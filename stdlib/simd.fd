@@ -2,8 +2,16 @@
 //
 // SIMD (Single Instruction, Multiple Data) intrinsics for AI/ML workloads.
 // SIMD vectors are represented as Vec<f64> of fixed size (e.g., f64x4 = 4 doubles).
-// In the interpreter, these are elementwise array operations.
-// In the x86 backend, they would map to SSE/AVX instructions.
+// In the interpreter and on the C path, these are elementwise loops.
+// Native builds (`fid emit`, the machine layer: compiler/nat_ir.fd
+// ng_simd_call, llvm-roadmap TG11) compile add, sub, mul, div, scale and
+// dot to vector loops: SSE2 (AVX2 under --cpu x86-64-v3|v4) on x86-64,
+// NEON on AArch64, RVV under --cpu rva23u64|rv64gcv on RISC-V, two f64
+// lanes a step (four under AVX2) and a scalar loop for the rest. Results
+// are the same bits as the elementwise loops (dot sums its products in
+// order; div keeps `x / 0 is 0`). FID_NAT_OFF=simd keeps them calls.
+// Integer lanes over Vec<i64> (add_i64, sub_i64, and_i64, or_i64,
+// xor_i64, wrapping at 64 bits) are at the end of the module.
 //
 // Common SIMD widths:
 //   f64x2 — 2 doubles (128-bit SSE2)
@@ -13,6 +21,27 @@
 
 module simd;
 /// Elementwise addition of two SIMD vectors.
+///
+/// Example:
+///   var a: Vec<f64> = Vec::new();
+///   a.push(1.0); a.push(2.0); a.push(3.0);
+///   var b: Vec<f64> = Vec::new();
+///   b.push(4.0); b.push(5.0); b.push(6.0);
+///   assert(dot(a, b) == 32.0);
+///   assert(sum(a) == 6.0);
+///   var x: Vec<i64> = Vec::new();
+///   x.push(12); x.push(10);
+///   assert_eq(and_i64(x, x).get(0), 12);
+///   assert_eq(add_i64(x, x).get(1), 20);
+///
+/// Example (native only):
+///   var a: Vec<f64> = Vec::new();
+///   a.push(1.0); a.push(2.0); a.push(3.0);
+///   var b: Vec<f64> = Vec::new();
+///   b.push(4.0); b.push(5.0); b.push(6.0);
+///   assert(add(a, b).get(2) == 9.0);
+///   assert(mul(a, b).get(1) == 10.0);
+///   assert(sum(scale(a, 2.0)) == 12.0);
 pub fn add(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
     p_simd_add(a, b)
 }
@@ -55,4 +84,103 @@ pub fn from_vec(a: Vec<f64>) -> Vec<f64> {
 /// Convert SIMD vector to string.
 pub fn to_str(a: Vec<f64>) -> str {
     p_simd_to_str(a)
+}
+
+// ---------------------------------------------------------------------------
+// Integer SIMD (competitive-roadmap OP21): Vec<i64> lanes
+//
+// Elementwise over a's length, a fresh Vec; b must be at least as long as
+// a (a shorter b panics: index out of bounds). add_i64 and sub_i64 wrap at
+// 64 bits, as the vector lanes do (paddq, add .2d, vadd.vv): they never
+// panic on overflow. The bodies below are what `fid run` and the C path
+// run; native builds (`fid emit`, compiler/nat_ir.fd ng_simd_call) turn a
+// call of simd_lanes_*_i64 into a vector loop of two lanes (four under
+// AVX2, --cpu x86-64-v3|v4) and a scalar loop for the rest, with the same
+// results. FID_NAT_OFF=simd keeps them calls.
+// ---------------------------------------------------------------------------
+
+/// Elementwise wrapping addition of two Vec<i64>.
+pub fn add_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    return simd_lanes_add_i64(a, b);
+}
+
+/// Elementwise wrapping subtraction of two Vec<i64>.
+pub fn sub_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    return simd_lanes_sub_i64(a, b);
+}
+
+/// Elementwise bitwise and of two Vec<i64>.
+pub fn and_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    return simd_lanes_and_i64(a, b);
+}
+
+/// Elementwise bitwise or of two Vec<i64>.
+pub fn or_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    return simd_lanes_or_i64(a, b);
+}
+
+/// Elementwise bitwise exclusive or of two Vec<i64>.
+pub fn xor_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    return simd_lanes_xor_i64(a, b);
+}
+
+/// The lanes of add_i64 (each simd_lanes_* function holds its own loop:
+/// the native build recognizes the call by its name and Vec<i64> types).
+@wrapping pub fn simd_lanes_add_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var n: i64 = a.len();
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        r.push(a.get(i) + b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The lanes of sub_i64.
+@wrapping pub fn simd_lanes_sub_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var n: i64 = a.len();
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        r.push(a.get(i) - b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The lanes of and_i64.
+pub fn simd_lanes_and_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var n: i64 = a.len();
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        r.push(a.get(i) & b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The lanes of or_i64.
+pub fn simd_lanes_or_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var n: i64 = a.len();
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        r.push(a.get(i) | b.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The lanes of xor_i64.
+pub fn simd_lanes_xor_i64(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var n: i64 = a.len();
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        r.push(a.get(i) ^ b.get(i));
+        i = i + 1;
+    }
+    return r;
 }

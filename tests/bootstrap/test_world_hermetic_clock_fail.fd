@@ -1,0 +1,33 @@
+// expect-error: Hermetic error: 'test_timer' is @hermetic but reaches the clock directly: 'stamp' calls 'p_clock_now_ms' (effect IO), on the path test_timer -> Timer.elapsed -> stamp
+// Complaint CT1: a @hermetic test may read the clock only through what
+// stdlib/world fakes (time's clock_now_*, datetime's dt_now). The method
+// `Timer.elapsed` calls `stamp`, which reads the OS clock directly
+// (p_clock_now_ms): the fake clock would not move it. The search follows
+// the method call the type checker resolved on the Timer value.
+use world;
+
+fn stamp() -> i64 {
+    return p_clock_now_ms();
+}
+
+struct Timer {
+    start: i64,
+}
+
+impl Timer {
+    fn elapsed(self: Timer) -> i64 {
+        return stamp() - self.start;
+    }
+}
+
+@hermetic
+fn test_timer() -> i64 {
+    world_fake_clock(1000);
+    val t: Timer = Timer { start: 1000 };
+    println(int_to_str(t.elapsed()));
+    return 0;
+}
+
+fn main() -> i64 {
+    return test_timer();
+}

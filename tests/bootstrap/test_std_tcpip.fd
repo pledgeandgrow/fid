@@ -1,0 +1,194 @@
+// stdlib/tcpip: two stacks over an in-memory link: checksum vector, ARP + ping, UDP, port unreachable, fragmentation and reassembly, TCP handshake, windowed transfer with a lost segment, close, RST, timers.
+// Expected output:
+// checksum 0xb861 valid true
+// seq lt true diff 10
+// ping frames 4 reply id 0x12340001 from 10.0.0.2 arp 1 1
+// udp b got 'hello' from 10.0.0.1:5000, a got 'HELLO' from 10.0.0.2:7
+// unreachable port 9
+// fragments 3 b got 3000 same true reassembled 1
+// reversed fragments b got 3000 same true reassembled 2
+// handshake frames 3 a ESTABLISHED b ESTABLISHED accepted true mss 536 536
+// request 'GET / HTTP/1.0'
+// response 3000 bytes same true, b retransmits 1, a out-of-order 1
+// close: a FIN_WAIT_2 b CLOSE_WAIT
+// close: a TIME_WAIT b CLOSED
+// rst: a CLOSED 'connection refused'
+// fragment timeout 1
+// after 2MSL a CLOSED, arp entries 0 0
+use tcpip;
+use vec;
+use string;
+
+var g_ctl: Vec<i64> = Vec::new();
+
+fn mac(last: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    m.push(2); m.push(0); m.push(0); m.push(0); m.push(0); m.push(last);
+    return m;
+}
+
+fn bytes(s: str) -> Vec<i64> {
+    return str_bytes(s);
+}
+
+// move frames both ways until the link is quiet; g_ctl[0] is the index
+// of a B->A frame to lose (-1: none), g_ctl[1] counts B->A frames
+fn pump(a: &mut NetStack, b: &mut NetStack) -> i64 {
+    var n: i64 = 0;
+    var busy: bool = true;
+    while busy {
+        busy = false;
+        val fa: Vec<Vec<i64>> = net_take_tx(a);
+        var i: i64 = 0;
+        while i < fa.len() {
+            net_input(b, fa.get(i));
+            n = n + 1;
+            busy = true;
+            i = i + 1;
+        }
+        val fb: Vec<Vec<i64>> = net_take_tx(b);
+        i = 0;
+        while i < fb.len() {
+            val k: i64 = g_ctl.get(1);
+            g_ctl.set(1, k + 1);
+            if k != g_ctl.get(0) {
+                net_input(a, fb.get(i));
+            }
+            n = n + 1;
+            busy = true;
+            i = i + 1;
+        }
+    }
+    return n;
+}
+
+fn pattern(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(i % 251);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() {
+    g_ctl.push(-1);
+    g_ctl.push(0);
+    var hdr: Vec<i64> = Vec::new();
+    val hx: str = "450000730000400040110000c0a80001c0a800c7";
+    var i: i64 = 0;
+    while i < 40 {
+        hdr.push(str_parse_hex(str_slice(hx, i, i + 2)));
+        i = i + 2;
+    }
+    val ck: i64 = net_checksum(hdr, 0, 20);
+    hdr.set(10, ck >> 8);
+    hdr.set(11, ck & 255);
+    println("checksum 0x" + int_to_hex(ck) + " valid " + bool_to_str(net_checksum(hdr, 0, 20) == 0));
+    println("seq lt " + bool_to_str(seq_lt(0xFFFFFFF0, 0x10)) + " diff " + int_to_str(seq_diff(5, 0xFFFFFFFB)));
+
+    val A: i64 = ip4(10, 0, 0, 1);
+    val B: i64 = ip4(10, 0, 0, 2);
+    val mask: i64 = ip4(255, 255, 255, 0);
+    var a: NetStack = net_new(mac(1), A, mask, ip4(10, 0, 0, 254));
+    var b: NetStack = net_new(mac(2), B, mask, ip4(10, 0, 0, 254));
+
+    icmp_ping(&mut a, B, 0x1234, 1, bytes("abc"));
+    val pf: i64 = pump(&mut a, &mut b);
+    println("ping frames " + int_to_str(pf) + " reply id 0x" + int_to_hex(a.ping_ids.get(0)) + " from " + ip_str(a.ping_from.get(0)) + " arp " + int_to_str(arp_cache_size(&a)) + " " + int_to_str(arp_cache_size(&b)));
+
+    val sb: i64 = udp_bind(&mut b, 7);
+    val sa: i64 = udp_bind(&mut a, 5000);
+    udp_sendto(&mut a, sa, B, 7, bytes("hello"));
+    pump(&mut a, &mut b);
+    val d1: UdpDatagram = udp_recv(&mut b, sb);
+    udp_sendto(&mut b, sb, d1.src, d1.sport, bytes("HELLO"));
+    pump(&mut a, &mut b);
+    val d2: UdpDatagram = udp_recv(&mut a, sa);
+    println("udp b got '" + str_from_bytes(d1.data) + "' from " + ip_str(d1.src) + ":" + int_to_str(d1.sport) + ", a got '" + str_from_bytes(d2.data) + "' from " + ip_str(d2.src) + ":" + int_to_str(d2.sport));
+    udp_sendto(&mut a, sa, B, 9, bytes("x"));
+    pump(&mut a, &mut b);
+    println("unreachable port " + int_to_str(a.unreachable.get(0)));
+
+    val big: Vec<i64> = pattern(3000);
+    val nf: i64 = udp_sendto(&mut a, sa, B, 7, big);
+    pump(&mut a, &mut b);
+    val d3: UdpDatagram = udp_recv(&mut b, sb);
+    println("fragments " + int_to_str(nf) + " b got " + int_to_str(d3.data.len()) + " same " + bool_to_str(same(d3.data, big)) + " reassembled " + int_to_str(b.reassembled));
+    udp_sendto(&mut a, sa, B, 7, big);
+    val fr: Vec<Vec<i64>> = net_take_tx(&mut a);
+    i = fr.len() - 1;
+    while i >= 0 {
+        net_input(&mut b, fr.get(i));
+        i = i - 1;
+    }
+    val d4: UdpDatagram = udp_recv(&mut b, sb);
+    println("reversed fragments b got " + int_to_str(d4.data.len()) + " same " + bool_to_str(same(d4.data, big)) + " reassembled " + int_to_str(b.reassembled));
+
+    tcp_listen(&mut b, 80);
+    a.tcp_rcvbuf = 1024;
+    b.mtu = 576;
+    val c: i64 = tcp_connect(&mut a, B, 80, 40000);
+    val hf: i64 = pump(&mut a, &mut b);
+    val sc: i64 = tcp_accept(&mut b, 80);
+    println("handshake frames " + int_to_str(hf) + " a " + tcp_state_name(tcp_state(&a, c)) + " b " + tcp_state_name(tcp_state(&b, sc)) + " accepted " + bool_to_str(sc >= 0) + " mss " + int_to_str(tcp_conn(&a, c).mss) + " " + int_to_str(tcp_conn(&b, sc).mss));
+    tcp_send(&mut a, c, bytes("GET / HTTP/1.0"));
+    pump(&mut a, &mut b);
+    println("request '" + str_from_bytes(tcp_recv(&mut b, sc, 100)) + "'");
+
+    val resp: Vec<i64> = pattern(3000);
+    // lose the second data segment B sends
+    g_ctl.set(0, g_ctl.get(1) + 1);
+    tcp_send(&mut b, sc, resp);
+    var got: Vec<i64> = Vec::new();
+    var t: i64 = 0;
+    var rounds: i64 = 0;
+    while got.len() < 3000 && rounds < 30 {
+        pump(&mut a, &mut b);
+        val r: Vec<i64> = tcp_recv(&mut a, c, 4096);
+        var k: i64 = 0;
+        while k < r.len() {
+            got.push(r.get(k));
+            k = k + 1;
+        }
+        if r.len() == 0 {
+            t = t + 1100;
+            net_tick(&mut a, t);
+            net_tick(&mut b, t);
+        }
+        rounds = rounds + 1;
+    }
+    println("response " + int_to_str(got.len()) + " bytes same " + bool_to_str(same(got, resp)) + ", b retransmits " + int_to_str(tcp_conn(&b, sc).retransmits) + ", a out-of-order " + int_to_str(tcp_conn(&a, c).ooo_segments));
+
+    tcp_close(&mut a, c);
+    pump(&mut a, &mut b);
+    println("close: a " + tcp_state_name(tcp_state(&a, c)) + " b " + tcp_state_name(tcp_state(&b, sc)));
+    tcp_close(&mut b, sc);
+    pump(&mut a, &mut b);
+    println("close: a " + tcp_state_name(tcp_state(&a, c)) + " b " + tcp_state_name(tcp_state(&b, sc)));
+
+    val c2: i64 = tcp_connect(&mut a, B, 81, 40001);
+    pump(&mut a, &mut b);
+    println("rst: a " + tcp_state_name(tcp_state(&a, c2)) + " '" + tcp_conn(&a, c2).error + "'");
+
+    udp_sendto(&mut a, sa, B, 7, big);
+    val fr2: Vec<Vec<i64>> = net_take_tx(&mut a);
+    net_input(&mut b, fr2.get(0));
+    net_tick(&mut a, t + 31000);
+    net_tick(&mut b, t + 31000);
+    println("fragment timeout " + int_to_str(b.frag_timeouts));
+    net_tick(&mut a, t + 61000);
+    net_tick(&mut b, t + 61000);
+    println("after 2MSL a " + tcp_state_name(tcp_state(&a, c)) + ", arp entries " + int_to_str(arp_cache_size(&a)) + " " + int_to_str(arp_cache_size(&b)));
+}

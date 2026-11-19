@@ -1,0 +1,66 @@
+// RA2 (docs/roadmap/llvm-roadmap.md): liveness from use lists and live
+// ranges as segments with holes in compiler/nat_ir.fd, through
+// nat_seg_unit and nat_seg_designed, on AArch64, RISC-V and x86-64:
+//   random    12 random functions per target (labels, definitions,
+//             reads, moves, calls, jumps, conditional branches,
+//             fall-throughs; 6 to 68 vregs, so one function has more than
+//             one word of liveness bits): the
+//             use-list liveness (ng_use_liveness) equals the block fixed
+//             point (mi_liveness); each vreg's segments (ng_class_segs)
+//             hold exactly the positions where it is written or live; the
+//             scan over segments (ng_seg_scan) and the greedy allocator
+//             over segments (ng_greedy_assign) pass the allocation
+//             checker's rules
+//   designed  a value read only past a branch whose near side keeps the
+//             whole pool busy: no spill over segments (scan and greedy),
+//             at least one over hulls (greedy)
+// Run:
+//   fid run tests/nattools/seg_unit.fd
+// Expected output:
+// a64 random ok
+// a64 designed ok
+// rv64 random ok
+// rv64 designed ok
+// x64 random ok
+// x64 designed ok
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn check(arch: i64, name: str) {
+    var bad: str = "";
+    var seed: i64 = 1;
+    while seed <= 12 && bad == "" {
+        var nblk: i64 = 2 + seed % 11;
+        var nvr: i64 = 3 + (seed * 13) % 70;
+        var r: str = nat_seg_unit(arch, seed, nblk, nvr, false);
+        if r != "" {
+            bad = "seed " + int_to_str(seed) + ": " + r;
+        }
+        seed = seed + 1;
+    }
+    if bad == "" {
+        println(name + " random ok");
+    } else {
+        println(name + " random FAILED: " + bad);
+    }
+    var d: str = nat_seg_designed(arch);
+    var parts: Vec<str> = str_split(d, " ");
+    var ok: bool = parts.len() == 3;
+    if ok {
+        ok = parts.get(0) == "0" && parts.get(1) == "0" && parts.get(2) != "0";
+    }
+    if ok {
+        println(name + " designed ok");
+    } else {
+        println(name + " designed FAILED: spills (scan, greedy over segments, greedy over hulls) " + d);
+    }
+}
+
+fn main() {
+    check(NAT_A64, "a64");
+    check(NAT_RV64, "rv64");
+    check(NAT_X64, "x64");
+}

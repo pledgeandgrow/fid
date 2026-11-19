@@ -1,0 +1,58 @@
+# me21-inline2-compile-time: what inline2 (compiler/iropt_me.fd ime_inline)
+# costs at compile time, and what was changed for it (Nov 17).
+#
+# Measured with ws/stage0.exe (the compiler of Nov 16: inline2 opt-in there,
+# named with FID_IROPT_ON=inline2; it has neither OP5's growth budget nor
+# ime_backend_named, so it still copies core's Vec_*/HashMap_* into loops),
+# `fid emit` (pe_ir) with FID_IROPT_STATS=1, one fid process at a time,
+# FID_HOME = the working tree. Every pair printed the same output.
+
+## iropt: instructions before -> after its passes, iropt time, build time
+program              inline2  instructions   iropt-ms  build-ms
+test_matrix_mul      on       10833 -> 9010      5600     15997
+                     off       6293 -> 5159      2573     11335
+test_generics_full   on       10960 -> 9383      4893     13020
+                     off       5643 -> 4877      1988      9616
+test_hashmap         on       11852 -> 9847      4868     13649
+                     off       7381 -> 6166      2641     11026
+test_lib_bigint      on      26046 -> 23123     18865     38188
+                     off     10382 -> 9110      4008     16295
+
+## where the time goes (iropt's pass table, ms, on vs off)
+program              promote       iv            inline2   midend
+test_matrix_mul      1256 / 309    372 / 80      777       483 / 223
+test_generics_full   1097 / 156    377 / 70      783       456 / 172
+test_hashmap         1030 / 274    328 / 124     658       516 / 249
+test_lib_bigint      4877 / 339    6606 / 225    2518      1040 / 413
+
+## What it says
+- iropt's time grows faster than the instructions inlining adds: promote
+  and iv grow 4-30x for 1.7-2.5x the instructions, so they are worse than
+  linear in a function's size. Inlining fewer, smaller copies into big
+  callers matters more than the total: IME_CALLER_MAX (4000) and the
+  once-called size (IME_INLINE_ONCE_MAX, 400, not charged to the growth
+  budget) are the limits to tune first (tests/tooling/inline2-tune.sh's
+  settings start with caller=2000, caller=1500,once=200).
+- inline2 itself took 0.66-2.5 s: each site inlined made its caller be
+  scanned again from the first block, and every call site weighed copied
+  the callee and walked it (ime_size, ime_callee_ok) again.
+
+## Changed (Nov 17, compiler/iropt_me.fd)
+- ime_inline_function goes on at the block after the site it inlined
+  instead of the first block (FID_IROPT_OFF=inlinescan: the old rescan,
+  to compare); the sites inlined and their order are the same (every call
+  before it was refused, and what refused it only tightens).
+- each callee's size and ime_callee_ok are found once (`memo`, forgotten
+  when the function changes) and the callee is copied only when a site is
+  inlined; the caller's size is found again only after a site is inlined.
+- the limits are read once per build from FID_INLINE2_LIMITS (defaults:
+  the constants), so one compiler can be tuned: tests/tooling/inline2-tune.sh.
+- FID_IROPT_STATS=1 prints `iropt: inline2 N sites (O once, M multi),
+  charged C of A, refused R by growth, Z by caller size, weighed W`.
+
+## To measure with the final compiler ($FID)
+  FID=$FID bash tests/tooling/inline2-limits-check.sh tests/bootstrap/test_matrix_mul.fd tests/bootstrap/test_lib_bigint.fd tests/bootstrap/test_generics_full.fd tests/bootstrap/test_hashmap.fd
+  FID=$FID bash tests/tooling/inline2-tune.sh           (writes me20-inline2-tune.txt)
+  FID=$FID bash tests/tooling/inline2-suite-check.sh    (the whole suite, inline2 on vs off)
+  FID=$FID EXTRA=--nat bash tests/tooling/inline2-suite-check.sh
+  OFF=inline2 bash scripts/me-measure.sh me20-inline2 $FID

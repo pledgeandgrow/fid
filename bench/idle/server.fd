@@ -1,0 +1,109 @@
+// bench/idle/server.fd — the server of the idle-connections benchmark
+// (competitive roadmap RT11): one task per connection, each waiting on its
+// socket with no time limit, so N open connections are N tasks parked on
+// the poller (IOCP/AFD on Windows, epoll on Linux, kqueue on macOS). A
+// connection that sends a line gets back "pong <open connections>\n" and
+// goes back to waiting; one that closes ends its task.
+//
+//   server <first port> [ports]   listen on ports first .. first+ports-1
+//                                 (default 1): one accept task per port
+//   server --selftest             print the reply to one ping, no socket
+//
+// bench/idle/run.sh builds it (fid ccompile and fid emit) and
+// bench/idle/idle.py opens the connections and measures it.
+
+use task;
+
+var g_open: i64 = 0;
+
+fn pong(open: i64) -> str {
+    return "pong " + int_to_str(open) + "\n";
+}
+
+fn conn_task(fd: i64) -> i64 {
+    p_atomic_add(g_open, 1);
+    var buf: i64 = 0;
+    // SAFETY: a 256-byte receive buffer, written only by p_co_recv (at most
+    // 255 bytes) and freed once below
+    unsafe {
+        buf = p_malloc(256);
+    }
+    var going: bool = true;
+    while going {
+        // -1: no time limit; the task stays parked until the socket is
+        // readable or closed
+        val n: i64 = p_co_recv(fd, buf, 255, - 1);
+        if n <= 0 {
+            going = false;
+        } else {
+            val msg: str = pong(p_atomic_load(g_open));
+            if p_co_send(fd, msg as i64, str_len(msg)) != str_len(msg) {
+                going = false;
+            }
+        }
+    }
+    unsafe {
+        p_free(buf);
+    }
+    p_socket_close(fd);
+    p_atomic_add(g_open, - 1);
+    return 0;
+}
+
+fn accept_task(fd: i64) -> i64 {
+    // p_co_accept parks the task until a connection is pending and takes
+    // it; the backlog is drained one accept per turn, with no poll between
+    // (task_wait_read before each accept cost a poller round trip per
+    // connection: ~250 accepts/s on Windows)
+    while true {
+        val client: i64 = p_co_accept(fd);
+        if client >= 0 {
+            task_detach(task_go("conn_task", client));
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    // SAFETY: one word, touched only through p_atomic_* (tasks run on
+    // several workers)
+    unsafe {
+        g_open = p_shared_alloc(8);
+    }
+    p_atomic_store(g_open, 0);
+    var first: i64 = 9300;
+    var ports: i64 = 1;
+    match arg_at(1) {
+        Option::Some(a) => {
+            if a == "--selftest" {
+                print(pong(p_atomic_load(g_open)));
+                p_atomic_add(g_open, 3);
+                print(pong(p_atomic_load(g_open)));
+                return 0;
+            }
+            first = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(2) {
+        Option::Some(b) => {
+            ports = str_parse_int(b);
+        }
+        Option::None => {
+        }
+    }
+    var i: i64 = 0;
+    while i < ports {
+        val fd: i64 = p_socket_listen(first + i);
+        if fd < 0 {
+            println("cannot listen on " + int_to_str(first + i));
+            return 1;
+        }
+        task_detach(task_go("accept_task", fd));
+        i = i + 1;
+    }
+    println("listening on " + int_to_str(first) + ".." + int_to_str(first + ports - 1));
+    task_run();
+    return 0;
+}

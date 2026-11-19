@@ -1,0 +1,209 @@
+// Fides HTTP/2 over TLS ("h2", RFC 9113 section 3.2): module `http2` over
+// module `tls`, the protocol chosen by ALPN (RFC 7301).
+//
+//   - a server: http2_tls_serve(port, cert, key, handler) answers clients
+//     that choose "h2" over HTTP/2 and the others (ALPN "http/1.1", or no
+//     ALPN) over HTTP/1.1 with module `http`, with the same handler;
+//   - a client: http2_tls_get / http2_tls_post, or http2_tls_connect and
+//     http2_request / http2_wait for several requests on one connection.
+//     The server must choose "h2"; requests say :scheme https.
+//
+// `cert` and `key` are as for tls_server: a .pfx file and its password on
+// Windows (Schannel), PEM files elsewhere (OpenSSL).
+//
+// Usage:
+//   use http; use http2; use http2_tls;
+//   fn route(req: HttpRequest) -> str {
+//       return build_response(200, "text/plain", "over HTTP/" + req.version + "\n");
+//   }
+//   http2_tls_serve(8443, "cert.pem", "key.pem", route);
+//   val r: Http2Response = http2_tls_get("example.com", 443, "/");
+
+module http2_tls;
+ use http; use http2; use task; use tls;
+
+fn h2t_recv(s: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+    return tls_session_recv(s, buf, n, timeout_ms);
+}
+
+fn h2t_send(s: i64, buf: i64, n: i64) -> i64 {
+    return tls_session_send(s, buf, n);
+}
+
+fn h2t_close(s: i64) -> i64 {
+    return tls_session_close(s);
+}
+
+var h2t_creds: i64 = 0;
+ fn h2t_accept(fd: i64) -> i64 {
+    return tls_accept(h2t_creds, fd);
+}
+
+// Modules http2 and http read, write and close TLS sessions through these.
+fn h2t_hooks() {
+    http2_set_tls(h2t_recv, h2t_send, h2t_close);
+    http_set_tls(h2t_recv, h2t_send, h2t_close, h2t_accept);
+}
+
+/// The protocols the server offers by ALPN, its preference first.
+pub const HTTP2_TLS_PROTOCOLS: str = "h2,http/1.1";
+
+// ─── Server ───────────────────────────────────────────────────────────────
+
+/// One accepted connection (task_go needs a name): the TLS handshake, then
+/// HTTP/2 when the client chose "h2", else HTTP/1.1 (module http). Its
+/// stalls hold up only this task.
+pub fn h2t_conn_task(fd: i64) -> i64 {
+    val s: i64 = tls_accept(h2t_creds, fd);
+    if s == 0 {
+        p_socket_close(fd);
+        return 0;
+    }
+    if tls_session_alpn(s) == "h2" {
+        return http2_serve_session(fd, s);
+    }
+    // http/1.1, or a client without ALPN
+    return http_conn_task(http_conn_new(fd, s));
+}
+
+/// Take connections off the listening socket, each its own task, until
+/// http2_stop().
+pub fn h2t_accept_task(fd: i64) -> i64 {
+    while !http2_stopped() {
+        if task_wait_read(fd, 200) {
+            val client: i64 = p_co_accept(fd);
+            if client >= 0 {
+                task_detach(task_go("h2t_conn_task", client));
+            }
+        }
+    }
+    p_socket_close(fd);
+    return 0;
+}
+
+/// Serve the listening socket `fd` over TLS from tasks and return: they
+/// run whenever the caller waits (task_sleep, task_run, a client call).
+/// ALPN offers "h2" then "http/1.1". False (nothing started) when the
+/// certificate cannot be loaded or ALPN cannot be set.
+pub fn http2_tls_listen(fd: i64, cert: str, key: str, handler: fn(HttpRequest) -> str) -> bool {
+    val creds: i64 = tls_server(cert, key);
+    if creds == 0 {
+        return false;
+    }
+    if !tls_server_alpn(creds, HTTP2_TLS_PROTOCOLS) {
+        return false;
+    }
+    h2t_creds = creds;
+    h2t_hooks();
+    http2_set_handler(handler);
+    http_set_handler(handler);
+    http2_reset_stop();
+    task_go("h2t_accept_task", fd);
+    return true;
+}
+
+/// Serve HTTPS on `port` with HTTP/2 for clients that choose "h2" and
+/// HTTP/1.1 for the others, until http2_stop(). False if the port or the
+/// certificate cannot be opened.
+pub fn http2_tls_serve(port: i64, cert: str, key: str, handler: fn(HttpRequest) -> str) -> bool {
+    val fd: i64 = p_socket_listen(port);
+    if fd < 0 {
+        return false;
+    }
+    if !http2_tls_listen(fd, cert, key, handler) {
+        p_socket_close(fd);
+        return false;
+    }
+    task_run();
+    return true;
+}
+
+// ─── Client ───────────────────────────────────────────────────────────────
+
+// A TLS session offering "h2" (checking the certificate, or not), as an
+// HTTP/2 connection; `ok` false, with `why`, when the handshake fails or
+// the server does not choose "h2".
+fn h2t_connect(host: str, port: i64, check: bool) -> H2Conn {
+    h2t_hooks();
+    var s: i64 = 0;
+    if check {
+        s = tls_connect_alpn(host, port, "h2");
+    } else {
+        s = tls_connect_alpn_unchecked(host, port, "h2");
+    }
+    if s == 0 {
+        return http2_failed("TLS handshake failed with " + host);
+    }
+    val fd: i64 = tls_session_fd(s);
+    val chosen: str = tls_session_alpn(s);
+    if chosen != "h2" {
+        tls_session_close(s);
+        p_socket_close(fd);
+        if chosen == "" {
+            return http2_failed("the server chose no protocol by ALPN (no HTTP/2)");
+        }
+        return http2_failed("the server chose " + chosen + " by ALPN, not h2");
+    }
+    return http2_connect_session(fd, s, host, port);
+}
+
+/// Connect to `host`:`port` over TLS (the certificate checked against the
+/// system's store and `host`), offering "h2" by ALPN, and start HTTP/2.
+/// `ok` false on failure (`why` says why).
+pub fn http2_tls_connect(host: str, port: i64) -> H2Conn {
+    return h2t_connect(host, port, true);
+}
+
+/// As http2_tls_connect, but accept any certificate: for checking a local
+/// server with a self-signed certificate only.
+pub fn http2_tls_connect_unchecked(host: str, port: i64) -> H2Conn {
+    return h2t_connect(host, port, false);
+}
+
+fn h2t_get(c: & mut H2Conn, path: str) -> Http2Response {
+    val id: i64 = http2_request(c, "GET", path, Vec::new(), Vec::new(), "");
+    val r: Http2Response = http2_wait(c, id);
+    http2_close(c);
+    return r;
+}
+
+/// GET `path` from https://`host`:`port` over HTTP/2. `status` 0 when there
+/// is no response (`error` says why).
+pub fn http2_tls_get(host: str, port: i64, path: str) -> Http2Response {
+    var c: H2Conn = http2_tls_connect(host, port);
+    if !c.ok {
+        var r: Http2Response = http2_wait(& mut c, - 1);
+        r.error = c.why;
+        return r;
+    }
+    return h2t_get(& mut c, path);
+}
+
+/// As http2_tls_get, accepting any certificate (local tests only).
+pub fn http2_tls_get_unchecked(host: str, port: i64, path: str) -> Http2Response {
+    var c: H2Conn = http2_tls_connect_unchecked(host, port);
+    if !c.ok {
+        var r: Http2Response = http2_wait(& mut c, - 1);
+        r.error = c.why;
+        return r;
+    }
+    return h2t_get(& mut c, path);
+}
+
+/// POST `body` to `path` of https://`host`:`port` over HTTP/2.
+pub fn http2_tls_post(host: str, port: i64, path: str, content_type: str, body: str) -> Http2Response {
+    var c: H2Conn = http2_tls_connect(host, port);
+    if !c.ok {
+        var r: Http2Response = http2_wait(& mut c, - 1);
+        r.error = c.why;
+        return r;
+    }
+    var names: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    names.push("content-type");
+    vals.push(content_type);
+    val id: i64 = http2_request(& mut c, "POST", path, names, vals, body);
+    val r: Http2Response = http2_wait(& mut c, id);
+    http2_close(& mut c);
+    return r;
+}

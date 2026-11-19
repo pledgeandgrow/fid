@@ -1,0 +1,211 @@
+// stdlib/dds: RTPS message bytes (header, INFO_TS, DATA; sequence number sets; ACKNACK; HEARTBEAT; SPDP parameter list, checked with an independent Python struct encoder), parsing with receiver context, well-known ports, and reliable delivery in memory with lost DATA recovered by HEARTBEAT/ACKNACK, a GAP for a removed change and a duplicate
+// Expected output:
+// message (72 bytes): 52 54 50 53 02 03 01 ff 01 02 03 04 0a 0b 0c 0d 00 00 00 01 09 01 08 00 00 f1 53 65 00 00 00 80 15 05 24 00 00 00 10 00 00 00 01 04 00 00 01 03 00 00 00 00 01 00 00 00 00 01 00 00 05 00 00 00 6d 73 67 31 00 00 00 00
+// parsed: ok=true v2.3 vendor=0x01ff subs=1 DATA reader=0x00000104 writer=0x00000103 sn=1 ts=1700000000 payload=16 bytes
+// snset: 00 00 00 00 05 00 00 00 24 00 00 00 00 00 00 a0 00 00 00 10
+// acknack: 06 03 1c 00 00 00 01 04 00 00 01 03 00 00 00 00 02 00 00 00 03 00 00 00 00 00 00 a0 01 00 00 00
+// heartbeat: 07 01 1c 00 00 00 01 04 00 00 01 03 00 00 00 00 01 00 00 00 00 00 00 00 05 00 00 00 01 00 00 00
+// parsed acknack: base=2 set=2,4 count=1 / gap: start=6 base=9 set=10
+// spdp (172 bytes): 00 03 00 00 15 00 04 00 02 03 00 00 16 00 04 00 01 0f 00 00 50 00 10 00 01 02 03 04 0a 0b 0c 0d 00 00 00 01 00 00 01 c1 0f 00 04 00 00 00 00 00
+// spdp back: ok=true name=talker vendor=0x010f domain=0 lease=20 endpoints=63 unicast=192.168.1.10:7410 multicast=239.255.0.1:7400 default=192.168.1.10:7411
+// spdp message: subs=1 reader=0x000100c7 writer=0x000100c2 payload ok=true
+// ports d0p0: 7400 7410 7401 7411 / d1p2: 7650 7664 7651 7665
+// round 1: sent=6 delivered=5-2 lost, reader has 1 pending=2
+// acknack 1: base=2 set=2,4
+// round 2: resent=2 delivered=1,2,3,4,5 all acked=true
+// round 3: gap sent=1 delivered=1,2,3,4,5,7 all acked=true duplicates=1
+// payloads: msg1 msg2 msg3 msg4 msg5 msg7
+use dds;
+
+fn hex32(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 7;
+    while i >= 0 {
+        val x: i64 = (v >> (4 * i)) & 15;
+        s = s + str_slice(d, x, x + 1);
+        i = i - 1;
+    }
+    return "0x" + s;
+}
+
+fn hex16(v: i64) -> str {
+    return "0x" + str_slice(hex32(v), 6, 10);
+}
+
+fn cdr_str(s: str) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0); b.push(1); b.push(0); b.push(0);
+    b.push(str_len(s) + 1); b.push(0); b.push(0); b.push(0);
+    var i: i64 = 0;
+    while i < str_len(s) {
+        b.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    b.push(0);
+    return b;
+}
+
+fn payload_str(b: & Vec<i64>) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 8;
+    while i < b.len() && b.get(i) != 0 {
+        bytes.push(b.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(bytes);
+}
+
+fn join_sns(v: & Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + ",";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val pa: Vec<i64> = rtps_prefix(0x01020304, 0x0a0b0c0d, 1);
+    val pb: Vec<i64> = rtps_prefix(0x01020304, 0x0a0b0c0d, 2);
+    val wid: i64 = rtps_entity(1, RTPS_KIND_WRITER_NO_KEY);
+    val rid: i64 = rtps_entity(1, RTPS_KIND_READER_NO_KEY);
+    val p1: Vec<i64> = cdr_str("msg1");
+    var m: Vec<i64> = rtps_header(&pa, 0x01ff);
+    m = cat(m, rtps_sub_info_ts(1700000000, 0x80000000));
+    m = cat(m, rtps_sub_data(rid, wid, 1, &p1));
+    println("message (" + int_to_str(m.len()) + " bytes): " + rtps_hex(&m));
+    val pm: RtpsMsg = rtps_parse(&m);
+    val s0: RtpsSub = pm.subs.get(0);
+    println("parsed: ok=" + db(pm.ok) + " v" + int_to_str(pm.major) + "." + int_to_str(pm.minor) + " vendor=" + hex16(pm.vendor) + " subs=" + int_to_str(pm.subs.len()) + " " + rtps_sub_name(s0.id) + " reader=" + hex32(s0.reader) + " writer=" + hex32(s0.writer) + " sn=" + int_to_str(s0.sn) + " ts=" + int_to_str(s0.ts_sec) + " payload=" + int_to_str(s0.payload.len()) + " bytes");
+    var set: Vec<i64> = Vec::new();
+    set.push(5); set.push(7); set.push(40);
+    println("snset: " + rtps_hex(&rtps_snset(5, &set)));
+    var miss: Vec<i64> = Vec::new();
+    miss.push(2); miss.push(4);
+    val ak: Vec<i64> = rtps_sub_acknack(rid, wid, 2, &miss, 1, true);
+    println("acknack: " + rtps_hex(&ak));
+    println("heartbeat: " + rtps_hex(&rtps_sub_heartbeat(rid, wid, 1, 5, 1, false, false)));
+    var gl: Vec<i64> = Vec::new();
+    gl.push(10);
+    val two: Vec<i64> = cat(cat(rtps_header(&pb, 0x01ff), ak), rtps_sub_gap(rid, wid, 6, 9, &gl));
+    val pm2: RtpsMsg = rtps_parse(&two);
+    val sa: RtpsSub = pm2.subs.get(0);
+    val sg: RtpsSub = pm2.subs.get(1);
+    println("parsed acknack: base=" + int_to_str(sa.set_base) + " set=" + join_sns(&sa.set) + " count=" + int_to_str(sa.count) + " / gap: start=" + int_to_str(sg.sn) + " base=" + int_to_str(sg.set_base) + " set=" + join_sns(&sg.set));
+
+    var sp: SpdpData = spdp_new(pa, 0x010f, 0, "talker");
+    sp.meta_unicast.push(rtps_locator_v4(192, 168, 1, 10, rtps_port_spdp_unicast(0, 0)));
+    sp.meta_multicast.push(rtps_locator_v4(239, 255, 0, 1, rtps_port_spdp_multicast(0)));
+    sp.default_unicast.push(rtps_locator_v4(192, 168, 1, 10, rtps_port_user_unicast(0, 0)));
+    val spb: Vec<i64> = spdp_encode(&sp);
+    var first: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 48 {
+        first.push(spb.get(i));
+        i = i + 1;
+    }
+    println("spdp (" + int_to_str(spb.len()) + " bytes): " + rtps_hex(&first));
+    val sd: SpdpData = spdp_decode(&spb);
+    println("spdp back: ok=" + db(sd.ok) + " name=" + sd.name + " vendor=" + hex16(sd.vendor) + " domain=" + int_to_str(sd.domain) + " lease=" + int_to_str(sd.lease_sec) + " endpoints=" + int_to_str(sd.builtin_endpoints) + " unicast=" + rtps_locator_str(&sd.meta_unicast.get(0)) + " multicast=" + rtps_locator_str(&sd.meta_multicast.get(0)) + " default=" + rtps_locator_str(&sd.default_unicast.get(0)));
+    val smsg: RtpsMsg = rtps_parse(&spdp_message(&sp, 1, 1700000000));
+    val ss: RtpsSub = smsg.subs.get(0);
+    println("spdp message: subs=" + int_to_str(smsg.subs.len()) + " reader=" + hex32(ss.reader) + " writer=" + hex32(ss.writer) + " payload ok=" + db(spdp_decode(&ss.payload).ok));
+    println("ports d0p0: " + int_to_str(rtps_port_spdp_multicast(0)) + " " + int_to_str(rtps_port_spdp_unicast(0, 0)) + " " + int_to_str(rtps_port_user_multicast(0)) + " " + int_to_str(rtps_port_user_unicast(0, 0)) + " / d1p2: " + int_to_str(rtps_port_spdp_multicast(1)) + " " + int_to_str(rtps_port_spdp_unicast(1, 2)) + " " + int_to_str(rtps_port_user_multicast(1)) + " " + int_to_str(rtps_port_user_unicast(1, 2)));
+
+    // reliable delivery over a lossy in-memory "network"
+    var w: RtpsWriter = rtps_writer_new(pa, wid);
+    var r: RtpsReader = rtps_reader_new(pb, rid);
+    rtps_writer_add_reader(&mut w, pb, rid);
+    rtps_reader_add_writer(&mut r, pa, wid);
+    var k: i64 = 1;
+    while k <= 5 {
+        rtps_writer_write(&mut w, cdr_str("msg" + int_to_str(k)));
+        k = k + 1;
+    }
+    rtps_writer_flush(&mut w);
+    val out1: Vec<Vec<i64>> = rtps_writer_take_outbox(&mut w);
+    var dup: Vec<i64> = Vec::new();
+    i = 0;
+    while i < out1.len() {
+        // the network loses the datagrams with SN 2 and SN 4
+        if i != 1 && i != 3 {
+            rtps_reader_receive(&mut r, &out1.get(i));
+        }
+        if i == 2 {
+            dup = out1.get(i);
+        }
+        i = i + 1;
+    }
+    println("round 1: sent=" + int_to_str(out1.len()) + " delivered=5-2 lost, reader has " + join_sns(&r.delivered_sn) + " pending=" + int_to_str(r.pend_sn.len()));
+    val back1: Vec<Vec<i64>> = rtps_reader_take_outbox(&mut r);
+    val pa1: RtpsMsg = rtps_parse(&back1.get(0));
+    val a1: RtpsSub = pa1.subs.get(0);
+    println("acknack " + int_to_str(back1.len()) + ": base=" + int_to_str(a1.set_base) + " set=" + join_sns(&a1.set));
+    rtps_writer_receive(&mut w, &back1.get(0));
+    val out2: Vec<Vec<i64>> = rtps_writer_take_outbox(&mut w);
+    i = 0;
+    while i < out2.len() {
+        rtps_reader_receive(&mut r, &out2.get(i));
+        i = i + 1;
+    }
+    val back2: Vec<Vec<i64>> = rtps_reader_take_outbox(&mut r);
+    i = 0;
+    while i < back2.len() {
+        rtps_writer_receive(&mut w, &back2.get(i));
+        i = i + 1;
+    }
+    println("round 2: resent=" + int_to_str(w.resent) + " delivered=" + join_sns(&r.delivered_sn) + " all acked=" + db(rtps_writer_all_acked(&w)));
+
+    rtps_writer_write(&mut w, cdr_str("msg6"));
+    rtps_writer_write(&mut w, cdr_str("msg7"));
+    rtps_writer_remove(&mut w, 6);
+    rtps_writer_flush(&mut w);
+    var guard: i64 = 0;
+    while (w.outbox.len() > 0 || r.outbox.len() > 0) && guard < 10 {
+        val ow: Vec<Vec<i64>> = rtps_writer_take_outbox(&mut w);
+        i = 0;
+        while i < ow.len() {
+            rtps_reader_receive(&mut r, &ow.get(i));
+            i = i + 1;
+        }
+        val orr: Vec<Vec<i64>> = rtps_reader_take_outbox(&mut r);
+        i = 0;
+        while i < orr.len() {
+            rtps_writer_receive(&mut w, &orr.get(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+    rtps_reader_receive(&mut r, &dup);
+    println("round 3: gap sent=" + int_to_str(w.gaps_sent) + " delivered=" + join_sns(&r.delivered_sn) + " all acked=" + db(rtps_writer_all_acked(&w)) + " duplicates=" + int_to_str(r.duplicates));
+    var ps: str = "payloads:";
+    i = 0;
+    while i < r.delivered.len() {
+        ps = ps + " " + payload_str(&r.delivered.get(i));
+        i = i + 1;
+    }
+    println(ps);
+    return 0;
+}
+
+fn db(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

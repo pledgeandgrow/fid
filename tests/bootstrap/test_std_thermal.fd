@@ -1,0 +1,121 @@
+// stdlib/thermal: layered-wall U-value, RC building models, degree-days, heat pump COP, psychrometrics
+// Wall (outside to inside): 102.5 mm brick k 0.77, cavity R 0.18, 100 mm block
+// k 0.11, 13 mm plaster k 0.16, Rse 0.04, Rsi 0.13 (ISO 6946): R = 1.4735,
+// U = 0.6787 W/m2K, 325.76 W through 20 m2 at 21 / -3 C. 1R1C against its
+// closed form Ta + RQ + (T0 - Ta - RQ) e^(-t/RC). Psychrometrics: ASHRAE
+// Fundamentals 2017 ch. 1 (Hyland-Wexler pws; table pws(20 C) = 2.3392 kPa,
+// pws(-10 C, ice) = 0.2600 kPa) and its moist-air example at 40 C dry bulb,
+// 20 C wet bulb, 101.325 kPa: W ~ 0.0064, h ~ 56.7 kJ/kg, dew point ~ 7.4 C,
+// RH ~ 14 %, v ~ 0.896 m3/kg. The 2R2C trajectory was reproduced in Python.
+// Expected output:
+// wall R=1.4735 U=0.6787 loss 325.76 W
+// interfaces: -2.35 -0.18 2.75 17.56 18.88
+// 1r1c after 10 h: 14.8675 (closed form 14.8675)
+// 2r2c after 48 h: air 18.8913 mass 12.9259 steady 20.0000
+// hdd 58.0 cdd 9.0, hourly hdd 0.5000, season 3480.0 kWh
+// carnot heating 35/0: 8.8043, cooling 35/25: 29.8150, 45% of carnot 3.9619, quadratic 3.4000, scop 3.0547
+// pws: 20C 2.3388 25C 3.1692 -10C 0.25990 kPa
+// ashrae example: W 0.006401 h 56.72 dew 7.43 rh 13.98% v 0.8962
+// wet bulb back from W: 20.0000, W at 25C 50% rh 0.009881
+use thermal;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn main() {
+    var w = thermal_wall();
+    thermal_add_layer(&mut w, "brick", 0.1025, 0.77);
+    thermal_add_resistance(&mut w, "cavity", 0.18);
+    thermal_add_layer(&mut w, "block", 0.1, 0.11);
+    thermal_add_layer(&mut w, "plaster", 0.013, 0.16);
+    println("wall R=" + fx(thermal_wall_r(&w), 4) + " U=" + fx(thermal_u_value(&w), 4) + " loss " + fx(thermal_heat_loss(&w, 20.0, 21.0, -3.0), 2) + " W");
+    val it = thermal_interface_temps(&w, 21.0, -3.0);
+    var line: str = "interfaces:";
+    var i: i64 = 0;
+    while i < it.len() {
+        line = line + " " + fx(it.get(i), 2);
+        i = i + 1;
+    }
+    println(line);
+
+    var m1 = Rc1 { r: 0.005, c: 10000000.0, t: 20.0 };
+    i = 0;
+    while i < 10 {
+        Rc1_step(&mut m1, 3600.0, 0.0, 2000.0);
+        i = i + 1;
+    }
+    val closed: f64 = 10.0 + (20.0 - 10.0) * math_exp(0.0 - 36000.0 / 50000.0);
+    println("1r1c after 10 h: " + fx(m1.t, 4) + " (closed form " + fx(closed, 4) + ")");
+    var m2 = Rc2 { ri: 0.002, re: 0.004, ci: 2000000.0, ce: 30000000.0, ti: 15.0, te: 10.0 };
+    i = 0;
+    while i < 48 {
+        Rc2_step(&mut m2, 3600.0, 0.0, 3000.0, 500.0);
+        i = i + 1;
+    }
+    println("2r2c after 48 h: air " + fx(m2.ti, 4) + " mass " + fx(m2.te, 4) + " steady " + fx(Rc2_steady(&m2, 0.0, 3000.0, 500.0), 4));
+
+    var days: Vec<f64> = Vec::new();
+    days.push(2.0);
+    days.push(5.0);
+    days.push(-1.0);
+    days.push(10.0);
+    days.push(16.0);
+    days.push(20.0);
+    days.push(25.0);
+    var hours: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 24 {
+        if i < 12 {
+            hours.push(17.0);
+        } else {
+            hours.push(19.0);
+        }
+        i = i + 1;
+    }
+    val hdd = thermal_hdd(&days, 18.0);
+    println("hdd " + fx(hdd, 1) + " cdd " + fx(thermal_cdd(&days, 18.0), 1) + ", hourly hdd " + fx(thermal_hdd_hourly(&hours, 18.0), 4) + ", season " + fx(thermal_degree_day_energy(250.0, 580.0), 1) + " kWh");
+    var heat: Vec<f64> = Vec::new();
+    var cop: Vec<f64> = Vec::new();
+    heat.push(500.0);
+    cop.push(4.5);
+    heat.push(1500.0);
+    cop.push(3.8);
+    heat.push(2500.0);
+    cop.push(3.0);
+    heat.push(1500.0);
+    cop.push(2.4);
+    println("carnot heating 35/0: " + fx(thermal_cop_carnot_heating(35.0, 0.0), 4) + ", cooling 35/25: " + fx(thermal_cop_carnot_cooling(35.0, 25.0), 4) + ", 45% of carnot " + fx(0.45 * thermal_cop_carnot_heating(35.0, 0.0), 4) + ", quadratic " + fx(thermal_cop_quadratic(6.0, -0.08, 0.0, 35.0, 2.5), 4) + ", scop " + fx(thermal_scop(&heat, &cop), 4));
+
+    println("pws: 20C " + fx(thermal_pws(20.0), 4) + " 25C " + fx(thermal_pws(25.0), 4) + " -10C " + fx(thermal_pws(-10.0), 5) + " kPa");
+    val p: f64 = 101.325;
+    val wx = thermal_w_from_wet_bulb(40.0, 20.0, p);
+    val pw = thermal_pw_from_w(wx, p);
+    println("ashrae example: W " + fx(wx, 6) + " h " + fx(thermal_enthalpy(40.0, wx), 2) + " dew " + fx(thermal_dew_point(pw), 2) + " rh " + fx(100.0 * thermal_rh(40.0, wx, p), 2) + "% v " + fx(thermal_specific_volume(40.0, wx, p), 4));
+    println("wet bulb back from W: " + fx(thermal_wet_bulb(40.0, wx, p), 4) + ", W at 25C 50% rh " + fx(thermal_w_from_rh(25.0, 0.5, p), 6));
+}

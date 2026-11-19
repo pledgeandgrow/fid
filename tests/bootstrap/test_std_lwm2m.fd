@@ -1,0 +1,201 @@
+// stdlib/lwm2m: the Device object TLV example of LwM2M 1.0 section 6.4.3.1 byte for byte (encode, decode, re-encode), SenML JSON, the server's Read/Discover/Write/Execute/Delete requests, and Register/Update/De-register over coap against a scripted server.
+// Expected output:
+// device tlv: same as the spec example (121 bytes)
+// device tlv: decoded and encoded again: same
+// object tlv: 080079c800144f70656e204d6f62696c6520416c6c69616e6365
+// ints: ff 0080 0ed8 0000000080000000 7f
+// 16-bit id: e2012c6162, long value f0012c012c...
+// senml /3/0/6: [{"bn":"/3/0/","n":"6/0","v":1},{"n":"6/1","v":5}]
+// senml /3/0 written back: same tlv
+// read /3/0/9: 2.05 cf 11542 c10964
+// discover /3/0: </3/0>,</3/0/0>,</3/0/1>,</3/0/2>,</3/0/3>,</3/0/6>,</3/0/7>,</3/0/8>,</3/0/9>,</3/0/10>,</3/0/11>,</3/0/13>,</3/0/14>,</3/0/16>
+// read /5/0: 4.04
+// execute /3/0/4: 2.04 executed /3/0/4; execute /3/0/0: 4.05
+// write /3/0: 2.04 utc offset +01:00, voltage [0]=3700 [1] gone
+// senml read /3/0/14: [{"bn":"/3/0/","n":"14","vs":"+01:00"}]
+// register: /rd ep=node-7 lt=300 lwm2m=1.0 b=U </1/0>,</3/0>
+// registered at /rd/5a3f
+// server read /3/0/0: 2.05 "Open Mobile Alliance"
+// update after 270 s: POST /rd/5a3f, state registered
+// deregister: DELETE /rd/5a3f, state unregistered
+use lwm2m;
+use coap;
+use vec;
+use string;
+use encoding;
+
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn device(s: &mut Lwm2mStore) {
+    lwm2m_define_device(s);
+    lwm2m_define(s, 1, 0, LWM2M_INT, false, false);
+    lwm2m_set_str(s, 3, 0, 0, -1, "Open Mobile Alliance");
+    lwm2m_set_str(s, 3, 0, 1, -1, "Lightweight M2M Client");
+    lwm2m_set_str(s, 3, 0, 2, -1, "345000123");
+    lwm2m_set_str(s, 3, 0, 3, -1, "1.0");
+    lwm2m_set_int(s, 3, 0, 6, 0, 1);
+    lwm2m_set_int(s, 3, 0, 6, 1, 5);
+    lwm2m_set_int(s, 3, 0, 7, 0, 3800);
+    lwm2m_set_int(s, 3, 0, 7, 1, 5000);
+    lwm2m_set_int(s, 3, 0, 8, 0, 125);
+    lwm2m_set_int(s, 3, 0, 8, 1, 900);
+    lwm2m_set_int(s, 3, 0, 9, -1, 100);
+    lwm2m_set_int(s, 3, 0, 10, -1, 15);
+    lwm2m_set_int(s, 3, 0, 11, 0, 0);
+    lwm2m_set_time(s, 3, 0, 13, -1, 1367491215);
+    lwm2m_set_str(s, 3, 0, 14, -1, "+02:00");
+    lwm2m_set_str(s, 3, 0, 16, -1, "U");
+}
+
+fn req(code: i64, path: str) -> CoapMsg {
+    var m: CoapMsg = coap_msg(COAP_CON, code, 1);
+    coap_set_uri(&mut m, path);
+    return m;
+}
+
+fn main() {
+    // LwM2M 1.0 section 6.4.3.1: Read /3/0 of the Device object
+    val want: str = "c800144f70656e204d6f62696c6520416c6c69616e6365c801164c69676874776569676874204d324d20436c69656e74c80209333435303030313233c303312e30860641000141010588070842000ed842011388870841007d42010384c10964c10a0f830b410000c40d5182428fc60e2b30323a3030c11055";
+    var s: Lwm2mStore = lwm2m_store_new();
+    device(&mut s);
+    val tlv: Vec<i64> = lwm2m_tlv_instance(&s, 3, 0);
+    if hx(tlv) == want {
+        println("device tlv: same as the spec example (" + int_to_str(tlv.len()) + " bytes)");
+    } else {
+        println("device tlv: DIFFERENT " + hx(tlv));
+    }
+    var s2: Lwm2mStore = lwm2m_store_new();
+    lwm2m_define_device(&mut s2);
+    val wrote: bool = lwm2m_tlv_write(&mut s2, 3, 0, &hex_decode_bytes(want), true);
+    if wrote && hx(lwm2m_tlv_instance(&s2, 3, 0)) == want {
+        println("device tlv: decoded and encoded again: same");
+    } else {
+        println("device tlv: decode/encode DIFFERENT");
+    }
+    val ob: str = hx(lwm2m_tlv_object(&s, 3));
+    println("object tlv: " + str_slice(ob, 0, 52));
+
+    println("ints: " + hx(lwm2m_int_bytes(-1)) + " " + hx(lwm2m_int_bytes(128)) + " " + hx(lwm2m_int_bytes(3800)) + " " + hx(lwm2m_int_bytes(2147483648)) + " " + hx(lwm2m_int_bytes(127)));
+    var t: Lwm2mStore = lwm2m_store_new();
+    lwm2m_set_str(&mut t, 9, 0, 300, -1, "ab");
+    val t1: str = hx(lwm2m_tlv_instance(&t, 9, 0));
+    var long: str = "";
+    var i: i64 = 0;
+    while i < 300 {
+        long = long + "x";
+        i = i + 1;
+    }
+    lwm2m_set_str(&mut t, 9, 0, 300, -1, long);
+    val t2: str = hx(lwm2m_tlv_instance(&t, 9, 0));
+    println("16-bit id: " + t1 + ", long value " + str_slice(t2, 0, 10) + "...");
+
+    println("senml /3/0/6: " + lwm2m_senml_json(&s, 3, 0, 6));
+    var s3: Lwm2mStore = lwm2m_store_new();
+    lwm2m_define_device(&mut s3);
+    lwm2m_senml_write(&mut s3, lwm2m_senml_json(&s, 3, 0, -1));
+    if hx(lwm2m_tlv_instance(&s3, 3, 0)) == want {
+        println("senml /3/0 written back: same tlv");
+    } else {
+        println("senml /3/0 written back: DIFFERENT " + hx(lwm2m_tlv_instance(&s3, 3, 0)));
+    }
+
+    // Requests of the server
+    val r9: CoapMsg = lwm2m_handle_request(&mut s, &req(COAP_GET, "/3/0/9"));
+    println("read /3/0/9: " + coap_code_str(r9.code) + " cf " + int_to_str(coap_get_uint(&r9, COAP_O_CONTENT_FORMAT, -1)) + " " + hx(r9.payload));
+    var dq: CoapMsg = req(COAP_GET, "/3/0");
+    coap_add_uint(&mut dq, COAP_O_ACCEPT, LWM2M_CF_LINK);
+    val dr: CoapMsg = lwm2m_handle_request(&mut s, &dq);
+    println("discover /3/0: " + str_from_bytes(dr.payload));
+    val nf: CoapMsg = lwm2m_handle_request(&mut s, &req(COAP_GET, "/5/0"));
+    println("read /5/0: " + coap_code_str(nf.code));
+    val ex: CoapMsg = lwm2m_handle_request(&mut s, &req(COAP_POST, "/3/0/4"));
+    val ex2: CoapMsg = lwm2m_handle_request(&mut s, &req(COAP_POST, "/3/0/0"));
+    println("execute /3/0/4: " + coap_code_str(ex.code) + " executed " + s.executed.get(0) + "; execute /3/0/0: " + coap_code_str(ex2.code));
+    // Write (replace) the UTC offset and the voltages: [0]=3700 only
+    var w: CoapMsg = req(COAP_PUT, "/3/0");
+    coap_add_uint(&mut w, COAP_O_CONTENT_FORMAT, LWM2M_CF_TLV);
+    w.payload = hex_decode_bytes("c60e2b30313a3030840742000e74");
+    val wr: CoapMsg = lwm2m_handle_request(&mut s, &w);
+    var gone: str = "kept";
+    if lwm2m_find(&s, 3, 0, 7, 1) < 0 {
+        gone = "gone";
+    }
+    println("write /3/0: " + coap_code_str(wr.code) + " utc offset " + lwm2m_get_str(&s, 3, 0, 14, -1) + ", voltage [0]=" + int_to_str(lwm2m_get_int(&s, 3, 0, 7, 0, -1)) + " [1] " + gone);
+    var sq: CoapMsg = req(COAP_GET, "/3/0/14");
+    coap_add_uint(&mut sq, COAP_O_ACCEPT, LWM2M_CF_SENML_JSON);
+    println("senml read /3/0/14: " + str_from_bytes(lwm2m_handle_request(&mut s, &sq).payload));
+
+    // Registration against a scripted server
+    var dev: Lwm2mStore = lwm2m_store_new();
+    device(&mut dev);
+    lwm2m_set_int(&mut dev, 1, 0, 0, -1, 1);
+    var c: Lwm2mClient = lwm2m_client_new("node-7", 300, 10, 5);
+    var srv: CoapEndpoint = coap_ep_new(900, 1);
+    lwm2m_client_register(&mut c, &dev, 0);
+    val o1: Vec<Vec<i64>> = lwm2m_client_take_outbox(&mut c);
+    coap_ep_receive(&mut srv, o1.get(0), 1);
+    val e1: Vec<CoapEvent> = coap_ep_take_events(&mut srv);
+    val reg: CoapEvent = e1.get(0);
+    val qs: Vec<str> = coap_get_strs(&reg.msg, COAP_O_URI_QUERY);
+    println("register: " + coap_uri_path(&reg.msg) + " " + str_join(qs, " ") + " " + str_from_bytes(reg.msg.payload));
+    var created: CoapMsg = coap_msg(0, COAP_CREATED, 0);
+    coap_add_str(&mut created, COAP_O_LOCATION_PATH, "rd");
+    coap_add_str(&mut created, COAP_O_LOCATION_PATH, "5a3f");
+    coap_ep_respond(&mut srv, &reg.msg, &mut created, 2);
+    val o2: Vec<Vec<i64>> = coap_ep_take_outbox(&mut srv);
+    lwm2m_client_receive(&mut c, &mut dev, o2.get(0), 3);
+    if c.state == LWM2M_REGISTERED {
+        println("registered at " + c.location);
+    }
+    // the server reads /3/0/0
+    var rq: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0);
+    coap_set_uri(&mut rq, "/3/0/0");
+    coap_ep_request(&mut srv, &mut rq, 10);
+    val o3: Vec<Vec<i64>> = coap_ep_take_outbox(&mut srv);
+    lwm2m_client_receive(&mut c, &mut dev, o3.get(0), 11);
+    val o4: Vec<Vec<i64>> = lwm2m_client_take_outbox(&mut c);
+    coap_ep_receive(&mut srv, o4.get(0), 12);
+    val e4: Vec<CoapEvent> = coap_ep_take_events(&mut srv);
+    val rr: CoapEvent = e4.get(0);
+    val rt: Lwm2mTlv = lwm2m_tlv_parse(&rr.msg.payload);
+    println("server read /3/0/0: " + coap_code_str(rr.msg.code) + " \"" + str_from_bytes(rt.values.get(0)) + "\"");
+    // Update at 90% of the lifetime
+    lwm2m_client_tick(&mut c, &mut dev, 269000);
+    val none: i64 = lwm2m_client_take_outbox(&mut c).len();
+    lwm2m_client_tick(&mut c, &mut dev, 270003);
+    val o5: Vec<Vec<i64>> = lwm2m_client_take_outbox(&mut c);
+    coap_ep_receive(&mut srv, o5.get(none), 270004);
+    val e5: Vec<CoapEvent> = coap_ep_take_events(&mut srv);
+    val up: CoapEvent = e5.get(0);
+    var changed: CoapMsg = coap_msg(0, COAP_CHANGED, 0);
+    coap_ep_respond(&mut srv, &up.msg, &mut changed, 270005);
+    lwm2m_client_receive(&mut c, &mut dev, coap_ep_take_outbox(&mut srv).get(0), 270006);
+    var st: str = "other";
+    if c.state == LWM2M_REGISTERED {
+        st = "registered";
+    }
+    var method: str = "POST";
+    if up.msg.code != COAP_POST {
+        method = "?";
+    }
+    println("update after 270 s: " + method + " " + coap_uri_path(&up.msg) + ", state " + st);
+    lwm2m_client_deregister(&mut c, 280000);
+    coap_ep_receive(&mut srv, lwm2m_client_take_outbox(&mut c).get(0), 280001);
+    val e6: Vec<CoapEvent> = coap_ep_take_events(&mut srv);
+    val de: CoapEvent = e6.get(0);
+    var deleted: CoapMsg = coap_msg(0, COAP_DELETED, 0);
+    coap_ep_respond(&mut srv, &de.msg, &mut deleted, 280002);
+    lwm2m_client_receive(&mut c, &mut dev, coap_ep_take_outbox(&mut srv).get(0), 280003);
+    var st2: str = "other";
+    if c.state == LWM2M_UNREGISTERED {
+        st2 = "unregistered";
+    }
+    var dm: str = "DELETE";
+    if de.msg.code != COAP_DELETE {
+        dm = "?";
+    }
+    println("deregister: " + dm + " " + coap_uri_path(&de.msg) + ", state " + st2);
+}

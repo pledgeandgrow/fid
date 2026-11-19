@@ -1,0 +1,59 @@
+// OP24 (competitive roadmap): a block's fact set (compiler/checks.fd
+// peir_dom_vfact, peir_dom_enter, peir_mul_fits). A fact on a value that
+// holds at a block's entry reaches every block that block dominates;
+// several facts on one value meet (`x >= 0` from one block, `x < 1000`
+// from the next); a call to Vec::filled(n, ..) that returned bounds n by
+// the bytes of memory (2^48); and a multiply is unchecked when its corner
+// products fit in i64 (it was |operands| < 2^31). `fid explain` lists each
+// multiply and add below as removed (range analysis);
+// FID_IROPT_OFF=rangedom keeps the first three functions' checks.
+// test_opt_range_facts_fail.fd and test_opt_range_filled_fail.fd: the
+// facts do not reach a block they do not dominate.
+//
+// Expected output:
+// 998001
+// 0
+// 9223372030926249001
+// 0
+// 5005
+
+// x in [0, 999] under the innermost branch: x * x needs no check
+fn inner_sq(x: i64, flag: i64) -> i64 {
+    var t: i64 = 0;
+    if x >= 0 {
+        if x < 1000 {
+            if flag > 0 {
+                t = x * x;
+            }
+        }
+    }
+    return t;
+}
+
+// a in [0, 3037000499]: a * a <= 9223372030926249001 fits
+fn sq_big(a: i64) -> i64 {
+    if a >= 0 {
+        if a <= 3037000499 {
+            return a * a;
+        }
+    }
+    return 0;
+}
+
+// n >= 0 (the branch) and n <= 2^48 (Vec::filled returned): n * 1000 and
+// the add of the length fit
+fn filled_scale(n: i64) -> i64 {
+    if n < 0 {
+        return 0;
+    }
+    var v: Vec<i64> = Vec::filled(n, 0);
+    return n * 1000 + v.len();
+}
+
+fn main() {
+    println(inner_sq(999, 1));
+    println(inner_sq(999, 0));
+    println(sq_big(3037000499));
+    println(filled_scale(0 - 3));
+    println(filled_scale(5));
+}

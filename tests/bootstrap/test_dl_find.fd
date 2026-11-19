@@ -1,0 +1,80 @@
+// roadmap L6C: loading a C library at run time through the OS loader
+// (LoadLibrary/GetProcAddress on Windows, dlopen/dlsym elsewhere).
+// p_dl_load gives the library's handle or 0, p_dl_find a symbol's address
+// or 0 (None below), p_dl_call calls an address as i64 -> i64, p_dl_unload
+// releases the library. llabs is in every host's C library.
+//
+// Expected output:
+//     loaded: true
+//     llabs: found
+//     llabs(-42) = 42
+//     llabs(7) = 7
+//     no_such_symbol_xyz: none
+//     empty name: none
+//     unloaded: 0
+//     missing library: 0
+
+fn dl_find(lib: i64, name: str) -> Option<i64> {
+    val p: i64 = p_dl_find(lib, name);
+    if p == 0 {
+        return Option::None;
+    }
+    return Option::Some(p);
+}
+
+fn show(lib: i64, name: str) -> i64 {
+    match dl_find(lib, name) {
+        Option::Some(p) => {
+            println(name + ": found");
+            return p;
+        }
+        Option::None => {
+            println(name + ": none");
+        }
+    }
+    return 0;
+}
+
+fn open_libc() -> i64 {
+    var names: Vec<str> = Vec::new();
+    names.push("ucrtbase.dll");
+    names.push("msvcrt.dll");
+    names.push("libc.so.6");
+    names.push("libc.so");
+    names.push("libc.dylib");
+    names.push("/usr/lib/libSystem.B.dylib");
+    var i: i64 = 0;
+    while i < names.len() {
+        val h: i64 = p_dl_load(names.get(i));
+        if h != 0 {
+            return h;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() {
+    val lib: i64 = open_libc();
+    if lib == 0 {
+        println("loaded: false");
+        return;
+    }
+    println("loaded: true");
+    val f: i64 = show(lib, "llabs");
+    if f != 0 {
+        println("llabs(-42) = " + int_to_str(p_dl_call(f, 0 - 42)));
+        println("llabs(7) = " + int_to_str(p_dl_call(f, 7)));
+    }
+    show(lib, "no_such_symbol_xyz");
+    match dl_find(lib, "") {
+        Option::Some(_) => {
+            println("empty name: found");
+        }
+        Option::None => {
+            println("empty name: none");
+        }
+    }
+    println("unloaded: " + int_to_str(p_dl_unload(lib)));
+    println("missing library: " + int_to_str(p_dl_load("no_such_library_xyz.so")));
+}

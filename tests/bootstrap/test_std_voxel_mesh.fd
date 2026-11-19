@@ -1,0 +1,172 @@
+// stdlib/voxel_mesh: marching cubes tables (edge masks, triangle rows, consistency), naive and greedy meshing with AO, closed-surface checks (volume = solid voxels), marching cubes sphere and torus (closed, Euler characteristic, volume, outward normals), OBJ export
+// Expected output:
+// edge mask 1 = 0x109, 0 = 0x0, 255 = 0x0, 254 = 0x109
+// row 1: 0 8 3; row 7: 2 8 3 2 10 8 10 9 8
+// table: 820 triangles, every row uses exactly its crossing edges: true
+// one voxel: naive 24 verts 12 tris area 6.00, greedy 12 tris
+// box 4x4x4: naive 192 tris, greedy 12 tris, areas 96.00 96.00, volumes 64.00 64.00
+// ao values: open 3, one side 2, side+corner 1, two sides 0
+// ao +y face next to a diagonal block: 239, beside a block: 235
+// random chunk: 238 solid voxels
+// random chunk: greedy area == naive area: true, greedy fewer tris: true
+// random chunk: naive volume 238.00, greedy volume 238.00
+// sphere: closed true, euler 2, volume 170.95 (exact sphere 179.59, same as a reference MC run)
+// sphere normals point outward: true
+// torus: closed true, euler 0
+// obj: 24 v lines, 12 f lines, first v 1 0 0
+use voxel_mesh;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn f2(x: f64) -> str {
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val v: i64 = (a * 100.0 + 0.5) as i64;
+    var fr: str = int_to_str(v % 100);
+    if str_len(fr) < 2 { fr = "0" + fr; }
+    var out: str = int_to_str(v / 100) + "." + fr;
+    if neg && v != 0 { out = "-" + out; }
+    return out;
+}
+
+fn hexn(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    if v == 0 { return "0x0"; }
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = byte_to_str(str_byte_at(d, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+fn row(v: &Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + " "; }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sphere(x: f64, y: f64, z: f64) -> f64 {
+    return math_sqrt((x - 5.0) * (x - 5.0) + (y - 5.2) * (y - 5.2) + (z - 4.9) * (z - 4.9)) - 3.5;
+}
+
+fn torus(x: f64, y: f64, z: f64) -> f64 {
+    val dx: f64 = x - 7.0;
+    val dy: f64 = y - 7.1;
+    val dz: f64 = z - 7.0;
+    val q: f64 = math_sqrt(dx * dx + dy * dy) - 4.0;
+    return q * q + dz * dz - 1.5 * 1.5;
+}
+
+var seed: i64 = 99;
+
+@wrapping
+fn rnd(n: i64) -> i64 {
+    seed = (seed * 6364136223846793005 + 1442695040888963407) & 0x7FFFFFFFFFFFFFFF;
+    return (seed >> 33) % n;
+}
+
+fn count_lines(s: str, prefix: str) -> i64 {
+    val ls: Vec<str> = str_lines(s);
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < ls.len() {
+        if str_starts_with(ls.get(i), prefix) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() {
+    println("edge mask 1 = " + hexn(vox_mc_edge_mask(1)) + ", 0 = " + hexn(vox_mc_edge_mask(0)) + ", 255 = " + hexn(vox_mc_edge_mask(255)) + ", 254 = " + hexn(vox_mc_edge_mask(254)));
+    println("row 1: " + row(&vox_mc_triangles(1)) + "; row 7: " + row(&vox_mc_triangles(7)));
+    var total: i64 = 0;
+    var consistent: bool = true;
+    var c: i64 = 0;
+    while c < 256 {
+        val r: Vec<i64> = vox_mc_triangles(c);
+        total = total + r.len() / 3;
+        var used: i64 = 0;
+        var i: i64 = 0;
+        while i < r.len() {
+            used = used | (1 << r.get(i));
+            i = i + 1;
+        }
+        if used != vox_mc_edge_mask(c) || r.len() % 3 != 0 { consistent = false; }
+        c = c + 1;
+    }
+    println("table: " + int_to_str(total) + " triangles, every row uses exactly its crossing edges: " + yes(consistent));
+
+    var one: VoxChunk = vox_chunk_new(3, 3, 3);
+    vox_set(&mut one, 0, 0, 0, 1);
+    val n1: VoxMesh = vox_mesh_naive(&one);
+    val g1: VoxMesh = vox_mesh_greedy(&one);
+    println("one voxel: naive " + int_to_str(vox_mesh_vertex_count(&n1)) + " verts " + int_to_str(vox_mesh_triangle_count(&n1)) + " tris area " + f2(vox_mesh_area(&n1)) + ", greedy " + int_to_str(vox_mesh_triangle_count(&g1)) + " tris");
+
+    var bx: VoxChunk = vox_chunk_new(6, 6, 6);
+    vox_fill_box(&mut bx, 1, 1, 1, 4, 4, 4, 2);
+    val nb: VoxMesh = vox_mesh_naive(&bx);
+    val gb: VoxMesh = vox_mesh_greedy(&bx);
+    println("box 4x4x4: naive " + int_to_str(vox_mesh_triangle_count(&nb)) + " tris, greedy " + int_to_str(vox_mesh_triangle_count(&gb)) + " tris, areas " + f2(vox_mesh_area(&nb)) + " " + f2(vox_mesh_area(&gb)) + ", volumes " + f2(vox_mesh_volume(&nb)) + " " + f2(vox_mesh_volume(&gb)));
+
+    println("ao values: open " + int_to_str(vox_ao_value(0, 0, 0)) + ", one side " + int_to_str(vox_ao_value(1, 0, 0)) + ", side+corner " + int_to_str(vox_ao_value(0, 1, 1)) + ", two sides " + int_to_str(vox_ao_value(1, 1, 0)));
+    var fl: VoxChunk = vox_chunk_new(3, 3, 3);
+    vox_fill_box(&mut fl, 0, 0, 0, 2, 0, 2, 1);
+    vox_set(&mut fl, 1, 1, 1, 1);
+    println("ao +y face next to a diagonal block: " + int_to_str(vox_face_ao_xyz(&fl, 2, 0, 0, 0)) + ", beside a block: " + int_to_str(vox_face_ao_xyz(&fl, 2, 1, 0, 0)));
+
+    var rc: VoxChunk = vox_chunk_new(8, 8, 8);
+    var z: i64 = 0;
+    while z < 8 {
+        var y: i64 = 0;
+        while y < 8 {
+            var x: i64 = 0;
+            while x < 8 {
+                if rnd(100) < 40 { vox_set(&mut rc, x, y, z, 1 + rnd(2)); }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        z = z + 1;
+    }
+    println("random chunk: " + int_to_str(vox_solid_count(&rc)) + " solid voxels");
+    val nr: VoxMesh = vox_mesh_naive(&rc);
+    val gr: VoxMesh = vox_mesh_greedy(&rc);
+    val da: f64 = vox_mesh_area(&nr) - vox_mesh_area(&gr);
+    println("random chunk: greedy area == naive area: " + yes(da < 0.000001 && da > 0.0 - 0.000001) + ", greedy fewer tris: " + yes(vox_mesh_triangle_count(&gr) < vox_mesh_triangle_count(&nr)));
+    println("random chunk: naive volume " + f2(vox_mesh_volume(&nr)) + ", greedy volume " + f2(vox_mesh_volume(&gr)));
+
+    val sf: Vec<f64> = vox_field_sample(10, 10, 10, 1.0, sphere);
+    val sm: VoxMesh = vox_marching_cubes(&sf, 10, 10, 10, 0.0);
+    val vol: f64 = vox_mesh_volume(&sm);
+    val exact: f64 = 4.0 / 3.0 * 3.141592653589793 * 3.5 * 3.5 * 3.5;
+    println("sphere: closed " + yes(vox_mesh_is_closed(&sm)) + ", euler " + int_to_str(vox_mesh_euler(&sm)) + ", volume " + f2(vol) + " (exact sphere " + f2(exact) + ", same as a reference MC run)");
+    var out_ok: bool = true;
+    var i: i64 = 0;
+    while i < vox_mesh_vertex_count(&sm) {
+        val px: f64 = sm.positions.get(3 * i) - 5.0;
+        val py: f64 = sm.positions.get(3 * i + 1) - 5.2;
+        val pz: f64 = sm.positions.get(3 * i + 2) - 4.9;
+        val l: f64 = math_sqrt(px * px + py * py + pz * pz);
+        val d: f64 = (px * sm.normals.get(3 * i) + py * sm.normals.get(3 * i + 1) + pz * sm.normals.get(3 * i + 2)) / l;
+        if d < 0.95 { out_ok = false; }
+        i = i + 1;
+    }
+    println("sphere normals point outward: " + yes(out_ok));
+    val tf: Vec<f64> = vox_field_sample(14, 14, 14, 1.0, torus);
+    val tm: VoxMesh = vox_marching_cubes(&tf, 14, 14, 14, 0.0);
+    println("torus: closed " + yes(vox_mesh_is_closed(&tm)) + ", euler " + int_to_str(vox_mesh_euler(&tm)));
+
+    val obj: str = vox_mesh_to_obj(&n1);
+    println("obj: " + int_to_str(count_lines(obj, "v ")) + " v lines, " + int_to_str(count_lines(obj, "f ")) + " f lines, first " + str_lines(obj).get(0));
+}

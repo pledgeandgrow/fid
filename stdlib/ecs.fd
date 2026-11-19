@@ -33,6 +33,47 @@ pub fn ecs_entity_count() -> i64 {
     return __ecs_entity_count();
 }
 
+// ─── World tracking ───────────────────────────────────────────────────
+// The runtime stores components in per-name tables and hands out entity
+// IDs from a monotonic counter. It cannot enumerate component names or
+// delete entities, so this module tracks both itself: every component
+// name ever passed to ecs_add, and every entity passed to
+// ecs_destroy_entity. Entity IDs are never reused, so once an entity is
+// dead it stays dead — ecs_reset() clears all component data but the
+// ID space keeps advancing (ecs_entity_count() is a high-water mark).
+
+var ECS_COMP_NAMES: Vec<str> = Vec::new();
+var ECS_DEAD: Vec<i64> = Vec::new();
+
+fn ecs_track_name(name: str) -> void {
+    var i: i64 = 0;
+    while i < ECS_COMP_NAMES.len() {
+        if str_equal(ECS_COMP_NAMES.get(i), name) {
+            return;
+        }
+        i = i + 1;
+    }
+    ECS_COMP_NAMES.push(name);
+}
+
+fn ecs_is_dead(entity: i64) -> bool {
+    var i: i64 = 0;
+    while i < ECS_DEAD.len() {
+        if ECS_DEAD.get(i) == entity {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// True while the entity has been created and not destroyed.
+/// Destroyed IDs are never reused, so this stays false forever after
+/// ecs_destroy_entity.
+pub fn ecs_is_alive(entity: i64) -> bool {
+    return entity >= 0 && entity < ecs_entity_count() && !ecs_is_dead(entity);
+}
+
 // ─── Component Management ─────────────────────────────────────────────
 
 // Check if an entity has a component
@@ -43,6 +84,7 @@ pub fn ecs_has(component_name: str, entity: i64) -> i64 {
 // Add a component to an entity (value is a struct)
 // Note: due to SRET calling convention, the value is passed as a pointer
 pub fn ecs_add<T>(component_name: str, entity: i64, value: T) {
+    ecs_track_name(component_name);
     __ecs_add(component_name, entity, value);
 }
 
@@ -64,7 +106,7 @@ pub fn ecs_remove(component_name: str, entity: i64) {
 // and desugared to `__on_event_name(params)` functions.
 // This is a simple dispatch — in a real game engine, this would use
 // an event queue and dispatch on the next frame.
-pub fn ecs_dispatch_event(event_name: str) {  // Event dispatch is handled by calling __on_<event_name> directly
+pub fn ecs_dispatch_event(_event_name: str) {  // Event dispatch is handled by calling __on_<event_name> directly
 // This function is a placeholder for future event queue support
 }
 
@@ -81,14 +123,14 @@ pub fn ecs_dispatch_event(event_name: str) {  // Event dispatch is handled by ca
 
 /// Register a component type. Called once per component type at startup.
 /// In comptime mode, this would generate the storage layout.
-pub fn ecs_register_component(component_name: str) -> void {  // The runtime ECS auto-registers components on first use.
+pub fn ecs_register_component(_component_name: str) -> void {  // The runtime ECS auto-registers components on first use.
 // This function is for explicit registration and future comptime support.
 }
 
 /// Register a system. A system is a function that runs every frame
 /// and queries entities with specific components.
 /// In comptime mode, this would generate the query iteration code.
-pub fn ecs_register_system(system_name: str, handler: fn() -> void) -> void {  // Store the system handler for later execution.
+pub fn ecs_register_system(_system_name: str, _handler: fn() -> void) -> void {  // Store the system handler for later execution.
 // In comptime mode, the handler would be inlined.
 }
 
@@ -106,7 +148,7 @@ pub fn ecs_query_entities(components: str) -> Vec<i64> {
     var n = ecs_entity_count();
     var i = 0;
     while i < n {
-        var has_all = true;
+        var has_all = !ecs_is_dead(i);
         var j = 0;
         var num_components = json_len(components);
         while j < num_components {
@@ -139,18 +181,44 @@ pub fn ecs_count_with_component(component_name: str) -> i64 {
 }
 
 /// Destroy an entity and all its components.
+/// Removes every registered component and marks the ID dead. The ID is
+/// never reused and ecs_entity_count() does not decrease (it is the
+/// high-water mark of IDs ever handed out).
 pub fn ecs_destroy_entity(entity: i64) -> void {
-    // Remove all known components
-    // In a real implementation, we'd track which components the entity has.
-    // For now, the runtime handles this.
-    // __ecs_destroy_entity is not implemented by any backend (it was an undefined
-    // symbol in the C build), so fail loudly instead
-    p_panic("ecs_destroy_entity: not implemented by the runtime");
+    if ecs_is_dead(entity) {
+        return;
+    }
+    var i: i64 = 0;
+    while i < ECS_COMP_NAMES.len() {
+        ecs_remove(ECS_COMP_NAMES.get(i), entity);
+        i = i + 1;
+    }
+    ECS_DEAD.push(entity);
 }
 
 /// Reset the ECS world — destroy all entities and components.
+/// Every registered component is removed from every entity. The entity
+/// ID counter is owned by the runtime and keeps its high-water mark, so
+/// post-reset entities get fresh IDs above all previous ones.
 pub fn ecs_reset() -> void {
-    p_panic("ecs_reset: not implemented by the runtime");
+    var n: i64 = ecs_entity_count();
+    var i: i64 = 0;
+    while i < ECS_COMP_NAMES.len() {
+        var e: i64 = 0;
+        while e < n {
+            ecs_remove(ECS_COMP_NAMES.get(i), e);
+            e = e + 1;
+        }
+        i = i + 1;
+    }
+    // IDs are never reused; all pre-reset IDs stay dead.
+    var d: i64 = 0;
+    while d < n {
+        if !ecs_is_dead(d) {
+            ECS_DEAD.push(d);
+        }
+        d = d + 1;
+    }
 }
 
 // ─── Game loop integration (Phase 15.5) ─────────────────────────────────
@@ -166,6 +234,19 @@ pub fn ecs_frame() -> void {
 }
 
 /// Create an entity with a single component (convenience function).
+///
+/// Example:
+///   component Health { hp: i64 }
+///   fn main() -> i64 {
+///       val before = ecs_entity_count();
+///       val e = ecs_spawn("Health", Health { hp: 5 });
+///       assert_eq(ecs_entity_count(), before + 1);
+///       assert_eq(ecs_has("Nothing", e), 0);
+///       val e2 = ecs_spawn2("Health", Health { hp: 1 }, "Health", Health { hp: 2 });
+///       assert_eq(e2, e + 1);
+///       assert_eq(ecs_query_entities("[]").len(), ecs_entity_count());
+///       return 0;
+///   }
 pub fn ecs_spawn<T>(component_name: str, value: T) -> i64 {
     var entity = ecs_create_entity();
     ecs_add(component_name, entity, value);

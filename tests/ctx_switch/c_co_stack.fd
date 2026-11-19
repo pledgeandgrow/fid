@@ -1,0 +1,46 @@
+// LG11: p_co_stack(bytes) in the C runtime (compiler/codegen_c.fd) sets the
+// stack of the tasks started after it. A task that recurses 200,000 calls
+// deep needs far more than the default (1 MB on Windows, 256 KB on POSIX):
+// with 256 MB asked for it runs; without, it ends in "Panic: Stack
+// overflow". The same is reached by name, p_thread_spawn("__p_co_stack",
+// 1, bytes), which a runtime without it answers -1 (fid's interpreter asks
+// that way: it is built by the previous fid).
+//
+// C path only (`fid run` has its own task stacks, the native runtimes
+// answer -2):
+//   CC="zig cc" $FID ccompile tests/ctx_switch/c_co_stack.fd -o cstk.exe
+//   ./cstk.exe
+//
+// Expected output:
+// before: 0
+// by name: 268435456
+// deep: 200000
+extern "C" {
+    fn p_co_stack(bytes: i64) -> i64;
+}
+
+fn deep(n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    var r: i64 = deep(n - 1) + 1;
+    return r;
+}
+
+fn body(n: i64) -> i64 {
+    return deep(n);
+}
+
+fn main() -> i64 {
+    var was: i64 = 0;
+    unsafe {
+        was = p_co_stack(268435456);
+    }
+    println("before: " + int_to_str(was));
+    var ctl: str = "__p_co_stack";
+    println("by name: " + int_to_str(p_thread_spawn(ctl, 1, 268435456)));
+    var entry: str = "body";
+    var h: i64 = p_co_async(entry, 1, 200000);
+    println("deep: " + int_to_str(p_future_poll(h)));
+    return 0;
+}

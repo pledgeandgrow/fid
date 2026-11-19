@@ -1,0 +1,145 @@
+// test_natabi_retregs.fd — llvm ME27 / LF24 / WP6, competitive OP12: on the
+// machine layer (compiler/nat_ir.fd ng_rr_plan) a function that returns a
+// struct of one or two words (two i64, narrower fields packed into words,
+// an Option or a Result of one word) and is only ever called directly
+// returns it in two registers instead of through the hidden result
+// pointer. The results do not change: every backend prints the same, and
+// `FID_NAT_OFF=retregs` builds the old convention natively to compare.
+//
+// Expected output:
+// 3 4
+// 4 3
+// 10 20
+// 55 89
+// found 2
+// none
+// ok 7
+// error: division by zero
+// 12 true 7
+// 2 false 7
+// 100
+// 6 9
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+struct Mixed {
+    n: i64,
+    flag: bool,
+    c: i32,
+}
+
+struct One {
+    v: i64,
+}
+
+fn make_pair(a: i64, b: i64) -> Pair {
+    return Pair { a: a, b: b };
+}
+
+fn swap(p: Pair) -> Pair {
+    return Pair { a: p.b, b: p.a };
+}
+
+fn add_pairs(p: Pair, q: Pair) -> Pair {
+    return make_pair(p.a + q.a, p.b + q.b);
+}
+
+/// (F(n), F(n + 1)), recursively: each level returns a pair to the next
+fn fib_pair(n: i64) -> Pair {
+    if n == 0 {
+        return Pair { a: 0, b: 1 };
+    }
+    val p: Pair = fib_pair(n - 1);
+    return Pair { a: p.b, b: p.a + p.b };
+}
+
+fn find(xs: Vec<i64>, x: i64) -> Option<i64> {
+    var i: i64 = 0;
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn safe_div(a: i64, b: i64) -> Result<i64, str> {
+    if b == 0 {
+        return Result::Err("division by zero");
+    }
+    return Result::Ok(a / b);
+}
+
+/// A bool and an i32 share the second word
+fn mixed(n: i64) -> Mixed {
+    return Mixed { n: n * 2, flag: n > 3, c: 7 };
+}
+
+fn one(v: i64) -> One {
+    return One { v: v * 10 };
+}
+
+fn flag_text(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn show_pair(p: Pair) {
+    println(int_to_str(p.a) + " " + int_to_str(p.b));
+}
+
+fn show_found(r: Option<i64>) {
+    match r {
+        Option::Some(i: i64) => {
+            println("found " + int_to_str(i));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+}
+
+fn show_div(r: Result<i64, str>) {
+    match r {
+        Result::Ok(v: i64) => {
+            println("ok " + int_to_str(v));
+        }
+        Result::Err(e: str) => {
+            println("error: " + e);
+        }
+    }
+}
+
+fn main() {
+    show_pair(make_pair(3, 4));
+    show_pair(swap(make_pair(3, 4)));
+    show_pair(add_pairs(make_pair(4, 8), make_pair(6, 12)));
+    show_pair(fib_pair(10));
+    var xs: Vec<i64> = Vec::new();
+    xs.push(5);
+    xs.push(6);
+    xs.push(7);
+    show_found(find(xs, 7));
+    show_found(find(xs, 9));
+    show_div(safe_div(21, 3));
+    show_div(safe_div(1, 0));
+    val m: Mixed = mixed(6);
+    println(int_to_str(m.n) + " " + flag_text(m.flag) + " " + int_to_str(m.c as i64));
+    val m2: Mixed = mixed(1);
+    println(int_to_str(m2.n) + " " + flag_text(m2.flag) + " " + int_to_str(m2.c as i64));
+    val o: One = one(10);
+    println(o.v);
+    var acc: Pair = make_pair(0, 0);
+    var i: i64 = 1;
+    while i <= 3 {
+        acc = add_pairs(acc, make_pair(i, i + 1));
+        i = i + 1;
+    }
+    show_pair(acc);
+}

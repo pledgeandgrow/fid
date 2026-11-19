@@ -1,0 +1,35 @@
+// CI5: an index past the end of a fixed-size array panics under `fid wasm`
+// as it does in the interpreter (compiler/wasm.fd wg_array_bound: the
+// GetElemPtr into a `*[T; N]` is checked against N, unsigned, so a negative
+// index is caught too; inside `unsafe` it is not checked). `b` in `pick`
+// is a typed `var b: [T; N]`, whose Load is typed `[T; N]` (the array's
+// address): without the check it read past the end and printed a number
+// then "after" (Nov 17, stage 0's wasm.fd). The C path and
+// the machine layer do not check a fixed-size array's index, so this test
+// lives here and not in tests/bootstrap (tests/wasm/task-switch-check.sh
+// runs it; the in-bounds cases are tests/bootstrap/test_wasm_array_index.fd).
+//
+// Expected output:
+//   6
+//   before
+// then on stderr "Panic: Array index out of bounds" and exit code 1
+fn pick(a: [i64; 3], i: i64) -> i64 {
+    var b: [i64; 3] = a;
+    return b[i];
+}
+
+fn main() -> i64 {
+    var a: [i64; 3] = [1, 2, 3];
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        s = s + a[i];
+        i = i + 1;
+    }
+    println(s);
+    println("before");
+    // i is 3 here: one past the end
+    print(pick(a, i));
+    println("after");
+    return 0;
+}

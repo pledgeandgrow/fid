@@ -15,15 +15,11 @@
 //   - Integer args: RCX, RDX, R8, R9 (then stack); return: RAX
 //   - Shadow space: 32 bytes; stack 16-byte aligned before CALL
 
-module compiler::pe_ir_enc;
- use core; use vec; use string;
-// ===========================================================================
+module compiler::pe_ir_enc; use core; use vec; use string; use compiler::image_writer; use compiler::nat_enc;// ===========================================================================
 // Register ids (Reg / XmmReg in Rust)
 // ===========================================================================
 
-pub const PEIR_RAX: i64 = 0; pub const PEIR_RCX: i64 = 1; pub const PEIR_RDX: i64 = 2; pub const PEIR_RBX: i64 = 3; pub const PEIR_RSP: i64 = 4; pub const PEIR_RBP: i64 = 5; pub const PEIR_RSI: i64 = 6; pub const PEIR_RDI: i64 = 7; pub const PEIR_R8: i64 = 8; pub const PEIR_R9: i64 = 9; pub const PEIR_R10: i64 = 10; pub const PEIR_R11: i64 = 11; pub const PEIR_R12: i64 = 12; pub const PEIR_R13: i64 = 13; pub const PEIR_R14: i64 = 14; pub const PEIR_R15: i64 = 15;
- pub const XMM0: i64 = 0; pub const XMM1: i64 = 1; pub const XMM2: i64 = 2; pub const XMM3: i64 = 3; pub const XMM4: i64 = 4; pub const XMM5: i64 = 5; pub const XMM6: i64 = 6; pub const XMM7: i64 = 7; pub const XMM8: i64 = 8; pub const XMM9: i64 = 9; pub const XMM10: i64 = 10; pub const XMM11: i64 = 11; pub const XMM12: i64 = 12; pub const XMM13: i64 = 13; pub const XMM14: i64 = 14; pub const XMM15: i64 = 15;
-/// Low 3 bits (ModR/M encoding) — Reg::code
+pub const PEIR_RAX: i64 = 0; pub const PEIR_RCX: i64 = 1; pub const PEIR_RDX: i64 = 2; pub const PEIR_RBX: i64 = 3; pub const PEIR_RSP: i64 = 4; pub const PEIR_RBP: i64 = 5; pub const PEIR_RSI: i64 = 6; pub const PEIR_RDI: i64 = 7; pub const PEIR_R8: i64 = 8; pub const PEIR_R9: i64 = 9; pub const PEIR_R10: i64 = 10; pub const PEIR_R11: i64 = 11; pub const PEIR_R12: i64 = 12; pub const PEIR_R13: i64 = 13; pub const PEIR_R14: i64 = 14; pub const PEIR_R15: i64 = 15; pub const XMM0: i64 = 0; pub const XMM1: i64 = 1; pub const XMM2: i64 = 2; pub const XMM3: i64 = 3; pub const XMM4: i64 = 4; pub const XMM5: i64 = 5; pub const XMM6: i64 = 6; pub const XMM7: i64 = 7; pub const XMM8: i64 = 8; pub const XMM9: i64 = 9; pub const XMM10: i64 = 10; pub const XMM11: i64 = 11; pub const XMM12: i64 = 12; pub const XMM13: i64 = 13; pub const XMM14: i64 = 14; pub const XMM15: i64 = 15;  /// Low 3 bits (ModR/M encoding) — Reg::code
 pub fn peir_reg_code(r: i64) -> i64 {
     return r & 7;
 }
@@ -46,8 +42,7 @@ pub fn xmm_high(x: i64) -> bool {
 pub const PEIR_RELOC_REL32: i64 = 0;  /// RIP-relative data access: disp32 = target_rva - (code_rva + 4)
 /// (marker only — rip refs use PeirRipRef, not PeirReloc)
 pub const PEIR_RELOC_RIPREL32: i64 = 1;  /// RIP-relative lea to a code label: disp32 = target_code - (code_offset + 4)
-pub const PEIR_RELOC_LEALABEL: i64 = 2;
-/// Pending relocation — a location in code that needs to be patched
+pub const PEIR_RELOC_LEALABEL: i64 = 2;  /// Pending relocation — a location in code that needs to be patched
 /// after all labels are resolved
 pub struct PeirReloc {
     /// Offset in code buffer where the 4-byte displacement should be written
@@ -101,11 +96,21 @@ pub struct PeirEnc {
     pub last_store_disp: i64,
     pub last_store_reg: i64,
     pub last_store_end: i64,
+    /// Copy propagation (D13): the last move emitted through
+    /// PeirEnc_mov_rr_cp (kind 1: `mov dst, src`) or PeirEnc_mov_imm_cp
+    /// (kind 2: `mov dst, imm`, src = imm) and the code position after it;
+    /// last_mov_end = -1 = none. A _cp move right after it that repeats it,
+    /// or (kind 1) copies back, is not emitted: the registers already hold
+    /// that. Cleared like last_store_end (place_label, emit_bytes).
+    pub last_mov_kind: i64,
+    pub last_mov_dst: i64,
+    pub last_mov_src: i64,
+    pub last_mov_end: i64,
 }
 
 pub fn PeirEnc_new() -> PeirEnc {
     return PeirEnc {
-        code: Vec::new(), labels: Vec::new(), pending_labels: Vec::new(), pending_rip_refs: Vec::new(), next_label: 0, last_store_disp: 0, last_store_reg: 0, last_store_end: - 1,
+        code: Vec::new(), labels: Vec::new(), pending_labels: Vec::new(), pending_rip_refs: Vec::new(), next_label: 0, last_store_disp: 0, last_store_reg: 0, last_store_end: - 1, last_mov_kind: 0, last_mov_dst: 0, last_mov_src: 0, last_mov_end: - 1,
     };
 }
 
@@ -120,7 +125,34 @@ pub fn PeirEnc_alloc_label(self: & mut PeirEnc) -> i64 {
 /// Mark a label at the current code position
 pub fn PeirEnc_place_label(self: & mut PeirEnc, label: i64) -> void {
     self.last_store_end = - 1;
+    self.last_mov_end = - 1;
     self.labels.set(label, self.code.len());
+}
+
+/// B5 (the per-function cache): a label at code offset `pos`
+pub fn PeirEnc_set_label(self: & mut PeirEnc, label: i64, pos: i64) -> void {
+    self.labels.set(label, pos);
+}
+
+/// B5: bytes copied in as they are (their references come after)
+pub fn PeirEnc_emit_bytes(self: & mut PeirEnc, bytes: Vec<i64>) -> void {
+    self.last_store_end = - 1;
+    self.last_mov_end = - 1;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        self.code.push(bytes.get(i));
+        i = i + 1;
+    }
+}
+
+/// B5: a label reference at code offset `pos` (4 bytes)
+pub fn PeirEnc_add_reloc(self: & mut PeirEnc, pos: i64, label: i64, kind: i64) -> void {
+    self.pending_labels.push(PeirReloc_new(pos, label, kind));
+}
+
+/// B5: an .rdata reference at code offset `pos` (4 bytes)
+pub fn PeirEnc_add_rip_ref(self: & mut PeirEnc, pos: i64, rdata_offset: i64) -> void {
+    self.pending_rip_refs.push(PeirRipRef_new(pos, rdata_offset));
 }
 
 /// Align code output to a boundary using multi-byte NOPs.
@@ -527,18 +559,57 @@ pub fn PeirEnc_mov_rr(self: & mut PeirEnc, dst: i64, src: i64) -> void {
     PeirEnc_modrm_rr(self, src, dst);
 }
 
+/// D13: whether the _cp moves leave out repeated moves (pe_ir.fd sets it
+/// per function from FID_PE_OFF=cprop).
+pub var g_peir_cp: bool = true;
+
+/// D13 copy propagation: `mov dst, src`, left out when dst is src or when
+/// the move emitted just before (through a _cp move, nothing in between)
+/// was this one or `mov src, dst`. Only for the moves between values that
+/// pe_ir.fd's generator emits (no hand-counted jump crosses them).
+pub fn PeirEnc_mov_rr_cp(self: & mut PeirEnc, dst: i64, src: i64) -> void {
+    if dst == src {
+        return;
+    }
+    if g_peir_cp && self.last_mov_end == self.code.len() && self.last_mov_kind == 1 {
+        if (self.last_mov_dst == src && self.last_mov_src == dst) || (self.last_mov_dst == dst && self.last_mov_src == src) {
+            return;
+        }
+    }
+    PeirEnc_mov_rr(self, dst, src);
+    self.last_mov_kind = 1;
+    self.last_mov_dst = dst;
+    self.last_mov_src = src;
+    self.last_mov_end = self.code.len();
+}
+
+/// D13 copy propagation: `mov r, val` (PeirEnc_mov_imm), left out when the
+/// move emitted just before (through a _cp move) put the same value in r.
+pub fn PeirEnc_mov_imm_cp(self: & mut PeirEnc, r: i64, val: i64) -> void {
+    if g_peir_cp && self.last_mov_end == self.code.len() && self.last_mov_kind == 2 && self.last_mov_dst == r && self.last_mov_src == val {
+        return;
+    }
+    PeirEnc_mov_imm(self, r, val);
+    self.last_mov_kind = 2;
+    self.last_mov_dst = r;
+    self.last_mov_src = val;
+    self.last_mov_end = self.code.len();
+}
+
 // A frame offset at or above this names register peir_value_reg(offset -
 // PEIR_REG_SLOT). Values are read and written through mov_reg_mem_rbp and
 // mov_mem_rbp_reg, so every instruction works on a register value unchanged;
 // anything else that takes an offset must not get one (emit_mem_rbp panics).
 pub const PEIR_REG_SLOT: i64 = 0x7F000000; pub const PEIR_VALUE_REGS: i64 = 7;  /// Value registers 7 and 8 are r10 and r11: caller-saved, so only a value
 /// whose live range has no call (and nothing else that uses them) gets one
-/// (competitive OP16).
-pub const PEIR_ALL_REGS: i64 = 9;  /// A frame offset at or above this names xmm register (offset -
+/// (competitive OP16). Value registers 9 and 10 are r8 and r9 (D4): also
+/// argument registers, so only a value whose live range neither holds a
+/// call nor starts or ends at one (nor is a parameter) gets one.
+pub const PEIR_ALL_REGS: i64 = 11;  /// The first of the value registers that are argument registers (r8, r9)
+pub const PEIR_ARG_VALUE_REGS: i64 = 9;  /// A frame offset at or above this names xmm register (offset -
 /// PEIR_XMM_SLOT): an f64 value kept in a register (competitive OP17).
-pub const PEIR_XMM_SLOT: i64 = 0x7F000100;
-/// The registers that hold values instead of stack slots: seven
-/// callee-saved ones, then r10 and r11.
+pub const PEIR_XMM_SLOT: i64 = 0x7F000100;  /// The registers that hold values instead of stack slots: seven
+/// callee-saved ones, then r10 and r11, then r8 and r9 (D4).
 pub fn peir_value_reg(i: i64) -> i64 {
     if i == 0 {
         return PEIR_RBX;
@@ -554,6 +625,12 @@ pub fn peir_value_reg(i: i64) -> i64 {
     }
     if i == 8 {
         return PEIR_R11;
+    }
+    if i == 9 {
+        return PEIR_R8;
+    }
+    if i == 10 {
+        return PEIR_R9;
     }
     return PEIR_R12 + i - 3;
 }
@@ -761,7 +838,7 @@ pub fn PeirEnc_mov_reg_mem_rbp(self: & mut PeirEnc, dst: i64, disp: i64) -> void
         self.last_store_end = - 1;
         var src: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
         if dst != src {
-            PeirEnc_mov_rr(self, dst, src);
+            PeirEnc_mov_rr_cp(self, dst, src);
         }
         return;
     }
@@ -770,7 +847,7 @@ pub fn PeirEnc_mov_reg_mem_rbp(self: & mut PeirEnc, dst: i64, disp: i64) -> void
         // since — forward the register, skip the reload.
         self.last_store_end = - 1;
         if dst != self.last_store_reg {
-            PeirEnc_mov_rr(self, dst, self.last_store_reg);
+            PeirEnc_mov_rr_cp(self, dst, self.last_store_reg);
         }
         return;
     }
@@ -791,7 +868,7 @@ pub fn PeirEnc_mov_mem_rbp_reg(self: & mut PeirEnc, disp: i64, src: i64) -> void
         self.last_store_end = - 1;
         var rd: i64 = peir_value_reg(disp - PEIR_REG_SLOT);
         if rd != src {
-            PeirEnc_mov_rr(self, rd, src);
+            PeirEnc_mov_rr_cp(self, rd, src);
         }
         return;
     }
@@ -1088,6 +1165,55 @@ pub fn PeirEnc_sar_cl(self: & mut PeirEnc, r: i64) -> void {
     PeirEnc_rex(self, true, false, false, reg_ext(r));
     self.code.push(0xD3);
     PeirEnc_modrm(self, 3, 7, peir_reg_code(r));
+}
+
+// --- OP20: BMI1/BMI2 forms (`fid emit --cpu x86-64-v3|v4`, g_pe_cpu) ---
+// The same encodings as the machine layer's x64_shiftx / x64_blsr /
+// x64_andn (compiler/nat_enc.fd, checked against clang's assembler): a
+// three-byte VEX prefix C4, then R'X'B' and map 0F38 (00010), then W=1,
+// the inverted vvvv register, L=0 and pp.
+
+/// The second VEX byte: ModRM.reg's and ModRM.rm's high bits inverted
+/// (R and B; X is always 1, no index), map 0F38.
+fn peir_vex1(reg: i64, rm: i64) -> i64 {
+    return ((((reg >> 3) & 1) ^ 1) << 7) | (1 << 6) | ((((rm >> 3) & 1) ^ 1) << 5) | 0x02;
+}
+
+/// The third VEX byte: W=1, vvvv = ~v, L=0, pp.
+fn peir_vex2(v: i64, pp: i64) -> i64 {
+    return 0x80 | (((v & 15) ^ 15) << 3) | (pp & 3);
+}
+
+/// OP20 (BMI2): d = a shifted by b (count masked to 6 bits, as by CL;
+/// flags untouched): VEX.LZ.pp.0F38.W1 F7 /r, ModRM.reg = d, ModRM.rm =
+/// a, vvvv = b. pp 1 SHLX, 2 SARX, 3 SHRX. `shlx rax, rbx, rcx` =
+/// C4 E2 F1 F7 C3.
+pub fn PeirEnc_shiftx(self: & mut PeirEnc, pp: i64, d: i64, a: i64, b: i64) -> void {
+    self.code.push(0xC4);
+    self.code.push(peir_vex1(d, a));
+    self.code.push(peir_vex2(b, pp));
+    self.code.push(0xF7);
+    PeirEnc_modrm_rr(self, d, a);
+}
+
+/// OP20 (BMI1): d = a & (a - 1): VEX.LZ.0F38.W1 F3 /1, vvvv = d,
+/// ModRM.rm = a. `blsr rax, rcx` = C4 E2 F8 F3 C9.
+pub fn PeirEnc_blsr(self: & mut PeirEnc, d: i64, a: i64) -> void {
+    self.code.push(0xC4);
+    self.code.push(peir_vex1(0, a));
+    self.code.push(peir_vex2(d, 0));
+    self.code.push(0xF3);
+    PeirEnc_modrm(self, 3, 1, peir_reg_code(a));
+}
+
+/// OP20 (BMI1): d = ~s & o: VEX.LZ.0F38.W1 F2 /r, ModRM.reg = d, vvvv =
+/// s, ModRM.rm = o. `andn rax, rbx, rcx` = C4 E2 E0 F2 C1.
+pub fn PeirEnc_andn(self: & mut PeirEnc, d: i64, s: i64, o: i64) -> void {
+    self.code.push(0xC4);
+    self.code.push(peir_vex1(d, o));
+    self.code.push(peir_vex2(s, 0));
+    self.code.push(0xF2);
+    PeirEnc_modrm_rr(self, d, o);
 }
 
 /// cqo (sign-extend RAX into RDX:RAX)
@@ -1742,7 +1868,8 @@ pub fn PeirEnc_ucomisd(self: & mut PeirEnc, dst: i64, src: i64) -> void {
 
 /// ucomiss xmm0, xmm1
 pub fn PeirEnc_ucomiss(self: & mut PeirEnc, dst: i64, src: i64) -> void {
-    self.code.push(0xF3);
+    // 0F 2E, no prefix (F3 0F 2E is no instruction: an f32 comparison
+    // stopped with "Illegal instruction")
     self.code.push(0x0F);
     self.code.push(0x2E);
     PeirEnc_modrm(self, 3, dst, src);
@@ -1918,6 +2045,18 @@ pub fn pe_kernel32_imports() -> Vec<str> {
     v.push("CreateIoCompletionPort");
     v.push("GetQueuedCompletionStatusEx");
     v.push("PostQueuedCompletionStatus");
+    // emit --checked-alloc: the fault report finds the block an access hit
+    // (PeirGen_gen_checked_fault)
+    v.push("VirtualQuery");
+    // p_signal_register (pe_runtime/base.fd): Ctrl-C and console close
+    v.push("SetConsoleCtrlHandler");
+    // RT7: pert_mem_resident (pe_runtime/base.fd), the working set
+    v.push("K32GetProcessMemoryInfo");
+    // P12: p_free gives a large block's bytes back to FID_MEM_LIMIT's count
+    // (PeirGen_gen_free, pert_lim_give)
+    v.push("HeapSize");
+    // stdlib/sys.fd sys_total_memory / sys_available_memory (sw_memstatus)
+    v.push("GlobalMemoryStatusEx");
     return v;
 }
 
@@ -1933,6 +2072,10 @@ pub fn pe_msvcrt_imports() -> Vec<str> {
     v.push("ceil");
     v.push("fabs");
     v.push("fmod");
+    // RL25: test_verify_abi_c_mixed.fd's c_ldexp/c_frexp/c_modf
+    v.push("ldexp");
+    v.push("frexp");
+    v.push("modf");
     v.push("exp");
     v.push("log");
     v.push("log10");
@@ -1963,6 +2106,8 @@ pub fn pe_msvcrt_imports() -> Vec<str> {
     v.push("memmove");
     v.push("memset");
     v.push("memcmp");
+    // pert_mem_find_byte (stdlib/pe_runtime/base.fd) calls it (2g.58)
+    v.push("memchr");
     v.push("toupper");
     v.push("tolower");
     v.push("isalpha");
@@ -1983,6 +2128,8 @@ pub fn pe_msvcrt_imports() -> Vec<str> {
     v.push("getenv");
     v.push("exit");
     v.push("qsort");
+    // CI3: test_c_callback_user_data.fd (a comparator with a context pointer)
+    v.push("qsort_s");
     v.push("bsearch");
     v.push("ldiv");
     v.push("_snprintf");
@@ -2014,8 +2161,7 @@ pub struct PeDllImport {
 }
 
 // What this program imports beyond kernel32 and msvcrt: `extern "C" link "x"`
-var g_pe_extra_imports: Vec<PeDllImport> = Vec::new();
- pub fn pe_clear_extra_imports() {
+var g_pe_extra_imports: Vec<PeDllImport> = Vec::new(); pub fn pe_clear_extra_imports() {
     g_pe_extra_imports = Vec::new();
 }
 
@@ -2065,8 +2211,7 @@ pub fn pe_link_dll(lib: str) -> str {
 /// The others (`link "x"`) have IAT slots too, but the program loads them
 /// itself at start-up (PeirGen_gen_dll_loader), so that a missing library
 /// is reported by name instead of the loader failing silently (release E4).
-pub const PE_STATIC_DLLS: i64 = 2;
-/// The files to try, in order, for a `link` DLL: SQLite's own sqlite3.dll,
+pub const PE_STATIC_DLLS: i64 = 2;  /// The files to try, in order, for a `link` DLL: SQLite's own sqlite3.dll,
 /// else the copy every Windows 10 and 11 has (winsqlite3.dll, same API).
 pub fn pe_link_dll_candidates(dll: str) -> Vec<str> {
     var v: Vec<str> = Vec::new();
@@ -2151,8 +2296,7 @@ pub fn pe_import_slot(name: str) -> i64 {
 }
 
 /// IAT indices for each imported function (first 13 kernel32 imports)
-pub const PIAT_GET_STD_HANDLE: i64 = 0; pub const PIAT_WRITE_FILE: i64 = 1; pub const PIAT_EXIT_PROCESS: i64 = 2; pub const PIAT_GET_PROCESS_HEAP: i64 = 3; pub const PIAT_HEAP_ALLOC: i64 = 4; pub const PIAT_HEAP_FREE: i64 = 5; pub const PIAT_CREATE_FILE_A: i64 = 6; pub const PIAT_READ_FILE: i64 = 7; pub const PIAT_CLOSE_HANDLE: i64 = 8; pub const PIAT_GET_FILE_SIZE: i64 = 9; pub const PIAT_GET_COMMAND_LINE_A: i64 = 10; pub const PIAT_CREATE_PROCESS_A: i64 = 11; pub const PIAT_WAIT_FOR_SINGLE_OBJECT: i64 = 12;
-// ===========================================================================
+pub const PIAT_GET_STD_HANDLE: i64 = 0; pub const PIAT_WRITE_FILE: i64 = 1; pub const PIAT_EXIT_PROCESS: i64 = 2; pub const PIAT_GET_PROCESS_HEAP: i64 = 3; pub const PIAT_HEAP_ALLOC: i64 = 4; pub const PIAT_HEAP_FREE: i64 = 5; pub const PIAT_CREATE_FILE_A: i64 = 6; pub const PIAT_READ_FILE: i64 = 7; pub const PIAT_CLOSE_HANDLE: i64 = 8; pub const PIAT_GET_FILE_SIZE: i64 = 9; pub const PIAT_GET_COMMAND_LINE_A: i64 = 10; pub const PIAT_CREATE_PROCESS_A: i64 = 11; pub const PIAT_WAIT_FOR_SINGLE_OBJECT: i64 = 12;  // ===========================================================================
 // PeirRdata — builds the .rdata section: string constants + import table
 // ===========================================================================
 
@@ -2309,8 +2453,7 @@ pub fn PeirRdata_build(self: & mut PeirRdata, string_constants: Vec<str>) -> voi
             i = i + 1;
         }
         d = d + 1;
-    }
-    // Align to 8 bytes for tables
+    }  // Align to 8 bytes for tables
     while (self.data.len() % 8) != 0 {
         self.data.push(0);
     }
@@ -2520,328 +2663,631 @@ pub fn pe_push_str(t: Vec<i64>, s: str) -> Vec<i64> {
 // PE file builder
 // ===========================================================================
 
-pub const PE_IMAGE_BASE: i64 = 0x140000000; pub const PE_SECTION_ALIGN: i64 = 0x1000; pub const PE_FILE_ALIGN: i64 = 0x200; pub const PE_TEXT_RVA: i64 = 0x1000;
- pub fn pe_align_up(val: i64, align: i64) -> i64 {
+pub const PE_IMAGE_BASE: i64 = 0x140000000; pub const PE_SECTION_ALIGN: i64 = 0x1000; pub const PE_FILE_ALIGN: i64 = 0x200; pub const PE_TEXT_RVA: i64 = 0x1000; pub fn pe_align_up(val: i64, align: i64) -> i64 {
     return (val + align - 1) & (~(align - 1));
+}
+
+/// ImageBase of a UEFI application. The firmware loads it where it likes
+/// and applies the .reloc section (pe_build_efi).
+pub const PE_EFI_IMAGE_BASE: i64 = 0x400000;
+/// PE subsystem of a UEFI application (EFI_APPLICATION)
+pub const PE_SUBSYSTEM_EFI_APPLICATION: i64 = 10;
+
+/// A UEFI application (`fid emit --uefi`, pe_ir_generate_uefi): PE32+,
+/// machine AMD64, subsystem EFI_APPLICATION, no imports (the firmware hands
+/// the entry point its system table), three sections:
+///   .text   RVA 0x1000: the flat binary's code, `code_size` bytes (a
+///           multiple of 4 KB); the entry point is its first byte
+///   .data   right after it: the rest of `flat` (strings, globals, the
+///           allocator state), read/write
+///   .reloc  DIR64 base relocations of `abs`: offsets in `flat` of 8-byte
+///           absolute addresses linked at PE_EFI_IMAGE_BASE
+/// The relocations are kept (no IMAGE_FILE_RELOCS_STRIPPED), so the image
+/// loads at any address.
+pub fn pe_build_efi(flat: Vec, code_size: i64, abs: Vec<i64>) -> Vec<i64> {
+    // TG13: a layout over image_writer (pe_build_efi_img; the old body,
+    // checked byte for byte against it on Nov 17, is gone:
+    // docs/image-writer.md)
+    return pe_build_efi_img(flat, code_size, abs);
+}
+
+/// TG13: pe_build_efi as a layout over image_writer (same bytes): the
+/// DOS stub, COFF header, PE32+ optional header (subsystem
+/// EFI_APPLICATION, DYNAMIC_BASE | NX_COMPAT, the base relocation table in
+/// directory 5), .text, .data and .reloc.
+fn pe_build_efi_img(flat: Vec, code_size: i64, abs: Vec<i64>) -> Vec<i64> {
+    var data_len: i64 = flat.len() - code_size;
+    var data_rva: i64 = PE_TEXT_RVA + code_size;
+    var reloc: Vec<i64> = pe_efi_relocs(abs);
+    var reloc_rva: i64 = data_rva + pe_align_up(data_len, PE_SECTION_ALIGN);
+    var size_of_image: i64 = reloc_rva + pe_align_up(reloc.len(), PE_SECTION_ALIGN);
+    // DOS(64) + signature(4) + COFF(20) + optional(240) + 3 sections(120)
+    var header_size: i64 = pe_align_up(64 + 4 + 20 + 240 + 3 * 40, PE_FILE_ALIGN);
+    var text_raw: i64 = pe_align_up(code_size, PE_FILE_ALIGN);
+    var data_raw: i64 = pe_align_up(data_len, PE_FILE_ALIGN);
+    var reloc_raw: i64 = pe_align_up(reloc.len(), PE_FILE_ALIGN);
+    var text_off: i64 = header_size;
+    var data_off: i64 = text_off + text_raw;
+    var reloc_off: i64 = data_off + data_raw;
+    var pe: Vec<i64> = Vec::new();
+    img_pe_dos(& mut pe, false);
+    img_pe_signature(& mut pe);
+    img_coff_header(& mut pe, 0x8664, 3, 0, 0, 240, 0x0022);
+    // AMD64; EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE (relocations kept)
+    var o: ImgPeOpt = ImgPeOpt {
+        linker_major: 14, code_size: text_raw, init_size: data_raw + reloc_raw, entry: PE_TEXT_RVA, base_of_code: PE_TEXT_RVA, image_base: PE_EFI_IMAGE_BASE, sect_align: PE_SECTION_ALIGN, file_align: PE_FILE_ALIGN, os_major: 0, subsys_major: 0, image_size: size_of_image, header_size: header_size, subsystem: PE_SUBSYSTEM_EFI_APPLICATION, dll_chars: 0x0140, stack_reserve: 0x100000, stack_commit: 0x1000, heap_reserve: 0x100000, heap_commit: 0x1000
+    };
+    var dirs: Vec<i64> = img_pe_dirs();
+    img_pe_dir(& mut dirs, 5, reloc_rva, reloc.len());
+    img_pe_optional(& mut pe, & o, & dirs);
+    img_pe_section(& mut pe, ".text", code_size, PE_TEXT_RVA, text_raw, text_off, 0x60000020);
+    // CODE | EXECUTE | READ
+    img_pe_section(& mut pe, ".data", data_len, data_rva, data_raw, data_off, 0xC0000040);
+    // INITIALIZED_DATA | READ | WRITE
+    img_pe_section(& mut pe, ".reloc", reloc.len(), reloc_rva, reloc_raw, reloc_off, 0x42000040);
+    // INITIALIZED_DATA | DISCARDABLE | READ
+    img_pad_to(& mut pe, header_size);
+    var i: i64 = 0;
+    while i < code_size {
+        pe.push(flat.get(i));
+        i = i + 1;
+    }
+    img_pad_to(& mut pe, data_off);
+    while i < flat.len() {
+        pe.push(flat.get(i));
+        i = i + 1;
+    }
+    img_pad_to(& mut pe, reloc_off);
+    img_append(& mut pe, & reloc);
+    img_pad_to(& mut pe, reloc_off + reloc_raw);
+    return pe;
+}
+
+/// The .reloc section of a UEFI image: one block per 4 KB page of DIR64
+/// entries (type 10) for each offset in `abs` (RVA = PE_TEXT_RVA + offset),
+/// each block padded to 4 bytes with an ABSOLUTE entry. Without any, one
+/// block of padding only: the image still says it can be relocated.
+pub fn pe_efi_relocs(abs: Vec<i64>) -> Vec<i64> {
+    // TG13: the blocks from image_writer (the old body, checked byte for
+    // byte against it on Nov 17, is gone: docs/image-writer.md)
+    var at: Vec<i64> = Vec::new();
+    var a: i64 = 0;
+    while a < abs.len() {
+        at.push(PE_TEXT_RVA + abs.get(a));
+        a = a + 1;
+    }
+    return img_pe_base_relocs(& at, PE_TEXT_RVA);
 }
 
 /// Build a complete PE32+ executable from .text and .rdata section data
 pub fn pe_build_file(text: Vec<i64>, rdata: Vec<i64>, entry_point_rva: i64, import_dir_rva: i64, iat_rva: i64, iat_size: i64, rdata_rva: i64) -> Vec<i64> {
+    // TG13: a layout over image_writer (pe_build_file_img; the old body,
+    // checked byte for byte against it on Nov 17, is gone:
+    // docs/image-writer.md)
+    return pe_build_file_img(& text, & rdata, entry_point_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
+}
+
+/// TG13: pe_build_file as a layout over image_writer (same bytes): a full
+/// DOS header, COFF header, PE32+ optional header (console, 4 GB stack
+/// reserve, imports in directories 1 and 12), .text and .rdata.
+pub fn pe_build_file_img(text: & Vec<i64>, rdata: & Vec<i64>, entry_point_rva: i64, import_dir_rva: i64, iat_rva: i64, iat_size: i64, rdata_rva: i64) -> Vec<i64> {
     var pe: Vec<i64> = Vec::new();
-
-    // Header size: DOS(64) + PE sig(4) + COFF(20) + Optional(240) + 2
-    // sections(80) = 408 bytes, aligned up to FILE_ALIGN (512).
+    // DOS(64) + PE sig(4) + COFF(20) + Optional(240) + 2 sections(80),
+    // aligned up to FILE_ALIGN: 512
     var header_size: i64 = pe_align_up(64 + 4 + 20 + 240 + 2 * 40, PE_FILE_ALIGN);
-    // = 512
-
-    // Section sizes (aligned to FILE_ALIGN for raw data)
     var text_raw_size: i64 = pe_align_up(text.len(), PE_FILE_ALIGN);
     var rdata_raw_size: i64 = pe_align_up(rdata.len(), PE_FILE_ALIGN);
-
-    // Virtual sizes (aligned to SECTION_ALIGN)
     var text_virt_size: i64 = pe_align_up(text.len(), PE_SECTION_ALIGN);
     var rdata_virt_size: i64 = pe_align_up(rdata.len(), PE_SECTION_ALIGN);
-
-    // SizeOfImage: headers + .text + .rdata (aligned)
     var size_of_image: i64 = pe_align_up(header_size, PE_SECTION_ALIGN) + text_virt_size + rdata_virt_size;
-
-    // ─── DOS Header (64 bytes) ───
-    pe = pe_push_u16(pe, 0x5A4D);
-    // e_magic = "MZ"
-    pe = pe_push_u16(pe, 0x90);
-    // e_cblp
-    pe = pe_push_u16(pe, 0x03);
-    // e_cp
-    pe = pe_push_u16(pe, 0);
-    // e_crlc
-    pe = pe_push_u16(pe, 0x04);
-    // e_cparhdr
-    pe = pe_push_u16(pe, 0);
-    // e_minalloc
-    pe = pe_push_u16(pe, 0xFFFF);
-    // e_maxalloc
-    pe = pe_push_u16(pe, 0);
-    // e_ss
-    pe = pe_push_u16(pe, 0xB8);
-    // e_sp
-    pe = pe_push_u16(pe, 0);
-    // e_csum
-    pe = pe_push_u16(pe, 0);
-    // e_ip
-    pe = pe_push_u16(pe, 0);
-    // e_cs
-    pe = pe_push_u16(pe, 0x40);
-    // e_lfarlc
-    pe = pe_push_u16(pe, 0);
-    // e_ovno
-    var z: i64 = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // e_res
-    pe = pe_push_u16(pe, 0);
-    // e_oemid
-    pe = pe_push_u16(pe, 0);
-    // e_oeminfo
-    z = 0;
-    while z < 20 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // e_res2
-    pe = pe_push_u32(pe, 64);
-    // e_lfanew = 64
-
-    // ─── PE Signature (4 bytes) ───
-    pe = pe_push_str(pe, "PE");
-    pe.push(0);
-    pe.push(0);
-
-    // ─── COFF Header (20 bytes) ───
-    pe = pe_push_u16(pe, 0x8664);
-    // Machine = AMD64
-    pe = pe_push_u16(pe, 2);
-    // NumberOfSections = 2 (.text, .rdata)
-    pe = pe_push_u32(pe, 0);
-    // TimeDateStamp
-    pe = pe_push_u32(pe, 0);
-    // PointerToSymbolTable
-    pe = pe_push_u32(pe, 0);
-    // NumberOfSymbols
-    pe = pe_push_u16(pe, 240);
-    // SizeOfOptionalHeader (PE32+)
-    pe = pe_push_u16(pe, 0x0022);
-    // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
-
-    // ─── Optional Header PE32+ (240 bytes) ───
-    // Standard fields (24 bytes)
-    pe = pe_push_u16(pe, 0x020B);
-    // Magic = PE32+
-    pe.push(14);
-    // MajorLinkerVersion
-    pe.push(0);
-    // MinorLinkerVersion
-    pe = pe_push_u32(pe, text_raw_size);
-    // SizeOfCode
-    pe = pe_push_u32(pe, rdata_raw_size);
-    // SizeOfInitializedData
-    pe = pe_push_u32(pe, 0);
-    // SizeOfUninitializedData
-    pe = pe_push_u32(pe, entry_point_rva);
-    // AddressOfEntryPoint
-    pe = pe_push_u32(pe, PE_TEXT_RVA);
-    // BaseOfCode
-
-    // Windows-specific fields (88 bytes)
-    pe = pe_push_u64(pe, PE_IMAGE_BASE);
-    // ImageBase
-    pe = pe_push_u32(pe, PE_SECTION_ALIGN);
-    // SectionAlignment
-    pe = pe_push_u32(pe, PE_FILE_ALIGN);
-    // FileAlignment
-    pe = pe_push_u16(pe, 6);
-    // MajorOperatingSystemVersion
-    pe = pe_push_u16(pe, 0);
-    // MinorOperatingSystemVersion
-    pe = pe_push_u16(pe, 0);
-    // MajorImageVersion
-    pe = pe_push_u16(pe, 0);
-    // MinorImageVersion
-    pe = pe_push_u16(pe, 6);
-    // MajorSubsystemVersion
-    pe = pe_push_u16(pe, 0);
-    // MinorSubsystemVersion
-    pe = pe_push_u32(pe, 0);
-    // Win32VersionValue
-    pe = pe_push_u32(pe, size_of_image);
-    // SizeOfImage
-    pe = pe_push_u32(pe, header_size);
-    // SizeOfHeaders
-    pe = pe_push_u32(pe, 0);
-    // CheckSum
-    pe = pe_push_u16(pe, 3);
-    // Subsystem = CONSOLE
-    pe = pe_push_u16(pe, 0x0000);
-    // DllCharacteristics: none (testing)
-    pe = pe_push_u64(pe, 0x100000000);
-    // SizeOfStackReserve = 4GB (native frames are large: one slot per IR value, no reuse — deep recursion in checker/parser needs it)
-    pe = pe_push_u64(pe, 0x100000);
-    // SizeOfStackCommit = 1MB
-    pe = pe_push_u64(pe, 0x100000);
-    // SizeOfHeapReserve
-    pe = pe_push_u64(pe, 0x1000);
-    // SizeOfHeapCommit
-    pe = pe_push_u32(pe, 0);
-    // LoaderFlags
-    pe = pe_push_u32(pe, 16);
-    // NumberOfRvaAndSizes
-
-    // Data directories (16 x 8 = 128 bytes)
-    // Entry 0: Export Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 1: Import Table
-    pe = pe_push_u32(pe, import_dir_rva);
-    pe = pe_push_u32(pe, 20);
-    // size = 1 descriptor + null = 20 bytes
-    // Entry 2: Resource Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 3: Exception Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 4: Certificate Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 5: Base Relocation Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 6: Debug
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 7: Architecture
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 8: Global Ptr
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 9: TLS Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 10: Load Config Table
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 11: Bound Import
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 12: IAT
-    pe = pe_push_u32(pe, iat_rva);
-    pe = pe_push_u32(pe, iat_size);
-    // Entry 13: Delay Import Descriptor
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 14: CLR Runtime Header
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-    // Entry 15: Reserved
-    z = 0;
-    while z < 8 {
-        pe.push(0);
-        z = z + 1;
-    }
-
-    // ─── Section Headers ───
-    // .text section (40 bytes)
-    pe = pe_push_str(pe, ".text");
-    pe.push(0);
-    pe.push(0);
-    pe.push(0);
-    // Name (8 bytes)
-    pe = pe_push_u32(pe, text_virt_size);
-    // VirtualSize
-    pe = pe_push_u32(pe, PE_TEXT_RVA);
-    // VirtualAddress
-    pe = pe_push_u32(pe, text_raw_size);
-    // SizeOfRawData
-    pe = pe_push_u32(pe, PE_FILE_ALIGN);
-    // PointerToRawData
-    pe = pe_push_u32(pe, 0);
-    // PointerToRelocations
-    pe = pe_push_u32(pe, 0);
-    // PointerToLinenumbers
-    pe = pe_push_u16(pe, 0);
-    // NumberOfRelocations
-    pe = pe_push_u16(pe, 0);
-    // NumberOfLinenumbers
-    pe = pe_push_u32(pe, 0x60000020);
-    // Characteristics: CODE|EXECUTE|READ
-
-    // .rdata section (40 bytes)
-    pe = pe_push_str(pe, ".rdata");
-    pe.push(0);
-    pe.push(0);
-    // Name (8 bytes)
-    pe = pe_push_u32(pe, rdata_virt_size);
-    // VirtualSize
-    pe = pe_push_u32(pe, rdata_rva);
-    // VirtualAddress
-    pe = pe_push_u32(pe, rdata_raw_size);
-    // SizeOfRawData
-    pe = pe_push_u32(pe, PE_FILE_ALIGN + text_raw_size);
-    // PointerToRawData
-    pe = pe_push_u32(pe, 0);
-    // PointerToRelocations
-    pe = pe_push_u32(pe, 0);
-    // PointerToLinenumbers
-    pe = pe_push_u16(pe, 0);
-    // NumberOfRelocations
-    pe = pe_push_u16(pe, 0);
-    // NumberOfLinenumbers
-    pe = pe_push_u32(pe, 0xC0000040);
-    // Characteristics: INITIALIZED_DATA|READ|WRITE (IAT needs write)
-
-    // Pad headers to FILE_ALIGN
-    while pe.len() < header_size {
-        pe.push(0);
-    }
-
-    // ─── .text section data ───
-    var ti: i64 = 0;
-    while ti < text.len() {
-        pe.push(text.get(ti));
-        ti = ti + 1;
-    } while pe.len() < header_size + text_raw_size {
-        pe.push(0);
-    }
-
-    // ─── .rdata section data ───
-    var ri: i64 = 0;
-    while ri < rdata.len() {
-        pe.push(rdata.get(ri));
-        ri = ri + 1;
-    } while pe.len() < header_size + text_raw_size + rdata_raw_size {
-        pe.push(0);
-    }
-
+    img_pe_dos(& mut pe, true);
+    img_pe_signature(& mut pe);
+    img_coff_header(& mut pe, 0x8664, 2, 0, 0, 240, 0x0022);
+    // AMD64, .text and .rdata; EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    // The stack reserve is 4 GB: native frames are large (one slot per IR
+    // value, no reuse) and the checker and parser recurse deeply
+    var o: ImgPeOpt = ImgPeOpt {
+        linker_major: 14, code_size: text_raw_size, init_size: rdata_raw_size, entry: entry_point_rva, base_of_code: PE_TEXT_RVA, image_base: PE_IMAGE_BASE, sect_align: PE_SECTION_ALIGN, file_align: PE_FILE_ALIGN, os_major: 6, subsys_major: 6, image_size: size_of_image, header_size: header_size, subsystem: 3, dll_chars: 0, stack_reserve: 0x100000000, stack_commit: 0x100000, heap_reserve: 0x100000, heap_commit: 0x1000
+    };
+    var dirs: Vec<i64> = img_pe_dirs();
+    img_pe_dir(& mut dirs, 1, import_dir_rva, 20);
+    // one descriptor + the null one
+    img_pe_dir(& mut dirs, 12, iat_rva, iat_size);
+    img_pe_optional(& mut pe, & o, & dirs);
+    img_pe_section(& mut pe, ".text", text_virt_size, PE_TEXT_RVA, text_raw_size, PE_FILE_ALIGN, 0x60000020);
+    // CODE | EXECUTE | READ
+    img_pe_section(& mut pe, ".rdata", rdata_virt_size, rdata_rva, rdata_raw_size, PE_FILE_ALIGN + text_raw_size, 0xC0000040);
+    // INITIALIZED_DATA | READ | WRITE (the IAT is written)
+    img_pad_to(& mut pe, header_size);
+    img_append(& mut pe, text);
+    img_pad_to(& mut pe, header_size + text_raw_size);
+    img_append(& mut pe, rdata);
+    img_pad_to(& mut pe, header_size + text_raw_size + rdata_raw_size);
     return pe;
+}
+
+// ===========================================================================
+// COFF symbol table (own-backend roadmap DB3, first step)
+// ===========================================================================
+
+/// File offsets in the COFF header of a pe_build_file image (DOS header 64
+/// bytes, "PE\0\0" 4, then Machine, NumberOfSections, TimeDateStamp).
+pub const PE_COFF_SYMTAB_PTR_AT: i64 = 76; pub const PE_COFF_NSYMS_AT: i64 = 80;
+
+fn pe_sym_u16(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 0xFF);
+    out.push((v >> 8) & 0xFF);
+}
+
+fn pe_sym_u32(out: & mut Vec<i64>, v: i64) {
+    pe_sym_u16(out, v);
+    pe_sym_u16(out, v >> 16);
+}
+
+/// Append a COFF symbol table to `image`, one function symbol per entry of
+/// `names` at .text offset `offs[i]`, and point the COFF header at it.
+/// The table goes after the last section (the loader maps sections only,
+/// so it is not part of the image in memory), as MinGW's linker writes it:
+/// llvm-nm, llvm-objdump -t, dumpbin /symbols and gdb name our functions
+/// from it. It is not a PDB: Visual Studio and WinDbg want one (DB3, left).
+/// Record (18 bytes): Name (8: inline when at most 8 bytes, else 0 then the
+/// string table offset), Value (offset in the section), SectionNumber 1
+/// (.text), Type 0x20 (function), StorageClass 2 (external), 0 aux records.
+/// Then the string table: its size (4 bytes, counted) and NUL-ended names.
+pub fn pe_append_coff_symbols(image: & mut Vec<i64>, names: Vec<str>, offs: Vec<i64>) {
+    pe_append_coff_symbols_pre(image, Vec::new(), names, offs);
+}
+
+/// pe_append_coff_symbols with the string table starting with the names
+/// `pre` (DB3: the long names of the debug sections, which their section
+/// headers name as "/4", "/18", ... : pe_add_debug_sections).
+pub fn pe_append_coff_symbols_pre(image: & mut Vec<i64>, pre: Vec<str>, names: Vec<str>, offs: Vec<i64>) {
+    if (names.len() == 0 && pre.len() == 0) || names.len() != offs.len() {
+        return;
+    }
+    // TG13: the records and string table from image_writer (global
+    // functions of section 1, .text; the old body, checked byte for byte
+    // against it on Nov 17, is gone: docs/image-writer.md)
+    var none: Vec<i64> = Vec::new();
+    var syms: Vec<ImgSym> = img_func_syms(& names, & offs, & none, 0, 1, IMG_GLOBAL);
+    img_coff_symbols(image, & pre, & syms, PE_COFF_SYMTAB_PTR_AT, PE_COFF_NSYMS_AT);
+}
+
+// ===========================================================================
+// DWARF line tables in the image (own-backend roadmap DB3; release N9,
+// competitive TL5). A debug build (pe_lines_setup) gets .debug_abbrev,
+// .debug_info and .debug_line sections after .rdata, as MinGW's linker
+// writes them: gdb, lldb and llvm-dwarfdump read DWARF from a PE image, so
+// they show the input file's functions and lines. The names are longer than
+// 8 bytes: each header says "/<offset>" into the COFF string table, which
+// starts with them (pe_append_coff_symbols_pre). A PDB (what Visual Studio
+// and WinDbg read) is not written yet.
+// ===========================================================================
+
+/// The DWARF sections pe_add_debug_sections adds, in that order (N9:
+/// pe_add_dwarf adds the fourth, .debug_frame, too; a three-section image
+/// leaves its name unused in the string table).
+pub fn pe_dwarf_section_names() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(".debug_abbrev");
+    v.push(".debug_info");
+    v.push(".debug_line");
+    v.push(".debug_frame");
+    return v;
+}
+
+fn pe_dw_u64(out: & mut Vec<i64>, v: i64) {
+    pe_sym_u32(out, v);
+    pe_sym_u32(out, v >> 32);
+}
+
+fn pe_dw_str(out: & mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    out.push(0);
+}
+
+fn pe_dw_uleb(out: & mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    while true {
+        var b: i64 = x & 127;
+        x = x >> 7;
+        if x == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 128);
+    }
+}
+
+fn pe_dw_sleb(out: & mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    while true {
+        var b: i64 = x & 127;
+        x = x >> 7;
+        if (x == 0 && (b & 64) == 0) || (x == 0 - 1 && (b & 64) != 0) {
+            out.push(b);
+            return;
+        }
+        out.push(b | 128);
+    }
+}
+
+pub fn pe_get_u32(v: & Vec<i64>, at: i64) -> i64 {
+    return v.get(at) | (v.get(at + 1) << 8) | (v.get(at + 2) << 16) | (v.get(at + 3) << 24);
+}
+
+pub fn pe_set_u32(v: & mut Vec<i64>, at: i64, val: i64) {
+    var i: i64 = 0;
+    while i < 4 {
+        v.set(at + i, (val >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+/// The address of .text offset `off` in the loaded image.
+fn pe_dw_addr(off: i64) -> i64 {
+    return PE_IMAGE_BASE + PE_TEXT_RVA + off;
+}
+
+/// .debug_abbrev: 1 the compile unit (producer, language, name, low_pc,
+/// high_pc as a length, stmt_list), 2 a function (name, low_pc, high_pc,
+/// external). The same as nat_enc.fd's ELF debug sections.
+pub fn pe_dwarf_abbrev() -> Vec<i64> {
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(0x11);
+    a.push(1);
+    a.push(0x25);
+    a.push(0x08);
+    a.push(0x13);
+    a.push(0x05);
+    a.push(0x03);
+    a.push(0x08);
+    a.push(0x11);
+    a.push(0x01);
+    a.push(0x12);
+    a.push(0x07);
+    a.push(0x10);
+    a.push(0x17);
+    a.push(0);
+    a.push(0);
+    a.push(2);
+    a.push(0x2E);
+    a.push(0);
+    a.push(0x03);
+    a.push(0x08);
+    a.push(0x11);
+    a.push(0x01);
+    a.push(0x12);
+    a.push(0x07);
+    a.push(0x3F);
+    a.push(0x19);
+    a.push(0);
+    a.push(0);
+    a.push(0);
+    return a;
+}
+
+/// .debug_info (DWARF 4): the compile unit of `file`, a function entry per
+/// [names, starts, ends) (.text offsets, in address order).
+pub fn pe_dwarf_info(file: str, names: Vec<str>, starts: Vec<i64>, ends: Vec<i64>) -> Vec<i64> {
+    var info: Vec<i64> = Vec::new();
+    pe_sym_u32(& mut info, 0);
+    // unit length, set below
+    pe_sym_u16(& mut info, 4);
+    pe_sym_u32(& mut info, 0);
+    // abbrev offset
+    info.push(8);
+    info.push(1);
+    pe_dw_str(& mut info, "fid (Fides)");
+    pe_sym_u16(& mut info, 0x0C);
+    // DW_LANG_C99: what debuggers expect
+    if file == "" {
+        pe_dw_str(& mut info, "fides");
+    } else {
+        pe_dw_str(& mut info, file);
+    }
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    if starts.len() > 0 && ends.len() > 0 {
+        lo = starts.get(0);
+        hi = ends.get(ends.len() - 1);
+    }
+    pe_dw_u64(& mut info, pe_dw_addr(lo));
+    pe_dw_u64(& mut info, hi - lo);
+    pe_sym_u32(& mut info, 0);
+    // the line program at .debug_line + 0
+    var i: i64 = 0;
+    while i < names.len() && i < starts.len() && i < ends.len() {
+        info.push(2);
+        pe_dw_str(& mut info, names.get(i));
+        pe_dw_u64(& mut info, pe_dw_addr(starts.get(i)));
+        pe_dw_u64(& mut info, ends.get(i) - starts.get(i));
+        i = i + 1;
+    }
+    info.push(0);
+    pe_set_u32(& mut info, 0, info.len() - 4);
+    return info;
+}
+
+/// .debug_line (DWARF 4) of the rows [.text offset, line, end?]: one file,
+/// a sequence per function (an end row closes it).
+pub fn pe_dwarf_line(file: str, rows: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    pe_sym_u32(& mut out, 0);
+    // unit length, set below
+    pe_sym_u16(& mut out, 4);
+    pe_sym_u32(& mut out, 0);
+    // header length, set below
+    var hstart: i64 = out.len();
+    out.push(1);
+    // minimum instruction length
+    out.push(1);
+    // maximum operations per instruction
+    out.push(1);
+    // default is_stmt
+    out.push(0xFB);
+    // line_base -5
+    out.push(14);
+    // line_range
+    out.push(13);
+    // opcode_base, then the standard opcodes' operand counts
+    out.push(0);
+    out.push(1);
+    out.push(1);
+    out.push(1);
+    out.push(1);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    out.push(1);
+    out.push(0);
+    out.push(0);
+    out.push(1);
+    out.push(0);
+    // no include directories
+    pe_dw_str(& mut out, file);
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    // directory, time, size
+    out.push(0);
+    pe_set_u32(& mut out, 6, out.len() - hstart);
+    var open: bool = false;
+    var addr: i64 = 0;
+    var line: i64 = 1;
+    var i: i64 = 0;
+    while i + 2 < rows.len() {
+        var at: i64 = pe_dw_addr(rows.get(i));
+        var l: i64 = rows.get(i + 1);
+        if rows.get(i + 2) == 1 {
+            if open {
+                out.push(0x02);
+                pe_dw_uleb(& mut out, at - addr);
+                // advance_pc
+                out.push(0);
+                out.push(1);
+                out.push(1);
+                // end_sequence
+                open = false;
+                line = 1;
+            }
+        } else {
+            if !open {
+                out.push(0);
+                out.push(9);
+                out.push(2);
+                // set_address
+                pe_dw_u64(& mut out, at);
+                addr = at;
+                open = true;
+            } else if at != addr {
+                out.push(0x02);
+                pe_dw_uleb(& mut out, at - addr);
+                addr = at;
+            }
+            if l != line {
+                out.push(0x03);
+                pe_dw_sleb(& mut out, l - line);
+                // advance_line
+                line = l;
+            }
+            out.push(0x01);
+            // copy
+        }
+        i = i + 3;
+    }
+    pe_set_u32(& mut out, 0, out.len() - 4);
+    return out;
+}
+
+/// One debug section: header `k` (after .text and .rdata), its data at the
+/// end of the file (file-aligned), at `rva` in memory; returns the next RVA.
+fn pe_put_debug_section(out: & mut Vec<i64>, k: i64, name_off: i64, data: Vec<i64>, rva: i64) -> i64 {
+    while out.len() % PE_FILE_ALIGN != 0 {
+        out.push(0);
+    }
+    var pos: i64 = out.len();
+    var raw: i64 = pe_align_up(data.len(), PE_FILE_ALIGN);
+    var h: i64 = 408 + 40 * k;
+    var hn: str = "/" + int_to_str(name_off);
+    // TG13: the header from image_writer (its relocation and line number
+    // fields were zero already; the old body, checked byte for byte
+    // against it on Nov 17, is gone: docs/image-writer.md);
+    // INITIALIZED_DATA | MEM_DISCARDABLE | MEM_READ
+    img_pe_section_at(out, h, hn, data.len(), rva, raw, pos, 0x42000040);
+    img_append(out, & data);
+    img_pad_to(out, pos + raw);
+    return rva + pe_align_up(data.len(), PE_SECTION_ALIGN);
+}
+
+/// A pe_build_file image (two sections, 512 bytes of headers) with the
+/// three DWARF sections after .rdata. The headers grow to 1024 bytes for
+/// the five section headers: .text and .rdata move 512 bytes down the file
+/// (their addresses in memory do not change), SizeOfImage covers the new
+/// sections. Another image comes back as it is. The COFF string table
+/// with the section names is written after (pe_append_coff_symbols_pre).
+pub fn pe_add_debug_sections(image: Vec<i64>, abbrev: Vec<i64>, info: Vec<i64>, line: Vec<i64>) -> Vec<i64> {
+    var parts: Vec<Vec<i64>> = Vec::new();
+    parts.push(abbrev);
+    parts.push(info);
+    parts.push(line);
+    return pe_add_debug_sections_n(image, parts);
+}
+
+/// N9: pe_add_debug_sections with the sections `parts`, named in the
+/// order of pe_dwarf_section_names (at most its four: .debug_abbrev,
+/// .debug_info, .debug_line, .debug_frame). Three parts give the bytes
+/// pe_add_debug_sections always wrote.
+pub fn pe_add_debug_sections_n(image: Vec<i64>, parts: Vec<Vec<i64>>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var ok: bool = image.len() >= 2 * PE_FILE_ALIGN;
+    if ok {
+        ok = (image.get(70) | (image.get(71) << 8)) == 2 && pe_get_u32(& image, 148) == PE_FILE_ALIGN;
+    }
+    if !ok {
+        while i < image.len() {
+            out.push(image.get(i));
+            i = i + 1;
+        }
+        return out;
+    }
+    while i < PE_FILE_ALIGN {
+        out.push(image.get(i));
+        i = i + 1;
+    }
+    var z: i64 = 0;
+    while z < PE_FILE_ALIGN {
+        out.push(0);
+        z = z + 1;
+    }
+    while i < image.len() {
+        out.push(image.get(i));
+        i = i + 1;
+    }
+    pe_set_u32(& mut out, 148, 2 * PE_FILE_ALIGN);
+    // SizeOfHeaders
+    pe_set_u32(& mut out, 328 + 20, pe_get_u32(& out, 328 + 20) + PE_FILE_ALIGN);
+    pe_set_u32(& mut out, 368 + 20, pe_get_u32(& out, 368 + 20) + PE_FILE_ALIGN);
+    // .text and .rdata PointerToRawData
+    var rva: i64 = pe_align_up(pe_get_u32(& out, 368 + 12) + pe_get_u32(& out, 368 + 8), PE_SECTION_ALIGN);
+    var init0: i64 = pe_get_u32(& out, 96);
+    var names: Vec<str> = pe_dwarf_section_names();
+    var noff: i64 = 4;
+    var sinit: i64 = 0;
+    var k: i64 = 0;
+    while k < parts.len() && k < names.len() {
+        var part: Vec<i64> = parts.get(k);
+        rva = pe_put_debug_section(& mut out, k, noff, part, rva);
+        noff = noff + str_len(names.get(k)) + 1;
+        sinit = sinit + pe_align_up(part.len(), PE_FILE_ALIGN);
+        k = k + 1;
+    }
+    out.set(70, 2 + k);
+    out.set(71, 0);
+    // NumberOfSections
+    pe_set_u32(& mut out, 144, rva);
+    // SizeOfImage
+    pe_set_u32(& mut out, 96, init0 + sinit);
+    // SizeOfInitializedData
+    return out;
+}
+
+// --- N9 (DB4 for pe_ir): variables, types and frames ----------------------
+// A debug build of the default Windows backend describes, besides its
+// functions and lines, each function's parameters and variables with
+// their types (structs with their fields, str as text) and where they
+// are, and each function's frame, as the machine layer's images do: the
+// .debug_info and .debug_frame come from nat_enc.fd nat_dwarf_build, fed
+// what pe_ir.fd recorded (PeirGen_dbg_vars_note: g_nat_dbg_vars' format;
+// peir_dbg_type_descs: g_nat_dbg_types'). A variable's location is
+// "f<off>" (its frame slot at CFA + off: pe_ir keeps a debug build's
+// values in their rbp slots, CFA = rbp + 16 after the prologue
+// `push rbp; mov rbp, rsp`, which the FDE describes), "c<v>" (a constant)
+// or "" (shown as optimized out). FID_PE_OFF=dbgvars: the three sections
+// of pe_add_debug_sections only, as before.
+
+/// CT9: the functions whose debugger name differs from their symbol, as
+/// pairs [symbol, shown, ...] (compiler/nat_ir.fd ng_dbg_shown_pairs, set
+/// by compiler/main.fd before a pe_ir debug build); empty: every
+/// function shows its symbol.
+pub var g_pe_dbg_shown_pairs: Vec<str> = Vec::new();
+
+/// CT9: the name a debugger shows for each of `names`, in the same order
+/// (g_nat_dbg_shown's format): its g_pe_dbg_shown_pairs entry, else the
+/// symbol. Empty when no name differs.
+fn pe_dbg_shown_for(names: Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if g_pe_dbg_shown_pairs.len() == 0 {
+        return out;
+    }
+    // symbol -> index of its shown name + 1 (0: not there)
+    var idx: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k + 1 < g_pe_dbg_shown_pairs.len() {
+        HashMap_insert(idx, g_pe_dbg_shown_pairs.get(k), k + 2);
+        k = k + 2;
+    }
+    var any: bool = false;
+    var i: i64 = 0;
+    while i < names.len() {
+        var at: i64 = HashMap_get(idx, names.get(i));
+        if at > 0 {
+            out.push(g_pe_dbg_shown_pairs.get(at - 1));
+            any = true;
+        } else {
+            out.push(names.get(i));
+        }
+        i = i + 1;
+    }
+    if !any {
+        return Vec::new();
+    }
+    return out;
+}
+
+/// N9: `image` (a pe_build_file image whose .text is `code`) with the
+/// DWARF of a debug build: .debug_abbrev, .debug_info (functions with
+/// their declaration lines, parameters, variables and types), .debug_line
+/// (pe_dwarf_line of `rows`) and .debug_frame (an FDE per function).
+/// `vars` and `types` are in nat_enc.fd's g_nat_dbg_vars / g_nat_dbg_types
+/// formats (vars: one entry per name of `names`, same order). nat_enc's
+/// globals are set for the call and given back after.
+/// CT9: a function shows under its name as written (`Point::len` for
+/// `Point_len`, `max<i64>` for `max__i64`) when g_pe_dbg_shown_pairs
+/// names it (pe_dbg_shown_for).
+pub fn pe_add_dwarf(image: Vec<i64>, code: Vec<i64>, names: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, rows: Vec<i64>, file: str, vars: Vec<str>, types: Vec<str>) -> Vec<i64> {
+    var line: Vec<i64> = pe_dwarf_line(file, rows);
+    if vars.len() != names.len() {
+        return pe_add_debug_sections(image, pe_dwarf_abbrev(), pe_dwarf_info(file, names, starts, ends), line);
+    }
+    var old_ext: bool = g_nat_dbg_ext;
+    var old_vars: Vec<str> = g_nat_dbg_vars;
+    var old_types: Vec<str> = g_nat_dbg_types;
+    var old_shown: Vec<str> = g_nat_dbg_shown;
+    var old_files: Vec<str> = g_nat_line_files;
+    g_nat_dbg_ext = true;
+    g_nat_dbg_vars = vars;
+    g_nat_dbg_types = types;
+    g_nat_dbg_shown = pe_dbg_shown_for(names);
+    // pe_ir's rows name one file (field 3 is 0 or 1, the end bit): the
+    // declaration lines are read from `file`
+    g_nat_line_files = Vec::new();
+    var dw: NatDwarf = nat_dwarf_build(NAT_X64, code, PE_IMAGE_BASE + PE_TEXT_RVA, names, starts, ends, file, rows, Vec::new(), false);
+    g_nat_dbg_ext = old_ext;
+    g_nat_dbg_vars = old_vars;
+    g_nat_dbg_types = old_types;
+    g_nat_dbg_shown = old_shown;
+    g_nat_line_files = old_files;
+    var parts: Vec<Vec<i64>> = Vec::new();
+    parts.push(dw.abbrev);
+    parts.push(dw.info);
+    parts.push(line);
+    parts.push(dw.frame);
+    return pe_add_debug_sections_n(image, parts);
 }

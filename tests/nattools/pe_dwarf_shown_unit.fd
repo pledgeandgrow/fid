@@ -1,0 +1,132 @@
+// llvm-roadmap CT9 for pe_ir: a debug build of the default Windows backend
+// names each function as Fides writes it (`Point::len` for the symbol
+// `Point_len`) in .debug_info, as the machine layer's images do
+// (compiler/pe_ir_enc.fd g_pe_dbg_shown_pairs / pe_dbg_shown_for, filled
+// by compiler/main.fd from compiler/nat_ir.fd ng_dbg_shown_pairs; written
+// by nat_enc.fd nat_dwarf_build through g_nat_dbg_shown). A stand-in .text
+// with two functions goes through pe_add_dwarf with and without the pairs.
+// Run (from the repository root):
+//   fid run tests/nattools/pe_dwarf_shown_unit.fd
+// Expected output:
+// shown name true
+// symbol kept true
+// plain name false
+// plain symbol true
+// shown restored true
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::pe_ir_enc;
+
+fn Point_len(n: i64) -> i64 {
+    return n + 1;
+}
+
+fn helper_two(n: i64) -> i64 {
+    return n * 2;
+}
+
+/// A function of `n` bytes: push rbp; mov rbp, rsp; nops; pop rbp; ret.
+fn stand_in_fn(text: & mut Vec<i64>, n: i64) {
+    text.push(0x55);
+    text.push(0x48);
+    text.push(0x89);
+    text.push(0xE5);
+    var i: i64 = 4;
+    while i < n - 2 {
+        text.push(0x90);
+        i = i + 1;
+    }
+    text.push(0x5D);
+    text.push(0xC3);
+}
+
+/// `s` followed by its NUL somewhere in `img` (a DW_FORM_string or a
+/// .debug_str entry).
+fn has_cstr(img: & Vec<i64>, s: str) -> bool {
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i + n < img.len() {
+        var j: i64 = 0;
+        while j < n && img.get(i + j) == str_byte_at(s, j) {
+            j = j + 1;
+        }
+        if j == n && img.get(i + n) == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn build(text: Vec<i64>) -> Vec<i64> {
+    var rdata: Vec<i64> = Vec::new();
+    var r: i64 = 0;
+    while r < 64 {
+        rdata.push(0);
+        r = r + 1;
+    }
+    var names: Vec<str> = Vec::new();
+    names.push("Point_len");
+    names.push("helper_two");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(64);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    ends.push(128);
+    // rows [offset, line, end?]: each function's first byte on its `fn`
+    // line (22 and 26 of this file), then its body
+    var rows: Vec<i64> = Vec::new();
+    var spec: Vec<i64> = Vec::new();
+    spec.push(0);
+    spec.push(22);
+    spec.push(0);
+    spec.push(8);
+    spec.push(23);
+    spec.push(0);
+    spec.push(64);
+    spec.push(0);
+    spec.push(1);
+    spec.push(64);
+    spec.push(26);
+    spec.push(0);
+    spec.push(72);
+    spec.push(27);
+    spec.push(0);
+    spec.push(128);
+    spec.push(0);
+    spec.push(1);
+    var si: i64 = 0;
+    while si < spec.len() {
+        rows.push(spec.get(si));
+        si = si + 1;
+    }
+    var vars: Vec<str> = Vec::new();
+    vars.push("P\tn\ti64\t8\t5\tf-24");
+    vars.push("P\tn\ti64\t8\t5\tf-24");
+    var types: Vec<str> = Vec::new();
+    var file: str = "tests/nattools/pe_dwarf_shown_unit.fd";
+    var img0: Vec<i64> = pe_build_file(text, rdata, 0x1000, 0x2040, 0x2000, 24, 0x2000);
+    return pe_add_dwarf(img0, text, names, starts, ends, rows, file, vars, types);
+}
+
+fn main() {
+    var text: Vec<i64> = Vec::new();
+    stand_in_fn(& mut text, 64);
+    stand_in_fn(& mut text, 64);
+    var pairs: Vec<str> = Vec::new();
+    pairs.push("Point_len");
+    pairs.push("Point::len");
+    g_pe_dbg_shown_pairs = pairs;
+    var img: Vec<i64> = build(text);
+    println("shown name " + bool_to_str(has_cstr(& img, "Point::len")));
+    println("symbol kept " + bool_to_str(has_cstr(& img, "helper_two")));
+    // without the pairs every function shows its symbol, as before
+    g_pe_dbg_shown_pairs = Vec::new();
+    var img2: Vec<i64> = build(text);
+    println("plain name " + bool_to_str(has_cstr(& img2, "Point::len")));
+    println("plain symbol " + bool_to_str(has_cstr(& img2, "Point_len")));
+    println("shown restored " + bool_to_str(g_nat_dbg_shown.len() == 0));
+}

@@ -1,0 +1,107 @@
+// stdlib/iec61850: object-reference parse/build, functional-constraint
+// check, ASN.1 BER TLV + length forms, a GOOSE PDU round trip (gocbRef,
+// timeAllowedtoLive, datSet, stNum/sqNum, allData) and a Sampled Values
+// ASDU round trip.
+// Expected output:
+// ref: ld RelayPIOC1 ln XCBR1 do Pos da stVal
+// build: RelayPIOC1/XCBR1.Pos.q
+// fc ST valid: yes, fc ZZ valid: no
+// ber len 5: 05, len 200: 81c8, len 300: 82012c
+// ber int 0x300: 82020300 ; bool true: 0101ff
+// goose: ref SIED/LLN0$GO$gcb01 ttl 2000 dataset SIED/LLN0$DS stnum 7 sqnum 3 test 1 entries 2
+// goose allData values: 2, first bool yes
+// goose eth: appid 0x1000 len ok pdu starts 10
+// sv: id MU01 smpcnt 1234 confrev 1 synch 2 seqdata 8
+use iec61850;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn yn(b: bool) -> str {
+    if b { return "yes"; }
+    return "no";
+}
+
+fn main() {
+    val r: Iec61850Ref = iec61850_parse_ref("RelayPIOC1/XCBR1.Pos.stVal");
+    println("ref: ld " + r.ld + " ln " + r.ln + " do " + r.do_name + " da " + r.da);
+    println("build: " + iec61850_build_ref("RelayPIOC1", "XCBR1", "Pos", "q"));
+    println("fc ST valid: " + yn(iec61850_fc_valid("ST")) + ", fc ZZ valid: " + yn(iec61850_fc_valid("ZZ")));
+
+    // BER length forms
+    var l1: Vec<i64> = Vec::new();
+    ber_put_len(& mut l1, 5);
+    var l2: Vec<i64> = Vec::new();
+    ber_put_len(& mut l2, 200);
+    var l3: Vec<i64> = Vec::new();
+    ber_put_len(& mut l3, 300);
+    println("ber len 5: " + hx(l1) + ", len 200: " + hx(l2) + ", len 300: " + hx(l3));
+
+    // BER integer and bool
+    val bi: Vec<i64> = ber_int(0x82, 0x300);
+    val bb: Vec<i64> = ber_bool(0x01, true);
+    println("ber int 0x300: " + hx(bi) + " ; bool true: " + hx(bb));
+
+    // Build a GOOSE allData with two values: a boolean TRUE (tag 0x83) and a
+    // 32-bit float (tag 0x87 with the FloatingPoint encoding).
+    var all: Vec<i64> = Vec::new();
+    appendv(& mut all, & ber_bool(0x83, true));
+    appendv(& mut all, & ber_float32(0x87, 50.0));
+
+    val pdu: GoosePdu = GoosePdu {
+        gocb_ref: "SIED/LLN0$GO$gcb01", time_allowed_to_live: 2000,
+        dat_set: "SIED/LLN0$DS", go_id: "gcb01",
+        t_seconds: 1700000000, t_fraction: 0, t_quality: 0,
+        st_num: 7, sq_num: 3, test: true, conf_rev: 1, nds_com: false,
+        num_dataset_entries: 2, all_data: all,
+    };
+    val enc: Vec<i64> = goose_encode_pdu(& pdu);
+    val dec: GoosePdu = goose_decode_pdu(& enc);
+    println("goose: ref " + dec.gocb_ref + " ttl " + int_to_str(dec.time_allowed_to_live) + " dataset " + dec.dat_set + " stnum " + int_to_str(dec.st_num) + " sqnum " + int_to_str(dec.sq_num) + " test " + int_to_str(b2i(dec.test)) + " entries " + int_to_str(dec.num_dataset_entries));
+
+    // Walk the decoded allData: count the TLVs and read the first boolean
+    var count: i64 = 0;
+    var pos: i64 = 0;
+    var firstbool: bool = false;
+    while pos < dec.all_data.len() {
+        val t: BerTlv = ber_read(& dec.all_data, pos);
+        if !t.ok { break; }
+        if count == 0 {
+            firstbool = dec.all_data.get(t.content) != 0;
+        }
+        count = count + 1;
+        pos = t.next;
+    }
+    println("goose allData values: " + int_to_str(count) + ", first bool " + yn(firstbool));
+
+    // Ethernet payload
+    val eth: Vec<i64> = goose_frame_payload(0x1000, & enc);
+    val gf: GooseFrame = goose_frame_parse(& eth);
+    var lenok: str = "bad";
+    if gf.length == 8 + enc.len() { lenok = "ok"; }
+    println("goose eth: appid 0x" + int_to_hex(gf.appid) + " len " + lenok + " pdu starts " + int_to_str(gf.pdu_start));
+
+    // Sampled Values
+    var samples: Vec<i64> = Vec::new();
+    // seqData is implementation-defined bytes here (one 8-byte sample block)
+    var i: i64 = 0;
+    while i < 8 { samples.push(i); i = i + 1; }
+    val sv: SvAsdu = SvAsdu { sv_id: "MU01", smp_cnt: 1234, conf_rev: 1, smp_synch: 2, seq_data: samples };
+    val svenc: Vec<i64> = sv_encode(& sv);
+    val svdec: SvAsdu = sv_decode(& svenc);
+    println("sv: id " + svdec.sv_id + " smpcnt " + int_to_str(svdec.smp_cnt) + " confrev " + int_to_str(svdec.conf_rev) + " synch " + int_to_str(svdec.smp_synch) + " seqdata " + int_to_str(svdec.seq_data.len()));
+}
+
+fn appendv(out: & mut Vec<i64>, src: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < src.len() { out.push(src.get(i)); i = i + 1; }
+}
+
+fn b2i(b: bool) -> i64 {
+    if b { return 1; }
+    return 0;
+}

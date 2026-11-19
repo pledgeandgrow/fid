@@ -1,0 +1,328 @@
+// stdlib/nvme: queue entry bytes, PRPs, then the driver against a simulated NVMe controller.
+// Expected output:
+// read SQE: 02000500010000000000000000000000000000000000000000002000000000000000000000000000001000000000000007000000000000000000000000000000
+// CQE: cid 9 phase 1 sqhd 3 sqid 1 status LBA out of range dnr false
+// PRPs 1 KiB across a page: 69120 69632
+// PRPs 5 KiB: 69120 1048576 69632 73728
+// CAP: 64 entries, contiguous true, timeout 10000 ms, stride 0, NVM true, page 4096
+// doorbells q1: 4104 4108, with DSTRD 2: 4128 4144
+// init: ok, NVMe 1.4
+// controller: model "FIDES SIM NVME", serial "SIM123", firmware "1.0", max transfer 131072, 1 namespaces
+// namespace 1: 128 blocks of 512, 2 formats
+// set queues: granted 4 SQ 4 CQ
+// I/O queue 1: ok
+// write 10 blocks via a PRP list, read back: same 5120 bytes
+// 5 flushes on a 4-entry queue: all ok true, phase 0, cq head 3
+// unknown opcode: invalid opcode
+// read past the end: LBA out of range
+// block device: 128 blocks of 512, block 7 round trip: true
+use nvme;
+use vfs;
+use vec;
+use string;
+use encoding;
+
+// --- the simulated controller ---------------------------------------------------
+
+var sim_regs: HashMap<i64, i64> = HashMap::new();
+var sim_mem: HashMap<i64, i64> = HashMap::new();
+var sim_disk: HashMap<i64, i64> = HashMap::new();
+// per queue id: SQ base, SQ size, SQ head, its CQ id; CQ base, size, tail, phase
+var sim_sq_base: Vec<i64> = Vec::new();
+var sim_sq_size: Vec<i64> = Vec::new();
+var sim_sq_head: Vec<i64> = Vec::new();
+var sim_sq_cq: Vec<i64> = Vec::new();
+var sim_cq_base: Vec<i64> = Vec::new();
+var sim_cq_size: Vec<i64> = Vec::new();
+var sim_cq_tail: Vec<i64> = Vec::new();
+var sim_cq_phase: Vec<i64> = Vec::new();
+
+fn sim_get(m: & HashMap<i64, i64>, k: i64) -> i64 {
+    if m.contains(k) {
+        return m.get(k);
+    }
+    return 0;
+}
+
+fn sim_mem_rd(addr: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(sim_get(&sim_mem, addr + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn sim_mem_wr(addr: i64, data: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < data.len() {
+        sim_mem.insert(addr + i, data.get(i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn sim_put_ascii(addr: i64, s: str, n: i64) {
+    val b: Vec<i64> = str_bytes(str_pad_right(s, n, 32));
+    sim_mem_wr(addr, b);
+}
+
+fn sim_m64(addr: i64) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = 7;
+    while k >= 0 {
+        v = (v << 8) | sim_get(&sim_mem, addr + k);
+        k = k - 1;
+    }
+    return v;
+}
+
+fn sim_rd(off: i64) -> i64 {
+    return sim_get(&sim_regs, off);
+}
+
+fn sim_set_queue(qid: i64, sq: i64, sqsize: i64, cqid: i64) {
+    while sim_sq_base.len() <= qid {
+        sim_sq_base.push(0);
+        sim_sq_size.push(0);
+        sim_sq_head.push(0);
+        sim_sq_cq.push(0);
+    }
+    sim_sq_base.set(qid, sq);
+    sim_sq_size.set(qid, sqsize);
+    sim_sq_head.set(qid, 0);
+    sim_sq_cq.set(qid, cqid);
+}
+
+fn sim_set_cq(qid: i64, cq: i64, size: i64) {
+    while sim_cq_base.len() <= qid {
+        sim_cq_base.push(0);
+        sim_cq_size.push(0);
+        sim_cq_tail.push(0);
+        sim_cq_phase.push(1);
+    }
+    sim_cq_base.set(qid, cq);
+    sim_cq_size.set(qid, size);
+    sim_cq_tail.set(qid, 0);
+    sim_cq_phase.set(qid, 1);
+}
+
+/// The pages of a transfer from its PRPs.
+fn sim_pages(prp1: i64, prp2: i64, nbytes: i64) -> Vec<i64> {
+    var pages: Vec<i64> = Vec::new();
+    pages.push(prp1);
+    var covered: i64 = 4096 - prp1 % 4096;
+    if covered >= nbytes {
+        return pages;
+    }
+    if covered + 4096 >= nbytes {
+        pages.push(prp2);
+        return pages;
+    }
+    var e: i64 = prp2;
+    while covered < nbytes {
+        pages.push(sim_m64(e));
+        e = e + 8;
+        covered = covered + 4096;
+    }
+    return pages;
+}
+
+/// Execute one command; returns [status code, dw0].
+fn sim_command(qid: i64, c: NvmeCmd) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var sc: i64 = 0;
+    var dw0: i64 = 0;
+    if qid == 0 {
+        if c.opc == 6 && (c.cdw10 & 255) == 1 {
+            sim_mem.insert(c.prp1, 77);
+            sim_mem.insert(c.prp1 + 1, 29);
+            sim_put_ascii(c.prp1 + 4, "SIM123", 20);
+            sim_put_ascii(c.prp1 + 24, "FIDES SIM NVME", 40);
+            sim_put_ascii(c.prp1 + 64, "1.0", 8);
+            sim_mem.insert(c.prp1 + 77, 5);
+            sim_mem.insert(c.prp1 + 512, 102);
+            sim_mem.insert(c.prp1 + 513, 68);
+            sim_mem.insert(c.prp1 + 516, 1);
+        } else if c.opc == 6 && (c.cdw10 & 255) == 0 {
+            sim_mem.insert(c.prp1, 128);
+            sim_mem.insert(c.prp1 + 8, 128);
+            sim_mem.insert(c.prp1 + 16, 128);
+            sim_mem.insert(c.prp1 + 25, 1);
+            sim_mem.insert(c.prp1 + 26, 1);
+            sim_mem.insert(c.prp1 + 128 + 2, 12);
+            sim_mem.insert(c.prp1 + 132 + 2, 9);
+        } else if c.opc == 9 {
+            dw0 = 3 | (3 << 16);
+        } else if c.opc == 5 {
+            sim_set_cq(c.cdw10 & 65535, c.prp1, ((c.cdw10 >> 16) & 65535) + 1);
+        } else if c.opc == 1 {
+            sim_set_queue(c.cdw10 & 65535, c.prp1, ((c.cdw10 >> 16) & 65535) + 1, (c.cdw11 >> 16) & 65535);
+        } else {
+            sc = 1;
+        }
+    } else {
+        if c.opc == 0 {
+            sc = 0;
+        } else if c.opc == 1 || c.opc == 2 {
+            val nlb: i64 = (c.cdw12 & 65535) + 1;
+            val slba: i64 = c.cdw10 | (c.cdw11 << 32);
+            if slba + nlb > 128 {
+                sc = 128;
+            } else {
+                val n: i64 = nlb * 512;
+                val pages: Vec<i64> = sim_pages(c.prp1, c.prp2, n);
+                var done: i64 = 0;
+                var pi: i64 = 0;
+                while done < n {
+                    val a: i64 = pages.get(pi);
+                    var room: i64 = 4096 - a % 4096;
+                    var k: i64 = 0;
+                    while k < room && done < n {
+                        if c.opc == 1 {
+                            sim_disk.insert(slba * 512 + done, sim_get(&sim_mem, a + k));
+                        } else {
+                            sim_mem.insert(a + k, sim_get(&sim_disk, slba * 512 + done));
+                        }
+                        k = k + 1;
+                        done = done + 1;
+                    }
+                    pi = pi + 1;
+                }
+            }
+        } else {
+            sc = 1;
+        }
+    }
+    r.push(sc);
+    r.push(dw0);
+    return r;
+}
+
+fn sim_ring_sq(qid: i64, tail: i64) {
+    while sim_sq_head.get(qid) != tail {
+        val head: i64 = sim_sq_head.get(qid);
+        val e: Vec<i64> = sim_mem_rd(sim_sq_base.get(qid) + 64 * head, 64);
+        val c: NvmeCmd = nvme_sqe_parse(&e, 0);
+        val res: Vec<i64> = sim_command(qid, c);
+        val nh: i64 = (head + 1) % sim_sq_size.get(qid);
+        sim_sq_head.set(qid, nh);
+        val cq: i64 = sim_sq_cq.get(qid);
+        val t: i64 = sim_cq_tail.get(cq);
+        sim_mem_wr(sim_cq_base.get(cq) + 16 * t, nvme_cqe(res.get(1), nh, qid, c.cid, sim_cq_phase.get(cq), res.get(0), 0));
+        if t + 1 == sim_cq_size.get(cq) {
+            sim_cq_tail.set(cq, 0);
+            sim_cq_phase.set(cq, 1 - sim_cq_phase.get(cq));
+        } else {
+            sim_cq_tail.set(cq, t + 1);
+        }
+    }
+}
+
+fn sim_wr(off: i64, v: i64) -> i64 {
+    sim_regs.insert(off, v);
+    if off == 20 {
+        // CSTS.RDY follows CC.EN; enabling takes the admin queue registers
+        sim_regs.insert(28, v & 1);
+        if (v & 1) != 0 {
+            val aqa: i64 = sim_rd(36);
+            sim_set_queue(0, sim_rd(40) | (sim_rd(44) << 32), (aqa & 4095) + 1, 0);
+            sim_set_cq(0, sim_rd(48) | (sim_rd(52) << 32), ((aqa >> 16) & 4095) + 1);
+        }
+    }
+    if off >= 4096 {
+        val idx: i64 = (off - 4096) / 4;
+        if idx % 2 == 0 {
+            sim_ring_sq(idx / 2, v);
+        }
+    }
+    return 0;
+}
+
+fn sim_init() {
+    sim_regs.insert(0, 63 | 65536 | (20 << 24));
+    sim_regs.insert(4, 32);
+    sim_regs.insert(8, 66560);
+}
+
+fn main() {
+    var rc: NvmeCmd = nvme_cmd_rw(false, 1, 4096, 8, 2097152, 0);
+    rc.cid = 5;
+    println("read SQE: " + hex_encode_bytes(nvme_sqe(&rc)));
+    val ce: Vec<i64> = nvme_cqe(0, 3, 1, 9, 1, 128, 0);
+    val cp: NvmeCqe = nvme_cqe_parse(&ce, 0);
+    println("CQE: cid " + int_to_str(cp.cid) + " phase " + int_to_str(cp.phase) + " sqhd " + int_to_str(cp.sqhd) + " sqid " + int_to_str(cp.sqid) + " status " + nvme_status_str(&cp) + " dnr " + bool_to_str(cp.dnr));
+    println("PRPs 1 KiB across a page: " + str_join_ints(nvme_prps(69120, 1024, 1048576), " "));
+    println("PRPs 5 KiB: " + str_join_ints(nvme_prps(69120, 5120, 1048576), " "));
+
+    sim_init();
+    val bus: NvmeBus = NvmeBus { mmio_rd: sim_rd, mmio_wr: sim_wr, mem_rd: sim_mem_rd, mem_wr: sim_mem_wr };
+    val cap: NvmeCap = nvme_cap_decode(nvme_rd(&bus, NVME_REG_CAP), nvme_rd(&bus, NVME_REG_CAP + 4));
+    println("CAP: " + int_to_str(cap.mqes) + " entries, contiguous " + bool_to_str(cap.cqr) + ", timeout " + int_to_str(cap.timeout_ms) + " ms, stride " + int_to_str(cap.dstrd) + ", NVM " + bool_to_str(cap.css_nvm) + ", page " + int_to_str(cap.mpsmin));
+    println("doorbells q1: " + int_to_str(nvme_sq_doorbell(1, 0)) + " " + int_to_str(nvme_cq_doorbell(1, 0)) + ", with DSTRD 2: " + int_to_str(nvme_sq_doorbell(1, 2)) + " " + int_to_str(nvme_cq_doorbell(1, 2)));
+    var ctl: NvmeCtrl = nvme_init(&bus, 65536, 69632, 8);
+    var st: str = ctl.err;
+    if str_len(st) == 0 {
+        st = "ok";
+    }
+    println("init: " + st + ", NVMe " + nvme_version_str(ctl.version));
+
+    val ic: NvmeCqe = nvme_exec(&bus, &mut ctl.admin, nvme_cmd_identify(NVME_CNS_CONTROLLER, 0, 131072));
+    val idc: NvmeIdCtrl = nvme_id_ctrl_parse(&sim_mem_rd(131072, 4096));
+    if nvme_ok(&ic) {
+        println("controller: model \"" + idc.model + "\", serial \"" + idc.serial + "\", firmware \"" + idc.firmware + "\", max transfer " + int_to_str(nvme_max_transfer(&idc, cap.mpsmin)) + ", " + int_to_str(idc.nn) + " namespaces");
+    }
+    nvme_exec(&bus, &mut ctl.admin, nvme_cmd_identify(NVME_CNS_NAMESPACE, 1, 135168));
+    val ns: NvmeIdNs = nvme_id_ns_parse(&sim_mem_rd(135168, 256));
+    println("namespace 1: " + int_to_str(ns.nsze) + " blocks of " + int_to_str(ns.lba_size) + ", " + int_to_str(ns.nlbaf) + " formats");
+    val fq: NvmeCqe = nvme_exec(&bus, &mut ctl.admin, nvme_cmd_set_num_queues(4, 4));
+    println("set queues: granted " + int_to_str((fq.dw0 & 65535) + 1) + " SQ " + int_to_str(((fq.dw0 >> 16) & 65535) + 1) + " CQ");
+    var q: NvmeQueue = nvme_create_io_queues(&bus, &mut ctl, 1, 196608, 200704, 4);
+    if q.qid == 1 && str_len(ctl.err) == 0 {
+        println("I/O queue 1: ok");
+    }
+
+    var pat: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 5120 {
+        pat.push((i * 13 + 1) % 256);
+        i = i + 1;
+    }
+    sim_mem_wr(200192 + 4096, pat);
+    val w: NvmeCqe = nvme_rw(&bus, &mut q, true, 1, 20, 10, 512, 204288, 262144);
+    val r: NvmeCqe = nvme_rw(&bus, &mut q, false, 1, 20, 10, 512, 331264, 266240);
+    val back: Vec<i64> = sim_mem_rd(331264, 5120);
+    var same: bool = nvme_ok(&w) && nvme_ok(&r);
+    i = 0;
+    while i < 5120 {
+        if back.get(i) != pat.get(i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    println("write 10 blocks via a PRP list, read back: " + str_replace(bool_to_str(same), "true", "same 5120 bytes"));
+
+    var all: bool = true;
+    i = 0;
+    while i < 5 {
+        val f: NvmeCqe = nvme_exec(&bus, &mut q, nvme_cmd_flush(1));
+        if !nvme_ok(&f) {
+            all = false;
+        }
+        i = i + 1;
+    }
+    println("5 flushes on a 4-entry queue: all ok " + bool_to_str(all) + ", phase " + int_to_str(q.phase) + ", cq head " + int_to_str(q.cq_head));
+    val bad: NvmeCqe = nvme_exec(&bus, &mut q, nvme_cmd(127, 1));
+    println("unknown opcode: " + nvme_status_str(&bad));
+    val past: NvmeCqe = nvme_rw(&bus, &mut q, false, 1, 127, 2, 512, 331264, 266240);
+    println("read past the end: " + nvme_status_str(&past));
+
+    val dev: BlockDev = nvme_blockdev(bus, q, 1, &ns, 393216);
+    var blk: Vec<i64> = Vec::filled(512, 0);
+    blk.set(0, 1);
+    blk.set(511, 2);
+    blk_write(&dev, 7, blk);
+    val rb: Vec<i64> = blk_read(&dev, 7);
+    println("block device: " + int_to_str(dev.nblocks) + " blocks of " + int_to_str(dev.block_size) + ", block 7 round trip: " + bool_to_str(rb.get(0) == 1 && rb.get(511) == 2 && rb.get(5) == 0));
+}

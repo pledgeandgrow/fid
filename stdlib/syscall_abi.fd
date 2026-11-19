@@ -1,0 +1,648 @@
+// Linux system call ABI for x86-64, AArch64 and RISC-V 64: numbers,
+// register conventions, argument kinds, a dispatcher keyed by number that
+// validates arguments (file descriptors, sizes, user pointer ranges and
+// strings) before calling the kernel's handler, and errno mapping.
+//
+// What is real: the syscall numbers of a common subset of Linux calls on
+// each architecture (x86-64 syscall_64.tbl; AArch64 and RISC-V share the
+// asm-generic unistd.h table), the registers each ABI uses for the
+// number, the six arguments and the result, the trap instruction bytes,
+// the argument descriptions (which arguments are user buffers and which
+// argument holds their length, fixed-size user structs such as timespec
+// or struct stat, NUL-terminated paths), validation of user pointers
+// against the user address space's regions and their permissions,
+// copy_from_user / copy_to_user / strncpy_from_user over those regions,
+// errno numbers, names and messages (shared by the three architectures),
+// and the -4095..-1 error return convention of the kernel and of libc.
+//
+// The seam: the user address space is a UserSpace of regions whose bytes
+// are held here (a kernel would back uaccess with its page tables and
+// fault handling), and the work of each call is a handler function
+// fn(name: str, args: Vec<i64>) -> i64 that the kernel supplies; it
+// returns a value or -errno.
+module syscall_abi;
+ use vec;
+
+pub const ABI_X86_64: i64 = 0;
+pub const ABI_AARCH64: i64 = 1;
+pub const ABI_RISCV64: i64 = 2;
+
+// Argument kinds.
+pub const SARG_INT: i64 = 0;
+pub const SARG_FD: i64 = 1;
+pub const SARG_SIZE: i64 = 2;
+pub const SARG_FLAGS: i64 = 3;
+pub const SARG_ADDR: i64 = 4;
+// a user address the kernel does not dereference
+pub const SARG_IN: i64 = 5;
+// user buffer read, length in another argument
+pub const SARG_OUT: i64 = 6;
+// user buffer written, length in another argument
+pub const SARG_INPTR: i64 = 7;
+// fixed-size user struct read
+pub const SARG_OUTPTR: i64 = 8;
+// fixed-size user struct written
+pub const SARG_STR: i64 = 9;  // NUL-terminated user string
+
+pub const UPROT_READ: i64 = 1;
+pub const UPROT_WRITE: i64 = 2;
+
+pub const SYS_PATH_MAX: i64 = 4096;
+
+// ─── errno ──────────────────────────────────────────────────────────────
+
+pub const EPERM: i64 = 1;
+pub const ENOENT: i64 = 2;
+pub const ESRCH: i64 = 3;
+pub const EINTR: i64 = 4;
+pub const EIO: i64 = 5;
+pub const EBADF: i64 = 9;
+pub const ECHILD: i64 = 10;
+pub const EAGAIN: i64 = 11;
+pub const ENOMEM: i64 = 12;
+pub const EACCES: i64 = 13;
+pub const EFAULT: i64 = 14;
+pub const EBUSY: i64 = 16;
+pub const EEXIST: i64 = 17;
+pub const ENOTDIR: i64 = 20;
+pub const EISDIR: i64 = 21;
+pub const EINVAL: i64 = 22;
+pub const EMFILE: i64 = 24;
+pub const ENOSPC: i64 = 28;
+pub const ESPIPE: i64 = 29;
+pub const EROFS: i64 = 30;
+pub const EPIPE: i64 = 32;
+pub const ERANGE: i64 = 34;
+pub const ENAMETOOLONG: i64 = 36;
+pub const ENOSYS: i64 = 38;
+pub const ENOTEMPTY: i64 = 39;
+pub const ELOOP: i64 = 40;
+pub const ENOTSOCK: i64 = 88;
+pub const EOPNOTSUPP: i64 = 95;
+pub const EADDRINUSE: i64 = 98;
+pub const ECONNRESET: i64 = 104;
+pub const ETIMEDOUT: i64 = 110;
+pub const ECONNREFUSED: i64 = 111;
+
+fn errno_row(n: i64) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    if n == 1 { r.push("EPERM"); r.push("Operation not permitted"); }
+    if n == 2 { r.push("ENOENT"); r.push("No such file or directory"); }
+    if n == 3 { r.push("ESRCH"); r.push("No such process"); }
+    if n == 4 { r.push("EINTR"); r.push("Interrupted system call"); }
+    if n == 5 { r.push("EIO"); r.push("Input/output error"); }
+    if n == 6 { r.push("ENXIO"); r.push("No such device or address"); }
+    if n == 7 { r.push("E2BIG"); r.push("Argument list too long"); }
+    if n == 8 { r.push("ENOEXEC"); r.push("Exec format error"); }
+    if n == 9 { r.push("EBADF"); r.push("Bad file descriptor"); }
+    if n == 10 { r.push("ECHILD"); r.push("No child processes"); }
+    if n == 11 { r.push("EAGAIN"); r.push("Resource temporarily unavailable"); }
+    if n == 12 { r.push("ENOMEM"); r.push("Cannot allocate memory"); }
+    if n == 13 { r.push("EACCES"); r.push("Permission denied"); }
+    if n == 14 { r.push("EFAULT"); r.push("Bad address"); }
+    if n == 16 { r.push("EBUSY"); r.push("Device or resource busy"); }
+    if n == 17 { r.push("EEXIST"); r.push("File exists"); }
+    if n == 18 { r.push("EXDEV"); r.push("Invalid cross-device link"); }
+    if n == 19 { r.push("ENODEV"); r.push("No such device"); }
+    if n == 20 { r.push("ENOTDIR"); r.push("Not a directory"); }
+    if n == 21 { r.push("EISDIR"); r.push("Is a directory"); }
+    if n == 22 { r.push("EINVAL"); r.push("Invalid argument"); }
+    if n == 23 { r.push("ENFILE"); r.push("Too many open files in system"); }
+    if n == 24 { r.push("EMFILE"); r.push("Too many open files"); }
+    if n == 25 { r.push("ENOTTY"); r.push("Inappropriate ioctl for device"); }
+    if n == 27 { r.push("EFBIG"); r.push("File too large"); }
+    if n == 28 { r.push("ENOSPC"); r.push("No space left on device"); }
+    if n == 29 { r.push("ESPIPE"); r.push("Illegal seek"); }
+    if n == 30 { r.push("EROFS"); r.push("Read-only file system"); }
+    if n == 31 { r.push("EMLINK"); r.push("Too many links"); }
+    if n == 32 { r.push("EPIPE"); r.push("Broken pipe"); }
+    if n == 33 { r.push("EDOM"); r.push("Numerical argument out of domain"); }
+    if n == 34 { r.push("ERANGE"); r.push("Numerical result out of range"); }
+    if n == 35 { r.push("EDEADLK"); r.push("Resource deadlock avoided"); }
+    if n == 36 { r.push("ENAMETOOLONG"); r.push("File name too long"); }
+    if n == 38 { r.push("ENOSYS"); r.push("Function not implemented"); }
+    if n == 39 { r.push("ENOTEMPTY"); r.push("Directory not empty"); }
+    if n == 40 { r.push("ELOOP"); r.push("Too many levels of symbolic links"); }
+    if n == 88 { r.push("ENOTSOCK"); r.push("Socket operation on non-socket"); }
+    if n == 95 { r.push("EOPNOTSUPP"); r.push("Operation not supported"); }
+    if n == 98 { r.push("EADDRINUSE"); r.push("Address already in use"); }
+    if n == 104 { r.push("ECONNRESET"); r.push("Connection reset by peer"); }
+    if n == 110 { r.push("ETIMEDOUT"); r.push("Connection timed out"); }
+    if n == 111 { r.push("ECONNREFUSED"); r.push("Connection refused"); }
+    return r;
+}
+
+/// "ENOENT" for 2; "E?" for numbers not in the table.
+pub fn errno_name(n: i64) -> str {
+    var r: Vec<str> = errno_row(n);
+    if r.len() == 0 {
+        return "E?";
+    }
+    return r.get(0);
+}
+
+/// strerror text.
+pub fn errno_message(n: i64) -> str {
+    var r: Vec<str> = errno_row(n);
+    if r.len() == 0 {
+        return "Unknown error " + int_to_str(n);
+    }
+    return r.get(1);
+}
+
+/// Number for a name ("EINVAL" -> 22), -1 when unknown.
+pub fn errno_from_name(name: str) -> i64 {
+    var n: i64 = 1;
+    while n < 134 {
+        var r: Vec<str> = errno_row(n);
+        if r.len() > 0 && str_equal(r.get(0), name) {
+            return n;
+        }
+        n = n + 1;
+    }
+    return -1;
+}
+
+/// Kernel return values -4095..-1 are -errno.
+pub fn sys_is_error(r: i64) -> bool {
+    return r < 0 && r >= -4095;
+}
+
+/// errno carried by a raw syscall result, 0 for success (libc's check).
+pub fn sys_errno(r: i64) -> i64 {
+    if sys_is_error(r) {
+        return 0 - r;
+    }
+    return 0;
+}
+
+/// What libc returns to the caller: -1 on error (errno set), else r.
+pub fn sys_libc_return(r: i64) -> i64 {
+    if sys_is_error(r) {
+        return -1;
+    }
+    return r;
+}
+
+// ─── Register conventions ───────────────────────────────────────────────
+// Register files are Vec<i64> indexed by the hardware register number:
+// x86-64 rax=0 rcx=1 rdx=2 rbx=3 rsp=4 rbp=5 rsi=6 rdi=7 r8..r15=8..15;
+// AArch64 x0..x30; RISC-V x0..x31 (a0..a7 = x10..x17).
+
+pub fn sys_nr_reg(arch: i64) -> i64 {
+    if arch == ABI_X86_64 { return 0; }
+    if arch == ABI_AARCH64 { return 8; }
+    return 17;
+}
+
+/// Register holding argument i (0..5).
+pub fn sys_arg_reg(arch: i64, i: i64) -> i64 {
+    if arch == ABI_X86_64 {
+        if i == 0 { return 7; }
+        if i == 1 { return 6; }
+        if i == 2 { return 2; }
+        if i == 3 { return 10; }
+        if i == 4 { return 8; }
+        return 9;
+    }
+    if arch == ABI_AARCH64 {
+        return i;
+    }
+    return 10 + i;
+}
+
+pub fn sys_ret_reg(arch: i64) -> i64 {
+    if arch == ABI_RISCV64 { return 10; }
+    return 0;
+}
+
+/// Names of the number register and the argument registers.
+pub fn sys_reg_names(arch: i64) -> str {
+    if arch == ABI_X86_64 { return "rax: rdi rsi rdx r10 r8 r9 -> rax (rcx, r11 clobbered)"; }
+    if arch == ABI_AARCH64 { return "x8: x0 x1 x2 x3 x4 x5 -> x0"; }
+    return "a7: a0 a1 a2 a3 a4 a5 -> a0";
+}
+
+/// Bytes of the trap instruction: syscall (0F 05), svc #0, ecall.
+pub fn sys_trap_bytes(arch: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    if arch == ABI_X86_64 {
+        b.push(0x0F);
+        b.push(0x05);
+        return b;
+    }
+    var w: i64 = 0x00000073;
+    if arch == ABI_AARCH64 {
+        w = 0xD4000001;
+    }
+    b.push(w & 255);
+    b.push((w >> 8) & 255);
+    b.push((w >> 16) & 255);
+    b.push((w >> 24) & 255);
+    return b;
+}
+
+pub struct SysFrame {
+    pub nr: i64,
+    pub args: Vec<i64>,
+}
+
+/// Number and arguments out of a trapped register file.
+pub fn sys_frame(arch: i64, regs: Vec<i64>) -> SysFrame {
+    var a: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 6 {
+        a.push(regs.get(sys_arg_reg(arch, i)));
+        i = i + 1;
+    }
+    return SysFrame { nr: regs.get(sys_nr_reg(arch)), args: a };
+}
+
+/// Store the result where user space expects it.
+pub fn sys_set_return(arch: i64, regs: & mut Vec<i64>, value: i64) {
+    regs.set(sys_ret_reg(arch), value);
+}
+
+/// Register file for a call (what a libc syscall() wrapper loads).
+pub fn sys_load_regs(arch: i64, nr: i64, args: Vec<i64>) -> Vec<i64> {
+    var regs: Vec<i64> = Vec::filled(32, 0);
+    regs.set(sys_nr_reg(arch), nr);
+    var i: i64 = 0;
+    while i < args.len() && i < 6 {
+        regs.set(sys_arg_reg(arch, i), args.get(i));
+        i = i + 1;
+    }
+    return regs;
+}
+
+// ─── Tables ─────────────────────────────────────────────────────────────
+
+pub struct SysDesc {
+    pub name: str,
+    pub nr: i64,
+    pub kinds: Vec<i64>,
+    pub lens: Vec<i64>,
+    // IN/OUT: index of the length argument; INPTR/OUTPTR: size in bytes
+    pub nullable: Vec<bool>,
+}
+
+pub struct SyscallTable {
+    pub arch: i64,
+    pub descs: Vec<SysDesc>,
+    pub by_nr: HashMap<i64, i64>,
+    pub calls: i64,
+    pub rejected: i64,
+}
+
+fn sys_parse_spec(arch: i64, name: str, nr: i64, spec: str) -> SysDesc {
+    var d: SysDesc = SysDesc { name: name, nr: nr, kinds: Vec::new(), lens: Vec::new(), nullable: Vec::new() };
+    if str_len(spec) == 0 {
+        return d;
+    }
+    var parts: Vec<str> = str_split(spec, " ");
+    var i: i64 = 0;
+    while i < parts.len() {
+        var p: str = parts.get(i);
+        var nul: bool = false;
+        var colon: i64 = str_find(p, ":");
+        var kind: str = p;
+        var arg: str = "";
+        if colon >= 0 {
+            kind = str_slice(p, 0, colon);
+            arg = str_slice(p, colon + 1, str_len(p));
+        }
+        if str_ends_with(kind, "?") {
+            nul = true;
+            kind = str_slice(kind, 0, str_len(kind) - 1);
+        }
+        var k: i64 = SARG_INT;
+        if str_equal(kind, "fd") { k = SARG_FD; }
+        if str_equal(kind, "size") { k = SARG_SIZE; }
+        if str_equal(kind, "flags") { k = SARG_FLAGS; }
+        if str_equal(kind, "addr") { k = SARG_ADDR; }
+        if str_equal(kind, "in") { k = SARG_IN; }
+        if str_equal(kind, "out") { k = SARG_OUT; }
+        if str_equal(kind, "inptr") { k = SARG_INPTR; }
+        if str_equal(kind, "outptr") { k = SARG_OUTPTR; }
+        if str_equal(kind, "str") { k = SARG_STR; }
+        var len: i64 = 0;
+        if str_equal(arg, "stat") {
+            // struct stat: 144 bytes on x86-64, 128 in asm-generic
+            len = 128;
+            if arch == ABI_X86_64 { len = 144; }
+        } else {
+            if str_len(arg) > 0 { len = str_parse_int(arg); }
+        }
+        d.kinds.push(k);
+        d.lens.push(len);
+        d.nullable.push(nul);
+        i = i + 1;
+    }
+    return d;
+}
+
+fn sys_row(t: & mut SyscallTable, name: str, x86: i64, generic: i64, spec: str) {
+    var nr: i64 = generic;
+    if t.arch == ABI_X86_64 {
+        nr = x86;
+    }
+    if nr < 0 {
+        return;
+    }
+    // the call does not exist on this architecture
+    t.by_nr.insert(nr, t.descs.len());
+    t.descs.push(sys_parse_spec(t.arch, name, nr, spec));
+}
+
+/// The Linux table (a common subset) for an architecture.
+pub fn syscall_table_linux(arch: i64) -> SyscallTable {
+    var t: SyscallTable = SyscallTable { arch: arch, descs: Vec::new(), by_nr: HashMap::new(), calls: 0, rejected: 0 };
+    sys_row(&mut t, "read", 0, 63, "fd out:2 size");
+    sys_row(&mut t, "write", 1, 64, "fd in:2 size");
+    sys_row(&mut t, "open", 2, -1, "str flags int");
+    sys_row(&mut t, "close", 3, 57, "fd");
+    sys_row(&mut t, "stat", 4, -1, "str outptr:stat");
+    sys_row(&mut t, "fstat", 5, 80, "fd outptr:stat");
+    sys_row(&mut t, "lseek", 8, 62, "fd int int");
+    sys_row(&mut t, "mmap", 9, 222, "addr size flags flags int int");
+    sys_row(&mut t, "mprotect", 10, 226, "addr size flags");
+    sys_row(&mut t, "munmap", 11, 215, "addr size");
+    sys_row(&mut t, "brk", 12, 214, "addr");
+    sys_row(&mut t, "ioctl", 16, 29, "fd int int");
+    sys_row(&mut t, "pread64", 17, 67, "fd out:2 size int");
+    sys_row(&mut t, "pwrite64", 18, 68, "fd in:2 size int");
+    sys_row(&mut t, "pipe", 22, -1, "outptr:8");
+    sys_row(&mut t, "sched_yield", 24, 124, "");
+    sys_row(&mut t, "dup", 32, 23, "fd");
+    sys_row(&mut t, "nanosleep", 35, 101, "inptr:16 outptr?:16");
+    sys_row(&mut t, "getpid", 39, 172, "");
+    sys_row(&mut t, "socket", 41, 198, "int int int");
+    sys_row(&mut t, "connect", 42, 203, "fd in:2 size");
+    sys_row(&mut t, "accept", 43, 202, "fd addr addr");
+    sys_row(&mut t, "sendto", 44, 206, "fd in:2 size flags addr int");
+    sys_row(&mut t, "recvfrom", 45, 207, "fd out:2 size flags addr addr");
+    sys_row(&mut t, "bind", 49, 200, "fd in:2 size");
+    sys_row(&mut t, "listen", 50, 201, "fd int");
+    sys_row(&mut t, "clone", 56, 220, "flags addr addr addr int");
+    sys_row(&mut t, "fork", 57, -1, "");
+    sys_row(&mut t, "execve", 59, 221, "str addr addr");
+    sys_row(&mut t, "exit", 60, 93, "int");
+    sys_row(&mut t, "wait4", 61, 260, "int outptr?:4 flags addr");
+    sys_row(&mut t, "kill", 62, 129, "int int");
+    sys_row(&mut t, "uname", 63, 160, "outptr:390");
+    sys_row(&mut t, "fcntl", 72, 25, "fd int int");
+    sys_row(&mut t, "fsync", 74, 82, "fd");
+    sys_row(&mut t, "getcwd", 79, 17, "out:1 size");
+    sys_row(&mut t, "chdir", 80, 49, "str");
+    sys_row(&mut t, "mkdir", 83, -1, "str int");
+    sys_row(&mut t, "unlink", 87, -1, "str");
+    sys_row(&mut t, "getuid", 102, 174, "");
+    sys_row(&mut t, "getppid", 110, 173, "");
+    sys_row(&mut t, "gettid", 186, 178, "");
+    sys_row(&mut t, "futex", 202, 98, "addr int int addr addr int");
+    sys_row(&mut t, "getdents64", 217, 61, "fd out:2 size");
+    sys_row(&mut t, "clock_gettime", 228, 113, "int outptr:16");
+    sys_row(&mut t, "exit_group", 231, 94, "int");
+    sys_row(&mut t, "openat", 257, 56, "int str flags int");
+    sys_row(&mut t, "mkdirat", 258, 34, "int str int");
+    sys_row(&mut t, "unlinkat", 263, 35, "int str flags");
+    sys_row(&mut t, "pipe2", 293, 59, "outptr:8 flags");
+    sys_row(&mut t, "getrandom", 318, 278, "out:1 size flags");
+    return t;
+}
+
+/// Number of `name` on the table's architecture, -1 when absent.
+pub fn syscall_nr(t: & SyscallTable, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < t.descs.len() {
+        if str_equal(t.descs.get(i).name, name) {
+            return t.descs.get(i).nr;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Name for a number, "" when unknown.
+pub fn syscall_name(t: & SyscallTable, nr: i64) -> str {
+    if !t.by_nr.contains(nr) {
+        return "";
+    }
+    return t.descs.get(t.by_nr.get(nr)).name;
+}
+
+// ─── User memory ────────────────────────────────────────────────────────
+
+pub struct URegion {
+    pub start: i64,
+    pub end: i64,
+    pub prot: i64,
+    pub data: Vec<i64>,
+}
+
+pub struct UserSpace {
+    pub regions: Vec<URegion>,
+    pub lo: i64,
+    // lowest valid user address (mmap_min_addr)
+    pub hi: i64,  // end of the user half (TASK_SIZE)
+}
+
+/// x86-64 / 48-bit layout: user addresses 0x10000 .. 0x7FFFFFFFF000.
+pub fn userspace_new() -> UserSpace {
+    return UserSpace { regions: Vec::new(), lo: 0x10000, hi: 0x00007FFFFFFFF000 };
+}
+
+pub fn userspace_map(us: & mut UserSpace, start: i64, len: i64, prot: i64) {
+    us.regions.push(URegion { start: start, end: start + len, prot: prot, data: Vec::filled(len, 0) });
+}
+
+/// Kernel-side load of bytes into user memory, ignoring protections
+/// (an exec loader filling a read-only segment).
+pub fn userspace_load(us: & mut UserSpace, p: i64, bytes: Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < bytes.len() {
+        var ri: i64 = uregion_at(us, p + i);
+        if ri < 0 {
+            return false;
+        }
+        var r: URegion = us.regions.get(ri);
+        r.data.set(p + i - r.start, bytes.get(i) & 255);
+        us.regions.set(ri, r);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn uregion_at(us: & UserSpace, a: i64) -> i64 {
+    var i: i64 = 0;
+    while i < us.regions.len() {
+        var r: URegion = us.regions.get(i);
+        if a >= r.start && a < r.end {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// access_ok plus the region walk: [p, p+n) is user memory with prot.
+pub fn uaccess_ok(us: & UserSpace, p: i64, n: i64, prot: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    if n < 0 || p < us.lo || p > us.hi - n {
+        return false;
+    }
+    var cur: i64 = p;
+    var end: i64 = p + n;
+    while cur < end {
+        var ri: i64 = uregion_at(us, cur);
+        if ri < 0 {
+            return false;
+        }
+        var r: URegion = us.regions.get(ri);
+        if (r.prot & prot) != prot {
+            return false;
+        }
+        cur = r.end;
+    }
+    return true;
+}
+
+/// copy_from_user: the bytes, or an empty Vec on a fault (n > 0).
+pub fn uaccess_read(us: & UserSpace, p: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if !uaccess_ok(us, p, n, UPROT_READ) {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < n {
+        var r: URegion = us.regions.get(uregion_at(us, p + i));
+        out.push(r.data.get(p + i - r.start));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// copy_to_user: false on a fault (nothing written).
+pub fn uaccess_write(us: & mut UserSpace, p: i64, bytes: Vec<i64>) -> bool {
+    if !uaccess_ok(us, p, bytes.len(), UPROT_WRITE) {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < bytes.len() {
+        var ri: i64 = uregion_at(us, p + i);
+        var r: URegion = us.regions.get(ri);
+        r.data.set(p + i - r.start, bytes.get(i) & 255);
+        us.regions.set(ri, r);
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Length of the user string at p (strnlen_user): -EFAULT when it runs
+/// into unmapped or unreadable memory, -ENAMETOOLONG past max bytes.
+pub fn uaccess_strlen(us: & UserSpace, p: i64, max: i64) -> i64 {
+    var i: i64 = 0;
+    while i < max {
+        var a: i64 = p + i;
+        if a < us.lo || a >= us.hi {
+            return 0 - EFAULT;
+        }
+        var ri: i64 = uregion_at(us, a);
+        if ri < 0 {
+            return 0 - EFAULT;
+        }
+        var r: URegion = us.regions.get(ri);
+        if (r.prot & UPROT_READ) == 0 {
+            return 0 - EFAULT;
+        }
+        if r.data.get(a - r.start) == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - ENAMETOOLONG;
+}
+
+/// strncpy_from_user: the string ("" on a fault; check uaccess_strlen).
+pub fn uaccess_str(us: & UserSpace, p: i64) -> str {
+    var n: i64 = uaccess_strlen(us, p, SYS_PATH_MAX);
+    if n <= 0 {
+        return "";
+    }
+    return str_from_bytes(uaccess_read(us, p, n));
+}
+
+// ─── Dispatch ───────────────────────────────────────────────────────────
+
+/// Validate the arguments of a call against its description: 0, or the
+/// -errno the kernel returns without running the call.
+pub fn syscall_validate(d: & SysDesc, us: & UserSpace, args: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < d.kinds.len() {
+        var k: i64 = d.kinds.get(i);
+        var a: i64 = args.get(i);
+        if k == SARG_FD && a < 0 {
+            return 0 - EBADF;
+        }
+        if k == SARG_SIZE && a < 0 {
+            return 0 - EINVAL;
+        }
+        if k == SARG_IN || k == SARG_OUT {
+            var n: i64 = args.get(d.lens.get(i));
+            var prot: i64 = UPROT_READ;
+            if k == SARG_OUT {
+                prot = UPROT_WRITE;
+            }
+            if n > 0 && !uaccess_ok(us, a, n, prot) {
+                return 0 - EFAULT;
+            }
+        }
+        if k == SARG_INPTR || k == SARG_OUTPTR {
+            if !(a == 0 && d.nullable.get(i)) {
+                var prot2: i64 = UPROT_READ;
+                if k == SARG_OUTPTR {
+                    prot2 = UPROT_WRITE;
+                }
+                if !uaccess_ok(us, a, d.lens.get(i), prot2) {
+                    return 0 - EFAULT;
+                }
+            }
+        }
+        if k == SARG_STR {
+            var sl: i64 = uaccess_strlen(us, a, SYS_PATH_MAX);
+            if sl < 0 {
+                return sl;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Dispatch one trapped call: look the number up (-ENOSYS when absent),
+/// validate, run handler(name, args), and return the value to put in the
+/// result register.
+pub fn syscall_dispatch(t: & mut SyscallTable, us: & UserSpace, f: SysFrame, handler: fn(str, Vec<i64>) -> i64) -> i64 {
+    t.calls = t.calls + 1;
+    if !t.by_nr.contains(f.nr) {
+        t.rejected = t.rejected + 1;
+        return 0 - ENOSYS;
+    }
+    var d: SysDesc = t.descs.get(t.by_nr.get(f.nr));
+    var v: i64 = syscall_validate(&d, us, f.args);
+    if v != 0 {
+        t.rejected = t.rejected + 1;
+        return v;
+    }
+    return handler(d.name, f.args);
+}
+
+/// Full trap path on a register file: frame out, dispatch, result in.
+pub fn syscall_trap(t: & mut SyscallTable, us: & UserSpace, regs: & mut Vec<i64>, handler: fn(str, Vec<i64>) -> i64) -> i64 {
+    var f: SysFrame = sys_frame(t.arch, regs);
+    var r: i64 = syscall_dispatch(t, us, f, handler);
+    sys_set_return(t.arch, regs, r);
+    return r;
+}

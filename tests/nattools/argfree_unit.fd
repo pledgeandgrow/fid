@@ -1,0 +1,190 @@
+// RA3 (docs/roadmap/llvm-roadmap.md): the free argument registers of
+// compiler/nat_ir.fd (ng_arg_free over RA7's model: ng_ra7_info,
+// ng_implicit_regs) and the checker that judges them (ng_mir_check_args),
+// on hand-made machine IR, through nat_argfree_unit / nat_arghint_check_unit.
+// Each value starts in the register given (-1: spilled):
+//   x64 fill   every value spilled. The parameter a lives across the call
+//              and stays spilled; the call's result r takes rdi, the
+//              divisor c takes rcx (rdi is r's, rsi holds the second
+//              result word, rdx is the division's), the quotient and the
+//              sum take rdi
+//   x64 across a value p lives across a second call; it stays spilled.
+//              With the implicit uses ignored (the mutation) it is put in
+//              rdx across the call, and the checker rejects that
+//   x64 trade  the fill's function with a in rbx and the rest in r12, r13
+//              and r14: a crosses the call and keeps rbx; r12, r13 and r14
+//              give their ranges to rdi, rcx and rdi and are freed
+//   x64 kept   x = f(); y = x; return (5, y) with x and y in r12: y would
+//              need rsi (rdi is written while it lives), x took rdi, so
+//              the copy y = x would become a move: r12 keeps them; the
+//              constant in r13 moves to rdi
+//   x64 result return (x, 5 + 6) with x = f() in r12: rdi holds the first
+//              result word from its move to the epilogue, so 5 and 6 take
+//              rsi and rdx, the sum rsi; forcing 5 into rdi is rejected
+//              (x86-64's first result word is rdi, not result_reg rax:
+//              ng_ra7_info counts both); x moves to rdi, freeing r12
+//   a64 fill   the fill's function on AArch64 (x0..x7)
+// Op codes are compiler/nat_ir.fd's MO_* numbers (MO_LI 1, MO_MOV 2,
+// MO_CALL 9, MO_ADD 16, MO_MUL 18, MO_DIV 27, MO_PROLOGUE 36,
+// MO_EPILOGUE 37); values are vregs 64 and up; x86-64 registers rcx 1,
+// rdx 2, rbx 3, rsi 6, rdi 7, r12..r14 12..14.
+// Run:
+//   fid run tests/nattools/argfree_unit.fd
+// Expected output:
+// x64 fill: -1 7 1 7 7 filled 4 traded 0 freed 0
+// x64 fill: sound
+// x64 across: -1 7 7 filled 2 traded 0 freed 0
+// x64 across: sound
+// x64 across mutant: 2 7 7 filled 3 traded 0 freed 0
+// x64 across mutant: rejected
+// x64 trade: 3 7 1 7 7 filled 0 traded 4 freed 3
+// x64 trade: sound
+// x64 kept: 12 12 7 filled 0 traded 1 freed 1
+// x64 kept: sound
+// x64 result: 7 6 2 6 filled 3 traded 1 freed 1
+// x64 result: sound
+// x64 result: rdi under the result rejected
+// a64 fill: -1 0 2 0 0 filled 4 traded 0 freed 0
+// a64 fill: sound
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn op(v: & mut Vec<i64>, o: i64, r0: i64, r1: i64, r2: i64, i0: i64) {
+    v.push(o);
+    v.push(r0);
+    v.push(r1);
+    v.push(r2);
+    v.push(i0);
+    v.push(0);
+    v.push(0);
+}
+
+fn show(res: & Vec<i64>, nv: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < nv {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(res.get(i));
+        i = i + 1;
+    }
+    return s + " filled " + int_to_str(res.get(nv)) + " traded " + int_to_str(res.get(nv + 1)) + " freed " + int_to_str(res.get(nv + 2));
+}
+
+fn verdict(msg: str) -> str {
+    if str_len(msg) == 0 {
+        return "sound";
+    }
+    return "rejected";
+}
+
+fn regs5(a: i64, b: i64, c: i64, d: i64, e: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    v.push(e);
+    return v;
+}
+
+fn regs3(a: i64, b: i64, c: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+/// a = parameter 0; r = f(); c = 7; return r / c + a (MO_MUL on AArch64)
+fn fill_shape(r0: i64, mid: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    op(& mut v, 36, 0, 0, 0, 0);
+    op(& mut v, 2, 64, r0, 0, 0);
+    op(& mut v, 9, 0, 0, 0, 99);
+    op(& mut v, 2, 65, r0, 0, 0);
+    op(& mut v, 1, 66, 0, 0, 7);
+    op(& mut v, mid, 67, 65, 66, 0);
+    op(& mut v, 16, 68, 67, 64, 0);
+    op(& mut v, 2, r0, 68, 0, 0);
+    op(& mut v, 37, 0, 0, 0, 0);
+    return v;
+}
+
+fn run_case(arch: i64, name: str, flat: & Vec<i64>, nv: i64, init: & Vec<i64>, blind: bool) {
+    var res: Vec<i64> = nat_argfree_unit(arch, flat, nv, init, blind);
+    println(name + ": " + show(& res, nv));
+    println(name + ": " + verdict(nat_arghint_check_unit(arch, flat, nv, & res)));
+}
+
+fn main() {
+    var f: Vec<i64> = fill_shape(7, 27);
+    var spilled5: Vec<i64> = regs5(0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+    run_case(NAT_X64, "x64 fill", & f, 5, & spilled5, false);
+
+    // p = f(); q = g(p); return q + p
+    var c: Vec<i64> = Vec::new();
+    op(& mut c, 36, 0, 0, 0, 0);
+    op(& mut c, 9, 0, 0, 0, 99);
+    op(& mut c, 2, 64, 7, 0, 0);
+    op(& mut c, 2, 7, 64, 0, 0);
+    op(& mut c, 9, 0, 0, 0, 98);
+    op(& mut c, 2, 65, 7, 0, 0);
+    op(& mut c, 16, 66, 65, 64, 0);
+    op(& mut c, 2, 7, 66, 0, 0);
+    op(& mut c, 37, 0, 0, 0, 0);
+    var spilled3: Vec<i64> = regs3(0 - 1, 0 - 1, 0 - 1);
+    run_case(NAT_X64, "x64 across", & c, 3, & spilled3, false);
+    run_case(NAT_X64, "x64 across mutant", & c, 3, & spilled3, true);
+
+    var held: Vec<i64> = regs5(3, 12, 13, 12, 14);
+    run_case(NAT_X64, "x64 trade", & f, 5, & held, false);
+
+    // x = f(); y = x; return (5, y)
+    var k: Vec<i64> = Vec::new();
+    op(& mut k, 36, 0, 0, 0, 0);
+    op(& mut k, 9, 0, 0, 0, 99);
+    op(& mut k, 2, 64, 7, 0, 0);
+    op(& mut k, 2, 65, 64, 0, 0);
+    op(& mut k, 1, 66, 0, 0, 5);
+    op(& mut k, 2, 7, 66, 0, 0);
+    op(& mut k, 2, 6, 65, 0, 0);
+    op(& mut k, 37, 0, 0, 0, 0);
+    var held3: Vec<i64> = regs3(12, 12, 13);
+    run_case(NAT_X64, "x64 kept", & k, 3, & held3, false);
+
+    // x = f(); return (x, 5 + 6)
+    var r: Vec<i64> = Vec::new();
+    op(& mut r, 36, 0, 0, 0, 0);
+    op(& mut r, 9, 0, 0, 0, 99);
+    op(& mut r, 2, 64, 7, 0, 0);
+    op(& mut r, 2, 7, 64, 0, 0);
+    op(& mut r, 1, 65, 0, 0, 5);
+    op(& mut r, 1, 66, 0, 0, 6);
+    op(& mut r, 16, 67, 65, 66, 0);
+    op(& mut r, 2, 6, 67, 0, 0);
+    op(& mut r, 37, 0, 0, 0, 0);
+    var rinit: Vec<i64> = Vec::new();
+    rinit.push(12);
+    rinit.push(0 - 1);
+    rinit.push(0 - 1);
+    rinit.push(0 - 1);
+    run_case(NAT_X64, "x64 result", & r, 4, & rinit, false);
+    var rbad: Vec<i64> = Vec::new();
+    rbad.push(12);
+    rbad.push(7);
+    rbad.push(2);
+    rbad.push(6);
+    if str_len(nat_arghint_check_unit(NAT_X64, & r, 4, & rbad)) > 0 {
+        println("x64 result: rdi under the result rejected");
+    } else {
+        println("x64 result: rdi under the result ACCEPTED");
+    }
+
+    var fa: Vec<i64> = fill_shape(0, 18);
+    run_case(NAT_A64, "a64 fill", & fa, 5, & spilled5, false);
+}

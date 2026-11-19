@@ -1,0 +1,917 @@
+// Fides Zigbee: ZCL frames, attribute data types, common clusters, APS
+//
+// What is real (pure Fides, runs everywhere; Zigbee Cluster Library rev 7
+// and the Zigbee PRO APS frame format):
+//   - ZCL frame header: frame control (type, manufacturer specific,
+//     direction, disable default response), manufacturer code, sequence
+//     number, command id; encode and decode
+//   - ZCL data types: boolean, bitmaps, unsigned and signed integers of
+//     8..64 bits, enums, single-precision float, octet and character
+//     strings, UTC time, cluster / attribute ids, IEEE addresses
+//   - global commands: Read Attributes (+ response), Write Attributes (+
+//     response), Configure Reporting, Report Attributes, Default Response
+//   - clusters On/Off (0x0006), Level Control (0x0008) and Temperature
+//     Measurement (0x0402): command builders and a small server endpoint
+//     that applies commands, answers reads/writes with the right status
+//     codes and produces attribute reports
+//   - the APS data frame header (frame control, delivery mode unicast /
+//     broadcast / group, endpoints, group address, cluster, profile,
+//     counter)
+//
+// The seam: ZigbeeRadio.tx sends an APS frame (header + ZCL payload) to
+// whatever carries it: a coordinator dongle (EZSP, ZNP), a stack on the
+// MCU. The IEEE 802.15.4 MAC, the NWK layer and Zigbee security are not
+// here.
+module zigbee;
+ use vec;
+ use string;
+
+pub const ZCL_FRAME_GLOBAL: i64 = 0;
+pub const ZCL_FRAME_CLUSTER: i64 = 1;
+pub const ZCL_DIR_TO_SERVER: i64 = 0;
+pub const ZCL_DIR_TO_CLIENT: i64 = 1;
+
+// global commands
+pub const ZCL_READ_ATTRIBUTES: i64 = 0x00;
+pub const ZCL_READ_ATTRIBUTES_RSP: i64 = 0x01;
+pub const ZCL_WRITE_ATTRIBUTES: i64 = 0x02;
+pub const ZCL_WRITE_ATTRIBUTES_UNDIVIDED: i64 = 0x03;
+pub const ZCL_WRITE_ATTRIBUTES_RSP: i64 = 0x04;
+pub const ZCL_WRITE_ATTRIBUTES_NO_RSP: i64 = 0x05;
+pub const ZCL_CONFIGURE_REPORTING: i64 = 0x06;
+pub const ZCL_CONFIGURE_REPORTING_RSP: i64 = 0x07;
+pub const ZCL_REPORT_ATTRIBUTES: i64 = 0x0A;
+pub const ZCL_DEFAULT_RSP: i64 = 0x0B;
+
+// status codes
+pub const ZCL_SUCCESS: i64 = 0x00;
+pub const ZCL_FAILURE: i64 = 0x01;
+pub const ZCL_MALFORMED_COMMAND: i64 = 0x80;
+pub const ZCL_UNSUP_COMMAND: i64 = 0x81;
+pub const ZCL_UNSUP_GENERAL_COMMAND: i64 = 0x82;
+pub const ZCL_UNSUPPORTED_ATTRIBUTE: i64 = 0x86;
+pub const ZCL_INVALID_VALUE: i64 = 0x87;
+pub const ZCL_READ_ONLY: i64 = 0x88;
+pub const ZCL_INVALID_DATA_TYPE: i64 = 0x8D;
+
+// data types
+pub const ZCL_NODATA: i64 = 0x00;
+pub const ZCL_DATA8: i64 = 0x08;
+pub const ZCL_BOOL: i64 = 0x10;
+pub const ZCL_MAP8: i64 = 0x18;
+pub const ZCL_MAP16: i64 = 0x19;
+pub const ZCL_UINT8: i64 = 0x20;
+pub const ZCL_UINT16: i64 = 0x21;
+pub const ZCL_UINT24: i64 = 0x22;
+pub const ZCL_UINT32: i64 = 0x23;
+pub const ZCL_UINT48: i64 = 0x25;
+pub const ZCL_UINT64: i64 = 0x27;
+pub const ZCL_INT8: i64 = 0x28;
+pub const ZCL_INT16: i64 = 0x29;
+pub const ZCL_INT24: i64 = 0x2A;
+pub const ZCL_INT32: i64 = 0x2B;
+pub const ZCL_INT64: i64 = 0x2F;
+pub const ZCL_ENUM8: i64 = 0x30;
+pub const ZCL_ENUM16: i64 = 0x31;
+pub const ZCL_SINGLE: i64 = 0x39;
+pub const ZCL_OCTSTR: i64 = 0x41;
+pub const ZCL_STRING: i64 = 0x42;
+pub const ZCL_UTC: i64 = 0xE2;
+pub const ZCL_CLUSTER_ID: i64 = 0xE8;
+pub const ZCL_ATTRIB_ID: i64 = 0xE9;
+pub const ZCL_IEEE_ADDR: i64 = 0xF0;
+
+// clusters, attributes, commands
+pub const ZCL_CLUSTER_BASIC: i64 = 0x0000;
+pub const ZCL_CLUSTER_ON_OFF: i64 = 0x0006;
+pub const ZCL_CLUSTER_LEVEL: i64 = 0x0008;
+pub const ZCL_CLUSTER_TEMPERATURE: i64 = 0x0402;
+pub const ZCL_ATTR_ON_OFF: i64 = 0x0000;
+pub const ZCL_ATTR_CURRENT_LEVEL: i64 = 0x0000;
+pub const ZCL_ATTR_MEASURED_VALUE: i64 = 0x0000;
+pub const ZCL_ATTR_MIN_MEASURED_VALUE: i64 = 0x0001;
+pub const ZCL_ATTR_MAX_MEASURED_VALUE: i64 = 0x0002;
+pub const ZCL_CMD_OFF: i64 = 0x00;
+pub const ZCL_CMD_ON: i64 = 0x01;
+pub const ZCL_CMD_TOGGLE: i64 = 0x02;
+pub const ZCL_CMD_MOVE_TO_LEVEL: i64 = 0x00;
+pub const ZCL_CMD_MOVE_TO_LEVEL_ON_OFF: i64 = 0x04;
+pub const ZCL_TEMPERATURE_INVALID: i64 = 0x8000;
+pub const ZIGBEE_PROFILE_HA: i64 = 0x0104;
+
+// ─── Frames ─────────────────────────────────────────────────────────────
+
+pub struct ZclFrame {
+    pub frame_type: i64,
+    pub manufacturer: i64,
+    pub direction: i64,
+    pub disable_default_rsp: bool,
+    pub seq: i64,
+    pub command: i64,
+    pub payload: Vec<i64>,
+    pub ok: bool,
+}
+
+/// A frame; manufacturer -1 when not manufacturer specific.
+pub fn zcl_frame(frame_type: i64, direction: i64, seq: i64, command: i64, payload: Vec<i64>) -> ZclFrame {
+    return ZclFrame { frame_type: frame_type, manufacturer: 0 - 1, direction: direction, disable_default_rsp: false, seq: seq, command: command, payload: payload, ok: true };
+}
+
+pub fn zcl_encode(f: & ZclFrame) -> Vec<i64> {
+    var fc: i64 = f.frame_type & 3;
+    if f.manufacturer >= 0 {
+        fc = fc | 0x04;
+    }
+    if f.direction == ZCL_DIR_TO_CLIENT {
+        fc = fc | 0x08;
+    }
+    if f.disable_default_rsp {
+        fc = fc | 0x10;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(fc);
+    if f.manufacturer >= 0 {
+        out.push(f.manufacturer & 0xFF);
+        out.push((f.manufacturer >> 8) & 0xFF);
+    }
+    out.push(f.seq & 0xFF);
+    out.push(f.command & 0xFF);
+    var i: i64 = 0;
+    while i < f.payload.len() {
+        out.push(f.payload.get(i) & 0xFF);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn zcl_decode(b: & Vec<i64>) -> ZclFrame {
+    var f: ZclFrame = zcl_frame(0, 0, 0, 0, Vec::new());
+    f.ok = false;
+    if b.len() < 3 {
+        return f;
+    }
+    val fc: i64 = b.get(0);
+    f.frame_type = fc & 3;
+    f.direction = (fc >> 3) & 1;
+    f.disable_default_rsp = (fc & 0x10) != 0;
+    var p: i64 = 1;
+    if (fc & 0x04) != 0 {
+        if b.len() < 5 {
+            return f;
+        }
+        f.manufacturer = b.get(1) | (b.get(2) << 8);
+        p = 3;
+    }
+    f.seq = b.get(p);
+    f.command = b.get(p + 1);
+    var i: i64 = p + 2;
+    while i < b.len() {
+        f.payload.push(b.get(i));
+        i = i + 1;
+    }
+    f.ok = true;
+    return f;
+}
+
+// ─── Data types ─────────────────────────────────────────────────────────
+
+/// A typed value: integers, booleans, bitmaps, enums and the single float
+/// (as its IEEE-754 bits) are in num; strings and addresses in bytes.
+pub struct ZclValue {
+    pub dtype: i64,
+    pub num: i64,
+    pub bytes: Vec<i64>,
+}
+
+pub fn zcl_num(dtype: i64, v: i64) -> ZclValue {
+    return ZclValue { dtype: dtype, num: v, bytes: Vec::new() };
+}
+
+pub fn zcl_bool(b: bool) -> ZclValue {
+    if b {
+        return zcl_num(ZCL_BOOL, 1);
+    }
+    return zcl_num(ZCL_BOOL, 0);
+}
+
+pub fn zcl_string(s: str) -> ZclValue {
+    return ZclValue { dtype: ZCL_STRING, num: 0, bytes: str_bytes(s) };
+}
+
+/// Fixed size in bytes of a type; -1 for strings (length-prefixed), -2
+/// unknown.
+pub fn zcl_type_size(t: i64) -> i64 {
+    if t == ZCL_NODATA {
+        return 0;
+    }
+    if t >= 0x08 && t <= 0x0F {
+        return t - 0x07;
+    }
+    if t == ZCL_BOOL {
+        return 1;
+    }
+    if t >= 0x18 && t <= 0x1F {
+        return t - 0x17;
+    }
+    if t >= 0x20 && t <= 0x27 {
+        return t - 0x1F;
+    }
+    if t >= 0x28 && t <= 0x2F {
+        return t - 0x27;
+    }
+    if t == ZCL_ENUM8 {
+        return 1;
+    }
+    if t == ZCL_ENUM16 {
+        return 2;
+    }
+    if t == 0x38 {
+        return 2;
+    }
+    if t == ZCL_SINGLE {
+        return 4;
+    }
+    if t == 0x3A {
+        return 8;
+    }
+    if t == ZCL_OCTSTR || t == ZCL_STRING {
+        return 0 - 1;
+    }
+    if t == 0xE0 || t == 0xE1 || t == ZCL_UTC {
+        return 4;
+    }
+    if t == ZCL_CLUSTER_ID || t == ZCL_ATTRIB_ID {
+        return 2;
+    }
+    if t == 0xEA {
+        return 4;
+    }
+    if t == ZCL_IEEE_ADDR {
+        return 8;
+    }
+    return 0 - 2;
+}
+
+pub fn zcl_type_signed(t: i64) -> bool {
+    return t >= 0x28 && t <= 0x2F;
+}
+
+/// The "invalid value" a sensor reports when it has no reading: the
+/// most negative value of a signed type, all ones for unsigned.
+pub fn zcl_invalid_value(t: i64) -> i64 {
+    val n: i64 = zcl_type_size(t);
+    if n <= 0 || n >= 8 {
+        return 0 - 1;
+    }
+    if zcl_type_signed(t) {
+        return 0 - (1 << (8 * n - 1));
+    }
+    return (1 << (8 * n)) - 1;
+}
+
+/// Append a value's bytes (without the type byte).
+pub fn zcl_put_value(out: & mut Vec<i64>, v: & ZclValue) {
+    val n: i64 = zcl_type_size(v.dtype);
+    if n == 0 - 1 {
+        out.push(v.bytes.len() & 0xFF);
+        var i: i64 = 0;
+        while i < v.bytes.len() {
+            out.push(v.bytes.get(i) & 0xFF);
+            i = i + 1;
+        }
+        return;
+    }
+    if v.dtype == ZCL_IEEE_ADDR && v.bytes.len() == 8 {
+        var i: i64 = 0;
+        while i < 8 {
+            out.push(v.bytes.get(i) & 0xFF);
+            i = i + 1;
+        }
+        return;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if i < 8 {
+            out.push((v.num >> (8 * i)) & 0xFF);
+        } else {
+            out.push(0);
+        }
+        i = i + 1;
+    }
+}
+
+/// Read a value of type t at off; [the value, the next offset] via
+/// next (next.num = -1 when the bytes run out or the type is unknown).
+pub fn zcl_get_value(b: & Vec<i64>, off: i64, t: i64, next: & mut i64) -> ZclValue {
+    var v: ZclValue = zcl_num(t, 0);
+    val n: i64 = zcl_type_size(t);
+    if n == 0 - 2 {
+        *next = 0 - 1;
+        return v;
+    }
+    if n == 0 - 1 {
+        if off >= b.len() {
+            *next = 0 - 1;
+            return v;
+        }
+        val len: i64 = b.get(off);
+        if len == 0xFF {
+            // the invalid (absent) string
+            *next = off + 1;
+            return v;
+        }
+        if off + 1 + len > b.len() {
+            *next = 0 - 1;
+            return v;
+        }
+        var i: i64 = 0;
+        while i < len {
+            v.bytes.push(b.get(off + 1 + i));
+            i = i + 1;
+        }
+        *next = off + 1 + len;
+        return v;
+    }
+    if off + n > b.len() {
+        *next = 0 - 1;
+        return v;
+    }
+    if t == ZCL_IEEE_ADDR {
+        var i: i64 = 0;
+        while i < 8 {
+            v.bytes.push(b.get(off + i));
+            i = i + 1;
+        }
+        *next = off + 8;
+        return v;
+    }
+    var x: i64 = 0;
+    var i: i64 = 0;
+    while i < n && i < 8 {
+        x = x | ((b.get(off + i) & 0xFF) << (8 * i));
+        i = i + 1;
+    }
+    if zcl_type_signed(t) && n < 8 && (x & (1 << (8 * n - 1))) != 0 {
+        x = x - (1 << (8 * n));
+    }
+    v.num = x;
+    *next = off + n;
+    return v;
+}
+
+/// IEEE-754 single bits of an f64 (round to nearest even; overflow to
+/// infinity, tiny values to subnormals or zero).
+pub fn zcl_f32_bits(x: f64) -> i64 {
+    val d: i64 = p_f64_to_bits(x);
+    val sign: i64 = (d >> 63) & 1;
+    val e: i64 = ((d >> 52) & 0x7FF);
+    val m: i64 = d & 0x000FFFFFFFFFFFFF;
+    if e == 0x7FF {
+        if m != 0 {
+            return (sign << 31) | 0x7FC00000;
+        }
+        return (sign << 31) | 0x7F800000;
+    }
+    var exp: i64 = e - 1023 + 127;
+    if e == 0 {
+        return sign << 31;
+    }
+    var mant: i64 = m | (1 << 52);
+    var shift: i64 = 29;
+    if exp <= 0 {
+        shift = 29 + (1 - exp);
+        exp = 0;
+        if shift > 60 {
+            return sign << 31;
+        }
+    }
+    var r: i64 = mant >> shift;
+    val rem: i64 = mant & ((1 << shift) - 1);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (r & 1) == 1) {
+        r = r + 1;
+    }
+    if exp == 0 {
+        // subnormal (r may have carried into the normal range: bit 23)
+        return (sign << 31) | r;
+    }
+    if r >= (1 << 24) {
+        r = r >> 1;
+        exp = exp + 1;
+    }
+    if exp >= 255 {
+        return (sign << 31) | 0x7F800000;
+    }
+    return (sign << 31) | (exp << 23) | (r & 0x7FFFFF);
+}
+
+pub fn zcl_f32_from_bits(b: i64) -> f64 {
+    val sign: i64 = (b >> 31) & 1;
+    val e: i64 = (b >> 23) & 0xFF;
+    val m: i64 = b & 0x7FFFFF;
+    var d: i64 = 0;
+    if e == 0xFF {
+        d = (sign << 63) | (0x7FF << 52) | (m << 29);
+    } else if e == 0 {
+        if m == 0 {
+            d = sign << 63;
+        } else {
+            var mm: i64 = m;
+            var ee: i64 = 1 - 127 + 1023;
+            while (mm & 0x800000) == 0 {
+                mm = mm << 1;
+                ee = ee - 1;
+            }
+            d = (sign << 63) | (ee << 52) | ((mm & 0x7FFFFF) << 29);
+        }
+    } else {
+        d = (sign << 63) | ((e - 127 + 1023) << 52) | (m << 29);
+    }
+    return p_f64_from_bits(d);
+}
+
+pub fn zcl_single(x: f64) -> ZclValue {
+    return zcl_num(ZCL_SINGLE, zcl_f32_bits(x));
+}
+
+// ─── Global commands ────────────────────────────────────────────────────
+
+fn zb_u16(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 0xFF);
+    out.push((v >> 8) & 0xFF);
+}
+
+fn zb_get16(b: & Vec<i64>, i: i64) -> i64 {
+    return (b.get(i) & 0xFF) | ((b.get(i + 1) & 0xFF) << 8);
+}
+
+pub fn zcl_read_attributes(seq: i64, attrs: & Vec<i64>) -> ZclFrame {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < attrs.len() {
+        zb_u16(& mut p, attrs.get(i));
+        i = i + 1;
+    }
+    return zcl_frame(ZCL_FRAME_GLOBAL, ZCL_DIR_TO_SERVER, seq, ZCL_READ_ATTRIBUTES, p);
+}
+
+/// One attribute record: id, status, value (value used when status is 0).
+pub struct ZclAttrRecord {
+    pub attr: i64,
+    pub status: i64,
+    pub value: ZclValue,
+}
+
+pub fn zcl_write_attributes(seq: i64, recs: & Vec<ZclAttrRecord>) -> ZclFrame {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < recs.len() {
+        val r: ZclAttrRecord = recs.get(i);
+        zb_u16(& mut p, r.attr);
+        p.push(r.value.dtype);
+        zcl_put_value(& mut p, & r.value);
+        i = i + 1;
+    }
+    return zcl_frame(ZCL_FRAME_GLOBAL, ZCL_DIR_TO_SERVER, seq, ZCL_WRITE_ATTRIBUTES, p);
+}
+
+/// Report Attributes (server to client, default response disabled).
+pub fn zcl_report_attributes(seq: i64, recs: & Vec<ZclAttrRecord>) -> ZclFrame {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < recs.len() {
+        val r: ZclAttrRecord = recs.get(i);
+        zb_u16(& mut p, r.attr);
+        p.push(r.value.dtype);
+        zcl_put_value(& mut p, & r.value);
+        i = i + 1;
+    }
+    var f: ZclFrame = zcl_frame(ZCL_FRAME_GLOBAL, ZCL_DIR_TO_CLIENT, seq, ZCL_REPORT_ATTRIBUTES, p);
+    f.disable_default_rsp = true;
+    return f;
+}
+
+/// Decode the records of a Report Attributes or Write Attributes payload
+/// (attr id, type, value).
+pub fn zcl_decode_attr_values(p: & Vec<i64>) -> Vec<ZclAttrRecord> {
+    var out: Vec<ZclAttrRecord> = Vec::new();
+    var i: i64 = 0;
+    while i + 3 <= p.len() {
+        val attr: i64 = zb_get16(p, i);
+        val t: i64 = p.get(i + 2);
+        var next: i64 = 0;
+        val v: ZclValue = zcl_get_value(p, i + 3, t, & mut next);
+        if next < 0 {
+            break;
+        }
+        out.push(ZclAttrRecord { attr: attr, status: ZCL_SUCCESS, value: v });
+        i = next;
+    }
+    return out;
+}
+
+/// Decode a Read Attributes Response payload (attr id, status, [type,
+/// value] when the status is success).
+pub fn zcl_decode_read_rsp(p: & Vec<i64>) -> Vec<ZclAttrRecord> {
+    var out: Vec<ZclAttrRecord> = Vec::new();
+    var i: i64 = 0;
+    while i + 3 <= p.len() {
+        val attr: i64 = zb_get16(p, i);
+        val st: i64 = p.get(i + 2);
+        if st != ZCL_SUCCESS {
+            out.push(ZclAttrRecord { attr: attr, status: st, value: zcl_num(ZCL_NODATA, 0) });
+            i = i + 3;
+        } else {
+            if i + 4 > p.len() {
+                break;
+            }
+            var next: i64 = 0;
+            val v: ZclValue = zcl_get_value(p, i + 4, p.get(i + 3), & mut next);
+            if next < 0 {
+                break;
+            }
+            out.push(ZclAttrRecord { attr: attr, status: st, value: v });
+            i = next;
+        }
+    }
+    return out;
+}
+
+/// Default Response to a received frame.
+pub fn zcl_default_response(req: & ZclFrame, status: i64) -> ZclFrame {
+    var p: Vec<i64> = Vec::new();
+    p.push(req.command & 0xFF);
+    p.push(status & 0xFF);
+    var f: ZclFrame = zcl_frame(ZCL_FRAME_GLOBAL, 1 - req.direction, req.seq, ZCL_DEFAULT_RSP, p);
+    f.manufacturer = req.manufacturer;
+    f.disable_default_rsp = true;
+    return f;
+}
+
+/// Configure Reporting of one attribute (direction 0: we report it):
+/// min/max interval in seconds, reportable change for analog types.
+pub fn zcl_configure_reporting(seq: i64, attr: i64, dtype: i64, min_s: i64, max_s: i64, change: i64) -> ZclFrame {
+    var p: Vec<i64> = Vec::new();
+    p.push(0);
+    zb_u16(& mut p, attr);
+    p.push(dtype);
+    zb_u16(& mut p, min_s);
+    zb_u16(& mut p, max_s);
+    val analog: bool = (dtype >= 0x20 && dtype <= 0x2F) || dtype == ZCL_SINGLE || dtype == 0x38 || dtype == 0x3A || dtype == ZCL_UTC;
+    if analog {
+        zcl_put_value(& mut p, & zcl_num(dtype, change));
+    }
+    return zcl_frame(ZCL_FRAME_GLOBAL, ZCL_DIR_TO_SERVER, seq, ZCL_CONFIGURE_REPORTING, p);
+}
+
+// ─── Cluster commands ───────────────────────────────────────────────────
+
+pub fn zcl_on_off_command(seq: i64, cmd: i64) -> ZclFrame {
+    return zcl_frame(ZCL_FRAME_CLUSTER, ZCL_DIR_TO_SERVER, seq, cmd, Vec::new());
+}
+
+/// Move to Level (with On/Off when with_on_off): level 0..254, transition
+/// time in tenths of a second.
+pub fn zcl_move_to_level(seq: i64, level: i64, transition_ds: i64, with_on_off: bool) -> ZclFrame {
+    var p: Vec<i64> = Vec::new();
+    p.push(level & 0xFF);
+    zb_u16(& mut p, transition_ds);
+    var cmd: i64 = ZCL_CMD_MOVE_TO_LEVEL;
+    if with_on_off {
+        cmd = ZCL_CMD_MOVE_TO_LEVEL_ON_OFF;
+    }
+    return zcl_frame(ZCL_FRAME_CLUSTER, ZCL_DIR_TO_SERVER, seq, cmd, p);
+}
+
+/// Temperature Measurement's MeasuredValue: 100 x Celsius, rounded;
+/// 0x8000 (invalid) for NaN.
+pub fn zcl_temperature_value(celsius: f64) -> i64 {
+    if celsius != celsius {
+        return 0 - 0x8000;
+    }
+    val x: f64 = celsius * 100.0;
+    if x >= 0.0 {
+        return (x + 0.5) as i64;
+    }
+    return 0 - ((0.5 - x) as i64);
+}
+
+// ─── A server endpoint ──────────────────────────────────────────────────
+
+pub struct ZclAttr {
+    pub cluster: i64,
+    pub attr: i64,
+    pub value: ZclValue,
+    pub writable: bool,
+}
+
+pub struct ZclEndpoint {
+    pub endpoint: i64,
+    pub attrs: Vec<ZclAttr>,
+    pub seq: i64,
+}
+
+/// An endpoint with On/Off, Level Control and Temperature Measurement
+/// servers (temperature range -40.00 .. 125.00 C).
+pub fn zcl_endpoint_light_sensor(ep: i64) -> ZclEndpoint {
+    var a: Vec<ZclAttr> = Vec::new();
+    a.push(ZclAttr { cluster: ZCL_CLUSTER_ON_OFF, attr: ZCL_ATTR_ON_OFF, value: zcl_bool(false), writable: false });
+    a.push(ZclAttr { cluster: ZCL_CLUSTER_LEVEL, attr: ZCL_ATTR_CURRENT_LEVEL, value: zcl_num(ZCL_UINT8, 0), writable: false });
+    a.push(ZclAttr { cluster: ZCL_CLUSTER_LEVEL, attr: 0x0010, value: zcl_num(ZCL_UINT16, 0), writable: true });
+    a.push(ZclAttr { cluster: ZCL_CLUSTER_TEMPERATURE, attr: ZCL_ATTR_MEASURED_VALUE, value: zcl_num(ZCL_INT16, 0 - 0x8000), writable: false });
+    a.push(ZclAttr { cluster: ZCL_CLUSTER_TEMPERATURE, attr: ZCL_ATTR_MIN_MEASURED_VALUE, value: zcl_num(ZCL_INT16, 0 - 4000), writable: false });
+    a.push(ZclAttr { cluster: ZCL_CLUSTER_TEMPERATURE, attr: ZCL_ATTR_MAX_MEASURED_VALUE, value: zcl_num(ZCL_INT16, 12500), writable: false });
+    return ZclEndpoint { endpoint: ep, attrs: a, seq: 0 };
+}
+
+fn zcl_find(e: & ZclEndpoint, cluster: i64, attr: i64) -> i64 {
+    var i: i64 = 0;
+    while i < e.attrs.len() {
+        val a: ZclAttr = e.attrs.get(i);
+        if a.cluster == cluster && a.attr == attr {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+pub fn zcl_get(e: & ZclEndpoint, cluster: i64, attr: i64) -> i64 {
+    val i: i64 = zcl_find(e, cluster, attr);
+    if i < 0 {
+        return 0 - 1;
+    }
+    return e.attrs.get(i).value.num;
+}
+
+/// Set an attribute from the application (a sensor reading).
+pub fn zcl_set(e: & mut ZclEndpoint, cluster: i64, attr: i64, v: i64) {
+    val i: i64 = zcl_find(e, cluster, attr);
+    if i >= 0 {
+        var a: ZclAttr = e.attrs.get(i);
+        a.value.num = v;
+        e.attrs.set(i, a);
+    }
+}
+
+/// A report of one attribute's current value.
+pub fn zcl_report_of(e: & mut ZclEndpoint, cluster: i64, attr: i64) -> Vec<i64> {
+    val i: i64 = zcl_find(e, cluster, attr);
+    if i < 0 {
+        return Vec::new();
+    }
+    var recs: Vec<ZclAttrRecord> = Vec::new();
+    recs.push(ZclAttrRecord { attr: attr, status: ZCL_SUCCESS, value: e.attrs.get(i).value });
+    e.seq = (e.seq + 1) & 0xFF;
+    return zcl_encode(& zcl_report_attributes(e.seq, & recs));
+}
+
+fn zcl_cluster_command(e: & mut ZclEndpoint, cluster: i64, f: & ZclFrame) -> i64 {
+    if cluster == ZCL_CLUSTER_ON_OFF {
+        val cur: i64 = zcl_get(e, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF);
+        if f.command == ZCL_CMD_OFF {
+            zcl_set(e, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF, 0);
+        } else if f.command == ZCL_CMD_ON {
+            zcl_set(e, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF, 1);
+        } else if f.command == ZCL_CMD_TOGGLE {
+            zcl_set(e, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF, 1 - cur);
+        } else {
+            return ZCL_UNSUP_COMMAND;
+        }
+        return ZCL_SUCCESS;
+    }
+    if cluster == ZCL_CLUSTER_LEVEL {
+        if f.command == ZCL_CMD_MOVE_TO_LEVEL || f.command == ZCL_CMD_MOVE_TO_LEVEL_ON_OFF {
+            if f.payload.len() < 3 {
+                return ZCL_MALFORMED_COMMAND;
+            }
+            var lv: i64 = f.payload.get(0);
+            if lv == 0xFF {
+                return ZCL_INVALID_VALUE;
+            }
+            zcl_set(e, ZCL_CLUSTER_LEVEL, ZCL_ATTR_CURRENT_LEVEL, lv);
+            if f.command == ZCL_CMD_MOVE_TO_LEVEL_ON_OFF {
+                if lv > 0 {
+                    zcl_set(e, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF, 1);
+                } else {
+                    zcl_set(e, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF, 0);
+                }
+            }
+            return ZCL_SUCCESS;
+        }
+        return ZCL_UNSUP_COMMAND;
+    }
+    return ZCL_UNSUP_COMMAND;
+}
+
+/// Handle a ZCL frame received for `cluster`; the response frame bytes
+/// (empty when none is due).
+pub fn zcl_endpoint_handle(e: & mut ZclEndpoint, cluster: i64, frame: Vec<i64>) -> Vec<i64> {
+    val f: ZclFrame = zcl_decode(& frame);
+    if !f.ok {
+        return Vec::new();
+    }
+    if f.frame_type == ZCL_FRAME_CLUSTER {
+        val st: i64 = zcl_cluster_command(e, cluster, & f);
+        if st == ZCL_SUCCESS && f.disable_default_rsp {
+            return Vec::new();
+        }
+        return zcl_encode(& zcl_default_response(& f, st));
+    }
+    if f.command == ZCL_READ_ATTRIBUTES {
+        var p: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i + 1 < f.payload.len() {
+            val id: i64 = zb_get16(& f.payload, i);
+            zb_u16(& mut p, id);
+            val k: i64 = zcl_find(e, cluster, id);
+            if k < 0 {
+                p.push(ZCL_UNSUPPORTED_ATTRIBUTE);
+            } else {
+                val a: ZclAttr = e.attrs.get(k);
+                p.push(ZCL_SUCCESS);
+                p.push(a.value.dtype);
+                zcl_put_value(& mut p, & a.value);
+            }
+            i = i + 2;
+        }
+        var r: ZclFrame = zcl_frame(ZCL_FRAME_GLOBAL, ZCL_DIR_TO_CLIENT, f.seq, ZCL_READ_ATTRIBUTES_RSP, p);
+        r.disable_default_rsp = true;
+        r.manufacturer = f.manufacturer;
+        return zcl_encode(& r);
+    }
+    if f.command == ZCL_WRITE_ATTRIBUTES || f.command == ZCL_WRITE_ATTRIBUTES_NO_RSP {
+        val recs: Vec<ZclAttrRecord> = zcl_decode_attr_values(& f.payload);
+        var p: Vec<i64> = Vec::new();
+        var all_ok: bool = true;
+        var i: i64 = 0;
+        while i < recs.len() {
+            val rc: ZclAttrRecord = recs.get(i);
+            val k: i64 = zcl_find(e, cluster, rc.attr);
+            var st: i64 = ZCL_SUCCESS;
+            if k < 0 {
+                st = ZCL_UNSUPPORTED_ATTRIBUTE;
+            } else if !e.attrs.get(k).writable {
+                st = ZCL_READ_ONLY;
+            } else if e.attrs.get(k).value.dtype != rc.value.dtype {
+                st = ZCL_INVALID_DATA_TYPE;
+            } else {
+                var a: ZclAttr = e.attrs.get(k);
+                a.value = rc.value;
+                e.attrs.set(k, a);
+            }
+            if st != ZCL_SUCCESS {
+                all_ok = false;
+                p.push(st);
+                zb_u16(& mut p, rc.attr);
+            }
+            i = i + 1;
+        }
+        if f.command == ZCL_WRITE_ATTRIBUTES_NO_RSP {
+            return Vec::new();
+        }
+        if all_ok {
+            p = Vec::new();
+            p.push(ZCL_SUCCESS);
+        }
+        var r: ZclFrame = zcl_frame(ZCL_FRAME_GLOBAL, ZCL_DIR_TO_CLIENT, f.seq, ZCL_WRITE_ATTRIBUTES_RSP, p);
+        r.disable_default_rsp = true;
+        return zcl_encode(& r);
+    }
+    if f.command == ZCL_DEFAULT_RSP || f.command == ZCL_REPORT_ATTRIBUTES || f.command == ZCL_READ_ATTRIBUTES_RSP {
+        return Vec::new();
+    }
+    return zcl_encode(& zcl_default_response(& f, ZCL_UNSUP_GENERAL_COMMAND));
+}
+
+// ─── APS ────────────────────────────────────────────────────────────────
+
+pub const APS_FRAME_DATA: i64 = 0;
+pub const APS_FRAME_COMMAND: i64 = 1;
+pub const APS_FRAME_ACK: i64 = 2;
+pub const APS_DELIVERY_UNICAST: i64 = 0;
+pub const APS_DELIVERY_BROADCAST: i64 = 2;
+pub const APS_DELIVERY_GROUP: i64 = 3;
+
+pub struct ApsHeader {
+    pub frame_type: i64,
+    pub delivery: i64,
+    pub security: bool,
+    pub ack_request: bool,
+    pub dst_endpoint: i64,
+    pub group: i64,
+    pub cluster: i64,
+    pub profile: i64,
+    pub src_endpoint: i64,
+    pub counter: i64,
+    pub header_len: i64,
+}
+
+pub fn aps_unicast(dst_ep: i64, cluster: i64, profile: i64, src_ep: i64, counter: i64) -> ApsHeader {
+    return ApsHeader { frame_type: APS_FRAME_DATA, delivery: APS_DELIVERY_UNICAST, security: false, ack_request: false, dst_endpoint: dst_ep, group: 0, cluster: cluster, profile: profile, src_endpoint: src_ep, counter: counter, header_len: 0 };
+}
+
+pub fn aps_group(group: i64, cluster: i64, profile: i64, src_ep: i64, counter: i64) -> ApsHeader {
+    return ApsHeader { frame_type: APS_FRAME_DATA, delivery: APS_DELIVERY_GROUP, security: false, ack_request: false, dst_endpoint: 0, group: group, cluster: cluster, profile: profile, src_endpoint: src_ep, counter: counter, header_len: 0 };
+}
+
+/// The APS data frame: header then payload (a ZCL frame).
+pub fn aps_encode(h: & ApsHeader, payload: & Vec<i64>) -> Vec<i64> {
+    var fc: i64 = (h.frame_type & 3) | ((h.delivery & 3) << 2);
+    if h.security {
+        fc = fc | 0x20;
+    }
+    if h.ack_request {
+        fc = fc | 0x40;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(fc);
+    if h.delivery == APS_DELIVERY_GROUP {
+        zb_u16(& mut out, h.group);
+    } else {
+        out.push(h.dst_endpoint & 0xFF);
+    }
+    zb_u16(& mut out, h.cluster);
+    zb_u16(& mut out, h.profile);
+    out.push(h.src_endpoint & 0xFF);
+    out.push(h.counter & 0xFF);
+    var i: i64 = 0;
+    while i < payload.len() {
+        out.push(payload.get(i) & 0xFF);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Decode an APS data frame header (header_len = where the payload
+/// starts; 0 when the frame is too short or not a data frame).
+pub fn aps_decode(b: & Vec<i64>) -> ApsHeader {
+    var h: ApsHeader = aps_unicast(0, 0, 0, 0, 0);
+    if b.len() < 1 {
+        return h;
+    }
+    val fc: i64 = b.get(0);
+    h.frame_type = fc & 3;
+    h.delivery = (fc >> 2) & 3;
+    h.security = (fc & 0x20) != 0;
+    h.ack_request = (fc & 0x40) != 0;
+    if h.frame_type != APS_FRAME_DATA {
+        return h;
+    }
+    var p: i64 = 1;
+    if h.delivery == APS_DELIVERY_GROUP {
+        if b.len() < 3 {
+            return h;
+        }
+        h.group = zb_get16(b, 1);
+        p = 3;
+    } else {
+        if b.len() < 2 {
+            return h;
+        }
+        h.dst_endpoint = b.get(1);
+        p = 2;
+    }
+    if (fc & 0x80) != 0 {
+        // extended header: skip its control byte (no fragmentation support)
+        p = p + 1;
+    }
+    if b.len() < p + 6 {
+        return h;
+    }
+    h.cluster = zb_get16(b, p);
+    h.profile = zb_get16(b, p + 2);
+    h.src_endpoint = b.get(p + 4);
+    h.counter = b.get(p + 5);
+    h.header_len = p + 6;
+    return h;
+}
+
+pub fn aps_payload(b: & Vec<i64>, h: & ApsHeader) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = h.header_len;
+    while i < b.len() && h.header_len > 0 {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The radio seam: tx(handle, aps frame) -> 0 when queued, plus the
+/// network addressing a coordinator API needs (short address / group).
+pub struct ZigbeeRadio {
+    pub tx: fn(i64, Vec<i64>) -> i64,
+    pub radio: i64,
+    pub counter: i64,
+}
+
+/// Send a ZCL frame to an endpoint of the HA profile; the APS counter used.
+pub fn zigbee_send_zcl(r: & mut ZigbeeRadio, dst_ep: i64, cluster: i64, zcl: & ZclFrame) -> i64 {
+    r.counter = (r.counter + 1) & 0xFF;
+    val h: ApsHeader = aps_unicast(dst_ep, cluster, ZIGBEE_PROFILE_HA, 1, r.counter);
+    val f = r.tx;
+    if f(r.radio, aps_encode(& h, & zcl_encode(zcl))) != 0 {
+        return 0 - 1;
+    }
+    return r.counter;
+}

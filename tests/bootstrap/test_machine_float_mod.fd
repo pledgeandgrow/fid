@@ -1,0 +1,75 @@
+// MI17 (docs/roadmap/llvm-roadmap.md): `%` on floats on the machine layer
+// (`fid emit --nat`, `--target x86_64-linux|aarch64-linux|riscv64-linux`)
+// is C's fmod, as `fid run` and the C path give: compiler/nat_ir.fd
+// ng_gen_binop calls the runtime's pert_c_fmod (stdlib/linux_runtime/
+// math.fd, exact long division of the significands). It gave 0 before.
+// Checks: the sign follows the dividend, large quotients stay exact, a
+// zero divisor or an infinite dividend give NaN, an infinite divisor gives
+// the dividend, subnormals, -0.0, and f32 (widened, then narrowed).
+//
+// Expected output:
+// 1.5
+// -1.5
+// 1.5
+// 5
+// -5
+// 2
+// 4576918229304087680
+// 4610631102574423448
+// true
+// true
+// true
+// 1
+// true
+// 1.5
+// -1.5
+// 2.5
+
+fn main() -> i64 {
+    var a: f64 = 7.5;
+    var b: f64 = 2.0;
+    println(float_to_str(a % b));
+    println(float_to_str((0.0 - a) % b));
+    println(float_to_str(a % (0.0 - b)));
+    // quotients far past 2^53: the remainder is still exact
+    var big: f64 = 100000000000000000.0;
+    var seven: f64 = 7.0;
+    println(int_to_str((big % seven) as i64));
+    println(int_to_str(((0.0 - big) % seven) as i64));
+    var p60: f64 = 1152921504606847232.0;
+    println(int_to_str((p60 % 3.0) as i64));
+    // inexact operands: the bits of the exact remainder
+    var x1: f64 = 0.1;
+    var y1: f64 = 0.03;
+    println(int_to_str(p_f64_to_bits(x1 % y1)));
+    var x2: f64 = 1e300;
+    var y2: f64 = 3.7;
+    println(int_to_str(p_f64_to_bits(x2 % y2)));
+    // NaN for a zero divisor and an infinite dividend; an infinite divisor
+    // leaves the dividend
+    var zero: f64 = 0.0;
+    var nan1: f64 = 5.0 % zero;
+    println(nan1 != nan1);
+    var inf: f64 = 1e308 * 10.0;
+    var nan2: f64 = inf % 2.0;
+    println(nan2 != nan2);
+    println((3.0 % inf) == 3.0);
+    // subnormals: 3 * min % 2 * min = min
+    var s3: f64 = p_f64_from_bits(3);
+    var s2: f64 = p_f64_from_bits(2);
+    println(int_to_str(p_f64_to_bits(s3 % s2)));
+    // an exact multiple keeps the dividend's sign: -0.0
+    var m4: f64 = 0.0 - 4.0;
+    println(p_f64_to_bits(m4 % 2.0) < 0);
+    // f32
+    var fa: f32 = 7.5 as f32;
+    var fb: f32 = 2.0 as f32;
+    var fr: f32 = fa % fb;
+    println(float_to_str(fr as f64));
+    var fn1: f32 = (0.0 - 7.5) as f32;
+    var fr2: f32 = fn1 % (3.0 as f32);
+    println(float_to_str(fr2 as f64));
+    var fc: f32 = 8.5 as f32;
+    println(float_to_str((fc % (3.0 as f32)) as f64));
+    return 0;
+}

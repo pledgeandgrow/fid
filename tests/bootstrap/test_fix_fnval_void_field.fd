@@ -1,0 +1,73 @@
+// Test: a function value with no result, kept in a struct field and
+// called through an unannotated local (stdlib netcode: `val adv =
+// s.game.advance; adv(h, inputs)`). The local's type lost the `-> void`,
+// so the C build looked for a function returning a word and none matched:
+// abort() (exit 127). The interpreter worked. Also run it through
+// `fid ccompile`.
+// Expected output:
+// 7
+// 7 5 9
+// 7 5 9 13
+var g_log: Vec<i64> = Vec::new();
+
+struct Hooks {
+    put: fn(i64, Vec<i64>) -> void,
+    get: fn(i64) -> Vec<i64>,
+}
+
+fn put_sum(h: i64, xs: Vec<i64>) {
+    var s: i64 = h;
+    var i: i64 = 0;
+    while i < xs.len() {
+        s = s + xs.get(i);
+        i = i + 1;
+    }
+    g_log.push(s);
+}
+
+fn get_log(h: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(h);
+    var i: i64 = 0;
+    while i < g_log.len() {
+        out.push(g_log.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn run(k: Hooks) {
+    val put = k.put;
+    var xs: Vec<i64> = Vec::new();
+    xs.push(2);
+    xs.push(4);
+    put(1, xs);
+    println(int_to_str(g_log.get(0)));
+    var ys: Vec<i64> = Vec::new();
+    ys.push(5);
+    put(0, ys);
+    val get = k.get;
+    val all: Vec<i64> = get(9);
+    println(int_to_str(all.get(1)) + " " + int_to_str(all.get(2)) + " " + int_to_str(all.get(0)));
+}
+
+struct Session {
+    n: i64,
+    hooks: Hooks,
+}
+
+// through a field of a field of a `&mut` struct, as netcode does
+fn step(s: & mut Session) {
+    val put = s.hooks.put;
+    var xs: Vec<i64> = Vec::new();
+    xs.push(s.n);
+    put(3, xs);
+    s.n = s.n + 1;
+}
+
+fn main() {
+    run(Hooks { put: put_sum, get: get_log });
+    var s: Session = Session { n: 10, hooks: Hooks { put: put_sum, get: get_log } };
+    step(& mut s);
+    println(int_to_str(g_log.get(0)) + " " + int_to_str(g_log.get(1)) + " " + int_to_str(s.n - 2) + " " + int_to_str(g_log.get(2)));
+}

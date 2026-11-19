@@ -1,0 +1,136 @@
+// Test: SP12 (compile speed) changes to compiler/lower.fd keep the program's
+// meaning. The lowering now answers from tables what it found by scans of
+// the whole function per candidate: a variable's last use (the list's name
+// index, Lowerer_used_after / cowcheck's cow_names_stmt), the body's
+// `defer` (cur_has_defer, saved across a closure lowered inside), use
+// counts in the count-cancelling pass (lw_rc_use_counts), the drops of
+// stack Vecs (one pass, lw_rc_stack_drops), and the slot references of the
+// empty-drop pass (lw_rc_empty_block_refs). Each case below depends on one
+// of them giving the scan's answer: a moved value used again would print
+// garbage or be freed twice; a Vec header on the stack freed by Vec_drop
+// would crash.
+// Expected output:
+//   moved abc1 abc2
+//   kept base base
+//   after defer
+//   defer fn 6
+//   outer still abc
+//   closure 15
+//   vecs 3 30 2
+//   filled 5 0
+//   shared 4 4
+//   empty 0 1
+//   pairs xy xy
+//   loop 0 1 2
+//   sp12 ok
+
+fn keep_len(s: str) -> i64 {
+    return str_len(s);
+}
+
+fn moved() -> str {
+    var a: str = "abc" + int_to_str(1);
+    var b: str = a;
+    var c: str = "abc" + int_to_str(2);
+    var d: str = c;
+    return b + " " + d;
+}
+
+fn kept(base: str) -> str {
+    var x: str = base;
+    var y: str = base;
+    return x + " " + y;
+}
+
+fn with_defer(n: i64) -> i64 {
+    var s: str = "q" + int_to_str(n);
+    var t: str = s;
+    defer {
+        print("after defer\n");
+    }
+    return keep_len(t) + keep_len(s) + n - 1;
+}
+
+fn with_closure(n: i64) -> i64 {
+    var s: str = "abc";
+    val f = fn(k: i64) -> i64 {
+        var u: str = "z" + int_to_str(k);
+        var w: str = u;
+        return k + keep_len(w);
+    };
+    var r: i64 = f(n) + f(n + 1);
+    print("outer still " + s + "\n");
+    return r;
+}
+
+fn vecs() -> str {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    var w: Vec<i64> = Vec::new();
+    w.push(10);
+    w.push(20);
+    var total: i64 = w.get(0) + w.get(1);
+    var u: Vec<i64> = Vec::new();
+    u.push(7);
+    u.push(8);
+    return int_to_str(v.len()) + " " + int_to_str(total) + " " + int_to_str(u.len());
+}
+
+fn filled() -> str {
+    var f: Vec<i64> = Vec::filled(5, 0);
+    var g: Vec<i64> = Vec::filled(3, 9);
+    return int_to_str(f.len()) + " " + int_to_str(f.get(4) * g.len() - f.get(0));
+}
+
+fn shared(v: Vec<i64>) -> str {
+    var w: Vec<i64> = v;
+    var n: i64 = w.len();
+    var m: i64 = v.len();
+    return int_to_str(n) + " " + int_to_str(m);
+}
+
+fn empties(k: i64) -> str {
+    var e: Vec<i64> = Vec::new();
+    var x: Vec<i64> = Vec::new();
+    x = Vec::new();
+    if k > 0 {
+        x.push(k);
+    }
+    return int_to_str(e.len()) + " " + int_to_str(x.len());
+}
+
+fn pairs(a: str, b: str) -> str {
+    var p: str = a + b;
+    var q: str = p;
+    var r: str = p;
+    return q + " " + r;
+}
+
+fn main() -> i64 {
+    print("moved " + moved() + "\n");
+    print("kept " + kept("base") + "\n");
+    print("defer fn " + int_to_str(with_defer(3)) + "\n");
+    print("closure " + int_to_str(with_closure(5)) + "\n");
+    print("vecs " + vecs() + "\n");
+    print("filled " + filled() + "\n");
+    var sv: Vec<i64> = Vec::new();
+    sv.push(1);
+    sv.push(2);
+    sv.push(3);
+    sv.push(4);
+    print("shared " + shared(sv) + "\n");
+    print("empty " + empties(1) + "\n");
+    print("pairs " + pairs("x", "y") + "\n");
+    var line: str = "loop";
+    var i: i64 = 0;
+    while i < 3 {
+        var piece: str = " " + int_to_str(i);
+        line = line + piece;
+        i = i + 1;
+    }
+    print(line + "\n");
+    print("sp12 ok\n");
+    return 0;
+}

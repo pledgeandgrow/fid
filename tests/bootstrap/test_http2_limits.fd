@@ -1,0 +1,278 @@
+// stdlib/http2 (competitive SL1): the limits a connection announces and
+// enforces, driven by hand (no socket, as test_http2_frames.fd):
+//   - our SETTINGS carry MAX_HEADER_LIST_SIZE (6 = 65536) and must be
+//     acknowledged in time: past the deadline the connection ends with
+//     GOAWAY SETTINGS_TIMEOUT (6.5.3); an ACK clears the deadline;
+//   - a request whose fields are larger than MAX_HEADER_LIST_SIZE gets 431
+//     (and RST_STREAM NO_ERROR if it was not over); the HPACK table stays
+//     in step, so the next request is answered;
+//   - a field value with CR or LF is malformed (8.2.1): stream error;
+//   - a client refuses a response larger than its limit (RST_STREAM
+//     CANCEL), and does not send a request larger than the server's.
+//
+// Expected output:
+// server starts: SETTINGS stream 0 flags 0 length 18 [3=100] [4=1048576] [6=65536]
+// deadline set true
+// overdue 1 ms before: false
+// overdue at the deadline: true
+// then: GOAWAY stream 0 flags 0 length 33: last 0 SETTINGS_TIMEOUT "SETTINGS not acknowledged"
+// connection ok false
+// acknowledged: deadline 0, overdue false
+// list size of 2 fields: 70
+// stream 1: HEADERS :status=431 end
+// stream 3: HEADERS :status=431 end, RST_STREAM NO_ERROR
+// stream 5: HEADERS :status=200, DATA "path /ok" end
+// stream 7: RST_STREAM PROTOCOL_ERROR
+// server connection ok true
+// client refuses: RST_STREAM 1 CANCEL, status 0, stream reset: CANCEL
+// client within the server's limit: stream 3
+// client over the server's limit: -1
+use http;
+use http2;
+use hpack;
+use vec;
+use string;
+
+fn handler(req: HttpRequest) -> str {
+    return build_response(200, "text/plain", "path " + req.path);
+}
+
+fn take(c: & mut H2Conn) -> Vec<H2Frame> {
+    val out: Vec<i64> = c.out;
+    c.out = Vec::new();
+    return h2_frames_decode(out, 0);
+}
+
+fn big(n: i64) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < n {
+        sb.append_str("a");
+        i = i + 1;
+    }
+    return sb.to_str();
+}
+
+fn request(path: str) -> Vec<str> {
+    var n: Vec<str> = Vec::new();
+    n.push(":method");
+    n.push(":scheme");
+    n.push(":authority");
+    n.push(":path");
+    return n;
+}
+
+fn request_vals(path: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("GET");
+    v.push("http");
+    v.push("example.org");
+    v.push(path);
+    return v;
+}
+
+// A header block as HEADERS and CONTINUATION frames of 16384 bytes at most.
+fn put_block(b: & mut Vec<i64>, id: i64, block: Vec<i64>, end_stream: bool) {
+    if block.len() <= 16384 {
+        h2_put_frame(b, h2_headers_frame(id, block, end_stream, true));
+        return;
+    }
+    var part: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16384 {
+        part.push(block.get(i));
+        i = i + 1;
+    }
+    h2_put_frame(b, h2_headers_frame(id, part, end_stream, false));
+    var at: i64 = 16384;
+    while at < block.len() {
+        var p: Vec<i64> = Vec::new();
+        var end: i64 = at + 16384;
+        if end > block.len() {
+            end = block.len();
+        }
+        var k: i64 = at;
+        while k < end {
+            p.push(block.get(k));
+            k = k + 1;
+        }
+        h2_put_frame(b, h2_continuation_frame(id, p, end == block.len()));
+        at = end;
+    }
+}
+
+fn feed(c: & mut H2Conn, b: Vec<i64>) {
+    val fs: Vec<H2Frame> = h2_frames_decode(b, 0);
+    var i: i64 = 0;
+    var alive: bool = true;
+    while i < fs.len() && alive {
+        alive = h2_process(c, fs.get(i));
+        if alive && !c.client {
+            h2_server_step(c);
+        }
+        i = i + 1;
+    }
+}
+
+// A line per frame of `fs`, in order: HEADERS decoded with `dec` (one
+// decoder for all of them: the dynamic table is the connection's).
+fn describe_all(fs: Vec<H2Frame>, dec: & mut Hpack) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < fs.len() {
+        val f: H2Frame = fs.get(i);
+        var d: str = h2_type_name(f.ftype);
+        if f.ftype == H2_HEADERS {
+            val hl: HpackHeaders = hpack_decode(dec, h2_parse(f).data);
+            if hl.ok && hl.names.len() > 0 {
+                d = "HEADERS " + hl.names.get(0) + "=" + hl.vals.get(0);
+            } else {
+                d = "HEADERS (undecodable)";
+            }
+        } else if f.ftype == H2_RST_STREAM {
+            d = "RST_STREAM " + h2_error_name(h2_parse(f).code);
+        } else if f.ftype == H2_DATA {
+            d = "DATA \"" + str_from_bytes(h2_parse(f).data) + "\"";
+        }
+        if (f.ftype == H2_HEADERS || f.ftype == H2_DATA) && (f.flags & H2_FLAG_END_STREAM) != 0 {
+            d = d + " end";
+        }
+        out.push(d);
+        i = i + 1;
+    }
+    return out;
+}
+
+// The lines of the frames of stream `id`.
+fn answer(fs: Vec<H2Frame>, ds: Vec<str>, id: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < fs.len() {
+        if fs.get(i).stream == id {
+            if out != "" {
+                out = out + ", ";
+            }
+            out = out + ds.get(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn settings_timeout() {
+    var c: H2Conn = h2_conn_new(- 1, false, "");
+    h2_conn_start(& mut c);
+    val start: Vec<H2Frame> = take(& mut c);
+    println("server starts: " + h2_frame_describe(start.get(0)));
+    val d: i64 = c.settings_deadline;
+    println("deadline set " + bool_to_str(d > 0));
+    println("overdue 1 ms before: " + bool_to_str(h2_settings_overdue(& mut c, d - 1)));
+    println("overdue at the deadline: " + bool_to_str(h2_settings_overdue(& mut c, d)));
+    val after: Vec<H2Frame> = take(& mut c);
+    println("then: " + h2_frame_describe(after.get(0)));
+    println("connection ok " + bool_to_str(c.ok));
+    var c2: H2Conn = h2_conn_new(- 1, false, "");
+    h2_conn_start(& mut c2);
+    take(& mut c2);
+    var b: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b, h2_settings_frame(Vec::new(), Vec::new()));
+    h2_put_frame(& mut b, h2_settings_ack());
+    feed(& mut c2, b);
+    println("acknowledged: deadline " + int_to_str(c2.settings_deadline) + ", overdue " + bool_to_str(h2_settings_overdue(& mut c2, c2.settings_deadline + 1000000000)));
+}
+
+fn header_lists() {
+    var two_n: Vec<str> = Vec::new();
+    var two_v: Vec<str> = Vec::new();
+    two_n.push("ab");
+    two_v.push("cde");
+    two_n.push("x");
+    two_v.push("");
+    // (2 + 3 + 32) + (1 + 0 + 32)
+    println("list size of 2 fields: " + int_to_str(h2_header_list_size(two_n, two_v)));
+    http2_set_handler(handler);
+    var c: H2Conn = h2_conn_new(- 1, false, "");
+    h2_conn_start(& mut c);
+    take(& mut c);
+    var enc: Hpack = hpack_new(4096);
+    var dec: Hpack = hpack_new(4096);
+    var b: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b, h2_settings_frame(Vec::new(), Vec::new()));
+    // Stream 1: a GET whose fields are past 65536 bytes, ending the stream
+    var n1: Vec<str> = request("/big");
+    var v1: Vec<str> = request_vals("/big");
+    n1.push("x-big");
+    v1.push(big(66000));
+    put_block(& mut b, 1, hpack_encode(& mut enc, n1, v1), true);
+    // Stream 3: as large, with a body still to come
+    put_block(& mut b, 3, hpack_encode(& mut enc, n1, v1), false);
+    // Stream 5: a small GET, answered
+    put_block(& mut b, 5, hpack_encode(& mut enc, request("/ok"), request_vals("/ok")), true);
+    // Stream 7: a value with CR LF
+    var n7: Vec<str> = request("/bad");
+    var v7: Vec<str> = request_vals("/bad");
+    n7.push("x-bad");
+    v7.push("a\r\nb");
+    put_block(& mut b, 7, hpack_encode(& mut enc, n7, v7), true);
+    feed(& mut c, b);
+    val fs: Vec<H2Frame> = take(& mut c);
+    val ds: Vec<str> = describe_all(fs, & mut dec);
+    println("stream 1: " + answer(fs, ds, 1));
+    println("stream 3: " + answer(fs, ds, 3));
+    println("stream 5: " + answer(fs, ds, 5));
+    println("stream 7: " + answer(fs, ds, 7));
+    println("server connection ok " + bool_to_str(c.ok));
+}
+
+fn client_limits() {
+    // A response larger than our limit
+    var c: H2Conn = h2_conn_new(- 1, true, "example.org");
+    h2_conn_start(& mut c);
+    take(& mut c);
+    val id: i64 = http2_request(& mut c, "GET", "/", Vec::new(), Vec::new(), "");
+    take(& mut c);
+    var enc: Hpack = hpack_new(4096);
+    var b: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b, h2_settings_frame(Vec::new(), Vec::new()));
+    var rn: Vec<str> = Vec::new();
+    var rv: Vec<str> = Vec::new();
+    rn.push(":status");
+    rv.push("200");
+    rn.push("x-big");
+    rv.push(big(66000));
+    put_block(& mut b, id, hpack_encode(& mut enc, rn, rv), true);
+    feed(& mut c, b);
+    val fs: Vec<H2Frame> = take(& mut c);
+    var rst: str = "none";
+    var i: i64 = 0;
+    while i < fs.len() {
+        if fs.get(i).ftype == H2_RST_STREAM {
+            rst = "RST_STREAM " + int_to_str(fs.get(i).stream) + " " + h2_error_name(h2_parse(fs.get(i)).code);
+        }
+        i = i + 1;
+    }
+    val r: Http2Response = http2_wait(& mut c, id);
+    println("client refuses: " + rst + ", status " + int_to_str(r.status) + ", " + r.error);
+    // The server's MAX_HEADER_LIST_SIZE is 300: a small request fits (176),
+    // one with a 200-byte field does not
+    var b2: Vec<i64> = Vec::new();
+    var ids: Vec<i64> = Vec::new();
+    var vals: Vec<i64> = Vec::new();
+    ids.push(H2_SETTINGS_MAX_HEADER_LIST_SIZE);
+    vals.push(300);
+    h2_put_frame(& mut b2, h2_settings_frame(ids, vals));
+    feed(& mut c, b2);
+    println("client within the server's limit: stream " + int_to_str(http2_request(& mut c, "GET", "/", Vec::new(), Vec::new(), "")));
+    var xn: Vec<str> = Vec::new();
+    var xv: Vec<str> = Vec::new();
+    xn.push("x-long");
+    xv.push(big(200));
+    println("client over the server's limit: " + int_to_str(http2_request(& mut c, "GET", "/", xn, xv, "")));
+}
+
+fn main() -> i64 {
+    settings_timeout();
+    header_lists();
+    client_limits();
+    return 0;
+}

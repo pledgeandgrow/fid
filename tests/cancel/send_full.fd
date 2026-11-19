@@ -1,0 +1,43 @@
+// A send on a full channel respects the token slot (complaint-roadmap CA7):
+// with a token in the slot whose deadline passes, the send gives up (false,
+// as on a closed channel) instead of blocking the thread for good; with
+// room in the channel it sends at once. Compiled backends only (fid
+// ccompile, fid emit): the interpreter's channels have no capacity, so a
+// send there never waits (tests/cancel/check.sh runs this file).
+//
+// Expected output:
+// first send: true
+// full send: false fast true
+// after: 1 left
+use string;
+use sync;
+
+fn make_token(ms: i64) -> i64 {
+    var tok: i64 = 0;
+    // SAFETY: three words, read and written through p_atomic_* only
+    unsafe {
+        tok = p_malloc(24);
+    }
+    p_atomic_store(tok, 0);
+    // the deadline clock of tokens (C6)
+    p_atomic_store(tok + 8, p_clock_mono_ms() + ms);
+    p_atomic_store(tok + 16, 0);
+    return tok;
+}
+
+fn main() -> i64 {
+    val ch: i64 = sync_channel_create(1);
+    val tok: i64 = make_token(40);
+    p_task_set_token(tok);
+    println("first send: " + bool_to_str(sync_channel_send(ch, 1)));
+    val t0: i64 = p_clock_now_ms();
+    val sent: bool = sync_channel_send(ch, 2);
+    p_task_set_token(0);
+    println("full send: " + bool_to_str(sent) + " fast " + bool_to_str(p_clock_now_ms() - t0 < 2000));
+    var left: i64 = 0;
+    while sync_channel_try_recv(ch) != SYNC_CHAN_PENDING {
+        left = left + 1;
+    }
+    println("after: " + int_to_str(left) + " left");
+    return 0;
+}

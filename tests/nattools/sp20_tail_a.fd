@@ -1,0 +1,41 @@
+// SP20 (docs/roadmap/llvm-roadmap.md), with tests/nattools/sp20_tail_b.fd
+// and tests/nattools/sp20_fncache_tail_check.sh: a build with the
+// per-function cache (FID_FNCACHE) makes the same tail jumps as one without
+// it (MI28's escape summaries, compiler/nat_ir.fd ng_ft_esc_map,
+// nc_note_ft), and a replayed caller whose callee's summary changed is
+// compiled again (nc_ft_hold, nc_deps_ok).
+// Version A: `look` reads its struct through the address and keeps
+// nothing of it (a clean summary), so `walk`'s tail call, which passes
+// only numbers, is a jump. Version B changes only `look`: it keeps the
+// address, so `walk`'s frame escapes and its tail call must stay a call.
+// `walk` is the same in both (same lines too: the machine layer keeps
+// source lines in its code), so building B with the cache A left replays
+// it unless the summary it read is checked.
+// Expected output:
+// 4398
+// 87
+
+struct Acc { a: i64, b: i64, c: i64 }
+
+var g_kept: i64 = 0;
+
+fn walk(n: i64, total: i64) -> i64 {
+    if n == 0 {
+        return total;
+    }
+    var t: Acc = Acc { a: n % 7, b: n % 5, c: 1 };
+    return walk(n - 1, total + look(&t, 1));
+}
+
+// recursive, so never inlined
+fn look(t: &Acc, d: i64) -> i64 {
+    if d <= 0 {
+        return t.a + t.b * 2 + t.c * 3;
+    }
+    return look(t, d - 1) + 1;
+}
+
+fn main() {
+    println(walk(400, 0));
+    println(g_kept + 87);
+}

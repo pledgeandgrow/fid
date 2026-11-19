@@ -1,0 +1,80 @@
+// DB4 (docs/roadmap/llvm-roadmap.md): lexical scopes in the native
+// builds' .debug_info. A name bound twice (an inner `var x` that shadows
+// the outer one, `var e` in two loops) gets a DW_TAG_lexical_block per
+// binding (compiler/nat_ir.fd ng_dbg_scope_lines / ng_dbg_scope_blocks,
+// compiler/nat_enc.fd nat_dbg_put_vars), so a debugger shows the binding
+// in scope at the stop, not both:
+//   fid emit tests/bootstrap/test_machine_dbg_scopes.fd --target x86_64-linux -o t
+//   python3 tests/nattools/dbg_scopes_check.py t tests/bootstrap/test_machine_dbg_scopes.fd
+//   python3 tests/nattools/dbg_run_check.py t tests/bootstrap/test_machine_dbg_scopes.fd
+//   fid emit ... --debug -o td; python3 tests/nattools/dbg_run_check.py td ... --strict
+//   FID_NAT_OFF=mir fid emit ... --target aarch64-linux -o tm (the direct path)
+// (also aarch64-linux, riscv64-linux). `// @name` marks a line to stop on,
+// `// dbg name#hit var=value` what the variables hold there (the innermost
+// binding of each name; `!`: available even in the optimized build),
+// `// dbg-scope fn name count` how many lexical blocks of `fn` at least
+// hold a `name`, and `// dbg-in marker name depth` how many blocks deep the
+// innermost binding of `name` is at the marker (dbg_scopes_check.py).
+// gdb: `break test_machine_dbg_scopes.fd:<line>`, `info locals`, `print x`.
+// Expected output:
+// 56
+// 18
+// 61
+
+fn shadow(n: i64) -> i64 {
+    var x: i64 = n + 1;
+    var total: i64 = 0;
+    if n > 2 {
+        var x: i64 = n * 10;
+        total = total + x; // @inner
+        if total > 1000000 {
+            println(total);
+        }
+    }
+    total = total + x; // @outer
+    if total > 1000000 {
+        println(x);
+    }
+    return total;
+}
+
+fn twice(k: i64) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < k {
+        var e: i64 = i * 2;
+        sum = sum + e; // @first
+        if sum > 1000000 {
+            println(e);
+        }
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < k {
+        var e: i64 = j * 3 + 1;
+        sum = sum + e; // @second
+        if sum > 1000000 {
+            println(e);
+        }
+        j = j + 1;
+    }
+    return sum;
+}
+
+// dbg inner#1 n=5 x=50 total=0
+// dbg outer#1 n=5 x=6 total=50
+// dbg first#2 e=2 sum=0 i=1
+// dbg second#2 e=4 sum=7 j=1
+// dbg-scope shadow x 2
+// dbg-scope twice e 2
+// dbg-in inner x 2
+// dbg-in outer x 1
+// dbg-in inner total 0
+// dbg-in first e 1
+// dbg-in second e 1
+
+fn main() {
+    println(shadow(5));
+    println(twice(3));
+    println(shadow(5) + 5);
+}

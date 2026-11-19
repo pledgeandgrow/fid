@@ -29,9 +29,7 @@
 //
 // Dependencies: compiler::ast
 
-module compiler::borrowck;
- use core; use vec; use string; use compiler::ast;
-// --- Vec-based map entry structs ------------------------------------------
+module compiler::borrowck; use core; use vec; use string; use compiler::ast; use compiler::escape;  // --- Vec-based map entry structs ------------------------------------------
 // These replace HashMap<String, T> with Vec<Entry> + linear search.
 
 // shared_borrows: var -> set of borrowers (Vec<str>)
@@ -378,6 +376,25 @@ pub struct BorrowChecker {
 
     // Active mode -- controls whether violations become errors or warnings.
     pub mode: BorrowckMode,
+
+    // CS5: a worker of the parallel check reads the LG3 tables from copies
+    // of its own (par_lt: lt_ties and lt_self_mut, made by the worker from
+    // g_bc_lt_ties and g_bc_lt_self_mut); the sequential check reads those.
+    pub par_lt: bool,
+    pub lt_ties: Vec<Vec<i64>>,
+    pub lt_self_mut: Vec<bool>,
+    // LG3: a `&mut` passed on (`val m = &mut a; val r = f(m)`): mh_to[i]
+    // took over the mutable borrow mh_from[i] held, which gets it back if
+    // mh_to[i] ends first (bc_hand_over_mut, release_borrow_one)
+    pub mh_to: Vec<str>,
+    pub mh_from: Vec<str>,
+    // LG3: some borrower holds further borrows under `name#k` (bc_tie_borrow),
+    // so release_borrow_by looks for them
+    pub alias_seen: bool,
+    // LG3: HashMap name -> 1 for the variables bound to a reference
+    // (`val q = &a`): a method called on one borrows what it points to,
+    // not the variable (bc_record_method_borrow)
+    pub ref_vars: i64,
 }
 
 /// Free the borrow checker's index maps (raw handles) once checked.
@@ -394,6 +411,8 @@ pub fn BorrowChecker_free_maps(self: & mut BorrowChecker) {
     self.sb_pfx = HashMap_new();
     HashMap_drop(self.mb_pfx);
     self.mb_pfx = HashMap_new();
+    HashMap_drop(self.ref_vars);
+    self.ref_vars = HashMap_new();
 }
 
 pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
@@ -401,7 +420,7 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
     var scope_stack: Vec<StringVec> = Vec::new();
     scope_stack.push(scope);
     return BorrowChecker {
-        shared_borrows: Vec::new(), mut_borrow: Vec::new(), borrow_of: Vec::new(), scope_stack: scope_stack, unsafe_depth: 0, current_func: OptStr::None, temp_counter: 0, stmt_line: 0, temp_checkpoints: Vec::new(), reserved_mut_borrows: Vec::new(), in_reservation_phase: false, dead_at: Vec::new(), last_use: Vec::new(), last_use_index: HashMap_new(), sb_ix: HashMap_new(), mb_ix: HashMap_new(), bo_ix: HashMap_new(), sb_pfx: HashMap_new(), mb_pfx: HashMap_new(), iterating: Vec::new(), skip_bodies: 0, stmt_index: 0, errors: Vec::new(), warnings: Vec::new(), mode: mode,
+        shared_borrows: Vec::new(), mut_borrow: Vec::new(), borrow_of: Vec::new(), scope_stack: scope_stack, unsafe_depth: 0, current_func: OptStr::None, temp_counter: 0, stmt_line: 0, temp_checkpoints: Vec::new(), reserved_mut_borrows: Vec::new(), in_reservation_phase: false, dead_at: Vec::new(), last_use: Vec::new(), last_use_index: HashMap_new(), sb_ix: HashMap_new(), mb_ix: HashMap_new(), bo_ix: HashMap_new(), sb_pfx: HashMap_new(), mb_pfx: HashMap_new(), iterating: Vec::new(), skip_bodies: 0, stmt_index: 0, errors: Vec::new(), warnings: Vec::new(), mode: mode, par_lt: false, lt_ties: Vec::new(), lt_self_mut: Vec::new(), mh_to: Vec::new(), mh_from: Vec::new(), alias_seen: false, ref_vars: HashMap_new(),
     };
 }
 
@@ -414,8 +433,7 @@ pub fn BorrowChecker_new(mode: BorrowckMode) -> BorrowChecker {
 // The units a parallel check walks, shared read-only with the workers for
 // the duration of the spawn/await block: spawn arguments must be @send and
 // Vec<Func> is not, so the worker receives only chunk bounds.
-pub var g_bc_units: Vec<Func> = Vec::new();
- pub fn bc_par_workers() -> i64 {
+pub var g_bc_units: Vec<Func> = Vec::new(); pub fn bc_par_workers() -> i64 {
     var r: i64 = p_getenv("FID_PAR");
     if r == 0 {
         return 1;
@@ -443,10 +461,17 @@ pub var g_bc_units: Vec<Func> = Vec::new();
 // Worker for the parallel borrow check (CS5). A spawned worker checks a
 // contiguous chunk of functions with its own BorrowChecker; concatenating
 // the chunks' results in order reproduces the sequential diagnostic order
-// exactly. Vec arguments arrive copy-on-write, so workers share nothing
-// mutable with the caller or each other.
+// exactly. Owner counts are not atomic, so no two threads may copy or drop
+// the same Vec or string (escape.fd "Parallel reporting pass"): a worker
+// reads the LG3 tables from copies of its own (made here; the globals are
+// only read), passes its units to check_func without keeping them, and the
+// chunks never split an impl block or the trait impls (par_chunk_bounds),
+// the only places where two functions' ASTs share pieces.
 pub fn bc_par_worker(s: i64, e: i64) -> Vec<str> {
     var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::On);
+    bc.lt_ties = par_own_i64ss(g_bc_lt_ties);
+    bc.lt_self_mut = par_own_bools(g_bc_lt_self_mut);
+    bc.par_lt = true;
     var i: i64 = s;
     while i < e {
         check_func(& mut bc, g_bc_units.get(i));
@@ -455,6 +480,540 @@ pub fn bc_par_worker(s: i64, e: i64) -> Vec<str> {
     var out: Vec<str> = bc.errors;
     BorrowChecker_free_maps(& mut bc);
     return out;
+}
+
+// LG3: function name -> index + 1 into g_bc_lt_ties (0: not built yet), and
+// for each such function the parameters its result borrows from by its
+// signature (`fn f<'a>(x: &'a T, y: &T) -> &'a T`: [0]). Module globals,
+// so the parallel workers of check() read them as they read g_bc_units.
+var g_bc_lt_index: i64 = 0; var g_bc_lt_ties: Vec<Vec<i64>> = Vec::new();
+// LG3: for each entry of g_bc_lt_ties, whether parameter 0 is `&mut` (a
+// method's receiver is borrowed the way its `self` is), and whether any
+// entry ties more than one parameter (then a borrower can hold several
+// borrows: `r`, `r#1`, `r#2`, ..., released together by release_borrow_by).
+var g_bc_lt_self_mut: Vec<bool> = Vec::new(); var g_bc_lt_multi: bool = false;
+// LG3: method name -> 1 when every user method of that name (impls, trait
+// impls, trait declarations) takes its receiver as `&` or by value, so a
+// call only reads it; 2 when one takes `&mut self` (bc_user_read_method).
+// Struct name -> 1 for a struct with lifetime parameters
+// (`struct View<'a> { r: &'a i64 }`): its values hold references.
+// Built once before the walk; the parallel workers only read them.
+var g_bc_meth_kind: i64 = 0; var g_bc_lt_structs: i64 = 0;
+
+/// LG3: the parameters entry `k` of g_bc_lt_ties ties; a parallel worker
+/// reads its own copy (CS5).
+fn bc_lt_ties_at(self: & BorrowChecker, k: i64) -> Vec<i64> {
+    if self.par_lt {
+        return self.lt_ties.get(k);
+    }
+    return g_bc_lt_ties.get(k);
+}
+
+fn bc_lt_self_mut_at(self: & BorrowChecker, k: i64) -> bool {
+    if self.par_lt {
+        return self.lt_self_mut.get(k);
+    }
+    return g_bc_lt_self_mut.get(k);
+}
+
+/// LG3: the parameters `f`'s result borrows from. With lifetimes, those its
+/// signature ties (`func_lifetime_ties`); without lifetimes, a result of
+/// reference type may borrow from any reference parameter (the escape check
+/// infers which; the borrow checker takes all of them, which is sound).
+/// Empty: the result borrows nothing.
+pub fn bc_sig_ties(f: Func) -> Vec<i64> {
+    if func_has_lifetimes(f) {
+        return func_lifetime_ties(f);
+    }
+    return bc_elided_ties(f.params, f.ret_ty);
+}
+
+/// LG3: the same for a trait's method declaration (its `@lifetime`
+/// annotations, or every reference parameter without them).
+fn bc_trait_sig_ties(tm: TraitMethod) -> Vec<i64> {
+    if ann_lifetimes(tm.annotations).len() > 0 {
+        return trait_method_lifetime_ties(tm);
+    }
+    return bc_elided_ties(tm.params, tm.ret_ty);
+}
+
+/// A signature without lifetimes: a result holding a reference may borrow
+/// from every parameter holding one.
+fn bc_elided_ties(params: Vec<Param>, ret_ty: Type) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if !bc_is_ref_type(ret_ty) {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < params.len() {
+        if bc_is_ref_type(params.get(i).ty) {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A reference, or a value of a struct with lifetime parameters (it holds
+/// references: `View<'a>`).
+fn bc_is_ref_type(t: Type) -> bool {
+    match t {
+        Type::Ref(_, _) => {
+            return true;
+        }
+        Type::Named(n) => {
+            return g_bc_lt_structs != 0 && HashMap_get(g_bc_lt_structs, n) != 0;
+        }
+        Type::Generic(gn, _) => {
+            return g_bc_lt_structs != 0 && HashMap_get(g_bc_lt_structs, gn) != 0;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// LG3: method name -> 1 (reads its receiver) or 2 (`&mut self`), for
+/// `f` with a `self` first parameter; the strongest kind wins.
+fn bc_meth_kind_add(name: str, params: Vec<Param>) {
+    if params.len() == 0 {
+        return;
+    }
+    if params.get(0).name != "self" {
+        return;
+    }
+    var kind: i64 = 1;
+    match params.get(0).ty {
+        Type::Ref(_, m) => {
+            if m {
+                kind = 2;
+            }
+        }
+        _ => {
+        }
+    }
+    if HashMap_get(g_bc_meth_kind, name) < kind {
+        HashMap_insert(g_bc_meth_kind, name, kind);
+    }
+}
+
+/// Builtin methods that change their receiver: a user method of the same
+/// name taking `&self` does not make `v.push(x)` on a Vec a read.
+fn bc_builtin_mut_method(m: str) -> bool {
+    return m == "push" || m == "pop" || m == "set" || m == "insert" || m == "remove" || m == "clear" || m == "extend" || m == "append" || m == "truncate" || m == "sort" || m == "sort_by" || m == "reverse" || m == "swap" || m == "drain" || m == "retain" || m == "push_str" || m == "push_back" || m == "push_front" || m == "pop_back" || m == "pop_front" || m == "resize" || m == "dedup" || m == "fill" || m == "reserve" || m == "take" || m == "replace" || m == "get_mut" || m == "iter_mut" || m == "split_off" || m == "shrink_to_fit" || m == "write" || m == "set_len";
+}
+
+/// LG3: whether `recv.m(..)` only reads `recv` because every user method
+/// called `m` takes `self` as `&` or by value (a struct value is a copy).
+fn bc_user_read_method(m: str) -> bool {
+    if g_bc_meth_kind == 0 || bc_builtin_mut_method(m) {
+        return false;
+    }
+    return HashMap_get(g_bc_meth_kind, m) == 1;
+}
+
+fn bc_param0_mut(f: Func) -> bool {
+    if f.params.len() == 0 {
+        return false;
+    }
+    match f.params.get(0).ty {
+        Type::Ref(_, m) => {
+            return m;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// Record `key` -> ties. A key seen before (one method name in several
+/// impls: the borrow checker does not know the receiver's type) gets the
+/// union of the ties, which over-approximates each.
+fn bc_lt_add(key: str, ties: Vec<i64>, self_mut: bool) {
+    if ties.len() == 0 {
+        return;
+    }
+    if ties.len() > 1 {
+        g_bc_lt_multi = true;
+    }
+    var slot: i64 = HashMap_get(g_bc_lt_index, key);
+    if slot == 0 {
+        g_bc_lt_ties.push(ties);
+        g_bc_lt_self_mut.push(self_mut);
+        HashMap_insert(g_bc_lt_index, key, g_bc_lt_ties.len());
+        return;
+    }
+    var old: Vec<i64> = g_bc_lt_ties.get(slot - 1);
+    var merged: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < old.len() {
+        merged.push(old.get(k));
+        k = k + 1;
+    }
+    var i: i64 = 0;
+    while i < ties.len() {
+        var t: i64 = ties.get(i);
+        var have: bool = false;
+        var j: i64 = 0;
+        while j < merged.len() {
+            if merged.get(j) == t {
+                have = true;
+            }
+            j = j + 1;
+        }
+        if !have {
+            merged.push(t);
+        }
+        i = i + 1;
+    }
+    if merged.len() > 1 {
+        g_bc_lt_multi = true;
+    }
+    g_bc_lt_ties.set(slot - 1, merged);
+    if self_mut {
+        g_bc_lt_self_mut.set(slot - 1, true);
+    }
+}
+
+fn bc_collect_lifetime_ties(program: Program) {
+    if g_bc_lt_index == 0 {
+        g_bc_lt_index = HashMap_new();
+    } else {
+        HashMap_clear(g_bc_lt_index);
+    }
+    g_bc_lt_ties = Vec::new();
+    g_bc_lt_self_mut = Vec::new();
+    g_bc_lt_multi = false;
+    if g_bc_meth_kind == 0 {
+        g_bc_meth_kind = HashMap_new();
+    } else {
+        HashMap_clear(g_bc_meth_kind);
+    }
+    if g_bc_lt_structs == 0 {
+        g_bc_lt_structs = HashMap_new();
+    } else {
+        HashMap_clear(g_bc_lt_structs);
+    }
+    // Structs with lifetime parameters first: bc_sig_ties counts their
+    // values as holding references
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        var sd: StructDef = program.structs.get(si);
+        if ann_lifetimes(sd.annotations).len() > 0 {
+            HashMap_insert(g_bc_lt_structs, sd.name, 1);
+            // a literal holding several references: `v`, `v#1`, ...
+            g_bc_lt_multi = true;
+        }
+        si = si + 1;
+    }
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        var f: Func = program.funcs.get(i);
+        if HashMap_get(g_bc_lt_index, f.name) == 0 {
+            bc_lt_add(f.name, bc_sig_ties(f), bc_param0_mut(f));
+        }
+        i = i + 1;
+    }
+    // Methods: `recv.m(args)` under ".m" (parameter 0 is the receiver), and
+    // `Type_m(&recv, args)` under the name a method is called by as a function
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            var m: Func = imp.methods.get(mi);
+            var ties: Vec<i64> = bc_sig_ties(m);
+            var smut: bool = bc_param0_mut(m);
+            bc_meth_kind_add(m.name, m.params);
+            bc_lt_add("." + m.name, ties, smut);
+            if HashMap_get(g_bc_lt_index, imp.struct_name + "_" + m.name) == 0 {
+                bc_lt_add(imp.struct_name + "_" + m.name, ties, smut);
+            }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    // Trait-impl methods: a call through the trait reaches one of them, so
+    // ".m" holds the union over every implementation
+    var ti: i64 = 0;
+    while ti < program.trait_impls.len() {
+        var timp: TraitImpl = program.trait_impls.get(ti);
+        var tm: i64 = 0;
+        while tm < timp.methods.len() {
+            var m2: Func = timp.methods.get(tm);
+            bc_meth_kind_add(m2.name, m2.params);
+            bc_lt_add("." + m2.name, bc_sig_ties(m2), bc_param0_mut(m2));
+            tm = tm + 1;
+        }
+        ti = ti + 1;
+    }
+    // Trait declarations: a call through `dyn Tr` (or a default method)
+    // reaches an impl the program may not contain; the trait's signature
+    // (its lifetimes, which every impl's must stay within) covers it
+    var tdi: i64 = 0;
+    while tdi < program.traits.len() {
+        var td: TraitDef = program.traits.get(tdi);
+        var tmi: i64 = 0;
+        while tmi < td.methods.len() {
+            var tmeth: TraitMethod = td.methods.get(tmi);
+            var tsm: bool = false;
+            if tmeth.params.len() > 0 {
+                match tmeth.params.get(0).ty {
+                    Type::Ref(_, rm) => {
+                        tsm = rm;
+                    }
+                    _ => {
+                    }
+                }
+            }
+            bc_meth_kind_add(tmeth.name, tmeth.params);
+            bc_lt_add("." + tmeth.name, bc_trait_sig_ties(tmeth), tsm);
+            tmi = tmi + 1;
+        }
+        tdi = tdi + 1;
+    }
+}
+
+/// LG3: the borrow number `count` of `name`: `name` itself for the first,
+/// `name#k` for each further one (released with `name`).
+fn bc_alias(name: str, count: i64) -> str {
+    if count == 0 {
+        return name;
+    }
+    return name + "#" + int_to_str(count);
+}
+
+/// LG3: the borrows `n` holds: its own and those of `n#1`, `n#2`, ...
+fn bc_held_borrows(self: & BorrowChecker, n: str) -> Vec<BorrowOfEntry> {
+    var out: Vec<BorrowOfEntry> = Vec::new();
+    var bi: i64 = HashMap_get(self.bo_ix, n);
+    if bi > 0 {
+        out.push(self.borrow_of.get(bi - 1));
+    }
+    if g_bc_lt_multi || self.alias_seen {
+        var k: i64 = 1;
+        var ai: i64 = HashMap_get(self.bo_ix, n + "#1");
+        while ai > 0 {
+            out.push(self.borrow_of.get(ai - 1));
+            k = k + 1;
+            ai = HashMap_get(self.bo_ix, n + "#" + int_to_str(k));
+        }
+    }
+    return out;
+}
+
+/// LG3: `name` borrows `path` too, as its borrow number `count`.
+fn bc_tie_borrow(self: & mut BorrowChecker, name: str, path: str, is_mut: bool, count: i64, line: i64) -> void {
+    if count > 0 {
+        self.alias_seen = true;
+    }
+    create_borrow(self, path, bc_alias(name, count), is_mut, line);
+}
+
+/// LG3: `who` takes over the mutable borrow of `path` that `holder` holds:
+/// a `&mut` passed on (`val m = &mut a; val r = f(m)`). While `who` lives,
+/// `path` stays mutably borrowed, also after `holder`'s last use; when `who`
+/// ends first and `holder` still lives, the borrow goes back to `holder`
+/// (release_borrow_one).
+fn bc_hand_over_mut(self: & mut BorrowChecker, who: str, holder: str, path: str, line: i64) -> void {
+    mut_borrow_set(self, path, OptStr::Some(who));
+    borrow_of_add(self, who, path, true, line);
+    self.mh_to.push(who);
+    self.mh_from.push(holder);
+}
+
+/// LG3: `name` borrows, from its borrow number `count` on, what variable
+/// `holder` borrows: shared borrows are shared again, a mutable one is
+/// handed over. Returns the next borrow number.
+fn bc_pass_on(self: & mut BorrowChecker, name: str, holder: str, count: i64, line: i64) -> i64 {
+    var c: i64 = count;
+    if holder == name {
+        return c;
+    }
+    var held: Vec<BorrowOfEntry> = bc_held_borrows(self, holder);
+    var i: i64 = 0;
+    while i < held.len() {
+        var be: BorrowOfEntry = held.get(i);
+        if be.is_mut {
+            if c > 0 {
+                self.alias_seen = true;
+            }
+            bc_hand_over_mut(self, bc_alias(name, c), be.borrower, be.borrowed, line);
+        } else {
+            bc_tie_borrow(self, name, be.borrowed, false, c, line);
+        }
+        c = c + 1;
+        i = i + 1;
+    }
+    return c;
+}
+
+/// LG3: `name` (from its borrow number `count` on) borrows what the value
+/// `e` tied to it borrows: `&path` / `&mut path` that path, and what `path`
+/// itself borrows when it is a variable holding borrows (`f(&view)` with
+/// `view` a struct holding a reference); a variable holding borrows passes
+/// them on (`val q = &a; val r = f(q)`: r borrows a; a `&mut` one is handed
+/// over). Returns the next borrow number.
+fn bc_tie_one(self: & mut BorrowChecker, name: str, e: Expr, count: i64, line: i64) -> i64 {
+    var c: i64 = count;
+    match e {
+        Expr::Ref(inner, m) => {
+            var ie: Expr = bc_box_expr_unbox(inner);
+            match extract_field_path(ie) {
+                OptStr::Some(path) => {
+                    bc_tie_borrow(self, name, path, m, c, line);
+                    c = c + 1;
+                }
+                OptStr::None => {
+                }
+            }
+            match ie {
+                Expr::Ident(iv) => {
+                    c = bc_pass_on(self, name, iv, c, line);
+                }
+                _ => {
+                }
+            }
+        }
+        Expr::Ident(n) => {
+            c = bc_pass_on(self, name, n, c, line);
+        }
+        _ => {
+        }
+    }
+    return c;
+}
+
+/// LG3: `val name = recv.method(args)`: the receiver is parameter 0, the
+/// arguments parameters 1... A receiver written as a path is borrowed the
+/// way the method's `self` is (`&mut self`: mutably); a receiver holding
+/// borrows passes them on too. A receiver that is itself a reference
+/// (`val q = &a; q.m()`) passes on what it points to and is not borrowed
+/// itself: the result points where `q` does.
+fn bc_record_method_borrow(self: & mut BorrowChecker, name: str, recv: Expr, method: str, args: Vec<Expr>, line: i64) -> void {
+    if self.unsafe_depth > 0 || g_bc_lt_index == 0 {
+        return;
+    }
+    var slot: i64 = HashMap_get(g_bc_lt_index, "." + method);
+    if slot == 0 {
+        return;
+    }
+    var ties: Vec<i64> = bc_lt_ties_at(self, slot - 1);
+    var count: i64 = 0;
+    var t: i64 = 0;
+    while t < ties.len() {
+        var ai: i64 = ties.get(t);
+        if ai == 0 {
+            match recv {
+                Expr::Ref(_, _) => {
+                    count = bc_tie_one(self, name, recv, count, line);
+                }
+                Expr::Ident(rn) => {
+                    if HashMap_get(self.ref_vars, rn) == 0 {
+                        bc_tie_borrow(self, name, rn, bc_lt_self_mut_at(self, slot - 1), count, line);
+                        count = count + 1;
+                    }
+                    count = bc_pass_on(self, name, rn, count, line);
+                }
+                _ => {
+                    match extract_field_path(recv) {
+                        OptStr::Some(path) => {
+                            bc_tie_borrow(self, name, path, bc_lt_self_mut_at(self, slot - 1), count, line);
+                            count = count + 1;
+                        }
+                        OptStr::None => {
+                        }
+                    }
+                }
+            }
+        } else if ai - 1 < args.len() {
+            count = bc_tie_one(self, name, args.get(ai - 1), count, line);
+        }
+        t = t + 1;
+    }
+}
+
+// `val name = callee(args)` where callee's result borrows from parameters
+// (bc_sig_ties: its lifetimes, or every reference parameter when it has
+// none): name borrows what each such argument borrows (bc_tie_one), so
+// changing any of them while name is live is the error it is for
+// `val r = &a`.
+fn bc_record_call_borrow(self: & mut BorrowChecker, name: str, callee: str, args: Vec<Expr>, line: i64) -> void {
+    if self.unsafe_depth > 0 || g_bc_lt_index == 0 {
+        return;
+    }
+    var slot: i64 = HashMap_get(g_bc_lt_index, callee);
+    if slot == 0 {
+        return;
+    }
+    var ties: Vec<i64> = bc_lt_ties_at(self, slot - 1);
+    var count: i64 = 0;
+    var t: i64 = 0;
+    while t < ties.len() {
+        var ai: i64 = ties.get(t);
+        if ai < args.len() {
+            count = bc_tie_one(self, name, args.get(ai), count, line);
+        }
+        t = t + 1;
+    }
+}
+
+/// LG3: `val name = S { f: &a, g: q, .. }` for a struct with lifetime
+/// parameters: name borrows what each field value borrows (bc_tie_one).
+fn bc_record_struct_borrow(self: & mut BorrowChecker, name: str, sname: str, fields: Vec<FieldInit>, line: i64) -> void {
+    if self.unsafe_depth > 0 || g_bc_lt_structs == 0 {
+        return;
+    }
+    if HashMap_get(g_bc_lt_structs, sname) == 0 {
+        return;
+    }
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < fields.len() {
+        count = bc_tie_one(self, name, fields.get(i).value, count, line);
+        i = i + 1;
+    }
+}
+
+/// LG3: `base.f = e` where `e` is `&path` or a variable holding borrows:
+/// base (a struct with lifetime parameters, or the escape check rejects the
+/// store) borrows that too, under its next borrow number. The `&path`'s
+/// temporary borrow made by check_expr is released first.
+fn bc_record_field_borrow(self: & mut BorrowChecker, base: str, e: Expr, line: i64) -> void {
+    var holds: bool = false;
+    match e {
+        Expr::Ref(inner, _) => {
+            match extract_field_path(bc_box_expr_unbox(inner)) {
+                OptStr::Some(_) => {
+                    holds = true;
+                    if self.temp_counter > 0 {
+                        var last_temp: str = "__tmp_ref_" + int_to_str(self.temp_counter - 1);
+                        release_borrow_by(self, last_temp);
+                        scope_stack_remove_name(self, last_temp);
+                        self.temp_counter = self.temp_counter - 1;
+                    }
+                }
+                OptStr::None => {
+                }
+            }
+        }
+        Expr::Ident(_) => {
+            holds = true;
+        }
+        _ => {
+        }
+    }
+    if !holds {
+        return;
+    }
+    var count: i64 = 0;
+    if HashMap_get(self.bo_ix, base) > 0 {
+        count = 1;
+        while HashMap_get(self.bo_ix, base + "#" + int_to_str(count)) > 0 {
+            count = count + 1;
+        }
+    }
+    bc_tie_one(self, base, e, count, line);
 }
 
 // Check an entire program. Walks every function and impl method body.
@@ -471,14 +1030,23 @@ pub fn check(self: & mut BorrowChecker, program: Program) -> void {
         }
     }
 
+    // LG3: functions whose signature names the lifetimes of their result:
+    // `val r = f(&a, &b)` makes r a borrower of what the result borrows from
+    bc_collect_lifetime_ties(program);
+
     // Gather the checkable units in sequential order: funcs, then impl
     // methods, then trait-impl methods.
     var units: Vec<Func> = Vec::new();
+    // each unit's skip-set key: par_chunk_bounds keeps an impl block, and
+    // the trait impls, in one chunk (CS5)
+    var ukeys: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < program.funcs.len() {
         var f: Func = program.funcs.get(i);
-        if !bc_skips(self, "fn:" + f.name) {
+        var fkey: str = "fn:" + f.name;
+        if !bc_skips(self, fkey) {
             units.push(f);
+            ukeys.push(fkey);
         }
         i = i + 1;
     }
@@ -488,8 +1056,10 @@ pub fn check(self: & mut BorrowChecker, program: Program) -> void {
         var k: i64 = 0;
         while k < impl_.methods.len() {
             var m: Func = impl_.methods.get(k);
-            if !bc_skips(self, "impl:" + impl_.struct_name + ":" + m.name) {
+            var mkey: str = "impl:" + impl_.struct_name + ":" + m.name;
+            if !bc_skips(self, mkey) {
                 units.push(m);
+                ukeys.push(mkey);
             }
             k = k + 1;
         }
@@ -502,8 +1072,10 @@ pub fn check(self: & mut BorrowChecker, program: Program) -> void {
         var tm: i64 = 0;
         while tm < ti.methods.len() {
             var m2: Func = ti.methods.get(tm);
-            if !bc_skips(self, "trait:" + ti.type_name + ":" + m2.name) {
+            var tkey: str = "trait:" + ti.type_name + ":" + m2.name;
+            if !bc_skips(self, tkey) {
                 units.push(m2);
+                ukeys.push(tkey);
             }
             tm = tm + 1;
         }
@@ -516,16 +1088,14 @@ pub fn check(self: & mut BorrowChecker, program: Program) -> void {
     if nw > 1 && units.len() >= 64 {
         match self.mode {
             BorrowckMode::On => {
+                var bounds: Vec<i64> = par_chunk_bounds(ukeys, nw);
+                var nch: i64 = bounds.len() / 2;
                 g_bc_units = units;
-                var per: i64 = (g_bc_units.len() + nw - 1) / nw;
                 var futs: Vec<Future<Vec<str>> > = Vec::new();
                 var wi: i64 = 0;
-                while wi < nw {
-                    var s: i64 = wi * per;
-                    var e: i64 = s + per;
-                    if e > g_bc_units.len() {
-                        e = g_bc_units.len();
-                    }
+                while wi < nch {
+                    var s: i64 = bounds.get(2 * wi);
+                    var e: i64 = bounds.get(2 * wi + 1);
                     futs.push(spawn bc_par_worker(s, e));
                     wi = wi + 1;
                 }
@@ -539,6 +1109,8 @@ pub fn check(self: & mut BorrowChecker, program: Program) -> void {
                     }
                     wi = wi + 1;
                 }
+                var no_units: Vec<Func> = Vec::new();
+                g_bc_units = no_units;
                 return;
             }
             _ => {
@@ -576,6 +1148,9 @@ pub fn check_func(self: & mut BorrowChecker, func: Func) -> void {
     HashMap_clear(self.bo_ix);
     HashMap_clear(self.sb_pfx);
     HashMap_clear(self.mb_pfx);
+    HashMap_clear(self.ref_vars);
+    self.mh_to.clear();
+    self.mh_from.clear();
     self.iterating.clear();
     self.stmt_index = 0;
 
@@ -1198,6 +1773,21 @@ fn scope_stack_remove_name(self: & mut BorrowChecker, name: str) -> void {
 // Release any borrow held by `borrower`. Called when the borrower goes out
 // of scope or is reassigned.
 fn release_borrow_by(self: & mut BorrowChecker, borrower: str) -> void {
+    // LG3: a call tying its result to several arguments made `borrower#k`
+    // hold the further borrows: they end with `borrower`
+    if g_bc_lt_multi || self.alias_seen {
+        var k: i64 = 1;
+        var alias: str = borrower + "#1";
+        while HashMap_get(self.bo_ix, alias) > 0 {
+            release_borrow_one(self, alias);
+            k = k + 1;
+            alias = borrower + "#" + int_to_str(k);
+        }
+    }
+    release_borrow_one(self, borrower);
+}
+
+fn release_borrow_one(self: & mut BorrowChecker, borrower: str) -> void {
     var i: i64 = HashMap_get(self.bo_ix, borrower);
     if i <= 0 {
         return;
@@ -1207,8 +1797,71 @@ fn release_borrow_by(self: & mut BorrowChecker, borrower: str) -> void {
     HashMap_remove(self.bo_ix, borrower);
     // Remove borrower from shared_borrows set.
     shared_borrows_remove_borrower(self, borrowed, borrower);
+    // LG3: a `&mut` passed on (bc_hand_over_mut)
+    if self.mh_to.len() > 0 && self.borrow_of.get(i - 1).is_mut {
+        bc_mut_release_handed(self, borrowed, borrower);
+        return;
+    }
     // Clear mut_borrow if it points to this borrower.
     mut_borrow_clear_if_borrower(self, borrowed, borrower);
+}
+
+/// Whether `b` holds the mutable borrow of `path`.
+fn bc_mut_holder_is(self: & BorrowChecker, path: str, b: str) -> bool {
+    var i: i64 = HashMap_get(self.mb_ix, path);
+    if i <= 0 {
+        return false;
+    }
+    match self.mut_borrow.get(i - 1).borrower {
+        OptStr::Some(x) => {
+            return x == b;
+        }
+        OptStr::None => {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// LG3: release the mutable borrow `borrower` holds of `path`, minding the
+/// hand-overs (bc_hand_over_mut): a borrow `borrower` took over goes back
+/// to the variable it came from when that one still holds it (`m` is used
+/// again after `r = f(m)` ends); one taken over from `borrower` now comes
+/// from where `borrower`'s came from (a chain `m -> r -> s`).
+fn bc_mut_release_handed(self: & mut BorrowChecker, path: str, borrower: str) -> void {
+    var from: str = "";
+    var j: i64 = 0;
+    while j < self.mh_to.len() {
+        if self.mh_to.get(j) == borrower {
+            from = self.mh_from.get(j);
+            self.mh_to.remove(j);
+            self.mh_from.remove(j);
+            break;
+        }
+        j = j + 1;
+    }
+    var holds: bool = bc_mut_holder_is(self, path, borrower);
+    mut_borrow_clear_if_borrower(self, path, borrower);
+    if from == "" {
+        return;
+    }
+    if holds {
+        var hi: i64 = HashMap_get(self.bo_ix, from);
+        if hi > 0 {
+            var he: BorrowOfEntry = self.borrow_of.get(hi - 1);
+            if he.is_mut && he.borrowed == path {
+                mut_borrow_set(self, path, OptStr::Some(from));
+            }
+        }
+    } else {
+        var k: i64 = 0;
+        while k < self.mh_from.len() {
+            if self.mh_from.get(k) == borrower {
+                self.mh_from.set(k, from);
+            }
+            k = k + 1;
+        }
+    }
 }
 
 // Declare a variable in the current scope. If it was previously a borrower
@@ -1216,6 +1869,7 @@ fn release_borrow_by(self: & mut BorrowChecker, borrower: str) -> void {
 fn declare_var(self: & mut BorrowChecker, name: str) -> void {
     // Reassignment: if this name was a borrower, release the old borrow.
     release_borrow_by(self, name);
+    HashMap_remove(self.ref_vars, name);
     scope_stack_push_name(self, name);
 }
 
@@ -1297,6 +1951,30 @@ fn extract_field_path(expr: Expr) -> OptStr {
     }
 }
 
+// 2g.73: the path of one element, `v.[3]`, for `v[3]` with a constant index
+// (`path` is the Vec's path, from extract_field_path). Element paths sit
+// under the Vec's path, so a borrow of one still conflicts with any use of
+// the whole Vec (push, `v[i]` with an unknown i, `&mut v`); two of them
+// conflict only when the indices are equal. Any other index: `path`.
+fn bc_elem_path(e: Expr, path: str) -> str {
+    match e {
+        Expr::Index(_, idx) => {
+            match bc_box_expr_unbox(idx) {
+                Expr::IntLit(n) => {
+                    if n >= 0 {
+                        return path + ".[" + int_to_str(n) + "]";
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return path;
+}
+
 // --- Borrow state queries -------------------------------------------------
 
 // Add `delta` to the live count of `key` and every dotted prefix of it.
@@ -1347,36 +2025,50 @@ fn has_mut_borrow_inclusive(self: & BorrowChecker, var: str) -> bool {
     return HashMap_get(self.mb_pfx, var) > 0;
 }
 
-// Check if any shared borrow exists on a PREFIX of path.
-fn has_shared_borrow_on_prefix(self: & BorrowChecker, path: str) -> bool {
-    var current: str = path;
-    while true {
-        var dot: i64 = str_rfind(current, ".");
-        if dot < 0 {
-            break;
+// SP10: whether a live borrow (mutable when `is_mut`, else shared) sits on a
+// strict prefix of `path` ("a" and "a.b" for "a.b.c"). The prefixes are
+// walked from the root down through the prefix counts (sb_pfx / mb_pfx: the
+// live borrows at a key or under it, kept exact by bc_pfx_add): a prefix
+// with a count of 0 has no borrow at it or under it, so no longer prefix
+// can hold one and the walk stops. A path whose root is not borrowed costs
+// one table lookup; a path without a dot costs none. Same answer as the
+// earlier walk from the longest prefix up (each prefix checked exactly).
+fn bc_borrow_on_prefix(self: & BorrowChecker, path: str, is_mut: bool) -> bool {
+    var pfx: i64 = self.sb_pfx;
+    if is_mut {
+        pfx = self.mb_pfx;
+    }
+    var n: i64 = str_len(path);
+    var k: i64 = 0;
+    while k < n {
+        if str_byte_at(path, k) == 46 {
+            var q: str = str_slice(path, 0, k);
+            if HashMap_get(pfx, q) <= 0 {
+                return false;
+            }
+            if is_mut {
+                if has_mut_borrow(self, q) {
+                    return true;
+                }
+            } else {
+                if has_shared_borrow(self, q) {
+                    return true;
+                }
+            }
         }
-        current = str_slice(current, 0, dot);
-        if has_shared_borrow(self, current) {
-            return true;
-        }
+        k = k + 1;
     }
     return false;
 }
 
+// Check if any shared borrow exists on a PREFIX of path.
+fn has_shared_borrow_on_prefix(self: & BorrowChecker, path: str) -> bool {
+    return bc_borrow_on_prefix(self, path, false);
+}
+
 // Check if any mutable borrow exists on a PREFIX of path.
 fn has_mut_borrow_on_prefix(self: & BorrowChecker, path: str) -> bool {
-    var current: str = path;
-    while true {
-        var dot: i64 = str_rfind(current, ".");
-        if dot < 0 {
-            break;
-        }
-        current = str_slice(current, 0, dot);
-        if has_mut_borrow(self, current) {
-            return true;
-        }
-    }
-    return false;
+    return bc_borrow_on_prefix(self, path, true);
 }
 
 // --- shared_borrows / mut_borrow map helpers ------------------------------
@@ -1547,8 +2239,18 @@ fn holder_note(self: & BorrowChecker, path: str, want: i64) -> str {
     if h.is_mut {
         kind = "&mut ";
     }
-    var who: str = "'" + h.borrower + "'";
-    var fix: str = "use '" + h.borrower + "' for the last time before this line, or declare it in an inner block { ... } that ends first";
+    // LG3: `r#k` is a further borrow of `r` (a call tied to several arguments)
+    var hname: str = h.borrower;
+    var hk: i64 = 0;
+    while hk < str_len(hname) {
+        if str_byte_at(hname, hk) == 35 {
+            hname = str_slice(hname, 0, hk);
+            break;
+        }
+        hk = hk + 1;
+    }
+    var who: str = "'" + hname + "'";
+    var fix: str = "use '" + hname + "' for the last time before this line, or declare it in an inner block { ... } that ends first";
     if str_starts_with(h.borrower, "__tmp_ref_") {
         who = "a reference made earlier in this statement";
         fix = "take that reference in a statement of its own, or copy the value into a local first";
@@ -1609,15 +2311,36 @@ fn create_borrow(self: & mut BorrowChecker, borrowed_path: str, borrower: str, i
         }
         mut_borrow_set(self, borrowed_path, OptStr::Some(borrower));
     } else {
-        // Rule 2: &path requires no active &mut on path or prefix.
+        // Rule 2: &path requires no active &mut on path, prefix or
+        // extension: `&g` while `&mut g.nodes` is live reads what the &mut
+        // may change (has_mut_borrow_inclusive: the path or under it).
         // Phase 4: reserved &mut borrows don't conflict with shared borrows.
-        if has_mut_borrow(self, borrowed_path) || has_mut_borrow_on_prefix(self, borrowed_path) {
-            violation(self, line, "cannot create &" + borrowed_path + ": a mutable borrow is already active on it or a parent path" + holder_note(self, borrowed_path, 1));
+        if has_mut_borrow_inclusive(self, borrowed_path) || has_mut_borrow_on_prefix(self, borrowed_path) {
+            violation(self, line, "cannot create &" + borrowed_path + ": a mutable borrow is already active on it or a related path" + holder_note(self, borrowed_path, 1));
             return;
         }
         shared_borrows_add_borrower(self, borrowed_path, borrower);
     }
     borrow_of_add(self, borrower, borrowed_path, is_mut, line);
+    // OW5 (reference §8.4: "A borrow ends at the borrower's last use"): a
+    // borrower the function never reads ends where it is made, at the top
+    // level and in an inner block alike (compute_last_use gives it no
+    // index, so the NLL buckets would keep it to its scope's end). The
+    // conflicts at its creation were checked above. Not a temporary of a
+    // statement (`__tmp_ref_*`, released at the statement's end) nor a
+    // further borrow `r#k` of a call tied to several arguments.
+    if bc_never_read(self, borrower) {
+        release_borrow_by(self, borrower);
+    }
+}
+
+/// OW5: a named borrower (not a temporary, a closure capture or `r#k`)
+/// that no statement of the function reads.
+fn bc_never_read(self: & BorrowChecker, borrower: str) -> bool {
+    if str_len(borrower) == 0 || str_starts_with(borrower, "__") || str_find(borrower, "#") >= 0 {
+        return false;
+    }
+    return last_use_get(self, borrower) < 0;
 }
 
 // Phase 4: Activate all reserved &mut borrows. Called after all call
@@ -1779,6 +2502,17 @@ fn check_stmt(self: & mut BorrowChecker, stmt: Stmt) -> void {
                     violation(self, fline, "cannot assign to " + fpath + ": " + opath + " is mutably borrowed" + holder_note(self, opath, 1));
                 }
             }
+            // LG3: `v.r = &b` into a struct with lifetime parameters: v
+            // borrows b too, as long as v lives
+            if g_bc_lt_structs != 0 && self.unsafe_depth == 0 {
+                match object {
+                    Expr::Ident(fbase) => {
+                        bc_record_field_borrow(self, fbase, expr, fline);
+                    }
+                    _ => {
+                    }
+                }
+            }
         }
         Stmt::Expr(e, _) => {
             check_expr(self, e);
@@ -1827,6 +2561,10 @@ fn check_stmt(self: & mut BorrowChecker, stmt: Stmt) -> void {
             pop_scope(self);
         }
         Stmt::For(loop_var, iterator, body, _) => {
+            // `for x in &v`: the reference the iterator makes holds while the
+            // loop runs and ends with it (it stayed active after the loop, so
+            // a later `&mut v` was rejected: test_for_borrowed_vec)
+            var for_checkpoint: i64 = self.temp_counter;
             check_expr(self, iterator);
             push_scope(self);
             declare_var(self, loop_var);
@@ -1862,6 +2600,7 @@ fn check_stmt(self: & mut BorrowChecker, stmt: Stmt) -> void {
                 self.iterating.pop();
             }
             pop_scope(self);
+            release_temps_since(self, for_checkpoint);
         }
         Stmt::Loop(body, _) => {
             push_scope(self);
@@ -2113,9 +2852,14 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
             var checkpoint: i64 = self.temp_counter;
             var prev_reservation: bool = self.in_reservation_phase;
             self.in_reservation_phase = true;
+            // An argument holding statements (a closure, a block) checks
+            // them on their own lines; the call's borrows keep the call's
+            // line (bugs 42/53: "line 0")
+            var call_line: i64 = self.stmt_line;
             var a: i64 = 0;
             while a < args.len() {
                 check_expr(self, args.get(a));
+                self.stmt_line = call_line;
                 a = a + 1;
             }
             self.in_reservation_phase = prev_reservation;
@@ -2132,7 +2876,8 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
         Expr::OptionalFieldAccess(e, _) => {
             check_expr(self, bc_box_expr_unbox(e));
         }
-        Expr::StructLit(_, fields, spread) => {
+        Expr::StructLit(slname, fields, spread) => {
+            var lt_checkpoint: i64 = self.temp_counter;
             var f: i64 = 0;
             while f < fields.len() {
                 var fi: FieldInit = fields.get(f);
@@ -2144,6 +2889,15 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
                     check_expr(self, bc_box_expr_unbox(s));
                 }
                 OptBoxExpr::None => {
+                }
+            }
+            // LG3: a struct with lifetime parameters holds its references
+            // as long as the variable it is bound to lives
+            // (bc_record_struct_borrow), not as temporaries to the end of
+            // the scope
+            if g_bc_lt_structs != 0 && !self.in_reservation_phase {
+                if HashMap_get(g_bc_lt_structs, slname) != 0 {
+                    release_temps_since(self, lt_checkpoint);
                 }
             }
         }
@@ -2192,7 +2946,9 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
             var receiver_path: OptStr = OptStr::None;
             match receiver {
                 Expr::Ident(name) => {
-                    if !bc_read_method(method) {
+                    // LG3: a user method taking `&self` or `self` by value
+                    // only reads its receiver too (bc_user_read_method)
+                    if !bc_read_method(method) && !bc_user_read_method(method) {
                         receiver_path = OptStr::Some(name);
                     }
                 }
@@ -2203,10 +2959,13 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
             var checkpoint: i64 = self.temp_counter;
             var prev_reservation: bool = self.in_reservation_phase;
             self.in_reservation_phase = true;
+            var mcall_line: i64 = self.stmt_line;
             check_expr(self, bc_box_expr_unbox(receiver));
+            self.stmt_line = mcall_line;
             var a: i64 = 0;
             while a < args.len() {
                 check_expr(self, args.get(a));
+                self.stmt_line = mcall_line;
                 a = a + 1;
             }
             self.in_reservation_phase = prev_reservation;
@@ -2303,7 +3062,14 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
                         // assigned (e.g. passed directly to a function call).
                         // The temp borrow is released by the enclosing
                         // Call/MethodCall via the checkpoint mechanism.
-                        create_temp_borrow(self, path, is_mut, 0);
+                        // 2g.73: inside a call's arguments, `&mut v[0]` and
+                        // `&mut v[1]` borrow two elements (paths v.[0] and
+                        // v.[1], both under v, so v itself stays borrowed).
+                        var ref_path: str = path;
+                        if self.in_reservation_phase {
+                            ref_path = bc_elem_path(bc_box_expr_unbox(inner), path);
+                        }
+                        create_temp_borrow(self, ref_path, is_mut, self.stmt_line);
                     }
                     OptStr::None => {
                     }
@@ -2380,8 +3146,23 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
                 collect_assigned_stmt_fd(body.get(b), & mut assigned);
                 b = b + 1;
             }
-            // Record a borrow for each captured variable that exists in an
-            // outer scope.
+            // The body first: what the closure itself does with a captured
+            // variable (`v.push(x)`, `n = n + 1`) goes through its own
+            // capture, so it must not conflict with that capture's borrow
+            // (B19: a closure that pushed to a captured Vec was refused with
+            // "cannot mutate v"). Borrows held outside still apply.
+            // The captures' borrows are made on the closure's line (bug 42:
+            // borrow errors said "line 0"), not on its body's last statement.
+            var closure_line: i64 = self.stmt_line;
+            b = 0;
+            while b < body.len() {
+                check_stmt(self, body.get(b));
+                b = b + 1;
+            }
+            self.stmt_line = closure_line;
+            // Then record a borrow for each captured variable that exists in
+            // an outer scope (a conflict with a borrow held outside is
+            // reported here); the closure's scope releases them.
             var ci: i64 = 0;
             while ci < captured.len() {
                 var cap: str = captured.get(ci);
@@ -2402,15 +3183,10 @@ fn check_expr(self: & mut BorrowChecker, expr: Expr) -> void {
                 if in_outer && self.unsafe_depth == 0 {
                     var is_mut: bool = bc_vec_contains_str(assigned, cap);
                     var borrower: str = "__closure_capture_" + cap;
-                    create_borrow(self, cap, borrower, is_mut, 0);
+                    create_borrow(self, cap, borrower, is_mut, self.stmt_line);
                     scope_stack_push_name(self, borrower);
                 }
                 ci = ci + 1;
-            }
-            b = 0;
-            while b < body.len() {
-                check_stmt(self, body.get(b));
-                b = b + 1;
             }
             pop_scope(self);
         }
@@ -2444,9 +3220,34 @@ fn maybe_record_borrow_from_expr(self: & mut BorrowChecker, name: str, expr: Exp
                         }
                         // Now create the named borrow.
                         create_borrow(self, path, name, is_mut, line);
+                        HashMap_insert(self.ref_vars, name, 1);
                     }
                     OptStr::None => {
                     }
+                }
+            }
+        }
+        Expr::Call(callee, args) => {
+            // LG3: a call whose signature ties its result to an argument
+            // (the call's own temporary borrows are already released)
+            bc_record_call_borrow(self, name, callee, args, line);
+        }
+        Expr::MethodCall(recv, method, args) => {
+            // LG3: likewise a method call; the receiver is parameter 0
+            bc_record_method_borrow(self, name, bc_box_expr_unbox(recv), method, args, line);
+        }
+        Expr::StructLit(sname, fields, _) => {
+            // LG3: a struct with lifetime parameters holds the references
+            // its fields are given (check_expr released their temporaries)
+            bc_record_struct_borrow(self, name, sname, fields, line);
+        }
+        Expr::Ident(src) => {
+            // LG3: `val w = v` where v holds borrows (a reference, or a
+            // struct holding one): w borrows the same; a `&mut` moves to w
+            if self.unsafe_depth == 0 && src != name {
+                var passed: i64 = bc_pass_on(self, name, src, 0, line);
+                if passed > 0 && HashMap_get(self.ref_vars, src) > 0 {
+                    HashMap_insert(self.ref_vars, name, 1);
                 }
             }
         }

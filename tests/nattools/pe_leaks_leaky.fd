@@ -1,0 +1,31 @@
+// RL16 (docs/roadmap/llvm-roadmap.md): a program that leaks two raw
+// blocks on purpose (100 and 28 bytes, from leak_here) and frees a third.
+// `fid emit --leaks` must report exactly those two at exit, by where they
+// were allocated, in the C runtime's words, on every backend:
+//   fid --leaks: 2 block(s), 128 bytes, never freed; by where they were allocated:
+//          128 bytes in      2 block(s): leak_here <- main
+// (main alone when the backend inlined leak_here). Checked by
+// tests/nattools/pe_leaks_check.sh (pe_ir: stdlib/pe_runtime/base.fd
+// pert_leak_malloc / pe_lk_report; nat_ir: linux_runtime/base.fd
+// pe_dbg_malloc / pe_leak_report; C: fid run --leaks).
+
+fn leak_here(n: i64) -> i64 {
+    // the address is kept as a raw word: nothing frees it
+    var p: i64 = 0;
+    unsafe { p = p_malloc(n); }
+    return p;
+}
+
+fn main() -> i64 {
+    val a: i64 = leak_here(100);
+    val b: i64 = leak_here(28);
+    unsafe {
+        val c: i64 = p_malloc(16);
+        p_free(c);
+    }
+    println(a != 0 && b != 0);
+    return 0;
+}
+
+// Expected output:
+// true

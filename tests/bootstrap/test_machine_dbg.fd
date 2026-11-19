@@ -1,0 +1,67 @@
+// Track DB (docs/roadmap/llvm-roadmap.md) on the machine layer
+// (compiler/nat_ir.fd, compiler/nat_enc.fd, stdlib/linux_runtime):
+//   DB6  .debug_frame: a framed function's prologue and each of its
+//        epilogues (`early` has several returns: nat_ir.fd ng_cfi_row,
+//        nat_enc.fd nat_fde_epilogue); a function with no frame record
+//        (a WP8 leaf) keeps the CIE's entry rules (nat_has_frame)
+//   DB9  the sampling profiler: with FID_PROF=1 a native Linux executable
+//        prints at exit which functions the samples fell in (sys.fd
+//        pe_prof_*); without it the program runs as before, though main's
+//        return now goes through pe_rt_exit and the signal handlers
+//        through pe_on_signal_uc
+//   DB2  Mach-O executables get a symbol table (nat_enc.fd nat_macho)
+// Check: python3 scripts/dbg-check.py --fid release/fid.exe (CFI rows,
+// Mach-O symbols) and bash scripts/prof-check.sh <target> (the profile).
+// Expected output:
+// 6765
+// 87776
+// -1
+// 0
+// 104285
+// 781287
+
+fn leaf_mix(a: i64, b: i64) -> i64 {
+    return (a * 31 + b) % 1000003;
+}
+
+fn spin(n: i64) -> i64 {
+    var h: i64 = 7;
+    var i: i64 = 0;
+    while i < n {
+        h = leaf_mix(h, i);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// Several returns: several epilogues in one function
+fn early(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - 1;
+    }
+    if x == 0 {
+        return 0;
+    }
+    val y: i64 = spin(x);
+    if y % 2 == 0 {
+        return y / 2;
+    }
+    return y;
+}
+
+fn main() -> i64 {
+    println(fib(20));
+    println(spin(10));
+    println(early(0 - 5));
+    println(early(0));
+    println(early(3));
+    println(early(1000));
+    return 0;
+}

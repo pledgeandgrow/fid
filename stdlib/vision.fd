@@ -1,0 +1,1221 @@
+// Fides computer vision library (robotics / perception)
+//
+// Classic image processing on 8-bit grayscale images (`GrayImg`, one i64
+// 0..255 per pixel, row-major) and float images (`FImg`):
+//   - RGB(A) -> gray with the BT.601 luma weights (0.299, 0.587, 0.114),
+//     from the interleaved layout of stdlib/image's `Image.data`;
+//   - convolution with replicated borders, separable convolution, Gaussian
+//     kernels (radius ceil(3 sigma), normalized) and blur, bilinear sampling;
+//   - Sobel gradients, Canny edges (Gaussian blur, Sobel, non-maximum
+//     suppression in four directions, double threshold, hysteresis);
+//   - histogram, fixed threshold, Otsu's threshold (maximum between-class
+//     variance; pixels > t are foreground, ties take the lowest t);
+//   - grayscale morphology with a square structuring element: erode
+//     (minimum), dilate (maximum), open, close;
+//   - connected components (4- or 8-connected) with area, bounding box and
+//     centroid of each;
+//   - FAST-9 corners (Rosten & Drummond: 9 contiguous pixels of the
+//     16-pixel Bresenham circle of radius 3 all brighter than p + t or all
+//     darker than p - t; score = the larger of the sums of |I - p| - t over
+//     the brighter / darker circle pixels; 3x3 non-maximum suppression);
+//   - ORB-style descriptors: orientation by the intensity centroid of a
+//     radius-15 disc, 256 binary tests steered by that angle on a Gaussian
+//     smoothed image, Hamming distance, brute-force matching with a cross
+//     check. The 256 test pairs come from a fixed pseudo-random generator
+//     (inside a 27x27 patch), not ORB's learned table, so descriptors are
+//     self-consistent but not interchangeable with OpenCV's;
+//   - camera model: pinhole (fx, fy, cx, cy) with Brown-Conrady distortion
+//     (k1, k2, k3 radial, p1, p2 tangential, OpenCV's formula), projection,
+//     iterative undistortion of points (OpenCV's fixed-point iteration),
+//     and undistortion of whole images by inverse mapping;
+//   - homography by the normalized DLT (Hartley normalization, h33 = 1,
+//     least squares over 4 or more correspondences), its application and
+//     inverse.
+//
+// Pure computation. The seam is the camera: frames arrive as byte buffers
+// from a driver (V4L2, a USB camera library) or a file decoder; convert
+// them with `vis_from_rgb` / `vis_gray_from_bytes`.
+//
+// Usage:
+//   use vision;
+//   val g: GrayImg = vis_from_rgb(w, h, 3, rgb_bytes);
+//   val e: GrayImg = vis_canny(&g, 1.0, 40.0, 100.0);
+//   val kps: Vec<Keypoint> = vis_fast(&g, 20, true);
+
+module vision;
+use math;
+use quat;
+
+// ─── Images ───
+
+pub struct GrayImg {
+    pub w: i64,
+    pub h: i64,
+    pub data: Vec<i64>,
+}
+
+pub struct FImg {
+    pub w: i64,
+    pub h: i64,
+    pub data: Vec<f64>,
+}
+
+pub fn vis_gray_new(w: i64, h: i64, v: i64) -> GrayImg {
+    var d: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < w * h {
+        d.push(v);
+        i = i + 1;
+    }
+    return GrayImg { w: w, h: h, data: d };
+}
+
+pub fn vis_fimg_new(w: i64, h: i64) -> FImg {
+    var d: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < w * h {
+        d.push(0.0);
+        i = i + 1;
+    }
+    return FImg { w: w, h: h, data: d };
+}
+
+/// A gray image over existing bytes (w * h of them).
+pub fn vis_gray_from_bytes(w: i64, h: i64, bytes: Vec<i64>) -> GrayImg {
+    return GrayImg { w: w, h: h, data: bytes };
+}
+
+fn vis_clampi(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
+
+/// Pixel (x, y), coordinates clamped to the image (replicated border).
+pub fn vis_get(g: & GrayImg, x: i64, y: i64) -> i64 {
+    return g.data.get(vis_clampi(y, 0, g.h - 1) * g.w + vis_clampi(x, 0, g.w - 1));
+}
+
+pub fn vis_set(g: & mut GrayImg, x: i64, y: i64, v: i64) {
+    if x >= 0 && y >= 0 && x < g.w && y < g.h {
+        g.data.set(y * g.w + x, v);
+    }
+}
+
+pub fn vis_fget(f: & FImg, x: i64, y: i64) -> f64 {
+    return f.data.get(vis_clampi(y, 0, f.h - 1) * f.w + vis_clampi(x, 0, f.w - 1));
+}
+
+/// Gray from interleaved RGB (channels 3) or RGBA (4) bytes: BT.601 luma,
+/// rounded.
+pub fn vis_from_rgb(w: i64, h: i64, channels: i64, data: & Vec<i64>) -> GrayImg {
+    var d: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < w * h {
+        val r: i64 = data.get(i * channels);
+        val gg: i64 = data.get(i * channels + 1);
+        val b: i64 = data.get(i * channels + 2);
+        d.push((299 * r + 587 * gg + 114 * b + 500) / 1000);
+        i = i + 1;
+    }
+    return GrayImg { w: w, h: h, data: d };
+}
+
+pub fn vis_to_float(g: & GrayImg) -> FImg {
+    var d: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < g.data.len() {
+        d.push(g.data.get(i) as f64);
+        i = i + 1;
+    }
+    return FImg { w: g.w, h: g.h, data: d };
+}
+
+/// Round and clamp to 0..255.
+pub fn vis_to_gray(f: & FImg) -> GrayImg {
+    var d: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.data.len() {
+        d.push(vis_clampi(math_floor(f.data.get(i) + 0.5) as i64, 0, 255));
+        i = i + 1;
+    }
+    return GrayImg { w: f.w, h: f.h, data: d };
+}
+
+/// Bilinear sample at (x, y) in pixel coordinates (pixel centres at
+/// integers), border replicated.
+pub fn vis_bilinear(f: & FImg, x: f64, y: f64) -> f64 {
+    val x0: i64 = math_floor(x) as i64;
+    val y0: i64 = math_floor(y) as i64;
+    val ax: f64 = x - (x0 as f64);
+    val ay: f64 = y - (y0 as f64);
+    val a: f64 = vis_fget(f, x0, y0) * (1.0 - ax) + vis_fget(f, x0 + 1, y0) * ax;
+    val b: f64 = vis_fget(f, x0, y0 + 1) * (1.0 - ax) + vis_fget(f, x0 + 1, y0 + 1) * ax;
+    return a * (1.0 - ay) + b * ay;
+}
+
+// ─── Convolution ───
+
+/// Convolve with a kw x kh kernel (row-major, centred), replicated border.
+/// (Correlation; for the symmetric kernels used here it is the same.)
+pub fn vis_convolve(f: & FImg, k: & Vec<f64>, kw: i64, kh: i64) -> FImg {
+    var out: FImg = vis_fimg_new(f.w, f.h);
+    val rx: i64 = kw / 2;
+    val ry: i64 = kh / 2;
+    var y: i64 = 0;
+    while y < f.h {
+        var x: i64 = 0;
+        while x < f.w {
+            var s: f64 = 0.0;
+            var j: i64 = 0;
+            while j < kh {
+                var i: i64 = 0;
+                while i < kw {
+                    s = s + k.get(j * kw + i) * vis_fget(f, x + i - rx, y + j - ry);
+                    i = i + 1;
+                }
+                j = j + 1;
+            }
+            out.data.set(y * f.w + x, s);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return out;
+}
+
+/// Convolve rows with kx, then columns with ky (odd lengths).
+pub fn vis_convolve_sep(f: & FImg, kx: & Vec<f64>, ky: & Vec<f64>) -> FImg {
+    val t: FImg = vis_convolve(f, kx, kx.len(), 1);
+    return vis_convolve(&t, ky, 1, ky.len());
+}
+
+/// A normalized 1-D Gaussian of radius ceil(3 sigma).
+pub fn vis_gaussian_kernel(sigma: f64) -> Vec<f64> {
+    var r: i64 = math_ceil(3.0 * sigma) as i64;
+    if r < 1 {
+        r = 1;
+    }
+    var k: Vec<f64> = Vec::new();
+    var s: f64 = 0.0;
+    var i: i64 = 0 - r;
+    while i <= r {
+        val v: f64 = math_exp(0.0 - ((i * i) as f64) / (2.0 * sigma * sigma));
+        k.push(v);
+        s = s + v;
+        i = i + 1;
+    }
+    var out: Vec<f64> = Vec::new();
+    i = 0;
+    while i < k.len() {
+        out.push(k.get(i) / s);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn vis_gaussian_blur(f: & FImg, sigma: f64) -> FImg {
+    val k: Vec<f64> = vis_gaussian_kernel(sigma);
+    return vis_convolve_sep(f, &k, &k);
+}
+
+// ─── Gradients and edges ───
+
+pub struct Gradient {
+    pub gx: FImg,
+    pub gy: FImg,
+}
+
+/// Sobel derivatives (x to the right, y down).
+pub fn vis_sobel(f: & FImg) -> Gradient {
+    var gx: FImg = vis_fimg_new(f.w, f.h);
+    var gy: FImg = vis_fimg_new(f.w, f.h);
+    var y: i64 = 0;
+    while y < f.h {
+        var x: i64 = 0;
+        while x < f.w {
+            val a: f64 = vis_fget(f, x - 1, y - 1);
+            val b: f64 = vis_fget(f, x, y - 1);
+            val c: f64 = vis_fget(f, x + 1, y - 1);
+            val d: f64 = vis_fget(f, x - 1, y);
+            val e: f64 = vis_fget(f, x + 1, y);
+            val g: f64 = vis_fget(f, x - 1, y + 1);
+            val h: f64 = vis_fget(f, x, y + 1);
+            val i: f64 = vis_fget(f, x + 1, y + 1);
+            gx.data.set(y * f.w + x, (c + 2.0 * e + i) - (a + 2.0 * d + g));
+            gy.data.set(y * f.w + x, (g + 2.0 * h + i) - (a + 2.0 * b + c));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return Gradient { gx: gx, gy: gy };
+}
+
+/// Gradient magnitude sqrt(gx^2 + gy^2).
+pub fn vis_grad_mag(gr: & Gradient) -> FImg {
+    var out: FImg = vis_fimg_new(gr.gx.w, gr.gx.h);
+    var i: i64 = 0;
+    while i < out.data.len() {
+        val a: f64 = gr.gx.data.get(i);
+        val b: f64 = gr.gy.data.get(i);
+        out.data.set(i, math_sqrt(a * a + b * b));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Canny edges (255 on edges, 0 elsewhere) with thresholds on the Sobel
+/// magnitude.
+pub fn vis_canny(g: & GrayImg, sigma: f64, low: f64, high: f64) -> GrayImg {
+    val f: FImg = vis_to_float(g);
+    var bl: FImg = f;
+    if sigma > 0.0 {
+        bl = vis_gaussian_blur(&f, sigma);
+    }
+    val gr: Gradient = vis_sobel(&bl);
+    val mag: FImg = vis_grad_mag(&gr);
+    val w: i64 = g.w;
+    val h: i64 = g.h;
+    // 0 none, 1 weak, 2 strong
+    var cls: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < w * h {
+        cls.push(0);
+        i = i + 1;
+    }
+    val t22: f64 = 0.41421356237309503;
+    var y: i64 = 1;
+    while y < h - 1 {
+        var x: i64 = 1;
+        while x < w - 1 {
+            val m: f64 = mag.data.get(y * w + x);
+            if m >= low {
+                val gx: f64 = gr.gx.data.get(y * w + x);
+                val gy: f64 = gr.gy.data.get(y * w + x);
+                val ax: f64 = math_fabs(gx);
+                val ay: f64 = math_fabs(gy);
+                var n1: f64 = 0.0;
+                var n2: f64 = 0.0;
+                if ay <= ax * t22 {
+                    n1 = vis_fget(&mag, x - 1, y);
+                    n2 = vis_fget(&mag, x + 1, y);
+                } else if ax <= ay * t22 {
+                    n1 = vis_fget(&mag, x, y - 1);
+                    n2 = vis_fget(&mag, x, y + 1);
+                } else if (gx > 0.0) == (gy > 0.0) {
+                    n1 = vis_fget(&mag, x - 1, y - 1);
+                    n2 = vis_fget(&mag, x + 1, y + 1);
+                } else {
+                    n1 = vis_fget(&mag, x + 1, y - 1);
+                    n2 = vis_fget(&mag, x - 1, y + 1);
+                }
+                // keep the maximum; on a plateau keep the first of the pair
+                if m > n1 && m >= n2 {
+                    if m >= high {
+                        cls.set(y * w + x, 2);
+                    } else {
+                        cls.set(y * w + x, 1);
+                    }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    // hysteresis: weak pixels connected (8-neighbours) to strong ones
+    var out: GrayImg = vis_gray_new(w, h, 0);
+    var stack: Vec<i64> = Vec::new();
+    i = 0;
+    while i < w * h {
+        if cls.get(i) == 2 {
+            out.data.set(i, 255);
+            stack.push(i);
+        }
+        i = i + 1;
+    }
+    while stack.len() > 0 {
+        val p: i64 = stack.pop();
+        val px: i64 = p % w;
+        val py: i64 = p / w;
+        var dy: i64 = - 1;
+        while dy <= 1 {
+            var dx: i64 = - 1;
+            while dx <= 1 {
+                val qx: i64 = px + dx;
+                val qy: i64 = py + dy;
+                if qx >= 0 && qy >= 0 && qx < w && qy < h {
+                    val q: i64 = qy * w + qx;
+                    if cls.get(q) == 1 && out.data.get(q) == 0 {
+                        out.data.set(q, 255);
+                        stack.push(q);
+                    }
+                }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+    }
+    return out;
+}
+
+// ─── Thresholds ───
+
+pub fn vis_histogram(g: & GrayImg) -> Vec<i64> {
+    var hist: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 {
+        hist.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < g.data.len() {
+        val v: i64 = vis_clampi(g.data.get(i), 0, 255);
+        hist.set(v, hist.get(v) + 1);
+        i = i + 1;
+    }
+    return hist;
+}
+
+/// Otsu's threshold: the t maximizing the between-class variance of
+/// {<= t} and {> t}.
+pub fn vis_otsu(g: & GrayImg) -> i64 {
+    val hist: Vec<i64> = vis_histogram(g);
+    val total: f64 = g.data.len() as f64;
+    var sum_all: f64 = 0.0;
+    var i: i64 = 0;
+    while i < 256 {
+        sum_all = sum_all + ((i * hist.get(i)) as f64);
+        i = i + 1;
+    }
+    var w0: f64 = 0.0;
+    var sum0: f64 = 0.0;
+    var best: f64 = - 1.0;
+    var best_t: i64 = 0;
+    var t: i64 = 0;
+    while t < 256 {
+        w0 = w0 + (hist.get(t) as f64);
+        sum0 = sum0 + ((t * hist.get(t)) as f64);
+        val w1: f64 = total - w0;
+        if w0 > 0.0 && w1 > 0.0 {
+            val m0: f64 = sum0 / w0;
+            val m1: f64 = (sum_all - sum0) / w1;
+            val v: f64 = w0 * w1 * (m0 - m1) * (m0 - m1);
+            if v > best {
+                best = v;
+                best_t = t;
+            }
+        }
+        t = t + 1;
+    }
+    return best_t;
+}
+
+/// 255 where the pixel is > t, 0 elsewhere.
+pub fn vis_threshold(g: & GrayImg, t: i64) -> GrayImg {
+    var out: GrayImg = vis_gray_new(g.w, g.h, 0);
+    var i: i64 = 0;
+    while i < g.data.len() {
+        if g.data.get(i) > t {
+            out.data.set(i, 255);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The number of pixels > 0.
+pub fn vis_count_nonzero(g: & GrayImg) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < g.data.len() {
+        if g.data.get(i) > 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ─── Morphology ───
+
+fn vis_morph(g: & GrayImg, r: i64, take_max: bool) -> GrayImg {
+    var out: GrayImg = vis_gray_new(g.w, g.h, 0);
+    var y: i64 = 0;
+    while y < g.h {
+        var x: i64 = 0;
+        while x < g.w {
+            var best: i64 = 255;
+            if take_max {
+                best = 0;
+            }
+            var dy: i64 = 0 - r;
+            while dy <= r {
+                var dx: i64 = 0 - r;
+                while dx <= r {
+                    val v: i64 = vis_get(g, x + dx, y + dy);
+                    if take_max && v > best {
+                        best = v;
+                    }
+                    if !take_max && v < best {
+                        best = v;
+                    }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            out.data.set(y * g.w + x, best);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return out;
+}
+
+/// Minimum over a (2r+1)^2 square (shrinks bright regions).
+pub fn vis_erode(g: & GrayImg, r: i64) -> GrayImg {
+    return vis_morph(g, r, false);
+}
+
+/// Maximum over a (2r+1)^2 square (grows bright regions).
+pub fn vis_dilate(g: & GrayImg, r: i64) -> GrayImg {
+    return vis_morph(g, r, true);
+}
+
+pub fn vis_open(g: & GrayImg, r: i64) -> GrayImg {
+    val e: GrayImg = vis_erode(g, r);
+    return vis_dilate(&e, r);
+}
+
+pub fn vis_close(g: & GrayImg, r: i64) -> GrayImg {
+    val d: GrayImg = vis_dilate(g, r);
+    return vis_erode(&d, r);
+}
+
+// ─── Connected components ───
+
+pub struct Components {
+    // label per pixel: 0 background, 1..count
+    pub labels: Vec<i64>,
+    pub count: i64,
+    // per component (index label - 1)
+    pub area: Vec<i64>,
+    pub min_x: Vec<i64>,
+    pub min_y: Vec<i64>,
+    pub max_x: Vec<i64>,
+    pub max_y: Vec<i64>,
+    pub cx: Vec<f64>,
+    pub cy: Vec<f64>,
+}
+
+/// Label the pixels > 0 (labels in raster order of each component's first
+/// pixel).
+pub fn vis_components(g: & GrayImg, eight: bool) -> Components {
+    val w: i64 = g.w;
+    val h: i64 = g.h;
+    var labels: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < w * h {
+        labels.push(0);
+        i = i + 1;
+    }
+    var c: Components = Components { labels: Vec::new(), count: 0, area: Vec::new(), min_x: Vec::new(), min_y: Vec::new(), max_x: Vec::new(), max_y: Vec::new(), cx: Vec::new(), cy: Vec::new() };
+    var stack: Vec<i64> = Vec::new();
+    i = 0;
+    while i < w * h {
+        if g.data.get(i) > 0 && labels.get(i) == 0 {
+            c.count = c.count + 1;
+            val lab: i64 = c.count;
+            var area: i64 = 0;
+            var x0: i64 = w;
+            var y0: i64 = h;
+            var x1: i64 = - 1;
+            var y1: i64 = - 1;
+            var sx: i64 = 0;
+            var sy: i64 = 0;
+            labels.set(i, lab);
+            stack.push(i);
+            while stack.len() > 0 {
+                val p: i64 = stack.pop();
+                val px: i64 = p % w;
+                val py: i64 = p / w;
+                area = area + 1;
+                sx = sx + px;
+                sy = sy + py;
+                if px < x0 { x0 = px; }
+                if py < y0 { y0 = py; }
+                if px > x1 { x1 = px; }
+                if py > y1 { y1 = py; }
+                var dy: i64 = - 1;
+                while dy <= 1 {
+                    var dx: i64 = - 1;
+                    while dx <= 1 {
+                        val diag: bool = dx != 0 && dy != 0;
+                        if (dx != 0 || dy != 0) && (eight || !diag) {
+                            val qx: i64 = px + dx;
+                            val qy: i64 = py + dy;
+                            if qx >= 0 && qy >= 0 && qx < w && qy < h {
+                                val q: i64 = qy * w + qx;
+                                if g.data.get(q) > 0 && labels.get(q) == 0 {
+                                    labels.set(q, lab);
+                                    stack.push(q);
+                                }
+                            }
+                        }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+            c.area.push(area);
+            c.min_x.push(x0);
+            c.min_y.push(y0);
+            c.max_x.push(x1);
+            c.max_y.push(y1);
+            c.cx.push((sx as f64) / (area as f64));
+            c.cy.push((sy as f64) / (area as f64));
+        }
+        i = i + 1;
+    }
+    c.labels = labels;
+    return c;
+}
+
+// ─── FAST corners ───
+
+pub struct Keypoint {
+    pub x: i64,
+    pub y: i64,
+    pub score: f64,
+    pub angle: f64,
+}
+
+fn vis_circle_dx() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0); v.push(1); v.push(2); v.push(3); v.push(3); v.push(3); v.push(2); v.push(1);
+    v.push(0); v.push(- 1); v.push(- 2); v.push(- 3); v.push(- 3); v.push(- 3); v.push(- 2); v.push(- 1);
+    return v;
+}
+
+fn vis_circle_dy() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(- 3); v.push(- 3); v.push(- 2); v.push(- 1); v.push(0); v.push(1); v.push(2); v.push(3);
+    v.push(3); v.push(3); v.push(2); v.push(1); v.push(0); v.push(- 1); v.push(- 2); v.push(- 3);
+    return v;
+}
+
+/// The FAST-9 score of pixel (x, y) at threshold t, or 0 when it is not a
+/// corner.
+pub fn vis_fast_score(g: & GrayImg, x: i64, y: i64, t: i64) -> f64 {
+    val dxs: Vec<i64> = vis_circle_dx();
+    val dys: Vec<i64> = vis_circle_dy();
+    val p: i64 = vis_get(g, x, y);
+    // +1 brighter, -1 darker, 0 similar
+    var st: Vec<i64> = Vec::new();
+    var sb: i64 = 0;
+    var sd: i64 = 0;
+    var k: i64 = 0;
+    while k < 16 {
+        val v: i64 = vis_get(g, x + dxs.get(k), y + dys.get(k));
+        if v > p + t {
+            st.push(1);
+            sb = sb + v - p - t;
+        } else if v < p - t {
+            st.push(- 1);
+            sd = sd + p - v - t;
+        } else {
+            st.push(0);
+        }
+        k = k + 1;
+    }
+    // the longest circular run of one sign
+    var best: i64 = 0;
+    var sgn: i64 = - 1;
+    while sgn <= 1 {
+        var run: i64 = 0;
+        k = 0;
+        while k < 32 {
+            if st.get(k % 16) == sgn {
+                run = run + 1;
+                if run > best {
+                    best = run;
+                }
+            } else {
+                run = 0;
+            }
+            k = k + 1;
+        }
+        sgn = sgn + 2;
+    }
+    if best < 9 {
+        return 0.0;
+    }
+    if sb > sd {
+        return sb as f64;
+    }
+    return sd as f64;
+}
+
+/// FAST-9 corners (3 pixels from the border or more), with 3x3
+/// non-maximum suppression when `nms`.
+pub fn vis_fast(g: & GrayImg, t: i64, nms: bool) -> Vec<Keypoint> {
+    var scores: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < g.w * g.h {
+        scores.push(0.0);
+        i = i + 1;
+    }
+    var y: i64 = 3;
+    while y < g.h - 3 {
+        var x: i64 = 3;
+        while x < g.w - 3 {
+            scores.set(y * g.w + x, vis_fast_score(g, x, y, t));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var out: Vec<Keypoint> = Vec::new();
+    y = 3;
+    while y < g.h - 3 {
+        var x: i64 = 3;
+        while x < g.w - 3 {
+            val s: f64 = scores.get(y * g.w + x);
+            if s > 0.0 {
+                var keep: bool = true;
+                if nms {
+                    var dy: i64 = - 1;
+                    while dy <= 1 {
+                        var dx: i64 = - 1;
+                        while dx <= 1 {
+                            if dx != 0 || dy != 0 {
+                                val o: f64 = scores.get((y + dy) * g.w + x + dx);
+                                // ties: the first in raster order wins
+                                if o > s || (o == s && (dy < 0 || (dy == 0 && dx < 0))) {
+                                    keep = false;
+                                }
+                            }
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                }
+                if keep {
+                    out.push(Keypoint { x: x, y: y, score: s, angle: 0.0 });
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return out;
+}
+
+// ─── ORB-style descriptors ───
+
+/// The intensity-centroid orientation of a radius-r disc around (x, y).
+pub fn vis_orientation(f: & FImg, x: i64, y: i64, r: i64) -> f64 {
+    var m10: f64 = 0.0;
+    var m01: f64 = 0.0;
+    var dy: i64 = 0 - r;
+    while dy <= r {
+        var dx: i64 = 0 - r;
+        while dx <= r {
+            if dx * dx + dy * dy <= r * r {
+                val v: f64 = vis_fget(f, x + dx, y + dy);
+                m10 = m10 + (dx as f64) * v;
+                m01 = m01 + (dy as f64) * v;
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return rmath_atan2(m01, m10);
+}
+
+var vis_pattern: Vec<i64> = Vec::new();
+
+// 256 test pairs (x1, y1, x2, y2) in [-13, 13]: a fixed linear
+// congruential sequence, roughly Gaussian (sum of three uniforms).
+@wrapping
+fn vis_brief_pattern() -> Vec<i64> {
+    if vis_pattern.len() == 1024 {
+        return vis_pattern;
+    }
+    var p: Vec<i64> = Vec::new();
+    var s: i64 = 12345;
+    var i: i64 = 0;
+    while i < 1024 {
+        var acc: i64 = 0;
+        var k: i64 = 0;
+        while k < 3 {
+            s = (s * 1103515245 + 12345) & 2147483647;
+            acc = acc + (s >> 16) % 19;
+            k = k + 1;
+        }
+        // 0..54 -> -27..27, halved -> -13..13
+        p.push((acc - 27) / 2);
+        i = i + 1;
+    }
+    vis_pattern = p;
+    return p;
+}
+
+/// Orientation of each keypoint (in place) and its 256-bit descriptor as
+/// 8 words of 32 bits. Keypoints closer than 20 pixels to the border get
+/// an empty descriptor.
+pub fn vis_orb(g: & GrayImg, kps: & mut Vec<Keypoint>) -> Vec<Vec<i64>> {
+    val f: FImg = vis_to_float(g);
+    val sm: FImg = vis_gaussian_blur(&f, 2.0);
+    val pat: Vec<i64> = vis_brief_pattern();
+    var out: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < kps.len() {
+        var kp: Keypoint = kps.get(i);
+        var d: Vec<i64> = Vec::new();
+        if kp.x >= 20 && kp.y >= 20 && kp.x < g.w - 20 && kp.y < g.h - 20 {
+            kp.angle = vis_orientation(&f, kp.x, kp.y, 15);
+            val c: f64 = math_cos(kp.angle);
+            val s: f64 = math_sin(kp.angle);
+            var word: i64 = 0;
+            var b: i64 = 0;
+            while b < 256 {
+                val x1: f64 = pat.get(4 * b) as f64;
+                val y1: f64 = pat.get(4 * b + 1) as f64;
+                val x2: f64 = pat.get(4 * b + 2) as f64;
+                val y2: f64 = pat.get(4 * b + 3) as f64;
+                val ax: i64 = kp.x + vis_round(c * x1 - s * y1);
+                val ay: i64 = kp.y + vis_round(s * x1 + c * y1);
+                val bx: i64 = kp.x + vis_round(c * x2 - s * y2);
+                val by: i64 = kp.y + vis_round(s * x2 + c * y2);
+                if vis_fget(&sm, ax, ay) < vis_fget(&sm, bx, by) {
+                    word = word | (1 << (b % 32));
+                }
+                if b % 32 == 31 {
+                    d.push(word);
+                    word = 0;
+                }
+                b = b + 1;
+            }
+            kps.set(i, kp);
+        }
+        out.push(d);
+        i = i + 1;
+    }
+    return out;
+}
+
+// round half away from zero
+fn vis_round(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (math_floor(0.0 - x + 0.5) as i64);
+    }
+    return math_floor(x + 0.5) as i64;
+}
+
+fn vis_popcount(v: i64) -> i64 {
+    var x: i64 = v & 4294967295;
+    var n: i64 = 0;
+    while x != 0 {
+        x = x & (x - 1);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Hamming distance of two descriptors (256 when either is empty).
+pub fn vis_hamming(a: & Vec<i64>, b: & Vec<i64>) -> i64 {
+    if a.len() == 0 || b.len() != a.len() {
+        return 256;
+    }
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        n = n + vis_popcount(a.get(i) ^ b.get(i));
+        i = i + 1;
+    }
+    return n;
+}
+
+pub struct Match {
+    pub i: i64,
+    pub j: i64,
+    pub dist: i64,
+}
+
+fn vis_nearest(d: & Vec<i64>, set: & Vec<Vec<i64>>) -> i64 {
+    var best: i64 = - 1;
+    var bd: i64 = 257;
+    var j: i64 = 0;
+    while j < set.len() {
+        val h: i64 = vis_hamming(d, &set.get(j));
+        if h < bd {
+            bd = h;
+            best = j;
+        }
+        j = j + 1;
+    }
+    return best;
+}
+
+/// Brute-force matches a -> b with a cross check (each is the other's
+/// nearest) and a maximum distance.
+pub fn vis_match(a: & Vec<Vec<i64>>, b: & Vec<Vec<i64>>, max_dist: i64) -> Vec<Match> {
+    var out: Vec<Match> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        val da: Vec<i64> = a.get(i);
+        if da.len() > 0 {
+            val j: i64 = vis_nearest(&da, b);
+            if j >= 0 {
+                val db: Vec<i64> = b.get(j);
+                val dist: i64 = vis_hamming(&da, &db);
+                if dist <= max_dist && vis_nearest(&db, a) == i {
+                    out.push(Match { i: i, j: j, dist: dist });
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Camera model ───
+
+pub struct Camera {
+    pub fx: f64,
+    pub fy: f64,
+    pub cx: f64,
+    pub cy: f64,
+    pub k1: f64,
+    pub k2: f64,
+    pub p1: f64,
+    pub p2: f64,
+    pub k3: f64,
+}
+
+pub fn cam_pinhole(fx: f64, fy: f64, cx: f64, cy: f64) -> Camera {
+    return Camera { fx: fx, fy: fy, cx: cx, cy: cy, k1: 0.0, k2: 0.0, p1: 0.0, p2: 0.0, k3: 0.0 };
+}
+
+pub fn cam_set_distortion(c: & mut Camera, k1: f64, k2: f64, p1: f64, p2: f64, k3: f64) {
+    c.k1 = k1;
+    c.k2 = k2;
+    c.p1 = p1;
+    c.p2 = p2;
+    c.k3 = k3;
+}
+
+/// Distort normalized image coordinates.
+pub fn cam_distort(c: & Camera, x: f64, y: f64) -> vec2 {
+    val r2: f64 = x * x + y * y;
+    val rad: f64 = 1.0 + c.k1 * r2 + c.k2 * r2 * r2 + c.k3 * r2 * r2 * r2;
+    return vec2(x * rad + 2.0 * c.p1 * x * y + c.p2 * (r2 + 2.0 * x * x), y * rad + c.p1 * (r2 + 2.0 * y * y) + 2.0 * c.p2 * x * y);
+}
+
+/// Undistort normalized coordinates (fixed-point iteration).
+pub fn cam_undistort(c: & Camera, xd: f64, yd: f64) -> vec2 {
+    var x: f64 = xd;
+    var y: f64 = yd;
+    var it: i64 = 0;
+    while it < 50 {
+        val r2: f64 = x * x + y * y;
+        val icd: f64 = 1.0 / (1.0 + c.k1 * r2 + c.k2 * r2 * r2 + c.k3 * r2 * r2 * r2);
+        val dx: f64 = 2.0 * c.p1 * x * y + c.p2 * (r2 + 2.0 * x * x);
+        val dy: f64 = c.p1 * (r2 + 2.0 * y * y) + 2.0 * c.p2 * x * y;
+        val nx: f64 = (xd - dx) * icd;
+        val ny: f64 = (yd - dy) * icd;
+        val ch: f64 = math_fabs(nx - x) + math_fabs(ny - y);
+        x = nx;
+        y = ny;
+        if ch < 0.000000000001 {
+            it = 50;
+        }
+        it = it + 1;
+    }
+    return vec2(x, y);
+}
+
+/// The pixel of a camera-frame point (z > 0), distortion applied.
+pub fn cam_project(c: & Camera, p: vec3) -> vec2 {
+    val d: vec2 = cam_distort(c, p.x / p.z, p.y / p.z);
+    return vec2(c.fx * d.x + c.cx, c.fy * d.y + c.cy);
+}
+
+/// The normalized (undistorted) coordinates of a pixel.
+pub fn cam_pixel_to_norm(c: & Camera, u: f64, v: f64) -> vec2 {
+    return cam_undistort(c, (u - c.cx) / c.fx, (v - c.cy) / c.fy);
+}
+
+/// The image the same camera would see without distortion: each output
+/// pixel is sampled (bilinear) where the distorted camera saw it.
+pub fn vis_undistort(g: & GrayImg, c: & Camera) -> GrayImg {
+    val f: FImg = vis_to_float(g);
+    var out: FImg = vis_fimg_new(g.w, g.h);
+    var y: i64 = 0;
+    while y < g.h {
+        var x: i64 = 0;
+        while x < g.w {
+            val d: vec2 = cam_distort(c, ((x as f64) - c.cx) / c.fx, ((y as f64) - c.cy) / c.fy);
+            out.data.set(y * g.w + x, vis_bilinear(&f, c.fx * d.x + c.cx, c.fy * d.y + c.cy));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return vis_to_gray(&out);
+}
+
+// ─── Homography ───
+
+pub struct Homography {
+    pub ok: bool,
+    // row-major 3x3, h[8] = 1
+    pub h: Vec<f64>,
+}
+
+// Solve a n x n system (row-major a, right side b) by Gaussian elimination
+// with partial pivoting; empty when singular.
+pub fn vis_solve(a: & Vec<f64>, b: & Vec<f64>, n: i64) -> Vec<f64> {
+    var m: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        var j: i64 = 0;
+        while j < n {
+            m.push(a.get(i * n + j));
+            j = j + 1;
+        }
+        m.push(b.get(i));
+        i = i + 1;
+    }
+    val w: i64 = n + 1;
+    var col: i64 = 0;
+    while col < n {
+        var piv: i64 = col;
+        var r: i64 = col + 1;
+        while r < n {
+            if math_fabs(m.get(r * w + col)) > math_fabs(m.get(piv * w + col)) {
+                piv = r;
+            }
+            r = r + 1;
+        }
+        if math_fabs(m.get(piv * w + col)) < 0.000000000001 {
+            return Vec::new();
+        }
+        if piv != col {
+            var k: i64 = 0;
+            while k < w {
+                val t: f64 = m.get(col * w + k);
+                m.set(col * w + k, m.get(piv * w + k));
+                m.set(piv * w + k, t);
+                k = k + 1;
+            }
+        }
+        r = 0;
+        while r < n {
+            if r != col {
+                val fct: f64 = m.get(r * w + col) / m.get(col * w + col);
+                if fct != 0.0 {
+                    var k: i64 = col;
+                    while k < w {
+                        m.set(r * w + k, m.get(r * w + k) - fct * m.get(col * w + k));
+                        k = k + 1;
+                    }
+                }
+            }
+            r = r + 1;
+        }
+        col = col + 1;
+    }
+    var x: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        x.push(m.get(i * w + n) / m.get(i * w + i));
+        i = i + 1;
+    }
+    return x;
+}
+
+// Hartley normalization of points: [s, tx, ty] with x' = s x + tx.
+fn vis_norm_params(xs: & Vec<f64>, ys: & Vec<f64>) -> Vec<f64> {
+    val n: f64 = xs.len() as f64;
+    var mx: f64 = 0.0;
+    var my: f64 = 0.0;
+    var i: i64 = 0;
+    while i < xs.len() {
+        mx = mx + xs.get(i);
+        my = my + ys.get(i);
+        i = i + 1;
+    }
+    mx = mx / n;
+    my = my / n;
+    var md: f64 = 0.0;
+    i = 0;
+    while i < xs.len() {
+        md = md + math_sqrt((xs.get(i) - mx) * (xs.get(i) - mx) + (ys.get(i) - my) * (ys.get(i) - my));
+        i = i + 1;
+    }
+    md = md / n;
+    var s: f64 = 1.0;
+    if md > 0.0 {
+        s = math_sqrt(2.0) / md;
+    }
+    var out: Vec<f64> = Vec::new();
+    out.push(s);
+    out.push(0.0 - s * mx);
+    out.push(0.0 - s * my);
+    return out;
+}
+
+/// The homography mapping (sx, sy) to (dx, dy), from 4 or more points.
+pub fn vis_homography(sx: & Vec<f64>, sy: & Vec<f64>, dx: & Vec<f64>, dy: & Vec<f64>) -> Homography {
+    val n: i64 = sx.len();
+    if n < 4 || sy.len() != n || dx.len() != n || dy.len() != n {
+        return Homography { ok: false, h: Vec::new() };
+    }
+    val ts: Vec<f64> = vis_norm_params(sx, sy);
+    val td: Vec<f64> = vis_norm_params(dx, dy);
+    // normal equations of the 2n x 8 system
+    var ata: Vec<f64> = Vec::new();
+    var atb: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        ata.push(0.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        atb.push(0.0);
+        i = i + 1;
+    }
+    var p: i64 = 0;
+    while p < n {
+        val x: f64 = ts.get(0) * sx.get(p) + ts.get(1);
+        val y: f64 = ts.get(0) * sy.get(p) + ts.get(2);
+        val u: f64 = td.get(0) * dx.get(p) + td.get(1);
+        val v: f64 = td.get(0) * dy.get(p) + td.get(2);
+        var rows: Vec<f64> = Vec::new();
+        rows.push(x); rows.push(y); rows.push(1.0); rows.push(0.0); rows.push(0.0); rows.push(0.0); rows.push(0.0 - u * x); rows.push(0.0 - u * y);
+        rows.push(0.0); rows.push(0.0); rows.push(0.0); rows.push(x); rows.push(y); rows.push(1.0); rows.push(0.0 - v * x); rows.push(0.0 - v * y);
+        var rr: i64 = 0;
+        while rr < 2 {
+            var rhs: f64 = u;
+            if rr == 1 {
+                rhs = v;
+            }
+            var a: i64 = 0;
+            while a < 8 {
+                val ra: f64 = rows.get(rr * 8 + a);
+                var b: i64 = 0;
+                while b < 8 {
+                    ata.set(a * 8 + b, ata.get(a * 8 + b) + ra * rows.get(rr * 8 + b));
+                    b = b + 1;
+                }
+                atb.set(a, atb.get(a) + ra * rhs);
+                a = a + 1;
+            }
+            rr = rr + 1;
+        }
+        p = p + 1;
+    }
+    val hn: Vec<f64> = vis_solve(&ata, &atb, 8);
+    if hn.len() == 0 {
+        return Homography { ok: false, h: Vec::new() };
+    }
+    // H = Td^-1 Hn Ts
+    val s1: f64 = ts.get(0);
+    val a1: f64 = ts.get(1);
+    val b1: f64 = ts.get(2);
+    val s2: f64 = td.get(0);
+    val a2: f64 = td.get(1);
+    val b2: f64 = td.get(2);
+    // Hn Ts
+    var m: Vec<f64> = Vec::new();
+    var r: i64 = 0;
+    while r < 3 {
+        val h0: f64 = hn.get(r * 3);
+        val h1: f64 = hn.get(r * 3 + 1);
+        var h2: f64 = 1.0;
+        if r < 2 {
+            h2 = hn.get(r * 3 + 2);
+        }
+        m.push(h0 * s1);
+        m.push(h1 * s1);
+        m.push(h0 * a1 + h1 * b1 + h2);
+        r = r + 1;
+    }
+    // Td^-1 = [1/s2, 0, -a2/s2; 0, 1/s2, -b2/s2; 0, 0, 1]
+    var h: Vec<f64> = Vec::new();
+    var c: i64 = 0;
+    while c < 3 {
+        h.push((m.get(c) - a2 * m.get(6 + c)) / s2);
+        c = c + 1;
+    }
+    c = 0;
+    while c < 3 {
+        h.push((m.get(3 + c) - b2 * m.get(6 + c)) / s2);
+        c = c + 1;
+    }
+    c = 0;
+    while c < 3 {
+        h.push(m.get(6 + c));
+        c = c + 1;
+    }
+    val k: f64 = h.get(8);
+    if math_fabs(k) < 0.000000000001 {
+        return Homography { ok: false, h: h };
+    }
+    var hh: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 9 {
+        hh.push(h.get(i) / k);
+        i = i + 1;
+    }
+    return Homography { ok: true, h: hh };
+}
+
+/// H applied to (x, y).
+pub fn vis_hom_apply(h: & Vec<f64>, x: f64, y: f64) -> vec2 {
+    val w: f64 = h.get(6) * x + h.get(7) * y + h.get(8);
+    return vec2((h.get(0) * x + h.get(1) * y + h.get(2)) / w, (h.get(3) * x + h.get(4) * y + h.get(5)) / w);
+}
+
+/// The inverse of a 3x3 matrix (empty when singular), scaled so [8] = 1
+/// when possible.
+pub fn vis_mat3_inverse(m: & Vec<f64>) -> Vec<f64> {
+    val a: f64 = m.get(0);
+    val b: f64 = m.get(1);
+    val c: f64 = m.get(2);
+    val d: f64 = m.get(3);
+    val e: f64 = m.get(4);
+    val f: f64 = m.get(5);
+    val g: f64 = m.get(6);
+    val h: f64 = m.get(7);
+    val i: f64 = m.get(8);
+    val det: f64 = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    var out: Vec<f64> = Vec::new();
+    if math_fabs(det) < 0.000000000000001 {
+        return out;
+    }
+    out.push((e * i - f * h) / det);
+    out.push((c * h - b * i) / det);
+    out.push((b * f - c * e) / det);
+    out.push((f * g - d * i) / det);
+    out.push((a * i - c * g) / det);
+    out.push((c * d - a * f) / det);
+    out.push((d * h - e * g) / det);
+    out.push((b * g - a * h) / det);
+    out.push((a * e - b * d) / det);
+    val k: f64 = out.get(8);
+    if math_fabs(k) > 0.000000000001 {
+        var s: Vec<f64> = Vec::new();
+        var j: i64 = 0;
+        while j < 9 {
+            s.push(out.get(j) / k);
+            j = j + 1;
+        }
+        return s;
+    }
+    return out;
+}

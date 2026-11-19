@@ -1,0 +1,53 @@
+// Track TG (docs/roadmap/llvm-roadmap.md), TG14: a position-independent
+// Linux executable that is also dynamically linked (CI2/TG15: C functions
+// the runtime does not provide, bound by glibc's loader). The loader takes
+// the program's load bias from PT_PHDR (compiler/nat_enc.fd nat_elf_img
+// writes it first when g_nat_pie and the image has PT_INTERP), relocates
+// its GOT slots and dynamic section, then _start adds the bias to the
+// program's own absolute words (nat_ir ng_gen_pie_reloc: the table is
+// made before the loader's tables, so they are not in it). Here the
+// absolute words (a function value, a string constant, a global) and C
+// calls (libc, libm) meet in one program. Check, once compiler/nat_ir.fd
+// ng_ldyn_ok no longer refuses g_nat_pie:
+//   FID_NAT_ON=pie fid emit tests/nattools/pie_ldyn_prog.fd --target x86_64-linux -o p
+//   python3 tests/nattools/elf_segments_check.py --dyn p   # PT_PHDR first, PT_INTERP
+//   ./p                                                    # (WSL / Linux) prints what follows
+// (Not in tests/bootstrap: `fid run`, the suites' reference, cannot call
+// C. The same without FID_NAT_ON=pie must print the same lines.)
+// Expected output:
+// 7
+// 13
+// 42
+// 21
+// machine
+// 7
+
+extern "C" link "m" {
+    fn hypot(x: f64, y: f64) -> f64;
+}
+
+extern "C" {
+    fn abs(x: i32) -> i32;
+    fn labs(x: i64) -> i64;
+    fn strlen(s: str) -> i64;
+}
+
+var word: str = "machine";
+
+fn triple(x: i64) -> i64 {
+    return x * 3;
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+@unsafe
+fn main() {
+    println(abs(0 - 7) as i64);
+    println(hypot(5.0, 12.0) as i64);
+    println(labs(0 - 42));
+    println(apply(triple, 7));
+    println(word);
+    println(strlen(word));
+}

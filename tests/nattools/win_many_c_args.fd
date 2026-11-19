@@ -1,0 +1,109 @@
+// --nat Windows: a C function with more than six arguments (the stub of
+// compiler/nat_enc.fd nat_pe_win64_stub passes arguments 4 and up on the
+// stack). Before, compiler/nat_ir.fd ng_ldyn_sig gave such a call no
+// signature on every target (System V's limit of six integer registers),
+// so on Windows it stayed unresolved and the build failed with "the C
+// function '...' is not in any library the program links" (BCryptEncrypt,
+// InitializeSecurityContextA, AcceptSecurityContext, ...).
+// WideCharToMultiByte takes eight: each check below depends on one of
+// the stack arguments (4..7) reaching its position.
+// Windows only: tests/nattools/win_many_c_args_check.sh builds it with
+// `fid emit --nat` (and `fid ccompile` when a C compiler is there).
+// Expected output:
+// 3
+// 3
+// 3
+// 104
+// 105
+// 0
+// 3
+// 35
+// 65
+// 0
+// 1
+
+// SAFETY: the prototypes come from <windows.h> (the include), so the C
+// compiler checks each call; every pointer is 0 or inside a 64-byte block
+// main allocated, with the length passed beside it.
+extern "C" include "<windows.h>" link "kernel32" {
+    fn MultiByteToWideChar as wm_to_wide(cp: i64, flags: i64, src: * mut u8, src_len: i64, dst: * mut u8, dst_len: i64) -> i32;
+    fn WideCharToMultiByte as wm_to_multi(cp: i64, flags: i64, src: * mut u8, src_len: i64, dst: * mut u8, dst_len: i64, def: * mut u8, used: * mut u8) -> i32;
+}
+
+fn set_byte(p: i64, i: i64, v: i64) {
+    // SAFETY: every caller writes inside a 64-byte block main allocated.
+    unsafe {
+        var q: * mut u8 = p + i;
+        * q = v as u8;
+    }
+}
+
+fn byte_at(p: i64, i: i64) -> i64 {
+    var v: i64 = 0;
+    // SAFETY: every caller reads inside a 64-byte block main allocated.
+    unsafe {
+        var q: * mut u8 = p + i;
+        v = (* q) as i64;
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    // `out`: 0..15 the UTF-8 result, 16..31 the code page 1252 result,
+    // 32..35 the BOOL "a default character was used", 40 the default
+    // character, 48.. "hi" and its NUL. `wide`: 0..15 "hi" as UTF-16,
+    // 32..37 U+4E2D "A" NUL as UTF-16.
+    var wide: i64 = 0;
+    var out: i64 = 0;
+    // SAFETY: two blocks of 64 bytes, freed at the end
+    unsafe {
+        wide = p_malloc(64);
+        out = p_malloc(64);
+    }
+    var z: i64 = 0;
+    while z < 64 {
+        set_byte(out, z, 0);
+        set_byte(wide, z, 0);
+        z = z + 1;
+    }
+    set_byte(out, 48, 104);
+    set_byte(out, 49, 105);
+    set_byte(out, 40, 35);
+    set_byte(wide, 32, 0x2D);
+    set_byte(wide, 33, 0x4E);
+    set_byte(wide, 34, 65);
+    var n1: i64 = 0;
+    var n2: i64 = 0;
+    var n3: i64 = 0;
+    var n4: i64 = 0;
+    // SAFETY: the buffers are the two zeroed 64-byte blocks above; each
+    // length passed is at most what fits where it points (16 UTF-16 units,
+    // 16 bytes).
+    unsafe {
+        // "hi" as UTF-16 (CP_UTF8 = 65001; -1: up to the NUL)
+        n1 = wm_to_wide(65001, 0, (out + 48) as * mut u8, 0 - 1, wide as * mut u8, 16) as i64;
+        // argument 5 (cbMultiByte, on the stack) 0: only the size
+        n2 = wm_to_multi(65001, 0, wide as * mut u8, 0 - 1, out as * mut u8, 0, 0 as * mut u8, 0 as * mut u8) as i64;
+        n3 = wm_to_multi(65001, 0, wide as * mut u8, 0 - 1, out as * mut u8, 16, 0 as * mut u8, 0 as * mut u8) as i64;
+        // Code page 1252 has no U+4E2D: it becomes the default character
+        // of argument 6 ('#'), and argument 7's BOOL is set
+        n4 = wm_to_multi(1252, 0, (wide + 32) as * mut u8, 0 - 1, (out + 16) as * mut u8, 16, (out + 40) as * mut u8, (out + 32) as * mut u8) as i64;
+    }
+    println(n1);
+    println(n2);
+    println(n3);
+    println(byte_at(out, 0));
+    println(byte_at(out, 1));
+    println(byte_at(out, 2));
+    println(n4);
+    println(byte_at(out, 16));
+    println(byte_at(out, 17));
+    println(byte_at(out, 18));
+    println(byte_at(out, 32));
+    // SAFETY: the blocks p_malloc returned above, each freed once
+    unsafe {
+        p_free(wide);
+        p_free(out);
+    }
+    return 0;
+}

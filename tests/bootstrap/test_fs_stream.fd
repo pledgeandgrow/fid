@@ -1,0 +1,184 @@
+// roadmap L4B: stdlib/fs.fd File handles stream. Writes go out with
+// zero bytes in place (p_file_append_vec), reads come from the file
+// FILE_READ_CHUNK bytes at a time (p_file_read_at), so lines and reads
+// cross the window's edges, and bytes appended to the file after it was
+// opened are read too (a handle that loaded the file when it opened would
+// not see them: "after open" fails then). fs_modified_ms is the file's
+// last write time.
+// Expected output:
+// written 100000 391
+// size 100000
+// sum 12748693 rest 99990
+// after open 99994 TAIL
+// lines 100 ok
+// last line none
+// modified yes
+// modified missing -1
+use fs;
+
+fn pattern(i: i64) -> i64 {
+    return (i * 7) % 256;
+}
+
+fn main() {
+    val path: str = "test_fs_stream.tmp";
+    fs_delete(path);
+    // 100000 bytes, 391 of them zero, written 1000 at a time
+    var zeros: i64 = 0;
+    match File::create(path) {
+        Option::Some(f) => {
+            var w: File = f;
+            var i: i64 = 0;
+            while i < 100000 {
+                var piece: Vec<i64> = Vec::new();
+                var j: i64 = 0;
+                while j < 1000 {
+                    val b: i64 = pattern(i + j);
+                    if b == 0 {
+                        zeros = zeros + 1;
+                    }
+                    piece.push(b);
+                    j = j + 1;
+                }
+                w.write(piece);
+                i = i + 1000;
+            }
+            println("written " + int_to_str(w.tell()) + " " + int_to_str(zeros));
+            w.close();
+        }
+        Option::None => {
+            println("create failed");
+        }
+    }
+    println("size " + int_to_str(fs_file_size(path)));
+
+    match File::open(path) {
+        Option::Some(f) => {
+            var r: File = f;
+            val head: Vec<i64> = r.read(10);
+            // every byte from 10 on, in pieces of 777 (not a divisor of the
+            // window), checked against the pattern
+            var sum: i64 = 0;
+            var count: i64 = 0;
+            var bad: i64 = 0;
+            var at: i64 = 10;
+            var piece: Vec<i64> = r.read(777);
+            while piece.len() > 0 {
+                var k: i64 = 0;
+                while k < piece.len() {
+                    if piece.get(k) != pattern(at) {
+                        bad = bad + 1;
+                    }
+                    sum = sum + piece.get(k);
+                    at = at + 1;
+                    k = k + 1;
+                }
+                count = count + piece.len();
+                piece = r.read(777);
+            }
+            if bad == 0 && head.len() == 10 {
+                println("sum " + int_to_str(sum) + " rest " + int_to_str(count));
+            } else {
+                println("bad bytes " + int_to_str(bad));
+            }
+            r.close();
+        }
+        Option::None => {
+            println("open failed");
+        }
+    }
+
+    // bytes appended after the handle opened the file are read too
+    match File::open(path) {
+        Option::Some(f) => {
+            var r: File = f;
+            r.read(10);
+            fs_append_text(path, "TAIL");
+            val rest: Vec<i64> = r.read_to_end();
+            var tail: Vec<i64> = Vec::new();
+            var t: i64 = rest.len() - 4;
+            while t >= 0 && t < rest.len() {
+                tail.push(rest.get(t));
+                t = t + 1;
+            }
+            println("after open " + int_to_str(rest.len()) + " " + str_from_bytes(tail));
+            r.close();
+        }
+        Option::None => {
+            println("open failed");
+        }
+    }
+
+    // 100 lines of 1000 bytes ('a' + line % 26, then "\n"): lines cross
+    // the window's edge at 65536
+    fs_delete(path);
+    match File::create(path) {
+        Option::Some(f) => {
+            var w: File = f;
+            var ln: i64 = 0;
+            while ln < 100 {
+                var line: Vec<i64> = Vec::new();
+                var c: i64 = 0;
+                while c < 999 {
+                    line.push(97 + ln % 26);
+                    c = c + 1;
+                }
+                line.push(10);
+                w.write(line);
+                ln = ln + 1;
+            }
+            w.close();
+        }
+        Option::None => {
+            println("create failed");
+        }
+    }
+    match File::open(path) {
+        Option::Some(f) => {
+            var r: File = f;
+            var n: i64 = 0;
+            var good: i64 = 0;
+            var more: bool = true;
+            while more {
+                val l: Option<str> = r.read_line();
+                match l {
+                    Option::Some(s) => {
+                        if str_len(s) == 999 && str_byte_at(s, 0) == 97 + n % 26 && str_byte_at(s, 998) == 97 + n % 26 {
+                            good = good + 1;
+                        }
+                        n = n + 1;
+                    }
+                    Option::None => {
+                        more = false;
+                    }
+                }
+            }
+            if good == n {
+                println("lines " + int_to_str(n) + " ok");
+            } else {
+                println("lines " + int_to_str(n) + " good " + int_to_str(good));
+            }
+            val last: Option<str> = r.read_line();
+            match last {
+                Option::Some(_) => {
+                    println("last line some");
+                }
+                Option::None => {
+                    println("last line none");
+                }
+            }
+            r.close();
+        }
+        Option::None => {
+            println("open failed");
+        }
+    }
+
+    if fs_modified_ms(path) > 1500000000000 {
+        println("modified yes");
+    } else {
+        println("modified no");
+    }
+    println("modified missing " + int_to_str(fs_modified_ms("no_such_file_rt10.tmp")));
+    fs_delete(path);
+}

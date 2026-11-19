@@ -1,0 +1,1540 @@
+// Fides ISO 15118-2 / DIN SPEC 70121 standard library (high-level charging)
+//
+// ISO 15118 is the "plug and charge" protocol between an EV and a charging
+// station over a direct IP link; DIN SPEC 70121 is its older DC-only
+// relative, the one most CCS chargers in the field still speak. This module
+// covers the parts that are pure computation on bytes (Vec<i64>, 0..255):
+//
+// Real (implemented and tested):
+//   - V2GTP (V2G Transfer Protocol) header: version 0x01, inverse version
+//     0xFE, a 2-byte payload type and a 4-byte big-endian payload length,
+//     then the payload. Payload types SDP request (0x9000), SDP response
+//     (0x9001) and EXI-encoded V2G message (0x8001).
+//   - SDP (SECC Discovery Protocol): the 2-byte request and the 20-byte
+//     response (the SECC's IPv6 address, port, security and transport).
+//   - The SupportedAppProtocol handshake, EXI-encoded with stdlib/exi.fd
+//     against grammar tables written from V2G_CI_AppProtocol.xsd.
+//   - The DIN SPEC 70121 message set, EXI-encoded and decoded with grammar
+//     tables written from the DIN 70121 V2G_CI schema (MsgDef, MsgHeader,
+//     MsgBody, MsgDataTypes): V2G_Message with Header (SessionID,
+//     Notification) and Body, and SessionSetup, ServiceDiscovery,
+//     ServicePaymentSelection, ContractAuthentication,
+//     ChargeParameterDiscovery (AC and DC parameters, SAScheduleList with
+//     PMax schedules), CableCheck, PreCharge, PowerDelivery (ChargingProfile,
+//     DC_EVPowerDeliveryParameter), CurrentDemand, WeldingDetection and
+//     SessionStop requests and responses, with PhysicalValue, DC_EVStatus,
+//     DC_EVSEStatus and AC_EVSEStatus. Builders (din_*_req / din_*_res) make
+//     the events of a body; din_encode / din_decode turn messages into EXI
+//     and back; din_field / din_pv_at / din_ev_status_at /
+//     din_evse_status_at read decoded fields.
+//     Checked byte for byte against 36 published DIN streams and 2
+//     handshake requests (the pyPLC project's captures from a Hyundai
+//     Ioniq, a BMW iX and several chargers, and its OpenV2G-made test
+//     messages, covering all 22 message types above): each decodes and
+//     re-encodes to the same bytes, and the builders reproduce 8 of them.
+//     Facts of the schema those streams settle: the grammars are
+//     non-strict, the heads of the substitution groups (BodyElement,
+//     SASchedules, EVSEChargeParameter, EVPowerDeliveryParameter,
+//     TimeInterval, ...) are elements of their own groups, SASchedules is
+//     required in ChargeParameterDiscoveryRes, and V2G_Message is global
+//     element 77 of 81.
+//   - The message sequence as a state machine with per-state timeouts, in
+//     two profiles: ISO 15118-2 (SupportedAppProtocol -> SessionSetup ->
+//     ServiceDiscovery -> PaymentServiceSelection -> ChargeParameterDiscovery
+//     -> PowerDelivery -> CurrentDemand* -> PowerDelivery -> SessionStop)
+//     and DIN 70121 DC (... ServicePaymentSelection -> ContractAuthentication*
+//     -> ChargeParameterDiscovery* -> CableCheck* -> PreCharge* ->
+//     PowerDelivery -> CurrentDemand* -> PowerDelivery -> WeldingDetection*
+//     -> SessionStop; * repeats while the EVSE says Ongoing, the pre-charge
+//     voltage is not reached or the welding check voltage is still high).
+//     The DIN profile runs on EXI bytes: v2g_din_send encodes and frames a
+//     request, v2g_din_receive parses, decodes and checks a response
+//     (message name, ResponseCode, SessionID, EVSEProcessing, voltages).
+//
+// The seams (said plainly): ISO 15118-2's own messages (the 2013/2014
+// schema) have no grammar tables here; for that profile the state machine
+// still takes message names and response codes from an EXI codec supplied
+// by the caller (v2g_step). Not in the DIN tables: SalesTariff, the
+// xmldsig Signature, and the messages that DIN DC charging with external
+// payment does not use (ServiceDetail, PaymentDetails, ChargingStatus,
+// MeteringReceipt, CertificateUpdate/Installation): they are named so that
+// event codes are right, and the codec refuses their content. TLS and the
+// transport (TCP for V2G messages, UDP multicast for SDP) are the caller's;
+// this module only builds and parses the bytes.
+
+module iso15118;
+use vec;
+use string;
+use exi;
+
+
+// V2GTP payload types
+pub const V2GTP_EXI: i64 = 0x8001;         // EXI-encoded V2G message
+pub const V2GTP_SDP_REQUEST: i64 = 0x9000;
+pub const V2GTP_SDP_RESPONSE: i64 = 0x9001;
+
+// SDP security / transport
+pub const SDP_SECURITY_TLS: i64 = 0x00;
+pub const SDP_SECURITY_NONE: i64 = 0x10;
+pub const SDP_TRANSPORT_TCP: i64 = 0x00;
+
+// V2G message-sequence states
+pub const V2G_APP_PROTOCOL: i64 = 0;
+pub const V2G_SESSION_SETUP: i64 = 1;
+pub const V2G_SERVICE_DISCOVERY: i64 = 2;
+pub const V2G_PAYMENT_SELECT: i64 = 3;
+pub const V2G_CHARGE_PARAM: i64 = 4;
+pub const V2G_POWER_DELIVERY_START: i64 = 5;
+pub const V2G_CURRENT_DEMAND: i64 = 6;
+pub const V2G_POWER_DELIVERY_STOP: i64 = 7;
+pub const V2G_SESSION_STOP: i64 = 8;
+pub const V2G_DONE: i64 = 9;
+
+// Response codes (ISO 15118-2)
+pub const V2G_OK: i64 = 0;
+pub const V2G_OK_NEW_SESSION: i64 = 1;
+pub const V2G_FAILED: i64 = 16;
+pub const V2G_FAILED_SEQUENCE_ERROR: i64 = 20;
+
+fn put32be(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn put16be(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+// ─── V2GTP ───────────────────────────────────────────────────────────────
+
+/// Build a V2GTP packet: 0x01 0xFE <payloadType:2> <length:4> <payload>.
+pub fn iso15118_v2gtp(payload_type: i64, payload: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0x01);
+    out.push(0xFE);
+    put16be(& mut out, payload_type);
+    put32be(& mut out, payload.len());
+    var i: i64 = 0;
+    while i < payload.len() { out.push(payload.get(i)); i = i + 1; }
+    return out;
+}
+
+pub struct V2gtpPacket {
+    pub ok: bool,
+    pub error: str,
+    pub payload_type: i64,
+    pub length: i64,
+    pub payload: Vec<i64>,
+}
+
+pub fn iso15118_v2gtp_parse(b: & Vec<i64>) -> V2gtpPacket {
+    if b.len() < 8 {
+        return V2gtpPacket { ok: false, error: "too short", payload_type: 0, length: 0, payload: Vec::new() };
+    }
+    if b.get(0) != 0x01 || b.get(1) != 0xFE {
+        return V2gtpPacket { ok: false, error: "bad version header", payload_type: 0, length: 0, payload: Vec::new() };
+    }
+    val ptype: i64 = (b.get(2) << 8) | b.get(3);
+    val length: i64 = (b.get(4) << 24) | (b.get(5) << 16) | (b.get(6) << 8) | b.get(7);
+    var payload: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < length && 8 + i < b.len() {
+        payload.push(b.get(8 + i));
+        i = i + 1;
+    }
+    if payload.len() != length {
+        return V2gtpPacket { ok: false, error: "truncated payload", payload_type: ptype, length: length, payload: payload };
+    }
+    return V2gtpPacket { ok: true, error: "", payload_type: ptype, length: length, payload: payload };
+}
+
+// ─── SDP (SECC Discovery Protocol) ───────────────────────────────────────
+
+/// Build an SDP request payload (2 bytes: security, transport).
+pub fn iso15118_sdp_request(security: i64, transport: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(security & 255);
+    out.push(transport & 255);
+    return out;
+}
+
+/// Build an SDP response payload: 16-byte IPv6 address, 2-byte port,
+/// security, transport (20 bytes).
+pub fn iso15118_sdp_response(ipv6: & Vec<i64>, port: i64, security: i64, transport: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        if i < ipv6.len() { out.push(ipv6.get(i)); } else { out.push(0); }
+        i = i + 1;
+    }
+    put16be(& mut out, port);
+    out.push(security & 255);
+    out.push(transport & 255);
+    return out;
+}
+
+pub struct SdpResponse {
+    pub ok: bool,
+    pub ipv6: Vec<i64>,
+    pub port: i64,
+    pub security: i64,
+    pub transport: i64,
+}
+
+pub fn iso15118_sdp_response_parse(b: & Vec<i64>) -> SdpResponse {
+    if b.len() < 20 {
+        return SdpResponse { ok: false, ipv6: Vec::new(), port: 0, security: 0, transport: 0 };
+    }
+    var ip: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { ip.push(b.get(i)); i = i + 1; }
+    return SdpResponse {
+        ok: true, ipv6: ip,
+        port: (b.get(16) << 8) | b.get(17),
+        security: b.get(18), transport: b.get(19),
+    };
+}
+
+// ─── SupportedAppProtocol (V2G_CI_AppProtocol.xsd) ───────────────────────
+
+pub const APP_NS: str = "urn:iso:15118:2:2010:AppProtocol";
+pub const APP_OK: i64 = 0;                 // OK_SuccessfulNegotiation
+pub const APP_OK_MINOR_DEVIATION: i64 = 1;
+pub const APP_FAILED: i64 = 2;             // Failed_NoNegotiation
+
+/// The grammar tables of the handshake schema.
+pub fn iso15118_app_schema() -> ExiSchema {
+    var s: ExiSchema = exi_schema_new();
+    val d_str: i64 = exi_dt(& mut s, EXI_DT_STRING, 0, 0);
+    val d_uint: i64 = exi_dt(& mut s, EXI_DT_UNSIGNED, 0, 0);
+    val d_id: i64 = exi_dt(& mut s, EXI_DT_NBIT, 0, 255);        // idType: unsignedByte
+    val d_prio: i64 = exi_dt(& mut s, EXI_DT_NBIT, 1, 20);       // priorityType
+    val d_rc: i64 = exi_dt_enum(& mut s, "OK_SuccessfulNegotiation|OK_SuccessfulNegotiationWithMinorDeviation|Failed_NoNegotiation");
+    val t_str: i64 = exi_type_simple(& mut s, d_str);
+    val t_uint: i64 = exi_type_simple(& mut s, d_uint);
+    val t_id: i64 = exi_type_simple(& mut s, d_id);
+    val t_prio: i64 = exi_type_simple(& mut s, d_prio);
+    val t_rc: i64 = exi_type_simple(& mut s, d_rc);
+    val ap: i64 = exi_type(& mut s);
+    exi_elem(& mut s, ap, "", "ProtocolNamespace", t_str, 1, 1);
+    exi_elem(& mut s, ap, "", "VersionNumberMajor", t_uint, 1, 1);
+    exi_elem(& mut s, ap, "", "VersionNumberMinor", t_uint, 1, 1);
+    exi_elem(& mut s, ap, "", "SchemaID", t_id, 1, 1);
+    exi_elem(& mut s, ap, "", "Priority", t_prio, 1, 1);
+    val req: i64 = exi_type(& mut s);
+    exi_elem(& mut s, req, "", "AppProtocol", ap, 1, 20);
+    val res: i64 = exi_type(& mut s);
+    exi_elem(& mut s, res, "", "ResponseCode", t_rc, 1, 1);
+    exi_elem(& mut s, res, "", "SchemaID", t_id, 0, 1);
+    exi_global(& mut s, APP_NS, "supportedAppProtocolReq", req);
+    exi_global(& mut s, APP_NS, "supportedAppProtocolRes", res);
+    exi_schema_finish(& mut s);
+    return s;
+}
+
+/// One AppProtocol entry offered by the EV.
+pub struct AppProtocol {
+    pub namespace: str,
+    pub version_major: i64,
+    pub version_minor: i64,
+    pub schema_id: i64,
+    pub priority: i64,
+}
+
+/// The events of a supportedAppProtocolReq.
+pub fn iso15118_app_protocol_req_events(protocols: & Vec<AppProtocol>) -> Vec<ExiEvent> {
+    var evs: Vec<ExiEvent> = Vec::new();
+    evs.push(exi_se(APP_NS, "supportedAppProtocolReq"));
+    var i: i64 = 0;
+    while i < protocols.len() {
+        val p: AppProtocol = protocols.get(i);
+        evs.push(exi_se("", "AppProtocol"));
+        exi_push_leaf(& mut evs, "", "ProtocolNamespace", exi_ch_str(p.namespace));
+        exi_push_leaf(& mut evs, "", "VersionNumberMajor", exi_ch_int(p.version_major));
+        exi_push_leaf(& mut evs, "", "VersionNumberMinor", exi_ch_int(p.version_minor));
+        exi_push_leaf(& mut evs, "", "SchemaID", exi_ch_int(p.schema_id));
+        exi_push_leaf(& mut evs, "", "Priority", exi_ch_int(p.priority));
+        evs.push(exi_ee());
+        i = i + 1;
+    }
+    evs.push(exi_ee());
+    return evs;
+}
+
+/// EXI of a supportedAppProtocolReq (empty when a value is out of range).
+pub fn iso15118_app_protocol_req(protocols: & Vec<AppProtocol>) -> Vec<i64> {
+    val s: ExiSchema = iso15118_app_schema();
+    val r: ExiResult = exi_encode(& s, & exi_options(), & iso15118_app_protocol_req_events(protocols));
+    return r.bytes;
+}
+
+/// Decode a supportedAppProtocolReq (an empty list if it is not one).
+pub fn iso15118_app_protocol_req_parse(b: & Vec<i64>) -> Vec<AppProtocol> {
+    var out: Vec<AppProtocol> = Vec::new();
+    val s: ExiSchema = iso15118_app_schema();
+    val d: ExiDoc = exi_decode(& s, & exi_options(), v2g_bytes(b));
+    if !d.ok || exi_find(& d.events, "supportedAppProtocolReq") != 0 {
+        return out;
+    }
+    val n: i64 = exi_count(& d.events, "supportedAppProtocolReq/AppProtocol");
+    var i: i64 = 0;
+    while i < n {
+        val at: i64 = exi_find_nth(& d.events, "supportedAppProtocolReq/AppProtocol", i);
+        // the five leaves follow in schema order: SE, CH, EE each
+        out.push(AppProtocol {
+            namespace: d.events.get(at + 2).sval,
+            version_major: d.events.get(at + 5).ival, version_minor: d.events.get(at + 8).ival,
+            schema_id: d.events.get(at + 11).ival, priority: d.events.get(at + 14).ival,
+        });
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn iso15118_app_protocol_res_events(response_code: i64, schema_id: i64) -> Vec<ExiEvent> {
+    var evs: Vec<ExiEvent> = Vec::new();
+    evs.push(exi_se(APP_NS, "supportedAppProtocolRes"));
+    exi_push_leaf(& mut evs, "", "ResponseCode", exi_ch_int(response_code));
+    if schema_id >= 0 {
+        exi_push_leaf(& mut evs, "", "SchemaID", exi_ch_int(schema_id));
+    }
+    evs.push(exi_ee());
+    return evs;
+}
+
+/// EXI of a supportedAppProtocolRes (schema_id -1: none chosen).
+pub fn iso15118_app_protocol_res(response_code: i64, schema_id: i64) -> Vec<i64> {
+    val s: ExiSchema = iso15118_app_schema();
+    val r: ExiResult = exi_encode(& s, & exi_options(), & iso15118_app_protocol_res_events(response_code, schema_id));
+    return r.bytes;
+}
+
+pub struct AppProtocolRes {
+    pub ok: bool,
+    pub response_code: i64,
+    pub schema_id: i64,    // -1: absent
+}
+
+pub fn iso15118_app_protocol_res_parse(b: & Vec<i64>) -> AppProtocolRes {
+    val s: ExiSchema = iso15118_app_schema();
+    val d: ExiDoc = exi_decode(& s, & exi_options(), v2g_bytes(b));
+    if !d.ok || exi_find(& d.events, "supportedAppProtocolRes") != 0 {
+        return AppProtocolRes { ok: false, response_code: 0, schema_id: - 1 };
+    }
+    var sid: i64 = - 1;
+    if exi_has(& d.events, "supportedAppProtocolRes/SchemaID") {
+        sid = exi_get(& d.events, "supportedAppProtocolRes/SchemaID").ival;
+    }
+    return AppProtocolRes { ok: true, response_code: exi_get(& d.events, "supportedAppProtocolRes/ResponseCode").ival, schema_id: sid };
+}
+
+/// Choose the EV protocol with the lowest Priority value (1 = highest) that
+/// the station also supports; returns the chosen schema id, or -1.
+pub fn iso15118_choose_protocol(offered: & Vec<AppProtocol>, supported_namespaces: & Vec<str>) -> i64 {
+    var best_schema: i64 = - 1;
+    var best_priority: i64 = 1000;
+    var i: i64 = 0;
+    while i < offered.len() {
+        val p: AppProtocol = offered.get(i);
+        var ok: bool = false;
+        var s: i64 = 0;
+        while s < supported_namespaces.len() {
+            if str_equal(supported_namespaces.get(s), p.namespace) { ok = true; }
+            s = s + 1;
+        }
+        if ok && p.priority < best_priority {
+            best_priority = p.priority;
+            best_schema = p.schema_id;
+        }
+        i = i + 1;
+    }
+    return best_schema;
+}
+
+// ─── DIN SPEC 70121 grammar tables ───────────────────────────────────────
+
+pub const DIN_MSG_DEF: str = "urn:din:70121:2012:MsgDef";
+pub const DIN_MSG_HEADER: str = "urn:din:70121:2012:MsgHeader";
+pub const DIN_MSG_BODY: str = "urn:din:70121:2012:MsgBody";
+pub const DIN_MSG_TYPES: str = "urn:din:70121:2012:MsgDataTypes";
+pub const DIN_XMLDSIG: str = "http://www.w3.org/2000/09/xmldsig#";
+pub const DIN_NAMESPACE: str = "urn:din:70121:2012:MsgDef";   // AppProtocol namespace
+
+/// A substitution group (or choice) particle: the members, the head too.
+fn din_group(s: & mut ExiSchema, t: i64, min: i64, max: i64, uri: str, names: str, types: & Vec<i64>) {
+    val p: i64 = exi_particle(s, t, min, max);
+    val ns: Vec<str> = str_split(names, "|");
+    var i: i64 = 0;
+    while i < ns.len() {
+        exi_alt_sorted(s, p, uri, ns.get(i), types.get(i));
+        i = i + 1;
+    }
+}
+
+fn din_two(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn din_three(a: i64, b: i64, c: i64) -> Vec<i64> {
+    var v: Vec<i64> = din_two(a, b);
+    v.push(c);
+    return v;
+}
+
+/// The grammar tables of the DIN 70121 V2G_CI schema (non-strict).
+pub fn iso15118_din_schema() -> ExiSchema {
+    var s: ExiSchema = exi_schema_new();
+    val dt: str = DIN_MSG_TYPES;
+    val bd: str = DIN_MSG_BODY;
+    // datatypes
+    val d_hex: i64 = exi_dt(& mut s, EXI_DT_BINARY, 0, 0);
+    val d_str: i64 = exi_dt(& mut s, EXI_DT_STRING, 0, 0);
+    val d_bool: i64 = exi_dt(& mut s, EXI_DT_BOOLEAN, 0, 0);
+    val d_uint: i64 = exi_dt(& mut s, EXI_DT_UNSIGNED, 0, 0);
+    val d_int: i64 = exi_dt(& mut s, EXI_DT_INTEGER, 0, 0);
+    val d_mult: i64 = exi_dt(& mut s, EXI_DT_NBIT, - 3, 3);     // unitMultiplierType
+    val d_pct: i64 = exi_dt(& mut s, EXI_DT_NBIT, 0, 100);      // percentValueType
+    val d_rc: i64 = exi_dt_enum(& mut s, "OK|OK_NewSessionEstablished|OK_OldSessionJoined|OK_CertificateExpiresSoon|FAILED|FAILED_SequenceError|FAILED_ServiceIDInvalid|FAILED_UnknownSession|FAILED_ServiceSelectionInvalid|FAILED_PaymentSelectionInvalid|FAILED_CertificateExpired|FAILED_SignatureError|FAILED_NoCertificateAvailable|FAILED_CertChainError|FAILED_ChallengeInvalid|FAILED_ContractCanceled|FAILED_WrongChargeParameter|FAILED_PowerDeliveryNotApplied|FAILED_TariffSelectionInvalid|FAILED_ChargingProfileInvalid|FAILED_EVSEPresentVoltageToLow|FAILED_MeteringSignatureNotValid|FAILED_WrongEnergyTransferType");
+    val d_fault: i64 = exi_dt_enum(& mut s, "ParsingError|NoTLSRootCertificatAvailable|UnknownError");
+    val d_scat: i64 = exi_dt_enum(& mut s, "EVCharging|Internet|ContractCertificate|OtherCustom");
+    val d_pay: i64 = exi_dt_enum(& mut s, "Contract|ExternalPayment");
+    val d_etsup: i64 = exi_dt_enum(& mut s, "AC_single_phase_core|AC_three_phase_core|DC_core|DC_extended|DC_combo_core|DC_dual|AC_core1p_DC_extended|AC_single_DC_core|AC_single_phase_three_phase_core_DC_extended|AC_core3p_DC_extended");
+    val d_etreq: i64 = exi_dt_enum(& mut s, "AC_single_phase_core|AC_three_phase_core|DC_core|DC_extended|DC_combo_core|DC_unique");
+    val d_proc: i64 = exi_dt_enum(& mut s, "Finished|Ongoing");
+    val d_everr: i64 = exi_dt_enum(& mut s, "NO_ERROR|FAILED_RESSTemperatureInhibit|FAILED_EVShiftPosition|FAILED_ChargerConnectorLockFault|FAILED_EVRESSMalfunction|FAILED_ChargingCurrentdifferential|FAILED_ChargingVoltageOutOfRange|Reserved_A|Reserved_B|Reserved_C|FAILED_ChargingSystemIncompatibility|NoData");
+    val d_unit: i64 = exi_dt_enum(& mut s, "h|m|s|A|Ah|V|VA|W|W_s|Wh");
+    val d_iso: i64 = exi_dt_enum(& mut s, "Invalid|Valid|Warning|Fault");
+    val d_evsesc: i64 = exi_dt_enum(& mut s, "EVSE_NotReady|EVSE_Ready|EVSE_Shutdown|EVSE_UtilityInterruptEvent|EVSE_IsolationMonitoringActive|EVSE_EmergencyShutdown|EVSE_Malfunction|Reserved_8|Reserved_9|Reserved_A|Reserved_B|Reserved_C");
+    val d_notif: i64 = exi_dt_enum(& mut s, "None|StopCharging|ReNegotiation");
+    // simple types
+    val hexb: i64 = exi_type_simple(& mut s, d_hex);
+    val txt: i64 = exi_type_simple(& mut s, d_str);
+    val bo: i64 = exi_type_simple(& mut s, d_bool);
+    val ui: i64 = exi_type_simple(& mut s, d_uint);
+    val ti: i64 = exi_type_simple(& mut s, d_int);
+    val mult: i64 = exi_type_simple(& mut s, d_mult);
+    val pct: i64 = exi_type_simple(& mut s, d_pct);
+    val rc: i64 = exi_type_simple(& mut s, d_rc);
+    val fault: i64 = exi_type_simple(& mut s, d_fault);
+    val scat: i64 = exi_type_simple(& mut s, d_scat);
+    val pay: i64 = exi_type_simple(& mut s, d_pay);
+    val etsup: i64 = exi_type_simple(& mut s, d_etsup);
+    val etreq: i64 = exi_type_simple(& mut s, d_etreq);
+    val prc: i64 = exi_type_simple(& mut s, d_proc);
+    val everr: i64 = exi_type_simple(& mut s, d_everr);
+    val unit: i64 = exi_type_simple(& mut s, d_unit);
+    val iso: i64 = exi_type_simple(& mut s, d_iso);
+    val evsesc: i64 = exi_type_simple(& mut s, d_evsesc);
+    val notif: i64 = exi_type_simple(& mut s, d_notif);
+    val emp: i64 = exi_type(& mut s);
+    val opaque: i64 = exi_type_opaque(& mut s);
+
+    // MsgDataTypes
+    val pv: i64 = exi_type(& mut s);                // PhysicalValueType
+    exi_elem(& mut s, pv, dt, "Multiplier", mult, 1, 1);
+    exi_elem(& mut s, pv, dt, "Unit", unit, 0, 1);
+    exi_elem(& mut s, pv, dt, "Value", ti, 1, 1);
+    val evst: i64 = exi_type(& mut s);              // DC_EVStatusType
+    exi_elem(& mut s, evst, dt, "EVReady", bo, 1, 1);
+    exi_elem(& mut s, evst, dt, "EVCabinConditioning", bo, 0, 1);
+    exi_elem(& mut s, evst, dt, "EVRESSConditioning", bo, 0, 1);
+    exi_elem(& mut s, evst, dt, "EVErrorCode", everr, 1, 1);
+    exi_elem(& mut s, evst, dt, "EVRESSSOC", pct, 1, 1);
+    val sest: i64 = exi_type(& mut s);              // DC_EVSEStatusType
+    exi_elem(& mut s, sest, dt, "EVSEIsolationStatus", iso, 0, 1);
+    exi_elem(& mut s, sest, dt, "EVSEStatusCode", evsesc, 1, 1);
+    exi_elem(& mut s, sest, dt, "NotificationMaxDelay", ui, 1, 1);
+    exi_elem(& mut s, sest, dt, "EVSENotification", notif, 1, 1);
+    val acst: i64 = exi_type(& mut s);              // AC_EVSEStatusType
+    exi_elem(& mut s, acst, dt, "PowerSwitchClosed", bo, 1, 1);
+    exi_elem(& mut s, acst, dt, "RCD", bo, 1, 1);
+    exi_elem(& mut s, acst, dt, "NotificationMaxDelay", ui, 1, 1);
+    exi_elem(& mut s, acst, dt, "EVSENotification", notif, 1, 1);
+    val notf: i64 = exi_type(& mut s);              // NotificationType
+    exi_elem(& mut s, notf, dt, "FaultCode", fault, 1, 1);
+    exi_elem(& mut s, notf, dt, "FaultMsg", txt, 0, 1);
+    val po: i64 = exi_type(& mut s);                // PaymentOptionsType
+    exi_elem(& mut s, po, dt, "PaymentOption", pay, 1, 2);
+    val stag: i64 = exi_type(& mut s);              // ServiceTagType
+    exi_elem(& mut s, stag, dt, "ServiceID", ui, 1, 1);
+    exi_elem(& mut s, stag, dt, "ServiceName", txt, 0, 1);
+    exi_elem(& mut s, stag, dt, "ServiceCategory", scat, 1, 1);
+    exi_elem(& mut s, stag, dt, "ServiceScope", txt, 0, 1);
+    val sch: i64 = exi_type(& mut s);               // ServiceChargeType
+    exi_elem(& mut s, sch, dt, "ServiceTag", stag, 1, 1);
+    exi_elem(& mut s, sch, dt, "FreeService", bo, 1, 1);
+    exi_elem(& mut s, sch, dt, "EnergyTransferType", etsup, 1, 1);
+    val svc: i64 = exi_type(& mut s);               // ServiceType
+    exi_elem(& mut s, svc, dt, "ServiceTag", stag, 1, 1);
+    exi_elem(& mut s, svc, dt, "FreeService", bo, 1, 1);
+    val slist: i64 = exi_type(& mut s);             // ServiceTagListType
+    exi_elem(& mut s, slist, dt, "Service", svc, 1, 8);
+    val ssel: i64 = exi_type(& mut s);              // SelectedServiceType
+    exi_elem(& mut s, ssel, dt, "ServiceID", ui, 1, 1);
+    exi_elem(& mut s, ssel, dt, "ParameterSetID", ti, 0, 1);
+    val ssl: i64 = exi_type(& mut s);               // SelectedServiceListType
+    exi_elem(& mut s, ssl, dt, "SelectedService", ssel, 1, 16);
+    val dcp: i64 = exi_type(& mut s);               // DC_EVChargeParameterType
+    exi_elem(& mut s, dcp, dt, "DC_EVStatus", evst, 1, 1);
+    exi_elem(& mut s, dcp, dt, "EVMaximumCurrentLimit", pv, 1, 1);
+    exi_elem(& mut s, dcp, dt, "EVMaximumPowerLimit", pv, 0, 1);
+    exi_elem(& mut s, dcp, dt, "EVMaximumVoltageLimit", pv, 1, 1);
+    exi_elem(& mut s, dcp, dt, "EVEnergyCapacity", pv, 0, 1);
+    exi_elem(& mut s, dcp, dt, "EVEnergyRequest", pv, 0, 1);
+    exi_elem(& mut s, dcp, dt, "FullSOC", pct, 0, 1);
+    exi_elem(& mut s, dcp, dt, "BulkSOC", pct, 0, 1);
+    val acp: i64 = exi_type(& mut s);               // AC_EVChargeParameterType
+    exi_elem(& mut s, acp, dt, "DepartureTime", ui, 1, 1);
+    exi_elem(& mut s, acp, dt, "EAmount", pv, 1, 1);
+    exi_elem(& mut s, acp, dt, "EVMaxVoltage", pv, 1, 1);
+    exi_elem(& mut s, acp, dt, "EVMaxCurrent", pv, 1, 1);
+    exi_elem(& mut s, acp, dt, "EVMinCurrent", pv, 1, 1);
+    val rti: i64 = exi_type(& mut s);               // RelativeTimeIntervalType
+    exi_elem(& mut s, rti, dt, "start", ui, 1, 1);
+    exi_elem(& mut s, rti, dt, "duration", ui, 0, 1);
+    val pme: i64 = exi_type(& mut s);               // PMaxScheduleEntryType
+    din_group(& mut s, pme, 1, 1, dt, "RelativeTimeInterval|TimeInterval", & din_two(rti, emp));
+    exi_elem(& mut s, pme, dt, "PMax", ti, 1, 1);
+    val pms: i64 = exi_type(& mut s);               // PMaxScheduleType
+    exi_elem(& mut s, pms, dt, "PMaxScheduleID", ti, 1, 1);
+    exi_elem(& mut s, pms, dt, "PMaxScheduleEntry", pme, 1, 1024);
+    val tup: i64 = exi_type(& mut s);               // SAScheduleTupleType
+    exi_elem(& mut s, tup, dt, "SAScheduleTupleID", ti, 1, 1);
+    exi_elem(& mut s, tup, dt, "PMaxSchedule", pms, 1, 1);
+    exi_elem(& mut s, tup, dt, "SalesTariff", opaque, 0, 1);
+    val sal: i64 = exi_type(& mut s);               // SAScheduleListType
+    exi_elem(& mut s, sal, dt, "SAScheduleTuple", tup, 1, 5);
+    val dce: i64 = exi_type(& mut s);               // DC_EVSEChargeParameterType
+    exi_elem(& mut s, dce, dt, "DC_EVSEStatus", sest, 1, 1);
+    exi_elem(& mut s, dce, dt, "EVSEMaximumCurrentLimit", pv, 1, 1);
+    exi_elem(& mut s, dce, dt, "EVSEMaximumPowerLimit", pv, 0, 1);
+    exi_elem(& mut s, dce, dt, "EVSEMaximumVoltageLimit", pv, 1, 1);
+    exi_elem(& mut s, dce, dt, "EVSEMinimumCurrentLimit", pv, 1, 1);
+    exi_elem(& mut s, dce, dt, "EVSEMinimumVoltageLimit", pv, 1, 1);
+    exi_elem(& mut s, dce, dt, "EVSECurrentRegulationTolerance", pv, 0, 1);
+    exi_elem(& mut s, dce, dt, "EVSEPeakCurrentRipple", pv, 1, 1);
+    exi_elem(& mut s, dce, dt, "EVSEEnergyToBeDelivered", pv, 0, 1);
+    val ace: i64 = exi_type(& mut s);               // AC_EVSEChargeParameterType
+    exi_elem(& mut s, ace, dt, "AC_EVSEStatus", acst, 1, 1);
+    exi_elem(& mut s, ace, dt, "EVSEMaxVoltage", pv, 1, 1);
+    exi_elem(& mut s, ace, dt, "EVSEMaxCurrent", pv, 1, 1);
+    exi_elem(& mut s, ace, dt, "EVSEMinCurrent", pv, 1, 1);
+    val pe: i64 = exi_type(& mut s);                // ProfileEntryType
+    exi_elem(& mut s, pe, dt, "ChargingProfileEntryStart", ui, 1, 1);
+    exi_elem(& mut s, pe, dt, "ChargingProfileEntryMaxPower", ti, 1, 1);
+    val cp: i64 = exi_type(& mut s);                // ChargingProfileType
+    exi_elem(& mut s, cp, dt, "SAScheduleTupleID", ti, 1, 1);
+    exi_elem(& mut s, cp, dt, "ProfileEntry", pe, 1, 24);
+    val dpd: i64 = exi_type(& mut s);               // DC_EVPowerDeliveryParameterType
+    exi_elem(& mut s, dpd, dt, "DC_EVStatus", evst, 1, 1);
+    exi_elem(& mut s, dpd, dt, "BulkChargingComplete", bo, 0, 1);
+    exi_elem(& mut s, dpd, dt, "ChargingComplete", bo, 1, 1);
+
+    // MsgBody
+    val ssq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, ssq, bd, "EVCCID", hexb, 1, 1);
+    val ssr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, ssr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, ssr, bd, "EVSEID", hexb, 1, 1);
+    exi_elem(& mut s, ssr, bd, "DateTimeNow", ti, 0, 1);
+    val sdq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, sdq, bd, "ServiceScope", txt, 0, 1);
+    exi_elem(& mut s, sdq, bd, "ServiceCategory", scat, 0, 1);
+    val sdr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, sdr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, sdr, bd, "PaymentOptions", po, 1, 1);
+    exi_elem(& mut s, sdr, bd, "ChargeService", sch, 1, 1);
+    exi_elem(& mut s, sdr, bd, "ServiceList", slist, 0, 1);
+    val spq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, spq, bd, "SelectedPaymentOption", pay, 1, 1);
+    exi_elem(& mut s, spq, bd, "SelectedServiceList", ssl, 1, 1);
+    val spr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, spr, bd, "ResponseCode", rc, 1, 1);
+    val caq: i64 = exi_type(& mut s);
+    exi_attr(& mut s, caq, "", "Id", d_str, false);
+    exi_elem(& mut s, caq, bd, "GenChallenge", txt, 0, 1);
+    val car: i64 = exi_type(& mut s);
+    exi_elem(& mut s, car, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, car, bd, "EVSEProcessing", prc, 1, 1);
+    val cpq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, cpq, bd, "EVRequestedEnergyTransferType", etreq, 1, 1);
+    din_group(& mut s, cpq, 1, 1, dt, "AC_EVChargeParameter|DC_EVChargeParameter|EVChargeParameter", & din_three(acp, dcp, emp));
+    val cpr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, cpr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, cpr, bd, "EVSEProcessing", prc, 1, 1);
+    din_group(& mut s, cpr, 1, 1, dt, "SAScheduleList|SASchedules", & din_two(sal, emp));
+    din_group(& mut s, cpr, 1, 1, dt, "AC_EVSEChargeParameter|DC_EVSEChargeParameter|EVSEChargeParameter", & din_three(ace, dce, emp));
+    val pdq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, pdq, bd, "ReadyToChargeState", bo, 1, 1);
+    exi_elem(& mut s, pdq, bd, "ChargingProfile", cp, 0, 1);
+    din_group(& mut s, pdq, 0, 1, dt, "DC_EVPowerDeliveryParameter|EVPowerDeliveryParameter", & din_two(dpd, emp));
+    val pdr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, pdr, bd, "ResponseCode", rc, 1, 1);
+    din_group(& mut s, pdr, 1, 1, dt, "AC_EVSEStatus|DC_EVSEStatus|EVSEStatus", & din_three(acst, sest, emp));
+    val ccq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, ccq, bd, "DC_EVStatus", evst, 1, 1);
+    val ccr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, ccr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, ccr, bd, "DC_EVSEStatus", sest, 1, 1);
+    exi_elem(& mut s, ccr, bd, "EVSEProcessing", prc, 1, 1);
+    val pcq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, pcq, bd, "DC_EVStatus", evst, 1, 1);
+    exi_elem(& mut s, pcq, bd, "EVTargetVoltage", pv, 1, 1);
+    exi_elem(& mut s, pcq, bd, "EVTargetCurrent", pv, 1, 1);
+    val pcr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, pcr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, pcr, bd, "DC_EVSEStatus", sest, 1, 1);
+    exi_elem(& mut s, pcr, bd, "EVSEPresentVoltage", pv, 1, 1);
+    val cdq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, cdq, bd, "DC_EVStatus", evst, 1, 1);
+    exi_elem(& mut s, cdq, bd, "EVTargetCurrent", pv, 1, 1);
+    exi_elem(& mut s, cdq, bd, "EVMaximumVoltageLimit", pv, 0, 1);
+    exi_elem(& mut s, cdq, bd, "EVMaximumCurrentLimit", pv, 0, 1);
+    exi_elem(& mut s, cdq, bd, "EVMaximumPowerLimit", pv, 0, 1);
+    exi_elem(& mut s, cdq, bd, "BulkChargingComplete", bo, 0, 1);
+    exi_elem(& mut s, cdq, bd, "ChargingComplete", bo, 1, 1);
+    exi_elem(& mut s, cdq, bd, "RemainingTimeToFullSoC", pv, 0, 1);
+    exi_elem(& mut s, cdq, bd, "RemainingTimeToBulkSoC", pv, 0, 1);
+    exi_elem(& mut s, cdq, bd, "EVTargetVoltage", pv, 1, 1);
+    val cdr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, cdr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, cdr, bd, "DC_EVSEStatus", sest, 1, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEPresentVoltage", pv, 1, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEPresentCurrent", pv, 1, 1);
+    exi_elem(& mut s, cdr, bd, "EVSECurrentLimitAchieved", bo, 1, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEVoltageLimitAchieved", bo, 1, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEPowerLimitAchieved", bo, 1, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEMaximumVoltageLimit", pv, 0, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEMaximumCurrentLimit", pv, 0, 1);
+    exi_elem(& mut s, cdr, bd, "EVSEMaximumPowerLimit", pv, 0, 1);
+    val wdq: i64 = exi_type(& mut s);
+    exi_elem(& mut s, wdq, bd, "DC_EVStatus", evst, 1, 1);
+    val wdr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, wdr, bd, "ResponseCode", rc, 1, 1);
+    exi_elem(& mut s, wdr, bd, "DC_EVSEStatus", sest, 1, 1);
+    exi_elem(& mut s, wdr, bd, "EVSEPresentVoltage", pv, 1, 1);
+    val stq: i64 = exi_type(& mut s);
+    val stres: i64 = exi_type(& mut s);
+    exi_elem(& mut s, stres, bd, "ResponseCode", rc, 1, 1);
+
+    // Body: the BodyElement substitution group (head included), 35 members
+    val body: i64 = exi_type(& mut s);
+    val bp: i64 = exi_particle(& mut s, body, 0, 1);
+    exi_alt_sorted(& mut s, bp, bd, "BodyElement", emp);
+    var mt: Vec<i64> = Vec::new();
+    mt.push(ccq); mt.push(ccr); mt.push(opaque); mt.push(opaque); mt.push(opaque); mt.push(opaque);
+    mt.push(cpq); mt.push(cpr); mt.push(opaque); mt.push(opaque); mt.push(caq); mt.push(car);
+    mt.push(cdq); mt.push(cdr); mt.push(opaque); mt.push(opaque); mt.push(opaque); mt.push(opaque);
+    mt.push(pdq); mt.push(pdr); mt.push(pcq); mt.push(pcr); mt.push(opaque); mt.push(opaque);
+    mt.push(sdq); mt.push(sdr); mt.push(spq); mt.push(spr); mt.push(ssq); mt.push(ssr);
+    mt.push(stq); mt.push(stres); mt.push(wdq); mt.push(wdr);
+    val names: Vec<str> = str_split("CableCheck|CertificateInstallation|CertificateUpdate|ChargeParameterDiscovery|ChargingStatus|ContractAuthentication|CurrentDemand|MeteringReceipt|PaymentDetails|PowerDelivery|PreCharge|ServiceDetail|ServiceDiscovery|ServicePaymentSelection|SessionSetup|SessionStop|WeldingDetection", "|");
+    var i: i64 = 0;
+    while i < names.len() {
+        exi_alt_sorted(& mut s, bp, bd, names.get(i) + "Req", mt.get(2 * i));
+        exi_alt_sorted(& mut s, bp, bd, names.get(i) + "Res", mt.get(2 * i + 1));
+        i = i + 1;
+    }
+    // MsgHeader and MsgDef
+    val hdr: i64 = exi_type(& mut s);
+    exi_elem(& mut s, hdr, DIN_MSG_HEADER, "SessionID", hexb, 1, 1);
+    exi_elem(& mut s, hdr, DIN_MSG_HEADER, "Notification", notf, 0, 1);
+    exi_elem(& mut s, hdr, DIN_XMLDSIG, "Signature", opaque, 0, 1);
+    val msg: i64 = exi_type(& mut s);
+    exi_elem(& mut s, msg, DIN_MSG_DEF, "Header", hdr, 1, 1);
+    exi_elem(& mut s, msg, DIN_MSG_DEF, "Body", body, 1, 1);
+    // V2G_Message is the 78th of the schema's 81 global elements (the
+    // others: the 35 MsgBody messages, the MsgDataTypes substitution
+    // groups and the xmldsig elements, which have no grammar here)
+    exi_global_at(& mut s, 77, 81, DIN_MSG_DEF, "V2G_Message", msg);
+    exi_schema_finish(& mut s);
+    return s;
+}
+
+// ─── DIN message values ──────────────────────────────────────────────────
+
+/// A PhysicalValueType: value * 10^multiplier in `unit` ("" for none:
+/// Unit is optional in DIN). present false: an absent optional field.
+pub struct DinPV {
+    pub present: bool,
+    pub multiplier: i64,
+    pub unit: str,
+    pub value: i64,
+}
+
+pub fn din_pv(multiplier: i64, unit: str, value: i64) -> DinPV {
+    return DinPV { present: true, multiplier: multiplier, unit: unit, value: value };
+}
+
+pub fn din_pv_none() -> DinPV {
+    return DinPV { present: false, multiplier: 0, unit: "", value: 0 };
+}
+
+/// The value in thousandths of its unit (millivolts for a voltage).
+pub fn din_pv_milli(p: & DinPV) -> i64 {
+    var v: i64 = p.value;
+    var e: i64 = p.multiplier + 3;
+    while e > 0 {
+        v = v * 10;
+        e = e - 1;
+    }
+    return v;
+}
+
+/// DC_EVStatus. cabin / ress: -1 absent, else 0/1.
+pub struct DinEVStatus {
+    pub ready: bool,
+    pub cabin: i64,
+    pub ress: i64,
+    pub error_code: str,
+    pub soc: i64,
+}
+
+pub fn din_ev_status(ready: bool, error_code: str, soc: i64) -> DinEVStatus {
+    return DinEVStatus { ready: ready, cabin: - 1, ress: - 1, error_code: error_code, soc: soc };
+}
+
+/// DC_EVSEStatus. isolation "" when absent.
+pub struct DinEVSEStatus {
+    pub isolation: str,
+    pub status_code: str,
+    pub max_delay: i64,
+    pub notification: str,
+}
+
+pub fn din_evse_status(isolation: str, status_code: str) -> DinEVSEStatus {
+    return DinEVSEStatus { isolation: isolation, status_code: status_code, max_delay: 0, notification: "None" };
+}
+
+fn din_leaf(evs: & mut Vec<ExiEvent>, uri: str, name: str, v: ExiEvent) {
+    exi_push_leaf(evs, uri, name, v);
+}
+
+pub fn din_push_pv(evs: & mut Vec<ExiEvent>, uri: str, name: str, p: & DinPV) {
+    if !p.present {
+        return;
+    }
+    evs.push(exi_se(uri, name));
+    din_leaf(evs, DIN_MSG_TYPES, "Multiplier", exi_ch_int(p.multiplier));
+    if p.unit != "" {
+        din_leaf(evs, DIN_MSG_TYPES, "Unit", exi_ch_str(p.unit));
+    }
+    din_leaf(evs, DIN_MSG_TYPES, "Value", exi_ch_int(p.value));
+    evs.push(exi_ee());
+}
+
+pub fn din_push_ev_status(evs: & mut Vec<ExiEvent>, uri: str, st: & DinEVStatus) {
+    val t: str = DIN_MSG_TYPES;
+    evs.push(exi_se(uri, "DC_EVStatus"));
+    din_leaf(evs, t, "EVReady", exi_ch_bool(st.ready));
+    if st.cabin >= 0 {
+        din_leaf(evs, t, "EVCabinConditioning", exi_ch_bool(st.cabin == 1));
+    }
+    if st.ress >= 0 {
+        din_leaf(evs, t, "EVRESSConditioning", exi_ch_bool(st.ress == 1));
+    }
+    din_leaf(evs, t, "EVErrorCode", exi_ch_str(st.error_code));
+    din_leaf(evs, t, "EVRESSSOC", exi_ch_int(st.soc));
+    evs.push(exi_ee());
+}
+
+pub fn din_push_evse_status(evs: & mut Vec<ExiEvent>, uri: str, st: & DinEVSEStatus) {
+    val t: str = DIN_MSG_TYPES;
+    evs.push(exi_se(uri, "DC_EVSEStatus"));
+    if st.isolation != "" {
+        din_leaf(evs, t, "EVSEIsolationStatus", exi_ch_str(st.isolation));
+    }
+    din_leaf(evs, t, "EVSEStatusCode", exi_ch_str(st.status_code));
+    din_leaf(evs, t, "NotificationMaxDelay", exi_ch_int(st.max_delay));
+    din_leaf(evs, t, "EVSENotification", exi_ch_str(st.notification));
+    evs.push(exi_ee());
+}
+
+fn din_body(name: str) -> Vec<ExiEvent> {
+    var evs: Vec<ExiEvent> = Vec::new();
+    evs.push(exi_se(DIN_MSG_BODY, name));
+    return evs;
+}
+
+fn din_code(evs: & mut Vec<ExiEvent>, code: str) {
+    din_leaf(evs, DIN_MSG_BODY, "ResponseCode", exi_ch_str(code));
+}
+
+// ─── DIN message builders (the events of the Body's message) ─────────────
+
+pub fn din_session_setup_req(evccid: Vec<i64>) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("SessionSetupReq");
+    din_leaf(& mut e, DIN_MSG_BODY, "EVCCID", exi_ch_bin(evccid));
+    e.push(exi_ee());
+    return e;
+}
+
+/// date_time_now: Unix seconds, -1 to leave DateTimeNow out.
+pub fn din_session_setup_res(code: str, evseid: Vec<i64>, date_time_now: i64) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("SessionSetupRes");
+    din_code(& mut e, code);
+    din_leaf(& mut e, DIN_MSG_BODY, "EVSEID", exi_ch_bin(evseid));
+    if date_time_now >= 0 {
+        din_leaf(& mut e, DIN_MSG_BODY, "DateTimeNow", exi_ch_int(date_time_now));
+    }
+    e.push(exi_ee());
+    return e;
+}
+
+/// scope / category "" to leave them out.
+pub fn din_service_discovery_req(scope: str, category: str) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("ServiceDiscoveryReq");
+    if scope != "" {
+        din_leaf(& mut e, DIN_MSG_BODY, "ServiceScope", exi_ch_str(scope));
+    }
+    if category != "" {
+        din_leaf(& mut e, DIN_MSG_BODY, "ServiceCategory", exi_ch_str(category));
+    }
+    e.push(exi_ee());
+    return e;
+}
+
+/// One charge service: `payment` options separated by "|" ("Contract",
+/// "ExternalPayment"); service_name "" for none.
+pub fn din_service_discovery_res(code: str, payment: str, service_id: i64, service_name: str, category: str, free: bool, energy_transfer: str) -> Vec<ExiEvent> {
+    val t: str = DIN_MSG_TYPES;
+    var e: Vec<ExiEvent> = din_body("ServiceDiscoveryRes");
+    din_code(& mut e, code);
+    e.push(exi_se(DIN_MSG_BODY, "PaymentOptions"));
+    val opts: Vec<str> = str_split(payment, "|");
+    var i: i64 = 0;
+    while i < opts.len() {
+        din_leaf(& mut e, t, "PaymentOption", exi_ch_str(opts.get(i)));
+        i = i + 1;
+    }
+    e.push(exi_ee());
+    e.push(exi_se(DIN_MSG_BODY, "ChargeService"));
+    e.push(exi_se(t, "ServiceTag"));
+    din_leaf(& mut e, t, "ServiceID", exi_ch_int(service_id));
+    if service_name != "" {
+        din_leaf(& mut e, t, "ServiceName", exi_ch_str(service_name));
+    }
+    din_leaf(& mut e, t, "ServiceCategory", exi_ch_str(category));
+    e.push(exi_ee());
+    din_leaf(& mut e, t, "FreeService", exi_ch_bool(free));
+    din_leaf(& mut e, t, "EnergyTransferType", exi_ch_str(energy_transfer));
+    e.push(exi_ee());
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_service_payment_selection_req(option: str, service_ids: & Vec<i64>) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("ServicePaymentSelectionReq");
+    din_leaf(& mut e, DIN_MSG_BODY, "SelectedPaymentOption", exi_ch_str(option));
+    e.push(exi_se(DIN_MSG_BODY, "SelectedServiceList"));
+    var i: i64 = 0;
+    while i < service_ids.len() {
+        e.push(exi_se(DIN_MSG_TYPES, "SelectedService"));
+        din_leaf(& mut e, DIN_MSG_TYPES, "ServiceID", exi_ch_int(service_ids.get(i)));
+        e.push(exi_ee());
+        i = i + 1;
+    }
+    e.push(exi_ee());
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_service_payment_selection_res(code: str) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("ServicePaymentSelectionRes");
+    din_code(& mut e, code);
+    e.push(exi_ee());
+    return e;
+}
+
+/// id / gen_challenge "" to leave them out.
+pub fn din_contract_authentication_req(id: str, gen_challenge: str) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("ContractAuthenticationReq");
+    if id != "" {
+        e.push(exi_at_str("", "Id", id));
+    }
+    if gen_challenge != "" {
+        din_leaf(& mut e, DIN_MSG_BODY, "GenChallenge", exi_ch_str(gen_challenge));
+    }
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_contract_authentication_res(code: str, processing: str) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("ContractAuthenticationRes");
+    din_code(& mut e, code);
+    din_leaf(& mut e, DIN_MSG_BODY, "EVSEProcessing", exi_ch_str(processing));
+    e.push(exi_ee());
+    return e;
+}
+
+/// The EV's DC charge parameters; full_soc / bulk_soc -1 when absent.
+pub struct DinDCEVParams {
+    pub status: DinEVStatus,
+    pub max_current: DinPV,
+    pub max_power: DinPV,
+    pub max_voltage: DinPV,
+    pub energy_capacity: DinPV,
+    pub energy_request: DinPV,
+    pub full_soc: i64,
+    pub bulk_soc: i64,
+}
+
+pub fn din_dc_ev_params(status: DinEVStatus, max_current: DinPV, max_voltage: DinPV) -> DinDCEVParams {
+    return DinDCEVParams {
+        status: status, max_current: max_current, max_power: din_pv_none(), max_voltage: max_voltage,
+        energy_capacity: din_pv_none(), energy_request: din_pv_none(), full_soc: - 1, bulk_soc: - 1,
+    };
+}
+
+pub fn din_charge_parameter_discovery_req(transfer: str, p: & DinDCEVParams) -> Vec<ExiEvent> {
+    val t: str = DIN_MSG_TYPES;
+    var e: Vec<ExiEvent> = din_body("ChargeParameterDiscoveryReq");
+    din_leaf(& mut e, DIN_MSG_BODY, "EVRequestedEnergyTransferType", exi_ch_str(transfer));
+    e.push(exi_se(t, "DC_EVChargeParameter"));
+    din_push_ev_status(& mut e, t, & p.status);
+    din_push_pv(& mut e, t, "EVMaximumCurrentLimit", & p.max_current);
+    din_push_pv(& mut e, t, "EVMaximumPowerLimit", & p.max_power);
+    din_push_pv(& mut e, t, "EVMaximumVoltageLimit", & p.max_voltage);
+    din_push_pv(& mut e, t, "EVEnergyCapacity", & p.energy_capacity);
+    din_push_pv(& mut e, t, "EVEnergyRequest", & p.energy_request);
+    if p.full_soc >= 0 {
+        din_leaf(& mut e, t, "FullSOC", exi_ch_int(p.full_soc));
+    }
+    if p.bulk_soc >= 0 {
+        din_leaf(& mut e, t, "BulkSOC", exi_ch_int(p.bulk_soc));
+    }
+    e.push(exi_ee());
+    e.push(exi_ee());
+    return e;
+}
+
+/// The EVSE's DC charge parameters.
+pub struct DinDCEVSEParams {
+    pub status: DinEVSEStatus,
+    pub max_current: DinPV,
+    pub max_power: DinPV,
+    pub max_voltage: DinPV,
+    pub min_current: DinPV,
+    pub min_voltage: DinPV,
+    pub regulation_tolerance: DinPV,
+    pub peak_current_ripple: DinPV,
+    pub energy_to_deliver: DinPV,
+}
+
+/// One SAScheduleTuple with one PMax schedule: entry i starts at
+/// starts[i] seconds, lasts durations[i] (-1: absent) with power pmax[i].
+/// An empty `starts` sends the empty SASchedules element instead.
+pub struct DinSchedule {
+    pub tuple_id: i64,
+    pub pmax_schedule_id: i64,
+    pub starts: Vec<i64>,
+    pub durations: Vec<i64>,
+    pub pmax: Vec<i64>,
+}
+
+pub fn din_charge_parameter_discovery_res(code: str, processing: str, sched: & DinSchedule, p: & DinDCEVSEParams) -> Vec<ExiEvent> {
+    val t: str = DIN_MSG_TYPES;
+    var e: Vec<ExiEvent> = din_body("ChargeParameterDiscoveryRes");
+    din_code(& mut e, code);
+    din_leaf(& mut e, DIN_MSG_BODY, "EVSEProcessing", exi_ch_str(processing));
+    if sched.starts.len() == 0 {
+        e.push(exi_se(t, "SASchedules"));
+        e.push(exi_ee());
+    } else {
+        e.push(exi_se(t, "SAScheduleList"));
+        e.push(exi_se(t, "SAScheduleTuple"));
+        din_leaf(& mut e, t, "SAScheduleTupleID", exi_ch_int(sched.tuple_id));
+        e.push(exi_se(t, "PMaxSchedule"));
+        din_leaf(& mut e, t, "PMaxScheduleID", exi_ch_int(sched.pmax_schedule_id));
+        var i: i64 = 0;
+        while i < sched.starts.len() {
+            e.push(exi_se(t, "PMaxScheduleEntry"));
+            e.push(exi_se(t, "RelativeTimeInterval"));
+            din_leaf(& mut e, t, "start", exi_ch_int(sched.starts.get(i)));
+            if sched.durations.get(i) >= 0 {
+                din_leaf(& mut e, t, "duration", exi_ch_int(sched.durations.get(i)));
+            }
+            e.push(exi_ee());
+            din_leaf(& mut e, t, "PMax", exi_ch_int(sched.pmax.get(i)));
+            e.push(exi_ee());
+            i = i + 1;
+        }
+        e.push(exi_ee());
+        e.push(exi_ee());
+        e.push(exi_ee());
+    }
+    e.push(exi_se(t, "DC_EVSEChargeParameter"));
+    din_push_evse_status(& mut e, t, & p.status);
+    din_push_pv(& mut e, t, "EVSEMaximumCurrentLimit", & p.max_current);
+    din_push_pv(& mut e, t, "EVSEMaximumPowerLimit", & p.max_power);
+    din_push_pv(& mut e, t, "EVSEMaximumVoltageLimit", & p.max_voltage);
+    din_push_pv(& mut e, t, "EVSEMinimumCurrentLimit", & p.min_current);
+    din_push_pv(& mut e, t, "EVSEMinimumVoltageLimit", & p.min_voltage);
+    din_push_pv(& mut e, t, "EVSECurrentRegulationTolerance", & p.regulation_tolerance);
+    din_push_pv(& mut e, t, "EVSEPeakCurrentRipple", & p.peak_current_ripple);
+    din_push_pv(& mut e, t, "EVSEEnergyToBeDelivered", & p.energy_to_deliver);
+    e.push(exi_ee());
+    e.push(exi_ee());
+    return e;
+}
+
+/// PowerDeliveryReq. A ChargingProfile is sent when profile_starts is not
+/// empty; the DC_EVPowerDeliveryParameter when with_dc is true
+/// (bulk_complete -1: absent).
+pub fn din_power_delivery_req(ready: bool, tuple_id: i64, profile_starts: & Vec<i64>, profile_max: & Vec<i64>, with_dc: bool, ev: & DinEVStatus, bulk_complete: i64, charging_complete: bool) -> Vec<ExiEvent> {
+    val t: str = DIN_MSG_TYPES;
+    var e: Vec<ExiEvent> = din_body("PowerDeliveryReq");
+    din_leaf(& mut e, DIN_MSG_BODY, "ReadyToChargeState", exi_ch_bool(ready));
+    if profile_starts.len() > 0 {
+        e.push(exi_se(DIN_MSG_BODY, "ChargingProfile"));
+        din_leaf(& mut e, t, "SAScheduleTupleID", exi_ch_int(tuple_id));
+        var i: i64 = 0;
+        while i < profile_starts.len() {
+            e.push(exi_se(t, "ProfileEntry"));
+            din_leaf(& mut e, t, "ChargingProfileEntryStart", exi_ch_int(profile_starts.get(i)));
+            din_leaf(& mut e, t, "ChargingProfileEntryMaxPower", exi_ch_int(profile_max.get(i)));
+            e.push(exi_ee());
+            i = i + 1;
+        }
+        e.push(exi_ee());
+    }
+    if with_dc {
+        e.push(exi_se(t, "DC_EVPowerDeliveryParameter"));
+        din_push_ev_status(& mut e, t, ev);
+        if bulk_complete >= 0 {
+            din_leaf(& mut e, t, "BulkChargingComplete", exi_ch_bool(bulk_complete == 1));
+        }
+        din_leaf(& mut e, t, "ChargingComplete", exi_ch_bool(charging_complete));
+        e.push(exi_ee());
+    }
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_power_delivery_res(code: str, st: & DinEVSEStatus) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("PowerDeliveryRes");
+    din_code(& mut e, code);
+    din_push_evse_status(& mut e, DIN_MSG_TYPES, st);
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_cable_check_req(ev: & DinEVStatus) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("CableCheckReq");
+    din_push_ev_status(& mut e, DIN_MSG_BODY, ev);
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_cable_check_res(code: str, st: & DinEVSEStatus, processing: str) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("CableCheckRes");
+    din_code(& mut e, code);
+    din_push_evse_status(& mut e, DIN_MSG_BODY, st);
+    din_leaf(& mut e, DIN_MSG_BODY, "EVSEProcessing", exi_ch_str(processing));
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_pre_charge_req(ev: & DinEVStatus, target_voltage: & DinPV, target_current: & DinPV) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("PreChargeReq");
+    din_push_ev_status(& mut e, DIN_MSG_BODY, ev);
+    din_push_pv(& mut e, DIN_MSG_BODY, "EVTargetVoltage", target_voltage);
+    din_push_pv(& mut e, DIN_MSG_BODY, "EVTargetCurrent", target_current);
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_pre_charge_res(code: str, st: & DinEVSEStatus, present_voltage: & DinPV) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("PreChargeRes");
+    din_code(& mut e, code);
+    din_push_evse_status(& mut e, DIN_MSG_BODY, st);
+    din_push_pv(& mut e, DIN_MSG_BODY, "EVSEPresentVoltage", present_voltage);
+    e.push(exi_ee());
+    return e;
+}
+
+/// CurrentDemandReq; bulk_complete -1: absent.
+pub struct DinCurrentDemand {
+    pub status: DinEVStatus,
+    pub target_current: DinPV,
+    pub max_voltage: DinPV,
+    pub max_current: DinPV,
+    pub max_power: DinPV,
+    pub bulk_complete: i64,
+    pub charging_complete: bool,
+    pub remaining_full: DinPV,
+    pub remaining_bulk: DinPV,
+    pub target_voltage: DinPV,
+}
+
+pub fn din_current_demand(status: DinEVStatus, target_current: DinPV, target_voltage: DinPV) -> DinCurrentDemand {
+    return DinCurrentDemand {
+        status: status, target_current: target_current, max_voltage: din_pv_none(), max_current: din_pv_none(), max_power: din_pv_none(),
+        bulk_complete: - 1, charging_complete: false, remaining_full: din_pv_none(), remaining_bulk: din_pv_none(), target_voltage: target_voltage,
+    };
+}
+
+pub fn din_current_demand_req(q: & DinCurrentDemand) -> Vec<ExiEvent> {
+    val b: str = DIN_MSG_BODY;
+    var e: Vec<ExiEvent> = din_body("CurrentDemandReq");
+    din_push_ev_status(& mut e, b, & q.status);
+    din_push_pv(& mut e, b, "EVTargetCurrent", & q.target_current);
+    din_push_pv(& mut e, b, "EVMaximumVoltageLimit", & q.max_voltage);
+    din_push_pv(& mut e, b, "EVMaximumCurrentLimit", & q.max_current);
+    din_push_pv(& mut e, b, "EVMaximumPowerLimit", & q.max_power);
+    if q.bulk_complete >= 0 {
+        din_leaf(& mut e, b, "BulkChargingComplete", exi_ch_bool(q.bulk_complete == 1));
+    }
+    din_leaf(& mut e, b, "ChargingComplete", exi_ch_bool(q.charging_complete));
+    din_push_pv(& mut e, b, "RemainingTimeToFullSoC", & q.remaining_full);
+    din_push_pv(& mut e, b, "RemainingTimeToBulkSoC", & q.remaining_bulk);
+    din_push_pv(& mut e, b, "EVTargetVoltage", & q.target_voltage);
+    e.push(exi_ee());
+    return e;
+}
+
+/// CurrentDemandRes; `limits` are "current|voltage|power" achieved flags
+/// as three booleans, the EVSE maxima optional.
+pub fn din_current_demand_res(code: str, st: & DinEVSEStatus, voltage: & DinPV, current: & DinPV, current_limit: bool, voltage_limit: bool, power_limit: bool, max_voltage: & DinPV, max_current: & DinPV, max_power: & DinPV) -> Vec<ExiEvent> {
+    val b: str = DIN_MSG_BODY;
+    var e: Vec<ExiEvent> = din_body("CurrentDemandRes");
+    din_code(& mut e, code);
+    din_push_evse_status(& mut e, b, st);
+    din_push_pv(& mut e, b, "EVSEPresentVoltage", voltage);
+    din_push_pv(& mut e, b, "EVSEPresentCurrent", current);
+    din_leaf(& mut e, b, "EVSECurrentLimitAchieved", exi_ch_bool(current_limit));
+    din_leaf(& mut e, b, "EVSEVoltageLimitAchieved", exi_ch_bool(voltage_limit));
+    din_leaf(& mut e, b, "EVSEPowerLimitAchieved", exi_ch_bool(power_limit));
+    din_push_pv(& mut e, b, "EVSEMaximumVoltageLimit", max_voltage);
+    din_push_pv(& mut e, b, "EVSEMaximumCurrentLimit", max_current);
+    din_push_pv(& mut e, b, "EVSEMaximumPowerLimit", max_power);
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_welding_detection_req(ev: & DinEVStatus) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("WeldingDetectionReq");
+    din_push_ev_status(& mut e, DIN_MSG_BODY, ev);
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_welding_detection_res(code: str, st: & DinEVSEStatus, present_voltage: & DinPV) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("WeldingDetectionRes");
+    din_code(& mut e, code);
+    din_push_evse_status(& mut e, DIN_MSG_BODY, st);
+    din_push_pv(& mut e, DIN_MSG_BODY, "EVSEPresentVoltage", present_voltage);
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_session_stop_req() -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("SessionStopReq");
+    e.push(exi_ee());
+    return e;
+}
+
+pub fn din_session_stop_res(code: str) -> Vec<ExiEvent> {
+    var e: Vec<ExiEvent> = din_body("SessionStopRes");
+    din_code(& mut e, code);
+    e.push(exi_ee());
+    return e;
+}
+
+// ─── DIN messages: encode, decode, read ──────────────────────────────────
+
+/// EXI of a V2G_Message with this SessionID and body.
+pub fn din_encode(s: & ExiSchema, session_id: & Vec<i64>, body: & Vec<ExiEvent>) -> ExiResult {
+    var evs: Vec<ExiEvent> = Vec::new();
+    evs.push(exi_se(DIN_MSG_DEF, "V2G_Message"));
+    evs.push(exi_se(DIN_MSG_DEF, "Header"));
+    var sid: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < session_id.len() {
+        sid.push(session_id.get(i));
+        i = i + 1;
+    }
+    exi_push_leaf(& mut evs, DIN_MSG_HEADER, "SessionID", exi_ch_bin(sid));
+    evs.push(exi_ee());
+    evs.push(exi_se(DIN_MSG_DEF, "Body"));
+    i = 0;
+    while i < body.len() {
+        evs.push(body.get(i));
+        i = i + 1;
+    }
+    evs.push(exi_ee());
+    evs.push(exi_ee());
+    return exi_encode(s, & exi_options(), & evs);
+}
+
+/// A decoded DIN message: the body element's name, the SessionID, the
+/// ResponseCode (name and index; "" and -1 for a request) and all events.
+pub struct DinMessage {
+    pub ok: bool,
+    pub error: str,
+    pub name: str,
+    pub session_id: Vec<i64>,
+    pub response_code: str,
+    pub code_index: i64,
+    pub events: Vec<ExiEvent>,
+}
+
+pub fn din_decode(s: & ExiSchema, b: Vec<i64>) -> DinMessage {
+    val d: ExiDoc = exi_decode(s, & exi_options(), b);
+    var m: DinMessage = DinMessage { ok: d.ok, error: d.error, name: "", session_id: Vec::new(), response_code: "", code_index: - 1, events: d.events };
+    if !d.ok {
+        return m;
+    }
+    m.session_id = exi_get(& m.events, "V2G_Message/Header/SessionID").bval;
+    val bi: i64 = exi_find(& m.events, "V2G_Message/Body");
+    if bi >= 0 && bi + 1 < m.events.len() && m.events.get(bi + 1).kind == EXI_SE {
+        m.name = m.events.get(bi + 1).name;
+    }
+    val rc: str = "V2G_Message/Body/" + m.name + "/ResponseCode";
+    if exi_has(& m.events, rc) {
+        val v: ExiEvent = exi_get(& m.events, rc);
+        m.response_code = v.sval;
+        m.code_index = v.ival;
+    }
+    return m;
+}
+
+/// The value of a field of the message, by its path below the body
+/// element ("DC_EVSEStatus/EVSEStatusCode").
+pub fn din_field(m: & DinMessage, rel: str) -> ExiEvent {
+    return exi_get(& m.events, "V2G_Message/Body/" + m.name + "/" + rel);
+}
+
+pub fn din_has(m: & DinMessage, rel: str) -> bool {
+    return exi_has(& m.events, "V2G_Message/Body/" + m.name + "/" + rel);
+}
+
+pub fn din_pv_at(m: & DinMessage, rel: str) -> DinPV {
+    if !din_has(m, rel) {
+        return din_pv_none();
+    }
+    var unit: str = "";
+    if din_has(m, rel + "/Unit") {
+        unit = din_field(m, rel + "/Unit").sval;
+    }
+    return din_pv(din_field(m, rel + "/Multiplier").ival, unit, din_field(m, rel + "/Value").ival);
+}
+
+pub fn din_ev_status_at(m: & DinMessage, rel: str) -> DinEVStatus {
+    var st: DinEVStatus = din_ev_status(din_field(m, rel + "/EVReady").ival != 0, din_field(m, rel + "/EVErrorCode").sval, din_field(m, rel + "/EVRESSSOC").ival);
+    if din_has(m, rel + "/EVCabinConditioning") {
+        st.cabin = din_field(m, rel + "/EVCabinConditioning").ival;
+    }
+    if din_has(m, rel + "/EVRESSConditioning") {
+        st.ress = din_field(m, rel + "/EVRESSConditioning").ival;
+    }
+    return st;
+}
+
+pub fn din_evse_status_at(m: & DinMessage, rel: str) -> DinEVSEStatus {
+    var iso: str = "";
+    if din_has(m, rel + "/EVSEIsolationStatus") {
+        iso = din_field(m, rel + "/EVSEIsolationStatus").sval;
+    }
+    var st: DinEVSEStatus = din_evse_status(iso, din_field(m, rel + "/EVSEStatusCode").sval);
+    st.max_delay = din_field(m, rel + "/NotificationMaxDelay").ival;
+    st.notification = din_field(m, rel + "/EVSENotification").sval;
+    return st;
+}
+
+// ─── Message-sequence state machine ──────────────────────────────────────
+
+// states of the DIN profile (with V2G_APP_PROTOCOL .. V2G_DONE above)
+pub const V2G_CONTRACT_AUTH: i64 = 10;
+pub const V2G_CABLE_CHECK: i64 = 11;
+pub const V2G_PRE_CHARGE: i64 = 12;
+pub const V2G_WELDING: i64 = 13;
+
+/// A V2G session's sequencing state with the expected next message and a
+/// per-state deadline (the caller supplies the clock in ticks).
+pub struct V2gSession {
+    pub state: i64,
+    pub din: bool,              // DIN 70121 profile (else ISO 15118-2)
+    pub order: Vec<i64>,        // the states in sequence
+    pub pos: i64,
+    pub session: Vec<i64>,      // SessionID (DIN profile)
+    pub schema_id: i64,
+    pub failed: bool,
+    pub error: str,
+    pub current_demand_rounds: i64,
+    pub repeats: i64,           // repetitions of the current state
+    pub deadline: i64,          // tick by which the expected response must arrive
+    pub timeout: i64,           // per-message timeout (ticks)
+    pub precharge_target_mv: i64,
+    pub precharge_tolerance_mv: i64,
+    pub welding_limit_mv: i64,
+}
+
+fn v2g_new(timeout: i64, din: bool) -> V2gSession {
+    var s: V2gSession = V2gSession {
+        state: V2G_APP_PROTOCOL, din: din, order: Vec::new(), pos: 0, session: Vec::new(), schema_id: - 1, failed: false, error: "",
+        current_demand_rounds: 0, repeats: 0, deadline: 0, timeout: timeout,
+        precharge_target_mv: 0, precharge_tolerance_mv: 20000, welding_limit_mv: 20000,
+    };
+    s.order.push(V2G_APP_PROTOCOL);
+    s.order.push(V2G_SESSION_SETUP);
+    s.order.push(V2G_SERVICE_DISCOVERY);
+    s.order.push(V2G_PAYMENT_SELECT);
+    if din {
+        s.order.push(V2G_CONTRACT_AUTH);
+    }
+    s.order.push(V2G_CHARGE_PARAM);
+    if din {
+        s.order.push(V2G_CABLE_CHECK);
+        s.order.push(V2G_PRE_CHARGE);
+    }
+    s.order.push(V2G_POWER_DELIVERY_START);
+    s.order.push(V2G_CURRENT_DEMAND);
+    s.order.push(V2G_POWER_DELIVERY_STOP);
+    if din {
+        s.order.push(V2G_WELDING);
+    }
+    s.order.push(V2G_SESSION_STOP);
+    s.order.push(V2G_DONE);
+    return s;
+}
+
+/// An ISO 15118-2 session (messages through the caller's codec).
+pub fn iso15118_session_new(timeout: i64) -> V2gSession {
+    return v2g_new(timeout, false);
+}
+
+/// A DIN 70121 DC session (messages through this module's EXI codec).
+pub fn iso15118_din_session_new(timeout: i64) -> V2gSession {
+    return v2g_new(timeout, true);
+}
+
+fn v2g_state_base(s: & V2gSession) -> str {
+    val st: i64 = s.state;
+    if st == V2G_SESSION_SETUP { return "SessionSetup"; }
+    if st == V2G_SERVICE_DISCOVERY { return "ServiceDiscovery"; }
+    if st == V2G_PAYMENT_SELECT {
+        if s.din {
+            return "ServicePaymentSelection";
+        }
+        return "PaymentServiceSelection";
+    }
+    if st == V2G_CONTRACT_AUTH { return "ContractAuthentication"; }
+    if st == V2G_CHARGE_PARAM { return "ChargeParameterDiscovery"; }
+    if st == V2G_CABLE_CHECK { return "CableCheck"; }
+    if st == V2G_PRE_CHARGE { return "PreCharge"; }
+    if st == V2G_POWER_DELIVERY_START || st == V2G_POWER_DELIVERY_STOP { return "PowerDelivery"; }
+    if st == V2G_CURRENT_DEMAND { return "CurrentDemand"; }
+    if st == V2G_WELDING { return "WeldingDetection"; }
+    if st == V2G_SESSION_STOP { return "SessionStop"; }
+    return "";
+}
+
+/// The request message name expected in the current state.
+pub fn v2g_expected_request(s: & V2gSession) -> str {
+    if s.state == V2G_APP_PROTOCOL { return "supportedAppProtocolReq"; }
+    if s.state == V2G_DONE { return ""; }
+    return v2g_state_base(s) + "Req";
+}
+
+/// The response message name expected in the current state.
+pub fn v2g_expected_response(s: & V2gSession) -> str {
+    if s.state == V2G_APP_PROTOCOL { return "supportedAppProtocolRes"; }
+    if s.state == V2G_DONE { return ""; }
+    return v2g_state_base(s) + "Res";
+}
+
+/// Mark that the request for the current state was sent at `tick`; sets the
+/// response deadline.
+pub fn v2g_on_send(s: & mut V2gSession, tick: i64) {
+    s.deadline = tick + s.timeout;
+}
+
+fn v2g_fail(s: & mut V2gSession, why: str) {
+    if !s.failed {
+        s.failed = true;
+        s.error = why;
+    }
+}
+
+/// Feed a received response of message `name` with `response_code` at
+/// `tick`. `repeat` keeps the session in its state (the request is sent
+/// again: EVSEProcessing Ongoing, pre-charge not done). CurrentDemand
+/// repeats until v2g_request_stop. A wrong name, a failed response code
+/// or a late response fails the session. Returns the new state.
+pub fn v2g_step_repeat(s: & mut V2gSession, name: str, response_code: i64, tick: i64, repeat: bool) -> i64 {
+    if s.failed || s.state == V2G_DONE {
+        return s.state;
+    }
+    if tick > s.deadline && s.deadline > 0 {
+        v2g_fail(s, "response timeout");
+        return s.state;
+    }
+    if !str_equal(name, v2g_expected_response(s)) {
+        v2g_fail(s, "expected " + v2g_expected_response(s) + ", got " + name);
+        return s.state;
+    }
+    if response_code >= V2G_FAILED {
+        v2g_fail(s, name + " failed");
+        return s.state;
+    }
+    if s.state == V2G_CURRENT_DEMAND {
+        s.current_demand_rounds = s.current_demand_rounds + 1;
+        return s.state;
+    }
+    if repeat {
+        s.repeats = s.repeats + 1;
+        return s.state;
+    }
+    s.pos = s.pos + 1;
+    s.state = s.order.get(s.pos);
+    s.repeats = 0;
+    return s.state;
+}
+
+/// v2g_step_repeat without repeating (ISO 15118-2 seam: the caller decoded
+/// the message with its own codec).
+pub fn v2g_step(s: & mut V2gSession, name: str, response_code: i64, tick: i64) -> i64 {
+    return v2g_step_repeat(s, name, response_code, tick, false);
+}
+
+/// Leave the CurrentDemand loop and move to the stop PowerDelivery.
+pub fn v2g_request_stop(s: & mut V2gSession) {
+    if s.state == V2G_CURRENT_DEMAND {
+        s.pos = s.pos + 1;
+        s.state = s.order.get(s.pos);
+    }
+}
+
+/// The grammar tables a DIN session needs.
+pub struct V2gCodecs {
+    pub app: ExiSchema,
+    pub din: ExiSchema,
+}
+
+pub fn iso15118_codecs() -> V2gCodecs {
+    return V2gCodecs { app: iso15118_app_schema(), din: iso15118_din_schema() };
+}
+
+/// EV side, DIN profile: encode the request `body` (the handshake's
+/// events in the first state, else a DIN body from din_*_req) with the
+/// session's SessionID, frame it as V2GTP and start the response timer.
+/// Empty (and the session failed) if it is not the expected request or
+/// does not encode.
+pub fn v2g_din_send(s: & mut V2gSession, k: & V2gCodecs, body: & Vec<ExiEvent>, tick: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if s.failed {
+        return out;
+    }
+    if body.len() == 0 || body.get(0).name != v2g_expected_request(s) {
+        v2g_fail(s, "not the expected request " + v2g_expected_request(s));
+        return out;
+    }
+    var r: ExiResult = exi_encode(& k.app, & exi_options(), body);
+    if s.state != V2G_APP_PROTOCOL {
+        r = din_encode(& k.din, & s.session, body);
+    }
+    if !r.ok {
+        v2g_fail(s, "encode: " + r.error);
+        return out;
+    }
+    v2g_on_send(s, tick);
+    return iso15118_v2gtp(V2GTP_EXI, & r.bytes);
+}
+
+/// EV side, DIN profile: take a V2GTP packet with the EVSE's response,
+/// decode it and advance the session: the SessionID of SessionSetupRes is
+/// kept and every later response must carry it; FAILED* codes fail the
+/// session; EVSEProcessing Ongoing repeats ContractAuthentication,
+/// ChargeParameterDiscovery and CableCheck; PreCharge repeats until the
+/// EVSE's present voltage is within precharge_tolerance_mv of
+/// precharge_target_mv, WeldingDetection until it is at most
+/// welding_limit_mv. Returns the decoded message.
+pub fn v2g_din_receive(s: & mut V2gSession, k: & V2gCodecs, packet: & Vec<i64>, tick: i64) -> DinMessage {
+    var m: DinMessage = DinMessage { ok: false, error: "", name: "", session_id: Vec::new(), response_code: "", code_index: - 1, events: Vec::new() };
+    val p: V2gtpPacket = iso15118_v2gtp_parse(packet);
+    if !p.ok || p.payload_type != V2GTP_EXI {
+        m.error = "not a V2GTP EXI packet";
+        v2g_fail(s, m.error);
+        return m;
+    }
+    if s.state == V2G_APP_PROTOCOL {
+        val r: AppProtocolRes = iso15118_app_protocol_res_parse(& p.payload);
+        m.ok = r.ok;
+        if !r.ok {
+            m.error = "not a supportedAppProtocolRes";
+            v2g_fail(s, m.error);
+            return m;
+        }
+        m.name = "supportedAppProtocolRes";
+        m.code_index = r.response_code;
+        s.schema_id = r.schema_id;
+        var code: i64 = r.response_code;
+        if code == APP_FAILED {
+            code = V2G_FAILED;
+        }
+        v2g_step_repeat(s, m.name, code, tick, false);
+        return m;
+    }
+    m = din_decode(& k.din, p.payload);
+    if !m.ok {
+        v2g_fail(s, "decode: " + m.error);
+        return m;
+    }
+    if s.state == V2G_SESSION_SETUP {
+        s.session = m.session_id;
+    } else if hex_of(& m.session_id) != hex_of(& s.session) {
+        v2g_fail(s, "SessionID mismatch");
+        return m;
+    }
+    var code: i64 = m.code_index;
+    if code >= 4 {
+        code = V2G_FAILED;   // FAILED and FAILED_*
+    }
+    var repeat: bool = false;
+    val st: i64 = s.state;
+    if st == V2G_CONTRACT_AUTH || st == V2G_CHARGE_PARAM || st == V2G_CABLE_CHECK {
+        repeat = din_field(& m, "EVSEProcessing").sval == "Ongoing";
+    }
+    if st == V2G_PRE_CHARGE {
+        var d: i64 = din_pv_milli(& din_pv_at(& m, "EVSEPresentVoltage")) - s.precharge_target_mv;
+        if d < 0 {
+            d = 0 - d;
+        }
+        repeat = d > s.precharge_tolerance_mv;
+    }
+    if st == V2G_WELDING {
+        repeat = din_pv_milli(& din_pv_at(& m, "EVSEPresentVoltage")) > s.welding_limit_mv;
+    }
+    v2g_step_repeat(s, m.name, code, tick, repeat);
+    return m;
+}
+
+fn hex_of(b: & Vec<i64>) -> str {
+    val digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        val v: i64 = b.get(i) & 255;
+        out = out + str_slice(digits, v >> 4, (v >> 4) + 1) + str_slice(digits, v & 15, (v & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A copy of bytes behind a reference.
+pub fn v2g_bytes(b: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}

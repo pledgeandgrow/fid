@@ -1,0 +1,171 @@
+// stdlib/steering: seek, flee, arrive, pursue, evade, seeded wander, obstacle avoidance, path following, flocking
+// Expected output:
+// seek (2.000, 0.000)
+// flee (-1.200, -1.600)
+// flee far (0.000, 0.000)
+// arrive inside (-2.000, 0.000)
+// pursue (-0.097, 0.981)
+// evade (-1.990, -0.197)
+// arrive end (12.010, 5.004) speed 0.005
+// wander (11.133, -10.005) reproducible yes seed matters yes
+// detect: obstacle 0 ahead 6.00 lateral 0.30
+// avoid force (-1.000, -1.500)
+// avoid end (20.774, 0.245) never touched yes
+// segment of (9, 6): 1
+// closest (3.000, 0.000)
+// path end (-0.466, 9.901) stays within 1.5 yes
+// separation of 0 (-0.923, -0.384)
+// alignment of 0 (-0.235, 0.972)
+// cohesion of 0 (0.514, 0.858)
+// flock alignment 0.936 min gap over 0.3 yes
+use steering;
+use math;
+
+// x rounded to d decimals ("-" only when the rounded value is not zero)
+fn fx(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val n: i64 = (a * (scale as f64) + 0.5) as i64;
+    if n == 0 { neg = false; }
+    var s: str = int_to_str(n / scale);
+    if d > 0 {
+        var fr: str = int_to_str(n % scale);
+        while str_len(fr) < d { fr = "0" + fr; }
+        s = s + "." + fr;
+    }
+    if neg { return "-" + s; }
+    return s;
+}
+
+fn v(p: vec2) -> str {
+    return "(" + fx(p.x, 3) + ", " + fx(p.y, 3) + ")";
+}
+
+fn main() {
+    var a: SteerAgent = steer_agent(vec2(0.0, 0.0), 5.0, 2.0);
+    println("seek " + v(steer_seek(&a, vec2(10.0, 0.0))));
+    println("flee " + v(steer_flee(&a, vec2(3.0, 4.0), 0.0)));
+    println("flee far " + v(steer_flee(&a, vec2(30.0, 40.0), 10.0)));
+    a.vel = vec2(5.0, 0.0);
+    println("arrive inside " + v(steer_arrive(&a, vec2(2.0, 0.0), 4.0)));
+    println("pursue " + v(steer_pursue(&a, vec2(10.0, 0.0), vec2(0.0, 1.0), 5.0)));
+    println("evade " + v(steer_evade(&a, vec2(10.0, 0.0), vec2(0.0, 1.0), 5.0)));
+
+    // arrive: stops on the target
+    var b: SteerAgent = steer_agent(vec2(0.0, 0.0), 4.0, 3.0);
+    var i: i64 = 0;
+    while i < 300 {
+        val fb: vec2 = steer_arrive(&b, vec2(12.0, 5.0), 5.0);
+        steer_apply(&mut b, fb, 0.05);
+        i = i + 1;
+    }
+    println("arrive end " + v(b.pos) + " speed " + fx(b.vel.length(), 3));
+
+    // wander: same seed, same walk; another seed, another walk
+    var w1: SteerAgent = steer_agent(vec2(0.0, 0.0), 2.0, 1.0);
+    var w2: SteerAgent = steer_agent(vec2(0.0, 0.0), 2.0, 1.0);
+    var w3: SteerAgent = steer_agent(vec2(0.0, 0.0), 2.0, 1.0);
+    steer_seed(&mut w1, 1234);
+    steer_seed(&mut w2, 1234);
+    steer_seed(&mut w3, 99);
+    i = 0;
+    while i < 100 {
+        val fw1: vec2 = steer_wander(&mut w1, 2.0, 1.0, 0.5);
+        steer_apply(&mut w1, fw1, 0.1);
+        val fw2: vec2 = steer_wander(&mut w2, 2.0, 1.0, 0.5);
+        steer_apply(&mut w2, fw2, 0.1);
+        val fw3: vec2 = steer_wander(&mut w3, 2.0, 1.0, 0.5);
+        steer_apply(&mut w3, fw3, 0.1);
+        i = i + 1;
+    }
+    val same: bool = w1.pos.x == w2.pos.x && w1.pos.y == w2.pos.y;
+    val differ: bool = w1.pos.x != w3.pos.x;
+    println("wander " + v(w1.pos) + " reproducible " + if same { "yes" } else { "no" } + " seed matters " + if differ { "yes" } else { "no" });
+
+    // obstacle avoidance on the way to (20, 0)
+    var obs: Vec<SteerObstacle> = Vec::new();
+    obs.push(steer_obstacle(vec2(6.0, 0.3), 1.0));
+    obs.push(steer_obstacle(vec2(14.0, -0.4), 1.5));
+    var c: SteerAgent = steer_agent(vec2(0.0, 0.0), 3.0, 4.0);
+    c.vel = vec2(3.0, 0.0);
+    val hit: SteerHit = steer_detect(&c, &obs, 4.0);
+    println("detect: obstacle " + int_to_str(hit.index) + " ahead " + fx(hit.ahead, 2) + " lateral " + fx(hit.lateral, 2));
+    println("avoid force " + v(steer_avoid(&c, &obs, 4.0)));
+    var min_clear: f64 = 100.0;
+    i = 0;
+    while i < 200 {
+        val f: vec2 = steer_avoid(&c, &obs, 4.0).scale(2.0).add(steer_arrive(&c, vec2(20.0, 0.0), 3.0));
+        steer_apply(&mut c, f, 0.05);
+        var k: i64 = 0;
+        while k < obs.len() {
+            val ob: SteerObstacle = obs.get(k);
+            val clear: f64 = ob.center.sub(c.pos).length() - ob.radius;
+            if clear < min_clear { min_clear = clear; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    println("avoid end " + v(c.pos) + " never touched " + if min_clear > 0.0 { "yes" } else { "no" });
+
+    // path following around three corners
+    var path: SteerPath = steer_path(0.5);
+    steer_path_add(&mut path, vec2(0.0, 0.0));
+    steer_path_add(&mut path, vec2(10.0, 0.0));
+    steer_path_add(&mut path, vec2(10.0, 10.0));
+    steer_path_add(&mut path, vec2(0.0, 10.0));
+    println("segment of (9, 6): " + int_to_str(steer_path_segment(&path, vec2(9.0, 6.0))));
+    println("closest " + v(steer_closest_on_segment(vec2(3.0, 4.0), vec2(0.0, 0.0), vec2(10.0, 0.0))));
+    var d: SteerAgent = steer_agent(vec2(0.0, 1.0), 2.0, 3.0);
+    d.vel = vec2(1.0, 0.0);
+    var worst: f64 = 0.0;
+    i = 0;
+    while i < 400 {
+        val fd: vec2 = steer_follow_path(&d, &path, 1.0);
+        steer_apply(&mut d, fd, 0.05);
+        val seg: i64 = steer_path_segment(&path, d.pos);
+        val off: f64 = steer_closest_on_segment(d.pos, path.points.get(seg), path.points.get(seg + 1)).sub(d.pos).length();
+        if i > 40 && off > worst { worst = off; }
+        i = i + 1;
+    }
+    println("path end " + v(d.pos) + " stays within 1.5 " + if worst < 1.5 { "yes" } else { "no" });
+
+    // flocking: five boids heading different ways
+    var flock: Vec<SteerAgent> = Vec::new();
+    var k: i64 = 0;
+    while k < 5 {
+        var bd: SteerAgent = steer_agent(vec2((k as f64) * 1.5, ((k * k) % 3) as f64), 2.0, 1.0);
+        bd.vel = vec2(math_cos((k as f64) * 1.3), math_sin((k as f64) * 1.3));
+        flock.push(bd);
+        k = k + 1;
+    }
+    println("separation of 0 " + v(steer_separation(&flock, 0, 3.0)));
+    println("alignment of 0 " + v(steer_alignment(&flock, 0, 3.0)));
+    println("cohesion of 0 " + v(steer_cohesion(&flock, 0, 3.0)));
+    i = 0;
+    while i < 150 {
+        steer_flock_step(&mut flock, 10.0, 1.5, 1.0, 1.0, 0.1);
+        i = i + 1;
+    }
+    // how aligned: length of the mean heading (1 = all the same way)
+    var mean: vec2 = vec2(0.0, 0.0);
+    var min_gap: f64 = 100.0;
+    k = 0;
+    while k < 5 {
+        mean = mean.add(flock.get(k).vel.normalize());
+        var j: i64 = k + 1;
+        while j < 5 {
+            val gap: f64 = flock.get(k).pos.sub(flock.get(j).pos).length();
+            if gap < min_gap { min_gap = gap; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    println("flock alignment " + fx(mean.length() / 5.0, 3) + " min gap over 0.3 " + if min_gap > 0.3 { "yes" } else { "no" });
+}

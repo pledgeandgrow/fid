@@ -1,0 +1,999 @@
+// Fides SMTP client and RFC 5322 / MIME message builder
+//
+// Real (pure computation):
+//   - reply parsing (RFC 5321 4.2): three-digit codes, multi-line replies
+//     ("250-" lines then "250 "), enhanced status codes (RFC 3463, "5.1.1"),
+//     an incremental reader that waits for the last line of a reply;
+//   - EHLO capabilities: STARTTLS, AUTH mechanisms, SIZE, 8BITMIME,
+//     PIPELINING, SMTPUTF8, ENHANCEDSTATUSCODES;
+//   - the client conversation: greeting, EHLO (HELO when EHLO is refused),
+//     STARTTLS when offered and wanted (then EHLO again, as RFC 3207 asks),
+//     AUTH PLAIN (RFC 4616) or AUTH LOGIN, MAIL FROM (with SIZE= when the
+//     server announced SIZE, and a size check against its limit), one RCPT
+//     TO per recipient (the mail goes on while at least one is accepted),
+//     DATA with dot-stuffing (RFC 5321 4.5.2) and the CRLF.CRLF end, QUIT;
+//     every step's reply is checked and an error says which step failed;
+//   - message building (RFC 5322, MIME RFC 2045-2047): From/To/Cc/Subject/
+//     Date/Message-ID/MIME-Version, Bcc kept out of the headers, non-ASCII
+//     subjects and names as RFC 2047 encoded-words (UTF-8, base64), text
+//     parts as 7bit or quoted-printable, multipart/alternative (text +
+//     HTML), multipart/mixed with base64 attachments in 76-character lines,
+//     RFC 5322 dates from a Unix time and offset, boundaries from a seed.
+//
+// The transport seam: SmtpTransport holds a connection id and functions
+// send(conn, bytes) -> bytes written, recv(conn, max) -> bytes read (empty
+// at the end), starttls(conn) -> true once TLS is up on that connection.
+// smtp_tcp_transport(sock) uses stdlib net for plain TCP; TLS (implicit on
+// port 465 or after STARTTLS) is the caller's transport (stdlib tls13 or
+// the platform's), this module only drives the protocol.
+//
+// Usage:
+//   use smtp;
+//   var m: MailMessage = mail_new("Ada <ada@example.org>", "Hello");
+//   mail_add_to(&mut m, "bob@example.com");
+//   mail_set_text(&mut m, "Hi Bob,\n.\nA dot line.\n");
+//   mail_attach(&mut m, "notes.txt", "text/plain", str_bytes("notes"));
+//   val raw: str = mail_build(&m, 1794910020, 0, 42);
+//   var cfg: SmtpConfig = smtp_config("client.example.org", "ada", "secret");
+//   val res: SmtpResult = smtp_send(tr, cfg, mail_envelope_from(&m), mail_recipients(&m), raw);
+
+module smtp;
+ use vec; use string; use encoding; use net;
+
+// ─── Replies ──────────────────────────────────────────────────────────────
+
+/// A reply: code (0 while incomplete), its lines without the code, and the
+/// enhanced status code of the first line ("" when none).
+pub struct SmtpReply {
+    pub complete: bool,
+    pub ok: bool,
+    pub code: i64,
+    pub lines: Vec<str>,
+    pub enhanced: str,
+    pub used: i64,
+    pub error: str,
+}
+
+fn sm_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn sm_enhanced(text: str) -> str {
+    // class.subject.detail: "2.1.0", "5.7.8"
+    val n: i64 = str_len(text);
+    if n < 5 {
+        return "";
+    }
+    val c: i64 = str_byte_at(text, 0);
+    if (c != 50 && c != 52 && c != 53) || str_byte_at(text, 1) != 46 {
+        return "";
+    }
+    var i: i64 = 2;
+    var dots: i64 = 1;
+    var digits: i64 = 0;
+    while i < n && str_byte_at(text, i) != 32 {
+        val b: i64 = str_byte_at(text, i);
+        if b == 46 {
+            if digits == 0 {
+                return "";
+            }
+            dots = dots + 1;
+            digits = 0;
+        } else if sm_digit(b) {
+            digits = digits + 1;
+            if digits > 3 {
+                return "";
+            }
+        } else {
+            return "";
+        }
+        i = i + 1;
+    }
+    if dots != 2 || digits == 0 {
+        return "";
+    }
+    return str_slice(text, 0, i);
+}
+
+/// Parse one reply at the start of `text` (lines end in CRLF; a bare LF
+/// is taken too). complete false: more bytes are needed.
+pub fn smtp_parse_reply(text: str) -> SmtpReply {
+    var r: SmtpReply = SmtpReply { complete: false, ok: true, code: 0, lines: Vec::new(), enhanced: "", used: 0, error: "" };
+    val n: i64 = str_len(text);
+    var at: i64 = 0;
+    while at < n {
+        var e: i64 = at;
+        while e < n && str_byte_at(text, e) != 10 {
+            e = e + 1;
+        }
+        if e >= n {
+            return r;
+        }
+        var end: i64 = e;
+        if end > at && str_byte_at(text, end - 1) == 13 {
+            end = end - 1;
+        }
+        val line: str = str_slice(text, at, end);
+        if str_len(line) < 3 || !sm_digit(str_byte_at(line, 0)) || !sm_digit(str_byte_at(line, 1)) || !sm_digit(str_byte_at(line, 2)) {
+            r.ok = false;
+            r.complete = true;
+            r.error = "bad reply line: " + line;
+            r.used = e + 1;
+            return r;
+        }
+        val code: i64 = str_parse_int(str_slice(line, 0, 3));
+        if r.code != 0 && code != r.code {
+            r.ok = false;
+            r.complete = true;
+            r.error = "reply code changed inside a multi-line reply";
+            r.used = e + 1;
+            return r;
+        }
+        r.code = code;
+        var sep: i64 = 32;
+        if str_len(line) > 3 {
+            sep = str_byte_at(line, 3);
+        }
+        var rest: str = "";
+        if str_len(line) > 4 {
+            rest = str_slice(line, 4, str_len(line));
+        }
+        r.lines.push(rest);
+        at = e + 1;
+        if sep != 45 {
+            r.complete = true;
+            r.used = at;
+            if r.lines.len() > 0 {
+                r.enhanced = sm_enhanced(r.lines.get(0));
+            }
+            return r;
+        }
+    }
+    return r;
+}
+
+/// The reply text, lines joined by a space.
+pub fn smtp_reply_text(r: & SmtpReply) -> str {
+    return str_join(r.lines, " ");
+}
+
+// ─── EHLO capabilities ────────────────────────────────────────────────────
+
+/// size: -1 without the SIZE extension, 0 with it and no limit.
+pub struct SmtpCaps {
+    pub esmtp: bool,
+    pub starttls: bool,
+    pub auth: Vec<str>,
+    pub size: i64,
+    pub eightbit: bool,
+    pub pipelining: bool,
+    pub smtputf8: bool,
+    pub enhanced: bool,
+}
+
+pub fn smtp_caps_none() -> SmtpCaps {
+    return SmtpCaps { esmtp: false, starttls: false, auth: Vec::new(), size: 0 - 1, eightbit: false, pipelining: false, smtputf8: false, enhanced: false };
+}
+
+/// The capabilities of a 250 reply to EHLO (its first line is the greeting).
+pub fn smtp_parse_caps(r: & SmtpReply) -> SmtpCaps {
+    var c: SmtpCaps = smtp_caps_none();
+    c.esmtp = r.code == 250;
+    var i: i64 = 1;
+    while i < r.lines.len() {
+        val words: Vec<str> = str_split(str_trim(r.lines.get(i)), " ");
+        val kw: str = str_to_upper(words.get(0));
+        if kw == "STARTTLS" {
+            c.starttls = true;
+        } else if kw == "AUTH" || str_starts_with(kw, "AUTH=") {
+            var k: i64 = 1;
+            if str_starts_with(kw, "AUTH=") {
+                k = 0;
+            }
+            while k < words.len() {
+                var mech: str = str_to_upper(words.get(k));
+                if str_starts_with(mech, "AUTH=") {
+                    mech = str_slice(mech, 5, str_len(mech));
+                }
+                var seen: bool = false;
+                var j: i64 = 0;
+                while j < c.auth.len() {
+                    if c.auth.get(j) == mech {
+                        seen = true;
+                    }
+                    j = j + 1;
+                }
+                if !seen && str_len(mech) > 0 {
+                    c.auth.push(mech);
+                }
+                k = k + 1;
+            }
+        } else if kw == "SIZE" {
+            c.size = 0;
+            if words.len() > 1 {
+                c.size = str_parse_int(words.get(1));
+            }
+        } else if kw == "8BITMIME" {
+            c.eightbit = true;
+        } else if kw == "PIPELINING" {
+            c.pipelining = true;
+        } else if kw == "SMTPUTF8" {
+            c.smtputf8 = true;
+        } else if kw == "ENHANCEDSTATUSCODES" {
+            c.enhanced = true;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+pub fn smtp_caps_has_auth(c: & SmtpCaps, mech: str) -> bool {
+    var i: i64 = 0;
+    while i < c.auth.len() {
+        if c.auth.get(i) == mech {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── Commands ─────────────────────────────────────────────────────────────
+
+/// "<a@b>" from "Name <a@b>", "<a@b>" or "a@b".
+pub fn smtp_addr_spec(addr: str) -> str {
+    // An address carrying CR or LF would splice extra SMTP commands into
+    // the session (envelope command injection) — reject it whole.
+    var i: i64 = 0;
+    val n: i64 = str_len(addr);
+    while i < n {
+        val c: i64 = str_byte_at(addr, i);
+        if c == 13 || c == 10 || c == 0 {
+            return "";
+        }
+        i = i + 1;
+    }
+    val lt: i64 = str_rfind(addr, "<");
+    val gt: i64 = str_rfind(addr, ">");
+    if lt >= 0 && gt > lt {
+        return str_slice(addr, lt, gt + 1);
+    }
+    return "<" + str_trim(addr) + ">";
+}
+
+/// The AUTH PLAIN initial response: base64(authzid NUL user NUL pass).
+pub fn smtp_auth_plain(user: str, pass: str) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    val u: Vec<i64> = str_bytes(user);
+    var i: i64 = 0;
+    while i < u.len() {
+        b.push(u.get(i));
+        i = i + 1;
+    }
+    b.push(0);
+    val p: Vec<i64> = str_bytes(pass);
+    i = 0;
+    while i < p.len() {
+        b.push(p.get(i));
+        i = i + 1;
+    }
+    return b64_encode_bytes(b);
+}
+
+/// The DATA payload: lines starting with '.' get another '.', bare LF
+/// become CRLF, and the terminating CRLF.CRLF is added.
+pub fn smtp_dot_stuff(msg: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(msg);
+    var line_start: bool = true;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(msg, i);
+        if line_start && c == 46 {
+            out.push(46);
+        }
+        if c == 10 {
+            if out.len() == 0 || out.get(out.len() - 1) != 13 {
+                out.push(13);
+            }
+            out.push(10);
+            line_start = true;
+        } else {
+            out.push(c);
+            line_start = false;
+        }
+        i = i + 1;
+    }
+    if !line_start {
+        out.push(13);
+        out.push(10);
+    }
+    out.push(46);
+    out.push(13);
+    out.push(10);
+    return str_from_bytes(out);
+}
+
+// ─── The client ───────────────────────────────────────────────────────────
+
+pub struct SmtpTransport {
+    pub conn: i64,
+    pub send: fn(i64, Vec<i64>) -> i64,
+    pub recv: fn(i64, i64) -> Vec<i64>,
+    pub starttls: fn(i64) -> bool,
+}
+
+fn sm_no_tls(conn: i64) -> bool {
+    return false;
+}
+
+/// Plain TCP over a connected socket (stdlib net); STARTTLS is refused.
+pub fn smtp_tcp_transport(sock: i64) -> SmtpTransport {
+    return SmtpTransport { conn: sock, send: net_send_bytes, recv: net_recv_bytes, starttls: sm_no_tls };
+}
+
+pub struct SmtpConfig {
+    pub helo: str,
+    pub user: str,
+    pub pass: str,
+    pub use_starttls: bool,
+    pub require_tls: bool,
+    pub prefer_login: bool,
+}
+
+/// EHLO name and credentials (user "" = no AUTH); STARTTLS when offered.
+pub fn smtp_config(helo: str, user: str, pass: str) -> SmtpConfig {
+    return SmtpConfig { helo: helo, user: user, pass: pass, use_starttls: true, require_tls: false, prefer_login: false };
+}
+
+/// What happened. ok: the server took the message (code 250 after DATA).
+/// step names the command that failed. accepted / rejected: recipients.
+pub struct SmtpResult {
+    pub ok: bool,
+    pub step: str,
+    pub code: i64,
+    pub enhanced: str,
+    pub message: str,
+    pub accepted: Vec<str>,
+    pub rejected: Vec<str>,
+    pub tls: bool,
+    pub auth: str,
+    pub caps: SmtpCaps,
+    pub transcript: Vec<str>,
+}
+
+struct SmSession {
+    tr: SmtpTransport,
+    inbuf: str,
+    ok: bool,
+    error: str,
+    log: Vec<str>,
+    ehlo: bool,
+}
+
+fn sm_send(s: & mut SmSession, line: str, logged: str) {
+    if !s.ok {
+        return;
+    }
+    val send: fn(i64, Vec<i64>) -> i64 = s.tr.send;
+    val b: Vec<i64> = str_bytes(line);
+    if send(s.tr.conn, b) != b.len() {
+        s.ok = false;
+        s.error = "send failed";
+        return;
+    }
+    s.log.push("C: " + logged);
+}
+
+fn sm_read(s: & mut SmSession) -> SmtpReply {
+    while s.ok {
+        val r: SmtpReply = smtp_parse_reply(s.inbuf);
+        if r.complete {
+            s.inbuf = str_slice(s.inbuf, r.used, str_len(s.inbuf));
+            if !r.ok {
+                s.ok = false;
+                s.error = r.error;
+            } else {
+                s.log.push("S: " + int_to_str(r.code) + " " + smtp_reply_text(& r));
+            }
+            return r;
+        }
+        val recv: fn(i64, i64) -> Vec<i64> = s.tr.recv;
+        val got: Vec<i64> = recv(s.tr.conn, 4096);
+        if got.len() == 0 {
+            s.ok = false;
+            s.error = "connection closed";
+        } else {
+            s.inbuf = s.inbuf + str_from_bytes(got);
+        }
+    }
+    return SmtpReply { complete: false, ok: false, code: 0, lines: Vec::new(), enhanced: "", used: 0, error: s.error };
+}
+
+fn sm_result() -> SmtpResult {
+    return SmtpResult { ok: false, step: "", code: 0, enhanced: "", message: "", accepted: Vec::new(), rejected: Vec::new(), tls: false, auth: "", caps: smtp_caps_none(), transcript: Vec::new() };
+}
+
+fn sm_fail(res: & mut SmtpResult, s: & SmSession, step: str, r: & SmtpReply) {
+    res.ok = false;
+    res.step = step;
+    res.code = r.code;
+    res.enhanced = r.enhanced;
+    if s.ok {
+        res.message = smtp_reply_text(r);
+    } else {
+        res.message = s.error;
+    }
+    res.transcript = s.log;
+}
+
+// EHLO, or HELO when EHLO is refused (5xx); s.ehlo tells which answered.
+fn sm_hello(s: & mut SmSession, helo: str) -> SmtpReply {
+    sm_send(s, "EHLO " + helo + "\r\n", "EHLO " + helo);
+    val r: SmtpReply = sm_read(s);
+    s.ehlo = s.ok && r.code == 250;
+    if s.ok && r.code >= 500 && r.code <= 502 {
+        sm_send(s, "HELO " + helo + "\r\n", "HELO " + helo);
+        return sm_read(s);
+    }
+    return r;
+}
+
+fn sm_caps_of(s: & SmSession, r: & SmtpReply) -> SmtpCaps {
+    if s.ehlo {
+        return smtp_parse_caps(r);
+    }
+    return smtp_caps_none();
+}
+
+/// Run a whole SMTP transaction: deliver `message` (RFC 5322 text, as
+/// mail_build makes it) from `from` to each of `rcpts`.
+pub fn smtp_send(tr: SmtpTransport, cfg: SmtpConfig, from: str, rcpts: Vec<str>, message: str) -> SmtpResult {
+    var res: SmtpResult = sm_result();
+    var s: SmSession = SmSession { tr: tr, inbuf: "", ok: true, error: "", log: Vec::new(), ehlo: false };
+    val greet: SmtpReply = sm_read(& mut s);
+    if !s.ok || greet.code != 220 {
+        sm_fail(& mut res, & s, "greeting", & greet);
+        return res;
+    }
+    var hr: SmtpReply = sm_hello(& mut s, cfg.helo);
+    if !s.ok || hr.code != 250 {
+        sm_fail(& mut res, & s, "EHLO", & hr);
+        return res;
+    }
+    var caps: SmtpCaps = sm_caps_of(& s, & hr);
+    if caps.starttls && cfg.use_starttls {
+        sm_send(& mut s, "STARTTLS\r\n", "STARTTLS");
+        val tr2: SmtpReply = sm_read(& mut s);
+        if !s.ok || tr2.code != 220 {
+            sm_fail(& mut res, & s, "STARTTLS", & tr2);
+            return res;
+        }
+        val up: fn(i64) -> bool = s.tr.starttls;
+        if !up(s.tr.conn) {
+            s.ok = false;
+            s.error = "TLS handshake failed";
+            sm_fail(& mut res, & s, "STARTTLS", & tr2);
+            return res;
+        }
+        res.tls = true;
+        // anything read before the handshake is discarded (RFC 3207 4.2)
+        s.inbuf = "";
+        hr = sm_hello(& mut s, cfg.helo);
+        if !s.ok || hr.code != 250 {
+            sm_fail(& mut res, & s, "EHLO", & hr);
+            return res;
+        }
+        caps = sm_caps_of(& s, & hr);
+    } else if cfg.require_tls {
+        s.ok = false;
+        s.error = "the server does not offer STARTTLS";
+        sm_fail(& mut res, & s, "STARTTLS", & hr);
+        return res;
+    }
+    res.caps = caps;
+    if str_len(cfg.user) > 0 {
+        val plain: bool = smtp_caps_has_auth(& caps, "PLAIN");
+        val login: bool = smtp_caps_has_auth(& caps, "LOGIN");
+        if login && (cfg.prefer_login || !plain) {
+            sm_send(& mut s, "AUTH LOGIN\r\n", "AUTH LOGIN");
+            val a1: SmtpReply = sm_read(& mut s);
+            if !s.ok || a1.code != 334 {
+                sm_fail(& mut res, & s, "AUTH", & a1);
+                return res;
+            }
+            sm_send(& mut s, b64_encode(cfg.user) + "\r\n", "(user)");
+            val a2: SmtpReply = sm_read(& mut s);
+            if !s.ok || a2.code != 334 {
+                sm_fail(& mut res, & s, "AUTH", & a2);
+                return res;
+            }
+            sm_send(& mut s, b64_encode(cfg.pass) + "\r\n", "(password)");
+            val a3: SmtpReply = sm_read(& mut s);
+            if !s.ok || a3.code != 235 {
+                sm_fail(& mut res, & s, "AUTH", & a3);
+                return res;
+            }
+            res.auth = "LOGIN";
+        } else if plain {
+            sm_send(& mut s, "AUTH PLAIN " + smtp_auth_plain(cfg.user, cfg.pass) + "\r\n", "AUTH PLAIN (credentials)");
+            val a: SmtpReply = sm_read(& mut s);
+            if !s.ok || a.code != 235 {
+                sm_fail(& mut res, & s, "AUTH", & a);
+                return res;
+            }
+            res.auth = "PLAIN";
+        } else {
+            s.ok = false;
+            s.error = "no AUTH mechanism in common (server offers " + str_join(caps.auth, " ") + ")";
+            sm_fail(& mut res, & s, "AUTH", & hr);
+            return res;
+        }
+    }
+    val from_spec: str = smtp_addr_spec(from);
+    if str_len(from_spec) == 0 {
+        s.ok = false;
+        s.error = "envelope sender contains CR/LF/NUL";
+        sm_fail(& mut res, & s, "MAIL", & hr);
+        return res;
+    }
+    var mail: str = "MAIL FROM:" + from_spec;
+    if caps.size > 0 && str_len(message) > caps.size {
+        s.ok = false;
+        s.error = "message of " + int_to_str(str_len(message)) + " bytes is over the server's SIZE " + int_to_str(caps.size);
+        sm_fail(& mut res, & s, "MAIL", & hr);
+        return res;
+    }
+    if caps.size >= 0 {
+        mail = mail + " SIZE=" + int_to_str(str_len(message));
+    }
+    sm_send(& mut s, mail + "\r\n", mail);
+    val mr: SmtpReply = sm_read(& mut s);
+    if !s.ok || mr.code != 250 {
+        sm_fail(& mut res, & s, "MAIL", & mr);
+        return res;
+    }
+    var i: i64 = 0;
+    var last_bad: SmtpReply = mr;
+    while i < rcpts.len() {
+        val to_spec: str = smtp_addr_spec(rcpts.get(i));
+        if str_len(to_spec) == 0 {
+            s.ok = false;
+            s.error = "recipient address contains CR/LF/NUL";
+            sm_fail(& mut res, & s, "RCPT", & last_bad);
+            return res;
+        }
+        val to: str = "RCPT TO:" + to_spec;
+        sm_send(& mut s, to + "\r\n", to);
+        val rr: SmtpReply = sm_read(& mut s);
+        if !s.ok {
+            sm_fail(& mut res, & s, "RCPT", & rr);
+            return res;
+        }
+        if rr.code == 250 || rr.code == 251 {
+            res.accepted.push(rcpts.get(i));
+        } else {
+            res.rejected.push(rcpts.get(i));
+            last_bad = rr;
+        }
+        i = i + 1;
+    }
+    if res.accepted.len() == 0 {
+        sm_send(& mut s, "RSET\r\n", "RSET");
+        sm_read(& mut s);
+        sm_fail(& mut res, & s, "RCPT", & last_bad);
+        return res;
+    }
+    sm_send(& mut s, "DATA\r\n", "DATA");
+    val dr: SmtpReply = sm_read(& mut s);
+    if !s.ok || dr.code != 354 {
+        sm_fail(& mut res, & s, "DATA", & dr);
+        return res;
+    }
+    sm_send(& mut s, smtp_dot_stuff(message), "(message, " + int_to_str(str_len(message)) + " bytes)");
+    val er: SmtpReply = sm_read(& mut s);
+    if !s.ok || er.code != 250 {
+        sm_fail(& mut res, & s, "DATA", & er);
+        return res;
+    }
+    res.ok = true;
+    res.step = "DATA";
+    res.code = er.code;
+    res.enhanced = er.enhanced;
+    res.message = smtp_reply_text(& er);
+    sm_send(& mut s, "QUIT\r\n", "QUIT");
+    sm_read(& mut s);
+    res.transcript = s.log;
+    return res;
+}
+
+// ─── Messages ─────────────────────────────────────────────────────────────
+
+pub struct MailMessage {
+    pub from: str,
+    pub to: Vec<str>,
+    pub cc: Vec<str>,
+    pub bcc: Vec<str>,
+    pub reply_to: str,
+    pub subject: str,
+    pub text: str,
+    pub html: str,
+    pub att_names: Vec<str>,
+    pub att_types: Vec<str>,
+    pub att_data: Vec<Vec<i64>>,
+    pub header_names: Vec<str>,
+    pub header_vals: Vec<str>,
+    pub message_id: str,
+}
+
+pub fn mail_new(from: str, subject: str) -> MailMessage {
+    return MailMessage { from: from, to: Vec::new(), cc: Vec::new(), bcc: Vec::new(), reply_to: "", subject: subject, text: "", html: "", att_names: Vec::new(), att_types: Vec::new(), att_data: Vec::new(), header_names: Vec::new(), header_vals: Vec::new(), message_id: "" };
+}
+
+pub fn mail_add_to(m: & mut MailMessage, addr: str) {
+    m.to.push(addr);
+}
+
+pub fn mail_add_cc(m: & mut MailMessage, addr: str) {
+    m.cc.push(addr);
+}
+
+/// A recipient who gets the mail but appears in no header.
+pub fn mail_add_bcc(m: & mut MailMessage, addr: str) {
+    m.bcc.push(addr);
+}
+
+pub fn mail_set_text(m: & mut MailMessage, text: str) {
+    m.text = text;
+}
+
+pub fn mail_set_html(m: & mut MailMessage, html: str) {
+    m.html = html;
+}
+
+pub fn mail_attach(m: & mut MailMessage, name: str, content_type: str, data: Vec<i64>) {
+    m.att_names.push(name);
+    m.att_types.push(content_type);
+    m.att_data.push(data);
+}
+
+pub fn mail_add_header(m: & mut MailMessage, name: str, value: str) {
+    m.header_names.push(name);
+    m.header_vals.push(value);
+}
+
+/// The envelope sender (the From address).
+pub fn mail_envelope_from(m: & MailMessage) -> str {
+    return smtp_addr_spec(m.from);
+}
+
+/// Every envelope recipient: To, Cc and Bcc.
+pub fn mail_recipients(m: & MailMessage) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < m.to.len() { out.push(m.to.get(i)); i = i + 1; }
+    i = 0;
+    while i < m.cc.len() { out.push(m.cc.get(i)); i = i + 1; }
+    i = 0;
+    while i < m.bcc.len() { out.push(m.bcc.get(i)); i = i + 1; }
+    return out;
+}
+
+fn sm_ascii(s: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c > 126 || (c < 32 && c != 9 && c != 10 && c != 13) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An RFC 2047 encoded-word for non-ASCII text ("=?UTF-8?B?...?="), split
+/// into words of at most 45 bytes of text each; ASCII text unchanged.
+/// `s` with CR, LF and NUL removed — the one thing every header value
+/// must pass through before it can be spliced into a header block.
+fn smtp_strip_crlf(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    var dirty: bool = false;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 13 || c == 10 || c == 0 {
+            dirty = true;
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    if !dirty {
+        return s;
+    }
+    return str_from_bytes(out);
+}
+
+pub fn mail_encode_word(s: str) -> str {
+    var s: str = smtp_strip_crlf(s);
+    if sm_ascii(s) {
+        return s;
+    }
+    val b: Vec<i64> = str_bytes(s);
+    var out: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        var chunk: Vec<i64> = Vec::new();
+        // stop a chunk before 45 bytes, never inside a UTF-8 sequence
+        while i < b.len() && (chunk.len() < 45 || (b.get(i) & 192) == 128) {
+            chunk.push(b.get(i));
+            i = i + 1;
+        }
+        if str_len(out) > 0 {
+            out = out + "\r\n ";
+        }
+        out = out + "=?UTF-8?B?" + b64_encode_bytes(chunk) + "?=";
+    }
+    return out;
+}
+
+// An address with a display name: the name encoded when not ASCII.
+fn sm_addr_header(addr: str) -> str {
+    var addr: str = smtp_strip_crlf(addr);
+    val lt: i64 = str_rfind(addr, "<");
+    if lt > 0 {
+        val name: str = str_trim(str_slice(addr, 0, lt));
+        if !sm_ascii(name) {
+            return mail_encode_word(name) + " " + str_slice(addr, lt, str_len(addr));
+        }
+    }
+    return addr;
+}
+
+fn sm_addr_list(v: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            out = out + ",\r\n ";
+        }
+        out = out + sm_addr_header(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Quoted-printable (RFC 2045 6.7) with CRLF line breaks and soft breaks
+/// keeping lines at most 76 characters.
+pub fn mail_quoted_printable(s: str) -> str {
+    val hx: str = "0123456789ABCDEF";
+    var out: Vec<i64> = Vec::new();
+    var col: i64 = 0;
+    val b: Vec<i64> = str_bytes(s);
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c == 10 || (c == 13 && i + 1 < n && b.get(i + 1) == 10) {
+            if c == 13 {
+                i = i + 1;
+            }
+            out.push(13);
+            out.push(10);
+            col = 0;
+            i = i + 1;
+        } else {
+            var enc: bool = c == 61 || c > 126 || (c < 32 && c != 9);
+            // a space or tab at a line's end must be encoded
+            if (c == 32 || c == 9) && (i + 1 >= n || b.get(i + 1) == 10 || b.get(i + 1) == 13) {
+                enc = true;
+            }
+            var w: i64 = 1;
+            if enc {
+                w = 3;
+            }
+            if col + w > 75 {
+                out.push(61);
+                out.push(13);
+                out.push(10);
+                col = 0;
+            }
+            if enc {
+                out.push(61);
+                out.push(str_byte_at(hx, c >> 4));
+                out.push(str_byte_at(hx, c & 15));
+            } else {
+                out.push(c);
+            }
+            col = col + w;
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+fn sm_crlf(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 10 && (out.len() == 0 || out.get(out.len() - 1) != 13) {
+            out.push(13);
+        }
+        out.push(c);
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+// A text part: 7bit when ASCII with short lines, else quoted-printable.
+fn sm_text_part(ctype: str, body: str) -> str {
+    var long_line: bool = false;
+    val lines: Vec<str> = str_split(body, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        if str_len(lines.get(i)) > 998 {
+            long_line = true;
+        }
+        i = i + 1;
+    }
+    if sm_ascii(body) && !long_line {
+        return "Content-Type: " + ctype + "; charset=us-ascii\r\nContent-Transfer-Encoding: 7bit\r\n\r\n" + sm_crlf(body);
+    }
+    return "Content-Type: " + ctype + "; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" + mail_quoted_printable(body);
+}
+
+/// Base64 in lines of 76 characters, CRLF after each.
+pub fn mail_base64_lines(data: Vec<i64>) -> str {
+    val all: str = b64_encode_bytes(data);
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(all) {
+        var e: i64 = i + 76;
+        if e > str_len(all) {
+            e = str_len(all);
+        }
+        out = out + str_slice(all, i, e) + "\r\n";
+        i = e;
+    }
+    return out;
+}
+
+fn sm_two(v: i64) -> str {
+    if v < 10 {
+        return "0" + int_to_str(v);
+    }
+    return int_to_str(v);
+}
+
+/// An RFC 5322 date for Unix time `t` at a UTC offset in minutes:
+/// "Tue, 17 Nov 2026 10:07:00 +0000".
+pub fn mail_date(t: i64, offset_min: i64) -> str {
+    val local: i64 = t + offset_min * 60;
+    var days: i64 = local / 86400;
+    var secs: i64 = local % 86400;
+    if secs < 0 {
+        secs = secs + 86400;
+        days = days - 1;
+    }
+    // civil date from days (H. Hinnant's algorithm)
+    val z: i64 = days + 719468;
+    var era: i64 = z / 146097;
+    if z < 0 && z % 146097 != 0 {
+        era = era - 1;
+    }
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    val d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = mp + 3;
+    if mp >= 10 {
+        m = mp - 9;
+    }
+    var y: i64 = yoe + era * 400;
+    if m <= 2 {
+        y = y + 1;
+    }
+    var wd: i64 = (days + 4) % 7;
+    if wd < 0 {
+        wd = wd + 7;
+    }
+    val wnames: str = "SunMonTueWedThuFriSat";
+    val mnames: str = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    var sign: str = "+";
+    var off: i64 = offset_min;
+    if off < 0 {
+        sign = "-";
+        off = 0 - off;
+    }
+    return str_slice(wnames, wd * 3, wd * 3 + 3) + ", " + int_to_str(d) + " " + str_slice(mnames, (m - 1) * 3, m * 3) + " " + int_to_str(y) + " " + sm_two(secs / 3600) + ":" + sm_two((secs / 60) % 60) + ":" + sm_two(secs % 60) + " " + sign + sm_two(off / 60) + sm_two(off % 60);
+}
+
+@wrapping fn sm_rand(state: & mut i64) -> i64 {
+    var x: i64 = *state;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    *state = x;
+    return x & 281474976710655;
+}
+
+fn sm_hex(v: i64, digits: i64) -> str {
+    val hx: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = digits - 1;
+    while i >= 0 {
+        val d: i64 = (v >> (i * 4)) & 15;
+        out = out + str_slice(hx, d, d + 1);
+        i = i - 1;
+    }
+    return out;
+}
+
+/// The whole message (headers, CRLF line ends) for Unix time `t` at
+/// `offset_min`; `seed` makes the boundaries and the Message-ID when none
+/// is set.
+pub fn mail_build(m: & MailMessage, t: i64, offset_min: i64, seed: i64) -> str {
+    var rng: i64 = seed;
+    if rng == 0 {
+        rng = 2463534242;
+    }
+    var h: str = "From: " + sm_addr_header(m.from) + "\r\n";
+    if m.to.len() > 0 {
+        h = h + "To: " + sm_addr_list(m.to) + "\r\n";
+    }
+    if m.cc.len() > 0 {
+        h = h + "Cc: " + sm_addr_list(m.cc) + "\r\n";
+    }
+    if str_len(m.reply_to) > 0 {
+        h = h + "Reply-To: " + sm_addr_header(m.reply_to) + "\r\n";
+    }
+    h = h + "Subject: " + mail_encode_word(m.subject) + "\r\n";
+    h = h + "Date: " + mail_date(t, offset_min) + "\r\n";
+    var mid: str = smtp_strip_crlf(m.message_id);
+    if str_len(mid) == 0 {
+        var domain: str = "localhost";
+        val spec: str = smtp_addr_spec(m.from);
+        val at: i64 = str_find(spec, "@");
+        if at >= 0 {
+            domain = str_slice(spec, at + 1, str_len(spec) - 1);
+        }
+        mid = "<" + sm_hex(t, 8) + "." + sm_hex(sm_rand(& mut rng), 12) + "@" + domain + ">";
+    }
+    h = h + "Message-ID: " + mid + "\r\n";
+    var i: i64 = 0;
+    while i < m.header_names.len() {
+        // A header name may not contain ':' either — "Bcc: x@y" would
+        // otherwise write its own header line.
+        val hn: str = str_replace(smtp_strip_crlf(m.header_names.get(i)), ":", "");
+        val hv: str = smtp_strip_crlf(m.header_vals.get(i));
+        if str_len(hn) > 0 {
+            h = h + hn + ": " + hv + "\r\n";
+        }
+        i = i + 1;
+    }
+    h = h + "MIME-Version: 1.0\r\n";
+    // the body: text, or text+html alternative, then attachments
+    var body: str = "";
+    if str_len(m.html) > 0 {
+        val b: str = "=_alt_" + sm_hex(sm_rand(& mut rng), 12);
+        body = "Content-Type: multipart/alternative; boundary=\"" + b + "\"\r\n\r\n" + "--" + b + "\r\n" + sm_text_part("text/plain", m.text) + "\r\n--" + b + "\r\n" + sm_text_part("text/html", m.html) + "\r\n--" + b + "--\r\n";
+    } else {
+        body = sm_text_part("text/plain", m.text);
+    }
+    if m.att_names.len() > 0 {
+        val b: str = "=_mix_" + sm_hex(sm_rand(& mut rng), 12);
+        var mixed: str = "Content-Type: multipart/mixed; boundary=\"" + b + "\"\r\n\r\nThis is a multi-part message in MIME format.\r\n--" + b + "\r\n" + body + "\r\n";
+        i = 0;
+        while i < m.att_names.len() {
+            val name: str = mail_encode_word(m.att_names.get(i));
+            mixed = mixed + "--" + b + "\r\nContent-Type: " + m.att_types.get(i) + "; name=\"" + name + "\"\r\nContent-Disposition: attachment; filename=\"" + name + "\"\r\nContent-Transfer-Encoding: base64\r\n\r\n" + mail_base64_lines(m.att_data.get(i)) + "\r\n";
+            i = i + 1;
+        }
+        body = mixed + "--" + b + "--\r\n";
+    }
+    return h + body;
+}

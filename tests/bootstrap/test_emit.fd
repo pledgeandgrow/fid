@@ -1,0 +1,72 @@
+// Roadmap Phase 9 (blockchain, F34): event logging. `@event fn` declares an
+// event (the compiler writes its body: one numbered record in the event
+// log, with the topic of its signature, FNV-1a of `Name(types)`); a
+// function lists the events it can emit, through everything it calls, with
+// @emit(...); a @contract entry point is @deterministic, has a gas limit,
+// cannot re-enter itself and makes no call through a function value.
+// Events appear in the order they were emitted; a rejected payment emits
+// none.
+// Expected output:
+// emit #1 Approval(i64,i64,bool) topic=0x17e79a01 owner=1 spender=2 allowed=true
+// emit #2 Transfer(i64,i64,i64) topic=0x6607873a from=1 to=2 amount=50
+// true
+// false
+// emit #3 Approval(i64,i64,bool) topic=0x17e79a01 owner=1 spender=2 allowed=true
+// emit #4 Transfer(i64,i64,i64) topic=0x6607873a from=1 to=2 amount=20
+// true
+// emit #5 Note(str) topic=0x79776e6d memo=settled
+// 930
+// 70
+
+struct Ledger {
+    a: i64,
+    b: i64,
+}
+
+@event
+fn Transfer(from: i64, to: i64, amount: i64) {}
+
+@event
+fn Approval(owner: i64, spender: i64, allowed: bool) {}
+
+@event
+fn Note(memo: str) {}
+
+@emit(Transfer)
+fn move_funds(l: & mut Ledger, amount: i64) {
+    l.a = l.a - amount;
+    l.b = l.b + amount;
+    Transfer(1, 2, amount);
+}
+
+@contract
+@deterministic
+@gas(5000)
+@emit(Transfer, Approval)
+fn pay(l: & mut Ledger, amount: i64) -> bool {
+    if amount > l.a {
+        return false;
+    }
+    Approval(1, 2, true);
+    move_funds(l, amount);
+    return true;
+}
+
+@emit(Note)
+fn note(memo: str) {
+    Note(memo);
+}
+
+fn main() -> i64 {
+    var l: Ledger = Ledger { a: 1000, b: 0 };
+    val ok1: bool = pay(& mut l, 50);
+    println(ok1);
+    val ok2: bool = pay(& mut l, 5000);
+    println(ok2);
+    val ok3: bool = pay(& mut l, 20);
+    println(ok3);
+    note("settled");
+    println(l.a);
+    println(l.b);
+    return 0;
+}

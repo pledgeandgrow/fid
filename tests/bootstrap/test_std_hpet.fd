@@ -1,0 +1,177 @@
+// stdlib/hpet: HPET capabilities and programming over a fake register file, the ACPI HPET table, 128-bit time math, TSC calibration and PIT channel 2.
+// Expected output:
+// qemu caps rev 1 timers 3 64bit true legacy true vendor 0x8086 period 10000000 fs valid true
+// qemu freq 100000000 Hz
+// ich period 69841279 fs freq 14318179 Hz, 1 ms = 14318 ticks, 1 s = 14318179 ticks
+// 14318 ticks = 999987 ns
+// bad period valid false
+// timer0 caps periodic true wide true fsb false routes 0x00f00800 first 11
+// periodic ok true conf 0x47c cmp 1000000 gen 0x1 counter 0
+// oneshot target 1234567 + 500 = 1235067 conf 0x424
+// timer1 periodic false
+// ack wrote 0x4
+// table valid true addr 0xfed00000 id 0x8086a201 min tick 128 number 0
+// muldiv 3952873730080618203 14318179940547 7
+// mult/shift 3 GHz 5592405 24 -> 5 s = 4999999701 ns
+// mult/shift HPET 585871109 23 -> 1 s = 999999999 ns
+// delta wrap 32-bit 16, 64-bit -5
+// tsc 3000000000 Hz best of 3: 3000000000 Hz
+// pit cmd ch2 0xb0 ch0 0x34 divisor 100 Hz 11932 latch 10 ms 11931
+// pit ch2 writes 0x6101 0x43b0 0x429b 0x422e
+// pit ch0 writes 0x4334 0x409c 0x402e
+// pit wait polls 4, timeout -1
+use hpet;
+use acpi;
+use vec;
+use string;
+
+var g_regs: Vec<i64> = Vec::new();
+var g_last: Vec<i64> = Vec::new();
+var g_clk: Vec<i64> = Vec::new();
+
+fn h(v: i64) -> str {
+    return "0x" + int_to_hex(v);
+}
+
+fn hx8(v: i64) -> str {
+    var d: str = "0123456789abcdef";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 7;
+    while i >= 0 {
+        out.push(str_byte_at(d, (v >> (i * 4)) & 15));
+        i = i - 1;
+    }
+    return "0x" + str_from_bytes(out);
+}
+
+fn rrd(off: i64) -> i64 {
+    return g_regs.get(off / 8);
+}
+
+fn rwr(off: i64, v: i64) {
+    g_last.set(0, off);
+    g_last.set(1, v);
+    if off == HPET_GINTR_STA {
+        g_regs.set(off / 8, g_regs.get(off / 8) & ~v);
+        return;
+    }
+    g_regs.set(off / 8, v);
+}
+
+// fake clocks: the reference advances 14318 ticks per read (1 ms at
+// 14.318 MHz), the TSC 3,000,000 cycles in the same time
+fn ref_read() -> i64 {
+    g_clk.set(0, g_clk.get(0) + 14318);
+    g_clk.set(1, g_clk.get(1) + 3000000);
+    return g_clk.get(0);
+}
+
+fn tsc_read() -> i64 {
+    return g_clk.get(1);
+}
+
+fn port61() -> i64 {
+    g_clk.set(2, g_clk.get(2) + 1);
+    if g_clk.get(2) >= 4 { return 0x21; }
+    return 0x01;
+}
+
+fn never() -> i64 {
+    return 0;
+}
+
+fn put(b: &mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        b.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn hpet_table() -> Vec<i64> {
+    var t: Vec<i64> = Vec::new();
+    val sig: str = "HPET";
+    var i: i64 = 0;
+    while i < 4 { t.push(str_byte_at(sig, i)); i = i + 1; }
+    put(&mut t, 56, 4);
+    put(&mut t, 1, 1);
+    put(&mut t, 0, 1);
+    val oem: str = "FIDES FIDESTBL";
+    i = 0;
+    while i < 14 { t.push(str_byte_at(oem, i)); i = i + 1; }
+    put(&mut t, 1, 4);
+    put(&mut t, 0x20444946, 4);
+    put(&mut t, 1, 4);
+    put(&mut t, 0x8086A201, 4);
+    put(&mut t, 0, 1);
+    put(&mut t, 64, 1);
+    put(&mut t, 0, 1);
+    put(&mut t, 0, 1);
+    put(&mut t, 0xFED00000, 8);
+    put(&mut t, 0, 1);
+    put(&mut t, 128, 2);
+    put(&mut t, 0, 1);
+    var sum: i64 = 0;
+    i = 0;
+    while i < t.len() { sum = sum + t.get(i); i = i + 1; }
+    t.set(9, (256 - sum % 256) % 256);
+    return t;
+}
+
+fn ports(w: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < w.len() {
+        s = s + " " + h(w.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    g_regs = Vec::filled(128, 0);
+    g_last = Vec::filled(2, 0);
+    g_clk = Vec::filled(3, 0);
+    val q: HpetCaps = hpet_caps_decode(0x009896808086A201);
+    println("qemu caps rev " + int_to_str(q.rev) + " timers " + int_to_str(q.timers) + " 64bit " + bool_to_str(q.counter64) + " legacy " + bool_to_str(q.legacy_capable) + " vendor " + h(q.vendor) + " period " + int_to_str(q.period_fs) + " fs valid " + bool_to_str(q.valid));
+    println("qemu freq " + int_to_str(hpet_freq_hz(q.period_fs)) + " Hz");
+    val p: i64 = 69841279;
+    println("ich period " + int_to_str(p) + " fs freq " + int_to_str(hpet_freq_hz(p)) + " Hz, 1 ms = " + int_to_str(hpet_ns_to_ticks(1000000, p)) + " ticks, 1 s = " + int_to_str(hpet_ns_to_ticks(1000000000, p)) + " ticks");
+    println("14318 ticks = " + int_to_str(hpet_ticks_to_ns(14318, p)) + " ns");
+    println("bad period valid " + bool_to_str(hpet_caps_decode(0x05F5E1018086A201).valid));
+
+    g_regs.set(HPET_GCAP_ID / 8, 0x009896808086A201);
+    g_regs.set(hpet_tn_conf(0) / 8, 0x00F0080000000030);
+    g_regs.set(hpet_tn_conf(1) / 8, 0x00F0080000000020);
+    val b: HpetBus = HpetBus { rd: rrd, wr: rwr };
+    val tc: HpetTimerCaps = hpet_timer_caps(hpet_read(&b, hpet_tn_conf(0)));
+    println("timer0 caps periodic " + bool_to_str(tc.periodic) + " wide " + bool_to_str(tc.wide) + " fsb " + bool_to_str(tc.fsb) + " routes " + hx8(tc.routes) + " first " + int_to_str(hpet_first_route(tc.routes)));
+    g_regs.set(HPET_MAIN_CNT / 8, 777);
+    val ok: bool = hpet_periodic(&b, 0, 2, 1000000);
+    println("periodic ok " + bool_to_str(ok) + " conf " + h(hpet_read(&b, hpet_tn_conf(0)) & 0xFFFF) + " cmp " + int_to_str(hpet_read(&b, hpet_tn_cmp(0))) + " gen " + h(hpet_read(&b, HPET_GEN_CONF)) + " counter " + int_to_str(hpet_counter(&b)));
+    g_regs.set(HPET_MAIN_CNT / 8, 1234567);
+    val tgt: i64 = hpet_oneshot(&b, 1, 2, 500);
+    println("oneshot target 1234567 + 500 = " + int_to_str(tgt) + " conf " + h(hpet_read(&b, hpet_tn_conf(1)) & 0xFFFF));
+    println("timer1 periodic " + bool_to_str(hpet_periodic(&b, 1, 2, 10)));
+    g_regs.set(HPET_GINTR_STA / 8, 0x5);
+    hpet_ack(&b, 2);
+    println("ack wrote " + h(g_last.get(1)));
+
+    val tb: HpetTable = hpet_table_parse(hpet_table());
+    println("table valid " + bool_to_str(tb.valid) + " addr " + h(tb.address) + " id " + h(tb.block_id) + " min tick " + int_to_str(tb.min_tick) + " number " + int_to_str(tb.number));
+
+    println("muldiv " + int_to_str(hpet_muldiv(0x7FFFFFFFFFFFFFFF, 3, 7)) + " " + int_to_str(hpet_muldiv(1000000000000000, 1000000, 69841279)) + " " + int_to_str(hpet_muldiv(7, 1, 1)));
+    val ms: MultShift = hpet_calc_mult_shift(3000000000, 1000000000, 600);
+    println("mult/shift 3 GHz " + int_to_str(ms.mult) + " " + int_to_str(ms.shift) + " -> 5 s = " + int_to_str(hpet_cyc2ns(15000000000, ms)) + " ns");
+    val mh: MultShift = hpet_calc_mult_shift(14318180, 1000000000, 600);
+    println("mult/shift HPET " + int_to_str(mh.mult) + " " + int_to_str(mh.shift) + " -> 1 s = " + int_to_str(hpet_cyc2ns(14318180, mh)) + " ns");
+    println("delta wrap 32-bit " + int_to_str(tsc_counter_delta(0xFFFFFFF8, 8, 32)) + ", 64-bit " + int_to_str(tsc_counter_delta(10, 5, 64)));
+    val f1: i64 = tsc_calibrate_once(tsc_read, ref_read, 14318000, 32, 143180);
+    val f3: i64 = tsc_calibrate(tsc_read, ref_read, 14318000, 32, 143180, 3);
+    println("tsc " + int_to_str(f1) + " Hz best of 3: " + int_to_str(f3) + " Hz");
+
+    println("pit cmd ch2 " + h(pit_command(2, 3, 0)) + " ch0 " + h(pit_command(0, 3, 2)) + " divisor 100 Hz " + int_to_str(pit_divisor(100)) + " latch 10 ms " + int_to_str(pit_ch2_latch(10)));
+    println("pit ch2 writes" + ports(pit_ch2_start(pit_ch2_latch(10), 0x02)));
+    println("pit ch0 writes" + ports(pit_ch0_periodic(100)));
+    println("pit wait polls " + int_to_str(pit_ch2_wait(port61, 10)) + ", timeout " + int_to_str(pit_ch2_wait(never, 10)));
+}

@@ -64,6 +64,17 @@ pub struct SceneManager {
 // ─── Creation ─────────────────────────────────────────────────────────────
 
 /// Create a new empty scene manager.
+///
+/// Example:
+///   var sm = scene_manager_create();
+///   val orc = scene_register_template(&mut sm, "orc", 30, 16, 16);
+///   assert_eq(scene_find_template(sm, "orc"), orc);
+///   assert_eq(scene_find_template(sm, "elf"), -1);
+///   val e = scene_spawn_by_name(&mut sm, "orc", 1.0, 2.0);
+///   assert(e > 0);
+///   assert_eq(scene_get_entity(sm, e).health, 30);
+///   assert(scene_despawn(&mut sm, e));
+///   assert_eq(scene_spawn(&mut sm, 7, 0.0, 0.0), -1);
 pub fn scene_manager_create() -> SceneManager {
     return SceneManager {
         templates: Vec::new(), entities: Vec::new(), next_id: 1, next_tag: 1,
@@ -147,9 +158,9 @@ pub fn scene_despawn(sm: & mut SceneManager, entity_id: i64) -> bool {
     while i < sm.entities.len() {
         var e = sm.entities.get(i);
         if e.id == entity_id {
-            // Mark as inactive (soft delete — can't remove from Vec during iteration)
-            // In a real engine, this would swap-remove for O(1) deletion.
-            // Here we just set active = false.
+            // Mark as inactive (a soft delete: indexes and ids stay put)
+            e.active = false;
+            sm.entities.set(i, e);
             return true;
         }
         i = i + 1;
@@ -237,8 +248,10 @@ pub fn scene_update_entity(sm: & mut SceneManager, entity_id: i64, dt: f64) -> v
     if idx < 0 {
         return;
     }
-    // Can't mutate in-place with current Vec API
-    // In a real implementation: sm.entities[idx].x += vx * dt;
+    var e = sm.entities.get(idx);
+    e.x = e.x + e.vx * dt;
+    e.y = e.y + e.vy * dt;
+    sm.entities.set(idx, e);
 }
 
 /// Set an entity's velocity.
@@ -247,7 +260,10 @@ pub fn scene_set_velocity(sm: & mut SceneManager, entity_id: i64, vx: f64, vy: f
     if idx < 0 {
         return;
     }
-    // Can't mutate in-place with current Vec API
+    var e = sm.entities.get(idx);
+    e.vx = vx;
+    e.vy = vy;
+    sm.entities.set(idx, e);
 }
 
 /// Apply damage to an entity. Returns true if the entity died.
@@ -256,8 +272,19 @@ pub fn scene_damage(sm: & mut SceneManager, entity_id: i64, amount: i64) -> bool
     if idx < 0 {
         return false;
     }
-    // Can't mutate in-place — return false as placeholder
-    return false;
+    var e = sm.entities.get(idx);
+    if !e.active {
+        return false;
+    }
+    e.health = e.health - amount;
+    var died = false;
+    if e.health <= 0 {
+        e.health = 0;
+        e.active = false;
+        died = true;
+    }
+    sm.entities.set(idx, e);
+    return died;
 }
 
 /// Set an entity's tag (for grouping/filtering).
@@ -266,7 +293,9 @@ pub fn scene_set_tag(sm: & mut SceneManager, entity_id: i64, tag: i64) -> void {
     if idx < 0 {
         return;
     }
-    // Can't mutate in-place with current Vec API
+    var e = sm.entities.get(idx);
+    e.tag = tag;
+    sm.entities.set(idx, e);
 }
 
 // ─── Spatial Query ────────────────────────────────────────────────────────

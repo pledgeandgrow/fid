@@ -1,0 +1,126 @@
+// stdlib/adc: unipolar and bipolar transfer functions, integer millivolts, oversampling, moving average / EMA / median filters, two-point calibration, divider and NTC helpers, IIO value formula and scan-type decoding
+// Expected output:
+// 12-bit lsb uV: 805
+// 2048 -> mV: 1650
+// full 4095 -> mV: 3300
+// ads1115 7fff -> uV: 4095875
+// ads1115 8000 -> uV: -4096000
+// -1.0V -> code: -8000
+// 1.65V -> code: 2048
+// int mV: 1650 994
+// oversample 14-bit: 8190
+// too few: -1
+// average: 2048
+// mavg: 10 15 20 25 35
+// ema: 100 75 56
+// median: 10 10 11 11 11
+// cal x10000: 17504
+// cal inverse: 3685
+// divider mV: 4030
+// ln(10) x1e6: 2302585
+// ntc 10k: 2500
+// ntc 5k: 4146
+// iio uV: 994189
+// iio missing: cannot read /nonexistent/iio:device0/in_voltage0_raw
+// scan le:s12/16>>4: ok -13
+// scan be:u10/16>>6: ok 513
+// scan le:s16/16X2>>0: ok repeat 2 -2
+// scan junk: bad
+use adc;
+use encoding;
+use string;
+
+fn r(x: f64) -> i64 {
+    if x >= 0.0 {
+        return (x + 0.5) as i64;
+    }
+    return 0 - ((0.5 - x) as i64);
+}
+
+fn show_scan(t: str, bytes: Vec<i64>) {
+    val st: AdcScanType = adc_parse_scan_type(t);
+    if !st.ok {
+        println("scan junk: bad");
+        return;
+    }
+    var extra: str = "";
+    if st.repeat > 1 {
+        extra = "repeat " + int_to_str(st.repeat) + " ";
+    }
+    println("scan " + t + ": ok " + extra + int_to_str(adc_scan_decode(& st, & bytes, 0)));
+}
+
+fn main() {
+    val s12: AdcSpec = adc_spec(12, 3.3);
+    println("12-bit lsb uV: " + int_to_str((adc_lsb(& s12) * 1000000.0) as i64));
+    println("2048 -> mV: " + int_to_str(r(adc_to_volts(& s12, 2048) * 1000.0)));
+    val f12: AdcSpec = adc_spec_full(12, 3.3);
+    println("full 4095 -> mV: " + int_to_str(r(adc_to_volts(& f12, 4095) * 1000.0)));
+    val ads: AdcSpec = adc_spec_bipolar(16, 4.096);
+    println("ads1115 7fff -> uV: " + int_to_str(r(adc_to_volts(& ads, 0x7FFF) * 1000000.0)));
+    println("ads1115 8000 -> uV: " + int_to_str(r(adc_to_volts(& ads, 0x8000) * 1000000.0)));
+    println("-1.0V -> code: " + int_to_str(adc_from_volts(& ads, -1.0)));
+    println("1.65V -> code: " + int_to_str(adc_from_volts(& s12, 1.65)));
+    println("int mV: " + int_to_str(adc_to_mv_int(2048, 12, 3300)) + " " + int_to_str(adc_to_mv_int(1234, 12, 3300)));
+
+    var samples: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        samples.push(2047 + (i % 2));
+        i = i + 1;
+    }
+    println("oversample 14-bit: " + int_to_str(adc_oversample(& samples, 2)));
+    println("too few: " + int_to_str(adc_oversample(& samples, 3)));
+    println("average: " + int_to_str(adc_average(& samples)));
+
+    var ma: AdcMovingAvg = adc_mavg_new(4);
+    var outs: str = "";
+    i = 1;
+    while i <= 5 {
+        if i > 1 {
+            outs = outs + " ";
+        }
+        outs = outs + int_to_str(adc_mavg_push(& mut ma, 10 * i));
+        i = i + 1;
+    }
+    println("mavg: " + outs);
+    var ema: AdcEma = adc_ema_new(2);
+    val e1: i64 = adc_ema_push(& mut ema, 100);
+    val e2: i64 = adc_ema_push(& mut ema, 0);
+    val e3: i64 = adc_ema_push(& mut ema, 0);
+    println("ema: " + int_to_str(e1) + " " + int_to_str(e2) + " " + int_to_str(e3));
+    var med: AdcMedian = adc_median_new(5);
+    val spikes: Vec<i64> = hex_decode_bytes("0a0bfa0c0b");
+    outs = "";
+    i = 0;
+    while i < spikes.len() {
+        if i > 0 {
+            outs = outs + " ";
+        }
+        outs = outs + int_to_str(adc_median_push(& mut med, spikes.get(i)));
+        i = i + 1;
+    }
+    println("median: " + outs);
+
+    val cal: AdcCal = adc_cal_two_point(410, 0.5, 3685, 3.0);
+    println("cal x10000: " + int_to_str(r(adc_cal_apply(& cal, 2048) * 10000.0)));
+    println("cal inverse: " + int_to_str(r(adc_cal_inverse(& cal, 3.0))));
+    println("divider mV: " + int_to_str((adc_divider_vin(1.0, 10000.0, 3300.0) * 1000.0) as i64));
+    println("ln(10) x1e6: " + int_to_str(r(adc_ln(10.0) * 1000000.0)));
+    println("ntc 10k: " + int_to_str(r(adc_ntc_celsius(10000.0, 10000.0, 25.0, 3950.0) * 100.0)));
+    println("ntc 5k: " + int_to_str(r(adc_ntc_celsius(5000.0, 10000.0, 25.0, 3950.0) * 100.0)));
+
+    println("iio uV: " + int_to_str(r(adc_iio_millivolts(1234, 0.0, 0.805664062) * 1000.0)));
+    match adc_iio_read_mv("/nonexistent", 0, 0) {
+        Result::Ok(v) => {
+            println("iio missing: read " + float_to_str(v));
+        }
+        Result::Err(e) => {
+            println("iio missing: " + e);
+        }
+    }
+    show_scan("le:s12/16>>4", hex_decode_bytes("30ff"));
+    show_scan("be:u10/16>>6", hex_decode_bytes("8040"));
+    show_scan("le:s16/16X2>>0", hex_decode_bytes("feff0100"));
+    show_scan("xx", hex_decode_bytes("00"));
+}

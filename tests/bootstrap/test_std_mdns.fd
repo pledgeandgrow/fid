@@ -1,0 +1,144 @@
+// stdlib/mdns: mDNS queries (QU bit), a DNS-SD announcement with name compression checked byte for byte, decoding it back, the responder (PTR with additional records, known-answer suppression, SRV, A, enumeration), goodbye, escaped instance names, IPv6 text and malformed messages.
+// Expected output:
+// query: 000000000001000000000000055f68747470045f746370056c6f63616c00000c0001
+// query QU: class 8001
+// announce: 128 bytes, same as hand-encoded
+// decoded: 4 answers
+//   _ipp._tcp.local 4500 PTR Printer._ipp._tcp.local
+//   Printer._ipp._tcp.local 120 flush SRV 0 0 631 printer.local
+//   Printer._ipp._tcp.local 4500 flush TXT txtvers=1 rp=ipp/print
+//   printer.local 120 flush A 192.168.1.20
+// txt rp = ipp/print
+// respond PTR: 1 answers, 3 additional (SRV TXT A)
+// respond with known answer: 0 answers
+// respond SRV: Printer._ipp._tcp.local 120 flush SRV 0 0 631 printer.local + 1 additional
+// respond A (case-insensitive): printer.local 120 flush A 192.168.1.20
+// enumeration: _services._dns-sd._udp.local 4500 PTR _ipp._tcp.local
+// goodbye: ttls 0 0 0 0
+// escaped: My\.Printer._ipp._tcp.local has 4 labels, first My.Printer, decoded the same
+// ipv6: fe80::1 2001:db8::1:0:0:1 ::
+// malformed: 5 of 5 rejected
+use mdns;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hb(s: str) -> Vec<i64> {
+    return hex_decode_bytes(s);
+}
+
+var bad_ok: i64 = 0;
+var bad_n: i64 = 0;
+
+fn bad(h: str) {
+    bad_n = bad_n + 1;
+    val d: MdnsDecoded = mdns_decode(hb(h));
+    if !d.ok {
+        bad_ok = bad_ok + 1;
+    } else {
+        println("accepted " + h);
+    }
+}
+
+fn printer() -> MdnsService {
+    var s: MdnsService = mdns_service("Printer", "_ipp._tcp", "printer.local", 631);
+    s.txt.push("txtvers=1");
+    s.txt.push("rp=ipp/print");
+    s.ipv4.push(192);
+    s.ipv4.push(168);
+    s.ipv4.push(1);
+    s.ipv4.push(20);
+    return s;
+}
+
+fn kinds(v: Vec<MdnsRR>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        val r: MdnsRR = v.get(i);
+        if i > 0 {
+            s = s + " ";
+        }
+        if r.rtype == MDNS_SRV { s = s + "SRV"; }
+        if r.rtype == MDNS_TXT { s = s + "TXT"; }
+        if r.rtype == MDNS_A { s = s + "A"; }
+        if r.rtype == MDNS_PTR { s = s + "PTR"; }
+        if r.rtype == MDNS_AAAA { s = s + "AAAA"; }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val q: MdnsMsg = mdns_query("_http._tcp.local", MDNS_PTR, false, Vec::new());
+    println("query: " + hx(mdns_encode(&q)));
+    val qu: Vec<i64> = mdns_encode(&mdns_query("_http._tcp.local", MDNS_PTR, true, Vec::new()));
+    println("query QU: class " + hx(hb(str_slice(hx(qu), str_len(hx(qu)) - 4, str_len(hx(qu))))));
+
+    val svc: MdnsService = printer();
+    val ann: Vec<i64> = mdns_encode(&mdns_announce(&svc, false));
+    val want: str = "000084000000000400000000045f697070045f746370056c6f63616c00000c000100001194000a075072696e746572c00cc02700218001000000780010000000000277077072696e746572c016c0270010800100001194001709747874766572733d310c72703d6970702f7072696e74c04300018001000000780004c0a80114";
+    if hx(ann) == want {
+        println("announce: " + int_to_str(ann.len()) + " bytes, same as hand-encoded");
+    } else {
+        println("announce: DIFFERENT " + hx(ann));
+    }
+    val d: MdnsDecoded = mdns_decode(ann);
+    println("decoded: " + int_to_str(d.msg.answers.len()) + " answers");
+    var i: i64 = 0;
+    while i < d.msg.answers.len() {
+        println("  " + mdns_rr_text(&d.msg.answers.get(i)));
+        i = i + 1;
+    }
+    val txtrr: MdnsRR = d.msg.answers.get(2);
+    println("txt rp = " + mdns_txt_get(&txtrr.txt, "rp"));
+
+    var services: Vec<MdnsService> = Vec::new();
+    services.push(svc);
+    val r1: MdnsMsg = mdns_respond(&services, &mdns_query("_ipp._tcp.local", MDNS_PTR, false, Vec::new()));
+    println("respond PTR: " + int_to_str(r1.answers.len()) + " answers, " + int_to_str(r1.additional.len()) + " additional (" + kinds(r1.additional) + ")");
+    var known: Vec<MdnsRR> = Vec::new();
+    known.push(r1.answers.get(0));
+    val r2: MdnsMsg = mdns_respond(&services, &mdns_query("_ipp._tcp.local", MDNS_PTR, false, known));
+    println("respond with known answer: " + int_to_str(r2.answers.len()) + " answers");
+    val r3: MdnsMsg = mdns_respond(&services, &mdns_query("Printer._ipp._tcp.local", MDNS_SRV, true, Vec::new()));
+    println("respond SRV: " + mdns_rr_text(&r3.answers.get(0)) + " + " + int_to_str(r3.additional.len()) + " additional");
+    val r4: MdnsMsg = mdns_respond(&services, &mdns_query("PRINTER.local", MDNS_A, false, Vec::new()));
+    println("respond A (case-insensitive): " + mdns_rr_text(&r4.answers.get(0)));
+    val r5: MdnsMsg = mdns_respond(&services, &mdns_query(mdns_enum_name("local"), MDNS_PTR, false, Vec::new()));
+    println("enumeration: " + mdns_rr_text(&r5.answers.get(0)));
+
+    val bye: MdnsDecoded = mdns_decode(mdns_encode(&mdns_announce(&svc, true)));
+    var ttls: str = "";
+    i = 0;
+    while i < bye.msg.answers.len() {
+        val br: MdnsRR = bye.msg.answers.get(i);
+        ttls = ttls + " " + int_to_str(br.ttl);
+        i = i + 1;
+    }
+    println("goodbye: ttls" + ttls);
+
+    val esc: MdnsService = mdns_service("My.Printer", "_ipp._tcp", "p.local", 631);
+    val en: str = mdns_instance_name(&esc);
+    val labs: Vec<str> = mdns_labels(en);
+    val ed: MdnsDecoded = mdns_decode(mdns_encode(&mdns_announce(&esc, false)));
+    val e0: MdnsRR = ed.msg.answers.get(0);
+    var same: str = "decoded differently";
+    if e0.target == en {
+        same = "decoded the same";
+    }
+    println("escaped: " + en + " has " + int_to_str(labs.len()) + " labels, first " + labs.get(0) + ", " + same);
+
+    println("ipv6: " + mdns_ipv6_text(&hb("fe800000000000000000000000000001")) + " " + mdns_ipv6_text(&hb("20010db8000000000001000000000001")) + " " + mdns_ipv6_text(&hb("00000000000000000000000000000000")));
+
+    bad("000000000001000000000000c00c000c0001");      // pointer to itself
+    bad("000000000001000000000000c010000c0001");      // pointer forwards
+    bad("0000000000010000000000000561626364");        // label cut short
+    bad("00008400000000010000000001610000010001000000780005c0a8011400"); // A of 5 bytes
+    bad("000084000000000100000000016100000c000100000078000a0161");        // PTR data cut short
+    println("malformed: " + int_to_str(bad_ok) + " of " + int_to_str(bad_n) + " rejected");
+}

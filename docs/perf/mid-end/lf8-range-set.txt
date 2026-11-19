@@ -1,0 +1,102 @@
+LF8 (llvm-roadmap): the range set — several range facts per block
+====================================================================
+Nov 17. compiler/checks.fd, range analysis (peir_range_ops / peir_range_scan).
+
+What was there
+--------------
+The scan carried ONE refinement per block (PeirRanges.ref_*: a fact on a
+plain local or on a value). OP24 added facts of dominating blocks
+(PeirDomFacts e_loc/e_loc2 for locals, fv_* for values), LF8 (Nov 15-16)
+joins of identical single facts (peir_join_fact) and one assumed fact per
+loop header (PeirBackFacts h_*). So:
+  - a branch's fact replaced the fact the block had before it, and what a
+    block held at its end was only that one fact;
+  - a join kept a fact only when every way in carried the same single one
+    (so `i >= 0 ... i <= 1000` on one way and `i >= 10 ... i <= 20` on the
+    other gave i <= 1000, not [0, 1000]);
+  - a store `y = 3` said nothing flow-sensitive about y (only y's bounds
+    over all its stores);
+  - a loop header held one assumed local: a second loop variable that
+    needs the back-edge induction kept its checks.
+
+What changed
+------------
+PeirRanges.sf_loc/sf_lo/sf_hi: facts on plain locals in force at the
+current point of the scanned block (at most PEIR_SF_MAX = 8), besides
+ref_*. Facts on values keep going into cf_* (with peir_cf_add, which
+intersects instead of duplicating).
+  - Load of a plain local: narrowed by every sf fact on it.
+  - Store p = v: ends the facts on p (ref and sf, peir_sf_kill), then
+    p in [range of v] (peir_sf_add).
+  - Block end: ref_*, sf_*, cf_* (at most PEIR_XS_MAX = 24 entries) saved
+    flat per block (xs, x_s0, x_sn: kind 0 local / 1 value, id, lo, hi;
+    peir_xs_save).
+  - Block with one way in: its predecessor's whole set (peir_sf_inherit,
+    on top of the edge's branch fact from peir_edge_fact).
+  - Join: every (kind, id) all ways in carry, each edge being the
+    predecessor's end set plus its branch's fact on that edge
+    (peir_sf_edge), as the hull of their intervals (peir_join_set). A
+    predecessor not scanned yet (a back edge) makes the join keep nothing.
+    A predecessor with no way in itself (a dead block after a `return`) is
+    left out, unless the function has a TryUnwrap (whose edges iro_cfg
+    does not list: PeirRanges.plain_cfg).
+  - A value fact is never taken into the block that computes the value
+    (PeirRanges.def_b); a value fact a block starts with is recorded for the
+    blocks it dominates (peir_dom_vfact) when new or narrower.
+  - Loop headers: up to 1 + PEIR_LF_MORE (3) assumptions (PeirBackFacts
+    m_* beside h_*, lf.multi); the further ones enter the header's sf and
+    reach the body through the blocks' sets. peir_lf_step checks/moves one
+    assumption (the old logic of peir_lf_update, unchanged: held -> narrow
+    twice at most; else grow, widen after 2, drop when both ends open or
+    after 4). All of a header's assumptions are assumed together in each
+    scan; the final scan uses them only when an update found all held
+    (induction over execution steps, as before). New ones are picked in
+    the first 4 scans; after 10 scans the ones still moving are dropped,
+    one scan at a time (freeze mode, at most 3), then all.
+
+Soundness argument: every entry of a set is a fact that holds on the edge
+it comes from (end of predecessor, or the branch's condition on that edge);
+the hull at a join holds on each way in; a store's fact holds until the
+next store to the same plain local (plain locals are only loaded/stored,
+never addressed); values never change once computed, and a fact about a
+value is not carried into the block that recomputes it.
+
+Switch: FID_IROPT_OFF=rangeset (rangejoin turns it off too). With it off
+the analysis is exactly what it was (one fact per block, one assumption
+per header, the old 8-scan loop).
+
+Checked before the build (stage0 of Nov 16 + today's checks.fd)
+--------------------------------------------------------------
+  - `fid check compiler/checks.fd` (stage0): no errors.
+  - tests/tooling/range_set_main.fd (the analysis on hand-built IR,
+    ccompiled with stage0 + zig cc, so it runs today's checks.fd):
+      set on : hull unchecked, hull_fail checked, hull_v unchecked,
+               pick unchecked, walk2 x and y unchecked, walk2_fail x
+               unchecked, walk2_fail y checked
+      set off: hull, hull_v, pick, walk2 y checked; the rest as before.
+  - tests/tooling/range-set-check.sh with FID=stage0: harness 7/7 PASS,
+    every output check (pe_ir, C; set on/off; the earlier range tests)
+    PASS; the explain checks fail as expected (stage0 has not the change).
+
+Tests
+-----
+  tests/bootstrap/test_midend_range_set.fd           hull, pick, walk2
+  tests/bootstrap/test_midend_range_set_fail.fd      join with an unbounded way in
+  tests/bootstrap/test_midend_range_set_loop_fail.fd large store: y's assumption fails
+  tests/tooling/range_set_main.fd                    analysis harness
+  tests/tooling/range-set-check.sh                   the gate (SUITE=1, NAT=1)
+
+To validate with the final compiler ($FID)
+------------------------------------------
+  FID=$FID NAT=1 bash tests/tooling/range-set-check.sh        -> 0 failed
+  FID=$FID bash tests/tooling/range-loop-check.sh             -> 0 failed
+  FID=$FID bash tests/tooling/range-dom-check.sh              -> 0 failed
+  FID=$FID NAT=1 SUITE=1 bash tests/tooling/range-set-check.sh
+      -> the suite: only SAME lines (no DIFF/BUILD/VERIFY), pe_ir and --nat
+  Compile time: `time $FID dump-c compiler/main.fd > /dev/null` with and
+  without FID_IROPT_OFF=rangeset (codegen_c runs the analysis on every
+  function): expect a few percent at most; if much more, lower
+  PEIR_XS_MAX.
+If the suite shows a DIFF that cannot be fixed, set the default off by
+changing `r.sf_on = joins && !iro_named_off(..., "rangeset")` in
+peir_range_ops to require FID_IROPT_ON=rangeset.

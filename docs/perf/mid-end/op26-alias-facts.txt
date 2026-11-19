@@ -1,0 +1,69 @@
+OP26 (competitive roadmap) / LF3 (llvm roadmap): the language's alias facts
+in the mid-end query (compiler/iropt_me.fd), Nov 17.
+
+State before today
+  ime_may_alias answered from locals (LF1-LF3 for locals), parameters
+  (`&` / `&mut`, LF1, LF2) and fields; its users loadhoist, forward and
+  matchfacts were on by default (Nov 16), dse opt-in. An earlier run added
+  `linear` (a @linear struct parameter is held by its function alone:
+  ime_unescaped checks it as a local) and `placefwd` (ime_forward: one
+  place reached by two address instructions, ime_addr_same_place), both
+  opt-in, with test_midend_linear_alias.fd and
+  tests/tooling/linear-alias-check.sh. Never built.
+
+Today (written, not built: the whole tree is built once at the end)
+  1. linear and placefwd are in IME_DEFAULT_ON (FID_IROPT_OFF names them
+     off). linear-alias-check.sh now names them off for its "plain" and
+     "placefwd" builds.
+  2. A Vec's buffer in the query (LF3), pass name `vecalias`, on by
+     default. vecdata (OP9, opt-in) turns v.get(i) in a loop into
+     e = GetElemPtr(d, i); x = Load(e), d = Load(BitCast(h)) (header word
+     0). ime_addr now calls such an address kind 5: an element of the
+     buffer of header h, base the owner of h:
+       - a home slot (ime_vb_owners): a Vec<i64> local whose address only
+         loads and stores use, whose stores store 0 or a fresh owner (Vec
+         makers and shares, program functions' results; never Vec_get's
+         or an unwrap's), and whose header values go only to call
+         arguments, a return, stores back into it, and the data view;
+       - a Vec<i64> parameter.
+     Facts (ownership, proposal 0004: every owner holds its own header;
+     two headers share a buffer only until a write through either copies
+     it, vec_own; nothing in the IR stores into such a buffer by a kind-5
+     address, core's Vec functions stay calls):
+       - ime_may_alias: elements of two different owners, one a home slot,
+         never overlap; an element never overlaps an unescaped local; an
+         escaped local is no longer said to be disjoint from an element;
+       - ime_vb_call_writes (from ime_writes / ime_call_writes): a call
+         writes a home slot's elements only when given something derived
+         from that slot (ime_vb_root: its headers, data pointer, element
+         addresses, the slot); a parameter's, unless the call is Vec_get,
+         Vec_len, a p_print_* or a Vec_set / Vec_push of a home slot's
+         header.
+     ime_call_writes for a `&mut` parameter's place still counts a
+     kind-5 argument as unknown (a `&mut` may point into a buffer).
+  3. ime_forward: with placefwd, two GetElemPtr of the same base and
+     index values (through its map of reused loads) and the same element
+     type are one place (ime_same_elem). ime_function_passes runs
+     forwarding again after vecdata changed a function (only with
+     vecalias on, so FID_IROPT_OFF=vecalias gives today's pipeline).
+  4. FID_IROPT_STATS prints "iropt: vecalias N element reads reused"
+     (compiler/iropt.fd): reads of a Vec<i64> element made by vecdata that
+     forwarding reused.
+
+Tests
+  tests/bootstrap/test_midend_vec_alias.fd: v read, w.set, v read again
+  (v a parameter sharing its buffer with w; v and w home locals; a print
+  between); prints v afterwards (CoW kept v).
+  tests/tooling/vecalias-check.sh: output the same with vecdata on,
+  vecalias on and off; reused reads > 0 on, 0 off; fewer instructions on.
+
+Validation (with the final compiler $FID)
+  FID=$FID bash tests/tooling/vecalias-check.sh                  (0 FAILs)
+  FID=$FID TARGET=--nat OUT=build/vecalias-nat bash tests/tooling/vecalias-check.sh
+  FID=$FID bash tests/tooling/linear-alias-check.sh              (0 FAILs)
+  FID=$FID PASS=linear,placefwd bash tests/tooling/midend-pass-suite-check.sh
+  FID=$FID PASS=linear,placefwd EXTRA=--nat OUT=build/pass-suite-lp-nat \
+    bash tests/tooling/midend-pass-suite-check.sh
+  FID=$FID PASS=vecdata,vecalias bash tests/tooling/midend-pass-suite-check.sh
+  No DIFF / BUILD / VERIFY lines. If a name fails, it leaves
+  IME_DEFAULT_ON (compiler/iropt_me.fd) and the roadmap says why.

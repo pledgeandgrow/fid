@@ -1,0 +1,199 @@
+// VF5, the machine layer's smaller passes (compiler/nat_ir.fd, each with a
+// switch in docs/verification/kill-switches.md), one section each:
+//   lea       x86-64 three-operand adds as one LEA: both operands live on
+//   leaf      frameless leaf functions: a leaf with many values and one
+//             that calls nothing but divides (it may panic: not a leaf)
+//   tailcall  sibling calls in tail position as a jump: with more
+//             arguments than registers, fewer arguments than the caller,
+//             the arguments in another order
+//   retregs   one- and two-word results in registers: Option, Result, a
+//             two-word struct, read field by field
+//   xmmcache  x86-64 xmm0/xmm1 mirrors: f64 values alternated with calls
+//             and integer conversions
+//   mirfold   constant compares and double extensions folded
+//   relax     short branches where the target is in reach: a loop whose
+//             body is long, so its branches need the long forms
+// Each line prints a value the pass changes when it is wrong.
+//
+// Expected output:
+// 17 12 5
+// 2310 7
+// 55 4950 36 21
+// 7 -1 30 41 8
+// 13.5
+// 27
+// 6.75
+// 1 0 1 1
+// 98 255
+// 1453
+
+struct Two {
+    a: i64,
+    b: i64,
+}
+
+fn lea3(a: i64, b: i64) -> str {
+    val s: i64 = a + b;
+    val t: i64 = a + 7;
+    return int_to_str(s + t - a - 7 + 5) + " " + int_to_str(a + b) + " " + int_to_str(a);
+}
+
+fn leaf_many(a: i64, b: i64, c: i64) -> i64 {
+    val d: i64 = a * b + c;
+    val e: i64 = d - a;
+    val f: i64 = e * 2 + b;
+    val g: i64 = f - c + d;
+    val h: i64 = g * 3 - e;
+    return a * 0 + b * 0 + c * 0 + d * 0 + e * 0 + f * 0 + g * 0 + h * 0 + 2310;
+}
+
+fn leaf_div(a: i64, b: i64) -> i64 {
+    return a / b;
+}
+
+fn sum_to(n: i64, acc: i64) -> i64 {
+    if n == 0 {
+        return acc;
+    }
+    return sum_to(n - 1, acc + n);
+}
+
+fn count_down(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
+    if n == 0 {
+        return a + b + c + d + e + f + g;
+    }
+    return count_down(n - 1, b, c, d, e, f, g, a);
+}
+
+fn fib_tail(n: i64, a: i64, b: i64) -> i64 {
+    if n == 0 {
+        return a;
+    }
+    return fib_tail(n - 1, b, a + b);
+}
+
+fn take_two(x: i64, y: i64) -> i64 {
+    return x * 2 + y;
+}
+
+fn three_to_two(x: i64, y: i64, z: i64) -> i64 {
+    return take_two(z, x + y);
+}
+
+fn find(v: Vec<i64>, x: i64) -> Option<i64> {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn checked_div(a: i64, b: i64) -> Result<i64, str> {
+    if b == 0 {
+        return Result::Err("zero");
+    }
+    return Result::Ok(a / b);
+}
+
+fn make_two(k: i64) -> Two {
+    return Two { a: k * 10, b: k + 1 };
+}
+
+fn half(x: f64) -> f64 {
+    return x / 2.0;
+}
+
+fn bump_f(x: f64) -> f64 {
+    return x + 1.5;
+}
+
+fn mirfold(x: i64) -> str {
+    val b: u8 = (x as u8);
+    val w: i64 = ((b as u16) as i64);
+    var s: str = "";
+    if 3 < 5 { s = s + "1"; } else { s = s + "0"; }
+    if x > x + 1 { s = s + " 1"; } else { s = s + " 0"; }
+    if w == 98 { s = s + " 1"; } else { s = s + " 0"; }
+    if ((w as u8) as i64) == w { s = s + " 1"; } else { s = s + " 0"; }
+    return s;
+}
+
+fn long_loop(n: i64) -> i64 {
+    var a: i64 = 1;
+    var b: i64 = 2;
+    var c: i64 = 3;
+    var i: i64 = 0;
+    while i < n {
+        a = a + b * 3 - c;
+        b = b + a % 7;
+        c = c + (a ^ b) % 5;
+        if a > 1000 {
+            a = a - 997;
+        }
+        if b > 1000 {
+            b = b - 991;
+        }
+        if c > 1000 {
+            c = c - 983;
+        }
+        a = a + (b & 15);
+        b = b + (c | 1) % 9;
+        c = c + (a + b) % 11;
+        if (a + b + c) % 2 == 0 {
+            a = a + 1;
+        } else {
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return a + b + c;
+}
+
+fn main() -> i64 {
+    println(lea3(5, 7));
+    println(int_to_str(leaf_many(3, 4, 5)) + " " + int_to_str(leaf_div(21, 3)));
+    println(int_to_str(fib_tail(10, 0, 1)) + " " + int_to_str(sum_to(99, 0)) + " " + int_to_str(count_down(5, 1, 2, 3, 4, 5, 6, 15)) + " " + int_to_str(three_to_two(4, 5, 6)));
+
+    var v: Vec<i64> = Vec::new();
+    v.push(4);
+    v.push(9);
+    v.push(16);
+    var fi: i64 = 0 - 1;
+    match find(v, 16) {
+        Option::Some(i) => { fi = i; }
+        Option::None => { fi = 0 - 2; }
+    }
+    var fn2: i64 = 0;
+    match find(v, 5) {
+        Option::Some(i) => { fn2 = i; }
+        Option::None => { fn2 = 0 - 1; }
+    }
+    var q: i64 = 0;
+    match checked_div(90, 3) {
+        Result::Ok(x) => { q = x; }
+        Result::Err(_) => { q = 0 - 1; }
+    }
+    match checked_div(1, 0) {
+        Result::Ok(_) => { q = q + 1000; }
+        Result::Err(_) => { q = q + 0; }
+    }
+    val t: Two = make_two(4);
+    println(int_to_str(fi + 5) + " " + int_to_str(fn2) + " " + int_to_str(q) + " " + int_to_str(t.a + 1) + " " + int_to_str(t.b + 3));
+
+    var x: f64 = 12.0;
+    x = bump_f(x);
+    val xi: i64 = (x * 2.0) as i64;
+    val h: f64 = half(x);
+    println(x);
+    println(xi);
+    println(h);
+
+    println(mirfold(98));
+    val big: i64 = 255;
+    println(int_to_str(98) + " " + int_to_str(((big as u8) as i64)));
+    println(long_loop(50));
+    return 0;
+}

@@ -65,6 +65,28 @@ const PE_M_TELLDIR: i64 = 39;
 const PE_M_SEEKDIR: i64 = 40;
 const PE_M_CLOSEDIR: i64 = 41;
 const PE_M_DUP: i64 = 42;
+const PE_M_SOCKET: i64 = 43;
+const PE_M_BIND: i64 = 44;
+const PE_M_LISTEN: i64 = 45;
+const PE_M_ACCEPT: i64 = 46;
+const PE_M_CONNECT: i64 = 47;
+const PE_M_SENDTO: i64 = 48;
+const PE_M_RECVFROM: i64 = 49;
+const PE_M_SETSOCKOPT: i64 = 50;
+const PE_M_GETSOCKOPT: i64 = 51;
+const PE_M_POLL: i64 = 52;
+const PE_M_FCNTL: i64 = 53;
+const PE_M_FORK: i64 = 54;
+const PE_M_EXECVE: i64 = 55;
+const PE_M_WAIT4: i64 = 56;
+const PE_M_SETITIMER: i64 = 57;
+const PE_M__EXIT: i64 = 58;        // _exit(): a forked child that could not exec
+const PE_M_GETPPID: i64 = 59;
+const PE_M_GETUID: i64 = 60;
+const PE_M_GETGID: i64 = 61;
+const PE_M_KQUEUE: i64 = 62;
+const PE_M_KEVENT: i64 = 63;
+const PE_M_PIPE: i64 = 64;
 
 fn pe_m(k: i64, a: i64, b: i64, c: i64) -> i64 {
     return nat_mac_call(k, a, b, c, 0, 0, 0);
@@ -74,6 +96,7 @@ var pe_mac_top: i64 = 0;        // the start block (nat_start_sp reads it)
 var pe_mac_info: i64 = 0;       // the siginfo handed to pe_on_signal
 var pe_mac_tls_key: i64 = 0;    // *i64: the pthread key for the thread block
 var pe_mac_key_ready: bool = false;
+var pe_mac_forked: bool = false;  // in a child of fork(): exit with _exit
 
 // ─── Start ──────────────────────────────────────────────────────────────
 
@@ -387,8 +410,19 @@ fn pe_mac_sig_to_linux(s: i64) -> i64 {
 
 /// The macOS signal handler's call into the shared runtime: macOS numbers
 /// and siginfo_t (si_addr at 24) become Linux ones (si_addr at 16), in
-/// pe_mac_info. Called by nat_ir's macOS nat_sig_handler.
-pub fn pe_mac_on_signal(sig: i64, info: i64) {
+/// pe_mac_info. Called by nat_ir's macOS nat_sig_handler with the Darwin
+/// ucontext uc: SIGPROF is a sample of the profiler (sys.fd, DB9) read
+/// from uc's mcontext, SIGUSR2 with the profiler on asks for its report.
+pub fn pe_mac_on_signal(sig: i64, info: i64, uc: i64) {
+    var lsig: i64 = pe_mac_sig_to_linux(sig);
+    if lsig == 27 && pe_prof_m != 0 {
+        pe_mac_prof_sample(uc);
+        return;
+    }
+    if lsig == 12 && pe_prof_m != 0 {
+        pe_prof_request();
+        return;
+    }
     var addr: i64 = 0;
     if info != 0 { addr = pe_ld(info + 24); }
     if pe_mac_info != 0 {
@@ -400,19 +434,468 @@ pub fn pe_mac_on_signal(sig: i64, info: i64) {
     pe_on_signal(pe_mac_sig_to_linux(sig), info);
 }
 
+/// The interrupted pc, frame pointer, sp and link register of a Darwin
+/// ucontext: uc_mcontext (a pointer) at 48; x86-64 mcontext64 is the
+/// exception state (16 bytes) then rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp,
+/// r8-r15, rip; arm64's the exception state (16) then x0-x28, fp, lr, sp,
+/// pc. One sample of the profiler (sys.fd pe_prof_tick_regs).
+fn pe_mac_prof_sample(uc: i64) {
+    if uc == 0 { return; }
+    var mc: i64 = pe_ld(uc + 48);
+    if mc == 0 { return; }
+    if nat_arch() == 3 {
+        pe_prof_tick_regs(pe_ld(mc + 144), pe_ld(mc + 64), pe_ld(mc + 72), 0);
+        return;
+    }
+    pe_prof_tick_regs(pe_ld(mc + 272), pe_ld(mc + 248), pe_ld(mc + 264), pe_ld(mc + 256));
+}
+
 // ─── Signals ────────────────────────────────────────────────────────────
 
 fn pe_mac_sigaction(sig: i64, act: i64) -> i64 {
     // base.fd builds a Linux struct sigaction (handler at 0, flags at 8).
     // macOS wants { handler (8), sa_mask uint32 (8), sa_flags int (12) },
-    // with SA_SIGINFO = 0x40. Translate into a temporary.
+    // with SA_SIGINFO = 0x40, SA_ONSTACK = 0x1, SA_RESTART = 0x2 (Linux
+    // 0x08000000 and 0x10000000). Translate into a temporary.
     var ma: i64 = pert_malloc(16);
     pe_zero(ma, 16);
     pe_st(ma, pe_ld(act));                 // handler
+    var lf: i64 = pe_ld(act + 8);
+    var mf: i64 = 0x40;                    // SA_SIGINFO
+    if (lf & 0x08000000) != 0 { mf = mf | 1; }      // SA_ONSTACK
+    if (lf & 0x10000000) != 0 { mf = mf | 2; }      // SA_RESTART
     var i: i64 = 0;
-    while i < 4 { pe_stb(ma + 12 + i, (0x40 >> (i * 8)) & 255); i = i + 1; }  // SA_SIGINFO
-    var r: i64 = pe_m(PE_M_SIGACTION, pe_mac_sig_from_linux(sig), ma, 0);
+    while i < 4 { pe_stb(ma + 12 + i, (mf >> (i * 8)) & 255); i = i + 1; }
+    var r: i64 = pe_mac_errno_ret(pe_m(PE_M_SIGACTION, pe_mac_sig_from_linux(sig), ma, 0));
     pert_free(ma);
+    return r;
+}
+
+/// sigaltstack: Linux stack_t { sp, flags int, size } -> macOS { sp, size,
+/// flags int }; SS_DISABLE is 2 on Linux, 4 on macOS. The old stack is not
+/// reported (the runtime passes none).
+fn pe_mac_sigaltstack(ss: i64) -> i64 {
+    if ss == 0 { return 0; }
+    var ms: i64 = pert_malloc(24);
+    pe_zero(ms, 24);
+    pe_st(ms, pe_ld(ss));
+    pe_st(ms + 8, pe_ld(ss + 16));
+    var fl: i64 = 0;
+    if (pe_ld(ss + 8) & 2) != 0 { fl = 4; }
+    pe_st(ms + 16, fl);
+    var r: i64 = pe_mac_errno_ret(pe_m(PE_M_SIGALTSTACK, ms, 0, 0));
+    pert_free(ms);
+    return r;
+}
+
+// ─── Sockets and poll ───────────────────────────────────────────────────
+// BSD sockaddrs start with a length byte and a one-byte family (Linux: a
+// 16-bit family); AF_INET6 is 30 (Linux 10). Socket options at SOL_SOCKET
+// (0xffff; Linux 1) have their own numbers. MSG_NOSIGNAL does not exist:
+// every socket gets SO_NOSIGPIPE instead.
+
+/// A copy of Linux sockaddr sa (len bytes) in the BSD layout; the caller
+/// frees it.
+fn pe_mac_sa(sa: i64, len: i64) -> i64 {
+    var n: i64 = len;
+    if n < 16 { n = 16; }
+    var t: i64 = pert_malloc(n);
+    pe_zero(t, n);
+    var i: i64 = 0;
+    while i < len {
+        pe_stb(t + i, pe_ldb(sa + i));
+        i = i + 1;
+    }
+    var fam: i64 = pe_ldb(sa) | (pe_ldb(sa + 1) << 8);
+    if fam == 10 { fam = 30; }
+    pe_stb(t, len & 255);
+    pe_stb(t + 1, fam & 255);
+    return t;
+}
+
+/// Store the low 32 bits of v at addr (a socklen_t, u32 on both systems).
+fn pe_mac_st32(addr: i64, v: i64) {
+    var k: i64 = 0;
+    while k < 4 { pe_stb(addr + k, (v >> (k * 8)) & 255); k = k + 1; }
+}
+
+/// MI16: the reverse of pe_mac_sa. t is a BSD sockaddr of tlen bytes the
+/// kernel filled (recvfrom's or accept's peer); sa/lenp the caller's Linux
+/// buffer and its socklen_t (capacity in, length out, as Linux: the full
+/// length even when the buffer was smaller and the copy cut). The bytes
+/// after the family (port, IPv4/IPv6 address, flow and scope id, a unix
+/// path) sit at the same offsets in both layouts; the family becomes a
+/// 16-bit Linux number (AF_INET6 30 -> 10).
+fn pe_mac_sa_back(t: i64, tlen: i64, sa: i64, lenp: i64) {
+    if sa == 0 || lenp == 0 { return; }
+    var cap: i64 = pe_ld(lenp) & 0xFFFFFFFF;
+    var n: i64 = tlen;
+    if n < 2 { n = 2; }
+    var fam: i64 = pe_ldb(t + 1);
+    if fam == 30 { fam = 10; }
+    var i: i64 = 2;
+    while i < n && i < cap {
+        pe_stb(sa + i, pe_ldb(t + i));
+        i = i + 1;
+    }
+    if cap >= 1 { pe_stb(sa, fam & 255); }
+    if cap >= 2 { pe_stb(sa + 1, (fam >> 8) & 255); }
+    var ln: i64 = n;
+    // BSD AF_UNIX addresses are 106 bytes long, Linux's 110: same path
+    if fam == 1 && ln < 110 { ln = ln + 4; }
+    pe_mac_st32(lenp, ln);
+}
+
+/// recvfrom(fd, buf, n, flags, src, lenp): the sender's address comes back
+/// in the Linux layout when src is given (UDP: who sent this datagram).
+fn pe_mac_recvfrom(fd: i64, buf: i64, n: i64, flags: i64, src: i64, lenp: i64) -> i64 {
+    if src == 0 || lenp == 0 {
+        return pe_mac_errno_ret(nat_mac_call(PE_M_RECVFROM, fd, buf, n, pe_mac_msg(flags), 0, 0));
+    }
+    var t: i64 = pert_malloc(136);          // sockaddr_storage (128) + its length
+    pe_zero(t, 136);
+    pe_st(t + 128, 128);
+    var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_RECVFROM, fd, buf, n, pe_mac_msg(flags), t, t + 128));
+    if r >= 0 {
+        var tl: i64 = pe_ld(t + 128) & 0xFFFFFFFF;
+        if tl > 128 { tl = 128; }
+        if tl == 0 {
+            // a connected socket's peer is not reported: Linux says length 0
+            pe_mac_st32(lenp, 0);
+        } else {
+            pe_mac_sa_back(t, tl, src, lenp);
+        }
+    }
+    pert_free(t);
+    return r;
+}
+
+fn pe_mac_nosigpipe(s: i64) {
+    var on: i64 = pert_malloc(8);
+    pe_st(on, 1);
+    nat_mac_call(PE_M_SETSOCKOPT, s, 0xFFFF, 0x1022, on, 4, 0);   // SO_NOSIGPIPE
+    pert_free(on);
+}
+
+/// A Linux SOL_SOCKET option name -> macOS (-1: none).
+fn pe_mac_sockopt(name: i64) -> i64 {
+    if name == 2 { return 4; }             // SO_REUSEADDR
+    if name == 4 { return 0x1007; }        // SO_ERROR
+    if name == 6 { return 0x20; }          // SO_BROADCAST
+    if name == 7 { return 0x1001; }        // SO_SNDBUF
+    if name == 8 { return 0x1002; }        // SO_RCVBUF
+    if name == 9 { return 8; }             // SO_KEEPALIVE
+    if name == 13 { return 0x80; }         // SO_LINGER
+    if name == 15 { return 0x200; }        // SO_REUSEPORT
+    if name == 20 { return 0x1006; }       // SO_RCVTIMEO
+    if name == 21 { return 0x1005; }       // SO_SNDTIMEO
+    return 0 - 1;
+}
+
+/// set/getsockopt(fd, level, name, val, len): the level and name in macOS
+/// numbers; SO_ERROR's value comes back as a Linux errno.
+fn pe_mac_sockopt_call(get: bool, fd: i64, level: i64, name: i64, val: i64, len: i64) -> i64 {
+    var lv: i64 = level;
+    var nm: i64 = name;
+    if level == 1 {
+        lv = 0xFFFF;
+        nm = pe_mac_sockopt(name);
+        if nm < 0 { return 0 - 92; }                             // ENOPROTOOPT
+    } else if level == 41 && name == 26 {
+        nm = 27;                                                 // IPV6_V6ONLY
+    }
+    if !get {
+        return pe_mac_errno_ret(nat_mac_call(PE_M_SETSOCKOPT, fd, lv, nm, val, len, 0));
+    }
+    var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_GETSOCKOPT, fd, lv, nm, val, len, 0));
+    if r == 0 && level == 1 && name == 4 && val != 0 {
+        var e: i64 = pe_ld(val) & 0xFFFFFFFF;
+        if e != 0 {
+            var le: i64 = pe_mac_errno_linux(e);
+            var k: i64 = 0;
+            while k < 4 { pe_stb(val + k, (le >> (k * 8)) & 255); k = k + 1; }
+        }
+    }
+    return r;
+}
+
+/// Linux MSG_* flags -> macOS: MSG_NOSIGNAL dropped (SO_NOSIGPIPE),
+/// MSG_DONTWAIT 0x40 -> 0x80; MSG_OOB, MSG_PEEK the same.
+fn pe_mac_msg(f: i64) -> i64 {
+    var m: i64 = f & 3;
+    if (f & 0x40) != 0 { m = m | 0x80; }
+    if (f & 0x100) != 0 { m = m | 0x40; }      // MSG_WAITALL
+    return m;
+}
+
+/// O_NONBLOCK and O_APPEND between the Linux and macOS fcntl values.
+fn pe_mac_fl_to(f: i64) -> i64 {
+    var m: i64 = f & 3;
+    if (f & 2048) != 0 { m = m | 4; }
+    if (f & 1024) != 0 { m = m | 8; }
+    return m;
+}
+
+fn pe_mac_fl_from(m: i64) -> i64 {
+    var f: i64 = m & 3;
+    if (m & 4) != 0 { f = f | 2048; }
+    if (m & 8) != 0 { f = f | 1024; }
+    return f;
+}
+
+/// fcntl(fd, cmd, arg). fcntl is variadic: on arm64 its third argument is
+/// read from the stack, where nat_mac_call puts argument d, so arg goes in
+/// both c and d.
+fn pe_mac_fcntl(fd: i64, cmd: i64, arg: i64) -> i64 {
+    if cmd == 4 {                                                // F_SETFL
+        var a: i64 = pe_mac_fl_to(arg);
+        return pe_mac_errno_ret(nat_mac_call(PE_M_FCNTL, fd, 4, a, a, 0, 0));
+    }
+    var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_FCNTL, fd, cmd, arg, arg, 0, 0));
+    if cmd == 3 && r >= 0 { return pe_mac_fl_from(r); }         // F_GETFL
+    return r;
+}
+
+/// socket(domain, type, proto): SOCK_NONBLOCK / SOCK_CLOEXEC (Linux type
+/// bits) by fcntl; SO_NOSIGPIPE on every socket.
+fn pe_mac_socket(domain: i64, ty: i64, proto: i64) -> i64 {
+    var d: i64 = domain;
+    if d == 10 { d = 30; }
+    var s: i64 = pe_mac_errno_ret(pe_m(PE_M_SOCKET, d, ty & 15, proto));
+    if s < 0 { return s; }
+    pe_mac_nosigpipe(s);
+    if (ty & 2048) != 0 { pe_mac_fcntl(s, 4, 2048); }
+    if (ty & 0x80000) != 0 { nat_mac_call(PE_M_FCNTL, s, 2, 1, 1, 0, 0); }  // FD_CLOEXEC
+    return s;
+}
+
+/// accept4(fd, addr, len, flags): the peer address comes back in the Linux
+/// layout when addr is given (MI16).
+fn pe_mac_accept(fd: i64, addr: i64, len: i64, flags: i64) -> i64 {
+    var c: i64 = 0;
+    if addr == 0 || len == 0 {
+        c = pe_mac_errno_ret(pe_m(PE_M_ACCEPT, fd, 0, 0));
+    } else {
+        var t: i64 = pert_malloc(136);
+        pe_zero(t, 136);
+        pe_st(t + 128, 128);
+        c = pe_mac_errno_ret(pe_m(PE_M_ACCEPT, fd, t, t + 128));
+        if c >= 0 {
+            var tl: i64 = pe_ld(t + 128) & 0xFFFFFFFF;
+            if tl > 128 { tl = 128; }
+            pe_mac_sa_back(t, tl, addr, len);
+        }
+        pert_free(t);
+    }
+    if c < 0 { return c; }
+    pe_mac_nosigpipe(c);
+    if (flags & 2048) != 0 { pe_mac_fcntl(c, 4, 2048); }
+    return c;
+}
+
+/// bind / connect / sendto with an address: the BSD layout of it.
+fn pe_mac_addr_call(k: i64, fd: i64, sa: i64, len: i64) -> i64 {
+    if sa == 0 { return pe_mac_errno_ret(pe_m(k, fd, 0, len)); }
+    var t: i64 = pe_mac_sa(sa, len);
+    var r: i64 = pe_mac_errno_ret(pe_m(k, fd, t, len));
+    pert_free(t);
+    return r;
+}
+
+fn pe_mac_sendto(fd: i64, buf: i64, n: i64, flags: i64, sa: i64, len: i64) -> i64 {
+    if sa == 0 {
+        return pe_mac_errno_ret(nat_mac_call(PE_M_SENDTO, fd, buf, n, pe_mac_msg(flags), 0, 0));
+    }
+    var t: i64 = pe_mac_sa(sa, len);
+    var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_SENDTO, fd, buf, n, pe_mac_msg(flags), t, len));
+    pert_free(t);
+    return r;
+}
+
+/// ppoll(fds, n, timespec, sigmask, size) -> poll(fds, n, ms): struct
+/// pollfd and the POLL* bits are the same; no timespec waits forever.
+fn pe_mac_ppoll(fds: i64, n: i64, ts: i64) -> i64 {
+    var ms: i64 = 0 - 1;
+    if ts != 0 {
+        ms = pe_ld(ts) * 1000 + (pe_ld(ts + 8) + 999999) / 1000000;
+        if ms > 2147483647 { ms = 2147483647; }
+    }
+    return pe_mac_errno_ret(pe_m(PE_M_POLL, fds, n, ms));
+}
+
+// ─── epoll and eventfd over kqueue (MI16 / F7) ──────────────────────────
+// The reactor (conc.fd pe_ep_*) asks for epoll_create1, an eventfd that
+// ends a wait, epoll_ctl and epoll_pwait; without them every socket task
+// polls for itself. macOS has kqueue: an epoll fd is a kqueue, EPOLLIN and
+// EPOLLOUT are the fd's EVFILT_READ (-1) and EVFILT_WRITE (-2) filters
+// (both level-triggered, as epoll is by default), and the epoll data
+// travels in udata. The eventfd is a non-blocking pipe: the runtime holds
+// its read end, and a write to that fd goes to the write end
+// (pe_mac_efd_w). struct kevent (64-bit): { ident u64, filter i16,
+// flags u16, fflags u32, data i64, udata u64 }, 32 bytes.
+
+var pe_mac_efd_r: i64 = 0 - 1;     // the eventfd's read end (the fd it is)
+var pe_mac_efd_w: i64 = 0 - 1;     // its write end
+
+/// eventfd2: a non-blocking, close-on-exec pipe; its read end is the fd.
+/// One is all the reactor makes.
+fn pe_mac_eventfd() -> i64 {
+    if pe_mac_efd_r >= 0 { return 0 - 24; }                  // EMFILE
+    var fds: i64 = pert_malloc(8);
+    pe_st(fds, 0);
+    var r: i64 = pe_mac_errno_ret(pe_m(PE_M_PIPE, fds, 0, 0));
+    var w0: i64 = pe_ld(fds);
+    pert_free(fds);
+    if r < 0 { return r; }
+    var rd: i64 = w0 & 0xFFFFFFFF;
+    var wr: i64 = (w0 >> 32) & 0xFFFFFFFF;
+    pe_mac_fcntl(rd, 4, 2048);                               // O_NONBLOCK
+    pe_mac_fcntl(wr, 4, 2048);
+    nat_mac_call(PE_M_FCNTL, rd, 2, 1, 1, 0, 0);             // FD_CLOEXEC
+    nat_mac_call(PE_M_FCNTL, wr, 2, 1, 1, 0, 0);
+    pe_mac_efd_r = rd;
+    pe_mac_efd_w = wr;
+    return rd;
+}
+
+/// epoll_create1: a close-on-exec kqueue.
+fn pe_mac_epoll_create() -> i64 {
+    var kq: i64 = pe_mac_errno_ret(pe_m(PE_M_KQUEUE, 0, 0, 0));
+    if kq >= 0 { nat_mac_call(PE_M_FCNTL, kq, 2, 1, 1, 0, 0); }
+    return kq;
+}
+
+/// One change (fd, filter, flags) on kqueue kq: 0 or a negative errno.
+fn pe_mac_kchange(kq: i64, fd: i64, filter: i64, flags: i64, udata: i64) -> i64 {
+    var kev: i64 = pert_malloc(32);
+    pe_st(kev, fd);
+    pe_st(kev + 8, (filter & 0xFFFF) | ((flags & 0xFFFF) << 16));   // fflags 0
+    pe_st(kev + 16, 0);
+    pe_st(kev + 24, udata);
+    var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_KEVENT, kq, kev, 1, 0, 0, 0));
+    pert_free(kev);
+    return r;
+}
+
+/// The events / data of a Linux epoll_event (packed, 12 bytes, on x86-64:
+/// conc.fd pe_ep_event).
+fn pe_mac_ep_events(ev: i64) -> i64 {
+    return pe_ld(ev) & 0xFFFFFFFF;
+}
+
+fn pe_mac_ep_data(ev: i64) -> i64 {
+    if nat_arch() == 3 {
+        return ((pe_ld(ev) >> 32) & 0xFFFFFFFF) | ((pe_ld(ev + 8) & 0xFFFFFFFF) << 32);
+    }
+    return pe_ld(ev + 8);
+}
+
+/// epoll_ctl(kq, op, fd, ev): ADD (1) and MOD (3) both set the two
+/// filters to what ev asks for (kqueue's EV_ADD changes one that is
+/// there); DEL (2) drops both. Deleting a filter that is not there is not
+/// an error here.
+fn pe_mac_epoll_ctl(kq: i64, op: i64, fd: i64, ev: i64) -> i64 {
+    var events: i64 = 0;
+    var data: i64 = fd;
+    if op != 2 && ev != 0 {
+        events = pe_mac_ep_events(ev);
+        data = pe_mac_ep_data(ev);
+    }
+    if (events & (1 | 8192)) != 0 {                          // EPOLLIN | EPOLLRDHUP
+        var r: i64 = pe_mac_kchange(kq, fd, 0 - 1, 1, data);  // EVFILT_READ, EV_ADD
+        if r < 0 { return r; }
+    } else {
+        pe_mac_kchange(kq, fd, 0 - 1, 2, 0);                  // EV_DELETE
+    }
+    if (events & 4) != 0 {                                   // EPOLLOUT
+        var r2: i64 = pe_mac_kchange(kq, fd, 0 - 2, 1, data); // EVFILT_WRITE, EV_ADD
+        if r2 < 0 { return r2; }
+    } else {
+        pe_mac_kchange(kq, fd, 0 - 2, 2, 0);
+    }
+    return 0;
+}
+
+/// Store the low `n` bytes of v at p.
+fn pe_mac_stn(p: i64, v: i64, n: i64) {
+    var k: i64 = 0;
+    while k < n {
+        pe_stb(p + k, (v >> (k * 8)) & 255);
+        k = k + 1;
+    }
+}
+
+/// epoll_pwait(kq, buf, max, ms): kevent with a timeout (ms < 0: none),
+/// each event written back as a Linux epoll_event: EVFILT_READ is EPOLLIN,
+/// EVFILT_WRITE EPOLLOUT, EV_EOF adds EPOLLHUP (and EPOLLRDHUP on the
+/// read side), EV_ERROR EPOLLERR.
+fn pe_mac_epoll_wait(kq: i64, buf: i64, max: i64, ms: i64) -> i64 {
+    if max <= 0 { return 0 - 22; }                           // EINVAL
+    var n: i64 = max;
+    if n > 256 { n = 256; }
+    var kevs: i64 = pert_malloc(n * 32);
+    var ts: i64 = 0;
+    if ms >= 0 {
+        ts = pert_malloc(16);
+        pe_st(ts, ms / 1000);
+        pe_st(ts + 8, (ms % 1000) * 1000000);
+    }
+    var k: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_KEVENT, kq, 0, 0, kevs, n, ts));
+    var i: i64 = 0;
+    while i < k {
+        var kv: i64 = kevs + i * 32;
+        var w: i64 = pe_ld(kv + 8);
+        var filter: i64 = w & 0xFFFF;                        // 0xFFFF read, 0xFFFE write
+        var flags: i64 = (w >> 16) & 0xFFFF;
+        var events: i64 = 0;
+        if filter == 0xFFFF { events = 1; }                  // EPOLLIN
+        if filter == 0xFFFE { events = 4; }                  // EPOLLOUT
+        if (flags & 0x8000) != 0 {                           // EV_EOF
+            events = events | 16;                            // EPOLLHUP
+            if filter == 0xFFFF { events = events | 8192; }  // EPOLLRDHUP
+        }
+        if (flags & 0x4000) != 0 { events = events | 8; }   // EV_ERROR: EPOLLERR
+        var data: i64 = pe_ld(kv + 24);
+        if nat_arch() == 3 {
+            var e: i64 = buf + i * 12;
+            pe_mac_stn(e, events, 4);
+            pe_mac_stn(e + 4, data, 8);
+        } else {
+            pe_st(buf + i * 16, events);
+            pe_st(buf + i * 16 + 8, data);
+        }
+        i = i + 1;
+    }
+    pert_free(kevs);
+    if ts != 0 { pert_free(ts); }
+    return k;
+}
+
+// ─── Processes ──────────────────────────────────────────────────────────
+
+/// clone(SIGCHLD) with no shared memory is fork; threads come through
+/// nat_clone_thread (pe_mac_clone), not here.
+fn pe_mac_fork(flags: i64) -> i64 {
+    if (flags & 0x100) != 0 { return 0 - 38; }                  // CLONE_VM: no
+    var pid: i64 = pe_mac_errno_ret(pe_m(PE_M_FORK, 0, 0, 0));
+    if pid == 0 { pe_mac_forked = true; }
+    return pid;
+}
+
+/// wait4(pid, status, options, rusage): the status word is the same
+/// (exit code << 8, or the signal: a macOS number, made a Linux one).
+fn pe_mac_wait4(pid: i64, status: i64, options: i64, ru: i64) -> i64 {
+    var o: i64 = options & 1;                                    // WNOHANG
+    var r: i64 = pe_mac_errno_ret(nat_mac_call(PE_M_WAIT4, pid, status, o, ru, 0, 0));
+    if r > 0 && status != 0 {
+        var st: i64 = pe_ld(status) & 0xFFFFFFFF;
+        var sg: i64 = st & 127;
+        if sg != 0 && sg != 127 {
+            st = (st & (0 - 128)) | pe_mac_sig_to_linux(sg);
+            var k: i64 = 0;
+            while k < 4 { pe_stb(status + k, (st >> (k * 8)) & 255); k = k + 1; }
+        }
+    }
     return r;
 }
 
@@ -461,6 +944,82 @@ fn pe_mac_cpus() -> i64 {
     return n;
 }
 
+/// sysctlbyname(name) into out (room for max bytes, zeroed first): the
+/// number of bytes it wrote, or -1 when the name is unknown or too large.
+fn pe_mac_sysctl(name: str, out: i64, max: i64) -> i64 {
+    pe_zero(out, max);
+    var sz: i64 = pert_malloc(8);
+    pe_st(sz, max);
+    var r: i64 = nat_mac_call(PE_M_SYSCTLBYNAME, name as i64, out, sz, 0, 0, 0);
+    var got: i64 = pe_ld(sz);
+    pert_free(sz);
+    if r != 0 { return 0 - 1; }
+    return got;
+}
+
+/// An integer sysctl (an int or a quad, by the length it gives), or dflt.
+fn pe_mac_sysctl_int(name: str, dflt: i64) -> i64 {
+    var out: i64 = pert_malloc(8);
+    var got: i64 = pe_mac_sysctl(name, out, 8);
+    var v: i64 = dflt;
+    if got == 4 { v = pe_ld(out) & 0xFFFFFFFF; }
+    if got == 8 { v = pe_ld(out); }
+    pert_free(out);
+    return v;
+}
+
+/// MI16: sysinfo(si) in the Linux layout (112 bytes: uptime 0, loads[3] 8
+/// (scaled by 1 << 16), totalram 32, freeram 40, sharedram 48, bufferram
+/// 56, totalswap 64, freeswap 72, procs u16 80, totalhigh 88, freehigh 96,
+/// mem_unit u32 104), from sysctls: hw.memsize; vm.page_free_count plus
+/// vm.page_speculative_count pages of hw.pagesize (what vm_stat calls
+/// free); kern.boottime against the real-time clock; vm.loadavg (fixed
+/// point of its own fscale); vm.swapusage (xsu_total, xsu_avail). sharedram,
+/// bufferram and procs have no macOS counterpart and stay 0; mem_unit is 1
+/// (the sizes are bytes).
+fn pe_mac_sysinfo(si: i64) -> i64 {
+    if si == 0 { return 0 - 14; }                             // EFAULT
+    pe_zero(si, 112);
+    var b: i64 = pert_malloc(64);
+    var total: i64 = pe_mac_sysctl_int("hw.memsize", 0);
+    var pg: i64 = pe_mac_sysctl_int("hw.pagesize", 4096);
+    if pg <= 0 { pg = 4096; }
+    var freep: i64 = pe_mac_sysctl_int("vm.page_free_count", 0);
+    freep = freep + pe_mac_sysctl_int("vm.page_speculative_count", 0);
+    pe_st(si + 32, total);
+    var fr: i64 = freep * pg;
+    if total > 0 && fr > total { fr = total; }
+    pe_st(si + 40, fr);
+    // uptime: now - boot (struct timeval: seconds first)
+    if pe_mac_sysctl("kern.boottime", b, 16) >= 8 {
+        var boot: i64 = pe_ld(b);
+        pe_zero(b + 16, 16);
+        pe_m(PE_M_CLOCK_GETTIME, 0, b + 16, 0);
+        var up: i64 = pe_ld(b + 16) - boot;
+        if up > 0 { pe_st(si, up); }
+    }
+    // struct loadavg { fixpt_t ldavg[3]; long fscale; }
+    if pe_mac_sysctl("vm.loadavg", b, 24) >= 24 {
+        var fs: i64 = pe_ld(b + 16);
+        if fs > 0 {
+            var k: i64 = 0;
+            while k < 3 {
+                var l: i64 = (pe_ld(b + k * 4) & 0xFFFFFFFF) * 65536 / fs;
+                pe_st(si + 8 + k * 8, l);
+                k = k + 1;
+            }
+        }
+    }
+    // struct xsw_usage { u64 xsu_total, xsu_avail, xsu_used; u32 pagesize; bool }
+    if pe_mac_sysctl("vm.swapusage", b, 32) >= 16 {
+        pe_st(si + 64, pe_ld(b));
+        pe_st(si + 72, pe_ld(b + 8));
+    }
+    pe_mac_st32(si + 104, 1);
+    pert_free(b);
+    return 0;
+}
+
 fn pe_mac_affinity(size: i64, mask: i64) -> i64 {
     var n: i64 = pe_mac_cpus();
     pe_zero(mask, size);
@@ -476,13 +1035,25 @@ fn pe_mac_affinity(size: i64, mask: i64) -> i64 {
 /// macOS through libSystem.
 pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
     if n == 63 { return pe_mac_errno_ret(pe_m(PE_M_READ, a, b, c)); }         // read
-    if n == 64 { return pe_mac_errno_ret(pe_m(PE_M_WRITE, a, b, c)); }        // write
+    if n == 64 {                                                             // write
+        // the eventfd (a pipe): written at its other end
+        if a >= 0 && a == pe_mac_efd_r { return pe_mac_errno_ret(pe_m(PE_M_WRITE, pe_mac_efd_w, b, c)); }
+        return pe_mac_errno_ret(pe_m(PE_M_WRITE, a, b, c));
+    }
     if n == 56 {                                                             // openat
         // openat(AT_FDCWD=-2, path, macOS flags, mode)
         var fd: i64 = nat_mac_call(PE_M_OPEN, 0 - 2, b, pe_mac_oflags(c), d, 0, 0);
         return pe_mac_errno_ret(fd);
     }
-    if n == 57 { pe_mac_dir_close(a); return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0)); }   // close
+    if n == 57 {                                                             // close
+        pe_mac_dir_close(a);
+        if a >= 0 && a == pe_mac_efd_r {
+            pe_m(PE_M_CLOSE, pe_mac_efd_w, 0, 0);
+            pe_mac_efd_r = 0 - 1;
+            pe_mac_efd_w = 0 - 1;
+        }
+        return pe_mac_errno_ret(pe_m(PE_M_CLOSE, a, 0, 0));
+    }
     if n == 62 { return pe_mac_errno_ret(pe_m(PE_M_LSEEK, a, b, c)); }        // lseek
     if n == 79 { return pe_mac_stat(b, c); }                                 // newfstatat
     if n == 61 { return pe_mac_getdents(a, b, c); }                          // getdents64
@@ -495,21 +1066,33 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
     if n == 276 || n == 38 {                                                 // renameat2 / renameat
         return pe_mac_errno_ret(nat_mac_call(PE_M_RENAMEAT, 0 - 2, b, 0 - 2, d, 0, 0));
     }
+    if n == 222 && (d & 16) != 0 {                                           // mmap MAP_FIXED
+        // RT7 (base.fd pe_decommit): fresh zero pages over [a, a + b);
+        // macOS MAP_FIXED 0x10 | MAP_ANON 0x1000 | MAP_PRIVATE 0x2
+        var fa: i64 = nat_mac_call(PE_M_MMAP, a, b, 3, 0x1012, 0 - 1, 0);
+        if fa == 0 - 1 { return 0 - 12; }
+        return fa;
+    }
     if n == 222 { return pe_mac_mmap(b); }                                   // mmap
     if n == 215 { return pe_m(PE_M_MUNMAP, a, b, 0); }                       // munmap
     if n == 226 { return pe_mac_mprotect(a, b, c); }                        // mprotect
     if n == 113 { return pe_mac_clock(a, b); }                              // clock_gettime
-    if n == 101 { return pe_m(PE_M_NANOSLEEP, a, b, 0); }                   // nanosleep
+    if n == 101 { return pe_mac_errno_ret(pe_m(PE_M_NANOSLEEP, a, b, 0)); } // nanosleep (-EINTR: the rest in b)
     if n == 124 { pe_m(PE_M_SCHED_YIELD, 0, 0, 0); return 0; }              // sched_yield
     if n == 123 { return pe_mac_affinity(b, c); }                          // sched_getaffinity
     if n == 172 { return pe_m(PE_M_GETPID, 0, 0, 0); }                     // getpid
     if n == 178 { return pe_m(PE_M_GETPID, 0, 0, 0); }                     // gettid ~ pid
-    if n == 173 || n == 174 || n == 175 || n == 176 || n == 177 { return 0; }
+    if n == 173 { return pe_m(PE_M_GETPPID, 0, 0, 0); }                    // getppid
+    if n == 174 || n == 175 { return pe_m(PE_M_GETUID, 0, 0, 0); }         // getuid / geteuid
+    if n == 176 || n == 177 { return pe_m(PE_M_GETGID, 0, 0, 0); }         // getgid / getegid
     if n == 278 {                                                           // getrandom
         pe_m(PE_M_ARC4RANDOM, a, b, 0);                                     // arc4random_buf(buf, n)
         return b;
     }
     if n == 93 || n == 94 {                                                 // exit / exit_group
+        // a forked child (exec failed) must not run the parent's atexit
+        // work: _exit
+        if pe_mac_forked { pe_m(PE_M__EXIT, a, 0, 0); }
         pe_m(PE_M_EXIT, a, 0, 0);
         return 0;
     }
@@ -518,13 +1101,38 @@ pub fn pe_mac_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
         if b != 0 { pe_mac_sigaction(a, b); }
         return 0;
     }
-    if n == 132 { return 0; }                                              // sigaltstack: pthreads handle this
+    if n == 132 { return pe_mac_sigaltstack(a); }                          // sigaltstack
+    if n == 103 { return pe_mac_errno_ret(pe_m(PE_M_SETITIMER, a, b, c)); } // setitimer (timeval: usec an int, padded)
+    if n == 198 { return pe_mac_socket(a, b, c); }                         // socket
+    if n == 200 { return pe_mac_addr_call(PE_M_BIND, a, b, c); }           // bind
+    if n == 203 { return pe_mac_addr_call(PE_M_CONNECT, a, b, c); }        // connect
+    if n == 201 { return pe_mac_errno_ret(pe_m(PE_M_LISTEN, a, b, 0)); }   // listen
+    if n == 202 { return pe_mac_accept(a, b, c, 0); }                      // accept
+    if n == 242 { return pe_mac_accept(a, b, c, d); }                      // accept4
+    if n == 206 { return pe_mac_sendto(a, b, c, d, e, f); }                // sendto
+    if n == 207 { return pe_mac_recvfrom(a, b, c, d, e, f); }              // recvfrom
+    if n == 208 { return pe_mac_sockopt_call(false, a, b, c, d, e); }      // setsockopt
+    if n == 209 { return pe_mac_sockopt_call(true, a, b, c, d, e); }       // getsockopt
+    if n == 73 { return pe_mac_ppoll(a, b, c); }                           // ppoll
+    if n == 220 { return pe_mac_fork(a); }                                 // clone: fork
+    if n == 221 { return pe_mac_errno_ret(pe_m(PE_M_EXECVE, a, b, c)); }   // execve
+    if n == 260 { return pe_mac_wait4(a, b, c, d); }                       // wait4
     if n == 129 || n == 131 {                                              // kill / tgkill
+        // kill(pid, sig) goes to that process (AD4: process_kill of a
+        // child); tgkill (raise) to this one
         var ksig: i64 = c;
-        if n == 129 { ksig = b; }
-        return pe_mac_errno_ret(pe_m(PE_M_KILL, pe_m(PE_M_GETPID, 0, 0, 0), pe_mac_sig_from_linux(ksig), 0));
+        var kpid: i64 = pe_m(PE_M_GETPID, 0, 0, 0);
+        if n == 129 {
+            ksig = b;
+            kpid = a;
+        }
+        return pe_mac_errno_ret(pe_m(PE_M_KILL, kpid, pe_mac_sig_from_linux(ksig), 0));
     }
-    if n == 179 { return 0 - 38; }                                         // sysinfo: none
-    if n == 25 { return 0; }                                               // fcntl: non-blocking handled elsewhere
+    if n == 179 { return pe_mac_sysinfo(a); }                              // sysinfo
+    if n == 25 { return pe_mac_fcntl(a, b, c); }                           // fcntl
+    if n == 19 { return pe_mac_eventfd(); }                                // eventfd2
+    if n == 20 { return pe_mac_epoll_create(); }                           // epoll_create1
+    if n == 21 { return pe_mac_epoll_ctl(a, b, c, d); }                    // epoll_ctl
+    if n == 22 { return pe_mac_epoll_wait(a, b, c, d); }                   // epoll_pwait
     return 0 - 38;                                                          // ENOSYS
 }

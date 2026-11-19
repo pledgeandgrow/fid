@@ -1,0 +1,152 @@
+// Competitive RT10: many short tasks over all cores, the contention the
+// run queues of stdlib/pe_runtime/conc.fd see (per-worker lock-free rings,
+// steal-half batching, a global queue for tasks woken off a worker).
+//
+//   fid emit tests/ctx_switch/steal_bench.fd -o steal.exe
+//   ./steal.exe [tasks] [work]          (FIDES_WORKERS=<n> to pick workers)
+//
+// Three phases, each `tasks` tasks of `work` rounds of integer mixing (about
+// 1 ns a round) that yield once in the middle:
+//   fan-out  one task spawns all of them: they start on its worker's ring
+//            and reach the other workers only by stealing (or the spills of
+//            a full ring to the global queue)
+//   tree     each task spawns two more until there are `tasks`: work appears
+//            on every worker at once
+//   global   main (not a worker) spawns them: they go through the global
+//            queue, which workers take in batches
+// Prints the time per task of each phase (lower is better) and checks that
+// every task ran once. Compare against the shared-lock queues (the RT10
+// "before") by building with an older stdlib: docs/perf/work-stealing.md.
+use task;
+use sync;
+
+var g_cnt: i64 = 0;
+var g_mix: i64 = 0;
+var g_work: i64 = 100;
+var g_tasks: i64 = 0;
+
+@wrapping
+fn spin(seed: i64, rounds: i64) -> i64 {
+    var x: i64 = seed * 2654435761 + 1;
+    var i: i64 = 0;
+    while i < rounds {
+        x = (x ^ (x >> 13)) * 31 + i;
+        i = i + 1;
+    }
+    return x & 1023;
+}
+
+fn leaf(i: i64) -> i64 {
+    var m: i64 = spin(i, g_work / 2);
+    task_yield();
+    m = m + spin(i + 1, g_work - g_work / 2);
+    sync_atomic_add(g_mix, m);
+    sync_atomic_add(g_cnt, 1);
+    return m;
+}
+
+fn fan_out(n: i64) -> i64 {
+    var last: i64 = 0;
+    var i: i64 = 1;
+    while i <= n {
+        last = task_go("leaf", i);
+        i = i + 1;
+    }
+    return n;
+}
+
+// Node k of a binary heap numbering (1 = root): children 2k, 2k+1, while
+// they are <= g_tasks, so the tree has exactly g_tasks nodes.
+fn tree(k: i64) -> i64 {
+    var last: i64 = 0;
+    if 2 * k <= g_tasks {
+        last = task_go("tree", 2 * k);
+    }
+    if 2 * k + 1 <= g_tasks {
+        last = task_go("tree", 2 * k + 1);
+    }
+    return leaf(k);
+}
+
+fn phase(name: str, n: i64, t0: i64, want_mix: i64) -> i64 {
+    var t1: i64 = p_clock_now();
+    var cnt: i64 = sync_atomic_load(g_cnt);
+    var per: i64 = (t1 - t0) / n;
+    print(name);
+    print(": ");
+    print(cnt);
+    print(" tasks, ");
+    print(per);
+    print(" ns per task");
+    if want_mix != 0 && sync_atomic_load(g_mix) != want_mix {
+        print(" (WRONG RESULT)");
+    }
+    print("\n");
+    if cnt != n {
+        return 1;
+    }
+    if want_mix != 0 && sync_atomic_load(g_mix) != want_mix {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    var n: i64 = 200000;
+    match arg_at(1) {
+        Option::Some(a) => {
+            n = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(2) {
+        Option::Some(w) => {
+            g_work = str_parse_int(w);
+        }
+        Option::None => {
+        }
+    }
+    g_tasks = n;
+    g_cnt = sync_atomic_alloc(0);
+    g_mix = sync_atomic_alloc(0);
+    // Warm up: the workers, the stack cache
+    var h: i64 = task_go("fan_out", 1000);
+    task_run();
+
+    // What every phase must add up to: the same leaves, computed here
+    var want: i64 = 0;
+    var i: i64 = 1;
+    while i <= n {
+        want = want + spin(i, g_work / 2) + spin(i + 1, g_work - g_work / 2);
+        i = i + 1;
+    }
+    var bad: i64 = 0;
+
+    sync_atomic_store(g_cnt, 0);
+    sync_atomic_store(g_mix, 0);
+    var t0: i64 = p_clock_now();
+    h = task_go("fan_out", n);
+    task_run();
+    // the spawning task is not a leaf: n leaves
+    bad = bad + phase("fan-out", n, t0, want);
+
+    sync_atomic_store(g_cnt, 0);
+    sync_atomic_store(g_mix, 0);
+    t0 = p_clock_now();
+    h = task_go("tree", 1);
+    task_run();
+    bad = bad + phase("tree", n, t0, want);
+
+    sync_atomic_store(g_cnt, 0);
+    sync_atomic_store(g_mix, 0);
+    t0 = p_clock_now();
+    i = 1;
+    while i <= n {
+        h = task_go("leaf", i);
+        i = i + 1;
+    }
+    task_run();
+    bad = bad + phase("global", n, t0, want);
+    return bad;
+}

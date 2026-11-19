@@ -1,0 +1,253 @@
+// MI20 (llvm-roadmap): the runtime's machine-code primitives are behind one
+// set of nat_* names (compiler/pe_ir_stubs.fd prim_interface_names) on every
+// native backend: the machine layer's targets (Linux x86-64 / AArch64 /
+// RISC-V, `emit --nat` Windows) and pe_ir, the default Windows `fid emit`.
+// This program calls them by those names, the way a runtime does, and must
+// print the same on each. Not a tests/bootstrap test: `fid run` and the C
+// backend have no nat_* primitives. tests/nattools/mi20_prim_check.sh builds
+// and runs it; the last line names the target and is checked there:
+// "target arch=3 os=1" on Windows (both backends), arch=3 os=0 on x86-64
+// Linux, arch=1 on AArch64, arch=2 on RISC-V.
+//
+// Expected output:
+// atomic 5 7
+// cas 1 0 12
+// fma 7
+// call_fn 42
+// names mi20_adder
+// frame main
+// tls ok
+// thread 1 0
+// start ok
+// sig ok
+// ctx ok
+
+extern "C" {
+    fn nat_atomic_load(addr: i64) -> i64;
+    fn nat_atomic_store(addr: i64, v: i64);
+    fn nat_atomic_add(addr: i64, v: i64) -> i64;
+    fn nat_atomic_cas(addr: i64, expected: i64, nv: i64) -> i64;
+    fn nat_ctx_tramp() -> i64;
+    fn nat_clone_thread(entry: i64, arg: i64, stack_top: i64, ctid: i64, tls: i64) -> i64;
+    fn nat_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
+    fn nat_fn_table() -> i64;
+    fn nat_tls_get() -> i64;
+    fn nat_tls_set(v: i64);
+    fn nat_frame_fp() -> i64;
+    fn nat_frame_ret(fp: i64) -> i64;
+    fn nat_frame_next(fp: i64) -> i64;
+    fn nat_fn_names() -> i64;
+    fn nat_sig_handler() -> i64;
+    fn nat_fma(a: i64, b: i64, c: i64) -> i64;
+    fn nat_arch() -> i64;
+    fn nat_start_sp() -> i64;
+    fn nat_os() -> i64;
+}
+
+@unsafe
+fn ld(addr: i64) -> i64 {
+    return *(addr as *i64);
+}
+
+@unsafe
+fn st(addr: i64, v: i64) {
+    *(addr as *i64) = v;
+}
+
+@unsafe
+fn ldb(addr: i64) -> i64 {
+    var p: *u8 = addr as *u8;
+    var v: u8 = *p;
+    return v as i64;
+}
+
+/// The NUL-terminated bytes at `p` are `s`
+@unsafe
+fn cstr_is(p: i64, s: str) -> bool {
+    if p == 0 {
+        return false;
+    }
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        if ldb(p + i) != str_byte_at(s, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return ldb(p + n) == 0;
+}
+
+/// Called through nat_call_fn (found by name in nat_fn_table)
+fn mi20_adder(x: i64) -> i64 {
+    return x + 40;
+}
+
+/// A thread's entry (nat_clone_thread): count, nothing else
+@unsafe
+fn mi20_worker(counter: i64) -> i64 {
+    nat_atomic_add(counter, 1);
+    return 0;
+}
+
+/// The address nat_fn_table gives function `name` (0: none)
+@unsafe
+fn fn_addr(name: str) -> i64 {
+    var t: i64 = nat_fn_table();
+    while ld(t) != 0 {
+        if cstr_is(ld(t), name) {
+            return ld(t + 8);
+        }
+        t = t + 16;
+    }
+    return 0;
+}
+
+/// The name (its bytes' address) nat_fn_names gives the code at `pc`
+@unsafe
+fn name_at(pc: i64) -> i64 {
+    var t: i64 = nat_fn_names();
+    var found: i64 = 0;
+    while ld(t + 8) != 0 {
+        if pc >= ld(t) && pc < ld(t + 16) {
+            found = ld(t + 8);
+        }
+        t = t + 16;
+    }
+    return found;
+}
+
+/// Where the call to it returns (recursive, so it is not inlined into its
+/// caller; called with 0 it returns at once)
+@unsafe
+fn mi20_where(d: i64) -> i64 {
+    if d > 0 {
+        var r: i64 = mi20_where(d - 1);
+        return r + 0;
+    }
+    var fp: i64 = nat_frame_fp();
+    if fp == 0 || (fp & 7) != 0 {
+        return 0;
+    }
+    if nat_frame_next(fp) == 0 {
+        return 0;
+    }
+    return nat_frame_ret(fp);
+}
+
+@unsafe
+fn name_or(p: i64, s: str) -> str {
+    if cstr_is(p, s) {
+        return s;
+    }
+    return "?";
+}
+
+@unsafe
+fn main() -> i64 {
+    // Atomics
+    var m: i64 = p_malloc(16) as i64;
+    nat_atomic_store(m, 5);
+    var old: i64 = nat_atomic_add(m, 2);
+    println("atomic " + int_to_str(old) + " " + int_to_str(nat_atomic_load(m)));
+    var c1: i64 = nat_atomic_cas(m, 7, 12);
+    var c2: i64 = nat_atomic_cas(m, 7, 99);
+    println("cas " + int_to_str(c1) + " " + int_to_str(c2) + " " + int_to_str(nat_atomic_load(m)));
+
+    // a * b + c on the bits of f64s
+    var r: i64 = nat_fma(p_f64_to_bits(2.0), p_f64_to_bits(3.0), p_f64_to_bits(1.0));
+    if r == p_f64_to_bits(7.0) {
+        println("fma 7");
+    } else {
+        println("fma " + int_to_str(r));
+    }
+
+    // A function found by name, called through nat_call_fn
+    var adder: i64 = fn_addr("mi20_adder");
+    var argv: i64 = p_malloc(64) as i64;
+    var k: i64 = 0;
+    while k < 8 {
+        st(argv + 8 * k, 0);
+        k = k + 1;
+    }
+    st(argv, 2);
+    if adder != 0 {
+        println("call_fn " + int_to_str(nat_call_fn(adder, 1, argv)));
+    } else {
+        println("call_fn: mi20_adder not in nat_fn_table");
+    }
+
+    // Traces: the function table, and a frame record
+    println("names " + name_or(name_at(adder), "mi20_adder"));
+    var pc: i64 = mi20_where(0);
+    println("frame " + name_or(name_at(pc - 1), "main"));
+
+    // The thread word: set and read back (a value of our own only on
+    // Windows: on Linux it is the runtime's thread block, fs / tp)
+    var t0: i64 = nat_tls_get();
+    nat_tls_set(t0);
+    var tls_ok: bool = nat_tls_get() == t0;
+    if nat_os() == 1 {
+        nat_tls_set(12345);
+        var got: i64 = nat_tls_get();
+        nat_tls_set(t0);
+        tls_ok = tls_ok && got == 12345 && nat_tls_get() == t0;
+    }
+    if tls_ok {
+        println("tls ok");
+    } else {
+        println("tls bad");
+    }
+
+    // A thread: its own stack and thread block, a counter it bumps, and
+    // the word the system clears when it ends
+    var worker: i64 = fn_addr("mi20_worker");
+    var stack: i64 = p_malloc(262144) as i64;
+    var top: i64 = (stack + 262144) & (0 - 16);
+    var tblk: i64 = p_malloc(512) as i64;
+    k = 0;
+    while k < 64 {
+        st(tblk + 8 * k, 0);
+        k = k + 1;
+    }
+    st(tblk + 64, tblk);
+    var counter: i64 = m + 8;
+    st(counter, 0);
+    var ctid: i64 = p_malloc(16) as i64;
+    st(ctid, 1);
+    var tid: i64 = 0 - 1;
+    if worker != 0 {
+        tid = nat_clone_thread(worker, counter, top, ctid, tblk);
+    }
+    var spins: i64 = 0;
+    while tid > 0 && nat_atomic_load(ctid) != 0 && spins < 2000000000 {
+        spins = spins + 1;
+    }
+    println("thread " + int_to_str(nat_atomic_load(counter)) + " " + int_to_str(nat_atomic_load(ctid)));
+
+    // The start block: argc, argv[0..argc), NULL
+    var sp: i64 = nat_start_sp();
+    var start_ok: bool = false;
+    if sp != 0 {
+        var argc: i64 = ld(sp);
+        start_ok = argc >= 1 && ld(sp + 8) != 0 && ld(sp + 8 + 8 * argc) == 0;
+    }
+    if start_ok {
+        println("start ok");
+    } else {
+        println("start bad");
+    }
+
+    if nat_sig_handler() != 0 {
+        println("sig ok");
+    } else {
+        println("sig bad");
+    }
+    if nat_ctx_tramp() != 0 {
+        println("ctx ok");
+    } else {
+        println("ctx bad");
+    }
+    println("target arch=" + int_to_str(nat_arch()) + " os=" + int_to_str(nat_os()));
+    return 0;
+}

@@ -1,12 +1,16 @@
-# Run-time and compile-time benchmarks (release D7): fail a change that makes
-# a benchmark more than 10% slower than the commit it is based on.
+# Run-time and compile-time benchmarks (release D7, competitive roadmap BM9):
+# fail a change that makes a program more than 5% slower (run time) or a
+# compile stage more than 10% slower than the commit it is based on.
 #
 # Times depend on the machine, so both compilers are built and measured on
-# the same runner, one after the other: the base commit's fid records the
-# baseline (bench/check.sh --save), the head's is checked against it.
-#   run time      bench/check.sh: bench/fides/*.fd, native (`fid emit
-#                 --target x86_64-linux`) and through C, best of 5
-#   compile time  bench/compile-check.sh: `fid emit --time` per stage
+# the same runner.
+#   run time      bench/check.sh --ab: bench/fides/*.fd, native (`fid emit
+#                 --target x86_64-linux`) and through C; the base and head
+#                 executables run in turn, best of 5 each, and a program
+#                 over the limit is measured again before it fails
+#   compile time  bench/compile-check.sh: `fid emit --time` per stage; and
+#                 scripts/compile-gate.sh (llvm-roadmap SP15) on its own set,
+#                 the base commit's fid recording the baseline on this runner
 # Locally: bash bench/check.sh (see its header).
 
 name: Benchmarks
@@ -59,13 +63,54 @@ jobs:
           cd "$RUNNER_TEMP/base-src"
           STAGE0="$GITHUB_WORKSPACE/target/release/fidesc" ./scripts/build-selfhost.sh
       # Each fid runs from its own tree: it finds its stdlib at <exe>/../stdlib.
-      - name: Run time (base records, head is checked)
+      # Run time (BM9): base and head in turn on this runner, best of 5 each,
+      # a program over 5% re-measured before it fails (bench/check.sh --ab).
+      # SUITES adds the BM3 (bench/game) and BM4 (bench/work) programs: all
+      # seven build natively and through C and agree (Nov 16); one the base
+      # compiler cannot build is reported "new", not failed.
+      - name: Run time (base and head in turn, 5%)
+        env:
+          BASE_FID: ${{ runner.temp }}/base-src/release/fid-dev
+          FID: ${{ github.workspace }}/release/fid-dev
+          LIMIT_PCT: "5"
+          RUNS: "5"
+          SUITES: "game work"
+        run: bash bench/check.sh --ab
+      # CU8 (complaint-roadmap): the gate itself fails on a slowdown. Head as
+      # both base and head must pass; a head whose programs run their main
+      # twice (an injected 2x slowdown) must fail, in --ab mode and against a
+      # baseline file (bench/check.sh --save into a scratch BENCH_BASE).
+      - name: Slowdown gate fails on an injected slowdown (CU8)
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          LIMIT_PCT: "10"
+          RUNS: "3"
+        run: bash scripts/bench-gate-check.sh
+      # RL4 (llvm-roadmap): a miscompile is fixed only with a test that fails
+      # without the fix. The entries this change marks fixed in
+      # docs/verification/miscompile-log.md (--new-since the base commit)
+      # have their tests run with head's fid (must pass) and with the base
+      # commit's fid, built above without the fix (must fail). A change that
+      # fixes no entry has nothing to run.
+      # SP14 (llvm-roadmap): the e-graph is bounded (egraph.fd EG_MAX_NODES,
+      # EG_MAX_ROUNDS) so a release build stays within 2x of `--debug` in
+      # compile time: head's fid, best of 3 per mode, on hello, test_hashmap
+      # and test_tooling_explain.
+      - name: Release within 2x of debug compile time (SP14)
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          LIMIT: "2.0"
+        run: bash scripts/egraph-bound-check.sh
+      - name: Newly fixed miscompiles fail on the base compiler (RL4)
+        if: always()
         env:
           BASE_FID: ${{ runner.temp }}/base-src/release/fid-dev
           HEAD_FID: ${{ github.workspace }}/release/fid-dev
         run: |
-          FID="$BASE_FID" BENCH_BASE="$RUNNER_TEMP/run-base.txt" bash bench/check.sh --save
-          FID="$HEAD_FID" BENCH_BASE="$RUNNER_TEMP/run-base.txt" bash bench/check.sh
+          bash scripts/miscompile-gate.sh --fid "$HEAD_FID" --run \
+            --before "$BASE_FID" --new-since "${{ steps.base.outputs.sha }}"
       - name: Compile time (base records, head is checked)
         if: always()
         env:
@@ -76,3 +121,18 @@ jobs:
           FID="$BASE_FID" bash bench/compile-check.sh --save
           FID="$HEAD_FID" bash bench/compile-check.sh
           cp "$RUNNER_TEMP/compile-baseline.orig" bench/compile-baseline.txt || true
+      # SP15 (llvm-roadmap): scripts/compile-gate.sh, `fid emit --target
+      # x86_64-linux --time` per stage on hello, test_hashmap and test_tasks,
+      # best of 3; a stage over 40 ms (and the total) more than 10% slower
+      # than the base commit's fid on this runner fails. The base compiler
+      # records a scratch baseline; the checked-in one is a local machine's.
+      - name: Compile-time gate per stage (base records, head is checked, 10%)
+        if: always()
+        env:
+          BASE_FID: ${{ runner.temp }}/base-src/release/fid-dev
+          HEAD_FID: ${{ github.workspace }}/release/fid-dev
+          COMPILE_GATE_BASE: ${{ runner.temp }}/compile-gate.baseline
+          LIMIT_PCT: "10"
+        run: |
+          FID="$BASE_FID" bash scripts/compile-gate.sh --save
+          FID="$HEAD_FID" bash scripts/compile-gate.sh

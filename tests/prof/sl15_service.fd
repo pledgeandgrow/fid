@@ -1,0 +1,63 @@
+// Competitive roadmap SL15, native Windows (`fid emit`, pe_ir): the
+// sampling profiler of a running program, controlled as on Linux. Run with
+// FID_PROF=1: the profiler starts before main (pert_prof_boot,
+// stdlib/pe_runtime/conc.fd) and a watcher thread waits on the named event
+// Local\fid-prof-<pid>. Halfway through, this program sets that event
+// itself (as another process would: PowerShell's
+// [Threading.EventWaitHandle]::OpenExisting(...).Set()), so the profile so
+// far goes to stderr while it runs on; the profile is printed again at
+// exit. tests/prof/sl15-check.sh runs it (with and without FID_PROF, and
+// with FID_PROF_EVERY) and counts the reports.
+// Expected output with FID_PROF=1:
+// event set
+// done
+// Without FID_PROF there is no event ("no event", then "done").
+
+extern "C" link "kernel32.dll" {
+    fn OpenEventA as svc_open_event(access: i64, inherit: i64, name: str) -> i64;
+    fn SetEvent as svc_set_event(h: i64) -> i32;
+}
+
+fn svc_spin(x: i64) -> i64 {
+    var a: i64 = x;
+    var i: i64 = 0;
+    while i < 2000 {
+        a = (a * 31 + i) % 1000003;
+        i = i + 1;
+    }
+    return a;
+}
+
+/// Busy for `ms` milliseconds.
+fn svc_work(ms: i64) -> i64 {
+    val until = p_clock_now_ms() + ms;
+    var acc: i64 = 1;
+    while p_clock_now_ms() < until {
+        acc = svc_spin(acc);
+    }
+    return acc % 7;
+}
+
+fn main() {
+    var r: i64 = svc_work(800);
+    // EVENT_MODIFY_STATE
+    val name = "Local\\fid-prof-" + int_to_str(p_getpid());
+    var h: i64 = 0;
+    // SAFETY: kernel32's OpenEventA reads the NUL-terminated name; SetEvent
+    // takes the handle it returned (or is not called)
+    unsafe {
+        h = svc_open_event(2, 0, name);
+        if h != 0 {
+            svc_set_event(h);
+        }
+    }
+    if h == 0 {
+        println("no event");
+    } else {
+        println("event set");
+    }
+    r = r + svc_work(800);
+    if r >= 0 {
+        println("done");
+    }
+}

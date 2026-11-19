@@ -12,7 +12,7 @@
 //   println(csv_serialize(rows));
 
 module csv;
- use vec; use string;
+ use vec;
 // ─── Row type ───────────────────────────────────────────────────────────
 
 /// One CSV record: a list of string fields.
@@ -173,7 +173,8 @@ fn csv_delim_str(delim: i64) -> str {
     if delim == 124 {
         return "|";
     }
-    return ",";
+    // any other delimiter byte as itself (was "," for every other one)
+    return byte_to_str(delim);
 }
 
 /// Quote a field if it contains the delimiter, quotes, or newlines.
@@ -205,7 +206,9 @@ pub fn csv_quote_field_dialect(field: str, delim: i64, quote: i64) -> str {
     if !need {
         return field;
     }
-    var out: str = "\"";
+    // the dialect's quote character around the field (was always '"')
+    var qs: str = byte_to_str(quote);
+    var out: str = qs;
     i = 0;
     while i < n {
         var ch: str = str_slice(field, i, i + 1);
@@ -216,7 +219,7 @@ pub fn csv_quote_field_dialect(field: str, delim: i64, quote: i64) -> str {
         out = out + ch;
         i = i + 1;
     }
-    return out + "\"";
+    return out + qs;
 }
 
 /// Serialize rows back to CSV text with LF line endings.
@@ -320,6 +323,383 @@ pub fn csv_column(rows: Vec<CsvRow>, c: i64) -> Vec<str> {
     var r: i64 = 0;
     while r < rows.len() {
         out.push(csv_field(rows, r, c));
+        r = r + 1;
+    }
+    return out;
+}
+
+// ─── Strict reader and dialect writer ───────────────────────────────────
+//
+// `csv_read` is the checked reader of Go's encoding/csv (and Python's csv
+// in strict mode): errors carry the line and column where they are found,
+// and the options cover comments, leading-space trimming, lazy quotes, a
+// fixed number of fields per record and empty lines. `csv_write` writes
+// with a quoting style (minimal, all, non-numeric, none) and LF or CRLF.
+
+/// Writer quoting: only fields that need it (delimiter, quote, line end,
+/// leading space).
+pub const CSV_QUOTE_MINIMAL: i64 = 0;
+/// Writer quoting: every field.
+pub const CSV_QUOTE_ALL: i64 = 1;
+/// Writer quoting: every field that is not a number.
+pub const CSV_QUOTE_NONNUMERIC: i64 = 2;
+/// Writer quoting: never; the delimiter, quote and line ends are escaped
+/// with `escape` instead (Python's QUOTE_NONE with an escapechar).
+pub const CSV_QUOTE_NONE: i64 = 3;
+
+/// Options of `csv_read` and `csv_write`; `csv_options()` gives RFC 4180.
+pub struct CsvOptions {
+    /// field separator (default ',')
+    pub delim: i64,
+    /// quote character (default '"')
+    pub quote: i64,
+    /// a line starting with this byte is skipped; 0: none
+    pub comment: i64,
+    /// spaces and tabs before a field are dropped
+    pub trim_space: bool,
+    /// a quote inside an unquoted field is kept, and a quote in a quoted
+    /// field not followed by a delimiter or line end is kept as text
+    pub lazy_quotes: bool,
+    /// fields per record: -1 any number, 0 as many as the first record,
+    /// n > 0 exactly n
+    pub fields: i64,
+    /// empty lines are skipped (true) or read as a record of one empty
+    /// field (false)
+    pub skip_empty: bool,
+    /// writer: CSV_QUOTE_MINIMAL, CSV_QUOTE_ALL, CSV_QUOTE_NONNUMERIC or
+    /// CSV_QUOTE_NONE
+    pub quote_style: i64,
+    /// writer: escape byte for CSV_QUOTE_NONE (default '\\')
+    pub escape: i64,
+    /// writer: CRLF line ends (RFC 4180) instead of LF
+    pub crlf: bool,
+}
+
+/// What `csv_read` gives: the records read, and on an error its message,
+/// line and column (1-based; the column counts bytes). Records before the
+/// error are kept in `rows`.
+pub struct CsvResult {
+    pub rows: Vec<CsvRow>,
+    pub ok: bool,
+    pub err: str,
+    pub line: i64,
+    pub col: i64,
+}
+
+/// RFC 4180 options: ',' and '"', no comments, strict quotes, any number
+/// of fields, empty lines skipped, minimal quoting, LF line ends.
+///
+/// Example:
+///   var o = csv_options();
+///   assert_eq(o.delim, ',');
+///   assert(!o.lazy_quotes);
+pub fn csv_options() -> CsvOptions {
+    return CsvOptions {
+        delim: 44, quote: 34, comment: 0, trim_space: false, lazy_quotes: false, fields: - 1, skip_empty: true, quote_style: 0, escape: 92, crlf: false,
+    };
+}
+
+fn csv_rd_fail(res: & mut CsvResult, msg: str, line: i64, col: i64) -> void {
+    res.ok = false;
+    res.err = msg;
+    res.line = line;
+    res.col = col;
+}
+
+/// Read CSV text with `opts`, checking it as Go's encoding/csv does:
+/// `bare " in non-quoted field`, `extraneous or missing " in quoted field`
+/// and `wrong number of fields` stop the read with the line and column.
+/// A CRLF inside a quoted field reads as LF.
+///
+/// Example:
+///   var r = csv_read("a,b\n1,\"x\"y\n", csv_options());
+///   assert(!r.ok);
+///   assert_eq(r.line, 2);
+///   assert_eq(r.col, 6);
+///   var o = csv_options();
+///   o.comment = '#';
+///   var r2 = csv_read("# note\nk,v\n", o);
+///   assert(r2.ok);
+///   assert_eq(csv_field(r2.rows, 0, 1), "v");
+pub fn csv_read(text: str, opts: CsvOptions) -> CsvResult {
+    var res: CsvResult = CsvResult {
+        rows: Vec::new(), ok: true, err: "", line: 0, col: 0,
+    };
+    var n: i64 = str_len(text);
+    var i: i64 = 0;
+    var line: i64 = 1;
+    var line_start: i64 = 0;
+    var expected: i64 = opts.fields;
+    while i < n {
+        var c0: i64 = str_byte_at(text, i);
+        // a comment line
+        if opts.comment != 0 && c0 == opts.comment {
+            while i < n && str_byte_at(text, i) != 10 && str_byte_at(text, i) != 13 {
+                i = i + 1;
+            }
+            if i < n && str_byte_at(text, i) == 13 && i + 1 < n && str_byte_at(text, i + 1) == 10 {
+                i = i + 1;
+            }
+            i = i + 1;
+            line = line + 1;
+            line_start = i;
+            continue;
+        }
+        // an empty line
+        if c0 == 10 || c0 == 13 {
+            if c0 == 13 && i + 1 < n && str_byte_at(text, i + 1) == 10 {
+                i = i + 1;
+            }
+            i = i + 1;
+            if !opts.skip_empty {
+                var empty: Vec<str> = Vec::new();
+                empty.push("");
+                res.rows.push(CsvRow {
+                    fields: empty
+                });
+            }
+            line = line + 1;
+            line_start = i;
+            continue;
+        }
+        var rec_line: i64 = line;
+        var fields: Vec<str> = Vec::new();
+        var rec_done: bool = false;
+        while !rec_done {
+            if opts.trim_space {
+                while i < n && (str_byte_at(text, i) == 32 || str_byte_at(text, i) == 9) && str_byte_at(text, i) != opts.delim {
+                    i = i + 1;
+                }
+            }
+            var field: str = "";
+            if i < n && str_byte_at(text, i) == opts.quote {
+                // quoted field
+                var q_line: i64 = line;
+                var q_col: i64 = i - line_start + 1;
+                i = i + 1;
+                var seg: i64 = i;
+                var closed: bool = false;
+                while !closed {
+                    if i >= n {
+                        if opts.lazy_quotes {
+                            field = field + str_slice(text, seg, n);
+                            closed = true;
+                        } else {
+                            csv_rd_fail(& mut res, "extraneous or missing \" in quoted field", q_line, q_col);
+                            return res;
+                        }
+                    } else {
+                        var c: i64 = str_byte_at(text, i);
+                        if c == opts.quote {
+                            if i + 1 < n && str_byte_at(text, i + 1) == opts.quote {
+                                // a doubled quote: one quote of text
+                                field = field + str_slice(text, seg, i + 1);
+                                i = i + 2;
+                                seg = i;
+                            } else if i + 1 >= n || str_byte_at(text, i + 1) == opts.delim || str_byte_at(text, i + 1) == 10 || str_byte_at(text, i + 1) == 13 {
+                                field = field + str_slice(text, seg, i);
+                                i = i + 1;
+                                closed = true;
+                            } else if opts.lazy_quotes {
+                                i = i + 1;
+                            } else {
+                                csv_rd_fail(& mut res, "extraneous or missing \" in quoted field", line, i - line_start + 2);
+                                return res;
+                            }
+                        } else if c == 13 && i + 1 < n && str_byte_at(text, i + 1) == 10 {
+                            // CRLF inside the field reads as LF
+                            field = field + str_slice(text, seg, i) + "\n";
+                            i = i + 2;
+                            seg = i;
+                            line = line + 1;
+                            line_start = i;
+                        } else if c == 10 || c == 13 {
+                            i = i + 1;
+                            line = line + 1;
+                            line_start = i;
+                        } else {
+                            i = i + 1;
+                        }
+                    }
+                }
+            } else {
+                // unquoted field: up to the delimiter or the line end
+                var start: i64 = i;
+                while i < n && str_byte_at(text, i) != opts.delim && str_byte_at(text, i) != 10 && str_byte_at(text, i) != 13 {
+                    if str_byte_at(text, i) == opts.quote && !opts.lazy_quotes {
+                        csv_rd_fail(& mut res, "bare \" in non-quoted field", line, i - line_start + 1);
+                        return res;
+                    }
+                    i = i + 1;
+                }
+                field = str_slice(text, start, i);
+            }
+            fields.push(field);
+            if i < n && str_byte_at(text, i) == opts.delim {
+                i = i + 1;
+                if i >= n {
+                    // "a,b," at the end of the text: a last empty field
+                    fields.push("");
+                    rec_done = true;
+                }
+            } else {
+                if i < n {
+                    if str_byte_at(text, i) == 13 && i + 1 < n && str_byte_at(text, i + 1) == 10 {
+                        i = i + 1;
+                    }
+                    i = i + 1;
+                    line = line + 1;
+                    line_start = i;
+                }
+                rec_done = true;
+            }
+        }
+        if expected == 0 {
+            expected = fields.len();
+        }
+        if expected > 0 && fields.len() != expected {
+            csv_rd_fail(& mut res, "wrong number of fields: " + int_to_str(fields.len()) + ", want " + int_to_str(expected), rec_line, 1);
+            return res;
+        }
+        res.rows.push(CsvRow {
+            fields: fields
+        });
+    }
+    return res;
+}
+
+/// Is `s` a decimal number (sign, digits, one point, exponent)?
+fn csv_is_number(s: str) -> bool {
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    if n == 0 {
+        return false;
+    }
+    if str_byte_at(s, 0) == 45 || str_byte_at(s, 0) == 43 {
+        i = 1;
+    }
+    var digits: i64 = 0;
+    var dot: bool = false;
+    while i < n {
+        var c: i64 = str_byte_at(s, i);
+        if c >= 48 && c <= 57 {
+            digits = digits + 1;
+        } else if c == 46 && !dot {
+            dot = true;
+        } else if (c == 101 || c == 69) && digits > 0 {
+            i = i + 1;
+            if i < n && (str_byte_at(s, i) == 45 || str_byte_at(s, i) == 43) {
+                i = i + 1;
+            }
+            var ed: i64 = 0;
+            while i < n && str_byte_at(s, i) >= 48 && str_byte_at(s, i) <= 57 {
+                ed = ed + 1;
+                i = i + 1;
+            }
+            return ed > 0 && i == n;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return digits > 0;
+}
+
+/// One field as `csv_write` writes it under `opts`.
+///
+/// Example:
+///   var o = csv_options();
+///   assert_eq(csv_write_field(" lead", o), "\" lead\"");
+///   o.quote_style = CSV_QUOTE_NONNUMERIC;
+///   assert_eq(csv_write_field("2.5e3", o), "2.5e3");
+///   assert_eq(csv_write_field("x", o), "\"x\"");
+pub fn csv_write_field(field: str, opts: CsvOptions) -> str {
+    var n: i64 = str_len(field);
+    if opts.quote_style == 3 {
+        // no quoting: escape the delimiter, quote, escape and line ends
+        var es: str = byte_to_str(opts.escape);
+        var out: str = "";
+        var seg: i64 = 0;
+        var i: i64 = 0;
+        while i < n {
+            var c: i64 = str_byte_at(field, i);
+            if c == opts.delim || c == opts.quote || c == opts.escape || c == 10 || c == 13 {
+                out = out + str_slice(field, seg, i) + es;
+                seg = i;
+            }
+            i = i + 1;
+        }
+        return out + str_slice(field, seg, n);
+    }
+    var need: bool = opts.quote_style == 1;
+    if opts.quote_style == 2 && !csv_is_number(field) {
+        need = true;
+    }
+    if !need {
+        // a leading space (Go quotes it) or an empty first field of a
+        // one-field row is left to the caller; the rest as minimal
+        if n > 0 && (str_byte_at(field, 0) == 32 || str_byte_at(field, 0) == 9) {
+            need = true;
+        }
+        var j: i64 = 0;
+        while j < n && !need {
+            var c2: i64 = str_byte_at(field, j);
+            if c2 == opts.delim || c2 == opts.quote || c2 == 10 || c2 == 13 {
+                need = true;
+            }
+            j = j + 1;
+        }
+    }
+    if !need {
+        return field;
+    }
+    var qs: str = byte_to_str(opts.quote);
+    var body: str = "";
+    var seg2: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        if str_byte_at(field, k) == opts.quote {
+            body = body + str_slice(field, seg2, k + 1) + qs;
+            seg2 = k + 1;
+        }
+        k = k + 1;
+    }
+    return qs + body + str_slice(field, seg2, n) + qs;
+}
+
+/// Write rows under `opts` (delimiter, quoting style, line ends). A row
+/// of one empty field is written as `""` so that it reads back as a
+/// record, not as an empty line.
+///
+/// Example:
+///   var o = csv_options();
+///   o.crlf = true;
+///   o.quote_style = CSV_QUOTE_ALL;
+///   var rows = csv_parse("a,b\n");
+///   assert_eq(csv_write(rows, o), "\"a\",\"b\"\r\n");
+pub fn csv_write(rows: Vec<CsvRow>, opts: CsvOptions) -> str {
+    var ds: str = byte_to_str(opts.delim);
+    var eol: str = "\n";
+    if opts.crlf {
+        eol = "\r\n";
+    }
+    var out: str = "";
+    var r: i64 = 0;
+    while r < rows.len() {
+        var row: Vec<str> = rows.get(r).fields;
+        if row.len() == 1 && str_len(row.get(0)) == 0 && opts.quote_style != 3 {
+            out = out + byte_to_str(opts.quote) + byte_to_str(opts.quote) + eol;
+        } else {
+            var c: i64 = 0;
+            while c < row.len() {
+                if c > 0 {
+                    out = out + ds;
+                }
+                out = out + csv_write_field(row.get(c), opts);
+                c = c + 1;
+            }
+            out = out + eol;
+        }
         r = r + 1;
     }
     return out;

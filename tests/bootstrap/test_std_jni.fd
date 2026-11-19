@@ -1,0 +1,230 @@
+// stdlib/jni: the JNIEnv table layout (slot names and offsets of jni.h),
+// descriptors and signature parsing, Call*MethodA slots, jfloat bits,
+// native name mangling (JNI spec examples), modified UTF-8 (NUL and a
+// supplementary character), and the call sequences run against a fake VM
+// behind the JniEnv seam (a real JNIEnv needs a device).
+// Expected output:
+// table 235 FindClass@48 NewStringUTF@1336 ExceptionCheck@1824
+// slots 33 GetMethodID 113 GetStaticMethodID 215 RegisterNatives 234 IsVirtualThread
+// call slots 61 CallVoidMethod 51 CallIntMethodA 141 CallStaticVoidMethod 143 CallStaticVoidMethodA 93 CallNonvirtualVoidMethodA
+// field slots 100 GetIntField 154 SetStaticObjectField
+// vm GetEnv AttachCurrentThread
+// desc I [[B Ljava/lang/String; [Landroid/view/View;
+// sig (ILjava/lang/String;[J)V
+// parse ok 3 I|Ljava/lang/String;|[J ret V
+// parse ok 0  ret [Ljava/lang/Object;
+// bad (I false bad (V)V false bad (Lx)V false bad (I)VV false
+// field desc true false
+// f32 3f800000 3dcccccd c0200000 7f800000 1 7f7fffff
+// jvalue 1 ff 7fffffff 4614253070214989087
+// mangle Java_p_q_r_A_f Java_com_ex_1y_Foo_bar__ILjava_lang_String_2_3J Java_a_B_f_000e9
+// mutf8 41 c080 c3a9 eda0bdedb880
+// decode ok A|0|233|55357|56832 true
+// decode bad false false
+// round trip true
+// fake: version 10006
+// add 7 + 35 = 42
+// echo -> hello again
+// exception pending true then false
+// global 1 then 0; frames 0
+// describe 1 clear 1
+// leaks locals=0 globals=0 frames=0
+use jni;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn join(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + "|"; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn joini(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + "|"; }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── A fake VM behind the seam ─────────────────────────────────────────
+
+var vm_classes: Vec<str> = Vec::new();
+var vm_methods: Vec<str> = Vec::new();
+var vm_strings: Vec<str> = Vec::new();
+var vm_pending: i64 = 0;
+var vm_describes: i64 = 0;
+var vm_clears: i64 = 0;
+var vm_globals: i64 = 0;
+
+fn fake_entry(env: i64, index: i64) -> i64 { return 0x1000 + index; }
+
+fn cstr(addr: i64) -> str { return enc_bytes_to_str(jni_cbuf_read(addr)); }
+
+fn fake_call(fp: i64, a: Vec<i64>) -> i64 {
+    val slot: i64 = fp - 0x1000;
+    val name: str = jni_fn_name(slot);
+    if name == "GetVersion" { return JNI_VERSION_1_6; }
+    if name == "FindClass" {
+        vm_classes.push(cstr(a.get(1)));
+        return 100 + vm_classes.len();
+    }
+    if name == "GetStaticMethodID" || name == "GetMethodID" {
+        vm_methods.push(cstr(a.get(2)) + cstr(a.get(3)));
+        return 500 + vm_methods.len();
+    }
+    if name == "CallStaticIntMethodA" {
+        // the method "add(II)I": two jvalue words
+        var p0: i64 = 0;
+        var p1: i64 = 0;
+        unsafe {
+            val w0: *mut i64 = a.get(3);
+            val w1: *mut i64 = a.get(3) + 8;
+            p0 = *w0;
+            p1 = *w1;
+        }
+        return p0 + p1;
+    }
+    if name == "CallStaticObjectMethodA" {
+        // "echo(Ljava/lang/String;)Ljava/lang/String;" returns a new string
+        var arg: i64 = 0;
+        unsafe {
+            val w0: *mut i64 = a.get(3);
+            arg = *w0;
+        }
+        vm_strings.push(str_replace(vm_strings.get(arg - 7001), "é", "e") + " again");
+        return 7000 + vm_strings.len();
+    }
+    if name == "NewStringUTF" {
+        val d: JniDecoded = jni_mutf8_decode(jni_cbuf_read(a.get(1)));
+        vm_strings.push(d.text);
+        return 7000 + vm_strings.len();
+    }
+    if name == "GetStringUTFChars" { return jni_cbuf(jni_mutf8_encode(vm_strings.get(a.get(1) - 7001))); }
+    if name == "ReleaseStringUTFChars" { jni_cbuf_free(a.get(2)); return 0; }
+    if name == "ThrowNew" { vm_pending = 1; return 0; }
+    if name == "ExceptionCheck" { return vm_pending; }
+    if name == "ExceptionDescribe" { vm_describes = vm_describes + 1; return 0; }
+    if name == "ExceptionClear" { vm_pending = 0; vm_clears = vm_clears + 1; return 0; }
+    if name == "NewGlobalRef" { vm_globals = vm_globals + 1; return a.get(1) + 1000000; }
+    if name == "DeleteGlobalRef" { vm_globals = vm_globals - 1; return 0; }
+    if name == "DeleteLocalRef" { return 0; }
+    if name == "PushLocalFrame" { return JNI_OK; }
+    if name == "PopLocalFrame" { return a.get(1); }
+    println("fake VM: unexpected " + name);
+    return 0;
+}
+
+fn main() {
+    println("table " + int_to_str(jni_table_len()) + " FindClass@" + int_to_str(jni_fn_offset(jni_fn_index("FindClass")))
+        + " NewStringUTF@" + int_to_str(jni_fn_offset(jni_fn_index("NewStringUTF")))
+        + " ExceptionCheck@" + int_to_str(jni_fn_offset(jni_fn_index("ExceptionCheck"))));
+    println("slots 33 " + jni_fn_name(33) + " 113 " + jni_fn_name(113) + " 215 " + jni_fn_name(215) + " 234 " + jni_fn_name(234));
+    println("call slots 61 " + jni_fn_name(61) + " 51 " + jni_fn_name(jni_call_slot(JNI_CALL_VIRTUAL, JNI_KIND_INT))
+        + " 141 " + jni_fn_name(141) + " 143 " + jni_fn_name(jni_call_slot(JNI_CALL_STATIC, JNI_KIND_VOID))
+        + " 93 " + jni_fn_name(jni_call_slot(JNI_CALL_NONVIRTUAL, JNI_KIND_VOID)));
+    println("field slots 100 " + jni_fn_name(jni_get_field_slot(false, JNI_KIND_INT)) + " 154 " + jni_fn_name(jni_set_field_slot(true, JNI_KIND_OBJECT)));
+    println("vm " + jni_vm_fn_name(JNI_VM_GET_ENV) + " " + jni_vm_fn_name(JNI_VM_ATTACH_CURRENT_THREAD));
+
+    println("desc " + jni_type_descriptor("int") + " " + jni_type_descriptor("byte[][]") + " "
+        + jni_type_descriptor("java.lang.String") + " " + jni_type_descriptor("android.view.View[]"));
+    var ps: Vec<str> = Vec::new();
+    ps.push("int"); ps.push("java.lang.String"); ps.push("long[]");
+    println("sig " + jni_method_sig(ps, "void"));
+    val p1: JniSig = jni_parse_sig("(ILjava/lang/String;[J)V");
+    println("parse " + (if p1.ok { "ok" } else { "bad" }) + " " + int_to_str(p1.args.len()) + " " + join(p1.args) + " ret " + p1.ret);
+    val p2: JniSig = jni_parse_sig("()[Ljava/lang/Object;");
+    println("parse " + (if p2.ok { "ok" } else { "bad" }) + " " + int_to_str(p2.args.len()) + " " + join(p2.args) + " ret " + p2.ret);
+    println("bad (I " + bool_to_str(jni_parse_sig("(I").ok) + " bad (V)V " + bool_to_str(jni_parse_sig("(V)V").ok)
+        + " bad (Lx)V " + bool_to_str(jni_parse_sig("(Lx)V").ok) + " bad (I)VV " + bool_to_str(jni_parse_sig("(I)VV").ok));
+    println("field desc " + bool_to_str(jni_valid_field_desc("[[Ljava/util/List;")) + " " + bool_to_str(jni_valid_field_desc("V")));
+
+    println("f32 " + int_to_hex(jni_f32_bits(1.0)) + " " + int_to_hex(jni_f32_bits(0.1)) + " " + int_to_hex(jni_f32_bits(-2.5))
+        + " " + int_to_hex(jni_f32_bits(1.0e39)) + " " + int_to_hex(jni_f32_bits(1.401298464324817e-45))
+        + " " + int_to_hex(jni_f32_bits(3.4028234663852886e38)));
+    var jv: Vec<JValue> = Vec::new();
+    jv.push(JValue::Z(true)); jv.push(JValue::B(-1)); jv.push(JValue::I(2147483647)); jv.push(JValue::D(3.14));
+    println("jvalue " + joini_sp(jni_jvalue_words(jv)));
+
+    println("mangle " + jni_native_symbol("p.q.r.A", "f", "") + " "
+        + jni_native_symbol("com/ex_y/Foo", "bar", "(ILjava/lang/String;[J)V") + " "
+        + jni_native_symbol("a.B", "fé", ""));
+
+    println("mutf8 " + hx(jni_mutf8_encode("A")) + " " + hx(jni_mutf8_encode(utf8_encode(0))) + " "
+        + hx(jni_mutf8_encode("é")) + " " + hx(jni_mutf8_encode(utf8_encode(0x1F600))));
+    var mb: Vec<i64> = Vec::new();
+    mb.push(0x41); mb.push(0xC0); mb.push(0x80); mb.push(0xC3); mb.push(0xA9);
+    mb.push(0xED); mb.push(0xA0); mb.push(0xBD); mb.push(0xED); mb.push(0xB8); mb.push(0x80);
+    val d: JniDecoded = jni_mutf8_decode(mb);
+    println("decode " + (if d.ok { "ok" } else { "bad" }) + " A|" + joini(slice_from(d.units, 1)) + " "
+        + bool_to_str(jni_utf16_to_codepoints(d.units).get(3) == 0x1F600));
+    var bad1: Vec<i64> = Vec::new();
+    bad1.push(0x41); bad1.push(0);
+    var bad2: Vec<i64> = Vec::new();
+    bad2.push(0xF0); bad2.push(0x9F); bad2.push(0x98); bad2.push(0x80);
+    println("decode bad " + bool_to_str(jni_mutf8_decode(bad1).ok) + " " + bool_to_str(jni_mutf8_decode(bad2).ok));
+    val txt: str = "aé中" + utf8_encode(0x1F600) + "z";
+    println("round trip " + bool_to_str(jni_mutf8_decode(jni_mutf8_encode(txt)).text == txt));
+
+    var e: JniEnv = jni_env(0x7000, fake_entry, fake_call);
+    println("fake: version " + int_to_hex(jni_get_version(&mut e)));
+    val cls: i64 = jni_find_class(&mut e, "com.example.MathUtil");
+    var ip: Vec<str> = Vec::new();
+    ip.push("int"); ip.push("int");
+    val sig_add: str = jni_method_sig(ip, "int");
+    val mid: i64 = jni_get_static_method_id(&mut e, cls, "add", sig_add);
+    var args: Vec<JValue> = Vec::new();
+    args.push(JValue::I(7)); args.push(JValue::I(35));
+    val sum: i64 = jni_call_method(&mut e, JNI_CALL_STATIC, cls, mid, sig_add, args);
+    println("add 7 + 35 = " + int_to_str(sum) + "");
+    val js: i64 = jni_new_string(&mut e, "héllo");
+    val mid2: i64 = jni_get_static_method_id(&mut e, cls, "echo", "(Ljava/lang/String;)Ljava/lang/String;");
+    var a2: Vec<JValue> = Vec::new();
+    a2.push(JValue::L(js));
+    val out: i64 = jni_call_method(&mut e, JNI_CALL_STATIC, cls, mid2, "(Ljava/lang/String;)Ljava/lang/String;", a2);
+    println("echo -> " + jni_string_to_str(&mut e, out));
+    jni_throw_new(&mut e, "java/lang/IllegalStateException", "boom");
+    val first: bool = jni_exception_pending(&mut e);
+    val second: bool = jni_exception_pending(&mut e);
+    println("exception pending " + bool_to_str(first) + " then " + bool_to_str(second));
+    val g: i64 = jni_new_global_ref(&mut e, cls);
+    val g1: i64 = e.global_refs;
+    jni_delete_global_ref(&mut e, g);
+    jni_push_local_frame(&mut e, 16);
+    jni_pop_local_frame(&mut e, 0);
+    println("global " + int_to_str(g1) + " then " + int_to_str(e.global_refs) + "; frames " + int_to_str(e.frames));
+    println("describe " + int_to_str(vm_describes) + " clear " + int_to_str(vm_clears));
+    jni_delete_local_ref(&mut e, out);
+    jni_delete_local_ref(&mut e, js);
+    jni_delete_local_ref(&mut e, cls);
+    println("leaks " + jni_leak_report(&e));
+}
+
+fn joini_sp(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + " "; }
+        if i == 1 || i == 2 { s = s + int_to_hex(v.get(i)); } else { s = s + int_to_str(v.get(i)); }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn slice_from(v: Vec<i64>, from: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < v.len() { o.push(v.get(i)); i = i + 1; }
+    return o;
+}

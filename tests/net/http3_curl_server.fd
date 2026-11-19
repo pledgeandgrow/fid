@@ -1,0 +1,73 @@
+// stdlib/http3 against another HTTP/3 implementation: an HTTP/3 server
+// (stdlib/http3_udp.fd) on UDP port 47951 that curl (built with ngtcp2 and
+// nghttp3) talks to: a GET and a POST whose body is echoed. Curl's QPACK
+// encoder Huffman-codes its literals, opens its control and QPACK streams
+// and may send reserved (GREASE) frames and settings: all of it goes
+// through stdlib/http3.fd and stdlib/qpack.fd here.
+//
+// Not in the suite (needs curl with HTTP/3). Build as
+// tests/net/http3_udp_loopback.fd says (output `hc`), then on Linux:
+//   ./hc & sleep 1
+//   curl -s --http3-only -k https://127.0.0.1:47951/; echo
+//   head -c 20000 /dev/zero | tr '\0' 'x' > body.txt
+//   curl -s --http3-only -k --data-binary @body.txt https://127.0.0.1:47951/echo | wc -c
+//   wait
+// curl prints "hello from fides http3" and 20000; the server prints:
+//
+// Expected output:
+// GET / user-agent curl
+// POST /echo 20000 bytes
+// served 2 requests
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use quic_udp;
+use http3;
+use http3_udp;
+use encoding;
+
+fn main() -> i64 {
+    val seed: Vec<i64> = hex_decode_bytes("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    var sv: H3UdpServer = h3_udp_listen(47951, quic_config_server(alpn, cert, seed));
+    var ct_n: Vec<str> = Vec::new();
+    var ct_v: Vec<str> = Vec::new();
+    ct_n.push("content-type");
+    ct_v.push("text/plain");
+    var served: i64 = 0;
+    val t0: i64 = p_clock_now_ms();
+    var last: i64 = t0;
+    // Serve two requests, then wait for the connections to end (at most
+    // 3 s more; 30 s in all)
+    while p_clock_now_ms() - t0 < 30000
+        && !(served >= 2 && (sv.udp.conns.len() == 0 || p_clock_now_ms() - last > 3000)) {
+        val reqs: Vec<H3UdpRequest> = h3_udp_server_poll(& mut sv, 10);
+        var k: i64 = 0;
+        while k < reqs.len() {
+            val r: H3UdpRequest = reqs.get(k);
+            val ua: str = h3_field(& r.msg, "user-agent");
+            if r.msg.method == "GET" && r.msg.path == "/" {
+                var agent: str = "other";
+                if str_starts_with(ua, "curl") {
+                    agent = "curl";
+                }
+                println("GET / user-agent " + agent);
+                h3_udp_respond(& mut sv, r.conn, r.id, 200, ct_n, ct_v, str_bytes("hello from fides http3"));
+            } else if r.msg.method == "POST" && r.msg.path == "/echo" {
+                println("POST /echo " + int_to_str(r.msg.body.len()) + " bytes");
+                h3_udp_respond(& mut sv, r.conn, r.id, 200, ct_n, ct_v, r.msg.body);
+            } else {
+                h3_udp_respond(& mut sv, r.conn, r.id, 404, ct_n, ct_v, str_bytes("not found"));
+            }
+            served = served + 1;
+            last = p_clock_now_ms();
+            k = k + 1;
+        }
+    }
+    println("served " + int_to_str(served) + " requests");
+    h3_udp_server_free(& mut sv);
+    return 0;
+}

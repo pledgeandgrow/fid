@@ -1,0 +1,265 @@
+// RL10 (docs/roadmap/llvm-roadmap.md): the random IR of `fid ir-fuzz`
+// (compiler/ir_ser.fd irfuzz_function, irfuzz_helper_function) holds
+// calls between the generated functions, f64 arithmetic and heap memory,
+// not only i64 arithmetic in stack slots. For seeds 4..7 this builds
+// fz_target, fz_h0 and fz_h1 from lowered-looking shells (parameters
+// __env, a, b) and counts what their IR does: f64 slots, conversions both
+// ways, f64 constants, compares and arithmetic; p_malloc, element
+// addresses, loads and stores through them, p_free; calls from fz_target
+// to both helpers and from fz_h1 to fz_h0 (never the other way, so the
+// calls end). Every block must end in a jump, branch or return, and
+// irfuzz_install_helpers must replace both helpers of a module. Without
+// the extension the "yes" lines say "no" (and the new functions are
+// missing). Values: irfuzz_eval is fz_target's irf_eval_unit and one value
+// per seed; tests/tooling/irfuzz-mirror-check.sh checks them against the
+// language, scripts/fuzz/fuzz_ir.sh against the machine code.
+//
+// Expected output:
+// f64 slots yes
+// int to f64 yes
+// f64 to int yes
+// f64 constants yes
+// f64 arithmetic yes
+// f64 compares yes
+// p_malloc yes
+// p_free yes
+// element addresses yes
+// heap loads and stores yes
+// target calls fz_h0 yes
+// target calls fz_h1 yes
+// fz_h1 calls fz_h0 yes
+// fz_h0 calls nothing yes
+// helpers have no heap yes
+// blocks end in a terminator yes
+// helpers installed yes
+// eval stable yes
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::ast_ser;
+use compiler::inc;
+use compiler::ir_ser;
+
+/// What a lowered `fn name(a: i64, b: i64) -> i64` starts as: the
+/// parameters __env, a, b and no body.
+fn shell(name: str) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var env: i64 = IrFunction_new_value(& mut f, ValueMeta_new(IrType::Ptr(Box::new(IrType::U8))));
+    f.params.push(ValueIdType_new(env, IrType::Ptr(Box::new(IrType::U8))));
+    var a: i64 = IrFunction_new_value(& mut f, ValueMeta_new(IrType::I64));
+    f.params.push(ValueIdType_new(a, IrType::I64));
+    var b: i64 = IrFunction_new_value(& mut f, ValueMeta_new(IrType::I64));
+    f.params.push(ValueIdType_new(b, IrType::I64));
+    return f;
+}
+
+fn is_f64(t: IrType) -> bool {
+    match t {
+        IrType::F64 => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+// counts: 0 f64 alloca, 1 int->f64, 2 f64->int, 3 f64 const, 4 f64
+// arithmetic, 5 f64 compare, 6 p_malloc, 7 p_free, 8 GetElemPtr, 9 load
+// or store through an element address, 10 call fz_h0, 11 call fz_h1,
+// 12 a block without a terminator
+fn count(f: & IrFunction, c: & mut Vec<i64>) {
+    // the values that are element addresses
+    var geps: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var blk: BasicBlock = f.blocks.get(b);
+        var k: i64 = 0;
+        var last_term: bool = false;
+        while k < blk.instructions.len() {
+            var id: i64 = blk.instructions.get(k);
+            last_term = false;
+            match IrFunction_get_inst(f, id) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Alloca(t, _) => {
+                            if is_f64(t) {
+                                c.set(0, c.get(0) + 1);
+                            }
+                        }
+                        Inst::IntToFloat(_, _, _) => {
+                            c.set(1, c.get(1) + 1);
+                        }
+                        Inst::FloatToInt(_, _, _) => {
+                            c.set(2, c.get(2) + 1);
+                        }
+                        Inst::ConstFloat(_, _) => {
+                            c.set(3, c.get(3) + 1);
+                        }
+                        Inst::BinOp(_, _, _, t) => {
+                            if is_f64(t) {
+                                c.set(4, c.get(4) + 1);
+                            }
+                        }
+                        Inst::Call(name, _, _, _) => {
+                            if name == "p_malloc" {
+                                c.set(6, c.get(6) + 1);
+                            }
+                            if name == "p_free" {
+                                c.set(7, c.get(7) + 1);
+                            }
+                            if name == "fz_h0" {
+                                c.set(10, c.get(10) + 1);
+                            }
+                            if name == "fz_h1" {
+                                c.set(11, c.get(11) + 1);
+                            }
+                        }
+                        Inst::GetElemPtr(_, _, _) => {
+                            c.set(8, c.get(8) + 1);
+                            geps.push(id);
+                        }
+                        Inst::Load(p, _) => {
+                            if vec_has(& geps, p) {
+                                c.set(9, c.get(9) + 1);
+                            }
+                        }
+                        Inst::Store(p, _, _) => {
+                            if vec_has(& geps, p) {
+                                c.set(9, c.get(9) + 1);
+                            }
+                        }
+                        Inst::Jump(_) => {
+                            last_term = true;
+                        }
+                        Inst::Branch(cv, _, _) => {
+                            last_term = true;
+                            // a compare of two f64 values feeds a branch
+                            match IrFunction_get_inst(f, cv) {
+                                OptInst::Some(ci) => {
+                                    match ci {
+                                        Inst::BinOp(_, x, _, _) => {
+                                            match IrFunction_get_meta(f, x) {
+                                                OptValueMeta::Some(xm) => {
+                                                    if is_f64(xm.ty) {
+                                                        c.set(5, c.get(5) + 1);
+                                                    }
+                                                }
+                                                OptValueMeta::None => {
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                        }
+                                    }
+                                }
+                                OptInst::None => {
+                                }
+                            }
+                        }
+                        Inst::Return(_) => {
+                            last_term = true;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptInst::None => {
+                }
+            }
+            k = k + 1;
+        }
+        if !last_term {
+            c.set(12, c.get(12) + 1);
+        }
+        b = b + 1;
+    }
+}
+
+fn vec_has(v: & Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn zeros(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    while v.len() < n {
+        v.push(0);
+    }
+    return v;
+}
+
+fn yes(label: str, ok: bool) {
+    if ok {
+        println(label + " yes");
+    } else {
+        println(label + " no");
+    }
+}
+
+fn main() -> i64 {
+    var t: Vec<i64> = zeros(13);
+    var h0: Vec<i64> = zeros(13);
+    var h1: Vec<i64> = zeros(13);
+    var seed: i64 = 4;
+    while seed <= 7 {
+        var ft: IrFunction = irfuzz_function(shell("fz_target"), seed);
+        count(& ft, & mut t);
+        var f0: IrFunction = irfuzz_helper_function(shell("fz_h0"), seed, 0);
+        count(& f0, & mut h0);
+        var f1: IrFunction = irfuzz_helper_function(shell("fz_h1"), seed, 1);
+        count(& f1, & mut h1);
+        seed = seed + 1;
+    }
+    yes("f64 slots", t.get(0) > 0 && h0.get(0) > 0 && h1.get(0) > 0);
+    yes("int to f64", t.get(1) + h0.get(1) + h1.get(1) > 0);
+    yes("f64 to int", t.get(2) > 0 && h0.get(2) > 0);
+    yes("f64 constants", t.get(3) > 0);
+    yes("f64 arithmetic", t.get(4) + h0.get(4) + h1.get(4) > 0);
+    yes("f64 compares", t.get(5) + h0.get(5) + h1.get(5) > 0);
+    // fz_target allocates and frees its buffer once per seed
+    yes("p_malloc", t.get(6) == 4);
+    yes("p_free", t.get(7) == 4);
+    yes("element addresses", t.get(8) >= 4 * 8);
+    yes("heap loads and stores", t.get(9) >= 4 * 16);
+    yes("target calls fz_h0", t.get(10) > 0);
+    yes("target calls fz_h1", t.get(11) > 0);
+    yes("fz_h1 calls fz_h0", h1.get(10) > 0 && h1.get(11) == 0);
+    yes("fz_h0 calls nothing", h0.get(10) == 0 && h0.get(11) == 0);
+    yes("helpers have no heap", h0.get(6) + h1.get(6) + h0.get(8) + h1.get(8) == 0);
+    yes("blocks end in a terminator", t.get(12) + h0.get(12) + h1.get(12) == 0);
+    // a module with the template's functions: both helpers replaced
+    var m: IrModule = IrModule_new();
+    IrModule_add_function(& mut m, shell("fz_h0"));
+    IrModule_add_function(& mut m, shell("fz_h1"));
+    var installed: bool = irfuzz_install_helpers(& mut m, 7);
+    var both: bool = false;
+    match IrModule_get_function(& m, "fz_h1") {
+        OptIrFunction::Some(g) => {
+            both = g.blocks.len() > 0 && g.insts.len() > 0;
+        }
+        OptIrFunction::None => {
+        }
+    }
+    yes("helpers installed", installed && both);
+    var stable: bool = true;
+    seed = 4;
+    while seed <= 7 {
+        var e1: i64 = irfuzz_eval(seed);
+        var e2: i64 = irf_eval_unit(seed, 0 - 1, irfuzz_arg(seed, 0), irfuzz_arg(seed, 1));
+        if e1 != e2 || e1 != irfuzz_eval(seed) {
+            stable = false;
+        }
+        seed = seed + 1;
+    }
+    yes("eval stable", stable);
+    return 0;
+}

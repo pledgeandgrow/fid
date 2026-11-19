@@ -1,0 +1,254 @@
+// stdlib/grpc: Length-Prefixed-Message framing and a deframer fed one byte at a time, status names and the HTTP mapping, grpc-message and grpc-timeout encoding, and unary calls (helloworld.Greeter/SayHello) as HTTP/2 frames from client to server and back: OK, gzip, errors, unknown names, bad content type, trailers-only, CONTINUATION, a cut stream.
+// Expected output:
+// frame: 00000000070a05776f726c64
+// deframe byte by byte: 000000000001111111111112
+// deframed: 0a05616761696e compressed true pending 0
+// deframe errors: message of 256 bytes is larger than 16; bad compressed flag 2
+// status: OK DEADLINE_EXCEEDED UNIMPLEMENTED UNAUTHENTICATED CODE(99)
+// http map: 400 INTERNAL, 401 UNAUTHENTICATED, 404 UNIMPLEMENTED, 503 UNAVAILABLE, 500 UNKNOWN
+// grpc-message: caf%C3%A9 100%25%0A -> café 100%\n, bad escape kept: a%zzb%4
+// grpc-timeout: 1500m 100000S 1666667H | 2000 3600000 2 1 -1 -1
+// services: helloworld.Greeter, calc.Calculator
+// unary: HEADERS DATA+ES -> HEADERS DATA HEADERS+ES
+//   OK "Hello world" deadline 1500 served-by test-suite http 200
+// gzip: HEADERS DATA+ES -> HEADERS DATA HEADERS+ES
+//   OK "Hello gzip" encoding gzip
+// sum: HEADERS DATA+ES -> HEADERS DATA HEADERS+ES
+//   OK total 70305
+// error: HEADERS DATA+ES -> HEADERS+ES
+//   INVALID_ARGUMENT "name is required: 100% needed\n" trailers-only true hint send a name messages 0
+// unknown method: HEADERS DATA+ES -> HEADERS+ES
+//   UNIMPLEMENTED unknown method SayBye for service helloworld.Greeter
+// unknown service: HEADERS DATA+ES -> HEADERS+ES
+//   UNIMPLEMENTED unknown service nope.Svc
+// json: HEADERS DATA+ES -> HEADERS+ES
+//   http 415 -> UNKNOWN
+// brotli: HEADERS DATA+ES -> HEADERS+ES
+//   UNIMPLEMENTED grpc-encoding br is not supported, accepts identity,gzip
+// small frames: HEADERS CONTINUATION DATA DATA DATA+ES -> HEADERS DATA DATA DATA HEADERS+ES CONTINUATION
+//   OK reply length 46
+// no end: RST_STREAM PROTOCOL_ERROR
+// cut message: HEADERS DATA+ES -> HEADERS+ES
+//   INTERNAL a unary call takes exactly one whole message, got 0
+// calls: 10
+use grpc;
+use http2;
+use hpack;
+use protobuf;
+use encoding;
+use vec;
+use string;
+
+fn hello_bytes(name: str) -> Vec<i64> {
+    var w: PbWriter = pb_writer_new();
+    pb_write_string(& mut w, 1, name);
+    return w.bytes;
+}
+
+fn say_hello(call: & GrpcCall, reply: & mut GrpcReply) -> bool {
+    var r: PbReader = pb_reader_new(call.message);
+    var name: str = "";
+    while pb_next(& mut r) {
+        if r.field == 1 {
+            name = pb_read_string(& mut r);
+        } else {
+            pb_skip(& mut r);
+        }
+    }
+    if str_len(name) == 0 {
+        grpc_reply_error(reply, GRPC_INVALID_ARGUMENT, "name is required: 100% needed\n");
+        reply.trailer_names.push("x-hint");
+        reply.trailer_vals.push("send a name");
+        return true;
+    }
+    var w: PbWriter = pb_writer_new();
+    pb_write_string(& mut w, 1, "Hello " + name);
+    grpc_reply_ok(reply, w);
+    reply.names.push("x-deadline");
+    reply.vals.push(int_to_str(call.deadline_ms));
+    reply.trailer_names.push("x-served-by");
+    reply.trailer_vals.push(grpc_call_header(call, "x-client"));
+    return true;
+}
+
+fn sum(call: & GrpcCall, reply: & mut GrpcReply) -> bool {
+    var r: PbReader = pb_reader_new(call.message);
+    var total: i64 = 0;
+    while pb_next(& mut r) {
+        if r.field == 1 {
+            val vs: Vec<i64> = pb_read_packed(& mut r);
+            var i: i64 = 0;
+            while i < vs.len() {
+                total = total + vs.get(i);
+                i = i + 1;
+            }
+        } else {
+            pb_skip(& mut r);
+        }
+    }
+    var w: PbWriter = pb_writer_new();
+    pb_write_varint(& mut w, 1, total);
+    grpc_reply_ok(reply, w);
+    return true;
+}
+
+fn first_string(resp: & GrpcResponse) -> str {
+    var r: PbReader = grpc_response_reader(resp);
+    while pb_next(& mut r) {
+        if r.field == 1 && r.wire == PB_LEN {
+            return pb_read_string(& mut r);
+        }
+        pb_skip(& mut r);
+    }
+    return "";
+}
+
+fn hdr(names: Vec<str>, vals: Vec<str>, n: str) -> str {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == n {
+            return vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn kinds(frames: Vec<H2Frame>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < frames.len() {
+        val f: H2Frame = frames.get(i);
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + h2_type_name(f.ftype);
+        if (f.flags & H2_FLAG_END_STREAM) != 0 && f.ftype != H2_CONTINUATION {
+            out = out + "+ES";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Client -> bytes -> server -> bytes -> client, through the wire format.
+fn round(server: & mut GrpcServer, sdec: & mut Hpack, senc: & mut Hpack, cenc: & mut Hpack, cdec: & mut Hpack, req: GrpcRequest, stream: i64, max_frame: i64, label: str) -> GrpcResponse {
+    val cf: Vec<H2Frame> = grpc_client_frames(cenc, stream, req, max_frame);
+    val wire: Vec<i64> = grpc_frames_bytes(cf);
+    val sf: Vec<H2Frame> = grpc_server_frames(server, sdec, senc, h2_frames_decode(wire, 0), max_frame);
+    val back: Vec<i64> = grpc_frames_bytes(sf);
+    val resp: GrpcResponse = grpc_client_read(cdec, h2_frames_decode(back, 0));
+    println(label + ": " + kinds(cf) + " -> " + kinds(sf));
+    return resp;
+}
+
+fn main() -> i64 {
+    // Framing (the gRPC docs' HelloRequest{name: "world"})
+    val msg: Vec<i64> = hello_bytes("world");
+    val framed: Vec<i64> = grpc_frame(msg, false);
+    println("frame: " + hex_encode_bytes(framed));
+    var d: GrpcDeframer = grpc_deframer_new(GRPC_MAX_MESSAGE);
+    var two: Vec<i64> = grpc_frame(msg, false);
+    val second: Vec<i64> = grpc_frame(hello_bytes("again"), true);
+    var i: i64 = 0;
+    while i < second.len() {
+        two.push(second.get(i));
+        i = i + 1;
+    }
+    var counts: str = "";
+    i = 0;
+    while i < two.len() {
+        var one: Vec<i64> = Vec::new();
+        one.push(two.get(i));
+        grpc_deframer_feed(& mut d, one);
+        counts = counts + int_to_str(d.messages.len());
+        i = i + 1;
+    }
+    println("deframe byte by byte: " + counts);
+    println("deframed: " + hex_encode_bytes(d.messages.get(1)) + " compressed " + bool_to_str(d.compressed.get(1)) + " pending " + int_to_str(grpc_deframer_pending(& d)));
+    var big: GrpcDeframer = grpc_deframer_new(16);
+    grpc_deframer_feed(& mut big, hex_decode_bytes("0000000100"));
+    var flag: GrpcDeframer = grpc_deframer_new(16);
+    grpc_deframer_feed(& mut flag, hex_decode_bytes("0200000000"));
+    println("deframe errors: " + big.error + "; " + flag.error);
+
+    // Status
+    println("status: " + grpc_status_name(0) + " " + grpc_status_name(4) + " " + grpc_status_name(12) + " " + grpc_status_name(16) + " " + grpc_status_name(99));
+    println("http map: 400 " + grpc_status_name(grpc_status_from_http(400)) + ", 401 " + grpc_status_name(grpc_status_from_http(401)) + ", 404 " + grpc_status_name(grpc_status_from_http(404)) + ", 503 " + grpc_status_name(grpc_status_from_http(503)) + ", 500 " + grpc_status_name(grpc_status_from_http(500)));
+    val em: str = grpc_message_encode("caf\u{e9} 100%\n");
+    println("grpc-message: " + em + " -> " + str_replace(grpc_message_decode(em), "\n", "\\n") + ", bad escape kept: " + grpc_message_decode("a%zzb%4"));
+    println("grpc-timeout: " + grpc_timeout_encode(1500) + " " + grpc_timeout_encode(100000000) + " " + grpc_timeout_encode(6000000000000) + " | " + int_to_str(grpc_timeout_parse("2S")) + " " + int_to_str(grpc_timeout_parse("1H")) + " " + int_to_str(grpc_timeout_parse("1500u")) + " " + int_to_str(grpc_timeout_parse("7n")) + " " + int_to_str(grpc_timeout_parse("123456789m")) + " " + int_to_str(grpc_timeout_parse("5x")));
+
+    // A server and two connections' header tables
+    var s: GrpcServer = grpc_server_new();
+    grpc_server_add(& mut s, "helloworld.Greeter", "SayHello", say_hello);
+    grpc_server_add(& mut s, "calc.Calculator", "Sum", sum);
+    println("services: " + str_join(grpc_server_services(& s), ", "));
+    var sdec: Hpack = hpack_new(4096);
+    var senc: Hpack = hpack_new(4096);
+    var cenc: Hpack = hpack_new(4096);
+    var cdec: Hpack = hpack_new(4096);
+
+    var req: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost:50051", hello_bytes("world"));
+    grpc_request_set_timeout(& mut req, 1500);
+    grpc_request_add_metadata(& mut req, "X-Client", "test-suite");
+    val r1: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, req, 1, 16384, "unary");
+    println("  " + grpc_status_name(r1.status) + " \"" + first_string(& r1) + "\" deadline " + hdr(r1.names, r1.vals, "x-deadline") + " served-by " + hdr(r1.trailer_names, r1.trailer_vals, "x-served-by") + " http " + int_to_str(r1.http_status));
+
+    var zreq: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost:50051", Vec::new());
+    grpc_request_gzip(& mut zreq, hello_bytes("gzip"));
+    val r2: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, zreq, 3, 16384, "gzip");
+    println("  " + grpc_status_name(r2.status) + " \"" + first_string(& r2) + "\" encoding " + hdr(r2.names, r2.vals, "grpc-encoding"));
+
+    var nums: PbWriter = pb_writer_new();
+    var vs: Vec<i64> = Vec::new();
+    vs.push(5);
+    vs.push(300);
+    vs.push(70000);
+    pb_write_packed(& mut nums, 1, vs);
+    val r3: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, grpc_unary_request("/calc.Calculator/Sum", "calc", nums.bytes), 5, 16384, "sum");
+    var rr: PbReader = grpc_response_reader(& r3);
+    pb_next(& mut rr);
+    println("  " + grpc_status_name(r3.status) + " total " + int_to_str(pb_read_varint(& mut rr)));
+
+    val r4: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, grpc_unary_request("/helloworld.Greeter/SayHello", "localhost", hello_bytes("")), 7, 16384, "error");
+    println("  " + grpc_status_name(r4.status) + " \"" + str_replace(r4.message, "\n", "\\n") + "\" trailers-only " + bool_to_str(r4.trailers_only) + " hint " + hdr(r4.trailer_names, r4.trailer_vals, "x-hint") + " messages " + int_to_str(r4.messages.len()));
+
+    val r5: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, grpc_unary_request("/helloworld.Greeter/SayBye", "localhost", hello_bytes("x")), 9, 16384, "unknown method");
+    println("  " + grpc_status_name(r5.status) + " " + r5.message);
+    val r6: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, grpc_unary_request("/nope.Svc/Do", "localhost", hello_bytes("x")), 11, 16384, "unknown service");
+    println("  " + grpc_status_name(r6.status) + " " + r6.message);
+
+    var bad: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost", hello_bytes("x"));
+    bad.vals.set(4, "application/json");
+    val r7: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, bad, 13, 16384, "json");
+    println("  http " + int_to_str(r7.http_status) + " -> " + grpc_status_name(r7.status));
+
+    var br: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost", hello_bytes("x"));
+    br.names.push("grpc-encoding");
+    br.vals.push("br");
+    val r8: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, br, 15, 16384, "brotli");
+    println("  " + grpc_status_name(r8.status) + " " + r8.message + ", accepts " + hdr(r8.names, r8.vals, "grpc-accept-encoding"));
+
+    // Small frames: CONTINUATION for the headers, several DATA frames
+    var longreq: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost", hello_bytes(str_repeat("n", 40)));
+    grpc_request_add_metadata(& mut longreq, "x-client", str_repeat("c", 30));
+    val r9: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, longreq, 17, 20, "small frames");
+    println("  " + grpc_status_name(r9.status) + " reply length " + int_to_str(str_len(first_string(& r9))));
+
+    // A stream that never ends is reset (its header block is made with
+    // another table: the server never decodes it)
+    var cut: Vec<H2Frame> = Vec::new();
+    var other: Hpack = hpack_new(4096);
+    cut.push(h2_headers_frame(19, hpack_encode(& mut other, grpc_unary_request("/a.B/C", "h", Vec::new()).names, grpc_unary_request("/a.B/C", "h", Vec::new()).vals), false, true));
+    val rs: Vec<H2Frame> = grpc_server_frames(& mut s, & mut sdec, & mut senc, cut, 16384);
+    println("no end: " + kinds(rs) + " " + h2_error_name(h2_parse(rs.get(0)).code));
+
+    // A message cut short by the end of the stream
+    var part: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost", hello_bytes("x"));
+    part.body.pop();
+    val r10: GrpcResponse = round(& mut s, & mut sdec, & mut senc, & mut cenc, & mut cdec, part, 21, 16384, "cut message");
+    println("  " + grpc_status_name(r10.status) + " " + r10.message);
+    println("calls: " + int_to_str(s.calls));
+    return 0;
+}

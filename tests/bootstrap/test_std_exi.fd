@@ -1,0 +1,215 @@
+// stdlib/exi: primitive encodings (Unsigned 300 = AC 02 as in EXI 7.1.6), built-in grammar documents with learning, the byte-aligned body and options header, and a schema-informed document (attributes, repeats, enumeration, n-bit, list, string table local and global hits) in non-strict and strict mode, each checked against bit sequences derived by hand from the EXI 1.0 rules, decoded back and re-encoded.
+// Expected output:
+// uint: 00 7f 8001 ac02 808001
+// int: 0000 8080 d58100 n-bit 3 bits of 5: a0
+// string: 0568e9016c6c6f
+// builtin <a>x</a>: 804098703780 same true
+// builtin list: 80415b1a5cdd2415a5d195b7037848040040 same true
+// learned: item 2 events, text x x
+// fragment: 2 roots, back the same true
+// byte-aligned with options: a00094010261030378 00 same true
+// options back: byte true strict false valueMaxLength 7 capacity 3 schemaId v2g
+// options strict+fragment+nil schemaId: round trip true nil true
+// schema non-strict: 8001104dc4033137b63a0ac0204000005240300300c04000 same true
+// schema strict: 8004413720cc4ded8e9580440005a03018060200 same true
+// decoded: id A7 prio 2 items 2 size M note bolt codes 3: 1 -2 0
+// valueMaxLength 3: longer by 8 bytes, back the same true
+// capacity 1: back the same true
+// refused: SE(qty) is not allowed in item here (expected SE(name))
+use exi;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn wuint(v: i64) -> str {
+    var w: ExiWriter = exi_writer();
+    exi_w_uint(& mut w, v);
+    return hx(exi_w_bytes(& w));
+}
+
+fn wint(v: i64) -> str {
+    var w: ExiWriter = exi_writer();
+    exi_w_int(& mut w, v);
+    return hx(exi_w_bytes(& w));
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+/// Encode, decode, re-encode: the hex and whether the second encoding is
+/// the same.
+fn trip(s: & ExiSchema, o: & ExiOptions, evs: & Vec<ExiEvent>) -> str {
+    val r: ExiResult = exi_encode(s, o, evs);
+    if !r.ok {
+        return "encode failed: " + r.error;
+    }
+    val d: ExiDoc = exi_decode(s, o, r.bytes);
+    if !d.ok {
+        return hx(r.bytes) + " decode failed: " + d.error;
+    }
+    val r2: ExiResult = exi_encode(s, o, & d.events);
+    return hx(r.bytes) + " same " + yes(r2.ok && hx(r2.bytes) == hx(r.bytes));
+}
+
+fn order_schema() -> ExiSchema {
+    var s: ExiSchema = exi_schema_new();
+    val ns: str = "urn:t";
+    val d_str: i64 = exi_dt(& mut s, EXI_DT_STRING, 0, 0);
+    val d_uns: i64 = exi_dt(& mut s, EXI_DT_UNSIGNED, 0, 0);
+    val d_prio: i64 = exi_dt(& mut s, EXI_DT_NBIT, 1, 4);
+    val d_size: i64 = exi_dt_enum(& mut s, "S|M|L");
+    val d_int: i64 = exi_dt(& mut s, EXI_DT_INTEGER, 0, 0);
+    val d_codes: i64 = exi_dt_list(& mut s, d_int);
+    val t_str: i64 = exi_type_simple(& mut s, d_str);
+    val t_uns: i64 = exi_type_simple(& mut s, d_uns);
+    val t_size: i64 = exi_type_simple(& mut s, d_size);
+    val t_codes: i64 = exi_type_simple(& mut s, d_codes);
+    val item: i64 = exi_type(& mut s);
+    exi_elem(& mut s, item, ns, "name", t_str, 1, 1);
+    exi_elem(& mut s, item, ns, "qty", t_uns, 1, 1);
+    exi_elem(& mut s, item, ns, "size", t_size, 0, 1);
+    val order: i64 = exi_type(& mut s);
+    exi_attr(& mut s, order, "", "prio", d_prio, false);
+    exi_attr(& mut s, order, "", "id", d_str, true);
+    exi_elem(& mut s, order, ns, "item", item, 1, - 1);
+    exi_elem(& mut s, order, ns, "note", t_str, 0, 1);
+    exi_elem(& mut s, order, ns, "codes", t_codes, 0, 1);
+    exi_global(& mut s, ns, "order", order);
+    exi_schema_finish(& mut s);
+    return s;
+}
+
+fn item(evs: & mut Vec<ExiEvent>, name: str, qty: i64, size: str) {
+    evs.push(exi_se("urn:t", "item"));
+    exi_push_leaf(evs, "urn:t", "name", exi_ch_str(name));
+    exi_push_leaf(evs, "urn:t", "qty", exi_ch_int(qty));
+    if size != "" {
+        exi_push_leaf(evs, "urn:t", "size", exi_ch_str(size));
+    }
+    evs.push(exi_ee());
+}
+
+fn order_events() -> Vec<ExiEvent> {
+    var evs: Vec<ExiEvent> = Vec::new();
+    evs.push(exi_se("urn:t", "order"));
+    evs.push(exi_at_str("", "id", "A7"));
+    evs.push(exi_at_int("", "prio", 2));
+    item(& mut evs, "bolt", 300, "M");
+    item(& mut evs, "bolt", 5, "");
+    exi_push_leaf(& mut evs, "urn:t", "note", exi_ch_str("bolt"));
+    var codes: ExiEvent = exi_ch_int(0);
+    codes.bval.push(1);
+    codes.bval.push(- 2);
+    codes.bval.push(0);
+    exi_push_leaf(& mut evs, "urn:t", "codes", codes);
+    evs.push(exi_ee());
+    return evs;
+}
+
+fn main() {
+    println("uint: " + wuint(0) + " " + wuint(127) + " " + wuint(128) + " " + wuint(300) + " " + wuint(16384));
+    var nb: ExiWriter = exi_writer();
+    exi_w_nbit(& mut nb, 5, 3);
+    println("int: " + wint(0) + " " + wint(- 2) + " " + wint(- 300) + " n-bit 3 bits of 5: " + hx(exi_w_bytes(& nb)));
+    var sw: ExiWriter = exi_writer();
+    exi_w_string(& mut sw, "h" + str_from_bytes(hex_decode_bytes("c3a9")) + "llo");
+    println("string: " + hx(exi_w_bytes(& sw)));
+
+    // built-in grammars
+    val none: ExiSchema = exi_schema_none();
+    val dflt: ExiOptions = exi_options();
+    var a: Vec<ExiEvent> = Vec::new();
+    exi_push_leaf(& mut a, "", "a", exi_ch_str("x"));
+    println("builtin <a>x</a>: " + trip(& none, & dflt, & a));
+    var lst: Vec<ExiEvent> = Vec::new();
+    lst.push(exi_se("", "list"));
+    exi_push_leaf(& mut lst, "", "item", exi_ch_str("x"));
+    exi_push_leaf(& mut lst, "", "item", exi_ch_str("x"));
+    lst.push(exi_ee());
+    println("builtin list: " + trip(& none, & dflt, & lst));
+    val lr: ExiResult = exi_encode(& none, & dflt, & lst);
+    val ld: ExiDoc = exi_decode(& none, & dflt, lr.bytes);
+    println("learned: item " + int_to_str(exi_count(& ld.events, "list/item")) + " events, text " + exi_value_of(& ld.events, exi_find_nth(& ld.events, "list/item", 0)).sval + " " + exi_value_of(& ld.events, exi_find_nth(& ld.events, "list/item", 1)).sval);
+
+    var fo: ExiOptions = exi_options();
+    fo.fragment = true;
+    var fr: Vec<ExiEvent> = Vec::new();
+    exi_push_leaf(& mut fr, "", "a", exi_ch_str("1"));
+    exi_push_leaf(& mut fr, "urn:b", "b", exi_ch_str("1"));
+    val fe: ExiResult = exi_encode(& none, & fo, & fr);
+    val fd: ExiDoc = exi_decode(& none, & fo, fe.bytes);
+    val fe2: ExiResult = exi_encode(& none, & fo, & fd.events);
+    println("fragment: " + int_to_str(fd.events.len() / 3) + " roots, back the same " + yes(fd.ok && hx(fe2.bytes) == hx(fe.bytes)));
+
+    // byte-aligned body, options in the header
+    var bo: ExiOptions = exi_options();
+    bo.alignment = EXI_BYTE_ALIGNED;
+    bo.in_header = true;
+    val bt: str = trip(& none, & bo, & a);
+    println("byte-aligned with options: " + str_slice(bt, 0, 18) + " " + str_slice(bt, 18, str_len(bt)));
+    var ho: ExiOptions = exi_options();
+    ho.alignment = EXI_BYTE_ALIGNED;
+    ho.in_header = true;
+    ho.value_max_length = 7;
+    ho.value_capacity = 3;
+    ho.has_schema_id = true;
+    ho.schema_id = "v2g";
+    val he: ExiResult = exi_encode(& none, & ho, & a);
+    val hd: ExiDoc = exi_decode(& none, & dflt, he.bytes);
+    println("options back: byte " + yes(hd.options.alignment == EXI_BYTE_ALIGNED) + " strict " + yes(hd.options.strict) + " valueMaxLength " + int_to_str(hd.options.value_max_length) + " capacity " + int_to_str(hd.options.value_capacity) + " schemaId " + hd.options.schema_id);
+    var so: ExiOptions = exi_options();
+    so.in_header = true;
+    so.strict = true;
+    so.fragment = true;
+    so.has_schema_id = true;
+    so.schema_id_nil = true;
+    so.cookie = true;
+    val se: ExiResult = exi_encode(& none, & so, & fr);
+    val sd: ExiDoc = exi_decode(& none, & dflt, se.bytes);
+    val se2: ExiResult = exi_encode(& none, & sd.options, & sd.events);
+    println("options strict+fragment+nil schemaId: round trip " + yes(sd.ok && sd.options.strict && sd.options.fragment && sd.options.cookie && hx(se2.bytes) == hx(se.bytes)) + " nil " + yes(sd.options.schema_id_nil));
+
+    // schema-informed
+    val os: ExiSchema = order_schema();
+    val oe: Vec<ExiEvent> = order_events();
+    println("schema non-strict: " + trip(& os, & dflt, & oe));
+    var st: ExiOptions = exi_options();
+    st.strict = true;
+    println("schema strict: " + trip(& os, & st, & oe));
+    val orr: ExiResult = exi_encode(& os, & dflt, & oe);
+    val od: ExiDoc = exi_decode(& os, & dflt, orr.bytes);
+    val ev: Vec<ExiEvent> = od.events;
+    val root: i64 = exi_find(& ev, "order");
+    val cd: ExiEvent = exi_get(& ev, "order/codes");
+    println("decoded: id " + exi_attr_of(& ev, root, "id").sval + " prio " + int_to_str(exi_attr_of(& ev, root, "prio").ival) + " items " + int_to_str(exi_count(& ev, "order/item")) + " size " + exi_get(& ev, "order/item/size").sval + " note " + exi_get(& ev, "order/note").sval + " codes " + int_to_str(cd.bval.len()) + ": " + int_to_str(cd.bval.get(0)) + " " + int_to_str(cd.bval.get(1)) + " " + int_to_str(cd.bval.get(2)));
+    var ml: ExiOptions = exi_options();
+    ml.value_max_length = 3;
+    val mr: ExiResult = exi_encode(& os, & ml, & oe);
+    val md: ExiDoc = exi_decode(& os, & ml, mr.bytes);
+    val mr2: ExiResult = exi_encode(& os, & ml, & md.events);
+    println("valueMaxLength 3: longer by " + int_to_str(mr.bytes.len() - orr.bytes.len()) + " bytes, back the same " + yes(md.ok && hx(mr2.bytes) == hx(mr.bytes)));
+    var cp: ExiOptions = exi_options();
+    cp.value_capacity = 1;
+    val cr: ExiResult = exi_encode(& os, & cp, & oe);
+    val cdd: ExiDoc = exi_decode(& os, & cp, cr.bytes);
+    val cr2: ExiResult = exi_encode(& os, & cp, & cdd.events);
+    println("capacity 1: back the same " + yes(cdd.ok && hx(cr2.bytes) == hx(cr.bytes)));
+
+    var bad: Vec<ExiEvent> = Vec::new();
+    bad.push(exi_se("urn:t", "order"));
+    bad.push(exi_at_str("", "id", "x"));
+    bad.push(exi_se("urn:t", "item"));
+    exi_push_leaf(& mut bad, "urn:t", "qty", exi_ch_int(1));
+    bad.push(exi_ee());
+    bad.push(exi_ee());
+    val br: ExiResult = exi_encode(& os, & dflt, & bad);
+    println("refused: " + br.error);
+}

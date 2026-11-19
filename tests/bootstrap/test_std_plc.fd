@@ -1,0 +1,274 @@
+// stdlib/plc: IEC 61131-3 Structured Text interpreter, function blocks, scan cycle, ladder rungs
+// Programs run over simulated inputs, one scan per time step. Expected
+// behaviour follows IEC 61131-3 (3rd ed.) semantics: TON output after PT of
+// continuous input, TOF holds Q for PT after the input falls, TP gives one
+// PT-long pulse per rising edge, CTU counts rising edges with reset priority,
+// R_TRIG is true for exactly one scan; INT division truncates toward zero and
+// MOD takes the dividend's sign (-17 / 5 = -3, -17 MOD 5 = -2). The ladder
+// is the classic start/stop seal-in circuit.
+// Expected output:
+// conveyor compiled: error='' vars=26
+// t=0 motor=1 lamp=0 count=0 batch=0 edges=0
+// t=500 motor=1 lamp=0 count=0 batch=0 edges=0
+// t=1000 motor=1 lamp=0 count=1 batch=0 edges=1
+// t=1500 motor=1 lamp=0 count=1 batch=0 edges=1
+// t=2000 motor=1 lamp=1 count=2 batch=0 edges=2
+// t=2500 motor=1 lamp=1 count=2 batch=0 edges=2
+// t=3000 motor=1 lamp=1 count=3 batch=1 edges=3
+// t=3500 motor=1 lamp=1 count=3 batch=1 edges=3
+// t=4000 motor=0 lamp=0 count=0 batch=0 edges=4
+// traffic: RRRRRRGGGGGYYR
+// math: sum=385 k=7 r=-2 q=-3 x=3.5 f=14.1421 bits=161 k2=-1 sum2=381 case=8
+// tof: 1 1 1 1 0 0  tp: 1 1 0 0 0 1  ctd: 2 1 0 q=1
+// syntax error: line 3: expected ;, found Y
+// undeclared: line 1: undeclared variable ZZ
+// runtime: false division by zero
+// watchdog: false watchdog: more than 5000 steps in one scan
+// ladder: start 1 hold 1 stop 0 restart 1 latch 1 reset 0 lamp 1
+use plc;
+use string;
+use math;
+
+fn b(x: f64) -> str {
+    if x != 0.0 {
+        return "1";
+    }
+    return "0";
+}
+
+fn conveyor() -> str {
+    return "PROGRAM conveyor
+VAR
+  start AT %IX0.0 : BOOL;
+  stop AT %IX0.1 : BOOL;
+  sensor AT %IX0.2 : BOOL;
+  motor AT %QX0.0 : BOOL;
+  lamp AT %QX0.1 : BOOL;
+  batch_done AT %QX0.2 : BOOL;
+  running : BOOL;
+  delay : TON;
+  counter : CTU;
+  edge : R_TRIG;
+  edges : INT;
+END_VAR
+(* seal-in: start latches, stop wins *)
+running := (start OR running) AND NOT stop;
+motor := running;
+delay(IN := running, PT := T#2s);
+lamp := delay.Q;
+counter(CU := sensor, R := stop, PV := 3);
+batch_done := counter.Q;
+edge(CLK := sensor);
+IF edge.Q THEN
+  edges := edges + 1;
+END_IF;
+END_PROGRAM";
+}
+
+fn traffic() -> str {
+    return "VAR
+  state : INT := 0;
+  t : TON;
+  red AT %QX1.0 : BOOL;
+  yellow AT %QX1.1 : BOOL;
+  green AT %QX1.2 : BOOL;
+END_VAR
+CASE state OF
+  0:
+    red := TRUE; yellow := FALSE; green := FALSE;
+    t(IN := TRUE, PT := T#5s);
+    IF t.Q THEN state := 1; t(IN := FALSE); END_IF;
+  1:
+    red := FALSE; green := TRUE;
+    t(IN := TRUE, PT := T#4s);
+    IF t.Q THEN state := 2; t(IN := FALSE); END_IF;
+  2:
+    green := FALSE; yellow := TRUE;
+    t(IN := TRUE, PT := T#1s);
+    IF t.Q THEN state := 0; t(IN := FALSE); END_IF;
+END_CASE;";
+}
+
+fn maths() -> str {
+    return "VAR
+  i, sum, k, r, q, bits, k2, sum2, c : INT;
+  n : INT := 10;
+  x, f : REAL;
+END_VAR
+sum := 0;
+FOR i := 1 TO n DO
+  sum := sum + i * i;
+END_FOR;
+k := 0;
+WHILE TRUE DO
+  k := k + 1;
+  IF k >= 7 THEN EXIT; END_IF;
+END_WHILE;
+r := -17 MOD 5;
+q := -17 / 5;
+x := 7 / 2.0;
+f := SQRT(2.0) * LIMIT(0, 15, 10);
+bits := 16#F0 AND 2#10101010 OR 1;
+k2 := k;
+REPEAT
+  k2 := k2 - 2;
+UNTIL k2 < 0 END_REPEAT;
+sum2 := sum;
+FOR i := 10 TO 1 BY -3 DO
+  sum2 := sum2 - 1;
+END_FOR;
+CASE k OF
+  1, 2: c := 1;
+  3..6: c := 5;
+  7..9: c := 8;
+ELSE
+  c := -1;
+END_CASE;";
+}
+
+fn blocks() -> str {
+    return "VAR
+  in1, in2, in3 : BOOL;
+  off : TOF;
+  pulse : TP;
+  down : CTD;
+END_VAR
+off(IN := in1, PT := T#1500ms);
+pulse(IN := in2, PT := TIME#1s);
+down(CD := in3, LD := FALSE, PV := 3);";
+}
+
+fn main() {
+    var p = plc_compile(conveyor());
+    var io = plc_io_new();
+    println("conveyor compiled: error='" + p.error + "' vars=" + int_to_str(p.var_names.len()));
+    var t: i64 = 0;
+    while t <= 4000 {
+        plc_set_input(&mut io, "%IX0.0", if t == 0 { 1.0 } else { 0.0 });
+        plc_set_input(&mut io, "%IX0.1", if t == 4000 { 1.0 } else { 0.0 });
+        plc_set_input(&mut io, "%IX0.2", if t % 1000 == 0 && t > 0 { 1.0 } else { 0.0 });
+        plc_scan(&mut p, &mut io, t as f64);
+        println("t=" + int_to_str(t) + " motor=" + b(plc_get_output(&io, "%QX0.0")) + " lamp=" + b(plc_get_output(&io, "%QX0.1")) + " count=" + int_to_str(plc_get(&p, "counter.CV") as i64) + " batch=" + b(plc_get_output(&io, "%QX0.2")) + " edges=" + int_to_str(plc_get(&p, "edges") as i64));
+        t = t + 500;
+    }
+
+    var tl = plc_compile(traffic());
+    var io2 = plc_io_new();
+    var seq: str = "";
+    t = 0;
+    while t <= 13 {
+        plc_scan(&mut tl, &mut io2, (t * 1000) as f64);
+        if plc_get_output(&io2, "%QX1.0") != 0.0 {
+            seq = seq + "R";
+        } else if plc_get_output(&io2, "%QX1.2") != 0.0 {
+            seq = seq + "G";
+        } else {
+            seq = seq + "Y";
+        }
+        t = t + 1;
+    }
+    println("traffic: " + seq);
+
+    var m = plc_compile(maths());
+    var io3 = plc_io_new();
+    plc_scan(&mut m, &mut io3, 0.0);
+    println("math: sum=" + int_to_str(plc_get(&m, "sum") as i64) + " k=" + int_to_str(plc_get(&m, "k") as i64) + " r=" + int_to_str(plc_get(&m, "r") as i64) + " q=" + int_to_str(plc_get(&m, "q") as i64) + " x=" + float_to_str(plc_get(&m, "x")) + " f=" + float_to_str(math_floor(plc_get(&m, "f") * 10000.0 + 0.5) / 10000.0) + " bits=" + int_to_str(plc_get(&m, "bits") as i64) + " k2=" + int_to_str(plc_get(&m, "k2") as i64) + " sum2=" + int_to_str(plc_get(&m, "sum2") as i64) + " case=" + int_to_str(plc_get(&m, "c") as i64));
+
+    // TOF: input high at 0 ms, low from 500 ms; Q stays for 1500 ms (until 2000)
+    // TP: rising edges at 0 and 2500 ms; each gives a 1 s pulse
+    // CTD: loads 3 then counts down on rising edges
+    var fb = plc_compile(blocks());
+    var io4 = plc_io_new();
+    plc_set(&mut fb, "down.CV", 3.0);
+    var tof: str = "";
+    var tp: str = "";
+    var ctd: str = "";
+    t = 0;
+    while t < 3000 {
+        plc_set(&mut fb, "in1", if t < 500 { 1.0 } else { 0.0 });
+        plc_set(&mut fb, "in2", if t < 1500 || t >= 2500 { 1.0 } else { 0.0 });
+        plc_set(&mut fb, "in3", if t == 500 || t == 1500 || t == 2500 { 1.0 } else { 0.0 });
+        plc_scan(&mut fb, &mut io4, t as f64);
+        tof = tof + " " + b(plc_get(&fb, "off.Q"));
+        tp = tp + " " + b(plc_get(&fb, "pulse.Q"));
+        if t == 500 || t == 1500 || t == 2500 {
+            ctd = ctd + " " + int_to_str(plc_get(&fb, "down.CV") as i64);
+        }
+        t = t + 500;
+    }
+    println("tof:" + tof + "  tp:" + tp + "  ctd:" + ctd + " q=" + b(plc_get(&fb, "down.Q")));
+
+    val bad = plc_compile("VAR x, y : INT; END_VAR
+x := 1;
+x := 2 y := 3;");
+    println("syntax error: " + bad.error);
+    val und = plc_compile("zz := 1;");
+    println("undeclared: " + und.error);
+    var dz = plc_compile("VAR a, z : INT; END_VAR a := 10 / z;");
+    val ok_dz = plc_scan(&mut dz, &mut io4, 0.0);
+    println("runtime: " + bool_to_str(ok_dz) + " " + dz.error);
+    var wd = plc_compile("VAR n : INT; END_VAR WHILE TRUE DO n := n + 1; END_WHILE;");
+    wd.max_steps = 5000;
+    val ok_wd = plc_scan(&mut wd, &mut io4, 0.0);
+    println("watchdog: " + bool_to_str(ok_wd) + " " + wd.error);
+
+    var lad = ladder_new();
+    var seal: Vec<i64> = Vec::new();
+    seal.push(lad_contact(&mut lad, "%IX0.0", false));
+    seal.push(lad_contact(&mut lad, "%QX0.0", false));
+    var r1: Vec<i64> = Vec::new();
+    val par = lad_parallel(&mut lad, seal);
+    r1.push(par);
+    r1.push(lad_contact(&mut lad, "%IX0.1", true));
+    var c1: Vec<str> = Vec::new();
+    c1.push("%QX0.0");
+    var k1: Vec<i64> = Vec::new();
+    k1.push(COIL_OUT);
+    val n1 = lad_series(&mut lad, r1);
+    lad_rung(&mut lad, n1, c1, k1);
+    var r2: Vec<i64> = Vec::new();
+    r2.push(lad_contact(&mut lad, "%QX0.0", false));
+    r2.push(lad_contact(&mut lad, "%IX0.2", false));
+    var c2: Vec<str> = Vec::new();
+    c2.push("%MX0.0");
+    var k2: Vec<i64> = Vec::new();
+    k2.push(COIL_SET);
+    val n2 = lad_series(&mut lad, r2);
+    lad_rung(&mut lad, n2, c2, k2);
+    var c3: Vec<str> = Vec::new();
+    c3.push("%MX0.0");
+    var k3: Vec<i64> = Vec::new();
+    k3.push(COIL_RESET);
+    val n3 = lad_contact(&mut lad, "%IX0.3", false);
+    lad_rung(&mut lad, n3, c3, k3);
+    var c4: Vec<str> = Vec::new();
+    c4.push("%QX0.1");
+    var k4: Vec<i64> = Vec::new();
+    k4.push(COIL_NEG);
+    val n4 = lad_contact(&mut lad, "%QX0.0", false);
+    lad_rung(&mut lad, n4, c4, k4);
+
+    var mem: HashMap<str, f64> = HashMap::new();
+    mem.insert("IX0.0", 1.0);
+    ladder_scan(&lad, &mut mem);
+    val s1: f64 = mem.get("QX0.0");
+    mem.insert("IX0.0", 0.0);
+    ladder_scan(&lad, &mut mem);
+    val s2: f64 = mem.get("QX0.0");
+    mem.insert("IX0.1", 1.0);
+    ladder_scan(&lad, &mut mem);
+    val s3: f64 = mem.get("QX0.0");
+    mem.insert("IX0.1", 0.0);
+    mem.insert("IX0.0", 1.0);
+    mem.insert("IX0.2", 1.0);
+    ladder_scan(&lad, &mut mem);
+    val s4: f64 = mem.get("QX0.0");
+    val latch: f64 = mem.get("MX0.0");
+    mem.insert("IX0.2", 0.0);
+    mem.insert("IX0.3", 1.0);
+    mem.insert("IX0.1", 1.0);
+    ladder_scan(&lad, &mut mem);
+    val reset: f64 = mem.get("MX0.0");
+    val lamp: f64 = mem.get("QX0.1");
+    println("ladder: start " + b(s1) + " hold " + b(s2) + " stop " + b(s3) + " restart " + b(s4) + " latch " + b(latch) + " reset " + b(reset) + " lamp " + b(lamp));
+}

@@ -1,0 +1,241 @@
+// stdlib/jobs: priority order, delayed and scheduled jobs, leases, retries with seeded exponential backoff and jitter, the dead-letter list, records through the in-memory backend and a queue reloaded from it, cron parsing and next-run times (checked against a brute-force search) and recurring jobs on an injected clock.
+// Expected output:
+// order: #2 high (try 1); #3 high-later (try 1); #1 low (try 1); none
+// next due: +60 s, pending 2, running 3
+// delayed at +60 s: #4 delayed (try 1)
+// other queue: none, any queue at +1 h: #5 nightly (try 1)
+// complete: true false, running 4
+// backoff: 962 1479 2636 5219 dead
+// jitter within [d/2, d] for 12 attempts: true
+// dead letters: 1 #1 tries 5 last error "timeout #5"
+// retry dead: true -> #1 flaky (try 1)
+// held by a worker that never answers; reserve again: -1
+// tick before expiry: 0, after: 1
+// after lease: state 0 attempts 1 error "lease expired"
+// record: v1 | 1 | q | 3 | 0 | 0 | 2 | 1794910025000 | 1794910020000 | 0 |  | tab%09here, newline%0Ahere, 100%25 sure
+// decoded payload same: true, run_at same: true
+// reloaded: 2 jobs, next id 3, job 2 attempts 1 error boom
+// bad record: false
+// now: 2026-11-17 10:07 Tue
+// cron */15 9-17 * * MON-FRI -> 2026-11-17 10:15 Tue
+// cron @yearly -> 2027-01-01 00:00 Fri
+// cron 30 4 1,15 * 5 -> 2026-11-20 04:30 Fri
+// cron 0 12 29 2 * -> 2028-02-29 12:00 Tue
+// cron 0 0 30 2 * -> never
+// cron @weekly -> 2026-11-22 00:00 Sun
+// cron 0 8 * * 5-7 -> 2026-11-20 08:00 Fri
+// cron 15 14 1 * * -> 2026-12-01 14:15 Tue
+// cron 0 22 * * 1-5 -> 2026-11-17 22:00 Tue
+// cron 5/20 */6 * JAN,JUL * -> 2027-01-01 00:05 Fri
+// bad: cron: bad minute field 60
+// bad: cron: need 5 fields, got 3 in "* * *"
+// bad: cron: bad month field 13
+// bad: cron: bad day-of-week field FRI-MON
+// bad: cron: bad minute field */0
+// bad: cron: bad minute field a
+// runs: 11-17 10:15 Tue; 11-17 10:30 Tue; 11-17 10:45 Tue; 11-17 11:00 Tue; 11-17 11:15 Tue; 11-17 11:30 Tue; 
+// after Fri 17:50: 2026-11-23 09:00 Mon
+// add cron: true false (cron: bad minute field 61)
+// sync next: 2026-11-17 10:30 Tue
+// tick +10 min: 0, tick +2 h: 4, pending 4
+// cron jobs ran for: 10:30 11:00 11:30 12:00 next 12:30
+use jobs;
+use vec;
+use string;
+
+fn show(o: Option<Job>) -> str {
+    match o {
+        Option::Some(j) => { return "#" + int_to_str(j.id) + " " + j.payload + " (try " + int_to_str(j.attempts) + ")"; }
+        Option::None => { return "none"; }
+    }
+}
+
+fn grab(q: & mut JobQueue, queue: str, now: i64) -> i64 {
+    return jobs_reserve_id(q, queue, now, 30000);
+}
+
+fn main() -> i64 {
+    val t0: i64 = 1794910020000;   // 2026-11-17 10:07 UTC, in ms
+    var q: JobQueue = jobs_queue_new(jobs_mem_backend(), 2026);
+
+    // Priority, then run-at, then age
+    jobs_enqueue(& mut q, "mail", "low", 1, 0, 3, t0);
+    jobs_enqueue(& mut q, "mail", "high", 9, 0, 3, t0);
+    jobs_enqueue(& mut q, "mail", "high-later", 9, 0, 3, t0 + 1);
+    jobs_enqueue(& mut q, "mail", "delayed", 50, 60000, 3, t0);
+    jobs_schedule(& mut q, "report", "nightly", 5, t0 + 3600000, 1, t0);
+    var order: str = "";
+    var k: i64 = 0;
+    while k < 3 {
+        val o: Option<Job> = jobs_reserve(& mut q, "mail", t0 + 10, 30000);
+        order = order + show(o) + "; ";
+        k = k + 1;
+    }
+    println("order: " + order + show(jobs_reserve(& mut q, "mail", t0 + 10, 30000)));
+    println("next due: +" + int_to_str((jobs_next_due(& q) - t0) / 1000) + " s, pending " + int_to_str(jobs_count(& q, JOB_PENDING)) + ", running " + int_to_str(jobs_count(& q, JOB_RUNNING)));
+    println("delayed at +60 s: " + show(jobs_reserve(& mut q, "mail", t0 + 60000, 30000)));
+    println("other queue: " + show(jobs_reserve(& mut q, "report", t0 + 60000, 30000)) + ", any queue at +1 h: " + show(jobs_reserve(& mut q, "", t0 + 3600000, 30000)));
+    println("complete: " + bool_to_str(jobs_complete(& mut q, 2, t0 + 70000)) + " " + bool_to_str(jobs_complete(& mut q, 2, t0 + 70000)) + ", running " + int_to_str(jobs_count(& q, JOB_RUNNING)));
+
+    // Retries with backoff (seeded: the same every run)
+    var r: JobQueue = jobs_queue_new(jobs_mem_backend(), 42);
+    r.backoff_base_ms = 1000;
+    r.backoff_max_ms = 8000;
+    val id: i64 = jobs_enqueue(& mut r, "x", "flaky", 0, 0, 5, t0);
+    var now: i64 = t0;
+    var delays: str = "";
+    var tries: i64 = 0;
+    while tries < 5 {
+        val got: i64 = grab(& mut r, "x", now);
+        if got < 0 {
+            delays = delays + "?";
+            break;
+        }
+        jobs_fail(& mut r, got, "timeout #" + int_to_str(tries + 1), now);
+        var state: i64 = 0 - 1;
+        var run_at: i64 = 0;
+        match jobs_get(& r, id) {
+            Option::Some(j) => {
+                state = j.state;
+                run_at = j.run_at;
+            }
+            Option::None => { }
+        }
+        if state == JOB_PENDING {
+            delays = delays + int_to_str(run_at - now) + " ";
+            // not due a millisecond early, due at run_at
+            if grab(& mut r, "x", run_at - 1) >= 0 {
+                delays = delays + "(early!) ";
+            }
+            now = run_at;
+        } else if state == JOB_DEAD {
+            delays = delays + "dead";
+        } else {
+            delays = delays + "gone";
+        }
+        tries = tries + 1;
+    }
+    println("backoff: " + delays);
+    var bounded: bool = true;
+    var r2: JobQueue = jobs_queue_new(jobs_mem_backend(), 7);
+    var a: i64 = 1;
+    while a <= 12 {
+        val d: i64 = jobs_backoff_ms(& mut r2, a);
+        var full: i64 = 1000;
+        var e: i64 = 1;
+        while e < a && full < 3600000 {
+            full = full * 2;
+            e = e + 1;
+        }
+        if full > 3600000 {
+            full = 3600000;
+        }
+        if d < full / 2 || d > full {
+            bounded = false;
+        }
+        a = a + 1;
+    }
+    println("jitter within [d/2, d] for 12 attempts: " + bool_to_str(bounded));
+    val dead: Vec<Job> = jobs_dead(& r);
+    println("dead letters: " + int_to_str(dead.len()) + " #" + int_to_str(dead.get(0).id) + " tries " + int_to_str(dead.get(0).attempts) + " last error \"" + dead.get(0).last_error + "\"");
+    println("retry dead: " + bool_to_str(jobs_retry_dead(& mut r, id, now)) + " -> " + show(jobs_reserve(& mut r, "x", now, 1000)));
+
+    // Leases: a worker that never answers
+    val lost: i64 = grab(& mut r, "x", now);
+    println("held by a worker that never answers; reserve again: " + int_to_str(lost));
+    println("tick before expiry: " + int_to_str(jobs_tick(& mut r, now + 500)) + ", after: " + int_to_str(jobs_tick(& mut r, now + 1000)));
+    match jobs_get(& r, id) {
+        Option::Some(j) => { println("after lease: state " + int_to_str(j.state) + " attempts " + int_to_str(j.attempts) + " error \"" + j.last_error + "\""); }
+        Option::None => { println("after lease: gone"); }
+    }
+
+    // Records and reloading from the backend
+    val b: JobBackend = jobs_mem_backend();
+    var p: JobQueue = jobs_queue_new(b, 1);
+    jobs_enqueue(& mut p, "q", "tab\there, newline\nhere, 100% sure", 3, 5000, 2, t0);
+    jobs_enqueue(& mut p, "q", "second", 1, 0, 2, t0);
+    val held: i64 = grab(& mut p, "q", t0);
+    jobs_fail(& mut p, held, "boom", t0);
+    match jobs_get(& p, 1) {
+        Option::Some(j) => {
+            val rec: str = jobs_encode(& j);
+            println("record: " + str_replace(rec, "\t", " | "));
+            match jobs_decode(rec) {
+                Option::Some(back) => { println("decoded payload same: " + bool_to_str(back.payload == j.payload) + ", run_at same: " + bool_to_str(back.run_at == j.run_at)); }
+                Option::None => { println("decode failed"); }
+            }
+        }
+        Option::None => { println("job 1 missing"); }
+    }
+    var p2: JobQueue = jobs_load(b, 1);
+    println("reloaded: " + int_to_str(p2.jobs.len()) + " jobs, next id " + int_to_str(p2.next_id) + ", job 2 attempts " + int_to_str(p2.jobs.get(1).attempts) + " error " + p2.jobs.get(1).last_error);
+    println("bad record: " + bool_to_str(jobs_decode("v2\tnope").is_some()));
+
+    // Cron
+    val t0s: i64 = t0 / 1000;
+    println("now: " + cron_format(t0s));
+    var exprs: Vec<str> = Vec::new();
+    exprs.push("*/15 9-17 * * MON-FRI");
+    exprs.push("@yearly");
+    exprs.push("30 4 1,15 * 5");
+    exprs.push("0 12 29 2 *");
+    exprs.push("0 0 30 2 *");
+    exprs.push("@weekly");
+    exprs.push("0 8 * * 5-7");
+    exprs.push("15 14 1 * *");
+    exprs.push("0 22 * * 1-5");
+    exprs.push("5/20 */6 * JAN,JUL *");
+    var i: i64 = 0;
+    while i < exprs.len() {
+        val s: CronSpec = cron_parse(exprs.get(i));
+        val n: i64 = cron_next(& s, t0s);
+        if n < 0 {
+            println("cron " + exprs.get(i) + " -> never");
+        } else {
+            println("cron " + exprs.get(i) + " -> " + cron_format(n));
+        }
+        i = i + 1;
+    }
+    var bad: Vec<str> = Vec::new();
+    bad.push("60 * * * *");
+    bad.push("* * *");
+    bad.push("* * * 13 *");
+    bad.push("* * * * FRI-MON");
+    bad.push("*/0 * * * *");
+    bad.push("a b c d e");
+    i = 0;
+    while i < bad.len() {
+        println("bad: " + cron_parse(bad.get(i)).error);
+        i = i + 1;
+    }
+    val five: CronSpec = cron_parse("*/15 9-17 * * MON-FRI");
+    var t: i64 = t0s;
+    var run: str = "";
+    i = 0;
+    while i < 6 {
+        t = cron_next(& five, t);
+        run = run + str_slice(cron_format(t), 5, 20) + "; ";
+        i = i + 1;
+    }
+    println("runs: " + run);
+    t = cron_next(& five, cron_days_from_civil(2026, 11, 20) * 86400 + 17 * 3600 + 50 * 60);
+    println("after Fri 17:50: " + cron_format(t));
+
+    // Recurring jobs
+    var c: JobQueue = jobs_queue_new(jobs_mem_backend(), 3);
+    println("add cron: " + bool_to_str(jobs_add_cron(& mut c, "sync", "*/30 * * * *", "sync", "pull", t0)) + " " + bool_to_str(jobs_add_cron(& mut c, "bad", "61 * * * *", "x", "", t0)) + " (" + c.error + ")");
+    println("sync next: " + cron_format(jobs_cron_next(& c, "sync")));
+    println("tick +10 min: " + int_to_str(jobs_tick(& mut c, t0 + 600000)) + ", tick +2 h: " + int_to_str(jobs_tick(& mut c, t0 + 7200000)) + ", pending " + int_to_str(jobs_count(& c, JOB_PENDING)));
+    var runs: str = "";
+    var g: i64 = grab(& mut c, "sync", t0 + 7200000);
+    while g >= 0 {
+        match jobs_get(& c, g) {
+            Option::Some(j) => { runs = runs + str_slice(cron_format(j.run_at / 1000), 11, 16) + " "; }
+            Option::None => {}
+        }
+        jobs_complete(& mut c, g, t0 + 7200000);
+        g = grab(& mut c, "sync", t0 + 7200000);
+    }
+    println("cron jobs ran for: " + runs + "next " + str_slice(cron_format(jobs_cron_next(& c, "sync")), 11, 16));
+    return 0;
+}

@@ -1,0 +1,1108 @@
+// tools/macho_check.fd — structural check of a 64-bit Mach-O executable:
+// the Fides port of scripts/macho-check.py (roadmap AD4). Same checks,
+// same output, same exit status:
+//
+//   fid ccompile tools/macho_check.fd -o macho_check.exe
+//   macho_check.exe <file> [--quiet]
+//   fid run tools/macho_check.fd <file> [--quiet]      (slower)
+//
+// For `fid emit --target aarch64-macos|x86_64-macos` (F7): no Mac is at
+// hand to run the output, so this reads what the kernel and dyld read and
+// fails on what they would refuse. Checks: the header (MH_MAGIC_64,
+// MH_EXECUTE, cpu, MH_PIE on arm64), load-command sizes and alignment,
+// segments (__PAGEZERO at 0 empty, __TEXT from file offset 0, page
+// alignment, no file/vm overlap, sections inside their segment, __LINKEDIT
+// last and ending the file), LC_MAIN entry inside a code section,
+// LC_LOAD_DYLINKER = /usr/lib/dyld, LC_LOAD_DYLIB of libSystem,
+// LC_BUILD_VERSION macOS, classic LC_DYLD_INFO rebase/bind opcodes replayed
+// (each site writable and 8-aligned, binds name a real dylib ordinal),
+// symtab/strtab bounds, and the ad-hoc code signature (CodeDirectory,
+// SHA-256 page hashes recomputed, codeLimit = signature offset).
+//
+// Exit 0 if every check passes, 1 if one fails, 2 without a file.
+//
+// Where the script raises an exception (a read past the end of a damaged
+// file), it stops and adds "FAIL: checker crashed: <repr>"; this port gives
+// the same message for the same reads (struct.error / IndexError) and logs
+// nothing after it. Differences, none of which a file `fid emit` writes
+// can reach: values are 64-bit (the script's integers are unbounded, so a
+// u64 field of 2^63 or more, or a sum past 2^64, compares differently; a
+// ULEB128 longer than 64 bits keeps its low 64), names are written as their
+// bytes (the script writes Latin-1 text in the console's encoding: the same
+// for ASCII), the usage line names this tool, and a missing file is
+// "macho_check: cannot read <file>" (exit 1) instead of a traceback.
+
+use core;
+use args;
+use fs;
+use io;
+use crypto;
+
+const LC_SEGMENT_64: i64 = 25;
+const LC_SYMTAB: i64 = 2;
+const LC_DYSYMTAB: i64 = 11;
+const LC_LOAD_DYLIB: i64 = 12;
+const LC_LOAD_DYLINKER: i64 = 14;
+const LC_CODE_SIGNATURE: i64 = 29;
+const LC_DYLD_INFO: i64 = 34;
+const LC_DYLD_INFO_ONLY: i64 = 2147483682;
+const LC_FUNCTION_STARTS: i64 = 38;
+const LC_MAIN: i64 = 2147483688;
+const LC_DATA_IN_CODE: i64 = 41;
+const LC_BUILD_VERSION: i64 = 50;
+const LC_DYLD_CHAINED_FIXUPS: i64 = 2147483700;
+const LC_DYLD_EXPORTS_TRIE: i64 = 2147483699;
+const CPU_ARM64: i64 = 16777228;
+const CPU_X86_64: i64 = 16777223;
+const MH_PIE: i64 = 2097152;
+const PROT_W: i64 = 2;
+const PROT_X: i64 = 4;
+
+/// A segment (LC_SEGMENT_64); its sections are sects[sect_lo ..
+/// sect_lo + nsect).
+pub struct McSeg {
+    pub name: str,
+    pub vmaddr: i64,
+    pub vmsize: i64,
+    pub fileoff: i64,
+    pub filesize: i64,
+    pub maxp: i64,
+    pub initp: i64,
+    pub sect_lo: i64,
+    pub nsect: i64,
+}
+
+/// A section of a segment.
+pub struct McSect {
+    pub name: str,
+    pub seg: str,
+    pub addr: i64,
+    pub size: i64,
+    pub offset: i64,
+    pub align: i64,
+    pub flags: i64,
+    pub segname: str,
+}
+
+/// The checker's state: the file, what it found, and what it said.
+pub struct Mc {
+    pub d: Vec<i64>,
+    pub n: i64,
+    pub fails: Vec<str>,
+    pub log: Vec<str>,
+    pub crashed: bool,
+    pub crash: str,
+    pub arm: bool,
+    pub page: i64,
+    pub hdr_end: i64,
+    pub cmd_cmd: Vec<i64>,
+    pub cmd_off: Vec<i64>,
+    pub cmd_sz: Vec<i64>,
+    pub segs: Vec<McSeg>,
+    pub sects: Vec<McSect>,
+    pub dylibs: Vec<str>,
+    pub has_dylinker: bool,
+    pub dylinker: str,
+    pub has_entry: bool,
+    pub entryoff: i64,
+    pub has_dyld: bool,
+    // rebase, bind, weak, lazy, export: (offset, size) each
+    pub dyld: Vec<i64>,
+    pub blob_cmd: Vec<i64>,
+    pub blob_off: Vec<i64>,
+    pub blob_n: Vec<i64>,
+    pub has_symtab: bool,
+    pub symtab: Vec<i64>,
+    pub has_bv: bool,
+    pub bv: Vec<i64>,
+    pub rb_seg: Vec<i64>,
+    pub rb_off: Vec<i64>,
+    pub bd_seg: Vec<i64>,
+    pub bd_sym: Vec<str>,
+    pub bd_ord: Vec<i64>,
+}
+
+// ─── Output ───
+
+fn mc_bad(s: &mut Mc, m: str) {
+    if !s.crashed { s.fails.push(m); }
+}
+
+fn mc_say(s: &mut Mc, m: str) {
+    if !s.crashed { s.log.push(m); }
+}
+
+/// The first exception ends the check, as it does in the script.
+fn mc_crash(s: &mut Mc, repr: str) {
+    if !s.crashed {
+        s.crashed = true;
+        s.crash = repr;
+    }
+}
+
+/// Python's "%x" of a non-negative integer (an i64 read as unsigned).
+pub fn mc_hex(x: i64) -> str {
+    if x == 0 { return "0"; }
+    val digits: str = "0123456789abcdef";
+    var bytes: Vec<i64> = Vec::new();
+    var v: i64 = x;
+    var k: i64 = 0;
+    while v != 0 && k < 16 {
+        bytes.push(str_byte_at(digits, v & 15));
+        v = (v >> 4) & 1152921504606846975;
+        k = k + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = bytes.len() - 1;
+    while i >= 0 {
+        out.push(bytes.get(i));
+        i = i - 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn mc_dec(x: i64) -> str {
+    return int_to_str(x);
+}
+
+/// The length of `t` as printed (an escaped 0 or 1 is one byte).
+fn mc_text_len(t: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(t) {
+        if str_byte_at(t, i) == 1 { i = i + 1; }
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Python's "%-12s".
+fn mc_pad12(t: str) -> str {
+    var r: str = t;
+    var n: i64 = mc_text_len(t);
+    while n < 12 {
+        r = r + " ";
+        n = n + 1;
+    }
+    return r;
+}
+
+/// Print a line, turning the escaped bytes of mc_name back into 0 and 1:
+/// a str does not hold a NUL on every backend, a damaged name can, and the
+/// script prints it.
+fn mc_out(t: str) {
+    if mc_text_len(t) == str_len(t) {
+        println(t);
+        return;
+    }
+    var i: i64 = 0;
+    while i < str_len(t) {
+        var c: i64 = str_byte_at(t, i);
+        if c == 1 {
+            i = i + 1;
+            c = str_byte_at(t, i) - 1;
+        }
+        io_putc(c);
+        i = i + 1;
+    }
+    io_putc(10);
+}
+
+// ─── Reading the file ───
+
+/// struct.unpack_from's bounds check for `n` bytes at `o`.
+fn mc_need(s: &mut Mc, o: i64, n: i64) -> bool {
+    if s.crashed { return false; }
+    if o < 0 || o + n > s.n {
+        mc_crash(s, "error('unpack_from requires a buffer of at least " + mc_dec(o + n) + " bytes for unpacking " + mc_dec(n) + " bytes at offset " + mc_dec(o) + " (actual buffer size is " + mc_dec(s.n) + ")')");
+        return false;
+    }
+    return true;
+}
+
+/// d[p], or IndexError.
+fn mc_byte(s: &mut Mc, p: i64) -> i64 {
+    if s.crashed { return 0; }
+    if p < 0 || p >= s.n {
+        mc_crash(s, "IndexError('index out of range')");
+        return 0;
+    }
+    return s.d.get(p);
+}
+
+/// Little-endian unsigned field of `w` bytes at `o` (inside a checked unpack).
+fn mc_le(s: &Mc, o: i64, w: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = w - 1;
+    while i >= 0 {
+        v = (v << 8) | s.d.get(o + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+fn mc_u32(s: &mut Mc, o: i64) -> i64 {
+    if !mc_need(s, o, 4) { return 0; }
+    return mc_le(s, o, 4);
+}
+
+/// A little-endian signed 32-bit field.
+fn mc_i32(s: &Mc, o: i64) -> i64 {
+    val v: i64 = mc_le(s, o, 4);
+    if v >= 2147483648 { return v - 4294967296; }
+    return v;
+}
+
+/// Big-endian u32 (the code signature), checked.
+fn mc_b32(s: &mut Mc, o: i64) -> i64 {
+    if !mc_need(s, o, 4) { return 0; }
+    return (s.d.get(o) << 24) | (s.d.get(o + 1) << 16) | (s.d.get(o + 2) << 8) | s.d.get(o + 3);
+}
+
+/// d[lo:hi] as bytes (clipped like a slice).
+fn mc_slice(s: &Mc, lo: i64, hi: i64) -> Vec<i64> {
+    var a: i64 = lo;
+    var b: i64 = hi;
+    if a < 0 { a = 0; }
+    if b > s.n { b = s.n; }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < b {
+        out.push(s.d.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// d[lo:hi].rstrip(b"\0") as text; a 0 left inside is kept as the bytes
+/// 1 1 (and a 1 as 1 2), which mc_out prints as the byte.
+fn mc_name(s: &Mc, lo: i64, hi: i64) -> str {
+    var v: Vec<i64> = mc_slice(s, lo, hi);
+    var end: i64 = v.len();
+    while end > 0 && v.get(end - 1) == 0 { end = end - 1; }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < end {
+        val c: i64 = v.get(i);
+        if c == 0 || c == 1 {
+            out.push(1);
+            out.push(c + 1);
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// d[lo:hi].split(b"\0")[0] as text.
+fn mc_cstr(s: &Mc, lo: i64, hi: i64) -> str {
+    var v: Vec<i64> = mc_slice(s, lo, hi);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() && v.get(i) != 0 {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+// ─── The checks ───
+
+pub fn mc_new(d: Vec<i64>) -> Mc {
+    return Mc {
+        d: d, n: d.len(), fails: Vec::new(), log: Vec::new(), crashed: false, crash: "",
+        arm: false, page: 0, hdr_end: 0, cmd_cmd: Vec::new(), cmd_off: Vec::new(), cmd_sz: Vec::new(),
+        segs: Vec::new(), sects: Vec::new(), dylibs: Vec::new(), has_dylinker: false, dylinker: "",
+        has_entry: false, entryoff: 0, has_dyld: false, dyld: Vec::new(),
+        blob_cmd: Vec::new(), blob_off: Vec::new(), blob_n: Vec::new(),
+        has_symtab: false, symtab: Vec::new(), has_bv: false, bv: Vec::new(),
+        rb_seg: Vec::new(), rb_off: Vec::new(), bd_seg: Vec::new(), bd_sym: Vec::new(), bd_ord: Vec::new()
+    };
+}
+
+pub fn mc_run(s: &mut Mc) {
+    if s.n < 32 || mc_le(s, 0, 4) != 4277009103 {
+        mc_bad(s, "not a 64-bit LE Mach-O");
+        return;
+    }
+    val cpu: i64 = mc_le(s, 4, 4);
+    val ftype: i64 = mc_le(s, 12, 4);
+    val ncmds: i64 = mc_le(s, 16, 4);
+    val soc: i64 = mc_le(s, 20, 4);
+    val flags: i64 = mc_le(s, 24, 4);
+    s.arm = cpu == CPU_ARM64;
+    if cpu != CPU_ARM64 && cpu != CPU_X86_64 { mc_bad(s, "cputype 0x" + mc_hex(cpu) + " not arm64/x86_64"); }
+    if ftype != 2 { mc_bad(s, "filetype " + mc_dec(ftype) + " not MH_EXECUTE"); }
+    if s.arm && (flags & MH_PIE) == 0 { mc_bad(s, "arm64 without MH_PIE"); }
+    s.page = 4096;
+    var cpuname: str = "x86_64";
+    if s.arm {
+        s.page = 16384;
+        cpuname = "arm64";
+    }
+    mc_say(s, "cpu " + cpuname + " flags 0x" + mc_hex(flags) + " " + mc_dec(ncmds) + " cmds (" + mc_dec(soc) + " bytes) page 0x" + mc_hex(s.page));
+    if 32 + soc > s.n {
+        mc_bad(s, "load commands past EOF");
+        return;
+    }
+    var off: i64 = 32;
+    var i: i64 = 0;
+    while i < ncmds {
+        if off + 8 > 32 + soc {
+            mc_bad(s, "cmd " + mc_dec(i) + " past sizeofcmds");
+            return;
+        }
+        val cmd: i64 = mc_le(s, off, 4);
+        val sz: i64 = mc_le(s, off + 4, 4);
+        if sz < 8 || sz % 8 != 0 {
+            mc_bad(s, "cmd " + mc_dec(i) + " size " + mc_dec(sz) + " not /8");
+            return;
+        }
+        if off + sz > 32 + soc {
+            mc_bad(s, "cmd " + mc_dec(i) + " past sizeofcmds");
+            return;
+        }
+        s.cmd_cmd.push(cmd);
+        s.cmd_off.push(off);
+        s.cmd_sz.push(sz);
+        off = off + sz;
+        i = i + 1;
+    }
+    if off != 32 + soc { mc_bad(s, "sizeofcmds mismatch"); }
+    s.hdr_end = 32 + soc;
+    i = 0;
+    while i < s.cmd_cmd.len() && !s.crashed {
+        mc_lc(s, s.cmd_cmd.get(i), s.cmd_off.get(i), s.cmd_sz.get(i));
+        i = i + 1;
+    }
+    if !s.crashed { mc_segcheck(s); }
+    if !s.crashed { mc_required(s); }
+    if !s.crashed { mc_linkedit(s); }
+    if !s.crashed { mc_fixups(s); }
+    if !s.crashed { mc_symtab(s); }
+    if !s.crashed { mc_sig(s); }
+}
+
+fn mc_blob_set(s: &mut Mc, cmd: i64, o: i64, n: i64) {
+    var i: i64 = 0;
+    while i < s.blob_cmd.len() {
+        if s.blob_cmd.get(i) == cmd {
+            s.blob_off.set(i, o);
+            s.blob_n.set(i, n);
+            return;
+        }
+        i = i + 1;
+    }
+    s.blob_cmd.push(cmd);
+    s.blob_off.push(o);
+    s.blob_n.push(n);
+}
+
+/// The index of `cmd` among the blobs, or -1.
+fn mc_blob_at(s: &Mc, cmd: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.blob_cmd.len() {
+        if s.blob_cmd.get(i) == cmd { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn mc_lc(s: &mut Mc, cmd: i64, off: i64, sz: i64) {
+    if cmd == LC_SEGMENT_64 {
+        val name: str = mc_name(s, off + 8, off + 24);
+        if !mc_need(s, off + 24, 56) { return; }
+        val vmaddr: i64 = mc_le(s, off + 24, 8);
+        val vmsize: i64 = mc_le(s, off + 32, 8);
+        val fo: i64 = mc_le(s, off + 40, 8);
+        val fs: i64 = mc_le(s, off + 48, 8);
+        val maxp: i64 = mc_i32(s, off + 56);
+        val initp: i64 = mc_i32(s, off + 60);
+        val nsec: i64 = mc_le(s, off + 64, 4);
+        if sz != 72 + 80 * nsec { mc_bad(s, name + " cmdsize for " + mc_dec(nsec) + " sects"); }
+        val lo: i64 = s.sects.len();
+        var k: i64 = 0;
+        while k < nsec {
+            val so: i64 = off + 72 + 80 * k;
+            val sn: str = mc_name(s, so, so + 16);
+            val gn: str = mc_name(s, so + 16, so + 32);
+            if !mc_need(s, so + 32, 36) { return; }
+            s.sects.push(McSect {
+                name: sn, seg: gn, addr: mc_le(s, so + 32, 8), size: mc_le(s, so + 40, 8), offset: mc_le(s, so + 48, 4),
+                align: mc_le(s, so + 52, 4), flags: mc_le(s, so + 64, 4), segname: name
+            });
+            k = k + 1;
+        }
+        s.segs.push(McSeg {
+            name: name, vmaddr: vmaddr, vmsize: vmsize, fileoff: fo, filesize: fs, maxp: maxp, initp: initp,
+            sect_lo: lo, nsect: nsec
+        });
+        mc_say(s, "  " + mc_pad12(name) + " vm[0x" + mc_hex(vmaddr) + "+0x" + mc_hex(vmsize) + ") file[0x" + mc_hex(fo) + "+0x" + mc_hex(fs) + ") prot " + mc_dec(initp) + "/" + mc_dec(maxp) + " sects " + mc_dec(nsec));
+    } else if cmd == LC_MAIN {
+        if !mc_need(s, off + 8, 16) { return; }
+        s.has_entry = true;
+        s.entryoff = mc_le(s, off + 8, 8);
+        mc_say(s, "  LC_MAIN entryoff 0x" + mc_hex(s.entryoff));
+    } else if cmd == LC_LOAD_DYLINKER {
+        val at: i64 = mc_u32(s, off + 8);
+        if s.crashed { return; }
+        s.has_dylinker = true;
+        s.dylinker = mc_cstr(s, off + at, off + sz);
+        mc_say(s, "  dylinker " + s.dylinker);
+    } else if cmd == LC_LOAD_DYLIB {
+        val at: i64 = mc_u32(s, off + 8);
+        if s.crashed { return; }
+        val nm: str = mc_cstr(s, off + at, off + sz);
+        s.dylibs.push(nm);
+        mc_say(s, "  dylib " + nm);
+    } else if cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY {
+        if !mc_need(s, off + 8, 40) { return; }
+        var v: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < 10 {
+            v.push(mc_le(s, off + 8 + 4 * j, 4));
+            j = j + 1;
+        }
+        s.has_dyld = true;
+        s.dyld = v;
+        mc_say(s, "  dyld_info rebase(" + mc_dec(v.get(0)) + ", " + mc_dec(v.get(1)) + ") bind(" + mc_dec(v.get(2)) + ", " + mc_dec(v.get(3)) + ") lazy(" + mc_dec(v.get(6)) + ", " + mc_dec(v.get(7)) + ")");
+    } else if cmd == LC_CODE_SIGNATURE || cmd == LC_FUNCTION_STARTS || cmd == LC_DATA_IN_CODE || cmd == LC_DYLD_CHAINED_FIXUPS || cmd == LC_DYLD_EXPORTS_TRIE {
+        if !mc_need(s, off + 8, 8) { return; }
+        val o: i64 = mc_le(s, off + 8, 4);
+        val n: i64 = mc_le(s, off + 12, 4);
+        mc_blob_set(s, cmd, o, n);
+        mc_say(s, "  blob 0x" + mc_hex(cmd) + " [0x" + mc_hex(o) + "+0x" + mc_hex(n) + ")");
+    } else if cmd == LC_SYMTAB {
+        if !mc_need(s, off + 8, 16) { return; }
+        var v: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < 4 {
+            v.push(mc_le(s, off + 8 + 4 * j, 4));
+            j = j + 1;
+        }
+        s.has_symtab = true;
+        s.symtab = v;
+        mc_say(s, "  symtab off 0x" + mc_hex(v.get(0)) + " n " + mc_dec(v.get(1)) + " stroff 0x" + mc_hex(v.get(2)) + " strsz " + mc_dec(v.get(3)));
+    } else if cmd == LC_DYSYMTAB {
+        if !mc_need(s, off + 8, 72) { return; }
+        mc_say(s, "  dysymtab");
+    } else if cmd == LC_BUILD_VERSION {
+        if !mc_need(s, off + 8, 16) { return; }
+        var v: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < 4 {
+            v.push(mc_le(s, off + 8 + 4 * j, 4));
+            j = j + 1;
+        }
+        s.has_bv = true;
+        s.bv = v;
+        mc_say(s, "  build_version platform " + mc_dec(v.get(0)) + " minos 0x" + mc_hex(v.get(1)) + " sdk 0x" + mc_hex(v.get(2)));
+    } else {
+        mc_say(s, "  cmd 0x" + mc_hex(cmd) + " (" + mc_dec(sz) + ")");
+    }
+}
+
+/// The first segment called `n`, or -1.
+fn mc_seg_index(s: &Mc, n: str) -> i64 {
+    var i: i64 = 0;
+    while i < s.segs.len() {
+        if s.segs.get(i).name == n { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Unsigned a < b (the script's integers are never negative).
+fn mc_ult(a: i64, b: i64) -> bool {
+    if (a < 0) != (b < 0) { return b < 0; }
+    return a < b;
+}
+
+fn mc_ule(a: i64, b: i64) -> bool {
+    return a == b || mc_ult(a, b);
+}
+
+fn mc_segcheck(s: &mut Mc) {
+    val pzi: i64 = mc_seg_index(s, "__PAGEZERO");
+    if pzi < 0 {
+        mc_bad(s, "no __PAGEZERO");
+    } else {
+        val pz: McSeg = s.segs.get(pzi);
+        if pz.vmaddr != 0 || pz.filesize != 0 || pz.initp != 0 {
+            mc_bad(s, "__PAGEZERO must be at 0, empty, no access");
+        } else if s.arm && mc_ult(pz.vmsize, 4294967296) {
+            mc_bad(s, "__PAGEZERO < 4GB on arm64");
+        }
+    }
+    val ti: i64 = mc_seg_index(s, "__TEXT");
+    if ti < 0 {
+        mc_bad(s, "no __TEXT");
+        return;
+    }
+    val t: McSeg = s.segs.get(ti);
+    if t.fileoff != 0 { mc_bad(s, "__TEXT must map file offset 0"); }
+    if t.initp != 5 { mc_bad(s, "__TEXT not r-x"); }
+    if mc_ult(t.filesize, s.hdr_end) { mc_bad(s, "load commands dont fit in __TEXT"); }
+    if mc_seg_index(s, "__LINKEDIT") < 0 { mc_bad(s, "no __LINKEDIT"); }
+    var gi: i64 = 0;
+    while gi < s.segs.len() {
+        val g: McSeg = s.segs.get(gi);
+        gi = gi + 1;
+        if g.name == "__PAGEZERO" { continue; }
+        if g.vmaddr % s.page != 0 { mc_bad(s, g.name + " vmaddr unaligned"); }
+        if g.fileoff % s.page != 0 { mc_bad(s, g.name + " fileoff unaligned"); }
+        if mc_ult(g.vmsize, g.filesize) { mc_bad(s, g.name + " filesize>vmsize"); }
+        if mc_ult(s.n, g.fileoff + g.filesize) { mc_bad(s, g.name + " past EOF"); }
+        if (g.initp & ~g.maxp) != 0 { mc_bad(s, g.name + " initprot>maxprot"); }
+        if (g.initp & PROT_W) != 0 && (g.initp & PROT_X) != 0 { mc_bad(s, g.name + " writable+executable"); }
+        var k: i64 = 0;
+        while k < g.nsect {
+            val x: McSect = s.sects.get(g.sect_lo + k);
+            k = k + 1;
+            if x.seg != g.name { mc_bad(s, "sect " + x.name + " wrong segname"); }
+            if mc_ult(x.addr, g.vmaddr) || mc_ult(g.vmaddr + g.vmsize, x.addr + x.size) { mc_bad(s, "sect " + x.name + " outside seg (vm)"); }
+            if x.offset != 0 && x.offset - g.fileoff != x.addr - g.vmaddr { mc_bad(s, "sect " + x.name + " file/vm offset disagree"); }
+        }
+    }
+    var mapped: Vec<McSeg> = Vec::new();
+    gi = 0;
+    while gi < s.segs.len() {
+        if s.segs.get(gi).vmsize != 0 { mapped.push(s.segs.get(gi)); }
+        gi = gi + 1;
+    }
+    var i: i64 = 0;
+    while i < mapped.len() {
+        var j: i64 = i + 1;
+        while j < mapped.len() {
+            val a: McSeg = mapped.get(i);
+            val b: McSeg = mapped.get(j);
+            if mc_ult(a.vmaddr, b.vmaddr + b.vmsize) && mc_ult(b.vmaddr, a.vmaddr + a.vmsize) { mc_bad(s, a.name + "/" + b.name + " vm overlap"); }
+            if a.filesize != 0 && b.filesize != 0 && mc_ult(a.fileoff, b.fileoff + b.filesize) && mc_ult(b.fileoff, a.fileoff + a.filesize) { mc_bad(s, a.name + "/" + b.name + " file overlap"); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    val lei: i64 = mc_seg_index(s, "__LINKEDIT");
+    if lei >= 0 {
+        val le_seg: McSeg = s.segs.get(lei);
+        gi = 0;
+        while gi < s.segs.len() {
+            val g: McSeg = s.segs.get(gi);
+            // `g is not le`: another segment, even one with the same name
+            if gi != lei && g.filesize != 0 && mc_ult(le_seg.fileoff, g.fileoff) { mc_bad(s, "__LINKEDIT not last in file"); }
+            gi = gi + 1;
+        }
+        if le_seg.fileoff + le_seg.filesize != s.n { mc_bad(s, "__LINKEDIT not ending the file"); }
+    }
+}
+
+/// The index of the segment that maps address `a`, or -1.
+fn mc_vm2seg(s: &Mc, a: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.segs.len() {
+        val g: McSeg = s.segs.get(i);
+        if g.vmsize != 0 && mc_ule(g.vmaddr, a) && mc_ult(a, g.vmaddr + g.vmsize) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn mc_has_dylib(s: &Mc, n: str) -> bool {
+    var i: i64 = 0;
+    while i < s.dylibs.len() {
+        if s.dylibs.get(i) == n { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn mc_required(s: &mut Mc) {
+    if !s.has_dylinker || s.dylinker != "/usr/lib/dyld" { mc_bad(s, "dylinker not /usr/lib/dyld"); }
+    if !mc_has_dylib(s, "/usr/lib/libSystem.B.dylib") { mc_bad(s, "no libSystem dylib"); }
+    if !s.has_entry {
+        mc_bad(s, "no LC_MAIN");
+    } else {
+        var ok: bool = false;
+        var i: i64 = 0;
+        while i < s.sects.len() {
+            val x: McSect = s.sects.get(i);
+            if mc_ule(x.offset, s.entryoff) && mc_ult(s.entryoff, x.offset + x.size) && (x.flags & 2147484672) != 0 { ok = true; }
+            i = i + 1;
+        }
+        if !ok { mc_bad(s, "LC_MAIN entry 0x" + mc_hex(s.entryoff) + " not in a code section"); }
+        if s.arm && s.entryoff % 4 != 0 { mc_bad(s, "arm64 entry not 4-aligned"); }
+    }
+    if !s.has_bv {
+        mc_bad(s, "no LC_BUILD_VERSION");
+    } else if s.bv.get(0) != 1 {
+        mc_bad(s, "platform " + mc_dec(s.bv.get(0)) + " not macOS");
+    }
+    if !s.has_symtab { mc_bad(s, "no LC_SYMTAB"); }
+    if !s.has_dyld && mc_blob_at(s, LC_DYLD_CHAINED_FIXUPS) < 0 { mc_bad(s, "nothing binds imports"); }
+    if s.arm && mc_blob_at(s, LC_CODE_SIGNATURE) < 0 { mc_bad(s, "arm64 without code signature"); }
+}
+
+fn mc_linkedit(s: &mut Mc) {
+    val lei: i64 = mc_seg_index(s, "__LINKEDIT");
+    if lei < 0 { return; }
+    val g: McSeg = s.segs.get(lei);
+    val lo: i64 = g.fileoff;
+    val hi: i64 = g.fileoff + g.filesize;
+    var names: Vec<str> = Vec::new();
+    var offs: Vec<i64> = Vec::new();
+    var lens: Vec<i64> = Vec::new();
+    if s.has_dyld {
+        var keys: Vec<str> = Vec::new();
+        keys.push("rebase");
+        keys.push("bind");
+        keys.push("weak");
+        keys.push("lazy");
+        keys.push("export");
+        var k: i64 = 0;
+        while k < 5 {
+            if s.dyld.get(2 * k + 1) != 0 {
+                names.push(keys.get(k));
+                offs.push(s.dyld.get(2 * k));
+                lens.push(s.dyld.get(2 * k + 1));
+            }
+            k = k + 1;
+        }
+    }
+    var b: i64 = 0;
+    while b < s.blob_cmd.len() {
+        if s.blob_n.get(b) != 0 {
+            names.push("blob" + mc_hex(s.blob_cmd.get(b)));
+            offs.push(s.blob_off.get(b));
+            lens.push(s.blob_n.get(b));
+        }
+        b = b + 1;
+    }
+    if s.has_symtab {
+        if s.symtab.get(1) != 0 {
+            names.push("sym");
+            offs.push(s.symtab.get(0));
+            lens.push(s.symtab.get(1) * 16);
+        }
+        if s.symtab.get(3) != 0 {
+            names.push("str");
+            offs.push(s.symtab.get(2));
+            lens.push(s.symtab.get(3));
+        }
+    }
+    var i: i64 = 0;
+    while i < names.len() {
+        if mc_ult(offs.get(i), lo) || mc_ult(hi, offs.get(i) + lens.get(i)) { mc_bad(s, names.get(i) + " outside __LINKEDIT"); }
+        i = i + 1;
+    }
+}
+
+/// ULEB128 at p: [value, next p]. Reads past the end are an IndexError.
+fn mc_uleb(s: &mut Mc, p0: i64) -> Vec<i64> {
+    var v: i64 = 0;
+    var sh: i64 = 0;
+    var p: i64 = p0;
+    while true {
+        val b: i64 = mc_byte(s, p);
+        p = p + 1;
+        if sh < 64 { v = v | ((b & 127) << sh); }
+        sh = sh + 7;
+        if (b & 128) == 0 || s.crashed { break; }
+    }
+    var r: Vec<i64> = Vec::new();
+    r.push(v);
+    r.push(p);
+    return r;
+}
+
+fn mc_add_rebase(s: &mut Mc, si: i64, off: i64) {
+    s.rb_seg.push(si);
+    s.rb_off.push(off);
+}
+
+fn mc_rebase(s: &mut Mc, p0: i64, e: i64) {
+    var p: i64 = p0;
+    var si: i64 = 0;
+    var off: i64 = 0;
+    while p < e && !s.crashed {
+        val b: i64 = mc_byte(s, p);
+        if s.crashed { return; }
+        p = p + 1;
+        val op: i64 = b & 240;
+        val im: i64 = b & 15;
+        if op == 0 {
+            break;
+        } else if op == 16 {
+            // REBASE_OPCODE_SET_TYPE_IMM: the type is not checked
+        } else if op == 32 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            off = r.get(0);
+            p = r.get(1);
+            si = im;
+        } else if op == 48 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            off = off + r.get(0);
+            p = r.get(1);
+        } else if op == 64 {
+            off = off + im * 8;
+        } else if op == 80 || op == 96 {
+            // the script reads a ULEB count for both (as written there)
+            val r: Vec<i64> = mc_uleb(s, p);
+            p = r.get(1);
+            var c: i64 = 0;
+            while c < r.get(0) && !s.crashed {
+                mc_add_rebase(s, si, off);
+                off = off + 8;
+                c = c + 1;
+            }
+        } else if op == 112 {
+            mc_add_rebase(s, si, off);
+            val r: Vec<i64> = mc_uleb(s, p);
+            p = r.get(1);
+            off = off + 8 + r.get(0);
+        } else if op == 128 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            val r2: Vec<i64> = mc_uleb(s, r.get(1));
+            p = r2.get(1);
+            var c: i64 = 0;
+            while c < r.get(0) && !s.crashed {
+                mc_add_rebase(s, si, off);
+                off = off + 8 + r2.get(0);
+                c = c + 1;
+            }
+        } else {
+            mc_bad(s, "unknown rebase op 0x" + mc_hex(op));
+            return;
+        }
+    }
+}
+
+fn mc_add_bind(s: &mut Mc, si: i64, sym: str, ordn: i64) {
+    s.bd_seg.push(si);
+    s.bd_sym.push(sym);
+    s.bd_ord.push(ordn);
+}
+
+/// d.find(b"\0", p), or -1.
+fn mc_find_nul(s: &Mc, p: i64) -> i64 {
+    var i: i64 = p;
+    if i < 0 { i = 0; }
+    while i < s.n {
+        if s.d.get(i) == 0 { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn mc_bind(s: &mut Mc, p0: i64, e: i64) {
+    var p: i64 = p0;
+    var si: i64 = 0;
+    var off: i64 = 0;
+    var sym: str = "";
+    var ordn: i64 = 0;
+    while p < e && !s.crashed {
+        val b: i64 = mc_byte(s, p);
+        if s.crashed { return; }
+        p = p + 1;
+        val op: i64 = b & 240;
+        val im: i64 = b & 15;
+        if op == 0 {
+            break;
+        } else if op == 16 {
+            ordn = im;
+        } else if op == 32 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            ordn = r.get(0);
+            p = r.get(1);
+        } else if op == 48 {
+            if im == 0 {
+                ordn = 0;
+            } else {
+                ordn = im | 240;
+            }
+        } else if op == 64 {
+            val end: i64 = mc_find_nul(s, p);
+            if end < 0 {
+                // d[p:-1], then p = 0, as the script does
+                sym = mc_cstr(s, p, s.n - 1);
+                p = 0;
+            } else {
+                sym = mc_cstr(s, p, end);
+                p = end + 1;
+            }
+        } else if op == 80 {
+            // BIND_OPCODE_SET_TYPE_IMM
+        } else if op == 96 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            p = r.get(1);
+        } else if op == 112 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            off = r.get(0);
+            p = r.get(1);
+            si = im;
+        } else if op == 128 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            off = off + r.get(0);
+            p = r.get(1);
+        } else if op == 144 {
+            mc_add_bind(s, si, sym, ordn);
+            off = off + 8;
+        } else if op == 160 {
+            mc_add_bind(s, si, sym, ordn);
+            val r: Vec<i64> = mc_uleb(s, p);
+            p = r.get(1);
+            off = off + 8 + r.get(0);
+        } else if op == 176 {
+            mc_add_bind(s, si, sym, ordn);
+            off = off + 8 + im * 8;
+        } else if op == 192 {
+            val r: Vec<i64> = mc_uleb(s, p);
+            val r2: Vec<i64> = mc_uleb(s, r.get(1));
+            p = r2.get(1);
+            var c: i64 = 0;
+            while c < r.get(0) && !s.crashed {
+                mc_add_bind(s, si, sym, ordn);
+                off = off + 8 + r2.get(0);
+                c = c + 1;
+            }
+        } else {
+            mc_bad(s, "unknown bind op 0x" + mc_hex(op));
+            return;
+        }
+    }
+}
+
+/// Byte order of two strings (Python's str order for latin-1 text).
+fn mc_bytes_lt(a: str, b: str) -> bool {
+    val la: i64 = str_len(a);
+    val lb: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < la && i < lb {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return la < lb;
+}
+
+/// sorted(set(names)) joined by ",", cut to 400 characters.
+fn mc_sorted_names(v: Vec<str>) -> str {
+    var u: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        val x: str = v.get(i);
+        // insert in order, skipping duplicates (binary search)
+        var lo: i64 = 0;
+        var hi: i64 = u.len();
+        while lo < hi {
+            val mid: i64 = (lo + hi) / 2;
+            if mc_bytes_lt(u.get(mid), x) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= u.len() || u.get(lo) != x { u.insert(lo, x); }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < u.len() && out.len() < 400 {
+        if i > 0 { out.push(44); }
+        val x: str = u.get(i);
+        var j: i64 = 0;
+        while j < str_len(x) && out.len() < 400 {
+            out.push(str_byte_at(x, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    while out.len() > 400 { out.pop(); }
+    return str_from_bytes(out);
+}
+
+fn mc_fixups(s: &mut Mc) {
+    if s.has_dyld {
+        val ro: i64 = s.dyld.get(0);
+        val rn: i64 = s.dyld.get(1);
+        if rn != 0 { mc_rebase(s, ro, ro + rn); }
+        val bo: i64 = s.dyld.get(2);
+        val bn: i64 = s.dyld.get(3);
+        if bn != 0 && !s.crashed { mc_bind(s, bo, bo + bn); }
+        val lo: i64 = s.dyld.get(6);
+        val ln: i64 = s.dyld.get(7);
+        if ln != 0 && !s.crashed { mc_bind(s, lo, lo + ln); }
+    }
+    if s.crashed { return; }
+    mc_say(s, "fixups: " + mc_dec(s.rb_seg.len()) + " rebases, " + mc_dec(s.bd_seg.len()) + " binds (" + mc_sorted_names(s.bd_sym) + ")");
+    var i: i64 = 0;
+    while i < s.rb_seg.len() {
+        val si: i64 = s.rb_seg.get(i);
+        val off: i64 = s.rb_off.get(i);
+        i = i + 1;
+        if si >= s.segs.len() {
+            mc_bad(s, "rebase in missing segment " + mc_dec(si));
+            continue;
+        }
+        val g: McSeg = s.segs.get(si);
+        if (g.initp & PROT_W) == 0 { mc_bad(s, "rebase in non-writable " + g.name); }
+        if off % 8 != 0 { mc_bad(s, "rebase at " + g.name + "+0x" + mc_hex(off) + " not 8-aligned"); }
+        if mc_ule(g.fileoff + off + 8, s.n) && g.fileoff + off >= 0 {
+            val v: i64 = mc_le(s, g.fileoff + off, 8);
+            if mc_vm2seg(s, v) < 0 { mc_bad(s, "rebase target 0x" + mc_hex(v) + " outside image"); }
+        }
+    }
+    val nlib: i64 = s.dylibs.len();
+    i = 0;
+    while i < s.bd_seg.len() {
+        val si: i64 = s.bd_seg.get(i);
+        val sym: str = s.bd_sym.get(i);
+        val ordn: i64 = s.bd_ord.get(i);
+        i = i + 1;
+        if si >= s.segs.len() {
+            mc_bad(s, "bind in missing segment " + mc_dec(si));
+            continue;
+        }
+        val g: McSeg = s.segs.get(si);
+        if (g.initp & PROT_W) == 0 { mc_bad(s, "bind in non-writable " + g.name); }
+        if ordn < 1 || ordn > nlib { mc_bad(s, "bind " + sym + " ordinal " + mc_dec(ordn) + " has no dylib"); }
+    }
+}
+
+fn mc_symtab(s: &mut Mc) {
+    if !s.has_symtab { return; }
+    val so: i64 = s.symtab.get(0);
+    val n: i64 = s.symtab.get(1);
+    val sto: i64 = s.symtab.get(2);
+    val ss: i64 = s.symtab.get(3);
+    if so + n * 16 > s.n { mc_bad(s, "symtab past EOF"); }
+    if sto + ss > s.n { mc_bad(s, "strtab past EOF"); }
+}
+
+/// The code signature: a SuperBlob holding a CodeDirectory whose SHA-256
+/// page hashes cover the file up to the signature.
+fn mc_sig(s: &mut Mc) {
+    val bi: i64 = mc_blob_at(s, LC_CODE_SIGNATURE);
+    if bi < 0 { return; }
+    val o: i64 = s.blob_off.get(bi);
+    if mc_b32(s, o) != 4208856256 {
+        mc_bad(s, "code sig not an embedded SuperBlob");
+        return;
+    }
+    val count: i64 = mc_b32(s, o + 8);
+    var cd: i64 = -1;
+    var i: i64 = 0;
+    while i < count && !s.crashed {
+        val typ: i64 = mc_b32(s, o + 12 + i * 8);
+        val boff: i64 = mc_b32(s, o + 16 + i * 8);
+        if typ == 0 && !s.crashed { cd = o + boff; }
+        i = i + 1;
+    }
+    if s.crashed { return; }
+    if cd < 0 {
+        mc_bad(s, "no CodeDirectory in signature");
+        return;
+    }
+    if mc_b32(s, cd) != 4208856066 {
+        mc_bad(s, "CodeDirectory magic");
+        return;
+    }
+    // every field the script reads, in its order (a read past the end
+    // stops at the same one)
+    val ver: i64 = mc_b32(s, cd + 8);
+    mc_b32(s, cd + 12);
+    val hash_off: i64 = mc_b32(s, cd + 16);
+    mc_b32(s, cd + 20);
+    mc_b32(s, cd + 24);
+    val ncode: i64 = mc_b32(s, cd + 28);
+    val code_limit: i64 = mc_b32(s, cd + 32);
+    val hsize: i64 = mc_byte(s, cd + 36);
+    val htype: i64 = mc_byte(s, cd + 37);
+    val page_shift: i64 = mc_byte(s, cd + 39);
+    mc_say(s, "CodeDirectory v0x" + mc_hex(ver) + " codeLimit 0x" + mc_hex(code_limit) + " ncode " + mc_dec(ncode) + " hsize " + mc_dec(hsize) + " htype " + mc_dec(htype) + " pageShift " + mc_dec(page_shift));
+    if s.crashed { return; }
+    if htype != 2 || hsize != 32 { mc_bad(s, "code hash is not SHA-256 (htype " + mc_dec(htype) + " size " + mc_dec(hsize) + ")"); }
+    if page_shift < 12 || page_shift > 14 { mc_bad(s, "unusual code page shift " + mc_dec(page_shift)); }
+    if code_limit != o { mc_bad(s, "codeLimit 0x" + mc_hex(code_limit) + " != signature offset 0x" + mc_hex(o)); }
+    var shift: i64 = page_shift;
+    if shift > 62 { shift = 62; }
+    val pg: i64 = 1 << shift;
+    val want: i64 = (code_limit + pg - 1) / pg;
+    if ncode != want { mc_bad(s, "nCodeSlots " + mc_dec(ncode) + ", expected " + mc_dec(want)); }
+    var nbad: i64 = 0;
+    i = 0;
+    while i < ncode {
+        val lo: i64 = i * pg;
+        var hi: i64 = lo + pg;
+        if hi > code_limit { hi = code_limit; }
+        val h: Vec<i64> = crypto_sha256_bytes(mc_slice(s, lo, hi));
+        val at: i64 = cd + hash_off + i * hsize;
+        val stored: Vec<i64> = mc_slice(s, at, at + hsize);
+        var same: bool = stored.len() == h.len();
+        var k: i64 = 0;
+        while same && k < h.len() {
+            if h.get(k) != stored.get(k) { same = false; }
+            k = k + 1;
+        }
+        if !same { nbad = nbad + 1; }
+        i = i + 1;
+    }
+    if nbad != 0 {
+        mc_bad(s, mc_dec(nbad) + " of " + mc_dec(ncode) + " page hashes do not match");
+    } else {
+        mc_say(s, "all " + mc_dec(ncode) + " page hashes verified");
+    }
+}
+
+/// The index of the first argument of this program: 1 when built, 3
+/// under `fid run tools/macho_check.fd ...` (the interpreter's argv is
+/// fid's own).
+pub fn mc_first_arg(av: Vec<str>) -> i64 {
+    if av.len() >= 3 && av.get(1) == "run" && str_ends_with(av.get(2), ".fd") { return 3; }
+    return 1;
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = args_all();
+    var files: Vec<str> = Vec::new();
+    var quiet: bool = false;
+    var i: i64 = mc_first_arg(av);
+    while i < av.len() {
+        val a: str = av.get(i);
+        if a == "--quiet" { quiet = true; }
+        if !str_starts_with(a, "--") { files.push(a); }
+        i = i + 1;
+    }
+    if files.len() == 0 {
+        println("usage: macho_check <file> [--quiet]");
+        return 2;
+    }
+    val path: str = files.get(0);
+    if !fs_is_file(path) {
+        io_eprintln("macho_check: cannot read " + path);
+        return 1;
+    }
+    var s: Mc = mc_new(fs_read_bytes(path));
+    mc_run(&mut s);
+    if s.crashed { s.fails.push("checker crashed: " + s.crash); }
+    if !quiet {
+        i = 0;
+        while i < s.log.len() {
+            mc_out(s.log.get(i));
+            i = i + 1;
+        }
+    }
+    i = 0;
+    while i < s.fails.len() {
+        mc_out("FAIL: " + s.fails.get(i));
+        i = i + 1;
+    }
+    if s.fails.len() > 0 {
+        println(mc_dec(s.fails.len()) + " problem(s) in " + path);
+        return 1;
+    }
+    println("OK: " + path + " is a well-formed Mach-O executable");
+    return 0;
+}

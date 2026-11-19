@@ -1,0 +1,343 @@
+// stdlib/netcode: two rollback peers over a lossy, delayed, reordering simulated link (inputs sent through the reliable channel) end in the same state as a reference run; channel order/acks/resends; delta compression vector and round trip; snapshot interpolation
+// Expected output:
+// seq: newer(1, 65535) true, newer(65535, 1) false, diff(2, 65534) 4
+// delta: 9 0 2 13 0 3 10
+// delta round trip: true
+// delta of 64-word state with 2 changes: 512 bytes -> 20 bytes, round trip true
+// delta truncated: delta: truncated
+// interp at 1.5: 15.00 -5.00
+// interp at 0.5: 10.00 0.00, at 9.0: 30.00 -10.00
+// interp out of order: 2.25 -> 22.50
+// channel: 60 delivered in order: true
+// channel: resends > 0: true, duplicates seen: true, unacked 0
+// channel: malformed packet refused: true
+// peers simulated 150 frames: true true
+// confirmed: 150 150
+// A == B: true
+// A == reference: true
+// rollbacks happened: true true
+// stalls happened: true
+// lead never above max prediction: true
+use netcode;
+
+// ─── the game: two dots moved by 4-bit inputs, plus a running hash ─────────
+
+var g_states: Vec<Vec<i64>> = Vec::new();
+
+fn game_save(h: i64) -> Vec<i64> {
+    return g_states.get(h);
+}
+
+fn game_load(h: i64, s: Vec<i64>) {
+    g_states.set(h, s);
+}
+
+@wrapping
+fn game_step(s: Vec<i64>, inputs: Vec<i64>) -> Vec<i64> {
+    var n: Vec<i64> = s;
+    var p: i64 = 0;
+    while p < 2 {
+        val inp: i64 = inputs.get(p);
+        var x: i64 = n.get(1 + 2 * p);
+        var y: i64 = n.get(2 + 2 * p);
+        if (inp & 1) != 0 { x = x + 1; }
+        if (inp & 2) != 0 { x = x - 1; }
+        if (inp & 4) != 0 { y = y + 1; }
+        if (inp & 8) != 0 { y = y - 1; }
+        n.set(1 + 2 * p, x);
+        n.set(2 + 2 * p, y);
+        p = p + 1;
+    }
+    n.set(0, n.get(0) + 1);
+    n.set(5, n.get(5) * 1000003 + n.get(1) * 31 + n.get(2) * 17 + n.get(3) * 13 + n.get(4) * 7 + inputs.get(0) * 3 + inputs.get(1));
+    return n;
+}
+
+fn game_advance(h: i64, inputs: Vec<i64>) {
+    g_states.set(h, game_step(g_states.get(h), inputs));
+}
+
+@wrapping
+fn input_of(p: i64, f: i64) -> i64 {
+    return (((f / 7 + p * 3 + 1) * 2654435761) >> 7) & 15;
+}
+
+// ─── a lossy link ──────────────────────────────────────────────────────────
+
+var rng: i64 = 12345;
+
+@wrapping
+fn rnd(n: i64) -> i64 {
+    rng = (rng * 6364136223846793005 + 1442695040888963407) & 0x7FFFFFFFFFFFFFFF;
+    return (rng >> 33) % n;
+}
+
+struct Link {
+    at: Vec<i64>,
+    pkts: Vec<Vec<i64>>,
+}
+
+fn link_send(l: &mut Link, now: i64, p: Vec<i64>, loss: i64) {
+    if rnd(100) < loss {
+        return;
+    }
+    l.at.push(now + 2 + rnd(4));
+    l.pkts.push(p);
+    if rnd(100) < 5 {
+        // duplicated by the network
+        l.at.push(now + 3 + rnd(4));
+        l.pkts.push(p);
+    }
+}
+
+fn link_due(l: &mut Link, now: i64) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < l.at.len() {
+        if l.at.get(i) <= now {
+            out.push(l.pkts.get(i));
+            l.at.remove(i);
+            l.pkts.remove(i);
+        } else {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn f2(x: f64) -> str {
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val v: i64 = (a * 100.0 + 0.5) as i64;
+    var fr: str = int_to_str(v % 100);
+    if str_len(fr) < 2 { fr = "0" + fr; }
+    var out: str = int_to_str(v / 100) + "." + fr;
+    if neg && v != 0 { out = "-" + out; }
+    return out;
+}
+
+fn bytes_str(b: &Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        if i > 0 { s = s + " "; }
+        s = s + int_to_str(b.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn same(a: &Vec<i64>, b: &Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Feed received packets into a channel and the inputs they carry into a session.
+fn pump(ch: &mut NcChannel, s: &mut NcSession, l: &mut Link, now: i64, remote: i64) {
+    val due: Vec<Vec<i64>> = link_due(l, now);
+    var i: i64 = 0;
+    while i < due.len() {
+        nc_channel_receive(ch, &due.get(i));
+        i = i + 1;
+    }
+    val msgs: Vec<Vec<i64>> = nc_channel_take(ch);
+    var k: i64 = 0;
+    while k < msgs.len() {
+        val m: Vec<i64> = msgs.get(k);
+        nc_session_add_remote_input(s, remote, (m.get(0) << 8) | m.get(1), m.get(2));
+        k = k + 1;
+    }
+}
+
+fn main() {
+    println("seq: newer(1, 65535) " + yes(nc_seq_newer(1, 65535)) + ", newer(65535, 1) " + yes(nc_seq_newer(65535, 1)) + ", diff(2, 65534) " + int_to_str(nc_seq_diff(2, 65534)));
+
+    // ── delta compression
+    var base: Vec<i64> = Vec::new();
+    var cur: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= 8 {
+        base.push(i);
+        cur.push(i);
+        i = i + 1;
+    }
+    cur.set(3, 9);
+    cur.push(10);
+    val d: Vec<i64> = nc_delta_encode(&base, &cur);
+    println("delta: " + bytes_str(&d));
+    match nc_delta_decode(&base, &d) {
+        Result::Ok(r) => { println("delta round trip: " + yes(same(&r, &cur))); }
+        Result::Err(e) => { println("delta: " + e); }
+    }
+    var w0: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 64 {
+        w0.push(i * 1000);
+        i = i + 1;
+    }
+    var w1: Vec<i64> = w0;
+    w1.set(10, 77);
+    w1.set(50, 0 - 5);
+    val b0: Vec<i64> = nc_words_to_bytes(&w0);
+    val b1: Vec<i64> = nc_words_to_bytes(&w1);
+    val d2: Vec<i64> = nc_delta_encode(&b0, &b1);
+    var rt: bool = false;
+    match nc_delta_decode(&b0, &d2) {
+        Result::Ok(r) => { rt = same(&nc_bytes_to_words(&r), &w1); }
+        Result::Err(e) => { println(e); }
+    }
+    println("delta of 64-word state with 2 changes: " + int_to_str(b1.len()) + " bytes -> " + int_to_str(d2.len()) + " bytes, round trip " + yes(rt));
+    var bad: Vec<i64> = d;
+    bad.pop();
+    match nc_delta_decode(&base, &bad) {
+        Result::Ok(_) => { println("delta truncated: accepted"); }
+        Result::Err(e) => { println("delta truncated: " + e); }
+    }
+
+    // ── snapshot interpolation
+    var ip: NcInterp = nc_interp_new(4);
+    var v0: Vec<f64> = Vec::new(); v0.push(10.0); v0.push(0.0);
+    var v1: Vec<f64> = Vec::new(); v1.push(20.0); v1.push(0.0 - 10.0);
+    var v2: Vec<f64> = Vec::new(); v2.push(30.0); v2.push(0.0 - 10.0);
+    nc_interp_push(&mut ip, 1.0, v0);
+    nc_interp_push(&mut ip, 3.0, v2);
+    nc_interp_push(&mut ip, 2.0, v1);
+    val s15: Vec<f64> = nc_interp_sample(&ip, 1.5);
+    println("interp at 1.5: " + f2(s15.get(0)) + " " + f2(s15.get(1)));
+    val s05: Vec<f64> = nc_interp_sample(&ip, 0.5);
+    val s90: Vec<f64> = nc_interp_sample(&ip, 9.0);
+    println("interp at 0.5: " + f2(s05.get(0)) + " " + f2(s05.get(1)) + ", at 9.0: " + f2(s90.get(0)) + " " + f2(s90.get(1)));
+    println("interp out of order: 2.25 -> " + f2(nc_interp_sample(&ip, 2.25).get(0)));
+
+    // ── reliable channel alone: 60 messages over 30% loss
+    var ca: NcChannel = nc_channel_new(4, 200);
+    var cb: NcChannel = nc_channel_new(4, 200);
+    var ab: Link = Link { at: Vec::new(), pkts: Vec::new() };
+    var ba: Link = Link { at: Vec::new(), pkts: Vec::new() };
+    var got: Vec<i64> = Vec::new();
+    var t: i64 = 0;
+    while t < 400 {
+        if t < 60 {
+            var m: Vec<i64> = Vec::new();
+            m.push(t);
+            m.push(255 - t);
+            nc_channel_send(&mut ca, m);
+        }
+        link_send(&mut ab, t, nc_channel_build_packet(&mut ca, t), 30);
+        link_send(&mut ba, t, nc_channel_build_packet(&mut cb, t), 30);
+        val to_b: Vec<Vec<i64>> = link_due(&mut ab, t);
+        i = 0;
+        while i < to_b.len() {
+            nc_channel_receive(&mut cb, &to_b.get(i));
+            i = i + 1;
+        }
+        val to_a: Vec<Vec<i64>> = link_due(&mut ba, t);
+        i = 0;
+        while i < to_a.len() {
+            nc_channel_receive(&mut ca, &to_a.get(i));
+            i = i + 1;
+        }
+        val ms: Vec<Vec<i64>> = nc_channel_take(&mut cb);
+        i = 0;
+        while i < ms.len() {
+            got.push(ms.get(i).get(0));
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    var in_order: bool = got.len() == 60;
+    i = 0;
+    while i < got.len() {
+        if got.get(i) != i { in_order = false; }
+        i = i + 1;
+    }
+    println("channel: " + int_to_str(got.len()) + " delivered in order: " + yes(in_order));
+    println("channel: resends > 0: " + yes(ca.resends > 0) + ", duplicates seen: " + yes(cb.duplicates > 0) + ", unacked " + int_to_str(nc_channel_unacked(&ca)));
+    var junk: Vec<i64> = Vec::new();
+    junk.push(1); junk.push(0); junk.push(5); junk.push(0); junk.push(0);
+    junk.push(0); junk.push(0); junk.push(0); junk.push(0); junk.push(2);
+    junk.push(0); junk.push(1);
+    println("channel: malformed packet refused: " + yes(!nc_channel_receive(&mut cb, &junk)));
+
+    // ── two rollback peers
+    val total: i64 = 150;
+    var st0: Vec<i64> = Vec::filled(6, 0);
+    g_states.push(st0);
+    g_states.push(st0);
+    g_states.push(st0);
+    val game: NcGame = nc_game(game_save, game_load, game_advance);
+    var sa: NcSession = nc_session_new(game, 0, 2, 0, 8, 0);
+    var sb: NcSession = nc_session_new(game, 1, 2, 1, 8, 0);
+    var na: NcChannel = nc_channel_new(3, 1200);
+    var nb: NcChannel = nc_channel_new(3, 1200);
+    var lab: Link = Link { at: Vec::new(), pkts: Vec::new() };
+    var lba: Link = Link { at: Vec::new(), pkts: Vec::new() };
+    var max_lead: i64 = 0;
+    t = 0;
+    while t < 2000 {
+        // A
+        if sa.frame < total && sa.next_local == sa.frame {
+            val f: i64 = nc_session_add_local_input(&mut sa, input_of(0, sa.frame));
+            var m: Vec<i64> = Vec::new();
+            m.push(f >> 8); m.push(f & 255); m.push(input_of(0, f));
+            nc_channel_send(&mut na, m);
+        }
+        if sa.frame < total {
+            nc_session_advance(&mut sa);
+        }
+        // B runs at a slightly different pace: it skips every 9th tick
+        if t % 9 != 4 {
+            if sb.frame < total && sb.next_local == sb.frame {
+                val f: i64 = nc_session_add_local_input(&mut sb, input_of(1, sb.frame));
+                var m: Vec<i64> = Vec::new();
+                m.push(f >> 8); m.push(f & 255); m.push(input_of(1, f));
+                nc_channel_send(&mut nb, m);
+            }
+            if sb.frame < total {
+                nc_session_advance(&mut sb);
+            }
+        }
+        if nc_session_lead(&sa) > max_lead { max_lead = nc_session_lead(&sa); }
+        if nc_session_lead(&sb) > max_lead { max_lead = nc_session_lead(&sb); }
+        link_send(&mut lab, t, nc_channel_build_packet(&mut na, t), 20);
+        link_send(&mut lba, t, nc_channel_build_packet(&mut nb, t), 20);
+        pump(&mut nb, &mut sb, &mut lab, t, 0);
+        pump(&mut na, &mut sa, &mut lba, t, 1);
+        if sa.frame == total && sb.frame == total && sa.confirmed >= total && sb.confirmed >= total && nc_channel_unacked(&na) == 0 && nc_channel_unacked(&nb) == 0 {
+            break;
+        }
+        t = t + 1;
+    }
+    nc_session_resolve(&mut sa);
+    nc_session_resolve(&mut sb);
+    // reference: all inputs known
+    var ref: Vec<i64> = st0;
+    var f: i64 = 0;
+    while f < total {
+        var inp: Vec<i64> = Vec::new();
+        inp.push(input_of(0, f));
+        inp.push(input_of(1, f));
+        ref = game_step(ref, inp);
+        f = f + 1;
+    }
+    println("peers simulated " + int_to_str(total) + " frames: " + yes(sa.frame == total) + " " + yes(sb.frame == total));
+    println("confirmed: " + int_to_str(sa.confirmed) + " " + int_to_str(sb.confirmed));
+    val ca2: i64 = nc_checksum(&g_states.get(0));
+    val cb2: i64 = nc_checksum(&g_states.get(1));
+    println("A == B: " + yes(ca2 == cb2 && same(&g_states.get(0), &g_states.get(1))));
+    println("A == reference: " + yes(same(&g_states.get(0), &ref)));
+    println("rollbacks happened: " + yes(sa.rollbacks > 0) + " " + yes(sb.rollbacks > 0));
+    println("stalls happened: " + yes(sa.stalls + sb.stalls > 0));
+    println("lead never above max prediction: " + yes(max_lead <= 8));
+}

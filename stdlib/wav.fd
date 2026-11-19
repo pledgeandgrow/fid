@@ -1,0 +1,522 @@
+// Fides WAV standard library
+//
+// RIFF/WAVE audio files, read and written entirely in Fides (no seam;
+// bytes in, bytes out — use stdlib fs to load or save them):
+//   - formats: integer PCM (format 1) at 8 bits (unsigned), 16, 24 and 32
+//     bits (signed little-endian), IEEE float (format 3) at 32 bits, and
+//     WAVE_FORMAT_EXTENSIBLE (0xFFFE) carrying either, with its channel mask;
+//   - any channel count (samples interleaved, frame by frame);
+//   - chunk walking per the RIFF rules: unknown chunks (LIST, fact, cue, ...)
+//     are skipped, odd-sized chunks are padded to even;
+//   - samples as f64 in -1..1: integer PCM is value / 2^(bits-1) (8-bit:
+//     (value - 128) / 128), as ffmpeg and most tools scale it; writing
+//     scales by 2^(bits-1), rounds and clips, so integer data round-trips
+//     bit-exactly; float32 is converted with round-to-nearest-even;
+//   - conversions: to another format/bit depth, mono <-> stereo, any
+//     channel count to mono (average), channel extraction.
+//
+// Usage:
+//   use wav;
+//   use fs;
+//   val w: Wav = wav_decode(fs_read_bytes("in.wav"));
+//   if w.ok { println(int_to_str(w.channels) + " ch, " + int_to_str(wav_frames(&w)) + " frames"); }
+//   fs_write_bytes("out.wav", wav_encode(&w, WAV_PCM, 16));
+
+module wav;
+use vec;
+
+pub const WAV_PCM: i64 = 1;
+pub const WAV_FLOAT: i64 = 3;
+pub const WAV_EXTENSIBLE: i64 = 65534;
+
+/// A decoded (or to-be-encoded) WAV file.
+pub struct Wav {
+    pub ok: bool,
+    pub error: str,
+    pub format: i64,
+    // WAV_PCM or WAV_FLOAT (the sub-format of an extensible file)
+    pub extensible: bool,
+    // the file used WAVE_FORMAT_EXTENSIBLE
+    pub channels: i64,
+    pub sample_rate: i64,
+    pub bits: i64,
+    // bits per sample as stored (8, 16, 24, 32)
+    pub valid_bits: i64,
+    // extensible only: meaningful bits (else = bits)
+    pub channel_mask: i64,
+    pub samples: Vec<f64>,  // interleaved, -1..1
+}
+
+/// An empty Wav to fill with samples.
+pub fn wav_new(channels: i64, sample_rate: i64) -> Wav {
+    return Wav {
+        ok: true, error: "", format: WAV_PCM, extensible: false, channels: channels, sample_rate: sample_rate, bits: 16, valid_bits: 16, channel_mask: 0, samples: Vec::new(),
+    };
+}
+
+fn wv_fail(msg: str) -> Wav {
+    var w: Wav = wav_new(0, 0);
+    w.ok = false;
+    w.error = msg;
+    return w;
+}
+
+/// Number of frames (samples per channel).
+pub fn wav_frames(w: &Wav) -> i64 {
+    if w.channels <= 0 {
+        return 0;
+    }
+    return w.samples.len() / w.channels;
+}
+
+/// Sample of channel `ch` in frame `frame`.
+pub fn wav_sample(w: &Wav, frame: i64, ch: i64) -> f64 {
+    return w.samples.get(frame * w.channels + ch);
+}
+
+/// Duration in seconds.
+pub fn wav_duration(w: &Wav) -> f64 {
+    if w.sample_rate <= 0 {
+        return 0.0;
+    }
+    return (wav_frames(w) as f64) / (w.sample_rate as f64);
+}
+
+// ─── Little-endian helpers ────────────────────────────────────────────────
+
+fn wv_u16(b: &Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256;
+}
+
+fn wv_u32(b: &Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256 + b.get(o + 2) * 65536 + b.get(o + 3) * 16777216;
+}
+
+fn wv_tag(b: &Vec<i64>, o: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < 4 {
+        s = s + char_to_str(b.get(o + i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn wv_put16(out: &mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+}
+
+fn wv_put32(out: &mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 24) & 255);
+}
+
+fn wv_puttag(out: &mut Vec<i64>, t: str) {
+    var i: i64 = 0;
+    while i < 4 {
+        out.push(str_byte_at(t, i));
+        i = i + 1;
+    }
+}
+
+// ─── float32 <-> f64 ──────────────────────────────────────────────────────
+
+/// The f64 value of IEEE-754 single-precision bits `bits` (0..2^32-1).
+@wrapping
+pub fn wav_f32_from_bits(bits: i64) -> f64 {
+    val sign: i64 = (bits >> 31) & 1;
+    val e: i64 = (bits >> 23) & 255;
+    val m: i64 = bits & 8388607;
+    var mag: f64 = 0.0;
+    if e == 255 {
+        // infinity or NaN: build the f64 with an all-ones exponent
+        var b64: i64 = 2047 << 52;
+        if m != 0 {
+            b64 = b64 | (m << 29);
+        }
+        if sign == 1 {
+            b64 = b64 | (1 << 63);
+        }
+        return p_f64_from_bits(b64);
+    }
+    if e == 0 {
+        // subnormal: m * 2^-149
+        mag = (m as f64) * p_f64_from_bits(874 << 52);
+    } else {
+        val b64: i64 = ((e - 127 + 1023) << 52) | (m << 29);
+        mag = p_f64_from_bits(b64);
+    }
+    if sign == 1 {
+        return - mag;
+    }
+    return mag;
+}
+
+/// IEEE-754 single-precision bits of `x` (round to nearest even;
+/// overflow gives infinity).
+@wrapping
+pub fn wav_f32_bits(x: f64) -> i64 {
+    val b: i64 = p_f64_to_bits(x);
+    val sign: i64 = (b >> 63) & 1;
+    val e: i64 = (b >> 52) & 2047;
+    val m: i64 = b & 4503599627370495;
+    val s32: i64 = sign << 31;
+    if e == 2047 {
+        if m != 0 {
+            return s32 | 2143289344;
+        }
+        return s32 | 2139095040;
+    }
+    var exp: i64 = e - 1023 + 127;
+    // the 53-bit significand with its hidden bit
+    var sig: i64 = m;
+    if e != 0 {
+        sig = m | 4503599627370496;
+    }
+    var shift: i64 = 29;
+    if exp <= 0 {
+        // subnormal result: shift the significand further
+        shift = 29 + 1 - exp;
+        exp = 0;
+        if shift > 60 {
+            return s32;
+        }
+    }
+    var q: i64 = sig >> shift;
+    val rem: i64 = sig - (q << shift);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (q & 1) == 1) {
+        q = q + 1;
+    }
+    if exp == 0 {
+        // q holds the subnormal mantissa (it may round up into the normals)
+        return s32 | q;
+    }
+    // q has 24 bits (the hidden one at bit 23), or 25 after rounding up
+    if q >= 16777216 {
+        q = q >> 1;
+        exp = exp + 1;
+    }
+    if exp >= 255 {
+        return s32 | 2139095040;
+    }
+    return s32 | (exp << 23) | (q & 8388607);
+}
+
+// ─── Decoding ─────────────────────────────────────────────────────────────
+
+/// Decode a WAV file. `ok` false with `error` on anything malformed or
+/// unsupported.
+pub fn wav_decode(b: &Vec<i64>) -> Wav {
+    val n: i64 = b.len();
+    if n < 12 || wv_tag(b, 0) != "RIFF" || wv_tag(b, 8) != "WAVE" {
+        return wv_fail("not a RIFF/WAVE file");
+    }
+    var end: i64 = 8 + wv_u32(b, 4);
+    if end > n {
+        end = n;
+    }
+    var w: Wav = wav_new(0, 0);
+    var have_fmt: bool = false;
+    var data_at: i64 = - 1;
+    var data_len: i64 = 0;
+    var p: i64 = 12;
+    while p + 8 <= end {
+        val tag: str = wv_tag(b, p);
+        val size: i64 = wv_u32(b, p + 4);
+        val body: i64 = p + 8;
+        if tag == "fmt " {
+            if size < 16 || body + size > n {
+                return wv_fail("short fmt chunk");
+            }
+            var fmt: i64 = wv_u16(b, body);
+            w.channels = wv_u16(b, body + 2);
+            w.sample_rate = wv_u32(b, body + 4);
+            val block_align: i64 = wv_u16(b, body + 12);
+            w.bits = wv_u16(b, body + 14);
+            w.valid_bits = w.bits;
+            if fmt == WAV_EXTENSIBLE {
+                if size < 40 || wv_u16(b, body + 16) < 22 {
+                    return wv_fail("short WAVE_FORMAT_EXTENSIBLE fmt chunk");
+                }
+                w.extensible = true;
+                w.valid_bits = wv_u16(b, body + 18);
+                w.channel_mask = wv_u32(b, body + 20);
+                // sub-format GUID: xxxx0000-0000-0010-8000-00aa00389b71
+                fmt = wv_u16(b, body + 24);
+            }
+            if fmt != WAV_PCM && fmt != WAV_FLOAT {
+                return wv_fail("unsupported format code " + int_to_str(fmt));
+            }
+            w.format = fmt;
+            if w.channels <= 0 {
+                return wv_fail("no channels");
+            }
+            if fmt == WAV_PCM && w.bits != 8 && w.bits != 16 && w.bits != 24 && w.bits != 32 {
+                return wv_fail("unsupported PCM bit depth " + int_to_str(w.bits));
+            }
+            if fmt == WAV_FLOAT && w.bits != 32 {
+                return wv_fail("unsupported float bit depth " + int_to_str(w.bits));
+            }
+            if block_align != w.channels * w.bits / 8 {
+                return wv_fail("block align does not match channels and bits");
+            }
+            have_fmt = true;
+        } else if tag == "data" {
+            data_at = body;
+            data_len = size;
+            if data_at + data_len > n {
+                // a truncated file: keep the whole frames that are there
+                data_len = n - data_at;
+            }
+        }
+        p = body + size + (size & 1);
+    }
+    if !have_fmt {
+        return wv_fail("no fmt chunk");
+    }
+    if data_at < 0 {
+        return wv_fail("no data chunk");
+    }
+    val bps: i64 = w.bits / 8;
+    val frame_bytes: i64 = bps * w.channels;
+    val frames: i64 = data_len / frame_bytes;
+    val count: i64 = frames * w.channels;
+    var i: i64 = 0;
+    var o: i64 = data_at;
+    while i < count {
+        var x: f64 = 0.0;
+        if w.format == WAV_FLOAT {
+            x = wav_f32_from_bits(wv_u32(b, o));
+        } else if bps == 1 {
+            x = ((b.get(o) - 128) as f64) / 128.0;
+        } else if bps == 2 {
+            var v: i64 = wv_u16(b, o);
+            if v >= 32768 { v = v - 65536; }
+            x = (v as f64) / 32768.0;
+        } else if bps == 3 {
+            var v: i64 = b.get(o) + b.get(o + 1) * 256 + b.get(o + 2) * 65536;
+            if v >= 8388608 { v = v - 16777216; }
+            x = (v as f64) / 8388608.0;
+        } else {
+            var v: i64 = wv_u32(b, o);
+            if v >= 2147483648 { v = v - 4294967296; }
+            x = (v as f64) / 2147483648.0;
+        }
+        w.samples.push(x);
+        o = o + bps;
+        i = i + 1;
+    }
+    return w;
+}
+
+/// The integer value sample `x` (-1..1) takes at `bits` (8: unsigned):
+/// x * 2^(bits-1), rounded half away from zero and clipped.
+pub fn wav_quantize(x: f64, bits: i64) -> i64 {
+    val scale: f64 = (1 << (bits - 1)) as f64;
+    val hi: i64 = (1 << (bits - 1)) - 1;
+    val lo: i64 = - (1 << (bits - 1));
+    var y: f64 = x * scale;
+    var v: i64 = 0;
+    if y >= 0.0 {
+        if y >= (hi as f64) {
+            v = hi;
+        } else {
+            v = (y + 0.5) as i64;
+        }
+    } else {
+        if y <= (lo as f64) {
+            v = lo;
+        } else {
+            v = - ((0.5 - y) as i64);
+        }
+    }
+    if v > hi { v = hi; }
+    if v < lo { v = lo; }
+    if bits == 8 {
+        return v + 128;
+    }
+    return v;
+}
+
+// ─── Encoding ─────────────────────────────────────────────────────────────
+
+/// Encode `w`'s samples as `format` (WAV_PCM or WAV_FLOAT) at `bits` per
+/// sample. Files with more than 2 channels, or integer PCM of more than 16
+/// bits, are written as WAVE_FORMAT_EXTENSIBLE (with `w.channel_mask`, or
+/// the default mask for the channel count), as Microsoft asks and ffmpeg
+/// does; others as plain PCM, or float with a fact chunk.
+pub fn wav_encode(w: &Wav, format: i64, bits: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val bps: i64 = bits / 8;
+    val ext: bool = w.channels > 2 || (format == WAV_PCM && bits > 16);
+    val data_len: i64 = w.samples.len() * bps;
+    var fmt_len: i64 = 16;
+    if ext { fmt_len = 40; }
+    if format == WAV_FLOAT && !ext { fmt_len = 18; }
+    var fact: bool = format == WAV_FLOAT;
+    var riff_len: i64 = 4 + 8 + fmt_len + 8 + data_len + (data_len & 1);
+    if fact { riff_len = riff_len + 12; }
+    wv_puttag(&mut out, "RIFF");
+    wv_put32(&mut out, riff_len);
+    wv_puttag(&mut out, "WAVE");
+    wv_puttag(&mut out, "fmt ");
+    wv_put32(&mut out, fmt_len);
+    if ext {
+        wv_put16(&mut out, WAV_EXTENSIBLE);
+    } else {
+        wv_put16(&mut out, format);
+    }
+    wv_put16(&mut out, w.channels);
+    wv_put32(&mut out, w.sample_rate);
+    wv_put32(&mut out, w.sample_rate * w.channels * bps);
+    wv_put16(&mut out, w.channels * bps);
+    wv_put16(&mut out, bits);
+    if ext {
+        wv_put16(&mut out, 22);
+        wv_put16(&mut out, bits);
+        var mask: i64 = w.channel_mask;
+        if mask == 0 {
+            mask = wav_default_mask(w.channels);
+        }
+        wv_put32(&mut out, mask);
+        wv_put16(&mut out, format);
+        // rest of KSDATAFORMAT_SUBTYPE GUID
+        val guid: Vec<i64> = wv_guid_tail();
+        var g: i64 = 0;
+        while g < guid.len() {
+            out.push(guid.get(g));
+            g = g + 1;
+        }
+    } else if format == WAV_FLOAT {
+        wv_put16(&mut out, 0);
+    }
+    if fact {
+        wv_puttag(&mut out, "fact");
+        wv_put32(&mut out, 4);
+        wv_put32(&mut out, wav_frames(w));
+    }
+    wv_puttag(&mut out, "data");
+    wv_put32(&mut out, data_len);
+    var i: i64 = 0;
+    while i < w.samples.len() {
+        val x: f64 = w.samples.get(i);
+        if format == WAV_FLOAT {
+            wv_put32(&mut out, wav_f32_bits(x));
+        } else {
+            val v: i64 = wav_quantize(x, bits);
+            var k: i64 = 0;
+            while k < bps {
+                out.push((v >> (8 * k)) & 255);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (data_len & 1) == 1 {
+        out.push(0);
+    }
+    return out;
+}
+
+fn wv_guid_tail() -> Vec<i64> {
+    var g: Vec<i64> = Vec::new();
+    g.push(0); g.push(0);
+    g.push(0); g.push(0);
+    g.push(16); g.push(0);
+    g.push(128); g.push(0);
+    g.push(0); g.push(170); g.push(0); g.push(56); g.push(155); g.push(113);
+    return g;
+}
+
+/// The usual speaker mask for `channels` (mono FC, stereo FL FR, 5.1 =
+/// FL FR FC LFE BL BR, 7.1 adds SL SR); other counts: the first n bits.
+pub fn wav_default_mask(channels: i64) -> i64 {
+    if channels == 1 { return 4; }
+    if channels == 2 { return 3; }
+    if channels == 4 { return 51; }
+    if channels == 6 { return 63; }
+    if channels == 8 { return 1599; }
+    if channels >= 31 { return 0; }
+    return (1 << channels) - 1;
+}
+
+// ─── Conversions ──────────────────────────────────────────────────────────
+
+/// A copy of `w` as it would read back after storing at `format`/`bits`
+/// (requantized), e.g. to preview 8-bit audio.
+pub fn wav_requantize(w: &Wav, format: i64, bits: i64) -> Wav {
+    return wav_decode(&wav_encode(w, format, bits));
+}
+
+/// Average all channels into one.
+pub fn wav_to_mono(w: &Wav) -> Wav {
+    var o: Wav = wav_new(1, w.sample_rate);
+    o.format = w.format;
+    o.bits = w.bits;
+    o.valid_bits = w.valid_bits;
+    val frames: i64 = wav_frames(w);
+    var f: i64 = 0;
+    while f < frames {
+        var s: f64 = 0.0;
+        var c: i64 = 0;
+        while c < w.channels {
+            s = s + w.samples.get(f * w.channels + c);
+            c = c + 1;
+        }
+        o.samples.push(s / (w.channels as f64));
+        f = f + 1;
+    }
+    return o;
+}
+
+/// Mono to stereo (the channel in both); stereo stays as it is.
+pub fn wav_to_stereo(w: &Wav) -> Wav {
+    if w.channels == 2 {
+        return wav_channels_copy(w);
+    }
+    val m: Wav = if w.channels == 1 { wav_channels_copy(w) } else { wav_to_mono(w) };
+    var o: Wav = wav_new(2, w.sample_rate);
+    o.format = w.format;
+    o.bits = w.bits;
+    o.valid_bits = w.valid_bits;
+    var i: i64 = 0;
+    while i < m.samples.len() {
+        o.samples.push(m.samples.get(i));
+        o.samples.push(m.samples.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn wav_channels_copy(w: &Wav) -> Wav {
+    var o: Wav = wav_new(w.channels, w.sample_rate);
+    o.format = w.format;
+    o.bits = w.bits;
+    o.valid_bits = w.valid_bits;
+    o.channel_mask = w.channel_mask;
+    var i: i64 = 0;
+    while i < w.samples.len() {
+        o.samples.push(w.samples.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Channel `ch` alone, as a mono Wav.
+pub fn wav_channel(w: &Wav, ch: i64) -> Wav {
+    var o: Wav = wav_new(1, w.sample_rate);
+    o.format = w.format;
+    o.bits = w.bits;
+    o.valid_bits = w.valid_bits;
+    val frames: i64 = wav_frames(w);
+    var f: i64 = 0;
+    while f < frames {
+        o.samples.push(w.samples.get(f * w.channels + ch));
+        f = f + 1;
+    }
+    return o;
+}

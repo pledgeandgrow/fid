@@ -1,0 +1,146 @@
+// stdlib/bms: OCV table, Rint/1RC/2RC cells, coulomb counting, EKF SoC, SoH, balancing, pack
+// Hand-checkable values (Plett, Battery Management Systems vol. 1-2): a 1RC
+// branch charged at constant current reaches R1*I*(1 - e^(-t/tau)), so with
+// R1 = 15 mOhm, tau = 30 s, I = 10 A it is 0.094818 V after 30 s; 10 A for
+// 30 s takes 1/60 of a 5 Ah cell; 5 A for 1800 s takes half of it. The EKF
+// starts 0.4 away from the true SoC and must end within 1 %, where plain
+// coulomb counting keeps its initial error.
+// Expected output:
+// ocv(0.55)=3.7800 slope(0.55)=0.8000 soc(3.86)=0.6500 soc(2.9)=0.0000
+// rint 10 A at soc 0.5: 3.6400 V
+// 1rc after 30 s at 10 A: soc=0.483333 v1=0.094818 v=3.535182
+// 1rc relaxes after 300 s rest: v1=0.000004 v=3.729996
+// 2rc after 30 s at 10 A: v2=0.009516 v=3.525666
+// coulomb counting 5 A for 1800 s: soc=0.5000 ah_out=2.5000
+// charge 5 A for 360 s at eta 0.99: soc=0.5990
+// ekf: true soc 0.6333 ekf 0.6331 cc 0.2333 ekf within 1%: true cc within 1%: false
+// soh: capacity 0.8200 resistance 0.5000 cycles to 80% 40
+// capacity from ocv 4.07 -> 3.62 with 2.46 Ah: 4.1000 Ah
+// balance: false true false true
+// bleed 33 ohm at 4.1 V for 1 h: 0.124242 Ah, 1% of 5 Ah takes 1448.8 s
+// pack 2s2p: V=7.5556 cap=9.0000 Ah avail=4.9000 Ah soc=0.5444 weakest=1 spread=0.0800
+use bms;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn table() -> OcvTable {
+    var s: Vec<f64> = Vec::new();
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i <= 10 {
+        s.push((i as f64) / 10.0);
+        i = i + 1;
+    }
+    v.push(3.00);
+    v.push(3.45);
+    v.push(3.55);
+    v.push(3.62);
+    v.push(3.68);
+    v.push(3.74);
+    v.push(3.82);
+    v.push(3.90);
+    v.push(3.98);
+    v.push(4.07);
+    v.push(4.20);
+    return bms_ocv_table(s, v);
+}
+
+// deterministic noise in [-a, a]
+fn noise(seed: &mut i64, a: f64) -> f64 {
+    *seed = (*seed * 1103515245 + 12345) % 2147483648;
+    return a * (2.0 * (((*seed) as f64) / 2147483648.0) - 1.0);
+}
+
+fn main() {
+    val t = table();
+    println("ocv(0.55)=" + fx(bms_ocv(&t, 0.55), 4) + " slope(0.55)=" + fx(bms_ocv_slope(&t, 0.55), 4) + " soc(3.86)=" + fx(bms_soc_from_ocv(&t, 3.86), 4) + " soc(2.9)=" + fx(bms_soc_from_ocv(&t, 2.9), 4));
+    val rint = bms_rint(5.0, 0.01, table());
+    val s0 = bms_cell_state(0.5);
+    println("rint 10 A at soc 0.5: " + fx(bms_terminal_voltage(&rint, &s0, 10.0), 4) + " V");
+
+    val th = bms_thevenin(5.0, 0.01, 0.015, 2000.0, table());
+    var s1 = bms_cell_state(0.5);
+    val v1 = bms_cell_step(&th, &mut s1, 10.0, 30.0);
+    println("1rc after 30 s at 10 A: soc=" + fx(s1.soc, 6) + " v1=" + fx(s1.v1, 6) + " v=" + fx(v1, 6));
+    var k: i64 = 0;
+    var vr: f64 = 0.0;
+    while k < 300 {
+        vr = bms_cell_step(&th, &mut s1, 0.0, 1.0);
+        k = k + 1;
+    }
+    println("1rc relaxes after 300 s rest: v1=" + fx(s1.v1, 6) + " v=" + fx(vr, 6));
+    val th2 = bms_thevenin2(5.0, 0.01, 0.015, 2000.0, 0.01, 30000.0, table());
+    var s2 = bms_cell_state(0.5);
+    val v2 = bms_cell_step(&th2, &mut s2, 10.0, 30.0);
+    println("2rc after 30 s at 10 A: v2=" + fx(s2.v2, 6) + " v=" + fx(v2, 6));
+
+    var cc = bms_coulomb_counter(1.0, 5.0, 0.99);
+    CoulombCounter_step(&mut cc, 5.0, 1800.0);
+    println("coulomb counting 5 A for 1800 s: soc=" + fx(cc.soc, 4) + " ah_out=" + fx(cc.ah_out, 4));
+    CoulombCounter_step(&mut cc, -5.0, 360.0);
+    println("charge 5 A for 360 s at eta 0.99: soc=" + fx(cc.soc, 4));
+
+    // EKF: the "true" cell is the 1RC model; measurements carry +-2 mV noise
+    var truth = bms_cell_state(0.9);
+    var ekf = bms_ekf(bms_thevenin(5.0, 0.01, 0.015, 2000.0, table()), 0.5, 0.1, 0.00000001, 0.000001, 0.000004);
+    var naive = bms_coulomb_counter(0.5, 5.0, 1.0);
+    var seed: i64 = 42;
+    k = 0;
+    while k < 1800 {
+        var cur: f64 = 5.0;
+        if (k / 60) % 3 == 2 {
+            cur = -2.0;
+        }
+        val vm: f64 = bms_cell_step(&th, &mut truth, cur, 1.0) + noise(&mut seed, 0.002);
+        BmsEkf_step(&mut ekf, cur, vm, 1.0);
+        CoulombCounter_step(&mut naive, cur, 1.0);
+        k = k + 1;
+    }
+    println("ekf: true soc " + fx(truth.soc, 4) + " ekf " + fx(ekf.soc, 4) + " cc " + fx(naive.soc, 4) + " ekf within 1%: " + bool_to_str(math_fabs(ekf.soc - truth.soc) < 0.01) + " cc within 1%: " + bool_to_str(math_fabs(naive.soc - truth.soc) < 0.01));
+
+    println("soh: capacity " + fx(bms_soh_capacity(4.1, 5.0), 4) + " resistance " + fx(bms_soh_resistance(0.015, 0.01, 0.02), 4) + " cycles to 80% " + fx(bms_cycles_to_eol(0.84, 0.001, 0.8), 0));
+    println("capacity from ocv 4.07 -> 3.62 with 2.46 Ah: " + fx(bms_capacity_from_ocv(&t, 4.07, 3.62, 2.46), 4) + " Ah");
+    var cells: Vec<f64> = Vec::new();
+    cells.push(4.100);
+    cells.push(4.150);
+    cells.push(4.110);
+    cells.push(4.180);
+    val dec = bms_balance_decisions(&cells, 0.02, 3.9);
+    println("balance: " + bool_to_str(dec.get(0)) + " " + bool_to_str(dec.get(1)) + " " + bool_to_str(dec.get(2)) + " " + bool_to_str(dec.get(3)));
+    println("bleed 33 ohm at 4.1 V for 1 h: " + fx(bms_bleed_ah(4.1, 33.0, 3600.0), 6) + " Ah, 1% of 5 Ah takes " + fx(bms_bleed_time(0.51, 0.50, 5.0, 4.1, 33.0), 1) + " s");
+
+    var pack = bms_pack(2, 2);
+    BmsPack_add_cell(&mut pack, 5.0, 0.5);
+    BmsPack_add_cell(&mut pack, 5.0, 0.6);
+    BmsPack_add_cell(&mut pack, 4.0, 0.6);
+    BmsPack_add_cell(&mut pack, 5.0, 0.5);
+    val ps = BmsPack_summary(&pack, &t);
+    println("pack 2s2p: V=" + fx(ps.voltage, 4) + " cap=" + fx(ps.capacity_ah, 4) + " Ah avail=" + fx(ps.available_ah, 4) + " Ah soc=" + fx(ps.soc, 4) + " weakest=" + int_to_str(ps.weakest_group) + " spread=" + fx(ps.v_max - ps.v_min, 4));
+}

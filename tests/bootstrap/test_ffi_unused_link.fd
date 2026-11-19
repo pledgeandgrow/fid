@@ -1,0 +1,37 @@
+// A `link` library whose functions nothing the program runs calls is not
+// linked: the C build works on a machine without it (compiler/codegen_c.fd
+// emit_extern_decls, cg_unlinked_libs; the stdlib FFI seams vulkan, webgpu,
+// metal, objc, android_ndk and motion depend on it). device_open is never
+// run but its C function still calls the library: those calls go to stubs
+// that panic. A function value of the same type keeps device_open among the
+// candidates of the indirect call in C.
+// Expected output:
+// seam 42
+// done
+
+// SAFETY: a library no machine has; the program never calls into it.
+extern "C" link "fides_no_such_library" {
+    fn fides_nsl_open as nsl_open(name: str) -> i64;
+    fn fides_nsl_close as nsl_close(h: i64);
+}
+
+fn device_open(name: str) -> i64 {
+    var h: i64 = 0;
+    // SAFETY: name is NUL-terminated; never run (the library is absent).
+    unsafe { h = nsl_open(name); }
+    if h != 0 {
+        // SAFETY: h came from nsl_open.
+        unsafe { nsl_close(h); }
+    }
+    return h;
+}
+
+fn fake_open(name: str) -> i64 {
+    return str_len(name) * 6;
+}
+
+fn main() {
+    val open: fn(str) -> i64 = fake_open;
+    println("seam " + int_to_str(open("abcdefg")));
+    println("done");
+}

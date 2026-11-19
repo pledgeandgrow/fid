@@ -1,0 +1,74 @@
+// OP14 (compiler/iropt.fd iro_dyn_specialize, pass `dynspec`, on the
+// native paths; FID_IROPT_OFF=dynspec turns it off): a `dyn` value that
+// reaches its trait calls through a parameter. `measure` and `scaled` are
+// cloned per concrete type of the argument (`measure__dyn0_Sq`, ...), in
+// which `s.area()` is a direct call to `Sq_area` with the struct as the
+// receiver. The results must be what the type dispatch computes: through
+// a direct `as dyn`, through a local stored once, two types into one
+// function, a method with arguments, and a call in a loop.
+//
+// Expected output:
+// 9
+// 10
+// 19
+// 36
+// 40
+// 18
+// 63
+// 83
+
+cap Shape {
+    fn area(self) -> i64;
+    fn grow(self, k: i64) -> i64;
+}
+
+struct Sq { s: i64 }
+
+impl Shape for Sq {
+    pub fn area(self: Sq) -> i64 { return self.s * self.s; }
+    pub fn grow(self: Sq, k: i64) -> i64 { return (self.s + k) * (self.s + k); }
+}
+
+struct Rect { w: i64, h: i64 }
+
+impl Shape for Rect {
+    pub fn area(self: Rect) -> i64 { return self.w * self.h; }
+    pub fn grow(self: Rect, k: i64) -> i64 { return (self.w + k) * (self.h + k); }
+}
+
+fn measure(s: dyn Shape) -> i64 {
+    return s.area();
+}
+
+fn scaled(n: i64, s: dyn Shape) -> i64 {
+    return n * s.area();
+}
+
+fn both(a: dyn Shape, b: dyn Shape) -> i64 {
+    return a.area() + b.area();
+}
+
+fn grown(s: dyn Shape, k: i64) -> i64 {
+    return s.grow(k);
+}
+
+fn main() -> i64 {
+    val q = Sq { s: 3 };
+    val r = Rect { w: 2, h: 5 };
+    println(measure(q as dyn Shape));
+    val dr = r as dyn Shape;
+    println(measure(dr));
+    println(both(q as dyn Shape, dr));
+    println(scaled(4, q as dyn Shape));
+    println(scaled(4, dr));
+    println(grown(dr, 1));
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 7 {
+        t = t + measure(q as dyn Shape);
+        i = i + 1;
+    }
+    println(t);
+    println(t + both(dr, dr));
+    return 0;
+}

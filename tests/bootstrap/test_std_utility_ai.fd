@@ -1,0 +1,127 @@
+// stdlib/utility_ai: response curves, compensated action scores, selection with inertia and cooldowns
+// Expected output:
+// linear 0.000 0.250 0.500 0.750 1.000
+// inverse 1.000 0.750 0.500 0.250 0.000
+// quadratic 0.000 0.063 0.250 0.563 1.000
+// falling cubic 1.000 0.984 0.875 0.578 0.000
+// logistic 0.007 0.076 0.500 0.924 0.993
+// step 0.200 0.200 1.000 1.000 1.000
+// clamped 0.000 0.000 0.500 1.000 1.000
+// normalized health 0.80 score 0.80
+// compensated 0.5 x 0.5 = 0.3906
+// t=0 attack [0.874 0.360 0.000 0.200]
+// t=1 heal [0.873 0.878 0.000 0.200]
+// t=2 heal [0.583 1.138 0.000 0.200]
+// t=3 attack [0.873 0.638 0.000 0.200]
+// t=4 attack [0.554 0.000 0.075 0.200]
+// t=9 heal [0.554 0.938 0.075 0.200]
+// t=10 heal [0.129 1.238 0.318 0.200]
+// t=11 patrol [0.000 0.000 0.000 0.200]
+use utility_ai;
+
+// x rounded to d decimals ("-" only when the rounded value is not zero)
+fn fx(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val n: i64 = (a * (scale as f64) + 0.5) as i64;
+    if n == 0 { neg = false; }
+    var s: str = int_to_str(n / scale);
+    if d > 0 {
+        var fr: str = int_to_str(n % scale);
+        while str_len(fr) < d { fr = "0" + fr; }
+        s = s + "." + fr;
+    }
+    if neg { return "-" + s; }
+    return s;
+}
+
+fn curve_line(name: str, cv: UtilCurve) {
+    var s: str = name;
+    var i: i64 = 0;
+    while i <= 4 {
+        s = s + " " + fx(util_curve_eval(&cv, (i as f64) / 4.0), 3);
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn tick(r: &mut UtilReasoner, ctx: &UtilContext, now: f64) {
+    val pick: i64 = util_select(r, ctx, now);
+    var s: str = "t=" + fx(now, 0) + " " + util_action_name(r, pick) + " [";
+    var i: i64 = 0;
+    while i < r.scores.len() {
+        if i > 0 { s = s + " "; }
+        s = s + fx(r.scores.get(i), 3);
+        i = i + 1;
+    }
+    println(s + "]");
+}
+
+fn main() {
+    curve_line("linear", util_curve(UTIL_LINEAR, 1.0, 0.0, 0.0, 0.0));
+    curve_line("inverse", util_curve(UTIL_LINEAR, -1.0, 0.0, 0.0, 1.0));
+    curve_line("quadratic", util_curve(UTIL_QUADRATIC, 1.0, 2.0, 0.0, 0.0));
+    curve_line("falling cubic", util_curve(UTIL_QUADRATIC, -1.0, 3.0, 0.0, 1.0));
+    curve_line("logistic", util_curve(UTIL_LOGISTIC, 10.0, 1.0, 0.5, 0.0));
+    curve_line("step", util_curve(UTIL_STEP, 0.0, 1.0, 0.5, 0.2));
+    curve_line("clamped", util_curve(UTIL_LINEAR, 3.0, 0.0, 0.0, -1.0));
+
+    var ctx: UtilContext = util_context();
+    util_ctx_set(&mut ctx, "health", 80.0);
+    util_ctx_set(&mut ctx, "enemy_dist", 5.0);
+    util_ctx_set(&mut ctx, "ammo", 10.0);
+
+    var c1: UtilConsideration = util_consideration("health", 0.0, 100.0, util_curve(UTIL_LINEAR, 1.0, 0.0, 0.0, 0.0));
+    println("normalized health " + fx(util_normalize(&c1, &ctx), 2) + " score " + fx(util_consideration_score(&c1, &ctx), 2));
+
+    var brain: UtilReasoner = util_reasoner(0.25);
+    // attack: healthy, enemy close, ammo left
+    var attack: UtilAction = util_action("attack", 1.0, 0.0);
+    util_consider(&mut attack, util_consideration("health", 0.0, 100.0, util_curve(UTIL_LOGISTIC, 12.0, 1.0, 0.3, 0.0)));
+    util_consider(&mut attack, util_consideration("enemy_dist", 0.0, 20.0, util_curve(UTIL_LINEAR, -1.0, 0.0, 0.0, 1.0)));
+    util_consider(&mut attack, util_consideration("ammo", 0.0, 1.0, util_curve(UTIL_STEP, 0.0, 1.0, 1.0, 0.0)));
+    util_add_action(&mut brain, attack);
+    // heal: hurt (falling quadratic), 6 s cooldown
+    var heal: UtilAction = util_action("heal", 1.0, 6.0);
+    util_consider(&mut heal, util_consideration("health", 0.0, 100.0, util_curve(UTIL_QUADRATIC, -1.0, 2.0, 0.0, 1.0)));
+    util_add_action(&mut brain, heal);
+    // flee: very hurt and enemy close
+    var flee: UtilAction = util_action("flee", 1.2, 0.0);
+    util_consider(&mut flee, util_consideration("health", 0.0, 100.0, util_curve(UTIL_LINEAR, -1.0, 0.0, 0.0, 0.3)));
+    util_consider(&mut flee, util_consideration("enemy_dist", 0.0, 20.0, util_curve(UTIL_LINEAR, -1.0, 0.0, 0.0, 1.0)));
+    util_add_action(&mut brain, flee);
+    // patrol: a constant fallback
+    util_add_action(&mut brain, util_action("patrol", 0.2, 0.0));
+
+    // compensation: two considerations of 0.5 score 0.625 * 0.625, not 0.25
+    var two: UtilAction = util_action("two", 1.0, 0.0);
+    util_consider(&mut two, util_consideration("half", 0.0, 1.0, util_curve(UTIL_LINEAR, 1.0, 0.0, 0.0, 0.0)));
+    util_consider(&mut two, util_consideration("half", 0.0, 1.0, util_curve(UTIL_LINEAR, 1.0, 0.0, 0.0, 0.0)));
+    util_ctx_set(&mut ctx, "half", 0.5);
+    println("compensated 0.5 x 0.5 = " + fx(util_action_score(&two, &ctx), 4));
+
+    tick(&mut brain, &ctx, 0.0);
+    util_ctx_set(&mut ctx, "health", 35.0);
+    tick(&mut brain, &ctx, 1.0);
+    util_ctx_set(&mut ctx, "health", 30.0);
+    tick(&mut brain, &ctx, 2.0);
+    util_ctx_set(&mut ctx, "health", 70.0);
+    tick(&mut brain, &ctx, 3.0);
+    util_ctx_set(&mut ctx, "health", 25.0);
+    tick(&mut brain, &ctx, 4.0);
+    tick(&mut brain, &ctx, 9.0);
+    util_ctx_set(&mut ctx, "health", 10.0);
+    util_ctx_set(&mut ctx, "enemy_dist", 2.0);
+    tick(&mut brain, &ctx, 10.0);
+    util_ctx_set(&mut ctx, "enemy_dist", 40.0);
+    util_ctx_set(&mut ctx, "health", 100.0);
+    util_ctx_set(&mut ctx, "ammo", 0.0);
+    tick(&mut brain, &ctx, 11.0);
+}

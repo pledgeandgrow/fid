@@ -1,0 +1,164 @@
+// stdlib/http2 (competitive SL1): content-length on requests, RFC 9113
+// §8.1.1. A server connection is driven by hand (no socket, as in
+// test_http2_frames.fd). A request whose DATA adds up to its
+// content-length is answered; one whose body is shorter or longer, whose
+// content-length is not a number, whose HEADERS end the stream while
+// declaring a body, or whose trailers end a body of the wrong size is
+// reset with PROTOCOL_ERROR (a stream error: the connection goes on).
+// Two equal content-length fields are one value.
+//
+// Expected output:
+// stream 1 answered
+// stream 3 reset 1
+// stream 5 reset 1
+// stream 7 reset 1
+// stream 9 reset 1
+// stream 11 reset 1
+// stream 13 answered
+// stream 15 answered
+// stream 17 answered
+// connection ok true
+use http;
+use http2;
+use hpack;
+use vec;
+use string;
+
+fn handler(req: HttpRequest) -> str {
+    return build_response(200, "text/plain", "got " + req.body);
+}
+
+// What the server sent for stream `id`: "answered" (HEADERS, no reset),
+// "reset <code>", or "nothing".
+fn verdict(out: Vec<i64>, id: i64) -> str {
+    val fs: Vec<H2Frame> = h2_frames_decode(out, 0);
+    var headers: bool = false;
+    var i: i64 = 0;
+    while i < fs.len() {
+        val f: H2Frame = fs.get(i);
+        if f.stream == id {
+            if f.ftype == H2_RST_STREAM {
+                return "reset " + int_to_str(h2_parse(f).code);
+            }
+            if f.ftype == H2_HEADERS {
+                headers = true;
+            }
+        }
+        i = i + 1;
+    }
+    if headers {
+        return "answered";
+    }
+    return "nothing";
+}
+
+fn feed(c: & mut H2Conn, b: Vec<i64>) -> Vec<i64> {
+    val fs: Vec<H2Frame> = h2_frames_decode(b, 0);
+    var i: i64 = 0;
+    var alive: bool = true;
+    while i < fs.len() && alive {
+        alive = h2_process(c, fs.get(i));
+        if alive {
+            h2_server_step(c);
+        }
+        i = i + 1;
+    }
+    val out: Vec<i64> = c.out;
+    c.out = Vec::new();
+    return out;
+}
+
+fn request(enc: & mut Hpack, cl: str, cl2: str) -> Vec<i64> {
+    var n: Vec<str> = Vec::new();
+    var v: Vec<str> = Vec::new();
+    n.push(":method");
+    v.push("POST");
+    n.push(":scheme");
+    v.push("http");
+    n.push(":authority");
+    v.push("example.org");
+    n.push(":path");
+    v.push("/echo");
+    if str_len(cl) > 0 {
+        n.push("content-length");
+        v.push(cl);
+    }
+    if str_len(cl2) > 0 {
+        n.push("content-length");
+        v.push(cl2);
+    }
+    return hpack_encode(enc, n, v);
+}
+
+fn expect(out: Vec<i64>, id: i64, want: str) {
+    val got: str = verdict(out, id);
+    println("stream " + int_to_str(id) + " " + got);
+    if !str_equal(got, want) {
+        p_panic("http2 length: stream " + int_to_str(id) + " gave " + got + ", want " + want);
+    }
+}
+
+fn main() -> i64 {
+    http2_set_handler(handler);
+    var c: H2Conn = h2_conn_new(- 1, false, "");
+    h2_conn_start(& mut c);
+    c.out = Vec::new();
+    var enc: Hpack = hpack_new(4096);
+    var b0: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b0, h2_settings_frame(Vec::new(), Vec::new()));
+    feed(& mut c, b0);
+
+    // 1: content-length 4, "ping" in two DATA frames
+    var b1: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b1, h2_headers_frame(1, request(& mut enc, "4", ""), false, true));
+    h2_put_frame(& mut b1, h2_data_frame(1, str_bytes("pi"), false, 0));
+    h2_put_frame(& mut b1, h2_data_frame(1, str_bytes("ng"), true, 0));
+    expect(feed(& mut c, b1), 1, "answered");
+    // 3: content-length 10, the stream ends after 3 bytes
+    var b3: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b3, h2_headers_frame(3, request(& mut enc, "10", ""), false, true));
+    h2_put_frame(& mut b3, h2_data_frame(3, str_bytes("abc"), true, 0));
+    expect(feed(& mut c, b3), 3, "reset 1");
+    // 5: content-length that is not a number
+    var b5: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b5, h2_headers_frame(5, request(& mut enc, "4x", ""), false, true));
+    expect(feed(& mut c, b5), 5, "reset 1");
+    // 7: HEADERS end the stream but declare 3 bytes
+    var b7: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b7, h2_headers_frame(7, request(& mut enc, "3", ""), true, true));
+    expect(feed(& mut c, b7), 7, "reset 1");
+    // 9: more DATA than declared, before the end of the stream
+    var b9: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b9, h2_headers_frame(9, request(& mut enc, "2", ""), false, true));
+    h2_put_frame(& mut b9, h2_data_frame(9, str_bytes("abc"), false, 0));
+    expect(feed(& mut c, b9), 9, "reset 1");
+    // 11: trailers end a 3-byte body that declared 5
+    var tn: Vec<str> = Vec::new();
+    var tv: Vec<str> = Vec::new();
+    tn.push("x-checksum");
+    tv.push("1");
+    var b11: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b11, h2_headers_frame(11, request(& mut enc, "5", ""), false, true));
+    h2_put_frame(& mut b11, h2_data_frame(11, str_bytes("abc"), false, 0));
+    h2_put_frame(& mut b11, h2_headers_frame(11, hpack_encode(& mut enc, tn, tv), true, true));
+    expect(feed(& mut c, b11), 11, "reset 1");
+    // 13: content-length 0 on HEADERS that end the stream
+    var b13: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b13, h2_headers_frame(13, request(& mut enc, "0", ""), true, true));
+    expect(feed(& mut c, b13), 13, "answered");
+    // 15: two equal content-length fields
+    var b15: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b15, h2_headers_frame(15, request(& mut enc, "3", "3"), false, true));
+    h2_put_frame(& mut b15, h2_data_frame(15, str_bytes("abc"), true, 0));
+    expect(feed(& mut c, b15), 15, "answered");
+    // 17: no content-length at all
+    var b17: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b17, h2_headers_frame(17, request(& mut enc, "", ""), false, true));
+    h2_put_frame(& mut b17, h2_data_frame(17, str_bytes("free"), true, 0));
+    expect(feed(& mut c, b17), 17, "answered");
+    println("connection ok " + bool_to_str(c.ok));
+    if !c.ok {
+        p_panic("http2 length: the connection failed");
+    }
+    return 0;
+}

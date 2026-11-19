@@ -1,0 +1,106 @@
+// stdlib/http3_udp (competitive SL2, part 3): an HTTP/3 server and client
+// in one process over real UDP sockets on 127.0.0.1: the QUIC handshake
+// (ALPN h3), both control streams with SETTINGS, a GET, a 30000-byte POST
+// echoed back, then the client closes with H3_NO_ERROR. It uses real
+// sockets, so it is not in the suite. The sockets are stdlib/udp.fd's
+// (nothing to link by hand), so it builds every way:
+//   $FID ccompile tests/net/http3_udp_loopback.fd -o hl.exe && ./hl.exe
+//   $FID emit tests/net/http3_udp_loopback.fd -o hl.exe && ./hl.exe        (Windows, native)
+//   CC="zig cc" $FID ccompile tests/net/http3_udp_loopback.fd --target x86_64-linux -o hl  (./hl in WSL)
+//
+// Expected output:
+// handshake over udp: h3
+// GET / -> 200 hello over udp
+// POST /echo 30000 bytes echoed
+// closed by the client: 256
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use quic_udp;
+use http3;
+use http3_udp;
+use encoding;
+
+fn pattern(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((i * 31 + i / 7) % 256);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i64 {
+    val seed: Vec<i64> = hex_decode_bytes("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    var sv: H3UdpServer = h3_udp_listen(47950, quic_config_server(alpn, cert, seed));
+    var ccfg: QuicConfig = quic_config_client(alpn, "localhost");
+    ccfg.peer_key = quic_cert_ed25519_key(cert);
+    var cl: H3UdpClient = h3_udp_connect("127.0.0.1", 47950, ccfg);
+    var none: Vec<str> = Vec::new();
+    var ct_n: Vec<str> = Vec::new();
+    var ct_v: Vec<str> = Vec::new();
+    ct_n.push("content-type");
+    ct_v.push("text/plain");
+    val big: Vec<i64> = pattern(30000);
+    var phase: i64 = 0;
+    var id: i64 = - 1;
+    val t0: i64 = p_clock_now_ms();
+    while phase < 5 && p_clock_now_ms() - t0 < 20000 {
+        h3_udp_client_poll(& mut cl, 2);
+        val reqs: Vec<H3UdpRequest> = h3_udp_server_poll(& mut sv, 2);
+        var k: i64 = 0;
+        while k < reqs.len() {
+            val r: H3UdpRequest = reqs.get(k);
+            if r.msg.path == "/" {
+                h3_udp_respond(& mut sv, r.conn, r.id, 200, ct_n, ct_v, str_bytes("hello over udp"));
+            } else if r.msg.path == "/echo" {
+                h3_udp_respond(& mut sv, r.conn, r.id, 200, ct_n, ct_v, r.msg.body);
+            } else {
+                h3_udp_respond(& mut sv, r.conn, r.id, 404, ct_n, ct_v, str_bytes("not found"));
+            }
+            k = k + 1;
+        }
+        if phase == 0 && quic_conn_established(& cl.udp.conn) {
+            println("handshake over udp: " + cl.udp.conn.alpn);
+            id = h3_request(& mut cl.h3, & mut cl.udp.conn, "GET", "https", "localhost", "/", none, none, pattern(0));
+            phase = 1;
+        } else if phase == 1 && h3_done(& cl.h3, id) {
+            val m: H3Message = h3_response(& mut cl.h3, id);
+            if !m.ok { p_panic("GET failed: " + m.why); }
+            println("GET / -> " + int_to_str(m.status) + " " + str_from_bytes(m.body));
+            id = h3_request(& mut cl.h3, & mut cl.udp.conn, "POST", "https", "localhost", "/echo", none, none, big);
+            phase = 2;
+        } else if phase == 2 && h3_done(& cl.h3, id) {
+            val m: H3Message = h3_response(& mut cl.h3, id);
+            if !m.ok || !same(m.body, big) { p_panic("POST failed: " + m.why); }
+            println("POST /echo " + int_to_str(m.body.len()) + " bytes echoed");
+            h3_close(& mut cl.h3, & mut cl.udp.conn, p_clock_now_ms());
+            phase = 3;
+        } else if phase == 3 && sv.udp.conns.len() > 0 && sv.udp.conns.get(0).peer_closed {
+            println("closed by the client: " + int_to_str(sv.udp.conns.get(0).error));
+            phase = 5;
+        }
+        if quic_conn_done(& cl.udp.conn) && phase < 3 {
+            p_panic("connection closed: " + cl.udp.conn.why);
+        }
+    }
+    if phase != 5 { p_panic("timed out in phase " + int_to_str(phase)); }
+    quic_udp_client_free(& mut cl.udp);
+    h3_udp_server_free(& mut sv);
+    return 0;
+}

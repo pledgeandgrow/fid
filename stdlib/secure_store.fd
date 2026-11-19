@@ -1,0 +1,479 @@
+// Fides secure storage: Android Keystore, iOS Keychain, encrypted file
+//
+// What is real (pure Fides, tested in the interpreter):
+//   - the portable fallback: an encrypted file holding a key -> value map.
+//     The key comes from a passphrase through PBKDF2-HMAC-SHA512 (written
+//     here over stdlib sha512, RFC 8018 §5.2) with a random 16-byte salt;
+//     the map is sealed with AES-256-GCM (stdlib aes_gcm) under a fresh
+//     12-byte nonce on every save; the file header (magic, version,
+//     iteration count, salt, nonce) is the GCM associated data, so any
+//     change to it or to the ciphertext fails the open
+//       "FSS1" | ver u8 | iterations u32 BE | salt 16 | nonce 12 | ct | tag 16
+//     entries inside: count u32, then per entry key-len u16, key, value-len
+//     u32, value (big-endian)
+//   - the Android Keystore protocol as data: the JNI steps that create an
+//     AES-256-GCM key in "AndroidKeyStore" and encrypt / decrypt with it,
+//     and the stored form of a value (version, 12-byte IV, ciphertext+tag,
+//     base64 for SharedPreferences)
+//   - the iOS Keychain queries as data (the CFString values of kSecClass,
+//     kSecAttrService, kSecAttrAccount, kSecAttrAccessible ...) for
+//     SecItemAdd / SecItemCopyMatching / SecItemUpdate / SecItemDelete, and
+//     the OSStatus codes mapped to one error set
+//
+// The platform seams: randomness is a function value (fn(i64) -> Vec<i64>,
+// n bytes; `secure_os_random` uses the OS generator); the Keychain
+// functions are declared extern "C" below (Security.framework, device
+// builds; the dictionaries are built through objc.fd); the Keystore steps
+// are performed through jni.fd. Files are read and written with the
+// runtime's binary-safe p_file_read_bytes / p_file_write_vec.
+//
+// Usage:
+//   use secure_store;
+//   var s: SecureFile = secure_file_new("pass phrase", 100000, secure_os_random);
+//   secure_put(&mut s, "token", str_bytes("abc"));
+//   val blob: Vec<i64> = secure_file_seal(&mut s);
+//   val back: SecureOpen = secure_file_open(blob, "pass phrase");
+
+module secure_store;
+use vec;
+use string;
+use encoding;
+use sha512;
+use aes_gcm;
+
+// ─── Keychain (Security.framework) ─────────────────────────────────────
+
+// SAFETY: OSStatus SecItemX(CFDictionaryRef, CFTypeRef*); dictionaries are
+// NSDictionary objects made through objc.fd (toll-free bridged).
+extern "C" {
+    fn SecItemAdd as secure_c_item_add(attributes: i64, result: i64) -> i64;
+    fn SecItemCopyMatching as secure_c_item_copy_matching(query: i64, result: i64) -> i64;
+    fn SecItemUpdate as secure_c_item_update(query: i64, attributes: i64) -> i64;
+    fn SecItemDelete as secure_c_item_delete(query: i64) -> i64;
+}
+
+// ─── Errors ────────────────────────────────────────────────────────────
+
+pub const SECURE_OK: i64 = 0;
+pub const SECURE_NOT_FOUND: i64 = 1;
+pub const SECURE_DUPLICATE: i64 = 2;
+pub const SECURE_AUTH_FAILED: i64 = 3;     // wrong passphrase, bad tag, biometrics failed
+pub const SECURE_LOCKED: i64 = 4;          // device locked / interaction not allowed
+pub const SECURE_CANCELED: i64 = 5;
+pub const SECURE_CORRUPT: i64 = 6;
+pub const SECURE_BAD_PARAM: i64 = 7;
+pub const SECURE_OTHER: i64 = 8;
+
+pub fn secure_error_name(e: i64) -> str {
+    val n: Vec<str> = str_split("ok,not-found,duplicate,auth-failed,locked,canceled,corrupt,bad-param,other", ",");
+    if e < 0 || e >= n.len() { return "?"; }
+    return n.get(e);
+}
+
+/// An OSStatus of the Security framework as an error code.
+pub fn secure_from_osstatus(st: i64) -> i64 {
+    if st == 0 { return SECURE_OK; }
+    if st == -25300 { return SECURE_NOT_FOUND; }        // errSecItemNotFound
+    if st == -25299 { return SECURE_DUPLICATE; }        // errSecDuplicateItem
+    if st == -25293 { return SECURE_AUTH_FAILED; }      // errSecAuthFailed
+    if st == -25308 { return SECURE_LOCKED; }           // errSecInteractionNotAllowed
+    if st == -128 { return SECURE_CANCELED; }           // errSecUserCanceled
+    if st == -50 { return SECURE_BAD_PARAM; }           // errSecParam
+    if st == -26276 { return SECURE_CORRUPT; }          // errSecInvalidData
+    return SECURE_OTHER;
+}
+
+// ─── PBKDF2-HMAC-SHA512 ────────────────────────────────────────────────
+
+/// HMAC-SHA512 (RFC 2104, block 128 bytes).
+pub fn secure_hmac_sha512(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    var k: Vec<i64> = key;
+    if k.len() > 128 { k = sha512_bytes(key); }
+    var ipad: Vec<i64> = Vec::new();
+    var opad: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 128 {
+        val b: i64 = if i < k.len() { k.get(i) } else { 0 };
+        ipad.push(b ^ 0x36);
+        opad.push(b ^ 0x5c);
+        i = i + 1;
+    }
+    i = 0;
+    while i < msg.len() { ipad.push(msg.get(i)); i = i + 1; }
+    val inner: Vec<i64> = sha512_bytes(ipad);
+    i = 0;
+    while i < inner.len() { opad.push(inner.get(i)); i = i + 1; }
+    return sha512_bytes(opad);
+}
+
+/// PBKDF2 with HMAC-SHA512: `dk_len` bytes.
+pub fn secure_pbkdf2_sha512(password: Vec<i64>, salt: Vec<i64>, iterations: i64, dk_len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var block: i64 = 1;
+    while out.len() < dk_len {
+        var s: Vec<i64> = salt;
+        s.push((block >> 24) & 255);
+        s.push((block >> 16) & 255);
+        s.push((block >> 8) & 255);
+        s.push(block & 255);
+        var u: Vec<i64> = secure_hmac_sha512(password, s);
+        var t: Vec<i64> = u;
+        var c: i64 = 1;
+        while c < iterations {
+            u = secure_hmac_sha512(password, u);
+            var j: i64 = 0;
+            while j < 64 { t.set(j, t.get(j) ^ u.get(j)); j = j + 1; }
+            c = c + 1;
+        }
+        var j: i64 = 0;
+        while j < 64 && out.len() < dk_len { out.push(t.get(j)); j = j + 1; }
+        block = block + 1;
+    }
+    return out;
+}
+
+// ─── Randomness ────────────────────────────────────────────────────────
+
+/// n bytes from the operating system's generator.
+pub fn secure_os_random(n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while out.len() < n {
+        var r: i64 = p_os_random_u64();
+        var k: i64 = 0;
+        while k < 8 && out.len() < n {
+            out.push(r & 255);
+            r = r >> 8;
+            k = k + 1;
+        }
+    }
+    return out;
+}
+
+// ─── Big-endian helpers ────────────────────────────────────────────────
+
+fn ss_put(out: &mut Vec<i64>, v: i64, n: i64) {
+    var k: i64 = n - 1;
+    while k >= 0 { out.push((v >> (k * 8)) & 255); k = k - 1; }
+}
+
+fn ss_get(b: &Vec<i64>, pos: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = 0;
+    while k < n { v = (v << 8) | (b.get(pos + k) & 255); k = k + 1; }
+    return v;
+}
+
+fn ss_append(out: &mut Vec<i64>, src: &Vec<i64>) {
+    var i: i64 = 0;
+    while i < src.len() { out.push(src.get(i)); i = i + 1; }
+}
+
+fn ss_slice(b: &Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { out.push(b.get(i)); i = i + 1; }
+    return out;
+}
+
+// ─── The encrypted file ────────────────────────────────────────────────
+
+pub const SECURE_FILE_VERSION: i64 = 1;
+pub const SECURE_FILE_HEADER: i64 = 37;   // 4 + 1 + 4 + 16 + 12
+
+pub struct SecureFile {
+    pub keys: Vec<str>,
+    pub vals: Vec<Vec<i64>>,
+    pub passphrase: str,
+    pub iterations: i64,
+    pub random: fn(i64) -> Vec<i64>,
+    pub saves: i64,
+}
+
+pub fn secure_file_new(passphrase: str, iterations: i64, random: fn(i64) -> Vec<i64>) -> SecureFile {
+    return SecureFile { keys: Vec::new(), vals: Vec::new(), passphrase: passphrase, iterations: iterations, random: random, saves: 0 };
+}
+
+fn ss_find(s: &SecureFile, key: str) -> i64 {
+    var i: i64 = 0;
+    while i < s.keys.len() {
+        if s.keys.get(i) == key { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Store a value (replacing an existing one).
+pub fn secure_put(s: &mut SecureFile, key: str, value: Vec<i64>) {
+    val i: i64 = ss_find(s, key);
+    if i >= 0 { s.vals.set(i, value); return; }
+    s.keys.push(key);
+    s.vals.push(value);
+}
+
+pub fn secure_has(s: &SecureFile, key: str) -> bool { return ss_find(s, key) >= 0; }
+
+/// The value of a key (empty when absent: check secure_has).
+pub fn secure_get(s: &SecureFile, key: str) -> Vec<i64> {
+    val i: i64 = ss_find(s, key);
+    if i < 0 { return Vec::new(); }
+    return s.vals.get(i);
+}
+
+pub fn secure_delete(s: &mut SecureFile, key: str) -> bool {
+    val i: i64 = ss_find(s, key);
+    if i < 0 { return false; }
+    s.keys.remove(i);
+    s.vals.remove(i);
+    return true;
+}
+
+/// The entries as bytes (before encryption).
+pub fn secure_encode_entries(s: &SecureFile) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    ss_put(&mut out, s.keys.len(), 4);
+    var i: i64 = 0;
+    while i < s.keys.len() {
+        val kb: Vec<i64> = str_bytes(s.keys.get(i));
+        ss_put(&mut out, kb.len(), 2);
+        ss_append(&mut out, &kb);
+        val v: Vec<i64> = s.vals.get(i);
+        ss_put(&mut out, v.len(), 4);
+        ss_append(&mut out, &v);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Seal the map into the file format (a new salt and nonce each time).
+pub fn secure_file_seal(s: &mut SecureFile) -> Vec<i64> {
+    val rnd: fn(i64) -> Vec<i64> = s.random;
+    val salt: Vec<i64> = rnd(16);
+    val nonce: Vec<i64> = rnd(12);
+    var header: Vec<i64> = str_bytes("FSS1");
+    header.push(SECURE_FILE_VERSION);
+    ss_put(&mut header, s.iterations, 4);
+    ss_append(&mut header, &salt);
+    ss_append(&mut header, &nonce);
+    val key: Vec<i64> = secure_pbkdf2_sha512(str_bytes(s.passphrase), salt, s.iterations, 32);
+    val sealed: Vec<i64> = aes_gcm_seal(key, nonce, header, secure_encode_entries(s));
+    var out: Vec<i64> = header;
+    ss_append(&mut out, &sealed);
+    s.saves = s.saves + 1;
+    return out;
+}
+
+/// The result of opening a file.
+pub struct SecureOpen {
+    pub error: i64,             // SECURE_OK, SECURE_AUTH_FAILED, SECURE_CORRUPT
+    pub store: SecureFile,
+}
+
+fn ss_no_random(n: i64) -> Vec<i64> { return Vec::new(); }
+
+/// Open sealed bytes with a passphrase. The returned store saves with
+/// the OS generator; set `store.random` to change it.
+pub fn secure_file_open(blob: Vec<i64>, passphrase: str) -> SecureOpen {
+    var st: SecureFile = secure_file_new(passphrase, 0, secure_os_random);
+    if blob.len() < SECURE_FILE_HEADER + 16 { return SecureOpen { error: SECURE_CORRUPT, store: st }; }
+    if blob.get(0) != 70 || blob.get(1) != 83 || blob.get(2) != 83 || blob.get(3) != 49 || blob.get(4) != SECURE_FILE_VERSION {
+        return SecureOpen { error: SECURE_CORRUPT, store: st };
+    }
+    val iters: i64 = ss_get(&blob, 5, 4);
+    if iters < 1 { return SecureOpen { error: SECURE_CORRUPT, store: st }; }
+    st.iterations = iters;
+    val header: Vec<i64> = ss_slice(&blob, 0, SECURE_FILE_HEADER);
+    val salt: Vec<i64> = ss_slice(&blob, 9, 25);
+    val nonce: Vec<i64> = ss_slice(&blob, 25, 37);
+    val key: Vec<i64> = secure_pbkdf2_sha512(str_bytes(passphrase), salt, iters, 32);
+    val o: GcmOpened = aes_gcm_open(key, nonce, header, ss_slice(&blob, SECURE_FILE_HEADER, blob.len()));
+    if !o.ok { return SecureOpen { error: SECURE_AUTH_FAILED, store: st }; }
+    val p: Vec<i64> = o.plain;
+    if p.len() < 4 { return SecureOpen { error: SECURE_CORRUPT, store: st }; }
+    val count: i64 = ss_get(&p, 0, 4);
+    var pos: i64 = 4;
+    var i: i64 = 0;
+    while i < count {
+        if pos + 2 > p.len() { return SecureOpen { error: SECURE_CORRUPT, store: st }; }
+        val kl: i64 = ss_get(&p, pos, 2);
+        pos = pos + 2;
+        if pos + kl + 4 > p.len() { return SecureOpen { error: SECURE_CORRUPT, store: st }; }
+        val k: str = enc_bytes_to_str(ss_slice(&p, pos, pos + kl));
+        pos = pos + kl;
+        val vl: i64 = ss_get(&p, pos, 4);
+        pos = pos + 4;
+        if pos + vl > p.len() { return SecureOpen { error: SECURE_CORRUPT, store: st }; }
+        secure_put(&mut st, k, ss_slice(&p, pos, pos + vl));
+        pos = pos + vl;
+        i = i + 1;
+    }
+    return SecureOpen { error: SECURE_OK, store: st };
+}
+
+/// Seal and write to `path` (binary-safe); true on success.
+pub fn secure_file_save(s: &mut SecureFile, path: str) -> bool {
+    val blob: Vec<i64> = secure_file_seal(s);
+    return p_file_write_vec(path, blob) >= 0;
+}
+
+/// Read and open the file at `path` (SECURE_NOT_FOUND when absent).
+pub fn secure_file_load(path: str, passphrase: str) -> SecureOpen {
+    if p_file_exists(path) == 0 {
+        return SecureOpen { error: SECURE_NOT_FOUND, store: secure_file_new(passphrase, 0, secure_os_random) };
+    }
+    return secure_file_open(p_file_read_bytes(path), passphrase);
+}
+
+/// Change the passphrase (and iteration count): the next save uses it.
+pub fn secure_file_rekey(s: &mut SecureFile, passphrase: str, iterations: i64) {
+    s.passphrase = passphrase;
+    s.iterations = iterations;
+}
+
+// ─── Android Keystore (as JNI steps) ───────────────────────────────────
+
+pub struct KeystoreStep {
+    pub cls: str,
+    pub method: str,
+    pub sig: str,
+    pub args: str,     // what to pass, for the JNI layer
+}
+
+fn ks(cls: str, method: str, sig: str, args: str) -> KeystoreStep {
+    return KeystoreStep { cls: cls, method: method, sig: sig, args: args };
+}
+
+/// The steps creating an AES-256-GCM key under `alias` in AndroidKeyStore
+/// (PURPOSE_ENCRYPT | PURPOSE_DECRYPT = 3, BLOCK_MODE_GCM, no padding;
+/// optionally bound to user authentication).
+pub fn keystore_create_key_steps(alias: str, require_auth: bool) -> Vec<KeystoreStep> {
+    var v: Vec<KeystoreStep> = Vec::new();
+    val b: str = "android/security/keystore/KeyGenParameterSpec$Builder";
+    v.push(ks(b, "<init>", "(Ljava/lang/String;I)V", alias + ", 3"));
+    v.push(ks(b, "setBlockModes", "([Ljava/lang/String;)L" + b + ";", "[\"GCM\"]"));
+    v.push(ks(b, "setEncryptionPaddings", "([Ljava/lang/String;)L" + b + ";", "[\"NoPadding\"]"));
+    v.push(ks(b, "setKeySize", "(I)L" + b + ";", "256"));
+    if require_auth { v.push(ks(b, "setUserAuthenticationRequired", "(Z)L" + b + ";", "true")); }
+    v.push(ks(b, "build", "()Landroid/security/keystore/KeyGenParameterSpec;", ""));
+    v.push(ks("javax/crypto/KeyGenerator", "getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;", "\"AES\", \"AndroidKeyStore\""));
+    v.push(ks("javax/crypto/KeyGenerator", "init", "(Ljava/security/spec/AlgorithmParameterSpec;)V", "spec"));
+    v.push(ks("javax/crypto/KeyGenerator", "generateKey", "()Ljavax/crypto/SecretKey;", ""));
+    return v;
+}
+
+/// The steps encrypting with the key: Cipher "AES/GCM/NoPadding",
+/// ENCRYPT_MODE (1) lets the keystore choose the IV, then getIV, doFinal.
+pub fn keystore_encrypt_steps(alias: str) -> Vec<KeystoreStep> {
+    var v: Vec<KeystoreStep> = Vec::new();
+    v.push(ks("java/security/KeyStore", "getInstance", "(Ljava/lang/String;)Ljava/security/KeyStore;", "\"AndroidKeyStore\""));
+    v.push(ks("java/security/KeyStore", "load", "(Ljava/security/KeyStore$LoadStoreParameter;)V", "null"));
+    v.push(ks("java/security/KeyStore", "getKey", "(Ljava/lang/String;[C)Ljava/security/Key;", alias + ", null"));
+    v.push(ks("javax/crypto/Cipher", "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;", "\"AES/GCM/NoPadding\""));
+    v.push(ks("javax/crypto/Cipher", "init", "(ILjava/security/Key;)V", "1, key"));
+    v.push(ks("javax/crypto/Cipher", "getIV", "()[B", ""));
+    v.push(ks("javax/crypto/Cipher", "doFinal", "([B)[B", "plaintext"));
+    return v;
+}
+
+/// The stored form of a Keystore-encrypted value: version 1, the 12-byte
+/// IV, then ciphertext with its 16-byte tag; base64 for SharedPreferences.
+pub fn keystore_pack(iv: Vec<i64>, ct_and_tag: Vec<i64>) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push(1);
+    ss_append(&mut b, &iv);
+    ss_append(&mut b, &ct_and_tag);
+    return b64_encode_bytes(b);
+}
+
+pub struct KeystorePacked {
+    pub ok: bool,
+    pub iv: Vec<i64>,
+    pub ct_and_tag: Vec<i64>,
+}
+
+/// Split a keystore_pack string (the decrypt side passes the IV in a
+/// GCMParameterSpec(128, iv) to Cipher.init(DECRYPT_MODE = 2, ...)).
+pub fn keystore_unpack(s: str) -> KeystorePacked {
+    val b: Vec<i64> = b64_decode_bytes(s);
+    if b.len() < 1 + 12 + 16 || b.get(0) != 1 {
+        return KeystorePacked { ok: false, iv: Vec::new(), ct_and_tag: Vec::new() };
+    }
+    return KeystorePacked { ok: true, iv: ss_slice(&b, 1, 13), ct_and_tag: ss_slice(&b, 13, b.len()) };
+}
+
+// ─── iOS Keychain (queries as data) ────────────────────────────────────
+
+// The CFString values behind the Security framework's constants.
+pub const KSEC_CLASS: str = "class";
+pub const KSEC_CLASS_GENERIC_PASSWORD: str = "genp";
+pub const KSEC_ATTR_SERVICE: str = "svce";
+pub const KSEC_ATTR_ACCOUNT: str = "acct";
+pub const KSEC_ATTR_ACCESSIBLE: str = "pdmn";
+pub const KSEC_VALUE_DATA: str = "v_Data";
+pub const KSEC_RETURN_DATA: str = "r_Data";
+pub const KSEC_MATCH_LIMIT: str = "m_Limit";
+pub const KSEC_MATCH_LIMIT_ONE: str = "m_LimitOne";
+pub const KSEC_ACCESSIBLE_WHEN_UNLOCKED: str = "ak";
+pub const KSEC_ACCESSIBLE_AFTER_FIRST_UNLOCK: str = "ck";
+pub const KSEC_ACCESSIBLE_WHEN_UNLOCKED_THIS_DEVICE: str = "aku";
+pub const KSEC_ACCESSIBLE_AFTER_FIRST_UNLOCK_THIS_DEVICE: str = "cku";
+pub const KSEC_ACCESSIBLE_WHEN_PASSCODE_SET_THIS_DEVICE: str = "akpu";
+
+/// A Keychain query: keys and values (values starting with "data:" are
+/// the base64 of an NSData, "bool:" a CFBoolean; the rest are strings).
+pub struct KeychainQuery {
+    pub op: str,                // SecItemAdd, SecItemCopyMatching, SecItemUpdate, SecItemDelete
+    pub keys: Vec<str>,
+    pub vals: Vec<str>,
+    pub update_keys: Vec<str>,  // SecItemUpdate's attributes to change
+    pub update_vals: Vec<str>,
+}
+
+fn kq(op: str, service: str, account: str) -> KeychainQuery {
+    var q: KeychainQuery = KeychainQuery { op: op, keys: Vec::new(), vals: Vec::new(), update_keys: Vec::new(), update_vals: Vec::new() };
+    q.keys.push(KSEC_CLASS); q.vals.push(KSEC_CLASS_GENERIC_PASSWORD);
+    q.keys.push(KSEC_ATTR_SERVICE); q.vals.push(service);
+    q.keys.push(KSEC_ATTR_ACCOUNT); q.vals.push(account);
+    return q;
+}
+
+pub fn keychain_add_query(service: str, account: str, value: Vec<i64>, accessible: str) -> KeychainQuery {
+    var q: KeychainQuery = kq("SecItemAdd", service, account);
+    q.keys.push(KSEC_ATTR_ACCESSIBLE); q.vals.push(accessible);
+    q.keys.push(KSEC_VALUE_DATA); q.vals.push("data:" + b64_encode_bytes(value));
+    return q;
+}
+
+pub fn keychain_get_query(service: str, account: str) -> KeychainQuery {
+    var q: KeychainQuery = kq("SecItemCopyMatching", service, account);
+    q.keys.push(KSEC_RETURN_DATA); q.vals.push("bool:true");
+    q.keys.push(KSEC_MATCH_LIMIT); q.vals.push(KSEC_MATCH_LIMIT_ONE);
+    return q;
+}
+
+pub fn keychain_update_query(service: str, account: str, value: Vec<i64>) -> KeychainQuery {
+    var q: KeychainQuery = kq("SecItemUpdate", service, account);
+    q.update_keys.push(KSEC_VALUE_DATA); q.update_vals.push("data:" + b64_encode_bytes(value));
+    return q;
+}
+
+pub fn keychain_delete_query(service: str, account: str) -> KeychainQuery {
+    return kq("SecItemDelete", service, account);
+}
+
+/// The queries of a put: add, and on errSecDuplicateItem update instead.
+pub fn keychain_put_plan(service: str, account: str, value: Vec<i64>, add_status: i64) -> Vec<KeychainQuery> {
+    var v: Vec<KeychainQuery> = Vec::new();
+    v.push(keychain_add_query(service, account, value, KSEC_ACCESSIBLE_AFTER_FIRST_UNLOCK_THIS_DEVICE));
+    if secure_from_osstatus(add_status) == SECURE_DUPLICATE { v.push(keychain_update_query(service, account, value)); }
+    return v;
+}
+
+/// One line per key: "key=value", for logs and tests.
+pub fn keychain_query_text(q: &KeychainQuery) -> str {
+    var s: str = q.op;
+    var i: i64 = 0;
+    while i < q.keys.len() { s = s + " " + q.keys.get(i) + "=" + q.vals.get(i); i = i + 1; }
+    i = 0;
+    while i < q.update_keys.len() { s = s + " set " + q.update_keys.get(i) + "=" + q.update_vals.get(i); i = i + 1; }
+    return s;
+}

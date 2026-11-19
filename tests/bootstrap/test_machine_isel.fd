@@ -1,0 +1,73 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG1), the machine layer
+// (compiler/nat_ir.fd ng_isel): instruction selection as rules. The integer
+// ALU operations (add, add of a constant, sub, mul, and, or, xor, shifts)
+// are selected from a table of rules [arch, op, form, cost, pre, arg],
+// tried cheapest first: AArch64's MADD/MSUB rule (cost 0, folds the mul
+// just emitted) before ADD/SUB, x86-64's in-place ADD r, imm before LEA,
+// AArch64's ADD #imm / SUB #imm by the sign of the constant. Every result
+// is the same with FID_NAT_OFF=isel (the hand-written selection), and
+// FID_VERIFY=1 compares the two byte for byte (nat_sel_check). Run:
+//   NATIVE=1 bash scripts/cross-test.sh aarch64-linux (riscv64-linux,
+//   x86_64-linux), bash tests/nattools/isel_table_check.sh.
+// Expected output:
+// 1000000041
+// -999999959
+// 41000000000
+// 8
+// 63
+// 55
+// 82
+// -3
+// 4611686018427387901
+// 47
+// 35
+// 1029
+// -1001
+// 1500
+// 7
+// 2147483689
+// 21
+
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+fn sub(a: i64, b: i64) -> i64 { return a - b; }
+fn mul(a: i64, b: i64) -> i64 { return a * b; }
+fn band(a: i64, b: i64) -> i64 { return a & b; }
+fn bor(a: i64, b: i64) -> i64 { return a | b; }
+fn bxor(a: i64, b: i64) -> i64 { return a ^ b; }
+fn shl(a: i64, b: i64) -> i64 { return a << b; }
+fn sar(a: i64, b: i64) -> i64 { return a >> b; }
+fn shr(a: i64, b: i64) -> i64 { return ((a as u64) >> (b as u64)) as i64; }
+fn plus5(a: i64) -> i64 { return a + 5; }
+fn minus7(a: i64) -> i64 { return a - 7; }
+fn madd(a: i64, b: i64, c: i64) -> i64 { return a * b + c; }
+fn msub(a: i64, b: i64, c: i64) -> i64 { return c - a * b; }
+
+fn sum_loop(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i * 3;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println(add(1000000000, 41));
+    println(sub(41, 1000000000));
+    println(mul(41, 1000000000));
+    println(band(12, 10));
+    println(bor(48, 15));
+    println(bxor(60, 11));
+    println(shl(41, 1));
+    println(sar(0 - 12, 2));
+    println(shr(0 - 12, 2));
+    println(plus5(42));
+    println(minus7(42));
+    println(madd(32, 32, 5));
+    println(msub(1001, 1, 0));
+    println(sum_loop(32) - sum_loop(31) + 1407);
+    println(plus5(2));
+    println(plus5(2147483684));
+    println(add(sub(30, 10), 1));
+}

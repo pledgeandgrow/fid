@@ -30,6 +30,18 @@ pub struct Animation {
 }
 
 /// Create a new animation with the given frame count and duration per frame.
+///
+/// Example:
+///   var a = sprite_anim_create(3, 0.25);
+///   sprite_anim_play(&mut a, 0);
+///   assert_eq(sprite_anim_update(&mut a, 0.5), 2);
+///   assert_eq(sprite_anim_update(&mut a, 0.25), 0);
+///   sprite_anim_set_looping(&mut a, false);
+///   assert_eq(sprite_anim_update(&mut a, 1.0), 2);
+///   assert(sprite_anim_is_finished(a));
+///   assert(sprite_anim_total_duration(a) == 0.75);
+///   sprite_anim_reset(&mut a);
+///   assert_eq(sprite_anim_get_frame(a), 0);
 pub fn sprite_anim_create(frame_count: i64, frame_duration: f64) -> Animation {
     return Animation {
         frame_count: frame_count, frame_duration: frame_duration, current_frame: 0, elapsed: 0.0, playing: false, looping: true, finished: false,
@@ -305,9 +317,10 @@ pub fn sprite_controller_play(controller: & mut AnimController, track: i64) -> v
         return;
     }
     controller.current = track;
-    // Play from frame 0 — need mutable access to the animation
-    // Since Fides doesn't have mutable Vec indexing yet, we use a workaround:
-    // We set current and let update handle the reset.
+    // Play it from frame 0
+    var anim = controller.animations.get(track);
+    sprite_anim_play(& mut anim, 0);
+    controller.animations.set(track, anim);
 }
 
 /// Update the current animation. Returns the current frame.
@@ -315,12 +328,11 @@ pub fn sprite_controller_update(controller: & mut AnimController, dt: f64) -> i6
     if controller.current < 0 || controller.current >= controller.animations.len() {
         return 0;
     }
-    // Get current animation, update it, return frame
-    // Note: In a real engine, this would modify the animation in the Vec.
-    // For now, we return the frame from a copy (the update is lost).
-    // This is a limitation of the current Vec API — needs mutable indexing.
+    // Advance the current animation and store it back
     var anim = controller.animations.get(controller.current);
-    return anim.current_frame;
+    val frame = sprite_anim_update(& mut anim, dt);
+    controller.animations.set(controller.current, anim);
+    return frame;
 }
 
 /// Get the current animation track index.

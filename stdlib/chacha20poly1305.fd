@@ -1,0 +1,340 @@
+// Fides ChaCha20-Poly1305 (RFC 8439) and XChaCha20-Poly1305
+// (draft-irtf-cfrg-xchacha-03): the ChaCha20 block function and stream
+// cipher, the Poly1305 one-time authenticator, the AEAD construction
+// (seal = ciphertext || 16-byte tag; open checks the tag in constant time
+// before decrypting), and HChaCha20 for the 24-byte-nonce variant.
+//
+// Pure computation, no platform seam: the nonce is the caller's (a
+// counter, or 24 random bytes for XChaCha20 where random nonces are safe).
+// 32-bit words live in i64 values masked after each addition; Poly1305
+// runs on five 26-bit limbs (the "donna" layout), so every product fits
+// in 56 bits and no overflow check can fire. Bytes are Vec<i64>.
+//
+// The names are prefixed cc20_/poly1305_/aead_ so this module can be used
+// next to tls_crypto.fd, which has its own ChaCha20 for TLS.
+//
+// Checked against RFC 8439 §2.3.2 (block), §2.4.2 (stream), §2.5.2 and
+// A.3 (Poly1305), §2.6.2 (key generation), §2.8.2 (AEAD), the HChaCha20
+// vector of draft-irtf-cfrg-xchacha §2.2.1, and an independent Python
+// model for XChaCha20-Poly1305, in tests/bootstrap/test_std_chacha20poly1305.fd.
+//
+// Usage:
+//   use chacha20poly1305;
+//   val sealed = aead_chacha20poly1305_seal(key32, nonce12, aad, plain);
+//   val o = aead_chacha20poly1305_open(key32, nonce12, aad, sealed);  // o.ok, o.data
+//   val x = aead_xchacha20poly1305_seal(key32, nonce24, aad, plain);
+
+module chacha20poly1305;
+use vec;
+
+/// The result of opening a sealed message.
+pub struct AeadOpened {
+    pub ok: bool,
+    pub data: Vec<i64>,
+}
+
+fn cc20_rotl(x: i64, n: i64) -> i64 {
+    return ((x << n) | (x >> (32 - n))) & 0xffffffff;
+}
+
+fn cc20_qr(s: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64) {
+    var xa: i64 = s.get(a);
+    var xb: i64 = s.get(b);
+    var xc: i64 = s.get(c);
+    var xd: i64 = s.get(d);
+    xa = (xa + xb) & 0xffffffff; xd = cc20_rotl(xd ^ xa, 16);
+    xc = (xc + xd) & 0xffffffff; xb = cc20_rotl(xb ^ xc, 12);
+    xa = (xa + xb) & 0xffffffff; xd = cc20_rotl(xd ^ xa, 8);
+    xc = (xc + xd) & 0xffffffff; xb = cc20_rotl(xb ^ xc, 7);
+    s.set(a, xa);
+    s.set(b, xb);
+    s.set(c, xc);
+    s.set(d, xd);
+}
+
+fn cc20_le32(b: & Vec<i64>, i: i64) -> i64 {
+    return (b.get(i) & 255) | ((b.get(i + 1) & 255) << 8) | ((b.get(i + 2) & 255) << 16) | ((b.get(i + 3) & 255) << 24);
+}
+
+fn cc20_rounds(s: & mut Vec<i64>) {
+    var r: i64 = 0;
+    while r < 10 {
+        cc20_qr(s, 0, 4, 8, 12);
+        cc20_qr(s, 1, 5, 9, 13);
+        cc20_qr(s, 2, 6, 10, 14);
+        cc20_qr(s, 3, 7, 11, 15);
+        cc20_qr(s, 0, 5, 10, 15);
+        cc20_qr(s, 1, 6, 11, 12);
+        cc20_qr(s, 2, 7, 8, 13);
+        cc20_qr(s, 3, 4, 9, 14);
+        r = r + 1;
+    }
+}
+
+fn cc20_init(key: & Vec<i64>, words12: Vec<i64>) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    s.push(0x61707865);
+    s.push(0x3320646e);
+    s.push(0x79622d32);
+    s.push(0x6b206574);
+    var i: i64 = 0;
+    while i < 8 { s.push(cc20_le32(key, i * 4)); i = i + 1; }
+    i = 0;
+    while i < 4 { s.push(words12.get(i)); i = i + 1; }
+    return s;
+}
+
+/// One 64-byte ChaCha20 block for a 32-byte key, 12-byte nonce and
+/// 32-bit block counter (RFC 8439 §2.3).
+pub fn cc20_block(key: Vec<i64>, nonce: Vec<i64>, counter: i64) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    w.push(counter & 0xffffffff);
+    w.push(cc20_le32(& nonce, 0));
+    w.push(cc20_le32(& nonce, 4));
+    w.push(cc20_le32(& nonce, 8));
+    val init: Vec<i64> = cc20_init(& key, w);
+    var s: Vec<i64> = init;
+    cc20_rounds(& mut s);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        val x: i64 = (s.get(i) + init.get(i)) & 0xffffffff;
+        out.push(x & 255);
+        out.push((x >> 8) & 255);
+        out.push((x >> 16) & 255);
+        out.push((x >> 24) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// ChaCha20 encryption = decryption: data XOR the key stream starting at
+/// block `counter`.
+pub fn cc20_xor(key: Vec<i64>, nonce: Vec<i64>, counter: i64, data: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var pos: i64 = 0;
+    var ctr: i64 = counter;
+    while pos < data.len() {
+        val ks: Vec<i64> = cc20_block(key, nonce, ctr);
+        var i: i64 = 0;
+        while i < 64 && pos < data.len() {
+            out.push((data.get(pos) & 255) ^ ks.get(i));
+            i = i + 1;
+            pos = pos + 1;
+        }
+        ctr = ctr + 1;
+    }
+    return out;
+}
+
+/// HChaCha20: a 32-byte subkey from a key and a 16-byte nonce.
+pub fn hchacha20(key: Vec<i64>, nonce16: Vec<i64>) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 { w.push(cc20_le32(& nonce16, i * 4)); i = i + 1; }
+    var s: Vec<i64> = cc20_init(& key, w);
+    cc20_rounds(& mut s);
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 {
+        var idx: i64 = i;
+        if i >= 4 { idx = i + 8; }
+        val x: i64 = s.get(idx);
+        out.push(x & 255);
+        out.push((x >> 8) & 255);
+        out.push((x >> 16) & 255);
+        out.push((x >> 24) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// XChaCha20: ChaCha20 under HChaCha20(key, nonce[0..16]) with the nonce
+/// 00000000 || nonce[16..24].
+pub fn xchacha20_xor(key: Vec<i64>, nonce24: Vec<i64>, counter: i64, data: Vec<i64>) -> Vec<i64> {
+    val sub: Vec<i64> = hchacha20(key, cc20_sub(& nonce24, 0, 16));
+    return cc20_xor(sub, cc20_xnonce(& nonce24), counter, data);
+}
+
+fn cc20_sub(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { out.push(b.get(i) & 255); i = i + 1; }
+    return out;
+}
+
+fn cc20_xnonce(n24: & Vec<i64>) -> Vec<i64> {
+    var n: Vec<i64> = Vec::new();
+    n.push(0); n.push(0); n.push(0); n.push(0);
+    var i: i64 = 16;
+    while i < 24 { n.push(n24.get(i) & 255); i = i + 1; }
+    return n;
+}
+
+// ─── Poly1305 (RFC 8439 §2.5) ──────────────────────────────────────────
+
+/// The 16-byte Poly1305 tag of msg under a 32-byte one-time key (r || s).
+pub fn poly1305_mac(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    val m26: i64 = 0x3ffffff;
+    val r0: i64 = cc20_le32(& key, 0) & 0x3ffffff;
+    val r1: i64 = (cc20_le32(& key, 3) >> 2) & 0x3ffff03;
+    val r2: i64 = (cc20_le32(& key, 6) >> 4) & 0x3ffc0ff;
+    val r3: i64 = (cc20_le32(& key, 9) >> 6) & 0x3f03fff;
+    val r4: i64 = (cc20_le32(& key, 12) >> 8) & 0x00fffff;
+    val s1: i64 = r1 * 5;
+    val s2: i64 = r2 * 5;
+    val s3: i64 = r3 * 5;
+    val s4: i64 = r4 * 5;
+    var h0: i64 = 0;
+    var h1: i64 = 0;
+    var h2: i64 = 0;
+    var h3: i64 = 0;
+    var h4: i64 = 0;
+    var pos: i64 = 0;
+    val n: i64 = msg.len();
+    var blk: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 17 { blk.push(0); i = i + 1; }
+    while pos < n {
+        var hibit: i64 = 1 << 24;
+        var take: i64 = n - pos;
+        if take >= 16 {
+            take = 16;
+        } else {
+            hibit = 0;
+        }
+        i = 0;
+        while i < 17 {
+            if i < take { blk.set(i, msg.get(pos + i) & 255); } else { blk.set(i, 0); }
+            i = i + 1;
+        }
+        if take < 16 { blk.set(take, 1); }
+        h0 = h0 + (cc20_le32(& blk, 0) & m26);
+        h1 = h1 + ((cc20_le32(& blk, 3) >> 2) & m26);
+        h2 = h2 + ((cc20_le32(& blk, 6) >> 4) & m26);
+        h3 = h3 + ((cc20_le32(& blk, 9) >> 6) & m26);
+        h4 = h4 + ((cc20_le32(& blk, 12) >> 8) | hibit);
+        val d0: i64 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        var d1: i64 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        var d2: i64 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        var d3: i64 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        var d4: i64 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+        var c: i64 = d0 >> 26;
+        h0 = d0 & m26;
+        d1 = d1 + c; c = d1 >> 26; h1 = d1 & m26;
+        d2 = d2 + c; c = d2 >> 26; h2 = d2 & m26;
+        d3 = d3 + c; c = d3 >> 26; h3 = d3 & m26;
+        d4 = d4 + c; c = d4 >> 26; h4 = d4 & m26;
+        h0 = h0 + c * 5; c = h0 >> 26; h0 = h0 & m26;
+        h1 = h1 + c;
+        pos = pos + take;
+    }
+    // Full carry, then h - p when h >= p = 2^130 - 5 (chosen by mask).
+    var c2: i64 = h1 >> 26; h1 = h1 & m26;
+    h2 = h2 + c2; c2 = h2 >> 26; h2 = h2 & m26;
+    h3 = h3 + c2; c2 = h3 >> 26; h3 = h3 & m26;
+    h4 = h4 + c2; c2 = h4 >> 26; h4 = h4 & m26;
+    h0 = h0 + c2 * 5; c2 = h0 >> 26; h0 = h0 & m26;
+    h1 = h1 + c2;
+    var g0: i64 = h0 + 5; c2 = g0 >> 26; g0 = g0 & m26;
+    var g1: i64 = h1 + c2; c2 = g1 >> 26; g1 = g1 & m26;
+    var g2: i64 = h2 + c2; c2 = g2 >> 26; g2 = g2 & m26;
+    var g3: i64 = h3 + c2; c2 = g3 >> 26; g3 = g3 & m26;
+    val g4: i64 = h4 + c2 - (1 << 26);
+    // g4 >= 0 means h >= p: take g. mask = all ones when g4 >= 0.
+    val mask: i64 = (g4 >> 63) ^ -1;
+    h0 = (h0 & (mask ^ -1)) | (g0 & mask);
+    h1 = (h1 & (mask ^ -1)) | (g1 & mask);
+    h2 = (h2 & (mask ^ -1)) | (g2 & mask);
+    h3 = (h3 & (mask ^ -1)) | (g3 & mask);
+    h4 = (h4 & (mask ^ -1)) | (g4 & mask & m26);
+    val w0: i64 = (h0 | (h1 << 26)) & 0xffffffff;
+    val w1: i64 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff;
+    val w2: i64 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
+    val w3: i64 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
+    var f: i64 = w0 + cc20_le32(& key, 16);
+    var out: Vec<i64> = Vec::new();
+    poly_put(& mut out, f);
+    f = w1 + cc20_le32(& key, 20) + (f >> 32);
+    poly_put(& mut out, f);
+    f = w2 + cc20_le32(& key, 24) + (f >> 32);
+    poly_put(& mut out, f);
+    f = w3 + cc20_le32(& key, 28) + (f >> 32);
+    poly_put(& mut out, f);
+    return out;
+}
+
+fn poly_put(out: & mut Vec<i64>, x: i64) {
+    out.push(x & 255);
+    out.push((x >> 8) & 255);
+    out.push((x >> 16) & 255);
+    out.push((x >> 24) & 255);
+}
+
+/// The Poly1305 one-time key for an AEAD message (RFC 8439 §2.6).
+pub fn poly1305_key_gen(key: Vec<i64>, nonce: Vec<i64>) -> Vec<i64> {
+    return cc20_sub(& cc20_block(key, nonce, 0), 0, 32);
+}
+
+/// Equality of two byte vectors without an early exit.
+pub fn aead_ct_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() { d = d | ((a.get(i) ^ b.get(i)) & 255); i = i + 1; }
+    return d == 0;
+}
+
+fn aead_mac_data(aad: & Vec<i64>, ct: & Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < aad.len() { m.push(aad.get(i) & 255); i = i + 1; }
+    while m.len() % 16 != 0 { m.push(0); }
+    i = 0;
+    while i < ct.len() { m.push(ct.get(i) & 255); i = i + 1; }
+    while m.len() % 16 != 0 { m.push(0); }
+    var k: i64 = 0;
+    while k < 8 { m.push((aad.len() >> (k * 8)) & 255); k = k + 1; }
+    k = 0;
+    while k < 8 { m.push((ct.len() >> (k * 8)) & 255); k = k + 1; }
+    return m;
+}
+
+/// AEAD_CHACHA20_POLY1305 encryption: ciphertext || 16-byte tag.
+pub fn aead_chacha20poly1305_seal(key: Vec<i64>, nonce: Vec<i64>, aad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    val otk: Vec<i64> = poly1305_key_gen(key, nonce);
+    var ct: Vec<i64> = cc20_xor(key, nonce, 1, plain);
+    val tag: Vec<i64> = poly1305_mac(otk, aead_mac_data(& aad, & ct));
+    var i: i64 = 0;
+    while i < 16 { ct.push(tag.get(i)); i = i + 1; }
+    return ct;
+}
+
+/// AEAD_CHACHA20_POLY1305 decryption of ciphertext || tag; nothing is
+/// decrypted unless the tag matches.
+pub fn aead_chacha20poly1305_open(key: Vec<i64>, nonce: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> AeadOpened {
+    if sealed.len() < 16 || key.len() != 32 || nonce.len() != 12 {
+        return AeadOpened { ok: false, data: Vec::new() };
+    }
+    val ct: Vec<i64> = cc20_sub(& sealed, 0, sealed.len() - 16);
+    val tag: Vec<i64> = cc20_sub(& sealed, sealed.len() - 16, sealed.len());
+    val otk: Vec<i64> = poly1305_key_gen(key, nonce);
+    val want: Vec<i64> = poly1305_mac(otk, aead_mac_data(& aad, & ct));
+    if !aead_ct_eq(& tag, & want) {
+        return AeadOpened { ok: false, data: Vec::new() };
+    }
+    return AeadOpened { ok: true, data: cc20_xor(key, nonce, 1, ct) };
+}
+
+/// XChaCha20-Poly1305 encryption with a 24-byte nonce.
+pub fn aead_xchacha20poly1305_seal(key: Vec<i64>, nonce24: Vec<i64>, aad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    val sub: Vec<i64> = hchacha20(key, cc20_sub(& nonce24, 0, 16));
+    return aead_chacha20poly1305_seal(sub, cc20_xnonce(& nonce24), aad, plain);
+}
+
+/// XChaCha20-Poly1305 decryption.
+pub fn aead_xchacha20poly1305_open(key: Vec<i64>, nonce24: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> AeadOpened {
+    if nonce24.len() != 24 { return AeadOpened { ok: false, data: Vec::new() }; }
+    val sub: Vec<i64> = hchacha20(key, cc20_sub(& nonce24, 0, 16));
+    return aead_chacha20poly1305_open(sub, cc20_xnonce(& nonce24), aad, sealed);
+}

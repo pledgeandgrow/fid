@@ -1,0 +1,132 @@
+// ME2 + ME23 (compiler/ssa.fd ssa_exit_values): the value a counted loop's
+// variable has after the loop is a constant, and the loop's body that
+// decides it ("no other way out of the loop") comes from the shared loop
+// tree (compiler/checks.fd iro_loops / iro_loop_body), not from a walk of
+// ssa.fd's own. Loops with inner loops, a `continue` (two latches), a
+// `return` and a `break` out of the body, `!=` and `<=` bounds, a loop
+// never entered: every result must be the one the program computes, with
+// the passes on (the default) and off (FID_IROPT_OFF=ssa,ssaexit).
+//@ env: FID_IROPT_ON=ssa,ssaexit
+//
+// Expected output:
+// 6015
+// 3 12
+// 10 37
+// 14
+// 50
+// 9
+// 12
+// 8
+// 4 4 16
+
+fn outer_with_inner() -> i64 {
+    // the outer loop's body holds an inner loop: i is 6 after it
+    var i: i64 = 0;
+    var acc: i64 = 0;
+    while i < 6 {
+        var j: i64 = 0;
+        while j < i {
+            j = j + 1;
+            acc = acc + 1;
+        }
+        i = i + 1;
+    }
+    return i * 1000 + acc;
+}
+
+fn inner_counted() {
+    // the inner loop's j is 4 after each run of it
+    var x: i64 = 0;
+    var t: i64 = 0;
+    while x < 3 {
+        var j: i64 = 0;
+        while j < 4 {
+            j = j + 1;
+        }
+        t = t + j;
+        x = x + 1;
+    }
+    println(int_to_str(x) + " " + int_to_str(t));
+}
+
+fn with_continue() {
+    // a `continue`: the header has two latches
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < 10 {
+        i = i + 1;
+        if i % 3 == 0 {
+            continue;
+        }
+        s = s + i;
+    }
+    println(int_to_str(i) + " " + int_to_str(s));
+}
+
+fn find(limit: i64) -> i64 {
+    // a `return` out of the body
+    var i: i64 = 0;
+    while i < 50 {
+        if i == limit {
+            return i * 2;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn not_equal() -> i64 {
+    var k: i64 = 2;
+    while k != 9 {
+        k = k + 1;
+    }
+    return k;
+}
+
+fn never_entered() -> i64 {
+    var m: i64 = 12;
+    while m <= 7 {
+        m = m + 1;
+    }
+    return m;
+}
+
+fn broken(limit: i64) -> i64 {
+    // a `break`: no exit value, the loop's own result
+    var k: i64 = 0;
+    while k < 100 {
+        if k * k > limit {
+            break;
+        }
+        k = k + 1;
+    }
+    return k;
+}
+
+fn two_loops() {
+    // a loop after a loop, each with its own exit value
+    var a: i64 = 0;
+    while a < 4 {
+        a = a + 1;
+    }
+    var b: i64 = 0;
+    var c: i64 = 0;
+    while b < a {
+        c = c + a;
+        b = b + 1;
+    }
+    println(int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c));
+}
+
+fn main() -> i64 {
+    println(outer_with_inner());
+    inner_counted();
+    with_continue();
+    println(find(7));
+    println(find(70));
+    println(not_equal());
+    println(never_entered());
+    println(broken(50));
+    two_loops();
+    return 0;
+}

@@ -59,6 +59,33 @@ this machine in `bench/baseline.txt`; `./bench/check.sh` then exits 1 when a
 program got more than 10% slower (`LIMIT_PCT` to change it). Run it in CI or
 before a change to code generation lands (release D7).
 
-Still to come (roadmap BM3–BM10): the Benchmarks Game set, real-work
-programs, service, compile-speed and size benchmarks, Linux runs, a CI
-check on slowdowns, and a public results page.
+In CI (`.github/workflows/bench.yml`, BM9) the base commit's compiler and the
+head's run in turn on one runner, `BASE_FID=... ./bench/check.sh --ab` with
+`LIMIT_PCT=5`: best of `RUNS` each, and a program over the limit is measured
+again before it fails (`SLACK_MS`, default 5, absorbs timer noise on short
+programs).
+
+## More sets and measures (Nov 15)
+
+| Command | Roadmap | What |
+|---|---|---|
+| `SUITE=game ./bench/run.sh` | BM3 | `bench/game/`: n-body (5M steps), spectral-norm (n = 2000), mandelbrot (4000 x 4000), fannkuch-redux (11), binary-trees (depths 4..16, one allocation per node), fasta (n = 2.5M, its 25M characters folded into a 32-bit hash instead of written), reverse-complement (fasta's three sections for n = 2.5M, made in memory, each reversed and complemented in place), k-nucleotide (fasta's THREE section for n = 1M: hash tables of every 1-, 2-, 3-, 4-, 6-, 12- and 18-long substring), regex-redux (fasta's output for n = 500000: nine variant counts and five substitutions; Rust and Zig have no regular expressions in their standard libraries, so all five run the same small backtracking matcher) and pidigits (10000 digits, Gibbons' spigot; big integers from `stdlib/bigint.fd`, Go's `math/big`, and a small one of their own in Rust, C++ and Zig), in all five languages; each prints one integer (the energy or norm times 1e9, the points in the set, checksum * 1000 + flips, the nodes of every tree, a 32-bit hash of the output), the arithmetic in the same order everywhere so every language must print the same number. `tests/bootstrap/test_verify_bm_*.fd` are the Fides programs on small inputs, checked by the suite against the reference algorithm's values; `python3 bench/game/reference.py` computes the values of the last four independently (Python's `re` and integers). |
+| `SUITE=work ./bench/run.sh` | BM4 | `bench/work/`: real work, not loops: sorting 5M integers with each language's own sort, building a 2M-number string with its string builder and hashing it, FNV-1a over 50 MB, a small compiler (generate 50000 lines of `let vK = <expr>;`, 11 MB, then lex, parse into boxed trees and evaluate; Zig has no `strings` program yet), JSON parse and print (15.9 MB of generated JSON parsed into an arena of nodes and printed back compact, 3 rounds), regex (a Thompson NFA, 8 patterns over 200000 generated lines) and file reading (a 50 MB text file, `bench/out/fileread.dat`, written by the first program that needs it, read 3 times and its numbers summed). JSON and regex are written by hand, the same algorithm in every language: Rust has neither in its standard library and `run.sh` fetches no crates, so Go and C++ do not use theirs either. `tests/bootstrap/test_verify_bm_{sort,strings,hash,compiler,json,regex,fileread}.fd` check the Fides ones. |
+| `./bench/size.sh` | BM7 | Binary size, startup time (hello, best of 20) and peak memory (`bench/peakmem.py`: ru_maxrss, or the peak working set on Windows) of `bench/size/hello` and every `bench/fides/` program, every language. First recorded run: [docs/perf/size-2026-11-16.md](../docs/perf/size-2026-11-16.md). |
+| `./bench/compile-speed.sh` | BM6 | `bench/gen_lines.py` writes the same program of N lines in each language; each is built clean and after a one-line change, plus `fid check` alone. `SIZES="hello 10000 100000 1000000"`. First recorded run (hello, 10k, 100k): [docs/benchmarks.md](../docs/benchmarks.md), Nov 16; 1M on Nov 17 (`fid check` 3422 s, the rivals' clean builds 82–185 s; the native build stopped after 5.5 h, through C and the change row not run). The footer gives the load average before and after. |
+| `bash bench/service/run.sh` | BM5 | TechEmpower-style service tests (plaintext, JSON, one row, 20 rows) for Fides, Go and Node, under wrk or `bench/service/load.py`; `serve` / `load` put the client on another machine. See [service/README.md](service/README.md). |
+| `bash bench/mixed.sh` | pe 89 | The mixed workload of pe-roadmap item 89 (`bench/mixed/mixed.fd`: 200k StringBuilder appends, 2M Vec pushes and gets, 100k HashMap inserts and lookups, ten rounds), `fid emit` against `fid ccompile --cc-opt 0`, each part alone too (`MIXED_PHASE`); checksums from `bench/mixed/reference.py`; exits 1 over 2x. First run: [docs/verification/a11-m7-lint-mixed-2026-11-18.md](../docs/verification/a11-m7-lint-mixed-2026-11-18.md) (native 0.27x of C -O0). |
+| `bash bench/alloc/run.sh` | RT8 | `bench/alloc/`: five allocator programs (small, churn, sizes, threads, large: mimalloc-bench's shapes) in C, built with the C library's malloc/calloc, mimalloc's mi_malloc/mi_zalloc and fid's p_malloc (the C runtime of `fid dump-c bench/alloc/c/rt.fd`), and in Fides through ccompile and emit; prints the best time of each and fid over mimalloc. See bench/alloc/README.md. |
+| `bench/versions.txt` | BM2 | The pinned toolchain versions; `run.sh` names any installed version that differs. `run.sh` also has a C++ (GCC) column (`g++ -O2`, when on the PATH; on Windows without one, the g++ of WSL, built and timed inside WSL and marked so under the table; `GCC_WSL=0` turns that off). |
+| `./bench/history.sh <tables.md> "<machine>"` | BM10 | Adds a run's tables, unchanged, to `docs/benchmarks.md` (newest first). |
+
+`run.sh` reports the spread of the runs beside each best time (BM8) and the
+load average before and after; on Linux "Fides native" is the machine layer
+(`emit --target x86_64-linux`). `.github/workflows/verify-weekly.yml` runs
+`run.sh` and `size.sh` on Linux every week and keeps the tables as an
+artifact.
+
+Still to come (roadmap BM5–BM10): Benchmarks Game numbers from a quiet
+machine (the Nov 17 table in docs/benchmarks.md is from a busy one); service
+benchmarks with the client on another machine (BM5); published Linux runs
+and results kept over time on the website.

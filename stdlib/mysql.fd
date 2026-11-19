@@ -1,0 +1,1619 @@
+// Fides MySQL client protocol (client/server protocol 4.1+)
+//
+// Real (pure computation):
+//   - packets: 3-byte little-endian length, sequence id, payload; payloads
+//     of 16 MiB - 1 and more split and joined back; length-encoded integers
+//     and strings; NUL-terminated strings;
+//   - the initial Handshake v10 (server version, connection id, the 20-byte
+//     nonce from its two parts, capabilities, character set, status, auth
+//     plugin name) and the client's HandshakeResponse41 (capabilities,
+//     max packet, utf8mb4, user, auth response, database, plugin name);
+//   - mysql_native_password: SHA1(pw) XOR SHA1(nonce + SHA1(SHA1(pw)));
+//     caching_sha2_password: SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) +
+//     nonce), with its fast-auth answers (0x01 0x03 success, 0x01 0x04 full
+//     authentication), AuthSwitchRequest (0xFE) answered with the new
+//     plugin's scramble; SHA-1 and SHA-256 are implemented here;
+//   - full authentication (caching_sha2_password after 0x01 0x04, and
+//     sha256_password): on a secure transport the password NUL-terminated;
+//     otherwise (password NUL) XOR the 20-byte scramble, encrypted with
+//     RSAES-OAEP SHA-1 (stdlib rsa; what OpenSSL's RSA_PKCS1_OAEP_PADDING
+//     does in libmysqlclient) to the server's key: a configured PEM key,
+//     or the one the server sends after a request (0x02 for caching_sha2,
+//     only when get_server_public_key is set, as MySQL's
+//     --get-server-public-key; 0x01 in sha256_password's first answer);
+//     the password length limit (k - 42 bytes with the NUL) is checked;
+//   - OK, ERR (code, SQLSTATE, message) and EOF packets;
+//   - COM_QUERY with text resultsets (column definitions, rows of
+//     length-encoded strings, NULL as 0xFB), with and without
+//     CLIENT_DEPRECATE_EOF; COM_PING, COM_INIT_DB, COM_QUIT;
+//   - prepared statements: COM_STMT_PREPARE and its answer (statement id,
+//     parameter and column definitions), COM_STMT_EXECUTE with a NULL
+//     bitmap and typed binary parameters (LONGLONG, DOUBLE, VAR_STRING,
+//     NULL), binary resultset rows (TINY..LONGLONG, FLOAT, DOUBLE, strings
+//     and decimals, DATE/DATETIME/TIMESTAMP, TIME), COM_STMT_CLOSE.
+//
+// The transport seam: MysqlTransport (conn, send, recv), as stdlib redis;
+// mysql_tcp_transport(sock) is plain TCP over stdlib net. MysqlAuthOpts
+// says whether that transport is secure (a TLS wrapper or a local socket
+// the caller provides) and which RSA key to use; OAEP seeds come from
+// crypto_random_bytes. With the default options (mysql_connect) a full
+// authentication is refused rather than sending the password in clear or
+// trusting a key fetched over plain TCP, as libmysqlclient does. Not here:
+// TLS itself (CLIENT_SSL is never asked for); compression; LOAD DATA LOCAL;
+// multi-resultsets past the first.
+//
+// Usage:
+//   use mysql;
+//   var c: MysqlConn = mysql_connect(mysql_tcp_transport(sock), "app", "secret", "shop");
+//   val r: MysqlResult = mysql_query(&mut c, "SELECT id, name FROM users");
+//   println(mysql_cell(&r, 0, 1));
+
+module mysql;
+ use vec; use string; use net; use rsa; use pem; use kdf; use crypto;
+
+// Capability flags
+pub const MYSQL_CLIENT_LONG_PASSWORD: i64 = 1;
+pub const MYSQL_CLIENT_FOUND_ROWS: i64 = 2;
+pub const MYSQL_CLIENT_LONG_FLAG: i64 = 4;
+pub const MYSQL_CLIENT_CONNECT_WITH_DB: i64 = 8;
+pub const MYSQL_CLIENT_PROTOCOL_41: i64 = 512;
+pub const MYSQL_CLIENT_TRANSACTIONS: i64 = 8192;
+pub const MYSQL_CLIENT_SECURE_CONNECTION: i64 = 32768;
+pub const MYSQL_CLIENT_MULTI_RESULTS: i64 = 131072;
+pub const MYSQL_CLIENT_PLUGIN_AUTH: i64 = 524288;
+pub const MYSQL_CLIENT_PLUGIN_AUTH_LENENC: i64 = 2097152;
+pub const MYSQL_CLIENT_DEPRECATE_EOF: i64 = 16777216;
+
+// Column types
+pub const MYSQL_TYPE_DECIMAL: i64 = 0;
+pub const MYSQL_TYPE_TINY: i64 = 1;
+pub const MYSQL_TYPE_SHORT: i64 = 2;
+pub const MYSQL_TYPE_LONG: i64 = 3;
+pub const MYSQL_TYPE_FLOAT: i64 = 4;
+pub const MYSQL_TYPE_DOUBLE: i64 = 5;
+pub const MYSQL_TYPE_NULL: i64 = 6;
+pub const MYSQL_TYPE_TIMESTAMP: i64 = 7;
+pub const MYSQL_TYPE_LONGLONG: i64 = 8;
+pub const MYSQL_TYPE_INT24: i64 = 9;
+pub const MYSQL_TYPE_DATE: i64 = 10;
+pub const MYSQL_TYPE_TIME: i64 = 11;
+pub const MYSQL_TYPE_DATETIME: i64 = 12;
+pub const MYSQL_TYPE_YEAR: i64 = 13;
+pub const MYSQL_TYPE_VARCHAR: i64 = 15;
+pub const MYSQL_TYPE_NEWDECIMAL: i64 = 246;
+pub const MYSQL_TYPE_BLOB: i64 = 252;
+pub const MYSQL_TYPE_VAR_STRING: i64 = 253;
+pub const MYSQL_TYPE_STRING: i64 = 254;
+
+pub const MYSQL_MAX_PAYLOAD: i64 = 16777215;
+
+// ─── SHA-1 and SHA-256 (32-bit words kept in i64, masked) ─────────────────
+
+fn my_rotl(x: i64, n: i64) -> i64 {
+    return ((x << n) | (x >> (32 - n))) & 4294967295;
+}
+
+fn my_rotr(x: i64, n: i64) -> i64 {
+    return ((x >> n) | (x << (32 - n))) & 4294967295;
+}
+
+// The message padded to whole 64-byte blocks, length in bits at the end.
+fn my_pad(msg: Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < msg.len() {
+        p.push(msg.get(i) & 255);
+        i = i + 1;
+    }
+    p.push(128);
+    while p.len() % 64 != 56 {
+        p.push(0);
+    }
+    val bits: i64 = msg.len() * 8;
+    var k: i64 = 7;
+    while k >= 0 {
+        p.push((bits >> (k * 8)) & 255);
+        k = k - 1;
+    }
+    return p;
+}
+
+fn my_word(p: & Vec<i64>, at: i64) -> i64 {
+    return (p.get(at) << 24) | (p.get(at + 1) << 16) | (p.get(at + 2) << 8) | p.get(at + 3);
+}
+
+fn my_out_words(h: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < h.len() {
+        val w: i64 = h.get(i);
+        out.push((w >> 24) & 255);
+        out.push((w >> 16) & 255);
+        out.push((w >> 8) & 255);
+        out.push(w & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// SHA-1 (FIPS 180-4) of bytes: 20 bytes.
+pub fn mysql_sha1(msg: Vec<i64>) -> Vec<i64> {
+    val p: Vec<i64> = my_pad(msg);
+    var h: Vec<i64> = Vec::new();
+    h.push(1732584193);
+    h.push(4023233417);
+    h.push(2562383102);
+    h.push(271733878);
+    h.push(3285377520);
+    var w: Vec<i64> = Vec::filled(80, 0);
+    var blk: i64 = 0;
+    while blk < p.len() {
+        var t: i64 = 0;
+        while t < 16 {
+            w.set(t, my_word(& p, blk + t * 4));
+            t = t + 1;
+        }
+        while t < 80 {
+            w.set(t, my_rotl(w.get(t - 3) ^ w.get(t - 8) ^ w.get(t - 14) ^ w.get(t - 16), 1));
+            t = t + 1;
+        }
+        var a: i64 = h.get(0);
+        var b: i64 = h.get(1);
+        var c: i64 = h.get(2);
+        var d: i64 = h.get(3);
+        var e: i64 = h.get(4);
+        t = 0;
+        while t < 80 {
+            var f: i64 = 0;
+            var k: i64 = 0;
+            if t < 20 {
+                f = (b & c) | ((b ^ 4294967295) & d);
+                k = 1518500249;
+            } else if t < 40 {
+                f = b ^ c ^ d;
+                k = 1859775393;
+            } else if t < 60 {
+                f = (b & c) | (b & d) | (c & d);
+                k = 2400959708;
+            } else {
+                f = b ^ c ^ d;
+                k = 3395469782;
+            }
+            val tmp: i64 = (my_rotl(a, 5) + f + e + k + w.get(t)) & 4294967295;
+            e = d;
+            d = c;
+            c = my_rotl(b, 30);
+            b = a;
+            a = tmp;
+            t = t + 1;
+        }
+        h.set(0, (h.get(0) + a) & 4294967295);
+        h.set(1, (h.get(1) + b) & 4294967295);
+        h.set(2, (h.get(2) + c) & 4294967295);
+        h.set(3, (h.get(3) + d) & 4294967295);
+        h.set(4, (h.get(4) + e) & 4294967295);
+        blk = blk + 64;
+    }
+    return my_out_words(h);
+}
+
+fn my_k256() -> Vec<i64> {
+    var k: Vec<i64> = Vec::new();
+    k.push(0x428a2f98); k.push(0x71374491); k.push(0xb5c0fbcf); k.push(0xe9b5dba5); k.push(0x3956c25b); k.push(0x59f111f1); k.push(0x923f82a4); k.push(0xab1c5ed5);
+    k.push(0xd807aa98); k.push(0x12835b01); k.push(0x243185be); k.push(0x550c7dc3); k.push(0x72be5d74); k.push(0x80deb1fe); k.push(0x9bdc06a7); k.push(0xc19bf174);
+    k.push(0xe49b69c1); k.push(0xefbe4786); k.push(0x0fc19dc6); k.push(0x240ca1cc); k.push(0x2de92c6f); k.push(0x4a7484aa); k.push(0x5cb0a9dc); k.push(0x76f988da);
+    k.push(0x983e5152); k.push(0xa831c66d); k.push(0xb00327c8); k.push(0xbf597fc7); k.push(0xc6e00bf3); k.push(0xd5a79147); k.push(0x06ca6351); k.push(0x14292967);
+    k.push(0x27b70a85); k.push(0x2e1b2138); k.push(0x4d2c6dfc); k.push(0x53380d13); k.push(0x650a7354); k.push(0x766a0abb); k.push(0x81c2c92e); k.push(0x92722c85);
+    k.push(0xa2bfe8a1); k.push(0xa81a664b); k.push(0xc24b8b70); k.push(0xc76c51a3); k.push(0xd192e819); k.push(0xd6990624); k.push(0xf40e3585); k.push(0x106aa070);
+    k.push(0x19a4c116); k.push(0x1e376c08); k.push(0x2748774c); k.push(0x34b0bcb5); k.push(0x391c0cb3); k.push(0x4ed8aa4a); k.push(0x5b9cca4f); k.push(0x682e6ff3);
+    k.push(0x748f82ee); k.push(0x78a5636f); k.push(0x84c87814); k.push(0x8cc70208); k.push(0x90befffa); k.push(0xa4506ceb); k.push(0xbef9a3f7); k.push(0xc67178f2);
+    return k;
+}
+
+/// SHA-256 (FIPS 180-4) of bytes: 32 bytes.
+pub fn mysql_sha256(msg: Vec<i64>) -> Vec<i64> {
+    val p: Vec<i64> = my_pad(msg);
+    val k: Vec<i64> = my_k256();
+    var h: Vec<i64> = Vec::new();
+    h.push(0x6a09e667); h.push(0xbb67ae85); h.push(0x3c6ef372); h.push(0xa54ff53a);
+    h.push(0x510e527f); h.push(0x9b05688c); h.push(0x1f83d9ab); h.push(0x5be0cd19);
+    var w: Vec<i64> = Vec::filled(64, 0);
+    var blk: i64 = 0;
+    while blk < p.len() {
+        var t: i64 = 0;
+        while t < 16 {
+            w.set(t, my_word(& p, blk + t * 4));
+            t = t + 1;
+        }
+        while t < 64 {
+            val x: i64 = w.get(t - 15);
+            val y: i64 = w.get(t - 2);
+            val s0: i64 = my_rotr(x, 7) ^ my_rotr(x, 18) ^ (x >> 3);
+            val s1: i64 = my_rotr(y, 17) ^ my_rotr(y, 19) ^ (y >> 10);
+            w.set(t, (w.get(t - 16) + s0 + w.get(t - 7) + s1) & 4294967295);
+            t = t + 1;
+        }
+        var a: i64 = h.get(0);
+        var b: i64 = h.get(1);
+        var c: i64 = h.get(2);
+        var d: i64 = h.get(3);
+        var e: i64 = h.get(4);
+        var f: i64 = h.get(5);
+        var g: i64 = h.get(6);
+        var hh: i64 = h.get(7);
+        t = 0;
+        while t < 64 {
+            val S1: i64 = my_rotr(e, 6) ^ my_rotr(e, 11) ^ my_rotr(e, 25);
+            val ch: i64 = (e & f) ^ ((e ^ 4294967295) & g);
+            val t1: i64 = (hh + S1 + ch + k.get(t) + w.get(t)) & 4294967295;
+            val S0: i64 = my_rotr(a, 2) ^ my_rotr(a, 13) ^ my_rotr(a, 22);
+            val mj: i64 = (a & b) ^ (a & c) ^ (b & c);
+            val t2: i64 = (S0 + mj) & 4294967295;
+            hh = g;
+            g = f;
+            f = e;
+            e = (d + t1) & 4294967295;
+            d = c;
+            c = b;
+            b = a;
+            a = (t1 + t2) & 4294967295;
+            t = t + 1;
+        }
+        h.set(0, (h.get(0) + a) & 4294967295);
+        h.set(1, (h.get(1) + b) & 4294967295);
+        h.set(2, (h.get(2) + c) & 4294967295);
+        h.set(3, (h.get(3) + d) & 4294967295);
+        h.set(4, (h.get(4) + e) & 4294967295);
+        h.set(5, (h.get(5) + f) & 4294967295);
+        h.set(6, (h.get(6) + g) & 4294967295);
+        h.set(7, (h.get(7) + hh) & 4294967295);
+        blk = blk + 64;
+    }
+    return my_out_words(h);
+}
+
+fn my_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        out.push(a.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn my_xor(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() && i < b.len() {
+        out.push(a.get(i) ^ b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// mysql_native_password's auth response (empty for an empty password).
+pub fn mysql_native_scramble(password: str, nonce: Vec<i64>) -> Vec<i64> {
+    if str_len(password) == 0 {
+        return Vec::new();
+    }
+    val s1: Vec<i64> = mysql_sha1(str_bytes(password));
+    val s2: Vec<i64> = mysql_sha1(s1);
+    return my_xor(s1, mysql_sha1(my_cat(nonce, s2)));
+}
+
+/// caching_sha2_password's fast-auth response.
+pub fn mysql_sha2_scramble(password: str, nonce: Vec<i64>) -> Vec<i64> {
+    if str_len(password) == 0 {
+        return Vec::new();
+    }
+    val h1: Vec<i64> = mysql_sha256(str_bytes(password));
+    val h2: Vec<i64> = mysql_sha256(h1);
+    return my_xor(h1, mysql_sha256(my_cat(h2, nonce)));
+}
+
+// ─── Packets ──────────────────────────────────────────────────────────────
+
+/// One payload as packets (split at 16 MiB - 1; a payload of exactly a
+/// multiple of that gets an empty packet after it), sequence ids from `seq`.
+pub fn mysql_packets(payload: Vec<i64>, seq: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var at: i64 = 0;
+    var s: i64 = seq;
+    while true {
+        var n: i64 = payload.len() - at;
+        if n > MYSQL_MAX_PAYLOAD {
+            n = MYSQL_MAX_PAYLOAD;
+        }
+        out.push(n & 255);
+        out.push((n >> 8) & 255);
+        out.push((n >> 16) & 255);
+        out.push(s & 255);
+        var i: i64 = 0;
+        while i < n {
+            out.push(payload.get(at + i));
+            i = i + 1;
+        }
+        at = at + n;
+        s = s + 1;
+        if n < MYSQL_MAX_PAYLOAD {
+            break;
+        }
+    }
+    return out;
+}
+
+/// A payload read from packets at `at`: complete false when bytes are
+/// missing; used = bytes taken; seq = the last packet's sequence id.
+pub struct MysqlPacket {
+    pub complete: bool,
+    pub payload: Vec<i64>,
+    pub seq: i64,
+    pub used: i64,
+}
+
+pub fn mysql_read_packet(b: Vec<i64>, at: i64) -> MysqlPacket {
+    var r: MysqlPacket = MysqlPacket { complete: false, payload: Vec::new(), seq: 0, used: 0 };
+    var p: i64 = at;
+    var payload: Vec<i64> = Vec::new();
+    while true {
+        if p + 4 > b.len() {
+            return r;
+        }
+        val n: i64 = b.get(p) | (b.get(p + 1) << 8) | (b.get(p + 2) << 16);
+        if p + 4 + n > b.len() {
+            return r;
+        }
+        r.seq = b.get(p + 3);
+        var i: i64 = 0;
+        while i < n {
+            payload.push(b.get(p + 4 + i));
+            i = i + 1;
+        }
+        p = p + 4 + n;
+        if n < MYSQL_MAX_PAYLOAD {
+            break;
+        }
+    }
+    r.complete = true;
+    r.payload = payload;
+    r.used = p - at;
+    return r;
+}
+
+/// Append a length-encoded integer.
+pub fn mysql_put_lenenc(out: & mut Vec<i64>, v: i64) {
+    if v < 251 {
+        out.push(v);
+    } else if v < 65536 {
+        out.push(252);
+        out.push(v & 255);
+        out.push((v >> 8) & 255);
+    } else if v < 16777216 {
+        out.push(253);
+        out.push(v & 255);
+        out.push((v >> 8) & 255);
+        out.push((v >> 16) & 255);
+    } else {
+        out.push(254);
+        var i: i64 = 0;
+        while i < 8 {
+            out.push((v >> (i * 8)) & 255);
+            i = i + 1;
+        }
+    }
+}
+
+fn my_put_text(out: & mut Vec<i64>, s: str) {
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn my_put_le(out: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+/// A cursor over a payload (readers stop at the end: ok turns false).
+pub struct MysqlReader {
+    pub b: Vec<i64>,
+    pub pos: i64,
+    pub ok: bool,
+}
+
+pub fn mysql_reader(b: Vec<i64>) -> MysqlReader {
+    return MysqlReader { b: b, pos: 0, ok: true };
+}
+
+@wrapping pub fn mysql_get_le(r: & mut MysqlReader, n: i64) -> i64 {
+    if r.pos + n > r.b.len() {
+        r.ok = false;
+        r.pos = r.b.len();
+        return 0;
+    }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        v = v | (r.b.get(r.pos + i) << (i * 8));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return v;
+}
+
+/// A length-encoded integer; -1 for the NULL marker 0xFB.
+pub fn mysql_get_lenenc(r: & mut MysqlReader) -> i64 {
+    val f: i64 = mysql_get_le(r, 1);
+    if f < 251 {
+        return f;
+    }
+    if f == 251 {
+        return 0 - 1;
+    }
+    if f == 252 {
+        return mysql_get_le(r, 2);
+    }
+    if f == 253 {
+        return mysql_get_le(r, 3);
+    }
+    if f == 254 {
+        return mysql_get_le(r, 8);
+    }
+    r.ok = false;
+    return 0;
+}
+
+pub fn mysql_get_bytes(r: & mut MysqlReader, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if n < 0 || r.pos + n > r.b.len() {
+        r.ok = false;
+        r.pos = r.b.len();
+        return out;
+    }
+    var i: i64 = 0;
+    while i < n {
+        out.push(r.b.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return out;
+}
+
+pub fn mysql_get_str(r: & mut MysqlReader, n: i64) -> str {
+    return str_from_bytes(mysql_get_bytes(r, n));
+}
+
+pub fn mysql_get_lenenc_str(r: & mut MysqlReader) -> str {
+    val n: i64 = mysql_get_lenenc(r);
+    if n < 0 {
+        return "";
+    }
+    return mysql_get_str(r, n);
+}
+
+pub fn mysql_get_cstr(r: & mut MysqlReader) -> str {
+    var e: i64 = r.pos;
+    while e < r.b.len() && r.b.get(e) != 0 {
+        e = e + 1;
+    }
+    val s: str = mysql_get_str(r, e - r.pos);
+    if e < r.b.len() {
+        r.pos = r.pos + 1;
+    }
+    return s;
+}
+
+fn my_rest(r: & mut MysqlReader) -> str {
+    return mysql_get_str(r, r.b.len() - r.pos);
+}
+
+// ─── Handshake ────────────────────────────────────────────────────────────
+
+pub struct MysqlHandshake {
+    pub ok: bool,
+    pub error: str,
+    pub protocol: i64,
+    pub server_version: str,
+    pub connection_id: i64,
+    pub nonce: Vec<i64>,
+    pub capabilities: i64,
+    pub charset: i64,
+    pub status: i64,
+    pub plugin: str,
+}
+
+/// Parse a Handshake v10 payload.
+pub fn mysql_parse_handshake(payload: Vec<i64>) -> MysqlHandshake {
+    var h: MysqlHandshake = MysqlHandshake { ok: false, error: "", protocol: 0, server_version: "", connection_id: 0, nonce: Vec::new(), capabilities: 0, charset: 0, status: 0, plugin: "mysql_native_password" };
+    var r: MysqlReader = mysql_reader(payload);
+    h.protocol = mysql_get_le(& mut r, 1);
+    if h.protocol == 255 {
+        mysql_get_le(& mut r, 2);
+        h.error = "server refused the connection: " + my_rest(& mut r);
+        return h;
+    }
+    if h.protocol != 10 {
+        h.error = "unsupported protocol version " + int_to_str(h.protocol);
+        return h;
+    }
+    h.server_version = mysql_get_cstr(& mut r);
+    h.connection_id = mysql_get_le(& mut r, 4);
+    var nonce: Vec<i64> = mysql_get_bytes(& mut r, 8);
+    mysql_get_le(& mut r, 1);
+    var caps: i64 = mysql_get_le(& mut r, 2);
+    if r.pos < r.b.len() {
+        h.charset = mysql_get_le(& mut r, 1);
+        h.status = mysql_get_le(& mut r, 2);
+        caps = caps | (mysql_get_le(& mut r, 2) << 16);
+        val auth_len: i64 = mysql_get_le(& mut r, 1);
+        mysql_get_bytes(& mut r, 10);
+        if (caps & MYSQL_CLIENT_SECURE_CONNECTION) != 0 {
+            var n2: i64 = auth_len - 8;
+            if n2 < 13 {
+                n2 = 13;
+            }
+            if r.pos + n2 > r.b.len() {
+                n2 = r.b.len() - r.pos;
+            }
+            val part2: Vec<i64> = mysql_get_bytes(& mut r, n2);
+            // the part ends with a NUL that is not part of the nonce
+            var i: i64 = 0;
+            while i < part2.len() && !(i == part2.len() - 1 && part2.get(i) == 0) {
+                nonce.push(part2.get(i));
+                i = i + 1;
+            }
+        }
+        if (caps & MYSQL_CLIENT_PLUGIN_AUTH) != 0 && r.pos < r.b.len() {
+            h.plugin = mysql_get_cstr(& mut r);
+        }
+    }
+    h.capabilities = caps;
+    h.nonce = nonce;
+    h.ok = r.ok;
+    if !r.ok {
+        h.error = "handshake packet too short";
+    }
+    return h;
+}
+
+/// The capabilities this client asks for, within what the server has.
+pub fn mysql_client_caps(server_caps: i64, with_db: bool) -> i64 {
+    var c: i64 = MYSQL_CLIENT_LONG_PASSWORD | MYSQL_CLIENT_LONG_FLAG | MYSQL_CLIENT_PROTOCOL_41 | MYSQL_CLIENT_TRANSACTIONS | MYSQL_CLIENT_SECURE_CONNECTION | MYSQL_CLIENT_MULTI_RESULTS | MYSQL_CLIENT_PLUGIN_AUTH | MYSQL_CLIENT_PLUGIN_AUTH_LENENC | MYSQL_CLIENT_DEPRECATE_EOF;
+    if with_db {
+        c = c | MYSQL_CLIENT_CONNECT_WITH_DB;
+    }
+    return c & server_caps;
+}
+
+/// The auth response for a plugin and nonce.
+pub fn mysql_scramble_for(plugin: str, password: str, nonce: Vec<i64>) -> Vec<i64> {
+    if plugin == "caching_sha2_password" {
+        return mysql_sha2_scramble(password, nonce);
+    }
+    if plugin == "mysql_clear_password" {
+        var b: Vec<i64> = str_bytes(password);
+        b.push(0);
+        return b;
+    }
+    return mysql_native_scramble(password, nonce);
+}
+
+/// HandshakeResponse41's payload (utf8mb4, character set 45).
+pub fn mysql_handshake_response(caps: i64, user: str, auth: Vec<i64>, database: str, plugin: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    my_put_le(& mut out, caps, 4);
+    my_put_le(& mut out, MYSQL_MAX_PAYLOAD, 4);
+    out.push(45);
+    var i: i64 = 0;
+    while i < 23 {
+        out.push(0);
+        i = i + 1;
+    }
+    my_put_text(& mut out, user);
+    out.push(0);
+    if (caps & MYSQL_CLIENT_PLUGIN_AUTH_LENENC) != 0 {
+        mysql_put_lenenc(& mut out, auth.len());
+    } else {
+        out.push(auth.len());
+    }
+    i = 0;
+    while i < auth.len() {
+        out.push(auth.get(i));
+        i = i + 1;
+    }
+    if (caps & MYSQL_CLIENT_CONNECT_WITH_DB) != 0 {
+        my_put_text(& mut out, database);
+        out.push(0);
+    }
+    if (caps & MYSQL_CLIENT_PLUGIN_AUTH) != 0 {
+        my_put_text(& mut out, plugin);
+        out.push(0);
+    }
+    return out;
+}
+
+// ─── OK, ERR, EOF ─────────────────────────────────────────────────────────
+
+/// What an OK, ERR or EOF packet says. kind: "OK", "ERR", "EOF" or "".
+pub struct MysqlStatus {
+    pub kind: str,
+    pub affected_rows: i64,
+    pub last_insert_id: i64,
+    pub status_flags: i64,
+    pub warnings: i64,
+    pub info: str,
+    pub error_code: i64,
+    pub sql_state: str,
+    pub message: str,
+}
+
+fn my_status_empty() -> MysqlStatus {
+    return MysqlStatus { kind: "", affected_rows: 0, last_insert_id: 0, status_flags: 0, warnings: 0, info: "", error_code: 0, sql_state: "", message: "" };
+}
+
+/// Is this payload an EOF packet (0xFE, shorter than 9 bytes)?
+pub fn mysql_is_eof(p: Vec<i64>) -> bool {
+    return p.len() > 0 && p.len() < 9 && p.get(0) == 254;
+}
+
+/// Parse an OK (0x00, or 0xFE ending a resultset under DEPRECATE_EOF),
+/// ERR (0xFF) or EOF (0xFE, short) payload.
+pub fn mysql_parse_status(p: Vec<i64>) -> MysqlStatus {
+    var s: MysqlStatus = my_status_empty();
+    if p.len() == 0 {
+        return s;
+    }
+    var r: MysqlReader = mysql_reader(p);
+    val h: i64 = mysql_get_le(& mut r, 1);
+    if h == 255 {
+        s.kind = "ERR";
+        s.error_code = mysql_get_le(& mut r, 2);
+        if r.pos < r.b.len() && r.b.get(r.pos) == 35 {
+            r.pos = r.pos + 1;
+            s.sql_state = mysql_get_str(& mut r, 5);
+        }
+        s.message = my_rest(& mut r);
+        return s;
+    }
+    if h == 254 && p.len() < 9 {
+        s.kind = "EOF";
+        s.warnings = mysql_get_le(& mut r, 2);
+        s.status_flags = mysql_get_le(& mut r, 2);
+        return s;
+    }
+    if h == 0 || h == 254 {
+        s.kind = "OK";
+        s.affected_rows = mysql_get_lenenc(& mut r);
+        s.last_insert_id = mysql_get_lenenc(& mut r);
+        s.status_flags = mysql_get_le(& mut r, 2);
+        s.warnings = mysql_get_le(& mut r, 2);
+        if r.pos < r.b.len() {
+            s.info = my_rest(& mut r);
+        }
+    }
+    return s;
+}
+
+// ─── Commands ─────────────────────────────────────────────────────────────
+
+pub fn mysql_com_query(sql: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(3);
+    my_put_text(& mut out, sql);
+    return out;
+}
+
+pub fn mysql_com_init_db(db: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(2);
+    my_put_text(& mut out, db);
+    return out;
+}
+
+pub fn mysql_com_ping() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(14);
+    return out;
+}
+
+pub fn mysql_com_quit() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(1);
+    return out;
+}
+
+pub fn mysql_com_stmt_prepare(sql: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(22);
+    my_put_text(& mut out, sql);
+    return out;
+}
+
+pub fn mysql_com_stmt_close(stmt_id: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(25);
+    my_put_le(& mut out, stmt_id, 4);
+    return out;
+}
+
+/// A parameter for COM_STMT_EXECUTE: type MYSQL_TYPE_LONGLONG (int),
+/// MYSQL_TYPE_DOUBLE (num), MYSQL_TYPE_VAR_STRING (text) or MYSQL_TYPE_NULL.
+pub struct MysqlParam {
+    pub kind: i64,
+    pub ival: i64,
+    pub num: f64,
+    pub text: str,
+}
+
+pub fn mysql_param_int(v: i64) -> MysqlParam {
+    return MysqlParam { kind: MYSQL_TYPE_LONGLONG, ival: v, num: 0.0, text: "" };
+}
+
+pub fn mysql_param_double(v: f64) -> MysqlParam {
+    return MysqlParam { kind: MYSQL_TYPE_DOUBLE, ival: 0, num: v, text: "" };
+}
+
+pub fn mysql_param_text(v: str) -> MysqlParam {
+    return MysqlParam { kind: MYSQL_TYPE_VAR_STRING, ival: 0, num: 0.0, text: v };
+}
+
+/// A text parameter sent with type VARCHAR (as some clients do).
+pub fn mysql_param_varchar(v: str) -> MysqlParam {
+    return MysqlParam { kind: MYSQL_TYPE_VARCHAR, ival: 0, num: 0.0, text: v };
+}
+
+pub fn mysql_param_null() -> MysqlParam {
+    return MysqlParam { kind: MYSQL_TYPE_NULL, ival: 0, num: 0.0, text: "" };
+}
+
+/// COM_STMT_EXECUTE (no cursor, one iteration, types always sent).
+pub fn mysql_com_stmt_execute(stmt_id: i64, params: Vec<MysqlParam>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(23);
+    my_put_le(& mut out, stmt_id, 4);
+    out.push(0);
+    my_put_le(& mut out, 1, 4);
+    val n: i64 = params.len();
+    if n == 0 {
+        return out;
+    }
+    var bitmap: Vec<i64> = Vec::filled((n + 7) / 8, 0);
+    var i: i64 = 0;
+    while i < n {
+        if params.get(i).kind == MYSQL_TYPE_NULL {
+            bitmap.set(i / 8, bitmap.get(i / 8) | (1 << (i % 8)));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < bitmap.len() {
+        out.push(bitmap.get(i));
+        i = i + 1;
+    }
+    out.push(1);
+    i = 0;
+    while i < n {
+        out.push(params.get(i).kind);
+        out.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        val p: MysqlParam = params.get(i);
+        if p.kind == MYSQL_TYPE_LONGLONG {
+            my_put_le(& mut out, p.ival, 8);
+        } else if p.kind == MYSQL_TYPE_DOUBLE {
+            my_put_le(& mut out, p_f64_to_bits(p.num), 8);
+        } else if p.kind != MYSQL_TYPE_NULL {
+            val b: Vec<i64> = str_bytes(p.text);
+            mysql_put_lenenc(& mut out, b.len());
+            var k: i64 = 0;
+            while k < b.len() {
+                out.push(b.get(k));
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Columns and rows ─────────────────────────────────────────────────────
+
+pub struct MysqlColumn {
+    pub schema: str,
+    pub table: str,
+    pub name: str,
+    pub org_name: str,
+    pub charset: i64,
+    pub length: i64,
+    pub kind: i64,
+    pub flags: i64,
+    pub decimals: i64,
+}
+
+/// Parse a ColumnDefinition41 payload.
+pub fn mysql_parse_column(p: Vec<i64>) -> MysqlColumn {
+    var r: MysqlReader = mysql_reader(p);
+    mysql_get_lenenc_str(& mut r);
+    val schema: str = mysql_get_lenenc_str(& mut r);
+    val table: str = mysql_get_lenenc_str(& mut r);
+    mysql_get_lenenc_str(& mut r);
+    val name: str = mysql_get_lenenc_str(& mut r);
+    val org_name: str = mysql_get_lenenc_str(& mut r);
+    mysql_get_lenenc(& mut r);
+    val cs: i64 = mysql_get_le(& mut r, 2);
+    val len: i64 = mysql_get_le(& mut r, 4);
+    val kind: i64 = mysql_get_le(& mut r, 1);
+    val flags: i64 = mysql_get_le(& mut r, 2);
+    val dec: i64 = mysql_get_le(& mut r, 1);
+    return MysqlColumn { schema: schema, table: table, name: name, org_name: org_name, charset: cs, length: len, kind: kind, flags: flags, decimals: dec };
+}
+
+/// A text-protocol row: each value as text, nulls[i] true for NULL.
+pub fn mysql_parse_text_row(p: Vec<i64>, ncols: i64, vals: & mut Vec<str>, nulls: & mut Vec<bool>) {
+    var r: MysqlReader = mysql_reader(p);
+    var i: i64 = 0;
+    while i < ncols {
+        if r.pos < r.b.len() && r.b.get(r.pos) == 251 {
+            r.pos = r.pos + 1;
+            vals.push("");
+            nulls.push(true);
+        } else {
+            vals.push(mysql_get_lenenc_str(& mut r));
+            nulls.push(false);
+        }
+        i = i + 1;
+    }
+}
+
+fn my_two(v: i64) -> str {
+    if v < 10 {
+        return "0" + int_to_str(v);
+    }
+    return int_to_str(v);
+}
+
+fn my_signed(v: i64, bytes: i64, unsigned: bool) -> i64 {
+    if unsigned || bytes >= 8 {
+        return v;
+    }
+    val top: i64 = 1 << (bytes * 8 - 1);
+    if v >= top {
+        return v - (top * 2);
+    }
+    return v;
+}
+
+/// A binary-protocol row (0x00, NULL bitmap with offset 2, values) as text
+/// values: integers in decimal, floats with float_to_str, dates as
+/// "YYYY-MM-DD[ HH:MM:SS[.ffffff]]", times as "[-][D ]HH:MM:SS".
+pub fn mysql_parse_binary_row(p: Vec<i64>, cols: Vec<MysqlColumn>, vals: & mut Vec<str>, nulls: & mut Vec<bool>) {
+    var r: MysqlReader = mysql_reader(p);
+    mysql_get_le(& mut r, 1);
+    val n: i64 = cols.len();
+    val bitmap: Vec<i64> = mysql_get_bytes(& mut r, (n + 9) / 8);
+    var i: i64 = 0;
+    while i < n {
+        val bit: i64 = i + 2;
+        if bitmap.len() > bit / 8 && (bitmap.get(bit / 8) & (1 << (bit % 8))) != 0 {
+            vals.push("");
+            nulls.push(true);
+        } else {
+            val c: MysqlColumn = cols.get(i);
+            val unsigned: bool = (c.flags & 32) != 0;
+            val t: i64 = c.kind;
+            var v: str = "";
+            if t == MYSQL_TYPE_TINY {
+                v = int_to_str(my_signed(mysql_get_le(& mut r, 1), 1, unsigned));
+            } else if t == MYSQL_TYPE_SHORT || t == MYSQL_TYPE_YEAR {
+                v = int_to_str(my_signed(mysql_get_le(& mut r, 2), 2, unsigned));
+            } else if t == MYSQL_TYPE_LONG || t == MYSQL_TYPE_INT24 {
+                v = int_to_str(my_signed(mysql_get_le(& mut r, 4), 4, unsigned));
+            } else if t == MYSQL_TYPE_LONGLONG {
+                val x: i64 = mysql_get_le(& mut r, 8);
+                if unsigned && x < 0 {
+                    v = u64_to_str(x as u64);
+                } else {
+                    v = int_to_str(x);
+                }
+            } else if t == MYSQL_TYPE_DOUBLE {
+                v = float_to_str(p_f64_from_bits(mysql_get_le(& mut r, 8)));
+            } else if t == MYSQL_TYPE_FLOAT {
+                v = float_to_str(my_f32(mysql_get_le(& mut r, 4)));
+            } else if t == MYSQL_TYPE_DATE || t == MYSQL_TYPE_DATETIME || t == MYSQL_TYPE_TIMESTAMP {
+                val len: i64 = mysql_get_le(& mut r, 1);
+                if len == 0 {
+                    v = "0000-00-00";
+                } else {
+                    val y: i64 = mysql_get_le(& mut r, 2);
+                    val mo: i64 = mysql_get_le(& mut r, 1);
+                    val d: i64 = mysql_get_le(& mut r, 1);
+                    v = int_to_str(y) + "-" + my_two(mo) + "-" + my_two(d);
+                    if len >= 7 {
+                        val hh: i64 = mysql_get_le(& mut r, 1);
+                        val mi: i64 = mysql_get_le(& mut r, 1);
+                        val ss: i64 = mysql_get_le(& mut r, 1);
+                        v = v + " " + my_two(hh) + ":" + my_two(mi) + ":" + my_two(ss);
+                        if len >= 11 {
+                            var us: str = int_to_str(mysql_get_le(& mut r, 4));
+                            while str_len(us) < 6 {
+                                us = "0" + us;
+                            }
+                            v = v + "." + us;
+                        }
+                    }
+                }
+            } else if t == MYSQL_TYPE_TIME {
+                val len: i64 = mysql_get_le(& mut r, 1);
+                if len == 0 {
+                    v = "00:00:00";
+                } else {
+                    val neg: i64 = mysql_get_le(& mut r, 1);
+                    val days: i64 = mysql_get_le(& mut r, 4);
+                    val hh: i64 = mysql_get_le(& mut r, 1);
+                    val mi: i64 = mysql_get_le(& mut r, 1);
+                    val ss: i64 = mysql_get_le(& mut r, 1);
+                    if neg == 1 {
+                        v = "-";
+                    }
+                    if days > 0 {
+                        v = v + int_to_str(days) + " ";
+                    }
+                    v = v + my_two(hh) + ":" + my_two(mi) + ":" + my_two(ss);
+                    if len >= 12 {
+                        mysql_get_le(& mut r, 4);
+                    }
+                }
+            } else {
+                v = mysql_get_lenenc_str(& mut r);
+            }
+            vals.push(v);
+            nulls.push(false);
+        }
+        i = i + 1;
+    }
+}
+
+// An IEEE single from its bits.
+fn my_f32(bits: i64) -> f64 {
+    val sign: i64 = (bits >> 31) & 1;
+    val ex: i64 = (bits >> 23) & 255;
+    val man: i64 = bits & 8388607;
+    var d: i64 = 0;
+    if ex == 0 {
+        if man == 0 {
+            d = sign << 63;
+            return p_f64_from_bits(d);
+        }
+        // subnormal: value = man * 2^-149
+        var f: f64 = man as f64;
+        var k: i64 = 0;
+        while k < 149 {
+            f = f / 2.0;
+            k = k + 1;
+        }
+        if sign == 1 {
+            return 0.0 - f;
+        }
+        return f;
+    }
+    var e64: i64 = ex - 127 + 1023;
+    if ex == 255 {
+        e64 = 2047;
+    }
+    d = (sign << 63) | (e64 << 52) | (man << 29);
+    return p_f64_from_bits(d);
+}
+
+// ─── Results ──────────────────────────────────────────────────────────────
+
+/// A command's result: an OK (affected rows, insert id), an error, or a
+/// resultset with columns and rows (vals[row * ncols + col]).
+pub struct MysqlResult {
+    pub ok: bool,
+    pub error_code: i64,
+    pub sql_state: str,
+    pub message: str,
+    pub affected_rows: i64,
+    pub last_insert_id: i64,
+    pub warnings: i64,
+    pub columns: Vec<MysqlColumn>,
+    pub nrows: i64,
+    pub vals: Vec<str>,
+    pub nulls: Vec<bool>,
+}
+
+fn my_result() -> MysqlResult {
+    return MysqlResult { ok: false, error_code: 0, sql_state: "", message: "", affected_rows: 0, last_insert_id: 0, warnings: 0, columns: Vec::new(), nrows: 0, vals: Vec::new(), nulls: Vec::new() };
+}
+
+pub fn mysql_cell(r: & MysqlResult, row: i64, col: i64) -> str {
+    return r.vals.get(row * r.columns.len() + col);
+}
+
+pub fn mysql_is_null(r: & MysqlResult, row: i64, col: i64) -> bool {
+    return r.nulls.get(row * r.columns.len() + col);
+}
+
+/// The column index of `name`, or -1.
+pub fn mysql_column_index(r: & MysqlResult, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < r.columns.len() {
+        if r.columns.get(i).name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Fill `res` from a status packet (OK or ERR).
+fn my_take_status(res: & mut MysqlResult, p: Vec<i64>) {
+    val s: MysqlStatus = mysql_parse_status(p);
+    if s.kind == "ERR" {
+        res.ok = false;
+        res.error_code = s.error_code;
+        res.sql_state = s.sql_state;
+        res.message = s.message;
+    } else {
+        res.ok = s.kind == "OK" || s.kind == "EOF";
+        res.affected_rows = s.affected_rows;
+        res.last_insert_id = s.last_insert_id;
+        res.warnings = s.warnings;
+        res.message = s.info;
+    }
+}
+
+/// Read a COM_QUERY or COM_STMT_EXECUTE answer from its payloads, in
+/// order. deprecate_eof: the session has CLIENT_DEPRECATE_EOF. binary:
+/// rows are in the binary protocol. Returns how many payloads it used
+/// (0 when the payloads stop before the answer is whole).
+pub fn mysql_read_result(payloads: Vec<Vec<i64>>, deprecate_eof: bool, binary: bool, res: & mut MysqlResult) -> i64 {
+    if payloads.len() == 0 {
+        return 0;
+    }
+    val first: Vec<i64> = payloads.get(0);
+    if first.len() > 0 && (first.get(0) == 0 || first.get(0) == 255) {
+        my_take_status(res, first);
+        return 1;
+    }
+    var r: MysqlReader = mysql_reader(first);
+    val ncols: i64 = mysql_get_lenenc(& mut r);
+    var at: i64 = 1;
+    var cols: Vec<MysqlColumn> = Vec::new();
+    while cols.len() < ncols {
+        if at >= payloads.len() {
+            return 0;
+        }
+        cols.push(mysql_parse_column(payloads.get(at)));
+        at = at + 1;
+    }
+    if !deprecate_eof {
+        if at >= payloads.len() {
+            return 0;
+        }
+        at = at + 1;
+    }
+    res.columns = cols;
+    while at < payloads.len() {
+        val p: Vec<i64> = payloads.get(at);
+        at = at + 1;
+        if p.len() > 0 && p.get(0) == 255 {
+            my_take_status(res, p);
+            return at;
+        }
+        if p.len() > 0 && p.get(0) == 254 && p.len() < 16777215 && (p.len() < 9 || deprecate_eof) {
+            my_take_status(res, p);
+            return at;
+        }
+        if binary {
+            mysql_parse_binary_row(p, cols, & mut res.vals, & mut res.nulls);
+        } else {
+            mysql_parse_text_row(p, ncols, & mut res.vals, & mut res.nulls);
+        }
+        res.nrows = res.nrows + 1;
+    }
+    return 0;
+}
+
+/// COM_STMT_PREPARE's answer: statement id, parameter count, columns.
+pub struct MysqlStmt {
+    pub ok: bool,
+    pub id: i64,
+    pub nparams: i64,
+    pub params: Vec<MysqlColumn>,
+    pub columns: Vec<MysqlColumn>,
+    pub warnings: i64,
+    pub error: str,
+}
+
+/// Read a COM_STMT_PREPARE answer from its payloads; used: payloads taken
+/// (0 when incomplete).
+pub fn mysql_read_prepare(payloads: Vec<Vec<i64>>, deprecate_eof: bool, used: & mut i64) -> MysqlStmt {
+    var s: MysqlStmt = MysqlStmt { ok: false, id: 0, nparams: 0, params: Vec::new(), columns: Vec::new(), warnings: 0, error: "" };
+    *used = 0;
+    if payloads.len() == 0 {
+        return s;
+    }
+    val first: Vec<i64> = payloads.get(0);
+    if first.len() > 0 && first.get(0) == 255 {
+        val st: MysqlStatus = mysql_parse_status(first);
+        s.error = int_to_str(st.error_code) + " (" + st.sql_state + "): " + st.message;
+        *used = 1;
+        return s;
+    }
+    var r: MysqlReader = mysql_reader(first);
+    mysql_get_le(& mut r, 1);
+    s.id = mysql_get_le(& mut r, 4);
+    val ncols: i64 = mysql_get_le(& mut r, 2);
+    s.nparams = mysql_get_le(& mut r, 2);
+    mysql_get_le(& mut r, 1);
+    s.warnings = mysql_get_le(& mut r, 2);
+    var at: i64 = 1;
+    var k: i64 = 0;
+    while k < s.nparams {
+        if at >= payloads.len() {
+            return s;
+        }
+        s.params.push(mysql_parse_column(payloads.get(at)));
+        at = at + 1;
+        k = k + 1;
+    }
+    if s.nparams > 0 && !deprecate_eof {
+        at = at + 1;
+    }
+    k = 0;
+    while k < ncols {
+        if at >= payloads.len() {
+            return s;
+        }
+        s.columns.push(mysql_parse_column(payloads.get(at)));
+        at = at + 1;
+        k = k + 1;
+    }
+    if ncols > 0 && !deprecate_eof {
+        at = at + 1;
+    }
+    if at > payloads.len() {
+        return s;
+    }
+    s.ok = true;
+    *used = at;
+    return s;
+}
+
+// ─── RSA password exchange (sha256_password, caching_sha2_password) ───────
+
+/// How a connection may send a password the server must see in full
+/// (sha256_password, and caching_sha2_password's full authentication):
+///   secure: the transport is already encrypted or local (TLS, a Unix
+///     socket): the password is sent as it is, NUL-terminated;
+///   server_public_key: the server's RSA public key in PEM ("PUBLIC KEY"
+///     or "RSA PUBLIC KEY"), "" when not configured (MySQL's
+///     --server-public-key-path);
+///   get_server_public_key: caching_sha2_password may ask the server for
+///     its key over the unencrypted connection (MySQL's
+///     --get-server-public-key; off by default, as there: a key fetched
+///     that way can be replaced by anyone on the path). sha256_password
+///     always asks when it has no key, as libmysqlclient does.
+pub struct MysqlAuthOpts {
+    pub secure: bool,
+    pub server_public_key: str,
+    pub get_server_public_key: bool,
+}
+
+/// The defaults: not secure, no key, do not ask for one.
+pub fn mysql_auth_opts() -> MysqlAuthOpts {
+    return MysqlAuthOpts { secure: false, server_public_key: "", get_server_public_key: false };
+}
+
+/// An RSA public key from PEM text: SubjectPublicKeyInfo ("PUBLIC KEY",
+/// what MySQL sends) or PKCS#1 ("RSA PUBLIC KEY"). ok false otherwise.
+pub fn mysql_rsa_key_from_pem(text: str) -> RsaPublicKey {
+    val blocks: Vec<PemBlock> = pem_decode_all(text);
+    var i: i64 = 0;
+    while i < blocks.len() {
+        val b: PemBlock = blocks.get(i);
+        if b.ok && b.label == "PUBLIC KEY" {
+            return rsa_public_from_spki(b.der);
+        }
+        if b.ok && b.label == "RSA PUBLIC KEY" {
+            return rsa_public_from_der(b.der);
+        }
+        i = i + 1;
+    }
+    var e: Vec<i64> = Vec::new();
+    return rsa_public_from_der(e);
+}
+
+/// The password, NUL-terminated, XORed with the nonce repeated (MySQL's
+/// xor_string over the 20-byte scramble).
+pub fn mysql_xor_password(password: str, nonce: Vec<i64>) -> Vec<i64> {
+    var b: Vec<i64> = str_bytes(password);
+    b.push(0);
+    if nonce.len() == 0 {
+        return b;
+    }
+    var i: i64 = 0;
+    while i < b.len() {
+        b.set(i, b.get(i) ^ nonce.get(i % nonce.len()));
+        i = i + 1;
+    }
+    return b;
+}
+
+/// The password as MySQL sends it to a server's RSA key: (password NUL)
+/// XOR nonce, encrypted with RSAES-OAEP (SHA-1, MGF1-SHA-1, empty label:
+/// OpenSSL's RSA_PKCS1_OAEP_PADDING). `seed` is 20 random bytes. Empty when
+/// the key is bad or the password too long for it (k - 42 bytes at most,
+/// the NUL included).
+pub fn mysql_rsa_encrypt_password(password: str, nonce: Vec<i64>, pk: RsaPublicKey, seed: Vec<i64>) -> Vec<i64> {
+    var e: Vec<i64> = Vec::new();
+    if !pk.ok {
+        return e;
+    }
+    val m: Vec<i64> = mysql_xor_password(password, nonce);
+    if m.len() + 41 >= pk.k {
+        return e;
+    }
+    var empty: Vec<i64> = Vec::new();
+    return rsa_oaep_encrypt(pk, KDF_SHA1, m, empty, seed);
+}
+
+/// The server side of the same exchange (for tests and servers): decrypt
+/// with the private key and undo the XOR. ok false when it fails.
+pub fn mysql_rsa_decrypt_password(sk: RsaPrivateKey, nonce: Vec<i64>, ct: Vec<i64>) -> RsaPlain {
+    var empty: Vec<i64> = Vec::new();
+    val p: RsaPlain = rsa_oaep_decrypt(sk, KDF_SHA1, ct, empty);
+    if !p.ok || p.data.len() == 0 {
+        return p;
+    }
+    var d: Vec<i64> = p.data;
+    var i: i64 = 0;
+    while i < d.len() {
+        if nonce.len() > 0 {
+            d.set(i, d.get(i) ^ nonce.get(i % nonce.len()));
+        }
+        i = i + 1;
+    }
+    if d.get(d.len() - 1) != 0 {
+        return RsaPlain { ok: false, data: Vec::new() };
+    }
+    d.pop();
+    return RsaPlain { ok: true, data: d };
+}
+
+// ─── Connection ───────────────────────────────────────────────────────────
+
+pub struct MysqlTransport {
+    pub conn: i64,
+    pub send: fn(i64, Vec<i64>) -> i64,
+    pub recv: fn(i64, i64) -> Vec<i64>,
+}
+
+pub fn mysql_tcp_transport(sock: i64) -> MysqlTransport {
+    return MysqlTransport { conn: sock, send: net_send_bytes, recv: net_recv_bytes };
+}
+
+/// A connection. `server_public_key` holds the PEM key the server sent
+/// (when one was asked for), so a caller can pin it for later connections.
+pub struct MysqlConn {
+    pub tr: MysqlTransport,
+    pub inbuf: Vec<i64>,
+    pub seq: i64,
+    pub ok: bool,
+    pub error: str,
+    pub caps: i64,
+    pub server_version: str,
+    pub connection_id: i64,
+    pub plugin: str,
+    pub server_public_key: str,
+    pub full_auth: bool,
+}
+
+fn my_send(c: & mut MysqlConn, payload: Vec<i64>) {
+    if !c.ok {
+        return;
+    }
+    val bytes: Vec<i64> = mysql_packets(payload, c.seq);
+    c.seq = (c.seq + 1 + payload.len() / MYSQL_MAX_PAYLOAD) & 255;
+    val send: fn(i64, Vec<i64>) -> i64 = c.tr.send;
+    if send(c.tr.conn, bytes) != bytes.len() {
+        c.ok = false;
+        c.error = "send failed";
+    }
+}
+
+// Start a command: the sequence restarts at 0.
+fn my_command(c: & mut MysqlConn, payload: Vec<i64>) {
+    c.seq = 0;
+    my_send(c, payload);
+}
+
+/// The next payload from the server (empty and c.ok false on error).
+pub fn mysql_next_payload(c: & mut MysqlConn) -> Vec<i64> {
+    while c.ok {
+        val p: MysqlPacket = mysql_read_packet(c.inbuf, 0);
+        if p.complete {
+            var rest: Vec<i64> = Vec::new();
+            var i: i64 = p.used;
+            while i < c.inbuf.len() {
+                rest.push(c.inbuf.get(i));
+                i = i + 1;
+            }
+            c.inbuf = rest;
+            c.seq = (p.seq + 1) & 255;
+            return p.payload;
+        }
+        val recv: fn(i64, i64) -> Vec<i64> = c.tr.recv;
+        val got: Vec<i64> = recv(c.tr.conn, 65536);
+        if got.len() == 0 {
+            c.ok = false;
+            c.error = "connection closed";
+        } else {
+            var j: i64 = 0;
+            while j < got.len() {
+                c.inbuf.push(got.get(j));
+                j = j + 1;
+            }
+        }
+    }
+    var e: Vec<i64> = Vec::new();
+    return e;
+}
+
+/// Connect: read the handshake, answer it, and follow the authentication
+/// exchange to its OK. c.ok false (c.error says why) on failure. With the
+/// default options a caching_sha2_password account that needs full
+/// authentication is refused (no TLS, no key): see mysql_connect_opts.
+pub fn mysql_connect(tr: MysqlTransport, user: str, password: str, database: str) -> MysqlConn {
+    return mysql_connect_opts(tr, user, password, database, mysql_auth_opts());
+}
+
+fn my_fail(c: & mut MysqlConn, msg: str) {
+    c.ok = false;
+    c.error = msg;
+}
+
+// Send the password for full authentication: in clear on a secure
+// transport, else encrypted to the server's key. Returns false (c.error
+// set) when there is no usable key.
+fn my_send_full_password(c: & mut MysqlConn, password: str, nonce: Vec<i64>, opts: & MysqlAuthOpts) -> bool {
+    if opts.secure {
+        var b: Vec<i64> = str_bytes(password);
+        b.push(0);
+        my_send(c, b);
+        return true;
+    }
+    val pk: RsaPublicKey = mysql_rsa_key_from_pem(c.server_public_key);
+    if !pk.ok {
+        my_fail(c, "the server's RSA public key cannot be read");
+        return false;
+    }
+    val ct: Vec<i64> = mysql_rsa_encrypt_password(password, nonce, pk, crypto_random_bytes(20));
+    if ct.len() == 0 {
+        my_fail(c, "the password is too long for the server's RSA key");
+        return false;
+    }
+    my_send(c, ct);
+    return true;
+}
+
+// The first auth data for a plugin. sha256_password: the clear password on
+// a secure transport, the encrypted one when the key is known, else the
+// public key request (0x01); an empty password is one NUL byte.
+fn my_first_auth(c: & mut MysqlConn, plugin: str, password: str, nonce: Vec<i64>, opts: & MysqlAuthOpts, awaiting_key: & mut bool) -> Vec<i64> {
+    *awaiting_key = false;
+    if plugin != "sha256_password" {
+        return mysql_scramble_for(plugin, password, nonce);
+    }
+    var b: Vec<i64> = Vec::new();
+    if str_len(password) == 0 || opts.secure {
+        b = str_bytes(password);
+        b.push(0);
+        return b;
+    }
+    val pk: RsaPublicKey = mysql_rsa_key_from_pem(c.server_public_key);
+    if pk.ok {
+        val ct: Vec<i64> = mysql_rsa_encrypt_password(password, nonce, pk, crypto_random_bytes(20));
+        if ct.len() > 0 {
+            return ct;
+        }
+    }
+    *awaiting_key = true;
+    b.push(1);
+    return b;
+}
+
+/// Connect with explicit options for the password exchanges that need TLS
+/// or the server's RSA key (sha256_password; caching_sha2_password's full
+/// authentication, which the server asks for when its cache has no entry
+/// for the account: AuthMoreData 0x01 0x04).
+pub fn mysql_connect_opts(tr: MysqlTransport, user: str, password: str, database: str, opts: MysqlAuthOpts) -> MysqlConn {
+    var c: MysqlConn = MysqlConn { tr: tr, inbuf: Vec::new(), seq: 0, ok: true, error: "", caps: 0, server_version: "", connection_id: 0, plugin: "", server_public_key: opts.server_public_key, full_auth: false };
+    val hp: Vec<i64> = mysql_next_payload(& mut c);
+    if !c.ok {
+        return c;
+    }
+    val h: MysqlHandshake = mysql_parse_handshake(hp);
+    if !h.ok {
+        my_fail(& mut c, h.error);
+        return c;
+    }
+    if (h.capabilities & MYSQL_CLIENT_PROTOCOL_41) == 0 {
+        my_fail(& mut c, "the server does not speak protocol 4.1");
+        return c;
+    }
+    c.server_version = h.server_version;
+    c.connection_id = h.connection_id;
+    c.caps = mysql_client_caps(h.capabilities, str_len(database) > 0);
+    c.plugin = h.plugin;
+    var awaiting_key: bool = false;
+    val first: Vec<i64> = my_first_auth(& mut c, h.plugin, password, h.nonce, & opts, & mut awaiting_key);
+    my_send(& mut c, mysql_handshake_response(c.caps, user, first, database, h.plugin));
+    var nonce: Vec<i64> = h.nonce;
+    var rounds: i64 = 0;
+    while c.ok && rounds < 8 {
+        val p: Vec<i64> = mysql_next_payload(& mut c);
+        if !c.ok {
+            return c;
+        }
+        rounds = rounds + 1;
+        if p.len() == 0 {
+            my_fail(& mut c, "empty authentication packet");
+            return c;
+        }
+        val h0: i64 = p.get(0);
+        if h0 == 0 {
+            return c;
+        }
+        if h0 == 255 {
+            val st: MysqlStatus = mysql_parse_status(p);
+            my_fail(& mut c, "access denied: " + int_to_str(st.error_code) + " (" + st.sql_state + "): " + st.message);
+            return c;
+        }
+        if h0 == 254 {
+            // AuthSwitchRequest: plugin name, then its nonce
+            var r: MysqlReader = mysql_reader(p);
+            r.pos = 1;
+            c.plugin = mysql_get_cstr(& mut r);
+            var nn: Vec<i64> = mysql_get_bytes(& mut r, r.b.len() - r.pos);
+            if nn.len() > 0 && nn.get(nn.len() - 1) == 0 {
+                nn.pop();
+            }
+            nonce = nn;
+            val again: Vec<i64> = my_first_auth(& mut c, c.plugin, password, nonce, & opts, & mut awaiting_key);
+            my_send(& mut c, again);
+        } else if h0 == 1 {
+            if awaiting_key {
+                // AuthMoreData carrying the server's public key (PEM)
+                awaiting_key = false;
+                var kb: Vec<i64> = Vec::new();
+                var i: i64 = 1;
+                while i < p.len() {
+                    kb.push(p.get(i));
+                    i = i + 1;
+                }
+                c.server_public_key = str_from_bytes(kb);
+                if !my_send_full_password(& mut c, password, nonce, & opts) {
+                    return c;
+                }
+            } else if c.plugin == "caching_sha2_password" && p.len() >= 2 && p.get(1) == 3 {
+                // fast auth succeeded: the OK follows
+            } else if c.plugin == "caching_sha2_password" && p.len() >= 2 && p.get(1) == 4 {
+                c.full_auth = true;
+                if opts.secure || mysql_rsa_key_from_pem(c.server_public_key).ok {
+                    if !my_send_full_password(& mut c, password, nonce, & opts) {
+                        return c;
+                    }
+                } else if opts.get_server_public_key {
+                    // request_public_key
+                    var rq: Vec<i64> = Vec::new();
+                    rq.push(2);
+                    my_send(& mut c, rq);
+                    awaiting_key = true;
+                } else {
+                    my_fail(& mut c, "caching_sha2_password needs full authentication (TLS or the server's RSA key), which this client does not do");
+                    return c;
+                }
+            } else {
+                my_fail(& mut c, "unexpected AuthMoreData");
+                return c;
+            }
+        } else {
+            my_fail(& mut c, "unexpected packet " + int_to_str(h0) + " during authentication");
+            return c;
+        }
+    }
+    if c.ok {
+        my_fail(& mut c, "authentication did not finish");
+    }
+    return c;
+}
+
+fn my_deprecate_eof(c: & MysqlConn) -> bool {
+    return (c.caps & MYSQL_CLIENT_DEPRECATE_EOF) != 0;
+}
+
+// Read payloads until a reader says the answer is whole.
+fn my_collect_result(c: & mut MysqlConn, binary: bool) -> MysqlResult {
+    var payloads: Vec<Vec<i64>> = Vec::new();
+    while c.ok {
+        payloads.push(mysql_next_payload(c));
+        if !c.ok {
+            break;
+        }
+        var res: MysqlResult = my_result();
+        if mysql_read_result(payloads, my_deprecate_eof(c), binary, & mut res) > 0 {
+            return res;
+        }
+    }
+    var e: MysqlResult = my_result();
+    e.message = c.error;
+    return e;
+}
+
+/// COM_QUERY: the OK, the error or the rows (text protocol).
+pub fn mysql_query(c: & mut MysqlConn, sql: str) -> MysqlResult {
+    my_command(c, mysql_com_query(sql));
+    return my_collect_result(c, false);
+}
+
+pub fn mysql_ping(c: & mut MysqlConn) -> bool {
+    my_command(c, mysql_com_ping());
+    val p: Vec<i64> = mysql_next_payload(c);
+    return c.ok && p.len() > 0 && p.get(0) == 0;
+}
+
+/// COM_STMT_PREPARE.
+pub fn mysql_prepare(c: & mut MysqlConn, sql: str) -> MysqlStmt {
+    my_command(c, mysql_com_stmt_prepare(sql));
+    var payloads: Vec<Vec<i64>> = Vec::new();
+    while c.ok {
+        payloads.push(mysql_next_payload(c));
+        if !c.ok {
+            break;
+        }
+        var used: i64 = 0;
+        val s: MysqlStmt = mysql_read_prepare(payloads, my_deprecate_eof(c), & mut used);
+        if used > 0 {
+            return s;
+        }
+    }
+    return MysqlStmt { ok: false, id: 0, nparams: 0, params: Vec::new(), columns: Vec::new(), warnings: 0, error: c.error };
+}
+
+/// COM_STMT_EXECUTE with parameters: the OK, error or rows (binary).
+pub fn mysql_execute(c: & mut MysqlConn, stmt: & MysqlStmt, params: Vec<MysqlParam>) -> MysqlResult {
+    if params.len() != stmt.nparams {
+        var e: MysqlResult = my_result();
+        e.message = "the statement takes " + int_to_str(stmt.nparams) + " parameters, got " + int_to_str(params.len());
+        return e;
+    }
+    my_command(c, mysql_com_stmt_execute(stmt.id, params));
+    return my_collect_result(c, true);
+}
+
+/// COM_STMT_CLOSE (the server sends no answer).
+pub fn mysql_close_stmt(c: & mut MysqlConn, stmt: & MysqlStmt) {
+    my_command(c, mysql_com_stmt_close(stmt.id));
+}
+
+pub fn mysql_close(c: & mut MysqlConn) {
+    my_command(c, mysql_com_quit());
+    c.ok = false;
+    c.error = "closed";
+}

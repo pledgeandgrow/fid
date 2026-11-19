@@ -1,0 +1,133 @@
+// stdlib/bootloader: signed images from a generated Ed25519 key, tamper and wrong-key rejection, A/B trial boots with rollback, confirm with anti-rollback counter, and the two-copy metadata.
+// Expected output:
+// header 1.1.0+42 counter 2 size 64 entry 0x10 load 0x08020000
+// img1 verify: true
+// payload flipped: payload CRC mismatch
+// version edited: bad signature
+// other key: bad signature
+// install: gen 0 min 0 [0:confirmed/0 1:pending/2]
+// boot 1: slot 1 trial true (trial boot of slot 1, 1 tries left)
+// boot 2: slot 1 trial true (trial boot of slot 1, 0 tries left)
+// boot 3: slot 0 trial false (boot confirmed slot 0)
+//   slot 1: trial boots used up without confirm, marked bad
+// after rollback: gen 3 min 0 [0:confirmed/0 1:bad/0]
+// boot 4: slot 1 trial true
+// confirmed: gen 5 min 2 [0:confirmed/0 1:confirmed/0]
+// boot 5: slot 1 trial false (boot confirmed slot 1)
+//   slot 0: security counter 1 < 2 (rollback)
+// final: gen 6 min 2 [0:bad/3 1:confirmed/0]
+// meta copies: pick 1 gen 6, next write goes to copy 0
+// copy 1 corrupted: pick 0 gen 5
+// neither valid: -1
+use bootloader;
+use ed25519;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn seed_of(k: i64) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 32 {
+        s.push((i * 29 + k) & 255);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn payload(tag: i64) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        p.push((i * 3 + tag) & 255);
+        i = i + 1;
+    }
+    return p;
+}
+
+fn hdr(major: i64, minor: i64, patch: i64, counter: i64) -> ImageHeader {
+    return ImageHeader { major: major, minor: minor, patch: patch, build: 42, counter: counter, size: 0, load_addr: 0x08020000, entry: 0x10, crc: 0, flags: 0 };
+}
+
+fn hex8(v: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    var out: str = "";
+    var i: i64 = 7;
+    while i >= 0 {
+        val n: i64 = (v >> (4 * i)) & 15;
+        out = out + str_slice(d, n, n + 1);
+        i = i - 1;
+    }
+    return "0x" + out;
+}
+
+fn show(label: str, d: BootDecision) {
+    println(label + ": slot " + int_to_str(d.slot) + " trial " + bs(d.trial) + " (" + d.reason + ")");
+    var i: i64 = 0;
+    while i < d.log.len() {
+        println("  " + d.log.get(i));
+        i = i + 1;
+    }
+}
+
+fn main() {
+    val seed: Vec<i64> = seed_of(5);
+    val pk: Vec<i64> = ed25519_public_key(seed);
+    val img1: Vec<i64> = bl_build_image(hdr(1, 0, 0, 1), payload(1), seed);
+    val img2: Vec<i64> = bl_build_image(hdr(1, 1, 0, 2), payload(2), seed);
+    val img3: Vec<i64> = bl_build_image(hdr(1, 0, 5, 1), payload(3), seed);
+    val h: ImageCheck = bl_parse_header(img2);
+    println("header " + bl_version_str(h.hdr) + " counter " + int_to_str(h.hdr.counter) + " size " + int_to_str(h.hdr.size)
+        + " entry 0x" + int_to_hex(h.hdr.entry) + " load " + hex8(h.hdr.load_addr));
+    println("img1 verify: " + bs(bl_verify_image(img1, pk).ok));
+    var t1: Vec<i64> = img1.clone();
+    t1.set(BL_HDR_SIZE + BL_SIG_SIZE + 5, t1.get(BL_HDR_SIZE + BL_SIG_SIZE + 5) ^ 1);
+    println("payload flipped: " + bl_verify_image(t1, pk).why);
+    var t2: Vec<i64> = img1.clone();
+    t2.set(9, 9);
+    println("version edited: " + bl_verify_image(t2, pk).why);
+    println("other key: " + bl_verify_image(img1, ed25519_public_key(seed_of(6))).why);
+
+    var m: BootMeta = bl_meta_new(2);
+    bl_install(&mut m, 0, img1, 0);
+    bl_install(&mut m, 1, img2, 2);
+    println("install: " + bl_meta_str(m));
+    var imgs: Vec<Vec<i64>> = Vec::new();
+    imgs.push(img1);
+    imgs.push(img2);
+    val d1: BootDecision = bl_decide(m, imgs, pk);
+    show("boot 1", d1);
+    val d2: BootDecision = bl_decide(d1.meta, imgs, pk);
+    show("boot 2", d2);
+    val d3: BootDecision = bl_decide(d2.meta, imgs, pk);
+    show("boot 3", d3);
+    println("after rollback: " + bl_meta_str(d3.meta));
+
+    var m4: BootMeta = d3.meta;
+    bl_install(&mut m4, 1, img2, 2);
+    val d4: BootDecision = bl_decide(m4, imgs, pk);
+    println("boot 4: slot " + int_to_str(d4.slot) + " trial " + bs(d4.trial));
+    var m5: BootMeta = bl_confirm(d4.meta, 1);
+    println("confirmed: " + bl_meta_str(m5));
+    bl_install(&mut m5, 0, img3, 3);
+    var imgs2: Vec<Vec<i64>> = Vec::new();
+    imgs2.push(img3);
+    imgs2.push(img2);
+    val d5: BootDecision = bl_decide(m5, imgs2, pk);
+    show("boot 5", d5);
+    println("final: " + bl_meta_str(d5.meta));
+
+    val c0: Vec<i64> = bl_meta_encode(m5);
+    var c1: Vec<i64> = bl_meta_encode(d5.meta);
+    val p1: MetaPick = bl_meta_pick(c0, c1);
+    println("meta copies: pick " + int_to_str(p1.which) + " gen " + int_to_str(p1.meta.generation) + ", next write goes to copy " + int_to_str(bl_meta_next_copy(p1)));
+    c1.set(20, c1.get(20) ^ 0x40);
+    val p2: MetaPick = bl_meta_pick(c0, c1);
+    println("copy 1 corrupted: pick " + int_to_str(p2.which) + " gen " + int_to_str(p2.meta.generation));
+    var e: Vec<i64> = Vec::new();
+    println("neither valid: " + int_to_str(bl_meta_pick(e, c1).which));
+}

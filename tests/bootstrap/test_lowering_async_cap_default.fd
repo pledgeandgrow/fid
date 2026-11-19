@@ -1,0 +1,51 @@
+// LG14: an async default method of a `cap`. An impl that does not write the
+// method gets the default body as an async method (parser: TraitMethod
+// is_async; compiler.fd fill_default_trait_methods), which the lowering
+// splits as it does a written one (lw_split_async_methods): a body function
+// run as a task and a method returning its future, so a call through `dyn`
+// gets a future from the default as from an override.
+// Expected output:
+// 11
+// 12
+// 15
+// 20
+use task;
+
+cap Source {
+    fn base(self) -> i64;
+    async fn fetch(self, k: i64) -> Future<i64> {
+        task_yield();
+        return self.base() + k;
+    }
+}
+
+struct Fixed { b: i64 }
+struct Other { b: i64 }
+
+impl Source for Fixed {
+    fn base(self) -> i64 {
+        return self.b;
+    }
+}
+
+impl Source for Other {
+    fn base(self) -> i64 {
+        return self.b * 2;
+    }
+    async fn fetch(self, k: i64) -> Future<i64> {
+        return self.b * k;
+    }
+}
+
+fn main() {
+    val a = Fixed { b: 10 };
+    val o = Other { b: 4 };
+    val fa = a.fetch(1);
+    val fo = o.fetch(3);
+    println(await fa);
+    println(await fo);
+    val d = a as dyn Source;
+    println(await d.fetch(5));
+    val e = o as dyn Source;
+    println(await e.fetch(5));
+}

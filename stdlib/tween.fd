@@ -1,0 +1,479 @@
+// Fides tween standard library
+//
+// Easing and tweening for games and UI animation. All of it is pure
+// computation (no platform seam):
+//   - every Robert Penner easing (quad, cubic, quart, quint, sine, expo,
+//     circ, back, elastic, bounce), each as in / out / in-out, plus linear,
+//     with the formulas of easings.net (f(0) = 0, f(1) = 1 for all of them);
+//   - a Tween over N components (one f64, a vec2, a vec3 or any length):
+//     delay, duration, easing, repeat count (-1: forever) and yoyo;
+//   - groups that play tweens in sequence or in parallel, with their own
+//     repeat and yoyo.
+//
+// A tween is a pure function of its local time (`tween_sample_at`), so it
+// can be scrubbed; `tween_update` advances it by dt and reports the frame
+// it finished on, exactly once.
+//
+// Usage:
+//   use tween;
+//   var tw: Tween = tween_f64(0.0, 100.0, 2.0, EASE_QUAD_OUT);
+//   tween_set_repeat(&mut tw, 1, true);       // there and back
+//   while !tween_update(&mut tw, 0.016) { draw(tween_value(&tw)); }
+
+module tween;
+use vec;
+use math;
+
+// ─── Easing kinds ─────────────────────────────────────────────────────────
+
+pub const EASE_LINEAR: i64 = 0;
+pub const EASE_QUAD_IN: i64 = 1;
+pub const EASE_QUAD_OUT: i64 = 2;
+pub const EASE_QUAD_INOUT: i64 = 3;
+pub const EASE_CUBIC_IN: i64 = 4;
+pub const EASE_CUBIC_OUT: i64 = 5;
+pub const EASE_CUBIC_INOUT: i64 = 6;
+pub const EASE_QUART_IN: i64 = 7;
+pub const EASE_QUART_OUT: i64 = 8;
+pub const EASE_QUART_INOUT: i64 = 9;
+pub const EASE_QUINT_IN: i64 = 10;
+pub const EASE_QUINT_OUT: i64 = 11;
+pub const EASE_QUINT_INOUT: i64 = 12;
+pub const EASE_SINE_IN: i64 = 13;
+pub const EASE_SINE_OUT: i64 = 14;
+pub const EASE_SINE_INOUT: i64 = 15;
+pub const EASE_EXPO_IN: i64 = 16;
+pub const EASE_EXPO_OUT: i64 = 17;
+pub const EASE_EXPO_INOUT: i64 = 18;
+pub const EASE_CIRC_IN: i64 = 19;
+pub const EASE_CIRC_OUT: i64 = 20;
+pub const EASE_CIRC_INOUT: i64 = 21;
+pub const EASE_BACK_IN: i64 = 22;
+pub const EASE_BACK_OUT: i64 = 23;
+pub const EASE_BACK_INOUT: i64 = 24;
+pub const EASE_ELASTIC_IN: i64 = 25;
+pub const EASE_ELASTIC_OUT: i64 = 26;
+pub const EASE_ELASTIC_INOUT: i64 = 27;
+pub const EASE_BOUNCE_IN: i64 = 28;
+pub const EASE_BOUNCE_OUT: i64 = 29;
+pub const EASE_BOUNCE_INOUT: i64 = 30;
+/// Number of easing kinds (0 .. EASE_COUNT - 1).
+pub const EASE_COUNT: i64 = 31;
+
+/// The name of an easing kind ("quad_in", ...), "linear" for 0.
+pub fn tween_ease_name(kind: i64) -> str {
+    if kind <= 0 || kind >= EASE_COUNT {
+        return "linear";
+    }
+    val fam: i64 = (kind - 1) / 3;
+    val dir: i64 = (kind - 1) % 3;
+    var f: str = "quad";
+    if fam == 1 { f = "cubic"; }
+    if fam == 2 { f = "quart"; }
+    if fam == 3 { f = "quint"; }
+    if fam == 4 { f = "sine"; }
+    if fam == 5 { f = "expo"; }
+    if fam == 6 { f = "circ"; }
+    if fam == 7 { f = "back"; }
+    if fam == 8 { f = "elastic"; }
+    if fam == 9 { f = "bounce"; }
+    if dir == 0 { return f + "_in"; }
+    if dir == 1 { return f + "_out"; }
+    return f + "_inout";
+}
+
+fn tw_powi(x: f64, n: i64) -> f64 {
+    var r: f64 = 1.0;
+    var i: i64 = 0;
+    while i < n {
+        r = r * x;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn tw_pow2(x: f64) -> f64 {
+    return math_pow(2.0, x);
+}
+
+fn tw_bounce_out(t0: f64) -> f64 {
+    val n1: f64 = 7.5625;
+    val d1: f64 = 2.75;
+    var t: f64 = t0;
+    if t < 1.0 / d1 {
+        return n1 * t * t;
+    }
+    if t < 2.0 / d1 {
+        t = t - 1.5 / d1;
+        return n1 * t * t + 0.75;
+    }
+    if t < 2.5 / d1 {
+        t = t - 2.25 / d1;
+        return n1 * t * t + 0.9375;
+    }
+    t = t - 2.625 / d1;
+    return n1 * t * t + 0.984375;
+}
+
+// in / out / in-out of t^n
+fn tw_poly(n: i64, dir: i64, t: f64) -> f64 {
+    if dir == 0 {
+        return tw_powi(t, n);
+    }
+    if dir == 1 {
+        return 1.0 - tw_powi(1.0 - t, n);
+    }
+    if t < 0.5 {
+        return tw_powi(2.0, n - 1) * tw_powi(t, n);
+    }
+    return 1.0 - tw_powi(- 2.0 * t + 2.0, n) / 2.0;
+}
+
+/// Ease `t` (0..1; clamped) with easing `kind`. The result may leave 0..1
+/// for back and elastic, which overshoot by design.
+pub fn tween_ease(kind: i64, t0: f64) -> f64 {
+    var t: f64 = t0;
+    if t < 0.0 { t = 0.0; }
+    if t > 1.0 { t = 1.0; }
+    if kind <= 0 || kind >= EASE_COUNT {
+        return t;
+    }
+    val fam: i64 = (kind - 1) / 3;
+    val dir: i64 = (kind - 1) % 3;
+    val pi: f64 = math_pi();
+    if fam <= 3 {
+        return tw_poly(fam + 2, dir, t);
+    }
+    if fam == 4 {
+        if dir == 0 { return 1.0 - math_cos(t * pi / 2.0); }
+        if dir == 1 { return math_sin(t * pi / 2.0); }
+        return - (math_cos(pi * t) - 1.0) / 2.0;
+    }
+    if fam == 5 {
+        if t == 0.0 { return 0.0; }
+        if t == 1.0 { return 1.0; }
+        if dir == 0 { return tw_pow2(10.0 * t - 10.0); }
+        if dir == 1 { return 1.0 - tw_pow2(- 10.0 * t); }
+        if t < 0.5 { return tw_pow2(20.0 * t - 10.0) / 2.0; }
+        return (2.0 - tw_pow2(- 20.0 * t + 10.0)) / 2.0;
+    }
+    if fam == 6 {
+        if dir == 0 { return 1.0 - math_sqrt(1.0 - t * t); }
+        if dir == 1 { return math_sqrt(1.0 - (t - 1.0) * (t - 1.0)); }
+        if t < 0.5 { return (1.0 - math_sqrt(1.0 - 4.0 * t * t)) / 2.0; }
+        val u: f64 = - 2.0 * t + 2.0;
+        return (math_sqrt(1.0 - u * u) + 1.0) / 2.0;
+    }
+    if fam == 7 {
+        val c1: f64 = 1.70158;
+        val c3: f64 = c1 + 1.0;
+        if dir == 0 { return c3 * t * t * t - c1 * t * t; }
+        if dir == 1 {
+            val u: f64 = t - 1.0;
+            return 1.0 + c3 * u * u * u + c1 * u * u;
+        }
+        val c2: f64 = c1 * 1.525;
+        if t < 0.5 {
+            val u: f64 = 2.0 * t;
+            return (u * u * ((c2 + 1.0) * u - c2)) / 2.0;
+        }
+        val u: f64 = 2.0 * t - 2.0;
+        return (u * u * ((c2 + 1.0) * u + c2) + 2.0) / 2.0;
+    }
+    if fam == 8 {
+        if t == 0.0 { return 0.0; }
+        if t == 1.0 { return 1.0; }
+        if dir == 0 {
+            val c4: f64 = 2.0 * pi / 3.0;
+            return - tw_pow2(10.0 * t - 10.0) * math_sin((t * 10.0 - 10.75) * c4);
+        }
+        if dir == 1 {
+            val c4: f64 = 2.0 * pi / 3.0;
+            return tw_pow2(- 10.0 * t) * math_sin((t * 10.0 - 0.75) * c4) + 1.0;
+        }
+        val c5: f64 = 2.0 * pi / 4.5;
+        if t < 0.5 {
+            return - (tw_pow2(20.0 * t - 10.0) * math_sin((20.0 * t - 11.125) * c5)) / 2.0;
+        }
+        return (tw_pow2(- 20.0 * t + 10.0) * math_sin((20.0 * t - 11.125) * c5)) / 2.0 + 1.0;
+    }
+    // bounce
+    if dir == 0 { return 1.0 - tw_bounce_out(1.0 - t); }
+    if dir == 1 { return tw_bounce_out(t); }
+    if t < 0.5 { return (1.0 - tw_bounce_out(1.0 - 2.0 * t)) / 2.0; }
+    return (1.0 + tw_bounce_out(2.0 * t - 1.0)) / 2.0;
+}
+
+/// Linear interpolation a + (b - a) * t.
+pub fn tween_lerp(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t;
+}
+
+// ─── Tween ────────────────────────────────────────────────────────────────
+
+/// A tween of `from.len()` components from `from` to `to`.
+pub struct Tween {
+    pub from: Vec<f64>,
+    pub to: Vec<f64>,
+    pub value: Vec<f64>,
+    // the current value, one per component
+    pub duration: f64,
+    pub delay: f64,
+    pub ease: i64,
+    pub repeat: i64,
+    // extra plays after the first; -1: forever
+    pub yoyo: bool,
+    // odd plays run backwards
+    pub time: f64,
+    // time since the tween was started (delay included)
+    pub done: bool,
+    pub progress: f64,  // eased progress of the current play, 0..1
+}
+
+/// A tween of `from` to `to` (same length) over `duration` seconds.
+pub fn tween_new(from: Vec<f64>, to: Vec<f64>, duration: f64, ease: i64) -> Tween {
+    var tw = Tween {
+        from: from, to: to, value: Vec::new(), duration: duration, delay: 0.0, ease: ease, repeat: 0, yoyo: false, time: 0.0, done: false, progress: 0.0,
+    };
+    var i: i64 = 0;
+    while i < tw.from.len() {
+        tw.value.push(tw.from.get(i));
+        i = i + 1;
+    }
+    return tw;
+}
+
+/// A one-component tween.
+pub fn tween_f64(from: f64, to: f64, duration: f64, ease: i64) -> Tween {
+    var a: Vec<f64> = Vec::new();
+    var b: Vec<f64> = Vec::new();
+    a.push(from);
+    b.push(to);
+    return tween_new(a, b, duration, ease);
+}
+
+/// A tween of a 2D vector.
+pub fn tween_vec2(from: vec2, to: vec2, duration: f64, ease: i64) -> Tween {
+    var a: Vec<f64> = Vec::new();
+    var b: Vec<f64> = Vec::new();
+    a.push(from.x);
+    a.push(from.y);
+    b.push(to.x);
+    b.push(to.y);
+    return tween_new(a, b, duration, ease);
+}
+
+/// A tween of a 3D vector.
+pub fn tween_vec3(from: vec3, to: vec3, duration: f64, ease: i64) -> Tween {
+    var a: Vec<f64> = Vec::new();
+    var b: Vec<f64> = Vec::new();
+    a.push(from.x);
+    a.push(from.y);
+    a.push(from.z);
+    b.push(to.x);
+    b.push(to.y);
+    b.push(to.z);
+    return tween_new(a, b, duration, ease);
+}
+
+/// Wait `delay` seconds before the first play.
+pub fn tween_set_delay(tw: &mut Tween, delay: f64) {
+    tw.delay = delay;
+}
+
+/// Play `repeat` more times after the first (-1: forever); with `yoyo`
+/// every second play runs from `to` back to `from`.
+pub fn tween_set_repeat(tw: &mut Tween, repeat: i64, yoyo: bool) {
+    tw.repeat = repeat;
+    tw.yoyo = yoyo;
+}
+
+/// Total length in seconds, delay included; -1.0 when it repeats forever.
+pub fn tween_total(tw: &Tween) -> f64 {
+    if tw.repeat < 0 {
+        return - 1.0;
+    }
+    return tw.delay + tw.duration * ((tw.repeat + 1) as f64);
+}
+
+/// The eased progress (0..1, beyond for back/elastic) at local time `t`.
+pub fn tween_progress_at(tw: &Tween, t: f64) -> f64 {
+    val local: f64 = t - tw.delay;
+    if local <= 0.0 {
+        return tween_ease(tw.ease, 0.0);
+    }
+    var frac: f64 = 1.0;
+    var cycle: i64 = 0;
+    if tw.duration <= 0.0 {
+        cycle = tw.repeat;
+        if cycle < 0 { cycle = 0; }
+    } else {
+        cycle = math_floor(local / tw.duration) as i64;
+        if tw.repeat >= 0 && cycle > tw.repeat {
+            cycle = tw.repeat;
+            frac = 1.0;
+        } else {
+            frac = (local - (cycle as f64) * tw.duration) / tw.duration;
+        }
+    }
+    if tw.yoyo && cycle % 2 == 1 {
+        frac = 1.0 - frac;
+    }
+    return tween_ease(tw.ease, frac);
+}
+
+/// Component `c` of the value at local time `t` (scrubbing: no state).
+pub fn tween_sample_at(tw: &Tween, c: i64, t: f64) -> f64 {
+    val p: f64 = tween_progress_at(tw, t);
+    return tween_lerp(tw.from.get(c), tw.to.get(c), p);
+}
+
+/// Move the tween to local time `t` and recompute its value.
+pub fn tween_seek(tw: &mut Tween, t: f64) {
+    tw.time = t;
+    tw.progress = tween_progress_at(tw, t);
+    var i: i64 = 0;
+    while i < tw.value.len() {
+        tw.value.set(i, tween_lerp(tw.from.get(i), tw.to.get(i), tw.progress));
+        i = i + 1;
+    }
+    val total: f64 = tween_total(tw);
+    tw.done = total >= 0.0 && t >= total;
+}
+
+/// Advance by `dt` seconds. True on the update that finishes the tween
+/// (only once; later updates return false).
+pub fn tween_update(tw: &mut Tween, dt: f64) -> bool {
+    if tw.done {
+        return false;
+    }
+    tween_seek(tw, tw.time + dt);
+    return tw.done;
+}
+
+/// Start again from time 0.
+pub fn tween_restart(tw: &mut Tween) {
+    tween_seek(tw, 0.0);
+}
+
+/// The first component of the current value.
+pub fn tween_value(tw: &Tween) -> f64 {
+    return tw.value.get(0);
+}
+
+/// The current value as a vec2 (components 0 and 1).
+pub fn tween_value2(tw: &Tween) -> vec2 {
+    return vec2(tw.value.get(0), tw.value.get(1));
+}
+
+/// The current value as a vec3 (components 0, 1 and 2).
+pub fn tween_value3(tw: &Tween) -> vec3 {
+    return vec3(tw.value.get(0), tw.value.get(1), tw.value.get(2));
+}
+
+// ─── Groups ───────────────────────────────────────────────────────────────
+
+pub const TWEEN_SEQUENCE: i64 = 0;
+pub const TWEEN_PARALLEL: i64 = 1;
+
+/// Tweens played one after the other (TWEEN_SEQUENCE) or all at once
+/// (TWEEN_PARALLEL). Each member tween's own delay/repeat/yoyo applies
+/// inside its slot; the group repeats and yoyos as a whole.
+pub struct TweenGroup {
+    pub mode: i64,
+    pub items: Vec<Tween>,
+    pub starts: Vec<f64>,
+    // start time of each item within one play of the group
+    pub length: f64,
+    // length of one play
+    pub repeat: i64,
+    pub yoyo: bool,
+    pub time: f64,
+    pub done: bool,
+}
+
+pub fn tween_group_new(mode: i64) -> TweenGroup {
+    return TweenGroup {
+        mode: mode, items: Vec::new(), starts: Vec::new(), length: 0.0, repeat: 0, yoyo: false, time: 0.0, done: false,
+    };
+}
+
+/// Add a tween (it must not repeat forever). Returns its index.
+pub fn tween_group_add(g: &mut TweenGroup, tw: Tween) -> i64 {
+    var len: f64 = tween_total(&tw);
+    if len < 0.0 {
+        len = tw.delay + tw.duration;
+    }
+    if g.mode == TWEEN_SEQUENCE {
+        g.starts.push(g.length);
+        g.length = g.length + len;
+    } else {
+        g.starts.push(0.0);
+        if len > g.length {
+            g.length = len;
+        }
+    }
+    g.items.push(tw);
+    return g.items.len() - 1;
+}
+
+pub fn tween_group_set_repeat(g: &mut TweenGroup, repeat: i64, yoyo: bool) {
+    g.repeat = repeat;
+    g.yoyo = yoyo;
+}
+
+/// Total length of the group; -1.0 when it repeats forever.
+pub fn tween_group_total(g: &TweenGroup) -> f64 {
+    if g.repeat < 0 {
+        return - 1.0;
+    }
+    return g.length * ((g.repeat + 1) as f64);
+}
+
+/// Time within one play of the group at group time `t` (repeat and yoyo).
+pub fn tween_group_local(g: &TweenGroup, t: f64) -> f64 {
+    if t <= 0.0 || g.length <= 0.0 {
+        return 0.0;
+    }
+    var cycle: i64 = math_floor(t / g.length) as i64;
+    var local: f64 = 0.0;
+    if g.repeat >= 0 && cycle > g.repeat {
+        cycle = g.repeat;
+        local = g.length;
+    } else {
+        local = t - (cycle as f64) * g.length;
+    }
+    if g.yoyo && cycle % 2 == 1 {
+        local = g.length - local;
+    }
+    return local;
+}
+
+/// Move the group to time `t`: every item is set from its own local time.
+pub fn tween_group_seek(g: &mut TweenGroup, t: f64) {
+    g.time = t;
+    val local: f64 = tween_group_local(g, t);
+    var i: i64 = 0;
+    while i < g.items.len() {
+        var tw: Tween = g.items.get(i);
+        tween_seek(&mut tw, local - g.starts.get(i));
+        g.items.set(i, tw);
+        i = i + 1;
+    }
+    val total: f64 = tween_group_total(g);
+    g.done = total >= 0.0 && t >= total;
+}
+
+/// Advance by dt; true on the update that finishes the group (once).
+pub fn tween_group_update(g: &mut TweenGroup, dt: f64) -> bool {
+    if g.done {
+        return false;
+    }
+    tween_group_seek(g, g.time + dt);
+    return g.done;
+}
+
+/// Component `c` of item `i`'s current value.
+pub fn tween_group_value(g: &TweenGroup, i: i64, c: i64) -> f64 {
+    return g.items.get(i).value.get(c);
+}

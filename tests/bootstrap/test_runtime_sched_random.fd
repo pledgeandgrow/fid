@@ -1,0 +1,47 @@
+// Tasks whose result does not depend on the order they run in (roadmap
+// RL17). The suite runs it with the normal scheduler; the same program
+// built natively and run with FIDES_SCHED_RANDOM=<seed> (one worker, the
+// next task picked at random, random preemption at loop safepoints, random
+// sleeps at atomics) must print the same, for every seed:
+//   python scripts/verify/interleave.py --sched-random --backends emit
+//       --programs tests/bootstrap/test_runtime_sched_random.fd
+// The interpreter runs a task to its end when it starts: one order only.
+//
+// Expected output:
+// tasks: 8
+// atomic total: 8000
+// sum of results: 36
+use task;
+use sync;
+
+var g_cell: i64 = 0;
+
+fn worker(k: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 1000 {
+        sync_atomic_add(g_cell, 1);
+        if i % 100 == 0 {
+            task_yield();
+        }
+        i = i + 1;
+    }
+    return k + 1;
+}
+
+fn main() -> i64 {
+    g_cell = sync_atomic_alloc(0);
+    var ts: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 8 {
+        ts.push(task_go("worker", k));
+        k = k + 1;
+    }
+    println("tasks: " + int_to_str(task_run()));
+    println("atomic total: " + int_to_str(sync_atomic_load(g_cell)));
+    var sum: i64 = 0;
+    for t in ts {
+        sum = sum + task_result(t);
+    }
+    println("sum of results: " + int_to_str(sum));
+    return 0;
+}

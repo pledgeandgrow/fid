@@ -1,0 +1,88 @@
+// SP16 (llvm-roadmap): the machine layer (compiler/nat_ir.fd
+// ng_zero_words_inline) clears a dropped owning struct variable with word
+// stores instead of a call to core's p_zero_words when the word count is a
+// constant (FID_NAT_OFF=zerowords keeps the call). Each struct below is
+// dropped and rebuilt in a loop, overwritten, moved into a Vec and read
+// back: a wrong store (an offset, a count, the wrong base) shows up as a
+// wrong field, a double free or a leak. tests/nattools/machine_zero_words_check.sh
+// also checks that the call is gone from main's machine IR.
+//
+// Expected output:
+// round 0: a0 1 b0 2
+// round 1: a1 2 b1 3
+// round 2: a2 3 b2 4
+// big: 16 words, sum 136, tag t9
+// kept: 5 items, total 30
+// last: k4 4
+// done
+
+struct Pair {
+    a: str,
+    n: i64,
+}
+
+struct Two {
+    first: Pair,
+    second: Pair,
+}
+
+struct Big {
+    w1: i64,
+    w2: i64,
+    w3: i64,
+    w4: i64,
+    w5: i64,
+    w6: i64,
+    w7: i64,
+    w8: i64,
+    w9: i64,
+    w10: i64,
+    w11: i64,
+    w12: i64,
+    w13: i64,
+    w14: i64,
+    w15: i64,
+    tag: str,
+}
+
+fn mk_two(i: i64) -> Two {
+    return Two { first: Pair { a: "a" + int_to_str(i), n: i + 1 }, second: Pair { a: "b" + int_to_str(i), n: i + 2 } };
+}
+
+fn mk_big(k: i64) -> Big {
+    return Big { w1: 1, w2: 2, w3: 3, w4: 4, w5: 5, w6: 6, w7: 7, w8: 8, w9: 9, w10: 10, w11: 11, w12: 12, w13: 13, w14: 14, w15: 15, tag: "t" + int_to_str(k) };
+}
+
+fn big_sum(b: & Big) -> i64 {
+    return b.w1 + b.w2 + b.w3 + b.w4 + b.w5 + b.w6 + b.w7 + b.w8 + b.w9 + b.w10 + b.w11 + b.w12 + b.w13 + b.w14 + b.w15;
+}
+
+fn main() -> i64 {
+    var i: i64 = 0;
+    while i < 3 {
+        var t: Two = mk_two(i);
+        println("round " + int_to_str(i) + ": " + t.first.a + " " + int_to_str(t.first.n) + " " + t.second.a + " " + int_to_str(t.second.n));
+        i = i + 1;
+    }
+    var b: Big = mk_big(0);
+    var k: i64 = 1;
+    while k < 10 {
+        b = mk_big(k);
+        k = k + 1;
+    }
+    println("big: 16 words, sum " + int_to_str(big_sum(& b) + 16) + ", tag " + b.tag);
+    var kept: Vec<Pair> = Vec::new();
+    var j: i64 = 0;
+    var total: i64 = 0;
+    while j < 5 {
+        var p: Pair = Pair { a: "k" + int_to_str(j), n: j };
+        total = total + p.n * 3;
+        kept.push(p);
+        j = j + 1;
+    }
+    println("kept: " + int_to_str(kept.len()) + " items, total " + int_to_str(total));
+    val last: Pair = kept.get(4);
+    println("last: " + last.a + " " + int_to_str(last.n));
+    println("done");
+    return 0;
+}

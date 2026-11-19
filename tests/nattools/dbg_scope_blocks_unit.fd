@@ -1,0 +1,164 @@
+// DB4 (docs/roadmap/llvm-roadmap.md): how a function's lexical scopes
+// are made (compiler/nat_ir.fd ng_dbg_scope_blocks through its unit hook
+// nat_dbg_scope_unit, and compiler/nat_enc.fd nat_dbg_scope_end). Tabs of
+// the text are printed as spaces.
+//   1. `shadow`: an outer `x` over lines 23-32 and an inner one over
+//      26-27; its rows put line 29 (a cold panic path) after the end of
+//      the hot code and a row of another file (inlined code) at 48, which
+//      counts as the line before it. Outer x: code [0, 52) and [70, 80);
+//      inner x: [20, 36), inside the first.
+//   2. Intervals 10-20 and 15-25 overlap: the first is widened to 25 and
+//      holds the second; `c` (lines 50-60) has no code and stays a
+//      variable of the whole function, its seventh field dropped.
+//   3. No scoped variable: the text comes back as it was.
+//   4. nat_dbg_scope_end on tests/bootstrap/test_machine_dbg_scopes.fd and
+//      on this file: the `}` closing a declaration's block, past braces in
+//      strings (one after an escaped quote) and comments.
+// Run (from the repository root):
+//   fid run tests/nattools/dbg_scope_blocks_unit.fd
+// Expected output:
+// P n i64 8 5 r5
+// V total i64 8 5 f-24
+// B 1 0 0 52
+// B 2 1 20 36
+// B 3 0 70 80
+// V x i64 8 5 r3@8:60 1
+// V x i64 8 5 r3@8:60 3
+// V x i64 8 5 r4@20:44 2
+// --
+// V c i64 8 5 r3
+// B 1 0 0 40
+// B 2 1 10 40
+// V a i64 8 5 r1 1
+// V b i64 8 5 r2 2
+// --
+// P n i64 8 5 r5
+// V t i64 8 5 f-8
+// --
+// end outer x ok
+// end inner x ok
+// end first e ok
+// end second e ok
+// end fixture true
+// end unreadable 0
+// { not a block }
+
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn show(s: str) {
+    var lines: Vec<str> = str_split(s, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        println(str_replace(lines.get(i), "\t", " "));
+        i = i + 1;
+    }
+}
+
+fn row(rows: & mut Vec<i64>, off: i64, line: i64, word: i64) {
+    rows.push(off);
+    rows.push(line);
+    rows.push(word);
+}
+
+// A declaration whose block holds braces in strings (one after an
+// escaped quote) and in a comment (part 4)
+fn braces_fixture(n: i64) -> str {
+    var s: str = "{ not a block }"; // a } in a comment
+    var c: str = "'{' \" }";
+    if n > str_len(c) {
+        s = s + "}";
+    }
+    return s;
+}
+
+fn line_of(path: str, needle: str) -> i64 {
+    match read_file(path) {
+        Option::Some(t) => {
+            var lines: Vec<str> = str_split(t, "\n");
+            var i: i64 = 0;
+            while i < lines.len() {
+                if str_contains(lines.get(i), needle) {
+                    return i + 1;
+                }
+                i = i + 1;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return 0;
+}
+
+// The scope of the declaration on the line holding `decl` in `path` ends
+// on line `want`
+fn scope_end_is(path: str, what: str, decl: str, want: i64) {
+    var l: i64 = line_of(path, decl);
+    var got: i64 = nat_dbg_scope_end(path, l);
+    if l > 0 && got == want {
+        println("end " + what + " ok");
+    } else {
+        println("end " + what + " at " + int_to_str(got) + ", want " + int_to_str(want) + " (declared at " + int_to_str(l) + ")");
+    }
+}
+
+fn main() {
+    // 1
+    var rows: Vec<i64> = Vec::new();
+    row(& mut rows, 0, 23, 0);
+    row(& mut rows, 8, 24, 0);
+    row(& mut rows, 12, 25, 0);
+    row(& mut rows, 20, 26, 0);
+    row(& mut rows, 28, 27, 0);
+    row(& mut rows, 36, 28, 0);
+    row(& mut rows, 44, 32, 0);
+    row(& mut rows, 48, 7, 10);
+    row(& mut rows, 52, 33, 0);
+    row(& mut rows, 60, 36, 0);
+    row(& mut rows, 70, 29, 0);
+    row(& mut rows, 80, 34, 0);
+    var lines: Vec<str> = Vec::new();
+    lines.push("P\tn\ti64\t8\t5\tr5");
+    lines.push("V\tx\ti64\t8\t5\tr3@8:60\tL23:32");
+    lines.push("V\ttotal\ti64\t8\t5\tf-24");
+    lines.push("V\tx\ti64\t8\t5\tr4@20:44\tL26:27");
+    show(nat_dbg_scope_unit("shadow", 0, 90, rows, lines));
+    println("--");
+    // 2: the function at [100, 160) of its buffer, a close row at 150
+    var rows2: Vec<i64> = Vec::new();
+    row(& mut rows2, 100, 10, 0);
+    row(& mut rows2, 110, 15, 0);
+    row(& mut rows2, 120, 21, 0);
+    row(& mut rows2, 130, 25, 0);
+    row(& mut rows2, 140, 26, 0);
+    row(& mut rows2, 150, 0, 1);
+    var lines2: Vec<str> = Vec::new();
+    lines2.push("V\ta\ti64\t8\t5\tr1\tL10:20");
+    lines2.push("V\tb\ti64\t8\t5\tr2\tL15:25");
+    lines2.push("V\tc\ti64\t8\t5\tr3\tL50:60");
+    show(nat_dbg_scope_unit("overlap", 100, 160, rows2, lines2));
+    println("--");
+    // 3
+    var rows3: Vec<i64> = Vec::new();
+    row(& mut rows3, 0, 5, 0);
+    var lines3: Vec<str> = Vec::new();
+    lines3.push("P\tn\ti64\t8\t5\tr5");
+    lines3.push("V\tt\ti64\t8\t5\tf-8");
+    show(nat_dbg_scope_unit("plain", 0, 16, rows3, lines3));
+    println("--");
+    // 4
+    var t: str = "tests/bootstrap/test_machine_dbg_scopes.fd";
+    scope_end_is(t, "outer x", "var x: i64 = n + 1;", line_of(t, "    return total;") + 1);
+    scope_end_is(t, "inner x", "var x: i64 = n * 10;", line_of(t, "total = total + x; // @outer") - 1);
+    scope_end_is(t, "first e", "var e: i64 = i * 2;", line_of(t, "var j: i64 = 0;") - 1);
+    scope_end_is(t, "second e", "var e: i64 = j * 3 + 1;", line_of(t, "    return sum;") - 1);
+    var me: str = "tests/nattools/dbg_scope_blocks_unit.fd";
+    var decl: i64 = line_of(me, "var s: str = \"{ not a block");
+    var close: i64 = line_of(me, "    return s;") + 1;
+    println("end fixture " + bool_to_str(decl > 0 && nat_dbg_scope_end(me, decl) == close));
+    println("end unreadable " + int_to_str(nat_dbg_scope_end("tests/nattools/no_such_file.fd", 3)));
+    println(braces_fixture(0));
+}

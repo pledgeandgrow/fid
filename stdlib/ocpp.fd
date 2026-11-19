@@ -1,0 +1,357 @@
+// Fides OCPP-J standard library (OCPP 1.6 and 2.0.1 JSON over WebSocket)
+//
+// OCPP is the protocol between an EV charge point and a central system. The
+// JSON variant (OCPP-J) sends each message as a JSON array over a WebSocket.
+// Everything here is pure computation on JSON strings (module `json`):
+//
+// Real (implemented and tested):
+//   - Message framing: CALL [2, uniqueId, action, payload], CALLRESULT
+//     [3, uniqueId, payload] and CALLERROR [4, uniqueId, errorCode,
+//     errorDescription, errorDetails]. Build each, and parse any frame into
+//     its parts (ocpp_build_call / _result / _error, ocpp_parse).
+//   - Unique-id generation (a monotonic counter formatted as a string) and
+//     matching a CALLRESULT/CALLERROR back to the CALL that is still open.
+//   - Payload builders and readers for the common 1.6 messages:
+//     BootNotification, Heartbeat, Authorize, StartTransaction,
+//     StopTransaction, MeterValues, StatusNotification, RemoteStart
+//     Transaction, RemoteStopTransaction; and the 2.0.1 TransactionEvent.
+//   - A charge-point state machine over the connector states Available,
+//     Preparing, Charging, SuspendedEV, Finishing and Faulted, driven by the
+//     events plug-in, authorize, start, stop, unplug and fault
+//     (ChargePoint / cp_step).
+//   - A small central-system handler that answers BootNotification (accepts
+//     with an interval), Heartbeat (returns a timestamp), Authorize (accepts
+//     a known id tag) and StartTransaction (hands out a transaction id).
+//
+// The seam: no WebSocket. A frame is a JSON string; send it with module `ws`
+// (ws_send_text) and feed received text back through ocpp_parse. Timestamps
+// are passed in as ISO-8601 strings, not read from a clock here.
+
+module ocpp;
+ use vec; use string; use json;
+
+// Message type ids
+pub const OCPP_CALL: i64 = 2;
+pub const OCPP_CALLRESULT: i64 = 3;
+pub const OCPP_CALLERROR: i64 = 4;
+
+// Connector / charge point states (OCPP 1.6 StatusNotification)
+pub const CP_AVAILABLE: i64 = 0;
+pub const CP_PREPARING: i64 = 1;
+pub const CP_CHARGING: i64 = 2;
+pub const CP_SUSPENDED_EV: i64 = 3;
+pub const CP_FINISHING: i64 = 4;
+pub const CP_FAULTED: i64 = 5;
+
+// Charge-point events
+pub const EV_PLUG_IN: i64 = 0;
+pub const EV_AUTHORIZE: i64 = 1;
+pub const EV_START: i64 = 2;
+pub const EV_SUSPEND: i64 = 3;
+pub const EV_RESUME: i64 = 4;
+pub const EV_STOP: i64 = 5;
+pub const EV_UNPLUG: i64 = 6;
+pub const EV_FAULT: i64 = 7;
+pub const EV_FAULT_CLEAR: i64 = 8;
+
+pub fn ocpp_state_name(s: i64) -> str {
+    if s == CP_AVAILABLE { return "Available"; }
+    if s == CP_PREPARING { return "Preparing"; }
+    if s == CP_CHARGING { return "Charging"; }
+    if s == CP_SUSPENDED_EV { return "SuspendedEV"; }
+    if s == CP_FINISHING { return "Finishing"; }
+    if s == CP_FAULTED { return "Faulted"; }
+    return "Unknown";
+}
+
+// ─── Message framing ─────────────────────────────────────────────────────
+
+/// Build a CALL frame: [2, "<uniqueId>", "<action>", <payload JSON>].
+pub fn ocpp_build_call(unique_id: str, action: str, payload_json: str) -> str {
+    return "[" + int_to_str(OCPP_CALL) + "," + json_string(unique_id) + "," + json_string(action) + "," + payload_json + "]";
+}
+
+/// Build a CALLRESULT frame: [3, "<uniqueId>", <payload JSON>].
+pub fn ocpp_build_result(unique_id: str, payload_json: str) -> str {
+    return "[" + int_to_str(OCPP_CALLRESULT) + "," + json_string(unique_id) + "," + payload_json + "]";
+}
+
+/// Build a CALLERROR frame: [4, "<uniqueId>", "<code>", "<desc>", {details}].
+pub fn ocpp_build_error(unique_id: str, code: str, description: str, details_json: str) -> str {
+    return "[" + int_to_str(OCPP_CALLERROR) + "," + json_string(unique_id) + "," + json_string(code) + "," + json_string(description) + "," + details_json + "]";
+}
+
+/// A parsed OCPP frame.
+pub struct OcppFrame {
+    pub ok: bool,
+    pub msg_type: i64,
+    pub unique_id: str,
+    pub action: str,       // CALL only
+    pub payload: str,      // CALL / CALLRESULT payload JSON
+    pub error_code: str,   // CALLERROR
+    pub error_desc: str,   // CALLERROR
+}
+
+/// Parse any OCPP-J frame.
+pub fn ocpp_parse(frame: str) -> OcppFrame {
+    if !str_equal(json_type_safe(frame), "array") {
+        return ocpp_bad();
+    }
+    val mt: i64 = json_at_int(frame, 0, -1);
+    val uid: str = json_unescape(json_at(frame, 1));
+    if mt == OCPP_CALL {
+        return OcppFrame {
+            ok: true, msg_type: mt, unique_id: uid,
+            action: json_unescape(json_at(frame, 2)),
+            payload: json_at(frame, 3),
+            error_code: "", error_desc: "",
+        };
+    } else if mt == OCPP_CALLRESULT {
+        return OcppFrame {
+            ok: true, msg_type: mt, unique_id: uid,
+            action: "", payload: json_at(frame, 2),
+            error_code: "", error_desc: "",
+        };
+    } else if mt == OCPP_CALLERROR {
+        return OcppFrame {
+            ok: true, msg_type: mt, unique_id: uid,
+            action: "", payload: json_at_safe(frame, 4),
+            error_code: json_unescape(json_at(frame, 2)),
+            error_desc: json_unescape(json_at(frame, 3)),
+        };
+    }
+    return ocpp_bad();
+}
+
+fn ocpp_bad() -> OcppFrame {
+    return OcppFrame { ok: false, msg_type: 0, unique_id: "", action: "", payload: "", error_code: "", error_desc: "" };
+}
+
+// ─── Unique ids + pending CALL tracking ──────────────────────────────────
+
+/// A client that hands out unique ids and remembers open CALLs so a result
+/// can be matched to its action.
+pub struct OcppClient {
+    pub next_id: i64,
+    pub pend_ids: Vec<str>,
+    pub pend_actions: Vec<str>,
+}
+
+pub fn ocpp_client_new() -> OcppClient {
+    return OcppClient { next_id: 1, pend_ids: Vec::new(), pend_actions: Vec::new() };
+}
+
+/// Produce the next unique id and remember a CALL of `action`; returns the
+/// full CALL frame.
+pub fn ocpp_client_call(c: & mut OcppClient, action: str, payload_json: str) -> str {
+    val uid: str = int_to_str(c.next_id);
+    c.next_id = c.next_id + 1;
+    c.pend_ids.push(uid);
+    c.pend_actions.push(action);
+    return ocpp_build_call(uid, action, payload_json);
+}
+
+/// Given a received result/error frame, return the action of the CALL it
+/// answers (and forget that CALL); "" if none is open for its id.
+pub fn ocpp_client_match(c: & mut OcppClient, frame: str) -> str {
+    val f: OcppFrame = ocpp_parse(frame);
+    if !f.ok { return ""; }
+    var i: i64 = 0;
+    while i < c.pend_ids.len() {
+        if str_equal(c.pend_ids.get(i), f.unique_id) {
+            val action: str = c.pend_actions.get(i);
+            c.pend_ids.remove(i);
+            c.pend_actions.remove(i);
+            return action;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn ocpp_client_pending(c: & OcppClient) -> i64 {
+    return c.pend_ids.len();
+}
+
+// ─── Payload builders (OCPP 1.6) ─────────────────────────────────────────
+
+/// BootNotification request payload.
+pub fn ocpp_boot_notification(vendor: str, model: str) -> str {
+    return "{" + json_string("chargePointVendor") + ":" + json_string(vendor) + "," + json_string("chargePointModel") + ":" + json_string(model) + "}";
+}
+
+/// BootNotification confirmation payload.
+pub fn ocpp_boot_conf(status: str, current_time: str, interval: i64) -> str {
+    return "{" + json_string("status") + ":" + json_string(status) + "," + json_string("currentTime") + ":" + json_string(current_time) + "," + json_string("interval") + ":" + int_to_str(interval) + "}";
+}
+
+/// Heartbeat confirmation payload (just currentTime).
+pub fn ocpp_heartbeat_conf(current_time: str) -> str {
+    return "{" + json_string("currentTime") + ":" + json_string(current_time) + "}";
+}
+
+/// Authorize request payload.
+pub fn ocpp_authorize(id_tag: str) -> str {
+    return "{" + json_string("idTag") + ":" + json_string(id_tag) + "}";
+}
+
+/// idTagInfo + Authorize/StartTransaction confirmation with a status.
+pub fn ocpp_id_tag_info(status: str) -> str {
+    return "{" + json_string("idTagInfo") + ":{" + json_string("status") + ":" + json_string(status) + "}}";
+}
+
+/// StartTransaction request payload.
+pub fn ocpp_start_transaction(connector_id: i64, id_tag: str, meter_start: i64, timestamp: str) -> str {
+    return "{" + json_string("connectorId") + ":" + int_to_str(connector_id) + "," + json_string("idTag") + ":" + json_string(id_tag) + "," + json_string("meterStart") + ":" + int_to_str(meter_start) + "," + json_string("timestamp") + ":" + json_string(timestamp) + "}";
+}
+
+/// StartTransaction confirmation (transactionId + idTagInfo status).
+pub fn ocpp_start_conf(transaction_id: i64, status: str) -> str {
+    return "{" + json_string("transactionId") + ":" + int_to_str(transaction_id) + "," + json_string("idTagInfo") + ":{" + json_string("status") + ":" + json_string(status) + "}}";
+}
+
+/// StopTransaction request payload.
+pub fn ocpp_stop_transaction(transaction_id: i64, meter_stop: i64, timestamp: str, reason: str) -> str {
+    return "{" + json_string("transactionId") + ":" + int_to_str(transaction_id) + "," + json_string("meterStop") + ":" + int_to_str(meter_stop) + "," + json_string("timestamp") + ":" + json_string(timestamp) + "," + json_string("reason") + ":" + json_string(reason) + "}";
+}
+
+/// StatusNotification request payload (connector, status name, error code).
+pub fn ocpp_status_notification(connector_id: i64, status: str, error_code: str) -> str {
+    return "{" + json_string("connectorId") + ":" + int_to_str(connector_id) + "," + json_string("status") + ":" + json_string(status) + "," + json_string("errorCode") + ":" + json_string(error_code) + "}";
+}
+
+/// MeterValues request payload: one sampled value (energy in Wh).
+pub fn ocpp_meter_values(connector_id: i64, transaction_id: i64, timestamp: str, energy_wh: i64) -> str {
+    val sampled: str = "{" + json_string("value") + ":" + json_string(int_to_str(energy_wh)) + "," + json_string("measurand") + ":" + json_string("Energy.Active.Import.Register") + "," + json_string("unit") + ":" + json_string("Wh") + "}";
+    val mv: str = "{" + json_string("timestamp") + ":" + json_string(timestamp) + "," + json_string("sampledValue") + ":[" + sampled + "]}";
+    return "{" + json_string("connectorId") + ":" + int_to_str(connector_id) + "," + json_string("transactionId") + ":" + int_to_str(transaction_id) + "," + json_string("meterValue") + ":[" + mv + "]}";
+}
+
+/// RemoteStartTransaction request payload.
+pub fn ocpp_remote_start(id_tag: str, connector_id: i64) -> str {
+    return "{" + json_string("idTag") + ":" + json_string(id_tag) + "," + json_string("connectorId") + ":" + int_to_str(connector_id) + "}";
+}
+
+/// RemoteStopTransaction request payload.
+pub fn ocpp_remote_stop(transaction_id: i64) -> str {
+    return "{" + json_string("transactionId") + ":" + int_to_str(transaction_id) + "}";
+}
+
+// ─── Payload builder (OCPP 2.0.1) ────────────────────────────────────────
+
+/// TransactionEvent request (2.0.1): eventType Started/Updated/Ended,
+/// timestamp, triggerReason, a sequence number and the transaction id.
+pub fn ocpp_transaction_event(event_type: str, timestamp: str, trigger: str, seq_no: i64, transaction_id: str) -> str {
+    return "{" + json_string("eventType") + ":" + json_string(event_type) + "," + json_string("timestamp") + ":" + json_string(timestamp) + "," + json_string("triggerReason") + ":" + json_string(trigger) + "," + json_string("seqNo") + ":" + int_to_str(seq_no) + "," + json_string("transactionInfo") + ":{" + json_string("transactionId") + ":" + json_string(transaction_id) + "}}";
+}
+
+// ─── Charge-point state machine ──────────────────────────────────────────
+
+/// A charge point with one connector's state and its current transaction.
+pub struct ChargePoint {
+    pub state: i64,
+    pub authorized: bool,
+    pub transaction_id: i64,
+    pub meter_wh: i64,
+    pub faulted: bool,
+}
+
+pub fn cp_new() -> ChargePoint {
+    return ChargePoint { state: CP_AVAILABLE, authorized: false, transaction_id: 0, meter_wh: 0, faulted: false };
+}
+
+/// Advance the state machine by one event; returns the new state. Unknown
+/// transitions leave the state unchanged. A fault forces Faulted until
+/// cleared; from Faulted only EV_FAULT_CLEAR escapes (to Available).
+pub fn cp_step(cp: & mut ChargePoint, event: i64) -> i64 {
+    if event == EV_FAULT {
+        cp.state = CP_FAULTED;
+        cp.faulted = true;
+        return cp.state;
+    }
+    if cp.state == CP_FAULTED {
+        if event == EV_FAULT_CLEAR {
+            cp.state = CP_AVAILABLE;
+            cp.faulted = false;
+            cp.authorized = false;
+        }
+        return cp.state;
+    }
+    if cp.state == CP_AVAILABLE {
+        if event == EV_PLUG_IN { cp.state = CP_PREPARING; }
+    } else if cp.state == CP_PREPARING {
+        if event == EV_AUTHORIZE { cp.authorized = true; }
+        else if event == EV_START {
+            if cp.authorized { cp.state = CP_CHARGING; }
+        } else if event == EV_UNPLUG { cp.state = CP_AVAILABLE; cp.authorized = false; }
+    } else if cp.state == CP_CHARGING {
+        if event == EV_SUSPEND { cp.state = CP_SUSPENDED_EV; }
+        else if event == EV_STOP { cp.state = CP_FINISHING; }
+    } else if cp.state == CP_SUSPENDED_EV {
+        if event == EV_RESUME { cp.state = CP_CHARGING; }
+        else if event == EV_STOP { cp.state = CP_FINISHING; }
+    } else if cp.state == CP_FINISHING {
+        if event == EV_UNPLUG { cp.state = CP_AVAILABLE; cp.authorized = false; }
+    }
+    return cp.state;
+}
+
+// ─── Central-system handler ──────────────────────────────────────────────
+
+/// A simple central system: a set of accepted id tags and a transaction-id
+/// counter.
+pub struct CentralSystem {
+    pub accepted_tags: Vec<str>,
+    pub next_tx: i64,
+    pub current_time: str,
+    pub heartbeat_interval: i64,
+}
+
+pub fn cs_new(current_time: str, interval: i64) -> CentralSystem {
+    return CentralSystem { accepted_tags: Vec::new(), next_tx: 1, current_time: current_time, heartbeat_interval: interval };
+}
+
+pub fn cs_accept_tag(cs: & mut CentralSystem, tag: str) {
+    cs.accepted_tags.push(tag);
+}
+
+fn cs_tag_ok(cs: & CentralSystem, tag: str) -> bool {
+    var i: i64 = 0;
+    while i < cs.accepted_tags.len() {
+        if str_equal(cs.accepted_tags.get(i), tag) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Handle a CALL frame; returns the CALLRESULT (or CALLERROR) frame to send
+/// back. Supports BootNotification, Heartbeat, Authorize, StartTransaction
+/// and StopTransaction; other actions get a NotImplemented CALLERROR.
+pub fn cs_handle(cs: & mut CentralSystem, frame: str) -> str {
+    val f: OcppFrame = ocpp_parse(frame);
+    if !f.ok || f.msg_type != OCPP_CALL {
+        return ocpp_build_error("", "FormationViolation", "not a CALL", "{}");
+    }
+    val action: str = f.action;
+    if str_equal(action, "BootNotification") {
+        return ocpp_build_result(f.unique_id, ocpp_boot_conf("Accepted", cs.current_time, cs.heartbeat_interval));
+    } else if str_equal(action, "Heartbeat") {
+        return ocpp_build_result(f.unique_id, ocpp_heartbeat_conf(cs.current_time));
+    } else if str_equal(action, "Authorize") {
+        val tag: str = json_get_str(f.payload, "idTag");
+        var status: str = "Invalid";
+        if cs_tag_ok(cs, tag) { status = "Accepted"; }
+        return ocpp_build_result(f.unique_id, ocpp_id_tag_info(status));
+    } else if str_equal(action, "StartTransaction") {
+        val tag: str = json_get_str(f.payload, "idTag");
+        if !cs_tag_ok(cs, tag) {
+            return ocpp_build_result(f.unique_id, ocpp_start_conf(0, "Invalid"));
+        }
+        val tx: i64 = cs.next_tx;
+        cs.next_tx = cs.next_tx + 1;
+        return ocpp_build_result(f.unique_id, ocpp_start_conf(tx, "Accepted"));
+    } else if str_equal(action, "StopTransaction") {
+        return ocpp_build_result(f.unique_id, ocpp_id_tag_info("Accepted"));
+    }
+    return ocpp_build_error(f.unique_id, "NotImplemented", action, "{}");
+}

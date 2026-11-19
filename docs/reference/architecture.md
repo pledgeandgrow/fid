@@ -713,14 +713,22 @@ every command:
 | `emit --target aarch64-linux \| riscv64-linux \| x86_64-linux`, `emit --nat` | iropt.fd, rules.fd, egraph.fd, then the machine layer nat_ir.fd + nat_enc.fd: static ELF, or a PE for `--nat` |
 | `emit --bare`, `emit --elf` | pe_ir's flat binary / no-std ELF |
 | `build`, POSIX host, no `--target` | through C |
-| `build --native` (default target), `opt`, `pir --opt`, `codegen`, `emit --boot` | the old PIR path: pir.fd, opt.fd, regalloc.fd, codegen_x64/arm64/riscv.fd, peephole.fd, elf64.fd, linker.fd, pe.fd. Only `codegen` and `pir` without `--opt` work; the optimizer panics (known-bugs 2g.17) |
-| `wasm`, `gpu` | wasm.fd, gpu.fd: run, output does not validate |
+| `build --native` (default target), `opt`, `pir --opt`, `codegen`, `gpu` | the old PIR path: pir.fd, opt.fd, regalloc.fd, codegen_x64/arm64/riscv.fd, peephole.fd, runtime_linux.fd, elf64.fd, linker.fd (`gpu`: pir.fd's L3 only). `emit --boot` left it for pe_ir (`PEIR_BARE_BOOT`, release G1). The optimizer's jump-threading panic (known-bugs 2g.17) was fixed Nov 15, not yet rebuilt; x86-64 objects still lack `sh_addr` (2g.16) |
+| `wasm`, `gpu` | wasm.fd: valid WASI modules (Nov 15, release F9); gpu.fd: SPIR-V/PTX for integer kernels, rewritten Nov 15 (known-bugs 2g.21), SPIR-V branches unstructured |
 | `check`, `lint`, `fmt`, `lsp`, `doc`, `veil`, `ark`, `qualify`, `audit`, `parse-header`, `test`, `test-rules` | tools: main.fd dispatches each (full list in docs/file-analysis/main.md) |
 
 **Checks of the own backends:** `FID_VERIFY=1` (irverify.fd after each
 mid-end stage, nat_ir's allocation checker), `scripts/enc-oracle.py`,
 `scripts/pass-matrix.sh`, `fid test-rules --smt`. Pass switches:
-`FID_IROPT_OFF`, `FID_IROPT_ON`, `FID_NAT_OFF`, `FID_RULES_ON`.
+`FID_IROPT_OFF`, `FID_IROPT_ON`, `FID_NAT_OFF`, `FID_RULES_ON`, and the
+`--no-pass=a,b` flag (iropt, iropt_me, rules, egraph; `iro_cli_off` in
+checks.fd). The mid-end's CFG, dominator tree and loop tree are one
+computation in checks.fd (`iro_cfg`, `iro_dominates`, `iro_loops`). The
+effects a caller must assume for each function, its own joined with
+everything it calls (`iro_effect_masks` in iropt.fd), are what the rules'
+call merging and the library-facts file (`FID_LIBFACTS`,
+`FID_LIBFACTS_IN`) use; `FID_IROPT_ON=icf` folds functions with the same
+IR (WP19).
 
 **Not reached from `main.fd`:** autograd, debugger, diag, embedded,
 flat_ast, hotreload, native_debugger, runtime. codegen.fd is imported by

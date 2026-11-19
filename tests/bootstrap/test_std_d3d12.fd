@@ -1,0 +1,123 @@
+// stdlib/d3d12: x64 struct layouts (D3D12_RESOURCE_DESC 56, D3D12_GRAPHICS_PIPELINE_STATE_DESC 656, ...), GUID byte layout, HRESULTs, resource state rules and barrier images, root signature builder (cost, checks, union fields), DXGI format sizes, upload footprints. No D3D12 or COM call is made (needs Windows with a D3D12 driver and the fides_com shim).
+// Expected output:
+// sizes: RESOURCE_DESC 56, HEAP_PROPERTIES 20, RESOURCE_BARRIER 32, ROOT_PARAMETER 32, DESCRIPTOR_RANGE 20, ROOT_SIGNATURE_DESC 40, STATIC_SAMPLER_DESC 52, GRAPHICS_PIPELINE_STATE_DESC 656
+// RESOURCE_DESC: Width 16, DepthOrArraySize 28, MipLevels 30, Format 32, SampleDesc.Count 36, Flags 48
+// PSO: StreamOutput 88, BlendState 120, BlendState.RenderTarget[1].BlendEnable 168, SampleMask 448, RasterizerState 452, DepthStencilState 496, BackFace 532, InputLayout 552, RTVFormats[7] 608, DSVFormat 612, CachedPSO 632, Flags 648
+// IID_ID3D12Device bytes: f1199818b61d574bbe541821339b85f7
+// GUID round trip: true, malformed rejected: true
+// hr: DXGI_ERROR_DEVICE_REMOVED failed true, S_OK succeeded true, HRESULT 0x80070005
+// states: GENERIC_READ valid true, RT|PSR valid false, COPY_DEST valid true
+// transition RT -> RT: StateBefore equals StateAfter (no transition needed)
+// transition (UAV|COPY_SOURCE) -> PSR: StateBefore combines a write state with others
+// barrier: type 0, resource 0x1234, subresource 4294967295, 0x400 -> 0x80
+// uav barrier type 2 resource 0x99, aliasing 0x5 -> 0x6
+// root signature: 4 parameters, cost 8 DWORDs, 0 problems
+// root params: CBV reg 0, constants 4 values at b1, table 2 ranges, sampler table 1 range, relocations 3
+// bad root: root signature is 72 DWORDs (limit 64)
+// bad root: parameter 1: descriptor table without ranges
+// bad root: parameter 2: sampler ranges cannot share a table with CBV/SRV/UAV ranges
+// dxgi bits: RGBA8 32, RGBA32F 128, BC1 64, BC7 128, R16F 16, D24S8 32
+// footprint rgba8 256x256: 262144; 100x100: pitch 512 total 51088
+// footprint rgba8 100x100 3 mips: offsets 0 51200 64000, pitches 512 256 256, total 70244
+// footprint bc1 128x128: row 256 rows 32 total 8192
+// cb size: 100 -> 256, 300 -> 512
+use d3d12;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn hexn(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    if v == 0 { return "0x0"; }
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = byte_to_str(str_byte_at(d, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+fn sz(n: str) -> str {
+    return int_to_str(d3d_layout("D3D12_" + n).size);
+}
+
+fn off(l: &D3dLayout, f: str) -> str {
+    return f + " " + int_to_str(d3d_offset(l, f));
+}
+
+fn main() {
+    println("sizes: RESOURCE_DESC " + sz("RESOURCE_DESC") + ", HEAP_PROPERTIES " + sz("HEAP_PROPERTIES") + ", RESOURCE_BARRIER " + sz("RESOURCE_BARRIER") + ", ROOT_PARAMETER " + sz("ROOT_PARAMETER") + ", DESCRIPTOR_RANGE " + sz("DESCRIPTOR_RANGE") + ", ROOT_SIGNATURE_DESC " + sz("ROOT_SIGNATURE_DESC") + ", STATIC_SAMPLER_DESC " + sz("STATIC_SAMPLER_DESC") + ", GRAPHICS_PIPELINE_STATE_DESC " + sz("GRAPHICS_PIPELINE_STATE_DESC"));
+    val rd: D3dLayout = d3d_layout("D3D12_RESOURCE_DESC");
+    println("RESOURCE_DESC: " + off(&rd, "Width") + ", " + off(&rd, "DepthOrArraySize") + ", " + off(&rd, "MipLevels") + ", " + off(&rd, "Format") + ", " + off(&rd, "SampleDesc.Count") + ", " + off(&rd, "Flags"));
+    val ps: D3dLayout = d3d_layout("D3D12_GRAPHICS_PIPELINE_STATE_DESC");
+    println("PSO: StreamOutput " + int_to_str(d3d_offset(&ps, "StreamOutput.pSODeclaration")) + ", BlendState " + int_to_str(d3d_offset(&ps, "BlendState.AlphaToCoverageEnable")) + ", " + off(&ps, "BlendState.RenderTarget[1].BlendEnable") + ", " + off(&ps, "SampleMask") + ", RasterizerState " + int_to_str(d3d_offset(&ps, "RasterizerState.FillMode")) + ", DepthStencilState " + int_to_str(d3d_offset(&ps, "DepthStencilState.DepthEnable")) + ", BackFace " + int_to_str(d3d_offset(&ps, "DepthStencilState.BackFace.StencilFailOp")) + ", InputLayout " + int_to_str(d3d_offset(&ps, "InputLayout.pInputElementDescs")) + ", " + off(&ps, "RTVFormats[7]") + ", " + off(&ps, "DSVFormat") + ", CachedPSO " + int_to_str(d3d_offset(&ps, "CachedPSO.p")) + ", " + off(&ps, "Flags"));
+
+    val g: Vec<i64> = d3d_guid_bytes(IID_ID3D12DEVICE);
+    var gh: str = "";
+    var i: i64 = 0;
+    while i < g.len() {
+        val x: i64 = g.get(i);
+        gh = gh + byte_to_str(str_byte_at("0123456789abcdef", x >> 4)) + byte_to_str(str_byte_at("0123456789abcdef", x & 15));
+        i = i + 1;
+    }
+    println("IID_ID3D12Device bytes: " + gh);
+    println("GUID round trip: " + yes(d3d_guid_str(&d3d_guid_bytes(IID_IDXGIFACTORY4)) == IID_IDXGIFACTORY4) + ", malformed rejected: " + yes(d3d_guid_bytes("1234-zz").len() == 0));
+    println("hr: " + d3d_hr_name(0x887A0005) + " failed " + yes(!d3d_succeeded(0x887A0005)) + ", " + d3d_hr_name(d3d_hr(0x100000000)) + " succeeded " + yes(d3d_succeeded(0)) + ", " + d3d_hr_name(0x80070005));
+    println("states: GENERIC_READ valid " + yes(d3d_state_valid(D3D12_RESOURCE_STATE_GENERIC_READ)) + ", RT|PSR valid " + yes(d3d_state_valid(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) + ", COPY_DEST valid " + yes(d3d_state_valid(D3D12_RESOURCE_STATE_COPY_DEST)));
+    println("transition RT -> RT: " + d3d_validate_transition(4, 4).get(0));
+    println("transition (UAV|COPY_SOURCE) -> PSR: " + d3d_validate_transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE).get(0));
+
+    var b: D3dBlob = d3d_blob_new();
+    val lb: D3dLayout = d3d_layout("D3D12_RESOURCE_BARRIER");
+    val t: i64 = d3d_barrier_transition(&mut b, 0x1234, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    println("barrier: type " + int_to_str(d3d_read(&b, t, &lb, "Type")) + ", resource " + hexn(d3d_read(&b, t, &lb, "Transition.pResource")) + ", subresource " + int_to_str(d3d_read(&b, t, &lb, "Transition.Subresource")) + ", " + hexn(d3d_read(&b, t, &lb, "Transition.StateBefore")) + " -> " + hexn(d3d_read(&b, t, &lb, "Transition.StateAfter")));
+    val u: i64 = d3d_barrier_uav(&mut b, 0x99);
+    val a: i64 = d3d_barrier_aliasing(&mut b, 5, 6);
+    println("uav barrier type " + int_to_str(d3d_read(&b, u, &lb, "Type")) + " resource " + hexn(d3d_get(&b, u + 8, 8)) + ", aliasing " + hexn(d3d_get(&b, a + 8, 8)) + " -> " + hexn(d3d_get(&b, a + 16, 8)));
+
+    var rs: D3dRootSig = d3d_root_sig_new(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+    d3d_root_descriptor(&mut rs, D3D12_ROOT_PARAMETER_TYPE_CBV, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+    d3d_root_constants(&mut rs, 1, 0, 4, D3D12_SHADER_VISIBILITY_VERTEX);
+    val tb: i64 = d3d_root_table(&mut rs, D3D12_SHADER_VISIBILITY_PIXEL);
+    d3d_root_table_range(&mut rs, tb, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0);
+    d3d_root_table_range(&mut rs, tb, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0);
+    val st: i64 = d3d_root_table(&mut rs, D3D12_SHADER_VISIBILITY_PIXEL);
+    d3d_root_table_range(&mut rs, st, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 2, 0, 0);
+    var sb: D3dBlob = d3d_blob_new();
+    val desc: i64 = d3d_root_sig_desc(&rs, &mut sb);
+    val ld: D3dLayout = d3d_layout("D3D12_ROOT_SIGNATURE_DESC");
+    println("root signature: " + int_to_str(d3d_read(&sb, desc, &ld, "NumParameters")) + " parameters, cost " + int_to_str(d3d_root_cost(&rs)) + " DWORDs, " + int_to_str(d3d_root_validate(&rs).len()) + " problems");
+    var pp: i64 = - 1;
+    i = 0;
+    while i < sb.reloc_at.len() {
+        if sb.reloc_at.get(i) == desc + d3d_offset(&ld, "pParameters") { pp = sb.reloc_to.get(i); }
+        i = i + 1;
+    }
+    val lp: D3dLayout = d3d_layout("D3D12_ROOT_PARAMETER");
+    println("root params: CBV reg " + int_to_str(d3d_get(&sb, pp + 8, 4)) + ", constants " + int_to_str(d3d_get(&sb, pp + 32 + 16, 4)) + " values at b" + int_to_str(d3d_get(&sb, pp + 32 + 8, 4)) + ", table " + int_to_str(d3d_read(&sb, pp + 64, &lp, "DescriptorTable.NumDescriptorRanges")) + " ranges, sampler table " + int_to_str(d3d_read(&sb, pp + 96, &lp, "DescriptorTable.NumDescriptorRanges")) + " range, relocations " + int_to_str(sb.reloc_at.len()));
+    var bad: D3dRootSig = d3d_root_sig_new(0);
+    d3d_root_constants(&mut bad, 0, 0, 70, D3D12_SHADER_VISIBILITY_ALL);
+    d3d_root_table(&mut bad, D3D12_SHADER_VISIBILITY_ALL);
+    val mixed: i64 = d3d_root_table(&mut bad, D3D12_SHADER_VISIBILITY_ALL);
+    d3d_root_table_range(&mut bad, mixed, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0);
+    d3d_root_table_range(&mut bad, mixed, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0);
+    val be: Vec<str> = d3d_root_validate(&bad);
+    i = 0;
+    while i < be.len() {
+        println("bad root: " + be.get(i));
+        i = i + 1;
+    }
+
+    println("dxgi bits: RGBA8 " + int_to_str(dxgi_format_bits(DXGI_FORMAT_R8G8B8A8_UNORM)) + ", RGBA32F " + int_to_str(dxgi_format_bits(DXGI_FORMAT_R32G32B32A32_FLOAT)) + ", BC1 " + int_to_str(dxgi_format_bits(DXGI_FORMAT_BC1_UNORM)) + ", BC7 " + int_to_str(dxgi_format_bits(DXGI_FORMAT_BC7_UNORM)) + ", R16F " + int_to_str(dxgi_format_bits(DXGI_FORMAT_R16_FLOAT)) + ", D24S8 " + int_to_str(dxgi_format_bits(DXGI_FORMAT_D24_UNORM_S8_UINT)));
+    val f1: D3dFootprints = d3d_footprints(DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 0);
+    val f2: D3dFootprints = d3d_footprints(DXGI_FORMAT_R8G8B8A8_UNORM, 100, 100, 1, 0);
+    println("footprint rgba8 256x256: " + int_to_str(f1.total) + "; 100x100: pitch " + int_to_str(f2.row_pitch.get(0)) + " total " + int_to_str(f2.total));
+    val f3: D3dFootprints = d3d_footprints(DXGI_FORMAT_R8G8B8A8_UNORM, 100, 100, 3, 0);
+    println("footprint rgba8 100x100 3 mips: offsets " + int_to_str(f3.offset.get(0)) + " " + int_to_str(f3.offset.get(1)) + " " + int_to_str(f3.offset.get(2)) + ", pitches " + int_to_str(f3.row_pitch.get(0)) + " " + int_to_str(f3.row_pitch.get(1)) + " " + int_to_str(f3.row_pitch.get(2)) + ", total " + int_to_str(f3.total));
+    val f4: D3dFootprints = d3d_footprints(DXGI_FORMAT_BC1_UNORM, 128, 128, 1, 0);
+    println("footprint bc1 128x128: row " + int_to_str(f4.row_size.get(0)) + " rows " + int_to_str(f4.rows.get(0)) + " total " + int_to_str(f4.total));
+    println("cb size: 100 -> " + int_to_str(d3d_cb_size(100)) + ", 300 -> " + int_to_str(d3d_cb_size(300)));
+}

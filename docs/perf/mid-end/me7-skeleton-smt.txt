@@ -1,0 +1,145 @@
+ME7 — the e-graph's side-effect skeleton and SMT proofs of its rewrites (Nov 17)
+==================================================================================
+
+Both parts are in compiler/egraph.fd. Neither was built or measured when
+this was written (the run that wrote it could not build the compiler); the
+checks below are what the release build must pass.
+
+1. The side-effect skeleton (Cranelift's aegraph), opt-in
+----------------------------------------------------------
+
+FID_IROPT_ON=egskel (or `all`); FID_NAT_OFF=egskel turns it off again. It
+runs at the end of eg_function, after extraction and the in-place rewrites,
+on the native paths (pe_ir, nat_ir: wherever egraph_run runs).
+
+  eg_skeleton     splits a function in two. The skeleton is everything with
+                  an effect or a possible panic (stores, calls, loads,
+                  checked arithmetic, division, shifts outside @wrapping
+                  code, float-to-int), the constants and the terminators,
+                  plus any pure value pinned to it: read in an unreachable
+                  block, read by an instruction ssa_remap cannot rename, or
+                  named by the function's name tables (locals, persist,
+                  drops, @zeroize). It keeps the IR's order exactly. The
+                  pure values (eg_place_kind: no memory read, no panic)
+                  leave their blocks.
+  the walk        the skeleton in reverse postorder; each operand that was
+                  a pure value is elaborated from its e-class where it is
+                  read (eg_sk_elab):
+                    - an equal value available there (its block dominates
+                      the use, or it is earlier in the block): GVN across
+                      blocks, equal forms (a + b, b + a) included;
+                    - else the class's cheapest node whose operands can be
+                      elaborated, then its other nodes (eg_sk_make), made
+                      in the block with the fewest loops on the dominator
+                      path between its deepest operand and the use, the
+                      latest one among equals (eg_sk_block: LICM falls
+                      out); a comparison a branch reads is made right before
+                      the branch. Only nodes that cannot panic are made
+                      (eg_sk_safe); a constant only within its type.
+                  The value read in an operand's place must have the
+                  operand's IR type (Nov 17: checked in the walk).
+  ids             the first copy of a class reuses an original
+                  instruction's id; copies in blocks the first does not
+                  dominate are new instructions (eg_detached).
+  dead code       a pure value no skeleton instruction needs is not made
+                  again.
+  undo            if anything cannot be elaborated, the function goes back
+                  to what it was before the skeleton (blocks, instructions,
+                  metas, next value id); the in-place rewrites stay.
+  not run         in @constant_time code and code holding a secret (where
+                  work happens is part of the contract); the mid-end memo
+                  (CS1) is off while it is on (it adds instructions, which
+                  a memo entry cannot replay).
+  stats           FID_EGRAPH_STATS=1 adds a line
+                    [egskel] functions F, floated P, originals placed R,
+                    new N, dead D, undone U
+
+Tests: tests/bootstrap/test_midend_egskel.fd (hoisting from loops and
+nested loops, GVN across branches, dead pure values, comparisons before
+branches, casts and floats, checked code where only bit operations and
+comparisons float, and the two reassociation folds below);
+tests/tooling/egskel-check.sh (the test with the e-graph off, on, skeleton
+on, skeleton and placement on, all with FID_VERIFY=1; the stats line; the
+other e-graph tests with the skeleton on; SUITE=1: the whole suite with the
+skeleton off and on).
+
+Default: it stays opt-in until `SUITE=1 bash tests/tooling/egskel-check.sh`
+shows no difference on Windows (--nat) and on one Linux target, and the
+pass matrix's round 3 (FID_IROPT_ON=all minus egskel) is clean.
+
+2. SMT proofs of the e-graph's own rewrites
+-------------------------------------------
+
+`fid test-rules --smt <dir>` now also writes the e-graph's obligations
+(compiler/rules.fd rules_smt calls egraph_smt), so scripts/rules-smt.sh,
+which asks z3 about every file in the folder, proves them with the rules of
+rules.fd. One file per rule family (the FID_EGRAPH_OFF names), type and
+mode: eg_<family>_<type>_c.smt2 for checked code, _w for @wrapping code;
+eg_invol_unaryfold_bool, eg_castfold_<ext|trunc|bitcast>_<from>,
+eg_float_<f32|f64>. Each file asserts that one of its rules has a
+counterexample: `unsat` proves them all.
+
+The rules come from the tables eg_round itself reads (refactored Nov 17 out
+of eg_round: eg_comm_op, eg_flip_op, eg_ident_k, eg_zero_value,
+eg_double_op, eg_same_of, eg_fold_rule; and eg_fold_unary, eg_fold_cast),
+RL11's mutants included. With FID_NAT_MUTATE=eg<family> the obligations of
+that family fail as the pass does: the solver catches a broken rule, not
+only the suite.
+
+Model:
+  - a w-bit integer type is a w-bit vector, division, remainder, shift
+    right and comparisons signed or not by the type;
+  - two forms of checked code are equal only if they panic on the same
+    operands and agree wherever they do not; a panic is a result outside the
+    type (add, sub, mul: the operation in a wider vector differs from the
+    narrow one extended) or a division by zero or of the minimum by -1
+    (the backends divide in 64 bits: a narrow quotient MIN / -1 does not
+    fit, a narrow remainder MIN % -1 is 0; i64 MIN / -1 and MIN % -1
+    trap); @wrapping arithmetic never panics (its division still does);
+  - comm, flip, ident, zero, double, shift, reassoc, same, invol: for all
+    operands (symbolic);
+  - fold and unaryfold: on sample values of each type (23 candidates: 0,
+    small values, every width's limits, those the type holds), ground
+    terms: the folded value is the operation's and the operation does not
+    panic there;
+  - castfold: for every constant eg_fold_cast's conditions accept (both
+    types hold it; a truncation only of a value >= 0), symbolic, and on
+    samples through eg_fold_cast itself;
+  - float: eg_float_rules in IEEE 754 (QF_FP, round to nearest even), with
+    SMT-LIB's `=`: +0.0 and -0.0 differ, every NaN is the one NaN, so the
+    proofs hold up to NaN payloads (x * 1.0 quiets a signaling NaN: the
+    bits of such a NaN may differ, as in LLVM's same fold).
+Not covered: idcast (a bit cast to its own type is its operand by the IR's
+definition) and float constants (never folded).
+
+Run before the build (Nov 17), with the generator compiled by the old
+stage0 compiler from this source (a driver calling egraph_smt) and z3
+5.3.3 (python z3-solver) through tests/tooling/egraph_smt_solve.py: 145 files, all 145
+proved. The first run found one false obligation per narrow signed type:
+the model said a narrow MIN % -1 panics, where the backends give 0 (the
+model was fixed, the pass was right). Each RL11 mutant breaks exactly its
+own family: egcomm 16 of 16 comm files, egflip 8/8, egfold 14/14 (u64 has
+no folds), egident 8/8, egzero 8/8, egdouble 16/16, egsame 8/8, and no
+file of any other family.
+
+Fixed on the way (eg_round, reassoc): c1 + c2 of (x + c1) + c2 in @wrapping
+code was added in eg_round, which is checked code, so i64 constants near
+the limits made the compiler panic; and a narrow sum outside the type made
+a constant the type does not hold. It is now eg_fold(EB_ADD, c1, c2, ty,
+true): wrapped in i64, refused outside a narrow type and for u64
+(test_midend_egskel.fd near_max, narrow_sum).
+
+Tests: tests/tooling/egraph-smt-check.sh (the files are written, every
+family has some, z3 proves them all, and each of the seven RL11 mutants
+breaks its family's obligations), tests/tooling/egraph_smt_solve.py (z3 on
+a folder in one process).
+
+3. The pass matrix with the e-graph off and on
+----------------------------------------------
+
+Nothing new in code: scripts/pass-matrix.sh already turns the e-graph off
+(round 2, FID_NAT_OFF=egraph), each rule family off (round 4) and the
+opt-in passes, egskel and egplace among them, off from FID_IROPT_ON=all
+(round 3). The run with this build is part of the validation:
+  NATIVE=1 FID=$FID JOBS=4 IROPT="" NAT="egraph forward" IME="egskel egplace" RULES="" bash scripts/pass-matrix.sh x86_64-windows
+  (and x86_64-linux in WSL): exit 0, matrix.txt with no difference.

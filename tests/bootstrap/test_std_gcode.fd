@@ -1,0 +1,206 @@
+// stdlib/gcode: RepRap checksum vector (N3 T0*57), words and comments, line-number sequence, modal state (G90/G91, G20/G21, G92, M83, sticky motion and feed), G2/G3 arcs by I/J and by R, full circles, helical and G18 arcs (points checked with a Python replica), generated programs read back
+// Expected output:
+// N3 T0*57: ok=true line=3 words=1 T0
+// N3 T0*58: ok=false checksum mismatch: line says 58, computed 57
+// words: G1 X10.5 Y-2 F1500 line=10 comment=done
+// G1 X: letter X without a number
+// seq: ok ok Resend: 3 ok(M110) ok
+// modal moves=5 last=(12.7000, 5.0000, 0.0000) e=0.0000 feed=600.0000
+// after G92: (0.0000, 0.0000, 0.0000) next move=(1.0000, 1.0000, 0.0000)
+// e relative: 5.0000 then 7.5000
+// G2 I5: segs=15 first=(0.1093, 1.0396) end=(10.0000, 0.0000) radius err<1e-9: true
+// G3 R5: segs=15 first=(9.8907, 1.0396)
+// G2 R10: segs=10 centre-y=-8.6603 top=(5.0000, 1.3397)
+// G2 R-10: segs=52 highest y=18.6603
+// full circle: segs=31 length=31.3622 end=(0.0000, 0.0000)
+// helix: segs=31 end z=-2.0000 mid z=-1.0323
+// G18 arc: segs=15 mid=(5.5226, 0.0000, -4.9726)
+// num: 10 -2.5 0.125 0 1.2346
+// polyline: G21 | G90 | G0 Z5 | G0 X0 Y0 | G1 Z-1 F300 | G1 X10 Y0 | G1 X10 Y10 | G0 Z5
+// rounded rect lines=15 moves=24 length=114.7287
+// numbered: N0 M110*35 / N5 G0 X3 Y0*46 checksums ok=15 seq errors=0
+// error program: line 3: arc end point is not on the circle
+use math;
+use quat;
+use gcode;
+
+fn p3(m: GMove) -> str {
+    return "(" + rmath_fmt(m.x, 4) + ", " + rmath_fmt(m.y, 4) + ", " + rmath_fmt(m.z, 4) + ")";
+}
+
+fn p2(m: GMove) -> str {
+    return "(" + rmath_fmt(m.x, 4) + ", " + rmath_fmt(m.y, 4) + ")";
+}
+
+fn words(l: & GLine) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < l.letters.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + char_to_str(l.letters.get(i)) + gcode_num(l.values.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    val a: GLine = gcode_parse_line("N3 T0*57");
+    println("N3 T0*57: ok=" + gc_b(a.ok) + " line=" + int_to_str(a.line_no) + " words=" + int_to_str(a.letters.len()) + " " + words(&a));
+    val b: GLine = gcode_parse_line("N3 T0*58");
+    println("N3 T0*58: ok=" + gc_b(b.ok) + " " + b.error);
+    val c: GLine = gcode_parse_line("n10 g1 x10.5 Y-2 (move fast) f1500 ; done");
+    println("words: " + words(&c) + " line=" + int_to_str(c.line_no) + " comment=" + c.comment);
+    println("G1 X: " + gcode_parse_line("G1 X").error);
+
+    var sq: GSeq = gcode_seq_new();
+    var s: str = "seq:";
+    val l1: GLine = gcode_parse_line(gcode_with_checksum(1, "G28"));
+    val l2: GLine = gcode_parse_line(gcode_with_checksum(2, "G1 X1"));
+    val l4: GLine = gcode_parse_line(gcode_with_checksum(4, "G1 X2"));
+    val lm: GLine = gcode_parse_line(gcode_with_checksum(100, "M110"));
+    val l101: GLine = gcode_parse_line(gcode_with_checksum(101, "G1 X3"));
+    s = s + " " + gc_ok(gcode_seq_check(&mut sq, &l1));
+    s = s + " " + gc_ok(gcode_seq_check(&mut sq, &l2));
+    s = s + " " + gc_ok(gcode_seq_check(&mut sq, &l4));
+    s = s + " " + gc_ok(gcode_seq_check(&mut sq, &lm)) + "(M110)";
+    s = s + " " + gc_ok(gcode_seq_check(&mut sq, &l101));
+    println(s);
+
+    var st: GState = gcode_state_new();
+    val prog: str = "G21 G90\nG0 X0 Y0 Z0 F3000\nG1 X10 F600\nY10\nG91\nX-5 Y-5\nG90\nG20\nG1 X0.5\nG21";
+    val mv: Vec<GMove> = gcode_run(&mut st, prog);
+    println("modal moves=" + int_to_str(mv.len()) + " last=" + p3(mv.get(mv.len() - 1)) + " e=" + rmath_fmt(st.e, 4) + " feed=" + rmath_fmt(st.feed, 4));
+    gcode_run_line(&mut st, "G92 X0 Y0");
+    val before: str = "(" + rmath_fmt(st.x, 4) + ", " + rmath_fmt(st.y, 4) + ", " + rmath_fmt(st.z, 4) + ")";
+    val nx: Vec<GMove> = gcode_run_line(&mut st, "G1 X1 Y1");
+    println("after G92: " + before + " next move=" + p3(nx.get(0)));
+    gcode_run_line(&mut st, "M83");
+    gcode_run_line(&mut st, "G1 X2 E5");
+    val e1: f64 = st.e;
+    gcode_run_line(&mut st, "G1 X3 E2.5");
+    println("e relative: " + rmath_fmt(e1, 4) + " then " + rmath_fmt(st.e, 4));
+
+    var ar: GState = gcode_state_new();
+    val m1: Vec<GMove> = gcode_run_line(&mut ar, "G2 X10 Y0 I5 J0 F600");
+    var ok: bool = true;
+    var i: i64 = 0;
+    while i < m1.len() {
+        val m: GMove = m1.get(i);
+        val r: f64 = math_sqrt((m.x - 5.0) * (m.x - 5.0) + m.y * m.y);
+        if math_fabs(r - 5.0) > 0.000000001 {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    println("G2 I5: segs=" + int_to_str(m1.len()) + " first=" + p2(m1.get(0)) + " end=" + p2(m1.get(m1.len() - 1)) + " radius err<1e-9: " + gc_b(ok));
+    val m2: Vec<GMove> = gcode_run_line(&mut ar, "G3 X0 Y0 R5");
+    println("G3 R5: segs=" + int_to_str(m2.len()) + " first=" + p2(m2.get(0)));
+    val m3: Vec<GMove> = gcode_run_line(&mut ar, "G2 X10 Y0 R10");
+    var top: GMove = m3.get(0);
+    i = 0;
+    while i < m3.len() {
+        if m3.get(i).y > top.y {
+            top = m3.get(i);
+        }
+        i = i + 1;
+    }
+    println("G2 R10: segs=" + int_to_str(m3.len()) + " centre-y=" + rmath_fmt(top.y - 10.0, 4) + " top=" + p2(top));
+    gcode_run_line(&mut ar, "G0 X0 Y0");
+    val m4: Vec<GMove> = gcode_run_line(&mut ar, "G2 X10 Y0 R-10");
+    var low: f64 = 0.0;
+    i = 0;
+    while i < m4.len() {
+        low = rmath_max(low, m4.get(i).y);
+        i = i + 1;
+    }
+    println("G2 R-10: segs=" + int_to_str(m4.len()) + " highest y=" + rmath_fmt(low, 4));
+    gcode_run_line(&mut ar, "G0 X0 Y0");
+    val m5: Vec<GMove> = gcode_run_line(&mut ar, "G2 X0 Y0 I5 J0");
+    println("full circle: segs=" + int_to_str(m5.len()) + " length=" + rmath_fmt(gcode_path_length(&m5, 0.0, 0.0, 0.0), 4) + " end=" + p2(m5.get(m5.len() - 1)));
+    val m6: Vec<GMove> = gcode_run_line(&mut ar, "G3 X0 Y0 Z-2 I5 J0");
+    println("helix: segs=" + int_to_str(m6.len()) + " end z=" + rmath_fmt(m6.get(m6.len() - 1).z, 4) + " mid z=" + rmath_fmt(m6.get(15).z, 4));
+    var g18: GState = gcode_state_new();
+    val m7: Vec<GMove> = gcode_run_line(&mut g18, "G18 G2 X10 Z0 I5 K0");
+    println("G18 arc: segs=" + int_to_str(m7.len()) + " mid=" + p3(m7.get(7)));
+
+    println("num: " + gcode_num(10.0) + " " + gcode_num(-2.5) + " " + gcode_num(0.125) + " " + gcode_num(-0.00001) + " " + gcode_num(1.23456));
+    var xs: Vec<f64> = Vec::new();
+    var ys: Vec<f64> = Vec::new();
+    xs.push(0.0); ys.push(0.0);
+    xs.push(10.0); ys.push(0.0);
+    xs.push(10.0); ys.push(10.0);
+    val pl: Vec<str> = gcode_polyline(&xs, &ys, -1.0, 5.0, 300.0);
+    var ps: str = "polyline:";
+    i = 0;
+    while i < pl.len() {
+        if i > 0 {
+            ps = ps + " |";
+        }
+        ps = ps + " " + pl.get(i);
+        i = i + 1;
+    }
+    println(ps);
+
+    val rr: Vec<str> = gcode_rounded_rect(0.0, 0.0, 30.0, 20.0, 3.0, -1.0, 5.0, 400.0);
+    var rs: GState = gcode_state_new();
+    var all: Vec<GMove> = Vec::new();
+    i = 0;
+    while i < rr.len() {
+        val ms: Vec<GMove> = gcode_run_line(&mut rs, rr.get(i));
+        var k: i64 = 0;
+        while k < ms.len() {
+            all.push(ms.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    println("rounded rect lines=" + int_to_str(rr.len()) + " moves=" + int_to_str(all.len()) + " length=" + rmath_fmt(gcode_path_length(&all, 0.0, 0.0, 0.0), 4));
+    val nl: Vec<str> = gcode_number_lines(&rr);
+    var good: i64 = 0;
+    var bad: i64 = 0;
+    var q: GSeq = gcode_seq_new();
+    i = 0;
+    while i < nl.len() {
+        val pl2: GLine = gcode_parse_line(nl.get(i));
+        if pl2.ok && pl2.has_checksum {
+            good = good + 1;
+        }
+        if str_len(gcode_seq_check(&mut q, &pl2)) > 0 {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    println("numbered: " + nl.get(0) + " / " + nl.get(5) + " checksums ok=" + int_to_str(good - 1) + " seq errors=" + int_to_str(bad));
+    var es: GState = gcode_state_new();
+    gcode_run(&mut es, "G0 X0 Y0\nG1 X1\nG2 X5 Y0 I1 J0\nG1 X9");
+    println("error program: " + es.error);
+    return 0;
+}
+
+fn gc_mid(v: & Vec<GMove>) -> GMove {
+    var best: GMove = v.get(0);
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i).z < best.z {
+            best = v.get(i);
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn gc_ok(s: str) -> str {
+    if str_len(s) == 0 {
+        return "ok";
+    }
+    return s;
+}
+
+fn gc_b(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

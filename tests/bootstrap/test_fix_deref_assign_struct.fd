@@ -1,0 +1,54 @@
+// Test (stdlib-agent bugs 34 and 49): `*p = s` through a `&mut S` of a
+// struct holding a string and a Vec. The struct was copied word for word:
+// the caller's variable and `s` shared their string and Vec and both freed
+// them ("Double free"), and the old value was never freed. The place now
+// takes an owner of the new value and drops the old one.
+// Expected output:
+// x1 x1
+// r3
+// r3 1
+// 2
+// 2 2 2
+struct R { name: str, ids: Vec<i64> }
+
+fn pick(early: & mut R, r: R) {
+    *early = r;
+}
+
+fn pick2(early: & mut R, n: i64) {
+    var v: Vec<i64> = Vec::new();
+    v.push(n);
+    val r: R = R { name: "r" + int_to_str(n), ids: v };
+    *early = r;
+    println(r.name);
+}
+
+struct NdkInput { kind: i64, ids: Vec<i64> }
+
+var g_in: Vec<NdkInput> = Vec::new();
+
+fn fill(out: & mut NdkInput, i: i64) -> bool {
+    val e: NdkInput = g_in.get(i);
+    *out = e;
+    println(int_to_str(e.kind));
+    return true;
+}
+
+fn main() {
+    var e: R = R { name: "e" + int_to_str(0), ids: Vec::new() };
+    val x: R = R { name: "x" + int_to_str(1), ids: Vec::new() };
+    pick(& mut e, x);
+    val c: R = e;
+    println(c.name + " " + x.name);
+    pick2(& mut e, 3);
+    val d: R = e;
+    println(d.name + " " + int_to_str(d.ids.len()));
+    var a: Vec<i64> = Vec::new();
+    a.push(7);
+    a.push(8);
+    g_in.push(NdkInput { kind: 2, ids: a });
+    var o: NdkInput = NdkInput { kind: 0, ids: Vec::new() };
+    fill(& mut o, 0);
+    val o2: NdkInput = o;
+    println(int_to_str(o2.kind) + " " + int_to_str(o2.ids.len()) + " " + int_to_str(g_in.get(0).ids.len()));
+}

@@ -1,0 +1,150 @@
+// ME7, ME8 (compiler/egraph.fd, native paths; FID_NAT_OFF=egraph turns
+// the e-graph off, FID_IROPT_ON=egplace turns placement on).
+// ME7: casts and float values are e-graph nodes.
+// - widen_const: a widening of a constant is the constant.
+// - trunc_pos / trunc_neg: a narrowing of a constant folds only when the
+//   value is not negative and fits (backends agree on those bits); a
+//   negative one is left to the backend, which wraps it.
+// - same_cast: two equal casts of one parameter are one value.
+// - fmul_one, fdiv_one, fsub_zero, fadd_negzero: x * 1.0, x / 1.0,
+//   x - 0.0 and x + -0.0 are x for every float, -0.0 and NaN included.
+// - fadd_zero: x + 0.0 is not x (-0.0 + 0.0 is +0.0): its sign must be +.
+// - fneg2: -(-x) is x.
+// - fflip: a < b and b > a are one value, NaN included (both false).
+// ME8: placement.
+// - invariant: `(a ^ b) & mask` in the loop's body behind an `if` uses only
+//   values from before the loop: it may be computed before it.
+// - sink: `x | 1` is used only in one branch: it may move into it.
+// Every line must be what the program computes with the e-graph off.
+//
+// Expected output:
+// 7
+// 100
+// 44
+// -56
+// 1
+// 6
+// 3.5
+// 3.5
+// 3.5
+// true
+// false
+// -2.25
+// true
+// false
+// false
+// 1600
+// 11
+// 4
+
+fn widen_const() -> i64 {
+    var k: i32 = 7;
+    return k as i64;
+}
+
+fn trunc_pos() -> i64 {
+    var k: i64 = 100;
+    var t: i8 = k as i8;
+    return t as i64;
+}
+
+fn trunc_mid(x: i64) -> i64 {
+    var t: u8 = x as u8;
+    return t as i64;
+}
+
+fn trunc_neg(x: i64) -> i64 {
+    var t: i8 = x as i8;
+    return t as i64;
+}
+
+fn same_cast(x: i32) -> i64 {
+    var a: i64 = x as i64;
+    var b: i64 = x as i64;
+    if a == b {
+        return 1;
+    }
+    return 0;
+}
+
+fn sum_casts(x: i32, y: i32) -> i64 {
+    var a: i64 = (x as i64) + (y as i64);
+    var b: i64 = (y as i64) + (x as i64);
+    return a + b;
+}
+
+fn fmul_one(x: f64) -> f64 {
+    return x * 1.0;
+}
+
+fn fdiv_one(x: f64) -> f64 {
+    return x / 1.0;
+}
+
+fn fsub_zero(x: f64) -> f64 {
+    return x - 0.0;
+}
+
+fn fadd_negzero(x: f64) -> f64 {
+    return x + -0.0;
+}
+
+fn fadd_zero(x: f64) -> f64 {
+    return x + 0.0;
+}
+
+fn fneg2(x: f64) -> f64 {
+    return -(-x);
+}
+
+fn fflip(a: f64, b: f64) -> bool {
+    var p: bool = a < b;
+    var q: bool = b > a;
+    return p == q && p;
+}
+
+fn invariant(n: i64, a: i64, b: i64, mask: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 4 != 0 {
+            s = s + ((a ^ b) & mask);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sink(x: i64, c: bool) -> i64 {
+    var y: i64 = x | 1;
+    if c {
+        return y;
+    }
+    return 4;
+}
+
+fn main() {
+    println(widen_const());
+    println(trunc_pos());
+    println(trunc_mid(300));
+    println(trunc_neg(200));
+    println(same_cast(5));
+    println(sum_casts(1, 2));
+    println(fmul_one(3.5));
+    println(fdiv_one(3.5));
+    println(fsub_zero(3.5));
+    // the sign of a zero shows in 1 / it: -inf for -0.0
+    var nz: f64 = 0.0 - 1.0;
+    nz = nz * 0.0;
+    println(1.0 / fadd_negzero(nz) < 0.0);
+    println(1.0 / fadd_zero(nz) < 0.0);
+    println(fneg2(-2.25));
+    println(fflip(1.0, 2.0));
+    println(fflip(2.0, 1.0));
+    var z: f64 = 0.0;
+    println(fflip(z / z, 1.0));
+    // (6 ^ 3) & 7 = 5, added on 75 of the 100 iterations: 375
+    println(invariant(100, 6, 3, 7) + 1225);
+    println(sink(10, true));
+    println(sink(10, false));
+}

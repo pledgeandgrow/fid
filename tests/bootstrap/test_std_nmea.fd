@@ -1,0 +1,128 @@
+// stdlib/nmea: the classic GGA, RMC, GSA, GSV and VTG example sentences (checksums verified), a u-blox GNRMC, a two-sentence GSV group, stream splitting, rejected lines, coordinate conversion both ways and a GGA rebuilt byte for byte.
+// Expected output:
+// checksums: 6 of 6 valid
+// gga: 12:35:19 = 45319 s, 48.117300 11.516667, quality 1, 8 sats, hdop 0.9, alt 545.4 m, geoid 46.9 m
+// rmc: valid true, 22.4 kn, course 84.4, 1994-03-23, magvar -3.1, unix 764426119
+// gsa: mode A fix 3, prns 4 5 9 12 24, pdop 2.5 hdop 1.3 vdop 2.1
+// gsv: complete true, 8 in view, prns 1 2 12 14 15 18 21 22, snr of 18 = -1, elevation of 21 = -1
+// vtg: true 54.7 magnetic 34.4, 5.5 kn = 10.2 km/h
+// gnrmc: talker GN, 44.068999 -121.314337, 0.146 kn, course given false, 2017-01-10, mode A, unix 1484007031
+// rejected: 7 of 7
+// reader: 2 lines from 4 chunks, kinds GGA VTG, waiting 6 bytes
+// ddmm: 4807.038 01131.000 0000.000 18000.000
+// rebuilt gga: same as the example
+use nmea;
+use vec;
+use string;
+
+const GGA: str = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47";
+const RMC: str = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+const GSA: str = "$GPGSA,A,3,04,05,,09,12,,,24,,,,,2.5,1.3,2.1*39";
+const GSV1: str = "$GPGSV,2,1,08,01,40,083,46,02,17,308,41,12,07,344,39,14,22,228,45*75";
+const VTG: str = "$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48";
+const UBX: str = "$GNRMC,001031.00,A,4404.13993,N,12118.86023,W,0.146,,100117,,,A*7B";
+
+var bad_ok: i64 = 0;
+var bad_n: i64 = 0;
+
+fn bad(line: str, require: bool) {
+    bad_n = bad_n + 1;
+    if !nmea_parse(line, require).ok {
+        bad_ok = bad_ok + 1;
+    } else {
+        println("accepted " + line);
+    }
+}
+
+fn ints(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn two(n: i64) -> str {
+    if n < 10 {
+        return "0" + int_to_str(n);
+    }
+    return int_to_str(n);
+}
+
+fn main() {
+    val gsv2: str = nmea_sentence("GPGSV,2,2,08,15,50,120,40,18,10,050,,21,,,,22,05,300,30");
+    var ok: i64 = 0;
+    var all: Vec<str> = Vec::new();
+    all.push(GGA); all.push(RMC); all.push(GSA); all.push(GSV1); all.push(VTG); all.push(UBX);
+    var i: i64 = 0;
+    while i < all.len() {
+        if nmea_parse(all.get(i), true).ok {
+            ok = ok + 1;
+        } else {
+            println("bad: " + all.get(i) + " " + nmea_parse(all.get(i), true).error);
+        }
+        i = i + 1;
+    }
+    println("checksums: " + int_to_str(ok) + " of " + int_to_str(all.len()) + " valid");
+
+    val g: NmeaGga = nmea_gga(&nmea_parse(GGA, true));
+    println("gga: 12:35:19 = " + nmea_fixed(g.time, 0) + " s, " + nmea_fixed(g.lat, 6) + " " + nmea_fixed(g.lon, 6) + ", quality " + int_to_str(g.quality) + ", " + int_to_str(g.sats) + " sats, hdop " + nmea_fixed(g.hdop, 1) + ", alt " + nmea_fixed(g.alt, 1) + " m, geoid " + nmea_fixed(g.geoid, 1) + " m");
+
+    val r: NmeaRmc = nmea_rmc(&nmea_parse(RMC, true));
+    println("rmc: valid " + bool_to_str(r.valid) + ", " + nmea_fixed(r.speed_knots, 1) + " kn, course " + nmea_fixed(r.course, 1) + ", " + int_to_str(r.year) + "-" + two(r.month) + "-" + two(r.day) + ", magvar " + nmea_fixed(r.magvar, 1) + ", unix " + nmea_fixed(nmea_rmc_unix(&r), 0));
+
+    val a: NmeaGsa = nmea_gsa(&nmea_parse(GSA, true));
+    println("gsa: mode " + a.mode + " fix " + int_to_str(a.fix) + ", prns " + ints(a.prns) + ", pdop " + nmea_fixed(a.pdop, 1) + " hdop " + nmea_fixed(a.hdop, 1) + " vdop " + nmea_fixed(a.vdop, 1));
+
+    var sky: NmeaSky = nmea_sky_new();
+    nmea_sky_add(&mut sky, &nmea_parse(GSV1, true));
+    val done: bool = nmea_sky_add(&mut sky, &nmea_parse(gsv2, true));
+    println("gsv: complete " + bool_to_str(done) + ", " + int_to_str(sky.in_view) + " in view, prns " + ints(sky.prns) + ", snr of 18 = " + int_to_str(sky.snrs.get(5)) + ", elevation of 21 = " + int_to_str(sky.elevs.get(6)));
+
+    val v: NmeaVtg = nmea_vtg(&nmea_parse(VTG, true));
+    println("vtg: true " + nmea_fixed(v.course_true, 1) + " magnetic " + nmea_fixed(v.course_mag, 1) + ", " + nmea_fixed(v.knots, 1) + " kn = " + nmea_fixed(v.kmh, 1) + " km/h");
+
+    val us: NmeaSentence = nmea_parse(UBX, true);
+    val u: NmeaRmc = nmea_rmc(&us);
+    println("gnrmc: talker " + us.talker + ", " + nmea_fixed(u.lat, 6) + " " + nmea_fixed(u.lon, 6) + ", " + nmea_fixed(u.speed_knots, 3) + " kn, course given " + bool_to_str(u.has_course) + ", " + int_to_str(u.year) + "-" + two(u.month) + "-" + two(u.day) + ", mode " + u.mode + ", unix " + nmea_fixed(nmea_rmc_unix(&u), 0));
+
+    bad("$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*49", false);   // wrong checksum
+    bad("GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48", false);    // no $
+    bad("$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K", true);       // checksum required
+    bad("$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*4G", false);   // not hex
+    bad("$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*4", false);    // one digit
+    bad("$GP,1,2", false);                                     // address too short
+    bad("$GPTXT,01,01,02,0123456789012345678901234567890123456789012345678901234567890123456789", false); // over 82
+    println("rejected: " + int_to_str(bad_ok) + " of " + int_to_str(bad_n));
+
+    var rd: NmeaReader = nmea_reader_new();
+    var lines: Vec<str> = Vec::new();
+    lines.extend(nmea_reader_feed(&mut rd, str_slice(GGA, 0, 20)));
+    lines.extend(nmea_reader_feed(&mut rd, str_slice(GGA, 20, str_len(GGA)) + "\r\n$GPVT"));
+    lines.extend(nmea_reader_feed(&mut rd, str_slice(VTG, 5, str_len(VTG)) + "\r"));
+    lines.extend(nmea_reader_feed(&mut rd, "\n$GPRMC"));
+    var kinds: str = "";
+    i = 0;
+    while i < lines.len() {
+        if i > 0 {
+            kinds = kinds + " ";
+        }
+        kinds = kinds + nmea_parse(lines.get(i), true).kind;
+        i = i + 1;
+    }
+    println("reader: " + int_to_str(lines.len()) + " lines from 4 chunks, kinds " + kinds + ", waiting " + int_to_str(str_len(rd.buf)) + " bytes");
+
+    println("ddmm: " + nmea_ddmm(48.1173, false, 3) + " " + nmea_ddmm(11.0 + 31.0 / 60.0, true, 3) + " " + nmea_ddmm(0.0, false, 3) + " " + nmea_ddmm(179.99999833, true, 3));
+
+    val built: str = nmea_build_gga("123519", g.lat, g.lon, 3, g.quality, g.sats, g.hdop, g.alt, g.geoid);
+    if built == GGA {
+        println("rebuilt gga: same as the example");
+    } else {
+        println("rebuilt gga: DIFFERENT " + built);
+    }
+}

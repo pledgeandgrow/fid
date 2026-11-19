@@ -68,13 +68,18 @@ pub fn hash_i64(n: i64) -> i64 {
 // ─── Combine ────────────────────────────────────────────────────────────
 
 /// Combine two hash values (for hashing tuples/structs).
-/// Simple XOR-based combine to avoid overflow.
+/// Boost-style combine: order-sensitive, and equal pairs do not cancel.
+/// a and b are treated as 32-bit; the result stays 32-bit.
 ///
 /// Example:
 ///   var h = hash_combine(hash_str("x"), hash_i64(7));
 ///   assert_eq(h, hash_combine(hash_str("x"), hash_i64(7)));
+///   assert(hash_combine(1, 2) != hash_combine(2, 1));
+///   assert(hash_combine(7, 7) != 0);
 pub fn hash_combine(a: i64, b: i64) -> i64 {
-    return (a ^ b) & 0xFFFFFFFF;
+    var x: i64 = a & 0xFFFFFFFF;
+    var y: i64 = b & 0xFFFFFFFF;
+    return (x ^ (y + 0x9e3779b9 + (x << 6) + (x >> 2))) & 0xFFFFFFFF;
 }
 
 /// Hash a Vec of i64 values by combining their hashes.
@@ -98,6 +103,7 @@ pub fn hash_vec(v: Vec<i64>) -> i64 {
 // ─── DJB2 ───────────────────────────────────────────────────────────────
 
 /// DJB2 hash of a string. Simple, fast, good for small hash tables.
+/// Kept modulo 2^32 so it never overflows i64 arithmetic.
 ///
 /// Example:
 ///   assert_eq(hash_djb2(""), 5381);
@@ -106,7 +112,7 @@ pub fn hash_djb2(s: str) -> i64 {
     var hash: i64 = 5381;
     var i = 0;
     while i < str_len(s) {
-        hash = ((hash << 5) + hash) + str_byte_at(s, i);
+        hash = ((hash << 5) + hash + str_byte_at(s, i)) & 0xFFFFFFFF;
         i = i + 1;
     }
     return hash;
@@ -122,7 +128,7 @@ pub fn hash_djb2_bytes(bytes: Vec<i64>) -> i64 {
     var hash: i64 = 5381;
     var i = 0;
     while i < bytes.len() {
-        hash = ((hash << 5) + hash) + bytes.get(i);
+        hash = ((hash << 5) + hash + bytes.get(i)) & 0xFFFFFFFF;
         i = i + 1;
     }
     return hash;
@@ -199,4 +205,142 @@ pub fn hash_crc32(bytes: Vec<i64>) -> i64 {
 pub fn hash_crc32_str(s: str) -> i64 {
     var bytes = str_bytes(s);
     return hash_crc32(bytes);
+}
+
+// ─── 64-bit FNV-1a ──────────────────────────────────────────────────────
+// Wider than the 32-bit helpers for large tables; wraps i64 on purpose.
+
+// FNV-1a 64: offset basis 0xCBF29CE484222325, prime 0x100000001B3.
+@wrapping fn fnv64_step(h: i64, b: i64) -> i64 {
+    return (h ^ (b & 255)) * 1099511628211;
+}
+
+/// 64-bit FNV-1a hash of a string (wraps i64; result can be negative).
+///
+/// Example:
+///   assert_eq(hash64_str(""), -3750763034362895579);
+///   assert(hash64_str("abc") != hash64_str("abd"));
+pub fn hash64_str(s: str) -> i64 {
+    var h: i64 = -3750763034362895579; // 14695981039346656037 unsigned
+    var i = 0;
+    while i < str_len(s) {
+        h = fnv64_step(h, str_byte_at(s, i));
+        i = i + 1;
+    }
+    return h;
+}
+
+/// 64-bit FNV-1a hash of a Vec of bytes.
+///
+/// Example:
+///   var b: Vec<i64> = Vec::new();
+///   b.push(97);
+///   assert_eq(hash64_bytes(b), hash64_str("a"));
+pub fn hash64_bytes(bytes: Vec<i64>) -> i64 {
+    var h: i64 = -3750763034362895579;
+    var i = 0;
+    while i < bytes.len() {
+        h = fnv64_step(h, bytes.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+/// 64-bit FNV-1a hash of an i64 (all 8 bytes).
+///
+/// Example:
+///   assert_eq(hash64_i64(42), hash64_i64(42));
+///   assert(hash64_i64(1) != hash64_i64(2));
+pub fn hash64_i64(n: i64) -> i64 {
+    var h: i64 = -3750763034362895579;
+    var i = 0;
+    while i < 8 {
+        h = fnv64_step(h, n >> (i * 8));
+        i = i + 1;
+    }
+    return h;
+}
+
+/// splitmix64 finalizer: strong avalanche for turning one i64 key into a
+/// table index. Mixes better than hashing the bytes for a single word.
+///
+/// Example:
+///   assert_eq(hash_mix64(0), -280303742238208354);
+///   assert(hash_mix64(1) != hash_mix64(2));
+@wrapping pub fn hash_mix64(x: i64) -> i64 {
+    var z: i64 = x + -7046029254386353131;
+    z = (z ^ (z >> 30)) * -4658895280553007687;
+    z = (z ^ (z >> 27)) * -7723592293110705685;
+    return z ^ (z >> 31);
+}
+
+/// Combine two 64-bit hashes (order-sensitive).
+///
+/// Example:
+///   assert(hash64_combine(1, 2) != hash64_combine(2, 1));
+@wrapping pub fn hash64_combine(a: i64, b: i64) -> i64 {
+    return a ^ (b + -7046029254386353131 + (a << 6) + (a >> 2));
+}
+
+// ─── Streaming hasher ───────────────────────────────────────────────────
+
+/// Incremental 64-bit FNV-1a hasher: feed bytes in any chunk sizes and the
+/// result equals hashing the concatenation.
+///
+/// Example:
+///   var h = Hasher::new();
+///   h.update_str("he");
+///   h.update_str("llo");
+///   assert_eq(h.digest(), hash64_str("hello"));
+pub struct Hasher {
+    pub h: i64,
+}
+
+impl Hasher {
+    /// An empty 64-bit hasher.
+    pub fn new() -> Hasher {
+        return Hasher { h: -3750763034362895579 };
+    }
+
+    /// Feed a Vec of bytes.
+    pub fn update(self: & mut Hasher, bytes: Vec<i64>) -> void {
+        var i = 0;
+        while i < bytes.len() {
+            self.h = fnv64_step(self.h, bytes.get(i));
+            i = i + 1;
+        }
+    }
+
+    /// Feed one byte.
+    pub fn update_byte(self: & mut Hasher, b: i64) -> void {
+        self.h = fnv64_step(self.h, b);
+    }
+
+    /// Feed all 8 bytes of an i64.
+    pub fn update_i64(self: & mut Hasher, n: i64) -> void {
+        var i = 0;
+        while i < 8 {
+            self.h = fnv64_step(self.h, n >> (i * 8));
+            i = i + 1;
+        }
+    }
+
+    /// Feed a string's bytes.
+    pub fn update_str(self: & mut Hasher, s: str) -> void {
+        var i = 0;
+        while i < str_len(s) {
+            self.h = fnv64_step(self.h, str_byte_at(s, i));
+            i = i + 1;
+        }
+    }
+
+    /// The current 64-bit hash value.
+    pub fn digest(self: &Hasher) -> i64 {
+        return self.h;
+    }
+
+    /// Reset to the empty state.
+    pub fn reset(self: & mut Hasher) -> void {
+        self.h = -3750763034362895579;
+    }
 }

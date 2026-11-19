@@ -1,0 +1,289 @@
+// stdlib/matchmaking: lobbies with host migration, Elo, Glicko-2 (Glickman worked example: the paper rounds intermediates to 1464.06 / 151.52 / 0.05999; unrounded 1464.0507 / 151.5165 / 0.059996), widening skill queue with snake-draft teams, SHA-1/HMAC-SHA1 (FIPS/RFC 2202 vectors), STUN codec on the RFC 5769 test vectors (decode, integrity, fingerprint, exact re-encode), NAT classification, ICE priorities
+// Expected output:
+// lobby 1 created by 7
+// join 9: ok 2, join 11: ok 3, join 12: lobby full, join 9 again: already in this lobby
+// 7 leaves: host changed true, new host 9
+// 11 kicks 12: only the host can kick; 9 kicks 11: ok
+// closed lobby: lobby closed; joinable now: 0
+// last leaves: closed true; lobby exists false
+// elo: 1607.69 1392.31 expected 0.7597
+// glicko-2: r 1464.0507 rd 151.5165 vol 0.059996
+// glicko-2 idle period: rd 200.27
+// queue t=0: 1 match(es): [2 1] spread 20
+// queue t=5: 0 match(es), waiting 3
+// queue t=10: 1 match(es): [3 4] spread 150
+// queue t=60: 0 match(es), waiting 1
+// 2v2: A [13 10] B [12 11] balance 0
+// sha1(abc) = a9993e364706816aba3e25717850c26c9cd0d89d
+// hmac-sha1 = effcdf6ae5eb2fa2d27416d5f184df9c259a7c79
+// request: method 1 class 0, 6 attributes, username evtj:h6vY, software STUN test client
+// request: integrity true, wrong password false, fingerprint true, corrupted fingerprint false
+// ipv4 response: 192.0.2.1:32853 integrity true fingerprint true
+// ipv4 response re-encoded identical: true
+// ipv6 response: [2001:db8:1234:5678:11:2233:4455:6677]:32853 integrity true fingerprint true
+// ipv6 response re-encoded identical: true
+// binding request: 28 bytes, stun true, fingerprint true, type 0x1
+// types: 0x101 success 2, 0x111 class 3 method 1
+// error code 420 round trip: 420
+// not stun: false
+// v6 compressed: [2001:db8::1]:3478
+// nat: no NAT / endpoint-independent mapping / address-dependent mapping / address and port-dependent mapping
+// hole punch: true false true
+// ice host priority 2130706431, srflx 1694498815, pair 7277816997797167103
+use matchmaking;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn fx(x: f64, dp: i64) -> str {
+    if dp == 0 {
+        return int_to_str((x + 0.5) as i64);
+    }
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < dp {
+        p = p * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val v: i64 = (a * (p as f64) + 0.5) as i64;
+    var fr: str = int_to_str(v % p);
+    while str_len(fr) < dp { fr = "0" + fr; }
+    var out: str = int_to_str(v / p) + "." + fr;
+    if neg { out = "-" + out; }
+    return out;
+}
+
+fn hx(b: &Vec<i64>) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        s = s + byte_to_str(str_byte_at(d, b.get(i) >> 4)) + byte_to_str(str_byte_at(d, b.get(i) & 15));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn hexn(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    if v == 0 { return "0x0"; }
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = byte_to_str(str_byte_at(d, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+fn unhex(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        var v: i64 = - 1;
+        if c >= 48 && c <= 57 { v = c - 48; }
+        if c >= 97 && c <= 102 { v = c - 87; }
+        if v >= 0 {
+            cur = cur * 16 + v;
+            n = n + 1;
+            if n == 2 {
+                out.push(cur);
+                cur = 0;
+                n = 0;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ids(v: &Vec<i64>) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + " "; }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+fn same(a: &Vec<i64>, b: &Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn res(r: Result<i64, str>) -> str {
+    match r {
+        Result::Ok(v) => { return "ok " + int_to_str(v); }
+        Result::Err(e) => { return e; }
+    }
+}
+
+fn show_tick(q: &mut MmQueue, t: i64) {
+    val ms: Vec<MmMatch> = mm_queue_tick(q, t);
+    var line: str = "queue t=" + int_to_str(t) + ": " + int_to_str(ms.len()) + " match(es)";
+    if ms.len() == 0 {
+        line = line + ", waiting " + int_to_str(q.entries.len());
+    }
+    var i: i64 = 0;
+    while i < ms.len() {
+        line = line + ": " + ids(&ms.get(i).players) + " spread " + fx(ms.get(i).spread, 0);
+        i = i + 1;
+    }
+    println(line);
+}
+
+fn addr_of(r: Result<StunAddr, str>) -> str {
+    match r {
+        Result::Ok(a) => { return stun_addr_str(&a); }
+        Result::Err(e) => { return e; }
+    }
+}
+
+fn v4(a: i64, b: i64, c: i64, d: i64, port: i64) -> StunAddr {
+    var ip: Vec<i64> = Vec::new();
+    ip.push(a); ip.push(b); ip.push(c); ip.push(d);
+    return StunAddr { family: 1, port: port, ip: ip };
+}
+
+fn main() {
+    // ── lobbies
+    var lob: MmLobbies = mm_lobbies_new();
+    val id: i64 = mm_lobby_create(&mut lob, 7, "duel", 3);
+    println("lobby " + int_to_str(id) + " created by 7");
+    val j1: str = res(mm_lobby_join(&mut lob, id, 9));
+    val j2: str = res(mm_lobby_join(&mut lob, id, 11));
+    val j3: str = res(mm_lobby_join(&mut lob, id, 12));
+    val j4: str = res(mm_lobby_join(&mut lob, id, 9));
+    println("join 9: " + j1 + ", join 11: " + j2 + ", join 12: " + j3 + ", join 9 again: " + j4);
+    val lv: MmLeave = mm_lobby_leave(&mut lob, id, 7);
+    println("7 leaves: host changed " + yes(lv.host_changed) + ", new host " + int_to_str(lv.new_host));
+    mm_lobby_join(&mut lob, id, 12);
+    val k1: str = res(mm_lobby_kick(&mut lob, id, 11, 12));
+    var k2: str = res(mm_lobby_kick(&mut lob, id, 9, 11));
+    if str_starts_with(k2, "ok") { k2 = "ok"; }
+    println("11 kicks 12: " + k1 + "; 9 kicks 11: " + k2);
+    mm_lobby_set_open(&mut lob, id, 9, false);
+    println("closed lobby: " + res(mm_lobby_join(&mut lob, id, 20)) + "; joinable now: " + int_to_str(mm_lobby_list_joinable(&lob).len()));
+    mm_lobby_leave(&mut lob, id, 9);
+    val last: MmLeave = mm_lobby_leave(&mut lob, id, 12);
+    var exists: bool = false;
+    match mm_lobby_get(&lob, id) {
+        Option::Some(_) => { exists = true; }
+        Option::None => { }
+    }
+    println("last leaves: closed " + yes(last.closed) + "; lobby exists " + yes(exists));
+
+    // ── ratings
+    println("elo: " + fx(elo_update(1600.0, 1400.0, 1.0, 32.0), 2) + " " + fx(elo_update(1400.0, 1600.0, 0.0, 32.0), 2) + " expected " + fx(elo_expected(1600.0, 1400.0), 4));
+    val me: Glicko2 = Glicko2 { rating: 1500.0, rd: 200.0, vol: 0.06 };
+    var opps: Vec<Glicko2> = Vec::new();
+    opps.push(Glicko2 { rating: 1400.0, rd: 30.0, vol: 0.06 });
+    opps.push(Glicko2 { rating: 1550.0, rd: 100.0, vol: 0.06 });
+    opps.push(Glicko2 { rating: 1700.0, rd: 300.0, vol: 0.06 });
+    var sc: Vec<f64> = Vec::new();
+    sc.push(1.0); sc.push(0.0); sc.push(0.0);
+    val g2: Glicko2 = glicko2_update(me, &opps, &sc, 0.5);
+    println("glicko-2: r " + fx(g2.rating, 4) + " rd " + fx(g2.rd, 4) + " vol " + fx(g2.vol, 6));
+    val idle: Glicko2 = glicko2_update(me, &Vec::new(), &Vec::new(), 0.5);
+    println("glicko-2 idle period: rd " + fx(idle.rd, 2));
+
+    // ── queue
+    var q: MmQueue = mm_queue_new(2, 50.0, 10.0, 400.0);
+    mm_queue_add(&mut q, 1, 1500.0, 0);
+    mm_queue_add(&mut q, 2, 1520.0, 0);
+    mm_queue_add(&mut q, 3, 1800.0, 0);
+    mm_queue_add(&mut q, 4, 1650.0, 0);
+    mm_queue_add(&mut q, 5, 2400.0, 0);
+    show_tick(&mut q, 0);
+    show_tick(&mut q, 5);
+    show_tick(&mut q, 10);
+    show_tick(&mut q, 60);
+    var qd: MmQueue = mm_queue_new(4, 400.0, 0.0, 400.0);
+    mm_queue_add(&mut qd, 10, 1000.0, 0);
+    mm_queue_add(&mut qd, 11, 1100.0, 0);
+    mm_queue_add(&mut qd, 12, 1200.0, 0);
+    mm_queue_add(&mut qd, 13, 1300.0, 0);
+    val m4: Vec<MmMatch> = mm_queue_tick(&mut qd, 0);
+    println("2v2: A " + ids(&m4.get(0).team_a) + " B " + ids(&m4.get(0).team_b) + " balance " + int_to_str(m4.get(0).balance as i64));
+
+    // ── hashes
+    println("sha1(abc) = " + hx(&mm_sha1(&str_bytes("abc"))));
+    println("hmac-sha1 = " + hx(&mm_hmac_sha1(&str_bytes("Jefe"), &str_bytes("what do ya want for nothing?"))));
+
+    // ── STUN, RFC 5769
+    val pw: Vec<i64> = str_bytes("VOkJxbRl1RmTxUk/WvJxBt");
+    val req: Vec<i64> = unhex("000100582112a442b7e7a701bc34d686fa87dfae802200105354554e20746573742063 6c69656e74002400046e0001ff80290008932ff9b151263b36000600096576746a3a68367659202020000800149aeaa70cbfd8cb56781ef2b5b2d3f249c1b571a280280004e57a3bcf");
+    match stun_decode(&req) {
+        Result::Ok(m) => {
+            var user: str = "";
+            var soft: str = "";
+            match stun_find_attr(&m, STUN_ATTR_USERNAME) {
+                Option::Some(v) => { user = str_from_bytes(v); }
+                Option::None => { }
+            }
+            match stun_find_attr(&m, STUN_ATTR_SOFTWARE) {
+                Option::Some(v) => { soft = str_from_bytes(v); }
+                Option::None => { }
+            }
+            println("request: method " + int_to_str(m.method) + " class " + int_to_str(m.class) + ", " + int_to_str(m.attrs.len()) + " attributes, username " + user + ", software " + soft);
+        }
+        Result::Err(e) => { println("request: " + e); }
+    }
+    var bad: Vec<i64> = req;
+    bad.set(30, bad.get(30) ^ 1);
+    println("request: integrity " + yes(stun_check_integrity(&req, &pw)) + ", wrong password " + yes(stun_check_integrity(&req, &str_bytes("nope"))) + ", fingerprint " + yes(stun_check_fingerprint(&req)) + ", corrupted fingerprint " + yes(stun_check_fingerprint(&bad)));
+
+    val r4: Vec<i64> = unhex("0101003c2112a442b7e7a701bc34d686fa87dfae8022000b7465737420766563746f7220002000080001a147e112a64300080014 2b91f599fd9e90c38c7489f92af9ba53f06be7d780280004c07d4c96");
+    println("ipv4 response: " + addr_of(stun_response_address(&r4)) + " integrity " + yes(stun_check_integrity(&r4, &pw)) + " fingerprint " + yes(stun_check_fingerprint(&r4)));
+    val txid: Vec<i64> = unhex("b7e7a701bc34d686fa87dfae");
+    var m4r: StunMsg = stun_msg_new(STUN_METHOD_BINDING, STUN_CLASS_SUCCESS, txid);
+    stun_add_attr(&mut m4r, STUN_ATTR_SOFTWARE, str_bytes("test vector"));
+    stun_add_attr(&mut m4r, STUN_ATTR_XOR_MAPPED_ADDRESS, stun_xor_address_encode(&v4(192, 0, 2, 1, 32853), &txid));
+    println("ipv4 response re-encoded identical: " + yes(same(&stun_encode_padded(&m4r, &pw, true, 32), &r4)));
+
+    val r6: Vec<i64> = unhex("010100482112a442b7e7a701bc34d686fa87dfae8022000b7465737420766563746f7220002000140002a1470113a9faa5d3f179bc25f4b5bed2b9d900080014a382954e4be67bf11784c97c8292c275bfe3ed4180280004c8fb0b4c");
+    println("ipv6 response: " + addr_of(stun_response_address(&r6)) + " integrity " + yes(stun_check_integrity(&r6, &pw)) + " fingerprint " + yes(stun_check_fingerprint(&r6)));
+    var a6: StunAddr = StunAddr { family: 2, port: 32853, ip: unhex("20010db8123456780011223344556677") };
+    var m6r: StunMsg = stun_msg_new(STUN_METHOD_BINDING, STUN_CLASS_SUCCESS, txid);
+    stun_add_attr(&mut m6r, STUN_ATTR_SOFTWARE, str_bytes("test vector"));
+    stun_add_attr(&mut m6r, STUN_ATTR_XOR_MAPPED_ADDRESS, stun_xor_address_encode(&a6, &txid));
+    println("ipv6 response re-encoded identical: " + yes(same(&stun_encode_padded(&m6r, &pw, true, 32), &r6)));
+
+    val br: Vec<i64> = stun_binding_request(txid, Vec::new(), true);
+    println("binding request: " + int_to_str(br.len()) + " bytes, stun " + yes(stun_is_message(&br)) + ", fingerprint " + yes(stun_check_fingerprint(&br)) + ", type " + hexn((br.get(0) << 8) | br.get(1)));
+    println("types: " + hexn(stun_type(1, 2)) + " success " + int_to_str(stun_type_class(0x0101)) + ", 0x111 class " + int_to_str(stun_type_class(0x0111)) + " method " + int_to_str(stun_type_method(0x0111)));
+    println("error code 420 round trip: " + int_to_str(stun_error_code_decode(&stun_error_code_encode(420, "Unknown Attribute"))));
+    println("not stun: " + yes(stun_is_message(&str_bytes("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))));
+    var a7: StunAddr = StunAddr { family: 2, port: 3478, ip: unhex("20010db8000000000000000000000001") };
+    println("v6 compressed: " + stun_addr_str(&a7));
+
+    // ── NAT and ICE
+    val local: StunAddr = v4(192, 168, 1, 10, 5000);
+    val pub1: StunAddr = v4(203, 0, 113, 5, 40000);
+    val pub2: StunAddr = v4(203, 0, 113, 5, 40001);
+    val pub3: StunAddr = v4(203, 0, 113, 5, 40002);
+    val n0: i64 = nat_mapping_behaviour(&local, &local, &local, &local);
+    val n1: i64 = nat_mapping_behaviour(&local, &pub1, &pub1, &pub1);
+    val n2: i64 = nat_mapping_behaviour(&local, &pub1, &pub2, &pub2);
+    val n3: i64 = nat_mapping_behaviour(&local, &pub1, &pub2, &pub3);
+    println("nat: " + nat_behaviour_name(n0) + " / " + nat_behaviour_name(n1) + " / " + nat_behaviour_name(n2) + " / " + nat_behaviour_name(n3));
+    println("hole punch: " + yes(nat_hole_punch_likely(n1, n1)) + " " + yes(nat_hole_punch_likely(n1, n3)) + " " + yes(nat_hole_punch_likely(n0, n3)));
+    val hp: i64 = ice_candidate_priority(ICE_TYPE_HOST, 65535, 1);
+    val sp: i64 = ice_candidate_priority(ICE_TYPE_SERVER_REFLEXIVE, 65535, 1);
+    println("ice host priority " + int_to_str(hp) + ", srflx " + int_to_str(sp) + ", pair " + int_to_str(ice_pair_priority(hp, sp)));
+}

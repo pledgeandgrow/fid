@@ -1,0 +1,129 @@
+// OP27 (competitive roadmap): a local Vec passed only to the program's own
+// functions that hand it to core's Vec functions keeps its header on the
+// stack (lower.fd lw_rc_header_safe_params, LF13). A function that keeps
+// the Vec, returns it, or passes it on to something unknown leaves the
+// caller's header on the heap. Every case must give the same results as a
+// heap header; under --leaks or --checked-alloc no block is left or misused.
+//
+// Expected output:
+//     sum 15
+//     count 5
+//     first 1 last 5
+//     depth sum 15
+//     kept 3
+//     kept again 3
+//     copy 4
+//     pushed 6
+//     after 5
+//     both 30
+//     words: a b c
+//     done
+
+struct Holder {
+    items: Vec<i64>,
+}
+
+// only reads through core's Vec functions: safe
+fn sum(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+// passes it on to a safe parameter: safe
+fn count(v: Vec<i64>) -> i64 {
+    return v.len() + sum(v) * 0;
+}
+
+fn ends(v: Vec<i64>) -> str {
+    return "first " + int_to_str(v.get(0)) + " last " + int_to_str(v.get(v.len() - 1));
+}
+
+// recursion: safe while nothing else spoils it
+fn depth_sum(v: Vec<i64>, i: i64) -> i64 {
+    if i >= v.len() {
+        return 0;
+    }
+    return v.get(i) + depth_sum(v, i + 1);
+}
+
+// keeps the Vec in a struct: the value it keeps is its own (a share)
+fn keep(v: Vec<i64>) -> Holder {
+    return Holder { items: v };
+}
+
+// returns it: the caller gets a value of its own
+fn same(v: Vec<i64>) -> Vec<i64> {
+    return v;
+}
+
+// changes its copy: the caller's Vec is unchanged
+fn pushed(v: Vec<i64>) -> i64 {
+    var w: Vec<i64> = v;
+    w.push(6);
+    return w.len();
+}
+
+fn both(a: Vec<i64>, b: Vec<i64>) -> i64 {
+    return sum(a) + sum(b);
+}
+
+fn join_words(ws: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < ws.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + ws.get(i);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= 5 {
+        v.push(i);
+        i = i + 1;
+    }
+    println("sum " + int_to_str(sum(v)));
+    println("count " + int_to_str(count(v)));
+    println(ends(v));
+    println("depth sum " + int_to_str(depth_sum(v, 0)));
+
+    var k: Vec<i64> = Vec::new();
+    k.push(7);
+    k.push(8);
+    k.push(9);
+    val h: Holder = keep(k);
+    println("kept " + int_to_str(h.items.len()));
+    val s2: Vec<i64> = same(k);
+    println("kept again " + int_to_str(s2.len()));
+
+    var c: Vec<i64> = Vec::new();
+    c.push(1);
+    c.push(2);
+    c.push(3);
+    println("copy " + int_to_str(c.len() + 1));
+    println("pushed " + int_to_str(pushed(v)));
+    println("after " + int_to_str(v.len()));
+
+    var a: Vec<i64> = Vec::new();
+    a.push(10);
+    var b: Vec<i64> = Vec::new();
+    b.push(20);
+    println("both " + int_to_str(both(a, b)));
+
+    var ws: Vec<str> = Vec::new();
+    ws.push("a");
+    ws.push("b");
+    ws.push("c");
+    println("words: " + join_words(ws));
+    println("done");
+}

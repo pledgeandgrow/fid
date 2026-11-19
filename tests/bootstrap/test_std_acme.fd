@@ -1,0 +1,278 @@
+// stdlib/acme: a full order for www.example.org (http-01) and *.example.org (dns-01) against a scripted fake ACME server written below, which verifies every JWS (signature, nonce, url, jwk/kid), the external account binding, each challenge's key authorization or TXT value and the CSR's signature and names, injects one badNonce and answers "processing" with Retry-After once; then the CSR checker refuses a tampered CSR. Ed25519 keys (EdDSA): P-256 takes minutes per signature in the interpreter; the ES256 flow ran from a C build. OpenSSL 3.5 accepts the CSR printed here (openssl req -verify).
+// Expected output:
+// GET /dir -> 200
+// HEAD /new-nonce -> 200
+// POST /new-acct -> 201
+// POST /new-order -> 400
+// POST /new-order -> 201
+// POST /authz/0 -> 200
+// publish http-01 /.well-known/acme-challenge/tok-www-0 tok-www-0.kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+// POST /chal/0/http-01 -> 200
+// POST /authz/0 -> 200
+// POST /authz/0 -> 200
+// POST /authz/1 -> 200
+// publish dns-01 _acme-challenge.example.org TXT eeI7CWElEz-evtGEfzr33E7ySBUuNaYXUroipWJDUMs
+// POST /chal/1/dns-01 -> 200
+// POST /authz/1 -> 200
+// POST /order/1/finalize -> 200
+// POST /order/1 -> 200
+// POST /cert/1 -> 200
+// state done, certificate blocks 2, account https://acme.test/acct/1
+// server saw 13 signed requests, 0 bad signatures
+// csr names www.example.org,*.example.org cn www.example.org key Ed25519
+// csr sha256 f83030889713816e64b4d13a6fabfe415fd420547d106ac0b233cee436c3a65d
+// tampered csr: bad CSR signature
+// problem urn:ietf:params:acme:error:rateLimited: too many orders
+use acme;
+use jose;
+use pem;
+use asn1;
+use vec;
+use string;
+use encoding;
+use json;
+use crypto;
+use kdf;
+
+struct FakeAcme {
+    base: str,
+    nonce_ctr: i64,
+    issued: Vec<str>,
+    acct: Jwk,
+    has_acct: bool,
+    eab_key: Vec<i64>,
+    bad_nonce_sent: bool,
+    authz0: str,
+    authz1: str,
+    polls0: i64,
+    order_status: str,
+    signed: i64,
+    bad: i64,
+}
+
+struct FakeResp {
+    status: i64,
+    location: str,
+    nonce: str,
+    retry_after: i64,
+    body: str,
+}
+
+fn fake_nonce(f: & mut FakeAcme) -> str {
+    f.nonce_ctr = f.nonce_ctr + 1;
+    val n: str = "nonce-" + int_to_str(f.nonce_ctr);
+    f.issued.push(n);
+    return n;
+}
+
+fn fake_resp(f: & mut FakeAcme, status: i64, location: str, body: str) -> FakeResp {
+    return FakeResp { status: status, location: location, nonce: fake_nonce(f), retry_after: 0, body: body };
+}
+
+fn fake_problem(f: & mut FakeAcme, status: i64, kind: str, detail: str) -> FakeResp {
+    return fake_resp(f, status, "", "{\"type\":\"urn:ietf:params:acme:error:" + kind + "\",\"detail\":" + json_string(detail) + ",\"status\":" + int_to_str(status) + "}");
+}
+
+/// Check a flattened JWS: nonce issued and unused, url, jwk or kid, signature.
+/// Returns the payload text, or "!" on failure.
+fn fake_verify(f: & mut FakeAcme, req: & AcmeHttpRequest) -> str {
+    val body: str = req.body;
+    val h: str = str_from_bytes(jose_b64url_bytes(json_get_str(body, "protected")));
+    val payload: str = str_from_bytes(jose_b64url_bytes(json_get_str(body, "payload")));
+    val sig: Vec<i64> = jose_b64url_bytes(json_get_str(body, "signature"));
+    if !str_equal(json_get_str(h, "url"), req.url) { return "!"; }
+    val nonce: str = json_get_str(h, "nonce");
+    var found: bool = false;
+    var rest: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < f.issued.len() {
+        if str_equal(f.issued.get(i), nonce) { found = true; } else { rest.push(f.issued.get(i)); }
+        i = i + 1;
+    }
+    f.issued = rest;
+    if !found { return "!nonce"; }
+    var key: Jwk = f.acct;
+    if json_has(h, "jwk") {
+        key = jwk_parse(json_get_safe(h, "jwk"));
+    } else if !f.has_acct || !str_equal(json_get_str(h, "kid"), f.base + "/acct/1") {
+        return "!";
+    }
+    f.signed = f.signed + 1;
+    val input: Vec<i64> = str_bytes(json_get_str(body, "protected") + "." + json_get_str(body, "payload"));
+    if !jws_raw_verify(json_get_str(h, "alg"), & key, input, sig) {
+        f.bad = f.bad + 1;
+        return "!";
+    }
+    if json_has(h, "jwk") {
+        f.acct = key;
+        f.has_acct = true;
+    }
+    return payload;
+}
+
+fn fake_authz(f: & FakeAcme, i: i64, status: str) -> str {
+    val tok: str = "tok-www-" + int_to_str(i);
+    if i == 0 {
+        return "{\"status\":\"" + status + "\",\"identifier\":{\"type\":\"dns\",\"value\":\"www.example.org\"},\"challenges\":["
+            + "{\"type\":\"http-01\",\"url\":\"" + f.base + "/chal/0/http-01\",\"token\":\"" + tok + "\",\"status\":\"pending\"},"
+            + "{\"type\":\"dns-01\",\"url\":\"" + f.base + "/chal/0/dns-01\",\"token\":\"" + tok + "\",\"status\":\"pending\"}]}";
+    }
+    return "{\"status\":\"" + status + "\",\"identifier\":{\"type\":\"dns\",\"value\":\"example.org\"},\"wildcard\":true,\"challenges\":["
+        + "{\"type\":\"dns-01\",\"url\":\"" + f.base + "/chal/1/dns-01\",\"token\":\"tok-wild-1\",\"status\":\"pending\"}]}";
+}
+
+fn fake_order(f: & FakeAcme) -> str {
+    var s: str = "{\"status\":\"" + f.order_status + "\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"www.example.org\"},{\"type\":\"dns\",\"value\":\"*.example.org\"}],"
+        + "\"authorizations\":[\"" + f.base + "/authz/0\",\"" + f.base + "/authz/1\"],\"finalize\":\"" + f.base + "/order/1/finalize\"";
+    if str_equal(f.order_status, "valid") { s = s + ",\"certificate\":\"" + f.base + "/cert/1\""; }
+    return s + "}";
+}
+
+fn fake_handle(f: & mut FakeAcme, req: & AcmeHttpRequest, http_path: str, http_body: str, txt_name: str, txt_value: str) -> FakeResp {
+    val path: str = str_slice(req.url, str_len(f.base), str_len(req.url));
+    if str_equal(req.method, "GET") && str_equal(path, "/dir") {
+        return FakeResp { status: 200, location: "", nonce: "", retry_after: 0,
+            body: "{\"newNonce\":\"" + f.base + "/new-nonce\",\"newAccount\":\"" + f.base + "/new-acct\",\"newOrder\":\"" + f.base + "/new-order\",\"revokeCert\":\"" + f.base + "/revoke\",\"meta\":{\"termsOfService\":\"https://acme.test/tos\",\"externalAccountRequired\":true}}" };
+    }
+    if str_equal(req.method, "HEAD") { return fake_resp(f, 200, "", ""); }
+    val payload: str = fake_verify(f, req);
+    if str_starts_with(payload, "!nonce") { return fake_problem(f, 400, "badNonce", "unknown nonce"); }
+    if str_starts_with(payload, "!") { return fake_problem(f, 403, "unauthorized", "bad JWS"); }
+    if str_equal(path, "/new-acct") {
+        // external account binding: HS256 over our account key, with this URL
+        val eab: str = json_get_safe(payload, "externalAccountBinding");
+        val eh: str = str_from_bytes(jose_b64url_bytes(json_get_str(eab, "protected")));
+        val ep: str = str_from_bytes(jose_b64url_bytes(json_get_str(eab, "payload")));
+        val mac: Vec<i64> = kdf_hmac(KDF_SHA256, f.eab_key, str_bytes(json_get_str(eab, "protected") + "." + json_get_str(eab, "payload")));
+        val epk: Jwk = jwk_parse(ep);
+        val eab_ok: bool = jose_b64url_encode(mac) == json_get_str(eab, "signature") && json_get_str(eh, "kid") == "kid-eab-1"
+            && json_get_str(eh, "url") == req.url && jwk_thumbprint_b64(& epk) == jwk_thumbprint_b64(& f.acct);
+        if !eab_ok || !json_get_bool(payload, "termsOfServiceAgreed", false) { return fake_problem(f, 403, "unauthorized", "bad external account binding"); }
+        val acct_url: str = f.base + "/acct/1";
+        return fake_resp(f, 201, acct_url, "{\"status\":\"valid\",\"contact\":" + json_get_safe(payload, "contact") + "}");
+    }
+    if str_equal(path, "/new-order") {
+        if !f.bad_nonce_sent {
+            f.bad_nonce_sent = true;
+            return fake_problem(f, 400, "badNonce", "try again");
+        }
+        f.order_status = "pending";
+        val ob: str = fake_order(f);
+        val loc: str = f.base + "/order/1";
+        return fake_resp(f, 201, loc, ob);
+    }
+    if str_equal(path, "/authz/0") {
+        if str_equal(f.authz0, "processing") {
+            f.polls0 = f.polls0 + 1;
+            if f.polls0 >= 2 { f.authz0 = "valid"; }
+            var ab: str = fake_authz(f, 0, "processing");
+            if str_equal(f.authz0, "valid") { ab = fake_authz(f, 0, "valid"); }
+            var r: FakeResp = fake_resp(f, 200, "", ab);
+            r.retry_after = 3;
+            return r;
+        }
+        val a0: str = fake_authz(f, 0, f.authz0);
+        return fake_resp(f, 200, "", a0);
+    }
+    if str_equal(path, "/authz/1") {
+        val a1: str = fake_authz(f, 1, f.authz1);
+        return fake_resp(f, 200, "", a1);
+    }
+    if str_equal(path, "/chal/0/http-01") {
+        val want: str = "tok-www-0." + jwk_thumbprint_b64(& f.acct);
+        if !str_equal(http_path, "/.well-known/acme-challenge/tok-www-0") || !str_equal(http_body, want) { return fake_problem(f, 403, "incorrectResponse", "wrong key authorization"); }
+        f.authz0 = "processing";
+        return fake_resp(f, 200, "", "{\"type\":\"http-01\",\"status\":\"processing\",\"token\":\"tok-www-0\"}");
+    }
+    if str_equal(path, "/chal/1/dns-01") {
+        val ka: str = "tok-wild-1." + jwk_thumbprint_b64(& f.acct);
+        val want2: str = jose_b64url_encode(crypto_sha256_bytes(str_bytes(ka)));
+        if !str_equal(txt_name, "_acme-challenge.example.org") || !str_equal(txt_value, want2) { return fake_problem(f, 403, "incorrectResponse", "wrong TXT record"); }
+        f.authz1 = "valid";
+        return fake_resp(f, 200, "", "{\"type\":\"dns-01\",\"status\":\"valid\",\"token\":\"tok-wild-1\"}");
+    }
+    if str_equal(path, "/order/1/finalize") {
+        if !str_equal(f.authz0, "valid") || !str_equal(f.authz1, "valid") { return fake_problem(f, 403, "orderNotReady", "authorizations pending"); }
+        val info: AcmeCsrInfo = acme_csr_check(jose_b64url_bytes(json_get_str(payload, "csr")));
+        if !info.ok || info.domains.len() != 2 || !str_equal(info.domains.get(0), "www.example.org") || !str_equal(info.domains.get(1), "*.example.org") {
+            return fake_problem(f, 400, "badCSR", "names do not match");
+        }
+        f.order_status = "processing";
+        val ob2: str = fake_order(f);
+        var r2: FakeResp = fake_resp(f, 200, "", ob2);
+        r2.retry_after = 1;
+        f.order_status = "valid";
+        return r2;
+    }
+    if str_equal(path, "/order/1") {
+        val ob3: str = fake_order(f);
+        return fake_resp(f, 200, "", ob3);
+    }
+    if str_equal(path, "/cert/1") {
+        val leaf: Vec<i64> = asn1_enc_seq(asn1_enc_utf8("leaf certificate stand-in"));
+        val root: Vec<i64> = asn1_enc_seq(asn1_enc_utf8("issuer certificate stand-in"));
+        return fake_resp(f, 200, "", pem_encode("CERTIFICATE", leaf) + pem_encode("CERTIFICATE", root));
+    }
+    return fake_problem(f, 404, "malformed", "no such resource");
+}
+
+fn main() {
+    val acct: Jwk = jwk_ed25519_private(hex_decode_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"));
+    val cert_key: Jwk = jwk_ed25519_private(hex_decode_bytes("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"));
+    var domains: Vec<str> = Vec::new();
+    domains.push("www.example.org");
+    domains.push("*.example.org");
+    var contacts: Vec<str> = Vec::new();
+    contacts.push("mailto:admin@example.org");
+    var c: AcmeClient = acme_client_new("https://acme.test/dir", acct, "EdDSA", contacts, domains);
+    acme_set_csr_key(& mut c, cert_key);
+    val eab_key: Vec<i64> = str_bytes("an external account MAC key 32b!");
+    acme_set_eab(& mut c, "kid-eab-1", eab_key);
+    var f: FakeAcme = FakeAcme {
+        base: "https://acme.test", nonce_ctr: 0, issued: Vec::new(), acct: jwk_empty(), has_acct: false,
+        eab_key: eab_key, bad_nonce_sent: false, authz0: "pending", authz1: "pending", polls0: 0,
+        order_status: "pending", signed: 0, bad: 0
+    };
+    var http_path: str = "";
+    var http_body: str = "";
+    var txt_name: str = "";
+    var txt_value: str = "";
+    var now: i64 = 1700000000;
+    var steps: i64 = 0;
+    while c.state != ACME_ST_DONE && c.state != ACME_ST_ERROR && steps < 60 {
+        val req: AcmeHttpRequest = acme_next_request(& mut c, now);
+        if c.state == ACME_ST_PUBLISH {
+            if str_equal(c.chal_type, "http-01") {
+                http_path = c.http01_path;
+                http_body = c.key_authorization;
+                println("publish http-01 " + http_path + " " + http_body);
+            } else {
+                txt_name = c.dns01_name;
+                txt_value = c.dns01_value;
+                println("publish dns-01 " + txt_name + " TXT " + txt_value);
+            }
+            acme_challenge_published(& mut c);
+        } else if str_equal(req.method, "") {
+            now = now + 1;
+        } else {
+            val r: FakeResp = fake_handle(& mut f, & req, http_path, http_body, txt_name, txt_value);
+            println(req.method + " " + str_slice(req.url, str_len(f.base), str_len(req.url)) + " -> " + int_to_str(r.status));
+            acme_handle_response(& mut c, r.status, r.location, r.nonce, r.retry_after, r.body, now);
+        }
+        steps = steps + 1;
+    }
+    var state: str = "error " + c.err;
+    if c.state == ACME_ST_DONE { state = "done"; }
+    println("state " + state + ", certificate blocks " + int_to_str(pem_decode_all(c.certificate).len()) + ", account " + c.kid);
+    println("server saw " + int_to_str(f.signed) + " signed requests, " + int_to_str(f.bad) + " bad signatures");
+
+    val csr: Vec<i64> = acme_csr(& cert_key, & domains);
+    val info: AcmeCsrInfo = acme_csr_check(csr);
+    println("csr names " + str_join(info.domains, ",") + " cn " + info.common_name + " key " + info.key_alg);
+    println("csr sha256 " + hex_encode_bytes(crypto_sha256_bytes(csr)));
+    var bad: Vec<i64> = csr;
+    bad.set(bad.len() - 1, bad.get(bad.len() - 1) ^ 1);
+    println("tampered csr: " + acme_csr_check(bad).err);
+    val pr: AcmeProblem = acme_parse_problem("{\"type\":\"urn:ietf:params:acme:error:rateLimited\",\"detail\":\"too many orders\",\"status\":429}");
+    println("problem " + pr.kind + ": " + pr.detail);
+}

@@ -1,0 +1,110 @@
+// FileView (stdlib/fs.fd, competitive roadmap RT14: mapped reads): a file
+// read in place. Its pages are mapped read-only where the system allows it
+// (C builds: compiler/codegen_c.fd __p_zc_map, mmap or MapViewOfFile;
+// native Linux: stdlib/linux_runtime/sys.fd pert_fs_map); elsewhere
+// (`fid run`, the Windows native runtime, an empty file) FileView reads the
+// file into a string. byte(), slice() and to_str() must give the same on
+// every back end: a file over several pages, slices across a page
+// boundary and at the ends, bytes out of range, binary bytes (NULs
+// included), an empty file, a missing one, a closed view, and the fake
+// file system of stdlib/world.fd.
+//
+// Expected output:
+// open: 10800
+// bytes: 116 10 -1 -1
+// line 2: true
+// across 4096:  fox| jum
+// tail: true
+// whole: true
+// closed: 0 -1
+// binary: 2560 0 255 0 -1
+// empty: 0 false
+// missing: none
+// fake: 11 world
+use fs;
+use world;
+
+fn b2s(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    val line: str = "the quick brown fox jumps.\n";
+    val text: str = str_repeat(line, 400);
+    fs_write_text("fid_view.tmp", text);
+    match FileView::open("fid_view.tmp") {
+        Option::Some(v) => {
+            var view: FileView = v;
+            println("open: " + int_to_str(view.len));
+            println("bytes: " + int_to_str(view.byte(0)) + " " + int_to_str(view.byte(10799)) + " " + int_to_str(view.byte(-1)) + " " + int_to_str(view.byte(10800)));
+            println("line 2: " + b2s(view.slice(27, 54) == line));
+            println("across 4096: " + view.slice(4092, 4096) + "|" + view.slice(4096, 4100));
+            println("tail: " + b2s(view.slice(10773, 99999) == line));
+            println("whole: " + b2s(view.to_str() == text));
+            view.close();
+            println("closed: " + int_to_str(view.len) + " " + int_to_str(view.byte(0)));
+        }
+        Option::None => {
+            println("open failed");
+        }
+    }
+    fs_delete("fid_view.tmp");
+
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 2560 {
+        bytes.push(i % 256);
+        i = i + 1;
+    }
+    fs_write_bytes("fid_view_bin.tmp", bytes);
+    match FileView::open("fid_view_bin.tmp") {
+        Option::Some(v) => {
+            var bv: FileView = v;
+            println("binary: " + int_to_str(bv.len) + " " + int_to_str(bv.byte(0)) + " " + int_to_str(bv.byte(255)) + " " + int_to_str(bv.byte(2304)) + " " + int_to_str(bv.byte(2560)));
+            bv.close();
+        }
+        Option::None => {
+            println("binary: open failed");
+        }
+    }
+    fs_delete("fid_view_bin.tmp");
+
+    fs_write_text("fid_view_empty.tmp", "");
+    match FileView::open("fid_view_empty.tmp") {
+        Option::Some(v) => {
+            var ev: FileView = v;
+            println("empty: " + int_to_str(ev.len) + " " + b2s(ev.is_mapped()));
+            ev.close();
+        }
+        Option::None => {
+            println("empty: open failed");
+        }
+    }
+    fs_delete("fid_view_empty.tmp");
+
+    match FileView::open("fid_view_no_such_file.tmp") {
+        Option::Some(_) => {
+            println("missing: opened");
+        }
+        Option::None => {
+            println("missing: none");
+        }
+    }
+
+    world_fake_files();
+    fs_write_text("v.txt", "hello world");
+    match FileView::open("v.txt") {
+        Option::Some(v) => {
+            val fv: FileView = v;
+            println("fake: " + int_to_str(fv.len) + " " + fv.slice(6, 11));
+        }
+        Option::None => {
+            println("fake: none");
+        }
+    }
+    world_real_files();
+    return 0;
+}

@@ -1,0 +1,1237 @@
+// Fides MQTT 3.1.1 and 5.0: packet codec, topic filters, client state machine
+//
+// Real (pure computation):
+//   - every control packet of MQTT 3.1.1 (OASIS, 2014) and 5.0 (2019):
+//     CONNECT (with will, username, password), CONNACK, PUBLISH (QoS 0/1/2,
+//     DUP, RETAIN), PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE (v5
+//     subscription options), SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ,
+//     PINGRESP, DISCONNECT and AUTH (v5), encoded and decoded, with v5
+//     properties (all 27 property identifiers of section 2.2.2.2, typed:
+//     byte, two/four-byte integer, variable byte integer, UTF-8 string,
+//     binary data, string pair); the variable byte integer remaining length;
+//     framing of a byte stream (mqtt_frame_len) and the checks the spec
+//     makes on fixed-header flags, QoS 3, protocol name and level;
+//   - topic names and filters: validation and matching with + and #, and
+//     $-topics not matched by a leading wildcard (section 4.7);
+//   - MqttClient, a client state machine: CONNECT/CONNACK, packet
+//     identifiers (1..65535, never one in use), outgoing QoS 1
+//     (PUBLISH -> PUBACK) and QoS 2 (PUBLISH -> PUBREC -> PUBREL -> PUBCOMP)
+//     inflight tracking with the v5 Receive Maximum, incoming QoS 1 and 2
+//     (a QoS 2 message is delivered once, duplicates held back until
+//     PUBREL), SUBSCRIBE/UNSUBSCRIBE acknowledgements, keep-alive
+//     PINGREQ and its timeout, and resending of unacknowledged packets with
+//     DUP after a reconnect to a session the server kept.
+//
+// The transport seam: the client does no I/O. It queues the bytes to send
+// (mqtt_client_take_outbox, write them to a TCP or TLS stream) and is given
+// the bytes received (mqtt_client_feed, any split); time is passed in as
+// milliseconds (`now`) to mqtt_client_tick. Received application messages
+// come out of mqtt_client_take_messages.
+//
+// Bytes are Vec<i64>, one value 0..255 each.
+
+module mqtt;
+ use vec; use string;
+
+// Packet types (fixed header bits 7..4)
+pub const MQTT_CONNECT: i64 = 1;
+pub const MQTT_CONNACK: i64 = 2;
+pub const MQTT_PUBLISH: i64 = 3;
+pub const MQTT_PUBACK: i64 = 4;
+pub const MQTT_PUBREC: i64 = 5;
+pub const MQTT_PUBREL: i64 = 6;
+pub const MQTT_PUBCOMP: i64 = 7;
+pub const MQTT_SUBSCRIBE: i64 = 8;
+pub const MQTT_SUBACK: i64 = 9;
+pub const MQTT_UNSUBSCRIBE: i64 = 10;
+pub const MQTT_UNSUBACK: i64 = 11;
+pub const MQTT_PINGREQ: i64 = 12;
+pub const MQTT_PINGRESP: i64 = 13;
+pub const MQTT_DISCONNECT: i64 = 14;
+pub const MQTT_AUTH: i64 = 15;
+
+// Protocol levels
+pub const MQTT_V311: i64 = 4;
+pub const MQTT_V5: i64 = 5;
+
+// Property identifiers (MQTT 5.0 section 2.2.2.2)
+pub const MQTT_P_PAYLOAD_FORMAT: i64 = 0x01;
+pub const MQTT_P_MESSAGE_EXPIRY: i64 = 0x02;
+pub const MQTT_P_CONTENT_TYPE: i64 = 0x03;
+pub const MQTT_P_RESPONSE_TOPIC: i64 = 0x08;
+pub const MQTT_P_CORRELATION_DATA: i64 = 0x09;
+pub const MQTT_P_SUBSCRIPTION_ID: i64 = 0x0B;
+pub const MQTT_P_SESSION_EXPIRY: i64 = 0x11;
+pub const MQTT_P_ASSIGNED_CLIENT_ID: i64 = 0x12;
+pub const MQTT_P_SERVER_KEEP_ALIVE: i64 = 0x13;
+pub const MQTT_P_AUTH_METHOD: i64 = 0x15;
+pub const MQTT_P_AUTH_DATA: i64 = 0x16;
+pub const MQTT_P_REASON_STRING: i64 = 0x1F;
+pub const MQTT_P_RECEIVE_MAXIMUM: i64 = 0x21;
+pub const MQTT_P_TOPIC_ALIAS_MAXIMUM: i64 = 0x22;
+pub const MQTT_P_TOPIC_ALIAS: i64 = 0x23;
+pub const MQTT_P_MAXIMUM_QOS: i64 = 0x24;
+pub const MQTT_P_USER_PROPERTY: i64 = 0x26;
+pub const MQTT_P_MAXIMUM_PACKET_SIZE: i64 = 0x27;
+
+// Client states
+pub const MQTT_ST_DISCONNECTED: i64 = 0;
+pub const MQTT_ST_CONNECTING: i64 = 1;
+pub const MQTT_ST_CONNECTED: i64 = 2;
+
+/// v5 properties of one packet, in order. Each entry: its identifier and
+/// one of an integer (byte, two/four-byte, varint), a string (and for a
+/// user property its value in `strs2`) or binary data.
+pub struct MqttProps {
+    pub ids: Vec<i64>,
+    pub ints: Vec<i64>,
+    pub strs: Vec<str>,
+    pub strs2: Vec<str>,
+    pub bins: Vec<Vec<i64>>,
+}
+
+/// One control packet. Fields not used by `ptype` are left at defaults.
+pub struct MqttPacket {
+    pub ptype: i64,
+    pub version: i64,
+    // CONNECT
+    pub client_id: str,
+    pub clean: bool,
+    pub keep_alive: i64,
+    pub has_username: bool,
+    pub username: str,
+    pub has_password: bool,
+    pub password: Vec<i64>,
+    pub has_will: bool,
+    pub will_topic: str,
+    pub will_payload: Vec<i64>,
+    pub will_qos: i64,
+    pub will_retain: bool,
+    pub will_props: MqttProps,
+    // CONNACK
+    pub session_present: bool,
+    // CONNACK return code (v3) or reason code (v5) of any packet
+    pub reason: i64,
+    // PUBLISH
+    pub topic: str,
+    pub payload: Vec<i64>,
+    pub qos: i64,
+    pub retain: bool,
+    pub dup: bool,
+    // most packets
+    pub packet_id: i64,
+    // SUBSCRIBE / UNSUBSCRIBE: filters; SUBSCRIBE: options byte each
+    // (QoS | no-local << 2 | retain-as-published << 3 | retain-handling << 4)
+    pub filters: Vec<str>,
+    pub options: Vec<i64>,
+    // SUBACK / UNSUBACK: return or reason codes
+    pub codes: Vec<i64>,
+    pub props: MqttProps,
+}
+
+pub fn mqtt_props_new() -> MqttProps {
+    return MqttProps {
+        ids: Vec::new(), ints: Vec::new(), strs: Vec::new(), strs2: Vec::new(), bins: Vec::new(),
+    };
+}
+
+pub fn mqtt_packet(ptype: i64, version: i64) -> MqttPacket {
+    return MqttPacket {
+        ptype: ptype, version: version, client_id: "", clean: true, keep_alive: 60, has_username: false, username: "", has_password: false, password: Vec::new(), has_will: false, will_topic: "", will_payload: Vec::new(), will_qos: 0, will_retain: false, will_props: mqtt_props_new(), session_present: false, reason: 0, topic: "", payload: Vec::new(), qos: 0, retain: false, dup: false, packet_id: 0, filters: Vec::new(), options: Vec::new(), codes: Vec::new(), props: mqtt_props_new(),
+    };
+}
+
+// ─── Properties ──────────────────────────────────────────────────────────
+
+/// How a property's value is encoded: 1 byte, 2 two-byte integer, 4
+/// four-byte integer, 5 variable byte integer, 6 UTF-8 string, 7 binary,
+/// 8 string pair; 0 for an unknown identifier.
+pub fn mqtt_prop_kind(id: i64) -> i64 {
+    if id == 0x01 || id == 0x17 || id == 0x19 || id == 0x24 || id == 0x25 || id == 0x28 || id == 0x29 || id == 0x2A {
+        return 1;
+    }
+    if id == 0x13 || id == 0x21 || id == 0x22 || id == 0x23 {
+        return 2;
+    }
+    if id == 0x02 || id == 0x11 || id == 0x18 || id == 0x27 {
+        return 4;
+    }
+    if id == 0x0B {
+        return 5;
+    }
+    if id == 0x03 || id == 0x08 || id == 0x12 || id == 0x15 || id == 0x1A || id == 0x1C || id == 0x1F {
+        return 6;
+    }
+    if id == 0x09 || id == 0x16 {
+        return 7;
+    }
+    if id == 0x26 {
+        return 8;
+    }
+    return 0;
+}
+
+fn mq_prop_push(p: & mut MqttProps, id: i64, n: i64, s: str, s2: str, b: Vec<i64>) {
+    p.ids.push(id);
+    p.ints.push(n);
+    p.strs.push(s);
+    p.strs2.push(s2);
+    p.bins.push(b);
+}
+
+/// Add an integer property (byte, two-byte, four-byte or varint kind).
+pub fn mqtt_prop_int(p: & mut MqttProps, id: i64, n: i64) {
+    mq_prop_push(p, id, n, "", "", Vec::new());
+}
+
+/// Add a string property (content type, response topic, reason string ...).
+pub fn mqtt_prop_str(p: & mut MqttProps, id: i64, s: str) {
+    mq_prop_push(p, id, 0, s, "", Vec::new());
+}
+
+/// Add a binary property (correlation data, authentication data).
+pub fn mqtt_prop_bin(p: & mut MqttProps, id: i64, b: Vec<i64>) {
+    mq_prop_push(p, id, 0, "", "", b);
+}
+
+/// Add a user property (name, value).
+pub fn mqtt_prop_user(p: & mut MqttProps, name: str, value: str) {
+    mq_prop_push(p, MQTT_P_USER_PROPERTY, 0, name, value, Vec::new());
+}
+
+/// Index of the first property `id`, or -1.
+pub fn mqtt_prop_find(p: & MqttProps, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < p.ids.len() {
+        if p.ids.get(i) == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// An integer property's value, or `def` when it is absent.
+pub fn mqtt_prop_get_int(p: & MqttProps, id: i64, def: i64) -> i64 {
+    val i: i64 = mqtt_prop_find(p, id);
+    if i < 0 {
+        return def;
+    }
+    return p.ints.get(i);
+}
+
+pub fn mqtt_prop_get_str(p: & MqttProps, id: i64) -> str {
+    val i: i64 = mqtt_prop_find(p, id);
+    if i < 0 {
+        return "";
+    }
+    return p.strs.get(i);
+}
+
+// ─── Primitive encoders ──────────────────────────────────────────────────
+
+/// Append a variable byte integer (0 .. 268435455).
+pub fn mqtt_put_varint(out: & mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    loop {
+        var b: i64 = x % 128;
+        x = x / 128;
+        if x > 0 {
+            b = b | 128;
+        }
+        out.push(b);
+        if x == 0 {
+            break;
+        }
+    }
+}
+
+fn mq_put16(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn mq_put32(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn mq_put_str(out: & mut Vec<i64>, s: str) {
+    val n: i64 = str_len(s);
+    mq_put16(out, n);
+    var i: i64 = 0;
+    while i < n {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn mq_put_bin(out: & mut Vec<i64>, b: Vec<i64>) {
+    mq_put16(out, b.len());
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+fn mq_put_props(out: & mut Vec<i64>, p: & MqttProps) {
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < p.ids.len() {
+        val id: i64 = p.ids.get(i);
+        val k: i64 = mqtt_prop_kind(id);
+        mqtt_put_varint(& mut body, id);
+        if k == 1 {
+            body.push(p.ints.get(i) & 255);
+        } else if k == 2 {
+            mq_put16(& mut body, p.ints.get(i));
+        } else if k == 4 {
+            mq_put32(& mut body, p.ints.get(i));
+        } else if k == 5 {
+            mqtt_put_varint(& mut body, p.ints.get(i));
+        } else if k == 6 {
+            mq_put_str(& mut body, p.strs.get(i));
+        } else if k == 7 {
+            mq_put_bin(& mut body, p.bins.get(i));
+        } else {
+            mq_put_str(& mut body, p.strs.get(i));
+            mq_put_str(& mut body, p.strs2.get(i));
+        }
+        i = i + 1;
+    }
+    mqtt_put_varint(out, body.len());
+    out.extend(body);
+}
+
+// ─── Encoding packets ────────────────────────────────────────────────────
+
+fn mq_fixed_flags(p: & MqttPacket) -> i64 {
+    val t: i64 = p.ptype;
+    if t == MQTT_PUBLISH {
+        var f: i64 = (p.qos & 3) << 1;
+        if p.dup {
+            f = f | 8;
+        }
+        if p.retain {
+            f = f | 1;
+        }
+        return f;
+    }
+    if t == MQTT_PUBREL || t == MQTT_SUBSCRIBE || t == MQTT_UNSUBSCRIBE {
+        return 2;
+    }
+    return 0;
+}
+
+/// Encode a packet (fixed header, variable header, payload).
+pub fn mqtt_encode(p: & MqttPacket) -> Vec<i64> {
+    val v5: bool = p.version >= MQTT_V5;
+    val t: i64 = p.ptype;
+    var body: Vec<i64> = Vec::new();
+    if t == MQTT_CONNECT {
+        mq_put_str(& mut body, "MQTT");
+        body.push(p.version);
+        var flags: i64 = 0;
+        if p.clean {
+            flags = flags | 2;
+        }
+        if p.has_will {
+            flags = flags | 4 | ((p.will_qos & 3) << 3);
+            if p.will_retain {
+                flags = flags | 32;
+            }
+        }
+        if p.has_password {
+            flags = flags | 64;
+        }
+        if p.has_username {
+            flags = flags | 128;
+        }
+        body.push(flags);
+        mq_put16(& mut body, p.keep_alive);
+        if v5 {
+            mq_put_props(& mut body, & p.props);
+        }
+        mq_put_str(& mut body, p.client_id);
+        if p.has_will {
+            if v5 {
+                mq_put_props(& mut body, & p.will_props);
+            }
+            mq_put_str(& mut body, p.will_topic);
+            mq_put_bin(& mut body, p.will_payload);
+        }
+        if p.has_username {
+            mq_put_str(& mut body, p.username);
+        }
+        if p.has_password {
+            mq_put_bin(& mut body, p.password);
+        }
+    } else if t == MQTT_CONNACK {
+        if p.session_present {
+            body.push(1);
+        } else {
+            body.push(0);
+        }
+        body.push(p.reason & 255);
+        if v5 {
+            mq_put_props(& mut body, & p.props);
+        }
+    } else if t == MQTT_PUBLISH {
+        mq_put_str(& mut body, p.topic);
+        if p.qos > 0 {
+            mq_put16(& mut body, p.packet_id);
+        }
+        if v5 {
+            mq_put_props(& mut body, & p.props);
+        }
+        body.extend(p.payload);
+    } else if t >= MQTT_PUBACK && t <= MQTT_PUBCOMP {
+        mq_put16(& mut body, p.packet_id);
+        if v5 && (p.reason != 0 || p.props.ids.len() > 0) {
+            body.push(p.reason & 255);
+            if p.props.ids.len() > 0 {
+                mq_put_props(& mut body, & p.props);
+            }
+        }
+    } else if t == MQTT_SUBSCRIBE || t == MQTT_UNSUBSCRIBE {
+        mq_put16(& mut body, p.packet_id);
+        if v5 {
+            mq_put_props(& mut body, & p.props);
+        }
+        var i: i64 = 0;
+        while i < p.filters.len() {
+            mq_put_str(& mut body, p.filters.get(i));
+            if t == MQTT_SUBSCRIBE {
+                body.push(p.options.get(i) & 255);
+            }
+            i = i + 1;
+        }
+    } else if t == MQTT_SUBACK || t == MQTT_UNSUBACK {
+        mq_put16(& mut body, p.packet_id);
+        if v5 {
+            mq_put_props(& mut body, & p.props);
+        }
+        if t == MQTT_SUBACK || v5 {
+            var i: i64 = 0;
+            while i < p.codes.len() {
+                body.push(p.codes.get(i) & 255);
+                i = i + 1;
+            }
+        }
+    } else if t == MQTT_DISCONNECT || t == MQTT_AUTH {
+        if v5 && (p.reason != 0 || p.props.ids.len() > 0) {
+            body.push(p.reason & 255);
+            if p.props.ids.len() > 0 {
+                mq_put_props(& mut body, & p.props);
+            }
+        }
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push((t << 4) | mq_fixed_flags(p));
+    mqtt_put_varint(& mut out, body.len());
+    out.extend(body);
+    return out;
+}
+
+// ─── Decoding ────────────────────────────────────────────────────────────
+
+/// The length of the first complete packet in `buf`: 0 while more bytes
+/// are needed, -1 when the remaining length is malformed.
+pub fn mqtt_frame_len(buf: & Vec<i64>) -> i64 {
+    var mult: i64 = 1;
+    var len: i64 = 0;
+    var i: i64 = 1;
+    while i < 5 {
+        if i >= buf.len() {
+            return 0;
+        }
+        val b: i64 = buf.get(i);
+        len = len + (b & 127) * mult;
+        if b < 128 {
+            if i + 1 + len > buf.len() {
+                return 0;
+            }
+            return i + 1 + len;
+        }
+        mult = mult * 128;
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// A decoded packet. `ok` false: `error` says why.
+pub struct MqttDecoded {
+    pub ok: bool,
+    pub error: str,
+    pub packet: MqttPacket,
+}
+
+struct MqReader {
+    b: Vec<i64>,
+    pos: i64,
+    end: i64,
+    ok: bool,
+    error: str,
+}
+
+fn mq_fail(r: & mut MqReader, msg: str) {
+    if r.ok {
+        r.ok = false;
+        r.error = msg;
+    }
+}
+
+fn mq_u8(r: & mut MqReader) -> i64 {
+    if r.pos >= r.end {
+        mq_fail(r, "packet too short");
+        return 0;
+    }
+    val v: i64 = r.b.get(r.pos);
+    r.pos = r.pos + 1;
+    return v;
+}
+
+fn mq_u16(r: & mut MqReader) -> i64 {
+    val hi: i64 = mq_u8(r);
+    val lo: i64 = mq_u8(r);
+    return (hi << 8) | lo;
+}
+
+fn mq_u32(r: & mut MqReader) -> i64 {
+    val a: i64 = mq_u16(r);
+    val b: i64 = mq_u16(r);
+    return (a << 16) | b;
+}
+
+fn mq_varint(r: & mut MqReader) -> i64 {
+    var mult: i64 = 1;
+    var v: i64 = 0;
+    var n: i64 = 0;
+    loop {
+        val b: i64 = mq_u8(r);
+        v = v + (b & 127) * mult;
+        n = n + 1;
+        if b < 128 || !r.ok {
+            break;
+        }
+        if n == 4 {
+            mq_fail(r, "variable byte integer too long");
+            break;
+        }
+        mult = mult * 128;
+    }
+    return v;
+}
+
+fn mq_bin(r: & mut MqReader) -> Vec<i64> {
+    val n: i64 = mq_u16(r);
+    var out: Vec<i64> = Vec::new();
+    if r.pos + n > r.end {
+        mq_fail(r, "string or data runs past the packet");
+        return out;
+    }
+    var i: i64 = 0;
+    while i < n {
+        out.push(r.b.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return out;
+}
+
+fn mq_str(r: & mut MqReader) -> str {
+    return str_from_bytes(mq_bin(r));
+}
+
+fn mq_props(r: & mut MqReader) -> MqttProps {
+    var p: MqttProps = mqtt_props_new();
+    val n: i64 = mq_varint(r);
+    val stop: i64 = r.pos + n;
+    if stop > r.end {
+        mq_fail(r, "properties run past the packet");
+        return p;
+    }
+    while r.ok && r.pos < stop {
+        val id: i64 = mq_varint(r);
+        val k: i64 = mqtt_prop_kind(id);
+        if k == 1 {
+            mqtt_prop_int(& mut p, id, mq_u8(r));
+        } else if k == 2 {
+            mqtt_prop_int(& mut p, id, mq_u16(r));
+        } else if k == 4 {
+            mqtt_prop_int(& mut p, id, mq_u32(r));
+        } else if k == 5 {
+            mqtt_prop_int(& mut p, id, mq_varint(r));
+        } else if k == 6 {
+            mqtt_prop_str(& mut p, id, mq_str(r));
+        } else if k == 7 {
+            mqtt_prop_bin(& mut p, id, mq_bin(r));
+        } else if k == 8 {
+            val name: str = mq_str(r);
+            mqtt_prop_user(& mut p, name, mq_str(r));
+        } else {
+            mq_fail(r, "unknown property " + int_to_str(id));
+        }
+    }
+    if r.ok && r.pos != stop {
+        mq_fail(r, "properties length mismatch");
+    }
+    return p;
+}
+
+/// Decode one whole packet (as mqtt_frame_len delimits it). `version` is
+/// the protocol level of the connection (a CONNECT carries its own).
+pub fn mqtt_decode(bytes: Vec<i64>, version: i64) -> MqttDecoded {
+    var p: MqttPacket = mqtt_packet(0, version);
+    val total: i64 = mqtt_frame_len(& bytes);
+    if total <= 0 || total != bytes.len() {
+        return MqttDecoded {
+            ok: false, error: "not one whole packet", packet: p
+        };
+    }
+    val b0: i64 = bytes.get(0);
+    val t: i64 = b0 >> 4;
+    val flags: i64 = b0 & 15;
+    var hdr: i64 = 2;
+    while (bytes.get(hdr - 1) & 128) != 0 {
+        hdr = hdr + 1;
+    }
+    var r: MqReader = MqReader {
+        b: bytes, pos: hdr, end: total, ok: true, error: ""
+    };
+    p.ptype = t;
+    if t == 0 {
+        mq_fail(& mut r, "reserved packet type 0");
+    }
+    if t == MQTT_PUBLISH {
+        p.dup = (flags & 8) != 0;
+        p.qos = (flags >> 1) & 3;
+        p.retain = (flags & 1) != 0;
+        if p.qos == 3 {
+            mq_fail(& mut r, "QoS 3");
+        }
+    } else if t == MQTT_PUBREL || t == MQTT_SUBSCRIBE || t == MQTT_UNSUBSCRIBE {
+        if flags != 2 {
+            mq_fail(& mut r, "bad fixed header flags");
+        }
+    } else if flags != 0 {
+        mq_fail(& mut r, "bad fixed header flags");
+    }
+    if t == MQTT_CONNECT {
+        mq_dec_connect(& mut r, & mut p);
+    } else {
+        mq_dec_rest(& mut r, & mut p, t, version >= MQTT_V5);
+    }
+    if r.ok && r.pos != r.end && t != MQTT_PUBLISH {
+        mq_fail(& mut r, "extra bytes in packet");
+    }
+    return MqttDecoded {
+        ok: r.ok, error: r.error, packet: p
+    };
+}
+
+fn mq_dec_connect(r: & mut MqReader, p: & mut MqttPacket) {
+    val name: str = mq_str(r);
+    val level: i64 = mq_u8(r);
+    if !r.ok {
+        return;
+    }
+    if !((name == "MQTT" && (level == 4 || level == 5)) || (name == "MQIsdp" && level == 3)) {
+        mq_fail(r, "unsupported protocol " + name + " level " + int_to_str(level));
+        return;
+    }
+    p.version = level;
+    val f: i64 = mq_u8(r);
+    if (f & 1) != 0 {
+        mq_fail(r, "reserved connect flag set");
+        return;
+    }
+    p.clean = (f & 2) != 0;
+    p.has_will = (f & 4) != 0;
+    p.will_qos = (f >> 3) & 3;
+    p.will_retain = (f & 32) != 0;
+    p.has_password = (f & 64) != 0;
+    p.has_username = (f & 128) != 0;
+    if p.will_qos == 3 || (!p.has_will && (p.will_qos != 0 || p.will_retain)) {
+        mq_fail(r, "bad will flags");
+        return;
+    }
+    p.keep_alive = mq_u16(r);
+    if level >= 5 {
+        p.props = mq_props(r);
+    }
+    p.client_id = mq_str(r);
+    if p.has_will {
+        if level >= 5 {
+            p.will_props = mq_props(r);
+        }
+        p.will_topic = mq_str(r);
+        p.will_payload = mq_bin(r);
+    }
+    if p.has_username {
+        p.username = mq_str(r);
+    }
+    if p.has_password {
+        p.password = mq_bin(r);
+    }
+}
+
+fn mq_dec_rest(r: & mut MqReader, p: & mut MqttPacket, t: i64, v5: bool) {
+    if t == MQTT_CONNACK {
+        val f: i64 = mq_u8(r);
+        if (f & 254) != 0 {
+            mq_fail(r, "reserved connack flags");
+        }
+        p.session_present = (f & 1) != 0;
+        p.reason = mq_u8(r);
+        if v5 {
+            p.props = mq_props(r);
+        }
+    } else if t == MQTT_PUBLISH {
+        p.topic = mq_str(r);
+        if p.qos > 0 {
+            p.packet_id = mq_u16(r);
+            if p.packet_id == 0 {
+                mq_fail(r, "packet identifier 0");
+            }
+        }
+        if v5 {
+            p.props = mq_props(r);
+        }
+        var pl: Vec<i64> = Vec::new();
+        while r.ok && r.pos < r.end {
+            pl.push(r.b.get(r.pos));
+            r.pos = r.pos + 1;
+        }
+        p.payload = pl;
+    } else if t >= MQTT_PUBACK && t <= MQTT_PUBCOMP {
+        p.packet_id = mq_u16(r);
+        if v5 && r.pos < r.end {
+            p.reason = mq_u8(r);
+            if r.pos < r.end {
+                p.props = mq_props(r);
+            }
+        }
+    } else if t == MQTT_SUBSCRIBE || t == MQTT_UNSUBSCRIBE {
+        p.packet_id = mq_u16(r);
+        if v5 {
+            p.props = mq_props(r);
+        }
+        while r.ok && r.pos < r.end {
+            p.filters.push(mq_str(r));
+            if t == MQTT_SUBSCRIBE {
+                val o: i64 = mq_u8(r);
+                if (o & 3) == 3 || (!v5 && o > 2) || (o & 192) != 0 {
+                    mq_fail(r, "bad subscription options");
+                }
+                p.options.push(o);
+            }
+        }
+        if r.ok && p.filters.len() == 0 {
+            mq_fail(r, "no topic filter");
+        }
+    } else if t == MQTT_SUBACK || t == MQTT_UNSUBACK {
+        p.packet_id = mq_u16(r);
+        if v5 {
+            p.props = mq_props(r);
+        }
+        while r.ok && r.pos < r.end {
+            p.codes.push(mq_u8(r));
+        }
+    } else if t == MQTT_DISCONNECT || t == MQTT_AUTH {
+        if v5 && r.pos < r.end {
+            p.reason = mq_u8(r);
+            if r.pos < r.end {
+                p.props = mq_props(r);
+            }
+        }
+    }
+}
+
+// ─── Topics (section 4.7) ────────────────────────────────────────────────
+
+/// A topic name to publish to: not empty, no wildcard, no NUL.
+pub fn mqtt_topic_valid(topic: str) -> bool {
+    val n: i64 = str_len(topic);
+    if n == 0 || n > 65535 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(topic, i);
+        if c == 35 || c == 43 || c == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A topic filter: '+' fills a whole level, '#' is the whole last level.
+pub fn mqtt_filter_valid(filter: str) -> bool {
+    val n: i64 = str_len(filter);
+    if n == 0 || n > 65535 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(filter, i);
+        if c == 0 {
+            return false;
+        }
+        if c == 43 || c == 35 {
+            if i > 0 && str_byte_at(filter, i - 1) != 47 {
+                return false;
+            }
+            if i + 1 < n && str_byte_at(filter, i + 1) != 47 {
+                return false;
+            }
+            if c == 35 && i != n - 1 {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Whether topic name `topic` matches filter `filter`.
+pub fn mqtt_topic_matches(filter: str, topic: str) -> bool {
+    if !mqtt_filter_valid(filter) || !mqtt_topic_valid(topic) {
+        return false;
+    }
+    // a wildcard first level does not match topics starting with '$'
+    if str_byte_at(topic, 0) == 36 {
+        val f0: i64 = str_byte_at(filter, 0);
+        if f0 == 43 || f0 == 35 {
+            return false;
+        }
+    }
+    val fl: Vec<str> = str_split(filter, "/");
+    val tl: Vec<str> = str_split(topic, "/");
+    var i: i64 = 0;
+    while i < fl.len() {
+        val f: str = fl.get(i);
+        if f == "#" {
+            return true;   // also matches the parent level itself
+        }
+        if i >= tl.len() {
+            return false;
+        }
+        if f != "+" && f != tl.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return i == tl.len();
+}
+
+// ─── Client state machine ────────────────────────────────────────────────
+
+/// A client of one broker connection. Feed it received bytes, take the
+/// bytes it wants sent; see the module header.
+pub struct MqttClient {
+    pub version: i64,
+    pub client_id: str,
+    pub keep_alive: i64,      // seconds, 0: off
+    pub state: i64,           // MQTT_ST_*
+    pub error: str,           // why the connection was given up
+    pub connack_reason: i64,
+    pub session_present: bool,
+    pub receive_max: i64,     // the server's Receive Maximum (v5), else 65535
+    pub next_id: i64,
+    pub outbox: Vec<Vec<i64>>,
+    pub inbuf: Vec<i64>,
+    pub messages: Vec<MqttPacket>,
+    // outgoing QoS 1 and 2 not yet complete: id, wait state
+    // (1 PUBACK, 2 PUBREC, 3 PUBCOMP) and the packet (for resending)
+    pub out_ids: Vec<i64>,
+    pub out_wait: Vec<i64>,
+    pub out_pkts: Vec<MqttPacket>,
+    // incoming QoS 2 delivered, PUBREL not yet received
+    pub in_ids: Vec<i64>,
+    // SUBSCRIBE / UNSUBSCRIBE waiting for their ack: id, type
+    pub ack_ids: Vec<i64>,
+    pub ack_types: Vec<i64>,
+    // results: ids whose publish completed; SUBACK codes per id
+    pub completed: Vec<i64>,
+    pub suback_ids: Vec<i64>,
+    pub suback_codes: Vec<Vec<i64>>,
+    pub last_send: i64,
+    pub last_recv: i64,
+    pub ping_sent: i64,       // time of an unanswered PINGREQ, -1: none
+}
+
+pub fn mqtt_client_new(client_id: str, version: i64, keep_alive: i64) -> MqttClient {
+    return MqttClient {
+        version: version, client_id: client_id, keep_alive: keep_alive, state: MQTT_ST_DISCONNECTED, error: "", connack_reason: 0, session_present: false, receive_max: 65535, next_id: 1, outbox: Vec::new(), inbuf: Vec::new(), messages: Vec::new(), out_ids: Vec::new(), out_wait: Vec::new(), out_pkts: Vec::new(), in_ids: Vec::new(), ack_ids: Vec::new(), ack_types: Vec::new(), completed: Vec::new(), suback_ids: Vec::new(), suback_codes: Vec::new(), last_send: 0, last_recv: 0, ping_sent: - 1,
+    };
+}
+
+fn mq_send(c: & mut MqttClient, p: & MqttPacket, now: i64) {
+    c.outbox.push(mqtt_encode(p));
+    c.last_send = now;
+}
+
+fn mq_id_used(c: & MqttClient, id: i64) -> bool {
+    return c.out_ids.contains(id) || c.ack_ids.contains(id);
+}
+
+/// A free packet identifier (1..65535), or 0 when all are in use.
+pub fn mqtt_client_alloc_id(c: & mut MqttClient) -> i64 {
+    var tries: i64 = 0;
+    while tries < 65535 {
+        val id: i64 = c.next_id;
+        c.next_id = c.next_id + 1;
+        if c.next_id > 65535 {
+            c.next_id = 1;
+        }
+        if !mq_id_used(c, id) {
+            return id;
+        }
+        tries = tries + 1;
+    }
+    return 0;
+}
+
+/// Queue CONNECT. `clean` false asks the server to keep the session.
+pub fn mqtt_client_connect(c: & mut MqttClient, clean: bool, now: i64) {
+    var p: MqttPacket = mqtt_packet(MQTT_CONNECT, c.version);
+    p.client_id = c.client_id;
+    p.clean = clean;
+    p.keep_alive = c.keep_alive;
+    c.state = MQTT_ST_CONNECTING;
+    c.error = "";
+    c.inbuf = Vec::new();
+    c.ping_sent = - 1;
+    c.last_recv = now;
+    if clean {
+        c.out_ids = Vec::new();
+        c.out_wait = Vec::new();
+        c.out_pkts = Vec::new();
+        c.in_ids = Vec::new();
+    }
+    mq_send(c, & p, now);
+}
+
+/// Inflight outgoing QoS 1/2 messages.
+pub fn mqtt_client_inflight(c: & MqttClient) -> i64 {
+    return c.out_ids.len();
+}
+
+/// Queue PUBLISH. The packet id (0 for QoS 0); -1 when not connected, the
+/// topic is invalid, or the server's Receive Maximum is reached.
+pub fn mqtt_client_publish(c: & mut MqttClient, topic: str, payload: Vec<i64>, qos: i64, retain: bool, now: i64) -> i64 {
+    if c.state != MQTT_ST_CONNECTED || !mqtt_topic_valid(topic) || qos < 0 || qos > 2 {
+        return - 1;
+    }
+    var p: MqttPacket = mqtt_packet(MQTT_PUBLISH, c.version);
+    p.topic = topic;
+    p.payload = payload;
+    p.qos = qos;
+    p.retain = retain;
+    if qos == 0 {
+        mq_send(c, & p, now);
+        return 0;
+    }
+    if c.out_ids.len() >= c.receive_max {
+        return - 1;
+    }
+    val id: i64 = mqtt_client_alloc_id(c);
+    if id == 0 {
+        return - 1;
+    }
+    p.packet_id = id;
+    c.out_ids.push(id);
+    c.out_wait.push(qos);
+    c.out_pkts.push(p);
+    mq_send(c, & p, now);
+    return id;
+}
+
+/// Queue SUBSCRIBE for `filters` with options (QoS) `qos`; the packet id or -1.
+pub fn mqtt_client_subscribe(c: & mut MqttClient, filters: Vec<str>, qos: Vec<i64>, now: i64) -> i64 {
+    if c.state != MQTT_ST_CONNECTED || filters.len() == 0 || filters.len() != qos.len() {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < filters.len() {
+        if !mqtt_filter_valid(filters.get(i)) {
+            return - 1;
+        }
+        i = i + 1;
+    }
+    val id: i64 = mqtt_client_alloc_id(c);
+    if id == 0 {
+        return - 1;
+    }
+    var p: MqttPacket = mqtt_packet(MQTT_SUBSCRIBE, c.version);
+    p.packet_id = id;
+    p.filters = filters;
+    p.options = qos;
+    c.ack_ids.push(id);
+    c.ack_types.push(MQTT_SUBSCRIBE);
+    mq_send(c, & p, now);
+    return id;
+}
+
+pub fn mqtt_client_unsubscribe(c: & mut MqttClient, filters: Vec<str>, now: i64) -> i64 {
+    if c.state != MQTT_ST_CONNECTED || filters.len() == 0 {
+        return - 1;
+    }
+    val id: i64 = mqtt_client_alloc_id(c);
+    if id == 0 {
+        return - 1;
+    }
+    var p: MqttPacket = mqtt_packet(MQTT_UNSUBSCRIBE, c.version);
+    p.packet_id = id;
+    p.filters = filters;
+    c.ack_ids.push(id);
+    c.ack_types.push(MQTT_UNSUBSCRIBE);
+    mq_send(c, & p, now);
+    return id;
+}
+
+/// Queue DISCONNECT; the client is disconnected afterwards.
+pub fn mqtt_client_disconnect(c: & mut MqttClient, now: i64) {
+    if c.state == MQTT_ST_CONNECTED {
+        val p: MqttPacket = mqtt_packet(MQTT_DISCONNECT, c.version);
+        mq_send(c, & p, now);
+    }
+    c.state = MQTT_ST_DISCONNECTED;
+}
+
+/// The connection dropped (the transport reports it).
+pub fn mqtt_client_lost(c: & mut MqttClient, why: str) {
+    c.state = MQTT_ST_DISCONNECTED;
+    c.error = why;
+}
+
+/// Bytes the client wants written, in order (the outbox empties).
+pub fn mqtt_client_take_outbox(c: & mut MqttClient) -> Vec<Vec<i64>> {
+    val out: Vec<Vec<i64>> = c.outbox;
+    c.outbox = Vec::new();
+    return out;
+}
+
+/// Application messages received (PUBLISH packets), in order.
+pub fn mqtt_client_take_messages(c: & mut MqttClient) -> Vec<MqttPacket> {
+    val out: Vec<MqttPacket> = c.messages;
+    c.messages = Vec::new();
+    return out;
+}
+
+fn mq_index(v: & Vec<i64>, x: i64) -> i64 {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn mq_out_remove(c: & mut MqttClient, k: i64) {
+    c.out_ids.remove(k);
+    c.out_wait.remove(k);
+    c.out_pkts.remove(k);
+}
+
+fn mq_ack(c: & mut MqttClient, t: i64, id: i64, now: i64) {
+    var p: MqttPacket = mqtt_packet(t, c.version);
+    p.packet_id = id;
+    mq_send(c, & p, now);
+}
+
+/// Give the client received bytes (any amount; partial packets wait for
+/// the rest). False when the connection must be closed (`error` says why).
+pub fn mqtt_client_feed(c: & mut MqttClient, bytes: Vec<i64>, now: i64) -> bool {
+    c.inbuf.extend(bytes);
+    loop {
+        val n: i64 = mqtt_frame_len(& c.inbuf);
+        if n < 0 {
+            mqtt_client_lost(c, "malformed remaining length");
+            return false;
+        }
+        if n == 0 {
+            break;
+        }
+        var one: Vec<i64> = Vec::new();
+        var rest: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < c.inbuf.len() {
+            if i < n {
+                one.push(c.inbuf.get(i));
+            } else {
+                rest.push(c.inbuf.get(i));
+            }
+            i = i + 1;
+        }
+        c.inbuf = rest;
+        c.last_recv = now;
+        val d: MqttDecoded = mqtt_decode(one, c.version);
+        if !d.ok {
+            mqtt_client_lost(c, "malformed packet: " + d.error);
+            return false;
+        }
+        if !mq_handle(c, d.packet, now) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn mq_handle(c: & mut MqttClient, p: MqttPacket, now: i64) -> bool {
+    val t: i64 = p.ptype;
+    if c.state == MQTT_ST_CONNECTING {
+        if t != MQTT_CONNACK {
+            mqtt_client_lost(c, "expected CONNACK");
+            return false;
+        }
+        c.connack_reason = p.reason;
+        if p.reason != 0 {
+            mqtt_client_lost(c, "connection refused, code " + int_to_str(p.reason));
+            return false;
+        }
+        c.state = MQTT_ST_CONNECTED;
+        c.session_present = p.session_present;
+        c.receive_max = mqtt_prop_get_int(& p.props, MQTT_P_RECEIVE_MAXIMUM, 65535);
+        val ka: i64 = mqtt_prop_get_int(& p.props, MQTT_P_SERVER_KEEP_ALIVE, - 1);
+        if ka >= 0 {
+            c.keep_alive = ka;
+        }
+        if p.session_present {
+            mq_resend(c, now);
+        } else {
+            c.out_ids = Vec::new();
+            c.out_wait = Vec::new();
+            c.out_pkts = Vec::new();
+            c.in_ids = Vec::new();
+        }
+        return true;
+    }
+    if c.state != MQTT_ST_CONNECTED {
+        return true;
+    }
+    if t == MQTT_PUBLISH {
+        if p.qos == 0 {
+            c.messages.push(p);
+        } else if p.qos == 1 {
+            c.messages.push(p);
+            mq_ack(c, MQTT_PUBACK, p.packet_id, now);
+        } else {
+            if mq_index(& c.in_ids, p.packet_id) < 0 {
+                c.in_ids.push(p.packet_id);
+                c.messages.push(p);
+            }
+            mq_ack(c, MQTT_PUBREC, p.packet_id, now);
+        }
+        return true;
+    }
+    if t == MQTT_PUBREL {
+        val k: i64 = mq_index(& c.in_ids, p.packet_id);
+        if k >= 0 {
+            c.in_ids.remove(k);
+        }
+        mq_ack(c, MQTT_PUBCOMP, p.packet_id, now);
+        return true;
+    }
+    if t == MQTT_PUBACK || t == MQTT_PUBREC || t == MQTT_PUBCOMP {
+        val k: i64 = mq_index(& c.out_ids, p.packet_id);
+        if k < 0 {
+            if t == MQTT_PUBREC {
+                // not ours any more: answer so the server can finish
+                var rel: MqttPacket = mqtt_packet(MQTT_PUBREL, c.version);
+                rel.packet_id = p.packet_id;
+                rel.reason = 0x92;   // packet identifier not found (v5)
+                if c.version < MQTT_V5 {
+                    rel.reason = 0;
+                }
+                mq_send(c, & rel, now);
+            }
+            return true;
+        }
+        val w: i64 = c.out_wait.get(k);
+        if t == MQTT_PUBACK && w == 1 {
+            mq_out_remove(c, k);
+            c.completed.push(p.packet_id);
+        } else if t == MQTT_PUBREC && (w == 2 || w == 3) {
+            if p.reason >= 0x80 {
+                mq_out_remove(c, k);   // the server refused the message
+                c.completed.push(p.packet_id);
+            } else {
+                c.out_wait.set(k, 3);
+                mq_ack(c, MQTT_PUBREL, p.packet_id, now);
+            }
+        } else if t == MQTT_PUBCOMP && w == 3 {
+            mq_out_remove(c, k);
+            c.completed.push(p.packet_id);
+        } else {
+            mqtt_client_lost(c, "acknowledgement out of order");
+            return false;
+        }
+        return true;
+    }
+    if t == MQTT_SUBACK || t == MQTT_UNSUBACK {
+        val k: i64 = mq_index(& c.ack_ids, p.packet_id);
+        if k >= 0 {
+            c.ack_ids.remove(k);
+            c.ack_types.remove(k);
+            if t == MQTT_SUBACK {
+                c.suback_ids.push(p.packet_id);
+                c.suback_codes.push(p.codes);
+            }
+        }
+        return true;
+    }
+    if t == MQTT_PINGRESP {
+        c.ping_sent = - 1;
+        return true;
+    }
+    if t == MQTT_DISCONNECT {
+        mqtt_client_lost(c, "server disconnected, reason " + int_to_str(p.reason));
+        return false;
+    }
+    mqtt_client_lost(c, "unexpected packet type " + int_to_str(t));
+    return false;
+}
+
+// After reconnecting to a kept session: resend what is unacknowledged
+// (PUBLISH with DUP, or PUBREL for QoS 2 messages past PUBREC).
+fn mq_resend(c: & mut MqttClient, now: i64) {
+    var i: i64 = 0;
+    while i < c.out_ids.len() {
+        if c.out_wait.get(i) == 3 {
+            mq_ack(c, MQTT_PUBREL, c.out_ids.get(i), now);
+        } else {
+            var p: MqttPacket = c.out_pkts.get(i);
+            p.dup = true;
+            mq_send(c, & p, now);
+        }
+        i = i + 1;
+    }
+}
+
+/// Let time pass: sends PINGREQ when nothing was sent for keep_alive
+/// seconds, gives the connection up when a PINGREQ stays unanswered for
+/// keep_alive seconds. False when it was given up.
+pub fn mqtt_client_tick(c: & mut MqttClient, now: i64) -> bool {
+    if c.state != MQTT_ST_CONNECTED || c.keep_alive == 0 {
+        return true;
+    }
+    val ka: i64 = c.keep_alive * 1000;
+    if c.ping_sent >= 0 && now - c.ping_sent >= ka {
+        mqtt_client_lost(c, "keep alive timeout");
+        return false;
+    }
+    if c.ping_sent < 0 && now - c.last_send >= ka {
+        val p: MqttPacket = mqtt_packet(MQTT_PINGREQ, c.version);
+        mq_send(c, & p, now);
+        c.ping_sent = now;
+    }
+    return true;
+}

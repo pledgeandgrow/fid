@@ -1,0 +1,145 @@
+// stdlib/onewire: Dallas CRC-8 (check value, Maxim AN27 ROM), slot timings, search ROM over a fake bus of 4 devices (AN187), READ ROM collisions, MATCH ROM temperature reads of DS18B20 models, resolution, alarm search, family search, the DS18B20 datasheet's raw values
+// Expected output:
+// crc8 check: a1
+// AN27 rom crc: a2 valid true
+// standard: reset 960000 write1 70000 write0 70000 read 70000
+// overdrive: reset 121000 write1 8500 read 9000
+// found 4
+// rom 28123F6A010000E0
+// rom 28EEFFC0000000D4
+// rom 2801F0EE0B000012
+// rom 01A5A5000000006B
+// read rom (4 devices): none
+// read rom (1 device): 28123F6A010000E0
+// temp 28123F6A010000E0: 250625
+// temp 28EEFFC0000000D4: 305000
+// temp 2801F0EE0B000012: -101250
+// temp 01A5A5000000006B: scratchpad CRC error
+// scratchpad: 9101641e7fff0c1049 crc ok
+// 9-bit: 250000 config 1f bits 9
+// alarm 28EEFFC0000000D4
+// alarm 2801F0EE0B000012
+// family 01: 01A5A5000000006B
+// no devices: 0
+// datasheet: 1250000 850000 101250 5000 -5000 -101250 -250625 -550000
+// to raw: 0191 fe6f fff8 07d0
+// conversion us: 93750 750000
+// pins without a device: false 960000
+use onewire;
+use encoding;
+use string;
+
+fn hex16(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn one(b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(b);
+    return v;
+}
+
+fn pin_nop(x: i64) -> i64 {
+    return 1;
+}
+
+fn main() {
+    println("crc8 check: " + hex_encode_bytes(one(ow_crc8(& str_bytes("123456789")))));
+    val an27: Vec<i64> = hex_decode_bytes("021cb801000000a2");
+    var first7: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 7 {
+        first7.push(an27.get(i));
+        i = i + 1;
+    }
+    println("AN27 rom crc: " + hex_encode_bytes(one(ow_crc8(& first7))) + " valid " + bool_to_str(ow_rom_valid(& an27)));
+    val st: OwTiming = ow_timing_standard();
+    println("standard: reset " + int_to_str(ow_steps_ns(& ow_steps_reset(& st))) + " write1 " + int_to_str(ow_steps_ns(& ow_steps_write(& st, 1))) + " write0 " + int_to_str(ow_steps_ns(& ow_steps_write(& st, 0))) + " read " + int_to_str(ow_steps_ns(& ow_steps_read(& st))));
+    val od: OwTiming = ow_timing_overdrive();
+    println("overdrive: reset " + int_to_str(ow_steps_ns(& ow_steps_reset(& od))) + " write1 " + int_to_str(ow_steps_ns(& ow_steps_write(& od, 1))) + " read " + int_to_str(ow_steps_ns(& ow_steps_read(& od))));
+
+    var bus: OneWire = ow_bus_fake();
+    ow_fake_add(& mut bus, ow_fake_ds18b20(0x0000016A3F12, 0x0191));
+    ow_fake_add(& mut bus, ow_fake_ds18b20(0x00000BEEF001, 0xFF5E));
+    ow_fake_add(& mut bus, ow_fake_rom(ow_rom_make(0x01, 0xA5A5)));
+    ow_fake_add(& mut bus, ow_fake_ds18b20(0x000000C0FFEE, 0x01E8));
+    val roms: Vec<Vec<i64>> = ow_search_all(& mut bus, OW_SEARCH_ROM);
+    println("found " + int_to_str(roms.len()));
+    i = 0;
+    while i < roms.len() {
+        val r: Vec<i64> = roms.get(i);
+        println("rom " + ow_rom_hex(& r));
+        i = i + 1;
+    }
+    val collided: Vec<i64> = ow_read_rom(& mut bus);
+    if collided.len() == 0 {
+        println("read rom (4 devices): none");
+    } else {
+        println("read rom (4 devices): " + ow_rom_hex(& collided));
+    }
+    var single: OneWire = ow_bus_fake();
+    ow_fake_add(& mut single, ow_fake_ds18b20(0x0000016A3F12, 0x0191));
+    val sr: Vec<i64> = ow_read_rom(& mut single);
+    println("read rom (1 device): " + ow_rom_hex(& sr));
+
+    i = 0;
+    while i < roms.len() {
+        val r: Vec<i64> = roms.get(i);
+        match ds18b20_read_temp(& mut bus, & r) {
+            Result::Ok(t) => {
+                println("temp " + ow_rom_hex(& r) + ": " + int_to_str(t));
+            }
+            Result::Err(e) => {
+                println("temp " + ow_rom_hex(& r) + ": " + e);
+            }
+        }
+        i = i + 1;
+    }
+    val dev1: Vec<i64> = roms.get(0);
+    val sp: Vec<i64> = ds18b20_read_scratchpad(& mut bus, & dev1);
+    var crc_state: str = "crc bad";
+    if ow_crc8(& sp) == 0 {
+        crc_state = "crc ok";
+    }
+    // TH 100 (0x64), TL 30 (0x1e) written below; first show the 12-bit pad
+    ds18b20_write_config(& mut bus, & dev1, 100, 30, 12);
+    val sp2: Vec<i64> = ds18b20_read_scratchpad(& mut bus, & dev1);
+    println("scratchpad: " + hex_encode_bytes(sp2) + " " + crc_state);
+    ds18b20_write_config(& mut bus, & dev1, 30, 0, 9);
+    match ds18b20_read_temp(& mut bus, & dev1) {
+        Result::Ok(t) => {
+            val sp3: Vec<i64> = ds18b20_read_scratchpad(& mut bus, & dev1);
+            println("9-bit: " + int_to_str(t) + " config " + hex_encode_bytes(one(sp3.get(4))) + " bits " + int_to_str(ds18b20_resolution(sp3.get(4))));
+        }
+        Result::Err(e) => {
+            println("9-bit: " + e);
+        }
+    }
+    // every device converts (SKIP ROM), then ask who is outside its limits
+    var none: Vec<i64> = Vec::new();
+    ds18b20_convert(& mut bus, & none);
+    val alarms: Vec<Vec<i64>> = ow_search_all(& mut bus, OW_ALARM_SEARCH);
+    i = 0;
+    while i < alarms.len() {
+        val r: Vec<i64> = alarms.get(i);
+        println("alarm " + ow_rom_hex(& r));
+        i = i + 1;
+    }
+    var fs: OwSearch = ow_search_family(0x01);
+    val fam: Vec<i64> = ow_search_next(& mut bus, & mut fs);
+    println("family 01: " + ow_rom_hex(& fam));
+    var empty: OneWire = ow_bus_fake();
+    println("no devices: " + int_to_str(ow_search_all(& mut empty, OW_SEARCH_ROM).len()));
+
+    println("datasheet: " + int_to_str(ds18b20_raw_to_c10000(0x07D0)) + " " + int_to_str(ds18b20_raw_to_c10000(0x0550)) + " " + int_to_str(ds18b20_raw_to_c10000(0x00A2)) + " " + int_to_str(ds18b20_raw_to_c10000(0x0008)) + " " + int_to_str(ds18b20_raw_to_c10000(0xFFF8)) + " " + int_to_str(ds18b20_raw_to_c10000(0xFF5E)) + " " + int_to_str(ds18b20_raw_to_c10000(0xFE6F)) + " " + int_to_str(ds18b20_raw_to_c10000(0xFC90)));
+    println("to raw: " + hex16(ds18b20_celsius_to_raw(25.0625)) + " " + hex16(ds18b20_celsius_to_raw(-25.0625)) + " " + hex16(ds18b20_celsius_to_raw(-0.5)) + " " + hex16(ds18b20_celsius_to_raw(125.0)));
+    println("conversion us: " + int_to_str(ds18b20_conversion_us(9)) + " " + int_to_str(ds18b20_conversion_us(12)));
+
+    val pins: OwPins = OwPins { drive_low: pin_nop, release: pin_nop, read: pin_nop, delay_ns: pin_nop };
+    var pb: OneWire = ow_bus_pins(pins, ow_timing_standard());
+    val pres: bool = ow_reset(& mut pb);
+    println("pins without a device: " + bool_to_str(pres) + " " + int_to_str(pb.bus_ns));
+}

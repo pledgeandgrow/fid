@@ -25,11 +25,15 @@ const PE_SYS_RENAMEAT2: i64 = 276;
 
 pub fn pert_file_size(path: str) -> i64 {
     if (path as i64) == 0 { return 0 - 1; }
+    // F4: a directory has no file size (as pert_file_read; the C runtime
+    // gives -1 for its huge ext4 end offset)
+    val dmode: i64 = pe_mode(path as i64);
+    if dmode >= 0 && (dmode & 61440) == 16384 { return 0 - 1; }
     var fd: i64 = pe_open(path as i64, 0);
     if fd < 0 { return 0 - 1; }
     var size: i64 = pe_sys(PE_SYS_LSEEK, fd, 0, 2);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
-    if size < 0 { return 0 - 1; }
+    if size < 0 || size >= 281474976710656 { return 0 - 1; }
     return size;
 }
 
@@ -87,6 +91,164 @@ pub fn pert_file_hash(path: str) -> i64 {
     pert_free(buf);
     pe_sys(PE_SYS_CLOSE, fd, 0, 0);
     return h;
+}
+
+// CU7: anonymous mappings (stdlib/mmap.fd), as the C runtime's p_mmap_*:
+// mmap'd pages (win.fd answers mmap / munmap on --nat Windows) and a table
+// of 256 [address, length] pairs, made on first use, for p_mmap_len and
+// p_munmap. Like the C runtime's table, not shared safely between threads.
+
+var lrt_mm_tab: i64 = 0;
+
+fn lrt_mm_table() -> i64 {
+    if lrt_mm_tab == 0 {
+        lrt_mm_tab = pe_zeroed(512);
+    }
+    return lrt_mm_tab;
+}
+
+/// The table index of mapping `addr` (0: a free entry), -1 when none.
+fn lrt_mm_find(addr: i64) -> i64 {
+    var t: i64 = lrt_mm_table();
+    var i: i64 = 0;
+    while i < 256 {
+        if pe_ld(t + i * 16) == addr {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// `len` zeroed read/write bytes of their own pages; 0 on failure.
+pub fn pert_mmap_anon(len: i64) -> i64 {
+    if len <= 0 {
+        return 0;
+    }
+    var s: i64 = lrt_mm_find(0);
+    if s < 0 {
+        return 0;
+    }
+    // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+    var p: i64 = nat_syscall(PE_SYS_MMAP, 0, len, 3, 34, 0 - 1, 0);
+    if p < 0 && p > 0 - 4096 {
+        return 0;
+    }
+    if p == 0 {
+        return 0;
+    }
+    var t: i64 = lrt_mm_table();
+    pe_st(t + s * 16, p);
+    pe_st(t + s * 16 + 8, len);
+    return p;
+}
+
+/// The length of mapping `addr`, 0 when it is not one.
+pub fn pert_mmap_len(addr: i64) -> i64 {
+    if addr == 0 {
+        return 0;
+    }
+    var s: i64 = lrt_mm_find(addr);
+    if s < 0 {
+        return 0;
+    }
+    return pe_ld(lrt_mm_table() + s * 16 + 8);
+}
+
+/// Unmap `addr`: 0, or -1 when it is not a mapping.
+pub fn pert_munmap(addr: i64) -> i64 {
+    if addr == 0 {
+        return 0 - 1;
+    }
+    var s: i64 = lrt_mm_find(addr);
+    if s < 0 {
+        return 0 - 1;
+    }
+    var t: i64 = lrt_mm_table();
+    val len: i64 = pe_ld(t + s * 16 + 8);
+    pe_st(t + s * 16, 0);
+    pe_st(t + s * 16 + 8, 0);
+    pe_sys(PE_SYS_MUNMAP, addr, len, 0);
+    return 0;
+}
+
+// roadmap L4B (streaming file handles, stdlib/fs.fd File; core.fd declares
+// p_file_read_at / p_file_append_vec): as the C runtime's.
+
+/// Up to n bytes from byte `offset`, one element each; empty past the end
+/// or when the file cannot be read. Only those bytes are read.
+pub fn pert_file_read_at(path: str, offset: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if (path as i64) == 0 || offset < 0 || n <= 0 { return v; }
+    var fd: i64 = pe_open(path as i64, 0);
+    if fd < 0 { return v; }
+    if pe_sys(PE_SYS_LSEEK, fd, offset, 0) != offset {
+        pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+        return v;
+    }
+    var left: i64 = n;
+    if left > 1073741824 { left = 1073741824; }
+    var chunk: i64 = 65536;
+    if left < chunk { chunk = left; }
+    var buf: i64 = pert_malloc(chunk);
+    while left > 0 {
+        var want: i64 = chunk;
+        if left < want { want = left; }
+        var got: i64 = pe_sys(PE_SYS_READ, fd, buf, want);
+        if got <= 0 { left = 0; } else {
+            var i: i64 = 0;
+            while i < got {
+                v.push(pe_ldb(buf + i));
+                i = i + 1;
+            }
+            left = left - got;
+        }
+    }
+    pert_free(buf);
+    pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+    return v;
+}
+
+/// Each element's low byte after what the file holds (created if missing),
+/// zero bytes included: 0, or -1 when it cannot be written.
+pub fn pert_file_append_vec(path: str, v: Vec<i64>) -> i64 {
+    if (path as i64) == 0 { return 0 - 1; }
+    var fd: i64 = pe_open(path as i64, 1089);       // WRONLY|CREAT|APPEND
+    if fd < 0 { return 0 - 1; }
+    var n: i64 = v.len();
+    var ok: bool = true;
+    if n > 0 {
+        var buf: i64 = pert_malloc(n);
+        var i: i64 = 0;
+        while i < n {
+            pe_stb(buf + i, v.get(i) & 255);
+            i = i + 1;
+        }
+        var at: i64 = 0;
+        while at < n && ok {
+            var w: i64 = pe_sys(PE_SYS_WRITE, fd, buf + at, n - at);
+            if w <= 0 { ok = false; } else { at = at + w; }
+        }
+        pert_free(buf);
+    }
+    pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+    if !ok { return 0 - 1; }
+    return 0;
+}
+
+/// The time the file was last written, in ms since 1970; -1 when it does
+/// not exist (as the C runtime's p_file_mtime_ms). Every OS layer's
+/// newfstatat fills st_mtime at 88 and its nanoseconds at 96 (win.fd,
+/// darwin.fd and wasi.fd copy them there).
+pub fn pert_file_mtime_ms(path: str) -> i64 {
+    if (path as i64) == 0 { return 0 - 1; }
+    var st: i64 = pert_malloc(160);
+    pe_zero(st, 160);
+    var r: i64 = nat_syscall(PE_SYS_NEWFSTATAT, PE_AT_FDCWD, path as i64, st, 0, 0, 0);
+    var ms: i64 = pe_ld(st + 88) * 1000 + pe_ld(st + 96) / 1000000;
+    pert_free(st);
+    if r < 0 { return 0 - 1; }
+    return ms;
 }
 
 // ─── Directories ────────────────────────────────────────────────────────
@@ -263,12 +425,15 @@ pub fn pert_volatile_store8(addr: i64, val: i64) {
 pub fn pert_volatile_load32(addr: i64) -> i64 {
     var p: *mut u32 = addr;
     var v: i64 = 0;
+    // SAFETY: NOT checked: p_volatile_load32 is a raw-address API (MMIO,
+    // buffers the caller made); the address is the caller's to vouch for.
     unsafe { v = *p; }
     return v;
 }
 
 pub fn pert_volatile_store32(addr: i64, val: i64) {
     var p: *mut u32 = addr;
+    // SAFETY: NOT checked: a raw 4-byte store, as pert_volatile_load32.
     unsafe { *p = val; }
 }
 
@@ -640,10 +805,35 @@ fn pe_sockaddr6(a: i64, port: i64) -> i64 {
 /// An IPv6 address of host from /etc/hosts, at out (16 bytes): false if
 /// there is none.
 fn pe_resolve6(host: i64, out: i64) -> bool {
+    if pe_resolve6_local(host, out) { return true; }
+    if nat_os() == 1 { return pe_win_resolve6(host, out); }
+    return pe_dns_query(host, 28, out);
+}
+
+/// Windows: the first IPv6 address the system resolver gives for host, at
+/// out (16 bytes): false if there is none.
+fn pe_win_resolve6(host: i64, out: i64) -> bool {
+    var recs: i64 = pe_zeroed(64);
+    var nr: i64 = pe_win_addrs(host, recs, 16);
+    var found: bool = false;
+    var i: i64 = 0;
+    while i < nr && !found {
+        if pe_ld(recs + i * 32) == 10 {
+            pe_copy(out, recs + i * 32 + 16, 16);
+            found = true;
+        }
+        i = i + 1;
+    }
+    pert_free(recs);
+    return found;
+}
+
+/// An IPv6 literal or an /etc/hosts entry for host, at out: no DNS.
+fn pe_resolve6_local(host: i64, out: i64) -> bool {
     var n: i64 = pe_len(host);
     if pe_parse_ipv6(host, n, out) { return true; }
     var text: i64 = pert_file_read("/etc/hosts" as i64) as i64;
-    if text == 0 { return nat_os() != 1 && pe_dns_query(host, 28, out); }
+    if text == 0 { return false; }
     var tl: i64 = pe_len(text);
     var at: i64 = 0;
     var found: bool = false;
@@ -676,26 +866,35 @@ fn pe_resolve6(host: i64, out: i64) -> bool {
     }
     pert_free(addr);
     p_str_free(text);
-    if !found && nat_os() != 1 { found = pe_dns_query(host, 28, out); }
     return found;
 }
 
 // ─── DNS (competitive SL5) ──────────────────────────────────────────────
-// A name /etc/hosts does not have is asked of the first IPv4 nameserver in
-// /etc/resolv.conf: one UDP query (recursion desired) for an A or AAAA
-// record, two tries of 2 s each, the first answer record of that type.
-// CNAME chains are followed by the resolver, which puts the address
-// records after them in the same answer. No cache (stdlib/dns.fd has one).
-// The wait blocks the thread (pe_poll_fd), as /etc/hosts reading does.
+// A name /etc/hosts does not have is asked of the IPv4 nameservers of
+// /etc/resolv.conf in order (at most 3, as glibc's MAXNS): one UDP query
+// (recursion desired) for an A or AAAA record, two tries of 2 s each per
+// server. A server that does not answer, or answers SERVFAIL/REFUSED, passes
+// the question to the next one; an answer (NXDOMAIN included) is final.
+// Every answer record of that type is kept (pe_dns_query_n), so connect can
+// try each address. CNAME chains are followed by the resolver, which puts
+// the address records after them in the same answer. No cache
+// (stdlib/dns.fd has one). The wait blocks the thread (pe_poll_fd), as
+// /etc/hosts reading does.
 
 /// The first IPv4 nameserver of /etc/resolv.conf, as a word of wire bytes,
 /// or -1.
 fn pe_dns_server() -> i64 {
+    return pe_dns_server_at(0);
+}
+
+/// The IPv4 nameserver number idx (0-based) of /etc/resolv.conf, or -1.
+fn pe_dns_server_at(idx: i64) -> i64 {
     var text: i64 = pert_file_read("/etc/resolv.conf" as i64) as i64;
     if text == 0 { return 0 - 1; }
     var tl: i64 = pe_len(text);
     var at: i64 = 0;
     var found: i64 = 0 - 1;
+    var seen: i64 = 0;
     while at < tl && found < 0 {
         var eol: i64 = at;
         while eol < tl && pe_ldb(text + eol) != 10 { eol = eol + 1; }
@@ -708,7 +907,12 @@ fn pe_dns_server() -> i64 {
             while b < eol && (pe_ldb(text + b) == 32 || pe_ldb(text + b) == 9) { b = b + 1; }
             var c: i64 = b;
             while c < eol && pe_ldb(text + c) != 32 && pe_ldb(text + c) != 9 && pe_ldb(text + c) != 13 && pe_ldb(text + c) != 35 { c = c + 1; }
-            found = pe_parse_ipv4(text + b, c - b);
+            // an IPv6 nameserver is skipped (the query socket is IPv4)
+            var ip: i64 = pe_parse_ipv4(text + b, c - b);
+            if ip >= 0 {
+                if seen == idx { found = ip; }
+                seen = seen + 1;
+            }
         }
         at = eol + 1;
     }
@@ -720,8 +924,8 @@ fn pe_dns_server() -> i64 {
 /// bytes, or -1 when it runs past the end.
 fn pe_dns_skip_name(m: i64, n: i64, pos: i64) -> i64 {
     var p: i64 = pos;
-    var guard: i64 = 0;
-    while p < n && guard < 128 {
+    var iters: i64 = 0;
+    while p < n && iters < 128 {
         var len: i64 = pe_ldb(m + p);
         if len == 0 { return p + 1; }
         if (len & 192) == 192 {
@@ -730,7 +934,7 @@ fn pe_dns_skip_name(m: i64, n: i64, pos: i64) -> i64 {
         }
         if (len & 192) != 0 { return 0 - 1; }
         p = p + 1 + len;
-        guard = guard + 1;
+        iters = iters + 1;
     }
     return 0 - 1;
 }
@@ -738,10 +942,16 @@ fn pe_dns_skip_name(m: i64, n: i64, pos: i64) -> i64 {
 /// The first answer of type qtype (1 A, 28 AAAA) for host, its 4 or 16
 /// address bytes at out: true when there is one.
 fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
+    return pe_dns_query_n(host, qtype, out, 1) > 0;
+}
+
+/// Up to max answers of type qtype for host, each 4 (A) or 16 (AAAA) bytes
+/// at out one after another: how many. Each nameserver in turn until one
+/// gives a final answer.
+fn pe_dns_query_n(host: i64, qtype: i64, out: i64, max: i64) -> i64 {
     var hl: i64 = pe_len(host);
-    if hl == 0 || hl > 253 { return false; }
-    var ns: i64 = pe_dns_server();
-    if ns < 0 { return false; }
+    if hl == 0 || hl > 253 || max <= 0 { return 0; }
+    if pe_dns_server_at(0) < 0 { return 0; }
     var q: i64 = pe_zeroed(64);                     // 512 bytes
     var id: i64 = pe_now_ns() & 65535;
     pe_stb(q, id >> 8);
@@ -771,30 +981,56 @@ fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
     }
     if !ok {
         pert_free(q);
-        return false;
+        return 0;
     }
     pe_stb(q + w, 0);
     pe_stb(q + w + 2, qtype);
     pe_stb(q + w + 4, 1);                           // class IN
     var qlen: i64 = w + 5;
-    var s: i64 = pe_sys(PE_SYS_SOCKET, 2, 2, 0);    // AF_INET, SOCK_DGRAM
-    if s < 0 {
-        pert_free(q);
-        return false;
+    var got: i64 = 0 - 1;
+    var si: i64 = 0;
+    while si < 3 && got < 0 {
+        var ns: i64 = pe_dns_server_at(si);
+        if ns < 0 {
+            si = 3;
+        } else {
+            got = pe_dns_ask(ns, q, qlen, id, qtype, out, max);
+            si = si + 1;
+        }
     }
+    pert_free(q);
+    if got < 0 { return 0; }
+    return got;
+}
+
+/// Ask nameserver ns the question q (qlen bytes, id): the number of answer
+/// records stored at out (0 for a final answer without one, NXDOMAIN
+/// included), or -1 when this server gave no usable answer (no reply in two
+/// tries, SERVFAIL, REFUSED): the caller asks the next one.
+fn pe_dns_ask(ns: i64, q: i64, qlen: i64, id: i64, qtype: i64, out: i64, max: i64) -> i64 {
+    var s: i64 = pe_sys(PE_SYS_SOCKET, 2, 2, 0);    // AF_INET, SOCK_DGRAM
+    if s < 0 { return 0 - 1; }
     var sa: i64 = pe_sockaddr(ns, 53);
-    var found: bool = false;
+    var got: i64 = 0 - 1;
+    var want: i64 = 4;
+    if qtype == 28 { want = 16; }
     if pe_sys(PE_SYS_CONNECT, s, sa, 16) == 0 {
         var r: i64 = pe_zeroed(64);
         var tries: i64 = 0;
-        while tries < 2 && !found {
+        while tries < 2 && got < 0 {
             tries = tries + 1;
             if nat_syscall(PE_SYS_SENDTO, s, q, qlen, 0, 0, 0) == qlen && pe_poll_fd(s, 0, 2000) == 1 {
                 var n: i64 = nat_syscall(PE_SYS_RECVFROM, s, r, 512, 0, 0, 0);
                 var rid: i64 = 0;
                 if n >= 12 { rid = (pe_ldb(r) << 8) | pe_ldb(r + 1); }
+                var rcode: i64 = 0 - 1;
+                if n >= 12 && rid == id && (pe_ldb(r + 2) & 128) != 0 { rcode = pe_ldb(r + 3) & 15; }
+                // NXDOMAIN is final; any other error passes to the next server
+                if rcode == 3 { got = 0; }
+                if rcode > 0 && rcode != 3 { tries = 2; }
                 // our id, a response, no error
-                if n >= 12 && rid == id && (pe_ldb(r + 2) & 128) != 0 && (pe_ldb(r + 3) & 15) == 0 {
+                if rcode == 0 {
+                    got = 0;
                     var qd: i64 = (pe_ldb(r + 4) << 8) | pe_ldb(r + 5);
                     var an: i64 = (pe_ldb(r + 6) << 8) | pe_ldb(r + 7);
                     var p: i64 = 12;
@@ -805,7 +1041,7 @@ fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
                         qi = qi + 1;
                     }
                     var ai: i64 = 0;
-                    while ai < an && p >= 0 && !found {
+                    while ai < an && p >= 0 && got < max {
                         p = pe_dns_skip_name(r, n, p);
                         if p >= 0 && p + 10 <= n {
                             var ty: i64 = (pe_ldb(r + p) << 8) | pe_ldb(r + p + 1);
@@ -814,15 +1050,13 @@ fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
                             if p + rdl > n {
                                 p = 0 - 1;
                             } else {
-                                var want: i64 = 4;
-                                if qtype == 28 { want = 16; }
                                 if ty == qtype && rdl == want {
                                     var k2: i64 = 0;
                                     while k2 < want {
-                                        pe_stb(out + k2, pe_ldb(r + p + k2));
+                                        pe_stb(out + got * want + k2, pe_ldb(r + p + k2));
                                         k2 = k2 + 1;
                                     }
-                                    found = true;
+                                    got = got + 1;
                                 }
                                 p = p + rdl;
                             }
@@ -840,8 +1074,7 @@ fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
     }
     pe_sys(PE_SYS_CLOSE, s, 0, 0);
     pert_free(sa);
-    pert_free(q);
-    return found;
+    return got;
 }
 
 /// The IPv4 address of host, or -1: a dotted quad, localhost, /etc/hosts,
@@ -849,12 +1082,20 @@ fn pe_dns_query(host: i64, qtype: i64, out: i64) -> bool {
 fn pe_resolve(host: i64) -> i64 {
     // Windows: the system resolver, through win.fd (its syscall 1001)
     if nat_os() == 1 { return nat_syscall(1001, host, 0, 0, 0, 0, 0); }
+    var found: i64 = pe_resolve4_local(host);
+    if found < 0 { found = pe_dns4(host); }
+    return found;
+}
+
+/// The IPv4 address of host without DNS: a dotted quad, localhost, or an
+/// /etc/hosts entry; -1 when none of them names it.
+fn pe_resolve4_local(host: i64) -> i64 {
     var n: i64 = pe_len(host);
     var direct: i64 = pe_parse_ipv4(host, n);
     if direct >= 0 { return direct; }
     if pert_str_equal(host, "localhost" as i64) { return 16777343; }   // 127.0.0.1
     var text: i64 = pert_file_read("/etc/hosts" as i64) as i64;
-    if text == 0 { return pe_dns4(host); }
+    if text == 0 { return 0 - 1; }
     var tl: i64 = pe_len(text);
     var at: i64 = 0;
     var found: i64 = 0 - 1;
@@ -882,7 +1123,6 @@ fn pe_resolve(host: i64) -> i64 {
         at = eol + 1;
     }
     p_str_free(text);
-    if found < 0 { found = pe_dns4(host); }
     return found;
 }
 
@@ -924,6 +1164,49 @@ pub fn pert_socket_listen(port: i64) -> i64 {
     var bound: i64 = pe_sys(PE_SYS_BIND, s, sa, 16);
     pert_free(sa);
     if bound != 0 || pe_sys(PE_SYS_LISTEN, s, 4096, 0) != 0 {
+        pe_sys(PE_SYS_CLOSE, s, 0, 0);
+        return 0 - 1;
+    }
+    return s;
+}
+
+// ─── Unix-domain sockets (roadmap L4B) ──────────────────────────────────
+// stdlib/unix_socket.fd's p_unix_listen / p_unix_connect: a stream socket
+// named by a path (the Linux sockaddr_un: 16-bit family 1, then the path
+// and its NUL; darwin.fd translates it for macOS, win.fd passes it to
+// ws2_32's AF_UNIX on --nat Windows, which has the same layout). -1 on
+// failure. pert_socket_accept / read / write / close work on them.
+
+/// A socket listening at `path`, or -1.
+pub fn pert_unix_listen(path: str) -> i64 {
+    return pe_unix_open(path, true);
+}
+
+/// A socket connected to the listener at `path`, or -1.
+pub fn pert_unix_connect(path: str) -> i64 {
+    return pe_unix_open(path, false);
+}
+
+fn pe_unix_open(path: str, listening: bool) -> i64 {
+    val n: i64 = pe_len(path as i64);
+    if n == 0 || n > 103 { return 0 - 1; }
+    // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC
+    val s: i64 = pe_sys(PE_SYS_SOCKET, 1, 524289, 0);
+    if s < 0 { return 0 - 1; }
+    val sa: i64 = pert_malloc(112);
+    pe_zero(sa, 112);
+    pe_stb(sa, 1);
+    pe_copy(sa + 2, path as i64, n);
+    val salen: i64 = 2 + n + 1;
+    var r: i64 = 0;
+    if listening {
+        r = nat_syscall(PE_SYS_BIND, s, sa, salen, 0, 0, 0);
+        if r == 0 { r = pe_sys(PE_SYS_LISTEN, s, 4096, 0); }
+    } else {
+        r = nat_syscall(PE_SYS_CONNECT, s, sa, salen, 0, 0, 0);
+    }
+    pert_free(sa);
+    if r != 0 {
         pe_sys(PE_SYS_CLOSE, s, 0, 0);
         return 0 - 1;
     }
@@ -989,45 +1272,229 @@ pub fn pert_socket_recv_str(fd: i64) -> str {
     return r;
 }
 
-/// A TCP connection to host:port, or -1: an IPv4 address of the host if
-/// it has one, else an IPv6 one.
+// ─── stdlib/net.fd's pledge_net_* (UDP) ─────────────────────────────────
+// The C backend links runtime/pledge_net.c; on the machine layer these are
+// the same functions over the system calls (Linux directly; macOS through
+// darwin.fd, which translates sockaddrs both ways, MI16). Addresses are
+// IPv4 in network order as inet_addr gives them (first octet in the low
+// byte; 0 = INADDR_ANY). Results as the C ones: -1 on an error.
+
+fn pe_pn_ret(r: i64) -> i64 {
+    if r < 0 { return 0 - 1; }
+    return r;
+}
+
+pub fn pert_c_pledge_net_socket(domain: i64, ty: i64, protocol: i64) -> i64 {
+    return pe_pn_ret(pe_sys(PE_SYS_SOCKET, domain, ty, protocol));
+}
+
+pub fn pert_c_pledge_net_close(sock: i64) -> i64 {
+    pe_ep_forget(sock);
+    return pe_pn_ret(pe_sys(PE_SYS_CLOSE, sock, 0, 0));
+}
+
+/// inet_addr: "a.b.c.d" in network order, INADDR_NONE (0xFFFFFFFF) when it
+/// is not one.
+pub fn pert_c_pledge_net_inet_addr(ip_str: str) -> i64 {
+    if (ip_str as i64) == 0 { return 4294967295; }
+    var a: i64 = pe_parse_ipv4(ip_str as i64, pe_len(ip_str as i64));
+    if a < 0 { return 4294967295; }
+    return a;
+}
+
+pub fn pert_c_pledge_net_bind(sock: i64, port: i64) -> i64 {
+    var on: i64 = pe_zeroed(1);
+    pe_st(on, 1);
+    nat_syscall(PE_SYS_SETSOCKOPT, sock, 1, 2, on, 4, 0);     // SO_REUSEADDR
+    pert_free(on);
+    var sa: i64 = pe_sockaddr(0, port);
+    var r: i64 = pe_sys(PE_SYS_BIND, sock, sa, 16);
+    pert_free(sa);
+    return pe_pn_ret(r);
+}
+
+pub fn pert_c_pledge_net_set_nonblocking(sock: i64) -> i64 {
+    var fl: i64 = pe_sys(PE_SYS_FCNTL, sock, 3, 0);            // F_GETFL
+    if fl < 0 { return 0 - 1; }
+    return pe_pn_ret(pe_sys(PE_SYS_FCNTL, sock, 4, fl | 2048));  // F_SETFL O_NONBLOCK
+}
+
+pub fn pert_c_pledge_net_set_recv_timeout(sock: i64, timeout_ms: i64) -> i64 {
+    var tv: i64 = pe_zeroed(2);                                // struct timeval
+    pe_st(tv, timeout_ms / 1000);
+    pe_st(tv + 8, (timeout_ms % 1000) * 1000);
+    var r: i64 = nat_syscall(PE_SYS_SETSOCKOPT, sock, 1, 20, tv, 16, 0);   // SO_RCVTIMEO
+    pert_free(tv);
+    return pe_pn_ret(r);
+}
+
+pub fn pert_c_pledge_net_sendto(sock: i64, data: i64, len: i64, ip: i64, port: i64) -> i64 {
+    var sa: i64 = pe_sockaddr(ip, port);
+    var r: i64 = nat_syscall(PE_SYS_SENDTO, sock, data, len, 16384, sa, 16);   // MSG_NOSIGNAL
+    pert_free(sa);
+    return pe_pn_ret(r);
+}
+
+/// A datagram into buf; when from_addr is given (a NetAddr: ip, port, raw)
+/// the sender's IPv4 address and port go there, as pledge_net.c does.
+pub fn pert_c_pledge_net_recvfrom(sock: i64, buf: i64, len: i64, from_addr: i64) -> i64 {
+    var src: i64 = pe_zeroed(4);                               // sockaddr_in6 room
+    var sl: i64 = pe_zeroed(1);
+    pe_st(sl, 28);
+    var r: i64 = nat_syscall(PE_SYS_RECVFROM, sock, buf, len, 0, src, sl);
+    if from_addr != 0 && r >= 0 {
+        var w: i64 = pe_ld(src);
+        pe_st(from_addr, (w >> 32) & 4294967295);
+        var phi: i64 = (w >> 16) & 255;                        // the port, big-endian
+        var plo: i64 = (w >> 24) & 255;
+        pe_st(from_addr + 8, (phi << 8) | plo);
+        pe_st(from_addr + 16, 0);
+    }
+    pert_free(src);
+    pert_free(sl);
+    return pe_pn_ret(r);
+}
+
+pub fn pert_c_pledge_net_connect(sock: i64, ip: i64, port: i64) -> i64 {
+    var sa: i64 = pe_sockaddr(ip, port);
+    var r: i64 = pe_sys(PE_SYS_CONNECT, sock, sa, 16);
+    pert_free(sa);
+    return pe_pn_ret(r);
+}
+
+pub fn pert_c_pledge_net_send(sock: i64, data: i64, len: i64) -> i64 {
+    return pe_pn_ret(nat_syscall(PE_SYS_SENDTO, sock, data, len, 16384, 0, 0));
+}
+
+pub fn pert_c_pledge_net_recv(sock: i64, buf: i64, len: i64) -> i64 {
+    return pe_pn_ret(nat_syscall(PE_SYS_RECVFROM, sock, buf, len, 0, 0, 0));
+}
+
+/// A TCP connection to host:port, or -1. Every address of the host is
+/// tried in turn until one connects (competitive SL5): the IPv4 and then
+/// the IPv6 address a literal or /etc/hosts gives; without one, every A
+/// answer of DNS and then every AAAA answer (at most 8 of each). On
+/// `--nat` Windows, every address getaddrinfo gives (pe_win_connect_all).
 pub fn pert_net_connect(host: str, port: i64) -> i64 {
     if (host as i64) == 0 { return 0 - 1; }
-    var family: i64 = 2;
-    var salen: i64 = 16;
-    var sa: i64 = 0;
-    var ip: i64 = pe_resolve(host as i64);
-    if ip >= 0 {
-        sa = pe_sockaddr(ip, port);
-    } else {
-        var a6: i64 = pe_zeroed(2);
-        if !pe_resolve6(host as i64, a6) {
-            pert_free(a6);
-            return 0 - 1;
-        }
-        sa = pe_sockaddr6(a6, port);
+    var h: i64 = host as i64;
+    // Windows (win.fd): every address the system resolver gives
+    // (getaddrinfo), IPv6 ones included, in its order
+    if nat_os() == 1 { return pe_win_connect_all(h, port); }
+    var ip: i64 = pe_resolve4_local(h);
+    var a6: i64 = pe_zeroed(2);
+    var has6: bool = pe_resolve6_local(h, a6);
+    if ip >= 0 || has6 {
+        var c: i64 = 0 - 1;
+        if ip >= 0 { c = pe_connect_sa(2, pe_sockaddr(ip, port), 16); }
+        if c < 0 && has6 { c = pe_connect_sa(10, pe_sockaddr6(a6, port), 28); }
         pert_free(a6);
-        family = 10;
-        salen = 28;
+        return c;
     }
+    pert_free(a6);
+    var conn: i64 = 0 - 1;
+    var buf4: i64 = pe_zeroed(4);                   // 8 IPv4 addresses
+    var n4: i64 = pe_dns_query_n(h, 1, buf4, 8);
+    var k: i64 = 0;
+    while k < n4 && conn < 0 {
+        var w4: i64 = 0;
+        var b: i64 = 0;
+        while b < 4 {
+            w4 = w4 | (pe_ldb(buf4 + k * 4 + b) << (b * 8));
+            b = b + 1;
+        }
+        conn = pe_connect_sa(2, pe_sockaddr(w4, port), 16);
+        k = k + 1;
+    }
+    pert_free(buf4);
+    if conn >= 0 { return conn; }
+    var buf6: i64 = pe_zeroed(16);                  // 8 IPv6 addresses
+    var n6: i64 = pe_dns_query_n(h, 28, buf6, 8);
+    var k6: i64 = 0;
+    while k6 < n6 && conn < 0 {
+        conn = pe_connect_sa(10, pe_sockaddr6(buf6 + k6 * 16, port), 28);
+        k6 = k6 + 1;
+    }
+    pert_free(buf6);
+    return conn;
+}
+
+/// Up to max addresses of host from the Windows resolver (win.fd syscall
+/// 1003, getaddrinfo), as 32-byte records at out: [family 2 or 10][IPv6
+/// scope id][address]. How many; 0 when the name does not resolve.
+fn pe_win_addrs(host: i64, out: i64, max: i64) -> i64 {
+    var n: i64 = nat_syscall(1003, host, out, max, 0, 0, 0);
+    if n < 0 { return 0; }
+    return n;
+}
+
+/// The sockaddr_in6 of address a (16 bytes) with scope id scope, port.
+fn pe_sockaddr6_scope(a: i64, port: i64, scope: i64) -> i64 {
+    var sa: i64 = pe_sockaddr6(a, port);
+    var j: i64 = 0;
+    while j < 4 {
+        pe_stb(sa + 24 + j, (scope >> (j * 8)) & 255);
+        j = j + 1;
+    }
+    return sa;
+}
+
+/// Windows (competitive SL5): a TCP connection to host:port trying every
+/// address the system resolver gives (at most 16), IPv4 and IPv6, in its
+/// order until one connects, as pe_runtime does; -1 when none does.
+fn pe_win_connect_all(h: i64, port: i64) -> i64 {
+    var recs: i64 = pe_zeroed(64);                  // 16 records of 32 bytes
+    var nr: i64 = pe_win_addrs(h, recs, 16);
+    var conn: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < nr && conn < 0 {
+        var rec: i64 = recs + i * 32;
+        if pe_ld(rec) == 2 {
+            conn = pe_connect_sa(2, pe_sockaddr(pe_ld(rec + 16) & 4294967295, port), 16);
+        } else {
+            conn = pe_connect_sa(10, pe_sockaddr6_scope(rec + 16, port, pe_ld(rec + 8)), 28);
+        }
+        i = i + 1;
+    }
+    pert_free(recs);
+    return conn;
+}
+
+/// Connect a new TCP socket of family to the address sa (salen bytes),
+/// which this frees: the socket, or -1. On a task the wait is the
+/// scheduler's (30 s).
+fn pe_connect_sa(family: i64, sa: i64, salen: i64) -> i64 {
     var s: i64 = pe_sys(PE_SYS_SOCKET, family, 1, 0);
     if s < 0 {
         pert_free(sa);
         return 0 - 1;
     }
     var r: i64 = 0;
-    if pe_co_self() != 0 {
+    // C7: under a timeout block's token (outside a task too) the connect
+    // is made non-blocking and waited for, so the token stops it; outside
+    // a task the socket is blocking again afterwards
+    val on_task: bool = pe_co_self() != 0;
+    if on_task || pert_task_token() != 0 {
+        var fl0: i64 = pe_sys(PE_SYS_FCNTL, s, 3, 0);              // F_GETFL
         pe_nonblock(s);
         r = pe_sys(PE_SYS_CONNECT, s, sa, salen);
         if r == PE_EINPROGRESS {
-            pert_co_wait_fd(s, 1, 30000);
-            var err: i64 = pe_zeroed(1);
-            var len: i64 = pe_zeroed(1);
-            pe_st(len, 4);
-            nat_syscall(209, s, 1, 4, err, len, 0);          // getsockopt SO_ERROR
-            r = 0 - (pe_ld(err) & 4294967295);
-            pert_free(err);
-            pert_free(len);
+            var limit: i64 = 0 - 1;
+            if on_task { limit = 30000; }
+            if pert_co_wait_fd(s, 1, limit) == 0 {
+                r = 0 - 110;                                         // ETIMEDOUT (or stopped)
+            } else {
+                var err: i64 = pe_zeroed(1);
+                var len: i64 = pe_zeroed(1);
+                pe_st(len, 4);
+                nat_syscall(209, s, 1, 4, err, len, 0);          // getsockopt SO_ERROR
+                r = 0 - (pe_ld(err) & 4294967295);
+                pert_free(err);
+                pert_free(len);
+            }
+        }
+        if r == 0 && !on_task && fl0 >= 0 {
+            pe_sys(PE_SYS_FCNTL, s, 4, fl0 - (fl0 & 2048));       // F_SETFL, blocking
         }
     } else {
         r = pe_sys(PE_SYS_CONNECT, s, sa, salen);
@@ -1086,6 +1553,233 @@ pub fn pert_co_send(fd: i64, buf: i64, n: i64) -> i64 {
     return done;
 }
 
+// ─── Zero-copy file and socket I/O (competitive roadmap RT14) ───────────
+// fs.fd's fs_copy_file and net.fd's net_send_file call p_fs_copy_file and
+// p_net_send_file; these run instead of their portable bodies. The kernel
+// moves the bytes where it can (copy_file_range, then sendfile), so they
+// never pass through the program; what it does not move (ENOSYS: an older
+// kernel, a number the x86-64 map lacks, Windows and macOS under this
+// runtime; EXDEV, EINVAL: a file system or socket without them) goes
+// through a 64 KB buffer from where the kernel stopped (the calls advance
+// the file offsets they are given none for).
+const PE_SYS_SENDFILE: i64 = 71;
+const PE_SYS_COPY_FILE_RANGE: i64 = 285;
+const PE_ZC_CHUNK: i64 = 1073741824;
+var pe_zc_pipe_done: i64 = 0;
+
+fn pe_zc_chunk(left: i64) -> i64 {
+    if left < PE_ZC_CHUNK { return left; }
+    return PE_ZC_CHUNK;
+}
+
+/// sendfile to a peer that has closed raises SIGPIPE, which would end the
+/// process (the runtime's own sends pass MSG_NOSIGNAL): ignored from the
+/// first file sent on, unless the program set a disposition of its own.
+fn pe_zc_quiet_pipe() {
+    if pe_zc_pipe_done != 0 { return; }
+    pe_zc_pipe_done = 1;
+    var old: i64 = pe_zeroed(4);
+    var act: i64 = pe_zeroed(4);
+    if nat_syscall(PE_SYS_RT_SIGACTION, 13, 0, old, 8, 0, 0) == 0 && pe_ld(old) == 0 {
+        pe_st(act, 1);                                   // SIG_IGN
+        nat_syscall(PE_SYS_RT_SIGACTION, 13, act, 0, 8, 0, 0);
+    }
+    pert_free(old);
+    pert_free(act);
+}
+
+/// The device and inode of `path` into the two words at out (zeros when it
+/// cannot be stat'ed; both layouts start st_dev, st_ino).
+fn pe_zc_ident(path: i64, out: i64) {
+    var st: i64 = pe_zeroed(32);
+    var r: i64 = nat_syscall(PE_SYS_NEWFSTATAT, PE_AT_FDCWD, path, st, 0, 0, 0);
+    if r < 0 {
+        pe_st(out, 0);
+        pe_st(out + 8, 0);
+    } else {
+        pe_st(out, pe_ld(st));
+        pe_st(out + 8, pe_ld(st + 8));
+    }
+    pert_free(st);
+}
+
+/// Are `a` and `b` one file (same device, same non-zero inode)?
+fn pe_zc_same_file(a: i64, b: i64) -> bool {
+    var w: i64 = pe_zeroed(4);
+    pe_zc_ident(a, w);
+    pe_zc_ident(b, w + 16);
+    var same: bool = pe_ld(w + 8) != 0 && pe_ld(w) == pe_ld(w + 16) && pe_ld(w + 8) == pe_ld(w + 24);
+    pert_free(w);
+    return same;
+}
+
+/// All n bytes at buf to fd: n, or -1.
+fn pe_zc_write_all(fd: i64, buf: i64, n: i64) -> i64 {
+    var done: i64 = 0;
+    while done < n {
+        var w: i64 = pe_sys(PE_SYS_WRITE, fd, buf + done, n - done);
+        if w <= 0 { return 0 - 1; }
+        done = done + w;
+    }
+    return done;
+}
+
+/// All n bytes at buf on socket fd (MSG_NOSIGNAL; a task waits while the
+/// socket is full): n, or -1.
+fn pe_zc_send_all(fd: i64, buf: i64, n: i64) -> i64 {
+    if pe_co_self() != 0 { return pert_co_send(fd, buf, n); }
+    var done: i64 = 0;
+    while done < n {
+        var w: i64 = nat_syscall(PE_SYS_SENDTO, fd, buf + done, n - done, 16384, 0, 0);
+        if w <= 0 { return 0 - 1; }
+        done = done + w;
+    }
+    return done;
+}
+
+/// The bytes of file inf from its offset to its end, to out (a socket when
+/// sock), through a 64 KB buffer: their count, or -1.
+fn pe_zc_pump(inf: i64, out: i64, sock: bool) -> i64 {
+    var buf: i64 = pert_malloc(65536);
+    var total: i64 = 0;
+    var n: i64 = pe_sys(PE_SYS_READ, inf, buf, 65536);
+    while n > 0 {
+        var w: i64 = 0;
+        if sock {
+            w = pe_zc_send_all(out, buf, n);
+        } else {
+            w = pe_zc_write_all(out, buf, n);
+        }
+        if w != n {
+            pert_free(buf);
+            return 0 - 1;
+        }
+        total = total + n;
+        n = pe_sys(PE_SYS_READ, inf, buf, 65536);
+    }
+    pert_free(buf);
+    if n < 0 { return 0 - 1; }
+    return total;
+}
+
+/// p_fs_copy_file: `src` to `dst` (created or emptied first; a file copied
+/// onto itself is left as it is): the bytes copied, or -1.
+pub fn pert_fs_copy_file(src: str, dst: str) -> i64 {
+    var s: i64 = src as i64;
+    var d: i64 = dst as i64;
+    if s == 0 || d == 0 { return 0 - 1; }
+    var inf: i64 = pe_open(s, 0);
+    if inf < 0 { return 0 - 1; }
+    var size: i64 = pe_sys(PE_SYS_LSEEK, inf, 0, 2);
+    pe_sys(PE_SYS_LSEEK, inf, 0, 0);
+    if pe_zc_same_file(s, d) {
+        pe_sys(PE_SYS_CLOSE, inf, 0, 0);
+        if size < 0 { return 0 - 1; }
+        return size;
+    }
+    var out: i64 = pe_open(d, 577);                     // O_WRONLY | O_CREAT | O_TRUNC
+    if out < 0 {
+        pe_sys(PE_SYS_CLOSE, inf, 0, 0);
+        return 0 - 1;
+    }
+    var total: i64 = 0;
+    var left: i64 = size;
+    var kernel: bool = size > 0;
+    while kernel && left > 0 {
+        var r: i64 = nat_syscall(PE_SYS_COPY_FILE_RANGE, inf, 0, out, 0, pe_zc_chunk(left), 0);
+        if r > 0 {
+            total = total + r;
+            left = left - r;
+        } else {
+            kernel = false;
+        }
+    }
+    kernel = left > 0;
+    while kernel && left > 0 {
+        var r2: i64 = nat_syscall(PE_SYS_SENDFILE, out, inf, 0, pe_zc_chunk(left), 0, 0);
+        if r2 > 0 {
+            total = total + r2;
+            left = left - r2;
+        } else {
+            kernel = false;
+        }
+    }
+    var rest: i64 = pe_zc_pump(inf, out, false);
+    pe_sys(PE_SYS_CLOSE, inf, 0, 0);
+    var closed: i64 = pe_sys(PE_SYS_CLOSE, out, 0, 0);
+    if rest < 0 || closed < 0 { return 0 - 1; }
+    return total + rest;
+}
+
+/// p_net_send_file: the file at `path` on the connected socket `sock`: the
+/// bytes sent, or -1. In a task the socket is made non-blocking and the
+/// task waits while it is full, as pert_co_send does.
+pub fn pert_net_send_file(sock: i64, path: str) -> i64 {
+    var p: i64 = path as i64;
+    if p == 0 || sock < 0 { return 0 - 1; }
+    var inf: i64 = pe_open(p, 0);
+    if inf < 0 { return 0 - 1; }
+    var size: i64 = pe_sys(PE_SYS_LSEEK, inf, 0, 2);
+    pe_sys(PE_SYS_LSEEK, inf, 0, 0);
+    var in_task: bool = pe_co_self() != 0;
+    if in_task { pe_nonblock(sock); }
+    pe_zc_quiet_pipe();
+    var total: i64 = 0;
+    var left: i64 = size;
+    var going: bool = size > 0;
+    while going && left > 0 {
+        var r: i64 = nat_syscall(PE_SYS_SENDFILE, sock, inf, 0, pe_zc_chunk(left), 0, 0);
+        if r > 0 {
+            total = total + r;
+            left = left - r;
+        } else if r == PE_EAGAIN && in_task {
+            if pert_co_wait_fd(sock, 1, 30000) == 0 {
+                pe_sys(PE_SYS_CLOSE, inf, 0, 0);
+                return 0 - 1;
+            }
+        } else if r == 0 || r == 0 - 38 || r == 0 - 22 || r == 0 - 95 {
+            // the file ended early, or no sendfile here (ENOSYS, EINVAL,
+            // EOPNOTSUPP): the buffer below sends the rest
+            going = false;
+        } else {
+            pe_sys(PE_SYS_CLOSE, inf, 0, 0);
+            return 0 - 1;
+        }
+    }
+    var rest: i64 = pe_zc_pump(inf, sock, true);
+    pe_sys(PE_SYS_CLOSE, inf, 0, 0);
+    if rest < 0 { return 0 - 1; }
+    return total + rest;
+}
+
+/// p_fs_map (fs.fd FileView): `size` bytes of the file `path` mapped
+/// read-only, or 0 (the file is not that size now, or cannot be mapped).
+/// Linux only: win.fd and darwin.fd give anonymous memory for every mmap,
+/// whatever the descriptor, so there FileView reads the file instead.
+pub fn pert_fs_map(path: str, size: i64) -> i64 {
+    var p: i64 = path as i64;
+    if p == 0 || size <= 0 || nat_os() != 0 { return 0; }
+    var fd: i64 = pe_open(p, 0);
+    if fd < 0 { return 0; }
+    var now: i64 = pe_sys(PE_SYS_LSEEK, fd, 0, 2);
+    if now != size {
+        pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+        return 0;
+    }
+    // PROT_READ, MAP_PRIVATE; the mapping outlives the descriptor
+    var a: i64 = nat_syscall(PE_SYS_MMAP, 0, size, 1, 2, fd, 0);
+    pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+    if a < 0 && a > 0 - 4096 { return 0; }
+    return a;
+}
+
+/// p_fs_unmap: undo pert_fs_map: 0, or -1.
+pub fn pert_fs_unmap(addr: i64, size: i64) -> i64 {
+    if addr == 0 || size <= 0 { return 0 - 1; }
+    if pe_sys(PE_SYS_MUNMAP, addr, size, 0) < 0 { return 0 - 1; }
+    return 0;
+}
+
 // ─── Processes ──────────────────────────────────────────────────────────
 
 /// Run `/bin/sh -c cmd`: its exit status (128 + n when killed by signal n),
@@ -1134,8 +1828,11 @@ pub fn pert_process_run(cmd: str) -> i64 {
     if (cmd as i64) == 0 || pe_len(cmd as i64) == 0 { return 0; }
     var rec: i64 = pe_zeroed(3);
     var tag: str = pert_to_str(rec);
-    var of: str = ".fprc_" + tag + ".out";
-    var ef: str = ".fprc_" + tag + ".err";
+    // in the temp directory (known-bugs 2g.44): the current one may not be
+    // writable
+    var dir: str = pe_capture_dir();
+    var of: str = dir + ".fprc_" + tag + ".out";
+    var ef: str = dir + ".fprc_" + tag + ".err";
     var line: str = "( " + cmd + " ) > \"" + of + "\" 2> \"" + ef + "\"";
     var code: i64 = pe_sh(line as i64);
     var outv: i64 = pert_file_read(of as i64) as i64;
@@ -1148,6 +1845,27 @@ pub fn pert_process_run(cmd: str) -> i64 {
     pert_file_delete(of as i64);
     pert_file_delete(ef as i64);
     return rec;
+}
+
+/// The directory for capture files, with its separator: $TMPDIR, else /tmp
+/// (Windows, win.fd: %TEMP%), else the current directory.
+fn pe_capture_dir() -> str {
+    var sep: str = "/";
+    var t: i64 = 0;
+    if nat_os() == 1 {
+        sep = "\\";
+        t = pert_getenv("TEMP" as i64) as i64;
+    } else {
+        t = pert_getenv("TMPDIR" as i64) as i64;
+    }
+    if t != 0 {
+        var d: str = "";
+        if pe_len(t) > 0 { d = (t as str) + sep; }
+        p_str_free(t);
+        if pe_len(d as i64) > 0 { return d; }
+    }
+    if nat_os() != 1 && pert_is_dir("/tmp") { return "/tmp/"; }
+    return "";
 }
 
 pub fn pert_process_stdout(h: i64) -> str {
@@ -1168,6 +1886,501 @@ pub fn pert_process_code(h: i64) -> i64 {
 pub fn pert_process_close(h: i64) {
     if h == 0 { return; }
     pert_free(h);
+}
+
+// ─── Child processes (roadmap AD4) ──────────────────────────────────────
+// stdlib/process.fd's fid_proc_* (process_spawn, process_wait,
+// process_kill), as the C runtime's (compiler/codegen_c.fd, "AD4"): argv
+// and env are lists in one string with byte 31 between the items; an env
+// item KEY=VALUE is set for the child on top of our environment (the start
+// block's, as pe_sh passes it), a bare KEY removed; dir 0 or "" keeps ours;
+// out is a list too: the file for the child's stdout, then the one for its
+// stderr ("" or none: the stdout file, or ours). Linux and macOS: fork,
+// then execve of /bin/sh running a
+// fixed script with the directory, the file and the program as its
+// arguments ("$@": never parsed as shell text). The script changes
+// directory, redirects and execs the program, which sh finds on PATH (127
+// when it cannot): execve does not search PATH, and the machine layer maps
+// no chdir or dup3. --nat Windows: win.fd's CreateProcessA (pseudo system
+// calls PE_WSYS_SPAWN..PE_WSYS_CLOSE). A handle is a 7-word record [pid
+// (Windows: the process handle), ended, exit code, process id, then our
+// ends of its stdin / stdout / stderr pipes (roadmap L4H, -1: none)]; 0
+// when the program could not start (WASI: always).
+
+fn pe_px_script() -> i64 {
+    // $1 the directory, $2 the stdout file, $3 the stderr file (""
+    // each: none). The files first, so a relative path is from our
+    // directory, as the C runtime opens them before the child changes
+    // directory; stderr goes with stdout when only that has a file. $3
+    // "-": stderr stays as it is (roadmap L4H: a pipe placed before exec).
+    return "d=$1; o=$2; e=$3; shift 3; if [ -n \"$o\" ]; then exec > \"$o\" || exit 127; fi; if [ \"$e\" = - ]; then :; elif [ -n \"$e\" ]; then exec 2> \"$e\" || exit 127; elif [ -n \"$o\" ]; then exec 2>&1; fi; if [ -n \"$d\" ]; then cd -- \"$d\" || exit 127; fi; exec \"$@\"" as i64;
+}
+
+/// The items of list s (byte 31 between them), each a fresh NUL-terminated
+/// copy (pe_px_free_items frees them).
+fn pe_px_split(s: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if s == 0 { return v; }
+    val n: i64 = pe_len(s);
+    if n == 0 { return v; }
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        if i == n || pe_ldb(s + i) == 31 {
+            var item: i64 = pert_malloc(i - start + 1);
+            pe_copy(item, s + start, i - start);
+            pe_stb(item + i - start, 0);
+            v.push(item);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn pe_px_free_items(v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        pert_free(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// Does environment entry e ("KEY=..") have the key of item o ("KEY=.." or
+/// "KEY")? On Windows keys ignore ASCII case.
+fn pe_px_same_key(e: i64, o: i64) -> bool {
+    val fold: bool = nat_os() == 1;
+    var i: i64 = 0;
+    while pe_ldb(o + i) != 0 && pe_ldb(o + i) != 61 {
+        var a: i64 = pe_ldb(e + i);
+        var b: i64 = pe_ldb(o + i);
+        if fold && a >= 97 && a <= 122 { a = a - 32; }
+        if fold && b >= 97 && b <= 122 { b = b - 32; }
+        if a == 0 || a != b { return false; }
+        i = i + 1;
+    }
+    return pe_ldb(e + i) == 61;
+}
+
+fn pe_px_has_eq(o: i64) -> bool {
+    var i: i64 = 0;
+    while pe_ldb(o + i) != 0 {
+        if pe_ldb(o + i) == 61 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Milliseconds on the monotonic clock.
+fn pe_px_now_ms() -> i64 {
+    var ts: i64 = pe_zeroed(2);
+    pe_sys(PE_SYS_CLOCK_GETTIME, 1, ts, 0);
+    val ms: i64 = pe_ld(ts) * 1000 + pe_ld(ts + 8) / 1000000;
+    pert_free(ts);
+    return ms;
+}
+
+pub fn pert_c_fid_proc_spawn(argv_list: i64, env_list: i64, dir: i64, out: i64) -> i64 {
+    return pe_px_spawn(argv_list, env_list, dir, out, 0);
+}
+
+/// roadmap L4H (stdlib/process.fd process_spawn_io, Command::spawn): io bits
+/// 1 / 2 / 4 give the child a pipe as its stdin / stdout / stderr
+/// (pert_c_fid_proc_write / _read / _close_in), 8 sends its stderr where
+/// its stdout goes; a piped stream takes no file. Linux and macOS: each
+/// "pipe" is a connected AF_UNIX stream pair (pe_px_pairs: nat_ir's x86-64
+/// system call map has no pipe2 or dup3), placed at the child's descriptor
+/// 0 / 1 / 2 with fcntl(F_DUPFD) between fork and exec. --nat Windows has
+/// no pipes yet: a request for one fails (0).
+pub fn pert_c_fid_proc_spawn_io(argv_list: i64, env_list: i64, dir: i64, out: i64, io: i64) -> i64 {
+    return pe_px_spawn(argv_list, env_list, dir, out, io & 15);
+}
+
+var pe_px_pair_ctr: i64 = 0;
+
+/// Close the descriptors of the n words at ends that are >= 0.
+fn pe_px_close_fds(ends: i64, n: i64) {
+    var k: i64 = 0;
+    while k < n {
+        val fd: i64 = pe_ld(ends + k * 8);
+        if fd >= 0 {
+            pe_sys(PE_SYS_CLOSE, fd, 0, 0);
+            pe_st(ends + k * 8, 0 - 1);
+        }
+        k = k + 1;
+    }
+}
+
+/// One connected AF_UNIX stream pair for each of io's bits 1, 2, 4, made as
+/// the tensor-parallel ranks make theirs (a listener in the abstract
+/// namespace on Linux, a file in the temp directory on macOS, removed at
+/// once). ends: 6 words, [2k] this process's end of stream k (stdin,
+/// stdout, stderr; close-on-exec), [2k + 1] the child's; -1 where none.
+/// False, everything closed, when a pair cannot be made.
+fn pe_px_pairs(io: i64, ends: i64) -> bool {
+    var k: i64 = 0;
+    while k < 6 {
+        pe_st(ends + k * 8, 0 - 1);
+        k = k + 1;
+    }
+    if (io & 7) == 0 { return true; }
+    val os: i64 = nat_os();
+    // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC
+    val lf: i64 = pe_sys(PE_SYS_SOCKET, 1, 524289, 0);
+    if lf < 0 { return false; }
+    val sa: i64 = pert_malloc(112);
+    pe_zero(sa, 112);
+    pe_stb(sa, 1);
+    pe_px_pair_ctr = pe_px_pair_ctr + 1;
+    var name: str = "fid-px-" + pert_to_str(pe_sys(PE_SYS_GETPID, 0, 0, 0)) + "-" + pert_to_str(pe_px_pair_ctr);
+    var at: i64 = 3;                                   // Linux: sun_path[0] = 0
+    if os != 0 {
+        at = 2;
+        name = pe_capture_dir() + name;
+    }
+    val nl: i64 = pe_len(name as i64);
+    val fits: bool = at + nl + 1 <= 104;
+    var ok: bool = fits;
+    var salen: i64 = at + nl;
+    if fits {
+        pe_copy(sa + at, name as i64, nl);
+        if os != 0 {
+            salen = salen + 1;
+            nat_syscall(PE_SYS_UNLINKAT, PE_AT_FDCWD, sa + 2, 0, 0, 0, 0);
+        }
+        ok = nat_syscall(PE_SYS_BIND, lf, sa, salen, 0, 0, 0) == 0 && pe_sys(PE_SYS_LISTEN, lf, 8, 0) == 0;
+    }
+    k = 0;
+    while ok && k < 3 {
+        if (io & (1 << k)) != 0 {
+            val c: i64 = pe_sys(PE_SYS_SOCKET, 1, 524289, 0);
+            if c < 0 {
+                ok = false;
+            } else {
+                pe_st(ends + k * 16, c);
+                if nat_syscall(PE_SYS_CONNECT, c, sa, salen, 0, 0, 0) != 0 {
+                    ok = false;
+                } else {
+                    var s: i64 = pe_sys(PE_SYS_ACCEPT, lf, 0, 0);
+                    while s == 0 - 4 { s = pe_sys(PE_SYS_ACCEPT, lf, 0, 0); }     // EINTR
+                    if s < 0 {
+                        ok = false;
+                    } else {
+                        pe_st(ends + k * 16 + 8, s);
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    pe_sys(PE_SYS_CLOSE, lf, 0, 0);
+    if os != 0 && fits { nat_syscall(PE_SYS_UNLINKAT, PE_AT_FDCWD, sa + 2, 0, 0, 0, 0); }
+    pert_free(sa);
+    if !ok {
+        pe_px_close_fds(ends, 6);
+        return false;
+    }
+    return true;
+}
+
+/// In the forked child, before exec: each pair's child end at descriptor
+/// k (close k, then fcntl(F_DUPFD, k) gives the lowest free one >= k,
+/// which is k); with merge, stderr a copy of stdout. Then the originals
+/// closed (this process's ends are close-on-exec).
+fn pe_px_child_stdio(ends: i64, merge: bool) {
+    var k: i64 = 0;
+    while k < 3 {
+        val c: i64 = pe_ld(ends + k * 16 + 8);
+        if c >= 0 {
+            pe_sys(PE_SYS_CLOSE, k, 0, 0);
+            pe_sys(PE_SYS_FCNTL, c, 0, k);              // F_DUPFD
+        }
+        k = k + 1;
+    }
+    if merge && pe_ld(ends + 40) < 0 {
+        pe_sys(PE_SYS_CLOSE, 2, 0, 0);
+        pe_sys(PE_SYS_FCNTL, 1, 0, 2);
+    }
+    k = 0;
+    while k < 3 {
+        val c2: i64 = pe_ld(ends + k * 16 + 8);
+        if c2 > 2 { pe_sys(PE_SYS_CLOSE, c2, 0, 0); }
+        k = k + 1;
+    }
+}
+
+/// The child: a 7-word record [pid (--nat Windows: the process handle),
+/// ended, exit code, process id, this process's end of its stdin / stdout
+/// / stderr pipe (-1: none)]; 0 when it could not start.
+fn pe_px_spawn(argv_list: i64, env_list: i64, dir: i64, out: i64, io: i64) -> i64 {
+    var av: Vec<i64> = pe_px_split(argv_list);
+    if av.len() == 0 { return 0; }
+    var ov: Vec<i64> = pe_px_split(env_list);
+    // the environment: ours less the keys the items name, then the items
+    // that set a value
+    var sp: i64 = nat_start_sp();
+    val penv: i64 = sp + 8 + (pe_ld(sp) + 1) * 8;
+    var envp: i64 = penv;
+    if ov.len() > 0 {
+        var m: i64 = 0;
+        while pe_ld(penv + m * 8) != 0 { m = m + 1; }
+        envp = pe_zeroed(m + ov.len() + 1);
+        var k: i64 = 0;
+        var i: i64 = 0;
+        while i < m {
+            val e: i64 = pe_ld(penv + i * 8);
+            var drop: bool = false;
+            var j: i64 = 0;
+            while j < ov.len() && !drop {
+                if pe_px_same_key(e, ov.get(j)) { drop = true; }
+                j = j + 1;
+            }
+            if !drop {
+                pe_st(envp + k * 8, e);
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        var j2: i64 = 0;
+        while j2 < ov.len() {
+            if pe_px_has_eq(ov.get(j2)) {
+                pe_st(envp + k * 8, ov.get(j2));
+                k = k + 1;
+            }
+            j2 = j2 + 1;
+        }
+    }
+    var d: i64 = dir;
+    if d == 0 { d = "" as i64; }
+    // out: the file for stdout, then the one for stderr ("" or none: the
+    // stdout file, or ours)
+    var fv: Vec<i64> = pe_px_split(out);
+    var o: i64 = "" as i64;
+    var ef: i64 = "" as i64;
+    if fv.len() > 0 { o = fv.get(0); }
+    if fv.len() > 1 { ef = fv.get(1); }
+    // roadmap L4H: a piped stream takes no file
+    if (io & 2) != 0 { o = "" as i64; }
+    if (io & 12) != 0 { ef = "" as i64; }
+    var rec: i64 = pe_zeroed(7);
+    pe_st(rec + 32, 0 - 1);
+    pe_st(rec + 40, 0 - 1);
+    pe_st(rec + 48, 0 - 1);
+    var ok: bool = false;
+    if nat_os() == 1 && (io & 7) != 0 {
+        // --nat Windows: no pipes yet (win.fd would need CreatePipe and
+        // SetHandleInformation among nat_ir's imports)
+        ok = false;
+    } else if nat_os() == 1 {
+        // --nat Windows: win.fd quotes the command line and starts it
+        var wargv: i64 = pe_zeroed(av.len() + 1);
+        var a: i64 = 0;
+        while a < av.len() {
+            pe_st(wargv + a * 8, av.get(a));
+            a = a + 1;
+        }
+        var wenv: i64 = 0;
+        if ov.len() > 0 { wenv = envp; }
+        ok = nat_syscall(1010, wargv, wenv, d, o, rec, ef) == 0;
+        pert_free(wargv);
+    } else {
+        // a file that cannot be written: no child (as the C runtime)
+        var files_ok: bool = true;
+        if pe_ldb(o) != 0 {
+            val fo: i64 = pe_open(o, 577);                  // O_WRONLY|O_CREAT|O_TRUNC
+            if fo < 0 { files_ok = false; } else { pe_sys(PE_SYS_CLOSE, fo, 0, 0); }
+        }
+        if pe_ldb(ef) != 0 {
+            val fe: i64 = pe_open(ef, 577);
+            if fe < 0 { files_ok = false; } else { pe_sys(PE_SYS_CLOSE, fe, 0, 0); }
+        }
+        // roadmap L4H: the pipes (6 words, see pe_px_pairs)
+        var ends: i64 = pe_zeroed(6);
+        if files_ok && !pe_px_pairs(io, ends) { files_ok = false; }
+        val merge: bool = (io & 8) != 0 && pe_ldb(o) == 0;
+        if files_ok {
+            // /bin/sh -c <script> fid-proc <dir> <out> <err> <program> <args>...
+            var sargv: i64 = pe_zeroed(av.len() + 8);
+            pe_st(sargv, "/bin/sh" as i64);
+            pe_st(sargv + 8, "-c" as i64);
+            pe_st(sargv + 16, pe_px_script());
+            pe_st(sargv + 24, "fid-proc" as i64);
+            pe_st(sargv + 32, d);
+            pe_st(sargv + 40, o);
+            // a stderr pipe stays (the script's "-"), not sent to o
+            if (io & 4) != 0 {
+                pe_st(sargv + 48, "-" as i64);
+            } else {
+                pe_st(sargv + 48, ef);
+            }
+            var a2: i64 = 0;
+            while a2 < av.len() {
+                pe_st(sargv + 56 + a2 * 8, av.get(a2));
+                a2 = a2 + 1;
+            }
+            var pid: i64 = nat_syscall(220, 17, 0, 0, 0, 0, 0);    // fork: clone(SIGCHLD)
+            if pid == 0 {
+                pe_px_child_stdio(ends, merge);
+                nat_syscall(PE_SYS_EXECVE, "/bin/sh" as i64, sargv, envp, 0, 0, 0);
+                pe_sys(93, 127, 0, 0);
+            }
+            pert_free(sargv);
+            // the child's ends (and ours too when it did not start)
+            var k: i64 = 0;
+            while k < 3 {
+                val ce: i64 = pe_ld(ends + k * 16 + 8);
+                if ce >= 0 { pe_sys(PE_SYS_CLOSE, ce, 0, 0); }
+                val pe2: i64 = pe_ld(ends + k * 16);
+                if pid > 0 {
+                    pe_st(rec + 32 + k * 8, pe2);
+                } else if pe2 >= 0 {
+                    pe_sys(PE_SYS_CLOSE, pe2, 0, 0);
+                }
+                k = k + 1;
+            }
+            if pid > 0 {
+                pe_st(rec, pid);
+                pe_st(rec + 24, pid);
+                ok = true;
+            }
+        }
+        pert_free(ends);
+    }
+    if ov.len() > 0 { pert_free(envp); }
+    pe_px_free_items(av);
+    pe_px_free_items(ov);
+    pe_px_free_items(fv);
+    if !ok {
+        pert_free(rec);
+        return 0;
+    }
+    pe_st(rec + 8, 0);
+    pe_st(rec + 16, 0 - 1);
+    return rec;
+}
+
+/// 1 once the child has ended (its code kept), 0 while it is still running
+/// after timeout_ms (< 0: no limit), -1 for a bad handle or an error.
+pub fn pert_c_fid_proc_wait(h: i64, timeout_ms: i64) -> i64 {
+    if h == 0 { return 0 - 1; }
+    if pe_ld(h + 8) != 0 { return 1; }
+    if nat_os() == 1 {
+        val wr: i64 = nat_syscall(1011, pe_ld(h), timeout_ms, h + 16, 0, 0, 0);
+        if wr == 1 { pe_st(h + 8, 1); }
+        return wr;
+    }
+    var status: i64 = pe_zeroed(1);
+    val t0: i64 = pe_px_now_ms();
+    var nap: i64 = 1;
+    var result: i64 = 0 - 1;
+    var going: bool = true;
+    while going {
+        var opt: i64 = 1;                                   // WNOHANG
+        if timeout_ms < 0 { opt = 0; }
+        pe_st(status, 0);
+        val r: i64 = nat_syscall(PE_SYS_WAIT4, pe_ld(h), status, opt, 0, 0, 0);
+        if r == pe_ld(h) {
+            val st: i64 = pe_ld(status) & 65535;
+            var code: i64 = 128 + (st & 127);
+            if (st & 127) == 0 { code = (st >> 8) & 255; }
+            pe_st(h + 16, code);
+            pe_st(h + 8, 1);
+            result = 1;
+            going = false;
+        } else if r == 0 - 4 {
+            // EINTR: again
+        } else if r < 0 {
+            going = false;
+        } else {
+            val ms: i64 = pe_px_now_ms() - t0;
+            if ms >= timeout_ms {
+                result = 0;
+                going = false;
+            } else {
+                var n: i64 = nap;
+                if n > timeout_ms - ms { n = timeout_ms - ms; }
+                pe_sleep_ms(n);
+                if nap < 10 { nap = nap + 1; }
+            }
+        }
+    }
+    pert_free(status);
+    return result;
+}
+
+/// Its exit code once pert_c_fid_proc_wait said it ended (killed by signal
+/// n: 128 + n; Windows: 137), else -1.
+pub fn pert_c_fid_proc_code(h: i64) -> i64 {
+    if h == 0 { return 0 - 1; }
+    if pe_ld(h + 8) == 0 { return 0 - 1; }
+    return pe_ld(h + 16);
+}
+
+/// SIGKILL (Windows: TerminateProcess with 137): 1 when asked, 0 when it
+/// had ended or could not be stopped.
+pub fn pert_c_fid_proc_kill(h: i64) -> i64 {
+    if h == 0 { return 0; }
+    if pe_ld(h + 8) != 0 { return 0; }
+    if nat_os() == 1 { return nat_syscall(1012, pe_ld(h), 0, 0, 0, 0, 0); }
+    if pe_sys(PE_SYS_KILL, pe_ld(h), 9, 0) == 0 { return 1; }
+    return 0;
+}
+
+pub fn pert_c_fid_proc_pid(h: i64) -> i64 {
+    if h == 0 { return 0 - 1; }
+    return pe_ld(h + 24);
+}
+
+/// Forget the handle (a child still running keeps running; POSIX: one not
+/// waited for stays a zombie until this process ends).
+pub fn pert_c_fid_proc_free(h: i64) -> i64 {
+    if h == 0 { return 0 - 1; }
+    if nat_os() == 1 { nat_syscall(1013, pe_ld(h), 0, 0, 0, 0, 0); }
+    pe_px_close_fds(h + 32, 3);
+    pert_free(h);
+    return 0;
+}
+
+/// roadmap L4H: all n bytes at data to the child's stdin pipe: n, or -1
+/// when it has none or the child closed it (MSG_NOSIGNAL: no SIGPIPE;
+/// macOS: SO_NOSIGPIPE, darwin.fd).
+pub fn pert_c_fid_proc_write(h: i64, data: i64, n: i64) -> i64 {
+    if h == 0 || n < 0 { return 0 - 1; }
+    val fd: i64 = pe_ld(h + 32);
+    if fd < 0 { return 0 - 1; }
+    var done: i64 = 0;
+    while done < n {
+        val w: i64 = nat_syscall(PE_SYS_SENDTO, fd, data + done, n - done, 16384, 0, 0);
+        if w == 0 - 4 {
+            // EINTR: again
+        } else if w <= 0 {
+            return 0 - 1;
+        } else {
+            done = done + w;
+        }
+    }
+    return done;
+}
+
+/// Up to max bytes the child wrote to its stdout (which 1) or stderr (2)
+/// pipe, into buf, waiting for at least one: 0 once it is closed and empty
+/// (the child ended), -1 when there is no such pipe.
+pub fn pert_c_fid_proc_read(h: i64, which: i64, buf: i64, max: i64) -> i64 {
+    if h == 0 || buf == 0 || max <= 0 { return 0 - 1; }
+    var fd: i64 = pe_ld(h + 40);
+    if which == 2 { fd = pe_ld(h + 48); }
+    if fd < 0 { return 0 - 1; }
+    var r: i64 = pe_sys(PE_SYS_READ, fd, buf, max);
+    while r == 0 - 4 { r = pe_sys(PE_SYS_READ, fd, buf, max); }      // EINTR
+    if r < 0 { return 0 - 1; }
+    return r;
+}
+
+/// Close our end of the child's stdin pipe: it reads the end of its input.
+pub fn pert_c_fid_proc_close_in(h: i64) -> i64 {
+    if h == 0 { return 0 - 1; }
+    pe_px_close_fds(h + 32, 1);
+    return 0;
 }
 
 /// sysconf: CPUs, the page size, clock ticks, memory pages.
@@ -1288,7 +2501,9 @@ pub fn pert_c_free(p: i64) { pert_free(p); }
 pub fn pert_c_calloc(count: i64, size: i64) -> i64 { return pert_malloc(count * size); }
 
 pub fn pert_c_memcpy(dst: i64, src: i64, n: i64) -> i64 {
-    pe_copy(dst, src, n);
+    // OP23: aligned words and 16-byte blocks (pert_vblk_copy), not
+    // pe_copy's words at any alignment
+    if n > 0 { pert_mem_copy(dst, src, n); }
     return dst;
 }
 
@@ -1296,26 +2511,51 @@ pub fn pert_c_memmove(dst: i64, src: i64, n: i64) -> i64 {
     if dst <= src || dst >= src + n {
         pe_copy(dst, src, n);
     } else {
-        var i: i64 = n - 1;
-        while i >= 0 {
-            pe_stb(dst + i, pe_ldb(src + i));
+        // backwards (dst overlaps the end of src): OP23, words from the end
+        // while eight bytes are left and both ends are equally aligned
+        var i: i64 = n;
+        if ((dst ^ src) & 7) == 0 {
+            while i > 0 && ((dst + i) & 7) != 0 {
+                i = i - 1;
+                pe_stb(dst + i, pe_ldb(src + i));
+            }
+            while i >= 8 {
+                i = i - 8;
+                pe_st(dst + i, pe_ld(src + i));
+            }
+        }
+        while i > 0 {
             i = i - 1;
+            pe_stb(dst + i, pe_ldb(src + i));
         }
     }
     return dst;
 }
 
 pub fn pert_c_memset(dst: i64, c: i64, n: i64) -> i64 {
-    var i: i64 = 0;
-    while i < n {
-        pe_stb(dst + i, c & 255);
-        i = i + 1;
-    }
+    pert_memset(dst, c, n);
     return dst;
 }
 
 pub fn pert_c_memcmp(a: i64, b: i64, n: i64) -> i64 {
     var i: i64 = 0;
+    if ((a ^ b) & 7) == 0 {
+        // OP23: equal words skipped eight bytes at a time (once a is
+        // aligned); the first word that differs is compared byte by byte
+        while i < n && ((a + i) & 7) != 0 {
+            var hx: i64 = pe_ldb(a + i);
+            var hy: i64 = pe_ldb(b + i);
+            if hx != hy { return hx - hy; }
+            i = i + 1;
+        }
+        // the equal 16-byte blocks first (pert_vblk_diff)
+        if n - i >= 16 {
+            i = i + pert_vblk_diff(a + i, b + i, n - i);
+        }
+        while i + 8 <= n && pe_ld(a + i) == pe_ld(b + i) {
+            i = i + 8;
+        }
+    }
     while i < n {
         var x: i64 = pe_ldb(a + i);
         var y: i64 = pe_ldb(b + i);
@@ -1476,7 +2716,49 @@ pub fn pert_dl_sym(handle: i64, symbol: str) -> i64 {
 
 pub fn pert_dl_close(handle: i64) { }
 
-pub fn pert_dl_call(func: i64, arg: i64) -> i64 { return arg; }
+/// A simulated symbol (pert_dl_sym: below 64 KiB, where no code is) gives
+/// the argument back; on `--nat` Windows a real one (p_dl_find's) is
+/// called as i64 -> i64 in the C convention (win.fd pe_win_dl_call), as
+/// the C backend and pe_ir do. No other target of this runtime loads a
+/// library, so it has no real symbols.
+pub fn pert_dl_call(func: i64, arg: i64) -> i64 {
+    if nat_os() == 1 && (func < 0 || func >= 65536) {
+        return nat_syscall(1043, func, arg, 0, 0, 0, 0);
+    }
+    return arg;
+}
+
+// The OS loader (roadmap L6C: the C backend's p_dl_load / p_dl_find /
+// p_dl_unload, pe_ir's over LoadLibraryA). On `--nat` Windows these are
+// LoadLibraryA / GetProcAddress / FreeLibrary (win.fd pe_win_dl_*, the
+// pseudo system calls 1040-1042). Any other program of this runtime is a
+// static executable (Linux, macOS, WASI) with no dynamic loader in it, so
+// no library ever loads: p_dl_load gives 0 (failure), p_dl_find 0 (no
+// symbol: None in stdlib/dynlib.fd), p_dl_unload -1 (not a loaded
+// library), as the interpreter does when its host cannot load. A program
+// that needs a C library at run time there is built with `fid ccompile`
+// (dlopen).
+
+pub fn pert_dl_load(path: str) -> i64 {
+    if nat_os() == 1 && (path as i64) != 0 && pe_len(path as i64) > 0 {
+        return nat_syscall(1040, path as i64, 0, 0, 0, 0, 0);
+    }
+    return 0;
+}
+
+pub fn pert_dl_find(handle: i64, name: str) -> i64 {
+    if nat_os() == 1 && handle != 0 && (name as i64) != 0 && pe_len(name as i64) > 0 {
+        return nat_syscall(1041, handle, name as i64, 0, 0, 0, 0);
+    }
+    return 0;
+}
+
+pub fn pert_dl_unload(handle: i64) -> i64 {
+    if nat_os() == 1 && handle != 0 {
+        return nat_syscall(1042, handle, 0, 0, 0, 0, 0);
+    }
+    return 0 - 1;
+}
 
 pub fn pert_simd_add(a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
     var r: Vec<f64> = Vec::new();
@@ -1640,4 +2922,1046 @@ pub fn pert_ecs_remove(name: str, entity: i64) -> i64 {
         i = i + 2;
     }
     return 0;
+}
+
+// ─── The sampling profiler (llvm-roadmap DB9) ───────────────────────────
+// `FID_PROF=1 ./prog` on native Linux (x86-64, AArch64, RISC-V): every
+// millisecond of CPU time the process uses (ITIMER_PROF), SIGPROF stops
+// it, and the signal handler (base.fd pe_on_signal_uc, the ucontext from
+// nat_ir.fd's handler stub) counts the function the interrupted pc is in
+// ("self") and every function on the stack once ("total", from the frame
+// records), named through nat_fn_names (the panic traces' table). At exit
+// (main's return through pe_rt_exit, p_exit) the table goes to stderr, most
+// self time first. The handler allocates nothing and takes no lock (atomic
+// adds); "total" may be off by one where two threads sample at once.
+// macOS: the same over setitimer and the Darwin ucontext (darwin.fd).
+// Windows `--nat`: a sampler thread suspends each thread every ms it ran
+// (win.fd pe_win_prof_main: the main thread and those started after the
+// profiler). WASI: off. FID_PROF=folded prints whole stacks instead of the
+// table (pe_prof_fold).
+
+const PE_SIGPROF: i64 = 27;
+const PE_SYS_SETITIMER: i64 = 103;
+const PE_SYS_PROF_THREAD: i64 = 1002;   // win.fd: start the sampler thread
+const PE_PROF_DEPTH: i64 = 256;
+
+var pe_prof_on: i64 = 0;       // 1 while samples are counted
+var pe_prof_m: i64 = 0;        // functions in nat_fn_names (0: profiler off)
+var pe_prof_tab: i64 = 0;      // nat_fn_names(): [address, name]*, [end, 0]
+var pe_prof_self: i64 = 0;     // per bucket (m functions, primitives, other)
+var pe_prof_total: i64 = 0;    // per bucket: samples with it on the stack
+var pe_prof_stamp: i64 = 0;    // per bucket: the sample that counted it last
+var pe_prof_cells: i64 = 0;    // [0]: samples taken
+
+// FID_PROF=folded (DB9): whole stacks instead of the table. A sample's
+// stack (its buckets, innermost first, at most PE_PROF_FDEPTH) is hashed
+// and counted in a table of PE_PROF_STACKS slots made before sampling
+// starts: [key][count][depth][bucket]*; a new stack claims its slot with
+// a compare-and-swap of the key, fills it, then sets depth (ready). The
+// handler allocates nothing. At exit the stacks go to stderr root first,
+// `main;work;fib 123`, the input of flamegraph.pl and speedscope.
+const PE_PROF_STACKS: i64 = 4096;
+const PE_PROF_FDEPTH: i64 = 96;
+const PE_PROF_SLOT: i64 = 99;        // words per slot: 3 + PE_PROF_FDEPTH
+var pe_prof_folded: i64 = 0;   // 1: FID_PROF=folded
+var pe_prof_stk: i64 = 0;      // the stack table (0: none)
+var pe_prof_lost: i64 = 0;     // *i64: samples whose stack found no slot
+
+/// The value of environment variable `name`: a pointer into the
+/// environment, 0 when it is not set. Allocates nothing.
+fn pe_env_raw(name: i64) -> i64 {
+    var sp: i64 = nat_start_sp();
+    if sp == 0 { return 0; }
+    var at: i64 = sp + 8 + (pe_ld(sp) + 1) * 8;
+    var n: i64 = pe_len(name);
+    while pe_ld(at) != 0 {
+        var e: i64 = pe_ld(at);
+        var j: i64 = 0;
+        while j < n && pe_ldb(e + j) == pe_ldb(name + j) { j = j + 1; }
+        if j == n && pe_ldb(e + n) == 61 { return e + n + 1; }
+        at = at + 8;
+    }
+    return 0;
+}
+
+/// ITIMER_PROF every `us` microseconds of CPU time (0: stopped).
+fn pe_prof_timer(us: i64) {
+    var it: i64 = pert_malloc(32);
+    pe_st(it, 0);
+    pe_st(it + 8, us);
+    pe_st(it + 16, 0);
+    pe_st(it + 24, us);
+    nat_syscall(PE_SYS_SETITIMER, 2, it, 0, 0, 0, 0);
+    pert_free(it);
+}
+
+/// A zeroed word per bucket: m functions, the primitives, the rest.
+fn pe_prof_table(m: i64) -> i64 {
+    var t: i64 = pert_malloc((m + 2) * 8);
+    pe_zero(t, (m + 2) * 8);
+    return t;
+}
+
+// ─── The main thread's stack (SP16) ─────────────────────────────────────
+// The compiler built by our own backend recurses as deeply as its C build,
+// which runs main on a 256 MB stack (scripts/bootstrap.sh); Linux starts a
+// process with the 8 MB of `ulimit -s`. The kernel grows the main stack on
+// a fault up to RLIMIT_STACK's soft limit as it is then, so raising it
+// here (to 256 MB, or the hard limit when lower; never lowering it) is
+// enough: the gap the kernel left below the stack at exec (at least
+// 128 MB) holds no mapping. pe_on_signal's overflow window follows. Linux
+// only: `--nat` Windows has the same 256 MB in its PE header (nat_enc.fd),
+// macOS and WASI keep theirs.
+const PE_SYS_PRLIMIT64: i64 = 261;
+const PE_RLIMIT_STACK: i64 = 3;
+const PE_MAIN_STACK: i64 = 268435456;
+
+fn pe_main_stack_raise() {
+    if nat_os() != 0 { return; }
+    var rl: i64 = pert_malloc(16);
+    if nat_syscall(PE_SYS_PRLIMIT64, 0, PE_RLIMIT_STACK, 0, rl, 0, 0) != 0 {
+        pert_free(rl);
+        return;
+    }
+    var cur: i64 = pe_ld(rl);
+    var max: i64 = pe_ld(rl + 8);
+    // RLIM_INFINITY is all ones: -1 as a signed word
+    if cur == 0 - 1 {
+        pe_main_stack_win = PE_MAIN_STACK + 67108864;
+        pert_free(rl);
+        return;
+    }
+    var want: i64 = PE_MAIN_STACK;
+    if max != 0 - 1 && max < want { want = max; }
+    if cur < want {
+        pe_st(rl, want);
+        if nat_syscall(PE_SYS_PRLIMIT64, 0, PE_RLIMIT_STACK, rl, 0, 0, 0) == 0 {
+            cur = want;
+        }
+    }
+    if cur + 67108864 > pe_main_stack_win { pe_main_stack_win = cur + 67108864; }
+    pert_free(rl);
+}
+
+// ─── Run-time resource limits (roadmap P12) ─────────────────────────────
+// As the C runtime's (codegen_c.fd emit_limits_runtime), read from the
+// environment when the program starts (pe_rt_init calls pe_lim_init):
+//   FID_MEM_LIMIT=<bytes>[K|M|G]: the live bytes of the heap. Every block
+//     pert_malloc hands out counts its size class (2^k bytes) while it is
+//     alive, a large block its mapping; the allocation that would pass the
+//     limit stops the program with "fid: memory limit of N bytes exceeded
+//     (FID_MEM_LIMIT): U bytes in use, A more asked for", the trace and
+//     exit code 125. (--checked-alloc / --leaks blocks are not counted.)
+//   FID_CPU_LIMIT=<seconds>: the process's CPU time, every thread's. Linux:
+//     RLIMIT_CPU (whole seconds, rounded up) and SIGXCPU, which writes
+//     "fid: CPU time limit of S seconds exceeded (FID_CPU_LIMIT)" and exits
+//     with 124 (as `timeout`). macOS, WASI and `--nat` Windows: not
+//     enforced (their system-call layers have no CPU-time limit yet).
+// Unset, empty or 0: no limit. A value that is not a number stops the
+// program at start-up with exit code 2, so a typo does not run unlimited.
+
+var lrt_lim_mem: i64 = 0;       // bytes; 0: no memory limit
+var lrt_lim_used: i64 = 0;      // live counted bytes (under the heap lock)
+var lrt_lim_cpu_msg: i64 = 0;   // the CPU-limit message (0: no CPU limit)
+var lrt_lim_cpu_len: i64 = 0;
+const PE_SIGXCPU: i64 = 24;
+const PE_RLIMIT_CPU: i64 = 0;
+
+/// <digits>[.digits]; with `units`, then K, M or G (and a B), the value in
+/// bytes; without, the value in thousandths (seconds -> milliseconds). 0
+/// for an empty string, -1 when it is not a number (or too large).
+fn pe_lim_parse(s: i64, units: bool) -> i64 {
+    var i: i64 = 0;
+    var whole: i64 = 0;
+    var digits: i64 = 0;
+    if pe_ldb(s) == 0 { return 0; }
+    while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+        if whole > 1000000000000000 { return 0 - 1; }
+        whole = whole * 10 + (pe_ldb(s + i) - 48);
+        i = i + 1;
+        digits = digits + 1;
+    }
+    var frac: i64 = 0;          // thousandths
+    if pe_ldb(s + i) == 46 {
+        i = i + 1;
+        var scale: i64 = 100;
+        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 {
+            frac = frac + (pe_ldb(s + i) - 48) * scale;
+            scale = scale / 10;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if digits == 0 { return 0 - 1; }
+    if !units {
+        if pe_ldb(s + i) != 0 { return 0 - 1; }
+        return whole * 1000 + frac;
+    }
+    var mult: i64 = 1;
+    var c: i64 = pe_ldb(s + i);
+    if c == 75 || c == 107 { mult = 1024; i = i + 1; }
+    else if c == 77 || c == 109 { mult = 1048576; i = i + 1; }
+    else if c == 71 || c == 103 { mult = 1073741824; i = i + 1; }
+    if pe_ldb(s + i) == 66 || pe_ldb(s + i) == 98 { i = i + 1; }
+    if pe_ldb(s + i) != 0 { return 0 - 1; }
+    if whole > 9223372036854775807 / mult / 2 { return 0 - 1; }
+    var v: i64 = whole * mult + frac * mult / 1000;
+    // a fraction of a byte is still a limit
+    if v == 0 && (whole != 0 || frac != 0) { v = 1; }
+    return v;
+}
+
+/// A malformed limit: stderr says so, exit code 2.
+fn pe_lim_bad(what: i64, v: i64, kind: i64) {
+    pe_fd_str(2, "fid: " as i64);
+    pe_fd_str(2, what);
+    pe_fd_str(2, kind);
+    pe_write_all(2, v, pe_cstr_len(v));
+    pe_fd_str(2, "'\n" as i64);
+    pe_sys(PE_SYS_EXIT_GROUP, 2, 0, 0);
+}
+
+/// Copy the bytes of string s to buf + at; returns at + its length.
+fn pe_lim_put(buf: i64, at: i64, s: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        pe_stb(buf + at + i, pe_ldb(s + i));
+        i = i + 1;
+    }
+    return at + n;
+}
+
+/// Called by pe_rt_init, before main: FID_MEM_LIMIT and FID_CPU_LIMIT.
+fn pe_lim_init() {
+    var m: i64 = pe_env_ptr("FID_MEM_LIMIT" as i64);
+    if m != 0 {
+        var mv: i64 = pe_lim_parse(m, true);
+        if mv < 0 {
+            pe_lim_bad("FID_MEM_LIMIT" as i64, m, " is not a size (bytes, or with K, M or G): '" as i64);
+        }
+        if mv > 0 {
+            lrt_lim_used = 0;
+            lrt_lim_mem = mv;
+        }
+    }
+    var t: i64 = pe_env_ptr("FID_CPU_LIMIT" as i64);
+    if t == 0 { return; }
+    var ms: i64 = pe_lim_parse(t, false);
+    if ms < 0 {
+        pe_lim_bad("FID_CPU_LIMIT" as i64, t, " is not a number of seconds: '" as i64);
+    }
+    if ms == 0 { return; }
+    // Linux only (see above)
+    if nat_os() != 0 || nat_sig_handler() == 0 { return; }
+    var a: i64 = "fid: CPU time limit of " as i64;
+    var b: i64 = " seconds exceeded (FID_CPU_LIMIT)\n" as i64;
+    var tn: i64 = pe_cstr_len(t);
+    var msg: i64 = pert_malloc(pe_len(a) + tn + pe_len(b) + 8);
+    var at: i64 = pe_lim_put(msg, 0, a, pe_len(a));
+    at = pe_lim_put(msg, at, t, tn);
+    at = pe_lim_put(msg, at, b, pe_len(b));
+    lrt_lim_cpu_len = at;
+    lrt_lim_cpu_msg = msg;
+    if pe_sig_install(PE_SIGXCPU) != 0 {
+        lrt_lim_cpu_msg = 0;
+        return;
+    }
+    var rl: i64 = pert_malloc(16);
+    if nat_syscall(PE_SYS_PRLIMIT64, 0, PE_RLIMIT_CPU, 0, rl, 0, 0) == 0 {
+        // whole seconds, rounded up; never above the hard limit
+        var want: i64 = (ms + 999) / 1000;
+        var max: i64 = pe_ld(rl + 8);
+        if max == 0 - 1 || want < max {
+            pe_st(rl, want);
+            nat_syscall(PE_SYS_PRLIMIT64, 0, PE_RLIMIT_CPU, rl, 0, 0, 0);
+        }
+    }
+    pert_free(rl);
+}
+
+/// A block of n bytes is taken from FID_MEM_LIMIT (pe_malloc_raw, under
+/// the heap lock): past the limit, the program stops (exit code 125).
+/// Allocates nothing.
+fn pe_lim_take(n: i64) {
+    if lrt_lim_used + n > lrt_lim_mem {
+        pe_fd_str(2, "fid: memory limit of " as i64);
+        pe_eprint_int(lrt_lim_mem);
+        pe_fd_str(2, " bytes exceeded (FID_MEM_LIMIT): " as i64);
+        pe_eprint_int(lrt_lim_used);
+        pe_fd_str(2, " bytes in use, " as i64);
+        pe_eprint_int(n);
+        pe_fd_str(2, " more asked for\n" as i64);
+        pe_trace_from(nat_frame_fp());
+        pe_sys(PE_SYS_EXIT_GROUP, 125, 0, 0);
+    }
+    lrt_lim_used = lrt_lim_used + n;
+}
+
+/// A freed block's n bytes go back (pe_free_raw, under the heap lock). A
+/// block from before pe_lim_init was never counted: the count stays >= 0.
+fn pe_lim_give(n: i64) {
+    lrt_lim_used = lrt_lim_used - n;
+    if lrt_lim_used < 0 { lrt_lim_used = 0; }
+}
+
+/// SIGXCPU of FID_CPU_LIMIT (pe_on_signal): the message, exit code 124.
+/// Allocates nothing.
+fn pe_lim_cpu_over() {
+    pe_write_all(2, lrt_lim_cpu_msg, lrt_lim_cpu_len);
+    pe_sys(PE_SYS_EXIT_GROUP, 124, 0, 0);
+}
+
+/// Called by pe_rt_init: FID_PROF set (not empty, not "0") on Linux starts
+/// the profiler.
+fn pe_prof_start() {
+    // Linux (0) and macOS (2, darwin.fd: setitimer, the Darwin ucontext)
+    // by SIGPROF; Windows (1, `--nat`) by a sampler thread (win.fd, its
+    // pseudo system call PE_SYS_PROF_THREAD)
+    var os: i64 = nat_os();
+    if os != 0 && os != 1 && os != 2 { return; }
+    if os != 1 && nat_sig_handler() == 0 { return; }
+    var v: i64 = pe_env_raw("FID_PROF" as i64);
+    if v == 0 || pe_ldb(v) == 0 { return; }
+    if pe_ldb(v) == 48 && pe_ldb(v + 1) == 0 { return; }
+    var tab: i64 = nat_fn_names();
+    var m: i64 = 0;
+    while pe_ld(tab + m * 16 + 8) != 0 { m = m + 1; }
+    if m == 0 { return; }
+    pe_prof_self = pe_prof_table(m);
+    pe_prof_total = pe_prof_table(m);
+    pe_prof_stamp = pe_prof_table(m);
+    pe_prof_cells = pert_malloc(16);
+    pe_zero(pe_prof_cells, 16);
+    pe_prof_tab = tab;
+    pe_prof_m = m;
+    pe_prof_fold_init(v);
+    if os == 1 {
+        // Windows: no SIGPROF; a thread suspends the main one every ms of
+        // its CPU time and reads its registers (GetThreadContext)
+        pe_prof_on = 1;
+        if nat_syscall(PE_SYS_PROF_THREAD, 0, 0, 0, 0, 0, 0) != 0 {
+            pe_prof_on = 0;
+            pe_prof_m = 0;
+            return;
+        }
+        pe_prof_armed = 1;
+        pe_prof_watch_thread();
+        return;
+    }
+    // SIGPROF: SA_SIGINFO | SA_ONSTACK | SA_RESTART (a system call the
+    // timer interrupts goes on), the restorer on x86-64
+    var act: i64 = pert_malloc(32);
+    pe_zero(act, 32);
+    pe_st(act, nat_sig_handler());
+    var flags: i64 = 134217732 | 268435456;
+    var restorer: i64 = nat_sig_restorer();
+    if restorer != 0 {
+        flags = flags | 67108864;
+        pe_st(act + 16, restorer);
+    }
+    pe_st(act + 8, flags);
+    var r: i64 = nat_syscall(PE_SYS_RT_SIGACTION, PE_SIGPROF, act, 0, 8, 0, 0);
+    pert_free(act);
+    if r != 0 { return; }
+    pe_prof_armed = 1;
+    pe_prof_on = 1;
+    pe_prof_timer(1000);
+    pe_prof_watch_start(flags, restorer);
+}
+
+/// The bucket of code address pc: the function of nat_fn_names it is in;
+/// m before the first function (the primitives), m + 1 past the code.
+fn pe_prof_bucket(pc: i64) -> i64 {
+    var tab: i64 = pe_prof_tab;
+    var m: i64 = pe_prof_m;
+    if pc < pe_ld(tab) { return m; }
+    if pc >= pe_ld(tab + m * 16) { return m + 1; }
+    var lo: i64 = 0;
+    var hi: i64 = m - 1;
+    while lo < hi {
+        var mid: i64 = (lo + hi + 1) / 2;
+        if pe_ld(tab + mid * 16) <= pc { lo = mid; } else { hi = mid - 1; }
+    }
+    return lo;
+}
+
+/// Bucket b is on the stack of sample `stamp`: counted once per sample.
+fn pe_prof_note(b: i64, stamp: i64) {
+    if pe_ld(pe_prof_stamp + b * 8) != stamp {
+        pe_st(pe_prof_stamp + b * 8, stamp);
+        nat_atomic_add(pe_prof_total + b * 8, 1);
+    }
+}
+
+/// The function at `at` starts with nat_ir's frame prologue (x86-64 `push
+/// rbp; mov rbp, rsp` 55 48 89 E5, AArch64 `stp x29, x30, [sp, #-16]!`
+/// A9BF7BFD, RISC-V `addi sp, sp, -16` FF010113): the test of nat_enc.fd's
+/// nat_has_frame.
+fn pe_prof_framed(arch: i64, at: i64) -> bool {
+    if arch == 3 {
+        return pe_ldb(at) == 85 && pe_ldb(at + 1) == 72 && pe_ldb(at + 2) == 137 && pe_ldb(at + 3) == 229;
+    }
+    var w: i64 = pe_ldb(at) | (pe_ldb(at + 1) << 8) | (pe_ldb(at + 2) << 16) | (pe_ldb(at + 3) << 24);
+    if arch == 1 { return w == 2847898621; }
+    return w == 4278255891;
+}
+
+/// SIGPROF (base.fd pe_on_signal_uc): one sample of the interrupted code,
+/// its registers in the Linux ucontext uc (x86-64: gregs at 40; AArch64:
+/// sigcontext at 176, x0 at 184; RISC-V: sigcontext at 176, pc first).
+fn pe_prof_tick(uc: i64) {
+    if pe_prof_on == 0 || uc == 0 { return; }
+    var arch: i64 = nat_arch();
+    var pc: i64 = 0;
+    var fp: i64 = 0;
+    var sp: i64 = 0;
+    var lr: i64 = 0;
+    if arch == 3 {
+        fp = pe_ld(uc + 120);
+        sp = pe_ld(uc + 160);
+        pc = pe_ld(uc + 168);
+    } else if arch == 1 {
+        fp = pe_ld(uc + 416);
+        lr = pe_ld(uc + 424);
+        sp = pe_ld(uc + 432);
+        pc = pe_ld(uc + 440);
+    } else {
+        pc = pe_ld(uc + 176);
+        lr = pe_ld(uc + 184);
+        sp = pe_ld(uc + 192);
+        fp = pe_ld(uc + 240);
+    }
+    pe_prof_tick_regs(pc, fp, sp, lr);
+}
+
+/// One sample from the interrupted registers (Linux: pe_prof_tick from the
+/// ucontext; macOS: darwin.fd pe_mac_prof_sample from the Darwin one;
+/// Windows: win.fd's sampler thread from GetThreadContext). lr is 0 on
+/// x86-64 (the return address is on the stack).
+fn pe_prof_tick_regs(pc: i64, fp0: i64, sp: i64, lr: i64) {
+    if pe_prof_on == 0 { return; }
+    // DB9: FID_PROF=folded, the whole stack too
+    if pe_prof_stk != 0 { pe_prof_fold(pc, fp0, sp, lr); }
+    var arch: i64 = nat_arch();
+    var fp: i64 = fp0;
+    var stamp: i64 = nat_atomic_add(pe_prof_cells, 1) + 1;
+    var m: i64 = pe_prof_m;
+    var b: i64 = pe_prof_bucket(pc);
+    nat_atomic_add(pe_prof_self + b * 8, 1);
+    pe_prof_note(b, stamp);
+    // A leaf or a primitive (no frame record), or pc still in the
+    // prologue: its caller is in the link register (x86-64: on top of the
+    // stack, a word higher once rbp is pushed), and fp is the caller's
+    var start: i64 = 0;
+    if b < m { start = pe_ld(pe_prof_tab + b * 16); }
+    var plen: i64 = 16;
+    if arch == 3 { plen = 4; } else if arch == 1 { plen = 8; }
+    if b >= m || !pe_prof_framed(arch, start) || pc < start + plen {
+        var ret: i64 = lr;
+        if arch == 3 {
+            if b < m && pc > start && pc < start + plen { ret = pe_ld(sp + 8); } else { ret = pe_ld(sp); }
+        }
+        var lb: i64 = pe_prof_bucket(ret - 1);
+        if lb < m { pe_prof_note(lb, stamp); }
+    }
+    // The frame records, each one's return address in a caller: upwards
+    // on the stack sp is on, at most PE_PROF_DEPTH of them
+    var k: i64 = 0;
+    var low: i64 = sp;
+    while fp != 0 && (fp & 7) == 0 && fp >= low && fp - low < 16777216 && k < PE_PROF_DEPTH {
+        var rb: i64 = pe_prof_bucket(nat_frame_ret(fp) - 1);
+        if rb < m { pe_prof_note(rb, stamp); }
+        low = fp + 8;
+        fp = nat_frame_next(fp);
+        k = k + 1;
+    }
+}
+
+/// FID_PROF's value v is "folded": the stack table, made once (before the
+/// sampler starts: the handler never allocates).
+fn pe_prof_fold_init(v: i64) {
+    if v == 0 || pe_prof_stk != 0 { return; }
+    if pe_ldb(v) != 102 || pe_ldb(v + 1) != 111 || pe_ldb(v + 2) != 108 { return; }
+    if pe_ldb(v + 3) != 100 || pe_ldb(v + 4) != 101 || pe_ldb(v + 5) != 100 || pe_ldb(v + 6) != 0 { return; }
+    var bytes: i64 = PE_PROF_STACKS * PE_PROF_SLOT * 8;
+    var t: i64 = pert_malloc(bytes);
+    if t == 0 { return; }
+    pe_zero(t, bytes);
+    pe_prof_lost = pert_malloc(8);
+    pe_st(pe_prof_lost, 0);
+    pe_prof_folded = 1;
+    pe_prof_stk = t;
+}
+
+/// The stack of one sample, walked as pe_prof_tick_regs walks it (the
+/// bucket of pc, the caller of a leaf or a prologue, then each frame
+/// record's caller; primitives and code outside the functions are left out
+/// past the first), at most PE_PROF_FDEPTH buckets. slot 0: its key (a
+/// hash, > 0); else its buckets written at slot + 24 and their count.
+@wrapping
+fn pe_prof_chain(pc: i64, fp0: i64, sp: i64, lr: i64, slot: i64) -> i64 {
+    var arch: i64 = nat_arch();
+    var m: i64 = pe_prof_m;
+    var h: i64 = 1469598103934665603;
+    var b: i64 = pe_prof_bucket(pc);
+    if slot != 0 { pe_st(slot + 24, b); }
+    h = (h ^ (b + 1)) * 1099511628211;
+    var d: i64 = 1;
+    var start: i64 = 0;
+    if b < m { start = pe_ld(pe_prof_tab + b * 16); }
+    var plen: i64 = 16;
+    if arch == 3 { plen = 4; } else if arch == 1 { plen = 8; }
+    if b >= m || !pe_prof_framed(arch, start) || pc < start + plen {
+        var ret: i64 = lr;
+        if arch == 3 {
+            if b < m && pc > start && pc < start + plen { ret = pe_ld(sp + 8); } else { ret = pe_ld(sp); }
+        }
+        var lb: i64 = pe_prof_bucket(ret - 1);
+        if lb < m {
+            if slot != 0 { pe_st(slot + 24 + d * 8, lb); }
+            h = (h ^ (lb + 1)) * 1099511628211;
+            d = d + 1;
+        }
+    }
+    var fp: i64 = fp0;
+    var k: i64 = 0;
+    var low: i64 = sp;
+    while fp != 0 && (fp & 7) == 0 && fp >= low && fp - low < 16777216 && k < PE_PROF_DEPTH && d < PE_PROF_FDEPTH {
+        var rb: i64 = pe_prof_bucket(nat_frame_ret(fp) - 1);
+        if rb < m {
+            if slot != 0 { pe_st(slot + 24 + d * 8, rb); }
+            h = (h ^ (rb + 1)) * 1099511628211;
+            d = d + 1;
+        }
+        low = fp + 8;
+        fp = nat_frame_next(fp);
+        k = k + 1;
+    }
+    if slot != 0 { return d; }
+    h = h ^ d;
+    return (h & 0x7FFFFFFFFFFFFFFF) | 1;
+}
+
+/// Count one sample's stack in the stack table (no allocation, no lock).
+fn pe_prof_fold(pc: i64, fp: i64, sp: i64, lr: i64) {
+    var key: i64 = pe_prof_chain(pc, fp, sp, lr, 0);
+    var i: i64 = 0;
+    while i < PE_PROF_STACKS {
+        var s: i64 = pe_prof_stk + ((key + i) & (PE_PROF_STACKS - 1)) * PE_PROF_SLOT * 8;
+        var k: i64 = nat_atomic_load(s);
+        if k == 0 {
+            if nat_atomic_cas(s, 0, key) != 0 {
+                var d: i64 = pe_prof_chain(pc, fp, sp, lr, s);
+                nat_atomic_add(s + 8, 1);
+                // ready: the buckets are written
+                pe_st(s + 16, d);
+                return;
+            }
+            k = nat_atomic_load(s);
+        }
+        if k == key {
+            nat_atomic_add(s + 8, 1);
+            return;
+        }
+        i = i + 1;
+    }
+    nat_atomic_add(pe_prof_lost, 1);
+}
+
+/// The name of bucket b on stderr.
+fn pe_prof_name(b: i64) {
+    if b < pe_prof_m {
+        pert_eprint_str(pe_ld(pe_prof_tab + b * 16 + 8));
+    } else if b == pe_prof_m {
+        pert_eprint_str("(runtime primitives)" as i64);
+    } else {
+        pert_eprint_str("(outside the functions)" as i64);
+    }
+}
+
+/// FID_PROF=folded: every stack sampled, root first, and its samples, one
+/// line each (`main;work;fib 123`), to stderr.
+fn pe_prof_print_folded() {
+    var i: i64 = 0;
+    while i < PE_PROF_STACKS {
+        var s: i64 = pe_prof_stk + i * PE_PROF_SLOT * 8;
+        var d: i64 = pe_ld(s + 16);
+        var c: i64 = pe_ld(s + 8);
+        if d > 0 && c > 0 {
+            var j: i64 = d - 1;
+            while j >= 0 {
+                pe_prof_name(pe_ld(s + 24 + j * 8));
+                if j > 0 { pe_write_all(2, ";" as i64, 1); }
+                j = j - 1;
+            }
+            pe_write_all(2, " " as i64, 1);
+            pe_prof_num(c, 0);
+            pe_write_all(2, "\n" as i64, 1);
+        }
+        i = i + 1;
+    }
+    var lost: i64 = pe_ld(pe_prof_lost);
+    if lost > 0 {
+        pert_eprint_str("(more stacks than the table holds) " as i64);
+        pe_prof_num(lost, 0);
+        pe_write_all(2, "\n" as i64, 1);
+    }
+}
+
+/// Bucket a goes before bucket b in the report: more self samples, then
+/// more total ones.
+fn pe_prof_before(a: i64, b: i64) -> bool {
+    var sa: i64 = pe_ld(pe_prof_self + a * 8);
+    var sb: i64 = pe_ld(pe_prof_self + b * 8);
+    if sa != sb { return sa > sb; }
+    return pe_ld(pe_prof_total + a * 8) > pe_ld(pe_prof_total + b * 8);
+}
+
+/// v right-aligned in `width` columns on stderr.
+fn pe_prof_num(v: i64, width: i64) {
+    var n: i64 = pe_int_digits(v, pe_sigbuf);
+    var i: i64 = n;
+    while i < width {
+        pe_write_all(2, " " as i64, 1);
+        i = i + 1;
+    }
+    pe_write_all(2, pe_sigbuf, n);
+}
+
+/// v of n as a percentage with one decimal, in 8 columns.
+fn pe_prof_pct(v: i64, n: i64) {
+    var p: i64 = v * 1000 / n;
+    pe_prof_num(p / 10, 6);
+    pe_stb(pe_sigbuf, 46);
+    pe_stb(pe_sigbuf + 1, 48 + p % 10);
+    pe_write_all(2, pe_sigbuf, 2);
+}
+
+/// One line of the report: bucket b's self and total samples of n.
+fn pe_prof_line(b: i64, n: i64) {
+    var s: i64 = pe_ld(pe_prof_self + b * 8);
+    var t: i64 = pe_ld(pe_prof_total + b * 8);
+    pe_prof_pct(s, n);
+    pe_prof_num(s, 9);
+    pe_prof_pct(t, n);
+    pe_prof_num(t, 9);
+    pe_write_all(2, "  " as i64, 2);
+    if b < pe_prof_m {
+        pert_eprint_str(pe_ld(pe_prof_tab + b * 16 + 8));
+    } else if b == pe_prof_m {
+        pert_eprint_str("(runtime primitives)" as i64);
+    } else {
+        pert_eprint_str("(outside the functions)" as i64);
+    }
+    pe_write_all(2, "\n" as i64, 1);
+}
+
+/// At exit (base.fd pe_rt_exit, pert_exit): the timer stopped, the profile
+/// on stderr, at most 40 lines, most self time first. Nothing when the
+/// profiler is off.
+fn pe_prof_report() {
+    if pe_prof_on == 0 { return; }
+    pe_prof_on = 0;
+    pe_prof_timer(0);
+    pe_prof_print();
+}
+
+// ─── The profile of a running service (competitive SL15) ────────────────
+// With FID_PROF set, `kill -USR2 <pid>` prints the profile so far to
+// stderr while the program runs on (the samples keep counting): the
+// SIGUSR2 handler only sets pe_prof_dump_req, and a watcher thread started
+// with the profiler prints it within 100 ms (printing allocates, which a
+// signal handler must not). FID_PROF_EVERY=<seconds> also prints it every
+// that many seconds. The report at exit stays.
+const PE_SIGUSR2: i64 = 12;
+var pe_prof_dump_req: i64 = 0;
+
+/// SIGUSR2 (base.fd pe_on_signal_uc): ask the watcher for a report.
+fn pe_prof_request() {
+    pe_prof_dump_req = 1;
+}
+
+/// The watcher thread: a report on request or every FID_PROF_EVERY s.
+pub fn pe_prof_watch_main(id: i64) -> i64 {
+    var every: i64 = 0;
+    var v: i64 = pe_env_raw("FID_PROF_EVERY" as i64);
+    if v != 0 {
+        var i: i64 = 0;
+        while pe_ldb(v + i) >= 48 && pe_ldb(v + i) <= 57 && i < 9 {
+            every = every * 10 + (pe_ldb(v + i) - 48);
+            i = i + 1;
+        }
+    }
+    var ticks: i64 = 0;
+    while pe_prof_on != 0 {
+        pe_sleep_ms(100);
+        ticks = ticks + 1;
+        var due: bool = every > 0 && ticks >= every * 10;
+        if pe_prof_dump_req != 0 || due {
+            pe_prof_dump_req = 0;
+            ticks = 0;
+            if pe_prof_on != 0 { pe_prof_print(); }
+        }
+    }
+    return 0;
+}
+
+/// SIGUSR2 to pe_prof_request and the watcher thread, once the profiler is
+/// on.
+fn pe_prof_watch_start(flags: i64, restorer: i64) {
+    var act: i64 = pert_malloc(32);
+    pe_zero(act, 32);
+    pe_st(act, nat_sig_handler());
+    pe_st(act + 8, flags);
+    if restorer != 0 { pe_st(act + 16, restorer); }
+    var r: i64 = nat_syscall(PE_SYS_RT_SIGACTION, PE_SIGUSR2, act, 0, 8, 0, 0);
+    pert_free(act);
+    if r != 0 { return; }
+    pe_prof_watch_thread();
+}
+
+/// The watcher thread (Windows has no SIGUSR2: FID_PROF_EVERY only).
+fn pe_prof_watch_thread() {
+    var entry: i64 = pe_fn_lookup("pe_prof_watch_main");
+    if entry == 0 { return; }
+    pe_mt_on();
+    pe_spawn_os(entry, 0, pe_zeroed(1));
+}
+
+/// The table of the samples so far, most self time first (to stderr).
+fn pe_prof_print() {
+    if pe_prof_stk != 0 {
+        pe_prof_print_folded();
+        return;
+    }
+    var n: i64 = pe_ld(pe_prof_cells);
+    var m: i64 = pe_prof_m;
+    pert_eprint_str("profile (FID_PROF): " as i64);
+    pe_prof_num(n, 0);
+    pert_eprint_str(" samples, one per ms of CPU time\n" as i64);
+    if n == 0 { return; }
+    pert_eprint_str("   self%     self  total%    total  function\n" as i64);
+    var shown: i64 = pe_prof_table(m);
+    var row: i64 = 0;
+    while row < 40 {
+        var best: i64 = 0 - 1;
+        var b: i64 = 0;
+        while b < m + 2 {
+            if pe_ld(shown + b * 8) == 0 && (pe_ld(pe_prof_self + b * 8) > 0 || pe_ld(pe_prof_total + b * 8) > 0) {
+                if best < 0 || pe_prof_before(b, best) { best = b; }
+            }
+            b = b + 1;
+        }
+        if best < 0 {
+            row = 40;
+        } else {
+            pe_st(shown + best * 8, 1);
+            pe_prof_line(best, n);
+            row = row + 1;
+        }
+    }
+    pert_free(shown);
+}
+
+// ─── The profiler from the program (competitive SL15) ───────────────────
+// p_prof_start / p_prof_stop / p_prof_report / p_prof_samples
+// (stdlib/profiler.fd prof_*): the sampler above, started and stopped by
+// the program itself, FID_PROF or not. Linux and macOS: SIGPROF every ms of
+// the process's CPU time (all threads); `--nat` Windows: win.fd's sampler
+// thread, which stays once the program has started it (pe_prof_keep) and
+// samples while pe_prof_on is 1.
+var pe_prof_armed: i64 = 0;    // the SIGPROF handler / sampler thread is up
+var pe_prof_keep: i64 = 0;     // win.fd: the sampler thread stays when off
+
+/// The counting tables, made once: false when this target has no sampler
+/// or the program no function table.
+fn pe_prof_tables() -> bool {
+    if pe_prof_m != 0 { return true; }
+    var os: i64 = nat_os();
+    if os != 0 && os != 1 && os != 2 { return false; }
+    if os != 1 && nat_sig_handler() == 0 { return false; }
+    var tab: i64 = nat_fn_names();
+    if tab == 0 { return false; }
+    var m: i64 = 0;
+    while pe_ld(tab + m * 16 + 8) != 0 { m = m + 1; }
+    if m == 0 { return false; }
+    pe_prof_self = pe_prof_table(m);
+    pe_prof_total = pe_prof_table(m);
+    pe_prof_stamp = pe_prof_table(m);
+    pe_prof_cells = pert_malloc(16);
+    pe_zero(pe_prof_cells, 16);
+    pe_prof_tab = tab;
+    pe_prof_m = m;
+    return true;
+}
+
+/// p_prof_start(): count samples from now on (earlier ones are dropped):
+/// 0, or -1 when this program cannot be sampled.
+pub fn pert_prof_start() -> i64 {
+    if !pe_prof_tables() { return 0 - 1; }
+    // Windows: the sampler thread (started under FID_PROF with keep 0)
+    // must not see the profiler off while the counts are reset, or it ends
+    if nat_os() == 1 { pe_prof_keep = 1; }
+    pe_prof_on = 0;
+    var m: i64 = pe_prof_m;
+    pe_zero(pe_prof_self, (m + 2) * 8);
+    pe_zero(pe_prof_total, (m + 2) * 8);
+    pe_zero(pe_prof_stamp, (m + 2) * 8);
+    pe_st(pe_prof_cells, 0);
+    // DB9: FID_PROF=folded, the stacks from now on
+    pe_prof_fold_init(pe_env_raw("FID_PROF" as i64));
+    if pe_prof_stk != 0 {
+        pe_zero(pe_prof_stk, PE_PROF_STACKS * PE_PROF_SLOT * 8);
+        pe_st(pe_prof_lost, 0);
+    }
+    if nat_os() == 1 {
+        pe_prof_keep = 1;
+        if pe_prof_armed == 0 {
+            if nat_syscall(PE_SYS_PROF_THREAD, 0, 0, 0, 0, 0, 0) != 0 { return 0 - 1; }
+            pe_prof_armed = 1;
+        }
+        pe_prof_on = 1;
+        return 0;
+    }
+    if pe_prof_armed == 0 {
+        // SA_SIGINFO | SA_ONSTACK | SA_RESTART, the restorer on x86-64 (as
+        // pe_prof_start)
+        var act: i64 = pert_malloc(32);
+        pe_zero(act, 32);
+        pe_st(act, nat_sig_handler());
+        var flags: i64 = 134217732 | 268435456;
+        var restorer: i64 = nat_sig_restorer();
+        if restorer != 0 {
+            flags = flags | 67108864;
+            pe_st(act + 16, restorer);
+        }
+        pe_st(act + 8, flags);
+        var r: i64 = nat_syscall(PE_SYS_RT_SIGACTION, PE_SIGPROF, act, 0, 8, 0, 0);
+        pert_free(act);
+        if r != 0 { return 0 - 1; }
+        pe_prof_armed = 1;
+    }
+    pe_prof_on = 1;
+    pe_prof_timer(1000);
+    return 0;
+}
+
+/// p_prof_stop(): stop counting; the samples taken.
+pub fn pert_prof_stop() -> i64 {
+    if pe_prof_m == 0 { return 0; }
+    if nat_os() == 1 { pe_prof_keep = 1; }
+    if pe_prof_on != 0 {
+        pe_prof_on = 0;
+        if nat_os() != 1 {
+            pe_prof_timer(0);
+        } else {
+            // a sample in progress on the sampler thread ends within it
+            pe_sleep_ms(2);
+        }
+    }
+    return pe_ld(pe_prof_cells);
+}
+
+/// p_prof_report(): the profile so far on stderr; the samples taken.
+pub fn pert_prof_report() -> i64 {
+    if pe_prof_m == 0 {
+        pert_eprint_str("profile (FID_PROF): 0 samples, one per ms of CPU time\n" as i64);
+        return 0;
+    }
+    pe_prof_print();
+    return pe_ld(pe_prof_cells);
+}
+
+// ─── Tensor-parallel ranks (roadmap P6) ─────────────────────────────────
+// The OS half of pe_runtime/tensor.fd "Tensor parallelism over several
+// ranks" (that file is merged here too). Rank 0 forks ranks 1..n-1 at
+// p_tp_init, so nothing before the call runs twice. Every pair of ranks
+// shares one connected AF_UNIX stream socket, both ways: one listener in
+// rank 0 (Linux: in the abstract namespace, macOS: a file in the temp
+// directory, removed at once), a connect and an accept per pair (pipe2 is
+// not in nat_ir's x86-64 system call map; sockets are). Each process then
+// closes every end but its own, so a rank that exits is the end of its
+// streams for the others ("is gone"). SIGPIPE is ignored once there are
+// ranks: a write to a rank that is gone fails instead of killing the
+// writer. --nat Windows (no fork) and WASI (no sockets, no processes) keep
+// one rank.
+
+/// Linux's processes start the ranks at p_tp_init: nothing to take.
+fn pe_tp_os_attach() -> bool {
+    return false;
+}
+
+fn pe_tp_os_fail(what: str) {
+    p_panic(p_str_concat("tp_init: cannot start the ranks (", p_str_concat(what, ")")));
+}
+
+fn pe_tp_os_spawn(n: i64) -> bool {
+    val os: i64 = nat_os();
+    if os == 1 { return false; }
+    // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC
+    val lf: i64 = pe_sys(PE_SYS_SOCKET, 1, 524289, 0);
+    if lf == 0 - 38 || lf == 0 - 97 { return false; }       // ENOSYS, EAFNOSUPPORT
+    if lf < 0 { pe_tp_os_fail("socket"); }
+    // sockaddr_un: family 1, then the name
+    val sa: i64 = pert_malloc(112);
+    pe_zero(sa, 112);
+    pe_stb(sa, 1);
+    var name: str = "fid-tp-" + pert_to_str(pe_sys(PE_SYS_GETPID, 0, 0, 0));
+    var at: i64 = 3;                                   // Linux: sun_path[0] = 0
+    if os != 0 {
+        at = 2;
+        name = pe_capture_dir() + name;
+    }
+    val nl: i64 = pe_len(name as i64);
+    if at + nl + 1 > 104 { pe_tp_os_fail("the temporary directory's name is too long"); }
+    var i: i64 = 0;
+    while i < nl {
+        pe_stb(sa + at + i, pe_ldb((name as i64) + i));
+        i = i + 1;
+    }
+    var salen: i64 = at + nl;
+    if os != 0 {
+        salen = salen + 1;
+        nat_syscall(PE_SYS_UNLINKAT, PE_AT_FDCWD, sa + 2, 0, 0, 0, 0);
+    }
+    if nat_syscall(PE_SYS_BIND, lf, sa, salen, 0, 0, 0) < 0 { pe_tp_os_fail("bind"); }
+    if pe_sys(PE_SYS_LISTEN, lf, 64, 0) < 0 { pe_tp_os_fail("listen"); }
+    // ends: word a * n + b is rank a's end of the stream it shares with b
+    val ends: i64 = pert_malloc(n * n * 8);
+    pe_zero(ends, n * n * 8);
+    var a: i64 = 0;
+    while a < n {
+        var b: i64 = a + 1;
+        while b < n {
+            val c: i64 = pe_sys(PE_SYS_SOCKET, 1, 524289, 0);
+            if c < 0 { pe_tp_os_fail("socket"); }
+            if nat_syscall(PE_SYS_CONNECT, c, sa, salen, 0, 0, 0) < 0 { pe_tp_os_fail("connect"); }
+            var s: i64 = pe_sys(PE_SYS_ACCEPT, lf, 0, 0);
+            while s == 0 - 4 { s = pe_sys(PE_SYS_ACCEPT, lf, 0, 0); }     // EINTR
+            if s < 0 { pe_tp_os_fail("accept"); }
+            pe_sys(PE_SYS_FCNTL, s, 2, 1);                               // F_SETFD FD_CLOEXEC
+            pe_st(ends + (a * n + b) * 8, c);
+            pe_st(ends + (b * n + a) * 8, s);
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    pe_sys(PE_SYS_CLOSE, lf, 0, 0);
+    if os != 0 { nat_syscall(PE_SYS_UNLINKAT, PE_AT_FDCWD, sa + 2, 0, 0, 0, 0); }
+    pert_free(sa);
+    // SIGPIPE: SIG_IGN
+    val act: i64 = pert_malloc(32);
+    pe_zero(act, 32);
+    pe_st(act, 1);
+    nat_syscall(PE_SYS_RT_SIGACTION, 13, act, 0, 8, 0, 0);
+    pert_free(act);
+    var me: i64 = 0;
+    var r: i64 = 1;
+    var forking: bool = true;
+    while forking && r < n {
+        val pid: i64 = nat_syscall(220, 17, 0, 0, 0, 0, 0);       // fork: clone(SIGCHLD)
+        if pid < 0 { pe_tp_os_fail("fork"); }
+        if pid == 0 {
+            me = r;
+            forking = false;
+        } else {
+            pet_tp_set_child(r, pid);
+            r = r + 1;
+        }
+    }
+    // keep this rank's ends, close the others'
+    a = 0;
+    while a < n {
+        var b2: i64 = 0;
+        while b2 < n {
+            if a != b2 {
+                val e: i64 = pe_ld(ends + (a * n + b2) * 8);
+                if a == me {
+                    pet_tp_set_link(b2, e, e);
+                } else {
+                    pe_sys(PE_SYS_CLOSE, e, 0, 0);
+                }
+            }
+            b2 = b2 + 1;
+        }
+        a = a + 1;
+    }
+    pert_free(ends);
+    if me == 0 {
+        pet_tp_joined(0, n, n - 1);
+    } else {
+        pet_tp_joined(me, n, 0);
+    }
+    return true;
+}
+
+/// All n bytes at buf to the stream: false when the other rank is gone.
+fn pe_tp_os_write(h: i64, buf: i64, n: i64) -> bool {
+    var done: i64 = 0;
+    while done < n {
+        val w: i64 = pe_sys(PE_SYS_WRITE, h, buf + done, n - done);
+        if w == 0 - 4 {
+            // EINTR: again
+        } else if w <= 0 {
+            return false;
+        } else {
+            done = done + w;
+        }
+    }
+    return true;
+}
+
+/// n bytes from the stream into buf: false when it ended first.
+fn pe_tp_os_read(h: i64, buf: i64, n: i64) -> bool {
+    var done: i64 = 0;
+    while done < n {
+        val k: i64 = pe_sys(PE_SYS_READ, h, buf + done, n - done);
+        if k == 0 - 4 {
+            // EINTR: again
+        } else if k <= 0 {
+            return false;
+        } else {
+            done = done + k;
+        }
+    }
+    return true;
+}
+
+fn pe_tp_os_close(inh: i64, outh: i64) {
+    pe_sys(PE_SYS_CLOSE, inh, 0, 0);
+    if outh != inh { pe_sys(PE_SYS_CLOSE, outh, 0, 0); }
+}
+
+/// The rank's exit status once it ended: its code, 128 + n when signal n
+/// killed it, -1 when it cannot be waited for.
+fn pe_tp_os_wait(pid: i64) -> i64 {
+    val status: i64 = pe_zeroed(1);
+    var r: i64 = nat_syscall(PE_SYS_WAIT4, pid, status, 0, 0, 0, 0);
+    while r == 0 - 4 {
+        r = nat_syscall(PE_SYS_WAIT4, pid, status, 0, 0, 0, 0);
+    }
+    val st: i64 = pe_ld(status) & 65535;
+    pert_free(status);
+    if r < 0 { return 0 - 1; }
+    if (st & 127) == 0 { return (st >> 8) & 255; }
+    return 128 + (st & 127);
+}
+
+/// p_prof_samples(name): the samples with function `name` on the stack.
+pub fn pert_prof_samples(name: str) -> i64 {
+    if pe_prof_m == 0 { return 0; }
+    var s: i64 = name as i64;
+    var n: i64 = pe_len(s);
+    var r: i64 = 0;
+    var b: i64 = 0;
+    while b < pe_prof_m {
+        var p: i64 = pe_ld(pe_prof_tab + b * 16 + 8);
+        if pe_len(p) == n {
+            var j: i64 = 0;
+            while j < n && pe_ldb(p + j) == pe_ldb(s + j) { j = j + 1; }
+            if j == n { r = r + pe_ld(pe_prof_total + b * 8); }
+        }
+        b = b + 1;
+    }
+    return r;
 }

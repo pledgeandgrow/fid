@@ -1,0 +1,38 @@
+// An async call whose task ends before it first waits (it never yields),
+// then one that waits, both awaited afterwards. Under `fid run` each
+// interpreted task runs on a task of the C runtime fid is built with
+// (compiler/interp.fd, LG11): the first ended inside p_co_async, and
+// p_co_detach freed its block while it was still in the runtime's task
+// list, so the scheduler's next pass (the second await) read freed memory
+// and fid stopped with exit code 127 and no message after "11". The
+// interpreter now detaches such a task after main's next pass
+// (itask_detach_flush), and the C runtime's p_co_detach marks an ended
+// task still in the list instead of freeing it.
+// Expected output:
+// 11
+// 12
+// 15
+// 3
+
+use task;
+
+async fn quick(k: i64) -> Future<i64> {
+    return k + 10;
+}
+
+async fn slow(k: i64) -> Future<i64> {
+    task_yield();
+    return k * 3;
+}
+
+fn main() {
+    val fa = quick(1);
+    val fb = slow(4);
+    println(await fa);
+    println(await fb);
+    // again, with the ended task's block set aside from before
+    val fc = quick(5);
+    val fd = slow(1);
+    println(await fc);
+    println(await fd);
+}

@@ -1,0 +1,177 @@
+// stdlib/i2c: address bytes (7/10-bit), register helpers over the fake bus, scan, NAK, SMBus PEC (CRC-8/SMBUS check value), the Linux I2C_RDWR image layout, a custom transport
+// Expected output:
+// wire 0x50 w: a0
+// wire 0x50 r: a1
+// wire 0x2A5 w: f4a5
+// wire 0x2A5 r: f4a5f5
+// unwire a1: 80 1
+// chip id: 96
+// reg16 be: 4660
+// reg16 le: 13330
+// write ctrl: true 39
+// update bits: true 35
+// burst: 601234
+// log: W 118 [F4 27]
+// eeprom: 0b0c0d
+// ten-bit: 7
+// scan: 80 118
+// nak: no ACK from address 33
+// nak reg8: -1
+// crc8 smbus: f4
+// pec read word: true
+// rdwr: 101000000000000002000000000000007600000001000000301000000000000076000100010000003110000000000000d000
+// reads: 2a
+// custom: 0 5 6 7
+// custom error: transfer failed, error 6
+use i2c;
+use encoding;
+use string;
+
+fn echo_xfer(h: i64, req: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val msgs: Vec<I2cMsg> = i2c_decode_request(& req);
+    if msgs.len() > 0 && msgs.get(0).addr == 0x11 {
+        out.push(0 - 6);
+        return out;
+    }
+    out.push(0);
+    var i: i64 = 0;
+    while i < msgs.len() {
+        val m: I2cMsg = msgs.get(i);
+        if i2c_msg_is_read(& m) {
+            var j: i64 = 0;
+            while j < m.len {
+                out.push(h + j);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn show(label: str, r: Result<Vec<i64>, str>) {
+    match r {
+        Result::Ok(b) => {
+            println(label + ": " + hex_encode_bytes(b));
+        }
+        Result::Err(e) => {
+            println(label + ": " + e);
+        }
+    }
+}
+
+fn main() {
+    println("wire 0x50 w: " + hex_encode_bytes(i2c_addr_wire(0x50, false, false)));
+    println("wire 0x50 r: " + hex_encode_bytes(i2c_addr_wire(0x50, false, true)));
+    println("wire 0x2A5 w: " + hex_encode_bytes(i2c_addr_wire(0x2A5, true, false)));
+    println("wire 0x2A5 r: " + hex_encode_bytes(i2c_addr_wire(0x2A5, true, true)));
+    val uw: Vec<i64> = i2c_addr_unwire7(0xA1);
+    println("unwire a1: " + int_to_str(uw.get(0)) + " " + int_to_str(uw.get(1)));
+
+    var bus: I2cBus = i2c_bus_fake();
+    var sensor: I2cFakeDev = i2c_fake_dev(0x76, 256);
+    i2c_fake_dev_set(& mut sensor, 0xD0, hex_decode_bytes("60"));
+    i2c_fake_dev_set(& mut sensor, 0x10, hex_decode_bytes("1234"));
+    i2c_fake_dev_set(& mut sensor, 0xF4, hex_decode_bytes("23"));
+    i2c_fake_add(& mut bus, sensor);
+    i2c_fake_add(& mut bus, i2c_fake_dev16(0x50, 4096));
+    var ten: I2cFakeDev = i2c_fake_dev_ten(0x2A5, 16);
+    i2c_fake_dev_set(& mut ten, 3, hex_decode_bytes("07"));
+    i2c_fake_add(& mut bus, ten);
+
+    println("chip id: " + int_to_str(i2c_read_reg8(& mut bus, 0x76, 0xD0)));
+    println("reg16 be: " + int_to_str(i2c_read_reg16_be(& mut bus, 0x76, 0x10)));
+    println("reg16 le: " + int_to_str(i2c_read_reg16_le(& mut bus, 0x76, 0x10)));
+    val ok: bool = i2c_write_reg8(& mut bus, 0x76, 0xF4, 0x27);
+    println("write ctrl: " + bool_to_str(ok) + " " + int_to_str(i2c_read_reg8(& mut bus, 0x76, 0xF4)));
+    // 0x27 = 0010_0111: replace bits 0b0001_1100 with 0b0000_0000 -> 0x23
+    val ub: bool = i2c_update_bits(& mut bus, 0x76, 0xF4, 0x1C, 0x00);
+    println("update bits: " + bool_to_str(ub) + " " + int_to_str(i2c_read_reg8(& mut bus, 0x76, 0xF4)));
+    // one register, then two with auto-increment
+    var burst: Vec<i64> = Vec::new();
+    burst.push(i2c_read_reg8(& mut bus, 0x76, 0xD0));
+    match i2c_read_regs(& mut bus, 0x76, 0x10, 2) {
+        Result::Ok(b) => {
+            burst.push(b.get(0));
+            burst.push(b.get(1));
+        }
+        Result::Err(_) => {
+        }
+    }
+    println("burst: " + hex_encode_bytes(burst));
+    var wrote: str = "";
+    var li: i64 = 0;
+    while li < bus.log.len() {
+        val line: str = bus.log.get(li);
+        if str_starts_with(line, "W 118 [F4 27") {
+            wrote = line;
+        }
+        li = li + 1;
+    }
+    println("log: " + wrote);
+
+    val wok: bool = i2c_write_a16(& mut bus, 0x50, 0x0102, hex_decode_bytes("0b0c0d"));
+    if wok {
+        show("eeprom", i2c_read_a16(& mut bus, 0x50, 0x0102, 3));
+    }
+    match i2c_write_read10(& mut bus, 0x2A5, hex_decode_bytes("03"), 1) {
+        Result::Ok(b) => {
+            println("ten-bit: " + int_to_str(b.get(0)));
+        }
+        Result::Err(e) => {
+            println("ten-bit: " + e);
+        }
+    }
+    val found: Vec<i64> = i2c_scan(& mut bus);
+    var fs: str = "";
+    var fi: i64 = 0;
+    while fi < found.len() {
+        if fi > 0 {
+            fs = fs + " ";
+        }
+        fs = fs + int_to_str(found.get(fi));
+        fi = fi + 1;
+    }
+    println("scan: " + fs);
+    show("nak", i2c_read(& mut bus, 0x21, 1));
+    println("nak reg8: " + int_to_str(i2c_read_reg8(& mut bus, 0x21, 0)));
+
+    println("crc8 smbus: " + hex_encode_bytes(i2c_one_byte(i2c_crc8_smbus(& str_bytes("123456789")))));
+    // a read word with PEC: the PEC over the whole frame, appended, gives CRC 0
+    val data: Vec<i64> = hex_decode_bytes("3412");
+    val pec: i64 = i2c_smbus_pec_read(0x0B, 0x09, & data);
+    var frame: Vec<i64> = Vec::new();
+    frame.push(0x16);
+    frame.push(0x09);
+    frame.push(0x17);
+    frame.push(0x34);
+    frame.push(0x12);
+    frame.push(pec);
+    println("pec read word: " + bool_to_str(i2c_crc8_smbus(& frame) == 0));
+
+    var msgs: Vec<I2cMsg> = Vec::new();
+    msgs.push(i2c_msg_write(0x76, hex_decode_bytes("d0")));
+    msgs.push(i2c_msg_read(0x76, 1));
+    var img: Vec<i64> = i2c_rdwr_image(& msgs, 0x1000);
+    println("rdwr: " + hex_encode_bytes(img));
+    img.set(img.len() - 1, 0x2A);
+    println("reads: " + hex_encode_bytes(i2c_rdwr_reads(& msgs, & img)));
+
+    var cb: I2cBus = i2c_bus_custom(5, echo_xfer);
+    match i2c_write_read(& mut cb, 0x40, hex_decode_bytes("01"), 3) {
+        Result::Ok(b) => {
+            println("custom: 0 " + int_to_str(b.get(0)) + " " + int_to_str(b.get(1)) + " " + int_to_str(b.get(2)));
+        }
+        Result::Err(e) => {
+            println("custom: " + e);
+        }
+    }
+    show("custom error", i2c_read(& mut cb, 0x11, 1));
+}
+
+fn i2c_one_byte(b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(b);
+    return v;
+}

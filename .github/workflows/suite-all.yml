@@ -1,0 +1,120 @@
+# RL2 (llvm-roadmap): the suite on every backend and target on every change.
+# scripts/suite-all.sh knows ten lanes (LIST_LANES=1 prints them); each one
+# runs on every push and pull request to main, against the interpreter, the
+# lanes of a target agreeing test by test (AGREE=1):
+#
+#   tier1.yml (PL2)  windows-x64  c:x86_64-windows native:x86_64-windows-pe
+#                                 native:x86_64-windows (`emit --nat`)
+#                    linux-x64    c:x86_64-linux native:x86_64-linux
+#                    linux-arm64  c:aarch64-linux native:aarch64-linux (on an
+#                                 ARM64 runner: the hardware, not QEMU)
+#   this workflow    riscv64      c:riscv64-linux native:riscv64-linux under
+#                                 qemu-riscv64, FID_VERIFY=1 (the IR verifier
+#                                 and the allocation checker on every emit)
+#                    wasm32       c:wasm32-wasi under Node's WASI, and the
+#                                 native WebAssembly backend (`fid wasm`,
+#                                 scripts/wasm-test.sh)
+#
+# scripts/suite-lanes-check.sh (ci.yml `gates`, through ci-wiring-check.sh)
+# fails when a lane suite-all.sh knows is run by none of these jobs.
+# Locally: bash scripts/suite-all.sh (every lane this host can run).
+
+name: Suite on every lane (RL2)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: suite-all-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lanes:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: riscv64
+            lanes: "c:riscv64-linux native:riscv64-linux"
+          - name: wasm32
+            lanes: "c:wasm32-wasi"
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUST_MIN_STACK: "268435456"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: mold (the linker .cargo/config.toml asks for) and qemu-user
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold qemu-user
+      - name: RISC-V C library for qemu-user (CI4; dynamic native programs)
+        if: matrix.name == 'riscv64'
+        run: sudo apt-get install -y -qq libc6-riscv64-cross
+      - name: The compiler's sources parse with stage 0
+        run: bash scripts/stage0-names-check.sh
+      - name: Build the Rust bootstrap compiler (stage 0)
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: |
+          ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: C through wasm32-wasi builds and runs (known bug 2g.61)
+        if: matrix.name == 'wasm32'
+        env:
+          CC: zig cc
+        run: bash tests/tooling/wasm-c-2g61-check.sh release/fid
+      - name: The suite on ${{ matrix.lanes }}
+        env:
+          CC: zig cc
+          FID: release/fid
+          FID_VERIFY: "1"
+          JOBS: "4"
+          AGREE: "1"
+          OUT: build/suite-all
+        run: bash scripts/suite-all.sh ${{ matrix.lanes }}
+      - name: The native WebAssembly backend (fid wasm)
+        if: always() && matrix.name == 'wasm32'
+        env:
+          FID: release/fid
+          JOBS: "4"
+        run: bash scripts/wasm-test.sh
+      - name: fid wasm tasks that switch stacks, processes, array bounds (PL4, CI5)
+        if: always() && matrix.name == 'wasm32'
+        env:
+          FID: release/fid
+        run: bash tests/wasm/task-switch-check.sh
+      - name: fid wasm structured control flow (TG16)
+        if: always() && matrix.name == 'wasm32'
+        env:
+          FID: release/fid
+        run: bash tests/wasm/stackify-check.sh
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-all-${{ matrix.name }}-${{ github.run_id }}
+          path: |
+            build/suite-all/*/results.txt
+            build/suite-all/*-native/results.txt
+            build/suite-all/disagree.txt
+            build/wasm-native/results.txt
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,942 @@
+// Fides behavior trees (robotics / AI)
+//
+// Behavior trees with the node set and semantics of BehaviorTree.CPP v4:
+//   control:    Sequence (on failure it starts over), SequenceWithMemory
+//               (on failure it resumes at the failed child),
+//               ReactiveSequence (re-checks earlier children every tick),
+//               Fallback, ReactiveFallback, Parallel (success_count /
+//               failure_count thresholds; -1 = all children)
+//   decorators: Inverter, ForceSuccess, ForceFailure, Repeat (num_cycles,
+//               -1 forever), RetryUntilSuccessful (num_attempts),
+//               Timeout (msec, against the injected clock)
+//   leaves:     Action and Condition, user functions `fn(i64) -> i64`
+//               that get the blackboard id and return BT_SUCCESS,
+//               BT_FAILURE or BT_RUNNING; an action may have a halt
+//               function, called when a running action is interrupted
+//               (a reactive parent re-evaluates, a parallel finishes, a
+//               timeout fires); AlwaysSuccess / AlwaysFailure.
+// Running children are halted (recursively, their state reset) whenever
+// their parent stops ticking them.
+//
+// Blackboards are typed key/value stores (int, float, str, bool) named by
+// an id. Node attributes are ports: "{key}" refers to a blackboard entry,
+// anything else is a literal; a leaf reads them with bt_port_* and writes
+// output ports with bt_port_set_*.
+//
+// `bt_from_xml` builds a tree from BehaviorTree.CPP XML (stdlib/xml):
+//   <root BTCPP_format="4" main_tree_to_execute="Main">
+//     <BehaviorTree ID="Main"> <Sequence> <Action ID="Go" goal="{g}"/>
+//       <Battery/> <SubTree ID="Other"/> ... </Sequence> </BehaviorTree>
+//   </root>
+// A leaf is `<Action ID="name">`, `<Condition ID="name">` or an element
+// named after a registered leaf.
+//
+// Time is injected: `bt_tick(&mut tree, now_ms)`. Pure computation; the
+// seam is the leaf functions, which talk to the robot.
+//
+// Implementation note: the interpreter cannot call a function value stored
+// in a Vec<fn>, nor let a function value take a reference, so leaves live
+// in BtLeaf structs and reach their data through the blackboard id and the
+// port functions (the tree sets the current node before calling a leaf).
+//
+// Usage:
+//   use behavior_tree;
+//   val bb: i64 = bb_new();
+//   var leaves: Vec<BtLeaf> = Vec::new();
+//   leaves.push(bt_leaf_action("Go", fn(b: i64) -> i64 { return BT_SUCCESS; }));
+//   val ld: BtLoad = bt_from_xml(xml_text, &leaves, bb);
+//   var t: BTree = ld.tree;
+//   while bt_tick(&mut t, now()) == BT_RUNNING { ... }
+
+module behavior_tree;
+use xml;
+
+pub const BT_SUCCESS: i64 = 0;
+pub const BT_FAILURE: i64 = 1;
+pub const BT_RUNNING: i64 = 2;
+// not ticked yet (or reset)
+pub const BT_IDLE: i64 = 3;
+
+pub const BTK_SEQUENCE: i64 = 1;
+pub const BTK_SEQUENCE_MEM: i64 = 2;
+pub const BTK_REACTIVE_SEQUENCE: i64 = 3;
+pub const BTK_FALLBACK: i64 = 4;
+pub const BTK_REACTIVE_FALLBACK: i64 = 5;
+pub const BTK_PARALLEL: i64 = 6;
+pub const BTK_INVERTER: i64 = 10;
+pub const BTK_FORCE_SUCCESS: i64 = 11;
+pub const BTK_FORCE_FAILURE: i64 = 12;
+pub const BTK_REPEAT: i64 = 13;
+pub const BTK_RETRY: i64 = 14;
+pub const BTK_TIMEOUT: i64 = 15;
+pub const BTK_ACTION: i64 = 20;
+pub const BTK_CONDITION: i64 = 21;
+pub const BTK_ALWAYS_SUCCESS: i64 = 22;
+pub const BTK_ALWAYS_FAILURE: i64 = 23;
+
+pub fn bt_status_str(s: i64) -> str {
+    if s == BT_SUCCESS {
+        return "SUCCESS";
+    }
+    if s == BT_FAILURE {
+        return "FAILURE";
+    }
+    if s == BT_RUNNING {
+        return "RUNNING";
+    }
+    return "IDLE";
+}
+
+// ─── Blackboards ───
+
+pub const BB_INT: i64 = 1;
+pub const BB_FLOAT: i64 = 2;
+pub const BB_STR: i64 = 3;
+pub const BB_BOOL: i64 = 4;
+
+var bb_count: i64 = 0;
+var bb_owner: Vec<i64> = Vec::new();
+var bb_keys: Vec<str> = Vec::new();
+var bb_kinds: Vec<i64> = Vec::new();
+var bb_ints: Vec<i64> = Vec::new();
+var bb_floats: Vec<f64> = Vec::new();
+var bb_strs: Vec<str> = Vec::new();
+
+/// A new, empty blackboard.
+pub fn bb_new() -> i64 {
+    bb_count = bb_count + 1;
+    return bb_count;
+}
+
+fn bb_find(bb: i64, key: str) -> i64 {
+    var i: i64 = 0;
+    while i < bb_keys.len() {
+        if bb_owner.get(i) == bb && bb_keys.get(i) == key {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn bb_slot(bb: i64, key: str) -> i64 {
+    val i: i64 = bb_find(bb, key);
+    if i >= 0 {
+        return i;
+    }
+    bb_owner.push(bb);
+    bb_keys.push(key);
+    bb_kinds.push(0);
+    bb_ints.push(0);
+    bb_floats.push(0.0);
+    bb_strs.push("");
+    return bb_keys.len() - 1;
+}
+
+pub fn bb_has(bb: i64, key: str) -> bool {
+    return bb_find(bb, key) >= 0;
+}
+
+/// The kind (BB_*) of an entry, 0 when absent.
+pub fn bb_kind(bb: i64, key: str) -> i64 {
+    val i: i64 = bb_find(bb, key);
+    if i < 0 {
+        return 0;
+    }
+    return bb_kinds.get(i);
+}
+
+pub fn bb_set_int(bb: i64, key: str, v: i64) {
+    val i: i64 = bb_slot(bb, key);
+    bb_kinds.set(i, BB_INT);
+    bb_ints.set(i, v);
+}
+
+pub fn bb_set_float(bb: i64, key: str, v: f64) {
+    val i: i64 = bb_slot(bb, key);
+    bb_kinds.set(i, BB_FLOAT);
+    bb_floats.set(i, v);
+}
+
+pub fn bb_set_str(bb: i64, key: str, v: str) {
+    val i: i64 = bb_slot(bb, key);
+    bb_kinds.set(i, BB_STR);
+    bb_strs.set(i, v);
+}
+
+pub fn bb_set_bool(bb: i64, key: str, v: bool) {
+    val i: i64 = bb_slot(bb, key);
+    bb_kinds.set(i, BB_BOOL);
+    if v {
+        bb_ints.set(i, 1);
+    } else {
+        bb_ints.set(i, 0);
+    }
+}
+
+/// An int entry (a float entry is truncated, a str entry parsed); `def`
+/// when absent.
+pub fn bb_get_int(bb: i64, key: str, def: i64) -> i64 {
+    val i: i64 = bb_find(bb, key);
+    if i < 0 {
+        return def;
+    }
+    val k: i64 = bb_kinds.get(i);
+    if k == BB_FLOAT {
+        return bb_floats.get(i) as i64;
+    }
+    if k == BB_STR {
+        return str_parse_int(bb_strs.get(i));
+    }
+    return bb_ints.get(i);
+}
+
+/// A float entry (an int entry is converted, a str entry parsed).
+pub fn bb_get_float(bb: i64, key: str, def: f64) -> f64 {
+    val i: i64 = bb_find(bb, key);
+    if i < 0 {
+        return def;
+    }
+    val k: i64 = bb_kinds.get(i);
+    if k == BB_INT || k == BB_BOOL {
+        return bb_ints.get(i) as f64;
+    }
+    if k == BB_STR {
+        return str_parse_float(bb_strs.get(i));
+    }
+    return bb_floats.get(i);
+}
+
+/// Any entry as text.
+pub fn bb_get_str(bb: i64, key: str, def: str) -> str {
+    val i: i64 = bb_find(bb, key);
+    if i < 0 {
+        return def;
+    }
+    val k: i64 = bb_kinds.get(i);
+    if k == BB_INT {
+        return int_to_str(bb_ints.get(i));
+    }
+    if k == BB_FLOAT {
+        return float_to_str(bb_floats.get(i));
+    }
+    if k == BB_BOOL {
+        if bb_ints.get(i) != 0 {
+            return "true";
+        }
+        return "false";
+    }
+    return bb_strs.get(i);
+}
+
+/// A bool entry (an int is true when non-zero, a str when "true" or "1").
+pub fn bb_get_bool(bb: i64, key: str, def: bool) -> bool {
+    val i: i64 = bb_find(bb, key);
+    if i < 0 {
+        return def;
+    }
+    val k: i64 = bb_kinds.get(i);
+    if k == BB_STR {
+        return bb_strs.get(i) == "true" || bb_strs.get(i) == "1";
+    }
+    if k == BB_FLOAT {
+        return bb_floats.get(i) != 0.0;
+    }
+    return bb_ints.get(i) != 0;
+}
+
+// ─── Leaves and nodes ───
+
+/// A registered leaf: its name, whether it is a condition, its tick and
+/// its halt function.
+pub struct BtLeaf {
+    pub name: str,
+    pub condition: bool,
+    pub tick: fn(i64) -> i64,
+    pub halt: fn(i64) -> i64,
+}
+
+fn bt_no_halt(bb: i64) -> i64 {
+    return 0;
+}
+
+pub fn bt_leaf_action(name: str, tick: fn(i64) -> i64) -> BtLeaf {
+    return BtLeaf { name: name, condition: false, tick: tick, halt: bt_no_halt };
+}
+
+pub fn bt_leaf_action_halt(name: str, tick: fn(i64) -> i64, halt: fn(i64) -> i64) -> BtLeaf {
+    return BtLeaf { name: name, condition: false, tick: tick, halt: halt };
+}
+
+pub fn bt_leaf_condition(name: str, tick: fn(i64) -> i64) -> BtLeaf {
+    return BtLeaf { name: name, condition: true, tick: tick, halt: bt_no_halt };
+}
+
+pub struct BtNode {
+    pub kind: i64,
+    pub name: str,
+    pub children: Vec<i64>,
+    pub port_names: Vec<str>,
+    pub port_vals: Vec<str>,
+    // index into the tree's leaves for leaf nodes
+    pub leaf: i64,
+    // success_count / num_cycles / num_attempts / msec
+    pub p1: i64,
+    // failure_count
+    pub p2: i64,
+    pub status: i64,
+    // running child (sequences), repetitions done (repeat, retry)
+    pub idx: i64,
+    pub start: f64,
+    pub child_done: Vec<i64>,
+}
+
+pub struct BTree {
+    pub nodes: Vec<BtNode>,
+    pub leaves: Vec<BtLeaf>,
+    pub root: i64,
+    pub bb: i64,
+    pub now: f64,
+    // "name:STATUS" of every leaf tick and "name:HALT" of every halt
+    pub log: Vec<str>,
+    pub ticks: i64,
+}
+
+pub fn bt_new(bb: i64) -> BTree {
+    return BTree { nodes: Vec::new(), leaves: Vec::new(), root: - 1, bb: bb, now: 0.0, log: Vec::new(), ticks: 0 };
+}
+
+/// Add a node; returns its id. The first node added is the root unless
+/// bt_set_root says otherwise.
+pub fn bt_add_node(t: & mut BTree, kind: i64, name: str, p1: i64, p2: i64) -> i64 {
+    t.nodes.push(BtNode { kind: kind, name: name, children: Vec::new(), port_names: Vec::new(), port_vals: Vec::new(), leaf: - 1, p1: p1, p2: p2, status: BT_IDLE, idx: 0, start: 0.0, child_done: Vec::new() });
+    val id: i64 = t.nodes.len() - 1;
+    if t.root < 0 {
+        t.root = id;
+    }
+    return id;
+}
+
+pub fn bt_set_root(t: & mut BTree, id: i64) {
+    t.root = id;
+}
+
+/// Make `child` the last child of `parent`.
+pub fn bt_add_child(t: & mut BTree, parent: i64, child: i64) {
+    var n: BtNode = t.nodes.get(parent);
+    n.children.push(child);
+    n.child_done.push(0);
+    t.nodes.set(parent, n);
+}
+
+/// Register a leaf with the tree (by name; a second one replaces the first).
+pub fn bt_register(t: & mut BTree, leaf: BtLeaf) -> i64 {
+    var i: i64 = 0;
+    while i < t.leaves.len() {
+        if t.leaves.get(i).name == leaf.name {
+            t.leaves.set(i, leaf);
+            return i;
+        }
+        i = i + 1;
+    }
+    t.leaves.push(leaf);
+    return t.leaves.len() - 1;
+}
+
+fn bt_find_leaf(t: & BTree, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < t.leaves.len() {
+        if t.leaves.get(i).name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// A leaf node running the registered leaf `name` (-1 if none has it).
+pub fn bt_add_leaf(t: & mut BTree, name: str) -> i64 {
+    val li: i64 = bt_find_leaf(t, name);
+    if li < 0 {
+        return - 1;
+    }
+    var kind: i64 = BTK_ACTION;
+    if t.leaves.get(li).condition {
+        kind = BTK_CONDITION;
+    }
+    val id: i64 = bt_add_node(t, kind, name, 0, 0);
+    var n: BtNode = t.nodes.get(id);
+    n.leaf = li;
+    t.nodes.set(id, n);
+    return id;
+}
+
+/// Give a node a port (attribute).
+pub fn bt_set_port(t: & mut BTree, id: i64, name: str, value: str) {
+    var n: BtNode = t.nodes.get(id);
+    n.port_names.push(name);
+    n.port_vals.push(value);
+    t.nodes.set(id, n);
+}
+
+// ─── Ports (for leaves, valid during their tick) ───
+
+var bt_cur_bb: i64 = 0;
+var bt_cur_names: Vec<str> = Vec::new();
+var bt_cur_vals: Vec<str> = Vec::new();
+var bt_cur_now: f64 = 0.0;
+
+fn bt_cur_port(name: str) -> i64 {
+    var i: i64 = 0;
+    while i < bt_cur_names.len() {
+        if bt_cur_names.get(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// "{key}" -> "key", else ""
+fn bt_ref_key(v: str) -> str {
+    val n: i64 = str_len(v);
+    if n >= 3 && str_byte_at(v, 0) == 123 && str_byte_at(v, n - 1) == 125 {
+        return str_slice(v, 1, n - 1);
+    }
+    return "";
+}
+
+/// The current clock (ms) during a tick.
+pub fn bt_now() -> f64 {
+    return bt_cur_now;
+}
+
+pub fn bt_port_has(name: str) -> bool {
+    return bt_cur_port(name) >= 0;
+}
+
+/// A port as text: the blackboard entry for "{key}", the literal otherwise,
+/// `def` when the node has no such port.
+pub fn bt_port_str(name: str, def: str) -> str {
+    val i: i64 = bt_cur_port(name);
+    if i < 0 {
+        return def;
+    }
+    val v: str = bt_cur_vals.get(i);
+    val k: str = bt_ref_key(v);
+    if str_len(k) > 0 {
+        return bb_get_str(bt_cur_bb, k, def);
+    }
+    return v;
+}
+
+pub fn bt_port_int(name: str, def: i64) -> i64 {
+    val i: i64 = bt_cur_port(name);
+    if i < 0 {
+        return def;
+    }
+    val k: str = bt_ref_key(bt_cur_vals.get(i));
+    if str_len(k) > 0 {
+        return bb_get_int(bt_cur_bb, k, def);
+    }
+    return str_parse_int(bt_cur_vals.get(i));
+}
+
+pub fn bt_port_float(name: str, def: f64) -> f64 {
+    val i: i64 = bt_cur_port(name);
+    if i < 0 {
+        return def;
+    }
+    val k: str = bt_ref_key(bt_cur_vals.get(i));
+    if str_len(k) > 0 {
+        return bb_get_float(bt_cur_bb, k, def);
+    }
+    return str_parse_float(bt_cur_vals.get(i));
+}
+
+/// The blackboard key an output port names ("" when it is not "{key}").
+pub fn bt_port_key(name: str) -> str {
+    val i: i64 = bt_cur_port(name);
+    if i < 0 {
+        return "";
+    }
+    return bt_ref_key(bt_cur_vals.get(i));
+}
+
+/// Write an output port; false when the port is not "{key}".
+pub fn bt_port_set_int(name: str, v: i64) -> bool {
+    val k: str = bt_port_key(name);
+    if str_len(k) == 0 {
+        return false;
+    }
+    bb_set_int(bt_cur_bb, k, v);
+    return true;
+}
+
+pub fn bt_port_set_float(name: str, v: f64) -> bool {
+    val k: str = bt_port_key(name);
+    if str_len(k) == 0 {
+        return false;
+    }
+    bb_set_float(bt_cur_bb, k, v);
+    return true;
+}
+
+pub fn bt_port_set_str(name: str, v: str) -> bool {
+    val k: str = bt_port_key(name);
+    if str_len(k) == 0 {
+        return false;
+    }
+    bb_set_str(bt_cur_bb, k, v);
+    return true;
+}
+
+// ─── Ticking ───
+
+fn bt_set_status(t: & mut BTree, id: i64, s: i64) {
+    var n: BtNode = t.nodes.get(id);
+    n.status = s;
+    t.nodes.set(id, n);
+}
+
+fn bt_enter_leaf(t: & BTree, n: & BtNode) {
+    bt_cur_bb = t.bb;
+    bt_cur_names = n.port_names;
+    bt_cur_vals = n.port_vals;
+    bt_cur_now = t.now;
+}
+
+/// Halt a node and everything under it: running actions get their halt
+/// function, and all state is reset to idle.
+pub fn bt_halt(t: & mut BTree, id: i64) {
+    var n: BtNode = t.nodes.get(id);
+    var i: i64 = 0;
+    while i < n.children.len() {
+        bt_halt(t, n.children.get(i));
+        i = i + 1;
+    }
+    n = t.nodes.get(id);
+    if n.kind == BTK_ACTION && n.status == BT_RUNNING {
+        bt_enter_leaf(t, &n);
+        val leaf: BtLeaf = t.leaves.get(n.leaf);
+        val h = leaf.halt;
+        h(t.bb);
+        t.log.push(n.name + ":HALT");
+    }
+    n.status = BT_IDLE;
+    n.idx = 0;
+    i = 0;
+    while i < n.child_done.len() {
+        n.child_done.set(i, 0);
+        i = i + 1;
+    }
+    t.nodes.set(id, n);
+}
+
+fn bt_halt_children_from(t: & mut BTree, id: i64, from: i64) {
+    val n: BtNode = t.nodes.get(id);
+    var i: i64 = from;
+    while i < n.children.len() {
+        bt_halt(t, n.children.get(i));
+        i = i + 1;
+    }
+}
+
+fn bt_set_idx(t: & mut BTree, id: i64, idx: i64) {
+    var n: BtNode = t.nodes.get(id);
+    n.idx = idx;
+    t.nodes.set(id, n);
+}
+
+/// Tick the whole tree at time now_ms; the root's status.
+pub fn bt_tick(t: & mut BTree, now_ms: f64) -> i64 {
+    t.now = now_ms;
+    t.ticks = t.ticks + 1;
+    if t.root < 0 {
+        return BT_FAILURE;
+    }
+    // every node resets itself when it finishes (SequenceWithMemory keeps
+    // its place after a failure), so the next tick starts over
+    return bt_tick_node(t, t.root);
+}
+
+/// Tick one node (and, through it, its children).
+pub fn bt_tick_node(t: & mut BTree, id: i64) -> i64 {
+    val n: BtNode = t.nodes.get(id);
+    val k: i64 = n.kind;
+    var s: i64 = BT_FAILURE;
+    if k == BTK_ACTION || k == BTK_CONDITION {
+        bt_enter_leaf(t, &n);
+        val leaf: BtLeaf = t.leaves.get(n.leaf);
+        val f = leaf.tick;
+        s = f(t.bb);
+        if k == BTK_CONDITION && s == BT_RUNNING {
+            s = BT_FAILURE;
+        }
+        t.log.push(n.name + ":" + bt_status_str(s));
+    } else if k == BTK_ALWAYS_SUCCESS {
+        s = BT_SUCCESS;
+    } else if k == BTK_ALWAYS_FAILURE {
+        s = BT_FAILURE;
+    } else if k == BTK_SEQUENCE || k == BTK_SEQUENCE_MEM || k == BTK_FALLBACK {
+        s = bt_tick_seq(t, id, k);
+    } else if k == BTK_REACTIVE_SEQUENCE || k == BTK_REACTIVE_FALLBACK {
+        s = bt_tick_reactive(t, id, k == BTK_REACTIVE_SEQUENCE);
+    } else if k == BTK_PARALLEL {
+        s = bt_tick_parallel(t, id);
+    } else {
+        s = bt_tick_decorator(t, id);
+    }
+    bt_set_status(t, id, s);
+    return s;
+}
+
+// Sequence / SequenceWithMemory / Fallback: resume at the running child.
+fn bt_tick_seq(t: & mut BTree, id: i64, k: i64) -> i64 {
+    val fallback: bool = k == BTK_FALLBACK;
+    // the status that moves on to the next child, and the one that ends
+    var go_on: i64 = BT_SUCCESS;
+    if fallback {
+        go_on = BT_FAILURE;
+    }
+    val n: BtNode = t.nodes.get(id);
+    var i: i64 = n.idx;
+    while i < n.children.len() {
+        val c: i64 = n.children.get(i);
+        val cs: i64 = bt_tick_node(t, c);
+        if cs == BT_RUNNING {
+            bt_set_idx(t, id, i);
+            return BT_RUNNING;
+        }
+        if cs != go_on {
+            if k == BTK_SEQUENCE_MEM {
+                // keep the index: the next tick retries this child
+                bt_halt_children_from(t, id, 0);
+                bt_set_idx(t, id, i);
+            } else {
+                bt_halt_children_from(t, id, 0);
+                bt_set_idx(t, id, 0);
+            }
+            return cs;
+        }
+        i = i + 1;
+    }
+    bt_halt_children_from(t, id, 0);
+    bt_set_idx(t, id, 0);
+    return go_on;
+}
+
+// ReactiveSequence / ReactiveFallback: every tick starts at the first child;
+// a child that answers halts the running ones after it.
+fn bt_tick_reactive(t: & mut BTree, id: i64, seq: bool) -> i64 {
+    var go_on: i64 = BT_FAILURE;
+    if seq {
+        go_on = BT_SUCCESS;
+    }
+    val n: BtNode = t.nodes.get(id);
+    var i: i64 = 0;
+    while i < n.children.len() {
+        val cs: i64 = bt_tick_node(t, n.children.get(i));
+        if cs == BT_RUNNING {
+            bt_halt_children_from(t, id, i + 1);
+            return BT_RUNNING;
+        }
+        if cs != go_on {
+            bt_halt_children_from(t, id, 0);
+            return cs;
+        }
+        i = i + 1;
+    }
+    bt_halt_children_from(t, id, 0);
+    return go_on;
+}
+
+fn bt_tick_parallel(t: & mut BTree, id: i64) -> i64 {
+    val n: BtNode = t.nodes.get(id);
+    val cnt: i64 = n.children.len();
+    var need_s: i64 = n.p1;
+    if need_s < 0 {
+        need_s = cnt;
+    }
+    var need_f: i64 = n.p2;
+    if need_f < 0 {
+        need_f = cnt;
+    }
+    var done: Vec<i64> = n.child_done;
+    var succ: i64 = 0;
+    var fail: i64 = 0;
+    var i: i64 = 0;
+    while i < cnt {
+        if done.get(i) == 1 {
+            succ = succ + 1;
+        } else if done.get(i) == 2 {
+            fail = fail + 1;
+        }
+        i = i + 1;
+    }
+    // as BehaviorTree.CPP: tick the unfinished children in order and stop
+    // as soon as a threshold is reached (later children are halted)
+    i = 0;
+    while i < cnt {
+        if done.get(i) == 0 {
+            val cs: i64 = bt_tick_node(t, n.children.get(i));
+            if cs == BT_SUCCESS {
+                done.set(i, 1);
+                succ = succ + 1;
+            } else if cs == BT_FAILURE {
+                done.set(i, 2);
+                fail = fail + 1;
+            }
+            var nn: BtNode = t.nodes.get(id);
+            nn.child_done = done;
+            t.nodes.set(id, nn);
+        }
+        if succ >= need_s {
+            bt_halt_children_from(t, id, 0);
+            return BT_SUCCESS;
+        }
+        if fail >= need_f || cnt - fail < need_s {
+            bt_halt_children_from(t, id, 0);
+            return BT_FAILURE;
+        }
+        i = i + 1;
+    }
+    return BT_RUNNING;
+}
+
+fn bt_tick_decorator(t: & mut BTree, id: i64) -> i64 {
+    val n: BtNode = t.nodes.get(id);
+    if n.children.len() != 1 {
+        return BT_FAILURE;
+    }
+    val c: i64 = n.children.get(0);
+    val k: i64 = n.kind;
+    if k == BTK_INVERTER || k == BTK_FORCE_SUCCESS || k == BTK_FORCE_FAILURE {
+        val cs: i64 = bt_tick_node(t, c);
+        if cs == BT_RUNNING {
+            return BT_RUNNING;
+        }
+        bt_halt(t, c);
+        if k == BTK_FORCE_SUCCESS {
+            return BT_SUCCESS;
+        }
+        if k == BTK_FORCE_FAILURE {
+            return BT_FAILURE;
+        }
+        if cs == BT_SUCCESS {
+            return BT_FAILURE;
+        }
+        return BT_SUCCESS;
+    }
+    if k == BTK_REPEAT || k == BTK_RETRY {
+        // repeat: until num_cycles successes (a failure ends it);
+        // retry: until a success, at most num_attempts tries
+        val repeat: bool = k == BTK_REPEAT;
+        var count: i64 = n.idx;
+        while n.p1 < 0 || count < n.p1 {
+            val cs: i64 = bt_tick_node(t, c);
+            if cs == BT_RUNNING {
+                bt_set_idx(t, id, count);
+                return BT_RUNNING;
+            }
+            bt_halt(t, c);
+            if repeat && cs == BT_FAILURE {
+                bt_set_idx(t, id, 0);
+                return BT_FAILURE;
+            }
+            if !repeat && cs == BT_SUCCESS {
+                bt_set_idx(t, id, 0);
+                return BT_SUCCESS;
+            }
+            count = count + 1;
+        }
+        bt_set_idx(t, id, 0);
+        if repeat {
+            return BT_SUCCESS;
+        }
+        return BT_FAILURE;
+    }
+    if k == BTK_TIMEOUT {
+        var nn: BtNode = t.nodes.get(id);
+        if nn.status != BT_RUNNING {
+            nn.start = t.now;
+            t.nodes.set(id, nn);
+        }
+        if t.now - nn.start >= (n.p1 as f64) {
+            bt_halt(t, c);
+            return BT_FAILURE;
+        }
+        val cs: i64 = bt_tick_node(t, c);
+        if cs != BT_RUNNING {
+            bt_halt(t, c);
+        }
+        return cs;
+    }
+    return BT_FAILURE;
+}
+
+/// A text picture of the tree: one node per line, indented, with its
+/// last status.
+pub fn bt_dump(t: & BTree) -> str {
+    return bt_dump_node(t, t.root, 0);
+}
+
+fn bt_dump_node(t: & BTree, id: i64, depth: i64) -> str {
+    val n: BtNode = t.nodes.get(id);
+    var s: str = str_repeat("  ", depth) + n.name + " [" + bt_status_str(n.status) + "]\n";
+    var i: i64 = 0;
+    while i < n.children.len() {
+        s = s + bt_dump_node(t, n.children.get(i), depth + 1);
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── XML (BehaviorTree.CPP format) ───
+
+pub struct BtLoad {
+    pub ok: bool,
+    pub error: str,
+    pub tree: BTree,
+}
+
+fn bt_kind_of(tag: str) -> i64 {
+    if tag == "Sequence" { return BTK_SEQUENCE; }
+    if tag == "SequenceWithMemory" { return BTK_SEQUENCE_MEM; }
+    if tag == "ReactiveSequence" { return BTK_REACTIVE_SEQUENCE; }
+    if tag == "Fallback" { return BTK_FALLBACK; }
+    if tag == "ReactiveFallback" { return BTK_REACTIVE_FALLBACK; }
+    if tag == "Parallel" { return BTK_PARALLEL; }
+    if tag == "Inverter" { return BTK_INVERTER; }
+    if tag == "ForceSuccess" { return BTK_FORCE_SUCCESS; }
+    if tag == "ForceFailure" { return BTK_FORCE_FAILURE; }
+    if tag == "Repeat" { return BTK_REPEAT; }
+    if tag == "RetryUntilSuccessful" { return BTK_RETRY; }
+    if tag == "Timeout" { return BTK_TIMEOUT; }
+    if tag == "AlwaysSuccess" { return BTK_ALWAYS_SUCCESS; }
+    if tag == "AlwaysFailure" { return BTK_ALWAYS_FAILURE; }
+    return 0;
+}
+
+fn bt_int_attr(x: XmlNode, name: str, def: i64) -> i64 {
+    val v: str = xml_attr(x, name);
+    if str_len(v) == 0 {
+        return def;
+    }
+    return str_parse_int(v);
+}
+
+/// Build a tree from BehaviorTree.CPP XML with the given leaves.
+pub fn bt_from_xml(text: str, leaves: & Vec<BtLeaf>, bb: i64) -> BtLoad {
+    var t: BTree = bt_new(bb);
+    var i: i64 = 0;
+    while i < leaves.len() {
+        bt_register(&mut t, leaves.get(i));
+        i = i + 1;
+    }
+    val doc: XmlDoc = xml_load(text);
+    if !doc.ok {
+        return BtLoad { ok: false, error: "xml: " + doc.error, tree: t };
+    }
+    val trees: Vec<XmlNode> = xml_children(doc.root, "BehaviorTree");
+    if trees.len() == 0 {
+        return BtLoad { ok: false, error: "no <BehaviorTree>", tree: t };
+    }
+    var main: str = xml_attr(doc.root, "main_tree_to_execute");
+    if str_len(main) == 0 {
+        main = xml_attr(trees.get(0), "ID");
+    }
+    var err: Vec<str> = Vec::new();
+    val root: i64 = bt_build_tree(&mut t, &trees, main, &mut err, 0);
+    if err.len() > 0 {
+        return BtLoad { ok: false, error: err.get(0), tree: t };
+    }
+    t.root = root;
+    return BtLoad { ok: true, error: "", tree: t };
+}
+
+fn bt_build_tree(t: & mut BTree, trees: & Vec<XmlNode>, id: str, err: & mut Vec<str>, depth: i64) -> i64 {
+    if depth > 32 {
+        err.push("subtrees nested too deep (recursive SubTree " + id + "?)");
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < trees.len() {
+        if xml_attr(trees.get(i), "ID") == id {
+            val bt: XmlNode = trees.get(i);
+            if bt.children.len() != 1 {
+                err.push("BehaviorTree " + id + " must have exactly one child");
+                return - 1;
+            }
+            return bt_build_node(t, trees, bt.children.get(0), err, depth);
+        }
+        i = i + 1;
+    }
+    err.push("no BehaviorTree with ID " + id);
+    return - 1;
+}
+
+fn bt_build_node(t: & mut BTree, trees: & Vec<XmlNode>, x: XmlNode, err: & mut Vec<str>, depth: i64) -> i64 {
+    val tag: str = x.tag;
+    if tag == "SubTree" {
+        return bt_build_tree(t, trees, xml_attr(x, "ID"), err, depth + 1);
+    }
+    val k: i64 = bt_kind_of(tag);
+    var label: str = xml_attr(x, "name");
+    if k == 0 {
+        // a leaf: <Action ID="x">, <Condition ID="x"> or <x>
+        var lname: str = tag;
+        if tag == "Action" || tag == "Condition" {
+            lname = xml_attr(x, "ID");
+        }
+        val id: i64 = bt_add_leaf(t, lname);
+        if id < 0 {
+            err.push("unknown node <" + tag + "> " + lname);
+            return - 1;
+        }
+        var a: i64 = 0;
+        while a < x.attr_names.len() {
+            val an: str = x.attr_names.get(a);
+            if an != "ID" && an != "name" {
+                bt_set_port(t, id, an, x.attr_vals.get(a));
+            }
+            a = a + 1;
+        }
+        if str_len(label) > 0 {
+            var nn: BtNode = t.nodes.get(id);
+            nn.name = label;
+            t.nodes.set(id, nn);
+        }
+        return id;
+    }
+    if str_len(label) == 0 {
+        label = tag;
+    }
+    var p1: i64 = 0;
+    var p2: i64 = 0;
+    if k == BTK_PARALLEL {
+        p1 = bt_int_attr(x, "success_count", - 1);
+        p2 = bt_int_attr(x, "failure_count", 1);
+    } else if k == BTK_REPEAT {
+        p1 = bt_int_attr(x, "num_cycles", 1);
+    } else if k == BTK_RETRY {
+        p1 = bt_int_attr(x, "num_attempts", 1);
+    } else if k == BTK_TIMEOUT {
+        p1 = bt_int_attr(x, "msec", 0);
+    }
+    val id: i64 = bt_add_node(t, k, label, p1, p2);
+    var c: i64 = 0;
+    while c < x.children.len() {
+        val cid: i64 = bt_build_node(t, trees, x.children.get(c), err, depth);
+        if cid < 0 {
+            return - 1;
+        }
+        bt_add_child(t, id, cid);
+        c = c + 1;
+    }
+    if k >= BTK_INVERTER && k <= BTK_TIMEOUT && x.children.len() != 1 {
+        err.push("decorator <" + tag + "> needs exactly one child");
+        return - 1;
+    }
+    return id;
+}

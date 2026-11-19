@@ -1,0 +1,131 @@
+// stdlib/fuzz: a coverage-guided run over a toy nested-list parser with a planted bug (a \x escape inside a string at nesting depth 4 or more "reads past the buffer"); the fuzzer finds it from the seed "[1]" with a small dictionary, ddmin shrinks the crash, the corpus is minimized; mutators and the RNG are deterministic.
+// Expected output:
+// rng same: true first 16294208416658607535
+// bitflip: hel,o
+// insert: 6 delete: 4
+// dict: heXYZ
+// splice: helrld
+// interesting 2-byte values: 18
+// crashed: true code: 3
+// found within 20000 execs: true
+// edges > 10: true, corpus grew: true
+// minimized: [[[["\x (7 bytes, from 98)
+// still crashes: true
+// corpus minimize keeps every edge: true
+// deterministic: true
+// ddmin: [[[["\x
+// simplify: [[[["0\x
+// no crash stays: [1,2]
+use fuzz;
+use vec;
+use string;
+
+// The code under test: a parser of [1,"a",[2]] lists. It reports an edge
+// per (depth, token kind) and crash code 3 where real code would index past
+// its buffer: a \x escape at depth >= 4 expects two hex digits it never
+// checks for.
+fn toy(data: Vec<i64>) -> Vec<i64> {
+    var ex: Vec<i64> = Vec::new();
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < data.len() {
+        val c: i64 = data.get(i);
+        var d: i64 = depth;
+        if d > 9 { d = 9; }
+        if c == 91 {
+            depth = depth + 1;
+            ex.push(d * 100 + 1);
+        } else if c == 93 {
+            if depth == 0 {
+                ex.push(2);
+                return ex;
+            }
+            depth = depth - 1;
+            ex.push(d * 100 + 3);
+        } else if c >= 48 && c <= 57 {
+            ex.push(d * 100 + 4);
+        } else if c == 44 {
+            ex.push(d * 100 + 5);
+        } else if c == 34 {
+            ex.push(d * 100 + 6);
+            i = i + 1;
+            while i < data.len() && data.get(i) != 34 {
+                if data.get(i) == 92 {
+                    ex.push(d * 100 + 7);
+                    if i + 1 < data.len() && data.get(i + 1) == 120 {
+                        ex.push(d * 100 + 8);
+                        if depth >= 4 {
+                            ex.push(- 3);  // crash code 3: index out of bounds
+                            return ex;
+                        }
+                    }
+                    i = i + 1;
+                }
+                i = i + 1;
+            }
+        } else {
+            ex.push(d * 100 + 9);
+            return ex;
+        }
+        i = i + 1;
+    }
+    return ex;
+}
+
+fn show(b: Vec<i64>) -> str { return str_from_bytes(b); }
+
+fn main() -> i64 {
+    // the generator repeats for a seed
+    var r1: FuzzRng = fuzz_rng_new(42);
+    var r2: FuzzRng = fuzz_rng_new(42);
+    val a: u64 = fuzz_rng_next(& mut r1);
+    val b: u64 = fuzz_rng_next(& mut r2);
+    println("rng same: " + bool_to_str(a == b) + " first " + u64_to_str(fuzz_rng_next(& mut fuzz_rng_new(0))));
+    var r: FuzzRng = fuzz_rng_new(7);
+    val base: Vec<i64> = str_bytes("hello");
+    println("bitflip: " + show(fuzz_mut_bitflip(& mut r, & base)));
+    println("insert: " + int_to_str(fuzz_mut_insert(& mut r, & base).len()) + " delete: " + int_to_str(fuzz_mut_delete(& mut r, & base).len()));
+    var dict: Vec<Vec<i64>> = Vec::new();
+    dict.push(str_bytes("XYZ"));
+    println("dict: " + show(fuzz_mut_dict(& mut r, & base, & dict)));
+    println("splice: " + show(fuzz_mut_splice(& mut r, & base, & str_bytes("world"))));
+    println("interesting 2-byte values: " + int_to_str(fuzz_interesting(2).len()));
+
+    var f: Fuzzer = fuzz_new(1234);
+    fuzz_add_seed(& mut f, str_bytes("[1]"));
+    fuzz_add_dict(& mut f, str_bytes("["));
+    fuzz_add_dict(& mut f, str_bytes("]"));
+    fuzz_add_dict(& mut f, str_bytes("\""));
+    fuzz_add_dict(& mut f, str_bytes("\\x"));
+    fuzz_add_dict(& mut f, str_bytes(","));
+    val rep: FuzzReport = fuzz_run(& mut f, toy, 20000);
+    println("crashed: " + bool_to_str(rep.crashed) + " code: " + int_to_str(rep.crash_code));
+    println("found within 20000 execs: " + bool_to_str(rep.crash_exec > 0 && rep.crash_exec <= 20000));
+    println("edges > 10: " + bool_to_str(rep.edges > 10) + ", corpus grew: " + bool_to_str(rep.corpus > 1));
+    val small: Vec<i64> = fuzz_minimize(toy, rep.crash_input);
+    println("minimized: " + show(small) + " (" + int_to_str(small.len()) + " bytes, from " + int_to_str(rep.crash_input.len()) + ")");
+    val again: Vec<i64> = toy(small);
+    println("still crashes: " + bool_to_str(fuzz_crash_code(& again) == 3));
+    val before: i64 = f.corpus.len();
+    val dropped: i64 = fuzz_corpus_minimize(& mut f);
+    println("corpus minimize keeps every edge: " + bool_to_str(f.corpus.len() + dropped == before && f.corpus.len() >= 1));
+
+    // the same seed gives the same run
+    var g: Fuzzer = fuzz_new(1234);
+    fuzz_add_seed(& mut g, str_bytes("[1]"));
+    fuzz_add_dict(& mut g, str_bytes("["));
+    fuzz_add_dict(& mut g, str_bytes("]"));
+    fuzz_add_dict(& mut g, str_bytes("\""));
+    fuzz_add_dict(& mut g, str_bytes("\\x"));
+    fuzz_add_dict(& mut g, str_bytes(","));
+    val rep2: FuzzReport = fuzz_run(& mut g, toy, 20000);
+    println("deterministic: " + bool_to_str(rep2.crash_exec == rep.crash_exec && show(rep2.crash_input) == show(rep.crash_input)));
+
+    // ddmin on a hand-made crash
+    val big: Vec<i64> = str_bytes("[7,[[,9,[8,\"ab\\x41cd\",3]]],5]");
+    val m: Vec<i64> = fuzz_minimize(toy, big);
+    println("ddmin: " + show(m));
+    println("simplify: " + show(fuzz_simplify(toy, str_bytes("[[[[\"q\\x"), 48)));
+    println("no crash stays: " + show(fuzz_minimize(toy, str_bytes("[1,2]"))));
+    return 0;
+}

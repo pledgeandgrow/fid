@@ -1,0 +1,1073 @@
+// Fides CBOR (RFC 8949): Concise Binary Object Representation
+//
+// What is here (all pure computation, no platform seam):
+//   - an encoder that appends items to a Vec<i64> of bytes: unsigned and
+//     negative integers (the full 64-bit ranges), byte and text strings,
+//     arrays and maps (definite and indefinite length), tags, simple values
+//     (false, true, null, undefined, simple(n)) and floats. cbor_put_float
+//     uses the preferred serialization of RFC 8949 4.1/4.2: the shortest of
+//     half, single and double precision that keeps the value exactly
+//     (half and single conversions are done on the bits, no f32 needed).
+//   - a decoder into a CborDoc: a flat tree of nodes (like json's JsonDoc),
+//     with accessors, that checks well-formedness (RFC 8949 Appendix C):
+//     reserved additional information 28..30, indefinite length on major
+//     types 0, 1, 6, a stray break, chunks of another type inside an
+//     indefinite string, two-byte simple values below 32, truncation, and
+//     nesting deeper than CBOR_MAX_DEPTH.
+//   - cbor_encode re-encodes a decoded node exactly (keeping indefinite
+//     lengths and float widths), and cbor_diag prints diagnostic notation
+//     (RFC 8949 section 8): 1(1363896240), h'0102', (_ h'01', h'02'),
+//     [_ 1, 2], {"a": 1}, simple(16), "ü", Infinity, NaN.
+//
+// Bytes are Vec<i64>, one value 0..255 each (as protobuf and hpack).
+// Integers: an unsigned value at or above 2^63 is kept as its 64 bits in an
+// i64 (cbor_uint gives those bits; cbor_int_fits says whether cbor_int is
+// exact). A negative integer -1-n keeps n the same way.
+//
+// Floats in diagnostics: integral values below 2^53 print as "N.0";
+// others print through float_to_str, which may differ in its last digits
+// from the shortest form the RFC shows. The bits are always exact.
+//
+// Usage:
+//   use cbor;
+//   var out: Vec<i64> = Vec::new();
+//   cbor_put_map_head(&mut out, 1);
+//   cbor_put_text(&mut out, "temp");
+//   cbor_put_float(&mut out, 21.5);
+//   val doc: CborDoc = cbor_decode(out);
+//   if doc.ok { println(cbor_diag(&doc, doc.root)); }   // {"temp": 21.5}
+
+module cbor;
+ use vec; use string;
+
+// Node kinds (major types; floats and simple values split out of major 7)
+pub const CBOR_UINT: i64 = 0;
+pub const CBOR_NEGINT: i64 = 1;
+pub const CBOR_BYTES: i64 = 2;
+pub const CBOR_TEXT: i64 = 3;
+pub const CBOR_ARRAY: i64 = 4;
+pub const CBOR_MAP: i64 = 5;
+pub const CBOR_TAG: i64 = 6;
+pub const CBOR_SIMPLE: i64 = 7;
+pub const CBOR_FLOAT: i64 = 8;
+
+// Simple values (major type 7)
+pub const CBOR_FALSE: i64 = 20;
+pub const CBOR_TRUE: i64 = 21;
+pub const CBOR_NULL: i64 = 22;
+pub const CBOR_UNDEFINED: i64 = 23;
+
+/// Deepest nesting the decoder accepts.
+pub const CBOR_MAX_DEPTH: i64 = 64;
+
+// ─── Encoding ─────────────────────────────────────────────────────────────
+
+/// Append a head: major type `major` (0..7) with argument `n`, taken as
+/// the 64 bits of an unsigned value, in the shortest form.
+@wrapping pub fn cbor_put_head(out: & mut Vec<i64>, major: i64, n: i64) {
+    val mt: i64 = major << 5;
+    val u: u64 = n as u64;
+    if u < 24 {
+        out.push(mt | n);
+    } else if u < 256 {
+        out.push(mt | 24);
+        out.push(n);
+    } else if u < 65536 {
+        out.push(mt | 25);
+        cb_put_be(out, n, 2);
+    } else if u < 4294967296 {
+        out.push(mt | 26);
+        cb_put_be(out, n, 4);
+    } else {
+        out.push(mt | 27);
+        cb_put_be(out, n, 8);
+    }
+}
+
+@wrapping fn cb_put_be(out: & mut Vec<i64>, n: i64, width: i64) {
+    var i: i64 = width - 1;
+    while i >= 0 {
+        out.push((((n as u64) >> ((i * 8) as u64)) & 255) as i64);
+        i = i - 1;
+    }
+}
+
+/// An unsigned integer; `n` is read as 64 unsigned bits (so -1 is
+/// 18446744073709551615).
+pub fn cbor_put_uint(out: & mut Vec<i64>, n: i64) {
+    cbor_put_head(out, 0, n);
+}
+
+/// A signed integer: major type 0 for v >= 0, 1 (as -1-n) below.
+pub fn cbor_put_int(out: & mut Vec<i64>, v: i64) {
+    if v >= 0 {
+        cbor_put_head(out, 0, v);
+    } else {
+        cbor_put_head(out, 1, - 1 - v);
+    }
+}
+
+/// A negative integer given by n: the value is -1-n (n as 64 unsigned
+/// bits, so every value down to -2^64 can be written).
+pub fn cbor_put_negint_raw(out: & mut Vec<i64>, n: i64) {
+    cbor_put_head(out, 1, n);
+}
+
+pub fn cbor_put_bytes(out: & mut Vec<i64>, data: Vec<i64>) {
+    cbor_put_head(out, 2, data.len());
+    var i: i64 = 0;
+    while i < data.len() {
+        out.push(data.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+/// A text string (the bytes of `s`, which should be UTF-8).
+pub fn cbor_put_text(out: & mut Vec<i64>, s: str) {
+    val n: i64 = str_len(s);
+    cbor_put_head(out, 3, n);
+    var i: i64 = 0;
+    while i < n {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+/// The head of an array of `n` items (the items follow).
+pub fn cbor_put_array_head(out: & mut Vec<i64>, n: i64) {
+    cbor_put_head(out, 4, n);
+}
+
+/// The head of a map of `n` pairs (key, value, key, value ... follow).
+pub fn cbor_put_map_head(out: & mut Vec<i64>, n: i64) {
+    cbor_put_head(out, 5, n);
+}
+
+/// A tag; the tagged item follows.
+pub fn cbor_put_tag(out: & mut Vec<i64>, tag: i64) {
+    cbor_put_head(out, 6, tag);
+}
+
+/// Start an indefinite-length item of major type 2, 3, 4 or 5; end it
+/// with cbor_put_break.
+pub fn cbor_put_indef(out: & mut Vec<i64>, major: i64) {
+    out.push((major << 5) | 31);
+}
+
+pub fn cbor_put_break(out: & mut Vec<i64>) {
+    out.push(255);
+}
+
+pub fn cbor_put_bool(out: & mut Vec<i64>, b: bool) {
+    if b {
+        out.push(0xf5);
+    } else {
+        out.push(0xf4);
+    }
+}
+
+pub fn cbor_put_null(out: & mut Vec<i64>) {
+    out.push(0xf6);
+}
+
+pub fn cbor_put_undefined(out: & mut Vec<i64>) {
+    out.push(0xf7);
+}
+
+/// simple(n), n in 0..19 or 32..255 (20..23 are false/true/null/undefined,
+/// 24..31 are reserved).
+pub fn cbor_put_simple(out: & mut Vec<i64>, n: i64) {
+    if n < 24 {
+        out.push(0xe0 | n);
+    } else {
+        out.push(0xf8);
+        out.push(n & 255);
+    }
+}
+
+/// A float in its preferred serialization: half precision if that keeps
+/// the value, else single, else double. Every NaN is written as f97e00.
+pub fn cbor_put_float(out: & mut Vec<i64>, x: f64) {
+    val h: i64 = cbor_f64_to_half(x);
+    if h >= 0 {
+        out.push(0xf9);
+        cb_put_be(out, h, 2);
+        return;
+    }
+    val s: i64 = cbor_f64_to_single(x);
+    if s >= 0 {
+        out.push(0xfa);
+        cb_put_be(out, s, 4);
+        return;
+    }
+    cbor_put_double(out, x);
+}
+
+/// A float always as 8 bytes (major 7, additional information 27).
+pub fn cbor_put_double(out: & mut Vec<i64>, x: f64) {
+    out.push(0xfb);
+    cb_put_be(out, p_f64_to_bits(x), 8);
+}
+
+// ─── Float conversions (on the bits) ─────────────────────────────────────
+
+/// 2^e as an f64, exactly (e in -1074..1023).
+pub fn cbor_pow2(e: i64) -> f64 {
+    var r: f64 = 1.0;
+    var i: i64 = 0;
+    if e >= 0 {
+        while i < e {
+            r = r * 2.0;
+            i = i + 1;
+        }
+    } else {
+        while i < 0 - e {
+            r = r * 0.5;
+            i = i + 1;
+        }
+    }
+    return r;
+}
+
+/// The value of a half-precision float (16 bits).
+pub fn cbor_half_to_f64(h: i64) -> f64 {
+    val sign: i64 = (h >> 15) & 1;
+    val e: i64 = (h >> 10) & 31;
+    val m: i64 = h & 1023;
+    var v: f64 = 0.0;
+    if e == 0 {
+        v = (m as f64) * cbor_pow2(- 24);
+    } else if e == 31 {
+        if m == 0 {
+            v = 1.0 / 0.0;
+        } else {
+            v = 0.0 / 0.0;
+        }
+    } else {
+        v = ((m + 1024) as f64) * cbor_pow2(e - 25);
+    }
+    if sign == 1 {
+        return cbor_negate(v);
+    }
+    return v;
+}
+
+/// The value of a single-precision float (32 bits).
+pub fn cbor_single_to_f64(s: i64) -> f64 {
+    val sign: i64 = (s >> 31) & 1;
+    val e: i64 = (s >> 23) & 255;
+    val m: i64 = s & 8388607;
+    var v: f64 = 0.0;
+    if e == 0 {
+        v = (m as f64) * cbor_pow2(- 149);
+    } else if e == 255 {
+        if m == 0 {
+            v = 1.0 / 0.0;
+        } else {
+            v = 0.0 / 0.0;
+        }
+    } else {
+        v = ((m + 8388608) as f64) * cbor_pow2(e - 150);
+    }
+    if sign == 1 {
+        return cbor_negate(v);
+    }
+    return v;
+}
+
+/// -x by flipping the sign bit (so 0.0 gives -0.0).
+@wrapping pub fn cbor_negate(x: f64) -> f64 {
+    return p_f64_from_bits(p_f64_to_bits(x) ^ (0 - 9223372036854775807 - 1));
+}
+
+// The sign bit of an f64's bits.
+@wrapping fn cb_sign(bits: i64) -> i64 {
+    return ((bits as u64) >> (63 as u64)) as i64;
+}
+
+/// The 16 bits of x as a half-precision float, or -1 when a half cannot
+/// hold x exactly. NaN gives 0x7e00.
+@wrapping pub fn cbor_f64_to_half(x: f64) -> i64 {
+    val bits: i64 = p_f64_to_bits(x);
+    val sign: i64 = cb_sign(bits) << 15;
+    val e: i64 = (bits >> 52) & 2047;
+    val m: i64 = bits & 4503599627370495;
+    if e == 2047 {
+        if m == 0 {
+            return sign | 0x7c00;
+        }
+        return 0x7e00;
+    }
+    if e == 0 && m == 0 {
+        return sign;
+    }
+    if e == 0 {
+        return - 1;   // an f64 subnormal is far below a half's range
+    }
+    val ex: i64 = e - 1023;
+    if ex >= - 14 && ex <= 15 {
+        if (m & 4398046511103) != 0 {
+            return - 1;   // low 42 bits must be zero
+        }
+        return sign | ((ex + 15) << 10) | (m >> 42);
+    }
+    if ex >= - 24 && ex < - 14 {
+        val full: i64 = m | 4503599627370496;
+        val shift: i64 = 28 - ex;
+        if (full & ((1 << shift) - 1)) != 0 {
+            return - 1;
+        }
+        return sign | (full >> shift);
+    }
+    return - 1;
+}
+
+/// The 32 bits of x as a single-precision float, or -1 when a single
+/// cannot hold x exactly. NaN gives 0x7fc00000.
+@wrapping pub fn cbor_f64_to_single(x: f64) -> i64 {
+    val bits: i64 = p_f64_to_bits(x);
+    val sign: i64 = cb_sign(bits) << 31;
+    val e: i64 = (bits >> 52) & 2047;
+    val m: i64 = bits & 4503599627370495;
+    if e == 2047 {
+        if m == 0 {
+            return sign | 0x7f800000;
+        }
+        return 0x7fc00000;
+    }
+    if e == 0 && m == 0 {
+        return sign;
+    }
+    if e == 0 {
+        return - 1;
+    }
+    val ex: i64 = e - 1023;
+    if ex >= - 126 && ex <= 127 {
+        if (m & 536870911) != 0 {
+            return - 1;   // low 29 bits must be zero
+        }
+        return sign | ((ex + 127) << 23) | (m >> 29);
+    }
+    if ex >= - 149 && ex < - 126 {
+        val full: i64 = m | 4503599627370496;
+        val shift: i64 = - 97 - ex;
+        if (full & ((1 << shift) - 1)) != 0 {
+            return - 1;
+        }
+        return sign | (full >> shift);
+    }
+    return - 1;
+}
+
+// ─── Decoded documents ────────────────────────────────────────────────────
+
+/// A decoded CBOR item as a flat tree. Node i has kind[i] (CBOR_*) and:
+///   UINT: val = the value (64 bits); NEGINT: val = n, the value is -1-n;
+///   BYTES/TEXT: data = the bytes (an indefinite string has its chunks as
+///     children and data = all of them joined);
+///   ARRAY: children = the items; MAP: children = key, value, key, ...;
+///   TAG: val = the tag number, one child; SIMPLE: val = the simple value;
+///   FLOAT: fval = the value, val = its width on the wire (2, 4 or 8).
+/// `indef` marks indefinite length. `ok` false: `error` says why.
+pub struct CborDoc {
+    pub kind: Vec<i64>,
+    pub val: Vec<i64>,
+    pub fval: Vec<f64>,
+    pub data: Vec<Vec<i64>>,
+    pub indef: Vec<bool>,
+    pub first: Vec<i64>,
+    pub nkids: Vec<i64>,
+    pub kids: Vec<i64>,
+    pub root: i64,
+    pub ok: bool,
+    pub error: str,
+    pub used: i64,   // bytes the root item took
+}
+
+struct CbReader {
+    bytes: Vec<i64>,
+    pos: i64,
+    ok: bool,
+    error: str,
+}
+
+fn cb_doc_new() -> CborDoc {
+    return CborDoc {
+        kind: Vec::new(), val: Vec::new(), fval: Vec::new(), data: Vec::new(), indef: Vec::new(), first: Vec::new(), nkids: Vec::new(), kids: Vec::new(), root: - 1, ok: true, error: "", used: 0,
+    };
+}
+
+fn cb_node(d: & mut CborDoc, kind: i64, v: i64) -> i64 {
+    val id: i64 = d.kind.len();
+    d.kind.push(kind);
+    d.val.push(v);
+    d.fval.push(0.0);
+    var empty: Vec<i64> = Vec::new();
+    d.data.push(empty);
+    d.indef.push(false);
+    d.first.push(0);
+    d.nkids.push(0);
+    return id;
+}
+
+fn cb_set_kids(d: & mut CborDoc, node: i64, ids: Vec<i64>) {
+    d.first.set(node, d.kids.len());
+    d.nkids.set(node, ids.len());
+    var i: i64 = 0;
+    while i < ids.len() {
+        d.kids.push(ids.get(i));
+        i = i + 1;
+    }
+}
+
+fn cb_fail(r: & mut CbReader, msg: str) {
+    if r.ok {
+        r.ok = false;
+        r.error = msg + " at byte " + int_to_str(r.pos);
+    }
+}
+
+fn cb_byte(r: & mut CbReader) -> i64 {
+    if r.pos >= r.bytes.len() {
+        cb_fail(r, "truncated");
+        return 0;
+    }
+    val b: i64 = r.bytes.get(r.pos) & 255;
+    r.pos = r.pos + 1;
+    return b;
+}
+
+@wrapping fn cb_be(r: & mut CbReader, width: i64) -> i64 {
+    if r.pos + width > r.bytes.len() {
+        cb_fail(r, "truncated");
+        r.pos = r.bytes.len();
+        return 0;
+    }
+    var x: i64 = 0;
+    var i: i64 = 0;
+    while i < width {
+        x = (x << 8) | (r.bytes.get(r.pos + i) & 255);
+        i = i + 1;
+    }
+    r.pos = r.pos + width;
+    return x;
+}
+
+// The argument of a head with additional information `ai` (< 28).
+fn cb_arg(r: & mut CbReader, ai: i64) -> i64 {
+    if ai < 24 {
+        return ai;
+    }
+    if ai == 24 {
+        return cb_byte(r);
+    }
+    if ai == 25 {
+        return cb_be(r, 2);
+    }
+    if ai == 26 {
+        return cb_be(r, 4);
+    }
+    return cb_be(r, 8);
+}
+
+// A length must fit what is left (each item takes at least one byte).
+fn cb_check_len(r: & mut CbReader, n: i64, unit: i64) -> bool {
+    val left: i64 = r.bytes.len() - r.pos;
+    if n < 0 || n > left / unit {
+        cb_fail(r, "length too large");
+        return false;
+    }
+    return true;
+}
+
+fn cb_take(r: & mut CbReader, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(r.bytes.get(r.pos + i) & 255);
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return out;
+}
+
+// Decode one item; its node, or -1 (a break when `allow_break`: -2).
+fn cb_item(d: & mut CborDoc, r: & mut CbReader, depth: i64, allow_break: bool) -> i64 {
+    if !r.ok {
+        return - 1;
+    }
+    if depth > CBOR_MAX_DEPTH {
+        cb_fail(r, "nesting too deep");
+        return - 1;
+    }
+    val ib: i64 = cb_byte(r);
+    if !r.ok {
+        return - 1;
+    }
+    val major: i64 = ib >> 5;
+    val ai: i64 = ib & 31;
+    if ai >= 28 && ai <= 30 {
+        cb_fail(r, "reserved additional information");
+        return - 1;
+    }
+    if ai == 31 {
+        return cb_indef(d, r, major, depth, allow_break);
+    }
+    if major == 7 {
+        return cb_major7(d, r, ai);
+    }
+    val n: i64 = cb_arg(r, ai);
+    if !r.ok {
+        return - 1;
+    }
+    if major == 0 || major == 1 {
+        return cb_node(d, major, n);
+    }
+    if major == 2 || major == 3 {
+        if !cb_check_len(r, n, 1) {
+            return - 1;
+        }
+        val node: i64 = cb_node(d, major, n);
+        d.data.set(node, cb_take(r, n));
+        return node;
+    }
+    if major == 4 || major == 5 {
+        var unit: i64 = 1;
+        var count: i64 = n;
+        if major == 5 {
+            unit = 2;
+        }
+        if !cb_check_len(r, count, unit) {
+            return - 1;
+        }
+        val node: i64 = cb_node(d, major, n);
+        var ids: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < count * unit {
+            val c: i64 = cb_item(d, r, depth + 1, false);
+            if c < 0 {
+                return - 1;
+            }
+            ids.push(c);
+            i = i + 1;
+        }
+        cb_set_kids(d, node, ids);
+        return node;
+    }
+    // major 6: a tag and its item
+    val node: i64 = cb_node(d, 6, n);
+    val c: i64 = cb_item(d, r, depth + 1, false);
+    if c < 0 {
+        return - 1;
+    }
+    var ids: Vec<i64> = Vec::new();
+    ids.push(c);
+    cb_set_kids(d, node, ids);
+    return node;
+}
+
+fn cb_major7(d: & mut CborDoc, r: & mut CbReader, ai: i64) -> i64 {
+    if ai < 24 {
+        return cb_node(d, CBOR_SIMPLE, ai);
+    }
+    if ai == 24 {
+        val s: i64 = cb_byte(r);
+        if !r.ok {
+            return - 1;
+        }
+        if s < 32 {
+            cb_fail(r, "two-byte simple value below 32");
+            return - 1;
+        }
+        return cb_node(d, CBOR_SIMPLE, s);
+    }
+    var width: i64 = 8;
+    if ai == 25 {
+        width = 2;
+    } else if ai == 26 {
+        width = 4;
+    }
+    val bits: i64 = cb_be(r, width);
+    if !r.ok {
+        return - 1;
+    }
+    val node: i64 = cb_node(d, CBOR_FLOAT, width);
+    if width == 2 {
+        d.fval.set(node, cbor_half_to_f64(bits));
+    } else if width == 4 {
+        d.fval.set(node, cbor_single_to_f64(bits));
+    } else {
+        d.fval.set(node, p_f64_from_bits(bits));
+    }
+    return node;
+}
+
+fn cb_indef(d: & mut CborDoc, r: & mut CbReader, major: i64, depth: i64, allow_break: bool) -> i64 {
+    if major == 7 {
+        if allow_break {
+            return - 2;
+        }
+        cb_fail(r, "break outside an indefinite-length item");
+        return - 1;
+    }
+    if major == 0 || major == 1 || major == 6 {
+        cb_fail(r, "indefinite length on major type " + int_to_str(major));
+        return - 1;
+    }
+    val node: i64 = cb_node(d, major, 0);
+    d.indef.set(node, true);
+    var ids: Vec<i64> = Vec::new();
+    var joined: Vec<i64> = Vec::new();
+    loop {
+        if !r.ok {
+            return - 1;
+        }
+        if major == 2 || major == 3 {
+            // chunks: definite strings of the same major type
+            var nb: i64 = 255;
+            if r.pos < r.bytes.len() {
+                nb = r.bytes.get(r.pos) & 255;
+            }
+            val nmajor: i64 = nb >> 5;
+            val nai: i64 = nb & 31;
+            if nb != 255 && (nmajor != major || nai == 31) {
+                cb_fail(r, "bad chunk in an indefinite-length string");
+                return - 1;
+            }
+        }
+        val c: i64 = cb_item(d, r, depth + 1, true);
+        if c == - 2 {
+            break;
+        }
+        if c < 0 {
+            return - 1;
+        }
+        ids.push(c);
+        if major == 2 || major == 3 {
+            joined.extend(d.data.get(c));
+        }
+    }
+    if major == 5 && ids.len() % 2 != 0 {
+        cb_fail(r, "indefinite map with a key and no value");
+        return - 1;
+    }
+    cb_set_kids(d, node, ids);
+    if major == 2 || major == 3 {
+        d.val.set(node, joined.len());
+        d.data.set(node, joined);
+    } else if major == 5 {
+        d.val.set(node, ids.len() / 2);
+    } else {
+        d.val.set(node, ids.len());
+    }
+    return node;
+}
+
+/// Decode the first item of `bytes`. Bytes after it are allowed (`used`
+/// says how many the item took); cbor_decode_all requires none.
+pub fn cbor_decode(bytes: Vec<i64>) -> CborDoc {
+    var d: CborDoc = cb_doc_new();
+    var r: CbReader = CbReader {
+        bytes: bytes, pos: 0, ok: true, error: ""
+    };
+    val root: i64 = cb_item(& mut d, & mut r, 0, false);
+    d.root = root;
+    d.ok = r.ok && root >= 0;
+    d.error = r.error;
+    d.used = r.pos;
+    return d;
+}
+
+/// Decode a whole buffer holding exactly one item.
+pub fn cbor_decode_all(bytes: Vec<i64>) -> CborDoc {
+    val n: i64 = bytes.len();
+    var d: CborDoc = cbor_decode(bytes);
+    if d.ok && d.used != n {
+        d.ok = false;
+        d.error = "extra bytes after the item";
+    }
+    return d;
+}
+
+// ─── Accessors ────────────────────────────────────────────────────────────
+
+pub fn cbor_kind(d: & CborDoc, node: i64) -> i64 {
+    return d.kind.get(node);
+}
+
+/// UINT: the value's 64 bits; NEGINT: n (value -1-n); TAG: the tag number;
+/// SIMPLE: the simple value; BYTES/TEXT: the length; ARRAY: items; MAP: pairs.
+pub fn cbor_uint(d: & CborDoc, node: i64) -> i64 {
+    return d.val.get(node);
+}
+
+/// Whether cbor_int gives the exact value (an integer in the i64 range).
+pub fn cbor_int_fits(d: & CborDoc, node: i64) -> bool {
+    val k: i64 = d.kind.get(node);
+    return (k == CBOR_UINT || k == CBOR_NEGINT) && d.val.get(node) >= 0;
+}
+
+/// An integer node's value (exact when cbor_int_fits).
+pub fn cbor_int(d: & CborDoc, node: i64) -> i64 {
+    if d.kind.get(node) == CBOR_NEGINT {
+        return - 1 - d.val.get(node);
+    }
+    return d.val.get(node);
+}
+
+/// Bytes of a byte or text string (all chunks joined).
+pub fn cbor_bytes(d: & CborDoc, node: i64) -> Vec<i64> {
+    return d.data.get(node);
+}
+
+pub fn cbor_text(d: & CborDoc, node: i64) -> str {
+    return str_from_bytes(d.data.get(node));
+}
+
+/// Items of an array, pairs of a map, chunks of an indefinite string.
+pub fn cbor_len(d: & CborDoc, node: i64) -> i64 {
+    val k: i64 = d.kind.get(node);
+    if k == CBOR_MAP {
+        return d.nkids.get(node) / 2;
+    }
+    if k == CBOR_ARRAY || d.indef.get(node) {
+        return d.nkids.get(node);
+    }
+    return 0;
+}
+
+/// Item i of an array (or chunk i of an indefinite string).
+pub fn cbor_at(d: & CborDoc, node: i64, i: i64) -> i64 {
+    return d.kids.get(d.first.get(node) + i);
+}
+
+pub fn cbor_map_key(d: & CborDoc, node: i64, i: i64) -> i64 {
+    return d.kids.get(d.first.get(node) + 2 * i);
+}
+
+pub fn cbor_map_val(d: & CborDoc, node: i64, i: i64) -> i64 {
+    return d.kids.get(d.first.get(node) + 2 * i + 1);
+}
+
+/// The value under text key `key` in a map, or -1.
+pub fn cbor_map_get(d: & CborDoc, node: i64, key: str) -> i64 {
+    if d.kind.get(node) != CBOR_MAP {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < cbor_len(d, node) {
+        val k: i64 = cbor_map_key(d, node, i);
+        if d.kind.get(k) == CBOR_TEXT && cbor_text(d, k) == key {
+            return cbor_map_val(d, node, i);
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The value under integer key `key` in a map, or -1.
+pub fn cbor_map_get_int(d: & CborDoc, node: i64, key: i64) -> i64 {
+    if d.kind.get(node) != CBOR_MAP {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < cbor_len(d, node) {
+        val k: i64 = cbor_map_key(d, node, i);
+        val kk: i64 = d.kind.get(k);
+        if (kk == CBOR_UINT || kk == CBOR_NEGINT) && cbor_int_fits(d, k) && cbor_int(d, k) == key {
+            return cbor_map_val(d, node, i);
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+pub fn cbor_tag(d: & CborDoc, node: i64) -> i64 {
+    return d.val.get(node);
+}
+
+pub fn cbor_tag_content(d: & CborDoc, node: i64) -> i64 {
+    return d.kids.get(d.first.get(node));
+}
+
+/// A float node's value; an integer node's value as f64.
+pub fn cbor_float(d: & CborDoc, node: i64) -> f64 {
+    val k: i64 = d.kind.get(node);
+    if k == CBOR_FLOAT {
+        return d.fval.get(node);
+    }
+    if k == CBOR_UINT || k == CBOR_NEGINT {
+        return cbor_int(d, node) as f64;
+    }
+    return 0.0;
+}
+
+pub fn cbor_is_number(d: & CborDoc, node: i64) -> bool {
+    val k: i64 = d.kind.get(node);
+    return k == CBOR_UINT || k == CBOR_NEGINT || k == CBOR_FLOAT;
+}
+
+pub fn cbor_is_bool(d: & CborDoc, node: i64) -> bool {
+    return d.kind.get(node) == CBOR_SIMPLE && (d.val.get(node) == CBOR_TRUE || d.val.get(node) == CBOR_FALSE);
+}
+
+pub fn cbor_bool(d: & CborDoc, node: i64) -> bool {
+    return d.kind.get(node) == CBOR_SIMPLE && d.val.get(node) == CBOR_TRUE;
+}
+
+pub fn cbor_is_null(d: & CborDoc, node: i64) -> bool {
+    return d.kind.get(node) == CBOR_SIMPLE && d.val.get(node) == CBOR_NULL;
+}
+
+// ─── Re-encoding a decoded node ──────────────────────────────────────────
+
+/// Encode node `node` of `d` again: definite and indefinite lengths and
+/// float widths as decoded, every head in its shortest form.
+pub fn cbor_encode(d: & CborDoc, node: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    cb_enc(d, node, & mut out);
+    return out;
+}
+
+fn cb_enc(d: & CborDoc, node: i64, out: & mut Vec<i64>) {
+    val k: i64 = d.kind.get(node);
+    val v: i64 = d.val.get(node);
+    if k == CBOR_UINT || k == CBOR_NEGINT || k == CBOR_TAG {
+        cbor_put_head(out, k, v);
+        if k == CBOR_TAG {
+            cb_enc(d, cbor_tag_content(d, node), out);
+        }
+        return;
+    }
+    if k == CBOR_SIMPLE {
+        cbor_put_simple(out, v);
+        return;
+    }
+    if k == CBOR_FLOAT {
+        val x: f64 = d.fval.get(node);
+        if v == 2 {
+            out.push(0xf9);
+            cb_put_be(out, cbor_f64_to_half(x), 2);
+        } else if v == 4 {
+            out.push(0xfa);
+            cb_put_be(out, cbor_f64_to_single(x), 4);
+        } else {
+            cbor_put_double(out, x);
+        }
+        return;
+    }
+    if d.indef.get(node) {
+        cbor_put_indef(out, k);
+        var i: i64 = 0;
+        while i < d.nkids.get(node) {
+            cb_enc(d, d.kids.get(d.first.get(node) + i), out);
+            i = i + 1;
+        }
+        cbor_put_break(out);
+        return;
+    }
+    if k == CBOR_BYTES || k == CBOR_TEXT {
+        val b: Vec<i64> = d.data.get(node);
+        cbor_put_head(out, k, b.len());
+        out.extend(b);
+        return;
+    }
+    cbor_put_head(out, k, v);
+    var i: i64 = 0;
+    while i < d.nkids.get(node) {
+        cb_enc(d, d.kids.get(d.first.get(node) + i), out);
+        i = i + 1;
+    }
+}
+
+// ─── Diagnostic notation (RFC 8949 section 8) ────────────────────────────
+
+/// Lowercase hex of the bytes, no separators.
+pub fn cbor_hex(bytes: Vec<i64>) -> str {
+    val digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < bytes.len() {
+        val b: i64 = bytes.get(i) & 255;
+        out = out + str_slice(digits, b >> 4, (b >> 4) + 1) + str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cb_hex4(n: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 3;
+    while i >= 0 {
+        val q: i64 = (n >> (i * 4)) & 15;
+        out = out + str_slice(digits, q, q + 1);
+        i = i - 1;
+    }
+    return out;
+}
+
+// Add one to a decimal digit string.
+fn cb_dec_inc(s: str) -> str {
+    var digits: Vec<i64> = str_bytes(s);
+    var i: i64 = digits.len() - 1;
+    var carry: bool = true;
+    while i >= 0 && carry {
+        val c: i64 = digits.get(i);
+        if c == 57 {
+            digits.set(i, 48);
+        } else {
+            digits.set(i, c + 1);
+            carry = false;
+        }
+        i = i - 1;
+    }
+    var out: str = str_from_bytes(digits);
+    if carry {
+        out = "1" + out;
+    }
+    return out;
+}
+
+// A text string with JSON-style escapes, as the RFC writes it.
+fn cb_diag_text(b: Vec<i64>) -> str {
+    var out: str = "\"";
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        var cp: i64 = c;
+        var n: i64 = 1;
+        if c >= 0xf0 && i + 3 < b.len() {
+            cp = ((c & 7) << 18) | ((b.get(i + 1) & 63) << 12) | ((b.get(i + 2) & 63) << 6) | (b.get(i + 3) & 63);
+            n = 4;
+        } else if c >= 0xe0 && i + 2 < b.len() {
+            cp = ((c & 15) << 12) | ((b.get(i + 1) & 63) << 6) | (b.get(i + 2) & 63);
+            n = 3;
+        } else if c >= 0xc0 && i + 1 < b.len() {
+            cp = ((c & 31) << 6) | (b.get(i + 1) & 63);
+            n = 2;
+        }
+        if cp == 34 {
+            out = out + "\\\"";
+        } else if cp == 92 {
+            out = out + "\\\\";
+        } else if cp < 32 || cp >= 127 {
+            if cp > 0xffff {
+                val v: i64 = cp - 0x10000;
+                out = out + "\\u" + cb_hex4(0xd800 + (v >> 10)) + "\\u" + cb_hex4(0xdc00 + (v & 1023));
+            } else {
+                out = out + "\\u" + cb_hex4(cp);
+            }
+        } else {
+            out = out + char_to_str(cp);
+        }
+        i = i + n;
+    }
+    return out + "\"";
+}
+
+/// A float as diagnostic notation: Infinity, -Infinity, NaN, "N.0" for
+/// integral values below 2^53, else float_to_str's digits.
+pub fn cbor_float_diag(x: f64) -> str {
+    if x != x {
+        return "NaN";
+    }
+    if x == 1.0 / 0.0 {
+        return "Infinity";
+    }
+    if x == - 1.0 / 0.0 {
+        return "-Infinity";
+    }
+    if x == 0.0 {
+        if p_f64_to_bits(x) < 0 {
+            return "-0.0";
+        }
+        return "0.0";
+    }
+    var a: f64 = x;
+    if a < 0.0 {
+        a = 0.0 - a;
+    }
+    if a < 9007199254740992.0 {
+        val i: i64 = x as i64;
+        if (i as f64) == x {
+            return int_to_str(i) + ".0";
+        }
+    }
+    return float_to_str(x);
+}
+
+/// Diagnostic notation of node `node`.
+pub fn cbor_diag(d: & CborDoc, node: i64) -> str {
+    val k: i64 = d.kind.get(node);
+    val v: i64 = d.val.get(node);
+    if k == CBOR_UINT {
+        return u64_to_str(v as u64);
+    }
+    if k == CBOR_NEGINT {
+        return "-" + cb_dec_inc(u64_to_str(v as u64));
+    }
+    if k == CBOR_FLOAT {
+        return cbor_float_diag(d.fval.get(node));
+    }
+    if k == CBOR_SIMPLE {
+        if v == CBOR_FALSE {
+            return "false";
+        }
+        if v == CBOR_TRUE {
+            return "true";
+        }
+        if v == CBOR_NULL {
+            return "null";
+        }
+        if v == CBOR_UNDEFINED {
+            return "undefined";
+        }
+        return "simple(" + int_to_str(v) + ")";
+    }
+    if k == CBOR_TAG {
+        return u64_to_str(v as u64) + "(" + cbor_diag(d, cbor_tag_content(d, node)) + ")";
+    }
+    val n: i64 = d.nkids.get(node);
+    if d.indef.get(node) && (k == CBOR_BYTES || k == CBOR_TEXT) {
+        var s: str = "(_ ";
+        var i: i64 = 0;
+        while i < n {
+            if i > 0 {
+                s = s + ", ";
+            }
+            s = s + cbor_diag(d, cbor_at(d, node, i));
+            i = i + 1;
+        }
+        return s + ")";
+    }
+    if k == CBOR_BYTES {
+        return "h'" + cbor_hex(d.data.get(node)) + "'";
+    }
+    if k == CBOR_TEXT {
+        return cb_diag_text(d.data.get(node));
+    }
+    var open: str = "[";
+    var close: str = "]";
+    if k == CBOR_MAP {
+        open = "{";
+        close = "}";
+    }
+    if d.indef.get(node) {
+        open = open + "_ ";
+    }
+    var s: str = open;
+    var i: i64 = 0;
+    while i < n {
+        if i > 0 {
+            if k == CBOR_MAP && i % 2 == 1 {
+                s = s + ": ";
+            } else {
+                s = s + ", ";
+            }
+        }
+        s = s + cbor_diag(d, d.kids.get(d.first.get(node) + i));
+        i = i + 1;
+    }
+    return s + close;
+}

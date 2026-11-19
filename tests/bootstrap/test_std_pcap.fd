@@ -1,0 +1,108 @@
+// stdlib/pcap: classic pcap (LE microsecond, BE nanosecond) and pcapng (LE with options, BE with a Simple Packet Block) read from known bytes (built with Python's struct per the specs), and written back byte for byte.
+// Expected output:
+// le ok=true v2.4 snap=65535 link=1 packets=2
+// p0 ts=1700000000.123456000 len=14/14 first=16
+// p1 ts=1700000001.000005000 len=5/60
+// le write: same bytes
+// be ok=true be=true nanos=true link=101 snap=262144
+// be p0 ts=7.999999999 data=deadbeef01
+// be write: same bytes
+// built: same bytes as the LE file
+// truncated: len=4 orig=10
+// bad magic: pcap: bad magic number
+// ng ok=true sections=1 app=fides ifaces=1 packets=2
+// iface eth0 link=1 snap=65535 tsresol=9
+// ng p0 ts=1700000000.000000042 comment=hi flags=1 data=deadbeef01
+// ng p1 ts=1700000002.500000000 len=14/1514
+// ng write: same bytes
+// ngbe ok=true be=true packets=2 link=101
+// spb len=4/5 data=deadbeef
+// epb ts=3.000250000 data=deadbeef
+// to pcapng: ifaces=1 packets=2 back=2
+// units: 1000000 1000000000 1024
+// detect: true false
+use pcap;
+use encoding;
+use vec;
+use string;
+
+fn h(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn pad9(n: i64) -> str {
+    var s: str = int_to_str(n);
+    while str_len(s) < 9 { s = "0" + s; }
+    return s;
+}
+
+fn ts(p: PcapPacket) -> str { return int_to_str(p.ts_sec) + "." + pad9(p.ts_nsec); }
+
+fn same(label: str, got: Vec<i64>, want: str) {
+    if hex_encode_bytes(got) == want {
+        println(label + ": same bytes");
+    } else {
+        println(label + ": DIFFERENT " + hex_encode_bytes(got));
+    }
+}
+
+fn main() -> i64 {
+    val le: str = "d4c3b2a1020004000000000000000000ffff00000100000000f1536540e201000e0000000e000000101112131415161718191a1b1c1d01f1536505000000050000003c000000deadbeef01";
+    val f: PcapFile = pcap_read(h(le));
+    println("le ok=" + bool_to_str(f.ok) + " v" + int_to_str(f.major) + "." + int_to_str(f.minor) + " snap=" + int_to_str(f.snaplen) + " link=" + int_to_str(f.linktype) + " packets=" + int_to_str(f.packets.len()));
+    val p0: PcapPacket = f.packets.get(0);
+    println("p0 ts=" + ts(p0) + " len=" + int_to_str(p0.data.len()) + "/" + int_to_str(p0.orig_len) + " first=" + int_to_str(p0.data.get(0)));
+    val p1: PcapPacket = f.packets.get(1);
+    println("p1 ts=" + ts(p1) + " len=" + int_to_str(p1.data.len()) + "/" + int_to_str(p1.orig_len));
+    same("le write", pcap_write(& f), le);
+
+    val be: str = "a1b23c4d0002000400000000000000000004000000000065000000073b9ac9ff0000000500000005deadbeef01";
+    val g: PcapFile = pcap_read(h(be));
+    println("be ok=" + bool_to_str(g.ok) + " be=" + bool_to_str(g.big_endian) + " nanos=" + bool_to_str(g.nanos) + " link=" + int_to_str(g.linktype) + " snap=" + int_to_str(g.snaplen));
+    println("be p0 ts=" + ts(g.packets.get(0)) + " data=" + hex_encode_bytes(g.packets.get(0).data));
+    same("be write", pcap_write(& g), be);
+
+    // the same LE file built from scratch
+    var nf: PcapFile = pcap_new(PCAP_LINKTYPE_ETHERNET, 65535);
+    var d0: Vec<i64> = Vec::new();
+    var i: i64 = 16;
+    while i < 30 { d0.push(i); i = i + 1; }
+    pcap_add(& mut nf, 1700000000, 123456000, d0);
+    var p: PcapPacket = PcapPacket { ts_sec: 1700000001, ts_nsec: 5000, orig_len: 60, data: h("deadbeef01"), iface: 0, comment: "", flags: - 1 };
+    nf.packets.push(p);
+    if hex_encode_bytes(pcap_write(& nf)) == le {
+        println("built: same bytes as the LE file");
+    } else {
+        println("built: DIFFERENT");
+    }
+    var tf: PcapFile = pcap_new(PCAP_LINKTYPE_RAW, 4);
+    pcap_add_truncated(& mut tf, 0, 0, h("00112233445566778899"));
+    val tr: PcapFile = pcap_read(pcap_write(& tf));
+    println("truncated: len=" + int_to_str(tr.packets.get(0).data.len()) + " orig=" + int_to_str(tr.packets.get(0).orig_len));
+    println("bad magic: " + pcap_read(h("00112233445566778899aabbccddeeff0011223344556677")).error);
+
+    val ng: str = "0a0d0d0a2c0000004d3c2b1a01000000ffffffffffffffff040005006669646573000000000000002c000000010000002800000001000000ffff0000020004006574683009000100090000000000000028000000060000003c00000000000000fe9c97172a002a360500000005000000deadbeef0100000001000200686900000200040001000000000000003c000000060000003000000000000000fe9c971700f92ccb0e000000ea050000101112131415161718191a1b1c1d000030000000";
+    val n: PcapngFile = pcapng_read(h(ng));
+    println("ng ok=" + bool_to_str(n.ok) + " sections=" + int_to_str(n.sections) + " app=" + n.app + " ifaces=" + int_to_str(n.interfaces.len()) + " packets=" + int_to_str(n.packets.len()));
+    val it: PcapngIface = n.interfaces.get(0);
+    println("iface " + it.name + " link=" + int_to_str(it.linktype) + " snap=" + int_to_str(it.snaplen) + " tsresol=" + int_to_str(it.tsresol));
+    val q0: PcapPacket = n.packets.get(0);
+    println("ng p0 ts=" + ts(q0) + " comment=" + q0.comment + " flags=" + int_to_str(q0.flags) + " data=" + hex_encode_bytes(q0.data));
+    val q1: PcapPacket = n.packets.get(1);
+    println("ng p1 ts=" + ts(q1) + " len=" + int_to_str(q1.data.len()) + "/" + int_to_str(q1.orig_len));
+    same("ng write", pcapng_write(& n), ng);
+
+    val ngbe: str = "0a0d0d0a0000001c1a2b3c4d00010000ffffffffffffffff0000001c0000000100000014006500000000000400000014000000030000001400000005deadbeef0000001400000006000000240000000000000000002dc7ba0000000400000004deadbeef00000024";
+    val m: PcapngFile = pcapng_read(h(ngbe));
+    println("ngbe ok=" + bool_to_str(m.ok) + " be=" + bool_to_str(m.big_endian) + " packets=" + int_to_str(m.packets.len()) + " link=" + int_to_str(m.interfaces.get(0).linktype));
+    val s0: PcapPacket = m.packets.get(0);
+    println("spb len=" + int_to_str(s0.data.len()) + "/" + int_to_str(s0.orig_len) + " data=" + hex_encode_bytes(s0.data));
+    println("epb ts=" + ts(m.packets.get(1)) + " data=" + hex_encode_bytes(m.packets.get(1).data));
+
+    val conv: PcapngFile = pcap_to_pcapng(& f);
+    val back: PcapngFile = pcapng_read(pcapng_write(& conv));
+    println("to pcapng: ifaces=" + int_to_str(back.interfaces.len()) + " packets=" + int_to_str(conv.packets.len()) + " back=" + int_to_str(back.packets.len()));
+    println("units: " + int_to_str(pcapng_units_per_sec(6)) + " " + int_to_str(pcapng_units_per_sec(9)) + " " + int_to_str(pcapng_units_per_sec(128 + 10)));
+    val nb: Vec<i64> = h(ng);
+    val lb: Vec<i64> = h(le);
+    println("detect: " + bool_to_str(pcap_is_pcapng(& nb)) + " " + bool_to_str(pcap_is_pcapng(& lb)));
+    return 0;
+}

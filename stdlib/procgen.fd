@@ -1,0 +1,809 @@
+// Fides procgen: procedural generation for games.
+//
+//   - PgRng: PCG32 (O'Neill's pcg32, XSH-RR output over a 64-bit LCG),
+//     seeded exactly like pcg32_srandom_r(initstate, initseq), so its
+//     stream matches the reference implementation; unbiased bounded
+//     integers and floats.
+//   - Dungeons on a tile grid (PG_WALL / PG_FLOOR / PG_CORRIDOR):
+//       BSP: the map is split recursively (along the longer side, at a
+//       random point) down to `min_leaf`; each leaf gets a room; sibling
+//       subtrees are joined by an L-shaped corridor between a room of each,
+//       so every floor tile is reachable;
+//       drunkard's walk: a walker carves random steps until a share of the
+//       map is floor;
+//       cellular automata caves: random fill, then the 4-5 rule (a tile is
+//       wall when 5 or more of the 9 tiles around it are walls), then only
+//       the largest connected cave is kept.
+//     The outer border is always wall. pg_grid_connected / pg_grid_regions
+//     check connectivity (4-neighbour flood fill).
+//   - L-systems: deterministic context-free rewriting (one replacement
+//     string per symbol) and a turtle (F, G draw; f moves; + turns left,
+//     - right, | turns around; [ and ] push and pop the state).
+//   - Poisson disk sampling (Bridson 2007): points no closer than r, with
+//     k tries per active point, using a background grid of cell r/sqrt(2).
+//
+// Everything is pure computation with no platform seam; the same seed
+// gives the same output on every backend.
+//
+// Usage:
+//   use procgen;
+//   val d: PgDungeon = pg_bsp_dungeon(80, 50, 10, 1234);
+//   val cave: PgGrid = pg_cave(64, 48, 45, 5, 99);
+//   val s: str = ls_expand(&koch, 3);
+//   val t: LsTurtle = ls_turtle(s, 1.0, 60.0);
+//   val pts: Vec<f64> = pg_poisson_disk(100.0, 100.0, 5.0, 30, 7);
+
+module procgen;
+use vec;
+use math;
+
+// ─── PCG32 ─────────────────────────────────────────────────────────────────
+
+pub struct PgRng {
+    pub state: i64,
+    pub inc: i64,
+}
+
+// logical shift right of a 64-bit value
+fn pg_shr(x: i64, s: i64) -> i64 {
+    if s == 0 {
+        return x;
+    }
+    return (x >> s) & ((1 << (64 - s)) - 1);
+}
+
+/// The next 32-bit output (0 .. 2^32-1).
+@wrapping
+pub fn pg_rng_u32(r: &mut PgRng) -> i64 {
+    val old: i64 = r.state;
+    r.state = old * 6364136223846793005 + r.inc;
+    val xs: i64 = pg_shr(pg_shr(old, 18) ^ old, 27) & 0xFFFFFFFF;
+    val rot: i64 = pg_shr(old, 59);
+    return ((xs >> rot) | (xs << ((32 - rot) & 31))) & 0xFFFFFFFF;
+}
+
+/// pcg32_srandom_r(initstate, initseq).
+@wrapping
+pub fn pg_rng_seeded(initstate: i64, initseq: i64) -> PgRng {
+    var r: PgRng = PgRng { state: 0, inc: (initseq << 1) | 1 };
+    pg_rng_u32(&mut r);
+    r.state = r.state + initstate;
+    pg_rng_u32(&mut r);
+    return r;
+}
+
+/// A generator from one seed (stream 54, as pcg32's demo).
+pub fn pg_rng_new(seed: i64) -> PgRng {
+    return pg_rng_seeded(seed, 54);
+}
+
+/// Uniform in 0 .. n-1 (n >= 1), without modulo bias.
+pub fn pg_rng_below(r: &mut PgRng, n: i64) -> i64 {
+    if n <= 1 {
+        return 0;
+    }
+    val threshold: i64 = (0x100000000 - n) % n;
+    while true {
+        val x: i64 = pg_rng_u32(r);
+        if x >= threshold {
+            return x % n;
+        }
+    }
+    return 0;
+}
+
+/// Uniform in lo ..= hi.
+pub fn pg_rng_range(r: &mut PgRng, lo: i64, hi: i64) -> i64 {
+    if hi <= lo {
+        return lo;
+    }
+    return lo + pg_rng_below(r, hi - lo + 1);
+}
+
+/// Uniform in [0, 1) with 53 random bits.
+pub fn pg_rng_f64(r: &mut PgRng) -> f64 {
+    val a: i64 = pg_rng_u32(r) >> 5;
+    val b: i64 = pg_rng_u32(r) >> 6;
+    return ((a * 67108864 + b) as f64) / 9007199254740992.0;
+}
+
+/// True with probability pct/100.
+pub fn pg_rng_chance(r: &mut PgRng, pct: i64) -> bool {
+    return pg_rng_below(r, 100) < pct;
+}
+
+// ─── Tile grids ────────────────────────────────────────────────────────────
+
+pub const PG_WALL: i64 = 0;
+pub const PG_FLOOR: i64 = 1;
+pub const PG_CORRIDOR: i64 = 2;
+
+pub struct PgGrid {
+    pub w: i64,
+    pub h: i64,
+    pub cells: Vec<i64>,
+}
+
+pub fn pg_grid_new(w: i64, h: i64, fill: i64) -> PgGrid {
+    return PgGrid { w: w, h: h, cells: Vec::filled(w * h, fill) };
+}
+
+pub fn pg_get(g: &PgGrid, x: i64, y: i64) -> i64 {
+    if x < 0 || y < 0 || x >= g.w || y >= g.h {
+        return PG_WALL;
+    }
+    return g.cells.get(x + g.w * y);
+}
+
+pub fn pg_set(g: &mut PgGrid, x: i64, y: i64, v: i64) {
+    if x < 0 || y < 0 || x >= g.w || y >= g.h {
+        return;
+    }
+    g.cells.set(x + g.w * y, v);
+}
+
+pub fn pg_walkable(g: &PgGrid, x: i64, y: i64) -> bool {
+    return pg_get(g, x, y) != PG_WALL;
+}
+
+pub fn pg_count_walkable(g: &PgGrid) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < g.cells.len() {
+        if g.cells.get(i) != PG_WALL {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Is every border tile a wall?
+pub fn pg_border_is_wall(g: &PgGrid) -> bool {
+    var x: i64 = 0;
+    while x < g.w {
+        if pg_walkable(g, x, 0) || pg_walkable(g, x, g.h - 1) {
+            return false;
+        }
+        x = x + 1;
+    }
+    var y: i64 = 0;
+    while y < g.h {
+        if pg_walkable(g, 0, y) || pg_walkable(g, g.w - 1, y) {
+            return false;
+        }
+        y = y + 1;
+    }
+    return true;
+}
+
+/// Label 4-connected walkable regions: label per tile (-1 for walls);
+/// the region count is the largest label + 1.
+pub fn pg_grid_regions(g: &PgGrid) -> Vec<i64> {
+    var label: Vec<i64> = Vec::filled(g.w * g.h, - 1);
+    var next: i64 = 0;
+    var i: i64 = 0;
+    while i < g.cells.len() {
+        if g.cells.get(i) != PG_WALL && label.get(i) < 0 {
+            var stack: Vec<i64> = Vec::new();
+            stack.push(i);
+            label.set(i, next);
+            while stack.len() > 0 {
+                val c: i64 = stack.pop();
+                val cx: i64 = c % g.w;
+                val cy: i64 = c / g.w;
+                var d: i64 = 0;
+                while d < 4 {
+                    var nx: i64 = cx;
+                    var ny: i64 = cy;
+                    if d == 0 { nx = cx + 1; }
+                    if d == 1 { nx = cx - 1; }
+                    if d == 2 { ny = cy + 1; }
+                    if d == 3 { ny = cy - 1; }
+                    if nx >= 0 && ny >= 0 && nx < g.w && ny < g.h {
+                        val ni: i64 = nx + g.w * ny;
+                        if g.cells.get(ni) != PG_WALL && label.get(ni) < 0 {
+                            label.set(ni, next);
+                            stack.push(ni);
+                        }
+                    }
+                    d = d + 1;
+                }
+            }
+            next = next + 1;
+        }
+        i = i + 1;
+    }
+    return label;
+}
+
+pub fn pg_region_count(g: &PgGrid) -> i64 {
+    val l: Vec<i64> = pg_grid_regions(g);
+    var m: i64 = - 1;
+    var i: i64 = 0;
+    while i < l.len() {
+        if l.get(i) > m {
+            m = l.get(i);
+        }
+        i = i + 1;
+    }
+    return m + 1;
+}
+
+/// One connected walkable region (or none)?
+pub fn pg_grid_connected(g: &PgGrid) -> bool {
+    return pg_region_count(g) <= 1;
+}
+
+/// Fill every region but the largest with wall.
+pub fn pg_keep_largest_region(g: &mut PgGrid) {
+    val l: Vec<i64> = pg_grid_regions(g);
+    var sizes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < l.len() {
+        val r: i64 = l.get(i);
+        while r >= 0 && sizes.len() <= r {
+            sizes.push(0);
+        }
+        if r >= 0 {
+            sizes.set(r, sizes.get(r) + 1);
+        }
+        i = i + 1;
+    }
+    var best: i64 = - 1;
+    var bs: i64 = - 1;
+    i = 0;
+    while i < sizes.len() {
+        if sizes.get(i) > bs {
+            bs = sizes.get(i);
+            best = i;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < l.len() {
+        if l.get(i) >= 0 && l.get(i) != best {
+            g.cells.set(i, PG_WALL);
+        }
+        i = i + 1;
+    }
+}
+
+/// The grid as text: '#' wall, '.' floor, ',' corridor; one line per row.
+pub fn pg_grid_to_str(g: &PgGrid) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    var y: i64 = 0;
+    while y < g.h {
+        var x: i64 = 0;
+        while x < g.w {
+            val v: i64 = pg_get(g, x, y);
+            if v == PG_WALL {
+                sb.append_str("#");
+            } else if v == PG_CORRIDOR {
+                sb.append_str(",");
+            } else {
+                sb.append_str(".");
+            }
+            x = x + 1;
+        }
+        sb.append_str("\n");
+        y = y + 1;
+    }
+    return sb.to_str();
+}
+
+/// FNV-1a over the tiles: a fingerprint for determinism checks.
+@wrapping
+pub fn pg_grid_hash(g: &PgGrid) -> i64 {
+    var h: i64 = 0xcbf29ce484222325;
+    var i: i64 = 0;
+    while i < g.cells.len() {
+        h = (h ^ g.cells.get(i)) * 0x100000001b3;
+        i = i + 1;
+    }
+    return h & 0x7FFFFFFFFFFFFFFF;
+}
+
+// ─── BSP dungeon ───────────────────────────────────────────────────────────
+
+pub struct PgRoom {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+}
+
+pub struct PgDungeon {
+    pub grid: PgGrid,
+    pub rooms: Vec<PgRoom>,
+}
+
+pub fn pg_room_center_x(r: PgRoom) -> i64 {
+    return r.x + r.w / 2;
+}
+
+pub fn pg_room_center_y(r: PgRoom) -> i64 {
+    return r.y + r.h / 2;
+}
+
+/// Do two rooms overlap or touch (share an edge or corner)?
+pub fn pg_rooms_touch(a: PgRoom, b: PgRoom) -> bool {
+    return a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h;
+}
+
+fn pg_carve(g: &mut PgGrid, x: i64, y: i64) {
+    if x <= 0 || y <= 0 || x >= g.w - 1 || y >= g.h - 1 {
+        return;
+    }
+    if pg_get(g, x, y) == PG_WALL {
+        pg_set(g, x, y, PG_CORRIDOR);
+    }
+}
+
+/// An L-shaped corridor from (x0, y0) to (x1, y1); horizontal first when
+/// `h_first`.
+pub fn pg_corridor(g: &mut PgGrid, x0: i64, y0: i64, x1: i64, y1: i64, h_first: bool) {
+    var x: i64 = x0;
+    var y: i64 = y0;
+    pg_carve(g, x, y);
+    if h_first {
+        while x != x1 {
+            if x < x1 { x = x + 1; } else { x = x - 1; }
+            pg_carve(g, x, y);
+        }
+        while y != y1 {
+            if y < y1 { y = y + 1; } else { y = y - 1; }
+            pg_carve(g, x, y);
+        }
+    } else {
+        while y != y1 {
+            if y < y1 { y = y + 1; } else { y = y - 1; }
+            pg_carve(g, x, y);
+        }
+        while x != x1 {
+            if x < x1 { x = x + 1; } else { x = x - 1; }
+            pg_carve(g, x, y);
+        }
+    }
+}
+
+// BSP node arrays: rect, children, and the rooms below each node.
+struct PgBsp {
+    nx: Vec<i64>,
+    ny: Vec<i64>,
+    nw: Vec<i64>,
+    nh: Vec<i64>,
+    left: Vec<i64>,
+    right: Vec<i64>,
+}
+
+fn pg_bsp_add(b: &mut PgBsp, x: i64, y: i64, w: i64, h: i64) -> i64 {
+    b.nx.push(x);
+    b.ny.push(y);
+    b.nw.push(w);
+    b.nh.push(h);
+    b.left.push(- 1);
+    b.right.push(- 1);
+    return b.nx.len() - 1;
+}
+
+// rooms (indices) under a node
+fn pg_bsp_rooms(b: &PgBsp, node: i64, room_of: &Vec<i64>, out: &mut Vec<i64>) {
+    if b.left.get(node) < 0 {
+        if room_of.get(node) >= 0 {
+            out.push(room_of.get(node));
+        }
+        return;
+    }
+    pg_bsp_rooms(b, b.left.get(node), room_of, out);
+    pg_bsp_rooms(b, b.right.get(node), room_of, out);
+}
+
+/// A dungeon of rooms and corridors on a w x h map. Leaves are at least
+/// `min_leaf` tiles on a side (min_leaf >= 5); rooms are at least 3x3.
+pub fn pg_bsp_dungeon(w: i64, h: i64, min_leaf: i64, seed: i64) -> PgDungeon {
+    var r: PgRng = pg_rng_new(seed);
+    var g: PgGrid = pg_grid_new(w, h, PG_WALL);
+    var b: PgBsp = PgBsp { nx: Vec::new(), ny: Vec::new(), nw: Vec::new(), nh: Vec::new(), left: Vec::new(), right: Vec::new() };
+    var ml: i64 = min_leaf;
+    if ml < 5 {
+        ml = 5;
+    }
+    pg_bsp_add(&mut b, 0, 0, w, h);
+    // split breadth first
+    var i: i64 = 0;
+    while i < b.nx.len() {
+        val x: i64 = b.nx.get(i);
+        val y: i64 = b.ny.get(i);
+        val nw: i64 = b.nw.get(i);
+        val nh: i64 = b.nh.get(i);
+        var vertical: bool = pg_rng_chance(&mut r, 50);
+        if nw * 4 > nh * 5 {
+            vertical = true;
+        } else if nh * 4 > nw * 5 {
+            vertical = false;
+        }
+        var size: i64 = nh;
+        if vertical {
+            size = nw;
+        }
+        if size >= 2 * ml {
+            val cut: i64 = pg_rng_range(&mut r, ml, size - ml);
+            var l: i64 = 0;
+            var rr: i64 = 0;
+            if vertical {
+                l = pg_bsp_add(&mut b, x, y, cut, nh);
+                rr = pg_bsp_add(&mut b, x + cut, y, nw - cut, nh);
+            } else {
+                l = pg_bsp_add(&mut b, x, y, nw, cut);
+                rr = pg_bsp_add(&mut b, x, y + cut, nw, nh - cut);
+            }
+            b.left.set(i, l);
+            b.right.set(i, rr);
+        }
+        i = i + 1;
+    }
+    // a room per leaf, inside the leaf with a one-tile margin
+    var rooms: Vec<PgRoom> = Vec::new();
+    var room_of: Vec<i64> = Vec::filled(b.nx.len(), - 1);
+    i = 0;
+    while i < b.nx.len() {
+        if b.left.get(i) < 0 {
+            val lw: i64 = b.nw.get(i) - 2;
+            val lh: i64 = b.nh.get(i) - 2;
+            val rw: i64 = pg_rng_range(&mut r, 3, lw - 1);
+            val rh: i64 = pg_rng_range(&mut r, 3, lh - 1);
+            val rx: i64 = b.nx.get(i) + 1 + pg_rng_range(&mut r, 0, lw - 1 - rw);
+            val ry: i64 = b.ny.get(i) + 1 + pg_rng_range(&mut r, 0, lh - 1 - rh);
+            room_of.set(i, rooms.len());
+            rooms.push(PgRoom { x: rx, y: ry, w: rw, h: rh });
+            var yy: i64 = ry;
+            while yy < ry + rh {
+                var xx: i64 = rx;
+                while xx < rx + rw {
+                    pg_set(&mut g, xx, yy, PG_FLOOR);
+                    xx = xx + 1;
+                }
+                yy = yy + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // join the two halves of every split with the closest pair of rooms
+    i = b.nx.len() - 1;
+    while i >= 0 {
+        if b.left.get(i) >= 0 {
+            var la: Vec<i64> = Vec::new();
+            var lb: Vec<i64> = Vec::new();
+            pg_bsp_rooms(&b, b.left.get(i), &room_of, &mut la);
+            pg_bsp_rooms(&b, b.right.get(i), &room_of, &mut lb);
+            var best_a: i64 = la.get(0);
+            var best_b: i64 = lb.get(0);
+            var best_d: i64 = - 1;
+            var p: i64 = 0;
+            while p < la.len() {
+                var q: i64 = 0;
+                while q < lb.len() {
+                    val ra: PgRoom = rooms.get(la.get(p));
+                    val rb: PgRoom = rooms.get(lb.get(q));
+                    val dx: i64 = pg_room_center_x(ra) - pg_room_center_x(rb);
+                    val dy: i64 = pg_room_center_y(ra) - pg_room_center_y(rb);
+                    val d: i64 = dx * dx + dy * dy;
+                    if best_d < 0 || d < best_d {
+                        best_d = d;
+                        best_a = la.get(p);
+                        best_b = lb.get(q);
+                    }
+                    q = q + 1;
+                }
+                p = p + 1;
+            }
+            val ra: PgRoom = rooms.get(best_a);
+            val rb: PgRoom = rooms.get(best_b);
+            pg_corridor(&mut g, pg_room_center_x(ra), pg_room_center_y(ra), pg_room_center_x(rb), pg_room_center_y(rb), pg_rng_chance(&mut r, 50));
+        }
+        i = i - 1;
+    }
+    return PgDungeon { grid: g, rooms: rooms };
+}
+
+// ─── Drunkard's walk ───────────────────────────────────────────────────────
+
+/// Carve from the centre with random steps until `pct` percent of the
+/// inner tiles are floor.
+pub fn pg_drunkard(w: i64, h: i64, pct: i64, seed: i64) -> PgGrid {
+    var r: PgRng = pg_rng_new(seed);
+    var g: PgGrid = pg_grid_new(w, h, PG_WALL);
+    val target: i64 = (w - 2) * (h - 2) * pct / 100;
+    var x: i64 = w / 2;
+    var y: i64 = h / 2;
+    pg_set(&mut g, x, y, PG_FLOOR);
+    var floor: i64 = 1;
+    var steps: i64 = 0;
+    while floor < target && steps < 1000000 {
+        val d: i64 = pg_rng_below(&mut r, 4);
+        var nx: i64 = x;
+        var ny: i64 = y;
+        if d == 0 { nx = x + 1; }
+        if d == 1 { nx = x - 1; }
+        if d == 2 { ny = y + 1; }
+        if d == 3 { ny = y - 1; }
+        if nx >= 1 && ny >= 1 && nx <= w - 2 && ny <= h - 2 {
+            x = nx;
+            y = ny;
+            if pg_get(&g, x, y) == PG_WALL {
+                pg_set(&mut g, x, y, PG_FLOOR);
+                floor = floor + 1;
+            }
+        }
+        steps = steps + 1;
+    }
+    return g;
+}
+
+// ─── Cellular automata caves ───────────────────────────────────────────────
+
+fn pg_walls_around(g: &PgGrid, x: i64, y: i64) -> i64 {
+    var n: i64 = 0;
+    var dy: i64 = - 1;
+    while dy <= 1 {
+        var dx: i64 = - 1;
+        while dx <= 1 {
+            if !pg_walkable(g, x + dx, y + dy) {
+                n = n + 1;
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return n;
+}
+
+/// One automaton step: wall where 5+ of the 9 tiles around are walls.
+pub fn pg_cave_step(g: &PgGrid) -> PgGrid {
+    var out: PgGrid = pg_grid_new(g.w, g.h, PG_WALL);
+    var y: i64 = 1;
+    while y < g.h - 1 {
+        var x: i64 = 1;
+        while x < g.w - 1 {
+            if pg_walls_around(g, x, y) < 5 {
+                pg_set(&mut out, x, y, PG_FLOOR);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return out;
+}
+
+/// A cave: `wall_pct` percent random walls, `steps` automaton steps, then
+/// only the largest connected cave kept.
+pub fn pg_cave(w: i64, h: i64, wall_pct: i64, steps: i64, seed: i64) -> PgGrid {
+    var r: PgRng = pg_rng_new(seed);
+    var g: PgGrid = pg_grid_new(w, h, PG_WALL);
+    var y: i64 = 1;
+    while y < h - 1 {
+        var x: i64 = 1;
+        while x < w - 1 {
+            if !pg_rng_chance(&mut r, wall_pct) {
+                pg_set(&mut g, x, y, PG_FLOOR);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var s: i64 = 0;
+    while s < steps {
+        g = pg_cave_step(&g);
+        s = s + 1;
+    }
+    pg_keep_largest_region(&mut g);
+    return g;
+}
+
+// ─── L-systems ─────────────────────────────────────────────────────────────
+
+pub struct LSystem {
+    pub axiom: str,
+    pub symbols: Vec<i64>,
+    pub replacements: Vec<str>,
+    /// Expansion stops growing past this many symbols.
+    pub max_len: i64,
+}
+
+pub fn ls_new(axiom: str) -> LSystem {
+    return LSystem { axiom: axiom, symbols: Vec::new(), replacements: Vec::new(), max_len: 4000000 };
+}
+
+/// Rule: every `sym` (one character) becomes `repl`.
+pub fn ls_rule(l: &mut LSystem, sym: str, repl: str) {
+    val c: i64 = str_byte_at(sym, 0);
+    var i: i64 = 0;
+    while i < l.symbols.len() {
+        if l.symbols.get(i) == c {
+            l.replacements.set(i, repl);
+            return;
+        }
+        i = i + 1;
+    }
+    l.symbols.push(c);
+    l.replacements.push(repl);
+}
+
+/// The string after n rewriting steps (symbols without a rule stay).
+pub fn ls_expand(l: &LSystem, n: i64) -> str {
+    var cur: str = l.axiom;
+    var step: i64 = 0;
+    while step < n {
+        var sb: StringBuilder = StringBuilder::new();
+        var len: i64 = 0;
+        var i: i64 = 0;
+        while i < str_len(cur) {
+            val c: i64 = str_byte_at(cur, i);
+            var k: i64 = 0;
+            var done: bool = false;
+            while k < l.symbols.len() {
+                if l.symbols.get(k) == c {
+                    sb.append_str(l.replacements.get(k));
+                    len = len + str_len(l.replacements.get(k));
+                    done = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if !done {
+                sb.append_char(c);
+                len = len + 1;
+            }
+            i = i + 1;
+        }
+        cur = sb.to_str();
+        if len > l.max_len {
+            return cur;
+        }
+        step = step + 1;
+    }
+    return cur;
+}
+
+/// Turtle drawing: segments as x0 y0 x1 y1, the final pose, the bounds.
+pub struct LsTurtle {
+    pub segments: Vec<f64>,
+    pub x: f64,
+    pub y: f64,
+    pub heading: f64,
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    /// Largest [ nesting reached; -1 when a ] had no matching [.
+    pub max_depth: i64,
+}
+
+fn ls_bound(t: &mut LsTurtle) {
+    if t.x < t.min_x { t.min_x = t.x; }
+    if t.y < t.min_y { t.min_y = t.y; }
+    if t.x > t.max_x { t.max_x = t.x; }
+    if t.y > t.max_y { t.max_y = t.y; }
+}
+
+/// Interpret s from (0,0) heading +x: F and G draw `step` forward, f moves,
+/// + turns left by `angle_deg`, - right, | half a turn, [ ] save/restore.
+pub fn ls_turtle(s: str, step: f64, angle_deg: f64) -> LsTurtle {
+    var t: LsTurtle = LsTurtle { segments: Vec::new(), x: 0.0, y: 0.0, heading: 0.0, min_x: 0.0, min_y: 0.0, max_x: 0.0, max_y: 0.0, max_depth: 0 };
+    val rad: f64 = angle_deg * 3.141592653589793 / 180.0;
+    var sx: Vec<f64> = Vec::new();
+    var sy: Vec<f64> = Vec::new();
+    var sh: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 70 || c == 71 || c == 102 {
+            val nx: f64 = t.x + step * math_cos(t.heading);
+            val ny: f64 = t.y + step * math_sin(t.heading);
+            if c != 102 {
+                t.segments.push(t.x);
+                t.segments.push(t.y);
+                t.segments.push(nx);
+                t.segments.push(ny);
+            }
+            t.x = nx;
+            t.y = ny;
+            ls_bound(&mut t);
+        } else if c == 43 {
+            t.heading = t.heading + rad;
+        } else if c == 45 {
+            t.heading = t.heading - rad;
+        } else if c == 124 {
+            t.heading = t.heading + 3.141592653589793;
+        } else if c == 91 {
+            sx.push(t.x);
+            sy.push(t.y);
+            sh.push(t.heading);
+            if sx.len() > t.max_depth && t.max_depth >= 0 {
+                t.max_depth = sx.len();
+            }
+        } else if c == 93 {
+            if sx.len() == 0 {
+                t.max_depth = - 1;
+            } else {
+                t.x = sx.pop();
+                t.y = sy.pop();
+                t.heading = sh.pop();
+            }
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+// ─── Poisson disk sampling ─────────────────────────────────────────────────
+
+/// Points (x, y pairs) in [0,w) x [0,h), pairwise at least r apart, filled
+/// to saturation (Bridson). k = tries per active point (30 is usual).
+pub fn pg_poisson_disk(w: f64, h: f64, r: f64, k: i64, seed: i64) -> Vec<f64> {
+    var rng: PgRng = pg_rng_new(seed);
+    val cell: f64 = r / math_sqrt(2.0);
+    val gw: i64 = (w / cell) as i64 + 1;
+    val gh: i64 = (h / cell) as i64 + 1;
+    var grid: Vec<i64> = Vec::filled(gw * gh, - 1);
+    var pts: Vec<f64> = Vec::new();
+    var active: Vec<i64> = Vec::new();
+    val x0: f64 = pg_rng_f64(&mut rng) * w;
+    val y0: f64 = pg_rng_f64(&mut rng) * h;
+    pts.push(x0);
+    pts.push(y0);
+    grid.set(((x0 / cell) as i64) + gw * ((y0 / cell) as i64), 0);
+    active.push(0);
+    while active.len() > 0 {
+        val ai: i64 = pg_rng_below(&mut rng, active.len());
+        val p: i64 = active.get(ai);
+        val px: f64 = pts.get(2 * p);
+        val py: f64 = pts.get(2 * p + 1);
+        var found: bool = false;
+        var tries: i64 = 0;
+        while tries < k && !found {
+            // uniform in the annulus r..2r
+            val ang: f64 = pg_rng_f64(&mut rng) * 6.283185307179586;
+            val rad: f64 = math_sqrt(pg_rng_f64(&mut rng) * 3.0 + 1.0) * r;
+            val cx: f64 = px + rad * math_cos(ang);
+            val cy: f64 = py + rad * math_sin(ang);
+            if cx >= 0.0 && cy >= 0.0 && cx < w && cy < h {
+                val gx: i64 = (cx / cell) as i64;
+                val gy: i64 = (cy / cell) as i64;
+                var ok: bool = true;
+                var yy: i64 = gy - 2;
+                while yy <= gy + 2 && ok {
+                    var xx: i64 = gx - 2;
+                    while xx <= gx + 2 && ok {
+                        if xx >= 0 && yy >= 0 && xx < gw && yy < gh {
+                            val q: i64 = grid.get(xx + gw * yy);
+                            if q >= 0 {
+                                val dx: f64 = pts.get(2 * q) - cx;
+                                val dy: f64 = pts.get(2 * q + 1) - cy;
+                                if dx * dx + dy * dy < r * r {
+                                    ok = false;
+                                }
+                            }
+                        }
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                if ok {
+                    val ni: i64 = pts.len() / 2;
+                    pts.push(cx);
+                    pts.push(cy);
+                    grid.set(gx + gw * gy, ni);
+                    active.push(ni);
+                    found = true;
+                }
+            }
+            tries = tries + 1;
+        }
+        if !found {
+            active.remove(ai);
+        }
+    }
+    return pts;
+}

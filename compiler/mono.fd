@@ -12,9 +12,7 @@
 // 5. Vec::iter().map().collect() -> explicit while loops with Vec::push
 // 6. &str -> str, String -> str, usize -> i64
 
-module compiler::mono;
- use core; use vec; use string; use compiler::ast;
-// --- Re-declared Opt enums (Fides doesn't import enums from other modules) -
+module compiler::mono; use core; use vec; use string; use compiler::ast;  // --- Re-declared Opt enums (Fides doesn't import enums from other modules) -
 
 pub enum OptType {
     Some(Type),
@@ -977,9 +975,29 @@ pub fn subst_expr(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
         Expr::Call(callee, args) => {
             var new_args: Vec<Expr> = Vec::new();
             var i: i64 = 0;
-            while i < args.len() {
+            // L8E: the pack being written out passed on as the last argument
+            // of a variadic function (a pack or a Vec variadic): its
+            // elements xs__0 .. xs__<m-1> become that call's last arguments
+            var fwd: bool = false;
+            if g_mono_pack_var != "" && args.len() > 0 {
+                if mono_is_ident(args.get(args.len() - 1), g_mono_pack_var) {
+                    fwd = mono_pack_fwd_ok(callee);
+                }
+            }
+            var n_own: i64 = args.len();
+            if fwd {
+                n_own = args.len() - 1;
+            }
+            while i < n_own {
                 new_args.push(subst_expr(args.get(i), subst, renames, method_renames));
                 i = i + 1;
+            }
+            if fwd {
+                var fk: i64 = 0;
+                while fk < g_mono_pack_n {
+                    new_args.push(Expr::Ident(g_mono_pack_var + "__" + int_to_str(fk)));
+                    fk = fk + 1;
+                }
             }
             var new_callee: str = callee;
             match rename_get(renames, callee) {
@@ -992,6 +1010,11 @@ pub fn subst_expr(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
             return Expr::Call(new_callee, new_args);
         }
         Expr::Ident(s) => {
+            // L8E: the pack being written out read any other way (xs[i],
+            // xs.get(i), passed as a value): it has no single type
+            if g_mono_pack_var != "" && s == g_mono_pack_var {
+                mono_pack_misuse();
+            }
             // Check if this is a const generic param being substituted
             match subst_get(subst, s) {
                 OptType::Some(replacement) => {
@@ -1089,6 +1112,23 @@ pub fn subst_expr(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
                         new_args.push(subst_expr(args.get(i), subst, renames, method_renames));
                         i = i + 1;
                     }
+                    // L8E: xs.len() / xs.get(K) of the pack being written out
+                    if g_mono_pack_var != "" && mono_is_ident(mn_box_expr_deref(receiver), g_mono_pack_var) {
+                        if method == "len" && new_args.len() == 0 {
+                            return Expr::IntLit(g_mono_pack_n);
+                        }
+                        if method == "get" && new_args.len() == 1 {
+                            match new_args.get(0) {
+                                Expr::IntLit(pk) => {
+                                    if pk >= 0 && pk < g_mono_pack_n {
+                                        return Expr::Ident(g_mono_pack_var + "__" + int_to_str(pk));
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                    }
                     return Expr::MethodCall(mn_box_expr_new(subst_expr(mn_box_expr_deref(receiver), subst, renames, method_renames)), method, new_args);
                 }
             }
@@ -1119,19 +1159,40 @@ pub fn subst_expr(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
 fn subst_expr_part2(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>, method_renames: Vec<RenameEntry>,) -> Expr {
     match expr {
         Expr::StructLit(name, fields, spread) => {
-            var new_fields: Vec<FieldInit> = Vec::new();
-            var i: i64 = 0;
-            while i < fields.len() {
-                new_fields.push(FieldInit_new(fields.get(i).name, subst_expr(fields.get(i).value, subst, renames, method_renames)));
-                i = i + 1;
-            }
+            // CL5: `S { a: 1, .. }` -- the defaults of the fields left out
+            // are written in (before substitution, so a default holding a
+            // literal of its own is filled too)
+            var all_fields: Vec<FieldInit> = fields;
+            var fill_depth_in: bool = false;
             var new_spread: OptBoxExpr = OptBoxExpr::None;
             match spread {
                 OptBoxExpr::Some(e) => {
-                    new_spread = OptBoxExpr::Some(mn_box_expr_new(subst_expr(mn_box_expr_deref(e), subst, renames, method_renames)));
+                    var se: Expr = mn_box_expr_deref(e);
+                    if ast_is_spread_defaults(se) {
+                        if g_mono_fill_defaults && g_mono_fill_depth < 32 {
+                            all_fields = mn_fill_struct_defaults(name, fields);
+                            g_mono_fill_depth = g_mono_fill_depth + 1;
+                            fill_depth_in = true;
+                        } else if !g_mono_fill_defaults {
+                            // not monomorphization (a rename pass before
+                            // type checking): keep the marker for later
+                            new_spread = OptBoxExpr::Some(mn_box_expr_new(se));
+                        }
+                    } else {
+                        new_spread = OptBoxExpr::Some(mn_box_expr_new(subst_expr(se, subst, renames, method_renames)));
+                    }
                 }
                 OptBoxExpr::None => {
                 }
+            }
+            var new_fields: Vec<FieldInit> = Vec::new();
+            var i: i64 = 0;
+            while i < all_fields.len() {
+                new_fields.push(FieldInit_new(all_fields.get(i).name, subst_expr(all_fields.get(i).value, subst, renames, method_renames)));
+                i = i + 1;
+            }
+            if fill_depth_in {
+                g_mono_fill_depth = g_mono_fill_depth - 1;
             }
             return Expr::StructLit(name, new_fields, new_spread);
         }
@@ -1183,6 +1244,7 @@ fn subst_expr_part2(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry
             while i < params.len() {
                 var p: Param = Param_new(params.get(i).name, subst_type(params.get(i).ty, subst), params.get(i).is_pub);
                 p.annotations = params.get(i).annotations;
+                p.is_variadic = params.get(i).is_variadic;
                 new_params.push(p);
                 i = i + 1;
             }
@@ -1376,6 +1438,10 @@ pub fn subst_stmt(stmt: Stmt, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
             return Stmt::While(subst_expr(cond, subst, renames, method_renames), new_body, line);
         }
         Stmt::For(var_name, iterator, body, line) => {
+            // L8E: a loop over the pack being written out is unrolled
+            if g_mono_pack_var != "" && mono_is_ident(iterator, g_mono_pack_var) {
+                return mono_pack_unroll(var_name, body, line, subst, renames, method_renames);
+            }
             var new_body: Vec<Stmt> = Vec::new();
             var i: i64 = 0;
             while i < body.len() {
@@ -1770,8 +1836,7 @@ pub fn MonoCtx_seen_insert(ctx: & mut MonoCtx, name: str) -> bool {
 // instantiation to the program, so every later pass sees an ordinary call
 // of an ordinary function.
 
-var g_mono_tf_only: bool = false; var g_mono_tf_table: Vec<Type> = Vec::new(); var g_mono_tf_names: Vec<str> = Vec::new(); var g_mono_tf_funcs: Vec<Func> = Vec::new(); var g_mono_tf_substs: Vec<Vec<SubstEntry>> = Vec::new(); var g_mono_tf_errors: Vec<str> = Vec::new();
-/// The errors of the last mono_resolve_turbofish.
+var g_mono_tf_only: bool = false; var g_mono_tf_table: Vec<Type> = Vec::new(); var g_mono_tf_names: Vec<str> = Vec::new(); var g_mono_tf_funcs: Vec<Func> = Vec::new(); var g_mono_tf_substs: Vec<Vec<SubstEntry>> = Vec::new(); var g_mono_tf_errors: Vec<str> = Vec::new();  /// The errors of the last mono_resolve_turbofish.
 pub fn mono_turbofish_errors() -> Vec<str> {
     return g_mono_tf_errors;
 }
@@ -1832,11 +1897,15 @@ fn mono_tf_body(f: Func, generics: Vec<GenericFuncEntry>) -> Func {
 
 /// Resolve the turbofish calls of `program` (table: the parser's
 /// turbofish_types). Errors are read with mono_turbofish_errors.
-pub fn mono_resolve_turbofish(program: Program, table: Vec<Type>) -> Program {
+pub fn mono_resolve_turbofish(program0: Program, table: Vec<Type>) -> Program {
     g_mono_tf_errors = Vec::new();
+    // L8E: variadic calls packed first, so the turbofish pass and type
+    // checking see a Vec argument
+    var program: Program = mono_desugar_variadics(program0);
     if table.len() == 0 {
         return program;
     }
+    mono_spec_setup(program);
     g_mono_tf_table = table;
     g_mono_tf_names = Vec::new();
     g_mono_tf_funcs = Vec::new();
@@ -1918,12 +1987,1537 @@ pub fn mono_resolve_turbofish(program: Program, table: Vec<Type>) -> Program {
     return result;
 }
 
+// --- L8E: variadic parameters ---------------------------------------------
+// `fn sum(...xs: i64)`: xs is a Vec<i64> in the body, and a call
+// `sum(1, 2, 3)` passes the arguments after the fixed ones packed into one,
+// `{ var __va_N: Vec<i64> = Vec::new(); __va_N.push(1); ...; __va_N }`.
+// Done on the merged program before type checking (mono_resolve_turbofish),
+// so every later pass sees an ordinary Vec parameter and argument; the type
+// checker registers the declared signature with the same Vec
+// (tc_variadic_param_ty). Not covered: generic variadic functions (their
+// element type would be written in the caller), methods, and a call with
+// named arguments (left as written, the checker reports its count).
+
+// L8H: the program's specializations `name__spec<k>` (ast.fd
+// spec_base_name), for instantiate
+var g_mono_specs: Vec<Func> = Vec::new();
+// L8H: the methods of narrower impls that specialize a generic impl's
+// (`impl Wrap<i64> { fn show__spec1(self: Wrap<i64>) }`, parser.fd
+// pd_impl_specializations), the struct each is a method of, and its impl's
+// type parameters
+var g_mono_mspecs: Vec<Func> = Vec::new();
+var g_mono_mspec_structs: Vec<str> = Vec::new();
+var g_mono_mspec_tps: Vec<Vec<str>> = Vec::new();
+
+fn mono_spec_setup(program: Program) {
+    g_mono_specs = Vec::new();
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if spec_base_name(program.funcs.get(i).name) != "" {
+            g_mono_specs.push(program.funcs.get(i));
+        }
+        i = i + 1;
+    }
+    // L8H: methods of narrower impls (parser.fd pd_impl_specializations)
+    g_mono_mspecs = Vec::new();
+    g_mono_mspec_structs = Vec::new();
+    g_mono_mspec_tps = Vec::new();
+    i = 0;
+    while i < program.impls.len() {
+        var imp: ImplDef = program.impls.get(i);
+        var j: i64 = 0;
+        while j < imp.methods.len() {
+            var m: Func = imp.methods.get(j);
+            if spec_base_name(m.name) != "" && m.params.len() > 0 && m.params.get(0).name == "self" {
+                g_mono_mspecs.push(m);
+                g_mono_mspec_structs.push(imp.struct_name);
+                g_mono_mspec_tps.push(imp.type_params);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// `self`'s type without a reference (`&mut Wrap<i64>`: Wrap<i64>).
+fn mono_self_value_type(t: Type) -> Type {
+    match t {
+        Type::Ref(inner, _) => {
+            return box_type_deref(inner);
+        }
+        _ => {
+        }
+    }
+    return t;
+}
+
+/// L8A: whether `tp` is one of the const parameters of method `f` (its
+/// impl's `const N: usize`, parser.fd pd_impl_consts).
+fn mono_is_const_param(f: Func, tp: str) -> bool {
+    var i: i64 = 0;
+    while i < f.const_params.len() {
+        if f.const_params.get(i).a == tp {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// --- LG4: generic methods (`fn m<U>(self, ..)` in an impl or trait impl) ---
+// A method with type parameters of its own is instantiated per call, like a
+// generic impl's: the call `v.m(x)` on a value of type Pos becomes
+// `Pos__m__T(v, x)` (fixup_generic_calls_expr), T what x's type gives U.
+// The impl keeps, under the plain name, the instance with i64 for them (as
+// a generic impl's methods keep theirs), for a call whose receiver mono
+// cannot type (`self.m(x)` inside the impl). A method without `self` is
+// not one: its calls (`Pos::m(x)`) pass no receiver.
+
+/// Whether `f` is a generic method LG4 instantiates.
+fn mono_lg4_generic(f: Func) -> bool {
+    if f.type_params.len() == 0 || f.params.len() == 0 {
+        return false;
+    }
+    return f.params.get(0).name == "self";
+}
+
+/// The type parameters an instantiation of method `f` of an impl with
+/// parameters `impl_tps` binds: the impl's, then (LG4) the method's own.
+fn mono_lg4_tps(impl_tps: Vec<str>, f: Func) -> Vec<str> {
+    if !mono_lg4_generic(f) {
+        return impl_tps;
+    }
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < impl_tps.len() {
+        out.push(impl_tps.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.type_params.len() {
+        if !str_vec_contains(out, f.type_params.get(i)) {
+            out.push(f.type_params.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Method `f` of the (non-generic) impl of `type_name` with `Self` read as
+/// that type: its instantiations are functions of their own
+/// (`Pos__m__str`), with no impl around them to say what `Self` is.
+fn mono_lg4_self(f: Func, type_name: str) -> Func {
+    var s: Vec<SubstEntry> = subst_new();
+    subst_set(& mut s, "Self", Type::Named(type_name));
+    var r: Func = f;
+    var ps: Vec<Param> = Vec::new();
+    var i: i64 = 0;
+    while i < f.params.len() {
+        var p: Param = f.params.get(i);
+        p.ty = subst_type(p.ty, s);
+        ps.push(p);
+        i = i + 1;
+    }
+    r.params = ps;
+    r.ret_ty = subst_type(f.ret_ty, s);
+    var body: Vec<Stmt> = Vec::new();
+    i = 0;
+    while i < f.body.len() {
+        body.push(subst_stmt(f.body.get(i), s, rename_new(), rename_new()));
+        i = i + 1;
+    }
+    r.body = body;
+    return r;
+}
+
+/// Whether the impl keeps method `f` under its plain name: always, but for
+/// a generic method whose own type parameters have bounds (`fn m<U: Show>`):
+/// its i64 instance would call Show's methods on an i64.
+fn mono_lg4_plain_ok(f: Func) -> bool {
+    if !mono_lg4_generic(f) {
+        return true;
+    }
+    var i: i64 = 0;
+    while i < f.type_param_bounds.len() {
+        if str_vec_contains(f.type_params, f.type_param_bounds.get(i).a) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `base` with i64 for each of method `f`'s own type parameters (the
+/// instance kept under the method's plain name).
+fn mono_lg4_i64_subst(f: Func, base: Vec<SubstEntry>) -> Vec<SubstEntry> {
+    var s: Vec<SubstEntry> = subst_new();
+    var i: i64 = 0;
+    while i < base.len() {
+        subst_set(& mut s, base.get(i).key, base.get(i).val);
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.type_params.len() {
+        if !subst_contains(s, f.type_params.get(i)) {
+            subst_set(& mut s, f.type_params.get(i), Type::I64);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// L8H: the instantiation `mangled` of method `gen_func` of the generic
+/// impl of `struct_name` (impl parameters `impl_tps`, bound in `subst`):
+/// with the body of the most specific narrower impl's method of that name
+/// whose type takes the receiver's (`impl Wrap<i64>` for a Wrap<i64>,
+/// `impl<U> Wrap<Vec<U>>` for a Wrap<Vec<str>>), else its own. The type
+/// checker has reported two that tie (TypeChecker_check_mspec_call).
+pub fn mono_method_inst(struct_name: str, gen_func: Func, impl_tps: Vec<str>, subst: Vec<SubstEntry>, mangled: str, ctx: & mut MonoCtx) -> Func {
+    if g_mono_mspecs.len() > 0 && spec_base_name(gen_func.name) == "" && impl_tps.len() > 0 {
+        var gargs: Vec<Type> = Vec::new();
+        var rargs: Vec<Type> = Vec::new();
+        var k: i64 = 0;
+        while k < impl_tps.len() {
+            gargs.push(Type::Named(impl_tps.get(k)));
+            rargs.push(subst_type(Type::Named(impl_tps.get(k)), subst));
+            k = k + 1;
+        }
+        var cands: Vec<Func> = Vec::new();
+        var at: Vec<i64> = Vec::new();
+        var base: Func = Func_new(gen_func.name, gen_func.ret_ty);
+        base.type_params = impl_tps;
+        var bps: Vec<Param> = Vec::new();
+        bps.push(Param_new("self", Type::Generic(struct_name, gargs), false));
+        base.params = bps;
+        cands.push(base);
+        at.push(- 1);
+        var si: i64 = 0;
+        while si < g_mono_mspecs.len() {
+            if g_mono_mspec_structs.get(si) == struct_name && spec_base_name(g_mono_mspecs.get(si).name) == gen_func.name {
+                val sm: Func = g_mono_mspecs.get(si);
+                var c: Func = Func_new(sm.name, sm.ret_ty);
+                c.type_params = g_mono_mspec_tps.get(si);
+                var cps: Vec<Param> = Vec::new();
+                cps.push(Param_new("self", mono_self_value_type(sm.params.get(0).ty), false));
+                c.params = cps;
+                cands.push(c);
+                at.push(si);
+            }
+            si = si + 1;
+        }
+        if cands.len() > 1 {
+            var concrete: Vec<Type> = Vec::new();
+            concrete.push(Type::Generic(struct_name, rargs));
+            var tie: Vec<i64> = Vec::new();
+            val chosen: i64 = spec_choose(cands, concrete, & mut tie);
+            if chosen > 0 {
+                val cf: Func = cands.get(chosen);
+                val ssub: Vec<SubstEntry> = infer_subst(spec_param_types(cf), concrete, cf.type_params);
+                return instantiate(g_mono_mspecs.get(at.get(chosen)), ssub, mangled, ctx);
+            }
+        }
+    }
+    return instantiate(gen_func, subst, mangled, ctx);
+}
+
+var g_mono_va_on: bool = false;
+var g_mono_va_only: bool = false;
+// function name -> 1 + index into g_mono_va_fixed / g_mono_va_elem
+var g_mono_va_at: i64 = 0;
+var g_mono_va_fixed: Vec<i64> = Vec::new();
+var g_mono_va_elem: Vec<Type> = Vec::new();
+var g_mono_va_n: i64 = 0;
+
+/// Whether `f` is a non-generic function whose last parameter is variadic.
+fn mono_va_last(f: Func) -> bool {
+    val n: i64 = f.params.len();
+    if n == 0 || f.type_params.len() > 0 {
+        return false;
+    }
+    return f.params.get(n - 1).is_variadic;
+}
+
+/// `f` with its variadic parameter `...xs: T` made `xs: Vec<T>`.
+fn mono_va_params(f: Func) -> Func {
+    var r: Func = f;
+    if !mono_va_last(f) {
+        return r;
+    }
+    var ps: Vec<Param> = Vec::new();
+    val n: i64 = f.params.len();
+    var i: i64 = 0;
+    while i < n {
+        var p: Param = f.params.get(i);
+        if i == n - 1 {
+            var ta: Vec<Type> = Vec::new();
+            ta.push(p.ty);
+            p.ty = Type::Generic("Vec", ta);
+            p.is_variadic = false;
+        }
+        ps.push(p);
+        i = i + 1;
+    }
+    r.params = ps;
+    return r;
+}
+
+/// The arguments of a call of a variadic function with `fixed` parameters
+/// before the variadic one of element type `elem`: the fixed ones, then
+/// the rest packed into one Vec.
+fn mono_va_pack(args: Vec<Expr>, fixed: i64, elem: Type) -> Vec<Expr> {
+    var i: i64 = 0;
+    while i < args.len() {
+        match args.get(i) {
+            Expr::NamedArg(_, _) => {
+                return args;
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    if args.len() < fixed {
+        return args;
+    }
+    var out: Vec<Expr> = Vec::new();
+    i = 0;
+    while i < fixed {
+        out.push(args.get(i));
+        i = i + 1;
+    }
+    g_mono_va_n = g_mono_va_n + 1;
+    val vn: str = "__va_" + int_to_str(g_mono_va_n);
+    var ta: Vec<Type> = Vec::new();
+    ta.push(elem);
+    var no_args: Vec<Expr> = Vec::new();
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Let(vn, OptType::Some(Type::Generic("Vec", ta)), Expr::MethodCall(mn_box_expr_new(Expr::Ident("Vec")), "new", no_args), true, false, Vec::new(), 0));
+    while i < args.len() {
+        var pa: Vec<Expr> = Vec::new();
+        pa.push(args.get(i));
+        body.push(Stmt::Expr(Expr::MethodCall(mn_box_expr_new(Expr::Ident(vn)), "push", pa), 0));
+        i = i + 1;
+    }
+    body.push(Stmt::Expr(Expr::Ident(vn), 0));
+    out.push(Expr::Block(body));
+    return out;
+}
+
+fn mono_va_body(f: Func) -> Func {
+    var r: Func = f;
+    var no_generics: Vec<GenericFuncEntry> = Vec::new();
+    var no_methods: Vec<GenericMethodEntry> = Vec::new();
+    var nb: Vec<Stmt> = fixup_generic_calls(f.body, no_generics, no_methods, f);
+    r.body = nb;
+    return r;
+}
+
+// --- L8E: variadic packs (comptime tuples) ---------------------------------
+// `fn show<T>(label: str, ...xs: T)` where T types nothing but xs: xs is a
+// pack, each argument with a type of its own (`show("a", 1, "two", true)`).
+// A call with m arguments after the fixed ones calls `show__pack<m>`, a
+// clone whose pack is m parameters `xs__0: T__0` .. `xs__<m-1>: T__<m-1>`;
+// the usual monomorphization then makes one instance per call shape (the
+// argument types). In the clone's body, which is written out here:
+//   xs.len()          is m (a constant),
+//   xs.get(K)         for a literal K < m is xs__K,
+//   for x in xs { B } is B once per element, x bound to xs__k and T meaning
+//                     T__k in that copy (a comptime-unrolled loop).
+//   f(.., xs)         where f is a pack or a Vec variadic function, passes
+//                     the pack on: f(.., xs__0, .., xs__<m-1>).
+// `break` and `continue` of an unrolled loop work as in a loop
+// (mono_pack_unroll_jumps). Any other use of xs (xs.get(i) with a variable
+// i, xs[i], xs passed as one value) is an error (mono_pack_misuse, read
+// with mono_turbofish_errors). Not covered: methods, calls with named
+// arguments.
+
+// name of a pack function -> 1 + index into g_mono_pack_funcs (0: none)
+var g_mono_pack_at: i64 = 0;
+var g_mono_pack_funcs: Vec<Func> = Vec::new();
+// clone name -> 1 once asked for
+var g_mono_pack_made: i64 = 0;
+// clones still to write: name, element count, 1 + pack function index
+var g_mono_pack_todo: Vec<str> = Vec::new();
+var g_mono_pack_todo_n: Vec<i64> = Vec::new();
+var g_mono_pack_todo_of: Vec<i64> = Vec::new();
+// while a clone's body is written out (subst_expr / subst_stmt): the pack
+// parameter ("" = none), its element type parameter, its element count
+var g_mono_pack_var: str = "";
+var g_mono_pack_tp: str = "";
+var g_mono_pack_n: i64 = 0;
+// the pack function whose clone is being written out (for its errors), and
+// a counter naming the flags and one-pass loops of unrolled pack loops
+var g_mono_pack_fname: str = "";
+var g_mono_pack_uid: i64 = 0;
+
+/// Whether the pack being written out may be passed on, as the last
+/// argument, to `callee`: a pack function or a Vec variadic function.
+fn mono_pack_fwd_ok(callee: str) -> bool {
+    if g_mono_pack_at != 0 {
+        if HashMap_get(g_mono_pack_at, callee) > 0 {
+            return true;
+        }
+    }
+    if g_mono_va_at != 0 {
+        if HashMap_get(g_mono_va_at, callee) > 0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The error for a use of the pack being written out that it cannot have
+/// (its elements have types of their own): once per function.
+fn mono_pack_misuse() {
+    val v: str = g_mono_pack_var;
+    val msg: str = "Type error (in '" + g_mono_pack_fname + "'): the pack '" + v + "' (`..." + v + ": " + g_mono_pack_tp + "`) has no single type: its elements each have their own.\n    Fix: read it as " + v + ".len(), " + v + ".get(K) with a literal K below its length, `for x in " + v + " { .. }`, or pass it on whole as the last argument of a variadic function (`f(.., " + v + ")`).";
+    var i: i64 = 0;
+    while i < g_mono_tf_errors.len() {
+        if g_mono_tf_errors.get(i) == msg {
+            return;
+        }
+        i = i + 1;
+    }
+    g_mono_tf_errors.push(msg);
+}
+
+/// What an unrolled pack loop's body does to the loop itself: 1 when it
+/// has a `break`, 2 a `continue`, 3 both (not counting those of loops
+/// inside it).
+fn mono_pack_jumps(stmts: Vec<Stmt>) -> i64 {
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < stmts.len() {
+        bits = bits | mono_pack_jumps_stmt(stmts.get(i));
+        i = i + 1;
+    }
+    return bits;
+}
+
+fn mono_pack_jumps_arms(arms: Vec<MatchArm>) -> i64 {
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < arms.len() {
+        bits = bits | mono_pack_jumps(arms.get(i).body);
+        i = i + 1;
+    }
+    return bits;
+}
+
+fn mono_pack_jumps_expr(e: Expr) -> i64 {
+    match e {
+        Expr::If(_, tb, eb) => {
+            var bits: i64 = mono_pack_jumps(tb);
+            match eb {
+                OptStmts::Some(es) => {
+                    bits = bits | mono_pack_jumps(es);
+                }
+                OptStmts::None => {
+                }
+            }
+            return bits;
+        }
+        Expr::Block(bs) => {
+            return mono_pack_jumps(bs);
+        }
+        Expr::Match(_, arms) => {
+            return mono_pack_jumps_arms(arms);
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+fn mono_pack_jumps_stmt(s: Stmt) -> i64 {
+    match s {
+        Stmt::Break(_, _) => {
+            return 1;
+        }
+        Stmt::Continue(_) => {
+            return 2;
+        }
+        Stmt::If(_, tb, eb, _) => {
+            var bits: i64 = mono_pack_jumps(tb);
+            match eb {
+                OptStmts::Some(es) => {
+                    bits = bits | mono_pack_jumps(es);
+                }
+                OptStmts::None => {
+                }
+            }
+            return bits;
+        }
+        Stmt::Match(_, arms, _) => {
+            return mono_pack_jumps_arms(arms);
+        }
+        Stmt::Unsafe(us, _) => {
+            return mono_pack_jumps(us);
+        }
+        Stmt::Expr(e, _) => {
+            return mono_pack_jumps_expr(e);
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+/// `stmts` with each `break` of the unrolled loop (not of a loop inside
+/// it) preceded by `flag = true`, so the copies after it are skipped.
+fn mono_pack_mark_breaks(stmts: Vec<Stmt>, flag: str) -> Vec<Stmt> {
+    var out: Vec<Stmt> = Vec::new();
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Break(bv, bl) => {
+                out.push(Stmt::Assign(flag, AssignOp::Assign, Expr::BoolLit(true), bl));
+                out.push(Stmt::Break(bv, bl));
+            }
+            s => {
+                out.push(mono_pack_mark_stmt(s, flag));
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mono_pack_mark_else(eb: OptStmts, flag: str) -> OptStmts {
+    match eb {
+        OptStmts::Some(es) => {
+            return OptStmts::Some(mono_pack_mark_breaks(es, flag));
+        }
+        OptStmts::None => {
+        }
+    }
+    return OptStmts::None;
+}
+
+fn mono_pack_mark_arms(arms: Vec<MatchArm>, flag: str) -> Vec<MatchArm> {
+    var out: Vec<MatchArm> = Vec::new();
+    var i: i64 = 0;
+    while i < arms.len() {
+        var a: MatchArm = arms.get(i);
+        a.body = mono_pack_mark_breaks(a.body, flag);
+        out.push(a);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mono_pack_mark_stmt(s: Stmt, flag: str) -> Stmt {
+    match s {
+        Stmt::If(c, tb, eb, l) => {
+            return Stmt::If(c, mono_pack_mark_breaks(tb, flag), mono_pack_mark_else(eb, flag), l);
+        }
+        Stmt::Match(m, arms, l) => {
+            return Stmt::Match(m, mono_pack_mark_arms(arms, flag), l);
+        }
+        Stmt::Unsafe(us, l) => {
+            return Stmt::Unsafe(mono_pack_mark_breaks(us, flag), l);
+        }
+        Stmt::Expr(e, l) => {
+            match e {
+                Expr::If(c, tb, eb) => {
+                    return Stmt::Expr(Expr::If(c, mono_pack_mark_breaks(tb, flag), mono_pack_mark_else(eb, flag)), l);
+                }
+                Expr::Block(bs) => {
+                    return Stmt::Expr(Expr::Block(mono_pack_mark_breaks(bs, flag)), l);
+                }
+                Expr::Match(m, arms) => {
+                    return Stmt::Expr(Expr::Match(m, mono_pack_mark_arms(arms, flag)), l);
+                }
+                _ => {
+                }
+            }
+            return Stmt::Expr(e, l);
+        }
+        _ => {
+        }
+    }
+    return s;
+}
+
+/// Whether type `t` mentions the type name `name`.
+fn mono_type_mentions(t: Type, name: str) -> bool {
+    match t {
+        Type::Named(n) => {
+            return n == name;
+        }
+        Type::Generic(g, gargs) => {
+            if g == name {
+                return true;
+            }
+            var i: i64 = 0;
+            while i < gargs.len() {
+                if mono_type_mentions(gargs.get(i), name) {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        Type::Ref(inner, _) => {
+            return mono_type_mentions(box_type_deref(inner), name);
+        }
+        Type::RawPtr(inner, _) => {
+            return mono_type_mentions(box_type_deref(inner), name);
+        }
+        Type::Array(e, _) => {
+            return mono_type_mentions(box_type_deref(e), name);
+        }
+        Type::ArrayConst(e, _) => {
+            return mono_type_mentions(box_type_deref(e), name);
+        }
+        Type::Tuple(ts) => {
+            var j: i64 = 0;
+            while j < ts.len() {
+                if mono_type_mentions(ts.get(j), name) {
+                    return true;
+                }
+                j = j + 1;
+            }
+        }
+        Type::Func(ps, r) => {
+            var k: i64 = 0;
+            while k < ps.len() {
+                if mono_type_mentions(ps.get(k), name) {
+                    return true;
+                }
+                k = k + 1;
+            }
+            return mono_type_mentions(box_type_deref(r), name);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// T when `f` is `fn f<.., T, ..>(.., ...xs: T)` and T types nothing but
+/// xs (a pack), else "".
+fn mono_pack_tp(f: Func) -> str {
+    val n: i64 = f.params.len();
+    if n == 0 || f.type_params.len() == 0 {
+        return "";
+    }
+    val last: Param = f.params.get(n - 1);
+    if !last.is_variadic {
+        return "";
+    }
+    var tp: str = "";
+    match last.ty {
+        Type::Named(t) => {
+            tp = t;
+        }
+        _ => {
+        }
+    }
+    if tp == "" {
+        return "";
+    }
+    var is_tp: bool = false;
+    var i: i64 = 0;
+    while i < f.type_params.len() {
+        if f.type_params.get(i) == tp {
+            is_tp = true;
+        }
+        i = i + 1;
+    }
+    if !is_tp {
+        return "";
+    }
+    i = 0;
+    while i < n - 1 {
+        if mono_type_mentions(f.params.get(i).ty, tp) {
+            return "";
+        }
+        i = i + 1;
+    }
+    if mono_type_mentions(f.ret_ty, tp) {
+        return "";
+    }
+    return tp;
+}
+
+fn mono_is_ident(e: Expr, name: str) -> bool {
+    match e {
+        Expr::Ident(s) => {
+            return s == name;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The clone a call of pack function `callee` (1 + index `pat`) with
+/// `args` calls, asked for when new; "" when the call is left as written
+/// (named arguments, fewer arguments than the fixed parameters).
+fn mono_pack_call(callee: str, pat: i64, args: Vec<Expr>) -> str {
+    var i: i64 = 0;
+    while i < args.len() {
+        match args.get(i) {
+            Expr::NamedArg(_, _) => {
+                return "";
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    val fixed: i64 = g_mono_pack_funcs.get(pat - 1).params.len() - 1;
+    if args.len() < fixed {
+        return "";
+    }
+    val m: i64 = args.len() - fixed;
+    val name: str = callee + "__pack" + int_to_str(m);
+    if HashMap_get(g_mono_pack_made, name) == 0 {
+        HashMap_insert(g_mono_pack_made, name, 1);
+        g_mono_pack_todo.push(name);
+        g_mono_pack_todo_n.push(m);
+        g_mono_pack_todo_of.push(pat);
+    }
+    return name;
+}
+
+/// `for x in xs { body }` over the pack being written out: the body once
+/// per element, in its own block, x bound to xs__k and T read as T__k.
+fn mono_pack_unroll(x: str, body: Vec<Stmt>, line: i64, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>, method_renames: Vec<RenameEntry>) -> Stmt {
+    // A `break` or `continue` of the loop itself: each copy runs inside a
+    // one-pass loop (`for __pk_once_N in 0..1`), so `continue` ends that
+    // copy and goes on to the next; a `break` also sets a flag that skips
+    // the copies after it.
+    if mono_pack_jumps(body) != 0 {
+        return mono_pack_unroll_jumps(x, body, line, subst, renames, method_renames);
+    }
+    var copies: Vec<Stmt> = Vec::new();
+    var k: i64 = 0;
+    while k < g_mono_pack_n {
+        var ks: Vec<SubstEntry> = Vec::new();
+        var s: i64 = 0;
+        while s < subst.len() {
+            ks.push(subst.get(s));
+            s = s + 1;
+        }
+        subst_set(& mut ks, g_mono_pack_tp, Type::Named(g_mono_pack_tp + "__" + int_to_str(k)));
+        var one: Vec<Stmt> = Vec::new();
+        one.push(Stmt::Let(x, OptType::None, Expr::Ident(g_mono_pack_var + "__" + int_to_str(k)), false, false, Vec::new(), line));
+        var i: i64 = 0;
+        while i < body.len() {
+            one.push(subst_stmt(body.get(i), ks, renames, method_renames));
+            i = i + 1;
+        }
+        copies.push(Stmt::If(Expr::BoolLit(true), one, OptStmts::None, line));
+        k = k + 1;
+    }
+    return Stmt::If(Expr::BoolLit(true), copies, OptStmts::None, line);
+}
+
+/// mono_pack_unroll for a body that breaks or continues the loop:
+///   var __pk_brk_N: bool = false;                    (only with a break)
+///   if !__pk_brk_N { for __pk_once_N in 0..1 { val x = xs__k; B_k } }
+/// once per element k, where B_k is the body with T read as T__k and each
+/// `break` of the loop preceded by `__pk_brk_N = true`.
+fn mono_pack_unroll_jumps(x: str, body: Vec<Stmt>, line: i64, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>, method_renames: Vec<RenameEntry>) -> Stmt {
+    g_mono_pack_uid = g_mono_pack_uid + 1;
+    val uid: str = int_to_str(g_mono_pack_uid);
+    val flag: str = "__pk_brk_" + uid;
+    val has_break: bool = (mono_pack_jumps(body) & 1) != 0;
+    var copies: Vec<Stmt> = Vec::new();
+    if has_break {
+        copies.push(Stmt::Let(flag, OptType::Some(Type::Bool), Expr::BoolLit(false), true, false, Vec::new(), line));
+    }
+    var k: i64 = 0;
+    while k < g_mono_pack_n {
+        var ks: Vec<SubstEntry> = Vec::new();
+        var s: i64 = 0;
+        while s < subst.len() {
+            ks.push(subst.get(s));
+            s = s + 1;
+        }
+        subst_set(& mut ks, g_mono_pack_tp, Type::Named(g_mono_pack_tp + "__" + int_to_str(k)));
+        var one: Vec<Stmt> = Vec::new();
+        one.push(Stmt::Let(x, OptType::None, Expr::Ident(g_mono_pack_var + "__" + int_to_str(k)), false, false, Vec::new(), line));
+        var i: i64 = 0;
+        while i < body.len() {
+            one.push(subst_stmt(body.get(i), ks, renames, method_renames));
+            i = i + 1;
+        }
+        if has_break {
+            one = mono_pack_mark_breaks(one, flag);
+        }
+        var once: Vec<Stmt> = Vec::new();
+        once.push(Stmt::For("__pk_once_" + uid, Expr::Range(mn_box_expr_new(Expr::IntLit(0)), mn_box_expr_new(Expr::IntLit(1)), false), one, line));
+        if has_break {
+            copies.push(Stmt::If(Expr::Unary(UnaryOp::Not, mn_box_expr_new(Expr::Ident(flag))), once, OptStmts::None, line));
+        } else {
+            copies.push(Stmt::If(Expr::BoolLit(true), once, OptStmts::None, line));
+        }
+        k = k + 1;
+    }
+    return Stmt::If(Expr::BoolLit(true), copies, OptStmts::None, line);
+}
+
+/// The clone `name` of pack function `f` (pack type parameter `tp`) for
+/// `m` elements.
+fn mono_pack_clone(f: Func, tp: str, m: i64, name: str) -> Func {
+    var r: Func = f;
+    r.name = name;
+    var tps: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < f.type_params.len() {
+        if f.type_params.get(i) != tp {
+            tps.push(f.type_params.get(i));
+        }
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < m {
+        tps.push(tp + "__" + int_to_str(k));
+        k = k + 1;
+    }
+    r.type_params = tps;
+    // a bound on T holds for each element's type
+    var bounds: Vec<StrPair> = Vec::new();
+    i = 0;
+    while i < f.type_param_bounds.len() {
+        val bp: StrPair = f.type_param_bounds.get(i);
+        if bp.a == tp {
+            k = 0;
+            while k < m {
+                bounds.push(StrPair { a: tp + "__" + int_to_str(k), b: bp.b });
+                k = k + 1;
+            }
+        } else {
+            bounds.push(bp);
+        }
+        i = i + 1;
+    }
+    r.type_param_bounds = bounds;
+    val n: i64 = f.params.len();
+    val last: Param = f.params.get(n - 1);
+    var ps: Vec<Param> = Vec::new();
+    i = 0;
+    while i < n - 1 {
+        ps.push(f.params.get(i));
+        i = i + 1;
+    }
+    k = 0;
+    while k < m {
+        var p: Param = last;
+        p.name = last.name + "__" + int_to_str(k);
+        p.ty = Type::Named(tp + "__" + int_to_str(k));
+        p.is_variadic = false;
+        ps.push(p);
+        k = k + 1;
+    }
+    r.params = ps;
+    val saved_var: str = g_mono_pack_var;
+    val saved_tp: str = g_mono_pack_tp;
+    val saved_n: i64 = g_mono_pack_n;
+    val saved_fname: str = g_mono_pack_fname;
+    g_mono_pack_var = last.name;
+    g_mono_pack_tp = tp;
+    g_mono_pack_n = m;
+    g_mono_pack_fname = f.name;
+    var no_subst: Vec<SubstEntry> = Vec::new();
+    var no_renames: Vec<RenameEntry> = Vec::new();
+    var no_mrenames: Vec<RenameEntry> = Vec::new();
+    var body: Vec<Stmt> = Vec::new();
+    i = 0;
+    while i < f.body.len() {
+        body.push(subst_stmt(f.body.get(i), no_subst, no_renames, no_mrenames));
+        i = i + 1;
+    }
+    g_mono_pack_var = saved_var;
+    g_mono_pack_tp = saved_tp;
+    g_mono_pack_n = saved_n;
+    g_mono_pack_fname = saved_fname;
+    r.body = body;
+    return r;
+}
+
+/// L8E: the program with its variadic functions' parameters made Vecs and
+/// every call of one packed. The program itself when it has none.
+pub fn mono_desugar_variadics(program: Program) -> Program {
+    var any: bool = false;
+    var any_pack: bool = false;
+    var i: i64 = 0;
+    while i < program.funcs.len() {
+        if mono_va_last(program.funcs.get(i)) {
+            any = true;
+        } else if mono_pack_tp(program.funcs.get(i)) != "" {
+            any_pack = true;
+        }
+        i = i + 1;
+    }
+    if !any && !any_pack {
+        return program;
+    }
+    g_mono_va_at = HashMap_new();
+    g_mono_va_fixed = Vec::new();
+    g_mono_va_elem = Vec::new();
+    g_mono_pack_funcs = Vec::new();
+    g_mono_pack_todo = Vec::new();
+    g_mono_pack_todo_n = Vec::new();
+    g_mono_pack_todo_of = Vec::new();
+    if any_pack {
+        g_mono_pack_at = HashMap_new();
+        g_mono_pack_made = HashMap_new();
+        i = 0;
+        while i < program.funcs.len() {
+            if mono_pack_tp(program.funcs.get(i)) != "" {
+                g_mono_pack_funcs.push(program.funcs.get(i));
+                HashMap_insert(g_mono_pack_at, program.funcs.get(i).name, g_mono_pack_funcs.len());
+            }
+            i = i + 1;
+        }
+    }
+    i = 0;
+    while i < program.funcs.len() {
+        var vf: Func = program.funcs.get(i);
+        if mono_va_last(vf) {
+            // a later declaration of the name wins (the user's program is
+            // merged last)
+            g_mono_va_fixed.push(vf.params.len() - 1);
+            g_mono_va_elem.push(vf.params.get(vf.params.len() - 1).ty);
+            HashMap_insert(g_mono_va_at, vf.name, g_mono_va_fixed.len());
+        }
+        i = i + 1;
+    }
+    val saved_tf: bool = g_mono_tf_only;
+    g_mono_tf_only = true;
+    g_mono_va_only = true;
+    g_mono_va_on = true;
+    var result: Program = program;
+    var funcs: Vec<Func> = Vec::new();
+    i = 0;
+    while i < program.funcs.len() {
+        // a pack function itself is replaced by its clones (below)
+        if !any_pack || mono_pack_tp(program.funcs.get(i)) == "" {
+            funcs.push(mono_va_body(mono_va_params(program.funcs.get(i))));
+        }
+        i = i + 1;
+    }
+    var impls: Vec<ImplDef> = Vec::new();
+    i = 0;
+    while i < program.impls.len() {
+        var imp: ImplDef = program.impls.get(i);
+        var ms: Vec<Func> = Vec::new();
+        var j: i64 = 0;
+        while j < imp.methods.len() {
+            ms.push(mono_va_body(imp.methods.get(j)));
+            j = j + 1;
+        }
+        imp.methods = ms;
+        impls.push(imp);
+        i = i + 1;
+    }
+    var timpls: Vec<TraitImpl> = Vec::new();
+    i = 0;
+    while i < program.trait_impls.len() {
+        var ti: TraitImpl = program.trait_impls.get(i);
+        var tms: Vec<Func> = Vec::new();
+        var tj: i64 = 0;
+        while tj < ti.methods.len() {
+            tms.push(mono_va_body(ti.methods.get(tj)));
+            tj = tj + 1;
+        }
+        ti.methods = tms;
+        timpls.push(ti);
+        i = i + 1;
+    }
+    // the pack clones the calls asked for; a clone's own calls of pack
+    // functions can ask for more
+    var pt: i64 = 0;
+    while pt < g_mono_pack_todo.len() {
+        val pf: Func = g_mono_pack_funcs.get(g_mono_pack_todo_of.get(pt) - 1);
+        val clone: Func = mono_pack_clone(pf, mono_pack_tp(pf), g_mono_pack_todo_n.get(pt), g_mono_pack_todo.get(pt));
+        funcs.push(mono_va_body(mono_va_params(clone)));
+        pt = pt + 1;
+    }
+    if any_pack {
+        HashMap_drop(g_mono_pack_at);
+        HashMap_drop(g_mono_pack_made);
+        g_mono_pack_at = 0;
+        g_mono_pack_made = 0;
+    }
+    g_mono_va_on = false;
+    g_mono_va_only = false;
+    g_mono_tf_only = saved_tf;
+    HashMap_drop(g_mono_va_at);
+    g_mono_va_at = 0;
+    result.funcs = funcs;
+    result.impls = impls;
+    result.trait_impls = timpls;
+    return result;
+}
+
 // --- Main monomorphization entry point -----------------------------------
 
 // The declared return type of every non-generic function, for the type of a
 // call (`parse(s).context(..)` is a method on what `parse` returns).
-var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
- pub fn monomorphize(program: Program) -> Program {
+// --- CL5: struct field defaults -------------------------------------------
+// `S { a: 1, .. }` (the parser's ast_spread_defaults) gets the default of
+// each field it leaves out, written in by subst_expr while
+// monomorphization runs: every function it writes out (process_func,
+// instantiate) passes through subst_stmt, so no later pass sees the marker.
+// The type checker has already checked that each such field has a default
+// (TypeChecker_check_struct_defaults). Not covered: a literal in a global's
+// or constant's initializer, and a default that calls a generic function
+// (its instantiation is collected before the default is written in).
+
+var g_mono_fill_defaults: bool = false;
+var g_mono_fill_depth: i64 = 0;
+// struct name -> 1 + index into g_mono_sdefs (structs with a default only)
+var g_mono_sdef_at: i64 = 0;
+var g_mono_sdefs: Vec<StructDef> = Vec::new();
+// type alias name -> 1 + index into g_mono_salias (the name it stands for)
+var g_mono_salias_at: i64 = 0;
+var g_mono_salias: Vec<str> = Vec::new();
+
+fn mn_defaults_setup(program: Program) {
+    g_mono_sdef_at = HashMap_new();
+    g_mono_sdefs = Vec::new();
+    g_mono_salias_at = HashMap_new();
+    g_mono_salias = Vec::new();
+    g_mono_fill_depth = 0;
+    var i: i64 = 0;
+    while i < program.structs.len() {
+        var s: StructDef = program.structs.get(i);
+        var has: bool = false;
+        var fi: i64 = 0;
+        while fi < s.fields.len() {
+            if s.fields.get(fi).has_default {
+                has = true;
+            }
+            fi = fi + 1;
+        }
+        // the first struct of a name, as the type checker reads it
+        if has && HashMap_get(g_mono_sdef_at, s.name) == 0 {
+            g_mono_sdefs.push(s);
+            HashMap_insert(g_mono_sdef_at, s.name, g_mono_sdefs.len());
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.type_aliases.len() {
+        var ta: TypeAlias = program.type_aliases.get(i);
+        match ta.alias_for {
+            Type::Named(target) => {
+                g_mono_salias.push(target);
+                HashMap_insert(g_mono_salias_at, ta.name, g_mono_salias.len());
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    g_mono_fill_defaults = true;
+}
+
+fn mn_defaults_done() {
+    g_mono_fill_defaults = false;
+    HashMap_drop(g_mono_sdef_at);
+    g_mono_sdef_at = HashMap_new();
+    g_mono_sdefs = Vec::new();
+    HashMap_drop(g_mono_salias_at);
+    g_mono_salias_at = HashMap_new();
+    g_mono_salias = Vec::new();
+}
+
+/// `fields` of a literal of struct `name` (or of an alias of it), with the
+/// declared default of each field they leave out added.
+fn mn_fill_struct_defaults(name: str, fields: Vec<FieldInit>) -> Vec<FieldInit> {
+    var sname: str = name;
+    var hops: i64 = 0;
+    while hops < 8 && HashMap_get(g_mono_sdef_at, sname) == 0 {
+        var al: i64 = HashMap_get(g_mono_salias_at, sname);
+        if al == 0 {
+            break;
+        }
+        sname = g_mono_salias.get(al - 1);
+        hops = hops + 1;
+    }
+    var out: Vec<FieldInit> = Vec::new();
+    var k: i64 = 0;
+    while k < fields.len() {
+        out.push(fields.get(k));
+        k = k + 1;
+    }
+    var at: i64 = HashMap_get(g_mono_sdef_at, sname);
+    if at == 0 {
+        return out;
+    }
+    var s: StructDef = g_mono_sdefs.get(at - 1);
+    var fi: i64 = 0;
+    while fi < s.fields.len() {
+        var f: Param = s.fields.get(fi);
+        if f.has_default {
+            var written: bool = false;
+            var j: i64 = 0;
+            while j < fields.len() {
+                if fields.get(j).name == f.name {
+                    written = true;
+                }
+                j = j + 1;
+            }
+            if !written {
+                out.push(FieldInit_new(f.name, f.default_expr));
+            }
+        }
+        fi = fi + 1;
+    }
+    return out;
+}
+
+// --- F45 @redundant: dual-channel execution with a voter ------------------
+// The function's body becomes two channels, `<f>_chan_a` and `<f>_chan_b`;
+// `f` itself runs both on the same arguments, compares the results and
+// stops the program (fail-safe) when they differ. The typechecker has
+// already required a scalar result, no generics, no `&mut` parameter and
+// nothing that acts outside (compiler/typechecker.fd
+// TypeChecker_verify_redundant), so running the body twice is sound.
+fn mn_is_redundant(func: Func) -> bool {
+    var i: i64 = 0;
+    while i < func.annotations.len() {
+        if func.annotations.get(i).name == "redundant" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The annotations without @redundant (and, for a channel, without what
+/// makes a function an entry point: @export, @test, @panic_handler).
+fn mn_redundant_anns(anns: Vec<Annotation>, channel: bool) -> Vec<Annotation> {
+    var out: Vec<Annotation> = Vec::new();
+    var i: i64 = 0;
+    while i < anns.len() {
+        var n: str = anns.get(i).name;
+        var entry: bool = n == "export" || n == "test" || n == "panic_handler";
+        if n != "redundant" && !(channel && entry) {
+            out.push(anns.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mn_push_redundant(out: & mut Vec<Func>, func: Func) {
+    var a: Func = func;
+    a.name = func.name + "_chan_a";
+    a.annotations = mn_redundant_anns(func.annotations, true);
+    a.preconditions = Vec::new();
+    a.postconditions = Vec::new();
+    a.is_pub = false;
+    var b: Func = a;
+    b.name = func.name + "_chan_b";
+    var a_name: str = a.name;
+    var b_name: str = b.name;
+    out.push(a);
+    out.push(b);
+    var args_a: Vec<Expr> = Vec::new();
+    var args_b: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < func.params.len() {
+        args_a.push(Expr::Ident(func.params.get(i).name));
+        args_b.push(Expr::Ident(func.params.get(i).name));
+        i = i + 1;
+    }
+    var line: i64 = 0;
+    if func.body.len() > 0 {
+        line = stmt_line(func.body.get(0));
+    }
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Let("rdn_chan_a", OptType::Some(func.ret_ty), Expr::Call(a_name, args_a), false, false, Vec::new(), line));
+    body.push(Stmt::Let("rdn_chan_b", OptType::Some(func.ret_ty), Expr::Call(b_name, args_b), false, false, Vec::new(), line));
+    var msg: Vec<Expr> = Vec::new();
+    msg.push(Expr::StringLit("@redundant: the two channels of '" + func.name + "' disagree (fail-safe stop)"));
+    var fail: Vec<Stmt> = Vec::new();
+    fail.push(Stmt::Expr(Expr::Call("p_panic", msg), line));
+    body.push(Stmt::If(Expr::Binary(BinOp::Neq, mn_box_expr_new(Expr::Ident("rdn_chan_a")), mn_box_expr_new(Expr::Ident("rdn_chan_b"))), fail, OptStmts::None, line));
+    body.push(Stmt::Return(OptBoxExpr::Some(mn_box_expr_new(Expr::Ident("rdn_chan_a"))), line));
+    var v: Func = func;
+    v.annotations = mn_redundant_anns(func.annotations, false);
+    v.body = body;
+    out.push(v);
+}
+
+// --- F34 @event / @emit: blockchain event log -----------------------------
+// An `@event fn Transfer(from: i64, to: i64, amount: i64) {}` is an event
+// declaration: the compiler writes its body. Each call appends one record
+// to the event log (standard output), numbered in emission order:
+//   emit #1 Transfer(i64,i64,i64) topic=0x1a2b3c4d from=1 to=2 amount=50
+// The topic is the FNV-1a (32-bit) hash of the canonical signature, so a
+// reader identifies the event by its signature as it would a log topic.
+// compiler/typechecker.fd TypeChecker_verify_emit has checked the
+// declaration (empty body, no result, parameters of encodable types) and
+// that every function emitting it declares it with @emit(...).
+var g_mn_emit_used: bool = false;
+
+pub fn mn_is_event(func: Func) -> bool {
+    var i: i64 = 0;
+    while i < func.annotations.len() {
+        if func.annotations.get(i).name == "event" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The canonical name of an event parameter's type in its signature.
+pub fn mn_event_type_name(t: Type) -> str {
+    match t {
+        Type::I8 => {
+            return "i8";
+        }
+        Type::I16 => {
+            return "i16";
+        }
+        Type::I32 => {
+            return "i32";
+        }
+        Type::I64 => {
+            return "i64";
+        }
+        Type::U8 => {
+            return "u8";
+        }
+        Type::U16 => {
+            return "u16";
+        }
+        Type::U32 => {
+            return "u32";
+        }
+        Type::U64 => {
+            return "u64";
+        }
+        Type::Bool => {
+            return "bool";
+        }
+        Type::Str => {
+            return "str";
+        }
+        _ => {
+            return "";
+        }
+    }
+}
+
+/// `Name(t1,t2,...)`: the event's canonical signature.
+pub fn mn_event_signature(func: Func) -> str {
+    var s: str = func.name + "(";
+    var i: i64 = 0;
+    while i < func.params.len() {
+        if i > 0 {
+            s = s + ",";
+        }
+        s = s + mn_event_type_name(func.params.get(i).ty);
+        i = i + 1;
+    }
+    return s + ")";
+}
+
+/// FNV-1a, 32 bits, of `s`.
+pub fn mn_fnv32(s: str) -> i64 {
+    var h: i64 = 2166136261;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        h = h ^ (str_byte_at(s, i) & 255);
+        h = (h * 16777619) & 4294967295;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// `v` (0 <= v < 2^32) as 8 lower-case hex digits.
+pub fn mn_hex8(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var k: i64 = 7;
+    while k >= 0 {
+        var d: i64 = (v >> (k * 4)) & 15;
+        out = out + str_slice(digits, d, d + 1);
+        k = k - 1;
+    }
+    return out;
+}
+
+/// The event function with the body the compiler writes for it.
+fn mn_event_body(func: Func) -> Func {
+    var sig: str = mn_event_signature(func);
+    var line: i64 = 0;
+    var parts: Vec<FStringPart> = Vec::new();
+    parts.push(FStringPart::Literal("emit #"));
+    parts.push(FStringPart::Expr(Expr::Ident("__emit_seq")));
+    var head: str = " " + sig + " topic=0x" + mn_hex8(mn_fnv32(sig));
+    var i: i64 = 0;
+    while i < func.params.len() {
+        parts.push(FStringPart::Literal(head + " " + func.params.get(i).name + "="));
+        parts.push(FStringPart::Expr(Expr::Ident(func.params.get(i).name)));
+        head = "";
+        i = i + 1;
+    }
+    if head != "" {
+        parts.push(FStringPart::Literal(head));
+    }
+    var body: Vec<Stmt> = Vec::new();
+    body.push(Stmt::Assign("__emit_seq", AssignOp::Assign, Expr::Binary(BinOp::Add, mn_box_expr_new(Expr::Ident("__emit_seq")), mn_box_expr_new(Expr::IntLit(1))), line));
+    var args: Vec<Expr> = Vec::new();
+    args.push(Expr::FString(parts));
+    body.push(Stmt::Expr(Expr::Call("println", args), line));
+    var out: Func = func;
+    out.body = body;
+    return out;
+}
+
+/// The program's globals, with the event counter when an event was written.
+fn mn_emit_globals(globals: Vec<GlobalVar>) -> Vec<GlobalVar> {
+    if !g_mn_emit_used {
+        return globals;
+    }
+    var out: Vec<GlobalVar> = Vec::new();
+    var have: bool = false;
+    var i: i64 = 0;
+    while i < globals.len() {
+        if globals.get(i).name == "__emit_seq" {
+            have = true;
+        }
+        out.push(globals.get(i));
+        i = i + 1;
+    }
+    if !have {
+        out.push(GlobalVar { name: "__emit_seq", ty: Type::I64, init: Expr::IntLit(0), is_pub: false });
+    }
+    return out;
+}
+
+// --- WP19: instances whose types lower alike share one body --------------
+//
+// An instance is keyed by its type arguments as lowering sees them, not as
+// they are spelled. Lowering (lower.fd Lowerer_resolve_type, which
+// Lowerer_lower_type, Lowerer_rc_kind and Lowerer_type_name_of all go
+// through) reads a type alias as its target, also inside a reference, a raw
+// pointer, an array and a generic's arguments: with `type Meters = i64`,
+// `f(m)` (m: Meters) and `f(5)` lower to the same IR. Both calls now go to
+// one instance, `f__i64`, built once (before: `f__Meters` and `f__i64`, the
+// same body twice). The key mirrors Lowerer_resolve_type exactly (the first
+// alias of a name; a tuple's or a function type's parts are left as they
+// are), so two instances share only when lowering could not tell them apart.
+// Not resolved, so not shared: an alias that has an impl or a trait impl of
+// its own name (a method call on T may resolve through that name), and the
+// type arguments of a function or method that has L8H specializations (they
+// are chosen by the spelled types). Types that lower to different IR but
+// happen to have the same layout (two structs with the same fields) stay
+// separate instances here: their bodies differ in names (field lookup,
+// printing); the IR-level fold (iropt.fd iro_fold_identical, `icf`) merges
+// what is still identical after lowering.
+// FID_MONO_SHARE_OFF=1 keys instances by the spelled types (as before);
+// FID_MONO_STATS=1 prints how many instances were not built.
+
+var g_mono_share_on: bool = false;
+// alias name -> 1 + index into g_mono_alias_tys; -1: an alias with an impl
+// of its name (not resolved)
+var g_mono_alias_at: i64 = 0;
+var g_mono_alias_tys: Vec<Type> = Vec::new();
+// instance keys seen: as spelled, and as lowering sees them
+var g_mono_share_orig_at: i64 = 0;
+var g_mono_share_canon_at: i64 = 0;
+var g_mono_share_orig_n: i64 = 0;
+var g_mono_share_canon_n: i64 = 0;
+
+fn mono_share_setup(program: Program) {
+    g_mono_share_on = false;
+    g_mono_alias_at = HashMap_new();
+    g_mono_alias_tys = Vec::new();
+    g_mono_share_orig_at = HashMap_new();
+    g_mono_share_canon_at = HashMap_new();
+    g_mono_share_orig_n = 0;
+    g_mono_share_canon_n = 0;
+    match env_var("FID_MONO_SHARE_OFF") {
+        Option::Some(v) => {
+            if str_len(v) > 0 && v != "0" {
+                return;
+            }
+        }
+        Option::None => {
+        }
+    }
+    var i: i64 = 0;
+    while i < program.type_aliases.len() {
+        var ta: TypeAlias = program.type_aliases.get(i);
+        // the first alias of a name, as Lowerer_lookup_type_alias finds it
+        if HashMap_get(g_mono_alias_at, ta.name) == 0 {
+            if mono_share_has_impl(program, ta.name) {
+                HashMap_insert(g_mono_alias_at, ta.name, - 1);
+            } else {
+                g_mono_alias_tys.push(ta.alias_for);
+                HashMap_insert(g_mono_alias_at, ta.name, g_mono_alias_tys.len());
+            }
+        }
+        i = i + 1;
+    }
+    g_mono_share_on = g_mono_alias_tys.len() > 0;
+}
+
+/// Whether `name` has an impl or a trait impl of its own.
+fn mono_share_has_impl(program: Program, name: str) -> bool {
+    var i: i64 = 0;
+    while i < program.impls.len() {
+        if program.impls.get(i).struct_name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.trait_impls.len() {
+        if program.trait_impls.get(i).type_name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn mono_share_done() {
+    if g_mono_share_orig_n > 0 {
+        match env_var("FID_MONO_STATS") {
+            Option::Some(v) => {
+                if str_len(v) > 0 && v != "0" {
+                    p_eprint_str("mono: " + int_to_str(g_mono_share_orig_n) + " instance key(s), " + int_to_str(g_mono_share_canon_n) + " built, " + int_to_str(g_mono_share_orig_n - g_mono_share_canon_n) + " shared by lowered type\n");
+                }
+            }
+            Option::None => {
+            }
+        }
+    }
+    g_mono_share_on = false;
+    HashMap_drop(g_mono_alias_at);
+    g_mono_alias_at = HashMap_new();
+    g_mono_alias_tys = Vec::new();
+    HashMap_drop(g_mono_share_orig_at);
+    g_mono_share_orig_at = HashMap_new();
+    HashMap_drop(g_mono_share_canon_at);
+    g_mono_share_canon_at = HashMap_new();
+}
+
+/// `t` as lowering sees it (lower.fd Lowerer_resolve_type): an alias is its
+/// target, also inside a reference, a raw pointer, an array and a generic's
+/// arguments.
+fn mono_share_type(t: Type, depth: i64) -> Type {
+    if depth > 32 {
+        return t;
+    }
+    match t {
+        Type::Named(name) => {
+            val at: i64 = HashMap_get(g_mono_alias_at, name);
+            if at > 0 {
+                return mono_share_type(g_mono_alias_tys.get(at - 1), depth + 1);
+            }
+            return t;
+        }
+        Type::Ref(inner, is_mut) => {
+            return Type::Ref(box_type_new(mono_share_type(box_type_deref(inner), depth + 1)), is_mut);
+        }
+        Type::RawPtr(inner, is_mut) => {
+            return Type::RawPtr(box_type_new(mono_share_type(box_type_deref(inner), depth + 1)), is_mut);
+        }
+        Type::Array(elem, size) => {
+            return Type::Array(box_type_new(mono_share_type(box_type_deref(elem), depth + 1)), size);
+        }
+        Type::ArrayConst(elem, size_param) => {
+            return Type::ArrayConst(box_type_new(mono_share_type(box_type_deref(elem), depth + 1)), size_param);
+        }
+        Type::Generic(name, args) => {
+            var new_args: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < args.len() {
+                new_args.push(mono_share_type(args.get(i), depth + 1));
+                i = i + 1;
+            }
+            return Type::Generic(name, new_args);
+        }
+        _ => {
+            return t;
+        }
+    }
+    return t;
+}
+
+/// `subst` keyed as lowering sees its types; unchanged when nothing is an
+/// alias, or when `may_share` is false.
+fn mono_share_key(subst: Vec<SubstEntry>, may_share: bool) -> Vec<SubstEntry> {
+    if !g_mono_share_on || !may_share {
+        return subst;
+    }
+    var out: Vec<SubstEntry> = Vec::new();
+    var changed: bool = false;
+    var i: i64 = 0;
+    while i < subst.len() {
+        val t: Type = subst.get(i).val;
+        val c: Type = mono_share_type(t, 0);
+        if mangle_type(c) != mangle_type(t) {
+            changed = true;
+        }
+        out.push(SubstEntry_new(subst.get(i).key, c));
+        i = i + 1;
+    }
+    if !changed {
+        return subst;
+    }
+    return out;
+}
+
+/// Whether a generic function's instances may share: not when it has L8H
+/// specializations (instantiate chooses among them by the spelled types).
+fn mono_share_fn_ok(name: str) -> bool {
+    var i: i64 = 0;
+    while i < g_mono_specs.len() {
+        if spec_base_name(g_mono_specs.get(i).name) == name {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Whether a generic method's instances may share: not when a narrower impl
+/// of its struct specializes it (mono_method_inst chooses by the types).
+fn mono_share_method_ok(struct_name: str, method_name: str) -> bool {
+    var i: i64 = 0;
+    while i < g_mono_mspecs.len() {
+        if g_mono_mspec_structs.get(i) == struct_name && spec_base_name(g_mono_mspecs.get(i).name) == method_name {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Counts an instance key (FID_MONO_STATS): `orig` as spelled, `canon` as
+/// lowering sees it.
+fn mono_share_count(orig: str, canon: str) {
+    if HashMap_get(g_mono_share_orig_at, orig) == 0 {
+        HashMap_insert(g_mono_share_orig_at, orig, 1);
+        g_mono_share_orig_n = g_mono_share_orig_n + 1;
+    }
+    if HashMap_get(g_mono_share_canon_at, canon) == 0 {
+        HashMap_insert(g_mono_share_canon_at, canon, 1);
+        g_mono_share_canon_n = g_mono_share_canon_n + 1;
+    }
+}
+
+var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new(); pub fn monomorphize(program: Program) -> Program {
+    g_mn_emit_used = false;
+    mn_defaults_setup(program);
+    mono_spec_setup(program);
+    mn_gstructs_setup(program);
+    // WP19: after mono_spec_setup (mono_share_fn_ok reads g_mono_specs)
+    mono_share_setup(program);
     g_mono_ret_index = HashMap_new();
     g_mono_ret_types = Vec::new();
     var ri: i64 = 0;
@@ -1946,7 +3540,16 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
             if str_contains(func.name, "__") {
                 ctx.seen.push(func.name);
             }
-            concrete_funcs.push(func);
+            if mn_is_redundant(func) {
+                // F45 @redundant: two channels and a voter
+                mn_push_redundant(& mut concrete_funcs, func);
+            } else if mn_is_event(func) && func.body.len() == 0 {
+                // F34 @event: the compiler writes the event's body
+                g_mn_emit_used = true;
+                concrete_funcs.push(mn_event_body(func));
+            } else {
+                concrete_funcs.push(func);
+            }
         } else {
             ctx.generics.push(GenericFuncEntry_new(func.name, func, func.type_params));
         }
@@ -1970,15 +3573,19 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
     }
 
     // Register generic impl methods BEFORE processing any functions
+    // (LG4: also a method with type parameters of its own, `fn m<U>(self,
+    // ..)`, in any impl: instantiated per call as `Type__m__U`)
     i = 0;
     while i < program.impls.len() {
         var imp: ImplDef = program.impls.get(i);
-        if imp.type_params.len() > 0 {
-            var j: i64 = 0;
-            while j < imp.methods.len() {
-                ctx.generic_methods.push(GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, imp.methods.get(j), imp.type_params));
-                j = j + 1;
+        var j: i64 = 0;
+        while j < imp.methods.len() {
+            if imp.type_params.len() > 0 {
+                ctx.generic_methods.push(GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, imp.methods.get(j), mono_lg4_tps(imp.type_params, imp.methods.get(j))));
+            } else if mono_lg4_generic(imp.methods.get(j)) {
+                ctx.generic_methods.push(GenericMethodEntry_new(imp.struct_name, imp.methods.get(j).name, mono_lg4_self(imp.methods.get(j), imp.struct_name), imp.methods.get(j).type_params));
             }
+            j = j + 1;
         }
         i = i + 1;
     }
@@ -1987,12 +3594,14 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
     i = 0;
     while i < program.trait_impls.len() {
         var ti: TraitImpl = program.trait_impls.get(i);
-        if ti.type_params.len() > 0 {
-            var j: i64 = 0;
-            while j < ti.methods.len() {
-                ctx.generic_methods.push(GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, ti.methods.get(j), ti.type_params));
-                j = j + 1;
+        var j: i64 = 0;
+        while j < ti.methods.len() {
+            if ti.type_params.len() > 0 {
+                ctx.generic_methods.push(GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, ti.methods.get(j), mono_lg4_tps(ti.type_params, ti.methods.get(j))));
+            } else if mono_lg4_generic(ti.methods.get(j)) {
+                ctx.generic_methods.push(GenericMethodEntry_new(ti.type_name, ti.methods.get(j).name, mono_lg4_self(ti.methods.get(j), ti.type_name), ti.methods.get(j).type_params));
             }
+            j = j + 1;
         }
         i = i + 1;
     }
@@ -2013,7 +3622,14 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
         var new_methods: Vec<Func> = Vec::new();
         var j: i64 = 0;
         while j < imp.methods.len() {
-            if imp.type_params.len() == 0 {
+            if imp.type_params.len() == 0 && mono_lg4_generic(imp.methods.get(j)) {
+                // LG4: under its plain name, the instance with i64 for the
+                // method's own parameters (a call mono could not type);
+                // none for a bounded one (i64 has not its bound's methods)
+                if mono_lg4_plain_ok(imp.methods.get(j)) {
+                    new_methods.push(instantiate(imp.methods.get(j), mono_lg4_i64_subst(imp.methods.get(j), subst_new()), imp.methods.get(j).name, & mut ctx));
+                }
+            } else if imp.type_params.len() == 0 {
                 new_methods.push(process_func(imp.methods.get(j), & mut ctx));
             } else {
                 // A generic impl's methods are instantiated on demand; the i64
@@ -2022,10 +3638,24 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
                 var isub: Vec<SubstEntry> = subst_new();
                 var tk: i64 = 0;
                 while tk < imp.type_params.len() {
-                    subst_set(& mut isub, imp.type_params.get(tk), Type::I64);
+                    // L8A: a const parameter (`impl<T, const N: usize>`) is
+                    // a number here, 0, so the body's N is a constant
+                    if mono_is_const_param(imp.methods.get(j), imp.type_params.get(tk)) {
+                        subst_set(& mut isub, imp.type_params.get(tk), Type::Named("__const_0"));
+                    } else {
+                        subst_set(& mut isub, imp.type_params.get(tk), Type::I64);
+                    }
                     tk = tk + 1;
                 }
-                new_methods.push(instantiate(imp.methods.get(j), isub, imp.methods.get(j).name, & mut ctx));
+                // LG4: and i64 for the method's own type parameters
+                if mono_lg4_generic(imp.methods.get(j)) {
+                    isub = mono_lg4_i64_subst(imp.methods.get(j), isub);
+                }
+                // L8H: the i64 instance of a method a narrower impl
+                // specializes runs that one's body when it takes the type
+                if mono_lg4_plain_ok(imp.methods.get(j)) {
+                    new_methods.push(mono_method_inst(imp.struct_name, imp.methods.get(j), imp.type_params, isub, imp.methods.get(j).name, & mut ctx));
+                }
             }
             j = j + 1;
         }
@@ -2043,7 +3673,12 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
         var new_methods: Vec<Func> = Vec::new();
         var j: i64 = 0;
         while j < ti.methods.len() {
-            if ti.type_params.len() == 0 {
+            if ti.type_params.len() == 0 && mono_lg4_generic(ti.methods.get(j)) {
+                // LG4: the i64 instance under the plain name, as for an impl
+                if mono_lg4_plain_ok(ti.methods.get(j)) {
+                    new_methods.push(instantiate(ti.methods.get(j), mono_lg4_i64_subst(ti.methods.get(j), subst_new()), ti.methods.get(j).name, & mut ctx));
+                }
+            } else if ti.type_params.len() == 0 {
                 new_methods.push(process_func(ti.methods.get(j), & mut ctx));
             }
             j = j + 1;
@@ -2068,7 +3703,7 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
     result.enums = program.enums;
     result.funcs = new_funcs;
     result.consts = program.consts;
-    result.globals = program.globals;
+    result.globals = mn_emit_globals(program.globals);
     result.type_aliases = program.type_aliases;
     result.impls = new_impls;
     result.imports = program.imports;
@@ -2082,6 +3717,8 @@ var g_mono_ret_index: i64 = 0; var g_mono_ret_types: Vec<Type> = Vec::new();
     result.systems = program.systems;
     result.state_machines = program.state_machines;
     result.event_handlers = program.event_handlers;
+    mn_defaults_done();
+    mono_share_done();
     return result;
 }
 
@@ -2275,6 +3912,20 @@ pub fn method_subst(gen_func: Func, type_params: Vec<str>, arg_types: Vec<Type>,
         _ => {
         }
     }
+    // L8H: the receiver against `self`'s type first: in `impl<U>
+    // Wrap<Vec<U>>` a Wrap<Vec<str>> gives U = str, not the struct's first
+    // argument (for `impl<T> Wrap<T>` the two agree)
+    if gen_func.params.len() > 0 && gen_func.params.get(0).name == "self" {
+        var ssub: Vec<SubstEntry> = Vec::new();
+        infer_from_pair(mono_self_value_type(gen_func.params.get(0).ty), recv, type_params, & mut ssub);
+        var sk: i64 = 0;
+        while sk < ssub.len() {
+            if !subst_contains(subst, ssub.get(sk).key) {
+                subst_set(& mut subst, ssub.get(sk).key, ssub.get(sk).val);
+            }
+            sk = sk + 1;
+        }
+    }
     match recv {
         Type::Generic(_, rargs) => {
             var k: i64 = 0;
@@ -2373,6 +4024,8 @@ pub fn fixup_hinted_call(expr: Expr, hint: OptType, generics: Vec<GenericFuncEnt
                         }
                         k = k + 1;
                     }
+                    // WP19: the instance process_func made (keyed as lowered)
+                    subst = mono_share_key(subst, mono_share_fn_ok(callee));
                     out.push(Expr::Call(mangle(callee, subst, entry.type_params), new_args));
                     return out;
                 }
@@ -2415,7 +4068,25 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm:
                 new_args.push(fixup_generic_calls_expr(args.get(i), generics, gm, current_func));
                 i = i + 1;
             }
-            if str_contains(callee, "::<#") {
+            if g_mono_va_on {
+                // L8E: the arguments after the fixed ones of a variadic
+                // function, packed into one Vec
+                var vat: i64 = HashMap_get(g_mono_va_at, callee);
+                if vat > 0 {
+                    new_args = mono_va_pack(new_args, g_mono_va_fixed.get(vat - 1), g_mono_va_elem.get(vat - 1));
+                }
+                // a pack function: the clone for this many arguments
+                if g_mono_pack_at != 0 && vat == 0 {
+                    val pat: i64 = HashMap_get(g_mono_pack_at, callee);
+                    if pat > 0 {
+                        val pk: str = mono_pack_call(callee, pat, new_args);
+                        if pk != "" {
+                            return Expr::Call(pk, new_args);
+                        }
+                    }
+                }
+            }
+            if !g_mono_va_only && str_contains(callee, "::<#") {
                 return Expr::Call(mono_turbofish_callee(callee, generics, current_func.name), new_args);
             }
             if g_mono_tf_only {
@@ -2437,6 +4108,8 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm:
                         k = k + 1;
                     }
                     var subst: Vec<SubstEntry> = infer_subst(param_types, arg_types, entry.type_params);
+                    // WP19: the instance process_func made (keyed as lowered)
+                    subst = mono_share_key(subst, mono_share_fn_ok(callee));
                     var mangled: str = mangle(callee, subst, entry.type_params);
                     return Expr::Call(mangled, new_args);
                 }
@@ -2474,6 +4147,8 @@ pub fn fixup_generic_calls_expr(expr: Expr, generics: Vec<GenericFuncEntry>, gm:
                                 j = j + 1;
                             }
                             var msubst: Vec<SubstEntry> = method_subst(gen.func, gen.type_params, arg_types, infer_expr_type(recv_expr, current_func));
+                            // WP19: the instance process_func made (keyed as lowered)
+                            msubst = mono_share_key(msubst, mono_share_method_ok(sn, method));
                             var all_args: Vec<Expr> = Vec::new();
                             all_args.push(new_recv);
                             j = 0;
@@ -2752,6 +4427,13 @@ pub fn process_func(func: Func, ctx: & mut MonoCtx) -> Func {
                     continue;
                 }
 
+                // WP19: keyed by the types as lowering sees them, so types
+                // that lower alike share one instance
+                if g_mono_share_on {
+                    val spelled: str = mangle(callee, subst, gen.type_params);
+                    subst = mono_share_key(subst, mono_share_fn_ok(callee));
+                    mono_share_count(spelled, mangle(callee, subst, gen.type_params));
+                }
                 var mangled: str = mangle(callee, subst, gen.type_params);
 
                 if MonoCtx_seen_insert(ctx, mangled) {
@@ -2780,10 +4462,17 @@ pub fn process_func(func: Func, ctx: & mut MonoCtx) -> Func {
             OptGenericMethod::Some(gen) => {
                 var subst: Vec<SubstEntry> = method_subst(gen.func, gen.type_params, arg_types, entry.recv_ty);
 
+                // WP19: as for a generic function's instances
+                if g_mono_share_on {
+                    val spelled: str = mangle_method(struct_name, method_name, subst, gen.type_params);
+                    subst = mono_share_key(subst, mono_share_method_ok(struct_name, method_name));
+                    mono_share_count(spelled, mangle_method(struct_name, method_name, subst, gen.type_params));
+                }
                 var mangled: str = mangle_method(struct_name, method_name, subst, gen.type_params);
 
                 if MonoCtx_seen_insert(ctx, mangled) {
-                    var instantiated: Func = instantiate(gen.func, subst, mangled, ctx);
+                    // L8H: the most specific impl's method for this receiver
+                    var instantiated: Func = mono_method_inst(struct_name, gen.func, gen.type_params, subst, mangled, ctx);
                     ctx.instantiated.push(instantiated);
                 }
 
@@ -2818,12 +4507,41 @@ pub fn process_func(func: Func, ctx: & mut MonoCtx) -> Func {
     result.preconditions = func.preconditions;
     result.postconditions = func.postconditions;
     result.is_async = func.is_async;
+    result.line = func.line;
     return result;
 }
 
 // --- Instantiate a generic function with a concrete substitution ---------
 
 pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ctx: & mut MonoCtx) -> Func {
+    // L8H: an instantiation of a name with specializations takes the body
+    // of the most specific definition whose parameters take its types (the
+    // type checker has reported a tie)
+    if g_mono_specs.len() > 0 && spec_base_name(gen_func.name) == "" {
+        var cands: Vec<Func> = Vec::new();
+        cands.push(gen_func);
+        var si: i64 = 0;
+        while si < g_mono_specs.len() {
+            if spec_base_name(g_mono_specs.get(si).name) == gen_func.name {
+                cands.push(g_mono_specs.get(si));
+            }
+            si = si + 1;
+        }
+        if cands.len() > 1 {
+            var concrete: Vec<Type> = Vec::new();
+            var ci: i64 = 0;
+            while ci < gen_func.params.len() {
+                concrete.push(subst_type(gen_func.params.get(ci).ty, subst));
+                ci = ci + 1;
+            }
+            var tie: Vec<i64> = Vec::new();
+            val chosen: i64 = spec_choose(cands, concrete, & mut tie);
+            if chosen > 0 {
+                val sf: Func = cands.get(chosen);
+                return instantiate(sf, infer_subst(spec_param_types(sf), concrete, sf.type_params), mangled_name, ctx);
+            }
+        }
+    }
     // Apply substitution to params, then resolve associated types
     var new_params: Vec<Param> = Vec::new();
     var i: i64 = 0;
@@ -2832,6 +4550,7 @@ pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ct
         var resolved: Type = resolve_assoc_types(substituted, subst, ctx.trait_assoc_bindings);
         var p: Param = Param_new(gen_func.params.get(i).name, resolved, gen_func.params.get(i).is_pub);
         p.annotations = gen_func.params.get(i).annotations;
+        p.is_variadic = gen_func.params.get(i).is_variadic;
         new_params.push(p);
         i = i + 1;
     }
@@ -2860,6 +4579,7 @@ pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ct
     temp_func.preconditions = gen_func.preconditions;
     temp_func.postconditions = gen_func.postconditions;
     temp_func.is_async = gen_func.is_async;
+    temp_func.line = gen_func.line;
 
     // Process this concrete function -- it may contain calls to other generics
     return process_func(temp_func, ctx);
@@ -3421,6 +5141,29 @@ pub fn infer_receiver_struct_name(receiver: Expr, func: Func) -> OptStr {
 
 pub fn infer_expr_type_with_hint(expr: Expr, func: Func, hint: OptType) -> Type {
     var inferred: Type = infer_expr_type(expr, func);
+    // A struct literal, or a variable whose declared type is a struct
+    // (`v: Pt` gives Named("Pt"); an unknown `v` gives Named("v")), has its
+    // own type: the hint (the call's expected result) is not the
+    // argument's. It made `inner_x(v)` with v: Pt, in a function returning
+    // i64, call inner_x__i64 while inner_x__Pt was the one named (CE9).
+    match expr {
+        Expr::StructLit(_, _, _) => {
+            return inferred;
+        }
+        Expr::Ident(vn) => {
+            match inferred {
+                Type::Named(tn) => {
+                    if tn != vn {
+                        return inferred;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
     // If inference produced a Named type (unknown), try the hint
     match inferred {
         Type::Named(_) => {
@@ -3436,6 +5179,110 @@ pub fn infer_expr_type_with_hint(expr: Expr, func: Func, hint: OptType) -> Type 
         }
     }
     return inferred;
+}
+
+// LG14: the generic structs of the program (`struct Cell<T> { .. }`), so a
+// literal of one has its type arguments (mn_struct_lit_type).
+// struct name -> 1 + index into g_mono_gstructs
+var g_mono_gstruct_at: i64 = 0;
+var g_mono_gstructs: Vec<StructDef> = Vec::new();
+
+fn mn_gstructs_setup(program: Program) {
+    if g_mono_gstruct_at != 0 {
+        HashMap_drop(g_mono_gstruct_at);
+    }
+    g_mono_gstruct_at = HashMap_new();
+    g_mono_gstructs = Vec::new();
+    var i: i64 = 0;
+    while i < program.structs.len() {
+        var s: StructDef = program.structs.get(i);
+        // the first struct of a name, as the type checker reads it
+        if s.type_params.len() > 0 && HashMap_get(g_mono_gstruct_at, s.name) == 0 {
+            g_mono_gstructs.push(s);
+            HashMap_insert(g_mono_gstruct_at, s.name, g_mono_gstructs.len());
+        }
+        i = i + 1;
+    }
+}
+
+/// Whether `t`, inferred for a field's value, is a type mono knows (a
+/// variable's unknown type is Named(<its name>)).
+fn mn_lit_arg_known(t: Type, value: Expr) -> bool {
+    match t {
+        Type::Named(_) => {
+            match value {
+                Expr::StructLit(_, _, _) => {
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        Type::Infer => {
+            return false;
+        }
+        Type::Void => {
+            return false;
+        }
+        _ => {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The type of literal `name { fields }`: for a generic struct, with the
+/// type each of its parameters takes from a field declared with it
+/// (`Cell { v: "hi", k: 3 }` is a `Cell<str>`), so a method call on it, or
+/// on a variable it initializes, picks the instance of those types (it
+/// picked the i64 one: `b.get()` gave the string's address). A parameter no
+/// field shows, or a field whose type is not known here: Named, as before.
+fn mn_struct_lit_type(name: str, fields: Vec<FieldInit>, func: Func) -> Type {
+    if g_mono_gstruct_at == 0 {
+        return Type::Named(name);
+    }
+    var at: i64 = HashMap_get(g_mono_gstruct_at, name);
+    if at == 0 {
+        return Type::Named(name);
+    }
+    var def: StructDef = g_mono_gstructs.get(at - 1);
+    var args: Vec<Type> = Vec::new();
+    var ti: i64 = 0;
+    while ti < def.type_params.len() {
+        var tp: str = def.type_params.get(ti);
+        var found: bool = false;
+        var fi: i64 = 0;
+        while fi < def.fields.len() && !found {
+            var declared_tp: bool = false;
+            match def.fields.get(fi).ty {
+                Type::Named(fty) => {
+                    declared_tp = fty == tp;
+                }
+                _ => {
+                }
+            }
+            if declared_tp {
+                var li: i64 = 0;
+                while li < fields.len() && !found {
+                    if fields.get(li).name == def.fields.get(fi).name {
+                        var vt: Type = infer_expr_type(fields.get(li).value, func);
+                        if mn_lit_arg_known(vt, fields.get(li).value) {
+                            args.push(vt);
+                            found = true;
+                        }
+                    }
+                    li = li + 1;
+                }
+            }
+            fi = fi + 1;
+        }
+        if !found {
+            return Type::Named(name);
+        }
+        ti = ti + 1;
+    }
+    return Type::Generic(name, args);
 }
 
 // --- Simple type inference for expressions -------------------------------
@@ -3582,7 +5429,13 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
             }
         }
         Expr::StructLit(name, fields, spread) => {
-            return Type::Named(name);
+            return mn_struct_lit_type(name, fields, func);
+        }
+        // `&x` / `&mut x` is a reference to x's type: a parameter `s: &mut
+        // T` binds T from it (stdlib-agent-bugs 19: T stayed unbound and the
+        // call went to `use_store__T`, which no instance defines)
+        Expr::Ref(rinner, rmut) => {
+            return Type::Ref(box_type_new(infer_expr_type(mn_box_expr_deref(rinner), func)), rmut);
         }
         Expr::ArrayLit(elem_type, elements) => {
             return Type::Array(elem_type, elements.len());

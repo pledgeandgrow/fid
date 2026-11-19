@@ -1,0 +1,167 @@
+// VF5, branch fusion in the machine layer (compiler/nat_ir.fd
+// ng_fuse_branches, `FID_NAT_OFF=brfuse` and its parts brgap, brnot,
+// brext, brandor, brxblock): a compare whose 0/1 value only a branch reads
+// becomes one compare-and-branch. Every comparison operator is tried at
+// its bound, signed and unsigned, on narrow types, with `!`, `&&` and `||`
+// around it, with a statement between the compare and the branch (the
+// compare is made again at the branch: nothing between may change its
+// operands), with the compare's value also used after the branch (it
+// must then stay a value), and in a loop condition. Each line is a bit
+// mask of which branches were taken; a branch with the wrong sense or the
+// wrong operands flips a bit. scripts/verify/variants.py's mutants
+// brfuse-beqz-not-inverted and brfuse-live-ignored break it.
+//
+// Expected output:
+// 8 8 4 8
+// 101001 010101 001110
+// 101001 010101 001110
+// 0101 1110
+// 110 001
+// 5 3
+// 1 0 1 0 1 0 1 0 1
+// 10 5
+// 4950
+
+fn bits6(a: i64, b: i64) -> str {
+    var s: str = "";
+    if a < b { s = s + "1"; } else { s = s + "0"; }
+    if a > b { s = s + "1"; } else { s = s + "0"; }
+    if a <= b { s = s + "1"; } else { s = s + "0"; }
+    if a >= b { s = s + "1"; } else { s = s + "0"; }
+    if a == b { s = s + "1"; } else { s = s + "0"; }
+    if a != b { s = s + "1"; } else { s = s + "0"; }
+    return s;
+}
+
+fn bits6u(a: u32, b: u32) -> str {
+    var s: str = "";
+    if a < b { s = s + "1"; } else { s = s + "0"; }
+    if a > b { s = s + "1"; } else { s = s + "0"; }
+    if a <= b { s = s + "1"; } else { s = s + "0"; }
+    if a >= b { s = s + "1"; } else { s = s + "0"; }
+    if a == b { s = s + "1"; } else { s = s + "0"; }
+    if a != b { s = s + "1"; } else { s = s + "0"; }
+    return s;
+}
+
+fn nots(a: i64, b: i64) -> str {
+    var s: str = "";
+    if !(a < b) { s = s + "1"; } else { s = s + "0"; }
+    if !(a == b) { s = s + "1"; } else { s = s + "0"; }
+    if !!(a > b) { s = s + "1"; } else { s = s + "0"; }
+    if !(a >= b) { s = s + "1"; } else { s = s + "0"; }
+    return s;
+}
+
+fn andor(a: i64, b: i64, c: i64) -> str {
+    var s: str = "";
+    if a < b && b < c { s = s + "1"; } else { s = s + "0"; }
+    if a < b || c < b { s = s + "1"; } else { s = s + "0"; }
+    if a > b || (b == c && a != c) { s = s + "1"; } else { s = s + "0"; }
+    return s;
+}
+
+fn gap(a: i64, b: i64) -> str {
+    // the compare, then a statement, then the branch on its value
+    var n: i64 = a;
+    val lt: bool = n < b;
+    n = n + 10;
+    var r: i64 = 0;
+    if lt {
+        r = r + 4;
+    }
+    // the operand changes between the compare and the branch
+    var m: i64 = a;
+    val ge: bool = m >= b;
+    m = b + 100;
+    if ge {
+        r = r + 2;
+    }
+    if m > b {
+        r = r + 1;
+    }
+    return int_to_str(r) + " " + int_to_str(n - a - 7);
+}
+
+fn kept(a: i64, b: i64) -> str {
+    // the compare's value is used after the branch too
+    val c: bool = a < b;
+    var x: i64 = 0;
+    if c {
+        x = 1;
+    }
+    var y: i64 = 0;
+    if c == false {
+        y = 1;
+    }
+    var z: i64 = 0;
+    if c {
+        z = 1;
+    }
+    return int_to_str(x) + " " + int_to_str(y) + " " + int_to_str(z);
+}
+
+fn narrow(a: u8, b: i16) -> str {
+    var k: i64 = 0;
+    var i: u8 = 0;
+    while i < a {
+        k = k + 1;
+        i = i + 1;
+    }
+    var j: i16 = 0 - 5;
+    var m: i64 = 0;
+    while j < b {
+        m = m + 1;
+        j = j + 1;
+    }
+    return int_to_str(k) + " " + int_to_str(m);
+}
+
+fn bittests(n: i64) -> str {
+    // branches on one bit (test-bit branches, `ng_fuse_tbz`), a high bit
+    // among them
+    var b4: i64 = 0;
+    var even: i64 = 0;
+    var both: i64 = 0;
+    var high: i64 = 0;
+    var x: i64 = 0;
+    while x < n {
+        if (x & 4) != 0 {
+            b4 = b4 + 1;
+        }
+        if (x & 1) == 0 {
+            even = even + 1;
+        }
+        if (x & 8) != 0 && (x & 2) == 0 {
+            both = both + 1;
+        }
+        val y: i64 = x << 37;
+        if (y & (1 << 40)) != 0 {
+            high = high + 1;
+        }
+        x = x + 1;
+    }
+    return int_to_str(b4) + " " + int_to_str(even) + " " + int_to_str(both) + " " + int_to_str(high);
+}
+
+fn main() -> i64 {
+    println(bittests(16));
+    println(bits6(3, 5) + " " + bits6(5, 3) + " " + bits6(4, 4));
+    val three: u32 = 3;
+    val five: u32 = 5;
+    val four: u32 = 4;
+    println(bits6u(three, five) + " " + bits6u(five, three) + " " + bits6u(four, four));
+    println(nots(3, 5) + " " + nots(5, 3));
+    println(andor(1, 2, 3) + " " + andor(3, 2, 2));
+    println(gap(1, 5));
+    println(kept(1, 2) + " " + kept(2, 1) + " " + kept(0, 9));
+    println(narrow(10, 0));
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        s = s + i;
+        i = i + 1;
+    }
+    println(s);
+    return 0;
+}

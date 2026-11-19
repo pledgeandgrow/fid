@@ -1,0 +1,109 @@
+// stdlib/rsa against a 768-bit key made by OpenSSL 3.5 (PKCS#8 and SPKI
+// PEM): the RSASSA-PKCS1-v1_5 SHA-256 signature OpenSSL made is
+// reproduced byte for byte and verified; OpenSSL's RSASSA-PSS signature
+// (salt 32) and RSAES-OAEP SHA-256 ciphertext are verified and decrypted;
+// our PSS signature and OAEP ciphertext (fixed salt and seed) round trip
+// (OpenSSL accepts both: checked when the test was written); tampering is
+// rejected; Montgomery exponentiation agrees with bigint_modpow; and a
+// 256-bit key generated from a seeded generator signs and verifies.
+// Expected output:
+// key bits 768 k 96 e 65537 check true
+// spki same modulus true der round trip true
+// modexp 445 true
+// pkcs1 same as openssl true
+// pkcs1 verify true tampered false
+// pss openssl true any-salt true wrong salt length false wrong msg false
+// pss ours true tampered false
+// oaep openssl secret 16 bytes!
+// oaep ours true label mismatch false
+// keygen bits 256 check true raw round trip true
+use rsa;
+use bigint;
+use pem;
+use kdf;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+fn hb(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn rep(b: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(b); i = i + 1; }
+    return v;
+}
+
+fn flip(v: Vec<i64>, at: i64) -> Vec<i64> {
+    var o: Vec<i64> = v;
+    o.set(at, o.get(at) ^ 1);
+    return o;
+}
+
+var g_drbg_ctr: i64 = 0;
+
+/// A deterministic byte source for the test: SHA-256 of a counter.
+fn seeded(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    while v.len() < n {
+        var block: Vec<i64> = str_bytes("rsa keygen test");
+        block.push(g_drbg_ctr & 255);
+        block.push((g_drbg_ctr >> 8) & 255);
+        block.push((g_drbg_ctr >> 16) & 255);
+        g_drbg_ctr = g_drbg_ctr + 1;
+        val d: Vec<i64> = kdf_hash(KDF_SHA256, block);
+        var i: i64 = 0;
+        while i < 32 && v.len() < n { v.push(d.get(i)); i = i + 1; }
+    }
+    return v;
+}
+
+fn main() {
+    val sk_pem: str = "-----BEGIN PRIVATE KEY-----\nMIIB5gIBADANBgkqhkiG9w0BAQEFAASCAdAwggHMAgEAAmEAzDNr/8vO2ugOpqlI\nW1DDmSnJcVCPuSFA6luw85vUHILq5O4c/ZTPT/fa/nBTroHwvYL1eQ7DoiOvN42Y\nHWz0GviBScJJULb1Ers1ORotmUAgeWBpl2QPnlXsCtiB2y8bAgMBAAECYQCpCSwu\nzJzIs25lYh6mkL3KDUBXEBRZcQCWwB5EGsvEak9eAQp4k/XlQczD8WIkRCTzZkKs\nurUyUMQ5yCix/NYQNn69TgYoyLIuGiM7ZtPWdBOoZAj2Hp3E36To6NZdbHkCMQD+\nGSfVtREdvoXIGLpk5w/cECq5a150EOTG20W85cfdE3Z0s1hFITQ+KAMVN23xk50C\nMQDNuqoWLkU/lLrG2govd6xvqN7TNfpcACLsJvm9xuV3lRE0+XfcO0xFVjlKM2u8\n3BcCMQDrEq6toOOC1v3BTk8yhik/95zvCQvK6M4dwkHULegm+JiAAmNJIRzJ3A5u\nFGecNGkCMQC2qa9NJGYtztOLrZrvjHVZavn1VG7ncuOPBAgoXUnuxDdT7tBihW/x\n/F2/qSpWtJ8CMEjLXp8J4n55yVTiYM+JYe+3ZoUFvDbQztGTyHIqx6BEbWOTAZY0\nmRC2SyKTh/sWFw==\n-----END PRIVATE KEY-----\n";
+    val pk_pem: str = "-----BEGIN PUBLIC KEY-----\nMHwwDQYJKoZIhvcNAQEBBQADawAwaAJhAMwza//LztroDqapSFtQw5kpyXFQj7kh\nQOpbsPOb1ByC6uTuHP2Uz0/32v5wU66B8L2C9XkOw6IjrzeNmB1s9Br4gUnCSVC2\n9RK7NTkaLZlAIHlgaZdkD55V7ArYgdsvGwIDAQAB\n-----END PUBLIC KEY-----\n";
+    val sk: RsaPrivateKey = rsa_private_from_pkcs8(pem_decode(sk_pem, "PRIVATE KEY").der);
+    val spki_der: Vec<i64> = pem_decode(pk_pem, "PUBLIC KEY").der;
+    val pk: RsaPublicKey = rsa_public_from_spki(spki_der);
+    println("key bits " + int_to_str(sk.bits) + " k " + int_to_str(sk.k) + " e " + bigint_to_str(sk.e) + " check " + bool_to_str(rsa_private_check(sk)));
+    val s: Spki = spki_parse(spki_der);
+    println("spki same modulus " + bool_to_str(bigint_eq(pk.n, sk.n)) + " der round trip " + bool_to_str(str_equal(hx(rsa_public_to_der(pk)), hx(s.key))));
+    val me: BigInt = rsa_modexp(bigint_from_i64(4), bigint_from_i64(13), bigint_from_i64(497));
+    val m127: BigInt = bigint_sub(bigint_pow(bigint_from_i64(2), 127), bigint_one());
+    val big: BigInt = rsa_modexp(bigint_from_i64(3), bigint_from_i64(1000003), m127);
+    println("modexp " + bigint_to_str(me) + " " + bool_to_str(bigint_eq(big, bigint_modpow(bigint_from_i64(3), bigint_from_i64(1000003), m127))));
+
+    val msg: Vec<i64> = str_bytes("Fides RSA test message");
+    val ossl_pkcs1: Vec<i64> = hb("687a81ead81f48731b8467f658a97630403297526995ca941a030b774d33576a157e013f74e97a44d5b15ebd71daf7af73e9a1906e1e337394a18ca844c7911b894979deadf5da46a1f133ed66fd9832e3cdf5b864bc485cc9031c9b37329339");
+    val sig1: Vec<i64> = rsa_pkcs1_sign(sk, KDF_SHA256, msg);
+    println("pkcs1 same as openssl " + bool_to_str(str_equal(hx(sig1), hx(ossl_pkcs1))));
+    println("pkcs1 verify " + bool_to_str(rsa_pkcs1_verify(pk, KDF_SHA256, msg, ossl_pkcs1)) + " tampered " + bool_to_str(rsa_pkcs1_verify(pk, KDF_SHA256, msg, flip(ossl_pkcs1, 50))));
+
+    val ossl_pss: Vec<i64> = hb("0f626e6389ada22b4ad09b9a2d628da354e75008ee16802166d8a0db7789d6d9929681b63e2e3734008c1405ea75979588a92703dbd7d0a4a5f5133737ca2648730106722cdb9df7dc76f27c441d3876b5ac6d651e6ebeeab9e2fc7b5b9fb4b0");
+    println("pss openssl " + bool_to_str(rsa_pss_verify(pk, KDF_SHA256, msg, ossl_pss, 32)) + " any-salt " + bool_to_str(rsa_pss_verify(pk, KDF_SHA256, msg, ossl_pss, -1)) + " wrong salt length " + bool_to_str(rsa_pss_verify(pk, KDF_SHA256, msg, ossl_pss, 20)) + " wrong msg " + bool_to_str(rsa_pss_verify(pk, KDF_SHA256, str_bytes("other"), ossl_pss, 32)));
+    val our_pss: Vec<i64> = rsa_pss_sign(sk, KDF_SHA256, msg, rep(0x11, 32));
+    println("pss ours " + bool_to_str(rsa_pss_verify(pk, KDF_SHA256, msg, our_pss, 32)) + " tampered " + bool_to_str(rsa_pss_verify(pk, KDF_SHA256, msg, flip(our_pss, 3), 32)));
+    if str_len(env_var_or("FIDES_RSA_DUMP")) > 0 { println("dump pss " + hx(our_pss)); }
+
+    val ossl_oaep: Vec<i64> = hb("05b873945febb0ffe10341d350e12949c73d8b8d9ebb186df7241137fe92bb8b4d4add0a7670b752030ed7887ed9e084e2e84f8e32fba7fc842e5625757cfaff8d6b439ac560295bcb958d14fbcb22c3fb122740c850177a52d23137a7881656");
+    val pt: RsaPlain = rsa_oaep_decrypt(sk, KDF_SHA256, ossl_oaep, Vec::new());
+    var shown: str = "FAILED";
+    if pt.ok { shown = str_from_bytes(pt.data); }
+    println("oaep openssl " + shown);
+    val ct: Vec<i64> = rsa_oaep_encrypt(pk, KDF_SHA256, str_bytes("hello oaep"), str_bytes("L"), rep(0x22, 32));
+    if str_len(env_var_or("FIDES_RSA_DUMP")) > 0 { println("dump oaep " + hx(ct)); }
+    val back: RsaPlain = rsa_oaep_decrypt(sk, KDF_SHA256, ct, str_bytes("L"));
+    val wrong: RsaPlain = rsa_oaep_decrypt(sk, KDF_SHA256, ct, str_bytes("M"));
+    println("oaep ours " + bool_to_str(back.ok && str_equal(str_from_bytes(back.data), "hello oaep")) + " label mismatch " + bool_to_str(wrong.ok));
+
+    val g: RsaPrivateKey = rsa_generate(256, 65537, fn(n: i64) -> Vec<i64> { return seeded(n); });
+    val m: BigInt = rsa_os2ip(str_bytes("raw"));
+    val c: BigInt = rsa_ep(rsa_public_of(g), m);
+    println("keygen bits " + int_to_str(g.bits) + " check " + bool_to_str(rsa_private_check(g)) + " raw round trip " + bool_to_str(bigint_eq(rsa_dp(g, c), m)));
+}
+
+fn env_var_or(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => { return v; }
+        Option::None => { return ""; }
+    }
+}

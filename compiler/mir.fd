@@ -1,0 +1,1579 @@
+// mir.fd -- the machine IR (MIR) of the machine layer (roadmap MI1).
+//
+// compiler/nat_ir.fd selects each IR instruction into operations on virtual
+// registers (Cranelift's VCode shape: selection happens in the layer),
+// recorded as `MInst`s, then allocates registers and emits machine code for
+// AArch64, RISC-V 64 and x86-64 (Linux, macOS, --nat Windows). This module
+// is the MIR itself, with no target in it:
+//
+//   - the operation codes (MO_*) and the operand kinds they take (compare
+//     kinds NCC_*, extension kinds NEXT_*, panic kinds NP_*);
+//   - an operation, `MInst`: op, three register fields r0..r2 and three
+//     immediates i0..i2. A register field holds a virtual register (vreg,
+//     NG_VBASE and up) or a physical register (below NG_VBASE); immediates
+//     hold constants, labels (a jump's target, a placed label) and stack
+//     slots (frame offsets);
+//   - which fields an operation reads and defines (mi_use_mask,
+//     mi_defines), the blocks (mi_blocks: a block starts at a placed label
+//     or after a jump, a return or a trap), block liveness (mi_liveness);
+//   - the printer (mi_op_name, mi_text) and the structural verifier
+//     (mir_verify, which nat_ir.fd's ng_mir_verify runs with the target's
+//     own checks added);
+//   - block parameters (below).
+//
+// Block parameters. A block may take parameters and the edges into it pass
+// arguments, instead of a value crossing blocks in a vreg that several
+// blocks write:
+//
+//   PLACE L                        the block's label
+//   BPARAM p0, 0                   r0 = parameter i0 of the block
+//   BPARAM p1, 1                   (right after the PLACE, numbered 0..)
+//   ...
+//   BARG a0, L, 0                  the edge to label i0 passes r0 as
+//   BARG a1, L, 1                  parameter i1
+//   JMP L                          (right before the block's jump, or at
+//                                  the end of a block that falls through)
+//
+// The arguments of one edge are assigned at once (a parallel copy). The
+// BARGs before a conditional branch name the edge by its label: those for
+// the branch's target hold when it is taken, those for the label of the
+// block it falls into when it is not (both, when that is the same label).
+// mir_bparams_form turns a function's MIR into this form: every vreg that
+// more than one operation writes becomes a value per definition, and a
+// labeled block takes a parameter for each of them live into it. A value
+// written once still crosses blocks by dominance, as in Cranelift. The
+// form is SSA: mir_bparams_ssa_check. mir_bparams_lower takes it out again
+// before allocation (moves on the edges; a conditional branch whose taken
+// edge passes arguments goes through an edge block after the function's
+// end). The liveness (mi_liveness) and the verifier read BPARAM as a
+// definition and BARG as a use, at the jump.
+//
+// nat_ir.fd: FID_NAT_ON=bparams forms and lowers every function (not yet
+// the default); FID_VERIFY=1 checks the form, SSA and the lowering.
+// docs/reference/mir.md describes the MIR; tests/nattools/bparam_unit.fd
+// runs the form and the lowering on random functions.
+
+module compiler::mir; use core; use vec; use string;
+
+// Integer compare kinds
+pub const NCC_EQ: i64 = 0;
+pub const NCC_NE: i64 = 1;
+pub const NCC_LT: i64 = 2;
+pub const NCC_LE: i64 = 3;
+pub const NCC_GT: i64 = 4;
+pub const NCC_GE: i64 = 5;
+pub const NCC_LTU: i64 = 6;
+pub const NCC_LEU: i64 = 7;
+pub const NCC_GTU: i64 = 8;
+pub const NCC_GEU: i64 = 9;
+// Extension kinds
+pub const NEXT_SB: i64 = 1;
+pub const NEXT_SH: i64 = 2;
+pub const NEXT_SW: i64 = 3;
+pub const NEXT_ZB: i64 = 4;
+pub const NEXT_ZH: i64 = 5;
+pub const NEXT_ZW: i64 = 6;
+// The arithmetic panics (the messages of pe_ir's peir_arith_panic_strings)
+pub const NP_ADD: i64 = 0;
+pub const NP_SUB: i64 = 1;
+pub const NP_MUL: i64 = 2;
+pub const NP_DIV_OVF: i64 = 3;
+pub const NP_DIV_ZERO: i64 = 4;
+pub const NP_MOD_ZERO: i64 = 5;
+
+// The first virtual register: below it, a register field names a physical
+// register (x86-64 60: the zero operand of a compare).
+pub const NG_VBASE: i64 = 64;
+
+pub const MO_LI: i64 = 1;
+pub const MO_MOV: i64 = 2;
+pub const MO_SLOTADDR: i64 = 3;
+pub const MO_LDSLOT: i64 = 4;
+pub const MO_STSLOT: i64 = 5;
+pub const MO_LOAD: i64 = 6;
+pub const MO_STORE: i64 = 7;
+pub const MO_ADDR: i64 = 8;
+pub const MO_CALL: i64 = 9;
+pub const MO_CALLR: i64 = 10;
+pub const MO_JMP: i64 = 11;
+pub const MO_BNEZ: i64 = 12;
+pub const MO_BEQZ: i64 = 13;
+pub const MO_PANICIF: i64 = 14;
+pub const MO_TRAP: i64 = 15;
+pub const MO_ADD: i64 = 16;
+pub const MO_SUB: i64 = 17;
+pub const MO_MUL: i64 = 18;
+pub const MO_AND: i64 = 19;
+pub const MO_OR: i64 = 20;
+pub const MO_XOR: i64 = 21;
+pub const MO_SHL: i64 = 22;
+pub const MO_SAR: i64 = 23;
+pub const MO_SHR: i64 = 24;
+pub const MO_NEG: i64 = 25;
+pub const MO_NOT: i64 = 26;
+pub const MO_DIV: i64 = 27;
+pub const MO_REM: i64 = 28;
+pub const MO_MULH: i64 = 29;
+pub const MO_SETCC: i64 = 30;
+pub const MO_EXT: i64 = 31;
+pub const MO_FBIN: i64 = 32;
+pub const MO_FCMP: i64 = 33;
+pub const MO_I2F: i64 = 34;
+pub const MO_F2I: i64 = 35;
+pub const MO_PROLOGUE: i64 = 36;
+pub const MO_EPILOGUE: i64 = 37;
+pub const MO_LDIN: i64 = 38;
+pub const MO_STOUT: i64 = 39;
+pub const MO_COPY: i64 = 40;
+pub const MO_PLACE: i64 = 41;
+pub const MO_ASR63: i64 = 42;
+pub const MO_LINE: i64 = 43;  // i0: a source line starts here (no code)
+pub const MO_F32BITS: i64 = 44;  // r0 = zero-extended f32 pattern of widened-f64 r1
+// MI23: branch to label i0 when (r0 cc r1), cc = i1 (an NCC_* kind): a
+// SETCC and the BNEZ/BEQZ that tests it, fused by ng_fuse_branches. r1 may
+// be the zero register (g.zr).
+pub const MO_BRCC: i64 = 45;
+// MI3/MI22: r0 = r1 + (r2 << i0), the address of an element: AArch64
+// `add d, n, m, lsl #s`, x86-64 `lea d, [n + m * 2^s]`, RISC-V slli + add.
+pub const MO_ADDSHL: i64 = 46;
+// MI3/OP20: r0 = ~r1 & r2 (x86-64 BMI1 ANDN, AArch64 BIC, RISC-V Zbb
+// ANDN) and r0 = r1 & (r1 - 1) (x86-64 BMI1 BLSR), selected from NOT/AND
+// and SUB/AND chains by ng_fuse_bits where ng_sel_has says the target has
+// them. TG7: MO_BLSR's i0 is the kind: 0 BLSR, 1 r0 = r1 ^ (r1 - 1)
+// (BLSMSK, from SUB/XOR), 2 r0 = r1 & -r1 (BLSI, from NEG/AND).
+pub const MO_ANDN: i64 = 47;
+pub const MO_BLSR: i64 = 48;
+// MI22: the element address folded into the access (ng_fuse_addr):
+//   MO_LDX  r0 = *(r1 + (r2 << s) + i0), i1 bytes, i2 = signed | (s << 1)
+//   MO_STX  *(r0 + (r2 << s) + i0) = r1, i1 bytes, i2 = s << 1
+// x86-64 a SIB operand ([base + index * 2^s + disp]), AArch64 the
+// register-offset form (`ldr x, [n, m, lsl #s]`, s 0 or log2(size), no
+// displacement); RISC-V has neither (ng_sel_has: never selected there).
+pub const MO_LDX: i64 = 49;
+pub const MO_STX: i64 = 50;
+// MI24: r0 = (r1 != 0) ? r2 : r0, a conditional select: x86-64 `test r1,
+// r1` + `cmovne r0, r2`, AArch64 `cmp r1, xzr` + `csel r0, r2, r0, ne`,
+// RISC-V Zicond (`--cpu rva23u64`) czero.eqz / czero.nez / or, else a
+// branch over one move. It reads r0 (the value kept when r1 is 0) and
+// defines it. Formed by ng_fuse_select from small branch diamonds.
+pub const MO_CSEL: i64 = 51;
+// RA6: r0 = r1 + i0, the constant an immediate of the target's add
+// (ng_addi_fits): x86-64 ADD r, imm32 (or LEA when r0 != r1), AArch64
+// ADD/SUB #imm12, RISC-V ADDI. Selected by ng_fuse_addi from an ADD or SUB
+// of a register and an LI, so a counter step `i = i + 1` is one
+// instruction once i and the sum share a register (ng_classes_interfere).
+pub const MO_ADDI: i64 = 52;
+// TG8/TG7: branch to label i0 when bit i1 (0..63) of r0 is set (i2 0) or
+// clear (i2 1): AArch64 TBNZ / TBZ, x86-64 TEST imm / BT + jcc, RISC-V
+// SLLI into ad2 (the bit to the sign) + BLT / BGE zero. Formed by
+// ng_fuse_tbz from an AND with a one-bit constant tested against zero.
+pub const MO_TBNZ: i64 = 53;
+// TG9: r0 = sign-extended low 32 bits of (r1 op r2), op i0: 0 add, 1 sub,
+// 2 mul — RISC-V ADDW / SUBW / MULW, where ADD + sext.w took two. Formed
+// by ng_fuse_opw from a wrapping i32 operation and its normalization;
+// selected on RISC-V only (ng_sel_has), any other target emits the two.
+pub const MO_OPW: i64 = 54;
+// OP18: r0 = r1 op *(r2 + i0), an 8-byte load folded into the ALU
+// operation that reads it, op i1: 0 add, 1 sub, 2 mul, 3 and, 4 or, 5 xor
+// — x86-64's memory source form (`add r, [base + disp]`, `imul r, [..]`).
+// Formed by ng_fuse_ldop (x86-64 only: ng_sel_has) from a LOAD whose one
+// reader is the operation.
+pub const MO_ALUM: i64 = 55;
+// TG1: r0 = r1 shifted by the constant i0 (0..63), kind i1: 0 shl, 1 sar,
+// 2 shr — x86-64 SHL / SAR / SHR r, imm8, AArch64 LSL / ASR / LSR #imm,
+// RISC-V SLLI / SRAI / SRLI. Formed by ng_fuse_addi from a SHL / SAR /
+// SHR whose count is a known constant (taken mod 64, as the register
+// forms do); selected from the table (ng_isel_rows_tg1) or ng_shi.
+pub const MO_SHI: i64 = 56;
+// TG11: the vector operations (codes 57..63; 56 is the scalar MO_SHI).
+// A vector value is held in a register of the vector class (NG_RC_VEC), named in the operation by its index k = 0..3 there
+// (ng_vphys: x86-64 xmm/ymm 12..15, --nat Windows xmm/ymm 2..5, AArch64
+// v28..v31, RISC-V v1..v4; v0 is the RISC-V mask). None of them is in
+// the float pool (MI25) or the float scratch pair, so float operations may
+// come between vector ones. The class has no allocatable pool: its registers
+// are the vector operations' scratch, as xmm0/xmm1 are the float
+// operations' (td.float_scratch), so a vector value lives from the load
+// that fills its register to the store that empties it, inside one IR
+// instruction's lowering with no call between (ng_simd_call). w is the
+// width in bytes: 16 (SSE2, NEON, RVV at VL = 2 x e64) or 32 (AVX2).
+//   MO_VLD     V[i2] = w bytes at r1 + i0, i1 = w
+//   MO_VST     w bytes at r0 + i0 = V[i2], i1 = w
+//   MO_VBIN    V[d] = V[d] op V[b], op i0 (nat_enc.fd NVK_*), i1 = w,
+//              i2 = d | (b << 4)
+//   MO_VSPLAT  every 64-bit lane of V[i2] = r1, i1 = w
+//   MO_VLANE   r0 = 64-bit lane i0 (0 or 1) of V[k], i1 = w, i2 = k |
+//              (t << 4), V[t] the scratch lane 1 passes through
+//   MO_VZMASK  V[d] lanes zeroed where V[b]'s f64 lane is +-0.0, i1 = w,
+//              i2 = d | (b << 4) | (t << 8), V[t] clobbered (the
+//              runtime's `x / 0 is 0`; NaN keeps its lane)
+//   MO_VEND    the end of 256-bit code (x86-64 VZEROUPPER), i1 = w
+pub const MO_VLD: i64 = 57;
+pub const MO_VST: i64 = 58;
+pub const MO_VBIN: i64 = 59;
+pub const MO_VSPLAT: i64 = 60;
+pub const MO_VLANE: i64 = 61;
+pub const MO_VZMASK: i64 = 62;
+pub const MO_VEND: i64 = 63;
+// OP18: compares and read-modify-writes with a memory operand (x86-64
+// only: ng_sel_has), formed after allocation-independent selection by
+// ng_fuse_memcmp and ng_fuse_rmw from a LOAD whose only reader is the
+// compare, or a LOAD, an ALU operation and a STORE back to the same
+// address. A compare's `flags` are cc | (size << 4) | (mode << 8): mode
+// 0 compares register A with the 8 bytes at base + disp, mode 1 the
+// `size` bytes there (1, 2, 4, 8) with the immediate imm (32 bits signed;
+// the compare kind already adjusted to the narrow field: ng_memcmp_cc).
+//   MO_BRCCM   branch to label i0 when (A cc B): r0 = A (mode 1: the
+//              base again), r1 = base, i1 = flags | (disp << 10), i2 = imm
+//              — `cmp r, [m]` / `cmp size [m], imm` + jcc
+//   MO_SETCCM  r0 = (A cc B) as 0 / 1: r1 = A (mode 1: the base), r2 =
+//              base, i0 = flags, i1 = disp, i2 = imm — the compare + setcc
+//   MO_ALUMST  *(r0 + i0) = *(r0 + i0) op B, 8 bytes, i1 = kind | (mode
+//              << 4) with kind 0 add, 1 sub, 3 and, 4 or, 5 xor (MO_ALUM's
+//              kinds), B = r1 (mode 0) or imm i2 (mode 1, r1 = r0) — `op
+//              [m], r` / `op qword [m], imm`
+pub const MO_BRCCM: i64 = 64;
+pub const MO_SETCCM: i64 = 65;
+pub const MO_ALUMST: i64 = 66;
+// MI1: block parameters (see the top of this file). Neither reaches
+// allocation or emission: mir_bparams_lower turns them into moves.
+//   MO_BPARAM  r0 = parameter i0 of the block whose PLACE comes before
+//   MO_BARG    the edge to label i0 passes r0 as parameter i1
+pub const MO_BPARAM: i64 = 67;
+pub const MO_BARG: i64 = 68;
+// MI27: a jump table (nat_ir.fd ng_gen_switch / ng_jtab_emit). The
+// dispatch is followed at once by one entry per index, then (usually) a
+// JMP to the default:
+//   MO_JTAB  branch to label i0 (the default) when r0 >u i1 - 1 (r0 the
+//            index, already x - lo; i1 the table's length); else jump
+//            through the table that the entries after it form
+//   MO_JTE   entry: index k (the k-th MO_JTE after the dispatch) goes to
+//            label i0
+// Both count as conditional branches (mi_is_cond_br) to their i0: every
+// target is a successor (mi_blocks), every label they name is referenced
+// (the passes that count references, the verifier), and the chain of
+// entries is a chain of one-instruction blocks, each falling into the
+// next (a fall-through that never runs: the dispatch jumps through the
+// table, whose entries are data). Nothing may come between the dispatch
+// and its entries (ng_mir_has_jtab: the passes that insert code on a
+// fall-through or move blocks leave such a function alone).
+pub const MO_JTAB: i64 = 69;
+pub const MO_JTE: i64 = 70;
+// The highest operation code (the MIR verifier's range check).
+pub const MO_LAST: i64 = 70;
+
+pub struct MInst {
+    pub op: i64,
+    pub r0: i64,
+    pub r1: i64,
+    pub r2: i64,
+    pub i0: i64,
+    pub i1: i64,
+    pub i2: i64,
+}
+
+pub fn mi_new(op: i64, r0: i64, r1: i64, r2: i64, i0: i64, i1: i64, i2: i64) -> MInst {
+    return MInst {
+        op: op, r0: r0, r1: r1, r2: r2, i0: i0, i1: i1, i2: i2
+    };
+}
+
+/// r0 of `op` is the register it defines.
+pub fn mi_defines(op: i64) -> bool {
+    if op == MO_LI || op == MO_MOV || op == MO_SLOTADDR || op == MO_LDSLOT || op == MO_LOAD || op == MO_ADDR {
+        return true;
+    }
+    if op >= MO_ADD && op <= MO_F2I {
+        return true;
+    }
+    if op == MO_VLANE {
+        // TG11: the one vector operation that writes a general register
+        return true;
+    }
+    if op == MO_BPARAM {
+        // MI1: a block parameter is defined at the block's start
+        return true;
+    }
+    return op == MO_LDIN || op == MO_ASR63 || op == MO_F32BITS || op == MO_ADDSHL || op == MO_ANDN || op == MO_BLSR || op == MO_LDX || op == MO_CSEL || op == MO_ADDI || op == MO_OPW || op == MO_ALUM || op == MO_SHI || op == MO_SETCCM;
+}
+
+/// The fields of `op` it reads: 1 r0, 2 r1, 4 r2.
+pub fn mi_use_mask(op: i64) -> i64 {
+    // TG11: a vector load and a splat read r1, a vector store its address
+    // in r0; the other vector operations read vector registers only
+    if op == MO_VLD || op == MO_VSPLAT {
+        return 2;
+    }
+    if op == MO_VST {
+        return 1;
+    }
+    if op == MO_MOV || op == MO_LOAD || op == MO_NEG || op == MO_NOT || op == MO_EXT || op == MO_I2F || op == MO_F2I || op == MO_ASR63 || op == MO_F32BITS || op == MO_BLSR || op == MO_ADDI || op == MO_SHI {
+        return 2;
+    }
+    // (MI1: a block argument is read at the jump that passes it)
+    if op == MO_STSLOT || op == MO_CALLR || op == MO_BNEZ || op == MO_BEQZ || op == MO_PANICIF || op == MO_STOUT || op == MO_TBNZ || op == MO_BARG || op == MO_JTAB {
+        return 1;
+    }
+    if op == MO_STORE || op == MO_COPY || op == MO_BRCC || op == MO_BRCCM || op == MO_ALUMST {
+        return 3;
+    }
+    if op == MO_SETCCM {
+        return 6;
+    }
+    if (op >= MO_ADD && op <= MO_SHR) || op == MO_ADDSHL || op == MO_ANDN || op == MO_LDX || op == MO_OPW || op == MO_ALUM {
+        return 6;
+    }
+    if op == MO_STX || op == MO_CSEL {
+        return 7;
+    }
+    if op == MO_DIV || op == MO_REM || op == MO_MULH || op == MO_SETCC || op == MO_FBIN || op == MO_FCMP {
+        return 6;
+    }
+    return 0;
+}
+
+pub fn mi_is_call(op: i64) -> bool {
+    return op == MO_CALL || op == MO_CALLR;
+}
+
+/// A jump inside the function to label i0: unconditional (MO_JMP) or
+/// conditional (it falls through to the next instruction otherwise).
+pub fn mi_is_cond_br(op: i64) -> bool {
+    return op == MO_BNEZ || op == MO_BEQZ || op == MO_BRCC || op == MO_TBNZ || op == MO_BRCCM || op == MO_JTAB || op == MO_JTE;
+}
+
+pub fn mi_is_br(op: i64) -> bool {
+    return op == MO_JMP || mi_is_cond_br(op);
+}
+
+pub fn mi_nop() -> MInst {
+    return MInst {
+        op: - 1, r0: 0, r1: 0, r2: 0, i0: 0, i1: 0, i2: 0
+    };
+}
+
+/// Ends a machine block: control does not go on to the next instruction
+/// only (it may jump, or not continue at all).
+pub fn mi_ends_block(op: i64) -> bool {
+    return mi_is_br(op) || op == MO_EPILOGUE || op == MO_TRAP;
+}
+
+/// MI27: the function holds a jump table (MO_JTAB). The passes that put
+/// code on a fall-through or after a block's last instruction (live-range
+/// splitting, shrink-wrapping, block parameters) or move blocks (the cold
+/// layout) leave it alone: nothing may come between a dispatch and its
+/// entries.
+pub fn mi_has_jtab(mir: & Vec<MInst>) -> bool {
+    var k: i64 = 0;
+    while k < mir.len() {
+        if mir.get(k).op == MO_JTAB {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+pub fn mi_field(m: MInst, f: i64) -> i64 {
+    if f == 0 {
+        return m.r0;
+    }
+    if f == 1 {
+        return m.r1;
+    }
+    return m.r2;
+}
+
+/// m with register field f set to v.
+pub fn mi_set_field(m: MInst, f: i64, v: i64) -> MInst {
+    var o: MInst = m;
+    if f == 0 {
+        o.r0 = v;
+    } else if f == 1 {
+        o.r1 = v;
+    } else {
+        o.r2 = v;
+    }
+    return o;
+}
+
+// --- Blocks and liveness --------------------------------------------------
+
+/// Machine blocks: starts, ends, the block of each instruction, successors.
+pub struct MBlocks {
+    pub start: Vec<i64>,
+    pub end: Vec<i64>,
+    pub of: Vec<i64>,
+    pub succs: Vec<Vec<i64>>,
+}
+
+pub fn mi_blocks(mir: & Vec<MInst>) -> MBlocks {
+    var start: Vec<i64> = Vec::new();
+    var end: Vec<i64> = Vec::new();
+    var of: Vec<i64> = Vec::new();
+    var n: i64 = mir.len();
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        var begins: bool = k == 0 || m.op == MO_PLACE;
+        if k > 0 && mi_ends_block(mir.get(k - 1).op) {
+            begins = true;
+        }
+        if begins {
+            if start.len() > 0 {
+                end.push(k - 1);
+            }
+            start.push(k);
+        }
+        of.push(start.len() - 1);
+        k = k + 1;
+    }
+    if start.len() > 0 {
+        end.push(n - 1);
+    }
+    var label_block: i64 = HashMap_new();
+    k = 0;
+    while k < n {
+        var mp: MInst = mir.get(k);
+        if mp.op == MO_PLACE {
+            HashMap_insert(label_block, int_to_str(mp.i0), of.get(k));
+        }
+        k = k + 1;
+    }
+    var succs: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < start.len() {
+        var s: Vec<i64> = Vec::new();
+        var last: MInst = mir.get(end.get(b));
+        var to: str = int_to_str(last.i0);
+        if last.op == MO_JMP {
+            if HashMap_contains(label_block, to) {
+                s.push(HashMap_get(label_block, to));
+            }
+        } else if mi_is_cond_br(last.op) {
+            if HashMap_contains(label_block, to) {
+                s.push(HashMap_get(label_block, to));
+            }
+            if b + 1 < start.len() {
+                s.push(b + 1);
+            }
+        } else if last.op != MO_EPILOGUE && last.op != MO_TRAP {
+            if b + 1 < start.len() {
+                s.push(b + 1);
+            }
+        }
+        succs.push(s);
+        b = b + 1;
+    }
+    return MBlocks {
+        start: start, end: end, of: of, succs: succs
+    };
+}
+
+/// Block liveness over the vregs whose index has sel[vi] >= 0 (their bit is
+/// sel[vi]); live_in and live_out as bit sets of `words` words per block.
+/// (MI1: a BPARAM defines its vreg at the block's start, a BARG reads its
+/// argument at the jump; both are ordinary definitions and uses here.)
+pub fn mi_liveness(mir: & Vec<MInst>, mb: & MBlocks, sel: & Vec<i64>, words: i64, live_in: & mut Vec<i64>, live_out: & mut Vec<i64>) {
+    var nb: i64 = mb.start.len();
+    var use_b: Vec<i64> = Vec::new();
+    var def_b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nb * words {
+        use_b.push(0);
+        def_b.push(0);
+        live_in.push(0);
+        live_out.push(0);
+        i = i + 1;
+    }
+    var b: i64 = 0;
+    while b < nb {
+        var k: i64 = mb.start.get(b);
+        while k <= mb.end.get(b) {
+            var m: MInst = mir.get(k);
+            var um: i64 = mi_use_mask(m.op);
+            var f: i64 = 0;
+            while f < 3 {
+                if (um & (1 << f)) != 0 {
+                    var v: i64 = mi_field(m, f);
+                    if v >= NG_VBASE && v - NG_VBASE < sel.len() && sel.get(v - NG_VBASE) >= 0 {
+                        var bit: i64 = sel.get(v - NG_VBASE);
+                        var w: i64 = b * words + bit / 64;
+                        if (def_b.get(w) & (1 << (bit % 64))) == 0 {
+                            use_b.set(w, use_b.get(w) | (1 << (bit % 64)));
+                        }
+                    }
+                }
+                f = f + 1;
+            }
+            if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < sel.len() && sel.get(m.r0 - NG_VBASE) >= 0 {
+                var dbit: i64 = sel.get(m.r0 - NG_VBASE);
+                var dw: i64 = b * words + dbit / 64;
+                def_b.set(dw, def_b.get(dw) | (1 << (dbit % 64)));
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var changed: bool = true;
+    var rounds: i64 = 0;
+    while changed && rounds < 1000 {
+        changed = false;
+        rounds = rounds + 1;
+        b = nb - 1;
+        while b >= 0 {
+            var ss: Vec<i64> = mb.succs.get(b);
+            var wi: i64 = 0;
+            while wi < words {
+                var o: i64 = 0;
+                var si: i64 = 0;
+                while si < ss.len() {
+                    o = o | live_in.get(ss.get(si) * words + wi);
+                    si = si + 1;
+                }
+                var at: i64 = b * words + wi;
+                var inn: i64 = use_b.get(at) | (o & ~def_b.get(at));
+                if o != live_out.get(at) {
+                    live_out.set(at, o);
+                    changed = true;
+                }
+                if inn != live_in.get(at) {
+                    live_in.set(at, inn);
+                    changed = true;
+                }
+                wi = wi + 1;
+            }
+            b = b - 1;
+        }
+    }
+}
+
+// --- The printer ----------------------------------------------------------
+
+/// The name of a machine IR operation (the MIR printer, the verifier).
+pub fn mi_op_name(op: i64) -> str {
+    // TG11: the vector operations (codes past the scalar list)
+    if op == MO_VLD { return "vld"; }
+    if op == MO_VST { return "vst"; }
+    if op == MO_VBIN { return "vbin"; }
+    if op == MO_VSPLAT { return "vsplat"; }
+    if op == MO_VLANE { return "vlane"; }
+    if op == MO_VZMASK { return "vzmask"; }
+    if op == MO_VEND { return "vend"; }
+    // OP18: memory compares and read-modify-writes
+    if op == MO_BRCCM { return "brccm"; }
+    if op == MO_SETCCM { return "setccm"; }
+    if op == MO_ALUMST { return "alumst"; }
+    // MI1: block parameters and arguments
+    if op == MO_BPARAM { return "bparam"; }
+    if op == MO_BARG { return "barg"; }
+    // MI27: jump tables
+    if op == MO_JTAB { return "jtab"; }
+    if op == MO_JTE { return "jte"; }
+    var names: Vec<str> = Vec::new();
+    names.push("nop");
+    names.push("li");
+    names.push("mov");
+    names.push("slotaddr");
+    names.push("ldslot");
+    names.push("stslot");
+    names.push("load");
+    names.push("store");
+    names.push("addr");
+    names.push("call");
+    names.push("callr");
+    names.push("jmp");
+    names.push("bnez");
+    names.push("beqz");
+    names.push("panicif");
+    names.push("trap");
+    names.push("add");
+    names.push("sub");
+    names.push("mul");
+    names.push("and");
+    names.push("or");
+    names.push("xor");
+    names.push("shl");
+    names.push("sar");
+    names.push("shr");
+    names.push("neg");
+    names.push("not");
+    names.push("div");
+    names.push("rem");
+    names.push("mulh");
+    names.push("setcc");
+    names.push("ext");
+    names.push("fbin");
+    names.push("fcmp");
+    names.push("i2f");
+    names.push("f2i");
+    names.push("prologue");
+    names.push("epilogue");
+    names.push("ldin");
+    names.push("stout");
+    names.push("copy");
+    names.push("place");
+    names.push("asr63");
+    names.push("line");
+    names.push("f32bits");
+    names.push("brcc");
+    names.push("addshl");
+    names.push("andn");
+    names.push("blsr");
+    names.push("ldx");
+    names.push("stx");
+    names.push("csel");
+    names.push("addi");
+    names.push("tbnz");
+    names.push("opw");
+    names.push("alum");
+    names.push("shi");
+    if op >= 0 && op < names.len() {
+        return names.get(op);
+    }
+    return "op" + int_to_str(op);
+}
+
+/// One operation as the MIR listings print it (FID_NAT_DUMP, `fid explain
+/// --stages`): its name, the three register fields (`v` a vreg, `p` a
+/// physical register) and i0, i1.
+pub fn mi_text(m: MInst) -> str {
+    var line: str = mi_op_name(m.op);
+    var f: i64 = 0;
+    while f < 3 {
+        var v: i64 = mi_field(m, f);
+        if v >= NG_VBASE {
+            line = line + " v" + int_to_str(v);
+        } else {
+            line = line + " p" + int_to_str(v);
+        }
+        f = f + 1;
+    }
+    return line + " i " + int_to_str(m.i0) + " " + int_to_str(m.i1);
+}
+
+/// A whole function, one operation a line ("k: text").
+pub fn mir_listing(mir: & Vec<MInst>) -> str {
+    var out: str = "";
+    var k: i64 = 0;
+    while k < mir.len() {
+        out = out + int_to_str(k) + ": " + mi_text(mir.get(k)) + "\n";
+        k = k + 1;
+    }
+    return out;
+}
+
+// --- The verifier ---------------------------------------------------------
+
+/// v names a register a MIR operand may hold: a vreg of the function, a
+/// physical register, or `zero_reg` (x86-64 60, the zero operand of a
+/// compare; -1 on targets whose zero register is an ordinary number).
+pub fn mir_reg_ok(v: i64, nvreg: i64, zero_reg: i64) -> bool {
+    if v >= NG_VBASE {
+        return v < nvreg;
+    }
+    if v >= 0 && v < 32 {
+        return true;
+    }
+    return zero_reg >= 0 && v == zero_reg;
+}
+
+/// The verifier's prefix for an error at MIR position k.
+pub fn mir_verify_at(name: str, k: i64, op: i64) -> str {
+    return name + ": MIR " + int_to_str(k) + " (" + mi_op_name(op) + "): ";
+}
+
+/// MI10: the structural MIR verifier, without the target's own checks
+/// (nat_ir.fd ng_mir_verify adds the vector operations'): every operation
+/// known; every register operand a vreg of the function (nvreg vregs, the
+/// first nslots of them the IR values') or a physical register; every
+/// temporary (a vreg past the IR values') read somewhere written somewhere
+/// (a temporary belongs to one IR instruction's lowering, so one read with
+/// no write is a lowering bug: an IR value's vreg may be read on a path
+/// that never sets it, which is the IR verifier's to judge); every jump to
+/// a label the function places, each placed once; operand classes (access
+/// sizes 1/2/4/8, extension kinds, compare kinds, shift counts, panic
+/// kinds); block parameters and arguments well formed (mir_verify_bparams);
+/// the prologue first and nothing falling off the end.
+pub fn mir_verify(name: str, mir: & Vec<MInst>, nvreg: i64, nslots: i64, zero_reg: i64) -> str {
+    var n: i64 = mir.len();
+    if n == 0 {
+        return name + ": no machine IR";
+    }
+    var temps: i64 = NG_VBASE + nslots;
+    var defd: Vec<i64> = Vec::new();
+    var i: i64 = temps;
+    while i < nvreg {
+        defd.push(0);
+        i = i + 1;
+    }
+    var placed: i64 = HashMap_new();
+    var has_bp: bool = false;
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        if m.op == MO_PLACE {
+            var pkey: str = int_to_str(m.i0);
+            if HashMap_contains(placed, pkey) {
+                return name + ": MIR " + int_to_str(k) + ": label " + pkey + " placed twice";
+            }
+            HashMap_insert(placed, pkey, 1);
+        }
+        if m.op == MO_BPARAM || m.op == MO_BARG {
+            has_bp = true;
+        }
+        if mi_defines(m.op) && m.r0 >= temps && m.r0 < nvreg {
+            defd.set(m.r0 - temps, 1);
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while k < n {
+        var m2: MInst = mir.get(k);
+        var op: i64 = m2.op;
+        if op < MO_LI || op > MO_LAST {
+            return mir_verify_at(name, k, op) + "unknown operation";
+        }
+        var um: i64 = mi_use_mask(op);
+        var f: i64 = 0;
+        while f < 3 {
+            var used: bool = (um & (1 << f)) != 0;
+            var defs: bool = f == 0 && mi_defines(op);
+            if used || defs {
+                var v: i64 = mi_field(m2, f);
+                if !mir_reg_ok(v, nvreg, zero_reg) {
+                    return mir_verify_at(name, k, op) + "operand " + int_to_str(f) + " (" + int_to_str(v) + ") is not a register";
+                }
+                if used && v >= temps && v < nvreg && defd.get(v - temps) == 0 {
+                    return mir_verify_at(name, k, op) + "temporary v" + int_to_str(v) + " is read but never written";
+                }
+            }
+            f = f + 1;
+        }
+        if (mi_is_br(op) || op == MO_BARG) && !HashMap_contains(placed, int_to_str(m2.i0)) {
+            return mir_verify_at(name, k, op) + "jumps to label " + int_to_str(m2.i0) + ", which the function never places";
+        }
+        if (op == MO_LOAD || op == MO_STORE || op == MO_LDX || op == MO_STX) && m2.i1 != 1 && m2.i1 != 2 && m2.i1 != 4 && m2.i1 != 8 {
+            return mir_verify_at(name, k, op) + "access size " + int_to_str(m2.i1);
+        }
+        if (op == MO_LDX || op == MO_STX) && ((m2.i2 >> 1) < 0 || (m2.i2 >> 1) > 3) {
+            return mir_verify_at(name, k, op) + "index scale " + int_to_str(m2.i2 >> 1);
+        }
+        if op == MO_EXT && (m2.i0 < NEXT_SB || m2.i0 > NEXT_ZW) {
+            return mir_verify_at(name, k, op) + "extension kind " + int_to_str(m2.i0);
+        }
+        if op == MO_SETCC && (m2.i0 < NCC_EQ || m2.i0 > NCC_GEU) {
+            return mir_verify_at(name, k, op) + "compare kind " + int_to_str(m2.i0);
+        }
+        if op == MO_BRCC && (m2.i1 < NCC_EQ || m2.i1 > NCC_GEU) {
+            return mir_verify_at(name, k, op) + "compare kind " + int_to_str(m2.i1);
+        }
+        if op == MO_OPW && (m2.i0 < 0 || m2.i0 > 2) {
+            return mir_verify_at(name, k, op) + "32-bit operation " + int_to_str(m2.i0);
+        }
+        if op == MO_ALUM && (m2.i1 < 0 || m2.i1 > 5) {
+            return mir_verify_at(name, k, op) + "memory-operand operation " + int_to_str(m2.i1);
+        }
+        if op == MO_BRCCM || op == MO_SETCCM {
+            // OP18: cc, size and mode of a compare against memory
+            var cfl: i64 = m2.i0;
+            var cdisp: i64 = m2.i1;
+            if op == MO_BRCCM {
+                cfl = m2.i1 & 1023;
+                cdisp = m2.i1 >> 10;
+            }
+            var csz: i64 = (cfl >> 4) & 15;
+            var cmode: i64 = (cfl >> 8) & 3;
+            if (cfl & 15) > NCC_GEU || (csz != 1 && csz != 2 && csz != 4 && csz != 8) || cmode > 1 || (cmode == 0 && csz != 8) || cdisp < 0 {
+                return mir_verify_at(name, k, op) + "memory compare " + int_to_str(cfl) + " at " + int_to_str(cdisp);
+            }
+        }
+        if op == MO_ALUMST && ((m2.i1 & 15) == 2 || (m2.i1 & 15) > 5 || (m2.i1 >> 4) > 1 || m2.i1 < 0) {
+            return mir_verify_at(name, k, op) + "read-modify-write operation " + int_to_str(m2.i1);
+        }
+        if op == MO_TBNZ && (m2.i1 < 0 || m2.i1 > 63 || (m2.i2 != 0 && m2.i2 != 1)) {
+            return mir_verify_at(name, k, op) + "bit " + int_to_str(m2.i1) + " sense " + int_to_str(m2.i2);
+        }
+        if op == MO_FCMP && (m2.i0 < NCC_EQ || m2.i0 > NCC_GE) {
+            return mir_verify_at(name, k, op) + "float compare kind " + int_to_str(m2.i0);
+        }
+        if op == MO_CSEL && m2.i0 != 0 && m2.i0 != 1 {
+            return mir_verify_at(name, k, op) + "select sense " + int_to_str(m2.i0);
+        }
+        if op == MO_ADDSHL && (m2.i0 < 0 || m2.i0 > 63) {
+            return mir_verify_at(name, k, op) + "shift count " + int_to_str(m2.i0);
+        }
+        if op == MO_SHI && (m2.i0 < 0 || m2.i0 > 63 || m2.i1 < 0 || m2.i1 > 2) {
+            return mir_verify_at(name, k, op) + "shift count " + int_to_str(m2.i0) + " kind " + int_to_str(m2.i1);
+        }
+        if op == MO_PANICIF && (m2.i0 < NP_ADD || m2.i0 > NP_MOD_ZERO) {
+            return mir_verify_at(name, k, op) + "panic kind " + int_to_str(m2.i0);
+        }
+        if (op == MO_COPY || op == MO_LDIN || op == MO_STOUT) && m2.i0 < 0 {
+            return mir_verify_at(name, k, op) + "negative size or index " + int_to_str(m2.i0);
+        }
+        if (op == MO_BPARAM || op == MO_BARG) && (m2.r0 < NG_VBASE) {
+            return mir_verify_at(name, k, op) + "a block parameter or argument in physical register " + int_to_str(m2.r0);
+        }
+        if op == MO_JTAB {
+            // MI27: a table of at least one entry, its entries right after
+            if m2.i1 < 1 {
+                return mir_verify_at(name, k, op) + "jump table of " + int_to_str(m2.i1) + " entries";
+            }
+            var je: i64 = 1;
+            while je <= m2.i1 {
+                if k + je >= n || mir.get(k + je).op != MO_JTE {
+                    return mir_verify_at(name, k, op) + "entry " + int_to_str(je - 1) + " of " + int_to_str(m2.i1) + " does not follow the dispatch";
+                }
+                je = je + 1;
+            }
+            if k + m2.i1 + 1 < n && mir.get(k + m2.i1 + 1).op == MO_JTE {
+                return mir_verify_at(name, k, op) + "more entries than its " + int_to_str(m2.i1);
+            }
+        }
+        if op == MO_JTE && (k == 0 || (mir.get(k - 1).op != MO_JTE && mir.get(k - 1).op != MO_JTAB)) {
+            return mir_verify_at(name, k, op) + "a jump-table entry with no dispatch before it";
+        }
+        k = k + 1;
+    }
+    var first: i64 = 0;
+    while first < n && mir.get(first).op == MO_LINE {
+        first = first + 1;
+    }
+    if first >= n || mir.get(first).op != MO_PROLOGUE {
+        return name + ": the machine IR does not start with the prologue";
+    }
+    var last: i64 = n - 1;
+    while last >= 0 && mir.get(last).op == MO_LINE {
+        last = last - 1;
+    }
+    var lop: i64 = mir.get(last).op;
+    if lop != MO_JMP && lop != MO_EPILOGUE && lop != MO_TRAP {
+        return name + ": MIR " + int_to_str(last) + " (" + mi_op_name(lop) + "): the function falls off its end";
+    }
+    if has_bp {
+        return mir_verify_bparams(name, mir);
+    }
+    return "";
+}
+
+// --- Block parameters -----------------------------------------------------
+
+/// The label a block starts with (its first operation a PLACE), else -1.
+fn mir_block_label(mir: & Vec<MInst>, mb: & MBlocks, b: i64) -> i64 {
+    if b < 0 || b >= mb.start.len() {
+        return 0 - 1;
+    }
+    var m: MInst = mir.get(mb.start.get(b));
+    if m.op == MO_PLACE {
+        return m.i0;
+    }
+    return 0 - 1;
+}
+
+/// The number of parameters of each block (from its BPARAMs).
+fn mir_block_nparams(mir: & Vec<MInst>, mb: & MBlocks) -> Vec<i64> {
+    var np: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < mb.start.len() {
+        var c: i64 = 0;
+        var k: i64 = mb.start.get(b);
+        while k <= mb.end.get(b) {
+            if mir.get(k).op == MO_BPARAM {
+                c = c + 1;
+            }
+            k = k + 1;
+        }
+        np.push(c);
+        b = b + 1;
+    }
+    return np;
+}
+
+/// MI1: block parameters and arguments well formed. A block's BPARAMs come
+/// right after its PLACE, numbered 0, 1, ..; a parameter is a vreg defined
+/// there only. A block's BARGs come together right before its jump (or at
+/// its end when it falls through), each naming a label the block's edges
+/// go to (the jump's target, or the block it falls into) and a parameter
+/// that label's block has; every edge passes each of its target's
+/// parameters exactly once.
+pub fn mir_verify_bparams(name: str, mir: & Vec<MInst>) -> str {
+    var n: i64 = mir.len();
+    var mb: MBlocks = mi_blocks(mir);
+    var nb: i64 = mb.start.len();
+    var np: Vec<i64> = mir_block_nparams(mir, & mb);
+    var lab_block: i64 = HashMap_new();
+    var b: i64 = 0;
+    while b < nb {
+        var lb: i64 = mir_block_label(mir, & mb, b);
+        if lb >= 0 {
+            HashMap_insert_i(lab_block, lb, b);
+        }
+        b = b + 1;
+    }
+    // a parameter's vreg: defined by its BPARAM only
+    var pdefs: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        if m.op == MO_BPARAM {
+            if HashMap_contains_i(pdefs, m.r0) {
+                return mir_verify_at(name, k, m.op) + "v" + int_to_str(m.r0) + " is a parameter twice";
+            }
+            HashMap_insert_i(pdefs, m.r0, 1);
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while k < n {
+        var m1: MInst = mir.get(k);
+        if mi_defines(m1.op) && m1.op != MO_BPARAM && HashMap_contains_i(pdefs, m1.r0) {
+            return mir_verify_at(name, k, m1.op) + "writes block parameter v" + int_to_str(m1.r0);
+        }
+        k = k + 1;
+    }
+    b = 0;
+    while b < nb {
+        var s: i64 = mb.start.get(b);
+        var e: i64 = mb.end.get(b);
+        // the parameters: right after the PLACE, numbered in order
+        var idx: i64 = 0;
+        var at: i64 = s;
+        if mir.get(s).op == MO_PLACE {
+            at = s + 1;
+        }
+        while at <= e && mir.get(at).op == MO_BPARAM {
+            if mir.get(at).i0 != idx {
+                return mir_verify_at(name, at, MO_BPARAM) + "parameter " + int_to_str(mir.get(at).i0) + " where " + int_to_str(idx) + " comes";
+            }
+            idx = idx + 1;
+            at = at + 1;
+        }
+        if idx > 0 && mir.get(s).op != MO_PLACE {
+            return mir_verify_at(name, s, mir.get(s).op) + "a block without a label has parameters";
+        }
+        var k2: i64 = at;
+        while k2 <= e {
+            if mir.get(k2).op == MO_BPARAM {
+                return mir_verify_at(name, k2, MO_BPARAM) + "a parameter after the block's start";
+            }
+            k2 = k2 + 1;
+        }
+        // the arguments: one run, right before the jump or at the end
+        var last: MInst = mir.get(e);
+        var run_end: i64 = e;
+        if mi_is_br(last.op) {
+            run_end = e - 1;
+        }
+        var run_start: i64 = run_end + 1;
+        while run_start - 1 >= at && mir.get(run_start - 1).op == MO_BARG {
+            run_start = run_start - 1;
+        }
+        k2 = at;
+        while k2 < run_start {
+            if mir.get(k2).op == MO_BARG {
+                return mir_verify_at(name, k2, MO_BARG) + "an argument before the block's other operations end";
+            }
+            k2 = k2 + 1;
+        }
+        // the labels this block's edges go to
+        var to: Vec<i64> = Vec::new();
+        if mi_is_br(last.op) {
+            to.push(last.i0);
+        }
+        var falls: bool = !mi_ends_block(last.op) || mi_is_cond_br(last.op);
+        if falls && b + 1 < nb {
+            var fl: i64 = mir_block_label(mir, & mb, b + 1);
+            if fl >= 0 {
+                to.push(fl);
+            } else if np.get(b + 1) > 0 {
+                return name + ": block " + int_to_str(b + 1) + " has parameters but no label";
+            }
+        }
+        // every argument for one of them, each parameter once per label
+        var seen: i64 = HashMap_new();
+        k2 = run_start;
+        while k2 <= run_end {
+            var a: MInst = mir.get(k2);
+            var ok: bool = false;
+            var ti: i64 = 0;
+            while ti < to.len() {
+                if to.get(ti) == a.i0 {
+                    ok = true;
+                }
+                ti = ti + 1;
+            }
+            if !ok {
+                return mir_verify_at(name, k2, MO_BARG) + "passes an argument to label " + int_to_str(a.i0) + ", where the block does not go";
+            }
+            var tb: i64 = HashMap_get_i(lab_block, a.i0);
+            if a.i1 < 0 || a.i1 >= np.get(tb) {
+                return mir_verify_at(name, k2, MO_BARG) + "label " + int_to_str(a.i0) + " has no parameter " + int_to_str(a.i1);
+            }
+            var skey: str = int_to_str(a.i0) + ":" + int_to_str(a.i1);
+            if HashMap_contains(seen, skey) {
+                return mir_verify_at(name, k2, MO_BARG) + "parameter " + int_to_str(a.i1) + " of label " + int_to_str(a.i0) + " passed twice";
+            }
+            HashMap_insert(seen, skey, 1);
+            k2 = k2 + 1;
+        }
+        var ti2: i64 = 0;
+        while ti2 < to.len() {
+            var tl: i64 = to.get(ti2);
+            if HashMap_contains_i(lab_block, tl) {
+                var want: i64 = np.get(HashMap_get_i(lab_block, tl));
+                var j: i64 = 0;
+                while j < want {
+                    if !HashMap_contains(seen, int_to_str(tl) + ":" + int_to_str(j)) {
+                        return name + ": block " + int_to_str(b) + " (MIR " + int_to_str(s) + ".." + int_to_str(e) + ") goes to label " + int_to_str(tl) + " without its parameter " + int_to_str(j);
+                    }
+                    j = j + 1;
+                }
+            }
+            ti2 = ti2 + 1;
+        }
+        b = b + 1;
+    }
+    return "";
+}
+
+/// MI1: the formed MIR is SSA: every vreg but `keep` written by at most
+/// one operation (an operation that updates its r0 in place, MO_CSEL, not
+/// counted: it follows the move that defines its name), and every vreg
+/// written more than once in `orig` (the MIR before the form) no longer
+/// read or written. "" when it holds.
+pub fn mir_bparams_ssa_check(name: str, orig: & Vec<MInst>, mir: & Vec<MInst>, nvreg: i64, keep: i64) -> str {
+    var nv: i64 = nvreg - NG_VBASE;
+    if nv <= 0 {
+        return "";
+    }
+    var ndef: Vec<i64> = Vec::new();
+    var odef: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv {
+        ndef.push(0);
+        odef.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < orig.len() {
+        var mo: MInst = orig.get(i);
+        if mi_defines(mo.op) && mo.r0 >= NG_VBASE && mo.r0 - NG_VBASE < nv {
+            odef.set(mo.r0 - NG_VBASE, odef.get(mo.r0 - NG_VBASE) + 1);
+        }
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < mir.len() {
+        var m: MInst = mir.get(k);
+        // (an operation that reads r0 and writes it, MO_CSEL, changes the
+        // value its own name holds: the form gives it a fresh name set by a
+        // move right before, so it is that value's second step, not a
+        // second definition)
+        var two_addr: bool = (mi_use_mask(m.op) & 1) != 0;
+        if mi_defines(m.op) && !two_addr && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv && m.r0 != keep {
+            var d: i64 = m.r0 - NG_VBASE;
+            ndef.set(d, ndef.get(d) + 1);
+            if ndef.get(d) > 1 {
+                return mir_verify_at(name, k, m.op) + "v" + int_to_str(m.r0) + " written a second time (block parameters: not SSA)";
+            }
+        }
+        var um: i64 = mi_use_mask(m.op);
+        var f: i64 = 0;
+        while f < 3 {
+            var touched: bool = (um & (1 << f)) != 0 || (f == 0 && mi_defines(m.op));
+            var v: i64 = mi_field(m, f);
+            if touched && v >= NG_VBASE && v - NG_VBASE < nv && v != keep && odef.get(v - NG_VBASE) > 1 {
+                return mir_verify_at(name, k, m.op) + "v" + int_to_str(v) + ", which several operations wrote, is still used (block parameters)";
+            }
+            f = f + 1;
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+/// A function's MIR with block parameters (mir_bparams_form) or without
+/// them again (mir_bparams_lower).
+pub struct MirBp {
+    pub mir: Vec<MInst>,
+    pub nvreg: i64,
+    // parameters formed (form); edge blocks, each a new label from label0
+    // on (lower)
+    pub n_params: i64,
+    pub n_labels: i64,
+    pub err: str,
+}
+
+/// The name of candidate vreg v (index vi) where the rewrite is: cur[vi],
+/// or (-1: no value on this path, a read of something never written) a
+/// fresh vreg set to 0 before the operation.
+fn mir_bp_name(out: & mut Vec<MInst>, cur: & mut Vec<i64>, touched: & mut Vec<i64>, vi: i64, nvreg: & mut i64) -> i64 {
+    var c: i64 = cur.get(vi);
+    if c >= 0 {
+        return c;
+    }
+    var t: i64 = * nvreg;
+    * nvreg = t + 1;
+    out.push(mi_new(MO_LI, t, 0, 0, 0, 0, 0));
+    cur.set(vi, t);
+    touched.push(vi);
+    return t;
+}
+
+/// MI1: the MIR in block-parameter form. Every vreg (but `keep`, the
+/// struct-result pointer) that more than one operation writes becomes one
+/// vreg per write, and each labeled block takes a parameter for each such
+/// value live into it, which every edge into the block passes. The form
+/// computes what the original computes: each name holds, wherever it is
+/// read, the value the original vreg held there. Nothing changes (n_params
+/// 0) when no vreg is written twice, when the entry is a labeled block, or
+/// when the function takes the address of one of its own labels (MO_ADDR:
+/// an edge the blocks do not show).
+pub fn mir_bparams_form(mir: & Vec<MInst>, nvreg: i64, keep: i64) -> MirBp {
+    var n: i64 = mir.len();
+    var same: MirBp = MirBp {
+        mir: * mir, nvreg: nvreg, n_params: 0, n_labels: 0, err: ""
+    };
+    var nv: i64 = nvreg - NG_VBASE;
+    if n == 0 || nv <= 0 {
+        return same;
+    }
+    var placed: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k < n {
+        var mp: MInst = mir.get(k);
+        if mp.op == MO_PLACE {
+            HashMap_insert_i(placed, mp.i0, 1);
+        }
+        if mp.op == MO_BPARAM || mp.op == MO_BARG {
+            return same;
+        }
+        k = k + 1;
+    }
+    var ndef: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nv {
+        ndef.push(0);
+        i = i + 1;
+    }
+    k = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        if m.op == MO_ADDR && HashMap_contains_i(placed, m.i0) {
+            return same;
+        }
+        if mi_defines(m.op) && m.r0 >= NG_VBASE && m.r0 - NG_VBASE < nv {
+            ndef.set(m.r0 - NG_VBASE, ndef.get(m.r0 - NG_VBASE) + 1);
+        }
+        k = k + 1;
+    }
+    // the candidates and their bits
+    var sel: Vec<i64> = Vec::new();
+    var cands: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv {
+        if ndef.get(i) > 1 && i + NG_VBASE != keep {
+            sel.push(cands.len());
+            cands.push(i);
+        } else {
+            sel.push(0 - 1);
+        }
+        i = i + 1;
+    }
+    if cands.len() == 0 {
+        return same;
+    }
+    var mb: MBlocks = mi_blocks(mir);
+    var nb: i64 = mb.start.len();
+    if mir.get(0).op == MO_PLACE {
+        return same;
+    }
+    var words: i64 = (cands.len() + 63) / 64;
+    var lin: Vec<i64> = Vec::new();
+    var lout: Vec<i64> = Vec::new();
+    mi_liveness(mir, & mb, & sel, words, & mut lin, & mut lout);
+    // the parameters: a labeled block's live-in candidates, in bit order
+    var lab: Vec<i64> = Vec::new();
+    var lab_block: i64 = HashMap_new();
+    var pstart: Vec<i64> = Vec::new();
+    var pcount: Vec<i64> = Vec::new();
+    var pvi: Vec<i64> = Vec::new();
+    var pvr: Vec<i64> = Vec::new();
+    var nvr: i64 = nvreg;
+    var b: i64 = 0;
+    while b < nb {
+        var lb: i64 = mir_block_label(mir, & mb, b);
+        lab.push(lb);
+        pstart.push(pvi.len());
+        if lb >= 0 {
+            HashMap_insert_i(lab_block, lb, b);
+            var bit: i64 = 0;
+            while bit < cands.len() {
+                if (lin.get(b * words + bit / 64) & (1 << (bit % 64))) != 0 {
+                    pvi.push(cands.get(bit));
+                    pvr.push(nvr);
+                    nvr = nvr + 1;
+                }
+                bit = bit + 1;
+            }
+        }
+        pcount.push(pvi.len() - pstart.get(b));
+        b = b + 1;
+    }
+    var is_cand: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv {
+        if sel.get(i) >= 0 {
+            is_cand.push(1);
+        } else {
+            is_cand.push(0);
+        }
+        i = i + 1;
+    }
+    // the rewrite, block by block in order: cur[vi] is the name of
+    // candidate vi's value here (-1: none on this path)
+    var cur: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nv {
+        cur.push(0 - 1);
+        i = i + 1;
+    }
+    var touched: Vec<i64> = Vec::new();
+    var out: Vec<MInst> = Vec::new();
+    b = 0;
+    while b < nb {
+        var s: i64 = mb.start.get(b);
+        var e: i64 = mb.end.get(b);
+        var inherit: bool = b > 0 && lab.get(b) < 0;
+        if inherit {
+            var pl: MInst = mir.get(mb.end.get(b - 1));
+            // a block without a label is entered only by falling in
+            inherit = !mi_ends_block(pl.op) || mi_is_cond_br(pl.op);
+        }
+        if !inherit {
+            var ti: i64 = 0;
+            while ti < touched.len() {
+                cur.set(touched.get(ti), 0 - 1);
+                ti = ti + 1;
+            }
+            touched.clear();
+        }
+        k = s;
+        if lab.get(b) >= 0 {
+            out.push(mir.get(s));
+            var j: i64 = 0;
+            while j < pcount.get(b) {
+                var pj: i64 = pstart.get(b) + j;
+                out.push(mi_new(MO_BPARAM, pvr.get(pj), 0, 0, j, 0, 0));
+                cur.set(pvi.get(pj), pvr.get(pj));
+                touched.push(pvi.get(pj));
+                j = j + 1;
+            }
+            k = s + 1;
+        }
+        while k <= e {
+            var m2: MInst = mir.get(k);
+            var is_term: bool = k == e && mi_is_br(m2.op);
+            var um: i64 = mi_use_mask(m2.op);
+            var defs: bool = mi_defines(m2.op) && m2.r0 >= NG_VBASE && m2.r0 - NG_VBASE < nv && is_cand.get(m2.r0 - NG_VBASE) != 0;
+            // (an operation that reads r0 and writes it, MO_CSEL: the old
+            // value is moved into the new name first)
+            var rw0: bool = defs && (um & 1) != 0;
+            var f: i64 = 0;
+            while f < 3 {
+                var reads: bool = (um & (1 << f)) != 0 && !(f == 0 && rw0);
+                var v: i64 = mi_field(m2, f);
+                if reads && v >= NG_VBASE && v - NG_VBASE < nv && is_cand.get(v - NG_VBASE) != 0 {
+                    var nm: i64 = mir_bp_name(& mut out, & mut cur, & mut touched, v - NG_VBASE, & mut nvr);
+                    m2 = mi_set_field(m2, f, nm);
+                }
+                f = f + 1;
+            }
+            if defs {
+                var dvi: i64 = mir.get(k).r0 - NG_VBASE;
+                var t: i64 = nvr;
+                nvr = nvr + 1;
+                if rw0 {
+                    var old: i64 = mir_bp_name(& mut out, & mut cur, & mut touched, dvi, & mut nvr);
+                    out.push(mi_new(MO_MOV, t, old, 0, 0, 0, 0));
+                }
+                m2.r0 = t;
+                out.push(m2);
+                cur.set(dvi, t);
+                touched.push(dvi);
+            } else if is_term {
+                // the edges' arguments, then the jump
+                var args: Vec<MInst> = Vec::new();
+                mir_bp_args(& mut out, & mut args, & mut cur, & mut touched, & mut nvr, m2.i0, lab_block, & pstart, & pcount, & pvi);
+                if mi_is_cond_br(m2.op) && b + 1 < nb && lab.get(b + 1) >= 0 && lab.get(b + 1) != m2.i0 {
+                    mir_bp_args(& mut out, & mut args, & mut cur, & mut touched, & mut nvr, lab.get(b + 1), lab_block, & pstart, & pcount, & pvi);
+                }
+                mir_push_all(& mut out, & args);
+                out.push(m2);
+            } else {
+                out.push(m2);
+            }
+            k = k + 1;
+        }
+        // falling into a labeled block: its arguments at the end
+        var lastop: i64 = mir.get(e).op;
+        if !mi_ends_block(lastop) && b + 1 < nb && lab.get(b + 1) >= 0 {
+            var fargs: Vec<MInst> = Vec::new();
+            mir_bp_args(& mut out, & mut fargs, & mut cur, & mut touched, & mut nvr, lab.get(b + 1), lab_block, & pstart, & pcount, & pvi);
+            mir_push_all(& mut out, & fargs);
+        }
+        b = b + 1;
+    }
+    return MirBp {
+        mir: out, nvreg: nvr, n_params: pvi.len(), n_labels: 0, err: ""
+    };
+}
+
+/// The BARGs of the edge to `label` into `args`: each parameter of its
+/// block gets the current name of the candidate it stands for (a fresh 0
+/// set in `out` when no path wrote it, so the BARGs stay together).
+fn mir_bp_args(out: & mut Vec<MInst>, args: & mut Vec<MInst>, cur: & mut Vec<i64>, touched: & mut Vec<i64>, nvr: & mut i64, label: i64, lab_block: i64, pstart: & Vec<i64>, pcount: & Vec<i64>, pvi: & Vec<i64>) {
+    if !HashMap_contains_i(lab_block, label) {
+        return;
+    }
+    var tb: i64 = HashMap_get_i(lab_block, label);
+    var j: i64 = 0;
+    while j < pcount.get(tb) {
+        var pj: i64 = pstart.get(tb) + j;
+        var a: i64 = mir_bp_name(out, cur, touched, pvi.get(pj), nvr);
+        args.push(mi_new(MO_BARG, a, 0, 0, label, j, 0));
+        j = j + 1;
+    }
+}
+
+fn mir_push_all(out: & mut Vec<MInst>, more: & Vec<MInst>) {
+    var i: i64 = 0;
+    while i < more.len() {
+        out.push(more.get(i));
+        i = i + 1;
+    }
+}
+
+/// The parallel copy dst[i] = src[i] (all read before any is written) as
+/// moves; a cycle goes through a fresh vreg. Returns the vreg count after.
+pub fn mir_par_moves(out: & mut Vec<MInst>, dst: & Vec<i64>, src: & Vec<i64>, nvreg: i64) -> i64 {
+    var nvr: i64 = nvreg;
+    var d: Vec<i64> = Vec::new();
+    var s: Vec<i64> = Vec::new();
+    var done: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < dst.len() {
+        if dst.get(i) != src.get(i) {
+            d.push(dst.get(i));
+            s.push(src.get(i));
+            done.push(0);
+        }
+        i = i + 1;
+    }
+    var left: i64 = d.len();
+    while left > 0 {
+        var found: i64 = 0 - 1;
+        i = 0;
+        while i < d.len() && found < 0 {
+            if done.get(i) == 0 {
+                var blocked: bool = false;
+                var j: i64 = 0;
+                while j < d.len() {
+                    if j != i && done.get(j) == 0 && s.get(j) == d.get(i) {
+                        blocked = true;
+                    }
+                    j = j + 1;
+                }
+                if !blocked {
+                    found = i;
+                }
+            }
+            i = i + 1;
+        }
+        if found >= 0 {
+            out.push(mi_new(MO_MOV, d.get(found), s.get(found), 0, 0, 0, 0));
+            done.set(found, 1);
+            left = left - 1;
+        } else {
+            // every pending destination is still to be read: save one
+            var c: i64 = 0;
+            while done.get(c) != 0 {
+                c = c + 1;
+            }
+            var t: i64 = nvr;
+            nvr = nvr + 1;
+            out.push(mi_new(MO_MOV, t, d.get(c), 0, 0, 0, 0));
+            var j2: i64 = 0;
+            while j2 < d.len() {
+                if done.get(j2) == 0 && s.get(j2) == d.get(c) {
+                    s.set(j2, t);
+                }
+                j2 = j2 + 1;
+            }
+        }
+    }
+    return nvr;
+}
+
+/// The moves of the edge to `label`: from the pending BARGs (flat: arg,
+/// label, index) to the label's parameters.
+fn mir_bp_edge_moves(out: & mut Vec<MInst>, pend: & Vec<i64>, label: i64, params: i64, nvreg: i64) -> i64 {
+    var dst: Vec<i64> = Vec::new();
+    var src: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 2 < pend.len() {
+        if pend.get(i + 1) == label {
+            var key: str = int_to_str(label) + ":" + int_to_str(pend.get(i + 2));
+            if HashMap_contains(params, key) {
+                dst.push(HashMap_get(params, key));
+                src.push(pend.get(i));
+            }
+        }
+        i = i + 3;
+    }
+    if dst.len() == 0 {
+        return nvreg;
+    }
+    return mir_par_moves(out, & dst, & src, nvreg);
+}
+
+/// Some pending BARG names `label`.
+fn mir_bp_pends(pend: & Vec<i64>, label: i64) -> bool {
+    var i: i64 = 0;
+    while i + 2 < pend.len() {
+        if pend.get(i + 1) == label {
+            return true;
+        }
+        i = i + 3;
+    }
+    return false;
+}
+
+/// MI1: block parameters out again, before allocation: each edge's
+/// arguments become moves into the parameters' vregs (a parallel copy,
+/// mir_par_moves) — before an unconditional jump, at the end of a block
+/// that falls into the labeled block, after a conditional branch for the
+/// edge it falls through, and in an edge block for the edge it takes (the
+/// branch goes to a new label label0, label0 + 1, .., placed after the
+/// function's end with the moves and a jump to the old target; n_labels of
+/// them, which the caller creates). BPARAMs go away (one no edge passes a
+/// value, of a block nothing but itself enters, becomes a 0).
+pub fn mir_bparams_lower(mir: & Vec<MInst>, nvreg: i64, label0: i64) -> MirBp {
+    var n: i64 = mir.len();
+    var nvr: i64 = nvreg;
+    // label:index -> the parameter's vreg
+    var params: i64 = HashMap_new();
+    // label:index of the parameters some edge passes
+    var passed: i64 = HashMap_new();
+    var cur_label: i64 = 0 - 1;
+    var any: bool = false;
+    var k: i64 = 0;
+    while k < n {
+        var m: MInst = mir.get(k);
+        if m.op == MO_PLACE {
+            cur_label = m.i0;
+        } else if m.op == MO_BPARAM {
+            HashMap_insert(params, int_to_str(cur_label) + ":" + int_to_str(m.i0), m.r0);
+            any = true;
+        } else if m.op == MO_BARG {
+            any = true;
+        }
+        k = k + 1;
+    }
+    // (an edge that passes a parameter its own value, a block's back edge
+    // that leaves it unchanged, does not count)
+    k = 0;
+    while k < n {
+        var ma: MInst = mir.get(k);
+        if ma.op == MO_BARG {
+            var akey: str = int_to_str(ma.i0) + ":" + int_to_str(ma.i1);
+            if !HashMap_contains(params, akey) || HashMap_get(params, akey) != ma.r0 {
+                HashMap_insert(passed, akey, 1);
+            }
+        }
+        k = k + 1;
+    }
+    if !any {
+        return MirBp {
+            mir: * mir, nvreg: nvreg, n_params: 0, n_labels: 0, err: ""
+        };
+    }
+    var out: Vec<MInst> = Vec::new();
+    var tail: Vec<MInst> = Vec::new();
+    var pend: Vec<i64> = Vec::new();
+    var nlab: i64 = 0;
+    var at_label: i64 = 0 - 1;
+    k = 0;
+    while k < n {
+        var m2: MInst = mir.get(k);
+        var op: i64 = m2.op;
+        if op == MO_PLACE {
+            at_label = m2.i0;
+        }
+        if op == MO_BPARAM {
+            // a parameter no edge passes a value (a block nothing enters
+            // but itself): 0, so that its vreg is still written
+            if !HashMap_contains(passed, int_to_str(at_label) + ":" + int_to_str(m2.i0)) {
+                out.push(mi_new(MO_LI, m2.r0, 0, 0, 0, 0, 0));
+            }
+            k = k + 1;
+            continue;
+        }
+        if op == MO_BARG {
+            pend.push(m2.r0);
+            pend.push(m2.i0);
+            pend.push(m2.i1);
+            k = k + 1;
+            continue;
+        }
+        if pend.len() > 0 {
+            if op == MO_JMP {
+                nvr = mir_bp_edge_moves(& mut out, & pend, m2.i0, params, nvr);
+                out.push(m2);
+                pend.clear();
+                k = k + 1;
+                continue;
+            }
+            if mi_is_cond_br(op) {
+                var target: i64 = m2.i0;
+                var br: MInst = m2;
+                if mir_bp_pends(& pend, target) {
+                    var el: i64 = label0 + nlab;
+                    nlab = nlab + 1;
+                    br.i0 = el;
+                    tail.push(mi_new(MO_PLACE, 0, 0, 0, el, 0, 0));
+                    nvr = mir_bp_edge_moves(& mut tail, & pend, target, params, nvr);
+                    tail.push(mi_new(MO_JMP, 0, 0, 0, target, 0, 0));
+                }
+                out.push(br);
+                // the edge it falls through: to the label placed next
+                if k + 1 < n && mir.get(k + 1).op == MO_PLACE {
+                    nvr = mir_bp_edge_moves(& mut out, & pend, mir.get(k + 1).i0, params, nvr);
+                }
+                pend.clear();
+                k = k + 1;
+                continue;
+            }
+            if op == MO_PLACE {
+                // falling into this block
+                nvr = mir_bp_edge_moves(& mut out, & pend, m2.i0, params, nvr);
+                pend.clear();
+            }
+        }
+        out.push(m2);
+        k = k + 1;
+    }
+    if pend.len() > 0 {
+        return MirBp {
+            mir: * mir, nvreg: nvreg, n_params: 0, n_labels: 0, err: "block arguments after the function's last jump"
+        };
+    }
+    var t: i64 = 0;
+    while t < tail.len() {
+        out.push(tail.get(t));
+        t = t + 1;
+    }
+    return MirBp {
+        mir: out, nvreg: nvr, n_params: 0, n_labels: nlab, err: ""
+    };
+}

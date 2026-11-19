@@ -3,12 +3,26 @@
 //
 //   fid run <file.fd> --profile <out.prof>
 //       the interpreter counts the calls of every function and writes them:
-//       a line "fides-profile 1", then one line "<calls> <function>" each,
-//       most called first.
+//       a line "fides-profile 2", then one line "<calls> <function>" each,
+//       most called first, each followed by its blocks (below).
 //   fid emit|ccompile|build <file.fd> ... --profile-use <out.prof>
 //       lowering puts the functions the run called most first in the module
 //       (hot code together on every backend), and `pgo_count` gives any
 //       pass the counts (an inliner or a block layout can weigh by them).
+//
+// Block counts (OP30): while recording, lowering starts each block of every
+// function of more than one block with a call to an empty probe function
+// "<function>@<block id>" (pgo_instrument), so the interpreter's call
+// counts are the times each block was entered. pgo_write gives, after each
+// function the run called, a line "<1 + times entered> <function>@<block
+// id>" per block (1: never entered). `pgo_block_entries`, `pgo_block_cold`
+// and `pgo_block_weight` answer for a block: the default inliner and
+// inline2 weigh a call by its block (pgo_site_calls), unrolling skips a
+// loop the run never ran, and nat_ir lays never-entered blocks last
+// (ng_pgo_cold_labels). Block ids are the lowering's; the mid-end keeps
+// them (a block it makes has a new id, which the profile does not know:
+// it counts as hot). FID_PGO_BLOCKS=0: no probes, calls only. A profile of
+// version 1 (calls only) is still read.
 //
 // Function names are the IR's (after monomorphization): the profile is for
 // the program as it was when profiled; a function it does not know counts 0.
@@ -19,6 +33,56 @@ pub var g_pgo_record: bool = false;  /// `--profile-use`: the profile lowering a
 pub var g_pgo_use_path: str = "";
  var g_pgo_counts: i64 = 0;  // name -> calls (recording or loaded)
 var g_pgo_names: Vec<str> = Vec::new(); var g_pgo_loaded: bool = false;
+/// OP30: the loaded profile counts blocks ("<function>@<block id>" lines).
+var g_pgo_has_blocks: bool = false;
+/// OP30: the probes pgo_instrument made: their names (name -> 1), the
+/// functions that have them (name -> 1 + index into g_pgo_probe_fns), and
+/// each such function's block ids, function after function in
+/// g_pgo_probe_ids from g_pgo_probe_first.
+var g_pgo_probe_set: i64 = 0;
+var g_pgo_probe_at: i64 = 0;
+var g_pgo_probe_fns: Vec<str> = Vec::new();
+var g_pgo_probe_first: Vec<i64> = Vec::new();
+var g_pgo_probe_ids: Vec<i64> = Vec::new();
+/// OP30: a block entered less than once per PGO_COLD_RATIO calls of its
+/// function is cold (as nat_ir's NG_PGO_COLD_RATIO).
+const PGO_COLD_RATIO: i64 = 1000;
+/// OP30: pgo_block_weight's scale: a block entered once per call weighs
+/// PGO_WEIGHT_ONE.
+const PGO_WEIGHT_ONE: i64 = 16;
+/// CT10 (complaint-roadmap): `fid run <file.fd> --trace f,g` prints each
+/// call of f and g with its arguments and result, no code change. The
+/// names, each with a comma before and after (",f,g,"); "" = no trace.
+/// Kept here because main.fd and interp.fd both import this module.
+pub var g_trace_fns: str = "";
+
+/// CT10: does `--trace` ask for the calls of `name` (an IR function name:
+/// a method `T::m` is `T_m`, as `--trace` also accepts it)?
+pub fn trace_wanted(name: str) -> bool {
+    if str_len(g_trace_fns) == 0 {
+        return false;
+    }
+    return str_contains(g_trace_fns, "," + name + ",");
+}
+
+/// CT10: `--trace`'s list ("f,g" or "T::m") as g_trace_fns keeps it.
+pub fn trace_set(list: str) {
+    var names: Vec<str> = str_split(list, ",");
+    var out: str = ",";
+    var i: i64 = 0;
+    while i < names.len() {
+        var nm: str = str_replace(str_trim(names.get(i)), "::", "_");
+        if str_len(nm) > 0 {
+            out = out + nm + ",";
+        }
+        i = i + 1;
+    }
+    if out == "," {
+        out = "";
+    }
+    g_trace_fns = out;
+}
+
 /// The interpreter calls this on entry to each function while recording.
 pub fn pgo_note_call(name: str) {
     if !g_pgo_record {
@@ -43,6 +107,183 @@ pub fn pgo_count(name: str) -> i64 {
         return 0;
     }
     return HashMap_get(g_pgo_counts, name);
+}
+
+/// CS6: is a profile in use (loaded for `--profile-use`, or being
+/// recorded)? iropt_native's memo of its per-function passes (ir_ser.fd
+/// imc_*) is off then: its keys do not hold the counts the passes read.
+pub fn pgo_active() -> bool {
+    if !g_pgo_loaded {
+        pgo_load_use();
+    }
+    return g_pgo_counts != 0 || g_pgo_record;
+}
+
+/// OP30: does the profile `--profile-use` names count blocks (a run made
+/// with the block probes, version 2)?
+pub fn pgo_has_blocks() -> bool {
+    if !g_pgo_loaded {
+        pgo_load_use();
+    }
+    return g_pgo_has_blocks;
+}
+
+/// OP30: how many times the profiled run entered block `block_id` (the
+/// BasicBlock's id, as lowering made it) of function `fname`; -1 when the
+/// profile does not say (no block counts, a function the run never called
+/// or of one block, a block an optimization made).
+pub fn pgo_block_entries(fname: str, block_id: i64) -> i64 {
+    if !pgo_has_blocks() || g_pgo_counts == 0 {
+        return 0 - 1;
+    }
+    var c: i64 = HashMap_get(g_pgo_counts, fname + "@" + int_to_str(block_id));
+    if c < 1 {
+        return 0 - 1;
+    }
+    return c - 1;
+}
+
+/// OP30: did the profiled run enter this block less than once per
+/// PGO_COLD_RATIO calls of its function (never, in particular)? false when
+/// the profile does not know the block.
+pub fn pgo_block_cold(fname: str, block_id: i64) -> bool {
+    var e: i64 = pgo_block_entries(fname, block_id);
+    if e < 0 {
+        return false;
+    }
+    var calls: i64 = pgo_count(fname);
+    if calls <= 0 {
+        return false;
+    }
+    return e * PGO_COLD_RATIO < calls;
+}
+
+/// OP30: how often the block runs per call of its function, PGO_WEIGHT_ONE
+/// being once per call (a loop body of 100 trips: 100 * PGO_WEIGHT_ONE),
+/// at most 1 << 20; 0 for a cold block (pgo_block_cold); -1 when the
+/// profile does not know the block (a weight from loop depth then).
+pub fn pgo_block_weight(fname: str, block_id: i64) -> i64 {
+    var e: i64 = pgo_block_entries(fname, block_id);
+    if e < 0 {
+        return 0 - 1;
+    }
+    var calls: i64 = pgo_count(fname);
+    if calls <= 0 {
+        return 0 - 1;
+    }
+    if e * PGO_COLD_RATIO < calls {
+        return 0;
+    }
+    // e / calls entries per call, in PGO_WEIGHT_ONE units, without
+    // overflowing for long runs
+    var w: i64 = 0;
+    if e > (1 << 40) {
+        w = (e / calls) * PGO_WEIGHT_ONE;
+    } else {
+        w = (e * PGO_WEIGHT_ONE) / calls;
+    }
+    if w < 1 {
+        w = 1;
+    }
+    if w > (1 << 20) {
+        w = 1 << 20;
+    }
+    return w;
+}
+
+/// OP30: the count an inliner weighs the call to `callee` in block
+/// `site_block` of `caller` by: the times the profiled run entered that
+/// block when the profile counts it (a call the run never made there is
+/// cold even when `callee` is hot elsewhere), else the callee's calls.
+pub fn pgo_site_calls(caller: str, site_block: i64, callee: str) -> i64 {
+    if site_block >= 0 {
+        var e: i64 = pgo_block_entries(caller, site_block);
+        if e >= 0 {
+            return e;
+        }
+        // a caller the run called that has no block lines (no probe of
+        // its entry block 0) had one block: each call in it ran as often
+        // as it did
+        var cc: i64 = pgo_count(caller);
+        if g_pgo_has_blocks && cc > 0 && pgo_count(caller + "@0") <= 0 {
+            return cc;
+        }
+    }
+    return pgo_count(callee);
+}
+
+/// OP30: start each block of every function of `module` with more than one
+/// block with a call to an empty probe "<function>@<block id>", added to
+/// the module, so the interpreter's call counts (pgo_note_call) count the
+/// blocks. Lowering does this through pgo_apply while `--profile` records.
+/// The number of probes made.
+pub fn pgo_instrument(module: & mut IrModule) -> i64 {
+    match env_var("FID_PGO_BLOCKS") {
+        Option::Some(off) => {
+            if off == "0" || off == "off" {
+                return 0;
+            }
+        }
+        Option::None => {
+        }
+    }
+    if g_pgo_probe_set == 0 {
+        g_pgo_probe_set = HashMap_new();
+        g_pgo_probe_at = HashMap_new();
+    }
+    var made: i64 = 0;
+    var n0: i64 = module.functions.len();
+    var fi: i64 = 0;
+    while fi < n0 {
+        var entry: IrFunctionEntry = module.functions.get(fi);
+        var f: IrFunction = entry.func;
+        var fname: str = f.name;
+        if f.blocks.len() > 1 && str_find(fname, "@") < 0 {
+            var first_time: bool = !HashMap_contains(g_pgo_probe_at, fname);
+            if first_time {
+                g_pgo_probe_fns.push(fname);
+                HashMap_insert(g_pgo_probe_at, fname, g_pgo_probe_fns.len());
+                g_pgo_probe_first.push(g_pgo_probe_ids.len());
+            }
+            var b: i64 = 0;
+            while b < f.blocks.len() {
+                var blk: BasicBlock = f.blocks.get(b);
+                var pname: str = fname + "@" + int_to_str(blk.id);
+                // the call, a value of its own at the block's start
+                var vid: i64 = IrFunction_new_value(& mut f, ValueMeta_new(IrType::Void));
+                while f.inst_at.len() <= vid {
+                    f.inst_at.push(0);
+                }
+                f.inst_at.set(vid, f.insts.len() + 1);
+                var noargs: Vec<i64> = Vec::new();
+                f.insts.push(ValueIdInst_new(vid, Inst::Call(pname, noargs, IrType::Void, EffectSet_none())));
+                var ids: Vec<i64> = Vec::new();
+                ids.push(vid);
+                var k: i64 = 0;
+                while k < blk.instructions.len() {
+                    ids.push(blk.instructions.get(k));
+                    k = k + 1;
+                }
+                blk.instructions = ids;
+                f.blocks.set(b, blk);
+                if first_time {
+                    g_pgo_probe_ids.push(blk.id);
+                }
+                if !HashMap_contains(g_pgo_probe_set, pname) {
+                    HashMap_insert(g_pgo_probe_set, pname, 1);
+                    var probe: IrFunction = IrFunction_new(pname, IrType::Void);
+                    IrFunction_emit(& mut probe, Inst::Return(OptValueId::None));
+                    IrModule_add_function(module, probe);
+                    made = made + 1;
+                }
+                b = b + 1;
+            }
+            entry.func = f;
+            module.functions.set(fi, entry);
+        }
+        fi = fi + 1;
+    }
+    return made;
 }
 
 /// Indices of `names` ordered by their counts, most first; equal counts
@@ -71,20 +312,45 @@ fn pgo_order(names: Vec<str>, counts: Vec<i64>) -> Vec<i64> {
 
 /// Write the recorded counts to `path`; false when it cannot be written.
 pub fn pgo_write(path: str) -> bool {
+    // the functions (not the block probes), most called first
+    var names: Vec<str> = Vec::new();
     var counts: Vec<i64> = Vec::new();
     var i: i64 = 0;
     while i < g_pgo_names.len() {
-        counts.push(HashMap_get(g_pgo_counts, g_pgo_names.get(i)));
+        var nm: str = g_pgo_names.get(i);
+        if g_pgo_probe_set == 0 || !HashMap_contains(g_pgo_probe_set, nm) {
+            names.push(nm);
+            counts.push(HashMap_get(g_pgo_counts, nm));
+        }
         i = i + 1;
     }
-    var order: Vec<i64> = pgo_order(g_pgo_names, counts);
-    var out: str = "fides-profile 1\n";
+    var order: Vec<i64> = pgo_order(names, counts);
+    // OP30: one line per function, then one per block of it (1 + the times
+    // the run entered it); lines joined once at the end (a profile of a
+    // large program has tens of thousands)
+    var lines: Vec<str> = Vec::new();
+    lines.push("fides-profile 2");
     var k: i64 = 0;
     while k < order.len() {
         var at: i64 = order.get(k);
-        out = out + int_to_str(counts.get(at)) + " " + g_pgo_names.get(at) + "\n";
+        var fname: str = names.get(at);
+        lines.push(int_to_str(counts.get(at)) + " " + fname);
+        if g_pgo_probe_at != 0 && HashMap_contains(g_pgo_probe_at, fname) {
+            var pi: i64 = HashMap_get(g_pgo_probe_at, fname) - 1;
+            var j: i64 = g_pgo_probe_first.get(pi);
+            var end: i64 = g_pgo_probe_ids.len();
+            if pi + 1 < g_pgo_probe_first.len() {
+                end = g_pgo_probe_first.get(pi + 1);
+            }
+            while j < end {
+                var bname: str = fname + "@" + int_to_str(g_pgo_probe_ids.get(j));
+                lines.push(int_to_str(1 + HashMap_get(g_pgo_counts, bname)) + " " + bname);
+                j = j + 1;
+            }
+        }
         k = k + 1;
     }
+    var out: str = str_join_fast(lines, "\n") + "\n";
     return p_file_write(path, out) >= 0;
 }
 
@@ -97,7 +363,12 @@ fn pgo_load_use() {
     match read_file(g_pgo_use_path) {
         Option::Some(text) => {
             var lines: Vec<str> = str_split(text, "\n");
-            if lines.len() == 0 || str_trim(lines.get(0)) != "fides-profile 1" {
+            // version 1: calls only; 2 (OP30): also "<function>@<block>"
+            var head: str = "";
+            if lines.len() > 0 {
+                head = str_trim(lines.get(0));
+            }
+            if head != "fides-profile 1" && head != "fides-profile 2" {
                 p_eprint_str("warning: " + g_pgo_use_path + " is not a fides profile (fid run --profile): ignored\n");
                 return;
             }
@@ -110,6 +381,9 @@ fn pgo_load_use() {
                     var name: str = str_slice(ln, sp + 1, str_len(ln));
                     HashMap_insert(g_pgo_counts, name, str_parse_int(str_slice(ln, 0, sp)));
                     g_pgo_names.push(name);
+                    if str_find(name, "@") > 0 {
+                        g_pgo_has_blocks = true;
+                    }
                 }
                 i = i + 1;
             }
@@ -124,6 +398,10 @@ fn pgo_load_use() {
 /// first, then the others in their order (the backends lay functions out in
 /// module order, so the hot ones end up together).
 pub fn pgo_apply(module: & mut IrModule) {
+    // OP30: `fid run --profile` counts blocks too (pgo_instrument)
+    if g_pgo_record {
+        pgo_instrument(module);
+    }
     if g_pgo_use_path == "" {
         return;
     }

@@ -1,0 +1,146 @@
+// LF15 diamonds: a variable that copies a by-value parameter, is only read
+// (in either arm of an if, in a loop, by calls) and is dropped on every
+// path out of its scope costs no Str_dup / Vec_share and no drops
+// (compiler/lower.fd lw_rc_cancel_param_slots, LOWER_CANCEL_PARAM_SLOTS).
+// Copies that are moved out, reassigned or changed keep their count. The
+// parameters' own values are checked after every call.
+// Expected output:
+// 5 2
+// yes hello 5
+// no 5
+// 7 4
+// hello5hello5hello
+// moved hello x
+// grown hello!
+// pushed 3 2
+// kept [ab] ab
+// map 1 1
+// done hello 4
+
+fn show(s: str) -> i64 {
+    return str_len(s);
+}
+
+fn total(v: Vec<i64>) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        sum = sum + v.get(i);
+        i = i + 1;
+    }
+    return sum;
+}
+
+// read in one arm, dropped at the join
+fn pick_len(s: str, c: bool) -> i64 {
+    var t: str = s;
+    var n: i64 = 0;
+    if c {
+        n = show(t);
+    } else {
+        n = 2;
+    }
+    return n;
+}
+
+// read in both arms, dropped on each return path
+fn both_arms(s: str, c: bool) -> str {
+    val t: str = s;
+    if c {
+        return "yes " + t + " " + int_to_str(show(t));
+    }
+    return "no " + int_to_str(show(t));
+}
+
+// a Vec copy read by core and by the program's own function
+fn vec_arms(v: Vec<i64>, c: bool) -> i64 {
+    val w: Vec<i64> = v;
+    if c {
+        return total(w);
+    }
+    return w.len() + w.get(0);
+}
+
+// declared in a loop body: dropped at the end of every round
+fn loop_copy(s: str, n: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < n {
+        val t: str = s;
+        if i % 2 == 0 {
+            out = out + t;
+        } else {
+            out = out + int_to_str(show(t));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// moved out on one path: keeps its count
+fn moved(s: str, c: bool) -> str {
+    var t: str = s;
+    if c {
+        return t;
+    }
+    return "x";
+}
+
+// reassigned: keeps its count
+fn grown(s: str) -> str {
+    var t: str = s;
+    t = t + "!";
+    return t;
+}
+
+// changed through core: keeps its share
+fn pushed(v: Vec<i64>) -> i64 {
+    var w: Vec<i64> = v;
+    w.push(9);
+    return w.len();
+}
+
+// a counted copy of the copy (its own Str_dup), kept in a Vec
+fn kept(s: str) -> Vec<str> {
+    val t: str = s;
+    var out: Vec<str> = Vec::new();
+    if str_len(t) > 0 {
+        out.push(t);
+    }
+    return out;
+}
+
+fn msize(m: HashMap<str, i64>) -> i64 {
+    return m.len();
+}
+
+// a map copy read by core and by the program's own function
+fn map_arms(m: HashMap<str, i64>, c: bool) -> i64 {
+    val w: HashMap<str, i64> = m;
+    if c {
+        return msize(w);
+    }
+    return w.get("a");
+}
+
+fn main() {
+    var s: str = "hel" + "lo";
+    println(int_to_str(pick_len(s, true)) + " " + int_to_str(pick_len(s, false)));
+    println(both_arms(s, true));
+    println(both_arms(s, false));
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    v.push(4);
+    println(int_to_str(vec_arms(v, true)) + " " + int_to_str(vec_arms(v, false) - 1));
+    println(loop_copy(s, 5));
+    println("moved " + moved(s, true) + " " + moved(s, false));
+    println("grown " + grown(s));
+    println("pushed " + int_to_str(pushed(v)) + " " + int_to_str(v.len()));
+    var ab: str = "a" + "b";
+    val ks: Vec<str> = kept(ab);
+    println("kept [" + ks.get(0) + "] " + ab);
+    var m: HashMap<str, i64> = HashMap::new();
+    m.insert("a", 1);
+    println("map " + int_to_str(map_arms(m, true)) + " " + int_to_str(map_arms(m, false)));
+    println("done " + s + " " + int_to_str(v.get(1)));
+}

@@ -1,0 +1,112 @@
+// LF14 (compiler/iropt.fd iro_vec_sroa, FID_IROPT_ON=vecsroa): a local
+// Vec<i64> filled by a few pushes in the block that makes it, then read,
+// set and measured there at constant indexes, becomes stack slots: no
+// allocation, no drop. A Vec made anew in each turn of a loop gets fresh
+// slots each time. A Vec read in a loop or at a variable index, given to
+// a function, or holding strings stays a Vec. The program prints the same
+// with the pass on and off.
+//
+// Expected output:
+// 72
+// 3
+// 60
+// 9
+// 6
+// 9
+// ab
+// 2
+
+// three pushes, three reads
+fn small_sum() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(42);
+    return v.get(0) + v.get(1) + v.get(2);
+}
+
+// len is the number of pushes
+fn small_len() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(7);
+    v.push(8);
+    v.push(9);
+    return v.len();
+}
+
+// a set after the pushes, values from a parameter
+fn small_set(a: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(a + 1);
+    v.set(1, a * 5);
+    return v.get(0) + v.get(1);
+}
+
+// a new Vec in every turn of the loop
+fn per_iteration() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        var v: Vec<i64> = Vec::new();
+        v.push(i);
+        v.push(i + 1);
+        t = t + v.get(0) + v.get(1);
+        i = i + 1;
+    }
+    return t;
+}
+
+// read in a loop at a variable index: stays a Vec
+fn loop_sum() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn total(v: Vec<i64>) -> i64 {
+    return v.get(0) + v.get(1);
+}
+
+// given to a function: stays a Vec
+fn passed() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(4);
+    v.push(5);
+    return total(v);
+}
+
+// elements it owns: stays a Vec
+fn names() -> str {
+    var v: Vec<str> = Vec::new();
+    v.push("a");
+    v.push("b");
+    return v.get(0) + v.get(1);
+}
+
+// an index known only at run time: stays a Vec
+fn index_var(k: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    return v.get(k);
+}
+
+fn main() {
+    println(small_sum());
+    println(small_len());
+    println(small_set(10));
+    println(per_iteration());
+    println(loop_sum());
+    println(passed());
+    println(names());
+    println(index_var(1));
+}

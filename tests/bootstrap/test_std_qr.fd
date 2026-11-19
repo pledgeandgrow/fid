@@ -1,0 +1,143 @@
+// stdlib/qr: the data codewords and Reed-Solomon codewords of the ISO
+// 18004 example "01234567" (1-M) and the "HELLO WORLD" 1-M example
+// (ECC 196 35 39 119 235 215 231 226 93 23), format information (M/0 is
+// 101010000010010, L/4 110011000101111), version information (7: 0x07C94,
+// 40: 0x28C69), capacities and alignment positions; then encode / decode
+// round trips in every mode, across versions (1, 7+, 40) and levels, a
+// damaged data module caught by the syndrome check, a damaged format bit
+// corrected, and an ECI segment.
+// Expected output:
+// data 01234567 10200c566180ec11ec11ec11ec11ec11
+// ecc 01234567 a524d4c1ed36c7872c55
+// data HELLO WORLD 205b0b78d172dc4d4340ec11ec11ec11
+// ecc HELLO WORLD c4232777ebd7e7e25d17
+// format 101010000010010 110011000101111
+// version 7c94 28c69
+// capacity 19 16 13 9 2956 1276 raw 26 196
+// align v7 6,22,38 v32 6,34,60,86,112,138 v40 6,30,58,86,114,142,170
+// count bits 10 9 8 12 11 16 14 13 16
+// hello version 1 size 21 ecl Q ok true
+// decoded HELLO WORLD v1 Q mask ok modes 2 bad 0
+// numeric 3141592653589793238462643383279 v2 modes 1
+// bytes h\u{e9}llo w\u{f6}rld modes 4 same true
+// v8 M 300 chars ok true version 13 bad 0
+// v40 L 2953 bytes version 40 size 177 ok true same true
+// forced v10 H mask 3 decoded mask 3 same true
+// damaged data bad 1 format fixed true
+// eci 26 modes 7,4 text café
+// too long data too long
+// finder corner dark true light-ring false center true timing true
+use qr;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn bin15(x: i64) -> str {
+    var s: str = "";
+    var i: i64 = 14;
+    while i >= 0 { s = s + (if ((x >> i) & 1) == 1 { "1" } else { "0" }); i = i - 1; }
+    return s;
+}
+
+fn ints(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() { if i > 0 { s = s + ","; } s = s + int_to_str(v.get(i)); i = i + 1; }
+    return s;
+}
+
+fn ecc_of(segs: Vec<QrSegment>, label: str) {
+    val data: Vec<i64> = qr_make_data(&segs, 1, QR_M);
+    println("data " + label + " " + hx(data));
+    val all: Vec<i64> = qr_add_ecc(&data, 1, QR_M);
+    var ecc: Vec<i64> = Vec::new();
+    var i: i64 = data.len();
+    while i < all.len() { ecc.push(all.get(i)); i = i + 1; }
+    println("ecc " + label + " " + hx(ecc));
+}
+
+fn seg1(s: QrSegment) -> Vec<QrSegment> { var v: Vec<QrSegment> = Vec::new(); v.push(s); return v; }
+
+fn ecl_name(e: i64) -> str {
+    if e == QR_L { return "L"; }
+    if e == QR_M { return "M"; }
+    if e == QR_Q { return "Q"; }
+    return "H";
+}
+
+fn main() {
+    ecc_of(seg1(qr_segment_numeric("01234567")), "01234567");
+    ecc_of(seg1(qr_segment_alnum("HELLO WORLD")), "HELLO WORLD");
+    println("format " + bin15(qr_format_bits(QR_M, 0)) + " " + bin15(qr_format_bits(QR_L, 4)));
+    println("version " + int_to_hex(qr_version_bits(7)) + " " + int_to_hex(qr_version_bits(40)));
+    println("capacity " + int_to_str(qr_data_codewords(1, QR_L)) + " " + int_to_str(qr_data_codewords(1, QR_M)) + " "
+        + int_to_str(qr_data_codewords(1, QR_Q)) + " " + int_to_str(qr_data_codewords(1, QR_H)) + " "
+        + int_to_str(qr_data_codewords(40, QR_L)) + " " + int_to_str(qr_data_codewords(40, QR_H))
+        + " raw " + int_to_str(qr_raw_modules(1) / 8) + " " + int_to_str(qr_raw_modules(7) / 8));
+    println("align v7 " + ints(qr_alignment_positions(7)) + " v32 " + ints(qr_alignment_positions(32)) + " v40 " + ints(qr_alignment_positions(40)));
+    println("count bits " + int_to_str(qr_count_bits(QR_MODE_NUMERIC, 1)) + " " + int_to_str(qr_count_bits(QR_MODE_ALNUM, 9)) + " "
+        + int_to_str(qr_count_bits(QR_MODE_BYTE, 9)) + " " + int_to_str(qr_count_bits(QR_MODE_NUMERIC, 10)) + " "
+        + int_to_str(qr_count_bits(QR_MODE_ALNUM, 26)) + " " + int_to_str(qr_count_bits(QR_MODE_BYTE, 26)) + " "
+        + int_to_str(qr_count_bits(QR_MODE_NUMERIC, 27)) + " " + int_to_str(qr_count_bits(QR_MODE_ALNUM, 40)) + " "
+        + int_to_str(qr_count_bits(QR_MODE_BYTE, 40)));
+
+    val h: QrCode = qr_encode_text("HELLO WORLD", QR_Q);
+    println("hello version " + int_to_str(h.version) + " size " + int_to_str(h.size) + " ecl " + ecl_name(h.ecl) + " ok " + bool_to_str(h.ok));
+    val hd: QrDecoded = qr_decode(h.modules, h.size);
+    println("decoded " + hd.text + " v" + int_to_str(hd.version) + " " + ecl_name(hd.ecl) + " mask " + (if hd.mask == h.mask { "ok" } else { "differs" })
+        + " modes " + ints(hd.modes) + " bad " + int_to_str(hd.bad_blocks));
+    val pi: str = "3141592653589793238462643383279";
+    val pq: QrCode = qr_encode_text(pi, QR_H);
+    val pd: QrDecoded = qr_decode(pq.modules, pq.size);
+    println("numeric " + pd.text + " v" + int_to_str(pd.version) + " modes " + ints(pd.modes));
+    val u: str = "h\u{e9}llo w\u{f6}rld";
+    val uq: QrCode = qr_encode_text(u, QR_M);
+    val ud: QrDecoded = qr_decode(uq.modules, uq.size);
+    println("bytes h\\u{e9}llo w\\u{f6}rld modes " + ints(ud.modes) + " same " + bool_to_str(ud.text == u));
+
+    var long: str = "";
+    var i: i64 = 0;
+    while str_len(long) < 300 { long = long + "The quick brown fox " + int_to_str(i) + ". "; i = i + 1; }
+    long = str_slice(long, 0, 300);
+    var ls: Vec<QrSegment> = Vec::new();
+    ls.push(qr_segment_bytes(str_bytes(long)));
+    val lq: QrCode = qr_encode_segments(ls, QR_M, 8, 40, 2);
+    val ld: QrDecoded = qr_decode(lq.modules, lq.size);
+    println("v8 M 300 chars ok " + bool_to_str(ld.ok && ld.text == long) + " version " + int_to_str(ld.version) + " bad " + int_to_str(ld.bad_blocks));
+    var big: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 2953 { big.push((i * 7 + 3) % 256); i = i + 1; }
+    val bq: QrCode = qr_encode_segments(seg1(qr_segment_bytes(big)), QR_L, 1, 40, 5);
+    val bd: QrDecoded = qr_decode(bq.modules, bq.size);
+    println("v40 L 2953 bytes version " + int_to_str(bq.version) + " size " + int_to_str(bq.size) + " ok " + bool_to_str(bd.ok && bd.bad_blocks == 0)
+        + " same " + bool_to_str(hx(bd.bytes) == hx(big)));
+    val fq: QrCode = qr_encode_segments(seg1(qr_segment_auto("FORCED VERSION TEN")), QR_H, 10, 40, 3);
+    val fd: QrDecoded = qr_decode(fq.modules, fq.size);
+    println("forced v" + int_to_str(fq.version) + " " + ecl_name(fq.ecl) + " mask " + int_to_str(fq.mask) + " decoded mask "
+        + int_to_str(fd.mask) + " same " + bool_to_str(fd.text == "FORCED VERSION TEN"));
+
+    // a data module flipped (the bottom-right corner is always data)
+    var dm: Vec<bool> = h.modules;
+    val last: i64 = h.size * h.size - 1;
+    dm.set(last, !dm.get(last));
+    val dd: QrDecoded = qr_decode(dm, h.size);
+    // a format bit flipped (column 8, row 0)
+    var fm: Vec<bool> = h.modules;
+    fm.set(8, !fm.get(8));
+    val fx: QrDecoded = qr_decode(fm, h.size);
+    println("damaged data bad " + int_to_str(dd.bad_blocks) + " format fixed " + bool_to_str(fx.ok && fx.text == "HELLO WORLD" && fx.mask == h.mask));
+    var es: Vec<QrSegment> = Vec::new();
+    es.push(qr_segment_eci(26));
+    es.push(qr_segment_bytes(str_bytes("caf\u{e9}")));
+    val eq: QrCode = qr_encode_segments(es, QR_M, 1, 40, -1);
+    val ed: QrDecoded = qr_decode(eq.modules, eq.size);
+    println("eci " + int_to_str(ed.eci) + " modes " + ints(ed.modes) + " text " + ed.text);
+    var huge: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 1300 { huge.push(65); i = i + 1; }
+    println("too long " + qr_encode_segments(seg1(qr_segment_bytes(huge)), QR_H, 1, 40, 0).error);
+    println("finder corner dark " + bool_to_str(qr_get(&h, 0, 0)) + " light-ring " + bool_to_str(qr_get(&h, 1, 1))
+        + " center " + bool_to_str(qr_get(&h, 3, 3)) + " timing " + bool_to_str(qr_get(&h, 8, 6) && !qr_get(&h, 9, 6)));
+}

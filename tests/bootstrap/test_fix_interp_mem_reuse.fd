@@ -1,0 +1,112 @@
+// stdlib-agent-bugs 20/51/52: `fid run` never reused memory. Every call's
+// locals, every pass of a loop body's `var` and every freed block took new
+// memory, so long work (bigint, P-256, RSA) grew the interpreter to
+// gigabytes and died with "p_malloc: OOM allocating 4294967304 bytes".
+// 600 blocks of 512 KB made and freed one after another (300 MB in all)
+// fit only when freed blocks are reused, and a block made again must read
+// zero; a loop's local is one slot, zeroed on each pass; Vec writes in a
+// function called many times (whose locals are freed at each return) keep
+// their values.
+// Expected output:
+// churn 600 blocks of 512 KB: zeroed true
+// loop locals 1000 sum 499500 struct sum 1000
+// work 60 calls acc 27450
+// strings 300 calls len 1500
+use vec;
+
+struct Pt {
+    x: i64,
+    y: i64,
+}
+
+/// `rounds` blocks of `size` bytes, each freed before the next is made:
+/// true when each one read zero at its start and end when made.
+@unsafe
+fn churn(rounds: i64, size: i64) -> bool {
+    var ok: bool = true;
+    var r: i64 = 0;
+    while r < rounds {
+        val b: i64 = p_malloc(size);
+        val first: * mut i64 = b;
+        val last: * mut i64 = b + size - 8;
+        var w0: i64 = 1;
+        var w1: i64 = 1;
+        unsafe {
+            w0 = * first;
+            w1 = * last;
+            * first = r + 1;
+            * last = r + 2;
+        }
+        if w0 != 0 || w1 != 0 {
+            ok = false;
+        }
+        p_free(b);
+        r = r + 1;
+    }
+    return ok;
+}
+
+/// A `var` in a loop body: one slot, as C has.
+fn loop_locals(n: i64) -> str {
+    var sum: i64 = 0;
+    var ysum: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var k: i64 = i;
+        var p: Pt = Pt { x: k, y: 1 };
+        sum = sum + p.x;
+        ysum = ysum + p.y;
+        i = i + 1;
+    }
+    return int_to_str(sum) + " struct sum " + int_to_str(ysum);
+}
+
+/// Vec writes in a function whose locals are freed when it returns.
+fn work(k: i64) -> i64 {
+    var t: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 17 {
+        t.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 15 {
+        var j: i64 = 0;
+        while j < 15 {
+            t.set(j, t.get(j) + k);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return t.get(14);
+}
+
+fn piece(s: str, n: i64) -> i64 {
+    return str_len(s) + n;
+}
+
+@unsafe
+fn main() {
+    if churn(600, 524288) {
+        println("churn 600 blocks of 512 KB: zeroed true");
+    } else {
+        println("churn 600 blocks of 512 KB: zeroed false");
+    }
+    println("loop locals 1000 sum " + loop_locals(1000));
+    var acc: i64 = 0;
+    var k: i64 = 1;
+    while k <= 60 {
+        acc = acc + work(k);
+        k = k + 1;
+    }
+    println("work 60 calls acc " + int_to_str(acc));
+    // the same string passed to a `str` parameter many times
+    val s: str = "ab" + "cde";
+    var total: i64 = 0;
+    var c: i64 = 0;
+    while c < 300 {
+        total = total + piece(s, 0);
+        c = c + 1;
+    }
+    println("strings 300 calls len " + int_to_str(total));
+}

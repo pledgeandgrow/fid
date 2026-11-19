@@ -1,0 +1,1512 @@
+// Fides GraphQL: lexer, parser, schema SDL, executor, pure Fides
+//
+// The GraphQL query language (October 2021 spec) in four parts:
+//   - lexer (§2.1): punctuators, names, int and float values, strings with
+//     escapes (\" \\ \/ \b \f \n \r \t \uXXXX) and block strings ("""...""",
+//     common indentation removed), comments, commas as whitespace
+//   - parser (§2): documents of operations (query, mutation, subscription,
+//     and the { ... } shorthand) with variable definitions (types,
+//     defaults), selection sets of fields (aliases, arguments, directives,
+//     sub-selections), fragment spreads, inline fragments, fragment
+//     definitions; every value kind (variables, ints, floats, strings,
+//     booleans, null, enums, lists, objects). Kept in a flat node arena.
+//   - schema SDL (§3): type, input, interface (implements), union, enum,
+//     scalar, schema { query mutation }, fields with arguments and default
+//     values; descriptions ("..." and """...""") are skipped
+//   - executor (§6): runs one operation over a schema with a resolver
+//     function, collecting fields through fragments, @skip and @include,
+//     substituting variables and argument defaults, completing values by
+//     their declared type (lists, non-null, objects, interfaces and unions
+//     through a "__typename" member), with errors carrying their path;
+//     introspection of __typename, __type(name:) { name kind fields { name
+//     args { name } type } } and __schema { queryType { name } types { name
+//     kind } }
+//
+// Values travel as JSON text (stdlib json). The resolver is one function
+// value `fn(str, str, str) -> str`: it gets "Type.field", the parent
+// object's JSON and the arguments as a JSON object, and returns the
+// field's JSON value, or "" to fall back to the parent's member of that
+// name (the default resolver). A result is JSON {"data": ...} with
+// "errors" first when there are any; members keep selection order.
+//
+// Everything here is real; the resolver is the application's seam.
+//
+// Usage:
+//   val schema: GqlSchema = gql_parse_schema("type Query { hello(name: String = \"x\"): String }");
+//   val out: str = gql_execute(& schema, "{ hello(name: \"Ada\") }", "{}", "", resolve);
+
+module graphql;
+ use vec; use json;
+
+// ─── lexer ──────────────────────────────────────────────────────────────
+
+pub const GT_PUNCT: i64 = 0;
+pub const GT_NAME: i64 = 1;
+pub const GT_INT: i64 = 2;
+pub const GT_FLOAT: i64 = 3;
+pub const GT_STRING: i64 = 4;
+pub const GT_EOF: i64 = 5;
+pub const GT_ERROR: i64 = 6;
+
+pub struct GqlTok {
+    pub kind: i64,
+    pub text: str,
+    pub line: i64,
+    pub block: bool,  // a block string (descriptions)
+}
+
+fn gt(kind: i64, text: str, line: i64) -> GqlTok {
+    return GqlTok { kind: kind, text: text, line: line, block: false };
+}
+
+fn g_name_start(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95;
+}
+
+fn g_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn g_utf8(cp: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    if cp < 0x80 {
+        b.push(cp);
+    } else if cp < 0x800 {
+        b.push(0xC0 | (cp >> 6));
+        b.push(0x80 | (cp & 0x3F));
+    } else {
+        b.push(0xE0 | (cp >> 12));
+        b.push(0x80 | ((cp >> 6) & 0x3F));
+        b.push(0x80 | (cp & 0x3F));
+    }
+    return str_from_bytes(b);
+}
+
+fn g_hex(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return - 1;
+}
+
+// the block string value (§2.9.4): common indentation of the lines after
+// the first removed, leading and trailing blank lines dropped
+fn g_block_value(raw: str) -> str {
+    val lines: Vec<str> = str_split(str_replace(raw, "\r\n", "\n"), "\n");
+    var common: i64 = - 1;
+    var i: i64 = 1;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        var k: i64 = 0;
+        while k < str_len(l) && (str_byte_at(l, k) == 32 || str_byte_at(l, k) == 9) { k = k + 1; }
+        if k < str_len(l) && (common < 0 || k < common) {
+            common = k;
+        }
+        i = i + 1;
+    }
+    var out: Vec<str> = Vec::new();
+    i = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        if i > 0 && common > 0 {
+            if str_len(l) >= common { l = str_slice(l, common, str_len(l)); } else { l = ""; }
+        }
+        out.push(l);
+        i = i + 1;
+    }
+    while out.len() > 0 && str_len(str_trim(out.get(0))) == 0 { out.remove(0); }
+    while out.len() > 0 && str_len(str_trim(out.get(out.len() - 1))) == 0 { out.pop(); }
+    var s: str = "";
+    i = 0;
+    while i < out.len() {
+        if i > 0 { s = s + "\n"; }
+        s = s + out.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Tokenize GraphQL source. A lexical error puts a GT_ERROR token (its
+/// text says what was wrong) before the final GT_EOF.
+pub fn gql_lex(src: str) -> Vec<GqlTok> {
+    var t: Vec<GqlTok> = gq_lex_raw(src);
+    if t.get(t.len() - 1).kind != GT_EOF {
+        t.push(gt(GT_EOF, "", t.get(t.len() - 1).line));
+    }
+    return t;
+}
+
+fn gq_lex_raw(src: str) -> Vec<GqlTok> {
+    var out: Vec<GqlTok> = Vec::new();
+    var i: i64 = 0;
+    var line: i64 = 1;
+    val n: i64 = str_len(src);
+    while i < n {
+        val c: i64 = str_byte_at(src, i);
+        if c == 10 {
+            line = line + 1;
+            i = i + 1;
+        } else if c == 32 || c == 9 || c == 13 || c == 44 || c == 0xEF || c == 0xBB || c == 0xBF {
+            i = i + 1;
+        } else if c == 35 {
+            while i < n && str_byte_at(src, i) != 10 { i = i + 1; }
+        } else if c == 46 {
+            if i + 2 < n && str_byte_at(src, i + 1) == 46 && str_byte_at(src, i + 2) == 46 {
+                out.push(gt(GT_PUNCT, "...", line));
+                i = i + 3;
+            } else {
+                out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": unexpected '.'", line));
+                return out;
+            }
+        } else if c == 33 || c == 36 || c == 38 || c == 40 || c == 41 || c == 58 || c == 61 || c == 64 || c == 91 || c == 93 || c == 123 || c == 124 || c == 125 {
+            out.push(gt(GT_PUNCT, char_to_str(c), line));
+            i = i + 1;
+        } else if g_name_start(c) {
+            val st: i64 = i;
+            while i < n && (g_name_start(str_byte_at(src, i)) || g_digit(str_byte_at(src, i))) { i = i + 1; }
+            out.push(gt(GT_NAME, str_slice(src, st, i), line));
+        } else if g_digit(c) || c == 45 {
+            val st: i64 = i;
+            var float: bool = false;
+            if c == 45 { i = i + 1; }
+            if i < n && str_byte_at(src, i) == 48 && i + 1 < n && g_digit(str_byte_at(src, i + 1)) {
+                out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": leading zero in a number", line));
+                return out;
+            }
+            while i < n && g_digit(str_byte_at(src, i)) { i = i + 1; }
+            if i < n && str_byte_at(src, i) == 46 {
+                float = true;
+                i = i + 1;
+                while i < n && g_digit(str_byte_at(src, i)) { i = i + 1; }
+            }
+            if i < n && (str_byte_at(src, i) == 101 || str_byte_at(src, i) == 69) {
+                float = true;
+                i = i + 1;
+                if i < n && (str_byte_at(src, i) == 43 || str_byte_at(src, i) == 45) { i = i + 1; }
+                while i < n && g_digit(str_byte_at(src, i)) { i = i + 1; }
+            }
+            val txt: str = str_slice(src, st, i);
+            if txt == "-" {
+                out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": '-' without digits", line));
+                return out;
+            }
+            if float { out.push(gt(GT_FLOAT, txt, line)); } else { out.push(gt(GT_INT, txt, line)); }
+        } else if c == 34 {
+            if i + 2 < n && str_byte_at(src, i + 1) == 34 && str_byte_at(src, i + 2) == 34 {
+                // block string
+                i = i + 3;
+                val st: i64 = i;
+                var raw: str = "";
+                while i < n && !(str_byte_at(src, i) == 34 && i + 2 < n && str_byte_at(src, i + 1) == 34 && str_byte_at(src, i + 2) == 34) {
+                    if str_byte_at(src, i) == 92 && i + 3 < n && str_byte_at(src, i + 1) == 34 && str_byte_at(src, i + 2) == 34 && str_byte_at(src, i + 3) == 34 {
+                        raw = raw + "\"\"\"";
+                        i = i + 4;
+                    } else {
+                        if str_byte_at(src, i) == 10 { line = line + 1; }
+                        raw = raw + char_to_str(str_byte_at(src, i));
+                        i = i + 1;
+                    }
+                }
+                if i >= n {
+                    out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": unterminated block string", line));
+                    return out;
+                }
+                i = i + 3;
+                var t: GqlTok = gt(GT_STRING, g_block_value(raw), line);
+                t.block = true;
+                out.push(t);
+            } else {
+                i = i + 1;
+                var s: str = "";
+                var closed: bool = false;
+                while i < n && !closed {
+                    val d: i64 = str_byte_at(src, i);
+                    if d == 34 {
+                        closed = true;
+                        i = i + 1;
+                    } else if d == 10 {
+                        out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": unterminated string", line));
+                        return out;
+                    } else if d == 92 && i + 1 < n {
+                        val e: i64 = str_byte_at(src, i + 1);
+                        if e == 117 && i + 5 < n {
+                            var cp: i64 = 0;
+                            var k: i64 = 2;
+                            while k < 6 {
+                                val h: i64 = g_hex(str_byte_at(src, i + k));
+                                if h < 0 {
+                                    out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": bad \\u escape", line));
+                                    return out;
+                                }
+                                cp = cp * 16 + h;
+                                k = k + 1;
+                            }
+                            s = s + g_utf8(cp);
+                            i = i + 6;
+                        } else {
+                            if e == 110 { s = s + "\n"; }
+                            else if e == 116 { s = s + "\t"; }
+                            else if e == 114 { s = s + "\r"; }
+                            else if e == 98 { s = s + char_to_str(8); }
+                            else if e == 102 { s = s + char_to_str(12); }
+                            else if e == 34 || e == 92 || e == 47 { s = s + char_to_str(e); }
+                            else {
+                                out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": bad escape", line));
+                                return out;
+                            }
+                            i = i + 2;
+                        }
+                    } else {
+                        s = s + char_to_str(d);
+                        i = i + 1;
+                    }
+                }
+                if !closed {
+                    out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": unterminated string", line));
+                    return out;
+                }
+                out.push(gt(GT_STRING, s, line));
+            }
+        } else {
+            out.push(gt(GT_ERROR, "line " + int_to_str(line) + ": unexpected character '" + char_to_str(c) + "'", line));
+            return out;
+        }
+    }
+    out.push(gt(GT_EOF, "", line));
+    return out;
+}
+
+// ─── document AST ───────────────────────────────────────────────────────
+
+pub const GN_DOCUMENT: i64 = 0;
+pub const GN_OPERATION: i64 = 1;    // op: query | mutation | subscription
+pub const GN_VARDEF: i64 = 2;       // name, type_ref, a = default value or -1
+pub const GN_SELSET: i64 = 3;       // children = selections
+pub const GN_FIELD: i64 = 4;        // name, alias, args, dirs, sel
+pub const GN_SPREAD: i64 = 5;       // name, dirs
+pub const GN_INLINE: i64 = 6;       // type_cond, dirs, sel
+pub const GN_FRAGMENT: i64 = 7;     // name, type_cond, dirs, sel
+pub const GN_ARG: i64 = 8;          // name, a = value
+pub const GN_DIRECTIVE: i64 = 9;    // name, args
+pub const GN_VAR: i64 = 10;         // value: $name
+pub const GN_INT: i64 = 11;
+pub const GN_FLOAT: i64 = 12;
+pub const GN_STRING: i64 = 13;
+pub const GN_BOOL: i64 = 14;
+pub const GN_NULL: i64 = 15;
+pub const GN_ENUM: i64 = 16;
+pub const GN_LIST: i64 = 17;        // children = values
+pub const GN_OBJECT: i64 = 18;      // children = object fields (GN_ARG)
+
+pub struct GqlNode {
+    pub kind: i64,
+    pub name: str,
+    pub alias: str,
+    pub op: str,
+    pub type_ref: str,
+    pub type_cond: str,
+    pub value: str,
+    pub a: i64,
+    pub sel: i64,
+    pub children: Vec<i64>,
+    pub args: Vec<i64>,
+    pub dirs: Vec<i64>,
+}
+
+pub struct GqlDoc {
+    pub ok: bool,
+    pub error: str,
+    pub nodes: Vec<GqlNode>,
+    pub root: i64,
+}
+
+struct GP {
+    toks: Vec<GqlTok>,
+    i: i64,
+    err: str,
+    nodes: Vec<GqlNode>,
+}
+
+fn gp_node(p: & mut GP, kind: i64) -> i64 {
+    p.nodes.push(GqlNode { kind: kind, name: "", alias: "", op: "", type_ref: "", type_cond: "", value: "", a: - 1, sel: - 1, children: Vec::new(), args: Vec::new(), dirs: Vec::new() });
+    return p.nodes.len() - 1;
+}
+
+fn gp_peek(p: & GP) -> GqlTok {
+    return p.toks.get(p.i);
+}
+
+fn gp_is(p: & GP, text: str) -> bool {
+    val t: GqlTok = p.toks.get(p.i);
+    return t.kind == GT_PUNCT && t.text == text;
+}
+
+fn gp_is_name(p: & GP, text: str) -> bool {
+    val t: GqlTok = p.toks.get(p.i);
+    return t.kind == GT_NAME && t.text == text;
+}
+
+fn gp_fail(p: & mut GP, msg: str) {
+    if str_len(p.err) == 0 {
+        val t: GqlTok = gp_peek(p);
+        val n: i64 = p.toks.len();
+        if n >= 2 && p.toks.get(n - 2).kind == GT_ERROR {
+            // a lexical error explains any parse failure after it
+            p.err = p.toks.get(n - 2).text;
+        } else if t.kind == GT_ERROR {
+            p.err = t.text;
+        } else {
+            var what: str = "'" + t.text + "'";
+            if t.kind == GT_EOF { what = "end of input"; }
+            p.err = "line " + int_to_str(t.line) + ": " + msg + ", found " + what;
+        }
+    }
+    // jump to EOF so every loop stops
+    p.i = p.toks.len() - 1;
+}
+
+fn gp_expect(p: & mut GP, text: str) {
+    if gp_is(p, text) {
+        p.i = p.i + 1;
+    } else {
+        gp_fail(p, "expected '" + text + "'");
+    }
+}
+
+fn gp_name(p: & mut GP) -> str {
+    val t: GqlTok = gp_peek(p);
+    if t.kind != GT_NAME {
+        gp_fail(p, "expected a name");
+        return "";
+    }
+    p.i = p.i + 1;
+    return t.text;
+}
+
+fn gp_set(p: & mut GP, id: i64, n: GqlNode) {
+    p.nodes.set(id, n);
+}
+
+// a type reference as text: Name, [Type], Type!
+fn gp_type(p: & mut GP) -> str {
+    var t: str = "";
+    if gp_is(p, "[") {
+        p.i = p.i + 1;
+        t = "[" + gp_type(p) + "]";
+        gp_expect(p, "]");
+    } else {
+        t = gp_name(p);
+    }
+    if gp_is(p, "!") {
+        p.i = p.i + 1;
+        t = t + "!";
+    }
+    return t;
+}
+
+fn gp_value(p: & mut GP, is_const: bool) -> i64 {
+    val t: GqlTok = gp_peek(p);
+    if t.kind == GT_PUNCT && t.text == "$" {
+        if is_const {
+            gp_fail(p, "a variable is not allowed in a constant value");
+            return - 1;
+        }
+        p.i = p.i + 1;
+        val id: i64 = gp_node(p, GN_VAR);
+        var n: GqlNode = p.nodes.get(id);
+        n.value = gp_name(p);
+        gp_set(p, id, n);
+        return id;
+    }
+    if t.kind == GT_INT || t.kind == GT_FLOAT || t.kind == GT_STRING {
+        p.i = p.i + 1;
+        var k: i64 = GN_INT;
+        if t.kind == GT_FLOAT { k = GN_FLOAT; }
+        if t.kind == GT_STRING { k = GN_STRING; }
+        val id: i64 = gp_node(p, k);
+        var n: GqlNode = p.nodes.get(id);
+        n.value = t.text;
+        gp_set(p, id, n);
+        return id;
+    }
+    if t.kind == GT_NAME {
+        p.i = p.i + 1;
+        var k: i64 = GN_ENUM;
+        if t.text == "true" || t.text == "false" { k = GN_BOOL; }
+        if t.text == "null" { k = GN_NULL; }
+        val id: i64 = gp_node(p, k);
+        var n: GqlNode = p.nodes.get(id);
+        n.value = t.text;
+        gp_set(p, id, n);
+        return id;
+    }
+    if t.kind == GT_PUNCT && t.text == "[" {
+        p.i = p.i + 1;
+        val id: i64 = gp_node(p, GN_LIST);
+        var kids: Vec<i64> = Vec::new();
+        while !gp_is(p, "]") && gp_peek(p).kind != GT_EOF {
+            kids.push(gp_value(p, is_const));
+        }
+        gp_expect(p, "]");
+        var n: GqlNode = p.nodes.get(id);
+        n.children = kids;
+        gp_set(p, id, n);
+        return id;
+    }
+    if t.kind == GT_PUNCT && t.text == "{" {
+        p.i = p.i + 1;
+        val id: i64 = gp_node(p, GN_OBJECT);
+        var kids: Vec<i64> = Vec::new();
+        while !gp_is(p, "}") && gp_peek(p).kind != GT_EOF {
+            val fid: i64 = gp_node(p, GN_ARG);
+            val fname: str = gp_name(p);
+            gp_expect(p, ":");
+            val v: i64 = gp_value(p, is_const);
+            var f: GqlNode = p.nodes.get(fid);
+            f.name = fname;
+            f.a = v;
+            gp_set(p, fid, f);
+            kids.push(fid);
+        }
+        gp_expect(p, "}");
+        var n: GqlNode = p.nodes.get(id);
+        n.children = kids;
+        gp_set(p, id, n);
+        return id;
+    }
+    gp_fail(p, "expected a value");
+    return - 1;
+}
+
+fn gp_args(p: & mut GP, is_const: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if !gp_is(p, "(") {
+        return out;
+    }
+    p.i = p.i + 1;
+    while !gp_is(p, ")") && gp_peek(p).kind != GT_EOF {
+        val id: i64 = gp_node(p, GN_ARG);
+        val name: str = gp_name(p);
+        gp_expect(p, ":");
+        val v: i64 = gp_value(p, is_const);
+        var n: GqlNode = p.nodes.get(id);
+        n.name = name;
+        n.a = v;
+        gp_set(p, id, n);
+        out.push(id);
+    }
+    gp_expect(p, ")");
+    if out.len() == 0 && str_len(p.err) == 0 {
+        gp_fail(p, "an argument list cannot be empty");
+    }
+    return out;
+}
+
+fn gp_directives(p: & mut GP, is_const: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while gp_is(p, "@") {
+        p.i = p.i + 1;
+        val id: i64 = gp_node(p, GN_DIRECTIVE);
+        val name: str = gp_name(p);
+        val args: Vec<i64> = gp_args(p, is_const);
+        var n: GqlNode = p.nodes.get(id);
+        n.name = name;
+        n.args = args;
+        gp_set(p, id, n);
+        out.push(id);
+    }
+    return out;
+}
+
+fn gp_selset(p: & mut GP) -> i64 {
+    val id: i64 = gp_node(p, GN_SELSET);
+    gp_expect(p, "{");
+    var kids: Vec<i64> = Vec::new();
+    while !gp_is(p, "}") && gp_peek(p).kind != GT_EOF {
+        kids.push(gp_selection(p));
+    }
+    gp_expect(p, "}");
+    if kids.len() == 0 && str_len(p.err) == 0 {
+        gp_fail(p, "a selection set cannot be empty");
+    }
+    var n: GqlNode = p.nodes.get(id);
+    n.children = kids;
+    gp_set(p, id, n);
+    return id;
+}
+
+fn gp_selection(p: & mut GP) -> i64 {
+    if gp_is(p, "...") {
+        p.i = p.i + 1;
+        if gp_peek(p).kind == GT_NAME && !gp_is_name(p, "on") {
+            val id: i64 = gp_node(p, GN_SPREAD);
+            val name: str = gp_name(p);
+            val dirs: Vec<i64> = gp_directives(p, false);
+            var n: GqlNode = p.nodes.get(id);
+            n.name = name;
+            n.dirs = dirs;
+            gp_set(p, id, n);
+            return id;
+        }
+        val id: i64 = gp_node(p, GN_INLINE);
+        var cond: str = "";
+        if gp_is_name(p, "on") {
+            p.i = p.i + 1;
+            cond = gp_name(p);
+        }
+        val dirs: Vec<i64> = gp_directives(p, false);
+        val sel: i64 = gp_selset(p);
+        var n: GqlNode = p.nodes.get(id);
+        n.type_cond = cond;
+        n.dirs = dirs;
+        n.sel = sel;
+        gp_set(p, id, n);
+        return id;
+    }
+    val id: i64 = gp_node(p, GN_FIELD);
+    var name: str = gp_name(p);
+    var alias: str = "";
+    if gp_is(p, ":") {
+        p.i = p.i + 1;
+        alias = name;
+        name = gp_name(p);
+    }
+    val args: Vec<i64> = gp_args(p, false);
+    val dirs: Vec<i64> = gp_directives(p, false);
+    var sel: i64 = - 1;
+    if gp_is(p, "{") {
+        sel = gp_selset(p);
+    }
+    var n: GqlNode = p.nodes.get(id);
+    n.name = name;
+    n.alias = alias;
+    n.args = args;
+    n.dirs = dirs;
+    n.sel = sel;
+    gp_set(p, id, n);
+    return id;
+}
+
+fn gp_operation(p: & mut GP) -> i64 {
+    val id: i64 = gp_node(p, GN_OPERATION);
+    var op: str = "query";
+    var name: str = "";
+    var vars: Vec<i64> = Vec::new();
+    var dirs: Vec<i64> = Vec::new();
+    if !gp_is(p, "{") {
+        op = gp_name(p);
+        if op != "query" && op != "mutation" && op != "subscription" {
+            p.i = p.i - 1;
+            gp_fail(p, "expected query, mutation, subscription or fragment");
+            return id;
+        }
+        if gp_peek(p).kind == GT_NAME {
+            name = gp_name(p);
+        }
+        if gp_is(p, "(") {
+            p.i = p.i + 1;
+            while !gp_is(p, ")") && gp_peek(p).kind != GT_EOF {
+                val vid: i64 = gp_node(p, GN_VARDEF);
+                gp_expect(p, "$");
+                val vname: str = gp_name(p);
+                gp_expect(p, ":");
+                val vtype: str = gp_type(p);
+                var def: i64 = - 1;
+                if gp_is(p, "=") {
+                    p.i = p.i + 1;
+                    def = gp_value(p, true);
+                }
+                gp_directives(p, true);
+                var vn: GqlNode = p.nodes.get(vid);
+                vn.name = vname;
+                vn.type_ref = vtype;
+                vn.a = def;
+                gp_set(p, vid, vn);
+                vars.push(vid);
+            }
+            gp_expect(p, ")");
+        }
+        dirs = gp_directives(p, false);
+    }
+    val sel: i64 = gp_selset(p);
+    var n: GqlNode = p.nodes.get(id);
+    n.op = op;
+    n.name = name;
+    n.args = vars;
+    n.dirs = dirs;
+    n.sel = sel;
+    gp_set(p, id, n);
+    return id;
+}
+
+/// Parse an executable document (operations and fragments).
+pub fn gql_parse(src: str) -> GqlDoc {
+    var p: GP = GP { toks: gql_lex(src), i: 0, err: "", nodes: Vec::new() };
+    val root: i64 = gp_node(& mut p, GN_DOCUMENT);
+    var defs: Vec<i64> = Vec::new();
+    if gp_peek(& p).kind == GT_EOF {
+        gp_fail(& mut p, "a document needs at least one definition");
+    }
+    while gp_peek(& p).kind != GT_EOF && str_len(p.err) == 0 {
+        if gp_peek(& p).kind == GT_ERROR {
+            gp_fail(& mut p, "");
+        } else if gp_is_name(& p, "fragment") {
+            p.i = p.i + 1;
+            val id: i64 = gp_node(& mut p, GN_FRAGMENT);
+            val name: str = gp_name(& mut p);
+            if name == "on" {
+                gp_fail(& mut p, "a fragment cannot be named 'on'");
+            }
+            if !gp_is_name(& p, "on") {
+                gp_fail(& mut p, "expected 'on'");
+            }
+            p.i = p.i + 1;
+            val cond: str = gp_name(& mut p);
+            val dirs: Vec<i64> = gp_directives(& mut p, false);
+            val sel: i64 = gp_selset(& mut p);
+            var n: GqlNode = p.nodes.get(id);
+            n.name = name;
+            n.type_cond = cond;
+            n.dirs = dirs;
+            n.sel = sel;
+            p.nodes.set(id, n);
+            defs.push(id);
+        } else {
+            defs.push(gp_operation(& mut p));
+        }
+    }
+    var r: GqlNode = p.nodes.get(root);
+    r.children = defs;
+    p.nodes.set(root, r);
+    return GqlDoc { ok: str_len(p.err) == 0, error: p.err, nodes: p.nodes, root: root };
+}
+
+/// The operations' names and kinds, as "query Name" lines (anonymous
+/// operations are "query").
+pub fn gql_operations(d: & GqlDoc) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val r: GqlNode = d.nodes.get(d.root);
+    var i: i64 = 0;
+    while i < r.children.len() {
+        val n: GqlNode = d.nodes.get(r.children.get(i));
+        if n.kind == GN_OPERATION {
+            if str_len(n.name) > 0 {
+                out.push(n.op + " " + n.name);
+            } else {
+                out.push(n.op);
+            }
+        } else if n.kind == GN_FRAGMENT {
+            out.push("fragment " + n.name + " on " + n.type_cond);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── values as JSON ─────────────────────────────────────────────────────
+
+/// A value node as JSON text; variables are read from `vars` (a JSON
+/// object), a missing one is null.
+pub fn gql_value_json(nodes: & Vec<GqlNode>, id: i64, vars: str) -> str {
+    if id < 0 {
+        return "null";
+    }
+    val n: GqlNode = nodes.get(id);
+    if n.kind == GN_VAR {
+        if json_has(vars, n.value) {
+            return json_get(vars, n.value);
+        }
+        return "null";
+    }
+    if n.kind == GN_INT || n.kind == GN_FLOAT || n.kind == GN_BOOL || n.kind == GN_NULL {
+        return n.value;
+    }
+    if n.kind == GN_STRING || n.kind == GN_ENUM {
+        return json_string(n.value);
+    }
+    if n.kind == GN_LIST {
+        var o: str = "[";
+        var i: i64 = 0;
+        while i < n.children.len() {
+            if i > 0 { o = o + ","; }
+            o = o + gql_value_json(nodes, n.children.get(i), vars);
+            i = i + 1;
+        }
+        return o + "]";
+    }
+    if n.kind == GN_OBJECT {
+        var o: str = "{";
+        var i: i64 = 0;
+        while i < n.children.len() {
+            val f: GqlNode = nodes.get(n.children.get(i));
+            if i > 0 { o = o + ","; }
+            o = o + json_string(f.name) + ":" + gql_value_json(nodes, f.a, vars);
+            i = i + 1;
+        }
+        return o + "}";
+    }
+    return "null";
+}
+
+// ─── schema (SDL) ───────────────────────────────────────────────────────
+
+pub struct GqlField {
+    pub name: str,
+    pub type_ref: str,
+    pub arg_names: Vec<str>,
+    pub arg_types: Vec<str>,
+    pub arg_defaults: Vec<str>,  // JSON, "" when none
+}
+
+/// kind: OBJECT INTERFACE UNION ENUM INPUT_OBJECT SCALAR
+pub struct GqlType {
+    pub kind: str,
+    pub name: str,
+    pub fields: Vec<GqlField>,
+    pub values: Vec<str>,
+    pub members: Vec<str>,
+    pub interfaces: Vec<str>,
+}
+
+pub struct GqlSchema {
+    pub ok: bool,
+    pub error: str,
+    pub types: Vec<GqlType>,
+    pub query: str,
+    pub mutation: str,
+}
+
+fn gs_skip_desc(p: & mut GP) {
+    while gp_peek(p).kind == GT_STRING {
+        p.i = p.i + 1;
+    }
+}
+
+fn gs_fields(p: & mut GP, with_args: bool) -> Vec<GqlField> {
+    var out: Vec<GqlField> = Vec::new();
+    if !gp_is(p, "{") {
+        return out;
+    }
+    p.i = p.i + 1;
+    while !gp_is(p, "}") && gp_peek(p).kind != GT_EOF {
+        gs_skip_desc(p);
+        var f: GqlField = GqlField { name: gp_name(p), type_ref: "", arg_names: Vec::new(), arg_types: Vec::new(), arg_defaults: Vec::new() };
+        if with_args && gp_is(p, "(") {
+            p.i = p.i + 1;
+            while !gp_is(p, ")") && gp_peek(p).kind != GT_EOF {
+                gs_skip_desc(p);
+                f.arg_names.push(gp_name(p));
+                gp_expect(p, ":");
+                f.arg_types.push(gp_type(p));
+                if gp_is(p, "=") {
+                    p.i = p.i + 1;
+                    val v: i64 = gp_value(p, true);
+                    f.arg_defaults.push(gql_value_json(& p.nodes, v, "{}"));
+                } else {
+                    f.arg_defaults.push("");
+                }
+                gp_directives(p, true);
+            }
+            gp_expect(p, ")");
+        }
+        gp_expect(p, ":");
+        f.type_ref = gp_type(p);
+        if !with_args && gp_is(p, "=") {
+            p.i = p.i + 1;
+            gp_value(p, true);
+        }
+        gp_directives(p, true);
+        out.push(f);
+    }
+    gp_expect(p, "}");
+    return out;
+}
+
+fn gs_type(kind: str, name: str) -> GqlType {
+    return GqlType { kind: kind, name: name, fields: Vec::new(), values: Vec::new(), members: Vec::new(), interfaces: Vec::new() };
+}
+
+/// Parse a schema in SDL. Without a `schema { }` block the roots are the
+/// types named Query and Mutation.
+pub fn gql_parse_schema(src: str) -> GqlSchema {
+    var p: GP = GP { toks: gql_lex(src), i: 0, err: "", nodes: Vec::new() };
+    var s: GqlSchema = GqlSchema { ok: true, error: "", types: Vec::new(), query: "Query", mutation: "" };
+    var has_mutation_type: bool = false;
+    var explicit: bool = false;
+    while gp_peek(& p).kind != GT_EOF && str_len(p.err) == 0 {
+        gs_skip_desc(& mut p);
+        if gp_peek(& p).kind == GT_ERROR {
+            gp_fail(& mut p, "");
+        } else {
+            var kw: str = gp_name(& mut p);
+            if kw == "extend" {
+                kw = gp_name(& mut p);
+            }
+            if kw == "schema" {
+                explicit = true;
+                gp_directives(& mut p, true);
+                gp_expect(& mut p, "{");
+                while !gp_is(& p, "}") && gp_peek(& p).kind != GT_EOF {
+                    val op: str = gp_name(& mut p);
+                    gp_expect(& mut p, ":");
+                    val tn: str = gp_name(& mut p);
+                    if op == "query" { s.query = tn; }
+                    if op == "mutation" { s.mutation = tn; }
+                }
+                gp_expect(& mut p, "}");
+            } else if kw == "type" || kw == "interface" || kw == "input" {
+                var kind: str = "OBJECT";
+                if kw == "interface" { kind = "INTERFACE"; }
+                if kw == "input" { kind = "INPUT_OBJECT"; }
+                var t: GqlType = gs_type(kind, gp_name(& mut p));
+                if gp_is_name(& p, "implements") {
+                    p.i = p.i + 1;
+                    if gp_is(& p, "&") { p.i = p.i + 1; }
+                    t.interfaces.push(gp_name(& mut p));
+                    while gp_is(& p, "&") {
+                        p.i = p.i + 1;
+                        t.interfaces.push(gp_name(& mut p));
+                    }
+                }
+                gp_directives(& mut p, true);
+                t.fields = gs_fields(& mut p, kind != "INPUT_OBJECT");
+                if t.name == "Mutation" { has_mutation_type = true; }
+                s.types.push(t);
+            } else if kw == "union" {
+                var t: GqlType = gs_type("UNION", gp_name(& mut p));
+                gp_directives(& mut p, true);
+                gp_expect(& mut p, "=");
+                if gp_is(& p, "|") { p.i = p.i + 1; }
+                t.members.push(gp_name(& mut p));
+                while gp_is(& p, "|") {
+                    p.i = p.i + 1;
+                    t.members.push(gp_name(& mut p));
+                }
+                s.types.push(t);
+            } else if kw == "enum" {
+                var t: GqlType = gs_type("ENUM", gp_name(& mut p));
+                gp_directives(& mut p, true);
+                gp_expect(& mut p, "{");
+                while !gp_is(& p, "}") && gp_peek(& p).kind != GT_EOF {
+                    gs_skip_desc(& mut p);
+                    t.values.push(gp_name(& mut p));
+                    gp_directives(& mut p, true);
+                }
+                gp_expect(& mut p, "}");
+                s.types.push(t);
+            } else if kw == "scalar" {
+                s.types.push(gs_type("SCALAR", gp_name(& mut p)));
+                gp_directives(& mut p, true);
+            } else if kw == "directive" {
+                // directive @name(args) on LOCATIONS: skipped
+                gp_expect(& mut p, "@");
+                gp_name(& mut p);
+                if gp_is(& p, "(") {
+                    var depth: i64 = 0;
+                    while gp_peek(& p).kind != GT_EOF {
+                        if gp_is(& p, "(") { depth = depth + 1; }
+                        if gp_is(& p, ")") {
+                            depth = depth - 1;
+                            if depth == 0 {
+                                p.i = p.i + 1;
+                                break;
+                            }
+                        }
+                        p.i = p.i + 1;
+                    }
+                }
+                if gp_is_name(& p, "repeatable") { p.i = p.i + 1; }
+                if gp_is_name(& p, "on") { p.i = p.i + 1; }
+                if gp_is(& p, "|") { p.i = p.i + 1; }
+                gp_name(& mut p);
+                while gp_is(& p, "|") {
+                    p.i = p.i + 1;
+                    gp_name(& mut p);
+                }
+            } else {
+                p.i = p.i - 1;
+                gp_fail(& mut p, "expected a type definition");
+            }
+        }
+    }
+    if !explicit && has_mutation_type {
+        s.mutation = "Mutation";
+    }
+    if str_len(p.err) > 0 {
+        s.ok = false;
+        s.error = p.err;
+    }
+    return s;
+}
+
+/// The type named `name`, or -1.
+pub fn gql_type_index(s: & GqlSchema, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < s.types.len() {
+        if s.types.get(i).name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The field names of a type ([] when the type is unknown).
+pub fn gql_field_names(s: & GqlSchema, type_name: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val ti: i64 = gql_type_index(s, type_name);
+    if ti < 0 {
+        return out;
+    }
+    val t: GqlType = s.types.get(ti);
+    var i: i64 = 0;
+    while i < t.fields.len() {
+        out.push(t.fields.get(i).name);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn gq_builtin_scalar(name: str) -> bool {
+    return name == "Int" || name == "Float" || name == "String" || name == "Boolean" || name == "ID";
+}
+
+fn gq_named(type_ref: str) -> str {
+    // the named type inside [ ] and !
+    var t: str = type_ref;
+    while str_len(t) > 0 && (str_byte_at(t, 0) == 91 || str_byte_at(t, str_len(t) - 1) == 93 || str_byte_at(t, str_len(t) - 1) == 33) {
+        if str_byte_at(t, str_len(t) - 1) == 33 {
+            t = str_slice(t, 0, str_len(t) - 1);
+        } else {
+            t = str_slice(t, 1, str_len(t) - 1);
+        }
+    }
+    return t;
+}
+
+// ─── introspection values ───────────────────────────────────────────────
+
+fn gq_kind_of(s: & GqlSchema, name: str) -> str {
+    if gq_builtin_scalar(name) {
+        return "SCALAR";
+    }
+    val ti: i64 = gql_type_index(s, name);
+    if ti < 0 {
+        return "";
+    }
+    return s.types.get(ti).kind;
+}
+
+fn gq_type_ref_json(s: & GqlSchema, t: str) -> str {
+    if str_len(t) > 0 && str_byte_at(t, str_len(t) - 1) == 33 {
+        return "{\"kind\":\"NON_NULL\",\"name\":null,\"ofType\":" + gq_type_ref_json(s, str_slice(t, 0, str_len(t) - 1)) + "}";
+    }
+    if str_len(t) > 0 && str_byte_at(t, 0) == 91 {
+        return "{\"kind\":\"LIST\",\"name\":null,\"ofType\":" + gq_type_ref_json(s, str_slice(t, 1, str_len(t) - 1)) + "}";
+    }
+    return "{\"kind\":" + json_string(gq_kind_of(s, t)) + ",\"name\":" + json_string(t) + ",\"ofType\":null}";
+}
+
+fn gq_type_json(s: & GqlSchema, name: str) -> str {
+    val kind: str = gq_kind_of(s, name);
+    if str_len(kind) == 0 {
+        return "null";
+    }
+    var o: str = "{\"name\":" + json_string(name) + ",\"kind\":" + json_string(kind);
+    val ti: i64 = gql_type_index(s, name);
+    var fields: str = "null";
+    var enums: str = "null";
+    var possible: str = "null";
+    if ti >= 0 {
+        val t: GqlType = s.types.get(ti);
+        if kind == "OBJECT" || kind == "INTERFACE" || kind == "INPUT_OBJECT" {
+            fields = "[";
+            var i: i64 = 0;
+            while i < t.fields.len() {
+                val f: GqlField = t.fields.get(i);
+                if i > 0 { fields = fields + ","; }
+                var args: str = "[";
+                var k: i64 = 0;
+                while k < f.arg_names.len() {
+                    if k > 0 { args = args + ","; }
+                    args = args + "{\"name\":" + json_string(f.arg_names.get(k)) + ",\"type\":" + gq_type_ref_json(s, f.arg_types.get(k)) + "}";
+                    k = k + 1;
+                }
+                args = args + "]";
+                fields = fields + "{\"name\":" + json_string(f.name) + ",\"type\":" + gq_type_ref_json(s, f.type_ref) + ",\"args\":" + args + "}";
+                i = i + 1;
+            }
+            fields = fields + "]";
+        }
+        if kind == "ENUM" {
+            enums = "[";
+            var i: i64 = 0;
+            while i < t.values.len() {
+                if i > 0 { enums = enums + ","; }
+                enums = enums + "{\"name\":" + json_string(t.values.get(i)) + "}";
+                i = i + 1;
+            }
+            enums = enums + "]";
+        }
+        if kind == "UNION" {
+            possible = "[";
+            var i: i64 = 0;
+            while i < t.members.len() {
+                if i > 0 { possible = possible + ","; }
+                possible = possible + "{\"name\":" + json_string(t.members.get(i)) + "}";
+                i = i + 1;
+            }
+            possible = possible + "]";
+        }
+    }
+    return o + ",\"fields\":" + fields + ",\"enumValues\":" + enums + ",\"possibleTypes\":" + possible + "}";
+}
+
+fn gq_schema_json(s: & GqlSchema) -> str {
+    var types: str = "[";
+    var i: i64 = 0;
+    while i < s.types.len() {
+        if i > 0 { types = types + ","; }
+        types = types + gq_type_json(s, s.types.get(i).name);
+        i = i + 1;
+    }
+    val builtins: Vec<str> = str_split("Int,Float,String,Boolean,ID", ",");
+    i = 0;
+    while i < builtins.len() {
+        if s.types.len() > 0 || i > 0 { types = types + ","; }
+        types = types + gq_type_json(s, builtins.get(i));
+        i = i + 1;
+    }
+    types = types + "]";
+    var mt: str = "null";
+    if str_len(s.mutation) > 0 {
+        mt = "{\"name\":" + json_string(s.mutation) + "}";
+    }
+    return "{\"queryType\":{\"name\":" + json_string(s.query) + "},\"mutationType\":" + mt + ",\"types\":" + types + "}";
+}
+
+// ─── executor ───────────────────────────────────────────────────────────
+
+struct GqEx {
+    nodes: Vec<GqlNode>,
+    vars: str,
+    frag_names: Vec<str>,
+    frag_ids: Vec<i64>,
+    errors: Vec<str>,
+    resolve: fn(str, str, str) -> str,
+}
+
+fn gq_error(ex: & mut GqEx, msg: str, path: & Vec<str>) {
+    var p: str = "[";
+    var i: i64 = 0;
+    while i < path.len() {
+        if i > 0 { p = p + ","; }
+        p = p + path.get(i);
+        i = i + 1;
+    }
+    ex.errors.push("{\"message\":" + json_string(msg) + ",\"path\":" + p + "]}");
+}
+
+fn gq_directive_bool(ex: & GqEx, d: & GqlNode) -> bool {
+    var i: i64 = 0;
+    while i < d.args.len() {
+        val a: GqlNode = ex.nodes.get(d.args.get(i));
+        if a.name == "if" {
+            return gql_value_json(& ex.nodes, a.a, ex.vars) == "true";
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// @skip(if: true) or @include(if: false) drop a selection
+fn gq_included(ex: & GqEx, dirs: & Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < dirs.len() {
+        val d: GqlNode = ex.nodes.get(dirs.get(i));
+        if d.name == "skip" && gq_directive_bool(ex, & d) {
+            return false;
+        }
+        if d.name == "include" && !gq_directive_bool(ex, & d) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn gq_applies(s: & GqlSchema, cond: str, type_name: str) -> bool {
+    if str_len(cond) == 0 || cond == type_name || str_len(type_name) == 0 {
+        return true;
+    }
+    val ci: i64 = gql_type_index(s, cond);
+    if ci >= 0 && s.types.get(ci).kind == "UNION" {
+        val m: Vec<str> = s.types.get(ci).members;
+        var i: i64 = 0;
+        while i < m.len() {
+            if m.get(i) == type_name { return true; }
+            i = i + 1;
+        }
+    }
+    val ti: i64 = gql_type_index(s, type_name);
+    if ti >= 0 {
+        val ifs: Vec<str> = s.types.get(ti).interfaces;
+        var i: i64 = 0;
+        while i < ifs.len() {
+            if ifs.get(i) == cond { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+// CollectFields (§6.3.2): response keys in order; for each key the field
+// node first seen and every selection set to merge under it
+fn gq_collect(ex: & GqEx, s: & GqlSchema, type_name: str, sel: i64, keys: & mut Vec<str>, fields: & mut Vec<i64>, subs: & mut Vec<Vec<i64>>, visited: & mut Vec<str>) {
+    if sel < 0 {
+        return;
+    }
+    val ss: GqlNode = ex.nodes.get(sel);
+    var i: i64 = 0;
+    while i < ss.children.len() {
+        val nid: i64 = ss.children.get(i);
+        val n: GqlNode = ex.nodes.get(nid);
+        if gq_included(ex, & n.dirs) {
+            if n.kind == GN_FIELD {
+                var key: str = n.name;
+                if str_len(n.alias) > 0 { key = n.alias; }
+                var k: i64 = 0;
+                var found: i64 = - 1;
+                while k < keys.len() {
+                    if keys.get(k) == key { found = k; }
+                    k = k + 1;
+                }
+                if found < 0 {
+                    keys.push(key);
+                    fields.push(nid);
+                    var one: Vec<i64> = Vec::new();
+                    if n.sel >= 0 { one.push(n.sel); }
+                    subs.push(one);
+                } else if n.sel >= 0 {
+                    var have: Vec<i64> = subs.get(found);
+                    have.push(n.sel);
+                    subs.set(found, have);
+                }
+            } else if n.kind == GN_INLINE {
+                if gq_applies(s, n.type_cond, type_name) {
+                    gq_collect(ex, s, type_name, n.sel, keys, fields, subs, visited);
+                }
+            } else if n.kind == GN_SPREAD {
+                var seen: bool = false;
+                var v: i64 = 0;
+                while v < visited.len() {
+                    if visited.get(v) == n.name { seen = true; }
+                    v = v + 1;
+                }
+                if !seen {
+                    visited.push(n.name);
+                    var f: i64 = 0;
+                    while f < ex.frag_names.len() {
+                        if ex.frag_names.get(f) == n.name {
+                            val fd: GqlNode = ex.nodes.get(ex.frag_ids.get(f));
+                            if gq_applies(s, fd.type_cond, type_name) && gq_included(ex, & fd.dirs) {
+                                gq_collect(ex, s, type_name, fd.sel, keys, fields, subs, visited);
+                            }
+                        }
+                        f = f + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn gq_find_field(s: & GqlSchema, type_name: str, field: str) -> i64 {
+    val ti: i64 = gql_type_index(s, type_name);
+    if ti < 0 {
+        return - 1;
+    }
+    val fs: Vec<GqlField> = s.types.get(ti).fields;
+    var i: i64 = 0;
+    while i < fs.len() {
+        if fs.get(i).name == field {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn gq_path_plus(path: & Vec<str>, seg: str) -> Vec<str> {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < path.len() {
+        p.push(path.get(i));
+        i = i + 1;
+    }
+    p.push(seg);
+    return p;
+}
+
+// an introspection value (or any JSON) selected without a schema type
+fn gq_select_any(ex: & mut GqEx, s: & GqlSchema, v: str, sels: & Vec<i64>) -> str {
+    if sels.len() == 0 || v == "null" {
+        return v;
+    }
+    val t: str = json_type_safe(v);
+    if t == "array" {
+        val items: Vec<str> = json_items(v);
+        var o: str = "[";
+        var i: i64 = 0;
+        while i < items.len() {
+            if i > 0 { o = o + ","; }
+            o = o + gq_select_any(ex, s, items.get(i), sels);
+            i = i + 1;
+        }
+        return o + "]";
+    }
+    if t != "object" {
+        return v;
+    }
+    var keys: Vec<str> = Vec::new();
+    var fields: Vec<i64> = Vec::new();
+    var subs: Vec<Vec<i64>> = Vec::new();
+    var visited: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < sels.len() {
+        gq_collect(ex, s, "", sels.get(i), & mut keys, & mut fields, & mut subs, & mut visited);
+        i = i + 1;
+    }
+    var o: str = "{";
+    i = 0;
+    while i < keys.len() {
+        val f: GqlNode = ex.nodes.get(fields.get(i));
+        if i > 0 { o = o + ","; }
+        o = o + json_string(keys.get(i)) + ":" + gq_select_any(ex, s, json_get_safe(v, f.name), & subs.get(i));
+        i = i + 1;
+    }
+    return o + "}";
+}
+
+fn gq_args_json(ex: & GqEx, f: & GqlNode, def: & GqlField) -> str {
+    var o: str = "{";
+    var first: bool = true;
+    var k: i64 = 0;
+    while k < def.arg_names.len() {
+        val name: str = def.arg_names.get(k);
+        var val_: str = "";
+        var i: i64 = 0;
+        while i < f.args.len() {
+            val a: GqlNode = ex.nodes.get(f.args.get(i));
+            if a.name == name {
+                val an: GqlNode = ex.nodes.get(a.a);
+                // a variable that was not provided falls back to the default
+                if an.kind == GN_VAR && !json_has(ex.vars, an.value) {
+                    val_ = def.arg_defaults.get(k);
+                } else {
+                    val_ = gql_value_json(& ex.nodes, a.a, ex.vars);
+                }
+            }
+            i = i + 1;
+        }
+        if str_len(val_) == 0 {
+            val_ = def.arg_defaults.get(k);
+        }
+        if str_len(val_) > 0 {
+            if !first { o = o + ","; }
+            o = o + json_string(name) + ":" + val_;
+            first = false;
+        }
+        k = k + 1;
+    }
+    return o + "}";
+}
+
+fn gq_complete(ex: & mut GqEx, s: & GqlSchema, type_ref: str, v: str, sels: & Vec<i64>, path: & Vec<str>) -> str {
+    if str_len(type_ref) > 0 && str_byte_at(type_ref, str_len(type_ref) - 1) == 33 {
+        val r: str = gq_complete(ex, s, str_slice(type_ref, 0, str_len(type_ref) - 1), v, sels, path);
+        if r == "null" {
+            gq_error(ex, "Cannot return null for non-nullable field", path);
+        }
+        return r;
+    }
+    if v == "null" || str_len(v) == 0 {
+        return "null";
+    }
+    if str_byte_at(type_ref, 0) == 91 {
+        val inner: str = str_slice(type_ref, 1, str_len(type_ref) - 1);
+        if json_type_safe(v) != "array" {
+            gq_error(ex, "Expected a list", path);
+            return "null";
+        }
+        val items: Vec<str> = json_items(v);
+        var o: str = "[";
+        var i: i64 = 0;
+        while i < items.len() {
+            if i > 0 { o = o + ","; }
+            o = o + gq_complete(ex, s, inner, items.get(i), sels, & gq_path_plus(path, int_to_str(i)));
+            i = i + 1;
+        }
+        return o + "]";
+    }
+    val kind: str = gq_kind_of(s, type_ref);
+    if kind == "SCALAR" || kind == "ENUM" || str_len(kind) == 0 {
+        return v;
+    }
+    var concrete: str = type_ref;
+    if kind == "INTERFACE" || kind == "UNION" {
+        concrete = json_get_str(v, "__typename");
+        if str_len(concrete) == 0 {
+            gq_error(ex, "Abstract type " + type_ref + " needs a __typename in the resolved value", path);
+            return "null";
+        }
+    }
+    return gq_select(ex, s, concrete, v, sels, path);
+}
+
+fn gq_select(ex: & mut GqEx, s: & GqlSchema, type_name: str, parent: str, sels: & Vec<i64>, path: & Vec<str>) -> str {
+    var keys: Vec<str> = Vec::new();
+    var fields: Vec<i64> = Vec::new();
+    var subs: Vec<Vec<i64>> = Vec::new();
+    var visited: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < sels.len() {
+        gq_collect(ex, s, type_name, sels.get(i), & mut keys, & mut fields, & mut subs, & mut visited);
+        i = i + 1;
+    }
+    var o: str = "{";
+    i = 0;
+    while i < keys.len() {
+        val f: GqlNode = ex.nodes.get(fields.get(i));
+        val fpath: Vec<str> = gq_path_plus(path, json_string(keys.get(i)));
+        var value: str = "null";
+        if f.name == "__typename" {
+            value = json_string(type_name);
+        } else if f.name == "__schema" && type_name == s.query {
+            value = gq_select_any(ex, s, gq_schema_json(s), & subs.get(i));
+        } else if f.name == "__type" && type_name == s.query {
+            var tname: str = "";
+            var k: i64 = 0;
+            while k < f.args.len() {
+                val a: GqlNode = ex.nodes.get(f.args.get(k));
+                if a.name == "name" {
+                    tname = json_unescape(gql_value_json(& ex.nodes, a.a, ex.vars));
+                }
+                k = k + 1;
+            }
+            value = gq_select_any(ex, s, gq_type_json(s, tname), & subs.get(i));
+        } else {
+            val fi: i64 = gq_find_field(s, type_name, f.name);
+            if fi < 0 {
+                gq_error(ex, "Cannot query field \"" + f.name + "\" on type \"" + type_name + "\"", & fpath);
+            } else {
+                val def: GqlField = s.types.get(gql_type_index(s, type_name)).fields.get(fi);
+                val args: str = gq_args_json(ex, & f, & def);
+                val resolve: fn(str, str, str) -> str = ex.resolve;
+                var raw: str = resolve(type_name + "." + f.name, parent, args);
+                if str_len(raw) == 0 {
+                    raw = json_get_safe(parent, f.name);
+                }
+                val sub: Vec<i64> = subs.get(i);
+                if sub.len() == 0 && gq_kind_of(s, gq_named(def.type_ref)) != "SCALAR" && gq_kind_of(s, gq_named(def.type_ref)) != "ENUM" {
+                    gq_error(ex, "Field \"" + f.name + "\" of type \"" + def.type_ref + "\" must have a selection of subfields", & fpath);
+                } else {
+                    value = gq_complete(ex, s, def.type_ref, raw, & sub, & fpath);
+                }
+            }
+        }
+        if i > 0 { o = o + ","; }
+        o = o + json_string(keys.get(i)) + ":" + value;
+        i = i + 1;
+    }
+    return o + "}";
+}
+
+/// Execute `query` over `schema`: `variables` is a JSON object, `op_name`
+/// picks the operation ("" for the only one), `resolve` the resolver.
+/// Returns the response JSON: {"errors":[...],"data":...} or {"data":...}.
+pub fn gql_execute(schema: & GqlSchema, query: str, variables: str, op_name: str, resolve: fn(str, str, str) -> str) -> str {
+    val doc: GqlDoc = gql_parse(query);
+    if !doc.ok {
+        return "{\"errors\":[{\"message\":" + json_string("Syntax Error: " + doc.error) + "}]}";
+    }
+    var ex: GqEx = GqEx { nodes: doc.nodes, vars: "{}", frag_names: Vec::new(), frag_ids: Vec::new(), errors: Vec::new(), resolve: resolve };
+    val root: GqlNode = ex.nodes.get(doc.root);
+    var op: i64 = - 1;
+    var ops: i64 = 0;
+    var i: i64 = 0;
+    while i < root.children.len() {
+        val n: GqlNode = ex.nodes.get(root.children.get(i));
+        if n.kind == GN_FRAGMENT {
+            ex.frag_names.push(n.name);
+            ex.frag_ids.push(root.children.get(i));
+        } else if n.kind == GN_OPERATION {
+            ops = ops + 1;
+            if (str_len(op_name) == 0 && op < 0) || n.name == op_name {
+                op = root.children.get(i);
+            }
+        }
+        i = i + 1;
+    }
+    if op < 0 || (str_len(op_name) == 0 && ops > 1) {
+        var msg: str = "Unknown operation named \"" + op_name + "\"";
+        if str_len(op_name) == 0 { msg = "Must provide operation name if query contains multiple operations"; }
+        return "{\"errors\":[{\"message\":" + json_string(msg) + "}]}";
+    }
+    val opn: GqlNode = ex.nodes.get(op);
+    // coerce variables (§6.1.2): given value, else default, else required error
+    var vars: str = "{";
+    var first: bool = true;
+    var given: str = variables;
+    if json_type_safe(given) != "object" { given = "{}"; }
+    var verrs: Vec<str> = Vec::new();
+    i = 0;
+    while i < opn.args.len() {
+        val vd: GqlNode = ex.nodes.get(opn.args.get(i));
+        var v: str = "";
+        if json_has(given, vd.name) {
+            v = json_get(given, vd.name);
+        } else if vd.a >= 0 {
+            v = gql_value_json(& ex.nodes, vd.a, "{}");
+        } else if str_byte_at(vd.type_ref, str_len(vd.type_ref) - 1) == 33 {
+            verrs.push("{\"message\":" + json_string("Variable \"$" + vd.name + "\" of required type \"" + vd.type_ref + "\" was not provided.") + "}");
+        }
+        if str_len(v) > 0 {
+            if !first { vars = vars + ","; }
+            vars = vars + json_string(vd.name) + ":" + v;
+            first = false;
+        }
+        i = i + 1;
+    }
+    if verrs.len() > 0 {
+        return "{\"errors\":[" + str_join_gq(verrs) + "]}";
+    }
+    ex.vars = vars + "}";
+    var root_type: str = schema.query;
+    if opn.op == "mutation" {
+        if str_len(schema.mutation) == 0 {
+            return "{\"errors\":[{\"message\":\"Schema is not configured for mutations\"}]}";
+        }
+        root_type = schema.mutation;
+    }
+    var sels: Vec<i64> = Vec::new();
+    sels.push(opn.sel);
+    val empty: Vec<str> = Vec::new();
+    val data: str = gq_select(& mut ex, schema, root_type, "{}", & sels, & empty);
+    if ex.errors.len() > 0 {
+        return "{\"errors\":[" + str_join_gq(ex.errors) + "],\"data\":" + data + "}";
+    }
+    return "{\"data\":" + data + "}";
+}
+
+fn str_join_gq(parts: Vec<str>) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { o = o + ","; }
+        o = o + parts.get(i);
+        i = i + 1;
+    }
+    return o;
+}

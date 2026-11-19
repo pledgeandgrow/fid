@@ -1,0 +1,139 @@
+// LF15 diamonds, copies of local variables: `val t = a`, a a local that
+// owns one value nothing changes, read in either arm of an if, in a loop,
+// or by calls, costs no Str_dup / Vec_share / HashMap_share and no drops of
+// t when no read of t can run after a drop of a (compiler/lower.fd
+// lw_rc_cancel_param_slots with LOWER_CANCEL_LOCAL_SLOTS:
+// lw_ps_local_src_ok, lw_ps_reaches). Copies whose source is reassigned,
+// moved out, changed or dropped while the copy can still be read keep
+// their count. tests/rc_cancel/check.sh counts the calls in the C.
+// Expected output:
+// L abcd abcd
+// R 4
+// xyzw
+// mn mn
+// 16
+// 7 1
+// 0:1:1:2:3:3:
+// pq pq!
+// 3 9 2
+// early ef
+// done
+
+fn show(s: str) -> i64 {
+    return str_len(s);
+}
+
+// read in one arm and at the join of the other
+fn local_arms(c: bool) -> str {
+    var a: str = "ab" + "cd";
+    val t: str = a;
+    if c {
+        return "L " + t + " " + a;
+    }
+    return "R " + int_to_str(show(t));
+}
+
+// the source reassigned while the copy lives: keeps its count
+fn reassigned() -> str {
+    var a: str = "x" + "y";
+    val t: str = a;
+    a = "z" + "w";
+    return t + a;
+}
+
+// the source moved out while the copy lives: keeps its count
+fn moved_src() -> str {
+    var a: str = "m" + "n";
+    val t: str = a;
+    var out: Vec<str> = Vec::new();
+    out.push(a);
+    out.push(t);
+    return out.get(0) + " " + out.get(1);
+}
+
+// a Vec copy of a local, made and read in each round of a loop
+fn vec_local(n: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(5);
+    v.push(6);
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val w: Vec<i64> = v;
+        sum = sum + w.get(i % 2);
+        i = i + 1;
+    }
+    return sum;
+}
+
+// a map copy of a local read in both arms
+fn map_local(c: bool) -> i64 {
+    var m: HashMap<str, i64> = HashMap::new();
+    m.insert("k", 7);
+    val w: HashMap<str, i64> = m;
+    if c {
+        return w.get("k");
+    }
+    return w.len();
+}
+
+// the source made again each round, the copy read in either arm
+fn rounds(n: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < n {
+        var a: str = int_to_str(i) + ":";
+        val t: str = a;
+        if i % 2 == 0 {
+            out = out + t;
+        } else {
+            out = out + a + t;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// the copy changed (grown in place): keeps its count, the source unchanged
+fn grown_copy() -> str {
+    var a: str = "p" + "q";
+    var t: str = a;
+    t = t + "!";
+    return a + " " + t;
+}
+
+// the copy pushed to: keeps its share, the source unchanged
+fn pushed_copy() -> str {
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    v.push(4);
+    var w: Vec<i64> = v;
+    w.push(9);
+    return int_to_str(w.len()) + " " + int_to_str(w.get(2)) + " " + int_to_str(v.len());
+}
+
+// the copy outlives the round that made its source: keeps its count
+fn outlives(n: i64) -> str {
+    var t: str = "";
+    var i: i64 = 0;
+    while i < n {
+        var a: str = "e" + "f";
+        t = a;
+        i = i + 1;
+    }
+    return "early " + t;
+}
+
+fn main() {
+    println(local_arms(true));
+    println(local_arms(false));
+    println(reassigned());
+    println(moved_src());
+    println(int_to_str(vec_local(3)));
+    println(int_to_str(map_local(true)) + " " + int_to_str(map_local(false)));
+    println(rounds(4));
+    println(grown_copy());
+    println(pushed_copy());
+    println(outlives(2));
+    println("done");
+}

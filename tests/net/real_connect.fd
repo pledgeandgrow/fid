@@ -1,0 +1,45 @@
+// A connect by name against the system's real resolver (competitive SL5):
+// p_net_connect resolves a public name and tries each of its addresses
+// until one connects, then an HTTP HEAD request must get an HTTP status
+// line back. A name under .invalid (RFC 6761: never resolves) gives -1.
+// Needs a network and a working resolver, so it is not in the bootstrap
+// suite. Resolvers by back end: getaddrinfo on the C path and pe_ir
+// (stdlib/pe_runtime/conc.fd pert_net_connect_sync), getaddrinfo through
+// win.fd on `--nat` Windows (stdlib/linux_runtime/sys.fd
+// pe_win_connect_all), the runtime's own DNS client over the nameservers
+// of /etc/resolv.conf on native Linux (sys.fd pe_dns_query_n). `fid run`
+// simulates sockets: its lines differ.
+//
+// Expected output:
+// connected: true
+// status line: true
+// invalid name: -1
+
+use string;
+
+fn b2s(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    val host: str = "example.com";
+    var fd: i64 = p_net_connect(host, 80);
+    println("connected: " + b2s(fd >= 0));
+    var status: bool = false;
+    if fd >= 0 {
+        p_socket_write_str(fd, "HEAD / HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+        val reply: str = p_socket_recv_str(fd);
+        status = str_starts_with(reply, "HTTP/1.");
+        p_net_close(fd);
+    }
+    println("status line: " + b2s(status));
+    var bad: i64 = p_net_connect("no-such-host.invalid", 80);
+    println("invalid name: " + int_to_str(bad));
+    if bad >= 0 {
+        p_net_close(bad);
+    }
+    return 0;
+}

@@ -1,0 +1,37 @@
+// CI2 (docs/roadmap/complaint-roadmap.md): C calls without a C compiler
+// on the machine layer's Linux x86-64 target. `cbrt`, `hypot` and `ldexp`
+// (libm) and `labs` and `strlen` (libc) have no runtime counterpart
+// (pert_c_/nat_c_), so `fid emit --target x86_64-linux` makes them dynamic
+// imports: PT_INTERP + PT_DYNAMIC with DT_NEEDED libm.so.6 and libc.so.6,
+// bound by the system's dynamic linker (compiler/nat_ir.fd ng_gen_ldyn,
+// ng_gen_ldyn_stubs; compiler/nat_enc.fd nat_elf). f64 arguments and
+// results travel in xmm registers, an int result is sign-extended.
+// Check on a glibc x86-64 Linux (or WSL):
+//   fid emit tests/bootstrap/test_machine_cimport.fd --target x86_64-linux -o t && ./t
+// The output matches `fid ccompile` (`fid run` has no FFI for these).
+// Expected output:
+// 3
+// 5
+// 24
+// 42
+// 5
+
+extern "C" link "m" {
+    fn cbrt(x: f64) -> f64;
+    fn hypot(x: f64, y: f64) -> f64;
+    fn ldexp(x: f64, e: i32) -> f64;
+}
+
+extern "C" {
+    fn labs(x: i64) -> i64;
+    fn strlen(s: str) -> i64;
+}
+
+@unsafe
+fn main() {
+    println(cbrt(27.0) as i64);
+    println(hypot(3.0, 4.0) as i64);
+    println(ldexp(3.0, 3) as i64);
+    println(labs(0 - 42));
+    println(strlen("fides"));
+}

@@ -1,0 +1,207 @@
+// stdlib/pointcloud: voxel-grid downsampling, k-d tree k-nearest-neighbour and radius search against brute force, Jacobi eigen solver (checked against numpy), PCA normals of a tilted plane, Horn's closed-form fit and point-to-point ICP aligning a rotated and translated square grid of points
+// Expected output:
+// voxels: 9 first (0.1250, 0.1250, 0.0000) last (1.0000, 1.0000, 0.0000)
+// knn matches brute force: true
+// radius matches brute force: true
+// nearest to (0.5, 0.5, 0.5) = 119
+// eigenvalues = 1.267949 3.000000 4.732051
+// smallest eigenvector = (0.211325, -0.577350, 0.788675)
+// normal = (-0.447214, 0.000000, 0.894427) all 49 agree: true
+// fit exact = t=(0.1500, -0.1000, 0.0500) q=(0.9945, 0.0000, 0.0000, 0.1045)
+// icp converged: true
+// icp = t=(0.0500, -0.0300, 0.0200) q=(0.9976, 0.0000, 0.0000, 0.0698)
+// icp rmse < 1e-6: true pairs 81
+use math;
+use quat;
+use transform3d;
+use pointcloud;
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+// a small LCG in [0, 1)
+fn lcg(s: & mut i64) -> f64 {
+    val v: i64 = (*s * 1103515245 + 12345) % 2147483648;
+    *s = v;
+    return (v as f64) / 2147483648.0;
+}
+
+fn brute_knn(pts: & Vec<vec3>, q: vec3, k: i64) -> Vec<i64> {
+    var bi: Vec<i64> = Vec::new();
+    var used: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < pts.len() {
+        used.push(false);
+        i = i + 1;
+    }
+    var r: i64 = 0;
+    while r < k {
+        var best: i64 = -1;
+        var bd: f64 = 0.0;
+        i = 0;
+        while i < pts.len() {
+            if !used.get(i) {
+                val d: f64 = pcl_dist2(pts.get(i), q);
+                if best < 0 || d < bd {
+                    best = i;
+                    bd = d;
+                }
+            }
+            i = i + 1;
+        }
+        used.set(best, true);
+        bi.push(best);
+        r = r + 1;
+    }
+    return bi;
+}
+
+// the outline of the square [-1, 1]^2 at z = 0, n points per side
+fn square(n: i64) -> Vec<vec3> {
+    var pts: Vec<vec3> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        val t: f64 = -1.0 + 2.0 * (i as f64) / (n as f64);
+        pts.push(vec3(t, -1.0, 0.0));
+        pts.push(vec3(1.0, t, 0.0));
+        pts.push(vec3(0.0 - t, 1.0, 0.0));
+        pts.push(vec3(-1.0, 0.0 - t, 0.0));
+        i = i + 1;
+    }
+    return pts;
+}
+
+fn main() -> i64 {
+    var grid: Vec<vec3> = Vec::new();
+    var y: i64 = 0;
+    while y < 5 {
+        var x: i64 = 0;
+        while x < 5 {
+            grid.push(vec3(0.25 * (x as f64), 0.25 * (y as f64), 0.0));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    val vox: Vec<vec3> = pcl_voxel_downsample(&grid, 0.5);
+    println("voxels: " + int_to_str(vox.len()) + " first " + rmath_vec3_str(vox.get(0), 4) + " last " + rmath_vec3_str(vox.get(vox.len() - 1), 4));
+
+    var seed: i64 = 12345;
+    var cloud: Vec<vec3> = Vec::new();
+    var i: i64 = 0;
+    while i < 150 {
+        val a: f64 = lcg(&mut seed);
+        val b: f64 = lcg(&mut seed);
+        val c: f64 = lcg(&mut seed);
+        cloud.push(vec3(a, b, c));
+        i = i + 1;
+    }
+    val tree: KdTree = kdtree_build(&cloud);
+    var ok: bool = true;
+    var rok: bool = true;
+    var qn: i64 = 0;
+    while qn < 15 {
+        val q: vec3 = vec3(lcg(&mut seed), lcg(&mut seed), lcg(&mut seed));
+        val got: Vec<i64> = kdtree_knn(&tree, q, 5);
+        val want: Vec<i64> = brute_knn(&cloud, q, 5);
+        var j: i64 = 0;
+        while j < 5 {
+            if got.get(j) != want.get(j) {
+                ok = false;
+            }
+            j = j + 1;
+        }
+        val rad: Vec<i64> = kdtree_radius(&tree, q, 0.2);
+        var cnt: i64 = 0;
+        j = 0;
+        while j < cloud.len() {
+            if pcl_dist2(cloud.get(j), q) <= 0.04 {
+                cnt = cnt + 1;
+            }
+            j = j + 1;
+        }
+        if cnt != rad.len() {
+            rok = false;
+        }
+        qn = qn + 1;
+    }
+    println("knn matches brute force: " + yes(ok));
+    println("radius matches brute force: " + yes(rok));
+    val nq: vec3 = vec3(0.5, 0.5, 0.5);
+    val nb: i64 = kdtree_nearest(&tree, nq);
+    if nb != brute_knn(&cloud, nq, 1).get(0) {
+        println("nearest differs from brute force");
+    }
+    println("nearest to (0.5, 0.5, 0.5) = " + int_to_str(nb));
+
+    var m: Vec<f64> = Vec::new();
+    m.push(4.0);
+    m.push(1.0);
+    m.push(0.0);
+    m.push(1.0);
+    m.push(3.0);
+    m.push(1.0);
+    m.push(0.0);
+    m.push(1.0);
+    m.push(2.0);
+    val e: EigenSym = pcl_eigen_sym(&m, 3);
+    println("eigenvalues = " + rmath_fmt(e.values.get(0), 6) + " " + rmath_fmt(e.values.get(1), 6) + " " + rmath_fmt(e.values.get(2), 6));
+    var ev: vec3 = pcl_eigvec3(&e, 0);
+    if ev.x < 0.0 {
+        ev = ev.scale(-1.0);
+    }
+    println("smallest eigenvector = " + rmath_vec3_str(ev, 6));
+
+    // the plane z = 0.5 x seen from above
+    var plane: Vec<vec3> = Vec::new();
+    y = 0;
+    while y < 7 {
+        var x: i64 = 0;
+        while x < 7 {
+            val px: f64 = 0.1 * (x as f64);
+            plane.push(vec3(px, 0.1 * (y as f64), 0.5 * px));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    val normals: Vec<vec3> = pcl_normals(&plane, 6, vec3(0.0, 0.0, 10.0));
+    val n0: vec3 = normals.get(0);
+    var agree: bool = true;
+    i = 0;
+    while i < normals.len() {
+        if normals.get(i).sub(n0).length() > 0.000001 {
+            agree = false;
+        }
+        i = i + 1;
+    }
+    println("normal = " + rmath_vec3_str(n0, 6) + " all " + int_to_str(normals.len()) + " agree: " + yes(agree));
+
+    val sq: Vec<vec3> = square(20);
+    val truth: Transform3 = tf3_new(qt_from_axis_angle(vec3(0.0, 0.0, 1.0), rmath_pi() * 12.0 / 180.0), vec3(0.15, -0.1, 0.05));
+    val moved: Vec<vec3> = tf3_apply_all(truth, &sq);
+    println("fit exact = " + tf3_to_str(pcl_fit_rigid(&sq, &moved), 4));
+    // ICP without correspondences: a 9 x 9 grid of points filling the
+    // square, rotated 8 degrees about z and shifted (0.05, -0.03, 0.02).
+    // (Point-to-point ICP on a regular grid or outline has local minima a
+    // grid step apart; larger motions stop in one of them.)
+    var fill: Vec<vec3> = Vec::new();
+    i = 0;
+    while i < 9 {
+        var j: i64 = 0;
+        while j < 9 {
+            fill.push(vec3(-1.0 + 0.25 * (i as f64), -1.0 + 0.25 * (j as f64), 0.0));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    val small: Transform3 = tf3_new(qt_from_axis_angle(vec3(0.0, 0.0, 1.0), rmath_pi() * 8.0 / 180.0), vec3(0.05, -0.03, 0.02));
+    val fmoved: Vec<vec3> = tf3_apply_all(small, &fill);
+    val r: IcpResult = pcl_icp(&fill, &fmoved, tf3_identity(), 60, 1.0, 0.0000000001);
+    println("icp converged: " + yes(r.converged));
+    println("icp = " + tf3_to_str(r.transform, 4));
+    println("icp rmse < 1e-6: " + yes(r.rmse < 0.000001) + " pairs " + int_to_str(r.pairs));
+    return 0;
+}

@@ -11,8 +11,10 @@
 // keeps the region for the next mmap of its size. Paths go to the
 // preopened directories as wasi-libc sends them (scripts/wasm-run.mjs
 // preopens ".", "/" and "/tmp"). Errors are -errno as
-// on Linux. A thread or a task runs to its end when it starts
-// (compiler/wasm.fd: nat_clone_thread, nat_ctx_swap); processes, signals
+// on Linux. A task switches stacks (compiler/wasm.fd "Tasks": the WASM
+// stack is unwound and rewound, asyncify-style); a thread still runs to
+// its end when it starts (compiler/wasm.fd: nat_clone_thread). Processes
+// are a panic `not available in WebAssembly: processes (...)`; signals
 // and sockets fail with ENOSYS. Merged only for this target.
 
 extern "C" {
@@ -395,6 +397,9 @@ pub fn pe_wasi_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -
     if n == 63 { return pe_wasi_rw(false, a, b, c); }                // read
     if n == 222 {                                                     // mmap
         if e >= 0 { return 0 - 38; }
+        // MAP_FIXED (RT7's decommit, base.fd pe_decommit): WASM memory
+        // cannot give pages back
+        if (d & 16) != 0 { return 0 - 38; }
         return pe_wasi_mmap(b);
     }
     if n == 215 { return pe_wasi_munmap(a, b); }                     // munmap

@@ -1,0 +1,243 @@
+// stdlib/apic: Local APIC (xAPIC and x2APIC) and IO APIC over fake register files, with a MADT built in memory.
+// Expected output:
+// msr icr 0x830 timer_init 0x838 eoi 0x80b
+// base 0xfee00000 bsp true x2 false enabled true -> x2 0xfee00d00
+// lvt timer 0x20020 lint0 extint masked 0x10700
+// lvt decode vec 0x29 mode 0 low true level true masked false
+// div 1:0xb 2:0x0 16:0x3 32:0x8 128:0xa 3:-1 decode 0xa:128 0xb:1
+// timer 10ms at 100MHz/16: 62500, calibrated 100000000 Hz
+// icr init 0xc4500 sipi 0xc4608 deassert 0x8500 fixed 0x40f0
+// icr64 x 0x03000000000040f0 x2 0x00000100000040f0
+// xapic init svr 0x1ff timer 0x10000 error 0xfe dfr 0xffffffff writes 10
+// xapic id 3 lvts 6
+// timer div 0x3 lvt 0x20020 count 62500
+// ipi init true hi 0x1000000 lo 0x4500, sipi true lo 0x4608
+// ipi stuck false
+// x2apic svr 0x1ff icr 0x0000010000004040 id 256
+// irr bit 0x31 true 0x30 false
+// ioapic entries 24 version 0x20 id 1
+// madt valid true lapic 0xfee00000 pcat true cpus 4 enabled 3
+// cpu x2 true id 0x100 uid 3
+// ioapic id 1 addr 0xfec00000 gsi 0 overrides 2 nmi lint 1
+// irq0 -> gsi 2 low false level false
+// irq1 redir 0x0000000000000021
+// irq9 redir 0x010000000000a029 masked after 0x1a029
+// ioapic for gsi 9: 0, gsi 30: -1
+use apic;
+use acpi;
+use vec;
+use string;
+
+var g_mmio: Vec<i64> = Vec::new();
+var g_msr: Vec<i64> = Vec::new();
+var g_writes: Vec<i64> = Vec::new();
+var g_flags: Vec<i64> = Vec::new();
+var g_io: Vec<i64> = Vec::new();
+
+fn hx(v: i64, digits: i64) -> str {
+    var d: str = "0123456789abcdef";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = digits - 1;
+    while i >= 0 {
+        out.push(str_byte_at(d, (v >> (i * 4)) & 15));
+        i = i - 1;
+    }
+    return "0x" + str_from_bytes(out);
+}
+
+fn h(v: i64) -> str {
+    if v < 0 { return int_to_str(v); }
+    return "0x" + int_to_hex(v);
+}
+
+fn mm_rd(off: i64) -> i64 {
+    return g_mmio.get(off / 4);
+}
+
+fn mm_wr(off: i64, v: i64) {
+    g_writes.push(off);
+    if off == LAPIC_ICR_LO && g_flags.get(0) == 0 {
+        g_mmio.set(off / 4, v & ~APIC_DELIVERY_PENDING);
+        return;
+    }
+    if off == LAPIC_ICR_LO {
+        g_mmio.set(off / 4, v | APIC_DELIVERY_PENDING);
+        return;
+    }
+    g_mmio.set(off / 4, v);
+}
+
+fn msr_rd(m: i64) -> i64 {
+    return g_msr.get(m - 0x800);
+}
+
+fn msr_wr(m: i64, v: i64) {
+    g_msr.set(m - 0x800, v);
+}
+
+// fake IO APIC: g_io[0] is IOREGSEL, g_io[1 + reg] the registers
+fn io_rd(off: i64) -> i64 {
+    if off == 0x10 { return g_io.get(1 + g_io.get(0)); }
+    return g_io.get(0);
+}
+
+fn io_wr(off: i64, v: i64) {
+    if off == 0x00 {
+        g_io.set(0, v);
+        return;
+    }
+    val sel: i64 = g_io.get(0);
+    if sel == IOAPIC_REG_VER { return; }
+    g_io.set(1 + sel, v);
+}
+
+fn put(b: &mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        b.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn put_str(b: &mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        b.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn build_madt() -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    put_str(&mut m, "APIC");
+    put(&mut m, 122, 4);
+    put(&mut m, 4, 1);
+    put(&mut m, 0, 1);
+    put_str(&mut m, "FIDES ");
+    put_str(&mut m, "FIDESTBL");
+    put(&mut m, 1, 4);
+    put_str(&mut m, "FID ");
+    put(&mut m, 1, 4);
+    put(&mut m, 0xFEE00000, 4);
+    put(&mut m, 1, 4);
+    var k: i64 = 0;
+    while k < 3 {
+        put(&mut m, 0, 1);
+        put(&mut m, 8, 1);
+        put(&mut m, k, 1);
+        put(&mut m, k, 1);
+        if k < 2 { put(&mut m, 1, 4); } else { put(&mut m, 2, 4); }
+        k = k + 1;
+    }
+    put(&mut m, 1, 1);
+    put(&mut m, 12, 1);
+    put(&mut m, 1, 1);
+    put(&mut m, 0, 1);
+    put(&mut m, 0xFEC00000, 4);
+    put(&mut m, 0, 4);
+    put(&mut m, 2, 1);
+    put(&mut m, 10, 1);
+    put(&mut m, 0, 1);
+    put(&mut m, 0, 1);
+    put(&mut m, 2, 4);
+    put(&mut m, 0, 2);
+    put(&mut m, 2, 1);
+    put(&mut m, 10, 1);
+    put(&mut m, 0, 1);
+    put(&mut m, 9, 1);
+    put(&mut m, 9, 4);
+    put(&mut m, 0x000F, 2);
+    put(&mut m, 4, 1);
+    put(&mut m, 6, 1);
+    put(&mut m, 0xFF, 1);
+    put(&mut m, 5, 2);
+    put(&mut m, 1, 1);
+    put(&mut m, 9, 1);
+    put(&mut m, 16, 1);
+    put(&mut m, 0, 2);
+    put(&mut m, 0x100, 4);
+    put(&mut m, 1, 4);
+    put(&mut m, 3, 4);
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < m.len() {
+        sum = sum + m.get(i);
+        i = i + 1;
+    }
+    m.set(9, (256 - sum % 256) % 256);
+    return m;
+}
+
+fn main() {
+    g_mmio = Vec::filled(256, 0);
+    g_msr = Vec::filled(64, 0);
+    g_flags.push(0);
+    g_io = Vec::filled(80, 0);
+    g_io.set(1 + IOAPIC_REG_ID, 0x01000000);
+    g_io.set(1 + IOAPIC_REG_VER, 0x00170020);
+
+    println("msr icr " + h(apic_x2_msr(LAPIC_ICR_LO)) + " timer_init " + h(apic_x2_msr(LAPIC_TIMER_INIT)) + " eoi " + h(apic_x2_msr(LAPIC_EOI)));
+    val bm: ApicBaseMsr = apic_base_decode(0xFEE00900);
+    var bm2: ApicBaseMsr = bm;
+    bm2.x2apic = true;
+    println("base " + h(bm.base) + " bsp " + bool_to_str(bm.bsp) + " x2 " + bool_to_str(bm.x2apic) + " enabled " + bool_to_str(bm.enabled) + " -> x2 " + h(apic_base_encode(bm2)));
+    println("lvt timer " + h(apic_lvt_timer(0x20, APIC_TIMER_PERIODIC, false)) + " lint0 extint masked " + h(apic_lvt(0, APIC_DM_EXTINT, false, false, true)));
+    val li: LvtInfo = apic_lvt_decode(0xA029);
+    println("lvt decode vec " + h(li.vector) + " mode " + int_to_str(li.mode) + " low " + bool_to_str(li.active_low) + " level " + bool_to_str(li.level) + " masked " + bool_to_str(li.masked));
+    println("div 1:" + h(apic_timer_div_encode(1)) + " 2:" + h(apic_timer_div_encode(2)) + " 16:" + h(apic_timer_div_encode(16)) + " 32:" + h(apic_timer_div_encode(32)) + " 128:" + h(apic_timer_div_encode(128)) + " 3:" + h(apic_timer_div_encode(3)) + " decode 0xa:" + int_to_str(apic_timer_div_decode(0xA)) + " 0xb:" + int_to_str(apic_timer_div_decode(0xB)));
+    println("timer 10ms at 100MHz/16: " + int_to_str(apic_timer_count(100000000, 16, 10000000)) + ", calibrated " + int_to_str(apic_timer_calibrate(625000, 16, 100000000)) + " Hz");
+    println("icr init " + h(apic_icr_init(APIC_DEST_OTHERS)) + " sipi " + h(apic_icr_sipi(0x8000, APIC_DEST_OTHERS)) + " deassert " + h(apic_icr_init_deassert()) + " fixed " + h(apic_icr(0xF0, APIC_DM_FIXED, false, APIC_DEST_NONE)));
+    println("icr64 x " + hx(apic_icr64(0x40F0, 3, false), 16) + " x2 " + hx(apic_icr64(0x40F0, 0x100, true), 16));
+
+    val xb: ApicBus = ApicBus { x2: false, rd: mm_rd, wr: mm_wr };
+    lapic_init(&xb, 0xFF, 0xFE);
+    println("xapic init svr " + h(lapic_read(&xb, LAPIC_SVR)) + " timer " + h(lapic_read(&xb, LAPIC_LVT_TIMER)) + " error " + h(lapic_read(&xb, LAPIC_LVT_ERROR)) + " dfr " + h(lapic_read(&xb, LAPIC_DFR)) + " writes " + int_to_str(g_writes.len()));
+    g_mmio.set(LAPIC_ID / 4, 0x03000000);
+    g_mmio.set(LAPIC_VERSION / 4, 0x00050014);
+    println("xapic id " + int_to_str(lapic_id(&xb)) + " lvts " + int_to_str(lapic_max_lvt(&xb)));
+    lapic_timer_start(&xb, 0x20, APIC_TIMER_PERIODIC, 16, 62500);
+    println("timer div " + h(lapic_read(&xb, LAPIC_TIMER_DIV)) + " lvt " + h(lapic_read(&xb, LAPIC_LVT_TIMER)) + " count " + int_to_str(lapic_read(&xb, LAPIC_TIMER_INIT)));
+    val ok1: bool = lapic_send_ipi(&xb, 1, apic_icr_init(APIC_DEST_NONE), 100);
+    val hi: i64 = lapic_read(&xb, LAPIC_ICR_HI);
+    val lo1: i64 = lapic_read(&xb, LAPIC_ICR_LO);
+    val ok2: bool = lapic_send_ipi(&xb, 1, apic_icr_sipi(0x8000, APIC_DEST_NONE), 100);
+    println("ipi init " + bool_to_str(ok1) + " hi " + h(hi) + " lo " + h(lo1) + ", sipi " + bool_to_str(ok2) + " lo " + h(lapic_read(&xb, LAPIC_ICR_LO)));
+    g_flags.set(0, 1);
+    println("ipi stuck " + bool_to_str(lapic_send_ipi(&xb, 1, apic_icr(0x40, APIC_DM_FIXED, false, APIC_DEST_NONE), 5)));
+
+    val x2b: ApicBus = ApicBus { x2: true, rd: msr_rd, wr: msr_wr };
+    lapic_init(&x2b, 0xFF, 0xFE);
+    g_msr.set(apic_x2_msr(LAPIC_ID) - 0x800, 256);
+    lapic_send_ipi(&x2b, 0x100, apic_icr(0x40, APIC_DM_FIXED, false, APIC_DEST_NONE), 5);
+    println("x2apic svr " + h(lapic_read(&x2b, LAPIC_SVR)) + " icr " + hx(g_msr.get(MSR_X2APIC_ICR - 0x800), 16) + " id " + int_to_str(lapic_id(&x2b)));
+    g_mmio.set((LAPIC_IRR + 16) / 4, 1 << 17);
+    println("irr bit 0x31 " + bool_to_str(lapic_vector_bit(&xb, LAPIC_IRR, 0x31)) + " 0x30 " + bool_to_str(lapic_vector_bit(&xb, LAPIC_IRR, 0x30)));
+
+    val io: ApicBus = ApicBus { x2: false, rd: io_rd, wr: io_wr };
+    println("ioapic entries " + int_to_str(ioapic_entries(&io)) + " version " + h(ioapic_version(&io)) + " id " + int_to_str((ioapic_read(&io, IOAPIC_REG_ID) >> 24) & 15));
+
+    val madt: Vec<i64> = build_madt();
+    val info: MadtInfo = madt_parse(madt);
+    var enabled: i64 = 0;
+    var i: i64 = 0;
+    while i < info.cpus.len() {
+        if info.cpus.get(i).enabled { enabled = enabled + 1; }
+        i = i + 1;
+    }
+    println("madt valid " + bool_to_str(sdt_at(madt, 0, "APIC").valid) + " lapic " + h(info.lapic_addr) + " pcat " + bool_to_str(info.pcat_compat) + " cpus " + int_to_str(info.cpus.len()) + " enabled " + int_to_str(enabled));
+    val c3: MadtCpu = info.cpus.get(3);
+    println("cpu x2 " + bool_to_str(c3.x2) + " id " + h(c3.apic_id) + " uid " + int_to_str(c3.uid));
+    val ia: MadtIoApic = info.ioapics.get(0);
+    println("ioapic id " + int_to_str(ia.id) + " addr " + h(ia.addr) + " gsi " + int_to_str(ia.gsi_base) + " overrides " + int_to_str(info.overrides.len()) + " nmi lint " + int_to_str(info.nmi_lint));
+    val r0: IrqRoute = madt_isa_route(&info, 0);
+    println("irq0 -> gsi " + int_to_str(r0.gsi) + " low " + bool_to_str(r0.active_low) + " level " + bool_to_str(r0.level));
+    ioapic_set_redir(&io, madt_isa_route(&info, 1).gsi, apic_isa_redir(&info, 1, 0x21, 0));
+    println("irq1 redir " + hx(ioapic_get_redir(&io, 1), 16));
+    ioapic_set_redir(&io, madt_isa_route(&info, 9).gsi, apic_isa_redir(&info, 9, 0x29, 1));
+    val e9: i64 = ioapic_get_redir(&io, 9);
+    ioapic_mask(&io, 9, true);
+    println("irq9 redir " + hx(e9, 16) + " masked after " + h(ioapic_read(&io, 0x10 + 18)));
+    var counts: Vec<i64> = Vec::new();
+    counts.push(ioapic_entries(&io));
+    println("ioapic for gsi 9: " + int_to_str(madt_ioapic_for(&info, 9, counts)) + ", gsi 30: " + int_to_str(madt_ioapic_for(&info, 30, counts)));
+}

@@ -1,0 +1,907 @@
+// Fides AC and DC power flow (load flow)
+//
+// All real computation, no platform seam. Quantities are per unit on the
+// network's MVA base, angles in radians.
+// - The bus admittance matrix from branches: series r + jx, total line
+//   charging b, off-nominal tap ratio and phase shift at the from end
+//   (the MATPOWER branch model: Yff = (ys + jb/2)/|t|^2, Ytt = ys + jb/2,
+//   Yft = -ys/conj(t), Ytf = -ys/t), plus bus shunts g + jb.
+// - Newton-Raphson in polar form with the full Jacobian (H, N, M, L blocks),
+//   PQ, PV and one slack bus, optional enforcement of PV reactive limits
+//   (a bus at its limit becomes PQ and the flow is solved again).
+// - Gauss-Seidel with an acceleration factor.
+// - Fast-decoupled load flow, XB scheme (B' from 1/x without shunts or taps,
+//   B'' from -Im(Ybus) of the PQ buses), each factorised once.
+// - DC power flow (B theta = P, flows (theta_i - theta_j - shift)/(x tap)).
+// - Results: bus injections, generation at slack and PV buses, branch flows
+//   at both ends, branch and total losses.
+// Linear systems are solved by dense LU with partial pivoting, which is
+// right for the textbook-sized systems this is meant for (tens of buses).
+//
+// Usage:
+//   use power_flow;
+//   var net = pf_network(100.0);
+//   pf_add_bus(&mut net, pf_slack_bus(1.0, 0.0));
+//   pf_add_bus(&mut net, pf_pq_bus(0.5, 0.2));            // load 0.5 + j0.2 pu
+//   pf_add_line(&mut net, 0, 1, 0.01, 0.1, 0.02);
+//   val r = pf_newton(&net, 0.00000001, 20);
+
+module power_flow;
+use math;
+use complex;
+use vec;
+
+pub const PF_SLACK: i64 = 0;
+pub const PF_PV: i64 = 1;
+pub const PF_PQ: i64 = 2;
+
+/// A bus. `v`/`theta` are the specified (slack, PV) or starting values;
+/// `pg`/`qg` generation, `pl`/`ql` load, `gsh`/`bsh` shunt admittance (pu).
+pub struct PfBus {
+    pub kind: i64,
+    pub v: f64,
+    pub theta: f64,
+    pub pg: f64,
+    pub qg: f64,
+    pub pl: f64,
+    pub ql: f64,
+    pub qmin: f64,
+    pub qmax: f64,
+    pub gsh: f64,
+    pub bsh: f64,
+}
+
+/// A line or transformer between bus indexes `from` and `to`.
+pub struct PfBranch {
+    pub from: i64,
+    pub to: i64,
+    pub r: f64,
+    pub x: f64,
+    pub b: f64,
+    pub tap: f64,
+    pub shift: f64,
+}
+
+pub struct PfNetwork {
+    pub base_mva: f64,
+    pub buses: Vec<PfBus>,
+    pub branches: Vec<PfBranch>,
+}
+
+/// Dense complex matrix as G + jB, row-major n x n.
+pub struct PfYbus {
+    pub n: i64,
+    pub g: Vec<f64>,
+    pub b: Vec<f64>,
+}
+
+pub struct PfResult {
+    pub converged: bool,
+    pub iterations: i64,
+    pub max_mismatch: f64,
+    pub v: Vec<f64>,
+    pub theta: Vec<f64>,
+    pub p: Vec<f64>,
+    pub q: Vec<f64>,
+}
+
+pub struct PfFlow {
+    pub p_from: f64,
+    pub q_from: f64,
+    pub p_to: f64,
+    pub q_to: f64,
+    pub p_loss: f64,
+    pub q_loss: f64,
+}
+
+// ─── Building a network ───
+
+pub fn pf_network(base_mva: f64) -> PfNetwork {
+    return PfNetwork {
+        base_mva: base_mva, buses: Vec::new(), branches: Vec::new()
+    };
+}
+
+pub fn pf_slack_bus(v: f64, theta: f64) -> PfBus {
+    return PfBus {
+        kind: PF_SLACK, v: v, theta: theta, pg: 0.0, qg: 0.0, pl: 0.0, ql: 0.0, qmin: -1.0e30, qmax: 1.0e30, gsh: 0.0, bsh: 0.0
+    };
+}
+
+/// A generator bus holding |V| = v and generation pg (pu), with load pl/ql.
+pub fn pf_pv_bus(v: f64, pg: f64, pl: f64, ql: f64) -> PfBus {
+    return PfBus {
+        kind: PF_PV, v: v, theta: 0.0, pg: pg, qg: 0.0, pl: pl, ql: ql, qmin: -1.0e30, qmax: 1.0e30, gsh: 0.0, bsh: 0.0
+    };
+}
+
+/// A load bus taking pl + j ql (pu).
+pub fn pf_pq_bus(pl: f64, ql: f64) -> PfBus {
+    return PfBus {
+        kind: PF_PQ, v: 1.0, theta: 0.0, pg: 0.0, qg: 0.0, pl: pl, ql: ql, qmin: -1.0e30, qmax: 1.0e30, gsh: 0.0, bsh: 0.0
+    };
+}
+
+pub fn pf_add_bus(net: &mut PfNetwork, bus: PfBus) -> i64 {
+    net.buses.push(bus);
+    return net.buses.len() - 1;
+}
+
+/// A line: series r + jx, total charging susceptance b.
+pub fn pf_add_line(net: &mut PfNetwork, from: i64, to: i64, r: f64, x: f64, b: f64) -> i64 {
+    net.branches.push(PfBranch {
+        from: from, to: to, r: r, x: x, b: b, tap: 1.0, shift: 0.0
+    });
+    return net.branches.len() - 1;
+}
+
+/// A transformer with off-nominal tap ratio `tap` and phase shift `shift`
+/// (radians) at the from end.
+pub fn pf_add_transformer(net: &mut PfNetwork, from: i64, to: i64, r: f64, x: f64, tap: f64, shift: f64) -> i64 {
+    net.branches.push(PfBranch {
+        from: from, to: to, r: r, x: x, b: 0.0, tap: tap, shift: shift
+    });
+    return net.branches.len() - 1;
+}
+
+pub fn pf_set_q_limits(net: &mut PfNetwork, bus: i64, qmin: f64, qmax: f64) {
+    var bb: PfBus = net.buses.get(bus);
+    bb.qmin = qmin;
+    bb.qmax = qmax;
+    net.buses.set(bus, bb);
+}
+
+pub fn pf_set_shunt(net: &mut PfNetwork, bus: i64, g: f64, b: f64) {
+    var bb: PfBus = net.buses.get(bus);
+    bb.gsh = g;
+    bb.bsh = b;
+    net.buses.set(bus, bb);
+}
+
+// ─── Admittance matrix ───
+
+fn pf_zeros(n: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn pf_yadd(y: &mut PfYbus, i: i64, k: i64, z: Complex) {
+    val at: i64 = i * y.n + k;
+    y.g.set(at, y.g.get(at) + z.re);
+    y.b.set(at, y.b.get(at) + z.im);
+}
+
+pub fn pf_ybus_get(y: &PfYbus, i: i64, k: i64) -> Complex {
+    return complex(y.g.get(i * y.n + k), y.b.get(i * y.n + k));
+}
+
+/// The four branch admittances [Yff, Yft, Ytf, Ytt].
+fn pf_branch_y(br: &PfBranch) -> Vec<Complex> {
+    val ys: Complex = complex_recip(complex(br.r, br.x));
+    val t: Complex = complex_from_polar(br.tap, br.shift);
+    val ysh: Complex = complex_add(ys, complex(0.0, br.b / 2.0));
+    var out: Vec<Complex> = Vec::new();
+    out.push(complex_scale(ysh, 1.0 / (br.tap * br.tap)));
+    out.push(complex_neg(complex_div(ys, complex_conj(t))));
+    out.push(complex_neg(complex_div(ys, t)));
+    out.push(ysh);
+    return out;
+}
+
+pub fn pf_ybus(net: &PfNetwork) -> PfYbus {
+    val n: i64 = net.buses.len();
+    var y = PfYbus {
+        n: n, g: pf_zeros(n * n), b: pf_zeros(n * n)
+    };
+    var k: i64 = 0;
+    while k < net.branches.len() {
+        val br: PfBranch = net.branches.get(k);
+        val yy: Vec<Complex> = pf_branch_y(&br);
+        pf_yadd(&mut y, br.from, br.from, yy.get(0));
+        pf_yadd(&mut y, br.from, br.to, yy.get(1));
+        pf_yadd(&mut y, br.to, br.from, yy.get(2));
+        pf_yadd(&mut y, br.to, br.to, yy.get(3));
+        k = k + 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val bus: PfBus = net.buses.get(i);
+        pf_yadd(&mut y, i, i, complex(bus.gsh, bus.bsh));
+        i = i + 1;
+    }
+    return y;
+}
+
+// ─── Dense LU ───
+
+/// LU factors with partial pivoting of an n x n row-major matrix.
+pub struct PfLu {
+    pub n: i64,
+    pub a: Vec<f64>,
+    pub perm: Vec<i64>,
+    pub singular: bool,
+}
+
+pub fn pf_lu(a: Vec<f64>, n: i64) -> PfLu {
+    var m: Vec<f64> = a;
+    var perm: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        perm.push(i);
+        i = i + 1;
+    }
+    var singular: bool = false;
+    var c: i64 = 0;
+    while c < n {
+        var p: i64 = c;
+        var best: f64 = math_fabs(m.get(c * n + c));
+        var r: i64 = c + 1;
+        while r < n {
+            val v: f64 = math_fabs(m.get(r * n + c));
+            if v > best {
+                best = v;
+                p = r;
+            }
+            r = r + 1;
+        }
+        if best < 1.0e-14 {
+            singular = true;
+            c = c + 1;
+            continue;
+        }
+        if p != c {
+            var j: i64 = 0;
+            while j < n {
+                val t: f64 = m.get(c * n + j);
+                m.set(c * n + j, m.get(p * n + j));
+                m.set(p * n + j, t);
+                j = j + 1;
+            }
+            val tp: i64 = perm.get(c);
+            perm.set(c, perm.get(p));
+            perm.set(p, tp);
+        }
+        val piv: f64 = m.get(c * n + c);
+        r = c + 1;
+        while r < n {
+            val f: f64 = m.get(r * n + c) / piv;
+            m.set(r * n + c, f);
+            if f != 0.0 {
+                var j: i64 = c + 1;
+                while j < n {
+                    m.set(r * n + j, m.get(r * n + j) - f * m.get(c * n + j));
+                    j = j + 1;
+                }
+            }
+            r = r + 1;
+        }
+        c = c + 1;
+    }
+    return PfLu {
+        n: n, a: m, perm: perm, singular: singular
+    };
+}
+
+pub fn pf_lu_solve(lu: &PfLu, rhs: &Vec<f64>) -> Vec<f64> {
+    val n: i64 = lu.n;
+    var x: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        x.push(rhs.get(lu.perm.get(i)));
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        var s: f64 = x.get(i);
+        var j: i64 = 0;
+        while j < i {
+            s = s - lu.a.get(i * n + j) * x.get(j);
+            j = j + 1;
+        }
+        x.set(i, s);
+        i = i + 1;
+    }
+    i = n - 1;
+    while i >= 0 {
+        var s: f64 = x.get(i);
+        var j: i64 = i + 1;
+        while j < n {
+            s = s - lu.a.get(i * n + j) * x.get(j);
+            j = j + 1;
+        }
+        x.set(i, s / lu.a.get(i * n + i));
+        i = i - 1;
+    }
+    return x;
+}
+
+// ─── Injections ───
+
+/// P and Q injected at every bus for the given voltages: [P..., Q...].
+pub fn pf_injections(y: &PfYbus, v: &Vec<f64>, th: &Vec<f64>) -> Vec<f64> {
+    val n: i64 = y.n;
+    var p: Vec<f64> = pf_zeros(n);
+    var q: Vec<f64> = pf_zeros(n);
+    var i: i64 = 0;
+    while i < n {
+        var sp: f64 = 0.0;
+        var sq: f64 = 0.0;
+        var k: i64 = 0;
+        while k < n {
+            val g: f64 = y.g.get(i * n + k);
+            val b: f64 = y.b.get(i * n + k);
+            if g != 0.0 || b != 0.0 {
+                val d: f64 = th.get(i) - th.get(k);
+                val c: f64 = math_cos(d);
+                val s: f64 = math_sin(d);
+                sp = sp + v.get(k) * (g * c + b * s);
+                sq = sq + v.get(k) * (g * s - b * c);
+            }
+            k = k + 1;
+        }
+        p.set(i, v.get(i) * sp);
+        q.set(i, v.get(i) * sq);
+        i = i + 1;
+    }
+    var out: Vec<f64> = p;
+    i = 0;
+    while i < n {
+        out.push(q.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pf_start(net: &PfNetwork, v: &mut Vec<f64>, th: &mut Vec<f64>) {
+    var i: i64 = 0;
+    while i < net.buses.len() {
+        val b: PfBus = net.buses.get(i);
+        v.push(b.v);
+        th.push(b.theta);
+        i = i + 1;
+    }
+}
+
+fn pf_finish(net: &PfNetwork, y: &PfYbus, v: Vec<f64>, th: Vec<f64>, conv: bool, iters: i64, mis: f64) -> PfResult {
+    val n: i64 = net.buses.len();
+    val s: Vec<f64> = pf_injections(y, &v, &th);
+    var p: Vec<f64> = Vec::new();
+    var q: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        p.push(s.get(i));
+        q.push(s.get(n + i));
+        i = i + 1;
+    }
+    return PfResult {
+        converged: conv, iterations: iters, max_mismatch: mis, v: v, theta: th, p: p, q: q
+    };
+}
+
+// ─── Newton-Raphson ───
+
+fn pf_kinds(net: &PfNetwork) -> Vec<i64> {
+    var k: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < net.buses.len() {
+        k.push(net.buses.get(i).kind);
+        i = i + 1;
+    }
+    return k;
+}
+
+fn pf_newton_kinds(net: &PfNetwork, y: &PfYbus, kinds: &Vec<i64>, v0: Vec<f64>, th0: Vec<f64>, tol: f64, max_iter: i64) -> PfResult {
+    val n: i64 = net.buses.len();
+    var v: Vec<f64> = v0;
+    var th: Vec<f64> = th0;
+    // unknown positions: angles of non-slack buses, magnitudes of PQ buses
+    var ang_at: Vec<i64> = Vec::new();
+    var mag_at: Vec<i64> = Vec::new();
+    var na: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if kinds.get(i) != PF_SLACK {
+            ang_at.push(na);
+            na = na + 1;
+        } else {
+            ang_at.push(-1);
+        }
+        i = i + 1;
+    }
+    var nm: i64 = 0;
+    i = 0;
+    while i < n {
+        if kinds.get(i) == PF_PQ {
+            mag_at.push(na + nm);
+            nm = nm + 1;
+        } else {
+            mag_at.push(-1);
+        }
+        i = i + 1;
+    }
+    val dim: i64 = na + nm;
+    var it: i64 = 0;
+    var mis: f64 = 1.0e30;
+    while it <= max_iter {
+        val s: Vec<f64> = pf_injections(y, &v, &th);
+        var f: Vec<f64> = pf_zeros(dim);
+        mis = 0.0;
+        i = 0;
+        while i < n {
+            val bus: PfBus = net.buses.get(i);
+            if ang_at.get(i) >= 0 {
+                val dp: f64 = (bus.pg - bus.pl) - s.get(i);
+                f.set(ang_at.get(i), dp);
+                mis = math_max_f64(mis, math_fabs(dp));
+            }
+            if mag_at.get(i) >= 0 {
+                val dq: f64 = (bus.qg - bus.ql) - s.get(n + i);
+                f.set(mag_at.get(i), dq);
+                mis = math_max_f64(mis, math_fabs(dq));
+            }
+            i = i + 1;
+        }
+        if mis < tol {
+            return pf_finish(net, y, v, th, true, it, mis);
+        }
+        if it == max_iter {
+            break;
+        }
+        var jac: Vec<f64> = pf_zeros(dim * dim);
+        i = 0;
+        while i < n {
+            val ri_p: i64 = ang_at.get(i);
+            val ri_q: i64 = mag_at.get(i);
+            if ri_p >= 0 || ri_q >= 0 {
+                val pi: f64 = s.get(i);
+                val qi: f64 = s.get(n + i);
+                val vi: f64 = v.get(i);
+                var k: i64 = 0;
+                while k < n {
+                    val ca: i64 = ang_at.get(k);
+                    val cm: i64 = mag_at.get(k);
+                    if ca >= 0 || cm >= 0 {
+                        val g: f64 = y.g.get(i * n + k);
+                        val b: f64 = y.b.get(i * n + k);
+                        var h: f64 = 0.0;
+                        var nn: f64 = 0.0;
+                        var mm: f64 = 0.0;
+                        var l: f64 = 0.0;
+                        if i == k {
+                            h = 0.0 - qi - b * vi * vi;
+                            nn = pi / vi + g * vi;
+                            mm = pi - g * vi * vi;
+                            l = qi / vi - b * vi;
+                        } else {
+                            val d: f64 = th.get(i) - th.get(k);
+                            val c: f64 = math_cos(d);
+                            val sn: f64 = math_sin(d);
+                            val vk: f64 = v.get(k);
+                            h = vi * vk * (g * sn - b * c);
+                            nn = vi * (g * c + b * sn);
+                            mm = 0.0 - vi * vk * (g * c + b * sn);
+                            l = vi * (g * sn - b * c);
+                        }
+                        if ri_p >= 0 && ca >= 0 {
+                            jac.set(ri_p * dim + ca, h);
+                        }
+                        if ri_p >= 0 && cm >= 0 {
+                            jac.set(ri_p * dim + cm, nn);
+                        }
+                        if ri_q >= 0 && ca >= 0 {
+                            jac.set(ri_q * dim + ca, mm);
+                        }
+                        if ri_q >= 0 && cm >= 0 {
+                            jac.set(ri_q * dim + cm, l);
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+            i = i + 1;
+        }
+        val lu: PfLu = pf_lu(jac, dim);
+        if lu.singular {
+            break;
+        }
+        val dx: Vec<f64> = pf_lu_solve(&lu, &f);
+        i = 0;
+        while i < n {
+            if ang_at.get(i) >= 0 {
+                th.set(i, th.get(i) + dx.get(ang_at.get(i)));
+            }
+            if mag_at.get(i) >= 0 {
+                v.set(i, v.get(i) + dx.get(mag_at.get(i)));
+            }
+            i = i + 1;
+        }
+        it = it + 1;
+    }
+    return pf_finish(net, y, v, th, false, it, mis);
+}
+
+/// Newton-Raphson load flow to a maximum power mismatch `tol` (pu).
+pub fn pf_newton(net: &PfNetwork, tol: f64, max_iter: i64) -> PfResult {
+    val y: PfYbus = pf_ybus(net);
+    var v: Vec<f64> = Vec::new();
+    var th: Vec<f64> = Vec::new();
+    pf_start(net, &mut v, &mut th);
+    val kinds: Vec<i64> = pf_kinds(net);
+    return pf_newton_kinds(net, &y, &kinds, v, th, tol, max_iter);
+}
+
+/// Newton-Raphson with PV reactive limits: a PV bus whose generation would
+/// leave [qmin, qmax] is held at the limit as a PQ bus and the flow is
+/// solved again (at most n times). `held` (one per bus) is set to 1 or -1
+/// for a bus held at its upper or lower limit.
+pub fn pf_newton_qlim(net: &PfNetwork, tol: f64, max_iter: i64, held: &mut Vec<i64>) -> PfResult {
+    var work: PfNetwork = PfNetwork {
+        base_mva: net.base_mva, buses: net.buses, branches: net.branches
+    };
+    val y: PfYbus = pf_ybus(net);
+    val n: i64 = net.buses.len();
+    held.clear();
+    var i: i64 = 0;
+    while i < n {
+        held.push(0);
+        i = i + 1;
+    }
+    var rounds: i64 = 0;
+    loop {
+        var v: Vec<f64> = Vec::new();
+        var th: Vec<f64> = Vec::new();
+        pf_start(&work, &mut v, &mut th);
+        val kinds: Vec<i64> = pf_kinds(&work);
+        val r: PfResult = pf_newton_kinds(&work, &y, &kinds, v, th, tol, max_iter);
+        if !r.converged || rounds >= n {
+            return r;
+        }
+        var changed: bool = false;
+        i = 0;
+        while i < n {
+            var b: PfBus = work.buses.get(i);
+            if b.kind == PF_PV {
+                val qg: f64 = r.q.get(i) + b.ql;
+                if qg > b.qmax || qg < b.qmin {
+                    if qg > b.qmax {
+                        b.qg = b.qmax;
+                        held.set(i, 1);
+                    } else {
+                        b.qg = b.qmin;
+                        held.set(i, -1);
+                    }
+                    b.kind = PF_PQ;
+                    b.v = r.v.get(i);
+                    work.buses.set(i, b);
+                    changed = true;
+                }
+            }
+            i = i + 1;
+        }
+        if !changed {
+            return r;
+        }
+        rounds = rounds + 1;
+    }
+    return pf_newton(net, tol, max_iter);
+}
+
+// ─── Gauss-Seidel ───
+
+/// Gauss-Seidel load flow; `accel` (typically 1.4..1.6) accelerates the
+/// PQ-bus updates. Converged when no voltage changes by more than `tol`.
+pub fn pf_gauss_seidel(net: &PfNetwork, tol: f64, max_iter: i64, accel: f64) -> PfResult {
+    val y: PfYbus = pf_ybus(net);
+    val n: i64 = net.buses.len();
+    var vr: Vec<f64> = Vec::new();
+    var vi: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        val b: PfBus = net.buses.get(i);
+        vr.push(b.v * math_cos(b.theta));
+        vi.push(b.v * math_sin(b.theta));
+        i = i + 1;
+    }
+    var it: i64 = 0;
+    var dmax: f64 = 1.0e30;
+    while it < max_iter {
+        dmax = 0.0;
+        i = 0;
+        while i < n {
+            val bus: PfBus = net.buses.get(i);
+            if bus.kind != PF_SLACK {
+                // sum_k Y_ik V_k over all k (including i)
+                var sr: f64 = 0.0;
+                var si: f64 = 0.0;
+                var k: i64 = 0;
+                while k < n {
+                    val g: f64 = y.g.get(i * n + k);
+                    val b: f64 = y.b.get(i * n + k);
+                    sr = sr + g * vr.get(k) - b * vi.get(k);
+                    si = si + g * vi.get(k) + b * vr.get(k);
+                    k = k + 1;
+                }
+                val vcur: Complex = complex(vr.get(i), vi.get(i));
+                var qsp: f64 = bus.qg - bus.ql;
+                if bus.kind == PF_PV {
+                    // Q = Im(V conj(I))
+                    qsp = vcur.im * sr - vcur.re * si;
+                }
+                val psp: f64 = bus.pg - bus.pl;
+                val yii: Complex = pf_ybus_get(&y, i, i);
+                // sum over k != i
+                val others: Complex = complex_sub(complex(sr, si), complex_mul(yii, vcur));
+                val term: Complex = complex_div(complex(psp, 0.0 - qsp), complex_conj(vcur));
+                var vnew: Complex = complex_div(complex_sub(term, others), yii);
+                if bus.kind == PF_PV {
+                    vnew = complex_scale(vnew, bus.v / complex_abs(vnew));
+                } else {
+                    vnew = complex_add(vcur, complex_scale(complex_sub(vnew, vcur), accel));
+                }
+                dmax = math_max_f64(dmax, complex_abs(complex_sub(vnew, vcur)));
+                vr.set(i, vnew.re);
+                vi.set(i, vnew.im);
+            }
+            i = i + 1;
+        }
+        it = it + 1;
+        if dmax < tol {
+            break;
+        }
+    }
+    var v: Vec<f64> = Vec::new();
+    var th: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        val z: Complex = complex(vr.get(i), vi.get(i));
+        v.push(complex_abs(z));
+        th.push(complex_arg(z));
+        i = i + 1;
+    }
+    return pf_finish(net, &y, v, th, dmax < tol, it, dmax);
+}
+
+// ─── Fast decoupled (XB) ───
+
+pub fn pf_fast_decoupled(net: &PfNetwork, tol: f64, max_iter: i64) -> PfResult {
+    val y: PfYbus = pf_ybus(net);
+    val n: i64 = net.buses.len();
+    var ang_at: Vec<i64> = Vec::new();
+    var mag_at: Vec<i64> = Vec::new();
+    var na: i64 = 0;
+    var nm: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val k: i64 = net.buses.get(i).kind;
+        if k != PF_SLACK {
+            ang_at.push(na);
+            na = na + 1;
+        } else {
+            ang_at.push(-1);
+        }
+        if k == PF_PQ {
+            mag_at.push(nm);
+            nm = nm + 1;
+        } else {
+            mag_at.push(-1);
+        }
+        i = i + 1;
+    }
+    // B': -1/x off the diagonal, sum of 1/x on it (no shunts, taps, r)
+    var bp: Vec<f64> = pf_zeros(na * na);
+    var k: i64 = 0;
+    while k < net.branches.len() {
+        val br: PfBranch = net.branches.get(k);
+        val s: f64 = 1.0 / br.x;
+        val a: i64 = ang_at.get(br.from);
+        val c: i64 = ang_at.get(br.to);
+        if a >= 0 {
+            bp.set(a * na + a, bp.get(a * na + a) + s);
+        }
+        if c >= 0 {
+            bp.set(c * na + c, bp.get(c * na + c) + s);
+        }
+        if a >= 0 && c >= 0 {
+            bp.set(a * na + c, bp.get(a * na + c) - s);
+            bp.set(c * na + a, bp.get(c * na + a) - s);
+        }
+        k = k + 1;
+    }
+    // B'' = -Im(Ybus) over the PQ buses
+    var bpp: Vec<f64> = pf_zeros(nm * nm);
+    i = 0;
+    while i < n {
+        if mag_at.get(i) >= 0 {
+            var j: i64 = 0;
+            while j < n {
+                if mag_at.get(j) >= 0 {
+                    bpp.set(mag_at.get(i) * nm + mag_at.get(j), 0.0 - y.b.get(i * n + j));
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val lup: PfLu = pf_lu(bp, na);
+    val lupp: PfLu = pf_lu(bpp, nm);
+    var v: Vec<f64> = Vec::new();
+    var th: Vec<f64> = Vec::new();
+    pf_start(net, &mut v, &mut th);
+    var it: i64 = 0;
+    var mis: f64 = 1.0e30;
+    while it < max_iter {
+        var s: Vec<f64> = pf_injections(&y, &v, &th);
+        var dp: Vec<f64> = pf_zeros(na);
+        mis = 0.0;
+        i = 0;
+        while i < n {
+            if ang_at.get(i) >= 0 {
+                val bus: PfBus = net.buses.get(i);
+                val d: f64 = (bus.pg - bus.pl) - s.get(i);
+                mis = math_max_f64(mis, math_fabs(d));
+                dp.set(ang_at.get(i), d / v.get(i));
+            }
+            if mag_at.get(i) >= 0 {
+                val bus2: PfBus = net.buses.get(i);
+                mis = math_max_f64(mis, math_fabs((bus2.qg - bus2.ql) - s.get(n + i)));
+            }
+            i = i + 1;
+        }
+        if mis < tol {
+            return pf_finish(net, &y, v, th, true, it, mis);
+        }
+        val dth: Vec<f64> = pf_lu_solve(&lup, &dp);
+        i = 0;
+        while i < n {
+            if ang_at.get(i) >= 0 {
+                th.set(i, th.get(i) + dth.get(ang_at.get(i)));
+            }
+            i = i + 1;
+        }
+        s = pf_injections(&y, &v, &th);
+        var dq: Vec<f64> = pf_zeros(nm);
+        i = 0;
+        while i < n {
+            if mag_at.get(i) >= 0 {
+                val bus: PfBus = net.buses.get(i);
+                dq.set(mag_at.get(i), ((bus.qg - bus.ql) - s.get(n + i)) / v.get(i));
+            }
+            i = i + 1;
+        }
+        val dv: Vec<f64> = pf_lu_solve(&lupp, &dq);
+        i = 0;
+        while i < n {
+            if mag_at.get(i) >= 0 {
+                v.set(i, v.get(i) + dv.get(mag_at.get(i)));
+            }
+            i = i + 1;
+        }
+        it = it + 1;
+    }
+    return pf_finish(net, &y, v, th, false, it, mis);
+}
+
+// ─── DC power flow ───
+
+/// Bus angles of the DC approximation (slack bus angle as given, |V| = 1,
+/// r and charging ignored): returns theta per bus.
+pub fn pf_dc(net: &PfNetwork) -> Vec<f64> {
+    val n: i64 = net.buses.len();
+    var at: Vec<i64> = Vec::new();
+    var slack: i64 = 0;
+    var na: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if net.buses.get(i).kind == PF_SLACK {
+            at.push(-1);
+            slack = i;
+        } else {
+            at.push(na);
+            na = na + 1;
+        }
+        i = i + 1;
+    }
+    val th_s: f64 = net.buses.get(slack).theta;
+    var bm: Vec<f64> = pf_zeros(na * na);
+    var p: Vec<f64> = pf_zeros(na);
+    i = 0;
+    while i < n {
+        if at.get(i) >= 0 {
+            val b: PfBus = net.buses.get(i);
+            p.set(at.get(i), b.pg - b.pl);
+        }
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < net.branches.len() {
+        val br: PfBranch = net.branches.get(k);
+        val s: f64 = 1.0 / (br.x * br.tap);
+        val a: i64 = at.get(br.from);
+        val c: i64 = at.get(br.to);
+        // a phase shifter injects -s*shift at from and +s*shift at to;
+        // a slack-side angle moves to the right-hand side
+        if a >= 0 {
+            bm.set(a * na + a, bm.get(a * na + a) + s);
+            p.set(a, p.get(a) + s * br.shift);
+            if c < 0 {
+                p.set(a, p.get(a) + s * th_s);
+            }
+        }
+        if c >= 0 {
+            bm.set(c * na + c, bm.get(c * na + c) + s);
+            p.set(c, p.get(c) - s * br.shift);
+            if a < 0 {
+                p.set(c, p.get(c) + s * th_s);
+            }
+        }
+        if a >= 0 && c >= 0 {
+            bm.set(a * na + c, bm.get(a * na + c) - s);
+            bm.set(c * na + a, bm.get(c * na + a) - s);
+        }
+        k = k + 1;
+    }
+    val lu: PfLu = pf_lu(bm, na);
+    val x: Vec<f64> = pf_lu_solve(&lu, &p);
+    var th: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        if at.get(i) >= 0 {
+            th.push(x.get(at.get(i)));
+        } else {
+            th.push(th_s);
+        }
+        i = i + 1;
+    }
+    return th;
+}
+
+/// DC flow on branch k from the angles of `pf_dc`.
+pub fn pf_dc_flow(net: &PfNetwork, th: &Vec<f64>, k: i64) -> f64 {
+    val br: PfBranch = net.branches.get(k);
+    return (th.get(br.from) - th.get(br.to) - br.shift) / (br.x * br.tap);
+}
+
+// ─── Results ───
+
+/// Flows at both ends of branch k and its losses (pu).
+pub fn pf_branch_flow(net: &PfNetwork, r: &PfResult, k: i64) -> PfFlow {
+    val br: PfBranch = net.branches.get(k);
+    val yy: Vec<Complex> = pf_branch_y(&br);
+    val vf: Complex = complex_from_polar(r.v.get(br.from), r.theta.get(br.from));
+    val vt: Complex = complex_from_polar(r.v.get(br.to), r.theta.get(br.to));
+    val i_f: Complex = complex_add(complex_mul(yy.get(0), vf), complex_mul(yy.get(1), vt));
+    val i_t: Complex = complex_add(complex_mul(yy.get(2), vf), complex_mul(yy.get(3), vt));
+    val sf: Complex = complex_mul(vf, complex_conj(i_f));
+    val st: Complex = complex_mul(vt, complex_conj(i_t));
+    return PfFlow {
+        p_from: sf.re, q_from: sf.im, p_to: st.re, q_to: st.im, p_loss: sf.re + st.re, q_loss: sf.im + st.im
+    };
+}
+
+/// Total losses: the sum of all bus injections, [P, Q].
+pub fn pf_total_losses(r: &PfResult) -> Complex {
+    var p: f64 = 0.0;
+    var q: f64 = 0.0;
+    var i: i64 = 0;
+    while i < r.p.len() {
+        p = p + r.p.get(i);
+        q = q + r.q.get(i);
+        i = i + 1;
+    }
+    return complex(p, q);
+}
+
+/// Generation at bus i: injection plus load.
+pub fn pf_generation(net: &PfNetwork, r: &PfResult, i: i64) -> Complex {
+    val b: PfBus = net.buses.get(i);
+    return complex(r.p.get(i) + b.pl, r.q.get(i) + b.ql);
+}
+
+pub fn pf_deg(rad: f64) -> f64 {
+    return rad * 57.29577951308232;
+}

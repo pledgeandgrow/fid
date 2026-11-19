@@ -1,0 +1,140 @@
+// stdlib/kalman: constant-velocity tracking with a fixed noise sequence by the linear KF, the EKF and the UKF (the two agree with the KF on a linear model), then EKF and UKF on a nonlinear range measurement; values from a numpy replica
+// Expected output:
+// kf x = [15.0180; 1.0002] P diag 0.2064 0.0331 mean nis 0.4513
+// ekf (linear) equals kf: true
+// ukf (linear) equals kf: true
+// ekf x = [9.4922; 0.4937]
+// ukf x = [9.4913; 0.4930]
+// singular: kalman: innovation covariance is singular
+use lqr;
+use kalman;
+use quat;
+use math;
+
+fn cv_f(x: Vec<f64>, u: Vec<f64>) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    o.push(x.get(0) + x.get(1));
+    o.push(x.get(1));
+    return o;
+}
+
+// row-major [1 1; 0 1]
+fn cv_fj(x: Vec<f64>, u: Vec<f64>) -> Vec<f64> {
+    val m: DMat = dm_parse("1 1 0 1");
+    return dm_to_vec(&m);
+}
+
+fn pos_h(x: Vec<f64>) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    o.push(x.get(0));
+    return o;
+}
+
+fn pos_hj(x: Vec<f64>) -> Vec<f64> {
+    val m: DMat = dm_parse("1 0");
+    return dm_to_vec(&m);
+}
+
+// range to a beacon 5 above the track
+fn range_h(x: Vec<f64>) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    o.push(math_sqrt(x.get(0) * x.get(0) + 25.0));
+    return o;
+}
+
+fn range_hj(x: Vec<f64>) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    o.push(x.get(0) / math_sqrt(x.get(0) * x.get(0) + 25.0));
+    o.push(0.0);
+    return o;
+}
+
+fn scalar(v: f64) -> DMat {
+    var z: DMat = dm_zeros(1, 1);
+    dm_set(&mut z, 0, 0, v);
+    return z;
+}
+
+fn main() -> i64 {
+    val noise: DMat = dm_parse("0.31 -0.52 0.12 0.84 -0.27 -0.66 0.45 0.08 -0.91 0.37 0.22 -0.14 0.59 -0.43 0.05");
+    val model: Vec<DMat> = kf_cv_model(1.0, 0.01);
+    val f: DMat = model.get(0);
+    val q: DMat = model.get(1);
+    val r: DMat = dm_parse("0.5");
+    val x0: DMat = dm_parse("0; 0");
+    val p0: DMat = dm_parse("10 0; 0 10");
+    var kf: Kf = kf_new(f, dm_parse("1 0"), q, r, x0, p0);
+    var ekf: Ekf = ekf_new(x0, p0, q, r);
+    var ukf: Ukf = ukf_new(x0, p0, q, r, 1.0, 2.0, 1.0);
+    var nou: Vec<f64> = Vec::new();
+    var nis: f64 = 0.0;
+    var ek_ok: bool = true;
+    var uk_ok: bool = true;
+    var k: i64 = 1;
+    while k <= 15 {
+        val z: DMat = scalar((k as f64) + dm_get(&noise, 0, k - 1));
+        kf_predict(&mut kf);
+        match kf_update(&mut kf, &z) {
+            Result::Ok(v) => {
+                nis = nis + v;
+            }
+            Result::Err(e) => {
+                println(e);
+            }
+        }
+        ekf_predict(&mut ekf, cv_f, cv_fj, &nou);
+        ekf_update(&mut ekf, &z, pos_h, pos_hj);
+        ukf_predict(&mut ukf, cv_f, &nou);
+        ukf_update(&mut ukf, &z, pos_h);
+        if dm_max_diff(&ekf.x, &kf.x) > 0.000000001 || dm_max_diff(&ekf.p, &kf.p) > 0.000000001 {
+            ek_ok = false;
+        }
+        if dm_max_diff(&ukf.x, &kf.x) > 0.000000001 || dm_max_diff(&ukf.p, &kf.p) > 0.000000001 {
+            uk_ok = false;
+        }
+        k = k + 1;
+    }
+    println("kf x = " + dm_to_str(&kf.x, 4) + " P diag " + rmath_fmt(dm_get(&kf.p, 0, 0), 4) + " " + rmath_fmt(dm_get(&kf.p, 1, 1), 4) + " mean nis " + rmath_fmt(nis / 15.0, 4));
+    if ek_ok {
+        println("ekf (linear) equals kf: true");
+    } else {
+        println("ekf (linear) equals kf: false");
+    }
+    if uk_ok {
+        println("ukf (linear) equals kf: true");
+    } else {
+        println("ukf (linear) equals kf: false");
+    }
+
+    // nonlinear: the track starts at 2 and moves 0.5 per step; the range
+    // to a beacon 5 above it is measured
+    val rn: DMat = dm_parse("0.01");
+    val xs: DMat = dm_parse("1; 0");
+    val ps: DMat = dm_parse("4 0; 0 1");
+    var e2: Ekf = ekf_new(xs, ps, q, rn);
+    var u2: Ukf = ukf_new(xs, ps, q, rn, 0.5, 2.0, 1.0);
+    k = 1;
+    while k <= 15 {
+        val tx: f64 = 2.0 + 0.5 * (k as f64);
+        val z: DMat = scalar(math_sqrt(tx * tx + 25.0) + 0.1 * dm_get(&noise, 0, k - 1));
+        ekf_predict(&mut e2, cv_f, cv_fj, &nou);
+        ekf_update(&mut e2, &z, range_h, range_hj);
+        ukf_predict(&mut u2, cv_f, &nou);
+        ukf_update(&mut u2, &z, range_h);
+        k = k + 1;
+    }
+    println("ekf x = " + dm_to_str(&e2.x, 4));
+    println("ukf x = " + dm_to_str(&u2.x, 4));
+
+    // a zero measurement noise and a zero H: S = 0
+    var bad: Kf = kf_new(f, dm_parse("0 0"), q, dm_parse("0"), x0, p0);
+    match kf_update(&mut bad, &scalar(1.0)) {
+        Result::Ok(v) => {
+            println("singular: updated?");
+        }
+        Result::Err(e) => {
+            println("singular: " + e);
+        }
+    }
+    return 0;
+}

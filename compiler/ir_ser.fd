@@ -2,8 +2,7 @@
 // Same AwBuf/ArBuf byte codec as ast_ser.fd; instructions reference
 // functions/strings/globals by name, so a replayed IrFunction needs no
 // fixups — names re-intern against the live module tables.
-use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::ast_ser; use compiler::inc;
- fn iw_bool(b: & mut AwBuf, v: bool) {
+use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::ast_ser; use compiler::inc; fn iw_bool(b: & mut AwBuf, v: bool) {
     if v {
         aw_i64(b, 1);
     } else {
@@ -30,6 +29,35 @@ fn ir_vec_i64(r: & mut ArBuf) -> Vec<i64> {
     var i: i64 = 0;
     while i < n {
         v.push(ar_i64(r));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// SP13: a byte buffer (each element 0..255) as its length and one byte per
+/// element. iw_vec_i64 wrote 8 bytes per byte, and the lowered-IR cache
+/// nests buffers twice (a 357 MB cache, then an OOM on the next build).
+fn iw_bytes(b: & mut AwBuf, v: Vec<i64>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        aw_u8(b, v.get(i));
+        i = i + 1;
+    }
+}
+
+/// SP13: reads what iw_bytes wrote; a length past the end of the buffer
+/// sets r.ok false (a damaged cache file, not a huge allocation).
+fn ir_bytes(r: & mut ArBuf) -> Vec<i64> {
+    var n: i64 = ar_i64(r);
+    var v: Vec<i64> = Vec::new();
+    if !r.ok || n < 0 || n > r.v.len() {
+        r.ok = false;
+        return v;
+    }
+    var i: i64 = 0;
+    while i < n {
+        v.push(ar_u8(r));
         i = i + 1;
     }
     return v;
@@ -686,6 +714,13 @@ fn iw_inst(b: & mut AwBuf, x: Inst) {
             aw_i64(b, t1);
             aw_i64(b, t2);
         }
+        Inst::Switch(sv, sk, st, sd) => {
+            aw_i64(b, 43);
+            aw_i64(b, sv);
+            iw_vec_i64(b, sk);
+            iw_vec_i64(b, st);
+            aw_i64(b, sd);
+        }
         Inst::Return(v) => {
             aw_i64(b, 16);
             iw_optvalueid(b, v);
@@ -1006,6 +1041,12 @@ fn ir_inst(r: & mut ArBuf) -> Inst {
     if t == 42 {
         return Inst::StructCopy(ar_i64(r), ar_i64(r), ir_irtype(r));
     }
+    if t == 43 {
+        var sv: i64 = ar_i64(r);
+        var sk: Vec<i64> = ir_vec_i64(r);
+        var st: Vec<i64> = ir_vec_i64(r);
+        return Inst::Switch(sv, sk, st, ar_i64(r));
+    }
     r.ok = false;
     return Inst::Unreachable;
 }
@@ -1111,6 +1152,8 @@ pub fn iw_irfunc(b: & mut AwBuf, f: IrFunction) {
     }
     iw_bool(b, f.internal_conv);
     iw_bool(b, f.is_constant_time);
+    iw_bool(b, f.has_secret);
+    iw_vec_i64(b, f.secret_values);
 }
 
 /// Deserialize an IrFunction; r.ok is false on any truncation/desync.
@@ -1192,6 +1235,8 @@ pub fn ir_irfunc(r: & mut ArBuf) -> IrFunction {
     }
     f.internal_conv = ir_bool(r);
     f.is_constant_time = ir_bool(r);
+    f.has_secret = ir_bool(r);
+    f.secret_values = ir_vec_i64(r);
     return f;
 }
 
@@ -1216,7 +1261,14 @@ pub fn IrcEntry_new(k: i64, n: str, b: Vec<i64>) -> IrcEntry {
 pub var g_irc_on: bool = false; pub var g_irc_path: str = ""; pub var g_irc_salt: i64 = 0; pub var g_irc_old: Vec<IrcEntry> = Vec::new(); pub var g_irc_ix: i64 = 0; pub var g_irc_new: Vec<IrcEntry> = Vec::new(); pub var g_irc_hits: i64 = 0;  /// Types a replayed record carried: the caller re-registers them into the
 /// lowerer's own_types (Lowerer is not importable here -- circular dep).
 pub var g_irc_rtypes: Vec<Type> = Vec::new();
- @wrapping fn irc_hash_bytes(v: Vec<i64>) -> i64 {
+// SP8: `fid serve` keeps the lowered-IR cache in memory (g_irc_mem, set by
+// main.fd cmd_serve from FID_SERVE_IRCACHE=1) when FID_IRCACHE names no
+// file: irc_finish keeps this build's records and their salt here, and the
+// next irc_begin with the same salt starts from them.
+pub var g_irc_mem: bool = false;
+pub var g_irc_mem_salt: i64 = 0;
+pub var g_irc_mem_recs: Vec<IrcEntry> = Vec::new();
+@wrapping fn irc_hash_bytes(v: Vec<i64>) -> i64 {
     var h: i64 = 1469598103934665603;
     var i: i64 = 0;
     while i < v.len() {
@@ -1305,26 +1357,21 @@ pub fn irc_fn_key(f: Func) -> i64 {
 
 fn irc_rentry(r: & mut ArBuf) -> IrcEntry {
     var e: IrcEntry = IrcEntry_new(ar_i64(r), ar_str(r), Vec::new());
-    var n: i64 = ar_i64(r);
-    var i: i64 = 0;
-    while i < n {
-        e.bytes.push(ar_i64(r));
-        i = i + 1;
-    }
+    e.bytes = ir_bytes(r);
     return e;
 }
 
 fn irc_wentry(b: & mut AwBuf, e: IrcEntry) {
     aw_i64(b, e.key);
     aw_str(b, e.name);
-    iw_vec_i64(b, e.bytes);
+    iw_bytes(b, e.bytes);
 }
 
 /// Initialize the cache for one lower() call; returns immediately when
 /// FID_IRCACHE is unset or the salt differs (file rewritten at finish).
 pub fn irc_begin(program: Program) {
     var path: str = env_or_empty("FID_IRCACHE");
-    if str_len(path) == 0 {
+    if str_len(path) == 0 && !g_irc_mem {
         g_irc_on = false;
         return;
     }
@@ -1335,6 +1382,20 @@ pub fn irc_begin(program: Program) {
     g_irc_old = Vec::new();
     g_irc_new = Vec::new();
     g_irc_ix = HashMap_new();
+    // SP8: no file, `fid serve`'s memory (g_irc_mem): the last build's
+    // records, when its declaration salt is this one's
+    if str_len(path) == 0 {
+        if g_irc_mem_salt == g_irc_salt {
+            var mi: i64 = 0;
+            while mi < g_irc_mem_recs.len() {
+                var me: IrcEntry = g_irc_mem_recs.get(mi);
+                g_irc_old.push(me);
+                HashMap_insert_i(g_irc_ix, me.key, g_irc_old.len());
+                mi = mi + 1;
+            }
+        }
+        return;
+    }
     if p_file_exists(path) == 0 {
         return;
     }
@@ -1347,7 +1408,8 @@ pub fn irc_begin(program: Program) {
     var ver: i64 = ar_i64(& mut r);
     var salt: i64 = ar_i64(& mut r);
     var count: i64 = ar_i64(& mut r);
-    if magic != 5062211 || ver != 1 || salt != g_irc_salt {
+    // ver 2 (SP13): byte buffers one byte per byte (iw_bytes)
+    if magic != 5062211 || ver != 2 || salt != g_irc_salt {
         return;
     }
     var i: i64 = 0;
@@ -1393,12 +1455,12 @@ pub fn irc_record(key: i64, f: IrFunction, spawned: Vec<IrFunction>, types: Vec<
         var sb: AwBuf = awbuf_new();
         iw_irfunc(& mut sb, spawned.get(i));
         aw_str(& mut b, spawned.get(i).name);
-        iw_vec_i64(& mut b, awbuf_bytes(& sb));
+        iw_bytes(& mut b, awbuf_bytes(& sb));
         i = i + 1;
     }
     var mb: AwBuf = awbuf_new();
     iw_irfunc(& mut mb, f);
-    iw_vec_i64(& mut b, awbuf_bytes(& mb));
+    iw_bytes(& mut b, awbuf_bytes(& mb));
     g_irc_new.push(IrcEntry_new(key, f.name, awbuf_bytes(& b)));
 }
 
@@ -1436,7 +1498,7 @@ pub fn irc_replay(r: & mut ArBuf, module: & mut IrModule, l: & mut Lowerer) -> I
     var i: i64 = 0;
     while i < nsp {
         var nm: str = ar_str(r);
-        var sb: Vec<i64> = ir_vec_i64(r);
+        var sb: Vec<i64> = ir_bytes(r);
         var sr: ArBuf = arbuf_new(sb);
         var sf: IrFunction = ir_irfunc(& mut sr);
         if !sr.ok {
@@ -1447,7 +1509,7 @@ pub fn irc_replay(r: & mut ArBuf, module: & mut IrModule, l: & mut Lowerer) -> I
         IrModule_add_function(module, sf);
         i = i + 1;
     }
-    var mb: Vec<i64> = ir_vec_i64(r);
+    var mb: Vec<i64> = ir_bytes(r);
     var mr: ArBuf = arbuf_new(mb);
     var f: IrFunction = ir_irfunc(& mut mr);
     if !mr.ok {
@@ -1462,9 +1524,17 @@ pub fn irc_finish() {
     if !g_irc_on {
         return;
     }
+    // SP8: in memory (`fid serve`, g_irc_mem): keep the records for the
+    // next build
+    if str_len(g_irc_path) == 0 {
+        g_irc_mem_recs = g_irc_new;
+        g_irc_mem_salt = g_irc_salt;
+        g_irc_on = false;
+        return;
+    }
     var b: AwBuf = awbuf_new();
     aw_i64(& mut b, 5062211);
-    aw_i64(& mut b, 1);
+    aw_i64(& mut b, 2);
     aw_i64(& mut b, g_irc_salt);
     aw_i64(& mut b, g_irc_new.len());
     var i: i64 = 0;
@@ -1474,4 +1544,2992 @@ pub fn irc_finish() {
     }
     p_file_write_vec(g_irc_path, awbuf_bytes(& b));
     g_irc_on = false;
+}
+
+// --- CS1: the mid-end's per-function memo (FID_MECACHE) ---
+// The rules (rules.fd rules_run) and the e-graph (egraph.fd egraph_run)
+// rewrite each function alone: what they do to it depends on its own IR,
+// on the switches of the run and, for the rules' call merging, on the
+// effect masks of the functions it calls. `emit hello.fd --nat` ran both
+// over the same core and runtime functions on every build (rules 48 ms +
+// e-graph 140 ms of 631, competitive roadmap CS1). The memo keeps, per
+// (pass, content hash of the function before the pass, the run's
+// switches, the callees' masks, this compiler), what the pass changed: the
+// instructions it rewrote and the blocks whose instruction lists it
+// changed (nothing at all, for most functions), the counts the pass
+// reported and the content hash after it. A later build that meets a
+// function hashing the same applies the change and skips the pass; the
+// rules hand each function's hash after them to the e-graph that follows
+// (mec_chain_*), so a function that hits both is hashed once.
+//
+// Exactness: the content hash covers everything iw_irfunc writes (every
+// field of the function and of each instruction). The passes log where
+// they write (mec_log_inst/mec_log_block, called by eg_set_inst,
+// ru_set_inst and eg_place); a change is recorded only when replaying it
+// on the function as it was before the pass gives the pass's own result
+// (the same hash, mec_note), so a write the log missed is never replayed.
+// Each entry of the file carries a check word; loading stops at the first
+// that does not match (a file another process was writing).
+//
+// The file: <TEMP>/fid-mec-<hash of this compiler>.bin, so a rebuilt
+// compiler starts empty. FID_MECACHE=<file> names another file;
+// FID_MECACHE=off (0, no, none, false), FIDES_NO_CACHE=1 or `--no-cache`
+// turn the memo off (no read, no write). FID_RULE_STATS / FID_EGRAPH_STATS
+// run the pass on every function (their counters count each rewrite).
+// FID_MECACHE_STATS=1: "[mecache] <pass>: H hits, M misses, R recorded".
+// Entries used or made by a build are written first, then the older ones,
+// up to MEC_MAX_ENTRIES; a build that made no entry writes nothing.
+// tests/tooling/mecache-check.sh checks all of it.
+
+pub const MEC_RULES: i64 = 1;
+pub const MEC_EGRAPH: i64 = 2;
+const MEC_MAGIC: i64 = 0x3143454D;
+const MEC_VERSION: i64 = 1;
+const MEC_MAX_ENTRIES: i64 = 20000;
+
+pub struct MecEntry {
+    pub key: i64,
+    pub name_h: i64,
+    pub post: i64,
+    pub c1: i64,
+    pub c2: i64,
+    pub c3: i64,
+    pub delta: Vec<i64>,
+}
+
+pub fn MecEntry_new(key: i64, name_h: i64, post: i64, c1: i64, c2: i64, c3: i64, delta: Vec<i64>) -> MecEntry {
+    return MecEntry {
+        key: key, name_h: name_h, post: post, c1: c1, c2: c2, c3: c3, delta: delta
+    };
+}
+
+/// 0: not loaded, 1: on (g_mec_path loaded), 2: never used
+var g_mec_state: i64 = 0;
+var g_mec_path: str = "";
+/// The entries of the file (or of this process's last build), their index
+/// (key -> position + 1) and whether this build used each.
+var g_mec_old: Vec<MecEntry> = Vec::new();
+var g_mec_used: Vec<i64> = Vec::new();
+var g_mec_ix: i64 = 0;
+/// The entries this build made.
+var g_mec_new: Vec<MecEntry> = Vec::new();
+/// This pass's counts (mec_pass_begin / mec_pass_end).
+var g_mec_pass_hits: i64 = 0;
+var g_mec_pass_misses: i64 = 0;
+var g_mec_pass_kept: i64 = 0;
+/// Where the running pass wrote (positions in f.insts, f.blocks).
+var g_mec_log_on: bool = false;
+var g_mec_log_insts: Vec<i64> = Vec::new();
+var g_mec_log_blocks: Vec<i64> = Vec::new();
+/// Per function of the module, in order: its hash after the rules
+/// (0: unknown), its name and instruction count, for the e-graph.
+var g_mec_chain_h: Vec<i64> = Vec::new();
+var g_mec_chain_name: Vec<str> = Vec::new();
+var g_mec_chain_n: Vec<i64> = Vec::new();
+
+@wrapping pub fn mec_mix(h: i64, v: i64) -> i64 {
+    var x: i64 = (h ^ v) * 1099511628211;
+    return x ^ (x >> 29);
+}
+
+pub fn mec_b(b: bool) -> i64 {
+    if b {
+        return 1;
+    }
+    return 2;
+}
+
+// The content hash: everything iw_irfunc writes, in its order, one mixed
+// word per field (strings by their hash_source), with no byte buffer in
+// between: through an AwBuf it cost twice what the rules pass costs.
+
+fn mh_s(h: i64, s: str) -> i64 {
+    return mec_mix(h, hash_source(s));
+}
+
+fn mh_vec(h0: i64, v: Vec<i64>) -> i64 {
+    var h: i64 = mec_mix(h0, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        h = mec_mix(h, v.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+fn mh_ty(h0: i64, t: IrType) -> i64 {
+    var h: i64 = h0;
+    match t {
+        IrType::I8 => {
+            h = mec_mix(h, 0);
+        }
+        IrType::I16 => {
+            h = mec_mix(h, 1);
+        }
+        IrType::I32 => {
+            h = mec_mix(h, 2);
+        }
+        IrType::I64 => {
+            h = mec_mix(h, 3);
+        }
+        IrType::U8 => {
+            h = mec_mix(h, 4);
+        }
+        IrType::U16 => {
+            h = mec_mix(h, 5);
+        }
+        IrType::U32 => {
+            h = mec_mix(h, 6);
+        }
+        IrType::U64 => {
+            h = mec_mix(h, 7);
+        }
+        IrType::F32 => {
+            h = mec_mix(h, 8);
+        }
+        IrType::F64 => {
+            h = mec_mix(h, 9);
+        }
+        IrType::Bool => {
+            h = mec_mix(h, 10);
+        }
+        IrType::Ptr(inner) => {
+            h = mh_ty(mec_mix(h, 11), inner);
+        }
+        IrType::Struct(n) => {
+            h = mh_s(mec_mix(h, 12), n);
+        }
+        IrType::Array(elem, count) => {
+            h = mec_mix(mh_ty(mec_mix(h, 13), elem), count);
+        }
+        IrType::Void => {
+            h = mec_mix(h, 14);
+        }
+        IrType::Never => {
+            h = mec_mix(h, 15);
+        }
+        IrType::Opaque(n) => {
+            h = mh_s(mec_mix(h, 16), n);
+        }
+        IrType::Generic(n, ps) => {
+            h = mec_mix(mh_s(mec_mix(h, 17), n), ps.len());
+            var i: i64 = 0;
+            while i < ps.len() {
+                h = mh_ty(h, ps.get(i));
+                i = i + 1;
+            }
+        }
+    }
+    return h;
+}
+
+fn mh_optty(h: i64, o: OptIrType) -> i64 {
+    match o {
+        OptIrType::Some(t) => {
+            return mh_ty(mec_mix(h, 1), t);
+        }
+        OptIrType::None => {
+        }
+    }
+    return mec_mix(h, 0);
+}
+
+fn mh_optu64(h: i64, o: OptU64) -> i64 {
+    match o {
+        OptU64::Some(v) => {
+            return mec_mix(mec_mix(h, 1), v);
+        }
+        OptU64::None => {
+        }
+    }
+    return mec_mix(h, 0);
+}
+
+fn mh_region(h: i64, rg: Region) -> i64 {
+    match rg {
+        Region::Stack => {
+            return mec_mix(h, 0);
+        }
+        Region::Heap => {
+            return mec_mix(h, 1);
+        }
+        Region::Static => {
+            return mec_mix(h, 2);
+        }
+        Region::Named(n) => {
+            return mh_s(mec_mix(h, 3), n);
+        }
+    }
+    return h;
+}
+
+fn mh_effects(h0: i64, s: EffectSet) -> i64 {
+    var h: i64 = mec_mix(h0, s.effects.len());
+    var i: i64 = 0;
+    while i < s.effects.len() {
+        var t: i64 = 0;
+        var ef: Effect = s.effects.get(i);
+        match ef {
+            Effect::Alloc => {
+                t = 0;
+            }
+            Effect::IO => {
+                t = 1;
+            }
+            Effect::Net => {
+                t = 2;
+            }
+            Effect::Spawn => {
+                t = 3;
+            }
+            Effect::Diverge => {
+                t = 4;
+            }
+            Effect::Read => {
+                t = 5;
+            }
+            Effect::Write => {
+                t = 6;
+            }
+            Effect::Diff => {
+                t = 7;
+            }
+            Effect::Noise => {
+                t = 8;
+            }
+            Effect::Comm => {
+                t = 9;
+            }
+        }
+        h = mec_mix(h, t);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn mh_meta(h0: i64, m: ValueMeta) -> i64 {
+    var h: i64 = mh_effects(mh_region(mh_ty(h0, m.ty), m.region), m.effects);
+    h = mec_mix(mec_mix(mh_optu64(h, m.source_line), mec_b(m.in_sandbox)), mec_b(m.is_linear));
+    var t: i64 = 0;
+    match m.borrow_kind {
+        BorrowKind::None => {
+            t = 0;
+        }
+        BorrowKind::Shared => {
+            t = 1;
+        }
+        BorrowKind::Mut => {
+            t = 2;
+        }
+    }
+    return mec_mix(h, t);
+}
+
+fn mh_binop(o: BinOp) -> i64 {
+    var t: i64 = 0;
+    match o {
+        BinOp::Add => {
+            t = 0;
+        }
+        BinOp::Sub => {
+            t = 1;
+        }
+        BinOp::Mul => {
+            t = 2;
+        }
+        BinOp::Div => {
+            t = 3;
+        }
+        BinOp::Mod => {
+            t = 4;
+        }
+        BinOp::Eq => {
+            t = 5;
+        }
+        BinOp::Neq => {
+            t = 6;
+        }
+        BinOp::Lt => {
+            t = 7;
+        }
+        BinOp::Gt => {
+            t = 8;
+        }
+        BinOp::LtEq => {
+            t = 9;
+        }
+        BinOp::GtEq => {
+            t = 10;
+        }
+        BinOp::And => {
+            t = 11;
+        }
+        BinOp::Or => {
+            t = 12;
+        }
+        BinOp::BitAnd => {
+            t = 13;
+        }
+        BinOp::BitOr => {
+            t = 14;
+        }
+        BinOp::BitXor => {
+            t = 15;
+        }
+        BinOp::Shl => {
+            t = 16;
+        }
+        BinOp::Shr => {
+            t = 17;
+        }
+    }
+    return t;
+}
+
+fn mh_unop(o: UnaryOp) -> i64 {
+    var t: i64 = 0;
+    match o {
+        UnaryOp::Neg => {
+            t = 0;
+        }
+        UnaryOp::Not => {
+            t = 1;
+        }
+        UnaryOp::BitNot => {
+            t = 2;
+        }
+    }
+    return t;
+}
+
+fn mh_strvids(h0: i64, v: Vec<StringValueId>) -> i64 {
+    var h: i64 = mec_mix(h0, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        h = mec_mix(mh_s(h, v.get(i).name), v.get(i).id);
+        i = i + 1;
+    }
+    return h;
+}
+
+/// One instruction, as iw_inst writes it (the same tags).
+fn mh_inst(h0: i64, x: Inst) -> i64 {
+    var h: i64 = h0;
+    match x {
+        Inst::ConstInt(v, ty) => {
+            h = mh_ty(mec_mix(mec_mix(h, 0), v), ty);
+        }
+        Inst::ConstFloat(v, ty) => {
+            h = mh_ty(mec_mix(mec_mix(h, 1), p_f64_to_bits(v)), ty);
+        }
+        Inst::ConstBool(v) => {
+            h = mec_mix(mec_mix(h, 2), mec_b(v));
+        }
+        Inst::ConstStr(s) => {
+            h = mh_s(mec_mix(h, 3), s);
+        }
+        Inst::ConstFnRef(s) => {
+            h = mh_s(mec_mix(h, 4), s);
+        }
+        Inst::ConstNull(ty) => {
+            h = mh_ty(mec_mix(h, 5), ty);
+        }
+        Inst::GlobalAddr(n, ty) => {
+            h = mh_ty(mh_s(mec_mix(h, 6), n), ty);
+        }
+        Inst::BinOp(o, l, rr, ty) => {
+            h = mh_ty(mec_mix(mec_mix(mec_mix(mec_mix(h, 7), mh_binop(o)), l), rr), ty);
+        }
+        Inst::UnaryOp(o, v, ty) => {
+            h = mh_ty(mec_mix(mec_mix(mec_mix(h, 8), mh_unop(o)), v), ty);
+        }
+        Inst::Alloca(ty, rg) => {
+            h = mh_region(mh_ty(mec_mix(h, 9), ty), rg);
+        }
+        Inst::Load(a, ty) => {
+            h = mh_ty(mec_mix(mec_mix(h, 10), a), ty);
+        }
+        Inst::Store(a, v, ty) => {
+            h = mh_optty(mec_mix(mec_mix(mec_mix(h, 11), a), v), ty);
+        }
+        Inst::GetFieldPtr(a, f, ty) => {
+            h = mh_ty(mec_mix(mec_mix(mec_mix(h, 12), a), f), ty);
+        }
+        Inst::GetElemPtr(a, ix, ty) => {
+            h = mh_ty(mec_mix(mec_mix(mec_mix(h, 13), a), ix), ty);
+        }
+        Inst::Jump(t) => {
+            h = mec_mix(mec_mix(h, 14), t);
+        }
+        Inst::Branch(c, t1, t2) => {
+            h = mec_mix(mec_mix(mec_mix(mec_mix(h, 15), c), t1), t2);
+        }
+        Inst::Switch(sv, sk, st, sd) => {
+            h = mec_mix(mh_vec(mh_vec(mec_mix(mec_mix(h, 43), sv), sk), st), sd);
+        }
+        Inst::Return(v) => {
+            h = mec_mix(h, 16);
+            match v {
+                OptValueId::Some(rv) => {
+                    h = mec_mix(mec_mix(h, 1), rv);
+                }
+                OptValueId::None => {
+                    h = mec_mix(h, 0);
+                }
+            }
+        }
+        Inst::Unreachable => {
+            h = mec_mix(h, 17);
+        }
+        Inst::Call(n, args, ty, fx) => {
+            h = mh_effects(mh_ty(mh_vec(mh_s(mec_mix(h, 18), n), args), ty), fx);
+        }
+        Inst::CallPtr(p, args, ty, fx, tail) => {
+            h = mec_mix(mh_effects(mh_ty(mh_vec(mec_mix(mec_mix(h, 19), p), args), ty), fx), mec_b(tail));
+        }
+        Inst::DynCall(t, m, args, ty, fx) => {
+            h = mh_effects(mh_ty(mh_vec(mh_s(mh_s(mec_mix(h, 20), t), m), args), ty), fx);
+        }
+        Inst::MakeDyn(v, t, m) => {
+            h = mh_s(mh_s(mec_mix(mec_mix(h, 21), v), t), m);
+        }
+        Inst::BitCast(v, f, t) => {
+            h = mh_ty(mh_ty(mec_mix(mec_mix(h, 22), v), f), t);
+        }
+        Inst::IntExtend(v, f, t) => {
+            h = mh_ty(mh_ty(mec_mix(mec_mix(h, 23), v), f), t);
+        }
+        Inst::IntTrunc(v, f, t) => {
+            h = mh_ty(mh_ty(mec_mix(mec_mix(h, 24), v), f), t);
+        }
+        Inst::IntToFloat(v, f, t) => {
+            h = mh_ty(mh_ty(mec_mix(mec_mix(h, 25), v), f), t);
+        }
+        Inst::FloatToInt(v, f, t) => {
+            h = mh_ty(mh_ty(mec_mix(mec_mix(h, 26), v), f), t);
+        }
+        Inst::TryUnwrap(a, b1, c1, d1) => {
+            h = mec_mix(mec_mix(mec_mix(mec_mix(mec_mix(h, 27), a), b1), c1), d1);
+        }
+        Inst::Print(v, ty) => {
+            h = mh_ty(mec_mix(mec_mix(h, 28), v), ty);
+        }
+        Inst::Panic(s) => {
+            h = mh_s(mec_mix(h, 29), s);
+        }
+        Inst::Asm(code, ins, outs, ty) => {
+            h = mh_ty(mh_strvids(mh_strvids(mh_s(mec_mix(h, 30), code), ins), outs), ty);
+        }
+        Inst::RegionBegin(n, a, c, l) => {
+            h = mh_optu64(mec_mix(mec_mix(mh_s(mec_mix(h, 31), n), mec_b(a)), mec_b(c)), l);
+        }
+        Inst::RegionEnd(n, a, c) => {
+            h = mec_mix(mec_mix(mh_s(mec_mix(h, 32), n), mec_b(a)), mec_b(c));
+        }
+        Inst::PersistLoad(n, v, ty) => {
+            h = mh_ty(mec_mix(mh_s(mec_mix(h, 33), n), v), ty);
+        }
+        Inst::PersistSave(n, v) => {
+            h = mec_mix(mh_s(mec_mix(h, 34), n), v);
+        }
+        Inst::TxnBegin => {
+            h = mec_mix(h, 35);
+        }
+        Inst::TxnEnd => {
+            h = mec_mix(h, 36);
+        }
+        Inst::UnsafeBegin => {
+            h = mec_mix(h, 37);
+        }
+        Inst::UnsafeEnd => {
+            h = mec_mix(h, 38);
+        }
+        Inst::GradBegin(n) => {
+            h = mh_s(mec_mix(h, 39), n);
+        }
+        Inst::GradEnd => {
+            h = mec_mix(h, 40);
+        }
+        Inst::Backward(v) => {
+            h = mec_mix(mec_mix(h, 41), v);
+        }
+        Inst::StructCopy(d, s, ty) => {
+            h = mh_ty(mec_mix(mec_mix(mec_mix(h, 42), d), s), ty);
+        }
+    }
+    return h;
+}
+
+/// The content hash of a function: every field iw_irfunc writes.
+pub fn mec_fn_hash(f: IrFunction) -> i64 {
+    var h: i64 = mh_s(MEC_MAGIC, f.name);
+    h = mec_mix(h, f.params.len());
+    var i: i64 = 0;
+    while i < f.params.len() {
+        h = mh_ty(mec_mix(h, f.params.get(i).id), f.params.get(i).ty);
+        i = i + 1;
+    }
+    h = mh_ty(h, f.ret_ty);
+    h = mec_mix(h, f.blocks.len());
+    i = 0;
+    while i < f.blocks.len() {
+        var bb: BasicBlock = f.blocks.get(i);
+        h = mh_vec(mh_vec(mec_mix(h, bb.id), bb.instructions), bb.predecessors);
+        h = mec_mix(h, bb.params.len());
+        var p: i64 = 0;
+        while p < bb.params.len() {
+            h = mh_ty(mec_mix(h, bb.params.get(p).id), bb.params.get(p).ty);
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    h = mec_mix(h, f.value_metas.len());
+    i = 0;
+    while i < f.value_metas.len() {
+        var vm: ValueIdMeta = f.value_metas.get(i);
+        h = mh_meta(mec_mix(h, vm.id), vm.meta);
+        i = i + 1;
+    }
+    h = mec_mix(h, f.insts.len());
+    i = 0;
+    while i < f.insts.len() {
+        var vi: ValueIdInst = f.insts.get(i);
+        h = mh_inst(mec_mix(h, vi.id), vi.inst);
+        i = i + 1;
+    }
+    h = mh_vec(h, f.inst_at);
+    h = mh_effects(h, f.effects);
+    h = mec_mix(mec_mix(mec_mix(mec_mix(h, f.next_value), f.next_block), f.current_block_idx), f.entry);
+    h = mh_strvids(h, f.locals);
+    h = mec_mix(mec_mix(h, mec_b(f.is_interrupt)), f.interrupt_vector);
+    h = mh_strvids(h, f.persist_vars);
+    h = mec_mix(h, f.drop_locals.len());
+    i = 0;
+    while i < f.drop_locals.len() {
+        h = mh_s(mec_mix(h, f.drop_locals.get(i).id), f.drop_locals.get(i).name);
+        i = i + 1;
+    }
+    h = mec_mix(mec_mix(mec_mix(h, mec_b(f.is_wrapping)), mec_b(f.is_deterministic)), mec_b(f.is_crashfree));
+    h = mh_optu64(h, f.gas_limit);
+    h = mec_mix(mec_mix(mec_mix(h, mec_b(f.is_no_alloc)), mec_b(f.is_medical)), mec_b(f.is_kernel));
+    h = mec_mix(mh_vec(h, f.workgroup_size), mec_b(f.is_simd));
+    h = mec_mix(h, f.zeroize_locals.len());
+    i = 0;
+    while i < f.zeroize_locals.len() {
+        h = mec_mix(mec_mix(h, f.zeroize_locals.get(i).id), f.zeroize_locals.get(i).val);
+        i = i + 1;
+    }
+    h = mec_mix(mec_mix(mec_mix(h, mec_b(f.internal_conv)), mec_b(f.is_constant_time)), mec_b(f.has_secret));
+    h = mh_vec(h, f.secret_values);
+    return h;
+}
+
+/// The key of pass `pass` on a function hashing `pre`, with the run's
+/// switches and other inputs folded into `salt`. Never one of the two
+/// integers core's HashMap reserves (core.fd hm_store_i).
+pub fn mec_key(pass: i64, pre: i64, salt: i64) -> i64 {
+    var k: i64 = mec_mix(mec_mix(mec_mix(pre, pass), salt), inc_compiler_hash());
+    var x: i64 = k ^ 0x5DEECE66D1234567;
+    if x == 0 || x == 0 - 1 {
+        k = k ^ 3;
+    }
+    return k;
+}
+
+fn mec_path() -> str {
+    var v: str = env_or_empty("FID_MECACHE");
+    if v == "0" || v == "off" || v == "no" || v == "none" || v == "false" {
+        return "";
+    }
+    if str_len(v) > 0 {
+        return v;
+    }
+    if str_len(env_or_empty("FIDES_NO_CACHE")) > 0 {
+        return "";
+    }
+    var n: i64 = argv_count();
+    var i: i64 = 1;
+    while i < n {
+        if argv_at(i) == "--no-cache" {
+            return "";
+        }
+        i = i + 1;
+    }
+    var dir: str = env_or_empty("TEMP");
+    if dir == "" {
+        dir = env_or_empty("TMPDIR");
+    }
+    if dir == "" {
+        dir = "/tmp";
+    }
+    var name: str = int_to_str(hash_source("mec1 " + int_to_str(inc_compiler_hash())));
+    if str_starts_with(name, "-") {
+        name = "n" + str_slice(name, 1, str_len(name));
+    }
+    return dir + "/fid-mec-" + name + ".bin";
+}
+
+/// One little-endian word of the file (aw_i64's order), without the
+/// per-word Vec ar_i64 builds.
+@wrapping fn mec_rd(r: & mut ArBuf) -> i64 {
+    if r.pos < 0 || r.pos + 8 > r.v.len() {
+        r.ok = false;
+        return 0;
+    }
+    var v: i64 = 0;
+    var j: i64 = 7;
+    while j >= 0 {
+        v = (v << 8) | (r.v.get(r.pos + j) & 255);
+        j = j - 1;
+    }
+    r.pos = r.pos + 8;
+    return v;
+}
+
+@wrapping fn mec_check(e: & MecEntry) -> i64 {
+    var h: i64 = mec_mix(mec_mix(mec_mix(MEC_MAGIC, e.key), e.name_h), e.post);
+    h = mec_mix(mec_mix(mec_mix(h, e.c1), e.c2), e.c3);
+    h = mec_mix(h, e.delta.len());
+    var i: i64 = 0;
+    while i < e.delta.len() {
+        h = mec_mix(h, e.delta.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+fn mec_wentry(b: & mut AwBuf, e: & MecEntry) {
+    aw_i64(b, e.key);
+    aw_i64(b, e.name_h);
+    aw_i64(b, e.post);
+    aw_i64(b, e.c1);
+    aw_i64(b, e.c2);
+    aw_i64(b, e.c3);
+    aw_i64(b, e.delta.len());
+    var i: i64 = 0;
+    while i < e.delta.len() {
+        aw_u8(b, e.delta.get(i));
+        i = i + 1;
+    }
+    aw_i64(b, mec_check(e));
+}
+
+fn mec_rentry(r: & mut ArBuf) -> MecEntry {
+    var key: i64 = mec_rd(r);
+    var name_h: i64 = mec_rd(r);
+    var post: i64 = mec_rd(r);
+    var c1: i64 = mec_rd(r);
+    var c2: i64 = mec_rd(r);
+    var c3: i64 = mec_rd(r);
+    var n: i64 = mec_rd(r);
+    var delta: Vec<i64> = Vec::new();
+    if !r.ok || n < 0 || r.pos + n > r.v.len() {
+        r.ok = false;
+        return MecEntry_new(0, 0, 0, 0, 0, 0, delta);
+    }
+    var i: i64 = 0;
+    while i < n {
+        delta.push(r.v.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    var e: MecEntry = MecEntry_new(key, name_h, post, c1, c2, c3, delta);
+    var chk: i64 = mec_rd(r);
+    if !r.ok || chk != mec_check(& e) {
+        r.ok = false;
+    }
+    return e;
+}
+
+fn mec_load(path: str) {
+    g_mec_path = path;
+    g_mec_state = 1;
+    g_mec_old = Vec::new();
+    g_mec_used = Vec::new();
+    g_mec_new = Vec::new();
+    g_mec_ix = HashMap_new();
+    if p_file_exists(path) == 0 {
+        return;
+    }
+    var vb: Vec<i64> = p_file_read_bytes(path);
+    if vb.len() < 32 {
+        return;
+    }
+    var r: ArBuf = arbuf_new(vb);
+    var magic: i64 = mec_rd(& mut r);
+    var ver: i64 = mec_rd(& mut r);
+    var salt: i64 = mec_rd(& mut r);
+    var count: i64 = mec_rd(& mut r);
+    if !r.ok || magic != MEC_MAGIC || ver != MEC_VERSION || salt != inc_compiler_hash() {
+        return;
+    }
+    var i: i64 = 0;
+    while i < count && i < MEC_MAX_ENTRIES {
+        var e: MecEntry = mec_rentry(& mut r);
+        if !r.ok {
+            return;
+        }
+        if HashMap_get_i(g_mec_ix, e.key) == 0 {
+            g_mec_old.push(e);
+            g_mec_used.push(0);
+            HashMap_insert_i(g_mec_ix, e.key, g_mec_old.len());
+        }
+        i = i + 1;
+    }
+}
+
+/// Start a pass with the memo: false when it is off. Loads the file on
+/// the first pass of the process (or when FID_MECACHE names another);
+/// a long-lived process (`fid serve`) keeps the entries in memory.
+pub fn mec_begin() -> bool {
+    var path: str = mec_path();
+    if str_len(path) == 0 {
+        return false;
+    }
+    if g_mec_state != 1 || path != g_mec_path {
+        mec_load(path);
+    }
+    return true;
+}
+
+pub fn mec_pass_begin() {
+    g_mec_pass_hits = 0;
+    g_mec_pass_misses = 0;
+    g_mec_pass_kept = 0;
+}
+
+pub fn mec_pass_end(name: str) {
+    var st: str = env_or_empty("FID_MECACHE_STATS");
+    if str_len(st) > 0 && st != "0" {
+        p_eprint_str("[mecache] " + name + ": " + int_to_str(g_mec_pass_hits) + " hits, " + int_to_str(g_mec_pass_misses) + " misses, " + int_to_str(g_mec_pass_kept) + " recorded\n");
+    }
+}
+
+/// The entry for `key` made on a function named `name`: its position + 1,
+/// or 0.
+pub fn mec_lookup(key: i64, name: str) -> i64 {
+    if g_mec_state != 1 {
+        return 0;
+    }
+    var at: i64 = HashMap_get_i(g_mec_ix, key);
+    if at <= 0 || at > g_mec_old.len() {
+        return 0;
+    }
+    if g_mec_old.get(at - 1).name_h != hash_source(name) {
+        return 0;
+    }
+    return at;
+}
+
+pub fn mec_entry(at: i64) -> MecEntry {
+    return g_mec_old.get(at - 1);
+}
+
+pub fn mec_log_begin() {
+    g_mec_log_on = true;
+    g_mec_log_insts = Vec::new();
+    g_mec_log_blocks = Vec::new();
+}
+
+pub fn mec_log_end() {
+    g_mec_log_on = false;
+}
+
+/// A pass replaced f.insts[at] (eg_set_inst, ru_set_inst).
+pub fn mec_log_inst(at: i64) {
+    if g_mec_log_on {
+        g_mec_log_insts.push(at);
+    }
+}
+
+/// A pass replaced f.blocks[bi] (eg_place).
+pub fn mec_log_block(bi: i64) {
+    if g_mec_log_on {
+        g_mec_log_blocks.push(bi);
+    }
+}
+
+fn mec_rvec(r: & mut ArBuf) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var n: i64 = ar_i64(r);
+    if !r.ok || n < 0 || n > r.v.len() {
+        r.ok = false;
+        return v;
+    }
+    var i: i64 = 0;
+    while i < n && r.ok {
+        v.push(ar_i64(r));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// What the logged writes left in `f`: [count, (position, id, instruction)
+/// ...] [count, (block, its instruction ids) ...]. Empty when it cannot be
+/// replayed (a position outside f, a string constant a replay would have
+/// to intern).
+fn mec_delta(f: & IrFunction) -> Vec<i64> {
+    var b: AwBuf = awbuf_new();
+    var mark: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        mark.push(0);
+        i = i + 1;
+    }
+    var pos: Vec<i64> = Vec::new();
+    i = 0;
+    while i < g_mec_log_insts.len() {
+        var at: i64 = g_mec_log_insts.get(i);
+        if at < 0 || at >= f.insts.len() {
+            return Vec::new();
+        }
+        if mark.get(at) == 0 {
+            mark.set(at, 1);
+            pos.push(at);
+        }
+        i = i + 1;
+    }
+    aw_i64(& mut b, pos.len());
+    i = 0;
+    while i < pos.len() {
+        var vi: ValueIdInst = f.insts.get(pos.get(i));
+        match vi.inst {
+            Inst::ConstStr(_) => {
+                return Vec::new();
+            }
+            _ => {
+            }
+        }
+        aw_i64(& mut b, pos.get(i));
+        aw_i64(& mut b, vi.id);
+        iw_inst(& mut b, vi.inst);
+        i = i + 1;
+    }
+    var bmark: Vec<i64> = Vec::new();
+    i = 0;
+    while i < f.blocks.len() {
+        bmark.push(0);
+        i = i + 1;
+    }
+    var bpos: Vec<i64> = Vec::new();
+    i = 0;
+    while i < g_mec_log_blocks.len() {
+        var bi: i64 = g_mec_log_blocks.get(i);
+        if bi < 0 || bi >= f.blocks.len() {
+            return Vec::new();
+        }
+        if bmark.get(bi) == 0 {
+            bmark.set(bi, 1);
+            bpos.push(bi);
+        }
+        i = i + 1;
+    }
+    aw_i64(& mut b, bpos.len());
+    i = 0;
+    while i < bpos.len() {
+        var bb: BasicBlock = f.blocks.get(bpos.get(i));
+        aw_i64(& mut b, bpos.get(i));
+        iw_vec_i64(& mut b, bb.instructions);
+        i = i + 1;
+    }
+    return b.bytes;
+}
+
+/// Replay a change (mec_delta) on `f`: false, and `f` unchanged, when it
+/// does not fit (every part is read and checked before anything is set).
+fn mec_apply(f: & mut IrFunction, delta: Vec<i64>) -> bool {
+    if delta.len() == 0 {
+        return true;
+    }
+    var r: ArBuf = arbuf_new(delta);
+    var n: i64 = ar_i64(& mut r);
+    if !r.ok || n < 0 || n > f.insts.len() {
+        return false;
+    }
+    var ats: Vec<i64> = Vec::new();
+    var ins: Vec<ValueIdInst> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        var at: i64 = ar_i64(& mut r);
+        var id: i64 = ar_i64(& mut r);
+        var inst: Inst = ir_inst(& mut r);
+        if !r.ok || at < 0 || at >= f.insts.len() {
+            return false;
+        }
+        if f.insts.get(at).id != id {
+            return false;
+        }
+        ats.push(at);
+        ins.push(ValueIdInst_new(id, inst));
+        i = i + 1;
+    }
+    var nb: i64 = ar_i64(& mut r);
+    if !r.ok || nb < 0 || nb > f.blocks.len() {
+        return false;
+    }
+    var bis: Vec<i64> = Vec::new();
+    var bls: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < nb {
+        var bi: i64 = ar_i64(& mut r);
+        var ids: Vec<i64> = mec_rvec(& mut r);
+        if !r.ok || bi < 0 || bi >= f.blocks.len() {
+            return false;
+        }
+        bis.push(bi);
+        bls.push(ids);
+        i = i + 1;
+    }
+    if !r.ok || r.pos != delta.len() {
+        return false;
+    }
+    i = 0;
+    while i < ats.len() {
+        f.insts.set(ats.get(i), ins.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < bis.len() {
+        var bb: BasicBlock = f.blocks.get(bis.get(i));
+        bb.instructions = bls.get(i);
+        f.blocks.set(bis.get(i), bb);
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A hit: replay entry `at` (mec_lookup) on `f`. False, `f` unchanged,
+/// when it does not fit: the caller runs the pass.
+pub fn mec_apply_at(at: i64, f: & mut IrFunction) -> bool {
+    var e: MecEntry = g_mec_old.get(at - 1);
+    if !mec_apply(f, e.delta) {
+        return false;
+    }
+    g_mec_used.set(at - 1, 1);
+    g_mec_pass_hits = g_mec_pass_hits + 1;
+    return true;
+}
+
+/// A miss: the pass ran on `f`, which was `pre` (hashing `pre_h`) and
+/// is now `f`; `changed` as the pass reported (when it reported nothing
+/// the caller keeps `pre`). Records the entry when its replay gives `f`
+/// exactly; returns f's hash.
+pub fn mec_note(key: i64, pre: IrFunction, pre_h: i64, f: IrFunction, changed: bool, c1: i64, c2: i64, c3: i64) -> i64 {
+    g_mec_pass_misses = g_mec_pass_misses + 1;
+    if !changed {
+        g_mec_new.push(MecEntry_new(key, hash_source(f.name), pre_h, c1, c2, c3, Vec::new()));
+        g_mec_pass_kept = g_mec_pass_kept + 1;
+        return pre_h;
+    }
+    var post_h: i64 = mec_fn_hash(f);
+    var d: Vec<i64> = mec_delta(& f);
+    if d.len() == 0 {
+        return post_h;
+    }
+    var g: IrFunction = pre;
+    if mec_apply(& mut g, d) {
+        if mec_fn_hash(g) == post_h {
+            g_mec_new.push(MecEntry_new(key, hash_source(f.name), post_h, c1, c2, c3, d));
+            g_mec_pass_kept = g_mec_pass_kept + 1;
+        }
+    }
+    return post_h;
+}
+
+pub fn mec_chain_clear() {
+    g_mec_chain_h = Vec::new();
+    g_mec_chain_name = Vec::new();
+    g_mec_chain_n = Vec::new();
+}
+
+pub fn mec_chain_push(name: str, n_insts: i64, h: i64) {
+    g_mec_chain_h.push(h);
+    g_mec_chain_name.push(name);
+    g_mec_chain_n.push(n_insts);
+}
+
+pub fn mec_chain_len() -> i64 {
+    return g_mec_chain_h.len();
+}
+
+/// The hash the rules left for function `i` of the module (named `name`,
+/// `n_insts` instructions), 0 when unknown.
+pub fn mec_chain_get(i: i64, name: str, n_insts: i64) -> i64 {
+    if i < 0 || i >= g_mec_chain_h.len() {
+        return 0;
+    }
+    if g_mec_chain_n.get(i) != n_insts || g_mec_chain_name.get(i) != name {
+        return 0;
+    }
+    return g_mec_chain_h.get(i);
+}
+
+fn mec_keep(keep: & mut Vec<MecEntry>, seen: i64, e: MecEntry) {
+    if keep.len() >= MEC_MAX_ENTRIES {
+        return;
+    }
+    if HashMap_get_i(seen, e.key) != 0 {
+        return;
+    }
+    HashMap_insert_i(seen, e.key, 1);
+    keep.push(e);
+}
+
+fn mec_write(keep: & Vec<MecEntry>) {
+    var b: AwBuf = awbuf_new();
+    aw_i64(& mut b, MEC_MAGIC);
+    aw_i64(& mut b, MEC_VERSION);
+    aw_i64(& mut b, inc_compiler_hash());
+    aw_i64(& mut b, keep.len());
+    var i: i64 = 0;
+    while i < keep.len() {
+        var e: MecEntry = keep.get(i);
+        mec_wentry(& mut b, & e);
+        i = i + 1;
+    }
+    // written whole under another name first: a reader never sees half a file
+    var tmp: str = g_mec_path + "." + int_to_str(p_getpid()) + ".tmp";
+    if p_file_write_vec(tmp, b.bytes) < 0 {
+        return;
+    }
+    if p_rename(tmp, g_mec_path) != 0 {
+        // Windows' rename does not replace a file
+        p_file_delete(g_mec_path);
+        if p_rename(tmp, g_mec_path) != 0 {
+            p_file_delete(tmp);
+        }
+    }
+}
+
+/// After the last pass of a build (egraph_run): write the entries when the
+/// build made any (used ones, then new ones, then the rest), and keep them
+/// for the process's next build.
+pub fn mec_finish() {
+    mec_chain_clear();
+    if g_mec_state != 1 {
+        return;
+    }
+    if g_mec_new.len() == 0 {
+        var u: i64 = 0;
+        while u < g_mec_used.len() {
+            if g_mec_used.get(u) != 0 {
+                g_mec_used.set(u, 0);
+            }
+            u = u + 1;
+        }
+        return;
+    }
+    var keep: Vec<MecEntry> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < g_mec_old.len() {
+        if g_mec_used.get(i) != 0 {
+            mec_keep(& mut keep, seen, g_mec_old.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < g_mec_new.len() {
+        mec_keep(& mut keep, seen, g_mec_new.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < g_mec_old.len() {
+        if g_mec_used.get(i) == 0 {
+            mec_keep(& mut keep, seen, g_mec_old.get(i));
+        }
+        i = i + 1;
+    }
+    mec_write(& keep);
+    g_mec_old = keep;
+    g_mec_new = Vec::new();
+    g_mec_used = Vec::new();
+    g_mec_ix = HashMap_new();
+    i = 0;
+    while i < g_mec_old.len() {
+        HashMap_insert_i(g_mec_ix, g_mec_old.get(i).key, i + 1);
+        g_mec_used.push(0);
+        i = i + 1;
+    }
+}
+
+// --- CS6: iropt_native's per-function passes, memoized (FID_IROCACHE) ---
+// iropt_native (compiler/iropt.fd) runs its module passes (inlining,
+// cloning, envtrim, ipcp, spec, the call facts) on every build, then the
+// per-function passes (fold ... version, the iropt_me passes) on each
+// function main reaches. Those read the function, the switches of the run
+// and what the module says of the functions it names: their effect masks,
+// quiet and lending facts (all computed from the callees' IR, transitively),
+// a dyn method's or a closure's target body. The memo keeps, per function,
+// what the per-function passes made of it, keyed (iro_imc_key) by
+//   - the function's content hash before them (mec_fn_hash),
+//   - the transitive closure of the functions it names (calls, function
+//     references, the `<Type>_<method>` targets of its dyn calls), each by
+//     its own content hash before the passes, its name, the names it uses
+//     the module does not define, whether the loop runs the passes on it,
+//     in module order (a member the loop met earlier is seen after its
+//     passes, a later one before: the order is part of the key),
+//   - the run's switches and the module's tables (iro_imc_salt),
+//   - this compiler (mec_key).
+// A one-line change to a function misses for it and for the functions that
+// name it, transitively; the rest replay. Off (the passes run, nothing is
+// read or written) with FID_IROPT_STATS (its counters count every pass),
+// --validate, inline remarks, a profile (pgo_active: the passes read its
+// counts), paramrange (ranges come from callers), FID_LIBFACTS_IN.
+//
+// On by default for `fid emit -o <output>` (CB3, IMC_EMIT_DEFAULT):
+// `<output>.fides-irocache`; FID_IROCACHE=0 (off, no, none, false) or
+// `--no-irocache`: off. FID_IROCACHE=1 (or on, yes, true): <TEMP>/fid-imc-
+// <hash of this compiler>.bin; FID_IROCACHE=<file>: that file.
+// FIDES_NO_CACHE=1 or `--no-cache`: off. With FID_IROCACHE_STATS a second
+// line, "[irocache] ran: f, g", names the functions the passes ran on. FID_IROCACHE_STATS=1 prints "[irocache] H hits, M
+// misses, R recorded, U unkeyed, V mismatches". FID_IROCACHE_VERIFY=1 runs
+// the passes on a hit too and counts (and prints "[irocache] MISMATCH
+// <function>") a hit whose recorded result differs from the passes' (the
+// passes' result is kept). An entry is the function after the passes
+// (iw_irfunc's bytes, with a check word), or only "unchanged". Entries used
+// or made by a build are written first, then older ones, up to
+// IMC_MAX_ENTRIES and IMC_MAX_BYTES; a build that made none writes nothing.
+// tests/tooling/irocache-check.sh checks all of it.
+
+pub const MEC_IROPT: i64 = 3;
+const IMC_MAGIC: i64 = 0x31434D49;
+const IMC_VERSION: i64 = 1;
+const IMC_MAX_ENTRIES: i64 = 20000;
+const IMC_MAX_BYTES: i64 = 64000000;
+/// A function whose bytes are longer than this is not recorded.
+const IMC_MAX_FN_BYTES: i64 = 4000000;
+
+pub struct ImcEntry {
+    pub key: i64,
+    pub name_h: i64,
+    // the content hash after the passes
+    pub post: i64,
+    // 1: the passes left the function as it was (no bytes)
+    pub same: i64,
+    // where its bytes start in g_imc_buf (-1: they are in `bytes`)
+    pub off: i64,
+    pub len: i64,
+    pub chk: i64,
+    pub bytes: Vec<i64>,
+}
+
+pub fn ImcEntry_new(key: i64, name_h: i64, post: i64, same: i64, off: i64, len: i64, chk: i64, bytes: Vec<i64>) -> ImcEntry {
+    return ImcEntry {
+        key: key, name_h: name_h, post: post, same: same, off: off, len: len, chk: chk, bytes: bytes
+    };
+}
+
+/// 0: not loaded, 1: on (g_imc_path loaded)
+var g_imc_state: i64 = 0;
+var g_imc_path: str = "";
+/// The file as read (or as this process last wrote it): the old entries'
+/// bytes stay in it until a hit reads them.
+var g_imc_buf: Vec<i64> = Vec::new();
+var g_imc_old: Vec<ImcEntry> = Vec::new();
+var g_imc_used: Vec<i64> = Vec::new();
+var g_imc_ix: i64 = 0;
+var g_imc_new: Vec<ImcEntry> = Vec::new();
+/// This build's counts (imc_begin resets them).
+var g_imc_hits: i64 = 0;
+var g_imc_misses: i64 = 0;
+var g_imc_kept: i64 = 0;
+var g_imc_nokey: i64 = 0;
+var g_imc_bad: i64 = 0;
+/// CB3: the functions this build ran the passes on (misses and unkeyed
+/// functions), in the loop's order; FID_IROCACHE_STATS prints them.
+var g_imc_ran: Vec<str> = Vec::new();
+
+/// CB3: the memo is on by default for `fid emit ... -o <output>`, in
+/// `<output>.fides-irocache` beside the output (as pe_ir's per-function
+/// cache, `<output>.fides-fncache.pe`). false: opt-in only (FID_IROCACHE).
+const IMC_EMIT_DEFAULT: bool = true;
+
+/// hash_source for iropt.fd (which does not import compiler::inc).
+pub fn imc_hs(s: str) -> i64 {
+    return hash_source(s);
+}
+
+/// The hash of environment variable `name`'s value ("" when unset).
+pub fn imc_env_h(name: str) -> i64 {
+    return hash_source(env_or_empty(name));
+}
+
+/// Is environment variable `name` set to something?
+pub fn imc_env_set(name: str) -> bool {
+    return str_len(env_or_empty(name)) > 0;
+}
+
+/// FID_IROCACHE_VERIFY: run the passes on a hit too and compare.
+pub fn imc_verify_on() -> bool {
+    var v: str = env_or_empty("FID_IROCACHE_VERIFY");
+    return str_len(v) > 0 && v != "0";
+}
+
+/// CB3: the memo's file when FID_IROCACHE is unset: `<output>.fides-irocache`
+/// for a `fid emit` with `-o <output>`; "" (off) for any other command
+/// (`run`, `ccompile`, `serve`, ...), an emit without `-o`, and the
+/// debug, dump and explain emits, whose mid-end is off or not the build's.
+fn imc_emit_default_path() -> str {
+    var n: i64 = argv_count();
+    if n < 3 || argv_at(1) != "emit" {
+        return "";
+    }
+    var out: str = "";
+    var i: i64 = 2;
+    while i < n {
+        var a: str = argv_at(i);
+        if a == "--debug" || a == "--explain" || a == "--dump-mir" || a == "--validate" {
+            return "";
+        }
+        if a == "-o" && i + 1 < n {
+            out = argv_at(i + 1);
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    if str_len(out) == 0 {
+        return "";
+    }
+    return out + ".fides-irocache";
+}
+
+fn imc_path() -> str {
+    var v: str = env_or_empty("FID_IROCACHE");
+    if v == "0" || v == "off" || v == "no" || v == "none" || v == "false" {
+        return "";
+    }
+    if str_len(v) == 0 && !IMC_EMIT_DEFAULT {
+        return "";
+    }
+    if str_len(env_or_empty("FIDES_NO_CACHE")) > 0 {
+        return "";
+    }
+    var n: i64 = argv_count();
+    var i: i64 = 1;
+    while i < n {
+        if argv_at(i) == "--no-cache" || argv_at(i) == "--no-irocache" {
+            return "";
+        }
+        i = i + 1;
+    }
+    if str_len(v) == 0 {
+        return imc_emit_default_path();
+    }
+    if v != "1" && v != "on" && v != "yes" && v != "true" {
+        return v;
+    }
+    var dir: str = env_or_empty("TEMP");
+    if dir == "" {
+        dir = env_or_empty("TMPDIR");
+    }
+    if dir == "" {
+        dir = "/tmp";
+    }
+    var name: str = int_to_str(hash_source("imc1 " + int_to_str(inc_compiler_hash())));
+    if str_starts_with(name, "-") {
+        name = "n" + str_slice(name, 1, str_len(name));
+    }
+    return dir + "/fid-imc-" + name + ".bin";
+}
+
+/// The check word of an entry whose bytes are data[off .. off + len].
+fn imc_check_of(key: i64, name_h: i64, post: i64, same: i64, len: i64, data: & Vec<i64>, off: i64) -> i64 {
+    var h: i64 = mec_mix(mec_mix(mec_mix(IMC_MAGIC, key), name_h), post);
+    h = mec_mix(mec_mix(h, same), len);
+    var i: i64 = 0;
+    while i < len {
+        h = mec_mix(h, data.get(off + i));
+        i = i + 1;
+    }
+    return h;
+}
+
+/// Take `vb` (a file's bytes) as the memo's entries. A header that does
+/// not match (another format, another compiler) leaves it empty; entries
+/// are read up to the first that does not fit in the file.
+fn imc_parse(vb: Vec<i64>) {
+    g_imc_buf = vb;
+    g_imc_old = Vec::new();
+    g_imc_used = Vec::new();
+    g_imc_new = Vec::new();
+    g_imc_ix = HashMap_new();
+    if vb.len() < 32 {
+        return;
+    }
+    var r: ArBuf = arbuf_new(vb);
+    var magic: i64 = mec_rd(& mut r);
+    var ver: i64 = mec_rd(& mut r);
+    var salt: i64 = mec_rd(& mut r);
+    var count: i64 = mec_rd(& mut r);
+    if !r.ok || magic != IMC_MAGIC || ver != IMC_VERSION || salt != inc_compiler_hash() {
+        return;
+    }
+    var i: i64 = 0;
+    while i < count && i < IMC_MAX_ENTRIES {
+        var key: i64 = mec_rd(& mut r);
+        var name_h: i64 = mec_rd(& mut r);
+        var post: i64 = mec_rd(& mut r);
+        var same: i64 = mec_rd(& mut r);
+        var len: i64 = mec_rd(& mut r);
+        if !r.ok || len < 0 || r.pos + len + 8 > vb.len() {
+            return;
+        }
+        var off: i64 = r.pos;
+        r.pos = r.pos + len;
+        var chk: i64 = mec_rd(& mut r);
+        if !r.ok {
+            return;
+        }
+        if HashMap_get_i(g_imc_ix, key) == 0 {
+            g_imc_old.push(ImcEntry_new(key, name_h, post, same, off, len, chk, Vec::new()));
+            g_imc_used.push(0);
+            HashMap_insert_i(g_imc_ix, key, g_imc_old.len());
+        }
+        i = i + 1;
+    }
+}
+
+fn imc_load(path: str) {
+    g_imc_path = path;
+    g_imc_state = 1;
+    if p_file_exists(path) == 0 {
+        imc_parse(Vec::new());
+        return;
+    }
+    imc_parse(p_file_read_bytes(path));
+}
+
+/// Start iropt_native's loop with the memo: false when it is off. Loads
+/// the file the first time (or when FID_IROCACHE names another); a
+/// long-lived process (`fid serve`) keeps the entries in memory.
+pub fn imc_begin() -> bool {
+    var path: str = imc_path();
+    if str_len(path) == 0 {
+        return false;
+    }
+    if g_imc_state != 1 || path != g_imc_path {
+        imc_load(path);
+    }
+    g_imc_hits = 0;
+    g_imc_misses = 0;
+    g_imc_kept = 0;
+    g_imc_nokey = 0;
+    g_imc_bad = 0;
+    g_imc_ran = Vec::new();
+    return true;
+}
+
+/// CB3: the functions the last build with the memo ran the passes on.
+pub fn imc_ran() -> Vec<str> {
+    return g_imc_ran;
+}
+
+/// The entry for `key` made on a function named `name`: its position + 1,
+/// or 0.
+pub fn imc_lookup(key: i64, name: str) -> i64 {
+    if g_imc_state != 1 {
+        return 0;
+    }
+    var at: i64 = HashMap_get_i(g_imc_ix, key);
+    if at <= 0 || at > g_imc_old.len() {
+        return 0;
+    }
+    if g_imc_old.get(at - 1).name_h != hash_source(name) {
+        return 0;
+    }
+    return at;
+}
+
+/// Did the passes leave the function of entry `at` as it was?
+pub fn imc_same(at: i64) -> bool {
+    return g_imc_old.get(at - 1).same == 1;
+}
+
+/// The content hash entry `at` recorded after the passes.
+pub fn imc_post(at: i64) -> i64 {
+    return g_imc_old.get(at - 1).post;
+}
+
+/// A hit on entry `at` is used.
+pub fn imc_use(at: i64) {
+    g_imc_used.set(at - 1, 1);
+    g_imc_hits = g_imc_hits + 1;
+}
+
+/// A function the loop runs on that has no key (iro_imc_key gave 0).
+pub fn imc_nokey_note(name: str) {
+    g_imc_nokey = g_imc_nokey + 1;
+    g_imc_ran.push(name);
+}
+
+/// The function entry `at` recorded (named `name`), when its bytes are
+/// whole: None when they are not (a damaged file), and the caller runs the
+/// passes. Marks the entry used.
+pub fn imc_take(at: i64, name: str) -> OptIrFunction {
+    var e: ImcEntry = g_imc_old.get(at - 1);
+    if e.same == 1 || e.off < 0 || e.len <= 0 || e.off + e.len > g_imc_buf.len() {
+        return OptIrFunction::None;
+    }
+    var buf: Vec<i64> = g_imc_buf;
+    if imc_check_of(e.key, e.name_h, e.post, e.same, e.len, & buf, e.off) != e.chk {
+        return OptIrFunction::None;
+    }
+    var r: ArBuf = arbuf_new(buf);
+    r.pos = e.off;
+    var g: IrFunction = ir_irfunc(& mut r);
+    // (the key holds the function's IR before the passes, its name too;
+    // `name` was checked by imc_lookup)
+    if !r.ok || r.pos != e.off + e.len {
+        return OptIrFunction::None;
+    }
+    imc_use(at);
+    return OptIrFunction::Some(g);
+}
+
+/// A miss: the passes made `f` (named `name`) of a function hashing
+/// `pre_h`; `changed` as they reported. Records the entry; returns f's
+/// content hash.
+pub fn imc_note(key: i64, name: str, pre_h: i64, f: IrFunction, changed: bool) -> i64 {
+    g_imc_misses = g_imc_misses + 1;
+    g_imc_ran.push(name);
+    var nh: i64 = hash_source(name);
+    var none: Vec<i64> = Vec::new();
+    if !changed {
+        g_imc_new.push(ImcEntry_new(key, nh, pre_h, 1, 0 - 1, 0, imc_check_of(key, nh, pre_h, 1, 0, & none, 0), Vec::new()));
+        g_imc_kept = g_imc_kept + 1;
+        return pre_h;
+    }
+    var b: AwBuf = awbuf_new();
+    iw_irfunc(& mut b, f);
+    var bytes: Vec<i64> = awbuf_bytes(& b);
+    var post: i64 = irc_hash_bytes(bytes);
+    if bytes.len() == 0 || bytes.len() > IMC_MAX_FN_BYTES {
+        return post;
+    }
+    var chk: i64 = imc_check_of(key, nh, post, 0, bytes.len(), & bytes, 0);
+    g_imc_new.push(ImcEntry_new(key, nh, post, 0, 0 - 1, bytes.len(), chk, bytes));
+    g_imc_kept = g_imc_kept + 1;
+    return post;
+}
+
+/// FID_IROCACHE_VERIFY: the passes ran on a hit of entry `at` and gave a
+/// function hashing `post`.
+pub fn imc_verify_note(at: i64, name: str, post: i64) {
+    g_imc_used.set(at - 1, 1);
+    g_imc_hits = g_imc_hits + 1;
+    if post != g_imc_old.get(at - 1).post {
+        g_imc_bad = g_imc_bad + 1;
+        p_eprint_str("[irocache] MISMATCH " + name + "\n");
+    }
+}
+
+/// Keep entry `e` (its bytes `total` so far): the new total.
+fn imc_keep(keep: & mut Vec<ImcEntry>, seen: i64, e: ImcEntry, total: i64) -> i64 {
+    if keep.len() >= IMC_MAX_ENTRIES || total + e.len > IMC_MAX_BYTES {
+        return total;
+    }
+    if HashMap_get_i(seen, e.key) != 0 {
+        return total;
+    }
+    HashMap_insert_i(seen, e.key, 1);
+    keep.push(e);
+    return total + e.len;
+}
+
+/// After iropt_native's loop: print the counts (FID_IROCACHE_STATS), and
+/// write the entries when the build made any (used ones, then new ones,
+/// then the rest); the process keeps them in memory for its next build.
+pub fn imc_finish() {
+    if g_imc_state != 1 {
+        return;
+    }
+    var st: str = env_or_empty("FID_IROCACHE_STATS");
+    if str_len(st) > 0 && st != "0" {
+        p_eprint_str("[irocache] " + int_to_str(g_imc_hits) + " hits, " + int_to_str(g_imc_misses) + " misses, " + int_to_str(g_imc_kept) + " recorded, " + int_to_str(g_imc_nokey) + " unkeyed, " + int_to_str(g_imc_bad) + " mismatches\n");
+        // CB3: which functions went through the mid-end again (the line
+        // above stays the first [irocache] line: scripts read it)
+        if g_imc_ran.len() > 0 {
+            p_eprint_str("[irocache] ran: " + str_join(g_imc_ran, ", ") + "\n");
+        }
+    }
+    if g_imc_new.len() == 0 {
+        var u: i64 = 0;
+        while u < g_imc_used.len() {
+            g_imc_used.set(u, 0);
+            u = u + 1;
+        }
+        return;
+    }
+    var keep: Vec<ImcEntry> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < g_imc_old.len() {
+        if g_imc_used.get(i) != 0 {
+            total = imc_keep(& mut keep, seen, g_imc_old.get(i), total);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < g_imc_new.len() {
+        total = imc_keep(& mut keep, seen, g_imc_new.get(i), total);
+        i = i + 1;
+    }
+    i = 0;
+    while i < g_imc_old.len() {
+        if g_imc_used.get(i) == 0 {
+            total = imc_keep(& mut keep, seen, g_imc_old.get(i), total);
+        }
+        i = i + 1;
+    }
+    var buf: Vec<i64> = g_imc_buf;
+    var b: AwBuf = awbuf_new();
+    aw_i64(& mut b, IMC_MAGIC);
+    aw_i64(& mut b, IMC_VERSION);
+    aw_i64(& mut b, inc_compiler_hash());
+    aw_i64(& mut b, keep.len());
+    i = 0;
+    while i < keep.len() {
+        var e: ImcEntry = keep.get(i);
+        aw_i64(& mut b, e.key);
+        aw_i64(& mut b, e.name_h);
+        aw_i64(& mut b, e.post);
+        aw_i64(& mut b, e.same);
+        aw_i64(& mut b, e.len);
+        var j: i64 = 0;
+        if e.off >= 0 {
+            while j < e.len {
+                aw_u8(& mut b, buf.get(e.off + j));
+                j = j + 1;
+            }
+        } else {
+            while j < e.len {
+                aw_u8(& mut b, e.bytes.get(j));
+                j = j + 1;
+            }
+        }
+        aw_i64(& mut b, e.chk);
+        i = i + 1;
+    }
+    var out: Vec<i64> = awbuf_bytes(& b);
+    // written whole under another name first: a reader never sees half a file
+    var tmp: str = g_imc_path + "." + int_to_str(p_getpid()) + ".tmp";
+    if p_file_write_vec(tmp, out) >= 0 {
+        if p_rename(tmp, g_imc_path) != 0 {
+            // Windows' rename does not replace a file
+            p_file_delete(g_imc_path);
+            if p_rename(tmp, g_imc_path) != 0 {
+                p_file_delete(tmp);
+            }
+        }
+    }
+    // what was written is the memo now (offsets into these bytes)
+    imc_parse(out);
+}
+
+// --- A whole module, to a file and back (llvm-roadmap RL10) ---
+// `fid emit <file> --save-ir <f.fir>` writes the module as it goes into the
+// machine layer (after the mid-end); `fid emit-ir <f.fir>` reads it and
+// runs the machine layer alone. A fuzzer can then feed the backend IR that
+// no front end would produce (`fid ir-fuzz`, below), and a backend bug can
+// be kept without its source. The file: magic "FIR1", version, the target
+// it was lowered for (its runtime is merged in), then every table of the
+// module. Instructions name functions, strings and globals by name, so the
+// tables are written as they are and re-indexed on reading.
+
+pub const IR_FILE_MAGIC: i64 = 0x31524946;
+pub const IR_FILE_VERSION: i64 = 3;  // 2 (Nov 16): IrFunction.has_secret (LF20); 3 (Nov 18): IrFunction.secret_values (LF20)
+
+/// The serialized module (with the target it was lowered for).
+pub fn ir_module_bytes(m: & IrModule, target: str) -> Vec<i64> {
+    var b: AwBuf = awbuf_new();
+    aw_i64(& mut b, IR_FILE_MAGIC);
+    aw_i64(& mut b, IR_FILE_VERSION);
+    aw_str(& mut b, target);
+    aw_i64(& mut b, m.functions.len());
+    var i: i64 = 0;
+    while i < m.functions.len() {
+        aw_str(& mut b, m.functions.get(i).name);
+        iw_irfunc(& mut b, m.functions.get(i).func);
+        i = i + 1;
+    }
+    aw_i64(& mut b, m.struct_layouts.len());
+    i = 0;
+    while i < m.struct_layouts.len() {
+        var sl: StructLayout = m.struct_layouts.get(i).layout;
+        aw_str(& mut b, sl.name);
+        aw_i64(& mut b, sl.fields.len());
+        var fi: i64 = 0;
+        while fi < sl.fields.len() {
+            var fl: StringIrTypeOffset = sl.fields.get(fi);
+            aw_str(& mut b, fl.name);
+            iw_irtype(& mut b, fl.ty);
+            aw_i64(& mut b, fl.offset);
+            fi = fi + 1;
+        }
+        aw_i64(& mut b, sl.size);
+        aw_i64(& mut b, sl.align);
+        iw_bool(& mut b, sl.repr_c);
+        iw_bool(& mut b, sl.packed_layout);
+        i = i + 1;
+    }
+    aw_i64(& mut b, m.string_constants.len());
+    i = 0;
+    while i < m.string_constants.len() {
+        aw_str(& mut b, m.string_constants.get(i).key);
+        aw_str(& mut b, m.string_constants.get(i).val);
+        i = i + 1;
+    }
+    aw_i64(& mut b, m.extern_functions.len());
+    i = 0;
+    while i < m.extern_functions.len() {
+        var ef: StringVecIrType = m.extern_functions.get(i);
+        aw_str(& mut b, ef.name);
+        aw_i64(& mut b, ef.params.len());
+        var pi: i64 = 0;
+        while pi < ef.params.len() {
+            iw_irtype(& mut b, ef.params.get(pi));
+            pi = pi + 1;
+        }
+        iw_irtype(& mut b, ef.ret);
+        i = i + 1;
+    }
+    aw_i64(& mut b, m.function_effects.len());
+    i = 0;
+    while i < m.function_effects.len() {
+        aw_str(& mut b, m.function_effects.get(i).name);
+        iw_effects(& mut b, m.function_effects.get(i).effects);
+        i = i + 1;
+    }
+    aw_i64(& mut b, m.extern_decls.len());
+    i = 0;
+    while i < m.extern_decls.len() {
+        var ed: ExternDecl = m.extern_decls.get(i);
+        aw_str(& mut b, ed.abi);
+        aw_str(& mut b, ed.c_name);
+        aw_str(& mut b, ed.pledge_name);
+        aw_params(& mut b, ed.params);
+        aw_type(& mut b, ed.ret_ty);
+        aw_optstr(& mut b, ed.include);
+        aw_optstr(& mut b, ed.link_lib);
+        i = i + 1;
+    }
+    aw_strs(& mut b, m.c_callbacks);
+    iw_strvecs(& mut b, m.trait_methods);
+    iw_strvecs(& mut b, m.trait_impls);
+    aw_strs(& mut b, m.linear_structs);
+    aw_i64(& mut b, m.globals.len());
+    i = 0;
+    while i < m.globals.len() {
+        var ge: GlobalEntry = m.globals.get(i);
+        aw_str(& mut b, ge.name);
+        iw_irtype(& mut b, ge.ty);
+        aw_expr(& mut b, ge.init);
+        i = i + 1;
+    }
+    return awbuf_bytes(& b);
+}
+
+fn iw_strvecs(b: & mut AwBuf, v: Vec<StringVecStr>) {
+    aw_i64(b, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        aw_str(b, v.get(i).name);
+        aw_strs(b, v.get(i).items);
+        i = i + 1;
+    }
+}
+
+fn ir_strvecs(r: & mut ArBuf) -> Vec<StringVecStr> {
+    var out: Vec<StringVecStr> = Vec::new();
+    var n: i64 = ar_i64(r);
+    var i: i64 = 0;
+    while i < n && r.ok {
+        var name: str = ar_str(r);
+        out.push(StringVecStr_new(name, ar_strs(r)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Write the module to `path`; false when the file cannot be written.
+pub fn ir_module_save(path: str, m: & IrModule, target: str) -> bool {
+    p_file_write_vec(path, ir_module_bytes(m, target));
+    return p_file_exists(path) != 0;
+}
+
+/// A module read back: `ok` false (and `err` why) on a file that is not
+/// one, is cut short, or is of another version.
+pub struct IrModuleLoad {
+    pub ok: bool,
+    pub err: str,
+    pub target: str,
+    pub module: IrModule,
+}
+
+fn ir_load_fail(why: str) -> IrModuleLoad {
+    return IrModuleLoad {
+        ok: false, err: why, target: "", module: IrModule_new()
+    };
+}
+
+/// Read a module that ir_module_save wrote.
+pub fn ir_module_load(path: str) -> IrModuleLoad {
+    if p_file_exists(path) == 0 {
+        return ir_load_fail("no file " + path);
+    }
+    var vb: Vec<i64> = p_file_read_bytes(path);
+    if vb.len() < 24 {
+        return ir_load_fail(path + " is not a saved IR module (too short)");
+    }
+    var r: ArBuf = arbuf_new(vb);
+    if ar_i64(& mut r) != IR_FILE_MAGIC {
+        return ir_load_fail(path + " is not a saved IR module (`fid emit <file> --save-ir <f>` writes one)");
+    }
+    var ver: i64 = ar_i64(& mut r);
+    if ver != IR_FILE_VERSION {
+        return ir_load_fail(path + " is IR file version " + int_to_str(ver) + "; this fid reads version " + int_to_str(IR_FILE_VERSION));
+    }
+    var target: str = ar_str(& mut r);
+    var m: IrModule = IrModule_new();
+    var n: i64 = ar_i64(& mut r);
+    var i: i64 = 0;
+    while i < n && r.ok {
+        var fname: str = ar_str(& mut r);
+        var f: IrFunction = ir_irfunc(& mut r);
+        m.functions.push(IrFunctionEntry_new(fname, f));
+        i = i + 1;
+    }
+    n = ar_i64(& mut r);
+    i = 0;
+    while i < n && r.ok {
+        var sl: StructLayout = StructLayout_new(ar_str(& mut r));
+        var nf: i64 = ar_i64(& mut r);
+        var fi: i64 = 0;
+        while fi < nf && r.ok {
+            var fname2: str = ar_str(& mut r);
+            var fty: IrType = ir_irtype(& mut r);
+            var foff: i64 = ar_i64(& mut r);
+            sl.fields.push(StringIrTypeOffset_new(fname2, fty, foff));
+            fi = fi + 1;
+        }
+        sl.size = ar_i64(& mut r);
+        sl.align = ar_i64(& mut r);
+        sl.repr_c = ir_bool(& mut r);
+        sl.packed_layout = ir_bool(& mut r);
+        IrModule_add_struct(& mut m, sl);
+        i = i + 1;
+    }
+    n = ar_i64(& mut r);
+    i = 0;
+    while i < n && r.ok {
+        var key: str = ar_str(& mut r);
+        var val: str = ar_str(& mut r);
+        m.string_constants.push(StringStringEntry_new(key, val));
+        HashMap_insert(m.str_index, key, m.string_constants.len());
+        i = i + 1;
+    }
+    n = ar_i64(& mut r);
+    i = 0;
+    while i < n && r.ok {
+        var ename: str = ar_str(& mut r);
+        var np: i64 = ar_i64(& mut r);
+        var ps: Vec<IrType> = Vec::new();
+        var pi: i64 = 0;
+        while pi < np && r.ok {
+            ps.push(ir_irtype(& mut r));
+            pi = pi + 1;
+        }
+        var eret: IrType = ir_irtype(& mut r);
+        m.extern_functions.push(StringVecIrType_new(ename, ps, eret));
+        i = i + 1;
+    }
+    n = ar_i64(& mut r);
+    i = 0;
+    while i < n && r.ok {
+        var fename: str = ar_str(& mut r);
+        var fe: EffectSet = ir_effects(& mut r);
+        m.function_effects.push(StringEffectSetEntry_new(fename, fe));
+        i = i + 1;
+    }
+    n = ar_i64(& mut r);
+    i = 0;
+    while i < n && r.ok {
+        var abi: str = ar_str(& mut r);
+        var c_name: str = ar_str(& mut r);
+        var pledge_name: str = ar_str(& mut r);
+        var eparams: Vec<Param> = ar_params(& mut r);
+        var ret_ty: Type = ar_type(& mut r);
+        var include: OptStr = ar_optstr(& mut r);
+        var link_lib: OptStr = ar_optstr(& mut r);
+        // (a literal of a struct declared in another file stops the
+        // stage-0 parser: release-roadmap A4)
+        var edecl: ExternDecl = ExternDecl_new(abi, c_name, pledge_name, ret_ty);
+        edecl.params = eparams;
+        edecl.include = include;
+        edecl.link_lib = link_lib;
+        m.extern_decls.push(edecl);
+        i = i + 1;
+    }
+    m.c_callbacks = ar_strs(& mut r);
+    m.trait_methods = ir_strvecs(& mut r);
+    m.trait_impls = ir_strvecs(& mut r);
+    m.linear_structs = ar_strs(& mut r);
+    n = ar_i64(& mut r);
+    i = 0;
+    while i < n && r.ok {
+        var gname: str = ar_str(& mut r);
+        var gty: IrType = ir_irtype(& mut r);
+        var ginit: Expr = ar_expr(& mut r);
+        m.globals.push(GlobalEntry_new(gname, gty, ginit));
+        i = i + 1;
+    }
+    if !r.ok {
+        return ir_load_fail(path + " is cut short or damaged");
+    }
+    // fn_index fills itself from `functions` on the first lookup
+    return IrModuleLoad {
+        ok: true, err: "", target: target, module: m
+    };
+}
+
+// --- Random IR for the backend (llvm-roadmap RL10) ---
+// `fid ir-fuzz <seed>` builds a small program whose function fz_target is
+// replaced, after lowering, by IR made here from the seed: four i64
+// variables in stack slots, straight-line arithmetic, if/else on
+// comparisons and counted loops, nested; two f64 variables in f64 stack
+// slots (conversions both ways, + - * /, compares); a heap buffer of
+// IRFUZZ_MEM words (p_malloc, loads and stores at constant and computed
+// indexes, p_free); calls to the generated functions fz_h0.. (fz_h<k> is
+// made from the same seed and may call fz_h0..fz_h<k-1>). The same seed
+// gives the same functions. Nothing in them can panic (no division by 0
+// or -1, shift counts 0..63, f64 values stay far inside the i64 range and
+// are never NaN, the functions are @wrapping), so the value the program
+// prints is known: irfuzz_eval works it out from the same description,
+// and scripts/fuzz/fuzz_ir.sh compares it with what the machine code
+// prints. The template (irfuzz_template) holds each fz_h<k> as source
+// that computes what its description says, so a driver that replaces
+// only fz_target still calls functions of the known value;
+// irfuzz_install_helpers replaces them by their random IR too.
+//
+// The description is a flat Vec<i64> of statements:
+//   [1, d, a, op, b]           v[d] = v[a] op v[b]   (op 0..5)
+//   [2, d, a, op, k]           v[d] = v[a] op k      (op 0..9)
+//   [3, a, cmp, b, nt, ne, then (nt words), else (ne words)]
+//   [4, n, nb, body (nb words)]   n times; loops do not nest
+//   [5, e, a, fop, c]          w[e] = f(v[a]) fop C[c]   (fop 0..3)
+//   [6, d, e, gop, g]          v[d] = w[e] gop w[g]      (gop 0..3)
+//   [7, a, ix, k]              mem[(v[ix] + k) & 7] = v[a]
+//   [8, d, ix, k]              v[d] = mem[(v[ix] + k) & 7]
+//                              (ix == IRFUZZ_VARS: the index is k & 7)
+//   [9, d, h, a, b]            v[d] = fz_h<h>(v[a], v[b])
+// op: 0 add, 1 sub, 2 mul, 3 and, 4 or, 5 xor, 6 shl, 7 shr, 8 div, 9 mod;
+// cmp: 0 ==, 1 !=, 2 <, 3 >, 4 <=, 5 >=; f(x) = ((x & 0xFFFFF) - 0x80000)
+// as f64; fop: 0 +, 1 -, 2 *, 3 /; C[c] is irf_fconst(c); gop: 0 (w + w)
+// as i64, 1 (w - w) as i64 (both truncate), 2 w < w, 3 w <= w (1 or 0).
+// |f(x)| <= 2^19 and |C| <= 2^20 or >= 2^-7, so |w| < 2^40.
+
+pub const IRFUZZ_VARS: i64 = 4;
+/// The f64 variables w0, w1.
+pub const IRFUZZ_FVARS: i64 = 2;
+/// Words of fz_target's heap buffer (a power of two).
+pub const IRFUZZ_MEM: i64 = 8;
+/// The generated functions fz_h0.. that the others call.
+pub const IRFUZZ_HELPERS: i64 = 2;
+/// Entries of irf_fconst.
+pub const IRFUZZ_FCONSTS: i64 = 8;
+
+/// The next number below `n` from the generator's state.
+@wrapping fn irf_next(s: & mut Vec<i64>, n: i64) -> i64 {
+    var x: i64 = s.get(0);
+    x = x * 6364136223846793005 + 1442695040888963407;
+    s.set(0, x);
+    var v: i64 = (x >> 33) & 0x7FFFFFFF;
+    if n <= 0 {
+        return 0;
+    }
+    return v % n;
+}
+
+/// A divisor that can neither trap nor overflow.
+fn irf_divisor(s: & mut Vec<i64>) -> i64 {
+    var k: i64 = irf_next(s, 8);
+    if k == 0 {
+        return 2;
+    }
+    if k == 1 {
+        return 3;
+    }
+    if k == 2 {
+        return 7;
+    }
+    if k == 3 {
+        return 0 - 3;
+    }
+    if k == 4 {
+        return 10;
+    }
+    if k == 5 {
+        return 0 - 7;
+    }
+    if k == 6 {
+        return 13;
+    }
+    return 1000003;
+}
+
+/// A constant of a kind that finds bugs: small, a power of two, near the
+/// 32-bit edges, or large.
+@wrapping fn irf_const(s: & mut Vec<i64>) -> i64 {
+    var k: i64 = irf_next(s, 6);
+    if k == 0 {
+        return irf_next(s, 17) - 8;
+    }
+    if k == 1 {
+        return 1 << irf_next(s, 63);
+    }
+    if k == 2 {
+        return 2147483647 + irf_next(s, 3) - 1;
+    }
+    if k == 3 {
+        return 0 - 2147483648 - irf_next(s, 2);
+    }
+    if k == 4 {
+        return irf_next(s, 2000000000) * 4611686018 + irf_next(s, 1000);
+    }
+    return irf_next(s, 100000) - 50000;
+}
+
+fn irf_push_all(dst: & mut Vec<i64>, src: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < src.len() {
+        dst.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+/// Statements into `out`: `count` of them, if/else up to `depth` deep,
+/// a loop only when not inside one, heap reads and writes when `mem`,
+/// calls to fz_h0..fz_h<ncall - 1>.
+fn irf_gen_list(s: & mut Vec<i64>, out: & mut Vec<i64>, count: i64, depth: i64, in_loop: bool, mem: bool, ncall: i64) {
+    var c: i64 = 0;
+    while c < count {
+        // 0..4 v op v, 5..8 and 15 v op k, 9..10 f64 from v, 11 v from
+        // f64, 12 store, 13 load, 14 call, 16..17 if, 18..19 loop
+        var kind: i64 = irf_next(s, 20);
+        if kind >= 16 && depth <= 0 {
+            kind = 5;
+        }
+        if (kind == 12 || kind == 13) && !mem {
+            kind = 6;
+        }
+        if kind == 14 && ncall <= 0 {
+            kind = 0;
+        }
+        if kind < 5 {
+            out.push(1);
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, 6));
+            out.push(irf_next(s, IRFUZZ_VARS));
+        } else if kind == 9 || kind == 10 {
+            out.push(5);
+            out.push(irf_next(s, IRFUZZ_FVARS));
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, 4));
+            out.push(irf_next(s, IRFUZZ_FCONSTS));
+        } else if kind == 11 {
+            out.push(6);
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, IRFUZZ_FVARS));
+            out.push(irf_next(s, 4));
+            out.push(irf_next(s, IRFUZZ_FVARS));
+        } else if kind == 12 || kind == 13 {
+            // 7 store, 8 load; an index variable of IRFUZZ_VARS is none
+            out.push(kind - 5);
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, IRFUZZ_VARS + 1));
+            out.push(irf_next(s, 2 * IRFUZZ_MEM) - IRFUZZ_MEM);
+        } else if kind == 14 {
+            out.push(9);
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, ncall));
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, IRFUZZ_VARS));
+        } else if kind < 16 {
+            var op: i64 = irf_next(s, 10);
+            var k: i64 = irf_const(s);
+            if op == 6 || op == 7 {
+                k = irf_next(s, 64);
+            }
+            if op == 8 || op == 9 {
+                k = irf_divisor(s);
+            }
+            out.push(2);
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(op);
+            out.push(k);
+        } else if kind < 18 || in_loop {
+            var then_l: Vec<i64> = Vec::new();
+            var else_l: Vec<i64> = Vec::new();
+            irf_gen_list(s, & mut then_l, 1 + irf_next(s, 3), depth - 1, in_loop, mem, ncall);
+            irf_gen_list(s, & mut else_l, irf_next(s, 3), depth - 1, in_loop, mem, ncall);
+            out.push(3);
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(irf_next(s, 6));
+            out.push(irf_next(s, IRFUZZ_VARS));
+            out.push(then_l.len());
+            out.push(else_l.len());
+            irf_push_all(out, & then_l);
+            irf_push_all(out, & else_l);
+        } else {
+            var body: Vec<i64> = Vec::new();
+            irf_gen_list(s, & mut body, 1 + irf_next(s, 4), depth - 1, true, mem, ncall);
+            out.push(4);
+            out.push(1 + irf_next(s, 6));
+            out.push(body.len());
+            irf_push_all(out, & body);
+        }
+        c = c + 1;
+    }
+}
+
+fn irf_push5(out: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64, e: i64) {
+    out.push(a);
+    out.push(b);
+    out.push(c);
+    out.push(d);
+    out.push(e);
+}
+
+/// The seed a function's description comes from: unit -1 is fz_target
+/// (the seed itself), unit k is fz_h<k>.
+@wrapping fn irf_unit_seed(seed: i64, unit: i64) -> i64 {
+    if unit < 0 {
+        return seed;
+    }
+    return seed * 7919 + 104729 * (unit + 1);
+}
+
+/// The words a statement takes in a description.
+fn irf_stmt_len(p: & Vec<i64>, pos: i64) -> i64 {
+    var kind: i64 = p.get(pos);
+    if kind == 3 {
+        return 6 + p.get(pos + 4) + p.get(pos + 5);
+    }
+    if kind == 4 {
+        return 3 + p.get(pos + 2);
+    }
+    if kind == 7 || kind == 8 {
+        return 4;
+    }
+    return 5;
+}
+
+/// The description of unit `unit`'s function (-1 fz_target, k fz_h<k>):
+/// only fz_target has the heap buffer; fz_h<k> calls fz_h0..fz_h<k-1>,
+/// fz_target any of them.
+@wrapping fn irf_unit_program(seed: i64, unit: i64) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    s.push(irf_unit_seed(seed, unit) * 2654435761 + 12345);
+    var _w: i64 = irf_next(& mut s, 2);
+    var out: Vec<i64> = Vec::new();
+    var mem: bool = unit < 0;
+    var ncall: i64 = unit;
+    if unit < 0 {
+        ncall = IRFUZZ_HELPERS;
+    }
+    // v2 and v3 start as constants (irfuzz_init), w0 and w1 too (irf_finit)
+    var count: i64 = 4 + irf_next(& mut s, 8);
+    irf_gen_list(& mut s, & mut out, count, 2, false, mem, ncall);
+    // every variable reaches the result: v0 = ((v0 ^ v1) + v2) - v3
+    irf_push5(& mut out, 1, 0, 0, 5, 1);
+    irf_push5(& mut out, 1, 0, 0, 0, 2);
+    irf_push5(& mut out, 1, 0, 0, 1, 3);
+    // v0 = v0 + ((w0 + w1) as i64)
+    irf_push5(& mut out, 6, 1, 0, 0, 1);
+    irf_push5(& mut out, 1, 0, 0, 0, 1);
+    if mem {
+        // and every word of the buffer: v0 = v0 + mem[j] or v0 ^ mem[j]
+        var j: i64 = 0;
+        while j < IRFUZZ_MEM {
+            out.push(8);
+            out.push(1);
+            out.push(IRFUZZ_VARS);
+            out.push(j);
+            irf_push5(& mut out, 1, 0, 0, 5 * (j % 2), 1);
+            j = j + 1;
+        }
+    }
+    return out;
+}
+
+/// The description of seed `seed`'s fz_target.
+pub fn irfuzz_program(seed: i64) -> Vec<i64> {
+    return irf_unit_program(seed, 0 - 1);
+}
+
+/// The description of seed `seed`'s fz_h<k>.
+pub fn irfuzz_helper_program(seed: i64, k: i64) -> Vec<i64> {
+    return irf_unit_program(seed, k);
+}
+
+/// The f64 constants of statement 5: exact binary fractions, so the
+/// template's source spells each exactly (irf_fconst_src); dividing by
+/// 7.0 or 3.0 rounds.
+fn irf_fconst(ix: i64) -> f64 {
+    if ix == 0 {
+        return 0.5;
+    }
+    if ix == 1 {
+        return 0.25;
+    }
+    if ix == 2 {
+        return 3.25;
+    }
+    if ix == 3 {
+        return 0.0 - 1.75;
+    }
+    if ix == 4 {
+        return 1048576.0;
+    }
+    if ix == 5 {
+        return 0.0078125;
+    }
+    if ix == 6 {
+        return 7.0;
+    }
+    return 3.0;
+}
+
+fn irf_fconst_src(ix: i64) -> str {
+    if ix == 0 {
+        return "0.5";
+    }
+    if ix == 1 {
+        return "0.25";
+    }
+    if ix == 2 {
+        return "3.25";
+    }
+    if ix == 3 {
+        return "(0.0 - 1.75)";
+    }
+    if ix == 4 {
+        return "1048576.0";
+    }
+    if ix == 5 {
+        return "0.0078125";
+    }
+    if ix == 6 {
+        return "7.0";
+    }
+    return "3.0";
+}
+
+/// The first values of w0 and w1 are irf_finit_k * 0.75 (-4.5..4.5).
+@wrapping fn irf_finit_k(unit_seed: i64, which: i64) -> i64 {
+    var k: i64 = (unit_seed * 31 + which * 17) % 13;
+    if k < 0 {
+        k = k + 13;
+    }
+    return k - 6;
+}
+
+fn irf_finit(unit_seed: i64, which: i64) -> f64 {
+    return (irf_finit_k(unit_seed, which) as f64) * 0.75;
+}
+
+/// f(x): the low 20 bits of x, centred on 0, as f64 (exact).
+fn irf_mask_f(x: i64) -> f64 {
+    return ((x & 1048575) - 524288) as f64;
+}
+
+fn irf_fapply(op: i64, x: f64, y: f64) -> f64 {
+    if op == 0 {
+        return x + y;
+    }
+    if op == 1 {
+        return x - y;
+    }
+    if op == 2 {
+        return x * y;
+    }
+    return x / y;
+}
+
+/// Statement 6's value from two f64 variables.
+fn irf_fcombine(op: i64, x: f64, y: f64) -> i64 {
+    if op == 0 {
+        return (x + y) as i64;
+    }
+    if op == 1 {
+        return (x - y) as i64;
+    }
+    if op == 2 {
+        if x < y {
+            return 1;
+        }
+        return 0;
+    }
+    if x <= y {
+        return 1;
+    }
+    return 0;
+}
+
+/// The buffer word statement 7 or 8 reaches (`val` is v[ix] when there
+/// is an index variable).
+@wrapping fn irf_mem_index(ix: i64, k: i64, val: i64) -> i64 {
+    if ix >= IRFUZZ_VARS {
+        return k & (IRFUZZ_MEM - 1);
+    }
+    return (val + k) & (IRFUZZ_MEM - 1);
+}
+
+/// The f64 variables while a description is worked out.
+struct IrfW {
+    w0: f64,
+    w1: f64,
+}
+
+fn irf_wset(w: & mut IrfW, i: i64, x: f64) {
+    if i == 0 {
+        w.w0 = x;
+    } else {
+        w.w1 = x;
+    }
+}
+
+/// The first values of v2 and v3 (v0 and v1 are the arguments).
+@wrapping pub fn irfuzz_init(seed: i64, which: i64) -> i64 {
+    return (seed * 1103515245 + 12345 * (which + 1)) % 1000003 - 500000;
+}
+
+/// The two arguments main passes (a, then b).
+@wrapping pub fn irfuzz_arg(seed: i64, which: i64) -> i64 {
+    return ((seed + 7) * 2246822519 + which * 3266489917) % 2000001 - 1000000;
+}
+
+@wrapping fn irf_apply(op: i64, x: i64, y: i64) -> i64 {
+    if op == 0 {
+        return x + y;
+    }
+    if op == 1 {
+        return x - y;
+    }
+    if op == 2 {
+        return x * y;
+    }
+    if op == 3 {
+        return x & y;
+    }
+    if op == 4 {
+        return x | y;
+    }
+    if op == 5 {
+        return x ^ y;
+    }
+    if op == 6 {
+        return x << y;
+    }
+    if op == 7 {
+        return x >> y;
+    }
+    if op == 8 {
+        return x / y;
+    }
+    return x % y;
+}
+
+fn irf_compare(cmp: i64, x: i64, y: i64) -> bool {
+    if cmp == 0 {
+        return x == y;
+    }
+    if cmp == 1 {
+        return x != y;
+    }
+    if cmp == 2 {
+        return x < y;
+    }
+    if cmp == 3 {
+        return x > y;
+    }
+    if cmp == 4 {
+        return x <= y;
+    }
+    return x >= y;
+}
+
+/// Statements p[from..to) on the variables v, w and the buffer `mem`;
+/// a call works out the called unit of `seed` the same way.
+fn irf_eval_list(p: & Vec<i64>, from: i64, to: i64, v: & mut Vec<i64>, w: & mut IrfW, mem: & mut Vec<i64>, seed: i64) {
+    var pos: i64 = from;
+    while pos < to {
+        var kind: i64 = p.get(pos);
+        if kind == 1 {
+            var r1: i64 = irf_apply(p.get(pos + 3), v.get(p.get(pos + 2)), v.get(p.get(pos + 4)));
+            v.set(p.get(pos + 1), r1);
+        } else if kind == 2 {
+            var r2: i64 = irf_apply(p.get(pos + 3), v.get(p.get(pos + 2)), p.get(pos + 4));
+            v.set(p.get(pos + 1), r2);
+        } else if kind == 3 {
+            var nt: i64 = p.get(pos + 4);
+            var ne: i64 = p.get(pos + 5);
+            var body: i64 = pos + 6;
+            if irf_compare(p.get(pos + 2), v.get(p.get(pos + 1)), v.get(p.get(pos + 3))) {
+                irf_eval_list(p, body, body + nt, v, w, mem, seed);
+            } else {
+                irf_eval_list(p, body + nt, body + nt + ne, v, w, mem, seed);
+            }
+        } else if kind == 4 {
+            var times: i64 = p.get(pos + 1);
+            var nb: i64 = p.get(pos + 2);
+            var t: i64 = 0;
+            while t < times {
+                irf_eval_list(p, pos + 3, pos + 3 + nb, v, w, mem, seed);
+                t = t + 1;
+            }
+        } else if kind == 5 {
+            var x5: f64 = irf_fapply(p.get(pos + 3), irf_mask_f(v.get(p.get(pos + 2))), irf_fconst(p.get(pos + 4)));
+            irf_wset(w, p.get(pos + 1), x5);
+        } else if kind == 6 {
+            var wa: f64 = w.w0;
+            if p.get(pos + 2) != 0 {
+                wa = w.w1;
+            }
+            var wb: f64 = w.w0;
+            if p.get(pos + 4) != 0 {
+                wb = w.w1;
+            }
+            var r6: i64 = irf_fcombine(p.get(pos + 3), wa, wb);
+            v.set(p.get(pos + 1), r6);
+        } else if kind == 7 || kind == 8 {
+            var ix: i64 = p.get(pos + 2);
+            var iv: i64 = 0;
+            if ix < IRFUZZ_VARS {
+                iv = v.get(ix);
+            }
+            var at: i64 = irf_mem_index(ix, p.get(pos + 3), iv);
+            if kind == 7 {
+                mem.set(at, v.get(p.get(pos + 1)));
+            } else {
+                v.set(p.get(pos + 1), mem.get(at));
+            }
+        } else {
+            var r9: i64 = irf_eval_unit(seed, p.get(pos + 2), v.get(p.get(pos + 3)), v.get(p.get(pos + 4)));
+            v.set(p.get(pos + 1), r9);
+        }
+        pos = pos + irf_stmt_len(p, pos);
+    }
+}
+
+/// What unit `unit` of seed `seed` (-1 fz_target, k fz_h<k>) returns
+/// for the arguments a and b.
+pub fn irf_eval_unit(seed: i64, unit: i64, a: i64, b: i64) -> i64 {
+    var p: Vec<i64> = irf_unit_program(seed, unit);
+    var us: i64 = irf_unit_seed(seed, unit);
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(irfuzz_init(us, 2));
+    v.push(irfuzz_init(us, 3));
+    var w: IrfW = IrfW {
+        w0: irf_finit(us, 0), w1: irf_finit(us, 1)
+    };
+    var mem: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < IRFUZZ_MEM {
+        mem.push(0);
+        j = j + 1;
+    }
+    irf_eval_list(& p, 0, p.len(), & mut v, & mut w, & mut mem, seed);
+    return v.get(0);
+}
+
+/// What fz_target returns for seed `seed` (arguments irfuzz_arg).
+pub fn irfuzz_eval(seed: i64) -> i64 {
+    return irf_eval_unit(seed, 0 - 1, irfuzz_arg(seed, 0), irfuzz_arg(seed, 1));
+}
+
+/// An integer as source text (a negative one as `(0 - n)`).
+@wrapping fn irf_int_src(x: i64) -> str {
+    if x < 0 {
+        return "(0 - " + int_to_str(0 - x) + ")";
+    }
+    return int_to_str(x);
+}
+
+fn irf_op_src(op: i64) -> str {
+    if op == 0 {
+        return "+";
+    }
+    if op == 1 {
+        return "-";
+    }
+    if op == 2 {
+        return "*";
+    }
+    if op == 3 {
+        return "&";
+    }
+    if op == 4 {
+        return "|";
+    }
+    if op == 5 {
+        return "^";
+    }
+    if op == 6 {
+        return "<<";
+    }
+    if op == 7 {
+        return ">>";
+    }
+    if op == 8 {
+        return "/";
+    }
+    return "%";
+}
+
+fn irf_cmp_src(cmp: i64) -> str {
+    if cmp == 0 {
+        return "==";
+    }
+    if cmp == 1 {
+        return "!=";
+    }
+    if cmp == 2 {
+        return "<";
+    }
+    if cmp == 3 {
+        return ">";
+    }
+    if cmp == 4 {
+        return "<=";
+    }
+    return ">=";
+}
+
+/// Source of statements p[from..to) of a fz_h<k> (no buffer: statements
+/// 7 and 8 are fz_target's only); `nloop` numbers the loop counters.
+fn irf_src_list(p: & Vec<i64>, from: i64, to: i64, ind: str, nloop: & mut Vec<i64>) -> str {
+    var out: str = "";
+    var pos: i64 = from;
+    while pos < to {
+        var kind: i64 = p.get(pos);
+        var d: str = int_to_str(p.get(pos + 1));
+        if kind == 1 {
+            out = out + ind + "v" + d + " = v" + int_to_str(p.get(pos + 2)) + " " + irf_op_src(p.get(pos + 3)) + " v" + int_to_str(p.get(pos + 4)) + ";\n";
+        } else if kind == 2 {
+            out = out + ind + "v" + d + " = v" + int_to_str(p.get(pos + 2)) + " " + irf_op_src(p.get(pos + 3)) + " " + irf_int_src(p.get(pos + 4)) + ";\n";
+        } else if kind == 3 {
+            var nt: i64 = p.get(pos + 4);
+            var ne: i64 = p.get(pos + 5);
+            var body: i64 = pos + 6;
+            out = out + ind + "if v" + d + " " + irf_cmp_src(p.get(pos + 2)) + " v" + int_to_str(p.get(pos + 3)) + " {\n";
+            out = out + irf_src_list(p, body, body + nt, ind + "    ", nloop);
+            out = out + ind + "} else {\n";
+            out = out + irf_src_list(p, body + nt, body + nt + ne, ind + "    ", nloop);
+            out = out + ind + "}\n";
+        } else if kind == 4 {
+            var tn: str = "t" + int_to_str(nloop.get(0));
+            nloop.set(0, nloop.get(0) + 1);
+            out = out + ind + "var " + tn + ": i64 = 0;\n";
+            out = out + ind + "while " + tn + " < " + d + " {\n";
+            out = out + irf_src_list(p, pos + 3, pos + 3 + p.get(pos + 2), ind + "    ", nloop);
+            out = out + ind + "    " + tn + " = " + tn + " + 1;\n";
+            out = out + ind + "}\n";
+        } else if kind == 5 {
+            var fop: str = irf_op_src(p.get(pos + 3));
+            if p.get(pos + 3) == 3 {
+                fop = "/";
+            }
+            out = out + ind + "w" + d + " = (((v" + int_to_str(p.get(pos + 2)) + " & 1048575) - 524288) as f64) " + fop + " " + irf_fconst_src(p.get(pos + 4)) + ";\n";
+        } else if kind == 6 {
+            var ga: str = "w" + int_to_str(p.get(pos + 2));
+            var gb: str = "w" + int_to_str(p.get(pos + 4));
+            var gop: i64 = p.get(pos + 3);
+            if gop < 2 {
+                out = out + ind + "v" + d + " = (" + ga + " " + irf_op_src(gop) + " " + gb + ") as i64;\n";
+            } else {
+                var gc: str = "<";
+                if gop == 3 {
+                    gc = "<=";
+                }
+                out = out + ind + "if " + ga + " " + gc + " " + gb + " {\n" + ind + "    v" + d + " = 1;\n" + ind + "} else {\n" + ind + "    v" + d + " = 0;\n" + ind + "}\n";
+            }
+        } else if kind == 7 || kind == 8 {
+            // the buffer as a Vec<i64> `mem` (irfuzz_unit_source of fz_target)
+            var at: str = irf_int_src(p.get(pos + 3) & (IRFUZZ_MEM - 1));
+            if p.get(pos + 2) < IRFUZZ_VARS {
+                at = "(v" + int_to_str(p.get(pos + 2)) + " + " + irf_int_src(p.get(pos + 3)) + ") & " + int_to_str(IRFUZZ_MEM - 1);
+            }
+            if kind == 7 {
+                out = out + ind + "mem.set(" + at + ", v" + d + ");\n";
+            } else {
+                out = out + ind + "v" + d + " = mem.get(" + at + ");\n";
+            }
+        } else if kind == 9 {
+            out = out + ind + "v" + d + " = fz_h" + int_to_str(p.get(pos + 2)) + "(v" + int_to_str(p.get(pos + 3)) + ", v" + int_to_str(p.get(pos + 4)) + ");\n";
+        }
+        pos = pos + irf_stmt_len(p, pos);
+    }
+    return out;
+}
+
+/// Source of seed `seed`'s fz_h<k>: it computes what its description
+/// says (irf_eval_unit), as irfuzz_helper_function's IR does.
+pub fn irfuzz_helper_source(seed: i64, k: i64) -> str {
+    return irfuzz_unit_source(seed, k, "fz_h" + int_to_str(k));
+}
+
+/// Source of unit `unit` (-1 fz_target, k fz_h<k>) as a function named
+/// `name` that computes what irf_eval_unit does; fz_target's buffer is a
+/// Vec<i64> here (tests/tooling/irfuzz-mirror-check.sh runs these
+/// against irfuzz_eval).
+pub fn irfuzz_unit_source(seed: i64, unit: i64, name: str) -> str {
+    var k: i64 = unit;
+    var us: i64 = irf_unit_seed(seed, k);
+    var p: Vec<i64> = irf_unit_program(seed, k);
+    var src: str = "@wrapping fn " + name + "(a: i64, b: i64) -> i64 {\n";
+    src = src + "    var v0: i64 = a;\n    var v1: i64 = b;\n";
+    if unit < 0 {
+        src = src + "    var mem: Vec<i64> = Vec::new();\n    while mem.len() < " + int_to_str(IRFUZZ_MEM) + " {\n        mem.push(0);\n    }\n";
+    }
+    src = src + "    var v2: i64 = " + irf_int_src(irfuzz_init(us, 2)) + ";\n";
+    src = src + "    var v3: i64 = " + irf_int_src(irfuzz_init(us, 3)) + ";\n";
+    src = src + "    var w0: f64 = ((" + irf_int_src(irf_finit_k(us, 0)) + ") as f64) * 0.75;\n";
+    src = src + "    var w1: f64 = ((" + irf_int_src(irf_finit_k(us, 1)) + ") as f64) * 0.75;\n";
+    var nloop: Vec<i64> = Vec::new();
+    nloop.push(0);
+    src = src + irf_src_list(& p, 0, p.len(), "    ", & mut nloop);
+    src = src + "    return v0;\n}\n";
+    return src;
+}
+
+/// The program `fid ir-fuzz` builds: fz_target's body is replaced by
+/// irfuzz_function, each fz_h<k>'s by irfuzz_install_helpers (its source
+/// here computes the same value). fz_target's template body calls every
+/// helper (so the lowering keeps them) and allocates (so main's call to
+/// it is not taken for a pure one, which the random body is not).
+pub fn irfuzz_template(seed: i64) -> str {
+    var a: str = int_to_str(irfuzz_arg(seed, 0));
+    var b: str = int_to_str(irfuzz_arg(seed, 1));
+    var src: str = "";
+    var body: str = "fn fz_target(a: i64, b: i64) -> i64 {\n    var keep: Vec<i64> = Vec::new();\n";
+    var k: i64 = 0;
+    while k < IRFUZZ_HELPERS {
+        src = src + irfuzz_helper_source(seed, k) + "\n";
+        body = body + "    keep.push(fz_h" + int_to_str(k) + "(a, b));\n";
+        k = k + 1;
+    }
+    body = body + "    return keep.get(0) ^ keep.get(keep.len() - 1);\n}\n";
+    return src + body + "\nfn main() -> i64 {\n    println(fz_target(0 + " + a + ", 0 + " + b + "));\n    return 0;\n}\n";
+}
+
+fn irf_binop(op: i64) -> BinOp {
+    if op == 0 {
+        return BinOp::Add;
+    }
+    if op == 1 {
+        return BinOp::Sub;
+    }
+    if op == 2 {
+        return BinOp::Mul;
+    }
+    if op == 3 {
+        return BinOp::BitAnd;
+    }
+    if op == 4 {
+        return BinOp::BitOr;
+    }
+    if op == 5 {
+        return BinOp::BitXor;
+    }
+    if op == 6 {
+        return BinOp::Shl;
+    }
+    if op == 7 {
+        return BinOp::Shr;
+    }
+    if op == 8 {
+        return BinOp::Div;
+    }
+    return BinOp::Mod;
+}
+
+fn irf_cmpop(cmp: i64) -> BinOp {
+    if cmp == 0 {
+        return BinOp::Eq;
+    }
+    if cmp == 1 {
+        return BinOp::Neq;
+    }
+    if cmp == 2 {
+        return BinOp::Lt;
+    }
+    if cmp == 3 {
+        return BinOp::Gt;
+    }
+    if cmp == 4 {
+        return BinOp::LtEq;
+    }
+    return BinOp::GtEq;
+}
+
+/// The loops of a description (each gets a counter slot in the entry block).
+fn irf_count_loops(p: & Vec<i64>, from: i64, to: i64) -> i64 {
+    var n: i64 = 0;
+    var pos: i64 = from;
+    while pos < to {
+        var kind: i64 = p.get(pos);
+        if kind == 3 {
+            var nt: i64 = p.get(pos + 4);
+            var ne: i64 = p.get(pos + 5);
+            n = n + irf_count_loops(p, pos + 6, pos + 6 + nt + ne);
+        } else if kind == 4 {
+            var nb: i64 = p.get(pos + 2);
+            n = n + 1 + irf_count_loops(p, pos + 3, pos + 3 + nb);
+        }
+        pos = pos + irf_stmt_len(p, pos);
+    }
+    return n;
+}
+
+fn irf_load(f: & mut IrFunction, slots: & Vec<i64>, var_ix: i64) -> i64 {
+    return IrFunction_emit(f, Inst::Load(slots.get(var_ix), IrType::I64));
+}
+
+fn irf_store(f: & mut IrFunction, slots: & Vec<i64>, var_ix: i64, value: i64) {
+    var _s: i64 = IrFunction_emit(f, Inst::Store(slots.get(var_ix), value, OptIrType::Some(IrType::I64)));
+}
+
+fn irf_fload(f: & mut IrFunction, fslots: & Vec<i64>, var_ix: i64) -> i64 {
+    return IrFunction_emit(f, Inst::Load(fslots.get(var_ix), IrType::F64));
+}
+
+fn irf_fstore(f: & mut IrFunction, fslots: & Vec<i64>, var_ix: i64, value: i64) {
+    var _s: i64 = IrFunction_emit(f, Inst::Store(fslots.get(var_ix), value, OptIrType::Some(IrType::F64)));
+}
+
+fn irf_fbinop(op: i64) -> BinOp {
+    if op == 0 {
+        return BinOp::Add;
+    }
+    if op == 1 {
+        return BinOp::Sub;
+    }
+    if op == 2 {
+        return BinOp::Mul;
+    }
+    return BinOp::Div;
+}
+
+fn irf_const_i64(f: & mut IrFunction, k: i64) -> i64 {
+    return IrFunction_emit(f, Inst::ConstInt(k, IrType::I64));
+}
+
+/// Statement 6's compares: v[d] = 1 when `c` holds, else 0, through
+/// blocks of their own.
+fn irf_emit_flag(f: & mut IrFunction, slots: & Vec<i64>, d: i64, c: i64) {
+    var tb: i64 = IrFunction_new_block(f);
+    var eb: i64 = IrFunction_new_block(f);
+    var jb: i64 = IrFunction_new_block(f);
+    var _br: i64 = IrFunction_emit(f, Inst::Branch(c, tb, eb));
+    f.current_block_idx = tb;
+    var one: i64 = irf_const_i64(f, 1);
+    irf_store(f, slots, d, one);
+    var _j1: i64 = IrFunction_emit(f, Inst::Jump(jb));
+    f.current_block_idx = eb;
+    var zero: i64 = irf_const_i64(f, 0);
+    irf_store(f, slots, d, zero);
+    var _j2: i64 = IrFunction_emit(f, Inst::Jump(jb));
+    f.current_block_idx = jb;
+}
+
+/// The IR of statements p[from..to) into `f`; `next_loop` holds the next
+/// loop's counter slot (an index into `slots`); `fslots` are w0, w1;
+/// `mem_ptr` is the buffer as *i64 (fz_target only).
+fn irf_emit_list(f: & mut IrFunction, p: & Vec<i64>, from: i64, to: i64, slots: & Vec<i64>, fslots: & Vec<i64>, mem_ptr: i64, next_loop: & mut Vec<i64>) {
+    var pos: i64 = from;
+    while pos < to {
+        var kind: i64 = p.get(pos);
+        if kind >= 5 {
+            irf_emit_more(f, p, pos, slots, fslots, mem_ptr);
+            pos = pos + irf_stmt_len(p, pos);
+        } else if kind == 1 {
+            var x: i64 = irf_load(f, slots, p.get(pos + 2));
+            var y: i64 = irf_load(f, slots, p.get(pos + 4));
+            var r: i64 = IrFunction_emit(f, Inst::BinOp(irf_binop(p.get(pos + 3)), x, y, IrType::I64));
+            irf_store(f, slots, p.get(pos + 1), r);
+            pos = pos + 5;
+        } else if kind == 2 {
+            var x2: i64 = irf_load(f, slots, p.get(pos + 2));
+            var k: i64 = IrFunction_emit(f, Inst::ConstInt(p.get(pos + 4), IrType::I64));
+            var r2: i64 = IrFunction_emit(f, Inst::BinOp(irf_binop(p.get(pos + 3)), x2, k, IrType::I64));
+            irf_store(f, slots, p.get(pos + 1), r2);
+            pos = pos + 5;
+        } else if kind == 3 {
+            var nt: i64 = p.get(pos + 4);
+            var ne: i64 = p.get(pos + 5);
+            var body: i64 = pos + 6;
+            var a: i64 = irf_load(f, slots, p.get(pos + 1));
+            var b: i64 = irf_load(f, slots, p.get(pos + 3));
+            var c: i64 = IrFunction_emit(f, Inst::BinOp(irf_cmpop(p.get(pos + 2)), a, b, IrType::Bool));
+            var tb: i64 = IrFunction_new_block(f);
+            var eb: i64 = IrFunction_new_block(f);
+            var jb: i64 = IrFunction_new_block(f);
+            var _br: i64 = IrFunction_emit(f, Inst::Branch(c, tb, eb));
+            f.current_block_idx = tb;
+            irf_emit_list(f, p, body, body + nt, slots, fslots, mem_ptr, next_loop);
+            var _j1: i64 = IrFunction_emit(f, Inst::Jump(jb));
+            f.current_block_idx = eb;
+            irf_emit_list(f, p, body + nt, body + nt + ne, slots, fslots, mem_ptr, next_loop);
+            var _j2: i64 = IrFunction_emit(f, Inst::Jump(jb));
+            f.current_block_idx = jb;
+            pos = body + nt + ne;
+        } else {
+            var times: i64 = p.get(pos + 1);
+            var nb: i64 = p.get(pos + 2);
+            var cs: i64 = next_loop.get(0);
+            next_loop.set(0, cs + 1);
+            var zero: i64 = IrFunction_emit(f, Inst::ConstInt(0, IrType::I64));
+            irf_store(f, slots, cs, zero);
+            var hb: i64 = IrFunction_new_block(f);
+            var bb: i64 = IrFunction_new_block(f);
+            var xb: i64 = IrFunction_new_block(f);
+            var _j0: i64 = IrFunction_emit(f, Inst::Jump(hb));
+            f.current_block_idx = hb;
+            var iv: i64 = irf_load(f, slots, cs);
+            var lim: i64 = IrFunction_emit(f, Inst::ConstInt(times, IrType::I64));
+            var more: i64 = IrFunction_emit(f, Inst::BinOp(BinOp::Lt, iv, lim, IrType::Bool));
+            var _bl: i64 = IrFunction_emit(f, Inst::Branch(more, bb, xb));
+            f.current_block_idx = bb;
+            irf_emit_list(f, p, pos + 3, pos + 3 + nb, slots, fslots, mem_ptr, next_loop);
+            var iv2: i64 = irf_load(f, slots, cs);
+            var one: i64 = IrFunction_emit(f, Inst::ConstInt(1, IrType::I64));
+            var iv3: i64 = IrFunction_emit(f, Inst::BinOp(BinOp::Add, iv2, one, IrType::I64));
+            irf_store(f, slots, cs, iv3);
+            var _jb: i64 = IrFunction_emit(f, Inst::Jump(hb));
+            f.current_block_idx = xb;
+            pos = pos + 3 + nb;
+        }
+    }
+}
+
+/// The IR of statement p[pos] of kind 5 to 9 (f64, buffer, call).
+fn irf_emit_more(f: & mut IrFunction, p: & Vec<i64>, pos: i64, slots: & Vec<i64>, fslots: & Vec<i64>, mem_ptr: i64) {
+    var kind: i64 = p.get(pos);
+    if kind == 5 {
+        // w[e] = (((v[a] & 0xFFFFF) - 0x80000) as f64) fop C
+        var x: i64 = irf_load(f, slots, p.get(pos + 2));
+        var lo: i64 = irf_const_i64(f, 1048575);
+        var m: i64 = IrFunction_emit(f, Inst::BinOp(BinOp::BitAnd, x, lo, IrType::I64));
+        var mid: i64 = irf_const_i64(f, 524288);
+        var c: i64 = IrFunction_emit(f, Inst::BinOp(BinOp::Sub, m, mid, IrType::I64));
+        var xf: i64 = IrFunction_emit(f, Inst::IntToFloat(c, IrType::I64, IrType::F64));
+        var kf: i64 = IrFunction_emit(f, Inst::ConstFloat(irf_fconst(p.get(pos + 4)), IrType::F64));
+        var r: i64 = IrFunction_emit(f, Inst::BinOp(irf_fbinop(p.get(pos + 3)), xf, kf, IrType::F64));
+        irf_fstore(f, fslots, p.get(pos + 1), r);
+        return;
+    }
+    if kind == 6 {
+        var wa: i64 = irf_fload(f, fslots, p.get(pos + 2));
+        var wb: i64 = irf_fload(f, fslots, p.get(pos + 4));
+        var gop: i64 = p.get(pos + 3);
+        if gop < 2 {
+            var s: i64 = IrFunction_emit(f, Inst::BinOp(irf_fbinop(gop), wa, wb, IrType::F64));
+            var si: i64 = IrFunction_emit(f, Inst::FloatToInt(s, IrType::F64, IrType::I64));
+            irf_store(f, slots, p.get(pos + 1), si);
+        } else {
+            var cmp: BinOp = BinOp::Lt;
+            if gop == 3 {
+                cmp = BinOp::LtEq;
+            }
+            var cf: i64 = IrFunction_emit(f, Inst::BinOp(cmp, wa, wb, IrType::Bool));
+            irf_emit_flag(f, slots, p.get(pos + 1), cf);
+        }
+        return;
+    }
+    if kind == 7 || kind == 8 {
+        // the word at (v[ix] + k) & 7, or at k & 7
+        var ix: i64 = p.get(pos + 2);
+        var k: i64 = p.get(pos + 3);
+        var idx: i64 = 0;
+        if ix >= IRFUZZ_VARS {
+            idx = irf_const_i64(f, k & (IRFUZZ_MEM - 1));
+        } else {
+            var xv: i64 = irf_load(f, slots, ix);
+            var kv: i64 = irf_const_i64(f, k);
+            var sum: i64 = IrFunction_emit(f, Inst::BinOp(BinOp::Add, xv, kv, IrType::I64));
+            var mask: i64 = irf_const_i64(f, IRFUZZ_MEM - 1);
+            idx = IrFunction_emit(f, Inst::BinOp(BinOp::BitAnd, sum, mask, IrType::I64));
+        }
+        var ep: i64 = IrFunction_emit(f, Inst::GetElemPtr(mem_ptr, idx, IrType::I64));
+        if kind == 7 {
+            var sv: i64 = irf_load(f, slots, p.get(pos + 1));
+            var _st: i64 = IrFunction_emit(f, Inst::Store(ep, sv, OptIrType::Some(IrType::I64)));
+        } else {
+            var lv: i64 = IrFunction_emit(f, Inst::Load(ep, IrType::I64));
+            irf_store(f, slots, p.get(pos + 1), lv);
+        }
+        return;
+    }
+    // 9: v[d] = fz_h<h>(v[a], v[b]), with a null environment first (as
+    // the lowering calls a function)
+    var args: Vec<i64> = Vec::new();
+    args.push(irf_const_i64(f, 0));
+    args.push(irf_load(f, slots, p.get(pos + 3)));
+    args.push(irf_load(f, slots, p.get(pos + 4)));
+    var callee: str = "fz_h" + int_to_str(p.get(pos + 2));
+    var rv: i64 = IrFunction_emit(f, Inst::Call(callee, args, IrType::I64, EffectSet_new()));
+    irf_store(f, slots, p.get(pos + 1), rv);
+}
+
+/// `old` (the lowered fz_target: its parameters `__env, a, b` are kept)
+/// with the body of seed `seed`'s description.
+pub fn irfuzz_function(old: IrFunction, seed: i64) -> IrFunction {
+    return irf_build(old, seed, 0 - 1);
+}
+
+/// `old` (the lowered fz_h<k>) with the body of seed `seed`'s description
+/// of fz_h<k>.
+pub fn irfuzz_helper_function(old: IrFunction, seed: i64, k: i64) -> IrFunction {
+    return irf_build(old, seed, k);
+}
+
+/// Each fz_h<k> of the template, lowered, replaced by its random IR (call
+/// after replacing fz_target: the value stays irfuzz_eval's). False when
+/// the module lacks one.
+pub fn irfuzz_install_helpers(m: & mut IrModule, seed: i64) -> bool {
+    var k: i64 = 0;
+    while k < IRFUZZ_HELPERS {
+        var name: str = "fz_h" + int_to_str(k);
+        match IrModule_get_function(m, name) {
+            OptIrFunction::Some(old) => {
+                if old.params.len() < 2 {
+                    return false;
+                }
+                var f: IrFunction = irf_build(old, seed, k);
+                IrModule_replace_function_named(m, f, name);
+            }
+            OptIrFunction::None => {
+                return false;
+            }
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// `old` with the body of unit `unit`'s description (-1 fz_target, k
+/// fz_h<k>).
+fn irf_build(old: IrFunction, seed: i64, unit: i64) -> IrFunction {
+    var f: IrFunction = old;
+    var nv: i64 = 0;
+    var i: i64 = 0;
+    while i < f.params.len() {
+        if f.params.get(i).id + 1 > nv {
+            nv = f.params.get(i).id + 1;
+        }
+        i = i + 1;
+    }
+    var metas: Vec<ValueIdMeta> = Vec::new();
+    i = 0;
+    while i < old.value_metas.len() {
+        if old.value_metas.get(i).id < nv {
+            metas.push(old.value_metas.get(i));
+        }
+        i = i + 1;
+    }
+    f.value_metas = metas;
+    f.next_value = nv;
+    f.blocks = Vec::new();
+    f.blocks.push(BasicBlock_new(0));
+    f.next_block = 1;
+    f.current_block_idx = 0;
+    f.entry = 0;
+    f.insts = Vec::new();
+    f.inst_at = Vec::new();
+    f.locals = Vec::new();
+    f.drop_locals = Vec::new();
+    f.zeroize_locals = Vec::new();
+    f.secret_values = Vec::new();
+    f.persist_vars = Vec::new();
+    f.is_wrapping = true;
+    var has_mem: bool = unit < 0;
+    if has_mem {
+        // the body allocates and writes the buffer
+        f.is_no_alloc = false;
+        var feff: EffectSet = EffectSet_new();
+        EffectSet_add_all(& mut feff, & old.effects);
+        EffectSet_add(& mut feff, Effect::Alloc);
+        EffectSet_add(& mut feff, Effect::Write);
+        f.effects = feff;
+    }
+    var us: i64 = irf_unit_seed(seed, unit);
+    var p: Vec<i64> = irf_unit_program(seed, unit);
+    var slots: Vec<i64> = Vec::new();
+    var nslots: i64 = IRFUZZ_VARS + irf_count_loops(& p, 0, p.len());
+    i = 0;
+    while i < nslots {
+        slots.push(IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack)));
+        i = i + 1;
+    }
+    var fslots: Vec<i64> = Vec::new();
+    i = 0;
+    while i < IRFUZZ_FVARS {
+        fslots.push(IrFunction_emit(& mut f, Inst::Alloca(IrType::F64, Region::Stack)));
+        i = i + 1;
+    }
+    var np: i64 = f.params.len();
+    var pa: i64 = f.params.get(np - 2).id;
+    var pb: i64 = f.params.get(np - 1).id;
+    irf_store(& mut f, & slots, 0, pa);
+    irf_store(& mut f, & slots, 1, pb);
+    var c2: i64 = IrFunction_emit(& mut f, Inst::ConstInt(irfuzz_init(us, 2), IrType::I64));
+    irf_store(& mut f, & slots, 2, c2);
+    var c3: i64 = IrFunction_emit(& mut f, Inst::ConstInt(irfuzz_init(us, 3), IrType::I64));
+    irf_store(& mut f, & slots, 3, c3);
+    i = 0;
+    while i < IRFUZZ_FVARS {
+        var wi: i64 = IrFunction_emit(& mut f, Inst::ConstFloat(irf_finit(us, i), IrType::F64));
+        irf_fstore(& mut f, & fslots, i, wi);
+        i = i + 1;
+    }
+    // fz_target's heap buffer: IRFUZZ_MEM words from p_malloc, zeroed
+    var raw: i64 = 0 - 1;
+    var mem_ptr: i64 = 0 - 1;
+    if has_mem {
+        var margs: Vec<i64> = Vec::new();
+        margs.push(irf_const_i64(& mut f, IRFUZZ_MEM * 8));
+        var aeff: EffectSet = EffectSet_new();
+        EffectSet_add(& mut aeff, Effect::Alloc);
+        EffectSet_add(& mut aeff, Effect::Write);
+        raw = IrFunction_emit(& mut f, Inst::Call("p_malloc", margs, IrType::Ptr(Box::new(IrType::U8)), aeff));
+        mem_ptr = IrFunction_emit(& mut f, Inst::BitCast(raw, IrType::Ptr(Box::new(IrType::U8)), IrType::Ptr(Box::new(IrType::I64))));
+        var zero: i64 = irf_const_i64(& mut f, 0);
+        var j: i64 = 0;
+        while j < IRFUZZ_MEM {
+            var jx: i64 = irf_const_i64(& mut f, j);
+            var jp: i64 = IrFunction_emit(& mut f, Inst::GetElemPtr(mem_ptr, jx, IrType::I64));
+            var _zs: i64 = IrFunction_emit(& mut f, Inst::Store(jp, zero, OptIrType::Some(IrType::I64)));
+            j = j + 1;
+        }
+    }
+    var next_loop: Vec<i64> = Vec::new();
+    next_loop.push(IRFUZZ_VARS);
+    irf_emit_list(& mut f, & p, 0, p.len(), & slots, & fslots, mem_ptr, & mut next_loop);
+    var res: i64 = irf_load(& mut f, & slots, 0);
+    if has_mem {
+        var fargs: Vec<i64> = Vec::new();
+        fargs.push(raw);
+        var feff2: EffectSet = EffectSet_new();
+        EffectSet_add(& mut feff2, Effect::Alloc);
+        var _fr: i64 = IrFunction_emit(& mut f, Inst::Call("p_free", fargs, IrType::Void, feff2));
+    }
+    var _ret: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(res)));
+    return f;
 }

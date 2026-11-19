@@ -1,0 +1,73 @@
+// Test (lower.fd LOWER_STATIC_FN_ENVS): a function named as a value, with
+// no captures, uses one static env per function instead of an 8-byte heap
+// block that nothing freed. It is called directly, through a parameter, a
+// local, a returned value, a Vec element and a struct field, in a loop,
+// with a str result; `fid run --leaks` of it reports every block freed.
+// Expected output:
+// 42
+// 10
+// 7
+// 12 14
+// 20
+// 4950
+// h(x)=hi x
+// h(y)=hi y
+// done
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn inc(x: i64) -> i64 {
+    return x + 1;
+}
+
+fn greet(s: str) -> str {
+    return "hi " + s;
+}
+
+struct Op {
+    f: fn(i64) -> i64,
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn pick(n: i64) -> fn(i64) -> i64 {
+    if n == 0 {
+        return twice;
+    }
+    return inc;
+}
+
+fn call_str(h: fn(str) -> str, x: str) -> str {
+    return h(x);
+}
+
+fn main() {
+    println(int_to_str(apply(twice, 21)));
+    val h: fn(i64) -> i64 = twice;
+    println(int_to_str(h(5)));
+    println(int_to_str(apply(pick(1), 6)));
+    var fs: Vec<fn(i64) -> i64> = Vec::new();
+    fs.push(twice);
+    fs.push(inc);
+    val f0: fn(i64) -> i64 = fs.get(0);
+    val f1: fn(i64) -> i64 = fs.get(1);
+    println(int_to_str(f0(6)) + " " + int_to_str(f1(13)));
+    val op: Op = Op { f: inc };
+    val of: fn(i64) -> i64 = op.f;
+    println(int_to_str(of(19)));
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        s = s + apply(inc, i) - 1;
+        i = i + 1;
+    }
+    println(int_to_str(s));
+    val gs: fn(str) -> str = greet;
+    println("h(x)=" + gs("x"));
+    println("h(y)=" + call_str(greet, "y"));
+    println("done");
+}

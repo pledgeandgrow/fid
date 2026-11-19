@@ -1,0 +1,108 @@
+// stdlib/world (complaint CT1): a test replaces the file system, the
+// clock and the network for code it does not change. `export_prices`
+// below is ordinary code over fs, http_client, time and datetime; the
+// test runs it against an in-memory file system, a fixed clock and an
+// in-process HTTP handler, so the output is the same on every run and
+// backend, and nothing touches the disk, the OS clock or a socket.
+//
+// Expected output:
+// result = ok
+// out.txt:
+// # prices at 2023-11-14T22:13:20Z
+// apple 120
+// pear 95
+// took 250 ms
+// files = config.txt,out.txt,log.txt
+// reads = 1 writes = 2
+// requests = 2
+// host 0 = prices.example:8080
+// req 0 = GET /price?item=apple
+// log = export done
+// on disk = false
+// missing config = no config
+// offline = fetch failed: apple
+// offline requests = 1
+// real clock again = true
+use fs;
+use time;
+use datetime;
+use http_client;
+use world;
+
+// ─── the code under test: no test hooks, no parameters for fakes ─────────
+
+fn export_prices(config_path: str, out_path: str) -> str {
+    if !fs_exists(config_path) { return "no config"; }
+    val lines: Vec<str> = fs_read_lines(config_path);
+    val host: str = str_trim(lines.get(0));
+    val start: i64 = clock_now_ms();
+    var out: str = "# prices at " + time_to_iso(dt_now()) + "\n";
+    var i: i64 = 1;
+    while i < lines.len() {
+        val item: str = str_trim(lines.get(i));
+        i = i + 1;
+        if str_len(item) == 0 { continue; }
+        val r = http_get(host, 8080, "/price?item=" + item);
+        if r.status != 200 { return "fetch failed: " + item; }
+        out = out + item + " " + str_trim(r.body) + "\n";
+    }
+    out = out + "took " + int_to_str(clock_elapsed_ms(start)) + " ms\n";
+    fs_write_text(out_path, out);
+    fs_append_text("log.txt", "export done");
+    return "ok";
+}
+
+// ─── the test's fake price server ────────────────────────────────────────
+
+fn price_server(host: str, port: i64, req: str) -> str {
+    val path: str = world_req_path(req);
+    // each answer "takes" 125 ms on the fake clock
+    world_clock_advance(125);
+    if str_equal(path, "/price?item=apple") { return world_http_response(200, "120"); }
+    if str_equal(path, "/price?item=pear") { return world_http_response(200, "95"); }
+    return world_http_response(404, "");
+}
+
+fn joined(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + ","; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    world_fake_files();
+    world_file_put("config.txt", "prices.example\napple\npear\n");
+    world_fake_clock(1700000000000);
+    world_fake_network(price_server);
+
+    println("result = " + export_prices("config.txt", "out.txt"));
+    println("out.txt:");
+    print(world_file_text("out.txt"));
+    println("files = " + joined(world_file_list()));
+    println("reads = " + int_to_str(world_file_reads()) + " writes = " + int_to_str(world_file_writes()));
+    println("requests = " + int_to_str(world_net_count()));
+    println("host 0 = " + world_net_host(0));
+    val r0: str = world_net_request(0);
+    println("req 0 = " + world_req_method(r0) + " " + world_req_path(r0));
+    println("log = " + world_file_text("log.txt"));
+    // the fake really kept the file off the disk
+    world_real_files();
+    println("on disk = " + (if fs_exists("out.txt") { "true" } else { "false" }));
+    world_fake_files();
+    println("missing config = " + export_prices("config.txt", "out.txt"));
+
+    // no network at all: the code's first request fails, and the test sees it tried
+    world_file_put("config.txt", "prices.example\napple\n");
+    world_no_network();
+    println("offline = " + export_prices("config.txt", "out.txt"));
+    println("offline requests = " + int_to_str(world_net_count()));
+
+    world_real_clock();
+    println("real clock again = " + (if clock_now_ms() > 1700000000000 { "true" } else { "false" }));
+    return 0;
+}

@@ -1,0 +1,267 @@
+// Fides utility AI standard library
+//
+// Utility-based decision making (the "infinite axis" utility system of
+// Dave Mark and Mike Lewis), pure computation (no seam):
+//   - response curves mapping a normalized input 0..1 to a utility 0..1:
+//     linear, quadratic/polynomial (any exponent), logistic and step, each
+//     with slope m, exponent k, x-shift c and y-shift b; the result is
+//     clamped to 0..1;
+//   - considerations: one named input from the context, its raw range
+//     (normalized and clamped to 0..1) and a curve;
+//   - actions: considerations multiplied together, with the compensation
+//     factor for the number of considerations (so an action with many
+//     considerations is not punished for having more factors below 1), and
+//     a weight;
+//   - a reasoner that picks the best action each tick, with inertia (the
+//     running action's score is multiplied by 1 + inertia, so near-ties do
+//     not flip-flop) and per-action cooldowns (an action used less than
+//     `cooldown` seconds ago scores 0).
+//
+// Usage:
+//   use utility_ai;
+//   var ctx: UtilContext = util_context();
+//   util_ctx_set(&mut ctx, "health", 30.0);
+//   var heal: UtilAction = util_action("heal", 1.0, 5.0);
+//   util_consider(&mut heal, util_consideration("health", 0.0, 100.0,
+//                 util_curve(UTIL_QUADRATIC, -1.0, 2.0, 1.0, 1.0)));
+//   val pick: i64 = util_select(&mut brain, &ctx, now);
+
+module utility_ai;
+use vec;
+use math;
+
+pub const UTIL_LINEAR: i64 = 0;
+pub const UTIL_QUADRATIC: i64 = 1;
+pub const UTIL_LOGISTIC: i64 = 2;
+pub const UTIL_STEP: i64 = 3;
+
+/// A response curve. linear: m*(x-c)+b; quadratic: m*(x-c)^k+b;
+/// logistic: k/(1+e^(-m*(x-c)))+b; step: k when x >= c, else b.
+pub struct UtilCurve {
+    pub kind: i64,
+    pub m: f64,
+    pub k: f64,
+    pub c: f64,
+    pub b: f64,
+}
+
+pub fn util_curve(kind: i64, m: f64, k: f64, c: f64, b: f64) -> UtilCurve {
+    return UtilCurve { kind: kind, m: m, k: k, c: c, b: b };
+}
+
+fn ua_clamp01(x: f64) -> f64 {
+    if x < 0.0 { return 0.0; }
+    if x > 1.0 { return 1.0; }
+    return x;
+}
+
+// x^k for x >= 0 or integral k (so (x - c)^2 of a negative x - c works)
+fn ua_pow(x: f64, k: f64) -> f64 {
+    if x >= 0.0 {
+        if x == 0.0 {
+            if k == 0.0 { return 1.0; }
+            return 0.0;
+        }
+        return math_pow(x, k);
+    }
+    val ki: i64 = k as i64;
+    if (ki as f64) == k {
+        var r: f64 = math_pow(- x, k);
+        if ki % 2 != 0 {
+            r = - r;
+        }
+        return r;
+    }
+    return 0.0;
+}
+
+/// The curve's utility at normalized input `x` (0..1), clamped to 0..1.
+pub fn util_curve_eval(cv: &UtilCurve, x0: f64) -> f64 {
+    val x: f64 = ua_clamp01(x0);
+    var y: f64 = 0.0;
+    if cv.kind == UTIL_LINEAR {
+        y = cv.m * (x - cv.c) + cv.b;
+    } else if cv.kind == UTIL_QUADRATIC {
+        y = cv.m * ua_pow(x - cv.c, cv.k) + cv.b;
+    } else if cv.kind == UTIL_LOGISTIC {
+        y = cv.k / (1.0 + math_exp(- cv.m * (x - cv.c))) + cv.b;
+    } else {
+        if x >= cv.c {
+            y = cv.k;
+        } else {
+            y = cv.b;
+        }
+    }
+    return ua_clamp01(y);
+}
+
+// ─── Context ──────────────────────────────────────────────────────────────
+
+/// The named inputs the considerations read (missing inputs read 0).
+pub struct UtilContext {
+    pub keys: Vec<str>,
+    pub vals: Vec<f64>,
+}
+
+pub fn util_context() -> UtilContext {
+    return UtilContext { keys: Vec::new(), vals: Vec::new() };
+}
+
+pub fn util_ctx_set(ctx: &mut UtilContext, key: str, value: f64) {
+    var i: i64 = 0;
+    while i < ctx.keys.len() {
+        if ctx.keys.get(i) == key {
+            ctx.vals.set(i, value);
+            return;
+        }
+        i = i + 1;
+    }
+    ctx.keys.push(key);
+    ctx.vals.push(value);
+}
+
+pub fn util_ctx_get(ctx: &UtilContext, key: str) -> f64 {
+    var i: i64 = 0;
+    while i < ctx.keys.len() {
+        if ctx.keys.get(i) == key {
+            return ctx.vals.get(i);
+        }
+        i = i + 1;
+    }
+    return 0.0;
+}
+
+// ─── Considerations and actions ───────────────────────────────────────────
+
+pub struct UtilConsideration {
+    pub input: str,
+    pub lo: f64,
+    pub hi: f64,
+    pub curve: UtilCurve,
+}
+
+/// Read `input`, map lo..hi to 0..1 (clamped), apply `curve`.
+pub fn util_consideration(input: str, lo: f64, hi: f64, curve: UtilCurve) -> UtilConsideration {
+    return UtilConsideration { input: input, lo: lo, hi: hi, curve: curve };
+}
+
+/// The normalized input of `c` in `ctx`.
+pub fn util_normalize(c: &UtilConsideration, ctx: &UtilContext) -> f64 {
+    val raw: f64 = util_ctx_get(ctx, c.input);
+    if c.hi == c.lo {
+        if raw >= c.hi { return 1.0; }
+        return 0.0;
+    }
+    return ua_clamp01((raw - c.lo) / (c.hi - c.lo));
+}
+
+pub fn util_consideration_score(c: &UtilConsideration, ctx: &UtilContext) -> f64 {
+    return util_curve_eval(&c.curve, util_normalize(c, ctx));
+}
+
+pub struct UtilAction {
+    pub name: str,
+    pub weight: f64,
+    pub cooldown: f64,
+    pub last_used: f64,
+    // time the action was last selected; negative: never
+    pub considerations: Vec<UtilConsideration>,
+}
+
+pub fn util_action(name: str, weight: f64, cooldown: f64) -> UtilAction {
+    return UtilAction { name: name, weight: weight, cooldown: cooldown, last_used: - 1.0, considerations: Vec::new() };
+}
+
+pub fn util_consider(a: &mut UtilAction, c: UtilConsideration) {
+    a.considerations.push(c);
+}
+
+/// Product of the consideration scores with the compensation factor
+/// (each score s becomes s + (1 - s) * (1 - 1/n) * s), times the weight.
+/// An action without considerations scores its weight.
+pub fn util_action_score(a: &UtilAction, ctx: &UtilContext) -> f64 {
+    val n: i64 = a.considerations.len();
+    if n == 0 {
+        return a.weight;
+    }
+    val modf: f64 = 1.0 - 1.0 / (n as f64);
+    var score: f64 = 1.0;
+    var i: i64 = 0;
+    while i < n {
+        val c: UtilConsideration = a.considerations.get(i);
+        val s: f64 = util_consideration_score(&c, ctx);
+        val makeup: f64 = (1.0 - s) * modf;
+        score = score * (s + makeup * s);
+        if score == 0.0 {
+            return 0.0;
+        }
+        i = i + 1;
+    }
+    return score * a.weight;
+}
+
+/// Is `a` cooling down at time `now`?
+pub fn util_on_cooldown(a: &UtilAction, now: f64) -> bool {
+    return a.last_used >= 0.0 && a.cooldown > 0.0 && now - a.last_used < a.cooldown;
+}
+
+// ─── Reasoner ─────────────────────────────────────────────────────────────
+
+pub struct UtilReasoner {
+    pub actions: Vec<UtilAction>,
+    pub current: i64,
+    // index of the running action, -1: none
+    pub inertia: f64,
+    // bonus fraction for the running action
+    pub scores: Vec<f64>,  // scores of the last selection, one per action
+}
+
+pub fn util_reasoner(inertia: f64) -> UtilReasoner {
+    return UtilReasoner { actions: Vec::new(), current: - 1, inertia: inertia, scores: Vec::new() };
+}
+
+pub fn util_add_action(r: &mut UtilReasoner, a: UtilAction) -> i64 {
+    r.actions.push(a);
+    return r.actions.len() - 1;
+}
+
+/// Score every action at time `now` and pick the best (first on ties);
+/// -1 when every action scores 0. A newly picked action starts its
+/// cooldown; the running one keeps going without restarting it.
+pub fn util_select(r: &mut UtilReasoner, ctx: &UtilContext, now: f64) -> i64 {
+    r.scores.clear();
+    var best: i64 = - 1;
+    var best_s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < r.actions.len() {
+        val a: UtilAction = r.actions.get(i);
+        var s: f64 = 0.0;
+        if i == r.current || !util_on_cooldown(&a, now) {
+            s = util_action_score(&a, ctx);
+            if i == r.current {
+                s = s * (1.0 + r.inertia);
+            }
+        }
+        r.scores.push(s);
+        if s > best_s {
+            best = i;
+            best_s = s;
+        }
+        i = i + 1;
+    }
+    if best >= 0 && best != r.current {
+        var a: UtilAction = r.actions.get(best);
+        a.last_used = now;
+        r.actions.set(best, a);
+    }
+    r.current = best;
+    return best;
+}
+
+/// The name of action `i`, "" for -1.
+pub fn util_action_name(r: &UtilReasoner, i: i64) -> str {
+    if i < 0 || i >= r.actions.len() {
+        return "";
+    }
+    return r.actions.get(i).name;
+}

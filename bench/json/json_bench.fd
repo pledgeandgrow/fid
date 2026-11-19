@@ -1,0 +1,151 @@
+// JSON scanning speed (competitive-roadmap SL6).
+//
+// Builds a nested 5.9 MB document in memory (records with strings,
+// escapes, numbers, nested objects and arrays), then times, best of
+// RUNS:
+//   valid   json_is_valid(text)       the validating scan
+//   index   json_index(text)          the scan that builds the indexed DOM
+//   parse   json_parse(text)          validate + canonicalize (one run)
+//   lookup  2000 jd_* lookups on the index (jd_children once, then by index)
+//   string  3 json_path lookups on the text (each one validates the text)
+// and prints MB/s for the scans (1 MB = 10^6 bytes) and microseconds per
+// lookup. The last line is a checksum of what the lookups read, the same on
+// every backend.
+//
+//   fid emit bench/json/json_bench.fd -o jb.exe && ./jb.exe
+//   fid ccompile bench/json/json_bench.fd -o jbc.exe && ./jbc.exe
+//
+// Results: docs/benchmarks.md, "JSON".
+use json;
+use time;
+
+const ITEMS: i64 = 12700;
+const RUNS: i64 = 3;
+
+fn item(sb: & mut StringBuilder, i: i64) {
+    sb.append_str("{\"id\": ");
+    sb.append_int(i);
+    sb.append_str(", \"name\": \"item-");
+    sb.append_int(i);
+    sb.append_str("\", \"price\": ");
+    sb.append_int(i % 1000);
+    sb.append_str(".25, \"ratio\": -1.5e-3, \"active\": ");
+    if i % 3 == 0 {
+        sb.append_str("true");
+    } else {
+        sb.append_str("false");
+    }
+    sb.append_str(", \"tags\": [\"red\", \"green\", \"blue\", \"a longer tag with spaces\"],\n");
+    sb.append_str("  \"note\": \"line with \\\"quotes\\\", a back\\\\slash, \\u00e9 and plain text that runs on for a while to look like prose in a real document\",\n");
+    sb.append_str("  \"pos\": {\"x\": 12.5, \"y\": -3, \"z\": null, \"frame\": {\"parent\": ");
+    sb.append_int(i / 7);
+    sb.append_str(", \"scale\": [1, 1, 1]}},\n");
+    sb.append_str("  \"children\": [{\"k\": 1, \"v\": \"a\"}, {\"k\": 2, \"v\": \"b\"}, {\"k\": 3, \"v\": [true, false, null]}]}");
+}
+
+fn build_doc() -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    sb.append_str("{\"meta\": {\"version\": 3, \"generator\": \"json_bench\", \"empty\": {}, \"none\": []},\n \"items\": [\n");
+    var i: i64 = 0;
+    while i < ITEMS {
+        if i > 0 {
+            sb.append_str(",\n");
+        }
+        item(& mut sb, i);
+        i = i + 1;
+    }
+    sb.append_str("\n]}\n");
+    return sb.to_str();
+}
+
+// Megabytes a second for `bytes` scanned in `ns` nanoseconds, to one decimal.
+fn mbps(bytes: i64, ns: i64) -> str {
+    var t: i64 = ns;
+    if t <= 0 {
+        t = 1;
+    }
+    // bytes * 1000 / ns = MB/s; times 10 for one decimal
+    val tenths: i64 = (bytes * 10000) / t;
+    return int_to_str(tenths / 10) + "." + int_to_str(tenths % 10);
+}
+
+fn ms(ns: i64) -> str {
+    return int_to_str(ns / 1000000);
+}
+
+fn main() -> i64 {
+    val text: str = build_doc();
+    val n: i64 = str_len(text);
+    println("document " + int_to_str(n) + " bytes, " + int_to_str(ITEMS) + " records");
+
+    var best: i64 = 0;
+    var r: i64 = 0;
+    var ok: bool = true;
+    while r < RUNS {
+        val t0: i64 = clock_now_ns();
+        ok = json_is_valid(text);
+        val dt: i64 = clock_now_ns() - t0;
+        if r == 0 || dt < best {
+            best = dt;
+        }
+        r = r + 1;
+    }
+    if !ok {
+        p_panic("json_bench: json_is_valid said no");
+    }
+    println("valid  " + mbps(n, best) + " MB/s (" + ms(best) + " ms)");
+
+    best = 0;
+    r = 0;
+    var nodes: i64 = 0;
+    while r < RUNS {
+        val t0: i64 = clock_now_ns();
+        val d: JsonDoc = json_index(text);
+        val dt: i64 = clock_now_ns() - t0;
+        if !d.ok {
+            p_panic("json_bench: json_index said no");
+        }
+        nodes = jd_nodes(& d);
+        if r == 0 || dt < best {
+            best = dt;
+        }
+        r = r + 1;
+    }
+    println("index  " + mbps(n, best) + " MB/s (" + ms(best) + " ms, " + int_to_str(nodes) + " nodes)");
+
+    val tp: i64 = clock_now_ns();
+    val canon: str = json_parse(text);
+    val dtp: i64 = clock_now_ns() - tp;
+    println("parse  " + mbps(n, dtp) + " MB/s (" + ms(dtp) + " ms, " + int_to_str(str_len(canon)) + " bytes out)");
+
+    // lookups on the index: the items array's children once, then fields
+    val d: JsonDoc = json_index(text);
+    val root: i64 = jd_root(& d);
+    val tl: i64 = clock_now_ns();
+    val items: i64 = jd_get(& d, root, "items");
+    val kids: Vec<i64> = jd_children(& d, items);
+    var sum: i64 = 0;
+    var k: i64 = 0;
+    val step: i64 = ITEMS / 1000;
+    while k < 1000 {
+        val it: i64 = kids.get(k * step);
+        sum = sum + jd_int(& d, jd_get(& d, it, "id"), 0);
+        sum = sum + str_len(jd_str(& d, jd_get(& d, it, "name")));
+        k = k + 1;
+    }
+    val dtl: i64 = clock_now_ns() - tl;
+    println("lookup " + int_to_str(dtl / 2000) + " ns each (2000 on the index)");
+
+    // the string API: every lookup validates the whole text first
+    val ts: i64 = clock_now_ns();
+    var j: i64 = 0;
+    while j < 3 {
+        val idx: i64 = (ITEMS / 3) * j;
+        sum = sum + str_parse_int(json_path(text, "items." + int_to_str(idx) + ".id"));
+        j = j + 1;
+    }
+    val dts: i64 = clock_now_ns() - ts;
+    println("string " + ms(dts / 3) + " ms each (json_path on the text)");
+    println("checksum " + int_to_str(sum));
+    return 0;
+}

@@ -98,6 +98,15 @@ pub struct HL7Message {
 }
 
 /// Create a new HL7 message.
+///
+/// Example:
+///   var m = hl7_new(HL7_ADT_A01, "MSG1", "HMS", "WARD", "20260101120000");
+///   assert_eq(hl7_segment_count(m), 0);
+///   hl7_add_segment(&mut m, hl7_pid_segment("123", "DOE^JANE", "19800101", "F"));
+///   assert_eq(hl7_segment_count(m), 1);
+///   assert(str_starts_with(hl7_msh_segment(m), "MSH|^~\\&|HMS|WARD|"));
+///   assert_eq(hl7_obx_segment(1, "NM", "HR", "72", "bpm"), "OBX|1|NM|HR||72|bpm|||||F");
+///   assert(hl7_adt_a01("WARD", "123", "DOE^JANE", "19800101", "F").segments.len() >= 3);
 pub fn hl7_new(msg_type: i64, msg_id: str, sending_app: str, sending_facility: str, timestamp: str) -> HL7Message {
     return HL7Message {
         msg_type: msg_type, msg_id: msg_id, sending_app: sending_app, sending_facility: sending_facility, receiving_app: "", receiving_facility: "", timestamp: timestamp, segments: Vec::new(),
@@ -221,7 +230,12 @@ pub fn hl7_parse(text: str) -> HL7Message {
 
     var msg = hl7_new(msg_type, msg_id, sending_app, sending_facility, timestamp);
     for i in 0..segments.len() {
-        hl7_add_segment(& mut msg, segments.get(i));
+        var seg = segments.get(i);
+        // A trailing CR (standard HL7 terminator) or a blank line must not
+        // become a phantom empty segment.
+        if str_len(seg) > 0 {
+            hl7_add_segment(& mut msg, seg);
+        }
     }
     return msg;
 }
@@ -284,6 +298,26 @@ pub fn icd10_validate(code: str) -> bool {
     var c2 = str_byte_at(code, 2);
     if c1 < 48 || c1 > 57 || c2 < 48 || c2 > 57 {
         return false;
+    }
+    // Any remainder must be ".X..." — a dot then alphanumeric characters.
+    if len > 3 {
+        if str_byte_at(code, 3) != 46 {
+            return false;
+        }
+        // '.'
+        if len == 4 {
+            return false;
+        }
+        // a bare trailing dot is not a code
+        var i = 4;
+        while i < len {
+            var c = str_byte_at(code, i);
+            var alnum = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+            if !alnum {
+                return false;
+            }
+            i = i + 1;
+        }
     }
     return true;
 }

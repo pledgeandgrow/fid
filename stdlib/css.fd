@@ -1,0 +1,563 @@
+// Fides CSS tokenizer and parser, pure Fides
+//
+// A CSS tokenizer and a parser into a small stylesheet model:
+//   - tokenizer (CSS Syntax Level 3): identifiers, hashes, strings, numbers
+//     with units and %, delimiters, {} () [], at-keywords, comments,
+//     whitespace
+//   - parser: style rules (a selector list and a block of declarations),
+//     at-rules (@media, @import, @font-face, @keyframes...) with an
+//     optional block of nested rules or declarations
+//   - selector specificity (CSS Selectors Level 4 §16): the (a, b, c)
+//     triple of id, class/attribute/pseudo-class, and type/pseudo-element
+//     counts, packed into one comparable number
+//   - a minifier (drop whitespace and comments, collapse to the shortest
+//     equivalent text) and a pretty printer
+//
+// Everything here is real; there is no platform seam.
+//
+// Usage:
+//   val sheet: CssSheet = css_parse("a.b#c { color: red; margin: 0 auto }");
+//   println(css_minify(& sheet));
+//   println(int_to_str(css_specificity("a.b#c")));
+
+module css;
+ use vec;
+
+// ─── tokens ─────────────────────────────────────────────────────────────
+
+pub const CSS_IDENT: i64 = 0;
+pub const CSS_HASH: i64 = 1;    // #id
+pub const CSS_STRING: i64 = 2;
+pub const CSS_NUMBER: i64 = 3;  // includes units / %: the text holds it
+pub const CSS_DELIM: i64 = 4;   // one punctuation char
+pub const CSS_LBRACE: i64 = 5;
+pub const CSS_RBRACE: i64 = 6;
+pub const CSS_LPAREN: i64 = 7;
+pub const CSS_RPAREN: i64 = 8;
+pub const CSS_LBRACKET: i64 = 9;
+pub const CSS_RBRACKET: i64 = 10;
+pub const CSS_COLON: i64 = 11;
+pub const CSS_SEMI: i64 = 12;
+pub const CSS_COMMA: i64 = 13;
+pub const CSS_ATKEYWORD: i64 = 14;
+pub const CSS_WS: i64 = 15;
+pub const CSS_EOF: i64 = 16;
+
+pub struct CssTok {
+    pub kind: i64,
+    pub text: str,
+}
+
+fn ct(kind: i64, text: str) -> CssTok {
+    return CssTok { kind: kind, text: text };
+}
+
+fn cs_name_start(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 45 || c >= 128;
+}
+
+fn cs_name(c: i64) -> bool {
+    return cs_name_start(c) || (c >= 48 && c <= 57);
+}
+
+fn cs_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// Tokenize CSS (comments are dropped; one whitespace token per run).
+pub fn css_tokenize(src: str) -> Vec<CssTok> {
+    var out: Vec<CssTok> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(src);
+    while i < n {
+        val c: i64 = str_byte_at(src, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            while i < n {
+                val d: i64 = str_byte_at(src, i);
+                if d == 32 || d == 9 || d == 10 || d == 13 { i = i + 1; } else { break; }
+            }
+            out.push(ct(CSS_WS, " "));
+        } else if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 42 {
+            // comment
+            i = i + 2;
+            while i + 1 < n && !(str_byte_at(src, i) == 42 && str_byte_at(src, i + 1) == 47) {
+                i = i + 1;
+            }
+            i = i + 2;
+        } else if c == 34 || c == 39 {
+            val q: i64 = c;
+            i = i + 1;
+            var s: str = "";
+            while i < n && str_byte_at(src, i) != q {
+                if str_byte_at(src, i) == 92 && i + 1 < n {
+                    s = s + char_to_str(str_byte_at(src, i + 1));
+                    i = i + 2;
+                } else {
+                    s = s + char_to_str(str_byte_at(src, i));
+                    i = i + 1;
+                }
+            }
+            i = i + 1;
+            out.push(ct(CSS_STRING, s));
+        } else if c == 35 {
+            i = i + 1;
+            val st: i64 = i;
+            while i < n && cs_name(str_byte_at(src, i)) {
+                i = i + 1;
+            }
+            out.push(ct(CSS_HASH, str_slice(src, st, i)));
+        } else if c == 64 && i + 1 < n && cs_name_start(str_byte_at(src, i + 1)) {
+            i = i + 1;
+            val st: i64 = i;
+            while i < n && cs_name(str_byte_at(src, i)) {
+                i = i + 1;
+            }
+            out.push(ct(CSS_ATKEYWORD, str_slice(src, st, i)));
+        } else if cs_digit(c) || (c == 46 && i + 1 < n && cs_digit(str_byte_at(src, i + 1))) || ((c == 43 || c == 45) && i + 1 < n && (cs_digit(str_byte_at(src, i + 1)) || str_byte_at(src, i + 1) == 46)) {
+            val st: i64 = i;
+            if c == 43 || c == 45 { i = i + 1; }
+            while i < n && cs_digit(str_byte_at(src, i)) { i = i + 1; }
+            if i < n && str_byte_at(src, i) == 46 {
+                i = i + 1;
+                while i < n && cs_digit(str_byte_at(src, i)) { i = i + 1; }
+            }
+            if i < n && (str_byte_at(src, i) == 101 || str_byte_at(src, i) == 69) {
+                i = i + 1;
+                if i < n && (str_byte_at(src, i) == 43 || str_byte_at(src, i) == 45) { i = i + 1; }
+                while i < n && cs_digit(str_byte_at(src, i)) { i = i + 1; }
+            }
+            // unit or %
+            if i < n && str_byte_at(src, i) == 37 {
+                i = i + 1;
+            } else {
+                while i < n && cs_name(str_byte_at(src, i)) { i = i + 1; }
+            }
+            out.push(ct(CSS_NUMBER, str_slice(src, st, i)));
+        } else if cs_name_start(c) {
+            val st: i64 = i;
+            while i < n && cs_name(str_byte_at(src, i)) { i = i + 1; }
+            out.push(ct(CSS_IDENT, str_slice(src, st, i)));
+        } else if c == 123 { out.push(ct(CSS_LBRACE, "{")); i = i + 1; }
+        else if c == 125 { out.push(ct(CSS_RBRACE, "}")); i = i + 1; }
+        else if c == 40 { out.push(ct(CSS_LPAREN, "(")); i = i + 1; }
+        else if c == 41 { out.push(ct(CSS_RPAREN, ")")); i = i + 1; }
+        else if c == 91 { out.push(ct(CSS_LBRACKET, "[")); i = i + 1; }
+        else if c == 93 { out.push(ct(CSS_RBRACKET, "]")); i = i + 1; }
+        else if c == 58 { out.push(ct(CSS_COLON, ":")); i = i + 1; }
+        else if c == 59 { out.push(ct(CSS_SEMI, ";")); i = i + 1; }
+        else if c == 44 { out.push(ct(CSS_COMMA, ",")); i = i + 1; }
+        else { out.push(ct(CSS_DELIM, char_to_str(c))); i = i + 1; }
+    }
+    out.push(ct(CSS_EOF, ""));
+    return out;
+}
+
+// ─── model ──────────────────────────────────────────────────────────────
+
+pub struct CssDecl {
+    pub property: str,
+    pub value: str,
+    pub important: bool,
+}
+
+/// A rule. kind 0: a style rule (selectors + decls). kind 1: an at-rule
+/// (`name`, `prelude`); when it has a block, `decls` or `rules` hold it.
+pub struct CssRule {
+    pub kind: i64,
+    pub selectors: Vec<str>,
+    pub decls: Vec<CssDecl>,
+    pub at_name: str,
+    pub prelude: str,
+    pub rules: Vec<CssRule>,
+    pub has_block: bool,
+}
+
+pub struct CssSheet {
+    pub rules: Vec<CssRule>,
+}
+
+// ─── parser ─────────────────────────────────────────────────────────────
+
+struct CPz {
+    toks: Vec<CssTok>,
+    i: i64,
+}
+
+fn cp_peek(p: & CPz) -> CssTok {
+    return p.toks.get(p.i);
+}
+
+fn cp_skip_ws(p: & mut CPz) {
+    while cp_peek(p).kind == CSS_WS {
+        p.i = p.i + 1;
+    }
+}
+
+// collect token text up to one of the stop kinds, as source-ish text
+fn cp_collect(p: & mut CPz, stop_a: i64, stop_b: i64, stop_c: i64) -> str {
+    var o: str = "";
+    var depth: i64 = 0;
+    while true {
+        val t: CssTok = cp_peek(p);
+        if t.kind == CSS_EOF {
+            return o;
+        }
+        if depth == 0 && (t.kind == stop_a || t.kind == stop_b || t.kind == stop_c) {
+            return o;
+        }
+        if t.kind == CSS_LPAREN || t.kind == CSS_LBRACKET { depth = depth + 1; }
+        if t.kind == CSS_RPAREN || t.kind == CSS_RBRACKET { depth = depth - 1; }
+        o = o + css_tok_text(& t);
+        p.i = p.i + 1;
+    }
+    return o;
+}
+
+fn css_tok_text(t: & CssTok) -> str {
+    if t.kind == CSS_HASH { return "#" + t.text; }
+    if t.kind == CSS_ATKEYWORD { return "@" + t.text; }
+    if t.kind == CSS_STRING { return "\"" + t.text + "\""; }
+    if t.kind == CSS_WS { return " "; }
+    return t.text;
+}
+
+fn cp_trim(s: str) -> str {
+    return str_trim(s);
+}
+
+// split a selector list on top-level commas (none appear inside () [])
+fn css_split_selectors(prelude: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var cur: str = "";
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(prelude) {
+        val c: i64 = str_byte_at(prelude, i);
+        if c == 40 || c == 91 { depth = depth + 1; }
+        if c == 41 || c == 93 { depth = depth - 1; }
+        if c == 44 && depth == 0 {
+            out.push(cp_trim(cur));
+            cur = "";
+        } else {
+            cur = cur + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    if str_len(cp_trim(cur)) > 0 {
+        out.push(cp_trim(cur));
+    }
+    return out;
+}
+
+fn cp_decl_block(p: & mut CPz) -> Vec<CssDecl> {
+    // at '{'; parse "prop: value;" entries until '}'
+    var out: Vec<CssDecl> = Vec::new();
+    p.i = p.i + 1;  // past {
+    while true {
+        cp_skip_ws(p);
+        val t: CssTok = cp_peek(p);
+        if t.kind == CSS_RBRACE || t.kind == CSS_EOF {
+            p.i = p.i + 1;
+            return out;
+        }
+        if t.kind == CSS_SEMI {
+            p.i = p.i + 1;
+        } else {
+            // property name
+            val prop: str = cp_trim(cp_collect(p, CSS_COLON, CSS_SEMI, CSS_RBRACE));
+            if cp_peek(p).kind == CSS_COLON {
+                p.i = p.i + 1;
+                var value: str = cp_trim(cp_collect(p, CSS_SEMI, CSS_RBRACE, CSS_EOF));
+                var important: bool = false;
+                if str_len(value) >= 10 {
+                    val low: str = css_lower(value);
+                    val bang: i64 = str_find(low, "!important");
+                    if bang >= 0 {
+                        important = true;
+                        value = cp_trim(str_slice(value, 0, bang));
+                    }
+                }
+                if str_len(prop) > 0 {
+                    out.push(CssDecl { property: prop, value: value, important: important });
+                }
+            } else {
+                // malformed; skip to ; or }
+                while cp_peek(p).kind != CSS_SEMI && cp_peek(p).kind != CSS_RBRACE && cp_peek(p).kind != CSS_EOF {
+                    p.i = p.i + 1;
+                }
+            }
+            if cp_peek(p).kind == CSS_SEMI {
+                p.i = p.i + 1;
+            }
+        }
+    }
+    return out;
+}
+
+fn css_lower(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c >= 65 && c <= 90 { c = c + 32; }
+        o = o + char_to_str(c);
+        i = i + 1;
+    }
+    return o;
+}
+
+// does an at-rule's block hold nested rules (true) or declarations?
+fn css_nests_rules(name: str) -> bool {
+    val l: str = css_lower(name);
+    return l == "media" || l == "supports" || l == "document" || l == "keyframes" || l == "-webkit-keyframes" || l == "layer" || l == "container" || l == "scope";
+}
+
+fn cp_rule(p: & mut CPz) -> CssRule {
+    cp_skip_ws(p);
+    val t: CssTok = cp_peek(p);
+    if t.kind == CSS_ATKEYWORD {
+        p.i = p.i + 1;
+        val prelude: str = cp_trim(cp_collect(p, CSS_LBRACE, CSS_SEMI, CSS_EOF));
+        var r: CssRule = CssRule { kind: 1, selectors: Vec::new(), decls: Vec::new(), at_name: t.text, prelude: prelude, rules: Vec::new(), has_block: false };
+        val nt: CssTok = cp_peek(p);
+        if nt.kind == CSS_LBRACE {
+            r.has_block = true;
+            if css_nests_rules(t.text) {
+                p.i = p.i + 1;  // past {
+                while cp_peek(p).kind != CSS_RBRACE && cp_peek(p).kind != CSS_EOF {
+                    r.rules.push(cp_rule(p));
+                    cp_skip_ws(p);
+                }
+                if cp_peek(p).kind == CSS_RBRACE { p.i = p.i + 1; }
+            } else {
+                r.decls = cp_decl_block(p);
+            }
+        } else if nt.kind == CSS_SEMI {
+            p.i = p.i + 1;
+        }
+        return r;
+    }
+    // style rule
+    val prelude: str = cp_collect(p, CSS_LBRACE, CSS_EOF, CSS_EOF);
+    var r: CssRule = CssRule { kind: 0, selectors: css_split_selectors(prelude), decls: Vec::new(), at_name: "", prelude: cp_trim(prelude), rules: Vec::new(), has_block: true };
+    if cp_peek(p).kind == CSS_LBRACE {
+        r.decls = cp_decl_block(p);
+    }
+    return r;
+}
+
+/// Parse a stylesheet.
+pub fn css_parse(src: str) -> CssSheet {
+    var p: CPz = CPz { toks: css_tokenize(src), i: 0 };
+    var sheet: CssSheet = CssSheet { rules: Vec::new() };
+    while true {
+        cp_skip_ws(& mut p);
+        if cp_peek(& p).kind == CSS_EOF {
+            return sheet;
+        }
+        sheet.rules.push(cp_rule(& mut p));
+    }
+    return sheet;
+}
+
+// ─── specificity ────────────────────────────────────────────────────────
+
+/// Specificity of one compound/complex selector as a << 16 | b << 8 | c,
+/// where a = #id count, b = .class/[attr]/:pseudo-class, c = type/::pseudo-
+/// element. The universal selector and combinators add nothing.
+pub fn css_specificity(sel: str) -> i64 {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var c: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(sel);
+    while i < n {
+        val ch: i64 = str_byte_at(sel, i);
+        if ch == 35 {
+            a = a + 1;
+            i = i + 1;
+            while i < n && cs_name(str_byte_at(sel, i)) { i = i + 1; }
+        } else if ch == 46 {
+            b = b + 1;
+            i = i + 1;
+            while i < n && cs_name(str_byte_at(sel, i)) { i = i + 1; }
+        } else if ch == 91 {
+            b = b + 1;
+            while i < n && str_byte_at(sel, i) != 93 { i = i + 1; }
+            i = i + 1;
+        } else if ch == 58 {
+            if i + 1 < n && str_byte_at(sel, i + 1) == 58 {
+                c = c + 1;  // ::pseudo-element
+                i = i + 2;
+            } else {
+                // :pseudo-class; :not(), :is(), :has() don't count themselves
+                b = b + 1;
+                i = i + 1;
+            }
+            while i < n && cs_name(str_byte_at(sel, i)) { i = i + 1; }
+        } else if cs_name_start(ch) && ch != 45 || (ch == 45 && i + 1 < n && cs_name_start(str_byte_at(sel, i + 1))) {
+            // type selector
+            c = c + 1;
+            while i < n && cs_name(str_byte_at(sel, i)) { i = i + 1; }
+        } else {
+            i = i + 1;  // combinator, *, whitespace
+        }
+    }
+    return (a << 16) | (b << 8) | c;
+}
+
+/// The (a, b, c) triple of a specificity value, as "a,b,c".
+pub fn css_specificity_str(spec: i64) -> str {
+    return int_to_str((spec >> 16) & 255) + "," + int_to_str((spec >> 8) & 255) + "," + int_to_str(spec & 255);
+}
+
+// ─── serialization ──────────────────────────────────────────────────────
+
+fn css_decls_min(decls: & Vec<CssDecl>) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < decls.len() {
+        val d: CssDecl = decls.get(i);
+        if i > 0 { o = o + ";"; }
+        o = o + d.property + ":" + d.value;
+        if d.important { o = o + "!important"; }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn css_rule_min(r: & CssRule) -> str {
+    if r.kind == 1 {
+        var head: str = "@" + r.at_name;
+        if str_len(r.prelude) > 0 {
+            head = head + " " + r.prelude;
+        }
+        if !r.has_block {
+            return head + ";";
+        }
+        if r.rules.len() > 0 {
+            var inner: str = "";
+            var i: i64 = 0;
+            while i < r.rules.len() {
+                inner = inner + css_rule_min(& r.rules.get(i));
+                i = i + 1;
+            }
+            return head + "{" + inner + "}";
+        }
+        return head + "{" + css_decls_min(& r.decls) + "}";
+    }
+    var sel: str = "";
+    var i: i64 = 0;
+    while i < r.selectors.len() {
+        if i > 0 { sel = sel + ","; }
+        sel = sel + css_collapse_ws(r.selectors.get(i));
+        i = i + 1;
+    }
+    return sel + "{" + css_decls_min(& r.decls) + "}";
+}
+
+fn css_collapse_ws(s: str) -> str {
+    // one space between tokens, none around combinators
+    var o: str = "";
+    var i: i64 = 0;
+    var prev_space: bool = false;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            prev_space = true;
+        } else {
+            if prev_space && str_len(o) > 0 {
+                o = o + " ";
+            }
+            o = o + char_to_str(c);
+            prev_space = false;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Minified text of a parsed stylesheet.
+pub fn css_minify(sheet: & CssSheet) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < sheet.rules.len() {
+        o = o + css_rule_min(& sheet.rules.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Minify CSS source directly.
+pub fn css_minify_str(src: str) -> str {
+    return css_minify(& css_parse(src));
+}
+
+fn css_pad(n: i64) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < n { o = o + "  "; i = i + 1; }
+    return o;
+}
+
+fn css_decls_pretty(decls: & Vec<CssDecl>, indent: i64) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < decls.len() {
+        val d: CssDecl = decls.get(i);
+        o = o + css_pad(indent) + d.property + ": " + d.value;
+        if d.important { o = o + " !important"; }
+        o = o + ";\n";
+        i = i + 1;
+    }
+    return o;
+}
+
+fn css_rule_pretty(r: & CssRule, indent: i64) -> str {
+    if r.kind == 1 {
+        var head: str = css_pad(indent) + "@" + r.at_name;
+        if str_len(r.prelude) > 0 { head = head + " " + r.prelude; }
+        if !r.has_block { return head + ";\n"; }
+        if r.rules.len() > 0 {
+            var inner: str = "";
+            var i: i64 = 0;
+            while i < r.rules.len() {
+                inner = inner + css_rule_pretty(& r.rules.get(i), indent + 1);
+                i = i + 1;
+            }
+            return head + " {\n" + inner + css_pad(indent) + "}\n";
+        }
+        return head + " {\n" + css_decls_pretty(& r.decls, indent + 1) + css_pad(indent) + "}\n";
+    }
+    var sel: str = "";
+    var i: i64 = 0;
+    while i < r.selectors.len() {
+        if i > 0 { sel = sel + ",\n" + css_pad(indent); }
+        sel = sel + css_collapse_ws(r.selectors.get(i));
+        i = i + 1;
+    }
+    return css_pad(indent) + sel + " {\n" + css_decls_pretty(& r.decls, indent + 1) + css_pad(indent) + "}\n";
+}
+
+/// Pretty-printed text of a parsed stylesheet.
+pub fn css_pretty(sheet: & CssSheet) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < sheet.rules.len() {
+        o = o + css_rule_pretty(& sheet.rules.get(i), 0);
+        i = i + 1;
+    }
+    return o;
+}
+
+/// A declaration's value for a property in a rule, "" when absent.
+pub fn css_get(r: & CssRule, property: str) -> str {
+    var i: i64 = 0;
+    while i < r.decls.len() {
+        if r.decls.get(i).property == property {
+            return r.decls.get(i).value;
+        }
+        i = i + 1;
+    }
+    return "";
+}

@@ -1,0 +1,250 @@
+// Competitive roadmap OP23: the runtime's byte search, compare and copy
+// (core's p_mem_find_byte, p_bytes_eq, p_mem_copy: memchr/memcmp/memmove
+// on the C path, msvcrt on pe_ir, stdlib/linux_runtime's two-words-a-step
+// loops on the machine layer, core's byte loops in the interpreter) give
+// the byte loop's answer for every start offset 0..8, lengths around the 8-
+// and 16-byte steps up to 40
+// and every position of the byte looked for (or of the one byte that
+// differs). The counts below are the cases checked; "bad" is how many
+// disagreed.
+// Expected output:
+// find 2214 bad 0
+// find wide 0 bad 0
+// eq 2214 bad 0
+// copy 729 bad 0
+// cmp 81 bad 0
+// done
+
+@unsafe
+fn ldb(a: i64) -> i64 {
+    var p: *mut u8 = a;
+    var v: i64 = 0;
+    unsafe { v = *p; }
+    return v;
+}
+
+@unsafe
+fn stb(a: i64, v: i64) {
+    var p: *mut u8 = a;
+    unsafe { *p = v; }
+}
+
+// SAFETY: (release M10: ldb is @unsafe) p..p+n are bytes the caller owns.
+@unsafe
+fn byte_find(p: i64, n: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        if ldb(p + i) == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// SAFETY: (release M10: ldb is @unsafe) a..a+n and b..b+n are bytes the
+// caller owns.
+@unsafe
+fn byte_eq(a: i64, b: i64, n: i64) -> bool {
+    var i: i64 = 0;
+    while i < n {
+        if ldb(a + i) != ldb(b + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// the bytes 1..250 cycling, never 0 or 255
+// SAFETY: (release M10: stb is @unsafe) p..p+n are writable bytes the
+// caller owns.
+@unsafe
+fn fill(p: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        stb(p + i, 1 + i % 250);
+        i = i + 1;
+    }
+}
+
+@unsafe
+fn main() -> i64 {
+    val a: i64 = p_malloc(256);
+    val b: i64 = p_malloc(256);
+    val c: i64 = p_malloc(256);
+
+    // search: a 0 (and a 255) at every position of every (offset, length);
+    // pos == n is "not there"
+    // lengths around the word (8) and two-word (16) steps
+    var lens: Vec<i64> = Vec::new();
+    lens.push(0);
+    lens.push(1);
+    lens.push(7);
+    lens.push(8);
+    lens.push(9);
+    lens.push(15);
+    lens.push(16);
+    lens.push(17);
+    lens.push(24);
+    lens.push(31);
+    lens.push(32);
+    lens.push(33);
+    lens.push(40);
+    fill(a, 120);
+    fill(b, 120);
+    var cases: i64 = 0;
+    var bad: i64 = 0;
+    var off: i64 = 0;
+    while off <= 8 {
+        var li: i64 = 0;
+        while li < lens.len() {
+            val n: i64 = lens.get(li);
+            var pos: i64 = 0;
+            while pos <= n {
+                if pos < n {
+                    stb(a + off + pos, 0);
+                    if pos + 3 < n {
+                        stb(a + off + pos + 3, 255);
+                    }
+                }
+                if p_mem_find_byte(a + off, n, 0) != byte_find(a + off, n, 0) {
+                    bad = bad + 1;
+                }
+                if p_mem_find_byte(a + off, n, 255) != byte_find(a + off, n, 255) {
+                    bad = bad + 1;
+                }
+                // put back the bytes fill wrote
+                if pos < n {
+                    stb(a + off + pos, 1 + (off + pos) % 250);
+                    if pos + 3 < n {
+                        stb(a + off + pos + 3, 1 + (off + pos + 3) % 250);
+                    }
+                }
+                cases = cases + 1;
+                pos = pos + 1;
+            }
+            li = li + 1;
+        }
+        off = off + 1;
+    }
+    println("find " + int_to_str(cases) + " bad " + int_to_str(bad));
+
+    // a value outside 0..255 is found nowhere (its low byte is there)
+    fill(a, 120);
+    var wbad: i64 = 0;
+    if p_mem_find_byte(a, 100, 256 + 5) != 0 - 1 {
+        wbad = wbad + 1;
+    }
+    if p_mem_find_byte(a, 100, 5) != 4 {
+        wbad = wbad + 1;
+    }
+    println("find wide 0 bad " + int_to_str(wbad));
+
+    // compare: equal, then one byte different at every position
+    cases = 0;
+    bad = 0;
+    off = 0;
+    fill(a, 120);
+    while off <= 8 {
+        var lj: i64 = 0;
+        while lj < lens.len() {
+            val n2: i64 = lens.get(lj);
+            var dpos: i64 = 0;
+            while dpos <= n2 {
+                if dpos < n2 {
+                    stb(b + off + dpos, 0);
+                }
+                // b at the same offset, and a at offset 0 against b at off
+                if p_bytes_eq(a + off, b + off, n2) != byte_eq(a + off, b + off, n2) {
+                    bad = bad + 1;
+                }
+                if p_bytes_eq(a, b + off, n2) != byte_eq(a, b + off, n2) {
+                    bad = bad + 1;
+                }
+                if dpos < n2 {
+                    stb(b + off + dpos, 1 + (off + dpos) % 250);
+                }
+                cases = cases + 1;
+                dpos = dpos + 1;
+            }
+            lj = lj + 1;
+        }
+        off = off + 1;
+    }
+    println("eq " + int_to_str(cases) + " bad " + int_to_str(bad));
+
+    // copy: every source and destination offset 0..8, length 0..80 in
+    // steps of 9; the bytes around the copy stay as they were
+    cases = 0;
+    bad = 0;
+    fill(a, 120);
+    var k0: i64 = 0;
+    while k0 < 120 {
+        stb(c + k0, 7);
+        k0 = k0 + 1;
+    }
+    var so: i64 = 0;
+    while so <= 8 {
+        var dof: i64 = 0;
+        while dof < 9 {
+            var n3: i64 = 0;
+            while n3 <= 80 {
+                p_mem_copy(c + dof, a + so, n3);
+                if !byte_eq(c + dof, a + so, n3) {
+                    bad = bad + 1;
+                }
+                if dof > 0 && ldb(c + dof - 1) != 7 {
+                    bad = bad + 1;
+                }
+                if ldb(c + dof + n3) != 7 {
+                    bad = bad + 1;
+                }
+                // back to 7s for the next copy
+                var k: i64 = 0;
+                while k < n3 {
+                    stb(c + dof + k, 7);
+                    k = k + 1;
+                }
+                cases = cases + 1;
+                n3 = n3 + 9;
+            }
+            dof = dof + 1;
+        }
+        so = so + 1;
+    }
+    println("copy " + int_to_str(cases) + " bad " + int_to_str(bad));
+
+    // string compare: strings of length 0..80 against the same with its
+    // last byte changed, compared by sign
+    cases = 0;
+    bad = 0;
+    var ln: i64 = 0;
+    while ln <= 80 {
+        var s: str = "";
+        var j: i64 = 0;
+        while j < ln {
+            s = s + str_slice("abcdefghijklmnopqrstuvwxyz", j % 26, j % 26 + 1);
+            j = j + 1;
+        }
+        val more: str = s + "b";
+        val less: str = s + "a";
+        if str_compare(s, s + "") != 0 {
+            bad = bad + 1;
+        }
+        if str_compare(more, less) <= 0 || str_compare(less, more) >= 0 {
+            bad = bad + 1;
+        }
+        if str_compare(s, more) >= 0 || str_compare(more, s) <= 0 {
+            bad = bad + 1;
+        }
+        cases = cases + 1;
+        ln = ln + 1;
+    }
+    println("cmp " + int_to_str(cases) + " bad " + int_to_str(bad));
+    p_free(a);
+    p_free(b);
+    p_free(c);
+    println("done");
+    return 0;
+}

@@ -1,0 +1,331 @@
+// Translated from features.c by c2fd (C to Fid, best effort): review it before use.
+// C headers: <stdio.h>, <string.h> (their calls are mapped to Fid's).
+
+// A tour of the C that c2fd translates: one function per feature.
+
+// c2fd: #define SQUARE(x) ((x) * (x))  (expanded where it is used)
+const N_PRIMES: i64 = 8;
+const GREETING: str = "hello";
+const MASK: i64 = 0x0F;
+
+type binop = fn(i64, i64) -> i64;
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+// TODO(c2fd): the union Word became a struct: its fields no longer share memory
+struct Word {
+    i: i64,
+    u: u32,
+}
+
+// enum flags: C enum values are integers, so they stay constants
+type flags = i64;
+const F_READ: flags = 1;
+const F_WRITE: flags = 2;
+const F_EXEC: flags = 4;
+const F_ALL: flags = 7;
+
+fn init_primes() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    for x in [2, 3, 5, 7, 11, 13, 17, 19] {
+        v.push(x);
+    }
+    return v;
+}
+var primes: Vec<i64> = init_primes();
+
+fn init_grid() -> Vec<Vec<i64>> {
+    var v: Vec<Vec<i64>> = Vec::new();
+    for _i in 0..3 {
+        v.push(Vec::filled(4, 0));
+    }
+    return v;
+}
+var grid: Vec<Vec<i64>> = init_grid();
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn mul(a: i64, b: i64) -> i64 {
+    return a * b;
+}
+
+fn apply(f: binop, a: i64, b: i64) -> i64 {
+    return f(a, b);
+}
+
+// static in counter
+var counter_calls: i64 = 0;
+
+// static locals keep their value between calls
+fn counter() -> i64 {
+    counter_calls += 1;
+    return counter_calls;
+}
+
+fn points() {
+    var pts: Vec<Point> = Vec::new();
+    for _i in 0..3 {
+        pts.push(Point { x: 0, y: 0 });
+    }
+    for i in 0..3 {
+        pts[i].x = i;
+        pts[i].y = (i + 1) * (i + 1);
+    }
+    val origin: Point = Point { x: 0, y: 0 };
+    val far: Point = Point { x: 8, y: 9 };
+    var dist: i64 = 0;
+    for i in 0..3 {
+        dist += pts[i].x - origin.x + (pts[i].y - origin.y);
+    }
+    println(f"points: {dist} ({far.x},{far.y})");
+}
+
+fn loops() {
+    var i: i64 = 0;
+    var odd: i64 = 0;
+    loop {
+        i += 1;
+        if i % 2 == 0 {
+            if i >= 9 {
+                break;
+            }
+            continue;
+        }
+        odd += i;
+        if i >= 9 {
+            break;
+        }
+    }
+    println(f"odd sum {odd}");
+
+    var found: i64 = -1;
+    for k in 0..N_PRIMES {
+        val _t1: i64 = primes.get(k) % 4;
+        loop {
+            if _t1 == 1 {
+                if primes.get(k) > 10 {
+                    found = primes.get(k);
+                    break;
+                }
+                println(f"small 4k+1 prime {primes.get(k)}");
+            } else if _t1 == 3 {
+            } else {
+                println(f"even prime {primes.get(k)}");
+            }
+            break;
+        }
+        if found > 0 {
+            break;
+        }
+    }
+    println(f"first 4k+1 prime above 10: {found}");
+
+    var a: i64 = 0;
+    var b: i64 = 10;
+    while a < b {
+        a += 2;
+        b -= 1;
+    }
+    println(f"a={a} b={b}");
+
+    for r in 0..3 {
+        for c in 0..4 {
+            var _t2: Vec<i64> = grid.get(r);
+            _t2[c] = r * 4 + c;
+            grid.set(r, _t2);
+        }
+    }
+    var total: i64 = 0;
+    var r: i64 = 2;
+    while r >= 0 {
+        total += grid.get(r)[3 - r];
+        r -= 1;
+    }
+    println(f"anti-diagonal sum {total}");
+}
+
+fn strings() {
+    var buf: str = "";
+    buf = GREETING;
+    buf = buf + ", c2fd";
+    println(f"{buf} ({str_len(buf)} chars)");
+    var line: str = "";
+    line = "id|" + c_rjust(int_to_str(42), 5) + "|" + c_ljust("ab", 4) + "|" + c_zfill(int_to_str(7), 3);
+    println(line);
+    var words: Vec<str> = Vec::new();
+    words.push("alpha");
+    words.push("beta");
+    words.push("gamma");
+    var longest: i64 = 0;
+    for i in 0..3 {
+        if str_len(words[i]) > str_len(words[longest]) {
+            longest = i;
+        }
+    }
+    println(f"longest: {words[longest]}");
+    print(char_to_str('O'));
+    print(char_to_str('K'));
+    print(char_to_str('\n'));
+}
+
+@wrapping
+fn numbers() {
+    var h: u32 = 5381;
+    var s: str = "fides";
+    while c_char(s, 0) != 0 {
+        val _t1: str = s;
+        s = c_skip(s, 1);
+        h = h * 33 + c_char(_t1, 0) as u8 as u32;
+    }
+    println(f"hash {h} {c_hex(h as i64, false)}");
+    val flags: i64 = F_READ | F_EXEC;
+    println("flags " + int_to_str(flags & MASK) + " " + int_to_str(if (flags & F_WRITE) != 0 { 1 } else { 0 }) + " " + int_to_str(F_ALL));
+    val avg: f64 = (1 + 2 + 4) as f64 / 3;
+    println(f"avg {c_fmt_f(avg, 3)} {c_fmt_f(avg * 2, 1)}");
+    var n: i64 = 7;
+    val _t2: i64 = n;
+    n += 1;
+    val m: i64 = _t2 + 1;
+    n -= 1;
+    val q: i64 = n * 2;
+    println(f"n={n} m={m} q={q} size={4}");
+    var x: i64 = 3;
+    var _t4: bool = false;
+    if x > 2 {
+        val _t3: i64 = x;
+        x += 1;
+        _t4 = _t3 < 10;
+    }
+    val y: i64 = if _t4 { x } else { -x };
+    println(f"x={x} y={y}");
+    var w: Word = Word { i: 0, u: 0 };
+    w.u = 7;
+    println(f"word {w.u}");
+    println(f"apply {apply(add, 2, 3)} {apply(mul, 4, 5)}");
+    println(f"shift {1 << 4} {-16 >> 2} {~0 & 0xFF}");
+}
+
+fn main() -> i64 {
+    points();
+    loops();
+    strings();
+    numbers();
+    counter();
+    counter();
+    println(f"counter {counter()}");
+    return 0;
+}
+
+// --- c2fd helpers: the C library behaviour this translation relies on ---
+
+/// s[i] of a C string: its NUL (0) at the end.
+fn c_char(s: str, i: i64) -> i64 {
+    if i < 0 || i >= str_len(s) {
+        return 0;
+    }
+    return str_byte_at(s, i);
+}
+
+/// s + n for a C string: what follows its first n bytes.
+fn c_skip(s: str, n: i64) -> str {
+    if n >= str_len(s) {
+        return "";
+    }
+    return str_slice(s, n, str_len(s));
+}
+
+/// printf's width: s right-aligned in w columns.
+fn c_rjust(s: str, w: i64) -> str {
+    var out: str = s;
+    while str_len(out) < w {
+        out = " " + out;
+    }
+    return out;
+}
+
+/// printf's "-" flag: s left-aligned in w columns.
+fn c_ljust(s: str, w: i64) -> str {
+    var out: str = s;
+    while str_len(out) < w {
+        out = out + " ";
+    }
+    return out;
+}
+
+/// printf's "0" flag: a number padded with zeros after its sign.
+fn c_zfill(s: str, w: i64) -> str {
+    var sign: str = "";
+    var digits: str = s;
+    if str_starts_with(s, "-") {
+        sign = "-";
+        digits = str_slice(s, 1, str_len(s));
+    }
+    while str_len(sign) + str_len(digits) < w {
+        digits = "0" + digits;
+    }
+    return sign + digits;
+}
+
+/// printf's "%.Nf": x rounded to prec decimals.
+fn c_fmt_f(x: f64, prec: i64) -> str {
+    var v: f64 = x;
+    var sign: str = "";
+    if v < 0.0 {
+        sign = "-";
+        v = 0.0 - v;
+    }
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < prec {
+        scale = scale * 10;
+        i += 1;
+    }
+    val total: i64 = (v * (scale as f64) + 0.5) as i64;
+    val whole: i64 = total / scale;
+    var out: str = sign + int_to_str(whole);
+    if prec > 0 {
+        var frac: str = int_to_str(total % scale);
+        while str_len(frac) < prec {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    return out;
+}
+
+/// printf's "%x" / "%X" (the value as an unsigned 64-bit number).
+fn c_hex(n: i64, upper: bool) -> str {
+    var digits: str = "0123456789abcdef";
+    if upper {
+        digits = "0123456789ABCDEF";
+    }
+    if n == 0 {
+        return "0";
+    }
+    var out: str = "";
+    var v: u64 = n as u64;
+    while v != 0 {
+        out = char_to_str(str_byte_at(digits, (v & 15) as i64)) + out;
+        v = v >> 4;
+    }
+    return out;
+}
+
+/// printf's "%o".
+fn c_oct(n: i64) -> str {
+    if n == 0 {
+        return "0";
+    }
+    var out: str = "";
+    var v: u64 = n as u64;
+    while v != 0 {
+        out = char_to_str('0' + (v & 7) as i64) + out;
+        v = v >> 3;
+    }
+    return out;
+}

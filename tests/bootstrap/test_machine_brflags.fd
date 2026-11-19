@@ -1,0 +1,244 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA19: a value used only as a
+// branch condition stays in the flags (compiler/nat_ir.fd
+// ng_fuse_branches and its helpers):
+//   not_if   `val c: bool = a < b; if !c`: the `!` (an XOR with 1) is
+//            folded into the branch's condition (FID_NAT_OFF=brnot: no)
+//   and_if   `if a < b && c < d` and or_if `||`: after select formation
+//            these are one select of two compares; they become two
+//            compare-and-branches (ng_fuse_andor, FID_NAT_OFF=brandor)
+//   and_loop / or_loop: the same conditions as loop conditions
+//   xb       the compare made before a block with a call, its branch
+//            after it: made again at the branch (ng_fuse_xblock,
+//            FID_NAT_OFF=brxblock); xb_loop keeps the compared values
+//            past a loop that changes the variables they came from
+// Every function is checked against a reference that computes the same
+// answer with arithmetic only, over a few hundred operand sets from a
+// fixed generator; each line prints the number of disagreements (0) and
+// a checksum. tests/nattools/machine_ra12_ra19_check.sh checks the MIR
+// after branch fusion (fewer SETCCs, no CSEL in and_if / or_if) on each
+// target, each switch off, and FID_NAT_MUTATE=brnot,brandor,brxblock.
+// Expected output:
+// not 0 140
+// and 0 65
+// or 0 359
+// and_loop 0 3495
+// or_loop 0 4850
+// xb 0 14866
+// xb_loop 0 249
+
+var g_seed: i64 = 12345;
+
+fn rnd(m: i64) -> i64 {
+    g_seed = (g_seed * 1103515245 + 12345) % 2147483648;
+    return (g_seed / 65536) % m;
+}
+
+// 1 when a < b, else 0, without a compare (operands well inside i64)
+fn lt01(a: i64, b: i64) -> i64 {
+    return ((a - b) >> 63) & 1;
+}
+
+fn not_if(a: i64, b: i64) -> i64 {
+    val c: bool = a < b;
+    if !c {
+        return 7;
+    }
+    return 3;
+}
+
+fn and_if(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    if a < b && c < d {
+        return 11;
+    }
+    return 5;
+}
+
+fn or_if(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    if a < b || c < d {
+        return 13;
+    }
+    return 2;
+}
+
+fn and_loop(a: i64, b: i64, n: i64) -> i64 {
+    var i: i64 = a;
+    var s: i64 = 0;
+    while i < b && s < n {
+        s = s + i + 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn or_loop(a: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    var j: i64 = 0;
+    while i < a || j < b {
+        i = i + 1;
+        j = j + 2;
+    }
+    return i * 3 + j;
+}
+
+fn side(x: i64) -> i64 {
+    if x > 1000 {
+        return side(x - 1000) + 1;
+    }
+    return x * 3 + 1;
+}
+
+fn xb(a: i64, b: i64, x: i64) -> i64 {
+    val c: bool = a < b;
+    var r: i64 = 0;
+    if x > 0 {
+        r = r + side(x);
+    }
+    if c {
+        r = r + 100;
+    }
+    return r;
+}
+
+fn xb_loop(a: i64, b: i64) -> i64 {
+    var p: i64 = a;
+    var q: i64 = b;
+    val c: bool = p < q;
+    var i: i64 = 0;
+    while i < 3 {
+        p = p + 10;
+        q = q - 10;
+        i = i + 1;
+    }
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() {
+    var bad: i64 = 0;
+    var sum: i64 = 0;
+    var t: i64 = 0;
+    while t < 300 {
+        var a: i64 = rnd(21) - 10;
+        var b: i64 = rnd(21) - 10;
+        var got: i64 = not_if(a, b);
+        var want: i64 = 3 + 4 * (1 - lt01(a, b));
+        if got != want {
+            bad = bad + 1;
+        }
+        sum = sum + lt01(a, b);
+        t = t + 1;
+    }
+    println("not " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 300 {
+        var a2: i64 = rnd(9) - 4;
+        var b2: i64 = rnd(9) - 4;
+        var c2: i64 = rnd(9) - 4;
+        var d2: i64 = rnd(9) - 4;
+        var both: i64 = lt01(a2, b2) * lt01(c2, d2);
+        if and_if(a2, b2, c2, d2) != 5 + 6 * both {
+            bad = bad + 1;
+        }
+        sum = sum + both;
+        t = t + 1;
+    }
+    println("and " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 500 {
+        var a3: i64 = rnd(9) - 4;
+        var b3: i64 = rnd(9) - 4;
+        var c3: i64 = rnd(9) - 4;
+        var d3: i64 = rnd(9) - 4;
+        var either: i64 = 1 - (1 - lt01(a3, b3)) * (1 - lt01(c3, d3));
+        if or_if(a3, b3, c3, d3) != 2 + 11 * either {
+            bad = bad + 1;
+        }
+        sum = sum + either;
+        t = t + 1;
+    }
+    println("or " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 200 {
+        var a4: i64 = rnd(10);
+        var b4: i64 = a4 + rnd(12);
+        var n4: i64 = rnd(40);
+        // reference: the same loop, its condition as arithmetic
+        var i4: i64 = a4;
+        var s4: i64 = 0;
+        var go: i64 = lt01(i4, b4) * lt01(s4, n4);
+        var guard: i64 = 0;
+        while go == 1 && guard < 100 {
+            s4 = s4 + i4 + 1;
+            i4 = i4 + 1;
+            go = lt01(i4, b4) * lt01(s4, n4);
+            guard = guard + 1;
+        }
+        var got4: i64 = and_loop(a4, b4, n4);
+        if got4 != s4 {
+            bad = bad + 1;
+        }
+        sum = sum + got4;
+        t = t + 1;
+    }
+    println("and_loop " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 200 {
+        var a5: i64 = rnd(8);
+        var b5: i64 = rnd(14);
+        // i rounds: the least i with i >= a5 and 2i >= b5
+        var r5: i64 = a5;
+        if (b5 + 1) / 2 > r5 {
+            r5 = (b5 + 1) / 2;
+        }
+        var got5: i64 = or_loop(a5, b5);
+        if got5 != r5 * 3 + r5 * 2 {
+            bad = bad + 1;
+        }
+        sum = sum + got5;
+        t = t + 1;
+    }
+    println("or_loop " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 300 {
+        var a6: i64 = rnd(21) - 10;
+        var b6: i64 = rnd(21) - 10;
+        var x6: i64 = rnd(9) - 4;
+        var w6: i64 = 100 * lt01(a6, b6);
+        if x6 > 0 {
+            w6 = w6 + x6 * 3 + 1;
+        }
+        var got6: i64 = xb(a6, b6, x6);
+        if got6 != w6 {
+            bad = bad + 1;
+        }
+        sum = sum + got6;
+        t = t + 1;
+    }
+    println("xb " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 500 {
+        var a7: i64 = rnd(41) - 20;
+        var b7: i64 = rnd(41) - 20;
+        var got7: i64 = xb_loop(a7, b7);
+        if got7 != lt01(a7, b7) {
+            bad = bad + 1;
+        }
+        sum = sum + got7;
+        t = t + 1;
+    }
+    println("xb_loop " + int_to_str(bad) + " " + int_to_str(sum));
+}

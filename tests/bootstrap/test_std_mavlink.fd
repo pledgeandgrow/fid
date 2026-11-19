@@ -1,0 +1,185 @@
+// stdlib/mavlink: CRC-16/MCRF4XX check value, CRC_EXTRA and lengths computed from the message definitions (they match common.xml's 50/124/24/39/104/152/143), v1 and v2 frames (bytes from an independent Python encoder), v2 truncation, signing (SHA-256), parser resync, CRC and signature errors, packet loss
+// Expected output:
+// crc("123456789") = 0x6f91
+// HEARTBEAT id=0 extra=50 len=9/9
+// SYS_STATUS id=1 extra=124 len=31/43
+// GPS_RAW_INT id=24 extra=24 len=30/52
+// ATTITUDE id=30 extra=39 len=28/28
+// GLOBAL_POSITION_INT id=33 extra=104 len=28/28
+// COMMAND_LONG id=76 extra=152 len=33/33
+// COMMAND_ACK id=77 extra=143 len=3/10
+// hb v1: fe 09 00 01 01 00 00 00 00 00 02 03 51 04 03 7d dd
+// hb v2: fd 09 00 00 01 01 01 00 00 00 00 00 00 00 02 03 51 04 03 f7 90
+// att v2: fd 10 00 00 02 01 01 1e 00 00 e8 03 00 00 cd cc cc 3d cd cc 4c be 00 00 40 40 02 d0
+// gps v2: fd 1e 00 00 05 01 01 18 00 00 d2 02 96 49 00 00 00 00 4a 52 40 1c 43 f4 17 05 40 72 07 00 79 00 ff ff 00 00 00 00 03 0a 2a d4
+// gps lengths v1=38 v2=42
+// cmd v1: fe 21 07 ff be 4c 00 00 80 3f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 90 01 01 01 00 72 46
+// ack v2: fd 02 00 00 08 01 01 4d 00 00 90 01 6a 27
+// timestamp=27992960000000
+// signed: fd 09 01 00 03 01 01 00 00 00 00 00 00 00 02 03 51 04 03 21 7c 00 00 e0 6f 9e 75 19 d1 8f 82 24 6d 28
+// parser: frames=6 crc errors=1 sig errors=1 dropped=23 lost=4
+// v1 HEARTBEAT seq=0 base_mode=81
+// v2 ATTITUDE seq=2 roll=0.100000001 pitch=-0.200000003 yaw=3.000000000
+// v2 HEARTBEAT seq=3 signed link=0 ts=27992960000000
+// v2 GPS_RAW_INT seq=5 lat=473977418 epv=65535 sats=10 yaw=0
+// v1 COMMAND_LONG seq=7 command=400 param1=1.000000000 sys=255
+// v2 COMMAND_ACK seq=8 command=400 result=0
+// f32 bits: 0.1=0x3dcccccd 1e-40=0x000116c2 1e39=0x7f800000 back=-2.500000000
+use math;
+use quat;
+use crypto;
+use mavlink;
+
+fn hex16(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 7;
+    while i >= 0 {
+        val x: i64 = (v >> (4 * i)) & 15;
+        s = s + str_slice(d, x, x + 1);
+        i = i - 1;
+    }
+    return s;
+}
+
+fn append(a: & mut Vec<i64>, b: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        a.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    var t: Vec<i64> = Vec::new();
+    val digits: str = "123456789";
+    var i: i64 = 0;
+    while i < 9 {
+        t.push(str_byte_at(digits, i));
+        i = i + 1;
+    }
+    println("crc(\"123456789\") = 0x" + str_slice(hex16(mav_crc_bytes(65535, &t)), 4, 8));
+    val defs: Vec<MavDef> = mav_common_defs();
+    i = 0;
+    while i < defs.len() {
+        val d: MavDef = defs.get(i);
+        println(d.name + " id=" + int_to_str(d.id) + " extra=" + int_to_str(d.crc_extra) + " len=" + int_to_str(d.min_len) + "/" + int_to_str(d.max_len));
+        i = i + 1;
+    }
+
+    var hb: MavMsg = mav_msg_new(defs.get(mav_find_def_name(&defs, "HEARTBEAT")));
+    mav_set(&mut hb, "type", 2.0);
+    mav_set(&mut hb, "autopilot", 3.0);
+    mav_set(&mut hb, "base_mode", 81.0);
+    mav_set(&mut hb, "system_status", 4.0);
+    mav_set(&mut hb, "mavlink_version", 3.0);
+    val f1: Vec<i64> = mav_frame_v1(&hb, 1, 1, 0);
+    println("hb v1: " + mav_hex(&f1));
+    val f2: Vec<i64> = mav_frame_v2(&hb, 1, 1, 1);
+    println("hb v2: " + mav_hex(&f2));
+    var att: MavMsg = mav_msg_new(defs.get(mav_find_def(&defs, 30)));
+    mav_set(&mut att, "time_boot_ms", 1000.0);
+    mav_set(&mut att, "roll", 0.1);
+    mav_set(&mut att, "pitch", -0.2);
+    mav_set(&mut att, "yaw", 3.0);
+    val f3: Vec<i64> = mav_frame_v2(&att, 1, 1, 2);
+    println("att v2: " + mav_hex(&f3));
+    var gps: MavMsg = mav_msg_new(defs.get(mav_find_def(&defs, 24)));
+    mav_set_int(&mut gps, "time_usec", 1234567890);
+    mav_set_int(&mut gps, "fix_type", 3);
+    mav_set_int(&mut gps, "lat", 473977418);
+    mav_set_int(&mut gps, "lon", 85455939);
+    mav_set_int(&mut gps, "alt", 488000);
+    mav_set_int(&mut gps, "eph", 121);
+    mav_set_int(&mut gps, "epv", 65535);
+    mav_set_int(&mut gps, "satellites_visible", 10);
+    val f4: Vec<i64> = mav_frame_v2(&gps, 1, 1, 5);
+    println("gps v2: " + mav_hex(&f4));
+    println("gps lengths v1=" + int_to_str(mav_frame_v1(&gps, 1, 1, 5).len()) + " v2=" + int_to_str(f4.len()));
+    var cl: MavMsg = mav_msg_new(defs.get(mav_find_def(&defs, 76)));
+    mav_set(&mut cl, "target_system", 1.0);
+    mav_set(&mut cl, "target_component", 1.0);
+    mav_set(&mut cl, "command", 400.0);
+    mav_set(&mut cl, "param1", 1.0);
+    val f5: Vec<i64> = mav_frame_v1(&cl, 255, 190, 7);
+    println("cmd v1: " + mav_hex(&f5));
+    var ack: MavMsg = mav_msg_new(defs.get(mav_find_def(&defs, 77)));
+    mav_set(&mut ack, "command", 400.0);
+    val f6: Vec<i64> = mav_frame_v2(&ack, 1, 1, 8);
+    println("ack v2: " + mav_hex(&f6));
+    var key: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 {
+        key.push(i);
+        i = i + 1;
+    }
+    val ts: i64 = mav_sign_timestamp(1700000000000000);
+    println("timestamp=" + int_to_str(ts));
+    val f7: Vec<i64> = mav_frame_v2_signed(&hb, 1, 1, 3, &key, 0, ts);
+    println("signed: " + mav_hex(&f7));
+
+    // a stream: junk, frames, a corrupted frame, a frame signed with another key
+    var stream: Vec<i64> = Vec::new();
+    stream.push(85);
+    stream.push(0);
+    append(&mut stream, &f1);
+    var bad: Vec<i64> = f2;
+    bad.set(14, 7);
+    append(&mut stream, &bad);
+    append(&mut stream, &f3);
+    append(&mut stream, &f7);
+    append(&mut stream, &f4);
+    append(&mut stream, &f5);
+    append(&mut stream, &f6);
+    var other: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 {
+        other.push(31 - i);
+        i = i + 1;
+    }
+    val f8: Vec<i64> = mav_frame_v2_signed(&hb, 1, 1, 9, &other, 0, ts);
+    append(&mut stream, &f8);
+    var p: MavParser = mav_parser_new(defs);
+    mav_parser_set_key(&mut p, key);
+    // feed in uneven pieces, as a serial port delivers them
+    var pos: i64 = 0;
+    var total: i64 = 0;
+    var piece: i64 = 1;
+    while pos < stream.len() {
+        var chunk: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < piece && pos < stream.len() {
+            chunk.push(stream.get(pos));
+            pos = pos + 1;
+            k = k + 1;
+        }
+        total = total + mav_parser_feed(&mut p, chunk);
+        piece = piece % 7 + 3;
+    }
+    println("parser: frames=" + int_to_str(total) + " crc errors=" + int_to_str(p.crc_errors) + " sig errors=" + int_to_str(p.sig_errors) + " dropped=" + int_to_str(p.dropped_bytes) + " lost=" + int_to_str(p.lost));
+    i = 0;
+    while i < p.frames.len() {
+        val fr: MavFrame = p.frames.get(i);
+        val m: MavMsg = mav_frame_msg(&p, &fr);
+        var s: str = "v" + int_to_str(fr.version) + " " + m.def.name + " seq=" + int_to_str(fr.seq);
+        if fr.msgid == 0 {
+            if fr.signed {
+                s = s + " signed link=" + int_to_str(fr.link_id) + " ts=" + int_to_str(fr.timestamp);
+            } else {
+                s = s + " base_mode=" + int_to_str(mav_get_int(&m, "base_mode"));
+            }
+        } else if fr.msgid == 30 {
+            s = s + " roll=" + rmath_fmt(mav_get(&m, "roll"), 9) + " pitch=" + rmath_fmt(mav_get(&m, "pitch"), 9) + " yaw=" + rmath_fmt(mav_get(&m, "yaw"), 9);
+        } else if fr.msgid == 24 {
+            s = s + " lat=" + int_to_str(mav_get_int(&m, "lat")) + " epv=" + int_to_str(mav_get_int(&m, "epv")) + " sats=" + int_to_str(mav_get_int(&m, "satellites_visible")) + " yaw=" + int_to_str(mav_get_int(&m, "yaw"));
+        } else if fr.msgid == 76 {
+            s = s + " command=" + int_to_str(mav_get_int(&m, "command")) + " param1=" + rmath_fmt(mav_get(&m, "param1"), 9) + " sys=" + int_to_str(fr.sysid);
+        } else if fr.msgid == 77 {
+            s = s + " command=" + int_to_str(mav_get_int(&m, "command")) + " result=" + int_to_str(mav_get_int(&m, "result"));
+        }
+        println(s);
+        i = i + 1;
+    }
+    println("f32 bits: 0.1=0x" + hex16(mav_f32_bits(0.1)) + " 1e-40=0x" + hex16(mav_f32_bits(1.0e-40)) + " 1e39=0x" + hex16(mav_f32_bits(1.0e39)) + " back=" + rmath_fmt(mav_f32_from_bits(mav_f32_bits(-2.5)), 9));
+    return 0;
+}

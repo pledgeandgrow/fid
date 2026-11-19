@@ -1,0 +1,652 @@
+// tools/doctest.fd — extract `/// Example:` blocks from .fd sources and run
+// them: the Fides port of scripts/doctest.py (roadmap AD4). Same arguments,
+// same output, the same time limits (60 s per example run, 300 s per native
+// build), through stdlib/process.fd's process_run_argv (no shell, a time
+// limit, stdout and stderr apart).
+//
+//   fid ccompile tools/doctest.fd -o doctest.exe
+//   doctest.exe [dir] [--fid <path>] [--emit] [--native-only] [-v]
+//   fid run tools/doctest.fd [dir] [--fid <path>] ...
+//
+// Convention: a `///` doc comment on a pub item may contain a `/// Example:`
+// line; every following `///` line indented by at least two spaces is code.
+// The block ends at the first `///` line that is not indented (or at `pub`).
+// The `///` may itself be indented (examples on methods in `impl` blocks).
+// Each example becomes a standalone program: `use <module>;` plus every
+// `use` line of the snippet at the top; the rest runs inside `fn main() ->
+// i64`. A block whose marker reads `/// Example (native only):` is skipped
+// unless --emit: then it is built natively (`fid emit --target
+// <host>-linux` on Linux, `fid emit` on Windows, `fid ccompile` elsewhere;
+// when `emit` fails, `fid ccompile`) and the binary is run. --native-only
+// runs those examples alone. Exit status 1 when an example fails. Prints
+// a coverage line, then each failure.
+//
+// Differences from the script, none of which the repository's sources
+// reach: lines are split at "\n" (a lone "\r" or the other characters
+// Python's splitlines() knows do not end a line); "whitespace" and word
+// characters are ASCII; a file's text is read as bytes (no U+FFFD for bad
+// UTF-8); directories are followed through links; the program a signal
+// killed is reported with code 128 + n (Python: -n); and a --fid that
+// cannot start makes every example fail instead of a Python traceback.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+// ─── Text ───
+
+fn dt_space(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13;
+}
+
+fn dt_word(c: i64) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+/// The first index at or after i that is not whitespace.
+fn dt_skip(s: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(s) && dt_space(str_byte_at(s, k)) { k = k + 1; }
+    return k;
+}
+
+/// Does s hold `word` at index i?
+fn dt_at(s: str, i: i64, word: str) -> bool {
+    if i + str_len(word) > str_len(s) { return false; }
+    return str_slice(s, i, i + str_len(word)) == word;
+}
+
+/// ASCII lower case, for the case-insensitive searches.
+fn dt_lower(s: str) -> str {
+    return str_to_lower(s);
+}
+
+/// re.search(a|b|..., ln, re.I) over the words of `alts`.
+fn dt_has_any(ln: str, alts: Vec<str>) -> bool {
+    val l: str = dt_lower(ln);
+    var i: i64 = 0;
+    while i < alts.len() {
+        if str_contains(l, alts.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The lines of s, split at "\n" with a "\r" before it dropped (Python's
+/// splitlines() for the text these files hold).
+fn dt_lines(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if str_byte_at(s, i) == 10 {
+            var end: i64 = i;
+            if end > start && str_byte_at(s, end - 1) == 13 { end = end - 1; }
+            out.push(str_slice(s, start, end));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < n {
+        var end2: i64 = n;
+        if str_byte_at(s, end2 - 1) == 13 { end2 = end2 - 1; }
+        out.push(str_slice(s, start, end2));
+    }
+    return out;
+}
+
+/// What a child printed, as the script reads it (text mode: "\r\n" and "\r"
+/// are "\n").
+fn dt_text(s: str) -> str {
+    return str_replace(str_replace(s, "\r\n", "\n"), "\r", "\n");
+}
+
+/// Byte order, which is Python's code point order for UTF-8 text.
+fn dt_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn dt_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && dt_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+// ─── Files ───
+
+/// os.path.join(a, b): the platform's separator unless a ends with one.
+fn dt_join(a: str, b: str) -> str {
+    if str_len(a) == 0 { return b; }
+    if str_ends_with(a, "/") { return a + b; }
+    if process_is_windows() {
+        if str_ends_with(a, "\\") { return a + b; }
+        return a + "\\" + b;
+    }
+    return a + "/" + b;
+}
+
+/// Every .fd file under dir (os.walk; any order).
+fn dt_walk(dir: str, out: &mut Vec<str>) {
+    val names: Vec<str> = fs_list_dir(dir);
+    var i: i64 = 0;
+    while i < names.len() {
+        val p: str = dt_join(dir, names.get(i));
+        if fs_is_dir(p) {
+            dt_walk(p, out);
+        } else if str_ends_with(names.get(i), ".fd") {
+            out.push(p);
+        }
+        i = i + 1;
+    }
+}
+
+fn dt_read(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+/// re.findall(r"^\s*pub\s+(?:fn|struct|const|enum)", src, re.M): the lines
+/// whose first word is pub, then one of the four (a prefix: `pub fnx`
+/// counts, as in the script).
+fn dt_pub_items(src: str) -> i64 {
+    val lines: Vec<str> = dt_lines(src);
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < lines.len() {
+        val ln: str = lines.get(i);
+        val a: i64 = dt_skip(ln, 0);
+        if dt_at(ln, a, "pub") {
+            val b: i64 = dt_skip(ln, a + 3);
+            if b > a + 3 {
+                if dt_at(ln, b, "fn") || dt_at(ln, b, "struct") || dt_at(ln, b, "const") || dt_at(ln, b, "enum") {
+                    count = count + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ─── Examples ───
+
+/// One example: its module, whether it is native only, its code lines.
+struct DtExample {
+    module: str,
+    native: bool,
+    code: Vec<str>,
+}
+
+/// re.match(r"\s*module\s+(\w+)", ln): the name, "" for none.
+fn dt_module_name(ln: str) -> str {
+    val a: i64 = dt_skip(ln, 0);
+    if !dt_at(ln, a, "module") { return ""; }
+    val b: i64 = dt_skip(ln, a + 6);
+    if b == a + 6 { return ""; }
+    var c: i64 = b;
+    while c < str_len(ln) && dt_word(str_byte_at(ln, c)) { c = c + 1; }
+    if c == b { return ""; }
+    return str_slice(ln, b, c);
+}
+
+/// re.match(r"\s*///\s*Example(\s*\(native only\))?\s*:\s*$", ln):
+/// -1 no, 0 an example, 1 a native-only one.
+fn dt_marker(ln: str) -> i64 {
+    var i: i64 = dt_skip(ln, 0);
+    if !dt_at(ln, i, "///") { return -1; }
+    i = dt_skip(ln, i + 3);
+    if !dt_at(ln, i, "Example") { return -1; }
+    i = i + 7;
+    var native: i64 = 0;
+    val j: i64 = dt_skip(ln, i);
+    if dt_at(ln, j, "(native only)") {
+        native = 1;
+        i = j + 13;
+    }
+    i = dt_skip(ln, i);
+    if !dt_at(ln, i, ":") { return -1; }
+    i = dt_skip(ln, i + 1);
+    if i != str_len(ln) { return -1; }
+    return native;
+}
+
+/// re.match(r"\s*///(  +)(.*)$", ln): the code after the spaces; ok false
+/// when the line is not code.
+fn dt_code_line(ln: str, ok: &mut bool) -> str {
+    *ok = false;
+    val a: i64 = dt_skip(ln, 0);
+    if !dt_at(ln, a, "///") { return ""; }
+    var b: i64 = a + 3;
+    while b < str_len(ln) && str_byte_at(ln, b) == 32 { b = b + 1; }
+    if b - (a + 3) < 2 { return ""; }
+    *ok = true;
+    return str_slice(ln, b, str_len(ln));
+}
+
+/// The basename of path without ".fd".
+fn dt_stem(path: str) -> str {
+    var i: i64 = str_len(path) - 1;
+    while i >= 0 {
+        val c: i64 = str_byte_at(path, i);
+        if c == 47 || c == 92 { break; }
+        i = i - 1;
+    }
+    val base: str = str_slice(path, i + 1, str_len(path));
+    return str_slice(base, 0, str_len(base) - 3);
+}
+
+fn dt_examples(path: str, src: str) -> Vec<DtExample> {
+    var out: Vec<DtExample> = Vec::new();
+    var module: str = "";
+    val lines: Vec<str> = dt_lines(src);
+    var i: i64 = 0;
+    while i < lines.len() {
+        val name: str = dt_module_name(lines.get(i));
+        if str_len(name) > 0 { module = name; }
+        val mk: i64 = dt_marker(lines.get(i));
+        if mk >= 0 {
+            var code: Vec<str> = Vec::new();
+            var j: i64 = i + 1;
+            var more: bool = true;
+            while more && j < lines.len() {
+                var ok: bool = false;
+                val c: str = dt_code_line(lines.get(j), &mut ok);
+                if ok {
+                    code.push(c);
+                    j = j + 1;
+                } else {
+                    more = false;
+                }
+            }
+            if code.len() > 0 {
+                var m: str = module;
+                if str_len(m) == 0 { m = dt_stem(path); }
+                out.push(DtExample { module: m, native: mk == 1, code: code });
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// re.match(r"\s*use\s+\w+\s*;", ln)
+fn dt_is_use(ln: str) -> bool {
+    val a: i64 = dt_skip(ln, 0);
+    if !dt_at(ln, a, "use") { return false; }
+    val b: i64 = dt_skip(ln, a + 3);
+    if b == a + 3 { return false; }
+    var c: i64 = b;
+    while c < str_len(ln) && dt_word(str_byte_at(ln, c)) { c = c + 1; }
+    if c == b { return false; }
+    return dt_at(ln, dt_skip(ln, c), ";");
+}
+
+/// re.match(r"\s*fn\s+main\b", ln)
+fn dt_is_main(ln: str) -> bool {
+    val a: i64 = dt_skip(ln, 0);
+    if !dt_at(ln, a, "fn") { return false; }
+    val b: i64 = dt_skip(ln, a + 2);
+    if b == a + 2 || !dt_at(ln, b, "main") { return false; }
+    val c: i64 = b + 4;
+    return c >= str_len(ln) || !dt_word(str_byte_at(ln, c));
+}
+
+/// The standalone program of an example (build_prog).
+fn dt_program(module: str, code: Vec<str>) -> str {
+    var uses: Vec<str> = Vec::new();
+    var body: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < code.len() {
+        if dt_is_use(code.get(i)) { uses.push(code.get(i)); } else { body.push(code.get(i)); }
+        i = i + 1;
+    }
+    var head: str = "use " + module + ";\n";
+    i = 0;
+    while i < uses.len() {
+        if i > 0 { head = head + "\n"; }
+        head = head + str_trim(uses.get(i));
+        i = i + 1;
+    }
+    if uses.len() > 0 { head = head + "\n"; }
+    var has_main: bool = false;
+    var has_return: bool = false;
+    i = 0;
+    while i < body.len() {
+        if dt_is_main(body.get(i)) { has_main = true; }
+        if str_contains(body.get(i), "return") { has_return = true; }
+        i = i + 1;
+    }
+    if has_main {
+        var all: str = "";
+        i = 0;
+        while i < body.len() {
+            if i > 0 { all = all + "\n"; }
+            all = all + body.get(i);
+            i = i + 1;
+        }
+        return head + "\n" + all + "\n";
+    }
+    var inner: str = "";
+    i = 0;
+    while i < body.len() {
+        if i > 0 { inner = inner + "\n"; }
+        inner = inner + "    " + body.get(i);
+        i = i + 1;
+    }
+    if !has_return { inner = inner + "\n    return 0;"; }
+    return head + "\nfn main() -> i64 {\n" + inner + "\n}\n";
+}
+
+// ─── Running ───
+
+/// The lines of what a child wrote, as the script takes them:
+/// (first + "\n" + second).strip().splitlines().
+fn dt_msg_lines(first: str, second: str) -> Vec<str> {
+    return dt_lines(str_trim(dt_text(first + "\n" + second)));
+}
+
+/// The first line that is not [build] progress and names the problem, else
+/// the first line, else `none`.
+fn dt_first_error(lines: Vec<str>, alts: Vec<str>, skip_colon: bool, none: str) -> str {
+    var i: i64 = 0;
+    while i < lines.len() {
+        val ln: str = lines.get(i);
+        var keep: bool = !str_starts_with(ln, "[") && dt_has_any(ln, alts);
+        if keep && skip_colon && str_ends_with(str_trim(ln), ":") { keep = false; }
+        if keep { return ln; }
+        i = i + 1;
+    }
+    if lines.len() > 0 { return lines.get(0); }
+    return none;
+}
+
+fn dt_argv(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+var dt_host: str = "";
+
+/// "win32", "linux-<arch>" (x86_64, aarch64, riscv64), or "other".
+fn dt_host_kind() -> str {
+    if str_len(dt_host) > 0 { return dt_host; }
+    if process_is_windows() {
+        dt_host = "win32";
+        return dt_host;
+    }
+    dt_host = "other";
+    var un: Vec<str> = Vec::new();
+    un.push("uname");
+    un.push("-s");
+    val s: ChildResult = process_run_argv(un, Vec::new(), "", 10000);
+    if str_trim(s.output) == "Linux" {
+        var um: Vec<str> = Vec::new();
+        um.push("uname");
+        um.push("-m");
+        val m: str = str_to_lower(str_trim(process_run_argv(um, Vec::new(), "", 10000).output));
+        if m == "x86_64" || m == "amd64" { dt_host = "linux-x86_64"; }
+        if m == "aarch64" || m == "arm64" { dt_host = "linux-aarch64"; }
+        if m == "riscv64" { dt_host = "linux-riscv64"; }
+    }
+    return dt_host;
+}
+
+/// The command that builds `prog` natively for this host.
+fn dt_native_cmd(fid: str, prog: str, exe: str) -> Vec<str> {
+    val host: str = dt_host_kind();
+    var v: Vec<str> = Vec::new();
+    v.push(fid);
+    if str_starts_with(host, "linux-") {
+        v.push("emit");
+        v.push(prog);
+        v.push("--target");
+        v.push(str_slice(host, 6, str_len(host)) + "-linux");
+    } else if host == "win32" {
+        v.push("emit");
+        v.push(prog);
+    } else {
+        v.push("ccompile");
+        v.push(prog);
+    }
+    v.push("-o");
+    v.push(exe);
+    return v;
+}
+
+/// A child's exit code as Python reports it on Windows (unsigned).
+fn dt_code(c: i64) -> i64 {
+    if c < 0 && process_is_windows() { return c + 4294967296; }
+    return c;
+}
+
+/// Build `prog` natively and run it: "" when it passed, else the first
+/// line of what went wrong (run_native).
+fn dt_run_native(fid: str, prog: str) -> str {
+    var exe: str = str_slice(prog, 0, str_len(prog) - 3);
+    if process_is_windows() { exe = exe + ".exe"; }
+    val cmd: Vec<str> = dt_native_cmd(fid, prog, exe);
+    var b: ChildResult = process_run_argv(cmd, Vec::new(), "", 300000);
+    if b.timed_out { return "build timeout"; }
+    if (b.code != 0 || !fs_exists(exe)) && cmd.get(1) == "emit" {
+        // the own backend lacks some runtime functions: the C route
+        var cc: Vec<str> = Vec::new();
+        cc.push(fid);
+        cc.push("ccompile");
+        cc.push(prog);
+        cc.push("-o");
+        cc.push(exe);
+        val c: ChildResult = process_run_argv(cc, Vec::new(), "", 300000);
+        if !c.timed_out && c.code == 0 && fs_exists(exe) { b = c; }
+    }
+    if b.code != 0 || !fs_exists(exe) {
+        var alts: Vec<str> = Vec::new();
+        alts.push("error");
+        alts.push("panic");
+        alts.push("fail");
+        alts.push("not available");
+        alts.push("undefined");
+        return "build: " + dt_first_error(dt_msg_lines(b.errors, b.output), alts, true, "no binary");
+    }
+    var run: Vec<str> = Vec::new();
+    run.push(exe);
+    val r: ChildResult = process_run_argv(run, Vec::new(), "", 60000);
+    if r.timed_out { return "timeout"; }
+    if r.code != 0 {
+        var text: str = r.errors;
+        if str_len(text) == 0 { text = r.output; }
+        val lines: Vec<str> = dt_lines(str_trim(dt_text(text)));
+        var first: str = "?";
+        if lines.len() > 0 { first = lines.get(0); }
+        return "exit " + int_to_str(dt_code(r.code)) + ": " + first;
+    }
+    return "";
+}
+
+/// os.path.abspath for spawning: a bare name is in the current directory
+/// (we never change it, so a relative path is the same as its absolute one).
+fn dt_fid_path(fid: str) -> str {
+    var p: str = fid;
+    if process_is_windows() { p = str_replace(p, "/", "\\"); }
+    if !str_contains(p, "/") && !str_contains(p, "\\") {
+        if process_is_windows() { return ".\\" + p; }
+        return "./" + p;
+    }
+    return p;
+}
+
+fn dt_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        match env_var(names.get(i)) {
+            Option::Some(s) => {
+                if str_len(s) > 0 { return s; }
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    if process_is_windows() { return "."; }
+    return "/tmp";
+}
+
+fn dt_contains(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    // `fid run tools/doctest.fd ...` passes "run" and the path first
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var argv: Vec<str> = Vec::new();
+    var i: i64 = first;
+    while i < all.len() {
+        argv.push(all.get(i));
+        i = i + 1;
+    }
+    var root: str = "stdlib";
+    var fid: str = "release/fid.exe";
+    val verbose: bool = dt_contains(argv, "-v");
+    val native_only: bool = dt_contains(argv, "--native-only");
+    var args: Vec<str> = Vec::new();
+    var flags: Vec<str> = Vec::new();
+    i = 0;
+    while i < argv.len() {
+        if str_starts_with(argv.get(i), "-") { flags.push(argv.get(i)); } else { args.push(argv.get(i)); }
+        i = i + 1;
+    }
+    val emit: bool = dt_contains(flags, "--emit");
+    if dt_contains(flags, "--fid") {
+        var k: i64 = 0;
+        while argv.get(k) != "--fid" { k = k + 1; }
+        if k + 1 >= argv.len() {
+            io_eprintln("doctest: --fid needs a path");
+            return 2;
+        }
+        fid = argv.get(k + 1);
+        var rest: Vec<str> = Vec::new();
+        i = 0;
+        while i < args.len() {
+            if args.get(i) != fid { rest.push(args.get(i)); }
+            i = i + 1;
+        }
+        if rest.len() > 0 { root = rest.get(0); }
+    } else if args.len() > 0 {
+        root = args.get(0);
+    }
+    fid = dt_fid_path(fid);
+
+    var files: Vec<str> = Vec::new();
+    dt_walk(root, &mut files);
+    dt_sort(&mut files);
+    var total_items: i64 = 0;
+    var n_doc: i64 = 0;
+    var n_run: i64 = 0;
+    var n_fail: i64 = 0;
+    var n_skip: i64 = 0;
+    var fails: Vec<str> = Vec::new();
+    val tmp: str = dt_join(dt_temp_dir(), "fiddoctest" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()));
+    fs_mkdir(tmp);
+    var run_alts: Vec<str> = Vec::new();
+    run_alts.push("error");
+    run_alts.push("panic");
+    run_alts.push("assert");
+    run_alts.push("fail");
+    run_alts.push("undefined");
+    var f: i64 = 0;
+    while f < files.len() {
+        val path: str = files.get(f);
+        f = f + 1;
+        val src: str = dt_read(path);
+        total_items = total_items + dt_pub_items(src);
+        val exs: Vec<DtExample> = dt_examples(path, src);
+        var k: i64 = 0;
+        while k < exs.len() {
+            val ex: DtExample = exs.get(k);
+            val tag: str = path + ":" + int_to_str(k);
+            n_doc = n_doc + 1;
+            if ex.native && !emit {
+                n_skip = n_skip + 1;
+                k = k + 1;
+                continue;
+            }
+            if native_only && !ex.native {
+                k = k + 1;
+                continue;
+            }
+            val prog: str = dt_join(tmp, ex.module + "_" + int_to_str(k) + ".fd");
+            fs_write_text(prog, dt_program(ex.module, ex.code));
+            if ex.native {
+                val why: str = dt_run_native(fid, prog);
+                n_run = n_run + 1;
+                if str_len(why) > 0 {
+                    n_fail = n_fail + 1;
+                    fails.push(tag + "  " + why);
+                } else if verbose {
+                    println("ok  " + path + " #" + int_to_str(k) + " (native)");
+                }
+                k = k + 1;
+                continue;
+            }
+            val r: ChildResult = process_run_argv(dt_argv(fid, "run", prog), Vec::new(), "", 60000);
+            n_run = n_run + 1;
+            if r.timed_out || r.code != 0 {
+                n_fail = n_fail + 1;
+                var line: str = "timeout";
+                if !r.timed_out {
+                    line = dt_first_error(dt_msg_lines(r.errors, r.output), run_alts, false, "?");
+                }
+                fails.push(tag + "  " + line);
+            } else if verbose {
+                println("ok  " + path + " #" + int_to_str(k));
+            }
+            k = k + 1;
+        }
+    }
+    println("doctest: " + int_to_str(total_items) + " pub items | " + int_to_str(n_doc) + " examples | "
+        + int_to_str(n_run) + " run | " + int_to_str(n_fail) + " failed | " + int_to_str(n_skip) + " skipped(native)");
+    i = 0;
+    while i < fails.len() {
+        println("  FAIL " + fails.get(i));
+        i = i + 1;
+    }
+    if n_fail > 0 { return 1; }
+    return 0;
+}

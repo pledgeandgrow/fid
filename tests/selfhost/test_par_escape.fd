@@ -1,0 +1,135 @@
+// CS5: the parallel passes of the escape, @secret and borrow checks
+// (FID_PAR=N) give the sequential messages, in the same order. This parses a program of 271
+// functions (reference errors of several kinds: a reference to a local
+// returned, a reference given to a parameter that may keep it, through
+// functions and methods whose summaries say what their result borrows;
+// @secret values printed; borrow errors through an LG3 signature) and runs
+// the escape, @secret and borrow checks. Run it with FID_PAR unset and
+// with FID_PAR=2, 4 and 16: every line must be the same (tests/par/par_check.sh does).
+//
+// Expected output:
+// escape: 120 messages, sum 855887520
+// first: Reference error (line 128): in 'dangle_0', 'dangle_0' returns a reference to local 'local', which is freed when it returns
+// last: Reference error (line 123): in 'm29', 'm29' returns a reference to local 'a', which is freed when it returns
+// keep: Reference error (line 276): in 'keep_7', a reference cannot be passed to parameter 'x' of 'store_7' (type 'Vec<i64>'), which may keep it; only reference parameters can borrow
+// secrecy: 30 messages, sum 958295030
+// first: Security error (@secret) (line 997): in 'show_0', a secret value reaches output 'println'
+// borrowck: 30 messages, sum 1903505938
+// first: borrow error in tie_0 (line 703): cannot mutate a: shared borrow(s) are active on it or its fields
+//     Held by: 'r' (&a, line 702).
+//     Fix: use 'r' for the last time before this line, or declare it in an inner block { ... } that ends first.
+
+use core;
+use vec;
+use string;
+use compiler::token;
+use compiler::lexer;
+use compiler::ast;
+use compiler::parser;
+use compiler::escape;
+use compiler::secrecy;
+use compiler::borrowck;
+
+fn source() -> str {
+    var s: str = "struct Holder {\n    v: i64,\n}\n";
+    // lines 4..: an impl block whose methods return references to locals
+    s = s + "impl Holder {\n";
+    var m: i64 = 0;
+    while m < 30 {
+        s = s + "    fn m" + int_to_str(m) + "(self: Holder) -> &i64 {\n        var a: i64 = " + int_to_str(m) + ";\n        return &a;\n    }\n";
+        m = m + 1;
+    }
+    s = s + "}\n";
+    var i: i64 = 0;
+    while i < 30 {
+        var n: str = int_to_str(i);
+        // a reference to a local returned
+        s = s + "fn dangle_" + n + "() -> &i64 {\n    var local: i64 = " + n + ";\n    return &local;\n}\n";
+        // a function whose result borrows its parameter (a summary)
+        s = s + "fn pass_" + n + "(r: &i64) -> &i64 {\n    return r;\n}\n";
+        // through that summary: still a reference to a local
+        s = s + "fn via_" + n + "() -> &i64 {\n    var x: i64 = " + n + ";\n    return pass_" + n + "(&x);\n}\n";
+        // a reference given to a parameter that may keep it
+        s = s + "fn store_" + n + "(x: Vec<i64>) -> i64 {\n    return x.len();\n}\n";
+        s = s + "fn keep_" + n + "() -> i64 {\n    var v: Vec<i64> = Vec::new();\n    var r: &Vec<i64> = &v;\n    return store_" + n + "(r);\n}\n";
+        i = i + 1;
+    }
+    // borrow errors, through an LG3 signature (the borrow check's tables)
+    var b: i64 = 0;
+    while b < 30 {
+        var bn: str = int_to_str(b);
+        s = s + "fn first_" + bn + "<'a>(x: &'a i64, y: &i64) -> &'a i64 {
+    return x;
+}
+";
+        s = s + "fn tie_" + bn + "() -> i64 {
+    var a: i64 = 1;
+    var c: i64 = 2;
+    val r = first_" + bn + "(&a, &c);
+    a = 5;
+    return *r;
+}
+";
+        b = b + 1;
+    }
+    var k: i64 = 0;
+    while k < 30 {
+        s = s + "fn show_" + int_to_str(k) + "(@secret k: i64) {\n    println(k);\n}\n";
+        k = k + 1;
+    }
+    s = s + "fn main() -> i64 {\n    return 0;\n}\n";
+    return s;
+}
+
+fn sum(msgs: Vec<str>) -> i64 {
+    var h: i64 = 0;
+    var i: i64 = 0;
+    while i < msgs.len() {
+        var m: str = msgs.get(i);
+        var j: i64 = 0;
+        while j < str_len(m) {
+            h = (h * 31 + str_byte_at(m, j) + i) % 2147483647;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return h;
+}
+
+fn report(what: str, msgs: Vec<str>) {
+    println(what + ": " + int_to_str(msgs.len()) + " messages, sum " + int_to_str(sum(msgs)));
+    if msgs.len() > 0 {
+        println("first: " + msgs.get(0));
+    }
+}
+
+fn main() -> i64 {
+    var lex: Lexer = Lexer::new(source());
+    var toks: Vec<Token> = lex.tokenize();
+    var p: Parser = Parser_new(toks);
+    match p.parse() {
+        ParseResultProgram::Ok(prog) => {
+            var esc: Vec<str> = escape_check(prog);
+            report("escape", esc);
+            if esc.len() > 0 {
+                println("last: " + esc.get(esc.len() - 1));
+            }
+            // a callee parameter's type in a message (param_tys in a worker)
+            var ki: i64 = 0;
+            while ki < esc.len() {
+                if str_contains(esc.get(ki), "'keep_7'") {
+                    println("keep: " + esc.get(ki));
+                }
+                ki = ki + 1;
+            }
+            report("secrecy", secrecy_check(prog));
+            var bc: BorrowChecker = BorrowChecker_new(BorrowckMode::On);
+            check(& mut bc, prog);
+            report("borrowck", bc.errors);
+        }
+        ParseResultProgram::Err(e) => {
+            println("parse error: " + e);
+        }
+    }
+    return 0;
+}

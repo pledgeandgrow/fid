@@ -1,0 +1,335 @@
+// Fides serial-chain kinematics (robotics)
+//
+// Denavit-Hartenberg chains (standard DH: link i is Rz(theta) Tz(d) Tx(a)
+// Rx(alpha)), each joint revolute (theta = q + offset) or prismatic
+// (d = q + offset), with an optional base and tool transform and joint
+// limits:
+//   dh_fk            forward kinematics: base * T1(q1) ... Tn(qn) * tool
+//   dh_fk_frames     the frame of every joint
+//   dh_jacobian      the 6 x n geometric Jacobian (linear rows first, in the
+//                    base frame): revolute z_{i-1} x (p_e - p_{i-1}) / z_{i-1},
+//                    prismatic z_{i-1} / 0
+//   dh_ik            numeric inverse kinematics by damped least squares:
+//                    dq = J' (J J' + lambda^2 I)^-1 e, the step limited and
+//                    the joints clamped to their limits; full pose or
+//                    position only
+//   planar2_fk/_ik   the two-link planar arm in closed form (both elbows)
+//
+// Poses are transform3d `Transform3` values; matrices are lqr `DMat`.
+// Everything here is pure computation; there is no platform seam.
+//
+// Usage:
+//   use math; use quat; use transform3d; use lqr; use kinematics;
+//   var arm = dh_chain_new();
+//   dh_chain_add(&mut arm, dh_revolute(1.0, 0.0, 0.0, 0.0));
+//   dh_chain_add(&mut arm, dh_revolute(0.8, 0.0, 0.0, 0.0));
+//   val pose = dh_fk(&arm, &q);
+//   val sol = dh_ik(&arm, pose, &q0, dh_ik_defaults());
+
+module kinematics;
+use math;
+use quat;
+use transform3d;
+use lqr;
+
+// ─── Chains ───
+
+/// One DH link: a, alpha, d, theta; q adds to theta (revolute) or d
+/// (prismatic). Limits apply when qmin < qmax.
+pub struct DhJoint {
+    pub a: f64,
+    pub alpha: f64,
+    pub d: f64,
+    pub theta: f64,
+    pub revolute: bool,
+    pub qmin: f64,
+    pub qmax: f64,
+}
+
+/// A serial chain: world_T_tool = base * links * tool.
+pub struct DhChain {
+    pub joints: Vec<DhJoint>,
+    pub base: Transform3,
+    pub tool: Transform3,
+}
+
+/// A revolute joint (theta = q + theta_offset), no limits.
+pub fn dh_revolute(a: f64, alpha: f64, d: f64, theta_offset: f64) -> DhJoint {
+    return DhJoint {
+        a: a, alpha: alpha, d: d, theta: theta_offset, revolute: true, qmin: 0.0, qmax: 0.0
+    };
+}
+
+/// A prismatic joint (d = q + d_offset), no limits.
+pub fn dh_prismatic(a: f64, alpha: f64, theta: f64, d_offset: f64) -> DhJoint {
+    return DhJoint {
+        a: a, alpha: alpha, d: d_offset, theta: theta, revolute: false, qmin: 0.0, qmax: 0.0
+    };
+}
+
+/// j with limits [qmin, qmax].
+pub fn dh_with_limits(j: DhJoint, qmin: f64, qmax: f64) -> DhJoint {
+    return DhJoint {
+        a: j.a, alpha: j.alpha, d: j.d, theta: j.theta, revolute: j.revolute, qmin: qmin, qmax: qmax
+    };
+}
+
+/// An empty chain with identity base and tool.
+pub fn dh_chain_new() -> DhChain {
+    return DhChain {
+        joints: Vec::new(), base: tf3_identity(), tool: tf3_identity()
+    };
+}
+
+/// Append a joint.
+pub fn dh_chain_add(c: & mut DhChain, j: DhJoint) {
+    c.joints.push(j);
+}
+
+/// The number of joints.
+pub fn dh_dof(c: & DhChain) -> i64 {
+    return c.joints.len();
+}
+
+/// The link transform of joint j at joint value q:
+/// Rz(theta) Tz(d) Tx(a) Rx(alpha).
+pub fn dh_link_transform(j: DhJoint, q: f64) -> Transform3 {
+    var theta: f64 = j.theta;
+    var d: f64 = j.d;
+    if j.revolute {
+        theta = theta + q;
+    } else {
+        d = d + q;
+    }
+    val rz: quat = qt_from_axis_angle(vec3(0.0, 0.0, 1.0), theta);
+    val rx: quat = qt_from_axis_angle(vec3(1.0, 0.0, 0.0), j.alpha);
+    return Transform3 {
+        rot: qt_mul(rz, rx), trans: vec3(j.a * math_cos(theta), j.a * math_sin(theta), d)
+    };
+}
+
+/// The frames base, base*T1, ..., base*T1..Tn (n + 1 transforms, the tool
+/// not applied).
+pub fn dh_fk_frames(c: & DhChain, q: & Vec<f64>) -> Vec<Transform3> {
+    var out: Vec<Transform3> = Vec::new();
+    var t: Transform3 = c.base;
+    out.push(t);
+    var i: i64 = 0;
+    while i < c.joints.len() {
+        t = tf3_compose(t, dh_link_transform(c.joints.get(i), q.get(i)));
+        out.push(t);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The tool pose base * T1(q1) ... Tn(qn) * tool.
+pub fn dh_fk(c: & DhChain, q: & Vec<f64>) -> Transform3 {
+    val frames: Vec<Transform3> = dh_fk_frames(c, q);
+    return tf3_compose(frames.get(frames.len() - 1), c.tool);
+}
+
+/// The 6 x n geometric Jacobian at q: rows 0..2 the linear velocity of the
+/// tool point, rows 3..5 the angular velocity, both in the base (world)
+/// frame.
+pub fn dh_jacobian(c: & DhChain, q: & Vec<f64>) -> DMat {
+    val n: i64 = c.joints.len();
+    val frames: Vec<Transform3> = dh_fk_frames(c, q);
+    val pe: vec3 = tf3_compose(frames.get(n), c.tool).trans;
+    var j: DMat = dm_zeros(6, n);
+    var i: i64 = 0;
+    while i < n {
+        val f: Transform3 = frames.get(i);
+        val z: vec3 = qt_rotate(f.rot, vec3(0.0, 0.0, 1.0));
+        if c.joints.get(i).revolute {
+            val v: vec3 = z.cross(pe.sub(f.trans));
+            dm_set(&mut j, 0, i, v.x);
+            dm_set(&mut j, 1, i, v.y);
+            dm_set(&mut j, 2, i, v.z);
+            dm_set(&mut j, 3, i, z.x);
+            dm_set(&mut j, 4, i, z.y);
+            dm_set(&mut j, 5, i, z.z);
+        } else {
+            dm_set(&mut j, 0, i, z.x);
+            dm_set(&mut j, 1, i, z.y);
+            dm_set(&mut j, 2, i, z.z);
+        }
+        i = i + 1;
+    }
+    return j;
+}
+
+/// The pose error target - current as a 6-vector: position difference and
+/// the rotation vector of target * current^-1 (both in the base frame).
+pub fn dh_pose_error(target: Transform3, current: Transform3) -> Vec<f64> {
+    val dp: vec3 = target.trans.sub(current.trans);
+    val qe: quat = qt_mul(target.rot, qt_conj(current.rot));
+    val w: vec3 = qt_to_rotvec(qe);
+    var e: Vec<f64> = Vec::new();
+    e.push(dp.x);
+    e.push(dp.y);
+    e.push(dp.z);
+    e.push(w.x);
+    e.push(w.y);
+    e.push(w.z);
+    return e;
+}
+
+// ─── Inverse kinematics ───
+
+/// Settings of `dh_ik`.
+pub struct IkOptions {
+    pub max_iter: i64,
+    // stop when the position error is below tol_pos (and the rotation error
+    // below tol_rot radians, unless position_only)
+    pub tol_pos: f64,
+    pub tol_rot: f64,
+    // damping of the least-squares step
+    pub lambda: f64,
+    // largest change of one joint per iteration
+    pub max_step: f64,
+    pub position_only: bool,
+}
+
+/// 200 iterations, 1e-9 m / 1e-9 rad, lambda 0.05, steps of at most 0.5.
+pub fn dh_ik_defaults() -> IkOptions {
+    return IkOptions {
+        max_iter: 200, tol_pos: 0.000000001, tol_rot: 0.000000001, lambda: 0.05, max_step: 0.5, position_only: false
+    };
+}
+
+/// The result of `dh_ik`.
+pub struct IkResult {
+    pub q: Vec<f64>,
+    pub iterations: i64,
+    pub pos_err: f64,
+    pub rot_err: f64,
+    pub converged: bool,
+}
+
+/// q with each joint clamped to its limits (joints without limits unchanged).
+pub fn dh_clamp(c: & DhChain, q: & Vec<f64>) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < q.len() {
+        val j: DhJoint = c.joints.get(i);
+        var v: f64 = q.get(i);
+        if j.qmin < j.qmax {
+            v = rmath_clamp(v, j.qmin, j.qmax);
+        }
+        out.push(v);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Joint values bringing the tool to `target`, from the guess q0, by damped
+/// least squares. `converged` says whether the tolerances were met.
+pub fn dh_ik(c: & DhChain, target: Transform3, q0: & Vec<f64>, opt: IkOptions) -> IkResult {
+    val n: i64 = c.joints.len();
+    var q: Vec<f64> = dh_clamp(c, q0);
+    var rows: i64 = 6;
+    if opt.position_only {
+        rows = 3;
+    }
+    var it: i64 = 0;
+    var pos_err: f64 = 0.0;
+    var rot_err: f64 = 0.0;
+    loop {
+        val cur: Transform3 = dh_fk(c, &q);
+        val e6: Vec<f64> = dh_pose_error(target, cur);
+        pos_err = math_sqrt(e6.get(0) * e6.get(0) + e6.get(1) * e6.get(1) + e6.get(2) * e6.get(2));
+        rot_err = math_sqrt(e6.get(3) * e6.get(3) + e6.get(4) * e6.get(4) + e6.get(5) * e6.get(5));
+        var done: bool = pos_err <= opt.tol_pos;
+        if !opt.position_only {
+            done = done && rot_err <= opt.tol_rot;
+        }
+        if done {
+            return IkResult {
+                q: q, iterations: it, pos_err: pos_err, rot_err: rot_err, converged: true
+            };
+        }
+        if it >= opt.max_iter {
+            break;
+        }
+        val jfull: DMat = dh_jacobian(c, &q);
+        val jac: DMat = dm_block(&jfull, 0, 0, rows, n);
+        var e: DMat = dm_zeros(rows, 1);
+        var r: i64 = 0;
+        while r < rows {
+            dm_set(&mut e, r, 0, e6.get(r));
+            r = r + 1;
+        }
+        // dq = J' (J J' + lambda^2 I)^-1 e
+        val jt: DMat = dm_transpose(&jac);
+        val jjt: DMat = dm_mul(&jac, &jt);
+        val damp: DMat = dm_scale(&dm_identity(rows), opt.lambda * opt.lambda);
+        val m: DMat = dm_add(&jjt, &damp);
+        match dm_solve(&m, &e) {
+            Result::Ok(y) => {
+                val dq: DMat = dm_mul(&jt, &y);
+                // limit the largest joint step
+                var big: f64 = dm_max_abs(&dq);
+                var s: f64 = 1.0;
+                if big > opt.max_step {
+                    s = opt.max_step / big;
+                }
+                var nq: Vec<f64> = Vec::new();
+                var i: i64 = 0;
+                while i < n {
+                    nq.push(q.get(i) + s * dm_get(&dq, i, 0));
+                    i = i + 1;
+                }
+                q = dh_clamp(c, &nq);
+            }
+            Result::Err(msg) => {
+                break;
+            }
+        }
+        it = it + 1;
+    }
+    return IkResult {
+        q: q, iterations: it, pos_err: pos_err, rot_err: rot_err, converged: false
+    };
+}
+
+// ─── Two-link planar arm in closed form ───
+
+/// The tip (x, y) of a planar arm with links l1, l2 at angles q1, q2
+/// (q2 relative to link 1).
+pub fn planar2_fk(l1: f64, l2: f64, q1: f64, q2: f64) -> vec2 {
+    return vec2(l1 * math_cos(q1) + l2 * math_cos(q1 + q2), l1 * math_sin(q1) + l2 * math_sin(q1 + q2));
+}
+
+/// Joint angles (q1, q2) putting the tip at (x, y): elbow_up picks q2 <= 0,
+/// otherwise q2 >= 0. Err
+/// when the point is out of reach.
+pub fn planar2_ik(l1: f64, l2: f64, x: f64, y: f64, elbow_up: bool) -> Result<vec2, str> {
+    val r2: f64 = x * x + y * y;
+    var c2: f64 = (r2 - l1 * l1 - l2 * l2) / (2.0 * l1 * l2);
+    if c2 > 1.0 + 0.000000001 || c2 < - 1.0 - 0.000000001 {
+        return Result::Err("planar2_ik: target out of reach");
+    }
+    c2 = rmath_clamp(c2, - 1.0, 1.0);
+    var s2: f64 = math_sqrt(1.0 - c2 * c2);
+    if elbow_up {
+        s2 = 0.0 - s2;
+    }
+    val q2: f64 = rmath_atan2(s2, c2);
+    val q1: f64 = rmath_atan2(y, x) - rmath_atan2(l2 * s2, l1 + l2 * c2);
+    return Result::Ok(vec2(rmath_wrap_angle(q1), q2));
+}
+
+/// The 2 x 2 Jacobian d(x, y)/d(q1, q2) of the planar arm.
+pub fn planar2_jacobian(l1: f64, l2: f64, q1: f64, q2: f64) -> DMat {
+    var j: DMat = dm_zeros(2, 2);
+    val s1: f64 = math_sin(q1);
+    val c1: f64 = math_cos(q1);
+    val s12: f64 = math_sin(q1 + q2);
+    val c12: f64 = math_cos(q1 + q2);
+    dm_set(&mut j, 0, 0, 0.0 - l1 * s1 - l2 * s12);
+    dm_set(&mut j, 0, 1, 0.0 - l2 * s12);
+    dm_set(&mut j, 1, 0, l1 * c1 + l2 * c12);
+    dm_set(&mut j, 1, 1, l2 * c12);
+    return j;
+}

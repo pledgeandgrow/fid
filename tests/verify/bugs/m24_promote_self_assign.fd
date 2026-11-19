@@ -1,0 +1,62 @@
+// Miscompile log M24 (VF1, found by scripts/fuzz/gen_programs.py --rich,
+// seed 20261189, reduced with scripts/fuzz/reduce.py and by hand, Nov 17).
+// A self-assignment `x = x;` between two `if`s (empty branches are
+// enough) loses the value on the native paths: with the stage 0 of Nov 16,
+// `fid emit` (pe_ir) prints garbage for `x` (5772960), `fid emit --nat`
+// prints 0; `run` and `ccompile` print 7. `FID_IROPT_OFF=promote` makes
+// emit right: the IR optimizer's `promote` (compiler/iropt.fd
+// iro_promote, mem2reg). The cause inside it is not pinned down; likely
+// the store of `x = x` stores the very load promote replaces, so the load
+// after the second `if` gets a value id that no longer exists (a garbage
+// register on pe_ir, 0 on nat_ir). Since Nov 17 promote runs only where
+// compiler/ssa.fd does not; m24_promote_self_assign_on.fd turns promote on
+// for every function.
+// The second program (`acc`) is the reduced fuzz program itself.
+
+fn f0(n: i64) -> i64 {
+    return n;
+}
+
+fn self_assign() -> i64 {
+    var x: i64 = 7;
+    if x > 3 {
+    } else {
+    }
+    x = x;
+    if x > 2 {
+    } else {
+    }
+    return x;
+}
+
+fn fuzz_seed() -> i64 {
+    var acc: i64 = 1;
+    var v0_1: i64 = ((f0(((462 & 1023) + (689 >> 3)) % 50) - 787 + 1000003) % 1000003);
+    if ((((18 + v0_1) % 1000003) - v0_1 + 1000003) % 1000003) > ((232 & 1023) + (v0_1 >> 3)) {
+    } else {
+    }
+    v0_1 = v0_1;
+    if ((((v0_1 - 756 + 1000003) % 1000003) + ((v0_1 + v0_1) % 1000003)) % 1000003) >= (f0(v0_1 % 50) / (v0_1 % 97 + 1)) {
+    } else {
+    }
+    acc = (acc * 31 + v0_1) % 1000003;
+    return acc;
+}
+
+fn main() -> i64 {
+    var x: i64 = 7;
+    if x > 3 {
+    } else {
+    }
+    x = x;
+    if x > 2 {
+    } else {
+    }
+    println(x);
+    println(self_assign());
+    println(fuzz_seed());
+    return 0;
+}
+//> 7
+//> 7
+//> 999295

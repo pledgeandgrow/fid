@@ -16,10 +16,12 @@
 # Environment: FID (the compiler that builds this one; default release/fid.exe),
 # CC (default `zig cc`), KEEP_TREE=1 keeps the edited copy beside <out>,
 # INSTRUMENT=<script> runs `python <script> <in.c> <out.c>` over the C
-# before compiling it (coverage, VF8).
+# before compiling it (coverage, VF8), EXTRA_CFLAGS="..." is added after the
+# fixed flags (sanitizers: scripts/sanitize.sh COMPILER=1, roadmap RL15).
 #
-# The generated C is built at -O0 like scripts/bootstrap.sh (one ~50 MB
-# translation unit; optimizing it needs more than 16 GB of RAM).
+# The generated C is split into SPLIT units at -O2 (default 8, see below)
+# or built as one ~70 MB translation unit at -O0 (optimizing one unit needs
+# more than 16 GB of RAM).
 set -u
 TREE="$1"; OUT="$2"; shift 2
 FID="${FID:-release/fid.exe}"
@@ -45,7 +47,10 @@ PY
 done
 
 C="${OUT%.exe}.c"
-( cd "$WORK" && "$FID" dump-c compiler/main.fd > "$C" 2> "${OUT%.exe}.log" ) || {
+# DUMP_C_FLAGS (VF8): more flags for that dump-c, e.g. `-g` for #line
+# directives where dump-c takes it (line coverage; FID_C_LINE_MARKS=1 in
+# the environment is the other way, read by the C generator itself)
+( cd "$WORK" && "$FID" dump-c compiler/main.fd ${DUMP_C_FLAGS:-} > "$C" 2> "${OUT%.exe}.log" ) || {
   echo "dump-c failed: $(grep -m5 -i error "${OUT%.exe}.log")"; exit 1; }
 if [ -n "${INSTRUMENT:-}" ]; then
   python "$INSTRUMENT" "$C" "$C.inst" || exit 1
@@ -85,10 +90,48 @@ int main(int argc, char** argv) {
 EOF
 LIBS=()
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32) ;; *) LIBS=(-lm -lpthread) ;; esac
-"${CC_CMD[@]}" -O0 -w -fno-sanitize=all -Wno-error -Wno-int-conversion \
-  -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -Wno-return-type \
-  "$W" -o "$OUT" "${LIBS[@]}" > "${OUT%.exe}.cc.log" 2>&1 || {
-  echo "C compile failed: $(grep -m5 error "${OUT%.exe}.cc.log")"; exit 1; }
+WFLAGS=(-w -fno-sanitize=all -Wno-error -Wno-int-conversion
+  -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -Wno-return-type)
+# Nov 17 (VF4): SPLIT=n (default 8 for a plain variant) splits the C with
+# `$FID split-c` into n units built at -O2, JOBS (default 4) at a time, as
+# scripts/build-selfhost.sh does: the variant then runs about as fast as
+# release/fid.exe instead of ~17x slower at -O0, which is what makes a
+# whole-suite run of each PEIR_* variant possible. An instrumented
+# (INSTRUMENT) or EXTRA_CFLAGS build stays one unit at -O0 unless SPLIT is
+# set; a failed split falls back to one unit at -O0. The generated C is the
+# same either way.
+if [ -n "${INSTRUMENT:-}" ] || [ -n "${EXTRA_CFLAGS:-}" ]; then SPLIT="${SPLIT:-1}"; else SPLIT="${SPLIT:-8}"; fi
+JOBS="${JOBS:-4}"
+built=0
+: > "${OUT%.exe}.cc.log"
+U="${OUT%.exe}_u"
+case "${CC_CMD[*]}" in *tcc*) SPLIT=1 ;; esac
+if [ "$SPLIT" -gt 1 ] && "$FID" split-c "$W" "$U" "$SPLIT" >> "${OUT%.exe}.cc.log" 2>&1 && [ -f "$U.h" ]; then
+  objs=(); pids=(); ok=1
+  for k in $(seq 0 $((SPLIT - 1))); do
+    "${CC_CMD[@]}" -O2 -fno-strict-aliasing -fwrapv "${WFLAGS[@]}" ${EXTRA_CFLAGS:-} \
+      -c "${U}_$k.c" -o "${U}_$k.o" >> "${OUT%.exe}.cc.log" 2>&1 &
+    pids+=($!)
+    objs+=("${U}_$k.o")
+    if [ ${#pids[@]} -ge "$JOBS" ]; then
+      wait "${pids[0]}" || ok=0
+      pids=("${pids[@]:1}")
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || ok=0; done
+  if [ "$ok" = 1 ] && "${CC_CMD[@]}" ${EXTRA_CFLAGS:-} "${objs[@]}" -o "$OUT" "${LIBS[@]}" >> "${OUT%.exe}.cc.log" 2>&1; then
+    built=1
+    echo "($SPLIT units at -O2)"
+  else
+    echo "split build failed (see ${OUT%.exe}.cc.log); building one unit at -O0"
+  fi
+  rm -f "${U}"_*.c "${U}"_*.o "$U.h"
+fi
+if [ "$built" = 0 ]; then
+  "${CC_CMD[@]}" -O0 "${WFLAGS[@]}" \
+    ${EXTRA_CFLAGS:-} "$W" -o "$OUT" "${LIBS[@]}" >> "${OUT%.exe}.cc.log" 2>&1 || {
+    echo "C compile failed: $(grep -m5 error "${OUT%.exe}.cc.log")"; exit 1; }
+fi
 rm -f "$W" "$C.inst"
 [ -n "${KEEP_TREE:-}" ] || rm -rf "$WORK"
 echo "built $OUT"

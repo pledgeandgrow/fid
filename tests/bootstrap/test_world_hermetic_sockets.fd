@@ -1,0 +1,57 @@
+// Complaint CT1: a @hermetic test may reach raw sockets through stdlib/net.
+// net's socket, address, connect, send, recv and close functions consult
+// stdlib/world (world_sockets_faked) before their C call
+// (pledge_net_*), so they are gates: `test_status` is accepted although
+// `fetch_status` opens, connects and reads a TCP socket, and under
+// world_fake_sockets it opens no real one. The type checker counts a
+// direct `pledge_net_*` call as reaching the network
+// (typechecker.fd hm_world_builtin), as it does `p_net_*`
+// (test_world_hermetic_net_fail.fd).
+//
+// Expected output:
+// status = up 42|players
+// sends = 1
+// request = tcp 192.168.1.9:8080 STATUS
+// faked = false
+use net;
+use world;
+
+// the code under test: no test hooks
+fn fetch_status(ip: str, port: i64) -> str {
+    val s: i64 = net_socket_create_tcp();
+    if s < 0 { return "no socket"; }
+    val addr: NetAddr = net_addr_create(ip, port);
+    if net_connect(s, & addr) != 0 {
+        net_close(s);
+        return "connect failed";
+    }
+    net_send_bytes(s, str_bytes("STATUS\n"));
+    val head: Vec<i64> = net_recv_bytes(s, 5);
+    val rest: Vec<i64> = net_recv_bytes(s, 100);
+    net_close(s);
+    return str_from_bytes(head) + "|" + str_trim(str_from_bytes(rest));
+}
+
+fn peers(proto: str, peer: str, data: Vec<i64>) -> Vec<i64> {
+    if str_equal(proto, "tcp") && str_equal(peer, "192.168.1.9:8080") && str_equal(str_from_bytes(data), "STATUS\n") {
+        return str_bytes("up 42 players\n");
+    }
+    var none: Vec<i64> = Vec::new();
+    return none;
+}
+
+@hermetic
+fn test_status() -> i64 {
+    world_fake_sockets(peers);
+    println("status = " + fetch_status("192.168.1.9", 8080));
+    println("sends = " + int_to_str(world_sock_sent_count()));
+    println("request = " + world_sock_sent_proto(0) + " " + world_sock_sent_peer(0) + " " + str_trim(world_sock_sent_text(0)));
+    return 0;
+}
+
+fn main() -> i64 {
+    test_status();
+    world_real_sockets();
+    println("faked = " + (if world_sockets_faked() { "true" } else { "false" }));
+    return 0;
+}

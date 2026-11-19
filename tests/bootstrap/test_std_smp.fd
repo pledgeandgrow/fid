@@ -1,0 +1,129 @@
+// stdlib/smp: INIT-SIPI-SIPI startup against fake APs, trampoline parameter block, CPU numbering from MADT data, topology and per-CPU blocks.
+// Expected output:
+// trampoline 0x8000 true 0x8800 false 0x0 false 0x9f000 false 0x9e000 true vector 8
+// plan: ipi 0x4500, delay 10000, ipi 0x4608, delay 200, sipi-if-absent 0x4608, delay 200, wait 100000
+// ap1 online ipis 2 waited 10400
+// ap2 online ipis 3 waited 10400
+// ap3 failed ipis 3 waited 110400
+// ap4 failed ipis 0 waited 0
+// ipi log: 1:init 1:sipi 2:init 2:sipi 2:sipi 3:init 3:sipi 3:sipi
+// map apic 0,2,6,4 uids 1,0,3,2 present 3 of 4
+// cpu of apic 6: 2, apic 8: -1
+// topology 0x1d: package 1 core 6 thread 1; shifts 6->3 2->1 1->0
+// percpu stride 128 base2 0xffff800000100100 owner 2 -1
+// params 52 bytes cr3 0x0000000000123000 stack 0xffff8000007f8000 entry 0xffffffff80001000 gdt 0x0000000000009000/23 cpu 2 apic 6
+// online 3 of 4
+use smp;
+use apic;
+use vec;
+use string;
+
+var g_flag: Vec<i64> = Vec::new();
+var g_sipis: Vec<i64> = Vec::new();
+var g_log: Vec<str> = Vec::new();
+var g_delay: Vec<i64> = Vec::new();
+
+fn hx(v: i64) -> str {
+    var d: str = "0123456789abcdef";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 15;
+    while i >= 0 {
+        out.push(str_byte_at(d, (v >> (i * 4)) & 15));
+        i = i - 1;
+    }
+    return "0x" + str_from_bytes(out);
+}
+
+// fake APs: APIC id 1 starts on the first SIPI, 2 on the second, 3 never,
+// and IPIs to 4 are not delivered
+fn send(dest: i64, lo: i64) -> bool {
+    if dest == 4 { return false; }
+    val mode: i64 = (lo >> 8) & 7;
+    if mode == APIC_DM_INIT {
+        g_log.push(int_to_str(dest) + ":init");
+    }
+    if mode == APIC_DM_STARTUP {
+        g_log.push(int_to_str(dest) + ":sipi");
+        g_sipis.set(dest, g_sipis.get(dest) + 1);
+        if (dest == 1 && g_sipis.get(dest) == 1) || (dest == 2 && g_sipis.get(dest) == 2) {
+            g_flag.set(dest, SMP_CALLIN_MAGIC);
+        }
+    }
+    return true;
+}
+
+fn delay(us: i64) {
+    g_delay.set(0, g_delay.get(0) + us);
+}
+
+fn flag(cpu: i64) -> i64 {
+    return g_flag.get(cpu);
+}
+
+fn sname(s: i64) -> str {
+    if s == SMP_ONLINE { return "online"; }
+    if s == SMP_FAILED { return "failed"; }
+    return "?";
+}
+
+fn boot(ops: &SmpOps, id: i64) {
+    val r: ApResult = smp_boot_ap(ops, id, id, 0x8000);
+    println("ap" + int_to_str(id) + " " + sname(r.state) + " ipis " + int_to_str(r.ipis) + " waited " + int_to_str(r.waited_us));
+}
+
+fn cpu(uid: i64, id: i64, en: bool, cap: bool) -> MadtCpu {
+    return MadtCpu { uid: uid, apic_id: id, enabled: en, online_capable: cap, x2: false };
+}
+
+fn main() {
+    g_flag = Vec::filled(8, 0);
+    g_sipis = Vec::filled(8, 0);
+    g_delay = Vec::filled(1, 0);
+    println("trampoline 0x8000 " + bool_to_str(smp_trampoline_ok(0x8000)) + " 0x8800 " + bool_to_str(smp_trampoline_ok(0x8800)) + " 0x0 " + bool_to_str(smp_trampoline_ok(0)) + " 0x9f000 " + bool_to_str(smp_trampoline_ok(0x9F000)) + " 0x9e000 " + bool_to_str(smp_trampoline_ok(0x9E000)) + " vector " + int_to_str(smp_sipi_vector(0x8000)));
+    val plan: Vec<SmpStep> = smp_boot_plan(0x8000);
+    var ps: str = "plan:";
+    var i: i64 = 0;
+    while i < plan.len() {
+        val st: SmpStep = plan.get(i);
+        if i > 0 { ps = ps + ","; }
+        if st.kind == SMP_STEP_IPI { ps = ps + " ipi 0x" + int_to_hex(st.value); }
+        if st.kind == SMP_STEP_DELAY { ps = ps + " delay " + int_to_str(st.value); }
+        if st.kind == SMP_STEP_SIPI_IF_ABSENT { ps = ps + " sipi-if-absent 0x" + int_to_hex(st.value); }
+        if st.kind == SMP_STEP_WAIT { ps = ps + " wait " + int_to_str(st.value); }
+        i = i + 1;
+    }
+    println(ps);
+    val ops: SmpOps = SmpOps { send_ipi: send, delay_us: delay, read_flag: flag };
+    var id: i64 = 1;
+    while id <= 4 {
+        g_delay.set(0, 0);
+        boot(&ops, id);
+        id = id + 1;
+    }
+    println("ipi log: " + str_join(g_log, " "));
+
+    var info: MadtInfo = MadtInfo { lapic_addr: 0xFEE00000, pcat_compat: true, cpus: Vec::new(), ioapics: Vec::new(), overrides: Vec::new(), nmi_lint: -1 };
+    info.cpus.push(cpu(0, 2, true, false));
+    info.cpus.push(cpu(1, 0, true, false));
+    info.cpus.push(cpu(2, 4, false, true));
+    info.cpus.push(cpu(3, 6, true, false));
+    info.cpus.push(cpu(4, 8, false, false));
+    var m: CpuMap = smp_cpu_map(&info, 0);
+    println("map apic " + str_join_ints(m.apic_ids, ",") + " uids " + str_join_ints(m.uids, ",") + " present " + int_to_str(smp_present_count(&m)) + " of " + int_to_str(m.apic_ids.len()));
+    println("cpu of apic 6: " + int_to_str(smp_cpu_of_apic(&m, 6)) + ", apic 8: " + int_to_str(smp_cpu_of_apic(&m, 8)));
+    val t: CpuTopo = smp_topology(0x1D, 1, 4);
+    println("topology 0x1d: package " + int_to_str(t.package) + " core " + int_to_str(t.core) + " thread " + int_to_str(t.thread) + "; shifts 6->" + int_to_str(smp_shift_for(6)) + " 2->" + int_to_str(smp_shift_for(2)) + " 1->" + int_to_str(smp_shift_for(1)));
+
+    val base: i64 = 0xFFFF800000100000;
+    var p: PerCpu = percpu_new(base, 4, 100);
+    percpu_init(&mut p, &m, 0xFFFF800000800000, 0x4000);
+    println("percpu stride " + int_to_str(p.stride) + " base2 " + hx(percpu_base(&p, 2)) + " owner " + int_to_str(percpu_owner(&p, base + 300)) + " " + int_to_str(percpu_owner(&p, base - 8)));
+    val ap: ApParams = smp_ap_params(&p, 2, 0x123000, 0xFFFFFFFF80001000, 0x9000, 23);
+    val enc: Vec<i64> = smp_params_encode(ap);
+    val back: ApParams = smp_params_decode(enc);
+    println("params " + int_to_str(enc.len()) + " bytes cr3 " + hx(back.cr3) + " stack " + hx(back.stack_top) + " entry " + hx(back.entry) + " gdt " + hx(back.gdt_base) + "/" + int_to_str(back.gdt_limit) + " cpu " + int_to_str(back.cpu) + " apic " + int_to_str(back.apic_id));
+    smp_set_state(&mut m, 1, SMP_ONLINE);
+    smp_set_state(&mut m, 2, SMP_ONLINE);
+    smp_set_state(&mut m, 3, SMP_FAILED);
+    println("online " + int_to_str(smp_online_count(&m)) + " of " + int_to_str(m.apic_ids.len()));
+}

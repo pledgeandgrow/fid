@@ -1,0 +1,82 @@
+// tests/projects/cli: a command-line tool (release-roadmap N11).
+//
+// A small `wc`: it counts the lines, words and bytes of each file named on
+// the command line and prints "<lines> <words> <bytes> <name>" for it, then
+// a "total" line when there were several files. A file that cannot be read
+// is reported on stderr and the exit status is 1; with no file at all the
+// usage goes to stderr and the exit status is 2.
+//
+// Built and run by scripts/projects-check.sh (fid ccompile, then the binary
+// with two input files the script writes); expected.txt is what it prints.
+
+struct Counts {
+    lines: i64,
+    words: i64,
+    bytes: i64,
+}
+
+/// The counts of one text: a line ends at a newline byte, a word is a run
+/// of bytes other than space, tab, CR and LF.
+fn count_text(text: str) -> Counts {
+    var lines: i64 = 0;
+    var words: i64 = 0;
+    var in_word: bool = false;
+    val n: i64 = str_len(text);
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(text, i);
+        if c == 10 {
+            lines = lines + 1;
+        }
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            words = words + 1;
+        }
+        i = i + 1;
+    }
+    return Counts { lines: lines, words: words, bytes: n };
+}
+
+fn report(c: Counts, name: str) {
+    print(int_to_str(c.lines) + " " + int_to_str(c.words) + " " + int_to_str(c.bytes) + " " + name + "\n");
+}
+
+fn main() -> i64 {
+    if p_argc() < 2 {
+        p_eprint_str("usage: wc <file>...\n");
+        return 2;
+    }
+    var total: Counts = Counts { lines: 0, words: 0, bytes: 0 };
+    var files: i64 = 0;
+    var status: i64 = 0;
+    var i: i64 = 1;
+    while i < p_argc() {
+        match arg_at(i) {
+            Option::Some(name) => {
+                match read_file(name) {
+                    Option::Some(text) => {
+                        val c: Counts = count_text(text);
+                        report(c, name);
+                        total.lines = total.lines + c.lines;
+                        total.words = total.words + c.words;
+                        total.bytes = total.bytes + c.bytes;
+                        files = files + 1;
+                    }
+                    Option::None => {
+                        p_eprint_str("wc: cannot read " + name + "\n");
+                        status = 1;
+                    }
+                }
+            }
+            Option::None => {
+            }
+        }
+        i = i + 1;
+    }
+    if files > 1 {
+        report(total, "total");
+    }
+    return status;
+}

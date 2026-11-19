@@ -1,0 +1,543 @@
+// Fides internal flash model and a log-structured key-value store, pure Fides.
+//
+// FlashDev models the NOR flash inside microcontrollers: pages of
+// `page_size` bytes that read 0xFF after an erase; programming works in
+// aligned units of `unit` bytes and can only turn bits from 1 to 0 (a
+// program that would need a 0 -> 1 change fails, as on hardware); with
+// `once` set a unit may be programmed only once per erase (STM32L4/G4
+// double-word flash, ECC flash). Erase counts are kept per page. A power
+// cut can be injected: after `fail_after` more bytes the device stops
+// mid-program, leaving a torn write, as a brown-out does.
+//
+// FlashKv is a log-structured key-value store on top (in the manner of
+// Zephyr NVS / EEPROM emulation): records are appended to the active
+// page, the newest record of a key wins, deletes write a tombstone.
+// Power-loss safety comes from the record layout and write order:
+//   page header  "FKV1" + u32 sequence (newest page = highest sequence)
+//   record       [0x4B, flags, key_len, 0x00, u16 val_len, 0x0000,
+//                 u32 CRC-32 of the 8 header bytes + key + value]
+//                key, value, padding 0xFF to the unit,
+//                then one commit unit whose first byte is 0x5A.
+// The commit unit is programmed last, so a record is used only when its
+// commit byte and its CRC are good; a torn record is skipped (its
+// lengths say how far) and a torn header ends the scan of that page.
+// Wear levelling: pages are used in a ring with one erased spare; when
+// the active page fills, the spare becomes active and the oldest page's
+// live records are copied forward before it is erased (the new spare),
+// so erases rotate evenly over all pages. A mount that finds no spare
+// (power lost while copying) erases the half-built page, whose records
+// all still exist in the older pages, and the copy is redone later.
+//
+// The seam: real flash is programmed through the vendor's flash
+// controller (unlock keys, busy flags); FlashDev is the model a driver's
+// logic is checked against. flash_program/flash_erase are the two calls a
+// port replaces.
+
+module flash;
+ use vec; use string;
+
+// ─── CRC-32 (IEEE 802.3, reflected, as zlib) ────────────────────────────
+
+/// CRC-32 of bytes[from..from+n).
+@wrapping
+pub fn flash_crc32(bytes: Vec<i64>, from: i64, n: i64, seed: i64) -> i64 {
+    var c: i64 = seed ^ 0xFFFFFFFF;
+    var i: i64 = 0;
+    while i < n {
+        c = c ^ (bytes.get(from + i) & 0xFF);
+        var k: i64 = 0;
+        while k < 8 {
+            if (c & 1) != 0 { c = (c >> 1) ^ 0xEDB88320; } else { c = c >> 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// ─── The flash device ───────────────────────────────────────────────────
+
+pub struct FlashDev {
+    pub page_size: i64,
+    pub pages: i64,
+    pub unit: i64,
+    pub once: bool,
+    pub data: Vec<i64>,
+    pub erases: Vec<i64>,
+    pub fail_after: i64,
+    pub dead: bool,
+    pub programmed: i64,
+    pub error: str,
+}
+
+/// A device of `pages` pages, erased.
+pub fn flash_new(page_size: i64, pages: i64, unit: i64, once: bool) -> FlashDev {
+    if unit < 1 || (unit & (unit - 1)) != 0 || page_size % unit != 0 { p_panic("flash: unit must be a power of two dividing the page size"); }
+    return FlashDev {
+        page_size: page_size, pages: pages, unit: unit, once: once, data: Vec::filled(page_size * pages, 0xFF),
+        erases: Vec::filled(pages, 0), fail_after: -1, dead: false, programmed: 0, error: ""
+    };
+}
+
+pub fn flash_size(f: &FlashDev) -> i64 {
+    return f.page_size * f.pages;
+}
+
+/// Erase one page (atomic in this model). False when powered off.
+pub fn flash_erase(f: &mut FlashDev, page: i64) -> bool {
+    if f.dead { f.error = "power off"; return false; }
+    if page < 0 || page >= f.pages { f.error = "no page " + int_to_str(page); return false; }
+    var i: i64 = page * f.page_size;
+    val end: i64 = i + f.page_size;
+    while i < end {
+        f.data.set(i, 0xFF);
+        i = i + 1;
+    }
+    f.erases.set(page, f.erases.get(page) + 1);
+    return true;
+}
+
+pub fn flash_read(f: &FlashDev, addr: i64) -> i64 {
+    return f.data.get(addr);
+}
+
+pub fn flash_read_bytes(f: &FlashDev, addr: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(f.data.get(addr + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Program `bytes` at `addr` (unit-aligned, a whole number of units).
+/// Checks first (nothing is written when a rule is broken): every byte
+/// must only clear bits, and with `once` every unit must still be erased.
+/// Then the bytes are written one by one; an injected power cut stops it
+/// part way (f.dead, false).
+pub fn flash_program(f: &mut FlashDev, addr: i64, bytes: Vec<i64>) -> bool {
+    if f.dead { f.error = "power off"; return false; }
+    val n: i64 = bytes.len();
+    if addr % f.unit != 0 || n % f.unit != 0 { f.error = "unaligned program at " + int_to_str(addr); return false; }
+    if addr < 0 || addr + n > flash_size(f) { f.error = "program out of range"; return false; }
+    var i: i64 = 0;
+    while i < n {
+        val old: i64 = f.data.get(addr + i);
+        val b: i64 = bytes.get(i) & 0xFF;
+        if (old & b) != b {
+            f.error = "0->1 bit change at " + int_to_str(addr + i) + " needs an erase";
+            return false;
+        }
+        i = i + 1;
+    }
+    if f.once {
+        var u: i64 = 0;
+        while u < n {
+            var j: i64 = 0;
+            while j < f.unit {
+                if f.data.get(addr + u + j) != 0xFF { f.error = "unit at " + int_to_str(addr + u) + " already programmed"; return false; }
+                j = j + 1;
+            }
+            u = u + f.unit;
+        }
+    }
+    i = 0;
+    while i < n {
+        if f.fail_after == 0 {
+            f.dead = true;
+            f.error = "power lost during program";
+            return false;
+        }
+        if f.fail_after > 0 { f.fail_after = f.fail_after - 1; }
+        f.data.set(addr + i, f.data.get(addr + i) & bytes.get(i));
+        f.programmed = f.programmed + 1;
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Power comes back: the device works again (contents as they were).
+pub fn flash_power_on(f: &mut FlashDev) {
+    f.dead = false;
+    f.fail_after = -1;
+    f.error = "";
+}
+
+/// Smallest and largest erase count over the pages, as [min, max].
+pub fn flash_wear(f: &FlashDev) -> Vec<i64> {
+    var lo: i64 = f.erases.get(0);
+    var hi: i64 = lo;
+    var i: i64 = 1;
+    while i < f.pages {
+        val e: i64 = f.erases.get(i);
+        if e < lo { lo = e; }
+        if e > hi { hi = e; }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(lo);
+    out.push(hi);
+    return out;
+}
+
+// ─── Log-structured key-value store ─────────────────────────────────────
+
+pub const FKV_REC_MAGIC: i64 = 0x4B;
+pub const FKV_COMMIT: i64 = 0x5A;
+pub const FKV_TOMBSTONE: i64 = 0x01;
+
+pub struct FlashKv {
+    pub first_page: i64,
+    pub npages: i64,
+    pub active: i64,
+    pub seq: i64,
+    pub woff: i64,
+    pub index: HashMap<str, i64>,
+    pub torn: i64,
+    pub compactions: i64,
+    pub error: str,
+}
+
+fn fkv_align(n: i64, u: i64) -> i64 {
+    return (n + u - 1) / u * u;
+}
+
+fn fkv_hdr_size(f: &FlashDev) -> i64 {
+    return fkv_align(8, f.unit);
+}
+
+/// Bytes a record with these lengths takes, commit unit included.
+pub fn fkv_record_size(f: &FlashDev, klen: i64, vlen: i64) -> i64 {
+    return fkv_align(12 + klen + vlen, f.unit) + f.unit;
+}
+
+fn fkv_page_addr(f: &FlashDev, kv: &FlashKv, p: i64) -> i64 {
+    return (kv.first_page + p) * f.page_size;
+}
+
+fn fkv_u32(f: &FlashDev, a: i64) -> i64 {
+    return f.data.get(a) | (f.data.get(a + 1) << 8) | (f.data.get(a + 2) << 16) | (f.data.get(a + 3) << 24);
+}
+
+fn fkv_all_ff(f: &FlashDev, a: i64, n: i64) -> bool {
+    var i: i64 = 0;
+    while i < n {
+        if f.data.get(a + i) != 0xFF { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Page state: -1 erased, -2 not a store page (or a torn header), else
+/// its sequence number.
+fn fkv_page_seq(f: &FlashDev, kv: &FlashKv, p: i64) -> i64 {
+    val a: i64 = fkv_page_addr(f, kv, p);
+    if fkv_all_ff(f, a, f.page_size) { return -1; }
+    if f.data.get(a) != 70 || f.data.get(a + 1) != 75 || f.data.get(a + 2) != 86 || f.data.get(a + 3) != 49 { return -2; }
+    val s: i64 = fkv_u32(f, a + 4);
+    if s == 0xFFFFFFFF { return -2; }
+    return s;
+}
+
+fn fkv_put_le(out: &mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn fkv_pad(out: &mut Vec<i64>, u: i64) {
+    while out.len() % u != 0 { out.push(0xFF); }
+}
+
+/// Open page p as the active page with sequence `seq` (it must be erased).
+fn fkv_open_page(f: &mut FlashDev, kv: &mut FlashKv, p: i64, seq: i64) -> bool {
+    var h: Vec<i64> = Vec::new();
+    h.push(70); h.push(75); h.push(86); h.push(49);
+    fkv_put_le(&mut h, seq, 4);
+    fkv_pad(&mut h, f.unit);
+    if !flash_program(f, fkv_page_addr(f, kv, p), h) { kv.error = f.error; return false; }
+    kv.active = p;
+    kv.seq = seq;
+    kv.woff = fkv_hdr_size(f);
+    return true;
+}
+
+/// A parsed record (ok = false: torn or bad CRC, but `size` still valid
+/// when `known` says the lengths were readable).
+struct FkvRec {
+    known: bool,
+    ok: bool,
+    size: i64,
+    tomb: bool,
+    key: str,
+}
+
+fn fkv_parse(f: &FlashDev, a: i64, room: i64) -> FkvRec {
+    var r: FkvRec = FkvRec { known: false, ok: false, size: 0, tomb: false, key: "" };
+    if room < 12 + f.unit { return r; }
+    if f.data.get(a) != FKV_REC_MAGIC || f.data.get(a + 3) != 0 { return r; }
+    val klen: i64 = f.data.get(a + 2);
+    val vlen: i64 = f.data.get(a + 4) | (f.data.get(a + 5) << 8);
+    val size: i64 = fkv_record_size(f, klen, vlen);
+    if klen == 0xFF || size > room { return r; }
+    r.known = true;
+    r.size = size;
+    if f.data.get(a + size - f.unit) != FKV_COMMIT { return r; }
+    var buf: Vec<i64> = flash_read_bytes(f, a, 8);
+    var i: i64 = 0;
+    while i < klen + vlen {
+        buf.push(f.data.get(a + 12 + i));
+        i = i + 1;
+    }
+    if flash_crc32(buf, 0, buf.len(), 0) != fkv_u32(f, a + 8) { return r; }
+    var key: str = "";
+    i = 0;
+    while i < klen {
+        key = key + byte_to_str(f.data.get(a + 12 + i));
+        i = i + 1;
+    }
+    r.ok = true;
+    r.key = key;
+    r.tomb = (f.data.get(a + 1) & FKV_TOMBSTONE) != 0;
+    return r;
+}
+
+/// Replay page p into the index; returns the offset where its free space
+/// starts (page_size when the scan stopped at damage: the page is full).
+fn fkv_replay(f: &FlashDev, kv: &mut FlashKv, p: i64) -> i64 {
+    val base: i64 = fkv_page_addr(f, kv, p);
+    var off: i64 = fkv_hdr_size(f);
+    while off < f.page_size {
+        if fkv_all_ff(f, base + off, f.page_size - off) { return off; }
+        val r: FkvRec = fkv_parse(f, base + off, f.page_size - off);
+        if !r.known { return f.page_size; }
+        if r.ok {
+            if r.tomb {
+                if kv.index.contains(r.key) { kv.index.remove(r.key); }
+            } else {
+                kv.index.insert(r.key, base + off);
+            }
+        } else {
+            kv.torn = kv.torn + 1;
+        }
+        off = off + r.size;
+    }
+    return off;
+}
+
+/// Mount the store on pages [first_page, first_page + npages): replay
+/// the pages oldest first, erase pages that are not store pages, format
+/// an empty device, and finish an interrupted compaction.
+pub fn fkv_mount(f: &mut FlashDev, first_page: i64, npages: i64) -> FlashKv {
+    if npages < 2 { p_panic("flash: the store needs at least 2 pages"); }
+    var kv: FlashKv = FlashKv { first_page: first_page, npages: npages, active: 0, seq: 0, woff: 0, index: HashMap::new(), torn: 0, compactions: 0, error: "" };
+    var seqs: Vec<i64> = Vec::new();
+    var p: i64 = 0;
+    while p < npages {
+        var s: i64 = fkv_page_seq(f, &kv, p);
+        if s == -2 {
+            flash_erase(f, first_page + p);
+            s = -1;
+        }
+        seqs.push(s);
+        p = p + 1;
+    }
+    // Replay in sequence order.
+    var last: i64 = -1;
+    while true {
+        var best: i64 = -1;
+        var bs: i64 = -1;
+        p = 0;
+        while p < npages {
+            val s: i64 = seqs.get(p);
+            if s > last && (bs < 0 || s < bs) {
+                best = p;
+                bs = s;
+            }
+            p = p + 1;
+        }
+        if best < 0 { break; }
+        kv.active = best;
+        kv.seq = bs;
+        kv.woff = fkv_replay(f, &mut kv, best);
+        last = bs;
+    }
+    if last < 0 {
+        fkv_open_page(f, &mut kv, 0, 1);
+        return kv;
+    }
+    // The page after the active one must be the erased spare. When it is
+    // not, power was lost while the active page was being filled with
+    // copies of the oldest page's live records (a roll-over opens the
+    // spare, copies, erases the oldest, and only then appends new data).
+    // Those copies still exist in the older pages, so the half-built page
+    // is erased and the store mounted again: the compaction is redone at
+    // the next roll-over.
+    val nxt: i64 = (kv.active + 1) % npages;
+    if fkv_page_seq(f, &kv, nxt) >= 0 {
+        if !flash_erase(f, first_page + kv.active) {
+            kv.error = f.error;
+            return kv;
+        }
+        return fkv_mount(f, first_page, npages);
+    }
+    return kv;
+}
+
+fn fkv_record_bytes(f: &FlashDev, key: str, val: Vec<i64>, tomb: bool) -> Vec<i64> {
+    var h: Vec<i64> = Vec::new();
+    h.push(FKV_REC_MAGIC);
+    if tomb { h.push(FKV_TOMBSTONE); } else { h.push(0); }
+    h.push(str_len(key));
+    h.push(0);
+    fkv_put_le(&mut h, val.len(), 2);
+    h.push(0);
+    h.push(0);
+    var body: Vec<i64> = h.clone();
+    var i: i64 = 0;
+    while i < str_len(key) {
+        body.push(str_byte_at(key, i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < val.len() {
+        body.push(val.get(i) & 0xFF);
+        i = i + 1;
+    }
+    val crc: i64 = flash_crc32(body, 0, body.len(), 0);
+    var out: Vec<i64> = h;
+    fkv_put_le(&mut out, crc, 4);
+    i = 8;
+    while i < body.len() {
+        out.push(body.get(i));
+        i = i + 1;
+    }
+    fkv_pad(&mut out, f.unit);
+    return out;
+}
+
+fn fkv_commit_unit(f: &FlashDev) -> Vec<i64> {
+    var c: Vec<i64> = Vec::new();
+    c.push(FKV_COMMIT);
+    fkv_pad(&mut c, f.unit);
+    return c;
+}
+
+/// Append a record at the write offset of the active page: body first,
+/// commit unit last. Assumes it fits.
+fn fkv_append(f: &mut FlashDev, kv: &mut FlashKv, key: str, val: Vec<i64>, tomb: bool) -> i64 {
+    val a: i64 = fkv_page_addr(f, kv, kv.active) + kv.woff;
+    val body: Vec<i64> = fkv_record_bytes(f, key, val, tomb);
+    val size: i64 = body.len() + f.unit;
+    // The space is used whether or not the write completes.
+    kv.woff = kv.woff + size;
+    if !flash_program(f, a, body) { kv.error = f.error; return -1; }
+    if !flash_program(f, a + body.len(), fkv_commit_unit(f)) { kv.error = f.error; return -1; }
+    return a;
+}
+
+/// Copy the live records of page `old` into the active page, then erase it.
+fn fkv_compact(f: &mut FlashDev, kv: &mut FlashKv, old: i64) -> bool {
+    val base: i64 = fkv_page_addr(f, kv, old);
+    val keys: Vec<str> = kv.index.keys();
+    var i: i64 = 0;
+    while i < keys.len() {
+        val k: str = keys.get(i);
+        val a: i64 = kv.index.get(k);
+        if a >= base && a < base + f.page_size {
+            val v: Vec<i64> = fkv_value_at(f, a);
+            if kv.woff + fkv_record_size(f, str_len(k), v.len()) > f.page_size {
+                kv.error = "store full: live data does not fit one page";
+                return false;
+            }
+            val na: i64 = fkv_append(f, kv, k, v, false);
+            if na < 0 { return false; }
+            kv.index.insert(k, na);
+        }
+        i = i + 1;
+    }
+    if !flash_erase(f, kv.first_page + old) { kv.error = f.error; return false; }
+    kv.compactions = kv.compactions + 1;
+    return true;
+}
+
+fn fkv_value_at(f: &FlashDev, a: i64) -> Vec<i64> {
+    val klen: i64 = f.data.get(a + 2);
+    val vlen: i64 = f.data.get(a + 4) | (f.data.get(a + 5) << 8);
+    return flash_read_bytes(f, a + 12 + klen, vlen);
+}
+
+/// Make room for a record of `size` bytes: when the active page cannot
+/// hold it, open the spare as the new active page and compact the oldest.
+fn fkv_room(f: &mut FlashDev, kv: &mut FlashKv, size: i64) -> bool {
+    if kv.woff + size <= f.page_size { return true; }
+    if fkv_hdr_size(f) + size > f.page_size { kv.error = "record larger than a page"; return false; }
+    val spare: i64 = (kv.active + 1) % kv.npages;
+    if !fkv_open_page(f, kv, spare, kv.seq + 1) { return false; }
+    val oldest: i64 = (spare + 1) % kv.npages;
+    if fkv_page_seq(f, kv, oldest) >= 0 {
+        if !fkv_compact(f, kv, oldest) { return false; }
+    }
+    if kv.woff + size > f.page_size { kv.error = "store full"; return false; }
+    return true;
+}
+
+fn fkv_bad_key(kv: &mut FlashKv, key: str) -> bool {
+    if str_len(key) == 0 || str_len(key) > 254 { kv.error = "key length must be 1..254"; return true; }
+    return false;
+}
+
+/// Store `val` under `key`. False on error (kv.error says why).
+pub fn fkv_put(f: &mut FlashDev, kv: &mut FlashKv, key: str, val: Vec<i64>) -> bool {
+    if fkv_bad_key(kv, key) { return false; }
+    if val.len() > 0xFFFD { kv.error = "value too long"; return false; }
+    if !fkv_room(f, kv, fkv_record_size(f, str_len(key), val.len())) { return false; }
+    val a: i64 = fkv_append(f, kv, key, val, false);
+    if a < 0 { return false; }
+    kv.index.insert(key, a);
+    return true;
+}
+
+/// Delete `key` (a tombstone record). True when it existed.
+pub fn fkv_delete(f: &mut FlashDev, kv: &mut FlashKv, key: str) -> bool {
+    if fkv_bad_key(kv, key) { return false; }
+    if !kv.index.contains(key) { return false; }
+    var empty: Vec<i64> = Vec::new();
+    if !fkv_room(f, kv, fkv_record_size(f, str_len(key), 0)) { return false; }
+    if fkv_append(f, kv, key, empty, true) < 0 { return false; }
+    kv.index.remove(key);
+    return true;
+}
+
+pub fn fkv_has(kv: &FlashKv, key: str) -> bool {
+    return kv.index.contains(key);
+}
+
+/// The value of `key` (empty when absent: check fkv_has).
+pub fn fkv_get(f: &FlashDev, kv: &FlashKv, key: str) -> Vec<i64> {
+    if !kv.index.contains(key) { return Vec::new(); }
+    return fkv_value_at(f, kv.index.get(key));
+}
+
+/// Value as text (for string values).
+pub fn fkv_get_str(f: &FlashDev, kv: &FlashKv, key: str) -> str {
+    val v: Vec<i64> = fkv_get(f, kv, key);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + byte_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn fkv_put_str(f: &mut FlashDev, kv: &mut FlashKv, key: str, s: str) -> bool {
+    return fkv_put(f, kv, key, str_bytes(s));
+}
+
+pub fn fkv_count(kv: &FlashKv) -> i64 {
+    return kv.index.len();
+}

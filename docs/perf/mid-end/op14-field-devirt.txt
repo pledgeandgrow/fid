@@ -1,0 +1,49 @@
+OP14 — devirtualization through struct fields (Nov 17)
+========================================================
+
+What was added (compiler/iropt.fd, module pass `fielddevirt`, on by
+default on the native paths, run after hofspec and dynspec and before the
+inliners; FID_IROPT_OFF=fielddevirt turns it off):
+
+  iro_field_devirt      the pass: collects, over every function of the
+                        module, what each struct field's stores store, then
+                        rewrites the calls
+  iro_fdv_collect       one function's stores to struct fields
+  iro_fdv_key           a field address as "S#i" (GetFieldPtr on a value
+                        typed as struct S or a pointer to S)
+  iro_fdv_once/_src     a plain local stored exactly once stands for the
+                        value stored (`val s = h.sh; s.area()`)
+  iro_fdv_merge/_lose   the per-field facts: one dyn type, one closure
+                        target, or none known
+  iro_fdv_rewrite       DynCall -> Call(T_m, [0, word 1 of the dyn value,
+                        args..]); CallPtr -> Call(F, [env, args..])
+
+Field facts:
+  - a field every store of which stores `x as dyn T` (one T) holds a dyn
+    value of type T wherever it is read: a trait call on a read of it is a
+    direct call to T_method, the receiver loaded from the dyn value
+    ({type id, receiver}: the word at +8, what pe_ir's and nat_ir's
+    dispatch pass);
+  - a field every store of which stores a closure env (Lowerer_make_fn_env)
+    of one target F: a call through a read of it is a direct call to F
+    with the env read as argument 0 (what the backends pass).
+  A store that copies the field from the same field of another value keeps
+  the fact. The fact is lost by any other store, by a field address used
+  other than to load from or store to (passed to a call, `&mut h.sh`), by a
+  struct a global holds, and (for the field index) by a dyn or closure
+  store, or an opaque-typed field address, on a pointer of no known struct.
+  Receivers of a type other than a pointer, i64/u64 or opaque (a float, a
+  narrow int) keep their dispatch.
+
+Stats: FID_IROPT_STATS=1 prints
+  iropt: dynspec N clones, fielddevirt D dyn calls, C closure calls
+
+Not built or run when this was written (the tree is built once at the end
+of the run). Checks: tests/tooling/devirt-check.sh (counters, the expected
+output of tests/bootstrap/test_midend_devirt_field.fd and
+test_midend_devirt_param.fd with the passes on and off, and the suite
+emitted with FID_IROPT_OFF=dynspec,fielddevirt against the default).
+Several-block closures: once a call is direct, inline2 (on by default,
+OP5) may copy a closure's body of several blocks into its caller
+(`steps` in test_midend_devirt_field.fd; ime_backend_named lets
+__closure_N through).

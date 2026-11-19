@@ -1,0 +1,154 @@
+// Leak gate copy of tests/bootstrap/test_stack_box.fd. OP27: a Box whose block never leaves its function
+// is made on the stack (lower.fd lw_rc_stack_boxes_fn, LOWER_STACK_BOXES):
+// Box::new's block of [count word][value] becomes a stack area and the
+// Box's drops drop only what it holds (__p_mem_drop). A Box that is kept,
+// returned, passed to a function, shared, made in a loop, or holds a
+// str/Vec/map handle stays on the heap. Every case must give the same
+// results either way; under --leaks or --checked-alloc no block is left or
+// misused. `fid explain <this file> --alloc box_math` lists no heap
+// allocation (the Box of box_math is on the stack).
+//
+// Expected output:
+//     math 59
+//     label pt-a 3 4
+//     moved 7 8
+//     shape 12
+//     bag 9
+//     kept 5
+//     made 9
+//     passed 25
+//     looped 45
+//     text hello world
+//     shared 11 11
+//     done
+
+struct Pt {
+    x: i64,
+    y: i64,
+}
+
+struct Named {
+    name: str,
+    p: Pt,
+}
+
+enum Shape {
+    Square(i64),
+    Rect(i64, i64),
+}
+
+struct Bag {
+    items: Vec<i64>,
+}
+
+struct Holder {
+    b: Box<Pt>,
+}
+
+// a Box of a plain struct, read and written through, dropped at the end:
+// on the stack
+fn box_math() -> i64 {
+    var b: Box<Pt> = Box::new(Pt { x: 3, y: 4 });
+    b.x = b.x * 10;
+    b.y = b.y + 5;
+    return b.x + b.y + 20;
+}
+
+// a Box of a struct holding a string: its drop drops the string
+fn box_label() -> str {
+    val b: Box<Named> = Box::new(Named { name: "pt" + "-a", p: Pt { x: 3, y: 4 } });
+    return b.name + " " + int_to_str(b.p.x) + " " + int_to_str(b.p.y);
+}
+
+// what it holds copied out
+fn box_moved() -> str {
+    val b: Box<Pt> = Box::new(Pt { x: 7, y: 8 });
+    val p: Pt = *b;
+    return int_to_str(p.x) + " " + int_to_str(p.y);
+}
+
+// a Box of an enum
+fn box_shape() -> i64 {
+    val b: Box<Shape> = Box::new(Shape::Rect(3, 4));
+    match *b {
+        Shape::Square(s) => {
+            return s * s;
+        }
+        Shape::Rect(w, h) => {
+            return w * h;
+        }
+    }
+    return 0;
+}
+
+// a Box of a struct holding a Vec: its drop drops the Vec
+fn box_bag() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(4);
+    v.push(5);
+    v.push(6);
+    val b: Box<Bag> = Box::new(Bag { items: v });
+    return b.items.len() + b.items.get(2);
+}
+
+// kept in a struct: heap
+fn box_kept() -> Holder {
+    return Holder { b: Box::new(Pt { x: 5, y: 6 }) };
+}
+
+// returned: heap
+fn box_made() -> Box<Pt> {
+    return Box::new(Pt { x: 9, y: 1 });
+}
+
+fn norm2(p: Box<Pt>) -> i64 {
+    return p.x * p.x + p.y * p.y;
+}
+
+// passed to a function: heap
+fn box_passed() -> i64 {
+    val b: Box<Pt> = Box::new(Pt { x: 3, y: 4 });
+    return norm2(b);
+}
+
+// made in a loop: heap
+fn box_looped() -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        val b: Box<Pt> = Box::new(Pt { x: i, y: 0 });
+        total = total + b.x;
+        i = i + 1;
+    }
+    return total;
+}
+
+// a Box of a string: heap
+fn box_text() -> str {
+    val b: Box<str> = Box::new("hello" + " world");
+    return *b;
+}
+
+// shared by a copy: heap
+fn box_shared() -> str {
+    val b: Box<Pt> = Box::new(Pt { x: 11, y: 0 });
+    val c: Box<Pt> = b;
+    return int_to_str(b.x) + " " + int_to_str(c.x);
+}
+
+fn main() {
+    println("math " + int_to_str(box_math()));
+    println("label " + box_label());
+    println("moved " + box_moved());
+    println("shape " + int_to_str(box_shape()));
+    println("bag " + int_to_str(box_bag()));
+    val h: Holder = box_kept();
+    println("kept " + int_to_str(h.b.x));
+    val m: Box<Pt> = box_made();
+    println("made " + int_to_str(m.x));
+    println("passed " + int_to_str(box_passed()));
+    println("looped " + int_to_str(box_looped()));
+    println("text " + box_text());
+    println("shared " + box_shared());
+    println("done");
+}

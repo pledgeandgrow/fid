@@ -1,0 +1,192 @@
+// stdlib/calendar and the new datetime codes (competitive SL8): calendars
+// other than the proleptic Gregorian, ISO week dates, and strptime-style
+// parsing. Expected values come from Python 3.14 (datetime.isocalendar,
+// date.fromisocalendar, strftime %G %V %u %g %w %h, timestamp) and
+// dateutil.easter (methods 1, 2 and 3); the Julian calendar from the
+// historical anchors (the Gregorian reform: 1582-10-05 Julian is
+// 1582-10-15 Gregorian; 1917-10-25 Julian is 1917-11-07) and the JDN of
+// 2000-01-01, 2451545. A wrong answer panics on every backend.
+//
+// Expected output:
+// gregorian ok
+// iso weeks ok
+// julian ok
+// easter ok
+// format ok
+// parse ok
+// calendar ok
+use calendar;
+use datetime;
+use time;
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(label + ": got " + got + ", want " + want);
+        p_panic("calendar: wrong " + label);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    if got != want {
+        println(label + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+        p_panic("calendar: wrong " + label);
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("calendar: wrong " + label);
+    }
+}
+
+fn week(y: i64, m: i64, d: i64, want: str) {
+    check("iso week of " + int_to_str(y) + "-" + int_to_str(m) + "-" + int_to_str(d), cal_iso_week_str(cal_iso_week(y, m, d)), want);
+}
+
+fn day_str(days: i64) -> str {
+    return cal_date_str(cal_civil_from_days(days));
+}
+
+fn parsed(label: str, s: str, fmt: str, want: i64) {
+    var(ok, ts) = dt_parse_format(s, fmt);
+    if !ok {
+        p_panic("calendar: " + label + ": \"" + s + "\" was refused");
+    }
+    check_i(label, ts, want);
+}
+
+fn refused(label: str, s: str, fmt: str) {
+    var(ok, ts) = dt_parse_format(s, fmt);
+    if ok {
+        p_panic("calendar: " + label + ": \"" + s + "\" was accepted as " + int_to_str(ts));
+    }
+}
+
+fn main() -> i64 {
+    // ── Gregorian days, JDN, ordinal dates ──
+    check_i("days 1970-01-01", cal_days_from_civil(1970, 1, 1), 0);
+    check_i("days 2000-01-01", cal_days_from_civil(2000, 1, 1), 10957);
+    check_i("days 1900-03-01", cal_days_from_civil(1900, 3, 1), - 25508);
+    check_i("jdn 2000-01-01", cal_jdn(2000, 1, 1), 2451545);
+    check_i("jdn 2026-11-15", cal_jdn(2026, 11, 15), 2461360);
+    check_i("from jdn", cal_days_from_jdn(2440588), 0);
+    check("day -1", day_str(- 1), "1969-12-31");
+    check("day 20772", day_str(20772), "2026-11-15");
+    check_i("weekday of the epoch", cal_iso_weekday(0), 4);
+    check_i("weekday 2026-11-15", cal_iso_weekday(20772), 7);
+    check_i("weekday 1969-12-29", cal_iso_weekday(- 3), 1);
+    check_b("valid 2024-02-29", cal_is_valid(2024, 2, 29), true);
+    check_b("valid 2023-02-29", cal_is_valid(2023, 2, 29), false);
+    check_b("valid 2026-04-31", cal_is_valid(2026, 4, 31), false);
+    check_b("valid month 13", cal_is_valid(2026, 13, 1), false);
+    check_i("day of year 2000-02-29", cal_day_of_year(2000, 2, 29), 60);
+    check_i("day of year 2020-12-31", cal_day_of_year(2020, 12, 31), 366);
+    check("ordinal 2024-060", day_str(cal_days_from_ordinal(2024, 60)), "2024-02-29");
+    println("gregorian ok");
+
+    // ── ISO 8601 week dates ──
+    week(2021, 1, 3, "2020-W53-7");
+    week(2020, 12, 31, "2020-W53-4");
+    week(2026, 11, 15, "2026-W46-7");
+    week(2008, 12, 29, "2009-W01-1");
+    week(2010, 1, 3, "2009-W53-7");
+    week(2015, 12, 31, "2015-W53-4");
+    week(2027, 1, 1, "2026-W53-5");
+    week(1970, 1, 1, "1970-W01-4");
+    week(2000, 2, 29, "2000-W09-2");
+    week(1900, 3, 1, "1900-W09-4");
+    check_i("weeks 2015", cal_iso_weeks_in_year(2015), 53);
+    check_i("weeks 2020", cal_iso_weeks_in_year(2020), 53);
+    check_i("weeks 2021", cal_iso_weeks_in_year(2021), 52);
+    check_i("weeks 2026", cal_iso_weeks_in_year(2026), 53);
+    check_i("weeks 2004", cal_iso_weeks_in_year(2004), 53);
+    check_i("weeks 2032", cal_iso_weeks_in_year(2032), 53);
+    check_i("weeks 1900", cal_iso_weeks_in_year(1900), 52);
+    check_i("weeks 2000", cal_iso_weeks_in_year(2000), 52);
+    check("from 2020-W53-7", day_str(cal_days_from_iso_week(2020, 53, 7)), "2021-01-03");
+    check("from 2026-W01-1", day_str(cal_days_from_iso_week(2026, 1, 1)), "2025-12-29");
+    check("from 2009-W53-5", day_str(cal_days_from_iso_week(2009, 53, 5)), "2010-01-01");
+    check_b("2020-W53 exists", cal_iso_week_is_valid(2020, 53, 1), true);
+    check_b("2021-W53 does not", cal_iso_week_is_valid(2021, 53, 1), false);
+    check_b("weekday 8", cal_iso_week_is_valid(2021, 10, 8), false);
+    println("iso weeks ok");
+
+    // ── Julian calendar ──
+    check("reform", cal_date_str(cal_gregorian_to_julian(1582, 10, 15)), "1582-10-05");
+    check("October revolution", cal_date_str(cal_gregorian_to_julian(1917, 11, 7)), "1917-10-25");
+    check("today", cal_date_str(cal_gregorian_to_julian(2026, 11, 15)), "2026-11-02");
+    check("1700-02-29 Julian", cal_date_str(cal_gregorian_to_julian(1700, 3, 11)), "1700-02-29");
+    check("1900-02-29 Julian", cal_date_str(cal_julian_to_gregorian(1900, 2, 29)), "1900-03-13");
+    check("2000-01-01 Julian", cal_date_str(cal_julian_to_gregorian(2000, 1, 1)), "2000-01-14");
+    check("epoch in Julian", cal_date_str(cal_days_to_julian(0)), "1969-12-19");
+    check_i("jdn of 1582-10-05 Julian", cal_jdn_from_days(cal_julian_to_days(1582, 10, 5)), cal_jdn(1582, 10, 15));
+    check_b("1900 Julian leap", cal_julian_is_leap(1900), true);
+    check_b("1900 Gregorian leap", is_leap_year(1900), false);
+    check_i("Julian February 1900", cal_julian_days_in_month(1900, 2), 29);
+    check_i("Julian February 1901", cal_julian_days_in_month(1901, 2), 28);
+    check_i("Julian September", cal_julian_days_in_month(1901, 9), 30);
+    // a round trip over every day of four Julian years
+    var z: i64 = cal_julian_to_days(1899, 1, 1);
+    val stop: i64 = cal_julian_to_days(1903, 1, 1);
+    check_i("four Julian years", stop - z, 4 * 365 + 1);
+    while z < stop {
+        val jd: CalDate = cal_days_to_julian(z);
+        if cal_julian_to_days(jd.year, jd.month, jd.day) != z {
+            p_panic("calendar: Julian round trip broke at day " + int_to_str(z));
+        }
+        z = z + 1;
+    }
+    println("julian ok");
+
+    // ── Easter ──
+    check("easter 2024", cal_date_str(cal_easter(2024)), "2024-03-31");
+    check("easter 2025", cal_date_str(cal_easter(2025)), "2025-04-20");
+    check("easter 2026", cal_date_str(cal_easter(2026)), "2026-04-05");
+    check("easter 2000", cal_date_str(cal_easter(2000)), "2000-04-23");
+    check("easter 1818", cal_date_str(cal_easter(1818)), "1818-03-22");
+    check("easter 2285", cal_date_str(cal_easter(2285)), "2285-03-22");
+    check("easter 2038", cal_date_str(cal_easter(2038)), "2038-04-25");
+    check("julian easter 2026", cal_date_str(cal_julian_easter(2026)), "2026-03-30");
+    val oe: CalDate = cal_julian_easter(2026);
+    check("orthodox easter 2026", cal_date_str(cal_julian_to_gregorian(oe.year, oe.month, oe.day)), "2026-04-12");
+    val oe24: CalDate = cal_julian_easter(2024);
+    check("orthodox easter 2024", cal_date_str(cal_julian_to_gregorian(oe24.year, oe24.month, oe24.day)), "2024-05-05");
+    check("julian easter 1818", cal_date_str(cal_julian_easter(1818)), "1818-04-14");
+    println("easter ok");
+
+    // ── New dt_format codes ──
+    check("iso week codes", dt_format(time_from_date(2021, 1, 3), "%G-W%V-%u %g %w"), "2020-W53-7 20 0");
+    check("seconds and %h", dt_format(time_new(2026, 11, 15, 8, 5, 9), "%s|%h"), "1794729909|Nov");
+    check("monday %u", dt_format(time_from_date(2025, 12, 29), "%u %w %G"), "1 1 2026");
+    println("format ok");
+
+    // ── dt_parse_format ──
+    parsed("%F %T", "2026-11-15 08:05:09", "%F %T", 1794729909);
+    parsed("rfc 2822", "Tue, 27 Oct 2026 14:30:00 +0200", "%a, %d %b %Y %T %z", 1793104200);
+    parsed("names any case", "tuesday, 27 OCTOBER 2026 14:30:00 +02:00", "%A, %d %B %Y %T %z", 1793104200);
+    refused("weekday not the date's", "Wed, 27 Oct 2026 14:30:00 +0200", "%a, %d %b %Y %T %z");
+    parsed("iso week", "2026-W44-2", "%G-W%V-%u", 1793059200);
+    refused("week 53 of a 52-week year", "2021-W53-1", "%G-W%V-%u");
+    parsed("ordinal", "2024-060", "%Y-%j", 1709164800);
+    refused("day 366 of 2023", "2023-366", "%Y-%j");
+    parsed("%D", "02/29/24", "%D", 1709164800);
+    refused("February 30", "02/30/24", "%D");
+    refused("month 13", "13/01/20", "%m/%d/%y");
+    parsed("pm", "7:05 pm", "%I:%M %p", 68700);
+    parsed("midnight", "12:00 AM", "%I:%M %p", 0);
+    refused("hour 13 on a 12-hour clock", "13:00 PM", "%I:%M %p");
+    parsed("spaces", "March   5 1999", "%B %e %Y", 920592000);
+    parsed("%s", "1700000000", "%s", 1700000000);
+    parsed("Z", "2026-11-15T08:05:09Z", "%Y-%m-%dT%H:%M:%S%z", 1794729909);
+    parsed("UTC name", "2026-11-15 08:05:09 UTC", "%F %T %Z", 1794729909);
+    parsed("negative offset", "2026-11-15 08:05 -05:30", "%Y-%m-%d %H:%M %z", 1794749700);
+    parsed("year 100", "100%", "%Y%%", - 59011459200);
+    refused("trailing text", "2026-11-15x", "%F");
+    refused("short input", "2026-11", "%F");
+    refused("unknown month", "Foo 1 2020", "%b %d %Y");
+    refused("unknown code", "2026", "%Q");
+    refused("zone name", "2026-11-15 08:05:09 CET", "%F %T %Z");
+    println("parse ok");
+    println("calendar ok");
+    return 0;
+}

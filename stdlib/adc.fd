@@ -1,0 +1,449 @@
+// Fides ADC: raw codes to volts, oversampling, filters, calibration, IIO
+//
+// What is real (pure Fides, runs everywhere):
+//   - transfer functions: unipolar codes (LSB = vref / 2^N, or
+//     vref / (2^N - 1) for converters specified that way) and two's
+//     complement bipolar codes (differential ADCs such as the ADS1115),
+//     both ways (volts -> code for thresholds)
+//   - oversampling and decimation: 4^n samples summed and shifted right
+//     by n give n extra bits (Atmel AVR121 / Silicon Labs AN118)
+//   - filters: moving average (ring buffer), exponential moving average in
+//     integers, median of a window
+//   - two-point calibration (gain and offset from two known inputs)
+//   - helpers: resistor divider, NTC thermistor (Beta equation)
+//   - Linux IIO: the sysfs channel files (in_voltageX_raw, _scale,
+//     _offset), value = (raw + offset) * scale in millivolts, and decoding
+//     buffered samples from a channel's scan type ("le:s12/16>>4")
+//
+// The seam: the IIO sysfs root (/sys/bus/iio/devices) is a parameter and
+// is read with stdlib file (no FFI). On bare metal, read the conversion
+// register yourself (stdlib volatile) and pass the code to these functions.
+module adc;
+ use vec;
+ use string;
+ use file;
+
+// ─── Transfer functions ─────────────────────────────────────────────────
+
+pub struct AdcSpec {
+    pub bits: i64,
+    pub vref: f64,
+    pub bipolar: bool,
+    pub minus_one: bool,
+}
+
+/// A unipolar converter: codes 0..2^bits-1 over 0..vref (LSB = vref/2^bits).
+pub fn adc_spec(bits: i64, vref: f64) -> AdcSpec {
+    return AdcSpec { bits: bits, vref: vref, bipolar: false, minus_one: false };
+}
+
+/// A converter whose full-scale code means exactly vref (LSB = vref/(2^bits-1)).
+pub fn adc_spec_full(bits: i64, vref: f64) -> AdcSpec {
+    return AdcSpec { bits: bits, vref: vref, bipolar: false, minus_one: true };
+}
+
+/// A bipolar converter: two's complement codes over -fs..+fs (LSB = fs / 2^(bits-1)).
+pub fn adc_spec_bipolar(bits: i64, full_scale: f64) -> AdcSpec {
+    return AdcSpec { bits: bits, vref: full_scale, bipolar: true, minus_one: false };
+}
+
+/// Volts per code.
+pub fn adc_lsb(s: & AdcSpec) -> f64 {
+    if s.bipolar {
+        return s.vref / ((1 << (s.bits - 1)) as f64);
+    }
+    if s.minus_one {
+        return s.vref / (((1 << s.bits) - 1) as f64);
+    }
+    return s.vref / ((1 << s.bits) as f64);
+}
+
+/// The low `bits` bits of raw as a signed number.
+pub fn adc_sign_extend(raw: i64, bits: i64) -> i64 {
+    val m: i64 = raw & ((1 << bits) - 1);
+    if (m & (1 << (bits - 1))) != 0 {
+        return m - (1 << bits);
+    }
+    return m;
+}
+
+pub fn adc_to_volts(s: & AdcSpec, raw: i64) -> f64 {
+    if s.bipolar {
+        return (adc_sign_extend(raw, s.bits) as f64) * adc_lsb(s);
+    }
+    return ((raw & ((1 << s.bits) - 1)) as f64) * adc_lsb(s);
+}
+
+/// The code for a voltage (nearest, clamped to the range).
+pub fn adc_from_volts(s: & AdcSpec, v: f64) -> i64 {
+    var x: f64 = v / adc_lsb(s);
+    var lo: i64 = 0;
+    var hi: i64 = (1 << s.bits) - 1;
+    if s.bipolar {
+        lo = 0 - (1 << (s.bits - 1));
+        hi = (1 << (s.bits - 1)) - 1;
+    }
+    var c: i64 = 0;
+    if x >= 0.0 {
+        c = (x + 0.5) as i64;
+    } else {
+        c = 0 - ((0.5 - x) as i64);
+    }
+    if c < lo {
+        c = lo;
+    }
+    if c > hi {
+        c = hi;
+    }
+    return c;
+}
+
+/// Integer path: millivolts for a unipolar code, rounded (no floats, for
+/// small MCUs): raw * vref_mv / 2^bits.
+pub fn adc_to_mv_int(raw: i64, bits: i64, vref_mv: i64) -> i64 {
+    return (raw * vref_mv + (1 << (bits - 1))) >> bits;
+}
+
+// ─── Oversampling ───────────────────────────────────────────────────────
+
+/// Decimate 4^extra_bits samples into one code with extra_bits more
+/// resolution. Uses the first 4^extra_bits samples; -1 if too few.
+pub fn adc_oversample(samples: & Vec<i64>, extra_bits: i64) -> i64 {
+    val need: i64 = 1 << (2 * extra_bits);
+    if samples.len() < need {
+        return 0 - 1;
+    }
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < need {
+        sum = sum + samples.get(i);
+        i = i + 1;
+    }
+    return sum >> extra_bits;
+}
+
+/// Plain average of n samples, rounded.
+pub fn adc_average(samples: & Vec<i64>) -> i64 {
+    if samples.len() == 0 {
+        return 0;
+    }
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < samples.len() {
+        sum = sum + samples.get(i);
+        i = i + 1;
+    }
+    return (sum + samples.len() / 2) / samples.len();
+}
+
+// ─── Filters ────────────────────────────────────────────────────────────
+
+/// Moving average over the last `size` samples (ring buffer, running sum).
+pub struct AdcMovingAvg {
+    pub buf: Vec<i64>,
+    pub pos: i64,
+    pub count: i64,
+    pub sum: i64,
+}
+
+pub fn adc_mavg_new(size: i64) -> AdcMovingAvg {
+    return AdcMovingAvg { buf: Vec::filled(size, 0), pos: 0, count: 0, sum: 0 };
+}
+
+/// Add a sample; the average of what the window holds (rounded down).
+pub fn adc_mavg_push(m: & mut AdcMovingAvg, x: i64) -> i64 {
+    if m.count == m.buf.len() {
+        m.sum = m.sum - m.buf.get(m.pos);
+    } else {
+        m.count = m.count + 1;
+    }
+    m.buf.set(m.pos, x);
+    m.sum = m.sum + x;
+    m.pos = (m.pos + 1) % m.buf.len();
+    return m.sum / m.count;
+}
+
+/// Exponential moving average in fixed point: y += (x - y) >> shift, y
+/// held with `shift` fractional bits so no precision is lost.
+pub struct AdcEma {
+    pub acc: i64,
+    pub shift: i64,
+    pub primed: bool,
+}
+
+pub fn adc_ema_new(shift: i64) -> AdcEma {
+    return AdcEma { acc: 0, shift: shift, primed: false };
+}
+
+pub fn adc_ema_push(e: & mut AdcEma, x: i64) -> i64 {
+    if !e.primed {
+        e.acc = x << e.shift;
+        e.primed = true;
+    } else {
+        e.acc = e.acc + x - (e.acc >> e.shift);
+    }
+    return e.acc >> e.shift;
+}
+
+fn adc_sorted(v: & Vec<i64>) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        val x: i64 = v.get(i);
+        var j: i64 = s.len();
+        s.push(x);
+        while j > 0 && s.get(j - 1) > x {
+            s.set(j, s.get(j - 1));
+            j = j - 1;
+        }
+        s.set(j, x);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Median of a set of samples (the lower middle one for an even count).
+pub fn adc_median(v: & Vec<i64>) -> i64 {
+    if v.len() == 0 {
+        return 0;
+    }
+    val s: Vec<i64> = adc_sorted(v);
+    return s.get((s.len() - 1) / 2);
+}
+
+/// Median over the last `size` samples: removes spikes.
+pub struct AdcMedian {
+    pub win: Vec<i64>,
+    pub size: i64,
+}
+
+pub fn adc_median_new(size: i64) -> AdcMedian {
+    return AdcMedian { win: Vec::new(), size: size };
+}
+
+pub fn adc_median_push(m: & mut AdcMedian, x: i64) -> i64 {
+    m.win.push(x);
+    if m.win.len() > m.size {
+        m.win.remove(0);
+    }
+    return adc_median(& m.win);
+}
+
+// ─── Calibration ────────────────────────────────────────────────────────
+
+/// value = gain * raw + offset.
+pub struct AdcCal {
+    pub gain: f64,
+    pub offset: f64,
+}
+
+/// From two points: raw1 reads ref1, raw2 reads ref2 (raw1 != raw2).
+pub fn adc_cal_two_point(raw1: i64, ref1: f64, raw2: i64, ref2: f64) -> AdcCal {
+    if raw1 == raw2 {
+        return AdcCal { gain: 1.0, offset: 0.0 };
+    }
+    val g: f64 = (ref2 - ref1) / ((raw2 - raw1) as f64);
+    return AdcCal { gain: g, offset: ref1 - g * (raw1 as f64) };
+}
+
+pub fn adc_cal_apply(c: & AdcCal, raw: i64) -> f64 {
+    return c.gain * (raw as f64) + c.offset;
+}
+
+/// The raw code that reads `value` after calibration.
+pub fn adc_cal_inverse(c: & AdcCal, value: f64) -> f64 {
+    if c.gain == 0.0 {
+        return 0.0;
+    }
+    return (value - c.offset) / c.gain;
+}
+
+// ─── Front-end helpers ──────────────────────────────────────────────────
+
+/// Input voltage of a divider: vin -> r1 -> (vout) -> r2 -> ground.
+pub fn adc_divider_vin(vout: f64, r1: f64, r2: f64) -> f64 {
+    return vout * (r1 + r2) / r2;
+}
+
+/// Natural logarithm (x > 0): x = m * 2^e with m in [sqrt(1/2), sqrt(2)),
+/// ln m by the atanh series.
+pub fn adc_ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0 - 1.0e308;
+    }
+    val bits: i64 = p_f64_to_bits(x);
+    var e: i64 = ((bits >> 52) & 0x7FF) - 1023;
+    var m: f64 = p_f64_from_bits((bits & 0x000FFFFFFFFFFFFF) | 0x3FF0000000000000);
+    if m > 1.4142135623730951 {
+        m = m / 2.0;
+        e = e + 1;
+    }
+    val t: f64 = (m - 1.0) / (m + 1.0);
+    val t2: f64 = t * t;
+    var term: f64 = t;
+    var sum: f64 = 0.0;
+    var k: i64 = 1;
+    while k < 40 {
+        sum = sum + term / (k as f64);
+        term = term * t2;
+        k = k + 2;
+    }
+    return 2.0 * sum + (e as f64) * 0.6931471805599453;
+}
+
+/// NTC resistance from a divider reading: vref -> r_fixed -> (vout) -> NTC
+/// -> ground.
+pub fn adc_ntc_resistance(vout: f64, vref: f64, r_fixed: f64) -> f64 {
+    if vout >= vref {
+        return 1.0e308;
+    }
+    return r_fixed * vout / (vref - vout);
+}
+
+/// Thermistor temperature (Celsius) by the Beta equation:
+/// 1/T = 1/T0 + ln(R/R0) / B, temperatures in kelvin.
+pub fn adc_ntc_celsius(r: f64, r0: f64, t0_c: f64, beta: f64) -> f64 {
+    val t0: f64 = t0_c + 273.15;
+    val inv: f64 = 1.0 / t0 + adc_ln(r / r0) / beta;
+    return 1.0 / inv - 273.15;
+}
+
+// ─── Linux IIO ──────────────────────────────────────────────────────────
+
+pub fn adc_iio_dir(root: str, dev: i64) -> str {
+    return root + "/iio:device" + int_to_str(dev);
+}
+
+/// The channel's processed value in millivolts: (raw + offset) * scale,
+/// as the IIO ABI defines it.
+pub fn adc_iio_millivolts(raw: i64, offset: f64, scale: f64) -> f64 {
+    return ((raw as f64) + offset) * scale;
+}
+
+fn adc_read_text(path: str) -> str {
+    match file_read_result(path) {
+        Result::Ok(t) => {
+            return str_trim(t);
+        }
+        Result::Err(_) => {
+            return "";
+        }
+    }
+}
+
+/// Read in_voltage<ch>_raw and its scale/offset (per channel, else the
+/// shared in_voltage_scale / in_voltage_offset) and give millivolts.
+pub fn adc_iio_read_mv(root: str, dev: i64, ch: i64) -> Result<f64, str> {
+    val d: str = adc_iio_dir(root, dev);
+    val pre: str = d + "/in_voltage" + int_to_str(ch);
+    val raw_t: str = adc_read_text(pre + "_raw");
+    if raw_t == "" {
+        return Result::Err("cannot read " + pre + "_raw");
+    }
+    var scale_t: str = adc_read_text(pre + "_scale");
+    if scale_t == "" {
+        scale_t = adc_read_text(d + "/in_voltage_scale");
+    }
+    var off_t: str = adc_read_text(pre + "_offset");
+    if off_t == "" {
+        off_t = adc_read_text(d + "/in_voltage_offset");
+    }
+    var scale: f64 = 1.0;
+    if scale_t != "" {
+        scale = str_parse_float(scale_t);
+    }
+    var offset: f64 = 0.0;
+    if off_t != "" {
+        offset = str_parse_float(off_t);
+    }
+    return Result::Ok(adc_iio_millivolts(str_parse_int(raw_t), offset, scale));
+}
+
+/// A buffered channel's format from scan_elements/<ch>_type:
+/// "[be|le]:[s|u]<realbits>/<storagebits>[X<repeat>]>><shift>".
+pub struct AdcScanType {
+    pub big_endian: bool,
+    pub signed: bool,
+    pub realbits: i64,
+    pub storagebits: i64,
+    pub repeat: i64,
+    pub shift: i64,
+    pub ok: bool,
+}
+
+fn adc_take_num(s: str, pos: & mut i64) -> i64 {
+    var v: i64 = 0;
+    var any: bool = false;
+    while *pos < str_len(s) {
+        val c: i64 = str_byte_at(s, *pos);
+        if c < 48 || c > 57 {
+            break;
+        }
+        v = v * 10 + (c - 48);
+        any = true;
+        *pos = *pos + 1;
+    }
+    if !any {
+        return 0 - 1;
+    }
+    return v;
+}
+
+pub fn adc_parse_scan_type(t: str) -> AdcScanType {
+    var r: AdcScanType = AdcScanType { big_endian: false, signed: false, realbits: 0, storagebits: 0, repeat: 1, shift: 0, ok: false };
+    val s: str = str_trim(t);
+    if str_len(s) < 8 || str_byte_at(s, 2) != 58 {
+        return r;
+    }
+    if str_starts_with(s, "be") {
+        r.big_endian = true;
+    } else if !str_starts_with(s, "le") {
+        return r;
+    }
+    val sc: i64 = str_byte_at(s, 3);
+    if sc == 115 {
+        r.signed = true;
+    } else if sc != 117 {
+        return r;
+    }
+    var p: i64 = 4;
+    r.realbits = adc_take_num(s, & mut p);
+    if p >= str_len(s) || str_byte_at(s, p) != 47 {
+        return r;
+    }
+    p = p + 1;
+    r.storagebits = adc_take_num(s, & mut p);
+    if p < str_len(s) && str_byte_at(s, p) == 88 {
+        p = p + 1;
+        r.repeat = adc_take_num(s, & mut p);
+    }
+    if p + 1 < str_len(s) && str_byte_at(s, p) == 62 && str_byte_at(s, p + 1) == 62 {
+        p = p + 2;
+        r.shift = adc_take_num(s, & mut p);
+    }
+    r.ok = r.realbits > 0 && r.storagebits >= r.realbits && r.storagebits % 8 == 0 && r.storagebits <= 64 && r.shift >= 0 && r.repeat > 0;
+    return r;
+}
+
+/// Decode one sample of a scan type at byte offset off in a buffer read.
+pub fn adc_scan_decode(st: & AdcScanType, bytes: & Vec<i64>, off: i64) -> i64 {
+    val n: i64 = st.storagebits / 8;
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = bytes.get(off + i) & 0xFF;
+        if st.big_endian {
+            v = (v << 8) | b;
+        } else {
+            v = v | (b << (8 * i));
+        }
+        i = i + 1;
+    }
+    if st.realbits < 63 {
+        v = (v >> st.shift) & ((1 << st.realbits) - 1);
+    }
+    if st.signed && st.realbits < 63 {
+        return adc_sign_extend(v, st.realbits);
+    }
+    return v;
+}

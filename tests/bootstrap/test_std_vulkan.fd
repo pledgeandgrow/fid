@@ -1,0 +1,171 @@
+// stdlib/vulkan: API versions, C struct layouts (sizes/offsets as in vulkan_core.h on 64-bit), f32 bits, create-info blobs with relocated pointers (also copied to C memory), format table and image sizes, layout-transition masks, descriptor set layout builder and checks, image/buffer validation. Calls into the Vulkan loader are not made (no GPU needed).
+// Expected output:
+// api 1.3 = 4206592 -> 1.3.0
+// sizes: AppInfo 48, InstanceCI 64, QueueCI 40, DeviceCI 72, BufferCI 56, ImageCI 88, ImageBarrier 72, DSLBinding 24, DSLCI 32, SubmitInfo 72, Raster 64
+// offsets: ImageCI.initialLayout 80, BufferCI.size 24, Barrier.image 40, Submit.pSignalSemaphores 64, Raster.lineWidth 56
+// f32: 1.0 0x3f800000, 0.1 0x3dcccccd, -2.5 0xc0200000, 1e39 0x7f800000
+// instance ci: sType 1, extensions 2, app demo v7, api 1.3.0, relocations 6
+// instance ci: extension names VK_KHR_surface VK_KHR_win32_surface
+// device ci: queue family 2, 2 priorities 0x3f800000 0x3f000000
+// C memory: pApplicationInfo patched to the app info: true
+// formats: RGBA8 4B, BC1 8B 4x4, BC7 16B 4x4, ASTC8x8 16B 8x8, ASTC12x12 12x12, D24S8 aspects 6
+// sizes: rgba8 256^2 full chain 349524, bc1 256^2 full chain 43704, mips(1920x1080) 11
+// undefined -> transfer dst: access 0x0 -> 0x1000, stages 0x1 -> 0x1000
+// transfer dst -> shader read: access 0x1000 -> 0x20, stages 0x1000 -> 0x80
+// undefined -> depth attachment: access 0x0 -> 0x600, stages 0x1 -> 0x300
+// color -> present: access 0x100 -> 0x0, stages 0x400 -> 0x2000
+// barrier: aspect 2, levels 1, layers 1, image 0xabc
+// dsl ok: 0 problems, 3 bindings sorted 0 1 2, pool 1:8 6:2 7:2
+// dsl bad: binding 1 used twice
+// dsl bad: binding 3: input attachments are fragment-only
+// dsl bad: stage bit 16: 24 sampled images (limit 16)
+// image ok: 0 problems
+// image bad: mipLevels 12 exceeds the full chain of 11
+// image bad: samples must be a power of two from 1 to 64
+// image bad: a depth/stencil format cannot be a color attachment or storage image
+// cube 512x256: a cube-compatible image is 2D, square, with at least 6 layers
+// buffer: 3 problems
+// results: VK_ERROR_DEVICE_LOST VK_SUBOPTIMAL_KHR VkResult(-42)
+use vulkan;
+
+fn hexn(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    if v == 0 { return "0x0"; }
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = byte_to_str(str_byte_at(d, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn sz(name: str) -> str {
+    return int_to_str(vk_layout(name).size);
+}
+
+fn masks(label: str, o: i64, n: i64, stage: i64) {
+    val m: VkBarrierMasks = vk_transition(o, n, stage);
+    println(label + ": access " + hexn(m.src_access) + " -> " + hexn(m.dst_access) + ", stages " + hexn(m.src_stage) + " -> " + hexn(m.dst_stage));
+}
+
+fn fmt(name: str, f: i64) -> str {
+    val fi: VkFormatInfo = vk_format_info(f);
+    var s: str = name + " " + int_to_str(fi.block_bytes) + "B";
+    if fi.compressed {
+        s = s + " " + int_to_str(fi.block_w) + "x" + int_to_str(fi.block_h);
+    }
+    return s;
+}
+
+fn main() {
+    println("api 1.3 = " + int_to_str(vk_make_api_version(0, 1, 3, 0)) + " -> " + vk_version_str(VK_API_VERSION_1_3));
+    println("sizes: AppInfo " + sz("VkApplicationInfo") + ", InstanceCI " + sz("VkInstanceCreateInfo") + ", QueueCI " + sz("VkDeviceQueueCreateInfo") + ", DeviceCI " + sz("VkDeviceCreateInfo") + ", BufferCI " + sz("VkBufferCreateInfo") + ", ImageCI " + sz("VkImageCreateInfo") + ", ImageBarrier " + sz("VkImageMemoryBarrier") + ", DSLBinding " + sz("VkDescriptorSetLayoutBinding") + ", DSLCI " + sz("VkDescriptorSetLayoutCreateInfo") + ", SubmitInfo " + sz("VkSubmitInfo") + ", Raster " + sz("VkPipelineRasterizationStateCreateInfo"));
+    println("offsets: ImageCI.initialLayout " + int_to_str(vk_offset(&vk_layout("VkImageCreateInfo"), "initialLayout")) + ", BufferCI.size " + int_to_str(vk_offset(&vk_layout("VkBufferCreateInfo"), "size")) + ", Barrier.image " + int_to_str(vk_offset(&vk_layout("VkImageMemoryBarrier"), "image")) + ", Submit.pSignalSemaphores " + int_to_str(vk_offset(&vk_layout("VkSubmitInfo"), "pSignalSemaphores")) + ", Raster.lineWidth " + int_to_str(vk_offset(&vk_layout("VkPipelineRasterizationStateCreateInfo"), "lineWidth")));
+    println("f32: 1.0 " + hexn(vk_f32_bits(1.0)) + ", 0.1 " + hexn(vk_f32_bits(0.1)) + ", -2.5 " + hexn(vk_f32_bits(0.0 - 2.5)) + ", 1e39 " + hexn(vk_f32_bits(1.0e39)));
+
+    var b: VkBlob = vk_blob_new();
+    var exts: Vec<str> = Vec::new();
+    exts.push("VK_KHR_surface");
+    exts.push("VK_KHR_win32_surface");
+    val ci: i64 = vk_instance_create_info(&mut b, "demo", 7, "fides", 1, VK_API_VERSION_1_3, Vec::new(), exts);
+    val li: VkLayout = vk_layout("VkInstanceCreateInfo");
+    val la: VkLayout = vk_layout("VkApplicationInfo");
+    val ai: i64 = vk_read_ptr(&b, ci, &li, "pApplicationInfo");
+    println("instance ci: sType " + int_to_str(vk_read(&b, ci, &li, "sType")) + ", extensions " + int_to_str(vk_read(&b, ci, &li, "enabledExtensionCount")) + ", app " + vk_blob_read_cstr(&b, vk_read_ptr(&b, ai, &la, "pApplicationName")) + " v" + int_to_str(vk_read(&b, ai, &la, "applicationVersion")) + ", api " + vk_version_str(vk_read(&b, ai, &la, "apiVersion")) + ", relocations " + int_to_str(b.reloc_at.len()));
+    val arr: i64 = vk_read_ptr(&b, ci, &li, "ppEnabledExtensionNames");
+    var names: str = "";
+    var i: i64 = 0;
+    while i < 2 {
+        var k: i64 = 0;
+        while k < b.reloc_at.len() {
+            if b.reloc_at.get(k) == arr + 8 * i {
+                names = names + " " + vk_blob_read_cstr(&b, b.reloc_to.get(k));
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    println("instance ci: extension names" + names);
+    var db: VkBlob = vk_blob_new();
+    var pr: Vec<f64> = Vec::new();
+    pr.push(1.0);
+    pr.push(0.5);
+    val dci: i64 = vk_device_create_info(&mut db, 2, pr, Vec::new());
+    val lq: VkLayout = vk_layout("VkDeviceQueueCreateInfo");
+    val qi: i64 = vk_read_ptr(&db, dci, &vk_layout("VkDeviceCreateInfo"), "pQueueCreateInfos");
+    val pp: i64 = vk_read_ptr(&db, qi, &lq, "pQueuePriorities");
+    println("device ci: queue family " + int_to_str(vk_read(&db, qi, &lq, "queueFamilyIndex")) + ", " + int_to_str(vk_read(&db, qi, &lq, "queueCount")) + " priorities " + hexn(vk_get(&db, pp, 4)) + " " + hexn(vk_get(&db, pp + 4, 4)));
+    val mem: i64 = vk_blob_to_mem(&b);
+    println("C memory: pApplicationInfo patched to the app info: " + yes(vk_out_read(mem + ci + vk_offset(&li, "pApplicationInfo")) == mem + ai));
+
+    println("formats: " + fmt("RGBA8", VK_FORMAT_R8G8B8A8_UNORM) + ", " + fmt("BC1", VK_FORMAT_BC1_RGB_UNORM_BLOCK) + ", " + fmt("BC7", VK_FORMAT_BC7_UNORM_BLOCK) + ", " + fmt("ASTC8x8", VK_FORMAT_ASTC_8X8_UNORM_BLOCK) + ", ASTC12x12 " + int_to_str(vk_format_info(VK_FORMAT_ASTC_12X12_SRGB_BLOCK).block_w) + "x" + int_to_str(vk_format_info(VK_FORMAT_ASTC_12X12_SRGB_BLOCK).block_h) + ", D24S8 aspects " + int_to_str(vk_format_info(VK_FORMAT_D24_UNORM_S8_UINT).aspects));
+    println("sizes: rgba8 256^2 full chain " + int_to_str(vk_image_size(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, vk_mip_levels(256, 256, 1), 1)) + ", bc1 256^2 full chain " + int_to_str(vk_image_size(VK_FORMAT_BC1_RGB_UNORM_BLOCK, 256, 256, 1, 9, 1)) + ", mips(1920x1080) " + int_to_str(vk_mip_levels(1920, 1080, 1)));
+
+    masks("undefined -> transfer dst", VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    masks("transfer dst -> shader read", VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    masks("undefined -> depth attachment", VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    masks("color -> present", VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    var bb: VkBlob = vk_blob_new();
+    val bar: i64 = vk_image_barrier(&mut bb, 0xabc, VK_FORMAT_D32_SFLOAT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 1, 1, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    val lb: VkLayout = vk_layout("VkImageMemoryBarrier");
+    println("barrier: aspect " + int_to_str(vk_read(&bb, bar, &lb, "subresourceRange.aspectMask")) + ", levels " + int_to_str(vk_read(&bb, bar, &lb, "subresourceRange.levelCount")) + ", layers " + int_to_str(vk_read(&bb, bar, &lb, "subresourceRange.layerCount")) + ", image " + hexn(vk_read(&bb, bar, &lb, "image")));
+
+    var dsl: VkDslBuilder = vk_dsl_new();
+    vk_dsl_add(&mut dsl, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT);
+    vk_dsl_add(&mut dsl, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+    vk_dsl_add(&mut dsl, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, VK_SHADER_STAGE_FRAGMENT_BIT);
+    var sb: VkBlob = vk_blob_new();
+    val dci2: i64 = vk_dsl_create_info(&dsl, &mut sb);
+    val lc: VkLayout = vk_layout("VkDescriptorSetLayoutCreateInfo");
+    val lbd: VkLayout = vk_layout("VkDescriptorSetLayoutBinding");
+    val pb: i64 = vk_read_ptr(&sb, dci2, &lc, "pBindings");
+    var order: str = "";
+    i = 0;
+    while i < 3 {
+        order = order + " " + int_to_str(vk_read(&sb, pb + 24 * i, &lbd, "binding"));
+        i = i + 1;
+    }
+    val ps: Vec<i64> = vk_dsl_pool_sizes(&dsl, 2);
+    var pool: str = "";
+    i = 0;
+    while i < ps.len() {
+        pool = pool + " " + int_to_str(ps.get(i)) + ":" + int_to_str(ps.get(i + 1));
+        i = i + 2;
+    }
+    println("dsl ok: " + int_to_str(vk_dsl_validate(&dsl).len()) + " problems, " + int_to_str(vk_read(&sb, dci2, &lc, "bindingCount")) + " bindings sorted" + order + ", pool" + pool);
+    var bad: VkDslBuilder = vk_dsl_new();
+    vk_dsl_add(&mut bad, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 20, VK_SHADER_STAGE_FRAGMENT_BIT);
+    vk_dsl_add(&mut bad, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, VK_SHADER_STAGE_FRAGMENT_BIT);
+    vk_dsl_add(&mut bad, 3, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_VERTEX_BIT);
+    val errs: Vec<str> = vk_dsl_validate(&bad);
+    i = 0;
+    while i < errs.len() {
+        println("dsl bad: " + errs.get(i));
+        i = i + 1;
+    }
+
+    val good: VkImageDesc = vk_image_desc_2d(VK_FORMAT_R8G8B8A8_SRGB, 1024, 1024, 11, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    println("image ok: " + int_to_str(vk_validate_image(&good).len()) + " problems");
+    var badimg: VkImageDesc = vk_image_desc_2d(VK_FORMAT_D32_SFLOAT, 1024, 1024, 12, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    badimg.samples = 3;
+    val ie: Vec<str> = vk_validate_image(&badimg);
+    i = 0;
+    while i < ie.len() {
+        println("image bad: " + ie.get(i));
+        i = i + 1;
+    }
+    var cube: VkImageDesc = vk_image_desc_2d(VK_FORMAT_R8G8B8A8_UNORM, 512, 256, 1, VK_IMAGE_USAGE_SAMPLED_BIT);
+    cube.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    cube.array_layers = 6;
+    println("cube 512x256: " + vk_validate_image(&cube).get(0));
+    var fam: Vec<i64> = Vec::new();
+    fam.push(0);
+    println("buffer: " + int_to_str(vk_validate_buffer(0, 0, VK_SHARING_MODE_CONCURRENT, &fam).len()) + " problems");
+    println("results: " + vk_result_name(VK_ERROR_DEVICE_LOST) + " " + vk_result_name(VK_SUBOPTIMAL_KHR) + " " + vk_result_name(0 - 42));
+}

@@ -1,0 +1,133 @@
+// stdlib/dialogue: script parser, conditional choices, set/add effects, {var} text, runner state machine, parse errors
+// Expected output:
+// parsed ok, 4 nodes
+//   Guard: Halt! Who goes there?
+//   Guard: Toll is 10 gold. You have 17.
+//   [0] Pay the toll
+//   [1] Leave
+// > choose 0
+//   Narrator: The gate creaks open. Visit 1.
+//   Merchant: Fresh bread!
+//   [0] Buy bread
+//   [1] Go home
+// > choose 0
+//   Merchant: Fresh bread!
+//   [0] Buy bread
+//   [1] Go home
+// > choose 0
+//   Merchant: Fresh bread!
+//   [0] Go home
+// > choose 0
+//   (end)
+// gold 1 bread 2 paid 1
+//   Guard: Halt! Who goes there?
+//   Guard: Toll is 10 gold. You have 2.
+//   [0] Sweet-talk the guard
+//   [1] Leave
+// > choose 5 (not offered)
+//   [0] Sweet-talk the guard
+//   [1] Leave
+// > choose 0
+//   Narrator: The gate creaks open. Visit 1.
+//   Merchant: Fresh bread!
+//   [0] Go home
+// charm 1 visits 1
+//   Guard: Halt! Who goes there?
+//   Guard: Toll is 10 gold. You have 0.
+//   [0] Leave
+// > choose 0
+//   You walk back down the road.
+//   (end)
+// error: unknown target: a -> nowhere
+// error: line 2: unknown effect 'mul'
+// error: line 2: bad variable name 'x ='
+// error: line 1: text before the first '= node'
+// error: line 3: node 'a' defined twice
+// empty cycle ends: yes
+use dialogue;
+
+// Play lines until a choice or the end; print what is shown.
+fn play(r: &mut DlgRunner, g: &DlgGraph) {
+    while r.state == DLG_LINE {
+        val who: str = dlg_speaker(r, g);
+        if who == "" {
+            println("  " + dlg_line_text(r, g));
+        } else {
+            println("  " + who + ": " + dlg_line_text(r, g));
+        }
+        dlg_advance(r, g);
+    }
+    if r.state == DLG_CHOICE {
+        val opts: Vec<i64> = dlg_options(r, g);
+        var k: i64 = 0;
+        while k < opts.len() {
+            println("  [" + int_to_str(k) + "] " + dlg_option_text(r, g, k));
+            k = k + 1;
+        }
+    } else {
+        println("  (end)");
+    }
+}
+
+fn pick(r: &mut DlgRunner, g: &DlgGraph, k: i64) {
+    println("> choose " + int_to_str(k) + if dlg_choose(r, g, k) { "" } else { " (not offered)" });
+    play(r, g);
+}
+
+fn main() {
+    val script: str = "# the gate guard\n= gate\nGuard: Halt! Who goes there?\nGuard: Toll is 10 gold. You have {gold}.\n* [gold >= 10] Pay the toll -> inside {add gold -10; set paid 1}\n* [gold < 10, charm >= 2] Sweet-talk the guard -> inside {add charm -2}\n* Leave -> road\n\n= inside\n~ add visits 1\nNarrator: The gate creaks open. Visit {visits}.\n-> market\n\n= market\nMerchant: Fresh bread!\n* [gold >= 3] Buy bread -> market {add gold -3; add bread 1}\n* Go home -> END\n\n= road\nYou walk back down the road.\n";
+    val p: DlgParse = dlg_parse(script);
+    println("parsed " + if p.ok { "ok" } else { p.error } + ", " + int_to_str(p.graph.nodes.len()) + " nodes");
+    val g: DlgGraph = p.graph;
+
+    // rich run: pay, buy twice, go home
+    var r: DlgRunner = dlg_runner(&g);
+    dlg_set(&mut r, "gold", 17);
+    dlg_start(&mut r, &g, "");
+    play(&mut r, &g);
+    pick(&mut r, &g, 0);
+    pick(&mut r, &g, 0);
+    pick(&mut r, &g, 0);
+    pick(&mut r, &g, 0);
+    println("gold " + int_to_str(dlg_get(&r, "gold")) + " bread " + int_to_str(dlg_get(&r, "bread")) + " paid " + int_to_str(dlg_get(&r, "paid")));
+
+    // poor but charming: the pay option is hidden
+    var r2: DlgRunner = dlg_runner(&g);
+    dlg_set(&mut r2, "gold", 2);
+    dlg_set(&mut r2, "charm", 3);
+    dlg_start(&mut r2, &g, "gate");
+    play(&mut r2, &g);
+    pick(&mut r2, &g, 5);
+    pick(&mut r2, &g, 0);
+    println("charm " + int_to_str(dlg_get(&r2, "charm")) + " visits " + int_to_str(dlg_get(&r2, "visits")));
+
+    // poor, no charm: only Leave
+    var r3: DlgRunner = dlg_runner(&g);
+    dlg_start(&mut r3, &g, "gate");
+    play(&mut r3, &g);
+    pick(&mut r3, &g, 0);
+
+    // errors
+    val e1: DlgParse = dlg_parse("= a\n* Go -> nowhere\n");
+    println("error: " + e1.error);
+    val e2: DlgParse = dlg_parse("= a\n~ mul x 2\n");
+    println("error: " + e2.error);
+    val e3: DlgParse = dlg_parse("= a\n* [x =< 2] Go -> END\n");
+    println("error: " + e3.error);
+    val e4: DlgParse = dlg_parse("hello\n");
+    println("error: " + e4.error);
+    val e5: DlgParse = dlg_parse("= a\nhi\n= a\n");
+    println("error: " + e5.error);
+
+    // a graph built in code; a cycle of empty nodes ends instead of looping
+    var g2: DlgGraph = dlg_graph();
+    var n1: DlgNode = dlg_node("x");
+    n1.next = "y";
+    var n2: DlgNode = dlg_node("y");
+    n2.next = "x";
+    dlg_add_node(&mut g2, n1);
+    dlg_add_node(&mut g2, n2);
+    var r4: DlgRunner = dlg_runner(&g2);
+    dlg_start(&mut r4, &g2, "x");
+    println("empty cycle ends: " + if r4.state == DLG_END { "yes" } else { "no" });
+}

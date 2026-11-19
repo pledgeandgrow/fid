@@ -31,11 +31,14 @@ pub struct CoverageData {
     pub all_instructions: Vec<CovLineEntry>,
     pub covered_instructions: Vec<CovLineEntry>,
     pub func_line_counts: Vec<FuncCount>,
+    // CT8: the interpreter's branch report (Interpreter_branch_report:
+    // a "Branches: c/t (p%)" line, then each way never taken), "" for none
+    pub branches: str,
 }
 
 pub fn CoverageData_new() -> CoverageData {
     return CoverageData {
-        all_functions: Vec::new(), called_functions: Vec::new(), all_lines: Vec::new(), covered_lines: Vec::new(), all_instructions: Vec::new(), covered_instructions: Vec::new(), func_line_counts: Vec::new(),
+        all_functions: Vec::new(), called_functions: Vec::new(), all_lines: Vec::new(), covered_lines: Vec::new(), all_instructions: Vec::new(), covered_instructions: Vec::new(), func_line_counts: Vec::new(), branches: "",
     };
 }
 
@@ -420,10 +423,15 @@ fn vl_record_covered(data: & mut CoverageData, interp: & Interpreter, module: & 
 pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
     // 1. Build IR from source (with the path, so `use` imports resolve)
     var module_result: ResultIrModule = lower_to_ir_module_with_path(source, source_path, "on");
-    var module: IrModule;
+    // known-bugs 2g.30: the module is not copied out of the result into a
+    // second local (`var module: IrModule; module = m;`): the generated C
+    // made that a 112-byte memcpy of the payload with no new owner, so the
+    // module's Vecs were dropped twice at the end (once as `module`, once
+    // through the result, `__own_drop_5`). The payload is lent to
+    // vl_cover_module instead, and the result alone owns it.
     match module_result {
         ResultIrModule::Ok(m) => {
-            module = m;
+            return vl_cover_module(m, source);
         }
         ResultIrModule::Err(errs) => {
             var err_data: CoverageData = CoverageData_new();
@@ -436,7 +444,12 @@ pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
             return CoverageRunResult_new(err_data, msg, OptStr::None);
         }
     }
+    return CoverageRunResult_new(CoverageData_new(), "Compilation failed", OptStr::None);
+}
 
+/// Steps 2-4 of run_with_coverage on the lowered `module` (lent: the
+/// interpreter takes its own owner of it in Interpreter_new).
+fn vl_cover_module(module: IrModule, source: str) -> CoverageRunResult {
     // 2. Collect all structural coverage points
     var data: CoverageData = collect_all_coverage(& module);
 
@@ -459,6 +472,14 @@ pub fn run_with_coverage(source: str, source_path: str) -> CoverageRunResult {
 
     // 4. Compute per-function line counts
     CoverageData_compute_func_counts(& mut data);
+
+    // CT8: branch coverage of the same functions: each conditional branch
+    // with a source line counts two ways (the interpreter recorded the way
+    // each one went under Interpreter_set_debug_hook). With no function
+    // left there is nothing to report (an empty list would mean all).
+    if data.all_functions.len() > 0 {
+        data.branches = Interpreter_branch_report(& interp, data.all_functions);
+    }
 
     // Convert RunResult to a status string
     var status: str = "ok";
@@ -483,6 +504,20 @@ pub fn veil_run(input_path: str, format: str, output_dir: str) -> str {
         return "Cannot read " + input_path;
     }
 
+    // 2g.60: the covered program sees its own command line, as under
+    // `fid run x.fd`: its file as argument 0 and no arguments (veil's own
+    // command and options are not the program's). Without it a program
+    // read `veil` as its first argument (`fid test --coverage`'s harness
+    // then ran no test at all).
+    var va_n: i64 = p_argc();
+    var va_i: i64 = 0;
+    while va_i < va_n {
+        if p_argv(va_i) == input_path {
+            interp_set_program_args(va_i, va_n);
+            break;
+        }
+        va_i = va_i + 1;
+    }
     var cov: CoverageRunResult = run_with_coverage(source, input_path);
     var status_line: str = "";
     if cov.status != "ok" {
@@ -526,6 +561,8 @@ pub fn generate_text_report(data: & CoverageData, source: str) -> str {
     report = report + "Functions:     " + int_to_str(data.called_functions.len()) + "/" + int_to_str(data.all_functions.len()) + " (" + float_to_str_1(CoverageData_function_coverage_pct(data)) + "%)\n";
     report = report + "Lines:         " + int_to_str(data.covered_lines.len()) + "/" + int_to_str(data.all_lines.len()) + " (" + float_to_str_1(CoverageData_line_coverage_pct(data)) + "%)\n";
     report = report + "Instructions:  " + int_to_str(data.covered_instructions.len()) + "/" + int_to_str(data.all_instructions.len()) + " (" + float_to_str_1(CoverageData_instruction_coverage_pct(data)) + "%)\n";
+    // CT8: "Branches: c/t (p%)", then the ways never taken
+    report = report + data.branches;
     report = report + "\n";
 
     report = report + "Per-Function Coverage\n";
@@ -610,6 +647,10 @@ pub const COVERAGE_CSS: str = "body { font-family: -apple-system, BlinkMacSystem
     html = html + summary_card("Lines", data.covered_lines.len(), data.all_lines.len(), CoverageData_line_coverage_pct(data));
     html = html + summary_card("Instructions", data.covered_instructions.len(), data.all_instructions.len(), CoverageData_instruction_coverage_pct(data));
     html = html + "</div>\n";
+    // CT8: the branch report as text (summary line, ways never taken)
+    if str_len(data.branches) > 0 {
+        html = html + "<h2>Branches</h2>\n<pre class=\"source\">" + vl_escape_html(data.branches) + "</pre>\n";
+    }
     html = html + "<h2>Per-Function Coverage</h2>\n";
     html = html + "<table>\n<thead><tr><th>Function</th><th>Lines</th><th>Covered</th><th>Coverage</th></tr></thead>\n<tbody>\n";
     var fi: i64 = 0;

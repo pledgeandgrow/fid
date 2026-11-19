@@ -1,0 +1,122 @@
+// stdlib/sched: round robin, priorities with aging and the fair scheduler as deterministic simulations.
+// Expected output:
+// rr1 AABBCCAABBCC
+// rr2 AACCAA
+// rr3 CCAABB
+// rr4 AABBAA
+// rr states A=ready B=ready C=running switches 17
+// rr idle -- idle_time 2
+// prio no aging HHHHHHHH
+// prio aging HHHHHHLLHHHHHHLL
+// prio block H -> M
+// prio wake H -> H
+// fair slices 2578 843
+// fair share A 43 B 43 C 14 (theory 43 43 14)
+// fair spread ok true
+// fair D placed at min-3000 true
+// fair D preempts true
+use sched;
+use vec;
+use string;
+
+fn run(s: &mut Sched, n: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < n {
+        out = out + sched_current_name(s);
+        sched_tick(s, 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn rr() {
+    var s: Sched = sched_new(SCHED_RR, 2);
+    val a: i64 = sched_spawn(&mut s, "A", 0);
+    val b: i64 = sched_spawn(&mut s, "B", 0);
+    val c: i64 = sched_spawn(&mut s, "C", 0);
+    sched_schedule(&mut s);
+    println("rr1 " + run(&mut s, 12));
+    sched_block(&mut s, b);
+    println("rr2 " + run(&mut s, 6));
+    sched_wake(&mut s, b);
+    println("rr3 " + run(&mut s, 6));
+    sched_sleep(&mut s, sched_current(&s), s.now + 3);
+    println("rr4 " + run(&mut s, 6));
+    println("rr states A=" + sched_state_name(sched_task(&s, a).state) + " B=" + sched_state_name(sched_task(&s, b).state) + " C=" + sched_state_name(sched_task(&s, c).state) + " switches " + int_to_str(s.switches));
+    sched_exit(&mut s, a);
+    sched_exit(&mut s, b);
+    sched_exit(&mut s, c);
+    println("rr idle " + run(&mut s, 2) + " idle_time " + int_to_str(s.idle_time));
+}
+
+fn prio() {
+    var s0: Sched = sched_new(SCHED_PRIO, 2);
+    sched_spawn(&mut s0, "H", 0);
+    sched_spawn(&mut s0, "L", 2);
+    sched_schedule(&mut s0);
+    println("prio no aging " + run(&mut s0, 8));
+    var s: Sched = sched_new(SCHED_PRIO, 2);
+    sched_set_aging(&mut s, 3);
+    val h: i64 = sched_spawn(&mut s, "H", 0);
+    sched_spawn(&mut s, "L", 2);
+    sched_schedule(&mut s);
+    println("prio aging " + run(&mut s, 16));
+    sched_spawn(&mut s, "M", 1);
+    sched_block(&mut s, h);
+    println("prio block H -> " + sched_current_name(&s));
+    sched_wake(&mut s, h);
+    println("prio wake H -> " + sched_current_name(&s));
+}
+
+fn pct(x: i64, total: i64) -> i64 {
+    return (x * 1000 / total + 5) / 10;
+}
+
+fn fair() {
+    var s: Sched = sched_new(SCHED_FAIR, 250);
+    sched_set_fair(&mut s, 6000, 750, 1000);
+    val a: i64 = sched_spawn(&mut s, "A", 0);
+    val b: i64 = sched_spawn(&mut s, "B", 0);
+    val c: i64 = sched_spawn(&mut s, "C", 5);
+    sched_schedule(&mut s);
+    println("fair slices " + int_to_str(sched_fair_slice(&s, a)) + " " + int_to_str(sched_fair_slice(&s, c)));
+    var i: i64 = 0;
+    while i < 2400 {
+        sched_tick(&mut s, 250);
+        i = i + 1;
+    }
+    val ra: i64 = sched_task(&s, a).runtime;
+    val rb: i64 = sched_task(&s, b).runtime;
+    val rc: i64 = sched_task(&s, c).runtime;
+    val tot: i64 = ra + rb + rc;
+    val w: i64 = 1024 + 1024 + 335;
+    println("fair share A " + int_to_str(pct(ra, tot)) + " B " + int_to_str(pct(rb, tot)) + " C " + int_to_str(pct(rc, tot)) + " (theory " + int_to_str(pct(1024, w)) + " " + int_to_str(pct(1024, w)) + " " + int_to_str(pct(335, w)) + ")");
+    var lo: i64 = sched_task(&s, a).vruntime;
+    var hi: i64 = lo;
+    var k: i64 = 0;
+    while k < 3 {
+        val v: i64 = sched_task(&s, k).vruntime;
+        if v < lo { lo = v; }
+        if v > hi { hi = v; }
+        k = k + 1;
+    }
+    println("fair spread ok " + bool_to_str(hi - lo <= 6000));
+    val d: i64 = sched_spawn(&mut s, "D", 0);
+    sched_block(&mut s, d);
+    i = 0;
+    while i < 400 {
+        sched_tick(&mut s, 250);
+        i = i + 1;
+    }
+    val minv: i64 = s.min_vruntime;
+    sched_wake(&mut s, d);
+    println("fair D placed at min-3000 " + bool_to_str(sched_task(&s, d).vruntime == minv - 3000));
+    println("fair D preempts " + bool_to_str(sched_current(&s) == d));
+}
+
+fn main() {
+    rr();
+    prio();
+    fair();
+}

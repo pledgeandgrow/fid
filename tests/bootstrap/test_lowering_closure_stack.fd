@@ -1,0 +1,79 @@
+// LG6: closures capture by value (reference §4.10) and by reference through
+// a captured `&mut` (the escape check keeps such a closure from leaving the
+// frame, test_escape_closure_fail.fd). A closure env that stays in the frame
+// that makes it (only called there: not passed, stored or returned) is a
+// stack Alloca since Nov 16 (lower.fd lw_stack_envs), on every path; one
+// that escapes keeps its heap env. The output is the same either way.
+// Expected output:
+// 2
+// 5
+// 5
+// 11
+// 15
+// 6
+// 30
+// 14
+// 106
+// 9
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn make_adder(n: i64) -> fn(i64) -> i64 {
+    return fn(x: i64) => x + n;
+}
+
+fn sum_squares(k: i64) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 1;
+    while i <= k {
+        val sq = fn(v: i64) -> i64 { return v * v; };
+        acc = acc + sq(i);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i64 {
+    // by reference: the closure writes through a captured &mut
+    var count: i64 = 0;
+    val r: &mut i64 = &mut count;
+    val bump = fn(k: i64) -> i64 { *r = *r + k; return *r; };
+    println(bump(2));
+    println(bump(3));
+    println(count);
+
+    // by value: the closure keeps the value it saw when it was made
+    var n: i64 = 10;
+    val add = fn(y: i64) -> i64 { return y + n; };
+    n = 20;
+    println(add(1));
+    // passed on: the env escapes into apply
+    println(apply(add, 5));
+
+    // a closure made in each iteration of a loop
+    var total: i64 = 0;
+    val t: &mut i64 = &mut total;
+    var i: i64 = 0;
+    while i < 4 {
+        val step = fn(v: i64) -> i64 { *t = *t + v; return 0; };
+        step(i);
+        i = i + 1;
+    }
+    println(total);
+    println(sum_squares(4));
+
+    // returned: the env must outlive make_adder's frame
+    val add4 = make_adder(4);
+    println(add4(10));
+    val add100 = make_adder(100);
+    println(add100(6));
+
+    // two closures over the same captured value
+    val base: i64 = 3;
+    val twice = fn(x: i64) -> i64 { return x * 2 + base - 3; };
+    val plus = fn(x: i64) -> i64 { return x + base; };
+    println(plus(twice(3)));
+    return 0;
+}

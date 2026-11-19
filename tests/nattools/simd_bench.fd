@@ -1,0 +1,68 @@
+// release-roadmap K10: the speed of @simd loops on the machine layer
+// (tests/nattools/simd_native_check.sh builds it with `fid emit` as is,
+// with FID_NAT_OFF=vzsimd, @simd then changing nothing, and with
+// FID_NAT_OFF=vectorize, and times the three). Over 2^20 elements, 100
+// times: a checked + reduction and a checked elementwise + (vectorized
+// only under @simd, after the pre-scan), an xor reduction (vectorized
+// either way; @simd unrolls it). The checksums printed are the same
+// whatever is vectorized.
+
+@simd
+fn sum_i(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+@simd
+fn add_into(c: & mut Vec<i64>, a: Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) + b.get(i));
+        i = i + 1;
+    }
+}
+
+@simd
+fn xor_all(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s ^ v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn data(n: i64, seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        v.push(x - 1073741824);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() {
+    var n: i64 = 1048576;
+    var a: Vec<i64> = data(n, 1);
+    var b: Vec<i64> = data(n, 2);
+    var c: Vec<i64> = data(n, 3);
+    var total: i64 = 0;
+    var x: i64 = 0;
+    var r: i64 = 0;
+    while r < 100 {
+        total = total + sum_i(a);
+        add_into(& mut c, a, b);
+        x = x ^ (xor_all(c) + r);
+        r = r + 1;
+    }
+    println("sum " + int_to_str(total) + " xor " + int_to_str(x) + " c " + int_to_str(c.get(12345)));
+}

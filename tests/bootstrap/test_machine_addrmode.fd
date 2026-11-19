@@ -1,0 +1,169 @@
+// Track MI (docs/roadmap/llvm-roadmap.md MI22), the machine layer
+// (compiler/nat_ir.fd): an element address folded into the load or store
+// that uses it (ng_fuse_addr, after ng_fuse_bits, before allocation):
+//   MO_ADDSHL d = base + (index << s) then LOAD [d] / STORE [d]
+//     -> MO_LDX / MO_STX of base and index: x86-64 one access with a SIB
+//        operand ([base + index * 8]), AArch64 the register-offset form
+//        (`ldr x, [n, m, lsl #3]`); RISC-V keeps SLLI+ADD (or Zba) and the
+//        access (no indexed addressing there).
+//   Only when the address dies at the access: an address used twice (the
+//   read and the write of a[k] = a[k] + 1, when lowering computes it
+//   once) keeps its ADDSHL.
+// The inline Vec_get / Vec_set / Vec_push element accesses and fixed
+// arrays exercise it; every result is the same with FID_NAT_OFF=ldx (the
+// old ADDSHL + access) and with FID_VERIFY=1 (the MIR verifier and the
+// allocation checker see the three-operand store). Run:
+//   NATIVE=1 bash scripts/cross-test.sh x86_64-linux (and aarch64-linux,
+//   riscv64-linux, x86_64-windows), and bash tests/nattools/machine_frame_check.sh
+//   (the folded forms in the image).
+// Expected output:
+// 2470
+// 2561
+// 150
+// 15
+// 4950
+// 285
+// 1 2 3 5 8 9
+// 120
+// 325
+// 42
+// 3
+// 9900
+// 32
+// 62
+
+struct Trio { a: i64, b: i64, c: i64 }
+
+// Field accesses: GetFieldPtr's base + constant becomes the access's
+// displacement (every target, ng_disp_fits)
+
+fn trio_sum(t: &Trio) -> i64 {
+    return t.a + t.b * 2 + t.c * 3;
+}
+
+fn trio_set(t: &mut Trio, v: i64) {
+    t.c = v;
+    t.b = t.a + v;
+}
+
+fn sum_vec(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+// Reads at a computed index: base + (2k+1) * 8
+fn odd_sum(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var k: i64 = 0;
+    while 2 * k + 1 < v.len() {
+        t = t + v.get(2 * k + 1);
+        k = k + 1;
+    }
+    return t;
+}
+
+// A read and a write of the same element in one statement, and a swap:
+// several element addresses live at once
+fn sort(v: & mut Vec<i64>) {
+    var n: i64 = v.len();
+    var i: i64 = 0;
+    while i < n {
+        var j: i64 = 0;
+        while j + 1 < n - i {
+            if v.get(j) > v.get(j + 1) {
+                val a: i64 = v.get(j);
+                v.set(j, v.get(j + 1));
+                v.set(j + 1, a);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn bump_all(v: & mut Vec<i64>, by: i64) {
+    var i: i64 = 0;
+    while i < v.len() {
+        v.set(i, v.get(i) + by);
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 20 {
+        v.push(i * i);
+        i = i + 1;
+    }
+    println(sum_vec(& v));
+    v.set(3, 100);
+    println(sum_vec(& v));
+    // fixed arrays: reads, writes, a read-modify-write
+    val arr = [10, 20, 30, 40, 50];
+    var s: i64 = 0;
+    for k in 0..5 {
+        s = s + arr[k];
+    }
+    println(s);
+    var m = [1, 2, 3, 4, 5];
+    for k in 0..5 {
+        m[k] = m[k] * 1;
+    }
+    var ms: i64 = 0;
+    for k in 0..5 {
+        ms = ms + m[k];
+    }
+    println(ms);
+    var w: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 100 {
+        w.push(i);
+        i = i + 1;
+    }
+    println(sum_vec(& w));
+    var sq: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 10 {
+        sq.push(i * i);
+        i = i + 1;
+    }
+    println(sum_vec(& sq));
+    var u: Vec<i64> = Vec::new();
+    u.push(5);
+    u.push(3);
+    u.push(9);
+    u.push(1);
+    u.push(8);
+    u.push(2);
+    sort(& mut u);
+    println(int_to_str(u.get(0)) + " " + int_to_str(u.get(1)) + " " + int_to_str(u.get(2)) + " " + int_to_str(u.get(3)) + " " + int_to_str(u.get(4)) + " " + int_to_str(u.get(5)));
+    var f: Vec<i64> = Vec::new();
+    i = 1;
+    while i <= 5 {
+        f.push(i);
+        i = i + 1;
+    }
+    var prod: i64 = 1;
+    i = 0;
+    while i < f.len() {
+        prod = prod * f.get(i);
+        i = i + 1;
+    }
+    println(prod);
+    bump_all(& mut sq, 4);
+    println(sum_vec(& sq) + odd_sum(& sq) - odd_sum(& sq));
+    println(f.get(0) * 42);
+    println(f.get(2));
+    println(odd_sum(& w) * 2 - odd_sum(& w) * 2 + 9900);
+    var tr: Trio = Trio { a: 4, b: 5, c: 6 };
+    println(trio_sum(&tr));
+    trio_set(&mut tr, 10);
+    println(trio_sum(&tr));
+    return 0;
+}

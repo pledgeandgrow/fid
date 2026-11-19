@@ -1,0 +1,80 @@
+// Competitive roadmap SL15: the sampling profiler a program drives itself
+// (stdlib/profiler.fd prof_start / prof_stop / prof_report / prof_samples).
+// The program burns about 400 ms in prof_burn (recursing a few levels, so
+// a C compiler cannot inline every copy into main) between prof_start and
+// prof_stop. Native (pe_ir on Windows: pe_runtime/conc.fd's sampler
+// thread; nat_ir: linux_runtime/sys.fd's SIGPROF or win.fd's thread) and C
+// (compiler/codegen_c.fd emit_prof_api_runtime) take one sample per ms of
+// CPU time; `fid run` counts calls (compiler/interp.fd interp_prof_count).
+// Either way some samples were taken, most of them with prof_burn on the
+// stack, none with a function that does not exist, and the count stays
+// put once stopped. The table goes to stderr (not checked here:
+// tests/prof/sl15-check.sh checks it).
+// Without the builtins the program does not build or run; with a sampler
+// that never fires "samples" is 0; with one that misnames frames
+// prof_burn is not on top.
+// Expected output:
+// start true
+// samples ok
+// burn on top
+// unknown 0
+// stopped ok
+// report ok
+use profiler;
+
+/// Some arithmetic the optimizer cannot fold away.
+fn prof_spin(x: i64) -> i64 {
+    var a: i64 = x;
+    var i: i64 = 0;
+    while i < 2000 {
+        a = (a * 31 + i) % 1000003;
+        i = i + 1;
+    }
+    return a;
+}
+
+/// depth more calls of itself, then spin until the clock passes `until`.
+fn prof_burn(depth: i64, until: i64) -> i64 {
+    if depth > 0 {
+        return prof_burn(depth - 1, until) + 1;
+    }
+    var acc: i64 = 1;
+    while p_clock_now_ms() < until {
+        acc = prof_spin(acc);
+    }
+    return acc % 7;
+}
+
+fn main() {
+    val started = prof_start();
+    if started {
+        println("start true");
+    } else {
+        println("start false");
+    }
+    val r = prof_burn(6, p_clock_now_ms() + 400);
+    val n = prof_stop();
+    val burn = prof_samples("prof_burn");
+    if n > 0 && r >= 0 {
+        println("samples ok");
+    } else {
+        println("samples " + int_to_str(n));
+    }
+    if burn * 2 >= n && burn > 0 {
+        println("burn on top");
+    } else {
+        println("burn " + int_to_str(burn) + " of " + int_to_str(n));
+    }
+    println("unknown " + int_to_str(prof_samples("no_such_function_here")));
+    // stopped: no more samples, however long the program runs on
+    val again = prof_burn(0, p_clock_now_ms() + 50);
+    val n2 = prof_stop();
+    if n2 == n && again >= 0 {
+        println("stopped ok");
+    } else {
+        println("stopped " + int_to_str(n) + " then " + int_to_str(n2));
+    }
+    if prof_report() == n {
+        println("report ok");
+    }
+}

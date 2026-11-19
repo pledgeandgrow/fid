@@ -1,0 +1,120 @@
+// Lab 3 solution: a calculator that reports overflow instead of panicking.
+//! lab: 3
+//! check: runs
+//! playground: yes
+
+enum CalcError {
+    Empty,
+    Underflow(op: str),
+    DivZero,
+    BadToken(tok: str),
+    Leftover(count: i64),
+    Overflow(op: str),
+}
+
+fn message(e: CalcError) -> str {
+    match e {
+        CalcError::Empty => { return "empty input"; }
+        CalcError::Underflow(op) => { return "'" + op + "' needs two operands"; }
+        CalcError::DivZero => { return "division by zero"; }
+        CalcError::BadToken(t) => { return "not a number or operator: '" + t + "'"; }
+        CalcError::Leftover(n) => { return int_to_str(n) + " values left on the stack"; }
+        CalcError::Overflow(op) => { return "'" + op + "' overflows i64"; }
+    }
+}
+
+fn max_i64() -> i64 { return 9223372036854775807; }
+fn min_i64() -> i64 { return 0 - 9223372036854775807 - 1; }
+
+fn checked_add(a: i64, b: i64) -> Result<i64, CalcError> {
+    if b > 0 && a > max_i64() - b { return Result::Err(CalcError::Overflow("+")); }
+    if b < 0 && a < min_i64() - b { return Result::Err(CalcError::Overflow("+")); }
+    return Result::Ok(a + b);
+}
+
+fn checked_sub(a: i64, b: i64) -> Result<i64, CalcError> {
+    if b < 0 && a > max_i64() + b { return Result::Err(CalcError::Overflow("-")); }
+    if b > 0 && a < min_i64() + b { return Result::Err(CalcError::Overflow("-")); }
+    return Result::Ok(a - b);
+}
+
+// The four sign cases of CERT INT32-C: each bound is a division that
+// cannot itself overflow, because neither divisor is -1 with MIN on top.
+fn checked_mul(a: i64, b: i64) -> Result<i64, CalcError> {
+    if a == 0 || b == 0 { return Result::Ok(0); }
+    var bad: bool = false;
+    if a > 0 {
+        if b > 0 { bad = a > max_i64() / b; } else { bad = b < min_i64() / a; }
+    } else {
+        if b > 0 { bad = a < min_i64() / b; } else { bad = a < max_i64() / b; }
+    }
+    if bad { return Result::Err(CalcError::Overflow("*")); }
+    return Result::Ok(a * b);
+}
+
+fn checked_div(a: i64, b: i64) -> Result<i64, CalcError> {
+    if b == 0 { return Result::Err(CalcError::DivZero); }
+    if a == min_i64() && b == -1 { return Result::Err(CalcError::Overflow("/")); }
+    return Result::Ok(a / b);
+}
+
+fn pop(stack: &mut Vec<i64>, op: str) -> Result<i64, CalcError> {
+    if stack.len() == 0 { return Result::Err(CalcError::Underflow(op)); }
+    return Result::Ok(stack.pop());
+}
+
+fn is_number(t: str) -> bool {
+    if str_len(t) == 0 { return false; }
+    var i: i64 = 0;
+    while i < str_len(t) {
+        val b: i64 = str_byte_at(t, i);
+        if b < '0' || b > '9' { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn apply(stack: &mut Vec<i64>, op: str) -> Result<i64, CalcError> {
+    val b: i64 = pop(stack, op)?;
+    val a: i64 = pop(stack, op)?;
+    if op == "+" { return checked_add(a, b); }
+    if op == "-" { return checked_sub(a, b); }
+    if op == "*" { return checked_mul(a, b); }
+    return checked_div(a, b);
+}
+
+fn eval(text: str) -> Result<i64, CalcError> {
+    var stack: Vec<i64> = Vec::new();
+    for t in str_split(text, " ") {
+        if t == "+" || t == "-" || t == "*" || t == "/" {
+            val r: i64 = apply(&mut stack, t)?;
+            stack.push(r);
+        } else if is_number(t) {
+            stack.push(str_parse_int(t));
+        } else {
+            return Result::Err(CalcError::BadToken(t));
+        }
+    }
+    if stack.len() == 0 { return Result::Err(CalcError::Empty); }
+    if stack.len() > 1 { return Result::Err(CalcError::Leftover(stack.len())); }
+    return Result::Ok(stack.get(0));
+}
+
+fn run(text: str) {
+    match eval(text) {
+        Result::Ok(v) => { println(text + "  =>  " + int_to_str(v)); }
+        Result::Err(e) => { println(text + "  =>  error: " + message(e)); }
+    }
+}
+
+fn main() -> i64 {
+    run("3 4 + 2 *");
+    run("5 0 /");
+    run("0 9223372036854775807 - 1 -");
+    run("9223372036854775807 1 +");
+    run("0 9223372036854775807 - 2 -");
+    run("3037000500 3037000500 *");
+    run("3037000499 3037000499 *");
+    run("0 9223372036854775807 - 1 - 0 1 - /");
+    return 0;
+}

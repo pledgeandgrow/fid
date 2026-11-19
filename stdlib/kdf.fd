@@ -1,0 +1,379 @@
+// Fides key derivation: HMAC over SHA-1, SHA-256 and SHA-512, HKDF
+// (RFC 5869), PBKDF2 (RFC 8018 §5.2), and scrypt (RFC 7914) with its
+// Salsa20/8 core and BlockMix/ROMix. SHA-1 (FIPS 180-4 §6.1) is written
+// here because the stdlib had none; it exists for HMAC-SHA1 (RFC 6070
+// PBKDF2 vectors, HOTP/TOTP in totp.fd) and must not be used as a
+// collision-resistant hash. SHA-256 comes from crypto.fd, SHA-512 from
+// sha512.fd.
+//
+// Pure computation, no platform seam. 32-bit words are kept in i64 values
+// masked to 0..2^32-1 after every addition, as in blake3.fd. Bytes are
+// Vec<i64>, one byte 0..255 per element. scrypt's memory is a Vec of
+// N * 32 * r words; cost grows with N * r * p (the RFC's N=16384 vectors
+// are meant for compiled code, not the interpreter).
+//
+// Checked against RFC 5869 (HKDF-SHA256 test cases 1-3), RFC 6070
+// (PBKDF2-HMAC-SHA1), RFC 7914 §11 (PBKDF2-HMAC-SHA256) and §12 (scrypt),
+// RFC 2202 (HMAC-SHA1) and FIPS 180 examples (SHA-1) in
+// tests/bootstrap/test_std_kdf.fd.
+//
+// Usage:
+//   use kdf;
+//   val okm = kdf_hkdf(KDF_SHA256, salt, ikm, info, 42);
+//   val dk = kdf_pbkdf2(KDF_SHA256, str_bytes("passwd"), str_bytes("salt"), 1, 64);
+//   val sk = kdf_scrypt(pw, salt, 16384, 8, 1, 32);
+
+module kdf;
+use vec;
+use crypto;
+use sha512;
+
+pub const KDF_SHA1: i64 = 1;
+pub const KDF_SHA256: i64 = 2;
+pub const KDF_SHA512: i64 = 3;
+
+// ─── SHA-1 ─────────────────────────────────────────────────────────────
+
+fn kdf_rotl32(x: i64, n: i64) -> i64 {
+    return ((x << n) | (x >> (32 - n))) & 0xffffffff;
+}
+
+/// SHA-1 of bytes: the 20-byte digest. Legacy use only (HMAC, OTP).
+pub fn kdf_sha1(msg: Vec<i64>) -> Vec<i64> {
+    val n: i64 = msg.len();
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { m.push(msg.get(i) & 255); i = i + 1; }
+    m.push(128);
+    while m.len() % 64 != 56 { m.push(0); }
+    val bits: i64 = n * 8;
+    i = 7;
+    while i >= 0 { m.push((bits >> (i * 8)) & 255); i = i - 1; }
+    var h0: i64 = 0x67452301;
+    var h1: i64 = 0xefcdab89;
+    var h2: i64 = 0x98badcfe;
+    var h3: i64 = 0x10325476;
+    var h4: i64 = 0xc3d2e1f0;
+    var w: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 80 { w.push(0); i = i + 1; }
+    var off: i64 = 0;
+    while off < m.len() {
+        i = 0;
+        while i < 16 {
+            val p: i64 = off + i * 4;
+            w.set(i, (m.get(p) << 24) | (m.get(p + 1) << 16) | (m.get(p + 2) << 8) | m.get(p + 3));
+            i = i + 1;
+        }
+        while i < 80 {
+            w.set(i, kdf_rotl32(w.get(i - 3) ^ w.get(i - 8) ^ w.get(i - 14) ^ w.get(i - 16), 1));
+            i = i + 1;
+        }
+        var a: i64 = h0;
+        var b: i64 = h1;
+        var c: i64 = h2;
+        var d: i64 = h3;
+        var e: i64 = h4;
+        i = 0;
+        while i < 80 {
+            var f: i64 = 0;
+            var k: i64 = 0;
+            if i < 20 {
+                f = (b & c) | ((b ^ 0xffffffff) & d);
+                k = 0x5a827999;
+            } else if i < 40 {
+                f = b ^ c ^ d;
+                k = 0x6ed9eba1;
+            } else if i < 60 {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8f1bbcdc;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xca62c1d6;
+            }
+            val t: i64 = (kdf_rotl32(a, 5) + f + e + k + w.get(i)) & 0xffffffff;
+            e = d;
+            d = c;
+            c = kdf_rotl32(b, 30);
+            b = a;
+            a = t;
+            i = i + 1;
+        }
+        h0 = (h0 + a) & 0xffffffff;
+        h1 = (h1 + b) & 0xffffffff;
+        h2 = (h2 + c) & 0xffffffff;
+        h3 = (h3 + d) & 0xffffffff;
+        h4 = (h4 + e) & 0xffffffff;
+        off = off + 64;
+    }
+    var out: Vec<i64> = Vec::new();
+    kdf_put32(& mut out, h0);
+    kdf_put32(& mut out, h1);
+    kdf_put32(& mut out, h2);
+    kdf_put32(& mut out, h3);
+    kdf_put32(& mut out, h4);
+    return out;
+}
+
+fn kdf_put32(out: & mut Vec<i64>, x: i64) {
+    out.push((x >> 24) & 255);
+    out.push((x >> 16) & 255);
+    out.push((x >> 8) & 255);
+    out.push(x & 255);
+}
+
+// ─── Hash dispatch and HMAC (RFC 2104) ─────────────────────────────────
+
+/// The digest of `msg` with hash `h` (KDF_SHA1, KDF_SHA256, KDF_SHA512).
+pub fn kdf_hash(h: i64, msg: Vec<i64>) -> Vec<i64> {
+    if h == KDF_SHA1 { return kdf_sha1(msg); }
+    if h == KDF_SHA512 { return sha512_bytes(msg); }
+    return crypto_sha256_bytes(msg);
+}
+
+/// Digest length in bytes.
+pub fn kdf_hash_len(h: i64) -> i64 {
+    if h == KDF_SHA1 { return 20; }
+    if h == KDF_SHA512 { return 64; }
+    return 32;
+}
+
+/// Block length in bytes (the HMAC key pad size).
+pub fn kdf_block_len(h: i64) -> i64 {
+    if h == KDF_SHA512 { return 128; }
+    return 64;
+}
+
+/// HMAC with hash `h`.
+pub fn kdf_hmac(h: i64, key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    val bl: i64 = kdf_block_len(h);
+    var kb: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    if key.len() > bl {
+        kb = kdf_hash(h, key);
+    } else {
+        while i < key.len() { kb.push(key.get(i) & 255); i = i + 1; }
+    }
+    while kb.len() < bl { kb.push(0); }
+    var inner: Vec<i64> = Vec::new();
+    i = 0;
+    while i < bl { inner.push(kb.get(i) ^ 0x36); i = i + 1; }
+    i = 0;
+    while i < msg.len() { inner.push(msg.get(i) & 255); i = i + 1; }
+    val ih: Vec<i64> = kdf_hash(h, inner);
+    var outer: Vec<i64> = Vec::new();
+    i = 0;
+    while i < bl { outer.push(kb.get(i) ^ 0x5c); i = i + 1; }
+    i = 0;
+    while i < ih.len() { outer.push(ih.get(i)); i = i + 1; }
+    return kdf_hash(h, outer);
+}
+
+/// HMAC-SHA1 (RFC 2202).
+pub fn kdf_hmac_sha1(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    return kdf_hmac(KDF_SHA1, key, msg);
+}
+
+/// HMAC-SHA256 (RFC 4231).
+pub fn kdf_hmac_sha256(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    return kdf_hmac(KDF_SHA256, key, msg);
+}
+
+/// HMAC-SHA512 (RFC 4231).
+pub fn kdf_hmac_sha512(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    return kdf_hmac(KDF_SHA512, key, msg);
+}
+
+// ─── HKDF (RFC 5869) ───────────────────────────────────────────────────
+
+/// HKDF-Extract: PRK = HMAC(salt, IKM). An empty salt is HashLen zeros.
+pub fn kdf_hkdf_extract(h: i64, salt: Vec<i64>, ikm: Vec<i64>) -> Vec<i64> {
+    var s: Vec<i64> = salt;
+    if s.len() == 0 {
+        var i: i64 = 0;
+        while i < kdf_hash_len(h) { s.push(0); i = i + 1; }
+    }
+    return kdf_hmac(h, s, ikm);
+}
+
+/// HKDF-Expand: `len` bytes (at most 255 * HashLen; more gives empty).
+pub fn kdf_hkdf_expand(h: i64, prk: Vec<i64>, info: Vec<i64>, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if len > 255 * kdf_hash_len(h) || len < 0 { return out; }
+    var t: Vec<i64> = Vec::new();
+    var counter: i64 = 1;
+    while out.len() < len {
+        var m: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < t.len() { m.push(t.get(i)); i = i + 1; }
+        i = 0;
+        while i < info.len() { m.push(info.get(i) & 255); i = i + 1; }
+        m.push(counter);
+        t = kdf_hmac(h, prk, m);
+        i = 0;
+        while i < t.len() && out.len() < len { out.push(t.get(i)); i = i + 1; }
+        counter = counter + 1;
+    }
+    return out;
+}
+
+/// HKDF: Extract then Expand.
+pub fn kdf_hkdf(h: i64, salt: Vec<i64>, ikm: Vec<i64>, info: Vec<i64>, len: i64) -> Vec<i64> {
+    return kdf_hkdf_expand(h, kdf_hkdf_extract(h, salt, ikm), info, len);
+}
+
+// ─── PBKDF2 (RFC 8018 §5.2) ────────────────────────────────────────────
+
+/// PBKDF2 with HMAC over hash `h`: `len` bytes, `iterations` >= 1.
+pub fn kdf_pbkdf2(h: i64, password: Vec<i64>, salt: Vec<i64>, iterations: i64, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val hl: i64 = kdf_hash_len(h);
+    var block: i64 = 1;
+    while out.len() < len {
+        var m: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < salt.len() { m.push(salt.get(i) & 255); i = i + 1; }
+        kdf_put32(& mut m, block);
+        var u: Vec<i64> = kdf_hmac(h, password, m);
+        var t: Vec<i64> = Vec::new();
+        i = 0;
+        while i < hl { t.push(u.get(i)); i = i + 1; }
+        var r: i64 = 1;
+        while r < iterations {
+            u = kdf_hmac(h, password, u);
+            i = 0;
+            while i < hl { t.set(i, t.get(i) ^ u.get(i)); i = i + 1; }
+            r = r + 1;
+        }
+        i = 0;
+        while i < hl && out.len() < len { out.push(t.get(i)); i = i + 1; }
+        block = block + 1;
+    }
+    return out;
+}
+
+// ─── scrypt (RFC 7914) ─────────────────────────────────────────────────
+
+/// Salsa20/8 core on 16 words at x[off..off+16], in place (RFC 7914 §3).
+pub fn kdf_salsa20_8(x: & mut Vec<i64>, off: i64) {
+    var z: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { z.push(x.get(off + i)); i = i + 1; }
+    var r: i64 = 0;
+    while r < 8 {
+        kdf_qr(& mut z, 4, 0, 12, 7); kdf_qr(& mut z, 8, 4, 0, 9);
+        kdf_qr(& mut z, 12, 8, 4, 13); kdf_qr(& mut z, 0, 12, 8, 18);
+        kdf_qr(& mut z, 9, 5, 1, 7); kdf_qr(& mut z, 13, 9, 5, 9);
+        kdf_qr(& mut z, 1, 13, 9, 13); kdf_qr(& mut z, 5, 1, 13, 18);
+        kdf_qr(& mut z, 14, 10, 6, 7); kdf_qr(& mut z, 2, 14, 10, 9);
+        kdf_qr(& mut z, 6, 2, 14, 13); kdf_qr(& mut z, 10, 6, 2, 18);
+        kdf_qr(& mut z, 3, 15, 11, 7); kdf_qr(& mut z, 7, 3, 15, 9);
+        kdf_qr(& mut z, 11, 7, 3, 13); kdf_qr(& mut z, 15, 11, 7, 18);
+        kdf_qr(& mut z, 1, 0, 3, 7); kdf_qr(& mut z, 2, 1, 0, 9);
+        kdf_qr(& mut z, 3, 2, 1, 13); kdf_qr(& mut z, 0, 3, 2, 18);
+        kdf_qr(& mut z, 6, 5, 4, 7); kdf_qr(& mut z, 7, 6, 5, 9);
+        kdf_qr(& mut z, 4, 7, 6, 13); kdf_qr(& mut z, 5, 4, 7, 18);
+        kdf_qr(& mut z, 11, 10, 9, 7); kdf_qr(& mut z, 8, 11, 10, 9);
+        kdf_qr(& mut z, 9, 8, 11, 13); kdf_qr(& mut z, 10, 9, 8, 18);
+        kdf_qr(& mut z, 12, 15, 14, 7); kdf_qr(& mut z, 13, 12, 15, 9);
+        kdf_qr(& mut z, 14, 13, 12, 13); kdf_qr(& mut z, 15, 14, 13, 18);
+        r = r + 2;
+    }
+    i = 0;
+    while i < 16 {
+        x.set(off + i, (x.get(off + i) + z.get(i)) & 0xffffffff);
+        i = i + 1;
+    }
+}
+
+/// z[t] ^= rotl(z[a] + z[b], n)
+fn kdf_qr(z: & mut Vec<i64>, t: i64, a: i64, b: i64, n: i64) {
+    z.set(t, z.get(t) ^ kdf_rotl32((z.get(a) + z.get(b)) & 0xffffffff, n));
+}
+
+/// scryptBlockMix on 2r 16-word blocks b[off..off+32r]; y is scratch of
+/// 32r words. The result replaces the input.
+fn kdf_block_mix(b: & mut Vec<i64>, off: i64, r: i64, y: & mut Vec<i64>) {
+    var x: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { x.push(b.get(off + (2 * r - 1) * 16 + i)); i = i + 1; }
+    var j: i64 = 0;
+    while j < 2 * r {
+        i = 0;
+        while i < 16 {
+            x.set(i, x.get(i) ^ b.get(off + j * 16 + i));
+            i = i + 1;
+        }
+        kdf_salsa20_8(& mut x, 0);
+        // Even blocks go to the first half, odd ones to the second.
+        var dst: i64 = (j / 2) * 16;
+        if j % 2 == 1 { dst = (r + j / 2) * 16; }
+        i = 0;
+        while i < 16 { y.set(dst + i, x.get(i)); i = i + 1; }
+        j = j + 1;
+    }
+    i = 0;
+    while i < 32 * r { b.set(off + i, y.get(i)); i = i + 1; }
+}
+
+/// scryptROMix on one 128r-byte block given as 32r words at b[off..].
+fn kdf_ro_mix(b: & mut Vec<i64>, off: i64, r: i64, n: i64) {
+    val w: i64 = 32 * r;
+    var x: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < w { x.push(b.get(off + i)); i = i + 1; }
+    var y: Vec<i64> = Vec::new();
+    i = 0;
+    while i < w { y.push(0); i = i + 1; }
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < n {
+        i = 0;
+        while i < w { v.push(x.get(i)); i = i + 1; }
+        kdf_block_mix(& mut x, 0, r, & mut y);
+        k = k + 1;
+    }
+    k = 0;
+    while k < n {
+        val jj: i64 = x.get((2 * r - 1) * 16) & (n - 1);
+        val base: i64 = jj * w;
+        i = 0;
+        while i < w { x.set(i, x.get(i) ^ v.get(base + i)); i = i + 1; }
+        kdf_block_mix(& mut x, 0, r, & mut y);
+        k = k + 1;
+    }
+    i = 0;
+    while i < w { b.set(off + i, x.get(i)); i = i + 1; }
+}
+
+/// scrypt(P, S, N, r, p, dkLen). N must be a power of two above 1; r and
+/// p at least 1. Returns empty bytes on bad parameters.
+pub fn kdf_scrypt(password: Vec<i64>, salt: Vec<i64>, n: i64, r: i64, p: i64, len: i64) -> Vec<i64> {
+    if n < 2 || (n & (n - 1)) != 0 || r < 1 || p < 1 || len < 1 {
+        return Vec::new();
+    }
+    val bytes: Vec<i64> = kdf_pbkdf2(KDF_SHA256, password, salt, 1, p * 128 * r);
+    // Bytes to little-endian words.
+    var words: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < bytes.len() {
+        words.push(bytes.get(i) | (bytes.get(i + 1) << 8) | (bytes.get(i + 2) << 16) | (bytes.get(i + 3) << 24));
+        i = i + 4;
+    }
+    var blk: i64 = 0;
+    while blk < p {
+        kdf_ro_mix(& mut words, blk * 32 * r, r, n);
+        blk = blk + 1;
+    }
+    var mixed: Vec<i64> = Vec::new();
+    i = 0;
+    while i < words.len() {
+        val x: i64 = words.get(i);
+        mixed.push(x & 255);
+        mixed.push((x >> 8) & 255);
+        mixed.push((x >> 16) & 255);
+        mixed.push((x >> 24) & 255);
+        i = i + 1;
+    }
+    return kdf_pbkdf2(KDF_SHA256, password, mixed, 1, len);
+}

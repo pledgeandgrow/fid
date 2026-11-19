@@ -1,0 +1,161 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG9), the machine layer: RVC,
+// RISC-V's 2-byte instructions (compiler/nat_enc.fd nat_rvc_compress after
+// layout, compiler/nat_ir.fd ng_rvc_pass; FID_NAT_ON=rvc or --size). The
+// program prints the same on every backend; built for riscv64-linux with
+// RVC (tests/nattools/rvc_check.sh) it runs code where many words became
+// 2 bytes between the words that keep 4 and must still reach their
+// targets:
+//   checked    overflow and division checks: a branch by a constant
+//              offset over the panic call (no fixup: the pass moves it)
+//   digits     a dense match: a jump table (data words in the code, each
+//              re-aligned to 4 bytes after 2-byte instructions)
+//   sum_sq /   loops, calls, a Vec, frames with saved registers (c.ldsp,
+//   fsum       c.sdsp), f64 values loaded and stored (c.fld, c.fsd)
+//   deep       a frame larger than the 2-byte forms reach (sp offsets
+//              over 504 keep their 4-byte words)
+//   ping/pong  mutual recursion (tail jumps between compressed functions)
+// Expected output:
+// 5050
+// 338350
+// 11
+// 1
+// 10
+// zero one two three four five six seven eight nine
+// other
+// 15
+// 440
+// 1
+// 0
+// 120
+// 40320
+
+fn checked(a: i64, b: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = a;
+    while i <= b {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sum_sq(n: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= n {
+        v.push(i * i);
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    var k: i64 = 0;
+    while k < v.len() {
+        s = s + v.get(k);
+        k = k + 1;
+    }
+    return s;
+}
+
+fn divs(a: i64, b: i64) -> i64 {
+    return a / b + a % b;
+}
+
+fn digit(d: i64) -> str {
+    match d {
+        0 => { return "zero"; }
+        1 => { return "one"; }
+        2 => { return "two"; }
+        3 => { return "three"; }
+        4 => { return "four"; }
+        5 => { return "five"; }
+        6 => { return "six"; }
+        7 => { return "seven"; }
+        8 => { return "eight"; }
+        9 => { return "nine"; }
+        _ => { return "other"; }
+    }
+}
+
+fn fsum(n: i64) -> f64 {
+    var s: f64 = 0.0;
+    var x: f64 = 0.5;
+    var i: i64 = 0;
+    while i < n {
+        s = s + x;
+        x = x + 1.0;
+        i = i + 1;
+    }
+    return s;
+}
+
+struct Oct { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64 }
+
+fn oct_sum(t: &Oct) -> i64 {
+    return t.a + t.b + t.c + t.d + t.e + t.f + t.g + t.h;
+}
+
+fn oct(v: i64) -> Oct {
+    return Oct { a: v, b: v, c: v, d: v, e: v, f: v, g: v, h: v };
+}
+
+// ten 64-byte structs in memory (their addresses go to oct_sum): a frame
+// of more than 504 bytes
+fn deep(n: i64) -> i64 {
+    var t0: Oct = oct(n);
+    var t1: Oct = oct(2 * n);
+    var t2: Oct = oct(3 * n);
+    var t3: Oct = oct(4 * n);
+    var t4: Oct = oct(5 * n);
+    var t5: Oct = oct(6 * n);
+    var t6: Oct = oct(7 * n);
+    var t7: Oct = oct(8 * n);
+    var t8: Oct = oct(9 * n);
+    var t9: Oct = oct(10 * n);
+    var s: i64 = oct_sum(&t9) + oct_sum(&t8) + oct_sum(&t7) + oct_sum(&t6) + oct_sum(&t5);
+    return s + oct_sum(&t4) + oct_sum(&t3) + oct_sum(&t2) + oct_sum(&t1) + oct_sum(&t0);
+}
+
+fn ping(n: i64) -> i64 {
+    if n == 0 {
+        return 1;
+    }
+    return pong(n - 1);
+}
+
+fn pong(n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    return ping(n - 1);
+}
+
+fn fact(n: i64) -> i64 {
+    if n <= 1 {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+fn main() {
+    println(int_to_str(checked(1, 100)));
+    println(int_to_str(sum_sq(100)));
+    println(int_to_str(divs(47, 7)));
+    println(int_to_str(divs(-7, 4) + 5));
+    println(int_to_str(divs(1000, 111)));
+    var line: str = "";
+    var d: i64 = 0;
+    while d < 10 {
+        if d > 0 {
+            line = line + " ";
+        }
+        line = line + digit(d);
+        d = d + 1;
+    }
+    println(line);
+    println(digit(42));
+    println(int_to_str((fsum(4) * 2.0) as i64 - 1));
+    println(int_to_str(deep(1)));
+    println(int_to_str(ping(100)));
+    println(int_to_str(ping(101)));
+    println(int_to_str(fact(5)));
+    println(int_to_str(fact(8)));
+}

@@ -1,0 +1,822 @@
+// Fides netcode: rollback netcode for peer-to-peer games, snapshot
+// interpolation, delta compression of state, and a reliable ordered
+// message channel over an unreliable packet link.
+//
+// Everything here is pure computation; nothing touches a socket. The seams:
+//   - the game: an NcGame of three function values over an instance handle
+//     (save(h) -> state words, load(h, state), advance(h, inputs)); the
+//     game keeps its state wherever it likes (usually a global table
+//     indexed by the handle). The simulation must be deterministic.
+//   - the network: NcChannel turns messages into packet bytes
+//     (nc_channel_build_packet) and takes received packet bytes
+//     (nc_channel_receive); the caller moves those bytes over UDP (stdlib
+//     net) or anything else that may drop, delay, duplicate or reorder them.
+//
+// Rollback (GGPO style): every peer simulates every frame at once with its
+// own input and a prediction (the last input received) for the others. A
+// snapshot is saved before each frame. When a remote input arrives for a
+// frame already simulated with a different prediction, the session loads
+// the snapshot of that frame and simulates forward again with what it
+// knows now. A peer that runs more than `max_prediction` frames ahead of
+// the last frame confirmed for every player stalls (nc_session_advance
+// returns false) until inputs arrive.
+//
+// Reliable channel: each packet carries a 16-bit sequence number, the
+// newest sequence received from the other side and a 32-bit field of the
+// 32 before it (acks), then whole messages (16-bit id, 16-bit length,
+// bytes). A message is resent every `resend_after` ticks until a packet
+// that carried it is acknowledged; the receiver drops duplicates and
+// delivers in id order.
+//   packet = flags u8 (bit 0: ack fields valid) | seq u16 | ack u16 |
+//            ack_bits u32 | count u8 | count x (id u16 | len u16 | bytes)
+//   (all big-endian)
+//
+// Delta compression: cur XOR base (base zero-extended), then zero runs as
+// two bytes (0, run-1) and other bytes as themselves, after a LEB128
+// varint of cur's length. Bytes are i64 0..255.
+//
+// Usage:
+//   use netcode;
+//   var s: NcSession = nc_session_new(game, handle, 2, local_player, 8, 0);
+//   val f: i64 = nc_session_add_local_input(&mut s, my_input);
+//   // send (f, my_input) to the peer; on receipt:
+//   nc_session_add_remote_input(&mut s, 1, frame, input);
+//   if nc_session_advance(&mut s) { render }
+
+module netcode;
+use vec;
+
+// ─── Game seam ─────────────────────────────────────────────────────────────
+
+/// The game as the rollback session sees it. `h` is the game instance.
+pub struct NcGame {
+    pub save: fn(i64) -> Vec<i64>,
+    pub load: fn(i64, Vec<i64>) -> void,
+    pub advance: fn(i64, Vec<i64>) -> void,
+}
+
+pub fn nc_game(save: fn(i64) -> Vec<i64>, load: fn(i64, Vec<i64>) -> void, advance: fn(i64, Vec<i64>) -> void) -> NcGame {
+    return NcGame { save: save, load: load, advance: advance };
+}
+
+/// FNV-1a 64 over the words of a state (each word as 8 bytes, LE).
+@wrapping
+pub fn nc_checksum(state: &Vec<i64>) -> i64 {
+    var h: i64 = 0xcbf29ce484222325;
+    var i: i64 = 0;
+    while i < state.len() {
+        val w: i64 = state.get(i);
+        var k: i64 = 0;
+        while k < 8 {
+            h = h ^ ((w >> (8 * k)) & 255);
+            h = h * 0x100000001b3;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return h;
+}
+
+// ─── Rollback session ──────────────────────────────────────────────────────
+
+pub struct NcSession {
+    pub game: NcGame,
+    pub handle: i64,
+    pub players: i64,
+    pub local: i64,
+    pub delay: i64,
+    pub max_prediction: i64,
+    /// The next frame to simulate.
+    pub frame: i64,
+    /// Every player's input is known for all frames below this one.
+    pub confirmed: i64,
+    pub ring: i64,
+    in_frame: Vec<i64>,
+    in_val: Vec<i64>,
+    used_frame: Vec<i64>,
+    used_val: Vec<i64>,
+    snap: Vec<Vec<i64>>,
+    snap_frame: Vec<i64>,
+    /// Per player: every frame below this one has its input.
+    pub contiguous: Vec<i64>,
+    /// Earliest frame to simulate again, -1 when none.
+    pub rollback_from: i64,
+    pub rollbacks: i64,
+    pub resimulated: i64,
+    pub stalls: i64,
+    pub next_local: i64,
+}
+
+/// A session for `players` players, this peer being `local`. Frames below
+/// `delay` have input 0 for everyone (local input is scheduled `delay`
+/// frames ahead; every peer must use the same delay).
+pub fn nc_session_new(game: NcGame, handle: i64, players: i64, local: i64, max_prediction: i64, delay: i64) -> NcSession {
+    val ring: i64 = 2 * max_prediction + delay + 8;
+    var s: NcSession = NcSession {
+        game: game, handle: handle, players: players, local: local, delay: delay,
+        max_prediction: max_prediction, frame: 0, confirmed: 0, ring: ring,
+        in_frame: Vec::filled(players * ring, - 1), in_val: Vec::filled(players * ring, 0),
+        used_frame: Vec::filled(players * ring, - 1), used_val: Vec::filled(players * ring, 0),
+        snap: Vec::new(), snap_frame: Vec::filled(ring, - 1),
+        contiguous: Vec::filled(players, 0), rollback_from: - 1,
+        rollbacks: 0, resimulated: 0, stalls: 0, next_local: delay,
+    };
+    var i: i64 = 0;
+    while i < ring {
+        s.snap.push(Vec::new());
+        i = i + 1;
+    }
+    var p: i64 = 0;
+    while p < players {
+        var f: i64 = 0;
+        while f < delay {
+            nc_store_input(&mut s, p, f, 0);
+            f = f + 1;
+        }
+        p = p + 1;
+    }
+    nc_update_confirmed(&mut s);
+    return s;
+}
+
+fn nc_slot(s: &NcSession, p: i64, f: i64) -> i64 {
+    return p * s.ring + (f % s.ring);
+}
+
+/// Is the input of player p at frame f known?
+pub fn nc_input_known(s: &NcSession, p: i64, f: i64) -> bool {
+    if f < 0 {
+        return false;
+    }
+    return s.in_frame.get(nc_slot(s, p, f)) == f;
+}
+
+fn nc_store_input(s: &mut NcSession, p: i64, f: i64, v: i64) {
+    val k: i64 = nc_slot(s, p, f);
+    s.in_frame.set(k, f);
+    s.in_val.set(k, v);
+    var c: i64 = s.contiguous.get(p);
+    while nc_input_known(s, p, c) {
+        c = c + 1;
+    }
+    s.contiguous.set(p, c);
+}
+
+fn nc_update_confirmed(s: &mut NcSession) {
+    var m: i64 = s.contiguous.get(0);
+    var p: i64 = 1;
+    while p < s.players {
+        if s.contiguous.get(p) < m {
+            m = s.contiguous.get(p);
+        }
+        p = p + 1;
+    }
+    s.confirmed = m;
+}
+
+/// The input to use for player p at frame f: the real one when known,
+/// else the newest known input before f (searching back over the window),
+/// else 0.
+pub fn nc_input_for(s: &NcSession, p: i64, f: i64) -> i64 {
+    if nc_input_known(s, p, f) {
+        return s.in_val.get(nc_slot(s, p, f));
+    }
+    var g: i64 = f - 1;
+    val lo: i64 = f - s.ring + 1;
+    while g >= 0 && g >= lo {
+        if nc_input_known(s, p, g) {
+            return s.in_val.get(nc_slot(s, p, g));
+        }
+        g = g - 1;
+    }
+    return 0;
+}
+
+/// Was frame f simulated with a guess for player p (no real input yet)?
+pub fn nc_input_predicted(s: &NcSession, p: i64, f: i64) -> bool {
+    return f < s.frame && !nc_input_known(s, p, f);
+}
+
+// Inputs are kept for frames from here on (a ring of `ring` frames).
+fn nc_window_base(s: &NcSession) -> i64 {
+    if s.confirmed < s.frame {
+        return s.confirmed;
+    }
+    return s.frame;
+}
+
+/// Schedule this peer's input; returns the frame it belongs to (send the
+/// pair to the other peers). Returns -1 when that frame is too far ahead.
+pub fn nc_session_add_local_input(s: &mut NcSession, v: i64) -> i64 {
+    val f: i64 = s.next_local;
+    if f >= nc_window_base(s) + s.ring - 1 {
+        return - 1;
+    }
+    nc_store_input(s, s.local, f, v);
+    s.next_local = f + 1;
+    nc_update_confirmed(s);
+    return f;
+}
+
+/// A remote player's input for frame f. Returns false when it is refused
+/// (outside the window); duplicates are accepted and ignored.
+pub fn nc_session_add_remote_input(s: &mut NcSession, p: i64, f: i64, v: i64) -> bool {
+    if p < 0 || p >= s.players || p == s.local || f < 0 {
+        return false;
+    }
+    if f < s.confirmed {
+        return true;
+    }
+    if f >= nc_window_base(s) + s.ring - 1 {
+        return false;
+    }
+    if nc_input_known(s, p, f) {
+        return true;
+    }
+    nc_store_input(s, p, f, v);
+    nc_update_confirmed(s);
+    if f < s.frame {
+        val k: i64 = nc_slot(s, p, f);
+        if s.used_frame.get(k) != f || s.used_val.get(k) != v {
+            if s.rollback_from < 0 || f < s.rollback_from {
+                s.rollback_from = f;
+            }
+        }
+    }
+    return true;
+}
+
+fn nc_simulate_one(s: &mut NcSession) {
+    val f: i64 = s.frame;
+    val save = s.game.save;
+    val adv = s.game.advance;
+    val slot: i64 = f % s.ring;
+    s.snap.set(slot, save(s.handle));
+    s.snap_frame.set(slot, f);
+    var inputs: Vec<i64> = Vec::new();
+    var p: i64 = 0;
+    while p < s.players {
+        val v: i64 = nc_input_for(s, p, f);
+        val k: i64 = nc_slot(s, p, f);
+        s.used_frame.set(k, f);
+        s.used_val.set(k, v);
+        inputs.push(v);
+        p = p + 1;
+    }
+    adv(s.handle, inputs);
+    s.frame = f + 1;
+}
+
+/// Simulate again from a pending rollback point up to the current frame.
+/// Returns the number of frames simulated again.
+pub fn nc_session_resolve(s: &mut NcSession) -> i64 {
+    if s.rollback_from < 0 {
+        return 0;
+    }
+    val from: i64 = s.rollback_from;
+    val target: i64 = s.frame;
+    s.rollback_from = - 1;
+    val slot: i64 = from % s.ring;
+    if s.snap_frame.get(slot) != from {
+        // cannot happen while frame - confirmed < ring
+        panic("netcode: snapshot of frame " + int_to_str(from) + " lost");
+    }
+    val load = s.game.load;
+    load(s.handle, s.snap.get(slot));
+    s.frame = from;
+    while s.frame < target {
+        nc_simulate_one(s);
+    }
+    s.rollbacks = s.rollbacks + 1;
+    s.resimulated = s.resimulated + (target - from);
+    return target - from;
+}
+
+/// Roll back if needed, then simulate the current frame. Returns false
+/// (and simulates nothing new) when the prediction window is full or this
+/// peer's own input for the frame is missing.
+pub fn nc_session_advance(s: &mut NcSession) -> bool {
+    nc_session_resolve(s);
+    if s.frame - s.confirmed >= s.max_prediction || !nc_input_known(s, s.local, s.frame) {
+        s.stalls = s.stalls + 1;
+        return false;
+    }
+    nc_simulate_one(s);
+    return true;
+}
+
+/// Frames simulated ahead of the confirmed frame (how much is a guess).
+pub fn nc_session_lead(s: &NcSession) -> i64 {
+    return s.frame - s.confirmed;
+}
+
+// ─── Snapshot interpolation ────────────────────────────────────────────────
+
+/// Snapshots received from a server (time, values), kept in time order.
+pub struct NcInterp {
+    pub times: Vec<f64>,
+    pub values: Vec<Vec<f64>>,
+    pub cap: i64,
+}
+
+pub fn nc_interp_new(cap: i64) -> NcInterp {
+    return NcInterp { times: Vec::new(), values: Vec::new(), cap: cap };
+}
+
+/// Add a snapshot; out-of-order ones go to their place, an equal time
+/// replaces, the oldest drops beyond `cap`.
+pub fn nc_interp_push(b: &mut NcInterp, t: f64, vals: Vec<f64>) {
+    var i: i64 = b.times.len();
+    while i > 0 && b.times.get(i - 1) > t {
+        i = i - 1;
+    }
+    if i > 0 && b.times.get(i - 1) == t {
+        b.values.set(i - 1, vals);
+        return;
+    }
+    b.times.insert(i, t);
+    b.values.insert(i, vals);
+    while b.times.len() > b.cap {
+        b.times.remove(0);
+        b.values.remove(0);
+    }
+}
+
+/// The values at time t: linear between the two snapshots around t, the
+/// first or last snapshot outside them (no extrapolation), empty when there
+/// is none.
+pub fn nc_interp_sample(b: &NcInterp, t: f64) -> Vec<f64> {
+    val n: i64 = b.times.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if t <= b.times.get(0) {
+        return b.values.get(0);
+    }
+    if t >= b.times.get(n - 1) {
+        return b.values.get(n - 1);
+    }
+    var i: i64 = 1;
+    while b.times.get(i) < t {
+        i = i + 1;
+    }
+    val t0: f64 = b.times.get(i - 1);
+    val t1: f64 = b.times.get(i);
+    val a: f64 = (t - t0) / (t1 - t0);
+    val v0: Vec<f64> = b.values.get(i - 1);
+    val v1: Vec<f64> = b.values.get(i);
+    var out: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    while k < v0.len() && k < v1.len() {
+        out.push(v0.get(k) + (v1.get(k) - v0.get(k)) * a);
+        k = k + 1;
+    }
+    return out;
+}
+
+// ─── Delta compression ─────────────────────────────────────────────────────
+
+/// Words as bytes (8 per word, little-endian).
+pub fn nc_words_to_bytes(w: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < w.len() {
+        val x: i64 = w.get(i);
+        var k: i64 = 0;
+        while k < 8 {
+            out.push((x >> (8 * k)) & 255);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+@wrapping
+pub fn nc_bytes_to_words(b: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 8 <= b.len() {
+        var x: i64 = 0;
+        var k: i64 = 7;
+        while k >= 0 {
+            x = (x << 8) | b.get(i + k);
+            k = k - 1;
+        }
+        out.push(x);
+        i = i + 8;
+    }
+    return out;
+}
+
+fn nc_put_varint(out: &mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    while x >= 128 {
+        out.push((x & 127) | 128);
+        x = x >> 7;
+    }
+    out.push(x);
+}
+
+/// cur against base: varint length, then XOR bytes with zero runs folded.
+pub fn nc_delta_encode(base: &Vec<i64>, cur: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    nc_put_varint(&mut out, cur.len());
+    var i: i64 = 0;
+    while i < cur.len() {
+        var b: i64 = 0;
+        if i < base.len() {
+            b = base.get(i);
+        }
+        val x: i64 = (cur.get(i) ^ b) & 255;
+        if x != 0 {
+            out.push(x);
+            i = i + 1;
+        } else {
+            var run: i64 = 0;
+            while i < cur.len() && run < 256 {
+                var bb: i64 = 0;
+                if i < base.len() {
+                    bb = base.get(i);
+                }
+                if ((cur.get(i) ^ bb) & 255) != 0 {
+                    break;
+                }
+                run = run + 1;
+                i = i + 1;
+            }
+            out.push(0);
+            out.push(run - 1);
+        }
+    }
+    return out;
+}
+
+/// Inverse of nc_delta_encode. Err on truncated or overlong input.
+pub fn nc_delta_decode(base: &Vec<i64>, d: &Vec<i64>) -> Result<Vec<i64>, str> {
+    var pos: i64 = 0;
+    var n: i64 = 0;
+    var shift: i64 = 0;
+    while true {
+        if pos >= d.len() || shift > 56 {
+            return Result::Err("delta: bad length");
+        }
+        val b: i64 = d.get(pos);
+        pos = pos + 1;
+        n = n | ((b & 127) << shift);
+        shift = shift + 7;
+        if b < 128 {
+            break;
+        }
+    }
+    var out: Vec<i64> = Vec::new();
+    while out.len() < n {
+        if pos >= d.len() {
+            return Result::Err("delta: truncated");
+        }
+        val t: i64 = d.get(pos);
+        pos = pos + 1;
+        if t != 0 {
+            val i: i64 = out.len();
+            var b: i64 = 0;
+            if i < base.len() {
+                b = base.get(i);
+            }
+            out.push((t ^ b) & 255);
+        } else {
+            if pos >= d.len() {
+                return Result::Err("delta: truncated run");
+            }
+            val run: i64 = d.get(pos) + 1;
+            pos = pos + 1;
+            if out.len() + run > n {
+                return Result::Err("delta: run past the end");
+            }
+            var k: i64 = 0;
+            while k < run {
+                val i: i64 = out.len();
+                var b: i64 = 0;
+                if i < base.len() {
+                    b = base.get(i);
+                }
+                out.push(b);
+                k = k + 1;
+            }
+        }
+    }
+    if pos != d.len() {
+        return Result::Err("delta: trailing bytes");
+    }
+    return Result::Ok(out);
+}
+
+// ─── Sequence numbers ──────────────────────────────────────────────────────
+
+/// Is 16-bit sequence a newer than b (with wrap-around)?
+pub fn nc_seq_newer(a: i64, b: i64) -> bool {
+    val d: i64 = (a - b) & 0xFFFF;
+    return d != 0 && d < 0x8000;
+}
+
+/// a - b for 16-bit sequences, in -32768..32767.
+pub fn nc_seq_diff(a: i64, b: i64) -> i64 {
+    var d: i64 = (a - b) & 0xFFFF;
+    if d >= 0x8000 {
+        d = d - 0x10000;
+    }
+    return d;
+}
+
+// ─── Reliable ordered channel ──────────────────────────────────────────────
+
+pub struct NcChannel {
+    pub local_seq: i64,
+    pub remote_seq: i64,
+    pub recv_bits: i64,
+    pub next_send_id: i64,
+    out_id: Vec<i64>,
+    out_data: Vec<Vec<i64>>,
+    out_sent_at: Vec<i64>,
+    out_acked: Vec<bool>,
+    flight_seq: Vec<i64>,
+    flight_ids: Vec<Vec<i64>>,
+    pub next_recv_id: i64,
+    pend_id: Vec<i64>,
+    pend_data: Vec<Vec<i64>>,
+    delivered: Vec<Vec<i64>>,
+    pub resend_after: i64,
+    pub max_packet: i64,
+    pub packets_sent: i64,
+    pub packets_received: i64,
+    pub resends: i64,
+    pub duplicates: i64,
+    pub bad_packets: i64,
+}
+
+pub const NC_HEADER_LEN: i64 = 10;
+
+/// A channel resending unacknowledged messages every `resend_after` ticks,
+/// packets at most `max_packet` bytes (a message must fit in one).
+pub fn nc_channel_new(resend_after: i64, max_packet: i64) -> NcChannel {
+    return NcChannel {
+        local_seq: 0, remote_seq: - 1, recv_bits: 0, next_send_id: 0,
+        out_id: Vec::new(), out_data: Vec::new(), out_sent_at: Vec::new(), out_acked: Vec::new(),
+        flight_seq: Vec::new(), flight_ids: Vec::new(),
+        next_recv_id: 0, pend_id: Vec::new(), pend_data: Vec::new(), delivered: Vec::new(),
+        resend_after: resend_after, max_packet: max_packet,
+        packets_sent: 0, packets_received: 0, resends: 0, duplicates: 0, bad_packets: 0,
+    };
+}
+
+/// Queue a message; returns its id. Err when it can never fit a packet.
+pub fn nc_channel_send(c: &mut NcChannel, msg: Vec<i64>) -> Result<i64, str> {
+    if msg.len() + 4 + NC_HEADER_LEN > c.max_packet || msg.len() > 0xFFFF {
+        return Result::Err("message too large for a packet");
+    }
+    val id: i64 = c.next_send_id;
+    c.next_send_id = id + 1;
+    c.out_id.push(id);
+    c.out_data.push(msg);
+    c.out_sent_at.push(- 1);
+    c.out_acked.push(false);
+    return Result::Ok(id);
+}
+
+/// Messages queued and not yet acknowledged.
+pub fn nc_channel_unacked(c: &NcChannel) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < c.out_acked.len() {
+        if !c.out_acked.get(i) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn nc_put16(out: &mut Vec<i64>, v: i64) {
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn nc_get16(b: &Vec<i64>, at: i64) -> i64 {
+    return (b.get(at) << 8) | b.get(at + 1);
+}
+
+/// The next packet to send at time `now`: acks plus every message that was
+/// never sent or was sent `resend_after` ticks ago or more, oldest first.
+pub fn nc_channel_build_packet(c: &mut NcChannel, now: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if c.remote_seq >= 0 {
+        out.push(1);
+    } else {
+        out.push(0);
+    }
+    val seq: i64 = c.local_seq;
+    nc_put16(&mut out, seq);
+    if c.remote_seq >= 0 {
+        nc_put16(&mut out, c.remote_seq);
+    } else {
+        nc_put16(&mut out, 0);
+    }
+    out.push((c.recv_bits >> 24) & 255);
+    out.push((c.recv_bits >> 16) & 255);
+    out.push((c.recv_bits >> 8) & 255);
+    out.push(c.recv_bits & 255);
+    val count_at: i64 = out.len();
+    out.push(0);
+    var count: i64 = 0;
+    var ids: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < c.out_id.len() && count < 255 {
+        if !c.out_acked.get(i) {
+            val sent: i64 = c.out_sent_at.get(i);
+            if sent < 0 || now - sent >= c.resend_after {
+                val m: Vec<i64> = c.out_data.get(i);
+                if out.len() + 4 + m.len() <= c.max_packet {
+                    nc_put16(&mut out, c.out_id.get(i) & 0xFFFF);
+                    nc_put16(&mut out, m.len());
+                    var k: i64 = 0;
+                    while k < m.len() {
+                        out.push(m.get(k) & 255);
+                        k = k + 1;
+                    }
+                    if sent >= 0 {
+                        c.resends = c.resends + 1;
+                    }
+                    c.out_sent_at.set(i, now);
+                    ids.push(c.out_id.get(i));
+                    count = count + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    out.set(count_at, count);
+    c.flight_seq.push(seq);
+    c.flight_ids.push(ids);
+    while c.flight_seq.len() > 33 {
+        c.flight_seq.remove(0);
+        c.flight_ids.remove(0);
+    }
+    c.local_seq = (seq + 1) & 0xFFFF;
+    c.packets_sent = c.packets_sent + 1;
+    return out;
+}
+
+fn nc_mark_acked(c: &mut NcChannel, seq: i64) {
+    var i: i64 = 0;
+    while i < c.flight_seq.len() {
+        if c.flight_seq.get(i) == seq {
+            val ids: Vec<i64> = c.flight_ids.get(i);
+            var k: i64 = 0;
+            while k < ids.len() {
+                var j: i64 = 0;
+                while j < c.out_id.len() {
+                    if c.out_id.get(j) == ids.get(k) {
+                        c.out_acked.set(j, true);
+                    }
+                    j = j + 1;
+                }
+                k = k + 1;
+            }
+            c.flight_seq.remove(i);
+            c.flight_ids.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// The full message id of a 16-bit wire id: the one nearest next_recv_id.
+fn nc_full_id(c: &NcChannel, id16: i64) -> i64 {
+    return c.next_recv_id + nc_seq_diff(id16, c.next_recv_id & 0xFFFF);
+}
+
+/// Take in a received packet. Returns false (and changes nothing) when it
+/// is malformed.
+pub fn nc_channel_receive(c: &mut NcChannel, p: &Vec<i64>) -> bool {
+    if p.len() < NC_HEADER_LEN {
+        c.bad_packets = c.bad_packets + 1;
+        return false;
+    }
+    // validate the message area before touching state
+    val count: i64 = p.get(9);
+    var at: i64 = NC_HEADER_LEN;
+    var m: i64 = 0;
+    while m < count {
+        if at + 4 > p.len() {
+            c.bad_packets = c.bad_packets + 1;
+            return false;
+        }
+        at = at + 4 + nc_get16(p, at + 2);
+        m = m + 1;
+    }
+    if at != p.len() {
+        c.bad_packets = c.bad_packets + 1;
+        return false;
+    }
+    c.packets_received = c.packets_received + 1;
+    val seq: i64 = nc_get16(p, 1);
+    var fresh: bool = true;
+    if c.remote_seq < 0 {
+        c.remote_seq = seq;
+        c.recv_bits = 0;
+    } else if nc_seq_newer(seq, c.remote_seq) {
+        val d: i64 = nc_seq_diff(seq, c.remote_seq);
+        if d > 32 {
+            c.recv_bits = 0;
+        } else {
+            c.recv_bits = ((c.recv_bits << d) | (1 << (d - 1))) & 0xFFFFFFFF;
+        }
+        c.remote_seq = seq;
+    } else {
+        val d: i64 = nc_seq_diff(c.remote_seq, seq);
+        if d == 0 {
+            fresh = false;
+        } else if d <= 32 {
+            if ((c.recv_bits >> (d - 1)) & 1) == 1 {
+                fresh = false;
+            }
+            c.recv_bits = c.recv_bits | (1 << (d - 1));
+        }
+    }
+    if !fresh {
+        c.duplicates = c.duplicates + 1;
+    }
+    // acks
+    if (p.get(0) & 1) == 1 {
+        val ack: i64 = nc_get16(p, 3);
+        val bits: i64 = (p.get(5) << 24) | (p.get(6) << 16) | (p.get(7) << 8) | p.get(8);
+        nc_mark_acked(c, ack);
+        var b: i64 = 0;
+        while b < 32 {
+            if ((bits >> b) & 1) == 1 {
+                nc_mark_acked(c, (ack - 1 - b) & 0xFFFF);
+            }
+            b = b + 1;
+        }
+        while c.out_acked.len() > 0 && c.out_acked.get(0) {
+            c.out_id.remove(0);
+            c.out_data.remove(0);
+            c.out_sent_at.remove(0);
+            c.out_acked.remove(0);
+        }
+    }
+    // messages
+    at = NC_HEADER_LEN;
+    m = 0;
+    while m < count {
+        val id: i64 = nc_full_id(c, nc_get16(p, at));
+        val len: i64 = nc_get16(p, at + 2);
+        var data: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < len {
+            data.push(p.get(at + 4 + k));
+            k = k + 1;
+        }
+        at = at + 4 + len;
+        m = m + 1;
+        if id < c.next_recv_id {
+            continue;
+        }
+        var dup: bool = false;
+        var j: i64 = 0;
+        while j < c.pend_id.len() {
+            if c.pend_id.get(j) == id {
+                dup = true;
+            }
+            j = j + 1;
+        }
+        if !dup {
+            c.pend_id.push(id);
+            c.pend_data.push(data);
+        }
+    }
+    // deliver in order
+    var moved: bool = true;
+    while moved {
+        moved = false;
+        var j: i64 = 0;
+        while j < c.pend_id.len() {
+            if c.pend_id.get(j) == c.next_recv_id {
+                c.delivered.push(c.pend_data.get(j));
+                c.pend_id.remove(j);
+                c.pend_data.remove(j);
+                c.next_recv_id = c.next_recv_id + 1;
+                moved = true;
+                break;
+            }
+            j = j + 1;
+        }
+    }
+    return true;
+}
+
+/// The messages delivered (in send order) since the last call.
+pub fn nc_channel_take(c: &mut NcChannel) -> Vec<Vec<i64>> {
+    val out: Vec<Vec<i64>> = c.delivered;
+    c.delivered = Vec::new();
+    return out;
+}

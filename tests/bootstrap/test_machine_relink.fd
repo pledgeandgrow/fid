@@ -1,0 +1,94 @@
+// Track SP (docs/roadmap/llvm-roadmap.md), SP7: incremental relinking in
+// memory (compiler/nat_ir.fd nl_*, docs/reference/incremental-relink.md).
+// tests/nattools/relink_check.sh builds this program in one `fid serve`,
+// then edits of it (tests/nattools/relink_edit_b.fd: rl_shrink smaller,
+// rl_grow much larger, another string in rl_text; relink_edit_c.fd: this
+// program with another string in rl_text) in the same process: the second
+// build puts each unchanged function back at its offset of the first,
+// moves rl_shrink and rl_text into their old places and places rl_grow
+// after the code; every image runs as a fresh build of its source.
+// Expected output:
+// sum 135
+// shrink 109
+// grow 8
+// mid 98
+// n=42
+// pair 5 10
+// fold 3628800
+// done
+
+struct RlPair {
+    a: i64,
+    b: i64,
+}
+
+// (each function that an edit changes has more than one block: the IR
+// inliner takes only straight-line callees, so it stays a function)
+fn rl_grow(x: i64) -> i64 {
+    if x < 0 {
+        return 0;
+    }
+    return x + 1;
+}
+
+fn rl_shrink(x: i64) -> i64 {
+    var a: i64 = x * 7 + 3;
+    var b: i64 = a % 11;
+    var c: i64 = a / 5 + b * 2;
+    if c > 100 {
+        c = c - 100;
+    }
+    var d: i64 = (a % 3) + ((a ^ 1) % 3) + ((a ^ 2) % 3) + ((a ^ 3) % 3);
+    if d > 4 {
+        d = d - 1;
+    }
+    return a + b + c + d;
+}
+
+fn rl_sum(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i * 3;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn rl_mid(x: i64) -> i64 {
+    return rl_shrink(x) + rl_grow(x);
+}
+
+fn rl_text(n: i64) -> str {
+    if n < 0 {
+        return "negative";
+    }
+    return "n=" + int_to_str(n);
+}
+
+fn rl_pair(x: i64) -> RlPair {
+    return RlPair { a: x, b: x * 2 };
+}
+
+fn rl_fold(n: i64) -> i64 {
+    var p: i64 = 1;
+    var i: i64 = 1;
+    while i <= n {
+        p = p * i;
+        i = i + 1;
+    }
+    return p;
+}
+
+fn main() -> i64 {
+    println("sum " + int_to_str(rl_sum(10)));
+    println("shrink " + int_to_str(rl_shrink(11)));
+    println("grow " + int_to_str(rl_grow(7)));
+    println("mid " + int_to_str(rl_mid(7)));
+    println(rl_text(42));
+    val p = rl_pair(5);
+    println("pair " + int_to_str(p.a) + " " + int_to_str(p.b));
+    println("fold " + int_to_str(rl_fold(10)));
+    println("done");
+    return 0;
+}

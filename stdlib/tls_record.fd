@@ -1,0 +1,321 @@
+// Fides TLS 1.3 record layer (RFC 8446 §5)
+//
+// What tls_crypto.fd left for TLS 1.3, the part that reads bytes from the
+// network: records are split out of a byte stream, handshake messages out
+// of handshake records, alerts read, and protected records sealed and
+// opened with TLS_CHACHA20_POLY1305_SHA256. Every parser here takes
+// untrusted bytes and never panics: a malformed input gives an error code
+// (the alert a peer should get), an incomplete one stops where the next
+// read must continue (`consumed`). scripts/fuzz/fuzz_parsers.py fuzzes it
+// (tests/fuzz/parsers.fd, parser "tls"; roadmap VF15).
+//
+//   val rs: TlsRecords = tls_records_parse(bytes);
+//   // rs.records: the whole records; rs.consumed: bytes used; rs.error
+//   val sealed: Vec<i64> = tls_record_seal(key, iv, seq, TLS_CT_HANDSHAKE, msg, 0);
+//   val inner: TlsInner = tls_record_open(key, iv, seq, rec);
+//
+// The keys are `@secret` (complaint CO1); seal and open are the audited
+// releases (`@declassify`) of what goes on and comes off the wire.
+// Not here: the handshake state machine and certificates.
+
+module tls_record;
+ use vec; use string; use tls_crypto;
+
+pub const TLS_CT_CHANGE_CIPHER_SPEC: i64 = 20;
+pub const TLS_CT_ALERT: i64 = 21;
+pub const TLS_CT_HANDSHAKE: i64 = 22;
+pub const TLS_CT_APPLICATION_DATA: i64 = 23;
+
+/// The largest TLSPlaintext fragment (2^14) and TLSCiphertext (2^14 + 256).
+pub const TLS_MAX_PLAINTEXT: i64 = 16384;
+pub const TLS_MAX_CIPHERTEXT: i64 = 16640;
+
+/// Error codes; each names the alert RFC 8446 §6.2 says to send.
+pub const TLS_REC_OK: i64 = 0;
+/// unexpected_message: an unknown content or handshake type
+pub const TLS_REC_BAD_TYPE: i64 = 1;
+/// protocol_version / decode_error: legacy_record_version is not 0x03XX
+pub const TLS_REC_BAD_VERSION: i64 = 2;
+/// record_overflow: a length over the limit
+pub const TLS_REC_OVERFLOW: i64 = 3;
+/// unexpected_message: a zero-length handshake or alert fragment, or an
+/// inner plaintext with no content type
+pub const TLS_REC_EMPTY: i64 = 4;
+/// decode_error: a message shorter than its fixed part
+pub const TLS_REC_DECODE: i64 = 5;
+/// bad_record_mac: the record does not authenticate
+pub const TLS_REC_BAD_MAC: i64 = 6;
+
+/// One record: its content type, legacy_record_version, fragment bytes.
+pub struct TlsRecord {
+    pub ctype: i64,
+    pub version: i64,
+    pub fragment: Vec<i64>,
+}
+
+/// The whole records at the front of a stream. `consumed` bytes were used:
+/// the rest is an incomplete record (read more, then parse from there), or
+/// where `error` (not TLS_REC_OK) stopped the parse.
+pub struct TlsRecords {
+    pub records: Vec<TlsRecord>,
+    pub consumed: i64,
+    pub error: i64,
+}
+
+/// One handshake message (RFC 8446 §4): msg_type and its body.
+pub struct TlsHandshake {
+    pub msg_type: i64,
+    pub body: Vec<i64>,
+}
+
+pub struct TlsHandshakes {
+    pub messages: Vec<TlsHandshake>,
+    pub consumed: i64,
+    pub error: i64,
+}
+
+/// An alert: level (1 warning, 2 fatal) and description, or an error.
+pub struct TlsAlert {
+    pub level: i64,
+    pub description: i64,
+    pub error: i64,
+}
+
+/// What a protected record holds: its real content type and content.
+pub struct TlsInner {
+    pub ctype: i64,
+    pub content: Vec<i64>,
+    pub error: i64,
+}
+
+fn tr_byte(b: Vec<i64>, i: i64) -> i64 {
+    return b.get(i) & 255;
+}
+
+fn tr_slice(b: Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tr_append(out: & mut Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+/// A known content type (RFC 8446 §5.1).
+pub fn tls_content_type_ok(t: i64) -> bool {
+    return t >= TLS_CT_CHANGE_CIPHER_SPEC && t <= TLS_CT_APPLICATION_DATA;
+}
+
+/// A handshake type TLS 1.3 sends (RFC 8446 §4).
+pub fn tls_handshake_type_ok(t: i64) -> bool {
+    return t == 1 || t == 2 || t == 4 || t == 5 || t == 8 || t == 11 || t == 13
+        || t == 15 || t == 20 || t == 24 || t == 254;
+}
+
+/// Split the records at the front of `data` (bytes 0..255).
+pub fn tls_records_parse(data: Vec<i64>) -> TlsRecords {
+    var recs: Vec<TlsRecord> = Vec::new();
+    var n: i64 = data.len();
+    var pos: i64 = 0;
+    var err: i64 = TLS_REC_OK;
+    var more: bool = true;
+    while more && pos + 5 <= n {
+        val ct: i64 = tr_byte(data, pos);
+        val ver: i64 = (tr_byte(data, pos + 1) << 8) | tr_byte(data, pos + 2);
+        val len: i64 = (tr_byte(data, pos + 3) << 8) | tr_byte(data, pos + 4);
+        if !tls_content_type_ok(ct) {
+            err = TLS_REC_BAD_TYPE;
+            more = false;
+        } else if (ver >> 8) != 3 {
+            err = TLS_REC_BAD_VERSION;
+            more = false;
+        } else if len > TLS_MAX_CIPHERTEXT || (len > TLS_MAX_PLAINTEXT && ct != TLS_CT_APPLICATION_DATA) {
+            // only a protected record (application_data) may pass 2^14
+            err = TLS_REC_OVERFLOW;
+            more = false;
+        } else if len == 0 && ct != TLS_CT_APPLICATION_DATA {
+            err = TLS_REC_EMPTY;
+            more = false;
+        } else if pos + 5 + len > n {
+            // incomplete: the caller reads more
+            more = false;
+        } else {
+            recs.push(TlsRecord { ctype: ct, version: ver, fragment: tr_slice(data, pos + 5, pos + 5 + len) });
+            pos = pos + 5 + len;
+        }
+    }
+    return TlsRecords { records: recs, consumed: pos, error: err };
+}
+
+/// The bytes of one plaintext record: header, then the fragment.
+pub fn tls_record_encode(ctype: i64, fragment: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(ctype & 255);
+    out.push(3);
+    out.push(3);
+    out.push((fragment.len() >> 8) & 255);
+    out.push(fragment.len() & 255);
+    tr_append(& mut out, fragment);
+    return out;
+}
+
+/// Split the handshake messages at the front of `data` (the fragments of
+/// handshake records joined: a message may span records).
+pub fn tls_handshake_parse(data: Vec<i64>) -> TlsHandshakes {
+    var msgs: Vec<TlsHandshake> = Vec::new();
+    var n: i64 = data.len();
+    var pos: i64 = 0;
+    var err: i64 = TLS_REC_OK;
+    var more: bool = true;
+    while more && pos + 4 <= n {
+        val t: i64 = tr_byte(data, pos);
+        val len: i64 = (tr_byte(data, pos + 1) << 16) | (tr_byte(data, pos + 2) << 8) | tr_byte(data, pos + 3);
+        if !tls_handshake_type_ok(t) {
+            err = TLS_REC_BAD_TYPE;
+            more = false;
+        } else if pos + 4 + len > n {
+            more = false;
+        } else {
+            msgs.push(TlsHandshake { msg_type: t, body: tr_slice(data, pos + 4, pos + 4 + len) });
+            pos = pos + 4 + len;
+        }
+    }
+    return TlsHandshakes { messages: msgs, consumed: pos, error: err };
+}
+
+/// The bytes of one handshake message.
+pub fn tls_handshake_encode(msg_type: i64, body: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val len: i64 = body.len();
+    out.push(msg_type & 255);
+    out.push((len >> 16) & 255);
+    out.push((len >> 8) & 255);
+    out.push(len & 255);
+    tr_append(& mut out, body);
+    return out;
+}
+
+/// An alert fragment: exactly two bytes, level 1 or 2.
+pub fn tls_alert_parse(fragment: Vec<i64>) -> TlsAlert {
+    if fragment.len() != 2 {
+        return TlsAlert { level: 0, description: 0, error: TLS_REC_DECODE };
+    }
+    val level: i64 = tr_byte(fragment, 0);
+    if level != 1 && level != 2 {
+        return TlsAlert { level: level, description: tr_byte(fragment, 1), error: TLS_REC_DECODE };
+    }
+    return TlsAlert { level: level, description: tr_byte(fragment, 1), error: TLS_REC_OK };
+}
+
+/// TLSInnerPlaintext (RFC 8446 §5.2): content, the content type, then zero
+/// padding. The type is the last byte that is not zero.
+pub fn tls_inner_parse(plain: Vec<i64>) -> TlsInner {
+    var i: i64 = plain.len() - 1;
+    while i >= 0 && tr_byte(plain, i) == 0 {
+        i = i - 1;
+    }
+    var none: Vec<i64> = Vec::new();
+    if i < 0 {
+        return TlsInner { ctype: 0, content: none, error: TLS_REC_EMPTY };
+    }
+    val t: i64 = tr_byte(plain, i);
+    if !tls_content_type_ok(t) {
+        return TlsInner { ctype: t, content: none, error: TLS_REC_BAD_TYPE };
+    }
+    if i > TLS_MAX_PLAINTEXT {
+        return TlsInner { ctype: t, content: none, error: TLS_REC_OVERFLOW };
+    }
+    return TlsInner { ctype: t, content: tr_slice(plain, 0, i), error: TLS_REC_OK };
+}
+
+/// The per-record nonce (RFC 8446 §5.3): the 12-byte write IV XOR the
+/// 64-bit sequence number, big-endian, at its right end.
+pub fn tls_record_nonce(iv: Vec<i64>, seq: i64) -> Vec<i64> {
+    var nonce: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 12 {
+        var b: i64 = 0;
+        if i < iv.len() {
+            b = iv.get(i) & 255;
+        }
+        if i >= 4 {
+            b = b ^ ((seq >> ((11 - i) * 8)) & 255);
+        }
+        nonce.push(b);
+        i = i + 1;
+    }
+    return nonce;
+}
+
+/// A protected record (TLS_CHACHA20_POLY1305_SHA256): the header
+/// (application_data, 0x0303, length) and the AEAD output of content ||
+/// ctype || `pad` zero bytes, with the header as additional data.
+@declassify pub fn tls_record_seal(@secret key: Vec<i64>, iv: Vec<i64>, seq: i64, ctype: i64, content: Vec<i64>, pad: i64) -> Vec<i64> {
+    var inner: Vec<i64> = Vec::new();
+    tr_append(& mut inner, content);
+    inner.push(ctype & 255);
+    var p: i64 = 0;
+    while p < pad {
+        inner.push(0);
+        p = p + 1;
+    }
+    val len: i64 = inner.len() + 16;
+    var out: Vec<i64> = Vec::new();
+    out.push(TLS_CT_APPLICATION_DATA);
+    out.push(3);
+    out.push(3);
+    out.push((len >> 8) & 255);
+    out.push(len & 255);
+    val sealed: Vec<i64> = chacha20poly_encrypt(key, tls_record_nonce(iv, seq), out, inner);
+    tr_append(& mut out, sealed);
+    return out;
+}
+
+/// Open a protected record: its real type and content, or an error
+/// (bad_record_mac when it does not authenticate).
+@declassify pub fn tls_record_open(@secret key: Vec<i64>, iv: Vec<i64>, seq: i64, rec: TlsRecord) -> TlsInner {
+    var none: Vec<i64> = Vec::new();
+    if rec.ctype != TLS_CT_APPLICATION_DATA {
+        return TlsInner { ctype: rec.ctype, content: none, error: TLS_REC_BAD_TYPE };
+    }
+    val len: i64 = rec.fragment.len();
+    if len > TLS_MAX_CIPHERTEXT {
+        return TlsInner { ctype: 0, content: none, error: TLS_REC_OVERFLOW };
+    }
+    // at least the content type and the 16-byte tag
+    if len < 17 {
+        return TlsInner { ctype: 0, content: none, error: TLS_REC_DECODE };
+    }
+    var aad: Vec<i64> = Vec::new();
+    aad.push(TLS_CT_APPLICATION_DATA);
+    aad.push((rec.version >> 8) & 255);
+    aad.push(rec.version & 255);
+    aad.push((len >> 8) & 255);
+    aad.push(len & 255);
+    val plain: Vec<i64> = chacha20poly_decrypt(key, tls_record_nonce(iv, seq), aad, rec.fragment);
+    if plain.len() == 0 {
+        return TlsInner { ctype: 0, content: none, error: TLS_REC_BAD_MAC };
+    }
+    return tls_inner_parse(plain);
+}
+
+/// The alert name of an error code (for logs).
+pub fn tls_rec_error_name(e: i64) -> str {
+    if e == TLS_REC_OK { return "ok"; }
+    if e == TLS_REC_BAD_TYPE { return "unexpected_message"; }
+    if e == TLS_REC_BAD_VERSION { return "protocol_version"; }
+    if e == TLS_REC_OVERFLOW { return "record_overflow"; }
+    if e == TLS_REC_EMPTY { return "unexpected_message (empty)"; }
+    if e == TLS_REC_DECODE { return "decode_error"; }
+    if e == TLS_REC_BAD_MAC { return "bad_record_mac"; }
+    return "unknown";
+}

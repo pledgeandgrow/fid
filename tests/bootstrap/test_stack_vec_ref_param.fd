@@ -1,0 +1,137 @@
+// OP27 (competitive roadmap): a local Vec passed as `&mut v` or `&v` only
+// to the program's own functions that load the header through the address
+// and hand it to core's Vec functions (no drop, no store through it) keeps
+// its 40-byte header on the stack (lower.fd lw_rc_header_safe_params
+// "name#r<i>", lw_rc_safe_slot_arg, LF13's lw_rc_stack_vecs_fn). A
+// function that stores a new Vec through the reference leaves the caller's
+// header on the heap. Every case must give the same results as a heap
+// header; under --leaks or --checked-alloc no block is left or misused.
+//
+// Expected output:
+//     filled 100 sum 4950
+//     total 4950
+//     twice 104 last 2
+//     words 3: x y z
+//     sorted 1 2 3 5 8
+//     popped 8 left 4
+//     snapshot 4 after 5
+//     replaced 2 first 7
+//     both 3 3
+//     done
+
+// pushes through the reference (the buffer grows; the header stays put)
+fn fill(v: &mut Vec<i64>, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        v.push(i);
+        i = i + 1;
+    }
+}
+
+fn total(v: &Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn add(v: &mut Vec<i64>, x: i64) {
+    v.push(x);
+}
+
+// passes the reference on to a reference-safe parameter
+fn add_twice(v: &mut Vec<i64>) {
+    add(v, 1);
+    add(v, 2);
+}
+
+fn add_word(ws: &mut Vec<str>, w: str) {
+    ws.push(w);
+}
+
+fn join(ws: &Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < ws.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + ws.get(i);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn sort_it(v: &mut Vec<i64>) {
+    v.sort();
+}
+
+fn take_last(v: &mut Vec<i64>) -> i64 {
+    return v.pop();
+}
+
+// a copy of its own (Vec_clone gives a fresh header)
+fn snapshot(v: &Vec<i64>) -> Vec<i64> {
+    return v.clone();
+}
+
+// stores a new Vec through the reference: not reference-safe, so the
+// caller's header stays on the heap
+fn replace(v: &mut Vec<i64>) {
+    var w: Vec<i64> = Vec::new();
+    w.push(7);
+    w.push(9);
+    *v = w;
+}
+
+fn lens(a: &Vec<i64>, b: Vec<i64>) -> str {
+    return int_to_str(a.len()) + " " + int_to_str(b.len());
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    fill(&mut v, 100);
+    println("filled " + int_to_str(v.len()) + " sum " + int_to_str(total(&v)));
+    println("total " + int_to_str(total(&v)));
+
+    var t: Vec<i64> = Vec::new();
+    fill(&mut t, 102);
+    add_twice(&mut t);
+    println("twice " + int_to_str(t.len()) + " last " + int_to_str(t.get(t.len() - 1)));
+
+    var ws: Vec<str> = Vec::new();
+    add_word(&mut ws, "x");
+    add_word(&mut ws, "y");
+    add_word(&mut ws, "z");
+    println("words " + int_to_str(ws.len()) + ": " + join(&ws));
+
+    var s: Vec<i64> = Vec::new();
+    s.push(5);
+    s.push(2);
+    s.push(8);
+    s.push(1);
+    s.push(3);
+    sort_it(&mut s);
+    println("sorted " + int_to_str(s.get(0)) + " " + int_to_str(s.get(1)) + " " + int_to_str(s.get(2)) + " " + int_to_str(s.get(3)) + " " + int_to_str(s.get(4)));
+    val top: i64 = take_last(&mut s);
+    println("popped " + int_to_str(top) + " left " + int_to_str(s.len()));
+
+    val snap: Vec<i64> = snapshot(&s);
+    s.push(4);
+    println("snapshot " + int_to_str(snap.len()) + " after " + int_to_str(s.len()));
+
+    var r: Vec<i64> = Vec::new();
+    r.push(1);
+    replace(&mut r);
+    println("replaced " + int_to_str(r.len()) + " first " + int_to_str(r.get(0)));
+
+    var b: Vec<i64> = Vec::new();
+    b.push(1);
+    b.push(2);
+    b.push(3);
+    println("both " + lens(&b, b));
+    println("done");
+}

@@ -1,0 +1,1267 @@
+// vfs: a virtual file system layer, and the block device seam the disk
+// file systems (fat32, ext4) read through.
+//
+// Real: the inode/dentry model (an inode is (mount, ino); a dentry stack
+// makes `..` and symlinks resolve as POSIX path walking does), the mount
+// table (mounting on a directory covers it; `..` from a mounted root goes
+// back to the covered directory's parent), a dentry cache (directory, name
+// -> inode, invalidated by unlink, rmdir and rename), symlink following
+// with an ELOOP limit (40, as Linux), the open file table (lowest free
+// descriptor, offsets, O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_DIRECTORY/
+// O_NOFOLLOW, access modes), read/write/pread/pwrite/lseek/fstat,
+// directory reading by descriptor, stat/lstat, mkdir/rmdir/unlink/rename/
+// symlink/readlink/truncate, chdir/getcwd. Errors are Linux errno values,
+// returned negated (or left in `Vfs.err` by calls that return data).
+//
+// The seam: a file system is an `FsOps` value, a struct of function values
+// taking the file system's own handle (`fs`) first. ramfs (stdlib/ramfs.fd)
+// implements every operation; `vfs_ops_readonly` fills the write side of
+// a read-only file system with EROFS. Function values only return i64,
+// str or Vec<i64> (in `fid run` an indirect call that returns a struct or
+// a Vec<str> loses its result), so getattr returns a Vec<i64> (see
+// VFS_ST_*) and readdir returns one name per call (index -> name, "" at
+// the end).
+//
+// Block devices: `BlockDev` holds a handle and read/write/zero function
+// values over fixed-size blocks. `memdisk_*` is a sparse in-memory disk
+// (blocks never written read as zeros, `zero` drops them), used by tests
+// and by anything that wants a RAM disk; a driver (ahci, nvme, virtio)
+// supplies its own functions.
+module vfs;
+use vec;
+use string;
+
+// --- errno -------------------------------------------------------------------
+
+pub const VFS_EPERM: i64 = 1;
+pub const VFS_ENOENT: i64 = 2;
+pub const VFS_EIO: i64 = 5;
+pub const VFS_EBADF: i64 = 9;
+pub const VFS_EACCES: i64 = 13;
+pub const VFS_EBUSY: i64 = 16;
+pub const VFS_EEXIST: i64 = 17;
+pub const VFS_EXDEV: i64 = 18;
+pub const VFS_ENOTDIR: i64 = 20;
+pub const VFS_EISDIR: i64 = 21;
+pub const VFS_EINVAL: i64 = 22;
+pub const VFS_EMFILE: i64 = 24;
+pub const VFS_EFBIG: i64 = 27;
+pub const VFS_ENOSPC: i64 = 28;
+pub const VFS_EROFS: i64 = 30;
+pub const VFS_ENAMETOOLONG: i64 = 36;
+pub const VFS_ENOSYS: i64 = 38;
+pub const VFS_ENOTEMPTY: i64 = 39;
+pub const VFS_ELOOP: i64 = 40;
+
+// --- inode kinds and mode bits -----------------------------------------------
+
+pub const VFS_REG: i64 = 1;
+pub const VFS_DIR: i64 = 2;
+pub const VFS_LNK: i64 = 3;
+
+pub const VFS_S_IFMT: i64 = 61440;
+pub const VFS_S_IFREG: i64 = 32768;
+pub const VFS_S_IFDIR: i64 = 16384;
+pub const VFS_S_IFLNK: i64 = 40960;
+
+// --- open flags (Linux values) and lseek whence ------------------------------
+
+pub const VFS_O_RDONLY: i64 = 0;
+pub const VFS_O_WRONLY: i64 = 1;
+pub const VFS_O_RDWR: i64 = 2;
+pub const VFS_O_ACCMODE: i64 = 3;
+pub const VFS_O_CREAT: i64 = 64;
+pub const VFS_O_EXCL: i64 = 128;
+pub const VFS_O_TRUNC: i64 = 512;
+pub const VFS_O_APPEND: i64 = 1024;
+pub const VFS_O_DIRECTORY: i64 = 65536;
+pub const VFS_O_NOFOLLOW: i64 = 131072;
+
+pub const VFS_SEEK_SET: i64 = 0;
+pub const VFS_SEEK_CUR: i64 = 1;
+pub const VFS_SEEK_END: i64 = 2;
+
+pub const VFS_MAX_FDS: i64 = 256;
+pub const VFS_MAX_LINKS: i64 = 40;
+pub const VFS_NAME_MAX: i64 = 255;
+
+// getattr result words: [err, kind, size, nlink, mode, mtime]
+pub const VFS_ST_ERR: i64 = 0;
+pub const VFS_ST_KIND: i64 = 1;
+pub const VFS_ST_SIZE: i64 = 2;
+pub const VFS_ST_NLINK: i64 = 3;
+pub const VFS_ST_MODE: i64 = 4;
+pub const VFS_ST_MTIME: i64 = 5;
+
+// --- file system operations --------------------------------------------------
+
+/// One file system type's operations. `fs` is the instance handle the
+/// file system gave out; inode numbers are the file system's own.
+/// Results are >= 0 on success, -errno on failure.
+pub struct FsOps {
+    pub name: str,
+    pub root: fn(i64) -> i64,
+    pub lookup: fn(i64, i64, str) -> i64,
+    pub getattr: fn(i64, i64) -> Vec<i64>,
+    pub read: fn(i64, i64, i64, i64) -> Vec<i64>,
+    pub write: fn(i64, i64, i64, Vec<i64>) -> i64,
+    pub truncate: fn(i64, i64, i64) -> i64,
+    pub create: fn(i64, i64, str, i64) -> i64,
+    pub mkdir: fn(i64, i64, str, i64) -> i64,
+    pub unlink: fn(i64, i64, str) -> i64,
+    pub rmdir: fn(i64, i64, str) -> i64,
+    pub rename: fn(i64, i64, str, i64, str) -> i64,
+    pub readdir: fn(i64, i64, i64) -> str,
+    pub symlink: fn(i64, i64, str, str) -> i64,
+    pub readlink: fn(i64, i64) -> str,
+}
+
+fn vfs_rofs_write(fs: i64, ino: i64, off: i64, data: Vec<i64>) -> i64 {
+    return 0 - VFS_EROFS;
+}
+fn vfs_rofs_truncate(fs: i64, ino: i64, size: i64) -> i64 {
+    return 0 - VFS_EROFS;
+}
+fn vfs_rofs_create(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+    return 0 - VFS_EROFS;
+}
+fn vfs_rofs_unlink(fs: i64, dir: i64, name: str) -> i64 {
+    return 0 - VFS_EROFS;
+}
+fn vfs_rofs_rename(fs: i64, od: i64, on: str, nd: i64, nn: str) -> i64 {
+    return 0 - VFS_EROFS;
+}
+fn vfs_rofs_symlink(fs: i64, dir: i64, name: str, target: str) -> i64 {
+    return 0 - VFS_EROFS;
+}
+
+/// Operations of a read-only file system: the given read side, EROFS for
+/// everything that would change it.
+pub fn vfs_ops_readonly(name: str, root: fn(i64) -> i64, lookup: fn(i64, i64, str) -> i64, getattr: fn(i64, i64) -> Vec<i64>, read: fn(i64, i64, i64, i64) -> Vec<i64>, readdir: fn(i64, i64, i64) -> str, readlink: fn(i64, i64) -> str) -> FsOps {
+    return FsOps {
+        name: name, root: root, lookup: lookup, getattr: getattr, read: read, write: vfs_rofs_write, truncate: vfs_rofs_truncate, create: vfs_rofs_create, mkdir: vfs_rofs_create, unlink: vfs_rofs_unlink, rmdir: vfs_rofs_unlink, rename: vfs_rofs_rename, readdir: readdir, symlink: vfs_rofs_symlink, readlink: readlink
+    };
+}
+
+// --- VFS state -----------------------------------------------------------------
+
+pub struct VStat {
+    pub err: i64,
+    pub dev: i64,
+    pub ino: i64,
+    pub kind: i64,
+    pub size: i64,
+    pub nlink: i64,
+    pub mode: i64,
+    pub mtime: i64,
+}
+
+pub struct VDirent {
+    pub name: str,
+    pub ino: i64,
+    pub kind: i64,
+}
+
+pub struct VMount {
+    pub used: bool,
+    pub path: str,
+    pub ops: FsOps,
+    pub fs: i64,
+    pub root: i64,
+    pub parent: i64,
+    pub covered: i64,
+}
+
+pub struct VFile {
+    pub used: bool,
+    pub m: i64,
+    pub ino: i64,
+    pub off: i64,
+    pub flags: i64,
+    pub kind: i64,
+}
+
+pub struct Vfs {
+    pub mounts: Vec<VMount>,
+    pub files: Vec<VFile>,
+    pub cwd_m: Vec<i64>,
+    pub cwd_i: Vec<i64>,
+    pub cwd_n: Vec<str>,
+    pub dcache: HashMap<str, i64>,
+    pub dc_hits: i64,
+    pub dc_misses: i64,
+    pub err: i64,
+}
+
+/// The result of a path walk: the inode reached (or, for a parent walk,
+/// the parent directory and the last name), and the dentry stack.
+pub struct VWalk {
+    pub err: i64,
+    pub m: i64,
+    pub ino: i64,
+    pub name: str,
+    pub sm: Vec<i64>,
+    pub si: Vec<i64>,
+    pub sn: Vec<str>,
+}
+
+pub fn vfs_new() -> Vfs {
+    return Vfs {
+        mounts: Vec::new(), files: Vec::new(), cwd_m: Vec::new(), cwd_i: Vec::new(), cwd_n: Vec::new(), dcache: HashMap::new(), dc_hits: 0, dc_misses: 0, err: 0
+    };
+}
+
+fn vfs_ops_of(v: & Vfs, m: i64) -> FsOps {
+    return v.mounts.get(m).ops;
+}
+
+fn vfs_fs_of(v: & Vfs, m: i64) -> i64 {
+    return v.mounts.get(m).fs;
+}
+
+/// getattr through the mount's operations, as a VStat.
+pub fn vfs_getattr(v: & Vfs, m: i64, ino: i64) -> VStat {
+    val ops: FsOps = vfs_ops_of(v, m);
+    val f = ops.getattr;
+    val w: Vec<i64> = f(vfs_fs_of(v, m), ino);
+    if w.len() < 6 {
+        return VStat { err: 0 - VFS_EIO, dev: m, ino: ino, kind: 0, size: 0, nlink: 0, mode: 0, mtime: 0 };
+    }
+    return VStat {
+        err: w.get(VFS_ST_ERR), dev: m, ino: ino, kind: w.get(VFS_ST_KIND), size: w.get(VFS_ST_SIZE), nlink: w.get(VFS_ST_NLINK), mode: w.get(VFS_ST_MODE), mtime: w.get(VFS_ST_MTIME)
+    };
+}
+
+fn vfs_dkey(m: i64, dir: i64, name: str) -> str {
+    return int_to_str(m) + ":" + int_to_str(dir) + "/" + name;
+}
+
+/// lookup through the dentry cache.
+fn vfs_lookup(v: &mut Vfs, m: i64, dir: i64, name: str) -> i64 {
+    val key: str = vfs_dkey(m, dir, name);
+    if v.dcache.contains(key) {
+        v.dc_hits = v.dc_hits + 1;
+        return v.dcache.get(key);
+    }
+    v.dc_misses = v.dc_misses + 1;
+    val ops: FsOps = vfs_ops_of(v, m);
+    val f = ops.lookup;
+    val ino: i64 = f(vfs_fs_of(v, m), dir, name);
+    if ino >= 0 {
+        v.dcache.insert(key, ino);
+    }
+    return ino;
+}
+
+fn vfs_dc_drop(v: &mut Vfs, m: i64, dir: i64, name: str) {
+    val key: str = vfs_dkey(m, dir, name);
+    if v.dcache.contains(key) {
+        v.dcache.remove(key);
+    }
+}
+
+/// The mount on top of (m, ino), or -1.
+fn vfs_mount_on(v: & Vfs, m: i64, ino: i64) -> i64 {
+    var found: i64 = -1;
+    var i: i64 = 0;
+    while i < v.mounts.len() {
+        val mt: VMount = v.mounts.get(i);
+        if mt.used && mt.parent == m && mt.covered == ino && i != m {
+            found = i;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn vfs_split(path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val parts: Vec<str> = str_split(path, "/");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        if str_len(p) > 0 {
+            out.push(p);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn vfs_walk_fail(e: i64) -> VWalk {
+    return VWalk { err: e, m: -1, ino: -1, name: "", sm: Vec::new(), si: Vec::new(), sn: Vec::new() };
+}
+
+/// Walk `path`. With `parent` the last component is not looked up: the
+/// result is its directory and `name`. `follow` follows a symlink in the
+/// last component.
+pub fn vfs_walk(v: &mut Vfs, path: str, follow: bool, parent: bool) -> VWalk {
+    if v.mounts.len() == 0 {
+        return vfs_walk_fail(0 - VFS_ENOENT);
+    }
+    if str_len(path) == 0 {
+        return vfs_walk_fail(0 - VFS_ENOENT);
+    }
+    var sm: Vec<i64> = Vec::new();
+    var si: Vec<i64> = Vec::new();
+    var sn: Vec<str> = Vec::new();
+    if str_byte_at(path, 0) == 47 || v.cwd_m.len() == 0 {
+        sm.push(0);
+        si.push(v.mounts.get(0).root);
+        sn.push("");
+    } else {
+        sm = v.cwd_m;
+        si = v.cwd_i;
+        sn = v.cwd_n;
+    }
+    var comps: Vec<str> = vfs_split(path);
+    var links: i64 = 0;
+    var i: i64 = 0;
+    var last_name: str = "";
+    while i < comps.len() {
+        val c: str = comps.get(i);
+        val last: bool = i == comps.len() - 1;
+        if str_len(c) > VFS_NAME_MAX {
+            return vfs_walk_fail(0 - VFS_ENAMETOOLONG);
+        }
+        val tm: i64 = sm.get(sm.len() - 1);
+        val ti: i64 = si.get(si.len() - 1);
+        val tst: VStat = vfs_getattr(v, tm, ti);
+        if tst.err < 0 {
+            return vfs_walk_fail(tst.err);
+        }
+        if tst.kind != VFS_DIR {
+            return vfs_walk_fail(0 - VFS_ENOTDIR);
+        }
+        if parent && last {
+            if c == "." || c == ".." {
+                return vfs_walk_fail(0 - VFS_EINVAL);
+            }
+            last_name = c;
+            i = i + 1;
+            continue;
+        }
+        if c == "." {
+            i = i + 1;
+            continue;
+        }
+        if c == ".." {
+            if sm.len() > 1 {
+                sm.pop();
+                si.pop();
+                sn.pop();
+            }
+            i = i + 1;
+            continue;
+        }
+        val child: i64 = vfs_lookup(v, tm, ti, c);
+        if child < 0 {
+            return vfs_walk_fail(child);
+        }
+        var cm: i64 = tm;
+        var ci: i64 = child;
+        var over: i64 = vfs_mount_on(v, cm, ci);
+        while over >= 0 {
+            cm = over;
+            ci = v.mounts.get(over).root;
+            over = vfs_mount_on(v, cm, ci);
+        }
+        val cst: VStat = vfs_getattr(v, cm, ci);
+        if cst.err < 0 {
+            return vfs_walk_fail(cst.err);
+        }
+        if cst.kind == VFS_LNK && (!last || follow) {
+            links = links + 1;
+            if links > VFS_MAX_LINKS {
+                return vfs_walk_fail(0 - VFS_ELOOP);
+            }
+            val ops: FsOps = vfs_ops_of(v, cm);
+            val rl = ops.readlink;
+            val target: str = rl(vfs_fs_of(v, cm), ci);
+            if str_len(target) == 0 {
+                return vfs_walk_fail(0 - VFS_ENOENT);
+            }
+            if str_byte_at(target, 0) == 47 {
+                sm = Vec::new();
+                si = Vec::new();
+                sn = Vec::new();
+                sm.push(0);
+                si.push(v.mounts.get(0).root);
+                sn.push("");
+            }
+            var rest: Vec<str> = vfs_split(target);
+            var j: i64 = i + 1;
+            while j < comps.len() {
+                rest.push(comps.get(j));
+                j = j + 1;
+            }
+            comps = rest;
+            i = 0;
+            if comps.len() == 0 {
+                break;
+            }
+            continue;
+        }
+        sm.push(cm);
+        si.push(ci);
+        sn.push(c);
+        i = i + 1;
+    }
+    if parent && str_len(last_name) == 0 {
+        return vfs_walk_fail(0 - VFS_EINVAL);
+    }
+    return VWalk { err: 0, m: sm.get(sm.len() - 1), ino: si.get(si.len() - 1), name: last_name, sm: sm, si: si, sn: sn };
+}
+
+// --- mounting -------------------------------------------------------------------
+
+/// Mount file system `fs` (operations `ops`) on `path`. The first mount
+/// must be "/". Returns the mount index or -errno.
+pub fn vfs_mount(v: &mut Vfs, path: str, ops: FsOps, fs: i64) -> i64 {
+    val rootf = ops.root;
+    val root: i64 = rootf(fs);
+    if root < 0 {
+        return root;
+    }
+    if v.mounts.len() == 0 {
+        if path != "/" {
+            return 0 - VFS_ENOENT;
+        }
+        v.mounts.push(VMount { used: true, path: "/", ops: ops, fs: fs, root: root, parent: -1, covered: -1 });
+        return 0;
+    }
+    val w: VWalk = vfs_walk(v, path, true, false);
+    if w.err < 0 {
+        return w.err;
+    }
+    val st: VStat = vfs_getattr(v, w.m, w.ino);
+    if st.kind != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    if w.si.len() == 1 {
+        return 0 - VFS_EBUSY;
+    }
+    // Mount on the directory itself (the walk already crossed into
+    // whatever is mounted on it, so stacking lands on the top mount).
+    val idx: i64 = v.mounts.len();
+    v.mounts.push(VMount { used: true, path: path, ops: ops, fs: fs, root: root, parent: w.m, covered: w.ino });
+    return idx;
+}
+
+/// Unmount the file system mounted at `path`: EBUSY while a file of it is
+/// open or another mount sits on it.
+pub fn vfs_umount(v: &mut Vfs, path: str) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, false);
+    if w.err < 0 {
+        return w.err;
+    }
+    val m: i64 = w.m;
+    if m == 0 || w.ino != v.mounts.get(m).root {
+        return 0 - VFS_EINVAL;
+    }
+    var i: i64 = 0;
+    while i < v.files.len() {
+        val f: VFile = v.files.get(i);
+        if f.used && f.m == m {
+            return 0 - VFS_EBUSY;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < v.mounts.len() {
+        val mt: VMount = v.mounts.get(i);
+        if mt.used && mt.parent == m {
+            return 0 - VFS_EBUSY;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < v.cwd_m.len() {
+        if v.cwd_m.get(i) == m {
+            return 0 - VFS_EBUSY;
+        }
+        i = i + 1;
+    }
+    var mt: VMount = v.mounts.get(m);
+    mt.used = false;
+    v.mounts.set(m, mt);
+    v.dcache = HashMap::new();
+    return 0;
+}
+
+// --- open file table -------------------------------------------------------------
+
+fn vfs_alloc_fd(v: &mut Vfs, m: i64, ino: i64, flags: i64, kind: i64) -> i64 {
+    val nf: VFile = VFile { used: true, m: m, ino: ino, off: 0, flags: flags, kind: kind };
+    var i: i64 = 0;
+    while i < v.files.len() {
+        if !v.files.get(i).used {
+            v.files.set(i, nf);
+            return i;
+        }
+        i = i + 1;
+    }
+    if v.files.len() >= VFS_MAX_FDS {
+        return 0 - VFS_EMFILE;
+    }
+    v.files.push(nf);
+    return v.files.len() - 1;
+}
+
+fn vfs_fd_ok(v: & Vfs, fd: i64) -> bool {
+    if fd < 0 || fd >= v.files.len() {
+        return false;
+    }
+    return v.files.get(fd).used;
+}
+
+/// open(2), creating with mode 0644. Returns a descriptor or -errno.
+pub fn vfs_open(v: &mut Vfs, path: str, flags: i64) -> i64 {
+    return vfs_open_mode(v, path, flags, 420);
+}
+
+/// open(2) with the permission bits a new file gets.
+pub fn vfs_open_mode(v: &mut Vfs, path: str, flags: i64, mode: i64) -> i64 {
+    val acc: i64 = flags & VFS_O_ACCMODE;
+    if acc == 3 {
+        return 0 - VFS_EINVAL;
+    }
+    val follow: bool = (flags & VFS_O_NOFOLLOW) == 0;
+    var m: i64 = -1;
+    var ino: i64 = -1;
+    var created: bool = false;
+    if (flags & VFS_O_CREAT) != 0 {
+        val pw: VWalk = vfs_walk(v, path, true, true);
+        if pw.err < 0 {
+            return pw.err;
+        }
+        val ex: i64 = vfs_lookup(v, pw.m, pw.ino, pw.name);
+        if ex >= 0 {
+            if (flags & VFS_O_EXCL) != 0 {
+                return 0 - VFS_EEXIST;
+            }
+        } else {
+            if ex != 0 - VFS_ENOENT {
+                return ex;
+            }
+            val ops: FsOps = vfs_ops_of(v, pw.m);
+            val cf = ops.create;
+            val ni: i64 = cf(vfs_fs_of(v, pw.m), pw.ino, pw.name, mode & 4095);
+            if ni < 0 {
+                return ni;
+            }
+            m = pw.m;
+            ino = ni;
+            created = true;
+        }
+    }
+    if !created {
+        val w: VWalk = vfs_walk(v, path, follow, false);
+        if w.err < 0 {
+            return w.err;
+        }
+        m = w.m;
+        ino = w.ino;
+    }
+    val st: VStat = vfs_getattr(v, m, ino);
+    if st.err < 0 {
+        return st.err;
+    }
+    if st.kind == VFS_LNK {
+        return 0 - VFS_ELOOP;
+    }
+    if (flags & VFS_O_DIRECTORY) != 0 && st.kind != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    if st.kind == VFS_DIR && acc != VFS_O_RDONLY {
+        return 0 - VFS_EISDIR;
+    }
+    if (flags & VFS_O_TRUNC) != 0 && acc != VFS_O_RDONLY && st.kind == VFS_REG && st.size > 0 {
+        val ops: FsOps = vfs_ops_of(v, m);
+        val tf = ops.truncate;
+        val r: i64 = tf(vfs_fs_of(v, m), ino, 0);
+        if r < 0 {
+            return r;
+        }
+    }
+    return vfs_alloc_fd(v, m, ino, flags, st.kind);
+}
+
+pub fn vfs_close(v: &mut Vfs, fd: i64) -> i64 {
+    if !vfs_fd_ok(v, fd) {
+        return 0 - VFS_EBADF;
+    }
+    var f: VFile = v.files.get(fd);
+    f.used = false;
+    v.files.set(fd, f);
+    return 0;
+}
+
+/// Duplicate a descriptor onto the lowest free one (dup(2)); the two share
+/// nothing afterwards except the inode (this table has no shared offsets).
+pub fn vfs_dup(v: &mut Vfs, fd: i64) -> i64 {
+    if !vfs_fd_ok(v, fd) {
+        return 0 - VFS_EBADF;
+    }
+    val f: VFile = v.files.get(fd);
+    val nfd: i64 = vfs_alloc_fd(v, f.m, f.ino, f.flags, f.kind);
+    if nfd >= 0 {
+        var g: VFile = v.files.get(nfd);
+        g.off = f.off;
+        v.files.set(nfd, g);
+    }
+    return nfd;
+}
+
+/// pread(2): `n` bytes at `off`, offset unchanged. Sets v.err.
+pub fn vfs_pread(v: &mut Vfs, fd: i64, off: i64, n: i64) -> Vec<i64> {
+    v.err = 0;
+    var empty: Vec<i64> = Vec::new();
+    if !vfs_fd_ok(v, fd) {
+        v.err = 0 - VFS_EBADF;
+        return empty;
+    }
+    val f: VFile = v.files.get(fd);
+    if (f.flags & VFS_O_ACCMODE) == VFS_O_WRONLY {
+        v.err = 0 - VFS_EBADF;
+        return empty;
+    }
+    if f.kind == VFS_DIR {
+        v.err = 0 - VFS_EISDIR;
+        return empty;
+    }
+    if off < 0 || n < 0 {
+        v.err = 0 - VFS_EINVAL;
+        return empty;
+    }
+    val ops: FsOps = vfs_ops_of(v, f.m);
+    val rf = ops.read;
+    return rf(vfs_fs_of(v, f.m), f.ino, off, n);
+}
+
+/// read(2): up to `n` bytes at the descriptor's offset, which advances.
+pub fn vfs_read(v: &mut Vfs, fd: i64, n: i64) -> Vec<i64> {
+    if !vfs_fd_ok(v, fd) {
+        v.err = 0 - VFS_EBADF;
+        return Vec::new();
+    }
+    val off: i64 = v.files.get(fd).off;
+    val data: Vec<i64> = vfs_pread(v, fd, off, n);
+    if v.err == 0 {
+        var f: VFile = v.files.get(fd);
+        f.off = off + data.len();
+        v.files.set(fd, f);
+    }
+    return data;
+}
+
+/// pwrite(2). Returns bytes written or -errno.
+pub fn vfs_pwrite(v: &mut Vfs, fd: i64, off: i64, data: Vec<i64>) -> i64 {
+    if !vfs_fd_ok(v, fd) {
+        return 0 - VFS_EBADF;
+    }
+    val f: VFile = v.files.get(fd);
+    if (f.flags & VFS_O_ACCMODE) == VFS_O_RDONLY {
+        return 0 - VFS_EBADF;
+    }
+    if off < 0 {
+        return 0 - VFS_EINVAL;
+    }
+    val ops: FsOps = vfs_ops_of(v, f.m);
+    val wf = ops.write;
+    return wf(vfs_fs_of(v, f.m), f.ino, off, data);
+}
+
+/// write(2): at the offset (at the end with O_APPEND); the offset advances.
+pub fn vfs_write(v: &mut Vfs, fd: i64, data: Vec<i64>) -> i64 {
+    if !vfs_fd_ok(v, fd) {
+        return 0 - VFS_EBADF;
+    }
+    val f: VFile = v.files.get(fd);
+    var off: i64 = f.off;
+    if (f.flags & VFS_O_APPEND) != 0 {
+        off = vfs_getattr(v, f.m, f.ino).size;
+    }
+    val n: i64 = vfs_pwrite(v, fd, off, data);
+    if n >= 0 {
+        var g: VFile = v.files.get(fd);
+        g.off = off + n;
+        v.files.set(fd, g);
+    }
+    return n;
+}
+
+/// lseek(2). Seeking past the end is allowed (a later write leaves a hole
+/// of zeros). Returns the new offset or -errno.
+pub fn vfs_lseek(v: &mut Vfs, fd: i64, off: i64, whence: i64) -> i64 {
+    if !vfs_fd_ok(v, fd) {
+        return 0 - VFS_EBADF;
+    }
+    var f: VFile = v.files.get(fd);
+    var base: i64 = 0;
+    if whence == VFS_SEEK_CUR {
+        base = f.off;
+    } else if whence == VFS_SEEK_END {
+        base = vfs_getattr(v, f.m, f.ino).size;
+    } else if whence != VFS_SEEK_SET {
+        return 0 - VFS_EINVAL;
+    }
+    val pos: i64 = base + off;
+    if pos < 0 {
+        return 0 - VFS_EINVAL;
+    }
+    f.off = pos;
+    v.files.set(fd, f);
+    return pos;
+}
+
+pub fn vfs_fstat(v: &mut Vfs, fd: i64) -> VStat {
+    if !vfs_fd_ok(v, fd) {
+        return VStat { err: 0 - VFS_EBADF, dev: -1, ino: -1, kind: 0, size: 0, nlink: 0, mode: 0, mtime: 0 };
+    }
+    val f: VFile = v.files.get(fd);
+    return vfs_getattr(v, f.m, f.ino);
+}
+
+/// The next entry of an open directory (getdents): ino -1 at the end.
+/// The descriptor's offset is the entry index.
+pub fn vfs_readdir_fd(v: &mut Vfs, fd: i64) -> VDirent {
+    v.err = 0;
+    if !vfs_fd_ok(v, fd) {
+        v.err = 0 - VFS_EBADF;
+        return VDirent { name: "", ino: -1, kind: 0 };
+    }
+    var f: VFile = v.files.get(fd);
+    if f.kind != VFS_DIR {
+        v.err = 0 - VFS_ENOTDIR;
+        return VDirent { name: "", ino: -1, kind: 0 };
+    }
+    val ops: FsOps = vfs_ops_of(v, f.m);
+    val rd = ops.readdir;
+    val name: str = rd(vfs_fs_of(v, f.m), f.ino, f.off);
+    if str_len(name) == 0 {
+        return VDirent { name: "", ino: -1, kind: 0 };
+    }
+    f.off = f.off + 1;
+    v.files.set(fd, f);
+    val ino: i64 = vfs_lookup(v, f.m, f.ino, name);
+    val st: VStat = vfs_getattr(v, f.m, ino);
+    return VDirent { name: name, ino: ino, kind: st.kind };
+}
+
+// --- path operations ------------------------------------------------------------
+
+fn vfs_stat_err(e: i64) -> VStat {
+    return VStat { err: e, dev: -1, ino: -1, kind: 0, size: 0, nlink: 0, mode: 0, mtime: 0 };
+}
+
+pub fn vfs_stat(v: &mut Vfs, path: str) -> VStat {
+    val w: VWalk = vfs_walk(v, path, true, false);
+    if w.err < 0 {
+        return vfs_stat_err(w.err);
+    }
+    return vfs_getattr(v, w.m, w.ino);
+}
+
+/// stat without following a symlink in the last component.
+pub fn vfs_lstat(v: &mut Vfs, path: str) -> VStat {
+    val w: VWalk = vfs_walk(v, path, false, false);
+    if w.err < 0 {
+        return vfs_stat_err(w.err);
+    }
+    return vfs_getattr(v, w.m, w.ino);
+}
+
+/// The entries of a directory (no "." or ".."), in the file system's
+/// order. Sets v.err.
+pub fn vfs_readdir(v: &mut Vfs, path: str) -> Vec<VDirent> {
+    var out: Vec<VDirent> = Vec::new();
+    val fd: i64 = vfs_open(v, path, VFS_O_RDONLY | VFS_O_DIRECTORY);
+    if fd < 0 {
+        v.err = fd;
+        return out;
+    }
+    loop {
+        val d: VDirent = vfs_readdir_fd(v, fd);
+        if d.ino < 0 {
+            break;
+        }
+        out.push(d);
+    }
+    val e: i64 = v.err;
+    vfs_close(v, fd);
+    v.err = e;
+    return out;
+}
+
+/// The names of a directory's entries.
+pub fn vfs_list(v: &mut Vfs, path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val ds: Vec<VDirent> = vfs_readdir(v, path);
+    var i: i64 = 0;
+    while i < ds.len() {
+        out.push(ds.get(i).name);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn vfs_mkdir(v: &mut Vfs, path: str, mode: i64) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, true);
+    if w.err < 0 {
+        if w.err == 0 - VFS_EINVAL {
+            return 0 - VFS_EEXIST;
+        }
+        return w.err;
+    }
+    if vfs_lookup(v, w.m, w.ino, w.name) >= 0 {
+        return 0 - VFS_EEXIST;
+    }
+    val ops: FsOps = vfs_ops_of(v, w.m);
+    val f = ops.mkdir;
+    val r: i64 = f(vfs_fs_of(v, w.m), w.ino, w.name, mode);
+    if r < 0 {
+        return r;
+    }
+    return 0;
+}
+
+/// mkdir -p: every missing directory of `path`. Returns 0 or -errno.
+pub fn vfs_mkdir_p(v: &mut Vfs, path: str) -> i64 {
+    val comps: Vec<str> = vfs_split(path);
+    var cur: str = "";
+    if str_len(path) > 0 && str_byte_at(path, 0) != 47 {
+        cur = ".";
+    }
+    var i: i64 = 0;
+    while i < comps.len() {
+        cur = cur + "/" + comps.get(i);
+        val st: VStat = vfs_stat(v, cur);
+        if st.err == 0 - VFS_ENOENT {
+            val r: i64 = vfs_mkdir(v, cur, 493);
+            if r < 0 {
+                return r;
+            }
+        } else if st.err < 0 {
+            return st.err;
+        } else if st.kind != VFS_DIR {
+            return 0 - VFS_ENOTDIR;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn vfs_is_mountpoint(v: & Vfs, m: i64, ino: i64) -> bool {
+    return vfs_mount_on(v, m, ino) >= 0;
+}
+
+pub fn vfs_unlink(v: &mut Vfs, path: str) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, true);
+    if w.err < 0 {
+        return w.err;
+    }
+    val ino: i64 = vfs_lookup(v, w.m, w.ino, w.name);
+    if ino < 0 {
+        return ino;
+    }
+    if vfs_getattr(v, w.m, ino).kind == VFS_DIR {
+        return 0 - VFS_EISDIR;
+    }
+    val ops: FsOps = vfs_ops_of(v, w.m);
+    val f = ops.unlink;
+    val r: i64 = f(vfs_fs_of(v, w.m), w.ino, w.name);
+    vfs_dc_drop(v, w.m, w.ino, w.name);
+    return r;
+}
+
+pub fn vfs_rmdir(v: &mut Vfs, path: str) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, true);
+    if w.err < 0 {
+        return w.err;
+    }
+    val ino: i64 = vfs_lookup(v, w.m, w.ino, w.name);
+    if ino < 0 {
+        return ino;
+    }
+    if vfs_getattr(v, w.m, ino).kind != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    if vfs_is_mountpoint(v, w.m, ino) {
+        return 0 - VFS_EBUSY;
+    }
+    val ops: FsOps = vfs_ops_of(v, w.m);
+    val f = ops.rmdir;
+    val r: i64 = f(vfs_fs_of(v, w.m), w.ino, w.name);
+    vfs_dc_drop(v, w.m, w.ino, w.name);
+    return r;
+}
+
+/// rename(2): within one mount (EXDEV across mounts); replaces a file, or
+/// an empty directory with a directory.
+pub fn vfs_rename(v: &mut Vfs, from: str, to: str) -> i64 {
+    val a: VWalk = vfs_walk(v, from, true, true);
+    if a.err < 0 {
+        return a.err;
+    }
+    val b: VWalk = vfs_walk(v, to, true, true);
+    if b.err < 0 {
+        return b.err;
+    }
+    if a.m != b.m {
+        return 0 - VFS_EXDEV;
+    }
+    val src: i64 = vfs_lookup(v, a.m, a.ino, a.name);
+    if src < 0 {
+        return src;
+    }
+    if vfs_is_mountpoint(v, a.m, src) {
+        return 0 - VFS_EBUSY;
+    }
+    val dst: i64 = vfs_lookup(v, b.m, b.ino, b.name);
+    if dst >= 0 && vfs_is_mountpoint(v, b.m, dst) {
+        return 0 - VFS_EBUSY;
+    }
+    val ops: FsOps = vfs_ops_of(v, a.m);
+    val f = ops.rename;
+    val r: i64 = f(vfs_fs_of(v, a.m), a.ino, a.name, b.ino, b.name);
+    if r >= 0 {
+        vfs_dc_drop(v, a.m, a.ino, a.name);
+        vfs_dc_drop(v, b.m, b.ino, b.name);
+    }
+    return r;
+}
+
+/// symlink(2): a link at `path` whose target is `target` (not checked).
+pub fn vfs_symlink(v: &mut Vfs, target: str, path: str) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, true);
+    if w.err < 0 {
+        return w.err;
+    }
+    if vfs_lookup(v, w.m, w.ino, w.name) >= 0 {
+        return 0 - VFS_EEXIST;
+    }
+    val ops: FsOps = vfs_ops_of(v, w.m);
+    val f = ops.symlink;
+    val r: i64 = f(vfs_fs_of(v, w.m), w.ino, w.name, target);
+    if r < 0 {
+        return r;
+    }
+    return 0;
+}
+
+/// readlink(2): the target, "" with v.err set when `path` is no symlink.
+pub fn vfs_readlink(v: &mut Vfs, path: str) -> str {
+    v.err = 0;
+    val w: VWalk = vfs_walk(v, path, false, false);
+    if w.err < 0 {
+        v.err = w.err;
+        return "";
+    }
+    if vfs_getattr(v, w.m, w.ino).kind != VFS_LNK {
+        v.err = 0 - VFS_EINVAL;
+        return "";
+    }
+    val ops: FsOps = vfs_ops_of(v, w.m);
+    val f = ops.readlink;
+    return f(vfs_fs_of(v, w.m), w.ino);
+}
+
+pub fn vfs_truncate(v: &mut Vfs, path: str, size: i64) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, false);
+    if w.err < 0 {
+        return w.err;
+    }
+    val st: VStat = vfs_getattr(v, w.m, w.ino);
+    if st.kind == VFS_DIR {
+        return 0 - VFS_EISDIR;
+    }
+    if size < 0 {
+        return 0 - VFS_EINVAL;
+    }
+    val ops: FsOps = vfs_ops_of(v, w.m);
+    val f = ops.truncate;
+    return f(vfs_fs_of(v, w.m), w.ino, size);
+}
+
+pub fn vfs_chdir(v: &mut Vfs, path: str) -> i64 {
+    val w: VWalk = vfs_walk(v, path, true, false);
+    if w.err < 0 {
+        return w.err;
+    }
+    if vfs_getattr(v, w.m, w.ino).kind != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    v.cwd_m = w.sm;
+    v.cwd_i = w.si;
+    v.cwd_n = w.sn;
+    return 0;
+}
+
+/// The current directory as the path walked to reach it (symlinks
+/// resolved, as getcwd(3) reports it).
+pub fn vfs_getcwd(v: & Vfs) -> str {
+    if v.cwd_n.len() <= 1 {
+        return "/";
+    }
+    var s: str = "";
+    var i: i64 = 1;
+    while i < v.cwd_n.len() {
+        s = s + "/" + v.cwd_n.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Read a whole file. Sets v.err.
+pub fn vfs_read_file(v: &mut Vfs, path: str) -> Vec<i64> {
+    val fd: i64 = vfs_open(v, path, VFS_O_RDONLY);
+    if fd < 0 {
+        v.err = fd;
+        return Vec::new();
+    }
+    val st: VStat = vfs_fstat(v, fd);
+    val data: Vec<i64> = vfs_read(v, fd, st.size);
+    val e: i64 = v.err;
+    vfs_close(v, fd);
+    v.err = e;
+    return data;
+}
+
+/// Create or replace a whole file. Returns bytes written or -errno.
+pub fn vfs_write_file(v: &mut Vfs, path: str, data: Vec<i64>) -> i64 {
+    val fd: i64 = vfs_open(v, path, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if fd < 0 {
+        return fd;
+    }
+    val n: i64 = vfs_write(v, fd, data);
+    vfs_close(v, fd);
+    return n;
+}
+
+pub fn vfs_errno_name(e: i64) -> str {
+    var n: i64 = e;
+    if n < 0 {
+        n = 0 - n;
+    }
+    if n == 0 { return "OK"; }
+    if n == VFS_EPERM { return "EPERM"; }
+    if n == VFS_ENOENT { return "ENOENT"; }
+    if n == VFS_EIO { return "EIO"; }
+    if n == VFS_EBADF { return "EBADF"; }
+    if n == VFS_EACCES { return "EACCES"; }
+    if n == VFS_EBUSY { return "EBUSY"; }
+    if n == VFS_EEXIST { return "EEXIST"; }
+    if n == VFS_EXDEV { return "EXDEV"; }
+    if n == VFS_ENOTDIR { return "ENOTDIR"; }
+    if n == VFS_EISDIR { return "EISDIR"; }
+    if n == VFS_EINVAL { return "EINVAL"; }
+    if n == VFS_EMFILE { return "EMFILE"; }
+    if n == VFS_EFBIG { return "EFBIG"; }
+    if n == VFS_ENOSPC { return "ENOSPC"; }
+    if n == VFS_EROFS { return "EROFS"; }
+    if n == VFS_ENAMETOOLONG { return "ENAMETOOLONG"; }
+    if n == VFS_ENOSYS { return "ENOSYS"; }
+    if n == VFS_ENOTEMPTY { return "ENOTEMPTY"; }
+    if n == VFS_ELOOP { return "ELOOP"; }
+    return "E" + int_to_str(n);
+}
+
+// --- block devices -----------------------------------------------------------------
+
+/// A block device: `read(handle, lba)` gives one block (block_size bytes,
+/// empty on error), `write(handle, lba, bytes)` stores one (0 or -errno),
+/// `zero(handle, lba, count)` zeroes a range (WRITE ZEROES / discard).
+pub struct BlockDev {
+    pub handle: i64,
+    pub block_size: i64,
+    pub nblocks: i64,
+    pub read: fn(i64, i64) -> Vec<i64>,
+    pub write: fn(i64, i64, Vec<i64>) -> i64,
+    pub zero: fn(i64, i64, i64) -> i64,
+}
+
+/// A BlockDev from a driver's functions (for modules that import vfs).
+pub fn blockdev_new(handle: i64, block_size: i64, nblocks: i64, read: fn(i64, i64) -> Vec<i64>, write: fn(i64, i64, Vec<i64>) -> i64, zero: fn(i64, i64, i64) -> i64) -> BlockDev {
+    return BlockDev { handle: handle, block_size: block_size, nblocks: nblocks, read: read, write: write, zero: zero };
+}
+
+pub fn blk_read(d: & BlockDev, lba: i64) -> Vec<i64> {
+    if lba < 0 || lba >= d.nblocks {
+        return Vec::new();
+    }
+    val f = d.read;
+    return f(d.handle, lba);
+}
+
+pub fn blk_write(d: & BlockDev, lba: i64, data: Vec<i64>) -> i64 {
+    if lba < 0 || lba >= d.nblocks || data.len() != d.block_size {
+        return 0 - VFS_EINVAL;
+    }
+    val f = d.write;
+    return f(d.handle, lba, data);
+}
+
+pub fn blk_zero(d: & BlockDev, lba: i64, count: i64) -> i64 {
+    if lba < 0 || count < 0 || lba + count > d.nblocks {
+        return 0 - VFS_EINVAL;
+    }
+    val f = d.zero;
+    return f(d.handle, lba, count);
+}
+
+/// `len` bytes from byte offset `off` (any alignment).
+pub fn blk_read_bytes(d: & BlockDev, off: i64, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var pos: i64 = off;
+    val end: i64 = off + len;
+    while pos < end {
+        val lba: i64 = pos / d.block_size;
+        val b: Vec<i64> = blk_read(d, lba);
+        if b.len() == 0 {
+            return out;
+        }
+        var i: i64 = pos - lba * d.block_size;
+        while i < d.block_size && pos < end {
+            out.push(b.get(i));
+            i = i + 1;
+            pos = pos + 1;
+        }
+    }
+    return out;
+}
+
+/// Write `data` at byte offset `off` (read-modify-write of partial blocks).
+pub fn blk_write_bytes(d: & BlockDev, off: i64, data: Vec<i64>) -> i64 {
+    var pos: i64 = off;
+    var k: i64 = 0;
+    while k < data.len() {
+        val lba: i64 = pos / d.block_size;
+        var start: i64 = pos - lba * d.block_size;
+        var b: Vec<i64> = Vec::new();
+        if start == 0 && data.len() - k >= d.block_size {
+            var j: i64 = 0;
+            while j < d.block_size {
+                b.push(data.get(k + j));
+                j = j + 1;
+            }
+            k = k + d.block_size;
+            pos = pos + d.block_size;
+        } else {
+            b = blk_read(d, lba);
+            if b.len() == 0 {
+                return 0 - VFS_EIO;
+            }
+            while start < d.block_size && k < data.len() {
+                b.set(start, data.get(k));
+                start = start + 1;
+                k = k + 1;
+                pos = pos + 1;
+            }
+        }
+        val r: i64 = blk_write(d, lba, b);
+        if r < 0 {
+            return r;
+        }
+    }
+    return 0;
+}
+
+// --- memdisk: a sparse RAM block device --------------------------------------------
+
+var md_bsize: Vec<i64> = Vec::new();
+var md_nblocks: Vec<i64> = Vec::new();
+var md_index: HashMap<i64, i64> = HashMap::new();
+var md_store: Vec<Vec<i64>> = Vec::new();
+var md_used: Vec<i64> = Vec::new();
+var md_zeros: Vec<Vec<i64>> = Vec::new();
+
+fn md_key(h: i64, lba: i64) -> i64 {
+    return h * 4294967296 + lba;
+}
+
+pub fn memdisk_read(h: i64, lba: i64) -> Vec<i64> {
+    if h < 0 || h >= md_bsize.len() || lba < 0 || lba >= md_nblocks.get(h) {
+        return Vec::new();
+    }
+    val k: i64 = md_key(h, lba);
+    if md_index.contains(k) {
+        return md_store.get(md_index.get(k));
+    }
+    // one shared zero block per disk (callers that change it get a copy)
+    return md_zeros.get(h);
+}
+
+pub fn memdisk_write(h: i64, lba: i64, data: Vec<i64>) -> i64 {
+    if h < 0 || h >= md_bsize.len() || lba < 0 || lba >= md_nblocks.get(h) {
+        return 0 - VFS_EIO;
+    }
+    val k: i64 = md_key(h, lba);
+    if md_index.contains(k) {
+        md_store.set(md_index.get(k), data);
+    } else {
+        md_index.insert(k, md_store.len());
+        md_store.push(data);
+        md_used.set(h, md_used.get(h) + 1);
+    }
+    return 0;
+}
+
+pub fn memdisk_zero(h: i64, lba: i64, count: i64) -> i64 {
+    var i: i64 = 0;
+    while i < count {
+        val k: i64 = md_key(h, lba + i);
+        if md_index.contains(k) {
+            md_store.set(md_index.get(k), Vec::new());
+            md_index.remove(k);
+            md_used.set(h, md_used.get(h) - 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// A new zero-filled RAM disk of `nblocks` blocks of `bsize` bytes.
+pub fn memdisk_new(bsize: i64, nblocks: i64) -> BlockDev {
+    val h: i64 = md_bsize.len();
+    md_bsize.push(bsize);
+    md_nblocks.push(nblocks);
+    md_used.push(0);
+    md_zeros.push(Vec::filled(bsize, 0));
+    return BlockDev { handle: h, block_size: bsize, nblocks: nblocks, read: memdisk_read, write: memdisk_write, zero: memdisk_zero };
+}
+
+/// A RAM disk holding `bytes` (padded with zeros to whole blocks); blocks
+/// that are all zero are not stored.
+pub fn memdisk_from_bytes(bytes: Vec<i64>, bsize: i64) -> BlockDev {
+    val n: i64 = (bytes.len() + bsize - 1) / bsize;
+    val d: BlockDev = memdisk_new(bsize, n);
+    var lba: i64 = 0;
+    while lba < n {
+        var b: Vec<i64> = Vec::new();
+        var nz: bool = false;
+        var i: i64 = 0;
+        while i < bsize {
+            val o: i64 = lba * bsize + i;
+            var x: i64 = 0;
+            if o < bytes.len() {
+                x = bytes.get(o);
+            }
+            if x != 0 {
+                nz = true;
+            }
+            b.push(x);
+            i = i + 1;
+        }
+        if nz {
+            memdisk_write(d.handle, lba, b);
+        }
+        lba = lba + 1;
+    }
+    return d;
+}
+
+/// How many blocks of the disk are stored (written and not zeroed).
+pub fn memdisk_used_blocks(h: i64) -> i64 {
+    return md_used.get(h);
+}

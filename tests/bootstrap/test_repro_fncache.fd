@@ -1,0 +1,77 @@
+// SP20 (docs/roadmap/llvm-roadmap.md): a build with the per-function
+// native cache (FID_FNCACHE, compiler/nat_ir.fd CS6) must be the same
+// bytes on a hit as a build without it. The program has functions with the
+// same code (the machine layer folds each pair into one function): when
+// the first of a pair is replayed from the cache and the second, folded
+// away when the cache was written, is compiled again, the two must still
+// fold. Before the fold key named call targets by identity
+// (nat_ir.fd ng_fold_key_ids) a hit's image had the second copy too.
+// scripts/repro-check.sh builds it with the caches off, on a miss and on a
+// hit and compares the files; this output is what every backend prints.
+// Expected output:
+// 5050
+// 5050
+// 120
+// 120
+// abcabc
+// abcabc
+// 74 74
+// repro ok
+
+// Each pair is written on one line: the machine layer keeps a function's
+// source lines in its code (MO_LINE), so only functions on the same lines
+// have the same code. The first of each pair calls a function or names a
+// string: its key holds that label.
+fn sum_to(n: i64) -> i64 { var s: i64 = 0; var i: i64 = 1; while i <= n { s = s + i; i = i + 1; } return s; } fn sum_to_again(n: i64) -> i64 { var s: i64 = 0; var i: i64 = 1; while i <= n { s = s + i; i = i + 1; } return s; }
+
+fn fact(n: i64) -> i64 {
+    var r: i64 = 1;
+    var i: i64 = 2;
+    while i <= n {
+        r = r * i;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn fact_of_five() -> i64 { return fact(5); } fn fact_of_five_again() -> i64 { return fact(5); }
+
+fn twice(s: str) -> str {
+    return s + s;
+}
+
+fn abc_twice() -> str { return twice("abc"); } fn abc_twice_again() -> str { return twice("abc"); }
+
+fn weigh(a: i64, b: i64) -> i64 { return fact(a) * 3 + b; } fn weigh_again(a: i64, b: i64) -> i64 { return fact(a) * 3 + b; }
+
+// Labels this function makes (its strings, its checked division and
+// indexing) come before the labels its callees make: a replayed copy of it
+// makes none, so the labels made after it are numbered differently on a hit
+fn run_all(v: Vec<i64>, d: i64) {
+    var k: i64 = 0;
+    var t: i64 = 0;
+    while k < v.len() {
+        t = t + v.get(k) / d;
+        k = k + 1;
+    }
+    if t < 0 {
+        println("negative total");
+    }
+    println(sum_to(100));
+    println(sum_to_again(100));
+    println(fact_of_five());
+    println(fact_of_five_again());
+    println(abc_twice());
+    println(abc_twice_again());
+    print(weigh(4, 2));
+    print(" ");
+    println(weigh_again(4, 2));
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    v.push(4);
+    run_all(v, 1);
+    println("repro ok");
+}

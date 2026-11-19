@@ -1,0 +1,818 @@
+// Fides background jobs: a priority queue of jobs with retries, backoff,
+// delays, cron schedules and a dead-letter list
+//
+// Real (pure computation; time is always a parameter, so tests are exact):
+//   - jobs with a queue name, a payload string, a priority (higher runs
+//     first), a run-at time (delayed and scheduled jobs), attempts and a
+//     maximum; reserve hands out the due job with the highest priority
+//     (then the earliest run-at, then the oldest) under a lease: a job not
+//     completed or failed before its lease ends goes back to the queue on
+//     the next tick, counted as a failed attempt;
+//   - retries with exponential backoff: base * 2^(attempt-1), capped, with
+//     "equal jitter" (half fixed, half random) from a seeded xorshift64*
+//     generator kept in the queue, so the same seed gives the same delays;
+//   - a dead-letter list for jobs out of attempts, with retry-from-dead;
+//   - cron expressions (minute hour day-of-month month day-of-week): '*',
+//     lists, ranges, steps ("*/15", "1-30/5", "5/10"), month and weekday
+//     names, 0 or 7 for Sunday, @yearly @annually @monthly @weekly @daily
+//     @midnight @hourly; Vixie cron's rule that when both day fields are
+//     restricted a day matching either runs; the next run time after a
+//     given Unix time (UTC), found field by field, -1 for an expression no
+//     date matches (Feb 30) within 8 years;
+//   - recurring jobs: jobs_tick enqueues one job per cron occurrence;
+//   - the storage interface: JobBackend, four functions over a handle
+//     (put record, get record, delete, list ids). The queue keeps its index
+//     in memory and writes every change through as a text record
+//     (jobs_encode / jobs_decode); jobs_load rebuilds a queue from a
+//     backend. jobs_mem_backend() is the in-memory implementation (records
+//     in a table of this module); a file or database backend implements
+//     the same four functions.
+//
+// No threads: workers call jobs_reserve / jobs_complete / jobs_fail in
+// their own loop (stdlib task, or another process sharing the backend).
+//
+// Usage:
+//   use jobs;
+//   var q: JobQueue = jobs_queue_new(jobs_mem_backend(), 7);
+//   val id: i64 = jobs_enqueue(&mut q, "mail", "to=ada", 5, 0, 3, now_ms);
+//   match jobs_reserve(&mut q, "mail", now_ms, 30000) {
+//       Option::Some(j) => { if send(j.payload) { jobs_complete(&mut q, j.id, now_ms); }
+//                             else { jobs_fail(&mut q, j.id, "smtp down", now_ms); } }
+//       Option::None => {}
+//   }
+//   jobs_add_cron(&mut q, "report", "0 6 * * MON-FRI", "daily", "build", now_ms);
+
+module jobs;
+ use vec; use string;
+
+pub const JOB_PENDING: i64 = 0;
+pub const JOB_RUNNING: i64 = 1;
+pub const JOB_DONE: i64 = 2;
+pub const JOB_DEAD: i64 = 3;
+
+pub struct Job {
+    pub id: i64,
+    pub queue: str,
+    pub payload: str,
+    pub priority: i64,
+    pub state: i64,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub run_at: i64,
+    pub created: i64,
+    pub lease_until: i64,
+    pub last_error: str,
+}
+
+// ─── Storage interface ────────────────────────────────────────────────────
+
+/// Where job records live. put(handle, id, record) stores or replaces,
+/// get(handle, id) gives the record ("" when none), del(handle, id)
+/// removes, ids(handle) lists the stored ids.
+pub struct JobBackend {
+    pub h: i64,
+    pub put: fn(i64, i64, str) -> bool,
+    pub get: fn(i64, i64) -> str,
+    pub del: fn(i64, i64) -> bool,
+    pub ids: fn(i64) -> Vec<i64>,
+}
+
+// The in-memory backend: one record table per handle.
+var JB_TABLE: Vec<i64> = Vec::new();
+var JB_IDS: Vec<i64> = Vec::new();
+var JB_RECS: Vec<str> = Vec::new();
+var JB_NEXT: i64 = 1;
+
+fn jb_find(h: i64, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < JB_IDS.len() {
+        if JB_TABLE.get(i) == h && JB_IDS.get(i) == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn jb_put(h: i64, id: i64, rec: str) -> bool {
+    val i: i64 = jb_find(h, id);
+    if i >= 0 {
+        JB_RECS.set(i, rec);
+        return true;
+    }
+    JB_TABLE.push(h);
+    JB_IDS.push(id);
+    JB_RECS.push(rec);
+    return true;
+}
+
+fn jb_get(h: i64, id: i64) -> str {
+    val i: i64 = jb_find(h, id);
+    if i < 0 {
+        return "";
+    }
+    return JB_RECS.get(i);
+}
+
+fn jb_del(h: i64, id: i64) -> bool {
+    val i: i64 = jb_find(h, id);
+    if i < 0 {
+        return false;
+    }
+    JB_TABLE.remove(i);
+    JB_IDS.remove(i);
+    JB_RECS.remove(i);
+    return true;
+}
+
+fn jb_ids(h: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < JB_IDS.len() {
+        if JB_TABLE.get(i) == h {
+            out.push(JB_IDS.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A new, empty in-memory backend.
+pub fn jobs_mem_backend() -> JobBackend {
+    val h: i64 = JB_NEXT;
+    JB_NEXT = JB_NEXT + 1;
+    return JobBackend { h: h, put: jb_put, get: jb_get, del: jb_del, ids: jb_ids };
+}
+
+// ─── Records ──────────────────────────────────────────────────────────────
+
+fn jb_escape(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    val hx: str = "0123456789ABCDEF";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 9 || c == 10 || c == 13 || c == 37 {
+            out.push(37);
+            out.push(str_byte_at(hx, c >> 4));
+            out.push(str_byte_at(hx, c & 15));
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn jb_hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return 0;
+}
+
+fn jb_unescape(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < str_len(s) {
+            out.push(jb_hexv(str_byte_at(s, i + 1)) * 16 + jb_hexv(str_byte_at(s, i + 2)));
+            i = i + 3;
+        } else {
+            out.push(c);
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+/// A job as one line of tab-separated fields (the backend's record).
+pub fn jobs_encode(j: & Job) -> str {
+    return "v1\t" + int_to_str(j.id) + "\t" + jb_escape(j.queue) + "\t" + int_to_str(j.priority) + "\t" + int_to_str(j.state) + "\t" + int_to_str(j.attempts) + "\t" + int_to_str(j.max_attempts) + "\t" + int_to_str(j.run_at) + "\t" + int_to_str(j.created) + "\t" + int_to_str(j.lease_until) + "\t" + jb_escape(j.last_error) + "\t" + jb_escape(j.payload);
+}
+
+/// Read a record back; None when it is not one.
+pub fn jobs_decode(rec: str) -> Option<Job> {
+    val f: Vec<str> = str_split(rec, "\t");
+    if f.len() != 12 || f.get(0) != "v1" {
+        return Option::None;
+    }
+    return Option::Some(Job {
+        id: str_parse_int(f.get(1)), queue: jb_unescape(f.get(2)), priority: str_parse_int(f.get(3)), state: str_parse_int(f.get(4)), attempts: str_parse_int(f.get(5)), max_attempts: str_parse_int(f.get(6)), run_at: str_parse_int(f.get(7)), created: str_parse_int(f.get(8)), lease_until: str_parse_int(f.get(9)), last_error: jb_unescape(f.get(10)), payload: jb_unescape(f.get(11)),
+    });
+}
+
+// ─── The queue ────────────────────────────────────────────────────────────
+
+pub struct JobQueue {
+    pub jobs: Vec<Job>,
+    // recurring jobs, as parallel lists
+    cron_names: Vec<str>,
+    cron_queues: Vec<str>,
+    cron_payloads: Vec<str>,
+    cron_specs: Vec<CronSpec>,
+    cron_next_s: Vec<i64>,
+    backend: JobBackend,
+    pub next_id: i64,
+    rng: i64,
+    pub backoff_base_ms: i64,
+    pub backoff_max_ms: i64,
+    pub keep_done: bool,
+    pub error: str,
+}
+
+/// A queue over `backend`; `seed` drives the backoff jitter.
+pub fn jobs_queue_new(backend: JobBackend, seed: i64) -> JobQueue {
+    var s: i64 = seed;
+    if s == 0 {
+        s = 88172645463325252;
+    }
+    return JobQueue { jobs: Vec::new(), cron_names: Vec::new(), cron_queues: Vec::new(), cron_payloads: Vec::new(), cron_specs: Vec::new(), cron_next_s: Vec::new(), backend: backend, next_id: 1, rng: s, backoff_base_ms: 1000, backoff_max_ms: 3600000, keep_done: false, error: "" };
+}
+
+/// Rebuild a queue from the records a backend holds.
+pub fn jobs_load(backend: JobBackend, seed: i64) -> JobQueue {
+    var q: JobQueue = jobs_queue_new(backend, seed);
+    val idsf: fn(i64) -> Vec<i64> = backend.ids;
+    val getf: fn(i64, i64) -> str = backend.get;
+    val ids: Vec<i64> = idsf(backend.h);
+    var i: i64 = 0;
+    while i < ids.len() {
+        val rec: str = getf(backend.h, ids.get(i));
+        match jobs_decode(rec) {
+            Option::Some(j) => {
+                q.jobs.push(j);
+                if j.id >= q.next_id {
+                    q.next_id = j.id + 1;
+                }
+            }
+            Option::None => {
+                q.error = "bad record for id " + int_to_str(ids.get(i));
+            }
+        }
+        i = i + 1;
+    }
+    return q;
+}
+
+fn jq_save(q: & mut JobQueue, j: & Job) {
+    val put: fn(i64, i64, str) -> bool = q.backend.put;
+    if !put(q.backend.h, j.id, jobs_encode(j)) {
+        q.error = "backend refused job " + int_to_str(j.id);
+    }
+}
+
+fn jq_index(q: & JobQueue, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < q.jobs.len() {
+        if q.jobs.get(i).id == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Add a job: runs after `delay_ms` from `now_ms`, at most `max_attempts`
+/// times. Returns its id.
+pub fn jobs_enqueue(q: & mut JobQueue, queue: str, payload: str, priority: i64, delay_ms: i64, max_attempts: i64, now_ms: i64) -> i64 {
+    return jobs_schedule(q, queue, payload, priority, now_ms + delay_ms, max_attempts, now_ms);
+}
+
+/// Add a job that runs at `run_at_ms` (or later).
+pub fn jobs_schedule(q: & mut JobQueue, queue: str, payload: str, priority: i64, run_at_ms: i64, max_attempts: i64, now_ms: i64) -> i64 {
+    var m: i64 = max_attempts;
+    if m < 1 {
+        m = 1;
+    }
+    val j: Job = Job { id: q.next_id, queue: queue, payload: payload, priority: priority, state: JOB_PENDING, attempts: 0, max_attempts: m, run_at: run_at_ms, created: now_ms, lease_until: 0, last_error: "" };
+    q.next_id = q.next_id + 1;
+    q.jobs.push(j);
+    jq_save(q, & j);
+    return j.id;
+}
+
+// The index of the due job to run next in `queue`, or -1.
+fn jq_pick(q: & JobQueue, queue: str, now_ms: i64) -> i64 {
+    var best: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < q.jobs.len() {
+        val j: Job = q.jobs.get(i);
+        if j.state == JOB_PENDING && j.run_at <= now_ms && (str_len(queue) == 0 || j.queue == queue) {
+            if best < 0 {
+                best = i;
+            } else {
+                val b: Job = q.jobs.get(best);
+                if j.priority > b.priority || (j.priority == b.priority && (j.run_at < b.run_at || (j.run_at == b.run_at && j.id < b.id))) {
+                    best = i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn jq_start(q: & mut JobQueue, i: i64, now_ms: i64, lease_ms: i64) {
+    var j: Job = q.jobs.get(i);
+    j.state = JOB_RUNNING;
+    j.attempts = j.attempts + 1;
+    j.lease_until = now_ms + lease_ms;
+    q.jobs.set(i, j);
+    jq_save(q, & j);
+}
+
+/// The due job to run next in `queue` ("" = any queue), now marked running
+/// until now + lease_ms.
+pub fn jobs_reserve(q: & mut JobQueue, queue: str, now_ms: i64, lease_ms: i64) -> Option<Job> {
+    val i: i64 = jq_pick(q, queue, now_ms);
+    if i < 0 {
+        return Option::None;
+    }
+    jq_start(q, i, now_ms, lease_ms);
+    return Option::Some(q.jobs.get(i));
+}
+
+/// jobs_reserve giving the job's id (-1 when none is due); read the job
+/// with jobs_get.
+pub fn jobs_reserve_id(q: & mut JobQueue, queue: str, now_ms: i64, lease_ms: i64) -> i64 {
+    val i: i64 = jq_pick(q, queue, now_ms);
+    if i < 0 {
+        return 0 - 1;
+    }
+    jq_start(q, i, now_ms, lease_ms);
+    return q.jobs.get(i).id;
+}
+
+/// The job finished: removed (or kept as done with keep_done).
+pub fn jobs_complete(q: & mut JobQueue, id: i64, now_ms: i64) -> bool {
+    val i: i64 = jq_index(q, id);
+    if i < 0 || q.jobs.get(i).state != JOB_RUNNING {
+        return false;
+    }
+    var j: Job = q.jobs.get(i);
+    if q.keep_done {
+        j.state = JOB_DONE;
+        j.lease_until = now_ms;
+        q.jobs.set(i, j);
+        jq_save(q, & j);
+    } else {
+        q.jobs.remove(i);
+        val del: fn(i64, i64) -> bool = q.backend.del;
+        del(q.backend.h, id);
+    }
+    return true;
+}
+
+@wrapping fn jq_random(q: & mut JobQueue) -> i64 {
+    var x: i64 = q.rng;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    q.rng = x;
+    val v: i64 = x * 2685821657736338717;
+    return (v >> 1) & 4611686018427387903;
+}
+
+/// The delay before retry number `attempt` (1 = after the first failure):
+/// base * 2^(attempt-1) capped at max, then half of it fixed and half
+/// random ("equal jitter").
+pub fn jobs_backoff_ms(q: & mut JobQueue, attempt: i64) -> i64 {
+    var d: i64 = q.backoff_base_ms;
+    var k: i64 = 1;
+    while k < attempt && d < q.backoff_max_ms {
+        d = d * 2;
+        k = k + 1;
+    }
+    if d > q.backoff_max_ms {
+        d = q.backoff_max_ms;
+    }
+    val half: i64 = d / 2;
+    return half + jq_random(q) % (d - half + 1);
+}
+
+fn jq_failed(q: & mut JobQueue, i: i64, error: str, now_ms: i64) {
+    var j: Job = q.jobs.get(i);
+    j.last_error = error;
+    j.lease_until = 0;
+    if j.attempts >= j.max_attempts {
+        j.state = JOB_DEAD;
+    } else {
+        j.state = JOB_PENDING;
+        j.run_at = now_ms + jobs_backoff_ms(q, j.attempts);
+    }
+    q.jobs.set(i, j);
+    jq_save(q, & j);
+}
+
+/// The job failed: retried after the backoff, or dead when out of attempts.
+pub fn jobs_fail(q: & mut JobQueue, id: i64, error: str, now_ms: i64) -> bool {
+    val i: i64 = jq_index(q, id);
+    if i < 0 || q.jobs.get(i).state != JOB_RUNNING {
+        return false;
+    }
+    jq_failed(q, i, error, now_ms);
+    return true;
+}
+
+/// The dead-letter list.
+pub fn jobs_dead(q: & JobQueue) -> Vec<Job> {
+    var out: Vec<Job> = Vec::new();
+    var i: i64 = 0;
+    while i < q.jobs.len() {
+        if q.jobs.get(i).state == JOB_DEAD {
+            out.push(q.jobs.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Put a dead job back with its attempts reset.
+pub fn jobs_retry_dead(q: & mut JobQueue, id: i64, now_ms: i64) -> bool {
+    val i: i64 = jq_index(q, id);
+    if i < 0 || q.jobs.get(i).state != JOB_DEAD {
+        return false;
+    }
+    var j: Job = q.jobs.get(i);
+    j.state = JOB_PENDING;
+    j.attempts = 0;
+    j.run_at = now_ms;
+    q.jobs.set(i, j);
+    jq_save(q, & j);
+    return true;
+}
+
+/// Jobs in a state (JOB_PENDING ...); pending ones not yet due count too.
+pub fn jobs_count(q: & JobQueue, state: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < q.jobs.len() {
+        if q.jobs.get(i).state == state {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn jobs_get(q: & JobQueue, id: i64) -> Option<Job> {
+    val i: i64 = jq_index(q, id);
+    if i < 0 {
+        return Option::None;
+    }
+    return Option::Some(q.jobs.get(i));
+}
+
+/// When the next pending job is due (-1 when none): a worker sleeps until.
+pub fn jobs_next_due(q: & JobQueue) -> i64 {
+    var t: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < q.jobs.len() {
+        val j: Job = q.jobs.get(i);
+        if j.state == JOB_PENDING && (t < 0 || j.run_at < t) {
+            t = j.run_at;
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+/// Housekeeping at `now_ms`: expired leases count as failures, and each
+/// cron occurrence that has come enqueues one job (priority 0, at most 3
+/// attempts, run-at the occurrence). Returns how many jobs it enqueued or
+/// requeued.
+pub fn jobs_tick(q: & mut JobQueue, now_ms: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < q.jobs.len() {
+        val j: Job = q.jobs.get(i);
+        if j.state == JOB_RUNNING && j.lease_until <= now_ms {
+            jq_failed(q, i, "lease expired", now_ms);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    val now_s: i64 = now_ms / 1000;
+    i = 0;
+    while i < q.cron_names.len() {
+        val spec: CronSpec = q.cron_specs.get(i);
+        var next_s: i64 = q.cron_next_s.get(i);
+        var guard: i64 = 0;
+        while next_s >= 0 && next_s <= now_s && guard < 1000 {
+            jobs_schedule(q, q.cron_queues.get(i), q.cron_payloads.get(i), 0, next_s * 1000, 3, now_ms);
+            n = n + 1;
+            next_s = cron_next(& spec, next_s);
+            guard = guard + 1;
+        }
+        q.cron_next_s.set(i, next_s);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// A recurring job: from now on, one job in `queue` per occurrence of the
+/// cron expression. false (q.error set) when the expression is bad.
+pub fn jobs_add_cron(q: & mut JobQueue, name: str, expr: str, queue: str, payload: str, now_ms: i64) -> bool {
+    val spec: CronSpec = cron_parse(expr);
+    if !spec.ok {
+        q.error = spec.error;
+        return false;
+    }
+    val first: i64 = cron_next(& spec, now_ms / 1000);
+    q.cron_names.push(name);
+    q.cron_queues.push(queue);
+    q.cron_payloads.push(payload);
+    q.cron_specs.push(spec);
+    q.cron_next_s.push(first);
+    return true;
+}
+
+/// The next occurrence (Unix seconds) of the cron job `name`, -1 if none.
+pub fn jobs_cron_next(q: & JobQueue, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < q.cron_names.len() {
+        if q.cron_names.get(i) == name {
+            return q.cron_next_s.get(i);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ─── Cron ─────────────────────────────────────────────────────────────────
+
+/// A parsed cron expression: allowed values of each field as bitmasks
+/// (minute 0-59, hour 0-23, dom 1-31, month 1-12, dow 0-6 Sunday=0).
+pub struct CronSpec {
+    pub minutes: i64,
+    pub hours: i64,
+    pub doms: i64,
+    pub months: i64,
+    pub dows: i64,
+    pub dom_star: bool,
+    pub dow_star: bool,
+    pub ok: bool,
+    pub error: str,
+}
+
+fn cr_name_value(s: str, field: i64) -> i64 {
+    val u: str = str_to_upper(s);
+    if field == 3 {
+        val months: str = "JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC";
+        var i: i64 = 0;
+        while i < 12 {
+            if str_slice(months, i * 3, i * 3 + 3) == u {
+                return i + 1;
+            }
+            i = i + 1;
+        }
+    }
+    if field == 4 {
+        val days: str = "SUNMONTUEWEDTHUFRISAT";
+        var i: i64 = 0;
+        while i < 7 {
+            if str_slice(days, i * 3, i * 3 + 3) == u {
+                return i;
+            }
+            i = i + 1;
+        }
+    }
+    if str_len(s) == 0 || str_len(s) > 2 {
+        return 0 - 1;
+    }
+    var v: i64 = 0;
+    var k: i64 = 0;
+    while k < str_len(s) {
+        val c: i64 = str_byte_at(s, k);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        v = v * 10 + (c - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+// One field ("*/15", "1-5,10", "MON-FRI") as a bitmask; -1 when bad.
+fn cr_field(text: str, field: i64, lo: i64, hi: i64) -> i64 {
+    var mask: i64 = 0;
+    val parts: Vec<str> = str_split(text, ",");
+    var p: i64 = 0;
+    while p < parts.len() {
+        val part: str = parts.get(p);
+        var range: str = part;
+        var step: i64 = 1;
+        val slash: i64 = str_find(part, "/");
+        if slash >= 0 {
+            range = str_slice(part, 0, slash);
+            step = cr_name_value(str_slice(part, slash + 1, str_len(part)), 0 - 1);
+            if step <= 0 {
+                return 0 - 1;
+            }
+        }
+        var a: i64 = lo;
+        var b: i64 = hi;
+        if range != "*" {
+            val dash: i64 = str_find(range, "-");
+            if dash >= 0 {
+                a = cr_name_value(str_slice(range, 0, dash), field);
+                b = cr_name_value(str_slice(range, dash + 1, str_len(range)), field);
+            } else {
+                a = cr_name_value(range, field);
+                if slash >= 0 {
+                    b = hi;
+                } else {
+                    b = a;
+                }
+            }
+            if field == 4 && b == 7 {
+                // 7 is Sunday too: "5-7" means Fri, Sat, Sun
+                if a == 7 {
+                    a = 0;
+                    b = 0;
+                } else {
+                    mask = mask | 1;
+                    b = 6;
+                }
+            }
+            if a < lo || b > hi || a > b {
+                return 0 - 1;
+            }
+        }
+        var v: i64 = a;
+        while v <= b {
+            mask = mask | (1 << v);
+            v = v + step;
+        }
+        p = p + 1;
+    }
+    return mask;
+}
+
+fn cr_bad(msg: str) -> CronSpec {
+    return CronSpec { minutes: 0, hours: 0, doms: 0, months: 0, dows: 0, dom_star: true, dow_star: true, ok: false, error: msg };
+}
+
+/// Parse a 5-field cron expression or an @macro.
+pub fn cron_parse(expr: str) -> CronSpec {
+    var e: str = str_trim(expr);
+    if e == "@yearly" || e == "@annually" { e = "0 0 1 1 *"; }
+    if e == "@monthly" { e = "0 0 1 * *"; }
+    if e == "@weekly" { e = "0 0 * * 0"; }
+    if e == "@daily" || e == "@midnight" { e = "0 0 * * *"; }
+    if e == "@hourly" { e = "0 * * * *"; }
+    var fields: Vec<str> = Vec::new();
+    val raw: Vec<str> = str_split(e, " ");
+    var i: i64 = 0;
+    while i < raw.len() {
+        if str_len(raw.get(i)) > 0 {
+            fields.push(raw.get(i));
+        }
+        i = i + 1;
+    }
+    if fields.len() != 5 {
+        return cr_bad("cron: need 5 fields, got " + int_to_str(fields.len()) + " in \"" + expr + "\"");
+    }
+    val mi: i64 = cr_field(fields.get(0), 0, 0, 59);
+    val ho: i64 = cr_field(fields.get(1), 1, 0, 23);
+    val dm: i64 = cr_field(fields.get(2), 2, 1, 31);
+    val mo: i64 = cr_field(fields.get(3), 3, 1, 12);
+    val dw: i64 = cr_field(fields.get(4), 4, 0, 7);
+    if mi < 0 { return cr_bad("cron: bad minute field " + fields.get(0)); }
+    if ho < 0 { return cr_bad("cron: bad hour field " + fields.get(1)); }
+    if dm < 0 { return cr_bad("cron: bad day-of-month field " + fields.get(2)); }
+    if mo < 0 { return cr_bad("cron: bad month field " + fields.get(3)); }
+    if dw < 0 { return cr_bad("cron: bad day-of-week field " + fields.get(4)); }
+    var dows: i64 = dw;
+    if (dows & 128) != 0 {
+        dows = (dows | 1) & 127;
+    }
+    return CronSpec { minutes: mi, hours: ho, doms: dm, months: mo, dows: dows, dom_star: str_starts_with(fields.get(2), "*"), dow_star: str_starts_with(fields.get(4), "*"), ok: true, error: "" };
+}
+
+/// Days since 1970-01-01 of a civil date (proleptic Gregorian).
+pub fn cron_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    var yy: i64 = y;
+    if m <= 2 {
+        yy = yy - 1;
+    }
+    var era: i64 = yy / 400;
+    if yy < 0 && yy % 400 != 0 {
+        era = era - 1;
+    }
+    val yoe: i64 = yy - era * 400;
+    var mp: i64 = m - 3;
+    if m <= 2 {
+        mp = m + 9;
+    }
+    val doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// [year, month, day] of a day number (days since 1970-01-01).
+pub fn cron_civil_from_days(z0: i64) -> Vec<i64> {
+    val z: i64 = z0 + 719468;
+    var era: i64 = z / 146097;
+    if z < 0 && z % 146097 != 0 {
+        era = era - 1;
+    }
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    val d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = mp + 3;
+    if mp >= 10 {
+        m = mp - 9;
+    }
+    var y: i64 = yoe + era * 400;
+    if m <= 2 {
+        y = y + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(y);
+    out.push(m);
+    out.push(d);
+    return out;
+}
+
+/// "YYYY-MM-DD HH:MM Ddd" of a Unix time (UTC), for logs and tests.
+pub fn cron_format(t: i64) -> str {
+    var days: i64 = t / 86400;
+    var secs: i64 = t % 86400;
+    if secs < 0 {
+        secs = secs + 86400;
+        days = days - 1;
+    }
+    val ymd: Vec<i64> = cron_civil_from_days(days);
+    val names: str = "ThuFriSatSunMonTueWed";
+    var wi: i64 = days % 7;
+    if wi < 0 {
+        wi = wi + 7;
+    }
+    return int_to_str(ymd.get(0)) + "-" + cr_two(ymd.get(1)) + "-" + cr_two(ymd.get(2)) + " " + cr_two(secs / 3600) + ":" + cr_two((secs / 60) % 60) + " " + str_slice(names, wi * 3, wi * 3 + 3);
+}
+
+fn cr_two(v: i64) -> str {
+    if v < 10 {
+        return "0" + int_to_str(v);
+    }
+    return int_to_str(v);
+}
+
+fn cr_day_ok(s: & CronSpec, days: i64, dom: i64) -> bool {
+    var dow: i64 = (days + 4) % 7;
+    if dow < 0 {
+        dow = dow + 7;
+    }
+    val dom_hit: bool = (s.doms & (1 << dom)) != 0;
+    val dow_hit: bool = (s.dows & (1 << dow)) != 0;
+    if s.dom_star || s.dow_star {
+        return dom_hit && dow_hit;
+    }
+    return dom_hit || dow_hit;
+}
+
+/// The first time strictly after `after_s` (Unix seconds, UTC) that the
+/// expression matches, or -1 when none comes within 8 years.
+pub fn cron_next(s: & CronSpec, after_s: i64) -> i64 {
+    if !s.ok {
+        return 0 - 1;
+    }
+    // start at the next whole minute
+    var t: i64 = (after_s / 60 + 1) * 60;
+    val limit: i64 = after_s + 8 * 366 * 86400;
+    while t <= limit {
+        val days: i64 = t / 86400;
+        val ymd: Vec<i64> = cron_civil_from_days(days);
+        val y: i64 = ymd.get(0);
+        val mo: i64 = ymd.get(1);
+        val d: i64 = ymd.get(2);
+        if (s.months & (1 << mo)) == 0 {
+            // first day of the next month
+            var ny: i64 = y;
+            var nm: i64 = mo + 1;
+            if nm > 12 {
+                nm = 1;
+                ny = y + 1;
+            }
+            t = cron_days_from_civil(ny, nm, 1) * 86400;
+        } else if !cr_day_ok(s, days, d) {
+            t = (days + 1) * 86400;
+        } else {
+            val secs: i64 = t - days * 86400;
+            val h: i64 = secs / 3600;
+            val mi: i64 = (secs / 60) % 60;
+            if (s.hours & (1 << h)) == 0 {
+                t = days * 86400 + (h + 1) * 3600;
+            } else if (s.minutes & (1 << mi)) == 0 {
+                t = t + 60;
+            } else {
+                return t;
+            }
+        }
+    }
+    return 0 - 1;
+}

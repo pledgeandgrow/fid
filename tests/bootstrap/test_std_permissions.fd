@@ -1,0 +1,125 @@
+// stdlib/permissions: Android permission names per API level and the
+// manifest lines, iOS Info.plist keys and status codes, and the request
+// flow (rationale, don't-ask-again, iOS one-shot, background location
+// after foreground) driven with scripted dialog answers.
+// Expected output:
+// camera android.permission.CAMERA
+// bluetooth 30 android.permission.ACCESS_FINE_LOCATION 31 android.permission.BLUETOOTH_SCAN,android.permission.BLUETOOTH_CONNECT
+// photos 32 1 33 2 34 3
+// runtime notif 32 false 33 true bg-location 28 false 29 true api22 false
+// manifest 11 lines
+// <uses-permission android:name="android.permission.CAMERA" />
+// <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+// <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+// <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+// <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+// <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+// <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+// <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+// <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+// <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+// <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+// android camera: request -> denied; rationale -> request -> permanently-denied; settings
+// android fine: request -> limited; done
+// android photos 34 selected only: limited; images: granted
+// ios camera: request -> permanently-denied; settings
+// ios notifications provisional: done
+// background blocked then request
+// ios location limited not-determined restricted granted
+// ios photos limited; notif ephemeral granted
+// plist missing NSMicrophoneUsageDescription,NSLocationWhenInUseUsageDescription
+// <key>NSCameraUsageDescription</key>
+// <string>Scan &lt;QR&gt; codes</string>
+// <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+// <string>Track runs</string>
+// order camera,location-fine,location-background
+// call requestPermissions (Landroid/app/Activity;[Ljava/lang/String;I)V
+// call PHPhotoLibrary requestAuthorizationForAccessLevel:handler:
+use permissions;
+use vec;
+use string;
+
+fn join(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() { if i > 0 { s = s + ","; } s = s + v.get(i); i = i + 1; }
+    return s;
+}
+
+fn r1(a: i64) -> Vec<i64> { var v: Vec<i64> = Vec::new(); v.push(a); return v; }
+fn r2(a: i64, b: i64) -> Vec<i64> { var v: Vec<i64> = r1(a); v.push(b); return v; }
+fn r3(a: i64, b: i64, c: i64) -> Vec<i64> { var v: Vec<i64> = r2(a, b); v.push(c); return v; }
+
+fn st(s: i64) -> str { return perm_step_name(s); }
+
+fn main() {
+    println("camera " + join(perm_android_names(PERM_CAMERA, 34)));
+    println("bluetooth 30 " + join(perm_android_names(PERM_BLUETOOTH, 30)) + " 31 " + join(perm_android_names(PERM_BLUETOOTH, 31)));
+    println("photos 32 " + int_to_str(perm_android_names(PERM_PHOTOS, 32).len()) + " 33 " + int_to_str(perm_android_names(PERM_PHOTOS, 33).len())
+        + " 34 " + int_to_str(perm_android_names(PERM_PHOTOS, 34).len()));
+    println("runtime notif 32 " + bool_to_str(perm_android_is_runtime(PERM_NOTIFICATIONS, 32)) + " 33 " + bool_to_str(perm_android_is_runtime(PERM_NOTIFICATIONS, 33))
+        + " bg-location 28 " + bool_to_str(perm_android_is_runtime(PERM_LOCATION_BACKGROUND, 28)) + " 29 " + bool_to_str(perm_android_is_runtime(PERM_LOCATION_BACKGROUND, 29))
+        + " api22 " + bool_to_str(perm_android_is_runtime(PERM_CAMERA, 22)));
+    var ps: Vec<i64> = Vec::new();
+    ps.push(PERM_CAMERA); ps.push(PERM_BLUETOOTH); ps.push(PERM_PHOTOS); ps.push(PERM_NOTIFICATIONS);
+    val m: str = perm_android_manifest(ps, 26);
+    val lines: Vec<str> = str_lines(m);
+    println("manifest " + int_to_str(lines.len()) + " lines");
+    var i: i64 = 0;
+    while i < lines.len() { println(lines.get(i)); i = i + 1; }
+
+    var f: PermFlow = perm_flow_new(PERM_CAMERA, PERM_ANDROID, 34);
+    var line: str = "android camera: " + st(perm_flow_next(&f, false));
+    perm_flow_result(&mut f, r1(-1), true);
+    line = line + " -> " + perm_status_name(f.status) + "; " + st(perm_flow_next(&f, true));
+    perm_flow_rationale_shown(&mut f);
+    line = line + " -> " + st(perm_flow_next(&f, true));
+    perm_flow_result(&mut f, r1(-1), false);
+    line = line + " -> " + perm_status_name(f.status) + "; " + st(perm_flow_next(&f, false));
+    println(line);
+
+    var fl: PermFlow = perm_flow_new(PERM_LOCATION_FINE, PERM_ANDROID, 31);
+    var l2: str = "android fine: " + st(perm_flow_next(&fl, false));
+    perm_flow_result(&mut fl, r2(-1, 0), true);
+    println(l2 + " -> " + perm_status_name(fl.status) + "; " + st(perm_flow_next(&fl, false)));
+    println("android photos 34 selected only: " + perm_status_name(perm_android_status(PERM_PHOTOS, 34, r3(-1, -1, 0), true, 1))
+        + "; images: " + perm_status_name(perm_android_status(PERM_PHOTOS, 34, r3(0, -1, -1), true, 0)));
+
+    var fi: PermFlow = perm_flow_new(PERM_CAMERA, PERM_IOS, 0);
+    var l3: str = "ios camera: " + st(perm_flow_next(&fi, false));
+    perm_flow_result(&mut fi, r1(perm_ios_av_status(2)), false);
+    println(l3 + " -> " + perm_status_name(fi.status) + "; " + st(perm_flow_next(&fi, false)));
+    var fn_: PermFlow = perm_flow_new(PERM_NOTIFICATIONS, PERM_IOS, 0);
+    perm_flow_result(&mut fn_, r1(perm_ios_notification_status(3)), false);
+    println("ios notifications " + perm_status_name(fn_.status) + ": " + st(perm_flow_next(&fn_, false)));
+    var fb: PermFlow = perm_flow_new(PERM_LOCATION_BACKGROUND, PERM_ANDROID, 34);
+    fb.prerequisite = PERM_NOT_DETERMINED;
+    val b1: i64 = perm_flow_next(&fb, false);
+    fb.prerequisite = PERM_GRANTED;
+    println("background " + st(b1) + " then " + st(perm_flow_next(&fb, false)));
+    println("ios location " + perm_status_name(perm_ios_location_status(PERM_LOCATION_FINE, 4, 1)) + " "
+        + perm_status_name(perm_ios_location_status(PERM_LOCATION_BACKGROUND, 4, 0)) + " "
+        + perm_status_name(perm_ios_location_status(PERM_LOCATION_COARSE, 1, 0)) + " "
+        + perm_status_name(perm_ios_location_status(PERM_LOCATION_BACKGROUND, 3, 0)));
+    println("ios photos " + perm_status_name(perm_ios_photos_status(4)) + "; notif ephemeral " + perm_status_name(perm_ios_notification_status(4)));
+
+    var pp: Vec<i64> = Vec::new();
+    pp.push(PERM_CAMERA); pp.push(PERM_LOCATION_BACKGROUND); pp.push(PERM_NOTIFICATIONS); pp.push(PERM_MICROPHONE);
+    var ds: Vec<str> = Vec::new();
+    ds.push("Scan <QR> codes"); ds.push("Track runs"); ds.push(""); ds.push("  ");
+    val pl: PlistEntries = perm_ios_plist(pp, ds);
+    println("plist missing " + join(pl.missing));
+    print(pl.xml);
+
+    var order_in: Vec<i64> = Vec::new();
+    order_in.push(PERM_LOCATION_BACKGROUND); order_in.push(PERM_CAMERA); order_in.push(PERM_CAMERA);
+    val order: Vec<i64> = perm_request_order(order_in);
+    var names: Vec<str> = Vec::new();
+    i = 0;
+    while i < order.len() { names.push(perm_name(order.get(i))); i = i + 1; }
+    println("order " + join(names));
+    val c1: PermCall = perm_android_call("request");
+    println("call " + c1.method + " " + c1.sig);
+    val c2: PermCall = perm_ios_call(PERM_PHOTOS);
+    println("call " + c2.cls + " " + c2.method);
+}

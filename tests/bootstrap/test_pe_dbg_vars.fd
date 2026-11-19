@@ -1,0 +1,77 @@
+// Release N9 / llvm-roadmap DB4 for the default Windows backend: a debug
+// build of pe_ir (`fid emit --debug` / `-g`) describes each function's
+// parameters and variables (DW_TAG_formal_parameter / DW_TAG_variable with
+// a type and a location), its declaration line, its frame (.debug_frame)
+// and a line row at its first byte, so a debugger can break at a .fd
+// line or a function, step, and print the variables (compiler/pe_ir.fd
+// PeirGen_dbg_vars_note, compiler/pe_ir_enc.fd pe_add_dwarf).
+// Check (Windows): FID=<fid> bash tests/nattools/pe_dbg_vars_check.sh,
+// which runs tests/nattools/pe_dbg_run_check.py: the program under the
+// Windows debugging API, stopped at the markers below, every variable read
+// through the DWARF and compared with the `dbg` lines; `dbg-step a b`: a
+// step from line @a ends on line @b; `dbg-break f`: a breakpoint on
+// function f stops after its prologue, with these values.
+// Expected output:
+// 45
+// 12
+// 5
+// 61
+// 1
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fn scale(base: i64, factor: i64) -> i64 {
+    var acc: i64 = base * factor;
+    var step: i64 = 3;
+    acc = acc + step; // @scale_add
+    return acc; // @scale_ret
+}
+
+fn area(p: Point) -> i64 {
+    var a: i64 = p.x * p.y; // @area_mul
+    return a; // @area_ret
+}
+
+fn count_bytes(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) != 32 {
+            n = n + 1; // @count
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() {
+    var total: i64 = scale(6, 7);
+    var name: str = "fides";
+    var pt: Point = Point { x: 3, y: 4 };
+    var big: bool = total > 40;
+    var shown: i64 = total; // @main_print
+    println(shown);
+    println(area(pt));
+    println(count_bytes(name));
+    var sum: i64 = total + area(pt) + 4;
+    var last: i64 = sum; // @main_sum
+    println(last);
+    if big {
+        println(1);
+    }
+}
+
+// dbg scale_add#1 base=6 factor=7 acc=42 step=3
+// dbg scale_ret#1 acc=45 base=6
+// dbg area_mul#1 p.x=3 p.y=4
+// dbg area_ret#1 a=12 p.x=3 p.y=4
+// dbg count#3 n=2 i=2 s="fides"
+// dbg main_print#1 total=45 name="fides" pt.x=3 pt.y=4 big=true
+// dbg main_sum#1 sum=61 total=45 shown=45
+// dbg-step scale_add scale_ret
+// dbg-step area_mul area_ret
+// dbg-break scale base=6 factor=7
+// dbg-break count_bytes s="fides"

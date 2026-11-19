@@ -1,0 +1,103 @@
+// stdlib/http (release I8): binary bodies. A body is a counted string
+// (D16: strings carry their length), so zero bytes and bytes above 127 go
+// through a request and a response unchanged, with a Content-Length that
+// counts them, with Content-Length and chunked. A server and a client in
+// one process over a real socket, as in test_http_server.fd.
+//
+// Expected output:
+// sent 7: 0 1 0 255 0 65 128
+// 200 length 7 header 7: 0 1 0 255 0 65 128
+// 200 length 5 header 5: 0 120 0 0 121
+// 200 length 0 header 0:
+// size 7 zeros 3
+use http;
+use task;
+
+fn bytes_of(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        out = out + " " + int_to_str(str_byte_at(s, i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn route(req: HttpRequest) -> str {
+    if req.path == "/echo" {
+        return build_response(200, "application/octet-stream", req.body);
+    }
+    if req.path == "/count" {
+        var zeros: i64 = 0;
+        var i: i64 = 0;
+        while i < str_len(req.body) {
+            if str_byte_at(req.body, i) == 0 {
+                zeros = zeros + 1;
+            }
+            i = i + 1;
+        }
+        return build_response(200, "text/plain", "size " + int_to_str(str_len(req.body)) + " zeros " + int_to_str(zeros));
+    }
+    return build_response(404, "text/plain", "none");
+}
+
+fn show(c: i64) {
+    val m: HttpRequest = http_read_message(c, 5000, false);
+    println(m.target + " length " + int_to_str(str_len(m.body)) + " header " + http_header(m, "content-length") + ":" + bytes_of(m.body));
+}
+
+fn blob(v: Vec<i64>) -> str {
+    return str_from_bytes(v);
+}
+
+async fn client(port: i64) -> Future<i64> {
+    val fd: i64 = p_co_connect("127.0.0.1", port);
+    val c: i64 = http_conn_new(fd, 0);
+    var v: Vec<i64> = Vec::new();
+    v.push(0);
+    v.push(1);
+    v.push(0);
+    v.push(255);
+    v.push(0);
+    v.push(65);
+    v.push(128);
+    val body: str = blob(v);
+    println("sent " + int_to_str(str_len(body)) + ":" + bytes_of(body));
+    if str_len(body) != 7 {
+        p_panic("http binary: str_from_bytes lost bytes");
+    }
+    // Content-Length
+    http_conn_write(c, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n" + body);
+    show(c);
+    // chunked: two chunks, zero bytes at the start, the end and across them
+    var c1: Vec<i64> = Vec::new();
+    c1.push(0);
+    c1.push(120);
+    c1.push(0);
+    var c2: Vec<i64> = Vec::new();
+    c2.push(0);
+    c2.push(121);
+    http_conn_write(c, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n" + blob(c1) + "\r\n2\r\n" + blob(c2) + "\r\n0\r\n\r\n");
+    show(c);
+    // an empty body
+    http_conn_write(c, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+    show(c);
+    // the server sees every byte
+    http_conn_write(c, "POST /count HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\nConnection: close\r\n\r\n" + body);
+    val m: HttpRequest = http_read_message(c, 5000, false);
+    println(m.body);
+    http_conn_close(c);
+    return 0;
+}
+
+fn main() -> i64 {
+    var port: i64 = 18520;
+    var fd: i64 = p_socket_listen(port);
+    while fd < 0 && port < 18540 {
+        port = port + 1;
+        fd = p_socket_listen(port);
+    }
+    http_listen_tasks(fd, route);
+    await client(port);
+    return 0;
+}

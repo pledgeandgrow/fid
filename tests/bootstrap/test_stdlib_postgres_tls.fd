@@ -1,0 +1,30 @@
+// stdlib/postgres_tls (competitive SL12): the module links with module
+// tls (OpenSSL on Linux and macOS, Schannel on Windows) and fails cleanly
+// without a server: nothing listens on 127.0.0.1 port 1, so
+// pg_connect_tls reports it and the connection is not usable. The whole
+// TLS exchange is checked byte by byte in test_stdlib_postgres_io.fd and
+// against a real server by tests/live/postgres_live.sh.
+//
+// Expected output:
+// no server ok
+// postgres tls ok
+use postgres;
+use postgres_tls;
+
+fn main() -> i64 {
+    var c: PgConn = pg_connect_tls("127.0.0.1", 1, "app", "pw", "appdb", PG_SSL_REQUIRE);
+    if c.ok || c.tls {
+        p_panic("postgres tls: connected to nothing");
+    }
+    if !str_equal(c.error, "cannot connect to 127.0.0.1:1") {
+        p_panic("postgres tls: wrong error " + c.error);
+    }
+    val r: PgResult = pg_query(& c, "SELECT 1");
+    if r.ok {
+        p_panic("postgres tls: a query on a failed connection worked");
+    }
+    pg_close(& mut c);
+    println("no server ok");
+    println("postgres tls ok");
+    return 0;
+}

@@ -1,0 +1,176 @@
+// Track MI (docs/roadmap/llvm-roadmap.md), the machine layer
+// (compiler/nat_ir.fd):
+//   MI24 small branch diamonds become conditional selects (ng_fuse_select:
+//        MO_CSEL; x86-64 test + cmov, AArch64 cmp + csel, RISC-V Zicond
+//        czero under --cpu rva23u64): both arms of at most four pure
+//        operations, one defining the result, run unconditionally and the
+//        select keeps one value. Two-armed and one-armed ifs, the arm
+//        that is selected falling through or taken, an arm that reads the
+//        value it replaces, `if` as an expression. What must stay a branch
+//        stays one: an arm that divides (the guard is the point), calls,
+//        prints, or reads memory. FID_NAT_OFF=csel: every diamond a branch.
+// Native check: bash tests/nattools/machine_batch4_check.sh (the MIR has
+// csel on x86-64 and AArch64, none with FID_NAT_OFF=csel; FID_VERIFY=1;
+// the output below on every machine-layer target).
+// Expected output:
+// 9
+// 3
+// -4
+// 4
+// 0
+// 7
+// 10
+// 5
+// 6
+// 100
+// 10
+// 0
+// 25
+// 8
+// 1
+// 0
+// 42
+// -2
+// -7
+// 2
+// 170
+// 2
+// 0
+// 3
+
+fn max2(a: i64, b: i64) -> i64 {
+    var x: i64 = 0;
+    if a < b {
+        x = b;
+    } else {
+        x = a;
+    }
+    return x;
+}
+
+fn min2(a: i64, b: i64) -> i64 {
+    return if a < b { a } else { b };
+}
+
+fn neg_or(a: i64, flip: bool) -> i64 {
+    var x: i64 = a;
+    if flip {
+        x = 0 - a;
+    }
+    return x;
+}
+
+fn abs1(a: i64) -> i64 {
+    var x: i64 = a;
+    if a < 0 {
+        x = 0 - a;
+    }
+    return x;
+}
+
+fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    var x: i64 = v;
+    if v < lo {
+        x = lo;
+    }
+    if v > hi {
+        x = hi;
+    }
+    return x;
+}
+
+// the arm reads the value it replaces
+fn bump_if(x0: i64, c: i64) -> i64 {
+    var x: i64 = x0;
+    if c != 0 {
+        x = x + 3;
+    } else {
+        x = x * 2;
+    }
+    return x;
+}
+
+// a guard: the division must only run when d != 0
+fn safe_div(n: i64, d: i64) -> i64 {
+    var q: i64 = 0;
+    if d != 0 {
+        q = n / d;
+    }
+    return q;
+}
+
+// a load guarded by a bounds test
+fn get_or(v: Vec<i64>, i: i64, dflt: i64) -> i64 {
+    var r: i64 = dflt;
+    if i >= 0 && i < v.len() {
+        r = v.get(i);
+    }
+    return r;
+}
+
+fn sign(a: i64) -> i64 {
+    if a > 0 {
+        return 1;
+    }
+    if a < 0 {
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// a select inside a loop, with the arms' own temporaries
+fn count_big(n: i64, t: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var add: i64 = 0;
+        if i * i > t {
+            add = i - t;
+        } else {
+            add = 1;
+        }
+        s = s + add;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn pick_bits(a: i64, b: i64, hi: bool) -> i64 {
+    var r: i64 = 0;
+    if hi {
+        r = (a << 4) | b;
+    } else {
+        r = (b << 4) | a;
+    }
+    return r;
+}
+
+fn main() {
+    println(max2(3, 9));
+    println(min2(3, 9));
+    println(neg_or(4, true));
+    println(neg_or(4, false));
+    println(abs1(0));
+    println(abs1(0 - 7));
+    println(clamp(12, 0, 10));
+    println(clamp(5, 0, 10));
+    println(clamp(6, 6, 6));
+    println(bump_if(97, 1));
+    println(bump_if(5, 0));
+    println(safe_div(5, 0));
+    println(safe_div(100, 4));
+    var v: Vec<i64> = Vec::new();
+    v.push(8);
+    v.push(1);
+    println(get_or(v, 0, 42));
+    println(get_or(v, 1, 42));
+    println(get_or(v, 5, 0));
+    println(get_or(v, 0 - 1, 42));
+    println(count_big(5, 10));
+    println(count_big(6, 10));
+    println(sign(99) + sign(0 - 3) + sign(0) + 2);
+    println(pick_bits(10, 10, true));
+    println(sign(5) * 2);
+    println(sign(0));
+    println(max2(0 - 3, 3));
+}

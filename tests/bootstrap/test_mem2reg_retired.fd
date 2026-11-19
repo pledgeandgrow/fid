@@ -1,0 +1,119 @@
+// ME3 (llvm-roadmap): `promote` (compiler/iropt.fd iro_promote) is retired
+// where the SSA round trip (compiler/ssa.fd, on by default) runs: ssa
+// replaces every load of a local that has one reaching store, and the
+// merges promote left in memory. promote still runs on the functions ssa
+// does not take (ssa_takes: @constant_time ones here), and everywhere when
+// ssa is off (FID_IROPT_OFF=ssa) or promote is named (FID_IROPT_ON=promote).
+// Every way must print the same: tests/tooling/promote-retired-check.sh
+// builds this with the default, FID_IROPT_ON=promote and
+// FID_IROPT_OFF=ssa,ssaexit.
+//
+// Expected output:
+// 36
+// 17
+// 1
+// 0
+// 200
+// 30
+// 34
+// hello world
+// 45
+
+fn single_stores(a: i64) -> i64 {
+    // each load has one reaching store (what promote did)
+    var x: i64 = a + 1;
+    var y: i64 = x * 2;
+    var z: i64 = y + x;
+    return z + y - x + 12;
+}
+
+fn merged(c: bool) -> i64 {
+    // a merge of two stores (what promote left in memory, ssa makes a phi)
+    var r: i64 = 5;
+    if c {
+        r = 17;
+    }
+    return r;
+}
+
+// @wrapping: a checked `0 - diff` is a data-dependent overflow branch, which
+// the native backend's @constant_time check rejects (test_ct_asm.fd)
+@constant_time
+@wrapping
+fn ct_eq(a: i64, b: i64) -> i64 {
+    // ssa leaves @constant_time functions alone: promote still runs here
+    var diff: i64 = a ^ b;
+    var nonzero: i64 = ((diff | (0 - diff)) >> 63) & 1;
+    var r: i64 = 1 - nonzero;
+    return r;
+}
+
+@constant_time
+@wrapping
+fn ct_pick(c: i64, a: i64, b: i64) -> i64 {
+    var mask: i64 = 0 - c;
+    var out: i64 = (a & mask) | (b & ~mask);
+    var again: i64 = out;
+    return again;
+}
+
+fn loop_sum(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i * 2;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn swap_sum(n: i64) -> i64 {
+    var a: i64 = 1;
+    var b: i64 = 2;
+    var k: i64 = 0;
+    while k < n {
+        var t: i64 = a;
+        a = b;
+        b = t + b;
+        k = k + 1;
+    }
+    return a + b;
+}
+
+fn owned_text(n: i64) -> str {
+    // an owned string local (dropped at scope end): stays a slot for ssa
+    var s: str = "hello";
+    if n > 0 {
+        s = s + " world";
+    }
+    return s;
+}
+
+fn vec_total(n: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(i);
+        i = i + 1;
+    }
+    var t: i64 = 0;
+    var j: i64 = 0;
+    while j < v.len() {
+        t = t + v.get(j);
+        j = j + 1;
+    }
+    return t;
+}
+
+fn main() -> i64 {
+    println(single_stores(5));
+    println(merged(true));
+    println(ct_eq(4, 4));
+    println(ct_eq(4, 5));
+    println(ct_pick(1, 200, 300));
+    println(loop_sum(5) + ct_pick(0, 7, 10));
+    println(swap_sum(5));
+    println(owned_text(1));
+    println(vec_total(10));
+    return 0;
+}

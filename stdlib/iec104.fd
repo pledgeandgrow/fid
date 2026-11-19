@@ -1,0 +1,488 @@
+// Fides IEC 60870-5-104 standard library
+//
+// IEC 104 is the TCP/IP telecontrol protocol of European power grids. It
+// wraps the IEC 101 ASDU in an APCI (Application Protocol Control
+// Information) over a TCP stream on port 2404. Everything here is pure
+// computation on byte vectors (Vec<i64>, bytes 0..255):
+//
+// Real (implemented and tested):
+//   - APCI: the 0x68 start, the length byte, and the four control-field
+//     octets in the three formats. I-format carries an ASDU with 15-bit
+//     send (N(S)) and receive (N(R)) sequence numbers; S-format acknowledges
+//     with only N(R); U-format carries one of STARTDT/STOPDT/TESTFR as
+//     act/con. Encoders and a decoder that classifies the format and pulls
+//     out the sequence numbers (iec104_i_frame / s_frame / u_frame /
+//     iec104_parse).
+//   - ASDU header: type id, variable structure qualifier (number of objects,
+//     SQ bit), cause of transmission (with P/N and test bits), originator
+//     address, and the 2-byte common address. Information objects with
+//     3-byte information object addresses.
+//   - Common type ids: M_SP_NA_1 (1, single point), M_ME_NC_1 (13, short
+//     float measured value), M_ME_TF_1 (36, short float with CP56Time2a),
+//     C_SC_NA_1 (45, single command), C_IC_NA_1 (100, interrogation
+//     command). Encoders and decoders for each, plus CP56Time2a time tags.
+//   - A sender/receiver sequence-state object implementing the k/w window
+//     and the t1/t2/t3 timer bookkeeping (iec104_state): track outstanding
+//     I-frames, decide when to send an S-frame ack (every w frames), and
+//     when t1/t2/t3 expire given a current time.
+//
+// The seam: no TCP socket. Frames are bytes; write them to a socket and
+// feed received bytes back through iec104_parse.
+
+module iec104;
+ use vec; use string;
+
+// ─── Type identifications ────────────────────────────────────────────────
+pub const M_SP_NA_1: i64 = 1;    // single-point information
+pub const M_DP_NA_1: i64 = 3;    // double-point information
+pub const M_ME_NC_1: i64 = 13;   // measured value, short float
+pub const M_ME_TF_1: i64 = 36;   // measured value, short float with time
+pub const C_SC_NA_1: i64 = 45;   // single command
+pub const C_DC_NA_1: i64 = 46;   // double command
+pub const C_IC_NA_1: i64 = 100;  // interrogation command
+pub const C_CI_NA_1: i64 = 101;  // counter interrogation
+pub const C_CS_NA_1: i64 = 103;  // clock synchronisation
+
+// ─── Causes of transmission ──────────────────────────────────────────────
+pub const COT_PERIODIC: i64 = 1;
+pub const COT_SPONT: i64 = 3;
+pub const COT_INIT: i64 = 4;
+pub const COT_REQUEST: i64 = 5;
+pub const COT_ACT: i64 = 6;       // activation
+pub const COT_ACTCON: i64 = 7;    // activation confirmation
+pub const COT_ACTTERM: i64 = 10;  // activation termination
+pub const COT_INTROGEN: i64 = 20; // interrogated by station interrogation
+
+// ─── APCI frame formats ──────────────────────────────────────────────────
+pub const APCI_I: i64 = 0;
+pub const APCI_S: i64 = 1;
+pub const APCI_U: i64 = 3;
+
+// U-format functions (bits in the first control octet)
+pub const U_STARTDT_ACT: i64 = 0x07;
+pub const U_STARTDT_CON: i64 = 0x0B;
+pub const U_STOPDT_ACT: i64 = 0x13;
+pub const U_STOPDT_CON: i64 = 0x23;
+pub const U_TESTFR_ACT: i64 = 0x43;
+pub const U_TESTFR_CON: i64 = 0x83;
+
+fn put16le(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+}
+
+// ─── APCI encoders ───────────────────────────────────────────────────────
+
+/// I-format frame: start, length, control (N(S) in octets 1-2, N(R) in 3-4),
+/// then the ASDU. ns/nr are the 15-bit sequence numbers.
+pub fn iec104_i_frame(ns: i64, nr: i64, asdu: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0x68);
+    out.push((4 + asdu.len()) & 255);
+    // N(S) << 1 (bit0 = 0 marks I-format), little endian
+    val nsf: i64 = (ns << 1) & 0xFFFF;
+    out.push(nsf & 255);
+    out.push((nsf >> 8) & 255);
+    val nrf: i64 = (nr << 1) & 0xFFFF;
+    out.push(nrf & 255);
+    out.push((nrf >> 8) & 255);
+    var i: i64 = 0;
+    while i < asdu.len() { out.push(asdu.get(i)); i = i + 1; }
+    return out;
+}
+
+/// S-format frame: acknowledges received I-frames with N(R) only.
+pub fn iec104_s_frame(nr: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0x68);
+    out.push(4);
+    out.push(0x01);   // bit0=1, bit1=0 -> S-format
+    out.push(0x00);
+    val nrf: i64 = (nr << 1) & 0xFFFF;
+    out.push(nrf & 255);
+    out.push((nrf >> 8) & 255);
+    return out;
+}
+
+/// U-format frame carrying one of the STARTDT/STOPDT/TESTFR functions.
+pub fn iec104_u_frame(func: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0x68);
+    out.push(4);
+    out.push(func & 255);
+    out.push(0x00);
+    out.push(0x00);
+    out.push(0x00);
+    return out;
+}
+
+// ─── APCI decoder ────────────────────────────────────────────────────────
+
+pub struct Iec104Frame {
+    pub ok: bool,
+    pub error: str,
+    pub format: i64,   // APCI_I / APCI_S / APCI_U
+    pub ns: i64,
+    pub nr: i64,
+    pub ufunc: i64,
+    pub asdu: Vec<i64>,
+    pub total_len: i64,   // bytes consumed (2 + length)
+}
+
+fn f_err(msg: str) -> Iec104Frame {
+    return Iec104Frame { ok: false, error: msg, format: 0, ns: 0, nr: 0, ufunc: 0, asdu: Vec::new(), total_len: 0 };
+}
+
+/// Parse one APCI frame starting at the front of `b`.
+pub fn iec104_parse(b: & Vec<i64>) -> Iec104Frame {
+    if b.len() < 6 {
+        return f_err("frame too short");
+    }
+    if b.get(0) != 0x68 {
+        return f_err("bad start byte");
+    }
+    val length: i64 = b.get(1);
+    val total: i64 = 2 + length;
+    if b.len() < total {
+        return f_err("incomplete frame");
+    }
+    val c0: i64 = b.get(2);
+    val c1: i64 = b.get(3);
+    val c2: i64 = b.get(4);
+    val c3: i64 = b.get(5);
+    if (c0 & 1) == 0 {
+        // I-format
+        val ns: i64 = ((c0 | (c1 << 8)) >> 1) & 0x7FFF;
+        val nr: i64 = ((c2 | (c3 << 8)) >> 1) & 0x7FFF;
+        var asdu: Vec<i64> = Vec::new();
+        var i: i64 = 6;
+        while i < total { asdu.push(b.get(i)); i = i + 1; }
+        return Iec104Frame { ok: true, error: "", format: APCI_I, ns: ns, nr: nr, ufunc: 0, asdu: asdu, total_len: total };
+    } else if (c0 & 3) == 1 {
+        // S-format
+        val nr: i64 = ((c2 | (c3 << 8)) >> 1) & 0x7FFF;
+        return Iec104Frame { ok: true, error: "", format: APCI_S, ns: 0, nr: nr, ufunc: 0, asdu: Vec::new(), total_len: total };
+    } else {
+        // U-format
+        return Iec104Frame { ok: true, error: "", format: APCI_U, ns: 0, nr: 0, ufunc: c0, asdu: Vec::new(), total_len: total };
+    }
+}
+
+// ─── ASDU header ─────────────────────────────────────────────────────────
+
+/// Build an ASDU header: type id, number of objects, SQ bit, cause of
+/// transmission (plus test/negative), originator address, common address.
+pub fn iec104_asdu_header(type_id: i64, num_objects: i64, sq: bool, cot: i64, test: bool, negative: bool, orig: i64, common_addr: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(type_id & 255);
+    var vsq: i64 = num_objects & 127;
+    if sq { vsq = vsq | 0x80; }
+    out.push(vsq);
+    var cotb: i64 = cot & 63;
+    if negative { cotb = cotb | 0x40; }
+    if test { cotb = cotb | 0x80; }
+    out.push(cotb);
+    out.push(orig & 255);
+    put16le(& mut out, common_addr);
+    return out;
+}
+
+/// Push a 3-byte information object address.
+pub fn iec104_put_ioa(out: & mut Vec<i64>, ioa: i64) {
+    out.push(ioa & 255);
+    out.push((ioa >> 8) & 255);
+    out.push((ioa >> 16) & 255);
+}
+
+/// A decoded ASDU header.
+pub struct Iec104Asdu {
+    pub type_id: i64,
+    pub num_objects: i64,
+    pub sq: bool,
+    pub cot: i64,
+    pub test: bool,
+    pub negative: bool,
+    pub orig: i64,
+    pub common_addr: i64,
+    pub body_start: i64,
+}
+
+pub fn iec104_asdu_decode(b: & Vec<i64>) -> Iec104Asdu {
+    val vsq: i64 = b.get(1);
+    val cotb: i64 = b.get(2);
+    return Iec104Asdu {
+        type_id: b.get(0),
+        num_objects: vsq & 127, sq: (vsq & 0x80) != 0,
+        cot: cotb & 63, negative: (cotb & 0x40) != 0, test: (cotb & 0x80) != 0,
+        orig: b.get(3),
+        common_addr: b.get(4) | (b.get(5) << 8),
+        body_start: 6,
+    };
+}
+
+pub fn iec104_get_ioa(b: & Vec<i64>, pos: i64) -> i64 {
+    return b.get(pos) | (b.get(pos + 1) << 8) | (b.get(pos + 2) << 16);
+}
+
+// ─── IEEE 754 single precision (for M_ME_NC_1 / M_ME_TF_1) ───────────────
+
+/// Encode an f64 as 4 little-endian IEEE-754 binary32 bytes.
+pub fn iec104_put_f32(out: & mut Vec<i64>, x: f64) {
+    val bits: i64 = iec104_f32_bits(x);
+    out.push(bits & 255);
+    out.push((bits >> 8) & 255);
+    out.push((bits >> 16) & 255);
+    out.push((bits >> 24) & 255);
+}
+
+/// The 32 bits of x rounded to single precision (nearest, ties to even).
+@wrapping pub fn iec104_f32_bits(x: f64) -> i64 {
+    val bits: i64 = p_f64_to_bits(x);
+    val sign: i64 = (((bits as u64) >> (63 as u64)) as i64) << 31;
+    val e: i64 = (bits >> 52) & 2047;
+    val m: i64 = bits & 4503599627370495;
+    if e == 2047 {
+        if m == 0 { return sign | 0x7f800000; }
+        return sign | 0x7fc00000 | ((m >> 29) & 4194303);
+    }
+    if e == 0 { return sign; }
+    val ex: i64 = e - 1023;
+    var full: i64 = m | 4503599627370496;
+    var shift: i64 = 29;
+    var biased: i64 = ex + 127;
+    if biased <= 0 {
+        shift = 29 + 1 - biased;
+        biased = 0;
+        if shift > 54 { return sign; }
+    }
+    var mant: i64 = full >> shift;
+    val rem: i64 = full & ((1 << shift) - 1);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (mant & 1) == 1) { mant = mant + 1; }
+    if biased == 0 { return sign | mant; }
+    if mant >= 16777216 { mant = mant >> 1; biased = biased + 1; }
+    if biased >= 255 { return sign | 0x7f800000; }
+    return sign | (biased << 23) | (mant & 8388607);
+}
+
+/// Decode 4 little-endian IEEE-754 binary32 bytes at `pos` to f64.
+pub fn iec104_get_f32(b: & Vec<i64>, pos: i64) -> f64 {
+    val s: i64 = b.get(pos) | (b.get(pos + 1) << 8) | (b.get(pos + 2) << 16) | (b.get(pos + 3) << 24);
+    return iec104_f32_to_f64(s);
+}
+
+pub fn iec104_f32_to_f64(s: i64) -> f64 {
+    val e: i64 = (s >> 23) & 255;
+    val m: i64 = s & 8388607;
+    var v: f64 = 0.0;
+    if e == 0 {
+        v = (m as f64) * iec104_pow2(- 149);
+    } else if e == 255 {
+        if m == 0 { v = 1.0 / 0.0; } else { v = 0.0 / 0.0; }
+    } else {
+        v = ((m + 8388608) as f64) * iec104_pow2(e - 150);
+    }
+    if ((s >> 31) & 1) == 1 {
+        return p_f64_from_bits(p_f64_to_bits(v) ^ (0 - 9223372036854775807 - 1));
+    }
+    return v;
+}
+
+fn iec104_pow2(e: i64) -> f64 {
+    var r: f64 = 1.0;
+    var i: i64 = 0;
+    if e >= 0 {
+        while i < e { r = r * 2.0; i = i + 1; }
+    } else {
+        var n: i64 = - e;
+        while i < n { r = r / 2.0; i = i + 1; }
+    }
+    return r;
+}
+
+// ─── CP56Time2a (7-byte time tag) ────────────────────────────────────────
+
+/// Encode a CP56Time2a time tag: milliseconds, minute, hour, day-of-month +
+/// day-of-week, month, year (0..99 since 2000).
+pub fn iec104_cp56_encode(ms: i64, minute: i64, hour: i64, day: i64, dow: i64, month: i64, year: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(ms & 255);
+    out.push((ms >> 8) & 255);
+    out.push(minute & 63);
+    out.push(hour & 31);
+    out.push((day & 31) | ((dow & 7) << 5));
+    out.push(month & 15);
+    out.push(year & 127);
+    return out;
+}
+
+pub struct Cp56Time {
+    pub ms: i64,
+    pub second: i64,
+    pub minute: i64,
+    pub hour: i64,
+    pub day: i64,
+    pub month: i64,
+    pub year: i64,   // full year (2000 + yy)
+}
+
+pub fn iec104_cp56_decode(b: & Vec<i64>, pos: i64) -> Cp56Time {
+    val ms: i64 = b.get(pos) | (b.get(pos + 1) << 8);
+    return Cp56Time {
+        ms: ms % 1000, second: ms / 1000,
+        minute: b.get(pos + 2) & 63,
+        hour: b.get(pos + 3) & 31,
+        day: b.get(pos + 4) & 31,
+        month: b.get(pos + 5) & 15,
+        year: 2000 + (b.get(pos + 6) & 127),
+    };
+}
+
+// ─── Full ASDU builders for common type ids ──────────────────────────────
+
+/// M_SP_NA_1 (1): one single-point object. `value` 0/1, in the SIQ low bit.
+pub fn iec104_sp_na(cot: i64, common_addr: i64, ioa: i64, value: bool) -> Vec<i64> {
+    var out: Vec<i64> = iec104_asdu_header(M_SP_NA_1, 1, false, cot, false, false, 0, common_addr);
+    iec104_put_ioa(& mut out, ioa);
+    var siq: i64 = 0;
+    if value { siq = 1; }
+    out.push(siq);
+    return out;
+}
+
+/// M_ME_NC_1 (13): one short-float measured value with a QDS quality byte.
+pub fn iec104_me_nc(cot: i64, common_addr: i64, ioa: i64, value: f64, quality: i64) -> Vec<i64> {
+    var out: Vec<i64> = iec104_asdu_header(M_ME_NC_1, 1, false, cot, false, false, 0, common_addr);
+    iec104_put_ioa(& mut out, ioa);
+    iec104_put_f32(& mut out, value);
+    out.push(quality & 255);
+    return out;
+}
+
+/// M_ME_TF_1 (36): short-float measured value with a CP56Time2a tag.
+pub fn iec104_me_tf(cot: i64, common_addr: i64, ioa: i64, value: f64, quality: i64, time: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = iec104_asdu_header(M_ME_TF_1, 1, false, cot, false, false, 0, common_addr);
+    iec104_put_ioa(& mut out, ioa);
+    iec104_put_f32(& mut out, value);
+    out.push(quality & 255);
+    var i: i64 = 0;
+    while i < time.len() { out.push(time.get(i)); i = i + 1; }
+    return out;
+}
+
+/// C_SC_NA_1 (45): single command. `on` sets SCS, `select` sets the S/E bit,
+/// `qu` the qualifier of command (0..31).
+pub fn iec104_sc_na(cot: i64, common_addr: i64, ioa: i64, on: bool, select: bool, qu: i64) -> Vec<i64> {
+    var out: Vec<i64> = iec104_asdu_header(C_SC_NA_1, 1, false, cot, false, false, 0, common_addr);
+    iec104_put_ioa(& mut out, ioa);
+    var sco: i64 = 0;
+    if on { sco = sco | 1; }
+    sco = sco | ((qu & 31) << 2);
+    if select { sco = sco | 0x80; }
+    out.push(sco);
+    return out;
+}
+
+/// C_IC_NA_1 (100): interrogation command. `qoi` is the qualifier of
+/// interrogation (20 = station interrogation / general).
+pub fn iec104_interrogation(cot: i64, common_addr: i64, qoi: i64) -> Vec<i64> {
+    var out: Vec<i64> = iec104_asdu_header(C_IC_NA_1, 1, false, cot, false, false, 0, common_addr);
+    iec104_put_ioa(& mut out, 0);
+    out.push(qoi & 255);
+    return out;
+}
+
+// ─── Sequence / window / timer state ─────────────────────────────────────
+
+/// Sender/receiver state for the k/w window and the t1/t2/t3 timers.
+/// `vs` = send sequence, `va` = count acked by the peer, `vr` = receive
+/// sequence (next expected). `unacked_at` holds the send time of each
+/// outstanding I-frame for t1. All times are caller-supplied ticks.
+pub struct Iec104State {
+    pub vs: i64,          // next N(S) to send
+    pub va: i64,          // peer has acked up to this N(S)
+    pub vr: i64,          // next expected N(S) from peer (our N(R))
+    pub k: i64,           // max outstanding I-frames
+    pub w: i64,           // ack after this many received I-frames
+    pub recv_since_ack: i64,
+    pub t1: i64,          // timeout for a sent I/U frame ack
+    pub t2: i64,          // timeout to send an S-frame ack when idle
+    pub t3: i64,          // timeout to send a TESTFR
+    pub last_send_tick: i64,
+    pub last_recv_tick: i64,
+    pub oldest_unacked_tick: i64,
+    pub has_unacked: bool,
+}
+
+pub fn iec104_state_new(k: i64, w: i64, t1: i64, t2: i64, t3: i64) -> Iec104State {
+    return Iec104State {
+        vs: 0, va: 0, vr: 0, k: k, w: w, recv_since_ack: 0,
+        t1: t1, t2: t2, t3: t3, last_send_tick: 0, last_recv_tick: 0,
+        oldest_unacked_tick: 0, has_unacked: false,
+    };
+}
+
+/// May we send another I-frame (window not full)?
+pub fn iec104_can_send(s: & Iec104State) -> bool {
+    return ((s.vs - s.va) & 0x7FFF) < s.k;
+}
+
+/// Record that we sent an I-frame at `tick`; returns its N(S).
+pub fn iec104_on_send(s: & mut Iec104State, tick: i64) -> i64 {
+    val ns: i64 = s.vs;
+    if !s.has_unacked {
+        s.oldest_unacked_tick = tick;
+        s.has_unacked = true;
+    }
+    s.vs = (s.vs + 1) & 0x7FFF;
+    s.last_send_tick = tick;
+    return ns;
+}
+
+/// Record that we received an I-frame with sequence `ns` carrying N(R)
+/// `nr`, at `tick`. Returns true if we now owe an S-frame ack (w reached).
+pub fn iec104_on_recv_i(s: & mut Iec104State, ns: i64, nr: i64, tick: i64) -> bool {
+    s.vr = (ns + 1) & 0x7FFF;
+    s.va = nr;
+    if ((s.vs - s.va) & 0x7FFF) == 0 {
+        s.has_unacked = false;
+    } else {
+        s.oldest_unacked_tick = tick;
+    }
+    s.last_recv_tick = tick;
+    s.recv_since_ack = s.recv_since_ack + 1;
+    if s.recv_since_ack >= s.w {
+        return true;
+    }
+    return false;
+}
+
+/// Record that we sent the S-frame ack (clears the received counter).
+pub fn iec104_on_send_ack(s: & mut Iec104State) {
+    s.recv_since_ack = 0;
+}
+
+/// Record a peer S-frame acking up to N(R).
+pub fn iec104_on_recv_s(s: & mut Iec104State, nr: i64, tick: i64) {
+    s.va = nr;
+    if ((s.vs - s.va) & 0x7FFF) == 0 {
+        s.has_unacked = false;
+    }
+    s.last_recv_tick = tick;
+}
+
+/// Which timer (if any) has expired by `now`: 1 = t1 (a sent frame was not
+/// acked, close the connection), 2 = t2 (send an S-frame ack), 3 = t3 (send
+/// a TESTFR), 0 = none. t1 takes priority, then t2, then t3.
+pub fn iec104_timer_expired(s: & Iec104State, now: i64) -> i64 {
+    if s.has_unacked && (now - s.oldest_unacked_tick) >= s.t1 {
+        return 1;
+    }
+    if s.recv_since_ack > 0 && (now - s.last_recv_tick) >= s.t2 {
+        return 2;
+    }
+    if (now - s.last_recv_tick) >= s.t3 && (now - s.last_send_tick) >= s.t3 {
+        return 3;
+    }
+    return 0;
+}

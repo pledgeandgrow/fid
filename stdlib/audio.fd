@@ -17,6 +17,7 @@
 //   audio_shutdown();
 
 module audio;
+ use file;
 // ─── Audio Handle Types ───────────────────────────────────────────────────
 //
 // Sound handles and channel handles are i64 (opaque pointers or indices).
@@ -29,6 +30,9 @@ pub const AUDIO_NO_CHANNEL: i64 = - 1; pub const AUDIO_MAX_CHANNELS: i64 = 32;
 // On Windows, the runtime would use WASAPI or DirectSound.
 // For now, these are no-ops that return 0.
 
+// SAFETY: pledge_audio.h is the runtime's own header, checked by the C
+// compiler; sounds are the handles pledge_audio_load returned and paths are
+// NUL-terminated strings.
 extern "C" include "pledge_audio.h" link "" {
     fn pledge_audio_init() -> i64;
     fn pledge_audio_shutdown() -> void;
@@ -129,6 +133,160 @@ pub fn audio_master_volume(volume: f64) -> void {
     pledge_audio_master_volume(volume);
 }
 
+// ─── WAV codec (pure Fides) ──────────────────────────────────────────────
+//
+// Decodes/encodes RIFF/WAVE PCM (8-bit unsigned, 16-bit signed, mono or
+// stereo). Samples are stored as signed i64 in interleaved order.
+// Playback still goes through the platform runtime — this gives games and
+// tools real audio data without it.
+
+pub struct AudioBuffer {
+    pub sample_rate: i64,
+    pub channels: i64,
+    pub bits: i64,
+    // 8 or 16
+    pub data: Vec<i64>,  // interleaved samples (i16 range for 16-bit, 0-255 for 8-bit)
+}
+
+fn aud_u16le(d: & Vec<i64>, at: i64) -> i64 {
+    return (d.get(at) & 255) | ((d.get(at + 1) & 255) << 8);
+}
+
+fn aud_u32le(d: & Vec<i64>, at: i64) -> i64 {
+    return (d.get(at) & 255) | ((d.get(at + 1) & 255) << 8) | ((d.get(at + 2) & 255) << 16) | ((d.get(at + 3) & 255) << 24);
+}
+
+fn aud_u32le_into(d: Vec<i64>, at: i64) -> i64 {
+    return aud_u32le(& d, at);
+}
+
+/// Decode a WAV byte stream. `sample_rate` is 0 on failure.
+pub fn audio_wav_decode(d: Vec<i64>) -> AudioBuffer {
+    var bad: AudioBuffer = AudioBuffer {
+        sample_rate: 0, channels: 0, bits: 0, data: Vec::new(),
+    };
+    if d.len() < 44 {
+        return bad;
+    }
+    if d.get(0) != 82 || d.get(1) != 73 || d.get(2) != 70 || d.get(3) != 70 {
+        return bad;
+    }
+    // 'RIFF'
+    if d.get(8) != 87 || d.get(9) != 65 || d.get(10) != 86 || d.get(11) != 69 {
+        return bad;
+    }
+    // 'WAVE'
+    var fmt_rate: i64 = 0;
+    var fmt_ch: i64 = 0;
+    var fmt_bits: i64 = 0;
+    var fmt_tag: i64 = 0;
+    var data_off: i64 = - 1;
+    var data_len: i64 = 0;
+    var pos: i64 = 12;
+    while pos + 8 <= d.len() {
+        val cid: i64 = aud_u32le(& d, pos);
+        val clen: i64 = aud_u32le(& d, pos + 4);
+        if clen < 0 || pos + 8 + clen > d.len() {
+            return bad;
+        }
+        if cid == 0x20746D66 {
+            // 'fmt '
+            if clen < 16 {
+                return bad;
+            }
+            fmt_tag = aud_u16le(& d, pos + 8);
+            fmt_ch = aud_u16le(& d, pos + 10);
+            fmt_rate = aud_u32le(& d, pos + 12);
+            fmt_bits = aud_u16le(& d, pos + 22);
+        } else if cid == 0x61746164 {
+            // 'data'
+            data_off = pos + 8;
+            data_len = clen;
+        }
+        pos = pos + 8 + clen + (clen % 2);
+        // chunks are word-aligned
+    }
+    if fmt_tag != 1 || fmt_rate <= 0 || (fmt_ch != 1 && fmt_ch != 2) || (fmt_bits != 8 && fmt_bits != 16) || data_off < 0 {
+        return bad;
+    }
+    var buf: AudioBuffer = AudioBuffer {
+        sample_rate: fmt_rate, channels: fmt_ch, bits: fmt_bits, data: Vec::new(),
+    };
+    var i: i64 = data_off;
+    if fmt_bits == 8 {
+        while i < data_off + data_len {
+            buf.data.push(d.get(i) & 255);
+            i = i + 1;
+        }
+    } else {
+        while i + 1 < data_off + data_len {
+            var s: i64 = aud_u16le(& d, i);
+            if s >= 32768 {
+                s = s - 65536;
+            }
+            buf.data.push(s);
+            i = i + 2;
+        }
+    }
+    return buf;
+}
+
+/// Load and decode a WAV file. `sample_rate` is 0 on failure.
+pub fn audio_load_wav(path: str) -> AudioBuffer {
+    return audio_wav_decode(file_read_bytes(path));
+}
+
+/// Encode an AudioBuffer as a 16-bit PCM WAV byte stream.
+/// 8-bit buffers are widened to 16 bits.
+pub fn audio_wav_encode(buf: & AudioBuffer) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val ns: i64 = buf.data.len();
+    val data_len: i64 = ns * 2;
+    out.push(82); out.push(73); out.push(70); out.push(70);
+    aud_push_u32le(& mut out, 36 + data_len);
+    out.push(87); out.push(65); out.push(86); out.push(69);
+    out.push(102); out.push(109); out.push(116); out.push(32);
+    aud_push_u32le(& mut out, 16);
+    aud_push_u16le(& mut out, 1);
+    aud_push_u16le(& mut out, buf.channels);
+    aud_push_u32le(& mut out, buf.sample_rate);
+    aud_push_u32le(& mut out, buf.sample_rate * buf.channels * 2);
+    aud_push_u16le(& mut out, buf.channels * 2);
+    aud_push_u16le(& mut out, 16);
+    out.push(100); out.push(97); out.push(116); out.push(97);
+    aud_push_u32le(& mut out, data_len);
+    var i: i64 = 0;
+    while i < ns {
+        var s: i64 = buf.data.get(i);
+        if buf.bits == 8 {
+            s = (s - 128) * 256;
+        }
+        if s > 32767 { s = 32767; }
+        if s < 0 - 32768 { s = 0 - 32768; }
+        out.push(s & 255);
+        out.push((s >> 8) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn aud_push_u16le(v: & mut Vec<i64>, x: i64) -> void {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+}
+
+fn aud_push_u32le(v: & mut Vec<i64>, x: i64) -> void {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+    v.push((x >> 16) & 255);
+    v.push((x >> 24) & 255);
+}
+
+/// Save an AudioBuffer as a 16-bit PCM WAV file.
+pub fn audio_save_wav(buf: & AudioBuffer, path: str) -> i64 {
+    return file_write_bytes(path, audio_wav_encode(buf));
+}
+
 // ─── Audio State Tracking (Fides-side) ────────────────────────────────────
 //
 // The runtime handles actual playback, but we track some state in Fides
@@ -144,6 +302,13 @@ pub struct AudioState {
 }
 
 /// Create an audio state tracker.
+///
+/// Example:
+///   val st = audio_state_create();
+///   assert(!st.muted);
+///   assert(st.master_vol == 1.0);
+///   assert_eq(st.music_channel, AUDIO_NO_CHANNEL);
+///   assert_eq(st.sfx_channels.len(), 0);
 pub fn audio_state_create() -> AudioState {
     return AudioState {
         master_vol: 1.0, muted: false, music_channel: AUDIO_NO_CHANNEL, sfx_channels: Vec::new(),

@@ -1,0 +1,47 @@
+// Expected to fail at run time (roadmap Phase 12, runtime sandbox): the
+// interpreter revokes capabilities while the program runs (compiler/interp.fd
+// p_cap_revoke, and p_sandbox_enter/exit, which lowering puts around
+// `sandbox { }`), so a call the type checker cannot see
+// through -- here a file read reached through a function value -- is stopped
+// once FS is revoked. `fid run` only: the C and native runtimes do not have
+// these builtins yet. Checked by tests/tooling/runtime-sandbox-check.sh.
+// Expected output (stdout), then the panic on stderr:
+// 0
+// 1
+// 0
+// 0
+// 1
+// -1
+// still printing
+//   Sandbox error: 'p_file_exists' needs capability 'FS', which was revoked at run time
+
+fn probe(path: str) -> i64 {
+    var s: i64 = p_file_exists(path);
+    return s;
+}
+
+fn apply(f: fn(str) -> i64, x: str) -> i64 {
+    return f(x);
+}
+
+fn main() {
+    println(p_cap_revoked("FS"));
+    // inside `sandbox { }` every capability is revoked, printing too
+    // (lowering calls p_sandbox_enter/exit around it; a program may not)
+    var inside: i64 = 0;
+    sandbox {
+        inside = p_cap_revoked("IO");
+    }
+    println(inside);
+    println(p_cap_revoked("IO"));
+    // a file read through a function value works before the revocation
+    var a: i64 = apply(probe, "no_such_file_for_sandbox_test.txt");
+    println(a);
+    p_cap_revoke("FS");
+    println(p_cap_revoked("FS"));
+    println(p_cap_revoke("Bogus"));
+    println("still printing");
+    var b: i64 = apply(probe, "no_such_file_for_sandbox_test.txt");
+    println(b);
+    println("unreachable");
+}

@@ -1,0 +1,182 @@
+// stdlib/dhcp: message codec, a client and server over two tcpip stacks (DORA, renewal), the server's pool rules, and client timers (backoff, T1, T2, expiry, NAK).
+// Expected output:
+// discover 300 bytes op 1 cookie 63825363 first option 350101 xid ok true
+// decoded DISCOVER broadcast 0x8000 client-id 7 host 'fides-box' params 1,3,6,15,51,58,59
+// long option 300 bytes back true
+// log: tx DISCOVER, rx OFFER, tx REQUEST, rx ACK
+// bound 192.168.1.100 mask 255.255.255.0 router 192.168.1.1 dns 8.8.8.8 lease 3600 t1 1800000 t2 3150000
+// server: OFFER 192.168.1.100, ACK 192.168.1.100 active 1
+// renew: RENEWING -> BOUND, log tx REQUEST, rx ACK, expires 5400000
+// b offer 192.168.1.102 ack 192.168.1.102
+// c offer 192.168.1.101 ack 192.168.1.101
+// d no reply true, log pool exhausted
+// init-reboot 10.9.9.9 -> NAK
+// release: active 3 -> 2
+// decline 192.168.1.101, d now offered 192.168.1.102
+// retries 3 discovers by 12 s
+// timers: BOUND, T1 RENEWING unicast 192.168.1.1, T2 REBINDING broadcast true, expiry SELECTING
+// nak: RENEWING -> SELECTING with DISCOVER true
+use dhcp;
+use tcpip;
+use vec;
+use string;
+use encoding;
+
+fn mac(last: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    m.push(2); m.push(0); m.push(0); m.push(0); m.push(0); m.push(last);
+    return m;
+}
+
+fn pump(a: &mut NetStack, b: &mut NetStack) {
+    var busy: bool = true;
+    while busy {
+        busy = false;
+        val fa: Vec<Vec<i64>> = net_take_tx(a);
+        var i: i64 = 0;
+        while i < fa.len() { net_input(b, fa.get(i)); busy = true; i = i + 1; }
+        val fb: Vec<Vec<i64>> = net_take_tx(b);
+        i = 0;
+        while i < fb.len() { net_input(a, fb.get(i)); busy = true; i = i + 1; }
+    }
+}
+
+fn joinlog(v: Vec<str>, from: i64) -> str {
+    var s: str = "";
+    var i: i64 = from;
+    while i < v.len() {
+        if i > from { s = s + ", "; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn req(m: Vec<i64>, ty: i64, xid: i64, ciaddr: i64, requested: i64, sid: i64) -> Vec<i64> {
+    var d: DhcpMsg = dhcp_msg_new(1, xid, m);
+    d.ciaddr = ciaddr;
+    dhcp_opt_u8(&mut d, OPT_MSG_TYPE, ty);
+    if requested != 0 { dhcp_opt_u32(&mut d, OPT_REQUESTED_IP, requested); }
+    if sid != 0 { dhcp_opt_u32(&mut d, OPT_SERVER_ID, sid); }
+    return dhcp_encode(&d);
+}
+
+// deliver the client's queued messages to a server and the replies back
+fn serve(s: &mut DhcpServer, c: &mut DhcpClient, now: i64) {
+    var rounds: i64 = 0;
+    while c.out_msgs.len() > 0 && rounds < 10 {
+        val msgs: Vec<Vec<i64>> = c.out_msgs;
+        c.out_msgs = Vec::new();
+        c.out_dst = Vec::new();
+        var i: i64 = 0;
+        while i < msgs.len() {
+            val r: DhcpOut = dhcps_handle(s, msgs.get(i), now);
+            if r.dst != 0 { dhcpc_input(c, r.bytes, now); }
+            i = i + 1;
+        }
+        rounds = rounds + 1;
+    }
+}
+
+fn main() {
+    val net: i64 = ip4(192, 168, 1, 0);
+    val sip: i64 = ip4(192, 168, 1, 1);
+    val mask: i64 = ip4(255, 255, 255, 0);
+    var cl: DhcpClient = dhcpc_new(mac(16), 1000, "fides-box");
+    dhcpc_start(&mut cl, 0);
+    val raw: Vec<i64> = cl.out_msgs.get(0);
+    val m: DhcpMsg = dhcp_decode(raw);
+    println("discover " + int_to_str(raw.len()) + " bytes op " + int_to_str(raw.get(0)) + " cookie " + hex_encode_bytes(net_slice(raw, 236, 240)) + " first option " + hex_encode_bytes(net_slice(raw, 240, 243)) + " xid ok " + bool_to_str(m.xid == cl.xid));
+    println("decoded " + dhcp_type_name(dhcp_msg_type(&m)) + " broadcast 0x" + int_to_hex(m.flags) + " client-id " + int_to_str(dhcp_opt(&m, OPT_CLIENT_ID).len()) + " host '" + str_from_bytes(dhcp_opt(&m, OPT_HOSTNAME)) + "' params " + str_join_ints(dhcp_opt(&m, OPT_PARAM_LIST), ","));
+    var lm: DhcpMsg = dhcp_msg_new(2, 1, mac(1));
+    dhcp_opt_set(&mut lm, 43, Vec::filled(300, 7));
+    val lb: DhcpMsg = dhcp_decode(dhcp_encode(&lm));
+    println("long option " + int_to_str(dhcp_opt(&lb, 43).len()) + " bytes back " + bool_to_str(lb.ok));
+
+    // over two tcpip stacks
+    var S: NetStack = net_new(mac(1), sip, mask, sip);
+    var C: NetStack = net_new(mac(16), 0, 0, 0);
+    var srv: DhcpServer = dhcps_new(sip, mask, net + 100, net + 102, 3600);
+    srv.dns.push(ip4(8, 8, 8, 8));
+    srv.domain = "lan";
+    val ss: i64 = udp_bind(&mut S, DHCP_SERVER_PORT);
+    val cs: i64 = udp_bind(&mut C, DHCP_CLIENT_PORT);
+    cl = dhcpc_new(mac(16), 1000, "fides-box");
+    dhcpc_start(&mut cl, 0);
+    var k: i64 = 0;
+    while k < 4 && cl.state != DHCPC_BOUND {
+        dhcpc_poll(&mut cl, &mut C, cs, 0);
+        pump(&mut C, &mut S);
+        dhcps_poll(&mut srv, &mut S, ss, 0);
+        pump(&mut C, &mut S);
+        k = k + 1;
+    }
+    dhcpc_poll(&mut cl, &mut C, cs, 0);
+    println("log: " + joinlog(cl.log, 0));
+    println("bound " + ip_str(cl.ip) + " mask " + ip_str(cl.mask) + " router " + ip_str(cl.router) + " dns " + ip_str(cl.dns.get(0)) + " lease " + int_to_str(cl.lease_s) + " t1 " + int_to_str(cl.t1_at) + " t2 " + int_to_str(cl.t2_at));
+    println("server: " + joinlog(srv.log, 0) + " active " + int_to_str(dhcps_active(&srv, 0)));
+    dhcpc_apply(&cl, &mut C);
+    val t1: i64 = 1800000;
+    net_tick(&mut C, t1);
+    net_tick(&mut S, t1);
+    val before: i64 = cl.log.len();
+    dhcpc_poll(&mut cl, &mut C, cs, t1);
+    val mid: str = dhcpc_state_name(cl.state);
+    pump(&mut C, &mut S);
+    dhcps_poll(&mut srv, &mut S, ss, t1);
+    pump(&mut C, &mut S);
+    dhcpc_poll(&mut cl, &mut C, cs, t1);
+    println("renew: " + mid + " -> " + dhcpc_state_name(cl.state) + ", log " + joinlog(cl.log, before) + ", expires " + int_to_str(cl.expire_at));
+
+    val ob: DhcpMsg = dhcp_decode(dhcps_handle(&mut srv, req(mac(2), DHCP_DISCOVER, 7, 0, net + 102, 0), t1).bytes);
+    val ab: DhcpMsg = dhcp_decode(dhcps_handle(&mut srv, req(mac(2), DHCP_REQUEST, 7, 0, ob.yiaddr, sip), t1).bytes);
+    println("b offer " + ip_str(ob.yiaddr) + " ack " + ip_str(ab.yiaddr));
+    val oc: DhcpMsg = dhcp_decode(dhcps_handle(&mut srv, req(mac(3), DHCP_DISCOVER, 8, 0, 0, 0), t1).bytes);
+    val ac: DhcpMsg = dhcp_decode(dhcps_handle(&mut srv, req(mac(3), DHCP_REQUEST, 8, 0, oc.yiaddr, sip), t1).bytes);
+    println("c offer " + ip_str(oc.yiaddr) + " ack " + ip_str(ac.yiaddr));
+    val od: DhcpOut = dhcps_handle(&mut srv, req(mac(4), DHCP_DISCOVER, 9, 0, 0, 0), t1);
+    println("d no reply " + bool_to_str(od.dst == 0) + ", log " + srv.log.get(srv.log.len() - 1));
+    val nk: DhcpMsg = dhcp_decode(dhcps_handle(&mut srv, req(mac(2), DHCP_REQUEST, 10, 0, ip4(10, 9, 9, 9), 0), t1).bytes);
+    println("init-reboot 10.9.9.9 -> " + dhcp_type_name(dhcp_msg_type(&nk)));
+    val a3: i64 = dhcps_active(&srv, t1);
+    dhcps_handle(&mut srv, req(mac(2), DHCP_RELEASE, 11, net + 102, 0, sip), t1);
+    println("release: active " + int_to_str(a3) + " -> " + int_to_str(dhcps_active(&srv, t1)));
+    dhcps_handle(&mut srv, req(mac(3), DHCP_DECLINE, 12, 0, net + 101, sip), t1);
+    val od2: DhcpMsg = dhcp_decode(dhcps_handle(&mut srv, req(mac(4), DHCP_DISCOVER, 13, 0, 0, 0), t1).bytes);
+    println("decline " + ip_str(net + 101) + ", d now offered " + ip_str(od2.yiaddr));
+
+    var c2: DhcpClient = dhcpc_new(mac(5), 77, "");
+    dhcpc_start(&mut c2, 0);
+    dhcpc_tick(&mut c2, 4000);
+    dhcpc_tick(&mut c2, 11999);
+    dhcpc_tick(&mut c2, 12000);
+    println("retries " + int_to_str(c2.out_msgs.len()) + " discovers by 12 s");
+    var s2: DhcpServer = dhcps_new(sip, mask, net + 50, net + 60, 3600);
+    c2.out_msgs = Vec::new();
+    c2.out_dst = Vec::new();
+    dhcpc_start(&mut c2, 0);
+    serve(&mut s2, &mut c2, 0);
+    val st0: str = dhcpc_state_name(c2.state);
+    dhcpc_tick(&mut c2, 1800000);
+    val st1: str = dhcpc_state_name(c2.state);
+    val d1: i64 = c2.out_dst.get(c2.out_dst.len() - 1);
+    dhcpc_tick(&mut c2, 3150000);
+    val st2: str = dhcpc_state_name(c2.state);
+    val d2: i64 = c2.out_dst.get(c2.out_dst.len() - 1);
+    dhcpc_tick(&mut c2, 3600000);
+    println("timers: " + st0 + ", T1 " + st1 + " unicast " + ip_str(d1) + ", T2 " + st2 + " broadcast " + bool_to_str(d2 == DHCP_BROADCAST) + ", expiry " + dhcpc_state_name(c2.state));
+
+    var c3: DhcpClient = dhcpc_new(mac(6), 99, "");
+    dhcpc_start(&mut c3, 0);
+    serve(&mut s2, &mut c3, 0);
+    dhcpc_tick(&mut c3, 1800000);
+    val rs: str = dhcpc_state_name(c3.state);
+    var s3: DhcpServer = dhcps_new(sip, mask, net + 50, net + 60, 3600);
+    val msgs: Vec<Vec<i64>> = c3.out_msgs;
+    c3.out_msgs = Vec::new();
+    c3.out_dst = Vec::new();
+    val r3: DhcpOut = dhcps_handle(&mut s3, msgs.get(msgs.len() - 1), 1800000);
+    dhcpc_input(&mut c3, r3.bytes, 1800000);
+    val dm: DhcpMsg = dhcp_decode(c3.out_msgs.get(0));
+    println("nak: " + rs + " -> " + dhcpc_state_name(c3.state) + " with DISCOVER " + bool_to_str(dhcp_msg_type(&dm) == DHCP_DISCOVER));
+}

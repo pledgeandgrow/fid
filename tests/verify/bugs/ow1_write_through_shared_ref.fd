@@ -1,0 +1,34 @@
+// Log OW1 (docs/verification/miscompile-log.md; VF11,
+// scripts/verify/own_diff.py --rejected). Reference §8.4: `&x` is a shared
+// (immutable) borrow and only `&mut` may change what it points to; passing
+// `&c` where `&mut` is expected is a type error (test_mut_ref_fail.fd).
+// But a field assignment through a `&T` is accepted, in a parameter and in
+// a local, and it changes the caller's value: this program prints 2 with
+// stage 0 of Nov 16 (`fid check`: no errors). `r.kids.push(..)`,
+// `r.kids.pop()` and a whole assignment `*r = v` through `var r: &Bx` are
+// accepted the same way (own_diff.py --rejected, Nov 18: 27 of the 52
+// sampled programs the model rejects were accepted by `fid check`, each a
+// change through a shared borrow).
+// The model (scripts/verify/own_model.py) rejects every such program
+// ("change through a shared borrow"); its proof needs this check: a shared
+// borrow is a snapshot of the owner's cell, and a write through it would
+// write a cell another owner shares without copying it (CoW is skipped).
+//! error: shared reference
+
+struct Bx {
+    n: i64,
+    kids: Vec<Bx>,
+}
+
+fn bump(p: &Bx) {
+    p.n = p.n + 1;
+}
+
+fn main() -> i64 {
+    var a: Bx = Bx { n: 0, kids: Vec::new() };
+    bump(&a);
+    val r: &Bx = &a;
+    r.n = r.n + 1;
+    println(a.n);
+    return 0;
+}

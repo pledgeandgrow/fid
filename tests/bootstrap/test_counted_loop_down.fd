@@ -1,0 +1,108 @@
+// LF7 (compiler/checks.fd peir_counted_down, peir_le_bound): counted loops
+// of three more shapes need no bounds checks on `v.get(i)` / `v.set(i, x)`:
+//   while i > 0 { i = i - 1; .. v.get(i) .. }       from i = v.len()
+//   while i >= 0 { .. v.get(i) .. i = i - 1 }       from i = v.len() - 1
+//   while i <= last { .. v.get(i) .. i = i + 1 }    last = v.len() - 1
+// and the decrement `i - 1` needs no overflow check. `fid explain` on this
+// file lists the get/set calls of sum_down, rev_fill, sum_le and
+// sum_le_direct as removed (counted loop). The results must not change,
+// also for an empty Vec (no iteration: i starts at 0, -1, or last = -1).
+// keep_down's test is `i > 1`: since Nov 17 (tests against any constant
+// K, reads at i + o) its two reads after the decrement, at i and i - 1,
+// are in [0, v.len()) and lose their checks too (test_counted_loop_shapes
+// keeps a read it cannot prove, keep_odd). A `>` loop
+// reading `v.get(i)` before the decrement (i can be v.len() there) keeps
+// its check and panics (test_counted_loop_down_fail.fd).
+//
+// Expected output:
+// 15
+// 0
+// 5 4 3 2 1
+// 15
+// 0
+// 15
+// 54321
+// 24
+
+fn sum_down(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = v.len();
+    while i > 0 {
+        i = i - 1;
+        t = t + v.get(i);
+    }
+    return t;
+}
+
+fn rev_fill(v: & mut Vec<i64>) {
+    var i: i64 = v.len() - 1;
+    var k: i64 = 1;
+    while i >= 0 {
+        v.set(i, k);
+        k = k + 1;
+        i = i - 1;
+    }
+}
+
+fn sum_le(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var last: i64 = v.len() - 1;
+    var i: i64 = 0;
+    while i <= last {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn sum_le_direct(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i <= v.len() - 1 {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn digits_down(v: & Vec<i64>) -> i64 {
+    // a `>=` loop reads before the decrement: in [0, v.len() - 1]
+    var r: i64 = 0;
+    var i: i64 = v.len() - 1;
+    while i >= 0 {
+        r = r * 10 + v.get(i);
+        i = i - 1;
+    }
+    return r;
+}
+
+fn keep_down(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = v.len();
+    while i > 1 {
+        i = i - 1;
+        t = t + v.get(i) + v.get(i - 1);
+    }
+    return t;
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var j: i64 = 1;
+    while j <= 5 {
+        v.push(j);
+        j = j + 1;
+    }
+    var empty: Vec<i64> = Vec::new();
+    println(sum_down(& v));
+    println(sum_down(& empty));
+    var w: Vec<i64> = Vec::filled(5, 0);
+    rev_fill(& mut w);
+    rev_fill(& mut empty);
+    print(int_to_str(w.get(0)) + " " + int_to_str(w.get(1)) + " " + int_to_str(w.get(2)) + " " + int_to_str(w.get(3)) + " " + int_to_str(w.get(4)) + "\n");
+    println(sum_le(& v));
+    println(sum_le(& empty));
+    println(sum_le_direct(& v));
+    println(digits_down(& v));
+    println(keep_down(& v));
+}

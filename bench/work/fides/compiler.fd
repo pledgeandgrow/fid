@@ -1,0 +1,196 @@
+// compiler (roadmap BM4, real work): a small compiler end to end. A
+// generator writes a program of 50000 lines `let vK = <expr>;` (11 MB of
+// text: integers, earlier variables, + - * and parentheses, nested 8 deep,
+// from a fixed linear congruential generator); a lexer turns the bytes into
+// tokens, a recursive-descent parser (+ - below *) builds a tree of boxed
+// nodes for each line, and an evaluator runs it modulo 1000003, each line
+// seeing the variables before it. Prints the sum of every line's value
+// (13744772436). tests/bootstrap/test_verify_bm_compiler.fd: 20 lines,
+// depth 6 (5210287).
+enum Expr {
+    Num(i64),
+    Var(i64),
+    Bin(i64, Box<Expr>, Box<Expr>),
+}
+
+fn rnd(s: &mut Vec<i64>) -> i64 {
+    val x: i64 = (s.get(0) * 1103515245 + 12345) % 2147483648;
+    s.set(0, x);
+    return x >> 8;
+}
+
+fn put_dec(out: &mut Vec<u8>, v: i64) {
+    if v >= 10 {
+        put_dec(out, v / 10);
+    }
+    out.push((48 + v % 10) as u8);
+}
+
+fn gen_expr(out: &mut Vec<u8>, s: &mut Vec<i64>, d: i64, k: i64) {
+    val r: i64 = rnd(s);
+    if d == 0 || r % 4 == 0 {
+        val r2: i64 = rnd(s);
+        if k > 0 && r2 % 5 == 0 {
+            out.push(118);
+            put_dec(out, r2 % k);
+        } else {
+            put_dec(out, r2 % 1000);
+        }
+        return;
+    }
+    out.push(40);
+    gen_expr(out, s, d - 1, k);
+    val op: i64 = rnd(s) % 3;
+    out.push(32);
+    if op == 0 {
+        out.push(43);
+    } else if op == 1 {
+        out.push(45);
+    } else {
+        out.push(42);
+    }
+    out.push(32);
+    gen_expr(out, s, d - 1, k);
+    out.push(41);
+}
+
+fn generate(lines: i64, depth: i64) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new();
+    var s: Vec<i64> = Vec::new();
+    s.push(1);
+    var k: i64 = 0;
+    while k < lines {
+        // "let v"
+        out.push(108);
+        out.push(101);
+        out.push(116);
+        out.push(32);
+        out.push(118);
+        put_dec(&mut out, k);
+        // " = "
+        out.push(32);
+        out.push(61);
+        out.push(32);
+        gen_expr(&mut out, &mut s, depth, k);
+        out.push(59);
+        out.push(10);
+        k = k + 1;
+    }
+    return out;
+}
+
+// token kinds: 1 number, 2 variable, 3 `let`, 4 punctuation (its byte)
+fn lex(src: Vec<u8>, kinds: &mut Vec<i64>, vals: &mut Vec<i64>) {
+    val n: i64 = src.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = src.get(i) as i64;
+        if c == 32 || c == 10 {
+            i = i + 1;
+        } else if (c >= 48 && c <= 57) || c == 118 {
+            var kind: i64 = 1;
+            if c == 118 {
+                kind = 2;
+                i = i + 1;
+            }
+            var v: i64 = 0;
+            while i < n && (src.get(i) as i64) >= 48 && (src.get(i) as i64) <= 57 {
+                v = v * 10 + (src.get(i) as i64) - 48;
+                i = i + 1;
+            }
+            kinds.push(kind);
+            vals.push(v);
+        } else if c == 108 {
+            i = i + 3;
+            kinds.push(3);
+            vals.push(0);
+        } else {
+            kinds.push(4);
+            vals.push(c);
+            i = i + 1;
+        }
+    }
+    kinds.push(0);
+    vals.push(0);
+}
+
+fn parse_atom(kinds: &Vec<i64>, vals: &Vec<i64>, pos: &mut Vec<i64>) -> Box<Expr> {
+    val p: i64 = pos.get(0);
+    pos.set(0, p + 1);
+    val k: i64 = kinds.get(p);
+    if k == 1 {
+        return Box::new(Expr::Num(vals.get(p)));
+    }
+    if k == 2 {
+        return Box::new(Expr::Var(vals.get(p)));
+    }
+    // `(` expr `)`
+    val e: Box<Expr> = parse_expr(kinds, vals, pos);
+    pos.set(0, pos.get(0) + 1);
+    return e;
+}
+
+fn parse_term(kinds: &Vec<i64>, vals: &Vec<i64>, pos: &mut Vec<i64>) -> Box<Expr> {
+    var a: Box<Expr> = parse_atom(kinds, vals, pos);
+    while kinds.get(pos.get(0)) == 4 && vals.get(pos.get(0)) == 42 {
+        pos.set(0, pos.get(0) + 1);
+        val b: Box<Expr> = parse_atom(kinds, vals, pos);
+        a = Box::new(Expr::Bin(42, a, b));
+    }
+    return a;
+}
+
+fn parse_expr(kinds: &Vec<i64>, vals: &Vec<i64>, pos: &mut Vec<i64>) -> Box<Expr> {
+    var a: Box<Expr> = parse_term(kinds, vals, pos);
+    while kinds.get(pos.get(0)) == 4 && (vals.get(pos.get(0)) == 43 || vals.get(pos.get(0)) == 45) {
+        val op: i64 = vals.get(pos.get(0));
+        pos.set(0, pos.get(0) + 1);
+        val b: Box<Expr> = parse_term(kinds, vals, pos);
+        a = Box::new(Expr::Bin(op, a, b));
+    }
+    return a;
+}
+
+fn eval(e: Box<Expr>, env: &Vec<i64>) -> i64 {
+    match e {
+        Expr::Num(n) => { return n; }
+        Expr::Var(i) => { return env.get(i); }
+        Expr::Bin(op, l, r) => {
+            val a: i64 = eval(l, env);
+            val b: i64 = eval(r, env);
+            if op == 43 {
+                return (a + b) % 1000003;
+            }
+            if op == 45 {
+                return (a - b + 1000003) % 1000003;
+            }
+            return (a * b) % 1000003;
+        }
+    }
+}
+
+fn compile_run(src: Vec<u8>) -> i64 {
+    var kinds: Vec<i64> = Vec::new();
+    var vals: Vec<i64> = Vec::new();
+    lex(src, &mut kinds, &mut vals);
+    var pos: Vec<i64> = Vec::new();
+    pos.push(0);
+    var env: Vec<i64> = Vec::new();
+    var total: i64 = 0;
+    while kinds.get(pos.get(0)) == 3 {
+        // `let` vK `=`
+        pos.set(0, pos.get(0) + 3);
+        val e: Box<Expr> = parse_expr(&kinds, &vals, &mut pos);
+        // `;`
+        pos.set(0, pos.get(0) + 1);
+        val x: i64 = eval(e, &env);
+        env.push(x);
+        total = total + x;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    println(compile_run(generate(50000, 8)));
+    return 0;
+}

@@ -1,0 +1,51 @@
+// HMAC-SHA256 (stdlib/crypto.fd) on every backend, a native `emit` too
+// (competitive SL2): crypto_hmac_sha256_bytes takes an @secret key and
+// pushes bytes derived from it into a Vec; once the native runtime is
+// merged into the program, the @secret check used to take `v.push(x)` for
+// the runtime's `pe_wq_push(t)` (which writes a global) and rejected the
+// program (known-bugs 2g.71). RFC 4231 test cases 1, 2 and 6 (a key longer
+// than the block), and the str form.
+//
+// Expected output:
+// rfc4231 case 1 ok
+// rfc4231 case 2 ok
+// rfc4231 case 6 ok
+// str form ok
+// hmac ok
+
+use crypto;
+
+fn hex(v: Vec<i64>) -> str {
+    return crypto_sha256_hex(v);
+}
+
+fn repeat(b: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(b);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn check(name: str, got: Vec<i64>, want: str) {
+    val h: str = hex(got);
+    if h != want {
+        println(name + " FAILED: " + h);
+        panic("hmac mismatch");
+    }
+    println(name + " ok");
+}
+
+fn main() {
+    check("rfc4231 case 1", crypto_hmac_sha256_bytes(repeat(0x0b, 20), str_bytes("Hi There")),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    check("rfc4231 case 2", crypto_hmac_sha256_bytes(str_bytes("Jefe"), str_bytes("what do ya want for nothing?")),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    check("rfc4231 case 6", crypto_hmac_sha256_bytes(repeat(0xaa, 131), str_bytes("Test Using Larger Than Block-Size Key - Hash Key First")),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    check("str form", crypto_hmac_sha256("Jefe", "what do ya want for nothing?"),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    println("hmac ok");
+}

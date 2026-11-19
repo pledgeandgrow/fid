@@ -1,0 +1,109 @@
+// Roadmap Phase 16 "UEFI PE32+ emission in self-hosted PE emitter": the
+// whole `fid emit --uefi` path as a program of its own, for checking the
+// emitter of the tree without a compiler built from it: compile this with
+// any fid (it compiles the tree's compiler/*.fd as libraries), then
+//   uefi_emit_driver <program.fd> <out.efi>
+// parses and checks the program without the stdlib (build_program_no_std,
+// as `--bare`), lowers it, and writes the UEFI application that
+// compiler/pe_ir.fd pe_ir_generate_uefi makes of it. The steps are the
+// ones of compiler/main.fd's `--uefi` branch.
+// tests/uefi/run.sh uses it when FID_UEFI_DRIVER names the built driver.
+// Prints "Emitted UEFI application: <out> (<n> bytes)" and returns 0, or
+// prints the errors and returns 1.
+use core;
+use vec;
+use string;
+use fs;
+use compiler::ast;
+use compiler::ir;
+use compiler::compiler;
+use compiler::lower;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+use compiler::pe_ir;
+
+/// The @panic_handler function of a program, or ""
+fn panic_handler_of(program: & Program) -> str {
+    var handler: str = "";
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        var f: Func = program.funcs.get(fi);
+        var ai: i64 = 0;
+        while ai < f.annotations.len() {
+            var an: str = f.annotations.get(ai).name;
+            if an == "panic_handler" || an == "@panic_handler" {
+                handler = f.name;
+            }
+            ai = ai + 1;
+        }
+        fi = fi + 1;
+    }
+    return handler;
+}
+
+fn print_errs(errs: Vec<str>) {
+    println("Compilation errors:");
+    var i: i64 = 0;
+    while i < errs.len() {
+        println(errs.get(i));
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    if p_argc() < 3 {
+        println("usage: uefi_emit_driver <program.fd> <out.efi>");
+        return 2;
+    }
+    var input: str = "";
+    var out: str = "";
+    match arg_at(1) {
+        Option::Some(a) => {
+            input = a;
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(2) {
+        Option::Some(a) => {
+            out = a;
+        }
+        Option::None => {
+        }
+    }
+    var source: str = "";
+    match read_file(input) {
+        Option::Some(s) => {
+            source = s;
+        }
+        Option::None => {
+            println("error: cannot read " + input);
+            return 1;
+        }
+    }
+    match build_program_no_std(source, OptStr::Some(input)) {
+        ResultProgram::Err(errs) => {
+            print_errs(errs);
+            return 1;
+        }
+        ResultProgram::Ok(program) => {
+            var handler: str = panic_handler_of(& program);
+            var ir_mod: IrModule = lower(program);
+            match pe_ir_generate_uefi(ir_mod, handler) {
+                ResultBytes::Err(errs2) => {
+                    print_errs(errs2);
+                    return 1;
+                }
+                ResultBytes::Ok(img) => {
+                    if !fs_write_bytes(out, img) {
+                        println("error: cannot write " + out);
+                        return 1;
+                    }
+                    println("Emitted UEFI application: " + out + " (" + int_to_str(img.len()) + " bytes)");
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}

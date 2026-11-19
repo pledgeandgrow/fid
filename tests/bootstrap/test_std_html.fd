@@ -1,0 +1,88 @@
+// stdlib/html: the builder escapes text and attributes and self-closes void elements; the parser handles attributes, comments, doctype, character references, void and raw-text elements, and the implied end tags for p/li/td; query by tag, id and class.
+// Expected output:
+// <a href="/search?q=a&amp;b" title="say &quot;hi&quot; &lt;there&gt;">Fish &amp; &lt;Chips&gt;</a>
+// <img src="x&amp;y.png">
+// <input type="checkbox" checked>
+// <p>a <b>bold</b> c</p>
+// A & B <c> A A © — &unknown; &amp
+// elements: 18
+// li nodes: 7,9,11
+// li text: one|two|three
+// title: T & Co
+// by id: node 6 has 3 children
+// by class sel: 11 text three
+// by class menu: 1
+// td cells: a,b,c rows 2
+// p count: 2 (siblings, not nested) parent same: true
+// img src=pic.png alt=a cat
+// script text: var x = 1 < 2;
+// title entity: T & Co
+// render: <div class="box"><a href="/a?x=1&amp;y=2">A &amp; B</a></div>
+use html;
+use vec;
+use string;
+
+fn idxs(v: Vec<i64>) -> str {
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() { parts.push(int_to_str(v.get(i))); i = i + 1; }
+    return str_join(parts, ",");
+}
+
+fn main() -> i64 {
+    // building with escaping
+    var a: HAttrs = h_attrs();
+    h_attr(& mut a, "href", "/search?q=a&b");
+    h_attr(& mut a, "title", "say \"hi\" <there>");
+    println(h_el("a", a, h_text("Fish & <Chips>")));
+    println(h_el("img", h_attrs1("src", "x&y.png"), ""));
+    var inp: HAttrs = h_attrs1("type", "checkbox");
+    h_attr_bool(& mut inp, "checked");
+    println(h_el("input", inp, ""));
+    println(h_tag("p", h_seq(mk3(h_text("a "), h_tag("b", h_text("bold")), h_text(" c")))));
+
+    // unescape
+    println(h_unescape("A &amp; B &lt;c&gt; &#65; &#x41; &copy; &mdash; &unknown; &amp"));
+
+    // parse a real-ish page
+    val html: str = "<!DOCTYPE html><html><head><title>T &amp; Co</title></head><body><ul id=list class='menu nav'><li>one<li>two<li class=sel>three</ul><p>para one<p>para two<table><tr><td>a<td>b<tr><td>c</table><img src=pic.png alt='a cat'><!-- note --><script>var x = 1 < 2;</script></body></html>";
+    val d: HtmlDoc = html_parse(html);
+    println("elements: " + int_to_str(html_element_count(& d)));
+    println("li nodes: " + idxs(html_by_tag(& d, "li")));
+    val lis: Vec<i64> = html_by_tag(& d, "li");
+    var texts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < lis.len() { texts.push(html_text_of(& d, lis.get(i))); i = i + 1; }
+    println("li text: " + str_join(texts, "|"));
+    println("title: " + html_text_of(& d, html_by_tag(& d, "title").get(0)));
+
+    val list: i64 = html_by_id(& d, "list");
+    println("by id: node " + int_to_str(list) + " has " + int_to_str(d.nodes.get(list).children.len()) + " children");
+    println("by class sel: " + idxs(html_by_class(& d, "sel")) + " text " + html_text_of(& d, html_by_class(& d, "sel").get(0)));
+    println("by class menu: " + int_to_str(html_by_class(& d, "menu").len()));
+
+    val td: Vec<i64> = html_by_tag(& d, "td");
+    var tds: Vec<str> = Vec::new();
+    i = 0;
+    while i < td.len() { tds.push(html_text_of(& d, td.get(i))); i = i + 1; }
+    println("td cells: " + str_join(tds, ",") + " rows " + int_to_str(html_by_tag(& d, "tr").len()));
+
+    val ps: Vec<i64> = html_by_tag(& d, "p");
+    println("p count: " + int_to_str(ps.len()) + " (siblings, not nested) parent same: " + bool_to_str(d.nodes.get(ps.get(0)).parent == d.nodes.get(ps.get(1)).parent));
+
+    val img: i64 = html_by_tag(& d, "img").get(0);
+    println("img src=" + html_attr(& d.nodes.get(img), "src") + " alt=" + html_attr(& d.nodes.get(img), "alt"));
+    println("script text: " + html_text_of(& d, html_by_tag(& d, "script").get(0)));
+    println("title entity: " + html_text_of(& d, html_by_tag(& d, "title").get(0)));
+
+    // round-trip render (escaping reapplied)
+    val d2: HtmlDoc = html_parse("<div class=\"box\"><a href='/a?x=1&y=2'>A & B</a></div>");
+    println("render: " + html_render(& d2, d2.root));
+    return 0;
+}
+
+fn mk3(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a); v.push(b); v.push(c);
+    return v;
+}

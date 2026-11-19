@@ -1,0 +1,252 @@
+// SP5 (docs/roadmap/llvm-roadmap.md): the ownership pattern of the native
+// backend's parallel emission (compiler/nat_ir.fd ng_par_finish,
+// ng_par_thread, ng_par_emit_job), on its own. Owner counts are not
+// atomic, so a worker thread may keep (copy, drop) only what no other
+// thread touches:
+//  - each thread gets a generator of its own, made on the main thread
+//    before the spawns and read from a module Vec by index (here Gen, with
+//    a nested struct and Vec, str and map-handle fields);
+//  - each job (a struct with a str and a Vec) is read by the one thread
+//    that emits it; a thread's label table moves into the copy of its
+//    generator for a job and back out after it (no second owner, so no
+//    copy of the table per job);
+//  - the shared map is a raw handle every thread only looks up;
+//  - a thread returns its buffers (structs with Vec and str fields) in a
+//    Vec through its Future, and the main thread joins them in order.
+// The thread functions write no module global (the race check accepts
+// the spawn). Four threads must give the buffers one thread gives.
+// Expected output:
+// jobs 240
+// chunks 4
+// same true
+// code 8619
+// labels 240
+// log 1090
+// sum 54661017
+
+struct Enc {
+    code: Vec<i64>,
+    labels: Vec<i64>,
+    last: i64,
+}
+
+struct Gen {
+    arch: i64,
+    e: Enc,
+    keys: i64,
+    regs: Vec<i64>,
+    name: str,
+    log: str,
+    par: bool,
+}
+
+struct Job {
+    name: str,
+    ops: Vec<i64>,
+    base: i64,
+}
+
+struct Buf {
+    code: Vec<i64>,
+    placed: i64,
+    log: str,
+    n: i64,
+}
+
+pub var g_gens: Vec<Gen> = Vec::new();
+pub var g_jobs: Vec<Job> = Vec::new();
+pub var g_n0: i64 = 0;
+
+fn gen_new(arch: i64, keys: i64) -> Gen {
+    var regs: Vec<i64> = Vec::new();
+    var r: i64 = 0;
+    while r < 8 {
+        regs.push(r * arch);
+        r = r + 1;
+    }
+    return Gen {
+        arch: arch, e: Enc { code: Vec::new(), labels: Vec::new(), last: 0 - 1 }, keys: keys, regs: regs, name: "", log: "", par: true,
+    };
+}
+
+// One job into a buffer of its own, with w a fresh copy of its thread's
+// generator holding the thread's label table.
+fn emit_job(w: & mut Gen, ji: i64) -> Buf {
+    var job: Job = g_jobs.get(ji);
+    w.name = job.name;
+    w.log = "";
+    var k: i64 = HashMap_get_i(w.keys, 11);
+    var i: i64 = 0;
+    while i < job.ops.len() {
+        var op: i64 = job.ops.get(i);
+        w.e.code.push(op * w.arch + k + w.regs.get(op % 8));
+        i = i + 1;
+    }
+    var lab: i64 = ji % g_n0;
+    w.e.labels.set(lab, job.base + w.e.code.len());
+    w.e.last = w.e.code.len();
+    w.log = w.log + w.name + ";";
+    var placed: i64 = w.e.labels.get(lab);
+    // every label unplaced again for the next job
+    w.e.labels.set(lab, 0 - 1);
+    return Buf {
+        code: w.e.code, placed: placed, log: w.log, n: w.e.last,
+    };
+}
+
+// A worker: jobs s..e with generator wi, one buffer per job, in order.
+pub fn par_thread(wi: i64, s: i64, e: i64) -> Vec<Buf> {
+    var out: Vec<Buf> = Vec::new();
+    var scratch: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < g_n0 {
+        scratch.push(0 - 1);
+        i = i + 1;
+    }
+    var ji: i64 = s;
+    while ji < e {
+        var w: Gen = g_gens.get(wi);
+        w.e.labels = scratch;
+        scratch = Vec::new();
+        var b: Buf = emit_job(& mut w, ji);
+        scratch = w.e.labels;
+        w.e.labels = Vec::new();
+        out.push(b);
+        ji = ji + 1;
+    }
+    // the table is every label unplaced again
+    var placed: i64 = 0;
+    i = 0;
+    while i < scratch.len() {
+        if scratch.get(i) >= 0 {
+            placed = placed + 1;
+        }
+        i = i + 1;
+    }
+    if placed != 0 {
+        out.clear();
+    }
+    return out;
+}
+
+fn checksum(bufs: & Vec<Buf>) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < bufs.len() {
+        var b: Buf = bufs.get(i);
+        var j: i64 = 0;
+        while j < b.code.len() {
+            sum = sum + b.code.get(j) * (j + 1);
+            j = j + 1;
+        }
+        sum = sum + b.placed + b.n + str_len(b.log);
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn same_bufs(a: & Vec<Buf>, b: & Vec<Buf>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        var x: Buf = a.get(i);
+        var y: Buf = b.get(i);
+        if x.placed != y.placed || x.n != y.n || x.log != y.log || x.code.len() != y.code.len() {
+            return false;
+        }
+        var j: i64 = 0;
+        while j < x.code.len() {
+            if x.code.get(j) != y.code.get(j) {
+                return false;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() {
+    var keys: i64 = HashMap_new();
+    HashMap_insert_i(keys, 11, 7);
+    var nj: i64 = 240;
+    var jobs: Vec<Job> = Vec::new();
+    var j: i64 = 0;
+    while j < nj {
+        var ops: Vec<i64> = Vec::new();
+        var n: i64 = 30 + j % 13;
+        var o: i64 = 0;
+        while o < n {
+            ops.push((j * 31 + o * 7) % 97);
+            o = o + 1;
+        }
+        jobs.push(Job { name: "f" + int_to_str(j), ops: ops, base: j * 1000 });
+        j = j + 1;
+    }
+    g_jobs = jobs;
+    g_n0 = 64;
+    var nw: i64 = 4;
+    var gens: Vec<Gen> = Vec::new();
+    var w: i64 = 0;
+    while w < nw {
+        gens.push(gen_new(3, keys));
+        w = w + 1;
+    }
+    g_gens = gens;
+    // serially: one worker over every job
+    var serial: Vec<Buf> = par_thread(0, 0, nj);
+    // on nw threads, a contiguous chunk each
+    var futs: Vec<Future<Vec<Buf>> > = Vec::new();
+    var per: i64 = (nj + nw - 1) / nw;
+    w = 0;
+    while w < nw {
+        var s: i64 = w * per;
+        var e: i64 = s + per;
+        if e > nj {
+            e = nj;
+        }
+        futs.push(spawn par_thread(w, s, e));
+        w = w + 1;
+    }
+    var joined: Vec<Buf> = Vec::new();
+    w = 0;
+    while w < futs.len() {
+        var part: Vec<Buf> = await futs.get(w);
+        var pi: i64 = 0;
+        while pi < part.len() {
+            joined.push(part.get(pi));
+            pi = pi + 1;
+        }
+        w = w + 1;
+    }
+    var no_gens: Vec<Gen> = Vec::new();
+    g_gens = no_gens;
+    var no_jobs: Vec<Job> = Vec::new();
+    g_jobs = no_jobs;
+    var ncode: i64 = 0;
+    var nlab: i64 = 0;
+    var nlog: i64 = 0;
+    var i: i64 = 0;
+    while i < joined.len() {
+        var b: Buf = joined.get(i);
+        ncode = ncode + b.code.len();
+        if b.placed >= 0 {
+            nlab = nlab + 1;
+        }
+        nlog = nlog + str_len(b.log);
+        i = i + 1;
+    }
+    println("jobs " + int_to_str(joined.len()));
+    println("chunks " + int_to_str(futs.len()));
+    if same_bufs(& serial, & joined) {
+        println("same true");
+    } else {
+        println("same false");
+    }
+    println("code " + int_to_str(ncode));
+    println("labels " + int_to_str(nlab));
+    println("log " + int_to_str(nlog));
+    println("sum " + int_to_str(checksum(& joined)));
+}

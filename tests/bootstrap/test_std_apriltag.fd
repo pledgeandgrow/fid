@@ -1,0 +1,149 @@
+// stdlib/apriltag: the tag36h11 table (587 codes from AprilTag's tag36h11.c; minimum Hamming distance over rotations among the first 64 codes is at least 11), tag pictures, lookup with bit errors, and detection of two tags rendered at known poses into a synthetic camera image: ids, corners, pose
+// Expected output:
+// codes=587 first=0xd7e00984b 0xdda664ca7 0xdc4a1c821 last=0xe8b772fe0
+// first 64 codes, all rotations: min distance=11 at least 11: true
+// tag 0:
+// ..........
+// .########.
+// .#..#.#.#.
+// .##...#.#.
+// .##..####.
+// .#.#.####.
+// .##.#..##.
+// .####.###.
+// .########.
+// ..........
+// lookup id 7 with 2 bits flipped: id=7 hamming=2
+// id 3 turned 90 degrees: nearest hamming=11 at least 11: true
+// detections=2
+// id=0 hamming=0 corners within 0.5 px: true t=(-0.08, 0.00, 0.45) rotation error < 2 deg: true
+// id=42 hamming=0 corners within 0.5 px: true t=(0.09, 0.01, 0.51) rotation error < 2 deg: true
+use math;
+use quat;
+use vision;
+use apriltag;
+
+fn hex9(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 8;
+    while i >= 0 {
+        val x: i64 = (v >> (4 * i)) & 15;
+        s = s + str_slice(d, x, x + 1);
+        i = i - 1;
+    }
+    return "0x" + s;
+}
+
+fn yesno(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    val codes: Vec<i64> = atag36h11_codes();
+    println("codes=" + int_to_str(codes.len()) + " first=" + hex9(codes.get(0)) + " " + hex9(codes.get(1)) + " " + hex9(codes.get(2)) + " last=" + hex9(codes.get(586)));
+    // the family's guarantee: codes differ in at least 11 bits in every
+    // rotation (it would fail with a wrong table or bit layout)
+    var rots: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        var c: i64 = codes.get(i);
+        var r: i64 = 0;
+        while r < 4 {
+            rots.push(c);
+            c = atag_rotate_code(c);
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    var mind: i64 = 99;
+    i = 0;
+    while i < 64 {
+        var j: i64 = 0;
+        while j < 64 {
+            var r: i64 = 0;
+            while r < 4 {
+                if j != i || r != 0 {
+                    val d: i64 = atag_hamming(codes.get(i), rots.get(j * 4 + r));
+                    if d < mind {
+                        mind = d;
+                    }
+                }
+                r = r + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    println("first 64 codes, all rotations: min distance=" + int_to_str(mind) + " at least 11: " + yesno(mind >= 11));
+    println("tag 0:");
+    val rows: Vec<str> = atag_ascii(0);
+    i = 0;
+    while i < rows.len() {
+        println(rows.get(i));
+        i = i + 1;
+    }
+    val noisy: i64 = codes.get(7) ^ (1 << 3) ^ (1 << 30);
+    val m: Vec<i64> = atag_lookup(noisy);
+    println("lookup id 7 with 2 bits flipped: id=" + int_to_str(m.get(0)) + " hamming=" + int_to_str(m.get(1)));
+    val turned: Vec<i64> = atag_lookup(atag_rotate_code(codes.get(3)));
+    println("id 3 turned 90 degrees: nearest hamming=" + int_to_str(turned.get(1)) + " at least 11: " + yesno(turned.get(1) >= 11));
+
+    // a camera looking at two tags of 0.1 m
+    val cam: Camera = cam_pinhole(150.0, 150.0, 80.0, 48.0);
+    var img: GrayImg = vis_gray_new(160, 96, 0);
+    var y: i64 = 0;
+    while y < 96 {
+        var x: i64 = 0;
+        while x < 160 {
+            vis_set(&mut img, x, y, 190 + (x + y) % 20);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    val size: f64 = 0.1;
+    val qa: quat = qt_from_euler_zyx(0.35, -0.25, 0.4);
+    val ta: vec3 = vec3(-0.08, 0.0, 0.45);
+    val qb: quat = qt_from_euler_zyx(-0.2, 0.3, 1.9);
+    val tb: vec3 = vec3(0.085, 0.01, 0.5);
+    val ha: Vec<f64> = atag_pose_homography(&cam, qt_to_mat3(qa), ta, size);
+    val hb: Vec<f64> = atag_pose_homography(&cam, qt_to_mat3(qb), tb, size);
+    atag_render(&mut img, 0, &ha);
+    atag_render(&mut img, 42, &hb);
+    val dets: Vec<AtagDetection> = atag_detect(&img, 2);
+    println("detections=" + int_to_str(dets.len()));
+    var k: i64 = 0;
+    while k < dets.len() {
+        val d: AtagDetection = dets.get(k);
+        var h: Vec<f64> = ha;
+        var qt: quat = qa;
+        if d.id == 42 {
+            h = hb;
+            qt = qb;
+        }
+        var err: f64 = 0.0;
+        var c: i64 = 0;
+        while c < 4 {
+            var u: f64 = -1.0;
+            var v: f64 = -1.0;
+            if c == 1 || c == 2 {
+                u = 1.0;
+            }
+            if c >= 2 {
+                v = 1.0;
+            }
+            val p: vec2 = vis_hom_apply(&h, u, v);
+            val e: f64 = math_sqrt((p.x - d.cx.get(c)) * (p.x - d.cx.get(c)) + (p.y - d.cy.get(c)) * (p.y - d.cy.get(c)));
+            err = rmath_max(err, e);
+            c = c + 1;
+        }
+        val pose: AtagPose = atag_pose(&d, &cam, size);
+        val ang: f64 = qt_angle_between(pose.q, qt);
+        println("id=" + int_to_str(d.id) + " hamming=" + int_to_str(d.hamming) + " corners within 0.5 px: " + yesno(err < 0.5) + " t=" + rmath_vec3_str(pose.t, 2) + " rotation error < 2 deg: " + yesno(ang < 2.0 * rmath_pi() / 180.0));
+        k = k + 1;
+    }
+    return 0;
+}

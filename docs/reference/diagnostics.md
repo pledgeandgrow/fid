@@ -1,9 +1,12 @@
 # Diagnostic Codes
 
 Every `fidesc` error carries a stable `Exxx` code. This index maps each code to
-its meaning and the usual fix. `fid` (Nov 9) prints its errors without codes:
-its diagnostics module, compiler/diag.fd, is not wired in (and no longer
-passes `fid check`; known-bugs 2g.22).
+its meaning and the usual fix. `fid` prints the code of each error it can
+classify (compiler/compiler.fd `classify_error` and `errcode_number`, applied
+in `enrich_errors`) as `error[E044]: ...`; an error no rule classifies stays
+plain `error: ...` (E000). Its diagnostics module, compiler/diag.fd, is still
+not wired in (known-bugs 2g.22). Codes marked *fid* below are given only by
+`fid`.
 
 ## Lexer (E001–E019)
 
@@ -47,6 +50,11 @@ passes `fid check`; known-bugs 2g.22).
 | E057 | Misplaced annotation | `@annotation` only valid on the documented target (fn/struct/field) |
 | E058 | Reference escape | References are second-class — don't store or return them |
 | E059 | Secrecy violation | `@secret`/`@sensitive` data cannot reach an output sink |
+| E060 | Duplicate definition (*fid*) | Rename one, or import only one module that defines it |
+| E061 | Taint violation (*fid*) | Pass the `@tainted` value through a sanitizer before a sink or a return |
+| E062 | Non-exhaustive match (*fid*) | Add the missing variants or a `_` arm |
+| E078 | Other check (*fid*) | An error of one of the other checks: `Event error`, `Redundancy error`, `Contract error`, `Thread safety error`, `Partition error`, `Transaction error`, `Serverless error`, `Differential privacy error`, `Comptime error`, `Shard error`, `Quantization error`, `Linear type error`, `Checkpoint error`, `Budget error`, `Visibility error`, `Privacy error`, `Unknown annotation`, `Misplaced annotation`, `Differentiability error`, `DP error`, `Adapter error`, `Hermetic error`, `Allocator error`, `KV cache region error`, `Injection error`; the message carries the details and the fix (CE4) |
+| E079 | Other type error (*fid*) | The message carries the details |
 
 ## Borrow checker (E080–E089)
 
@@ -54,6 +62,9 @@ passes `fid check`; known-bugs 2g.22).
 |---|---|---|
 | E080 | Mutate under active borrow | Use the borrow for the last time first, or scope it in `{ }` |
 | E081 | Conflicting mutable borrows | Only one `&mut` may be live at a time |
+| E082 | Data race (*fid*) | Guard the global with a lock, or keep it on one thread |
+| E083 | Lock order (*fid*) | Take the locks in one order everywhere (CA4) |
+| E084 | Task never awaited, joined or detached (*fid*) | A `Concurrency error`: await the handle, start the task in `spawn scope { }`, or write `spawn detached f(x)` (CA6, docs/reference/structured-concurrency.md) |
 
 ## Capabilities & safety (E090–E109)
 
@@ -66,6 +77,9 @@ passes `fid check`; known-bugs 2g.22).
 | E094 | `@crashfree` function may panic | Remove the fallible op or drop the annotation |
 | E095 | Contract violation | A call with constant arguments makes a `given` precondition false (`ensure` is not checked) |
 | E096 | `@medical` violation | Medical-mode code hit a forbidden operation |
+| E097 | Safety annotation violated (*fid*) | A `Safety error` / `Determinism error`: see docs/reference/safety-rules.md |
+| E098 | `@constant_time` violation (*fid*) | No secret-dependent branch, early return, index or effect |
+| E099 | `@realtime` violation (*fid*) | No blocking effect, `while` loop or recursion |
 
 ## Effects (E110–E119)
 

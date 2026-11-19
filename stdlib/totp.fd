@@ -1,0 +1,263 @@
+// Fides one-time passwords: HOTP (RFC 4226) and TOTP (RFC 6238) with
+// HMAC-SHA1, HMAC-SHA256 or HMAC-SHA512 (kdf.fd provides the HMACs; its
+// SHA-1 exists for this and for legacy PBKDF2), 6 to 9 digits, a
+// verification window for clock drift with replay protection, base32
+// secrets (RFC 4648, as authenticator apps exchange them) and the
+// otpauth:// key URI that QR codes carry (Google Authenticator's format).
+//
+// Pure computation. The seam is time: TOTP functions take the Unix time as
+// an argument (the caller reads the clock, e.g. time.fd), so they are
+// testable at the RFC's fixed instants. Codes are compared in constant
+// time.
+//
+// Checked against RFC 4226 Appendix D (HOTP counters 0-9) and RFC 6238
+// Appendix B (TOTP, all three hashes, the six test times) in
+// tests/bootstrap/test_std_totp.fd.
+//
+// Usage:
+//   use totp;
+//   val secret = base32_decode("JBSWY3DPEHPK3PXP");
+//   val code = totp_code(secret, KDF_SHA1, now, 30, 6);          // "123456"
+//   var state = totp_state();
+//   val good = totp_verify(& mut state, secret, KDF_SHA1, now, 30, 6, 1, input);
+
+module totp;
+use vec;
+use string;
+use kdf;
+
+/// HOTP value (RFC 4226 §5.3) as a zero-padded decimal string.
+pub fn hotp_code(secret: Vec<i64>, hash: i64, counter: i64, digits: i64) -> str {
+    var c: Vec<i64> = Vec::new();
+    var i: i64 = 7;
+    while i >= 0 { c.push((counter >> (i * 8)) & 255); i = i - 1; }
+    val mac: Vec<i64> = kdf_hmac(hash, secret, c);
+    // Dynamic truncation: the low nibble of the last byte picks 4 bytes.
+    val off: i64 = mac.get(mac.len() - 1) & 15;
+    val bin: i64 = ((mac.get(off) & 0x7f) << 24) | (mac.get(off + 1) << 16) | (mac.get(off + 2) << 8) | mac.get(off + 3);
+    var m: i64 = 1;
+    i = 0;
+    while i < digits { m = m * 10; i = i + 1; }
+    var s: str = int_to_str(bin % m);
+    while str_len(s) < digits { s = "0" + s; }
+    return s;
+}
+
+/// The TOTP time step of a Unix time (T0 = 0).
+pub fn totp_counter(unix_time: i64, period: i64) -> i64 {
+    if unix_time < 0 { return 0; }
+    return unix_time / period;
+}
+
+/// TOTP value (RFC 6238 §4) at a Unix time with the given period (30 s).
+pub fn totp_code(secret: Vec<i64>, hash: i64, unix_time: i64, period: i64, digits: i64) -> str {
+    return hotp_code(secret, hash, totp_counter(unix_time, period), digits);
+}
+
+/// Seconds left before the code at unix_time changes.
+pub fn totp_remaining(unix_time: i64, period: i64) -> i64 {
+    return period - (unix_time % period);
+}
+
+/// Replay protection: the highest time step already accepted.
+pub struct TotpState {
+    pub last_counter: i64,
+}
+
+pub fn totp_state() -> TotpState {
+    return TotpState { last_counter: -1 };
+}
+
+fn totp_str_eq(a: str, b: str) -> bool {
+    if str_len(a) != str_len(b) { return false; }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(a) { d = d | (str_byte_at(a, i) ^ str_byte_at(b, i)); i = i + 1; }
+    return d == 0;
+}
+
+/// Accept `input` if it equals the code of a time step within `window`
+/// steps of now and later than any step accepted before; the accepted
+/// step is recorded so the same code cannot be used twice.
+pub fn totp_verify(state: & mut TotpState, secret: Vec<i64>, hash: i64, unix_time: i64, period: i64, digits: i64, window: i64, input: str) -> bool {
+    val now: i64 = totp_counter(unix_time, period);
+    var found: i64 = -1;
+    var k: i64 = 0 - window;
+    while k <= window {
+        val step: i64 = now + k;
+        if step >= 0 && step > state.last_counter {
+            if totp_str_eq(hotp_code(secret, hash, step, digits), input) && found < 0 { found = step; }
+        }
+        k = k + 1;
+    }
+    if found < 0 { return false; }
+    state.last_counter = found;
+    return true;
+}
+
+/// HOTP verification with a look-ahead window: the matching counter + 1
+/// (the next counter to store), or -1 when no counter in
+/// [counter, counter + look_ahead] matches.
+pub fn hotp_verify(secret: Vec<i64>, hash: i64, counter: i64, digits: i64, look_ahead: i64, input: str) -> i64 {
+    var c: i64 = counter;
+    while c <= counter + look_ahead {
+        if totp_str_eq(hotp_code(secret, hash, c, digits), input) { return c + 1; }
+        c = c + 1;
+    }
+    return -1;
+}
+
+// ─── Base32 (RFC 4648 §6) ──────────────────────────────────────────────
+
+/// Base32 of bytes, with "=" padding when pad is true.
+pub fn base32_encode(data: Vec<i64>, pad: bool) -> str {
+    val alpha: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    var out: str = "";
+    var acc: i64 = 0;
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < data.len() {
+        acc = ((acc << 8) | (data.get(i) & 255)) & 0xffff;
+        bits = bits + 8;
+        while bits >= 5 {
+            val v: i64 = (acc >> (bits - 5)) & 31;
+            out = out + str_slice(alpha, v, v + 1);
+            bits = bits - 5;
+        }
+        i = i + 1;
+    }
+    if bits > 0 {
+        val v2: i64 = (acc << (5 - bits)) & 31;
+        out = out + str_slice(alpha, v2, v2 + 1);
+    }
+    if pad {
+        while str_len(out) % 8 != 0 { out = out + "="; }
+    }
+    return out;
+}
+
+/// Decode base32 (case-insensitive; spaces, dashes and "=" ignored).
+/// Returns empty bytes on any other character.
+pub fn base32_decode(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var acc: i64 = 0;
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        var v: i64 = -1;
+        if c >= 65 && c <= 90 { v = c - 65; }
+        if c >= 97 && c <= 122 { v = c - 97; }
+        if c >= 50 && c <= 55 { v = c - 24; }
+        if c == 32 || c == 45 || c == 61 {
+            v = -2;
+        }
+        if v == -1 { return Vec::new(); }
+        if v >= 0 {
+            acc = ((acc << 5) | v) & 0xffff;
+            bits = bits + 5;
+            if bits >= 8 {
+                out.push((acc >> (bits - 8)) & 255);
+                bits = bits - 8;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── otpauth:// URIs ───────────────────────────────────────────────────
+
+fn totp_pct(s: str) -> str {
+    val hexd: str = "0123456789ABCDEF";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        val keep: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126;
+        if keep {
+            out = out + str_slice(s, i, i + 1);
+        } else {
+            out = out + "%" + str_slice(hexd, c >> 4, (c >> 4) + 1) + str_slice(hexd, c & 15, (c & 15) + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn totp_unpct(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < str_len(s) {
+            out.push(str_parse_hex(str_slice(s, i + 1, i + 3)));
+            i = i + 3;
+        } else {
+            if c == 43 { out.push(32); } else { out.push(c); }
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+fn totp_hash_name(h: i64) -> str {
+    if h == KDF_SHA256 { return "SHA256"; }
+    if h == KDF_SHA512 { return "SHA512"; }
+    return "SHA1";
+}
+
+/// The key URI of a TOTP secret: otpauth://totp/Issuer:account?secret=...
+pub fn totp_uri(issuer: str, account: str, secret: Vec<i64>, hash: i64, digits: i64, period: i64) -> str {
+    return "otpauth://totp/" + totp_pct(issuer) + ":" + totp_pct(account) + "?secret=" + base32_encode(secret, false) + "&issuer=" + totp_pct(issuer) + "&algorithm=" + totp_hash_name(hash) + "&digits=" + int_to_str(digits) + "&period=" + int_to_str(period);
+}
+
+/// A parsed key URI (defaults: SHA1, 6 digits, 30 s, as apps assume).
+pub struct OtpAuth {
+    pub ok: bool,
+    pub kind: str,
+    pub label: str,
+    pub issuer: str,
+    pub secret: Vec<i64>,
+    pub hash: i64,
+    pub digits: i64,
+    pub period: i64,
+    pub counter: i64,
+}
+
+/// Parse an otpauth://totp/... or otpauth://hotp/... URI.
+pub fn totp_parse_uri(uri: str) -> OtpAuth {
+    var r: OtpAuth = OtpAuth { ok: false, kind: "", label: "", issuer: "", secret: Vec::new(), hash: KDF_SHA1, digits: 6, period: 30, counter: 0 };
+    if !str_starts_with(uri, "otpauth://") { return r; }
+    val rest: str = str_slice(uri, 10, str_len(uri));
+    val slash: i64 = str_find(rest, "/");
+    if slash < 0 { return r; }
+    r.kind = str_slice(rest, 0, slash);
+    if !str_equal(r.kind, "totp") && !str_equal(r.kind, "hotp") { return r; }
+    val after: str = str_slice(rest, slash + 1, str_len(rest));
+    val q: i64 = str_find(after, "?");
+    if q < 0 { return r; }
+    r.label = totp_unpct(str_slice(after, 0, q));
+    val params: Vec<str> = str_split(str_slice(after, q + 1, str_len(after)), "&");
+    var i: i64 = 0;
+    while i < params.len() {
+        val p: str = params.get(i);
+        val eq: i64 = str_find(p, "=");
+        if eq > 0 {
+            val k: str = str_slice(p, 0, eq);
+            val v: str = totp_unpct(str_slice(p, eq + 1, str_len(p)));
+            if str_equal(k, "secret") { r.secret = base32_decode(v); }
+            if str_equal(k, "issuer") { r.issuer = v; }
+            if str_equal(k, "digits") { r.digits = str_parse_int(v); }
+            if str_equal(k, "period") { r.period = str_parse_int(v); }
+            if str_equal(k, "counter") { r.counter = str_parse_int(v); }
+            if str_equal(k, "algorithm") {
+                if str_equal(str_to_upper(v), "SHA256") { r.hash = KDF_SHA256; }
+                if str_equal(str_to_upper(v), "SHA512") { r.hash = KDF_SHA512; }
+            }
+        }
+        i = i + 1;
+    }
+    r.ok = r.secret.len() > 0 && r.digits >= 6 && r.digits <= 9 && r.period > 0;
+    return r;
+}

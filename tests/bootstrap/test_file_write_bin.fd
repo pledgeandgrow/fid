@@ -1,0 +1,77 @@
+// Competitive roadmap RT2: p_file_write_bin(path, data, n) writes the n
+// bytes at data, zero bytes included, on every backend: the interpreter
+// (compiler/interp.fd), C (codegen_c.fd's runtime), pe_ir
+// (stdlib/pe_runtime/base.fd pert_file_write_bin) and the machine layer
+// (stdlib/linux_runtime/base.fd). p_file_write stays a text builtin: it
+// stops at the first zero byte.
+// Expected output:
+// str 0 7 80 69 0 0 1 0 255
+// prefix 0 3 104 101 108
+// buf 0 300 0 255 0 43 33586
+// empty 0 0
+// text 0 2
+// bad -1
+// neg -1
+// done
+use file;
+
+fn bytes_line(path: str) -> str {
+    val back: Vec<i64> = file_read_bytes(path);
+    var s: str = int_to_str(back.len());
+    var i: i64 = 0;
+    while i < back.len() {
+        s = s + " " + int_to_str(back.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+@unsafe
+fn main() -> i64 {
+    val path: str = "_fides_write_bin_test.tmp";
+    val z: str = char_to_str(0);
+    // a string with zero bytes in it: "PE" 0 0 1 0 255
+    val data: str = "PE" + z + z + char_to_str(1) + z + char_to_str(255);
+    val rc: i64 = p_file_write_bin(path, data, 7);
+    println("str " + int_to_str(rc) + " " + bytes_line(path));
+
+    // the first n bytes only
+    val rc2: i64 = p_file_write_bin(path, "hello", 3);
+    println("prefix " + int_to_str(rc2) + " " + bytes_line(path));
+
+    // a buffer the program filled: bytes i & 255 (zeros at 0 and 256)
+    val buf: i64 = p_malloc(304);
+    var i: i64 = 0;
+    while i < 300 {
+        var p: *mut u8 = buf + i;
+        unsafe { *p = i & 255; }
+        i = i + 1;
+    }
+    val rc3: i64 = p_file_write_bin(path, buf as *u8, 300);
+    val back: Vec<i64> = file_read_bytes(path);
+    var sum: i64 = 0;
+    var j: i64 = 0;
+    while j < back.len() {
+        sum = sum + back.get(j);
+        j = j + 1;
+    }
+    println("buf " + int_to_str(rc3) + " " + int_to_str(back.len()) + " " + int_to_str(back.get(0)) + " " + int_to_str(back.get(255)) + " " + int_to_str(back.get(256)) + " " + int_to_str(back.get(299)) + " " + int_to_str(sum));
+    p_free(buf);
+
+    // nothing to write: an empty file
+    val rc4: i64 = p_file_write_bin(path, data, 0);
+    println("empty " + int_to_str(rc4) + " " + int_to_str(file_size(path)));
+
+    // the text builtin stops at the zero byte
+    val rc5: i64 = p_file_write(path, "AB" + z + "CD");
+    println("text " + int_to_str(rc5) + " " + int_to_str(file_size(path)));
+
+    // a file that cannot be made
+    println("bad " + int_to_str(p_file_write_bin("_fides_no_such_dir_/x/y.bin", data, 7)));
+    val gone: i64 = file_delete(path);
+    // a negative length writes nothing
+    println("neg " + int_to_str(p_file_write_bin(path, data, 0 - 1)));
+    val gone2: i64 = file_delete(path);
+    println("done");
+    return 0;
+}

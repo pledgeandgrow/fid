@@ -1,0 +1,163 @@
+// stdlib/cobol + stdlib/banking_batch: COBOL packed (COMP-3), zoned and
+// binary fields from a copybook, a fixed-width transaction file with
+// header/trailer control totals, and a batch posted with @conserve moves.
+//
+// Expected output:
+// pack 12345 = 12345C
+// pack -12345 = 12345D
+// pack 7 unsigned 4 = 00007F
+// unpack 12345D = -12345
+// valid 12345C = true
+// valid 1A345C = false
+// fits 99999/5 = true
+// fits 100000/5 = false
+// zone 123 signed = 12C
+// zone -120 signed = 12}
+// unzone 12} = -120
+// unzone 12L = -123
+// layout:
+// CUST-ID kind=zoned digits=6 scale=0 offset=0 size=6
+// CUST-NAME kind=alpha digits=10 scale=0 offset=6 size=10
+// BALANCE kind=packed digits=9 scale=2 signed offset=16 size=5
+// RATE kind=binary digits=4 scale=3 offset=21 size=2
+// HIST(1) kind=zoned digits=3 scale=0 signed offset=23 size=3
+// HIST(2) kind=zoned digits=3 scale=0 signed offset=26 size=3
+// record size 29 name CUST-REC error ""
+// set balance = true
+// set too big = false
+// CUST-ID = 4711
+// CUST-NAME = SMITH J
+// BALANCE = -1234.56
+// RATE = 2.125
+// HIST(2) = -42
+// balance bytes = 000123456D
+// bad pic error = unsupported PIC Z(5) for X
+// file bytes = 324
+// file errors = 0
+// txns = 7
+// applied 4
+// rejected 3
+// deposits 250.00
+// withdrawals 75.25
+// transfers 700.00
+// opening 1500.00
+// closing 1674.75
+// balanced yes
+// error T0004: insufficient funds in 1002
+// error T0005: unknown account 9999
+// error T0007: amount must be positive
+// 1001 = 1150.00
+// 1002 = 474.75
+// tampered errors = 1
+// trailer total 251.00, records sum to 250.00 is first: true
+use cobol;
+use banking_batch;
+
+fn bb_yn(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn bytes_of(s: str) -> Vec<i64> {
+    return str_bytes(s);
+}
+
+fn main() -> i64 {
+    // packed decimal
+    println("pack 12345 = " + cobol_packed_hex(cobol_pack(12345, 5, true)));
+    println("pack -12345 = " + cobol_packed_hex(cobol_pack(-12345, 5, true)));
+    println("pack 7 unsigned 4 = " + cobol_packed_hex(cobol_pack(7, 5, false)));
+    var neg: Vec<i64> = Vec::new();
+    neg.push(18); neg.push(52); neg.push(93);          // 12 34 5D
+    println("unpack 12345D = " + int_to_str(cobol_unpack(neg, 0, 3)));
+    var good: Vec<i64> = Vec::new();
+    good.push(18); good.push(52); good.push(92);       // 12 34 5C
+    println("valid 12345C = " + bb_yn(cobol_packed_valid(good, 0, 3)));
+    var bad: Vec<i64> = Vec::new();
+    bad.push(26); bad.push(52); bad.push(92);          // 1A 34 5C
+    println("valid 1A345C = " + bb_yn(cobol_packed_valid(bad, 0, 3)));
+    println("fits 99999/5 = " + bb_yn(cobol_fits(99999, 5, false)));
+    println("fits 100000/5 = " + bb_yn(cobol_fits(100000, 5, false)));
+
+    // zoned decimal with overpunch
+    println("zone 123 signed = " + str_from_bytes(cobol_zone(123, 3, true)));
+    println("zone -120 signed = " + str_from_bytes(cobol_zone(-120, 3, true)));
+    println("unzone 12} = " + int_to_str(cobol_unzone(bytes_of("12}"), 0, 3)));
+    println("unzone 12L = " + int_to_str(cobol_unzone(bytes_of("12L"), 0, 3)));
+
+    // a copybook with every kind
+    val cb = cobol_copybook(
+        "      * customer master record\n"
+        + "       01  CUST-REC.\n"
+        + "           05  CUST-ID     PIC 9(6).\n"
+        + "           05  CUST-NAME   PIC X(10).\n"
+        + "           05  BALANCE     PIC S9(7)V99 USAGE IS COMP-3.\n"
+        + "           05  RATE        PIC 9V999 COMP.\n"
+        + "           05  HIST        PIC S999 OCCURS 2 TIMES.\n"
+        + "           88  IS-VIP      VALUE 'Y'.\n");
+    println("layout:");
+    print(cobol_layout(& cb));
+    println("record size " + int_to_str(cb.size) + " name " + cb.name + " error \"" + cb.error + "\"");
+    var rec = cobol_record_new(& cb);
+    cobol_set_num(& cb, & mut rec, "CUST-ID", 4711);
+    cobol_set_str(& cb, & mut rec, "CUST-NAME", "SMITH J");
+    println("set balance = " + bb_yn(cobol_set_num(& cb, & mut rec, "BALANCE", -123456)));
+    println("set too big = " + bb_yn(cobol_set_num(& cb, & mut rec, "BALANCE", 1000000000)));
+    cobol_set_num(& cb, & mut rec, "RATE", 2125);
+    cobol_set_num(& cb, & mut rec, "HIST(2)", -42);
+    println("CUST-ID = " + int_to_str(cobol_get_num(& cb, rec, "CUST-ID")));
+    println("CUST-NAME = " + cobol_get_str(& cb, rec, "CUST-NAME"));
+    println("BALANCE = " + cobol_format(cobol_get_num(& cb, rec, "BALANCE"), 2));
+    println("RATE = " + cobol_format(cobol_get_num(& cb, rec, "rate"), 3));
+    println("HIST(2) = " + int_to_str(cobol_get_num(& cb, rec, "HIST(2)")));
+    var bal_bytes: Vec<i64> = Vec::new();
+    var j: i64 = 16;
+    while j < 21 {
+        bal_bytes.push(rec.get(j));
+        j = j + 1;
+    }
+    println("balance bytes = " + cobol_packed_hex(bal_bytes));
+    val badcb = cobol_copybook("01 R. 05 X PIC Z(5).");
+    println("bad pic error = " + badcb.error);
+
+    // a batch: write the COBOL file, read it back, post it
+    var txns: Vec<BatchTxn> = Vec::new();
+    txns.push(BatchTxn { kind: BATCH_DEPOSIT, from: 1001, to: 0, cents: 25000, ref_id: "T0001" });
+    txns.push(BatchTxn { kind: BATCH_TRANSFER, from: 1001, to: 1002, cents: 40000, ref_id: "T0002" });
+    txns.push(BatchTxn { kind: BATCH_WITHDRAW, from: 1002, to: 0, cents: 7525, ref_id: "T0003" });
+    txns.push(BatchTxn { kind: BATCH_WITHDRAW, from: 1002, to: 0, cents: 99999999, ref_id: "T0004" });
+    txns.push(BatchTxn { kind: BATCH_TRANSFER, from: 1001, to: 9999, cents: 100, ref_id: "T0005" });
+    txns.push(BatchTxn { kind: BATCH_TRANSFER, from: 1003, to: 1001, cents: 30000, ref_id: "T0006" });
+    txns.push(BatchTxn { kind: BATCH_TRANSFER, from: 1003, to: 1002, cents: 0, ref_id: "T0007" });
+    val tcb = batch_txn_copybook();
+    val file = batch_write_file(& tcb, txns);
+    println("file bytes = " + int_to_str(file.len()));
+    val bf = batch_read_file(& tcb, file);
+    println("file errors = " + int_to_str(bf.errors.len()));
+    println("txns = " + int_to_str(bf.txns.len()));
+
+    var led = ledger_new();
+    ledger_open(& mut led, 1001, 100000);
+    ledger_open(& mut led, 1002, 15000);
+    ledger_open(& mut led, 1003, 35000);
+    val rep = batch_run(& mut led, bf.txns);
+    print(batch_report_text(& rep));
+    println("1001 = " + cobol_format(ledger_balance(& led, 1001), 2));
+    println("1002 = " + cobol_format(ledger_balance(& led, 1002), 2));
+
+    // a tampered trailer total is caught
+    var t2: Vec<BatchTxn> = Vec::new();
+    t2.push(BatchTxn { kind: BATCH_DEPOSIT, from: 1001, to: 0, cents: 25000, ref_id: "X1" });
+    var f2 = batch_write_file(& tcb, t2);
+    // trailer is the last record: bump its amount from 250.00 to 251.00
+    val trail: i64 = f2.len() - tcb.size;
+    f2.set(trail + 17 + 5, f2.get(trail + 17 + 5) + 16);   // 25000 -> 25100: bytes 00 00 00 00 25 00 0C -> .. 25 10 0C
+    val bf2 = batch_read_file(& tcb, f2);
+    println("tampered errors = " + int_to_str(bf2.errors.len()));
+    if bf2.errors.len() > 0 {
+        println("trailer total 251.00, records sum to 250.00 is first: "
+            + bb_yn(str_equal(bf2.errors.get(0), "trailer total 251.00, records sum to 250.00")));
+    }
+    if !rep.balanced { return 1; }
+    return 0;
+}

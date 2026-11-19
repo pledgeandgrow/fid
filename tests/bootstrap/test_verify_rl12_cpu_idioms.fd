@@ -1,0 +1,225 @@
+// RL12 (own-backend roadmap): line and branch coverage of the machine layer
+// (compiler/nat_ir.fd, nat_enc.fd, rules.fd, egraph.fd). The coverage run
+// (scripts/nat-coverage.py) compiles this test under every variant (its
+// name is in the run's FOCUS list): --cpu x86-64-v3 (BMI1 BLSR / BLSI /
+// BLSMSK / ANDN selections), armv8.1-a, rv64gc_zba_zbb, rv64gcv, the opt-in
+// passes, each FID_NAT_OFF pass. It gathers the idioms those selections
+// and encoders look for, each fed from run-time values so no fold removes
+// it:
+//   bits     x & (x - 1), x & -x, x ^ (x - 1), ~a & b, a count of set bits
+//   rotate   (x << s) | (x >> (32 - s)) on u32
+//   divide   signed division and remainder by constants, both signs
+//   madd     a * b + c and c - a * b (AArch64 MADD/MSUB, RISC-V mul+add)
+//   args     ten arguments (past the registers of every ABI)
+//   jtab     a match of ten integer arms (a jump table)
+//   float    a * b + c on f64, conversions both ways, the six compares
+//   bytes    u8 elements stored and read back
+//   shifts   shifts by a run-time amount, arithmetic and logical
+// Each line prints values a wrong selection or encoding changes.
+//
+// Expected output:
+// 8 4 7 3 8 5
+// 3 878082066
+// -14 -2 14 7
+// 50 -34
+// 385
+// 39
+// 3.875 10 -10
+// 1 1 0 0 0 1
+// 897 222
+// 1099511627776 -128 15
+
+fn blsr(x: i64) -> i64 {
+    return x & (x - 1);
+}
+
+fn blsi(x: i64) -> i64 {
+    return x & (0 - x);
+}
+
+fn blsmsk(x: i64) -> i64 {
+    return x ^ (x - 1);
+}
+
+fn andn(a: i64, b: i64) -> i64 {
+    return (~a) & b;
+}
+
+fn popcount(x0: i64) -> i64 {
+    var x: i64 = x0;
+    var n: i64 = 0;
+    while x != 0 {
+        x = x & (x - 1);
+        n = n + 1;
+    }
+    return n;
+}
+
+fn rotl32(x: u32, s: u32) -> u32 {
+    return (x << s) | (x >> (32 - s));
+}
+
+fn madd(a: i64, b: i64, c: i64) -> i64 {
+    return a * b + c;
+}
+
+fn msub(a: i64, b: i64, c: i64) -> i64 {
+    return c - a * b;
+}
+
+fn many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64) -> i64 {
+    return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10;
+}
+
+fn arm(k: i64) -> i64 {
+    var r: i64 = 0;
+    match k {
+        0 => { r = 3; }
+        1 => { r = 1; }
+        2 => { r = 4; }
+        3 => { r = 1; }
+        4 => { r = 5; }
+        5 => { r = 9; }
+        6 => { r = 2; }
+        7 => { r = 6; }
+        8 => { r = 5; }
+        9 => { r = 3; }
+        _ => { r = 0; }
+    }
+    return r;
+}
+
+fn fmadd(a: f64, b: f64, c: f64) -> f64 {
+    return a * b + c;
+}
+
+fn cmps(a: f64, b: f64) -> str {
+    var lt: i64 = 0;
+    var le: i64 = 0;
+    var gt: i64 = 0;
+    var ge: i64 = 0;
+    var eq: i64 = 0;
+    var ne: i64 = 0;
+    if a < b {
+        lt = 1;
+    }
+    if a <= b {
+        le = 1;
+    }
+    if a > b {
+        gt = 1;
+    }
+    if a >= b {
+        ge = 1;
+    }
+    if a == b {
+        eq = 1;
+    }
+    if a != b {
+        ne = 1;
+    }
+    return int_to_str(lt) + " " + int_to_str(le) + " " + int_to_str(gt) + " " + int_to_str(ge) + " " + int_to_str(eq) + " " + int_to_str(ne);
+}
+
+fn shl(x: i64, s: i64) -> i64 {
+    return x << s;
+}
+
+fn sar(x: i64, s: i64) -> i64 {
+    return x >> s;
+}
+
+fn shr_u(x: u64, s: u64) -> u64 {
+    return x >> s;
+}
+
+fn main() {
+    // run-time inputs: the loop makes 12, 15, 255, 682, 7, 6, 8, 100 and -100
+    var ins: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 9 {
+        if k == 0 {
+            ins.push(12);
+        } else if k == 1 {
+            ins.push(15);
+        } else if k == 2 {
+            ins.push(255);
+        } else if k == 3 {
+            ins.push(682);
+        } else if k == 4 {
+            ins.push(7);
+        } else if k == 5 {
+            ins.push(6);
+        } else if k == 6 {
+            ins.push(8);
+        } else if k == 7 {
+            ins.push(100);
+        } else {
+            ins.push(0 - 100);
+        }
+        k = k + 1;
+    }
+    val x: i64 = ins.get(0);
+    println(int_to_str(blsr(x)) + " " + int_to_str(blsi(x)) + " " + int_to_str(blsmsk(x)) + " " + int_to_str(andn(x, ins.get(1))) + " " + int_to_str(popcount(ins.get(2))) + " " + int_to_str(popcount(ins.get(3))));
+
+    val one: u32 = ins.get(1) as u32;
+    val r1: u32 = rotl32((0x80000000 as u32) | (one & (1 as u32)), (ins.get(1) - 14) as u32);
+    val r2: u32 = rotl32(0x12345678 as u32, ins.get(6) as u32);
+    println(int_to_str(r1 as i64) + " " + int_to_str(r2 as i64));
+
+    val neg: i64 = ins.get(8);
+    val pos: i64 = ins.get(7);
+    val big: i64 = pos * 10000000 + 7;
+    println(int_to_str(neg / 7) + " " + int_to_str(neg % 7) + " " + int_to_str(pos / 7) + " " + int_to_str(big % 1000));
+
+    println(int_to_str(madd(ins.get(5), ins.get(4), ins.get(6))) + " " + int_to_str(msub(ins.get(5), ins.get(4), ins.get(6))));
+
+    var a: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= 10 {
+        a.push(i);
+        i = i + 1;
+    }
+    println(int_to_str(many(a.get(0), a.get(1), a.get(2), a.get(3), a.get(4), a.get(5), a.get(6), a.get(7), a.get(8), a.get(9))));
+
+    var js: i64 = 0;
+    var j: i64 = 0;
+    while j < 12 {
+        js = js + arm(j);
+        j = j + 1;
+    }
+    println(int_to_str(js));
+
+    val seven: f64 = ins.get(4) as f64;
+    val f1: f64 = seven / 7.0 * 1.5;
+    val f2: f64 = seven / 7.0 * 2.5;
+    val fm: f64 = fmadd(f1, f2, 0.125);
+    val c1: i64 = (seven * 1.5) as i64;
+    val c2: i64 = ((0.0 - seven) * 1.5) as i64;
+    println(float_to_str(fm) + " " + int_to_str(c1) + " " + int_to_str(c2));
+    println(cmps(f1, f2));
+
+    var bytes: Vec<u8> = Vec::new();
+    var b: i64 = 0;
+    while b < 10 {
+        bytes.push(((b * 37) % 256) as u8);
+        b = b + 1;
+    }
+    var bsum: i64 = 0;
+    var bmax: i64 = 0;
+    var q: i64 = 0;
+    while q < bytes.len() {
+        val v: i64 = bytes.get(q) as i64;
+        bsum = bsum + v;
+        if v > bmax {
+            bmax = v;
+        }
+        q = q + 1;
+    }
+    println(int_to_str(bsum) + " " + int_to_str(bmax));
+
+    val s40: i64 = ins.get(4) * 5 + ins.get(1) - 10;
+    val m1024: i64 = 0 - ins.get(6) * 128;
+    val lsr: u64 = shr_u(m1024 as u64, (ins.get(4) * 8 + 4) as u64);
+    println(int_to_str(shl(1, s40)) + " " + int_to_str(sar(m1024, ins.get(6) - 5)) + " " + int_to_str(lsr as i64));
+}

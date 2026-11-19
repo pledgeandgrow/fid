@@ -1,0 +1,116 @@
+// VF5, the specializing passes of compiler/iropt.fd: spec (clone a function
+// for a constant argument its hot call sites pass), hofspec (clone a
+// higher-order function per closure it is given), devirt / closuredevirt (a
+// call through a closure whose function is known becomes a direct call) and
+// icf (opt-in, FID_IROPT_ON=icf: functions with the same body share one).
+// Each case prints a value a wrong pass changes:
+//   spec     `step` gets the constant 4 from a hot loop and a varying value
+//            elsewhere: the clone must be used for the first only
+//   hofspec  `apply_all` gets two different closures, capturing 2 and 3:
+//            each clone must call its own closure with its own capture
+//   devirt   a closure stored in a variable on one path and another on
+//            the other path is called after the join (not resolvable: it
+//            must stay an indirect call)
+//   icf      `plus_one` and `plus_two` differ in one constant only, and
+//            `twice_a`/`twice_b` are the same (folding these is right)
+//
+// Expected output:
+// 400 15
+// 12 18
+// 7 50
+// 6 7 20 20
+// 1629
+
+fn step(k: i64, x: i64) -> i64 {
+    var s: i64 = x;
+    var i: i64 = 0;
+    while i < k {
+        s = s + 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn apply_all(v: Vec<i64>, f: fn(i64) -> i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + f(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn plus_one(x: i64) -> i64 {
+    var r: i64 = x;
+    var i: i64 = 0;
+    while i < 1 {
+        r = r + 1;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn plus_two(x: i64) -> i64 {
+    var r: i64 = x;
+    var i: i64 = 0;
+    while i < 1 {
+        r = r + 2;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn twice_a(x: i64) -> i64 {
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < 2 {
+        r = r + x;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn twice_b(x: i64) -> i64 {
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < 2 {
+        r = r + x;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn choose(c: bool, m: i64) -> fn(i64) -> i64 {
+    if c {
+        return fn(x: i64) -> i64 { return x + m; };
+    }
+    return fn(x: i64) -> i64 { return x * m; };
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    // spec: 100 hot calls with k = 4 (each adds 4 to 0), one with k = v[2]
+    var hot: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        hot = hot + step(4, 0);
+        i = i + 1;
+    }
+    println(int_to_str(hot) + " " + int_to_str(step(v.get(2), 12)));
+    // hofspec: two closures with different captures
+    val two: i64 = v.get(1);
+    val three: i64 = v.get(2);
+    println(int_to_str(apply_all(v, fn(x: i64) -> i64 { return x * two; })) + " " + int_to_str(apply_all(v, fn(x: i64) -> i64 { return x * three; })));
+    // devirt: which closure is not known after the join
+    val f1: fn(i64) -> i64 = choose(v.get(0) == 1, 5);
+    val f2: fn(i64) -> i64 = choose(v.get(0) == 2, 5);
+    println(int_to_str(f1(2)) + " " + int_to_str(f2(10)));
+    // icf
+    println(int_to_str(plus_one(5)) + " " + int_to_str(plus_two(5)) + " " + int_to_str(twice_a(10)) + " " + int_to_str(twice_b(10)));
+    println(hot + step(v.get(0), 2) + apply_all(v, plus_two) * 100 + twice_a(v.get(2)) + plus_one(v.get(0)) * 10 + 0);
+    return 0;
+}

@@ -1,0 +1,54 @@
+// stdlib/totp: RFC 4226 Appendix D (HOTP-SHA1, counters 0..9), RFC 6238
+// Appendix B (TOTP, 8 digits, SHA-1/SHA-256/SHA-512 at the six test
+// times), RFC 4648 §10 base32 vectors, verification with a drift window
+// and replay protection, HOTP look-ahead, and an otpauth:// URI round trip.
+// Expected output:
+// hotp 755224 287082 359152 969429 338314 254676 287922 162583 399871 520489
+// totp 59 94287082 46119246 90693936
+// totp 1111111109 07081804 68084774 25091201
+// totp 1111111111 14050471 67062674 99943326
+// totp 1234567890 89005924 91819424 93441116
+// totp 2000000000 69279037 90698825 38618901
+// totp 20000000000 65353130 77737706 47863826
+// base32 MY====== MZXQ==== MZXW6YTBOI====== foobar
+// verify drift true replay false next step true too old false
+// hotp look-ahead 6 none -1
+// uri otpauth://totp/Fides%20Test:alice%40example.test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Fides%20Test&algorithm=SHA1&digits=6&period=30
+// parsed ok true totp Fides Test:alice@example.test Fides Test 20 6 30
+use totp;
+use kdf;
+use vec;
+
+fn main() {
+    val s1: Vec<i64> = str_bytes("12345678901234567890");
+    var line: str = "hotp";
+    var c: i64 = 0;
+    while c < 10 { line = line + " " + hotp_code(s1, KDF_SHA1, c, 6); c = c + 1; }
+    println(line);
+    val s256: Vec<i64> = str_bytes("12345678901234567890123456789012");
+    val s512: Vec<i64> = str_bytes("1234567890123456789012345678901234567890123456789012345678901234");
+    var times: Vec<i64> = Vec::new();
+    times.push(59); times.push(1111111109); times.push(1111111111);
+    times.push(1234567890); times.push(2000000000); times.push(20000000000);
+    var i: i64 = 0;
+    while i < times.len() {
+        val t: i64 = times.get(i);
+        println("totp " + int_to_str(t) + " " + totp_code(s1, KDF_SHA1, t, 30, 8) + " " + totp_code(s256, KDF_SHA256, t, 30, 8) + " " + totp_code(s512, KDF_SHA512, t, 30, 8));
+        i = i + 1;
+    }
+    println("base32 " + base32_encode(str_bytes("f"), true) + " " + base32_encode(str_bytes("fo"), true) + " " + base32_encode(str_bytes("foobar"), true) + " " + str_from_bytes(base32_decode("mzxw6ytboi======")));
+    var st: TotpState = totp_state();
+    val now: i64 = 1700000000;
+    val prev: str = totp_code(s1, KDF_SHA1, now - 30, 30, 6);
+    val v1: bool = totp_verify(& mut st, s1, KDF_SHA1, now, 30, 6, 1, prev);
+    val v2: bool = totp_verify(& mut st, s1, KDF_SHA1, now, 30, 6, 1, prev);
+    val v3: bool = totp_verify(& mut st, s1, KDF_SHA1, now, 30, 6, 1, totp_code(s1, KDF_SHA1, now, 30, 6));
+    var st2: TotpState = totp_state();
+    val v4: bool = totp_verify(& mut st2, s1, KDF_SHA1, now, 30, 6, 1, totp_code(s1, KDF_SHA1, now - 90, 30, 6));
+    println("verify drift " + bool_to_str(v1) + " replay " + bool_to_str(v2) + " next step " + bool_to_str(v3) + " too old " + bool_to_str(v4));
+    println("hotp look-ahead " + int_to_str(hotp_verify(s1, KDF_SHA1, 3, 6, 5, "254676")) + " none " + int_to_str(hotp_verify(s1, KDF_SHA1, 3, 6, 5, "000000")));
+    val uri: str = totp_uri("Fides Test", "alice@example.test", s1, KDF_SHA1, 6, 30);
+    println("uri " + uri);
+    val p: OtpAuth = totp_parse_uri(uri);
+    println("parsed ok " + bool_to_str(p.ok) + " " + p.kind + " " + p.label + " " + p.issuer + " " + int_to_str(p.secret.len()) + " " + int_to_str(p.digits) + " " + int_to_str(p.period));
+}

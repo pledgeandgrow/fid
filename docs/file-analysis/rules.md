@@ -34,8 +34,9 @@ Only importer: `main.fd`. Not on the pe_ir default Windows path, C path, `run` o
 ## Switches
 
 - `FID_NAT_OFF=rules`, `FID_NAT_OFF=purecse` (`ru_on`).
-- `FID_RULES_ON=readcse` turns read-only call merging on (`ru_opt_in` :572; off since Nov 9:
-  "an access at -1 on every native program").
+- `FID_NAT_OFF=readcse` (or `FID_IROPT_OFF=readcse`) turns read-only call merging off (`ru_on`;
+  on by default since Nov 17, OP25; it was opt-in through `FID_RULES_ON=readcse` and
+  `ru_opt_in` from Nov 9: "an access at -1 on every native program").
 - `FID_RULE_STATS=1` prints hits per rule (ME18). `FID_LIBFACTS_IN=<path>`.
 
 ## Findings
@@ -50,8 +51,9 @@ skipped, and the part of `bi` after the call (`bk+1..end`) is checked only for a
 loop (:423). Example: `a = rd()` before a `while` loop whose body does `b = rd(); G = G + 1;`
 with `rd` a multi-block function reading `G`: the body call is replaced by `a` although the store
 to `G` sits on the path body → header → body. Fix: when a predecessor is `bi` at any depth, check
-`ru_block_barrier(f, esc, bi, bk + 1, MAX)`. Now behind `FID_RULES_ON=readcse`, so not on by
-default.
+`ru_block_barrier(f, esc, bi, bk + 1, MAX)`. Nov 15: a write after the second call on a loop
+back to it stops the merge (llvm-roadmap WP10); readcse is on by default since Nov 17
+(`FID_NAT_OFF=readcse` turns it off).
 
 #### LOW — library-facts reader never sees read-only entries
 

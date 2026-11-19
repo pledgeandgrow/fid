@@ -1,0 +1,197 @@
+// stdlib/csv: the strict reader and the dialect writer (complaint CD2,
+// SL11). csv_read reports Go encoding/csv's errors with their line and
+// column (bare quote, extraneous quote, unterminated field, wrong number
+// of fields), and handles comments, leading-space trimming, lazy quotes,
+// kept or skipped empty lines, trailing delimiters and other dialects;
+// csv_write writes minimal, all, non-numeric and no quoting with LF or
+// CRLF, and what it writes reads back the same. Also the two dialect
+// fixes: the quote character around a quoted field and any delimiter
+// byte in csv_serialize_dialect. In the output, \n and \r stand for the
+// line-end bytes.
+//
+// Expected output:
+// rfc: ok 3 [name|qty] [Smith, J|3] [multi\nline|say "hi"]
+// bare: error 2:4 bare " in non-quoted field (1 read)
+// extraneous: error 1:6 extraneous or missing " in quoted field (0 read)
+// unterminated: error 1:3 extraneous or missing " in quoted field (0 read)
+// lazy.bare: ok 2 [a|b] [c|d"e]
+// lazy.extra: ok 1 [a|b"c\n]
+// lazy.open: ok 1 [x|open\n]
+// comment: ok 2 [a|b] [c |d]
+// fields0: error 3:1 wrong number of fields: 1, want 2 (2 read)
+// fields3: ok 1 [1|2|3]
+// keep_empty: ok 3 [a] [] [b]
+// skip_empty: ok 2 [a] [b]
+// trailing: ok 1 [a|b|]
+// trailing.eof: ok 1 [a|b|]
+// dialect: ok 1 [x|y;z|it's]
+// write.minimal: a,b c\n1,"q""t"\n" lead",2.5\n
+// write.all: "a","b c"\r\n"1","q""t"\r\n" lead","2.5"\r\n
+// write.nonnumeric: "a","b c"\n1,"q""t"\n" lead",2.5\n
+// write.none: a,b c\n1,q\"t\n lead,2.5\n
+// write.dialect: 'x;y';'it''s'\n
+// roundtrip: true
+// quote_dialect: 'a;b'
+// serialize_colon: a:"b:c"\n
+// csv dialects ok
+
+use csv;
+use string;
+
+fn esc(s: str) -> str {
+    var out = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else {
+            out = out + str_slice(s, i, i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn show(rows: Vec<CsvRow>) -> str {
+    var out = "";
+    var r: i64 = 0;
+    while r < rows.len() {
+        if r > 0 {
+            out = out + " ";
+        }
+        out = out + "[";
+        var f: Vec<str> = rows.get(r).fields;
+        var c: i64 = 0;
+        while c < f.len() {
+            if c > 0 {
+                out = out + "|";
+            }
+            out = out + esc(f.get(c));
+            c = c + 1;
+        }
+        out = out + "]";
+        r = r + 1;
+    }
+    return out;
+}
+
+fn report(label: str, r: CsvResult) {
+    if r.ok {
+        println(label + ": ok " + int_to_str(r.rows.len()) + " " + show(r.rows));
+    } else {
+        println(label + ": error " + int_to_str(r.line) + ":" + int_to_str(r.col) + " " + r.err + " (" + int_to_str(r.rows.len()) + " read)");
+    }
+}
+
+fn row2(a: str, b: str) -> CsvRow {
+    var f: Vec<str> = Vec::new();
+    f.push(a);
+    f.push(b);
+    return csv_row(f);
+}
+
+fn same_rows(a: Vec<CsvRow>, b: Vec<CsvRow>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var r: i64 = 0;
+    while r < a.len() {
+        var x: Vec<str> = a.get(r).fields;
+        var y: Vec<str> = b.get(r).fields;
+        if x.len() != y.len() {
+            return false;
+        }
+        var c: i64 = 0;
+        while c < x.len() {
+            if !str_equal(x.get(c), y.get(c)) {
+                return false;
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return true;
+}
+
+fn main() -> i64 {
+    var std = csv_options();
+    report("rfc", csv_read("name,qty\r\n\"Smith, J\",3\r\n\"multi\r\nline\",\"say \"\"hi\"\"\"\r\n", std));
+    report("bare", csv_read("a,b\nc,d\"e\n", std));
+    report("extraneous", csv_read("a,\"b\"c\n", std));
+    report("unterminated", csv_read("x,\"open\n", std));
+
+    var lazy = csv_options();
+    lazy.lazy_quotes = true;
+    report("lazy.bare", csv_read("a,b\nc,d\"e\n", lazy));
+    report("lazy.extra", csv_read("a,\"b\"c\n", lazy));
+    report("lazy.open", csv_read("x,\"open\n", lazy));
+
+    var com = csv_options();
+    com.comment = '#';
+    com.trim_space = true;
+    report("comment", csv_read("# header comment\n  a,  b\n#x,y\n c , d\n", com));
+
+    var f0 = csv_options();
+    f0.fields = 0;
+    report("fields0", csv_read("a,b\n1,2\n3\n", f0));
+    var f3 = csv_options();
+    f3.fields = 3;
+    report("fields3", csv_read("1,2,3\n", f3));
+
+    var keep = csv_options();
+    keep.skip_empty = false;
+    report("keep_empty", csv_read("a\n\nb\n", keep));
+    report("skip_empty", csv_read("a\n\nb\n", std));
+    report("trailing", csv_read("a,b,\n", std));
+    report("trailing.eof", csv_read("a,b,", std));
+
+    var semi = csv_options();
+    semi.delim = ';';
+    semi.quote = '\'';
+    report("dialect", csv_read("x;'y;z';'it''s'\n", semi));
+
+    var rows: Vec<CsvRow> = Vec::new();
+    rows.push(row2("a", "b c"));
+    rows.push(row2("1", "q\"t"));
+    rows.push(row2(" lead", "2.5"));
+    println("write.minimal: " + esc(csv_write(rows, std)));
+    var all = csv_options();
+    all.quote_style = CSV_QUOTE_ALL;
+    all.crlf = true;
+    println("write.all: " + esc(csv_write(rows, all)));
+    var nn = csv_options();
+    nn.quote_style = CSV_QUOTE_NONNUMERIC;
+    println("write.nonnumeric: " + esc(csv_write(rows, nn)));
+    var none = csv_options();
+    none.quote_style = CSV_QUOTE_NONE;
+    println("write.none: " + esc(csv_write(rows, none)));
+    var drows: Vec<CsvRow> = Vec::new();
+    drows.push(row2("x;y", "it's"));
+    println("write.dialect: " + esc(csv_write(drows, semi)));
+
+    // what csv_write writes, csv_read reads back
+    var w2: Vec<CsvRow> = Vec::new();
+    var f: Vec<str> = Vec::new();
+    f.push("multi\nline");
+    f.push("");
+    f.push("x");
+    w2.push(csv_row(f));
+    var lone: Vec<str> = Vec::new();
+    lone.push("");
+    w2.push(csv_row(lone));
+    w2.push(row2("q\"t", " lead"));
+    var back1: CsvResult = csv_read(csv_write(w2, std), std);
+    var back2: CsvResult = csv_read(csv_write(w2, all), std);
+    var back3: CsvResult = csv_read(csv_write(drows, semi), semi);
+    println("roundtrip: " + bool_to_str(back1.ok && back2.ok && back3.ok && same_rows(back1.rows, w2) && same_rows(back2.rows, w2) && same_rows(back3.rows, drows)));
+
+    println("quote_dialect: " + csv_quote_field_dialect("a;b", ';', '\''));
+    var colon: Vec<CsvRow> = Vec::new();
+    colon.push(row2("a", "b:c"));
+    println("serialize_colon: " + esc(csv_serialize_dialect(colon, ':')));
+    println("csv dialects ok");
+    return 0;
+}

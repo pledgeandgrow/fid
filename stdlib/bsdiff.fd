@@ -1,0 +1,488 @@
+// Fides bsdiff: binary diff and patch for small over-the-air updates
+//
+// All pure computation, no platform seam. The algorithm is Colin
+// Percival's bsdiff ("Naive differences of executable code", 2003): a
+// suffix array of the old file (built here by prefix doubling), then a scan
+// of the new file that finds approximate matches, and three streams:
+//   - control triples (x, y, z): add x bytes of the diff stream to x bytes
+//     of old, copy y bytes of the extra stream, move the old position by z;
+//   - diff bytes (new - old, mod 256: mostly zeros for recompiled code, so
+//     the patch compresses well);
+//   - extra bytes (new data with no match).
+//
+// The patch format (not BSDIFF40, which needs bzip2):
+//   0   "FDBSDIF1"                  magic, 8 bytes
+//   8   new size                    8 bytes } bsdiff's offtout: little-
+//   16  number of control triples   8 bytes } endian magnitude, top bit
+//   24  diff stream length          8 bytes } of the last byte = sign
+//   32  extra stream length         8 bytes }
+//   40  CRC-32 of old, CRC-32 of new (4 bytes each, little-endian)
+//   48  control triples (24 bytes each), diff stream, extra stream
+// The diff stream is run-length coded for zeros (a 0 byte is followed by
+// the run length - 1, so 1..256 zeros take two bytes; other bytes stand for
+// themselves), which takes most of what bsdiff gets from bzip2 on code that
+// changed a little; the control and extra streams are stored as they are.
+// bsdiff_apply checks the old CRC before patching,
+// every bound while patching, and the new CRC after.
+//
+// Sizes: the suffix array keys pack rank pairs into an i64, which limits
+// the old file to 2^20 bytes (1 MiB): enough for the small updates this is
+// meant for. Memory is a few words per old byte.
+
+module bsdiff;
+ use vec; use string;
+
+pub const BSDIFF_MAX_OLD: i64 = 1048576;
+
+// ─── CRC-32 (IEEE 802.3, reflected 0xEDB88320) ───────────────────────────
+
+/// CRC-32 of the bytes ("123456789" gives 0xCBF43926).
+pub fn bsdiff_crc32(b: & Vec<i64>) -> i64 {
+    var crc: i64 = 4294967295;
+    var i: i64 = 0;
+    while i < b.len() {
+        crc = crc ^ (b.get(i) & 255);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 3988292384;
+            } else {
+                crc = crc >> 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc ^ 4294967295;
+}
+
+// ─── Suffix array ────────────────────────────────────────────────────────
+
+/// The suffix array of `old` including the empty suffix: n + 1 starting
+/// positions in sorted order (the first is n, the empty suffix).
+pub fn bsdiff_suffix_array(old: & Vec<i64>) -> Vec<i64> {
+    val n: i64 = old.len();
+    var rank: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        rank.push((old.get(i) & 255) + 1);
+        i = i + 1;
+    }
+    rank.push(0);   // the empty suffix sorts first
+    var sa: Vec<i64> = Vec::new();
+    // ranks are 0..max(n, 256): the second key must stay below the base
+    var base: i64 = n + 2;
+    if base < 258 {
+        base = 258;
+    }
+    var k: i64 = 1;
+    loop {
+        // sort positions by (rank[i], rank[i + k]) packed in one key
+        var keys: Vec<i64> = Vec::new();
+        i = 0;
+        while i <= n {
+            var r2: i64 = 0;
+            if i + k <= n {
+                r2 = rank.get(i + k) + 1;
+            }
+            val key: i64 = rank.get(i) * base + r2;
+            keys.push(key * 1048577 + i);
+            i = i + 1;
+        }
+        keys.sort();
+        sa = Vec::new();
+        var newrank: Vec<i64> = Vec::filled(n + 1, 0);
+        var r: i64 = 0;
+        var prev: i64 = - 1;
+        i = 0;
+        while i <= n {
+            val kk: i64 = keys.get(i);
+            val pos: i64 = kk % 1048577;
+            val key: i64 = kk / 1048577;
+            if i > 0 && key != prev {
+                r = r + 1;
+            }
+            prev = key;
+            newrank.set(pos, r);
+            sa.push(pos);
+            i = i + 1;
+        }
+        rank = newrank;
+        if r == n || k > n {
+            break;
+        }
+        k = k * 2;
+    }
+    return sa;
+}
+
+// ─── Zero-run coding of the diff stream ──────────────────────────────────
+
+pub fn bsdiff_rle_encode(b: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) == 0 {
+            var run: i64 = 0;
+            while i < b.len() && b.get(i) == 0 && run < 256 {
+                run = run + 1;
+                i = i + 1;
+            }
+            out.push(0);
+            out.push(run - 1);
+        } else {
+            out.push(b.get(i) & 255);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Decode b[start..end]; `ok` false when a zero has no run length.
+pub fn bsdiff_rle_decode(b: & Vec<i64>, start: i64, end: i64, ok: & mut bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = start;
+    while i < end {
+        val c: i64 = b.get(i);
+        if c == 0 {
+            if i + 1 >= end {
+                *ok = false;
+                return out;
+            }
+            var k: i64 = 0;
+            while k <= b.get(i + 1) {
+                out.push(0);
+                k = k + 1;
+            }
+            i = i + 2;
+        } else {
+            out.push(c);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// ─── Diff ────────────────────────────────────────────────────────────────
+
+fn bd_matchlen(a: & Vec<i64>, ai: i64, b: & Vec<i64>, bi: i64) -> i64 {
+    var i: i64 = 0;
+    while ai + i < a.len() && bi + i < b.len() && a.get(ai + i) == b.get(bi + i) {
+        i = i + 1;
+    }
+    return i;
+}
+
+// old[ai..] compared with new[bi..] over min(lengths): <0, 0, >0
+fn bd_cmp(a: & Vec<i64>, ai: i64, b: & Vec<i64>, bi: i64) -> i64 {
+    var i: i64 = 0;
+    while ai + i < a.len() && bi + i < b.len() {
+        val x: i64 = a.get(ai + i);
+        val y: i64 = b.get(bi + i);
+        if x != y {
+            return x - y;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The longest match of new[scan..] in old; its length, position in *pos.
+fn bd_search(sa: & Vec<i64>, old: & Vec<i64>, nw: & Vec<i64>, scan: i64, st0: i64, en0: i64, pos: & mut i64) -> i64 {
+    var st: i64 = st0;
+    var en: i64 = en0;
+    while en - st >= 2 {
+        val x: i64 = st + (en - st) / 2;
+        if bd_cmp(old, sa.get(x), nw, scan) < 0 {
+            st = x;
+        } else {
+            en = x;
+        }
+    }
+    val a: i64 = bd_matchlen(old, sa.get(st), nw, scan);
+    val b: i64 = bd_matchlen(old, sa.get(en), nw, scan);
+    if a > b {
+        *pos = sa.get(st);
+        return a;
+    }
+    *pos = sa.get(en);
+    return b;
+}
+
+fn bd_put_off(out: & mut Vec<i64>, v: i64) {
+    var y: i64 = v;
+    if y < 0 {
+        y = 0 - y;
+    }
+    var i: i64 = 0;
+    while i < 8 {
+        var byte: i64 = (y >> (i * 8)) & 255;
+        if i == 7 && v < 0 {
+            byte = byte | 128;
+        }
+        out.push(byte);
+        i = i + 1;
+    }
+}
+
+fn bd_get_off(b: & Vec<i64>, at: i64) -> i64 {
+    var y: i64 = b.get(at + 7) & 127;
+    var i: i64 = 6;
+    while i >= 0 {
+        y = (y << 8) | b.get(at + i);
+        i = i - 1;
+    }
+    if (b.get(at + 7) & 128) != 0 {
+        return 0 - y;
+    }
+    return y;
+}
+
+fn bd_put32(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 24) & 255);
+}
+
+fn bd_get32(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+/// A patch that turns `old` into `nw` (see the module header for the
+/// format); [] when old is larger than BSDIFF_MAX_OLD.
+pub fn bsdiff_diff(old: & Vec<i64>, nw: & Vec<i64>) -> Vec<i64> {
+    val oldsize: i64 = old.len();
+    val newsize: i64 = nw.len();
+    if oldsize > BSDIFF_MAX_OLD {
+        return Vec::new();
+    }
+    val sa: Vec<i64> = bsdiff_suffix_array(old);
+    var ctrl: Vec<i64> = Vec::new();
+    var db: Vec<i64> = Vec::new();
+    var eb: Vec<i64> = Vec::new();
+    var ntriples: i64 = 0;
+    var scan: i64 = 0;
+    var len: i64 = 0;
+    var pos: i64 = 0;
+    var lastscan: i64 = 0;
+    var lastpos: i64 = 0;
+    var lastoffset: i64 = 0;
+    while scan < newsize {
+        var oldscore: i64 = 0;
+        scan = scan + len;
+        var scsc: i64 = scan;
+        while scan < newsize {
+            len = bd_search(& sa, old, nw, scan, 0, oldsize, & mut pos);
+            while scsc < scan + len {
+                if scsc + lastoffset < oldsize && old.get(scsc + lastoffset) == nw.get(scsc) {
+                    oldscore = oldscore + 1;
+                }
+                scsc = scsc + 1;
+            }
+            if (len == oldscore && len != 0) || len > oldscore + 8 {
+                break;
+            }
+            if scan + lastoffset < oldsize && old.get(scan + lastoffset) == nw.get(scan) {
+                oldscore = oldscore - 1;
+            }
+            scan = scan + 1;
+        }
+        if len != oldscore || scan == newsize {
+            // extend the previous match forwards ...
+            var s: i64 = 0;
+            var sf: i64 = 0;
+            var lenf: i64 = 0;
+            var i: i64 = 0;
+            while lastscan + i < scan && lastpos + i < oldsize {
+                if old.get(lastpos + i) == nw.get(lastscan + i) {
+                    s = s + 1;
+                }
+                i = i + 1;
+                if s * 2 - i > sf * 2 - lenf {
+                    sf = s;
+                    lenf = i;
+                }
+            }
+            // ... and the new one backwards
+            var lenb: i64 = 0;
+            if scan < newsize {
+                s = 0;
+                var sb: i64 = 0;
+                i = 1;
+                while scan >= lastscan + i && pos >= i {
+                    if old.get(pos - i) == nw.get(scan - i) {
+                        s = s + 1;
+                    }
+                    if s * 2 - i > sb * 2 - lenb {
+                        sb = s;
+                        lenb = i;
+                    }
+                    i = i + 1;
+                }
+            }
+            // where they overlap, split at the best point
+            if lastscan + lenf > scan - lenb {
+                val overlap: i64 = (lastscan + lenf) - (scan - lenb);
+                s = 0;
+                var ss: i64 = 0;
+                var lens: i64 = 0;
+                i = 0;
+                while i < overlap {
+                    if nw.get(lastscan + lenf - overlap + i) == old.get(lastpos + lenf - overlap + i) {
+                        s = s + 1;
+                    }
+                    if nw.get(scan - lenb + i) == old.get(pos - lenb + i) {
+                        s = s - 1;
+                    }
+                    if s > ss {
+                        ss = s;
+                        lens = i + 1;
+                    }
+                    i = i + 1;
+                }
+                lenf = lenf + lens - overlap;
+                lenb = lenb - lens;
+            }
+            i = 0;
+            while i < lenf {
+                db.push((nw.get(lastscan + i) - old.get(lastpos + i) + 256) & 255);
+                i = i + 1;
+            }
+            val extra: i64 = (scan - lenb) - (lastscan + lenf);
+            i = 0;
+            while i < extra {
+                eb.push(nw.get(lastscan + lenf + i));
+                i = i + 1;
+            }
+            bd_put_off(& mut ctrl, lenf);
+            bd_put_off(& mut ctrl, extra);
+            bd_put_off(& mut ctrl, (pos - lenb) - (lastpos + lenf));
+            ntriples = ntriples + 1;
+            lastscan = scan - lenb;
+            lastpos = pos - lenb;
+            lastoffset = pos - scan;
+        }
+    }
+    val dcoded: Vec<i64> = bsdiff_rle_encode(& db);
+    var out: Vec<i64> = str_bytes("FDBSDIF1");
+    bd_put_off(& mut out, newsize);
+    bd_put_off(& mut out, ntriples);
+    bd_put_off(& mut out, dcoded.len());
+    bd_put_off(& mut out, eb.len());
+    bd_put32(& mut out, bsdiff_crc32(old));
+    bd_put32(& mut out, bsdiff_crc32(nw));
+    out.extend(ctrl);
+    out.extend(dcoded);
+    out.extend(eb);
+    return out;
+}
+
+// ─── Patch ───────────────────────────────────────────────────────────────
+
+pub struct BsdiffResult {
+    pub ok: bool,
+    pub error: str,
+    pub data: Vec<i64>,
+}
+
+fn bd_err(why: str) -> BsdiffResult {
+    return BsdiffResult {
+        ok: false, error: why, data: Vec::new()
+    };
+}
+
+/// Header facts of a patch: [new size, triples, diff length, extra
+/// length], or [] when it is not a patch of this format.
+pub fn bsdiff_header(p: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if p.len() < 48 || str_from_bytes(bd_slice(p, 0, 8)) != "FDBSDIF1" {
+        return out;
+    }
+    out.push(bd_get_off(p, 8));
+    out.push(bd_get_off(p, 16));
+    out.push(bd_get_off(p, 24));
+    out.push(bd_get_off(p, 32));
+    return out;
+}
+
+fn bd_slice(p: & Vec<i64>, a: i64, b: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < b && i < p.len() {
+        out.push(p.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Apply a patch to `old`. Fails on a different old file (CRC), a
+/// malformed or truncated patch, or a result whose CRC is wrong.
+pub fn bsdiff_apply(old: & Vec<i64>, patch: & Vec<i64>) -> BsdiffResult {
+    val h: Vec<i64> = bsdiff_header(patch);
+    if h.len() != 4 {
+        return bd_err("not a FDBSDIF1 patch");
+    }
+    val newsize: i64 = h.get(0);
+    val ntrip: i64 = h.get(1);
+    val dlen: i64 = h.get(2);
+    val elen: i64 = h.get(3);
+    if newsize < 0 || ntrip < 0 || dlen < 0 || elen < 0 || ntrip > patch.len() || dlen > patch.len() || elen > patch.len() {
+        return bd_err("bad header");
+    }
+    val cstart: i64 = 48;
+    val dstart: i64 = cstart + ntrip * 24;
+    val estart: i64 = dstart + dlen;
+    if estart + elen != patch.len() {
+        return bd_err("patch length does not match its header");
+    }
+    if bd_get32(patch, 40) != bsdiff_crc32(old) {
+        return bd_err("the old file is not the one the patch was made from");
+    }
+    var rle_ok: bool = true;
+    val db: Vec<i64> = bsdiff_rle_decode(patch, dstart, estart, & mut rle_ok);
+    if !rle_ok {
+        return bd_err("bad diff stream");
+    }
+    var nw: Vec<i64> = Vec::new();
+    var oldpos: i64 = 0;
+    var dpos: i64 = 0;
+    var epos: i64 = estart;
+    var t: i64 = 0;
+    while t < ntrip {
+        val x: i64 = bd_get_off(patch, cstart + t * 24);
+        val y: i64 = bd_get_off(patch, cstart + t * 24 + 8);
+        val z: i64 = bd_get_off(patch, cstart + t * 24 + 16);
+        if x < 0 || y < 0 || nw.len() + x + y > newsize || dpos + x > db.len() || epos + y > patch.len() {
+            return bd_err("control triple out of bounds");
+        }
+        var i: i64 = 0;
+        while i < x {
+            var b: i64 = db.get(dpos + i);
+            if oldpos + i >= 0 && oldpos + i < old.len() {
+                b = (b + old.get(oldpos + i)) & 255;
+            }
+            nw.push(b);
+            i = i + 1;
+        }
+        dpos = dpos + x;
+        oldpos = oldpos + x;
+        i = 0;
+        while i < y {
+            nw.push(patch.get(epos + i));
+            i = i + 1;
+        }
+        epos = epos + y;
+        oldpos = oldpos + z;
+        t = t + 1;
+    }
+    if nw.len() != newsize || dpos != db.len() {
+        return bd_err("patch ended early");
+    }
+    if bd_get32(patch, 44) != bsdiff_crc32(& nw) {
+        return bd_err("result CRC mismatch");
+    }
+    return BsdiffResult {
+        ok: true, error: "", data: nw
+    };
+}

@@ -1,0 +1,147 @@
+// stdlib/particle_filter: SplitMix64 draws, systematic resampling indices, effective sample size, 1D corridor localization with door sensing and 2D localization from ranges to four landmarks, all from fixed seeds (values from a Python replica)
+// Expected output:
+// systematic [0.1 0.2 0.3 0.4] u0=0.2: 1 2 3 3
+// neff = 3.3333
+// rng: 3543 26140 10754 0.582930 0.003920
+// 1d truth 16.000 mean 16.141 std 1.296 resamples 2
+// 2d mean 3.134 6.586 std 0.092 0.090 neff 368.4 resamples 2
+// lost filter resets weights: 0.0025
+use particle_filter;
+use quat;
+use math;
+
+fn near_door(x: f64) -> bool {
+    return math_fabs(x - 3.0) < 0.6 || math_fabs(x - 7.0) < 0.6 || math_fabs(x - 14.0) < 0.6;
+}
+
+fn door_lik(s: Vec<f64>, z: Vec<f64>) -> f64 {
+    val near: bool = near_door(s.get(0));
+    if z.get(0) > 0.5 {
+        if near {
+            return 0.9;
+        }
+        return 0.05;
+    }
+    if near {
+        return 0.1;
+    }
+    return 0.95;
+}
+
+fn lmx(k: i64) -> f64 {
+    if k == 1 || k == 3 {
+        return 10.0;
+    }
+    return 0.0;
+}
+
+fn lmy(k: i64) -> f64 {
+    if k >= 2 {
+        return 10.0;
+    }
+    return 0.0;
+}
+
+fn range_lik(s: Vec<f64>, z: Vec<f64>) -> f64 {
+    var p: f64 = 1.0;
+    var k: i64 = 0;
+    while k < 4 {
+        val dx: f64 = s.get(0) - lmx(k);
+        val dy: f64 = s.get(1) - lmy(k);
+        p = p * pf_gauss_likelihood(math_sqrt(dx * dx + dy * dy), z.get(k), 0.3);
+        k = k + 1;
+    }
+    return p;
+}
+
+fn zero_lik(s: Vec<f64>, z: Vec<f64>) -> f64 {
+    return 0.0;
+}
+
+fn one(v: f64) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    o.push(v);
+    return o;
+}
+
+fn two(a: f64, b: f64) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    o.push(a);
+    o.push(b);
+    return o;
+}
+
+fn main() -> i64 {
+    var w: Vec<f64> = Vec::new();
+    w.push(0.1);
+    w.push(0.2);
+    w.push(0.3);
+    w.push(0.4);
+    val idx: Vec<i64> = pf_systematic_indices(&w, 0.2);
+    println("systematic [0.1 0.2 0.3 0.4] u0=0.2: " + int_to_str(idx.get(0)) + " " + int_to_str(idx.get(1)) + " " + int_to_str(idx.get(2)) + " " + int_to_str(idx.get(3)));
+    println("neff = " + rmath_fmt(pf_neff_of(&w), 4));
+    var r: PfRng = pfrng_new(7);
+    val a: i64 = pfrng_next(&mut r) & 65535;
+    val b: i64 = pfrng_next(&mut r) & 65535;
+    val c: i64 = pfrng_next(&mut r) & 65535;
+    val u: f64 = pfrng_uniform(&mut r);
+    val g: f64 = pfrng_gauss(&mut r);
+    println("rng: " + int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c) + " " + rmath_fmt(u, 6) + " " + rmath_fmt(g, 6));
+
+    // 1D corridor with doors at 3, 7 and 14; the robot starts at 1 and
+    // moves 1 per step
+    var pf: ParticleFilter = pf_new(300, 1, 42);
+    pf_init_uniform(&mut pf, &one(0.0), &one(20.0));
+    var truth: f64 = 1.0;
+    var step: i64 = 0;
+    while step < 15 {
+        truth = truth + 1.0;
+        pf_predict_shift(&mut pf, &one(1.0), &one(0.1));
+        var z: f64 = 0.0;
+        if near_door(truth) {
+            z = 1.0;
+        }
+        pf_weight(&mut pf, door_lik, &one(z));
+        pf_resample_if_needed(&mut pf, 0.5);
+        step = step + 1;
+    }
+    val m: Vec<f64> = pf_mean(&pf);
+    val v: Vec<f64> = pf_variance(&pf);
+    println("1d truth " + rmath_fmt(truth, 3) + " mean " + rmath_fmt(m.get(0), 3) + " std " + rmath_fmt(math_sqrt(v.get(0)), 3) + " resamples " + int_to_str(pf.resamples));
+
+    // 2D: a static robot at (3, 6.5) measures its distance to four landmarks
+    var zs: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    while k < 4 {
+        val dx: f64 = 3.0 - lmx(k);
+        val dy: f64 = 6.5 - lmy(k);
+        var n: f64 = 0.0;
+        if k == 0 {
+            n = 0.05;
+        } else if k == 1 {
+            n = -0.08;
+        } else if k == 2 {
+            n = 0.03;
+        } else {
+            n = -0.02;
+        }
+        zs.push(rmath_hypot(dx, dy) + n);
+        k = k + 1;
+    }
+    var p2: ParticleFilter = pf_new(400, 2, 2024);
+    pf_init_uniform(&mut p2, &two(0.0, 0.0), &two(10.0, 10.0));
+    var it: i64 = 0;
+    while it < 5 {
+        pf_predict_shift(&mut p2, &two(0.0, 0.0), &two(0.05, 0.05));
+        pf_weight(&mut p2, range_lik, &zs);
+        pf_resample_if_needed(&mut p2, 0.5);
+        it = it + 1;
+    }
+    val m2: Vec<f64> = pf_mean(&p2);
+    val v2: Vec<f64> = pf_variance(&p2);
+    println("2d mean " + rmath_fmt(m2.get(0), 3) + " " + rmath_fmt(m2.get(1), 3) + " std " + rmath_fmt(math_sqrt(v2.get(0)), 3) + " " + rmath_fmt(math_sqrt(v2.get(1)), 3) + " neff " + rmath_fmt(pf_neff(&p2), 1) + " resamples " + int_to_str(p2.resamples));
+
+    pf_weight(&mut p2, zero_lik, &zs);
+    println("lost filter resets weights: " + rmath_fmt(pf_weight_of(&p2, 0), 4));
+    return 0;
+}

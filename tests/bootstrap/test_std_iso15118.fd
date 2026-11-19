@@ -1,0 +1,323 @@
+// stdlib/iso15118: V2GTP and SDP; the SupportedAppProtocol handshake in EXI (a Hyundai Ioniq and a BMW iX3 request as captured by the pyPLC project, decoded and re-encoded byte for byte; the response derived by hand); 36 published DIN 70121 EXI messages (pyPLC's captures from cars and chargers and its OpenV2G-made test messages, all 22 message types of a DC session) decoded and re-encoded byte for byte, with fields read back; the message builders reproducing 8 of them exactly; and a full DIN DC session through the state machine on EXI bytes, with repeats for EVSEProcessing Ongoing, pre-charge and welding detection, then a SessionID mismatch and a FAILED code.
+// Expected output:
+// v2gtp: ptype 0x8001 len 4 payload 4 ok
+// sdp req: 1000; sdp resp port 15118 sec 0
+// appproto ioniq: 1 protocol urn:din:70121:2012:MsgDef v2.0 schema 1 priority 1, re-encoded same true
+// appproto bmw: schema 0, re-encoded same true
+// appproto res: 80400040 -> code 0 schema 1
+// appproto own: 2 protocols round trip true; choose schema 1 (DIN not supported -> picks ISO)
+// din vectors: 36 of 36 decode and re-encode byte for byte
+// SessionSetupRes: OK_NewSessionEstablished sid c905ed985452932e EVSEID 41a455654a55230210783f time 1684066647
+// Ioniq ChargeParameterDiscoveryReq: DC_extended max 412800 mV 200000 mA SOC 40 full 94 bulk 83
+// ChargeParameterDiscoveryRes: tuple 123 entries 1 duration 86400 pmax -2135, max power 1 W 26000, isolation Invalid
+// CurrentDemandRes: 237590 mV, max current 500000 mA, limits false false false
+// PowerDeliveryReq Ioniq: ready false error FAILED_ChargingSystemIncompatibility cabin 0
+// builders: 8 of 8 reproduce the published bytes
+// din session: AppProtocol -> SessionSetup -> ServiceDiscovery -> PaymentSelect -> ContractAuth (x2) -> ChargeParam -> CableCheck (x2) -> PreCharge (x2) -> PowerDeliveryStart -> CurrentDemand
+// session id 1122334455667788, schema 1, current demand rounds 3
+// din session end: PowerDeliveryStop -> Welding (x2) -> SessionStop -> Done failed false
+// din session errors: SessionID mismatch; ServiceDiscoveryRes failed
+// iso-2 seam: wrong response fails: expected supportedAppProtocolRes, got SessionSetupRes
+use iso15118;
+use exi;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hb(s: str) -> Vec<i64> {
+    return hex_decode_bytes(s);
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn vec(names: & mut Vec<str>, hexes: & mut Vec<str>, n: str, h: str) {
+    names.push(n);
+    hexes.push(h);
+}
+
+fn sname(s: i64) -> str {
+    if s == V2G_APP_PROTOCOL { return "AppProtocol"; }
+    if s == V2G_SESSION_SETUP { return "SessionSetup"; }
+    if s == V2G_SERVICE_DISCOVERY { return "ServiceDiscovery"; }
+    if s == V2G_PAYMENT_SELECT { return "PaymentSelect"; }
+    if s == V2G_CONTRACT_AUTH { return "ContractAuth"; }
+    if s == V2G_CHARGE_PARAM { return "ChargeParam"; }
+    if s == V2G_CABLE_CHECK { return "CableCheck"; }
+    if s == V2G_PRE_CHARGE { return "PreCharge"; }
+    if s == V2G_POWER_DELIVERY_START { return "PowerDeliveryStart"; }
+    if s == V2G_CURRENT_DEMAND { return "CurrentDemand"; }
+    if s == V2G_POWER_DELIVERY_STOP { return "PowerDeliveryStop"; }
+    if s == V2G_WELDING { return "Welding"; }
+    if s == V2G_SESSION_STOP { return "SessionStop"; }
+    return "Done";
+}
+
+/// The EVSE's answer as a V2GTP packet.
+fn evse(k: & V2gCodecs, sid: & Vec<i64>, body: Vec<ExiEvent>) -> Vec<i64> {
+    val r: ExiResult = din_encode(& k.din, sid, & body);
+    if !r.ok {
+        println("evse encode failed: " + r.error);
+    }
+    return iso15118_v2gtp(V2GTP_EXI, & r.bytes);
+}
+
+/// Send `req` and feed the EVSE's response to the session.
+fn exchange(s: & mut V2gSession, k: & V2gCodecs, req: Vec<ExiEvent>, res: Vec<i64>, tick: & mut i64) {
+    val pkt: Vec<i64> = v2g_din_send(s, k, & req, *tick);
+    if pkt.len() == 0 {
+        println("send failed: " + s.error);
+    }
+    v2g_din_receive(s, k, & res, *tick + 1);
+    *tick = *tick + 2;
+}
+
+fn main() {
+    // V2GTP wrapping a 4-byte EXI payload
+    var exipay: Vec<i64> = Vec::new();
+    exipay.push(0x80); exipay.push(0x81); exipay.push(0x01); exipay.push(0x02);
+    val pkt: Vec<i64> = iso15118_v2gtp(V2GTP_EXI, & exipay);
+    val pp: V2gtpPacket = iso15118_v2gtp_parse(& pkt);
+    var okstr: str = "bad";
+    if pp.ok { okstr = "ok"; }
+    println("v2gtp: ptype 0x" + int_to_hex(pp.payload_type) + " len " + int_to_str(pp.length) + " payload " + int_to_str(pp.payload.len()) + " " + okstr);
+
+    // SDP
+    val sdpreq: Vec<i64> = iso15118_sdp_request(SDP_SECURITY_NONE, SDP_TRANSPORT_TCP);
+    var ip: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { ip.push(0); i = i + 1; }
+    ip.set(15, 1);   // ::1
+    val sdpresp: Vec<i64> = iso15118_sdp_response(& ip, 15118, SDP_SECURITY_TLS, SDP_TRANSPORT_TCP);
+    val sr: SdpResponse = iso15118_sdp_response_parse(& sdpresp);
+    println("sdp req: " + hx(sdpreq) + "; sdp resp port " + int_to_str(sr.port) + " sec " + int_to_str(sr.security));
+
+    // SupportedAppProtocol: captured requests
+    val ioniq: Vec<i64> = hb("8000dbab9371d3234b71d1b981899189d191818991d26b9b3a232b30020000040040");
+    val back: Vec<AppProtocol> = iso15118_app_protocol_req_parse(& ioniq);
+    val p0: AppProtocol = back.get(0);
+    println("appproto ioniq: " + int_to_str(back.len()) + " protocol " + p0.namespace + " v" + int_to_str(p0.version_major) + "." + int_to_str(p0.version_minor) + " schema " + int_to_str(p0.schema_id) + " priority " + int_to_str(p0.priority) + ", re-encoded same " + yes(hx(iso15118_app_protocol_req(& back)) == hx(ioniq)));
+    val bmw: Vec<i64> = hb("8000dbab9371d3234b71d1b981899189d191818991d26b9b3a232b30020000000040");
+    val bb: Vec<AppProtocol> = iso15118_app_protocol_req_parse(& bmw);
+    println("appproto bmw: schema " + int_to_str(bb.get(0).schema_id) + ", re-encoded same " + yes(hx(iso15118_app_protocol_req(& bb)) == hx(bmw)));
+    val res: Vec<i64> = iso15118_app_protocol_res(APP_OK, 1);
+    val rp: AppProtocolRes = iso15118_app_protocol_res_parse(& res);
+    println("appproto res: " + hx(res) + " -> code " + int_to_str(rp.response_code) + " schema " + int_to_str(rp.schema_id));
+    var protos: Vec<AppProtocol> = Vec::new();
+    protos.push(AppProtocol { namespace: "urn:iso:15118:2:2013:MsgDef", version_major: 2, version_minor: 0, schema_id: 1, priority: 1 });
+    protos.push(AppProtocol { namespace: DIN_NAMESPACE, version_major: 2, version_minor: 0, schema_id: 2, priority: 2 });
+    val own: Vec<i64> = iso15118_app_protocol_req(& protos);
+    val ob: Vec<AppProtocol> = iso15118_app_protocol_req_parse(& own);
+    var supported: Vec<str> = Vec::new();
+    supported.push("urn:iso:15118:2:2013:MsgDef");
+    val chosen: i64 = iso15118_choose_protocol(& ob, & supported);
+    println("appproto own: " + int_to_str(ob.len()) + " protocols round trip " + yes(ob.get(1).namespace == DIN_NAMESPACE && ob.get(1).priority == 2) + "; choose schema " + int_to_str(chosen) + " (DIN not supported -> picks ISO)");
+
+    // DIN 70121: published messages
+    val k: V2gCodecs = iso15118_codecs();
+    var names: Vec<str> = Vec::new();
+    var hexes: Vec<str> = Vec::new();
+    vec(& mut names, & mut hexes, "SessionSetupReq", "809a0011d00000");
+    vec(& mut names, & mut hexes, "SessionSetupRes", "809a02004080c1014181c211e0000080");
+    vec(& mut names, & mut hexes, "ServiceDiscoveryReq", "809a001198");
+    vec(& mut names, & mut hexes, "ServiceDiscoveryRes", "809a0011a0012002412104");
+    vec(& mut names, & mut hexes, "ServicePaymentSelectionReq", "809a0011b2001280");
+    vec(& mut names, & mut hexes, "ServicePaymentSelectionRes", "809a0011c000");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryReq", "809a00107211400dc0c8c82324701900");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryRes", "809a001080004820400000c99002062050193080c0c802064c8010190140c80a20");
+    vec(& mut names, & mut hexes, "CableCheckReq", "809a001010400000");
+    vec(& mut names, & mut hexes, "CableCheckRes", "809a0010200200000000");
+    vec(& mut names, & mut hexes, "PreChargeReq", "809a001150400000c80006400000");
+    vec(& mut names, & mut hexes, "PreChargeRes", "809a00116002000000320000");
+    vec(& mut names, & mut hexes, "PowerDeliveryReq", "809a00113020000a00000000");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryReq", "809a02004080c1014181c2107190000005004061a01e04070c84c02050a02000c2438368040309094820105e0a60");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryReq", "809a0233ebc74ab099a6dc907191400500c8c82324701900");
+    vec(& mut names, & mut hexes, "ServiceDiscoveryReq", "809a02004080c1014181c2119400");
+    vec(& mut names, & mut hexes, "ServiceDiscoveryRes", "809a02004080c1014181c211a0012002410084");
+    vec(& mut names, & mut hexes, "ContractAuthenticationReq", "809a02004080c1014181c210b8");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryRes", "809a0200000000031fdc8bd08002000000000010002a80040000140c004080e18a3a0a0a00a0606000080a01e230300610");
+    vec(& mut names, & mut hexes, "PowerDeliveryReq", "809a00113060");
+    vec(& mut names, & mut hexes, "PowerDeliveryRes", "809a0011400420400000");
+    vec(& mut names, & mut hexes, "CurrentDemandReq", "809a0010d0400000c800410c8000");
+    vec(& mut names, & mut hexes, "CurrentDemandRes", "809a0010e0020000003200019000000600");
+    vec(& mut names, & mut hexes, "WeldingDetectionReq", "809a001210400000");
+    vec(& mut names, & mut hexes, "WeldingDetectionRes", "809a00122002000000320000");
+    vec(& mut names, & mut hexes, "SessionStopReq", "809a0011f0");
+    vec(& mut names, & mut hexes, "SessionStopRes", "809a00120000");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryReq", "809a0211c1ff77aed4fdff907190000009204061104e04070a8c30102050961f12805000");
+    vec(& mut names, & mut hexes, "SessionSetupRes", "809a0232417b661514a4cb91e0202d0691559529548c0841e0fc1af4507460c0");
+    vec(& mut names, & mut hexes, "ServiceDiscoveryRes", "809a021a3b7c417774813311a00120024100c4");
+    vec(& mut names, & mut hexes, "ContractAuthenticationRes", "809a021a3b7c417774813310c00200");
+    vec(& mut names, & mut hexes, "ChargeParameterDiscoveryRes", "809a0125e6cecc50800001ec00200004051828758405500080000101844138101c2432c04081436c900c0c000041435ecc044606000200");
+    vec(& mut names, & mut hexes, "CableCheckRes", "809a0125e6cecc5020004080000400");
+    vec(& mut names, & mut hexes, "PreChargeRes", "809a0125e6cecc516000408000008284de880800");
+    vec(& mut names, & mut hexes, "PowerDeliveryRes", "809a0125e6cecc51400420400000");
+    vec(& mut names, & mut hexes, "CurrentDemandRes", "809a0125e6cecc50e0004080000082867dc8081818000000040a1b64802030882702038486580800");
+    var good: i64 = 0;
+    var msgs: Vec<DinMessage> = Vec::new();
+    i = 0;
+    while i < hexes.len() {
+        val m: DinMessage = din_decode(& k.din, hb(hexes.get(i)));
+        if !m.ok || m.name != names.get(i) {
+            println("vector " + int_to_str(i) + " " + names.get(i) + ": " + m.error + " got " + m.name);
+        } else {
+            val r: ExiResult = exi_encode(& k.din, & exi_options(), & m.events);
+            if r.ok && hx(r.bytes) == hexes.get(i) {
+                good = good + 1;
+            } else {
+                println("vector " + int_to_str(i) + " re-encodes as " + hx(r.bytes) + " " + r.error);
+            }
+        }
+        msgs.push(m);
+        i = i + 1;
+    }
+    println("din vectors: " + int_to_str(good) + " of " + int_to_str(hexes.len()) + " decode and re-encode byte for byte");
+    val ss: DinMessage = msgs.get(28);
+    println("SessionSetupRes: " + ss.response_code + " sid " + hx(ss.session_id) + " EVSEID " + hx(din_field(& ss, "EVSEID").bval) + " time " + int_to_str(din_field(& ss, "DateTimeNow").ival));
+    val cq: DinMessage = msgs.get(13);
+    val evmax: DinPV = din_pv_at(& cq, "DC_EVChargeParameter/EVMaximumVoltageLimit");
+    val evcur: DinPV = din_pv_at(& cq, "DC_EVChargeParameter/EVMaximumCurrentLimit");
+    val evst: DinEVStatus = din_ev_status_at(& cq, "DC_EVChargeParameter/DC_EVStatus");
+    println("Ioniq ChargeParameterDiscoveryReq: " + din_field(& cq, "EVRequestedEnergyTransferType").sval + " max " + int_to_str(din_pv_milli(& evmax)) + " m" + evmax.unit + " " + int_to_str(din_pv_milli(& evcur)) + " m" + evcur.unit + " SOC " + int_to_str(evst.soc) + " full " + int_to_str(din_field(& cq, "DC_EVChargeParameter/FullSOC").ival) + " bulk " + int_to_str(din_field(& cq, "DC_EVChargeParameter/BulkSOC").ival));
+    val cr: DinMessage = msgs.get(31);
+    val sched: str = "SAScheduleList/SAScheduleTuple";
+    val pw: DinPV = din_pv_at(& cr, "DC_EVSEChargeParameter/EVSEMaximumPowerLimit");
+    println("ChargeParameterDiscoveryRes: tuple " + int_to_str(din_field(& cr, sched + "/SAScheduleTupleID").ival) + " entries " + int_to_str(exi_count(& cr.events, "V2G_Message/Body/ChargeParameterDiscoveryRes/" + sched + "/PMaxSchedule/PMaxScheduleEntry")) + " duration " + int_to_str(din_field(& cr, sched + "/PMaxSchedule/PMaxScheduleEntry/RelativeTimeInterval/duration").ival) + " pmax " + int_to_str(din_field(& cr, sched + "/PMaxSchedule/PMaxScheduleEntry/PMax").ival) + ", max power " + int_to_str(pw.multiplier) + " " + pw.unit + " " + int_to_str(pw.value) + ", isolation " + din_evse_status_at(& cr, "DC_EVSEChargeParameter/DC_EVSEStatus").isolation);
+    val cd: DinMessage = msgs.get(35);
+    val cdv: DinPV = din_pv_at(& cd, "EVSEPresentVoltage");
+    val cdi: DinPV = din_pv_at(& cd, "EVSEMaximumCurrentLimit");
+    println("CurrentDemandRes: " + int_to_str(din_pv_milli(& cdv)) + " mV, max current " + int_to_str(din_pv_milli(& cdi)) + " mA, limits " + yes(din_field(& cd, "EVSECurrentLimitAchieved").ival != 0) + " " + yes(din_field(& cd, "EVSEVoltageLimitAchieved").ival != 0) + " " + yes(din_field(& cd, "EVSEPowerLimitAchieved").ival != 0));
+    val pd: DinMessage = msgs.get(12);
+    val pds: DinEVStatus = din_ev_status_at(& pd, "DC_EVPowerDeliveryParameter/DC_EVStatus");
+    println("PowerDeliveryReq Ioniq: ready " + yes(din_field(& pd, "ReadyToChargeState").ival != 0) + " error " + pds.error_code + " cabin " + int_to_str(pds.cabin));
+
+    // the builders reproduce published messages
+    var built: i64 = 0;
+    val nosid: Vec<i64> = Vec::new();
+    built = built + same(& k, & nosid, din_session_setup_req(Vec::new()), hexes.get(0));
+    built = built + same(& k, & hb("68edf105ddd204cc"), din_service_discovery_res("OK", "ExternalPayment", 1, "", "EVCharging", false, "DC_extended"), hexes.get(29));
+    var iq: DinDCEVParams = din_dc_ev_params(din_ev_status(false, "NO_ERROR", 40), din_pv(- 1, "A", 2000), din_pv(- 1, "V", 4128));
+    iq.status.cabin = 0;
+    iq.status.ress = 0;
+    iq.max_power = din_pv(1, "W", 9800);
+    iq.energy_capacity = din_pv(0, "Wh", 28000);
+    iq.energy_request = din_pv(0, "Wh", 16660);
+    iq.full_soc = 94;
+    iq.bulk_soc = 83;
+    built = built + same(& k, & hb("0102030405060708"), din_charge_parameter_discovery_req("DC_extended", & iq), hexes.get(13));
+    var sc: DinSchedule = DinSchedule { tuple_id: 123, pmax_schedule_id: 1, starts: Vec::new(), durations: Vec::new(), pmax: Vec::new() };
+    sc.starts.push(0);
+    sc.durations.push(86400);
+    sc.pmax.push(- 2135);
+    val ep: DinDCEVSEParams = DinDCEVSEParams {
+        status: din_evse_status("Invalid", "EVSE_Ready"), max_current: din_pv(- 1, "A", 5000), max_power: din_pv(1, "W", 26000),
+        max_voltage: din_pv(- 1, "V", 4699), min_current: din_pv(0, "A", 0), min_voltage: din_pv(- 2, "V", 22999),
+        regulation_tolerance: din_pv_none(), peak_current_ripple: din_pv(0, "A", 0), energy_to_deliver: din_pv_none(),
+    };
+    built = built + same(& k, & hb("979b3b31"), din_charge_parameter_discovery_res("OK", "Finished", & sc, & ep), hexes.get(31));
+    built = built + same(& k, & hb("979b3b31"), din_current_demand_res("OK", & din_evse_status("Valid", "EVSE_Ready"), & din_pv(- 2, "V", 23759), & din_pv(0, "A", 0), false, false, false, & din_pv(- 1, "V", 4699), & din_pv(- 1, "A", 5000), & din_pv(1, "W", 26000)), hexes.get(35));
+    var pdev: DinEVStatus = din_ev_status(false, "FAILED_ChargingSystemIncompatibility", 0);
+    pdev.cabin = 0;
+    pdev.ress = 0;
+    val none: Vec<i64> = Vec::new();
+    built = built + same(& k, & nosid, din_power_delivery_req(false, 0, & none, & none, true, & pdev, 0, false), hexes.get(12));
+    built = built + same(& k, & nosid, din_pre_charge_req(& din_ev_status(false, "NO_ERROR", 0), & din_pv(0, "", 0), & din_pv(0, "", 0)), hexes.get(10));
+    built = built + same(& k, & nosid, din_session_stop_res("OK"), hexes.get(26));
+    println("builders: " + int_to_str(built) + " of 8 reproduce the published bytes");
+
+    // a DIN DC session on EXI bytes
+    var s: V2gSession = iso15118_din_session_new(100);
+    s.precharge_target_mv = 400000;
+    var tick: i64 = 0;
+    val sid: Vec<i64> = hb("1122334455667788");
+    val ev: DinEVStatus = din_ev_status(true, "NO_ERROR", 55);
+    val ok: DinEVSEStatus = din_evse_status("Valid", "EVSE_Ready");
+    var trail: str = sname(s.state);
+    exchange(& mut s, & k, iso15118_app_protocol_req_events(& protos), iso15118_v2gtp(V2GTP_EXI, & iso15118_app_protocol_res(APP_OK, 1)), & mut tick);
+    trail = trail + " -> " + sname(s.state);
+    exchange(& mut s, & k, din_session_setup_req(hb("0a0b0c0d0e0f")), evse(& k, & sid, din_session_setup_res("OK_NewSessionEstablished", hb("49"), 1700000000)), & mut tick);
+    trail = trail + " -> " + sname(s.state);
+    exchange(& mut s, & k, din_service_discovery_req("", "EVCharging"), evse(& k, & sid, din_service_discovery_res("OK", "ExternalPayment", 1, "", "EVCharging", false, "DC_extended")), & mut tick);
+    trail = trail + " -> " + sname(s.state);
+    var ids: Vec<i64> = Vec::new();
+    ids.push(1);
+    exchange(& mut s, & k, din_service_payment_selection_req("ExternalPayment", & ids), evse(& k, & sid, din_service_payment_selection_res("OK")), & mut tick);
+    trail = trail + " -> " + sname(s.state);
+    exchange(& mut s, & k, din_contract_authentication_req("", ""), evse(& k, & sid, din_contract_authentication_res("OK", "Ongoing")), & mut tick);
+    exchange(& mut s, & k, din_contract_authentication_req("", ""), evse(& k, & sid, din_contract_authentication_res("OK", "Finished")), & mut tick);
+    trail = trail + " (x2) -> " + sname(s.state);
+    val evp: DinDCEVParams = din_dc_ev_params(ev, din_pv(0, "A", 100), din_pv(0, "V", 450));
+    val nosched: DinSchedule = DinSchedule { tuple_id: 0, pmax_schedule_id: 0, starts: Vec::new(), durations: Vec::new(), pmax: Vec::new() };
+    val evsep: DinDCEVSEParams = DinDCEVSEParams {
+        status: ok, max_current: din_pv(0, "A", 200), max_power: din_pv_none(), max_voltage: din_pv(0, "V", 500), min_current: din_pv(0, "A", 0),
+        min_voltage: din_pv(0, "V", 150), regulation_tolerance: din_pv_none(), peak_current_ripple: din_pv(0, "A", 5), energy_to_deliver: din_pv_none(),
+    };
+    exchange(& mut s, & k, din_charge_parameter_discovery_req("DC_extended", & evp), evse(& k, & sid, din_charge_parameter_discovery_res("OK", "Finished", & nosched, & evsep)), & mut tick);
+    trail = trail + " -> " + sname(s.state);
+    exchange(& mut s, & k, din_cable_check_req(& ev), evse(& k, & sid, din_cable_check_res("OK", & ok, "Ongoing")), & mut tick);
+    exchange(& mut s, & k, din_cable_check_req(& ev), evse(& k, & sid, din_cable_check_res("OK", & ok, "Finished")), & mut tick);
+    trail = trail + " (x2) -> " + sname(s.state);
+    exchange(& mut s, & k, din_pre_charge_req(& ev, & din_pv(0, "V", 400), & din_pv(0, "A", 2)), evse(& k, & sid, din_pre_charge_res("OK", & ok, & din_pv(0, "V", 120))), & mut tick);
+    exchange(& mut s, & k, din_pre_charge_req(& ev, & din_pv(0, "V", 400), & din_pv(0, "A", 2)), evse(& k, & sid, din_pre_charge_res("OK", & ok, & din_pv(- 1, "V", 3955))), & mut tick);
+    trail = trail + " (x2) -> " + sname(s.state);
+    exchange(& mut s, & k, din_power_delivery_req(true, 0, & none, & none, true, & ev, - 1, false), evse(& k, & sid, din_power_delivery_res("OK", & ok)), & mut tick);
+    trail = trail + " -> " + sname(s.state);
+    println("din session: " + trail);
+    var q: DinCurrentDemand = din_current_demand(ev, din_pv(0, "A", 100), din_pv(0, "V", 400));
+    q.max_voltage = din_pv(0, "V", 450);
+    var round: i64 = 0;
+    while round < 3 {
+        exchange(& mut s, & k, din_current_demand_req(& q), evse(& k, & sid, din_current_demand_res("OK", & ok, & din_pv(0, "V", 400), & din_pv(0, "A", 99), false, false, false, & din_pv_none(), & din_pv_none(), & din_pv_none())), & mut tick);
+        round = round + 1;
+    }
+    println("session id " + hx(s.session) + ", schema " + int_to_str(s.schema_id) + ", current demand rounds " + int_to_str(s.current_demand_rounds));
+    v2g_request_stop(& mut s);
+    var tail: str = sname(s.state);
+    exchange(& mut s, & k, din_power_delivery_req(false, 0, & none, & none, true, & ev, - 1, true), evse(& k, & sid, din_power_delivery_res("OK", & ok)), & mut tick);
+    tail = tail + " -> " + sname(s.state);
+    exchange(& mut s, & k, din_welding_detection_req(& ev), evse(& k, & sid, din_welding_detection_res("OK", & ok, & din_pv(0, "V", 300))), & mut tick);
+    exchange(& mut s, & k, din_welding_detection_req(& ev), evse(& k, & sid, din_welding_detection_res("OK", & ok, & din_pv(0, "V", 10))), & mut tick);
+    tail = tail + " (x2) -> " + sname(s.state);
+    exchange(& mut s, & k, din_session_stop_req(), evse(& k, & sid, din_session_stop_res("OK")), & mut tick);
+    tail = tail + " -> " + sname(s.state);
+    println("din session end: " + tail + " failed " + yes(s.failed));
+
+    // a response with another SessionID; a FAILED response code
+    var e1: V2gSession = iso15118_din_session_new(100);
+    var t1: i64 = 0;
+    exchange(& mut e1, & k, iso15118_app_protocol_req_events(& protos), iso15118_v2gtp(V2GTP_EXI, & iso15118_app_protocol_res(APP_OK, 1)), & mut t1);
+    exchange(& mut e1, & k, din_session_setup_req(hb("0a")), evse(& k, & sid, din_session_setup_res("OK", hb("49"), - 1)), & mut t1);
+    exchange(& mut e1, & k, din_service_discovery_req("", ""), evse(& k, & hb("99"), din_service_discovery_res("OK", "ExternalPayment", 1, "", "EVCharging", false, "DC_extended")), & mut t1);
+    var e2: V2gSession = iso15118_din_session_new(100);
+    var t2: i64 = 0;
+    exchange(& mut e2, & k, iso15118_app_protocol_req_events(& protos), iso15118_v2gtp(V2GTP_EXI, & iso15118_app_protocol_res(APP_OK, 1)), & mut t2);
+    exchange(& mut e2, & k, din_session_setup_req(hb("0a")), evse(& k, & sid, din_session_setup_res("OK", hb("49"), - 1)), & mut t2);
+    exchange(& mut e2, & k, din_service_discovery_req("", ""), evse(& k, & sid, din_service_discovery_res("FAILED_SequenceError", "ExternalPayment", 1, "", "EVCharging", false, "DC_extended")), & mut t2);
+    println("din session errors: " + e1.error + "; " + e2.error);
+
+    // ISO 15118-2 profile: names and codes from the caller's codec
+    var bad: V2gSession = iso15118_session_new(100);
+    v2g_on_send(& mut bad, 0);
+    v2g_step(& mut bad, "SessionSetupRes", V2G_OK, 1);
+    var badstr: str = "ok";
+    if bad.failed { badstr = "fails: " + bad.error; }
+    println("iso-2 seam: wrong response " + badstr);
+}
+
+/// 1 if `body` with SessionID `sid` encodes to `want` (hex), else 0.
+fn same(k: & V2gCodecs, sid: & Vec<i64>, body: Vec<ExiEvent>, want: str) -> i64 {
+    val r: ExiResult = din_encode(& k.din, sid, & body);
+    if r.ok && hx(r.bytes) == want {
+        return 1;
+    }
+    println("built " + hx(r.bytes) + " " + r.error + " want " + want);
+    return 0;
+}

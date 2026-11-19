@@ -1,0 +1,615 @@
+// Fides CRDTs for offline sync
+//
+// All of this is real, portable code (no platform calls): the replicas
+// live in the app, and whatever transport the app has (HTTP, a sync
+// server, peer to peer) carries the serialized states or deltas.
+//   - vector clocks: increment, merge, compare (before, after, equal,
+//     concurrent)
+//   - G-Counter and PN-Counter (state-based, merge = per-node maximum)
+//   - LWW-Register (last writer wins on (timestamp, node), deterministic
+//     ties)
+//   - OR-Set (observed-remove: each add carries a unique tag; a remove
+//     tombstones the tags it has seen, so a concurrent add survives)
+//   - RGA (replicated growable array) for sequences and text: elements
+//     with ids (counter, node), inserted after an origin; concurrent
+//     inserts at the same place are ordered by id; deletes are
+//     tombstones; merge integrates missing elements in id order
+//   - delta-state: the part of an OR-Set or RGA newer than a version
+//     vector, and a line-based text serialization of every type (values
+//     percent-escaped) with a parser
+//
+// Merges are commutative, associative and idempotent: the tests apply the
+// same operations and merges in shuffled orders and check that all
+// replicas converge.
+
+module crdt;
+use vec;
+use string;
+use encoding;
+
+// ─── Escaping for the text format ──────────────────────────────────────
+
+/// Escape '%', '|', ',', '=' and newlines as %XX.
+pub fn crdt_esc(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 || c == 124 || c == 44 || c == 61 || c == 10 || c == 13 {
+            val h: str = "0123456789ABCDEF";
+            out = out + "%" + str_slice(h, c >> 4, (c >> 4) + 1) + str_slice(h, c & 15, (c & 15) + 1);
+        } else {
+            var j: i64 = i;
+            while j < str_len(s) {
+                val d: i64 = str_byte_at(s, j);
+                if d == 37 || d == 124 || d == 44 || d == 61 || d == 10 || d == 13 { break; }
+                j = j + 1;
+            }
+            out = out + str_slice(s, i, j);
+            i = j - 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn crdt_hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return -1;
+}
+
+pub fn crdt_unesc(s: str) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var plain: bool = true;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < str_len(s) && crdt_hexv(str_byte_at(s, i + 1)) >= 0 && crdt_hexv(str_byte_at(s, i + 2)) >= 0 {
+            bytes.push(crdt_hexv(str_byte_at(s, i + 1)) * 16 + crdt_hexv(str_byte_at(s, i + 2)));
+            plain = false;
+            i = i + 3;
+        } else {
+            bytes.push(c);
+            i = i + 1;
+        }
+    }
+    if plain { return s; }
+    return enc_bytes_to_str(bytes);
+}
+
+// ─── Vector clocks ─────────────────────────────────────────────────────
+
+pub const CRDT_EQUAL: i64 = 0;
+pub const CRDT_BEFORE: i64 = 1;
+pub const CRDT_AFTER: i64 = 2;
+pub const CRDT_CONCURRENT: i64 = 3;
+
+pub struct VClock {
+    pub nodes: Vec<str>,
+    pub counts: Vec<i64>,
+}
+
+pub fn vclock_new() -> VClock { return VClock { nodes: Vec::new(), counts: Vec::new() }; }
+
+pub fn vclock_get(c: &VClock, node: str) -> i64 {
+    var i: i64 = 0;
+    while i < c.nodes.len() {
+        if c.nodes.get(i) == node { return c.counts.get(i); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn vclock_set(c: &mut VClock, node: str, v: i64) {
+    var i: i64 = 0;
+    while i < c.nodes.len() {
+        if c.nodes.get(i) == node { c.counts.set(i, v); return; }
+        i = i + 1;
+    }
+    // keep nodes sorted so equal clocks serialize equally
+    var k: i64 = 0;
+    while k < c.nodes.len() && str_compare(c.nodes.get(k), node) < 0 { k = k + 1; }
+    c.nodes.insert(k, node);
+    c.counts.insert(k, v);
+}
+
+pub fn vclock_tick(c: &mut VClock, node: str) -> i64 {
+    val v: i64 = vclock_get(c, node) + 1;
+    vclock_set(c, node, v);
+    return v;
+}
+
+pub fn vclock_merge(a: &mut VClock, b: &VClock) {
+    var i: i64 = 0;
+    while i < b.nodes.len() {
+        val n: str = b.nodes.get(i);
+        if b.counts.get(i) > vclock_get(a, n) { vclock_set(a, n, b.counts.get(i)); }
+        i = i + 1;
+    }
+}
+
+/// How a relates to b.
+pub fn vclock_compare(a: &VClock, b: &VClock) -> i64 {
+    var less: bool = false;
+    var more: bool = false;
+    var i: i64 = 0;
+    while i < a.nodes.len() {
+        val x: i64 = a.counts.get(i);
+        val y: i64 = vclock_get(b, a.nodes.get(i));
+        if x < y { less = true; }
+        if x > y { more = true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < b.nodes.len() {
+        val y: i64 = b.counts.get(i);
+        val x: i64 = vclock_get(a, b.nodes.get(i));
+        if x < y { less = true; }
+        if x > y { more = true; }
+        i = i + 1;
+    }
+    if less && more { return CRDT_CONCURRENT; }
+    if less { return CRDT_BEFORE; }
+    if more { return CRDT_AFTER; }
+    return CRDT_EQUAL;
+}
+
+pub fn vclock_encode(c: &VClock) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < c.nodes.len() {
+        if i > 0 { s = s + ","; }
+        s = s + crdt_esc(c.nodes.get(i)) + "=" + int_to_str(c.counts.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn vclock_decode(s: str) -> VClock {
+    var c: VClock = vclock_new();
+    if str_len(s) == 0 { return c; }
+    val parts: Vec<str> = str_split(s, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        val eq: i64 = str_find(p, "=");
+        if eq > 0 { vclock_set(&mut c, crdt_unesc(str_slice(p, 0, eq)), str_parse_int(str_slice(p, eq + 1, str_len(p)))); }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ─── Counters ──────────────────────────────────────────────────────────
+
+/// A G-Counter is a vector clock read as per-node counts.
+pub struct GCounter {
+    pub c: VClock,
+}
+
+pub fn gcounter_new() -> GCounter { return GCounter { c: vclock_new() }; }
+
+pub fn gcounter_inc(g: &mut GCounter, node: str, n: i64) {
+    if n < 0 { return; }
+    vclock_set(&mut g.c, node, vclock_get(&g.c, node) + n);
+}
+
+pub fn gcounter_value(g: &GCounter) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < g.c.counts.len() { s = s + g.c.counts.get(i); i = i + 1; }
+    return s;
+}
+
+pub fn gcounter_merge(a: &mut GCounter, b: &GCounter) { vclock_merge(&mut a.c, &b.c); }
+pub fn gcounter_encode(g: &GCounter) -> str { return "g|" + vclock_encode(&g.c); }
+pub fn gcounter_decode(s: str) -> GCounter {
+    if !str_starts_with(s, "g|") { return gcounter_new(); }
+    return GCounter { c: vclock_decode(str_slice(s, 2, str_len(s))) };
+}
+
+pub struct PNCounter {
+    pub p: GCounter,
+    pub n: GCounter,
+}
+
+pub fn pncounter_new() -> PNCounter { return PNCounter { p: gcounter_new(), n: gcounter_new() }; }
+
+pub fn pncounter_add(c: &mut PNCounter, node: str, delta: i64) {
+    if delta >= 0 { gcounter_inc(&mut c.p, node, delta); } else { gcounter_inc(&mut c.n, node, 0 - delta); }
+}
+
+pub fn pncounter_value(c: &PNCounter) -> i64 { return gcounter_value(&c.p) - gcounter_value(&c.n); }
+
+pub fn pncounter_merge(a: &mut PNCounter, b: &PNCounter) {
+    gcounter_merge(&mut a.p, &b.p);
+    gcounter_merge(&mut a.n, &b.n);
+}
+
+pub fn pncounter_encode(c: &PNCounter) -> str { return "pn|" + vclock_encode(&c.p.c) + "|" + vclock_encode(&c.n.c); }
+
+pub fn pncounter_decode(s: str) -> PNCounter {
+    val parts: Vec<str> = str_split(s, "|");
+    if parts.len() != 3 || parts.get(0) != "pn" { return pncounter_new(); }
+    return PNCounter { p: GCounter { c: vclock_decode(parts.get(1)) }, n: GCounter { c: vclock_decode(parts.get(2)) } };
+}
+
+// ─── LWW-Register ──────────────────────────────────────────────────────
+
+pub struct LwwRegister {
+    pub value: str,
+    pub ts: i64,
+    pub node: str,
+}
+
+pub fn lww_new() -> LwwRegister { return LwwRegister { value: "", ts: -1, node: "" }; }
+
+fn lww_wins(ts: i64, node: str, cur: &LwwRegister) -> bool {
+    if ts != cur.ts { return ts > cur.ts; }
+    return str_compare(node, cur.node) > 0;
+}
+
+/// Set at (ts, node); ignored when an equal or later write is known.
+pub fn lww_set(r: &mut LwwRegister, value: str, ts: i64, node: str) {
+    if lww_wins(ts, node, r) {
+        r.value = value;
+        r.ts = ts;
+        r.node = node;
+    }
+}
+
+pub fn lww_merge(a: &mut LwwRegister, b: &LwwRegister) { lww_set(a, b.value, b.ts, b.node); }
+
+pub fn lww_encode(r: &LwwRegister) -> str {
+    return "lww|" + int_to_str(r.ts) + "|" + crdt_esc(r.node) + "|" + crdt_esc(r.value);
+}
+
+pub fn lww_decode(s: str) -> LwwRegister {
+    val p: Vec<str> = str_split(s, "|");
+    if p.len() != 4 || p.get(0) != "lww" { return lww_new(); }
+    return LwwRegister { value: crdt_unesc(p.get(3)), ts: str_parse_int(p.get(1)), node: crdt_unesc(p.get(2)) };
+}
+
+// ─── OR-Set ────────────────────────────────────────────────────────────
+
+pub struct ORSet {
+    pub elems: Vec<str>,      // one entry per add: element and its tag
+    pub tag_node: Vec<str>,
+    pub tag_seq: Vec<i64>,
+    pub dead_node: Vec<str>,  // tombstoned tags
+    pub dead_seq: Vec<i64>,
+    pub clock: VClock,        // the tags seen, per node
+}
+
+pub fn orset_new() -> ORSet {
+    return ORSet { elems: Vec::new(), tag_node: Vec::new(), tag_seq: Vec::new(), dead_node: Vec::new(), dead_seq: Vec::new(), clock: vclock_new() };
+}
+
+fn orset_has_tag(s: &ORSet, node: str, seq: i64) -> bool {
+    var i: i64 = 0;
+    while i < s.tag_node.len() {
+        if s.tag_seq.get(i) == seq && s.tag_node.get(i) == node { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn orset_is_dead(s: &ORSet, node: str, seq: i64) -> bool {
+    var i: i64 = 0;
+    while i < s.dead_node.len() {
+        if s.dead_seq.get(i) == seq && s.dead_node.get(i) == node { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn orset_put(s: &mut ORSet, e: str, node: str, seq: i64) {
+    if orset_has_tag(s, node, seq) { return; }
+    s.elems.push(e);
+    s.tag_node.push(node);
+    s.tag_seq.push(seq);
+    if seq > vclock_get(&s.clock, node) { vclock_set(&mut s.clock, node, seq); }
+}
+
+fn orset_kill(s: &mut ORSet, node: str, seq: i64) {
+    if orset_is_dead(s, node, seq) { return; }
+    s.dead_node.push(node);
+    s.dead_seq.push(seq);
+}
+
+pub fn orset_add(s: &mut ORSet, node: str, e: str) {
+    val seq: i64 = vclock_get(&s.clock, node) + 1;
+    orset_put(s, e, node, seq);
+}
+
+/// Remove every tag of `e` this replica has seen.
+pub fn orset_remove(s: &mut ORSet, e: str) {
+    var i: i64 = 0;
+    while i < s.elems.len() {
+        if s.elems.get(i) == e { orset_kill(s, s.tag_node.get(i), s.tag_seq.get(i)); }
+        i = i + 1;
+    }
+}
+
+pub fn orset_contains(s: &ORSet, e: str) -> bool {
+    var i: i64 = 0;
+    while i < s.elems.len() {
+        if s.elems.get(i) == e && !orset_is_dead(s, s.tag_node.get(i), s.tag_seq.get(i)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The live elements, sorted, each once.
+pub fn orset_values(s: &ORSet) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < s.elems.len() {
+        val e: str = s.elems.get(i);
+        if !orset_is_dead(s, s.tag_node.get(i), s.tag_seq.get(i)) {
+            var k: i64 = 0;
+            var dup: bool = false;
+            while k < out.len() && str_compare(out.get(k), e) <= 0 {
+                if out.get(k) == e { dup = true; }
+                k = k + 1;
+            }
+            if !dup { out.insert(k, e); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn orset_merge(a: &mut ORSet, b: &ORSet) {
+    var i: i64 = 0;
+    while i < b.elems.len() { orset_put(a, b.elems.get(i), b.tag_node.get(i), b.tag_seq.get(i)); i = i + 1; }
+    i = 0;
+    while i < b.dead_node.len() { orset_kill(a, b.dead_node.get(i), b.dead_seq.get(i)); i = i + 1; }
+    vclock_merge(&mut a.clock, &b.clock);
+}
+
+/// The delta newer than `since`: adds with tags above it, and all
+/// tombstones (they carry no time). Merging it equals merging the state.
+pub fn orset_delta(s: &ORSet, since: &VClock) -> ORSet {
+    var d: ORSet = orset_new();
+    var i: i64 = 0;
+    while i < s.elems.len() {
+        if s.tag_seq.get(i) > vclock_get(since, s.tag_node.get(i)) { orset_put(&mut d, s.elems.get(i), s.tag_node.get(i), s.tag_seq.get(i)); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < s.dead_node.len() { orset_kill(&mut d, s.dead_node.get(i), s.dead_seq.get(i)); i = i + 1; }
+    return d;
+}
+
+/// "or" then one line per add "+node,seq,elem" and per tombstone
+/// "-node,seq".
+pub fn orset_encode(s: &ORSet) -> str {
+    var out: str = "or";
+    var i: i64 = 0;
+    while i < s.elems.len() {
+        out = out + "\n+" + crdt_esc(s.tag_node.get(i)) + "," + int_to_str(s.tag_seq.get(i)) + "," + crdt_esc(s.elems.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < s.dead_node.len() {
+        out = out + "\n-" + crdt_esc(s.dead_node.get(i)) + "," + int_to_str(s.dead_seq.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn orset_decode(text: str) -> ORSet {
+    var s: ORSet = orset_new();
+    val lines: Vec<str> = str_split(text, "\n");
+    if lines.len() == 0 || lines.get(0) != "or" { return s; }
+    var i: i64 = 1;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        val f: Vec<str> = str_split(str_slice(l, 1, str_len(l)), ",");
+        if str_starts_with(l, "+") && f.len() == 3 { orset_put(&mut s, crdt_unesc(f.get(2)), crdt_unesc(f.get(0)), str_parse_int(f.get(1))); }
+        if str_starts_with(l, "-") && f.len() == 2 { orset_kill(&mut s, crdt_unesc(f.get(0)), str_parse_int(f.get(1))); }
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── RGA ───────────────────────────────────────────────────────────────
+
+pub struct RgaElem {
+    pub seq: i64,           // id: (seq, node)
+    pub node: str,
+    pub origin_seq: i64,    // the element it was inserted after (0: head)
+    pub origin_node: str,
+    pub value: str,
+    pub deleted: bool,
+}
+
+pub struct Rga {
+    pub elems: Vec<RgaElem>,  // document order
+    pub max_seq: i64,
+    pub clock: VClock,
+}
+
+pub fn rga_new() -> Rga { return Rga { elems: Vec::new(), max_seq: 0, clock: vclock_new() }; }
+
+/// Is id a greater than id b? (higher seq first, then node)
+fn rga_gt(a_s: i64, a_n: str, b_s: i64, b_n: str) -> bool {
+    if a_s != b_s { return a_s > b_s; }
+    return str_compare(a_n, b_n) > 0;
+}
+
+fn rga_index(r: &Rga, seq: i64, node: str) -> i64 {
+    var i: i64 = 0;
+    while i < r.elems.len() {
+        if r.elems.get(i).seq == seq && r.elems.get(i).node == node { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Integrate an element (idempotent): after its origin, skipping the
+/// elements with greater ids (concurrent inserts that win, and theirs).
+/// False when its origin is not known yet.
+pub fn rga_integrate(r: &mut Rga, e: RgaElem) -> bool {
+    if rga_index(r, e.seq, e.node) >= 0 { return true; }
+    var pos: i64 = 0;
+    if e.origin_seq != 0 {
+        val o: i64 = rga_index(r, e.origin_seq, e.origin_node);
+        if o < 0 { return false; }
+        pos = o + 1;
+    }
+    while pos < r.elems.len() && rga_gt(r.elems.get(pos).seq, r.elems.get(pos).node, e.seq, e.node) { pos = pos + 1; }
+    r.elems.insert(pos, e);
+    if e.seq > r.max_seq { r.max_seq = e.seq; }
+    if e.seq > vclock_get(&r.clock, e.node) { vclock_set(&mut r.clock, e.node, e.seq); }
+    return true;
+}
+
+/// Index in r.elems of the k-th visible element (-1 when out of range).
+fn rga_visible_index(r: &Rga, k: i64) -> i64 {
+    var seen: i64 = 0;
+    var i: i64 = 0;
+    while i < r.elems.len() {
+        if !r.elems.get(i).deleted {
+            if seen == k { return i; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Insert `value` at visible position `pos` (0 = front) by `node`;
+/// returns the new element (the operation to send).
+pub fn rga_insert(r: &mut Rga, node: str, pos: i64, value: str) -> RgaElem {
+    var os: i64 = 0;
+    var on: str = "";
+    if pos > 0 {
+        val k: i64 = rga_visible_index(r, pos - 1);
+        val oi: i64 = if k >= 0 { k } else { r.elems.len() - 1 };
+        if oi >= 0 {
+            os = r.elems.get(oi).seq;
+            on = r.elems.get(oi).node;
+        }
+    }
+    val e: RgaElem = RgaElem { seq: r.max_seq + 1, node: node, origin_seq: os, origin_node: on, value: value, deleted: false };
+    rga_integrate(r, e);
+    return e;
+}
+
+/// Insert each character of `text` from position `pos`.
+pub fn rga_insert_text(r: &mut Rga, node: str, pos: i64, text: str) {
+    var i: i64 = 0;
+    while i < str_len(text) {
+        rga_insert(r, node, pos + i, str_slice(text, i, i + 1));
+        i = i + 1;
+    }
+}
+
+/// Delete by id (an operation); false when unknown.
+pub fn rga_delete_id(r: &mut Rga, seq: i64, node: str) -> bool {
+    val i: i64 = rga_index(r, seq, node);
+    if i < 0 { return false; }
+    var e: RgaElem = r.elems.get(i);
+    e.deleted = true;
+    r.elems.set(i, e);
+    return true;
+}
+
+/// Delete the visible element at `pos`; its id (seq) or -1.
+pub fn rga_delete_at(r: &mut Rga, pos: i64) -> i64 {
+    val i: i64 = rga_visible_index(r, pos);
+    if i < 0 { return -1; }
+    var e: RgaElem = r.elems.get(i);
+    e.deleted = true;
+    r.elems.set(i, e);
+    return e.seq;
+}
+
+pub fn rga_text(r: &Rga) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < r.elems.len() {
+        if !r.elems.get(i).deleted { s = s + r.elems.get(i).value; }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn rga_sorted_by_id(v: &Vec<RgaElem>) -> Vec<RgaElem> {
+    var out: Vec<RgaElem> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        val e: RgaElem = v.get(i);
+        var k: i64 = out.len();
+        while k > 0 && rga_gt(out.get(k - 1).seq, out.get(k - 1).node, e.seq, e.node) { k = k - 1; }
+        out.insert(k, e);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Merge another replica (or a delta): its elements in id order (origins
+/// always have smaller ids), then its tombstones.
+pub fn rga_merge(a: &mut Rga, b: &Rga) {
+    val sorted: Vec<RgaElem> = rga_sorted_by_id(&b.elems);
+    var i: i64 = 0;
+    while i < sorted.len() {
+        var e: RgaElem = sorted.get(i);
+        val del: bool = e.deleted;
+        e.deleted = false;
+        rga_integrate(a, e);
+        if del { rga_delete_id(a, e.seq, e.node); }
+        i = i + 1;
+    }
+    vclock_merge(&mut a.clock, &b.clock);
+}
+
+/// The delta newer than `since`: elements with ids above it, plus every
+/// tombstoned element (so deletes travel).
+pub fn rga_delta(r: &Rga, since: &VClock) -> Rga {
+    var d: Rga = rga_new();
+    var i: i64 = 0;
+    while i < r.elems.len() {
+        val e: RgaElem = r.elems.get(i);
+        if e.seq > vclock_get(since, e.node) || e.deleted { d.elems.push(e); }
+        i = i + 1;
+    }
+    d.clock = r.clock;
+    return d;
+}
+
+/// "rga" then one line per element "seq,node,oseq,onode,deleted,value".
+pub fn rga_encode(r: &Rga) -> str {
+    var out: str = "rga";
+    var i: i64 = 0;
+    while i < r.elems.len() {
+        val e: RgaElem = r.elems.get(i);
+        out = out + "\n" + int_to_str(e.seq) + "," + crdt_esc(e.node) + "," + int_to_str(e.origin_seq) + "," + crdt_esc(e.origin_node)
+            + "," + (if e.deleted { "1" } else { "0" }) + "," + crdt_esc(e.value);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse rga_encode text into a replica (merged in id order, so a delta
+/// whose origins the receiver already has decodes too).
+pub fn rga_decode_into(r: &mut Rga, text: str) -> bool {
+    val lines: Vec<str> = str_split(text, "\n");
+    if lines.len() == 0 || lines.get(0) != "rga" { return false; }
+    var tmp: Rga = rga_new();
+    var i: i64 = 1;
+    while i < lines.len() {
+        val f: Vec<str> = str_split(lines.get(i), ",");
+        if f.len() != 6 { return false; }
+        tmp.elems.push(RgaElem {
+            seq: str_parse_int(f.get(0)), node: crdt_unesc(f.get(1)), origin_seq: str_parse_int(f.get(2)),
+            origin_node: crdt_unesc(f.get(3)), value: crdt_unesc(f.get(5)), deleted: f.get(4) == "1",
+        });
+        i = i + 1;
+    }
+    rga_merge(r, &tmp);
+    return true;
+}

@@ -1,0 +1,118 @@
+// stdlib/pwm: period/duty math, output level over time, the sysfs write order run against a fake chip with the kernel's rules, servo pulses, 16-bit timer prescaler/reload values
+// Expected output:
+// period 50Hz: 20000000
+// period 1kHz: 1000000
+// hz x1000: 50000
+// 7.5 permille of 20ms: 1500000
+// 25 percent of 1ms: 250000
+// percent x10: 750
+// check ok: ''
+// check bad: duty cycle above period
+// levels: 1 1 0 1 inversed 0
+// measured x1000: 250
+// plan: /sys/class/pwm/pwmchip0/export <- 1
+// plan: /sys/class/pwm/pwmchip0/pwm1/period <- 20000000
+// plan: /sys/class/pwm/pwmchip0/pwm1/duty_cycle <- 1500000
+// plan: /sys/class/pwm/pwmchip0/pwm1/enable <- 1
+// fake: '' 20000000 1500000 true
+// plan: /sys/class/pwm/pwmchip0/pwm1/enable <- 0
+// plan: /sys/class/pwm/pwmchip0/pwm1/polarity <- inversed
+// plan: /sys/class/pwm/pwmchip0/pwm1/duty_cycle <- 300000
+// plan: /sys/class/pwm/pwmchip0/pwm1/period <- 1000000
+// plan: /sys/class/pwm/pwmchip0/pwm1/enable <- 1
+// fake: '' 1000000 300000 true inversed
+// wrong order: period: EINVAL
+// polarity while on: polarity: EBUSY
+// servo: 1000000 1250000 1500000 2000000 2000000
+// servo angle x10: 450
+// servo speed: 1000000 1500000 1750000
+// servo 270: 1500000
+// servo state: 20000000 1250000
+// timer 1kHz: psc 1 arr 35999 ccr 18000 hz 1000000 bits 15
+// timer 50Hz: psc 21 arr 65454 ccr 4909 hz 49999 bits 15
+// timer 8-bit 1Hz: psc -1
+use pwm;
+use string;
+
+fn show_plan(w: & Vec<PwmWrite>) {
+    var i: i64 = 0;
+    while i < w.len() {
+        val x: PwmWrite = w.get(i);
+        println("plan: " + x.path + " <- " + x.value);
+        i = i + 1;
+    }
+}
+
+fn show_timer(label: str, t: PwmTimer) {
+    if t.psc < 0 {
+        println(label + ": psc -1");
+        return;
+    }
+    println(label + ": psc " + int_to_str(t.psc) + " arr " + int_to_str(t.arr) + " ccr " + int_to_str(t.ccr) + " hz " + int_to_str((t.actual_hz * 1000.0) as i64) + " bits " + int_to_str(t.resolution_bits));
+}
+
+fn main() {
+    println("period 50Hz: " + int_to_str(pwm_period_for_hz(50)));
+    println("period 1kHz: " + int_to_str(pwm_period_for_hz(1000)));
+    println("hz x1000: " + int_to_str((pwm_hz_for_period(20000000) * 1000.0) as i64));
+    println("7.5 permille of 20ms: " + int_to_str(pwm_duty_permille(20000000, 75)));
+    println("25 percent of 1ms: " + int_to_str(pwm_duty_percent(1000000, 25.0)));
+    val s75: PwmState = pwm_state(20000000, 15000000);
+    println("percent x10: " + int_to_str((pwm_percent(& s75) * 10.0 + 0.5) as i64));
+    println("check ok: '" + pwm_check(& s75) + "'");
+    val bad: PwmState = pwm_state(1000, 2000);
+    println("check bad: " + pwm_check(& bad));
+
+    var s: PwmState = pwm_state(1000, 250);
+    val l0: i64 = pwm_level_at(& s, 0);
+    val l1: i64 = pwm_level_at(& s, 249);
+    val l2: i64 = pwm_level_at(& s, 250);
+    val l3: i64 = pwm_level_at(& s, 1249);
+    s.polarity = PWM_POLARITY_INVERSED;
+    println("levels: " + int_to_str(l0) + " " + int_to_str(l1) + " " + int_to_str(l2) + " " + int_to_str(l3) + " inversed " + int_to_str(pwm_level_at(& s, 0)));
+    s.polarity = PWM_POLARITY_NORMAL;
+    println("measured x1000: " + int_to_str((pwm_measured_duty(& s, 100) * 1000.0 + 0.5) as i64));
+
+    var chip: PwmFakeChip = pwm_fake_chip(2);
+    val root: str = "/sys/class/pwm";
+    val off: PwmState = pwm_off();
+    val servo_mid: PwmState = pwm_state(20000000, 1500000);
+    val p1: Vec<PwmWrite> = pwm_sysfs_plan(root, 0, 1, false, & off, & servo_mid);
+    show_plan(& p1);
+    val r1: str = pwm_fake_apply(& mut chip, 1, & p1);
+    val st1: PwmState = chip.states.get(1);
+    println("fake: '" + r1 + "' " + int_to_str(st1.period_ns) + " " + int_to_str(st1.duty_ns) + " " + bool_to_str(st1.enabled));
+
+    var fast: PwmState = pwm_state(1000000, 300000);
+    fast.polarity = PWM_POLARITY_INVERSED;
+    val p2: Vec<PwmWrite> = pwm_sysfs_plan(root, 0, 1, true, & servo_mid, & fast);
+    show_plan(& p2);
+    val r2: str = pwm_fake_apply(& mut chip, 1, & p2);
+    val st2: PwmState = chip.states.get(1);
+    var pol: str = "normal";
+    if st2.polarity == PWM_POLARITY_INVERSED {
+        pol = "inversed";
+    }
+    println("fake: '" + r2 + "' " + int_to_str(st2.period_ns) + " " + int_to_str(st2.duty_ns) + " " + bool_to_str(st2.enabled) + " " + pol);
+
+    // the naive order (period first) is refused when the duty is larger
+    var naive: Vec<PwmWrite> = Vec::new();
+    naive.push(PwmWrite { path: root + "/pwmchip0/pwm1/period", value: "100000" });
+    println("wrong order: " + pwm_fake_apply(& mut chip, 1, & naive));
+    var pol_on: Vec<PwmWrite> = Vec::new();
+    pol_on.push(PwmWrite { path: root + "/pwmchip0/pwm1/polarity", value: "normal" });
+    println("polarity while on: " + pwm_fake_apply(& mut chip, 1, & pol_on));
+
+    val sv: Servo = servo_standard();
+    println("servo: " + int_to_str(servo_pulse_ns(& sv, 0.0)) + " " + int_to_str(servo_pulse_ns(& sv, 45.0)) + " " + int_to_str(servo_pulse_ns(& sv, 90.0)) + " " + int_to_str(servo_pulse_ns(& sv, 180.0)) + " " + int_to_str(servo_pulse_ns(& sv, 200.0)));
+    println("servo angle x10: " + int_to_str((servo_angle(& sv, 1250000) * 10.0 + 0.5) as i64));
+    println("servo speed: " + int_to_str(servo_speed_pulse_ns(& sv, -1.0)) + " " + int_to_str(servo_speed_pulse_ns(& sv, 0.0)) + " " + int_to_str(servo_speed_pulse_ns(& sv, 0.5)));
+    val wide: Servo = servo_new(500, 2500, 270.0, 50);
+    println("servo 270: " + int_to_str(servo_pulse_ns(& wide, 135.0)));
+    val ss: PwmState = servo_state(& sv, 45.0);
+    println("servo state: " + int_to_str(ss.period_ns) + " " + int_to_str(ss.duty_ns));
+
+    show_timer("timer 1kHz", pwm_timer_setup(72000000, 1000, 500, 65535));
+    show_timer("timer 50Hz", pwm_timer_setup(72000000, 50, 75, 65535));
+    show_timer("timer 8-bit 1Hz", pwm_timer_setup(72000000, 1, 500, 255));
+}

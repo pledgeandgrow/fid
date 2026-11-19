@@ -1,0 +1,1298 @@
+// Fides Matter: TLV, data model, Interaction Model reads, setup payloads
+//
+// What is real (pure Fides, runs everywhere; Matter Core spec 1.x):
+//   - TLV (Appendix A): every element type (signed / unsigned integers of
+//     1..8 octets, booleans, single and double floats, UTF-8 and octet
+//     strings, null, structures, arrays, lists, end of container) and every
+//     tag form (anonymous, context, common profile 2/4 octets, implicit
+//     profile 2/4, fully qualified 6/8); a writer choosing the smallest
+//     integer width, a decoder to a flat element list, a text form
+//   - data model ids: node, endpoint (16 bits), cluster and attribute (32
+//     bits), common clusters, global attributes; a node of endpoints,
+//     clusters (with data versions) and attributes stored as TLV
+//   - Interaction Model: ReadRequestMessage and ReportDataMessage in TLV
+//     (AttributePathIB, AttributeDataIB, AttributeReportIB,
+//     AttributeStatusIB, StatusIB, InteractionModelRevision), wildcard path
+//     expansion and the status codes for unknown endpoints / clusters /
+//     attributes; the protocol header (exchange flags, opcode, exchange id,
+//     protocol id, acknowledged counter) that carries them
+//   - onboarding payloads: the 11- and 21-digit manual pairing codes with
+//     the Verhoeff check digit, and the QR code payload (88-bit packing,
+//     Base38, "MT:" prefix), both ways
+//
+// Out of scope, said plainly: secure sessions. PASE (SPAKE2+) and CASE
+// (SIGMA with operational certificates), the message-layer encryption
+// (AES-CCM with session keys), MRP retransmission and the transports
+// (UDP / BLE BTP) are not here; this module produces and consumes the
+// plaintext application payloads such a session carries.
+module matter;
+ use vec;
+ use string;
+
+// ─── TLV constants ──────────────────────────────────────────────────────
+
+pub const TLV_TAG_ANON: i64 = 0;
+pub const TLV_TAG_CONTEXT: i64 = 1;
+pub const TLV_TAG_COMMON2: i64 = 2;
+pub const TLV_TAG_COMMON4: i64 = 3;
+pub const TLV_TAG_IMPLICIT2: i64 = 4;
+pub const TLV_TAG_IMPLICIT4: i64 = 5;
+pub const TLV_TAG_FULL6: i64 = 6;
+pub const TLV_TAG_FULL8: i64 = 7;
+
+pub const TLV_INT: i64 = 0;
+pub const TLV_UINT: i64 = 1;
+pub const TLV_BOOL: i64 = 2;
+pub const TLV_FLOAT: i64 = 3;
+pub const TLV_DOUBLE: i64 = 4;
+pub const TLV_UTF8: i64 = 5;
+pub const TLV_BYTES: i64 = 6;
+pub const TLV_NULL: i64 = 7;
+pub const TLV_STRUCT: i64 = 8;
+pub const TLV_ARRAY: i64 = 9;
+pub const TLV_LIST: i64 = 10;
+pub const TLV_END: i64 = 11;
+
+pub struct TlvTag {
+    pub control: i64,
+    pub vendor: i64,
+    pub profile: i64,
+    pub num: i64,
+}
+
+pub fn tlv_anon() -> TlvTag {
+    return TlvTag { control: TLV_TAG_ANON, vendor: 0, profile: 0, num: 0 };
+}
+
+pub fn tlv_ctx(n: i64) -> TlvTag {
+    return TlvTag { control: TLV_TAG_CONTEXT, vendor: 0, profile: 0, num: n & 0xFF };
+}
+
+/// A tag in the Matter common profile (2 or 4 octets as needed).
+pub fn tlv_common(n: i64) -> TlvTag {
+    if n >= 0 && n <= 0xFFFF {
+        return TlvTag { control: TLV_TAG_COMMON2, vendor: 0, profile: 0, num: n };
+    }
+    return TlvTag { control: TLV_TAG_COMMON4, vendor: 0, profile: 0, num: n & 0xFFFFFFFF };
+}
+
+pub fn tlv_implicit(n: i64) -> TlvTag {
+    if n >= 0 && n <= 0xFFFF {
+        return TlvTag { control: TLV_TAG_IMPLICIT2, vendor: 0, profile: 0, num: n };
+    }
+    return TlvTag { control: TLV_TAG_IMPLICIT4, vendor: 0, profile: 0, num: n & 0xFFFFFFFF };
+}
+
+pub fn tlv_full(vendor: i64, profile: i64, n: i64) -> TlvTag {
+    if n >= 0 && n <= 0xFFFF {
+        return TlvTag { control: TLV_TAG_FULL6, vendor: vendor, profile: profile, num: n };
+    }
+    return TlvTag { control: TLV_TAG_FULL8, vendor: vendor, profile: profile, num: n & 0xFFFFFFFF };
+}
+
+// ─── Writer ─────────────────────────────────────────────────────────────
+
+pub struct TlvWriter {
+    pub out: Vec<i64>,
+    pub depth: i64,
+}
+
+pub fn tlv_writer() -> TlvWriter {
+    return TlvWriter { out: Vec::new(), depth: 0 };
+}
+
+fn tlv_le(out: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn tlv_head(w: & mut TlvWriter, tag: & TlvTag, etype: i64) {
+    w.out.push(((tag.control & 7) << 5) | (etype & 0x1F));
+    val c: i64 = tag.control;
+    if c == TLV_TAG_CONTEXT {
+        w.out.push(tag.num & 0xFF);
+    } else if c == TLV_TAG_COMMON2 || c == TLV_TAG_IMPLICIT2 {
+        tlv_le(& mut w.out, tag.num, 2);
+    } else if c == TLV_TAG_COMMON4 || c == TLV_TAG_IMPLICIT4 {
+        tlv_le(& mut w.out, tag.num, 4);
+    } else if c == TLV_TAG_FULL6 {
+        tlv_le(& mut w.out, tag.vendor, 2);
+        tlv_le(& mut w.out, tag.profile, 2);
+        tlv_le(& mut w.out, tag.num, 2);
+    } else if c == TLV_TAG_FULL8 {
+        tlv_le(& mut w.out, tag.vendor, 2);
+        tlv_le(& mut w.out, tag.profile, 2);
+        tlv_le(& mut w.out, tag.num, 4);
+    }
+}
+
+/// A signed integer in the fewest octets (1, 2, 4 or 8).
+pub fn tlv_put_int(w: & mut TlvWriter, tag: TlvTag, v: i64) {
+    if v >= -128 && v <= 127 {
+        tlv_head(w, & tag, 0x00);
+        tlv_le(& mut w.out, v, 1);
+    } else if v >= -32768 && v <= 32767 {
+        tlv_head(w, & tag, 0x01);
+        tlv_le(& mut w.out, v, 2);
+    } else if v >= -2147483648 && v <= 2147483647 {
+        tlv_head(w, & tag, 0x02);
+        tlv_le(& mut w.out, v, 4);
+    } else {
+        tlv_head(w, & tag, 0x03);
+        tlv_le(& mut w.out, v, 8);
+    }
+}
+
+/// An unsigned integer in the fewest octets (a negative i64 is taken as
+/// its 64-bit pattern).
+pub fn tlv_put_uint(w: & mut TlvWriter, tag: TlvTag, v: i64) {
+    if v >= 0 && v <= 0xFF {
+        tlv_head(w, & tag, 0x04);
+        tlv_le(& mut w.out, v, 1);
+    } else if v >= 0 && v <= 0xFFFF {
+        tlv_head(w, & tag, 0x05);
+        tlv_le(& mut w.out, v, 2);
+    } else if v >= 0 && v <= 0xFFFFFFFF {
+        tlv_head(w, & tag, 0x06);
+        tlv_le(& mut w.out, v, 4);
+    } else {
+        tlv_head(w, & tag, 0x07);
+        tlv_le(& mut w.out, v, 8);
+    }
+}
+
+pub fn tlv_put_bool(w: & mut TlvWriter, tag: TlvTag, b: bool) {
+    if b {
+        tlv_head(w, & tag, 0x09);
+    } else {
+        tlv_head(w, & tag, 0x08);
+    }
+}
+
+pub fn tlv_put_null(w: & mut TlvWriter, tag: TlvTag) {
+    tlv_head(w, & tag, 0x14);
+}
+
+/// IEEE-754 single bits of an f64, round to nearest even.
+pub fn tlv_f32_bits(x: f64) -> i64 {
+    val d: i64 = p_f64_to_bits(x);
+    val sign: i64 = (d >> 63) & 1;
+    val e: i64 = (d >> 52) & 0x7FF;
+    val m: i64 = d & 0x000FFFFFFFFFFFFF;
+    if e == 0x7FF {
+        if m != 0 {
+            return (sign << 31) | 0x7FC00000;
+        }
+        return (sign << 31) | 0x7F800000;
+    }
+    if e == 0 {
+        return sign << 31;
+    }
+    var exp: i64 = e - 1023 + 127;
+    val mant: i64 = m | (1 << 52);
+    var shift: i64 = 29;
+    if exp <= 0 {
+        shift = 29 + (1 - exp);
+        exp = 0;
+        if shift > 60 {
+            return sign << 31;
+        }
+    }
+    var r: i64 = mant >> shift;
+    val rem: i64 = mant & ((1 << shift) - 1);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (r & 1) == 1) {
+        r = r + 1;
+    }
+    if exp == 0 {
+        return (sign << 31) | r;
+    }
+    if r >= (1 << 24) {
+        r = r >> 1;
+        exp = exp + 1;
+    }
+    if exp >= 255 {
+        return (sign << 31) | 0x7F800000;
+    }
+    return (sign << 31) | (exp << 23) | (r & 0x7FFFFF);
+}
+
+pub fn tlv_f32_value(b: i64) -> f64 {
+    val sign: i64 = (b >> 31) & 1;
+    val e: i64 = (b >> 23) & 0xFF;
+    val m: i64 = b & 0x7FFFFF;
+    var d: i64 = 0;
+    if e == 0xFF {
+        d = (sign << 63) | (0x7FF << 52) | (m << 29);
+    } else if e == 0 {
+        if m == 0 {
+            d = sign << 63;
+        } else {
+            var mm: i64 = m;
+            var ee: i64 = 1 - 127 + 1023;
+            while (mm & 0x800000) == 0 {
+                mm = mm << 1;
+                ee = ee - 1;
+            }
+            d = (sign << 63) | (ee << 52) | ((mm & 0x7FFFFF) << 29);
+        }
+    } else {
+        d = (sign << 63) | ((e - 127 + 1023) << 52) | (m << 29);
+    }
+    return p_f64_from_bits(d);
+}
+
+pub fn tlv_put_float(w: & mut TlvWriter, tag: TlvTag, x: f64) {
+    tlv_head(w, & tag, 0x0A);
+    tlv_le(& mut w.out, tlv_f32_bits(x), 4);
+}
+
+pub fn tlv_put_double(w: & mut TlvWriter, tag: TlvTag, x: f64) {
+    tlv_head(w, & tag, 0x0B);
+    tlv_le(& mut w.out, p_f64_to_bits(x), 8);
+}
+
+fn tlv_put_string(w: & mut TlvWriter, tag: & TlvTag, base: i64, b: & Vec<i64>) {
+    val n: i64 = b.len();
+    if n <= 0xFF {
+        tlv_head(w, tag, base);
+        tlv_le(& mut w.out, n, 1);
+    } else if n <= 0xFFFF {
+        tlv_head(w, tag, base + 1);
+        tlv_le(& mut w.out, n, 2);
+    } else {
+        tlv_head(w, tag, base + 2);
+        tlv_le(& mut w.out, n, 4);
+    }
+    var i: i64 = 0;
+    while i < n {
+        w.out.push(b.get(i) & 0xFF);
+        i = i + 1;
+    }
+}
+
+pub fn tlv_put_utf8(w: & mut TlvWriter, tag: TlvTag, s: str) {
+    tlv_put_string(w, & tag, 0x0C, & str_bytes(s));
+}
+
+pub fn tlv_put_bytes(w: & mut TlvWriter, tag: TlvTag, b: & Vec<i64>) {
+    tlv_put_string(w, & tag, 0x10, b);
+}
+
+pub fn tlv_start_struct(w: & mut TlvWriter, tag: TlvTag) {
+    tlv_head(w, & tag, 0x15);
+    w.depth = w.depth + 1;
+}
+
+pub fn tlv_start_array(w: & mut TlvWriter, tag: TlvTag) {
+    tlv_head(w, & tag, 0x16);
+    w.depth = w.depth + 1;
+}
+
+pub fn tlv_start_list(w: & mut TlvWriter, tag: TlvTag) {
+    tlv_head(w, & tag, 0x17);
+    w.depth = w.depth + 1;
+}
+
+pub fn tlv_end(w: & mut TlvWriter) {
+    w.out.push(0x18);
+    w.depth = w.depth - 1;
+}
+
+/// Copy an already encoded element, giving it a new tag (the element
+/// must start with an anonymous tag: its control byte's low 5 bits keep
+/// the type).
+pub fn tlv_put_raw_tagged(w: & mut TlvWriter, tag: TlvTag, anon_elem: & Vec<i64>) {
+    if anon_elem.len() == 0 {
+        return;
+    }
+    tlv_head(w, & tag, anon_elem.get(0) & 0x1F);
+    var i: i64 = 1;
+    while i < anon_elem.len() {
+        w.out.push(anon_elem.get(i) & 0xFF);
+        i = i + 1;
+    }
+}
+
+// ─── Reader ─────────────────────────────────────────────────────────────
+
+/// One decoded element. Containers are followed by their members (depth
+/// + 1) and an END element at the container's depth.
+pub struct TlvElem {
+    pub tag: TlvTag,
+    pub kind: i64,
+    pub ival: i64,
+    pub fval: f64,
+    pub bytes: Vec<i64>,
+    pub depth: i64,
+    pub width: i64,
+}
+
+fn tlv_get_le(b: & Vec<i64>, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        v = v | ((b.get(off + i) & 0xFF) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Decode a TLV byte stream; Err on truncation, a reserved type or an
+/// unbalanced end of container.
+pub fn tlv_decode(b: & Vec<i64>) -> Result<Vec<TlvElem>, str> {
+    var out: Vec<TlvElem> = Vec::new();
+    var p: i64 = 0;
+    var depth: i64 = 0;
+    while p < b.len() {
+        val ctrl: i64 = b.get(p);
+        p = p + 1;
+        val tc: i64 = (ctrl >> 5) & 7;
+        val et: i64 = ctrl & 0x1F;
+        var tag: TlvTag = tlv_anon();
+        tag.control = tc;
+        var tl: i64 = 0;
+        if tc == TLV_TAG_CONTEXT {
+            tl = 1;
+        } else if tc == TLV_TAG_COMMON2 || tc == TLV_TAG_IMPLICIT2 {
+            tl = 2;
+        } else if tc == TLV_TAG_COMMON4 || tc == TLV_TAG_IMPLICIT4 {
+            tl = 4;
+        } else if tc == TLV_TAG_FULL6 {
+            tl = 6;
+        } else if tc == TLV_TAG_FULL8 {
+            tl = 8;
+        }
+        if p + tl > b.len() {
+            return Result::Err("truncated tag at " + int_to_str(p - 1));
+        }
+        if tc == TLV_TAG_FULL6 || tc == TLV_TAG_FULL8 {
+            tag.vendor = tlv_get_le(b, p, 2);
+            tag.profile = tlv_get_le(b, p + 2, 2);
+            tag.num = tlv_get_le(b, p + 4, tl - 4);
+        } else if tl > 0 {
+            tag.num = tlv_get_le(b, p, tl);
+        }
+        p = p + tl;
+        var e: TlvElem = TlvElem { tag: tag, kind: TLV_NULL, ival: 0, fval: 0.0, bytes: Vec::new(), depth: depth, width: 0 };
+        if et <= 0x07 {
+            val n: i64 = 1 << (et & 3);
+            if p + n > b.len() {
+                return Result::Err("truncated integer at " + int_to_str(p));
+            }
+            var v: i64 = tlv_get_le(b, p, n);
+            if et <= 0x03 {
+                e.kind = TLV_INT;
+                if n < 8 && (v & (1 << (8 * n - 1))) != 0 {
+                    v = v - (1 << (8 * n));
+                }
+            } else {
+                e.kind = TLV_UINT;
+            }
+            e.ival = v;
+            e.width = n;
+            p = p + n;
+        } else if et == 0x08 || et == 0x09 {
+            e.kind = TLV_BOOL;
+            e.ival = et - 0x08;
+        } else if et == 0x0A {
+            if p + 4 > b.len() {
+                return Result::Err("truncated float");
+            }
+            e.kind = TLV_FLOAT;
+            e.ival = tlv_get_le(b, p, 4);
+            e.fval = tlv_f32_value(e.ival);
+            p = p + 4;
+        } else if et == 0x0B {
+            if p + 8 > b.len() {
+                return Result::Err("truncated double");
+            }
+            e.kind = TLV_DOUBLE;
+            e.ival = tlv_get_le(b, p, 8);
+            e.fval = p_f64_from_bits(e.ival);
+            p = p + 8;
+        } else if et >= 0x0C && et <= 0x13 {
+            val ln: i64 = 1 << ((et - 0x0C) & 3);
+            if p + ln > b.len() {
+                return Result::Err("truncated length");
+            }
+            val n: i64 = tlv_get_le(b, p, ln);
+            p = p + ln;
+            if n < 0 || p + n > b.len() {
+                return Result::Err("truncated string");
+            }
+            var i: i64 = 0;
+            while i < n {
+                e.bytes.push(b.get(p + i));
+                i = i + 1;
+            }
+            p = p + n;
+            if et <= 0x0F {
+                e.kind = TLV_UTF8;
+            } else {
+                e.kind = TLV_BYTES;
+            }
+        } else if et == 0x14 {
+            e.kind = TLV_NULL;
+        } else if et == 0x15 || et == 0x16 || et == 0x17 {
+            e.kind = TLV_STRUCT + (et - 0x15);
+            depth = depth + 1;
+        } else if et == 0x18 {
+            if depth == 0 || tc != 0 {
+                return Result::Err("unexpected end of container");
+            }
+            depth = depth - 1;
+            e.kind = TLV_END;
+            e.depth = depth;
+        } else {
+            return Result::Err("reserved element type " + int_to_str(et));
+        }
+        out.push(e);
+    }
+    if depth != 0 {
+        return Result::Err("unterminated container");
+    }
+    return Result::Ok(out);
+}
+
+/// The index of the END that closes the container at i (i itself for a
+/// non-container).
+pub fn tlv_container_end(es: & Vec<TlvElem>, i: i64) -> i64 {
+    val k: i64 = es.get(i).kind;
+    if k != TLV_STRUCT && k != TLV_ARRAY && k != TLV_LIST {
+        return i;
+    }
+    val d: i64 = es.get(i).depth;
+    var j: i64 = i + 1;
+    while j < es.len() {
+        if es.get(j).kind == TLV_END && es.get(j).depth == d {
+            return j;
+        }
+        j = j + 1;
+    }
+    return es.len() - 1;
+}
+
+/// The direct member of the container at i with context tag n, or -1.
+pub fn tlv_member(es: & Vec<TlvElem>, i: i64, n: i64) -> i64 {
+    val end: i64 = tlv_container_end(es, i);
+    var j: i64 = i + 1;
+    while j < end {
+        val e: TlvElem = es.get(j);
+        if e.tag.control == TLV_TAG_CONTEXT && e.tag.num == n {
+            return j;
+        }
+        j = tlv_container_end(es, j) + 1;
+    }
+    return 0 - 1;
+}
+
+/// The direct members of the container at i.
+pub fn tlv_members(es: & Vec<TlvElem>, i: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val end: i64 = tlv_container_end(es, i);
+    var j: i64 = i + 1;
+    while j < end {
+        out.push(j);
+        j = tlv_container_end(es, j) + 1;
+    }
+    return out;
+}
+
+fn tlv_tag_text(t: & TlvTag) -> str {
+    val c: i64 = t.control;
+    if c == TLV_TAG_ANON {
+        return "";
+    }
+    if c == TLV_TAG_CONTEXT {
+        return int_to_str(t.num) + " = ";
+    }
+    if c == TLV_TAG_COMMON2 || c == TLV_TAG_COMMON4 {
+        return "Matter::" + int_to_str(t.num) + " = ";
+    }
+    if c == TLV_TAG_IMPLICIT2 || c == TLV_TAG_IMPLICIT4 {
+        return "::" + int_to_str(t.num) + " = ";
+    }
+    return int_to_str(t.vendor) + "::" + int_to_str(t.profile) + ":" + int_to_str(t.num) + " = ";
+}
+
+fn tlv_hex(b: & Vec<i64>) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        val x: i64 = b.get(i) & 0xFF;
+        s = s + char_to_str(str_byte_at(d, x >> 4)) + char_to_str(str_byte_at(d, x & 15));
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The text form used by the spec's examples: {0 = 42, 1 = -17},
+/// [1, 2], [[...]] for lists, 42U for unsigned, "text", hex:0102, null.
+pub fn tlv_text(es: & Vec<TlvElem>) -> str {
+    var s: str = "";
+    var need_sep: bool = false;
+    var i: i64 = 0;
+    while i < es.len() {
+        val e: TlvElem = es.get(i);
+        if e.kind == TLV_END {
+            s = s + tlv_close_of(es, i);
+            need_sep = true;
+            i = i + 1;
+            continue;
+        }
+        if need_sep {
+            s = s + ", ";
+        }
+        s = s + tlv_tag_text(& e.tag);
+        need_sep = true;
+        if e.kind == TLV_INT {
+            s = s + int_to_str(e.ival);
+        } else if e.kind == TLV_UINT {
+            s = s + int_to_str(e.ival) + "U";
+        } else if e.kind == TLV_BOOL {
+            if e.ival == 1 {
+                s = s + "true";
+            } else {
+                s = s + "false";
+            }
+        } else if e.kind == TLV_FLOAT || e.kind == TLV_DOUBLE {
+            s = s + float_to_str(e.fval);
+        } else if e.kind == TLV_UTF8 {
+            s = s + "\"" + str_from_bytes(e.bytes) + "\"";
+        } else if e.kind == TLV_BYTES {
+            s = s + "hex:" + tlv_hex(& e.bytes);
+        } else if e.kind == TLV_NULL {
+            s = s + "null";
+        } else if e.kind == TLV_STRUCT {
+            s = s + "{";
+            need_sep = false;
+        } else if e.kind == TLV_ARRAY {
+            s = s + "[";
+            need_sep = false;
+        } else if e.kind == TLV_LIST {
+            s = s + "[[";
+            need_sep = false;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn tlv_close_of(es: & Vec<TlvElem>, end_i: i64) -> str {
+    val d: i64 = es.get(end_i).depth;
+    var j: i64 = end_i - 1;
+    while j >= 0 {
+        val e: TlvElem = es.get(j);
+        if e.depth == d && e.kind != TLV_END {
+            if e.kind == TLV_STRUCT {
+                return "}";
+            }
+            if e.kind == TLV_ARRAY {
+                return "]";
+            }
+            return "]]";
+        }
+        j = j - 1;
+    }
+    return "?";
+}
+
+// ─── Data model ─────────────────────────────────────────────────────────
+
+pub const MATTER_CLUSTER_ON_OFF: i64 = 0x0006;
+pub const MATTER_CLUSTER_LEVEL: i64 = 0x0008;
+pub const MATTER_CLUSTER_DESCRIPTOR: i64 = 0x001D;
+pub const MATTER_CLUSTER_BASIC_INFORMATION: i64 = 0x0028;
+pub const MATTER_CLUSTER_TEMPERATURE: i64 = 0x0402;
+pub const MATTER_ATTR_CLUSTER_REVISION: i64 = 0xFFFD;
+pub const MATTER_ATTR_FEATURE_MAP: i64 = 0xFFFC;
+pub const MATTER_ATTR_ATTRIBUTE_LIST: i64 = 0xFFFB;
+pub const MATTER_ATTR_ACCEPTED_COMMANDS: i64 = 0xFFF9;
+pub const MATTER_ATTR_GENERATED_COMMANDS: i64 = 0xFFF8;
+pub const MATTER_STATUS_SUCCESS: i64 = 0x00;
+pub const MATTER_STATUS_UNSUPPORTED_ATTRIBUTE: i64 = 0x86;
+pub const MATTER_STATUS_UNSUPPORTED_ENDPOINT: i64 = 0x7F;
+pub const MATTER_STATUS_UNSUPPORTED_CLUSTER: i64 = 0xC3;
+pub const MATTER_STATUS_INVALID_ACTION: i64 = 0x80;
+pub const MATTER_IM_REVISION: i64 = 11;
+pub const MATTER_PROTOCOL_IM: i64 = 0x0001;
+pub const MATTER_OP_STATUS_RESPONSE: i64 = 0x01;
+pub const MATTER_OP_READ_REQUEST: i64 = 0x02;
+pub const MATTER_OP_REPORT_DATA: i64 = 0x05;
+
+/// A stored attribute: its value as an anonymous TLV element.
+pub struct MatterAttr {
+    pub endpoint: i64,
+    pub cluster: i64,
+    pub attribute: i64,
+    pub value: Vec<i64>,
+}
+
+pub struct MatterClusterVersion {
+    pub endpoint: i64,
+    pub cluster: i64,
+    pub version: i64,
+}
+
+pub struct MatterNode {
+    pub node_id: i64,
+    pub attrs: Vec<MatterAttr>,
+    pub versions: Vec<MatterClusterVersion>,
+}
+
+pub fn matter_node(node_id: i64) -> MatterNode {
+    return MatterNode { node_id: node_id, attrs: Vec::new(), versions: Vec::new() };
+}
+
+fn matter_version_index(n: & MatterNode, ep: i64, cl: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n.versions.len() {
+        val v: MatterClusterVersion = n.versions.get(i);
+        if v.endpoint == ep && v.cluster == cl {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Add a cluster to an endpoint with its starting data version.
+pub fn matter_add_cluster(n: & mut MatterNode, ep: i64, cl: i64, version: i64) {
+    if matter_version_index(n, ep, cl) < 0 {
+        n.versions.push(MatterClusterVersion { endpoint: ep, cluster: cl, version: version & 0xFFFFFFFF });
+    }
+}
+
+/// Set (or add) an attribute value (one anonymous TLV element); the
+/// cluster's data version goes up by one when the value changes.
+pub fn matter_set_attr(n: & mut MatterNode, ep: i64, cl: i64, attr: i64, value: Vec<i64>) {
+    matter_add_cluster(n, ep, cl, 0);
+    var i: i64 = 0;
+    while i < n.attrs.len() {
+        val a: MatterAttr = n.attrs.get(i);
+        if a.endpoint == ep && a.cluster == cl && a.attribute == attr {
+            if tlv_hex(& a.value) != tlv_hex(& value) {
+                n.attrs.set(i, MatterAttr { endpoint: ep, cluster: cl, attribute: attr, value: value });
+                val vi: i64 = matter_version_index(n, ep, cl);
+                var v: MatterClusterVersion = n.versions.get(vi);
+                v.version = (v.version + 1) & 0xFFFFFFFF;
+                n.versions.set(vi, v);
+            }
+            return;
+        }
+        i = i + 1;
+    }
+    n.attrs.push(MatterAttr { endpoint: ep, cluster: cl, attribute: attr, value: value });
+}
+
+pub fn matter_data_version(n: & MatterNode, ep: i64, cl: i64) -> i64 {
+    val i: i64 = matter_version_index(n, ep, cl);
+    if i < 0 {
+        return 0 - 1;
+    }
+    return n.versions.get(i).version;
+}
+
+/// Anonymous TLV encodings of plain values, for matter_set_attr.
+pub fn matter_value_bool(b: bool) -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_bool(& mut w, tlv_anon(), b);
+    return w.out;
+}
+
+pub fn matter_value_uint(v: i64) -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_uint(& mut w, tlv_anon(), v);
+    return w.out;
+}
+
+pub fn matter_value_int(v: i64) -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_int(& mut w, tlv_anon(), v);
+    return w.out;
+}
+
+pub fn matter_value_utf8(s: str) -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_utf8(& mut w, tlv_anon(), s);
+    return w.out;
+}
+
+pub fn matter_value_null() -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_null(& mut w, tlv_anon());
+    return w.out;
+}
+
+// ─── Interaction Model ──────────────────────────────────────────────────
+
+/// An attribute path; -1 in a field is a wildcard.
+pub struct MatterPath {
+    pub endpoint: i64,
+    pub cluster: i64,
+    pub attribute: i64,
+}
+
+pub fn matter_path(ep: i64, cl: i64, attr: i64) -> MatterPath {
+    return MatterPath { endpoint: ep, cluster: cl, attribute: attr };
+}
+
+/// AttributePathIB (a list): 2 Endpoint, 3 Cluster, 4 Attribute.
+fn matter_put_path(w: & mut TlvWriter, tag: TlvTag, p: & MatterPath) {
+    tlv_start_list(w, tag);
+    if p.endpoint >= 0 {
+        tlv_put_uint(w, tlv_ctx(2), p.endpoint);
+    }
+    if p.cluster >= 0 {
+        tlv_put_uint(w, tlv_ctx(3), p.cluster);
+    }
+    if p.attribute >= 0 {
+        tlv_put_uint(w, tlv_ctx(4), p.attribute);
+    }
+    tlv_end(w);
+}
+
+fn matter_read_path(es: & Vec<TlvElem>, i: i64) -> MatterPath {
+    var p: MatterPath = matter_path(0 - 1, 0 - 1, 0 - 1);
+    val e: i64 = tlv_member(es, i, 2);
+    if e >= 0 {
+        p.endpoint = es.get(e).ival;
+    }
+    val c: i64 = tlv_member(es, i, 3);
+    if c >= 0 {
+        p.cluster = es.get(c).ival;
+    }
+    val a: i64 = tlv_member(es, i, 4);
+    if a >= 0 {
+        p.attribute = es.get(a).ival;
+    }
+    return p;
+}
+
+/// ReadRequestMessage: {0 = [paths...], 3 = fabric_filtered, 255 = rev}.
+pub fn matter_read_request(paths: & Vec<MatterPath>, fabric_filtered: bool) -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_start_struct(& mut w, tlv_anon());
+    tlv_start_array(& mut w, tlv_ctx(0));
+    var i: i64 = 0;
+    while i < paths.len() {
+        val p: MatterPath = paths.get(i);
+        matter_put_path(& mut w, tlv_anon(), & p);
+        i = i + 1;
+    }
+    tlv_end(& mut w);
+    tlv_put_bool(& mut w, tlv_ctx(3), fabric_filtered);
+    tlv_put_uint(& mut w, tlv_ctx(0xFF), MATTER_IM_REVISION);
+    tlv_end(& mut w);
+    return w.out;
+}
+
+/// The attribute paths of a ReadRequestMessage.
+pub fn matter_parse_read_request(b: & Vec<i64>) -> Result<Vec<MatterPath>, str> {
+    match tlv_decode(b) {
+        Result::Ok(es) => {
+            if es.len() == 0 || es.get(0).kind != TLV_STRUCT {
+                return Result::Err("not a structure");
+            }
+            var out: Vec<MatterPath> = Vec::new();
+            val ar: i64 = tlv_member(& es, 0, 0);
+            if ar >= 0 {
+                val ms: Vec<i64> = tlv_members(& es, ar);
+                var i: i64 = 0;
+                while i < ms.len() {
+                    out.push(matter_read_path(& es, ms.get(i)));
+                    i = i + 1;
+                }
+            }
+            return Result::Ok(out);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+fn matter_endpoint_known(n: & MatterNode, ep: i64) -> bool {
+    var i: i64 = 0;
+    while i < n.versions.len() {
+        if n.versions.get(i).endpoint == ep {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn matter_put_status(w: & mut TlvWriter, p: & MatterPath, status: i64) {
+    tlv_start_struct(w, tlv_anon());
+    tlv_start_struct(w, tlv_ctx(0));
+    matter_put_path(w, tlv_ctx(0), p);
+    tlv_start_struct(w, tlv_ctx(1));
+    tlv_put_uint(w, tlv_ctx(0), status);
+    tlv_end(w);
+    tlv_end(w);
+    tlv_end(w);
+}
+
+fn matter_put_data(w: & mut TlvWriter, version: i64, a: & MatterAttr) {
+    tlv_start_struct(w, tlv_anon());
+    tlv_start_struct(w, tlv_ctx(1));
+    tlv_put_uint(w, tlv_ctx(0), version);
+    matter_put_path(w, tlv_ctx(1), & matter_path(a.endpoint, a.cluster, a.attribute));
+    tlv_put_raw_tagged(w, tlv_ctx(2), & a.value);
+    tlv_end(w);
+    tlv_end(w);
+}
+
+/// Answer a ReadRequestMessage with a ReportDataMessage: {1 = [reports],
+/// 4 = true (SuppressResponse), 255 = rev}. Wildcards expand over what the
+/// node has; a concrete path that does not exist gives an AttributeStatusIB.
+pub fn matter_node_read(n: & MatterNode, request: & Vec<i64>) -> Result<Vec<i64>, str> {
+    var paths: Vec<MatterPath> = Vec::new();
+    match matter_parse_read_request(request) {
+        Result::Ok(p) => {
+            paths = p;
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    var w: TlvWriter = tlv_writer();
+    tlv_start_struct(& mut w, tlv_anon());
+    tlv_start_array(& mut w, tlv_ctx(1));
+    var pi: i64 = 0;
+    while pi < paths.len() {
+        val p: MatterPath = paths.get(pi);
+        var found: i64 = 0;
+        var i: i64 = 0;
+        while i < n.attrs.len() {
+            val a: MatterAttr = n.attrs.get(i);
+            if (p.endpoint < 0 || p.endpoint == a.endpoint) && (p.cluster < 0 || p.cluster == a.cluster) && (p.attribute < 0 || p.attribute == a.attribute) {
+                matter_put_data(& mut w, matter_data_version(n, a.endpoint, a.cluster), & a);
+                found = found + 1;
+            }
+            i = i + 1;
+        }
+        if found == 0 && p.endpoint >= 0 && p.cluster >= 0 && p.attribute >= 0 {
+            var st: i64 = MATTER_STATUS_UNSUPPORTED_ATTRIBUTE;
+            if !matter_endpoint_known(n, p.endpoint) {
+                st = MATTER_STATUS_UNSUPPORTED_ENDPOINT;
+            } else if matter_data_version(n, p.endpoint, p.cluster) < 0 {
+                st = MATTER_STATUS_UNSUPPORTED_CLUSTER;
+            }
+            matter_put_status(& mut w, & p, st);
+        }
+        pi = pi + 1;
+    }
+    tlv_end(& mut w);
+    tlv_put_bool(& mut w, tlv_ctx(4), true);
+    tlv_put_uint(& mut w, tlv_ctx(0xFF), MATTER_IM_REVISION);
+    tlv_end(& mut w);
+    return Result::Ok(w.out);
+}
+
+/// One entry of a ReportDataMessage: data (status -1, version, value in
+/// text form) or a status.
+pub struct MatterReport {
+    pub path: MatterPath,
+    pub version: i64,
+    pub status: i64,
+    pub value_text: str,
+}
+
+pub fn matter_parse_report(b: & Vec<i64>) -> Result<Vec<MatterReport>, str> {
+    match tlv_decode(b) {
+        Result::Ok(es) => {
+            var out: Vec<MatterReport> = Vec::new();
+            if es.len() == 0 || es.get(0).kind != TLV_STRUCT {
+                return Result::Err("not a structure");
+            }
+            val ar: i64 = tlv_member(& es, 0, 1);
+            if ar < 0 {
+                return Result::Ok(out);
+            }
+            val rs: Vec<i64> = tlv_members(& es, ar);
+            var i: i64 = 0;
+            while i < rs.len() {
+                val r: i64 = rs.get(i);
+                val d: i64 = tlv_member(& es, r, 1);
+                if d >= 0 {
+                    val vi: i64 = tlv_member(& es, d, 0);
+                    val pth: i64 = tlv_member(& es, d, 1);
+                    val dat: i64 = tlv_member(& es, d, 2);
+                    var ver: i64 = 0 - 1;
+                    if vi >= 0 {
+                        ver = es.get(vi).ival;
+                    }
+                    var txt: str = "";
+                    if dat >= 0 {
+                        var sub: Vec<TlvElem> = Vec::new();
+                        val endd: i64 = tlv_container_end(& es, dat);
+                        var k: i64 = dat;
+                        while k <= endd {
+                            var e: TlvElem = es.get(k);
+                            if k == dat {
+                                e.tag = tlv_anon();
+                            }
+                            sub.push(e);
+                            k = k + 1;
+                        }
+                        txt = tlv_text(& sub);
+                    }
+                    var path: MatterPath = matter_path(0 - 1, 0 - 1, 0 - 1);
+                    if pth >= 0 {
+                        path = matter_read_path(& es, pth);
+                    }
+                    out.push(MatterReport { path: path, version: ver, status: 0 - 1, value_text: txt });
+                } else {
+                    val s: i64 = tlv_member(& es, r, 0);
+                    if s >= 0 {
+                        val pth: i64 = tlv_member(& es, s, 0);
+                        val sib: i64 = tlv_member(& es, s, 1);
+                        var st: i64 = 0 - 1;
+                        if sib >= 0 {
+                            val sc: i64 = tlv_member(& es, sib, 0);
+                            if sc >= 0 {
+                                st = es.get(sc).ival;
+                            }
+                        }
+                        var path: MatterPath = matter_path(0 - 1, 0 - 1, 0 - 1);
+                        if pth >= 0 {
+                            path = matter_read_path(& es, pth);
+                        }
+                        out.push(MatterReport { path: path, version: 0 - 1, status: st, value_text: "" });
+                    }
+                }
+                i = i + 1;
+            }
+            return Result::Ok(out);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+/// The protocol header in front of an IM payload: exchange flags
+/// (0x01 initiator, 0x02 ack present, 0x04 reliability wanted), opcode,
+/// exchange id, protocol id (IM = 0x0001), then the acknowledged message
+/// counter when ack_counter >= 0.
+pub fn matter_protocol_header(opcode: i64, exchange_id: i64, initiator: bool, reliable: bool, ack_counter: i64) -> Vec<i64> {
+    var flags: i64 = 0;
+    if initiator {
+        flags = flags | 0x01;
+    }
+    if ack_counter >= 0 {
+        flags = flags | 0x02;
+    }
+    if reliable {
+        flags = flags | 0x04;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(flags);
+    out.push(opcode & 0xFF);
+    tlv_le(& mut out, exchange_id, 2);
+    tlv_le(& mut out, MATTER_PROTOCOL_IM, 2);
+    if ack_counter >= 0 {
+        tlv_le(& mut out, ack_counter, 4);
+    }
+    return out;
+}
+
+// ─── Onboarding payloads ────────────────────────────────────────────────
+
+fn verhoeff_d(a: i64, b: i64) -> i64 {
+    val rows: str = "0123456789123406789523401789563401289567401239567859876043216598710432765982104387659321049876543210";
+    // rows of the dihedral group D5 multiplication table, 10 digits each
+    return str_byte_at(rows, 10 * a + b) - 48;
+}
+
+fn verhoeff_p(pos: i64, digit: i64) -> i64 {
+    val rows: str = "01234567891576283094580379614289160435279453126870428657390127938064157046913258";
+    return str_byte_at(rows, 10 * (pos % 8) + digit) - 48;
+}
+
+fn verhoeff_inv(c: i64) -> i64 {
+    val t: str = "0432156789";
+    return str_byte_at(t, c) - 48;
+}
+
+/// The Verhoeff check digit of a decimal string.
+pub fn verhoeff_check_digit(digits: str) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(digits);
+    while i < n {
+        val d: i64 = str_byte_at(digits, n - 1 - i) - 48;
+        c = verhoeff_d(c, verhoeff_p(i + 1, d));
+        i = i + 1;
+    }
+    return verhoeff_inv(c);
+}
+
+/// Whether a decimal string ends with its correct Verhoeff check digit.
+pub fn verhoeff_valid(digits: str) -> bool {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(digits);
+    while i < n {
+        val d: i64 = str_byte_at(digits, n - 1 - i) - 48;
+        if d < 0 || d > 9 {
+            return false;
+        }
+        c = verhoeff_d(c, verhoeff_p(i, d));
+        i = i + 1;
+    }
+    return c == 0;
+}
+
+fn matter_pad(v: i64, width: i64) -> str {
+    var s: str = int_to_str(v);
+    while str_len(s) < width {
+        s = "0" + s;
+    }
+    return s;
+}
+
+pub struct MatterSetup {
+    pub version: i64,
+    pub vendor_id: i64,
+    pub product_id: i64,
+    pub flow: i64,
+    pub discovery: i64,
+    pub discriminator: i64,
+    pub passcode: i64,
+    pub ok: bool,
+}
+
+pub const MATTER_DISCOVERY_SOFTAP: i64 = 0x01;
+pub const MATTER_DISCOVERY_BLE: i64 = 0x02;
+pub const MATTER_DISCOVERY_ON_NETWORK: i64 = 0x04;
+
+/// Passcodes the spec forbids (trivial ones and out of range).
+pub fn matter_passcode_valid(pc: i64) -> bool {
+    if pc < 1 || pc > 99999998 {
+        return false;
+    }
+    if pc == 11111111 || pc == 22222222 || pc == 33333333 || pc == 44444444 || pc == 55555555 || pc == 66666666 || pc == 77777777 || pc == 88888888 || pc == 12345678 || pc == 87654321 {
+        return false;
+    }
+    return true;
+}
+
+/// The manual pairing code: 11 digits, or 21 with vendor and product id
+/// (custom flow); the short discriminator is the top 4 of the 12 bits.
+pub fn matter_manual_code(s: & MatterSetup, with_vid_pid: bool) -> str {
+    val short: i64 = (s.discriminator >> 8) & 0xF;
+    var vp: i64 = 0;
+    if with_vid_pid {
+        vp = 1;
+    }
+    val c1: i64 = (vp << 2) | (short >> 2);
+    val c2: i64 = ((short & 3) << 14) | (s.passcode & 0x3FFF);
+    val c3: i64 = (s.passcode >> 14) & 0x1FFF;
+    var code: str = int_to_str(c1) + matter_pad(c2, 5) + matter_pad(c3, 4);
+    if with_vid_pid {
+        code = code + matter_pad(s.vendor_id, 5) + matter_pad(s.product_id, 5);
+    }
+    return code + int_to_str(verhoeff_check_digit(code));
+}
+
+/// Decode a manual code (dashes and spaces allowed): passcode, the short
+/// discriminator (as discriminator << 8) and vendor / product ids.
+pub fn matter_parse_manual_code(text: str) -> MatterSetup {
+    var digits: str = "";
+    var i: i64 = 0;
+    while i < str_len(text) {
+        val c: i64 = str_byte_at(text, i);
+        if c >= 48 && c <= 57 {
+            digits = digits + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    var s: MatterSetup = MatterSetup { version: 0, vendor_id: 0, product_id: 0, flow: 0, discovery: 0, discriminator: 0, passcode: 0, ok: false };
+    val n: i64 = str_len(digits);
+    if (n != 11 && n != 21) || !verhoeff_valid(digits) {
+        return s;
+    }
+    val c1: i64 = str_byte_at(digits, 0) - 48;
+    val vp: bool = (c1 & 4) != 0;
+    if (vp && n != 21) || (!vp && n != 11) {
+        return s;
+    }
+    val c2: i64 = str_parse_int_range(digits, 1, 6);
+    val c3: i64 = str_parse_int_range(digits, 6, 10);
+    val short: i64 = ((c1 & 3) << 2) | ((c2 >> 14) & 3);
+    s.discriminator = short << 8;
+    s.passcode = (c3 << 14) | (c2 & 0x3FFF);
+    if vp {
+        s.vendor_id = str_parse_int_range(digits, 10, 15);
+        s.product_id = str_parse_int_range(digits, 15, 20);
+        s.flow = 2;
+    }
+    s.ok = true;
+    return s;
+}
+
+fn matter_b38() -> str {
+    return "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-.";
+}
+
+/// Base38 (Matter 5.1.3.1): 3 bytes -> 5 characters, 2 -> 4, 1 -> 2,
+/// least significant first.
+pub fn matter_base38_encode(b: & Vec<i64>) -> str {
+    val a: str = matter_b38();
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        var n: i64 = b.len() - i;
+        if n > 3 {
+            n = 3;
+        }
+        var v: i64 = 0;
+        var k: i64 = 0;
+        while k < n {
+            v = v | ((b.get(i + k) & 0xFF) << (8 * k));
+            k = k + 1;
+        }
+        var chars: i64 = 5;
+        if n == 2 {
+            chars = 4;
+        } else if n == 1 {
+            chars = 2;
+        }
+        k = 0;
+        while k < chars {
+            s = s + char_to_str(str_byte_at(a, v % 38));
+            v = v / 38;
+            k = k + 1;
+        }
+        i = i + n;
+    }
+    return s;
+}
+
+pub fn matter_base38_decode(s: str) -> Vec<i64> {
+    val a: str = matter_b38();
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        var chars: i64 = n - i;
+        if chars > 5 {
+            chars = 5;
+        }
+        var bytes: i64 = 3;
+        if chars == 4 {
+            bytes = 2;
+        } else if chars == 2 {
+            bytes = 1;
+        } else if chars != 5 {
+            return Vec::new();
+        }
+        var v: i64 = 0;
+        var k: i64 = chars - 1;
+        while k >= 0 {
+            val c: i64 = str_byte_at(s, i + k);
+            var d: i64 = 0 - 1;
+            var j: i64 = 0;
+            while j < 38 {
+                if str_byte_at(a, j) == c {
+                    d = j;
+                }
+                j = j + 1;
+            }
+            if d < 0 {
+                return Vec::new();
+            }
+            v = v * 38 + d;
+            k = k - 1;
+        }
+        k = 0;
+        while k < bytes {
+            out.push((v >> (8 * k)) & 0xFF);
+            k = k + 1;
+        }
+        i = i + chars;
+    }
+    return out;
+}
+
+/// The QR code payload: "MT:" + Base38 of the 88-bit packing (LSB first)
+/// version(3) vendor(16) product(16) flow(2) discovery(8)
+/// discriminator(12) passcode(27) padding(4).
+pub fn matter_qr_payload(s: & MatterSetup) -> str {
+    var bits: Vec<i64> = Vec::filled(11, 0);
+    var off: i64 = 0;
+    off = matter_put_bits(& mut bits, off, s.version, 3);
+    off = matter_put_bits(& mut bits, off, s.vendor_id, 16);
+    off = matter_put_bits(& mut bits, off, s.product_id, 16);
+    off = matter_put_bits(& mut bits, off, s.flow, 2);
+    off = matter_put_bits(& mut bits, off, s.discovery, 8);
+    off = matter_put_bits(& mut bits, off, s.discriminator, 12);
+    off = matter_put_bits(& mut bits, off, s.passcode, 27);
+    matter_put_bits(& mut bits, off, 0, 4);
+    return "MT:" + matter_base38_encode(& bits);
+}
+
+fn matter_put_bits(b: & mut Vec<i64>, off: i64, v: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        if ((v >> i) & 1) != 0 {
+            val p: i64 = off + i;
+            b.set(p / 8, b.get(p / 8) | (1 << (p % 8)));
+        }
+        i = i + 1;
+    }
+    return off + n;
+}
+
+fn matter_get_bits(b: & Vec<i64>, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val p: i64 = off + i;
+        if ((b.get(p / 8) >> (p % 8)) & 1) != 0 {
+            v = v | (1 << i);
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Decode "MT:..." back into its fields (ok=false when malformed).
+pub fn matter_parse_qr(text: str) -> MatterSetup {
+    var s: MatterSetup = MatterSetup { version: 0, vendor_id: 0, product_id: 0, flow: 0, discovery: 0, discriminator: 0, passcode: 0, ok: false };
+    if !str_starts_with(text, "MT:") {
+        return s;
+    }
+    var body: str = "";
+    var i: i64 = 3;
+    while i < str_len(text) {
+        val c: i64 = str_byte_at(text, i);
+        if c == 42 {
+            // '*' separates several payloads; take the first
+            break;
+        }
+        body = body + char_to_str(c);
+        i = i + 1;
+    }
+    val b: Vec<i64> = matter_base38_decode(body);
+    if b.len() < 11 {
+        return s;
+    }
+    s.version = matter_get_bits(& b, 0, 3);
+    s.vendor_id = matter_get_bits(& b, 3, 16);
+    s.product_id = matter_get_bits(& b, 19, 16);
+    s.flow = matter_get_bits(& b, 35, 2);
+    s.discovery = matter_get_bits(& b, 37, 8);
+    s.discriminator = matter_get_bits(& b, 45, 12);
+    s.passcode = matter_get_bits(& b, 57, 27);
+    s.ok = s.version == 0 && matter_get_bits(& b, 84, 4) == 0;
+    return s;
+}

@@ -1,0 +1,130 @@
+// test_natabi_optmatch.fd — llvm LF24: `Option` and `Result` of one word
+// in registers on the caller's side too. On the machine layer
+// (compiler/nat_ir.fd) such a result comes back in two registers (ME27,
+// ng_rr_plan), the caller keeps the tag and the payload in two vregs
+// (ng_rr_caller_rewrite, ng_rf_promote), the match reads them from there,
+// and the result slot's address is no longer taken (ng_rf_promote turns
+// its MO_SLOTADDR into a constant): `index_or`, `div_or` and `count_found`
+// below have no load, store, copy or slot address left in their final MIR
+// (tests/nattools/machine_optmatch_check.sh). `div_msg` matches a Result
+// whose error owns a string: the temporary is dropped through a call that
+// takes the slot's address, so that slot stays in memory (only the output
+// is checked). Every backend prints the same; `FID_NAT_OFF=retfwd` /
+// `retregs` build the old code to compare.
+//
+// Expected output:
+// 20
+// -1
+// 0
+// 70
+// 7
+// -5
+// 3
+// 2
+// 4
+// 16
+// 20
+
+fn find_at(xs: & Vec<i64>, x: i64) -> Option<i64> {
+    var i: i64 = 0;
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn checked_div(a: i64, b: i64) -> Result<i64, i64> {
+    if b == 0 {
+        return Result::Err(0 - 1);
+    }
+    return Result::Ok(a / b);
+}
+
+fn checked_div_msg(a: i64, b: i64) -> Result<i64, str> {
+    if b == 0 {
+        return Result::Err("division by zero");
+    }
+    return Result::Ok(a / b);
+}
+
+/// The match on the returned Option is all the function does with it
+fn index_or(xs: & Vec<i64>, x: i64, d: i64) -> i64 {
+    match find_at(xs, x) {
+        Option::Some(ix: i64) => {
+            return ix * 10;
+        }
+        Option::None => {
+            return d;
+        }
+    }
+}
+
+/// The same with a Result of two words
+fn div_or(a: i64, b: i64, d: i64) -> i64 {
+    match checked_div(a, b) {
+        Result::Ok(q: i64) => {
+            return q;
+        }
+        Result::Err(_e: i64) => {
+            return d;
+        }
+    }
+}
+
+/// A Result whose error is a string: dropped through a call (in memory)
+fn div_msg(a: i64, b: i64) -> i64 {
+    match checked_div_msg(a, b) {
+        Result::Ok(q: i64) => {
+            return q;
+        }
+        Result::Err(e: str) => {
+            return str_len(e);
+        }
+    }
+}
+
+/// Matches in a loop: each iteration's result in the same two vregs
+fn count_found(xs: & Vec<i64>, lo: i64, hi: i64) -> i64 {
+    var n: i64 = 0;
+    var k: i64 = lo;
+    while k <= hi {
+        match find_at(xs, k) {
+            Option::Some(_ix: i64) => {
+                n = n + 1;
+            }
+            Option::None => {
+            }
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+fn main() {
+    var xs: Vec<i64> = Vec::new();
+    xs.push(5);
+    xs.push(6);
+    xs.push(7);
+    println(index_or(& xs, 7, 0 - 1));
+    println(index_or(& xs, 9, 0 - 1));
+    println(index_or(& xs, 5, 0 - 1));
+    println(index_or(& xs, 6, 0 - 1) * 7);
+    println(div_or(21, 3, 0 - 5));
+    println(div_or(1, 0, 0 - 5));
+    println(count_found(& xs, 4, 8));
+    println(count_found(& xs, 6, 100));
+    println(div_msg(17, 4));
+    println(div_msg(1, 0));
+    // the payload read where the result comes back, in main
+    match find_at(& xs, 7) {
+        Option::Some(ix: i64) => {
+            println(ix * 10);
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+}

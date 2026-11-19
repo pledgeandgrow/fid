@@ -1,0 +1,34 @@
+// Run by tests/tooling/runtime-sandbox-block-check.sh (roadmap Phase 12,
+// run-time sandbox). The type checker cannot see what a function value
+// kept in a struct does, so it accepts `check_file` inside `sandbox { }`;
+// at run time the interpreter has revoked every capability there
+// (lowering puts p_sandbox_enter/p_sandbox_exit around the block), so the
+// file check stops the program. `fid run` only: compiled programs keep
+// the compile-time check alone (core's p_sandbox_enter/exit do nothing).
+// Expected output (stdout), then on stderr:
+//   before 0
+//   Sandbox error: 'p_file_exists' needs capability 'FS', which was revoked at run time
+
+fn probe(path: str) -> i64 {
+    var s: i64 = p_file_exists(path);
+    return s;
+}
+
+struct Handler {
+    f: fn(str) -> i64,
+}
+
+fn check_file(h: Handler, path: str) -> i64 {
+    val g: fn(str) -> i64 = h.f;
+    return g(path);
+}
+
+fn main() {
+    val h: Handler = Handler { f: probe };
+    println("before " + int_to_str(check_file(h, "no_such_file_for_sandbox_test.txt")));
+    var r: i64 = 0;
+    sandbox {
+        r = check_file(h, "no_such_file_for_sandbox_test.txt");
+    }
+    println("after " + int_to_str(r));
+}

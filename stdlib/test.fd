@@ -20,6 +20,18 @@ pub struct TestRunner {
 }
 
 /// Create a new test runner.
+///
+/// Example:
+///   var r = test_runner_new();
+///   test_begin(&mut r, "counters");
+///   test_pass(&mut r);
+///   assert(test_all_passed(r));
+///   test_fail(&mut r, "boom");
+///   assert_eq(r.passed, 1);
+///   assert_eq(r.failed, 1);
+///   assert(!test_all_passed(r));
+///   assert(test_assert_eq(3, 3, "eq"));
+///   assert(test_assert_true(true, "t"));
 pub fn test_runner_new() -> TestRunner {
     return TestRunner {
         passed: 0, failed: 0, current_test: ""
@@ -256,6 +268,111 @@ pub fn test_assert_eq_or_abort(a: i64, b: i64, msg: str) -> void {
         println(int_to_str(a));
         p_panic("abort");
     }
+}
+
+// ─── Table tests (competitive SL13, complaint CT2) ──────────────────────
+//
+// Go's table-driven tests: one check per row, each row named, every row
+// run even after one fails, and the failures listed together at the end.
+//
+//   var t: TableTest = table_new("parse_int");
+//   table_int(& mut t, "zero", str_parse_int("0"), 0);
+//   table_int(& mut t, "negative", str_parse_int("-12"), - 12);
+//   table_str(& mut t, "trim", str_trim("  a "), "a");
+//   table_done(t);      // panics when a row failed
+//
+// FIDES_ROW=<text> runs only the rows whose name contains <text> (the
+// others count as skipped), like `go test -run 'Test/<row>'`.
+
+/// The rows of one table test.
+pub struct TableTest {
+    pub name: str,
+    pub passed: i64,
+    pub skipped: i64,
+    /// "<row>: <why>" for each failed row
+    pub failures: Vec<str>,
+    /// Only rows whose name contains this run ("" all)
+    pub filter: str,
+}
+
+/// A table test named `name` (FIDES_ROW, when set, filters its rows).
+pub fn table_new(name: str) -> TableTest {
+    var filter: str = "";
+    match env_var("FIDES_ROW") {
+        Option::Some(v) => {
+            filter = v;
+        }
+        Option::None => {
+        }
+    }
+    return TableTest {
+        name: name, passed: 0, skipped: 0, failures: Vec::new(), filter: filter,
+    };
+}
+
+/// Whether row `row` runs under the filter (a skipped row is counted).
+pub fn table_runs(t: & mut TableTest, row: str) -> bool {
+    if str_len(t.filter) > 0 && !str_contains(row, t.filter) {
+        t.skipped = t.skipped + 1;
+        return false;
+    }
+    return true;
+}
+
+/// Row `row` passed when `ok`; `why` says what was wrong otherwise.
+pub fn table_check(t: & mut TableTest, row: str, ok: bool, why: str) -> bool {
+    if !table_runs(t, row) {
+        return true;
+    }
+    if ok {
+        t.passed = t.passed + 1;
+        return true;
+    }
+    t.failures.push(row + ": " + why);
+    return false;
+}
+
+/// Row `row`: `got` must equal `want`.
+pub fn table_int(t: & mut TableTest, row: str, got: i64, want: i64) -> bool {
+    return table_check(t, row, got == want, "got " + int_to_str(got) + ", want " + int_to_str(want));
+}
+
+/// Row `row`: `got` must equal `want` (text).
+pub fn table_str(t: & mut TableTest, row: str, got: str, want: str) -> bool {
+    return table_check(t, row, str_equal(got, want), "got \"" + got + "\", want \"" + want + "\"");
+}
+
+/// Row `row`: `got` must equal `want` (a truth value).
+pub fn table_bool(t: & mut TableTest, row: str, got: bool, want: bool) -> bool {
+    return table_check(t, row, got == want, "got " + bool_to_str(got) + ", want " + bool_to_str(want));
+}
+
+/// How many rows failed so far.
+pub fn table_failed(t: & TableTest) -> i64 {
+    return t.failures.len();
+}
+
+/// Print "table <name>: <n> passed[, <k> skipped][, <f> failed]" and each
+/// failed row, then panic when a row failed (so `fid test` reports the
+/// test as failed). Returns the number of rows that passed.
+pub fn table_done(t: TableTest) -> i64 {
+    var line: str = "table " + t.name + ": " + int_to_str(t.passed) + " passed";
+    if t.skipped > 0 {
+        line = line + ", " + int_to_str(t.skipped) + " skipped";
+    }
+    if t.failures.len() > 0 {
+        line = line + ", " + int_to_str(t.failures.len()) + " failed";
+    }
+    println(line);
+    var i: i64 = 0;
+    while i < t.failures.len() {
+        println("  FAIL " + t.name + "/" + t.failures.get(i));
+        i = i + 1;
+    }
+    if t.failures.len() > 0 {
+        p_panic("table " + t.name + ": " + int_to_str(t.failures.len()) + " row(s) failed");
+    }
+    return t.passed;
 }
 
 // ─── Snapshots (complaint CT5) ──────────────────────────────────────────

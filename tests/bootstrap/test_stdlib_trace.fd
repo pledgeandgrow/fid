@@ -1,0 +1,43 @@
+// Complaint CO2: stdlib trace. A span's JSON line, the escaping of its
+// text, and the switch: FIDES_TRACE unset (or "0") means trace_span_begin
+// gives -1 and trace_span_end prints nothing, so file_write below stays
+// silent. scripts/verify/co2_trace.sh runs this with FIDES_TRACE=1 and
+// checks the spans on stderr.
+//
+// Expected output:
+// {"span":"http.request","detail":"GET example.com:80/","us":42,"ok":true}
+// {"span":"pg.query","detail":"say \"hi\" \\ tab\u0009","us":0,"ok":false}
+// switch ok
+// trace ok
+use trace;
+use file;
+
+fn main() -> i64 {
+    println(trace_span_line("http.request", "GET example.com:80/", 42, true));
+    println(trace_span_line("pg.query", "say \"hi\" \\ tab\t", 0, false));
+    var want: bool = false;
+    match env_var("FIDES_TRACE") {
+        Option::Some(v) => {
+            want = str_len(v) > 0 && v != "0";
+        }
+        Option::None => {
+        }
+    }
+    if trace_enabled() != want {
+        p_panic("trace_enabled does not follow FIDES_TRACE");
+    }
+    val t0: i64 = trace_span_begin();
+    if !want && t0 != - 1 {
+        p_panic("trace_span_begin: tracing is off, want -1");
+    }
+    trace_span_end(t0, "test.span", "done", true);
+    // a traced stdlib call: one "file.write" span on stderr when tracing
+    val path: str = "_fides_test_trace.txt";
+    if file_write(path, "x") != 0 {
+        p_panic("file_write failed");
+    }
+    p_file_delete(path);
+    println("switch ok");
+    println("trace ok");
+    return 0;
+}

@@ -1,0 +1,359 @@
+// Track OP (docs/roadmap/competitive-roadmap.md OP18), the machine layer
+// (compiler/nat_ir.fd): memory operands beyond MO_ALUM.
+// - Compares against memory (x86-64, ng_fuse_memcmp): a load whose only
+//   reader is a compare-and-branch, a SETCC or a branch on the value itself
+//   is the compare's memory operand: `cmp r, [m]` for 8 bytes against a
+//   register (MO_BRCCM / MO_SETCCM mode 0), `cmp size [m], imm` for a
+//   load of 1, 2, 4 or 8 bytes against a constant (mode 1, the compare
+//   kind adjusted to the field: ng_memcmp_cc).
+// - Read-modify-write destinations (x86-64, ng_fuse_rmw): `c.f = c.f op x`
+//   with op add, sub, and, or, xor (wrapping add / sub: a checked one reads
+//   its operands again) is one `op [m], r` or `op qword [m], imm`
+//   (MO_ALUMST).
+// - Extending loads (every target, ng_fuse_ldext): an extension of a load
+//   read once is the narrower load itself (`r.a as u8` one movzx / ldrb /
+//   lbu, `r.small as i16` one movsx / ldrsh / lh).
+// Cases where a fold would be wrong stay as they are: a store between the
+// load and its use, a value read twice, an immediate past 32 bits, the
+// load on the right of SUB. The functions are @wrapping, which keeps them
+// out of line, so each one's MIR can be seen in a dump. Every result is
+// the same with FID_NAT_OFF=memcmp,rmw,ldext and on run / ccompile. Run:
+//   bash tests/nattools/machine_memop_check.sh
+//   NATIVE=1 bash scripts/cross-test.sh x86_64-linux (and x86_64-windows)
+// Expected output:
+// below 1 0
+// ge 1 0 1
+// eq42 1 0
+// neg 1 0
+// big 1 0
+// tiny 1 0
+// byte 1 0
+// half 1 0
+// uhalf 1 0
+// small 1 0
+// word 1 0
+// flag 7 3
+// setcc true false
+// eqx true false
+// store 1
+// twice 50
+// rmw 15 105 12 4091 21845 4080 10000000015 2
+// sub_right -90
+// rmw_ret 30
+// ldext 247 -9 -32767 2147483653 -2147483643 -6
+// ldext_twice 6442450946
+// ldext_store 5
+// vlow 255 128
+
+struct Rec {
+    a: i64,
+    b: i64,
+    small: i32,
+    tiny: i8,
+    flag: bool,
+    byte: u8,
+    half: i16,
+    uhalf: u16,
+    word: u32,
+}
+
+fn rec_new(a: i64, b: i64) -> Rec {
+    return Rec { a: a, b: b, small: 0, tiny: 0, flag: false, byte: 0, half: 0, uhalf: 0, word: 0 };
+}
+
+// --- compares against memory ------------------------------------------------
+
+// 8 bytes against a register: `cmp r, [m]`
+@wrapping fn below(r: &Rec, x: i64) -> i64 {
+    if r.a < x {
+        return 1;
+    }
+    return 0;
+}
+
+// the register on the left of the compare
+@wrapping fn ge_left(r: &Rec, x: i64) -> i64 {
+    if x >= r.b {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn eq42(r: &Rec) -> i64 {
+    if r.a == 42 {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn below_neg(r: &Rec) -> i64 {
+    if r.b < 0 - 100 {
+        return 1;
+    }
+    return 0;
+}
+
+// a constant past 32 bits: not an immediate (`cmp r, [m]` with it loaded)
+@wrapping fn is_big(r: &Rec) -> i64 {
+    if r.a == 5000000000 {
+        return 1;
+    }
+    return 0;
+}
+
+// narrow fields against constants: the compare on the field's own bytes
+@wrapping fn tiny_neg(r: &Rec) -> i64 {
+    if r.tiny < 0 - 5 {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn byte_high(r: &Rec) -> i64 {
+    if r.byte > 200 {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn half_m3(r: &Rec) -> i64 {
+    if r.half == 0 - 3 {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn uhalf_ge(r: &Rec) -> i64 {
+    if r.uhalf >= 40000 {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn small_gt(r: &Rec) -> i64 {
+    if r.small > 100000 {
+        return 1;
+    }
+    return 0;
+}
+
+@wrapping fn word_gt(r: &Rec) -> i64 {
+    if r.word > 3000000000 {
+        return 1;
+    }
+    return 0;
+}
+
+// a branch on the loaded value itself: `cmp byte [m], 0`
+@wrapping fn flag_val(r: &Rec) -> i64 {
+    if r.flag {
+        return 7;
+    }
+    return 3;
+}
+
+// compares as values (SETCC)
+@wrapping fn more_than(r: &Rec) -> bool {
+    return r.a > 1000;
+}
+
+@wrapping fn same_b(r: &Rec, x: i64) -> bool {
+    val c: bool = r.b == x;
+    return c;
+}
+
+// a store between the load and the compare: the old value is compared
+@wrapping fn after_store(r: &mut Rec) -> i64 {
+    val t: i64 = r.a;
+    r.a = 0;
+    if t > 5 {
+        return 1;
+    }
+    return 0;
+}
+
+// the loaded value read twice stays a load
+@wrapping fn twice(r: &Rec, x: i64) -> i64 {
+    val t: i64 = r.a;
+    if t < x {
+        return t;
+    }
+    return t * 2;
+}
+
+// --- read-modify-write destinations -------------------------------------------
+
+@wrapping fn bump(c: &mut Rec, k: i64) {
+    c.a = c.a + k;
+}
+
+@wrapping fn bump5(c: &mut Rec) {
+    c.b = c.b + 5;
+}
+
+@wrapping fn take(c: &mut Rec, k: i64) {
+    c.b = c.b - k;
+}
+
+@wrapping fn set_bits(c: &mut Rec, m: i64) {
+    c.a = c.a | m;
+}
+
+@wrapping fn flip(c: &mut Rec) {
+    c.a = c.a ^ 21845;
+}
+
+@wrapping fn keep_mid(c: &mut Rec) {
+    c.a = c.a & 4080;
+}
+
+// an immediate past 32 bits: the constant in a register
+@wrapping fn bump_big(c: &mut Rec) {
+    c.a = c.a + 10000000000;
+}
+
+@wrapping fn mix_in(c: &mut Rec, x: i64) {
+    c.b = x & c.b;
+}
+
+// the load on the right of SUB is not a read-modify-write
+@wrapping fn sub_right(c: &mut Rec, k: i64) {
+    c.b = k - c.b;
+}
+
+// the result read again after the store
+@wrapping fn bump_ret(c: &mut Rec, k: i64) -> i64 {
+    c.a = c.a + k;
+    return c.a;
+}
+
+// --- extending loads -------------------------------------------------------------
+
+@wrapping fn low8(r: &Rec) -> i64 {
+    return (r.a as u8) as i64;
+}
+
+@wrapping fn low8s(r: &Rec) -> i64 {
+    return (r.a as i8) as i64;
+}
+
+@wrapping fn small16(r: &Rec) -> i64 {
+    return (r.small as i16) as i64;
+}
+
+@wrapping fn low32u(r: &Rec) -> i64 {
+    return (r.b as u32) as i64;
+}
+
+@wrapping fn low32s(r: &Rec) -> i64 {
+    return (r.b as i32) as i64;
+}
+
+// a zero-extended field read as a narrower signed one
+@wrapping fn byte_signed(r: &Rec) -> i64 {
+    return (r.uhalf as i8) as i64;
+}
+
+// the full value is read too: the load stays
+@wrapping fn ld_twice(r: &Rec) -> i64 {
+    val t: i64 = r.b;
+    return ((t as u8) as i64) + t;
+}
+
+// a store between the load and the extension
+@wrapping fn ld_store(r: &mut Rec) -> i64 {
+    val t: i64 = r.a;
+    r.a = 0;
+    return (t as u8) as i64;
+}
+
+@wrapping fn vlow(v: & Vec<i64>, i: i64) -> i64 {
+    return (v.get(i) as u8) as i64;
+}
+
+fn tf(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() {
+    var r: Rec = rec_new(7, 20);
+    var s: Rec = rec_new(9, 3);
+    println("below " + int_to_str(below(&r, 8)) + " " + int_to_str(below(&s, 8)));
+    println("ge " + int_to_str(ge_left(&r, 20)) + " " + int_to_str(ge_left(&r, 19)) + " " + int_to_str(ge_left(&s, 100)));
+    var f: Rec = rec_new(42, 0 - 101);
+    println("eq42 " + int_to_str(eq42(&f)) + " " + int_to_str(eq42(&r)));
+    println("neg " + int_to_str(below_neg(&f)) + " " + int_to_str(below_neg(&r)));
+    var bg: Rec = rec_new(5000000000, 0);
+    println("big " + int_to_str(is_big(&bg)) + " " + int_to_str(is_big(&f)));
+    var n1: Rec = rec_new(0, 0);
+    n1.tiny = 0 - 6;
+    n1.byte = 250;
+    n1.half = 0 - 3;
+    n1.uhalf = 50000;
+    n1.small = 100001;
+    n1.word = 4000000000;
+    n1.flag = true;
+    var n2: Rec = rec_new(0, 0);
+    n2.tiny = 0 - 5;
+    n2.byte = 200;
+    n2.half = 3;
+    n2.uhalf = 39999;
+    n2.small = 0 - 200000;
+    n2.word = 3000000000;
+    println("tiny " + int_to_str(tiny_neg(&n1)) + " " + int_to_str(tiny_neg(&n2)));
+    println("byte " + int_to_str(byte_high(&n1)) + " " + int_to_str(byte_high(&n2)));
+    println("half " + int_to_str(half_m3(&n1)) + " " + int_to_str(half_m3(&n2)));
+    println("uhalf " + int_to_str(uhalf_ge(&n1)) + " " + int_to_str(uhalf_ge(&n2)));
+    println("small " + int_to_str(small_gt(&n1)) + " " + int_to_str(small_gt(&n2)));
+    println("word " + int_to_str(word_gt(&n1)) + " " + int_to_str(word_gt(&n2)));
+    println("flag " + int_to_str(flag_val(&n1)) + " " + int_to_str(flag_val(&n2)));
+    var m1: Rec = rec_new(1001, 4);
+    println("setcc " + tf(more_than(&m1)) + " " + tf(more_than(&r)));
+    println("eqx " + tf(same_b(&m1, 4)) + " " + tf(same_b(&m1, 5)));
+    var st: Rec = rec_new(6, 0);
+    val sv: i64 = after_store(&mut st);
+    println("store " + int_to_str(sv + st.a));
+    var tw: Rec = rec_new(25, 0);
+    println("twice " + int_to_str(twice(&tw, 10)));
+    var c: Rec = rec_new(10, 100);
+    bump(&mut c, 5);
+    bump5(&mut c);
+    val a1: i64 = c.a;
+    val b1: i64 = c.b;
+    take(&mut c, 93);
+    val b2: i64 = c.b;
+    var c2: Rec = rec_new(4090, 0);
+    set_bits(&mut c2, 3);
+    val a2: i64 = c2.a;
+    var c3: Rec = rec_new(0, 0);
+    flip(&mut c3);
+    val a3: i64 = c3.a;
+    var c4: Rec = rec_new(65535, 0);
+    keep_mid(&mut c4);
+    val a4: i64 = c4.a;
+    var c5: Rec = rec_new(15, 6);
+    bump_big(&mut c5);
+    mix_in(&mut c5, 3);
+    println("rmw " + int_to_str(a1) + " " + int_to_str(b1) + " " + int_to_str(b2) + " " + int_to_str(a2) + " " + int_to_str(a3) + " " + int_to_str(a4) + " " + int_to_str(c5.a) + " " + int_to_str(c5.b));
+    var c6: Rec = rec_new(0, 100);
+    sub_right(&mut c6, 10);
+    println("sub_right " + int_to_str(c6.b));
+    var c7: Rec = rec_new(10, 0);
+    println("rmw_ret " + int_to_str(bump_ret(&mut c7, 20)));
+    var e: Rec = rec_new(305420023, 6442450949);
+    e.small = 305430529;
+    e.uhalf = 506;
+    println("ldext " + int_to_str(low8(&e)) + " " + int_to_str(low8s(&e)) + " " + int_to_str(small16(&e)) + " " + int_to_str(low32u(&e)) + " " + int_to_str(low32s(&e)) + " " + int_to_str(byte_signed(&e)));
+    var e2: Rec = rec_new(0, 6442450945);
+    println("ldext_twice " + int_to_str(ld_twice(&e2)));
+    var e3: Rec = rec_new(261, 0);
+    val l3: i64 = ld_store(&mut e3);
+    println("ldext_store " + int_to_str(l3 + e3.a));
+    var v: Vec<i64> = Vec::new();
+    v.push(1023);
+    v.push(0 - 128);
+    println("vlow " + int_to_str(vlow(&v, 0)) + " " + int_to_str(vlow(&v, 1)));
+}

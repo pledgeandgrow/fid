@@ -1,0 +1,493 @@
+// Fides microgrid dispatch and islanding control
+//
+// Pure computation; the seam is the caller, which supplies forecasts and
+// measurements (load, PV, prices, grid voltage and frequency) and applies
+// the set-points and breaker commands this module returns.
+// - Components: dispatchable generators (minimum and maximum output, energy
+//   cost), one battery (capacity, charge/discharge power limits and
+//   efficiencies, SoC window, initial SoC), load and PV profiles, grid
+//   import/export prices and limits, a value of lost load (VOLL) and, per
+//   step, whether the grid is available.
+// - Rule-based dispatch, step by step: PV serves the load; a surplus charges
+//   the battery, then is exported, then curtailed; a deficit is met by the
+//   battery, then the generators in merit order (cheapest first, at least
+//   their minimum output once started), then grid import; what is left is
+//   unserved.
+// - Optimal dispatch as a linear program solved with stdlib `lp_solver`:
+//   per step generator outputs, charge, discharge, import, export,
+//   curtailment, unserved load and the stored energy; power balance and
+//   storage dynamics E_t = E_(t-1) + eta_c c_t dt - d_t dt / eta_d as
+//   equalities; every limit as a bound row; the final stored energy at
+//   least the initial one. Minimises generation, import and unserved-load
+//   cost minus export revenue. Generator minimum outputs are not modelled
+//   in the LP (that needs unit commitment).
+// - An islanding state machine for the point of common coupling after
+//   IEEE 1547: trip to island when grid voltage or frequency leaves its
+//   band for longer than the trip delay (or on command), wait for the grid
+//   to be back in band for the reconnection delay, then reconnect only when
+//   the voltage, frequency and phase differences across the breaker are
+//   within the synchronisation limits (1547 Table 5 for <= 500 kVA: 10 %,
+//   0.3 Hz, 20 deg).
+
+module microgrid;
+use math;
+use vec;
+use lp_solver;
+
+pub struct MgGenerator {
+    pub name: str,
+    pub pmin: f64,
+    pub pmax: f64,
+    pub cost: f64,
+}
+
+pub struct MgStorage {
+    pub capacity_kwh: f64,
+    pub p_charge_max: f64,
+    pub p_discharge_max: f64,
+    pub eta_charge: f64,
+    pub eta_discharge: f64,
+    pub soc_min: f64,
+    pub soc_max: f64,
+    pub soc_init: f64,
+}
+
+pub struct Microgrid {
+    pub gens: Vec<MgGenerator>,
+    pub storage: MgStorage,
+    pub load: Vec<f64>,
+    pub pv: Vec<f64>,
+    pub import_price: Vec<f64>,
+    pub export_price: Vec<f64>,
+    pub grid_up: Vec<bool>,
+    pub import_limit: f64,
+    pub export_limit: f64,
+    pub voll: f64,
+    pub dt: f64,
+}
+
+/// A schedule: per step values (gen is step-major: gen[t * G + i]); `soc`
+/// is the stored energy (kWh) at the end of each step.
+pub struct MgDispatch {
+    pub feasible: bool,
+    pub gen: Vec<f64>,
+    pub charge: Vec<f64>,
+    pub discharge: Vec<f64>,
+    pub import: Vec<f64>,
+    pub export: Vec<f64>,
+    pub curtail: Vec<f64>,
+    pub shed: Vec<f64>,
+    pub soc: Vec<f64>,
+    pub cost: f64,
+}
+
+pub fn mg_new(storage: MgStorage, dt: f64, import_limit: f64, export_limit: f64, voll: f64) -> Microgrid {
+    return Microgrid {
+        gens: Vec::new(), storage: storage, load: Vec::new(), pv: Vec::new(), import_price: Vec::new(), export_price: Vec::new(), grid_up: Vec::new(), import_limit: import_limit, export_limit: export_limit, voll: voll, dt: dt
+    };
+}
+
+pub fn mg_add_generator(m: &mut Microgrid, name: str, pmin: f64, pmax: f64, cost: f64) {
+    m.gens.push(MgGenerator {
+        name: name, pmin: pmin, pmax: pmax, cost: cost
+    });
+}
+
+/// Append one step of forecasts.
+pub fn mg_add_step(m: &mut Microgrid, load: f64, pv: f64, import_price: f64, export_price: f64, grid_up: bool) {
+    m.load.push(load);
+    m.pv.push(pv);
+    m.import_price.push(import_price);
+    m.export_price.push(export_price);
+    m.grid_up.push(grid_up);
+}
+
+fn mg_empty(feasible: bool) -> MgDispatch {
+    return MgDispatch {
+        feasible: feasible, gen: Vec::new(), charge: Vec::new(), discharge: Vec::new(), import: Vec::new(), export: Vec::new(), curtail: Vec::new(), shed: Vec::new(), soc: Vec::new(), cost: 0.0
+    };
+}
+
+/// Cost of a schedule: generation + import + VOLL x unserved - export.
+pub fn mg_cost(m: &Microgrid, d: &MgDispatch) -> f64 {
+    val ng: i64 = m.gens.len();
+    var c: f64 = 0.0;
+    var t: i64 = 0;
+    while t < m.load.len() {
+        var i: i64 = 0;
+        while i < ng {
+            c = c + m.gens.get(i).cost * d.gen.get(t * ng + i) * m.dt;
+            i = i + 1;
+        }
+        c = c + (m.import_price.get(t) * d.import.get(t) - m.export_price.get(t) * d.export.get(t) + m.voll * d.shed.get(t)) * m.dt;
+        t = t + 1;
+    }
+    return c;
+}
+
+/// Largest power-balance error of a schedule (should be ~0).
+pub fn mg_balance_error(m: &Microgrid, d: &MgDispatch) -> f64 {
+    val ng: i64 = m.gens.len();
+    var worst: f64 = 0.0;
+    var t: i64 = 0;
+    while t < m.load.len() {
+        var supply: f64 = m.pv.get(t) - d.curtail.get(t) + d.discharge.get(t) - d.charge.get(t) + d.import.get(t) - d.export.get(t) + d.shed.get(t);
+        var i: i64 = 0;
+        while i < ng {
+            supply = supply + d.gen.get(t * ng + i);
+            i = i + 1;
+        }
+        worst = math_max_f64(worst, math_fabs(supply - m.load.get(t)));
+        t = t + 1;
+    }
+    return worst;
+}
+
+// ─── Rule-based dispatch ───
+
+pub fn mg_dispatch_rules(m: &Microgrid) -> MgDispatch {
+    val ng: i64 = m.gens.len();
+    val st: MgStorage = m.storage;
+    var d: MgDispatch = mg_empty(true);
+    // merit order
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < ng {
+        var at: i64 = order.len();
+        var k: i64 = 0;
+        while k < order.len() {
+            if m.gens.get(i).cost < m.gens.get(order.get(k)).cost {
+                at = k;
+                break;
+            }
+            k = k + 1;
+        }
+        order.insert(at, i);
+        i = i + 1;
+    }
+    var e: f64 = st.soc_init * st.capacity_kwh;
+    val e_min: f64 = st.soc_min * st.capacity_kwh;
+    val e_max: f64 = st.soc_max * st.capacity_kwh;
+    var t: i64 = 0;
+    while t < m.load.len() {
+        var g: Vec<f64> = Vec::new();
+        i = 0;
+        while i < ng {
+            g.push(0.0);
+            i = i + 1;
+        }
+        var ch: f64 = 0.0;
+        var dis: f64 = 0.0;
+        var imp: f64 = 0.0;
+        var ex: f64 = 0.0;
+        var curt: f64 = 0.0;
+        var shed: f64 = 0.0;
+        val up: bool = m.grid_up.get(t);
+        var net: f64 = m.load.get(t) - m.pv.get(t);
+        if net > 0.0 {
+            dis = math_min_f64(net, math_min_f64(st.p_discharge_max, math_max_f64(0.0, (e - e_min) * st.eta_discharge / m.dt)));
+            net = net - dis;
+            var k: i64 = 0;
+            while k < ng && net > 0.0 {
+                val gi: i64 = order.get(k);
+                val gen: MgGenerator = m.gens.get(gi);
+                var p: f64 = math_min_f64(net, gen.pmax);
+                if p < gen.pmin {
+                    p = gen.pmin;
+                }
+                g.set(gi, p);
+                net = net - p;
+                k = k + 1;
+            }
+            if net > 0.0 && up {
+                imp = math_min_f64(net, m.import_limit);
+                net = net - imp;
+            }
+            if net > 0.0 {
+                shed = net;
+                net = 0.0;
+            }
+        }
+        if net < 0.0 {
+            // surplus (from PV, or a generator held at its minimum)
+            var sur: f64 = 0.0 - net;
+            ch = math_min_f64(sur, math_min_f64(st.p_charge_max, math_max_f64(0.0, (e_max - e) / (st.eta_charge * m.dt))));
+            sur = sur - ch;
+            if up {
+                ex = math_min_f64(sur, m.export_limit);
+                sur = sur - ex;
+            }
+            curt = math_min_f64(sur, m.pv.get(t));
+            sur = sur - curt;
+            if sur > 0.0 {
+                // a generator minimum the system cannot absorb: back it off
+                var k: i64 = ng - 1;
+                while k >= 0 && sur > 0.0 {
+                    val gi: i64 = order.get(k);
+                    val cut: f64 = math_min_f64(sur, g.get(gi));
+                    g.set(gi, g.get(gi) - cut);
+                    sur = sur - cut;
+                    k = k - 1;
+                }
+            }
+        }
+        e = e + st.eta_charge * ch * m.dt - dis * m.dt / st.eta_discharge;
+        i = 0;
+        while i < ng {
+            d.gen.push(g.get(i));
+            i = i + 1;
+        }
+        d.charge.push(ch);
+        d.discharge.push(dis);
+        d.import.push(imp);
+        d.export.push(ex);
+        d.curtail.push(curt);
+        d.shed.push(shed);
+        d.soc.push(e);
+        t = t + 1;
+    }
+    d.cost = mg_cost(m, &d);
+    return d;
+}
+
+// ─── LP dispatch ───
+
+/// Optimal schedule by linear programming. `keep_energy` requires the
+/// stored energy at the end to be at least the initial energy.
+pub fn mg_dispatch_lp(m: &Microgrid, keep_energy: bool) -> MgDispatch {
+    val ng: i64 = m.gens.len();
+    val tn: i64 = m.load.len();
+    val st: MgStorage = m.storage;
+    // variables per step: gens, ch, dis, imp, exp, curt, shed, e
+    val nv: i64 = ng + 7;
+    val n: i64 = nv * tn;
+    var p = lp_new(n, false);
+    p.max_iter = 200000;
+    val e0: f64 = st.soc_init * st.capacity_kwh;
+    var t: i64 = 0;
+    while t < tn {
+        val b: i64 = t * nv;
+        var i: i64 = 0;
+        while i < ng {
+            val gen: MgGenerator = m.gens.get(i);
+            lp_set_objective(&mut p, b + i, gen.cost * m.dt);
+            lp_add_upper_bound(&mut p, b + i, gen.pmax);
+            i = i + 1;
+        }
+        val ch: i64 = b + ng;
+        val dis: i64 = ch + 1;
+        val imp: i64 = ch + 2;
+        val ex: i64 = ch + 3;
+        val curt: i64 = ch + 4;
+        val shed: i64 = ch + 5;
+        val e: i64 = ch + 6;
+        lp_set_objective(&mut p, imp, m.import_price.get(t) * m.dt);
+        lp_set_objective(&mut p, ex, 0.0 - m.export_price.get(t) * m.dt);
+        lp_set_objective(&mut p, shed, m.voll * m.dt);
+        lp_add_upper_bound(&mut p, ch, st.p_charge_max);
+        lp_add_upper_bound(&mut p, dis, st.p_discharge_max);
+        if m.grid_up.get(t) {
+            lp_add_upper_bound(&mut p, imp, m.import_limit);
+            lp_add_upper_bound(&mut p, ex, m.export_limit);
+        } else {
+            lp_add_upper_bound(&mut p, imp, 0.0);
+            lp_add_upper_bound(&mut p, ex, 0.0);
+        }
+        lp_add_upper_bound(&mut p, curt, m.pv.get(t));
+        lp_add_upper_bound(&mut p, shed, m.load.get(t));
+        lp_add_upper_bound(&mut p, e, st.soc_max * st.capacity_kwh);
+        var idx: Vec<i64> = Vec::new();
+        var val_: Vec<f64> = Vec::new();
+        idx.push(e);
+        val_.push(1.0);
+        lp_add_sparse(&mut p, idx, val_, LP_GE, st.soc_min * st.capacity_kwh);
+        // balance: sum g + dis - ch + imp - exp - curt + shed = load - pv
+        var bi: Vec<i64> = Vec::new();
+        var bv: Vec<f64> = Vec::new();
+        i = 0;
+        while i < ng {
+            bi.push(b + i);
+            bv.push(1.0);
+            i = i + 1;
+        }
+        bi.push(dis);
+        bv.push(1.0);
+        bi.push(ch);
+        bv.push(-1.0);
+        bi.push(imp);
+        bv.push(1.0);
+        bi.push(ex);
+        bv.push(-1.0);
+        bi.push(curt);
+        bv.push(-1.0);
+        bi.push(shed);
+        bv.push(1.0);
+        lp_add_sparse(&mut p, bi, bv, LP_EQ, m.load.get(t) - m.pv.get(t));
+        // storage: e_t - e_(t-1) - eta_c dt ch + dt/eta_d dis = 0
+        var si: Vec<i64> = Vec::new();
+        var sv: Vec<f64> = Vec::new();
+        si.push(e);
+        sv.push(1.0);
+        si.push(ch);
+        sv.push(0.0 - st.eta_charge * m.dt);
+        si.push(dis);
+        sv.push(m.dt / st.eta_discharge);
+        var rhs: f64 = e0;
+        if t > 0 {
+            si.push(e - nv);
+            sv.push(-1.0);
+            rhs = 0.0;
+        }
+        lp_add_sparse(&mut p, si, sv, LP_EQ, rhs);
+        t = t + 1;
+    }
+    if keep_energy && tn > 0 {
+        var fi: Vec<i64> = Vec::new();
+        var fv: Vec<f64> = Vec::new();
+        fi.push((tn - 1) * nv + ng + 6);
+        fv.push(1.0);
+        lp_add_sparse(&mut p, fi, fv, LP_GE, e0);
+    }
+    val r: LpResult = lp_solve(&p);
+    if r.status != LP_OPTIMAL {
+        return mg_empty(false);
+    }
+    var d: MgDispatch = mg_empty(true);
+    t = 0;
+    while t < tn {
+        val b: i64 = t * nv;
+        var i: i64 = 0;
+        while i < ng {
+            d.gen.push(r.x.get(b + i));
+            i = i + 1;
+        }
+        d.charge.push(r.x.get(b + ng));
+        d.discharge.push(r.x.get(b + ng + 1));
+        d.import.push(r.x.get(b + ng + 2));
+        d.export.push(r.x.get(b + ng + 3));
+        d.curtail.push(r.x.get(b + ng + 4));
+        d.shed.push(r.x.get(b + ng + 5));
+        d.soc.push(r.x.get(b + ng + 6));
+        t = t + 1;
+    }
+    d.cost = r.objective;
+    return d;
+}
+
+// ─── Islanding state machine ───
+
+pub const MG_CONNECTED: i64 = 0;
+pub const MG_ISLANDED: i64 = 1;
+pub const MG_RESYNC: i64 = 2;
+
+pub struct IslandLimits {
+    pub v_min: f64,
+    pub v_max: f64,
+    pub f_min: f64,
+    pub f_max: f64,
+    pub trip_delay: f64,
+    pub reconnect_delay: f64,
+    pub sync_dv: f64,
+    pub sync_df: f64,
+    pub sync_dphase: f64,
+}
+
+/// Limits of IEEE 1547: 0.88..1.10 pu, 59.3..60.5 Hz (60 Hz systems),
+/// a 0.16 s trip delay, 300 s in band before reconnecting, and the
+/// synchronisation limits for units up to 500 kVA.
+pub fn mg_island_limits_1547() -> IslandLimits {
+    return IslandLimits {
+        v_min: 0.88, v_max: 1.10, f_min: 59.3, f_max: 60.5, trip_delay: 0.16, reconnect_delay: 300.0, sync_dv: 0.10, sync_df: 0.3, sync_dphase: 20.0
+    };
+}
+
+pub struct IslandController {
+    pub state: i64,
+    pub limits: IslandLimits,
+    pub abnormal_for: f64,
+    pub normal_for: f64,
+    pub breaker_closed: bool,
+    pub hold_island: bool,
+    pub events: Vec<str>,
+    pub time: f64,
+}
+
+pub fn mg_island_controller(limits: IslandLimits) -> IslandController {
+    return IslandController {
+        state: MG_CONNECTED, limits: limits, abnormal_for: 0.0, normal_for: 0.0, breaker_closed: true, hold_island: false, events: Vec::new(), time: 0.0
+    };
+}
+
+pub fn mg_state_name(s: i64) -> str {
+    if s == MG_CONNECTED {
+        return "connected";
+    }
+    if s == MG_ISLANDED {
+        return "islanded";
+    }
+    return "resync";
+}
+
+fn mg_event(c: &mut IslandController, what: str) {
+    c.events.push("t=" + int_to_str(math_floor(c.time * 1000.0 + 0.5) as i64) + "ms " + what);
+}
+
+/// Intentional islanding (true) or release of the hold (false).
+pub fn IslandController_command(c: &mut IslandController, island: bool) {
+    c.hold_island = island;
+    if island && c.state != MG_ISLANDED {
+        c.state = MG_ISLANDED;
+        c.breaker_closed = false;
+        c.normal_for = 0.0;
+        mg_event(c, "open PCC (command)");
+    }
+}
+
+/// Advance by dt seconds with the grid-side voltage (pu) and frequency
+/// (Hz), and the voltage difference (pu), frequency difference (Hz) and
+/// phase difference (degrees) across the open breaker. Returns the state.
+pub fn IslandController_step(c: &mut IslandController, dt: f64, grid_v: f64, grid_f: f64, dv: f64, df: f64, dphase: f64) -> i64 {
+    c.time = c.time + dt;
+    val lim: IslandLimits = c.limits;
+    val in_band: bool = grid_v >= lim.v_min && grid_v <= lim.v_max && grid_f >= lim.f_min && grid_f <= lim.f_max;
+    if c.state == MG_CONNECTED {
+        if in_band {
+            c.abnormal_for = 0.0;
+        } else {
+            c.abnormal_for = c.abnormal_for + dt;
+            if c.abnormal_for >= lim.trip_delay {
+                c.state = MG_ISLANDED;
+                c.breaker_closed = false;
+                c.normal_for = 0.0;
+                mg_event(c, "open PCC (grid out of band)");
+            }
+        }
+        return c.state;
+    }
+    if c.state == MG_ISLANDED {
+        if in_band && !c.hold_island {
+            c.normal_for = c.normal_for + dt;
+            if c.normal_for >= lim.reconnect_delay {
+                c.state = MG_RESYNC;
+                mg_event(c, "grid stable, synchronising");
+            }
+        } else {
+            c.normal_for = 0.0;
+        }
+        return c.state;
+    }
+    // resynchronising
+    if !in_band || c.hold_island {
+        c.state = MG_ISLANDED;
+        c.normal_for = 0.0;
+        mg_event(c, "grid lost during resync");
+        return c.state;
+    }
+    if math_fabs(dv) <= lim.sync_dv && math_fabs(df) <= lim.sync_df && math_fabs(dphase) <= lim.sync_dphase {
+        c.state = MG_CONNECTED;
+        c.breaker_closed = true;
+        c.abnormal_for = 0.0;
+        mg_event(c, "close PCC (in sync)");
+    }
+    return c.state;
+}

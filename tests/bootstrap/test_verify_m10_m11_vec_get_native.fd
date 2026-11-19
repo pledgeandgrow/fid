@@ -1,0 +1,37 @@
+// Miscompiles M10 and M11 (docs/verification/miscompile-log.md), both on
+// `fid emit`, for a program that indexes a Vec and has no dynamic dispatch:
+//   M10: dead-function elimination (compiler/ir.fd) kept callees by the
+//        literal Call target only; the native backends call the resolved
+//        name (`p_vec_get` -> `Vec_get`), so `Vec_get` was dropped and the
+//        build failed ("not available in native Windows executables").
+//   M11: env trimming (iro_env_trim, WP7) removed the unused `__env`
+//        parameter of the `Vec_get` stand-in, while the backend still
+//        passes a null env first: `v` became 0 and the binary panicked
+//        "Invalid memory access".
+// Nothing else in the program may keep `Vec_get` alive by accident: no
+// traits, no closures, no `dyn`.
+//
+// Expected output:
+// 20
+// 30
+// 7
+// 21
+
+fn main() -> i64 {
+    var v = Vec::new();
+    v.push(10);
+    v.push(20);
+    println(int_to_str(v[1]));
+    v.push(30);
+    println(int_to_str(v.get(2)));
+    var f: Vec<i64> = Vec::filled(3, 7);
+    println(int_to_str(f[2]));
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < f.len() {
+        t = t + f[i];
+        i = i + 1;
+    }
+    println(int_to_str(t));
+    return 0;
+}

@@ -1,0 +1,80 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), the machine layer's allocator
+// (compiler/nat_ir.fd ng_mir_alloc / ng_mir_emit):
+//   RA8  a spilled value defined once by a constant, the address of a
+//        global (a string literal) or the address of a frame slot (a local
+//        whose address is taken) is computed again where it is used, not
+//        stored and reloaded (FID_NAT_OFF=remat: the old way)
+//   RA13 callee-saved registers saved and restored two at a time with
+//        stp/ldp on AArch64 (FID_NAT_OFF=pairs: one at a time)
+// More values live across calls than there are registers, so some spill;
+// the recursion keeps several values in callee-saved registers across each
+// call, so every restore must give back the caller's values.
+// Native check: NATIVE=1 bash scripts/cross-test.sh aarch64-linux
+//   tests/bootstrap/test_machine_remat.fd (and with FID_VERIFY=1).
+// Expected output:
+// 45
+// 170
+// 890
+// 630
+// alphabegamma!
+// 4124
+// 102
+// 1177
+
+fn mix(a: i64, b: i64) -> i64 {
+    return a * 3 + b;
+}
+
+fn add_to(x: &mut i64, n: i64) {
+    *x += n;
+}
+
+// D(n, a, b) = D(n - 1, a + 1, b + 2) + 4a + 3b + 5n, D(0, a, b) = a + b
+fn deep(n: i64, a: i64, b: i64) -> i64 {
+    if n == 0 {
+        return a + b;
+    }
+    val x1: i64 = a + 1;
+    val x2: i64 = b + 2;
+    val x3: i64 = a * 2;
+    val x4: i64 = b * 3;
+    val x5: i64 = a + b;
+    val x6: i64 = a - b;
+    val x7: i64 = n * 5;
+    val r: i64 = deep(n - 1, x1, x2);
+    return r + x3 + x4 + x5 + x6 + x7;
+}
+
+fn main() -> i64 {
+    // String literals (global addresses), counters whose addresses are
+    // taken (frame-slot addresses) and constants, all live across calls
+    val s1: str = "alpha";
+    val s2: str = "be";
+    val s3: str = "gamma!";
+    var c1: i64 = 0;
+    var c2: i64 = 100;
+    var c3: i64 = 1000;
+    val k1: i64 = 7;
+    val k2: i64 = 11;
+    val k3: i64 = 13;
+    val k4: i64 = 4096;
+    val k5: i64 = 0 - 3;
+    var acc: i64 = 0;
+    var n: i64 = 0;
+    while n < 10 {
+        add_to(&mut c1, n);
+        add_to(&mut c2, k1);
+        add_to(&mut c3, 0 - k2);
+        acc = acc + mix(str_len(s1), str_len(s2)) + mix(k3, k5) + str_len(s3) + k4 / 1024;
+        n = n + 1;
+    }
+    println(c1);
+    println(c2);
+    println(c3);
+    println(acc);
+    println(s1 + s2 + s3);
+    println(k1 + k2 + k3 + k4 + k5);
+    println(deep(3, 1, 2));
+    println(deep(10, 5, 7));
+    return 0;
+}

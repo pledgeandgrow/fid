@@ -1,0 +1,157 @@
+// stdlib/iap: prices per currency exponent, ISO 8601 periods and calendar
+// arithmetic (dates checked against Python's datetime), RFC 3339 parsing,
+// the purchase state machine (consumable rebuy, non-consumable refusal,
+// Ask to Buy, refunds, the Play acknowledgement window), the App Store
+// Server API token and a JWS transaction (built with Python's base64;
+// the signature check is a seam), subscription status, notifications,
+// legacy receipts and the Google Play resources.
+// Expected output:
+// prices 4.99 USD 500 JPY 1.250 KWD 1.00 USD -1.99 EUR
+// periods 0,1,0 1,2,10 0,0,14 bad 0 0 0
+// add month 1709200800000 year 1738317600000 week 1707300000000
+// civil 0 11017 2024-1-1
+// rfc3339 1714564800123 1714557600000 -1
+// consumable idle>purchasing>purchased>verified>delivered>finished>purchasing
+// non-consumable rebuy false refused 1
+// ask to buy purchasing>pending>purchased refund after finish refunded
+// illegal deliver false state purchasing
+// ack overdue false true
+// token input eyJhbGciOiJFUzI1NiIsImtpZCI6IjJYOVI0SFhGMzQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiI1NzI0NjU0Mi05NmZlLTFhNjMtZTA1My0wODI0ZDAxMTA3MmEiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMzYwMCwiYXVkIjoiYXBwc3RvcmVjb25uZWN0LXYxIiwiYmlkIjoiY29tLmV4YW1wbGUudGVzdGJ1bmRsZWlkIn0
+// token parts 3
+// jws ok true verified true alg "ES256"
+// transaction 2000000123 2000000100 pro.monthly kind 2 1706695200000 1709200800000 Sandbox PURCHASED ok true
+// status active expired grace-period billing-retry revoked entitled true false
+// notification DID_RENEW Sandbox x.y.z event 2 refund 9
+// receipt sandbox receipt: retry in sandbox entries 1 a 2000
+// play https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.ex/purchases/products/coins/tokens/tok:acknowledge
+// play sub https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.ex/purchases/subscriptionsv2/tokens/tok
+// play product GPA.1234 purchased finished pending 1714564800123
+// play sub status active expired grace-period
+// play local true true opaque-token-abcdefghijklmnop coins_100 false; token valid true false
+// urls https://api.storekit-sandbox.itunes.apple.com/inApps/v1/transactions/1 https://api.storekit.itunes.apple.com/inApps/v2/history/1?revision=r%201
+use iap;
+use json;
+use vec;
+use string;
+
+fn zero_sign(input: Vec<i64>) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 { v.push(0); i = i + 1; }
+    return v;
+}
+
+fn verify_len(h: str, p: str, sig: Vec<i64>) -> bool { return sig.len() == 64; }
+fn verify_play(json: str, sig: str) -> bool { return sig == "c2ln"; }
+
+fn period(p: str) -> str {
+    val v: Vec<i64> = iap_parse_period(p);
+    if v.len() == 0 { return "0"; }
+    return int_to_str(v.get(0)) + "," + int_to_str(v.get(1)) + "," + int_to_str(v.get(2));
+}
+
+fn hist(p: &IapPurchase) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < p.history.len() {
+        if i > 0 { s = s + ">"; }
+        s = s + iap_state_name(p.history.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn prod(id: str, kind: i64) -> IapProduct {
+    return IapProduct { id: id, kind: kind, price_micros: 990000, currency: "USD", period: "", intro_period: "" };
+}
+
+fn main() {
+    println("prices " + iap_format_price(4990000, "USD") + " " + iap_format_price(500000000, "JPY") + " "
+        + iap_format_price(1250000, "KWD") + " " + iap_format_price(999999, "USD") + " " + iap_format_price(-1990000, "EUR"));
+    println("periods " + period("P1M") + " " + period("P1Y2M10D") + " " + period("P2W") + " bad " + period("1M") + " " + period("PM") + " " + period("P1"));
+    val jan31: i64 = 1706695200000;
+    println("add month " + int_to_str(iap_add_period(jan31, "P1M")) + " year " + int_to_str(iap_add_period(jan31, "P1Y"))
+        + " week " + int_to_str(iap_add_period(jan31, "P1W")));
+    val c: Vec<i64> = iap_civil_from_days(19723);
+    println("civil " + int_to_str(iap_days_from_civil(1970, 1, 1)) + " " + int_to_str(iap_days_from_civil(2000, 3, 1)) + " "
+        + int_to_str(c.get(0)) + "-" + int_to_str(c.get(1)) + "-" + int_to_str(c.get(2)));
+    println("rfc3339 " + int_to_str(iap_parse_rfc3339("2024-05-01T12:00:00.123Z")) + " "
+        + int_to_str(iap_parse_rfc3339("2024-05-01T12:00:00+02:00")) + " " + int_to_str(iap_parse_rfc3339("2024-13-01T00:00:00Z")));
+
+    var p: IapPurchase = iap_purchase_new(prod("coins", IAP_CONSUMABLE));
+    iap_purchase_event(&mut p, IAP_EV_BUY, 0);
+    iap_purchase_event(&mut p, IAP_EV_STORE_OK, 1000);
+    iap_purchase_event(&mut p, IAP_EV_VERIFY_OK, 1100);
+    iap_purchase_event(&mut p, IAP_EV_DELIVER, 1200);
+    iap_purchase_event(&mut p, IAP_EV_FINISH, 1300);
+    iap_purchase_event(&mut p, IAP_EV_BUY, 2000);
+    println("consumable " + hist(&p));
+    var nc: IapPurchase = iap_purchase_new(prod("pro", IAP_NON_CONSUMABLE));
+    iap_purchase_event(&mut nc, IAP_EV_BUY, 0);
+    iap_purchase_event(&mut nc, IAP_EV_STORE_OK, 1);
+    iap_purchase_event(&mut nc, IAP_EV_VERIFY_OK, 2);
+    iap_purchase_event(&mut nc, IAP_EV_DELIVER, 3);
+    iap_purchase_event(&mut nc, IAP_EV_FINISH, 4);
+    val rebuy: bool = iap_purchase_event(&mut nc, IAP_EV_BUY, 5);
+    println("non-consumable rebuy " + bool_to_str(rebuy) + " refused " + int_to_str(nc.refused));
+    var ask: IapPurchase = iap_purchase_new(prod("pro", IAP_NON_CONSUMABLE));
+    iap_purchase_event(&mut ask, IAP_EV_BUY, 0);
+    iap_purchase_event(&mut ask, IAP_EV_DEFERRED, 0);
+    iap_purchase_event(&mut ask, IAP_EV_STORE_OK, 5000);
+    val ask_h: str = hist(&ask);
+    iap_purchase_event(&mut ask, IAP_EV_VERIFY_OK, 5001);
+    iap_purchase_event(&mut ask, IAP_EV_DELIVER, 5002);
+    iap_purchase_event(&mut ask, IAP_EV_FINISH, 5003);
+    iap_purchase_event(&mut ask, IAP_EV_REFUND, 9000);
+    println("ask to buy " + str_slice(ask_h, 5, str_len(ask_h)) + " refund after finish " + iap_state_name(ask.state));
+    var il: IapPurchase = iap_purchase_new(prod("x", IAP_CONSUMABLE));
+    iap_purchase_event(&mut il, IAP_EV_BUY, 0);
+    println("illegal deliver " + bool_to_str(iap_purchase_event(&mut il, IAP_EV_DELIVER, 1)) + " state " + iap_state_name(il.state));
+    var ak: IapPurchase = iap_purchase_new(prod("x", IAP_CONSUMABLE));
+    iap_purchase_event(&mut ak, IAP_EV_BUY, 0);
+    iap_purchase_event(&mut ak, IAP_EV_STORE_OK, 1000);
+    println("ack overdue " + bool_to_str(iap_play_ack_overdue(&ak, 1000 + IAP_PLAY_ACK_WINDOW_MS))
+        + " " + bool_to_str(iap_play_ack_overdue(&ak, 1001 + IAP_PLAY_ACK_WINDOW_MS)));
+
+    println("token input " + iap_api_token_input("2X9R4HXF34", "57246542-96fe-1a63-e053-0824d011072a", "com.example.testbundleid", 1700000000, 3600));
+    println("token parts " + int_to_str(str_split(iap_api_token("2X9R4HXF34", "i", "b", 1, zero_sign), ".").len()));
+    val jws: str = "eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlCIl19.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMDEyMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDAxMDAiLCJwcm9kdWN0SWQiOiJwcm8ubW9udGhseSIsImJ1bmRsZUlkIjoiY29tLmV4YW1wbGUiLCJ0eXBlIjoiQXV0by1SZW5ld2FibGUgU3Vic2NyaXB0aW9uIiwicHVyY2hhc2VEYXRlIjoxNzA2Njk1MjAwMDAwLCJleHBpcmVzRGF0ZSI6MTcwOTIwMDgwMDAwMCwicXVhbnRpdHkiOjEsImVudmlyb25tZW50IjoiU2FuZGJveCIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCJ9.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    val d: IapJws = iap_jws_decode(jws, verify_len);
+    println("jws ok " + bool_to_str(d.ok) + " verified " + bool_to_str(d.verified) + " alg " + json_get_safe(d.header, "alg"));
+    val t: IapTransaction = iap_appstore_transaction(d.payload);
+    println("transaction " + t.transaction_id + " " + t.original_id + " " + t.product_id + " kind " + int_to_str(t.kind) + " "
+        + int_to_str(t.purchase_ms) + " " + int_to_str(t.expires_ms) + " " + t.environment + " " + t.ownership + " ok " + bool_to_str(t.ok));
+    val e: i64 = t.expires_ms;
+    val grace: i64 = e + 16 * 86400000;
+    var rv: IapTransaction = t;
+    rv.revocation_ms = e - 10;
+    println("status " + iap_sub_status_name(iap_subscription_status(&t, e - 1, false, -1)) + " "
+        + iap_sub_status_name(iap_subscription_status(&t, e + 1, false, -1)) + " "
+        + iap_sub_status_name(iap_subscription_status(&t, e + 1, true, grace)) + " "
+        + iap_sub_status_name(iap_subscription_status(&t, grace + 1, true, grace)) + " "
+        + iap_sub_status_name(iap_subscription_status(&rv, e - 1, false, -1))
+        + " entitled " + bool_to_str(iap_entitled(IAP_SUB_GRACE_PERIOD)) + " " + bool_to_str(iap_entitled(IAP_SUB_BILLING_RETRY)));
+    val n: IapNotification = iap_appstore_notification("{\"notificationType\":\"DID_RENEW\",\"notificationUUID\":\"abc\",\"data\":{\"environment\":\"Sandbox\",\"signedTransactionInfo\":\"x.y.z\"}}");
+    println("notification " + n.kind + " " + n.environment + " " + n.signed_transaction + " event " + int_to_str(iap_notification_event(n.kind))
+        + " refund " + int_to_str(iap_notification_event("REFUND")));
+    val rt: Vec<IapTransaction> = iap_receipt_transactions("{\"status\":0,\"latest_receipt_info\":[{\"product_id\":\"a\",\"transaction_id\":\"1\",\"original_transaction_id\":\"1\",\"purchase_date_ms\":\"1000\",\"expires_date_ms\":\"2000\"}]}");
+    println("receipt " + iap_receipt_status(21007) + " entries " + int_to_str(rt.len()) + " " + rt.get(0).product_id + " " + int_to_str(rt.get(0).expires_ms));
+
+    println("play " + iap_play_acknowledge_url("com.ex", "coins", "tok"));
+    println("play sub " + iap_play_subscription_url("com.ex", "tok"));
+    val pp: IapPlayProduct = iap_play_product("{\"purchaseTimeMillis\":\"1714564800123\",\"purchaseState\":0,\"consumptionState\":0,\"orderId\":\"GPA.1234\",\"acknowledgementState\":0}");
+    var pa: IapPlayProduct = pp;
+    pa.acknowledged = true;
+    var pe: IapPlayProduct = pp;
+    pe.purchase_state = 2;
+    println("play product " + pp.order_id + " " + iap_state_name(iap_play_product_state(&pp)) + " " + iap_state_name(iap_play_product_state(&pa))
+        + " " + iap_state_name(iap_play_product_state(&pe)) + " " + int_to_str(pp.purchase_ms));
+    val sub: str = "{\"subscriptionState\":\"SUBSCRIPTION_STATE_CANCELED\",\"lineItems\":[{\"productId\":\"pro\",\"expiryTime\":\"2024-05-01T12:00:00.123Z\"}]}";
+    println("play sub status " + iap_sub_status_name(iap_play_subscription_status(sub, 1714564800000)) + " "
+        + iap_sub_status_name(iap_play_subscription_status(sub, 1714564800200)) + " "
+        + iap_sub_status_name(iap_play_subscription_status("{\"subscriptionState\":\"SUBSCRIPTION_STATE_IN_GRACE_PERIOD\"}", 0)));
+    val loc: IapPlayLocal = iap_play_local("{\"orderId\":\"GPA.1\",\"packageName\":\"com.ex\",\"productId\":\"coins_100\",\"purchaseTime\":1,\"purchaseState\":0,\"purchaseToken\":\"opaque-token-abcdefghijklmnop\",\"acknowledged\":false}", "c2ln", verify_play);
+    println("play local " + bool_to_str(loc.ok) + " " + bool_to_str(loc.verified) + " " + loc.token + " " + loc.product_id + " "
+        + bool_to_str(loc.acknowledged) + "; token valid " + bool_to_str(iap_play_token_valid(loc.token)) + " " + bool_to_str(iap_play_token_valid("short")));
+    println("urls " + iap_appstore_transaction_url(true, "1") + " " + iap_appstore_history_url(false, "1", "r 1"));
+}

@@ -19,6 +19,18 @@
 module sync;
 /// Allocate a shared atomic i64 slot, initialized to 0.
 /// Returns an address that can be used with atomic operations.
+///
+/// Example:
+///   val a = sync_atomic_alloc(5);
+///   assert_eq(sync_atomic_add(a, 2), 5);
+///   assert_eq(sync_atomic_load(a), 7);
+///   assert(sync_atomic_cas(a, 7, 9));
+///   assert(!sync_atomic_cas(a, 7, 1));
+///   sync_atomic_store(a, 0);
+///   assert_eq(sync_atomic_load(a), 0);
+///   val m = sync_mutex_create();
+///   sync_mutex_lock(m);
+///   sync_mutex_unlock(m);
 pub fn sync_atomic_alloc(initial: i64) -> i64 {
     var addr = p_shared_alloc(8);
     p_atomic_store(addr, initial);
@@ -106,6 +118,8 @@ pub fn sync_rwlock_create() -> i64 {
     // and use a separate allocation for reader count.
     // For simplicity, we return a struct pointer: [lock, reader_count]
     var handle = p_shared_alloc(16);
+    // SAFETY: writes the two words of the 16-byte block p_shared_alloc just
+    // returned.
     unsafe {
         var lock_ptr: * mut i64 = handle;
         * lock_ptr = lock;
@@ -119,6 +133,10 @@ pub fn sync_rwlock_create() -> i64 {
 pub fn sync_rwlock_read_lock(rwlock: i64) -> void {
     var lock_ptr: * mut i64 = rwlock;
     var rc_ptr: * mut i64 = rwlock + 8;
+    // SAFETY: rwlock must be a handle from sync_rwlock_create (a 16-byte
+    // block: the mutex, then the reader-count word). The i64 API cannot
+    // catch a forged handle; SyncRwLock (below) keeps it private, so its
+    // callers can only pass one sync_rwlock_create made (release M10).
     unsafe {
         p_mutex_lock(* lock_ptr);
         // Atomically increment reader count. p_atomic_add returns the OLD value.
@@ -135,6 +153,8 @@ pub fn sync_rwlock_read_lock(rwlock: i64) -> void {
 pub fn sync_rwlock_read_unlock(rwlock: i64) -> void {
     var lock_ptr: * mut i64 = rwlock;
     var rc_ptr: * mut i64 = rwlock + 8;
+    // SAFETY: as in sync_rwlock_read_lock: words 0 and 1 of a
+    // sync_rwlock_create block.
     unsafe {
         // Atomically decrement reader count. If old value was 1, we're the
         // last reader — release the lock so writers can acquire it.
@@ -148,6 +168,7 @@ pub fn sync_rwlock_read_unlock(rwlock: i64) -> void {
 /// Acquire a write lock (exclusive — no other readers or writers).
 pub fn sync_rwlock_write_lock(rwlock: i64) -> void {
     var lock_ptr: * mut i64 = rwlock;
+    // SAFETY: word 0 of a sync_rwlock_create block (the mutex).
     unsafe {
         p_mutex_lock(* lock_ptr);
     }
@@ -156,6 +177,7 @@ pub fn sync_rwlock_write_lock(rwlock: i64) -> void {
 /// Release a write lock.
 pub fn sync_rwlock_write_unlock(rwlock: i64) -> void {
     var lock_ptr: * mut i64 = rwlock;
+    // SAFETY: word 0 of a sync_rwlock_create block (the mutex).
     unsafe {
         p_mutex_unlock(* lock_ptr);
     }
@@ -285,4 +307,192 @@ pub fn with_read_lock(rwlock: i64, f: fn() -> i64) -> i64 {
         sync_rwlock_read_unlock(rwlock);
     }
     return f();
+}
+
+// ─── Typed handles (release M10) ────────────────────────────────────────
+//
+// The i64 functions above take handles that any integer can forge: a
+// mutex handle is the address of a pthread mutex, an rwlock handle the
+// address of its two words, an atomic slot the address of a word, a
+// channel handle the address of the channel. A made-up one makes them read
+// or write memory nobody owns. The types below keep the handle in a private
+// field: code outside this module gets one only from `new`, so every call
+// receives a handle this module made, and nothing else is needed to be
+// sound. Prefer them; the i64 API stays for existing code. (For atomics
+// with memory orders, stdlib/atomic.fd's Atomic is the same idea.)
+//
+//   use sync;
+//   val m: SyncMutex = SyncMutex::new();
+//   m.lock(); ...; m.unlock();
+//   val total: i64 = m.locked(tally);
+//   val hits: SyncCounter = SyncCounter::new(0);
+//   hits.add(1);
+
+/// A mutex. Copies refer to the same lock, so it can be given to threads.
+@send pub struct SyncMutex {
+    handle: i64,
+}
+
+impl SyncMutex {
+    /// A new, unlocked mutex.
+    pub fn new() -> SyncMutex {
+        return SyncMutex {
+            handle: sync_mutex_create()
+        };
+    }
+
+    /// Lock it (blocks while another thread holds it).
+    pub fn lock(self: SyncMutex) -> void {
+        sync_mutex_lock(self.handle);
+    }
+
+    /// Unlock it.
+    pub fn unlock(self: SyncMutex) -> void {
+        sync_mutex_unlock(self.handle);
+    }
+
+    /// Lock, run `f`, unlock (also on the error and panic paths).
+    pub fn locked(self: SyncMutex, f: fn() -> i64) -> i64 {
+        return with_lock(self.handle, f);
+    }
+}
+
+/// A reader-writer lock: several readers or one writer.
+@send pub struct SyncRwLock {
+    handle: i64,
+}
+
+impl SyncRwLock {
+    /// A new, unlocked reader-writer lock.
+    pub fn new() -> SyncRwLock {
+        return SyncRwLock {
+            handle: sync_rwlock_create()
+        };
+    }
+
+    pub fn read_lock(self: SyncRwLock) -> void {
+        sync_rwlock_read_lock(self.handle);
+    }
+
+    pub fn read_unlock(self: SyncRwLock) -> void {
+        sync_rwlock_read_unlock(self.handle);
+    }
+
+    pub fn write_lock(self: SyncRwLock) -> void {
+        sync_rwlock_write_lock(self.handle);
+    }
+
+    pub fn write_unlock(self: SyncRwLock) -> void {
+        sync_rwlock_write_unlock(self.handle);
+    }
+
+    /// Hold the read lock while `f` runs.
+    pub fn with_read(self: SyncRwLock, f: fn() -> i64) -> i64 {
+        return with_read_lock(self.handle, f);
+    }
+
+    /// Hold the write lock while `f` runs.
+    pub fn with_write(self: SyncRwLock, f: fn() -> i64) -> i64 {
+        return with_write_lock(self.handle, f);
+    }
+}
+
+/// A shared 64-bit counter (one atomic word). Copies refer to the same word.
+@send pub struct SyncCounter {
+    addr: i64,
+}
+
+impl SyncCounter {
+    /// A new counter holding `initial`.
+    ///
+    /// Example:
+    ///   val c = SyncCounter::new(1);
+    ///   assert_eq(c.add(4), 1);
+    ///   assert_eq(c.load(), 5);
+    ///   assert(c.cas(5, 6));
+    ///   c.store(0);
+    ///   assert_eq(c.load(), 0);
+    pub fn new(initial: i64) -> SyncCounter {
+        return SyncCounter {
+            addr: sync_atomic_alloc(initial)
+        };
+    }
+
+    pub fn load(self: SyncCounter) -> i64 {
+        return sync_atomic_load(self.addr);
+    }
+
+    pub fn store(self: SyncCounter, value: i64) -> void {
+        sync_atomic_store(self.addr, value);
+    }
+
+    /// Add `value`; the value before the add.
+    pub fn add(self: SyncCounter, value: i64) -> i64 {
+        return sync_atomic_add(self.addr, value);
+    }
+
+    /// Set it to `new_val` if it holds `expected`: true when it did.
+    pub fn cas(self: SyncCounter, expected: i64, new_val: i64) -> bool {
+        return sync_atomic_cas(self.addr, expected, new_val);
+    }
+}
+
+/// A thread-local storage key: each thread sees its own value (0 unset).
+@send pub struct SyncTlsKey {
+    key: i64,
+}
+
+impl SyncTlsKey {
+    pub fn new() -> SyncTlsKey {
+        return SyncTlsKey {
+            key: sync_tls_create()
+        };
+    }
+
+    /// This thread's value.
+    pub fn get(self: SyncTlsKey) -> i64 {
+        return sync_tls_get(self.key);
+    }
+
+    /// Set this thread's value.
+    pub fn set(self: SyncTlsKey, value: i64) -> void {
+        sync_tls_set(self.key, value);
+    }
+}
+
+/// A bounded channel of i64 values.
+@send pub struct SyncChannel {
+    handle: i64,
+}
+
+impl SyncChannel {
+    /// A channel holding up to `capacity` values.
+    pub fn new(capacity: i64) -> SyncChannel {
+        return SyncChannel {
+            handle: sync_channel_create(capacity)
+        };
+    }
+
+    /// Send (blocks while full): false when the channel is closed.
+    pub fn send(self: SyncChannel, value: i64) -> bool {
+        return sync_channel_send(self.handle, value);
+    }
+
+    /// Receive (blocks while empty): SYNC_CHAN_PENDING once closed and empty.
+    pub fn recv(self: SyncChannel) -> i64 {
+        return sync_channel_recv(self.handle);
+    }
+
+    /// Receive without blocking: SYNC_CHAN_PENDING when empty.
+    pub fn try_recv(self: SyncChannel) -> i64 {
+        return sync_channel_try_recv(self.handle);
+    }
+
+    pub fn close(self: SyncChannel) -> void {
+        sync_channel_close(self.handle);
+    }
+
+    pub fn is_closed(self: SyncChannel) -> bool {
+        return sync_channel_is_closed(self.handle);
+    }
 }

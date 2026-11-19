@@ -1,0 +1,98 @@
+// A Fides library with a C API (complaint-roadmap CI7, CI6): build.sh
+// builds it with `fid ccompile --lib` and links host.c against it.
+
+use task;
+
+@export
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+@export
+fn greet(name: str) -> str {
+    return "hello, " + name;
+}
+
+@export
+fn can_read() -> bool {
+    return p_file_exists("mathlib.fd") == true;
+}
+
+@export
+fn boom(d: i64) -> i64 {
+    return 10 / d;
+}
+
+// CI6: a thread or a task started inside fides_call has the call's
+// capabilities, also a task that runs after the call returned.
+
+fn read_flag() -> i64 {
+    if p_file_exists("mathlib.fd") {
+        return 1;
+    }
+    return 0;
+}
+
+fn read_flag_task(x: i64) -> i64 {
+    return read_flag() + x;
+}
+
+@export
+fn thread_can_read() -> i64 {
+    val t = spawn read_flag();
+    return await t;
+}
+
+@export
+fn task_can_read() -> i64 {
+    val t: i64 = task_go("read_flag_task", 0);
+    task_run();
+    return task_result(t);
+}
+
+@export
+fn task_start() -> i64 {
+    return task_go("read_flag_task", 0);
+}
+
+@export
+fn task_finish(t: i64) -> i64 {
+    task_run();
+    return task_result(t);
+}
+
+// CI6: the blocks a panicking fides_call allocated are freed. A block
+// freed goes back on its size's free list, so the next block of that size
+// is the same one: probe(n) is where a block of n bytes lands now.
+// (@unsafe: p_malloc and p_free, by hand)
+
+@export
+@unsafe
+fn probe(n: i64) -> i64 {
+    val p: i64 = p_malloc(n);
+    p_free(p);
+    return p;
+}
+
+@export
+@unsafe
+fn alloc_keep(n: i64) -> i64 {
+    return p_malloc(n);
+}
+
+@export
+@unsafe
+fn release(p: i64) -> i64 {
+    p_free(p);
+    return 0;
+}
+
+@export
+@unsafe
+fn fail_alloc(n: i64) -> i64 {
+    val p: i64 = p_malloc(n);
+    if p != 0 {
+        panic("failed after allocating");
+    }
+    return p;
+}

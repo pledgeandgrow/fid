@@ -1,0 +1,57 @@
+// alloc/churn (competitive roadmap RT8; mimalloc-bench's glibc-simple and
+// rptest shape): the allocator's fast path. A ring of 64 live blocks; 30
+// million times, the oldest block is read and freed and a new one of 8..135
+// bytes takes its place. Prints the sum of the words read back.
+
+// 31-bit LCG: no product passes 2^62, so no overflow check fires
+fn next(x: i64) -> i64 {
+    return (x * 1103515245 + 12345) % 2147483648;
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: *mut i64 = a;
+    *p = v;
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: *mut i64 = a;
+    return *p;
+}
+
+@unsafe
+fn main() -> i64 {
+    val ring: i64 = p_malloc(64 * 8);
+    var seed: i64 = 7;
+    var i: i64 = 0;
+    while i < 64 {
+        var b: i64 = p_malloc(8);
+        st(b, 0);
+        st(ring + i * 8, b);
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < 30000000 {
+        val slot: i64 = ring + (i & 63) * 8;
+        var old: i64 = ld(slot);
+        sum = sum + ld(old);
+        p_free(old);
+        seed = next(seed);
+        var b: i64 = p_malloc(8 + (seed >> 8) % 128);
+        st(b, i & 1023);
+        st(slot, b);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 64 {
+        var b: i64 = ld(ring + i * 8);
+        sum = sum + ld(b);
+        p_free(b);
+        i = i + 1;
+    }
+    p_free(ring);
+    println(sum);
+    return 0;
+}

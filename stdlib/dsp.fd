@@ -1,0 +1,718 @@
+// Fides digital signal processing
+//
+// Everything here is pure computation (no platform seam):
+// - FFT of any length: iterative radix-2 Cooley-Tukey for powers of two,
+//   Bluestein's chirp-z algorithm (a radix-2 convolution) for every other
+//   length; the inverse by the conjugate trick, scaled by 1/n. The forward
+//   transform is X[k] = sum x[n] e^{-2 pi i k n / N} (numpy's convention).
+// - Windows (symmetric for filter design, periodic for spectral analysis):
+//   Hann, Hamming (0.54/0.46), Blackman (0.42/0.5/0.08) and flat-top (the
+//   five-term HP/Matlab `flattopwin` coefficients).
+// - FIR design by the windowed-sinc method (low-pass normalised to unit DC
+//   gain, high-pass by spectral inversion, band-pass as a difference of two
+//   low-passes) and direct-form filtering.
+// - IIR biquads from Robert Bristow-Johnson's "Audio EQ Cookbook" (low-pass,
+//   high-pass, band-pass with 0 dB peak, notch, all-pass, peaking EQ, low and
+//   high shelf), run in transposed direct form II.
+// - RMS, the frequency response of any b/a filter, harmonic amplitudes and
+//   THD (IEEE THD_F: the RMS of harmonics 2..n over the fundamental) of a
+//   record holding a whole number of periods, and the Goertzel algorithm
+//   (power and the complex DFT value at any frequency).
+//
+// Usage:
+//   use dsp;
+//   var x = dsp_cvec_from_real(samples);
+//   val spec = dsp_fft(&x);
+//   val back = dsp_ifft(&spec);
+//   var lp = dsp_biquad_lowpass(48000.0, 1000.0, 0.7071);
+//   val y = Biquad_process(&mut lp, 1.0);
+
+module dsp;
+use math;
+use complex;
+use vec;
+
+pub const DSP_WIN_RECT: i64 = 0;
+pub const DSP_WIN_HANN: i64 = 1;
+pub const DSP_WIN_HAMMING: i64 = 2;
+pub const DSP_WIN_BLACKMAN: i64 = 3;
+pub const DSP_WIN_FLATTOP: i64 = 4;
+
+/// A complex sequence as two parallel arrays.
+pub struct CVec {
+    pub re: Vec<f64>,
+    pub im: Vec<f64>,
+}
+
+pub fn dsp_pi() -> f64 {
+    return 3.14159265358979323846;
+}
+
+pub fn dsp_cvec_zeros(n: i64) -> CVec {
+    var re: Vec<f64> = Vec::new();
+    var im: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        re.push(0.0);
+        im.push(0.0);
+        i = i + 1;
+    }
+    return CVec {
+        re: re, im: im
+    };
+}
+
+pub fn dsp_cvec_from_real(x: &Vec<f64>) -> CVec {
+    var re: Vec<f64> = Vec::new();
+    var im: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < x.len() {
+        re.push(x.get(i));
+        im.push(0.0);
+        i = i + 1;
+    }
+    return CVec {
+        re: re, im: im
+    };
+}
+
+pub fn dsp_cvec_len(x: &CVec) -> i64 {
+    return x.re.len();
+}
+
+pub fn dsp_cvec_get(x: &CVec, i: i64) -> Complex {
+    return complex(x.re.get(i), x.im.get(i));
+}
+
+/// |X[k]| for every k.
+pub fn dsp_magnitude(x: &CVec) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < x.re.len() {
+        val a: f64 = x.re.get(i);
+        val b: f64 = x.im.get(i);
+        out.push(math_sqrt(a * a + b * b));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn dsp_is_pow2(n: i64) -> bool {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+pub fn dsp_next_pow2(n: i64) -> i64 {
+    var m: i64 = 1;
+    while m < n {
+        m = m * 2;
+    }
+    return m;
+}
+
+// ─── FFT ───
+
+/// In-place iterative radix-2 FFT; n must be a power of two. `inverse`
+/// uses e^{+i...} and does not scale.
+fn dsp_fft_pow2(x: &mut CVec, inverse: bool) {
+    val n: i64 = x.re.len();
+    if n <= 1 {
+        return;
+    }
+    // bit-reversal permutation
+    var j: i64 = 0;
+    var i: i64 = 1;
+    while i < n {
+        var bit: i64 = n >> 1;
+        while (j & bit) != 0 {
+            j = j ^ bit;
+            bit = bit >> 1;
+        }
+        j = j ^ bit;
+        if i < j {
+            val tr: f64 = x.re.get(i);
+            val ti: f64 = x.im.get(i);
+            x.re.set(i, x.re.get(j));
+            x.im.set(i, x.im.get(j));
+            x.re.set(j, tr);
+            x.im.set(j, ti);
+        }
+        i = i + 1;
+    }
+    var len: i64 = 2;
+    while len <= n {
+        var ang: f64 = -2.0 * dsp_pi() / (len as f64);
+        if inverse {
+            ang = 0.0 - ang;
+        }
+        val half: i64 = len / 2;
+        // twiddles of this stage computed directly (no accumulated drift)
+        var wr: Vec<f64> = Vec::new();
+        var wi: Vec<f64> = Vec::new();
+        var k: i64 = 0;
+        while k < half {
+            wr.push(math_cos(ang * (k as f64)));
+            wi.push(math_sin(ang * (k as f64)));
+            k = k + 1;
+        }
+        var s: i64 = 0;
+        while s < n {
+            k = 0;
+            while k < half {
+                val a: i64 = s + k;
+                val b: i64 = a + half;
+                val br: f64 = x.re.get(b);
+                val bi: f64 = x.im.get(b);
+                val cr: f64 = wr.get(k);
+                val ci: f64 = wi.get(k);
+                val tr: f64 = br * cr - bi * ci;
+                val ti: f64 = br * ci + bi * cr;
+                val ar: f64 = x.re.get(a);
+                val ai: f64 = x.im.get(a);
+                x.re.set(a, ar + tr);
+                x.im.set(a, ai + ti);
+                x.re.set(b, ar - tr);
+                x.im.set(b, ai - ti);
+                k = k + 1;
+            }
+            s = s + len;
+        }
+        len = len * 2;
+    }
+}
+
+/// Bluestein's algorithm: the length-n DFT as a convolution with a chirp,
+/// done with radix-2 FFTs of length m >= 2n - 1.
+fn dsp_bluestein(x: &CVec) -> CVec {
+    val n: i64 = x.re.len();
+    val m: i64 = dsp_next_pow2(2 * n - 1);
+    // chirp w_k = e^{-i pi k^2 / n}; k^2 is reduced mod 2n for accuracy
+    var cr: Vec<f64> = Vec::new();
+    var ci: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    while k < n {
+        val k2: i64 = (k * k) % (2 * n);
+        val ang: f64 = 0.0 - dsp_pi() * (k2 as f64) / (n as f64);
+        cr.push(math_cos(ang));
+        ci.push(math_sin(ang));
+        k = k + 1;
+    }
+    var a: CVec = dsp_cvec_zeros(m);
+    var b: CVec = dsp_cvec_zeros(m);
+    k = 0;
+    while k < n {
+        val xr: f64 = x.re.get(k);
+        val xi: f64 = x.im.get(k);
+        a.re.set(k, xr * cr.get(k) - xi * ci.get(k));
+        a.im.set(k, xr * ci.get(k) + xi * cr.get(k));
+        // b = conj(w)
+        b.re.set(k, cr.get(k));
+        b.im.set(k, 0.0 - ci.get(k));
+        if k > 0 {
+            b.re.set(m - k, cr.get(k));
+            b.im.set(m - k, 0.0 - ci.get(k));
+        }
+        k = k + 1;
+    }
+    dsp_fft_pow2(&mut a, false);
+    dsp_fft_pow2(&mut b, false);
+    k = 0;
+    while k < m {
+        val ar: f64 = a.re.get(k);
+        val ai: f64 = a.im.get(k);
+        val br: f64 = b.re.get(k);
+        val bi: f64 = b.im.get(k);
+        a.re.set(k, ar * br - ai * bi);
+        a.im.set(k, ar * bi + ai * br);
+        k = k + 1;
+    }
+    dsp_fft_pow2(&mut a, true);
+    var out: CVec = dsp_cvec_zeros(n);
+    val inv_m: f64 = 1.0 / (m as f64);
+    k = 0;
+    while k < n {
+        val vr: f64 = a.re.get(k) * inv_m;
+        val vi: f64 = a.im.get(k) * inv_m;
+        out.re.set(k, vr * cr.get(k) - vi * ci.get(k));
+        out.im.set(k, vr * ci.get(k) + vi * cr.get(k));
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The DFT of x, any length (radix-2 or Bluestein).
+pub fn dsp_fft(x: &CVec) -> CVec {
+    val n: i64 = x.re.len();
+    if n == 0 {
+        return dsp_cvec_zeros(0);
+    }
+    if dsp_is_pow2(n) {
+        var y = CVec {
+            re: x.re, im: x.im
+        };
+        dsp_fft_pow2(&mut y, false);
+        return y;
+    }
+    return dsp_bluestein(x);
+}
+
+/// The inverse DFT (1/n scaling), any length.
+pub fn dsp_ifft(x: &CVec) -> CVec {
+    val n: i64 = x.re.len();
+    var c: CVec = dsp_cvec_zeros(n);
+    var i: i64 = 0;
+    while i < n {
+        c.re.set(i, x.re.get(i));
+        c.im.set(i, 0.0 - x.im.get(i));
+        i = i + 1;
+    }
+    var y: CVec = dsp_fft(&c);
+    val s: f64 = 1.0 / (n as f64);
+    i = 0;
+    while i < n {
+        y.re.set(i, y.re.get(i) * s);
+        y.im.set(i, 0.0 - y.im.get(i) * s);
+        i = i + 1;
+    }
+    return y;
+}
+
+/// The FFT of a real sequence.
+pub fn dsp_fft_real(x: &Vec<f64>) -> CVec {
+    val c: CVec = dsp_cvec_from_real(x);
+    return dsp_fft(&c);
+}
+
+/// The direct O(n^2) DFT (a reference for checking).
+pub fn dsp_dft(x: &CVec) -> CVec {
+    val n: i64 = x.re.len();
+    var out: CVec = dsp_cvec_zeros(n);
+    var k: i64 = 0;
+    while k < n {
+        var sr: f64 = 0.0;
+        var si: f64 = 0.0;
+        var t: i64 = 0;
+        while t < n {
+            val ang: f64 = -2.0 * dsp_pi() * (((k * t) % n) as f64) / (n as f64);
+            val c: f64 = math_cos(ang);
+            val s: f64 = math_sin(ang);
+            sr = sr + x.re.get(t) * c - x.im.get(t) * s;
+            si = si + x.re.get(t) * s + x.im.get(t) * c;
+            t = t + 1;
+        }
+        out.re.set(k, sr);
+        out.im.set(k, si);
+        k = k + 1;
+    }
+    return out;
+}
+
+/// Linear convolution of two real sequences through the FFT.
+pub fn dsp_convolve(a: &Vec<f64>, b: &Vec<f64>) -> Vec<f64> {
+    val n: i64 = a.len() + b.len() - 1;
+    val m: i64 = dsp_next_pow2(n);
+    var x: CVec = dsp_cvec_zeros(m);
+    var y: CVec = dsp_cvec_zeros(m);
+    var i: i64 = 0;
+    while i < a.len() {
+        x.re.set(i, a.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < b.len() {
+        y.re.set(i, b.get(i));
+        i = i + 1;
+    }
+    dsp_fft_pow2(&mut x, false);
+    dsp_fft_pow2(&mut y, false);
+    i = 0;
+    while i < m {
+        val xr: f64 = x.re.get(i);
+        val xi: f64 = x.im.get(i);
+        x.re.set(i, xr * y.re.get(i) - xi * y.im.get(i));
+        x.im.set(i, xr * y.im.get(i) + xi * y.re.get(i));
+        i = i + 1;
+    }
+    dsp_fft_pow2(&mut x, true);
+    var out: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        out.push(x.re.get(i) / (m as f64));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Windows ───
+
+/// Window `kind` of length n. Symmetric (w[0] == w[n-1], for FIR design)
+/// unless `periodic` (the DFT-even form for spectral analysis).
+pub fn dsp_window(kind: i64, n: i64, periodic: bool) -> Vec<f64> {
+    var w: Vec<f64> = Vec::new();
+    if n == 1 {
+        w.push(1.0);
+        return w;
+    }
+    var d: f64 = (n - 1) as f64;
+    if periodic {
+        d = n as f64;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val x: f64 = 2.0 * dsp_pi() * (i as f64) / d;
+        var v: f64 = 1.0;
+        if kind == DSP_WIN_HANN {
+            v = 0.5 - 0.5 * math_cos(x);
+        } else if kind == DSP_WIN_HAMMING {
+            v = 0.54 - 0.46 * math_cos(x);
+        } else if kind == DSP_WIN_BLACKMAN {
+            v = 0.42 - 0.5 * math_cos(x) + 0.08 * math_cos(2.0 * x);
+        } else if kind == DSP_WIN_FLATTOP {
+            v = 0.21557895 - 0.41663158 * math_cos(x) + 0.277263158 * math_cos(2.0 * x) - 0.083578947 * math_cos(3.0 * x) + 0.006947368 * math_cos(4.0 * x);
+        }
+        w.push(v);
+        i = i + 1;
+    }
+    return w;
+}
+
+/// x[i] * w[i].
+pub fn dsp_apply_window(x: &Vec<f64>, w: &Vec<f64>) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < x.len() {
+        out.push(x.get(i) * w.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The coherent gain of a window: mean of its samples.
+pub fn dsp_window_gain(w: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < w.len() {
+        s = s + w.get(i);
+        i = i + 1;
+    }
+    return s / (w.len() as f64);
+}
+
+// ─── FIR design and filtering ───
+
+fn dsp_sinc(x: f64) -> f64 {
+    if math_fabs(x) < 0.000000000001 {
+        return 1.0;
+    }
+    val px: f64 = dsp_pi() * x;
+    return math_sin(px) / px;
+}
+
+/// Windowed-sinc low-pass with `ntaps` taps and cutoff `fc` as a fraction
+/// of the sample rate (0 < fc < 0.5), scaled to unit gain at DC.
+pub fn dsp_fir_lowpass(ntaps: i64, fc: f64, window: i64) -> Vec<f64> {
+    val w: Vec<f64> = dsp_window(window, ntaps, false);
+    val mid: f64 = ((ntaps - 1) as f64) / 2.0;
+    var h: Vec<f64> = Vec::new();
+    var sum: f64 = 0.0;
+    var i: i64 = 0;
+    while i < ntaps {
+        val v: f64 = 2.0 * fc * dsp_sinc(2.0 * fc * ((i as f64) - mid)) * w.get(i);
+        h.push(v);
+        sum = sum + v;
+        i = i + 1;
+    }
+    i = 0;
+    while i < ntaps {
+        h.set(i, h.get(i) / sum);
+        i = i + 1;
+    }
+    return h;
+}
+
+/// High-pass by spectral inversion of the low-pass (ntaps must be odd).
+pub fn dsp_fir_highpass(ntaps: i64, fc: f64, window: i64) -> Vec<f64> {
+    if ntaps % 2 == 0 {
+        panic("dsp_fir_highpass: ntaps must be odd");
+    }
+    var h: Vec<f64> = dsp_fir_lowpass(ntaps, fc, window);
+    var i: i64 = 0;
+    while i < ntaps {
+        h.set(i, 0.0 - h.get(i));
+        i = i + 1;
+    }
+    val mid: i64 = (ntaps - 1) / 2;
+    h.set(mid, h.get(mid) + 1.0);
+    return h;
+}
+
+/// Band-pass f1..f2 (fractions of the sample rate): low-pass(f2) minus
+/// low-pass(f1).
+pub fn dsp_fir_bandpass(ntaps: i64, f1: f64, f2: f64, window: i64) -> Vec<f64> {
+    val hi: Vec<f64> = dsp_fir_lowpass(ntaps, f2, window);
+    val lo: Vec<f64> = dsp_fir_lowpass(ntaps, f1, window);
+    var h: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < ntaps {
+        h.push(hi.get(i) - lo.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+/// y[n] = sum_k h[k] x[n - k], zero initial state, same length as x.
+pub fn dsp_fir_filter(h: &Vec<f64>, x: &Vec<f64>) -> Vec<f64> {
+    var y: Vec<f64> = Vec::new();
+    var n: i64 = 0;
+    while n < x.len() {
+        var acc: f64 = 0.0;
+        var k: i64 = 0;
+        while k < h.len() && k <= n {
+            acc = acc + h.get(k) * x.get(n - k);
+            k = k + 1;
+        }
+        y.push(acc);
+        n = n + 1;
+    }
+    return y;
+}
+
+/// H(e^{iw}) of b/a at frequency f (fraction of the sample rate).
+pub fn dsp_freq_response(b: &Vec<f64>, a: &Vec<f64>, f: f64) -> Complex {
+    val w: f64 = 2.0 * dsp_pi() * f;
+    var nr: f64 = 0.0;
+    var ni: f64 = 0.0;
+    var k: i64 = 0;
+    while k < b.len() {
+        nr = nr + b.get(k) * math_cos(w * (k as f64));
+        ni = ni - b.get(k) * math_sin(w * (k as f64));
+        k = k + 1;
+    }
+    var dr: f64 = 0.0;
+    var di: f64 = 0.0;
+    k = 0;
+    while k < a.len() {
+        dr = dr + a.get(k) * math_cos(w * (k as f64));
+        di = di - a.get(k) * math_sin(w * (k as f64));
+        k = k + 1;
+    }
+    if a.len() == 0 {
+        dr = 1.0;
+    }
+    return complex_div(complex(nr, ni), complex(dr, di));
+}
+
+/// |H| in decibels (20 log10).
+pub fn dsp_db(mag: f64) -> f64 {
+    return 20.0 * math_log(mag) / math_log(10.0);
+}
+
+// ─── Biquads (RBJ Audio EQ Cookbook) ───
+
+/// Normalised biquad (a0 = 1) with its transposed-direct-form-II state.
+pub struct Biquad {
+    pub b0: f64,
+    pub b1: f64,
+    pub b2: f64,
+    pub a1: f64,
+    pub a2: f64,
+    pub z1: f64,
+    pub z2: f64,
+}
+
+fn dsp_biquad_norm(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Biquad {
+    return Biquad {
+        b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0
+    };
+}
+
+fn dsp_w0(fs: f64, f0: f64) -> f64 {
+    return 2.0 * dsp_pi() * f0 / fs;
+}
+
+pub fn dsp_biquad_lowpass(fs: f64, f0: f64, q: f64) -> Biquad {
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    return dsp_biquad_norm((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + al, -2.0 * c, 1.0 - al);
+}
+
+pub fn dsp_biquad_highpass(fs: f64, f0: f64, q: f64) -> Biquad {
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    return dsp_biquad_norm((1.0 + c) / 2.0, 0.0 - (1.0 + c), (1.0 + c) / 2.0, 1.0 + al, -2.0 * c, 1.0 - al);
+}
+
+/// Band-pass with a constant 0 dB peak gain.
+pub fn dsp_biquad_bandpass(fs: f64, f0: f64, q: f64) -> Biquad {
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    return dsp_biquad_norm(al, 0.0, 0.0 - al, 1.0 + al, -2.0 * c, 1.0 - al);
+}
+
+pub fn dsp_biquad_notch(fs: f64, f0: f64, q: f64) -> Biquad {
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    return dsp_biquad_norm(1.0, -2.0 * c, 1.0, 1.0 + al, -2.0 * c, 1.0 - al);
+}
+
+pub fn dsp_biquad_allpass(fs: f64, f0: f64, q: f64) -> Biquad {
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    return dsp_biquad_norm(1.0 - al, -2.0 * c, 1.0 + al, 1.0 + al, -2.0 * c, 1.0 - al);
+}
+
+/// Peaking EQ with `gain_db` at f0.
+pub fn dsp_biquad_peaking(fs: f64, f0: f64, q: f64, gain_db: f64) -> Biquad {
+    val a: f64 = math_pow(10.0, gain_db / 40.0);
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    return dsp_biquad_norm(1.0 + al * a, -2.0 * c, 1.0 - al * a, 1.0 + al / a, -2.0 * c, 1.0 - al / a);
+}
+
+pub fn dsp_biquad_lowshelf(fs: f64, f0: f64, q: f64, gain_db: f64) -> Biquad {
+    val a: f64 = math_pow(10.0, gain_db / 40.0);
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    val sa: f64 = 2.0 * math_sqrt(a) * al;
+    return dsp_biquad_norm(a * ((a + 1.0) - (a - 1.0) * c + sa), 2.0 * a * ((a - 1.0) - (a + 1.0) * c), a * ((a + 1.0) - (a - 1.0) * c - sa), (a + 1.0) + (a - 1.0) * c + sa, -2.0 * ((a - 1.0) + (a + 1.0) * c), (a + 1.0) + (a - 1.0) * c - sa);
+}
+
+pub fn dsp_biquad_highshelf(fs: f64, f0: f64, q: f64, gain_db: f64) -> Biquad {
+    val a: f64 = math_pow(10.0, gain_db / 40.0);
+    val w0: f64 = dsp_w0(fs, f0);
+    val c: f64 = math_cos(w0);
+    val al: f64 = math_sin(w0) / (2.0 * q);
+    val sa: f64 = 2.0 * math_sqrt(a) * al;
+    return dsp_biquad_norm(a * ((a + 1.0) + (a - 1.0) * c + sa), -2.0 * a * ((a - 1.0) + (a + 1.0) * c), a * ((a + 1.0) + (a - 1.0) * c - sa), (a + 1.0) - (a - 1.0) * c + sa, 2.0 * ((a - 1.0) - (a + 1.0) * c), (a + 1.0) - (a - 1.0) * c - sa);
+}
+
+/// One sample through the biquad.
+pub fn Biquad_process(bq: &mut Biquad, x: f64) -> f64 {
+    val y: f64 = bq.b0 * x + bq.z1;
+    bq.z1 = bq.b1 * x - bq.a1 * y + bq.z2;
+    bq.z2 = bq.b2 * x - bq.a2 * y;
+    return y;
+}
+
+pub fn Biquad_reset(bq: &mut Biquad) {
+    bq.z1 = 0.0;
+    bq.z2 = 0.0;
+}
+
+/// A whole sequence through the biquad (state carries on).
+pub fn Biquad_filter(bq: &mut Biquad, x: &Vec<f64>) -> Vec<f64> {
+    var y: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < x.len() {
+        y.push(Biquad_process(bq, x.get(i)));
+        i = i + 1;
+    }
+    return y;
+}
+
+/// |H| of the biquad at frequency f (Hz) for sample rate fs.
+pub fn Biquad_magnitude(bq: &Biquad, fs: f64, f: f64) -> f64 {
+    var b: Vec<f64> = Vec::new();
+    b.push(bq.b0);
+    b.push(bq.b1);
+    b.push(bq.b2);
+    var a: Vec<f64> = Vec::new();
+    a.push(1.0);
+    a.push(bq.a1);
+    a.push(bq.a2);
+    return complex_abs(dsp_freq_response(&b, &a, f / fs));
+}
+
+// ─── Measurements ───
+
+pub fn dsp_rms(x: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < x.len() {
+        s = s + x.get(i) * x.get(i);
+        i = i + 1;
+    }
+    return math_sqrt(s / (x.len() as f64));
+}
+
+pub fn dsp_mean(x: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < x.len() {
+        s = s + x.get(i);
+        i = i + 1;
+    }
+    return s / (x.len() as f64);
+}
+
+/// The DFT value sum x[n] e^{-2 pi i f n / fs} at any frequency f, by the
+/// (generalised) Goertzel recurrence.
+pub fn dsp_goertzel(x: &Vec<f64>, f: f64, fs: f64) -> Complex {
+    val n: i64 = x.len();
+    val w: f64 = 2.0 * dsp_pi() * f / fs;
+    val coeff: f64 = 2.0 * math_cos(w);
+    var s1: f64 = 0.0;
+    var s2: f64 = 0.0;
+    var i: i64 = 0;
+    while i < n {
+        val s0: f64 = x.get(i) + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+        i = i + 1;
+    }
+    // y = s[N-1] - e^{-iw} s[N-2], X = y e^{-iw(N-1)}
+    val yr: f64 = s1 - math_cos(w) * s2;
+    val yi: f64 = math_sin(w) * s2;
+    val ph: f64 = 0.0 - w * ((n - 1) as f64);
+    return complex_mul(complex(yr, yi), complex(math_cos(ph), math_sin(ph)));
+}
+
+/// |X(f)|^2 by the classic Goertzel recurrence (no complex output needed).
+pub fn dsp_goertzel_power(x: &Vec<f64>, f: f64, fs: f64) -> f64 {
+    val w: f64 = 2.0 * dsp_pi() * f / fs;
+    val coeff: f64 = 2.0 * math_cos(w);
+    var s1: f64 = 0.0;
+    var s2: f64 = 0.0;
+    var i: i64 = 0;
+    while i < x.len() {
+        val s0: f64 = x.get(i) + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+        i = i + 1;
+    }
+    return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+/// Peak amplitudes of harmonics 1..nh of f0 in a record of a whole number
+/// of periods of f0 sampled at fs (one DFT bin per harmonic, so leakage is
+/// zero). Index 0 of the result is the DC level.
+pub fn dsp_harmonics(x: &Vec<f64>, fs: f64, f0: f64, nh: i64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    out.push(dsp_mean(x));
+    val n: f64 = x.len() as f64;
+    var h: i64 = 1;
+    while h <= nh {
+        val c: Complex = dsp_goertzel(x, f0 * (h as f64), fs);
+        out.push(2.0 * complex_abs(c) / n);
+        h = h + 1;
+    }
+    return out;
+}
+
+/// THD_F: sqrt(sum of squares of harmonics 2..n) / fundamental, from the
+/// amplitudes `dsp_harmonics` gives.
+pub fn dsp_thd(harm: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var h: i64 = 2;
+    while h < harm.len() {
+        s = s + harm.get(h) * harm.get(h);
+        h = h + 1;
+    }
+    return math_sqrt(s) / harm.get(1);
+}

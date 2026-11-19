@@ -1,0 +1,60 @@
+// Complaint roadmap CA4: lock order checked across the call graph. Every
+// path here takes ACCOUNTS before LEDGER (directly, through a helper, and
+// through arguments), and `report` releases LEDGER before it takes
+// ACCOUNTS, so there is no cycle and the program is accepted.
+// Expected output:
+//   10
+//   3
+//   2
+//   4
+
+var ACCOUNTS: i64 = 0;
+var LEDGER: i64 = 0;
+
+fn transfer(amount: i64) -> i64 {
+    p_mutex_lock(ACCOUNTS);
+    p_mutex_lock(LEDGER);
+    val r: i64 = amount * 2;
+    p_mutex_unlock(LEDGER);
+    p_mutex_unlock(ACCOUNTS);
+    return r;
+}
+
+fn count_ledger() -> i64 {
+    p_mutex_lock(LEDGER);
+    val n: i64 = 3;
+    p_mutex_unlock(LEDGER);
+    return n;
+}
+
+fn audit() -> i64 {
+    p_mutex_lock(ACCOUNTS);
+    val n: i64 = count_ledger();
+    p_mutex_unlock(ACCOUNTS);
+    return n;
+}
+
+fn report() -> i64 {
+    p_mutex_lock(LEDGER);
+    p_mutex_unlock(LEDGER);
+    p_mutex_lock(ACCOUNTS);
+    p_mutex_unlock(ACCOUNTS);
+    return 2;
+}
+
+fn lock_both(x: i64, y: i64) -> i64 {
+    p_mutex_lock(x);
+    p_mutex_lock(y);
+    p_mutex_unlock(y);
+    p_mutex_unlock(x);
+    return 2;
+}
+
+fn main() {
+    ACCOUNTS = p_mutex_init();
+    LEDGER = p_mutex_init();
+    println(int_to_str(transfer(5)));
+    println(int_to_str(audit()));
+    println(int_to_str(report()));
+    println(int_to_str(lock_both(ACCOUNTS, LEDGER) + lock_both(ACCOUNTS, LEDGER)));
+}

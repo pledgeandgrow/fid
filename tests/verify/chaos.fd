@@ -11,8 +11,17 @@
 //   chaos print <n>               print n lines
 //   chaos deep <n>                recurse n levels
 //   chaos read <path>             read a file
+//   chaos fetch <host> <port> <path> <ms|none>
+//                                 GET; the connect and each read wait at most
+//                                 <ms>, or (none) without a limit as
+//                                 stdlib/http_client.fd's transport does
+//   chaos clock <case> [port]     a wait a clock jump must neither stretch
+//                                 nor cut short: sleep, tasks, timeout,
+//                                 token, cosleep, waitfd (chaos_linux.py)
 
 use file;
+use string;
+use task;
 
 // The transport of stdlib/http_client.fd http_request, line for line
 // (connect, write, read until the peer closes), without the module: with
@@ -40,6 +49,108 @@ Connection: close
     p_socket_close(fd);
     if total == 0 { return "status 0 body 0"; }
     return "status ? body " + int_to_str(total);
+}
+
+// The fetch mode (network partitions, scripts/verify/chaos_linux.py). ms < 0:
+// http_client's transport (p_net_connect, then blocking reads until the peer
+// closes: no limit anywhere). ms >= 0: the connect inside a timeout block
+// (p_co_connect waits on the token slot) and each read at most ms
+// (p_co_recv). Says how it ended and how many bytes came: "fetch closed
+// body N", "fetch timed out body N", "fetch error body N", "connect timed
+// out", "connect failed".
+@unsafe
+fn fetch(host: str, port: i64, path: str, ms: i64) -> str {
+    var fd: i64 = -1;
+    if ms < 0 {
+        fd = p_net_connect(host, port);
+    } else {
+        var late: bool = false;
+        timeout(ms) {
+            fd = p_co_connect(host, port);
+        } else {
+            late = true;
+        }
+        if late {
+            if fd >= 0 { p_socket_close(fd); }
+            return "connect timed out";
+        }
+    }
+    if fd < 0 { return "connect failed"; }
+    p_socket_write_str(fd, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+    var buf: i64 = p_malloc(8192);
+    var total: i64 = 0;
+    var how: str = "closed";
+    while true {
+        var n: i64 = 0;
+        if ms < 0 {
+            n = p_socket_read(fd, buf, 8192);
+        } else {
+            n = p_co_recv(fd, buf, 8192, ms);
+        }
+        if n == -2 { how = "timed out"; break; }
+        if n < 0 { how = "error"; break; }
+        if n == 0 { break; }
+        total = total + n;
+    }
+    p_free(buf);
+    p_socket_close(fd);
+    return "fetch " + how + " body " + int_to_str(total);
+}
+
+// A task of the clock "tasks" case: wakes by its deadline.
+fn napper(ms: i64) -> i64 {
+    task_sleep(ms);
+    println("woke " + int_to_str(ms));
+    return ms;
+}
+
+// The clock cases (chaos_linux.py runs each with the clocks jumping 250 ms
+// in): each takes the time it names on the real clock, whatever the clocks
+// say, and prints the same line.
+fn clock_case(which: str, port: i64) -> str {
+    if which == "sleep" {
+        task_sleep(1000);
+        return "slept";
+    }
+    if which == "tasks" {
+        val a: i64 = task_go("napper", 900);
+        val b: i64 = task_go("napper", 300);
+        val c: i64 = task_go("napper", 600);
+        val n: i64 = task_run();
+        return "tasks " + int_to_str(n) + " " + bool_to_str(task_done(a) && task_done(b) && task_done(c));
+    }
+    if which == "timeout" {
+        var whole: bool = true;
+        var late: bool = false;
+        timeout(700) {
+            whole = task_sleep_cancellable(4000, p_task_token());
+        } else {
+            late = true;
+        }
+        return "timeout whole " + bool_to_str(whole) + " late " + bool_to_str(late);
+    }
+    if which == "token" {
+        val tok: i64 = task_token_with_timeout(700);
+        return "token whole " + bool_to_str(task_sleep_cancellable(4000, tok));
+    }
+    if which == "cosleep" {
+        var gave_up: bool = false;
+        timeout(700) {
+            task_sleep(4000);
+        } else {
+            gave_up = true;
+        }
+        return "cosleep late " + bool_to_str(gave_up);
+    }
+    if which == "waitfd" {
+        val fd: i64 = p_net_connect("127.0.0.1", port);
+        if fd < 0 { return "waitfd connect failed"; }
+        val ready: bool = task_wait_read(fd, 700);
+        p_socket_close(fd);
+        if ready { return "waitfd ready"; }
+        return "waitfd timed out";
+    }
+    return "unknown clock case";
 }
 
 fn deep(n: i64) -> i64 {
@@ -75,7 +186,22 @@ fn main() -> i64 {
             if total % 64 == 0 { println("MiB " + int_to_str(total)); }
         }
     } else if mode == "http" {
-        println(get_status(str_parse_int(a2), a3));
+        var st: str = "";
+        // SAFETY: get_status is @unsafe (release M10); it reads only the
+        // socket it opens
+        unsafe { st = get_status(str_parse_int(a2), a3); }
+        println(st);
+    } else if mode == "fetch" {
+        val a5: str = arg_at(5) ?? "none";
+        var ms: i64 = -1;
+        if a5 != "none" { ms = str_parse_int(a5); }
+        var got: str = "";
+        // SAFETY: fetch is @unsafe for its read buffer (p_malloc), freed
+        // before it returns; it reads only the socket it opens
+        unsafe { got = fetch(a2, str_parse_int(a3), arg_at(4) ?? "/", ms); }
+        println(got);
+    } else if mode == "clock" {
+        println(clock_case(a2, str_parse_int(a3)));
     } else if mode == "print" {
         val n: i64 = str_parse_int(a2);
         var i: i64 = 0;

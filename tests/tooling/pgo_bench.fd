@@ -1,0 +1,69 @@
+// pgo_bench.fd — the benchmark of profile-guided optimization (competitive
+// roadmap OP30), run by tests/tooling/pgo-bench.sh: profiled with a small
+// count through the interpreter (`fid run --profile`), then built twice
+// (`fid emit`, with and without `--profile-use`) and timed with a large one.
+//
+// What a real run's profile tells the compiler here:
+// - mix: one block, larger than the default inlining limit (16
+//   instructions) but within twice it; its call in step's first block runs
+//   on every iteration, so with the profile it is inlined (iropt.fd
+//   iro_inline_limit, by the call's block: pgo.fd pgo_site_calls);
+// - step's `if` side runs about once in 65536 iterations and calls fixup,
+//   a loop: with the block counts nat_ir lays that block and its code after
+//   the hot path (ng_pgo_cold_labels), fixup's loop is not unrolled into
+//   code the run does not use (iropt_me.fd ime_unroll_one), and a call
+//   there is not inlined (the site is cold);
+// - main's loop and step are the hot code: they come first in the image
+//   (pgo.fd pgo_apply).
+// It prints one checksum, the same for both builds.
+//
+// PGO_BENCH_N: the iterations (default 20000, what the profiling run uses).
+
+fn mix(a: i64, b: i64) -> i64 {
+    var r: i64 = ((a * 3 + b) ^ (a & 1023)) + ((b | 5) & (a + 7));
+    return r + (a & 1) + (a & 2) + (a & 4) + (a & 8) + (a & 16);
+}
+
+fn fixup(v: i64) -> i64 {
+    var t: i64 = v & 255;
+    var i: i64 = 0;
+    while i < 16 {
+        t = (t * 7 + i) & 65535;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn step(x: i64, i: i64) -> i64 {
+    var y: i64 = mix(x & 1048575, i);
+    if (y & 65535) == 4242 {
+        y = y + fixup(y) * 3 + (y >> 2);
+        y = y ^ (fixup(y + 1) << 1);
+    }
+    return y & 268435455;
+}
+
+fn bench_n() -> i64 {
+    match env_var("PGO_BENCH_N") {
+        Option::Some(s) => {
+            var n: i64 = str_parse_int(s);
+            if n > 0 {
+                return n;
+            }
+        }
+        Option::None => {
+        }
+    }
+    return 20000;
+}
+
+fn main() {
+    var n: i64 = bench_n();
+    var s: i64 = 1;
+    var i: i64 = 0;
+    while i < n {
+        s = (s + step(s, i)) & 268435455;
+        i = i + 1;
+    }
+    println(s);
+}

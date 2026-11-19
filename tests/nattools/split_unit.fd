@@ -1,0 +1,541 @@
+// RA4 (docs/roadmap/llvm-roadmap.md): live-range splitting of the machine
+// layer (compiler/nat_ir.fd ng_split_plan) and its checker
+// (ng_split_check) on hand-made machine IR, through nat_split_unit /
+// nat_split_unit_mir. Each function is run before and after the split by
+// the small machine-IR interpreter below (a call clobbers the argument
+// registers, nothing else); both must give the same result, and the
+// checker must accept the split:
+//   loop      a spilled value written in a call-free loop: loaded before
+//             the loop's head, stored where the loop falls out
+//   calls     two spilled values read and written between calls: a piece
+//             per run of accesses with no call between, loaded before its
+//             first read, stored after its last write when still live
+//   midexit   a loop left from its middle by a conditional branch: the
+//             store goes in an edge block (placed after the epilogue, a
+//             jump back to the old target)
+//   mutant    midexit with the stores at loop exits left out: the checker
+//             rejects it (the read after the loop sees a stale value)
+//   callloop  a loop with a call in it is no region: runs inside it only
+//   jumpin    the loop's head entered by a conditional branch whose
+//             previous instruction is a jump: the edge block goes right
+//             before the head and falls into it
+//   noload    `loop` split, then its load before the loop left out
+//             (nat_split_unit_drop): the checker rejects it (a piece holds
+//             nothing on entry to the function)
+//   nostore   `loop` split without its store at the loop's exit: rejected
+// Then random programs (random_progs: every split checked and run; the
+// mutation's wrong splits rejected) and random_drops (each split with one
+// inserted move left out at a time: none that computes something else may
+// be accepted). (Each case, after the loop, reads the value again in a run
+// of its own: a second piece.)
+// Op codes are compiler/nat_ir.fd's MO_* numbers (MO_LI 1, MO_MOV 2,
+// MO_CALL 9, MO_JMP 11, MO_BNEZ 12, MO_BEQZ 13, MO_ADD 16, MO_SUB 17,
+// MO_MUL 18, MO_PROLOGUE 36, MO_EPILOGUE 37, MO_PLACE 41); values are vregs
+// 64 and up, physical register 0 holds the result.
+// Run (natively: `fid run` interprets all of compiler::nat_ir, which takes
+// hours for the random programs; the native build runs in under a second):
+//   fid ccompile tests/nattools/split_unit.fd -o split_unit.exe && ./split_unit.exe
+// Expected output:
+// loop: pieces 2 loops 1 edges 0
+// loop: check: ok
+// loop: 14 inserted 3 result 208 208 same
+// calls: pieces 4 loops 0 edges 0
+// calls: check: ok
+// calls: 14 inserted 6 result 23520 23520 same
+// midexit: pieces 2 loops 1 edges 1
+// midexit: check: ok
+// midexit: 20 inserted 6 result 167 167 same
+// mutant: pieces 2 loops 1 edges 0
+// mutant: rejected
+// mutant: 20 inserted 2 result 167 75 differs
+// callloop: pieces 2 loops 0 edges 0
+// callloop: check: ok
+// callloop: 16 inserted 4 result 106 106 same
+// jumpin: pieces 2 loops 1 edges 1
+// jumpin: check: ok
+// jumpin: 23 inserted 4 result 448 448 same
+// noload: rejected result 208 55 differs
+// nostore: rejected result 208 78 differs
+// random: 40 programs, splits made: yes
+// random: 0 rejected, 0 differ
+// random mutants: 0 wrong and accepted
+// random drops: some rejected: yes, 0 wrong and accepted
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn op(v: & mut Vec<i64>, o: i64, r0: i64, r1: i64, r2: i64, i0: i64) {
+    v.push(o);
+    v.push(r0);
+    v.push(r1);
+    v.push(r2);
+    v.push(i0);
+    v.push(0);
+    v.push(0);
+}
+
+/// Run machine IR rows: every register and vreg starts at 0, a call sets
+/// the argument registers 0..17 to garbage, the epilogue returns register
+/// 0. -1 when it runs too long or jumps nowhere.
+fn eval(flat: & Vec<i64>) -> i64 {
+    var regs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4096 {
+        regs.push(0);
+        i = i + 1;
+    }
+    var n: i64 = flat.len() / 7;
+    var labels: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k < n {
+        if flat.get(7 * k) == 41 {
+            HashMap_insert_i(labels, flat.get(7 * k + 4), k);
+        }
+        k = k + 1;
+    }
+    var pc: i64 = 0;
+    var steps: i64 = 0;
+    while pc < n && steps < 100000 {
+        steps = steps + 1;
+        var o: i64 = flat.get(7 * pc);
+        var r0: i64 = flat.get(7 * pc + 1);
+        var r1: i64 = flat.get(7 * pc + 2);
+        var r2: i64 = flat.get(7 * pc + 3);
+        var i0: i64 = flat.get(7 * pc + 4);
+        var to: i64 = pc + 1;
+        if o == 1 {
+            regs.set(r0, i0);
+        } else if o == 2 {
+            regs.set(r0, regs.get(r1));
+        } else if o == 16 {
+            regs.set(r0, regs.get(r1) + regs.get(r2));
+        } else if o == 17 {
+            regs.set(r0, regs.get(r1) - regs.get(r2));
+        } else if o == 18 {
+            regs.set(r0, regs.get(r1) * regs.get(r2));
+        } else if o == 19 {
+            regs.set(r0, regs.get(r1) & regs.get(r2));
+        } else if o == 9 {
+            var c: i64 = 0;
+            while c < 18 {
+                regs.set(c, 7777 + steps);
+                c = c + 1;
+            }
+        } else if o == 11 || (o == 12 && regs.get(r0) != 0) || (o == 13 && regs.get(r0) == 0) {
+            if !HashMap_contains_i(labels, i0) {
+                return 0 - 1;
+            }
+            to = HashMap_get_i(labels, i0);
+        } else if o == 37 {
+            return regs.get(0);
+        }
+        pc = to;
+    }
+    return 0 - 1;
+}
+
+fn show(name: str, flat: & Vec<i64>, nv: i64, spilled: & Vec<i64>, mutate: bool) {
+    var lines: Vec<str> = nat_split_unit(flat, nv, spilled, mutate);
+    println(name + ": " + lines.get(0));
+    var verdict: str = lines.get(1);
+    if mutate {
+        if str_starts_with(verdict, "check: ok") {
+            println(name + ": accepted");
+        } else {
+            println(name + ": rejected");
+        }
+    } else {
+        println(name + ": " + verdict);
+    }
+    var sp: Vec<i64> = nat_split_unit_mir(flat, nv, spilled, mutate);
+    var a: i64 = eval(flat);
+    var b: i64 = eval(& sp);
+    var same: str = "same";
+    if a != b {
+        same = "differs";
+    }
+    println(name + ": " + int_to_str(flat.len() / 7) + " inserted " + int_to_str(sp.len() / 7 - flat.len() / 7) + " result " + int_to_str(a) + " " + int_to_str(b) + " " + same);
+}
+
+// x (v64) written in the loop; s (v65), i (v66), one (v67)
+fn case_loop() -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    op(& mut f, 36, 0, 0, 0, 0);
+    op(& mut f, 1, 64, 0, 0, 3);
+    op(& mut f, 1, 65, 0, 0, 0);
+    op(& mut f, 1, 66, 0, 0, 5);
+    op(& mut f, 1, 67, 0, 0, 1);
+    op(& mut f, 41, 0, 0, 0, 1);
+    op(& mut f, 16, 65, 65, 64, 0);
+    op(& mut f, 16, 64, 64, 67, 0);
+    op(& mut f, 17, 66, 66, 67, 0);
+    op(& mut f, 12, 66, 0, 0, 1);
+    op(& mut f, 18, 68, 65, 64, 0);
+    op(& mut f, 16, 68, 68, 64, 0);
+    op(& mut f, 2, 0, 68, 0, 0);
+    op(& mut f, 37, 0, 0, 0, 0);
+    return f;
+}
+
+// x (v64) and y (v65) across two calls
+fn case_calls() -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    op(& mut f, 36, 0, 0, 0, 0);
+    op(& mut f, 1, 64, 0, 0, 7);
+    op(& mut f, 16, 65, 64, 64, 0);
+    op(& mut f, 18, 66, 65, 64, 0);
+    op(& mut f, 9, 0, 0, 0, 50);
+    op(& mut f, 16, 67, 64, 66, 0);
+    op(& mut f, 16, 64, 64, 67, 0);
+    op(& mut f, 17, 68, 64, 65, 0);
+    op(& mut f, 16, 65, 65, 68, 0);
+    op(& mut f, 9, 0, 0, 0, 50);
+    op(& mut f, 16, 69, 64, 68, 0);
+    op(& mut f, 18, 69, 69, 65, 0);
+    op(& mut f, 2, 0, 69, 0, 0);
+    op(& mut f, 37, 0, 0, 0, 0);
+    return f;
+}
+
+// x (v64) written in a loop left in its middle when i == three (v69)
+fn case_midexit() -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    op(& mut f, 36, 0, 0, 0, 0);
+    op(& mut f, 1, 64, 0, 0, 3);
+    op(& mut f, 1, 65, 0, 0, 0);
+    op(& mut f, 1, 66, 0, 0, 6);
+    op(& mut f, 1, 67, 0, 0, 1);
+    op(& mut f, 1, 69, 0, 0, 3);
+    op(& mut f, 41, 0, 0, 0, 1);
+    op(& mut f, 16, 64, 64, 67, 0);
+    op(& mut f, 16, 65, 65, 64, 0);
+    op(& mut f, 17, 68, 66, 69, 0);
+    op(& mut f, 13, 68, 0, 0, 2);
+    op(& mut f, 17, 66, 66, 67, 0);
+    op(& mut f, 12, 66, 0, 0, 1);
+    op(& mut f, 41, 0, 0, 0, 2);
+    op(& mut f, 18, 70, 65, 64, 0);
+    op(& mut f, 16, 70, 70, 64, 0);
+    op(& mut f, 16, 70, 70, 66, 0);
+    op(& mut f, 16, 70, 70, 69, 0);
+    op(& mut f, 2, 0, 70, 0, 0);
+    op(& mut f, 37, 0, 0, 0, 0);
+    return f;
+}
+
+// a call in the loop: x (v64) and s (v65) only split between calls
+fn case_callloop() -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    op(& mut f, 36, 0, 0, 0, 0);
+    op(& mut f, 1, 64, 0, 0, 2);
+    op(& mut f, 1, 65, 0, 0, 1);
+    op(& mut f, 1, 66, 0, 0, 3);
+    op(& mut f, 1, 67, 0, 0, 1);
+    op(& mut f, 41, 0, 0, 0, 1);
+    op(& mut f, 16, 65, 65, 64, 0);
+    op(& mut f, 16, 65, 65, 65, 0);
+    op(& mut f, 9, 0, 0, 0, 50);
+    op(& mut f, 16, 64, 64, 67, 0);
+    op(& mut f, 16, 64, 64, 64, 0);
+    op(& mut f, 17, 66, 66, 67, 0);
+    op(& mut f, 12, 66, 0, 0, 1);
+    op(& mut f, 16, 68, 65, 64, 0);
+    op(& mut f, 2, 0, 68, 0, 0);
+    op(& mut f, 37, 0, 0, 0, 0);
+    return f;
+}
+
+// the head (label 1) entered by a conditional branch after a jump
+fn case_jumpin() -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    op(& mut f, 36, 0, 0, 0, 0);
+    op(& mut f, 1, 64, 0, 0, 4);
+    op(& mut f, 1, 65, 0, 0, 0);
+    op(& mut f, 1, 66, 0, 0, 5);
+    op(& mut f, 1, 67, 0, 0, 1);
+    op(& mut f, 12, 66, 0, 0, 1);
+    op(& mut f, 11, 0, 0, 0, 9);
+    op(& mut f, 41, 0, 0, 0, 1);
+    op(& mut f, 16, 65, 65, 64, 0);
+    op(& mut f, 16, 64, 64, 67, 0);
+    op(& mut f, 17, 66, 66, 67, 0);
+    op(& mut f, 12, 66, 0, 0, 1);
+    op(& mut f, 41, 0, 0, 0, 9);
+    op(& mut f, 16, 65, 65, 64, 0);
+    op(& mut f, 18, 68, 65, 64, 0);
+    op(& mut f, 16, 68, 68, 64, 0);
+    op(& mut f, 16, 68, 68, 65, 0);
+    op(& mut f, 16, 68, 68, 65, 0);
+    op(& mut f, 16, 68, 68, 64, 0);
+    op(& mut f, 16, 68, 68, 66, 0);
+    op(& mut f, 16, 68, 68, 67, 0);
+    op(& mut f, 2, 0, 68, 0, 0);
+    op(& mut f, 37, 0, 0, 0, 0);
+    return f;
+}
+
+// --- random programs: six values (v64..v69) kept below 65536 by an AND
+// with v70, calls, loops with counters of their own (some left from the
+// middle), if and if/else; every vreg a candidate
+var g_seed: i64 = 20261117;
+var g_lab: i64 = 1;
+var g_tmp: i64 = 71;
+
+fn rnd(n: i64) -> i64 {
+    g_seed = (g_seed * 1103515245 + 12345) % 2147483648;
+    return (g_seed / 65536) % n;
+}
+
+fn new_tmp() -> i64 {
+    var t: i64 = g_tmp;
+    g_tmp = g_tmp + 1;
+    return t;
+}
+
+fn new_lab() -> i64 {
+    var l: i64 = g_lab;
+    g_lab = g_lab + 1;
+    return l;
+}
+
+fn val() -> i64 {
+    return 64 + rnd(6);
+}
+
+fn gen_block(f: & mut Vec<i64>, depth: i64, count: i64) {
+    var i: i64 = 0;
+    while i < count {
+        gen_stmt(f, depth);
+        i = i + 1;
+    }
+}
+
+fn gen_stmt(f: & mut Vec<i64>, depth: i64) {
+    var r: i64 = rnd(10);
+    if r == 5 {
+        op(f, 9, 0, 0, 0, 50);
+    } else if r == 6 {
+        op(f, 2, val(), val(), 0, 0);
+    } else if r == 7 && depth < 2 {
+        var t: i64 = new_tmp();
+        var one: i64 = new_tmp();
+        var top: i64 = new_lab();
+        op(f, 1, t, 0, 0, 1 + rnd(3));
+        op(f, 1, one, 0, 0, 1);
+        op(f, 41, 0, 0, 0, top);
+        gen_block(f, depth + 1, 1 + rnd(4));
+        var out: i64 = 0 - 1;
+        if rnd(2) == 0 {
+            out = new_lab();
+            var c: i64 = new_tmp();
+            op(f, 17, c, val(), val(), 0);
+            op(f, 13, c, 0, 0, out);
+            gen_block(f, depth + 1, rnd(3));
+        }
+        op(f, 17, t, t, one, 0);
+        op(f, 12, t, 0, 0, top);
+        if out >= 0 {
+            op(f, 41, 0, 0, 0, out);
+        }
+    } else if r == 8 && depth < 2 {
+        var c2: i64 = new_tmp();
+        var skip: i64 = new_lab();
+        op(f, 17, c2, val(), val(), 0);
+        op(f, 12 + rnd(2), c2, 0, 0, skip);
+        gen_block(f, depth + 1, 1 + rnd(3));
+        op(f, 41, 0, 0, 0, skip);
+    } else if r == 9 && depth < 2 {
+        var c3: i64 = new_tmp();
+        var els: i64 = new_lab();
+        var end: i64 = new_lab();
+        op(f, 17, c3, val(), val(), 0);
+        op(f, 13, c3, 0, 0, els);
+        gen_block(f, depth + 1, 1 + rnd(3));
+        op(f, 11, 0, 0, 0, end);
+        op(f, 41, 0, 0, 0, els);
+        gen_block(f, depth + 1, 1 + rnd(3));
+        op(f, 41, 0, 0, 0, end);
+    } else {
+        var d: i64 = val();
+        op(f, 16 + rnd(2), d, val(), val(), 0);
+        op(f, 19, d, d, 70, 0);
+    }
+}
+
+fn gen_prog() -> Vec<i64> {
+    g_lab = 1;
+    g_tmp = 71;
+    var f: Vec<i64> = Vec::new();
+    op(& mut f, 36, 0, 0, 0, 0);
+    var v: i64 = 64;
+    while v < 70 {
+        op(& mut f, 1, v, 0, 0, rnd(50));
+        v = v + 1;
+    }
+    op(& mut f, 1, 70, 0, 0, 65535);
+    gen_block(& mut f, 0, 4 + rnd(6));
+    var acc: i64 = new_tmp();
+    op(& mut f, 1, acc, 0, 0, 0);
+    v = 64;
+    while v < 70 {
+        op(& mut f, 16, acc, acc, v, 0);
+        op(& mut f, 18, acc, acc, v, 0);
+        op(& mut f, 19, acc, acc, 70, 0);
+        v = v + 1;
+    }
+    op(& mut f, 2, 0, acc, 0, 0);
+    op(& mut f, 37, 0, 0, 0, 0);
+    return f;
+}
+
+/// Random programs, every vreg a candidate: the checker must accept each
+/// split and the split must compute the same; with the mutation, a split
+/// that computes something else must be rejected.
+fn random_progs(count: i64) {
+    var n_split: i64 = 0;
+    var n_pieces: i64 = 0;
+    var n_edges: i64 = 0;
+    var n_bad_check: i64 = 0;
+    var n_differ: i64 = 0;
+    var n_mut_rej: i64 = 0;
+    var n_mut_missed: i64 = 0;
+    var p: i64 = 0;
+    while p < count {
+        var f: Vec<i64> = gen_prog();
+        var nv: i64 = g_tmp - 64;
+        var all: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < nv {
+            all.push(i);
+            i = i + 1;
+        }
+        var lines: Vec<str> = nat_split_unit(& f, nv, & all, false);
+        var hp: Vec<str> = str_split(lines.get(0), " ");
+        var pieces: i64 = str_parse_int(hp.get(1));
+        if pieces > 0 {
+            n_split = n_split + 1;
+            n_pieces = n_pieces + pieces;
+            n_edges = n_edges + str_parse_int(hp.get(5));
+            if lines.get(1) != "check: ok" {
+                n_bad_check = n_bad_check + 1;
+                println("random " + int_to_str(p) + ": " + lines.get(1));
+            }
+        }
+        var sp: Vec<i64> = nat_split_unit_mir(& f, nv, & all, false);
+        if eval(& f) != eval(& sp) {
+            n_differ = n_differ + 1;
+            println("random " + int_to_str(p) + ": differs");
+        }
+        var ml: Vec<str> = nat_split_unit(& f, nv, & all, true);
+        var msp: Vec<i64> = nat_split_unit_mir(& f, nv, & all, true);
+        var mok: bool = str_starts_with(ml.get(1), "check: ok");
+        if !mok && ml.get(1) != "check: nothing split" {
+            n_mut_rej = n_mut_rej + 1;
+        }
+        if mok && eval(& f) != eval(& msp) {
+            n_mut_missed = n_mut_missed + 1;
+        }
+        p = p + 1;
+    }
+    // (the counts themselves go to stderr: the lines checked hold only
+    // what must hold for any seed)
+    p_eprint_str("[split_unit] random: " + int_to_str(count) + " programs, " + int_to_str(n_split) + " split, " + int_to_str(n_pieces) + " pieces, " + int_to_str(n_edges) + " edge blocks, mutants " + int_to_str(n_mut_rej) + " rejected\n");
+    println("random: " + int_to_str(count) + " programs, splits made: " + yes_no(n_split > 0 && n_pieces > 0));
+    println("random: " + int_to_str(n_bad_check) + " rejected, " + int_to_str(n_differ) + " differ");
+    println("random mutants: " + int_to_str(n_mut_missed) + " wrong and accepted");
+}
+
+fn yes_no(b: bool) -> str {
+    if b {
+        return "yes";
+    }
+    return "no";
+}
+
+/// The split of `flat` without its `nth` inserted move: the checker's
+/// verdict and both results.
+fn show_drop(name: str, flat: & Vec<i64>, nv: i64, spilled: & Vec<i64>, nth: i64) {
+    var verdict: str = nat_split_unit_drop(flat, nv, spilled, nth);
+    var word: str = "rejected";
+    if verdict == "check: ok" {
+        word = "accepted";
+    }
+    var sp: Vec<i64> = nat_split_unit_drop_mir(flat, nv, spilled, nth);
+    var a: i64 = eval(flat);
+    var b: i64 = eval(& sp);
+    var same: str = "same";
+    if a != b {
+        same = "differs";
+    }
+    println(name + ": " + word + " result " + int_to_str(a) + " " + int_to_str(b) + " " + same);
+}
+
+/// Random programs again, each split with one inserted move left out at a
+/// time (the first `per` moves): a split that computes something else must
+/// be rejected (a load before a loop or a run, a store at an exit or after
+/// a run's last write missing).
+fn random_drops(count: i64, per: i64) {
+    g_seed = 777;
+    var n_rej: i64 = 0;
+    var n_missed: i64 = 0;
+    var n_tried: i64 = 0;
+    var p: i64 = 0;
+    while p < count {
+        var f: Vec<i64> = gen_prog();
+        var nv: i64 = g_tmp - 64;
+        var all: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < nv {
+            all.push(i);
+            i = i + 1;
+        }
+        var want: i64 = eval(& f);
+        var d: i64 = 0;
+        while d < per {
+            var verdict: str = nat_split_unit_drop(& f, nv, & all, d);
+            if verdict == "check: no such move" || verdict == "check: nothing split" {
+                d = per;
+            } else {
+                n_tried = n_tried + 1;
+                if verdict != "check: ok" {
+                    n_rej = n_rej + 1;
+                } else {
+                    var sp: Vec<i64> = nat_split_unit_drop_mir(& f, nv, & all, d);
+                    if eval(& sp) != want {
+                        n_missed = n_missed + 1;
+                        println("random drop " + int_to_str(p) + "/" + int_to_str(d) + ": wrong and accepted");
+                    }
+                }
+                d = d + 1;
+            }
+        }
+        p = p + 1;
+    }
+    p_eprint_str("[split_unit] random drops: " + int_to_str(n_tried) + " tried, " + int_to_str(n_rej) + " rejected\n");
+    println("random drops: some rejected: " + yes_no(n_rej > 0) + ", " + int_to_str(n_missed) + " wrong and accepted");
+}
+
+fn main() {
+    var x: Vec<i64> = Vec::new();
+    x.push(0);
+    var xy: Vec<i64> = Vec::new();
+    xy.push(0);
+    xy.push(1);
+    var f1: Vec<i64> = case_loop();
+    show("loop", & f1, 5, & x, false);
+    var f2: Vec<i64> = case_calls();
+    show("calls", & f2, 6, & xy, false);
+    var f3: Vec<i64> = case_midexit();
+    show("midexit", & f3, 7, & x, false);
+    show("mutant", & f3, 7, & x, true);
+    var f4: Vec<i64> = case_callloop();
+    show("callloop", & f4, 5, & xy, false);
+    var f5: Vec<i64> = case_jumpin();
+    show("jumpin", & f5, 5, & x, false);
+    show_drop("noload", & f1, 5, & x, 0);
+    show_drop("nostore", & f1, 5, & x, 1);
+    random_progs(40);
+    random_drops(12, 6);
+}

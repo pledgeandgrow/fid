@@ -1,0 +1,54 @@
+// stdlib/crc: every predefined CRC against its catalogue check value (the
+// CRC of "123456789"), the table result against the bitwise definition,
+// streaming in pieces, CRC-32 of a pangram, and a Modbus RTU frame.
+// Expected output:
+// CRC-8/SMBUS f4 ok
+// CRC-8/MAXIM-DOW a1 ok
+// CRC-16/IBM-3740 29b1 ok
+// CRC-16/KERMIT 2189 ok
+// CRC-16/XMODEM 31c3 ok
+// CRC-16/MODBUS 4b37 ok
+// CRC-16/ARC bb3d ok
+// CRC-32/ISO-HDLC cbf43926 ok
+// CRC-32/ISCSI e3069283 ok
+// CRC-32/BZIP2 fc891918 ok
+// streaming cbf43926
+// fox 414fa339
+// modbus 01030000000ac5cd
+// modbus check true false
+use crc;
+use vec;
+use encoding;
+
+fn one(s: CrcSpec) {
+    val data: Vec<i64> = str_bytes("123456789");
+    val v: i64 = crc_compute(& s, data);
+    val b: i64 = crc_compute_bitwise(& s, data);
+    var tag: str = "ok";
+    if !crc_self_test(& s) || v != b { tag = "FAIL"; }
+    println(s.name + " " + crc_hex(v, s.width) + " " + tag);
+}
+
+fn main() {
+    one(crc_spec_crc8());
+    one(crc_spec_crc8_maxim());
+    one(crc_spec_crc16_ccitt_false());
+    one(crc_spec_crc16_kermit());
+    one(crc_spec_crc16_xmodem());
+    one(crc_spec_crc16_modbus());
+    one(crc_spec_crc16_arc());
+    one(crc_spec_crc32());
+    one(crc_spec_crc32c());
+    one(crc_spec_crc32_bzip2());
+    val s: CrcSpec = crc_spec_crc32();
+    var st: i64 = crc_begin(& s);
+    crc_update(& s, & mut st, str_bytes("1234"));
+    crc_update(& s, & mut st, str_bytes("56789"));
+    println("streaming " + crc_hex(crc_finish(& s, st), 32));
+    println("fox " + crc_hex(crc32_bytes(str_bytes("The quick brown fox jumps over the lazy dog")), 32));
+    val frame: Vec<i64> = crc16_modbus_append(hex_decode_bytes("01030000000a"));
+    println("modbus " + hex_encode_bytes(frame));
+    var bad: Vec<i64> = frame;
+    bad.set(2, 1);
+    println("modbus check " + bool_to_str(crc16_modbus_check(frame)) + " " + bool_to_str(crc16_modbus_check(bad)));
+}

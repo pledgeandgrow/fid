@@ -1,0 +1,533 @@
+// Fides save-game standard library
+//
+// Versioned, checksummed save files with named sections, migrations from
+// older versions, and crash-safe writing. Everything is real Fides code;
+// files go through stdlib fs (fs_write_bytes, fs_read_bytes, fs_rename,
+// fs_delete), the only platform contact.
+//
+// File layout (all integers little-endian):
+//   0  "FSAV"            magic
+//   4  u16 1             container format
+//   6  u16 0             flags (reserved)
+//   8  u32 version       the game's data version (what migrations step)
+//   12 u32 sections      number of sections
+//   16 u32 length        payload bytes
+//   20 u32 crc           CRC-32 (IEEE 802.3, as zlib computes it) of bytes
+//                        0..19 followed by the payload
+//   24 payload           per section: u16 name length, name, u32 data
+//                        length, data
+// Section data is free-form bytes; SaveWriter / SaveReader write and read
+// typed values (u8, bool, i64 as 8 bytes, f64 as its IEEE bits, str as u32
+// length + bytes) in order.
+//
+// Writing (`save_game_write_file`): the bytes go to `path.tmp`, are read
+// back and compared, then the old file (if any) is renamed to `path.bak`,
+// the temp file renamed to `path`, and the backup deleted. A crash leaves
+// either the old file, its .bak, or the new file whole; `save_game_read_file`
+// falls back to the .bak when `path` is missing or fails its checksum.
+// (rename over an existing file is not atomic on Windows, hence the .bak
+// step rather than a single replacing rename.)
+//
+// Usage:
+//   use save_game;
+//   var sg: SaveGame = save_game_new(3);
+//   var w: SaveWriter = save_writer();
+//   save_put_str(&mut w, "Aria"); save_put_i64(&mut w, 1200);
+//   save_game_set(&mut sg, "player", w.bytes);
+//   save_game_write_file("slot1.sav", &sg);
+//   val got: SaveLoad = save_game_read_file("slot1.sav");
+
+module save_game;
+use vec;
+use string;
+use fs;
+
+pub const SAVE_HEADER_LEN: i64 = 24;
+pub const SAVE_CONTAINER: i64 = 1;
+
+// ─── CRC-32 ───────────────────────────────────────────────────────────────
+
+var sv_crc_table: Vec<i64> = Vec::new();
+
+fn sv_crc_init() {
+    if sv_crc_table.len() == 256 {
+        return;
+    }
+    var n: i64 = 0;
+    while n < 256 {
+        var c: i64 = n;
+        var k: i64 = 0;
+        while k < 8 {
+            if (c & 1) == 1 {
+                c = 3988292384 ^ (c >> 1);
+            } else {
+                c = c >> 1;
+            }
+            k = k + 1;
+        }
+        sv_crc_table.push(c);
+        n = n + 1;
+    }
+}
+
+/// Continue a CRC-32 over bytes[from..to); start with crc = 0.
+pub fn save_crc32_update(crc: i64, bytes: &Vec<i64>, from: i64, to: i64) -> i64 {
+    sv_crc_init();
+    var c: i64 = crc ^ 4294967295;
+    var i: i64 = from;
+    while i < to {
+        c = sv_crc_table.get((c ^ bytes.get(i)) & 255) ^ (c >> 8);
+        i = i + 1;
+    }
+    return c ^ 4294967295;
+}
+
+/// CRC-32 (IEEE, reflected, as zlib/PNG/ZIP) of all of `bytes`.
+pub fn save_crc32(bytes: &Vec<i64>) -> i64 {
+    return save_crc32_update(0, bytes, 0, bytes.len());
+}
+
+// ─── Typed section data ───────────────────────────────────────────────────
+
+pub struct SaveWriter {
+    pub bytes: Vec<i64>,
+}
+
+pub fn save_writer() -> SaveWriter {
+    return SaveWriter { bytes: Vec::new() };
+}
+
+pub fn save_put_u8(w: &mut SaveWriter, v: i64) {
+    w.bytes.push(v & 255);
+}
+
+pub fn save_put_bool(w: &mut SaveWriter, v: bool) {
+    if v {
+        w.bytes.push(1);
+    } else {
+        w.bytes.push(0);
+    }
+}
+
+pub fn save_put_u32(w: &mut SaveWriter, v: i64) {
+    var k: i64 = 0;
+    while k < 4 {
+        w.bytes.push((v >> (8 * k)) & 255);
+        k = k + 1;
+    }
+}
+
+pub fn save_put_i64(w: &mut SaveWriter, v: i64) {
+    var k: i64 = 0;
+    while k < 8 {
+        w.bytes.push((v >> (8 * k)) & 255);
+        k = k + 1;
+    }
+}
+
+pub fn save_put_f64(w: &mut SaveWriter, v: f64) {
+    save_put_i64(w, p_f64_to_bits(v));
+}
+
+pub fn save_put_str(w: &mut SaveWriter, s: str) {
+    val b: Vec<i64> = str_bytes(s);
+    save_put_u32(w, b.len());
+    var i: i64 = 0;
+    while i < b.len() {
+        w.bytes.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+/// Reads typed values back in order; `ok` turns false (and stays) when a
+/// read runs past the end.
+pub struct SaveReader {
+    pub bytes: Vec<i64>,
+    pub pos: i64,
+    pub ok: bool,
+}
+
+pub fn save_reader(bytes: Vec<i64>) -> SaveReader {
+    return SaveReader { bytes: bytes, pos: 0, ok: true };
+}
+
+fn sv_need(r: &mut SaveReader, n: i64) -> bool {
+    if !r.ok || r.pos + n > r.bytes.len() {
+        r.ok = false;
+        return false;
+    }
+    return true;
+}
+
+pub fn save_get_u8(r: &mut SaveReader) -> i64 {
+    if !sv_need(r, 1) {
+        return 0;
+    }
+    r.pos = r.pos + 1;
+    return r.bytes.get(r.pos - 1);
+}
+
+pub fn save_get_bool(r: &mut SaveReader) -> bool {
+    return save_get_u8(r) != 0;
+}
+
+pub fn save_get_u32(r: &mut SaveReader) -> i64 {
+    if !sv_need(r, 4) {
+        return 0;
+    }
+    val o: i64 = r.pos;
+    r.pos = r.pos + 4;
+    return r.bytes.get(o) + r.bytes.get(o + 1) * 256 + r.bytes.get(o + 2) * 65536 + r.bytes.get(o + 3) * 16777216;
+}
+
+@wrapping
+pub fn save_get_i64(r: &mut SaveReader) -> i64 {
+    if !sv_need(r, 8) {
+        return 0;
+    }
+    var v: i64 = 0;
+    var k: i64 = 7;
+    while k >= 0 {
+        v = (v << 8) | r.bytes.get(r.pos + k);
+        k = k - 1;
+    }
+    r.pos = r.pos + 8;
+    return v;
+}
+
+pub fn save_get_f64(r: &mut SaveReader) -> f64 {
+    return p_f64_from_bits(save_get_i64(r));
+}
+
+pub fn save_get_str(r: &mut SaveReader) -> str {
+    val n: i64 = save_get_u32(r);
+    if !sv_need(r, n) {
+        return "";
+    }
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        b.push(r.bytes.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return str_from_bytes(b);
+}
+
+/// Every byte has been read.
+pub fn save_reader_done(r: &SaveReader) -> bool {
+    return r.ok && r.pos == r.bytes.len();
+}
+
+// ─── Save games ───────────────────────────────────────────────────────────
+
+pub struct SaveGame {
+    pub version: i64,
+    pub names: Vec<str>,
+    pub data: Vec<Vec<i64>>,
+}
+
+pub fn save_game_new(version: i64) -> SaveGame {
+    return SaveGame { version: version, names: Vec::new(), data: Vec::new() };
+}
+
+/// Index of section `name`, -1 when absent.
+pub fn save_game_find(sg: &SaveGame, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < sg.names.len() {
+        if sg.names.get(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Set (add or replace) section `name`.
+pub fn save_game_set(sg: &mut SaveGame, name: str, bytes: Vec<i64>) {
+    val i: i64 = save_game_find(sg, name);
+    if i >= 0 {
+        sg.data.set(i, bytes);
+        return;
+    }
+    sg.names.push(name);
+    sg.data.push(bytes);
+}
+
+/// Section `name` (empty when absent).
+pub fn save_game_get(sg: &SaveGame, name: str) -> Vec<i64> {
+    val i: i64 = save_game_find(sg, name);
+    if i < 0 {
+        return Vec::new();
+    }
+    return sg.data.get(i);
+}
+
+pub fn save_game_has(sg: &SaveGame, name: str) -> bool {
+    return save_game_find(sg, name) >= 0;
+}
+
+/// Remove section `name` (no-op when absent).
+pub fn save_game_remove(sg: &mut SaveGame, name: str) {
+    val i: i64 = save_game_find(sg, name);
+    if i >= 0 {
+        sg.names.remove(i);
+        sg.data.remove(i);
+    }
+}
+
+/// A reader over section `name`.
+pub fn save_game_reader(sg: &SaveGame, name: str) -> SaveReader {
+    return save_reader(save_game_get(sg, name));
+}
+
+fn sv_put16(out: &mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+}
+
+fn sv_put32(out: &mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 24) & 255);
+}
+
+fn sv_u16(b: &Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256;
+}
+
+fn sv_u32(b: &Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256 + b.get(o + 2) * 65536 + b.get(o + 3) * 16777216;
+}
+
+/// The file bytes of `sg`.
+pub fn save_game_encode(sg: &SaveGame) -> Vec<i64> {
+    var payload: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < sg.names.len() {
+        val nb: Vec<i64> = str_bytes(sg.names.get(i));
+        sv_put16(&mut payload, nb.len());
+        var k: i64 = 0;
+        while k < nb.len() {
+            payload.push(nb.get(k));
+            k = k + 1;
+        }
+        val d: Vec<i64> = sg.data.get(i);
+        sv_put32(&mut payload, d.len());
+        k = 0;
+        while k < d.len() {
+            payload.push(d.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(70);
+    out.push(83);
+    out.push(65);
+    out.push(86);
+    sv_put16(&mut out, SAVE_CONTAINER);
+    sv_put16(&mut out, 0);
+    sv_put32(&mut out, sg.version);
+    sv_put32(&mut out, sg.names.len());
+    sv_put32(&mut out, payload.len());
+    var crc: i64 = save_crc32_update(0, &out, 0, 20);
+    crc = save_crc32_update(crc, &payload, 0, payload.len());
+    sv_put32(&mut out, crc);
+    i = 0;
+    while i < payload.len() {
+        out.push(payload.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub struct SaveLoad {
+    pub ok: bool,
+    pub error: str,
+    pub save: SaveGame,
+    pub from_backup: bool,  // save_game_read_file used path.bak
+}
+
+fn sv_fail(msg: str) -> SaveLoad {
+    return SaveLoad { ok: false, error: msg, save: save_game_new(0), from_backup: false };
+}
+
+/// Parse save bytes: magic, container format, length, CRC, sections.
+pub fn save_game_decode(b: &Vec<i64>) -> SaveLoad {
+    if b.len() < SAVE_HEADER_LEN {
+        return sv_fail("too short");
+    }
+    if b.get(0) != 70 || b.get(1) != 83 || b.get(2) != 65 || b.get(3) != 86 {
+        return sv_fail("not a save file (bad magic)");
+    }
+    if sv_u16(b, 4) != SAVE_CONTAINER {
+        return sv_fail("unknown container format " + int_to_str(sv_u16(b, 4)));
+    }
+    val version: i64 = sv_u32(b, 8);
+    val count: i64 = sv_u32(b, 12);
+    val len: i64 = sv_u32(b, 16);
+    if SAVE_HEADER_LEN + len != b.len() {
+        return sv_fail("length mismatch (truncated or padded file)");
+    }
+    var crc: i64 = save_crc32_update(0, b, 0, 20);
+    crc = save_crc32_update(crc, b, SAVE_HEADER_LEN, b.len());
+    if crc != sv_u32(b, 20) {
+        return sv_fail("checksum mismatch (corrupted file)");
+    }
+    var sg: SaveGame = save_game_new(version);
+    var p: i64 = SAVE_HEADER_LEN;
+    var i: i64 = 0;
+    while i < count {
+        if p + 2 > b.len() {
+            return sv_fail("section table runs past the end");
+        }
+        val nl: i64 = sv_u16(b, p);
+        p = p + 2;
+        if p + nl + 4 > b.len() {
+            return sv_fail("section name runs past the end");
+        }
+        var nb: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < nl {
+            nb.push(b.get(p + k));
+            k = k + 1;
+        }
+        p = p + nl;
+        val dl: i64 = sv_u32(b, p);
+        p = p + 4;
+        if p + dl > b.len() {
+            return sv_fail("section data runs past the end");
+        }
+        var d: Vec<i64> = Vec::new();
+        k = 0;
+        while k < dl {
+            d.push(b.get(p + k));
+            k = k + 1;
+        }
+        p = p + dl;
+        sg.names.push(str_from_bytes(nb));
+        sg.data.push(d);
+        i = i + 1;
+    }
+    if p != b.len() {
+        return sv_fail("bytes after the last section");
+    }
+    return SaveLoad { ok: true, error: "", save: sg, from_backup: false };
+}
+
+// ─── Migrations ───────────────────────────────────────────────────────────
+
+pub struct SaveMigrate {
+    pub ok: bool,
+    pub error: str,
+    pub save: SaveGame,
+    pub steps: i64,
+}
+
+/// Bring `sg` up to `target`: `step(&mut save)` is called with a save at
+/// version N and must change it into version N + 1 (setting `version`),
+/// returning false if it cannot. A save newer than `target`, a failing
+/// step, or one that does not advance the version by exactly one, is an
+/// error. (The step works in place: a struct passed by value through a
+/// function value is not supported by every Fides back end.)
+pub fn save_game_migrate(sg: &SaveGame, target: i64, step: fn(&mut SaveGame) -> bool) -> SaveMigrate {
+    var cur: SaveGame = save_game_new(sg.version);
+    var i: i64 = 0;
+    while i < sg.names.len() {
+        cur.names.push(sg.names.get(i));
+        cur.data.push(sg.data.get(i));
+        i = i + 1;
+    }
+    if cur.version > target {
+        return SaveMigrate { ok: false, error: "save version " + int_to_str(cur.version) + " is newer than " + int_to_str(target), save: cur, steps: 0 };
+    }
+    var steps: i64 = 0;
+    while cur.version < target {
+        val before: i64 = cur.version;
+        val ok: bool = step(&mut cur);
+        if !ok {
+            return SaveMigrate { ok: false, error: "migration from version " + int_to_str(before) + " failed", save: cur, steps: steps };
+        }
+        if cur.version != before + 1 {
+            return SaveMigrate { ok: false, error: "migration from version " + int_to_str(before) + " gave version " + int_to_str(cur.version), save: cur, steps: steps };
+        }
+        steps = steps + 1;
+    }
+    return SaveMigrate { ok: true, error: "", save: cur, steps: steps };
+}
+
+// ─── Files ────────────────────────────────────────────────────────────────
+
+fn sv_same(a: &Vec<i64>, b: &Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Write `sg` to `path` crash-safely (temp file, verify, backup, rename).
+/// False when any step fails; the old file is then still in place (or in
+/// `path.bak`).
+pub fn save_game_write_file(path: str, sg: &SaveGame) -> bool {
+    val bytes: Vec<i64> = save_game_encode(sg);
+    val tmp: str = path + ".tmp";
+    val bak: str = path + ".bak";
+    if !fs_write_bytes(tmp, bytes) {
+        return false;
+    }
+    val back: Vec<i64> = fs_read_bytes(tmp);
+    if !sv_same(&back, &bytes) {
+        fs_delete(tmp);
+        return false;
+    }
+    val had_old: bool = fs_exists(path);
+    if had_old {
+        if fs_exists(bak) {
+            fs_delete(bak);
+        }
+        if !fs_rename(path, bak) {
+            fs_delete(tmp);
+            return false;
+        }
+    }
+    if !fs_rename(tmp, path) {
+        if had_old {
+            fs_rename(bak, path);
+        }
+        return false;
+    }
+    if had_old {
+        fs_delete(bak);
+    }
+    return true;
+}
+
+/// Read and check `path`; when it is missing or damaged, try `path.bak`
+/// (left by a write that was interrupted).
+pub fn save_game_read_file(path: str) -> SaveLoad {
+    var first: SaveLoad = sv_fail("no such file");
+    if fs_exists(path) {
+        first = save_game_decode(&fs_read_bytes(path));
+        if first.ok {
+            return first;
+        }
+    }
+    val bak: str = path + ".bak";
+    if fs_exists(bak) {
+        var second: SaveLoad = save_game_decode(&fs_read_bytes(bak));
+        if second.ok {
+            second.from_backup = true;
+            return second;
+        }
+    }
+    return first;
+}

@@ -1,0 +1,720 @@
+// TG13 (docs/roadmap/llvm-roadmap.md, docs/image-writer.md): the writers
+// outside the machine layer as layouts over compiler/image_writer.fd.
+//   - the bytes the old bodies wrote: pe_ir_enc.fd pe_build_file,
+//     pe_build_efi, pe_efi_relocs, pe_append_coff_symbols_pre,
+//     pe_add_debug_sections; coff.fd CoffEmitter_build_coff; linker.fd
+//     Linker_build_executable. Until Nov 17 the old bodies stayed behind
+//     FID_IMG_OLD=1 and this test compared old and new byte for byte; all
+//     were the same (the COFF object of asm_full apart from a long-name
+//     offset the old body got wrong). The old bodies are gone now, so each
+//     output is compared with the digest it had then (golden): "same" means
+//     the bytes did not change; an intended change shows "CHANGED: digest
+//     N" (check the bytes, then put N in golden()). Each writer runs twice
+//     and the two runs must agree.
+//   - well-formed where the old bodies were not: elf64.fd
+//     ElfEmitter_build_elf (ELF64 ET_REL) and macho.fd
+//     MachOEmitter_build_macho (MH_OBJECT); each is read back by a small
+//     checker here (which rejected the old bytes), and the ELF object goes
+//     through compiler/linker.fd (which reads it as ld would)
+// (tests/nattools/image_writer_unit.fd covers nat_enc.fd's writers.)
+// Run:
+//   fid run tests/nattools/image_writer_obj_unit.fd
+//   (or, faster: fid ccompile tests/nattools/image_writer_obj_unit.fd -o t.exe && ./t.exe)
+// ("coff ok": the COFF object of asm_full has its pinned bytes and its long
+// names resolve.)
+// Expected output:
+// pe file same
+// pe file nsect 2
+// pe efi same
+// pe efi relocs same
+// pe efi no relocs same
+// pe coff symbols same
+// pe coff symbols nsyms 3
+// pe debug sections same
+// coff ok
+// coff linkable same
+// coff text only same
+// coff nsyms 6
+// linker x64 same
+// linker a64 same
+// elf object well-formed
+// elf object shnum 8 shstrndx 5
+// elf object rodata label defined
+// elf object comment ok
+// elf object links
+// macho object well-formed
+// macho object const symbol at __const
+use core;
+use vec;
+use string;
+use compiler::image_writer;
+use compiler::pe_ir_enc;
+use compiler::elf64;
+use compiler::coff;
+use compiler::macho;
+use compiler::linker;
+
+fn stand_in(n: i64, seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((i * 37 + seed) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn first_diff(a: & Vec<i64>, b: & Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < a.len() && i < b.len() {
+        if a.get(i) != b.get(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    if a.len() != b.len() {
+        return i;
+    }
+    return 0 - 1;
+}
+
+/// Two independent sums of the bytes (no overflow: each stays below 2^30).
+fn img_digest(b: & Vec<i64>) -> i64 {
+    var h1: i64 = 0;
+    var h2: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        h1 = (h1 * 257 + b.get(i) + 1) % 1000000007;
+        h2 = (h2 * 131 + b.get(i) + 7) % 998244353;
+        i = i + 1;
+    }
+    return h1 * 1000000000 + h2;
+}
+
+/// The digest of each writer's bytes when they were checked against the old
+/// bodies (Nov 17); 0 for a label without one.
+fn golden(label: str) -> i64 {
+    if label == "pe file" {
+        return 322189245672193039;
+    }
+    if label == "pe efi" {
+        return 236806528322778228;
+    }
+    if label == "pe efi relocs" {
+        return 651793415393262500;
+    }
+    if label == "pe efi no relocs" {
+        return 158143268236917478;
+    }
+    if label == "pe coff symbols" {
+        return 478741674051434131;
+    }
+    if label == "pe debug sections" {
+        return 917213333134604990;
+    }
+    if label == "coff" {
+        return 566598166898402962;
+    }
+    if label == "coff linkable" {
+        return 769365180753328204;
+    }
+    if label == "coff text only" {
+        return 473511066884987717;
+    }
+    if label == "linker x64" {
+        return 179779136748176245;
+    }
+    if label == "linker a64" {
+        return 386832204587033430;
+    }
+    return 0;
+}
+
+/// `a` and `b`: two runs of a writer on the same input.
+fn report(label: str, a: & Vec<i64>, b: & Vec<i64>) {
+    var d: i64 = first_diff(a, b);
+    var got: i64 = img_digest(b);
+    if b.len() == 0 {
+        println(label + " EMPTY");
+    } else if d >= 0 {
+        println(label + " NONDETERMINISTIC: the two runs differ at " + int_to_str(d));
+    } else if got == golden(label) {
+        println(label + " same");
+    } else {
+        println(label + " CHANGED: digest " + int_to_str(got) + " (" + int_to_str(b.len()) + " bytes), golden " + int_to_str(golden(label)));
+    }
+}
+
+// Bounds-checked little-endian reads (-1 past the end)
+fn rd8(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at >= b.len() {
+        return 0 - 1;
+    }
+    return b.get(at);
+}
+
+fn rd16(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 2 > b.len() {
+        return 0 - 1;
+    }
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn rd32(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 4 > b.len() {
+        return 0 - 1;
+    }
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn rd64(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 8 > b.len() {
+        return 0 - 1;
+    }
+    return rd32(b, at) | (rd32(b, at + 4) << 32);
+}
+
+/// The NUL-ended name at `at` (at most 64 bytes).
+fn rdname(b: & Vec<i64>, at: i64) -> str {
+    var s: str = "";
+    var i: i64 = at;
+    while i >= 0 && i < b.len() && i < at + 64 {
+        var c: i64 = b.get(i);
+        if c == 0 {
+            return s;
+        }
+        s = s + char_from_byte(c);
+        i = i + 1;
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// pe_ir_enc.fd
+// ---------------------------------------------------------------------------
+
+fn check_pe_ir() {
+    var text: Vec<i64> = stand_in(0x500, 3);
+    var rdata: Vec<i64> = stand_in(0x230, 7);
+    var a: Vec<i64> = pe_build_file(text, rdata, 0x1010, 0x2040, 0x2000, 24, 0x2000);
+    var b: Vec<i64> = pe_build_file(text, rdata, 0x1010, 0x2040, 0x2000, 24, 0x2000);
+    report("pe file", & a, & b);
+    println("pe file nsect " + int_to_str(rd16(& b, 70)));
+    // UEFI: 8 KB of code, data after it, absolute words on three pages
+    // (given out of order: the writer sorts them)
+    var flat: Vec<i64> = stand_in(0x2000 + 0x340, 5);
+    var abs: Vec<i64> = Vec::new();
+    abs.push(0x2010);
+    abs.push(0x8);
+    abs.push(0x2300);
+    abs.push(0x10);
+    abs.push(0x2008);
+    a = pe_build_efi(flat, 0x2000, abs);
+    b = pe_build_efi(flat, 0x2000, abs);
+    report("pe efi", & a, & b);
+    a = pe_efi_relocs(abs);
+    b = pe_efi_relocs(abs);
+    report("pe efi relocs", & a, & b);
+    var none: Vec<i64> = Vec::new();
+    a = pe_efi_relocs(none);
+    b = pe_efi_relocs(none);
+    report("pe efi no relocs", & a, & b);
+    // COFF symbols after a pe_build_file image, with long section names
+    // first in the string table
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("a_rather_long_function_name");
+    names.push("exactly8");
+    var offs: Vec<i64> = Vec::new();
+    offs.push(0);
+    offs.push(0x40);
+    offs.push(0x200);
+    var pre: Vec<str> = Vec::new();
+    pre.push(".debug_abbrev");
+    pre.push(".debug_info");
+    var sa: Vec<i64> = pe_build_file(text, rdata, 0x1010, 0x2040, 0x2000, 24, 0x2000);
+    pe_append_coff_symbols_pre(& mut sa, pre, names, offs);
+    var sb: Vec<i64> = pe_build_file(text, rdata, 0x1010, 0x2040, 0x2000, 24, 0x2000);
+    pe_append_coff_symbols_pre(& mut sb, pre, names, offs);
+    report("pe coff symbols", & sa, & sb);
+    println("pe coff symbols nsyms " + int_to_str(rd32(& sb, 80)));
+    // DWARF sections after a pe_build_file image (headers rewritten in place)
+    var abbrev: Vec<i64> = stand_in(40, 1);
+    var info: Vec<i64> = stand_in(700, 2);
+    var line: Vec<i64> = stand_in(90, 4);
+    a = pe_add_debug_sections(pe_build_file(text, rdata, 0x1010, 0x2040, 0x2000, 24, 0x2000), abbrev, info, line);
+    b = pe_add_debug_sections(pe_build_file(text, rdata, 0x1010, 0x2040, 0x2000, 24, 0x2000), abbrev, info, line);
+    report("pe debug sections", & a, & b);
+}
+
+// ---------------------------------------------------------------------------
+// The assembler path: COFF, ELF and Mach-O objects, the ELF linker
+// ---------------------------------------------------------------------------
+
+/// x86-64 assembly as compiler/codegen_x64.fd writes it: two functions
+/// (one with a name longer than 8 bytes), a local label, a call to an
+/// undefined function, a string in .rodata and a vtable word that points
+/// at a function (a .rodata relocation).
+fn asm_full() -> str {
+    var s: str = "main:\n";
+    s = s + "    pushq %rbp\n";
+    s = s + "    movq %rsp, %rbp\n";
+    s = s + "    leaq .str_0(%rip), %rdi\n";
+    s = s + "    call puts\n";
+    s = s + "    call a_long_helper_name\n";
+    s = s + "    leave\n";
+    s = s + "    ret\n";
+    s = s + "a_long_helper_name:\n";
+    s = s + ".Lloop:\n";
+    s = s + "    nop\n";
+    s = s + "    jmp .Lloop\n";
+    s = s + "    ret\n";
+    s = s + ".str_0: .asciz \"hello\"\n";
+    s = s + ".vtable_T: .quad a_long_helper_name\n";
+    return s;
+}
+
+/// The same without the undefined function (it links on its own).
+fn asm_linkable() -> str {
+    var s: str = "main:\n";
+    s = s + "    pushq %rbp\n";
+    s = s + "    movq %rsp, %rbp\n";
+    s = s + "    leaq .str_0(%rip), %rdi\n";
+    s = s + "    call a_long_helper_name\n";
+    s = s + "    leave\n";
+    s = s + "    ret\n";
+    s = s + "a_long_helper_name:\n";
+    s = s + "    ret\n";
+    s = s + ".str_0: .asciz \"hello\"\n";
+    return s;
+}
+
+fn asm_text_only() -> str {
+    var s: str = "f:\n";
+    s = s + "    nop\n";
+    s = s + "    ret\n";
+    return s;
+}
+
+fn coff_bytes(asm: str, old: bool) -> Vec<i64> {
+    match emit_coff_file(0, asm) {
+        ResultVec::Ok(b) => {
+            return b;
+        }
+        ResultVec::Err(e) => {
+            println("coff error: " + e);
+        }
+    }
+    return Vec::new();
+}
+
+/// The long (more than 8 bytes) symbol names of the COFF object `b`, as
+/// its string table gives them ("" for an offset that names nothing).
+fn coff_long_names(b: & Vec<i64>) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    var symptr: i64 = rd32(b, 8);
+    var nsyms: i64 = rd32(b, 12);
+    var strtab: i64 = symptr + 18 * nsyms;
+    var i: i64 = 0;
+    while i < nsyms {
+        var at: i64 = symptr + 18 * i;
+        if rd32(b, at) == 0 {
+            var off: i64 = rd32(b, at + 4);
+            if off >= 4 {
+                v.push(rdname(b, strtab + off));
+            } else {
+                v.push("");
+            }
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn check_coff() {
+    var a: Vec<i64> = coff_bytes(asm_full(), true);
+    var b: Vec<i64> = coff_bytes(asm_full(), false);
+    var names: Vec<str> = coff_long_names(& b);
+    var names_ok: bool = names.len() == 2 && names.get(0) == "a_long_helper_name" && names.get(1) == ".vtable_T";
+    if first_diff(& a, & b) < 0 && names_ok && img_digest(& b) == golden("coff") {
+        println("coff ok");
+    } else {
+        report("coff", & a, & b);
+        if !names_ok {
+            println("coff long names WRONG");
+        }
+    }
+    a = coff_bytes(asm_linkable(), true);
+    b = coff_bytes(asm_linkable(), false);
+    report("coff linkable", & a, & b);
+    a = coff_bytes(asm_text_only(), true);
+    b = coff_bytes(asm_text_only(), false);
+    report("coff text only", & a, & b);
+    var c: Vec<i64> = coff_bytes(asm_full(), false);
+    println("coff nsyms " + int_to_str(rd32(& c, 12)));
+}
+
+fn linker_bytes(lk: & Linker, old: bool) -> Vec<i64> {
+    match Linker_build_executable(lk, 0x10) {
+        LinkerResult::Ok(b) => {
+            var out: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < b.len() {
+                out.push(b.get(i));
+                i = i + 1;
+            }
+            return out;
+        }
+        LinkerResult::Err(e) => {
+            println("linker error: " + e);
+        }
+    }
+    return Vec::new();
+}
+
+fn check_linker() {
+    var lk: Linker = Linker_new();
+    var t: Vec<i64> = stand_in(300, 9);
+    var i: i64 = 0;
+    while i < t.len() {
+        lk.text_bytes.push(t.get(i));
+        i = i + 1;
+    }
+    var r: Vec<i64> = stand_in(45, 2);
+    i = 0;
+    while i < r.len() {
+        lk.rodata.push(r.get(i));
+        i = i + 1;
+    }
+    var a: Vec<i64> = linker_bytes(& lk, true);
+    var b: Vec<i64> = linker_bytes(& lk, false);
+    report("linker x64", & a, & b);
+    lk.target = "arm64";
+    a = linker_bytes(& lk, true);
+    b = linker_bytes(& lk, false);
+    report("linker a64", & a, & b);
+}
+
+fn elf_bytes(asm: str, old: bool) -> Vec<i64> {
+    match emit_object_file(0, asm) {
+        ResultVec::Ok(b) => {
+            return b;
+        }
+        ResultVec::Err(e) => {
+            println("elf error: " + e);
+        }
+    }
+    return Vec::new();
+}
+
+/// The file offset of section `name`'s header, or -1.
+fn elf_find_section(b: & Vec<i64>, name: str) -> i64 {
+    var shoff: i64 = rd64(b, 0x28);
+    var shnum: i64 = rd16(b, 0x3C);
+    var shstr: i64 = rd64(b, shoff + 64 * rd16(b, 0x3E) + 24);
+    var i: i64 = 0;
+    while i < shnum {
+        var h: i64 = shoff + 64 * i;
+        if rdname(b, shstr + rd32(b, h)) == name {
+            return h;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// "" when `b` is a well-formed ELF64 relocatable object, else what is
+/// wrong: header sizes, every section inside the file, the symbol table
+/// (locals before sh_info, globals from it), every relocation's symbol.
+fn elf_check(b: & Vec<i64>) -> str {
+    if b.len() < 64 || rd32(b, 0) != 0x464C457F || rd16(b, 0x10) != 1 {
+        return "header";
+    }
+    if rd16(b, 0x3A) != 64 {
+        return "e_shentsize";
+    }
+    var shoff: i64 = rd64(b, 0x28);
+    var shnum: i64 = rd16(b, 0x3C);
+    if shoff % 8 != 0 || shoff + 64 * shnum != b.len() {
+        return "section headers not at the end";
+    }
+    var i: i64 = 1;
+    while i < shnum {
+        var h: i64 = shoff + 64 * i;
+        if rd32(b, h + 4) != 8 && rd64(b, h + 24) + rd64(b, h + 32) > shoff {
+            return "section " + int_to_str(i) + " outside the file";
+        }
+        i = i + 1;
+    }
+    var st: i64 = elf_find_section(b, ".symtab");
+    if st < 0 || rd64(b, st + 56) != 24 {
+        return ".symtab";
+    }
+    var sym_at: i64 = rd64(b, st + 24);
+    var nsyms: i64 = rd64(b, st + 32) / 24;
+    var first_global: i64 = rd32(b, st + 44);
+    var s: i64 = 1;
+    while s < nsyms {
+        var bind: i64 = rd8(b, sym_at + 24 * s + 4) >> 4;
+        if (s < first_global && bind != 0) || (s >= first_global && bind == 0) {
+            return "symbol " + int_to_str(s) + " out of order";
+        }
+        s = s + 1;
+    }
+    var rnames: Vec<str> = Vec::new();
+    rnames.push(".rela.text");
+    rnames.push(".rela.rodata");
+    var k: i64 = 0;
+    while k < rnames.len() {
+        var rh: i64 = elf_find_section(b, rnames.get(k));
+        if rh < 0 || rd32(b, rh + 40) != (st - shoff) / 64 {
+            return rnames.get(k) + " link";
+        }
+        var r_at: i64 = rd64(b, rh + 24);
+        var nr: i64 = rd64(b, rh + 32) / 24;
+        var j: i64 = 0;
+        while j < nr {
+            var info: i64 = rd64(b, r_at + 24 * j + 8);
+            var rs: i64 = (info >> 32) & 0xFFFFFFFF;
+            var rt: i64 = info & 0xFFFFFFFF;
+            if rs <= 0 || rs >= nsyms || (rt != 1 && rt != 2 && rt != 4) {
+                return rnames.get(k) + " entry " + int_to_str(j);
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+/// The section index of symbol `name` in the object `b` (-1: none).
+fn elf_sym_shndx(b: & Vec<i64>, name: str) -> i64 {
+    var st: i64 = elf_find_section(b, ".symtab");
+    var stab: i64 = elf_find_section(b, ".strtab");
+    var sym_at: i64 = rd64(b, st + 24);
+    var str_at: i64 = rd64(b, stab + 24);
+    var nsyms: i64 = rd64(b, st + 32) / 24;
+    var s: i64 = 1;
+    while s < nsyms {
+        if rdname(b, str_at + rd32(b, sym_at + 24 * s)) == name {
+            return rd16(b, sym_at + 24 * s + 6);
+        }
+        s = s + 1;
+    }
+    return 0 - 1;
+}
+
+fn check_elf_object() {
+    var b: Vec<i64> = elf_bytes(asm_full(), false);
+    var why: str = elf_check(& b);
+    if why == "" {
+        println("elf object well-formed");
+    } else {
+        println("elf object MALFORMED: " + why);
+    }
+    println("elf object shnum " + int_to_str(rd16(& b, 0x3C)) + " shstrndx " + int_to_str(rd16(& b, 0x3E)));
+    if elf_sym_shndx(& b, ".str_0") == 2 && elf_sym_shndx(& b, "puts") == 0 && elf_sym_shndx(& b, "main") == 1 {
+        println("elf object rodata label defined");
+    } else {
+        println("elf object symbols WRONG: .str_0 " + int_to_str(elf_sym_shndx(& b, ".str_0")) + " puts " + int_to_str(elf_sym_shndx(& b, "puts")));
+    }
+    // an AArch64 emitter: the assembly text in .comment
+    match emit_object_file_for_target(0, "main:\n    ret\n", "arm64") {
+        ResultVec::Ok(ab) => {
+            var ch: i64 = elf_find_section(& ab, ".comment");
+            if elf_check(& ab) == "" && rd16(& ab, 0x12) == 183 && ch >= 0 && rd64(& ab, ch + 32) == 14 && rd8(& ab, rd64(& ab, ch + 24)) == 109 {
+                println("elf object comment ok");
+            } else {
+                println("elf object comment WRONG");
+            }
+        }
+        ResultVec::Err(e) => {
+            println("elf a64 error: " + e);
+        }
+    }
+    // compiler/linker.fd reads the object as ld would
+    var lb: Vec<i64> = elf_bytes(asm_linkable(), false);
+    var objs: Vec<Vec> = Vec::new();
+    objs.push(lb);
+    match link_objects(objs, "main") {
+        LinkerResult::Ok(exe) => {
+            if exe.len() > 120 && exe.get(0) == 0x7F && exe.get(1) == 0x45 {
+                println("elf object links");
+            } else {
+                println("elf object links to a BAD executable");
+            }
+        }
+        LinkerResult::Err(e) => {
+            println("elf object does NOT link: " + e);
+        }
+    }
+}
+
+fn macho_bytes(asm: str, old: bool) -> Vec<i64> {
+    match emit_macho_file(0, asm) {
+        ResultVec::Ok(b) => {
+            return b;
+        }
+        ResultVec::Err(e) => {
+            println("macho error: " + e);
+        }
+    }
+    return Vec::new();
+}
+
+/// "" when `b` is a well-formed Mach-O object: the load commands where
+/// sizeofcmds says, each section's data and relocations inside the file
+/// with a sane alignment, LC_SYMTAB's tables inside the file, LC_DYSYMTAB's
+/// ranges covering the symbols in order, every relocation's symbol.
+fn macho_check(b: & Vec<i64>) -> str {
+    if rd32(b, 0) != 0xFEEDFACF || rd32(b, 12) != 1 {
+        return "header";
+    }
+    var ncmds: i64 = rd32(b, 16);
+    var at: i64 = 32;
+    var nsyms: i64 = 0 - 1;
+    var symoff: i64 = 0;
+    var dys: i64 = 0 - 1;
+    var rel_at: Vec<i64> = Vec::new();
+    var rel_n: Vec<i64> = Vec::new();
+    var c: i64 = 0;
+    while c < ncmds {
+        var cmd: i64 = rd32(b, at);
+        var size: i64 = rd32(b, at + 4);
+        if size <= 0 {
+            return "load command " + int_to_str(c);
+        }
+        if cmd == 0x19 {
+            var nsects: i64 = rd32(b, at + 64);
+            if size != 72 + 80 * nsects {
+                return "segment size";
+            }
+            var s: i64 = 0;
+            while s < nsects {
+                var h: i64 = at + 72 + 80 * s;
+                var off: i64 = rd32(b, h + 48);
+                var align: i64 = rd32(b, h + 52);
+                var reloff: i64 = rd32(b, h + 56);
+                var nreloc: i64 = rd32(b, h + 60);
+                if align < 0 || align > 15 || off + rd64(b, h + 40) > b.len() || reloff + 8 * nreloc > b.len() {
+                    return "section " + int_to_str(s);
+                }
+                rel_at.push(reloff);
+                rel_n.push(nreloc);
+                s = s + 1;
+            }
+        } else if cmd == 2 {
+            symoff = rd32(b, at + 8);
+            nsyms = rd32(b, at + 12);
+            if symoff + 16 * nsyms > b.len() || rd32(b, at + 16) + rd32(b, at + 20) > b.len() {
+                return "LC_SYMTAB";
+            }
+        } else if cmd == 0xB {
+            dys = at;
+        } else {
+            return "unknown load command " + int_to_str(cmd);
+        }
+        at = at + size;
+        c = c + 1;
+    }
+    if at != 32 + rd32(b, 20) {
+        return "sizeofcmds";
+    }
+    if nsyms < 0 || dys < 0 {
+        return "no LC_SYMTAB/LC_DYSYMTAB";
+    }
+    var nloc: i64 = rd32(b, dys + 12);
+    var next: i64 = rd32(b, dys + 20);
+    if rd32(b, dys + 16) != nloc || rd32(b, dys + 24) != nloc + next || nloc + next + rd32(b, dys + 28) != nsyms {
+        return "LC_DYSYMTAB ranges";
+    }
+    var i: i64 = 0;
+    while i < nsyms {
+        var ty: i64 = rd8(b, symoff + 16 * i + 4);
+        var want: i64 = 0x0E;
+        if i >= nloc + next {
+            want = 0x01;
+        } else if i >= nloc {
+            want = 0x0F;
+        }
+        if ty != want {
+            return "symbol " + int_to_str(i) + " out of order";
+        }
+        i = i + 1;
+    }
+    var r: i64 = 0;
+    while r < rel_at.len() {
+        var j: i64 = 0;
+        while j < rel_n.get(r) {
+            if (rd32(b, rel_at.get(r) + 8 * j + 4) & 0xFFFFFF) >= nsyms {
+                return "relocation symbol";
+            }
+            j = j + 1;
+        }
+        r = r + 1;
+    }
+    return "";
+}
+
+/// n_value of symbol `name` (-1: none).
+fn macho_sym_value(b: & Vec<i64>, name: str) -> i64 {
+    var at: i64 = 32;
+    var c: i64 = 0;
+    while c < rd32(b, 16) {
+        if rd32(b, at) == 2 {
+            var symoff: i64 = rd32(b, at + 8);
+            var nsyms: i64 = rd32(b, at + 12);
+            var stroff: i64 = rd32(b, at + 16);
+            var i: i64 = 0;
+            while i < nsyms {
+                if rdname(b, stroff + rd32(b, symoff + 16 * i)) == name {
+                    return rd64(b, symoff + 16 * i + 8);
+                }
+                i = i + 1;
+            }
+        }
+        at = at + rd32(b, at + 4);
+        c = c + 1;
+    }
+    return 0 - 1;
+}
+
+fn check_macho_object() {
+    var b: Vec<i64> = macho_bytes(asm_full(), false);
+    var why: str = macho_check(& b);
+    if why == "" {
+        println("macho object well-formed");
+    } else {
+        println("macho object MALFORMED: " + why);
+    }
+    // .str_0 is __const's first byte: its n_value is __const's address
+    // (the second section header's addr), the next 8-byte address after
+    // __text (the old body wrote the offset, 0)
+    var text_size: i64 = rd64(& b, 32 + 72 + 40);
+    var const_addr: i64 = rd64(& b, 32 + 72 + 80 + 32);
+    var v: i64 = macho_sym_value(& b, ".str_0");
+    if v == const_addr && const_addr == (text_size + 7) / 8 * 8 && v > 0 {
+        println("macho object const symbol at __const");
+    } else {
+        println("macho object const symbol WRONG at 0x" + int_to_hex(v) + " (__const at 0x" + int_to_hex(const_addr) + ")");
+    }
+}
+
+fn int_to_hex(v: i64) -> str {
+    if v < 0 {
+        return "-" + int_to_hex(0 - v);
+    }
+    var digits: str = "0123456789abcdef";
+    if v < 16 {
+        return char_from_byte(str_byte_at(digits, v));
+    }
+    return int_to_hex(v / 16) + char_from_byte(str_byte_at(digits, v % 16));
+}
+
+fn main() {
+    check_pe_ir();
+    check_coff();
+    check_linker();
+    check_elf_object();
+    check_macho_object();
+}

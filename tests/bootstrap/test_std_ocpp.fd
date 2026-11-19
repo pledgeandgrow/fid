@@ -1,0 +1,82 @@
+// stdlib/ocpp: OCPP-J CALL/CALLRESULT/CALLERROR framing with unique ids,
+// payloads for BootNotification/Authorize/StartTransaction/MeterValues, the
+// charge-point state machine, and a central-system handler.
+// Expected output:
+// call: [2,"1","BootNotification",{"chargePointVendor":"ACME","chargePointModel":"CP-1"}]
+// parse call: type 2 id 1 action BootNotification
+// boot conf: status Accepted interval 300
+// match: BootNotification pending 0
+// error parse: code SecurityError desc bad
+// states: Available Preparing Preparing Charging SuspendedEV Charging Finishing Available
+// fault: Faulted then Available
+// cs boot: Accepted; cs auth known: Accepted unknown: Invalid
+// cs start: tx 1 Accepted; unknown tag tx 0 Invalid
+// txevent 2.0.1: eventType Started seqNo 0
+use ocpp;
+use json;
+use vec;
+use string;
+
+fn main() {
+    var c: OcppClient = ocpp_client_new();
+    val call: str = ocpp_client_call(& mut c, "BootNotification", ocpp_boot_notification("ACME", "CP-1"));
+    println("call: " + call);
+
+    val f: OcppFrame = ocpp_parse(call);
+    println("parse call: type " + int_to_str(f.msg_type) + " id " + f.unique_id + " action " + f.action);
+
+    val boot: str = ocpp_boot_conf("Accepted", "2024-11-17T10:00:00Z", 300);
+    println("boot conf: status " + json_get_str(boot, "status") + " interval " + int_to_str(json_get_int(boot, "interval", 0)));
+
+    // Central system answers the boot call; client matches the result
+    var cs: CentralSystem = cs_new("2024-11-17T10:00:00Z", 300);
+    cs_accept_tag(& mut cs, "RFID-ABC");
+    val result: str = cs_handle(& mut cs, call);
+    val matched: str = ocpp_client_match(& mut c, result);
+    println("match: " + matched + " pending " + int_to_str(ocpp_client_pending(& c)));
+
+    // CALLERROR parse
+    val err: str = ocpp_build_error("7", "SecurityError", "bad", "{}");
+    val ef: OcppFrame = ocpp_parse(err);
+    println("error parse: code " + ef.error_code + " desc " + ef.error_desc);
+
+    // State machine: a full charging session
+    var cp: ChargePoint = cp_new();
+    var trail: str = ocpp_state_name(cp.state);
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_PLUG_IN));    // Preparing
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_AUTHORIZE));  // Preparing (authorized)
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_START));      // Charging
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_SUSPEND));    // SuspendedEV
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_RESUME));     // Charging
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_STOP));       // Finishing
+    trail = trail + " " + ocpp_state_name(cp_step(& mut cp, EV_UNPLUG));     // Available
+    println("states: " + trail);
+
+    // Fault handling
+    var cp2: ChargePoint = cp_new();
+    cp_step(& mut cp2, EV_PLUG_IN);
+    val fs: i64 = cp_step(& mut cp2, EV_FAULT);
+    val fc: i64 = cp_step(& mut cp2, EV_FAULT_CLEAR);
+    println("fault: " + ocpp_state_name(fs) + " then " + ocpp_state_name(fc));
+
+    // CS authorize + start
+    val authknown: str = cs_handle(& mut cs, ocpp_build_call("10", "Authorize", ocpp_authorize("RFID-ABC")));
+    val authunknown: str = cs_handle(& mut cs, ocpp_build_call("11", "Authorize", ocpp_authorize("RFID-XYZ")));
+    println("cs boot: " + json_get_str(ocpp_parse(result).payload, "status") + "; cs auth known: " + id_status(authknown) + " unknown: " + id_status(authunknown));
+
+    val start_ok: str = cs_handle(& mut cs, ocpp_build_call("12", "StartTransaction", ocpp_start_transaction(1, "RFID-ABC", 0, "2024-11-17T10:05:00Z")));
+    val start_bad: str = cs_handle(& mut cs, ocpp_build_call("13", "StartTransaction", ocpp_start_transaction(1, "RFID-XYZ", 0, "2024-11-17T10:05:00Z")));
+    val rp_ok: str = ocpp_parse(start_ok).payload;
+    val rp_bad: str = ocpp_parse(start_bad).payload;
+    println("cs start: tx " + int_to_str(json_get_int(rp_ok, "transactionId", -1)) + " " + id_status(start_ok) + "; unknown tag tx " + int_to_str(json_get_int(rp_bad, "transactionId", -1)) + " " + id_status(start_bad));
+
+    // 2.0.1 TransactionEvent
+    val te: str = ocpp_transaction_event("Started", "2024-11-17T10:05:00Z", "Authorized", 0, "tx-9");
+    println("txevent 2.0.1: eventType " + json_get_str(te, "eventType") + " seqNo " + int_to_str(json_get_int(te, "seqNo", -1)));
+}
+
+fn id_status(result_frame: str) -> str {
+    val payload: str = ocpp_parse(result_frame).payload;
+    val info: str = json_get(payload, "idTagInfo");
+    return json_get_str(info, "status");
+}

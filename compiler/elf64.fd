@@ -8,9 +8,7 @@
 //   - Section headers (array of Elf64Shdr, 64 bytes each)
 //   - Sections: .text, .rela.text, .symtab, .strtab, .shstrtab
 
-module compiler::elf64;
- use core; use vec; use string; use compiler::pir;
-// --- Local helper: split string by newlines ---
+module compiler::elf64; use core; use vec; use string; use compiler::image_writer;  // --- Local helper: split string by newlines ---
 pub fn str_lines(s: str) -> Vec<str> {
     var result: Vec<str> = Vec::new();
     var i: i64 = 0;
@@ -34,14 +32,7 @@ pub fn str_lines(s: str) -> Vec<str> {
 pub const ELFMAG0: i64 = 0x7f; pub const ELFMAG1: i64 = 0x45;  // 'E'
 pub const ELFMAG2: i64 = 0x4c;  // 'L'
 pub const ELFMAG3: i64 = 0x46;  // 'F'
-pub const ELFCLASS64: i64 = 2; pub const ELFDATA2LSB: i64 = 1; pub const EV_CURRENT: i64 = 1; pub const ELFOSABI_NONE: i64 = 0; pub const ET_REL: i64 = 1; pub const ET_EXEC: i64 = 2; pub const EM_X86_64: i64 = 62; pub const EM_AARCH64: i64 = 183; pub const EM_RISCV: i64 = 243;
- pub const SHT_NULL: i64 = 0; pub const SHT_PROGBITS: i64 = 1; pub const SHT_SYMTAB: i64 = 2; pub const SHT_STRTAB: i64 = 3; pub const SHT_RELA: i64 = 4; pub const SHT_NOBITS: i64 = 8;
- pub const SHF_WRITE: i64 = 0x1; pub const SHF_ALLOC: i64 = 0x2; pub const SHF_EXECINSTR: i64 = 0x4; pub const SHF_INFO_LINK: i64 = 0x40;
- pub const STB_LOCAL: i64 = 0; pub const STB_GLOBAL: i64 = 1;
- pub const STT_NOTYPE: i64 = 0; pub const STT_FUNC: i64 = 2; pub const STT_SECTION: i64 = 3; pub const STT_FILE: i64 = 4;
- pub const SHN_UNDEF: i64 = 0; pub const SHN_ABS: i64 = 0xfff1;
- pub const R_X86_64_64: i64 = 1; pub const R_X86_64_PC32: i64 = 2; pub const R_X86_64_PLT32: i64 = 4;
-// --- Structs --------------------------------------------------------------
+pub const ELFCLASS64: i64 = 2; pub const ELFDATA2LSB: i64 = 1; pub const EV_CURRENT: i64 = 1; pub const ELFOSABI_NONE: i64 = 0; pub const ET_REL: i64 = 1; pub const ET_EXEC: i64 = 2; pub const EM_X86_64: i64 = 62; pub const EM_AARCH64: i64 = 183; pub const EM_RISCV: i64 = 243; pub const SHT_NULL: i64 = 0; pub const SHT_PROGBITS: i64 = 1; pub const SHT_SYMTAB: i64 = 2; pub const SHT_STRTAB: i64 = 3; pub const SHT_RELA: i64 = 4; pub const SHT_NOBITS: i64 = 8; pub const SHF_WRITE: i64 = 0x1; pub const SHF_ALLOC: i64 = 0x2; pub const SHF_EXECINSTR: i64 = 0x4; pub const SHF_INFO_LINK: i64 = 0x40; pub const STB_LOCAL: i64 = 0; pub const STB_GLOBAL: i64 = 1; pub const STT_NOTYPE: i64 = 0; pub const STT_FUNC: i64 = 2; pub const STT_SECTION: i64 = 3; pub const STT_FILE: i64 = 4; pub const SHN_UNDEF: i64 = 0; pub const SHN_ABS: i64 = 0xfff1; pub const R_X86_64_64: i64 = 1; pub const R_X86_64_PC32: i64 = 2; pub const R_X86_64_PLT32: i64 = 4;  // --- Structs --------------------------------------------------------------
 
 pub struct Symbol {
     pub name: str,
@@ -3124,294 +3115,194 @@ fn parse_byte_reg(s: str) -> i64 {
 }
 // Assembles the final ELF64 relocatable object file.
 pub fn ElfEmitter_build_elf(self: & mut ElfEmitter) -> ResultVec {
-    var buf: Vec = Vec::new();
-    // ELF Header (64 bytes)
-    buf.push(ELFMAG0);
-    buf.push(ELFMAG1);
-    buf.push(ELFMAG2);
-    buf.push(ELFMAG3);
-    buf.push(ELFCLASS64);
-    buf.push(ELFDATA2LSB);
-    buf.push(EV_CURRENT);
-    buf.push(ELFOSABI_NONE);
-    // 8 bytes padding
-    var pi: i64 = 0;
-    while pi < 8 {
-        buf.push(0);
-        pi = pi + 1;
+    // TG13: the object from compiler/image_writer.fd (the old body wrote a
+    // malformed ET_REL and is gone: docs/image-writer.md)
+    return ElfEmitter_build_elf_img(self);
+}
+
+/// The .rodata offset of the label `name`, or -1.
+fn elf_rodata_offset(self: & ElfEmitter, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < self.rodata_symbols.len() {
+        var rs: RodataSym = self.rodata_symbols.get(i);
+        if rs.name == name {
+            return rs.offset;
+        }
+        i = i + 1;
     }
-    emit_u16(& mut buf, ET_REL);
-    // e_type
-    emit_u16(& mut buf, self.machine);
-    // e_machine
-    emit_u32(& mut buf, EV_CURRENT);
-    // e_version
-    emit_u64(& mut buf, 0);
-    // e_entry (0 for relocatable)
-    emit_u64(& mut buf, 0);
-    // e_phoff (no program headers)
-    // e_shoff: section headers offset (computed later)
-    var shoff_pos: i64 = buf.len();
-    emit_u64(& mut buf, 0);
-    // placeholder
-    emit_u32(& mut buf, 0);
-    // e_flags
-    emit_u16(& mut buf, 64);
-    // e_ehsize
-    emit_u16(& mut buf, 0);
-    // e_phentsize
-    emit_u16(& mut buf, 0);
-    // e_phnum
-    emit_u16(& mut buf, 64);
-    // e_shentsize
-    emit_u16(& mut buf, 0);
-    // e_shnum (placeholder)
-    emit_u16(& mut buf, 0);
-    // e_shstrndx (placeholder)
-    // Section data follows ELF header
-    // .text section
-    var text_offset: i64 = buf.len();
-    var ti: i64 = 0;
-    while ti < self.text.len() {
-        buf.push(self.text.get(ti));
-        ti = ti + 1;
+    return 0 - 1;
+}
+
+/// The .symtab index of the emitter's symbol `old` (0, the null symbol,
+/// when there is no such symbol).
+fn elf_img_sym_index(newidx: & Vec<i64>, old: i64) -> i64 {
+    if old < 0 || old >= newidx.len() {
+        return 0;
     }
-    // .rodata section
-    var rodata_offset: i64 = buf.len();
-    var ri: i64 = 0;
-    while ri < self.rodata.len() {
-        buf.push(self.rodata.get(ri));
-        ri = ri + 1;
+    return newidx.get(old);
+}
+
+/// TG13: the ELF64 relocatable object of the assembler path (`fid codegen
+/// --elf`, build_executable) over image_writer. Unlike the old body above
+/// it is well-formed (readelf -a, the linker in compiler/linker.fd and
+/// ld read it), so the bytes differ (docs/image-writer.md):
+///   - 64-byte section headers (sh_addr 0 included; the old ones were 56)
+///   - r_info = symbol << 32 | type, the symbol counted from the null
+///     symbol (the old body swapped the halves and was off by one)
+///   - the local symbols first, .symtab's sh_info the first global
+///   - the .rodata labels (.str_N, .flt_N, .vtable_*) defined in section
+///     2, so that references to them resolve; undefined symbols global
+///   - .symtab, the relocations and the section headers 8-byte aligned,
+///     .rodata 16-byte aligned
+///   - an AArch64/RISC-V emitter's assembly text (`comment`) in .comment
+/// Sections: 0 null, 1 .text, 2 .rodata, 3 .symtab, 4 .strtab,
+/// 5 .shstrtab, 6 .rela.text, 7 .rela.rodata, then the custom sections,
+/// then .comment when there is one.
+pub fn ElfEmitter_build_elf_img(self: & mut ElfEmitter) -> ResultVec {
+    // The symbols, locals first; newidx: an emitter index -> .symtab index
+    var n: i64 = self.symbols.len();
+    var newidx: Vec<i64> = Vec::new();
+    while newidx.len() < n {
+        newidx.push(0);
     }
-    // .symtab section
-    var symtab_offset: i64 = buf.len();
-    // Null symbol (index 0)
-    emit_u32(& mut buf, 0);
-    // st_name
-    buf.push(0);
-    buf.push(0);
-    // st_info, st_other
-    emit_u16(& mut buf, 0);
-    // st_shndx
-    emit_u64(& mut buf, 0);
-    // st_value
-    emit_u64(& mut buf, 0);
-    // st_size
-    // Real symbols
-    var si: i64 = 0;
-    while si < self.symbols.len() {
-        var sym: Symbol = self.symbols.get(si);
-        var name_off: i64 = ElfEmitter_add_strtab(self, sym.name);
-        emit_u32(& mut buf, name_off);
-        // st_name
-        var st_info: i64 = (sym.binding << 4) | sym.sym_type;
-        buf.push(st_info & 0xFF);
-        // st_info
-        buf.push(0);
-        // st_other
-        emit_u16(& mut buf, sym.section);
-        // st_shndx
-        emit_u64(& mut buf, sym.value);
-        // st_value
-        emit_u64(& mut buf, sym.size);
-        // st_size
-        si = si + 1;
-    }
-    var symtab_size: i64 = buf.len() - symtab_offset;
-    // .strtab section
-    var strtab_offset: i64 = buf.len();
-    var stri: i64 = 0;
-    while stri < self.strtab.len() {
-        buf.push(self.strtab.get(stri));
-        stri = stri + 1;
-    }
-    // .shstrtab section
-    var shstrtab_offset: i64 = buf.len();
-    var shstri: i64 = 0;
-    while shstri < self.shstrtab.len() {
-        buf.push(self.shstrtab.get(shstri));
-        shstri = shstri + 1;
-    }
-    // .rela.text section
-    var rela_offset: i64 = buf.len();
-    var rli: i64 = 0;
-    while rli < self.relocations.len() {
-        var rel: Relocation = self.relocations.get(rli);
-        emit_u64(& mut buf, rel.offset);
-        // r_offset
-        // r_info = (symbol << 32) | type
-        emit_u32(& mut buf, rel.symbol);
-        // r_info lower 32 = symbol
-        emit_u32(& mut buf, rel.rtype);
-        // r_info upper 32 = type
-        emit_u64(& mut buf, rel.addend);
-        // r_addend
-        rli = rli + 1;
-    }
-    var rela_size: i64 = buf.len() - rela_offset;
-    // .rela.rodata section (relocations inside .rodata — e.g. vtable entries)
-    var rela_rodata_offset: i64 = buf.len();
-    var rrli: i64 = 0;
-    while rrli < self.rodata_relocations.len() {
-        var rrel: Relocation = self.rodata_relocations.get(rrli);
-        emit_u64(& mut buf, rrel.offset);
-        emit_u32(& mut buf, rrel.symbol);
-        emit_u32(& mut buf, rrel.rtype);
-        emit_u64(& mut buf, rrel.addend);
-        rrli = rrli + 1;
-    }
-    var rela_rodata_size: i64 = buf.len() - rela_rodata_offset;
-    // Custom section data (emitted after .rela.text, before section headers)
-    var custom_section_offsets: Vec<i64> = Vec::new();
-    var csi: i64 = 0;
-    while csi < self.custom_sections.len() {
-        var cs: CustomSection = self.custom_sections.get(csi);
-        var cs_offset: i64 = buf.len();
-        custom_section_offsets.push(cs_offset);
-        // For SHT_NOBITS (.bss), no data is emitted — just record the offset
-        if cs.sh_type != SHT_NOBITS {
-            var di: i64 = 0;
-            while di < cs.data.len() {
-                buf.push(cs.data.get(di));
-                di = di + 1;
+    var syms: Vec<ImgSym> = Vec::new();
+    var pass: i64 = 0;
+    while pass < 2 {
+        var i: i64 = 0;
+        while i < n {
+            var s: Symbol = self.symbols.get(i);
+            var sect: i64 = s.section;
+            var value: i64 = s.value;
+            var size: i64 = s.size;
+            var bind: i64 = s.binding;
+            var kind: i64 = s.sym_type;
+            if !s.is_defined {
+                var ro: i64 = elf_rodata_offset(self, s.name);
+                if ro >= 0 {
+                    // a .rodata label the code refers to
+                    sect = 2;
+                    value = ro;
+                    size = 0;
+                    bind = STB_LOCAL;
+                    kind = STT_NOTYPE;
+                } else {
+                    sect = SHN_UNDEF;
+                    value = 0;
+                    size = 0;
+                    bind = STB_GLOBAL;
+                }
+            }
+            var local: bool = bind == STB_LOCAL;
+            if (pass == 0 && local) || (pass == 1 && !local) {
+                newidx.set(i, syms.len() + 1);
+                syms.push(img_sym(s.name, value, size, sect, kind, bind));
+            }
+            i = i + 1;
+        }
+        if pass == 0 {
+            // the .rodata labels no symbol names yet, as locals of .rodata
+            var r: i64 = 0;
+            while r < self.rodata_symbols.len() {
+                var rs: RodataSym = self.rodata_symbols.get(r);
+                if symindex_lookup(self.symbol_index, rs.name) < 0 {
+                    syms.push(img_sym(rs.name, rs.offset, 0, 2, STT_NOTYPE, STB_LOCAL));
+                }
+                r = r + 1;
             }
         }
-        csi = csi + 1;
+        pass = pass + 1;
     }
-    // Section headers
-    var shoff: i64 = buf.len();
-    // Section 0: null
-    emit_u32(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u64(& mut buf, 0);
-    emit_u64(& mut buf, 0);
-    emit_u64(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u64(& mut buf, 0);
-    emit_u64(& mut buf, 0);
-    // Section 1: .text
-    var text_name: i64 = ElfEmitter_add_shstrtab(self, ".text");
-    emit_u32(& mut buf, text_name);
-    emit_u32(& mut buf, SHT_PROGBITS);
-    emit_u64(& mut buf, SHF_ALLOC | SHF_EXECINSTR);
-    emit_u64(& mut buf, text_offset);
-    emit_u64(& mut buf, self.text.len());
-    emit_u32(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u64(& mut buf, 16);
-    emit_u64(& mut buf, 0);
-    // Section 2: .rodata
-    var rodata_name: i64 = ElfEmitter_add_shstrtab(self, ".rodata");
-    emit_u32(& mut buf, rodata_name);
-    emit_u32(& mut buf, SHT_PROGBITS);
-    emit_u64(& mut buf, SHF_ALLOC);
-    emit_u64(& mut buf, rodata_offset);
-    emit_u64(& mut buf, self.rodata.len());
-    emit_u32(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u64(& mut buf, 16);
-    emit_u64(& mut buf, 0);
-    // Section 3: .symtab
-    var symtab_name: i64 = ElfEmitter_add_shstrtab(self, ".symtab");
-    var strtab_idx: i64 = 4;
-    emit_u32(& mut buf, symtab_name);
-    emit_u32(& mut buf, SHT_SYMTAB);
-    emit_u64(& mut buf, 0);
-    emit_u64(& mut buf, symtab_offset);
-    emit_u64(& mut buf, symtab_size);
-    emit_u32(& mut buf, strtab_idx);
-    emit_u32(& mut buf, 1);
-    emit_u64(& mut buf, 8);
-    emit_u64(& mut buf, 24);
-    // Section 4: .strtab
-    var strtab_name: i64 = ElfEmitter_add_shstrtab(self, ".strtab");
-    emit_u32(& mut buf, strtab_name);
-    emit_u32(& mut buf, SHT_STRTAB);
-    emit_u64(& mut buf, 0);
-    emit_u64(& mut buf, strtab_offset);
-    emit_u64(& mut buf, self.strtab.len());
-    emit_u32(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u64(& mut buf, 1);
-    emit_u64(& mut buf, 0);
-    // Section 5: .shstrtab
-    var shstrtab_name: i64 = ElfEmitter_add_shstrtab(self, ".shstrtab");
-    emit_u32(& mut buf, shstrtab_name);
-    emit_u32(& mut buf, SHT_STRTAB);
-    emit_u64(& mut buf, 0);
-    emit_u64(& mut buf, shstrtab_offset);
-    emit_u64(& mut buf, self.shstrtab.len());
-    emit_u32(& mut buf, 0);
-    emit_u32(& mut buf, 0);
-    emit_u64(& mut buf, 1);
-    emit_u64(& mut buf, 0);
-    // Section 6: .rela.text — sh_link=.symtab(3), sh_info=.text(1)
-    var rela_name: i64 = ElfEmitter_add_shstrtab(self, ".rela.text");
-    emit_u32(& mut buf, rela_name);
-    emit_u32(& mut buf, SHT_RELA);
-    emit_u64(& mut buf, SHF_INFO_LINK);
-    emit_u64(& mut buf, rela_offset);
-    emit_u64(& mut buf, rela_size);
-    emit_u32(& mut buf, 3);
-    emit_u32(& mut buf, 1);
-    emit_u64(& mut buf, 8);
-    emit_u64(& mut buf, 24);
-    // Section 7: .rela.rodata — sh_link=.symtab(3), sh_info=.rodata(2)
-    var rela_rodata_name: i64 = ElfEmitter_add_shstrtab(self, ".rela.rodata");
-    emit_u32(& mut buf, rela_rodata_name);
-    emit_u32(& mut buf, SHT_RELA);
-    emit_u64(& mut buf, SHF_INFO_LINK);
-    emit_u64(& mut buf, rela_rodata_offset);
-    emit_u64(& mut buf, rela_rodata_size);
-    emit_u32(& mut buf, 3);
-    emit_u32(& mut buf, 2);
-    emit_u64(& mut buf, 8);
-    emit_u64(& mut buf, 24);
-    // Custom sections (starting at section index 8)
-    var csi2: i64 = 0;
-    while csi2 < self.custom_sections.len() {
-        var cs: CustomSection = self.custom_sections.get(csi2);
-        var cs_name_off: i64 = ElfEmitter_add_shstrtab(self, cs.name);
-        var cs_off: i64 = custom_section_offsets.get(csi2);
-        var cs_size: i64 = cs.data.len();
-        // For SHT_NOBITS, sh_offset is alignment-aligned and sh_size is the size
-        emit_u32(& mut buf, cs_name_off);
-        emit_u32(& mut buf, cs.sh_type);
-        emit_u64(& mut buf, cs.sh_flags);
-        emit_u64(& mut buf, cs_off);
-        emit_u64(& mut buf, cs_size);
-        emit_u32(& mut buf, 0);
-        // sh_link
-        emit_u32(& mut buf, 0);
-        // sh_info
-        emit_u64(& mut buf, cs.align);
-        emit_u64(& mut buf, 0);
-        // sh_entsize
-        csi2 = csi2 + 1;
+    var strtab: Vec<i64> = Vec::new();
+    strtab.push(0);
+    var symtab: Vec<i64> = img_elf_symtab(& syms, & mut strtab);
+    var first_global: i64 = img_elf_first_global(& syms);
+    // The relocations of .text and of .rodata
+    var rela_text: Vec<i64> = Vec::new();
+    var ri: i64 = 0;
+    while ri < self.relocations.len() {
+        var rel: Relocation = self.relocations.get(ri);
+        img_elf_rela(& mut rela_text, rel.offset, elf_img_sym_index(& newidx, rel.symbol), rel.rtype, rel.addend);
+        ri = ri + 1;
     }
-    var num_sections: i64 = 8 + self.custom_sections.len();
-    // Patch e_shoff, e_shnum, e_shstrndx
-    // e_shoff at offset 40
-    var p: i64 = 40;
-    buf.set(p, shoff & 0xFF);
-    buf.set(p + 1, (shoff >> 8) & 0xFF);
-    buf.set(p + 2, (shoff >> 16) & 0xFF);
-    buf.set(p + 3, (shoff >> 24) & 0xFF);
-    buf.set(p + 4, (shoff >> 32) & 0xFF);
-    buf.set(p + 5, (shoff >> 40) & 0xFF);
-    buf.set(p + 6, (shoff >> 48) & 0xFF);
-    buf.set(p + 7, (shoff >> 56) & 0xFF);
-    // e_shnum at offset 60
-    p = 60;
-    buf.set(p, num_sections & 0xFF);
-    buf.set(p + 1, (num_sections >> 8) & 0xFF);
-    // e_shstrndx at offset 62
-    p = 62;
-    var shstrndx: i64 = 5;
-    buf.set(p, shstrndx & 0xFF);
-    buf.set(p + 1, (shstrndx >> 8) & 0xFF);
-    return ResultVec::Ok(buf);
+    var rela_ro: Vec<i64> = Vec::new();
+    ri = 0;
+    while ri < self.rodata_relocations.len() {
+        var rrel: Relocation = self.rodata_relocations.get(ri);
+        img_elf_rela(& mut rela_ro, rrel.offset, elf_img_sym_index(& newidx, rrel.symbol), rrel.rtype, rrel.addend);
+        ri = ri + 1;
+    }
+    // The section names, then the data in section order
+    var names: Vec<str> = Vec::new();
+    names.push("");
+    names.push(".text");
+    names.push(".rodata");
+    names.push(".symtab");
+    names.push(".strtab");
+    names.push(".shstrtab");
+    names.push(".rela.text");
+    names.push(".rela.rodata");
+    var ci: i64 = 0;
+    while ci < self.custom_sections.len() {
+        var cn: CustomSection = self.custom_sections.get(ci);
+        names.push(cn.name);
+        ci = ci + 1;
+    }
+    var has_comment: bool = self.comment.len() > 0;
+    if has_comment {
+        names.push(".comment");
+    }
+    var shstrtab: Vec<i64> = img_elf_shstrtab(& names);
+    var out: Vec<i64> = Vec::new();
+    img_elf_header(& mut out, ET_REL, self.machine, 0, 0, 0, 0, 0, 0, 0, 0);
+    var text_off: i64 = out.len();
+    img_append(& mut out, & self.text);
+    img_align(& mut out, 16);
+    var ro_off: i64 = out.len();
+    img_append(& mut out, & self.rodata);
+    img_align(& mut out, 8);
+    var sym_off: i64 = out.len();
+    img_append(& mut out, & symtab);
+    var str_off: i64 = out.len();
+    img_append(& mut out, & strtab);
+    var shs_off: i64 = out.len();
+    img_append(& mut out, & shstrtab);
+    img_align(& mut out, 8);
+    var rt_off: i64 = out.len();
+    img_append(& mut out, & rela_text);
+    var rr_off: i64 = out.len();
+    img_append(& mut out, & rela_ro);
+    var secs: Vec<ImgSec> = Vec::new();
+    secs.push(img_sec("", SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0));
+    secs.push(img_sec(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 0, text_off, self.text.len(), 0, 0, 16, 0));
+    secs.push(img_sec(".rodata", SHT_PROGBITS, SHF_ALLOC, 0, ro_off, self.rodata.len(), 0, 0, 16, 0));
+    secs.push(img_sec(".symtab", SHT_SYMTAB, 0, 0, sym_off, symtab.len(), 4, first_global, 8, 24));
+    secs.push(img_sec(".strtab", SHT_STRTAB, 0, 0, str_off, strtab.len(), 0, 0, 1, 0));
+    secs.push(img_sec(".shstrtab", SHT_STRTAB, 0, 0, shs_off, shstrtab.len(), 0, 0, 1, 0));
+    secs.push(img_sec(".rela.text", SHT_RELA, SHF_INFO_LINK, 0, rt_off, rela_text.len(), 3, 1, 8, 24));
+    secs.push(img_sec(".rela.rodata", SHT_RELA, SHF_INFO_LINK, 0, rr_off, rela_ro.len(), 3, 2, 8, 24));
+    ci = 0;
+    while ci < self.custom_sections.len() {
+        var cs: CustomSection = self.custom_sections.get(ci);
+        var calign: i64 = cs.align;
+        if calign < 1 {
+            calign = 1;
+        }
+        img_align(& mut out, calign);
+        var c_off: i64 = out.len();
+        if cs.sh_type != SHT_NOBITS {
+            img_append(& mut out, & cs.data);
+        }
+        secs.push(img_sec(cs.name, cs.sh_type, cs.sh_flags, 0, c_off, cs.data.len(), 0, 0, cs.align, 0));
+        ci = ci + 1;
+    }
+    if has_comment {
+        var cm_off: i64 = out.len();
+        img_append(& mut out, & self.comment);
+        secs.push(img_sec(".comment", SHT_PROGBITS, 0, 0, cm_off, self.comment.len(), 0, 0, 1, 0));
+    }
+    img_align(& mut out, 8);
+    img_elf_sections(& mut out, & secs);
+    return ResultVec::Ok(out);
 }
 
 // --- encode_asm_block ---

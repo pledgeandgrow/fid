@@ -1,0 +1,302 @@
+// stdlib/quic (competitive SL2, part 1): QUIC v1 packet protection against
+// every sample of RFC 9001 Appendix A: the Initial secrets, keys, IVs and
+// header-protection keys (A.1); the client Initial (A.2) and server Initial
+// (A.3) protected byte for byte from their headers and frames, and opened
+// again by the peer; the Retry Integrity Tag (A.4); the ChaCha20-Poly1305
+// short-header packet (A.5) with its key-update secret. Then RFC 9000's
+// varint (A.1) and packet-number (A.3) examples, a tampered packet and a
+// tampered Retry rejected. A wrong answer panics on every backend.
+//
+// Expected output:
+// initial secret ok
+// client initial secret ok
+// client key ok
+// client iv ok
+// client hp ok
+// server initial secret ok
+// server key ok
+// server iv ok
+// server hp ok
+// client header ok
+// client sample ok
+// client mask ok
+// client packet ok
+// client open pn 2
+// client open header ok
+// client open payload ok
+// server header ok
+// server mask ok
+// server packet ok
+// server open pn 1
+// server open payload ok
+// server parse ok
+// retry key ok
+// retry iv ok
+// retry tag ok
+// retry check: good accepted, bad rejected
+// chacha key ok
+// chacha iv ok
+// chacha hp ok
+// chacha ku ok
+// chacha nonce ok
+// chacha header ok
+// chacha mask ok
+// chacha packet ok
+// chacha open pn 654360564
+// chacha open payload ok
+// key update ok
+// varint ok
+// packet numbers ok
+// tampered packets rejected
+// quic protection vectors ok
+use quic;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+/// Secrets and keys are @secret (complaint CO1): the RFC vectors print
+/// them through this audited release.
+@declassify fn reveal(v: Vec<i64>) -> Vec<i64> { return v; }
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn copy(v: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    // A.1: keys from the client's Destination Connection ID
+    val dcid: Vec<i64> = hb("8394c8f03e515708");
+    check("initial secret", he(reveal(quic_initial_secret(dcid))),
+        "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44");
+    check("client initial secret", he(reveal(quic_client_initial_secret(dcid))),
+        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
+    val ck: QuicKeys = quic_initial_keys(dcid, false);
+    check("client key", he(reveal(ck.key)), "1f369613dd76d5467730efcbe3b1a22d");
+    check("client iv", he(reveal(ck.iv)), "fa044b2f42a3fd3b46fb255c");
+    check("client hp", he(reveal(ck.hp)), "9f50449e04a0e810283a1e9933adedd2");
+    check("server initial secret", he(reveal(quic_server_initial_secret(dcid))),
+        "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b");
+    val sk: QuicKeys = quic_initial_keys(dcid, true);
+    check("server key", he(reveal(sk.key)), "cf3a5331653c364c88f0f379b6067e37");
+    check("server iv", he(reveal(sk.iv)), "0ac1493ca1905853b0bba03e");
+    check("server hp", he(reveal(sk.hp)), "c206b8d9b9f0f37644430b490eeaa314");
+
+    // A.2: the client Initial, a CRYPTO frame padded to 1162 bytes
+    val none: Vec<i64> = Vec::new();
+    var cpay: Vec<i64> = hb("060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e868" +
+        "04fe3a47f06a2b69484c00000413011302010000c000000010000e00000b6578" +
+        "616d706c652e636f6dff01000100000a00080006001d00170018001000070005" +
+        "04616c706e000500050100000000003300260024001d00209370b2c9caa47fba" +
+        "baf4559fedba753de171fa71f50f1ce15d43e994ec74d748002b000302030400" +
+        "0d0010000e0403050306030203080408050806002d00020101001c0002400100" +
+        "3900320408ffffffffffffffff05048000ffff07048000ffff08011001048000" +
+        "75300901100f088394c8f03e51570806048000ffff");
+    while cpay.len() < 1162 {
+        cpay.push(0);
+    }
+    val chdr: Vec<i64> = quic_long_header(QUIC_INITIAL, QUIC_V1, dcid, none, none, 2, 4, cpay.len());
+    check("client header", he(chdr), "c300000001088394c8f03e5157080000449e00000002");
+    val cpkt: Vec<i64> = quic_protect(ck, chdr, 2, cpay);
+    val want_c: str = "c000000001088394c8f03e5157080000449e7b9aec34d1b1c98dd7689fb8ec11" +
+        "d242b123dc9bd8bab936b47d92ec356c0bab7df5976d27cd449f63300099f399" +
+        "1c260ec4c60d17b31f8429157bb35a1282a643a8d2262cad67500cadb8e7378c" +
+        "8eb7539ec4d4905fed1bee1fc8aafba17c750e2c7ace01e6005f80fcb7df6212" +
+        "30c83711b39343fa028cea7f7fb5ff89eac2308249a02252155e2347b63d58c5" +
+        "457afd84d05dfffdb20392844ae812154682e9cf012f9021a6f0be17ddd0c208" +
+        "4dce25ff9b06cde535d0f920a2db1bf362c23e596d11a4f5a6cf3948838a3aec" +
+        "4e15daf8500a6ef69ec4e3feb6b1d98e610ac8b7ec3faf6ad760b7bad1db4ba3" +
+        "485e8a94dc250ae3fdb41ed15fb6a8e5eba0fc3dd60bc8e30c5c4287e53805db" +
+        "059ae0648db2f64264ed5e39be2e20d82df566da8dd5998ccabdae053060ae6c" +
+        "7b4378e846d29f37ed7b4ea9ec5d82e7961b7f25a9323851f681d582363aa5f8" +
+        "9937f5a67258bf63ad6f1a0b1d96dbd4faddfcefc5266ba6611722395c906556" +
+        "be52afe3f565636ad1b17d508b73d8743eeb524be22b3dcbc2c7468d54119c74" +
+        "68449a13d8e3b95811a198f3491de3e7fe942b330407abf82a4ed7c1b311663a" +
+        "c69890f4157015853d91e923037c227a33cdd5ec281ca3f79c44546b9d90ca00" +
+        "f064c99e3dd97911d39fe9c5d0b23a229a234cb36186c4819e8b9c5927726632" +
+        "291d6a418211cc2962e20fe47feb3edf330f2c603a9d48c0fcb5699dbfe58964" +
+        "25c5bac4aee82e57a85aaf4e2513e4f05796b07ba2ee47d80506f8d2c25e50fd" +
+        "14de71e6c418559302f939b0e1abd576f279c4b2e0feb85c1f28ff18f58891ff" +
+        "ef132eef2fa09346aee33c28eb130ff28f5b766953334113211996d20011a198" +
+        "e3fc433f9f2541010ae17c1bf202580f6047472fb36857fe843b19f5984009dd" +
+        "c324044e847a4f4a0ab34f719595de37252d6235365e9b84392b061085349d73" +
+        "203a4a13e96f5432ec0fd4a1ee65accdd5e3904df54c1da510b0ff20dcc0c77f" +
+        "cb2c0e0eb605cb0504db87632cf3d8b4dae6e705769d1de354270123cb11450e" +
+        "fc60ac47683d7b8d0f811365565fd98c4c8eb936bcab8d069fc33bd801b03ade" +
+        "a2e1fbc5aa463d08ca19896d2bf59a071b851e6c239052172f296bfb5e724047" +
+        "90a2181014f3b94a4e97d117b438130368cc39dbb2d198065ae3986547926cd2" +
+        "162f40a29f0c3c8745c0f50fba3852e566d44575c29d39a03f0cda721984b6f4" +
+        "40591f355e12d439ff150aab7613499dbd49adabc8676eef023b15b65bfc5ca0" +
+        "6948109f23f350db82123535eb8a7433bdabcb909271a6ecbcb58b936a88cd4e" +
+        "8f2e6ff5800175f113253d8fa9ca8885c2f552e657dc603f252e1a8e308f76f0" +
+        "be79e2fb8f5d5fbbe2e30ecadd220723c8c0aea8078cdfcb3868263ff8f09400" +
+        "54da48781893a7e49ad5aff4af300cd804a6b6279ab3ff3afb64491c85194aab" +
+        "760d58a606654f9f4400e8b38591356fbf6425aca26dc85244259ff2b19c41b9" +
+        "f96f3ca9ec1dde434da7d2d392b905ddf3d1f9af93d1af5950bd493f5aa731b4" +
+        "056df31bd267b6b90a079831aaf579be0a39013137aac6d404f518cfd4684064" +
+        "7e78bfe706ca4cf5e9c5453e9f7cfd2b8b4c8d169a44e55c88d4a9a7f9474241" +
+        "e221af44860018ab0856972e194cd934";
+    val csample: Vec<i64> = quic_slice(cpkt, 22, 38);
+    check("client sample", he(csample), "d1b1c98dd7689fb8ec11d242b123dc9b");
+    check("client mask", he(quic_hp_mask(ck, csample)), "437b9aec36");
+    if cpkt.len() != 1200 {
+        p_panic("client packet: " + int_to_str(cpkt.len()) + " bytes, want 1200");
+    }
+    check("client packet", he(cpkt), want_c);
+    // The server opens it (no packet received yet: largest -1)
+    val co: QuicOpened = quic_unprotect_long(ck, cpkt, -1);
+    if !co.ok { p_panic("client open failed"); }
+    println("client open pn " + int_to_str(co.pn));
+    check("client open header", he(co.header), he(chdr));
+    check("client open payload", he(co.payload), he(cpay));
+
+    // A.3: the server Initial, ACK + CRYPTO, packet number 1 on 2 bytes
+    val scid: Vec<i64> = hb("f067a5502a4262b5");
+    val spay: Vec<i64> = hb("02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf739" +
+        "88cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c94" +
+        "0d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00" +
+        "020304");
+    val shdr: Vec<i64> = quic_long_header(QUIC_INITIAL, QUIC_V1, none, scid, none, 1, 2, spay.len());
+    check("server header", he(shdr), "c1000000010008f067a5502a4262b50040750001");
+    val spkt: Vec<i64> = quic_protect(sk, shdr, 1, spay);
+    check("server mask", he(quic_hp_mask(sk, quic_slice(spkt, 22, 38))), "2ec0d8356a");
+    val want_s: str = "cf000000010008f067a5502a4262b5004075c0d95a482cd0991cd25b0aac406a" +
+        "5816b6394100f37a1c69797554780bb38cc5a99f5ede4cf73c3ec2493a1839b3" +
+        "dbcba3f6ea46c5b7684df3548e7ddeb9c3bf9c73cc3f3bded74b562bfb19fb84" +
+        "022f8ef4cdd93795d77d06edbb7aaf2f58891850abbdca3d20398c276456cbc4" +
+        "2158407dd074ee";
+    check("server packet", he(spkt), want_s);
+    val so: QuicOpened = quic_unprotect_long(sk, spkt, 0);
+    if !so.ok { p_panic("server open failed"); }
+    println("server open pn " + int_to_str(so.pn));
+    check("server open payload", he(so.payload), he(spay));
+    val sh: QuicLongHeader = quic_parse_long(spkt);
+    if !sh.ok || sh.ptype != QUIC_INITIAL || sh.version != 1 || sh.dcid.len() != 0
+        || sh.token.len() != 0 || sh.pn_offset != 18 || sh.end != spkt.len() {
+        p_panic("server parse: wrong long header fields");
+    }
+    check("server parse", he(sh.scid), "f067a5502a4262b5");
+
+    // A.4: the Retry, its tag over the client's original DCID
+    val rk: QuicKeys = quic_keys_from_secret(
+        hb("d9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e"),
+        QUIC_AEAD_AES_128_GCM);
+    check("retry key", he(reveal(rk.key)), "be0c690b9f66575a1d766b54e368c84e");
+    check("retry iv", he(reveal(rk.iv)), "461599d35d632bf2239825bb");
+    val retry: Vec<i64> = hb("ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba");
+    check("retry tag", he(quic_retry_tag(dcid, quic_slice(retry, 0, retry.len() - 16))),
+        "04a265ba2eff4d829058fb3f0f2496ba");
+    if !quic_retry_valid(dcid, retry) { p_panic("retry: the RFC's Retry was rejected"); }
+    var rbad: Vec<i64> = copy(retry);
+    rbad.set(17, rbad.get(17) ^ 1);
+    if quic_retry_valid(dcid, rbad) { p_panic("retry: a tampered token was accepted"); }
+    if quic_retry_valid(hb("8394c8f03e515709"), retry) { p_panic("retry: another DCID was accepted"); }
+    val rh: QuicLongHeader = quic_parse_long(retry);
+    if !rh.ok || rh.ptype != QUIC_RETRY || !str_equal(he(rh.token), "746f6b656e") {
+        p_panic("retry: wrong parse");
+    }
+    println("retry check: good accepted, bad rejected");
+
+    // A.5: ChaCha20-Poly1305, a short header, packet number 654360564
+    val secret: Vec<i64> = hb("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b");
+    val xk: QuicKeys = quic_keys_from_secret(secret, QUIC_AEAD_CHACHA20_POLY1305);
+    check("chacha key", he(reveal(xk.key)),
+        "c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8");
+    check("chacha iv", he(reveal(xk.iv)), "e0459b3474bdd0e44a41c144");
+    check("chacha hp", he(reveal(xk.hp)),
+        "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
+    val ku: Vec<i64> = quic_next_secret(secret);
+    check("chacha ku", he(reveal(ku)),
+        "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9");
+    val pn: i64 = 654360564;
+    check("chacha nonce", he(reveal(quic_nonce(xk.iv, pn))), "e0459b3474bdd0e46d417eb0");
+    val xhdr: Vec<i64> = quic_short_header(none, pn, 3, false, false);
+    check("chacha header", he(xhdr), "4200bff4");
+    val xpkt: Vec<i64> = quic_protect(xk, xhdr, pn, hb("01"));
+    check("chacha mask", he(quic_hp_mask(xk, quic_slice(xpkt, 5, 21))), "aefefe7d03");
+    check("chacha packet", he(xpkt), "4cfe4189655e5cd55c41f69080575d7999c25a5bfb");
+    val xo: QuicOpened = quic_unprotect_short(xk, xpkt, 0, pn - 1);
+    if !xo.ok { p_panic("chacha open failed"); }
+    println("chacha open pn " + int_to_str(xo.pn));
+    check("chacha open payload", he(xo.payload), "01");
+
+    // Key update: new key and IV from "quic ku", the hp key kept; a packet
+    // sealed under the old keys does not open under the new ones
+    val uk: QuicKeys = quic_updated_keys(xk, ku);
+    val uk_want: QuicKeys = quic_keys_from_secret(ku, QUIC_AEAD_CHACHA20_POLY1305);
+    if !str_equal(he(reveal(uk.key)), he(reveal(uk_want.key)))
+        || !str_equal(he(reveal(uk.iv)), he(reveal(uk_want.iv)))
+        || !str_equal(he(reveal(uk.hp)), he(reveal(xk.hp))) {
+        p_panic("key update: wrong keys");
+    }
+    if quic_unprotect_short(uk, xpkt, 0, pn - 1).ok { p_panic("key update: old packet opened"); }
+    val upkt: Vec<i64> = quic_protect(uk, quic_short_header(none, pn + 1, 3, true, false), pn + 1, hb("01"));
+    val uo: QuicOpened = quic_unprotect_short(uk, upkt, 0, pn);
+    if !uo.ok || uo.pn != pn + 1 || (uo.header.get(0) & 0x04) == 0 {
+        p_panic("key update: new packet did not open");
+    }
+    println("key update ok");
+
+    // RFC 9000 A.1: varints
+    val v8: QuicVarint = quic_varint_decode(hb("c2197c5eff14e88c"), 0);
+    val v4: QuicVarint = quic_varint_decode(hb("9d7f3e7d"), 0);
+    val v2: QuicVarint = quic_varint_decode(hb("7bbd"), 0);
+    val v1: QuicVarint = quic_varint_decode(hb("25"), 0);
+    val v2b: QuicVarint = quic_varint_decode(hb("4025"), 0);
+    if !v8.ok || v8.value != 151288809941952652 || v8.len != 8
+        || !v4.ok || v4.value != 494878333 || v4.len != 4
+        || !v2.ok || v2.value != 15293 || v2.len != 2
+        || !v1.ok || v1.value != 37 || v1.len != 1
+        || !v2b.ok || v2b.value != 37 || v2b.len != 2 {
+        p_panic("varint: wrong decode");
+    }
+    if quic_varint_decode(hb("c2197c"), 0).ok { p_panic("varint: a cut-short varint decoded"); }
+    if !str_equal(he(quic_varint_encode(151288809941952652)), "c2197c5eff14e88c")
+        || !str_equal(he(quic_varint_encode(494878333)), "9d7f3e7d")
+        || !str_equal(he(quic_varint_encode(15293)), "7bbd")
+        || !str_equal(he(quic_varint_encode(37)), "25")
+        || !str_equal(he(quic_varint_encode_n(37, 2)), "4025")
+        || quic_varint_encode_n(16384, 2).len() != 0 {
+        p_panic("varint: wrong encode");
+    }
+    println("varint ok");
+
+    // RFC 9000 A.3: a 16-bit packet number after 0xa82f30ea; A.2: lengths
+    if quic_decode_pn(2821665002, 39730, 16) != 2821692210 {
+        p_panic("packet numbers: wrong decode of 0x9b32");
+    }
+    if quic_decode_pn(255, 0, 8) != 256 || quic_decode_pn(-1, 2, 32) != 2 {
+        p_panic("packet numbers: wrong wrap");
+    }
+    if quic_pn_length(2821692210, 2821665002) != 2 || quic_pn_length(0, -1) != 1
+        || quic_pn_length(10000000, 1) != 4 {
+        p_panic("packet numbers: wrong length");
+    }
+    println("packet numbers ok");
+
+    // Tampering: a payload byte, a header byte (AAD), the wrong keys
+    var t1: Vec<i64> = copy(spkt);
+    t1.set(t1.len() - 20, t1.get(t1.len() - 20) ^ 1);
+    if quic_unprotect_long(sk, t1, 0).ok { p_panic("tampered payload accepted"); }
+    var t2: Vec<i64> = copy(spkt);
+    t2.set(10, t2.get(10) ^ 1);
+    if quic_unprotect_long(sk, t2, 0).ok { p_panic("tampered header accepted"); }
+    if quic_unprotect_long(ck, spkt, 0).ok { p_panic("client keys opened a server packet"); }
+    if quic_unprotect_long(sk, quic_slice(spkt, 0, 30), 0).ok { p_panic("a cut packet opened"); }
+    println("tampered packets rejected");
+    println("quic protection vectors ok");
+    return 0;
+}

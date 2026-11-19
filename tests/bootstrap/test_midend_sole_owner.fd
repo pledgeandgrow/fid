@@ -1,0 +1,69 @@
+// LF16 in the mid-end (compiler/iropt.fd iro_sole_owner, FID_IROPT_ON=
+// soleown): a Vec made in a function and only given to core's Vec
+// functions has one owner, so the copy-on-write `vec_own` the lowering
+// puts before a write into one of its elements (`ps[i].x = ...`) does
+// nothing and is removed. A Vec shared by a copy keeps it: the copy's
+// write must not show in the original. A Vec given to a function keeps it
+// too. The program prints the same with the pass on and off.
+//
+// Expected output:
+// 55
+// 1 99
+// 30 3
+// 12
+
+struct P { x: i64, y: i64 }
+
+// one owner: both element writes lose their vec_own
+fn sole_fields() -> i64 {
+    var ps: Vec<P> = Vec::new();
+    ps.push(P { x: 1, y: 2 });
+    ps.push(P { x: 3, y: 4 });
+    ps[0].x = 10;
+    ps[1].y = 40;
+    return ps[0].x + ps[0].y + ps[1].x + ps[1].y;
+}
+
+// b shares a's buffer: b's write takes a copy first
+fn shared_fields() -> str {
+    var a: Vec<P> = Vec::new();
+    a.push(P { x: 1, y: 2 });
+    var b: Vec<P> = a;
+    b[0].x = 99;
+    return int_to_str(a[0].x) + " " + int_to_str(b[0].x);
+}
+
+// writes in a loop, on a Vec filled in another loop
+fn in_loop() -> str {
+    var ps: Vec<P> = Vec::new();
+    var i: i64 = 0;
+    while i < 3 {
+        ps.push(P { x: i, y: 1 });
+        i = i + 1;
+    }
+    i = 0;
+    while i < 3 {
+        ps[i].x = ps[i].x * 10;
+        i = i + 1;
+    }
+    return int_to_str(ps[0].x + ps[1].x + ps[2].x) + " " + int_to_str(ps[0].y + ps[1].y + ps[2].y);
+}
+
+fn total(ps: Vec<P>) -> i64 {
+    return ps[0].x + ps[0].y;
+}
+
+// given to a function: keeps its vec_own
+fn passed() -> i64 {
+    var ps: Vec<P> = Vec::new();
+    ps.push(P { x: 5, y: 6 });
+    ps[0].x = 6;
+    return total(ps);
+}
+
+fn main() {
+    println(sole_fields());
+    println(shared_fields());
+    println(in_loop());
+    println(passed());
+}

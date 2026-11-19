@@ -1,0 +1,111 @@
+// stdlib/app_lifecycle: the transition table, shortest paths, strict and
+// tolerant dispatch, observers with masks, launch kinds and time per
+// state, driven by iOS delegate methods and Android Activity callbacks.
+// Expected output:
+// table not-running: launch>inactive launch-background>background
+// table active: resign-active>inactive terminate>terminated memory-warning>active
+// table suspended: enter-foreground>inactive wake>background terminate>terminated
+// path active>suspended resign-active,enter-background,suspend
+// path suspended>active enter-foreground,become-active
+// path terminated>active launch,become-active
+// ios enter-background while active applied 2
+// A 10 B 3
+// B inactive>background background>suspended suspended>background
+// ios terminated launches=ch ms=7400/200/1400/3000 warnings=1 rejected=0
+// after unobserve A 10 removed true again false
+// android restart events 0 trim20 0 trim80 1
+// android terminated launches=cw ms=2000/30/4010/0 warnings=1 rejected=0
+// strict false rejected 1 state not-running
+// tolerant suspend from not-running 0 rejected 2
+// tolerant suspend from active 3 -> suspended
+// impossible 0 rejected 3
+use app_lifecycle;
+use vec;
+use string;
+
+var log_a: Vec<str> = Vec::new();
+var log_b: Vec<str> = Vec::new();
+
+fn obs_a(from: i64, to: i64, ev: i64) { log_a.push(lc_state_name(from) + ">" + lc_state_name(to)); }
+fn obs_b(from: i64, to: i64, ev: i64) { log_b.push(lc_state_name(from) + ">" + lc_state_name(to)); }
+
+fn row(s: i64) {
+    var line: str = "table " + lc_state_name(s) + ":";
+    var e: i64 = 0;
+    while e <= LC_EV_MEMORY_WARNING {
+        val n: i64 = lc_next(s, e);
+        if n >= 0 { line = line + " " + lc_event_name(e) + ">" + lc_state_name(n); }
+        e = e + 1;
+    }
+    println(line);
+}
+
+fn path(a: i64, b: i64) {
+    val p: Vec<i64> = lc_path(a, b);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < p.len() {
+        if i > 0 { s = s + ","; }
+        s = s + lc_event_name(p.get(i));
+        i = i + 1;
+    }
+    println("path " + lc_state_name(a) + ">" + lc_state_name(b) + " " + s);
+}
+
+fn main() {
+    row(LC_NOT_RUNNING);
+    row(LC_ACTIVE);
+    row(LC_SUSPENDED);
+    path(LC_ACTIVE, LC_SUSPENDED);
+    path(LC_SUSPENDED, LC_ACTIVE);
+    path(LC_TERMINATED, LC_ACTIVE);
+
+    var lc: Lifecycle = lifecycle_new();
+    val ida: i64 = lifecycle_observe(&mut lc, LC_MASK_ALL, obs_a);
+    lifecycle_observe(&mut lc, lc_mask(LC_BACKGROUND) | lc_mask(LC_SUSPENDED), obs_b);
+    lifecycle_ios(&mut lc, "application:didFinishLaunchingWithOptions:", 0, 0);
+    lifecycle_ios(&mut lc, "applicationDidBecomeActive:", 0, 100);
+    val n: i64 = lifecycle_ios(&mut lc, "applicationDidEnterBackground:", 0, 5100);
+    println("ios enter-background while active applied " + int_to_str(n));
+    lifecycle_ios(&mut lc, "backgroundTimeExpired", 0, 6000);
+    lifecycle_ios(&mut lc, "application:performFetchWithCompletionHandler:", 0, 9000);
+    lifecycle_ios(&mut lc, "applicationWillEnterForeground:", 0, 9500);
+    lifecycle_ios(&mut lc, "applicationDidBecomeActive:", 0, 9600);
+    lifecycle_ios(&mut lc, "applicationDidReceiveMemoryWarning:", 0, 9700);
+    lifecycle_ios(&mut lc, "applicationWillTerminate:", 0, 12000);
+    println("A " + int_to_str(log_a.len()) + " B " + int_to_str(log_b.len()));
+    println("B " + log_b.get(0) + " " + log_b.get(1) + " " + log_b.get(2));
+    println("ios " + lifecycle_summary(&lc));
+    val removed: bool = lifecycle_unobserve(&mut lc, ida);
+    lifecycle_ios(&mut lc, "application:didFinishLaunchingWithOptions:", 0, 20000);
+    println("after unobserve A " + int_to_str(log_a.len()) + " removed " + bool_to_str(removed) + " again "
+        + bool_to_str(lifecycle_unobserve(&mut lc, ida)));
+
+    var an: Lifecycle = lifecycle_new();
+    lifecycle_android(&mut an, "onCreate", 0, 0);
+    lifecycle_android(&mut an, "onStart", 0, 10);
+    lifecycle_android(&mut an, "onResume", 0, 20);
+    lifecycle_android(&mut an, "onPause", 0, 1020);
+    lifecycle_android(&mut an, "onStop", 0, 1030);
+    val r0: i64 = lifecycle_android(&mut an, "onRestart", 0, 5000);
+    lifecycle_android(&mut an, "onStart", 0, 5030);
+    lifecycle_android(&mut an, "onResume", 0, 5040);
+    val t20: i64 = lifecycle_android(&mut an, "onTrimMemory", ANDROID_TRIM_MEMORY_UI_HIDDEN, 5050);
+    val t80: i64 = lifecycle_android(&mut an, "onTrimMemory", ANDROID_TRIM_MEMORY_COMPLETE, 5050);
+    lifecycle_android(&mut an, "onDestroy", 0, 6040);
+    println("android restart events " + int_to_str(r0) + " trim20 " + int_to_str(t20) + " trim80 " + int_to_str(t80));
+    println("android " + lifecycle_summary(&an));
+
+    var st: Lifecycle = lifecycle_new();
+    val ok: bool = lifecycle_apply(&mut st, LC_EV_BECOME_ACTIVE, 0);
+    println("strict " + bool_to_str(ok) + " rejected " + int_to_str(st.rejected) + " state " + lc_state_name(st.state));
+    val k0: i64 = lifecycle_dispatch(&mut st, LC_EV_SUSPEND, 0);
+    println("tolerant suspend from not-running " + int_to_str(k0) + " rejected " + int_to_str(st.rejected));
+    lifecycle_apply(&mut st, LC_EV_LAUNCH, 0);
+    lifecycle_apply(&mut st, LC_EV_BECOME_ACTIVE, 0);
+    val k: i64 = lifecycle_dispatch(&mut st, LC_EV_SUSPEND, 0);
+    println("tolerant suspend from active " + int_to_str(k) + " -> " + lc_state_name(st.state));
+    lifecycle_apply(&mut st, LC_EV_TERMINATE, 1);
+    val k2: i64 = lifecycle_dispatch(&mut st, LC_EV_MEMORY_WARNING, 2);
+    println("impossible " + int_to_str(k2) + " rejected " + int_to_str(st.rejected));
+}

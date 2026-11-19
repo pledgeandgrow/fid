@@ -1,0 +1,61 @@
+OP30 (competitive roadmap): profile-guided optimization from a real run,
+with block counts. Written Nov 17; not built or run yet with the compiler
+that has it (the run that wrote it could only use an older compiler).
+
+What changed
+------------
+compiler/pgo.fd
+  pgo_instrument: while `fid run --profile <p>` records, lowering (through
+    pgo_apply) starts each block of every function of more than one block
+    with a call to an empty function "<function>@<block id>". The
+    interpreter already counts every call (pgo_note_call), so a probe's
+    count is how many times its block was entered. No interpreter change.
+    FID_PGO_BLOCKS=0: no probes (calls only, as before).
+  pgo_write: "fides-profile 2"; per function, most called first,
+    "<calls> <function>", then "<1 + times entered> <function>@<block id>"
+    for each of its blocks (1: never entered). The probes are not listed
+    as functions. Lines joined once (str_join_fast), not one concatenation
+    per line.
+  pgo_load_use: reads version 1 (calls only) and 2.
+  pgo_has_blocks, pgo_block_entries, pgo_block_cold (entered less than
+    once per 1000 calls: the rule nat_ir's ng_pgo_cold_labels already
+    applies to the same lines), pgo_block_weight (runs per call in 1/16,
+    0 when cold, -1 unknown), pgo_site_calls (the count an inliner weighs a
+    call by: its block's entries, else a one-block caller's calls, else the
+    callee's calls).
+compiler/iropt.fd
+  iro_inline_limit(callee, caller, site), iro_body and iro_not_inlined_why
+  take the call's block: with block counts a call in a block the run never
+  entered gets the cold limit (8) though its callee is hot elsewhere, a
+  call in a block entered 1000 times or more twice the limit (32).
+compiler/iropt_me.fd
+  ime_inline_weigh (inline2) weighs the call's block the same way.
+  ime_unroll_one leaves a loop whose body block the profile shows cold
+  (FID_IROPT_OFF=unrollpgo: no); FID_IROPT_STATS's ivsr/unroll line ends
+  with ", <n> cold (profile)".
+
+Block ids are the lowering's. The mid-end never renumbers blocks (a block
+it makes gets a new id, unknown to the profile, which counts as hot), and
+`fid run` and `fid emit` lower each function the same way, so the ids of
+the profiling run name the same blocks in the build.
+
+Users of the counts outside the mid-end
+---------------------------------------
+nat_ir.fd ng_pgo_cold_labels (OP15) already reads "<function>@<block>"
+lines and lays never-entered blocks after the rest; until now no profile
+had them. Spill weights in nat_ir and pe_ir's block order are hunks for
+those files' owners (described in the run's report).
+
+Validation (with the final compiler as $FID)
+--------------------------------------------
+FID=$FID bash tests/tooling/pgo-block-check.sh        all PASS, exit 0
+FID=$FID bash tests/tooling/pgo-inline-default-check.sh   exit 0
+FID=$FID bash tests/tooling/inline-pgo-check.sh       exit 0
+FID=$FID RUNS=5 bash tests/tooling/pgo-bench.sh       PASS, speedup >= 1.00
+
+Measured with the older compiler (calls only, no block counts; the same
+scripts, a Windows x64 laptop, `--nat`): pgo_bench.fd at 50M iterations,
+best of 3: 948 ms without the profile, 702 ms with it (1.35x), the same
+checksum; at 100M: 2410-2480 ms vs 1766-1944 ms. The gain is mix inlined
+in step's loop (17-32 instructions: inlined only when the profile shows
+it hot). Re-measure with the final compiler.

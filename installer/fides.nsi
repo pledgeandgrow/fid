@@ -1,10 +1,12 @@
-; installer/fides.nsi — NSIS installer for Fides Language
+; installer/fides.nsi — NSIS installer for the Fid language (its compiler is
+; Fides: fid.exe). Up to 0.8.0 the product was named Fides; this installer
+; removes such an install first (.onInit) so only one is on PATH.
 ;
 ; Build:
 ;   makensis installer/fides.nsi
 ;
 ; Output:
-;   installer/Fides-Setup-<version>.exe
+;   installer/Fid-Setup-<version>.exe (releases up to 0.8.0: Fides-Setup)
 
 ; ─── Version ─────────────────────────────────────────────────────────────
 
@@ -12,22 +14,26 @@
 !ifndef VERSION
   !define VERSION "0.8.0"
 !endif
-!define PRODUCT_NAME "Fides"
+!define PRODUCT_NAME "Fid"
 !define PRODUCT_PUBLISHER "Pledge & Grow"
 !define PRODUCT_URL "https://github.com/pledgeandgrow/fid"
-!define PRODUCT_REGKEY "Software\Fides"
-!define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fides"
+!define PRODUCT_REGKEY "Software\Fid"
+!define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fid"
+; The keys of the product as it was named up to 0.8.0
+!define OLD_REGKEY "Software\Fides"
+!define OLD_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fides"
 !define ENV_HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 
 ; ─── Includes ────────────────────────────────────────────────────────────
 
 !include "MUI2.nsh"
+!include "WordFunc.nsh"
 
 ; ─── General ──────────────────────────────────────────────────────────────
 
 Name "${PRODUCT_NAME} ${VERSION}"
-OutFile "Fides-Setup-${VERSION}.exe"
-InstallDir "$PROGRAMFILES64\Fides"
+OutFile "Fid-Setup-${VERSION}.exe"
+InstallDir "$PROGRAMFILES64\Fid"
 InstallDirRegKey HKLM "${PRODUCT_REGKEY}" "InstallDir"
 ShowInstDetails show
 ShowUnInstDetails show
@@ -38,10 +44,10 @@ Unicode True
 ; ─── Version Info ─────────────────────────────────────────────────────────
 
 VIProductVersion "1.0.0.0"
-VIAddVersionKey "ProductName" "Fides Language"
+VIAddVersionKey "ProductName" "Fid Language"
 VIAddVersionKey "CompanyName" "Pledge"
 VIAddVersionKey "LegalCopyright" "© 2026 Pledge"
-VIAddVersionKey "FileDescription" "Fides Language Installer"
+VIAddVersionKey "FileDescription" "Fid Language Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 
@@ -68,6 +74,52 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; ─── Languages ──────────────────────────────────────────────────────────
 
 !insertmacro MUI_LANGUAGE "English"
+
+; ─── PATH ──────────────────────────────────────────────────────────────────
+; Remove directory $R9 from the system PATH (every place it appears: alone,
+; first, in the middle, last). The uninstaller of 0.8.0 and earlier wrote
+; PATH back unchanged, so its directory stayed on PATH after uninstall.
+
+!macro REMOVE_FROM_PATH UN
+Function ${UN}RemoveFromPath
+  Push $0
+  ReadRegStr $0 HKLM "${ENV_HKLM}" "PATH"
+  StrCmp $0 "$R9" 0 +3
+    StrCpy $0 ""
+    Goto write
+  ${${UN}WordReplace} "$0" ";$R9;" ";" "+" $0
+  ${${UN}WordReplace} "$0" ";$R9" "" "+}" $0
+  ${${UN}WordReplace} "$0" "$R9;" "" "+{" $0
+  write:
+  WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$0"
+  Pop $0
+FunctionEnd
+!macroend
+!insertmacro REMOVE_FROM_PATH ""
+!insertmacro REMOVE_FROM_PATH "un."
+
+; ─── An install under the old name ──────────────────────────────────────────
+; Fides 0.8.0 and earlier: run its uninstaller silently in its own directory,
+; then take that directory off PATH (its uninstaller did not).
+
+Function .onInit
+  ReadRegStr $R0 HKLM "${OLD_UNINST_KEY}" "UninstallString"
+  StrCmp $R0 "" done
+  ReadRegStr $R1 HKLM "${OLD_REGKEY}" "InstallDir"
+  StrCmp $R1 "" done
+  IfSilent run
+  MessageBox MB_OKCANCEL|MB_ICONINFORMATION "Fides (the name of Fid up to 0.8.0) is installed in$\r$\n$R1$\r$\n$\r$\nIt will be uninstalled first. Your own files are not touched." IDOK run
+  Abort
+  run:
+  ExecWait '$R0 /S _?=$R1'
+  Delete "$R1\uninstall.exe"
+  RMDir "$R1"
+  StrCpy $R9 $R1
+  Call RemoveFromPath
+  DeleteRegKey HKLM "${OLD_UNINST_KEY}"
+  DeleteRegKey HKLM "${OLD_REGKEY}"
+  done:
+FunctionEnd
 
 ; ─── Section: Core (required) ────────────────────────────────────────────
 
@@ -96,7 +148,7 @@ Section "Fides Compiler (required)" SecCore
   WriteRegStr HKLM "${PRODUCT_REGKEY}" "Version" "${VERSION}"
 
   ; Write uninstall info
-  WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayName" "Fides Language"
+  WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayName" "Fid Language"
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayIcon" '"$INSTDIR\fid.exe"'
   WriteRegStr HKLM "${PRODUCT_UNINST_KEY}" "DisplayVersion" "${VERSION}"
@@ -108,7 +160,9 @@ Section "Fides Compiler (required)" SecCore
   ; Create uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Add to PATH (append to existing PATH)
+  ; Add to PATH once: a reinstall takes the old entry out first
+  StrCpy $R9 "$INSTDIR"
+  Call RemoveFromPath
   ReadRegStr $0 HKLM "${ENV_HKLM}" "PATH"
   StrCmp $0 "" +3
     WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$0;$INSTDIR"
@@ -118,7 +172,7 @@ Section "Fides Compiler (required)" SecCore
   ; Broadcast environment change
   SendMessage HWND_BROADCAST ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
-  DetailPrint "Fides installed to $INSTDIR"
+  DetailPrint "Fid installed to $INSTDIR"
   DetailPrint "Added $INSTDIR to PATH"
 SectionEnd
 
@@ -157,24 +211,36 @@ Section "Example Programs" SecExamples
   DetailPrint "Installed examples"
 SectionEnd
 
+; ─── Section: Seeded store of unit objects (inc-roadmap B6) ──────────────
+; Objects of the core and stdlib units, built by build-installer.sh with
+; `fid ccompile --inc --seed-store`; an installed fid looks in
+; $INSTDIR\cache before compiling a unit (docs/inc-seed-store.md).
+
+Section "Prebuilt standard library objects" SecCache
+  SetOutPath "$INSTDIR\cache"
+  File /nonfatal "..\build\installer\cache\*.exe"
+  DetailPrint "Installed the seeded store of unit objects"
+SectionEnd
+
 ; ─── Section: File Association (.fd) ─────────────────────────────────────
 
 Section "Associate .fd files" SecAssoc
   ; Register .fd extension
-  WriteRegStr HKCR ".fd" "" "Fides.SourceFile"
-  WriteRegStr HKCR "Fides.SourceFile" "" "Fides Source File"
-  WriteRegStr HKCR "Fides.SourceFile\shell\open\command" "" '"$INSTDIR\fid.exe" "%1"'
-  WriteRegStr HKCR "Fides.SourceFile\DefaultIcon" "" '"$INSTDIR\fid.exe",0'
-  DetailPrint "Associated .fd files with Fides"
+  WriteRegStr HKCR ".fd" "" "Fid.SourceFile"
+  WriteRegStr HKCR "Fid.SourceFile" "" "Fid Source File"
+  WriteRegStr HKCR "Fid.SourceFile\shell\open\command" "" '"$INSTDIR\fid.exe" "%1"'
+  WriteRegStr HKCR "Fid.SourceFile\DefaultIcon" "" '"$INSTDIR\fid.exe",0'
+  DeleteRegKey HKCR "Fides.SourceFile"
+  DetailPrint "Associated .fd files with Fid"
 SectionEnd
 
 ; ─── Section: Start Menu Shortcuts ───────────────────────────────────────
 
 Section "Start Menu Shortcuts" SecShortcuts
-  CreateDirectory "$SMPROGRAMS\Fides"
-  CreateShortcut "$SMPROGRAMS\Fides\Fides Compiler.lnk" "$INSTDIR\fid.exe" \
+  CreateDirectory "$SMPROGRAMS\Fid"
+  CreateShortcut "$SMPROGRAMS\Fid\Fides Compiler.lnk" "$INSTDIR\fid.exe" \
     "" "$INSTDIR\fid.exe" 0
-  CreateShortcut "$SMPROGRAMS\Fides\Uninstall Fides.lnk" "$INSTDIR\uninstall.exe" \
+  CreateShortcut "$SMPROGRAMS\Fid\Uninstall Fid.lnk" "$INSTDIR\uninstall.exe" \
     "" "" 0
   DetailPrint "Created Start Menu shortcuts"
 SectionEnd
@@ -185,9 +251,10 @@ LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fid.exe / fidesc.exe) 
 LangString DESC_Stdlib ${LANG_ENGLISH} "Standard library modules (core, vec, string, math, etc.)."
 LangString DESC_Runtime ${LANG_ENGLISH} "C runtime files for SDL, audio, networking."
 LangString DESC_Docs ${LANG_ENGLISH} "Language reference, guides, and roadmap documentation."
-LangString DESC_Examples ${LANG_ENGLISH} "Example Fides programs to get started."
-LangString DESC_Assoc ${LANG_ENGLISH} "Open .fd files with Fides when double-clicked."
-LangString DESC_Shortcuts ${LANG_ENGLISH} "Create Start Menu shortcuts for Fides."
+LangString DESC_Examples ${LANG_ENGLISH} "Example Fid programs to get started."
+LangString DESC_Cache ${LANG_ENGLISH} "Prebuilt objects of the core and standard library units, so a first per-module build (fid ccompile --inc) does not compile them."
+LangString DESC_Assoc ${LANG_ENGLISH} "Open .fd files with Fid when double-clicked."
+LangString DESC_Shortcuts ${LANG_ENGLISH} "Create Start Menu shortcuts for Fid."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
 !insertmacro MUI_DESCRIPTION_TEXT ${SecCore} $(DESC_Core)
@@ -195,6 +262,7 @@ LangString DESC_Shortcuts ${LANG_ENGLISH} "Create Start Menu shortcuts for Fides
 !insertmacro MUI_DESCRIPTION_TEXT ${SecRuntime} $(DESC_Runtime)
 !insertmacro MUI_DESCRIPTION_TEXT ${SecDocs} $(DESC_Docs)
 !insertmacro MUI_DESCRIPTION_TEXT ${SecExamples} $(DESC_Examples)
+!insertmacro MUI_DESCRIPTION_TEXT ${SecCache} $(DESC_Cache)
 !insertmacro MUI_DESCRIPTION_TEXT ${SecAssoc} $(DESC_Assoc)
 !insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} $(DESC_Shortcuts)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
@@ -216,19 +284,19 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\runtime"
   RMDir /r "$INSTDIR\docs"
   RMDir /r "$INSTDIR\examples"
+  RMDir /r "$INSTDIR\cache"
 
   ; Remove shortcuts
-  RMDir /r "$SMPROGRAMS\Fides"
+  RMDir /r "$SMPROGRAMS\Fid"
 
-  ; Remove from PATH (simple approach — just remove the install dir from PATH)
-  ReadRegStr $0 HKLM "${ENV_HKLM}" "PATH"
-  ; Write back without our path (best effort)
-  WriteRegExpandStr HKLM "${ENV_HKLM}" "PATH" "$0"
+  ; Remove the install directory from PATH
+  StrCpy $R9 "$INSTDIR"
+  Call un.RemoveFromPath
   SendMessage HWND_BROADCAST ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
   ; Remove file association
   DeleteRegKey HKCR ".fd"
-  DeleteRegKey HKCR "Fides.SourceFile"
+  DeleteRegKey HKCR "Fid.SourceFile"
 
   ; Remove registry keys
   DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
@@ -237,5 +305,5 @@ Section "Uninstall"
   ; Remove install directory (if empty)
   RMDir "$INSTDIR"
 
-  DetailPrint "Fides uninstalled"
+  DetailPrint "Fid uninstalled"
 SectionEnd

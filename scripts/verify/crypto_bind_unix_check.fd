@@ -1,0 +1,172 @@
+// The check of stdlib/crypto_bind_unix.fd (release J5, the OpenSSL twin of
+// crypto_bind): the same vectors as tests/bootstrap/test_crypto_bind.fd,
+// plus the BCrypt blob format of the keys. It needs libcrypto, so it is not
+// in the suite (the suite's harness, frozen, has no "Linux only" list):
+//
+//   fid ccompile scripts/verify/crypto_bind_unix_check.fd -o cbu && ./cbu
+//
+// Prints "crypto_bind_unix: all ok" and exits 0, or names what failed and
+// exits 1. RSA is checked by tests/bootstrap/test_crypto_bind_rsa.fd, which
+// runs on both bindings (`use crypto_bind` picks this one on Linux/macOS).
+// Nov 17: run in WSL (Kali, OpenSSL 3.6.2) through `OS=Linux fid dump-c`
+// and gcc with libcrypto.so.3: all ok.
+use crypto_bind_unix;
+use crypto;
+
+fn bytes(s: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        v.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn hex(h: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        v.push(str_parse_hex(str_slice(h, i, i + 2)));
+        i = i + 2;
+    }
+    return v;
+}
+
+fn eq(a: & Vec, b: & Vec) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fail(what: str) -> i64 {
+    println("FAIL: " + what);
+    return 1;
+}
+
+fn main() -> i64 {
+    // NIST GCM test case 2: zero 128-bit key, zero 96-bit IV, one zero block
+    val key: Vec<i64> = hex("00000000000000000000000000000000");
+    val nonce: Vec<i64> = hex("000000000000000000000000");
+    val none: Vec<i64> = Vec::new();
+    // Test case 1: empty plaintext, tag only
+    val t1: Vec<i64> = cb_gcm_encrypt(& key, & nonce, & none, & none);
+    val t1_want: Vec<i64> = hex("58e2fccefa7e3061367f1d57a4e7455a");
+    if !eq(& t1, & t1_want) {
+        return fail("GCM test case 1 tag");
+    }
+    // Test case 2: one zero block
+    val pt2: Vec<i64> = hex("00000000000000000000000000000000");
+    val c2: Vec<i64> = cb_gcm_encrypt(& key, & nonce, & none, & pt2);
+    val c2_want: Vec<i64> = hex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf");
+    if !eq(& c2, & c2_want) {
+        return fail("GCM test case 2");
+    }
+    val d2: Vec<i64> = cb_gcm_decrypt(& key, & nonce, & none, & c2);
+    if !eq(& d2, & pt2) {
+        return fail("GCM test case 2 decrypt");
+    }
+    var bad: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < c2.len() {
+        bad.push(c2.get(i));
+        i = i + 1;
+    }
+    bad.set(31, bad.get(31) ^ 1);
+    if cb_gcm_decrypt(& key, & nonce, & none, & bad).len() != 0 {
+        return fail("GCM accepted a wrong tag");
+    }
+    // AAD changes the tag: decrypting with other AAD fails
+    val aad: Vec<i64> = bytes("header");
+    val c3: Vec<i64> = cb_gcm_encrypt(& key, & nonce, & aad, & pt2);
+    if cb_gcm_decrypt(& key, & nonce, & none, & c3).len() != 0 {
+        return fail("GCM ignored the AAD");
+    }
+    if !eq(& cb_gcm_decrypt(& key, & nonce, & aad, & c3), & pt2) {
+        return fail("GCM with AAD decrypt");
+    }
+    println("gcm ok");
+
+    // PBKDF2-HMAC-SHA256 ("password", "salt", 1 and 2 iterations, 32 bytes)
+    val pw: Vec<i64> = bytes("password");
+    val salt: Vec<i64> = bytes("salt");
+    if !eq(& cb_pbkdf2_derive(& pw, & salt, 1, 32), & hex("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")) {
+        return fail("PBKDF2 c=1");
+    }
+    if !eq(& cb_pbkdf2_derive(& pw, & salt, 2, 32), & hex("ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")) {
+        return fail("PBKDF2 c=2");
+    }
+    println("pbkdf2 ok");
+
+    // ECDSA P-256: generate, the blob format, sign, verify, corrupt
+    var priv_blob: Vec<i64> = Vec::new();
+    var pub_blob: Vec<i64> = Vec::new();
+    if cb_ecdsa_generate(& mut priv_blob, & mut pub_blob) != 0 {
+        return fail("ECDSA generate");
+    }
+    // "ECS2" / "ECS1", cbKey 32, then 2 or 3 coordinates
+    if priv_blob.len() != 104 || pub_blob.len() != 72 {
+        return fail("ECDSA blob sizes");
+    }
+    if priv_blob.get(0) != 69 || priv_blob.get(1) != 67 || priv_blob.get(2) != 83 || priv_blob.get(3) != 50 || priv_blob.get(4) != 32 {
+        return fail("ECDSA private blob header");
+    }
+    if pub_blob.get(0) != 69 || pub_blob.get(1) != 67 || pub_blob.get(2) != 83 || pub_blob.get(3) != 49 || pub_blob.get(4) != 32 {
+        return fail("ECDSA public blob header");
+    }
+    // The public blob's X and Y are the private blob's
+    i = 8;
+    while i < 72 {
+        if priv_blob.get(i) != pub_blob.get(i) {
+            return fail("ECDSA blobs disagree on the point");
+        }
+        i = i + 1;
+    }
+    val h: Vec<i64> = crypto_sha256("abc");
+    val sig: Vec<i64> = cb_ecdsa_sign(& priv_blob, & h);
+    if sig.len() != 64 {
+        return fail("ECDSA sign");
+    }
+    if !cb_ecdsa_verify(& pub_blob, & h, & sig) {
+        return fail("ECDSA verify");
+    }
+    var badsig: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 64 {
+        badsig.push(sig.get(i));
+        i = i + 1;
+    }
+    badsig.set(5, badsig.get(5) ^ 255);
+    if cb_ecdsa_verify(& pub_blob, & h, & badsig) {
+        return fail("ECDSA accepted a corrupt signature");
+    }
+    val h2: Vec<i64> = crypto_sha256("abd");
+    if cb_ecdsa_verify(& pub_blob, & h2, & sig) {
+        return fail("ECDSA accepted another hash");
+    }
+    // A blob with a wrong magic, and a public blob as a private one
+    var odd: Vec<i64> = Vec::new();
+    i = 0;
+    while i < pub_blob.len() {
+        odd.push(pub_blob.get(i));
+        i = i + 1;
+    }
+    odd.set(3, 51);
+    if cb_ecdsa_verify(& odd, & h, & sig) {
+        return fail("ECDSA took a blob with a wrong magic");
+    }
+    if cb_ecdsa_sign(& pub_blob, & h).len() != 0 {
+        return fail("ECDSA signed with a public blob");
+    }
+    println("ecdsa ok");
+    println("crypto_bind_unix: all ok");
+    return 0;
+}

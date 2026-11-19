@@ -1,0 +1,573 @@
+// Fides internationalization: message catalogs, CLDR plurals, number and
+// date formatting, pure Fides
+//
+//   - message catalogs: per locale, key -> message; a missing key falls
+//     back to the base language ("pt-BR" -> "pt"), then to the default
+//     locale, then to the key itself
+//   - messages with placeholders "{name}" and ICU-style plurals
+//     "{count, plural, =0 {no files} one {# file} other {# files}}" (exact
+//     matches first, then the CLDR category; "#" is the locale-formatted
+//     number) and selects "{gender, select, female {her} other {their}}"
+//   - CLDR plural rules (cardinal, CLDR 42 plurals.xml) for en de nl it es
+//     pt fr ru uk pl cs ar he tr ja zh ko, on the CLDR operands n i v f t
+//     of a decimal string, so "1.0" (v = 1) and "1" can differ (en: "1 file"
+//     but "1.0 files")
+//   - numbers: decimal and grouping separators and the minimum grouping
+//     digits per locale (es and pl group only from five digits), with
+//     U+202F (fr) and U+00A0 (ru uk pl cs) spaces, and Arabic-Indic digits
+//     with ٫ ٬ for ar (CLDR's default numbering system for ar)
+//   - dates: the CLDR short and long patterns (no weekday) for en de fr es
+//     it pt nl ru pl ja zh, with month names (genitive for ru and pl)
+//
+// Everything here is real; there is no platform seam (pass the locale in;
+// read the user's preference from Accept-Language or the OS elsewhere).
+//
+// Usage:
+//   var cat: I18n = i18n_new("en");
+//   i18n_add(& mut cat, "en", "files", "{n, plural, one {# file} other {# files}}");
+//   println(i18n_t(& cat, "en", "files", i18n_args1("n", "3")));   // 3 files
+//   println(i18n_plural("ru", "22"));                               // few
+//   println(i18n_number("de", "1234567.891", 2));                   // 1.234.567,89
+
+module i18n;
+ use vec;
+
+// ─── locales ────────────────────────────────────────────────────────────
+
+/// The language part of a locale tag: "pt-BR" -> "pt", "zh_Hant" -> "zh".
+pub fn i18n_lang(locale: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(locale) {
+        var c: i64 = str_byte_at(locale, i);
+        if c == 45 || c == 95 {
+            return o;
+        }
+        if c >= 65 && c <= 90 { c = c + 32; }
+        o = o + char_to_str(c);
+        i = i + 1;
+    }
+    return o;
+}
+
+// ─── plural operands and rules ──────────────────────────────────────────
+
+/// CLDR operands of a decimal string ("-1.50"): i the integer digits, v the
+/// count of visible fraction digits, f the visible fraction digits, t the
+/// fraction without trailing zeros. n is i when f is 0 (else not integral).
+pub struct PluralOps {
+    pub i: i64,
+    pub v: i64,
+    pub f: i64,
+    pub t: i64,
+}
+
+pub fn i18n_operands(num: str) -> PluralOps {
+    var s: str = num;
+    if str_len(s) > 0 && str_byte_at(s, 0) == 45 {
+        s = str_slice(s, 1, str_len(s));
+    }
+    val dot: i64 = str_find(s, ".");
+    var ip: str = s;
+    var fp: str = "";
+    if dot >= 0 {
+        ip = str_slice(s, 0, dot);
+        fp = str_slice(s, dot + 1, str_len(s));
+    }
+    var i: i64 = 0;
+    if str_len(ip) > 0 { i = str_parse_int(ip); }
+    var f: i64 = 0;
+    if str_len(fp) > 0 { f = str_parse_int(fp); }
+    var tt: str = fp;
+    while str_len(tt) > 0 && str_byte_at(tt, str_len(tt) - 1) == 48 {
+        tt = str_slice(tt, 0, str_len(tt) - 1);
+    }
+    var t: i64 = 0;
+    if str_len(tt) > 0 { t = str_parse_int(tt); }
+    return PluralOps { i: i, v: str_len(fp), f: f, t: t };
+}
+
+fn ip_in(x: i64, lo: i64, hi: i64) -> bool {
+    return x >= lo && x <= hi;
+}
+
+// "e = 0 and i != 0 and i % 1000000 = 0 and v = 0" (the millions rule)
+fn ip_millions(o: & PluralOps) -> bool {
+    return o.i != 0 && o.i % 1000000 == 0 && o.v == 0;
+}
+
+/// The CLDR cardinal plural category of a decimal number for a locale:
+/// "zero" "one" "two" "few" "many" or "other". Unknown languages: "one"
+/// for an integer 1 (the English rule), else "other".
+pub fn i18n_plural(locale: str, num: str) -> str {
+    val l: str = i18n_lang(locale);
+    val o: PluralOps = i18n_operands(num);
+    val integral: bool = o.f == 0;  // n is a whole number
+    if l == "ja" || l == "zh" || l == "ko" {
+        return "other";
+    }
+    if l == "en" || l == "de" || l == "nl" {
+        if o.i == 1 && o.v == 0 { return "one"; }
+        return "other";
+    }
+    if l == "it" {
+        if o.i == 1 && o.v == 0 { return "one"; }
+        if ip_millions(& o) { return "many"; }
+        return "other";
+    }
+    if l == "es" {
+        if integral && o.i == 1 { return "one"; }
+        if ip_millions(& o) { return "many"; }
+        return "other";
+    }
+    if l == "pt" {
+        if o.i == 0 || o.i == 1 { return "one"; }
+        if ip_millions(& o) { return "many"; }
+        return "other";
+    }
+    if l == "fr" {
+        if o.i == 0 || o.i == 1 { return "one"; }
+        if ip_millions(& o) { return "many"; }
+        return "other";
+    }
+    if l == "ru" || l == "uk" {
+        if o.v == 0 {
+            val m10: i64 = o.i % 10;
+            val m100: i64 = o.i % 100;
+            if m10 == 1 && m100 != 11 { return "one"; }
+            if ip_in(m10, 2, 4) && !ip_in(m100, 12, 14) { return "few"; }
+            if m10 == 0 || ip_in(m10, 5, 9) || ip_in(m100, 11, 14) { return "many"; }
+        }
+        return "other";
+    }
+    if l == "pl" {
+        if o.v == 0 {
+            val m10: i64 = o.i % 10;
+            val m100: i64 = o.i % 100;
+            if o.i == 1 { return "one"; }
+            if ip_in(m10, 2, 4) && !ip_in(m100, 12, 14) { return "few"; }
+            if (o.i != 1 && ip_in(m10, 0, 1)) || ip_in(m10, 5, 9) || ip_in(m100, 12, 14) { return "many"; }
+        }
+        return "other";
+    }
+    if l == "cs" {
+        if o.i == 1 && o.v == 0 { return "one"; }
+        if ip_in(o.i, 2, 4) && o.v == 0 { return "few"; }
+        if o.v != 0 { return "many"; }
+        return "other";
+    }
+    if l == "ar" {
+        if integral {
+            val m100: i64 = o.i % 100;
+            if o.i == 0 { return "zero"; }
+            if o.i == 1 { return "one"; }
+            if o.i == 2 { return "two"; }
+            if ip_in(m100, 3, 10) { return "few"; }
+            if ip_in(m100, 11, 99) { return "many"; }
+        }
+        return "other";
+    }
+    if l == "he" {
+        if (o.i == 1 && o.v == 0) || (o.i == 0 && o.v != 0) { return "one"; }
+        if o.i == 2 && o.v == 0 { return "two"; }
+        return "other";
+    }
+    if l == "tr" {
+        if integral && o.i == 1 { return "one"; }
+        return "other";
+    }
+    if o.i == 1 && o.v == 0 { return "one"; }
+    return "other";
+}
+
+// ─── numbers ────────────────────────────────────────────────────────────
+
+/// Locale number symbols: [decimal, group, min grouping digits, digits]
+/// where digits is "latn" or "arab".
+fn i18n_symbols(locale: str) -> Vec<str> {
+    val l: str = i18n_lang(locale);
+    var v: Vec<str> = Vec::new();
+    if l == "de" || l == "nl" || l == "it" || l == "pt" || l == "tr" {
+        v.push(","); v.push("."); v.push("1"); v.push("latn");
+    } else if l == "es" {
+        v.push(","); v.push("."); v.push("2"); v.push("latn");
+    } else if l == "fr" {
+        v.push(","); v.push("\u{202F}"); v.push("1"); v.push("latn");
+    } else if l == "ru" || l == "uk" || l == "cs" {
+        v.push(","); v.push("\u{00A0}"); v.push("1"); v.push("latn");
+    } else if l == "pl" {
+        v.push(","); v.push("\u{00A0}"); v.push("2"); v.push("latn");
+    } else if l == "ar" {
+        v.push("\u{066B}"); v.push("\u{066C}"); v.push("1"); v.push("arab");
+    } else {
+        v.push("."); v.push(","); v.push("1"); v.push("latn");
+    }
+    return v;
+}
+
+fn i18n_arab_digit(d: i64) -> str {
+    // U+0660..U+0669 as UTF-8: D9 A0 .. D9 A9
+    var b: Vec<i64> = Vec::new();
+    b.push(0xD9);
+    b.push(0xA0 + d);
+    return str_from_bytes(b);
+}
+
+fn i18n_digits(s: str, arab: bool) -> str {
+    if !arab {
+        return s;
+    }
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c >= 48 && c <= 57 {
+            o = o + i18n_arab_digit(c - 48);
+        } else {
+            o = o + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+// round a decimal string to `decimals` places (half away from zero) as
+// [sign, integer digits, fraction digits]
+fn i18n_round(num: str, decimals: i64) -> Vec<str> {
+    var s: str = str_trim(num);
+    var neg: bool = false;
+    if str_len(s) > 0 && str_byte_at(s, 0) == 45 {
+        neg = true;
+        s = str_slice(s, 1, str_len(s));
+    }
+    val dot: i64 = str_find(s, ".");
+    var ip: str = s;
+    var fp: str = "";
+    if dot >= 0 {
+        ip = str_slice(s, 0, dot);
+        fp = str_slice(s, dot + 1, str_len(s));
+    }
+    if str_len(ip) == 0 { ip = "0"; }
+    while str_len(fp) < decimals + 1 { fp = fp + "0"; }
+    // digits to keep, as one integer string, plus the next digit
+    var keep: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < str_len(ip) { keep.push(str_byte_at(ip, k) - 48); k = k + 1; }
+    k = 0;
+    while k < decimals { keep.push(str_byte_at(fp, k) - 48); k = k + 1; }
+    if str_byte_at(fp, decimals) >= 53 {
+        var j: i64 = keep.len() - 1;
+        var carry: bool = true;
+        while carry && j >= 0 {
+            if keep.get(j) == 9 {
+                keep.set(j, 0);
+                j = j - 1;
+            } else {
+                keep.set(j, keep.get(j) + 1);
+                carry = false;
+            }
+        }
+        if carry { keep.insert(0, 1); }
+    }
+    val nint: i64 = keep.len() - decimals;
+    var is: str = "";
+    k = 0;
+    while k < nint { is = is + int_to_str(keep.get(k)); k = k + 1; }
+    // strip leading zeros of the integer part
+    while str_len(is) > 1 && str_byte_at(is, 0) == 48 { is = str_slice(is, 1, str_len(is)); }
+    var fs: str = "";
+    while k < keep.len() { fs = fs + int_to_str(keep.get(k)); k = k + 1; }
+    var sign: str = "";
+    var zero: bool = is == "0";
+    var z: i64 = 0;
+    while z < str_len(fs) { if str_byte_at(fs, z) != 48 { zero = false; } z = z + 1; }
+    if neg && !zero { sign = "-"; }
+    var out: Vec<str> = Vec::new();
+    out.push(sign);
+    out.push(is);
+    out.push(fs);
+    return out;
+}
+
+/// Format a decimal string with `decimals` fraction digits (rounded half
+/// away from zero) in the locale's style.
+pub fn i18n_number(locale: str, num: str, decimals: i64) -> str {
+    val sym: Vec<str> = i18n_symbols(locale);
+    val parts: Vec<str> = i18n_round(num, decimals);
+    val ip: str = parts.get(1);
+    val min_group: i64 = str_parse_int(sym.get(2));
+    var grouped: str = ip;
+    if str_len(ip) >= 4 + (min_group - 1) {
+        grouped = "";
+        var i: i64 = 0;
+        val n: i64 = str_len(ip);
+        while i < n {
+            if i > 0 && (n - i) % 3 == 0 {
+                grouped = grouped + sym.get(1);
+            }
+            grouped = grouped + str_slice(ip, i, i + 1);
+            i = i + 1;
+        }
+    }
+    val arab: bool = sym.get(3) == "arab";
+    var out: str = parts.get(0) + i18n_digits(grouped, arab);
+    if decimals > 0 {
+        out = out + sym.get(0) + i18n_digits(parts.get(2), arab);
+    }
+    return out;
+}
+
+/// Format an integer in the locale's style.
+pub fn i18n_int(locale: str, n: i64) -> str {
+    return i18n_number(locale, int_to_str(n), 0);
+}
+
+// ─── dates ──────────────────────────────────────────────────────────────
+
+fn i18n_months(l: str) -> str {
+    if l == "de" { return "Januar,Februar,März,April,Mai,Juni,Juli,August,September,Oktober,November,Dezember"; }
+    if l == "fr" { return "janvier,février,mars,avril,mai,juin,juillet,août,septembre,octobre,novembre,décembre"; }
+    if l == "es" { return "enero,febrero,marzo,abril,mayo,junio,julio,agosto,septiembre,octubre,noviembre,diciembre"; }
+    if l == "it" { return "gennaio,febbraio,marzo,aprile,maggio,giugno,luglio,agosto,settembre,ottobre,novembre,dicembre"; }
+    if l == "pt" { return "janeiro,fevereiro,março,abril,maio,junho,julho,agosto,setembro,outubro,novembro,dezembro"; }
+    if l == "nl" { return "januari,februari,maart,april,mei,juni,juli,augustus,september,oktober,november,december"; }
+    if l == "ru" { return "января,февраля,марта,апреля,мая,июня,июля,августа,сентября,октября,ноября,декабря"; }
+    if l == "pl" { return "stycznia,lutego,marca,kwietnia,maja,czerwca,lipca,sierpnia,września,października,listopada,grudnia"; }
+    return "January,February,March,April,May,June,July,August,September,October,November,December";
+}
+
+/// The CLDR date pattern for a locale: style "short" or "long". Locales
+/// without data use English.
+pub fn i18n_date_pattern(locale: str, style: str) -> str {
+    val l: str = i18n_lang(locale);
+    val long: bool = style == "long";
+    if l == "de" { if long { return "d. MMMM y"; } return "dd.MM.yy"; }
+    if l == "fr" { if long { return "d MMMM y"; } return "dd/MM/y"; }
+    if l == "es" { if long { return "d 'de' MMMM 'de' y"; } return "d/M/yy"; }
+    if l == "it" { if long { return "d MMMM y"; } return "dd/MM/yy"; }
+    if l == "pt" { if long { return "d 'de' MMMM 'de' y"; } return "dd/MM/y"; }
+    if l == "nl" { if long { return "d MMMM y"; } return "dd-MM-y"; }
+    if l == "ru" { if long { return "d MMMM y 'г'."; } return "dd.MM.y"; }
+    if l == "pl" { if long { return "d MMMM y"; } return "d.MM.y"; }
+    if l == "ja" { if long { return "y年M月d日"; } return "y/MM/dd"; }
+    if l == "zh" { if long { return "y年M月d日"; } return "y/M/d"; }
+    if long { return "MMMM d, y"; }
+    return "M/d/yy";
+}
+
+fn i18n_pad2(n: i64) -> str {
+    if n < 10 { return "0" + int_to_str(n); }
+    return int_to_str(n);
+}
+
+/// Apply a CLDR date pattern (y yy M MM MMMM d dd and 'quoted' text).
+pub fn i18n_format_pattern(locale: str, pattern: str, year: i64, month: i64, day: i64) -> str {
+    val months: Vec<str> = str_split(i18n_months(i18n_lang(locale)), ",");
+    var o: str = "";
+    var i: i64 = 0;
+    val n: i64 = str_len(pattern);
+    while i < n {
+        val c: i64 = str_byte_at(pattern, i);
+        if c == 39 {
+            i = i + 1;
+            while i < n && str_byte_at(pattern, i) != 39 {
+                o = o + char_to_str(str_byte_at(pattern, i));
+                i = i + 1;
+            }
+            i = i + 1;
+        } else if c == 121 || c == 77 || c == 100 {
+            var run: i64 = 0;
+            while i < n && str_byte_at(pattern, i) == c {
+                run = run + 1;
+                i = i + 1;
+            }
+            if c == 121 {
+                if run == 2 { o = o + i18n_pad2(year % 100); } else { o = o + int_to_str(year); }
+            } else if c == 77 {
+                if run >= 4 { o = o + months.get(month - 1); }
+                else if run == 2 { o = o + i18n_pad2(month); }
+                else { o = o + int_to_str(month); }
+            } else {
+                if run == 2 { o = o + i18n_pad2(day); } else { o = o + int_to_str(day); }
+            }
+        } else {
+            o = o + char_to_str(c);
+            i = i + 1;
+        }
+    }
+    return o;
+}
+
+/// A date in the locale's "short" or "long" style.
+pub fn i18n_date(locale: str, style: str, year: i64, month: i64, day: i64) -> str {
+    return i18n_format_pattern(locale, i18n_date_pattern(locale, style), year, month, day);
+}
+
+// ─── catalogs and messages ──────────────────────────────────────────────
+
+pub struct I18n {
+    pub default_locale: str,
+    pub keys: HashMap<str, str>,   // "locale\u{1}key" -> message
+}
+
+pub fn i18n_new(default_locale: str) -> I18n {
+    return I18n { default_locale: default_locale, keys: HashMap::new() };
+}
+
+fn i18n_slot(locale: str, key: str) -> str {
+    return locale + "|" + key;
+}
+
+pub fn i18n_add(c: & mut I18n, locale: str, key: str, message: str) {
+    c.keys.insert(i18n_slot(locale, key), message);
+}
+
+/// The message for `key`: the exact locale, its language, the default
+/// locale, else the key itself.
+pub fn i18n_lookup(c: & I18n, locale: str, key: str) -> str {
+    if c.keys.contains(i18n_slot(locale, key)) {
+        return c.keys.get(i18n_slot(locale, key));
+    }
+    val l: str = i18n_lang(locale);
+    if c.keys.contains(i18n_slot(l, key)) {
+        return c.keys.get(i18n_slot(l, key));
+    }
+    if c.keys.contains(i18n_slot(c.default_locale, key)) {
+        return c.keys.get(i18n_slot(c.default_locale, key));
+    }
+    return key;
+}
+
+/// Message arguments: parallel names and values (values as text; numbers
+/// as decimal strings).
+pub struct I18nArgs {
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+}
+
+pub fn i18n_args() -> I18nArgs {
+    return I18nArgs { names: Vec::new(), vals: Vec::new() };
+}
+
+pub fn i18n_arg(a: & mut I18nArgs, name: str, value: str) {
+    a.names.push(name);
+    a.vals.push(value);
+}
+
+pub fn i18n_args1(name: str, value: str) -> I18nArgs {
+    var a: I18nArgs = i18n_args();
+    i18n_arg(& mut a, name, value);
+    return a;
+}
+
+fn i18n_argval(a: & I18nArgs, name: str) -> str {
+    var i: i64 = 0;
+    while i < a.names.len() {
+        if a.names.get(i) == name {
+            return a.vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "{" + name + "}";
+}
+
+// the index after the '}' matching the '{' at `open`
+fn i18n_close(s: str, open: i64) -> i64 {
+    var depth: i64 = 0;
+    var i: i64 = open;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 123 { depth = depth + 1; }
+        if c == 125 {
+            depth = depth - 1;
+            if depth == 0 {
+                return i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return str_len(s);
+}
+
+// in "one {# file} other {# files}", the branch text for `want` (or other)
+fn i18n_branch(body: str, want: str, exact: str) -> str {
+    var i: i64 = 0;
+    var other: str = "";
+    var hit_cat: str = "";
+    var found_cat: bool = false;
+    val n: i64 = str_len(body);
+    while i < n {
+        while i < n && (str_byte_at(body, i) == 32 || str_byte_at(body, i) == 10 || str_byte_at(body, i) == 9) { i = i + 1; }
+        val ks: i64 = i;
+        while i < n && str_byte_at(body, i) != 123 && str_byte_at(body, i) != 32 { i = i + 1; }
+        val sel: str = str_slice(body, ks, i);
+        while i < n && str_byte_at(body, i) != 123 { i = i + 1; }
+        if i >= n {
+            i = n;
+        } else {
+            val e: i64 = i18n_close(body, i);
+            val text: str = str_slice(body, i + 1, e - 1);
+            if str_len(exact) > 0 && sel == "=" + exact {
+                return text;
+            }
+            if sel == want && !found_cat {
+                hit_cat = text;
+                found_cat = true;
+            }
+            if sel == "other" {
+                other = text;
+            }
+            i = e;
+        }
+    }
+    if found_cat {
+        return hit_cat;
+    }
+    return other;
+}
+
+/// Format a message with arguments for a locale.
+pub fn i18n_format(locale: str, msg: str, a: & I18nArgs) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    val n: i64 = str_len(msg);
+    while i < n {
+        val c: i64 = str_byte_at(msg, i);
+        if c == 123 {
+            val e: i64 = i18n_close(msg, i);
+            val inner: str = str_slice(msg, i + 1, e - 1);
+            val c1: i64 = str_find(inner, ",");
+            if c1 < 0 {
+                o = o + i18n_argval(a, str_trim(inner));
+            } else {
+                val name: str = str_trim(str_slice(inner, 0, c1));
+                val rest: str = str_slice(inner, c1 + 1, str_len(inner));
+                val c2: i64 = str_find(rest, ",");
+                val kind: str = str_trim(str_slice(rest, 0, c2));
+                val body: str = str_slice(rest, c2 + 1, str_len(rest));
+                val value: str = i18n_argval(a, name);
+                if kind == "plural" {
+                    var exact: str = value;
+                    val br: str = i18n_branch(body, i18n_plural(locale, value), exact);
+                    val v: i64 = i18n_operands(value).v;
+                    val shown: str = i18n_number(locale, value, v);
+                    o = o + i18n_format(locale, str_replace(br, "#", shown), a);
+                } else if kind == "select" {
+                    o = o + i18n_format(locale, i18n_branch(body, value, ""), a);
+                } else {
+                    o = o + value;
+                }
+            }
+            i = e;
+        } else {
+            o = o + char_to_str(c);
+            i = i + 1;
+        }
+    }
+    return o;
+}
+
+/// Look up `key` and format it.
+pub fn i18n_t(c: & I18n, locale: str, key: str, a: I18nArgs) -> str {
+    return i18n_format(locale, i18n_lookup(c, locale, key), & a);
+}

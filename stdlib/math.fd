@@ -14,6 +14,8 @@ module math;
 // Declare FFI functions from C's math.h
 // The runtime (runtime_linux.rs) provides pledge_* implementations.
 // The C codegen links against libm.
+// SAFETY: the prototypes come from <math.h> (the include), checked by the C
+// compiler; every function takes and returns doubles.
 extern "C" include "<math.h>" link "m" {
     fn sqrt as pledge_sqrt(x: f64) -> f64;
     fn sin as pledge_sin(x: f64) -> f64;
@@ -592,16 +594,9 @@ impl quat {
             }
             .normalize();
         }
-        // Spherical interpolation
-        var theta = pledge_sqrt(1.0 - dot * dot);
-        var angle = pledge_sqrt(1.0 - dot * dot);
-        // arccos via atan2: angle = atan2(sqrt(1 - dot^2), dot)
-        // Use math approximation: sin_theta = sqrt(1 - dot^2)
-        var sin_theta = pledge_sqrt(1.0 - dot * dot);
-        // scale factors
-        var scale0 = pledge_sin((1.0 - t) * 1.5707963267948966) / sin_theta;
-        var scale1 = pledge_sin(t * 1.5707963267948966) / sin_theta;
-        // Simplified: use linear blend when close, exact slerp otherwise
+        // Exact slerp needs acos, which this module lacks (stdlib/quat has
+        // a constant-speed slerp): this is the normalized lerp, the same
+        // path but not at constant speed
         // For robustness, fall back to nlerp (normalized lerp)
         var blend_w = self.w + (q2.w - self.w) * t;
         var blend_x = self.x + (q2.x - self.x) * t;

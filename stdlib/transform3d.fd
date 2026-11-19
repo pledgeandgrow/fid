@@ -1,0 +1,384 @@
+// Fides 3D rigid transforms and a frame tree (robotics)
+//
+// `Transform3` is a rigid motion: a unit quaternion rotation (math's `quat`)
+// and a translation (`vec3`); applied to a point p it gives R p + t.
+// Compose, invert, apply to points and directions, interpolate (slerp +
+// lerp), convert to and from math's 4x4 `mat4`, and build one from x, y, z,
+// roll, pitch, yaw (URDF's origin convention: R = Rz(yaw) Ry(pitch) Rx(roll)).
+//
+// `FrameTree` is a tree of named coordinate frames like ROS tf: each frame
+// but the root has a parent and the transform parent_T_child (it maps
+// coordinates in the child frame to coordinates in the parent frame).
+// `ftree_lookup(tree, target, source)` gives target_T_source for any two
+// frames, through their lowest common ancestor; frames can be re-attached
+// (with a cycle check) and their transforms updated.
+//
+// Naming: `tf3_compose(a, b)` is a * b: apply b first, then a. A transform
+// named a_T_b maps b coordinates to a coordinates, so
+// a_T_c = tf3_compose(a_T_b, b_T_c).
+//
+// Everything here is pure computation; there is no platform seam.
+//
+// Usage:
+//   use math; use quat; use transform3d;
+//   var tree = ftree_new("world");
+//   ftree_add(&mut tree, "base", "world", tf3_from_xyz_rpy(1.0, 0.0, 0.0, 0.0, 0.0, 1.57));
+//   ftree_add(&mut tree, "camera", "base", tf3_translation(vec3(0.0, 0.0, 0.5)));
+//   match ftree_lookup(&tree, "world", "camera") {
+//       Result::Ok(t) => { println(tf3_to_str(t, 3)); }
+//       Result::Err(e) => { println(e); }
+//   }
+
+module transform3d;
+use math;
+use quat;
+
+// ─── Rigid transforms ───
+
+/// A rigid transform: p -> rot * p + trans.
+pub struct Transform3 {
+    pub rot: quat,
+    pub trans: vec3,
+}
+
+/// The identity transform.
+pub fn tf3_identity() -> Transform3 {
+    return Transform3 {
+        rot: qt_identity(), trans: vec3(0.0, 0.0, 0.0)
+    };
+}
+
+/// A transform from a rotation (normalized here) and a translation.
+pub fn tf3_new(rot: quat, trans: vec3) -> Transform3 {
+    return Transform3 {
+        rot: qt_normalize(rot), trans: trans
+    };
+}
+
+/// A pure translation.
+pub fn tf3_translation(t: vec3) -> Transform3 {
+    return Transform3 {
+        rot: qt_identity(), trans: t
+    };
+}
+
+/// A pure rotation.
+pub fn tf3_rotation(q: quat) -> Transform3 {
+    return Transform3 {
+        rot: qt_normalize(q), trans: vec3(0.0, 0.0, 0.0)
+    };
+}
+
+/// A transform from a translation and fixed-axis roll, pitch, yaw
+/// (R = Rz(yaw) Ry(pitch) Rx(roll), as in a URDF origin).
+pub fn tf3_from_xyz_rpy(x: f64, y: f64, z: f64, roll: f64, pitch: f64, yaw: f64) -> Transform3 {
+    return Transform3 {
+        rot: qt_from_euler_zyx(roll, pitch, yaw), trans: vec3(x, y, z)
+    };
+}
+
+/// a * b: apply b, then a.
+pub fn tf3_compose(a: Transform3, b: Transform3) -> Transform3 {
+    return Transform3 {
+        rot: qt_normalize(qt_mul(a.rot, b.rot)), trans: qt_rotate(a.rot, b.trans).add(a.trans)
+    };
+}
+
+/// The inverse: p -> R^T (p - t).
+pub fn tf3_inverse(t: Transform3) -> Transform3 {
+    val ri: quat = qt_conj(t.rot);
+    val ti: vec3 = qt_rotate(ri, t.trans);
+    return Transform3 {
+        rot: ri, trans: vec3(0.0 - ti.x, 0.0 - ti.y, 0.0 - ti.z)
+    };
+}
+
+/// The point p transformed: R p + t.
+pub fn tf3_apply(t: Transform3, p: vec3) -> vec3 {
+    return qt_rotate(t.rot, p).add(t.trans);
+}
+
+/// The direction v rotated (no translation).
+pub fn tf3_apply_dir(t: Transform3, v: vec3) -> vec3 {
+    return qt_rotate(t.rot, v);
+}
+
+/// Every point of `pts` transformed.
+pub fn tf3_apply_all(t: Transform3, pts: & Vec<vec3>) -> Vec<vec3> {
+    var out: Vec<vec3> = Vec::new();
+    var i: i64 = 0;
+    while i < pts.len() {
+        out.push(tf3_apply(t, pts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The transform at fraction s of the way from a (s = 0) to b (s = 1):
+/// slerp of the rotations, lerp of the translations.
+pub fn tf3_interpolate(a: Transform3, b: Transform3, s: f64) -> Transform3 {
+    return Transform3 {
+        rot: qt_slerp(a.rot, b.rot, s), trans: a.trans.lerp(b.trans, s)
+    };
+}
+
+/// The relative motion a^-1 * b (b seen from a).
+pub fn tf3_between(a: Transform3, b: Transform3) -> Transform3 {
+    return tf3_compose(tf3_inverse(a), b);
+}
+
+/// Translation distance and rotation angle (radians) between a and b.
+pub fn tf3_distance(a: Transform3, b: Transform3) -> vec2 {
+    return vec2(a.trans.sub(b.trans).length(), qt_angle_between(a.rot, b.rot));
+}
+
+/// True when a and b differ by at most `tol_t` in translation and `tol_r`
+/// radians in rotation.
+pub fn tf3_approx_eq(a: Transform3, b: Transform3, tol_t: f64, tol_r: f64) -> bool {
+    val d: vec2 = tf3_distance(a, b);
+    return d.x <= tol_t && d.y <= tol_r;
+}
+
+/// The homogeneous 4x4 matrix (math's mat4, mRC = row R column C).
+pub fn tf3_to_mat4(t: Transform3) -> mat4 {
+    val r: Mat3 = qt_to_mat3(t.rot);
+    return mat4 {
+        m00: r.m00, m01: r.m01, m02: r.m02, m03: t.trans.x, m10: r.m10, m11: r.m11, m12: r.m12, m13: t.trans.y, m20: r.m20, m21: r.m21, m22: r.m22, m23: t.trans.z, m30: 0.0, m31: 0.0, m32: 0.0, m33: 1.0
+    };
+}
+
+/// The transform of a homogeneous 4x4 matrix whose upper 3x3 is a rotation.
+pub fn tf3_from_mat4(m: mat4) -> Transform3 {
+    val r: Mat3 = Mat3 {
+        m00: m.m00, m01: m.m01, m02: m.m02, m10: m.m10, m11: m.m11, m12: m.m12, m20: m.m20, m21: m.m21, m22: m.m22
+    };
+    return Transform3 {
+        rot: qt_from_mat3(r), trans: vec3(m.m03, m.m13, m.m23)
+    };
+}
+
+/// The rotation matrix and translation of t.
+pub fn tf3_rot_mat3(t: Transform3) -> Mat3 {
+    return qt_to_mat3(t.rot);
+}
+
+/// "t=(x, y, z) q=(w, x, y, z)" with `dp` decimals.
+pub fn tf3_to_str(t: Transform3, dp: i64) -> str {
+    return "t=" + rmath_vec3_str(t.trans, dp) + " q=" + qt_to_str(qt_canonical(t.rot), dp);
+}
+
+// ─── Frame tree ───
+
+/// Named frames with parent links; frame 0 is the root.
+pub struct FrameTree {
+    pub names: Vec<str>,
+    pub parents: Vec<i64>,
+    // parent_T_child for each frame; the root's is the identity
+    pub to_parent: Vec<Transform3>,
+    pub index: HashMap<str, i64>,
+}
+
+/// A tree with only the root frame.
+pub fn ftree_new(root: str) -> FrameTree {
+    var t = FrameTree {
+        names: Vec::new(), parents: Vec::new(), to_parent: Vec::new(), index: HashMap::new()
+    };
+    t.names.push(root);
+    t.parents.push(- 1);
+    t.to_parent.push(tf3_identity());
+    t.index.insert(root, 0);
+    return t;
+}
+
+/// The number of frames.
+pub fn ftree_len(t: & FrameTree) -> i64 {
+    return t.names.len();
+}
+
+/// The id of frame `name`, or -1.
+pub fn ftree_id(t: & FrameTree, name: str) -> i64 {
+    if t.index.contains(name) {
+        return t.index.get(name);
+    }
+    return - 1;
+}
+
+/// True when frame `name` exists.
+pub fn ftree_has(t: & FrameTree, name: str) -> bool {
+    return t.index.contains(name);
+}
+
+/// The parent's name of frame `name` ("" for the root or an unknown frame).
+pub fn ftree_parent(t: & FrameTree, name: str) -> str {
+    val id: i64 = ftree_id(t, name);
+    if id <= 0 {
+        return "";
+    }
+    return t.names.get(t.parents.get(id));
+}
+
+/// Add frame `name` under `parent` with parent_T_child `tf`.
+/// Err when the name exists or the parent does not.
+pub fn ftree_add(t: & mut FrameTree, name: str, parent: str, tf: Transform3) -> Result<i64, str> {
+    if t.index.contains(name) {
+        return Result::Err("frame exists: " + name);
+    }
+    if !t.index.contains(parent) {
+        return Result::Err("unknown parent frame: " + parent);
+    }
+    val pid: i64 = t.index.get(parent);
+    val id: i64 = t.names.len();
+    t.names.push(name);
+    t.parents.push(pid);
+    t.to_parent.push(tf);
+    t.index.insert(name, id);
+    return Result::Ok(id);
+}
+
+/// Replace parent_T_child of frame `name`. Err for the root or an unknown frame.
+pub fn ftree_set_transform(t: & mut FrameTree, name: str, tf: Transform3) -> Result<i64, str> {
+    val id: i64 = ftree_id(t, name);
+    if id < 0 {
+        return Result::Err("unknown frame: " + name);
+    }
+    if id == 0 {
+        return Result::Err("the root frame has no parent transform");
+    }
+    t.to_parent.set(id, tf);
+    return Result::Ok(id);
+}
+
+/// True when `anc` is `id` or one of its ancestors.
+fn ftree_is_ancestor(t: & FrameTree, anc: i64, id: i64) -> bool {
+    var cur: i64 = id;
+    while cur >= 0 {
+        if cur == anc {
+            return true;
+        }
+        cur = t.parents.get(cur);
+    }
+    return false;
+}
+
+/// Move frame `name` under `parent` with a new parent_T_child. Err when it
+/// would make a cycle (the new parent is the frame or below it).
+pub fn ftree_reparent(t: & mut FrameTree, name: str, parent: str, tf: Transform3) -> Result<i64, str> {
+    val id: i64 = ftree_id(t, name);
+    val pid: i64 = ftree_id(t, parent);
+    if id < 0 {
+        return Result::Err("unknown frame: " + name);
+    }
+    if pid < 0 {
+        return Result::Err("unknown parent frame: " + parent);
+    }
+    if id == 0 {
+        return Result::Err("the root frame cannot be moved");
+    }
+    if ftree_is_ancestor(t, id, pid) {
+        return Result::Err("cycle: " + parent + " is " + name + " or below it");
+    }
+    t.parents.set(id, pid);
+    t.to_parent.set(id, tf);
+    return Result::Ok(id);
+}
+
+/// The depth of frame id (root = 0).
+fn ftree_depth(t: & FrameTree, id: i64) -> i64 {
+    var d: i64 = 0;
+    var cur: i64 = id;
+    while t.parents.get(cur) >= 0 {
+        cur = t.parents.get(cur);
+        d = d + 1;
+    }
+    return d;
+}
+
+/// The lowest common ancestor of frames a and b.
+fn ftree_lca(t: & FrameTree, a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    var y: i64 = b;
+    var dx: i64 = ftree_depth(t, x);
+    var dy: i64 = ftree_depth(t, y);
+    while dx > dy {
+        x = t.parents.get(x);
+        dx = dx - 1;
+    }
+    while dy > dx {
+        y = t.parents.get(y);
+        dy = dy - 1;
+    }
+    while x != y {
+        x = t.parents.get(x);
+        y = t.parents.get(y);
+    }
+    return x;
+}
+
+/// anc_T_id, for `anc` an ancestor of `id` (or `id` itself).
+fn ftree_chain(t: & FrameTree, anc: i64, id: i64) -> Transform3 {
+    var acc: Transform3 = tf3_identity();
+    var cur: i64 = id;
+    while cur != anc {
+        acc = tf3_compose(t.to_parent.get(cur), acc);
+        cur = t.parents.get(cur);
+    }
+    return acc;
+}
+
+/// target_T_source: maps coordinates in frame `source` to frame `target`.
+pub fn ftree_lookup(t: & FrameTree, target: str, source: str) -> Result<Transform3, str> {
+    val ti: i64 = ftree_id(t, target);
+    val si: i64 = ftree_id(t, source);
+    if ti < 0 {
+        return Result::Err("unknown frame: " + target);
+    }
+    if si < 0 {
+        return Result::Err("unknown frame: " + source);
+    }
+    val l: i64 = ftree_lca(t, ti, si);
+    val l_t_s: Transform3 = ftree_chain(t, l, si);
+    val l_t_t: Transform3 = ftree_chain(t, l, ti);
+    return Result::Ok(tf3_compose(tf3_inverse(l_t_t), l_t_s));
+}
+
+/// The point p given in frame `source`, expressed in frame `target`.
+pub fn ftree_transform_point(t: & FrameTree, target: str, source: str, p: vec3) -> Result<vec3, str> {
+    match ftree_lookup(t, target, source) {
+        Result::Ok(tf) => {
+            return Result::Ok(tf3_apply(tf, p));
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+/// The frames from `source` up to the common ancestor and down to `target`,
+/// joined with " -> ".
+pub fn ftree_path(t: & FrameTree, target: str, source: str) -> str {
+    val ti: i64 = ftree_id(t, target);
+    val si: i64 = ftree_id(t, source);
+    if ti < 0 || si < 0 {
+        return "";
+    }
+    val l: i64 = ftree_lca(t, ti, si);
+    var out: str = "";
+    var cur: i64 = si;
+    while cur != l {
+        out = out + t.names.get(cur) + " -> ";
+        cur = t.parents.get(cur);
+    }
+    out = out + t.names.get(l);
+    var down: Vec<i64> = Vec::new();
+    cur = ti;
+    while cur != l {
+        down.push(cur);
+        cur = t.parents.get(cur);
+    }
+    var i: i64 = down.len() - 1;
+    while i >= 0 {
+        out = out + " -> " + t.names.get(down.get(i));
+        i = i - 1;
+    }
+    return out;
+}

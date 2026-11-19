@@ -1,0 +1,190 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG1), the machine layer
+// (compiler/nat_ir.fd ng_isel_rows_tg1): instruction selection as rules
+// past the integer ALU. Each function below is selected from the table
+// on every machine-layer target: constants by their immediate class
+// (x86-64 xor / mov r32 / mov simm32 / movabs, AArch64 MOVZ / MOVN /
+// MOVZ+MOVK, RISC-V ADDI / LUI+ADDIW / longer), shifts by a constant
+// (MO_SHI: one SHL / SAR / SHR imm, LSL / ASR / LSR, SLLI / SRAI /
+// SRLI), compares to a value and in branches (against a register and
+// against zero: x86-64 TEST, AArch64 CBZ / CBNZ), loads and stores whose
+// displacement fits the target's immediate or not (AArch64 past 32760,
+// RISC-V past 2047: through a scratch register), element addresses, and
+// f64 / f32 arithmetic and compares. The output is the same with
+// FID_NAT_OFF=isel (the hand-written selection), and FID_VERIFY=1 builds
+// compare the two byte for byte and run each rule on random operands
+// (nat_sel_check, nat_isel_mem_check, nat_isel_rule_check). Run:
+//   NATIVE=1 bash scripts/cross-test.sh aarch64-linux (riscv64-linux,
+//   x86_64-linux), bash tests/nattools/isel_rules_check.sh.
+// Expected output:
+// 65535 65536 4294901760 4294967295 4294967296
+// -1 -65536 -2147483648 -2147483649 1311768467463790320
+// 2047 2048 -2048 -2049 281470681743360
+// 8 -8 160 -1 2305843009213693951 1
+// 1 0 1 1 0 1 0 1 1 0 1 0
+// 1 0 1 1
+// 7 4095 4096 32767 32768 2047 2048 4412
+// 13 -2 26 7 1 0 0 1 1 1
+// 13 -2 42 7 1 0 1 1
+// 12345
+
+fn k_u16() -> i64 { return 65535; }
+fn k_hw1() -> i64 { return 65536; }
+fn k_hw2() -> i64 { return 4294901760; }
+fn k_u32() -> i64 { return 4294967295; }
+fn k_2_32() -> i64 { return 4294967296; }
+fn k_m1() -> i64 { return 0 - 1; }
+fn k_m65536() -> i64 { return 0 - 65536; }
+fn k_s32min() -> i64 { return 0 - 2147483648; }
+fn k_s32min1() -> i64 { return 0 - 2147483649; }
+fn k_big() -> i64 { return 1311768467463790320; }
+fn k_2047() -> i64 { return 2047; }
+fn k_2048() -> i64 { return 2048; }
+fn k_m2048() -> i64 { return 0 - 2048; }
+fn k_m2049() -> i64 { return 0 - 2049; }
+fn k_mid() -> i64 { return 281470681743360; }
+
+@wrapping fn shl3(a: i64) -> i64 { return a << 3; }
+@wrapping fn sar2(a: i64) -> i64 { return a >> 2; }
+@wrapping fn shl5(a: i64) -> i64 { return a << 5; }
+@wrapping fn sar63(a: i64) -> i64 { return a >> 63; }
+@wrapping fn shr3(a: i64) -> i64 { return ((a as u64) >> (3 as u64)) as i64; }
+@wrapping fn shr63(a: i64) -> i64 { return ((a as u64) >> (63 as u64)) as i64; }
+
+fn b(c: bool) -> i64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+fn lt(x: i64, y: i64) -> i64 { if x < y { return 1; } return 0; }
+fn eqz(x: i64) -> i64 { if x == 0 { return 1; } return 0; }
+fn nez(x: i64) -> i64 { if x != 0 { return 1; } return 0; }
+fn geu(x: i64, y: i64) -> i64 { if (x as u64) >= (y as u64) { return 1; } return 0; }
+
+fn sum_at(v: & Vec<i64>) -> i64 {
+    return v.get(1) + v.get(511) + v.get(512) + v.get(4095) + v.get(4096);
+}
+
+fn fadd(x: f64, y: f64) -> f64 { return x + y; }
+fn fsub(x: f64, y: f64) -> f64 { return x - y; }
+fn fmul(x: f64, y: f64) -> f64 { return x * y; }
+fn fdiv(x: f64, y: f64) -> f64 { return x / y; }
+fn fadd32(x: f32, y: f32) -> f32 { return x + y; }
+fn fsub32(x: f32, y: f32) -> f32 { return x - y; }
+fn fmul32(x: f32, y: f32) -> f32 { return x * y; }
+fn fdiv32(x: f32, y: f32) -> f32 { return x / y; }
+
+fn line(v: Vec<i64>) {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn main() {
+    var l1: Vec<i64> = Vec::new();
+    l1.push(k_u16());
+    l1.push(k_hw1());
+    l1.push(k_hw2());
+    l1.push(k_u32());
+    l1.push(k_2_32());
+    line(l1);
+    var l2: Vec<i64> = Vec::new();
+    l2.push(k_m1());
+    l2.push(k_m65536());
+    l2.push(k_s32min());
+    l2.push(k_s32min1());
+    l2.push(k_big());
+    line(l2);
+    var l3: Vec<i64> = Vec::new();
+    l3.push(k_2047());
+    l3.push(k_2048());
+    l3.push(k_m2048());
+    l3.push(k_m2049());
+    l3.push(k_mid());
+    line(l3);
+    var l4: Vec<i64> = Vec::new();
+    l4.push(shl3(1));
+    l4.push(sar2(0 - 32));
+    l4.push(shl5(5));
+    l4.push(sar63(0 - 5));
+    l4.push(shr3(0 - 1));
+    l4.push(shr63(0 - 1));
+    line(l4);
+    var l5: Vec<i64> = Vec::new();
+    val p: i64 = 0 - 3;
+    val q: i64 = 4;
+    l5.push(b(p < q));
+    l5.push(b(p > q));
+    l5.push(b(p <= q));
+    l5.push(b(p != q));
+    l5.push(b(p == q));
+    l5.push(b((q as u64) < (p as u64)));
+    l5.push(b((q as u64) > (p as u64)));
+    l5.push(b((p as u64) >= (q as u64)));
+    l5.push(b(p < 0));
+    l5.push(b(q < 0));
+    l5.push(b(q >= 0));
+    l5.push(b(p == 0));
+    line(l5);
+    var l6: Vec<i64> = Vec::new();
+    l6.push(lt(p, q));
+    l6.push(eqz(q));
+    l6.push(nez(p));
+    l6.push(geu(p, q));
+    line(l6);
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 5000 {
+        v.push(i);
+        i = i + 1;
+    }
+    v.set(511, 4095);
+    v.set(512, 4096);
+    v.set(4095, 32767);
+    v.set(4096, 32768);
+    var l7: Vec<i64> = Vec::new();
+    l7.push(v.get(7));
+    l7.push(v.get(511));
+    l7.push(v.get(512));
+    l7.push(v.get(4095));
+    l7.push(v.get(4096));
+    l7.push(v.get(2047));
+    l7.push(v.get(2048));
+    l7.push(sum_at(& v) - 69355 + 41 - 1);
+    line(l7);
+    val x: f64 = 6.5;
+    val y: f64 = 0.0 - 8.5;
+    var l8: Vec<i64> = Vec::new();
+    l8.push(fsub(x, 0.0 - 6.5) as i64);
+    l8.push(fadd(x, y) as i64);
+    l8.push(fmul(x, 4.0) as i64);
+    l8.push(fdiv(x * 14.0, 13.0) as i64);
+    l8.push(b(x > y));
+    l8.push(b(x < y));
+    l8.push(b(x == y));
+    l8.push(b(x != y));
+    l8.push(b(x >= 6.5));
+    l8.push(b(y <= 0.0 - 8.5));
+    line(l8);
+    val x32: f32 = 6.5 as f32;
+    val y32: f32 = (0.0 - 8.5) as f32;
+    var l9: Vec<i64> = Vec::new();
+    l9.push(fsub32(x32, (0.0 - 6.5) as f32) as i64);
+    l9.push(fadd32(x32, y32) as i64);
+    l9.push(fmul32(x32, 6.5 as f32) as i64);
+    l9.push(fdiv32(x32 * (14.0 as f32), 13.0 as f32) as i64);
+    l9.push(b(x32 > y32));
+    l9.push(b(x32 < y32));
+    l9.push(b(x32 != y32));
+    l9.push(b(x32 >= x32));
+    line(l9);
+    println(12345);
+}

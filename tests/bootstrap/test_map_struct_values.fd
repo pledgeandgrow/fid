@@ -1,0 +1,77 @@
+// Competitive roadmap RT5: struct values in a HashMap, with string fields
+// (owned: scripts/leak-check.sh frees every block). With the lowering's
+// HashMap_insert_mem / HashMap_insert_i_mem (core keeps the structs in the
+// map's values block) and without it (a heap copy per value) the output is
+// the same: a value read out of the map is a copy of its own, untouched by
+// later changes to the map.
+// Expected output:
+// 3
+// first
+// first
+// 10
+// third
+// 2
+// 114
+// n57
+// 100
+// n3
+// 99
+// gone false
+// 98
+// n42
+// copy n42 changed n42!
+
+struct Pt {
+    x: i64,
+    y: i64,
+    name: str,
+}
+
+fn make(i: i64) -> Pt {
+    return Pt { x: i, y: i * 2, name: "n" + int_to_str(i) };
+}
+
+fn main() {
+    var m: HashMap<str, Pt> = HashMap::new();
+    m.insert("a", Pt { x: 1, y: 2, name: "first" });
+    m.insert("b", Pt { x: 3, y: 4, name: "second" });
+    var p: Pt = m.get("a");
+    println(p.x + p.y);
+    println(p.name);
+    m.insert("a", Pt { x: 10, y: 20, name: "third" });
+    println(p.name);
+    var q: Pt = m.get("a");
+    println(q.x);
+    println(q.name);
+    println(m.len());
+
+    var n: HashMap<i64, Pt> = HashMap::new();
+    var i: i64 = 0;
+    while i < 100 {
+        n.insert(i, make(i));
+        i = i + 1;
+    }
+    var r: Pt = n.get(57);
+    println(r.y);
+    println(r.name);
+    var vs: Vec<Pt> = n.values();
+    println(vs.len());
+    println(vs.get(3).name);
+    n.remove(3);
+    println(n.len());
+    if n.contains(3) {
+        println("gone true");
+    } else {
+        println("gone false");
+    }
+    n.remove(4);
+    println(n.len());
+    var c: HashMap<i64, Pt> = n.clone();
+    var e: Pt = make(42);
+    e.name = e.name + "!";
+    n.insert(42, e);
+    var from_c: Pt = c.get(42);
+    var from_n: Pt = n.get(42);
+    println(from_c.name);
+    println("copy " + from_c.name + " changed " + from_n.name);
+}

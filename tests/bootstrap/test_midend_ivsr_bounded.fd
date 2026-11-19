@@ -1,0 +1,154 @@
+// OP10 (compiler/iropt_me.fd ime_strength_reduce, pass `ivsr`, opt-in
+// FID_IROPT_ON=ivsr on the native paths; FID_IROPT_OFF=ivbound keeps it to
+// @wrapping code): strength reduction outside @wrapping functions, with
+// the bound proof of iropt.fd's `iv` (checks.fd iro_iv_bounded). In a loop
+// whose test bounds the induction variable by a constant and whose entry
+// value is a constant, `i * c` becomes a second variable stepped by
+// `c * step`. Loops it must leave alone (a bound that is a parameter, the
+// variable stepped by an inner loop) are here too. Every result must be
+// what the multiplies compute, with ivsr on and off
+// (tests/tooling/ivsr-check.sh).
+//
+// Expected output:
+// 34650
+// 3825
+// 7161
+// 250
+// 150
+// 3915
+// 8658
+// 1200025
+// 523763712000
+// 4950
+
+fn up() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        t = t + i * 7;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn down() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 50;
+    while i > 0 {
+        t = t + i * 3;
+        i = i - 1;
+    }
+    return t;
+}
+
+fn step3() -> i64 {
+    // `<=`, step 3: i = 1, 4, ..., 61
+    var t: i64 = 0;
+    var i: i64 = 1;
+    while i <= 61 {
+        t = t + i * 11;
+        i = i + 3;
+    }
+    return t;
+}
+
+fn in_branch() -> i64 {
+    // the products sit in blocks other than the step's
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 20 {
+        if i % 2 == 0 {
+            t = t + i * 5;
+        } else {
+            t = t - i * 2;
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+fn inner_step() -> i64 {
+    // i is stepped by the inner loop: between two tests of `i < 10` it
+    // grows by 3, so the outer test does not bound it (no shadow here)
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        var k: i64 = 0;
+        while k < 3 {
+            i = i + 1;
+            k = k + 1;
+        }
+        t = t + i * 5;
+    }
+    return t;
+}
+
+fn param(n: i64) -> i64 {
+    // a bound known only at run time: left alone
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        t = t + i * 9;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn early() -> i64 {
+    // a second exit: i stays below the test's bound all the same
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        if i == 37 {
+            break;
+        }
+        t = t + i * 13;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn last() -> i64 {
+    // the variable after the loop (its exit value)
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 25 {
+        t = t + i * 4;
+        i = i + 1;
+    }
+    return t * 1000 + i;
+}
+
+fn large() -> i64 {
+    // the largest factor the proof takes (2^20)
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 1000 {
+        t = t + i * 1048576;
+        i = i + 1;
+    }
+    return t;
+}
+
+@wrapping fn wrapped() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        t = t + i * 1;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn main() {
+    println(up());
+    println(down());
+    println(step3());
+    println(in_branch());
+    println(inner_step());
+    println(param(30));
+    println(early());
+    println(last());
+    println(large());
+    println(wrapped());
+}

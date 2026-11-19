@@ -1,0 +1,472 @@
+// stdlib/x509 on a chain made with OpenSSL 3.5 (openssl verify accepts it):
+// an Ed25519 root, a P-256 intermediate it signs with Ed25519 (pathlen 1),
+// an RSA-1024 intermediate signed with ecdsa-with-SHA256 (pathlen 0), and
+// an Ed25519 leaf signed with sha256WithRSAEncryption carrying DNS, IP and
+// e-mail SANs. Fields are printed; every signature is checked; the chain
+// passes at a time inside every validity period and fails for an expired
+// leaf, a missing link, a tampered TBS, a leaf in place of its issuer, and with
+// no anchor; host names are matched against the SANs.
+// Expected output:
+// root v3 serial 01 Ed25519 subject C=FR, O=Fides Test, CN=Fides Test Root
+// root self-issued true ca true pathlen -1 ku 96 valid 1767225600 2082758400
+// int1 EC P-256 issuer CN Fides Test Root ca true pathlen 1 sig Ed25519
+// int2 RSA ca true pathlen 0 sig ecdsa-with-SHA256
+// leaf serial 0123456789abcdef01 CN example.test sig sha256WithRSAEncryption
+// leaf ca false ku 1 valid 1780272000 1811808000
+// leaf dns example.test www.example.test ip 127.0.0.1 email ops@example.test
+// leaf aki = int2 ski true
+// signatures root true int1 true int2 true leaf true wrong issuer false
+// chain ok true at 3
+// chain with root ok true
+// expired false outside its validity period at 0
+// missing link false issuer name does not match at 0
+// tampered false bad signature at 0
+// leaf as issuer false issuer name does not match at 0
+// no anchor false no trust anchor at 2
+// host www.example.test true EXAMPLE.TEST true 127.0.0.1 true other.test false
+// nc root ecdsa-with-SHA384 1.3.132.0.34 self-signed true
+// nc int ecdsa-with-SHA384 signed true constraints true critical understood true
+// nc permitted dns:example.test email:example.test ip:0a000000ff000000 dn:310b300906035504061302465231133011060355040a0c0a46696465732054657374
+// nc excluded dns:bad.example.test
+// pss leaf RSASSA-PSS true pss384 leaf RSASSA-PSS true rsa-sha384 leaf sha384WithRSAEncryption true tampered false
+// chain ok true at 2
+// chain pss384 true s384 true
+// chain excl false name excluded: dns:host.bad.example.test at 0
+// chain wild false name excluded: dns:*.example.test at 0
+// chain dns false name not permitted: dns:www.other.test at 0
+// chain ip false name not permitted: ip:c0a80101 at 0
+// chain mail false name not permitted: email:root@other.test at 0
+// chain dn false name not permitted: dn:310b3009060355040613024445310e300c060355040a0c054f746865723117301506035504030c0e782e6578616d706c652e74657374 at 0
+// crl v2 sha256WithRSAEncryption issuer C=FR, O=Fides Test, CN=Fides NC Intermediate
+// crl this 1798761600 next 1830297600 number 05 aki is int ski true
+// crl revoked 12 1782864000 reason 4, 18 1788220800 reason 1
+// crl signed by int true by root false
+// root crl ecdsa-with-SHA384 revoked 0 signed by root true
+// pss crl RSASSA-PSS signed by int true
+// crl check ok "" rev "certificate revoked"
+// chain crl ok true
+// chain crl revoked false certificate revoked at 0
+// chain crl 2029 false CRL expired at 0
+// chain crl 2026 false CRL not yet valid at 0
+// chain crl none required false no CRL for the issuer at 0 not required true
+// chain crl tampered false bad CRL signature at 0
+use x509;
+use pem;
+use vec;
+use encoding;
+
+fn main() {
+    val root: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIIBaTCCARugAwIBAgIBATAFBgMrZXAwPDELMAkGA1UEBhMCRlIxEzARBgNVBAoM
+CkZpZGVzIFRlc3QxGDAWBgNVBAMMD0ZpZGVzIFRlc3QgUm9vdDAeFw0yNjAxMDEw
+MDAwMDBaFw0zNjAxMDEwMDAwMDBaMDwxCzAJBgNVBAYTAkZSMRMwEQYDVQQKDApG
+aWRlcyBUZXN0MRgwFgYDVQQDDA9GaWRlcyBUZXN0IFJvb3QwKjAFBgMrZXADIQDf
+fuS4wrj3PraXVpYX/mPDnHGelrBrxNkpyVafLSJOnaNCMEAwDwYDVR0TAQH/BAUw
+AwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBSShCx3RYFTF+E9cC0AW1Bk
+v9WUMAUGAytlcANBAHqFSQ5VCKPNpEqZyM/jDBVZVtL5cat177QxnA4Hy08ilYSd
+oIcOmW6EAnI9Bzjf3SOODTreQLO8pqsAqQAsOAY=
+-----END CERTIFICATE-----");
+    val int1: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIIBwjCCAXSgAwIBAgIBAjAFBgMrZXAwPDELMAkGA1UEBhMCRlIxEzARBgNVBAoM
+CkZpZGVzIFRlc3QxGDAWBgNVBAMMD0ZpZGVzIFRlc3QgUm9vdDAeFw0yNjAxMDEw
+MDAwMDBaFw0zMTAxMDEwMDAwMDBaMEIxCzAJBgNVBAYTAkZSMRMwEQYDVQQKDApG
+aWRlcyBUZXN0MR4wHAYDVQQDDBVGaWRlcyBFQyBJbnRlcm1lZGlhdGUwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAASGYn3VpErN/cJiRSPEVikKMlBeoqrhKQMThsev
+/2DrbpXfGjRqKVax1WQvo3FQoGHRKrLhqAfllZiuMdW1FGbco2YwZDASBgNVHRMB
+Af8ECDAGAQH/AgEBMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUxeKG01eFTdt9
+lKvIWFA36G2ARZcwHwYDVR0jBBgwFoAUFJKELHdFgVMX4T1wLQBbUGS/1ZQwBQYD
+K2VwA0EAM7XqzTGZRlw51GieH8e0VErbNYmDz/HO6+9rt957icIf7VRY7aNK5KZC
+PNf/N/+IlwGp3cmmfOp8uLHnGCTQCQ==
+-----END CERTIFICATE-----");
+    val int2: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIICITCCAcegAwIBAgIBAzAKBggqhkjOPQQDAjBCMQswCQYDVQQGEwJGUjETMBEG
+A1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgRUMgSW50ZXJtZWRpYXRl
+MB4XDTI2MDEwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowQzELMAkGA1UEBhMCRlIx
+EzARBgNVBAoMCkZpZGVzIFRlc3QxHzAdBgNVBAMMFkZpZGVzIFJTQSBJbnRlcm1l
+ZGlhdGUwgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAKWfanWgdAI+CSctW3d9
+MBb0XxZ3PGj1+BKXmL+u1hUC+M1kik8m3LbRqHxEYEjfZbf12U/lG5WXSbegfMdD
+wbNEWQmpx/mMoBSdB+DudEaw83vvtJbDl4UDAD6zSKYpsjW4QhpZcoAK1mSOFLCB
+f3CpoUpXhSGf6pjKLfmm+rdRAgMBAAGjZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQAw
+DgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBT75a2X0ACn+QauIgJPBBvWgtrfeTAf
+BgNVHSMEGDAWgBTF4obTV4VN232Uq8hYUDfobYBFlzAKBggqhkjOPQQDAgNIADBF
+AiEAuHGljoBIsysrt09hzAvnR9vk8nOsHS8NHdcE8J9sSkECIEiGmca/1fd+gPoD
+Fpkl1HFY9934NtY3ec9A1DQMmEn2
+-----END CERTIFICATE-----");
+    val leaf: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIICKTCCAZKgAwIBAgIJASNFZ4mrze8BMA0GCSqGSIb3DQEBCwUAMEMxCzAJBgNV
+BAYTAkZSMRMwEQYDVQQKDApGaWRlcyBUZXN0MR8wHQYDVQQDDBZGaWRlcyBSU0Eg
+SW50ZXJtZWRpYXRlMB4XDTI2MDYwMTAwMDAwMFoXDTI3MDYwMTAwMDAwMFowOTEL
+MAkGA1UEBhMCRlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxFTATBgNVBAMMDGV4YW1w
+bGUudGVzdDAqMAUGAytlcAMhAOShyF5uGrGJDXgvhel6ABiDCSKAfUBJh+I66Jsp
+qlxho4GkMIGhMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMEEGA1UdEQQ6
+MDiCDGV4YW1wbGUudGVzdIIQd3d3LmV4YW1wbGUudGVzdIcEfwAAAYEQb3BzQGV4
+YW1wbGUudGVzdDAdBgNVHQ4EFgQUsnu3Jou7LyEwuFqKEh+2+HQ8vowwHwYDVR0j
+BBgwFoAU++Wtl9AAp/kGriICTwQb1oLa33kwDQYJKoZIhvcNAQELBQADgYEAKeNt
+QynF7UNweMba6DNgGPuEmp8kW6JQCs5MjQ6JQmH6VQCpTfLyGSOOtBVHBMx+wmZ5
+ZSFB+MCx0Lhm7lMmI9+6kZIs3nrtRVD1JSd1mPOfeeugPufPcGfV5rAm5VKLyNXv
+y0M7VXcAYN+zwuoi3ZwI9qyw6Zvwxq7x1bXispk=
+-----END CERTIFICATE-----");
+    println("root v" + int_to_str(root.version) + " serial " + x509_serial_hex(root) + " " + pem_oid_name(root.spki.alg) + " subject " + root.subject);
+    println("root self-issued " + bool_to_str(x509_self_issued(root)) + " ca " + bool_to_str(root.is_ca) + " pathlen " + int_to_str(root.path_len) + " ku " + int_to_str(root.key_usage) + " valid " + int_to_str(root.not_before) + " " + int_to_str(root.not_after));
+    println("int1 " + pem_oid_name(int1.spki.alg) + " " + pem_oid_name(int1.spki.params) + " issuer CN " + root.common_name + " ca " + bool_to_str(int1.is_ca) + " pathlen " + int_to_str(int1.path_len) + " sig " + x509_sig_alg_name(int1.sig_alg));
+    println("int2 " + pem_oid_name(int2.spki.alg) + " ca " + bool_to_str(int2.is_ca) + " pathlen " + int_to_str(int2.path_len) + " sig " + x509_sig_alg_name(int2.sig_alg));
+    println("leaf serial " + x509_serial_hex(leaf) + " CN " + leaf.common_name + " sig " + x509_sig_alg_name(leaf.sig_alg));
+    println("leaf ca " + bool_to_str(leaf.is_ca) + " ku " + int_to_str(leaf.key_usage) + " valid " + int_to_str(leaf.not_before) + " " + int_to_str(leaf.not_after));
+    println("leaf dns " + leaf.san_dns.get(0) + " " + leaf.san_dns.get(1) + " ip " + leaf.san_ip.get(0) + " email " + leaf.san_email.get(0));
+    println("leaf aki = int2 ski " + bool_to_str(str_equal(hex_encode_bytes(leaf.aki), hex_encode_bytes(int2.ski)) && leaf.aki.len() == 20));
+    println("signatures root " + bool_to_str(x509_verify_signed_by(root, root)) + " int1 " + bool_to_str(x509_verify_signed_by(int1, root)) + " int2 " + bool_to_str(x509_verify_signed_by(int2, int1)) + " leaf " + bool_to_str(x509_verify_signed_by(leaf, int2)) + " wrong issuer " + bool_to_str(x509_verify_signed_by(leaf, int1)));
+
+    val now: i64 = 1800000000;
+    var chain: Vec<X509Cert> = Vec::new();
+    chain.push(leaf); chain.push(int2); chain.push(int1);
+    var anchors: Vec<X509Cert> = Vec::new();
+    anchors.push(root);
+    val r1: X509ChainResult = x509_verify_chain(chain, anchors, now);
+    println("chain ok " + bool_to_str(r1.ok) + " at " + int_to_str(r1.at));
+    var chain2: Vec<X509Cert> = chain;
+    chain2.push(root);
+    val r2: X509ChainResult = x509_verify_chain(chain2, anchors, now);
+    println("chain with root ok " + bool_to_str(r2.ok));
+    val r3: X509ChainResult = x509_verify_chain(chain, anchors, 1850000000);
+    println("expired " + bool_to_str(r3.ok) + " " + r3.err + " at " + int_to_str(r3.at));
+    var gap: Vec<X509Cert> = Vec::new();
+    gap.push(leaf); gap.push(int1);
+    val r4: X509ChainResult = x509_verify_chain(gap, anchors, now);
+    println("missing link " + bool_to_str(r4.ok) + " " + r4.err + " at " + int_to_str(r4.at));
+    var der: Vec<i64> = leaf.raw;
+    // Flip a byte inside the subject's common name (TBS offset ~ 150).
+    der.set(160, der.get(160) ^ 1);
+    var forged: Vec<X509Cert> = Vec::new();
+    forged.push(x509_parse(der)); forged.push(int2); forged.push(int1);
+    val r5: X509ChainResult = x509_verify_chain(forged, anchors, now);
+    println("tampered " + bool_to_str(r5.ok) + " " + r5.err + " at " + int_to_str(r5.at));
+    var bad_ca: Vec<X509Cert> = Vec::new();
+    bad_ca.push(leaf); bad_ca.push(leaf);
+    val r6: X509ChainResult = x509_verify_chain(bad_ca, anchors, now);
+    println("leaf as issuer " + bool_to_str(r6.ok) + " " + r6.err + " at " + int_to_str(r6.at));
+    val r7: X509ChainResult = x509_verify_chain(chain, Vec::new(), now);
+    println("no anchor " + bool_to_str(r7.ok) + " " + r7.err + " at " + int_to_str(r7.at));
+    println("host www.example.test " + bool_to_str(x509_matches_host(leaf, "www.example.test")) + " EXAMPLE.TEST " + bool_to_str(x509_matches_host(leaf, "EXAMPLE.TEST")) + " 127.0.0.1 " + bool_to_str(x509_matches_host(leaf, "127.0.0.1")) + " other.test " + bool_to_str(x509_matches_host(leaf, "other.test")));
+    nc_crl_tests();
+}
+
+fn show(name: str, r: X509ChainResult) {
+    if r.ok {
+        println("chain " + name + " true at " + int_to_str(r.at));
+    } else {
+        println("chain " + name + " false " + r.err + " at " + int_to_str(r.at));
+    }
+}
+
+fn nc_crl_tests() {
+    val root: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIIB4zCCAWigAwIBAgIBATAKBggqhkjOPQQDAzA6MQswCQYDVQQGEwJGUjETMBEG
+A1UECgwKRmlkZXMgVGVzdDEWMBQGA1UEAwwNRmlkZXMgTkMgUm9vdDAeFw0yNjAx
+MDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMDoxCzAJBgNVBAYTAkZSMRMwEQYDVQQK
+DApGaWRlcyBUZXN0MRYwFAYDVQQDDA1GaWRlcyBOQyBSb290MHYwEAYHKoZIzj0C
+AQYFK4EEACIDYgAEfOCSxQOWv54virPiSmX9hZ/9s6Xla2o85c2myQec9Rzq1VL1
+C5LpGfMKktTEoYsusAKUArCeARzuJ1p9YsAp9SLWYp5sWy86OSD2FDRx+N+7E4xR
+K9E2qOCMJvJicJ9Wo0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB
+BjAdBgNVHQ4EFgQU3pdNvy0EIDqvh7ctKiEkIpURDEgwCgYIKoZIzj0EAwMDaQAw
+ZgIxAMT7pWMrEABnyMMEnHWFZCt+KwvQ11SOzUMpqdonvBH3i+yt23Lsvy0r5NbH
+1Q0KzAIxALZrm3TYK2RbYaewT2S5WnSjszk+TvDKUTOGJJaLubN/W5TOwUvgvRny
+300JSnzlIw==
+-----END CERTIFICATE-----");
+    val int1: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIIDNzCCAr6gAwIBAgIBAjAKBggqhkjOPQQDAzA6MQswCQYDVQQGEwJGUjETMBEG
+A1UECgwKRmlkZXMgVGVzdDEWMBQGA1UEAwwNRmlkZXMgTkMgUm9vdDAeFw0yNjAx
+MDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMEIxCzAJBgNVBAYTAkZSMRMwEQYDVQQK
+DApGaWRlcyBUZXN0MR4wHAYDVQQDDBVGaWRlcyBOQyBJbnRlcm1lZGlhdGUwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCid/4YYgB3HBL5etNerP1I/jlL
+wd5OBmv19Us1Of4p6pi4OH5yyhJ3ohdfJzkN3+LCtIBDfX/Ytzt+SuYkJvwJO3sN
+Go8hTVjtyEoy2yh978W/92gCabu+1Jxf/8A6tD3N3AnxG/oZb4APtVUHJK0FnusK
+1jEioU1HcZbKP0vlBzAxFxIUjz//hg/qUV8Aa12bZRtUw57rPwezlojmkpyY9xEo
+ITsM7MDEoKuv50wGziUX8sRsF88QUIJ+f9S0/dAE4mrO6YW6rz7EdLOIH3MBpajW
+Aj5dQmPkQ7guBVXmqc3LvLhDXDiqK0FypdAz7NizBkjkzarfbzJnXIx3brE3AgMB
+AAGjgeEwgd4wEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYD
+VR0OBBYEFEHXvArkpomVGbfFxuVgQAak99c6MB8GA1UdIwQYMBaAFN6XTb8tBCA6
+r4e3LSohJCKVEQxIMHgGA1UdHgEB/wRuMGygVDAOggxleGFtcGxlLnRlc3QwDoEM
+ZXhhbXBsZS50ZXN0MAqHCAoAAAD/AAAAMCakJDAiMQswCQYDVQQGEwJGUjETMBEG
+A1UECgwKRmlkZXMgVGVzdKEUMBKCEGJhZC5leGFtcGxlLnRlc3QwCgYIKoZIzj0E
+AwMDZwAwZAIwdu6GN8VQemCpi4nxYWhTsGRBmr07oTGt6R1ffUuVXyXGYgBDJTVh
+NeMh7JsEfDLSAjAR4Eag6dXeuuo1D9qdNfsgFoQs9ugLyopMTWko6mtCn06gvq9B
+VNaT8isDRkV0d4Y=
+-----END CERTIFICATE-----");
+    println("nc root " + x509_sig_alg_name(root.sig_alg) + " " + root.spki.params + " self-signed " + bool_to_str(x509_verify_signed_by(root, root)));
+    println("nc int " + x509_sig_alg_name(int1.sig_alg) + " signed " + bool_to_str(x509_verify_signed_by(int1, root)) + " constraints " + bool_to_str(int1.has_nc) + " critical understood " + bool_to_str(!int1.unknown_critical));
+    var perm: str = "";
+    var i: i64 = 0;
+    while i < int1.nc_permitted.len() {
+        if i > 0 { perm = perm + " "; }
+        perm = perm + int1.nc_permitted.get(i);
+        i = i + 1;
+    }
+    println("nc permitted " + perm);
+    println("nc excluded " + int1.nc_excluded.get(0));
+    val ok: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIIDKzCCAd+gAwIBAgIBEDBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAQUA
+oRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASAwQjELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxHjAcBgNVBAMMFUZpZGVzIE5DIEludGVy
+bWVkaWF0ZTAeFw0yNjA2MDEwMDAwMDBaFw0zMDAxMDEwMDAwMDBaMD0xCzAJBgNV
+BAYTAkZSMRMwEQYDVQQKDApGaWRlcyBUZXN0MRkwFwYDVQQDDBB3d3cuZXhhbXBs
+ZS50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExUsu8vHRM05SL4Rr0YZV
+nEoLgBTygIse131Qj2bfpgUbo1l6mNgli/QFyP88zxgYUslea12T1XBMhp8IdS+G
+raOBkzCBkDAJBgNVHRMEAjAAMA4GA1UdDwEB/wQEAwIHgDAzBgNVHREELDAqghB3
+d3cuZXhhbXBsZS50ZXN0hwQKAQIDgRBvcHNAZXhhbXBsZS50ZXN0MB8GA1UdIwQY
+MBaAFEHXvArkpomVGbfFxuVgQAak99c6MB0GA1UdDgQWBBRlB2bST6xt4Q++Q35S
+9Si/7TQsuTBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAQUAoRwwGgYJKoZI
+hvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASADggEBADxUXTsYCckUiVkULqXVTWFd
+WGRBb7NLohI2ofD3BjwsyqhOPgaz+dpMV+9eR4s4RtiuBR85KDbughPRWPz5gXYd
+HK9tqdIwsEn8ErruXehM5JcBPwC0IOC1jTExgxfWmWv8okinQajNvrfrQsYSPuEa
+hcWoMujY7G31uUTpW1LE0PDZpUgm0vBatgHJtM54xjRHcMHiArKuKIwDnFCcA46e
+6C1ZHhfUHYD+PI5yHpfREKclc1EOwxALKtClwEcSV3pQh/qTJCVkbGNaxlM9sB/H
+GeeZ0qFLqwH0xMh/R3nQfRXjHAoijKkpfmiUWATmjER0IvbeOO1VjKMr91EhE70=
+-----END CERTIFICATE-----");
+    val p384: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIIDETCCAcWgAwIBAgIBETBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAgUA
+oRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATAwQjELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxHjAcBgNVBAMMFUZpZGVzIE5DIEludGVy
+bWVkaWF0ZTAeFw0yNjA2MDEwMDAwMDBaFw0zMDAxMDEwMDAwMDBaMD0xCzAJBgNV
+BAYTAkZSMRMwEQYDVQQKDApGaWRlcyBUZXN0MRkwFwYDVQQDDBBhcGkuZXhhbXBs
+ZS50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZQGBO2rUgQv3s/KVf8Py
+CnCj8BNf3PyiujwbrIeKgLFCQVt26/uBV9LjxdHti4sYpjTpRONhjUcitSsMEibF
+oqN6MHgwCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwGwYDVR0RBBQwEoIQYXBp
+LmV4YW1wbGUudGVzdDAfBgNVHSMEGDAWgBRB17wK5KaJlRm3xcblYEAGpPfXOjAd
+BgNVHQ4EFgQU7aPdO6ApezP9fvjIge23VB2v0xkwQQYJKoZIhvcNAQEKMDSgDzAN
+BglghkgBZQMEAgIFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgIFAKIDAgEw
+A4IBAQBurb7cxVXerGNSETSP0XE9P6eTeNrD+m9m7coH58019qnJTeG00gB2bclo
+3ctVMLcCAZmsc+9m/UIUWnhGCGsD32dVkNcs5PN+imnRWmoKfZY6jUj6PYwMYSww
+v7y3oN6HYw0lHzAsNAi9NuzUg3ApMSC+wp7+a/jhLaDV4YwbrAfBC2Rf4gPqfhis
+aUFymZyMyQ0AG1fHS+Kj7AAsZ3mrk/LK1Go74HOGbE/AxiYCjiq1RQxPW+5hUjpr
+aCHZ6XVKDeCauVIqgDgDSORuGK4fDZG2yuj2HMwKARwnj6fmUaMRv62gLigaI0el
++hR7Dzgj69H/DNGjEDWpKOoXED1g
+-----END CERTIFICATE-----");
+    val s384: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIICqzCCAZOgAwIBAgIBGTANBgkqhkiG9w0BAQwFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowPjELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxGjAYBgNVBAMMEXMzODQuZXhhbXBsZS50
+ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMPuFQDY0E8CEA5e1WPvOvtqn
+6+/+ZNE3I3WMeUokXYCmtV6Lt1GHtShOwOOrirRHb92NBlNmbPhF5W6TcJOX1KN7
+MHkwCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwHAYDVR0RBBUwE4IRczM4NC5l
+eGFtcGxlLnRlc3QwHwYDVR0jBBgwFoAUQde8CuSmiZUZt8XG5WBABqT31zowHQYD
+VR0OBBYEFJjVthaH4nwGkuJQsibGaNvC+sjmMA0GCSqGSIb3DQEBDAUAA4IBAQB5
+VhAsslxbxfeYO0EwKURXLkCqB344ZaquDiu0RUvN89+Ll1LyJgEA2fFCDdZMxMEv
+2aFXlvZ/Nv7pSRRhPODal+bX0KRGORtk2BZKfKiWTrtf/nli8LzCzT7bY1Ebawrf
+SKA4BLRUjc0R49Eu3PTQjHJVGJMui+n2MAh2zqWMiEGCljDiTKW3yXw3GwapuGwj
+KCl4VtNXwSFBAXbGQP11BUYAQWXK5jHZO4yeHK3tCa6ibBFpd1jgLvOA/M+ttbVH
+YEWciel56QnOdDWlFEFJirkGmrfl4rVTEfdQpxjNQpRTJHv0DMnSY9mGitFWS8ZG
+OtIOoylTgHxvUDsF2kBd
+-----END CERTIFICATE-----");
+    var bad: X509Cert = ok;
+    bad.sig.set(10, bad.sig.get(10) ^ 1);
+    println("pss leaf " + x509_sig_alg_name(ok.sig_alg) + " " + bool_to_str(x509_verify_signed_by(ok, int1))
+        + " pss384 leaf " + x509_sig_alg_name(p384.sig_alg) + " " + bool_to_str(x509_verify_signed_by(p384, int1))
+        + " rsa-sha384 leaf " + x509_sig_alg_name(s384.sig_alg) + " " + bool_to_str(x509_verify_signed_by(s384, int1))
+        + " tampered " + bool_to_str(x509_verify_signed_by(bad, int1)));
+    var anchors: Vec<X509Cert> = Vec::new();
+    anchors.push(root);
+    val now: i64 = 1811808000;
+    var chain: Vec<X509Cert> = Vec::new();
+    chain.push(ok); chain.push(int1);
+    show("ok", x509_verify_chain(chain, anchors, now));
+    var c2: Vec<X509Cert> = Vec::new();
+    c2.push(p384); c2.push(int1);
+    var c3: Vec<X509Cert> = Vec::new();
+    c3.push(s384); c3.push(int1);
+    println("chain pss384 " + bool_to_str(x509_verify_chain(c2, anchors, now).ok) + " s384 " + bool_to_str(x509_verify_chain(c3, anchors, now).ok));
+    var names: Vec<str> = Vec::new();
+    names.push("excl"); names.push("wild"); names.push("dns"); names.push("ip"); names.push("mail"); names.push("dn");
+    var pems: Vec<str> = Vec::new();
+    pems.push("-----BEGIN CERTIFICATE-----
+MIICszCCAZugAwIBAgIBEjANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowQjELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxHjAcBgNVBAMMFWhvc3QuYmFkLmV4YW1w
+bGUudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJ4Dq/iVjt+/bMP2aYOD
+64dvp5Nl/WWb/K+IGsbJqLbH6PPthSm8I9vT+SyGN42mkyeGBMCRBAqmR6nMAHs/
+7qyjfzB9MAkGA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgeAMCAGA1UdEQQZMBeCFWhv
+c3QuYmFkLmV4YW1wbGUudGVzdDAfBgNVHSMEGDAWgBRB17wK5KaJlRm3xcblYEAG
+pPfXOjAdBgNVHQ4EFgQUT8rW56BiYUT5I4HTijn5IoATi6cwDQYJKoZIhvcNAQEL
+BQADggEBACNujF4KtHjy8hsXE0y/06LZ7Z7ik+/tHmcLQUuj68QzENFyafbKHR6t
+7F3cYl1EbDhslt6jI54nk1WOziFfSrUTWqw4Dot7++9ZnqsXtCNV04ALql5l6IBK
+nQCl/o4BKV+I3ue0snO0kseh48VswFfKzoqiBQBz9dcaarmlUPCOPBLTv4yYU8b7
+vCFSyFQYytRQwOfDoI1b2WUDjKNWkgOTWsQzEJ86va+BdLi50AgQ3zmGT5Jk5flE
+mhwobGzPydLMbt3PXJtTFxzWNButAomDaWM7Es9KkKtswjP64Kf61cUt/j0tUatu
+SOpHedKGZAeaYV2pjbFE8hKT9uT9dpU=
+-----END CERTIFICATE-----");
+    pems.push("-----BEGIN CERTIFICATE-----
+MIICmzCCAYOgAwIBAgIBEzANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowMTELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxDTALBgNVBAMMBHdpbGQwWTATBgcqhkjO
+PQIBBggqhkjOPQMBBwNCAATCxXW6mbRb4zuNr6vd5omZiM9bRuQYl6AKHx8CmkMJ
+NzunI3muPV6CFlqo0rzfuWTy5Q7lkMGzP/HcVmSxef1Io3gwdjAJBgNVHRMEAjAA
+MA4GA1UdDwEB/wQEAwIHgDAZBgNVHREEEjAQgg4qLmV4YW1wbGUudGVzdDAfBgNV
+HSMEGDAWgBRB17wK5KaJlRm3xcblYEAGpPfXOjAdBgNVHQ4EFgQUEqXRjJhH+MtU
+FlB+5KcR6h+vM+AwDQYJKoZIhvcNAQELBQADggEBAIIaSXgx64tpZbP3L1bvGEzB
+2RU70h2XCiPQzgxURSO01/zXkns4F8qKGHox1AEQNzW0H9D8nt903cWeLnjLP5dR
+MJHifaFjMHH3bYhrf9/LT5eSjwHJwmGoUh32Og6kY36w8G/SIdO6Jr2jBn2FuuVF
+GHDCX89xVkKXVyzgz+U/+tsFPI0wfF4+IXcbeVKXAzVG9UAoemJk6t5kT4SsN922
+/IqCxRIzIXTWzrF0oUs0JJKCIUC4Nr5PRa0xpSZ66R9T9IDmNFxOgFSoqJNQu/Hw
+tvQmWZpBBAqPTnG8SN9M9l6dgGqOpFSzYEA17msSX7J00Bh129jCn4mgRThx/jg=
+-----END CERTIFICATE-----");
+    pems.push("-----BEGIN CERTIFICATE-----
+MIICpTCCAY2gAwIBAgIBFDANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowOzELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxFzAVBgNVBAMMDnd3dy5vdGhlci50ZXN0
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8UWz5LVCKNgzjOGlDN/NV1HIyLHH
+wkxES0YReT9A4rE6rKLa/h8X88Z4bGnK56VwyaY7QaX9s4S1k5GSc95o4KN4MHYw
+CQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwGQYDVR0RBBIwEIIOd3d3Lm90aGVy
+LnRlc3QwHwYDVR0jBBgwFoAUQde8CuSmiZUZt8XG5WBABqT31zowHQYDVR0OBBYE
+FPxXv/ea8WQGLBg4tNOfccRo7NubMA0GCSqGSIb3DQEBCwUAA4IBAQAsvQk6fRxq
+UutXU2fLw7zH2TG7oVUne8Y1rwOLSE1+nnh/nvWADzxMjxraFPj4MBDpoiYK6lQs
+2kn9A1mhCeSZkpILWTP8ztaqZnVxZLTlFf6dkTtLdob+5P+LQfBwMmNYsOY8hSi0
+r6IzwN02Y4YpXf8VdXdOswpI9vhKQ13gb+N4B8u52U+QxuY7M9g7yAlZQz8xUz+A
+Vz4l6hYCnEpnrJOsqC8SUtRYkU3SmVwrQIDk+Xk+t1T6I/m7HR1wd4LTUIfPtgr5
+pUG8P1IIP9kWSOAWkRRhvQY0ndZI85den+pPaZCWQPf9rq9DU5Ml6HDkho9NFUyY
+rQ2J4n87pdTi
+-----END CERTIFICATE-----");
+    pems.push("-----BEGIN CERTIFICATE-----
+MIICjzCCAXegAwIBAgIBFTANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowLzELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxCzAJBgNVBAMMAmlwMFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAECW0pEr7eu/XVtf2CeG/l35LzUCvOwg0HvHEUebz0nve8
+VeAeZcdBb7MGbK1zdT6I37OWn5xV7yEo10hROAPUZ6NuMGwwCQYDVR0TBAIwADAO
+BgNVHQ8BAf8EBAMCB4AwDwYDVR0RBAgwBocEwKgBATAfBgNVHSMEGDAWgBRB17wK
+5KaJlRm3xcblYEAGpPfXOjAdBgNVHQ4EFgQUBYHQcuaNuV0KkJJvXHrydfzn/ZYw
+DQYJKoZIhvcNAQELBQADggEBAGWUKN99SwBDl9RzJG1PPjWHohm4SkXOKpOKRuoW
+4goHe6GgDngmVw1Tcxmw4ZWcOgGsJjkuy8I4yb6FW8ODkr+04XqBBhfrSNr3oH7U
+SaYQ5bcdCjBOfBhkC03IAJH/JgDwWeNrfbSa7p3qCytFm0AzLINI5nSTj3OcScSx
+aH+bp7bRWNNZ7RT5odjl1AvAsFZbe+6IDpPkPoaHn8cBmjioYB1t91aotuado2XF
+qFcWup0xf+000pS9vF9cCBiOBISf5MayaILFBZiSUIhNlCFwAwRiz86kAYcgCNO5
+orZ2ED1Ty29qyipaCW3q5f8RGhZ74EiH1mMmdv4HGQgWp6k=
+-----END CERTIFICATE-----");
+    pems.push("-----BEGIN CERTIFICATE-----
+MIICnDCCAYSgAwIBAgIBFjANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowMTELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxDTALBgNVBAMMBG1haWwwWTATBgcqhkjO
+PQIBBggqhkjOPQMBBwNCAAQI9+LLtilUPAEL1NFP2wdOy3hoeeSbE3d0sEFL2BlF
+zhBLsH3HRTpPXc8QOxsPkoDCE1IB9CkQcSAodZmSllwdo3kwdzAJBgNVHRMEAjAA
+MA4GA1UdDwEB/wQEAwIHgDAaBgNVHREEEzARgQ9yb290QG90aGVyLnRlc3QwHwYD
+VR0jBBgwFoAUQde8CuSmiZUZt8XG5WBABqT31zowHQYDVR0OBBYEFA6xFoOja3rx
+FVOju9afzBoOjNFSMA0GCSqGSIb3DQEBCwUAA4IBAQAJDfPBwDwc1Y1XegDdbyz8
+ZRUZt887Oms6AVgjZBIDTrrkOZ61t98BfCA9WupJomcm27wJ6Ri83wYsBYbNIf8z
+sHxFycYheDes4E6u6dqoF7PBNkOCNgPvaECFmMLI1wVFehLEhrSHxQP/BCV6FNd0
+N/veoMhCnGKelQjI1kyWopH+1u1AR9Fa9QYOYutqAueN1OBTnPhOSwucBshAjgkY
+476FXOzXR11q3zD5OoVGHHvjNUP7/pA1HXSsdUd4idoTiMvJwQYDRHblnZnqtZB1
+kOWuYG4Jw2mD6nc4F9WHWYLgtUkchkjsee8Oq24GLd8cLpn6XkRbgP8/31Smm7Pc
+-----END CERTIFICATE-----");
+    pems.push("-----BEGIN CERTIFICATE-----
+MIICoDCCAYigAwIBAgIBFzANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowNjELMAkGA1UEBhMC
+REUxDjAMBgNVBAoMBU90aGVyMRcwFQYDVQQDDA54LmV4YW1wbGUudGVzdDBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABCIDjqDd6BcJoo5k82LIBQOWHNlBtLd7s5+A
+z3BgThVW5MC0kvGsOo5r7Xif+MS7UXq2LARw7w6hQF+iMuxqcJOjeDB2MAkGA1Ud
+EwQCMAAwDgYDVR0PAQH/BAQDAgeAMBkGA1UdEQQSMBCCDnguZXhhbXBsZS50ZXN0
+MB8GA1UdIwQYMBaAFEHXvArkpomVGbfFxuVgQAak99c6MB0GA1UdDgQWBBRWUy+U
+8Do6Z67zbcSFnIFwZLnURzANBgkqhkiG9w0BAQsFAAOCAQEAeYcxaT7AMBBPuFNe
+ZyB3Pdjwq2Svl9PRDHdjzMD4QPoJJUcGO/r2xcqLlhduFAOpQYUu36qDFHWlxi9u
+3tCFqSkefFVK0BMvHBc0Rbg/bKuguauAiEdQ9TGiqffkFPxEvbpq7hvh+VZBBa0O
+ZRvCcWU+6/WLT3qiwy+5EW0ax92SvW72D6Fow/WSX49+65orhFO0ke64pEChND9W
+rbSqt5xIp/kcne47u6gBpwgSadWE1ELpmx4EyiTOOp3OQWrgCsChD1vjn7dhjQCm
+vQqeCjtWj28RQCna8LBiHgVdjV18mybX8FIz9dG7FB6I0dk0lt/PThdRk8IWt1ev
+M9iF8Q==
+-----END CERTIFICATE-----");
+    i = 0;
+    while i < names.len() {
+        var cc: Vec<X509Cert> = Vec::new();
+        cc.push(x509_parse_pem(pems.get(i)));
+        cc.push(int1);
+        show(names.get(i), x509_verify_chain(cc, anchors, now));
+        i = i + 1;
+    }
+    val crl: X509Crl = x509_crl_parse_pem("-----BEGIN X509 CRL-----
+MIICAjCB6wIBATANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjETMBEGA1UE
+CgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRpYXRlFw0y
+NzAxMDEwMDAwMDBaFw0yODAxMDEwMDAwMDBaMEQwIAIBEhcNMjYwNzAxMDAwMDAw
+WjAMMAoGA1UdFQQDCgEEMCACARgXDTI2MDkwMTAwMDAwMFowDDAKBgNVHRUEAwoB
+AaAvMC0wHwYDVR0jBBgwFoAUQde8CuSmiZUZt8XG5WBABqT31zowCgYDVR0UBAMC
+AQUwDQYJKoZIhvcNAQELBQADggEBAFTSvesrUfJkme6Db6Q+SHcOJQ95IZYmbC8x
+B3BP3WKW3YofUc7v+dKyBVFm51KtrvAoTSoYkLhcyeGKHKIbGozJJlDJg8yLfYj0
+kZ4mvVXeHroxq8A57cYwJz5oSr1SGDtRIKt71vNvxBkzEpwVNCJR/CXaI262Xlg3
+Ggpfa1O8yD32KLuBVmqbRB8y6m4TCNpXzoJanfZZcNam5GPJ603PSNbmue8VLmI1
+Cn8XVWUgIL9CWs9DHWOsYROhiUdkqDsTCxRWQb9u7QQuep8wVqOjZlvoXakgHw+o
+eA4kt529lYPvqd2lgKdx0XcFQ6ouyqLABj+YoR1nV08BiZaJo4o=
+-----END X509 CRL-----");
+    println("crl v" + int_to_str(crl.version) + " " + x509_sig_alg_name(crl.sig_alg) + " issuer " + crl.issuer);
+    println("crl this " + int_to_str(crl.this_update) + " next " + int_to_str(crl.next_update) + " number " + hex_encode_bytes(crl.crl_number) + " aki is int ski " + bool_to_str(hex_encode_bytes(crl.aki) == hex_encode_bytes(int1.ski)));
+    var rl: str = "";
+    i = 0;
+    while i < crl.revoked.len() {
+        val e: X509Revoked = crl.revoked.get(i);
+        if i > 0 { rl = rl + ", "; }
+        rl = rl + hex_encode_bytes(e.serial) + " " + int_to_str(e.date) + " reason " + int_to_str(e.reason);
+        i = i + 1;
+    }
+    println("crl revoked " + rl);
+    println("crl signed by int " + bool_to_str(x509_crl_verify_signed_by(crl, int1)) + " by root " + bool_to_str(x509_crl_verify_signed_by(crl, root)));
+    val rcrl: X509Crl = x509_crl_parse_pem("-----BEGIN X509 CRL-----
+MIIBEzCBmgIBATAKBggqhkjOPQQDAzA6MQswCQYDVQQGEwJGUjETMBEGA1UECgwK
+RmlkZXMgVGVzdDEWMBQGA1UEAwwNRmlkZXMgTkMgUm9vdBcNMjcwMTAxMDAwMDAw
+WhcNMjgwMTAxMDAwMDAwWqAvMC0wHwYDVR0jBBgwFoAU3pdNvy0EIDqvh7ctKiEk
+IpURDEgwCgYDVR0UBAMCAQEwCgYIKoZIzj0EAwMDaAAwZQIwKygJQwpWEYy+2n4s
+bKKwF7U/sqtLsu5n6uyzREO2xDhm88sMMvAnhl3KH5cQWWY5AjEAxT6c40quFaio
+p7ebvqb6BYZje8QVctK9eBAVWwLYMFFZPIUyIRXdVKiY2BxD6eAH
+-----END X509 CRL-----");
+    println("root crl " + x509_sig_alg_name(rcrl.sig_alg) + " revoked " + int_to_str(rcrl.revoked.len()) + " signed by root " + bool_to_str(x509_crl_verify_signed_by(rcrl, root)));
+    val pcrl: X509Crl = x509_crl_parse_pem("-----BEGIN X509 CRL-----
+MIICazCCAR8CAQEwQQYJKoZIhvcNAQEKMDSgDzANBglghkgBZQMEAgEFAKEcMBoG
+CSqGSIb3DQEBCDANBglghkgBZQMEAgEFAKIDAgEgMEIxCzAJBgNVBAYTAkZSMRMw
+EQYDVQQKDApGaWRlcyBUZXN0MR4wHAYDVQQDDBVGaWRlcyBOQyBJbnRlcm1lZGlh
+dGUXDTI3MDEwMTAwMDAwMFoXDTI4MDEwMTAwMDAwMFowRDAgAgESFw0yNjA3MDEw
+MDAwMDBaMAwwCgYDVR0VBAMKAQQwIAIBGBcNMjYwOTAxMDAwMDAwWjAMMAoGA1Ud
+FQQDCgEBoC8wLTAfBgNVHSMEGDAWgBRB17wK5KaJlRm3xcblYEAGpPfXOjAKBgNV
+HRQEAwIBBjBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAQUAoRwwGgYJKoZI
+hvcNAQEIMA0GCWCGSAFlAwQCAQUAogMCASADggEBAJGadN92W/sYnDzIRR3UK+Yj
+gWcG4YrzzMy/dDgccF7y662KeaGJoi4KNCZTvCWW5xxkeptBSvNkErtkOgnaKqjQ
+tOxS53ZmOKPWH83K47nZYusnRS95Elht/Qk48mV0gYCDevFTJRft0XUMjiV8eazQ
+B03w2A12OMnnohcRSNc3MhAhycb+ZmnBb0kpGNrss0zsmGndw+uQnQZZAiOm1XCT
+BAYDnihIZHkRl6CiEg8rgSGfMLKE9uNNygDR/7PNutt83L0enjNB2rXQ3qTMDnt/
+Ul/oFlAwy64bfHmzNZ8rTeFSHPLymGSHI8HaAxYBvMHqivfZzR4TtFsFVRyRFyM=
+-----END X509 CRL-----");
+    println("pss crl " + x509_sig_alg_name(pcrl.sig_alg) + " signed by int " + bool_to_str(x509_crl_verify_signed_by(pcrl, int1)));
+    val rev: X509Cert = x509_parse_pem("-----BEGIN CERTIFICATE-----
+MIICqTCCAZGgAwIBAgIBGDANBgkqhkiG9w0BAQsFADBCMQswCQYDVQQGEwJGUjET
+MBEGA1UECgwKRmlkZXMgVGVzdDEeMBwGA1UEAwwVRmlkZXMgTkMgSW50ZXJtZWRp
+YXRlMB4XDTI2MDYwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowPTELMAkGA1UEBhMC
+RlIxEzARBgNVBAoMCkZpZGVzIFRlc3QxGTAXBgNVBAMMEG9sZC5leGFtcGxlLnRl
+c3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQj0hRlnPaTkozPgxBbfzQ6H/R5
+rTug6CuYVMqA3+CkpR0Xxq3+zbX5o7Zk0bwAjHliUcCRiCOvcAiX41qDCHvro3ow
+eDAJBgNVHRMEAjAAMA4GA1UdDwEB/wQEAwIHgDAbBgNVHREEFDASghBvbGQuZXhh
+bXBsZS50ZXN0MB8GA1UdIwQYMBaAFEHXvArkpomVGbfFxuVgQAak99c6MB0GA1Ud
+DgQWBBT5600phHUsMJjqQ5wIqkUb36xFqTANBgkqhkiG9w0BAQsFAAOCAQEAoT2D
+1JqyUaQQj7/zGdHjyembxI0NuWBXXwJcC7HfpE2naPPQ1jJY9f+4DtDBGQFcbp8a
+hR/k2/Emb58+NCoe8ow6gS6vggmiigW4E6e+X7wcAzWpf5G2HVl6ZV41RyHV0NI4
+pQoWj9w23Th24tj8mpaXW9d3QCozHj+3h63ysK51ag6E4ol7XSaELY6R43eXg6F9
+MewXLrVW+6f+I+rptXkQlGm1XVl35oe2deMb9z7YrziKAWiiSBq6Mi0EG3ILc+hN
+MhUkivlrVInViw35IPNYoaSVF34kIvzu9o9gVDT4KmxhXW1TZyc4Oon0xN2+opDg
+EluINYxXezaXxLNs9g==
+-----END CERTIFICATE-----");
+    println("crl check ok \"" + x509_crl_check(ok, int1, crl, now) + "\" rev \"" + x509_crl_check(rev, int1, crl, now) + "\"");
+    var crls: Vec<X509Crl> = Vec::new();
+    crls.push(rcrl); crls.push(crl);
+    val q1: X509ChainResult = x509_verify_chain_crl(chain, anchors, now, crls, true);
+    println("chain crl ok " + bool_to_str(q1.ok));
+    var rc: Vec<X509Cert> = Vec::new();
+    rc.push(rev); rc.push(int1);
+    show("crl revoked", x509_verify_chain_crl(rc, anchors, now, crls, true));
+    show("crl 2029", x509_verify_chain_crl(chain, anchors, 1861920000, crls, true));
+    show("crl 2026", x509_verify_chain_crl(chain, anchors, 1782864000, crls, true));
+    val q5: X509ChainResult = x509_verify_chain_crl(chain, anchors, now, Vec::new(), true);
+    println("chain crl none required " + bool_to_str(q5.ok) + " " + q5.err + " at " + int_to_str(q5.at) + " not required " + bool_to_str(x509_verify_chain_crl(chain, anchors, now, Vec::new(), false).ok));
+    var tcrl: X509Crl = crl;
+    tcrl.sig.set(20, tcrl.sig.get(20) ^ 1);
+    var crls2: Vec<X509Crl> = Vec::new();
+    crls2.push(rcrl); crls2.push(tcrl);
+    show("crl tampered", x509_verify_chain_crl(chain, anchors, now, crls2, true));
+}

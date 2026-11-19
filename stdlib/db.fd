@@ -127,23 +127,56 @@ pub fn query_builder(sql: str) -> str {
     return sql;
 }
 
-/// Add a parameter to a query builder. Returns the updated query.
-/// In a full implementation, this would use prepared statements.
-/// For now, it does simple string substitution (safe for integer params).
+/// Escape `s` as a single-quoted SQL string literal (' → '').
+pub fn db_quote(s: str) -> str {
+    return "'" + str_replace(s, "'", "''") + "'";
+}
+
+/// Is the byte before position `upto` inside a single-quoted SQL string
+/// literal? A `''` pair inside a literal is an escaped quote.
+fn db_in_quote(q: str, upto: i64) -> bool {
+    var inq: bool = false;
+    var i: i64 = 0;
+    while i < upto {
+        if str_byte_at(q, i) == 39 {
+            if inq && i + 1 < upto && str_byte_at(q, i + 1) == 39 {
+                i = i + 1;
+            } else {
+                inq = !inq;
+            }
+        }
+        i = i + 1;
+    }
+    return inq;
+}
+
+/// Add a parameter to a query builder. Replaces the FIRST `?` with the
+/// escaped parameter — quote-doubled, and wrapped in quotes itself when
+/// the `?` is not already inside a string literal, so the value can never
+/// break out into query syntax. (Prepared statements are still strictly
+/// safer: this is correct escaping, not a wire-level bind.)
 pub fn qb_param(query: str, param: str) -> str {
-    // Replace the first ? with the parameter
+    var escaped: str = str_replace(param, "'", "''");
     var idx = str_find(query, "?");
     if idx < 0 {
         return query;
     }
     var before = str_slice(query, 0, idx);
     var after = str_slice(query, idx + 1, str_len(query));
-    return before + param + after;
+    if db_in_quote(query, idx) {
+        return before + escaped + after;
+    }
+    return before + "'" + escaped + "'" + after;
 }
 
 /// Add an integer parameter to a query builder.
 pub fn qb_param_i64(query: str, param: i64) -> str {
-    return qb_param(query, int_to_str(param));
+    var q: str = query;
+    var idx = str_find(q, "?");
+    if idx < 0 {
+        return q;
+    }
+    return str_slice(q, 0, idx) + int_to_str(param) + str_slice(q, idx + 1, str_len(q));
 }
 
 /// Build an INSERT query from a table name and column/value pairs.
@@ -225,15 +258,49 @@ pub fn build_delete(table: str, where_clause: str) -> str {
 // + query functions. For now, these functions provide the runtime API
 // that comptime code will call.
 
+/// Is `name` usable as a bare SQL identifier (letters, digits, '_'; not
+/// starting with a digit)? PRAGMA and identifier positions cannot take
+/// quoted parameters, so they must be validated instead of escaped.
+pub fn db_ident_safe(name: str) -> bool {
+    var n: i64 = str_len(name);
+    if n == 0 || n > 128 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(name, i);
+        var ok: bool = false;
+        if c >= 97 && c <= 122 {
+            ok = true;
+        } else if c >= 65 && c <= 90 {
+            ok = true;
+        } else if c == 95 {
+            ok = true;
+        } else if c >= 48 && c <= 57 && i > 0 {
+            ok = true;
+        }
+        if !ok {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 /// Get the schema of a table as JSON.
 /// Returns: [{"name": "id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, ...]
+/// The table name must be a safe bare identifier (db_ident_safe) —
+/// returns "[]" otherwise.
 pub fn get_schema<T: Database>(db: T, table: str) -> str {
+    if !db_ident_safe(table) {
+        return "[]";
+    }
     return db.query ("PRAGMA table_info(" + table + ")");
 }
 
 /// Check if a table exists.
 pub fn table_exists<T: Database>(db: T, table: str) -> bool {
-    var result = db.query ("SELECT name FROM sqlite_master WHERE type='table' AND name='" + table + "'");
+    var result = db.query ("SELECT name FROM sqlite_master WHERE type='table' AND name=" + db_quote(table));
     return json_len(result) > 0;
 }
 

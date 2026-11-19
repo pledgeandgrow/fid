@@ -1,0 +1,46 @@
+// llvm-roadmap DB9: what the sampling profiler must see. main computes in
+// main_work while a second OS thread (spawn) computes in thread_work, both
+// through fib. `FID_PROF=1 ./prog` prints the table at exit, fib first;
+// `FID_PROF=folded ./prog` prints whole stacks, root first, one line each
+// ("main;main_work;fib;fib 12"), and both threads' stacks are there: on
+// POSIX SIGPROF falls on whichever thread runs, on Windows the sampler
+// thread suspends each thread (C path: emit_prof_api_runtime; pe_ir:
+// pe_runtime/conc.fd; --nat: linux_runtime/win.fd). Checked by
+// tests/prof/db9-check.sh. Output (stdout), on every backend:
+// main 75025
+// thread 75025
+use sync;
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main_work(until: i64) -> i64 {
+    var s: i64 = 0;
+    while p_clock_now_ms() < until {
+        s = fib(25);
+    }
+    return s;
+}
+
+fn thread_work(until: i64) -> i64 {
+    var s: i64 = 0;
+    while p_clock_now_ms() < until {
+        s = fib(25);
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    // about 400 ms of work on each thread
+    val until: i64 = p_clock_now_ms() + 400;
+    val t = spawn thread_work(until);
+    val a: i64 = main_work(until);
+    val b: i64 = await t;
+    println("main " + int_to_str(a));
+    println("thread " + int_to_str(b));
+    return 0;
+}

@@ -1,0 +1,75 @@
+// LF4 in DSE (compiler/iropt_me.fd ime_overwritten_stores, run by iropt's
+// dse, FID_IROPT_ON=dse): a store to a local's or a `&mut` parameter's
+// field that a later store in the block overwrites, with nothing between
+// that may read it, is dead. A load of the field, a call that receives the
+// place, or a read through a view as another type keeps the first store.
+// The program prints the same with the pass on and off.
+//
+// Expected output:
+// 6
+// 5
+// 21
+// 9
+// 0
+// 13
+// 30
+// 4
+
+struct P { x: i64, y: i64 }
+
+fn set_twice(p: &mut P, a: i64) {
+    // the first store is dead: overwritten with nothing reading it
+    p.x = a;
+    p.x = a + 1;
+    p.y = a;
+}
+
+fn read_between(p: &mut P, a: i64) -> i64 {
+    p.x = a;
+    // a load of the field between: the first store stays
+    val r: i64 = p.x;
+    p.x = a * 2;
+    return r + p.x;
+}
+
+fn peek(p: &mut P) -> i64 {
+    return p.x;
+}
+
+fn call_between(p: &mut P, a: i64) -> i64 {
+    p.x = a;
+    // the call receives the place: the first store stays
+    val r: i64 = peek(p);
+    p.x = 0;
+    return r;
+}
+
+fn two_params(a: &mut P, b: &mut P) -> i64 {
+    a.x = 1;
+    // a store through another `&mut` never reads a's place
+    b.x = 20;
+    a.x = 10;
+    return a.x + b.x;
+}
+
+fn main() {
+    var p: P = P { x: 0, y: 0 };
+    set_twice(&mut p, 5);
+    println(p.x);
+    println(p.y);
+    println(read_between(&mut p, 7));
+    println(call_between(&mut p, 9));
+    println(p.x);
+    // a local's field stored twice
+    var q: P = P { x: 1, y: 2 };
+    q.x = 10;
+    q.x = 11;
+    println(q.x + q.y);
+    var c: P = P { x: 0, y: 0 };
+    println(two_params(&mut p, &mut c));
+    // a store, a read of the whole value, another store
+    var s: P = P { x: 3, y: 1 };
+    var t: P = s;
+    s.x = 100;
+    println(t.x + t.y);
+}

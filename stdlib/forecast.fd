@@ -1,0 +1,732 @@
+// Fides time-series forecasting
+//
+// Pure computation (no platform seam):
+// - Simple exponential smoothing with the NIST/SEMATECH e-Handbook
+//   convention (section 6.4.3.1): S_2 = y_1, S_t = a y_(t-1) + (1-a) S_(t-1),
+//   so S_t is the forecast of y_t.
+// - Holt's linear trend (double exponential smoothing), level started at
+//   y_0 and trend at y_1 - y_0.
+// - Holt-Winters additive and multiplicative seasonality with season length
+//   m: trend from the means of the first two seasons, level and seasonal
+//   indexes from the first season around that trend line (an exactly
+//   linear-plus-seasonal additive series is then forecast exactly).
+// - Parameter fitting for every smoother by a coarse-to-fine grid search
+//   (0.2, 0.05, 0.01) minimising the one-step-ahead squared error.
+// - ARIMA(p, d, q): d-fold differencing; AR coefficients and intercept by
+//   ordinary least squares; MA coefficients by the Hannan-Rissanen
+//   two-stage regression (a long autoregression supplies residual
+//   estimates); h-step forecasts with future shocks at zero, integrated
+//   back d times.
+// - Error metrics MAE, RMSE, MAPE (%), sMAPE (%), and rolling-origin
+//   backtesting of any of these models.
+//
+// Forecast methods return `Vec<f64>` of the next h values.
+
+module forecast;
+use math;
+use vec;
+
+pub const FC_SES: i64 = 0;
+pub const FC_HOLT: i64 = 1;
+pub const FC_HW_ADD: i64 = 2;
+pub const FC_HW_MUL: i64 = 3;
+pub const FC_ARIMA: i64 = 4;
+
+/// A model choice for backtesting: kind, smoothing parameters, season
+/// length and ARIMA orders.
+pub struct FcModel {
+    pub kind: i64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub gamma: f64,
+    pub season: i64,
+    pub p: i64,
+    pub d: i64,
+    pub q: i64,
+}
+
+pub fn fc_model(kind: i64, alpha: f64, beta: f64, gamma: f64, season: i64) -> FcModel {
+    return FcModel {
+        kind: kind, alpha: alpha, beta: beta, gamma: gamma, season: season, p: 0, d: 0, q: 0
+    };
+}
+
+pub fn fc_arima_model(p: i64, d: i64, q: i64) -> FcModel {
+    return FcModel {
+        kind: FC_ARIMA, alpha: 0.0, beta: 0.0, gamma: 0.0, season: 0, p: p, d: d, q: q
+    };
+}
+
+fn fc_const(n: i64, x: f64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(x);
+        i = i + 1;
+    }
+    return v;
+}
+
+// ─── Exponential smoothing ───
+
+/// S_t for t = 0..n (one more than y: the last is the next forecast);
+/// S_0 is undefined and set to y_0, S_1 = y_0.
+pub fn fc_ses_smooth(y: &Vec<f64>, alpha: f64) -> Vec<f64> {
+    var s: Vec<f64> = Vec::new();
+    s.push(y.get(0));
+    s.push(y.get(0));
+    var t: i64 = 2;
+    while t <= y.len() {
+        s.push(alpha * y.get(t - 1) + (1.0 - alpha) * s.get(t - 1));
+        t = t + 1;
+    }
+    return s;
+}
+
+pub fn fc_ses(y: &Vec<f64>, alpha: f64, h: i64) -> Vec<f64> {
+    val s: Vec<f64> = fc_ses_smooth(y, alpha);
+    return fc_const(h, s.get(y.len()));
+}
+
+/// One-step-ahead forecasts f[t] of y[t] for t = 1..n-1 (f[0] = y[0]) of
+/// a model; the in-sample errors are y - f.
+pub fn fc_one_step(y: &Vec<f64>, m: &FcModel) -> Vec<f64> {
+    val n: i64 = y.len();
+    if m.kind == FC_SES {
+        val s: Vec<f64> = fc_ses_smooth(y, m.alpha);
+        var f: Vec<f64> = Vec::new();
+        var t: i64 = 0;
+        while t < n {
+            f.push(s.get(t));
+            t = t + 1;
+        }
+        return f;
+    }
+    if m.kind == FC_HOLT {
+        var f: Vec<f64> = Vec::new();
+        f.push(y.get(0));
+        if n < 2 {
+            return f;
+        }
+        f.push(y.get(1));
+        var l: f64 = y.get(1);
+        var b: f64 = y.get(1) - y.get(0);
+        var t: i64 = 2;
+        while t < n {
+            f.push(l + b);
+            val ln: f64 = m.alpha * y.get(t) + (1.0 - m.alpha) * (l + b);
+            b = m.beta * (ln - l) + (1.0 - m.beta) * b;
+            l = ln;
+            t = t + 1;
+        }
+        return f;
+    }
+    // Holt-Winters
+    val mm: i64 = m.season;
+    val mul: bool = m.kind == FC_HW_MUL;
+    var st = fc_hw_init(y, mm, mul);
+    var f: Vec<f64> = Vec::new();
+    var t: i64 = 0;
+    while t < mm {
+        f.push(y.get(t));
+        t = t + 1;
+    }
+    while t < n {
+        f.push(fc_hw_forecast_one(&st, 1, mul));
+        fc_hw_update(&mut st, y.get(t), m.alpha, m.beta, m.gamma, mul);
+        t = t + 1;
+    }
+    return f;
+}
+
+pub fn fc_holt(y: &Vec<f64>, alpha: f64, beta: f64, h: i64) -> Vec<f64> {
+    var l: f64 = y.get(1);
+    var b: f64 = y.get(1) - y.get(0);
+    var t: i64 = 2;
+    while t < y.len() {
+        val ln: f64 = alpha * y.get(t) + (1.0 - alpha) * (l + b);
+        b = beta * (ln - l) + (1.0 - beta) * b;
+        l = ln;
+        t = t + 1;
+    }
+    var out: Vec<f64> = Vec::new();
+    var k: i64 = 1;
+    while k <= h {
+        out.push(l + b * (k as f64));
+        k = k + 1;
+    }
+    return out;
+}
+
+// ─── Holt-Winters ───
+
+struct FcHw {
+    level: f64,
+    trend: f64,
+    seasonal: Vec<f64>,
+    m: i64,
+    t: i64,
+}
+
+fn fc_hw_init(y: &Vec<f64>, m: i64, mul: bool) -> FcHw {
+    if y.len() < 2 * m {
+        panic("Holt-Winters needs at least two seasons");
+    }
+    var a1: f64 = 0.0;
+    var a2: f64 = 0.0;
+    var i: i64 = 0;
+    while i < m {
+        a1 = a1 + y.get(i);
+        a2 = a2 + y.get(m + i);
+        i = i + 1;
+    }
+    a1 = a1 / (m as f64);
+    a2 = a2 / (m as f64);
+    val b: f64 = (a2 - a1) / (m as f64);
+    val mid: f64 = ((m - 1) as f64) / 2.0;
+    var s: Vec<f64> = Vec::new();
+    i = 0;
+    while i < m {
+        val line: f64 = a1 + b * ((i as f64) - mid);
+        if mul {
+            s.push(y.get(i) / line);
+        } else {
+            s.push(y.get(i) - line);
+        }
+        i = i + 1;
+    }
+    return FcHw {
+        level: a1 + b * mid, trend: b, seasonal: s, m: m, t: m
+    };
+}
+
+/// k-step forecast from the state (k >= 1).
+fn fc_hw_forecast_one(st: &FcHw, k: i64, mul: bool) -> f64 {
+    val si: f64 = st.seasonal.get((st.t + k - 1) % st.m);
+    val base: f64 = st.level + st.trend * (k as f64);
+    if mul {
+        return base * si;
+    }
+    return base + si;
+}
+
+fn fc_hw_update(st: &mut FcHw, yt: f64, alpha: f64, beta: f64, gamma: f64, mul: bool) {
+    val idx: i64 = st.t % st.m;
+    val s_old: f64 = st.seasonal.get(idx);
+    var ln: f64 = 0.0;
+    if mul {
+        ln = alpha * yt / s_old + (1.0 - alpha) * (st.level + st.trend);
+    } else {
+        ln = alpha * (yt - s_old) + (1.0 - alpha) * (st.level + st.trend);
+    }
+    val bn: f64 = beta * (ln - st.level) + (1.0 - beta) * st.trend;
+    if mul {
+        st.seasonal.set(idx, gamma * yt / ln + (1.0 - gamma) * s_old);
+    } else {
+        st.seasonal.set(idx, gamma * (yt - ln) + (1.0 - gamma) * s_old);
+    }
+    st.level = ln;
+    st.trend = bn;
+    st.t = st.t + 1;
+}
+
+/// Holt-Winters forecasts (season length m, multiplicative when `mul`).
+pub fn fc_holt_winters(y: &Vec<f64>, m: i64, alpha: f64, beta: f64, gamma: f64, mul: bool, h: i64) -> Vec<f64> {
+    var st = fc_hw_init(y, m, mul);
+    var t: i64 = m;
+    while t < y.len() {
+        fc_hw_update(&mut st, y.get(t), alpha, beta, gamma, mul);
+        t = t + 1;
+    }
+    var out: Vec<f64> = Vec::new();
+    var k: i64 = 1;
+    while k <= h {
+        out.push(fc_hw_forecast_one(&st, k, mul));
+        k = k + 1;
+    }
+    return out;
+}
+
+// ─── Fitting smoothing parameters ───
+
+/// Sum of squared one-step errors after a warm-up of `skip` points.
+pub fn fc_sse(y: &Vec<f64>, m: &FcModel, skip: i64) -> f64 {
+    val f: Vec<f64> = fc_one_step(y, m);
+    var s: f64 = 0.0;
+    var t: i64 = skip;
+    while t < y.len() {
+        val e: f64 = y.get(t) - f.get(t);
+        s = s + e * e;
+        t = t + 1;
+    }
+    return s;
+}
+
+fn fc_grid(lo: f64, hi: f64, steps: i64, k: i64) -> f64 {
+    return lo + (hi - lo) * (k as f64) / (steps as f64);
+}
+
+/// Fit alpha (and beta, gamma where the kind uses them) on a 0.2 grid, then
+/// a 0.05 grid within 0.1 of the best and a 0.01 grid within 0.02 of that;
+/// returns the fitted model (the starting guess 0.5/0.1/0.1 when nothing
+/// beats it).
+pub fn fc_fit(y: &Vec<f64>, kind: i64, season: i64) -> FcModel {
+    var best = fc_model(kind, 0.5, 0.1, 0.1, season);
+    var skip: i64 = 1;
+    if kind == FC_HOLT {
+        skip = 2;
+    }
+    if kind == FC_HW_ADD || kind == FC_HW_MUL {
+        skip = season;
+    }
+    var best_e: f64 = fc_sse(y, &best, skip);
+    var lo_a: f64 = 0.0;
+    var hi_a: f64 = 1.0;
+    var lo_b: f64 = 0.0;
+    var hi_b: f64 = 1.0;
+    var lo_g: f64 = 0.0;
+    var hi_g: f64 = 1.0;
+    var pass: i64 = 0;
+    while pass < 3 {
+        var steps: i64 = 5;
+        var width: f64 = 0.1;
+        if pass > 0 {
+            steps = 4;
+        }
+        if pass == 1 {
+            width = 0.02;
+        }
+        val nb: i64 = if kind == FC_SES { 0 } else { steps };
+        val ng: i64 = if kind == FC_HW_ADD || kind == FC_HW_MUL { steps } else { 0 };
+        var ia: i64 = 0;
+        while ia <= steps {
+            val a: f64 = math_clamp_f64(fc_grid(lo_a, hi_a, steps, ia), 0.001, 1.0);
+            var ib: i64 = 0;
+            while ib <= nb {
+                val b: f64 = math_clamp_f64(fc_grid(lo_b, hi_b, steps, ib), 0.0, 1.0);
+                var ig: i64 = 0;
+                while ig <= ng {
+                    val g: f64 = math_clamp_f64(fc_grid(lo_g, hi_g, steps, ig), 0.0, 1.0);
+                    val cand = fc_model(kind, a, b, g, season);
+                    val e: f64 = fc_sse(y, &cand, skip);
+                    if e < best_e {
+                        best_e = e;
+                        best = cand;
+                    }
+                    ig = ig + 1;
+                }
+                ib = ib + 1;
+            }
+            ia = ia + 1;
+        }
+        lo_a = math_max_f64(0.0, best.alpha - width);
+        hi_a = math_min_f64(1.0, best.alpha + width);
+        lo_b = math_max_f64(0.0, best.beta - width);
+        hi_b = math_min_f64(1.0, best.beta + width);
+        lo_g = math_max_f64(0.0, best.gamma - width);
+        hi_g = math_min_f64(1.0, best.gamma + width);
+        pass = pass + 1;
+    }
+    return best;
+}
+
+// ─── Least squares ───
+
+/// Solve min |X b - y| (X row-major, n rows, k columns) by the normal
+/// equations with partially pivoted elimination.
+pub fn fc_least_squares(x: &Vec<f64>, y: &Vec<f64>, n: i64, k: i64) -> Vec<f64> {
+    var a: Vec<f64> = fc_const(k * (k + 1), 0.0);
+    var i: i64 = 0;
+    while i < k {
+        var j: i64 = 0;
+        while j < k {
+            var s: f64 = 0.0;
+            var r: i64 = 0;
+            while r < n {
+                s = s + x.get(r * k + i) * x.get(r * k + j);
+                r = r + 1;
+            }
+            a.set(i * (k + 1) + j, s);
+            j = j + 1;
+        }
+        var sy: f64 = 0.0;
+        var r2: i64 = 0;
+        while r2 < n {
+            sy = sy + x.get(r2 * k + i) * y.get(r2);
+            r2 = r2 + 1;
+        }
+        a.set(i * (k + 1) + k, sy);
+        i = i + 1;
+    }
+    val w: i64 = k + 1;
+    var c: i64 = 0;
+    while c < k {
+        var p: i64 = c;
+        var r: i64 = c + 1;
+        while r < k {
+            if math_fabs(a.get(r * w + c)) > math_fabs(a.get(p * w + c)) {
+                p = r;
+            }
+            r = r + 1;
+        }
+        if p != c {
+            var j: i64 = 0;
+            while j < w {
+                val tmp: f64 = a.get(c * w + j);
+                a.set(c * w + j, a.get(p * w + j));
+                a.set(p * w + j, tmp);
+                j = j + 1;
+            }
+        }
+        val piv: f64 = a.get(c * w + c);
+        if math_fabs(piv) < 1.0e-300 {
+            c = c + 1;
+            continue;
+        }
+        r = 0;
+        while r < k {
+            if r != c {
+                val f: f64 = a.get(r * w + c) / piv;
+                if f != 0.0 {
+                    var j: i64 = c;
+                    while j < w {
+                        a.set(r * w + j, a.get(r * w + j) - f * a.get(c * w + j));
+                        j = j + 1;
+                    }
+                }
+            }
+            r = r + 1;
+        }
+        c = c + 1;
+    }
+    var b: Vec<f64> = Vec::new();
+    i = 0;
+    while i < k {
+        val d: f64 = a.get(i * w + i);
+        if math_fabs(d) < 1.0e-300 {
+            b.push(0.0);
+        } else {
+            b.push(a.get(i * w + k) / d);
+        }
+        i = i + 1;
+    }
+    return b;
+}
+
+// ─── ARIMA ───
+
+/// A fitted ARIMA(p, d, q): intercept c, ar[0..p), ma[0..q) of the
+/// d-times differenced series, its residuals, and the series itself.
+pub struct ArimaFit {
+    pub p: i64,
+    pub d: i64,
+    pub q: i64,
+    pub c: f64,
+    pub ar: Vec<f64>,
+    pub ma: Vec<f64>,
+    pub resid: Vec<f64>,
+    pub w: Vec<f64>,
+    pub y: Vec<f64>,
+    pub sigma2: f64,
+}
+
+/// First difference applied d times.
+pub fn fc_diff(y: &Vec<f64>, d: i64) -> Vec<f64> {
+    var w: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < y.len() {
+        w.push(y.get(i));
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < d {
+        var nw: Vec<f64> = Vec::new();
+        i = 1;
+        while i < w.len() {
+            nw.push(w.get(i) - w.get(i - 1));
+            i = i + 1;
+        }
+        w = nw;
+        k = k + 1;
+    }
+    return w;
+}
+
+/// Regress w[t] on 1, w[t-1..t-p] and e[t-1..t-q] for t >= start.
+fn fc_arma_regress(w: &Vec<f64>, e: &Vec<f64>, p: i64, q: i64, start: i64) -> Vec<f64> {
+    val k: i64 = 1 + p + q;
+    var x: Vec<f64> = Vec::new();
+    var yy: Vec<f64> = Vec::new();
+    var t: i64 = start;
+    var rows: i64 = 0;
+    while t < w.len() {
+        x.push(1.0);
+        var i: i64 = 1;
+        while i <= p {
+            x.push(w.get(t - i));
+            i = i + 1;
+        }
+        i = 1;
+        while i <= q {
+            x.push(e.get(t - i));
+            i = i + 1;
+        }
+        yy.push(w.get(t));
+        rows = rows + 1;
+        t = t + 1;
+    }
+    return fc_least_squares(&x, &yy, rows, k);
+}
+
+/// Residuals of an ARMA with the given coefficients (shocks before the
+/// first `start` points are taken as zero).
+fn fc_arma_resid(w: &Vec<f64>, c: f64, ar: &Vec<f64>, ma: &Vec<f64>) -> Vec<f64> {
+    var e: Vec<f64> = Vec::new();
+    var t: i64 = 0;
+    while t < w.len() {
+        var pred: f64 = c;
+        var i: i64 = 0;
+        while i < ar.len() {
+            if t - 1 - i >= 0 {
+                pred = pred + ar.get(i) * w.get(t - 1 - i);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < ma.len() {
+            if t - 1 - i >= 0 {
+                pred = pred + ma.get(i) * e.get(t - 1 - i);
+            }
+            i = i + 1;
+        }
+        if t < ar.len() {
+            e.push(0.0);
+        } else {
+            e.push(w.get(t) - pred);
+        }
+        t = t + 1;
+    }
+    return e;
+}
+
+/// Fit ARIMA(p, d, q) by least squares (Hannan-Rissanen when q > 0).
+pub fn fc_arima_fit(y: &Vec<f64>, p: i64, d: i64, q: i64) -> ArimaFit {
+    val w: Vec<f64> = fc_diff(y, d);
+    var e0: Vec<f64> = fc_const(w.len(), 0.0);
+    var start: i64 = p;
+    if q > 0 {
+        // stage 1: a long autoregression for the shocks
+        var m: i64 = p + q + 5;
+        if m < 10 {
+            m = 10;
+        }
+        if m > w.len() / 4 {
+            m = w.len() / 4;
+        }
+        val coef: Vec<f64> = fc_arma_regress(&w, &e0, m, 0, m);
+        var ar_long: Vec<f64> = Vec::new();
+        var i: i64 = 1;
+        while i <= m {
+            ar_long.push(coef.get(i));
+            i = i + 1;
+        }
+        val empty: Vec<f64> = Vec::new();
+        e0 = fc_arma_resid(&w, coef.get(0), &ar_long, &empty);
+        start = m + q;
+        if p > start {
+            start = p;
+        }
+    }
+    // stage 2
+    val coef2: Vec<f64> = fc_arma_regress(&w, &e0, p, q, start);
+    var ar: Vec<f64> = Vec::new();
+    var ma: Vec<f64> = Vec::new();
+    var i: i64 = 1;
+    while i <= p {
+        ar.push(coef2.get(i));
+        i = i + 1;
+    }
+    while i <= p + q {
+        ma.push(coef2.get(i));
+        i = i + 1;
+    }
+    val resid: Vec<f64> = fc_arma_resid(&w, coef2.get(0), &ar, &ma);
+    var ss: f64 = 0.0;
+    var cnt: i64 = 0;
+    i = p;
+    while i < resid.len() {
+        ss = ss + resid.get(i) * resid.get(i);
+        cnt = cnt + 1;
+        i = i + 1;
+    }
+    var yc: Vec<f64> = Vec::new();
+    i = 0;
+    while i < y.len() {
+        yc.push(y.get(i));
+        i = i + 1;
+    }
+    return ArimaFit {
+        p: p, d: d, q: q, c: coef2.get(0), ar: ar, ma: ma, resid: resid, w: w, y: yc, sigma2: ss / (cnt as f64)
+    };
+}
+
+/// h-step forecasts of the original series.
+pub fn fc_arima_forecast(f: &ArimaFit, h: i64) -> Vec<f64> {
+    var w: Vec<f64> = Vec::new();
+    var e: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.w.len() {
+        w.push(f.w.get(i));
+        e.push(f.resid.get(i));
+        i = i + 1;
+    }
+    val n: i64 = w.len();
+    var k: i64 = 0;
+    while k < h {
+        val t: i64 = n + k;
+        var pred: f64 = f.c;
+        i = 0;
+        while i < f.p {
+            if t - 1 - i >= 0 {
+                pred = pred + f.ar.get(i) * w.get(t - 1 - i);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < f.q {
+            if t - 1 - i >= 0 {
+                pred = pred + f.ma.get(i) * e.get(t - 1 - i);
+            }
+            i = i + 1;
+        }
+        w.push(pred);
+        e.push(0.0);
+        k = k + 1;
+    }
+    // integrate back d times: keep the last value of each differencing level
+    var out: Vec<f64> = Vec::new();
+    i = 0;
+    while i < h {
+        out.push(w.get(n + i));
+        i = i + 1;
+    }
+    var level: i64 = f.d;
+    while level > 0 {
+        val base: Vec<f64> = fc_diff(&f.y, level - 1);
+        var last: f64 = base.get(base.len() - 1);
+        i = 0;
+        while i < h {
+            last = last + out.get(i);
+            out.set(i, last);
+            i = i + 1;
+        }
+        level = level - 1;
+    }
+    return out;
+}
+
+// ─── Metrics ───
+
+pub fn fc_mae(actual: &Vec<f64>, pred: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < actual.len() {
+        s = s + math_fabs(actual.get(i) - pred.get(i));
+        i = i + 1;
+    }
+    return s / (actual.len() as f64);
+}
+
+pub fn fc_rmse(actual: &Vec<f64>, pred: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < actual.len() {
+        val e: f64 = actual.get(i) - pred.get(i);
+        s = s + e * e;
+        i = i + 1;
+    }
+    return math_sqrt(s / (actual.len() as f64));
+}
+
+/// Mean absolute percentage error in percent (points with actual 0 skipped).
+pub fn fc_mape(actual: &Vec<f64>, pred: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < actual.len() {
+        if actual.get(i) != 0.0 {
+            s = s + math_fabs((actual.get(i) - pred.get(i)) / actual.get(i));
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    return 100.0 * s / (n as f64);
+}
+
+/// Symmetric MAPE in percent: mean of 2|a - f| / (|a| + |f|).
+pub fn fc_smape(actual: &Vec<f64>, pred: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < actual.len() {
+        val den: f64 = math_fabs(actual.get(i)) + math_fabs(pred.get(i));
+        if den > 0.0 {
+            s = s + 2.0 * math_fabs(actual.get(i) - pred.get(i)) / den;
+        }
+        i = i + 1;
+    }
+    return 100.0 * s / (actual.len() as f64);
+}
+
+// ─── Backtesting ───
+
+/// Forecast h steps of a model fitted to y (parameters as given).
+pub fn fc_forecast(y: &Vec<f64>, m: &FcModel, h: i64) -> Vec<f64> {
+    if m.kind == FC_SES {
+        return fc_ses(y, m.alpha, h);
+    }
+    if m.kind == FC_HOLT {
+        return fc_holt(y, m.alpha, m.beta, h);
+    }
+    if m.kind == FC_HW_ADD {
+        return fc_holt_winters(y, m.season, m.alpha, m.beta, m.gamma, false, h);
+    }
+    if m.kind == FC_HW_MUL {
+        return fc_holt_winters(y, m.season, m.alpha, m.beta, m.gamma, true, h);
+    }
+    val fit: ArimaFit = fc_arima_fit(y, m.p, m.d, m.q);
+    return fc_arima_forecast(&fit, h);
+}
+
+pub struct Backtest {
+    pub actual: Vec<f64>,
+    pub predicted: Vec<f64>,
+    pub mae: f64,
+    pub rmse: f64,
+    pub mape: f64,
+}
+
+/// Rolling-origin evaluation: for every origin t from `first` to n - h,
+/// fit on y[0..t) and compare the h-th step ahead with y[t + h - 1].
+pub fn fc_backtest(y: &Vec<f64>, m: &FcModel, first: i64, h: i64) -> Backtest {
+    var act: Vec<f64> = Vec::new();
+    var pred: Vec<f64> = Vec::new();
+    var t: i64 = first;
+    while t + h - 1 < y.len() {
+        var train: Vec<f64> = Vec::new();
+        var i: i64 = 0;
+        while i < t {
+            train.push(y.get(i));
+            i = i + 1;
+        }
+        val f: Vec<f64> = fc_forecast(&train, m, h);
+        act.push(y.get(t + h - 1));
+        pred.push(f.get(h - 1));
+        t = t + 1;
+    }
+    return Backtest {
+        actual: act, predicted: pred, mae: fc_mae(&act, &pred), rmse: fc_rmse(&act, &pred), mape: fc_mape(&act, &pred)
+    };
+}

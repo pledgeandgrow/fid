@@ -1,0 +1,155 @@
+// ME28/MI27: a match on an integer or an enum tag with 4 or more keys
+// becomes one Inst::Switch on the C path (a C switch) and on nat_ir (a tree
+// of compares and bit tests, ir.fd ir_switch_plan); `fid run` and pe_ir keep
+// the compare chain. Every backend must print the same. Covers negative and
+// large keys, the default, an arm with a guard in the middle of the chain
+// (the chain stops there), enum payloads, an if/else-if chain on one local,
+// and a match in a loop. FID_SWITCH=off turns the forming off.
+// Expected output:
+// 10 20 30 40 50 99
+// -1000 big small 0 none
+// circle 3
+// square 4
+// rect 6
+// tri 5
+// none 0
+// g1 g2 x7 d
+// 1 2 3 4 0
+// 41
+
+enum Shape {
+    Circle(i64),
+    Square(i64),
+    Rect(i64, i64),
+    Tri(i64, i64, i64),
+    Empty,
+}
+
+fn small(n: i64) -> i64 {
+    match n {
+        1 => {
+            return 10;
+        }
+        2 => {
+            return 20;
+        }
+        3 => {
+            return 30;
+        }
+        4 => {
+            return 40;
+        }
+        5 => {
+            return 50;
+        }
+        _ => {
+            return 99;
+        }
+    }
+    return 0;
+}
+
+// negative and extreme keys (patterns have no negative literals: an
+// if/else-if chain on one value forms a Switch too)
+fn wide(n: i64) -> str {
+    if n == - 7 {
+        return "-1000";
+    } else if n == 9223372036854775807 {
+        return "big";
+    } else if n == - 9223372036854775807 - 1 {
+        return "small";
+    } else if n == 0 {
+        return "0";
+    } else if n == 1000000 {
+        return "million";
+    }
+    return "none";
+}
+
+fn shape_name(s: Shape) -> str {
+    match s {
+        Shape::Circle(r) => {
+            return "circle " + int_to_str(r);
+        }
+        Shape::Square(a) => {
+            return "square " + int_to_str(a);
+        }
+        Shape::Rect(w, h) => {
+            return "rect " + int_to_str(w * h);
+        }
+        Shape::Tri(a, b, c) => {
+            return "tri " + int_to_str(a + b + c - 7);
+        }
+        Shape::Empty => {
+            return "none 0";
+        }
+    }
+    return "";
+}
+
+fn guarded(n: i64, flag: bool) -> str {
+    val r = match n {
+        1 => "g1",
+        2 => "g2",
+        7 if flag => "x7",
+        8 => "e8",
+        9 => "e9",
+        10 => "e10",
+        11 => "e11",
+        _ => "d",
+    };
+    return r;
+}
+
+fn chain(c: i64) -> i64 {
+    if c == 97 {
+        return 1;
+    } else if c == 98 {
+        return 2;
+    } else if c == 99 {
+        return 3;
+    } else if c == 100 {
+        return 4;
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    println(int_to_str(small(1)) + " " + int_to_str(small(2)) + " " + int_to_str(small(3)) + " " + int_to_str(small(4)) + " " + int_to_str(small(5)) + " " + int_to_str(small(6)));
+    println(wide(- 7) + " " + wide(9223372036854775807) + " " + wide(- 9223372036854775807 - 1) + " " + wide(0) + " " + wide(5));
+    println(shape_name(Shape::Circle(3)));
+    println(shape_name(Shape::Square(4)));
+    println(shape_name(Shape::Rect(2, 3)));
+    println(shape_name(Shape::Tri(3, 4, 5)));
+    println(shape_name(Shape::Empty));
+    println(guarded(1, true) + " " + guarded(2, false) + " " + guarded(7, true) + " " + guarded(7, false));
+    println(int_to_str(chain(97)) + " " + int_to_str(chain(98)) + " " + int_to_str(chain(99)) + " " + int_to_str(chain(100)) + " " + int_to_str(chain(101)));
+    // a lexer-like loop: the tested value changes every iteration
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 12 {
+        match i % 6 {
+            0 => {
+                total = total + 1;
+            }
+            1 => {
+                total = total + 2;
+            }
+            2 => {
+                total = total + 3;
+            }
+            3 => {
+                total = total + 4;
+            }
+            4 => {
+                total = total + 5;
+            }
+            _ => {
+                total = total + 6;
+            }
+        }
+        i = i + 1;
+    }
+    println(total - 1);
+    return 0;
+}

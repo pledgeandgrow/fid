@@ -1,0 +1,63 @@
+// Roadmap RL17: a program whose output IS the schedule. Six tasks each
+// record their number three times, yielding between records; the record
+// slot comes from an atomic counter, so "order" lists which task ran each
+// step. The default C scheduler runs the tasks round-robin in creation
+// order (012345012345012345); with FIDES_SCHED_RANDOM=<seed> the order
+// follows from the seed (compiler/codegen_c.fd "Roadmap RL17": a shuffled
+// pass, random yields at atomics). Checked by
+// tests/sched/sched-random-check.sh: random mode gives many orders over
+// many seeds, the same order for the same seed, and "records: 18" always.
+use task;
+use sync;
+
+var g_n: i64 = 0;
+var g_sig: i64 = 0;
+
+fn pow7(i: i64) -> i64 {
+    var r: i64 = 1;
+    var k: i64 = 0;
+    while k < i {
+        r = r * 7;
+        k = k + 1;
+    }
+    return r;
+}
+
+fn record(k: i64) {
+    val i: i64 = sync_atomic_add(g_n, 1);
+    sync_atomic_add(g_sig, (k + 1) * pow7(i));
+}
+
+fn worker(k: i64) -> i64 {
+    var j: i64 = 0;
+    while j < 3 {
+        record(k);
+        task_yield();
+        j = j + 1;
+    }
+    return k;
+}
+
+fn main() -> i64 {
+    g_n = sync_atomic_alloc(0);
+    g_sig = sync_atomic_alloc(0);
+    var ts: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 6 {
+        ts.push(task_go("worker", k));
+        k = k + 1;
+    }
+    task_run();
+    var sig: i64 = sync_atomic_load(g_sig);
+    val n: i64 = sync_atomic_load(g_n);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < n {
+        s = s + int_to_str(sig % 7 - 1);
+        sig = sig / 7;
+        i = i + 1;
+    }
+    println("records: " + int_to_str(n));
+    println("order: " + s);
+    return 0;
+}

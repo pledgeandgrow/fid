@@ -1,0 +1,67 @@
+// LG14: async methods of a generic impl. Each instance mono makes of one
+// (`Cell__get__str`, `Cell__pair__i64`, ...) is an async function whose
+// `self` is a generic struct: it runs as a task through its word adapter,
+// `self` and any generic struct argument carried as a heap copy (lower.fd
+// Lowerer_task_gstruct), and a generic struct result comes back through the
+// future as a plain struct's does (before, these ran to their end at the
+// call and returned a ready future). The order of a task's steps is in
+// test_lowering_async_generic_task.fd. A literal with no written type
+// (`val u = Cell { v: "yo", k: 1 }`) is a `Cell<str>` to mono too
+// (mono.fd mn_struct_lit_type: it took the i64 instance and printed the
+// string's address).
+// Expected output:
+// 41
+// hi
+// 15
+// 6
+// 7
+// 8
+// 2
+// yo
+// 1
+use task;
+
+struct Cell<T> { v: T, k: i64 }
+struct Pair<T> { a: T, b: T }
+
+impl<T> Cell<T> {
+    async fn get(self) -> Future<T> {
+        task_yield();
+        return self.v;
+    }
+    async fn scaled(self, m: i64) -> Future<i64> {
+        task_yield();
+        return self.k * m;
+    }
+    async fn add_k(self, other: Cell<T>) -> Future<i64> {
+        task_yield();
+        return self.k + other.k;
+    }
+    async fn pair(self, n: i64) -> Future<Pair<i64>> {
+        task_yield();
+        return Pair { a: self.k + n, b: self.k + n + 1 };
+    }
+    fn plain(self) -> i64 {
+        return self.k;
+    }
+}
+
+fn main() {
+    val a: Cell<i64> = Cell { v: 41, k: 2 };
+    val b: Cell<str> = Cell { v: "hi", k: 3 };
+    val fa = a.get();
+    val fb = b.get();
+    val fs = b.scaled(5);
+    println(await fa);
+    println(await fb);
+    println(await fs);
+    val c: Cell<i64> = Cell { v: 0, k: 4 };
+    println(await a.add_k(c));
+    val p: Pair<i64> = await c.pair(3);
+    println(p.a);
+    println(p.b);
+    println(a.plain());
+    val u = Cell { v: "yo", k: 1 };
+    println(await u.get());
+    println(u.plain());
+}

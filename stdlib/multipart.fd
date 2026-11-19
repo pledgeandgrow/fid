@@ -1,0 +1,572 @@
+// Fides multipart bodies: multipart/form-data and multipart/mixed, pure Fides
+//
+// RFC 2046 §5.1 (the multipart syntax) and RFC 7578 (form-data):
+//   - a streaming parser: feed the body in chunks of any size (a boundary
+//     may be split across chunks) and get events: a part begins (its
+//     headers), a run of its data, the part ends, the body ends; the
+//     preamble before the first boundary and the epilogue after the last
+//     are skipped; header lines are parsed (name: value, continuation
+//     lines folded) and Content-Disposition is read for name, filename and
+//     filename* (RFC 5987 UTF-8 percent-encoded)
+//   - a whole-body parser on top of it (parts with their data)
+//   - a builder: form fields and file parts (name, filename, content
+//     type, bytes) with Content-Disposition quoting, and the matching
+//     Content-Type header "multipart/form-data; boundary=..."
+//   - the boundary from a Content-Type header value
+//
+// Bodies are byte vectors (Vec<i64>, 0..255), so file parts may hold any
+// bytes. Everything here is real; there is no platform seam.
+//
+// Usage:
+//   var s: MpStream = mp_stream_new(mp_boundary_of(content_type));
+//   val evs: Vec<MpEvent> = mp_feed(& mut s, chunk);   // repeat per chunk
+//   val all: Vec<MpEvent> = mp_finish(& mut s);
+//   val r: MpBody = mp_parse(body, boundary);            // or in one go
+
+module multipart;
+ use vec;
+
+pub struct MpPart {
+    pub header_names: Vec<str>,   // lowercase
+    pub header_vals: Vec<str>,
+    pub name: str,
+    pub filename: str,
+    pub content_type: str,        // "text/plain" when absent (RFC 2046)
+    pub data: Vec<i64>,
+}
+
+/// kind: 0 part start (`part` has the headers), 1 data (`data`), 2 part
+/// end, 3 body end, 4 error (`error`).
+pub struct MpEvent {
+    pub kind: i64,
+    pub part: MpPart,
+    pub data: Vec<i64>,
+    pub error: str,
+}
+
+pub const MP_PART_START: i64 = 0;
+pub const MP_DATA: i64 = 1;
+pub const MP_PART_END: i64 = 2;
+pub const MP_END: i64 = 3;
+pub const MP_ERROR: i64 = 4;
+
+pub struct MpBody {
+    pub ok: bool,
+    pub error: str,
+    pub parts: Vec<MpPart>,
+}
+
+// state: 0 preamble, 1 after a delimiter (CRLF or "--"), 2 headers,
+// 3 body, 4 done, 5 failed
+pub struct MpStream {
+    pub boundary: str,
+    pub buf: Vec<i64>,
+    pub state: i64,
+    pub cur: MpPart,
+    pub parts_seen: i64,
+}
+
+fn mp_empty_part() -> MpPart {
+    return MpPart { header_names: Vec::new(), header_vals: Vec::new(), name: "", filename: "", content_type: "text/plain", data: Vec::new() };
+}
+
+fn mp_ev(kind: i64) -> MpEvent {
+    return MpEvent { kind: kind, part: mp_empty_part(), data: Vec::new(), error: "" };
+}
+
+pub fn mp_stream_new(boundary: str) -> MpStream {
+    return MpStream { boundary: boundary, buf: Vec::new(), state: 0, cur: mp_empty_part(), parts_seen: 0 };
+}
+
+// ─── header values ──────────────────────────────────────────────────────
+
+fn mp_lower(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c >= 65 && c <= 90 { c = c + 32; }
+        o = o + char_to_str(c);
+        i = i + 1;
+    }
+    return o;
+}
+
+fn mp_hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return - 1;
+}
+
+fn mp_pct_decode(s: str) -> str {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < str_len(s) && mp_hexv(str_byte_at(s, i + 1)) >= 0 && mp_hexv(str_byte_at(s, i + 2)) >= 0 {
+            b.push(mp_hexv(str_byte_at(s, i + 1)) * 16 + mp_hexv(str_byte_at(s, i + 2)));
+            i = i + 3;
+        } else {
+            b.push(c);
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(b);
+}
+
+/// A parameter of a header value like `form-data; name="a"; filename=x`
+/// (quoted strings with \-escapes or tokens; names compare without case).
+/// "" when absent.
+pub fn mp_header_param(value: str, param: str) -> str {
+    val want: str = mp_lower(param);
+    var i: i64 = 0;
+    val n: i64 = str_len(value);
+    // skip the leading token
+    while i < n && str_byte_at(value, i) != 59 { i = i + 1; }
+    while i < n {
+        i = i + 1;  // past ';'
+        while i < n && (str_byte_at(value, i) == 32 || str_byte_at(value, i) == 9) { i = i + 1; }
+        val ks: i64 = i;
+        while i < n && str_byte_at(value, i) != 61 && str_byte_at(value, i) != 59 { i = i + 1; }
+        val key: str = mp_lower(str_trim(str_slice(value, ks, i)));
+        var v: str = "";
+        if i < n && str_byte_at(value, i) == 61 {
+            i = i + 1;
+            while i < n && str_byte_at(value, i) == 32 { i = i + 1; }
+            if i < n && str_byte_at(value, i) == 34 {
+                i = i + 1;
+                while i < n && str_byte_at(value, i) != 34 {
+                    if str_byte_at(value, i) == 92 && i + 1 < n {
+                        i = i + 1;
+                    }
+                    v = v + char_to_str(str_byte_at(value, i));
+                    i = i + 1;
+                }
+                i = i + 1;
+                while i < n && str_byte_at(value, i) != 59 { i = i + 1; }
+            } else {
+                val vs: i64 = i;
+                while i < n && str_byte_at(value, i) != 59 { i = i + 1; }
+                v = str_trim(str_slice(value, vs, i));
+            }
+        }
+        if key == want {
+            return v;
+        }
+    }
+    return "";
+}
+
+/// The boundary parameter of a multipart Content-Type value.
+pub fn mp_boundary_of(content_type: str) -> str {
+    return mp_header_param(content_type, "boundary");
+}
+
+/// A part's header value by name (case-insensitive), "" when absent.
+pub fn mp_header(p: & MpPart, name: str) -> str {
+    val want: str = mp_lower(name);
+    var i: i64 = 0;
+    while i < p.header_names.len() {
+        if p.header_names.get(i) == want {
+            return p.header_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn mp_apply_headers(p: & mut MpPart, block: str) {
+    // header lines; a line starting with space/tab continues the previous
+    val lines: Vec<str> = str_split(block, "\r\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        if str_len(l) > 0 && (str_byte_at(l, 0) == 32 || str_byte_at(l, 0) == 9) && p.header_vals.len() > 0 {
+            val k: i64 = p.header_vals.len() - 1;
+            p.header_vals.set(k, p.header_vals.get(k) + " " + str_trim(l));
+        } else {
+            val c: i64 = str_find(l, ":");
+            if c > 0 {
+                p.header_names.push(mp_lower(str_trim(str_slice(l, 0, c))));
+                p.header_vals.push(str_trim(str_slice(l, c + 1, str_len(l))));
+            }
+        }
+        i = i + 1;
+    }
+    val cd: str = mp_header(p, "content-disposition");
+    if str_len(cd) > 0 {
+        p.name = mp_header_param(cd, "name");
+        p.filename = mp_header_param(cd, "filename");
+        val star: str = mp_header_param(cd, "filename*");
+        if str_len(star) > 0 {
+            // charset'lang'pct-encoded (RFC 5987)
+            val q1: i64 = str_find(star, "'");
+            if q1 >= 0 {
+                val rest: str = str_slice(star, q1 + 1, str_len(star));
+                val q2: i64 = str_find(rest, "'");
+                if q2 >= 0 {
+                    p.filename = mp_pct_decode(str_slice(rest, q2 + 1, str_len(rest)));
+                }
+            }
+        }
+    }
+    val ct: str = mp_header(p, "content-type");
+    if str_len(ct) > 0 {
+        p.content_type = ct;
+    }
+}
+
+// ─── streaming parser ───────────────────────────────────────────────────
+
+fn mp_find(b: & Vec<i64>, pat: & Vec<i64>, from: i64) -> i64 {
+    var i: i64 = from;
+    while i + pat.len() <= b.len() {
+        var j: i64 = 0;
+        while j < pat.len() && (b.get(i + j) & 255) == pat.get(j) {
+            j = j + 1;
+        }
+        if j == pat.len() {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn mp_drop(b: & Vec<i64>, n: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = n;
+    while i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn mp_take(b: & Vec<i64>, n: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n && i < b.len() {
+        o.push(b.get(i) & 255);
+        i = i + 1;
+    }
+    return o;
+}
+
+fn mp_fail(s: & mut MpStream, out: & mut Vec<MpEvent>, msg: str) {
+    s.state = 5;
+    var e: MpEvent = mp_ev(MP_ERROR);
+    e.error = msg;
+    out.push(e);
+}
+
+fn mp_step(s: & mut MpStream, out: & mut Vec<MpEvent>, last: bool) -> bool {
+    // one transition; false when more input is needed
+    val dash: Vec<i64> = str_bytes("--" + s.boundary);
+    val delim: Vec<i64> = str_bytes("\r\n--" + s.boundary);
+    if s.state == 0 {
+        // the first delimiter may start the body without a CRLF
+        var at: i64 = - 1;
+        if s.buf.len() >= dash.len() && mp_find(& s.buf, & dash, 0) == 0 {
+            at = 0;
+            s.buf = mp_drop(& s.buf, dash.len());
+        } else {
+            val k: i64 = mp_find(& s.buf, & delim, 0);
+            if k >= 0 {
+                s.buf = mp_drop(& s.buf, k + delim.len());
+                at = k;
+            }
+        }
+        if at < 0 {
+            // keep a tail that might begin a delimiter
+            if s.buf.len() > delim.len() {
+                s.buf = mp_drop(& s.buf, s.buf.len() - delim.len());
+            }
+            return false;
+        }
+        s.state = 1;
+        return true;
+    }
+    if s.state == 1 {
+        // after "--boundary": "--" closes the body, else (spaces) CRLF
+        if s.buf.len() < 2 {
+            return false;
+        }
+        if s.buf.get(0) == 45 && s.buf.get(1) == 45 {
+            s.state = 4;
+            out.push(mp_ev(MP_END));
+            return false;
+        }
+        var i: i64 = 0;
+        while i < s.buf.len() && (s.buf.get(i) == 32 || s.buf.get(i) == 9) { i = i + 1; }
+        if i + 2 > s.buf.len() {
+            return false;
+        }
+        if s.buf.get(i) != 13 || s.buf.get(i + 1) != 10 {
+            mp_fail(s, out, "expected CRLF after the boundary");
+            return false;
+        }
+        s.buf = mp_drop(& s.buf, i + 2);
+        s.state = 2;
+        s.cur = mp_empty_part();
+        return true;
+    }
+    if s.state == 2 {
+        val crlf2: Vec<i64> = str_bytes("\r\n\r\n");
+        var hdr_end: i64 = - 1;
+        var skip: i64 = 0;
+        // a part with no headers starts with CRLF right away
+        if s.buf.len() >= 2 && s.buf.get(0) == 13 && s.buf.get(1) == 10 {
+            hdr_end = 0;
+            skip = 2;
+        } else {
+            val k: i64 = mp_find(& s.buf, & crlf2, 0);
+            if k >= 0 {
+                hdr_end = k;
+                skip = k + 4;
+            }
+        }
+        if hdr_end < 0 {
+            if s.buf.len() > 65536 {
+                mp_fail(s, out, "part headers too long");
+            }
+            return false;
+        }
+        mp_apply_headers(& mut s.cur, str_from_bytes(mp_take(& s.buf, hdr_end)));
+        s.buf = mp_drop(& s.buf, skip);
+        var e: MpEvent = mp_ev(MP_PART_START);
+        e.part = s.cur;
+        out.push(e);
+        s.parts_seen = s.parts_seen + 1;
+        s.state = 3;
+        return true;
+    }
+    if s.state == 3 {
+        val k: i64 = mp_find(& s.buf, & delim, 0);
+        if k >= 0 {
+            if k > 0 {
+                var e: MpEvent = mp_ev(MP_DATA);
+                e.data = mp_take(& s.buf, k);
+                out.push(e);
+            }
+            out.push(mp_ev(MP_PART_END));
+            s.buf = mp_drop(& s.buf, k + delim.len());
+            s.state = 1;
+            return true;
+        }
+        // emit what cannot be the start of a delimiter
+        val safe: i64 = s.buf.len() - delim.len() + 1;
+        if safe > 0 {
+            var e: MpEvent = mp_ev(MP_DATA);
+            e.data = mp_take(& s.buf, safe);
+            out.push(e);
+            s.buf = mp_drop(& s.buf, safe);
+        }
+        return false;
+    }
+    return false;
+}
+
+/// Feed the next chunk of the body; the events it completes.
+pub fn mp_feed(s: & mut MpStream, chunk: Vec<i64>) -> Vec<MpEvent> {
+    var out: Vec<MpEvent> = Vec::new();
+    if s.state >= 4 {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < chunk.len() {
+        s.buf.push(chunk.get(i) & 255);
+        i = i + 1;
+    }
+    while s.state < 4 && mp_step(s, & mut out, false) {
+    }
+    return out;
+}
+
+/// The end of the input: an error event when the body was not closed by
+/// its final "--boundary--".
+pub fn mp_finish(s: & mut MpStream) -> Vec<MpEvent> {
+    var out: Vec<MpEvent> = Vec::new();
+    if s.state == 4 || s.state == 5 {
+        return out;
+    }
+    if s.state == 0 {
+        mp_fail(s, & mut out, "no boundary found");
+    } else {
+        mp_fail(s, & mut out, "the body ended before the closing boundary");
+    }
+    return out;
+}
+
+/// Parse a whole body.
+pub fn mp_parse(body: Vec<i64>, boundary: str) -> MpBody {
+    var r: MpBody = MpBody { ok: true, error: "", parts: Vec::new() };
+    if str_len(boundary) == 0 || str_len(boundary) > 70 {
+        r.ok = false;
+        r.error = "a boundary is 1 to 70 characters (RFC 2046)";
+        return r;
+    }
+    var s: MpStream = mp_stream_new(boundary);
+    var evs: Vec<MpEvent> = mp_feed(& mut s, body);
+    val tail: Vec<MpEvent> = mp_finish(& mut s);
+    var i: i64 = 0;
+    while i < tail.len() {
+        evs.push(tail.get(i));
+        i = i + 1;
+    }
+    var cur: MpPart = mp_empty_part();
+    i = 0;
+    while i < evs.len() {
+        val e: MpEvent = evs.get(i);
+        if e.kind == MP_PART_START {
+            cur = e.part;
+        } else if e.kind == MP_DATA {
+            var j: i64 = 0;
+            while j < e.data.len() {
+                cur.data.push(e.data.get(j));
+                j = j + 1;
+            }
+        } else if e.kind == MP_PART_END {
+            r.parts.push(cur);
+        } else if e.kind == MP_ERROR {
+            r.ok = false;
+            r.error = e.error;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The first part named `name`, its index or -1.
+pub fn mp_find_part(b: & MpBody, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < b.parts.len() {
+        if b.parts.get(i).name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// ─── building ───────────────────────────────────────────────────────────
+
+/// A form field part.
+pub fn mp_field(name: str, value: str) -> MpPart {
+    var p: MpPart = mp_empty_part();
+    p.name = name;
+    p.data = str_bytes(value);
+    return p;
+}
+
+/// A file part.
+pub fn mp_file(name: str, filename: str, content_type: str, data: Vec<i64>) -> MpPart {
+    var p: MpPart = mp_empty_part();
+    p.name = name;
+    p.filename = filename;
+    p.content_type = content_type;
+    p.data = data;
+    return p;
+}
+
+fn mp_quote(s: str) -> str {
+    // RFC 7578 §4.2: quoted; '"' and CR/LF percent-encoded as browsers do
+    var o: str = "\"";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 34 { o = o + "%22"; }
+        else if c == 13 { o = o + "%0D"; }
+        else if c == 10 { o = o + "%0A"; }
+        else { o = o + char_to_str(c); }
+        i = i + 1;
+    }
+    return o + "\"";
+}
+
+fn mp_push_str(o: & mut Vec<i64>, s: str) {
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+/// A multipart/form-data body. Each part gets Content-Disposition (name,
+/// filename when set) and, for files, its Content-Type; extra headers in
+/// a part's header lists are written after them.
+pub fn mp_build(parts: & Vec<MpPart>, boundary: str) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: MpPart = parts.get(i);
+        mp_push_str(& mut o, "--" + boundary + "\r\n");
+        var cd: str = "Content-Disposition: form-data; name=" + mp_quote(p.name);
+        if str_len(p.filename) > 0 {
+            cd = cd + "; filename=" + mp_quote(p.filename);
+        }
+        mp_push_str(& mut o, cd + "\r\n");
+        if str_len(p.filename) > 0 || p.content_type != "text/plain" {
+            mp_push_str(& mut o, "Content-Type: " + p.content_type + "\r\n");
+        }
+        var h: i64 = 0;
+        while h < p.header_names.len() {
+            val hn: str = p.header_names.get(h);
+            if hn != "content-disposition" && hn != "content-type" {
+                mp_push_str(& mut o, hn + ": " + p.header_vals.get(h) + "\r\n");
+            }
+            h = h + 1;
+        }
+        mp_push_str(& mut o, "\r\n");
+        var j: i64 = 0;
+        while j < p.data.len() {
+            o.push(p.data.get(j) & 255);
+            j = j + 1;
+        }
+        mp_push_str(& mut o, "\r\n");
+        i = i + 1;
+    }
+    mp_push_str(& mut o, "--" + boundary + "--\r\n");
+    return o;
+}
+
+/// Whether `boundary` is usable for these parts: RFC 2046 §5.1.1 forbids
+/// the delimiter (CRLF "--" boundary) inside any part's data or at its
+/// start.
+pub fn mp_boundary_ok(parts: & Vec<MpPart>, boundary: str) -> bool {
+    if str_len(boundary) == 0 || str_len(boundary) > 70 {
+        return false;
+    }
+    val delim: Vec<i64> = str_bytes("
+--" + boundary);
+    val dash: Vec<i64> = str_bytes("--" + boundary);
+    var i: i64 = 0;
+    while i < parts.len() {
+        val d: Vec<i64> = parts.get(i).data;
+        if mp_find(& d, & delim, 0) >= 0 || mp_find(& d, & dash, 0) == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The Content-Type header value for a form-data body with `boundary`.
+pub fn mp_content_type(boundary: str) -> str {
+    return "multipart/form-data; boundary=" + boundary;
+}
+
+/// A boundary from 64 random bits (hex), e.g. for mp_build.
+pub fn mp_new_boundary(r: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "----FidesBoundary";
+    var i: i64 = 0;
+    while i < 16 {
+        val nib: i64 = (r >> (i * 4)) & 15;
+        s = s + str_slice(d, nib, nib + 1);
+        i = i + 1;
+    }
+    return s;
+}

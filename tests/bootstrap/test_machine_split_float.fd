@@ -1,0 +1,120 @@
+// Track MI (docs/roadmap/llvm-roadmap.md), MI14: floats live across calls
+// in the machine layer (compiler/nat_ir.fd). No float register is
+// callee-saved on any target, so a float value a call falls inside spills
+// for its whole range (ng_float_assign); since MI14 the live-range splitter
+// (RA4, ng_mir_alloc_split) takes spilled floats too: the pieces of such a
+// value between two calls and in a call-free loop take float registers,
+// joined to the value by moves (FID_NAT_OFF=splitfloat: integers only).
+// `between` keeps three floats live across two calls a round, with runs of
+// float operations between the calls and a call-free inner loop reading
+// them; `around` keeps two floats live across calls before and after a
+// call-free loop that reads and writes them; `many` keeps more floats live
+// across a call than the pool holds. Every product is by a power of two
+// (exact, so a fused multiply-add gives the same bits). A piece split
+// wrong (a stale slot read after a run, a float register clobbered by a
+// call) changes what is printed. tests/nattools/machine_mi14_check.sh
+// builds it on every nat_ir target, --nat Windows included, with
+// FID_VERIFY=1 (the allocation checker and the split checker) with and
+// without the switches, and runs it where it can.
+// Expected output:
+// -26404857
+// 2080
+// 2328
+// 73362
+
+// a real call: recursive, so never inlined
+fn tick(k: i64) -> i64 {
+    if k <= 0 {
+        return 1;
+    }
+    return (k % 3) + tick(k / 4);
+}
+
+fn between(n: i64) -> i64 {
+    var a: f64 = 1.5;
+    var b: f64 = 0.25;
+    var c: f64 = 3.0;
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        // a run of float operations between two calls
+        a = a * 0.5 + b;
+        b = b + c * 0.25;
+        c = c - a * 0.125;
+        t = t + tick(i);
+        a = a + b * 0.5;
+        c = c + 1.0;
+        // a call-free loop reading values live across the calls
+        var s: f64 = 0.0;
+        var j: i64 = 0;
+        while j < 8 {
+            s = s + a * 0.5 + c * 0.25;
+            j = j + 1;
+        }
+        t = t + tick(j + i);
+        b = b * 0.5 + s * 0.125;
+        i = i + 1;
+    }
+    return ((a * 1024.0) as i64) + ((b * 1024.0) as i64) * 3 + ((c * 1024.0) as i64) * 7 + t;
+}
+
+fn around(n: i64) -> i64 {
+    var k: f64 = 0.75;
+    var acc: f64 = 0.0;
+    val t0: i64 = tick(n);
+    var i: i64 = 0;
+    while i < n {
+        acc = acc + k;
+        k = k * 0.5 + 0.375;
+        i = i + 1;
+    }
+    val t1: i64 = tick(n + 1);
+    acc = acc + k * 2.0;
+    val t2: i64 = tick(t1 + t0);
+    return ((acc * 64.0) as i64) + ((k * 64.0) as i64) + t0 + t1 + t2;
+}
+
+fn many(seed: i64) -> i64 {
+    val x: f64 = seed as f64;
+    var f1: f64 = x + 1.0;
+    var f2: f64 = x + 2.0;
+    var f3: f64 = x + 3.0;
+    var f4: f64 = x + 4.0;
+    var f5: f64 = x + 5.0;
+    var f6: f64 = x + 6.0;
+    var f7: f64 = x + 7.0;
+    var f8: f64 = x + 8.0;
+    var f9: f64 = x + 9.0;
+    var f10: f64 = x + 10.0;
+    var f11: f64 = x + 11.0;
+    var f12: f64 = x + 12.0;
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < 6 {
+        f1 = f1 + f2 * 0.5;
+        f2 = f2 + f3 * 0.25;
+        f3 = f3 - f4 * 0.125;
+        f4 = f4 + f5 * 0.5;
+        f5 = f5 + f6 * 0.25;
+        f6 = f6 - f7 * 0.5;
+        r = r + tick(i * 5);
+        f7 = f7 + f8 * 0.25;
+        f8 = f8 + f9 * 0.5;
+        f9 = f9 - f10 * 0.25;
+        f10 = f10 + f11 * 0.5;
+        f11 = f11 + f12 * 0.125;
+        f12 = f12 + f1 * 0.25;
+        r = r + tick(i + 7);
+        i = i + 1;
+    }
+    val s: f64 = f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 + f10 + f11 + f12;
+    return ((s * 16.0) as i64) + r;
+}
+
+fn main() -> i64 {
+    println(between(30));
+    println(around(40));
+    println(many(3));
+    println(between(3) + around(5) + many(-2));
+    return 0;
+}

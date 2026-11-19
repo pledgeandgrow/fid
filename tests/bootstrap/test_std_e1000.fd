@@ -1,0 +1,168 @@
+// stdlib/e1000: EEPROM (EERD and bit-banged Microwire), initialisation, TX and RX rings against a modelled 8254x and fake DMA memory.
+// Expected output:
+// eerd words 0x5452 0x1200 0x5634 mac 52:54:00:12:34:56 checksum 0xfe34 ok true
+// bitbang words 0x1200 0x5634 0xfe34
+// init true ctrl 0x60 ral 0x12005452 rah 0x80005634
+// rctl 0x4008002 tctl 0x400fa tipg 0x60200a rdlen 128 rdt 7 tdlen 128 ims 0xd5
+// tx true tdt 1 desc len 60 cmd 0xb same bytes true
+// reclaimed 1
+// queued 7 then full false
+// rx got true len 64 first 0xff type 0x800 rdt 0 packets 1
+// rx error got true len 0 errors 0x1 rdt 1 errors 1
+// rx empty got false
+// icr 0x84 then 0x0
+// link up true speed 1000
+// mta bit 0x10 reg 0x10000, ssdp bit 0xfaf reg 0x53f4 bit 15
+// bsize 4096 0x2030000 333 -1
+use e1000;
+use vmm;
+use vec;
+use string;
+
+var g_r: Vec<i64> = Vec::new();
+var g_ee: Vec<i64> = Vec::new();
+var g_bb: Vec<i64> = Vec::new();
+
+fn h(v: i64) -> str {
+    if v < 0 { return int_to_str(v); }
+    return "0x" + int_to_hex(v);
+}
+
+fn rd(off: i64) -> i64 {
+    val v: i64 = g_r.get(off / 4);
+    if off == E1K_ICR { g_r.set(off / 4, 0); }
+    return v;
+}
+
+// g_bb: [0] last EECD, [1] bits received, [2] shift register, [3] data,
+// [4] data bit index
+fn eecd(v: i64) {
+    var nv: i64 = v & ~(EECD_GNT | EECD_DO);
+    if (v & EECD_REQ) != 0 { nv = nv | EECD_GNT; }
+    if (v & EECD_CS) == 0 {
+        g_bb.set(1, 0);
+        g_bb.set(2, 0);
+    }
+    val rising: bool = (v & EECD_SK) != 0 && (g_bb.get(0) & EECD_SK) == 0;
+    var dout: i64 = g_r.get(E1K_EECD / 4) & EECD_DO;
+    if rising && (v & EECD_CS) != 0 {
+        if g_bb.get(1) < 9 {
+            var bit: i64 = 0;
+            if (v & EECD_DI) != 0 { bit = 1; }
+            g_bb.set(2, g_bb.get(2) * 2 + bit);
+            g_bb.set(1, g_bb.get(1) + 1);
+            if g_bb.get(1) == 9 {
+                g_bb.set(3, g_ee.get(g_bb.get(2) & 63));
+                g_bb.set(4, 0);
+            }
+        } else {
+            dout = 0;
+            if ((g_bb.get(3) >> (15 - g_bb.get(4))) & 1) != 0 { dout = EECD_DO; }
+            g_bb.set(4, g_bb.get(4) + 1);
+        }
+    }
+    g_bb.set(0, v);
+    g_r.set(E1K_EECD / 4, nv | dout);
+}
+
+fn wr(off: i64, v: i64) {
+    if off == E1K_CTRL {
+        g_r.set(off / 4, v & ~CTRL_RST);
+        return;
+    }
+    if off == E1K_EERD {
+        if (v & 1) != 0 {
+            val a: i64 = (v >> 8) & 255;
+            g_r.set(off / 4, (g_ee.get(a) << 16) | (a << 8) | 0x10);
+        }
+        return;
+    }
+    if off == E1K_EECD { eecd(v); return; }
+    if off == E1K_IMS { g_r.set(off / 4, g_r.get(off / 4) | v); return; }
+    if off == E1K_IMC { g_r.set(E1K_IMS / 4, g_r.get(E1K_IMS / 4) & ~v); return; }
+    g_r.set(off / 4, v);
+}
+
+fn frame(n: i64, first: i64, ethertype: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 6 { f.push(first); i = i + 1; }
+    f.push(0x52); f.push(0x54); f.push(0); f.push(0x12); f.push(0x34); f.push(0x56);
+    f.push(ethertype >> 8);
+    f.push(ethertype & 255);
+    while f.len() < n { f.push(f.len() & 255); }
+    return f;
+}
+
+fn main() {
+    g_r = Vec::filled(0x5800 / 4, 0);
+    g_bb = Vec::filled(5, 0);
+    g_ee = Vec::filled(64, 0);
+    g_ee.set(0, 0x5452);
+    g_ee.set(1, 0x1200);
+    g_ee.set(2, 0x5634);
+    g_ee.set(63, e1k_eeprom_checksum(g_ee));
+    val b: E1000Bus = E1000Bus { rd: rd, wr: wr };
+    val w0: i64 = e1k_eeprom_read(&b, 0, false, 10);
+    val w1: i64 = e1k_eeprom_read(&b, 1, false, 10);
+    val w2: i64 = e1k_eeprom_read(&b, 2, false, 10);
+    println("eerd words " + h(w0) + " " + h(w1) + " " + h(w2) + " mac " + e1k_mac_str(e1k_mac_from_words(w0, w1, w2)) + " checksum " + h(g_ee.get(63)) + " ok " + bool_to_str(e1k_eeprom_checksum_ok(g_ee)));
+    println("bitbang words " + h(e1k_eeprom_read_bitbang(&b, 1, 6, 10)) + " " + h(e1k_eeprom_read_bitbang(&b, 2, 6, 10)) + " " + h(e1k_eeprom_read_bitbang(&b, 63, 6, 10)));
+
+    var m: PhysMem = physmem_fake(0x200000, 9);
+    var e: E1000 = e1k_new(0x200000, 8, 2048);
+    val ok: bool = e1k_init(&mut e, &b, &mut m, false, 10);
+    println("init " + bool_to_str(ok) + " ctrl " + h(rd(E1K_CTRL)) + " ral " + h(rd(E1K_RAL0)) + " rah " + h(rd(E1K_RAH0)));
+    println("rctl " + h(rd(E1K_RCTL)) + " tctl " + h(rd(E1K_TCTL)) + " tipg " + h(rd(E1K_TIPG)) + " rdlen " + int_to_str(rd(E1K_RDLEN)) + " rdt " + int_to_str(rd(E1K_RDT)) + " tdlen " + int_to_str(rd(E1K_TDLEN)) + " ims " + h(rd(E1K_IMS)));
+
+    val f1: Vec<i64> = frame(60, 0xFF, 0x0806);
+    val sent: bool = e1k_transmit(&mut e, &b, &mut m, f1);
+    // the NIC: fetch descriptor TDH, send the bytes, write back DD
+    var td: TxDesc = e1k_tx_desc_read(&m, e.tx_ring);
+    val wire: Vec<i64> = phys_read_bytes(&m, td.addr, td.len);
+    var same: bool = wire.len() == f1.len();
+    var i: i64 = 0;
+    while same && i < f1.len() {
+        if wire.get(i) != f1.get(i) { same = false; }
+        i = i + 1;
+    }
+    println("tx " + bool_to_str(sent) + " tdt " + int_to_str(rd(E1K_TDT)) + " desc len " + int_to_str(td.len) + " cmd " + h(td.cmd) + " same bytes " + bool_to_str(same));
+    td.status = TXD_STAT_DD;
+    e1k_tx_desc_write(&mut m, e.tx_ring, td);
+    g_r.set(E1K_TDH / 4, 1);
+    println("reclaimed " + int_to_str(e1k_tx_reclaim(&mut e, &m)));
+    var q: i64 = 0;
+    var last: bool = true;
+    while last {
+        last = e1k_transmit(&mut e, &b, &mut m, frame(42, 1, 0x0800));
+        if last { q = q + 1; }
+    }
+    println("queued " + int_to_str(q) + " then full " + bool_to_str(last));
+
+    // the NIC receives: buffer of descriptor RDH, length, DD | EOP
+    val rf: Vec<i64> = frame(64, 0xFF, 0x0800);
+    val d0: RxDesc = e1k_rx_desc_read(&m, e.rx_ring);
+    phys_write_bytes(&mut m, d0.addr, rf);
+    e1k_rx_desc_write(&mut m, e.rx_ring, RxDesc { addr: d0.addr, len: 64, csum: 0, status: RXD_STAT_DD | RXD_STAT_EOP, errors: 0, special: 0 });
+    val r1: RxResult = e1k_receive(&mut e, &b, &mut m);
+    println("rx got " + bool_to_str(r1.got) + " len " + int_to_str(r1.frame.len()) + " first " + h(r1.frame.get(0)) + " type " + h(r1.frame.get(12) * 256 + r1.frame.get(13)) + " rdt " + int_to_str(rd(E1K_RDT)) + " packets " + int_to_str(e.rx_packets));
+    val d1: RxDesc = e1k_rx_desc_read(&m, e.rx_ring + 16);
+    e1k_rx_desc_write(&mut m, e.rx_ring + 16, RxDesc { addr: d1.addr, len: 64, csum: 0, status: RXD_STAT_DD | RXD_STAT_EOP, errors: RXD_ERR_CE, special: 0 });
+    val r2: RxResult = e1k_receive(&mut e, &b, &mut m);
+    println("rx error got " + bool_to_str(r2.got) + " len " + int_to_str(r2.frame.len()) + " errors " + h(r2.errors) + " rdt " + int_to_str(rd(E1K_RDT)) + " errors " + int_to_str(e.rx_errors));
+    println("rx empty got " + bool_to_str(e1k_receive(&mut e, &b, &mut m).got));
+
+    g_r.set(E1K_ICR / 4, ICR_RXT0 | ICR_LSC);
+    val c1: i64 = e1k_irq_causes(&b);
+    println("icr " + h(c1) + " then " + h(e1k_irq_causes(&b)));
+    g_r.set(E1K_STATUS / 4, 0x80 | STATUS_LU | STATUS_FD);
+    println("link up " + bool_to_str(e1k_link_up(&b)) + " speed " + int_to_str(e1k_link_speed(rd(E1K_STATUS))));
+    var mc: Vec<i64> = Vec::new();
+    mc.push(0x01); mc.push(0x00); mc.push(0x5E); mc.push(0x00); mc.push(0x00); mc.push(0x01);
+    e1k_mta_add(&b, mc);
+    var ssdp: Vec<i64> = Vec::new();
+    ssdp.push(0x01); ssdp.push(0x00); ssdp.push(0x5E); ssdp.push(0x7F); ssdp.push(0xFF); ssdp.push(0xFA);
+    val sb: i64 = e1k_mta_bit(ssdp);
+    println("mta bit " + h(e1k_mta_bit(mc)) + " reg " + h(rd(E1K_MTA)) + ", ssdp bit " + h(sb) + " reg " + h(E1K_MTA + 4 * (sb >> 5)) + " bit " + int_to_str(sb & 31));
+    println("bsize 4096 " + h(e1k_rctl_bsize(4096)) + " 333 " + int_to_str(e1k_rctl_bsize(333)));
+}

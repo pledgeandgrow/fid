@@ -1,0 +1,82 @@
+// stdlib/css: tokenize, parse rules/at-rules/declarations, compute selector specificity (CSS Selectors §16 examples), minify and pretty-print.
+// Expected output:
+// rules: 4
+// rule 0 selectors: a.btn#main | .box > p:hover
+// rule 0 decls: 3
+//   color=#fff
+//   margin=0 auto important=true
+//   padding=1.5em
+// @media prelude: (max-width: 600px) nested rules: 1
+//   inner: body { font-size: 14px }
+// @import: import url(reset.css) block=false
+// @font-face family="My Font" src=url(a.woff2)
+// * -> 0,0,0
+// li -> 0,0,1
+// ul li -> 0,0,2
+// ul ol+li -> 0,0,3
+// h1 + *[rel=up] -> 0,1,1
+// ul ol li.red -> 0,1,3
+// li.red.level -> 0,2,1
+// #x34y -> 1,0,0
+// a.btn#main -> 1,1,1
+// .box > p:hover -> 0,2,1
+// p::before -> 0,0,2
+// a.btn#main > .box>p:hover: true
+// minify:
+// a.btn#main,.box > p:hover{color:#fff;margin:0 auto!important;padding:1.5em}@media (max-width: 600px){body{font-size:14px}}@import url(reset.css);@font-face{font-family:"My Font";src:url(a.woff2)}
+// pretty:
+// a {
+//   color: red;
+//   background: blue;
+// }
+use css;
+use vec;
+use string;
+
+fn main() -> i64 {
+    val src: str = "/* header */\n\na.btn#main, .box > p:hover {\n  color: #fff;\n  margin: 0 auto !important;\n  /* c */ padding: 1.5em\n}\n\n@media (max-width: 600px) {\n  body { font-size: 14px }\n}\n\n@import url(reset.css);\n\n@font-face { font-family: 'My Font'; src: url(a.woff2) }";
+    val sheet: CssSheet = css_parse(src);
+    println("rules: " + int_to_str(sheet.rules.len()));
+
+    val r0: CssRule = sheet.rules.get(0);
+    println("rule 0 selectors: " + str_join(r0.selectors, " | "));
+    println("rule 0 decls: " + int_to_str(r0.decls.len()));
+    println("  color=" + css_get(& r0, "color"));
+    println("  margin=" + css_get(& r0, "margin") + " important=" + bool_to_str(r0.decls.get(1).important));
+    println("  padding=" + css_get(& r0, "padding"));
+
+    val media: CssRule = sheet.rules.get(1);
+    println("@media prelude: " + media.prelude + " nested rules: " + int_to_str(media.rules.len()));
+    println("  inner: " + media.rules.get(0).selectors.get(0) + " { font-size: " + css_get(& media.rules.get(0), "font-size") + " }");
+
+    val imp: CssRule = sheet.rules.get(2);
+    println("@import: " + imp.at_name + " " + imp.prelude + " block=" + bool_to_str(imp.has_block));
+
+    val ff: CssRule = sheet.rules.get(3);
+    println("@font-face family=" + css_get(& ff, "font-family") + " src=" + css_get(& ff, "src"));
+
+    // specificity (CSS Selectors Level 4 examples)
+    println("* -> " + css_specificity_str(css_specificity("*")));
+    println("li -> " + css_specificity_str(css_specificity("li")));
+    println("ul li -> " + css_specificity_str(css_specificity("ul li")));
+    println("ul ol+li -> " + css_specificity_str(css_specificity("ul ol+li")));
+    println("h1 + *[rel=up] -> " + css_specificity_str(css_specificity("h1 + *[rel=up]")));
+    println("ul ol li.red -> " + css_specificity_str(css_specificity("ul ol li.red")));
+    println("li.red.level -> " + css_specificity_str(css_specificity("li.red.level")));
+    println("#x34y -> " + css_specificity_str(css_specificity("#x34y")));
+    println("a.btn#main -> " + css_specificity_str(css_specificity("a.btn#main")));
+    println(".box > p:hover -> " + css_specificity_str(css_specificity(".box > p:hover")));
+    println("p::before -> " + css_specificity_str(css_specificity("p::before")));
+
+    // ordering by specificity
+    println("a.btn#main > .box>p:hover: " + bool_to_str(css_specificity("a.btn#main") > css_specificity(".box > p:hover")));
+
+    // minify
+    println("minify:");
+    println(css_minify(& sheet));
+
+    // pretty print round-trips through the model
+    println("pretty:");
+    print(css_pretty(& css_parse("a{color:red;background:blue}")));
+    return 0;
+}

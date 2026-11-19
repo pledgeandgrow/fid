@@ -1,0 +1,71 @@
+// stdlib/pqc: SHA3-256/512 and SHAKE128/256 against FIPS 202 examples
+// and Python's hashlib (including a message longer than the rate and an
+// output longer than one squeeze); ML-KEM-768 against OpenSSL 3.5:
+// keygen from the seed 00 01 .. 3f gives OpenSSL's encapsulation key
+// (compared through its SHA3-256), OpenSSL's ciphertext decapsulates to
+// OpenSSL's shared secret, a ciphertext with one bit flipped gives the
+// implicit-rejection key OpenSSL gives, our encapsulation round trips
+// (OpenSSL decapsulates it to the same key: checked when the test was
+// written), and an encapsulation key with a coefficient >= q is refused.
+// Expected output:
+// sha3-256 abc 3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532
+// sha3-256 empty a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a
+// sha3-512 abc b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0
+// shake128 empty 7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26
+// shake256 abc 483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739d5a15bef186a5386c75744c0527e1faa9f8726e462a12a4feb06bd8801e751e4
+// sha3-256 200 zeros 2b43036c229ba512995f91fdb46fcd5327a4dc834d86d6e0f58a08053346dc2e
+// shake128 400 bytes tail 3396020392e85506d2042fffff5a39e0
+// ek 1184 dk 2400 H(ek) a24e16d8f8f9383a95b77050f4d9fd2f5733eec1d63ef3c23ebf9918173669a7
+// openssl ct decaps 662356d60a1bdef889d166773389ff6cfd5caab8751d98f4361c1eca8e190e1f
+// tampered ct c47292390e56c89a62543b21c940c729dd6545e50b7a7dbd718a58db4d1bb816
+// our encaps ct 1088 round trip true
+// bad ek refused true
+use pqc;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn main() {
+    println("sha3-256 abc " + hx(sha3_256(str_bytes("abc"))));
+    println("sha3-256 empty " + hx(sha3_256(Vec::new())));
+    println("sha3-512 abc " + hx(sha3_512(str_bytes("abc"))));
+    println("shake128 empty " + hx(shake128(Vec::new(), 32)));
+    println("shake256 abc " + hx(shake256(str_bytes("abc"), 64)));
+    var z: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 200 { z.push(0); i = i + 1; }
+    println("sha3-256 200 zeros " + hx(sha3_256(z)));
+    var r: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 256 { r.push(i); i = i + 1; }
+    val long: Vec<i64> = shake128(r, 400);
+    var t: Vec<i64> = Vec::new();
+    i = 384;
+    while i < 400 { t.push(long.get(i)); i = i + 1; }
+    println("shake128 400 bytes tail " + hx(t));
+    var seed: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 64 { seed.push(i); i = i + 1; }
+    val kp: MlkemKeyPair = mlkem768_keygen(seed);
+    println("ek " + int_to_str(kp.ek.len()) + " dk " + int_to_str(kp.dk.len()) + " H(ek) " + hx(sha3_256(kp.ek)));
+    val ct: Vec<i64> = hex_decode_bytes("b1dd25f9e62e11f166c0c0713d3bf25dee4d4638b1c6763583db6c28a5e067a56d4540d8294a7906f153c99b155206e53d067bb8a7ba90fb0b6b9e6ee90e9b2b866e0d9f61843232d925bfd3e58ee8d775c296a904397d2973f50299b960e16ab7d7b9ca7e7c9788c6af859880511698258f1407f119d2312ba8c5e6b62a9e495ab7d80434708f9d02329797ffd9859bce3a0b7807a3d99c18242c7502f854b63f4930aab6daf3b15b8528cb521c0b9e81eaaef34128dfc3c0adac766e8e54cf9a0aeb9cd029d72153790ebe741ac821a83cdb6cb2702f08527026c19747be966843d268f169c13193bf0a8445470ca1dc0c481cc7112b7eb8faa30a3a6beaa5c7a6c745f8e48d157060180c19a4f21bb21f497f7e94205acd68e0039033c6df1bdb3715169ed44bd46765256d62dcd0acd01d93c92efe0a8df3a58a58555ff76f669e495af06cba81d45f271db8b097c52ed2d42d499a01e9222b0c9b6f0432b659a227a52ec34a490f393cea397da2f9ffda6a5175bf670c60c7a4ac3a5d428281b3e04922052b1ddb86edc6e1215957008e29169bfd273b6705123a346c60ab0fc2be22f7f69d2bef46bdf2706c0e7c7e88fd2620c0397463f9bd61f4905243305f3fe84de507af9e4706a34730eb993164b2426b2c45db4fb76027f2a80cec0d9df2b8f1f768626a19da4b65980b8c04bb727f0166eeb6c8729cae7122863eb4d10046f52e3a5a59af8dee7ebce4719d31d627b411cf60b9fcff852111a2ab0532e28924e259f94fba20eed53997da2823410252d4630aecd158c1e771f8fca3e4f41e52b3d475745a382ea80937b8e1baee9bf3b315f259a986fa5f67d185d905541387a876330e0d485b4d99c8decd08c109b96984b894fdfe549d283de3470d24406878815518e0bee206fd9d984d73c86a3afca03f8593355723b1c27a5387155581526baf1ecd1f747107527abcf7a048db58bacbd8be060d95bf77f3e89783adb73a1d3b3e3129e4c7c00fa278a8c052817ad551757cc906190a470bf4c4a8310a055c07c429e44173ce33d7927ed9978a45fbbd453c2ac2aad5cb07f529a7dc6d847dba0df1f1d4f8e0396374ada4f457685b2f585aa7158744971dc9df471a6baf96a237b80906e4a6f511fae7148c2162a66e75caeef500ae864e1b83d7817e538ee8333601073f5b159657ae9ccf082d6832bbaf479428c85183d844120743315de1cd241932d4d9feb2f5f25d0182c1a05ef45dc3aebdca399dd1c6732e1d1b9115c2abf0a8afe1a8aa2267c564a2f12a9fea220580314cde349d158723af16e6dfa33b15d3aadad7938437a191c46abab0510e01cc8b095f2949b235a92bc174edb5e1532c7d783136193fbd8dfa297c0143c0c1e57526cd77c3383232b1d63dfe3c4519a8532c63c33bcafd87d1d7d394919620b3639b467d586b3d9dc9eb69aca06c83c0338a9f88f119c13d155027c7be8fff8dd8a1872ec59edc6fdde97420c492f2388ec63e1baeaf7a1af644caaa94b33b5073ea47");
+    println("openssl ct decaps " + hx(mlkem768_decaps(kp.dk, ct)));
+    var bad: Vec<i64> = ct;
+    bad.set(0, bad.get(0) ^ 1);
+    println("tampered ct " + hx(mlkem768_decaps(kp.dk, bad)));
+    var m: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 { m.push(0x55); i = i + 1; }
+    val e: MlkemEncap = mlkem768_encaps(kp.ek, m);
+    match env_var("FIDES_PQC_DUMP") {
+        Option::Some(x) => { println("dump ct " + hx(e.ct)); println("dump key " + hx(e.key)); }
+        Option::None => { }
+    }
+    println("our encaps ct " + int_to_str(e.ct.len()) + " round trip " + bool_to_str(str_equal(hx(mlkem768_decaps(kp.dk, e.ct)), hx(e.key))));
+    var bek: Vec<i64> = kp.ek;
+    bek.set(0, 255);
+    bek.set(1, 255);
+    val be: MlkemEncap = mlkem768_encaps(bek, m);
+    println("bad ek refused " + bool_to_str(!be.ok));
+}

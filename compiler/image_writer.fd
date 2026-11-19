@@ -1,0 +1,968 @@
+// image_writer.fd -- the one writer of executable and object files (own-
+// backend roadmap TG13): sections, relocations and symbol tables for ELF,
+// PE/COFF and Mach-O, written once. The format writers are thin layouts
+// over it:
+//   compiler/nat_enc.fd    nat_elf, nat_elf_debug, nat_elf_object (ELF),
+//                          nat_pe, nat_pe_symbols (PE32+, COFF symbols),
+//                          nat_macho, nat_macho_fat (Mach-O)
+//   compiler/pe_ir_enc.fd  pe_build_file, pe_build_efi, pe_efi_relocs,
+//                          pe_append_coff_symbols_pre, pe_put_debug_section
+//   the assembler path (`fid codegen --elf|--coff|--macho`, build_executable):
+//   compiler/elf64.fd      ElfEmitter_build_elf (ELF relocatable object)
+//   compiler/coff.fd       CoffEmitter_build_coff (COFF object)
+//   compiler/macho.fd      MachOEmitter_build_macho (Mach-O object)
+//   compiler/linker.fd     Linker_build_executable (ELF executable)
+// Each of them says where its bytes come from; this module knows the
+// records (headers, section headers, symbols, relocations, string tables)
+// and nothing about the machine layer or pe_ir.
+//
+// The images are byte-identical to what the writers wrote before, but for
+// the assembler path's two objects, whose old bodies wrote broken files:
+// ElfEmitter_build_elf (56-byte section headers without sh_addr, the
+// halves of r_info swapped, symbol indexes off by the null symbol, the
+// .rodata labels undefined) and MachOEmitter_build_macho (88-byte section
+// headers with reloff/nreloc where align goes, __const symbols at their
+// offset): docs/image-writer.md. The old bodies stayed behind FID_IMG_OLD=1
+// until Nov 17, when every writer was checked byte for byte against its old
+// body (tests/nattools/image_writer_unit.fd, image_writer_obj_unit.fd);
+// they are gone now, and those tests pin each writer's bytes by digest.
+//
+// Everything is little-endian but the Mach-O code signature and fat header
+// (img_be_*). Bytes are i64 in 0..255, as everywhere in the compiler.
+
+module compiler::image_writer; use core; use vec; use string;
+
+// ===========================================================================
+// Bytes
+// ===========================================================================
+
+pub fn img_u8(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+}
+
+pub fn img_u16(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+}
+
+pub fn img_u32(out: & mut Vec<i64>, v: i64) {
+    img_u16(out, v);
+    img_u16(out, v >> 16);
+}
+
+pub fn img_u64(out: & mut Vec<i64>, v: i64) {
+    img_u32(out, v);
+    img_u32(out, v >> 32);
+}
+
+pub fn img_be_u32(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+pub fn img_be_u64(out: & mut Vec<i64>, v: i64) {
+    var b: i64 = 7;
+    while b >= 0 {
+        out.push((v >> (b * 8)) & 255);
+        b = b - 1;
+    }
+}
+
+pub fn img_set_u16(out: & mut Vec<i64>, at: i64, v: i64) {
+    out.set(at, v & 255);
+    out.set(at + 1, (v >> 8) & 255);
+}
+
+pub fn img_set_u32(out: & mut Vec<i64>, at: i64, v: i64) {
+    var i: i64 = 0;
+    while i < 4 {
+        out.set(at + i, (v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+pub fn img_set_u64(out: & mut Vec<i64>, at: i64, v: i64) {
+    img_set_u32(out, at, v);
+    img_set_u32(out, at + 4, v >> 32);
+}
+
+pub fn img_get_u32(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+pub fn img_uleb(out: & mut Vec<i64>, v: i64) {
+    var x: i64 = v;
+    while true {
+        var b: i64 = x & 127;
+        x = x >> 7;
+        if x == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 128);
+    }
+}
+
+/// The bytes of `s`, without a NUL.
+pub fn img_bytes(out: & mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+/// The bytes of `s` and a NUL.
+pub fn img_cstr(out: & mut Vec<i64>, s: str) {
+    img_bytes(out, s);
+    out.push(0);
+}
+
+/// `s` in a field of `width` bytes: cut there, NUL-padded.
+pub fn img_name_field(out: & mut Vec<i64>, s: str, width: i64) {
+    var i: i64 = 0;
+    while i < width {
+        if i < str_len(s) {
+            out.push(str_byte_at(s, i));
+        } else {
+            out.push(0);
+        }
+        i = i + 1;
+    }
+}
+
+/// The same, set at `at` (headers written in place).
+pub fn img_set_name_field(out: & mut Vec<i64>, at: i64, s: str, width: i64) {
+    var i: i64 = 0;
+    while i < width {
+        if i < str_len(s) {
+            out.set(at + i, str_byte_at(s, i));
+        } else {
+            out.set(at + i, 0);
+        }
+        i = i + 1;
+    }
+}
+
+/// Zeros until `out` is `len` bytes long (nothing when it is longer).
+pub fn img_pad_to(out: & mut Vec<i64>, len: i64) {
+    while out.len() < len {
+        out.push(0);
+    }
+}
+
+/// Zeros until the length of `out` is a multiple of `align`.
+pub fn img_align(out: & mut Vec<i64>, align: i64) {
+    while out.len() % align != 0 {
+        out.push(0);
+    }
+}
+
+pub fn img_append(out: & mut Vec<i64>, src: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < src.len() {
+        out.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+/// Bytes [from, to) of `src`.
+pub fn img_append_range(out: & mut Vec<i64>, src: & Vec<i64>, from: i64, to: i64) {
+    var i: i64 = from;
+    while i < to && i < src.len() {
+        out.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+/// Each of `parts` after `out`, each starting at a multiple of `align` and
+/// `out` ending at one; the file offset of each part.
+pub fn img_place_parts(out: & mut Vec<i64>, parts: & Vec<Vec<i64>>, align: i64) -> Vec<i64> {
+    var offs: Vec<i64> = Vec::new();
+    var p: i64 = 0;
+    while p < parts.len() {
+        img_align(out, align);
+        offs.push(out.len());
+        var part: Vec<i64> = parts.get(p);
+        img_append(out, & part);
+        p = p + 1;
+    }
+    img_align(out, align);
+    return offs;
+}
+
+/// Round `v` up to a multiple of `n` (any n > 0).
+pub fn img_round(v: i64, n: i64) -> i64 {
+    return (v + n - 1) / n * n;
+}
+
+// ===========================================================================
+// Symbols, one list for the three formats
+// ===========================================================================
+
+pub const IMG_SYM_NONE: i64 = 0; pub const IMG_SYM_FUNC: i64 = 2; pub const IMG_SYM_SECTION: i64 = 3;  // = ELF STT_*
+pub const IMG_LOCAL: i64 = 0; pub const IMG_GLOBAL: i64 = 1;  // = ELF STB_*
+
+/// A symbol: `value` is what the format records (an address, or an offset
+/// in section `sect`, numbered from 1 in every format), `size` its length
+/// (ELF only). A section symbol has no name.
+pub struct ImgSym {
+    pub name: str,
+    pub value: i64,
+    pub size: i64,
+    pub sect: i64,
+    pub kind: i64,
+    pub bind: i64,
+}
+
+pub fn img_sym(name: str, value: i64, size: i64, sect: i64, kind: i64, bind: i64) -> ImgSym {
+    return ImgSym {
+        name: name, value: value, size: size, sect: sect, kind: kind, bind: bind
+    };
+}
+
+/// The functions `names` at `starts[i] + base` (sizes ends[i] - starts[i];
+/// no `ends`: 0), in section `sect`, all with binding `bind`.
+pub fn img_func_syms(names: & Vec<str>, starts: & Vec<i64>, ends: & Vec<i64>, base: i64, sect: i64, bind: i64) -> Vec<ImgSym> {
+    var syms: Vec<ImgSym> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() && i < starts.len() {
+        var size: i64 = 0;
+        if i < ends.len() {
+            size = ends.get(i) - starts.get(i);
+        }
+        syms.push(img_sym(names.get(i), base + starts.get(i), size, sect, IMG_SYM_FUNC, bind));
+        i = i + 1;
+    }
+    return syms;
+}
+
+/// Add `s` (and its NUL) to the string table `tab`; its offset.
+pub fn img_str_add(tab: & mut Vec<i64>, s: str) -> i64 {
+    var at: i64 = tab.len();
+    img_cstr(tab, s);
+    return at;
+}
+
+// ---------------------------------------------------------------------------
+// ELF symbols and relocations
+// ---------------------------------------------------------------------------
+
+/// One Elf64_Sym (24 bytes).
+pub fn img_elf_sym(out: & mut Vec<i64>, name: i64, info: i64, shndx: i64, value: i64, size: i64) {
+    img_u32(out, name);
+    out.push(info);
+    out.push(0);
+    img_u16(out, shndx);
+    img_u64(out, value);
+    img_u64(out, size);
+}
+
+/// .symtab of `syms`: the null symbol, then each in order (ELF wants the
+/// locals first: img_elf_first_global); the names go into `strtab` (which
+/// starts with its empty name), a section symbol's name is 0.
+pub fn img_elf_symtab(syms: & Vec<ImgSym>, strtab: & mut Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    img_elf_sym(& mut out, 0, 0, 0, 0, 0);
+    var i: i64 = 0;
+    while i < syms.len() {
+        var s: ImgSym = syms.get(i);
+        var nm: i64 = 0;
+        if s.kind != IMG_SYM_SECTION {
+            nm = img_str_add(strtab, s.name);
+        }
+        img_elf_sym(& mut out, nm, (s.bind << 4) | s.kind, s.sect, s.value, s.size);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// sh_info of .symtab: the index of the first global symbol (the null
+/// symbol is 0), or one past the last when there is none.
+pub fn img_elf_first_global(syms: & Vec<ImgSym>) -> i64 {
+    var i: i64 = 0;
+    while i < syms.len() {
+        var s: ImgSym = syms.get(i);
+        if s.bind != IMG_LOCAL {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return syms.len() + 1;
+}
+
+/// One Elf64_Rela (24 bytes).
+pub fn img_elf_rela(out: & mut Vec<i64>, offset: i64, sym: i64, rtype: i64, addend: i64) {
+    img_u64(out, offset);
+    img_u64(out, (sym << 32) | rtype);
+    img_u64(out, addend);
+}
+
+// ---------------------------------------------------------------------------
+// ELF headers and sections
+// ---------------------------------------------------------------------------
+
+/// Where the ELF header keeps e_shoff, e_shnum and e_shstrndx.
+pub const IMG_ELF_SHOFF_AT: i64 = 0x28; pub const IMG_ELF_SHNUM_AT: i64 = 0x3C; pub const IMG_ELF_SHSTRNDX_AT: i64 = 0x3E;
+
+/// The 64-byte ELF64 header (little-endian, version 1, System V ABI).
+pub fn img_elf_header(out: & mut Vec<i64>, etype: i64, machine: i64, entry: i64, phoff: i64, shoff: i64, flags: i64, phentsize: i64, phnum: i64, shnum: i64, shstrndx: i64) {
+    out.push(0x7F);
+    out.push(0x45);
+    out.push(0x4C);
+    out.push(0x46);
+    out.push(2);
+    out.push(1);
+    out.push(1);
+    out.push(0);
+    img_u64(out, 0);
+    img_u16(out, etype);
+    img_u16(out, machine);
+    img_u32(out, 1);
+    img_u64(out, entry);
+    img_u64(out, phoff);
+    img_u64(out, shoff);
+    img_u32(out, flags);
+    img_u16(out, 64);
+    img_u16(out, phentsize);
+    img_u16(out, phnum);
+    img_u16(out, 64);
+    img_u16(out, shnum);
+    img_u16(out, shstrndx);
+}
+
+/// One Elf64_Phdr (56 bytes); p_paddr = p_vaddr.
+pub fn img_elf_phdr(out: & mut Vec<i64>, kind: i64, flags: i64, off: i64, vaddr: i64, filesz: i64, memsz: i64, align: i64) {
+    img_u32(out, kind);
+    img_u32(out, flags);
+    img_u64(out, off);
+    img_u64(out, vaddr);
+    img_u64(out, vaddr);
+    img_u64(out, filesz);
+    img_u64(out, memsz);
+    img_u64(out, align);
+}
+
+/// A section of any of the formats: ELF's fields (the PE and Mach-O
+/// writers use name, addr, off, size, flags and align).
+pub struct ImgSec {
+    pub name: str,
+    pub typ: i64,
+    pub flags: i64,
+    pub addr: i64,
+    pub off: i64,
+    pub size: i64,
+    pub link: i64,
+    pub info: i64,
+    pub align: i64,
+    pub entsize: i64,
+}
+
+pub fn img_sec(name: str, typ: i64, flags: i64, addr: i64, off: i64, size: i64, link: i64, info: i64, align: i64, entsize: i64) -> ImgSec {
+    return ImgSec {
+        name: name, typ: typ, flags: flags, addr: addr, off: off, size: size, link: link, info: info, align: align, entsize: entsize
+    };
+}
+
+/// The section header string table of sections named `names` (in section
+/// order; "" is the null section's name, offset 0, not stored).
+pub fn img_elf_shstrtab(names: & Vec<str>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0);
+    var i: i64 = 0;
+    while i < names.len() {
+        var nm: str = names.get(i);
+        if str_len(nm) > 0 {
+            img_cstr(& mut out, nm);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// One Elf64_Shdr (64 bytes).
+pub fn img_elf_shdr(out: & mut Vec<i64>, name: i64, typ: i64, flags: i64, addr: i64, off: i64, size: i64, link: i64, info: i64, align: i64, entsize: i64) {
+    img_u32(out, name);
+    img_u32(out, typ);
+    img_u64(out, flags);
+    img_u64(out, addr);
+    img_u64(out, off);
+    img_u64(out, size);
+    img_u32(out, link);
+    img_u32(out, info);
+    img_u64(out, align);
+    img_u64(out, entsize);
+}
+
+/// The section headers of `secs`, their names at the offsets
+/// img_elf_shstrtab gives them; then e_shoff, e_shnum and e_shstrndx (the
+/// section named ".shstrtab") of the ELF header at the start of `out`.
+pub fn img_elf_sections(out: & mut Vec<i64>, secs: & Vec<ImgSec>) {
+    var noff: i64 = 1;
+    var shstrndx: i64 = 0;
+    var name_offs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < secs.len() {
+        var s: ImgSec = secs.get(i);
+        var nm: i64 = 0;
+        if str_len(s.name) > 0 {
+            nm = noff;
+            noff = noff + str_len(s.name) + 1;
+        }
+        if s.name == ".shstrtab" {
+            shstrndx = i;
+        }
+        name_offs.push(nm);
+        i = i + 1;
+    }
+    img_elf_sections_named(out, secs, & name_offs, shstrndx);
+}
+
+/// The section headers of `secs` with the names at `name_offs` of a
+/// section header string table the caller made, section `shstrndx` being
+/// that table; then e_shoff, e_shnum and e_shstrndx of the ELF header at
+/// the start of `out`.
+pub fn img_elf_sections_named(out: & mut Vec<i64>, secs: & Vec<ImgSec>, name_offs: & Vec<i64>, shstrndx: i64) {
+    var shoff: i64 = out.len();
+    var i: i64 = 0;
+    while i < secs.len() {
+        var s: ImgSec = secs.get(i);
+        var nm: i64 = 0;
+        if i < name_offs.len() {
+            nm = name_offs.get(i);
+        }
+        img_elf_shdr(out, nm, s.typ, s.flags, s.addr, s.off, s.size, s.link, s.info, s.align, s.entsize);
+        i = i + 1;
+    }
+    img_set_u64(out, IMG_ELF_SHOFF_AT, shoff);
+    img_set_u16(out, IMG_ELF_SHNUM_AT, secs.len());
+    img_set_u16(out, IMG_ELF_SHSTRNDX_AT, shstrndx);
+}
+
+/// The names of `secs`, in order (for img_elf_shstrtab).
+pub fn img_sec_names(secs: & Vec<ImgSec>) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < secs.len() {
+        var s: ImgSec = secs.get(i);
+        v.push(s.name);
+        i = i + 1;
+    }
+    return v;
+}
+
+// ===========================================================================
+// PE / COFF
+// ===========================================================================
+
+/// File offsets in a PE image whose DOS header is 64 bytes (e_lfanew 0x40):
+/// the COFF header's NumberOfSections, PointerToSymbolTable and
+/// NumberOfSymbols, the optional header and its data directories.
+pub const IMG_PE_NSECT_AT: i64 = 70; pub const IMG_PE_SYMPTR_AT: i64 = 76; pub const IMG_PE_NSYMS_AT: i64 = 80; pub const IMG_PE_OPT_AT: i64 = 88; pub const IMG_PE_DIRS_AT: i64 = 0xC8;
+
+/// The DOS header (64 bytes, e_lfanew = 64): `full` the fields of a real
+/// MS-DOS header (what pe_build_file writes), else "MZ" and zeros.
+pub fn img_pe_dos(out: & mut Vec<i64>, full: bool) {
+    var start: i64 = out.len();
+    img_u16(out, 0x5A4D);
+    if full {
+        img_u16(out, 0x90);
+        img_u16(out, 0x03);
+        img_u16(out, 0);
+        img_u16(out, 0x04);
+        img_u16(out, 0);
+        img_u16(out, 0xFFFF);
+        img_u16(out, 0);
+        img_u16(out, 0xB8);
+        img_u16(out, 0);
+        img_u16(out, 0);
+        img_u16(out, 0);
+        img_u16(out, 0x40);
+    }
+    img_pad_to(out, start + 0x3C);
+    img_u32(out, 0x40);
+}
+
+/// "PE\0\0".
+pub fn img_pe_signature(out: & mut Vec<i64>) {
+    out.push(0x50);
+    out.push(0x45);
+    out.push(0);
+    out.push(0);
+}
+
+/// The 20-byte COFF file header (TimeDateStamp 0: reproducible).
+pub fn img_coff_header(out: & mut Vec<i64>, machine: i64, nsect: i64, symptr: i64, nsyms: i64, opt_size: i64, chars: i64) {
+    img_u16(out, machine);
+    img_u16(out, nsect);
+    img_u32(out, 0);
+    img_u32(out, symptr);
+    img_u32(out, nsyms);
+    img_u16(out, opt_size);
+    img_u16(out, chars);
+}
+
+/// The fields of a PE32+ optional header that differ between images
+/// (versions: major only, minors 0; image version 0).
+pub struct ImgPeOpt {
+    pub linker_major: i64,
+    pub code_size: i64,
+    pub init_size: i64,
+    pub entry: i64,
+    pub base_of_code: i64,
+    pub image_base: i64,
+    pub sect_align: i64,
+    pub file_align: i64,
+    pub os_major: i64,
+    pub subsys_major: i64,
+    pub image_size: i64,
+    pub header_size: i64,
+    pub subsystem: i64,
+    pub dll_chars: i64,
+    pub stack_reserve: i64,
+    pub stack_commit: i64,
+    pub heap_reserve: i64,
+    pub heap_commit: i64,
+}
+
+/// The 240-byte PE32+ optional header; `dirs` the 16 data directories as
+/// [rva, size] pairs (missing ones 0).
+pub fn img_pe_optional(out: & mut Vec<i64>, o: & ImgPeOpt, dirs: & Vec<i64>) {
+    img_u16(out, 0x20B);
+    out.push(o.linker_major);
+    out.push(0);
+    img_u32(out, o.code_size);
+    img_u32(out, o.init_size);
+    img_u32(out, 0);
+    img_u32(out, o.entry);
+    img_u32(out, o.base_of_code);
+    img_u64(out, o.image_base);
+    img_u32(out, o.sect_align);
+    img_u32(out, o.file_align);
+    img_u16(out, o.os_major);
+    img_u16(out, 0);
+    img_u16(out, 0);
+    img_u16(out, 0);
+    img_u16(out, o.subsys_major);
+    img_u16(out, 0);
+    img_u32(out, 0);
+    // Win32VersionValue
+    img_u32(out, o.image_size);
+    img_u32(out, o.header_size);
+    img_u32(out, 0);
+    // CheckSum
+    img_u16(out, o.subsystem);
+    img_u16(out, o.dll_chars);
+    img_u64(out, o.stack_reserve);
+    img_u64(out, o.stack_commit);
+    img_u64(out, o.heap_reserve);
+    img_u64(out, o.heap_commit);
+    img_u32(out, 0);
+    // LoaderFlags
+    img_u32(out, 16);
+    var d: i64 = 0;
+    while d < 32 {
+        if d < dirs.len() {
+            img_u32(out, dirs.get(d));
+        } else {
+            img_u32(out, 0);
+        }
+        d = d + 1;
+    }
+}
+
+/// 16 empty data directories, for img_pe_dir.
+pub fn img_pe_dirs() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    while v.len() < 32 {
+        v.push(0);
+    }
+    return v;
+}
+
+pub fn img_pe_dir(dirs: & mut Vec<i64>, idx: i64, rva: i64, size: i64) {
+    dirs.set(idx * 2, rva);
+    dirs.set(idx * 2 + 1, size);
+}
+
+/// One 40-byte section header (a name of at most 8 bytes; longer names are
+/// "/<offset>" into the COFF string table, which the caller makes).
+pub fn img_pe_section(out: & mut Vec<i64>, name: str, vsize: i64, rva: i64, raw_size: i64, raw_off: i64, flags: i64) {
+    img_coff_section(out, name, vsize, rva, raw_size, raw_off, 0, 0, flags);
+}
+
+/// The same header with a relocation table (an object's section):
+/// PointerToRelocations `reloc_off`, NumberOfRelocations `nreloc`; no line
+/// numbers.
+pub fn img_coff_section(out: & mut Vec<i64>, name: str, vsize: i64, rva: i64, raw_size: i64, raw_off: i64, reloc_off: i64, nreloc: i64, flags: i64) {
+    img_name_field(out, name, 8);
+    img_u32(out, vsize);
+    img_u32(out, rva);
+    img_u32(out, raw_size);
+    img_u32(out, raw_off);
+    img_u32(out, reloc_off);
+    img_u32(out, 0);
+    img_u16(out, nreloc);
+    img_u16(out, 0);
+    img_u32(out, flags);
+}
+
+/// One COFF relocation (10 bytes): VirtualAddress, SymbolTableIndex, Type.
+pub fn img_coff_reloc(out: & mut Vec<i64>, va: i64, sym: i64, rtype: i64) {
+    img_u32(out, va);
+    img_u32(out, sym);
+    img_u16(out, rtype);
+}
+
+/// Where a COFF object's header (no DOS header, no PE signature) keeps
+/// PointerToSymbolTable and NumberOfSymbols, for img_coff_symbols.
+pub const IMG_COFF_SYMPTR_AT: i64 = 8; pub const IMG_COFF_NSYMS_AT: i64 = 12;
+
+/// The same header written over the 40 bytes at `at`.
+pub fn img_pe_section_at(out: & mut Vec<i64>, at: i64, name: str, vsize: i64, rva: i64, raw_size: i64, raw_off: i64, flags: i64) {
+    img_set_name_field(out, at, name, 8);
+    img_set_u32(out, at + 8, vsize);
+    img_set_u32(out, at + 12, rva);
+    img_set_u32(out, at + 16, raw_size);
+    img_set_u32(out, at + 20, raw_off);
+    img_set_u32(out, at + 24, 0);
+    img_set_u32(out, at + 28, 0);
+    img_set_u32(out, at + 32, 0);
+    img_set_u32(out, at + 36, flags);
+}
+
+/// A COFF symbol table and string table after `image`, one 18-byte record
+/// per symbol (the name inline when at most 8 bytes, else 0 and its string
+/// table offset; Value; SectionNumber; Type 0x20 for a function;
+/// StorageClass EXTERNAL 2 for a global, STATIC 3 for a local; no aux
+/// records), the string table starting with the names `pre` (long section
+/// names). The COFF header's PointerToSymbolTable and NumberOfSymbols, at
+/// `ptr_at` and `nsyms_at`, point at it.
+pub fn img_coff_symbols(image: & mut Vec<i64>, pre: & Vec<str>, syms: & Vec<ImgSym>, ptr_at: i64, nsyms_at: i64) {
+    var sym_at: i64 = image.len();
+    var strtab: Vec<i64> = Vec::new();
+    var pi: i64 = 0;
+    while pi < pre.len() {
+        img_cstr(& mut strtab, pre.get(pi));
+        pi = pi + 1;
+    }
+    var i: i64 = 0;
+    while i < syms.len() {
+        var s: ImgSym = syms.get(i);
+        if str_len(s.name) <= 8 {
+            img_name_field(image, s.name, 8);
+        } else {
+            img_u32(image, 0);
+            img_u32(image, 4 + strtab.len());
+            img_cstr(& mut strtab, s.name);
+        }
+        img_u32(image, s.value);
+        img_u16(image, s.sect);
+        if s.kind == IMG_SYM_FUNC {
+            img_u16(image, 0x20);
+        } else {
+            img_u16(image, 0);
+        }
+        if s.bind == IMG_LOCAL {
+            image.push(3);
+        } else {
+            image.push(2);
+        }
+        image.push(0);
+        i = i + 1;
+    }
+    img_u32(image, 4 + strtab.len());
+    img_append(image, & strtab);
+    img_set_u32(image, ptr_at, sym_at);
+    img_set_u32(image, nsyms_at, syms.len());
+}
+
+/// A .reloc section: one block per 4 KB page of DIR64 entries (type 10)
+/// for each RVA of `rvas` (any order), each block padded to 4 bytes with
+/// an ABSOLUTE entry. Without any, one block (page `empty_page`) of
+/// padding only: the image still says it can be relocated.
+pub fn img_pe_base_relocs(rvas: & Vec<i64>, empty_page: i64) -> Vec<i64> {
+    var sorted: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < rvas.len() {
+        var v: i64 = rvas.get(i);
+        var j: i64 = sorted.len() - 1;
+        sorted.push(v);
+        while j >= 0 && sorted.get(j) > v {
+            sorted.set(j + 1, sorted.get(j));
+            j = j - 1;
+        }
+        sorted.set(j + 1, v);
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    if sorted.len() == 0 {
+        img_u32(& mut out, empty_page);
+        img_u32(& mut out, 12);
+        img_u32(& mut out, 0);
+        return out;
+    }
+    i = 0;
+    while i < sorted.len() {
+        var page: i64 = sorted.get(i) - sorted.get(i) % 4096;
+        var e: i64 = i;
+        while e < sorted.len() && sorted.get(e) - sorted.get(e) % 4096 == page {
+            e = e + 1;
+        }
+        var count: i64 = e - i;
+        img_u32(& mut out, page);
+        img_u32(& mut out, 8 + 2 * (count + count % 2));
+        var k: i64 = i;
+        while k < e {
+            img_u16(& mut out, 0xA000 + sorted.get(k) % 4096);
+            k = k + 1;
+        }
+        if count % 2 == 1 {
+            img_u16(& mut out, 0);
+        }
+        i = e;
+    }
+    return out;
+}
+
+// ===========================================================================
+// Mach-O
+// ===========================================================================
+
+/// mach_header_64 (32 bytes).
+pub fn img_macho_header(out: & mut Vec<i64>, cputype: i64, cpusub: i64, filetype: i64, ncmds: i64, sizeofcmds: i64, flags: i64) {
+    img_u32(out, 0xFEEDFACF);
+    img_u32(out, cputype);
+    img_u32(out, cpusub);
+    img_u32(out, filetype);
+    img_u32(out, ncmds);
+    img_u32(out, sizeofcmds);
+    img_u32(out, flags);
+    img_u32(out, 0);
+}
+
+/// One LC_SEGMENT_64 (nsects section headers follow).
+pub fn img_macho_segment(out: & mut Vec<i64>, name: str, vmaddr: i64, vmsize: i64, fileoff: i64, filesize: i64, maxprot: i64, initprot: i64, nsects: i64) {
+    img_u32(out, 0x19);
+    img_u32(out, 72 + 80 * nsects);
+    img_name_field(out, name, 16);
+    img_u64(out, vmaddr);
+    img_u64(out, vmsize);
+    img_u64(out, fileoff);
+    img_u64(out, filesize);
+    img_u32(out, maxprot);
+    img_u32(out, initprot);
+    img_u32(out, nsects);
+    img_u32(out, 0);
+}
+
+/// One section_64 (80 bytes), without relocations.
+pub fn img_macho_section(out: & mut Vec<i64>, sect: str, seg: str, addr: i64, size: i64, offset: i64, align: i64, flags: i64) {
+    img_macho_section_rel(out, sect, seg, addr, size, offset, align, 0, 0, flags);
+}
+
+/// The same with a relocation table (an object's section): `reloff`,
+/// `nreloc` entries of img_macho_reloc.
+pub fn img_macho_section_rel(out: & mut Vec<i64>, sect: str, seg: str, addr: i64, size: i64, offset: i64, align: i64, reloff: i64, nreloc: i64, flags: i64) {
+    img_name_field(out, sect, 16);
+    img_name_field(out, seg, 16);
+    img_u64(out, addr);
+    img_u64(out, size);
+    img_u32(out, offset);
+    img_u32(out, align);
+    img_u32(out, reloff);
+    img_u32(out, nreloc);
+    img_u32(out, flags);
+    img_u32(out, 0);
+    img_u32(out, 0);
+    img_u32(out, 0);
+}
+
+/// One relocation_info (8 bytes): the address, then r_symbolnum (24 bits),
+/// r_pcrel, r_length (2 bits: 0..3 for 1..8 bytes), r_extern, r_type.
+pub fn img_macho_reloc(out: & mut Vec<i64>, addr: i64, symnum: i64, pcrel: bool, length: i64, ext: bool, rtype: i64) {
+    img_u32(out, addr);
+    var packed: i64 = symnum & 0x00ffffff;
+    if pcrel {
+        packed = packed | (1 << 24);
+    }
+    packed = packed | ((length & 3) << 25);
+    if ext {
+        packed = packed | (1 << 27);
+    }
+    packed = packed | ((rtype & 0xf) << 28);
+    img_u32(out, packed);
+}
+
+/// One nlist_64 (16 bytes): n_strx, n_type, n_sect, n_desc, n_value.
+pub fn img_macho_nlist(out: & mut Vec<i64>, strx: i64, ntype: i64, nsect: i64, desc: i64, value: i64) {
+    img_u32(out, strx);
+    out.push(ntype & 255);
+    out.push(nsect & 255);
+    img_u16(out, desc);
+    img_u64(out, value);
+}
+
+/// The nlist_64 records of `syms` (C's leading underscore on each name, in
+/// `strtab`, which starts with the empty name): N_SECT, N_EXT for a global.
+pub fn img_macho_symtab(syms: & Vec<ImgSym>, strtab: & mut Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < syms.len() {
+        var s: ImgSym = syms.get(i);
+        var strx: i64 = strtab.len();
+        strtab.push(95);
+        img_cstr(strtab, s.name);
+        var ntype: i64 = 0x0F;
+        if s.bind == IMG_LOCAL {
+            ntype = 0x0E;
+        }
+        img_macho_nlist(& mut out, strx, ntype, s.sect, 0, s.value);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// LC_SYMTAB.
+pub fn img_macho_symtab_cmd(out: & mut Vec<i64>, symoff: i64, nsyms: i64, stroff: i64, strsize: i64) {
+    img_u32(out, 0x2);
+    img_u32(out, 24);
+    img_u32(out, symoff);
+    img_u32(out, nsyms);
+    img_u32(out, stroff);
+    img_u32(out, strsize);
+}
+
+/// LC_DYSYMTAB with the local, external and undefined ranges (no tables).
+pub fn img_macho_dysymtab_cmd(out: & mut Vec<i64>, ilocal: i64, nlocal: i64, iext: i64, next: i64, iundef: i64, nundef: i64) {
+    img_u32(out, 0xB);
+    img_u32(out, 80);
+    img_u32(out, ilocal);
+    img_u32(out, nlocal);
+    img_u32(out, iext);
+    img_u32(out, next);
+    img_u32(out, iundef);
+    img_u32(out, nundef);
+    var z: i64 = 0;
+    while z < 12 {
+        img_u32(out, 0);
+        z = z + 1;
+    }
+}
+
+/// LC_DYLD_INFO_ONLY with rebase and bind opcodes (no weak, lazy or export).
+pub fn img_macho_dyld_info_cmd(out: & mut Vec<i64>, rebase_off: i64, rebase_size: i64, bind_off: i64, bind_size: i64) {
+    img_u32(out, 0x80000022);
+    img_u32(out, 48);
+    img_u32(out, rebase_off);
+    img_u32(out, rebase_size);
+    img_u32(out, bind_off);
+    img_u32(out, bind_size);
+    var z: i64 = 0;
+    while z < 6 {
+        img_u32(out, 0);
+        z = z + 1;
+    }
+}
+
+/// The relocations of a Mach-O executable, as dyld's rebase opcodes: one
+/// pointer rebase per offset of `offs` (file positions in the image; `seg`
+/// the segment index, `seg_start` where it starts in the image). Empty
+/// without any.
+pub fn img_macho_rebase(offs: & Vec<i64>, seg: i64, seg_start: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if offs.len() == 0 {
+        return out;
+    }
+    out.push(0x10 | 1);
+    // SET_TYPE_IMM pointer
+    var i: i64 = 0;
+    while i < offs.len() {
+        out.push(0x20 | seg);
+        // SET_SEGMENT_AND_OFFSET_ULEB
+        img_uleb(& mut out, offs.get(i) - seg_start);
+        out.push(0x60);
+        // DO_REBASE_ULEB_TIMES 1
+        img_uleb(& mut out, 1);
+        i = i + 1;
+    }
+    out.push(0x00);
+    return out;
+}
+
+/// The imports of a Mach-O executable, as dyld's bind opcodes: `names[i]`
+/// of dylib `ordinal` into the pointer at `offs[i]` (as img_macho_rebase).
+pub fn img_macho_bind(names: & Vec<str>, offs: & Vec<i64>, seg: i64, seg_start: i64, ordinal: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if names.len() == 0 {
+        return out;
+    }
+    out.push(0x10 | ordinal);
+    // SET_DYLIB_ORDINAL_IMM
+    out.push(0x50 | 1);
+    // SET_TYPE_IMM pointer
+    var i: i64 = 0;
+    while i < names.len() {
+        out.push(0x40);
+        // SET_SYMBOL_TRAILING_FLAGS_IMM
+        img_cstr(& mut out, names.get(i));
+        out.push(0x70 | seg);
+        // SET_SEGMENT_AND_OFFSET_ULEB
+        img_uleb(& mut out, offs.get(i) - seg_start);
+        out.push(0x90);
+        // DO_BIND
+        i = i + 1;
+    }
+    out.push(0x00);
+    return out;
+}
+
+/// TG15: img_macho_bind with a dylib ordinal per import (`ords[i]`, 1 for
+/// the first LC_LOAD_DYLIB): SET_DYLIB_ORDINAL_IMM (ordinals up to 15) or
+/// SET_DYLIB_ORDINAL_ULEB, written only when the ordinal changes.
+pub fn img_macho_bind_ords(names: & Vec<str>, ords: & Vec<i64>, offs: & Vec<i64>, seg: i64, seg_start: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if names.len() == 0 {
+        return out;
+    }
+    out.push(0x50 | 1);
+    // SET_TYPE_IMM pointer
+    var cur: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < names.len() {
+        var ord: i64 = ords.get(i);
+        if ord != cur {
+            if ord <= 15 {
+                out.push(0x10 | ord);
+                // SET_DYLIB_ORDINAL_IMM
+            } else {
+                out.push(0x20);
+                // SET_DYLIB_ORDINAL_ULEB
+                img_uleb(& mut out, ord);
+            }
+            cur = ord;
+        }
+        out.push(0x40);
+        // SET_SYMBOL_TRAILING_FLAGS_IMM
+        img_cstr(& mut out, names.get(i));
+        out.push(0x70 | seg);
+        // SET_SEGMENT_AND_OFFSET_ULEB
+        img_uleb(& mut out, offs.get(i) - seg_start);
+        out.push(0x90);
+        // DO_BIND
+        i = i + 1;
+    }
+    out.push(0x00);
+    return out;
+}
+
+/// One fat_arch (big-endian, 20 bytes) of a universal binary.
+pub fn img_fat_arch(out: & mut Vec<i64>, cputype: i64, cpusub: i64, offset: i64, size: i64, align: i64) {
+    img_be_u32(out, cputype);
+    img_be_u32(out, cpusub);
+    img_be_u32(out, offset);
+    img_be_u32(out, size);
+    img_be_u32(out, align);
+}

@@ -1,0 +1,53 @@
+// SP16 (llvm-roadmap): the compiler's own front end (compiler/lexer.fd,
+// compiler/parser.fd) built by the machine layer, as a step towards the
+// whole compiler built by `fid emit`. Lexes and parses each file named on
+// the command line and prints, per file, its token count, the functions,
+// structs, enums and impls the parser found, and a checksum of the token
+// lines. tests/nattools/selfhost_front_check.sh compares the output of the
+// natively built program with `fid run` of the same file.
+use core;
+use compiler::token;
+use compiler::lexer;
+use compiler::ast;
+use compiler::parser;
+
+fn main() -> i64 {
+    var i: i64 = 1;
+    var bad: i64 = 0;
+    while i < p_argc() {
+        match arg_at(i) {
+            Option::Some(path) => {
+                match read_file(path) {
+                    Option::Some(src) => {
+                        var lex: Lexer = Lexer::new(src);
+                        var toks: Vec<Token> = lex.tokenize();
+                        var sum: i64 = 0;
+                        var k: i64 = 0;
+                        while k < toks.len() {
+                            val t: Token = toks.get(k);
+                            sum = (sum * 31 + t.line * 7 + t.col) % 1000000007;
+                            k = k + 1;
+                        }
+                        var p: Parser = Parser_new(toks);
+                        match p.parse() {
+                            ParseResultProgram::Ok(prog) => {
+                                println(path + ": " + int_to_str(toks.len()) + " tokens, sum " + int_to_str(sum) + ", " + int_to_str(prog.funcs.len()) + " fns, " + int_to_str(prog.structs.len()) + " structs, " + int_to_str(prog.enums.len()) + " enums, " + int_to_str(prog.impls.len()) + " impls");
+                            }
+                            ParseResultProgram::Err(e) => {
+                                println(path + ": parse error");
+                                bad = bad + 1;
+                            }
+                        }
+                    }
+                    Option::None => {
+                        println(path + ": cannot read");
+                        bad = bad + 1;
+                    }
+                }
+            }
+            Option::None => {}
+        }
+        i = i + 1;
+    }
+    return bad;
+}

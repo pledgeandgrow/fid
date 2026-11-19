@@ -1,0 +1,86 @@
+// LF8/LF9 (compiler/checks.fd, peir_join_fact / peir_edge_fact): a range
+// fact from a condition (`i < n`, `x < MAX`) survives a branch that says
+// nothing about it (`if flag`) and the join after the branch's two arms,
+// so the arithmetic after the join may skip its overflow check. The
+// program must compute the same values with the facts on and off
+// (FID_IROPT_OFF=rangejoin). The case where the check must stay (one arm
+// stores into the variable) is test_midend_range_join_fail.fd.
+//
+// Expected output:
+// 70
+// 23
+// 35
+// 0
+// 0
+// 9223372036854775807
+// 9223372036854775807
+// -9223372036854775808
+
+fn alt(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 2 == 0 {
+            s = s + i;
+        } else {
+            s = s - 1;
+        }
+        // after the join, i < n still holds
+        s = s + (i + 1);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn clamp_sum(v: Vec<i64>, i: i64, flag: bool) -> i64 {
+    var t: i64 = 0;
+    if i >= 0 && i < v.len() {
+        if flag {
+            t = 1;
+        } else {
+            t = 2;
+        }
+        t = t + v.get(i) + i + 1;
+    }
+    return t;
+}
+
+fn near_max(x: i64, flag: bool) -> i64 {
+    if x < 9223372036854775807 {
+        var k: i64 = 0;
+        if flag {
+            k = 1;
+        } else {
+            k = 2;
+        }
+        // x + 1 cannot overflow on either way into this block
+        return x + 1 - k + k;
+    }
+    return x;
+}
+
+fn near_min(x: i64, flag: bool) -> i64 {
+    var y: i64 = x;
+    if y > - 9223372036854775807 - 1 {
+        if flag {
+            print("");
+        }
+        return y - 1;
+    }
+    return y;
+}
+
+fn main() {
+    println(alt(10));
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    println(clamp_sum(v, 1, true));
+    println(clamp_sum(v, 2, false));
+    println(clamp_sum(v, 3, true));
+    println(clamp_sum(v, - 1, false));
+    println(near_max(9223372036854775806, true));
+    println(near_max(9223372036854775806, false));
+    println(near_min(- 9223372036854775807, true));
+}

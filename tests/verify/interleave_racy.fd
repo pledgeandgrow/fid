@@ -1,0 +1,38 @@
+// A program with a data race on purpose (roadmap VF18): the harness check
+// for scripts/verify/interleave.py (tests/tooling/vf18-interleave-check.sh).
+// Four threads each add 1 to a shared cell 100000 times with a load and a
+// store that are separate atomics, not one read-modify-write and no lock,
+// so two threads that read the same value lose an update. With threads on
+// several CPUs the total comes out below 400000 in most runs and differs
+// from run to run: interleave.py must report FAIL (a run that does not
+// print the expected block, or more than one distinct result). If it
+// reports PASS on this program, the harness misses races.
+//
+// Expected output (only when no update is lost):
+// 400000
+
+use sync;
+
+fn bump_racy(cell: i64, n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        val v: i64 = sync_atomic_load(cell);
+        sync_atomic_store(cell, v + 1);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    val cell: i64 = sync_atomic_alloc(0);
+    val t1 = spawn bump_racy(cell, 100000);
+    val t2 = spawn bump_racy(cell, 100000);
+    val t3 = spawn bump_racy(cell, 100000);
+    val t4 = spawn bump_racy(cell, 100000);
+    await t1;
+    await t2;
+    await t3;
+    await t4;
+    println(sync_atomic_load(cell));
+    return 0;
+}

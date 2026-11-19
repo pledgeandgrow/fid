@@ -1,0 +1,86 @@
+// SP6: the second version of nat_fncache_edit_a.fd (same functions,
+// structs and globals), built with the cache the first left. Only inner
+// and pick changed; what the cached code of the others took for granted
+// does not hold any more, and the build must notice:
+//   - pick names "mk" in a string, so mk may be looked up by name at run
+//     time (ng_named_fn) and can no longer return its Pair in registers:
+//     mk and use_mk (replayed, recorded with that convention) are built
+//     again (ng_rr_plan gives them up; "[fncache] built again without");
+//   - inner now keeps many values in registers, so its clobber mask
+//     changed: outer's recorded allocation kept a, b and c in registers
+//     the old inner left alone, so outer (and what relied on its mask) is
+//     built again (nc_masks_hold).
+// The output must be the same as a build without the cache.
+// Expected output:
+// 2900
+// 50
+// 15
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn mk(n: i64) -> Pair {
+    return Pair { a: n, b: n + 1 };
+}
+
+fn use_mk(n: i64) -> i64 {
+    val p: Pair = mk(n);
+    return p.a * p.b + n;
+}
+
+fn pick(n: i64) -> i64 {
+    if n > 1000000 {
+        println("mk");
+    }
+    return n + 1;
+}
+
+fn inner(x: i64) -> i64 {
+    var t1: i64 = x + 1;
+    var t2: i64 = x * 3;
+    var t3: i64 = x * 5 + 2;
+    var t4: i64 = x * 7 + 3;
+    var t5: i64 = x * 11 + 4;
+    var t6: i64 = x * 13 + 5;
+    var t7: i64 = x * 17 + 6;
+    var t8: i64 = x * 19 + 7;
+    var k: i64 = 0;
+    while k < 3 {
+        t1 = t1 + t2;
+        t2 = t2 + t3;
+        t3 = t3 + t4;
+        t4 = t4 + t5;
+        t5 = t5 + t6;
+        t6 = t6 + t7;
+        t7 = t7 + t8;
+        t8 = t8 + t1;
+        k = k + 1;
+    }
+    return (t1 + t2 + t3 + t4 + t5 + t6 + t7 + t8) % 1000;
+}
+
+fn outer(n: i64) -> i64 {
+    val a: i64 = n * 3;
+    val b: i64 = n * 5 + 1;
+    val c: i64 = n * 7 + 2;
+    val d: i64 = inner(n);
+    return a + b + c + d;
+}
+
+fn main() {
+    var s: i64 = 0;
+    var u: i64 = 0;
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i < 5 {
+        s = s + outer(i);
+        u = u + use_mk(i);
+        k = k + pick(i);
+        i = i + 1;
+    }
+    println(s);
+    println(u);
+    println(k);
+}

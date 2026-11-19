@@ -1,0 +1,153 @@
+// stdlib/ssh: a client and a server in memory (seeded randomness, zero padding): version exchange with a server banner line, KEXINIT negotiation with strict KEX, curve25519-sha256 with an ssh-ed25519 host key, NEWKEYS, then over chacha20-poly1305@openssh.com the service request, a failed password, a publickey query and a signed publickey login, a session channel with exec, data, extended data, eof and close, a re-key, a tampered packet and an untrusted host key. The exchange hash (so both KEXINITs, the keys and K), the host key fingerprint and the first encrypted packet (so the derived keys and the cipher) are byte-exact against an independent Node.js computation (OpenSSL X25519, Ed25519, ChaCha20; Poly1305 in BigInt).
+// Expected output:
+// client ready true server ready true
+// algorithms curve25519-sha256 ssh-ed25519 chacha20-poly1305@openssh.com none strict true
+// server version SSH-2.0-FidesSSHD_1.0 client version SSH-2.0-FidesSSH_1.0
+// exchange hash 492108fe8cb7edcc36f4a5a648095be1bef7ab95b314b169ef4c4da9fd76feca
+// host key SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8
+// session ids equal true
+// first encrypted packet 45e0c20f1cb4881aaf75fee9ca4c55733d43e1f14cfc22183c8aba96f1671eb611fe958df86b64f971f827e5
+// server got service ssh-userauth
+// client got accept ssh-userauth
+// password failure, methods publickey,password
+// pk ok for ssh-ed25519
+// signed login: user alice service ssh-connection signature true
+// client authenticated true
+// channel open session window 2097152 max 32768
+// confirmed: our channel 0, server channel 7
+// exec echo hi want reply true
+// client got success true
+// stdout hi
+// stderr warning
+// eof true close true
+// rekey: kex count 2 2, new hash true, same session id true
+// data after rekey ping
+// tampered packet: MAC error
+// untrusted host key: host key not trusted
+use ssh;
+use vec;
+use encoding;
+use ed25519;
+
+fn hb(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn pump(c: & mut SshSession, s: & mut SshSession, first_c: Vec<i64>, first_s: Vec<i64>) {
+    var to_s: Vec<i64> = first_c;
+    var to_c: Vec<i64> = first_s;
+    var rounds: i64 = 0;
+    while (to_s.len() > 0 || to_c.len() > 0) && rounds < 10 {
+        val a: Vec<i64> = ssh_feed(s, to_s);
+        val b: Vec<i64> = ssh_feed(c, to_c);
+        to_c = a;
+        to_s = b;
+        rounds = rounds + 1;
+    }
+}
+
+fn main() {
+    val host_seed: Vec<i64> = hb("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    val user_seed: Vec<i64> = hb("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+    var c: SshSession = ssh_client_new("SSH-2.0-FidesSSH_1.0");
+    var s: SshSession = ssh_server_new("SSH-2.0-FidesSSHD_1.0", host_seed);
+    ssh_set_kex_seed(& mut c, str_bytes("client seed"));
+    ssh_set_kex_seed(& mut s, str_bytes("server seed"));
+    val c0: Vec<i64> = ssh_start(& mut c);
+    val s0: Vec<i64> = ssh_cat_bytes(str_bytes("Welcome to the test server\r\n"), ssh_start(& mut s));
+    pump(& mut c, & mut s, c0, s0);
+    println("client ready " + bool_to_str(ssh_ready(& c)) + " server ready " + bool_to_str(ssh_ready(& s)));
+    println("algorithms " + c.algs.kex + " " + c.algs.host_key + " " + c.algs.enc_cs + " " + c.algs.comp_cs + " strict " + bool_to_str(c.algs.strict));
+    println("server version " + c.peer_ident + " client version " + s.peer_ident);
+    println("exchange hash " + hex_encode_bytes(c.exchange_hash));
+    println("host key " + ssh_fingerprint(c.host_key));
+    println("session ids equal " + bool_to_str(hex_encode_bytes(c.session_id) == hex_encode_bytes(s.session_id)));
+
+    // service request (the first encrypted packet)
+    val p1: Vec<i64> = ssh_send(& mut c, ssh_service_request("ssh-userauth"));
+    println("first encrypted packet " + hex_encode_bytes(p1));
+    val o1: Vec<i64> = ssh_feed(& mut s, p1);
+    val m1: SshMessage = ssh_next_message(& mut s);
+    println("server got service " + ssh_parse_service(m1.payload));
+    val ignored: Vec<i64> = ssh_feed(& mut c, ssh_send(& mut s, ssh_service_accept("ssh-userauth")));
+    println("client got accept " + ssh_parse_service(ssh_next_message(& mut c).payload));
+
+    // a wrong password
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_userauth_password("alice", "wrong")));
+    val q1: SshAuthRequest = ssh_parse_userauth(ssh_next_message(& mut s).payload);
+    if str_equal(q1.method, "password") && !str_equal(q1.password, "correct horse") {
+        ssh_feed(& mut c, ssh_send(& mut s, ssh_userauth_failure("publickey,password", false)));
+    }
+    println("password failure, methods " + ssh_parse_userauth_failure(ssh_next_message(& mut c).payload));
+
+    // publickey: query, then a signed request
+    val user_pub: Vec<i64> = ed25519_public_key(user_seed);
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_userauth_publickey_query("alice", user_pub)));
+    val q2: SshAuthRequest = ssh_parse_userauth(ssh_next_message(& mut s).payload);
+    if q2.ok && !q2.has_sig && hex_encode_bytes(ssh_ed25519_blob_key(q2.key_blob)) == hex_encode_bytes(user_pub) {
+        ssh_feed(& mut c, ssh_send(& mut s, ssh_userauth_pk_ok(q2.alg, q2.key_blob)));
+    }
+    var rr: SshReader = ssh_reader(ssh_next_message(& mut c).payload);
+    val pk_ok_type: i64 = ssh_get_byte(& mut rr);
+    println("pk ok for " + ssh_get_text(& mut rr));
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_userauth_publickey(& c, "alice", user_seed)));
+    val q3: SshAuthRequest = ssh_parse_userauth(ssh_next_message(& mut s).payload);
+    val good: bool = ssh_userauth_check_signature(& s, & q3);
+    println("signed login: user " + q3.user + " service " + q3.service + " signature " + bool_to_str(good));
+    if good { ssh_feed(& mut c, ssh_send(& mut s, ssh_userauth_success())); }
+    println("client authenticated " + bool_to_str(ssh_next_message(& mut c).msg == SSH_MSG_USERAUTH_SUCCESS));
+
+    // a session channel
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_channel_open(0, 2097152, 32768)));
+    val ch: SshChannelMsg = ssh_parse_channel(ssh_next_message(& mut s).payload);
+    println("channel open " + ch.kind + " window " + int_to_str(ch.window) + " max " + int_to_str(ch.max_packet));
+    ssh_feed(& mut c, ssh_send(& mut s, ssh_channel_open_confirm(ch.sender, 7, 1048576, 32768)));
+    val cf: SshChannelMsg = ssh_parse_channel(ssh_next_message(& mut c).payload);
+    println("confirmed: our channel " + int_to_str(cf.recipient) + ", server channel " + int_to_str(cf.sender));
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_channel_request(cf.sender, "exec", true, "echo hi")));
+    val rq: SshChannelMsg = ssh_parse_channel(ssh_next_message(& mut s).payload);
+    println("exec " + rq.text + " want reply " + bool_to_str(rq.want_reply));
+    var to_c: Vec<i64> = ssh_send(& mut s, ssh_channel_success(0));
+    to_c = ssh_cat_bytes(to_c, ssh_send(& mut s, ssh_channel_data(0, str_bytes("hi"))));
+    to_c = ssh_cat_bytes(to_c, ssh_send(& mut s, ssh_channel_extended_data(0, 1, str_bytes("warning"))));
+    to_c = ssh_cat_bytes(to_c, ssh_send(& mut s, ssh_channel_eof(0)));
+    to_c = ssh_cat_bytes(to_c, ssh_send(& mut s, ssh_channel_close(0)));
+    ssh_feed(& mut c, to_c);
+    println("client got success " + bool_to_str(ssh_next_message(& mut c).msg == SSH_MSG_CHANNEL_SUCCESS));
+    println("stdout " + str_from_bytes(ssh_parse_channel(ssh_next_message(& mut c).payload).data));
+    println("stderr " + str_from_bytes(ssh_parse_channel(ssh_next_message(& mut c).payload).data));
+    val e1: SshChannelMsg = ssh_parse_channel(ssh_next_message(& mut c).payload);
+    val e2: SshChannelMsg = ssh_parse_channel(ssh_next_message(& mut c).payload);
+    println("eof " + bool_to_str(e1.msg == SSH_MSG_CHANNEL_EOF) + " close " + bool_to_str(e2.msg == SSH_MSG_CHANNEL_CLOSE));
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_channel_close(7)));
+    val closed: SshMessage = ssh_next_message(& mut s);
+
+    // re-key, initiated by the client
+    val h1: str = hex_encode_bytes(c.exchange_hash);
+    val rk: Vec<i64> = ssh_rekey(& mut c);
+    pump(& mut c, & mut s, rk, Vec::new());
+    println("rekey: kex count " + int_to_str(c.kex_count) + " " + int_to_str(s.kex_count) + ", new hash " + bool_to_str(hex_encode_bytes(c.exchange_hash) != h1) + ", same session id " + bool_to_str(hex_encode_bytes(c.session_id) == hex_encode_bytes(s.session_id)));
+    ssh_feed(& mut s, ssh_send(& mut c, ssh_channel_data(7, str_bytes("ping"))));
+    println("data after rekey " + str_from_bytes(ssh_parse_channel(ssh_next_message(& mut s).payload).data));
+
+    var bad: Vec<i64> = ssh_send(& mut c, ssh_channel_data(7, str_bytes("x")));
+    bad.set(10, bad.get(10) ^ 1);
+    ssh_feed(& mut s, bad);
+    println("tampered packet: " + s.err);
+
+    // a client that trusts another host key
+    var c2: SshSession = ssh_client_new("SSH-2.0-FidesSSH_1.0");
+    c2.trusted_host_key = ssh_ed25519_blob(user_pub);
+    var s2: SshSession = ssh_server_new("SSH-2.0-FidesSSHD_1.0", host_seed);
+    ssh_set_kex_seed(& mut c2, str_bytes("client seed 2"));
+    ssh_set_kex_seed(& mut s2, str_bytes("server seed 2"));
+    val c20: Vec<i64> = ssh_start(& mut c2);
+    val s20: Vec<i64> = ssh_start(& mut s2);
+    pump(& mut c2, & mut s2, c20, s20);
+    println("untrusted host key: " + c2.err);
+}
+
+fn ssh_cat_bytes(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    return out;
+}

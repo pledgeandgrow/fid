@@ -1,0 +1,49 @@
+// DB6 (llvm-roadmap): values live across calls sit in callee-saved
+// registers, which the prologue stores; .debug_frame now says where
+// (nat_ir.fd ng_cfi_saves, nat_enc.fd nat_elf_debug) and the epilogue
+// restores the rule, and `fid emit --nat` images carry .pdata / .xdata
+// (nat_enc.fd nat_pe_unwind). tests/nattools/machine_batch8_check.sh
+// builds this on the native targets and checks both
+// (tests/nattools/cfi_saves_check.py, pe_unwind_check.py).
+//
+// Expected output:
+// 9004
+// 115
+// 1487
+fn leaf_mix(a: i64, b: i64) -> i64 {
+    return a * 3 + b;
+}
+
+fn keep_across(x: i64, y: i64, z: i64) -> i64 {
+    // a, b, c and d are live across the calls: callee-saved registers
+    var a: i64 = x + 1;
+    var b: i64 = y * 2;
+    var c: i64 = z - 3;
+    var d: i64 = x ^ y;
+    var s: i64 = leaf_mix(a, b);
+    s = s + leaf_mix(c, d);
+    s = s + leaf_mix(s, a + b + c + d);
+    return s + a + b + c + d;
+}
+
+fn depth(n: i64, acc: i64) -> i64 {
+    if n == 0 {
+        return acc;
+    }
+    var k: i64 = n * 7;
+    var r: i64 = depth(n - 1, acc + k);
+    return r + (k % 5);
+}
+
+fn main() -> i64 {
+    println(keep_across(100, 200, 300));
+    println(depth(5, 0));
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        t = t + keep_across(i, i + 1, i + 2) % 97;
+        i = i + 1;
+    }
+    println(t + 1000);
+    return 0;
+}

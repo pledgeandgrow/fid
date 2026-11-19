@@ -1,0 +1,632 @@
+// stdlib/mp3: frame headers, Huffman tables as prefix codes, synthesis window and filterbank reconstruction, Layer III (LAME files, MPEG-2 intensity stereo), Layers I and II, free-format framing, all decoded vs ffmpeg
+// Expected output:
+// FFFB9064: MPEG-1 layer 3 128 kbit/s 44100 Hz mode 1 ext 2 crc no pad 0 frame 417 bytes 1152 samples side 32
+// FFFB92C4: MPEG-1 layer 3 128 kbit/s 44100 Hz mode 3 ext 0 crc no pad 1 frame 418 bytes 1152 samples side 17
+// FFFA9044: MPEG-1 layer 3 128 kbit/s 44100 Hz mode 1 ext 0 crc yes pad 0 frame 417 bytes 1152 samples side 32
+// FFF38844: MPEG-2 layer 3 64 kbit/s 16000 Hz mode 1 ext 0 crc no pad 0 frame 288 bytes 576 samples side 17
+// FFE31864: MPEG-2.5 layer 3 8 kbit/s 8000 Hz mode 1 ext 2 crc no pad 0 frame 72 bytes 576 samples side 17
+// FFFD9004: MPEG-1 layer 2 160 kbit/s 44100 Hz mode 0 ext 0 crc no pad 0 frame 522 bytes 1152 samples side 0
+// FFFBF064: not a frame header
+// 00112233: not a frame header
+// table 1 decodes (0,0) (0,1) (1,0) (1,1), table 16 then (0,0) at bit 10
+// linbits of tables 16 23 24 31: 1 13 4 13
+// imdct36 matches the direct sum within 1e-12: yes
+// mono 44.1 kHz: id3 45 bytes; frames 208 208 209 209 209 = 5, ends at 1088 of 1088
+// stereo 22.05 kHz: id3 45 bytes; frames 182 104 105 104 105 104 105 = 7, ends at 854 of 854
+// no frames: no MPEG audio frame found
+// layer II frame of zeros: ok yes, 2 channels of 1152 samples, all zero yes
+// free-format header: ok yes, free yes, frame length 0 until the next header is found
+// mono 44.1 kHz: MPEG-1 44100 Hz 1 ch, Info frame yes, delay 576 padding 1386, 4 frames, 2646 samples per channel after trimming
+// mono 44.1 kHz values: 0.0728 -0.0050 -0.0650 0.1106 -0.1152 0.0770 -0.0101 -0.0604
+// mono 44.1 kHz matches ffmpeg at 45 points within 1e-5: yes
+// stereo 22.05 kHz: MPEG-2 22050 Hz 2 ch, Info frame yes, delay 576 padding 675, 6 frames, 2205 samples per channel after trimming
+// stereo 22.05 kHz values: -0.2777 -0.0626 0.1417 -0.2699 0.1003 0.1202 -0.2696 0.2429
+// stereo 22.05 kHz matches ffmpeg at 46 points within 1e-5: yes
+// huffman tables (ISO 11172-3 Table 3-B.7): 16 tables, 1394 codewords, longest 19 bits, complete prefix codes: 16
+// code {0, 01, 11}: prefix-free no; code {0, 10}: prefix-free yes, complete no
+// window D[1] D[64] D[128] D[256] D[320] x 65536: -1 213 2037 75038 6574
+// analysis + synthesis: 576 samples, input back after 481 within 1e-4: yes
+// free format: frame lengths found 313 314 0 (the last has no next header)
+// Layer I joint stereo + CRC: layer 1 MPEG-1 48000 Hz 2 ch, 1 frames, 384 samples per channel
+// Layer I joint stereo + CRC matches ffmpeg at 42 points within 1e-5: yes
+// Layer II joint stereo + CRC: layer 2 MPEG-1 48000 Hz 2 ch, 1 frames, 1152 samples per channel
+// Layer II joint stereo + CRC matches ffmpeg at 46 points within 1e-5: yes
+// Layer III MPEG-2 intensity stereo: layer 3 MPEG-2 24000 Hz 2 ch, 1 frames, 576 samples per channel
+// Layer III MPEG-2 intensity stereo matches ffmpeg at 40 points within 1e-5: yes
+use mp3;
+use encoding;
+use math;
+
+// x rounded to d decimals ("-" only when the rounded value is not zero)
+fn fx(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val n: i64 = (a * (scale as f64) + 0.5) as i64;
+    if n == 0 { neg = false; }
+    var s: str = int_to_str(n / scale);
+    if d > 0 {
+        var fr: str = int_to_str(n % scale);
+        while str_len(fr) < d { fr = "0" + fr; }
+        s = s + "." + fr;
+    }
+    if neg { return "-" + s; }
+    return s;
+}
+
+fn show_header(label: str, hex: str) {
+    val h: Mp3Header = mp3_parse_header(&hex_decode_bytes(hex), 0);
+    if !h.ok {
+        println(label + ": not a frame header");
+        return;
+    }
+    println(label + ": MPEG-" + if h.version == 25 { "2.5" } else { int_to_str(h.version) } + " layer " + int_to_str(h.layer) + " " + int_to_str(h.bitrate) + " kbit/s " + int_to_str(h.rate) + " Hz mode " + int_to_str(h.mode) + " ext " + int_to_str(h.mode_ext) + " crc " + if h.has_crc { "yes" } else { "no" } + " pad " + int_to_str(h.padding) + " frame " + int_to_str(h.frame_len) + " bytes " + int_to_str(h.samples) + " samples side " + int_to_str(h.side_len));
+}
+
+// Walk the frames of a file: offsets, lengths, bitrates.
+fn frames(label: str, b: &Vec<i64>) {
+    var at: i64 = mp3_id3_size(b);
+    var s: str = label + ": id3 " + int_to_str(at) + " bytes; frames";
+    var n: i64 = 0;
+    while at + 4 <= b.len() {
+        val h: Mp3Header = mp3_parse_header(b, at);
+        if !h.ok {
+            s = s + " (junk at " + int_to_str(at) + ")";
+            break;
+        }
+        s = s + " " + int_to_str(h.frame_len);
+        at = at + h.frame_len;
+        n = n + 1;
+    }
+    println(s + " = " + int_to_str(n) + ", ends at " + int_to_str(at) + " of " + int_to_str(b.len()));
+}
+
+fn decode_check(label: str, b: &Vec<i64>, step: i64, want: Vec<f64>) {
+    val f: Mp3File = mp3_decode_stream(b, true);
+    if !f.ok {
+        println(label + ": ERROR " + f.error);
+        return;
+    }
+    println(label + ": MPEG-" + if f.version == 25 { "2.5" } else { int_to_str(f.version) } + " " + int_to_str(f.rate) + " Hz " + int_to_str(f.channels) + " ch, Info frame " + if f.info_frame { "yes" } else { "no" } + ", delay " + int_to_str(f.delay) + " padding " + int_to_str(f.padding) + ", " + int_to_str(f.frames) + " frames, " + int_to_str(f.pcm.get(0).len()) + " samples per channel after trimming");
+    var worst: f64 = 0.0;
+    var shown: str = "";
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while k < want.len() {
+        var c: i64 = 0;
+        while c < f.channels {
+            val got: f64 = f.pcm.get(c).get(i);
+            val d: f64 = math_fabs(got - want.get(k));
+            if d > worst { worst = d; }
+            if k >= 4 && k < 12 { shown = shown + " " + fx(got, 4); }
+            k = k + 1;
+            c = c + 1;
+        }
+        i = i + step;
+    }
+    println(label + " values:" + shown);
+    println(label + " matches ffmpeg at " + int_to_str(want.len()) + " points within 1e-5: " + if worst < 0.00001 { "yes" } else { "NO (" + float_to_str(worst) + ")" });
+}
+
+// Decode a Layer I/II/III stream without trimming and compare with
+// ffmpeg's float decoder at every `step`-th sample of each channel.
+fn layer_check(label: str, b: &Vec<i64>, step: i64, want: Vec<f64>) {
+    val f: Mp3File = mp3_decode(b);
+    if !f.ok {
+        println(label + ": ERROR " + f.error);
+        return;
+    }
+    println(label + ": layer " + int_to_str(f.layer) + " MPEG-" + int_to_str(f.version) + " " + int_to_str(f.rate) + " Hz " + int_to_str(f.channels) + " ch" + if f.free_format { " free format" } else { "" } + ", " + int_to_str(f.frames) + " frames, " + int_to_str(f.pcm.get(0).len()) + " samples per channel");
+    var worst: f64 = 0.0;
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while k < want.len() {
+        var c: i64 = 0;
+        while c < f.channels {
+            val d: f64 = math_fabs(f.pcm.get(c).get(i) - want.get(k));
+            if d > worst { worst = d; }
+            k = k + 1;
+            c = c + 1;
+        }
+        i = i + step;
+    }
+    println(label + " matches ffmpeg at " + int_to_str(want.len()) + " points within 1e-5: " + if worst < 0.00001 { "yes" } else { "NO (" + float_to_str(worst) + ")" });
+}
+
+// The Huffman tables as codes, and two codes that are not complete prefix codes.
+fn huffman_checks() {
+    var ids: Vec<i64> = Vec::new();
+    ids.push(1);
+    ids.push(2);
+    ids.push(3);
+    var t: i64 = 5;
+    while t <= 13 {
+        ids.push(t);
+        t = t + 1;
+    }
+    ids.push(15);
+    ids.push(16);
+    ids.push(24);
+    ids.push(32);
+    var codes: i64 = 0;
+    var longest: i64 = 0;
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < ids.len() {
+        val h: Mp3HuffCheck = mp3_huff_check(ids.get(i));
+        codes = codes + h.codes;
+        if h.max_len > longest { longest = h.max_len; }
+        if h.prefix_free && h.complete { good = good + 1; }
+        i = i + 1;
+    }
+    println("huffman tables (ISO 11172-3 Table 3-B.7): " + int_to_str(ids.len()) + " tables, " + int_to_str(codes) + " codewords, longest " + int_to_str(longest) + " bits, complete prefix codes: " + int_to_str(good));
+    var c1: Vec<i64> = Vec::new();
+    var l1: Vec<i64> = Vec::new();
+    c1.push(0);
+    l1.push(1);
+    c1.push(1);
+    l1.push(2);
+    c1.push(3);
+    l1.push(2);
+    val a: Mp3HuffCheck = mp3_prefix_code_check(&c1, &l1);
+    var c2: Vec<i64> = Vec::new();
+    var l2: Vec<i64> = Vec::new();
+    c2.push(0);
+    l2.push(1);
+    c2.push(2);
+    l2.push(2);
+    val b: Mp3HuffCheck = mp3_prefix_code_check(&c2, &l2);
+    println("code {0, 01, 11}: prefix-free " + if a.prefix_free { "yes" } else { "no" } + "; code {0, 10}: prefix-free " + if b.prefix_free { "yes" } else { "no" } + ", complete " + if b.complete { "yes" } else { "no" });
+}
+
+// The synthesis window, and the ISO analysis filterbank (11172-3 Annex
+// C.1.3, window C[i] = D[i] / 32) followed by the decoder's synthesis:
+// near-perfect reconstruction, delayed by 481 samples.
+fn window_checks() {
+    println("window D[1] D[64] D[128] D[256] D[320] x 65536: " + int_to_str((mp3_synth_window(1) * 65536.0) as i64) + " " + int_to_str((mp3_synth_window(64) * 65536.0) as i64) + " " + int_to_str((mp3_synth_window(128) * 65536.0) as i64) + " " + int_to_str((mp3_synth_window(256) * 65536.0) as i64) + " " + int_to_str((mp3_synth_window(320) * 65536.0) as i64));
+    val nblk: i64 = 18;
+    var x: Vec<f64> = Vec::new();
+    var n: i64 = 0;
+    while n < nblk * 32 {
+        val fn_: f64 = n as f64;
+        x.push(0.5 * math_sin(0.05 * fn_) + 0.3 * math_sin(1.3 * fn_ + 0.2) + 0.1 * math_cos(2.9 * fn_));
+        n = n + 1;
+    }
+    var cw: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 512 {
+        cw.push(mp3_synth_window(i) / 32.0);
+        i = i + 1;
+    }
+    var m: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    while k < 32 {
+        i = 0;
+        while i < 64 {
+            m.push(math_cos(((2 * k + 1) * (i - 16)) as f64 * math_pi() / 64.0));
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    // sub[k * nblk + b]
+    var sub: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 32 * nblk {
+        sub.push(0.0);
+        i = i + 1;
+    }
+    var b: i64 = 0;
+    while b < nblk {
+        var y: Vec<f64> = Vec::new();
+        i = 0;
+        while i < 64 {
+            var s: f64 = 0.0;
+            var j: i64 = 0;
+            while j < 8 {
+                val at: i64 = b * 32 + 31 - i - 64 * j;
+                if at >= 0 {
+                    s = s + cw.get(i + 64 * j) * x.get(at);
+                }
+                j = j + 1;
+            }
+            y.push(s);
+            i = i + 1;
+        }
+        k = 0;
+        while k < 32 {
+            var s: f64 = 0.0;
+            i = 0;
+            while i < 64 {
+                s = s + m.get(k * 64 + i) * y.get(i);
+                i = i + 1;
+            }
+            sub.set(k * nblk + b, s);
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var dec: Mp3Decoder = mp3_decoder();
+    val out: Vec<f64> = mp3_synthesize(&mut dec, 0, &sub, nblk);
+    var worst: f64 = 0.0;
+    n = 0;
+    while n + 481 < out.len() {
+        val d: f64 = math_fabs(out.get(n + 481) - x.get(n));
+        if d > worst { worst = d; }
+        n = n + 1;
+    }
+    println("analysis + synthesis: " + int_to_str(out.len()) + " samples, input back after 481 within 1e-4: " + if worst < 0.0001 { "yes" } else { "NO (" + float_to_str(worst) + ")" });
+}
+
+fn main() {
+    show_header("FFFB9064", "fffb9064");
+    show_header("FFFB92C4", "fffb92c4");
+    show_header("FFFA9044", "fffa9044");
+    show_header("FFF38844", "fff38844");
+    show_header("FFE31864", "ffe31864");
+    show_header("FFFD9004", "fffd9004");
+    show_header("FFFBF064", "fffbf064");
+    show_header("00112233", "00112233");
+
+    // Huffman table 1: (0,0) = 1, (0,1) = 001, (1,0) = 01, (1,1) = 000;
+    // bits 1 001 01 000 then table 16 code 1 (0,0): 1001 0100 0100 0000
+    var hb: Vec<i64> = Vec::new();
+    hb.push(148);
+    hb.push(64);
+    var hr: Mp3Bits = mp3_bits(hb);
+    var hs: str = "";
+    var t: i64 = 0;
+    while t < 4 {
+        val v: i64 = mp3_huff_pair(1, &mut hr);
+        hs = hs + " (" + int_to_str(v / 16) + "," + int_to_str(v % 16) + ")";
+        t = t + 1;
+    }
+    val v16: i64 = mp3_huff_pair(16, &mut hr);
+    println("table 1 decodes" + hs + ", table 16 then (" + int_to_str(v16 / 16) + "," + int_to_str(v16 % 16) + ") at bit " + int_to_str(hr.pos));
+    println("linbits of tables 16 23 24 31: " + int_to_str(mp3_linbits(16)) + " " + int_to_str(mp3_linbits(23)) + " " + int_to_str(mp3_linbits(24)) + " " + int_to_str(mp3_linbits(31)));
+
+    // IMDCT-36 against its defining sum
+    var x: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 18 {
+        x.push(math_cos((i as f64) * 0.9) - 0.05 * (i as f64));
+        i = i + 1;
+    }
+    val y: Vec<f64> = mp3_imdct36(&x);
+    var worst: f64 = 0.0;
+    i = 0;
+    while i < 36 {
+        var s: f64 = 0.0;
+        var k: i64 = 0;
+        while k < 18 {
+            s = s + x.get(k) * math_cos(math_pi() / 72.0 * ((2 * i + 19) * (2 * k + 1)) as f64);
+            k = k + 1;
+        }
+        val d: f64 = math_fabs(s - y.get(i));
+        if d > worst { worst = d; }
+        i = i + 1;
+    }
+    println("imdct36 matches the direct sum within 1e-12: " + if worst < 0.000000000001 { "yes" } else { "NO" });
+
+    val m1: Vec<i64> = hex_decode_bytes("49443304000000000023545353450000000f0000034c61766636322e31322e3130320000000000000000000000fffb50c00000000000000000000000" +
+        "000000000000496e666f0000000f00000004000004130066666666666666666666666666666666666666666666666699999999999999999999999999" +
+        "999999999999999999999999ccccccccccccccccccccccccccccccccccccccccccccccccccffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffff000000004c61766336322e323800000000000000000000000024056a0000000000000413e8788e1e000000000000000000000000000000000000" +
+        "00000000000000000000000000fffb50c400000a2c432e55948001811566233ad00007aac38e3385d364f1a1c1081c581f5e1f181c46041e89e5b32e" +
+        "5a0fa83b136bf0f860501404030282440c4e68d1a36c1f7880100431383fc1074e74f9ce5fce72feee9f772e0f83e0f87c100c4a00c1fd2001080001" +
+        "0400186a3a187b7108004314e4646831b4ca35b8850081c6fb074a76733038a2662584c611848b7bafd6c11d01d3e03944982d5f85a8768c2896ff8e" +
+        "e18612e2447affe4899178bc625dfff2e99178bc8974bbfc4415054447bfe0aa00000004796f37ba5bfffb52c404820870212dfdd100217f8ae151cf" +
+        "d448594b293000051c00042061b83bc9ab46198b01798380680406300c0201014cebbf65cea5599a75faa84a387bf2adffad76ff57eafde9c6fbfffe" +
+        "f00106050498e88067f479be2646128879667b33ac66784879a612e02a807157081a3d4206804701a05fa064b2280a010596450be68827dbf2f295fb" +
+        "a8ea0675ee4a75ba62f4e5de8ebd468b6af72bed45bfb8dfba74c1942deeb4edf317f5a135303040713010c04530158182309882de310f07ec334021" +
+        "543403c0c73009c0d910fffb52c410800c2c570a15f10001c21e2e7716b00280882401a84012e6003821a602d006a601380125c773e92c211ed5e90a" +
+        "7ff60636561bf756ecd2cc7794a5546fe415db7eb66ce4a3db7f5d5b073eff546735b500000ebb5dad1b0d86c361b0b441884f36da732d62991f1a07" +
+        "5801005560e0c47a046eb1d6461def497ff04f22823d8f2e5476ffe1ecf1307f2449a9d44efff8f86c3b0e120e24d61b697ffef262a4f58dcf9b41e9" +
+        "75a3ffffaa6f9bb8e1f40e728894680bea0c0601c1380e788a7ffbd2004aa00a0020144588e842fffb52c40583c9185b003cc3000000003480000004" +
+        "119d3a328ce4c623a12940c020ad99f5eaaab5e51d99f55b2440a0a961e74150d48e0a963c0d4e88941dfc4b7256744bffc44a3dffcef42c35f88ba8" +
+        "f08a4c414d45332e313030aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" +
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" +
+        "aaaaaaaaaaaaaaaa");
+    val m2: Vec<i64> = hex_decode_bytes("49443304000000000023545353450000000f0000034c61766636322e31322e3130320000000000000000000000fff370000000000000000000000000" +
+        "000000000000496e666f0000000f0000000600000329005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b9c9c9c9c" +
+        "9c9c9c9c9c9c9c9c9c9c9c9cbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbddededededededededededededededededeffffffffffffffffffffffffffff" +
+        "ffff000000004c61766336322e32380000000000000000000000002402a300000000000003295b8a5ddf0000000000fff340640005b0016c3fa08c01" +
+        "056046cd0146000249cbbfdb70003e0f87d40983e0f83e1f7020083ab07cbbe50103983e1fe0841c762007f2e0e063bfa3dfd1effeec12975dddef68" +
+        "20164ed8c20841987f820180c65c1f46e2cf4c25bcca760d63988921a14299fff342441005883d5000cd94000ac89ea8019a3800b05882a839ed752e" +
+        "e9075eee00a00803f890783dc15097834253bf069d261dfffe5d60a01f1d1de3a04f43a2e10865c107a572d7012012037f1e1b0dbf3488e9ee582a0a" +
+        "fc44796a829b740281003c04038606e0fff340440c058c292c00ef000009505a6401dd00009460fa28c66761326b3c38261ee340608218860b60341c" +
+        "0148dab565b129755bdffff836a5f50100a8e214024c2014cc80214c82fcce48490c4b03c1412820015a8e836d4d9d626c21150b8801027303705530" +
+        "fff342440d0554232e00af00008a685a60015e0000bb14f31596951e625302f08e30400563070042301e0104092c76bf23213fffeaa32c2ea3252eb9" +
+        "80400105807cc20432cc33d08cd378510c490290c0f004098004be6b9e3cfe4515d4af38833555c0e953a4c378fff340640c0538495c00cc9c000ad0" +
+        "8ea4019a500030e32155a273030203d785ad05bfcfb80704a33f8d889de0c835f6857fab076f369102b5237c340064d1d22264652798d1878ce2f73d" +
+        "4317005859100e498208b45bf2539dca9e3bea0ba004c2103627467224fff342440a047c393c1ce6040008a0728439cc08008924d84250223ab8b9e4" +
+        "a62f32b6b369aad625c4bd677897ac3617400d191f5d6bb0084091368b973dec9898c6b4c56f5beab4425744afd677897ac36a4c414d45332e313030" +
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    frames("mono 44.1 kHz", &m1);
+    frames("stereo 22.05 kHz", &m2);
+    var junk: Vec<i64> = Vec::new();
+    junk.push(1);
+    junk.push(2);
+    println("no frames: " + mp3_decode(&junk).error);
+    var dec: Mp3Decoder = mp3_decoder();
+    var l2: Vec<i64> = hex_decode_bytes("fffd9004");
+    while l2.len() < 600 {
+        l2.push(0);
+    }
+    val zf: Mp3Frame = mp3_decode_frame(&mut dec, &l2, 0);
+    var zmax: f64 = 0.0;
+    var zi: i64 = 0;
+    while zi < zf.pcm.get(0).len() {
+        if math_fabs(zf.pcm.get(0).get(zi)) > zmax { zmax = math_fabs(zf.pcm.get(0).get(zi)); }
+        zi = zi + 1;
+    }
+    println("layer II frame of zeros: ok " + if zf.ok { "yes" } else { "no" } + ", " + int_to_str(zf.pcm.len()) + " channels of " + int_to_str(zf.pcm.get(0).len()) + " samples, all zero " + if zmax == 0.0 { "yes" } else { "no" });
+    val fh: Mp3Header = mp3_parse_header(&hex_decode_bytes("fffd00c4"), 0);
+    println("free-format header: ok " + if fh.ok { "yes" } else { "no" } + ", free " + if fh.free { "yes" } else { "no" } + ", frame length " + int_to_str(fh.frame_len) + " until the next header is found");
+
+    var w1: Vec<f64> = Vec::new();
+    w1.push(0.000922308);
+    w1.push(-0.068824723);
+    w1.push(0.112088099);
+    w1.push(-0.113596030);
+    w1.push(0.072820656);
+    w1.push(-0.004956536);
+    w1.push(-0.064955592);
+    w1.push(0.110623978);
+    w1.push(-0.115236886);
+    w1.push(0.077027753);
+    w1.push(-0.010078320);
+    w1.push(-0.060387745);
+    w1.push(0.108472124);
+    w1.push(-0.116184659);
+    w1.push(0.080828480);
+    w1.push(-0.015329095);
+    w1.push(-0.055816714);
+    w1.push(0.106250614);
+    w1.push(-0.117248714);
+    w1.push(0.084455356);
+    w1.push(-0.020116124);
+    w1.push(-0.051493619);
+    w1.push(0.104076847);
+    w1.push(-0.117929958);
+    w1.push(0.087931372);
+    w1.push(-0.025203351);
+    w1.push(-0.046879187);
+    w1.push(0.101505503);
+    w1.push(-0.118409187);
+    w1.push(0.091245867);
+    w1.push(-0.030151688);
+    w1.push(-0.042140156);
+    w1.push(0.098780312);
+    w1.push(-0.118664600);
+    w1.push(0.094400093);
+    w1.push(-0.034982264);
+    w1.push(-0.037023574);
+    w1.push(0.096198052);
+    w1.push(-0.121516414);
+    w1.push(0.080726691);
+    w1.push(-0.032938410);
+    w1.push(-0.015289329);
+    w1.push(0.083281755);
+    w1.push(-0.100888342);
+    w1.push(0.104428560);
+    decode_check("mono 44.1 kHz", &m1, 60, w1);
+    var w2: Vec<f64> = Vec::new();
+    w2.push(0.028282344);
+    w2.push(0.027627397);
+    w2.push(0.217441291);
+    w2.push(0.287288666);
+    w2.push(-0.277656257);
+    w2.push(-0.062583357);
+    w2.push(0.141707733);
+    w2.push(-0.269853026);
+    w2.push(0.100294851);
+    w2.push(0.120188460);
+    w2.push(-0.269562066);
+    w2.push(0.242917955);
+    w2.push(0.243843123);
+    w2.push(-0.176151663);
+    w2.push(-0.042914733);
+    w2.push(-0.203806564);
+    w2.push(-0.189107329);
+    w2.push(0.220692873);
+    w2.push(0.284699529);
+    w2.push(0.155742288);
+    w2.push(-0.175264925);
+    w2.push(-0.254358709);
+    w2.push(-0.060418963);
+    w2.push(-0.100327909);
+    w2.push(0.252585918);
+    w2.push(0.276635587);
+    w2.push(-0.263244748);
+    w2.push(0.037809625);
+    w2.push(0.083965369);
+    w2.push(-0.284867615);
+    w2.push(0.155269861);
+    w2.push(0.024618663);
+    w2.push(-0.282770038);
+    w2.push(0.279349655);
+    w2.push(0.206474900);
+    w2.push(-0.084047854);
+    w2.push(0.014621370);
+    w2.push(-0.260701567);
+    w2.push(-0.229356140);
+    w2.push(0.144935817);
+    w2.push(0.277757585);
+    w2.push(0.229098529);
+    w2.push(-0.123744108);
+    w2.push(-0.192821637);
+    w2.push(-0.128493771);
+    w2.push(-0.193009377);
+    decode_check("stereo 22.05 kHz", &m2, 100, w2);
+    huffman_checks();
+    window_checks();
+    // free format: three Layer II headers with bitrate index 0 (44.1 kHz
+    // mono, the second with the padding slot) 313 and 314 bytes apart
+    var ff: Vec<i64> = Vec::new();
+    while ff.len() < 940 {
+        ff.push(0);
+    }
+    val fh0: Vec<i64> = hex_decode_bytes("fffd00c4fffd02c4");
+    var q: i64 = 0;
+    while q < 4 {
+        ff.set(q, fh0.get(q));
+        ff.set(313 + q, fh0.get(4 + q));
+        ff.set(627 + q, fh0.get(q));
+        q = q + 1;
+    }
+    println("free format: frame lengths found " + int_to_str(mp3_free_frame_len(&ff, 0)) + " " + int_to_str(mp3_free_frame_len(&ff, 313)) + " " + int_to_str(mp3_free_frame_len(&ff, 627)) + " (the last has no next header)");
+    val l1_b: Vec<i64> = hex_decode_bytes("fffe64501234314104301324203155441221001010001201000144719058f49c24810554e7a39d631c76756168f3954cf68f9cc3566628e38cd21d74" +
+        "276b1cdb3b17136128c3206432769c9836d1219edd849948b352ee8241296c7465d1044c8b9ba150415a00dc6b0830d759a185a51194af25ece297bd" +
+        "3cd290a018a3554b650c1d1b5b250c9b50ae45580e173dfc2d2dab9b970094eb302fc08cd0025472e0689842f3e9e104208acacc4053433532752a00" +
+        "204a140091a63464274b3110");
+    var l1_w: Vec<f64> = Vec::new();
+    l1_w.push(0.000000000);
+    l1_w.push(0.000000000);
+    l1_w.push(0.000061868);
+    l1_w.push(-0.000029694);
+    l1_w.push(0.000332156);
+    l1_w.push(0.000135616);
+    l1_w.push(0.000539523);
+    l1_w.push(-0.000084030);
+    l1_w.push(0.001742978);
+    l1_w.push(-0.000257094);
+    l1_w.push(0.002035018);
+    l1_w.push(-0.000833291);
+    l1_w.push(-0.006961717);
+    l1_w.push(0.001890438);
+    l1_w.push(0.014738210);
+    l1_w.push(0.003356113);
+    l1_w.push(-0.017243080);
+    l1_w.push(0.022547105);
+    l1_w.push(-0.077862598);
+    l1_w.push(-0.013666804);
+    l1_w.push(-0.018767357);
+    l1_w.push(0.042809006);
+    l1_w.push(-0.053775541);
+    l1_w.push(-0.002116983);
+    l1_w.push(0.042682789);
+    l1_w.push(0.194267049);
+    l1_w.push(-0.270833313);
+    l1_w.push(-0.316153288);
+    l1_w.push(0.278513104);
+    l1_w.push(0.488757610);
+    l1_w.push(-0.012977600);
+    l1_w.push(0.179436326);
+    l1_w.push(-0.322088212);
+    l1_w.push(0.149836332);
+    l1_w.push(-1.160527706);
+    l1_w.push(-0.123729289);
+    l1_w.push(0.717499018);
+    l1_w.push(0.226507530);
+    l1_w.push(-0.760495007);
+    l1_w.push(-0.118398413);
+    l1_w.push(0.769397378);
+    l1_w.push(-0.691613257);
+    layer_check("Layer I joint stereo + CRC", &l1_b, 19, l1_w);
+    val l2j_b: Vec<i64> = hex_decode_bytes("fffc7440e36445333376312133260000100000ae0ba000000aa18846031ab394abe1039238e5ace96bba770e55bf8871ed9b78875e56c396b1e57bb8" +
+        "6ade16b7a4d23cf7bdefbefbbbbbbbbbbbbbefbef7bdb6d7cd6db6df36daf7bdf7a07697767857888208df08b6daf9adb6dbe6db5cdd354ca5c8e3da" +
+        "b39cb47dcd394446242108442f72b50723f71259ca9a61e1df2c70ad28006be6b6db6f8818d193d8f83e13516abd73e1861ce7000f92fc5d11e0031b" +
+        "78d872c6d5d1d777777c30c39ce001af9adb6dbe0062d7213d0659472eeeeeef8618739c0035f35b6db7c00c376ae0ca4635305dddddf0c30e738006" +
+        "be6b6db6f80182e68fab919ee8e54352a61861ce7000a6a14d56ec803038e86ec481a479275593c30c39ce002c2209b712a0060e8dea8c784a7a2fb6" +
+        "ead8618739c00292b359126200c407598fdf58b4aa1581670c30e738004be118b2a54018");
+    var l2j_w: Vec<f64> = Vec::new();
+    l2j_w.push(0.000000000);
+    l2j_w.push(0.000000000);
+    l2j_w.push(0.000000000);
+    l2j_w.push(0.000000000);
+    l2j_w.push(-0.000000007);
+    l2j_w.push(0.000000000);
+    l2j_w.push(-0.000002872);
+    l2j_w.push(-0.000000252);
+    l2j_w.push(0.000023309);
+    l2j_w.push(-0.000009264);
+    l2j_w.push(0.000081225);
+    l2j_w.push(-0.000277074);
+    l2j_w.push(-0.001867963);
+    l2j_w.push(-0.001144861);
+    l2j_w.push(-0.000664213);
+    l2j_w.push(-0.010474268);
+    l2j_w.push(0.001651587);
+    l2j_w.push(-0.016436137);
+    l2j_w.push(0.009737276);
+    l2j_w.push(0.001882426);
+    l2j_w.push(0.351410598);
+    l2j_w.push(-0.153926641);
+    l2j_w.push(-0.370945752);
+    l2j_w.push(0.311360598);
+    l2j_w.push(0.547956407);
+    l2j_w.push(0.096578881);
+    l2j_w.push(-0.249596864);
+    l2j_w.push(-0.157817870);
+    l2j_w.push(0.230081260);
+    l2j_w.push(0.156236067);
+    l2j_w.push(-0.362813383);
+    l2j_w.push(-0.018918321);
+    l2j_w.push(0.074695826);
+    l2j_w.push(-0.411801219);
+    l2j_w.push(-0.048230052);
+    l2j_w.push(0.125773862);
+    l2j_w.push(0.102384835);
+    l2j_w.push(0.328837395);
+    l2j_w.push(0.137659937);
+    l2j_w.push(-0.129340798);
+    l2j_w.push(-0.219893262);
+    l2j_w.push(-0.209883153);
+    l2j_w.push(0.206110686);
+    l2j_w.push(0.279723167);
+    l2j_w.push(-0.247850731);
+    l2j_w.push(-0.010521539);
+    layer_check("Layer II joint stereo + CRC", &l2j_b, 51, l2j_w);
+    val l3i_b: Vec<i64> = hex_decode_bytes("fff384700008280172b6c00084852802be0580000b65084000022447614a83f53a1567cd9ae8986d9b0c6517e7d8ea3d98ca52f6f0251abcc08f6238" +
+        "1d6585a6417707973979836cf693d142b00c27bec91993573e23914e1d36308542736af048c6e92b75bac2d510be9e00000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000");
+    var l3i_w: Vec<f64> = Vec::new();
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000000);
+    l3i_w.push(0.000000100);
+    l3i_w.push(0.000000075);
+    l3i_w.push(-0.000001039);
+    l3i_w.push(-0.000000413);
+    l3i_w.push(-0.000009135);
+    l3i_w.push(-0.000006138);
+    l3i_w.push(-0.000030379);
+    l3i_w.push(-0.000023886);
+    l3i_w.push(-0.000077855);
+    l3i_w.push(-0.000057373);
+    l3i_w.push(0.000095067);
+    l3i_w.push(0.000060690);
+    l3i_w.push(-0.000015372);
+    l3i_w.push(0.000235977);
+    l3i_w.push(-0.000690033);
+    l3i_w.push(-0.000504381);
+    l3i_w.push(-0.001885577);
+    l3i_w.push(-0.002081529);
+    l3i_w.push(-0.002897584);
+    l3i_w.push(-0.002762435);
+    l3i_w.push(-0.007422007);
+    l3i_w.push(-0.007641325);
+    l3i_w.push(-0.000021221);
+    l3i_w.push(0.000128317);
+    l3i_w.push(-0.013116751);
+    l3i_w.push(-0.015685311);
+    layer_check("Layer III MPEG-2 intensity stereo", &l3i_b, 29, l3i_w);
+}

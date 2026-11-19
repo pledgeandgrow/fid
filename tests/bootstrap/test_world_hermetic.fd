@@ -1,0 +1,111 @@
+// Complaint CT1: a test marked @hermetic is checked at compile time to
+// reach the files, the clock and the network only through what
+// stdlib/world can fake (compiler/typechecker.fd TypeChecker_verify_hermetic).
+// `greet_all` below reads names through io (Reader::open + BufReader),
+// stamps the greeting with the clock (clock_now_ms, dt_now), asks a
+// server through http_client, writes through io (Writer::create) and fs
+// (fs_append_text): every route goes through a function that consults
+// stdlib/world, so `test_greet` is accepted, and run under world_hermetic()
+// it touches no disk, OS clock or socket. `peek_disk` reads the disk
+// directly (core's read_file), which is fine: no @hermetic test reaches it.
+// The rejected forms are test_world_hermetic_fail.fd (files),
+// test_world_hermetic_clock_fail.fd and test_world_hermetic_net_fail.fd.
+//
+// Expected output:
+// greeted = 2
+// out.txt = at 2023-11-14T22:13:20Z|hello ada (#1)|hello linus (#2)
+// log.txt = greet 2
+// requests = 2
+// took = 30 ms
+// peek = none
+use fs;
+use io;
+use time;
+use datetime;
+use http_client;
+use world;
+
+// ─── the code under test ─────────────────────────────────────────────────
+
+fn read_names(path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    match Reader::open(path) {
+        Option::Some(r) => {
+            var br: BufReader = BufReader::new(r);
+            var going: bool = true;
+            while going {
+                val l: Option<str> = br.read_line();
+                match l {
+                    Option::Some(s) => {
+                        if str_len(s) > 0 { out.push(s); }
+                    }
+                    Option::None => { going = false; }
+                }
+            }
+        }
+        Option::None => {}
+    }
+    return out;
+}
+
+fn greet_all(names_path: str, out_path: str) -> i64 {
+    val names: Vec<str> = read_names(names_path);
+    val start: i64 = clock_now_ms();
+    match Writer::create(out_path) {
+        Option::Some(w0) => {
+            var w: Writer = w0;
+            w.write_line("at " + time_to_iso(dt_now()));
+            var i: i64 = 0;
+            while i < names.len() {
+                val r = http_get("greeter.example", 80, "/hello/" + names.get(i));
+                w.write_line(str_trim(r.body));
+                i = i + 1;
+            }
+        }
+        Option::None => { return -1; }
+    }
+    fs_append_text("log.txt", "greet " + int_to_str(names.len()) + "\n");
+    return clock_elapsed_ms(start);
+}
+
+// reads the disk directly: allowed, as no @hermetic test reaches it
+fn peek_disk(path: str) -> str {
+    match read_file(path) {
+        Option::Some(s) => { return s; }
+        Option::None => { return "none"; }
+    }
+    return "none";
+}
+
+// ─── the test ────────────────────────────────────────────────────────────
+
+var served: i64 = 0;
+
+fn greeter(host: str, port: i64, req: str) -> str {
+    served = served + 1;
+    world_clock_advance(15);
+    val who: str = str_slice(world_req_path(req), 7, str_len(world_req_path(req)));
+    return world_http_response(200, "hello " + who + " (#" + int_to_str(served) + ")");
+}
+
+@hermetic
+fn test_greet() -> i64 {
+    world_hermetic();
+    world_fake_clock(1700000000000);
+    world_fake_network(greeter);
+    world_file_put("names.txt", "ada\nlinus\n");
+    val took: i64 = greet_all("names.txt", "out.txt");
+    println("greeted = " + int_to_str(served));
+    println("out.txt = " + str_replace(str_trim(world_file_text("out.txt")), "\n", "|"));
+    println("log.txt = " + str_trim(world_file_text("log.txt")));
+    println("requests = " + int_to_str(world_net_count()));
+    println("took = " + int_to_str(took) + " ms");
+    return 0;
+}
+
+fn main() -> i64 {
+    test_greet();
+    world_real();
+    println("peek = " + peek_disk("tests/bootstrap/no_such_file_ct1.txt"));
+    return 0;
+}

@@ -1,0 +1,111 @@
+// CA5 / CM3: a Vec, str or HashMap given to a spawned task is the task's
+// own value (ownership, proposal 0004: a spawn argument is copied whole
+// for the thread). The task changes its parameter through `var v = v;`
+// (a by-value parameter itself cannot be changed), while
+// the parent changes its own value before the task is awaited: neither
+// side sees the other's changes, and `var b = a; b.push(..)` leaves `a`
+// as it was.
+//
+// Expected output:
+// copy a 1 1
+// copy b 2 9
+// copy s ab abc
+// copy m 1 10 2 11
+// task vec 4 109
+// task map 3 30
+// task words 2 x!
+// parent vec 3 1 2 3
+// parent map 1 1
+// parent words 1 x
+// twins 10 14
+
+fn grow_in_place(v: Vec<i64>) -> i64 {
+    var v = v;
+    v.push(100);
+    v.set(0, 7);
+    v.push(0);
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return v.len() * 1000 + s;
+}
+
+fn fill_map(m: HashMap<i64, i64>) -> i64 {
+    var m = m;
+    m.insert(2, 20);
+    m.insert(3, 30);
+    m.insert(1, 99);
+    return m.len() * 1000 + m.get(3);
+}
+
+fn shout(ws: Vec<str>) -> str {
+    var ws = ws;
+    ws.set(0, ws.get(0) + "!");
+    ws.push("y");
+    return int_to_str(ws.len()) + " " + ws.get(0);
+}
+
+fn add_k(v: Vec<i64>, k: i64) -> i64 {
+    var v = v;
+    v.push(k);
+    v.set(0, v.get(0) + k);
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    // let of an existing value: its own owner
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    var b = a;
+    b.push(2);
+    b.set(0, 9);
+    println("copy a " + int_to_str(a.len()) + " " + int_to_str(a.get(0)));
+    println("copy b " + int_to_str(b.len()) + " " + int_to_str(b.get(0)));
+    var s: str = "ab";
+    var t = s;
+    t = t + "c";
+    println("copy s " + s + " " + t);
+    var m0: HashMap<i64, i64> = HashMap::new();
+    m0.insert(1, 10);
+    var m1 = m0;
+    m1.insert(2, 20);
+    m1.insert(1, 11);
+    println("copy m " + int_to_str(m0.len()) + " " + int_to_str(m0.get(1)) + " " + int_to_str(m1.len()) + " " + int_to_str(m1.get(1)));
+
+    // spawn, then both sides change the value
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    var m: HashMap<i64, i64> = HashMap::new();
+    m.insert(1, 1);
+    var ws: Vec<str> = Vec::new();
+    ws.push("x");
+    val tv = spawn grow_in_place(v);
+    val tm = spawn fill_map(m);
+    val tw = spawn shout(ws);
+    v.push(3);
+    ws.set(0, "x");
+    val rv = await tv;
+    val rm = await tm;
+    val rw = await tw;
+    println("task vec " + int_to_str(rv / 1000) + " " + int_to_str(rv % 1000));
+    println("task map " + int_to_str(rm / 1000) + " " + int_to_str(rm % 1000));
+    println("task words " + rw);
+    println("parent vec " + int_to_str(v.len()) + " " + int_to_str(v.get(0)) + " " + int_to_str(v.get(1)) + " " + int_to_str(v.get(2)));
+    println("parent map " + int_to_str(m.len()) + " " + int_to_str(m.get(1)));
+    println("parent words " + int_to_str(ws.len()) + " " + ws.get(0));
+    // two tasks given the same Vec, each changing its own
+    val x = spawn add_k(v, 2);
+    val y = spawn add_k(v, 4);
+    println("twins " + int_to_str(await x) + " " + int_to_str(await y));
+    return 0;
+}

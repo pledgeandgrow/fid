@@ -12,7 +12,10 @@
 //   - Comments aligned with their code
 
 module compiler::fmt;
- use core; use vec; use string;
+use core;
+use vec;
+use string;
+
 // --- Formatter Token --------------------------------------------------
 
 /// A formatter token. Unlike the compiler's Token, this preserves comments
@@ -277,9 +280,16 @@ pub fn fmt_tokenize(src: str) -> Vec<FTok> {
         }
 
         // If we accumulated blank lines before this token, emit a marker
+        var after_newline: bool = saw_newline;
         if blank_count > 0 {
             tokens.push(FTok::BlankLines(blank_count));
             blank_count = 0;
+        } else if after_newline && c == 47 && i + 1 < len && str_byte_at(src, i + 1) == 47 {
+            // N4: a line comment on a line of its own gets a marker too
+            // (no blank line: BlankLines(0)), so the printer keeps it on
+            // its own line; one with no marker is a trailing comment of the
+            // code before it on the same line, and stays there
+            tokens.push(FTok::BlankLines(0));
         }
         saw_newline = false;
 
@@ -315,6 +325,24 @@ pub fn fmt_tokenize(src: str) -> Vec<FTok> {
             text = str_trim_end(text);
             tokens.push(FTok::BlockComment(text));
             continue;
+        }
+
+        // Character literal: 'A', '\n', '\'' -- one token, printed as it
+        // is. Read as quote / name / quote, the spacing rules put spaces
+        // inside it (`c >= ' A '`), which changed its meaning and broke the
+        // build after a whole-tree `fid fmt` (the token check could not see
+        // it: the three tokens were the same). A quote with no closing one
+        // within a few bytes stays punctuation.
+        if c == 39 {
+            var cj: i64 = i + 1;
+            if cj < len && str_byte_at(src, cj) == 92 { cj = cj + 2; } else { cj = cj + 1; }
+            // a UTF-8 character: its continuation bytes
+            while cj < len && cj < i + 6 && str_byte_at(src, cj) >= 128 && str_byte_at(src, cj) < 192 { cj = cj + 1; }
+            if cj < len && str_byte_at(src, cj) == 39 {
+                tokens.push(FTok::Str(str_slice(src, i, cj + 1)));
+                i = cj + 1;
+                continue;
+            }
         }
 
         // f-string: f"..."
@@ -944,6 +972,16 @@ fn prev_significant_before(tokens: Vec<FTok>, idx: i64) -> FTok {
 /// impl/cap/etc.) where `,` should produce newlines between fields.
 fn is_def_body_brace_at(tokens: Vec<FTok>, idx: i64) -> bool {
     var prev1: FTok = prev_significant_at(tokens, idx);
+    // N4: a generic definition (`struct Matrix<T, const N: usize> {`,
+    // `enum Tree<T> {`): what stands before its `<` decides
+    val gt: str = fmt_punct(prev1);
+    if gt == ">" || gt == ">>" {
+        val lt: i64 = fmt_generic_open_before(tokens, prev_significant_index(tokens, idx));
+        if lt < 0 {
+            return false;
+        }
+        return is_def_body_brace_at(tokens, lt);
+    }
     match prev1 {
         FTok::Word(w) => {
             if w == "struct" {
@@ -998,6 +1036,36 @@ fn is_def_body_brace_at(tokens: Vec<FTok>, idx: i64) -> bool {
             return false;
         }
     }
+}
+
+/// The index of the `<` that the `>` (or `>>`) at `gt` closes, walking
+/// back over what a type list holds; -1 when a `;`, `{`, `}` or `=` comes
+/// first (a comparison, not a generic).
+fn fmt_generic_open_before(tokens: Vec<FTok>, gt: i64) -> i64 {
+    var depth: i64 = 0;
+    var i: i64 = gt;
+    var seen: i64 = 0;
+    while i >= 0 && seen < 256 {
+        val p: str = fmt_punct(tokens.get(i));
+        if p == ">" {
+            depth = depth + 1;
+        } else if p == ">>" {
+            depth = depth + 2;
+        } else if p == "<" {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+            if depth < 0 {
+                return 0 - 1;
+            }
+        } else if p == ";" || p == "{" || p == "}" || p == "=" {
+            return 0 - 1;
+        }
+        i = i - 1;
+        seen = seen + 1;
+    }
+    return 0 - 1;
 }
 
 /// Whether the `<` at `idx` is closed by a matching `>` (or `>>`, which
@@ -1126,6 +1194,119 @@ fn is_generic_open(tokens: Vec<FTok>, idx: i64) -> bool {
 
 // --- Spacing decision -------------------------------------------------
 
+/// Keywords after which an operator can only be a prefix one
+/// (`return -1`, `in &v`, `if !x`, `match *p`).
+fn fmt_prefix_kw(w: str) -> bool {
+    return w == "return" || w == "in" || w == "if" || w == "while" || w == "match" || w == "else" || w == "yield" || w == "break" || w == "assert";
+}
+
+/// Whether `prev`, the significant token right before `idx`, is a prefix
+/// (unary) `&`, `*`, `-`, `~` or `!`: it starts an operand, so the token
+/// before it is not something that ends one. Before it: nothing, an opening
+/// bracket, a separator, an operator, `:`/`->` (a type: `x: &Vec<i64>`),
+/// or a keyword like `return`. After a name, a literal, `)`, `]`, `}` or a
+/// postfix `?` it is binary (`a & b`, `n - 1`, `f(x) * 2`).
+fn fmt_prev_is_prefix_op(prev: str, tokens: Vec<FTok>, idx: i64) -> bool {
+    if prev != "&" && prev != "*" && prev != "-" && prev != "~" && prev != "!" {
+        return false;
+    }
+    var before: FTok = prev_significant_before(tokens, idx);
+    match before {
+        FTok::Eof => {
+            return true;
+        }
+        FTok::Punct(p) => {
+            if p == ")" || p == "]" || p == "}" || p == "?" {
+                return false;
+            }
+            return true;
+        }
+        FTok::Word(w) => {
+            return fmt_prefix_kw(w);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The text of a punctuation token; "" for any other token.
+fn fmt_punct(t: FTok) -> str {
+    match t {
+        FTok::Punct(p) => {
+            return p;
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// Whether `t` starts an item an annotation can stand before: `fn`, `pub`,
+/// `struct`, ... or the `@` of a further annotation.
+fn fmt_item_start(t: FTok) -> bool {
+    match t {
+        FTok::Word(w) => {
+            return w == "fn" || w == "pub" || w == "struct" || w == "enum" || w == "impl" || w == "extern" || w == "trait" || w == "unsafe" || w == "async" || w == "type" || w == "static" || w == "const";
+        }
+        FTok::Punct(p) => {
+            return p == "@";
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// Whether the significant token before `idx` ends an annotation: the name
+/// of `@name`, or the `)` of `@name(...)`.
+fn fmt_ends_annotation(tokens: Vec<FTok>, idx: i64) -> bool {
+    var j: i64 = prev_significant_index(tokens, idx);
+    if j < 0 {
+        return false;
+    }
+    if fmt_punct(tokens.get(j)) == ")" {
+        // back to the matching `(`
+        var depth: i64 = 0;
+        var open: i64 = -1;
+        while j >= 0 && open < 0 {
+            val p: str = fmt_punct(tokens.get(j));
+            if p == ")" {
+                depth = depth + 1;
+            } else if p == "(" {
+                depth = depth - 1;
+                if depth == 0 {
+                    open = j;
+                }
+            }
+            j = j - 1;
+        }
+        if open < 0 {
+            return false;
+        }
+        j = prev_significant_index(tokens, open);
+        if j < 0 {
+            return false;
+        }
+    }
+    var is_name: bool = false;
+    match tokens.get(j) {
+        FTok::Word(_) => {
+            is_name = true;
+        }
+        _ => {
+        }
+    }
+    if !is_name {
+        return false;
+    }
+    val k: i64 = prev_significant_index(tokens, j);
+    if k < 0 {
+        return false;
+    }
+    return fmt_punct(tokens.get(k)) == "@";
+}
+
 /// Decide whether a space is needed between `prev` and `cur`.
 fn need_space(prev: str, cur: FTok, tokens: Vec<FTok>, idx: i64) -> bool {
     if str_len(prev) == 0 {
@@ -1171,6 +1352,10 @@ fn need_space(prev: str, cur: FTok, tokens: Vec<FTok>, idx: i64) -> bool {
         return false;
     }
     if cur_text == "?." {
+        return false;
+    }
+    // postfix `?` (error propagation) sticks to its operand: `f(x)?`
+    if cur_text == "?" {
         return false;
     }
     if cur_text == ".." {
@@ -1235,6 +1420,13 @@ fn need_space(prev: str, cur: FTok, tokens: Vec<FTok>, idx: i64) -> bool {
     }
     if is_arrow(cur_text) {
         return true;
+    }
+
+    // A prefix operator (`&v`, `&mut v`, `*p`, `-1`, `-x`) sticks to what
+    // follows it. Checked before the binary-operator rule, which used to
+    // win and wrote `& v`, `& mut v`, `- 1` (2g.62).
+    if fmt_prev_is_prefix_op(prev, tokens, idx) {
+        return false;
     }
 
     // Binary operators -- spaces around
@@ -1442,6 +1634,63 @@ fn need_space(prev: str, cur: FTok, tokens: Vec<FTok>, idx: i64) -> bool {
     return true;
 }
 
+// --- Comments: own line or trailing (N4) -------------------------------
+
+/// Whether the line comment at `idx` stood on a line of its own in the
+/// source: the tokenizer puts a BlankLines marker (count 0 when there is no
+/// blank line) before such a comment.
+fn fmt_comment_own_line(tokens: Vec<FTok>, idx: i64) -> bool {
+    if idx <= 0 {
+        return true;
+    }
+    match tokens.get(idx - 1) {
+        FTok::BlankLines(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// A comment that never ends a line of code: a doc comment (`///`, `//!`)
+/// documents what follows it, and a section rule (`// ---`, `// ===`,
+/// `// ───`) heads what follows it. A formatter that did not end top-level
+/// lines at `;` joined such comments onto the line before; printed on a
+/// line of their own again, they go back where they were written.
+fn fmt_detached_comment(text: str) -> bool {
+    if str_starts_with(text, "///") || str_starts_with(text, "//!") {
+        return true;
+    }
+    var rest: str = str_trim(str_slice(text, 2, str_len(text)));
+    if str_starts_with(rest, "---") || str_starts_with(rest, "===") {
+        return true;
+    }
+    // box drawing (U+2500..U+257F: E2 94 xx, E2 95 xx)
+    if str_len(rest) >= 3 && str_byte_at(rest, 0) == 226 && (str_byte_at(rest, 1) == 148 || str_byte_at(rest, 1) == 149) {
+        return true;
+    }
+    return false;
+}
+
+/// Whether the token right after `idx` is a line comment written on the
+/// same line as it (a trailing comment that is not detached): the comment
+/// then ends the line, instead of a newline printed before it that would
+/// move it under the code it explains (`var n = 0;  // the count`).
+fn fmt_trailing_comment_next(tokens: Vec<FTok>, idx: i64) -> bool {
+    if idx + 1 >= tokens.len() {
+        return false;
+    }
+    match tokens.get(idx + 1) {
+        FTok::LineComment(t) => {
+            return !fmt_detached_comment(t);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 // --- Printer ----------------------------------------------------------
 
 /// Format Fides source code. Returns the formatted string.
@@ -1458,6 +1707,11 @@ pub fn format_source(src: str) -> str {
     var brace_depth: i64 = 0;
     var paren_depth: i64 = 0;
     var brace_is_def_body: Vec<bool> = Vec::new();
+    // N4: paren_depth when each open `{` was opened; a line that starts
+    // inside more parentheses than that (after a comment of its own line
+    // in an argument list) is indented one more level
+    var brace_paren: Vec<i64> = Vec::new();
+    var cont_line: bool = false;
     var generic_depth: i64 = 0;
 
     var idx: i64 = 0;
@@ -1481,9 +1735,20 @@ pub fn format_source(src: str) -> str {
                 continue;
             }
             FTok::LineComment(text) => {
-                just_closed_top_level = false;
-                // Flush blanks
+                // N4: a comment of its own line (or a detached one: a doc
+                // comment or a section rule) starts a line; a trailing one
+                // stays after the code it follows. A trailing comment after
+                // `}` leaves the blank line before the next item to come.
+                var own_line: bool = fmt_comment_own_line(tokens, idx) || fmt_detached_comment(text);
+                if own_line {
+                    just_closed_top_level = false;
+                }
+                // Flush blanks; an open line is ended first, so that the
+                // blank line itself survives
                 if pending_blanks > 0 {
+                    if !at_line_start {
+                        sb.append_str("\n");
+                    }
                     var b: i64 = 0;
                     while b < pending_blanks {
                         // Trim trailing whitespace
@@ -1493,16 +1758,34 @@ pub fn format_source(src: str) -> str {
                     pending_blanks = 0;
                     at_line_start = true;
                 }
+                if own_line && !at_line_start {
+                    sb.append_str("\n");
+                    at_line_start = true;
+                }
                 if at_line_start {
-                    // Indent
+                    // Indent (one level more inside an argument list)
+                    var open_base: i64 = 0;
+                    if brace_paren.len() > 0 {
+                        open_base = brace_paren.get(brace_paren.len() - 1);
+                    }
+                    cont_line = paren_depth > open_base;
+                    var cols: i64 = indent * 4;
+                    if cont_line {
+                        cols = cols + 4;
+                    }
                     var k: i64 = 0;
-                    while k < indent * 4 {
+                    while k < cols {
                         sb.append_str(" ");
                         k = k + 1;
                     }
                 } else {
                     // Trailing comment -- two spaces before it
                     sb.append_str("  ");
+                    var open_base2: i64 = 0;
+                    if brace_paren.len() > 0 {
+                        open_base2 = brace_paren.get(brace_paren.len() - 1);
+                    }
+                    cont_line = paren_depth > open_base2;
                 }
                 sb.append_str(text);
                 // Newline
@@ -1566,6 +1849,9 @@ pub fn format_source(src: str) -> str {
             // Pop def-body stack
             if brace_is_def_body.len() > 0 {
                 brace_is_def_body.pop();
+            }
+            if brace_paren.len() > 0 {
+                brace_paren.pop();
             }
             // Ensure } is on its own line
             if !at_line_start {
@@ -1634,6 +1920,11 @@ pub fn format_source(src: str) -> str {
             if prev_sig == "," {
                 need_space_before = true;
             }
+            // two words stay two words: `<T, const N: usize>`, `<&mut T>`,
+            // `<dyn Shape>` (they were joined into `constN`, a token change)
+            if is_word_text(prev_sig) && is_word_text(text) {
+                need_space_before = true;
+            }
         }
         if cur_is_generic_open {
             need_space_before = false;
@@ -1679,7 +1970,28 @@ pub fn format_source(src: str) -> str {
             just_closed_top_level = false;
         }
 
-        // Flush blanks
+        // An item after its annotation starts a new line (`@pure` / `fn f`),
+        // as written in the tree: the annotation is not joined to the item.
+        if !at_line_start && paren_depth == 0 && fmt_item_start(tok) && fmt_ends_annotation(tokens, idx) {
+            sb.append_str("\n");
+            at_line_start = true;
+            need_space_before = false;
+        }
+
+        // Flush blanks. When the current line is still open (after `@pure`,
+        // a block comment, mid-expression), the space decided above belonged
+        // to that line: at the top level the line is ended first so the blank
+        // line survives, and the token starts the next line with no space
+        // (it used to print `@pure\n fn`, 2g.62); inside a body the blank
+        // lines are dropped and the token stays on the line.
+        if pending_blanks > 0 && !at_line_start {
+            if brace_depth == 0 && paren_depth == 0 {
+                sb.append_str("\n");
+                need_space_before = false;
+            } else {
+                pending_blanks = 0;
+            }
+        }
         if pending_blanks > 0 {
             var b: i64 = 0;
             while b < pending_blanks {
@@ -1688,17 +2000,24 @@ pub fn format_source(src: str) -> str {
             }
             pending_blanks = 0;
             at_line_start = true;
+            need_space_before = false;
         }
 
-        // Write indentation at line start
+        // Write indentation at line start (one level more for an argument
+        // that follows a comment in its argument list)
         if at_line_start {
+            var cols: i64 = indent * 4;
+            if cont_line {
+                cols = cols + 4;
+            }
             var k: i64 = 0;
-            while k < indent * 4 {
+            while k < cols {
                 sb.append_str(" ");
                 k = k + 1;
             }
             at_line_start = false;
         }
+        cont_line = false;
 
         // Write space before if needed
         if need_space_before {
@@ -1719,11 +2038,15 @@ pub fn format_source(src: str) -> str {
                     brace_depth = brace_depth + 1;
                     var is_def_body: bool = is_def_body_brace_at(tokens, idx);
                     brace_is_def_body.push(is_def_body);
-                    // Opening brace: newline after (unless next is })
+                    brace_paren.push(paren_depth);
+                    // Opening brace: newline after (unless next is }; a
+                    // trailing comment ends the line itself)
                     if !next_significant_is(tokens, idx + 1, "}") {
                         indent = brace_depth;
-                        sb.append_str("\n");
-                        at_line_start = true;
+                        if !fmt_trailing_comment_next(tokens, idx) {
+                            sb.append_str("\n");
+                            at_line_start = true;
+                        }
                     }
                 } else if p == "}" {
                     // Closing brace -- check what follows
@@ -1752,9 +2075,9 @@ pub fn format_source(src: str) -> str {
                             if w == "else" {
                                 stay_on_line = true;
                             }
-                            if w == "while" {
-                                stay_on_line = true;
-                            }
+                            // not `while`: Fid has no do-while, so a `while`
+                            // after `}` is the next statement (it printed
+                            // `} while j < n {`)
                             if w == "catch" {
                                 stay_on_line = true;
                             }
@@ -1766,15 +2089,17 @@ pub fn format_source(src: str) -> str {
                         if brace_depth <= 0 {
                             just_closed_top_level = true;
                         }
-                        sb.append_str("\n");
-                        at_line_start = true;
+                        if !fmt_trailing_comment_next(tokens, idx) {
+                            sb.append_str("\n");
+                            at_line_start = true;
+                        }
                     } else {
                         at_line_start = false;
                     }
                 } else if p == ";" {
-                    // Semicolon: newline after (statement boundary), unless inside
-                    // for-loop header parens (paren_depth > 0).
-                    if brace_depth > 0 && paren_depth == 0 {
+                    // Semicolon: newline after (statement boundary, top level too),
+                    // unless inside for-loop header parens.
+                    if paren_depth == 0 && !fmt_trailing_comment_next(tokens, idx) {
                         sb.append_str("\n");
                         at_line_start = true;
                     }
@@ -1786,7 +2111,7 @@ pub fn format_source(src: str) -> str {
                         in_def_body = brace_is_def_body.get(brace_is_def_body.len() - 1);
                     }
                     if in_def_body && brace_depth > 0 && paren_depth == 0 {
-                        if !next_significant_is(tokens, idx + 1, "}") {
+                        if !next_significant_is(tokens, idx + 1, "}") && !fmt_trailing_comment_next(tokens, idx) {
                             sb.append_str("\n");
                             at_line_start = true;
                         }

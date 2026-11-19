@@ -1,0 +1,353 @@
+// Fides BLAKE3 (the BLAKE3 specification, 2020), pure Fides: the hash,
+// keyed_hash and derive_key modes, each with extendable output.
+//
+// A port of the reference implementation (reference_impl.rs of the
+// BLAKE3 team), hashing a whole message at once: 1024-byte chunks, each a
+// chain of 64-byte block compressions, merged pairwise into a binary tree
+// with a stack of chaining values. 32-bit words are kept in i64 values in
+// 0..2^32-1 and masked after every addition, so no overflow check or shift
+// semantics matter. Messages and outputs are Vec<i64> of bytes 0..255.
+//
+// Checked against the official test vectors (test_vectors.json of the
+// BLAKE3 repository) in tests/bootstrap/test_blake3.fd.
+//
+// Usage:
+//   use blake3;
+//   val d = blake3_bytes(msg);                    // 32-byte hash
+//   val x = blake3_xof(msg, 131);                 // any output length
+//   val m = blake3_keyed(key32, msg);             // MAC, 32-byte key
+//   val k = blake3_derive_key("app 2026 ctx", material);
+
+module blake3;
+ use vec;
+
+const B3_CHUNK_START: i64 = 1;
+const B3_CHUNK_END: i64 = 2;
+const B3_PARENT: i64 = 4;
+const B3_ROOT: i64 = 8;
+const B3_KEYED_HASH: i64 = 16;
+const B3_DERIVE_KEY_CONTEXT: i64 = 32;
+const B3_DERIVE_KEY_MATERIAL: i64 = 64;
+
+/// The IV: SHA-256's initial state.
+fn b3_iv() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0x6a09e667); v.push(0xbb67ae85); v.push(0x3c6ef372); v.push(0xa54ff53a);
+    v.push(0x510e527f); v.push(0x9b05688c); v.push(0x1f83d9ab); v.push(0x5be0cd19);
+    return v;
+}
+
+fn b3_rotr(x: i64, n: i64) -> i64 {
+    return ((x >> n) | (x << (32 - n))) & 0xffffffff;
+}
+
+/// The quarter-round G on state words a, b, c, d with message words x, y.
+fn b3_g(s: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64, x: i64, y: i64) {
+    var va: i64 = s.get(a);
+    var vb: i64 = s.get(b);
+    var vc: i64 = s.get(c);
+    var vd: i64 = s.get(d);
+    va = (va + vb + x) & 0xffffffff;
+    vd = b3_rotr(vd ^ va, 16);
+    vc = (vc + vd) & 0xffffffff;
+    vb = b3_rotr(vb ^ vc, 12);
+    va = (va + vb + y) & 0xffffffff;
+    vd = b3_rotr(vd ^ va, 8);
+    vc = (vc + vd) & 0xffffffff;
+    vb = b3_rotr(vb ^ vc, 7);
+    s.set(a, va);
+    s.set(b, vb);
+    s.set(c, vc);
+    s.set(d, vd);
+}
+
+/// The message word permutation applied between rounds.
+fn b3_perm(i: i64) -> i64 {
+    if i == 0 { return 2; }
+    if i == 1 { return 6; }
+    if i == 2 { return 3; }
+    if i == 3 { return 10; }
+    if i == 4 { return 7; }
+    if i == 5 { return 0; }
+    if i == 6 { return 4; }
+    if i == 7 { return 13; }
+    if i == 8 { return 1; }
+    if i == 9 { return 11; }
+    if i == 10 { return 12; }
+    if i == 11 { return 5; }
+    if i == 12 { return 9; }
+    if i == 13 { return 14; }
+    if i == 14 { return 15; }
+    return 8;
+}
+
+/// The compression function: chaining value cv (8 words), message block
+/// (16 words), 64-bit counter, block length and flags; 16 output words.
+fn b3_compress(cv: & Vec<i64>, block: & Vec<i64>, counter: i64, block_len: i64, flags: i64) -> Vec<i64> {
+    val iv: Vec<i64> = b3_iv();
+    var s: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        s.push(cv.get(i));
+        i = i + 1;
+    }
+    s.push(iv.get(0));
+    s.push(iv.get(1));
+    s.push(iv.get(2));
+    s.push(iv.get(3));
+    s.push(counter & 0xffffffff);
+    s.push((counter >> 32) & 0xffffffff);
+    s.push(block_len);
+    s.push(flags);
+    var m: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 {
+        m.push(block.get(i));
+        i = i + 1;
+    }
+    var r: i64 = 0;
+    while r < 7 {
+        b3_g(& mut s, 0, 4, 8, 12, m.get(0), m.get(1));
+        b3_g(& mut s, 1, 5, 9, 13, m.get(2), m.get(3));
+        b3_g(& mut s, 2, 6, 10, 14, m.get(4), m.get(5));
+        b3_g(& mut s, 3, 7, 11, 15, m.get(6), m.get(7));
+        b3_g(& mut s, 0, 5, 10, 15, m.get(8), m.get(9));
+        b3_g(& mut s, 1, 6, 11, 12, m.get(10), m.get(11));
+        b3_g(& mut s, 2, 7, 8, 13, m.get(12), m.get(13));
+        b3_g(& mut s, 3, 4, 9, 14, m.get(14), m.get(15));
+        if r < 6 {
+            var p: Vec<i64> = Vec::new();
+            i = 0;
+            while i < 16 {
+                p.push(m.get(b3_perm(i)));
+                i = i + 1;
+            }
+            m = p;
+        }
+        r = r + 1;
+    }
+    i = 0;
+    while i < 8 {
+        s.set(i, s.get(i) ^ s.get(i + 8));
+        s.set(i + 8, s.get(i + 8) ^ cv.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn b3_first8(v: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The 16 little-endian words of the block of msg at [start, start+len),
+/// zero-padded to 64 bytes.
+fn b3_block_words(msg: & Vec<i64>, start: i64, len: i64) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        var x: i64 = 0;
+        var j: i64 = 3;
+        while j >= 0 {
+            val p: i64 = i * 4 + j;
+            var b: i64 = 0;
+            if p < len {
+                b = msg.get(start + p) & 255;
+            }
+            x = (x << 8) | b;
+            j = j - 1;
+        }
+        w.push(x);
+        i = i + 1;
+    }
+    return w;
+}
+
+/// The words of a 32-byte key (bytes 0..255), little-endian.
+fn b3_key_words(key: & Vec<i64>) -> Vec<i64> {
+    return b3_block_words(key, 0, 32);
+}
+
+/// The hash of msg under key words `key` and mode flags `flags`, as
+/// `out_len` bytes of extendable output.
+fn b3_hash_with(key: & Vec<i64>, flags: i64, msg: & Vec<i64>, out_len: i64) -> Vec<i64> {
+    val n: i64 = msg.len();
+    var chunks: i64 = (n + 1023) / 1024;
+    if chunks == 0 {
+        chunks = 1;
+    }
+    // The stack of chaining values of finished subtrees, 8 words each.
+    var stack: Vec<i64> = Vec::new();
+    var depth: i64 = 0;
+    // The root's pending output: input cv, block words, counter, length, flags.
+    var out_cv: Vec<i64> = Vec::new();
+    var out_block: Vec<i64> = Vec::new();
+    var out_counter: i64 = 0;
+    var out_len_b: i64 = 0;
+    var out_flags: i64 = 0;
+    var c: i64 = 0;
+    while c < chunks {
+        val cstart: i64 = c * 1024;
+        var clen: i64 = n - cstart;
+        if clen > 1024 {
+            clen = 1024;
+        }
+        var blocks: i64 = (clen + 63) / 64;
+        if blocks == 0 {
+            blocks = 1;
+        }
+        var cv: Vec<i64> = b3_first8(key);
+        var b: i64 = 0;
+        while b < blocks - 1 {
+            var f: i64 = flags;
+            if b == 0 {
+                f = f | B3_CHUNK_START;
+            }
+            val words: Vec<i64> = b3_block_words(msg, cstart + b * 64, 64);
+            val st: Vec<i64> = b3_compress(& cv, & words, c, 64, f);
+            cv = b3_first8(& st);
+            b = b + 1;
+        }
+        val last_len: i64 = clen - (blocks - 1) * 64;
+        val last: Vec<i64> = b3_block_words(msg, cstart + (blocks - 1) * 64, last_len);
+        var lf: i64 = flags | B3_CHUNK_END;
+        if blocks == 1 {
+            lf = lf | B3_CHUNK_START;
+        }
+        if c == chunks - 1 {
+            out_cv = cv;
+            out_block = last;
+            out_counter = c;
+            out_len_b = last_len;
+            out_flags = lf;
+        } else {
+            val st2: Vec<i64> = b3_compress(& cv, & last, c, last_len, lf);
+            var ncv: Vec<i64> = b3_first8(& st2);
+            // Merge completed subtrees: one per trailing zero bit of the
+            // number of chunks done so far.
+            var total: i64 = c + 1;
+            while (total & 1) == 0 {
+                depth = depth - 1;
+                var pb: Vec<i64> = Vec::new();
+                var i: i64 = 0;
+                while i < 8 { pb.push(stack.get(depth * 8 + i)); i = i + 1; }
+                i = 0;
+                while i < 8 { pb.push(ncv.get(i)); i = i + 1; }
+                val pst: Vec<i64> = b3_compress(key, & pb, 0, 64, flags | B3_PARENT);
+                ncv = b3_first8(& pst);
+                total = total >> 1;
+            }
+            var si: i64 = 0;
+            while si < 8 {
+                if depth * 8 + si < stack.len() {
+                    stack.set(depth * 8 + si, ncv.get(si));
+                } else {
+                    stack.push(ncv.get(si));
+                }
+                si = si + 1;
+            }
+            depth = depth + 1;
+        }
+        c = c + 1;
+    }
+    // Fold the remaining subtrees into the root, right to left.
+    var rem: i64 = depth;
+    while rem > 0 {
+        rem = rem - 1;
+        val st3: Vec<i64> = b3_compress(& out_cv, & out_block, out_counter, out_len_b, out_flags);
+        val right: Vec<i64> = b3_first8(& st3);
+        var pb2: Vec<i64> = Vec::new();
+        var i2: i64 = 0;
+        while i2 < 8 { pb2.push(stack.get(rem * 8 + i2)); i2 = i2 + 1; }
+        i2 = 0;
+        while i2 < 8 { pb2.push(right.get(i2)); i2 = i2 + 1; }
+        out_cv = b3_first8(key);
+        out_block = pb2;
+        out_counter = 0;
+        out_len_b = 64;
+        out_flags = flags | B3_PARENT;
+    }
+    // Root output: compress with ROOT at increasing output block counters.
+    var out: Vec<i64> = Vec::new();
+    var oc: i64 = 0;
+    while out.len() < out_len {
+        val rs: Vec<i64> = b3_compress(& out_cv, & out_block, oc, out_len_b, out_flags | B3_ROOT);
+        var wi: i64 = 0;
+        while wi < 16 && out.len() < out_len {
+            val w: i64 = rs.get(wi);
+            var bi: i64 = 0;
+            while bi < 4 && out.len() < out_len {
+                out.push((w >> (bi * 8)) & 255);
+                bi = bi + 1;
+            }
+            wi = wi + 1;
+        }
+        oc = oc + 1;
+    }
+    return out;
+}
+
+/// BLAKE3 of a byte vector (each element 0..255) with `out_len` bytes of
+/// extendable output; the first 32 bytes are the default hash.
+pub fn blake3_xof(msg: Vec<i64>, out_len: i64) -> Vec<i64> {
+    val iv: Vec<i64> = b3_iv();
+    return b3_hash_with(& iv, 0, & msg, out_len);
+}
+
+/// BLAKE3 of a byte vector: the 32-byte hash.
+pub fn blake3_bytes(msg: Vec<i64>) -> Vec<i64> {
+    return blake3_xof(msg, 32);
+}
+
+/// BLAKE3 of the bytes of a string: the 32-byte hash.
+pub fn blake3_str(s: str) -> Vec<i64> {
+    return blake3_bytes(str_bytes(s));
+}
+
+/// keyed_hash mode (a MAC or PRF) with a 32-byte key and `out_len` bytes
+/// of output. Panics if the key is not 32 bytes.
+pub fn blake3_keyed_xof(key: Vec<i64>, msg: Vec<i64>, out_len: i64) -> Vec<i64> {
+    if key.len() != 32 {
+        p_panic("blake3_keyed: the key must be 32 bytes");
+    }
+    val kw: Vec<i64> = b3_key_words(& key);
+    return b3_hash_with(& kw, B3_KEYED_HASH, & msg, out_len);
+}
+
+/// keyed_hash mode: the 32-byte MAC of msg under a 32-byte key.
+pub fn blake3_keyed(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    return blake3_keyed_xof(key, msg, 32);
+}
+
+/// derive_key mode: `out_len` bytes of key derived from key material under
+/// a context string (hard-coded, globally unique, application-specific).
+pub fn blake3_derive_key_xof(context: str, material: Vec<i64>, out_len: i64) -> Vec<i64> {
+    val iv: Vec<i64> = b3_iv();
+    val cb: Vec<i64> = str_bytes(context);
+    val ck: Vec<i64> = b3_hash_with(& iv, B3_DERIVE_KEY_CONTEXT, & cb, 32);
+    val kw: Vec<i64> = b3_key_words(& ck);
+    return b3_hash_with(& kw, B3_DERIVE_KEY_MATERIAL, & material, out_len);
+}
+
+/// derive_key mode: a 32-byte key.
+pub fn blake3_derive_key(context: str, material: Vec<i64>) -> Vec<i64> {
+    return blake3_derive_key_xof(context, material, 32);
+}
+
+/// Lowercase hex of a byte vector.
+pub fn blake3_hex(d: Vec<i64>) -> str {
+    val digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < d.len() {
+        val b: i64 = d.get(i) & 255;
+        out = out + str_slice(digits, b >> 4, (b >> 4) + 1) + str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}

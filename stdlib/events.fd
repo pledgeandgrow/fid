@@ -1,37 +1,170 @@
 // stdlib/events.fd — Event system (Phase 8B: F20)
 //
-// Event handlers are defined with the `on` keyword:
-//   on click(x: i64, y: i64) {
-//       print("clicked at ", x, ", ", y);
+// Two layers:
+//
+//   1. Compile-time handlers. `on name(args) { body }` desugars to
+//      `fn __on_name(args) { body }` — call __on_name(args) directly for
+//      a statically-known event (zero cost).
+//
+//   2. Runtime event bus (this file): subscribe named handlers and emit
+//      events by string name. The bus is a pair of parallel vectors —
+//      event names and the handlers subscribed to each — so a handler is
+//      a real `fn(i64) -> i64` value, callable on every backend.
+//
+// Usage:
+//   use events;
+//
+//   fn on_hit(dmg: i64) -> i64 {
+//       println("hit for " + int_to_str(dmg));
+//       return 0;
 //   }
 //
-// The compiler desugars `on event_name(params) { body }` into
-// `fn __on_event_name(params) { body }`.
-//
-// To dispatch an event, call the handler function directly:
-//   __on_click(10, 20);
-//
-// In a game loop, you would typically dispatch events from the input system:
-//   fn game_loop() {
-//       while true {
-//           // Process input
-//           if input_is_key_pressed("space") {
-//               __on_key("space");
-//           }
-//           // Update systems
-//           // Render
-//       }
+//   fn main() -> i64 {
+//       event_on("hit", on_hit);
+//       event_emit("hit", 15);          // prints "hit for 15"
+//       events_dispatch("hit");         // same, arg 0 (old API)
+//       event_off("hit");               // drop all "hit" subscribers
+//       return 0;
 //   }
+//
+// Handlers take one i64 and return i64 (0 conventionally). To pass more
+// data, pack a pointer or index into the i64.
+//
+module events;
 
-// ─── Event Queue (simple) ─────────────────────────────────────────────
-// A simple event queue for deferred dispatch.
-// In the future, this will support prioritized events and batching.
+// The default bus: parallel vectors of names and handler functions.
+// Global so event_on/event_emit work without plumbing a bus value.
+var EV_NAMES: Vec<str> = Vec::new();
+var EV_HANDLERS: Vec<fn(i64) -> i64> = Vec::new();
 
-// Event queue entry: (event_type, data)
-// For now, events are dispatched immediately by calling __on_<event_type>
+/// Subscribe `f` to `name` on the default bus. Every event_emit(name, x)
+/// calls f(x); handlers run in subscription order. Returns the handler's
+/// index (for event_remove_at).
+///
+/// Example:
+///   fn h(x: i64) -> i64 { return x; }
+///   event_on("e", h);
+///   assert_eq(event_count("e"), 1);
+pub fn event_on(name: str, f: fn(i64) -> i64) -> i64 {
+    EV_NAMES.push(name);
+    EV_HANDLERS.push(f);
+    return EV_HANDLERS.len() - 1;
+}
 
-// Dispatch an event by name (no arguments)
-pub fn events_dispatch(event_name: str) {  // Direct dispatch — calls __on_<event_name>()
-// This is resolved at compile time by the desugar pass
-// For runtime dispatch, use a match on event_name
+/// Remove every subscription for `name`. Returns how many were removed.
+pub fn event_off(name: str) -> i64 {
+    var removed: i64 = 0;
+    var i: i64 = 0;
+    while i < EV_NAMES.len() {
+        if str_equal(EV_NAMES.get(i), name) {
+            EV_NAMES.remove(i);
+            EV_HANDLERS.remove(i);
+            removed = removed + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return removed;
+}
+
+/// Remove the subscription at `idx` (from event_on). Out of range is a
+/// no-op.
+pub fn event_remove_at(idx: i64) -> void {
+    if idx < 0 || idx >= EV_HANDLERS.len() {
+        return;
+    }
+    EV_NAMES.remove(idx);
+    EV_HANDLERS.remove(idx);
+}
+
+/// How many handlers are subscribed to `name`.
+pub fn event_count(name: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < EV_NAMES.len() {
+        if str_equal(EV_NAMES.get(i), name) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Emit `name` with argument `arg`: every subscribed handler is called
+/// in subscription order. Returns the number of handlers called.
+///
+/// Example:
+///   assert_eq(event_emit("nothing", 5), 0);
+pub fn event_emit(name: str, arg: i64) -> i64 {
+    var calls: i64 = 0;
+    var i: i64 = 0;
+    // Iterate by index over a snapshot of the length: a handler that
+    // unsubscribes its own event shifts later entries, but each is still
+    // visited at most once.
+    var n: i64 = EV_NAMES.len();
+    while i < n {
+        if i >= EV_NAMES.len() {
+            return calls;
+        }
+        if str_equal(EV_NAMES.get(i), name) {
+            var f: fn(i64) -> i64 = EV_HANDLERS.get(i);
+            f(arg);
+            calls = calls + 1;
+        }
+        i = i + 1;
+    }
+    return calls;
+}
+
+/// Emit `name` with no argument (arg = 0). The historical
+/// events_dispatch entry point — now dispatches on the default bus.
+/// Compile-time `on` handlers (__on_<name>) are a separate mechanism:
+/// this calls only handlers registered via event_on.
+pub fn events_dispatch(event_name: str) {
+    event_emit(event_name, 0);
+}
+
+/// Remove every subscription on the default bus. Returns how many there
+/// were.
+pub fn event_clear() -> i64 {
+    var n: i64 = EV_HANDLERS.len();
+    EV_NAMES.clear();
+    EV_HANDLERS.clear();
+    return n;
+}
+
+// ─── Queue ────────────────────────────────────────────────────────────
+//
+// Deferred dispatch: events are queued as (name, arg) pairs and flushed
+// later — e.g. at the end of a frame — so handlers do not run inside
+// the code that raised them.
+
+var EVQ_NAMES: Vec<str> = Vec::new();
+var EVQ_ARGS: Vec<i64> = Vec::new();
+
+/// Queue an event for later. `arg` is carried with it.
+pub fn event_queue(name: str, arg: i64) -> void {
+    EVQ_NAMES.push(name);
+    EVQ_ARGS.push(arg);
+}
+
+/// Dispatch every queued event in FIFO order and clear the queue.
+/// Returns the number of queued events processed (not the number of
+/// handler calls).
+pub fn event_flush() -> i64 {
+    var processed: i64 = 0;
+    var i: i64 = 0;
+    while i < EVQ_NAMES.len() {
+        event_emit(EVQ_NAMES.get(i), EVQ_ARGS.get(i));
+        processed = processed + 1;
+        i = i + 1;
+    }
+    EVQ_NAMES.clear();
+    EVQ_ARGS.clear();
+    return processed;
+}
+
+/// Events waiting in the queue.
+pub fn event_queued() -> i64 {
+    return EVQ_NAMES.len();
 }

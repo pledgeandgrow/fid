@@ -1,0 +1,104 @@
+// OP26 / LF3 (compiler/iropt_me.fd: ime_addr kind 5, ime_vb_owners,
+// ime_vb_call_writes, ime_same_elem; `vecalias`, on by default, acts on
+// the loads of the opt-in FID_IROPT_ON=vecdata): an owned Vec's elements
+// cannot be changed through any other name, so after vecdata made the
+// reads of v loads from its data pointer, forwarding reuses the first
+// read of v[i] for the second one across a set of another Vec.
+// - twice: v a parameter, w a local sharing v's buffer until its first
+//   set copies it (vec_own): v[i] read, w.set, v[i] read again. The set is
+//   core's Vec_set on a home slot's header, which writes that buffer
+//   alone. v keeps its elements (printed after).
+// - local_sum: v and w locals made in the function (home slots): the
+//   second read of v[i] after w.set reuses the first.
+// - with_print: a print between the two reads writes no element.
+// tests/tooling/vecalias-check.sh builds it with vecdata on, vecalias on
+// and off: the same output, "iropt: vecalias N element reads reused" with
+// N > 0 only with vecalias on, and fewer instructions after iropt.
+//
+// Expected output:
+// 2 4 6 8 10
+// 1 2 3 4 5
+// 75
+// 110
+// 1
+// 2
+// 3
+// 4
+// 5
+// 55
+
+fn twice(v: Vec<i64>) -> Vec<i64> {
+    var w: Vec<i64> = v;
+    var i: i64 = 0;
+    while i < v.len() {
+        var a: i64 = v.get(i);
+        w.set(i, a + 1);
+        var b: i64 = v.get(i);
+        w.set(i, a + b);
+        i = i + 1;
+    }
+    return w;
+}
+
+fn local_sum(n: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var w: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < n {
+        v.push(k * k);
+        w.push(0);
+        k = k + 1;
+    }
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        var a: i64 = v.get(i);
+        w.set(i, a * 3);
+        var b: i64 = v.get(i);
+        s = s + a + b;
+        i = i + 1;
+    }
+    // w is 3 v: its last element 3 * 25
+    println(w.get(n - 1));
+    return s;
+}
+
+fn with_print(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        var a: i64 = v.get(i);
+        println(a);
+        var b: i64 = v.get(i);
+        s = s + a * b;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn show(v: Vec<i64>) {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    println(out);
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 1;
+    while k <= 5 {
+        v.push(k);
+        k = k + 1;
+    }
+    var w: Vec<i64> = twice(v);
+    show(w);
+    show(v);
+    println(local_sum(6));
+    println(with_print(v));
+}

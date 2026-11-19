@@ -1,0 +1,1210 @@
+// Fides path planning (robotics)
+//
+// Grid planners on a `PlanGrid` (cells free or blocked; 4- or 8-connected,
+// diagonal moves cost sqrt(2) and may not cut a blocked corner):
+//   plan_astar        A* with the Manhattan (4) or octile (8) heuristic,
+//                     ties broken toward larger g (deeper nodes)
+//   DStarLite         D* Lite (Koenig & Likhachev 2002, the optimized
+//                     version): plans from the goal back to the start, so
+//                     when cells change (`dstar_set_blocked`) or the robot
+//                     moves (`dstar_move_start`) only the affected part is
+//                     repaired; `dstar_path` follows the g values greedily
+//   plan_grid_shortcut  drop grid waypoints a straight line can skip
+// Sampling planners in a continuous 2D `PlanWorld` (a box with circle and
+// axis-aligned box obstacles; segments are checked exactly against each
+// obstacle, with a clearance margin):
+//   plan_rrt          RRT with goal bias and a fixed step
+//   plan_rrt_star     RRT*: the cheapest parent within a radius, then
+//                     rewiring of the neighbours through the new node
+//   plan_shortcut     greedy shortcutting (farthest visible waypoint);
+//   plan_shortcut_random  random pair shortcutting with a seeded generator
+// Every random choice comes from `PlanRng` (SplitMix64) seeded by the
+// caller, so a run repeats exactly. Everything here is pure computation;
+// there is no platform seam.
+//
+// Usage:
+//   use math; use planner;
+//   var g = plan_grid_from_rows(rows);           // '#' blocked
+//   val p = plan_astar(&g, 0, 0, 9, 7, true);
+//   var w = plan_world_new(0.0, 0.0, 10.0, 10.0, 0.1);
+//   plan_world_add_circle(&mut w, 5.0, 5.0, 1.5);
+//   val r = plan_rrt_star(&w, vec2(1.0, 1.0), vec2(9.0, 9.0), plan_params(0.5, 0.1, 2000, 0.3, 42));
+
+module planner;
+use math;
+
+// ─── Random numbers ───
+
+/// SplitMix64 state.
+pub struct PlanRng {
+    pub state: i64,
+}
+
+/// A generator seeded with `seed`.
+pub fn plan_rng_new(seed: i64) -> PlanRng {
+    return PlanRng {
+        state: seed
+    };
+}
+
+/// The next 64 random bits.
+@wrapping pub fn plan_rng_next(r: & mut PlanRng) -> i64 {
+    var z: u64 = (r.state as u64) + (0x9E3779B97F4A7C15 as u64);
+    r.state = z as i64;
+    z = (z ^ (z >> 30)) * (0xBF58476D1CE4E5B9 as u64);
+    z = (z ^ (z >> 27)) * (0x94D049BB133111EB as u64);
+    z = z ^ (z >> 31);
+    return z as i64;
+}
+
+/// A uniform float in [0, 1).
+@wrapping pub fn plan_rng_uniform(r: & mut PlanRng) -> f64 {
+    val bits: u64 = (plan_rng_next(r) as u64) >> 11;
+    return ((bits as i64) as f64) * 0.00000000000000011102230246251565;
+}
+
+// ─── Grids ───
+
+/// A grid of free / blocked cells; cell (x, y) has id y * width + x.
+pub struct PlanGrid {
+    pub width: i64,
+    pub height: i64,
+    pub blocked: Vec<bool>,
+}
+
+/// A width x height grid with every cell free.
+pub fn plan_grid_new(width: i64, height: i64) -> PlanGrid {
+    var b: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < width * height {
+        b.push(false);
+        i = i + 1;
+    }
+    return PlanGrid {
+        width: width, height: height, blocked: b
+    };
+}
+
+/// A grid from text rows ('#' blocked, anything else free); row k is y = k.
+pub fn plan_grid_from_rows(rows: & Vec<str>) -> PlanGrid {
+    val h: i64 = rows.len();
+    var w: i64 = 0;
+    var i: i64 = 0;
+    while i < h {
+        if str_len(rows.get(i)) > w {
+            w = str_len(rows.get(i));
+        }
+        i = i + 1;
+    }
+    var g: PlanGrid = plan_grid_new(w, h);
+    var y: i64 = 0;
+    while y < h {
+        val row: str = rows.get(y);
+        var x: i64 = 0;
+        while x < str_len(row) {
+            if str_byte_at(row, x) == 35 {
+                g.blocked.set(y * w + x, true);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return g;
+}
+
+/// True when (x, y) is inside the grid.
+pub fn plan_grid_in(g: & PlanGrid, x: i64, y: i64) -> bool {
+    return x >= 0 && y >= 0 && x < g.width && y < g.height;
+}
+
+/// True when (x, y) is inside and free.
+pub fn plan_grid_free(g: & PlanGrid, x: i64, y: i64) -> bool {
+    return plan_grid_in(g, x, y) && !g.blocked.get(y * g.width + x);
+}
+
+/// Block or free cell (x, y).
+pub fn plan_grid_set(g: & mut PlanGrid, x: i64, y: i64, blocked: bool) {
+    if plan_grid_in(g, x, y) {
+        g.blocked.set(y * g.width + x, blocked);
+    }
+}
+
+/// The cost of the move from cell a to its neighbour b (1 or sqrt 2), or a
+/// negative number when it is not allowed (blocked, or a diagonal past a
+/// blocked corner).
+pub fn plan_grid_step_cost(g: & PlanGrid, ax: i64, ay: i64, bx: i64, by: i64) -> f64 {
+    if !plan_grid_free(g, ax, ay) || !plan_grid_free(g, bx, by) {
+        return - 1.0;
+    }
+    if ax != bx && ay != by {
+        if !plan_grid_free(g, bx, ay) || !plan_grid_free(g, ax, by) {
+            return - 1.0;
+        }
+        return 1.4142135623730951;
+    }
+    return 1.0;
+}
+
+fn plan_dx(k: i64) -> i64 {
+    // E, N, W, S, NE, NW, SW, SE
+    if k == 0 || k == 4 || k == 7 {
+        return 1;
+    }
+    if k == 2 || k == 5 || k == 6 {
+        return - 1;
+    }
+    return 0;
+}
+
+fn plan_dy(k: i64) -> i64 {
+    if k == 1 || k == 4 || k == 5 {
+        return 1;
+    }
+    if k == 3 || k == 6 || k == 7 {
+        return - 1;
+    }
+    return 0;
+}
+
+fn plan_iabs(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x;
+    }
+    return x;
+}
+
+/// The heuristic between cells: Manhattan (4-connected) or octile (8).
+pub fn plan_grid_heuristic(ax: i64, ay: i64, bx: i64, by: i64, diag: bool) -> f64 {
+    val dx: i64 = plan_iabs(ax - bx);
+    val dy: i64 = plan_iabs(ay - by);
+    if !diag {
+        return (dx + dy) as f64;
+    }
+    var mn: i64 = dx;
+    var mx: i64 = dy;
+    if dy < dx {
+        mn = dy;
+        mx = dx;
+    }
+    return (mx - mn) as f64 + 1.4142135623730951 * (mn as f64);
+}
+
+// ─── A binary heap of (k1, k2, node), smallest key first ───
+
+/// A min-heap ordered by (k1, k2).
+pub struct PlanHeap {
+    pub k1: Vec<f64>,
+    pub k2: Vec<f64>,
+    pub node: Vec<i64>,
+}
+
+/// An empty heap.
+pub fn plan_heap_new() -> PlanHeap {
+    return PlanHeap {
+        k1: Vec::new(), k2: Vec::new(), node: Vec::new()
+    };
+}
+
+fn plan_heap_less(h: & PlanHeap, a: i64, b: i64) -> bool {
+    if h.k1.get(a) != h.k1.get(b) {
+        return h.k1.get(a) < h.k1.get(b);
+    }
+    if h.k2.get(a) != h.k2.get(b) {
+        return h.k2.get(a) < h.k2.get(b);
+    }
+    return h.node.get(a) < h.node.get(b);
+}
+
+fn plan_heap_swap(h: & mut PlanHeap, a: i64, b: i64) {
+    val t1: f64 = h.k1.get(a);
+    h.k1.set(a, h.k1.get(b));
+    h.k1.set(b, t1);
+    val t2: f64 = h.k2.get(a);
+    h.k2.set(a, h.k2.get(b));
+    h.k2.set(b, t2);
+    val tn: i64 = h.node.get(a);
+    h.node.set(a, h.node.get(b));
+    h.node.set(b, tn);
+}
+
+/// Add node with key (k1, k2).
+pub fn plan_heap_push(h: & mut PlanHeap, k1: f64, k2: f64, node: i64) {
+    h.k1.push(k1);
+    h.k2.push(k2);
+    h.node.push(node);
+    var i: i64 = h.node.len() - 1;
+    while i > 0 {
+        val p: i64 = (i - 1) / 2;
+        if plan_heap_less(h, i, p) {
+            plan_heap_swap(h, i, p);
+            i = p;
+        } else {
+            break;
+        }
+    }
+}
+
+/// The number of entries.
+pub fn plan_heap_len(h: & PlanHeap) -> i64 {
+    return h.node.len();
+}
+
+/// Remove the smallest entry (the heap must not be empty).
+pub fn plan_heap_pop(h: & mut PlanHeap) {
+    val last: i64 = h.node.len() - 1;
+    plan_heap_swap(h, 0, last);
+    h.k1.pop();
+    h.k2.pop();
+    h.node.pop();
+    val n: i64 = h.node.len();
+    var i: i64 = 0;
+    loop {
+        val l: i64 = 2 * i + 1;
+        val r: i64 = l + 1;
+        var m: i64 = i;
+        if l < n && plan_heap_less(h, l, m) {
+            m = l;
+        }
+        if r < n && plan_heap_less(h, r, m) {
+            m = r;
+        }
+        if m == i {
+            break;
+        }
+        plan_heap_swap(h, i, m);
+        i = m;
+    }
+}
+
+// ─── A* ───
+
+/// A grid path: cell ids from start to goal (empty when none), its cost and
+/// the number of expanded cells.
+pub struct GridPath {
+    pub found: bool,
+    pub cells: Vec<i64>,
+    pub cost: f64,
+    pub expanded: i64,
+}
+
+/// The cheapest path from (sx, sy) to (gx, gy); diag allows the 8 moves.
+pub fn plan_astar(g: & PlanGrid, sx: i64, sy: i64, gx: i64, gy: i64, diag: bool) -> GridPath {
+    val n: i64 = g.width * g.height;
+    var gs: Vec<f64> = Vec::new();
+    var parent: Vec<i64> = Vec::new();
+    var closed: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        gs.push(1.0e300);
+        parent.push(- 1);
+        closed.push(false);
+        i = i + 1;
+    }
+    var empty: Vec<i64> = Vec::new();
+    if !plan_grid_free(g, sx, sy) || !plan_grid_free(g, gx, gy) {
+        return GridPath {
+            found: false, cells: empty, cost: 0.0, expanded: 0
+        };
+    }
+    val start: i64 = sy * g.width + sx;
+    val goal: i64 = gy * g.width + gx;
+    var moves: i64 = 4;
+    if diag {
+        moves = 8;
+    }
+    var open: PlanHeap = plan_heap_new();
+    gs.set(start, 0.0);
+    plan_heap_push(&mut open, plan_grid_heuristic(sx, sy, gx, gy, diag), 0.0, start);
+    var expanded: i64 = 0;
+    while plan_heap_len(&open) > 0 {
+        val u: i64 = open.node.get(0);
+        plan_heap_pop(&mut open);
+        if closed.get(u) {
+            continue;
+        }
+        closed.set(u, true);
+        expanded = expanded + 1;
+        if u == goal {
+            break;
+        }
+        val ux: i64 = u % g.width;
+        val uy: i64 = u / g.width;
+        var k: i64 = 0;
+        while k < moves {
+            val vx: i64 = ux + plan_dx(k);
+            val vy: i64 = uy + plan_dy(k);
+            val c: f64 = plan_grid_step_cost(g, ux, uy, vx, vy);
+            if c > 0.0 {
+                val v: i64 = vy * g.width + vx;
+                val ng: f64 = gs.get(u) + c;
+                if !closed.get(v) && ng < gs.get(v) - 0.000000001 {
+                    gs.set(v, ng);
+                    parent.set(v, u);
+                    // larger g first among equal f: key2 = -g
+                    plan_heap_push(&mut open, ng + plan_grid_heuristic(vx, vy, gx, gy, diag), 0.0 - ng, v);
+                }
+            }
+            k = k + 1;
+        }
+    }
+    if !closed.get(goal) {
+        return GridPath {
+            found: false, cells: empty, cost: 0.0, expanded: expanded
+        };
+    }
+    var rev: Vec<i64> = Vec::new();
+    var c: i64 = goal;
+    while c >= 0 {
+        rev.push(c);
+        c = parent.get(c);
+    }
+    var cells: Vec<i64> = Vec::new();
+    i = rev.len() - 1;
+    while i >= 0 {
+        cells.push(rev.get(i));
+        i = i - 1;
+    }
+    return GridPath {
+        found: true, cells: cells, cost: gs.get(goal), expanded: expanded
+    };
+}
+
+/// The sum of step costs along a cell path (negative if a step is illegal).
+pub fn plan_grid_path_cost(g: & PlanGrid, cells: & Vec<i64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 1;
+    while i < cells.len() {
+        val a: i64 = cells.get(i - 1);
+        val b: i64 = cells.get(i);
+        val c: f64 = plan_grid_step_cost(g, a % g.width, a / g.width, b % g.width, b / g.width);
+        if c < 0.0 || plan_iabs(a % g.width - b % g.width) > 1 || plan_iabs(a / g.width - b / g.width) > 1 {
+            return - 1.0;
+        }
+        s = s + c;
+        i = i + 1;
+    }
+    return s;
+}
+
+/// True when the straight segment between the centres of cells a and b
+/// touches only free cells (a supercover walk: both cells are visited
+/// where the segment passes exactly through a corner).
+pub fn plan_grid_line_free(g: & PlanGrid, ax: i64, ay: i64, bx: i64, by: i64) -> bool {
+    val dx: i64 = plan_iabs(bx - ax);
+    val dy: i64 = plan_iabs(by - ay);
+    var sx: i64 = 1;
+    if bx < ax {
+        sx = - 1;
+    }
+    var sy: i64 = 1;
+    if by < ay {
+        sy = - 1;
+    }
+    var x: i64 = ax;
+    var y: i64 = ay;
+    var ix: i64 = 0;
+    var iy: i64 = 0;
+    if !plan_grid_free(g, x, y) {
+        return false;
+    }
+    while ix < dx || iy < dy {
+        // compare (0.5 + ix) / dx with (0.5 + iy) / dy without division
+        val lhs: i64 = (1 + 2 * ix) * dy;
+        val rhs: i64 = (1 + 2 * iy) * dx;
+        if lhs == rhs {
+            // through a corner: both side cells must be free
+            if !plan_grid_free(g, x + sx, y) || !plan_grid_free(g, x, y + sy) {
+                return false;
+            }
+            x = x + sx;
+            y = y + sy;
+            ix = ix + 1;
+            iy = iy + 1;
+        } else if lhs < rhs {
+            x = x + sx;
+            ix = ix + 1;
+        } else {
+            y = y + sy;
+            iy = iy + 1;
+        }
+        if !plan_grid_free(g, x, y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The waypoints of a cell path after dropping every cell a straight free
+/// line can skip (greedy, from the start).
+pub fn plan_grid_shortcut(g: & PlanGrid, cells: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if cells.len() == 0 {
+        return out;
+    }
+    var i: i64 = 0;
+    out.push(cells.get(0));
+    while i < cells.len() - 1 {
+        var j: i64 = cells.len() - 1;
+        val a: i64 = cells.get(i);
+        while j > i + 1 {
+            val b: i64 = cells.get(j);
+            if plan_grid_line_free(g, a % g.width, a / g.width, b % g.width, b / g.width) {
+                break;
+            }
+            j = j - 1;
+        }
+        out.push(cells.get(j));
+        i = j;
+    }
+    return out;
+}
+
+/// The Euclidean length of a waypoint list of cell ids.
+pub fn plan_grid_polyline_length(g: & PlanGrid, cells: & Vec<i64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 1;
+    while i < cells.len() {
+        val dx: f64 = ((cells.get(i) % g.width) - (cells.get(i - 1) % g.width)) as f64;
+        val dy: f64 = ((cells.get(i) / g.width) - (cells.get(i - 1) / g.width)) as f64;
+        s = s + math_sqrt(dx * dx + dy * dy);
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── D* Lite ───
+
+/// D* Lite state over an 8-connected grid.
+pub struct DStarLite {
+    pub grid: PlanGrid,
+    pub start: i64,
+    pub goal: i64,
+    pub last: i64,
+    pub km: f64,
+    pub g: Vec<f64>,
+    pub rhs: Vec<f64>,
+    // the key each node was queued with (lazy deletion: stale entries are
+    // skipped), and whether it is in the queue
+    pub qk1: Vec<f64>,
+    pub qk2: Vec<f64>,
+    pub inq: Vec<bool>,
+    pub open: PlanHeap,
+    pub expanded: i64,
+}
+
+fn ds_inf() -> f64 {
+    return 1.0e300;
+}
+
+fn ds_h(d: & DStarLite, a: i64, b: i64) -> f64 {
+    val w: i64 = d.grid.width;
+    return plan_grid_heuristic(a % w, a / w, b % w, b / w, true);
+}
+
+fn ds_cost(d: & DStarLite, a: i64, b: i64) -> f64 {
+    val w: i64 = d.grid.width;
+    val c: f64 = plan_grid_step_cost(&d.grid, a % w, a / w, b % w, b / w);
+    if c < 0.0 {
+        return ds_inf();
+    }
+    return c;
+}
+
+fn ds_min(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn ds_key1(d: & DStarLite, s: i64) -> f64 {
+    val m: f64 = ds_min(d.g.get(s), d.rhs.get(s));
+    if m >= ds_inf() {
+        return ds_inf();
+    }
+    return m + ds_h(d, d.start, s) + d.km;
+}
+
+fn ds_key2(d: & DStarLite, s: i64) -> f64 {
+    return ds_min(d.g.get(s), d.rhs.get(s));
+}
+
+fn ds_queue(d: & mut DStarLite, s: i64) {
+    val k1: f64 = ds_key1(d, s);
+    val k2: f64 = ds_key2(d, s);
+    d.qk1.set(s, k1);
+    d.qk2.set(s, k2);
+    d.inq.set(s, true);
+    plan_heap_push(&mut d.open, k1, k2, s);
+}
+
+/// Drop stale heap entries; true when a live entry is on top.
+fn ds_clean_top(d: & mut DStarLite) -> bool {
+    while plan_heap_len(&d.open) > 0 {
+        val s: i64 = d.open.node.get(0);
+        if d.inq.get(s) && d.open.k1.get(0) == d.qk1.get(s) && d.open.k2.get(0) == d.qk2.get(s) {
+            return true;
+        }
+        plan_heap_pop(&mut d.open);
+    }
+    return false;
+}
+
+fn ds_succ_ok(d: & DStarLite, u: i64, k: i64) -> i64 {
+    val w: i64 = d.grid.width;
+    val x: i64 = u % w + plan_dx(k);
+    val y: i64 = u / w + plan_dy(k);
+    if !plan_grid_in(&d.grid, x, y) {
+        return - 1;
+    }
+    return y * w + x;
+}
+
+fn ds_update_vertex(d: & mut DStarLite, u: i64) {
+    if u != d.goal {
+        var best: f64 = ds_inf();
+        var k: i64 = 0;
+        while k < 8 {
+            val v: i64 = ds_succ_ok(d, u, k);
+            if v >= 0 {
+                val c: f64 = ds_cost(d, u, v);
+                if c < ds_inf() && d.g.get(v) < ds_inf() {
+                    best = ds_min(best, c + d.g.get(v));
+                }
+            }
+            k = k + 1;
+        }
+        d.rhs.set(u, best);
+    }
+    d.inq.set(u, false);
+    if d.g.get(u) != d.rhs.get(u) {
+        ds_queue(d, u);
+    }
+}
+
+/// D* Lite from (sx, sy) to (gx, gy) on a copy of the grid (8-connected).
+/// Call dstar_compute before reading the path.
+pub fn dstar_new(grid: & PlanGrid, sx: i64, sy: i64, gx: i64, gy: i64) -> DStarLite {
+    val n: i64 = grid.width * grid.height;
+    var gcopy: PlanGrid = plan_grid_new(grid.width, grid.height);
+    var g: Vec<f64> = Vec::new();
+    var rhs: Vec<f64> = Vec::new();
+    var qk1: Vec<f64> = Vec::new();
+    var qk2: Vec<f64> = Vec::new();
+    var inq: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        gcopy.blocked.set(i, grid.blocked.get(i));
+        g.push(ds_inf());
+        rhs.push(ds_inf());
+        qk1.push(0.0);
+        qk2.push(0.0);
+        inq.push(false);
+        i = i + 1;
+    }
+    val start: i64 = sy * grid.width + sx;
+    val goal: i64 = gy * grid.width + gx;
+    var d = DStarLite {
+        grid: gcopy, start: start, goal: goal, last: start, km: 0.0, g: g, rhs: rhs, qk1: qk1, qk2: qk2, inq: inq, open: plan_heap_new(), expanded: 0
+    };
+    d.rhs.set(goal, 0.0);
+    ds_queue(&mut d, goal);
+    return d;
+}
+
+fn ds_key_less(a1: f64, a2: f64, b1: f64, b2: f64) -> bool {
+    if a1 != b1 {
+        return a1 < b1;
+    }
+    return a2 < b2;
+}
+
+/// Bring g up to date for the current start (ComputeShortestPath).
+pub fn dstar_compute(d: & mut DStarLite) {
+    loop {
+        val live: bool = ds_clean_top(d);
+        val sk1: f64 = ds_key1(d, d.start);
+        val sk2: f64 = ds_key2(d, d.start);
+        if !live {
+            break;
+        }
+        val tk1: f64 = d.open.k1.get(0);
+        val tk2: f64 = d.open.k2.get(0);
+        if !ds_key_less(tk1, tk2, sk1, sk2) && d.rhs.get(d.start) == d.g.get(d.start) {
+            break;
+        }
+        val u: i64 = d.open.node.get(0);
+        d.expanded = d.expanded + 1;
+        val n1: f64 = ds_key1(d, u);
+        val n2: f64 = ds_key2(d, u);
+        if ds_key_less(tk1, tk2, n1, n2) {
+            // the key went up (km changed): requeue
+            plan_heap_pop(&mut d.open);
+            ds_queue(d, u);
+        } else if d.g.get(u) > d.rhs.get(u) {
+            d.g.set(u, d.rhs.get(u));
+            plan_heap_pop(&mut d.open);
+            d.inq.set(u, false);
+            var k: i64 = 0;
+            while k < 8 {
+                val p: i64 = ds_succ_ok(d, u, k);
+                if p >= 0 {
+                    ds_update_vertex(d, p);
+                }
+                k = k + 1;
+            }
+        } else {
+            d.g.set(u, ds_inf());
+            ds_update_vertex(d, u);
+            var k: i64 = 0;
+            while k < 8 {
+                val p: i64 = ds_succ_ok(d, u, k);
+                if p >= 0 {
+                    ds_update_vertex(d, p);
+                }
+                k = k + 1;
+            }
+        }
+    }
+}
+
+/// The cost of the current best path from the start (>= 1e300: none).
+pub fn dstar_cost(d: & DStarLite) -> f64 {
+    return d.g.get(d.start);
+}
+
+/// The path from the current start to the goal following the cheapest
+/// successor (empty when there is none).
+pub fn dstar_path(d: & DStarLite) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if d.g.get(d.start) >= ds_inf() {
+        return out;
+    }
+    var u: i64 = d.start;
+    out.push(u);
+    var guard: i64 = 0;
+    while u != d.goal && guard < d.g.len() {
+        var best: i64 = - 1;
+        var bc: f64 = ds_inf();
+        var k: i64 = 0;
+        while k < 8 {
+            val v: i64 = ds_succ_ok(d, u, k);
+            if v >= 0 {
+                val c: f64 = ds_cost(d, u, v);
+                if c < ds_inf() && d.g.get(v) < ds_inf() && c + d.g.get(v) < bc {
+                    bc = c + d.g.get(v);
+                    best = v;
+                }
+            }
+            k = k + 1;
+        }
+        if best < 0 {
+            var none: Vec<i64> = Vec::new();
+            return none;
+        }
+        u = best;
+        out.push(u);
+        guard = guard + 1;
+    }
+    return out;
+}
+
+/// The robot is now at (x, y): the start moves and km grows by the
+/// heuristic distance moved. Call dstar_compute afterwards.
+pub fn dstar_move_start(d: & mut DStarLite, x: i64, y: i64) {
+    val ns: i64 = y * d.grid.width + x;
+    d.km = d.km + ds_h(d, d.last, ns);
+    d.last = ns;
+    d.start = ns;
+}
+
+/// Cell (x, y) became blocked (or free): every vertex whose edges changed
+/// (the cell and its 8 neighbours) is updated. Call dstar_compute afterwards.
+pub fn dstar_set_blocked(d: & mut DStarLite, x: i64, y: i64, blocked: bool) {
+    if !plan_grid_in(&d.grid, x, y) {
+        return;
+    }
+    val w: i64 = d.grid.width;
+    if d.grid.blocked.get(y * w + x) == blocked {
+        return;
+    }
+    // km and last are brought up to the current start by dstar_move_start
+    d.grid.blocked.set(y * w + x, blocked);
+    val c: i64 = y * w + x;
+    ds_update_vertex(d, c);
+    var k: i64 = 0;
+    while k < 8 {
+        val v: i64 = ds_succ_ok(d, c, k);
+        if v >= 0 {
+            ds_update_vertex(d, v);
+        }
+        k = k + 1;
+    }
+}
+
+// ─── Continuous worlds ───
+
+/// A rectangle [xmin, xmax] x [ymin, ymax] with circle and box obstacles;
+/// `margin` is the clearance every point must keep from them.
+pub struct PlanWorld {
+    pub xmin: f64,
+    pub ymin: f64,
+    pub xmax: f64,
+    pub ymax: f64,
+    pub margin: f64,
+    pub cx: Vec<f64>,
+    pub cy: Vec<f64>,
+    pub cr: Vec<f64>,
+    pub bx0: Vec<f64>,
+    pub by0: Vec<f64>,
+    pub bx1: Vec<f64>,
+    pub by1: Vec<f64>,
+}
+
+/// An empty world.
+pub fn plan_world_new(xmin: f64, ymin: f64, xmax: f64, ymax: f64, margin: f64) -> PlanWorld {
+    return PlanWorld {
+        xmin: xmin, ymin: ymin, xmax: xmax, ymax: ymax, margin: margin, cx: Vec::new(), cy: Vec::new(), cr: Vec::new(), bx0: Vec::new(), by0: Vec::new(), bx1: Vec::new(), by1: Vec::new()
+    };
+}
+
+/// Add a disc obstacle.
+pub fn plan_world_add_circle(w: & mut PlanWorld, x: f64, y: f64, r: f64) {
+    w.cx.push(x);
+    w.cy.push(y);
+    w.cr.push(r);
+}
+
+/// Add an axis-aligned box obstacle [x0, x1] x [y0, y1].
+pub fn plan_world_add_box(w: & mut PlanWorld, x0: f64, y0: f64, x1: f64, y1: f64) {
+    w.bx0.push(plan_minf(x0, x1));
+    w.by0.push(plan_minf(y0, y1));
+    w.bx1.push(plan_maxf(x0, x1));
+    w.by1.push(plan_maxf(y0, y1));
+}
+
+fn plan_minf(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn plan_maxf(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+/// The distance from p to the segment ab.
+fn plan_seg_point_dist(p: vec2, a: vec2, b: vec2) -> f64 {
+    val ab: vec2 = b.sub(a);
+    val l2: f64 = ab.dot(ab);
+    var t: f64 = 0.0;
+    if l2 > 0.0 {
+        t = plan_minf(1.0, plan_maxf(0.0, p.sub(a).dot(ab) / l2));
+    }
+    return p.sub(a.add(ab.scale(t))).length();
+}
+
+/// The distance between two segments ab and cd (0 when they cross).
+fn plan_seg_seg_dist(a: vec2, b: vec2, c: vec2, d: vec2) -> f64 {
+    val d1: f64 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    val d2: f64 = (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
+    val d3: f64 = (d.x - c.x) * (a.y - c.y) - (d.y - c.y) * (a.x - c.x);
+    val d4: f64 = (d.x - c.x) * (b.y - c.y) - (d.y - c.y) * (b.x - c.x);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0)) {
+        return 0.0;
+    }
+    return plan_minf(plan_minf(plan_seg_point_dist(a, c, d), plan_seg_point_dist(b, c, d)), plan_minf(plan_seg_point_dist(c, a, b), plan_seg_point_dist(d, a, b)));
+}
+
+/// True when the segment ab stays inside the world and at least `margin`
+/// away from every obstacle.
+pub fn plan_world_segment_free(w: & PlanWorld, a: vec2, b: vec2) -> bool {
+    if a.x < w.xmin || a.x > w.xmax || a.y < w.ymin || a.y > w.ymax || b.x < w.xmin || b.x > w.xmax || b.y < w.ymin || b.y > w.ymax {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < w.cx.len() {
+        if plan_seg_point_dist(vec2(w.cx.get(i), w.cy.get(i)), a, b) < w.cr.get(i) + w.margin {
+            return false;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < w.bx0.len() {
+        val x0: f64 = w.bx0.get(i);
+        val y0: f64 = w.by0.get(i);
+        val x1: f64 = w.bx1.get(i);
+        val y1: f64 = w.by1.get(i);
+        // inside (an end point in the box), or near one of its edges
+        if a.x >= x0 && a.x <= x1 && a.y >= y0 && a.y <= y1 {
+            return false;
+        }
+        if b.x >= x0 && b.x <= x1 && b.y >= y0 && b.y <= y1 {
+            return false;
+        }
+        val p00: vec2 = vec2(x0, y0);
+        val p10: vec2 = vec2(x1, y0);
+        val p11: vec2 = vec2(x1, y1);
+        val p01: vec2 = vec2(x0, y1);
+        var dmin: f64 = plan_seg_seg_dist(a, b, p00, p10);
+        dmin = plan_minf(dmin, plan_seg_seg_dist(a, b, p10, p11));
+        dmin = plan_minf(dmin, plan_seg_seg_dist(a, b, p11, p01));
+        dmin = plan_minf(dmin, plan_seg_seg_dist(a, b, p01, p00));
+        if dmin < w.margin || (w.margin == 0.0 && dmin == 0.0) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// True when point p is free.
+pub fn plan_world_point_free(w: & PlanWorld, p: vec2) -> bool {
+    return plan_world_segment_free(w, p, p);
+}
+
+/// True when every segment of the path is free.
+pub fn plan_path_free(w: & PlanWorld, path: & Vec<vec2>) -> bool {
+    var i: i64 = 1;
+    while i < path.len() {
+        if !plan_world_segment_free(w, path.get(i - 1), path.get(i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return path.len() > 0 && plan_world_point_free(w, path.get(0));
+}
+
+/// The length of a polyline.
+pub fn plan_path_length(path: & Vec<vec2>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 1;
+    while i < path.len() {
+        s = s + path.get(i).sub(path.get(i - 1)).length();
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── RRT and RRT* ───
+
+/// Settings of the sampling planners.
+pub struct PlanParams {
+    // the longest edge added per iteration
+    pub step: f64,
+    // the chance of sampling the goal itself
+    pub goal_bias: f64,
+    pub max_iter: i64,
+    // a node this close to the goal (with a free segment) reaches it
+    pub goal_tol: f64,
+    pub seed: i64,
+    // RRT*: neighbours within this radius are considered (0: 2 * step)
+    pub radius: f64,
+}
+
+/// Settings with radius 2 * step.
+pub fn plan_params(step: f64, goal_bias: f64, max_iter: i64, goal_tol: f64, seed: i64) -> PlanParams {
+    return PlanParams {
+        step: step, goal_bias: goal_bias, max_iter: max_iter, goal_tol: goal_tol, seed: seed, radius: 0.0
+    };
+}
+
+/// A sampling planner's result.
+pub struct PlanResult {
+    pub found: bool,
+    pub path: Vec<vec2>,
+    pub cost: f64,
+    pub nodes: i64,
+    pub iterations: i64,
+}
+
+/// The tree of a sampling planner.
+struct PlanTree {
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    parent: Vec<i64>,
+    cost: Vec<f64>,
+    children: Vec<Vec<i64>>,
+}
+
+fn plan_tree_pt(t: & PlanTree, i: i64) -> vec2 {
+    return vec2(t.xs.get(i), t.ys.get(i));
+}
+
+fn plan_tree_nearest(t: & PlanTree, p: vec2) -> i64 {
+    var best: i64 = 0;
+    var bd: f64 = 1.0e300;
+    var i: i64 = 0;
+    while i < t.xs.len() {
+        val dx: f64 = t.xs.get(i) - p.x;
+        val dy: f64 = t.ys.get(i) - p.y;
+        val d: f64 = dx * dx + dy * dy;
+        if d < bd {
+            bd = d;
+            best = i;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn plan_tree_path(t: & PlanTree, last: i64, goal: vec2) -> Vec<vec2> {
+    var rev: Vec<vec2> = Vec::new();
+    rev.push(goal);
+    var c: i64 = last;
+    while c >= 0 {
+        rev.push(plan_tree_pt(t, c));
+        c = t.parent.get(c);
+    }
+    var out: Vec<vec2> = Vec::new();
+    var i: i64 = rev.len() - 1;
+    while i >= 0 {
+        out.push(rev.get(i));
+        i = i - 1;
+    }
+    return out;
+}
+
+/// Grow the tree (RRT, or RRT* when `star`); the shared loop.
+fn plan_grow(w: & PlanWorld, start: vec2, goal: vec2, p: PlanParams, star: bool) -> PlanResult {
+    var empty: Vec<vec2> = Vec::new();
+    if !plan_world_point_free(w, start) || !plan_world_point_free(w, goal) {
+        return PlanResult {
+            found: false, path: empty, cost: 0.0, nodes: 0, iterations: 0
+        };
+    }
+    var rng: PlanRng = plan_rng_new(p.seed);
+    var t = PlanTree {
+        xs: Vec::new(), ys: Vec::new(), parent: Vec::new(), cost: Vec::new(), children: Vec::new()
+    };
+    t.xs.push(start.x);
+    t.ys.push(start.y);
+    t.parent.push(- 1);
+    t.cost.push(0.0);
+    t.children.push(Vec::new());
+    var radius: f64 = p.radius;
+    if radius <= 0.0 {
+        radius = 2.0 * p.step;
+    }
+    // the best node connected to the goal so far
+    var best: i64 = - 1;
+    var best_cost: f64 = 1.0e300;
+    var it: i64 = 0;
+    while it < p.max_iter {
+        it = it + 1;
+        var q: vec2 = goal;
+        if plan_rng_uniform(&mut rng) >= p.goal_bias {
+            q = vec2(w.xmin + plan_rng_uniform(&mut rng) * (w.xmax - w.xmin), w.ymin + plan_rng_uniform(&mut rng) * (w.ymax - w.ymin));
+        }
+        val ni: i64 = plan_tree_nearest(&t, q);
+        val np: vec2 = plan_tree_pt(&t, ni);
+        val d: vec2 = q.sub(np);
+        val dl: f64 = d.length();
+        if dl < 0.000000001 {
+            continue;
+        }
+        var nq: vec2 = q;
+        if dl > p.step {
+            nq = np.add(d.scale(p.step / dl));
+        }
+        if !plan_world_segment_free(w, np, nq) {
+            continue;
+        }
+        var parent: i64 = ni;
+        var pcost: f64 = t.cost.get(ni) + nq.sub(np).length();
+        var near: Vec<i64> = Vec::new();
+        if star {
+            var i: i64 = 0;
+            while i < t.xs.len() {
+                val pi: vec2 = plan_tree_pt(&t, i);
+                if pi.sub(nq).length() <= radius {
+                    near.push(i);
+                    val c: f64 = t.cost.get(i) + pi.sub(nq).length();
+                    if c < pcost - 0.000000001 && plan_world_segment_free(w, pi, nq) {
+                        parent = i;
+                        pcost = c;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        val id: i64 = t.xs.len();
+        t.xs.push(nq.x);
+        t.ys.push(nq.y);
+        t.parent.push(parent);
+        t.cost.push(pcost);
+        t.children.push(Vec::new());
+        var pc: Vec<i64> = t.children.get(parent);
+        pc.push(id);
+        t.children.set(parent, pc);
+        if star {
+            // rewire: a neighbour reached more cheaply through the new node
+            var k: i64 = 0;
+            while k < near.len() {
+                val j: i64 = near.get(k);
+                if j != parent {
+                    val pj: vec2 = plan_tree_pt(&t, j);
+                    val c: f64 = pcost + pj.sub(nq).length();
+                    if c < t.cost.get(j) - 0.000000001 && plan_world_segment_free(w, nq, pj) {
+                        val delta: f64 = t.cost.get(j) - c;
+                        // move j from its old parent's children to id's
+                        val old: i64 = t.parent.get(j);
+                        var oc: Vec<i64> = t.children.get(old);
+                        var r: i64 = 0;
+                        while r < oc.len() {
+                            if oc.get(r) == j {
+                                oc.remove(r);
+                                break;
+                            }
+                            r = r + 1;
+                        }
+                        t.children.set(old, oc);
+                        var nc: Vec<i64> = t.children.get(id);
+                        nc.push(j);
+                        t.children.set(id, nc);
+                        t.parent.set(j, id);
+                        // lower the costs of j's subtree by the same amount
+                        var stack: Vec<i64> = Vec::new();
+                        stack.push(j);
+                        while stack.len() > 0 {
+                            val m: i64 = stack.pop();
+                            t.cost.set(m, t.cost.get(m) - delta);
+                            val ch: Vec<i64> = t.children.get(m);
+                            var q2: i64 = 0;
+                            while q2 < ch.len() {
+                                stack.push(ch.get(q2));
+                                q2 = q2 + 1;
+                            }
+                        }
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        // goal check (and, for RRT*, the best goal connection so far)
+        val gd: f64 = goal.sub(nq).length();
+        if gd <= p.goal_tol && plan_world_segment_free(w, nq, goal) {
+            if !star {
+                val path: Vec<vec2> = plan_tree_path(&t, id, goal);
+                return PlanResult {
+                    found: true, path: path, cost: plan_path_length(&path), nodes: t.xs.len(), iterations: it
+                };
+            }
+        }
+    }
+    if star {
+        // the cheapest node that reaches the goal
+        var i: i64 = 0;
+        while i < t.xs.len() {
+            val pi: vec2 = plan_tree_pt(&t, i);
+            val gd: f64 = goal.sub(pi).length();
+            if gd <= p.goal_tol && plan_world_segment_free(w, pi, goal) {
+                val c: f64 = t.cost.get(i) + gd;
+                if c < best_cost {
+                    best_cost = c;
+                    best = i;
+                }
+            }
+            i = i + 1;
+        }
+        if best >= 0 {
+            val path: Vec<vec2> = plan_tree_path(&t, best, goal);
+            return PlanResult {
+                found: true, path: path, cost: plan_path_length(&path), nodes: t.xs.len(), iterations: it
+            };
+        }
+    }
+    return PlanResult {
+        found: false, path: empty, cost: 0.0, nodes: t.xs.len(), iterations: it
+    };
+}
+
+/// RRT from start to goal: stops at the first connection to the goal.
+pub fn plan_rrt(w: & PlanWorld, start: vec2, goal: vec2, p: PlanParams) -> PlanResult {
+    return plan_grow(w, start, goal, p, false);
+}
+
+/// RRT*: runs all max_iter iterations, choosing parents and rewiring within
+/// the radius, and returns the cheapest path to the goal found.
+pub fn plan_rrt_star(w: & PlanWorld, start: vec2, goal: vec2, p: PlanParams) -> PlanResult {
+    return plan_grow(w, start, goal, p, true);
+}
+
+// ─── Shortcutting ───
+
+/// Greedy shortcutting: from each waypoint jump to the farthest later one
+/// a free segment reaches.
+pub fn plan_shortcut(w: & PlanWorld, path: & Vec<vec2>) -> Vec<vec2> {
+    var out: Vec<vec2> = Vec::new();
+    if path.len() == 0 {
+        return out;
+    }
+    out.push(path.get(0));
+    var i: i64 = 0;
+    while i < path.len() - 1 {
+        var j: i64 = path.len() - 1;
+        while j > i + 1 {
+            if plan_world_segment_free(w, path.get(i), path.get(j)) {
+                break;
+            }
+            j = j - 1;
+        }
+        out.push(path.get(j));
+        i = j;
+    }
+    return out;
+}
+
+/// Random shortcutting: `iters` times pick two points on the path (on any
+/// segments) and splice in the straight segment between them when it is
+/// free.
+pub fn plan_shortcut_random(w: & PlanWorld, path: & Vec<vec2>, iters: i64, seed: i64) -> Vec<vec2> {
+    var p: Vec<vec2> = Vec::new();
+    var i: i64 = 0;
+    while i < path.len() {
+        p.push(path.get(i));
+        i = i + 1;
+    }
+    var rng: PlanRng = plan_rng_new(seed);
+    var k: i64 = 0;
+    while k < iters && p.len() > 2 {
+        val nseg: i64 = p.len() - 1;
+        var a: i64 = (plan_rng_uniform(&mut rng) * (nseg as f64)) as i64;
+        var b: i64 = (plan_rng_uniform(&mut rng) * (nseg as f64)) as i64;
+        if a > b {
+            val t: i64 = a;
+            a = b;
+            b = t;
+        }
+        if a != b {
+            val ta: f64 = plan_rng_uniform(&mut rng);
+            val tb: f64 = plan_rng_uniform(&mut rng);
+            val pa: vec2 = p.get(a).lerp(p.get(a + 1), ta);
+            val pb: vec2 = p.get(b).lerp(p.get(b + 1), tb);
+            if plan_world_segment_free(w, pa, pb) {
+                var np: Vec<vec2> = Vec::new();
+                var j: i64 = 0;
+                while j <= a {
+                    np.push(p.get(j));
+                    j = j + 1;
+                }
+                np.push(pa);
+                np.push(pb);
+                j = b + 1;
+                while j < p.len() {
+                    np.push(p.get(j));
+                    j = j + 1;
+                }
+                if plan_path_length(&np) < plan_path_length(&p) {
+                    p = np;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return p;
+}

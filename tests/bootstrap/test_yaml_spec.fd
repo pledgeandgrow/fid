@@ -2,8 +2,11 @@
 // examples of chapter 2 ("Language Overview", 2.1 to 2.28), each read with
 // yaml_load (or yaml_load_all for the streams) and its entries compared
 // with what the specification says the example means. Examples 2.11 and
-// 2.25 use explicit "? " keys, which stdlib/yaml does not support: they
-// must be rejected. Then the parts the examples leave out: block scalar
+// 2.25 use explicit "? " keys: a key that is a sequence becomes the path
+// segment "[a, b]" (stdlib/yaml writes a complex key in flow style), a
+// key with no ": " line has a null value. Merge keys ("<<", the example of
+// https://yaml.org/type/merge.html) copy the merged mappings' keys. Then
+// the parts the examples leave out: block scalar
 // chomping and indentation indicators, every double-quoted escape, folding
 // of quoted scalars, flow collections over lines, and documents yaml_load
 // rejects. Entries print as path=kind:value, ';' between them, a line
@@ -108,7 +111,8 @@ fn chapter2_collections() {
        "hr=list:; hr.0=str:Mark McGwire; hr.1=str:Sammy Sosa; rbi=list:; rbi.0=str:Sammy Sosa; rbi.1=str:Ken Griffey");
     ex("2.10 node appears twice (anchor, alias)", "---\nhr:\n- Mark McGwire\n# Following node labeled SS\n- &SS Sammy Sosa\nrbi:\n- *SS # Subsequent occurrence\n- Ken Griffey\n",
        "hr=list:; hr.0=str:Mark McGwire; hr.1=str:Sammy Sosa; rbi=list:; rbi.0=str:Sammy Sosa; rbi.1=str:Ken Griffey");
-    bad("2.11 mapping between sequences (? keys)", "? - Detroit Tigers\n  - Chicago cubs\n: - 2001-07-23\n\n? [ New York Yankees,\n    Atlanta Braves ]\n: [ 2001-07-02, 2001-08-12,\n    2001-08-14 ]\n");
+    ex("2.11 mapping between sequences (? keys)", "? - Detroit Tigers\n  - Chicago cubs\n: - 2001-07-23\n\n? [ New York Yankees,\n    Atlanta Braves ]\n: [ 2001-07-02, 2001-08-12,\n    2001-08-14 ]\n",
+       "[Detroit Tigers, Chicago cubs]=list:; [Detroit Tigers, Chicago cubs].0=str:2001-07-23; [New York Yankees, Atlanta Braves]=list:; [New York Yankees, Atlanta Braves].0=str:2001-07-02; [New York Yankees, Atlanta Braves].1=str:2001-08-12; [New York Yankees, Atlanta Braves].2=str:2001-08-14");
     ex("2.12 compact nested mapping", "---\n# Products purchased\n- item    : Super Hoop\n  quantity: 1\n- item    : Basketball\n  quantity: 4\n- item    : Big Shoes\n  quantity: 1\n",
        "0=map:; 0.item=str:Super Hoop; 0.quantity=int:1; 1=map:; 1.item=str:Basketball; 1.quantity=int:4; 2=map:; 2.item=str:Big Shoes; 2.quantity=int:1");
 }
@@ -140,7 +144,8 @@ fn chapter2_scalars() {
        "not-date=str:2002-04-28; picture=str:R0lGODlhDAAMAIQAAP//9/X\\n17unp5WZmZgAAAOfn515eXv\\nPz7Y6OjuDg4J+fn5OTk6enp\\n56enmleECcgggoBADs=\\n; application specific tag=str:The semantics of the tag\\nabove may be different for\\ndifferent documents.\\n");
     ex("2.24 global tags", "%TAG ! tag:clarkevans.com,2002:\n--- !shape\n  # Use the ! handle for presenting\n  # tag:clarkevans.com,2002:circle\n- !circle\n  center: &ORIGIN \x7bx: 73, y: 129\x7d\n  radius: 7\n- !line\n  start: *ORIGIN\n  finish: \x7b x: 89, y: 102 \x7d\n- !label\n  start: *ORIGIN\n  color: 0xFFEEBB\n  text: Pretty vector drawing.\n",
        "0=map:; 0.center=map:; 0.center.x=int:73; 0.center.y=int:129; 0.radius=int:7; 1=map:; 1.start=map:; 1.start.x=int:73; 1.start.y=int:129; 1.finish=map:; 1.finish.x=int:89; 1.finish.y=int:102; 2=map:; 2.start=map:; 2.start.x=int:73; 2.start.y=int:129; 2.color=int:0xFFEEBB; 2.text=str:Pretty vector drawing.");
-    bad("2.25 unordered sets (? keys)", "# Sets are represented as a\n# Mapping where each key is\n# associated with a null value\n--- !!set\n? Mark McGwire\n? Sammy Sosa\n? Ken Griffey\n");
+    ex("2.25 unordered sets (? keys)", "# Sets are represented as a\n# Mapping where each key is\n# associated with a null value\n--- !!set\n? Mark McGwire\n? Sammy Sosa\n? Ken Griffey\n",
+       "Mark McGwire=null:; Sammy Sosa=null:; Ken Griffey=null:");
     ex("2.26 ordered mappings", "# Ordered maps are represented as\n# A sequence of mappings, with\n# each mapping having one key\n--- !!omap\n- Mark McGwire: 65\n- Sammy Sosa: 63\n- Ken Griffy: 58\n",
        "0=map:; 0.Mark McGwire=int:65; 1=map:; 1.Sammy Sosa=int:63; 2=map:; 2.Ken Griffy=int:58");
 }
@@ -175,6 +180,30 @@ fn beyond_chapter2() {
        "a=list:; a.0=int:1; a.1=list:; a.1.0=int:2; a.1.1=int:3; a.2=map:; a.2.k=str:v; a.2.n=null:; a.3=str:q; a.4=str:d; b=map:; b.url=str:http://x.org:80/p; b.list=list:; b.list.0=str:x; b.list.1=str:y");
     ex("flow over lines", "a: [\n  one,   # first\n  two\n]\n",
        "a=list:; a.0=str:one; a.1=str:two");
+    println("-- Explicit (complex) keys");
+    ex("explicit scalar key is the implicit one", "? a\n: 1\nb: 2\n",
+       "a=int:1; b=int:2");
+    ex("mapping as a key", "? x: 1\n  y: 2\n: v\n",
+       "\x7bx: 1, y: 2\x7d=str:v");
+    ex("value on the next lines", "? k\n:\n  - 1\n  - 2\n",
+       "k=list:; k.0=int:1; k.1=int:2");
+    ex("strings quoted inside a key", "? [a, 'b, c', '1', ~]\n: x\n",
+       "[a, \"b, c\", \"1\", null]=str:x");
+    ex("explicit key in a sequence item", "- ? a\n  : 1\n- b\n",
+       "0=map:; 0.a=int:1; 1=str:b");
+    bad("duplicate explicit key", "a: 1\n? a\n: 2\n");
+    bad("value without a key", ": 1\n");
+    println("-- Merge keys");
+    ex("yaml.org merge example", "---\n- &CENTER \x7b x: 1, y: 2 \x7d\n- &LEFT \x7b x: 0, y: 2 \x7d\n- &BIG \x7b r: 10 \x7d\n- &SMALL \x7b r: 1 \x7d\n\n# All the following maps are equal:\n\n- # Explicit keys\n  x: 1\n  y: 2\n  r: 10\n  label: center/big\n\n- # Merge one map\n  << : *CENTER\n  r: 10\n  label: center/big\n\n- # Merge multiple maps\n  << : [ *CENTER, *BIG ]\n  label: center/big\n\n- # Override\n  << : [ *BIG, *LEFT, *SMALL ]\n  x: 1\n  label: center/big\n",
+       "0=map:; 0.x=int:1; 0.y=int:2; 1=map:; 1.x=int:0; 1.y=int:2; 2=map:; 2.r=int:10; 3=map:; 3.r=int:1; 4=map:; 4.x=int:1; 4.y=int:2; 4.r=int:10; 4.label=str:center/big; 5=map:; 5.x=int:1; 5.y=int:2; 5.r=int:10; 5.label=str:center/big; 6=map:; 6.x=int:1; 6.y=int:2; 6.r=int:10; 6.label=str:center/big; 7=map:; 7.r=int:10; 7.y=int:2; 7.x=int:1; 7.label=str:center/big");
+    ex("merge in a flow mapping", "base: &b \x7bx: 1, y: 2\x7d\nm: \x7b<<: *b, y: 3\x7d\n",
+       "base=map:; base.x=int:1; base.y=int:2; m=map:; m.x=int:1; m.y=int:3");
+    ex("merged mapping with its own merge", "a: &a\n  x: 1\nb: &b\n  <<: *a\n  y: 2\nc:\n  <<: *b\n  z: 3\n",
+       "a=map:; a.x=int:1; b=map:; b.x=int:1; b.y=int:2; c=map:; c.x=int:1; c.y=int:2; c.z=int:3");
+    bad("merge of a scalar", "a: &s 1\nb:\n  <<: *s\n");
+    bad("merge of a sequence of scalars", "a: &s [1, 2]\nb:\n  <<: *s\n");
+    same("lenient keeps <<", dump(yaml_parse("a: &b\n  x: 1\nc:\n  <<: *b\n")),
+         "a=map:; a.x=int:1; c=map:; c.<<=map:; c.<<.x=int:1");
     println("-- Typing (core schema)");
     ex("core schema", "a: ~\nb: Null\nc: TRUE\nd: yes\ne: 0o17\nf: 0x1f\ng: 1_000\nh: .Inf\ni: -.INF\nj: 0777\nk: '1'\n",
        "a=null:; b=null:; c=bool:true; d=str:yes; e=int:0o17; f=int:0x1f; g=str:1_000; h=float:.inf; i=float:-.inf; j=int:0777; k=str:1");

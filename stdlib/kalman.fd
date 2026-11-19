@@ -1,0 +1,397 @@
+// Fides Kalman filters (robotics / estimation)
+//
+// Three filters over lqr's `DMat` (state and measurements are column
+// matrices):
+//   Kf   the linear filter: x' = F x + B u + w, z = H x + v; predict and
+//        update with the Joseph form P = (I-KH) P (I-KH)' + K R K' (keeps P
+//        symmetric positive semidefinite), the innovation, its covariance S
+//        and the normalized innovation squared (NIS) of every update;
+//   Ekf  the extended filter: the caller passes the models as fn values,
+//        f(x, u) and its Jacobian F(x, u) for the prediction, h(x) and its
+//        Jacobian H(x) for the update;
+//   Ukf  the unscented filter: Merwe's scaled sigma points (alpha, beta,
+//        kappa) from a Cholesky factor of (n + lambda) P, propagated through
+//        f(x, u) and h(x) (fn values; no Jacobians).
+// The model fn values take and return plain `Vec<f64>`: states, inputs and
+// measurements are vectors, a Jacobian is its entries row-major (F is
+// n x n, H is m x n). (A fn value returning a struct such as DMat crashes
+// `fid run` today, so the models do not use DMat.)
+// The UKF averages measurements linearly: a measurement with an angle that
+// wraps around needs its residual wrapped by the caller.
+//
+// Errors (a singular innovation covariance, a covariance that lost
+// positive definiteness) come back as Result::Err and leave the filter as
+// it was. Everything here is pure computation; there is no platform seam
+// (the sensor readings are the caller's).
+//
+// Usage:
+//   use lqr; use kalman;
+//   var kf = kf_new(dm_parse("1 1; 0 1"), dm_parse("1 0"), q, r, x0, p0);
+//   kf_predict(&mut kf);
+//   kf_update(&mut kf, &dm_parse("1.2"));
+
+module kalman;
+use math;
+use quat;
+use lqr;
+
+// ─── Linear Kalman filter ───
+
+/// A linear Kalman filter.
+pub struct Kf {
+    pub x: DMat,
+    pub p: DMat,
+    pub f: DMat,
+    // control input matrix (n x 0 when there is no input)
+    pub b: DMat,
+    pub h: DMat,
+    pub q: DMat,
+    pub r: DMat,
+    // the last innovation z - H x, its covariance and NIS
+    pub y: DMat,
+    pub s: DMat,
+    pub nis: f64,
+}
+
+/// A filter with transition f, measurement h, noises q and r, initial
+/// state x0 (n x 1) and covariance p0.
+pub fn kf_new(f: DMat, h: DMat, q: DMat, r: DMat, x0: DMat, p0: DMat) -> Kf {
+    val n: i64 = f.rows;
+    val m: i64 = h.rows;
+    return Kf {
+        x: x0, p: p0, f: f, b: dm_zeros(n, 0), h: h, q: q, r: r, y: dm_zeros(m, 1), s: dm_zeros(m, m), nis: 0.0
+    };
+}
+
+/// Set the control input matrix B (n x k).
+pub fn kf_set_control(kf: & mut Kf, b: DMat) {
+    kf.b = b;
+}
+
+/// x = F x, P = F P F' + Q.
+pub fn kf_predict(kf: & mut Kf) {
+    val fx: DMat = dm_mul(&kf.f, &kf.x);
+    kf.x = fx;
+    val ft: DMat = dm_transpose(&kf.f);
+    val fp: DMat = dm_mul(&kf.f, &kf.p);
+    val fpf: DMat = dm_mul(&fp, &ft);
+    kf.p = dm_symmetrize(&dm_add(&fpf, &kf.q));
+}
+
+/// x = F x + B u, P = F P F' + Q.
+pub fn kf_predict_u(kf: & mut Kf, u: & DMat) {
+    kf_predict(kf);
+    val bu: DMat = dm_mul(&kf.b, u);
+    kf.x = dm_add(&kf.x, &bu);
+}
+
+/// The gain-and-covariance step shared by the linear and extended filters:
+/// innovation y = z - zhat, S = H P H' + R, K = P H' S^-1, x += K y,
+/// Joseph-form P. Returns (new x, new P, S) or Err for a singular S.
+fn kf_correct(x: & DMat, p: & DMat, h: & DMat, r: & DMat, y: & DMat) -> Result<Vec<DMat>, str> {
+    val ht: DMat = dm_transpose(h);
+    val pht: DMat = dm_mul(p, &ht);
+    val hpht: DMat = dm_mul(h, &pht);
+    val s: DMat = dm_add(&hpht, r);
+    // K' = S^-1 (P H')' (S symmetric)
+    val hp: DMat = dm_transpose(&pht);
+    match dm_solve(&s, &hp) {
+        Result::Ok(kt) => {
+            val k: DMat = dm_transpose(&kt);
+            val ky: DMat = dm_mul(&k, y);
+            val xn: DMat = dm_add(x, &ky);
+            val n: i64 = x.rows;
+            val kh: DMat = dm_mul(&k, h);
+            val ikh: DMat = dm_sub(&dm_identity(n), &kh);
+            val ikht: DMat = dm_transpose(&ikh);
+            val a: DMat = dm_mul(&dm_mul(&ikh, p), &ikht);
+            val krk: DMat = dm_mul(&dm_mul(&k, r), &kt);
+            val pn: DMat = dm_symmetrize(&dm_add(&a, &krk));
+            var out: Vec<DMat> = Vec::new();
+            out.push(xn);
+            out.push(pn);
+            out.push(s);
+            return Result::Ok(out);
+        }
+        Result::Err(e) => {
+            return Result::Err("kalman: innovation covariance is singular");
+        }
+    }
+}
+
+/// y' S^-1 y.
+fn kf_nis(y: & DMat, s: & DMat) -> f64 {
+    match dm_solve(s, y) {
+        Result::Ok(w) => {
+            var acc: f64 = 0.0;
+            var i: i64 = 0;
+            while i < y.rows {
+                acc = acc + dm_get(y, i, 0) * dm_get(&w, i, 0);
+                i = i + 1;
+            }
+            return acc;
+        }
+        Result::Err(e) => {
+            return 0.0;
+        }
+    }
+}
+
+/// Fold in measurement z (m x 1). Returns the NIS of the innovation.
+pub fn kf_update(kf: & mut Kf, z: & DMat) -> Result<f64, str> {
+    val hx: DMat = dm_mul(&kf.h, &kf.x);
+    val y: DMat = dm_sub(z, &hx);
+    match kf_correct(&kf.x, &kf.p, &kf.h, &kf.r, &y) {
+        Result::Ok(r) => {
+            kf.x = r.get(0);
+            kf.p = r.get(1);
+            kf.s = r.get(2);
+            kf.y = y;
+            kf.nis = kf_nis(&y, &kf.s);
+            return Result::Ok(kf.nis);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+/// The constant-velocity model of one axis with step dt and white
+/// acceleration noise of spectral density qc: F = [1 dt; 0 1],
+/// Q = qc [dt^3/3 dt^2/2; dt^2/2 dt].
+pub fn kf_cv_model(dt: f64, qc: f64) -> Vec<DMat> {
+    var f: DMat = dm_identity(2);
+    dm_set(&mut f, 0, 1, dt);
+    var q: DMat = dm_zeros(2, 2);
+    dm_set(&mut q, 0, 0, qc * dt * dt * dt / 3.0);
+    dm_set(&mut q, 0, 1, qc * dt * dt / 2.0);
+    dm_set(&mut q, 1, 0, qc * dt * dt / 2.0);
+    dm_set(&mut q, 1, 1, qc * dt);
+    var out: Vec<DMat> = Vec::new();
+    out.push(f);
+    out.push(q);
+    return out;
+}
+
+// ─── Extended Kalman filter ───
+
+/// A copy of v.
+fn kf_vcopy(v: & Vec<f64>) -> Vec<f64> {
+    var o: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        o.push(v.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// An extended Kalman filter: state, covariance and the noises.
+pub struct Ekf {
+    pub x: DMat,
+    pub p: DMat,
+    pub q: DMat,
+    pub r: DMat,
+    pub y: DMat,
+    pub nis: f64,
+}
+
+/// A filter at x0 with covariance p0, process noise q, measurement noise r.
+pub fn ekf_new(x0: DMat, p0: DMat, q: DMat, r: DMat) -> Ekf {
+    return Ekf {
+        x: x0, p: p0, q: q, r: r, y: dm_zeros(r.rows, 1), nis: 0.0
+    };
+}
+
+/// x = f(x, u), P = F P F' + Q with F = fjac(x, u) at the old x.
+pub fn ekf_predict(e: & mut Ekf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, fjac: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: & Vec<f64>) {
+    val n: i64 = e.x.rows;
+    val xv: Vec<f64> = dm_to_vec(&e.x);
+    val fm: DMat = dm_from(n, n, fjac(xv, kf_vcopy(u)));
+    val xn: DMat = dm_col_vec(f(xv, kf_vcopy(u)));
+    val ft: DMat = dm_transpose(&fm);
+    val fp: DMat = dm_mul(&fm, &e.p);
+    val fpf: DMat = dm_mul(&fp, &ft);
+    e.x = xn;
+    e.p = dm_symmetrize(&dm_add(&fpf, &e.q));
+}
+
+/// Fold in z with the measurement model h(x) and its Jacobian hjac(x).
+/// Returns the NIS.
+pub fn ekf_update(e: & mut Ekf, z: & DMat, h: fn(Vec<f64>) -> Vec<f64>, hjac: fn(Vec<f64>) -> Vec<f64>) -> Result<f64, str> {
+    val xv: Vec<f64> = dm_to_vec(&e.x);
+    val hm: DMat = dm_from(z.rows, e.x.rows, hjac(xv));
+    val zh: DMat = dm_col_vec(h(xv));
+    val y: DMat = dm_sub(z, &zh);
+    match kf_correct(&e.x, &e.p, &hm, &e.r, &y) {
+        Result::Ok(r) => {
+            e.x = r.get(0);
+            e.p = r.get(1);
+            e.y = y;
+            val s: DMat = r.get(2);
+            e.nis = kf_nis(&y, &s);
+            return Result::Ok(e.nis);
+        }
+        Result::Err(msg) => {
+            return Result::Err(msg);
+        }
+    }
+}
+
+// ─── Unscented Kalman filter ───
+
+/// An unscented Kalman filter with Merwe's scaled sigma points.
+pub struct Ukf {
+    pub x: DMat,
+    pub p: DMat,
+    pub q: DMat,
+    pub r: DMat,
+    pub alpha: f64,
+    pub beta: f64,
+    pub kappa: f64,
+    // weights of the mean and of the covariance, 2n + 1 each
+    pub wm: Vec<f64>,
+    pub wc: Vec<f64>,
+    pub lambda: f64,
+    pub y: DMat,
+    pub nis: f64,
+}
+
+/// A filter at x0 / p0 with noises q and r and sigma-point parameters
+/// alpha (spread, e.g. 1e-3 .. 1), beta (2 for Gaussian priors), kappa
+/// (usually 0 or 3 - n).
+pub fn ukf_new(x0: DMat, p0: DMat, q: DMat, r: DMat, alpha: f64, beta: f64, kappa: f64) -> Ukf {
+    val n: i64 = x0.rows;
+    val nf: f64 = n as f64;
+    val lambda: f64 = alpha * alpha * (nf + kappa) - nf;
+    var wm: Vec<f64> = Vec::new();
+    var wc: Vec<f64> = Vec::new();
+    wm.push(lambda / (nf + lambda));
+    wc.push(lambda / (nf + lambda) + 1.0 - alpha * alpha + beta);
+    var i: i64 = 0;
+    while i < 2 * n {
+        wm.push(0.5 / (nf + lambda));
+        wc.push(0.5 / (nf + lambda));
+        i = i + 1;
+    }
+    return Ukf {
+        x: x0, p: p0, q: q, r: r, alpha: alpha, beta: beta, kappa: kappa, wm: wm, wc: wc, lambda: lambda, y: dm_zeros(r.rows, 1), nis: 0.0
+    };
+}
+
+/// The 2n + 1 sigma points of (x, p): x, then x + c_i and x - c_i for the
+/// columns c_i of the Cholesky factor of (n + lambda) p.
+pub fn ukf_sigma_points(x: & DMat, p: & DMat, lambda: f64) -> Result<Vec<DMat>, str> {
+    val n: i64 = x.rows;
+    val sp: DMat = dm_scale(p, (n as f64) + lambda);
+    match dm_cholesky(&sp) {
+        Result::Ok(l) => {
+            var pts: Vec<DMat> = Vec::new();
+            pts.push(dm_block(x, 0, 0, n, 1));
+            var i: i64 = 0;
+            while i < n {
+                val c: DMat = dm_block(&l, 0, i, n, 1);
+                pts.push(dm_add(x, &c));
+                i = i + 1;
+            }
+            i = 0;
+            while i < n {
+                val c: DMat = dm_block(&l, 0, i, n, 1);
+                pts.push(dm_sub(x, &c));
+                i = i + 1;
+            }
+            return Result::Ok(pts);
+        }
+        Result::Err(e) => {
+            return Result::Err("ukf: covariance is not positive definite");
+        }
+    }
+}
+
+/// Weighted mean of column points.
+fn ukf_mean(pts: & Vec<DMat>, w: & Vec<f64>) -> DMat {
+    val first: DMat = pts.get(0);
+    var m: DMat = dm_zeros(first.rows, 1);
+    var i: i64 = 0;
+    while i < pts.len() {
+        val t: DMat = dm_scale(&pts.get(i), w.get(i));
+        m = dm_add(&m, &t);
+        i = i + 1;
+    }
+    return m;
+}
+
+/// sum_i w_i (a_i - ma)(b_i - mb)'.
+fn ukf_cross(a: & Vec<DMat>, ma: & DMat, b: & Vec<DMat>, mb: & DMat, w: & Vec<f64>) -> DMat {
+    var c: DMat = dm_zeros(ma.rows, mb.rows);
+    var i: i64 = 0;
+    while i < a.len() {
+        val da: DMat = dm_sub(&a.get(i), ma);
+        val db: DMat = dm_sub(&b.get(i), mb);
+        val dbt: DMat = dm_transpose(&db);
+        val o: DMat = dm_scale(&dm_mul(&da, &dbt), w.get(i));
+        c = dm_add(&c, &o);
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Propagate the sigma points through f(x, u): x = mean, P = cov + Q.
+pub fn ukf_predict(k: & mut Ukf, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: & Vec<f64>) -> Result<i64, str> {
+    match ukf_sigma_points(&k.x, &k.p, k.lambda) {
+        Result::Ok(pts) => {
+            var fp: Vec<DMat> = Vec::new();
+            var i: i64 = 0;
+            while i < pts.len() {
+                fp.push(dm_col_vec(f(dm_to_vec(&pts.get(i)), kf_vcopy(u))));
+                i = i + 1;
+            }
+            val xm: DMat = ukf_mean(&fp, &k.wm);
+            val pc: DMat = ukf_cross(&fp, &xm, &fp, &xm, &k.wc);
+            k.x = xm;
+            k.p = dm_symmetrize(&dm_add(&pc, &k.q));
+            return Result::Ok(pts.len());
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+/// Fold in z with the measurement model h(x). Returns the NIS.
+pub fn ukf_update(k: & mut Ukf, z: & DMat, h: fn(Vec<f64>) -> Vec<f64>) -> Result<f64, str> {
+    match ukf_sigma_points(&k.x, &k.p, k.lambda) {
+        Result::Ok(pts) => {
+            var zp: Vec<DMat> = Vec::new();
+            var i: i64 = 0;
+            while i < pts.len() {
+                zp.push(dm_col_vec(h(dm_to_vec(&pts.get(i)))));
+                i = i + 1;
+            }
+            val zm: DMat = ukf_mean(&zp, &k.wm);
+            val pzz: DMat = dm_add(&ukf_cross(&zp, &zm, &zp, &zm, &k.wc), &k.r);
+            val pxz: DMat = ukf_cross(&pts, &k.x, &zp, &zm, &k.wc);
+            // K' = Pzz^-1 Pxz'
+            val pzx: DMat = dm_transpose(&pxz);
+            match dm_solve(&pzz, &pzx) {
+                Result::Ok(kt) => {
+                    val kg: DMat = dm_transpose(&kt);
+                    val y: DMat = dm_sub(z, &zm);
+                    val ky: DMat = dm_mul(&kg, &y);
+                    k.x = dm_add(&k.x, &ky);
+                    val kpk: DMat = dm_mul(&dm_mul(&kg, &pzz), &kt);
+                    k.p = dm_symmetrize(&dm_sub(&k.p, &kpk));
+                    k.y = y;
+                    k.nis = kf_nis(&y, &pzz);
+                    return Result::Ok(k.nis);
+                }
+                Result::Err(e) => {
+                    return Result::Err("ukf: innovation covariance is singular");
+                }
+            }
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}

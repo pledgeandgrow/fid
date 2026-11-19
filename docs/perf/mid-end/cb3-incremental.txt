@@ -1,0 +1,72 @@
+CB3 (complaint-roadmap): "Incremental builds are not incremental"
+=================================================================
+
+Goal: a one-line change rebuilds one function, not the program
+(competitive CS6's open part).
+
+What a `fid emit` reuses after a one-line edit (Nov 17)
+-------------------------------------------------------
+
+1. The mid-end. compiler/iropt.fd iropt_native memoizes its per-function
+   passes (CS6, iro_imc_key / compiler/ir_ser.fd imc_*). A function's key
+   holds its own IR, the IR of every function it names transitively
+   (calls, function references, dyn targets), the switches and the
+   compiler. An edit misses for the edited function and the functions
+   that call it, transitively; the others replay the recorded result.
+   CB3 turned the memo on by default for `fid emit -o <output>`
+   (ir_ser.fd IMC_EMIT_DEFAULT, imc_emit_default_path), with the file
+   `<output>.fides-irocache` beside the output, as pe_ir's per-function
+   cache is. It is off for any other command, an emit without `-o`,
+   `--debug`, `--explain`, `--validate`, FID_IROCACHE=0, `--no-irocache`,
+   `--no-cache` and FIDES_NO_CACHE. FID_IROCACHE_STATS=1 prints the counts
+   line and then "[irocache] ran: f, g", the functions that went through
+   the passes again (ir_ser.fd g_imc_ran, imc_ran()).
+
+2. Machine code, Windows (pe_ir, B5): on by default for emit/build,
+   `<output>.fides-fncache.pe`. FID_PE_FNCACHE_STATS=1 prints
+   "[pe] fncache: H hits, M misses".
+
+3. Machine code, machine layer (nat_ir, FID_FNCACHE): with the cache on,
+   `--stats` prints "[fncache] entries from ..., H hits, C compiled" and
+   "[fncache] re-emitted: f, g". Line-table rows of a replayed function
+   are replayed with it (NcEntry.lrows, nc_skel_fn). It is on by default
+   only for debug builds (compiler/main.fd debug_cache_setup).
+
+Dry run with the stage-0 compiler (Nov 16 build: no memo, no B5 default)
+on tests/bootstrap/test_cb3_one_edit.fd, same source file name each
+build, the caches named explicitly:
+
+  pe  (FID_FNCACHE=<file> FID_PE_FNCACHE_STATS=1)
+    cold  [pe] fncache: 0 hits, 44 misses
+    warm  [pe] fncache: 44 hits, 0 misses
+    edit  [pe] fncache: 43 hits, 1 misses           output 275 55 12 3 5
+  nat (--nat --stats, FID_FNCACHE=<file>)
+    cold  [fncache] entries from none, 0 hits, 253 compiled
+    warm  [fncache] entries from file, 253 hits, 1 compiled
+          (re-emitted: vec_copy_bytes: stage 0 folds it onto another
+          function when fresh; nat_ir's SP20 fold key, newer than stage 0,
+          is the fix)
+    edit  [fncache] entries from file, 253 hits, 1 compiled
+          [fncache] re-emitted: tri                 output 275 55 12 3 5
+
+The source file name is part of the nat cache's salt (the line table
+names it): a copy of the program under another name misses everywhere.
+
+Check: FID=<compiler> bash tests/tooling/cb3-incremental-check.sh
+(BACKENDS="pe nat" on Windows). It also checks that the memo is on
+without FID_IROCACHE, that the warm build runs the passes on nothing, and
+that after the edit they ran on `tri` and on no function that does not
+call it.
+
+Left
+----
+- nat_ir's function cache is not on by default for a non-debug emit
+  (compiler/main.fd, driver group: call debug_cache_setup, or the same
+  FID_FNCACHE default, for every machine-layer emit with an output).
+- pe_ir prints only counts, not the names of the functions it emitted
+  again.
+- The front end (parse, type check, mono, lowering) still runs on the
+  whole program on every build.
+- Nothing of the above has been built with the compiler that holds it;
+  the default memo stays on only if tests/tooling/irocache-check.sh
+  (SUITE=1, NAT=1) shows 0 mismatches and the cold-build cost is small.

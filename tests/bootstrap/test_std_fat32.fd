@@ -1,0 +1,134 @@
+// stdlib/fat32: format FAT12 (1.44 MB floppy), FAT16 and FAT32 images on RAM disks, write, read back, LFNs, delete.
+// Expected output:
+// FAT12 bps 512 spc 1 rsvd 1 fats 2 root 224 sectors 2880 media 240 fatsz 9 spt 18 heads 2 clusters 2847 label FIDES
+// README.TXT short README.TXT size 6
+// notes.txt short NOTES.TXT size 5
+// A Long File Name.text short ALONGF~1.TEX size 4
+// Mixed.Txt short MIXED.TXT size 3
+// longfilename1.txt short LONGFI~1.TXT size 1
+// longfilename2.txt short LONGFI~2.TXT size 1
+// read notes.txt: hello, any case: hello
+// big file: 1300 bytes, 3 clusters, byte 1299 = 19
+// replace big file: 2 bytes, free 2840
+// sub/inner.txt via ..: inner
+// delete non-empty dir: ENOTEMPTY
+// delete inner, then sub: 0 0, free 2841
+// reopened: 6 entries, notes.txt = hello, time 2026-03-14 15:09:26
+// FAT12 entry 341 straddles sectors: 2748 340=0 342=0
+// LFN checksum of NOTES   TXT: 193
+// FAT16 spc 4 fatsz 32 clusters 8167 root 512
+// FAT16 /dir/file.bin 2048 bytes ok
+// FAT32 spc 1 rsvd 32 fatsz 539 clusters 68890 root cluster 2
+// FAT32 fsinfo free 68889, backup boot sector same: true
+// FAT32 /a/b/Some long directory/data.txt: deep
+// FAT32 reopened fsinfo free 68885 counted from hint ok: true
+// vfs over FAT16: ls /mnt/dir = file.bin new.txt, read new.txt = via vfs, renamed: true
+use fat32;
+use vfs;
+use ramfs;
+use vec;
+use string;
+
+fn show_list(vol: & FatVol, path: str) {
+    val es: Vec<FatDirEnt> = fat_list(vol, path);
+    var i: i64 = 0;
+    while i < es.len() {
+        val e: FatDirEnt = es.get(i);
+        println(e.name + " short " + e.short + " size " + int_to_str(e.size));
+        i = i + 1;
+    }
+}
+
+fn bytes_n(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(i % 256);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() {
+    val d12: BlockDev = memdisk_new(512, 2880);
+    var v: FatVol = fat_format(d12, 0, "fides", 305419896);
+    println(fat_type_name(&v) + " bps " + int_to_str(v.bps) + " spc " + int_to_str(v.spc) + " rsvd " + int_to_str(v.rsvd) + " fats " + int_to_str(v.nfats) + " root " + int_to_str(v.root_ent) + " sectors " + int_to_str(v.tot_sec) + " media " + int_to_str(v.media) + " fatsz " + int_to_str(v.fatsz) + " spt " + int_to_str(v.spt) + " heads " + int_to_str(v.heads) + " clusters " + int_to_str(v.nclusters) + " label " + v.label);
+    fat_set_clock(&mut v, 2026, 3, 14, 15, 9, 26);
+    fat_write_file(&mut v, "/README.TXT", str_bytes("readme"));
+    fat_write_file(&mut v, "/notes.txt", str_bytes("hello"));
+    fat_write_file(&mut v, "/A Long File Name.text", str_bytes("long"));
+    fat_write_file(&mut v, "/Mixed.Txt", str_bytes("mix"));
+    fat_write_file(&mut v, "/longfilename1.txt", str_bytes("1"));
+    fat_write_file(&mut v, "/longfilename2.txt", str_bytes("2"));
+    show_list(&v, "/");
+    println("read notes.txt: " + str_from_bytes(fat_read_file(&mut v, "/notes.txt")) + ", any case: " + str_from_bytes(fat_read_file(&mut v, "/NOTES.TXT")));
+
+    fat_write_file(&mut v, "/big.bin", bytes_n(1300));
+    val big: Vec<i64> = fat_read_file(&mut v, "/big.bin");
+    val be: FatDirEnt = fat_lookup(&v, "/big.bin");
+    println("big file: " + int_to_str(big.len()) + " bytes, " + int_to_str(fat_chain(&v, be.clus).len()) + " clusters, byte 1299 = " + int_to_str(big.get(1299)));
+    fat_write_file(&mut v, "/big.bin", str_bytes("ab"));
+    println("replace big file: " + int_to_str(fat_read_file(&mut v, "/big.bin").len()) + " bytes, free " + int_to_str(fat_count_free(&v)));
+
+    fat_mkdir(&mut v, "/sub");
+    fat_write_file(&mut v, "/sub/inner.txt", str_bytes("inner"));
+    println("sub/inner.txt via ..: " + str_from_bytes(fat_read_file(&mut v, "/sub/../sub/./inner.txt")));
+    println("delete non-empty dir: " + vfs_errno_name(fat_delete(&mut v, "/sub")));
+    val r1: i64 = fat_delete(&mut v, "/sub/inner.txt");
+    val r2: i64 = fat_delete(&mut v, "/sub");
+    fat_delete(&mut v, "/big.bin");
+    println("delete inner, then sub: " + int_to_str(r1) + " " + int_to_str(r2) + ", free " + int_to_str(fat_count_free(&v)));
+
+    var again: FatVol = fat_open(d12);
+    val ne: FatDirEnt = fat_lookup(&again, "/notes.txt");
+    println("reopened: " + int_to_str(fat_list(&again, "/").len()) + " entries, notes.txt = " + str_from_bytes(fat_read_file(&mut again, "/notes.txt")) + ", time " + fat_datetime_str(ne.wdate, ne.wtime));
+
+    fat_set(&again, 341, 2748);
+    println("FAT12 entry 341 straddles sectors: " + int_to_str(fat_get(&again, 341)) + " 340=" + int_to_str(fat_get(&again, 340)) + " 342=" + int_to_str(fat_get(&again, 342)));
+    fat_set(&again, 341, 0);
+    println("LFN checksum of NOTES   TXT: " + int_to_str(fat_lfn_checksum(&str_bytes("NOTES   TXT"))));
+
+    val d16: BlockDev = memdisk_new(512, 32768);
+    var v16: FatVol = fat_format(d16, 16, "", 1);
+    println(fat_type_name(&v16) + " spc " + int_to_str(v16.spc) + " fatsz " + int_to_str(v16.fatsz) + " clusters " + int_to_str(v16.nclusters) + " root " + int_to_str(v16.root_ent));
+    fat_mkdir(&mut v16, "/dir");
+    fat_write_file(&mut v16, "/dir/file.bin", bytes_n(2048));
+    val fb: Vec<i64> = fat_read_file(&mut v16, "/dir/file.bin");
+    if fb.len() == 2048 && fb.get(2047) == 255 && fb.get(1024) == 0 {
+        println("FAT16 /dir/file.bin 2048 bytes ok");
+    }
+
+    val d32: BlockDev = memdisk_new(512, 70000);
+    var v32: FatVol = fat_format(d32, 32, "BIG", 7);
+    println(fat_type_name(&v32) + " spc " + int_to_str(v32.spc) + " rsvd " + int_to_str(v32.rsvd) + " fatsz " + int_to_str(v32.fatsz) + " clusters " + int_to_str(v32.nclusters) + " root cluster " + int_to_str(v32.root_clus));
+    val s0: Vec<i64> = blk_read(&d32, 0);
+    val s6: Vec<i64> = blk_read(&d32, 6);
+    var same: bool = true;
+    var i: i64 = 0;
+    while i < 512 {
+        if s0.get(i) != s6.get(i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    println("FAT32 fsinfo free " + int_to_str(v32.free_count) + ", backup boot sector same: " + bool_to_str(same));
+    fat_mkdir(&mut v32, "/a");
+    fat_mkdir(&mut v32, "/a/b");
+    fat_mkdir(&mut v32, "/a/b/Some long directory");
+    fat_write_file(&mut v32, "/a/b/Some long directory/data.txt", str_bytes("deep"));
+    println("FAT32 /a/b/Some long directory/data.txt: " + str_from_bytes(fat_read_file(&mut v32, "/A/B/some long DIRECTORY/data.txt")));
+    val r32: FatVol = fat_open(d32);
+    println("FAT32 reopened fsinfo free " + int_to_str(r32.free_count) + " counted from hint ok: " + bool_to_str(r32.next_free == 7));
+
+    var vf: Vfs = vfs_new();
+    vfs_mount(&mut vf, "/", ramfs_ops(), ramfs_new());
+    vfs_mkdir(&mut vf, "/mnt", 493);
+    fat_mount(&mut vf, "/mnt", fat_open(d16));
+    vfs_write_file(&mut vf, "/mnt/dir/new.txt", str_bytes("via vfs"));
+    val names: str = str_join(vfs_list(&mut vf, "/mnt/dir"), " ");
+    val nt: str = str_from_bytes(vfs_read_file(&mut vf, "/mnt/dir/new.txt"));
+    vfs_rename(&mut vf, "/mnt/dir/new.txt", "/mnt/renamed.txt");
+    var vchk: FatVol = fat_open(d16);
+    val ren: bool = str_from_bytes(fat_read_file(&mut vchk, "/renamed.txt")) == "via vfs" && !fat_lookup(&vchk, "/dir/new.txt").found;
+    println("vfs over FAT16: ls /mnt/dir = " + names + ", read new.txt = " + nt + ", renamed: " + bool_to_str(ren));
+}

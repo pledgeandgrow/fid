@@ -1,0 +1,123 @@
+// stdlib/motion: ASensorEvent float decoding, the iOS unit conversion,
+// gravity / linear split, tilt angles, the complementary filter (exact
+// tracking, and the bounded error alpha*b*dt/(1-alpha) under gyro bias),
+// the getRotationMatrix/getOrientation compass (heading unchanged under
+// tilt), step detection on a synthetic 2 Hz gait and shake detection.
+// Expected output:
+// f32 1.000000 -10.000000 9.806650 0.000000
+// ios flat z 9.806650
+// linear x 0.800000 z 0.000000
+// tilt x 30.000000 y 20.000000
+// track 28.647890 bias error 1.403747 gyro only 57.295780
+// compass flat north 0.000000 east 90.000000
+// compass tilted east 90.000000 sw 225.000000 SW
+// orientation pitch -25.000000 ok true free-fall ok false
+// true heading 5.000000 N
+// steps 10 cadence 120.0
+// shakes 2 at 200 1500
+use motion;
+use vec;
+use string;
+use math;
+
+fn fmt(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d { scale = scale * 10; i = i + 1; }
+    val neg: bool = x < 0.0;
+    val ax: f64 = if neg { 0.0 - x } else { x };
+    val n: i64 = (ax * (scale as f64) + 0.5) as i64;
+    var fp: str = int_to_str(n % scale);
+    while str_len(fp) < d { fp = "0" + fp; }
+    var s: str = int_to_str(n / scale) + "." + fp;
+    if neg && n != 0 { s = "-" + s; }
+    return s;
+}
+
+// Device-frame coordinates of a world vector for a device with heading
+// psi (clockwise from north), then tilted by theta about its x axis and
+// phi about its y axis.
+fn to_device(v: MVec, psi: f64, theta: f64, phi: f64) -> MVec {
+    val p: f64 = motion_rad(psi);
+    val c1: f64 = math_cos(p);
+    val s1: f64 = math_sin(p);
+    val a: MVec = mvec(v.x * c1 - v.y * s1, v.x * s1 + v.y * c1, v.z);
+    val t: f64 = motion_rad(theta);
+    val c2: f64 = math_cos(t);
+    val s2: f64 = math_sin(t);
+    val b: MVec = mvec(a.x, a.y * c2 + a.z * s2, 0.0 - a.y * s2 + a.z * c2);
+    val f: f64 = motion_rad(phi);
+    val c3: f64 = math_cos(f);
+    val s3: f64 = math_sin(f);
+    return mvec(b.x * c3 - b.z * s3, b.y, b.x * s3 + b.z * c3);
+}
+
+fn main() {
+    val ev: SensorEvent = motion_event_from_bits(ASENSOR_TYPE_ACCELEROMETER, 0, 0x3F800000, 0xC1200000, 0x411CE80A);
+    println("f32 " + fmt(ev.x, 6) + " " + fmt(ev.y, 6) + " " + fmt(ev.z, 6) + " " + fmt(motion_event_from_bits(1, 0, 0, 0, 0).x, 6));
+    println("ios flat z " + fmt(motion_from_ios_accel(0.0, 0.0, -1.0).z, 6));
+    var gf: GravityFilter = gravity_filter_new(0.8);
+    gravity_filter_update(&mut gf, mvec(0.0, 0.0, 9.81));
+    val lin: MVec = gravity_filter_update(&mut gf, mvec(1.0, 0.0, 9.81));
+    println("linear x " + fmt(lin.x, 6) + " z " + fmt(lin.z, 6));
+    val g: f64 = MOTION_G;
+    val ax: MVec = mvec(0.0, g * math_sin(motion_rad(30.0)), g * math_cos(motion_rad(30.0)));
+    val ay: MVec = mvec(0.0 - g * math_sin(motion_rad(20.0)), 0.0, g * math_cos(motion_rad(20.0)));
+    println("tilt x " + fmt(motion_deg(motion_tilt_x(ax)), 6) + " y " + fmt(motion_deg(motion_tilt_y(ay)), 6));
+
+    // exact tracking: gyro and gravity agree
+    var c: Complementary = complementary_new(0.98);
+    var k: i64 = 0;
+    while k <= 100 {
+        val th: f64 = 0.5 * (k as f64) * 0.01;
+        complementary_update(&mut c, mvec(0.0, g * math_sin(th), g * math_cos(th)), mvec(0.5, 0.0, 0.0), 0.01);
+        k = k + 1;
+    }
+    val track: f64 = motion_deg(c.angle_x);
+    // a gyro bias of 0.05 rad/s while the device lies still
+    var cb: Complementary = complementary_new(0.98);
+    var gyro_only: f64 = 0.0;
+    k = 0;
+    while k <= 2000 {
+        complementary_update(&mut cb, mvec(0.0, 0.0, g), mvec(0.05, 0.0, 0.0), 0.01);
+        if k > 0 { gyro_only = gyro_only + 0.05 * 0.01; }
+        k = k + 1;
+    }
+    println("track " + fmt(track, 6) + " bias error " + fmt(motion_deg(cb.angle_x), 6) + " gyro only " + fmt(motion_deg(gyro_only), 6));
+
+    val up: MVec = mvec(0.0, 0.0, g);
+    val field: MVec = mvec(0.0, 20.0, -40.0);
+    val n0: Orientation = motion_orientation(up, field);
+    val e0: Orientation = motion_orientation(to_device(up, 90.0, 0.0, 0.0), to_device(field, 90.0, 0.0, 0.0));
+    println("compass flat north " + fmt(n0.azimuth, 6) + " east " + fmt(e0.azimuth, 6));
+    val e1: Orientation = motion_orientation(to_device(up, 90.0, 25.0, -15.0), to_device(field, 90.0, 25.0, -15.0));
+    val sw: Orientation = motion_orientation(to_device(up, 225.0, -10.0, 30.0), to_device(field, 225.0, -10.0, 30.0));
+    println("compass tilted east " + fmt(e1.azimuth, 6) + " sw " + fmt(sw.azimuth, 6) + " " + motion_compass_point(sw.azimuth));
+    val pt: Orientation = motion_orientation(to_device(up, 0.0, 25.0, 0.0), to_device(field, 0.0, 25.0, 0.0));
+    println("orientation pitch " + fmt(pt.pitch, 6) + " ok " + bool_to_str(pt.ok) + " free-fall ok "
+        + bool_to_str(motion_orientation(mvec(0.0, 0.0, 0.1), field).ok));
+    val th: f64 = motion_true_heading(350.0, 15.0);
+    println("true heading " + fmt(th, 6) + " " + motion_compass_point(th));
+
+    var sd: StepDetector = step_detector_new(1.5, 300);
+    var t: i64 = 0;
+    while t < 5000 {
+        val ts: f64 = (t as f64) / 1000.0;
+        step_detector_update(&mut sd, mvec(0.0, 0.0, g + 3.0 * math_sin(2.0 * motion_pi() * 2.0 * ts)), t);
+        t = t + 10;
+    }
+    println("steps " + int_to_str(sd.steps) + " cadence " + fmt(step_cadence(&sd), 1));
+
+    var sh: ShakeDetector = shake_detector_new(2.7, 500, 3, 1000);
+    var at: str = "";
+    t = 0;
+    while t <= 2000 {
+        var a: MVec = mvec(0.0, 0.0, g);
+        if t == 0 || t == 100 || t == 200 || t == 300 || t == 400 || t == 500 || t == 1300 || t == 1400 || t == 1500 {
+            a = mvec(3.0 * g, 0.0, 0.0);
+        }
+        if shake_detector_update(&mut sh, a, t) { at = at + " " + int_to_str(t); }
+        t = t + 50;
+    }
+    println("shakes " + int_to_str(sh.shakes) + " at" + at);
+}

@@ -1,31 +1,109 @@
 // Fides Random standard library
 //
-// Pseudo-random number generation using a pure-Fides LCG (Linear Congruential Generator).
-// Not cryptographically secure — use crypto.fd for security-sensitive randomness.
+// Pseudo-random number generation: a 64-bit xorshift* generator seeded with
+// SplitMix64. The process-wide generator seeds itself from the OS entropy
+// source (p_os_random_u64) mixed with the clock on first use, so two runs
+// see different sequences unless seeded explicitly with random_seed().
+// Not cryptographically secure — use crypto.fd (crypto_random) for keys,
+// nonces and tokens.
 //
 // Usage:
 //   use random;
-//   random_seed(42);
+//   random_seed(42);              // deterministic sequence for tests
 //   println(random_int(100));     // random int in [0, 100)
 //   println(random_float());      // random float in [0.0, 1.0)
+//   var own = RngState::new(7);   // a generator independent of the global one
+//   println(own.next_bounded(6));
 
 module random;
- use vec;
-// ─── Internal state ─────────────────────────────────────────────────────
+ use vec; use math;
 
-/// RNG state holder (LCG seed).
+// ─── Core generator ─────────────────────────────────────────────────────
+
+/// RNG state for one generator. `state` is the xorshift64* word; `seeded`
+/// is false until the generator has taken a seed (the global one seeds
+/// itself from OS entropy on first use).
 pub struct RngState {
     pub state: i64,
+    pub seeded: bool,
 }
 
-/// Global RNG state instance. A `var`: as a `const`, the assignments in
-/// random_seed/next_raw did not persist and every call returned the same value.
+// SplitMix64: turns any seed (0 included) into a well-mixed nonzero state.
+@wrapping fn sm64(seed: i64) -> i64 {
+    var z: i64 = seed + -7046029254386353131; // 0x9E3779B97F4A7C15 as signed
+    z = (z ^ (z >> 30)) * -4658895280553007687; // 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * -7723592293110705685; // 0x94D049BB133111EB
+    z = z ^ (z >> 31);
+    if z == 0 {
+        z = 0x9E3779B97F4A7C15;
+    }
+    return z;
+}
+
+/// Seed from the operating system (p_os_random_u64) mixed with the clock;
+/// falls back to the clock alone.
+@wrapping fn os_seed() -> i64 {
+    var s: i64 = p_os_random_u64();
+    s = s ^ (p_clock_now_us() * -7046029254386353131);
+    s = s ^ (p_clock_now_ms() << 21);
+    return sm64(s);
+}
+
+impl RngState {
+    /// A generator with a deterministic sequence for `seed`.
+    pub fn new(seed: i64) -> RngState {
+        return RngState { state: sm64(seed), seeded: true };
+    }
+
+    /// A generator seeded from OS entropy (different sequence every run).
+    pub fn new_os() -> RngState {
+        return RngState { state: os_seed(), seeded: true };
+    }
+
+    /// Next raw word of the xorshift64* sequence.
+    @wrapping pub fn next(self: & mut RngState) -> i64 {
+        if !self.seeded {
+            self.state = os_seed();
+            self.seeded = true;
+        }
+        var x: i64 = self.state;
+        x = x ^ (x >> 12);
+        x = x ^ (x << 25);
+        x = x ^ (x >> 27);
+        self.state = x;
+        return x * 2685821657736338717; // 0x2545F4914F6CDD1D
+    }
+
+    /// A value in [0, bound) with no modulo bias: a power-of-two window of
+    /// raw bits, resampled on rejection. bound <= 0 gives 0.
+    pub fn next_bounded(self: & mut RngState, bound: i64) -> i64 {
+        if bound <= 0 {
+            return 0;
+        }
+        var mask: i64 = 1;
+        while mask < bound - 1 {
+            mask = mask * 2 + 1;
+        }
+        var r: i64 = self.next() & mask;
+        while r >= bound {
+            r = self.next() & mask;
+        }
+        return r;
+    }
+}
+
+// ─── Global generator ───────────────────────────────────────────────────
+
+/// The process-wide generator. Seeds lazily from OS entropy; random_seed()
+/// and random_seed_time() set an explicit sequence.
 var RNG_DEFAULT: RngState = RngState {
-    state: 1
+    state: 0,
+    seeded: false
 };
+
 // ─── Seeding ────────────────────────────────────────────────────────────
 
-/// Seed the random number generator.
+/// Seed the global generator with a fixed seed (deterministic sequence).
 ///
 /// Example:
 ///   random_seed(42);
@@ -33,47 +111,36 @@ var RNG_DEFAULT: RngState = RngState {
 ///   random_seed(42);
 ///   assert_eq(random_int(1000), a);
 pub fn random_seed(seed: i64) -> void {
-    if seed == 0 {
-        RNG_DEFAULT.state = 1;
-    } else {
-        RNG_DEFAULT.state = seed;
-    }
+    RNG_DEFAULT.state = sm64(seed);
+    RNG_DEFAULT.seeded = true;
 }
 
-/// Seed with current time (non-deterministic).
-/// Uses p_clock_now() for a time-based seed.
-///
-/// Example:
-///   random_seed_time();
-///   var n = random_int(10);
-///   assert(n >= 0 && n < 10);
+/// Seed with a per-run seed: FIDES_TEST_SEED when set (test determinism),
+/// else OS entropy mixed with the clock.
 pub fn random_seed_time() -> void {
-    RNG_DEFAULT.state = p_clock_now() & 0x7FFFFFFF;
-    if RNG_DEFAULT.state == 0 {
-        RNG_DEFAULT.state = 1;
+    // Complaint CT3: with FIDES_TEST_SEED set (a test run), the "time" seed
+    // is that number, so a test that seeds from the clock repeats exactly.
+    match env_var("FIDES_TEST_SEED") {
+        Option::Some(s) => {
+            random_seed(str_parse_int(s));
+            return;
+        }
+        Option::None => {
+        }
     }
+    RNG_DEFAULT.state = os_seed();
+    RNG_DEFAULT.seeded = true;
 }
 
 // ─── Integer generation ─────────────────────────────────────────────────
 
-/// Internal: next raw LCG value (masked to 32 bits to avoid overflow).
-fn next_raw() -> i64 {
-    // LCG: state = (state * 1103515245 + 12345) & 0x7FFFFFFF
-    // Using 32-bit mask to avoid i64 overflow
-    RNG_DEFAULT.state = (RNG_DEFAULT.state * 1103515245 + 12345) & 0x7FFFFFFF;
-    return RNG_DEFAULT.state;
-}
-
-/// Generate a random i64 in [0, RAND_MAX].
-///
-/// Example:
-///   random_seed(1);
-///   assert(random_raw() >= 0);
+/// Generate the next raw 64-bit word of the global generator.
 pub fn random_raw() -> i64 {
-    return next_raw();
+    return RNG_DEFAULT.next();
 }
 
-/// Generate a random i64 in [0, max).
+/// Generate a random i64 in [0, max) (unbiased; the low bits are not just
+/// taken modulo max).
 ///
 /// Example:
 ///   random_seed(7);
@@ -84,10 +151,7 @@ pub fn random_raw() -> i64 {
 ///     i = i + 1;
 ///   }
 pub fn random_int(max: i64) -> i64 {
-    if max <= 0 {
-        return 0;
-    }
-    return next_raw() % max;
+    return RNG_DEFAULT.next_bounded(max);
 }
 
 /// Generate a random i64 in [min, max].
@@ -100,45 +164,58 @@ pub fn random_int_range(min: i64, max: i64) -> i64 {
     if max < min {
         return min;
     }
-    var range = max - min + 1;
-    return min + (next_raw() % range);
+    return min + RNG_DEFAULT.next_bounded(max - min + 1);
+}
+
+/// Generate a random i64 over the whole range (any bits may be set).
+pub fn random_i64() -> i64 {
+    return RNG_DEFAULT.next();
 }
 
 // ─── Float generation ───────────────────────────────────────────────────
 
-/// Generate a random f64 in [0.0, 1.0).
+/// Generate a random f64 in [0.0, 1.0): 53 raw bits over 2^53, so 1.0 is
+/// never returned.
 ///
 /// Example:
 ///   random_seed(3);
 ///   var f = random_float();
 ///   assert(f >= 0.0 && f < 1.0);
 pub fn random_float() -> f64 {
-    return (next_raw() as f64) / 2147483647.0;
+    var u: i64 = (RNG_DEFAULT.next() >> 11) & 9007199254740991; // 2^53 - 1
+    return (u as f64) / 9007199254740992.0;
 }
 
 /// Generate a random f64 in [0.0, max).
-///
-/// Example:
-///   random_seed(3);
-///   var f = random_float_max(5.0);
-///   assert(f >= 0.0 && f < 5.0);
 pub fn random_float_max(max: f64) -> f64 {
     return random_float() * max;
 }
 
 /// Generate a random f64 in [min, max).
-///
-/// Example:
-///   random_seed(3);
-///   var f = random_float_range(-1.0, 1.0);
-///   assert(f >= -1.0 && f < 1.0);
 pub fn random_float_range(min: f64, max: f64) -> f64 {
     return min + random_float() * (max - min);
 }
 
+/// Generate a Gaussian (normal) sample with the given mean and standard
+/// deviation (Box-Muller).
+///
+/// Example:
+///   random_seed(3);
+///   var g = random_gaussian(0.0, 1.0);
+pub fn random_gaussian(mean: f64, stddev: f64) -> f64 {
+    var u1: f64 = random_float();
+    if u1 <= 0.0 {
+        u1 = 0.0000000000000001;
+    }
+    var u2: f64 = random_float();
+    var mag: f64 = math_sqrt(0.0 - 2.0 * math_log(u1));
+    return mean + stddev * mag * math_cos(2.0 * math_pi() * u2);
+}
+
 // ─── Boolean / choice ───────────────────────────────────────────────────
 
-/// Generate a random boolean.
+/// Generate a random boolean (a whole bounded draw, not a fixed bit of the
+/// sequence, so consecutive calls do not correlate).
 ///
 /// Example:
 ///   random_seed(9);
@@ -150,7 +227,7 @@ pub fn random_float_range(min: f64, max: f64) -> f64 {
 ///   }
 ///   assert(t > 0 && t < 100);
 pub fn random_bool() -> bool {
-    return (next_raw() & 1) == 1;
+    return RNG_DEFAULT.next_bounded(2) == 1;
 }
 
 /// Pick a random element from a Vec. Returns 0 if empty.
@@ -165,20 +242,12 @@ pub fn random_choice(v: Vec<i64>) -> i64 {
     if v.is_empty() {
         return 0;
     }
-    return v.get(random_int(v.len()));
+    return v.get(RNG_DEFAULT.next_bounded(v.len()));
 }
 
 /// Pick a random index from a Vec of the given length.
-///
-/// Example:
-///   random_seed(5);
-///   var i = random_choice_idx(4);
-///   assert(i >= 0 && i < 4);
 pub fn random_choice_idx(len: i64) -> i64 {
-    if len <= 0 {
-        return 0;
-    }
-    return random_int(len);
+    return RNG_DEFAULT.next_bounded(len);
 }
 
 // ─── Shuffle ────────────────────────────────────────────────────────────
@@ -195,13 +264,15 @@ pub fn random_choice_idx(len: i64) -> i64 {
 pub fn random_shuffle(v: & mut Vec<i64>) -> void {
     var i = v.len() - 1;
     while i > 0 {
-        var j = random_int(i + 1);
+        var j = RNG_DEFAULT.next_bounded(i + 1);
         var tmp = v.get(i);
         v.set(i, v.get(j));
         v.set(j, tmp);
         i = i - 1;
     }
 }
+
+// ─── Bytes / hex ────────────────────────────────────────────────────────
 
 /// Generate a random byte (0-255).
 ///
@@ -210,7 +281,18 @@ pub fn random_shuffle(v: & mut Vec<i64>) -> void {
 ///   var b = random_byte();
 ///   assert(b >= 0 && b <= 255);
 pub fn random_byte() -> i64 {
-    return next_raw() & 0xFF;
+    return RNG_DEFAULT.next_bounded(256);
+}
+
+/// Generate `n` random bytes as a Vec of values 0-255.
+pub fn random_bytes(n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(RNG_DEFAULT.next_bounded(256));
+        i = i + 1;
+    }
+    return out;
 }
 
 /// Generate a random hex string of the given length.
@@ -224,7 +306,7 @@ pub fn random_hex(length: i64) -> str {
     var bytes = Vec::new();
     var i = 0;
     while i < length {
-        bytes.push(str_byte_at(hex_chars, next_raw() & 0xF));
+        bytes.push(str_byte_at(hex_chars, RNG_DEFAULT.next_bounded(16)));
         i = i + 1;
     }
     return str_from_bytes(bytes);

@@ -1,0 +1,121 @@
+// tests/projects/service: a service (release-roadmap N11).
+//
+// A key-value store that answers requests, one per line, read from
+// standard input, the way a line-protocol daemon or a language server
+// does; it runs until QUIT or the end of its input.
+//   SET <key> <value>   OK
+//   GET <key>           VALUE <value>, or NOT_FOUND
+//   DEL <key>           OK, or NOT_FOUND
+//   COUNT               COUNT <keys held>
+//   QUIT                BYE, and the service stops
+// Anything else is answered with ERR <reason>. The exit status is 1 when
+// any request got ERR, else 0.
+//
+// scripts/projects-check.sh builds it (fid ccompile), feeds it the requests
+// of requests.txt and compares the replies with expected.txt.
+
+/// The slot of `key` among the live entries, or -1.
+fn find(keys: & Vec<str>, live: & Vec<i64>, key: str) -> i64 {
+    var i: i64 = 0;
+    while i < keys.len() {
+        if live.get(i) == 1 && keys.get(i) == key {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The number of live entries.
+fn count_live(live: & Vec<i64>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < live.len() {
+        n = n + live.get(i);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The reply to one request line. (Not named `handle`: that is the
+/// keyword of an effect handler, so a call `handle(...)` parsed as one.)
+fn reply_to(line: str, keys: & mut Vec<str>, values: & mut Vec<str>, live: & mut Vec<i64>) -> str {
+    val parts: Vec<str> = str_split(str_trim(line), " ");
+    if parts.len() == 0 {
+        return "ERR empty request";
+    }
+    val cmd: str = parts.get(0);
+    if cmd == "" {
+        return "ERR empty request";
+    }
+    if cmd == "SET" {
+        if parts.len() != 3 {
+            return "ERR SET takes a key and a value";
+        }
+        val at: i64 = find(keys, live, parts.get(1));
+        if at >= 0 {
+            values.set(at, parts.get(2));
+        } else {
+            keys.push(parts.get(1));
+            values.push(parts.get(2));
+            live.push(1);
+        }
+        return "OK";
+    }
+    if cmd == "GET" {
+        if parts.len() != 2 {
+            return "ERR GET takes a key";
+        }
+        val at2: i64 = find(keys, live, parts.get(1));
+        if at2 < 0 {
+            return "NOT_FOUND";
+        }
+        return "VALUE " + values.get(at2);
+    }
+    if cmd == "DEL" {
+        if parts.len() != 2 {
+            return "ERR DEL takes a key";
+        }
+        val at3: i64 = find(keys, live, parts.get(1));
+        if at3 < 0 {
+            return "NOT_FOUND";
+        }
+        live.set(at3, 0);
+        return "OK";
+    }
+    if cmd == "COUNT" {
+        return "COUNT " + int_to_str(count_live(live));
+    }
+    return "ERR unknown request " + cmd;
+}
+
+fn main() -> i64 {
+    var keys: Vec<str> = Vec::new();
+    var values: Vec<str> = Vec::new();
+    var live: Vec<i64> = Vec::new();
+    var errors: i64 = 0;
+    var running: bool = true;
+    while running {
+        match read_line() {
+            Option::Some(line) => {
+                if str_trim(line) == "QUIT" {
+                    println("BYE");
+                    running = false;
+                } else {
+                    val reply: str = reply_to(line,& mut keys, & mut values, & mut live);
+                    if str_starts_with(reply, "ERR") {
+                        errors = errors + 1;
+                    }
+                    println(reply);
+                }
+            }
+            Option::None => {
+                running = false;
+            }
+        }
+    }
+    if errors > 0 {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,108 @@
+// stdlib/secure_store: HMAC-SHA512 and PBKDF2-HMAC-SHA512 against
+// Python's hmac/hashlib (password/salt c=1 and c=2 are the published
+// vectors), the encrypted-file fallback (seal, open, wrong passphrase,
+// tampered header and ciphertext, truncation, a file on disk), with a
+// counting generator behind the randomness seam; the Keystore stored form
+// and steps, the Keychain queries and OSStatus mapping.
+// Expected output:
+// hmac b42af09057bac1e2d41708e48a902e09b5ff7f12ab428a4fe86653c73dd248fb82f948a549f7b791a5b41915ee4d1ec3935357e4e2317250d0372afa2ebeeb3a
+// pbkdf2 c1 867f70cf1ade02cff3752599a3a53dc4af34c7a669815ae5d513554e1c8cf252c02d470a285a0501bad999bfe943c08f050235d7d68b1da55e63f73b60a57fce
+// pbkdf2 c2 e1d9c16aa681708a45f5c7c4e215ceb66e011a2e9f0040713f18aefdb866d53cf76cab2868a39b9f7840edce4fef5a82be67335c77a6068e04112754f27ccf4e
+// file key 43603533b93b158f17bf048ec60e9dafce481cfcb2aeb57d00ea40e818a6a2c6
+// blob 84 header 465353310100000032000102030405060708090a0b0c0d0e0f101112131415161718191a1b
+// open ok entries 2 token=abc pin=1234 iterations 50
+// second seal differs true nonce 2c2d2e2f30313233
+// wrong passphrase auth-failed
+// tampered salt auth-failed ciphertext auth-failed tag auth-failed
+// truncated corrupt magic corrupt
+// delete true false entries 1
+// disk ok hello=world missing not-found
+// keystore AV== ok true iv 12 ct 20
+// keystore steps 8 first <init> last generateKey encrypt 7 AES/GCM/NoPadding
+// SecItemAdd class=genp svce=com.example acct=alice pdmn=cku v_Data=data:c2VjcmV0
+// SecItemCopyMatching class=genp svce=com.example acct=alice r_Data=bool:true m_Limit=m_LimitOne
+// put plan 2 SecItemUpdate class=genp svce=com.example acct=alice set v_Data=data:c2VjcmV0
+// osstatus ok not-found duplicate locked canceled other
+use secure_store;
+use vec;
+use string;
+use encoding;
+
+var counter: i64 = 0;
+
+fn counting(n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { out.push(counter & 255); counter = counter + 1; i = i + 1; }
+    return out;
+}
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn sub(v: Vec<i64>, a: i64, b: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < b { o.push(v.get(i)); i = i + 1; }
+    return o;
+}
+
+fn flip(v: Vec<i64>, at: i64) -> Vec<i64> {
+    var o: Vec<i64> = v;
+    o.set(at, o.get(at) ^ 1);
+    return o;
+}
+
+fn main() {
+    println("hmac " + hx(secure_hmac_sha512(str_bytes("key"), str_bytes("The quick brown fox jumps over the lazy dog"))));
+    println("pbkdf2 c1 " + hx(secure_pbkdf2_sha512(str_bytes("password"), str_bytes("salt"), 1, 64)));
+    println("pbkdf2 c2 " + hx(secure_pbkdf2_sha512(str_bytes("password"), str_bytes("salt"), 2, 64)));
+    println("file key " + hx(secure_pbkdf2_sha512(str_bytes("open sesame"), counting(16), 50, 32)));
+    counter = 0;
+
+    var s: SecureFile = secure_file_new("open sesame", 50, counting);
+    secure_put(&mut s, "token", str_bytes("abc"));
+    secure_put(&mut s, "pin", str_bytes("0000"));
+    secure_put(&mut s, "pin", str_bytes("1234"));
+    val blob: Vec<i64> = secure_file_seal(&mut s);
+    println("blob " + int_to_str(blob.len()) + " header " + hx(sub(blob, 0, SECURE_FILE_HEADER)));
+    val o: SecureOpen = secure_file_open(blob, "open sesame");
+    println("open " + secure_error_name(o.error) + " entries " + int_to_str(o.store.keys.len()) + " token="
+        + enc_bytes_to_str(secure_get(&o.store, "token")) + " pin=" + enc_bytes_to_str(secure_get(&o.store, "pin"))
+        + " iterations " + int_to_str(o.store.iterations));
+    val blob2: Vec<i64> = secure_file_seal(&mut s);
+    println("second seal differs " + bool_to_str(hx(blob2) != hx(blob)) + " nonce " + hx(sub(blob2, 25, 33)));
+    println("wrong passphrase " + secure_error_name(secure_file_open(blob, "open sesame!").error));
+    println("tampered salt " + secure_error_name(secure_file_open(flip(blob, 10), "open sesame").error)
+        + " ciphertext " + secure_error_name(secure_file_open(flip(blob, 40), "open sesame").error)
+        + " tag " + secure_error_name(secure_file_open(flip(blob, blob.len() - 1), "open sesame").error));
+    println("truncated " + secure_error_name(secure_file_open(sub(blob, 0, 40), "open sesame").error)
+        + " magic " + secure_error_name(secure_file_open(flip(blob, 0), "open sesame").error));
+    var st: SecureFile = o.store;
+    val d1: bool = secure_delete(&mut st, "token");
+    val d2: bool = secure_delete(&mut st, "token");
+    println("delete " + bool_to_str(d1) + " " + bool_to_str(d2) + " entries " + int_to_str(st.keys.len()));
+
+    val path: str = "test_std_secure_store.tmp";
+    var disk: SecureFile = secure_file_new("pw", 10, counting);
+    secure_put(&mut disk, "hello", str_bytes("world"));
+    val saved: bool = secure_file_save(&mut disk, path);
+    val back: SecureOpen = secure_file_load(path, "pw");
+    p_file_delete(path);
+    println("disk " + (if saved { secure_error_name(back.error) } else { "save failed" }) + " hello="
+        + enc_bytes_to_str(secure_get(&back.store, "hello")) + " missing " + secure_error_name(secure_file_load(path, "pw").error));
+
+    val packed: str = keystore_pack(counting(12), counting(20));
+    val up: KeystorePacked = keystore_unpack(packed);
+    println("keystore " + str_slice(packed, 0, 2) + "== ok " + bool_to_str(up.ok) + " iv " + int_to_str(up.iv.len()) + " ct " + int_to_str(up.ct_and_tag.len()));
+    val steps: Vec<KeystoreStep> = keystore_create_key_steps("k1", false);
+    val enc: Vec<KeystoreStep> = keystore_encrypt_steps("k1");
+    println("keystore steps " + int_to_str(steps.len()) + " first " + steps.get(0).method + " last " + steps.get(steps.len() - 1).method
+        + " encrypt " + int_to_str(enc.len()) + " " + str_slice(enc.get(3).args, 1, 18));
+    println(keychain_query_text(&keychain_add_query("com.example", "alice", str_bytes("secret"), KSEC_ACCESSIBLE_AFTER_FIRST_UNLOCK_THIS_DEVICE)));
+    println(keychain_query_text(&keychain_get_query("com.example", "alice")));
+    val plan: Vec<KeychainQuery> = keychain_put_plan("com.example", "alice", str_bytes("secret"), -25299);
+    println("put plan " + int_to_str(plan.len()) + " " + keychain_query_text(&plan.get(1)));
+    println("osstatus " + secure_error_name(secure_from_osstatus(0)) + " " + secure_error_name(secure_from_osstatus(-25300)) + " "
+        + secure_error_name(secure_from_osstatus(-25299)) + " " + secure_error_name(secure_from_osstatus(-25308)) + " "
+        + secure_error_name(secure_from_osstatus(-128)) + " " + secure_error_name(secure_from_osstatus(-1)));
+}

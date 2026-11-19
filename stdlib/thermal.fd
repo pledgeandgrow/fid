@@ -1,0 +1,314 @@
+// Fides building heat transfer and psychrometrics
+//
+// Pure computation (no platform seam):
+// - Conduction through a layered wall: R = Rsi + sum(d / k) + extra
+//   resistances (air gaps) + Rse, U = 1 / R (ISO 6946 surface resistances
+//   for horizontal heat flow: Rsi 0.13, Rse 0.04 m2K/W), heat loss
+//   U A dT, and the temperature at every interface (the drop across a
+//   layer is proportional to its resistance).
+// - Lumped-capacitance building models: 1R1C, C dT/dt = (Ta - T)/R + Q,
+//   stepped with the exact zero-order-hold solution (any step length), and
+//   2R2C (envelope mass node and indoor air node), stepped by backward
+//   Euler (unconditionally stable), with heating power and solar gains.
+// - Degree-days: heating and cooling degree-days from daily mean
+//   temperatures, or integrated from hourly data, for a base temperature.
+// - Heat pumps: Carnot COP for heating and cooling, a fraction of Carnot,
+//   a quadratic COP(lift) fit, and the seasonal COP by the bin method
+//   (sum of heat / sum of heat / COP).
+// - Psychrometrics after ASHRAE Handbook - Fundamentals (2017), ch. 1:
+//   Hyland-Wexler saturation pressure over ice (< 0 C) and water, humidity
+//   ratio 0.621945 pw / (p - pw), relative humidity, dew point (inverse of
+//   the saturation pressure by bisection), enthalpy
+//   1.006 t + W (2501 + 1.86 t) kJ/kg, specific volume
+//   0.287042 (t + 273.15)(1 + 1.607858 W) / p, and the thermodynamic wet
+//   bulb from ASHRAE's eq. 33 (solved by bisection).
+// Units: SI; temperatures C, pressures kPa, W in kg/kg dry air.
+
+module thermal;
+use math;
+use vec;
+
+// ─── Layered walls ───
+
+pub struct WallLayer {
+    pub name: str,
+    pub thickness: f64,
+    pub conductivity: f64,
+    pub resistance: f64,
+}
+
+pub struct Wall {
+    pub layers: Vec<WallLayer>,
+    pub rsi: f64,
+    pub rse: f64,
+}
+
+/// A wall with ISO 6946 surface resistances for horizontal heat flow.
+pub fn thermal_wall() -> Wall {
+    return Wall {
+        layers: Vec::new(), rsi: 0.13, rse: 0.04
+    };
+}
+
+/// A solid layer (outside first): thickness m, conductivity W/mK.
+pub fn thermal_add_layer(w: &mut Wall, name: str, thickness: f64, k: f64) {
+    w.layers.push(WallLayer {
+        name: name, thickness: thickness, conductivity: k, resistance: thickness / k
+    });
+}
+
+/// A layer given by its thermal resistance (air cavity), m2K/W.
+pub fn thermal_add_resistance(w: &mut Wall, name: str, r: f64) {
+    w.layers.push(WallLayer {
+        name: name, thickness: 0.0, conductivity: 0.0, resistance: r
+    });
+}
+
+pub fn thermal_wall_r(w: &Wall) -> f64 {
+    var r: f64 = w.rsi + w.rse;
+    var i: i64 = 0;
+    while i < w.layers.len() {
+        r = r + w.layers.get(i).resistance;
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn thermal_u_value(w: &Wall) -> f64 {
+    return 1.0 / thermal_wall_r(w);
+}
+
+/// Steady heat flow (W) through area a for inside/outside temperatures.
+pub fn thermal_heat_loss(w: &Wall, area: f64, t_in: f64, t_out: f64) -> f64 {
+    return thermal_u_value(w) * area * (t_in - t_out);
+}
+
+/// Temperatures from the outside air inwards: outside surface, every
+/// interface between layers, inside surface (layers.len() + 1 values).
+pub fn thermal_interface_temps(w: &Wall, t_in: f64, t_out: f64) -> Vec<f64> {
+    val q: f64 = (t_in - t_out) / thermal_wall_r(w);
+    var out: Vec<f64> = Vec::new();
+    var t: f64 = t_out + q * w.rse;
+    out.push(t);
+    var i: i64 = 0;
+    while i < w.layers.len() {
+        t = t + q * w.layers.get(i).resistance;
+        out.push(t);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Lumped-capacitance models ───
+
+/// 1R1C: resistance R (K/W) to the outside, capacitance C (J/K).
+pub struct Rc1 {
+    pub r: f64,
+    pub c: f64,
+    pub t: f64,
+}
+
+/// Advance dt seconds with outside temperature ta and heat input q (W)
+/// held constant over the step (exact solution).
+pub fn Rc1_step(m: &mut Rc1, dt: f64, ta: f64, q: f64) -> f64 {
+    val eq: f64 = ta + m.r * q;
+    m.t = eq + (m.t - eq) * math_exp(0.0 - dt / (m.r * m.c));
+    return m.t;
+}
+
+/// 2R2C: indoor air (ti, ci) coupled to the envelope mass (te, ce) by ri,
+/// the envelope to outside by re. Heating goes to the air, solar gains to
+/// the envelope mass.
+pub struct Rc2 {
+    pub ri: f64,
+    pub re: f64,
+    pub ci: f64,
+    pub ce: f64,
+    pub ti: f64,
+    pub te: f64,
+}
+
+/// Backward-Euler step: solves the 2x2 implicit system exactly.
+pub fn Rc2_step(m: &mut Rc2, dt: f64, ta: f64, q_heat: f64, q_solar: f64) {
+    // ci (ti' - ti)/dt = (te' - ti')/ri + q_heat
+    // ce (te' - te)/dt = (ti' - te')/ri + (ta - te')/re + q_solar
+    val a11: f64 = m.ci / dt + 1.0 / m.ri;
+    val a12: f64 = -1.0 / m.ri;
+    val b1: f64 = m.ci / dt * m.ti + q_heat;
+    val a21: f64 = -1.0 / m.ri;
+    val a22: f64 = m.ce / dt + 1.0 / m.ri + 1.0 / m.re;
+    val b2: f64 = m.ce / dt * m.te + ta / m.re + q_solar;
+    val det: f64 = a11 * a22 - a12 * a21;
+    m.ti = (b1 * a22 - a12 * b2) / det;
+    m.te = (a11 * b2 - a21 * b1) / det;
+}
+
+/// Steady indoor temperature of the 2R2C model.
+pub fn Rc2_steady(m: &Rc2, ta: f64, q_heat: f64, q_solar: f64) -> f64 {
+    // all heat leaves through re; te = ta + re (q_heat + q_solar)
+    val te: f64 = ta + m.re * (q_heat + q_solar);
+    return te + m.ri * q_heat;
+}
+
+/// Heating power that holds `t_set` against `ta` in a 1R1C building.
+pub fn thermal_steady_power(r: f64, t_set: f64, ta: f64) -> f64 {
+    return (t_set - ta) / r;
+}
+
+// ─── Degree-days ───
+
+/// Heating degree-days from daily mean temperatures.
+pub fn thermal_hdd(daily_mean: &Vec<f64>, base: f64) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < daily_mean.len() {
+        s = s + math_max_f64(0.0, base - daily_mean.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+pub fn thermal_cdd(daily_mean: &Vec<f64>, base: f64) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < daily_mean.len() {
+        s = s + math_max_f64(0.0, daily_mean.get(i) - base);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Heating degree-days integrated from hourly temperatures (degree-hours
+/// / 24).
+pub fn thermal_hdd_hourly(hourly: &Vec<f64>, base: f64) -> f64 {
+    return thermal_hdd(hourly, base) / 24.0;
+}
+
+pub fn thermal_cdd_hourly(hourly: &Vec<f64>, base: f64) -> f64 {
+    return thermal_cdd(hourly, base) / 24.0;
+}
+
+/// Seasonal heating energy (kWh) of a building with heat loss coefficient
+/// h (W/K): h x HDD x 24 / 1000.
+pub fn thermal_degree_day_energy(h_w_per_k: f64, hdd: f64) -> f64 {
+    return h_w_per_k * hdd * 24.0 / 1000.0;
+}
+
+// ─── Heat pumps ───
+
+/// Carnot heating COP between sink t_hot and source t_cold (C).
+pub fn thermal_cop_carnot_heating(t_hot: f64, t_cold: f64) -> f64 {
+    val th: f64 = t_hot + 273.15;
+    return th / (th - (t_cold + 273.15));
+}
+
+pub fn thermal_cop_carnot_cooling(t_hot: f64, t_cold: f64) -> f64 {
+    val tc: f64 = t_cold + 273.15;
+    return tc / ((t_hot + 273.15) - tc);
+}
+
+/// COP = a + b lift + c lift^2, lift = t_hot - t_cold (a regression of
+/// manufacturer data).
+pub fn thermal_cop_quadratic(a: f64, b: f64, c: f64, t_hot: f64, t_cold: f64) -> f64 {
+    val lift: f64 = t_hot - t_cold;
+    return a + b * lift + c * lift * lift;
+}
+
+/// Bin method: heat demand (kWh) and COP per temperature bin; seasonal
+/// COP = sum heat / sum (heat / COP).
+pub fn thermal_scop(heat: &Vec<f64>, cop: &Vec<f64>) -> f64 {
+    var q: f64 = 0.0;
+    var e: f64 = 0.0;
+    var i: i64 = 0;
+    while i < heat.len() {
+        q = q + heat.get(i);
+        e = e + heat.get(i) / cop.get(i);
+        i = i + 1;
+    }
+    return q / e;
+}
+
+// ─── Psychrometrics ───
+
+/// Saturation vapour pressure (kPa), Hyland-Wexler (ASHRAE eq. 5 and 6).
+pub fn thermal_pws(t: f64) -> f64 {
+    val tk: f64 = t + 273.15;
+    if t < 0.0 {
+        val ln_p: f64 = -5674.5359 / tk + 6.3925247 - 0.009677843 * tk + 0.00000062215701 * tk * tk + 0.0000000020747825 * tk * tk * tk - 0.0000000000009484024 * tk * tk * tk * tk + 4.1635019 * math_log(tk);
+        return math_exp(ln_p) / 1000.0;
+    }
+    val ln_p2: f64 = -5800.2206 / tk + 1.3914993 - 0.048640239 * tk + 0.000041764768 * tk * tk - 0.000000014452093 * tk * tk * tk + 6.5459673 * math_log(tk);
+    return math_exp(ln_p2) / 1000.0;
+}
+
+/// Humidity ratio from vapour partial pressure pw at total pressure p.
+pub fn thermal_humidity_ratio(pw: f64, p: f64) -> f64 {
+    return 0.621945 * pw / (p - pw);
+}
+
+/// Vapour partial pressure from humidity ratio.
+pub fn thermal_pw_from_w(w: f64, p: f64) -> f64 {
+    return p * w / (0.621945 + w);
+}
+
+/// Humidity ratio of air at t with relative humidity rh (0..1).
+pub fn thermal_w_from_rh(t: f64, rh: f64, p: f64) -> f64 {
+    return thermal_humidity_ratio(rh * thermal_pws(t), p);
+}
+
+pub fn thermal_rh(t: f64, w: f64, p: f64) -> f64 {
+    return thermal_pw_from_w(w, p) / thermal_pws(t);
+}
+
+/// Dew point (C) for vapour pressure pw: the temperature whose saturation
+/// pressure is pw (bisection on -100..200 C).
+pub fn thermal_dew_point(pw: f64) -> f64 {
+    var lo: f64 = -100.0;
+    var hi: f64 = 200.0;
+    var k: i64 = 0;
+    while k < 100 {
+        val mid: f64 = (lo + hi) / 2.0;
+        if thermal_pws(mid) < pw {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        k = k + 1;
+    }
+    return (lo + hi) / 2.0;
+}
+
+/// Specific enthalpy of moist air, kJ/kg dry air.
+pub fn thermal_enthalpy(t: f64, w: f64) -> f64 {
+    return 1.006 * t + w * (2501.0 + 1.86 * t);
+}
+
+/// Specific volume, m3/kg dry air.
+pub fn thermal_specific_volume(t: f64, w: f64, p: f64) -> f64 {
+    return 0.287042 * (t + 273.15) * (1.0 + 1.607858 * w) / p;
+}
+
+/// Humidity ratio from dry bulb t and thermodynamic wet bulb tw (ASHRAE
+/// eq. 33, above freezing).
+pub fn thermal_w_from_wet_bulb(t: f64, tw: f64, p: f64) -> f64 {
+    val ws: f64 = thermal_humidity_ratio(thermal_pws(tw), p);
+    return ((2501.0 - 2.326 * tw) * ws - 1.006 * (t - tw)) / (2501.0 + 1.86 * t - 4.186 * tw);
+}
+
+/// Thermodynamic wet bulb for dry bulb t and humidity ratio w (bisection
+/// between the dew point and t).
+pub fn thermal_wet_bulb(t: f64, w: f64, p: f64) -> f64 {
+    var lo: f64 = thermal_dew_point(thermal_pw_from_w(w, p));
+    var hi: f64 = t;
+    var k: i64 = 0;
+    while k < 100 {
+        val mid: f64 = (lo + hi) / 2.0;
+        if thermal_w_from_wet_bulb(t, mid, p) < w {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        k = k + 1;
+    }
+    return (lo + hi) / 2.0;
+}

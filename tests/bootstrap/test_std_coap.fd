@@ -1,0 +1,282 @@
+// stdlib/coap: RFC 7252 messages (the GET /temperature exchange of its examples, option delta/length extensions), format errors, RFC 7959 block values and a three-block transfer, RFC 7641 freshness and notifications, and two endpoints exchanging piggybacked, duplicate, separate, retransmitted, reset and observed messages.
+// Expected output:
+// rfc 7252 request: 40017d34bb74656d7065726174757265
+// rfc 7252 response: 2.05 "22.3 C" mid 7d34
+// options: 42010001 7a10 b773656e736f7273 0474656d70 46756e69743d63 2132 6122
+// options: same after decode, path /sensors/temp, accept 50, block2 2/0/64
+// extended: 50021234dd1607636f61703a2f2f6578616d706c652e6f72672f78d20c03e8e006b7ff6869
+// extended: decoded 3 options 35 60 2048, size1 1000
+// format errors: 7 of 7 rejected
+// block values: 2/0/64 0/1/1024 22 0e
+// block2 transfer: 3 blocks 64+64+22, 150 bytes, same body
+// block1 upload: 0/1/32 1/1/32 2/1/32 3/0/32
+// observe fresh: true false true true false
+// piggybacked: 2.05 "21.5" pending 0
+// duplicate: 1 reply resent, 0 new requests
+// separate: empty ack, then 2.05 "late" acked, server waiting 0
+// retransmit: 5 sends, then timeout at 78500 ms
+// reset: event reset, pending 0
+// observe: 3 notifications 2 3 4, after forget: reset sent, observers 0
+use coap;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn bytes(s: str) -> Vec<i64> {
+    return str_bytes(s);
+}
+
+var bad_ok: i64 = 0;
+var bad_n: i64 = 0;
+
+fn bad(h: str) {
+    bad_n = bad_n + 1;
+    val d: CoapDecoded = coap_decode(hex_decode_bytes(h));
+    if !d.ok {
+        bad_ok = bad_ok + 1;
+    } else {
+        println("accepted " + h);
+    }
+}
+
+// Carry every datagram from a to b; how many were carried.
+fn carry(a: &mut CoapEndpoint, b: &mut CoapEndpoint, now: i64) -> i64 {
+    val out: Vec<Vec<i64>> = coap_ep_take_outbox(a);
+    var i: i64 = 0;
+    while i < out.len() {
+        coap_ep_receive(b, out.get(i), now);
+        i = i + 1;
+    }
+    return out.len();
+}
+
+fn main() {
+    var req: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0x7d34);
+    coap_set_uri(&mut req, "/temperature");
+    println("rfc 7252 request: " + hx(coap_encode(&req)));
+    val rd: CoapDecoded = coap_decode(hex_decode_bytes("60457d34ff32322e332043"));
+    println("rfc 7252 response: " + coap_code_str(rd.msg.code) + " \"" + str_from_bytes(rd.msg.payload) + "\" mid " + int_to_hex(rd.msg.mid));
+
+    var m: CoapMsg = coap_msg(COAP_CON, COAP_GET, 1);
+    m.token.push(0x7a);
+    m.token.push(0x10);
+    coap_add_uint(&mut m, COAP_O_BLOCK2, coap_block_value(2, false, 2));
+    coap_add_uint(&mut m, COAP_O_ACCEPT, COAP_CF_JSON);
+    coap_set_uri(&mut m, "/sensors/temp?unit=c");
+    val mb: Vec<i64> = coap_encode(&m);
+    val want: str = "420100017a10b773656e736f72730474656d7046756e69743d6321326122";
+    if hx(mb) == want {
+        println("options: 42010001 7a10 b773656e736f7273 0474656d70 46756e69743d63 2132 6122");
+    } else {
+        println("options: DIFFERENT " + hx(mb));
+    }
+    val md: CoapDecoded = coap_decode(mb);
+    var same: str = "DIFFERENT";
+    if hx(coap_encode(&md.msg)) == want {
+        same = "same";
+    }
+    println("options: " + same + " after decode, path " + coap_uri_path(&md.msg) + ", accept " + int_to_str(coap_get_uint(&md.msg, COAP_O_ACCEPT, 0)) + ", block2 " + coap_block_str(coap_get_uint(&md.msg, COAP_O_BLOCK2, 0)));
+
+    var x: CoapMsg = coap_msg(COAP_NON, COAP_POST, 0x1234);
+    coap_add_uint(&mut x, 2048, 0);
+    coap_add_uint(&mut x, COAP_O_SIZE1, 1000);
+    coap_add_str(&mut x, COAP_O_PROXY_URI, "coap://example.org/x");
+    x.payload = bytes("hi");
+    val xb: Vec<i64> = coap_encode(&x);
+    println("extended: " + hx(xb));
+    val xd: CoapDecoded = coap_decode(xb);
+    println("extended: decoded " + int_to_str(xd.msg.opt_nums.len()) + " options " + int_to_str(xd.msg.opt_nums.get(0)) + " " + int_to_str(xd.msg.opt_nums.get(1)) + " " + int_to_str(xd.msg.opt_nums.get(2)) + ", size1 " + int_to_str(coap_get_uint(&xd.msg, COAP_O_SIZE1, 0)));
+
+    bad("80010000");          // version 2
+    bad("49010000");          // token length 9
+    bad("40010000ff");        // payload marker, no payload
+    bad("40010000f100");      // option delta nibble 15
+    bad("41000000aa");        // empty message with a token
+    bad("40010000b561");      // option value cut short
+    bad("400100");            // shorter than the header
+    println("format errors: " + int_to_str(bad_ok) + " of " + int_to_str(bad_n) + " rejected");
+
+    println("block values: " + coap_block_str(coap_block_value(2, false, 2)) + " " + coap_block_str(coap_block_value(0, true, 6)) + " " + int_to_hex(coap_block_value(2, false, 2)) + " 0" + int_to_hex(coap_block_value(0, true, 6)));
+
+    // Block2: a 150-byte body in 64-byte blocks
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 150 {
+        body.push((i * 7) & 255);
+        i = i + 1;
+    }
+    var asm: CoapBlockAsm = coap_block_asm_new();
+    var sizes: str = "";
+    var blocks: i64 = 0;
+    var ask: i64 = 0;
+    while !asm.done && asm.ok && blocks < 10 {
+        var resp: CoapMsg = coap_msg(COAP_ACK, COAP_CONTENT, blocks);
+        coap_add_uint(&mut resp, COAP_O_ETAG, 0x5a);
+        coap_block2_respond(&mut resp, &body, coap_block_num(ask), 2);
+        coap_block_asm_add(&mut asm, &resp);
+        if blocks > 0 {
+            sizes = sizes + "+";
+        }
+        sizes = sizes + int_to_str(resp.payload.len());
+        ask = asm.next;
+        blocks = blocks + 1;
+    }
+    var bsame: str = "different body";
+    if hx(asm.data) == hx(body) {
+        bsame = "same body";
+    }
+    println("block2 transfer: " + int_to_str(blocks) + " blocks " + sizes + ", " + int_to_str(asm.data.len()) + " bytes, " + bsame);
+
+    var up: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 100 {
+        up.push(i);
+        i = i + 1;
+    }
+    val base: CoapMsg = coap_msg(COAP_CON, COAP_PUT, 9);
+    var b1: str = "";
+    i = 0;
+    while i < coap_block1_count(up.len(), 1) {
+        val r: CoapMsg = coap_block1_request(&base, &up, i, 1);
+        if i > 0 {
+            b1 = b1 + " ";
+        }
+        b1 = b1 + coap_block_str(coap_get_uint(&r, COAP_O_BLOCK1, 0));
+        i = i + 1;
+    }
+    println("block1 upload: " + b1);
+
+    println("observe fresh: " + bool_to_str(coap_observe_fresh(5, 0, 6, 1)) + " " + bool_to_str(coap_observe_fresh(6, 0, 5, 1)) + " " + bool_to_str(coap_observe_fresh(16777000, 0, 3, 1)) + " " + bool_to_str(coap_observe_fresh(9, 0, 5, 200)) + " " + bool_to_str(coap_observe_fresh(3, 0, 16777000, 1)));
+
+    // Two endpoints: a client and a server
+    var cl: CoapEndpoint = coap_ep_new(100, 7);
+    var sv: CoapEndpoint = coap_ep_new(5000, 9);
+    var g: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0);
+    coap_set_uri(&mut g, "/temp");
+    coap_ep_request(&mut cl, &mut g, 0);
+    val first: Vec<Vec<i64>> = coap_ep_take_outbox(&mut cl);
+    coap_ep_receive(&mut sv, first.get(0), 1);
+    val sev: Vec<CoapEvent> = coap_ep_take_events(&mut sv);
+    val got_req: CoapEvent = sev.get(0);
+    var answer: CoapMsg = coap_msg(0, COAP_CONTENT, 0);
+    answer.payload = bytes("21.5");
+    coap_ep_respond(&mut sv, &got_req.msg, &mut answer, 2);
+    carry(&mut sv, &mut cl, 3);
+    val cev: Vec<CoapEvent> = coap_ep_take_events(&mut cl);
+    val ce: CoapEvent = cev.get(0);
+    println("piggybacked: " + coap_code_str(ce.msg.code) + " \"" + str_from_bytes(ce.msg.payload) + "\" pending " + int_to_str(coap_ep_pending(&cl)));
+    // the same request datagram again
+    coap_ep_receive(&mut sv, first.get(0), 4);
+    val resent: i64 = coap_ep_take_outbox(&mut sv).len();
+    println("duplicate: " + int_to_str(resent) + " reply resent, " + int_to_str(coap_ep_take_events(&mut sv).len()) + " new requests");
+
+    // separate response
+    var g2: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0);
+    coap_set_uri(&mut g2, "/slow");
+    coap_ep_request(&mut cl, &mut g2, 10);
+    carry(&mut cl, &mut sv, 11);
+    val sev2: Vec<CoapEvent> = coap_ep_take_events(&mut sv);
+    val r2: CoapEvent = sev2.get(0);
+    coap_ep_ack_empty(&mut sv, &r2.msg);
+    carry(&mut sv, &mut cl, 12);
+    val after_ack: i64 = coap_ep_take_events(&mut cl).len();
+    var late: CoapMsg = coap_msg(COAP_CON, COAP_CONTENT, 0);
+    late.token = r2.msg.token;
+    late.payload = bytes("late");
+    coap_ep_send(&mut sv, &mut late, 500);
+    carry(&mut sv, &mut cl, 501);
+    val cev2: Vec<CoapEvent> = coap_ep_take_events(&mut cl);
+    carry(&mut cl, &mut sv, 502);
+    var what: str = "no event";
+    if after_ack == 0 {
+        what = "empty ack";
+    }
+    val ce2: CoapEvent = cev2.get(0);
+    println("separate: " + what + ", then " + coap_code_str(ce2.msg.code) + " \"" + str_from_bytes(ce2.msg.payload) + "\" acked, server waiting " + int_to_str(sv.rt_mids.len()));
+
+    // retransmission: every datagram is lost
+    var lone: CoapEndpoint = coap_ep_new(1, 3);
+    var gl: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0);
+    coap_ep_request(&mut lone, &mut gl, 0);
+    var sends: i64 = coap_ep_take_outbox(&mut lone).len();
+    var t: i64 = 0;
+    var timeout_at: i64 = -1;
+    while t < 200000 && timeout_at < 0 {
+        t = t + 125;
+        coap_ep_tick(&mut lone, t);
+        sends = sends + coap_ep_take_outbox(&mut lone).len();
+        val evs: Vec<CoapEvent> = coap_ep_take_events(&mut lone);
+        if evs.len() > 0 {
+            val ev: CoapEvent = evs.get(0);
+            if ev.kind == COAP_EV_TIMEOUT {
+                timeout_at = t;
+            }
+        }
+    }
+    println("retransmit: " + int_to_str(sends) + " sends, then timeout at " + int_to_str(timeout_at) + " ms");
+
+    // reset
+    var g3: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0);
+    coap_ep_request(&mut cl, &mut g3, 600);
+    val o3: Vec<Vec<i64>> = coap_ep_take_outbox(&mut cl);
+    val d3: CoapDecoded = coap_decode(o3.get(0));
+    val rst: CoapMsg = coap_msg(COAP_RST, COAP_EMPTY, d3.msg.mid);
+    coap_ep_receive(&mut cl, coap_encode(&rst), 601);
+    val rev: Vec<CoapEvent> = coap_ep_take_events(&mut cl);
+    val re: CoapEvent = rev.get(0);
+    var rk: str = "other";
+    if re.kind == COAP_EV_RESET {
+        rk = "reset";
+    }
+    println("reset: event " + rk + ", pending " + int_to_str(coap_ep_pending(&cl)));
+
+    // observe
+    var obs: CoapObservers = coap_observers_new();
+    var go: CoapMsg = coap_msg(COAP_CON, COAP_GET, 0);
+    coap_set_uri(&mut go, "/temp");
+    coap_add_uint(&mut go, COAP_O_OBSERVE, 0);
+    val otok: Vec<i64> = coap_ep_request(&mut cl, &mut go, 700);
+    carry(&mut cl, &mut sv, 701);
+    val oev: Vec<CoapEvent> = coap_ep_take_events(&mut sv);
+    val oreq: CoapEvent = oev.get(0);
+    var oans: CoapMsg = coap_msg(0, COAP_CONTENT, 0);
+    if coap_observers_request(&mut obs, &oreq.msg) {
+        coap_add_uint(&mut oans, COAP_O_OBSERVE, coap_observers_next_seq(&mut obs));
+    }
+    oans.payload = bytes("20");
+    coap_ep_respond(&mut sv, &oreq.msg, &mut oans, 702);
+    carry(&mut sv, &mut cl, 703);
+    var k: i64 = 0;
+    while k < 2 {
+        var ns: Vec<CoapMsg> = coap_observers_notify(&mut obs, "/temp", bytes("21"), COAP_CF_TEXT, COAP_NON, 0);
+        var n0: CoapMsg = ns.get(0);
+        coap_ep_send(&mut sv, &mut n0, 800 + k);
+        carry(&mut sv, &mut cl, 801 + k);
+        k = k + 1;
+    }
+    val nev: Vec<CoapEvent> = coap_ep_take_events(&mut cl);
+    var seqs: str = "";
+    k = 0;
+    while k < nev.len() {
+        val ne: CoapEvent = nev.get(k);
+        seqs = seqs + " " + int_to_str(coap_get_uint(&ne.msg, COAP_O_OBSERVE, 0 - 1));
+        k = k + 1;
+    }
+    coap_ep_forget(&mut cl, &otok);
+    var last: Vec<CoapMsg> = coap_observers_notify(&mut obs, "/temp", bytes("22"), COAP_CF_TEXT, COAP_NON, 0);
+    var l0: CoapMsg = last.get(0);
+    coap_ep_send(&mut sv, &mut l0, 900);
+    carry(&mut sv, &mut cl, 901);
+    val back: Vec<Vec<i64>> = coap_ep_take_outbox(&mut cl);
+    val bd: CoapDecoded = coap_decode(back.get(0));
+    var said: str = "nothing";
+    if bd.msg.mtype == COAP_RST {
+        said = "reset sent";
+        coap_observers_cancel(&mut obs, &l0.token);
+    }
+    println("observe: " + int_to_str(nev.len()) + " notifications" + seqs + ", after forget: " + said + ", observers " + int_to_str(obs.paths.len()));
+}

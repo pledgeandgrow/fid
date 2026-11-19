@@ -1,0 +1,772 @@
+// Fides Modbus: RTU and TCP framing, the PDUs of function codes 1-6, 15,
+// 16 and 23 with exceptions, a client and a server register map
+//
+// Real (pure computation):
+//   - CRC-16/MODBUS (polynomial 0xA001 reflected, initial 0xFFFF, low byte
+//     first on the wire) and RTU frames: unit address + PDU + CRC, with the
+//     length of a frame worked out from its function code so a serial byte
+//     stream can be cut into frames (modbus_rtu_frame_len);
+//   - Modbus TCP: the MBAP header (transaction id, protocol 0, length,
+//     unit id) and stream framing (modbus_tcp_frame_len);
+//   - PDUs (Modbus Application Protocol 1.1b3): Read Coils (1), Read
+//     Discrete Inputs (2), Read Holding Registers (3), Read Input Registers
+//     (4), Write Single Coil (5), Write Single Register (6), Write Multiple
+//     Coils (15), Write Multiple Registers (16), Read/Write Multiple
+//     Registers (23), and exception responses (function | 0x80, codes 1-4),
+//     with the quantity limits of the spec;
+//   - ModbusMap, a server: coils, discrete inputs, holding and input
+//     registers with their sizes, answering every function above with the
+//     right exception (illegal function, address or value), RTU unit
+//     addressing and broadcast (unit 0: carried out, not answered);
+//   - ModbusClient: builds requests, matches TCP responses by transaction
+//     id (RTU: the single outstanding request) and checks each response
+//     against its request (function, byte count, echo).
+//
+// The seam: no serial port or socket here. Frames are Vec<i64> (bytes
+// 0..255): write the client's frames to a UART or a TCP socket, give it
+// what comes back; a server gets request frames and returns the answer.
+
+module modbus;
+ use vec; use string;
+
+pub const MODBUS_READ_COILS: i64 = 1;
+pub const MODBUS_READ_DISCRETE: i64 = 2;
+pub const MODBUS_READ_HOLDING: i64 = 3;
+pub const MODBUS_READ_INPUT: i64 = 4;
+pub const MODBUS_WRITE_COIL: i64 = 5;
+pub const MODBUS_WRITE_REGISTER: i64 = 6;
+pub const MODBUS_WRITE_COILS: i64 = 15;
+pub const MODBUS_WRITE_REGISTERS: i64 = 16;
+pub const MODBUS_READ_WRITE: i64 = 23;
+
+pub const MODBUS_EX_ILLEGAL_FUNCTION: i64 = 1;
+pub const MODBUS_EX_ILLEGAL_ADDRESS: i64 = 2;
+pub const MODBUS_EX_ILLEGAL_VALUE: i64 = 3;
+pub const MODBUS_EX_DEVICE_FAILURE: i64 = 4;
+
+// ─── CRC-16/MODBUS ───────────────────────────────────────────────────────
+
+/// CRC-16/MODBUS of `b` ("123456789" gives 0x4B37).
+pub fn modbus_crc16(b: & Vec<i64>) -> i64 {
+    var crc: i64 = 65535;
+    var i: i64 = 0;
+    while i < b.len() {
+        crc = crc ^ (b.get(i) & 255);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 40961;
+            } else {
+                crc = crc >> 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+// ─── PDUs ────────────────────────────────────────────────────────────────
+
+/// A request or response PDU, decoded. For reads `addr`/`qty`; for single
+/// writes `addr`/`value`; for 23 also `waddr`/`wqty`. `regs` holds register
+/// values, `bits` coil or input states (0/1). `exception` > 0 for an
+/// exception response (its function is fc, without 0x80).
+pub struct ModbusPdu {
+    pub ok: bool,
+    pub error: str,
+    pub fc: i64,
+    pub addr: i64,
+    pub qty: i64,
+    pub value: i64,
+    pub waddr: i64,
+    pub wqty: i64,
+    pub regs: Vec<i64>,
+    pub bits: Vec<i64>,
+    pub exception: i64,
+}
+
+fn mb_pdu(fc: i64) -> ModbusPdu {
+    return ModbusPdu {
+        ok: true, error: "", fc: fc, addr: 0, qty: 0, value: 0, waddr: 0, wqty: 0, regs: Vec::new(), bits: Vec::new(), exception: 0,
+    };
+}
+
+fn mb_append(out: & mut Vec<i64>, src: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < src.len() {
+        out.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+fn mb_put16(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+/// Pack 0/1 values, first in the lowest bit of the first byte.
+pub fn modbus_pack_bits(bits: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < bits.len() {
+        if i % 8 == 0 {
+            out.push(0);
+        }
+        if bits.get(i) != 0 {
+            val k: i64 = i / 8;
+            out.set(k, out.get(k) | (1 << (i % 8)));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn modbus_unpack_bits(bytes: & Vec<i64>, start: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push((bytes.get(start + i / 8) >> (i % 8)) & 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Read request (functions 1-4): function, address, quantity.
+pub fn modbus_req_read(fc: i64, addr: i64, qty: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(fc);
+    mb_put16(& mut out, addr);
+    mb_put16(& mut out, qty);
+    return out;
+}
+
+/// Write Single Coil (5): on is 0xFF00, off 0x0000.
+pub fn modbus_req_write_coil(addr: i64, on: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(MODBUS_WRITE_COIL);
+    mb_put16(& mut out, addr);
+    if on {
+        mb_put16(& mut out, 65280);
+    } else {
+        mb_put16(& mut out, 0);
+    }
+    return out;
+}
+
+/// Write Single Register (6).
+pub fn modbus_req_write_register(addr: i64, value: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(MODBUS_WRITE_REGISTER);
+    mb_put16(& mut out, addr);
+    mb_put16(& mut out, value);
+    return out;
+}
+
+/// Write Multiple Coils (15).
+pub fn modbus_req_write_coils(addr: i64, bits: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(MODBUS_WRITE_COILS);
+    mb_put16(& mut out, addr);
+    mb_put16(& mut out, bits.len());
+    val packed: Vec<i64> = modbus_pack_bits(bits);
+    out.push(packed.len());
+    out.extend(packed);
+    return out;
+}
+
+/// Write Multiple Registers (16).
+pub fn modbus_req_write_registers(addr: i64, regs: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(MODBUS_WRITE_REGISTERS);
+    mb_put16(& mut out, addr);
+    mb_put16(& mut out, regs.len());
+    out.push(regs.len() * 2);
+    var i: i64 = 0;
+    while i < regs.len() {
+        mb_put16(& mut out, regs.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Read/Write Multiple Registers (23): the write is done before the read.
+pub fn modbus_req_read_write(raddr: i64, rqty: i64, waddr: i64, regs: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(MODBUS_READ_WRITE);
+    mb_put16(& mut out, raddr);
+    mb_put16(& mut out, rqty);
+    mb_put16(& mut out, waddr);
+    mb_put16(& mut out, regs.len());
+    out.push(regs.len() * 2);
+    var i: i64 = 0;
+    while i < regs.len() {
+        mb_put16(& mut out, regs.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mb_u16(b: & Vec<i64>, i: i64) -> i64 {
+    return ((b.get(i) & 255) << 8) | (b.get(i + 1) & 255);
+}
+
+fn mb_bad(fc: i64, why: str) -> ModbusPdu {
+    var p: ModbusPdu = mb_pdu(fc);
+    p.ok = false;
+    p.error = why;
+    return p;
+}
+
+/// Decode a request PDU. A malformed one has ok false and `exception` set
+/// to what a server answers (1 unknown function, 3 bad quantity/length).
+pub fn modbus_decode_request(b: & Vec<i64>) -> ModbusPdu {
+    if b.len() == 0 {
+        return mb_bad(0, "empty PDU");
+    }
+    val fc: i64 = b.get(0);
+    var p: ModbusPdu = mb_pdu(fc);
+    val n: i64 = b.len();
+    if fc >= 1 && fc <= 6 {
+        if n != 5 {
+            p = mb_bad(fc, "wrong length");
+            p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            return p;
+        }
+        p.addr = mb_u16(b, 1);
+        if fc <= 4 {
+            p.qty = mb_u16(b, 3);
+            var max: i64 = 125;
+            if fc <= 2 {
+                max = 2000;
+            }
+            if p.qty < 1 || p.qty > max {
+                p.ok = false;
+                p.error = "quantity out of range";
+                p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            }
+        } else {
+            p.value = mb_u16(b, 3);
+            p.qty = 1;
+            if fc == MODBUS_WRITE_COIL && p.value != 0 && p.value != 65280 {
+                p.ok = false;
+                p.error = "coil value not 0xFF00 or 0x0000";
+                p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            }
+        }
+        return p;
+    }
+    if fc == MODBUS_WRITE_COILS || fc == MODBUS_WRITE_REGISTERS {
+        if n < 6 {
+            p = mb_bad(fc, "too short");
+            p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            return p;
+        }
+        p.addr = mb_u16(b, 1);
+        p.qty = mb_u16(b, 3);
+        val count: i64 = b.get(5);
+        var want: i64 = p.qty * 2;
+        var max: i64 = 123;
+        if fc == MODBUS_WRITE_COILS {
+            want = (p.qty + 7) / 8;
+            max = 1968;
+        }
+        if p.qty < 1 || p.qty > max || count != want || n != 6 + count {
+            p.ok = false;
+            p.error = "quantity or byte count wrong";
+            p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            return p;
+        }
+        if fc == MODBUS_WRITE_COILS {
+            p.bits = modbus_unpack_bits(b, 6, p.qty);
+        } else {
+            var i: i64 = 0;
+            while i < p.qty {
+                p.regs.push(mb_u16(b, 6 + 2 * i));
+                i = i + 1;
+            }
+        }
+        return p;
+    }
+    if fc == MODBUS_READ_WRITE {
+        if n < 10 {
+            p = mb_bad(fc, "too short");
+            p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            return p;
+        }
+        p.addr = mb_u16(b, 1);
+        p.qty = mb_u16(b, 3);
+        p.waddr = mb_u16(b, 5);
+        p.wqty = mb_u16(b, 7);
+        val count: i64 = b.get(9);
+        if p.qty < 1 || p.qty > 125 || p.wqty < 1 || p.wqty > 121 || count != p.wqty * 2 || n != 10 + count {
+            p.ok = false;
+            p.error = "quantity or byte count wrong";
+            p.exception = MODBUS_EX_ILLEGAL_VALUE;
+            return p;
+        }
+        var i: i64 = 0;
+        while i < p.wqty {
+            p.regs.push(mb_u16(b, 10 + 2 * i));
+            i = i + 1;
+        }
+        return p;
+    }
+    p = mb_bad(fc, "unsupported function");
+    p.exception = MODBUS_EX_ILLEGAL_FUNCTION;
+    return p;
+}
+
+/// Encode a response PDU: reads carry `bits` (1, 2) or `regs` (3, 4, 23);
+/// writes echo addr/value or addr/qty; `exception` > 0 gives fc|0x80, code.
+pub fn modbus_encode_response(p: & ModbusPdu) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if p.exception > 0 {
+        out.push((p.fc | 128) & 255);
+        out.push(p.exception);
+        return out;
+    }
+    out.push(p.fc);
+    if p.fc == MODBUS_READ_COILS || p.fc == MODBUS_READ_DISCRETE {
+        val packed: Vec<i64> = modbus_pack_bits(& p.bits);
+        out.push(packed.len());
+        out.extend(packed);
+    } else if p.fc == MODBUS_READ_HOLDING || p.fc == MODBUS_READ_INPUT || p.fc == MODBUS_READ_WRITE {
+        out.push(p.regs.len() * 2);
+        var i: i64 = 0;
+        while i < p.regs.len() {
+            mb_put16(& mut out, p.regs.get(i));
+            i = i + 1;
+        }
+    } else if p.fc == MODBUS_WRITE_COIL || p.fc == MODBUS_WRITE_REGISTER {
+        mb_put16(& mut out, p.addr);
+        mb_put16(& mut out, p.value);
+    } else {
+        mb_put16(& mut out, p.addr);
+        mb_put16(& mut out, p.qty);
+    }
+    return out;
+}
+
+/// Decode a response PDU to request `req` (also decoded): the function
+/// must match, the byte count fit the quantity asked, writes must echo.
+pub fn modbus_decode_response(b: & Vec<i64>, req: & ModbusPdu) -> ModbusPdu {
+    if b.len() < 2 {
+        return mb_bad(0, "response too short");
+    }
+    val fc0: i64 = b.get(0);
+    if fc0 >= 128 {
+        var e: ModbusPdu = mb_pdu(fc0 & 127);
+        e.exception = b.get(1);
+        if b.len() != 2 || (fc0 & 127) != req.fc {
+            e.ok = false;
+            e.error = "bad exception response";
+        }
+        return e;
+    }
+    if fc0 != req.fc {
+        return mb_bad(fc0, "function does not match the request");
+    }
+    var p: ModbusPdu = mb_pdu(fc0);
+    val n: i64 = b.len();
+    if fc0 == MODBUS_READ_COILS || fc0 == MODBUS_READ_DISCRETE {
+        val count: i64 = b.get(1);
+        if count != (req.qty + 7) / 8 || n != 2 + count {
+            return mb_bad(fc0, "byte count does not fit the quantity");
+        }
+        p.qty = req.qty;
+        p.bits = modbus_unpack_bits(b, 2, req.qty);
+        return p;
+    }
+    if fc0 == MODBUS_READ_HOLDING || fc0 == MODBUS_READ_INPUT || fc0 == MODBUS_READ_WRITE {
+        val count: i64 = b.get(1);
+        if count != req.qty * 2 || n != 2 + count {
+            return mb_bad(fc0, "byte count does not fit the quantity");
+        }
+        p.qty = req.qty;
+        var i: i64 = 0;
+        while i < req.qty {
+            p.regs.push(mb_u16(b, 2 + 2 * i));
+            i = i + 1;
+        }
+        return p;
+    }
+    if n != 5 {
+        return mb_bad(fc0, "wrong length");
+    }
+    p.addr = mb_u16(b, 1);
+    if fc0 == MODBUS_WRITE_COIL || fc0 == MODBUS_WRITE_REGISTER {
+        p.value = mb_u16(b, 3);
+        if p.addr != req.addr || p.value != req.value {
+            return mb_bad(fc0, "echo differs from the request");
+        }
+    } else {
+        p.qty = mb_u16(b, 3);
+        if p.addr != req.addr || p.qty != req.qty {
+            return mb_bad(fc0, "echo differs from the request");
+        }
+    }
+    return p;
+}
+
+// ─── RTU and TCP framing ─────────────────────────────────────────────────
+
+/// An RTU frame: unit address, PDU, CRC (low byte first).
+pub fn modbus_rtu_frame(unit: i64, pdu: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(unit & 255);
+    mb_append(& mut out, pdu);
+    val crc: i64 = modbus_crc16(& out);
+    out.push(crc & 255);
+    out.push((crc >> 8) & 255);
+    return out;
+}
+
+/// A frame split into unit and PDU.
+pub struct ModbusAdu {
+    pub ok: bool,
+    pub error: str,
+    pub unit: i64,
+    pub tid: i64,
+    pub pdu: Vec<i64>,
+}
+
+/// Check an RTU frame's CRC and split it.
+pub fn modbus_rtu_parse(f: & Vec<i64>) -> ModbusAdu {
+    var a: ModbusAdu = ModbusAdu {
+        ok: false, error: "", unit: 0, tid: 0, pdu: Vec::new()
+    };
+    if f.len() < 4 {
+        a.error = "frame too short";
+        return a;
+    }
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.len() - 2 {
+        body.push(f.get(i));
+        i = i + 1;
+    }
+    val crc: i64 = modbus_crc16(& body);
+    if (crc & 255) != f.get(f.len() - 2) || ((crc >> 8) & 255) != f.get(f.len() - 1) {
+        a.error = "CRC mismatch";
+        return a;
+    }
+    a.unit = f.get(0);
+    i = 1;
+    while i < f.len() - 2 {
+        a.pdu.push(f.get(i));
+        i = i + 1;
+    }
+    a.ok = true;
+    return a;
+}
+
+/// The length of the RTU frame at the start of `buf` (`request` true for
+/// frames to a server): 0 while more bytes are needed, -1 for an unknown
+/// function code.
+pub fn modbus_rtu_frame_len(buf: & Vec<i64>, request: bool) -> i64 {
+    if buf.len() < 2 {
+        return 0;
+    }
+    val fc: i64 = buf.get(1);
+    var need: i64 = 0;
+    if !request && fc >= 128 {
+        need = 5;
+    } else if fc >= 1 && fc <= 6 && (request || fc >= 5) {
+        need = 8;
+    } else if !request && fc >= 1 && fc <= 4 {
+        if buf.len() < 3 {
+            return 0;
+        }
+        need = 5 + buf.get(2);
+    } else if !request && (fc == 15 || fc == 16) {
+        need = 8;
+    } else if !request && fc == 23 {
+        if buf.len() < 3 {
+            return 0;
+        }
+        need = 5 + buf.get(2);
+    } else if request && (fc == 15 || fc == 16) {
+        if buf.len() < 7 {
+            return 0;
+        }
+        need = 9 + buf.get(6);
+    } else if request && fc == 23 {
+        if buf.len() < 11 {
+            return 0;
+        }
+        need = 13 + buf.get(10);
+    } else {
+        return - 1;
+    }
+    if buf.len() < need {
+        return 0;
+    }
+    return need;
+}
+
+/// A Modbus TCP frame: MBAP header (transaction, protocol 0, length,
+/// unit) and the PDU.
+pub fn modbus_tcp_frame(tid: i64, unit: i64, pdu: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    mb_put16(& mut out, tid);
+    mb_put16(& mut out, 0);
+    mb_put16(& mut out, pdu.len() + 1);
+    out.push(unit & 255);
+    mb_append(& mut out, pdu);
+    return out;
+}
+
+/// Length of the first TCP frame in `buf`: 0 while incomplete, -1 when
+/// the header is invalid.
+pub fn modbus_tcp_frame_len(buf: & Vec<i64>) -> i64 {
+    if buf.len() < 7 {
+        return 0;
+    }
+    val len: i64 = mb_u16(buf, 4);
+    if mb_u16(buf, 2) != 0 || len < 2 || len > 254 {
+        return - 1;
+    }
+    if buf.len() < 6 + len {
+        return 0;
+    }
+    return 6 + len;
+}
+
+pub fn modbus_tcp_parse(f: & Vec<i64>) -> ModbusAdu {
+    var a: ModbusAdu = ModbusAdu {
+        ok: false, error: "", unit: 0, tid: 0, pdu: Vec::new()
+    };
+    val n: i64 = modbus_tcp_frame_len(f);
+    if n <= 0 || n != f.len() {
+        a.error = "not one whole MBAP frame";
+        return a;
+    }
+    a.tid = mb_u16(f, 0);
+    a.unit = f.get(6);
+    var i: i64 = 7;
+    while i < n {
+        a.pdu.push(f.get(i));
+        i = i + 1;
+    }
+    a.ok = true;
+    return a;
+}
+
+// ─── Server register map ─────────────────────────────────────────────────
+
+/// The four data tables of a server, addressed from 0.
+pub struct ModbusMap {
+    pub coils: Vec<i64>,
+    pub discrete: Vec<i64>,
+    pub holding: Vec<i64>,
+    pub input: Vec<i64>,
+    pub writes: i64,   // write requests carried out
+}
+
+pub fn modbus_map_new(ncoils: i64, ndiscrete: i64, nholding: i64, ninput: i64) -> ModbusMap {
+    return ModbusMap {
+        coils: Vec::filled(ncoils, 0), discrete: Vec::filled(ndiscrete, 0), holding: Vec::filled(nholding, 0), input: Vec::filled(ninput, 0), writes: 0,
+    };
+}
+
+fn mb_range_ok(table: & Vec<i64>, addr: i64, qty: i64) -> bool {
+    return addr >= 0 && qty >= 1 && addr + qty <= table.len();
+}
+
+fn mb_slice(table: & Vec<i64>, addr: i64, qty: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < qty {
+        out.push(table.get(addr + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mb_ex(fc: i64, code: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push((fc | 128) & 255);
+    out.push(code);
+    return out;
+}
+
+/// Carry out a request PDU on the map; the response PDU (an exception
+/// response for an unknown function, bad value or address out of range).
+pub fn modbus_server_handle(m: & mut ModbusMap, pdu: & Vec<i64>) -> Vec<i64> {
+    val q: ModbusPdu = modbus_decode_request(pdu);
+    if !q.ok {
+        return mb_ex(q.fc, q.exception);
+    }
+    var r: ModbusPdu = mb_pdu(q.fc);
+    val fc: i64 = q.fc;
+    if fc == MODBUS_READ_COILS || fc == MODBUS_READ_DISCRETE {
+        var table: Vec<i64> = m.coils;
+        if fc == MODBUS_READ_DISCRETE {
+            table = m.discrete;
+        }
+        if !mb_range_ok(& table, q.addr, q.qty) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        r.bits = mb_slice(& table, q.addr, q.qty);
+    } else if fc == MODBUS_READ_HOLDING || fc == MODBUS_READ_INPUT {
+        var table: Vec<i64> = m.holding;
+        if fc == MODBUS_READ_INPUT {
+            table = m.input;
+        }
+        if !mb_range_ok(& table, q.addr, q.qty) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        r.regs = mb_slice(& table, q.addr, q.qty);
+    } else if fc == MODBUS_WRITE_COIL {
+        if !mb_range_ok(& m.coils, q.addr, 1) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        var on: i64 = 0;
+        if q.value == 65280 {
+            on = 1;
+        }
+        m.coils.set(q.addr, on);
+        r.addr = q.addr;
+        r.value = q.value;
+        m.writes = m.writes + 1;
+    } else if fc == MODBUS_WRITE_REGISTER {
+        if !mb_range_ok(& m.holding, q.addr, 1) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        m.holding.set(q.addr, q.value);
+        r.addr = q.addr;
+        r.value = q.value;
+        m.writes = m.writes + 1;
+    } else if fc == MODBUS_WRITE_COILS {
+        if !mb_range_ok(& m.coils, q.addr, q.qty) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        var i: i64 = 0;
+        while i < q.qty {
+            m.coils.set(q.addr + i, q.bits.get(i));
+            i = i + 1;
+        }
+        r.addr = q.addr;
+        r.qty = q.qty;
+        m.writes = m.writes + 1;
+    } else if fc == MODBUS_WRITE_REGISTERS {
+        if !mb_range_ok(& m.holding, q.addr, q.qty) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        var i: i64 = 0;
+        while i < q.qty {
+            m.holding.set(q.addr + i, q.regs.get(i));
+            i = i + 1;
+        }
+        r.addr = q.addr;
+        r.qty = q.qty;
+        m.writes = m.writes + 1;
+    } else {
+        // 23: write first, then read
+        if !mb_range_ok(& m.holding, q.waddr, q.wqty) || !mb_range_ok(& m.holding, q.addr, q.qty) {
+            return mb_ex(fc, MODBUS_EX_ILLEGAL_ADDRESS);
+        }
+        var i: i64 = 0;
+        while i < q.wqty {
+            m.holding.set(q.waddr + i, q.regs.get(i));
+            i = i + 1;
+        }
+        m.writes = m.writes + 1;
+        r.regs = mb_slice(& m.holding, q.addr, q.qty);
+    }
+    return modbus_encode_response(& r);
+}
+
+/// Serve one RTU frame for unit `unit`: the response frame, or [] when the
+/// frame is for another unit, has a bad CRC, or is a broadcast (unit 0,
+/// carried out but not answered).
+pub fn modbus_server_rtu(m: & mut ModbusMap, unit: i64, frame: & Vec<i64>) -> Vec<i64> {
+    val a: ModbusAdu = modbus_rtu_parse(frame);
+    if !a.ok || (a.unit != unit && a.unit != 0) {
+        return Vec::new();
+    }
+    val resp: Vec<i64> = modbus_server_handle(m, & a.pdu);
+    if a.unit == 0 {
+        return Vec::new();
+    }
+    return modbus_rtu_frame(unit, & resp);
+}
+
+/// Serve one TCP frame: the response frame (same transaction and unit).
+pub fn modbus_server_tcp(m: & mut ModbusMap, frame: & Vec<i64>) -> Vec<i64> {
+    val a: ModbusAdu = modbus_tcp_parse(frame);
+    if !a.ok {
+        return Vec::new();
+    }
+    val resp: Vec<i64> = modbus_server_handle(m, & a.pdu);
+    return modbus_tcp_frame(a.tid, a.unit, & resp);
+}
+
+// ─── Client ──────────────────────────────────────────────────────────────
+
+/// A client: TCP when `tcp`, else RTU (one request at a time).
+pub struct ModbusClient {
+    pub tcp: bool,
+    pub next_tid: i64,
+    pub pend_tids: Vec<i64>,
+    pub pend_units: Vec<i64>,
+    pub pend_pdus: Vec<Vec<i64>>,
+}
+
+pub fn modbus_client_new(tcp: bool) -> ModbusClient {
+    return ModbusClient {
+        tcp: tcp, next_tid: 1, pend_tids: Vec::new(), pend_units: Vec::new(), pend_pdus: Vec::new(),
+    };
+}
+
+/// The frame to send for request `pdu` to `unit` (and remember it).
+pub fn modbus_client_request(c: & mut ModbusClient, unit: i64, pdu: Vec<i64>) -> Vec<i64> {
+    var tid: i64 = 0;
+    if c.tcp {
+        tid = c.next_tid;
+        c.next_tid = (c.next_tid + 1) & 65535;
+    } else {
+        c.pend_tids = Vec::new();
+        c.pend_units = Vec::new();
+        c.pend_pdus = Vec::new();
+    }
+    c.pend_tids.push(tid);
+    c.pend_units.push(unit);
+    c.pend_pdus.push(pdu);
+    if c.tcp {
+        return modbus_tcp_frame(tid, unit, & pdu);
+    }
+    return modbus_rtu_frame(unit, & pdu);
+}
+
+/// Requests still waiting for their response.
+pub fn modbus_client_pending(c: & ModbusClient) -> i64 {
+    return c.pend_tids.len();
+}
+
+/// Match a response frame to its request and decode it.
+pub fn modbus_client_response(c: & mut ModbusClient, frame: & Vec<i64>) -> ModbusPdu {
+    var a: ModbusAdu = modbus_rtu_parse(frame);
+    if c.tcp {
+        a = modbus_tcp_parse(frame);
+    }
+    if !a.ok {
+        return mb_bad(0, a.error);
+    }
+    var k: i64 = 0;
+    while k < c.pend_tids.len() {
+        if c.pend_tids.get(k) == a.tid && c.pend_units.get(k) == a.unit {
+            break;
+        }
+        k = k + 1;
+    }
+    if k >= c.pend_tids.len() {
+        return mb_bad(0, "no request waits for this response");
+    }
+    val req: ModbusPdu = modbus_decode_request(& c.pend_pdus.get(k));
+    c.pend_tids.remove(k);
+    c.pend_units.remove(k);
+    c.pend_pdus.remove(k);
+    return modbus_decode_response(& a.pdu, & req);
+}

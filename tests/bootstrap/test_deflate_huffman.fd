@@ -1,0 +1,210 @@
+// stdlib/compress: the compressing DEFLATE writer (complaint CD2, SL10).
+// deflate_compress / zlib_compress_level / gzip_compress_level at levels
+// 0-9 on empty, tiny, repetitive, run-length, text and pseudo-random
+// input: every stream inflates back to the input, the block type chosen
+// is the smallest (fixed for short input, dynamic for text, stored for
+// noise), repetitive input shrinks, and two streams are pinned byte for
+// byte. When written, the zlib and gzip streams of these inputs at every
+// level (45 streams) were decoded by Python's zlib.decompress and
+// gzip.decompress (checksums and sizes checked); sizes are within a few
+// bytes of zlib 1.3's.
+//
+// Expected output:
+// rt.empty.1 ok
+// rt.one.6 ok
+// rt.abc.1 ok
+// rt.abc.6 ok
+// rt.abc.9 ok
+// rt.run.1 ok
+// rt.run.9 ok
+// rt.text.1 ok
+// rt.text.6 ok
+// rt.text.9 ok
+// rt.noise.6 ok
+// rt.mixed.6 ok
+// rt.big.6 ok
+// btype.short = 1
+// btype.text = 2
+// btype.noise = 0
+// small.abc = true
+// small.run = true
+// small.text = true
+// level9 <= level1 = true
+// size.abc.6 = 23
+// size.run.9 = 21
+// size.text.1 = 275
+// size.text.6 = 274
+// size.noise.6 = 2005
+// size.big.6 = 70025
+// pin.deflate = 4b4c4a862000
+// pin.zlib = 789c4b4c4a862000113d0373
+// zlib.rt ok
+// gzip.rt ok
+// gzip.header = 1f8b08000000000000ff
+// deflate huffman ok
+
+use compress;
+use string;
+
+fn hexd(v: i64) -> str {
+    var digits = "0123456789abcdef";
+    return str_slice(digits, v, v + 1);
+}
+
+fn to_hex(v: Vec) -> str {
+    var out = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        var b: i64 = v.get(i);
+        out = out + hexd(b >> 4) + hexd(b & 15);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn same(a: Vec, b: Vec) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn bytes_of(s: str) -> Vec {
+    var v: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        v.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn round_trip(label: str, data: Vec, level: i64) -> Vec {
+    var z: Vec = deflate_compress(data, level);
+    var back: Vec = inflate(z);
+    if !same(back, data) {
+        p_panic("deflate: " + label + " did not round-trip (" + int_to_str(back.len()) + " of " + int_to_str(data.len()) + " bytes)");
+    }
+    println("rt." + label + " ok");
+    return z;
+}
+
+fn noise(n: i64, seed: i64) -> Vec {
+    var v: Vec = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = (x * 1103515245 + 12345) & 2147483647;
+        v.push((x >> 16) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    var abc: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 3000 {
+        abc.push(97 + (i % 3));
+        i = i + 1;
+    }
+    var run: Vec = Vec::new();
+    i = 0;
+    while i < 5000 {
+        run.push(120);
+        i = i + 1;
+    }
+    var para = "It is a truth universally acknowledged, that a single program in possession of a good standard library, must be in want of a compressor. However little known the feelings or views of such a program may be on its first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding modules. ";
+    var text: Vec = Vec::new();
+    i = 0;
+    while i < 6 {
+        var w: Vec = bytes_of(para + "Section " + int_to_str(i) + ": the quick brown fox jumps over the lazy dog. ");
+        var k: i64 = 0;
+        while k < w.len() {
+            text.push(w.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var rnd: Vec = noise(2000, 7);
+    var mixed: Vec = Vec::new();
+    i = 0;
+    while i < 1000 {
+        mixed.push(rnd.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < text.len() {
+        mixed.push(text.get(i));
+        i = i + 1;
+    }
+
+    round_trip("empty.1", Vec::new(), 1);
+    var one: Vec = Vec::new();
+    one.push(65);
+    round_trip("one.6", one, 6);
+    var z_abc1: Vec = round_trip("abc.1", abc, 1);
+    var z_abc6: Vec = round_trip("abc.6", abc, 6);
+    round_trip("abc.9", abc, 9);
+    round_trip("run.1", run, 1);
+    var z_run9: Vec = round_trip("run.9", run, 9);
+    var z_text1: Vec = round_trip("text.1", text, 1);
+    var z_text6: Vec = round_trip("text.6", text, 6);
+    var z_text9: Vec = round_trip("text.9", text, 9);
+    var z_noise: Vec = round_trip("noise.6", rnd, 6);
+    round_trip("mixed.6", mixed, 6);
+    // over one block of tokens and one stored chunk: 70000 noise bytes
+    var big: Vec = noise(70000, 99);
+    var z_big: Vec = round_trip("big.6", big, 6);
+
+    // block type of the first block: bits 1-2 of the first byte
+    var short: Vec = deflate_compress(bytes_of("hello hello hello"), 6);
+    println("btype.short = " + int_to_str((short.get(0) >> 1) & 3));
+    println("btype.text = " + int_to_str((z_text6.get(0) >> 1) & 3));
+    println("btype.noise = " + int_to_str((z_noise.get(0) >> 1) & 3));
+
+    println("small.abc = " + bool_to_str(z_abc6.len() < 40 && z_abc1.len() < 60));
+    println("small.run = " + bool_to_str(z_run9.len() < 40));
+    println("small.text = " + bool_to_str(z_text6.len() * 3 < text.len()));
+    println("level9 <= level1 = " + bool_to_str(z_text9.len() <= z_text1.len()));
+    // sizes (zlib 1.3 at level 6 on the same input, raw: 24, 22, 271,
+    // 2005, 70025): the writer is deterministic, so every backend agrees
+    println("size.abc.6 = " + int_to_str(z_abc6.len()));
+    println("size.run.9 = " + int_to_str(z_run9.len()));
+    println("size.text.1 = " + int_to_str(z_text1.len()));
+    println("size.text.6 = " + int_to_str(z_text6.len()));
+    println("size.noise.6 = " + int_to_str(z_noise.len()));
+    println("size.big.6 = " + int_to_str(z_big.len()));
+
+    // pinned bytes; Python: zlib.decompress(bytes.fromhex(...), -15) == b"abcabcabc"
+    println("pin.deflate = " + to_hex(deflate_compress(bytes_of("abcabcabc"), 6)));
+    var zl: Vec = zlib_compress_level(bytes_of("abcabcabc"), 6);
+    println("pin.zlib = " + to_hex(zl));
+
+    var zt: Vec = zlib_compress_level(text, 9);
+    if !same(zlib_decompress(zt), text) {
+        p_panic("deflate: zlib_compress_level did not round-trip");
+    }
+    println("zlib.rt ok");
+    var gz: Vec = gzip_compress_level(text, 6);
+    if !same(gzip_decompress(gz), text) {
+        p_panic("deflate: gzip_compress_level did not round-trip");
+    }
+    println("gzip.rt ok");
+    var head: Vec = Vec::new();
+    i = 0;
+    while i < 10 {
+        head.push(gz.get(i));
+        i = i + 1;
+    }
+    println("gzip.header = " + to_hex(head));
+    println("deflate huffman ok");
+    return 0;
+}

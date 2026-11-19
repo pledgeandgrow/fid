@@ -1,0 +1,1019 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG2), with RA19, TG7, TG8 and
+// TG9: each selection rule of the machine layer (compiler/nat_ir.fd) run
+// on random operands against a reference written so that no rule applies
+// to it (the generic lowering). A line per rule: its name, how many of
+// the trials disagreed (always 0), and how many trials took the branch or
+// how many results were nonzero (the trials cover both ways).
+//   tbz     ng_fuse_tbz: `if (x & 2^k) != 0` / `== 0` / `== 2^k` and
+//           `((x >> k) & 1) == 1` as one test-bit branch (AArch64 TBZ /
+//           TBNZ, x86-64 TEST imm / BT, RISC-V SLLI + BLT / BGE)
+//   brgap   ng_fuse_branches (RA19): `let c = a < b; ...; if c` with
+//           instructions between the compare and the branch; one where
+//           what lies between writes an operand of the compare (it must
+//           stay a SETCC)
+//   opw     ng_fuse_opw (TG9): wrapping i32 add / sub / mul as ADDW /
+//           SUBW / MULW on RISC-V
+//   memop   ng_x64_bin_mem (TG7): spilled second operands of ADD, SUB,
+//           MUL, AND, OR, XOR read from their slot on x86-64
+//   andn    ng_fuse_bits: ~a & b (BMI1 under --cpu x86-64-v3, BIC, Zbb)
+//   blsr    ng_fuse_bits: a & (a - 1) (BMI1 under --cpu x86-64-v3)
+//   addi    ng_fuse_addi: adds of a constant as one add-immediate
+// TG1's selection-table rules past the ALU (ng_isel_rows_tg1):
+//   shi     shifts by a constant (MO_SHI, formed by ng_fuse_addi) against
+//           shifts by a count read from memory
+//   li      constants of every immediate class (x86-64 xor / mov r32 /
+//           mov simm32 / movabs, AArch64 MOVZ / MOVN / sequences, RISC-V
+//           ADDI / LUI+ADDIW / sequences) against constants put together
+//           from 16-bit pieces
+//   cmp     compares to a value and in branches, signed, unsigned and
+//           against zero, against references made of sign bits
+//   mem     loads and stores at constant offsets in and out of each
+//           target's immediate against indexes read from memory
+// FID_NAT_MUTATE=<rule> breaks a rule on purpose: then that line's count
+// is not 0 (shi: the count off by one; iselimm: the constant of the LI /
+// ADDI / SHI table rules off by one; iselcc: the SETCC / BRCC table rules
+// test the inverse condition). tests/nattools/rule_mutation_check.sh and
+// tests/nattools/isel_rules_check.sh build this test on the machine-layer
+// targets, check the output below, and check that each mutation changes it.
+// Expected output:
+// tbz 0 1111
+// brgap 0 479
+// opw 0 600
+// memop 0 200
+// andn 0 200
+// blsr 0 199
+// addi 0 400
+// shi 0 416
+// li 0 2040
+// cmp 0 1775
+// mem 0 106
+
+var g_seed: i64 = 88172645463325252;
+
+@wrapping fn rnd() -> i64 {
+    g_seed = g_seed * 6364136223846793005 + 1442695040888963407;
+    return g_seed ^ (g_seed >> 29);
+}
+
+// The reference of one bit: no AND, so no rule sees it
+fn bit_ref(x: i64, k: i64) -> i64 {
+    if ((x >> k) % 2) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb0(x: i64) -> i64 {
+    if (x & 1) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb3(x: i64) -> i64 {
+    if (x & 8) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb7(x: i64) -> i64 {
+    if (x & 128) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb8(x: i64) -> i64 {
+    if (x & 256) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb31(x: i64) -> i64 {
+    if (x & 2147483648) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb32(x: i64) -> i64 {
+    if (x & 4294967296) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn tb40(x: i64) -> i64 {
+    if (x & 1099511627776) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// branch when the bit is clear
+fn tbc5(x: i64) -> i64 {
+    if (x & 32) == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// a compare with the mask itself
+fn tbeq6(x: i64) -> i64 {
+    if (x & 64) == 64 {
+        return 1;
+    }
+    return 0;
+}
+
+// the shifted form
+fn tbsh13(x: i64) -> i64 {
+    if ((x >> 13) & 1) == 1 {
+        return 1;
+    }
+    return 0;
+}
+
+// the AND's value is used again: the AND must stay
+fn tb_kept(x: i64) -> i64 {
+    val m: i64 = x & 16;
+    if m != 0 {
+        return m / 16;
+    }
+    return m;
+}
+
+fn less_ref(a: i64, b: i64) -> bool {
+    return a < b;
+}
+
+@wrapping fn gap_lt(a: i64, b: i64) -> i64 {
+    val c: bool = a < b;
+    var n: i64 = a ^ b;
+    n = n * 3 + 7;
+    if c {
+        return n;
+    }
+    return 0 - n;
+}
+
+@wrapping fn gap_lt_ref(a: i64, b: i64) -> i64 {
+    var n: i64 = a ^ b;
+    n = n * 3 + 7;
+    if less_ref(a, b) {
+        return n;
+    }
+    return 0 - n;
+}
+
+// `if !c` after a gap: the branch on the compare's inverse
+@wrapping fn gap_ge(a: i64, b: i64) -> i64 {
+    val c: bool = a < b;
+    val n: i64 = a - b;
+    if !c {
+        return n;
+    }
+    return 5;
+}
+
+@wrapping fn gap_ge_ref(a: i64, b: i64) -> i64 {
+    val n: i64 = a - b;
+    if !less_ref(a, b) {
+        return n;
+    }
+    return 5;
+}
+
+// What lies between writes the compare's operand: no fusion, and the
+// branch must still test the old value
+@wrapping fn gap_written(a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    val c: bool = x < b;
+    x = x + 1000;
+    if c {
+        return x;
+    }
+    return 0 - x;
+}
+
+@wrapping fn gap_written_ref(a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    val c: bool = less_ref(x, b);
+    x = x + 1000;
+    if c {
+        return x;
+    }
+    return 0 - x;
+}
+
+@wrapping fn add32(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+@wrapping fn sub32(a: i32, b: i32) -> i32 {
+    return a - b;
+}
+
+@wrapping fn mul32(a: i32, b: i32) -> i32 {
+    return a * b;
+}
+
+// The two's-complement i32 a 64-bit value wraps to
+fn wrap32(v: i64) -> i64 {
+    var r: i64 = v % 4294967296;
+    if r >= 2147483648 {
+        r = r - 4294967296;
+    }
+    if r < 0 - 2147483648 {
+        r = r + 4294967296;
+    }
+    return r;
+}
+
+// Twenty values live at once: some are spilled on x86-64, and the
+// operations read them as their second operand
+@wrapping fn pressure(a: i64, b: i64) -> i64 {
+    val v1: i64 = a + 1;
+    val v2: i64 = b + 2;
+    val v3: i64 = a * 3;
+    val v4: i64 = b * 5;
+    val v5: i64 = a ^ 77;
+    val v6: i64 = b ^ 99;
+    val v7: i64 = a - 11;
+    val v8: i64 = b - 13;
+    val v9: i64 = a | 6;
+    val v10: i64 = b | 10;
+    val v11: i64 = a * 7;
+    val v12: i64 = b * 9;
+    val v13: i64 = a + b;
+    val v14: i64 = a - b;
+    val v15: i64 = a ^ b;
+    val v16: i64 = a & b;
+    val v17: i64 = a + 17;
+    val v18: i64 = b + 19;
+    val v19: i64 = a * 21;
+    val v20: i64 = b * 23;
+    var s: i64 = v20 + v19;
+    s = s - v18;
+    s = s * v17;
+    s = s & v16;
+    s = s | v15;
+    s = s ^ v14;
+    s = s + v13;
+    s = s - v12;
+    s = s * v11;
+    s = s ^ v10;
+    s = s | v9;
+    s = s + v8;
+    s = s - v7;
+    s = s & v6;
+    s = s + v5;
+    s = s * v4;
+    s = s - v3;
+    s = s ^ v2;
+    s = s + v1;
+    return s;
+}
+
+// The same computation from memory: the values in a Vec
+@wrapping fn pressure_ref(a: i64, b: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(0);
+    v.push(a + 1);
+    v.push(b + 2);
+    v.push(a * 3);
+    v.push(b * 5);
+    v.push(a ^ 77);
+    v.push(b ^ 99);
+    v.push(a - 11);
+    v.push(b - 13);
+    v.push(a | 6);
+    v.push(b | 10);
+    v.push(a * 7);
+    v.push(b * 9);
+    v.push(a + b);
+    v.push(a - b);
+    v.push(a ^ b);
+    v.push(a & b);
+    v.push(a + 17);
+    v.push(b + 19);
+    v.push(a * 21);
+    v.push(b * 23);
+    var s: i64 = v.get(20) + v.get(19);
+    s = s - v.get(18);
+    s = s * v.get(17);
+    s = s & v.get(16);
+    s = s | v.get(15);
+    s = s ^ v.get(14);
+    s = s + v.get(13);
+    s = s - v.get(12);
+    s = s * v.get(11);
+    s = s ^ v.get(10);
+    s = s | v.get(9);
+    s = s + v.get(8);
+    s = s - v.get(7);
+    s = s & v.get(6);
+    s = s + v.get(5);
+    s = s * v.get(4);
+    s = s - v.get(3);
+    s = s ^ v.get(2);
+    s = s + v.get(1);
+    return s;
+}
+
+@wrapping fn andn(a: i64, b: i64) -> i64 {
+    return ~a & b;
+}
+
+@wrapping fn andn_ref(a: i64, b: i64) -> i64 {
+    return b - (b & a);
+}
+
+@wrapping fn blsr(a: i64) -> i64 {
+    return a & (a - 1);
+}
+
+// a without its lowest set bit, found one bit at a time
+@wrapping fn blsr_ref(a: i64) -> i64 {
+    if a == 0 {
+        return 0;
+    }
+    var k: i64 = 0;
+    while bit_ref(a, k) == 0 {
+        k = k + 1;
+    }
+    if k == 63 {
+        return 0;
+    }
+    return a - (1 << k);
+}
+
+@wrapping fn add7(a: i64) -> i64 {
+    return a + 7;
+}
+
+@wrapping fn sub300(a: i64) -> i64 {
+    return a - 300;
+}
+
+// --- TG1's rules past the integer ALU (compiler/nat_ir.fd
+// ng_isel_rows_tg1): shifts by a constant (MO_SHI), constants of every
+// immediate class (MO_LI), compares (MO_SETCC / MO_BRCC) and loads and
+// stores at constant offsets (MO_LOAD / MO_STORE displacements in and
+// out of each target's immediate) ---
+
+@wrapping fn shl1(a: i64) -> i64 {
+    return a << 1;
+}
+
+@wrapping fn shl13(a: i64) -> i64 {
+    return a << 13;
+}
+
+@wrapping fn shl32(a: i64) -> i64 {
+    return a << 32;
+}
+
+@wrapping fn shl63(a: i64) -> i64 {
+    return a << 63;
+}
+
+@wrapping fn sar5(a: i64) -> i64 {
+    return a >> 5;
+}
+
+@wrapping fn sar40(a: i64) -> i64 {
+    return a >> 40;
+}
+
+@wrapping fn shr3(a: i64) -> i64 {
+    return ((a as u64) >> (3 as u64)) as i64;
+}
+
+@wrapping fn shr60(a: i64) -> i64 {
+    return ((a as u64) >> (60 as u64)) as i64;
+}
+
+// the reference: the count from memory, so no constant reaches the shift
+@wrapping fn shl_ref(a: i64, c: i64) -> i64 {
+    return a << c;
+}
+
+@wrapping fn sar_ref(a: i64, c: i64) -> i64 {
+    return a >> c;
+}
+
+@wrapping fn shr_ref(a: i64, c: i64) -> i64 {
+    return ((a as u64) >> (c as u64)) as i64;
+}
+
+// One constant of each class a target's LI rules tell apart
+@wrapping fn kc0(x: i64) -> i64 {
+    return x ^ (65535);
+}
+
+@wrapping fn kc1(x: i64) -> i64 {
+    return x ^ (65536);
+}
+
+@wrapping fn kc2(x: i64) -> i64 {
+    return x ^ (4294901760);
+}
+
+@wrapping fn kc3(x: i64) -> i64 {
+    return x ^ (2147483647);
+}
+
+@wrapping fn kc4(x: i64) -> i64 {
+    return x ^ (2147483648);
+}
+
+@wrapping fn kc5(x: i64) -> i64 {
+    return x ^ (4294967295);
+}
+
+@wrapping fn kc6(x: i64) -> i64 {
+    return x ^ (4294967296);
+}
+
+@wrapping fn kc7(x: i64) -> i64 {
+    return x ^ (0 - 1);
+}
+
+@wrapping fn kc8(x: i64) -> i64 {
+    return x ^ (0 - 65536);
+}
+
+@wrapping fn kc9(x: i64) -> i64 {
+    return x ^ (0 - 2147483648);
+}
+
+@wrapping fn kc10(x: i64) -> i64 {
+    return x ^ (0 - 2147483649);
+}
+
+@wrapping fn kc11(x: i64) -> i64 {
+    return x ^ (1311768467463790320);
+}
+
+@wrapping fn kc12(x: i64) -> i64 {
+    return x ^ (0 - 1311768467463790320);
+}
+
+@wrapping fn kc13(x: i64) -> i64 {
+    return x ^ (2047);
+}
+
+@wrapping fn kc14(x: i64) -> i64 {
+    return x ^ (2048);
+}
+
+@wrapping fn kc15(x: i64) -> i64 {
+    return x ^ (0 - 2048);
+}
+
+@wrapping fn kc16(x: i64) -> i64 {
+    return x ^ (0 - 2049);
+}
+
+@wrapping fn kc17(x: i64) -> i64 {
+    return x ^ (281470681743360);
+}
+
+@wrapping fn kc18(x: i64) -> i64 {
+    return x ^ (0 - 281470681743361);
+}
+
+@wrapping fn kc19(x: i64) -> i64 {
+    return x ^ (2147481600);
+}
+
+fn p4(v: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64) {
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+}
+
+// The constants of kc0..kc19 as four 16-bit pieces each, high first
+fn kc_pieces() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    p4(& mut v, 0, 0, 0, 65535);
+    p4(& mut v, 0, 0, 1, 0);
+    p4(& mut v, 0, 0, 65535, 0);
+    p4(& mut v, 0, 0, 32767, 65535);
+    p4(& mut v, 0, 0, 32768, 0);
+    p4(& mut v, 0, 0, 65535, 65535);
+    p4(& mut v, 0, 1, 0, 0);
+    p4(& mut v, 65535, 65535, 65535, 65535);
+    p4(& mut v, 65535, 65535, 65535, 0);
+    p4(& mut v, 65535, 65535, 32768, 0);
+    p4(& mut v, 65535, 65535, 32767, 65535);
+    p4(& mut v, 4660, 22136, 39612, 57072);
+    p4(& mut v, 60875, 43399, 25923, 8464);
+    p4(& mut v, 0, 0, 0, 2047);
+    p4(& mut v, 0, 0, 0, 2048);
+    p4(& mut v, 65535, 65535, 65535, 63488);
+    p4(& mut v, 65535, 65535, 65535, 63487);
+    p4(& mut v, 0, 65535, 0, 0);
+    p4(& mut v, 65535, 0, 65535, 65535);
+    p4(& mut v, 0, 0, 32767, 63488);
+    return v;
+}
+
+// a constant put together from its pieces: only small constants are
+// loaded, the big ones' rules are not used
+@wrapping fn kc_ref(x: i64, ps: & Vec<i64>, i: i64, w16: i64) -> i64 {
+    var c: i64 = ps.get(4 * i);
+    c = c * w16 + ps.get(4 * i + 1);
+    c = c * w16 + ps.get(4 * i + 2);
+    c = c * w16 + ps.get(4 * i + 3);
+    return x ^ c;
+}
+
+// Compares to a value (SETCC) and in a branch (BRCC), signed and
+// unsigned, against a register and against zero
+fn bit_of(c: bool) -> i64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+fn cmp_vals(a: i64, b: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    r.push(bit_of(a < b));
+    r.push(bit_of(a <= b));
+    r.push(bit_of(a > b));
+    r.push(bit_of(a >= b));
+    r.push(bit_of(a == b));
+    r.push(bit_of(a != b));
+    r.push(bit_of((a as u64) < (b as u64)));
+    r.push(bit_of((a as u64) <= (b as u64)));
+    r.push(bit_of((a as u64) > (b as u64)));
+    r.push(bit_of((a as u64) >= (b as u64)));
+    r.push(bit_of(a < 0));
+    r.push(bit_of(a == 0));
+    r.push(bit_of(a != 0));
+    r.push(bit_of(a >= 0));
+    return r;
+}
+
+fn br_lt(a: i64, b: i64) -> i64 {
+    if a < b {
+        return 1;
+    }
+    return 0;
+}
+
+fn br_le(a: i64, b: i64) -> i64 {
+    if a <= b {
+        return 1;
+    }
+    return 0;
+}
+
+fn br_gtu(a: i64, b: i64) -> i64 {
+    if (a as u64) > (b as u64) {
+        return 1;
+    }
+    return 0;
+}
+
+fn br_geu(a: i64, b: i64) -> i64 {
+    if (a as u64) >= (b as u64) {
+        return 1;
+    }
+    return 0;
+}
+
+fn br_eqz(a: i64) -> i64 {
+    if a == 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn br_nez(a: i64) -> i64 {
+    if a != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// The references: sign bits of differences, no compare at all
+@wrapping fn sgn_bit(x: i64) -> i64 {
+    return (x >> 63) & 1;
+}
+
+@wrapping fn slt_ref(a: i64, b: i64) -> i64 {
+    val d: i64 = a - b;
+    return sgn_bit(d ^ ((a ^ b) & (d ^ a)));
+}
+
+@wrapping fn ult_ref(a: i64, b: i64) -> i64 {
+    return sgn_bit(((~a) & b) | ((~(a ^ b)) & (a - b)));
+}
+
+@wrapping fn eq_ref(a: i64, b: i64) -> i64 {
+    val x: i64 = a ^ b;
+    return 1 - sgn_bit(x | (0 - x));
+}
+
+fn cmp_refs(a: i64, b: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    r.push(slt_ref(a, b));
+    r.push(1 - slt_ref(b, a));
+    r.push(slt_ref(b, a));
+    r.push(1 - slt_ref(a, b));
+    r.push(eq_ref(a, b));
+    r.push(1 - eq_ref(a, b));
+    r.push(ult_ref(a, b));
+    r.push(1 - ult_ref(b, a));
+    r.push(ult_ref(b, a));
+    r.push(1 - ult_ref(a, b));
+    r.push(sgn_bit(a));
+    r.push(eq_ref(a, 0));
+    r.push(1 - eq_ref(a, 0));
+    r.push(1 - sgn_bit(a));
+    return r;
+}
+
+// Loads and stores at constant offsets 24, 4088, 4096, 32760, 32768,
+// 40000 (in and out of AArch64's and RISC-V's immediates), against the
+// same elements at indexes read from memory
+@wrapping fn mem_consts(v: & mut Vec<i64>, x: i64) -> i64 {
+    v.set(3, x);
+    v.set(511, x + 1);
+    v.set(512, x ^ 2);
+    v.set(4095, x * 3);
+    v.set(4096, x - 4);
+    v.set(5000, x | 5);
+    return v.get(3) + v.get(511) * 3 + v.get(512) * 5 + v.get(4095) * 7 + v.get(4096) * 11 + v.get(5000) * 13 + v.get(17);
+}
+
+@wrapping fn mem_ref(v: & mut Vec<i64>, x: i64, ix: & Vec<i64>) -> i64 {
+    v.set(ix.get(0), x);
+    v.set(ix.get(1), x + 1);
+    v.set(ix.get(2), x ^ 2);
+    v.set(ix.get(3), x * 3);
+    v.set(ix.get(4), x - 4);
+    v.set(ix.get(5), x | 5);
+    return v.get(ix.get(0)) + v.get(ix.get(1)) * 3 + v.get(ix.get(2)) * 5 + v.get(ix.get(3)) * 7 + v.get(ix.get(4)) * 11 + v.get(ix.get(5)) * 13 + v.get(ix.get(6));
+}
+
+fn report(name: str, bad: i64, hits: i64) {
+    println(name + " " + int_to_str(bad) + " " + int_to_str(hits));
+}
+
+@wrapping fn main() {
+    val trials: i64 = 200;
+    var consts: Vec<i64> = Vec::new();
+    consts.push(7);
+    consts.push(300);
+    // tbz
+    var bad: i64 = 0;
+    var hits: i64 = 0;
+    var t: i64 = 0;
+    while t < trials {
+        val x: i64 = rnd();
+        var got: Vec<i64> = Vec::new();
+        var want: Vec<i64> = Vec::new();
+        got.push(tb0(x));
+        want.push(bit_ref(x, 0));
+        got.push(tb3(x));
+        want.push(bit_ref(x, 3));
+        got.push(tb7(x));
+        want.push(bit_ref(x, 7));
+        got.push(tb8(x));
+        want.push(bit_ref(x, 8));
+        got.push(tb31(x));
+        want.push(bit_ref(x, 31));
+        got.push(tb32(x));
+        want.push(bit_ref(x, 32));
+        got.push(tb40(x));
+        want.push(bit_ref(x, 40));
+        got.push(tbc5(x));
+        want.push(bit_ref(x, 5));
+        got.push(tbeq6(x));
+        want.push(bit_ref(x, 6));
+        got.push(tbsh13(x));
+        want.push(bit_ref(x, 13));
+        got.push(tb_kept(x));
+        want.push(bit_ref(x, 4));
+        var i: i64 = 0;
+        while i < got.len() {
+            if got.get(i) != want.get(i) {
+                bad = bad + 1;
+            }
+            hits = hits + got.get(i);
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    report("tbz", bad, hits);
+    // brgap
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a: i64 = rnd();
+        var b: i64 = rnd();
+        if t % 4 == 0 {
+            b = a;
+        }
+        if gap_lt(a, b) != gap_lt_ref(a, b) {
+            bad = bad + 1;
+        }
+        if gap_ge(a, b) != gap_ge_ref(a, b) {
+            bad = bad + 1;
+        }
+        if gap_written(a, b) != gap_written_ref(a, b) {
+            bad = bad + 1;
+        }
+        if less_ref(a, b) {
+            hits = hits + 1;
+        }
+        if gap_ge(a, b) != 5 {
+            hits = hits + 1;
+        }
+        if gap_written(a, b) != 0 {
+            hits = hits + 1;
+        }
+        if less_ref(b, a) {
+            hits = hits + 1;
+        }
+        t = t + 1;
+    }
+    report("brgap", bad, hits);
+    // opw
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a64: i64 = rnd() >> 32;
+        val b64: i64 = rnd() >> 32;
+        val a: i32 = a64 as i32;
+        val b: i32 = b64 as i32;
+        if (add32(a, b) as i64) != wrap32(a64 + b64) {
+            bad = bad + 1;
+        }
+        if (sub32(a, b) as i64) != wrap32(a64 - b64) {
+            bad = bad + 1;
+        }
+        if (mul32(a, b) as i64) != wrap32(a64 * b64) {
+            bad = bad + 1;
+        }
+        if add32(a, b) != (0 as i32) {
+            hits = hits + 1;
+        }
+        if sub32(a, b) != (0 as i32) {
+            hits = hits + 1;
+        }
+        if mul32(a, b) != (0 as i32) {
+            hits = hits + 1;
+        }
+        t = t + 1;
+    }
+    report("opw", bad, hits);
+    // memop
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a: i64 = rnd();
+        val b: i64 = rnd();
+        val p: i64 = pressure(a, b);
+        if p != pressure_ref(a, b) {
+            bad = bad + 1;
+        }
+        if p != 0 {
+            hits = hits + 1;
+        }
+        t = t + 1;
+    }
+    report("memop", bad, hits);
+    // andn
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a: i64 = rnd();
+        val b: i64 = rnd();
+        val r: i64 = andn(a, b);
+        if r != andn_ref(a, b) {
+            bad = bad + 1;
+        }
+        if r != 0 {
+            hits = hits + 1;
+        }
+        t = t + 1;
+    }
+    report("andn", bad, hits);
+    // blsr (0 once)
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        var a: i64 = rnd();
+        if t == 0 {
+            a = 0;
+        }
+        val r: i64 = blsr(a);
+        if r != blsr_ref(a) {
+            bad = bad + 1;
+        }
+        if r != 0 {
+            hits = hits + 1;
+        }
+        t = t + 1;
+    }
+    report("blsr", bad, hits);
+    // addi
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a: i64 = rnd();
+        if add7(a) != a + consts.get(0) {
+            bad = bad + 1;
+        }
+        if sub300(a) != a - consts.get(1) {
+            bad = bad + 1;
+        }
+        if add7(a) != 0 {
+            hits = hits + 1;
+        }
+        if sub300(a) != 0 {
+            hits = hits + 1;
+        }
+        t = t + 1;
+    }
+    report("addi", bad, hits);
+    // shi: shifts by a constant against shifts by a count from memory
+    var cnts: Vec<i64> = Vec::new();
+    cnts.push(1);
+    cnts.push(13);
+    cnts.push(32);
+    cnts.push(63);
+    cnts.push(5);
+    cnts.push(40);
+    cnts.push(3);
+    cnts.push(60);
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a: i64 = rnd();
+        var got: Vec<i64> = Vec::new();
+        var want: Vec<i64> = Vec::new();
+        got.push(shl1(a));
+        want.push(shl_ref(a, cnts.get(0)));
+        got.push(shl13(a));
+        want.push(shl_ref(a, cnts.get(1)));
+        got.push(shl32(a));
+        want.push(shl_ref(a, cnts.get(2)));
+        got.push(shl63(a));
+        want.push(shl_ref(a, cnts.get(3)));
+        got.push(sar5(a));
+        want.push(sar_ref(a, cnts.get(4)));
+        got.push(sar40(a));
+        want.push(sar_ref(a, cnts.get(5)));
+        got.push(shr3(a));
+        want.push(shr_ref(a, cnts.get(6)));
+        got.push(shr60(a));
+        want.push(shr_ref(a, cnts.get(7)));
+        var i: i64 = 0;
+        while i < got.len() {
+            if got.get(i) != want.get(i) {
+                bad = bad + 1;
+            }
+            hits = hits + (got.get(i) & 1);
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    report("shi", bad, hits);
+    // li: constants of every class against constants put together from
+    // 16-bit pieces
+    val ps: Vec<i64> = kc_pieces();
+    val w16: i64 = cnts.get(2) * 2048;
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val x: i64 = rnd();
+        var got: Vec<i64> = Vec::new();
+        got.push(kc0(x));
+        got.push(kc1(x));
+        got.push(kc2(x));
+        got.push(kc3(x));
+        got.push(kc4(x));
+        got.push(kc5(x));
+        got.push(kc6(x));
+        got.push(kc7(x));
+        got.push(kc8(x));
+        got.push(kc9(x));
+        got.push(kc10(x));
+        got.push(kc11(x));
+        got.push(kc12(x));
+        got.push(kc13(x));
+        got.push(kc14(x));
+        got.push(kc15(x));
+        got.push(kc16(x));
+        got.push(kc17(x));
+        got.push(kc18(x));
+        got.push(kc19(x));
+        var i: i64 = 0;
+        while i < got.len() {
+            if got.get(i) != kc_ref(x, & ps, i, w16) {
+                bad = bad + 1;
+            }
+            hits = hits + (got.get(i) & 1);
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    report("li", bad, hits);
+    // cmp: compares as values and as branches against sign-bit references
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val a: i64 = rnd();
+        var b: i64 = rnd();
+        if t % 4 == 1 {
+            b = a;
+        }
+        if t % 8 == 2 {
+            b = 0;
+        }
+        if t % 8 == 3 {
+            b = a + 1;
+        }
+        val cv: Vec<i64> = cmp_vals(a, b);
+        val cr: Vec<i64> = cmp_refs(a, b);
+        var i: i64 = 0;
+        while i < cv.len() {
+            if cv.get(i) != cr.get(i) {
+                bad = bad + 1;
+            }
+            hits = hits + cv.get(i);
+            i = i + 1;
+        }
+        if br_lt(a, b) != cr.get(0) {
+            bad = bad + 1;
+        }
+        if br_le(a, b) != cr.get(1) {
+            bad = bad + 1;
+        }
+        if br_gtu(a, b) != cr.get(8) {
+            bad = bad + 1;
+        }
+        if br_geu(a, b) != cr.get(9) {
+            bad = bad + 1;
+        }
+        if br_eqz(b) != eq_ref(b, 0) {
+            bad = bad + 1;
+        }
+        if br_nez(b) != 1 - eq_ref(b, 0) {
+            bad = bad + 1;
+        }
+        hits = hits + br_lt(a, b) + br_geu(a, b) + br_nez(b);
+        t = t + 1;
+    }
+    report("cmp", bad, hits);
+    // mem: constant offsets against indexes from memory
+    var mv: Vec<i64> = Vec::new();
+    var mw: Vec<i64> = Vec::new();
+    var mi: i64 = 0;
+    while mi < 6000 {
+        mv.push(mi * 7);
+        mw.push(mi * 7);
+        mi = mi + 1;
+    }
+    var ix: Vec<i64> = Vec::new();
+    ix.push(3);
+    ix.push(511);
+    ix.push(512);
+    ix.push(4095);
+    ix.push(4096);
+    ix.push(5000);
+    ix.push(17);
+    bad = 0;
+    hits = 0;
+    t = 0;
+    while t < trials {
+        val x: i64 = rnd();
+        val r1: i64 = mem_consts(& mut mv, x);
+        val r2: i64 = mem_ref(& mut mw, x, & ix);
+        if r1 != r2 {
+            bad = bad + 1;
+        }
+        hits = hits + (r1 & 1);
+        t = t + 1;
+    }
+    report("mem", bad, hits);
+}

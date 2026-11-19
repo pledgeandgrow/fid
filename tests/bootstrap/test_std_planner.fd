@@ -1,0 +1,99 @@
+// stdlib/planner: A* on a grid (4- and 8-connected, no path), grid path shortcutting, D* Lite agreeing with A* before and after cells are blocked and the start moves, RRT and RRT* among circle and box obstacles with fixed seeds, greedy and random shortcutting (grid costs checked against a Python Dijkstra)
+// Expected output:
+// astar 8: found true cost 24.4142 cells 25
+// astar 4: found true cost 25.0000 cells 26
+// path cost check: true
+// grid shortcut: 6 waypoints, length 24.0828
+// dstar cost 24.4142 equals astar: true path equals cost: true
+// blocked (8,6): dstar 25.2426 astar 25.2426
+// moved to (11,4), blocked (6,6): dstar 12.8284 astar 12.8284
+// gap (11,5) closed: dstar none: true, astar found false
+// rrt found: true path free: true
+// rrt* found: true path free: true
+// rrt* shorter than rrt: true
+// shortcut free: true shorter: true
+// random shortcut free: true not longer: true
+// blocked start: found false
+use math;
+use planner;
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn rows() -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    r.push("............");
+    r.push(".#########..");
+    r.push(".#.......#..");
+    r.push(".#.#####.#..");
+    r.push("...#...#....");
+    r.push("####.#.####.");
+    r.push("............");
+    r.push("............");
+    return r;
+}
+
+fn main() -> i64 {
+    var g: PlanGrid = plan_grid_from_rows(&rows());
+    val p8: GridPath = plan_astar(&g, 0, 0, 5, 4, true);
+    println("astar 8: found " + yes(p8.found) + " cost " + fmt4(p8.cost) + " cells " + int_to_str(p8.cells.len()));
+    val p4: GridPath = plan_astar(&g, 0, 0, 5, 4, false);
+    println("astar 4: found " + yes(p4.found) + " cost " + fmt4(p4.cost) + " cells " + int_to_str(p4.cells.len()));
+    println("path cost check: " + yes(math_fabs(plan_grid_path_cost(&g, &p8.cells) - p8.cost) < 0.000000001));
+    val sc: Vec<i64> = plan_grid_shortcut(&g, &p8.cells);
+    println("grid shortcut: " + int_to_str(sc.len()) + " waypoints, length " + fmt4(plan_grid_polyline_length(&g, &sc)));
+
+    var ds: DStarLite = dstar_new(&g, 0, 0, 5, 4);
+    dstar_compute(&mut ds);
+    val dp: Vec<i64> = dstar_path(&ds);
+    println("dstar cost " + fmt4(dstar_cost(&ds)) + " equals astar: " + yes(math_fabs(dstar_cost(&ds) - p8.cost) < 0.000000001) + " path equals cost: " + yes(math_fabs(plan_grid_path_cost(&g, &dp) - p8.cost) < 0.000000001));
+    // a new obstacle appears on the way
+    dstar_set_blocked(&mut ds, 8, 6, true);
+    plan_grid_set(&mut g, 8, 6, true);
+    dstar_compute(&mut ds);
+    println("blocked (8,6): dstar " + fmt4(dstar_cost(&ds)) + " astar " + fmt4(plan_astar(&g, 0, 0, 5, 4, true).cost));
+    // the robot moves, then the map changes again
+    dstar_move_start(&mut ds, 11, 4);
+    dstar_set_blocked(&mut ds, 6, 6, true);
+    plan_grid_set(&mut g, 6, 6, true);
+    dstar_compute(&mut ds);
+    println("moved to (11,4), blocked (6,6): dstar " + fmt4(dstar_cost(&ds)) + " astar " + fmt4(plan_astar(&g, 11, 4, 5, 4, true).cost));
+    // close the only gap toward the goal's room
+    dstar_set_blocked(&mut ds, 11, 5, true);
+    plan_grid_set(&mut g, 11, 5, true);
+    dstar_compute(&mut ds);
+    println("gap (11,5) closed: dstar none: " + yes(dstar_cost(&ds) >= 1.0e299 && dstar_path(&ds).len() == 0) + ", astar found " + yes(plan_astar(&g, 11, 4, 5, 4, true).found));
+
+    // a 10 x 10 world with a disc and a box between start and goal
+    var w: PlanWorld = plan_world_new(0.0, 0.0, 10.0, 10.0, 0.1);
+    plan_world_add_circle(&mut w, 5.0, 5.0, 1.8);
+    plan_world_add_box(&mut w, 1.5, 6.0, 4.0, 7.0);
+    plan_world_add_box(&mut w, 6.0, 2.0, 7.0, 4.5);
+    val s: vec2 = vec2(1.0, 1.0);
+    val goal: vec2 = vec2(9.0, 9.0);
+    val r1: PlanResult = plan_rrt(&w, s, goal, plan_params(0.8, 0.1, 2000, 0.8, 7));
+    println("rrt found: " + yes(r1.found) + " path free: " + yes(plan_path_free(&w, &r1.path)));
+    val r2: PlanResult = plan_rrt_star(&w, s, goal, plan_params(0.8, 0.1, 400, 0.8, 7));
+    println("rrt* found: " + yes(r2.found) + " path free: " + yes(plan_path_free(&w, &r2.path)));
+    println("rrt* shorter than rrt: " + yes(r2.cost < r1.cost));
+    val short: Vec<vec2> = plan_shortcut(&w, &r1.path);
+    println("shortcut free: " + yes(plan_path_free(&w, &short)) + " shorter: " + yes(plan_path_length(&short) < r1.cost));
+    val rs: Vec<vec2> = plan_shortcut_random(&w, &r1.path, 100, 3);
+    println("random shortcut free: " + yes(plan_path_free(&w, &rs)) + " not longer: " + yes(plan_path_length(&rs) <= r1.cost + 0.000000001));
+    val bad: PlanResult = plan_rrt(&w, vec2(5.0, 5.0), goal, plan_params(0.8, 0.1, 100, 0.8, 7));
+    println("blocked start: found " + yes(bad.found));
+    return 0;
+}
+
+fn fmt4(x: f64) -> str {
+    val v: i64 = math_floor(x * 10000.0 + 0.5) as i64;
+    var frac: str = int_to_str(v % 10000);
+    while str_len(frac) < 4 {
+        frac = "0" + frac;
+    }
+    return int_to_str(v / 10000) + "." + frac;
+}

@@ -1,0 +1,105 @@
+// stdlib/background: WorkManager limits (interval, flex, backoff), backoff
+// delays, the WorkManager builder calls and the BGTaskScheduler plan of a
+// spec, the Info.plist identifiers, and the scheduler simulation (waiting
+// for network, exponential and linear retries, max attempts, charging +
+// unmetered constraints, periodic flex windows, cancellation).
+// Expected output:
+// notes interval 600000 ms raised to 15 minutes | flex 60000 ms raised to 5 minutes | backoff 5000 ms raised to 10 s
+// exponential 30000 60000 120000 240000 linear 20000 40000 60000 cap 18000000
+// Constraints.Builder() | setRequiredNetworkType(NetworkType.UNMETERED) | setRequiresCharging(true) | OneTimeWorkRequest.Builder(worker) | setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30000, MILLISECONDS) | addTag("com.example.upload") | WorkManager.enqueueUniqueWork("com.example.upload", KEEP, request)
+// periodic PeriodicWorkRequest.Builder(worker, 900000, MILLISECONDS, 300000, MILLISECONDS)
+// ios upload BGProcessingTaskRequest network true power true warnings 1
+// ios refresh BGAppRefreshTaskRequest earliest 900000 warnings 1: not periodic on iOS: submit the next request when the task completes
+// ios bad id true false
+// <key>BGTaskSchedulerPermittedIdentifiers</key>
+// <array>
+//     <string>com.example.sync</string>
+//     <string>com.example.refresh</string>
+// </array>
+// keep duplicate false
+// 0s com.example.flaky attempt 1 retry
+// 20s com.example.flaky attempt 2 retry
+// 50s com.example.doomed cancelled
+// 50s com.example.sync attempt 1 retry
+// 60s com.example.flaky attempt 3 retry
+// 80s com.example.sync attempt 2 retry
+// 140s com.example.sync attempt 3 success
+// 300s com.example.upload attempt 1 success
+// 600s com.example.refresh attempt 1 success
+// 1500s com.example.refresh attempt 1 success
+// 2400s com.example.refresh attempt 1 success
+// states succeeded succeeded enqueued failed cancelled
+use background;
+use vec;
+use string;
+
+fn w_sync(attempt: i64) -> i64 { if attempt < 3 { return BG_RETRY; } return BG_SUCCESS; }
+fn w_ok(attempt: i64) -> i64 { return BG_SUCCESS; }
+fn w_retry(attempt: i64) -> i64 { return BG_RETRY; }
+
+fn join(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() { if i > 0 { s = s + " | "; } s = s + v.get(i); i = i + 1; }
+    return s;
+}
+
+fn main() {
+    var p: BgSpec = bg_periodic("x", 600000, 60000);
+    p.backoff_ms = 5000;
+    println("notes " + join(bg_normalize(p).notes));
+    val ex: BgSpec = bg_one_off("e");
+    var li: BgSpec = bg_one_off("l");
+    li.backoff = BG_BACKOFF_LINEAR;
+    li.backoff_ms = 20000;
+    println("exponential " + int_to_str(bg_backoff_delay(&ex, 1)) + " " + int_to_str(bg_backoff_delay(&ex, 2)) + " "
+        + int_to_str(bg_backoff_delay(&ex, 3)) + " " + int_to_str(bg_backoff_delay(&ex, 4)) + " linear "
+        + int_to_str(bg_backoff_delay(&li, 1)) + " " + int_to_str(bg_backoff_delay(&li, 2)) + " " + int_to_str(bg_backoff_delay(&li, 3))
+        + " cap " + int_to_str(bg_backoff_delay(&ex, 20)));
+
+    var sync: BgSpec = bg_one_off("com.example.sync");
+    sync.network = BG_NET_CONNECTED;
+    var upload: BgSpec = bg_one_off("com.example.upload");
+    upload.network = BG_NET_UNMETERED;
+    upload.charging = true;
+    val refresh: BgSpec = bg_periodic("com.example.refresh", 900000, 300000);
+    var flaky: BgSpec = bg_one_off("com.example.flaky");
+    flaky.backoff = BG_BACKOFF_LINEAR;
+    flaky.backoff_ms = 20000;
+    flaky.max_attempts = 3;
+    var doomed: BgSpec = bg_one_off("com.example.doomed");
+    doomed.initial_delay_ms = 100000;
+
+    println(join(bg_workmanager_calls(upload)));
+    println("periodic " + bg_workmanager_calls(refresh).get(1));
+    val iu: BgIosPlan = bg_ios_plan(&upload);
+    println("ios upload " + iu.request_class + " network " + bool_to_str(iu.requires_network) + " power " + bool_to_str(iu.requires_power)
+        + " warnings " + int_to_str(iu.warnings.len()));
+    val ir: BgIosPlan = bg_ios_plan(&refresh);
+    println("ios refresh " + ir.request_class + " earliest " + int_to_str(ir.earliest_begin_ms) + " warnings " + int_to_str(ir.warnings.len())
+        + ": " + ir.warnings.get(0));
+    println("ios bad id " + bool_to_str(bg_identifier_ok("com.example.sync")) + " " + bool_to_str(bg_identifier_ok("sync")));
+    var ids: Vec<str> = Vec::new();
+    ids.push("com.example.sync");
+    ids.push("com.example.refresh");
+    print(bg_ios_plist(ids));
+
+    var s: BgScheduler = bg_scheduler_new(bg_device(0, false));
+    bg_enqueue(&mut s, sync, w_sync);
+    bg_enqueue(&mut s, upload, w_ok);
+    bg_enqueue(&mut s, refresh, w_ok);
+    bg_enqueue(&mut s, flaky, w_retry);
+    bg_enqueue(&mut s, doomed, w_ok);
+    println("keep duplicate " + bool_to_str(bg_enqueue(&mut s, sync, w_ok)));
+    bg_advance(&mut s, 50000, 10000);
+    bg_cancel(&mut s, "com.example.doomed");
+    bg_set_device(&mut s, bg_device(BG_NET_CONNECTED, false));
+    bg_advance(&mut s, 300000, 10000);
+    bg_set_device(&mut s, bg_device(BG_NET_UNMETERED, true));
+    bg_advance(&mut s, 2500000, 10000);
+    var i: i64 = 0;
+    while i < s.log.len() { println(s.log.get(i)); i = i + 1; }
+    println("states " + bg_state_name(bg_state(&s, "com.example.sync")) + " " + bg_state_name(bg_state(&s, "com.example.upload")) + " "
+        + bg_state_name(bg_state(&s, "com.example.refresh")) + " " + bg_state_name(bg_state(&s, "com.example.flaky")) + " "
+        + bg_state_name(bg_state(&s, "com.example.doomed")));
+}

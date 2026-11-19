@@ -1,0 +1,142 @@
+// CI3: a C function takes a Fides callback and a user data pointer, and the
+// callback gets the pointer back: the state of the caller (a struct here)
+// read and changed from inside the callback. Windows' qsort_s passes the
+// context first, the C library's qsort_r (glibc, musl) last; macOS's
+// qsort_r (BSD) takes the context before the comparison and passes it
+// first. glibc declares qsort_r only under _GNU_SOURCE, which the C
+// output defines on Linux when C gets a callback (codegen_c.fd
+// cg_emit_ffi_feature_macros).
+// `&mut st as *u8` (parsed `&mut (st as *u8)`) is the struct's address
+// (lower.fd, Expr::Ref of a Cast), the same as `(&mut st) as *u8`.
+// Needs native FFI: `fid ccompile` (the interpreter has no qsort_s/qsort_r).
+// Expected output:
+// 4 3 2 1 0
+// called 1
+// 0 1 2 3 4
+// called 1
+
+extern "C" include "<stdlib.h>" {
+    fn qsort_s as c_qsort_s(base: *u8, n: i64, size: i64, cmp: fn(*u8, *u8, *u8) -> i32, ctx: *u8);
+    fn qsort_r as c_qsort_r(base: *u8, n: i64, size: i64, cmp: fn(*u8, *u8, *u8) -> i32, ctx: *u8);
+    fn qsort_r as c_qsort_r_bsd(base: *u8, n: i64, size: i64, ctx: *u8, cmp: fn(*u8, *u8, *u8) -> i32);
+}
+
+struct Order {
+    calls: i64,
+    sign: i64,
+}
+
+@unsafe
+fn slot(base: *u8, i: i64) -> *i64 {
+    return (base as i64 + i * 8) as *i64;
+}
+
+@unsafe
+fn compare(ctx: *u8, a: *u8, b: *u8) -> i32 {
+    val o: *Order = ctx as *Order;
+    (*o).calls = (*o).calls + 1;
+    val x: i64 = *(a as *i64) * (*o).sign;
+    val y: i64 = *(b as *i64) * (*o).sign;
+    if x < y { return -1; }
+    if x > y { return 1; }
+    return 0;
+}
+
+// qsort_r's order: the elements, then the context
+@unsafe
+fn compare_last(a: *u8, b: *u8, ctx: *u8) -> i32 {
+    return compare(ctx, a, b);
+}
+
+// Sorts the 5 words at base by `sign`; the comparison counts its calls in
+// the Order it gets as user data. `paren` picks the written form.
+@cfg(windows)
+@unsafe
+fn sort_signed(base: *u8, sign: i64, paren: bool) -> i64 {
+    var o: Order = Order { calls: 0, sign: sign };
+    if paren {
+        c_qsort_s(base, 5, 8, compare, (&mut o) as *u8);
+    } else {
+        c_qsort_s(base, 5, 8, compare, &mut o as *u8);
+    }
+    return o.calls;
+}
+
+@cfg(linux)
+@unsafe
+fn sort_signed(base: *u8, sign: i64, paren: bool) -> i64 {
+    var o: Order = Order { calls: 0, sign: sign };
+    if paren {
+        c_qsort_r(base, 5, 8, compare_last, (&mut o) as *u8);
+    } else {
+        c_qsort_r(base, 5, 8, compare_last, &mut o as *u8);
+    }
+    return o.calls;
+}
+
+@cfg(macos)
+@unsafe
+fn sort_signed(base: *u8, sign: i64, paren: bool) -> i64 {
+    var o: Order = Order { calls: 0, sign: sign };
+    if paren {
+        c_qsort_r_bsd(base, 5, 8, (&mut o) as *u8, compare);
+    } else {
+        c_qsort_r_bsd(base, 5, 8, &mut o as *u8, compare);
+    }
+    return o.calls;
+}
+
+// PL3: FreeBSD 14's qsort_r is POSIX's (the context last, as glibc's;
+// <stdlib.h> sends the old BSD order to __qsort_r_compat by the type of
+// the last argument). Needs compiler.fd check_cfg to know `freebsd`
+// (else this variant held on every system).
+@cfg(freebsd)
+@unsafe
+fn sort_signed(base: *u8, sign: i64, paren: bool) -> i64 {
+    var o: Order = Order { calls: 0, sign: sign };
+    if paren {
+        c_qsort_r(base, 5, 8, compare_last, (&mut o) as *u8);
+    } else {
+        c_qsort_r(base, 5, 8, compare_last, &mut o as *u8);
+    }
+    return o.calls;
+}
+
+fn at_most_one(n: i64) -> i64 {
+    if n > 0 {
+        return 1;
+    }
+    return 0;
+}
+
+@unsafe
+fn show(base: *u8, n: i64) {
+    var line: str = "";
+    var i: i64 = 0;
+    while i < n {
+        if i > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(*slot(base, i));
+        i = i + 1;
+    }
+    println(line);
+}
+
+@unsafe
+fn main() -> i64 {
+    val base: *u8 = p_malloc(40);
+    var i: i64 = 0;
+    while i < 5 {
+        *slot(base, i) = (7 * i + 3) % 5;
+        i = i + 1;
+    }
+    var calls: i64 = sort_signed(base, 0 - 1, false);
+    show(base, 5);
+    println("called " + int_to_str(at_most_one(calls)));
+    calls = sort_signed(base, 1, true);
+    show(base, 5);
+    println("called " + int_to_str(at_most_one(calls)));
+    p_free(base);
+    return 0;
+}

@@ -1,0 +1,65 @@
+// stdlib/blake3.fd on multi-chunk inputs (2 to 9 chunks of 1024 bytes:
+// the chaining-value stack merges subtrees at depths 1 to 3), against the
+// official BLAKE3 test vectors. The one-chunk cases and MD5 are in
+// test_blake3_md5.fd. Slow in an -O0 interpreter (minutes); instant native.
+// Vectors: the official BLAKE3 test vectors
+// (test_vectors/test_vectors.json of the BLAKE3 repository: input byte i
+// is i % 251; keyed_hash key "whats the Elvish word for friend";
+// derive_key context "BLAKE3 2019-12-27 16:29:52 test vectors context").
+// Each case is an extended output: the first 32 bytes must equal the
+// default-length output, which is checked too. A wrong answer panics.
+use blake3;
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn input(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(i % 251); i = i + 1; }
+    return v;
+}
+
+/// The hash mode: the full 131-byte output when `want` has 262 digits,
+/// and always the default 32-byte hash against its first 64 digits.
+fn check_hash(n: i64, want: str) {
+    val label: str = "blake3 hash " + p_to_str(n);
+    if str_len(want) > 64 {
+        check(label + " xof", blake3_hex(blake3_xof(input(n), str_len(want) / 2)), want);
+    }
+    check(label, blake3_hex(blake3_bytes(input(n))), str_slice(want, 0, 64));
+}
+
+fn check_keyed(n: i64, want: str) {
+    val key: Vec<i64> = str_bytes("whats the Elvish word for friend");
+    val label: str = "blake3 keyed " + p_to_str(n);
+    check(label + " xof", blake3_hex(blake3_keyed_xof(key, input(n), str_len(want) / 2)), want);
+    check(label, blake3_hex(blake3_keyed(key, input(n))), str_slice(want, 0, 64));
+}
+
+fn check_derive(n: i64, want: str) {
+    val ctx: str = "BLAKE3 2019-12-27 16:29:52 test vectors context";
+    val label: str = "blake3 derive " + p_to_str(n);
+    check(label + " xof", blake3_hex(blake3_derive_key_xof(ctx, input(n), str_len(want) / 2)), want);
+    check(label, blake3_hex(blake3_derive_key(ctx, input(n))), str_slice(want, 0, 64));
+}
+
+fn main() -> i64 {
+    check_hash(2048, "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a");
+    check_hash(2049, "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030");
+    check_hash(3072, "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2");
+    check_hash(3073, "7124b49501012f81cc7f11ca069ec9226cecb8a2c850cfe644e327d22d3e1cd3");
+    check_hash(4096, "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969");
+    check_hash(4097, "9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d890d15c96a1c25b8aa0fb995");
+    check_hash(5121, "628bd2cb2004694adaab7bbd778a25df25c47b9d4155a55f8fbd79f2fe154cff");
+    check_hash(8192, "aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63");
+    check_hash(8193, "bab6c09cb8ce8cf459261398d2e7aef35700bf488116ceb94a36d0f5f1b7bc3b");
+    check_keyed(1025, "357dc55de0c7e382c900fd6e320acc04146be01db6a8ce7210b7189bd664ea69362396b77fdc0d2634a552970843722066c3c15902ae5097e00ff53f1e116f1cd5352720113a837ab2452cafbde4d54085d9cf5d21ca613071551b25d52e69d6c81123872b6f19cd3bc1333edf0c52b94de23ba772cf82636cff4542540a7738d5b930");
+    check_derive(1025, "effaa245f065fbf82ac186839a249707c3bddf6d3fdda22d1b95a3c970379bcb5d31013a167509e9066273ab6e2123bc835b408b067d88f96addb550d96b6852dad38e320b9d940f86db74d398c770f462118b35d2724efa13da97194491d96dd37c3c09cbef665953f2ee85ec83d88b88d11547a6f911c8217cca46defa2751e7f3ad");
+    println("blake3 tree vectors ok");
+    return 0;
+}

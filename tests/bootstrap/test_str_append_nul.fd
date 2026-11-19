@@ -1,0 +1,41 @@
+// known-bugs 2g.41: a string grown by `s = s + x` (core's p_str_append
+// marks its header word P_STR_RC + P_STR_ROOM + count) lost everything
+// after a zero byte when it was then joined with `+` in a native Windows
+// build: pe_ir's p_str_concat stub (PeirGen_emit_slen) did not take that
+// header as a counted string and fell back to strlen. The interpreter and
+// C were right. toml-test's string/unicode-escape (\u0000) tripped on it.
+//
+// Expected output:
+// grown: 2
+// joined: 3 120
+// pushed: 4
+// nul then text: 2
+// both grown: 4
+
+fn nul() -> str {
+    var b: Vec<u8> = Vec::new();
+    b.push(0);
+    return str_from_bytes(b);
+}
+
+fn main() -> i64 {
+    var acc: str = "";
+    acc = acc + "a";
+    acc = acc + nul();
+    println("grown: " + int_to_str(str_len(acc)));
+    val joined: str = acc + "x";
+    println("joined: " + int_to_str(str_len(joined)) + " " + int_to_str(str_byte_at(joined, 2)));
+    var v: Vec<str> = Vec::new();
+    v.push(acc + str_slice("xyz", 0, 2));
+    println("pushed: " + int_to_str(str_len(v.get(0))));
+    val z: str = nul();
+    println("nul then text: " + int_to_str(str_len(z + "q")));
+    var acc2: str = "";
+    acc2 = acc2 + nul();
+    acc2 = acc2 + "b";
+    println("both grown: " + int_to_str(str_len(acc + acc2)));
+    if str_len(joined) != 3 || str_len(v.get(0)) != 4 || str_len(acc + acc2) != 4 {
+        p_panic("2g.41: a zero byte was dropped");
+    }
+    return 0;
+}

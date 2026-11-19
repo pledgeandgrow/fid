@@ -1,0 +1,149 @@
+// VF5, the machine layer's rule passes (`FID_NAT_OFF=egraph`, `forward`,
+// `rules`, `purecse`: compiler/egraph.fd and compiler/rules.fd). The IR
+// optimizer's folds are turned off for this file (//@ env below), so the
+// constant expressions, identities and repeated loads reach the backend's
+// passes instead of being settled earlier. Each line prints values that a
+// wrong rule changes: identities at a type's edges (x - x, x ^ x, x * 2
+// against x + x in wrapping u8, x & -1, x | 0), constant folds of signed
+// division and remainder, of shifts of negative values, of narrow
+// wrapping sums that do not fit, comparisons of a value with itself and
+// flipped ones, unsigned comparisons above 2^31; store-to-load forwarding
+// of a local across a call that cannot see it and of one whose address a
+// call gets (it must be loaded again); equal calls of a pure function with
+// different arguments (they must not be merged). scripts/verify/
+// variants.py's mutant egraph-ge-as-gt breaks it, and the run-time
+// mutants of scripts/mutation-check.sh (FID_NAT_MUTATE=egfold, egident,
+// egsame, ...) are meant to as well.
+//
+//@ env: FID_IROPT_OFF=fold,sccp,gvn,promote,branchfacts,licm,iv
+//
+// Expected output:
+// 0 0 88 88 44 44
+// -3 -1 3 1 -4 -3
+// 44 255 0
+// 0 1 1 0 1 0
+// 1 0 1 0
+// 4000000000 1
+// 15 12
+// 1 0 1 1 0 1
+// 23 2
+// 49 64
+
+fn opaque(k: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < k {
+        s = s + 1;
+        i = i + 1;
+    }
+    if s > 1000000 {
+        println("unreachable");
+    }
+    return s;
+}
+
+@wrapping fn ident_u8(x: u8) -> str {
+    val a: u8 = x - x;
+    val b: u8 = x ^ x;
+    val c: u8 = x * 2;
+    val d: u8 = x + x;
+    val e: u8 = x & 255;
+    val f: u8 = x | 0;
+    return int_to_str(a as i64) + " " + int_to_str(b as i64) + " " + int_to_str(c as i64) + " " + int_to_str(d as i64) + " " + int_to_str(e as i64) + " " + int_to_str(f as i64);
+}
+
+fn divs() -> str {
+    val a: i64 = 0 - 7;
+    val b: i64 = 2;
+    val n: i64 = 0 - 8;
+    return int_to_str(a / b) + " " + int_to_str(a % b) + " " + int_to_str(7 / b) + " " + int_to_str(7 % b) + " " + int_to_str(n >> 1) + " " + int_to_str((0 - 9) >> 2);
+}
+
+@wrapping fn narrow_sum() -> str {
+    val a: u8 = 200;
+    val b: u8 = 100;
+    val c: u8 = 255;
+    val z: u8 = 0;
+    val m: u8 = z - 1;
+    return int_to_str((a + b) as i64) + " " + int_to_str((c + z) as i64) + " " + int_to_str((m + 1) as i64);
+}
+
+fn self_cmp(x: i64) -> str {
+    var s: str = "";
+    if x < x { s = s + "1"; } else { s = s + "0"; }
+    if x <= x { s = s + " 1"; } else { s = s + " 0"; }
+    if x == x { s = s + " 1"; } else { s = s + " 0"; }
+    if x != x { s = s + " 1"; } else { s = s + " 0"; }
+    if x >= x { s = s + " 1"; } else { s = s + " 0"; }
+    if x > x { s = s + " 1"; } else { s = s + " 0"; }
+    return s;
+}
+
+fn flipped(a: i64, b: i64) -> str {
+    var s: str = "";
+    if b > a { s = s + "1"; } else { s = s + "0"; }
+    if b < a { s = s + " 1"; } else { s = s + " 0"; }
+    if b >= a { s = s + " 1"; } else { s = s + " 0"; }
+    if b <= a { s = s + " 1"; } else { s = s + " 0"; }
+    return s;
+}
+
+fn unsigned_big() -> str {
+    val a: u32 = 4000000000;
+    val b: u32 = 5;
+    var r: i64 = 0;
+    if a > b {
+        r = 1;
+    }
+    return int_to_str(a as i64) + " " + int_to_str(r);
+}
+
+fn const_cmp() -> str {
+    // constants compared at and next to their bound (folded by the
+    // backend when the IR optimizer does not)
+    val c5: i64 = 5;
+    val c6: i64 = 6;
+    var s: str = "";
+    if c5 >= 5 { s = s + "1"; } else { s = s + "0"; }
+    if c5 >= c6 { s = s + " 1"; } else { s = s + " 0"; }
+    if c6 >= c5 { s = s + " 1"; } else { s = s + " 0"; }
+    if c5 <= 5 { s = s + " 1"; } else { s = s + " 0"; }
+    if c6 > 6 { s = s + " 1"; } else { s = s + " 0"; }
+    if c5 < c6 { s = s + " 1"; } else { s = s + " 0"; }
+    return s;
+}
+
+fn bump(r: &mut i64) {
+    *r = *r + 5;
+}
+
+fn forwards(k: i64) -> str {
+    // a local stored, a call that cannot see it, then loaded
+    var x: i64 = k + 10;
+    val o: i64 = opaque(3);
+    val y: i64 = x + o - 3;
+    // a local whose address the call gets: loaded again after it
+    var z: i64 = k + 2;
+    bump(&mut z);
+    return int_to_str(y) + " " + int_to_str(z);
+}
+
+fn sq(x: i64) -> i64 {
+    return x * x;
+}
+
+fn main() -> i64 {
+    println(ident_u8(44));
+    println(divs());
+    println(narrow_sum());
+    println(self_cmp(opaque(4)));
+    println(flipped(opaque(1), opaque(2)));
+    println(unsigned_big());
+    println(forwards(5));
+    println(const_cmp());
+    // equal calls of a pure function with different arguments
+    val p: i64 = sq(opaque(2)) + sq(opaque(3)) + sq(opaque(2)) * 0 + 10;
+    println(int_to_str(p) + " " + int_to_str(sq(opaque(2)) - sq(opaque(2)) + 2));
+    println(int_to_str(sq(opaque(7))) + " " + int_to_str(sq(opaque(8))));
+    return 0;
+}

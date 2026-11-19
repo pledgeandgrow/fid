@@ -1,0 +1,45 @@
+// ME25 (compiler/iropt.fd iro_version, `version`, on by default on the
+// native paths since Nov 17): expected to fail at run time (index out of
+// bounds at i = 5), after printing 1 to 5. `sum_first`'s loop is versioned:
+// its copy, without bounds checks, runs only when `n > 0` and then
+// `n <= v.len() && i >= 0`. Here n = 7 > v.len() = 5, so the guard sends
+// the loop to the original, checked one, which panics reading v[5] (the
+// copy would read past the end). The first call (n = 5) takes the copy.
+// "unreachable" is never printed. tests/tooling/version-default-check.sh
+// runs this with version on and off: the same output and a failing exit
+// status both times.
+
+fn sum_first(v: & Vec<i64>, n: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        total = total + v.get(i);
+        i = i + 1;
+    }
+    return total;
+}
+
+fn print_first(v: & Vec<i64>, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        println(v.get(i));
+        i = i + 1;
+    }
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 1;
+    while k <= 5 {
+        v.push(k);
+        k = k + 1;
+    }
+    // bounds from calls: not constants after inlining
+    var five: i64 = str_len("abcde");
+    var seven: i64 = str_len("abcdefg");
+    if sum_first(& v, five) != 15 {
+        println("wrong sum");
+    }
+    print_first(& v, seven);
+    println("unreachable");
+}

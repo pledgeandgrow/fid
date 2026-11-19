@@ -1,0 +1,59 @@
+// Competitive RT9: the C path's task context switch alone (__p_ctx_swap in
+// the C runtime, compiler/codegen_c.fd), apart from the scheduler. The
+// native Windows counterpart is ctx_swap_bench.fd (pe_ctx_swap, `fid emit`).
+//
+//   CC="zig cc" fid ccompile tests/ctx_switch/c_ctx_swap_bench.fd -o cctx.exe
+//   ./cctx.exe [pairs]
+//
+// p_ctx_switch_bench(n) is part of the C runtime: main and a task that only
+// switches back ping-pong n times (2n switches) through __p_ctx_swap, with
+// the task's stack laid out by __p_ctx_init as for any task (on Windows a
+// 1 MB reserved stack with a guard page, and the switch saves xmm6-15 and
+// the TEB stack fields). It returns nanoseconds per switch, or -1 when the
+// C compiler gives the runtime no own switch (cl.exe and tcc keep fibers,
+// other POSIX targets ucontext). The best of 5 runs is printed; exit code 0
+// when it is under 20 ns, 2 when the C path has no own switch.
+// C path only: `fid run` and `fid emit` have no p_ctx_switch_bench.
+extern "C" {
+    fn p_ctx_switch_bench(n: i64) -> i64;
+}
+
+fn main() -> i64 {
+    var n: i64 = 10000000;
+    match arg_at(1) {
+        Option::Some(a) => {
+            n = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    // warm-up: the caches, the stack's first pages
+    val w = p_ctx_switch_bench(100000);
+    if w < 0 {
+        print("no own context switch on this C path\n");
+        return 2;
+    }
+    var best: i64 = -1;
+    var r: i64 = 0;
+    while r < 5 {
+        val ns = p_ctx_switch_bench(n);
+        print("run ");
+        print(r + 1);
+        print(": ");
+        print(ns);
+        print(" ns per switch\n");
+        if best < 0 || ns < best {
+            best = ns;
+        }
+        r = r + 1;
+    }
+    print("best: ");
+    print(best);
+    print(" ns per switch\n");
+    if best < 20 {
+        print("under 20 ns: yes\n");
+        return 0;
+    }
+    print("under 20 ns: no\n");
+    return 1;
+}

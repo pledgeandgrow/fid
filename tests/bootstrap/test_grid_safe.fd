@@ -1,0 +1,53 @@
+// Roadmap Phase 9 / F59: @grid-safe marks an IEC 61850 protection path. It
+// is @no-alloc + @no-recursion + @no-unbounded + @no-indirect +
+// @no-blocking: bounded response, no heap, deterministic dispatch and no
+// call that waits. A relay written that way, calling only other @grid-safe
+// functions, is accepted.
+// Expected output:
+//   trip 1
+//   trip 0
+//   over 3
+//   breaker 7 tripped
+
+struct Breaker {
+    id: i64,
+    tripped: bool,
+}
+
+@grid-safe
+fn fault_detected(current: i64, voltage: i64) -> bool {
+    return current > 1000 || voltage < 200;
+}
+
+@grid-safe
+fn protection_relay(current: i64, voltage: i64, b: & mut Breaker) -> i64 {
+    if fault_detected(current, voltage) {
+        b.tripped = true;
+        return 1;
+    }
+    return 0;
+}
+
+// a bounded scan: a `for` over a fixed range, no `while`
+@grid-safe
+fn samples_over(limit: i64) -> i64 {
+    var n: i64 = 0;
+    for i in 0..8 {
+        if i * 100 > limit {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    var b = Breaker { id: 7, tripped: false };
+    println("trip " + int_to_str(protection_relay(1500, 230, & mut b)));
+    var ok = Breaker { id: 8, tripped: false };
+    println("trip " + int_to_str(protection_relay(500, 230, & mut ok)));
+    println("over " + int_to_str(samples_over(400)));
+    if b.tripped && !ok.tripped {
+        println("breaker " + int_to_str(b.id) + " tripped");
+    }
+    return 0;
+}

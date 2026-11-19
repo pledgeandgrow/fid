@@ -1,0 +1,522 @@
+// Fides hierarchical state machines (robotics / control)
+//
+// UML-style statecharts:
+//   - states nest (each has a parent; a composite state has an initial
+//     child), with entry, exit and "do" actions;
+//   - transitions on named events, with an optional guard and action;
+//     an event goes to the active leaf state first, then to its ancestors
+//     (inner transitions win); target -1 makes an internal transition (no
+//     exit or entry); a transition to the source itself exits and enters
+//     it again (an external self-transition);
+//   - the exit/entry order of UML: exit from the active leaf up to (not
+//     including) the least common ancestor of source and target, run the
+//     transition action, enter down to the target, then follow initial
+//     children (or history) down to a leaf;
+//   - shallow history (re-enter the child that was active, then its
+//     initial chain) and deep history (re-enter the leaf that was active);
+//   - an event queue with run-to-completion: an event is processed fully
+//     before the next one; actions post new events with `hsm_emit`, and
+//     they join the end of the queue;
+//   - timed transitions ("after N ms in this state"), checked by
+//     `hsm_update(&mut m, now_ms)` against an injected clock, which also
+//     runs the do actions of the active states (outermost first);
+//   - a trace of everything that happened ("enter:S", "exit:S",
+//     "S -> T on ev", "drop:ev", "do:S").
+//
+// Actions and guards are function values `fn(i64) -> i64` that receive the
+// machine's context value (whatever the user chose: an index, a handle);
+// a guard passes when it returns non-zero. Pure computation; the seam is
+// the actions, which drive the robot.
+//
+// Usage:
+//   use state_machine;
+//   var m: Hsm = hsm_new(0);
+//   val off: i64 = hsm_add_state(&mut m, "Off", -1);
+//   val on: i64 = hsm_add_state(&mut m, "On", -1);
+//   hsm_add_transition(&mut m, off, on, "power");
+//   hsm_start(&mut m, 0.0);
+//   hsm_post(&mut m, "power");
+//   hsm_run(&mut m);
+
+module state_machine;
+
+pub const HSM_NO_HISTORY: i64 = 0;
+pub const HSM_SHALLOW: i64 = 1;
+pub const HSM_DEEP: i64 = 2;
+
+pub struct HsmState {
+    pub name: str,
+    pub parent: i64,
+    pub initial: i64,
+    pub history: i64,
+    // the remembered child (shallow) or leaf (deep); -1 = none yet
+    pub hist: i64,
+    pub entered_at: f64,
+    pub has_entry: bool,
+    pub has_exit: bool,
+    pub has_do: bool,
+    pub on_entry: fn(i64) -> i64,
+    pub on_exit: fn(i64) -> i64,
+    pub on_do: fn(i64) -> i64,
+}
+
+pub struct HsmTrans {
+    pub source: i64,
+    // -1: internal transition
+    pub target: i64,
+    // "" for a timed transition
+    pub event: str,
+    // timed: fires after this many ms in the source state (-1: not timed)
+    pub after: f64,
+    pub has_guard: bool,
+    pub has_action: bool,
+    pub guard: fn(i64) -> i64,
+    pub action: fn(i64) -> i64,
+}
+
+pub struct Hsm {
+    pub states: Vec<HsmState>,
+    pub trans: Vec<HsmTrans>,
+    // the top-level state entered by hsm_start
+    pub initial: i64,
+    // the active leaf (-1 before start)
+    pub cur: i64,
+    pub queue: Vec<str>,
+    pub now: f64,
+    pub ctx: i64,
+    pub log: Vec<str>,
+    pub trace_do: bool,
+}
+
+fn hsm_nop(c: i64) -> i64 {
+    return 0;
+}
+
+/// A machine whose actions get `ctx`.
+pub fn hsm_new(ctx: i64) -> Hsm {
+    return Hsm { states: Vec::new(), trans: Vec::new(), initial: - 1, cur: - 1, queue: Vec::new(), now: 0.0, ctx: ctx, log: Vec::new(), trace_do: false };
+}
+
+/// Add a state under `parent` (-1: top level). The first child added to a
+/// state becomes its initial child, and the first top-level state the
+/// machine's initial state; hsm_set_initial changes either.
+pub fn hsm_add_state(m: & mut Hsm, name: str, parent: i64) -> i64 {
+    m.states.push(HsmState { name: name, parent: parent, initial: - 1, history: HSM_NO_HISTORY, hist: - 1, entered_at: 0.0, has_entry: false, has_exit: false, has_do: false, on_entry: hsm_nop, on_exit: hsm_nop, on_do: hsm_nop });
+    val id: i64 = m.states.len() - 1;
+    if parent >= 0 {
+        var p: HsmState = m.states.get(parent);
+        if p.initial < 0 {
+            p.initial = id;
+            m.states.set(parent, p);
+        }
+    } else if m.initial < 0 {
+        m.initial = id;
+    }
+    return id;
+}
+
+/// The initial child of a state (state -1: the machine's initial state).
+pub fn hsm_set_initial(m: & mut Hsm, state: i64, child: i64) {
+    if state < 0 {
+        m.initial = child;
+        return;
+    }
+    var s: HsmState = m.states.get(state);
+    s.initial = child;
+    m.states.set(state, s);
+}
+
+pub fn hsm_set_history(m: & mut Hsm, state: i64, kind: i64) {
+    var s: HsmState = m.states.get(state);
+    s.history = kind;
+    m.states.set(state, s);
+}
+
+pub fn hsm_on_entry(m: & mut Hsm, state: i64, f: fn(i64) -> i64) {
+    var s: HsmState = m.states.get(state);
+    s.on_entry = f;
+    s.has_entry = true;
+    m.states.set(state, s);
+}
+
+pub fn hsm_on_exit(m: & mut Hsm, state: i64, f: fn(i64) -> i64) {
+    var s: HsmState = m.states.get(state);
+    s.on_exit = f;
+    s.has_exit = true;
+    m.states.set(state, s);
+}
+
+pub fn hsm_on_do(m: & mut Hsm, state: i64, f: fn(i64) -> i64) {
+    var s: HsmState = m.states.get(state);
+    s.on_do = f;
+    s.has_do = true;
+    m.states.set(state, s);
+}
+
+/// A transition on `event` from source to target (-1: internal); its index.
+pub fn hsm_add_transition(m: & mut Hsm, source: i64, target: i64, event: str) -> i64 {
+    m.trans.push(HsmTrans { source: source, target: target, event: event, after: - 1.0, has_guard: false, has_action: false, guard: hsm_nop, action: hsm_nop });
+    return m.trans.len() - 1;
+}
+
+/// A transition taken after `ms` milliseconds in `source`.
+pub fn hsm_add_timed(m: & mut Hsm, source: i64, target: i64, ms: f64) -> i64 {
+    m.trans.push(HsmTrans { source: source, target: target, event: "", after: ms, has_guard: false, has_action: false, guard: hsm_nop, action: hsm_nop });
+    return m.trans.len() - 1;
+}
+
+pub fn hsm_set_guard(m: & mut Hsm, t: i64, g: fn(i64) -> i64) {
+    var tr: HsmTrans = m.trans.get(t);
+    tr.guard = g;
+    tr.has_guard = true;
+    m.trans.set(t, tr);
+}
+
+pub fn hsm_set_action(m: & mut Hsm, t: i64, a: fn(i64) -> i64) {
+    var tr: HsmTrans = m.trans.get(t);
+    tr.action = a;
+    tr.has_action = true;
+    m.trans.set(t, tr);
+}
+
+pub fn hsm_state_name(m: & Hsm, id: i64) -> str {
+    if id < 0 {
+        return "-";
+    }
+    return m.states.get(id).name;
+}
+
+/// The id of the state with this name (-1 when none).
+pub fn hsm_find(m: & Hsm, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < m.states.len() {
+        if m.states.get(i).name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Whether `s` is the active leaf or one of its ancestors.
+pub fn hsm_in(m: & Hsm, s: i64) -> bool {
+    var c: i64 = m.cur;
+    while c >= 0 {
+        if c == s {
+            return true;
+        }
+        c = m.states.get(c).parent;
+    }
+    return false;
+}
+
+/// The active configuration, outermost first: "On/Moving/Fast".
+pub fn hsm_path(m: & Hsm) -> str {
+    var s: str = "";
+    var c: i64 = m.cur;
+    while c >= 0 {
+        if str_len(s) == 0 {
+            s = m.states.get(c).name;
+        } else {
+            s = m.states.get(c).name + "/" + s;
+        }
+        c = m.states.get(c).parent;
+    }
+    return s;
+}
+
+// ─── Events posted by actions ───
+
+var hsm_outbox: Vec<str> = Vec::new();
+
+/// Post an event from inside an action; it is queued after the current
+/// one (run to completion).
+pub fn hsm_emit(ev: str) {
+    hsm_outbox.push(ev);
+}
+
+fn hsm_drain_outbox(m: & mut Hsm) {
+    var i: i64 = 0;
+    while i < hsm_outbox.len() {
+        m.queue.push(hsm_outbox.get(i));
+        i = i + 1;
+    }
+    hsm_outbox = Vec::new();
+}
+
+// ─── Entering and leaving ───
+
+fn hsm_depth(m: & Hsm, s: i64) -> i64 {
+    var d: i64 = 0;
+    var c: i64 = s;
+    while c >= 0 {
+        d = d + 1;
+        c = m.states.get(c).parent;
+    }
+    return d;
+}
+
+// The least common ancestor of a and b (-1: the top).
+fn hsm_lca(m: & Hsm, a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    var y: i64 = b;
+    var dx: i64 = hsm_depth(m, x);
+    var dy: i64 = hsm_depth(m, y);
+    while dx > dy {
+        x = m.states.get(x).parent;
+        dx = dx - 1;
+    }
+    while dy > dx {
+        y = m.states.get(y).parent;
+        dy = dy - 1;
+    }
+    while x != y {
+        x = m.states.get(x).parent;
+        y = m.states.get(y).parent;
+    }
+    return x;
+}
+
+fn hsm_enter_one(m: & mut Hsm, s: i64) {
+    var st: HsmState = m.states.get(s);
+    st.entered_at = m.now;
+    m.states.set(s, st);
+    m.log.push("enter:" + st.name);
+    if st.has_entry {
+        val f = st.on_entry;
+        f(m.ctx);
+    }
+    m.cur = s;
+}
+
+fn hsm_exit_one(m: & mut Hsm, s: i64, leaf: i64) {
+    val st: HsmState = m.states.get(s);
+    m.log.push("exit:" + st.name);
+    if st.has_exit {
+        val f = st.on_exit;
+        f(m.ctx);
+    }
+    // the parent remembers what was active below it
+    if st.parent >= 0 {
+        var p: HsmState = m.states.get(st.parent);
+        if p.history == HSM_SHALLOW {
+            p.hist = s;
+            m.states.set(st.parent, p);
+        } else if p.history == HSM_DEEP {
+            p.hist = leaf;
+            m.states.set(st.parent, p);
+        }
+    }
+    m.cur = st.parent;
+}
+
+// Exit from the active leaf up to (not including) `upto`.
+fn hsm_exit_to(m: & mut Hsm, upto: i64) {
+    val leaf: i64 = m.cur;
+    while m.cur >= 0 && m.cur != upto {
+        val c: i64 = m.cur;
+        hsm_exit_one(m, c, leaf);
+    }
+}
+
+// Enter the states from just below `from` down to `to` (inclusive).
+fn hsm_enter_path(m: & mut Hsm, from: i64, to: i64) {
+    var path: Vec<i64> = Vec::new();
+    var c: i64 = to;
+    while c >= 0 && c != from {
+        path.push(c);
+        c = m.states.get(c).parent;
+    }
+    var i: i64 = path.len() - 1;
+    while i >= 0 {
+        hsm_enter_one(m, path.get(i));
+        i = i - 1;
+    }
+}
+
+// From a just-entered state, go down by history or initial children.
+fn hsm_drill(m: & mut Hsm, s: i64) {
+    var c: i64 = s;
+    while true {
+        val st: HsmState = m.states.get(c);
+        if st.initial < 0 {
+            return;
+        }
+        if st.history == HSM_DEEP && st.hist >= 0 {
+            hsm_enter_path(m, c, st.hist);
+            c = st.hist;
+        } else if st.history == HSM_SHALLOW && st.hist >= 0 {
+            hsm_enter_one(m, st.hist);
+            c = st.hist;
+        } else {
+            hsm_enter_one(m, st.initial);
+            c = st.initial;
+        }
+    }
+}
+
+/// Enter the initial configuration.
+pub fn hsm_start(m: & mut Hsm, now: f64) {
+    m.now = now;
+    m.cur = - 1;
+    if m.initial < 0 {
+        return;
+    }
+    hsm_enter_path(m, - 1, m.initial);
+    hsm_drill(m, m.initial);
+    hsm_drain_outbox(m);
+}
+
+fn hsm_guard_ok(m: & Hsm, tr: & HsmTrans) -> bool {
+    if !tr.has_guard {
+        return true;
+    }
+    val g = tr.guard;
+    val r: i64 = g(m.ctx);
+    return r != 0;
+}
+
+fn hsm_fire(m: & mut Hsm, ti: i64, ev: str) {
+    val tr: HsmTrans = m.trans.get(ti);
+    var label: str = ev;
+    if str_len(label) == 0 {
+        label = "after " + int_to_str(tr.after as i64) + "ms";
+    }
+    if tr.target < 0 {
+        m.log.push(hsm_state_name(m, tr.source) + " internal on " + label);
+        if tr.has_action {
+            val a = tr.action;
+            a(m.ctx);
+        }
+        return;
+    }
+    m.log.push(hsm_state_name(m, tr.source) + " -> " + hsm_state_name(m, tr.target) + " on " + label);
+    var lca: i64 = hsm_lca(m, tr.source, tr.target);
+    if lca == tr.source || lca == tr.target {
+        // a self transition, or one into a sub/super-state: the source or
+        // target itself is exited and entered again (external semantics)
+        lca = m.states.get(lca).parent;
+    }
+    hsm_exit_to(m, lca);
+    if tr.has_action {
+        val a = tr.action;
+        a(m.ctx);
+    }
+    hsm_enter_path(m, lca, tr.target);
+    hsm_drill(m, tr.target);
+}
+
+// The first enabled transition for `ev` from the active leaf outwards.
+fn hsm_select(m: & Hsm, ev: str) -> i64 {
+    var c: i64 = m.cur;
+    while c >= 0 {
+        var i: i64 = 0;
+        while i < m.trans.len() {
+            val tr: HsmTrans = m.trans.get(i);
+            if tr.source == c && tr.after < 0.0 && tr.event == ev && hsm_guard_ok(m, &tr) {
+                return i;
+            }
+            i = i + 1;
+        }
+        c = m.states.get(c).parent;
+    }
+    return - 1;
+}
+
+/// Queue an event.
+pub fn hsm_post(m: & mut Hsm, ev: str) {
+    m.queue.push(ev);
+}
+
+/// Process one event now (run to completion); false when nothing took it.
+pub fn hsm_dispatch(m: & mut Hsm, ev: str) -> bool {
+    val ti: i64 = hsm_select(m, ev);
+    if ti < 0 {
+        m.log.push("drop:" + ev);
+        return false;
+    }
+    hsm_fire(m, ti, ev);
+    hsm_drain_outbox(m);
+    return true;
+}
+
+/// Process queued events until the queue is empty (events emitted by
+/// actions are processed too, in order). The number processed; stops after
+/// `limit` events to break event loops.
+pub fn hsm_run_limit(m: & mut Hsm, limit: i64) -> i64 {
+    var n: i64 = 0;
+    while m.queue.len() > 0 && n < limit {
+        val ev: str = m.queue.get(0);
+        m.queue.remove(0);
+        hsm_dispatch(m, ev);
+        n = n + 1;
+    }
+    return n;
+}
+
+pub fn hsm_run(m: & mut Hsm) -> i64 {
+    return hsm_run_limit(m, 10000);
+}
+
+/// Advance the clock: run the do actions of the active states (outermost
+/// first), take due timed transitions (innermost first, one per call
+/// level, then again from the new state), then the queued events.
+pub fn hsm_update(m: & mut Hsm, now: f64) {
+    m.now = now;
+    var chain: Vec<i64> = Vec::new();
+    var c: i64 = m.cur;
+    while c >= 0 {
+        chain.insert(0, c);
+        c = m.states.get(c).parent;
+    }
+    var i: i64 = 0;
+    while i < chain.len() {
+        val st: HsmState = m.states.get(chain.get(i));
+        if st.has_do {
+            if m.trace_do {
+                m.log.push("do:" + st.name);
+            }
+            val f = st.on_do;
+            f(m.ctx);
+        }
+        i = i + 1;
+    }
+    hsm_drain_outbox(m);
+    var guard: i64 = 0;
+    var fired: bool = true;
+    while fired && guard < 100 {
+        fired = false;
+        var s: i64 = m.cur;
+        while s >= 0 && !fired {
+            val since: f64 = now - m.states.get(s).entered_at;
+            var k: i64 = 0;
+            while k < m.trans.len() && !fired {
+                val tr: HsmTrans = m.trans.get(k);
+                if tr.source == s && tr.after >= 0.0 && since >= tr.after && hsm_guard_ok(m, &tr) {
+                    hsm_fire(m, k, "");
+                    hsm_drain_outbox(m);
+                    fired = true;
+                }
+                k = k + 1;
+            }
+            s = m.states.get(s).parent;
+        }
+        guard = guard + 1;
+    }
+    hsm_run(m);
+}
+
+/// The trace joined with ", " (and cleared).
+pub fn hsm_take_log(m: & mut Hsm) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < m.log.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + m.log.get(i);
+        i = i + 1;
+    }
+    m.log = Vec::new();
+    return s;
+}

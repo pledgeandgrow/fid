@@ -1,0 +1,85 @@
+// F8: a function that returns a two-word struct in registers (the machine
+// layer's ng_rr_plan) must not turn its last call into a jump. With scalar
+// replacement (iropt_me ime_sra) `Pair { a: noise(n), b: 5 }` becomes
+// `call noise; mov x0, <result>; mov x1, 5; return`, and OP13's tail-call
+// check (compiler/nat_ir.fd ng_tail_at) followed only the first result
+// register: the call became a jump and the caller read the callee's
+// leftover second register as `b` (StringBuilder::new()'s `len` printed an
+// address on AArch64: bench_stringbuilder, test_lang_features,
+// test_derive_serialize). ng_tail_own_rr2 refuses such jumps.
+// Run on every backend; `fid emit --target aarch64-linux` (and the other
+// machine-layer targets) must print the same as `fid run`.
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn spin(n: i64, seed: i64) -> i64 {
+    var acc: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        acc = (acc * 31 + i) % 1000003;
+        i = i + 1;
+    }
+    return acc;
+}
+
+// Leaves values of its own in the argument registers when it returns
+fn noise(n: i64) -> i64 {
+    return spin(n, 77777) + spin(n + 1, 99999) - spin(n + 2, 12345);
+}
+
+fn make_pair(n: i64) -> Pair {
+    return Pair { a: noise(n), b: 5 };
+}
+
+fn make_zero(n: i64) -> Pair {
+    return Pair { a: noise(n), b: 0 };
+}
+
+struct Builder {
+    handle: i64,
+    len: i64,
+}
+
+fn new_builder(n: i64) -> Builder {
+    return Builder { handle: spin(n, 3), len: 0 };
+}
+
+fn main() -> i64 {
+    var total: i64 = 0;
+    var k: i64 = 0;
+    while k < 4 {
+        val p: Pair = make_pair(k + 10);
+        val z: Pair = make_zero(k + 20);
+        print(p.b);
+        print(" ");
+        print(z.b);
+        print("\n");
+        total = total + p.b + z.b;
+        k = k + 1;
+    }
+    var b: Builder = new_builder(7);
+    b.len = b.len + 11;
+    print(b.len);
+    print("\n");
+    print(total);
+    print("\n");
+    val q: Pair = make_pair(3);
+    if q.a == noise(3) {
+        print("a ok\n");
+    } else {
+        print("a wrong\n");
+    }
+    return 0;
+}
+
+// Expected output:
+// 5 0
+// 5 0
+// 5 0
+// 5 0
+// 11
+// 20
+// a ok

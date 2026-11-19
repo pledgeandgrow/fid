@@ -1,0 +1,123 @@
+// A struct, Result or Option result of a call through a function value.
+// lower.fd passes the pointer the callee writes the result to first,
+// before the env (CallPtr args[0], as for a direct call). The machine
+// layer (compiler/nat_ir.fd, Inst::CallPtr: ng_callptr_sret) and the
+// mid-end's direct calls made of CallPtrs (compiler/iropt.fd
+// iro_cp_direct_args: closure devirtualization, the `__cdev_` clones of
+// higher-order functions, field facts) put it there; they passed the env
+// first and the fields came back 0 or garbage. The function values here
+// are picked at run time, from a Vec, and through a parameter, so both
+// the indirect call and the direct one are used.
+// Expected output:
+// 3 4
+// 30 40
+// 7 9
+// ok 6
+// err none
+// some 21
+// none
+// 12 13
+// 101 2
+
+struct P {
+    a: i64,
+    b: i64,
+}
+
+fn mk(x: i64, y: i64) -> P {
+    return P { a: x, b: y };
+}
+
+fn mk10(x: i64, y: i64) -> P {
+    return P { a: x * 10, b: y * 10 };
+}
+
+fn total(v: Vec<i64>) -> Result<i64, str> {
+    if v.len() == 0 {
+        return Result::Err("none");
+    }
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return Result::Ok(s);
+}
+
+fn third(n: i64) -> Option<i64> {
+    if n % 3 != 0 {
+        return Option::None;
+    }
+    return Option::Some(n / 3);
+}
+
+fn apply(f: fn(i64, i64) -> P, x: i64, y: i64) -> P {
+    return f(x, y);
+}
+
+fn pick(k: i64) -> fn(i64, i64) -> P {
+    if k == 0 {
+        return mk;
+    }
+    return mk10;
+}
+
+fn show(p: P) {
+    println(int_to_str(p.a) + " " + int_to_str(p.b));
+}
+
+fn report(r: Result<i64, str>) {
+    match r {
+        Result::Ok(n) => {
+            println("ok " + int_to_str(n));
+        }
+        Result::Err(e) => {
+            println("err " + e);
+        }
+    }
+}
+
+fn main() {
+    var fs: Vec<fn(i64, i64) -> P> = Vec::new();
+    fs.push(mk);
+    fs.push(mk10);
+    val f0: fn(i64, i64) -> P = fs.get(0);
+    show(f0(3, 4));
+    show(apply(pick(1), 3, 4));
+    val off: i64 = 2;
+    val g = fn(x: i64, y: i64) -> P {
+        return P { a: x + off, b: y + off };
+    };
+    show(apply(g, 5, 7));
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    val t = total;
+    report(t(v));
+    val e: Vec<i64> = Vec::new();
+    report(t(e));
+    val h: fn(i64) -> Option<i64> = third;
+    match h(63) {
+        Option::Some(x) => {
+            println("some " + int_to_str(x));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    match h(64) {
+        Option::Some(x2) => {
+            println("some " + int_to_str(x2));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    val f2: fn(i64, i64) -> P = pick(0);
+    val q: P = f2(12, 13);
+    show(q);
+    val f1: fn(i64, i64) -> P = fs.get(1);
+    println(int_to_str(f1(10, 0).a + 1) + " " + int_to_str(apply(mk, 1, 2).b));
+}

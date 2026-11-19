@@ -1,0 +1,152 @@
+// stdlib/ble: UUIDs (base, 128-bit text and wire forms), advertising data encode/parse and iBeacon, a GATT server answering service/characteristic discovery, reads, writes, CCCD subscription and notifications, ATT errors, L2CAP frames, HCI commands/events/ACL and a transport round trip
+// Expected output:
+// uuid 0x180D: 0000180d-0000-1000-8000-00805f9b34fb wire 0d18
+// nus: 6e400001-b5a3-f393-e0a9-e50e24dcca9e short -1 wire 9ecadc240ee5a9e093f3a3b50100406e
+// adv: 0201060609466964657305030d180f18020afc
+// parsed: 4 structures, name Fides, tx fc
+// ibeacon: 0201061aff4c000215e2c56db5dffb48d2b060d0f5a71096e000010002c5 (30)
+// too long: 0
+// padded: 1
+// mtu: 031700
+// services: 1106010003000018040009000d18
+// services decoded: 1-3 0018 / 4-9 0d18
+// characteristics: 09070200020300002a0500100600372a0800020900382a
+// descriptors: 050107000229
+// read name: 0b4669646573
+// read blob: 0d646573
+// read missing: 010a200001
+// past the end: 01080a000a
+// subscribe: 13 sub 1
+// notify: 1b06000050
+// write read-only: 0112090003
+// group of characteristics: 0110010010
+// unknown request: 0120000006
+// write command ignored: 0
+// l2cap: 030004000a0300 cid 4
+// hci reset: 01030c00
+// adv enable: 010a200101
+// scan enable: 010c20020100
+// adv params: 0106200fa000a0000000000000000000000700
+// adv data: 0108202003020106 (36)
+// cmd complete: 0e op 0c03 status 0
+// cmd status: 0f op 2006 status 0
+// report: 11:22:33:44:55:66 rssi -59 flags 06
+// acl: 0240200700030004000a0300 handle 64 pb 2
+// transport: true op 0c03 status 0
+use ble;
+use encoding;
+use string;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hex16(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn hexb(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn t_send(h: i64, pkt: Vec<i64>) -> i64 {
+    if pkt.len() < 4 {
+        return 0 - 1;
+    }
+    return 0;
+}
+
+fn t_recv(h: i64) -> Vec<i64> {
+    return hex_decode_bytes("040e0401030c00");
+}
+
+fn main() {
+    val hr: BleUuid = ble_uuid16(0x180D);
+    println("uuid 0x180D: " + ble_uuid_str(& hr) + " wire " + hx(ble_uuid_wire(& hr)));
+    val nus: BleUuid = ble_uuid_parse("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    println("nus: " + ble_uuid_str(& nus) + " short " + int_to_str(ble_uuid_short(& nus)) + " wire " + hx(ble_uuid_wire(& nus)));
+
+    var ads: Vec<AdStruct> = Vec::new();
+    ads.push(ad_flags(AD_FLAG_LE_GENERAL | AD_FLAG_NO_BREDR));
+    ads.push(ad_name("Fides"));
+    var su: Vec<i64> = Vec::new();
+    su.push(0x180D);
+    su.push(0x180F);
+    ads.push(ad_uuid16_list(& su));
+    ads.push(ad_tx_power(-4));
+    val adv: Vec<i64> = ad_encode(& ads, BLE_ADV_MAX);
+    println("adv: " + hx(adv));
+    val back: Vec<AdStruct> = ad_parse(& adv);
+    println("parsed: " + int_to_str(back.len()) + " structures, name " + ad_find_name(& back) + ", tx " + hx(ad_find(& back, AD_TX_POWER)));
+    var bea: Vec<AdStruct> = Vec::new();
+    bea.push(ad_flags(0x06));
+    bea.push(ad_ibeacon(& hex_decode_bytes("e2c56db5dffb48d2b060d0f5a71096e0"), 1, 2, -59));
+    val beacon: Vec<i64> = ad_encode(& bea, BLE_ADV_MAX);
+    println("ibeacon: " + hx(beacon) + " (" + int_to_str(beacon.len()) + ")");
+    var big: Vec<AdStruct> = Vec::new();
+    big.push(ad_name("a name far too long for one advert"));
+    println("too long: " + int_to_str(ad_encode(& big, BLE_ADV_MAX).len()));
+    println("padded: " + int_to_str(ad_parse(& hex_decode_bytes("020106000000")).len()));
+
+    var db: GattDb = gatt_db_new(ATT_DEFAULT_MTU);
+    gatt_add_service(& mut db, & ble_uuid16(0x1800));
+    gatt_add_characteristic(& mut db, & ble_uuid16(0x2A00), GATT_PROP_READ, str_bytes("Fides"));
+    gatt_add_service(& mut db, & ble_uuid16(0x180D));
+    val hrm: i64 = gatt_add_characteristic(& mut db, & ble_uuid16(0x2A37), GATT_PROP_NOTIFY, hex_decode_bytes("0048"));
+    gatt_add_characteristic(& mut db, & ble_uuid16(0x2A38), GATT_PROP_READ, hex_decode_bytes("01"));
+
+    println("mtu: " + hx(gatt_handle(& mut db, att_mtu_req(64))));
+    val svc: Vec<i64> = gatt_handle(& mut db, att_read_by_group_req(1, 0xFFFF, & ble_uuid16(GATT_PRIMARY_SERVICE)));
+    println("services: " + hx(svc));
+    val ents: Vec<AttEntry> = att_decode_list(& svc);
+    val e0: AttEntry = ents.get(0);
+    val e1: AttEntry = ents.get(1);
+    println("services decoded: " + int_to_str(e0.handle) + "-" + int_to_str(e0.end_handle) + " " + hx(e0.value) + " / " + int_to_str(e1.handle) + "-" + int_to_str(e1.end_handle) + " " + hx(e1.value));
+    println("characteristics: " + hx(gatt_handle(& mut db, att_read_by_type_req(1, 0xFFFF, & ble_uuid16(GATT_CHARACTERISTIC)))));
+    println("descriptors: " + hx(gatt_handle(& mut db, att_find_info_req(7, 7))));
+    println("read name: " + hx(gatt_handle(& mut db, att_read_req(3))));
+    println("read blob: " + hx(gatt_handle(& mut db, att_read_blob_req(3, 2))));
+    println("read missing: " + hx(gatt_handle(& mut db, att_read_req(0x20))));
+    println("past the end: " + hx(gatt_handle(& mut db, att_read_by_type_req(10, 0xFFFF, & ble_uuid16(GATT_CHARACTERISTIC)))));
+    val sub: str = hx(gatt_handle(& mut db, att_write_req(7, & hex_decode_bytes("0100"))));
+    println("subscribe: " + sub + " sub " + int_to_str(gatt_subscription(& db, hrm)));
+    println("notify: " + hx(gatt_update(& mut db, hrm, hex_decode_bytes("0050"))));
+    println("write read-only: " + hx(gatt_handle(& mut db, att_write_req(9, & hex_decode_bytes("02")))));
+    println("group of characteristics: " + hx(gatt_handle(& mut db, att_read_by_group_req(1, 0xFFFF, & ble_uuid16(GATT_CHARACTERISTIC)))));
+    println("unknown request: " + hx(gatt_handle(& mut db, hex_decode_bytes("20"))));
+    println("write command ignored: " + int_to_str(gatt_handle(& mut db, att_write_cmd(9, & hex_decode_bytes("02"))).len()));
+
+    val fr: Vec<i64> = l2cap_frame(L2CAP_CID_ATT, & att_read_req(3));
+    println("l2cap: " + hx(fr) + " cid " + int_to_str(l2cap_unframe(& fr).get(0)));
+    println("hci reset: " + hx(hci_reset()));
+    println("adv enable: " + hx(hci_le_set_adv_enable(true)));
+    println("scan enable: " + hx(hci_le_set_scan_enable(true, false)));
+    println("adv params: " + hx(hci_le_set_adv_params(0x00A0, 0x00A0, 0, 0)));
+    val ad_cmd: Vec<i64> = hci_le_set_adv_data(& hex_decode_bytes("020106"));
+    var first8: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        first8.push(ad_cmd.get(i));
+        i = i + 1;
+    }
+    println("adv data: " + hx(first8) + " (" + int_to_str(ad_cmd.len()) + ")");
+    val cc: HciEvent = hci_decode_event(& hex_decode_bytes("040e0401030c00"));
+    println("cmd complete: " + hexb(cc.code) + " op " + hex16(cc.opcode) + " status " + int_to_str(cc.status));
+    val cs: HciEvent = hci_decode_event(& hex_decode_bytes("040f0400010620"));
+    println("cmd status: " + hexb(cs.code) + " op " + hex16(cs.opcode) + " status " + int_to_str(cs.status));
+    val rep: HciEvent = hci_decode_event(& hex_decode_bytes("043e0f0201000066554433221103020106c5"));
+    val reports: Vec<BleAdvReport> = hci_decode_adv_reports(& rep.params);
+    val r0: BleAdvReport = reports.get(0);
+    println("report: " + ble_addr_str(& r0.addr) + " rssi " + int_to_str(r0.rssi) + " flags " + hx(ad_find(& ad_parse(& r0.data), AD_FLAGS)));
+    val acl: Vec<i64> = hci_acl(0x40, 2, & fr);
+    val ad: Vec<i64> = hci_acl_decode(& acl);
+    println("acl: " + hx(acl) + " handle " + int_to_str(ad.get(0)) + " pb " + int_to_str(ad.get(1)));
+    val t: HciTransport = HciTransport { write_pkt: t_send, read_pkt: t_recv, handle: 0 };
+    val got: HciEvent = hci_send_command(& t, hci_reset(), 3);
+    println("transport: " + bool_to_str(got.ok) + " op " + hex16(got.opcode) + " status " + int_to_str(got.status));
+}

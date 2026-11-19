@@ -1,0 +1,83 @@
+// 2g.62 (fid fmt): a prefix `&`, `&mut`, `*`, `-` or `!` sticks to its
+// operand (it printed `& v`, `& mut v`, `- 1`), a binary one keeps its
+// spaces, and a `fn` after an annotation or a blank line starts its line
+// with no stray space (it printed `@pure\n fn`). Runs compiler/fmt.fd's
+// format_source on small sources; `fid fmt` is the same function.
+//
+// Expected output:
+// borrow ok
+// borrow mut ok
+// deref ok
+// negative ok
+// negative arg ok
+// not ok
+// binary ok
+// return neg ok
+// annotated fn ok
+// no stray space ok
+// blank line fn ok
+// annotation args ok
+// top-level use ok
+// comment fn ok
+// idempotent ok
+use core;
+use vec;
+use string;
+use compiler::fmt;
+
+fn check(label: str, got: str, want: str) -> i64 {
+    if str_contains(got, want) {
+        println(label + " ok");
+        return 0;
+    }
+    println(label + " FAILED: wanted `" + want + "` in:");
+    println(got);
+    return 1;
+}
+
+fn check_absent(label: str, got: str, bad: str) -> i64 {
+    if str_contains(got, bad) {
+        println(label + " FAILED: found `" + bad + "` in:");
+        println(got);
+        return 1;
+    }
+    println(label + " ok");
+    return 0;
+}
+
+fn main() -> i64 {
+    var bad: i64 = 0;
+    val a: str = format_source("fn f(v: Vec<i64>) -> i64 {\n    return g(&v);\n}\n");
+    bad = bad + check("borrow", a, "g(&v)");
+    val b: str = format_source("fn f() -> i64 {\n    var v: Vec<i64> = Vec::new();\n    h(&mut v);\n    return 0;\n}\n");
+    bad = bad + check("borrow mut", b, "h(&mut v)");
+    val c: str = format_source("fn f(p: i64) -> i64 {\n    val x: i64 = *p;\n    return x;\n}\n");
+    bad = bad + check("deref", c, "= *p;");
+    val d: str = format_source("fn f() -> i64 {\n    val x: i64 = -1;\n    return g(x, -2);\n}\n");
+    bad = bad + check("negative", d, "= -1;") + check_absent("negative arg", d, "- 2");
+    val e: str = format_source("fn f(x: bool) -> bool {\n    return !x;\n}\n");
+    bad = bad + check("not", e, "return !x;");
+    val f: str = format_source("fn f(a: i64, b: i64) -> i64 {\n    return a - b & 3;\n}\n");
+    bad = bad + check("binary", f, "a - b & 3");
+    val g: str = format_source("fn f() -> i64 {\n    return -1;\n}\n");
+    bad = bad + check("return neg", g, "return -1;");
+    val h: str = format_source("@pure\nfn f() -> i64 {\n    return 1;\n}\n");
+    bad = bad + check("annotated fn", h, "\nfn f()") + check_absent("no stray space", h, "\n fn");
+    val k: str = format_source("fn f() -> i64 {\n    return 1;\n}\n\nfn g() -> i64 {\n    return 2;\n}\n");
+    bad = bad + check_absent("blank line fn", k, " fn g");
+    val m: str = format_source("@cfg(target = \"linux\")\n@inline\npub fn f() -> i64 {\n    return 1;\n}\n");
+    bad = bad + check("annotation args", m, "@cfg(target = \"linux\")\n@inline\npub fn f()");
+    val u: str = format_source("use core;\n\nfn main() -> i64 {\n    return 0;\n}\n");
+    bad = bad + check("top-level use", u, "use core;\n\nfn main()");
+    val q: str = format_source("/* a block comment */\n\nfn main() -> i64 {\n    return 0;\n}\n");
+    bad = bad + check_absent("comment fn", q, " fn main");
+    val once: str = format_source(b);
+    if once == b {
+        println("idempotent ok");
+    } else {
+        println("idempotent FAILED:");
+        println(once);
+        bad = bad + 1;
+    }
+    return bad;
+}

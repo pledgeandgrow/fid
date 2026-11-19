@@ -1,0 +1,130 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA9: the greedy allocator of
+// the machine layer (compiler/nat_ir.fd ng_greedy_assign), selected with
+// FID_NAT_ON=greedy in place of the linear scan. `pressure` keeps twenty
+// values live across a loop that calls, more than any target has
+// registers, so ranges are evicted and spilled; `mixed` has a long,
+// rarely used range beside short hot ones (the hot ones evict it);
+// `chain` passes values through calls. A wrong assignment (two live
+// values in one register, a caller-saved register across a call) changes
+// what is printed. tests/nattools/machine_batch12_check.sh builds it on
+// every target with FID_VERIFY=1 (the allocation checker) with and without
+// the switch, runs it where it can, and prints the spill counts of both
+// allocators (`fid emit --stats`) side by side.
+// Expected output:
+// 1170819970
+// 4950
+// 338350
+// 1830
+// 120
+// 13
+
+fn bump(x: i64) -> i64 {
+    return x + 1;
+}
+
+fn pressure(n: i64) -> i64 {
+    var a0: i64 = 1;
+    var a1: i64 = 2;
+    var a2: i64 = 3;
+    var a3: i64 = 4;
+    var a4: i64 = 5;
+    var a5: i64 = 6;
+    var a6: i64 = 7;
+    var a7: i64 = 8;
+    var a8: i64 = 9;
+    var a9: i64 = 10;
+    var b0: i64 = 11;
+    var b1: i64 = 12;
+    var b2: i64 = 13;
+    var b3: i64 = 14;
+    var b4: i64 = 15;
+    var b5: i64 = 16;
+    var b6: i64 = 17;
+    var b7: i64 = 18;
+    var b8: i64 = 19;
+    var b9: i64 = 20;
+    var i: i64 = 0;
+    while i < n {
+        a0 = bump(a0) + a9;
+        a1 = a1 + a0;
+        a2 = a2 + a1 - a0;
+        a3 = a3 + i;
+        a4 = bump(a4);
+        a5 = a5 + a4 % 7;
+        a6 = a6 + a5 % 5;
+        a7 = a7 + a6 % 3;
+        a8 = a8 + 1;
+        a9 = a9 % 11 + 1;
+        b0 = b0 + a0 % 13;
+        b1 = b1 + b0 % 17;
+        b2 = bump(b2) + b1 % 19;
+        b3 = b3 + b2 % 23;
+        b4 = b4 + b3 % 29;
+        b5 = b5 + b4 % 31;
+        b6 = b6 + b5 % 37;
+        b7 = bump(b7);
+        b8 = b8 + b7 % 41;
+        b9 = b9 + b8 % 43;
+        i = i + 1;
+    }
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9;
+}
+
+fn tri(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn squares(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 1;
+    while i <= n {
+        s = s + i * i;
+        i = i + 1;
+    }
+    return s;
+}
+
+/// A long range (`base`) read once at the end, beside short hot ones.
+fn mixed(n: i64) -> i64 {
+    var base: i64 = n * 0 + 7;
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var p: i64 = i * 3;
+        var q: i64 = p + 1;
+        var r: i64 = q * 2;
+        var s: i64 = r - p;
+        var u: i64 = s + q;
+        var v: i64 = u - r;
+        var w: i64 = v + s;
+        var x: i64 = w - u;
+        var y: i64 = x + v;
+        var z: i64 = y - w;
+        t = t + z % 3;
+        i = i + 1;
+    }
+    return t * 0 + tri(n + 2) + base * 0 + bump(base) * 0 + base - 7;
+}
+
+fn chain(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    var e: i64 = bump(a) + b;
+    var f: i64 = bump(e) + c;
+    var g: i64 = bump(f) + d;
+    var h: i64 = bump(g) + a + b + c + d + e + f;
+    return h + g - h + 0 * (e + f + g + h);
+}
+
+fn main() {
+    println(int_to_str(pressure(1000)));
+    println(int_to_str(tri(100)));
+    println(int_to_str(squares(100)));
+    println(int_to_str(mixed(59)));
+    println(int_to_str(tri(16)));
+    println(int_to_str(chain(1, 2, 3, 4)));
+}

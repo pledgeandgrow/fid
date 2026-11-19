@@ -1,0 +1,691 @@
+// nvme: NVM Express 1.4 controllers (base specification).
+//
+// Real: the controller register map (CAP, VS, CC, CSTS, AQA, ASQ, ACQ and
+// the doorbells with the CAP.DSTRD stride) and their fields; 64-byte
+// submission queue entries for the admin commands Identify (controller,
+// namespace, active namespace list), Create/Delete I/O Completion Queue,
+// Create/Delete I/O Submission Queue, Set/Get Features (number of queues)
+// and the NVM commands Read, Write, Flush; PRP construction (PRP1, PRP2 as
+// a second page or as a PRP list) for any buffer alignment; 16-byte
+// completion queue entries (phase tag, status code and type, SQ head,
+// command id); queue bookkeeping (tail and head doorbells, wrap-around,
+// phase inversion on each pass, SQ head tracking from completions);
+// controller enable/disable/reset with CSTS.RDY polling and fatal status
+// detection; Identify data parsing (serial, model, firmware, MDTS, number
+// of namespaces, namespace size and LBA format); a vfs BlockDev over a
+// namespace.
+//
+// The seam: an `NvmeBus` of function values for 32-bit MMIO reads and
+// writes at BAR0 offsets and host memory reads/writes at physical
+// addresses (queues, PRP lists and buffers). 64-bit registers are
+// accessed as two 32-bit halves, low first. Memory for queues must be
+// page aligned and physically contiguous (CAP.CQR); the caller provides
+// it. The test runs it against a simulated controller.
+module nvme;
+use vec;
+use string;
+use vfs;
+
+// --- registers ----------------------------------------------------------------------
+
+pub const NVME_REG_CAP: i64 = 0;
+pub const NVME_REG_VS: i64 = 8;
+pub const NVME_REG_INTMS: i64 = 12;
+pub const NVME_REG_INTMC: i64 = 16;
+pub const NVME_REG_CC: i64 = 20;
+pub const NVME_REG_CSTS: i64 = 28;
+pub const NVME_REG_NSSR: i64 = 32;
+pub const NVME_REG_AQA: i64 = 36;
+pub const NVME_REG_ASQ: i64 = 40;
+pub const NVME_REG_ACQ: i64 = 48;
+pub const NVME_REG_DBS: i64 = 4096;
+
+pub const NVME_CC_EN: i64 = 1;
+pub const NVME_CSTS_RDY: i64 = 1;
+pub const NVME_CSTS_CFS: i64 = 2;
+
+pub const NVME_PAGE: i64 = 4096;
+pub const NVME_SQE_SIZE: i64 = 64;
+pub const NVME_CQE_SIZE: i64 = 16;
+pub const NVME_POLL_LIMIT: i64 = 100000;
+
+// admin opcodes
+pub const NVME_ADMIN_DELETE_SQ: i64 = 0;
+pub const NVME_ADMIN_CREATE_SQ: i64 = 1;
+pub const NVME_ADMIN_GET_LOG_PAGE: i64 = 2;
+pub const NVME_ADMIN_DELETE_CQ: i64 = 4;
+pub const NVME_ADMIN_CREATE_CQ: i64 = 5;
+pub const NVME_ADMIN_IDENTIFY: i64 = 6;
+pub const NVME_ADMIN_ABORT: i64 = 8;
+pub const NVME_ADMIN_SET_FEATURES: i64 = 9;
+pub const NVME_ADMIN_GET_FEATURES: i64 = 10;
+// NVM opcodes
+pub const NVME_CMD_FLUSH: i64 = 0;
+pub const NVME_CMD_WRITE: i64 = 1;
+pub const NVME_CMD_READ: i64 = 2;
+// Identify CNS values
+pub const NVME_CNS_NAMESPACE: i64 = 0;
+pub const NVME_CNS_CONTROLLER: i64 = 1;
+pub const NVME_CNS_NS_LIST: i64 = 2;
+// feature ids
+pub const NVME_FEAT_NUM_QUEUES: i64 = 7;
+// generic status codes
+pub const NVME_SC_SUCCESS: i64 = 0;
+pub const NVME_SC_INVALID_OPCODE: i64 = 1;
+pub const NVME_SC_INVALID_FIELD: i64 = 2;
+pub const NVME_SC_LBA_RANGE: i64 = 128;
+
+pub struct NvmeCap {
+    pub mqes: i64,
+    pub cqr: bool,
+    pub timeout_ms: i64,
+    pub dstrd: i64,
+    pub css_nvm: bool,
+    pub mpsmin: i64,
+    pub mpsmax: i64,
+}
+
+/// Decode CAP from its two 32-bit halves.
+pub fn nvme_cap_decode(lo: i64, hi: i64) -> NvmeCap {
+    return NvmeCap {
+        mqes: (lo & 65535) + 1, cqr: ((lo >> 16) & 1) != 0, timeout_ms: ((lo >> 24) & 255) * 500, dstrd: hi & 15, css_nvm: ((hi >> 5) & 1) != 0, mpsmin: 4096 << ((hi >> 16) & 15), mpsmax: 4096 << ((hi >> 20) & 15)
+    };
+}
+
+pub fn nvme_version_str(vs: i64) -> str {
+    var s: str = int_to_str((vs >> 16) & 65535) + "." + int_to_str((vs >> 8) & 255);
+    if (vs & 255) != 0 {
+        s = s + "." + int_to_str(vs & 255);
+    }
+    return s;
+}
+
+/// The SQ y tail doorbell offset.
+pub fn nvme_sq_doorbell(qid: i64, dstrd: i64) -> i64 {
+    return NVME_REG_DBS + (2 * qid) * (4 << dstrd);
+}
+
+/// The CQ y head doorbell offset.
+pub fn nvme_cq_doorbell(qid: i64, dstrd: i64) -> i64 {
+    return NVME_REG_DBS + (2 * qid + 1) * (4 << dstrd);
+}
+
+/// CC for enabling: NVM command set, 2^(12+mps) pages, 64-byte SQ and
+/// 16-byte CQ entries, round robin.
+pub fn nvme_cc_value(mps: i64) -> i64 {
+    return NVME_CC_EN | ((mps & 15) << 7) | (6 << 16) | (4 << 20);
+}
+
+pub fn nvme_aqa_value(sq_entries: i64, cq_entries: i64) -> i64 {
+    return ((sq_entries - 1) & 4095) | (((cq_entries - 1) & 4095) << 16);
+}
+
+// --- bytes -------------------------------------------------------------------------
+
+fn nv_put32(b: &mut Vec<i64>, o: i64, v: i64) {
+    b.set(o, v & 255);
+    b.set(o + 1, (v >> 8) & 255);
+    b.set(o + 2, (v >> 16) & 255);
+    b.set(o + 3, (v >> 24) & 255);
+}
+
+fn nv_put64(b: &mut Vec<i64>, o: i64, v: i64) {
+    nv_put32(b, o, v & 4294967295);
+    nv_put32(b, o + 4, (v >> 32) & 4294967295);
+}
+
+fn nv_get32(b: & Vec<i64>, o: i64) -> i64 {
+    return b.get(o) | (b.get(o + 1) << 8) | (b.get(o + 2) << 16) | (b.get(o + 3) << 24);
+}
+
+fn nv_get64(b: & Vec<i64>, o: i64) -> i64 {
+    return nv_get32(b, o) | (nv_get32(b, o + 4) << 32);
+}
+
+fn nv_zeros(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0);
+        i = i + 1;
+    }
+    return v;
+}
+
+// --- submission queue entries ---------------------------------------------------------
+
+pub struct NvmeCmd {
+    pub opc: i64,
+    pub cid: i64,
+    pub nsid: i64,
+    pub prp1: i64,
+    pub prp2: i64,
+    pub cdw10: i64,
+    pub cdw11: i64,
+    pub cdw12: i64,
+    pub cdw13: i64,
+    pub cdw14: i64,
+    pub cdw15: i64,
+}
+
+pub fn nvme_cmd(opc: i64, nsid: i64) -> NvmeCmd {
+    return NvmeCmd { opc: opc, cid: 0, nsid: nsid, prp1: 0, prp2: 0, cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0 };
+}
+
+/// The 64-byte submission queue entry (PRPs, no fused operation).
+pub fn nvme_sqe(c: & NvmeCmd) -> Vec<i64> {
+    var e: Vec<i64> = nv_zeros(64);
+    nv_put32(&mut e, 0, (c.opc & 255) | ((c.cid & 65535) << 16));
+    nv_put32(&mut e, 4, c.nsid);
+    nv_put64(&mut e, 24, c.prp1);
+    nv_put64(&mut e, 32, c.prp2);
+    nv_put32(&mut e, 40, c.cdw10);
+    nv_put32(&mut e, 44, c.cdw11);
+    nv_put32(&mut e, 48, c.cdw12);
+    nv_put32(&mut e, 52, c.cdw13);
+    nv_put32(&mut e, 56, c.cdw14);
+    nv_put32(&mut e, 60, c.cdw15);
+    return e;
+}
+
+pub fn nvme_sqe_parse(e: & Vec<i64>, o: i64) -> NvmeCmd {
+    val dw0: i64 = nv_get32(e, o);
+    return NvmeCmd {
+        opc: dw0 & 255, cid: (dw0 >> 16) & 65535, nsid: nv_get32(e, o + 4), prp1: nv_get64(e, o + 24), prp2: nv_get64(e, o + 32), cdw10: nv_get32(e, o + 40), cdw11: nv_get32(e, o + 44), cdw12: nv_get32(e, o + 48), cdw13: nv_get32(e, o + 52), cdw14: nv_get32(e, o + 56), cdw15: nv_get32(e, o + 60)
+    };
+}
+
+pub fn nvme_cmd_identify(cns: i64, nsid: i64, buf: i64) -> NvmeCmd {
+    var c: NvmeCmd = nvme_cmd(NVME_ADMIN_IDENTIFY, nsid);
+    c.prp1 = buf;
+    c.cdw10 = cns & 255;
+    return c;
+}
+
+/// Create I/O Completion Queue `qid` of `entries` at `base`, physically
+/// contiguous, interrupts on vector `iv` when `ien`.
+pub fn nvme_cmd_create_cq(qid: i64, entries: i64, base: i64, iv: i64, ien: bool) -> NvmeCmd {
+    var c: NvmeCmd = nvme_cmd(NVME_ADMIN_CREATE_CQ, 0);
+    c.prp1 = base;
+    c.cdw10 = (((entries - 1) & 65535) << 16) | (qid & 65535);
+    c.cdw11 = ((iv & 65535) << 16) | 1;
+    if ien {
+        c.cdw11 = c.cdw11 | 2;
+    }
+    return c;
+}
+
+/// Create I/O Submission Queue `qid` of `entries` at `base` completing
+/// into `cqid`, priority `prio` (0 urgent .. 3 low).
+pub fn nvme_cmd_create_sq(qid: i64, entries: i64, base: i64, cqid: i64, prio: i64) -> NvmeCmd {
+    var c: NvmeCmd = nvme_cmd(NVME_ADMIN_CREATE_SQ, 0);
+    c.prp1 = base;
+    c.cdw10 = (((entries - 1) & 65535) << 16) | (qid & 65535);
+    c.cdw11 = ((cqid & 65535) << 16) | ((prio & 3) << 1) | 1;
+    return c;
+}
+
+pub fn nvme_cmd_delete_sq(qid: i64) -> NvmeCmd {
+    var c: NvmeCmd = nvme_cmd(NVME_ADMIN_DELETE_SQ, 0);
+    c.cdw10 = qid & 65535;
+    return c;
+}
+
+pub fn nvme_cmd_delete_cq(qid: i64) -> NvmeCmd {
+    var c: NvmeCmd = nvme_cmd(NVME_ADMIN_DELETE_CQ, 0);
+    c.cdw10 = qid & 65535;
+    return c;
+}
+
+/// Set Features: Number of Queues (counts are 1-based here, 0-based on
+/// the wire).
+pub fn nvme_cmd_set_num_queues(nsq: i64, ncq: i64) -> NvmeCmd {
+    var c: NvmeCmd = nvme_cmd(NVME_ADMIN_SET_FEATURES, 0);
+    c.cdw10 = NVME_FEAT_NUM_QUEUES;
+    c.cdw11 = ((nsq - 1) & 65535) | (((ncq - 1) & 65535) << 16);
+    return c;
+}
+
+/// Read or Write of `nlb` blocks (1..65536) at `slba`.
+pub fn nvme_cmd_rw(write: bool, nsid: i64, slba: i64, nlb: i64, prp1: i64, prp2: i64) -> NvmeCmd {
+    var op: i64 = NVME_CMD_READ;
+    if write {
+        op = NVME_CMD_WRITE;
+    }
+    var c: NvmeCmd = nvme_cmd(op, nsid);
+    c.prp1 = prp1;
+    c.prp2 = prp2;
+    c.cdw10 = slba & 4294967295;
+    c.cdw11 = (slba >> 32) & 4294967295;
+    c.cdw12 = (nlb - 1) & 65535;
+    return c;
+}
+
+pub fn nvme_cmd_flush(nsid: i64) -> NvmeCmd {
+    return nvme_cmd(NVME_CMD_FLUSH, nsid);
+}
+
+// --- PRPs -----------------------------------------------------------------------------
+
+/// The pages a buffer touches: [prp1, prp2, list entries...]. prp2 is 0
+/// for one page, the second page for two, and for more the address
+/// `list` where the remaining page addresses must be written (one page
+/// of list holds 512; longer lists are chained through their last entry,
+/// which this layout also does).
+pub fn nvme_prps(buf: i64, nbytes: i64, list: i64) -> Vec<i64> {
+    var pages: Vec<i64> = Vec::new();
+    pages.push(buf);
+    var next: i64 = (buf / NVME_PAGE + 1) * NVME_PAGE;
+    while next < buf + nbytes {
+        pages.push(next);
+        next = next + NVME_PAGE;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(buf);
+    if pages.len() == 1 {
+        out.push(0);
+        return out;
+    }
+    if pages.len() == 2 {
+        out.push(pages.get(1));
+        return out;
+    }
+    out.push(list);
+    // list pages: 511 addresses and a pointer to the next list page,
+    // unless the rest fits in this page
+    var i: i64 = 1;
+    var lp: i64 = list;
+    while i < pages.len() {
+        val left: i64 = pages.len() - i;
+        if left <= 512 {
+            while i < pages.len() {
+                out.push(pages.get(i));
+                i = i + 1;
+            }
+        } else {
+            var k: i64 = 0;
+            while k < 511 {
+                out.push(pages.get(i));
+                i = i + 1;
+                k = k + 1;
+            }
+            lp = lp + NVME_PAGE;
+            out.push(lp);
+        }
+    }
+    return out;
+}
+
+/// The PRP list bytes for `nvme_prps` (entries after the first two).
+pub fn nvme_prp_list_bytes(prps: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 2;
+    while i < prps.len() {
+        val a: i64 = prps.get(i);
+        var k: i64 = 0;
+        while k < 8 {
+            out.push((a >> (8 * k)) & 255);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- completion entries ---------------------------------------------------------------
+
+pub struct NvmeCqe {
+    pub dw0: i64,
+    pub sqhd: i64,
+    pub sqid: i64,
+    pub cid: i64,
+    pub phase: i64,
+    pub sc: i64,
+    pub sct: i64,
+    pub dnr: bool,
+}
+
+pub fn nvme_cqe_parse(e: & Vec<i64>, o: i64) -> NvmeCqe {
+    val dw2: i64 = nv_get32(e, o + 8);
+    val dw3: i64 = nv_get32(e, o + 12);
+    return NvmeCqe {
+        dw0: nv_get32(e, o), sqhd: dw2 & 65535, sqid: (dw2 >> 16) & 65535, cid: dw3 & 65535, phase: (dw3 >> 16) & 1, sc: (dw3 >> 17) & 255, sct: (dw3 >> 25) & 7, dnr: ((dw3 >> 31) & 1) != 0
+    };
+}
+
+/// A completion entry (what a controller writes).
+pub fn nvme_cqe(dw0: i64, sqhd: i64, sqid: i64, cid: i64, phase: i64, sc: i64, sct: i64) -> Vec<i64> {
+    var e: Vec<i64> = nv_zeros(16);
+    nv_put32(&mut e, 0, dw0);
+    nv_put32(&mut e, 8, (sqhd & 65535) | ((sqid & 65535) << 16));
+    nv_put32(&mut e, 12, (cid & 65535) | ((phase & 1) << 16) | ((sc & 255) << 17) | ((sct & 7) << 25));
+    return e;
+}
+
+pub fn nvme_status_str(c: & NvmeCqe) -> str {
+    if c.sct == 0 {
+        if c.sc == 0 { return "success"; }
+        if c.sc == 1 { return "invalid opcode"; }
+        if c.sc == 2 { return "invalid field"; }
+        if c.sc == 11 { return "invalid namespace"; }
+        if c.sc == 128 { return "LBA out of range"; }
+    }
+    if c.sct == 1 {
+        if c.sc == 1 { return "invalid queue identifier"; }
+        if c.sc == 2 { return "invalid queue size"; }
+    }
+    return "sct " + int_to_str(c.sct) + " sc " + int_to_str(c.sc);
+}
+
+// --- identify data -------------------------------------------------------------------
+
+pub struct NvmeIdCtrl {
+    pub vid: i64,
+    pub serial: str,
+    pub model: str,
+    pub firmware: str,
+    pub mdts: i64,
+    pub cntlid: i64,
+    pub version: i64,
+    pub sqes: i64,
+    pub cqes: i64,
+    pub nn: i64,
+}
+
+fn nv_ascii(d: & Vec<i64>, o: i64, n: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(d.get(o + i));
+        i = i + 1;
+    }
+    return str_trim(str_from_bytes(out));
+}
+
+pub fn nvme_id_ctrl_parse(d: & Vec<i64>) -> NvmeIdCtrl {
+    return NvmeIdCtrl {
+        vid: d.get(0) | (d.get(1) << 8), serial: nv_ascii(d, 4, 20), model: nv_ascii(d, 24, 40), firmware: nv_ascii(d, 64, 8), mdts: d.get(77), cntlid: d.get(78) | (d.get(79) << 8), version: nv_get32(d, 80), sqes: d.get(512), cqes: d.get(513), nn: nv_get32(d, 516)
+    };
+}
+
+/// Largest transfer in bytes (MDTS; 0 means no limit, given as -1).
+pub fn nvme_max_transfer(id: & NvmeIdCtrl, mpsmin: i64) -> i64 {
+    if id.mdts == 0 {
+        return -1;
+    }
+    return mpsmin << id.mdts;
+}
+
+pub struct NvmeIdNs {
+    pub nsze: i64,
+    pub ncap: i64,
+    pub nuse: i64,
+    pub nlbaf: i64,
+    pub flbas: i64,
+    pub lba_size: i64,
+    pub ms: i64,
+}
+
+pub fn nvme_id_ns_parse(d: & Vec<i64>) -> NvmeIdNs {
+    val fl: i64 = d.get(26) & 15;
+    val lbaf: i64 = nv_get32(d, 128 + 4 * fl);
+    return NvmeIdNs {
+        nsze: nv_get64(d, 0), ncap: nv_get64(d, 8), nuse: nv_get64(d, 16), nlbaf: d.get(25) + 1, flbas: fl, lba_size: 1 << ((lbaf >> 16) & 255), ms: lbaf & 65535
+    };
+}
+
+// --- queues and the driver ----------------------------------------------------------------
+
+pub struct NvmeBus {
+    pub mmio_rd: fn(i64) -> i64,
+    pub mmio_wr: fn(i64, i64) -> i64,
+    pub mem_rd: fn(i64, i64) -> Vec<i64>,
+    pub mem_wr: fn(i64, Vec<i64>) -> i64,
+}
+
+pub struct NvmeQueue {
+    pub qid: i64,
+    pub sq: i64,
+    pub cq: i64,
+    pub size: i64,
+    pub sq_tail: i64,
+    pub sq_head: i64,
+    pub cq_head: i64,
+    pub phase: i64,
+    pub next_cid: i64,
+    pub dstrd: i64,
+}
+
+pub fn nvme_queue(qid: i64, sq: i64, cq: i64, size: i64, dstrd: i64) -> NvmeQueue {
+    return NvmeQueue { qid: qid, sq: sq, cq: cq, size: size, sq_tail: 0, sq_head: 0, cq_head: 0, phase: 1, next_cid: 0, dstrd: dstrd };
+}
+
+pub fn nvme_rd(bus: & NvmeBus, off: i64) -> i64 {
+    val f = bus.mmio_rd;
+    return f(off) & 4294967295;
+}
+
+pub fn nvme_wr(bus: & NvmeBus, off: i64, v: i64) {
+    val f = bus.mmio_wr;
+    f(off, v & 4294967295);
+}
+
+pub fn nvme_wr64(bus: & NvmeBus, off: i64, v: i64) {
+    nvme_wr(bus, off, v & 4294967295);
+    nvme_wr(bus, off + 4, (v >> 32) & 4294967295);
+}
+
+fn nv_mem_wr(bus: & NvmeBus, addr: i64, data: Vec<i64>) {
+    val f = bus.mem_wr;
+    f(addr, data);
+}
+
+fn nv_mem_rd(bus: & NvmeBus, addr: i64, n: i64) -> Vec<i64> {
+    val f = bus.mem_rd;
+    return f(addr, n);
+}
+
+/// Is the submission queue full (one slot always stays empty)?
+pub fn nvme_sq_full(q: & NvmeQueue) -> bool {
+    return (q.sq_tail + 1) % q.size == q.sq_head;
+}
+
+/// Put `c` on the queue with the next command id and ring the doorbell.
+/// Returns the command id, or -EBUSY when the queue is full.
+pub fn nvme_submit(bus: & NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> i64 {
+    if nvme_sq_full(q) {
+        return 0 - VFS_EBUSY;
+    }
+    var c: NvmeCmd = cmd;
+    c.cid = q.next_cid;
+    q.next_cid = (q.next_cid + 1) & 65535;
+    nv_mem_wr(bus, q.sq + q.sq_tail * NVME_SQE_SIZE, nvme_sqe(&c));
+    q.sq_tail = (q.sq_tail + 1) % q.size;
+    nvme_wr(bus, nvme_sq_doorbell(q.qid, q.dstrd), q.sq_tail);
+    return c.cid;
+}
+
+/// Take one completion if the controller posted one (its phase tag equals
+/// the queue's current phase): cid -1 when there is none.
+pub fn nvme_poll(bus: & NvmeBus, q: &mut NvmeQueue) -> NvmeCqe {
+    val e: Vec<i64> = nv_mem_rd(bus, q.cq + q.cq_head * NVME_CQE_SIZE, NVME_CQE_SIZE);
+    var c: NvmeCqe = nvme_cqe_parse(&e, 0);
+    if c.phase != q.phase {
+        c.cid = -1;
+        return c;
+    }
+    q.cq_head = q.cq_head + 1;
+    if q.cq_head == q.size {
+        q.cq_head = 0;
+        q.phase = 1 - q.phase;
+    }
+    q.sq_head = c.sqhd;
+    nvme_wr(bus, nvme_cq_doorbell(q.qid, q.dstrd), q.cq_head);
+    return c;
+}
+
+/// Submit and wait for that command's completion.
+pub fn nvme_exec(bus: & NvmeBus, q: &mut NvmeQueue, cmd: NvmeCmd) -> NvmeCqe {
+    val cid: i64 = nvme_submit(bus, q, cmd);
+    var none: NvmeCqe = NvmeCqe { dw0: 0, sqhd: 0, sqid: 0, cid: -1, phase: 0, sc: 255, sct: 7, dnr: true };
+    if cid < 0 {
+        return none;
+    }
+    var i: i64 = 0;
+    while i < NVME_POLL_LIMIT {
+        val c: NvmeCqe = nvme_poll(bus, q);
+        if c.cid == cid {
+            return c;
+        }
+        i = i + 1;
+    }
+    return none;
+}
+
+pub fn nvme_ok(c: & NvmeCqe) -> bool {
+    return c.cid >= 0 && c.sc == 0 && c.sct == 0;
+}
+
+pub struct NvmeCtrl {
+    pub err: str,
+    pub cap: NvmeCap,
+    pub version: i64,
+    pub admin: NvmeQueue,
+}
+
+fn nv_wait_rdy(bus: & NvmeBus, want: i64) -> i64 {
+    var i: i64 = 0;
+    while i < NVME_POLL_LIMIT {
+        val s: i64 = nvme_rd(bus, NVME_REG_CSTS);
+        if (s & NVME_CSTS_CFS) != 0 {
+            return -1;
+        }
+        if (s & NVME_CSTS_RDY) == want {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return -2;
+}
+
+/// Reset and enable the controller with an admin queue pair of `entries`
+/// entries at `asq` and `acq` (page aligned).
+pub fn nvme_init(bus: & NvmeBus, asq: i64, acq: i64, entries: i64) -> NvmeCtrl {
+    val cap: NvmeCap = nvme_cap_decode(nvme_rd(bus, NVME_REG_CAP), nvme_rd(bus, NVME_REG_CAP + 4));
+    var ctl: NvmeCtrl = NvmeCtrl { err: "", cap: cap, version: nvme_rd(bus, NVME_REG_VS), admin: nvme_queue(0, asq, acq, entries, cap.dstrd) };
+    if asq % NVME_PAGE != 0 || acq % NVME_PAGE != 0 {
+        ctl.err = "admin queues not page aligned";
+        return ctl;
+    }
+    if entries < 2 || entries > 4096 || entries > cap.mqes {
+        ctl.err = "bad admin queue size";
+        return ctl;
+    }
+    if !cap.css_nvm {
+        ctl.err = "no NVM command set";
+        return ctl;
+    }
+    nvme_wr(bus, NVME_REG_CC, nvme_rd(bus, NVME_REG_CC) & (4294967295 - NVME_CC_EN));
+    if nv_wait_rdy(bus, 0) != 0 {
+        ctl.err = "controller does not disable";
+        return ctl;
+    }
+    nv_mem_wr(bus, acq, nv_zeros(entries * NVME_CQE_SIZE));
+    nvme_wr(bus, NVME_REG_AQA, nvme_aqa_value(entries, entries));
+    nvme_wr64(bus, NVME_REG_ASQ, asq);
+    nvme_wr64(bus, NVME_REG_ACQ, acq);
+    nvme_wr(bus, NVME_REG_CC, nvme_cc_value(0));
+    val r: i64 = nv_wait_rdy(bus, 1);
+    if r == -1 {
+        ctl.err = "controller fatal status";
+    } else if r != 0 {
+        ctl.err = "controller does not become ready";
+    }
+    return ctl;
+}
+
+/// Create the I/O queue pair `qid` (completion queue first, as required).
+pub fn nvme_create_io_queues(bus: & NvmeBus, ctl: &mut NvmeCtrl, qid: i64, sq: i64, cq: i64, entries: i64) -> NvmeQueue {
+    var q: NvmeQueue = nvme_queue(qid, sq, cq, entries, ctl.cap.dstrd);
+    nv_mem_wr(bus, cq, nv_zeros(entries * NVME_CQE_SIZE));
+    val c1: NvmeCqe = nvme_exec(bus, &mut ctl.admin, nvme_cmd_create_cq(qid, entries, cq, 0, false));
+    if !nvme_ok(&c1) {
+        ctl.err = "create I/O CQ: " + nvme_status_str(&c1);
+        q.qid = -1;
+        return q;
+    }
+    val c2: NvmeCqe = nvme_exec(bus, &mut ctl.admin, nvme_cmd_create_sq(qid, entries, sq, qid, 2));
+    if !nvme_ok(&c2) {
+        ctl.err = "create I/O SQ: " + nvme_status_str(&c2);
+        q.qid = -1;
+    }
+    return q;
+}
+
+/// Read or write `nlb` blocks between `slba` and the buffer `buf`; `list`
+/// is a page for the PRP list when the buffer spans more than two pages.
+pub fn nvme_rw(bus: & NvmeBus, q: &mut NvmeQueue, write: bool, nsid: i64, slba: i64, nlb: i64, lba_size: i64, buf: i64, list: i64) -> NvmeCqe {
+    val prps: Vec<i64> = nvme_prps(buf, nlb * lba_size, list);
+    if prps.len() > 2 {
+        nv_mem_wr(bus, list, nvme_prp_list_bytes(&prps));
+    }
+    return nvme_exec(bus, q, nvme_cmd_rw(write, nsid, slba, nlb, prps.get(0), prps.get(1)));
+}
+
+// --- a vfs block device over a namespace -----------------------------------------------
+
+var nv_dev_bus: Vec<NvmeBus> = Vec::new();
+var nv_dev_q: Vec<NvmeQueue> = Vec::new();
+var nv_dev_ns: Vec<i64> = Vec::new();
+var nv_dev_lbas: Vec<i64> = Vec::new();
+var nv_dev_buf: Vec<i64> = Vec::new();
+
+fn nv_bd_io(h: i64, lba: i64, write: bool) -> i64 {
+    val bus: NvmeBus = nv_dev_bus.get(h);
+    var q: NvmeQueue = nv_dev_q.get(h);
+    val c: NvmeCqe = nvme_rw(&bus, &mut q, write, nv_dev_ns.get(h), lba, 1, nv_dev_lbas.get(h), nv_dev_buf.get(h), nv_dev_buf.get(h) + NVME_PAGE);
+    nv_dev_q.set(h, q);
+    if nvme_ok(&c) {
+        return 0;
+    }
+    return 0 - VFS_EIO;
+}
+
+fn nv_bd_read(h: i64, lba: i64) -> Vec<i64> {
+    if nv_bd_io(h, lba, false) < 0 {
+        return Vec::new();
+    }
+    val bus: NvmeBus = nv_dev_bus.get(h);
+    return nv_mem_rd(&bus, nv_dev_buf.get(h), nv_dev_lbas.get(h));
+}
+
+fn nv_bd_write(h: i64, lba: i64, data: Vec<i64>) -> i64 {
+    val bus: NvmeBus = nv_dev_bus.get(h);
+    nv_mem_wr(&bus, nv_dev_buf.get(h), data);
+    return nv_bd_io(h, lba, true);
+}
+
+fn nv_bd_zero(h: i64, lba: i64, count: i64) -> i64 {
+    val z: Vec<i64> = nv_zeros(nv_dev_lbas.get(h));
+    var i: i64 = 0;
+    while i < count {
+        val r: i64 = nv_bd_write(h, lba + i, z);
+        if r < 0 {
+            return r;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// A BlockDev over namespace `nsid` through I/O queue `q`; `buf` is two
+/// pages of DMA memory (a bounce page and a PRP list page).
+pub fn nvme_blockdev(bus: NvmeBus, q: NvmeQueue, nsid: i64, ns: & NvmeIdNs, buf: i64) -> BlockDev {
+    val h: i64 = nv_dev_bus.len();
+    nv_dev_bus.push(bus);
+    nv_dev_q.push(q);
+    nv_dev_ns.push(nsid);
+    nv_dev_lbas.push(ns.lba_size);
+    nv_dev_buf.push(buf);
+    return blockdev_new(h, ns.lba_size, ns.nsze, nv_bd_read, nv_bd_write, nv_bd_zero);
+}

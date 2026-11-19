@@ -1,0 +1,397 @@
+// Fides schema migrations, pure Fides
+//
+// Versioned migrations with up and down scripts:
+//   - a migration is a version number, a name, an up script and a down
+//     script; it can be read from a file "0003_add_users.sql" whose text
+//     has "-- +up" and "-- +down" sections
+//   - each up script has a checksum (the first 16 bytes of its SHA-512,
+//     stdlib sha512, as hex), recorded when it is applied, so an edited
+//     migration that already ran is detected
+//   - the applied-migrations table (schema_migrations: version, name,
+//     checksum, applied_at) and the SQL to create, insert and delete rows
+//   - planning: given the known migrations, the applied rows and a target
+//     version (-1 for the latest), the ordered steps to apply (up) or
+//     revert (down), refusing on duplicate versions, applied versions with
+//     no source, checksum mismatches, and pending versions older than the
+//     newest applied one (unless out-of-order is allowed)
+//   - an executor that runs a plan through a database seam: each step in
+//     its own transaction (BEGIN, the script, the bookkeeping row,
+//     COMMIT), ROLLBACK and stop at the first failure
+//
+// The seam is MigDb: function values `exec(sql) -> str` ("" on success,
+// else the error) and `applied() -> str` (the table's rows, one per line,
+// "version|name|checksum|applied_at"). Bind them to stdlib postgres or
+// sqlite in a program; a test binds them to an in-memory fake.
+//
+// Usage:
+//   var ms: Vec<Migration> = Vec::new();
+//   ms.push(migration_new(1, "create users", "CREATE TABLE users(...)", "DROP TABLE users"));
+//   val plan: MigPlan = migrate_plan(& ms, migrate_parse_applied(db_rows), - 1, false);
+//   val rep: MigReport = migrate_run(& db, & ms, - 1, now, false);
+
+module migrate;
+ use vec; use sha512;
+
+pub struct Migration {
+    pub version: i64,
+    pub name: str,
+    pub up: str,
+    pub down: str,
+}
+
+pub struct Applied {
+    pub version: i64,
+    pub name: str,
+    pub checksum: str,
+    pub applied_at: i64,
+}
+
+/// One step of a plan: `up` true applies, false reverts.
+pub struct MigStep {
+    pub version: i64,
+    pub name: str,
+    pub up: bool,
+    pub sql: str,
+    pub checksum: str,
+}
+
+pub struct MigPlan {
+    pub ok: bool,
+    pub error: str,
+    pub steps: Vec<MigStep>,
+    pub current: i64,  // the newest applied version (0 when none)
+    pub target: i64,
+}
+
+pub struct MigReport {
+    pub ok: bool,
+    pub error: str,
+    pub done: Vec<str>,   // "up 3 add users" / "down 3 add users"
+    pub version: i64,     // the version after the run
+}
+
+/// The database seam (see the header).
+pub struct MigDb {
+    pub exec: fn(str) -> str,
+    pub applied: fn() -> str,
+}
+
+pub fn migration_new(version: i64, name: str, up: str, down: str) -> Migration {
+    return Migration { version: version, name: name, up: up, down: down };
+}
+
+/// Checksum of a script: the first 16 bytes of SHA-512 as 32 hex digits.
+/// Line endings are normalized (CRLF -> LF) and trailing whitespace of the
+/// whole script ignored, so a re-saved file keeps its checksum.
+pub fn migrate_checksum(script: str) -> str {
+    val norm: str = str_trim_end(str_replace(script, "\r\n", "\n"));
+    return str_slice(sha512_hex(sha512_str(norm)), 0, 32);
+}
+
+/// Read a migration file "0003_add_users.sql": the version from the digits
+/// before '_', the name from the rest (underscores become spaces), the up
+/// and down scripts from the "-- +up" and "-- +down" sections. version -1
+/// when the name or sections are malformed.
+pub fn migrate_parse_file(filename: str, text: str) -> Migration {
+    var base: str = filename;
+    val slash: i64 = str_rfind(base, "/");
+    if slash >= 0 {
+        base = str_slice(base, slash + 1, str_len(base));
+    }
+    if str_ends_with(base, ".sql") {
+        base = str_slice(base, 0, str_len(base) - 4);
+    }
+    val us: i64 = str_find(base, "_");
+    var m: Migration = migration_new(- 1, "", "", "");
+    if us <= 0 {
+        return m;
+    }
+    val digits: str = str_slice(base, 0, us);
+    var i: i64 = 0;
+    while i < str_len(digits) {
+        val c: i64 = str_byte_at(digits, i);
+        if c < 48 || c > 57 {
+            return m;
+        }
+        i = i + 1;
+    }
+    val norm: str = str_replace(text, "\r\n", "\n");
+    val up_at: i64 = str_find(norm, "-- +up");
+    val down_at: i64 = str_find(norm, "-- +down");
+    if up_at < 0 {
+        return m;
+    }
+    m.version = str_parse_int(digits);
+    m.name = str_replace(str_slice(base, us + 1, str_len(base)), "_", " ");
+    val up_start: i64 = up_at + 6;
+    if down_at > up_at {
+        m.up = str_trim(str_slice(norm, up_start, down_at));
+        m.down = str_trim(str_slice(norm, down_at + 8, str_len(norm)));
+    } else if down_at >= 0 {
+        m.down = str_trim(str_slice(norm, down_at + 8, up_at));
+        m.up = str_trim(str_slice(norm, up_start, str_len(norm)));
+    } else {
+        m.up = str_trim(str_slice(norm, up_start, str_len(norm)));
+    }
+    return m;
+}
+
+// ─── the applied-migrations table ───────────────────────────────────────
+
+/// CREATE TABLE for the bookkeeping table (PostgreSQL and SQLite alike).
+pub fn migrate_table_sql() -> str {
+    return "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at BIGINT NOT NULL)";
+}
+
+fn mg_lit(s: str) -> str {
+    return "'" + str_replace(s, "'", "''") + "'";
+}
+
+/// The INSERT that records an applied migration.
+pub fn migrate_record_sql(version: i64, name: str, checksum: str, now: i64) -> str {
+    return "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (" + int_to_str(version) + ", " + mg_lit(name) + ", " + mg_lit(checksum) + ", " + int_to_str(now) + ")";
+}
+
+/// The DELETE that forgets a reverted migration.
+pub fn migrate_unrecord_sql(version: i64) -> str {
+    return "DELETE FROM schema_migrations WHERE version = " + int_to_str(version);
+}
+
+/// Rows of the table from "version|name|checksum|applied_at" lines.
+pub fn migrate_parse_applied(rows: str) -> Vec<Applied> {
+    var out: Vec<Applied> = Vec::new();
+    val lines: Vec<str> = str_split(rows, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = str_trim(lines.get(i));
+        if str_len(l) > 0 {
+            val f: Vec<str> = str_split(l, "|");
+            if f.len() >= 4 {
+                out.push(Applied { version: str_parse_int(f.get(0)), name: f.get(1), checksum: f.get(2), applied_at: str_parse_int(f.get(3)) });
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── planning ───────────────────────────────────────────────────────────
+
+fn mg_sorted(ms: & Vec<Migration>) -> Vec<Migration> {
+    // insertion sort by version (lists are small)
+    var out: Vec<Migration> = Vec::new();
+    var i: i64 = 0;
+    while i < ms.len() {
+        val m: Migration = ms.get(i);
+        out.push(m);
+        var j: i64 = out.len() - 1;
+        while j > 0 && out.get(j - 1).version > m.version {
+            out.set(j, out.get(j - 1));
+            j = j - 1;
+        }
+        out.set(j, m);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mg_applied_index(ap: & Vec<Applied>, version: i64) -> i64 {
+    var i: i64 = 0;
+    while i < ap.len() {
+        if ap.get(i).version == version {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn mg_fail(msg: str) -> MigPlan {
+    return MigPlan { ok: false, error: msg, steps: Vec::new(), current: 0, target: 0 };
+}
+
+/// Plan the way from the applied state to `target` (-1: the latest).
+pub fn migrate_plan(ms: & Vec<Migration>, applied: Vec<Applied>, target: i64, allow_out_of_order: bool) -> MigPlan {
+    val sorted: Vec<Migration> = mg_sorted(ms);
+    var i: i64 = 0;
+    while i < sorted.len() {
+        if sorted.get(i).version <= 0 {
+            return mg_fail("migration \"" + sorted.get(i).name + "\" has no valid version");
+        }
+        if i > 0 && sorted.get(i).version == sorted.get(i - 1).version {
+            return mg_fail("duplicate migration version " + int_to_str(sorted.get(i).version));
+        }
+        i = i + 1;
+    }
+    // every applied row must have its source, unchanged
+    var current: i64 = 0;
+    i = 0;
+    while i < applied.len() {
+        val a: Applied = applied.get(i);
+        if a.version > current {
+            current = a.version;
+        }
+        var found: bool = false;
+        var k: i64 = 0;
+        while k < sorted.len() {
+            val m: Migration = sorted.get(k);
+            if m.version == a.version {
+                found = true;
+                if migrate_checksum(m.up) != a.checksum {
+                    return mg_fail("migration " + int_to_str(a.version) + " (" + m.name + ") was changed after it was applied: checksum " + a.checksum + " recorded, " + migrate_checksum(m.up) + " now");
+                }
+            }
+            k = k + 1;
+        }
+        if !found {
+            return mg_fail("applied migration " + int_to_str(a.version) + " (" + a.name + ") has no source");
+        }
+        i = i + 1;
+    }
+    var tgt: i64 = target;
+    if tgt < 0 {
+        tgt = 0;
+        if sorted.len() > 0 {
+            tgt = sorted.get(sorted.len() - 1).version;
+        }
+    }
+    if tgt > 0 {
+        var known: bool = false;
+        i = 0;
+        while i < sorted.len() {
+            if sorted.get(i).version == tgt { known = true; }
+            i = i + 1;
+        }
+        if !known {
+            return mg_fail("unknown target version " + int_to_str(tgt));
+        }
+    }
+    var plan: MigPlan = MigPlan { ok: true, error: "", steps: Vec::new(), current: current, target: tgt };
+    // revert, newest first: applied versions above the target
+    i = sorted.len() - 1;
+    while i >= 0 {
+        val m: Migration = sorted.get(i);
+        if m.version > tgt && mg_applied_index(& applied, m.version) >= 0 {
+            if str_len(str_trim(m.down)) == 0 {
+                return mg_fail("migration " + int_to_str(m.version) + " (" + m.name + ") has no down script");
+            }
+            plan.steps.push(MigStep { version: m.version, name: m.name, up: false, sql: m.down, checksum: migrate_checksum(m.up) });
+        }
+        i = i - 1;
+    }
+    // apply, oldest first: pending versions up to the target
+    i = 0;
+    while i < sorted.len() {
+        val m: Migration = sorted.get(i);
+        if m.version <= tgt && mg_applied_index(& applied, m.version) < 0 {
+            if m.version < current && !allow_out_of_order {
+                return mg_fail("pending migration " + int_to_str(m.version) + " (" + m.name + ") is older than applied version " + int_to_str(current));
+            }
+            plan.steps.push(MigStep { version: m.version, name: m.name, up: true, sql: m.up, checksum: migrate_checksum(m.up) });
+        }
+        i = i + 1;
+    }
+    return plan;
+}
+
+/// One line per step: "up 2 add email" / "down 3 drop users".
+pub fn migrate_plan_lines(p: & MigPlan) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < p.steps.len() {
+        val s: MigStep = p.steps.get(i);
+        var dir: str = "down";
+        if s.up { dir = "up"; }
+        out.push(dir + " " + int_to_str(s.version) + " " + s.name);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── execution ──────────────────────────────────────────────────────────
+
+/// Plan against the database's table and run the steps: each step in a
+/// transaction with its bookkeeping row; the first failure rolls back
+/// that step and stops (earlier steps stay applied).
+pub fn migrate_run(db: & MigDb, ms: & Vec<Migration>, target: i64, now: i64, allow_out_of_order: bool) -> MigReport {
+    var rep: MigReport = MigReport { ok: true, error: "", done: Vec::new(), version: 0 };
+    val exec: fn(str) -> str = db.exec;
+    val read: fn() -> str = db.applied;
+    val e0: str = exec(migrate_table_sql());
+    if str_len(e0) > 0 {
+        rep.ok = false;
+        rep.error = "creating schema_migrations: " + e0;
+        return rep;
+    }
+    val before: Vec<Applied> = migrate_parse_applied(read());
+    var k0: i64 = 0;
+    while k0 < before.len() {
+        if before.get(k0).version > rep.version { rep.version = before.get(k0).version; }
+        k0 = k0 + 1;
+    }
+    val plan: MigPlan = migrate_plan(ms, before, target, allow_out_of_order);
+    if !plan.ok {
+        rep.ok = false;
+        rep.error = plan.error;
+        return rep;
+    }
+    var i: i64 = 0;
+    while i < plan.steps.len() {
+        val s: MigStep = plan.steps.get(i);
+        var err: str = exec("BEGIN");
+        if str_len(err) == 0 {
+            err = exec(s.sql);
+        }
+        if str_len(err) == 0 {
+            if s.up {
+                err = exec(migrate_record_sql(s.version, s.name, s.checksum, now));
+            } else {
+                err = exec(migrate_unrecord_sql(s.version));
+            }
+        }
+        if str_len(err) == 0 {
+            err = exec("COMMIT");
+        }
+        var dir: str = "down";
+        if s.up { dir = "up"; }
+        if str_len(err) > 0 {
+            exec("ROLLBACK");
+            rep.ok = false;
+            rep.error = dir + " " + int_to_str(s.version) + " (" + s.name + ") failed: " + err;
+            return rep;
+        }
+        rep.done.push(dir + " " + int_to_str(s.version) + " " + s.name);
+        // the version now in effect
+        val after: Vec<Applied> = migrate_parse_applied(read());
+        var newest: i64 = 0;
+        var k: i64 = 0;
+        while k < after.len() {
+            if after.get(k).version > newest { newest = after.get(k).version; }
+            k = k + 1;
+        }
+        rep.version = newest;
+        i = i + 1;
+    }
+    return rep;
+}
+
+/// "applied" / "pending" / "changed" for each known migration, in order.
+pub fn migrate_status(ms: & Vec<Migration>, applied: Vec<Applied>) -> Vec<str> {
+    val sorted: Vec<Migration> = mg_sorted(ms);
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < sorted.len() {
+        val m: Migration = sorted.get(i);
+        val ai: i64 = mg_applied_index(& applied, m.version);
+        var st: str = "pending";
+        if ai >= 0 {
+            st = "applied";
+            if applied.get(ai).checksum != migrate_checksum(m.up) {
+                st = "changed";
+            }
+        }
+        out.push(int_to_str(m.version) + " " + m.name + ": " + st);
+        i = i + 1;
+    }
+    return out;
+}

@@ -1,0 +1,346 @@
+// Fides occupancy grid mapping (robotics)
+//
+// A 2D grid of cells holding the log-odds l = log(p / (1 - p)) that the cell
+// is occupied (0: unknown, p = 0.5). Range beams update it with the inverse
+// sensor model of the classic occupancy-grid algorithm: every cell the beam
+// crosses gets l_free added, the cell where it ends gets l_occ when the
+// beam hit something, all clamped to [l_min, l_max] so a cell can still
+// change its mind. Cells along a beam come from Bresenham's line algorithm
+// (all octants, both endpoints included).
+//
+//   ogrid_new / ogrid_set_model     geometry (cells, metres per cell, the
+//                                   world position of cell (0, 0)'s corner)
+//                                   and the sensor model
+//   ogrid_world_to_cell / _center   coordinates
+//   ogrid_insert_ray / _scan        beams; readings at or beyond range_max
+//                                   only clear space
+//   ogrid_prob / ogrid_state        p(occupied); occupied / free / unknown
+//   ogrid_raycast                   distance along a ray to the first
+//                                   occupied cell (a simulated range sensor)
+//   ogrid_merge / ogrid_merge_at    sum of log-odds of two maps (same
+//                                   geometry, or b placed at a cell offset)
+//   ogrid_to_ascii                  '#' occupied, '.' free, '?' unknown,
+//                                   top row = largest y
+//
+// Everything here is pure computation; there is no platform seam (the
+// ranges come from the caller's sensor driver).
+//
+// Usage:
+//   use occupancy_grid;
+//   var g = ogrid_new(200, 200, 0.05, -5.0, -5.0);
+//   ogrid_insert_scan(&mut g, x, y, theta, &ranges, -1.57, 0.01, 8.0);
+//   println(ogrid_to_ascii(&g));
+
+module occupancy_grid;
+use math;
+
+/// A log-odds occupancy grid.
+pub struct OccGrid {
+    pub width: i64,
+    pub height: i64,
+    // metres per cell
+    pub resolution: f64,
+    // world coordinates of the lower-left corner of cell (0, 0)
+    pub origin_x: f64,
+    pub origin_y: f64,
+    // row-major, index = cy * width + cx
+    pub logodds: Vec<f64>,
+    pub l_occ: f64,
+    pub l_free: f64,
+    pub l_min: f64,
+    pub l_max: f64,
+}
+
+/// A cell index pair.
+pub struct GridCell {
+    pub x: i64,
+    pub y: i64,
+}
+
+/// A width x height grid of unknown cells; hit 0.7 / miss 0.4, clamped to
+/// p in [0.12, 0.97] (the usual defaults of mapping packages).
+pub fn ogrid_new(width: i64, height: i64, resolution: f64, origin_x: f64, origin_y: f64) -> OccGrid {
+    var l: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < width * height {
+        l.push(0.0);
+        i = i + 1;
+    }
+    return OccGrid {
+        width: width, height: height, resolution: resolution, origin_x: origin_x, origin_y: origin_y, logodds: l, l_occ: ogrid_logit(0.7), l_free: ogrid_logit(0.4), l_min: ogrid_logit(0.12), l_max: ogrid_logit(0.97)
+    };
+}
+
+/// log(p / (1 - p)).
+pub fn ogrid_logit(p: f64) -> f64 {
+    return math_log(p / (1.0 - p));
+}
+
+/// 1 / (1 + exp(-l)).
+pub fn ogrid_inv_logit(l: f64) -> f64 {
+    return 1.0 - 1.0 / (1.0 + math_exp(l));
+}
+
+/// The sensor model: p(occupied) of a hit cell and of a crossed cell, and
+/// the clamp range of p.
+pub fn ogrid_set_model(g: & mut OccGrid, p_hit: f64, p_miss: f64, p_min: f64, p_max: f64) {
+    g.l_occ = ogrid_logit(p_hit);
+    g.l_free = ogrid_logit(p_miss);
+    g.l_min = ogrid_logit(p_min);
+    g.l_max = ogrid_logit(p_max);
+}
+
+/// True when (cx, cy) is inside the grid.
+pub fn ogrid_in_bounds(g: & OccGrid, cx: i64, cy: i64) -> bool {
+    return cx >= 0 && cy >= 0 && cx < g.width && cy < g.height;
+}
+
+/// The cell containing world point (x, y) (it may be out of bounds).
+pub fn ogrid_world_to_cell(g: & OccGrid, x: f64, y: f64) -> GridCell {
+    return GridCell {
+        x: math_floor((x - g.origin_x) / g.resolution) as i64, y: math_floor((y - g.origin_y) / g.resolution) as i64
+    };
+}
+
+/// The world coordinates of the centre of cell (cx, cy).
+pub fn ogrid_cell_center(g: & OccGrid, cx: i64, cy: i64) -> vec2 {
+    return vec2(g.origin_x + ((cx as f64) + 0.5) * g.resolution, g.origin_y + ((cy as f64) + 0.5) * g.resolution);
+}
+
+/// The log-odds of a cell (0 outside the grid).
+pub fn ogrid_get(g: & OccGrid, cx: i64, cy: i64) -> f64 {
+    if !ogrid_in_bounds(g, cx, cy) {
+        return 0.0;
+    }
+    return g.logodds.get(cy * g.width + cx);
+}
+
+/// Add `delta` to a cell's log-odds, clamped; cells outside are ignored.
+pub fn ogrid_update_cell(g: & mut OccGrid, cx: i64, cy: i64, delta: f64) {
+    if !ogrid_in_bounds(g, cx, cy) {
+        return;
+    }
+    val k: i64 = cy * g.width + cx;
+    var l: f64 = g.logodds.get(k) + delta;
+    if l < g.l_min {
+        l = g.l_min;
+    }
+    if l > g.l_max {
+        l = g.l_max;
+    }
+    g.logodds.set(k, l);
+}
+
+/// p(occupied) of a cell; 0.5 outside the grid.
+pub fn ogrid_prob(g: & OccGrid, cx: i64, cy: i64) -> f64 {
+    return ogrid_inv_logit(ogrid_get(g, cx, cy));
+}
+
+/// p(occupied) at world point (x, y).
+pub fn ogrid_prob_at(g: & OccGrid, x: f64, y: f64) -> f64 {
+    val c: GridCell = ogrid_world_to_cell(g, x, y);
+    return ogrid_prob(g, c.x, c.y);
+}
+
+/// 1 occupied (p > 0.65), 0 free (p < 0.35), -1 unknown.
+pub fn ogrid_state(g: & OccGrid, cx: i64, cy: i64) -> i64 {
+    val p: f64 = ogrid_prob(g, cx, cy);
+    if p > 0.65 {
+        return 1;
+    }
+    if p < 0.35 {
+        return 0;
+    }
+    return - 1;
+}
+
+/// How many cells are in `state` (1, 0 or -1).
+pub fn ogrid_count(g: & OccGrid, state: i64) -> i64 {
+    var n: i64 = 0;
+    var cy: i64 = 0;
+    while cy < g.height {
+        var cx: i64 = 0;
+        while cx < g.width {
+            if ogrid_state(g, cx, cy) == state {
+                n = n + 1;
+            }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+    return n;
+}
+
+fn ogrid_iabs(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x;
+    }
+    return x;
+}
+
+/// The cells of the line from (x0, y0) to (x1, y1), both included, as a
+/// flat Vec [x, y, x, y, ...] (Bresenham, every octant).
+pub fn ogrid_bresenham(x0: i64, y0: i64, x1: i64, y1: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val dx: i64 = ogrid_iabs(x1 - x0);
+    val dy: i64 = 0 - ogrid_iabs(y1 - y0);
+    var sx: i64 = 1;
+    if x0 > x1 {
+        sx = - 1;
+    }
+    var sy: i64 = 1;
+    if y0 > y1 {
+        sy = - 1;
+    }
+    var err: i64 = dx + dy;
+    var x: i64 = x0;
+    var y: i64 = y0;
+    loop {
+        out.push(x);
+        out.push(y);
+        if x == x1 && y == y1 {
+            break;
+        }
+        val e2: i64 = 2 * err;
+        if e2 >= dy {
+            err = err + dy;
+            x = x + sx;
+        }
+        if e2 <= dx {
+            err = err + dx;
+            y = y + sy;
+        }
+    }
+    return out;
+}
+
+/// One beam from world (sx, sy) to (ex, ey): the cells before the end are
+/// free; the end cell is occupied when `hit`, else free too.
+pub fn ogrid_insert_ray(g: & mut OccGrid, sx: f64, sy: f64, ex: f64, ey: f64, hit: bool) {
+    val a: GridCell = ogrid_world_to_cell(g, sx, sy);
+    val b: GridCell = ogrid_world_to_cell(g, ex, ey);
+    val cells: Vec<i64> = ogrid_bresenham(a.x, a.y, b.x, b.y);
+    val n: i64 = cells.len() / 2;
+    var i: i64 = 0;
+    while i < n - 1 {
+        ogrid_update_cell(g, cells.get(2 * i), cells.get(2 * i + 1), g.l_free);
+        i = i + 1;
+    }
+    if hit {
+        ogrid_update_cell(g, b.x, b.y, g.l_occ);
+    } else {
+        ogrid_update_cell(g, b.x, b.y, g.l_free);
+    }
+}
+
+/// A scan from pose (px, py, theta): beam i at angle theta + angle_min +
+/// i * angle_inc with range ranges[i]. Readings <= 0 or NaN are skipped;
+/// readings >= range_max clear space up to range_max without a hit.
+pub fn ogrid_insert_scan(g: & mut OccGrid, px: f64, py: f64, theta: f64, ranges: & Vec<f64>, angle_min: f64, angle_inc: f64, range_max: f64) {
+    var i: i64 = 0;
+    while i < ranges.len() {
+        val r: f64 = ranges.get(i);
+        if r == r && r > 0.0 {
+            val a: f64 = theta + angle_min + (i as f64) * angle_inc;
+            var d: f64 = r;
+            var hit: bool = true;
+            if r >= range_max {
+                d = range_max;
+                hit = false;
+            }
+            ogrid_insert_ray(g, px, py, px + d * math_cos(a), py + d * math_sin(a), hit);
+        }
+        i = i + 1;
+    }
+}
+
+/// The distance from world (x, y) along `angle` to the first occupied cell
+/// (state 1), stepping a quarter cell at a time; max_range if none.
+pub fn ogrid_raycast(g: & OccGrid, x: f64, y: f64, angle: f64, max_range: f64) -> f64 {
+    val step: f64 = g.resolution * 0.25;
+    val c: f64 = math_cos(angle);
+    val s: f64 = math_sin(angle);
+    var d: f64 = 0.0;
+    while d <= max_range {
+        val cell: GridCell = ogrid_world_to_cell(g, x + d * c, y + d * s);
+        if !ogrid_in_bounds(g, cell.x, cell.y) {
+            return max_range;
+        }
+        if ogrid_state(g, cell.x, cell.y) == 1 {
+            return d;
+        }
+        d = d + step;
+    }
+    return max_range;
+}
+
+/// The sum of the log-odds of a and b (clamped with a's limits), for two
+/// grids of the same size, resolution and origin.
+pub fn ogrid_merge(a: & OccGrid, b: & OccGrid) -> Result<OccGrid, str> {
+    if a.width != b.width || a.height != b.height || a.resolution != b.resolution || a.origin_x != b.origin_x || a.origin_y != b.origin_y {
+        return Result::Err("ogrid_merge: grids differ in geometry");
+    }
+    var m: OccGrid = ogrid_new(a.width, a.height, a.resolution, a.origin_x, a.origin_y);
+    m.l_occ = a.l_occ;
+    m.l_free = a.l_free;
+    m.l_min = a.l_min;
+    m.l_max = a.l_max;
+    var k: i64 = 0;
+    while k < a.logodds.len() {
+        var l: f64 = a.logodds.get(k) + b.logodds.get(k);
+        if l < m.l_min {
+            l = m.l_min;
+        }
+        if l > m.l_max {
+            l = m.l_max;
+        }
+        m.logodds.set(k, l);
+        k = k + 1;
+    }
+    return Result::Ok(m);
+}
+
+/// Add b's log-odds into a, b's cell (0, 0) on a's cell (dx, dy); cells
+/// falling outside a are dropped.
+pub fn ogrid_merge_at(a: & mut OccGrid, b: & OccGrid, dx: i64, dy: i64) {
+    var cy: i64 = 0;
+    while cy < b.height {
+        var cx: i64 = 0;
+        while cx < b.width {
+            val l: f64 = b.logodds.get(cy * b.width + cx);
+            if l != 0.0 {
+                ogrid_update_cell(a, cx + dx, cy + dy, l);
+            }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+}
+
+/// The map as text: one line per row from the top (largest y), '#'
+/// occupied, '.' free, '?' unknown.
+pub fn ogrid_to_ascii(g: & OccGrid) -> str {
+    var out: str = "";
+    var cy: i64 = g.height - 1;
+    while cy >= 0 {
+        var line: str = "";
+        var cx: i64 = 0;
+        while cx < g.width {
+            val s: i64 = ogrid_state(g, cx, cy);
+            if s == 1 {
+                line = line + "#";
+            } else if s == 0 {
+                line = line + ".";
+            } else {
+                line = line + "?";
+            }
+            cx = cx + 1;
+        }
+        out = out + line;
+        if cy > 0 {
+            out = out + "\n";
+        }
+        cy = cy - 1;
+    }
+    return out;
+}

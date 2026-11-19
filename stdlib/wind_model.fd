@@ -1,0 +1,312 @@
+// Fides wind energy modelling
+//
+// Pure computation (no platform seam):
+// - Turbine power curves: a measured table (linear interpolation, zero
+//   below cut-in and above cut-out), the idealised cubic curve between
+//   cut-in and rated speed, and the IEC 61400-12-1 air-density
+//   normalisation of wind speed v (rho / rho0)^(1/3).
+// - The Weibull distribution (pdf, cdf, mean, the Rayleigh case from a mean
+//   speed, Justus' empirical fit k = (sigma/mu)^-1.086 from mean and
+//   standard deviation); the gamma function by Lanczos' approximation.
+// - Annual energy production: 8760 h times the integral of P(v) f(v) dv by
+//   composite Simpson's rule, times an availability/loss factor; capacity
+//   factor.
+// - Vertical wind shear: power law (exponent from two heights or given)
+//   and logarithmic law with roughness length z0.
+// - Jensen (Park) wake model (N.O. Jensen 1983; Katic, Hojstrup & Jensen
+//   1986): velocity deficit (1 - sqrt(1 - Ct)) / (1 + k x / r0)^2 in a wake
+//   whose radius grows as r0 + k x, weighted by the fraction of the
+//   downstream rotor inside the wake (circle-circle overlap), several wakes
+//   combined by root-sum-square; a farm solver for wind along +x.
+//
+// Units: m/s, metres, kW (whatever unit the curve uses), hours.
+
+module wind_model;
+use math;
+use complex;
+use vec;
+
+pub fn wind_pi() -> f64 {
+    return 3.14159265358979323846;
+}
+
+// ─── Power curves ───
+
+pub struct PowerCurve {
+    pub speeds: Vec<f64>,
+    pub powers: Vec<f64>,
+    pub cut_in: f64,
+    pub cut_out: f64,
+}
+
+/// A tabulated curve; speeds increasing. Below `cut_in` and above
+/// `cut_out` the output is 0.
+pub fn wind_power_curve(speeds: Vec<f64>, powers: Vec<f64>, cut_in: f64, cut_out: f64) -> PowerCurve {
+    if speeds.len() != powers.len() || speeds.len() < 2 {
+        panic("wind_power_curve: need two equal-length columns");
+    }
+    return PowerCurve {
+        speeds: speeds, powers: powers, cut_in: cut_in, cut_out: cut_out
+    };
+}
+
+pub fn wind_power(pc: &PowerCurve, v: f64) -> f64 {
+    if v < pc.cut_in || v > pc.cut_out {
+        return 0.0;
+    }
+    val n: i64 = pc.speeds.len();
+    if v <= pc.speeds.get(0) {
+        return pc.powers.get(0);
+    }
+    if v >= pc.speeds.get(n - 1) {
+        return pc.powers.get(n - 1);
+    }
+    var i: i64 = 0;
+    while i < n - 2 && v > pc.speeds.get(i + 1) {
+        i = i + 1;
+    }
+    val f: f64 = (v - pc.speeds.get(i)) / (pc.speeds.get(i + 1) - pc.speeds.get(i));
+    return pc.powers.get(i) + f * (pc.powers.get(i + 1) - pc.powers.get(i));
+}
+
+/// Idealised curve: rated * (v^3 - vi^3) / (vr^3 - vi^3) between cut-in
+/// and rated speed, rated up to cut-out.
+pub fn wind_power_cubic(v: f64, cut_in: f64, rated_speed: f64, rated: f64, cut_out: f64) -> f64 {
+    if v < cut_in || v > cut_out {
+        return 0.0;
+    }
+    if v >= rated_speed {
+        return rated;
+    }
+    val vi3: f64 = cut_in * cut_in * cut_in;
+    return rated * (v * v * v - vi3) / (rated_speed * rated_speed * rated_speed - vi3);
+}
+
+/// IEC 61400-12-1 normalised speed for a site air density rho (reference
+/// rho0, 1.225 kg/m^3 at sea level).
+pub fn wind_density_normalise(v: f64, rho: f64, rho0: f64) -> f64 {
+    return v * math_pow(rho / rho0, 1.0 / 3.0);
+}
+
+/// Air density from pressure (Pa) and temperature (C), dry air.
+pub fn wind_air_density(pressure_pa: f64, temp_c: f64) -> f64 {
+    return pressure_pa / (287.05 * (temp_c + 273.15));
+}
+
+/// Power in the wind through a rotor of diameter d: 0.5 rho A v^3 (W).
+pub fn wind_power_available(rho: f64, d: f64, v: f64) -> f64 {
+    return 0.5 * rho * wind_pi() * d * d / 4.0 * v * v * v;
+}
+
+// ─── Weibull ───
+
+/// Gamma function (Lanczos, g = 7, 9 terms; reflection below 0.5).
+pub fn wind_gamma(x: f64) -> f64 {
+    if x < 0.5 {
+        return wind_pi() / (math_sin(wind_pi() * x) * wind_gamma(1.0 - x));
+    }
+    var c: Vec<f64> = Vec::new();
+    c.push(0.99999999999980993);
+    c.push(676.5203681218851);
+    c.push(-1259.1392167224028);
+    c.push(771.32342877765313);
+    c.push(-176.61502916214059);
+    c.push(12.507343278686905);
+    c.push(-0.13857109526572012);
+    c.push(0.0000099843695780195716);
+    c.push(0.00000015056327351493116);
+    val z: f64 = x - 1.0;
+    var a: f64 = c.get(0);
+    val t: f64 = z + 7.5;
+    var i: i64 = 1;
+    while i < 9 {
+        a = a + c.get(i) / (z + (i as f64));
+        i = i + 1;
+    }
+    return math_sqrt(2.0 * wind_pi()) * math_pow(t, z + 0.5) * math_exp(0.0 - t) * a;
+}
+
+pub fn wind_weibull_pdf(v: f64, k: f64, c: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0;
+    }
+    if v == 0.0 {
+        if k < 1.0 {
+            return 1.0e30;
+        }
+        if k == 1.0 {
+            return 1.0 / c;
+        }
+        return 0.0;
+    }
+    val r: f64 = v / c;
+    return k / c * math_pow(r, k - 1.0) * math_exp(0.0 - math_pow(r, k));
+}
+
+pub fn wind_weibull_cdf(v: f64, k: f64, c: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0;
+    }
+    return 1.0 - math_exp(0.0 - math_pow(v / c, k));
+}
+
+pub fn wind_weibull_mean(k: f64, c: f64) -> f64 {
+    return c * wind_gamma(1.0 + 1.0 / k);
+}
+
+/// Rayleigh (k = 2) scale for a mean speed: c = 2 mean / sqrt(pi).
+pub fn wind_rayleigh_scale(mean: f64) -> f64 {
+    return 2.0 * mean / math_sqrt(wind_pi());
+}
+
+/// Justus' empirical fit: k = (sigma / mean)^-1.086, c = mean / G(1+1/k).
+/// Returns [k, c].
+pub fn wind_weibull_fit(mean: f64, sigma: f64) -> Vec<f64> {
+    val k: f64 = math_pow(sigma / mean, -1.086);
+    var out: Vec<f64> = Vec::new();
+    out.push(k);
+    out.push(mean / wind_gamma(1.0 + 1.0 / k));
+    return out;
+}
+
+/// Mean and standard deviation of a sample of speeds, then Justus' fit.
+pub fn wind_weibull_fit_samples(v: &Vec<f64>) -> Vec<f64> {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    val mean: f64 = s / (v.len() as f64);
+    var q: f64 = 0.0;
+    i = 0;
+    while i < v.len() {
+        q = q + (v.get(i) - mean) * (v.get(i) - mean);
+        i = i + 1;
+    }
+    return wind_weibull_fit(mean, math_sqrt(q / ((v.len() - 1) as f64)));
+}
+
+// ─── Energy ───
+
+/// Annual energy (curve units x hours) for Weibull(k, c): 8760 x the
+/// Simpson integral of P(v) f(v) over [0, vmax] with `steps` (even)
+/// intervals, times `availability` (0..1).
+pub fn wind_aep(pc: &PowerCurve, k: f64, c: f64, availability: f64) -> f64 {
+    val vmax: f64 = pc.cut_out + 1.0;
+    val steps: i64 = 4000;
+    val h: f64 = vmax / (steps as f64);
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i <= steps {
+        val v: f64 = h * (i as f64);
+        var w: f64 = 2.0;
+        if i == 0 || i == steps {
+            w = 1.0;
+        } else if i % 2 == 1 {
+            w = 4.0;
+        }
+        s = s + w * wind_power(pc, v) * wind_weibull_pdf(v, k, c);
+        i = i + 1;
+    }
+    return 8760.0 * availability * s * h / 3.0;
+}
+
+/// Annual energy from a histogram: hours[i] at speed bin centre speeds[i].
+pub fn wind_aep_histogram(pc: &PowerCurve, speeds: &Vec<f64>, hours: &Vec<f64>) -> f64 {
+    var e: f64 = 0.0;
+    var i: i64 = 0;
+    while i < speeds.len() {
+        e = e + wind_power(pc, speeds.get(i)) * hours.get(i);
+        i = i + 1;
+    }
+    return e;
+}
+
+pub fn wind_capacity_factor(aep: f64, rated: f64) -> f64 {
+    return aep / (rated * 8760.0);
+}
+
+// ─── Shear ───
+
+pub fn wind_shear_power(v_ref: f64, h_ref: f64, h: f64, alpha: f64) -> f64 {
+    return v_ref * math_pow(h / h_ref, alpha);
+}
+
+pub fn wind_shear_log(v_ref: f64, h_ref: f64, h: f64, z0: f64) -> f64 {
+    return v_ref * math_log(h / z0) / math_log(h_ref / z0);
+}
+
+/// Power-law exponent from speeds measured at two heights.
+pub fn wind_shear_alpha(v1: f64, h1: f64, v2: f64, h2: f64) -> f64 {
+    return math_log(v2 / v1) / math_log(h2 / h1);
+}
+
+// ─── Jensen wake model ───
+
+/// Fractional velocity deficit on the wake axis at distance x behind a
+/// rotor of diameter d with thrust coefficient ct and decay constant k
+/// (about 0.075 onshore, 0.04-0.05 offshore).
+pub fn wind_jensen_deficit(ct: f64, k: f64, d: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    val r0: f64 = d / 2.0;
+    val g: f64 = 1.0 + k * x / r0;
+    return (1.0 - math_sqrt(1.0 - ct)) / (g * g);
+}
+
+/// Area of the intersection of circles of radii r1, r2 with centres d apart.
+pub fn wind_circle_overlap(r1: f64, r2: f64, d: f64) -> f64 {
+    if d >= r1 + r2 {
+        return 0.0;
+    }
+    val rmin: f64 = math_min_f64(r1, r2);
+    if d <= math_fabs(r1 - r2) {
+        return wind_pi() * rmin * rmin;
+    }
+    val a1: f64 = math_clamp_f64((d * d + r1 * r1 - r2 * r2) / (2.0 * d * r1), -1.0, 1.0);
+    val a2: f64 = math_clamp_f64((d * d + r2 * r2 - r1 * r1) / (2.0 * d * r2), -1.0, 1.0);
+    val t1: f64 = complex_arg(complex(a1, math_sqrt(1.0 - a1 * a1)));
+    val t2: f64 = complex_arg(complex(a2, math_sqrt(1.0 - a2 * a2)));
+    val tri: f64 = 0.5 * math_sqrt(math_max_f64(0.0, (0.0 - d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)));
+    return r1 * r1 * t1 + r2 * r2 * t2 - tri;
+}
+
+/// Deficit seen by a rotor (same diameter) at distance x downstream and
+/// lateral offset y: the axial deficit times the shaded fraction of its
+/// swept area.
+pub fn wind_jensen_rotor_deficit(ct: f64, k: f64, d: f64, x: f64, y: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    val rw: f64 = d / 2.0 + k * x;
+    val r: f64 = d / 2.0;
+    val frac: f64 = wind_circle_overlap(rw, r, math_fabs(y)) / (wind_pi() * r * r);
+    return wind_jensen_deficit(ct, k, d, x) * frac;
+}
+
+/// Speeds at turbines (xs[i], ys[i]) for free stream u0 along +x, every
+/// turbine with diameter d and thrust coefficient ct; wakes combined by
+/// root-sum-square of deficits.
+pub fn wind_farm_speeds(xs: &Vec<f64>, ys: &Vec<f64>, u0: f64, ct: f64, k: f64, d: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < xs.len() {
+        var ss: f64 = 0.0;
+        var j: i64 = 0;
+        while j < xs.len() {
+            if j != i {
+                val dx: f64 = xs.get(i) - xs.get(j);
+                if dx > 0.0 {
+                    val df: f64 = wind_jensen_rotor_deficit(ct, k, d, dx, ys.get(i) - ys.get(j));
+                    ss = ss + df * df;
+                }
+            }
+            j = j + 1;
+        }
+        out.push(u0 * (1.0 - math_sqrt(ss)));
+        i = i + 1;
+    }
+    return out;
+}

@@ -1,0 +1,90 @@
+// stdlib/openadr: build an oadrDistributeEvent with one EiEvent (signal with
+// intervals, target), parse it back, read signal values, report
+// registration, the opt reply, and the VEN state machine.
+// Expected output:
+// event: id EVT-1 mod 0 pri 1 status active ctx https://example.com/market
+// period: dtstart 2024-11-17T18:00:00Z dur PT1H
+// signal: SIMPLE type level intervals 3 values 0 1 0
+// value at 1: 1
+// ven target: VEN-01 group GRP-A
+// registered report: code 200 ven VEN-01
+// opt reply parse: optIn
+// ven: next oadrCreatePartyRegistration; after register oadrPoll; polls 2
+// ven event: active EVT-1 then opt optIn -> polling
+use openadr;
+use xml;
+use vec;
+use string;
+
+fn main() {
+    // Build an event
+    var ivs: Vec<OadrInterval> = Vec::new();
+    ivs.push(OadrInterval { duration: "PT20M", value: 0.0 });
+    ivs.push(OadrInterval { duration: "PT20M", value: 1.0 });
+    ivs.push(OadrInterval { duration: "PT20M", value: 0.0 });
+    val sig: OadrSignal = OadrSignal { name: "SIMPLE", signal_type: "level", intervals: ivs };
+    val ev: OadrEvent = OadrEvent {
+        event_id: "EVT-1", modification_number: 0, priority: 1,
+        market_context: "https://example.com/market", created: "2024-11-17T17:55:00Z",
+        status: OADR_STATUS_ACTIVE, dtstart: "2024-11-17T18:00:00Z", duration: "PT1H",
+        signal: sig, ven_id: "VEN-01", group_id: "GRP-A",
+    };
+    val payload: str = openadr_distribute_event("REQ-1", "VTN-A", & ev);
+
+    // Parse it back
+    val pe: OadrEvent = openadr_parse_distribute_event(payload);
+    println("event: id " + pe.event_id + " mod " + int_to_str(pe.modification_number) + " pri " + int_to_str(pe.priority) + " status " + openadr_status_name(pe.status) + " ctx " + pe.market_context);
+    println("period: dtstart " + pe.dtstart + " dur " + pe.duration);
+    var vals: str = "";
+    var i: i64 = 0;
+    while i < pe.signal.intervals.len() {
+        if i > 0 { vals = vals + " "; }
+        vals = vals + float_to_str(pe.signal.intervals.get(i).value);
+        i = i + 1;
+    }
+    println("signal: " + pe.signal.name + " type " + pe.signal.signal_type + " intervals " + int_to_str(pe.signal.intervals.len()) + " values " + vals);
+    println("value at 1: " + float_to_str(openadr_signal_value_at(& pe, 1)));
+    println("ven target: " + pe.ven_id + " group " + pe.group_id);
+
+    // Report registration round trip
+    val rr: str = openadr_registered_report("REQ-2", 200, "VEN-01");
+    val rrdoc: XmlDoc = xml_load(rr);
+    val code: str = deep_text(rrdoc.root, "ei:responseCode");
+    val ven: str = deep_text(rrdoc.root, "ei:venID");
+    println("registered report: code " + code + " ven " + ven);
+
+    // Opt reply
+    val created: str = openadr_created_event("REQ-3", "VEN-01", "EVT-1", 0, true);
+    println("opt reply parse: " + openadr_parse_opt(created));
+
+    // VEN state machine
+    var v: OadrVen = openadr_ven_new("VEN-01");
+    val n1: str = ven_next_request(& v);
+    ven_register(& mut v);
+    val n2: str = ven_next_request(& v);
+    ven_poll(& mut v);
+    ven_poll(& mut v);
+    println("ven: next " + n1 + "; after register " + n2 + "; polls " + int_to_str(v.poll_count));
+
+    ven_on_event(& mut v, "EVT-1");
+    val active: str = v.active_event;
+    ven_opt(& mut v, true);
+    var optstr: str = "optOut";
+    if v.last_opt_in { optstr = "optIn"; }
+    var statestr: str = "other";
+    if v.state == VEN_POLLING { statestr = "polling"; }
+    println("ven event: active " + active + " then opt " + optstr + " -> " + statestr);
+}
+
+fn deep_text(node: XmlNode, tag: str) -> str {
+    if str_equal(node.tag, tag) {
+        return node.text;
+    }
+    var i: i64 = 0;
+    while i < node.children.len() {
+        val r: str = deep_text(node.children.get(i), tag);
+        if str_len(r) > 0 { return r; }
+        i = i + 1;
+    }
+    return "";
+}

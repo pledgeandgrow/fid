@@ -1,0 +1,129 @@
+// stdlib/cookie.fd: Cookie and Set-Cookie (RFC 6265), the RFC 9110 date
+// example, HMAC-SHA512 against RFC 4231 test cases 1 and 2, signed values
+// (tampering, a moved cookie, a wrong secret) and the session store.
+// Expected output:
+// pairs 3 a=1 b=two c="q"
+// get b two
+// header a=1; b=two
+// sid=abc; Max-Age=3600; Path=/; Secure; HttpOnly; SameSite=Lax
+// refused none-without-secure true
+// refused bad-value true
+// refused host-prefix true
+// host ok __Host-id=1; Path=/; Secure
+// parsed id 42 path=/app domain=example.com secure=true httponly=true samesite=Strict maxage=-1
+// parsed bad-path path=
+// parsed no-eq name=
+// default-path /docs /
+// path-match true true false
+// domain-match true true false
+// date Sun, 06 Nov 1994 08:49:37 GMT
+// date Thu, 01 Jan 1970 00:00:00 GMT
+// date Tue, 29 Feb 2000 00:00:00 GMT
+// hmac1 87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854
+// hmac2 164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737
+// signed len 134
+// unsign ok user7
+// unsign tampered none
+// unsign other-name none
+// unsign wrong-secret none
+// id 0123456789abcdefffffffffffffffff
+// session created true again false
+// session get alice
+// session after-ttl none
+// session renewed alice
+// session destroyed none
+// sweep left 1
+
+use cookie;
+use sha512;
+
+fn show(o: Option<str>) -> str {
+    match o {
+        Option::Some(v) => { return v; }
+        Option::None => { return "none"; }
+    }
+    return "none";
+}
+
+fn b2s(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() {
+    val cs: Vec<Cookie> = cookie_parse_header(" a=1; b=two ;c=\"q\"; =x; noeq");
+    println("pairs " + int_to_str(cs.len()) + " " + cs.get(0).name + "=" + cs.get(0).value + " " + cs.get(1).name + "=" + cs.get(1).value + " " + cs.get(2).name + "=" + cs.get(2).value);
+    println("get b " + show(cookie_get(cs, "b")));
+    var two: Vec<Cookie> = Vec::new();
+    two.push(cs.get(0));
+    two.push(cs.get(1));
+    println("header " + cookie_header(two));
+
+    var sc: SetCookie = set_cookie_new("sid", "abc");
+    sc.has_max_age = true;
+    sc.max_age = 3600;
+    sc.path = "/";
+    sc.secure = true;
+    sc.http_only = true;
+    sc.same_site = "Lax";
+    println(set_cookie_serialize(sc));
+    var bad: SetCookie = set_cookie_new("sid", "abc");
+    bad.same_site = "None";
+    println("refused none-without-secure " + b2s(set_cookie_serialize(bad) == ""));
+    println("refused bad-value " + b2s(set_cookie_serialize(set_cookie_new("sid", "a b")) == ""));
+    var hp: SetCookie = set_cookie_new("__Host-id", "1");
+    hp.secure = true;
+    println("refused host-prefix " + b2s(set_cookie_serialize(hp) == ""));
+    hp.path = "/";
+    println("host ok " + set_cookie_serialize(hp));
+
+    val p: SetCookie = set_cookie_parse("id=42; path=/app; DOMAIN=.Example.COM; secure; HttpOnly; samesite=strict; max-age=-1");
+    println("parsed " + p.name + " " + p.value + " path=" + p.path + " domain=" + p.domain + " secure=" + b2s(p.secure) + " httponly=" + b2s(p.http_only) + " samesite=" + p.same_site + " maxage=" + int_to_str(p.max_age));
+    println("parsed bad-path path=" + set_cookie_parse("a=b; Path=relative").path);
+    println("parsed no-eq name=" + set_cookie_parse("justtext; Secure").name);
+    println("default-path " + cookie_default_path("/docs/page") + " " + cookie_default_path("/x"));
+    println("path-match " + b2s(cookie_path_match("/docs", "/docs/a")) + " " + b2s(cookie_path_match("/docs/", "/docs/a")) + " " + b2s(cookie_path_match("/docs", "/docsx")));
+    println("domain-match " + b2s(cookie_domain_match("example.com", "example.com")) + " " + b2s(cookie_domain_match("example.com", "WWW.example.com")) + " " + b2s(cookie_domain_match("example.com", "badexample.com")));
+
+    println("date " + cookie_http_date(784111777));
+    println("date " + cookie_http_date(0));
+    println("date " + cookie_http_date(951782400));
+
+    var k1: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 20 {
+        k1.push(11);
+        i = i + 1;
+    }
+    println("hmac1 " + sha512_hex(cookie_hmac_sha512(k1, str_bytes("Hi There"))));
+    println("hmac2 " + sha512_hex(cookie_hmac_sha512(str_bytes("Jefe"), str_bytes("what do ya want for nothing?"))));
+
+    val signed: str = cookie_sign("s3cret", "uid", "user7");
+    println("signed len " + int_to_str(str_len(signed)));
+    println("unsign ok " + show(cookie_unsign("s3cret", "uid", signed)));
+    val tampered: str = "user8" + str_slice(signed, 5, str_len(signed));
+    println("unsign tampered " + show(cookie_unsign("s3cret", "uid", tampered)));
+    println("unsign other-name " + show(cookie_unsign("s3cret", "admin", signed)));
+    println("unsign wrong-secret " + show(cookie_unsign("other", "uid", signed)));
+
+    var w: Vec<i64> = Vec::new();
+    w.push(81985529216486895);
+    w.push(0 - 1);
+    println("id " + session_id_from_words(w));
+    var st: SessionStore = session_store_new(100);
+    val c1: bool = session_create(& mut st, "s1", 1000);
+    val c2: bool = session_create(& mut st, "s1", 1001);
+    println("session created " + b2s(c1) + " again " + b2s(c2));
+    session_set(& mut st, "s1", "user", "alice", 1010);
+    println("session get " + show(session_get(& st, "s1", "user", 1050)));
+    println("session after-ttl " + show(session_get(& st, "s1", "user", 1111)));
+    session_create(& mut st, "s2", 2000);
+    session_set(& mut st, "s2", "user", "alice", 2000);
+    session_touch(& mut st, "s2", 2090);
+    println("session renewed " + show(session_get(& st, "s2", "user", 2150)));
+    session_destroy(& mut st, "s2");
+    println("session destroyed " + show(session_get(& st, "s2", "user", 2150)));
+    session_create(& mut st, "s3", 3000);
+    session_create(& mut st, "s4", 3050);
+    println("sweep left " + int_to_str(session_sweep(& mut st, 3120)));
+}

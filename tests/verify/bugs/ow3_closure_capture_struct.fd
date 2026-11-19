@@ -1,0 +1,52 @@
+// Log OW3 (docs/verification/miscompile-log.md; VF11,
+// scripts/verify/own_diff.py --ext closure). A closure owns what it captured
+// (closures capture by value, reference §4.6) and reads it when called;
+// when the closure's variable goes out of scope its environment must be
+// dropped. With stage 0 of Nov 16, for a captured struct holding a Vec:
+// (a) calling the closure reads garbage: `fid run` prints (4920) and
+// (4880) for the two calls (n read from the wrong word), C (`--leaks`,
+// `--checked-alloc`) prints an address in place of the string — every
+// closure call of the own_diff runs disagreed with the model, on every
+// mode; (b) `fid run --leaks` reports one 16-byte block per closure made,
+// allocated on the line of the closure (26 of 77 closure programs of the
+// Nov 18 runs leaked one block per `fn() ...`), plus the string made in
+// each call.
+// Check: fid run tests/verify/bugs/ow3_closure_capture_struct.fd --leaks must
+// print the lines below and "fid --leaks: every block was freed".
+//> (0)
+//> (1)
+//> (0)
+
+struct Bx {
+    n: i64,
+    kids: Vec<Bx>,
+}
+
+fn bx_show(b: &Bx) -> str {
+    var s: str = "(" + int_to_str(b.n);
+    var i: i64 = 0;
+    while i < b.kids.len() {
+        s = s + " " + bx_show(&b.kids.get(i));
+        i = i + 1;
+    }
+    return s + ")";
+}
+
+fn show_later() {
+    var a: Bx = Bx { n: 0, kids: Vec::new() };
+    val c = fn() -> str { return bx_show(&a); };
+    a.n = a.n + 1;
+    println(c());
+    println(bx_show(&a));
+}
+
+fn main() -> i64 {
+    show_later();
+    {
+        var b: Bx = Bx { n: 0, kids: Vec::new() };
+        val d = fn() -> str { return bx_show(&b); };
+        val e = d;
+        println(e());
+    }
+    return 0;
+}

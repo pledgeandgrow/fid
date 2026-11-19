@@ -1,0 +1,96 @@
+// PL4: tasks switch stacks under `fid wasm` (compiler/wasm.fd, "Tasks").
+// Every part needs a task to stop in the middle and another to run: two
+// players take turns through a global (a task run to its end when started
+// would wait for its turn for ever), tasks give control away 200 calls
+// deep with a struct in every frame and must find their frames intact,
+// and a task awaits async calls that sleep. Not in tests/bootstrap: the
+// interpreter runs a task to its end when it starts (compiler/interp.fd),
+// so it cannot be the reference; tests/wasm/task-switch-check.sh compares
+// with test_wasm_task_switch.expected.
+//
+// Expected output:
+//   100
+//   992123766
+//   20101
+//   20102
+//   180
+//   21
+//   true
+//   tasks switch
+use task;
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+var g_turn: i64 = 0;
+var g_seq: i64 = 0;
+
+/// Takes its turn 50 times: waits, yielding, until g_turn says it may
+fn player(me: i64) -> i64 {
+    var done: i64 = 0;
+    var spins: i64 = 0;
+    while done < 50 {
+        if g_turn == me {
+            g_seq = (g_seq * 2) % 1000000007 + me;
+            g_turn = 1 - me;
+            done = done + 1;
+        }
+        task_yield();
+        spins = spins + 1;
+        if spins > 100000 {
+            return 0 - 1;
+        }
+    }
+    return done;
+}
+
+/// n frames down, each with a struct of its own, then gives control away
+fn deep(n: i64, me: i64) -> i64 {
+    if n == 0 {
+        task_yield();
+        task_yield();
+        return me;
+    }
+    var p: Pair = Pair { a: n, b: me * 1000 + n };
+    val r: i64 = deep(n - 1, me);
+    return r + p.a + (p.b - me * 1000 - n);
+}
+
+fn diver(me: i64) -> i64 {
+    return deep(200, me);
+}
+
+async fn later(x: i64) -> Future<i64> {
+    task_sleep(20);
+    return x * 3;
+}
+
+fn waiter(x: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 5 {
+        total = total + (await later(x + i));
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    val a = task_go("player", 0);
+    val b = task_go("player", 1);
+    val d0 = task_go("diver", 1);
+    val d1 = task_go("diver", 2);
+    val w = task_go("waiter", 10);
+    val n = task_run();
+    println(task_result(a) + task_result(b));
+    println(g_seq);
+    println(task_result(d0));
+    println(task_result(d1));
+    println(task_result(w));
+    println(await later(7));
+    println(n >= 5);
+    println("tasks switch");
+    return 0;
+}

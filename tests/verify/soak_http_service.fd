@@ -1,0 +1,56 @@
+// Socket soak service (release-roadmap I6; scripts/verify/soak_http.py).
+// An HTTP server on a real socket, served with `http_serve_scoped` (the
+// request's strings and the response are freed after each response), so
+// its memory must stay flat under any amount of load:
+//
+//   soak_http_service [port]        (default 8099; runs until killed)
+//
+//   GET  /             "ok\n"
+//   GET  /item?id=N    {"id": N, "double": 2N, "name": "item<N mod 997>"}
+//   POST /echo         the body back
+//   anything else      404 "not found\n"
+//
+// Every reply is a function of the request alone, so the load generator
+// checks each body. On a port it cannot open it prints "cannot listen on
+// <port>" and exits 1.
+
+use http;
+
+fn soak_item(query: str) -> str {
+    var id: i64 = 0;
+    if str_starts_with(query, "id=") {
+        id = str_parse_int(str_slice(query, 3, str_len(query)));
+    }
+    return "{\"id\": " + int_to_str(id) + ", \"double\": " + int_to_str(id * 2)
+        + ", \"name\": \"item" + int_to_str(id % 997) + "\"}";
+}
+
+fn soak_route(req: ScopedRequest) -> str {
+    if req.method == "GET" && req.path == "/" {
+        return build_response(200, "text/plain", "ok\n");
+    }
+    if req.method == "GET" && req.path == "/item" {
+        return build_response(200, "application/json", soak_item(str_clone(req.query)));
+    }
+    if req.method == "POST" && req.path == "/echo" {
+        return build_response(200, "text/plain", str_clone(req.body));
+    }
+    return build_response(404, "text/plain", "not found\n");
+}
+
+fn main() -> i64 {
+    var port: i64 = 8099;
+    match arg_at(1) {
+        Option::Some(a) => {
+            port = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    println("listening on " + int_to_str(port));
+    if !http_serve_scoped(port, soak_route) {
+        println("cannot listen on " + int_to_str(port));
+        return 1;
+    }
+    return 0;
+}

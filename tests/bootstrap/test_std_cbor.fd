@@ -1,0 +1,335 @@
+// stdlib/cbor: every example of RFC 8949 Appendix A decoded (diagnostic notation or value checked) and re-encoded byte for byte, the encoder's preferred serialization, and malformed input.
+// Expected output:
+// appendix A: 74 of 74 diagnostics match
+// appendix A: 97 of 97 re-encode to the same bytes
+// floats: 23 of 23 values match
+// encoder: 41 of 41 items as in appendix A
+// accessors: Fun=true Amt=-2 n=2
+// malformed: 9 of 9 rejected
+use cbor;
+use vec;
+use string;
+use encoding;
+
+var diag_ok: i64 = 0;
+var diag_n: i64 = 0;
+var enc_ok: i64 = 0;
+var enc_n: i64 = 0;
+
+// Decode `hex`, compare its diagnostic notation with `want` (unless empty)
+// and its re-encoding with the input.
+fn ex(hex: str, want: str) {
+    val bytes: Vec<i64> = hex_decode_bytes(hex);
+    val d: CborDoc = cbor_decode_all(bytes);
+    if !d.ok {
+        println("decode error " + hex + ": " + d.error);
+        return;
+    }
+    if want != "" {
+        diag_n = diag_n + 1;
+        val got: str = cbor_diag(&d, d.root);
+        if got == want {
+            diag_ok = diag_ok + 1;
+        } else {
+            println("diag " + hex + ": got " + got + " want " + want);
+        }
+    }
+    enc_n = enc_n + 1;
+    val again: str = cbor_hex(cbor_encode(&d, d.root));
+    if again == hex {
+        enc_ok = enc_ok + 1;
+    } else {
+        println("re-encode " + hex + ": got " + again);
+    }
+}
+
+var fl_ok: i64 = 0;
+var fl_n: i64 = 0;
+
+fn fl(hex: str, want: f64) {
+    fl_n = fl_n + 1;
+    ex(hex, "");
+    val d: CborDoc = cbor_decode_all(hex_decode_bytes(hex));
+    val got: f64 = cbor_float(&d, d.root);
+    var same: bool = p_f64_to_bits(got) == p_f64_to_bits(want);
+    if want != want {
+        same = got != got;
+    }
+    if same {
+        fl_ok = fl_ok + 1;
+    } else {
+        println("float " + hex + ": got " + float_to_str(got));
+    }
+}
+
+var put_ok: i64 = 0;
+var put_n: i64 = 0;
+
+fn put(out: Vec<i64>, hex: str) {
+    put_n = put_n + 1;
+    val got: str = cbor_hex(out);
+    if got == hex {
+        put_ok = put_ok + 1;
+    } else {
+        println("encode: got " + got + " want " + hex);
+    }
+}
+
+fn pint(v: i64, hex: str) {
+    var o: Vec<i64> = Vec::new();
+    cbor_put_int(&mut o, v);
+    put(o, hex);
+}
+
+fn pfl(x: f64, hex: str) {
+    var o: Vec<i64> = Vec::new();
+    cbor_put_float(&mut o, x);
+    put(o, hex);
+}
+
+fn ptext(s: str, hex: str) {
+    var o: Vec<i64> = Vec::new();
+    cbor_put_text(&mut o, s);
+    put(o, hex);
+}
+
+var bad_ok: i64 = 0;
+var bad_n: i64 = 0;
+
+fn bad(hex: str) {
+    bad_n = bad_n + 1;
+    val d: CborDoc = cbor_decode_all(hex_decode_bytes(hex));
+    if !d.ok {
+        bad_ok = bad_ok + 1;
+    } else {
+        println("accepted malformed " + hex);
+    }
+}
+
+fn main() {
+    // Integers
+    ex("00", "0");
+    ex("01", "1");
+    ex("0a", "10");
+    ex("17", "23");
+    ex("1818", "24");
+    ex("1819", "25");
+    ex("1864", "100");
+    ex("1903e8", "1000");
+    ex("1a000f4240", "1000000");
+    ex("1b000000e8d4a51000", "1000000000000");
+    ex("1bffffffffffffffff", "18446744073709551615");
+    ex("c249010000000000000000", "2(h'010000000000000000')");
+    ex("3bffffffffffffffff", "-18446744073709551616");
+    ex("c349010000000000000000", "3(h'010000000000000000')");
+    ex("20", "-1");
+    ex("29", "-10");
+    ex("3863", "-100");
+    ex("3903e7", "-1000");
+    // Floats with a short exact form
+    ex("f90000", "0.0");
+    ex("f98000", "-0.0");
+    ex("f93c00", "1.0");
+    ex("f93e00", "1.5");
+    ex("f97bff", "65504.0");
+    ex("fa47c35000", "100000.0");
+    ex("f9c400", "-4.0");
+    ex("f97c00", "Infinity");
+    ex("f97e00", "NaN");
+    ex("f9fc00", "-Infinity");
+    ex("fa7f800000", "Infinity");
+    ex("fa7fc00000", "NaN");
+    ex("faff800000", "-Infinity");
+    ex("fb7ff0000000000000", "Infinity");
+    ex("fb7ff8000000000000", "NaN");
+    ex("fbfff0000000000000", "-Infinity");
+    // Simple values
+    ex("f4", "false");
+    ex("f5", "true");
+    ex("f6", "null");
+    ex("f7", "undefined");
+    ex("f0", "simple(16)");
+    ex("f8ff", "simple(255)");
+    // Tags
+    ex("c074323031332d30332d32315432303a30343a30305a", "0(\"2013-03-21T20:04:00Z\")");
+    ex("c11a514b67b0", "1(1363896240)");
+    ex("d74401020304", "23(h'01020304')");
+    ex("d818456449455446", "24(h'6449455446')");
+    ex("d82076687474703a2f2f7777772e6578616d706c652e636f6d", "32(\"http://www.example.com\")");
+    // Strings
+    ex("40", "h''");
+    ex("4401020304", "h'01020304'");
+    ex("60", "\"\"");
+    ex("6161", "\"a\"");
+    ex("6449455446", "\"IETF\"");
+    ex("62225c", "\"\\\"\\\\\"");
+    ex("62c3bc", "\"\\u00fc\"");
+    ex("63e6b0b4", "\"\\u6c34\"");
+    ex("64f0908591", "\"\\ud800\\udd51\"");
+    // Arrays and maps
+    ex("80", "[]");
+    ex("83010203", "[1, 2, 3]");
+    ex("8301820203820405", "[1, [2, 3], [4, 5]]");
+    ex("98190102030405060708090a0b0c0d0e0f101112131415161718181819", "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]");
+    ex("a0", "{}");
+    ex("a201020304", "{1: 2, 3: 4}");
+    ex("a26161016162820203", "{\"a\": 1, \"b\": [2, 3]}");
+    ex("826161a161626163", "[\"a\", {\"b\": \"c\"}]");
+    ex("a56161614161626142616361436164614461656145", "{\"a\": \"A\", \"b\": \"B\", \"c\": \"C\", \"d\": \"D\", \"e\": \"E\"}");
+    // Indefinite length
+    ex("5f42010243030405ff", "(_ h'0102', h'030405')");
+    ex("7f657374726561646d696e67ff", "(_ \"strea\", \"ming\")");
+    ex("9fff", "[_ ]");
+    ex("9f018202039f0405ffff", "[_ 1, [2, 3], [_ 4, 5]]");
+    ex("9f01820203820405ff", "[_ 1, [2, 3], [4, 5]]");
+    ex("83018202039f0405ff", "[1, [2, 3], [_ 4, 5]]");
+    ex("83019f0203ff820405", "[1, [_ 2, 3], [4, 5]]");
+    ex("9f0102030405060708090a0b0c0d0e0f101112131415161718181819ff", "[_ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]");
+    ex("bf61610161629f0203ffff", "{_ \"a\": 1, \"b\": [_ 2, 3]}");
+    ex("826161bf61626163ff", "[\"a\", {_ \"b\": \"c\"}]");
+    ex("bf6346756ef563416d7421ff", "{_ \"Fun\": true, \"Amt\": -2}");
+    // Floats whose shortest decimal form is long: checked by value
+    fl("fb3ff199999999999a", 1.1);
+    fl("fa7f7fffff", 3.4028234663852886e+38);
+    fl("fb7e37e43c8800759c", 1.0e+300);
+    fl("f90001", 5.960464477539063e-8);
+    fl("f90400", 0.00006103515625);
+    fl("fbc010666666666666", 0.0 - 4.1);
+    fl("f90000", 0.0);
+    fl("f98000", cbor_negate(0.0));
+    fl("f93c00", 1.0);
+    fl("f93e00", 1.5);
+    fl("f97bff", 65504.0);
+    fl("fa47c35000", 100000.0);
+    fl("f9c400", 0.0 - 4.0);
+    fl("f97c00", 1.0 / 0.0);
+    fl("f97e00", 0.0 / 0.0);
+    fl("f9fc00", 0.0 - 1.0 / 0.0);
+    fl("fa7f800000", 1.0 / 0.0);
+    fl("fa7fc00000", 0.0 / 0.0);
+    fl("faff800000", 0.0 - 1.0 / 0.0);
+    fl("fb7ff0000000000000", 1.0 / 0.0);
+    fl("fb7ff8000000000000", 0.0 / 0.0);
+    fl("fbfff0000000000000", 0.0 - 1.0 / 0.0);
+    // 1(1363896240.5): the tag's content
+    fl_n = fl_n + 1;
+    ex("c1fb41d452d9ec200000", "");
+    val tagged: CborDoc = cbor_decode_all(hex_decode_bytes("c1fb41d452d9ec200000"));
+    if cbor_float(&tagged, cbor_tag_content(&tagged, tagged.root)) == 1363896240.5 && cbor_tag(&tagged, tagged.root) == 1 {
+        fl_ok = fl_ok + 1;
+    } else {
+        println("tag 1 float content wrong");
+    }
+    println("appendix A: " + int_to_str(diag_ok) + " of " + int_to_str(diag_n) + " diagnostics match");
+    println("appendix A: " + int_to_str(enc_ok) + " of " + int_to_str(enc_n) + " re-encode to the same bytes");
+    println("floats: " + int_to_str(fl_ok) + " of " + int_to_str(fl_n) + " values match");
+
+    // The encoder from values
+    pint(0, "00");
+    pint(1, "01");
+    pint(10, "0a");
+    pint(23, "17");
+    pint(24, "1818");
+    pint(25, "1819");
+    pint(100, "1864");
+    pint(1000, "1903e8");
+    pint(1000000, "1a000f4240");
+    pint(1000000000000, "1b000000e8d4a51000");
+    pint(0 - 1, "20");
+    pint(0 - 10, "29");
+    pint(0 - 100, "3863");
+    pint(0 - 1000, "3903e7");
+    var o1: Vec<i64> = Vec::new();
+    cbor_put_uint(&mut o1, 0 - 1);
+    put(o1, "1bffffffffffffffff");
+    var o2: Vec<i64> = Vec::new();
+    cbor_put_negint_raw(&mut o2, 0 - 1);
+    put(o2, "3bffffffffffffffff");
+    pfl(0.0, "f90000");
+    pfl(cbor_negate(0.0), "f98000");
+    pfl(1.0, "f93c00");
+    pfl(1.1, "fb3ff199999999999a");
+    pfl(1.5, "f93e00");
+    pfl(65504.0, "f97bff");
+    pfl(100000.0, "fa47c35000");
+    pfl(3.4028234663852886e+38, "fa7f7fffff");
+    pfl(1.0e+300, "fb7e37e43c8800759c");
+    pfl(5.960464477539063e-8, "f90001");
+    pfl(0.00006103515625, "f90400");
+    pfl(0.0 - 4.0, "f9c400");
+    pfl(0.0 - 4.1, "fbc010666666666666");
+    pfl(1.0 / 0.0, "f97c00");
+    pfl(0.0 / 0.0, "f97e00");
+    pfl(0.0 - 1.0 / 0.0, "f9fc00");
+    ptext("IETF", "6449455446");
+    ptext(str_from_bytes(hex_decode_bytes("c3bc")), "62c3bc");
+    ptext("http://www.example.com", "76687474703a2f2f7777772e6578616d706c652e636f6d");
+    var o3: Vec<i64> = Vec::new();
+    cbor_put_tag(&mut o3, 1);
+    cbor_put_int(&mut o3, 1363896240);
+    put(o3, "c11a514b67b0");
+    var o4: Vec<i64> = Vec::new();
+    cbor_put_array_head(&mut o4, 3);
+    cbor_put_int(&mut o4, 1);
+    cbor_put_array_head(&mut o4, 2);
+    cbor_put_int(&mut o4, 2);
+    cbor_put_int(&mut o4, 3);
+    cbor_put_indef(&mut o4, 4);
+    cbor_put_int(&mut o4, 4);
+    cbor_put_int(&mut o4, 5);
+    cbor_put_break(&mut o4);
+    put(o4, "83018202039f0405ff");
+    var o5: Vec<i64> = Vec::new();
+    cbor_put_indef(&mut o5, 5);
+    cbor_put_text(&mut o5, "Fun");
+    cbor_put_bool(&mut o5, true);
+    cbor_put_text(&mut o5, "Amt");
+    cbor_put_int(&mut o5, 0 - 2);
+    cbor_put_break(&mut o5);
+    put(o5, "bf6346756ef563416d7421ff");
+    var o6: Vec<i64> = Vec::new();
+    cbor_put_simple(&mut o6, 16);
+    cbor_put_simple(&mut o6, 255);
+    cbor_put_null(&mut o6);
+    cbor_put_undefined(&mut o6);
+    put(o6, "f0f8fff6f7");
+    var o7: Vec<i64> = Vec::new();
+    cbor_put_indef(&mut o7, 2);
+    var c1: Vec<i64> = Vec::new();
+    c1.push(1);
+    c1.push(2);
+    cbor_put_bytes(&mut o7, c1);
+    var c2: Vec<i64> = Vec::new();
+    c2.push(3);
+    c2.push(4);
+    c2.push(5);
+    cbor_put_bytes(&mut o7, c2);
+    cbor_put_break(&mut o7);
+    put(o7, "5f42010243030405ff");
+    var o8: Vec<i64> = Vec::new();
+    cbor_put_map_head(&mut o8, 2);
+    cbor_put_int(&mut o8, 1);
+    cbor_put_int(&mut o8, 2);
+    cbor_put_int(&mut o8, 3);
+    cbor_put_int(&mut o8, 4);
+    put(o8, "a201020304");
+    println("encoder: " + int_to_str(put_ok) + " of " + int_to_str(put_n) + " items as in appendix A");
+
+    // Accessors on {_ "Fun": true, "Amt": -2}
+    val m: CborDoc = cbor_decode_all(o5);
+    val fun: i64 = cbor_map_get(&m, m.root, "Fun");
+    val amt: i64 = cbor_map_get(&m, m.root, "Amt");
+    println("accessors: Fun=" + bool_to_str(cbor_bool(&m, fun)) + " Amt=" + int_to_str(cbor_int(&m, amt)) + " n=" + int_to_str(cbor_len(&m, m.root)));
+
+    // Malformed (RFC 8949 Appendix F examples)
+    bad("1c");          // reserved additional information
+    bad("1f");          // indefinite length on major type 0
+    bad("ff");          // break outside an indefinite item
+    bad("f818");        // two-byte simple value below 32
+    bad("8301");        // array cut short
+    bad("1a0102");      // argument cut short
+    bad("5f01ff");      // an integer chunk in an indefinite byte string
+    bad("0001");        // extra bytes after the item
+    bad("7f5f4100ffff"); // an indefinite chunk inside an indefinite string
+    println("malformed: " + int_to_str(bad_ok) + " of " + int_to_str(bad_n) + " rejected");
+}

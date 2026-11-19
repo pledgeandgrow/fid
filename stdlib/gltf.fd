@@ -11,7 +11,7 @@
 // PBR material parameters beyond baseColorFactor, sparse accessors,
 // KHR extensions, Draco/meshopt compression.
 
-use vec; use string; use json; use math; use mesh;
+use vec; use json; use math; use mesh;
  pub const GLB_MAGIC: i64 = 0x46546C67;  // "glTF" little-endian
 pub const GLB_JSON: i64 = 0x4E4F534A;  // "JSON"
 pub const GLB_BIN: i64 = 0x004E4942;  // "BIN\0"
@@ -40,12 +40,15 @@ fn rd_i8(b: Vec<i64>, o: i64) -> i64 {
     return v;
 }
 
-/// Parsed asset: `json` is the canonicalized JSON document; `bin_off`/
-/// `bin_len` locate the BIN chunk inside `b` for GLB sources (bin_len 0
-/// for JSON-only .gltf — caller supplies the .bin blob as `b` then).
+/// Parsed asset: `json` is the JSON document's text and `doc` its index
+/// (json.fd json_index: scanned once, every lookup below walks its nodes
+/// instead of rescanning the text); `bin_off`/`bin_len` locate the BIN
+/// chunk inside `b` for GLB sources (bin_len 0 for JSON-only .gltf —
+/// caller supplies the .bin blob as `b` then).
 pub struct GltfDoc {
     pub ok: bool,
     pub json: str,
+    pub doc: JsonDoc,
     pub bin_off: i64,
     pub bin_len: i64,
 }
@@ -54,7 +57,7 @@ pub struct GltfDoc {
 /// ok=false when magic/version/length don't check out.
 pub fn gltf_open(b: Vec<i64>) -> GltfDoc {
     var d: GltfDoc = GltfDoc {
-        ok: false, json: "", bin_off: 0, bin_len: 0
+        ok: false, json: "", doc: json_index(""), bin_off: 0, bin_len: 0
     };
     if b.len() < 20 {
         return d;
@@ -84,7 +87,7 @@ pub fn gltf_open(b: Vec<i64>) -> GltfDoc {
                 jb.push(b.get(off + 8 + i));
                 i = i + 1;
             }
-            js = json_parse_safe(str_from_bytes(jb));
+            js = str_from_bytes(jb);
         } else {
             if ctype == GLB_BIN {
                 d.bin_off = off + 8;
@@ -95,6 +98,10 @@ pub fn gltf_open(b: Vec<i64>) -> GltfDoc {
         // chunks 4-aligned
     }
     if str_len(js) == 0 {
+        return d;
+    }
+    d.doc = json_index(js);
+    if !d.doc.ok {
         return d;
     }
     d.ok = true;
@@ -109,43 +116,34 @@ pub fn gltf_open(b: Vec<i64>) -> GltfDoc {
 ///   var d = gltf_open_json("{\"meshes\":[{\"name\":\"tri\"}]}");
 ///   println(int_to_str(gltf_mesh_count(d)));   // 1
 pub fn gltf_open_json(j: str) -> GltfDoc {
+    val doc: JsonDoc = json_index(j);
+    // ok=false when the text is not valid JSON
+    val ok: bool = doc.ok;
     var d: GltfDoc = GltfDoc {
-        ok: true, json: json_parse_safe(j), bin_off: 0, bin_len: 0
+        ok: ok, json: j, doc: doc, bin_off: 0, bin_len: 0
     };
     return d;
 }
 
-fn gltf_array(d: GltfDoc, key: str) -> str {
-    if !json_has(d.json, key) {
-        return "";
+// The node of top-level array `key`, -1 when it is absent or not an array.
+fn gltf_array(d: GltfDoc, key: str) -> i64 {
+    val a: i64 = jd_get(& d.doc, jd_root(& d.doc), key);
+    if jd_kind(& d.doc, a) != JSON_ARRAY {
+        return - 1;
     }
-    return json_get_safe(d.json, key);
+    return a;
 }
 
-fn gltf_elem(d: GltfDoc, key: str, i: i64) -> str {
-    var a: str = gltf_array(d, key);
-    if str_len(a) == 0 {
-        return "";
-    }
-    if i < 0 || i >= json_len_safe(a) {
-        return "";
-    }
-    return json_at_safe(a, i);
+// Element `i` of top-level array `key`, -1 when out of range.
+fn gltf_elem(d: GltfDoc, key: str, i: i64) -> i64 {
+    return jd_at(& d.doc, gltf_array(d, key), i);
 }
 
 pub fn gltf_mesh_count(d: GltfDoc) -> i64 {
-    var a: str = gltf_array(d, "meshes");
-    if str_len(a) == 0 {
-        return 0;
-    }
-    return json_len_safe(a);
+    return jd_len(& d.doc, gltf_array(d, "meshes"));
 }
 pub fn gltf_node_count(d: GltfDoc) -> i64 {
-    var a: str = gltf_array(d, "nodes");
-    if str_len(a) == 0 {
-        return 0;
-    }
-    return json_len_safe(a);
+    return jd_len(& d.doc, gltf_array(d, "nodes"));
 }
 
 // --- accessors --------------------------------------------------------------
@@ -215,27 +213,28 @@ pub fn gltf_acc(d: GltfDoc, ai: i64, base: i64) -> GltfAcc {
     var a: GltfAcc = GltfAcc {
         ok: false, off: 0, stride: 0, count: 0, ctype: 0, csize: 0, ncomp: 0, norm: false
     };
-    var acc: str = gltf_elem(d, "accessors", ai);
-    if str_len(acc) == 0 {
+    val acc: i64 = gltf_elem(d, "accessors", ai);
+    if jd_kind(& d.doc, acc) != JSON_OBJECT {
         return a;
     }
-    if !json_has(acc, "bufferView") {
+    val bvi: i64 = jd_get(& d.doc, acc, "bufferView");
+    if bvi < 0 {
         return a;
     }
-    var bv: str = gltf_elem(d, "bufferViews", json_get_int(acc, "bufferView", - 1));
-    if str_len(bv) == 0 {
+    val bv: i64 = gltf_elem(d, "bufferViews", jd_int(& d.doc, bvi, - 1));
+    if jd_kind(& d.doc, bv) != JSON_OBJECT {
         return a;
     }
-    a.ctype = json_get_int(acc, "componentType", 0);
+    a.ctype = jd_int(& d.doc, jd_get(& d.doc, acc, "componentType"), 0);
     a.csize = gltf_comp_size(a.ctype);
-    a.ncomp = gltf_type_count(json_get_str(acc, "type"));
+    a.ncomp = gltf_type_count(jd_str(& d.doc, jd_get(& d.doc, acc, "type")));
     if a.csize == 0 || a.ncomp == 0 {
         return a;
     }
-    a.count = json_get_int(acc, "count", 0);
-    a.norm = json_get_bool(acc, "normalized", false);
-    a.off = base + json_get_int(bv, "byteOffset", 0) + json_get_int(acc, "byteOffset", 0);
-    a.stride = json_get_int(bv, "byteStride", 0);
+    a.count = jd_int(& d.doc, jd_get(& d.doc, acc, "count"), 0);
+    a.norm = jd_bool(& d.doc, jd_get(& d.doc, acc, "normalized"), false);
+    a.off = base + jd_int(& d.doc, jd_get(& d.doc, bv, "byteOffset"), 0) + jd_int(& d.doc, jd_get(& d.doc, acc, "byteOffset"), 0);
+    a.stride = jd_int(& d.doc, jd_get(& d.doc, bv, "byteStride"), 0);
     if a.stride == 0 {
         a.stride = a.csize * a.ncomp;
     }
@@ -321,25 +320,25 @@ pub fn gltf_acc_f32_at(b: Vec<i64>, a: GltfAcc, i: i64, j: i64) -> f64 {
 /// the mesh/primitive or its POSITION accessor is missing.
 pub fn gltf_mesh(b: Vec<i64>, d: GltfDoc, mi: i64, pi: i64) -> Mesh {
     var m: Mesh = mesh_create();
-    var me: str = gltf_elem(d, "meshes", mi);
-    if str_len(me) == 0 {
+    val me: i64 = gltf_elem(d, "meshes", mi);
+    if jd_kind(& d.doc, me) != JSON_OBJECT {
         m.valid = false;
         return m;
     }
-    m.name = json_get_str(me, "name");
-    var prims: str = json_get_safe(me, "primitives");
-    if str_len(prims) == 0 || pi >= json_len_safe(prims) {
+    m.name = jd_str(& d.doc, jd_get(& d.doc, me, "name"));
+    val prims: i64 = jd_get(& d.doc, me, "primitives");
+    if jd_kind(& d.doc, prims) != JSON_ARRAY || pi >= jd_len(& d.doc, prims) {
         m.valid = false;
         return m;
     }
-    var pr: str = json_at_safe(prims, pi);
-    var attrs: str = json_get_safe(pr, "attributes");
-    if str_len(attrs) == 0 {
+    val pr: i64 = jd_at(& d.doc, prims, pi);
+    val attrs: i64 = jd_get(& d.doc, pr, "attributes");
+    if jd_kind(& d.doc, attrs) != JSON_OBJECT {
         m.valid = false;
         return m;
     }
     var base: i64 = d.bin_off;
-    var pa: GltfAcc = gltf_acc(d, json_get_int(attrs, "POSITION", - 1), base);
+    var pa: GltfAcc = gltf_acc(d, jd_int(& d.doc, jd_get(& d.doc, attrs, "POSITION"), - 1), base);
     if !pa.ok || pa.ncomp < 3 {
         m.valid = false;
         return m;
@@ -349,7 +348,7 @@ pub fn gltf_mesh(b: Vec<i64>, d: GltfDoc, mi: i64, pi: i64) -> Mesh {
         m.vertices.push(vertex_create(gltf_acc_f32_at(b, pa, i, 0), gltf_acc_f32_at(b, pa, i, 1), gltf_acc_f32_at(b, pa, i, 2)));
         i = i + 1;
     }
-    var na: GltfAcc = gltf_acc(d, json_get_int(attrs, "NORMAL", - 1), base);
+    var na: GltfAcc = gltf_acc(d, jd_int(& d.doc, jd_get(& d.doc, attrs, "NORMAL"), - 1), base);
     if na.ok && na.ncomp >= 3 {
         i = 0;
         while i < na.count {
@@ -357,7 +356,7 @@ pub fn gltf_mesh(b: Vec<i64>, d: GltfDoc, mi: i64, pi: i64) -> Mesh {
             i = i + 1;
         }
     }
-    var ta: GltfAcc = gltf_acc(d, json_get_int(attrs, "TEXCOORD_0", - 1), base);
+    var ta: GltfAcc = gltf_acc(d, jd_int(& d.doc, jd_get(& d.doc, attrs, "TEXCOORD_0"), - 1), base);
     if ta.ok && ta.ncomp >= 2 {
         i = 0;
         while i < ta.count {
@@ -365,8 +364,8 @@ pub fn gltf_mesh(b: Vec<i64>, d: GltfDoc, mi: i64, pi: i64) -> Mesh {
             i = i + 1;
         }
     }
-    var iai: i64 = json_get_int(pr, "indices", - 1);
-    var mode: i64 = json_get_int(pr, "mode", 4);
+    var iai: i64 = jd_int(& d.doc, jd_get(& d.doc, pr, "indices"), - 1);
+    var mode: i64 = jd_int(& d.doc, jd_get(& d.doc, pr, "mode"), 4);
     if mode != 4 {
         m.valid = false;
         return m;
@@ -419,20 +418,14 @@ pub fn gltf_mesh(b: Vec<i64>, d: GltfDoc, mi: i64, pi: i64) -> Mesh {
 /// baseColorFactor of material `mi` as [r,g,b,a] (defaults 1,1,1,1).
 pub fn gltf_material_color(d: GltfDoc, mi: i64) -> Vec<f64> {
     var out: Vec<f64> = Vec::new();
-    var c: str = "";
-    var ma: str = gltf_elem(d, "materials", mi);
-    if str_len(ma) != 0 {
-        var pbr: str = json_get_safe(ma, "pbrMetallicRoughness");
-        if str_len(pbr) != 0 {
-            c = json_get_safe(pbr, "baseColorFactor");
-        }
-    }
+    // jd_get and jd_at give -1 on a miss and take -1
+    val ma: i64 = gltf_elem(d, "materials", mi);
+    val c: i64 = jd_get(& d.doc, jd_get(& d.doc, ma, "pbrMetallicRoughness"), "baseColorFactor");
     var i: i64 = 0;
     while i < 4 {
         var f: f64 = 1.0;
-        if str_len(c) != 0 && i < json_len_safe(c) {
-            var v: str = json_at_safe(c, i);
-            f = json_get_num("{\"v\":" + v + "}", "v", 1.0);
+        if jd_kind(& d.doc, c) == JSON_ARRAY && i < jd_len(& d.doc, c) {
+            f = jd_num(& d.doc, jd_at(& d.doc, c, i), 1.0);
         }
         out.push(f);
         i = i + 1;

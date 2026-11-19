@@ -1,0 +1,188 @@
+// llvm-roadmap TG11: vector values in frame slots. The machine layer's
+// vectorizer (compiler/nat_ir.fd, OP22 ng_vz_*) gives a loop that needs
+// more vector values at once than the class's four registers vector homes
+// instead (ng_vz_pins): the accumulator and the first splats keep
+// registers 2 and 3, every other value lives in a 16- or 32-byte frame
+// slot past the locals (ng_vz_vslot), and each operation loads its
+// operands into registers 0 and 1 and stores its result back. The loops
+// here need five to eight vector values at once: six element reads live
+// together (f64 and an i64 reduction), five f64 invariants, an i64
+// reduction with three invariants, and one with eight general values live
+// across the vector loop as well (so the allocator spills general
+// registers next to the vector slots). One loop needs more than the 16
+// homes and stays scalar. `fid run` and the C path run every loop as
+// written; tests/nattools/vectorize_spill_check.sh checks which loops the
+// native builds vectorize, that they spill, and that every image prints
+// these lines (also with FID_NAT_OFF=vzspill and FID_NAT_OFF=vectorize).
+// Lengths 0..9, 33 and 1001: no vector iteration, a tail only, whole
+// vectors only and both. Checksums of f64 results are over their bits.
+// Expected output:
+// n=0 wide=17 splats=17 red6=0 redk=0 many=17/0 deep=17
+// n=1 wide=4720517632984351247 splats=-4590749118011276785 red6=7635959437229216622 redk=139055117439678487 many=4725988601614041615/1 deep=4664569229188530703
+// n=2 wide=4165245102887813073 splats=-8224741150683021359 red6=-7714544741296979338 redk=-44867310997804380 many=-4918208108208963631/2 deep=-7696385269045379119
+// n=3 wide=1565813116988275279 splats=-4451535965088400817 red6=5664960846636340604 redk=2529258890616861619 many=-482231741347022257/3 deep=8878775334544587343
+// n=4 wide=1781414356098322321 splats=5777353474155974545 red6=6123484333689076912 redk=-2238961616016779056 many=-2605862212934332527/4 deep=-3166031500098433135
+// n=5 wide=8074094752777527951 splats=-69002600493456753 red6=3621990511518197422 redk=-4329903499226488289 many=-5565626977243995505/5 deep=5801841247844983439
+// n=6 wide=2999748332263436113 splats=-2212983189846495407 red6=7279197833053479126 redk=-6226060351260340700 many=5219392811222757201/6 deep=-4436376570872336559
+// n=7 wide=5146636916848589519 splats=6739977608923183823 red6=4735235240632042716 redk=1470581228795865403 many=-7605012943218935089/7 deep=9133026871065443023
+// n=8 wide=-4720903560014602479 splats=270746972377014033 red6=7301880995451850736 redk=-4493315744300706160 many=5320879034967613201/8 deep=-8025440993634722031
+// n=9 wide=3290788930024342287 splats=-5500121280118001 red6=3777925250390743150 redk=-1205022042715189273 many=6003248363591729935/9 deep=-2900576222182341873
+// n=33 wide=6650945655964730895 splats=-1788365987425548785 red6=5278127545232120878 redk=3642021193490012503 many=4350396162861303311/33 deep=-1237042682273200625
+// n=1001 wide=8527584610684567311 splats=2559706162496339727 red6=3287682959706981742 redk=7193781982019162151 many=1907200867365289743/1001 deep=7699468236852100879
+// done
+
+@wrapping fn rnd(x: i64) -> i64 {
+    return x * 6364136223846793005 + 1442695040888963407;
+}
+
+/// n values over the whole i64 range
+fn ints(n: i64, seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = rnd(x);
+        v.push(x);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// n multiples of 1/4 between -300 and 700
+fn floats(n: i64, seed: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = rnd(x);
+        v.push(((x >> 44) % 4000) as f64 * 0.25 - 300.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn zeros_f(n: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// a wrapping checksum of the bits of an f64 Vec
+@wrapping fn fhash(v: Vec<f64>) -> i64 {
+    var h: i64 = 17;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = h * 31 + p_f64_to_bits(v.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+// --- loops that need more than four vector registers ----------------------
+
+/// six element reads live at once
+fn wide(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>, d: Vec<f64>, e: Vec<f64>, f: Vec<f64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) * (b.get(i) + (d.get(i) - (e.get(i) * (f.get(i) + a.get(i))))));
+        i = i + 1;
+    }
+}
+
+/// five invariants splat into lanes
+fn splats(c: & mut Vec<f64>, a: Vec<f64>, k1: f64, k2: f64, k3: f64, k4: f64, k5: f64) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, (((a.get(i) * k1 + k2) * k3 - k4) / k5));
+        i = i + 1;
+    }
+}
+
+/// an i64 reduction over six element reads live at once
+@wrapping fn red6(a: Vec<i64>, b: Vec<i64>, d: Vec<i64>, e: Vec<i64>, f: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s ^ (a.get(i) + (b.get(i) - (d.get(i) ^ (e.get(i) & (f.get(i) | a.get(i))))));
+        i = i + 1;
+    }
+    return s;
+}
+
+/// a wrapping + reduction with three invariants (the accumulator and the
+/// splats alone take the four registers)
+@wrapping fn redk(a: Vec<i64>, k1: i64, k3: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s + (((a.get(i) ^ k1) + (a.get(i) & 255)) - k3);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// the wide loop with eight general values live across it
+@wrapping fn many(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>, p1: i64, p2: i64, p3: i64, p4: i64, p5: i64, p6: i64, p7: i64, p8: i64) -> i64 {
+    var qa: i64 = p1 * 3 + p8;
+    var qb: i64 = p2 * 5 + p7;
+    var qc: i64 = p3 * 7 + p6;
+    var qd: i64 = p4 * 11 + p5;
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) * (b.get(i) + (a.get(i) - (b.get(i) * (a.get(i) + b.get(i))))));
+        i = i + 1;
+    }
+    return (qa ^ qb) + (qc ^ qd) + p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + a.len() - (qa + qb + qc + qd) + (p1 * 3 + p8) + (p2 * 5 + p7) + (p3 * 7 + p6) + (p4 * 11 + p5) - ((qa ^ qb) + (qc ^ qd)) - (p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8);
+}
+
+// --- a loop it leaves alone ----------------------------------------------
+
+/// eighteen element reads live at once: more than the 16 vector homes
+fn deep(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - (b.get(i) - (a.get(i) - b.get(i))))))))))))))))));
+        i = i + 1;
+    }
+}
+
+fn one(n: i64) {
+    var x: Vec<f64> = floats(n, 3 + n);
+    var y: Vec<f64> = floats(n, 9 + n);
+    var z: Vec<f64> = floats(n, 15 + n);
+    var a: Vec<i64> = ints(n, 11 + n);
+    var b: Vec<i64> = ints(n, 23 + n);
+    var d: Vec<i64> = ints(n, 31 + n);
+    var c1: Vec<f64> = zeros_f(n);
+    wide(& mut c1, x, y, z, x, y);
+    var c2: Vec<f64> = zeros_f(n);
+    splats(& mut c2, x, 1.5, 0.0 - 2.25, 0.75, 3.5, 4.0);
+    var r6: i64 = red6(a, b, d, a, b);
+    var rk: i64 = redk(b, 0x5A5A5A5A5A5A5A5A, 77);
+    var c3: Vec<f64> = zeros_f(n);
+    var mk: i64 = many(& mut c3, x, z, 1, 2, 3, 4, 5, 6, 7, 8);
+    var c4: Vec<f64> = zeros_f(n);
+    deep(& mut c4, x, y);
+    println("n=" + int_to_str(n) + " wide=" + int_to_str(fhash(c1)) + " splats=" + int_to_str(fhash(c2)) + " red6=" + int_to_str(r6) + " redk=" + int_to_str(rk) + " many=" + int_to_str(fhash(c3)) + "/" + int_to_str(mk) + " deep=" + int_to_str(fhash(c4)));
+}
+
+fn main() {
+    var ns: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k <= 9 {
+        ns.push(k);
+        k = k + 1;
+    }
+    ns.push(33);
+    ns.push(1001);
+    var j: i64 = 0;
+    while j < ns.len() {
+        one(ns.get(j));
+        j = j + 1;
+    }
+    println("done");
+}

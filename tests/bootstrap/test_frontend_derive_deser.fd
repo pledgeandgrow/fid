@@ -1,0 +1,61 @@
+// CL1 (fid): @derive(Deserialize) reads each field from its JSON key
+// (stdlib/derive_json.fd, added by the compiler): integers, floats, bools,
+// strings with escapes, a nested struct that derives Deserialize too, keys
+// in any order, white space, and a key inside a nested value not taken for
+// the object's own. `S_from_json_error` names a missing key or a value of
+// the wrong type ("" when the text is complete); `S_from_json` leaves such
+// a field at its default.
+// Expected output:
+// 7
+// Ada "the first"
+// true
+// 2.5
+// 3
+// 4
+// []
+// 0
+// missing key 'name'
+// key 'id' is not a number
+// key 'at': missing key 'y'
+// not a JSON object
+// round trip ok
+
+@derive(Serialize, Deserialize)
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+@derive(Serialize, Deserialize)
+struct User {
+    id: i64,
+    name: str,
+    admin: bool,
+    score: f64,
+    at: Point,
+}
+
+fn main() -> i64 {
+    val text: str = "{ \"name\": \"Ada \\\"the first\\\"\", \"at\": {\"x\": 3, \"y\": 4, \"id\": 99},\n \"id\": 7, \"admin\": true, \"score\": 2.5 }";
+    val u: User = User_from_json(text);
+    println(u.id);
+    println(u.name);
+    println(u.admin);
+    println(u.score);
+    println(u.at.x);
+    println(u.at.y);
+    println("[" + User_from_json_error(text) + "]");
+
+    val partial: User = User_from_json("{\"id\": 1, \"admin\": true}");
+    println(str_len(partial.name));
+    println(User_from_json_error("{\"id\": 1, \"admin\": true, \"score\": 1.0, \"at\": {\"x\": 1, \"y\": 2}}"));
+    println(User_from_json_error("{\"id\": \"one\", \"name\": \"b\", \"admin\": false, \"score\": 1, \"at\": {\"x\": 1, \"y\": 2}}"));
+    println(User_from_json_error("{\"id\": 1, \"name\": \"b\", \"admin\": false, \"score\": 1, \"at\": {\"x\": 1}}"));
+    println(User_from_json_error("[1, 2]"));
+
+    val back: User = User_from_json(User_to_json(u));
+    if back.id == u.id && back.at.y == u.at.y && back.admin == u.admin {
+        println("round trip ok");
+    }
+    return 0;
+}

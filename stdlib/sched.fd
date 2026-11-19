@@ -1,0 +1,453 @@
+// Scheduler policies for a kernel: round robin with time slices, fixed
+// priorities with aging, and a CFS-like fair scheduler (weights from
+// nice values, virtual runtime, a run queue kept sorted by vruntime,
+// sleeper placement and wakeup preemption).
+//
+// What is real: the whole policy layer — task states (ready, running,
+// blocked, sleeping, exited), run queues, time-slice accounting, aging,
+// the Linux nice-to-weight table, vruntime arithmetic, wakeups, timed
+// sleeps, and the decision of what runs next. Nothing here touches a CPU:
+// time arrives through sched_tick(s, dt) (dt in any unit, e.g. ns from a
+// timer interrupt) and the result is the task id that should run. The
+// seam is the context switch itself: when sched_current() changes, the
+// kernel saves and restores registers (s.switches counts the changes).
+// That makes every policy a deterministic simulation in tests.
+//
+//   var s = sched_new(SCHED_RR, 2);
+//   sched_spawn(&mut s, "A", 0);
+//   sched_schedule(&mut s);
+//   loop { run(sched_current(&s)); sched_tick(&mut s, 1); }
+module sched;
+ use vec;
+
+pub const SCHED_RR: i64 = 0;
+pub const SCHED_PRIO: i64 = 1;
+pub const SCHED_FAIR: i64 = 2;
+
+pub const TASK_READY: i64 = 0;
+pub const TASK_RUNNING: i64 = 1;
+pub const TASK_BLOCKED: i64 = 2;
+pub const TASK_SLEEPING: i64 = 3;
+pub const TASK_EXITED: i64 = 4;
+
+/// Linux sched_prio_to_weight: nice -20 .. 19.
+pub const SCHED_WEIGHTS: [i64; 40] = [88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15];
+
+pub struct Task {
+    pub id: i64,
+    pub name: str,
+    pub state: i64,
+    pub prio: i64,
+    // SCHED_PRIO: base priority, 0 = highest; SCHED_FAIR: nice
+    pub eff_prio: i64,
+    // priority after aging
+    pub weight: i64,
+    pub vruntime: i64,
+    pub slice_left: i64,
+    pub waited: i64,
+    // time spent ready since the last aging step
+    pub runtime: i64,
+    pub wake_at: i64,
+    pub switches_in: i64,
+}
+
+pub struct Sched {
+    pub policy: i64,
+    pub tasks: Vec<Task>,
+    pub rq: Vec<i64>,
+    // ready task ids (not the current one); sorted by vruntime for FAIR
+    pub current: i64,
+    pub now: i64,
+    pub quantum: i64,
+    // RR / PRIO time slice
+    pub aging_interval: i64,
+    // PRIO: ready time that raises priority by one (0 = no aging)
+    pub latency: i64,
+    // FAIR: target period in which every ready task runs once
+    pub min_granularity: i64,
+    pub wakeup_granularity: i64,
+    pub min_vruntime: i64,
+    pub switches: i64,
+    pub idle_time: i64,
+}
+
+pub fn sched_new(policy: i64, quantum: i64) -> Sched {
+    return Sched {
+        policy: policy, tasks: Vec::new(), rq: Vec::new(), current: -1, now: 0, quantum: quantum, aging_interval: 0, latency: 6 * quantum, min_granularity: quantum, wakeup_granularity: quantum, min_vruntime: 0, switches: 0, idle_time: 0
+    };
+}
+
+/// CFS parameters: period, minimum slice and wakeup granularity
+/// (Linux defaults 6 ms, 0.75 ms, 1 ms).
+pub fn sched_set_fair(s: & mut Sched, latency: i64, min_gran: i64, wakeup_gran: i64) {
+    s.latency = latency;
+    s.min_granularity = min_gran;
+    s.wakeup_granularity = wakeup_gran;
+}
+
+pub fn sched_set_aging(s: & mut Sched, interval: i64) {
+    s.aging_interval = interval;
+}
+
+/// Weight for a nice value (clamped to -20..19).
+pub fn sched_nice_weight(nice: i64) -> i64 {
+    var n: i64 = nice;
+    if n < -20 { n = -20; }
+    if n > 19 { n = 19; }
+    return SCHED_WEIGHTS[n + 20];
+}
+
+pub fn sched_task(s: & Sched, id: i64) -> Task {
+    return s.tasks.get(id);
+}
+
+pub fn sched_current(s: & Sched) -> i64 {
+    return s.current;
+}
+
+pub fn sched_state_name(st: i64) -> str {
+    if st == TASK_READY { return "ready"; }
+    if st == TASK_RUNNING { return "running"; }
+    if st == TASK_BLOCKED { return "blocked"; }
+    if st == TASK_SLEEPING { return "sleeping"; }
+    return "exited";
+}
+
+// ─── Run queue ──────────────────────────────────────────────────────────
+
+fn sched_less(s: & Sched, a: i64, b: i64) -> bool {
+    var ta: Task = s.tasks.get(a);
+    var tb: Task = s.tasks.get(b);
+    if ta.vruntime != tb.vruntime {
+        return ta.vruntime < tb.vruntime;
+    }
+    return a < b;
+}
+
+/// Put a ready task on the run queue (FIFO tail, or by vruntime).
+fn sched_enqueue(s: & mut Sched, id: i64) {
+    if s.policy != SCHED_FAIR {
+        s.rq.push(id);
+        return;
+    }
+    var lo: i64 = 0;
+    var hi: i64 = s.rq.len();
+    while lo < hi {
+        var mid: i64 = (lo + hi) / 2;
+        if sched_less(s, s.rq.get(mid), id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    s.rq.insert(lo, id);
+}
+
+fn sched_rq_remove(s: & mut Sched, id: i64) {
+    var i: i64 = 0;
+    while i < s.rq.len() {
+        if s.rq.get(i) == id {
+            s.rq.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// Run-queue position of the task that should run next, -1 when empty.
+fn sched_best(s: & Sched) -> i64 {
+    if s.rq.len() == 0 {
+        return -1;
+    }
+    if s.policy != SCHED_PRIO {
+        return 0;
+    }
+    var best: i64 = 0;
+    var bp: i64 = s.tasks.get(s.rq.get(0)).eff_prio;
+    var i: i64 = 1;
+    while i < s.rq.len() {
+        var p: i64 = s.tasks.get(s.rq.get(i)).eff_prio;
+        if p < bp {
+            best = i;
+            bp = p;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn sched_total_weight(s: & Sched) -> i64 {
+    var w: i64 = 0;
+    var i: i64 = 0;
+    while i < s.rq.len() {
+        w = w + s.tasks.get(s.rq.get(i)).weight;
+        i = i + 1;
+    }
+    if s.current >= 0 {
+        w = w + s.tasks.get(s.current).weight;
+    }
+    return w;
+}
+
+/// CFS slice of task id: its weight's share of the period, at least the
+/// minimum granularity.
+pub fn sched_fair_slice(s: & Sched, id: i64) -> i64 {
+    var total: i64 = sched_total_weight(s);
+    var w: i64 = s.tasks.get(id).weight;
+    if total <= 0 {
+        return s.latency;
+    }
+    var sl: i64 = s.latency * w / total;
+    if sl < s.min_granularity {
+        sl = s.min_granularity;
+    }
+    return sl;
+}
+
+fn sched_update_min_vruntime(s: & mut Sched) {
+    var m: i64 = -1;
+    if s.current >= 0 {
+        m = s.tasks.get(s.current).vruntime;
+    }
+    if s.policy == SCHED_FAIR && s.rq.len() > 0 {
+        var left: i64 = s.tasks.get(s.rq.get(0)).vruntime;
+        if m < 0 || left < m {
+            m = left;
+        }
+    }
+    if m > s.min_vruntime {
+        s.min_vruntime = m;
+    }
+}
+
+// ─── Switching ──────────────────────────────────────────────────────────
+
+/// Take the current task off the CPU, back to the run queue as ready.
+fn sched_put_prev(s: & mut Sched) {
+    if s.current < 0 {
+        return;
+    }
+    var id: i64 = s.current;
+    var t: Task = s.tasks.get(id);
+    t.state = TASK_READY;
+    t.eff_prio = t.prio;
+    // aging boost ends when the task has had its turn
+    t.waited = 0;
+    s.tasks.set(id, t);
+    s.current = -1;
+    sched_enqueue(s, id);
+}
+
+/// Choose the next task when the CPU is free. Returns the running id.
+pub fn sched_schedule(s: & mut Sched) -> i64 {
+    if s.current >= 0 {
+        return s.current;
+    }
+    var pos: i64 = sched_best(s);
+    if pos < 0 {
+        return -1;
+    }
+    var id: i64 = s.rq.get(pos);
+    s.rq.remove(pos);
+    s.current = id;
+    var t: Task = s.tasks.get(id);
+    t.state = TASK_RUNNING;
+    t.switches_in = t.switches_in + 1;
+    if s.policy == SCHED_FAIR {
+        t.slice_left = sched_fair_slice(s, id);
+    } else {
+        t.slice_left = s.quantum;
+    }
+    s.tasks.set(id, t);
+    s.switches = s.switches + 1;
+    return id;
+}
+
+fn sched_preempt(s: & mut Sched) {
+    sched_put_prev(s);
+    sched_schedule(s);
+}
+
+/// New ready task. prio is the base priority (SCHED_PRIO, 0 = highest)
+/// or the nice value (SCHED_FAIR). Returns its id.
+pub fn sched_spawn(s: & mut Sched, name: str, prio: i64) -> i64 {
+    var id: i64 = s.tasks.len();
+    var w: i64 = 1024;
+    if s.policy == SCHED_FAIR {
+        w = sched_nice_weight(prio);
+    }
+    s.tasks.push(Task {
+        id: id, name: name, state: TASK_READY, prio: prio, eff_prio: prio, weight: w, vruntime: s.min_vruntime, slice_left: 0, waited: 0, runtime: 0, wake_at: 0, switches_in: 0
+    });
+    sched_enqueue(s, id);
+    return id;
+}
+
+/// Whether the ready task id should take the CPU from the current one.
+fn sched_should_preempt(s: & Sched, id: i64) -> bool {
+    if s.current < 0 {
+        return true;
+    }
+    var cur: Task = s.tasks.get(s.current);
+    var t: Task = s.tasks.get(id);
+    if s.policy == SCHED_PRIO {
+        return t.eff_prio < cur.eff_prio;
+    }
+    if s.policy == SCHED_FAIR {
+        return t.vruntime + s.wakeup_granularity < cur.vruntime;
+    }
+    return false;
+}
+
+/// Make a blocked or sleeping task ready; it may preempt the current one.
+pub fn sched_wake(s: & mut Sched, id: i64) -> bool {
+    var t: Task = s.tasks.get(id);
+    if t.state != TASK_BLOCKED && t.state != TASK_SLEEPING {
+        return false;
+    }
+    t.state = TASK_READY;
+    t.waited = 0;
+    if s.policy == SCHED_FAIR {
+        // sleeper credit: at most half a period behind the queue
+        var floor: i64 = s.min_vruntime - s.latency / 2;
+        if t.vruntime < floor {
+            t.vruntime = floor;
+        }
+    }
+    s.tasks.set(id, t);
+    sched_enqueue(s, id);
+    if sched_should_preempt(s, id) {
+        if s.current >= 0 {
+            sched_preempt(s);
+        } else {
+            sched_schedule(s);
+        }
+    }
+    return true;
+}
+
+fn sched_leave(s: & mut Sched, id: i64, state: i64) {
+    var t: Task = s.tasks.get(id);
+    if t.state == TASK_READY {
+        sched_rq_remove(s, id);
+    }
+    t.state = state;
+    t.eff_prio = t.prio;
+    s.tasks.set(id, t);
+    if s.current == id {
+        s.current = -1;
+        sched_schedule(s);
+    }
+}
+
+/// Block a task (waiting for I/O, a lock, a message) until sched_wake.
+pub fn sched_block(s: & mut Sched, id: i64) {
+    sched_leave(s, id, TASK_BLOCKED);
+}
+
+/// Put a task to sleep until absolute time `until`.
+pub fn sched_sleep(s: & mut Sched, id: i64, until: i64) {
+    var t: Task = s.tasks.get(id);
+    t.wake_at = until;
+    s.tasks.set(id, t);
+    sched_leave(s, id, TASK_SLEEPING);
+}
+
+pub fn sched_exit(s: & mut Sched, id: i64) {
+    sched_leave(s, id, TASK_EXITED);
+}
+
+/// Give up the rest of the slice.
+pub fn sched_yield(s: & mut Sched) {
+    if s.current >= 0 && s.rq.len() > 0 {
+        sched_preempt(s);
+    }
+}
+
+/// Account dt of CPU time to the current task, wake sleepers whose time
+/// has come, age waiting tasks, and preempt when the policy says so.
+/// Returns the task that runs next (-1: idle).
+pub fn sched_tick(s: & mut Sched, dt: i64) -> i64 {
+    s.now = s.now + dt;
+    if s.current >= 0 {
+        var t: Task = s.tasks.get(s.current);
+        t.runtime = t.runtime + dt;
+        t.slice_left = t.slice_left - dt;
+        if s.policy == SCHED_FAIR {
+            t.vruntime = t.vruntime + dt * 1024 / t.weight;
+        }
+        s.tasks.set(s.current, t);
+        sched_update_min_vruntime(s);
+    } else {
+        s.idle_time = s.idle_time + dt;
+    }
+    // aging of tasks that waited on the run queue
+    if s.policy == SCHED_PRIO && s.aging_interval > 0 {
+        var i: i64 = 0;
+        while i < s.rq.len() {
+            var id: i64 = s.rq.get(i);
+            var w: Task = s.tasks.get(id);
+            w.waited = w.waited + dt;
+            while w.waited >= s.aging_interval {
+                w.waited = w.waited - s.aging_interval;
+                if w.eff_prio > 0 {
+                    w.eff_prio = w.eff_prio - 1;
+                }
+            }
+            s.tasks.set(id, w);
+            i = i + 1;
+        }
+    }
+    // timed sleeps, in id order
+    var k: i64 = 0;
+    while k < s.tasks.len() {
+        var st: Task = s.tasks.get(k);
+        if st.state == TASK_SLEEPING && st.wake_at <= s.now {
+            sched_wake(s, k);
+        }
+        k = k + 1;
+    }
+    if s.current < 0 {
+        return sched_schedule(s);
+    }
+    var cur: Task = s.tasks.get(s.current);
+    if s.policy == SCHED_PRIO {
+        var pos: i64 = sched_best(s);
+        if pos >= 0 {
+            var cand: Task = s.tasks.get(s.rq.get(pos));
+            if cand.eff_prio < cur.eff_prio || (cur.slice_left <= 0 && cand.eff_prio == cur.eff_prio) {
+                sched_preempt(s);
+                return s.current;
+            }
+        }
+    }
+    if s.policy == SCHED_RR && cur.slice_left <= 0 && s.rq.len() > 0 {
+        sched_preempt(s);
+        return s.current;
+    }
+    if s.policy == SCHED_FAIR && cur.slice_left <= 0 && s.rq.len() > 0 {
+        var left: Task = s.tasks.get(s.rq.get(0));
+        if left.vruntime < cur.vruntime {
+            sched_preempt(s);
+            return s.current;
+        }
+    }
+    if cur.slice_left <= 0 {
+        // nobody to switch to: a fresh slice
+        if s.policy == SCHED_FAIR {
+            cur.slice_left = sched_fair_slice(s, s.current);
+        } else {
+            cur.slice_left = s.quantum;
+        }
+        s.tasks.set(s.current, cur);
+    }
+    return s.current;
+}
+
+/// Name of the running task, "-" when idle (for traces).
+pub fn sched_current_name(s: & Sched) -> str {
+    if s.current < 0 {
+        return "-";
+    }
+    return s.tasks.get(s.current).name;
+}

@@ -1,0 +1,235 @@
+// stdlib/srtp: RFC 3711 B.2 AES-CM keystream and B.3 key derivation, libsrtp's AES_CM_128_HMAC_SHA1_80 reference packet, the _32 profile, RFC 7714 AEAD_AES_128_GCM SRTP and SRTCP vectors (encrypted and tagging only), ROC estimation and wrap, replay window, SRTCP over AES-CM, contexts from master keys. Passes in the interpreter (about 2 minutes; it can stop with an out-of-memory error from the interpreter leak, docs/stdlib-agent-bugs.md 20: retry or use the C backend).
+// Expected output:
+// aes-cm 0000 e03ead0935c95e80e166b16dd92b4eb4
+// aes-cm 0001 d23513162b02d0f72a43a2fe4a5f97ab
+// aes-cm 0002 41e95b3bb0a2e8dd477901e4fca894c0
+// aes-cm feff ec8cdf7398607cb0f2d21675ea9ea1e4
+// aes-cm ff00 362b7c3c6773516318a077d7fc5073ae
+// aes-cm ff01 6a2cc3787889374fbeb4c81b17ba6c44
+// kdf cipher key c61e7a93744f39ee10734afe3ff7a087
+// kdf cipher salt 30cbbc08863d8c85d49db34a9ae1
+// kdf auth key cebe321f6ff7716b6fd4ab49af256a156d38baa48f0a0acf3c34e2359e6cdbcee049646c43d9327ad175578ef72270986371c10c9a369ac2f94a8c5fbcdddc256d6e919a48b610ef17c2041e474035766b68642c59bbfc2f34db60dbdfb2
+// sha1_80 800f1234decafbadcafebabe4e55dc4ce79978d88ca4d215949d2402b78d6acc99ea179b8dbb
+// sha1_80 open same true, again: replayed, tampered: authentication failed
+// sha1_32 800f1234decafbadcafebabe4e55dc4ce79978d88ca4d215949d2402b78d6acc open same true
+// gcm rtp 8040f17b8041f8d35501a0b2f24de3a3fb34de6cacba861c9d7e4bcabe633bd50d294e6f42a5f47a51c7d19b36de3adf8833899d7f27beb16a9152cf765ee4390cce
+// gcm rtp open same true
+// gcm srtcp 81c8000d4d61727363e94885dcdab67ca727d7662f6b7e997ff5c0f76c06f32dc676a5f1730d6fda4ce09b4686303ded0bb9275bc84aa45896cf4d2fc5abf87245d9eade800005d4
+// gcm srtcp open same true
+// gcm srtcp tag only 81c8000d4d6172734e5450314e545032525450200000042a0000e9304c756e61deadbeefdeadbeefdeadbeefdeadbeefdeadbeef841dd9683dd78ec92ae58790125f62b3000005d4
+// gcm srtcp tag only open same true
+// roc estimate 6 4 0 -1 7
+// wrap: sent roc 1, received 4 of 4 in order 65534 0 65535 1, receiver roc 1
+// again seq 0: replayed, seq 65000 roc 0: too old
+// window: newest 69 ok true, 5 too old, 10 fresh true, 10 again replayed
+// srtcp cm 32 bytes -> 46, open same true, again replayed, tag only open same true, wrong key authentication failed
+// header len 24 (csrc 1, extension 1 word), header kept true
+// master key contexts: cm80 true gcm true cm32 true
+use encoding;
+use srtp;
+use string;
+use vec;
+
+fn hb(h: str) -> Vec<i64> {
+    return hex_decode_bytes(h);
+}
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn rtp(seq: i64, ssrc: i64, payload: str) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    p.push(128);
+    p.push(96);
+    p.push((seq >> 8) & 255);
+    p.push(seq & 255);
+    p.push(0);
+    p.push(0);
+    p.push(1);
+    p.push(seq & 255);
+    p.push((ssrc >> 24) & 255);
+    p.push((ssrc >> 16) & 255);
+    p.push((ssrc >> 8) & 255);
+    p.push(ssrc & 255);
+    val b: Vec<i64> = str_bytes(payload);
+    var i: i64 = 0;
+    while i < b.len() {
+        p.push(b.get(i));
+        i = i + 1;
+    }
+    return p;
+}
+
+fn ks_line(key: Vec<i64>, ctr: str) {
+    val iv: Vec<i64> = hb("f0f1f2f3f4f5f6f7f8f9fafbfcfd" + ctr);
+    println("aes-cm " + ctr + " " + hx(srtp_aes_cm(key, iv, Vec::filled(16, 0))));
+}
+
+fn roundtrip(profile: i64) -> bool {
+    val mk: Vec<i64> = hb("000102030405060708090a0b0c0d0e0f");
+    var ms: Vec<i64> = hb("a0a1a2a3a4a5a6a7a8a9aaabacad");
+    if profile == SRTP_AEAD_AES_128_GCM {
+        ms = hb("a0a1a2a3a4a5a6a7a8a9aaab");
+    }
+    var tx: SrtpContext = srtp_context_new(profile, mk, ms);
+    var rx: SrtpContext = srtp_context_new(profile, mk, ms);
+    val p: Vec<i64> = rtp(77, 3735928559, "media bytes");
+    val s: SrtpResult = srtp_protect(& mut tx, p);
+    val o: SrtpResult = srtp_unprotect(& mut rx, s.data);
+    val q: Vec<i64> = hb("80c8000600000099" + "0102030405060708");
+    val sc: SrtpResult = srtcp_protect(& mut tx, q);
+    val oc: SrtpResult = srtcp_unprotect(& mut rx, sc.data);
+    return tx.ok && s.ok && o.ok && hx(o.data) == hx(p) && hx(s.data) != hx(p) && oc.ok && hx(oc.data) == hx(q);
+}
+
+fn main() -> i64 {
+    // RFC 3711 B.2
+    val k2: Vec<i64> = hb("2b7e151628aed2a6abf7158809cf4f3c");
+    ks_line(k2, "0000");
+    ks_line(k2, "0001");
+    ks_line(k2, "0002");
+    ks_line(k2, "feff");
+    ks_line(k2, "ff00");
+    ks_line(k2, "ff01");
+
+    // RFC 3711 B.3
+    val mk: Vec<i64> = hb("e1f97a0d3e018be0d64fa32c06de4139");
+    val ms: Vec<i64> = hb("0ec675ad498afeebb6960b3aabe6");
+    println("kdf cipher key " + hx(srtp_kdf(mk, ms, SRTP_LABEL_RTP_ENC, 0, 0, 16)));
+    println("kdf cipher salt " + hx(srtp_kdf(mk, ms, SRTP_LABEL_RTP_SALT, 0, 0, 14)));
+    println("kdf auth key " + hx(srtp_kdf(mk, ms, SRTP_LABEL_RTP_AUTH, 0, 0, 94)));
+
+    // libsrtp reference packet (srtp_driver.c), master key/salt as B.3
+    val plain: Vec<i64> = hb("800f1234decafbadcafebabeabababababababababababababababab");
+    var tx: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mk, ms);
+    var rx: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mk, ms);
+    val sp: SrtpResult = srtp_protect(& mut tx, plain);
+    println("sha1_80 " + hx(sp.data));
+    val op: SrtpResult = srtp_unprotect(& mut rx, sp.data);
+    val op2: SrtpResult = srtp_unprotect(& mut rx, sp.data);
+    var bad: Vec<i64> = sp.data;
+    bad.set(20, bad.get(20) ^ 1);
+    var rx2: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mk, ms);
+    val op3: SrtpResult = srtp_unprotect(& mut rx2, bad);
+    println("sha1_80 open same " + bool_to_str(op.ok && hx(op.data) == hx(plain)) + ", again: " + op2.err + ", tampered: " + op3.err);
+    var tx32: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_32, mk, ms);
+    var rx32: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_32, mk, ms);
+    val s32: SrtpResult = srtp_protect(& mut tx32, plain);
+    val o32: SrtpResult = srtp_unprotect(& mut rx32, s32.data);
+    println("sha1_32 " + hx(s32.data) + " open same " + bool_to_str(o32.ok && hx(o32.data) == hx(plain)));
+
+    // RFC 7714 §16.1.1 and §17.1
+    val gk: Vec<i64> = hb("000102030405060708090a0b0c0d0e0f");
+    val gs: Vec<i64> = hb("517569642070726f2071756f");
+    var none: Vec<i64> = Vec::new();
+    var gtx: SrtpContext = srtp_context_session(SRTP_AEAD_AES_128_GCM, gk, gs, none, gk, gs, none);
+    var grx: SrtpContext = srtp_context_session(SRTP_AEAD_AES_128_GCM, gk, gs, none, gk, gs, none);
+    val gp: Vec<i64> = hb("8040f17b8041f8d35501a0b247616c6c696120657374206f6d6e69732064697669736120696e207061727465732074726573");
+    val gsr: SrtpResult = srtp_protect(& mut gtx, gp);
+    println("gcm rtp " + hx(gsr.data));
+    val gor: SrtpResult = srtp_unprotect(& mut grx, gsr.data);
+    println("gcm rtp open same " + bool_to_str(gor.ok && hx(gor.data) == hx(gp)));
+    val gc: Vec<i64> = hb("81c8000d4d6172734e5450314e54503252545020" + "0000042a0000e9304c756e61deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    srtcp_set_index(& mut gtx, 1298231923, 1492);
+    val gcs: SrtpResult = srtcp_protect(& mut gtx, gc);
+    println("gcm srtcp " + hx(gcs.data));
+    val gco: SrtpResult = srtcp_unprotect(& mut grx, gcs.data);
+    println("gcm srtcp open same " + bool_to_str(gco.ok && hx(gco.data) == hx(gc)));
+    var gtx2: SrtpContext = srtp_context_session(SRTP_AEAD_AES_128_GCM, gk, gs, none, gk, gs, none);
+    var grx2: SrtpContext = srtp_context_session(SRTP_AEAD_AES_128_GCM, gk, gs, none, gk, gs, none);
+    srtcp_set_index(& mut gtx2, 1298231923, 1492);
+    val gts: SrtpResult = srtcp_protect_opt(& mut gtx2, gc, false);
+    println("gcm srtcp tag only " + hx(gts.data));
+    val gto: SrtpResult = srtcp_unprotect(& mut grx2, gts.data);
+    println("gcm srtcp tag only open same " + bool_to_str(gto.ok && hx(gto.data) == hx(gc)));
+
+    // ROC estimation (RFC 3711 Appendix A)
+    println("roc estimate " + int_to_str(srtp_estimate_roc(5, 65530, 3)) + " " + int_to_str(srtp_estimate_roc(5, 2, 65533)) + " " + int_to_str(srtp_estimate_roc(0, 100, 200)) + " " + int_to_str(srtp_estimate_roc(0, 10, 65000)) + " " + int_to_str(srtp_estimate_roc(7, 40000, 30000)));
+
+    // sequence wrap, delivered out of order
+    val wk: Vec<i64> = hb("00112233445566778899aabbccddeeff");
+    val wsalt: Vec<i64> = hb("0102030405060708090a0b0c0d0e");
+    var wt: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, wk, wsalt);
+    var wr: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, wk, wsalt);
+    val a: SrtpResult = srtp_protect(& mut wt, rtp(65534, 42, "a"));
+    val b: SrtpResult = srtp_protect(& mut wt, rtp(65535, 42, "b"));
+    val c: SrtpResult = srtp_protect(& mut wt, rtp(0, 42, "c"));
+    val d: SrtpResult = srtp_protect(& mut wt, rtp(1, 42, "d"));
+    var got: i64 = 0;
+    var order: str = "";
+    var arr: Vec<Vec<i64>> = Vec::new();
+    arr.push(a.data);
+    arr.push(c.data);
+    arr.push(b.data);
+    arr.push(d.data);
+    var i: i64 = 0;
+    while i < arr.len() {
+        val r: SrtpResult = srtp_unprotect(& mut wr, arr.get(i));
+        if r.ok {
+            got = got + 1;
+            order = order + " " + int_to_str((r.data.get(2) << 8) | r.data.get(3));
+        }
+        i = i + 1;
+    }
+    println("wrap: sent roc " + int_to_str(srtp_get_roc(& mut wt, 42)) + ", received " + int_to_str(got) + " of 4 in order" + order + ", receiver roc " + int_to_str(srtp_get_roc(& mut wr, 42)));
+    val again: SrtpResult = srtp_unprotect(& mut wr, c.data);
+    // a packet from roc 0 far behind the receiver: estimated as roc 1 -> fails auth;
+    // send one 65000 under roc 0 from a fresh sender and check it is too old
+    var wt2: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, wk, wsalt);
+    val old: SrtpResult = srtp_protect(& mut wt2, rtp(65000, 42, "x"));
+    val oldr: SrtpResult = srtp_unprotect(& mut wr, old.data);
+    println("again seq 0: " + again.err + ", seq 65000 roc 0: " + oldr.err);
+
+    // replay window: 70 packets, then an old one and a skipped one
+    var vt: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, wk, wsalt);
+    var vr: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, wk, wsalt);
+    var pk: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < 70 {
+        pk.push(srtp_protect(& mut vt, rtp(i, 7, "w")).data);
+        i = i + 1;
+    }
+    var last_ok: bool = false;
+    i = 0;
+    while i < 70 {
+        if i != 10 {
+            last_ok = srtp_unprotect(& mut vr, pk.get(i)).ok;
+        }
+        i = i + 1;
+    }
+    val r5: SrtpResult = srtp_unprotect(& mut vr, pk.get(5));
+    val r10: SrtpResult = srtp_unprotect(& mut vr, pk.get(10));
+    val r10b: SrtpResult = srtp_unprotect(& mut vr, pk.get(10));
+    println("window: newest 69 ok " + bool_to_str(last_ok) + ", 5 " + r5.err + ", 10 fresh " + bool_to_str(r10.ok) + ", 10 again " + r10b.err);
+
+    // SRTCP over AES-CM
+    var ct: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_32, wk, wsalt);
+    var cr: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_32, wk, wsalt);
+    val rr: Vec<i64> = hb("80c90007000004d2" + "000016e1000000000000001e000000000000000000000000");
+    val sc: SrtpResult = srtcp_protect(& mut ct, rr);
+    val oc: SrtpResult = srtcp_unprotect(& mut cr, sc.data);
+    val oc2: SrtpResult = srtcp_unprotect(& mut cr, sc.data);
+    val st: SrtpResult = srtcp_protect_opt(& mut ct, rr, false);
+    val ot: SrtpResult = srtcp_unprotect(& mut cr, st.data);
+    var cw: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_32, mk, ms);
+    val ow: SrtpResult = srtcp_unprotect(& mut cw, sc.data);
+    println("srtcp cm " + int_to_str(rr.len()) + " bytes -> " + int_to_str(sc.data.len()) + ", open same " + bool_to_str(oc.ok && hx(oc.data) == hx(rr)) + ", again " + oc2.err + ", tag only open same " + bool_to_str(ot.ok && hx(ot.data) == hx(rr)) + ", wrong key " + ow.err);
+
+    // header with a CSRC and a one-word extension stays in the clear
+    val hp: Vec<i64> = hb("9160000100000001000000aa" + "000000bb" + "bede0001" + "10ff0000" + "7061796c6f6164");
+    var ht: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, wk, wsalt);
+    val hs: SrtpResult = srtp_protect(& mut ht, hp);
+    var same_head: bool = true;
+    i = 0;
+    while i < 24 {
+        if hs.data.get(i) != hp.get(i) {
+            same_head = false;
+        }
+        i = i + 1;
+    }
+    println("header len " + int_to_str(srtp_rtp_header_len(& hp)) + " (csrc 1, extension 1 word), header kept " + bool_to_str(same_head && hs.data.get(24) != hp.get(24)));
+
+    println("master key contexts: cm80 " + bool_to_str(roundtrip(SRTP_AES128_CM_SHA1_80)) + " gcm " + bool_to_str(roundtrip(SRTP_AEAD_AES_128_GCM)) + " cm32 " + bool_to_str(roundtrip(SRTP_AES128_CM_SHA1_32)));
+    return 0;
+}

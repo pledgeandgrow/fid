@@ -1,0 +1,106 @@
+// LF2 (compiler/iropt_me.fd ime_note_ref_params, ime_unescaped = 2,
+// FID_IROPT_ON=lendref with forward / loadhoist / dse): a local passed by
+// `&` / `&mut` to a function whose reference parameter never lets go of it
+// (only loads, stores as the address, fields, and reference parameters of
+// further such calls) is reached by that call alone. A later call it is
+// not passed to cannot change it, so a load after that call is forwarded
+// from the store before it, and a load in a loop that calls only other
+// functions is moved out. A call that is given the local still writes it,
+// and a callee that hands the reference on to something unknown (a closure
+// call, the runtime) keeps the local escaped. The program prints the same
+// with the passes on and off.
+//
+// Expected output:
+// 11
+// 3
+// 12
+// 40
+// 107
+// 5
+// 26
+// 8
+
+struct Acc { total: i64, count: i64 }
+
+var g_seen: i64 = 0;
+
+fn bump(x: &mut i64) {
+    *x = *x + 1;
+}
+
+fn peek(x: &i64) -> i64 {
+    return *x;
+}
+
+// forwards its reference to another lending function: still lent
+fn bump_twice(x: &mut i64) {
+    bump(x);
+    bump(x);
+}
+
+fn note(v: i64) {
+    g_seen = g_seen + v;
+}
+
+fn add(a: &mut Acc, v: i64) {
+    a.total = a.total + v;
+    a.count = a.count + 1;
+}
+
+// recursion keeps the parameter lent (greatest fixpoint)
+fn add_down(a: &mut Acc, n: i64) {
+    if n > 0 {
+        a.total = a.total + n;
+        add_down(a, n - 1);
+    }
+}
+
+fn main() {
+    // lent to bump, then a call that is not given it: x stays known
+    var x: i64 = 10;
+    bump(&mut x);
+    note(x);
+    println(x);
+    // a call that is given the local writes it: reloaded after
+    var y: i64 = 1;
+    bump_twice(&mut y);
+    note(y);
+    println(y);
+    // a shared reference: read by the call, written by nothing after
+    var z: i64 = 12;
+    val pz: i64 = peek(&z);
+    note(pz);
+    println(z);
+    // a struct local lent in a loop that also calls other functions
+    var acc: Acc = Acc { total: 0, count: 0 };
+    var i: i64 = 0;
+    while i < 5 {
+        add(&mut acc, i * 4);
+        note(i);
+        i = i + 1;
+    }
+    println(acc.total);
+    // the loop reads a field of a lent struct that only `note` runs
+    // beside: the load can move out of the loop
+    var acc2: Acc = Acc { total: 7, count: 0 };
+    add(&mut acc2, 100);
+    var s: i64 = 0;
+    var k: i64 = 0;
+    while k < 3 {
+        note(k);
+        s = acc2.total;
+        k = k + 1;
+    }
+    println(s);
+    println(acc.count);
+    var acc3: Acc = Acc { total: 11, count: 0 };
+    add_down(&mut acc3, 5);
+    note(1);
+    println(acc3.total);
+    // a store before a call that is given the place stays (DSE)
+    var w: i64 = 3;
+    w = 7;
+    bump(&mut w);
+    note(w);
+    println(w);
+}

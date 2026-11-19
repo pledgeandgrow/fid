@@ -1,0 +1,127 @@
+// VF5, copy coalescing of the machine layer's allocator
+// (compiler/nat_ir.fd, `FID_NAT_OFF=coalesce` and its second round
+// `livecoal`): the two sides of a copy d <- s share one register when one
+// of them never changes while the other lives. It is wrong to merge them
+// when both change while both live: a copy whose source is stepped while
+// the copy is still read, a rotation of three values, a swap in a loop,
+// two copies of one value changed differently, a copy kept across a call
+// while its source is reassigned, a copy made on one path only. Each line
+// prints a value that changes when two such values share a register.
+// scripts/verify/variants.py's mutant coalesce-source-redefined breaks it.
+//
+// Expected output:
+// 65
+// 3 1 2
+// 89 144
+// 606
+// 1005
+// 42 43
+// 12 4
+// 104
+
+fn id(x: i64) -> i64 {
+    return x;
+}
+
+fn pick(c: bool, x: i64) -> i64 {
+    var y: i64 = 0;
+    var z: i64 = x;
+    if c {
+        y = z;
+    } else {
+        y = z + 1;
+    }
+    z = 0;
+    return y + z;
+}
+
+fn rot3(n: i64) -> str {
+    var a: i64 = 1;
+    var b: i64 = 2;
+    var c: i64 = 3;
+    var i: i64 = 0;
+    while i < n {
+        val t: i64 = a;
+        a = c;
+        c = b;
+        b = t;
+        i = i + 1;
+    }
+    return int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c);
+}
+
+fn fib_pair(n: i64) -> str {
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var i: i64 = 0;
+    while i < n {
+        val old: i64 = a;
+        a = b;
+        b = old + b;
+        i = i + 1;
+    }
+    return int_to_str(a) + " " + int_to_str(b);
+}
+
+fn main() -> i64 {
+    // the copy keeps the old value when its source changes
+    var a: i64 = 5;
+    val b: i64 = a;
+    a = a + 1;
+    println(a * 10 + b);
+
+    // a rotation of three values, once
+    println(rot3(1));
+
+    // a swap through a temporary, eleven times
+    println(fib_pair(11));
+
+    // two copies of one value, each changed its own way
+    var s: i64 = 1;
+    var r: i64 = 0;
+    while r < 5 {
+        var p: i64 = s;
+        var q: i64 = s;
+        p = p * 2;
+        q = q + 3;
+        s = p + q;
+        r = r + 1;
+    }
+    println(s);
+
+    // a copy kept across a call while its source is reassigned
+    var src: i64 = 10;
+    val keep: i64 = src;
+    src = id(src * 100);
+    println(src + keep / 2);
+
+    // a copy that is read after the source moves on, and the source
+    var cnt: i64 = 41;
+    var last: i64 = 0;
+    var k: i64 = 0;
+    while k < 2 {
+        last = cnt;
+        cnt = cnt + 1;
+        k = k + 1;
+    }
+    println(int_to_str(last) + " " + int_to_str(cnt));
+
+    // a copy made on one path only
+    println(int_to_str(pick(true, 12)) + " " + int_to_str(pick(false, 3)));
+
+    // copies in a loop body, summed: (x, y) = (y, x + y) with x read late
+    var x: i64 = 2;
+    var y: i64 = 3;
+    var acc: i64 = 0;
+    var j: i64 = 0;
+    while j < 6 {
+        val nx: i64 = y;
+        val ny: i64 = x + y;
+        acc = acc + x * 2;
+        x = nx;
+        y = ny;
+        j = j + 1;
+    }
+    println(acc);
+    return 0;
+}

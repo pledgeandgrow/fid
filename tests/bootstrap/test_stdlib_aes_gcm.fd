@@ -1,0 +1,109 @@
+// stdlib/aes_gcm (competitive SL2, the crypto QUIC needs): AES against
+// FIPS 197 Appendix C.1 / C.3, AES-128-GCM against the GCM specification's
+// test cases 1-4 (McGrew and Viega; the vectors of NIST's GCM validation),
+// each sealed message opened again, and a flipped tag, ciphertext or AAD
+// byte rejected. A wrong answer panics on every backend.
+//
+// Expected output:
+// fips197 aes128 ok
+// fips197 aes256 ok
+// gcm tc1 ok
+// gcm tc2 ok
+// gcm tc3 ok
+// gcm tc3 open ok
+// gcm tc4 ok
+// gcm tc4 open ok
+// bad tag rejected
+// bad ciphertext rejected
+// bad aad rejected
+// bad key length rejected
+// aes_gcm vectors ok
+use aes_gcm;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn copy(v: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// aes_encrypt_block gives keystream, which is @secret (complaint CO1):
+/// the FIPS vectors print it through this audited release.
+@declassify fn reveal(v: Vec<i64>) -> Vec<i64> { return v; }
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn main() -> i64 {
+    // FIPS 197 C.1 (AES-128) and C.3 (AES-256)
+    check("fips197 aes128", he(reveal(aes_encrypt_block(
+        aes_key_expand(hb("000102030405060708090a0b0c0d0e0f")),
+        hb("00112233445566778899aabbccddeeff")))),
+        "69c4e0d86a7b0430d8cdb78070b4c55a");
+    check("fips197 aes256", he(aes_ecb_encrypt(
+        hb("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+        hb("00112233445566778899aabbccddeeff"))),
+        "8ea2b7ca516745bfeafc49904b496089");
+    val empty: Vec<i64> = Vec::new();
+    val k0: Vec<i64> = hb("00000000000000000000000000000000");
+    val iv0: Vec<i64> = hb("000000000000000000000000");
+    // Test case 1: no plaintext, no AAD (the tag alone)
+    check("gcm tc1", he(aes_gcm_seal(k0, iv0, empty, empty)),
+        "58e2fccefa7e3061367f1d57a4e7455a");
+    // Test case 2: one zero block
+    check("gcm tc2", he(aes_gcm_seal(k0, iv0, empty, hb("00000000000000000000000000000000"))),
+        "0388dace60b6a392f328c2b971b2fe78" + "ab6e47d42cec13bdf53a67b21257bddf");
+    // Test case 3: four blocks
+    val k3: Vec<i64> = hb("feffe9928665731c6d6a8f9467308308");
+    val iv3: Vec<i64> = hb("cafebabefacedbaddecaf888");
+    val p3: str = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72" +
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255";
+    val c3: str = "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e" +
+        "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985";
+    val s3: Vec<i64> = aes_gcm_seal(k3, iv3, empty, hb(p3));
+    check("gcm tc3", he(s3), c3 + "4d5c2af327cd64a62cf35abd2ba6fab4");
+    val o3: GcmOpened = aes_gcm_open(k3, iv3, empty, s3);
+    if !o3.ok { p_panic("gcm tc3: open failed"); }
+    check("gcm tc3 open", he(o3.plain), p3);
+    // Test case 4: 60 bytes of plaintext (a partial last block) and AAD
+    val p4: str = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72" +
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39";
+    val a4: Vec<i64> = hb("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+    val c4: str = "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e" +
+        "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091";
+    val s4: Vec<i64> = aes_gcm_seal(k3, iv3, a4, hb(p4));
+    check("gcm tc4", he(s4), c4 + "5bc94fbc3221a5db94fae95ae7121a47");
+    val o4: GcmOpened = aes_gcm_open(k3, iv3, a4, s4);
+    if !o4.ok { p_panic("gcm tc4: open failed"); }
+    check("gcm tc4 open", he(o4.plain), p4);
+    // Tampering: the last tag byte, the first ciphertext byte, the AAD
+    var t1: Vec<i64> = copy(s4);
+    t1.set(t1.len() - 1, t1.get(t1.len() - 1) ^ 1);
+    if aes_gcm_open(k3, iv3, a4, t1).ok { p_panic("bad tag accepted"); }
+    println("bad tag rejected");
+    var t2: Vec<i64> = copy(s4);
+    t2.set(0, t2.get(0) ^ 128);
+    if aes_gcm_open(k3, iv3, a4, t2).ok { p_panic("bad ciphertext accepted"); }
+    println("bad ciphertext rejected");
+    var a4b: Vec<i64> = copy(a4);
+    a4b.set(19, a4b.get(19) ^ 2);
+    if aes_gcm_open(k3, iv3, a4b, s4).ok { p_panic("bad aad accepted"); }
+    println("bad aad rejected");
+    if aes_gcm_seal(hb("0011"), iv3, empty, empty).len() != 0 { p_panic("short key sealed"); }
+    if aes_gcm_open(hb("0011"), iv3, empty, s4).ok { p_panic("short key opened"); }
+    println("bad key length rejected");
+    println("aes_gcm vectors ok");
+    return 0;
+}

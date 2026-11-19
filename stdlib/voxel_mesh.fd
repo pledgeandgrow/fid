@@ -1,0 +1,844 @@
+// Fides voxel meshing: turns a voxel chunk into triangle meshes three
+// ways, plus marching cubes over a scalar field.
+//
+//   - naive: one quad per solid voxel face that touches an empty voxel
+//     (or the chunk border), with per-vertex ambient occlusion;
+//   - greedy: the same faces merged into maximal rectangles per slice and
+//     direction (Lysenko's greedy meshing); faces merge only when their
+//     material and their four corner AO values agree, so AO survives;
+//   - ambient occlusion per vertex from the three voxels around each
+//     corner in front of the face (0 = darkest .. 3 = open), and quads are
+//     split along the diagonal that keeps the AO gradient symmetric;
+//   - marching cubes (Lorensen & Cline, with Paul Bourke's standard edge
+//     and triangle tables: corners 0..7 = (0,0,0) (1,0,0) (1,1,0) (0,1,0)
+//     (0,0,1) (1,0,1) (1,1,1) (0,1,1), edges 0..11 as in his
+//     "Polygonising a scalar field"); a corner is inside when its value is
+//     below the iso level. Vertices are shared between cells (one per grid
+//     edge), so a closed surface gives a closed, consistently wound mesh;
+//     normals come from the field's gradient.
+//
+// Everything is pure computation; there is no platform seam. Output is
+// flat arrays ready for a GPU vertex buffer (stdlib gl, vulkan, webgpu):
+// positions xyz, normals xyz, uvs (in voxel units, so a texture tiles
+// across greedy quads), AO 0..3, material per vertex, and triangle
+// indices, counter-clockwise seen from outside. (stdlib mesh's Mesh holds
+// OBJ data and no AO/material channels, so VoxMesh is its own type;
+// vox_mesh_to_obj writes it as Wavefront OBJ text.)
+//
+// Usage:
+//   use voxel_mesh;
+//   var c: VoxChunk = vox_chunk_new(16, 16, 16);
+//   vox_set(&mut c, 1, 2, 3, 5);            // material 5
+//   val m: VoxMesh = vox_mesh_greedy(&c);
+//   val s: VoxMesh = vox_marching_cubes(&field, 16, 16, 16, 0.0);
+
+module voxel_mesh;
+use vec;
+use math;
+
+// ─── Marching cubes tables ─────────────────────────────────────────────────
+// Bourke's triTable, one row per cube configuration, edge numbers in hex,
+// each row ended by '.'.
+fn vox_tri_src() -> str {
+    return
+    ".083.019.183981.12a.08312a.92a029.2832a8a98." +
+    "3b2.0b28b0.19023b.1b219b98b.3a1ba3.0a108a8ba.3903b9ba9.98aa8b." +
+    "478.430734.019847.419471731.12a847.34730412a.92a902847.2a9297273794." +
+    "8473b2.b47b24204.90184723b.47b94b9b2921.3a13ba784.1ba14b1047b4.47890b9bab03.47b4b99ba." +
+    "954.954083.054150.854835315.12a954.30812a495.52a542402.2a5325354348." +
+    "95423b.0b208b495.05401523b.21525828b485.a3ba13954.4950818a18ba.54050b5bab03.54858aa8b." +
+    "978579.930953573.078017157.153357.978957a12.a12950530573.802825857a52.2a5253357." +
+    "7957893b2.95797292027b.23b018178157.b21b17715.958857a13a3b.5705097b010aba0.ba0b03a50807570.ba57b5." +
+    "a65.0835a6.9015a6.1831985a6.165261.165126308.965906026.598582526328." +
+    "23ba65.b08b20a65.01923b5a6.5a61929b298b.63b653513.08b0b50515b6.3b6036065059.65969bb98." +
+    "5a6478.43047365a.1905a6847.a65197173794.612651478.125526304347.847905065026.739794329596269." +
+    "3b2784a65.5a647242027b.01947823b5a6.9219b294b7b45a6.8473b53515b6.51b5b610b7b404b.059065036b63847.65969b4797b9." +
+    "a4964a.4a649a083.a01a60640.83181686461a.149124264.308129249264.024426.832824426." +
+    "a49a64b23.08228b49a4a6.3b201606461a.64161a48121b8b1.964936913b63.8b1810b61914641.3b6360064.648b68." +
+    "7a678a89a.0730a709a67a.a671a7178180.a67a71173.126168189867.269291679093739.780706602.732672." +
+    "23ba68a89867.20727b09767a9a7.1801781a767a23b.b21b17a61671.896867916b63136.091b67.7807063b0b60.7b6." +
+    "76b.308b76.019b76.819831b76.a126b7.12a3086b7.2902a96b7.6b72a3a83a98." +
+    "723627.708760620.276237019.162186198876.a76a17137.a7617a187108.03707a0a96a7.76a7a88a9." +
+    "684b86.36b306046.86b846901.946963931b36.6846b82a1.12a30b06b046.4b846b0292a9.a93a32943b36463." +
+    "823842462.042462.190234246438.194142246.8138618466a1.a10a06604.4634386a3039a93.a946a4." +
+    "49576b.083495b76.50154076b.b76834354315.954a1276b.6b712a083495.76b54a42a402.348354325a52b76." +
+    "723762549.954086062687.362376150540.628687218485158.954a16176137.16a176107870954.40a4a503a6a737a.76a7a854a48a." +
+    "6956b9b89.36b063056095.0b805b01556b.6b3635531.12a95b9b8b56.0b306b09656912a.b85b56805a52025.6b36352a3a53." +
+    "589528562382.956960062.158180568382628.156216.13616a386569896.a10a06950560.03856a.a56." +
+    "b5a75b.b5ab75830.5b75ab190.a75ab7981831.b12b71751.08312717572b.9759279022b7.75272b592328982." +
+    "25a235375.820852875a25.9015a35373a2.982921872a25752.135375.087071175.903935537.987597." +
+    "5845a8ab8.5045b05abb30.01984a8aba45.ab4a45b34941314.2512852b8458.04b0b345b2b151b.0250592b5458b85.9452b3." +
+    "25a352345384.5a2524420.3a235a385458019.5a2524192942.845853351.045105.845853905035.945." +
+    "4b749b9ab.0834979b79ab.1ab1b414074b.3143481a474bab4.4b79b492b912.9749b791b2b1083.b74b42240.b74b42834324." +
+    "29a279237749.9a7974a27870207.37a3a274a1a040a.1a2874.491417713.491417081871.403743.487." +
+    "9a8ab8.30939bb9a.01a0a88ab.31ab3a.12b1b99b8.30939b1292b9.02b80b.32b." +
+    "23828aa89.9a2092.23828a0181a8.1a2.138918.091.038.."
+;
+}
+
+var vox_tri_start: Vec<i64> = Vec::new();
+var vox_tri_edges: Vec<i64> = Vec::new();
+var vox_edge_table: Vec<i64> = Vec::new();
+
+// corner c of the unit cube: x, y, z
+fn vox_cx(c: i64) -> i64 {
+    if c == 1 || c == 2 || c == 5 || c == 6 {
+        return 1;
+    }
+    return 0;
+}
+
+fn vox_cy(c: i64) -> i64 {
+    if c == 2 || c == 3 || c == 6 || c == 7 {
+        return 1;
+    }
+    return 0;
+}
+
+fn vox_cz(c: i64) -> i64 {
+    if c >= 4 {
+        return 1;
+    }
+    return 0;
+}
+
+/// The two corners (which = 0 or 1) of cube edge e (0..11).
+pub fn vox_edge_corner(e: i64, which: i64) -> i64 {
+    if e < 4 {
+        if which == 0 {
+            return e;
+        }
+        return (e + 1) % 4;
+    }
+    if e < 8 {
+        if which == 0 {
+            return e;
+        }
+        return 4 + (e - 3) % 4;
+    }
+    if which == 0 {
+        return e - 8;
+    }
+    return e - 4;
+}
+
+fn vox_tables_init() {
+    if vox_tri_start.len() == 257 {
+        return;
+    }
+    val src: str = vox_tri_src();
+    vox_tri_start.push(0);
+    var i: i64 = 0;
+    while i < str_len(src) {
+        val ch: i64 = str_byte_at(src, i);
+        if ch == 46 {
+            vox_tri_start.push(vox_tri_edges.len());
+        } else if ch >= 97 {
+            vox_tri_edges.push(ch - 87);
+        } else {
+            vox_tri_edges.push(ch - 48);
+        }
+        i = i + 1;
+    }
+    // edgeTable: bit e set when edge e's corners are on different sides
+    var c: i64 = 0;
+    while c < 256 {
+        var bits: i64 = 0;
+        var e: i64 = 0;
+        while e < 12 {
+            val a: i64 = (c >> vox_edge_corner(e, 0)) & 1;
+            val b: i64 = (c >> vox_edge_corner(e, 1)) & 1;
+            if a != b {
+                bits = bits | (1 << e);
+            }
+            e = e + 1;
+        }
+        vox_edge_table.push(bits);
+        c = c + 1;
+    }
+}
+
+/// Bourke's edgeTable entry for a cube configuration (12-bit mask).
+pub fn vox_mc_edge_mask(config: i64) -> i64 {
+    vox_tables_init();
+    return vox_edge_table.get(config & 255);
+}
+
+/// The triangle list of a configuration: edge numbers, three per triangle.
+pub fn vox_mc_triangles(config: i64) -> Vec<i64> {
+    vox_tables_init();
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = vox_tri_start.get(config & 255);
+    while i < vox_tri_start.get((config & 255) + 1) {
+        out.push(vox_tri_edges.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Chunks ────────────────────────────────────────────────────────────────
+
+pub struct VoxChunk {
+    pub sx: i64,
+    pub sy: i64,
+    pub sz: i64,
+    /// x fastest, then y, then z; 0 is empty, anything else a material.
+    pub cells: Vec<i64>,
+}
+
+pub fn vox_chunk_new(sx: i64, sy: i64, sz: i64) -> VoxChunk {
+    return VoxChunk { sx: sx, sy: sy, sz: sz, cells: Vec::filled(sx * sy * sz, 0) };
+}
+
+/// The voxel at (x, y, z); 0 outside the chunk.
+pub fn vox_get(c: &VoxChunk, x: i64, y: i64, z: i64) -> i64 {
+    if x < 0 || y < 0 || z < 0 || x >= c.sx || y >= c.sy || z >= c.sz {
+        return 0;
+    }
+    return c.cells.get(x + c.sx * (y + c.sy * z));
+}
+
+pub fn vox_set(c: &mut VoxChunk, x: i64, y: i64, z: i64, m: i64) {
+    if x < 0 || y < 0 || z < 0 || x >= c.sx || y >= c.sy || z >= c.sz {
+        return;
+    }
+    c.cells.set(x + c.sx * (y + c.sy * z), m);
+}
+
+pub fn vox_fill_box(c: &mut VoxChunk, x0: i64, y0: i64, z0: i64, x1: i64, y1: i64, z1: i64, m: i64) {
+    var z: i64 = z0;
+    while z <= z1 {
+        var y: i64 = y0;
+        while y <= y1 {
+            var x: i64 = x0;
+            while x <= x1 {
+                vox_set(c, x, y, z, m);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        z = z + 1;
+    }
+}
+
+pub fn vox_solid_count(c: &VoxChunk) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < c.cells.len() {
+        if c.cells.get(i) != 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ─── Meshes ────────────────────────────────────────────────────────────────
+
+pub struct VoxMesh {
+    pub positions: Vec<f64>,
+    pub normals: Vec<f64>,
+    pub uvs: Vec<f64>,
+    pub ao: Vec<i64>,
+    pub material: Vec<i64>,
+    pub indices: Vec<i64>,
+}
+
+pub fn vox_mesh_new() -> VoxMesh {
+    return VoxMesh { positions: Vec::new(), normals: Vec::new(), uvs: Vec::new(), ao: Vec::new(), material: Vec::new(), indices: Vec::new() };
+}
+
+pub fn vox_mesh_vertex_count(m: &VoxMesh) -> i64 {
+    return m.positions.len() / 3;
+}
+
+pub fn vox_mesh_triangle_count(m: &VoxMesh) -> i64 {
+    return m.indices.len() / 3;
+}
+
+fn vox_push_vertex(m: &mut VoxMesh, x: f64, y: f64, z: f64, nx: f64, ny: f64, nz: f64, u: f64, v: f64, ao: i64, mat: i64) {
+    m.positions.push(x);
+    m.positions.push(y);
+    m.positions.push(z);
+    m.normals.push(nx);
+    m.normals.push(ny);
+    m.normals.push(nz);
+    m.uvs.push(u);
+    m.uvs.push(v);
+    m.ao.push(ao);
+    m.material.push(mat);
+}
+
+// Face directions: 0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z. For a direction
+// along axis a, the face's own axes are u = a+1 and v = a+2 (mod 3).
+fn vox_axis(d: i64) -> i64 {
+    return d / 2;
+}
+
+fn vox_sign(d: i64) -> i64 {
+    if d % 2 == 0 {
+        return 1;
+    }
+    return - 1;
+}
+
+fn vox_dim(c: &VoxChunk, axis: i64) -> i64 {
+    if axis == 0 {
+        return c.sx;
+    }
+    if axis == 1 {
+        return c.sy;
+    }
+    return c.sz;
+}
+
+// The voxel at axis coordinates (pa along a, pu along a+1, pv along a+2).
+fn vox_at_axes(c: &VoxChunk, a: i64, pa: i64, pu: i64, pv: i64) -> i64 {
+    if a == 0 {
+        return vox_get(c, pa, pu, pv);
+    }
+    if a == 1 {
+        return vox_get(c, pv, pa, pu);
+    }
+    return vox_get(c, pu, pv, pa);
+}
+
+fn vox_solid_axes(c: &VoxChunk, a: i64, pa: i64, pu: i64, pv: i64) -> i64 {
+    if vox_at_axes(c, a, pa, pu, pv) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+/// AO of one face corner: s1, s2 the side voxels, k the diagonal one
+/// (each 0 or 1). 3 = open, 0 = in a corner.
+pub fn vox_ao_value(s1: i64, s2: i64, k: i64) -> i64 {
+    if s1 == 1 && s2 == 1 {
+        return 0;
+    }
+    return 3 - (s1 + s2 + k);
+}
+
+// AO of corner (cu, cv) of the face of voxel (pa, pu, pv) toward d.
+fn vox_corner_ao(c: &VoxChunk, d: i64, pa: i64, pu: i64, pv: i64, cu: i64, cv: i64) -> i64 {
+    val a: i64 = vox_axis(d);
+    val na: i64 = pa + vox_sign(d);
+    var du: i64 = - 1;
+    if cu == 1 {
+        du = 1;
+    }
+    var dv: i64 = - 1;
+    if cv == 1 {
+        dv = 1;
+    }
+    val s1: i64 = vox_solid_axes(c, a, na, pu + du, pv);
+    val s2: i64 = vox_solid_axes(c, a, na, pu, pv + dv);
+    val k: i64 = vox_solid_axes(c, a, na, pu + du, pv + dv);
+    return vox_ao_value(s1, s2, k);
+}
+
+/// The 4 AO values of the face of voxel (x, y, z) toward d, packed 2 bits
+/// each, corners (u,v) = (0,0) (1,0) (1,1) (0,1).
+pub fn vox_face_ao_xyz(c: &VoxChunk, d: i64, x: i64, y: i64, z: i64) -> i64 {
+    val a: i64 = vox_axis(d);
+    if a == 0 {
+        return vox_face_ao(c, d, x, y, z);
+    }
+    if a == 1 {
+        return vox_face_ao(c, d, y, z, x);
+    }
+    return vox_face_ao(c, d, z, x, y);
+}
+
+fn vox_face_ao(c: &VoxChunk, d: i64, pa: i64, pu: i64, pv: i64) -> i64 {
+    return vox_corner_ao(c, d, pa, pu, pv, 0, 0) | (vox_corner_ao(c, d, pa, pu, pv, 1, 0) << 2) | (vox_corner_ao(c, d, pa, pu, pv, 1, 1) << 4) | (vox_corner_ao(c, d, pa, pu, pv, 0, 1) << 6);
+}
+
+// Emit a quad on the plane a = `plane`, spanning [pu, pu+w] x [pv, pv+h],
+// facing d, with packed corner AO.
+fn vox_emit_quad(m: &mut VoxMesh, d: i64, plane: i64, pu: i64, pv: i64, w: i64, h: i64, ao: i64, mat: i64) {
+    val a: i64 = vox_axis(d);
+    val s: i64 = vox_sign(d);
+    val base: i64 = vox_mesh_vertex_count(m);
+    var nrm: Vec<f64> = Vec::filled(3, 0.0);
+    nrm.set(a, s as f64);
+    var k: i64 = 0;
+    while k < 4 {
+        var cu: i64 = 0;
+        var cv: i64 = 0;
+        if k == 1 || k == 2 {
+            cu = 1;
+        }
+        if k >= 2 {
+            cv = 1;
+        }
+        var p: Vec<f64> = Vec::filled(3, 0.0);
+        p.set(a, plane as f64);
+        p.set((a + 1) % 3, (pu + cu * w) as f64);
+        p.set((a + 2) % 3, (pv + cv * h) as f64);
+        vox_push_vertex(m, p.get(0), p.get(1), p.get(2), nrm.get(0), nrm.get(1), nrm.get(2), (cu * w) as f64, (cv * h) as f64, (ao >> (2 * k)) & 3, mat);
+        k = k + 1;
+    }
+    val a0: i64 = ao & 3;
+    val a1: i64 = (ao >> 2) & 3;
+    val a2: i64 = (ao >> 4) & 3;
+    val a3: i64 = (ao >> 6) & 3;
+    // corners 0,1,2,3 run counter-clockwise seen from +a; split along the
+    // diagonal whose ends are brighter, so the darkening stays symmetric
+    var q: Vec<i64> = Vec::new();
+    if a0 + a2 >= a1 + a3 {
+        q.push(0); q.push(1); q.push(2); q.push(0); q.push(2); q.push(3);
+    } else {
+        q.push(1); q.push(2); q.push(3); q.push(1); q.push(3); q.push(0);
+    }
+    var t: i64 = 0;
+    while t < 6 {
+        var src: i64 = t;
+        if s < 0 {
+            // facing -a: swap the 2nd and 3rd vertex of each triangle
+            if t % 3 == 1 {
+                src = t + 1;
+            } else if t % 3 == 2 {
+                src = t - 1;
+            }
+        }
+        m.indices.push(base + q.get(src));
+        t = t + 1;
+    }
+}
+
+/// One quad per exposed face.
+pub fn vox_mesh_naive(c: &VoxChunk) -> VoxMesh {
+    var m: VoxMesh = vox_mesh_new();
+    var d: i64 = 0;
+    while d < 6 {
+        val a: i64 = vox_axis(d);
+        val du: i64 = vox_dim(c, (a + 1) % 3);
+        val dv: i64 = vox_dim(c, (a + 2) % 3);
+        var pa: i64 = 0;
+        while pa < vox_dim(c, a) {
+            var plane: i64 = pa;
+            if vox_sign(d) > 0 {
+                plane = pa + 1;
+            }
+            var pv: i64 = 0;
+            while pv < dv {
+                var pu: i64 = 0;
+                while pu < du {
+                    val mat: i64 = vox_at_axes(c, a, pa, pu, pv);
+                    if mat != 0 && vox_at_axes(c, a, pa + vox_sign(d), pu, pv) == 0 {
+                        vox_emit_quad(&mut m, d, plane, pu, pv, 1, 1, vox_face_ao(c, d, pa, pu, pv), mat);
+                    }
+                    pu = pu + 1;
+                }
+                pv = pv + 1;
+            }
+            pa = pa + 1;
+        }
+        d = d + 1;
+    }
+    return m;
+}
+
+/// Exposed faces merged into maximal rectangles (same material and AO).
+pub fn vox_mesh_greedy(c: &VoxChunk) -> VoxMesh {
+    var m: VoxMesh = vox_mesh_new();
+    var d: i64 = 0;
+    while d < 6 {
+        val a: i64 = vox_axis(d);
+        val du: i64 = vox_dim(c, (a + 1) % 3);
+        val dv: i64 = vox_dim(c, (a + 2) % 3);
+        var pa: i64 = 0;
+        while pa < vox_dim(c, a) {
+            // mask key: material * 256 + packed AO, 0 = no face
+            var mask: Vec<i64> = Vec::filled(du * dv, 0);
+            var pv: i64 = 0;
+            while pv < dv {
+                var pu: i64 = 0;
+                while pu < du {
+                    val mat: i64 = vox_at_axes(c, a, pa, pu, pv);
+                    if mat != 0 && vox_at_axes(c, a, pa + vox_sign(d), pu, pv) == 0 {
+                        mask.set(pu + du * pv, mat * 256 + vox_face_ao(c, d, pa, pu, pv));
+                    }
+                    pu = pu + 1;
+                }
+                pv = pv + 1;
+            }
+            var plane: i64 = pa;
+            if vox_sign(d) > 0 {
+                plane = pa + 1;
+            }
+            pv = 0;
+            while pv < dv {
+                var pu: i64 = 0;
+                while pu < du {
+                    val key: i64 = mask.get(pu + du * pv);
+                    if key == 0 {
+                        pu = pu + 1;
+                        continue;
+                    }
+                    var w: i64 = 1;
+                    while pu + w < du && mask.get(pu + w + du * pv) == key {
+                        w = w + 1;
+                    }
+                    var h: i64 = 1;
+                    var grow: bool = true;
+                    while grow && pv + h < dv {
+                        var k: i64 = 0;
+                        while k < w {
+                            if mask.get(pu + k + du * (pv + h)) != key {
+                                grow = false;
+                                break;
+                            }
+                            k = k + 1;
+                        }
+                        if grow {
+                            h = h + 1;
+                        }
+                    }
+                    var yy: i64 = 0;
+                    while yy < h {
+                        var xx: i64 = 0;
+                        while xx < w {
+                            mask.set(pu + xx + du * (pv + yy), 0);
+                            xx = xx + 1;
+                        }
+                        yy = yy + 1;
+                    }
+                    vox_emit_quad(&mut m, d, plane, pu, pv, w, h, key & 255, key / 256);
+                    pu = pu + w;
+                }
+                pv = pv + 1;
+            }
+            pa = pa + 1;
+        }
+        d = d + 1;
+    }
+    return m;
+}
+
+/// Total area of the mesh's triangles.
+pub fn vox_mesh_area(m: &VoxMesh) -> f64 {
+    var total: f64 = 0.0;
+    var t: i64 = 0;
+    while t + 2 < m.indices.len() {
+        val i0: i64 = 3 * m.indices.get(t);
+        val i1: i64 = 3 * m.indices.get(t + 1);
+        val i2: i64 = 3 * m.indices.get(t + 2);
+        val ax: f64 = m.positions.get(i1) - m.positions.get(i0);
+        val ay: f64 = m.positions.get(i1 + 1) - m.positions.get(i0 + 1);
+        val az: f64 = m.positions.get(i1 + 2) - m.positions.get(i0 + 2);
+        val bx: f64 = m.positions.get(i2) - m.positions.get(i0);
+        val by: f64 = m.positions.get(i2 + 1) - m.positions.get(i0 + 1);
+        val bz: f64 = m.positions.get(i2 + 2) - m.positions.get(i0 + 2);
+        val cx: f64 = ay * bz - az * by;
+        val cy: f64 = az * bx - ax * bz;
+        val cz: f64 = ax * by - ay * bx;
+        total = total + math_sqrt(cx * cx + cy * cy + cz * cz) / 2.0;
+        t = t + 3;
+    }
+    return total;
+}
+
+/// Signed volume enclosed (divergence theorem); positive when triangles
+/// wind counter-clockwise seen from outside.
+pub fn vox_mesh_volume(m: &VoxMesh) -> f64 {
+    var total: f64 = 0.0;
+    var t: i64 = 0;
+    while t + 2 < m.indices.len() {
+        val i0: i64 = 3 * m.indices.get(t);
+        val i1: i64 = 3 * m.indices.get(t + 1);
+        val i2: i64 = 3 * m.indices.get(t + 2);
+        val x0: f64 = m.positions.get(i0);
+        val y0: f64 = m.positions.get(i0 + 1);
+        val z0: f64 = m.positions.get(i0 + 2);
+        val x1: f64 = m.positions.get(i1);
+        val y1: f64 = m.positions.get(i1 + 1);
+        val z1: f64 = m.positions.get(i1 + 2);
+        val x2: f64 = m.positions.get(i2);
+        val y2: f64 = m.positions.get(i2 + 1);
+        val z2: f64 = m.positions.get(i2 + 2);
+        total = total + (x0 * (y1 * z2 - z1 * y2) - y0 * (x1 * z2 - z1 * x2) + z0 * (x1 * y2 - y1 * x2)) / 6.0;
+        t = t + 3;
+    }
+    return total;
+}
+
+// ─── Marching cubes ────────────────────────────────────────────────────────
+
+fn vox_fidx(nx: i64, ny: i64, x: i64, y: i64, z: i64) -> i64 {
+    return x + (nx + 1) * (y + (ny + 1) * z);
+}
+
+fn vox_fval(f: &Vec<f64>, nx: i64, ny: i64, nz: i64, x: i64, y: i64, z: i64) -> f64 {
+    var cx: i64 = x;
+    var cy: i64 = y;
+    var cz: i64 = z;
+    if cx < 0 {
+        cx = 0;
+    }
+    if cy < 0 {
+        cy = 0;
+    }
+    if cz < 0 {
+        cz = 0;
+    }
+    if cx > nx {
+        cx = nx;
+    }
+    if cy > ny {
+        cy = ny;
+    }
+    if cz > nz {
+        cz = nz;
+    }
+    return f.get(vox_fidx(nx, ny, cx, cy, cz));
+}
+
+fn vox_grad(f: &Vec<f64>, nx: i64, ny: i64, nz: i64, x: i64, y: i64, z: i64, axis: i64) -> f64 {
+    if axis == 0 {
+        return vox_fval(f, nx, ny, nz, x + 1, y, z) - vox_fval(f, nx, ny, nz, x - 1, y, z);
+    }
+    if axis == 1 {
+        return vox_fval(f, nx, ny, nz, x, y + 1, z) - vox_fval(f, nx, ny, nz, x, y - 1, z);
+    }
+    return vox_fval(f, nx, ny, nz, x, y, z + 1) - vox_fval(f, nx, ny, nz, x, y, z - 1);
+}
+
+/// Sample a field into the (nx+1)(ny+1)(nz+1) grid marching cubes reads:
+/// the value at grid point (x, y, z) is f(x * scale, y * scale, z * scale).
+pub fn vox_field_sample(nx: i64, ny: i64, nz: i64, scale: f64, f: fn(f64, f64, f64) -> f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var z: i64 = 0;
+    while z <= nz {
+        var y: i64 = 0;
+        while y <= ny {
+            var x: i64 = 0;
+            while x <= nx {
+                out.push(f((x as f64) * scale, (y as f64) * scale, (z as f64) * scale));
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        z = z + 1;
+    }
+    return out;
+}
+
+/// Iso-surface of `field` (samples on an (nx+1) x (ny+1) x (nz+1) grid, x
+/// fastest) at `iso`; inside is below iso. Positions are in grid units.
+/// Triangles wind counter-clockwise seen from outside (the side above
+/// iso), and normals (the field's gradient) point outward.
+pub fn vox_marching_cubes(field: &Vec<f64>, nx: i64, ny: i64, nz: i64, iso: f64) -> VoxMesh {
+    vox_tables_init();
+    var m: VoxMesh = vox_mesh_new();
+    // one vertex per grid edge: key = 3 * lower grid point index + axis
+    var edge_vert: HashMap<i64, i64> = HashMap::new();
+    var z: i64 = 0;
+    while z < nz {
+        var y: i64 = 0;
+        while y < ny {
+            var x: i64 = 0;
+            while x < nx {
+                var config: i64 = 0;
+                var c: i64 = 0;
+                while c < 8 {
+                    if field.get(vox_fidx(nx, ny, x + vox_cx(c), y + vox_cy(c), z + vox_cz(c))) < iso {
+                        config = config | (1 << c);
+                    }
+                    c = c + 1;
+                }
+                val e_end: i64 = vox_tri_start.get(config + 1);
+                var t: i64 = vox_tri_start.get(config);
+                while t < e_end {
+                    var tri: Vec<i64> = Vec::new();
+                    var k: i64 = 0;
+                    while k < 3 {
+                        val e: i64 = vox_tri_edges.get(t + k);
+                        val ca: i64 = vox_edge_corner(e, 0);
+                        val cb: i64 = vox_edge_corner(e, 1);
+                        var ax: i64 = x + vox_cx(ca);
+                        var ay: i64 = y + vox_cy(ca);
+                        var az: i64 = z + vox_cz(ca);
+                        var bx: i64 = x + vox_cx(cb);
+                        var by: i64 = y + vox_cy(cb);
+                        var bz: i64 = z + vox_cz(cb);
+                        if bx + by + bz < ax + ay + az {
+                            val tx: i64 = ax;
+                            ax = bx;
+                            bx = tx;
+                            val ty: i64 = ay;
+                            ay = by;
+                            by = ty;
+                            val tz: i64 = az;
+                            az = bz;
+                            bz = tz;
+                        }
+                        var axis: i64 = 0;
+                        if by != ay {
+                            axis = 1;
+                        }
+                        if bz != az {
+                            axis = 2;
+                        }
+                        val key: i64 = 3 * vox_fidx(nx, ny, ax, ay, az) + axis;
+                        if edge_vert.contains(key) {
+                            tri.push(edge_vert.get(key));
+                        } else {
+                            val va: f64 = field.get(vox_fidx(nx, ny, ax, ay, az));
+                            val vb: f64 = field.get(vox_fidx(nx, ny, bx, by, bz));
+                            var mu: f64 = 0.5;
+                            if vb != va {
+                                mu = (iso - va) / (vb - va);
+                            }
+                            val px: f64 = (ax as f64) + mu * ((bx - ax) as f64);
+                            val py: f64 = (ay as f64) + mu * ((by - ay) as f64);
+                            val pz: f64 = (az as f64) + mu * ((bz - az) as f64);
+                            var gx: f64 = vox_grad(field, nx, ny, nz, ax, ay, az, 0) * (1.0 - mu) + vox_grad(field, nx, ny, nz, bx, by, bz, 0) * mu;
+                            var gy: f64 = vox_grad(field, nx, ny, nz, ax, ay, az, 1) * (1.0 - mu) + vox_grad(field, nx, ny, nz, bx, by, bz, 1) * mu;
+                            var gz: f64 = vox_grad(field, nx, ny, nz, ax, ay, az, 2) * (1.0 - mu) + vox_grad(field, nx, ny, nz, bx, by, bz, 2) * mu;
+                            val gl: f64 = math_sqrt(gx * gx + gy * gy + gz * gz);
+                            if gl > 0.0 {
+                                gx = gx / gl;
+                                gy = gy / gl;
+                                gz = gz / gl;
+                            }
+                            val vi: i64 = vox_mesh_vertex_count(&m);
+                            vox_push_vertex(&mut m, px, py, pz, gx, gy, gz, 0.0, 0.0, 3, 0);
+                            edge_vert.insert(key, vi);
+                            tri.push(vi);
+                        }
+                        k = k + 1;
+                    }
+                    vox_push_tri(&mut m, tri.get(0), tri.get(1), tri.get(2));
+                    t = t + 3;
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        z = z + 1;
+    }
+    return m;
+}
+
+// The table's triangles, in this corner order, wind clockwise seen from
+// outside: emit them reversed.
+fn vox_push_tri(m: &mut VoxMesh, a: i64, b: i64, c: i64) {
+    m.indices.push(a);
+    m.indices.push(c);
+    m.indices.push(b);
+}
+
+// ─── Mesh checks and export ────────────────────────────────────────────────
+
+/// Every edge used by exactly two triangles, once in each direction: the
+/// mesh is closed and consistently wound.
+pub fn vox_mesh_is_closed(m: &VoxMesh) -> bool {
+    var dir: HashMap<i64, i64> = HashMap::new();
+    val n: i64 = vox_mesh_vertex_count(m);
+    var t: i64 = 0;
+    while t + 2 < m.indices.len() {
+        var k: i64 = 0;
+        while k < 3 {
+            val key: i64 = m.indices.get(t + k) * n + m.indices.get(t + (k + 1) % 3);
+            if dir.contains(key) {
+                return false;
+            }
+            dir.insert(key, 1);
+            k = k + 1;
+        }
+        t = t + 3;
+    }
+    t = 0;
+    while t + 2 < m.indices.len() {
+        var k: i64 = 0;
+        while k < 3 {
+            if !dir.contains(m.indices.get(t + (k + 1) % 3) * n + m.indices.get(t + k)) {
+                return false;
+            }
+            k = k + 1;
+        }
+        t = t + 3;
+    }
+    return true;
+}
+
+/// V - E + F of an indexed triangle mesh (2 for a sphere, 0 for a torus).
+pub fn vox_mesh_euler(m: &VoxMesh) -> i64 {
+    var edges: HashMap<i64, i64> = HashMap::new();
+    val n: i64 = vox_mesh_vertex_count(m);
+    var t: i64 = 0;
+    while t + 2 < m.indices.len() {
+        var k: i64 = 0;
+        while k < 3 {
+            var a: i64 = m.indices.get(t + k);
+            var b: i64 = m.indices.get(t + (k + 1) % 3);
+            if b < a {
+                val tmp: i64 = a;
+                a = b;
+                b = tmp;
+            }
+            edges.insert(a * n + b, 1);
+            k = k + 1;
+        }
+        t = t + 3;
+    }
+    return n - edges.len() + m.indices.len() / 3;
+}
+
+fn vox_num(x: f64) -> str {
+    // up to 4 decimals, trailing zeros trimmed
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg {
+        a = 0.0 - x;
+    }
+    val v: i64 = (a * 10000.0 + 0.5) as i64;
+    var s: str = int_to_str(v / 10000);
+    val fr: i64 = v % 10000;
+    if fr != 0 {
+        var f: str = int_to_str(fr);
+        while str_len(f) < 4 {
+            f = "0" + f;
+        }
+        while str_ends_with(f, "0") {
+            f = str_slice(f, 0, str_len(f) - 1);
+        }
+        s = s + "." + f;
+    }
+    if neg && v != 0 {
+        s = "-" + s;
+    }
+    return s;
+}
+
+/// Wavefront OBJ text (v, vt, vn and f lines; indices 1-based).
+pub fn vox_mesh_to_obj(m: &VoxMesh) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    val n: i64 = vox_mesh_vertex_count(m);
+    var i: i64 = 0;
+    while i < n {
+        sb.append_str("v " + vox_num(m.positions.get(3 * i)) + " " + vox_num(m.positions.get(3 * i + 1)) + " " + vox_num(m.positions.get(3 * i + 2)) + "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        sb.append_str("vt " + vox_num(m.uvs.get(2 * i)) + " " + vox_num(m.uvs.get(2 * i + 1)) + "\n");
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        sb.append_str("vn " + vox_num(m.normals.get(3 * i)) + " " + vox_num(m.normals.get(3 * i + 1)) + " " + vox_num(m.normals.get(3 * i + 2)) + "\n");
+        i = i + 1;
+    }
+    var t: i64 = 0;
+    while t + 2 < m.indices.len() {
+        val a: str = int_to_str(m.indices.get(t) + 1);
+        val b: str = int_to_str(m.indices.get(t + 1) + 1);
+        val c: str = int_to_str(m.indices.get(t + 2) + 1);
+        sb.append_str("f " + a + "/" + a + "/" + a + " " + b + "/" + b + "/" + b + " " + c + "/" + c + "/" + c + "\n");
+        t = t + 3;
+    }
+    return sb.to_str();
+}

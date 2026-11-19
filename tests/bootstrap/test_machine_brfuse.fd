@@ -1,0 +1,203 @@
+// Track MI (docs/roadmap/llvm-roadmap.md), the machine layer
+// (compiler/nat_ir.fd):
+//   MI23 a compare and the branch that tests it fuse into one MO_BRCC
+//        (x86-64 cmp + jcc, AArch64 cmp + b.cond or cbz/cbnz, RISC-V one
+//        inverse branch over a jal) when the compare's value is not used
+//        after the branch (ng_fuse_branches; FID_NAT_OFF=brfuse: SETCC +
+//        BNEZ as before). Every compare kind, signed and unsigned, against
+//        zero, in loops, and a compare whose value is used again (no
+//        fusion: the value stays live).
+//   MI22 element addresses as one MO_ADDSHL (fixed arrays, inline Vec
+//        get/set: FID_NAT_OFF=addshl turns it off).
+// Native check: NATIVE=1 bash scripts/cross-test.sh aarch64-linux (and
+// riscv64-linux, x86_64-linux), also with FID_VERIFY=1 (the MIR verifier).
+// Expected output:
+// 14
+// 41
+// 50
+// 41
+// 14
+// 14
+// 50
+// 41
+// -1
+// 0
+// 1
+// 11
+// 0
+// 4950
+// 55
+// 11
+// 2470
+// 2561
+// 150
+// 7
+// 3
+
+fn cmp_all(a: i64, b: i64) -> i64 {
+    var bits: i64 = 0;
+    if a == b {
+        bits = bits + 1;
+    }
+    if a != b {
+        bits = bits + 2;
+    }
+    if a < b {
+        bits = bits + 4;
+    }
+    if a <= b {
+        bits = bits + 8;
+    }
+    if a > b {
+        bits = bits + 16;
+    }
+    if a >= b {
+        bits = bits + 32;
+    }
+    return bits;
+}
+
+fn cmp_u(a: u64, b: u64) -> i64 {
+    var bits: i64 = 0;
+    if a == b {
+        bits = bits + 1;
+    }
+    if a != b {
+        bits = bits + 2;
+    }
+    if a < b {
+        bits = bits + 4;
+    }
+    if a <= b {
+        bits = bits + 8;
+    }
+    if a > b {
+        bits = bits + 16;
+    }
+    if a >= b {
+        bits = bits + 32;
+    }
+    return bits;
+}
+
+fn sign(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - 1;
+    }
+    if x == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+// The compare's value is read again after the first branch: it must stay
+fn keep(a: i64, b: i64) -> i64 {
+    val c: bool = a < b;
+    var r: i64 = 0;
+    if c {
+        r = 10;
+    }
+    if c {
+        r = r + 1;
+    }
+    return r;
+}
+
+fn sum_to(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn count_down(n: i64) -> i64 {
+    var k: i64 = n;
+    var steps: i64 = 0;
+    while k > 0 {
+        steps = steps + k;
+        k = k - 1;
+    }
+    return steps;
+}
+
+fn in_range(x: i64, lo: i64, hi: i64) -> bool {
+    return x >= lo && x <= hi;
+}
+
+fn main() -> i64 {
+    println(cmp_all(3, 5));
+    println(cmp_all(5, 5));
+    println(cmp_all(7, 0 - 2));
+    println(cmp_all(0 - 9, 0 - 9));
+    println(cmp_all(0 - 4, 0));
+    val one: u64 = 1;
+    val top: u64 = 18446744073709551615;
+    val zero: u64 = 0;
+    println(cmp_u(one, top));
+    println(cmp_u(top, one));
+    println(cmp_u(zero, zero));
+    println(sign(0 - 5));
+    println(sign(0));
+    println(sign(8));
+    println(keep(1, 2));
+    println(keep(2, 1));
+    println(sum_to(100));
+    println(count_down(10));
+    var inside: i64 = 0;
+    var x: i64 = 0;
+    while x < 50 {
+        if in_range(x, 10, 20) {
+            inside = inside + 1;
+        }
+        x = x + 1;
+    }
+    println(inside);
+    // Inline Vec get/set: bounds checks fused, element addresses in one op
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 20 {
+        v.push(i * i);
+        i = i + 1;
+    }
+    var t: i64 = 0;
+    i = 0;
+    while i < 20 {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    println(t);
+    v.set(3, 100);
+    t = 0;
+    i = 0;
+    while i < v.len() {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    println(t);
+    // A fixed array: element addresses (8-byte elements)
+    val arr = [10, 20, 30, 40, 50];
+    var s: i64 = 0;
+    for k in 0..5 {
+        s = s + arr[k];
+    }
+    println(s);
+    // Equal and unequal against a value that changes in the loop
+    var hits: i64 = 0;
+    var j: i64 = 0;
+    while j != 7 {
+        hits = hits + 1;
+        j = j + 1;
+    }
+    println(hits);
+    var evens: i64 = 0;
+    for m in 0..6 {
+        if m % 2 == 0 {
+            evens = evens + 1;
+        }
+    }
+    println(evens);
+    return 0;
+}

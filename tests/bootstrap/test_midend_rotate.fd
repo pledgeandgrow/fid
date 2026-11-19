@@ -1,0 +1,144 @@
+// ME23 (compiler/iropt_me.fd ime_rotate, pass `rotate`, opt-in on the
+// native paths: FID_IROPT_ON=rotate): loop rotation on the IR, shared by
+// pe_ir and nat_ir. A latch that jumps back to a header made only of the
+// loop's test gets a copy of the test and branches to the body itself; a
+// value of the header read after it is loaded again at the top of the body
+// and of the exit. Shapes: a counted loop over a Vec (checks.fd's
+// counted-loop proof must still remove its bounds checks: `fid explain`
+// with FID_IROPT_ON=rotate lists `sum_vec`'s get as removed), a test with
+// arithmetic (`i < n - 1`), the loop variable read after the loop, nested
+// loops, a loop never entered, a `break` and a `continue` (not rotated: the
+// exit or the header has two ways in), a loop counting down (left alone).
+// Every result must be the one the program computes, with rotate on and
+// off (tests/tooling/rotate-check.sh, which also reads `iropt: rotate N
+// loops`, N > 0 here).
+//
+// Expected output:
+// 15
+// 6
+// 6 21
+// 36 11
+// 0 0
+// 7
+// 12
+// 15
+// 1 2 3 4 5
+
+fn sum_vec(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn below_last(n: i64) -> i64 {
+    // the test computes n - 1 each time
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n - 1 {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn after_loop(n: i64) {
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n {
+        i = i + 1;
+        s = s + i;
+    }
+    println(int_to_str(i) + " " + int_to_str(s));
+}
+
+fn nested(n: i64) {
+    var i: i64 = 0;
+    var c: i64 = 0;
+    var last: i64 = 0;
+    while i < n {
+        var j: i64 = 0;
+        while j < n {
+            c = c + 1;
+            last = i + j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    println(int_to_str(c) + " " + int_to_str(last + 1));
+}
+
+fn never(n: i64) {
+    var i: i64 = 5;
+    var s: i64 = 0;
+    while i < n {
+        s = s + 1;
+        i = i + 1;
+    }
+    println(int_to_str(s) + " " + int_to_str(i - 5));
+}
+
+fn with_break(n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        if i == 7 {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn with_continue(n: i64) -> i64 {
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n {
+        i = i + 1;
+        if i % 2 == 1 {
+            continue;
+        }
+        s = s + i;
+    }
+    return s;
+}
+
+fn down(v: & Vec<i64>) -> i64 {
+    var i: i64 = v.len();
+    var s: i64 = 0;
+    while i > 0 {
+        i = i - 1;
+        s = s + v.get(i);
+    }
+    return s;
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 1;
+    while k <= 5 {
+        v.push(k);
+        k = k + 1;
+    }
+    var six: i64 = str_len("abcdef");
+    println(sum_vec(& v));
+    println(below_last(six - 1));
+    after_loop(six);
+    nested(six);
+    never(six - 2);
+    println(with_break(six * 2));
+    println(with_continue(six));
+    println(down(& v));
+    var line: str = "";
+    var q: i64 = 0;
+    while q < v.len() {
+        if q > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(v.get(q));
+        q = q + 1;
+    }
+    println(line);
+}

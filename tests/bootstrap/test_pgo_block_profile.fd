@@ -1,0 +1,76 @@
+// OP30 (competitive roadmap): a block-level profile from a real run.
+// `fid run --profile p` starts each block of every function of more than
+// one block with a call to an empty probe "<function>@<block id>"
+// (compiler/pgo.fd pgo_instrument) and writes, besides each function's
+// calls, "<1 + times entered> <function>@<block id>" for every block of
+// each function the run called (pgo_write; "fides-profile 2").
+// `fid emit --profile-use p` then weighs blocks, not only functions
+// (tests/tooling/pgo-block-check.sh):
+// - scan: called 3000 times; its call to mid sits in a block the run never
+//   enters, so that call site is cold and the default inliner keeps the
+//   call (iropt.fd iro_inline_limit: limit 8), though mid itself is hot
+//   (3000 calls from sum_mid's loop) and inlined there;
+// - rare: called 3000 times; its 12-trip loop never runs (flag is 0 to 4,
+//   never 7), so the loop is not unrolled (iropt_me.fd ime_unroll_one);
+// - nat_ir lays the blocks the run never entered after the others
+//   (nat_ir.fd ng_pgo_cold_labels, which reads the same lines).
+// The program prints the same with and without the probes and the profile.
+//
+// Expected output:
+// 10500
+// 13498500
+// 36017968
+
+fn mid(a: i64) -> i64 {
+    return a * 7 + 1 + (a & 15) + (a | 3);
+}
+
+fn scan(x: i64) -> i64 {
+    if x < 0 {
+        return mid(x);
+    }
+    return x & 7;
+}
+
+fn sum_mid(n: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        t = t + mid(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn rare(n: i64, flag: i64) -> i64 {
+    var t: i64 = n;
+    if flag == 7 {
+        var i: i64 = 0;
+        while i < 12 {
+            t = t + i * n;
+            i = i + 1;
+        }
+    }
+    return t;
+}
+
+fn main() {
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 3000 {
+        data.push(i * 3 + 1);
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    var r: i64 = 0;
+    i = 0;
+    while i < data.len() {
+        var x: i64 = data.get(i);
+        s = s + scan(x);
+        r = r + rare(x, x / 2000);
+        i = i + 1;
+    }
+    println(s);
+    println(r);
+    println(sum_mid(3000));
+}

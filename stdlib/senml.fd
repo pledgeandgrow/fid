@@ -1,0 +1,781 @@
+// Fides SenML (RFC 8428): Sensor Measurement Lists in JSON and CBOR
+//
+// All pure computation, no platform seam:
+//   - SenmlRecord: one record with any of the fields of RFC 8428 Table 1
+//     (bn bt bu bv bs bver n u v vs vb vd s t ut); `fields` says which are
+//     present (SENML_* bits).
+//   - JSON (application/senml+json, section 5): senml_json_encode writes
+//     the compact form the RFC's examples use (labels in the order
+//     bn bt bu bv bs bver n u t ut v vs vb vd s); vd is base64url without
+//     padding. senml_json_decode reads any valid JSON pack (stdlib json's
+//     JsonDoc), checks each label's type and rejects unknown labels ending
+//     in "_" (must-understand, section 4.4).
+//   - CBOR (application/senml+cbor, section 6, using stdlib cbor): integer
+//     map keys of Table 4, numbers as integers when integral, else the
+//     shortest float that keeps them; vd as a byte string. The decoder
+//     takes definite or indefinite arrays and maps.
+//   - senml_resolve (section 4.6): applies base name, time, unit, value,
+//     sum and version to each record, turns times below 2^28 into times
+//     relative to `now` (4.5.3), checks names (4.5.1), drops records that
+//     carry only base fields, and sorts the records by time (stable).
+//
+// Numbers in JSON are written with float_to_str (the shortest digits that
+// read back the same, without an exponent): 1.276020076001e+09 is written
+// 1276020076.001, the same number. A NaN or infinite value is refused.
+//
+// Usage:
+//   use senml;
+//   val p: SenmlPack = senml_json_decode(text);
+//   val r: SenmlPack = senml_resolve(p.records, 1700000000.0);
+//   val cb: Vec<i64> = senml_cbor_encode(r.records);
+
+module senml;
+ use vec; use string; use encoding; use json; use cbor;
+
+// Field bits of SenmlRecord.fields
+pub const SENML_BN: i64 = 1;
+pub const SENML_BT: i64 = 2;
+pub const SENML_BU: i64 = 4;
+pub const SENML_BV: i64 = 8;
+pub const SENML_BS: i64 = 16;
+pub const SENML_BVER: i64 = 32;
+pub const SENML_N: i64 = 64;
+pub const SENML_U: i64 = 128;
+pub const SENML_V: i64 = 256;
+pub const SENML_VS: i64 = 512;
+pub const SENML_VB: i64 = 1024;
+pub const SENML_VD: i64 = 2048;
+pub const SENML_S: i64 = 4096;
+pub const SENML_T: i64 = 8192;
+pub const SENML_UT: i64 = 16384;
+
+/// Times below this are relative to "now" (RFC 8428 4.5.3).
+pub const SENML_REL_LIMIT: f64 = 268435456.0;
+
+pub struct SenmlRecord {
+    pub fields: i64,
+    pub bn: str,
+    pub bt: f64,
+    pub bu: str,
+    pub bv: f64,
+    pub bs: f64,
+    pub bver: i64,
+    pub n: str,
+    pub u: str,
+    pub v: f64,
+    pub vs: str,
+    pub vb: bool,
+    pub vd: Vec<i64>,
+    pub s: f64,
+    pub t: f64,
+    pub ut: f64,
+}
+
+/// A decoded or resolved pack. `ok` false: `error` says why.
+pub struct SenmlPack {
+    pub ok: bool,
+    pub error: str,
+    pub records: Vec<SenmlRecord>,
+}
+
+pub fn senml_record() -> SenmlRecord {
+    return SenmlRecord {
+        fields: 0, bn: "", bt: 0.0, bu: "", bv: 0.0, bs: 0.0, bver: 10, n: "", u: "", v: 0.0, vs: "", vb: false, vd: Vec::new(), s: 0.0, t: 0.0, ut: 0.0,
+    };
+}
+
+/// A record with a name, a unit ("" for none) and a numeric value.
+pub fn senml_value(name: str, unit: str, v: f64) -> SenmlRecord {
+    var r: SenmlRecord = senml_record();
+    senml_set_n(& mut r, name);
+    if unit != "" {
+        senml_set_u(& mut r, unit);
+    }
+    senml_set_v(& mut r, v);
+    return r;
+}
+
+pub fn senml_has(r: & SenmlRecord, bit: i64) -> bool {
+    return (r.fields & bit) != 0;
+}
+
+pub fn senml_set_bn(r: & mut SenmlRecord, x: str) {
+    r.bn = x;
+    r.fields = r.fields | SENML_BN;
+}
+
+pub fn senml_set_bt(r: & mut SenmlRecord, x: f64) {
+    r.bt = x;
+    r.fields = r.fields | SENML_BT;
+}
+
+pub fn senml_set_bu(r: & mut SenmlRecord, x: str) {
+    r.bu = x;
+    r.fields = r.fields | SENML_BU;
+}
+
+pub fn senml_set_bv(r: & mut SenmlRecord, x: f64) {
+    r.bv = x;
+    r.fields = r.fields | SENML_BV;
+}
+
+pub fn senml_set_bs(r: & mut SenmlRecord, x: f64) {
+    r.bs = x;
+    r.fields = r.fields | SENML_BS;
+}
+
+pub fn senml_set_bver(r: & mut SenmlRecord, x: i64) {
+    r.bver = x;
+    r.fields = r.fields | SENML_BVER;
+}
+
+pub fn senml_set_n(r: & mut SenmlRecord, x: str) {
+    r.n = x;
+    r.fields = r.fields | SENML_N;
+}
+
+pub fn senml_set_u(r: & mut SenmlRecord, x: str) {
+    r.u = x;
+    r.fields = r.fields | SENML_U;
+}
+
+pub fn senml_set_v(r: & mut SenmlRecord, x: f64) {
+    r.v = x;
+    r.fields = r.fields | SENML_V;
+}
+
+pub fn senml_set_vs(r: & mut SenmlRecord, x: str) {
+    r.vs = x;
+    r.fields = r.fields | SENML_VS;
+}
+
+pub fn senml_set_vb(r: & mut SenmlRecord, x: bool) {
+    r.vb = x;
+    r.fields = r.fields | SENML_VB;
+}
+
+pub fn senml_set_vd(r: & mut SenmlRecord, x: Vec<i64>) {
+    r.vd = x;
+    r.fields = r.fields | SENML_VD;
+}
+
+pub fn senml_set_s(r: & mut SenmlRecord, x: f64) {
+    r.s = x;
+    r.fields = r.fields | SENML_S;
+}
+
+pub fn senml_set_t(r: & mut SenmlRecord, x: f64) {
+    r.t = x;
+    r.fields = r.fields | SENML_T;
+}
+
+pub fn senml_set_ut(r: & mut SenmlRecord, x: f64) {
+    r.ut = x;
+    r.fields = r.fields | SENML_UT;
+}
+
+fn sm_finite(x: f64) -> bool {
+    return x == x && x != 1.0 / 0.0 && x != - 1.0 / 0.0;
+}
+
+// ─── base64url (RFC 4648 section 5, no padding) ──────────────────────────
+
+pub fn senml_b64url_encode(b: Vec<i64>) -> str {
+    val std: str = b64_encode_bytes(b);
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(std) {
+        val c: i64 = str_byte_at(std, i);
+        if c == 43 {
+            out = out + "-";
+        } else if c == 47 {
+            out = out + "_";
+        } else if c != 61 {
+            out = out + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Decode base64url (padding optional); false in `ok` of the result when a
+/// character is outside the alphabet.
+pub fn senml_b64url_decode(s: str, ok: & mut bool) -> Vec<i64> {
+    var std: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 45 {
+            std = std + "+";
+        } else if c == 95 {
+            std = std + "/";
+        } else if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+            std = std + char_to_str(c);
+        } else if c != 61 {
+            *ok = false;
+        }
+        i = i + 1;
+    }
+    if str_len(std) % 4 == 1 {
+        *ok = false;
+    }
+    while str_len(std) % 4 != 0 {
+        std = std + "=";
+    }
+    return b64_decode_bytes(std);
+}
+
+// ─── JSON ─────────────────────────────────────────────────────────────────
+
+/// A number as JSON text: integral values without a fraction.
+pub fn senml_num(x: f64) -> str {
+    return float_to_str(x);
+}
+
+fn sm_jnum(out: str, label: str, x: f64, first: & mut bool) -> str {
+    return sm_jraw(out, label, senml_num(x), first);
+}
+
+fn sm_jraw(out: str, label: str, raw: str, first: & mut bool) -> str {
+    var o: str = out;
+    if !*first {
+        o = o + ",";
+    }
+    *first = false;
+    return o + "\"" + label + "\":" + raw;
+}
+
+/// One record as a JSON object.
+pub fn senml_json_record(r: & SenmlRecord) -> str {
+    var o: str = "{";
+    var first: bool = true;
+    if senml_has(r, SENML_BN) {
+        o = sm_jraw(o, "bn", json_string(r.bn), & mut first);
+    }
+    if senml_has(r, SENML_BT) {
+        o = sm_jnum(o, "bt", r.bt, & mut first);
+    }
+    if senml_has(r, SENML_BU) {
+        o = sm_jraw(o, "bu", json_string(r.bu), & mut first);
+    }
+    if senml_has(r, SENML_BV) {
+        o = sm_jnum(o, "bv", r.bv, & mut first);
+    }
+    if senml_has(r, SENML_BS) {
+        o = sm_jnum(o, "bs", r.bs, & mut first);
+    }
+    if senml_has(r, SENML_BVER) {
+        o = sm_jraw(o, "bver", int_to_str(r.bver), & mut first);
+    }
+    if senml_has(r, SENML_N) {
+        o = sm_jraw(o, "n", json_string(r.n), & mut first);
+    }
+    if senml_has(r, SENML_U) {
+        o = sm_jraw(o, "u", json_string(r.u), & mut first);
+    }
+    if senml_has(r, SENML_T) {
+        o = sm_jnum(o, "t", r.t, & mut first);
+    }
+    if senml_has(r, SENML_UT) {
+        o = sm_jnum(o, "ut", r.ut, & mut first);
+    }
+    if senml_has(r, SENML_V) {
+        o = sm_jnum(o, "v", r.v, & mut first);
+    }
+    if senml_has(r, SENML_VS) {
+        o = sm_jraw(o, "vs", json_string(r.vs), & mut first);
+    }
+    if senml_has(r, SENML_VB) {
+        o = sm_jraw(o, "vb", bool_to_str(r.vb), & mut first);
+    }
+    if senml_has(r, SENML_VD) {
+        o = sm_jraw(o, "vd", "\"" + senml_b64url_encode(r.vd) + "\"", & mut first);
+    }
+    if senml_has(r, SENML_S) {
+        o = sm_jnum(o, "s", r.s, & mut first);
+    }
+    return o + "}";
+}
+
+fn sm_record_finite(r: & SenmlRecord) -> bool {
+    return sm_finite(r.bt) && sm_finite(r.bv) && sm_finite(r.bs) && sm_finite(r.v) && sm_finite(r.s) && sm_finite(r.t) && sm_finite(r.ut);
+}
+
+/// A pack as compact JSON: [{...},{...}]. "" when a number is NaN or
+/// infinite (JSON has no such numbers).
+pub fn senml_json_encode(records: Vec<SenmlRecord>) -> str {
+    var o: str = "[";
+    var i: i64 = 0;
+    while i < records.len() {
+        val r: SenmlRecord = records.get(i);
+        if !sm_record_finite(& r) {
+            return "";
+        }
+        if i > 0 {
+            o = o + ",";
+        }
+        o = o + senml_json_record(& r);
+        i = i + 1;
+    }
+    return o + "]";
+}
+
+fn sm_pack_err(msg: str) -> SenmlPack {
+    return SenmlPack {
+        ok: false, error: msg, records: Vec::new()
+    };
+}
+
+/// Read a JSON pack.
+pub fn senml_json_decode(text: str) -> SenmlPack {
+    val d: JsonDoc = json_index(text);
+    if !d.ok {
+        return sm_pack_err("not valid JSON");
+    }
+    val root: i64 = jd_root(& d);
+    if jd_kind(& d, root) != JSON_ARRAY {
+        return sm_pack_err("a pack is a JSON array");
+    }
+    var out: Vec<SenmlRecord> = Vec::new();
+    var i: i64 = 0;
+    while i < jd_len(& d, root) {
+        val obj: i64 = jd_at(& d, root, i);
+        if jd_kind(& d, obj) != JSON_OBJECT {
+            return sm_pack_err("record " + int_to_str(i) + " is not an object");
+        }
+        var r: SenmlRecord = senml_record();
+        var m: i64 = 0;
+        while m < jd_len(& d, obj) {
+            val key: str = jd_key(& d, obj, m);
+            val node: i64 = jd_member(& d, obj, m);
+            val err: str = sm_json_field(& mut r, key, & d, node);
+            if err != "" {
+                return sm_pack_err("record " + int_to_str(i) + ": " + err);
+            }
+            m = m + 1;
+        }
+        out.push(r);
+        i = i + 1;
+    }
+    return SenmlPack {
+        ok: true, error: "", records: out
+    };
+}
+
+fn sm_is_text_label(k: str) -> bool {
+    return k == "bn" || k == "bu" || k == "n" || k == "u" || k == "vs" || k == "vd";
+}
+
+fn sm_is_num_label(k: str) -> bool {
+    return k == "bt" || k == "bv" || k == "bs" || k == "bver" || k == "v" || k == "s" || k == "t" || k == "ut";
+}
+
+// Store one JSON member; an error message, or "".
+fn sm_json_field(r: & mut SenmlRecord, key: str, d: & JsonDoc, node: i64) -> str {
+    val kind: i64 = jd_kind(d, node);
+    if sm_is_text_label(key) {
+        if kind != JSON_STRING {
+            return "label " + key + " needs a string";
+        }
+        val sv: str = jd_str(d, node);
+        if key == "vd" {
+            var ok: bool = true;
+            val bytes: Vec<i64> = senml_b64url_decode(sv, & mut ok);
+            if !ok {
+                return "vd is not base64url";
+            }
+            senml_set_vd(r, bytes);
+            return "";
+        }
+        return sm_set_text(r, key, sv);
+    }
+    if sm_is_num_label(key) {
+        if kind != JSON_NUMBER {
+            return "label " + key + " needs a number";
+        }
+        if key == "bver" {
+            senml_set_bver(r, jd_int(d, node, 10));
+            return "";
+        }
+        return sm_set_num(r, key, jd_num(d, node, 0.0));
+    }
+    if key == "vb" {
+        if kind != JSON_TRUE && kind != JSON_FALSE {
+            return "label vb needs a boolean";
+        }
+        senml_set_vb(r, kind == JSON_TRUE);
+        return "";
+    }
+    if str_ends_with(key, "_") {
+        return "unknown must-understand label " + key;
+    }
+    return "";   // other labels are extensions: ignored
+}
+
+fn sm_set_text(r: & mut SenmlRecord, key: str, sv: str) -> str {
+    if key == "bn" {
+        senml_set_bn(r, sv);
+    } else if key == "bu" {
+        senml_set_bu(r, sv);
+    } else if key == "n" {
+        senml_set_n(r, sv);
+    } else if key == "u" {
+        senml_set_u(r, sv);
+    } else {
+        senml_set_vs(r, sv);
+    }
+    return "";
+}
+
+fn sm_set_num(r: & mut SenmlRecord, key: str, x: f64) -> str {
+    if key == "bt" {
+        senml_set_bt(r, x);
+    } else if key == "bv" {
+        senml_set_bv(r, x);
+    } else if key == "bs" {
+        senml_set_bs(r, x);
+    } else if key == "v" {
+        senml_set_v(r, x);
+    } else if key == "s" {
+        senml_set_s(r, x);
+    } else if key == "t" {
+        senml_set_t(r, x);
+    } else {
+        senml_set_ut(r, x);
+    }
+    return "";
+}
+
+// ─── CBOR (section 6) ─────────────────────────────────────────────────────
+
+/// The CBOR map key of a label (Table 4), or 99 for none.
+pub fn senml_cbor_key(label: str) -> i64 {
+    if label == "bver" { return - 1; }
+    if label == "bn" { return - 2; }
+    if label == "bt" { return - 3; }
+    if label == "bu" { return - 4; }
+    if label == "bv" { return - 5; }
+    if label == "bs" { return - 16; }
+    if label == "n" { return 0; }
+    if label == "u" { return 1; }
+    if label == "v" { return 2; }
+    if label == "vs" { return 3; }
+    if label == "vb" { return 4; }
+    if label == "s" { return 5; }
+    if label == "t" { return 6; }
+    if label == "ut" { return 7; }
+    if label == "vd" { return 8; }
+    return 99;
+}
+
+fn sm_label_of_key(k: i64) -> str {
+    if k == - 1 { return "bver"; }
+    if k == - 2 { return "bn"; }
+    if k == - 3 { return "bt"; }
+    if k == - 4 { return "bu"; }
+    if k == - 5 { return "bv"; }
+    if k == - 16 { return "bs"; }
+    if k == 0 { return "n"; }
+    if k == 1 { return "u"; }
+    if k == 2 { return "v"; }
+    if k == 3 { return "vs"; }
+    if k == 4 { return "vb"; }
+    if k == 5 { return "s"; }
+    if k == 6 { return "t"; }
+    if k == 7 { return "ut"; }
+    if k == 8 { return "vd"; }
+    return "";
+}
+
+/// A number in CBOR: an integer when integral (and within +-2^53), else
+/// the shortest float that keeps it.
+pub fn senml_cbor_put_num(out: & mut Vec<i64>, x: f64) {
+    if x >= - 9007199254740992.0 && x <= 9007199254740992.0 {
+        val i: i64 = x as i64;
+        if (i as f64) == x && p_f64_to_bits(x) != p_f64_to_bits(cbor_negate(0.0)) {
+            cbor_put_int(out, i);
+            return;
+        }
+    }
+    cbor_put_float(out, x);
+}
+
+fn sm_count(r: & SenmlRecord) -> i64 {
+    var n: i64 = 0;
+    var f: i64 = r.fields;
+    while f != 0 {
+        n = n + (f & 1);
+        f = f >> 1;
+    }
+    return n;
+}
+
+fn sm_cbor_record(out: & mut Vec<i64>, r: & SenmlRecord) {
+    cbor_put_map_head(out, sm_count(r));
+    if senml_has(r, SENML_BN) {
+        cbor_put_int(out, - 2);
+        cbor_put_text(out, r.bn);
+    }
+    if senml_has(r, SENML_BT) {
+        cbor_put_int(out, - 3);
+        senml_cbor_put_num(out, r.bt);
+    }
+    if senml_has(r, SENML_BU) {
+        cbor_put_int(out, - 4);
+        cbor_put_text(out, r.bu);
+    }
+    if senml_has(r, SENML_BV) {
+        cbor_put_int(out, - 5);
+        senml_cbor_put_num(out, r.bv);
+    }
+    if senml_has(r, SENML_BS) {
+        cbor_put_int(out, - 16);
+        senml_cbor_put_num(out, r.bs);
+    }
+    if senml_has(r, SENML_BVER) {
+        cbor_put_int(out, - 1);
+        cbor_put_int(out, r.bver);
+    }
+    if senml_has(r, SENML_N) {
+        cbor_put_int(out, 0);
+        cbor_put_text(out, r.n);
+    }
+    if senml_has(r, SENML_U) {
+        cbor_put_int(out, 1);
+        cbor_put_text(out, r.u);
+    }
+    if senml_has(r, SENML_T) {
+        cbor_put_int(out, 6);
+        senml_cbor_put_num(out, r.t);
+    }
+    if senml_has(r, SENML_UT) {
+        cbor_put_int(out, 7);
+        senml_cbor_put_num(out, r.ut);
+    }
+    if senml_has(r, SENML_V) {
+        cbor_put_int(out, 2);
+        senml_cbor_put_num(out, r.v);
+    }
+    if senml_has(r, SENML_VS) {
+        cbor_put_int(out, 3);
+        cbor_put_text(out, r.vs);
+    }
+    if senml_has(r, SENML_VB) {
+        cbor_put_int(out, 4);
+        cbor_put_bool(out, r.vb);
+    }
+    if senml_has(r, SENML_VD) {
+        cbor_put_int(out, 8);
+        cbor_put_bytes(out, r.vd);
+    }
+    if senml_has(r, SENML_S) {
+        cbor_put_int(out, 5);
+        senml_cbor_put_num(out, r.s);
+    }
+}
+
+/// A pack as CBOR: a definite-length array of maps.
+pub fn senml_cbor_encode(records: Vec<SenmlRecord>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    cbor_put_array_head(& mut out, records.len());
+    var i: i64 = 0;
+    while i < records.len() {
+        val r: SenmlRecord = records.get(i);
+        sm_cbor_record(& mut out, & r);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Read a CBOR pack (keys: Table 4 integers, or the JSON labels as text).
+pub fn senml_cbor_decode(bytes: Vec<i64>) -> SenmlPack {
+    val d: CborDoc = cbor_decode_all(bytes);
+    if !d.ok {
+        return sm_pack_err("CBOR: " + d.error);
+    }
+    if cbor_kind(& d, d.root) != CBOR_ARRAY {
+        return sm_pack_err("a pack is a CBOR array");
+    }
+    var out: Vec<SenmlRecord> = Vec::new();
+    var i: i64 = 0;
+    while i < cbor_len(& d, d.root) {
+        val m: i64 = cbor_at(& d, d.root, i);
+        if cbor_kind(& d, m) != CBOR_MAP {
+            return sm_pack_err("record " + int_to_str(i) + " is not a map");
+        }
+        var r: SenmlRecord = senml_record();
+        var j: i64 = 0;
+        while j < cbor_len(& d, m) {
+            val k: i64 = cbor_map_key(& d, m, j);
+            val v: i64 = cbor_map_val(& d, m, j);
+            var label: str = "";
+            val kk: i64 = cbor_kind(& d, k);
+            if kk == CBOR_TEXT {
+                label = cbor_text(& d, k);
+            } else if (kk == CBOR_UINT || kk == CBOR_NEGINT) && cbor_int_fits(& d, k) {
+                label = sm_label_of_key(cbor_int(& d, k));
+            }
+            val err: str = sm_cbor_field(& mut r, label, & d, v);
+            if err != "" {
+                return sm_pack_err("record " + int_to_str(i) + ": " + err);
+            }
+            j = j + 1;
+        }
+        out.push(r);
+        i = i + 1;
+    }
+    return SenmlPack {
+        ok: true, error: "", records: out
+    };
+}
+
+fn sm_cbor_field(r: & mut SenmlRecord, label: str, d: & CborDoc, v: i64) -> str {
+    val kind: i64 = cbor_kind(d, v);
+    if label == "vd" {
+        if kind != CBOR_BYTES {
+            return "vd needs a byte string";
+        }
+        senml_set_vd(r, cbor_bytes(d, v));
+        return "";
+    }
+    if sm_is_text_label(label) {
+        if kind != CBOR_TEXT {
+            return "label " + label + " needs a text string";
+        }
+        return sm_set_text(r, label, cbor_text(d, v));
+    }
+    if sm_is_num_label(label) {
+        if !cbor_is_number(d, v) {
+            return "label " + label + " needs a number";
+        }
+        if label == "bver" {
+            senml_set_bver(r, cbor_int(d, v));
+            return "";
+        }
+        return sm_set_num(r, label, cbor_float(d, v));
+    }
+    if label == "vb" {
+        if !cbor_is_bool(d, v) {
+            return "label vb needs a boolean";
+        }
+        senml_set_vb(r, cbor_bool(d, v));
+        return "";
+    }
+    if str_ends_with(label, "_") {
+        return "unknown must-understand label " + label;
+    }
+    return "";
+}
+
+// ─── Resolution (section 4.6) ─────────────────────────────────────────────
+
+/// Whether a resolved name is valid (RFC 8428 4.5.1): it starts with a
+/// letter or digit and holds only letters, digits and - : . / _
+pub fn senml_name_ok(name: str) -> bool {
+    val n: i64 = str_len(name);
+    if n == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(name, i);
+        val alnum: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if !alnum {
+            if i == 0 {
+                return false;
+            }
+            if !(c == 45 || c == 58 || c == 46 || c == 47 || c == 95) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Resolve a pack: each record gets its full name, absolute time (`now`
+/// is the current time in seconds since 1970, for relative times), unit,
+/// value and sum; base fields are gone (bver stays when it is not 10).
+/// Records with no value and no sum are dropped; the rest are sorted by
+/// time, keeping the pack's order for equal times.
+pub fn senml_resolve(records: Vec<SenmlRecord>, now: f64) -> SenmlPack {
+    var bn: str = "";
+    var bt: f64 = 0.0;
+    var bu: str = "";
+    var has_bu: bool = false;
+    var bv: f64 = 0.0;
+    var has_bv: bool = false;
+    var bs: f64 = 0.0;
+    var has_bs: bool = false;
+    var bver: i64 = 10;
+    var out: Vec<SenmlRecord> = Vec::new();
+    var i: i64 = 0;
+    while i < records.len() {
+        val r: SenmlRecord = records.get(i);
+        if senml_has(& r, SENML_BN) { bn = r.bn; }
+        if senml_has(& r, SENML_BT) { bt = r.bt; }
+        if senml_has(& r, SENML_BU) { bu = r.bu; has_bu = true; }
+        if senml_has(& r, SENML_BV) { bv = r.bv; has_bv = true; }
+        if senml_has(& r, SENML_BS) { bs = r.bs; has_bs = true; }
+        if senml_has(& r, SENML_BVER) { bver = r.bver; }
+        val other: bool = senml_has(& r, SENML_VS) || senml_has(& r, SENML_VB) || senml_has(& r, SENML_VD);
+        val numeric: bool = senml_has(& r, SENML_V) || (has_bv && !other && !senml_has(& r, SENML_S));
+        val has_sum: bool = senml_has(& r, SENML_S) || has_bs;
+        if numeric || other || has_sum {
+            var x: SenmlRecord = senml_record();
+            val name: str = bn + r.n;
+            if !senml_name_ok(name) {
+                return sm_pack_err("record " + int_to_str(i) + ": bad name \"" + name + "\"");
+            }
+            senml_set_n(& mut x, name);
+            if senml_has(& r, SENML_U) {
+                senml_set_u(& mut x, r.u);
+            } else if has_bu {
+                senml_set_u(& mut x, bu);
+            }
+            var t: f64 = bt + r.t;
+            if t < SENML_REL_LIMIT {
+                t = now + t;
+            }
+            senml_set_t(& mut x, t);
+            if senml_has(& r, SENML_UT) {
+                senml_set_ut(& mut x, r.ut);
+            }
+            if numeric {
+                senml_set_v(& mut x, bv + r.v);
+            }
+            if senml_has(& r, SENML_VS) { senml_set_vs(& mut x, r.vs); }
+            if senml_has(& r, SENML_VB) { senml_set_vb(& mut x, r.vb); }
+            if senml_has(& r, SENML_VD) { senml_set_vd(& mut x, r.vd); }
+            if has_sum {
+                senml_set_s(& mut x, bs + r.s);
+            }
+            if bver != 10 {
+                senml_set_bver(& mut x, bver);
+            }
+            out.push(x);
+        }
+        i = i + 1;
+    }
+    // stable insertion sort by time
+    var j: i64 = 1;
+    while j < out.len() {
+        val cur: SenmlRecord = out.get(j);
+        var k: i64 = j - 1;
+        var moving: bool = true;
+        while k >= 0 && moving {
+            val prev: SenmlRecord = out.get(k);
+            if prev.t > cur.t {
+                out.set(k + 1, prev);
+                k = k - 1;
+            } else {
+                moving = false;
+            }
+        }
+        out.set(k + 1, cur);
+        j = j + 1;
+    }
+    return SenmlPack {
+        ok: true, error: "", records: out
+    };
+}

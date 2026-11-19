@@ -14,6 +14,7 @@
 extern "C" {
     // msvcrt.dll
     fn calloc as pet_c_calloc(count: i64, size: i64) -> i64;
+    fn free as pet_c_free(p: i64);
     fn memcpy as pet_c_memcpy(dst: i64, src: i64, n: i64) -> i64;
     fn memmove as pet_c_memmove(dst: i64, src: i64, n: i64) -> i64;
     fn floor as pet_c_floor(x: f64) -> f64;
@@ -51,24 +52,30 @@ fn pet_alloc(n: i64) -> i64 {
 fn pet_ld(addr: i64) -> i64 {
     var p: *mut i64 = addr;
     var v: i64 = 0;
+    // SAFETY: NOT checked here: callers read a word of a tensor block (its
+    // header or its element buffer, calloc'd at its size) they hold.
     unsafe { v = *p; }
     return v;
 }
 
 fn pet_st(addr: i64, v: i64) {
     var p: *mut i64 = addr;
+    // SAFETY: NOT checked here: as pet_ld, inside a tensor block.
     unsafe { *p = v; }
 }
 
 fn pet_ldf(addr: i64) -> f64 {
     var p: *mut f64 = addr;
     var v: f64 = 0.0;
+    // SAFETY: NOT checked here: an element of a tensor's buffer, the index
+    // bounded by the caller against the tensor's shape.
     unsafe { v = *p; }
     return v;
 }
 
 fn pet_stf(addr: i64, v: f64) {
     var p: *mut f64 = addr;
+    // SAFETY: NOT checked here: as pet_ldf.
     unsafe { *p = v; }
 }
 
@@ -1225,30 +1232,484 @@ pub fn pert_dropout(t: i64, p: f64) -> i64 {
     return r;
 }
 
-// ─── Tensor parallelism (one device: rank 0 of 1) ───────────────────────
+// ─── Tensor parallelism over several ranks (roadmap P6) ─────────────────
+// As the C runtime's (compiler/codegen_c.fd cg_emit_tp_runtime,
+// docs/reference/tensor-parallel.md): one process per rank, the
+// collectives through rank 0 in rank order (a sum is the same on every
+// run), a message a 12-word header [magic, op, ndim, len, shape x 8] and
+// then len doubles. With one rank (the default) every collective is a copy.
+// Starting the ranks and the links between them are the OS's, in the
+// runtime this file is merged with:
+//   pe_tp_os_attach() -> bool       a rank rank 0 started takes its links
+//   pe_tp_os_spawn(n) -> bool       start ranks 1..n-1 (false: this system
+//                                   cannot, the program keeps one rank)
+//   pe_tp_os_write(h, buf, n) -> bool, pe_tp_os_read(h, buf, n) -> bool
+//   pe_tp_os_close(in, out), pe_tp_os_wait(child) -> exit status
+// pe_runtime/conc.fd (native Windows: the program runs again with
+// CreateProcessA, a pipe each way per pair of ranks, FID_TP_LINKS) and
+// linux_runtime/sys.fd (fork at p_tp_init, an AF_UNIX stream per pair).
+// The OS layer reports what it set up with pet_tp_set_link,
+// pet_tp_set_child and pet_tp_joined. pert_tp_exit is main's end: rank 0
+// waits for the others (the program's exit code 1 when one failed).
+
+const PET_TP_MAX: i64 = 32;
+const PET_TP_MAGIC: i64 = 0x46494454504d5347;     // the C runtime's P_TP_MAGIC
+
+var pet_tp_rank_v: i64 = 0;
+var pet_tp_world_v: i64 = 1;
+var pet_tp_started: i64 = 0;   // p_tp_init ran
+var pet_tp_open: i64 = 0;      // the links are open
+var pet_tp_waited: i64 = 0;    // rank 0 waited for the others
+var pet_tp_nchild: i64 = 0;    // rank 0: ranks 1..nchild were started
+// words [0, 32) the link from each rank, [32, 64) to each rank, [64, 96)
+// each started rank (process handle or pid), [96, 108) a message header
+var pet_tp_tab: i64 = 0;
+
+fn pet_tp_t() -> i64 {
+    if pet_tp_tab == 0 {
+        pet_tp_tab = pet_alloc(112 * 8);
+    }
+    return pet_tp_tab;
+}
+
+fn pet_tp_in(b: i64) -> i64 {
+    return pet_ld(pet_tp_t() + b * 8);
+}
+
+fn pet_tp_out(b: i64) -> i64 {
+    return pet_ld(pet_tp_t() + (32 + b) * 8);
+}
+
+fn pet_tp_child(r: i64) -> i64 {
+    return pet_ld(pet_tp_t() + (64 + r) * 8);
+}
+
+/// The OS layer: this rank's link from rank b (inh) and to it (outh); one
+/// handle both ways is fine (pe_tp_os_close closes it once).
+fn pet_tp_set_link(b: i64, inh: i64, outh: i64) {
+    pet_st(pet_tp_t() + b * 8, inh);
+    pet_st(pet_tp_t() + (32 + b) * 8, outh);
+}
+
+/// The OS layer, rank 0: rank r runs as process c.
+fn pet_tp_set_child(r: i64, c: i64) {
+    pet_st(pet_tp_t() + (64 + r) * 8, c);
+    pet_tp_nchild = r;
+}
+
+/// The OS layer: the ranks are up, this process is `rank` of `world`.
+fn pet_tp_joined(rank: i64, world: i64, nchild: i64) {
+    pet_tp_rank_v = rank;
+    pet_tp_world_v = world;
+    pet_tp_nchild = nchild;
+    pet_tp_open = 1;
+}
+
+fn pet_tp_ldb(addr: i64) -> i64 {
+    var p: *mut u8 = addr;
+    var v: i64 = 0;
+    // SAFETY: NOT checked here: a byte of an environment string up to its
+    // NUL (pet_tp_parse's caller checked it is not null).
+    unsafe { v = *p; }
+    return v;
+}
+
+/// The decimal number at s (a NUL-ended string), -1 when it is not one.
+fn pet_tp_parse(s: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while pet_tp_ldb(s + i) >= 48 && pet_tp_ldb(s + i) <= 57 {
+        if v > 100000000 {
+            return 0 - 1;
+        }
+        v = v * 10 + pet_tp_ldb(s + i) - 48;
+        i = i + 1;
+    }
+    if i == 0 || pet_tp_ldb(s + i) != 0 {
+        return 0 - 1;
+    }
+    return v;
+}
+
+fn pet_tp_op_name(op: i64) -> str {
+    if op == 1 || op == 2 {
+        return "all_reduce";
+    }
+    if op == 3 {
+        return "broadcast";
+    }
+    if op == 4 || op == 5 {
+        return "all_gather";
+    }
+    if op == 6 {
+        return "scatter";
+    }
+    if op == 7 {
+        return "send_tensor/recv_tensor";
+    }
+    return "?";
+}
+
+/// "<op> on rank <me>: rank <peer> <what>", a panic.
+fn pet_tp_fail(op: str, peer: i64, what: str) {
+    var m: str = p_str_concat(p_str_concat(op, " on rank "), pet_int_str(pet_tp_rank_v));
+    m = p_str_concat(p_str_concat(m, ": rank "), pet_int_str(peer));
+    pet_fail(p_str_concat(p_str_concat(m, " "), what));
+}
+
+fn pet_tp_free(t: i64) {
+    if t == 0 {
+        return;
+    }
+    pet_c_free(pet_ld(t));
+    pet_c_free(pet_ld(t + 24));
+    pet_c_free(t);
+}
+
+fn pet_tp_send(peer: i64, op: i64, t: i64) {
+    var nd: i64 = pet_t_ndim(t);
+    if nd > 8 {
+        pet_fail(p_str_concat(pet_tp_op_name(op), ": a tensor of more than 8 dimensions cannot go to another rank"));
+    }
+    var h: i64 = pet_tp_t() + 96 * 8;
+    pet_st(h, PET_TP_MAGIC);
+    pet_st(h + 8, op);
+    pet_st(h + 16, nd);
+    pet_st(h + 24, pet_t_len(t));
+    var i: i64 = 0;
+    while i < 8 {
+        var d: i64 = 0;
+        if i < nd {
+            d = pet_t_dim(t, i);
+        }
+        pet_st(h + 32 + i * 8, d);
+        i = i + 1;
+    }
+    var ok: bool = pe_tp_os_write(pet_tp_out(peer), h, 96);
+    if ok && pet_t_len(t) > 0 {
+        ok = pe_tp_os_write(pet_tp_out(peer), pet_ld(t), pet_t_len(t) * 8);
+    }
+    if !ok {
+        pet_tp_fail(pet_tp_op_name(op), peer, "is gone (it exited or failed)");
+    }
+}
+
+fn pet_tp_recv(peer: i64, op: i64) -> i64 {
+    var h: i64 = pet_tp_t() + 96 * 8;
+    if !pe_tp_os_read(pet_tp_in(peer), h, 96) {
+        pet_tp_fail(pet_tp_op_name(op), peer, "is gone (it exited or failed)");
+    }
+    if pet_ld(h) != PET_TP_MAGIC {
+        pet_tp_fail(pet_tp_op_name(op), peer, "sent a corrupt message");
+    }
+    if pet_ld(h + 8) != op {
+        var m: str = p_str_concat(p_str_concat(pet_tp_op_name(op), " on rank "), pet_int_str(pet_tp_rank_v));
+        m = p_str_concat(p_str_concat(m, ": rank "), pet_int_str(peer));
+        m = p_str_concat(p_str_concat(m, " called "), pet_tp_op_name(pet_ld(h + 8)));
+        pet_fail(p_str_concat(m, " instead (every rank must call the same collectives in the same order)"));
+    }
+    var nd: i64 = pet_ld(h + 16);
+    var nvals: i64 = pet_ld(h + 24);
+    if nd < 0 || nd > 8 || nvals < 0 || nvals > 1099511627776 {
+        pet_tp_fail(pet_tp_op_name(op), peer, "sent a corrupt tensor header");
+    }
+    var r: i64 = pet_t_new(nd, nvals);
+    var i: i64 = 0;
+    while i < nd {
+        pet_t_set_dim(r, i, pet_ld(h + 32 + i * 8));
+        i = i + 1;
+    }
+    if nvals > 0 && !pe_tp_os_read(pet_tp_in(peer), pet_ld(r), nvals * 8) {
+        pet_tp_fail(pet_tp_op_name(op), peer, "is gone (it exited or failed)");
+    }
+    return r;
+}
+
+/// Same number of dimensions, values and the same shape.
+fn pet_tp_same_shape(a: i64, b: i64) -> bool {
+    if pet_t_ndim(a) != pet_t_ndim(b) || pet_t_len(a) != pet_t_len(b) {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < pet_t_ndim(a) {
+        if pet_t_dim(a, i) != pet_t_dim(b, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn pet_tp_close_links() {
+    if pet_tp_open == 0 {
+        return;
+    }
+    pet_tp_open = 0;
+    var b: i64 = 0;
+    while b < pet_tp_world_v {
+        if b != pet_tp_rank_v {
+            pe_tp_os_close(pet_tp_in(b), pet_tp_out(b));
+        }
+        b = b + 1;
+    }
+}
+
+/// Rank 0 waits for the others: its links are closed first, so a rank
+/// still waiting on rank 0 sees it gone instead of waiting for ever. True
+/// when every rank ended with status 0.
+fn pet_tp_wait_all() -> bool {
+    if pet_tp_waited != 0 {
+        return true;
+    }
+    pet_tp_waited = 1;
+    pet_tp_close_links();
+    var ok: bool = true;
+    var r: i64 = 1;
+    while r <= pet_tp_nchild {
+        var st: i64 = pe_tp_os_wait(pet_tp_child(r));
+        if st != 0 {
+            p_eprint_str(p_str_concat(p_str_concat(p_str_concat(p_str_concat("tp: rank ", pet_int_str(r)), " exited with status "), pet_int_str(st)), "\n"));
+            ok = false;
+        }
+        r = r + 1;
+    }
+    return ok;
+}
+
+/// Start the ranks: n of them (FID_TP_WORLD=n > 1 in the environment
+/// overrides the program's n); this process's rank. Once per run: a later
+/// call gives the rank again. A rank started by rank 0 returns its own.
+pub fn pert_tp_init(n: i64) -> i64 {
+    if pet_tp_started != 0 {
+        return pet_tp_rank_v;
+    }
+    pet_tp_started = 1;
+    if pe_tp_os_attach() {
+        return pet_tp_rank_v;
+    }
+    var want: i64 = n;
+    var w: i64 = p_getenv("FID_TP_WORLD") as i64;
+    if w != 0 {
+        var wn: i64 = pet_tp_parse(w);
+        p_str_free(w);
+        if wn > PET_TP_MAX {
+            pet_fail(p_str_concat(p_str_concat("FID_TP_WORLD=", pet_int_str(wn)), ": at most 32 ranks"));
+        }
+        if wn > 1 {
+            want = wn;
+        }
+    }
+    if want > PET_TP_MAX {
+        pet_fail(p_str_concat(p_str_concat("tp_init(", pet_int_str(want)), "): at most 32 ranks"));
+    }
+    if want > 1 {
+        // false: no processes here (WASI, --nat Windows), one rank
+        if !pe_tp_os_spawn(want) {
+            pet_tp_world_v = 1;
+        }
+    }
+    return pet_tp_rank_v;
+}
 
 pub fn pert_tp_rank() -> i64 {
-    return 0;
+    return pet_tp_rank_v;
 }
 
 pub fn pert_tp_world_size() -> i64 {
-    return 1;
+    return pet_tp_world_v;
 }
 
+/// main's end (and exit's): rank 0 waits for the other ranks; its exit
+/// code becomes 1 when one of them failed and the program's was 0.
+pub fn pert_tp_exit(code: i64) -> i64 {
+    if pet_tp_world_v <= 1 {
+        return code;
+    }
+    if pet_tp_rank_v != 0 {
+        pet_tp_close_links();
+        return code;
+    }
+    if !pet_tp_wait_all() && code == 0 {
+        return 1;
+    }
+    return code;
+}
+
+/// The element-wise sum over the ranks, added in rank order on rank 0.
 pub fn pert_all_reduce(t: i64) -> i64 {
-    return pet_t_clone(t);
+    var n: i64 = pet_tp_world_v;
+    if n <= 1 || t == 0 {
+        return pet_t_clone(t);
+    }
+    if pet_tp_rank_v != 0 {
+        pet_tp_send(0, 1, t);
+        return pet_tp_recv(0, 2);
+    }
+    var sum: i64 = pet_t_clone(t);
+    var r: i64 = 1;
+    while r < n {
+        var part: i64 = pet_tp_recv(r, 1);
+        if !pet_tp_same_shape(sum, part) {
+            pet_tp_fail("all_reduce", r, "sent a tensor of another shape");
+        }
+        var i: i64 = 0;
+        while i < pet_t_len(sum) {
+            pet_t_put(sum, i, pet_t_at(sum, i) + pet_t_at(part, i));
+            i = i + 1;
+        }
+        pet_tp_free(part);
+        r = r + 1;
+    }
+    r = 1;
+    while r < n {
+        pet_tp_send(r, 2, sum);
+        r = r + 1;
+    }
+    return sum;
 }
 
+/// Rank 0's tensor, on every rank.
 pub fn pert_broadcast(t: i64) -> i64 {
+    var n: i64 = pet_tp_world_v;
+    if n <= 1 || t == 0 {
+        return pet_t_clone(t);
+    }
+    if pet_tp_rank_v != 0 {
+        return pet_tp_recv(0, 3);
+    }
+    var r: i64 = 1;
+    while r < n {
+        pet_tp_send(r, 3, t);
+        r = r + 1;
+    }
     return pet_t_clone(t);
 }
 
+/// Every rank's tensor joined along dimension 0, in rank order.
 pub fn pert_all_gather(t: i64) -> i64 {
-    return pet_t_clone(t);
+    var n: i64 = pet_tp_world_v;
+    if n <= 1 || t == 0 {
+        return pet_t_clone(t);
+    }
+    if pet_tp_rank_v != 0 {
+        pet_tp_send(0, 4, t);
+        return pet_tp_recv(0, 5);
+    }
+    var nd: i64 = pet_t_ndim(t);
+    var parts: i64 = pet_alloc(n * 8);
+    pet_st(parts, t);
+    var total: i64 = pet_t_len(t);
+    var rows: i64 = 1;
+    if nd > 0 {
+        rows = pet_t_dim(t, 0);
+    }
+    var r: i64 = 1;
+    while r < n {
+        var q: i64 = pet_tp_recv(r, 4);
+        pet_st(parts + r * 8, q);
+        var same: bool = pet_t_ndim(q) == nd;
+        var i: i64 = 1;
+        while same && i < nd {
+            if pet_t_dim(q, i) != pet_t_dim(t, i) {
+                same = false;
+            }
+            i = i + 1;
+        }
+        if !same {
+            pet_tp_fail("all_gather", r, "sent a tensor whose shape differs past dimension 0");
+        }
+        total = total + pet_t_len(q);
+        if pet_t_ndim(q) > 0 {
+            rows = rows + pet_t_dim(q, 0);
+        } else {
+            rows = rows + 1;
+        }
+        r = r + 1;
+    }
+    var gnd: i64 = nd;
+    if gnd < 1 {
+        gnd = 1;
+    }
+    var g: i64 = pet_t_new(gnd, total);
+    var k: i64 = 1;
+    while k < nd {
+        pet_t_set_dim(g, k, pet_t_dim(t, k));
+        k = k + 1;
+    }
+    pet_t_set_dim(g, 0, rows);
+    var at: i64 = 0;
+    r = 0;
+    while r < n {
+        var p: i64 = pet_ld(parts + r * 8);
+        var j: i64 = 0;
+        while j < pet_t_len(p) {
+            pet_t_put(g, at + j, pet_t_at(p, j));
+            j = j + 1;
+        }
+        at = at + pet_t_len(p);
+        if r > 0 {
+            pet_tp_free(p);
+        }
+        r = r + 1;
+    }
+    pet_c_free(parts);
+    r = 1;
+    while r < n {
+        pet_tp_send(r, 5, g);
+        r = r + 1;
+    }
+    return g;
 }
 
+/// Rank 0's tensor cut along dimension 0: rank r gets the r-th share of
+/// the rows (the first rows % n ranks one row more).
 pub fn pert_scatter(t: i64) -> i64 {
-    return pet_t_clone(t);
+    var n: i64 = pet_tp_world_v;
+    if n <= 1 || t == 0 {
+        return pet_t_clone(t);
+    }
+    if pet_tp_rank_v != 0 {
+        return pet_tp_recv(0, 6);
+    }
+    var nd: i64 = pet_t_ndim(t);
+    if nd < 1 {
+        pet_fail("scatter: the tensor needs at least one dimension");
+    }
+    var rows: i64 = pet_t_dim(t, 0);
+    var row_len: i64 = 0;
+    if rows > 0 {
+        row_len = pet_t_len(t) / rows;
+    }
+    var mine: i64 = 0;
+    var start: i64 = 0;
+    var r: i64 = 0;
+    while r < n {
+        var cnt: i64 = rows / n;
+        if r < rows % n {
+            cnt = cnt + 1;
+        }
+        var s: i64 = pet_t_new(nd, cnt * row_len);
+        var k: i64 = 1;
+        while k < nd {
+            pet_t_set_dim(s, k, pet_t_dim(t, k));
+            k = k + 1;
+        }
+        pet_t_set_dim(s, 0, cnt);
+        var i: i64 = 0;
+        while i < cnt * row_len {
+            pet_t_put(s, i, pet_t_at(t, start * row_len + i));
+            i = i + 1;
+        }
+        start = start + cnt;
+        if r == 0 {
+            mine = s;
+        } else {
+            pet_tp_send(r, 6, s);
+            pet_tp_free(s);
+        }
+        r = r + 1;
+    }
+    return mine;
 }
 
 // ─── KV caches ──────────────────────────────────────────────────────────
@@ -1534,13 +1995,33 @@ pub fn pert_find_quant_params(t: i64) -> str {
 }
 
 // ─── ML13: remaining tensor-parallelism builtins ─────────────────────────
-// Single-rank mode, as in the C backend: send is a no-op, recv fabricates a
-// zero tensor of the requested shape.
+// Point to point along the ring ("Tensor parallelism over several ranks"):
+// to rank + 1, from rank - 1. With one rank, as in the C backend, send is a
+// no-op and recv a zero tensor of the requested shape.
 
 pub fn pert_send_tensor(t: i64) {
-    // no-op in single-rank mode
+    if t == 0 || pet_tp_world_v <= 1 {
+        return;
+    }
+    pet_tp_send((pet_tp_rank_v + 1) % pet_tp_world_v, 7, t);
 }
 
 pub fn pert_recv_tensor(shape: Vec<i64>) -> i64 {
-    return pert_tensor_zeros(shape);
+    if pet_tp_world_v <= 1 {
+        return pert_tensor_zeros(shape);
+    }
+    var from: i64 = (pet_tp_rank_v + pet_tp_world_v - 1) % pet_tp_world_v;
+    var got: i64 = pet_tp_recv(from, 7);
+    var same: bool = pet_t_ndim(got) == shape.len();
+    var i: i64 = 0;
+    while same && i < shape.len() {
+        if pet_t_dim(got, i) != shape.get(i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    if !same {
+        pet_tp_fail("recv_tensor", from, "sent a tensor of another shape than the one asked for");
+    }
+    return got;
 }

@@ -1,0 +1,196 @@
+// stdlib/http2 (competitive SL1): a server runs each request's handler on
+// a task of its own. The request goes to the task as text (h2_job_text,
+// read back by h2_job_request: the same HttpRequest h2_request gives,
+// bodies with any bytes), the response comes back through the task's
+// slot, and h2_collect_jobs sends it on its stream. Driven by hand (no
+// socket): three requests on one connection, each handled on a task,
+// their answers on the right streams; a request the client resets before
+// the server steps is never handled. (A response whose stream was reset
+// while its handler ran is dropped by h2_respond.)
+//
+// Expected output:
+// method POST, target /p?q=1&r=2, path /p, query q=1&r=2, version 2
+// fields: x-a=v 1; x-empty=; host=example.org
+// body: [line1\nline2\n:x]
+// same as h2_request: true
+// answers sent at once without tasks: 3
+// handlers running: 3 or fewer, done after task_run: 0
+// stream 1: HEADERS :status=200, DATA "handled /a body []" end
+// stream 3: HEADERS :status=200, DATA "handled /b body [12345]" end
+// stream 5: HEADERS :status=200, DATA "handled /c body []" end
+// stream 7: nothing
+// connection ok true, open streams 0
+use http;
+use http2;
+use hpack;
+use task;
+use vec;
+use string;
+
+fn handler(req: HttpRequest) -> str {
+    return build_response(200, "text/plain", "handled " + req.path + " body [" + req.body + "]");
+}
+
+fn take(c: & mut H2Conn) -> Vec<H2Frame> {
+    val out: Vec<i64> = c.out;
+    c.out = Vec::new();
+    return h2_frames_decode(out, 0);
+}
+
+fn fields(req: HttpRequest) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < req.names.len() {
+        if i > 0 {
+            out = out + "; ";
+        }
+        out = out + req.names.get(i) + "=" + req.vals.get(i);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn get(enc: & mut Hpack, b: & mut Vec<i64>, id: i64, method: str, path: str, end: bool) {
+    var n: Vec<str> = Vec::new();
+    var v: Vec<str> = Vec::new();
+    n.push(":method");
+    v.push(method);
+    n.push(":scheme");
+    v.push("http");
+    n.push(":authority");
+    v.push("example.org");
+    n.push(":path");
+    v.push(path);
+    h2_put_frame(b, h2_headers_frame(id, hpack_encode(enc, n, v), end, true));
+}
+
+fn feed(c: & mut H2Conn, b: Vec<i64>) {
+    val fs: Vec<H2Frame> = h2_frames_decode(b, 0);
+    var i: i64 = 0;
+    while i < fs.len() {
+        if h2_process(c, fs.get(i)) {
+            h2_server_step(c);
+        }
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    // The text a handler task gets, and the request it reads back
+    var names: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    names.push(":method");
+    vals.push("POST");
+    names.push(":scheme");
+    vals.push("http");
+    names.push(":authority");
+    vals.push("example.org");
+    names.push(":path");
+    vals.push("/p?q=1&r=2");
+    names.push("x-a");
+    vals.push("v 1");
+    names.push("x-empty");
+    vals.push("");
+    val s: H2Stream = H2Stream {
+        id: 1, state: H2_HALF_CLOSED_REMOTE, send_window: 0, recv_window: 0, names: names, vals: vals, got_headers: true, body: str_bytes("line1\nline2\n:x"), pending: Vec::new(), pending_end: false, handled: false, reset: - 1,
+    };
+    val req: HttpRequest = h2_job_request(h2_job_text(s));
+    println("method " + req.method + ", target " + req.target + ", path " + req.path + ", query " + req.query + ", version " + req.version);
+    println("fields: " + fields(req));
+    println("body: [" + str_replace(req.body, "\n", "\\n") + "]");
+    val direct: HttpRequest = h2_request(s);
+    println("same as h2_request: " + bool_to_str(direct.method == req.method && direct.target == req.target && direct.path == req.path && direct.query == req.query && direct.body == req.body && fields(direct) == fields(req)));
+
+    http2_set_handler(handler);
+    // Without tasks (a connection driven by hand): answered at once
+    var c0: H2Conn = h2_conn_new(- 1, false, "");
+    var e0: Hpack = hpack_new(4096);
+    var b0: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b0, h2_settings_frame(Vec::new(), Vec::new()));
+    get(& mut e0, & mut b0, 1, "GET", "/a", true);
+    get(& mut e0, & mut b0, 3, "GET", "/b", true);
+    get(& mut e0, & mut b0, 5, "GET", "/c", true);
+    feed(& mut c0, b0);
+    val f0: Vec<H2Frame> = take(& mut c0);
+    var heads: i64 = 0;
+    var i: i64 = 0;
+    while i < f0.len() {
+        if f0.get(i).ftype == H2_HEADERS {
+            heads = heads + 1;
+        }
+        i = i + 1;
+    }
+    println("answers sent at once without tasks: " + int_to_str(heads));
+
+    // With tasks: the handlers run on tasks, their answers are collected
+    var c: H2Conn = h2_conn_new(- 1, false, "");
+    c.tasks = true;
+    var enc: Hpack = hpack_new(4096);
+    var b: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b, h2_settings_frame(Vec::new(), Vec::new()));
+    get(& mut enc, & mut b, 1, "GET", "/a", true);
+    get(& mut enc, & mut b, 3, "POST", "/b", false);
+    h2_put_frame(& mut b, h2_data_frame(3, str_bytes("12345"), true, 0));
+    get(& mut enc, & mut b, 5, "GET", "/c", true);
+    feed(& mut c, b);
+    // Stream 7: the client gives up (RST_STREAM) before the server steps:
+    // its handler never runs
+    var b7: Vec<i64> = Vec::new();
+    get(& mut enc, & mut b7, 7, "GET", "/gone", true);
+    h2_put_frame(& mut b7, h2_rst_stream_frame(7, H2_CANCEL));
+    val f7: Vec<H2Frame> = h2_frames_decode(b7, 0);
+    h2_process(& mut c, f7.get(0));
+    h2_process(& mut c, f7.get(1));
+    val running: i64 = c.jobs.len();
+    task_run();
+    val left: i64 = h2_collect_jobs(& mut c);
+    h2_pump(& mut c);
+    h2_server_step(& mut c);
+    var shown: str = "3 or fewer";
+    if running > 4 {
+        shown = int_to_str(running);
+    }
+    println("handlers running: " + shown + ", done after task_run: " + int_to_str(left));
+    val fs: Vec<H2Frame> = take(& mut c);
+    var dec: Hpack = hpack_new(4096);
+    var lines: Vec<str> = Vec::new();
+    i = 0;
+    while i < fs.len() {
+        val f: H2Frame = fs.get(i);
+        var d: str = h2_type_name(f.ftype);
+        if f.ftype == H2_HEADERS {
+            val hl: HpackHeaders = hpack_decode(& mut dec, h2_parse(f).data);
+            d = "HEADERS " + hl.names.get(0) + "=" + hl.vals.get(0);
+        } else if f.ftype == H2_DATA {
+            d = "DATA \"" + str_from_bytes(h2_parse(f).data) + "\"";
+        } else if f.ftype == H2_RST_STREAM {
+            d = "RST_STREAM " + h2_error_name(h2_parse(f).code);
+        }
+        if (f.ftype == H2_HEADERS || f.ftype == H2_DATA) && (f.flags & H2_FLAG_END_STREAM) != 0 {
+            d = d + " end";
+        }
+        lines.push(d);
+        i = i + 1;
+    }
+    var id: i64 = 1;
+    while id <= 7 {
+        var out: str = "";
+        i = 0;
+        while i < fs.len() {
+            if fs.get(i).stream == id {
+                if out != "" {
+                    out = out + ", ";
+                }
+                out = out + lines.get(i);
+            }
+            i = i + 1;
+        }
+        if id == 7 && out == "" {
+            out = "nothing";
+        }
+        println("stream " + int_to_str(id) + ": " + out);
+        id = id + 2;
+    }
+    println("connection ok " + bool_to_str(c.ok) + ", open streams " + int_to_str(c.streams.len()));
+    return 0;
+}

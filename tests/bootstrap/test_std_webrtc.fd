@@ -1,0 +1,428 @@
+// stdlib/webrtc: SHA-1/HMAC-SHA1 (RFC 2202) and CRC-32 checks, the three RFC 5769 STUN test vectors decoded, verified and the request rebuilt byte for byte, message types, XOR addresses, a binding exchange, ICE candidate parsing, priorities and pairing, an SDP offer parsed and answered; then two peer connections in memory (OpenSSL-made P-256 certificates): offer/answer, ICE checks, DTLS, SRTP media both ways, close; with lost datagrams; blocked (ICE fails); a wrong fingerprint (DTLS fails). The DTLS part needs P-256, too slow for the interpreter (docs/stdlib-agent-bugs.md 20, 51): run it through the C backend.
+// Expected output:
+// sha1 abc: a9993e364706816aba3e25717850c26c9cd0d89d
+// hmac rfc2202 #1: b617318655057264e28bc0b6fb378c8ef146be00
+// hmac rfc2202 #2: effcdf6ae5eb2fa2d27416d5f184df9c259a7c79
+// hmac long key: aa4ae5e15272d00e95705637ce8a3b55ed402112
+// crc32: cbf43926
+// request: ok true method 1 class 0 user evtj:h6vY software STUN test client priority 6e0001ff controlled 932ff9b151263b36
+//   integrity true wrong key false fingerprint true
+//   rebuilt same: true
+// ipv4 response: class 2 mapped 192.0.2.1:32853 integrity true fingerprint true
+// ipv6 response: mapped [2001:db8:1234:5678:11:2233:4455:6677]:32853 integrity true fingerprint true
+// tampered: integrity false fingerprint false
+// not stun: false, bad length: bad length
+// types: 1 11 101 111 allocate-error 113
+// ip: 2001:db8::1 fe80:0:0:1:: ::1 2001:db8:0:1::1
+// error response: 487 Role Conflict, checks true
+// check: 104 bytes, integrity true use-candidate true controlling true
+// response: same txid true mapped 203.0.113.7:54321 checks true
+// candidate: ok true srflx 198.51.100.4:46154 base 192.168.1.10:46154 ext [generation 0 network-cost 999]
+//   back: candidate:842163049 1 udp 1677729535 198.51.100.4 46154 typ srflx raddr 192.168.1.10 rport 46154 generation 0 network-cost 999
+//   bad: false
+// priority: host 2130706431 srflx 1694498815 relay rtcp 16777214
+// pair: 7277816997797167103 7277816997797167102
+// pairs: 5
+//   1:a 192.168.1.10 -> 10.0.0.5 9151314442783293438
+//   3:c 2001:db8::10 -> 2001:db8::99 9115038255631187454
+//   1:b 192.168.1.10 -> 192.0.2.9 7277816997797167103
+//   4:a 203.0.113.50 -> 10.0.0.5 72057594004373502
+//   4:b 203.0.113.50 -> 192.0.2.9 72057593131958270
+// offer: ok true 3 sections, bundle BUNDLE 0 1 2, round trip same true
+//   audio mid 0 sendrecv ufrag EsAw codecs 111 opus/48000/2, 103 ISAC/16000, 0 PCMU/8000 candidates 1
+//   video mid 1 sendonly ufrag EsAw codecs 96 VP8/90000, 98 VP9/90000 candidates 0
+//   application mid 2 sendrecv ufrag  codecs webrtc-datachannel  candidates 0
+//   first candidate: 192.168.1.10:46154 host
+// | v=0
+// | o=- 99 1 IN IP4 127.0.0.1
+// | s=-
+// | t=0 0
+// | a=group:BUNDLE 0 1 2
+// | a=msid-semantic: WMS stream
+// | m=audio 9 UDP/TLS/RTP/SAVPF 111 0
+// | c=IN IP4 0.0.0.0
+// | a=ice-ufrag:Ufr4
+// | a=ice-pwd:an-answer-password-22c
+// | a=fingerprint:sha-256 AB:CD
+// | a=setup:active
+// | a=mid:0
+// | a=sendrecv
+// | a=rtcp-mux
+// | a=rtpmap:111 opus/48000/2
+// | a=fmtp:111 minptime=10;useinbandfec=1
+// | a=rtpmap:0 PCMU/8000
+// | m=video 9 UDP/TLS/RTP/SAVPF 98
+// | c=IN IP4 0.0.0.0
+// | a=ice-ufrag:Ufr4
+// | a=ice-pwd:an-answer-password-22c
+// | a=fingerprint:sha-256 AB:CD
+// | a=setup:active
+// | a=mid:1
+// | a=recvonly
+// | a=rtcp-mux
+// | a=rtpmap:98 VP9/90000
+// | a=fmtp:98 profile-id=0
+// | m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+// | c=IN IP4 0.0.0.0
+// | a=ice-ufrag:Ufr4
+// | a=ice-pwd:an-answer-password-22c
+// | a=fingerprint:sha-256 AB:CD
+// | a=setup:active
+// | a=mid:2
+// | a=sctp-port:5000
+// nothing in common: ports 0 0 0, bundle false
+// bad sdp: bad line: hello; no v= line
+// peer offer: setup actpass, fingerprint of a true, codecs 111 opus/48000/2, 0 PCMU/8000, candidate 1 1 udp 2130706431 10.0.0.1 5000 typ host
+// peer answer: setup active, fingerprint of b true, codecs 111 opus/48000/2, 0 PCMU/8000, candidate 1 1 udp 2130706431 10.0.0.2 6000 typ host
+// a: new > checking > connected (ice controlling, dtls server)
+// b: new > checking > connected (ice controlled, dtls client)
+// selected: 10.0.0.1:5000 -> 10.0.0.2:6000 and 10.0.0.2:6000 -> 10.0.0.1:5000, srtp SRTP_AEAD_AES_128_GCM
+// media: a->b rtp same true, b->a rtp same true, a->b rtcp same true, encrypted on the wire true
+// close: a new > checking > connected > closed; b new > checking > connected > closed
+// lossy: a new > checking > connected, b new > checking > connected, dropped 6, checks sent 1/3, dtls retransmissions 2/4
+// blocked: a new > checking > failed (ICE failed: no candidate pair answered), b new > checking > failed, after 19550 ms, 7 checks each way true
+// bad fingerprint: a new > checking > failed (DTLS: certificate fingerprint does not match), b new > checking > failed (DTLS: alert 42 from peer)
+use dtls;
+use encoding;
+use srtp;
+use string;
+use vec;
+use webrtc;
+
+fn hb(h: str) -> Vec<i64> {
+    return hex_decode_bytes(h);
+}
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn cert_a() -> str {
+    return "-----BEGIN CERTIFICATE-----
+MIIBijCCAS+gAwIBAgIUCHxZir9785/S5itlOHU0H9A/ALwwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOZmlkZXMtd2VicnRjLWEwIBcNMjYxMTE3MTI1NDI4WhgPMjEy
+NjEwMjQxMjU0MjhaMBkxFzAVBgNVBAMMDmZpZGVzLXdlYnJ0Yy1hMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAE7GH3n0uqZR4gvasJ3qV/74ehakkuDJHuwplvRdAC
+vMpUM68RU5N96vIOc3K2BKNgulrSTUJ+ByKqmqCmQneNoKNTMFEwHQYDVR0OBBYE
+FBoZ55wljiyOyGz5PRA06kr4qkaUMB8GA1UdIwQYMBaAFBoZ55wljiyOyGz5PRA0
+6kr4qkaUMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAKqaX9FD
+dqjyHMXX7m7mlg5d4RSJGRKZQK7EyvTE0L85AiEAo3kiN2CsQn9Gzl7ubHC3KXBk
+gk0vhA+YQ9d/IoXfI7g=
+-----END CERTIFICATE-----
+";
+}
+
+fn key_a() -> str {
+    return "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBteegdhCSfZ0TYmh
+LJ3pvB/Q/BNrubTy9qj/lcCAwrWhRANCAATsYfefS6plHiC9qwnepX/vh6FqSS4M
+ke7CmW9F0AK8ylQzrxFTk33q8g5zcrYEo2C6WtJNQn4HIqqaoKZCd42g
+-----END PRIVATE KEY-----
+";
+}
+
+fn cert_b() -> str {
+    return "-----BEGIN CERTIFICATE-----
+MIIBijCCAS+gAwIBAgIURELEswHdMI4PSM21hWI/fnBZC80wCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOZmlkZXMtd2VicnRjLWIwIBcNMjYxMTE3MTI1NDI5WhgPMjEy
+NjEwMjQxMjU0MjlaMBkxFzAVBgNVBAMMDmZpZGVzLXdlYnJ0Yy1iMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEEl87SExeJTzUgLBDfpSPQXjzeKaZKCPMy5SswdEf
+gn7myeZqVOl8hP+jAs4grvmmCBQoRrUWKKgfpC66NZv8V6NTMFEwHQYDVR0OBBYE
+FE1+NvlOV0DPAEBkypVk7ePXXNfHMB8GA1UdIwQYMBaAFE1+NvlOV0DPAEBkypVk
+7ePXXNfHMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAM/4091C
+ujjifn9kZzlEk6cLxorXAO/POAll6KNTqE6DAiEAuuoiKp+A0vRklI616/+Ylvic
+hS+fC87fWH+66Pq3MEg=
+-----END CERTIFICATE-----
+";
+}
+
+fn key_b() -> str {
+    return "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgbOh4mGuNC43Rwg07
+tCxk5SLl+yPTGMlthSXRffL3biGhRANCAAQSXztITF4lPNSAsEN+lI9BePN4ppko
+I8zLlKzB0R+CfubJ5mpU6XyE/6MCziCu+aYIFChGtRYoqB+kLro1m/xX
+-----END PRIVATE KEY-----
+";
+}
+
+fn wcfg(cert: str, key: str, ufrag: str, pwd: str, ip: str, port: i64, seed: i64) -> WebrtcConfig {
+    var c: WebrtcConfig = webrtc_config(cert, key, ufrag, pwd, ip, port);
+    c.seed = Vec::filled(32, seed);
+    return c;
+}
+
+// mode 0: deliver everything; 1: drop some datagrams; 2: drop all.
+// st: [datagrams, dropped, unroutable]
+fn pump(from: & mut WebrtcPeer, to: & mut WebrtcPeer, t: i64, mode: i64, st: & mut Vec<i64>) {
+    val dgs: Vec<WebrtcDatagram> = webrtc_peer_drain(from);
+    val fip: str = from.cfg.ip;
+    val fport: i64 = from.cfg.port;
+    var i: i64 = 0;
+    while i < dgs.len() {
+        val d: WebrtcDatagram = dgs.get(i);
+        val n: i64 = st.get(0);
+        st.set(0, n + 1);
+        if mode == 2 || (mode == 1 && n < 60 && n % 3 == 1) {
+            st.set(1, st.get(1) + 1);
+        } else if d.ip == to.cfg.ip && d.port == to.cfg.port {
+            webrtc_peer_receive(to, fip, fport, d.data, t);
+        } else {
+            st.set(2, st.get(2) + 1);
+        }
+        i = i + 1;
+    }
+}
+
+fn settled(p: & WebrtcPeer) -> bool {
+    return p.state == WEBRTC_CONNECTED || p.state == WEBRTC_FAILED || p.state == WEBRTC_CLOSED;
+}
+
+fn run_pair(a: & mut WebrtcPeer, b: & mut WebrtcPeer, mode: i64, st: & mut Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    while t <= 60000 && !(settled(a) && settled(b)) {
+        webrtc_peer_poll(a, t);
+        webrtc_peer_poll(b, t);
+        pump(a, b, t, mode, st);
+        pump(b, a, t, mode, st);
+        t = t + 50;
+    }
+    pump(a, b, t, mode, st);
+    pump(b, a, t, mode, st);
+    return t;
+}
+
+fn role(p: & WebrtcPeer) -> str {
+    var ice: str = "controlled";
+    if p.offerer {
+        ice = "controlling";
+    }
+    var d: str = "server";
+    if p.dtls_client {
+        d = "client";
+    }
+    return "ice " + ice + ", dtls " + d;
+}
+
+fn peer_a(seed: i64) -> WebrtcPeer {
+    return webrtc_peer_new(wcfg(cert_a(), key_a(), "aUfr", "a-ice-password-0123456789", "10.0.0.1", 5000, seed), true);
+}
+
+fn peer_b(seed: i64) -> WebrtcPeer {
+    return webrtc_peer_new(wcfg(cert_b(), key_b(), "bUfr", "b-ice-password-0123456789", "10.0.0.2", 6000, seed), false);
+}
+
+fn rtp_packet(seq: i64, ssrc: i64, text: str) -> Vec<i64> {
+    var p: Vec<i64> = hb("8060");
+    p.push((seq >> 8) & 255);
+    p.push(seq & 255);
+    p.push(0);
+    p.push(0);
+    p.push(3);
+    p.push(232);
+    p.push((ssrc >> 24) & 255);
+    p.push((ssrc >> 16) & 255);
+    p.push((ssrc >> 8) & 255);
+    p.push(ssrc & 255);
+    val b: Vec<i64> = str_bytes(text);
+    var i: i64 = 0;
+    while i < b.len() {
+        p.push(b.get(i));
+        i = i + 1;
+    }
+    return p;
+}
+
+fn one(v: Vec<Vec<i64>>) -> str {
+    if v.len() != 1 {
+        return "(" + int_to_str(v.len()) + " packets)";
+    }
+    return hx(v.get(0));
+}
+
+fn peer_tests() {
+    var st: Vec<i64> = Vec::filled(3, 0);
+    var a: WebrtcPeer = peer_a(21);
+    var b: WebrtcPeer = peer_b(22);
+    val offer: str = webrtc_peer_offer(& mut a);
+    webrtc_peer_set_remote(& mut b, offer);
+    val answer: str = webrtc_peer_answer(& mut b);
+    webrtc_peer_set_remote(& mut a, answer);
+    val so: Sdp = sdp_parse(offer);
+    val sa: Sdp = sdp_parse(answer);
+    val om: SdpMedia = so.media.get(0);
+    val am: SdpMedia = sa.media.get(0);
+    println("peer offer: setup " + sdp_attr(om.names, om.vals, "setup") + ", fingerprint of a " + bool_to_str(sdp_fingerprint(& so, & om) == a.fingerprint) + ", codecs " + str_join(sdp_codecs(& om), ", ") + ", candidate " + sdp_attr(om.names, om.vals, "candidate"));
+    println("peer answer: setup " + sdp_attr(am.names, am.vals, "setup") + ", fingerprint of b " + bool_to_str(sdp_fingerprint(& sa, & am) == b.fingerprint) + ", codecs " + str_join(sdp_codecs(& am), ", ") + ", candidate " + sdp_attr(am.names, am.vals, "candidate"));
+    run_pair(& mut a, & mut b, 0, & mut st);
+    println("a: " + a.history + " (" + role(& a) + ")");
+    println("b: " + b.history + " (" + role(& b) + ")");
+    println("selected: " + webrtc_peer_selected(& a) + " and " + webrtc_peer_selected(& b) + ", srtp " + srtp_profile_name(a.dtls.srtp_profile));
+    val r1: Vec<i64> = rtp_packet(1, 1111, "audio from a");
+    val r2: Vec<i64> = rtp_packet(9, 2222, "audio from b");
+    val c1: Vec<i64> = hb("81c90007000004570000000100000000000000000000000000000000");
+    webrtc_peer_send_rtp(& mut a, r1);
+    val wire: Vec<WebrtcDatagram> = a.out;
+    var enc: bool = false;
+    if wire.len() == 1 {
+        val w0: WebrtcDatagram = wire.get(0);
+        enc = hx(w0.data) != hx(r1) && w0.data.len() > r1.len();
+    }
+    pump(& mut a, & mut b, 0, 0, & mut st);
+    webrtc_peer_send_rtp(& mut b, r2);
+    pump(& mut b, & mut a, 0, 0, & mut st);
+    webrtc_peer_send_rtp(& mut a, c1);
+    pump(& mut a, & mut b, 0, 0, & mut st);
+    println("media: a->b rtp same " + bool_to_str(one(webrtc_peer_read_rtp(& mut b)) == hx(r1)) + ", b->a rtp same " + bool_to_str(one(webrtc_peer_read_rtp(& mut a)) == hx(r2)) + ", a->b rtcp same " + bool_to_str(one(webrtc_peer_read_rtcp(& mut b)) == hx(c1)) + ", encrypted on the wire " + bool_to_str(enc));
+    webrtc_peer_close(& mut a);
+    pump(& mut a, & mut b, 0, 0, & mut st);
+    println("close: a " + a.history + "; b " + b.history);
+
+    // some datagrams lost (STUN checks, DTLS flights): retransmissions recover
+    var st2: Vec<i64> = Vec::filled(3, 0);
+    var a2: WebrtcPeer = peer_a(31);
+    var b2: WebrtcPeer = peer_b(32);
+    webrtc_peer_set_remote(& mut b2, webrtc_peer_offer(& mut a2));
+    webrtc_peer_set_remote(& mut a2, webrtc_peer_answer(& mut b2));
+    run_pair(& mut a2, & mut b2, 1, & mut st2);
+    println("lossy: a " + a2.history + ", b " + b2.history + ", dropped " + int_to_str(st2.get(1)) + ", checks sent " + int_to_str(a2.checks_sent) + "/" + int_to_str(b2.checks_sent) + ", dtls retransmissions " + int_to_str(a2.dtls.retransmissions) + "/" + int_to_str(b2.dtls.retransmissions));
+
+    // nothing gets through: ICE checks run out
+    var st3: Vec<i64> = Vec::filled(3, 0);
+    var a3: WebrtcPeer = peer_a(41);
+    var b3: WebrtcPeer = peer_b(42);
+    webrtc_peer_set_remote(& mut b3, webrtc_peer_offer(& mut a3));
+    webrtc_peer_set_remote(& mut a3, webrtc_peer_answer(& mut b3));
+    val t3: i64 = run_pair(& mut a3, & mut b3, 2, & mut st3);
+    println("blocked: a " + a3.history + " (" + a3.err + "), b " + b3.history + ", after " + int_to_str(t3) + " ms, " + int_to_str(a3.checks_sent) + " checks each way " + bool_to_str(a3.checks_sent == b3.checks_sent));
+
+    // the answer's fingerprint replaced by another certificate's
+    var st4: Vec<i64> = Vec::filled(3, 0);
+    var a4: WebrtcPeer = peer_a(51);
+    var b4: WebrtcPeer = peer_b(52);
+    webrtc_peer_set_remote(& mut b4, webrtc_peer_offer(& mut a4));
+    val bad: str = str_replace(webrtc_peer_answer(& mut b4), b4.fingerprint, a4.fingerprint);
+    webrtc_peer_set_remote(& mut a4, bad);
+    run_pair(& mut a4, & mut b4, 0, & mut st4);
+    println("bad fingerprint: a " + a4.history + " (" + a4.err + "), b " + b4.history + " (" + b4.err + ")");
+}
+
+fn main() -> i64 {
+    // Hashes
+    println("sha1 abc: " + hx(webrtc_sha1(str_bytes("abc"))));
+    println("hmac rfc2202 #1: " + hx(webrtc_hmac_sha1(hb("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"), str_bytes("Hi There"))));
+    println("hmac rfc2202 #2: " + hx(webrtc_hmac_sha1(str_bytes("Jefe"), str_bytes("what do ya want for nothing?"))));
+    println("hmac long key: " + hx(webrtc_hmac_sha1(Vec::filled(80, 170), str_bytes("Test Using Larger Than Block-Size Key - Hash Key First"))));
+    println("crc32: " + int_to_hex(webrtc_crc32(str_bytes("123456789"))));
+
+    // RFC 5769
+    val pw: Vec<i64> = str_bytes("VOkJxbRl1RmTxUk/WvJxBt");
+    val req: Vec<i64> = hb("000100582112a442b7e7a701bc34d686fa87dfae802200105354554e207465737420636c69656e74002400046e0001ff80290008932ff9b151263b36000600096576746a3a68367659202020000800149aeaa70cbfd8cb56781ef2b5b2d3f249c1b571a280280004e57a3bcf");
+    val r4: Vec<i64> = hb("0101003c2112a442b7e7a701bc34d686fa87dfae8022000b7465737420766563746f7220002000080001a147e112a643000800142b91f599fd9e90c38c7489f92af9ba53f06be7d780280004c07d4c96");
+    val r6: Vec<i64> = hb("010100482112a442b7e7a701bc34d686fa87dfae8022000b7465737420766563746f7220002000140002a1470113a9faa5d3f179bc25f4b5bed2b9d900080014a382954e4be67bf11784c97c8292c275bfe3ed4180280004c8fb0b4c");
+    val m: StunMsg = stun_decode(req);
+    println("request: ok " + bool_to_str(m.ok) + " method " + int_to_str(stun_method(m.mtype)) + " class " + int_to_str(stun_class(m.mtype)) + " user " + str_from_bytes(stun_attr(& m, STUN_USERNAME)) + " software " + str_from_bytes(stun_attr(& m, STUN_SOFTWARE)) + " priority " + hx(stun_attr(& m, STUN_PRIORITY)) + " controlled " + hx(stun_attr(& m, STUN_ICE_CONTROLLED)));
+    println("  integrity " + bool_to_str(stun_check_integrity(req, pw)) + " wrong key " + bool_to_str(stun_check_integrity(req, str_bytes("nope"))) + " fingerprint " + bool_to_str(stun_check_fingerprint(req)));
+    var again: StunMsg = stun_new(STUN_BINDING, STUN_REQUEST, m.txid);
+    again.pad = 32;
+    stun_add_software(& mut again, "STUN test client");
+    stun_add_attr(& mut again, STUN_PRIORITY, hb("6e0001ff"));
+    stun_add_ice_role(& mut again, false, hb("932ff9b151263b36"));
+    stun_add_username(& mut again, "evtj:h6vY");
+    println("  rebuilt same: " + bool_to_str(hx(stun_encode(& again, pw, true)) == hx(req)));
+    val a4: StunMsg = stun_decode(r4);
+    println("ipv4 response: class " + int_to_str(stun_class(a4.mtype)) + " mapped " + stun_mapped_address(& a4) + " integrity " + bool_to_str(stun_check_integrity(r4, pw)) + " fingerprint " + bool_to_str(stun_check_fingerprint(r4)));
+    val a6: StunMsg = stun_decode(r6);
+    println("ipv6 response: mapped " + stun_mapped_address(& a6) + " integrity " + bool_to_str(stun_check_integrity(r6, pw)) + " fingerprint " + bool_to_str(stun_check_fingerprint(r6)));
+    var flipped: Vec<i64> = r4;
+    flipped.set(30, flipped.get(30) ^ 1);
+    println("tampered: integrity " + bool_to_str(stun_check_integrity(flipped, pw)) + " fingerprint " + bool_to_str(stun_check_fingerprint(flipped)));
+    println("not stun: " + bool_to_str(stun_is_stun(hb("80c8000600000001"))) + ", bad length: " + stun_decode(hb("000100042112a442b7e7a701bc34d686fa87dfae")).error);
+
+    // Types, addresses, errors
+    println("types: " + int_to_hex(stun_type(STUN_BINDING, STUN_REQUEST)) + " " + int_to_hex(stun_type(STUN_BINDING, STUN_INDICATION)) + " " + int_to_hex(stun_type(STUN_BINDING, STUN_SUCCESS)) + " " + int_to_hex(stun_type(STUN_BINDING, STUN_ERROR)) + " allocate-error " + int_to_hex(stun_type(3, STUN_ERROR)));
+    println("ip: " + webrtc_ip_text(webrtc_ip_bytes("2001:db8::1")) + " " + webrtc_ip_text(webrtc_ip_bytes("fe80:0:0:1::")) + " " + webrtc_ip_text(webrtc_ip_bytes("::1")) + " " + webrtc_ip_text(webrtc_ip_bytes("2001:db8:0:1:0:0:0:1")));
+    var e: StunMsg = stun_new(STUN_BINDING, STUN_ERROR, m.txid);
+    stun_add_error(& mut e, 487, "Role Conflict");
+    val eb: Vec<i64> = stun_encode(& e, pw, true);
+    val ed: StunMsg = stun_decode(eb);
+    println("error response: " + stun_error(& ed) + ", checks " + bool_to_str(stun_check_integrity(eb, pw) && stun_check_fingerprint(eb)));
+
+    // A binding exchange as ICE does it
+    var check: StunMsg = stun_new(STUN_BINDING, STUN_REQUEST, hb("000102030405060708090a0b"));
+    stun_add_username(& mut check, "remoteUfrag:localUfrag");
+    stun_add_priority(& mut check, ice_priority(110, 65535, 1));
+    stun_add_ice_role(& mut check, true, hb("0102030405060708"));
+    stun_add_use_candidate(& mut check);
+    val cb: Vec<i64> = stun_encode(& check, str_bytes("remotePassword"), true);
+    val got: StunMsg = stun_decode(cb);
+    println("check: " + int_to_str(cb.len()) + " bytes, integrity " + bool_to_str(stun_check_integrity(cb, str_bytes("remotePassword"))) + " use-candidate " + bool_to_str(stun_has_attr(& got, STUN_USE_CANDIDATE)) + " controlling " + bool_to_str(stun_has_attr(& got, STUN_ICE_CONTROLLING)));
+    val resp: Vec<i64> = stun_binding_response(& got, "203.0.113.7", 54321, str_bytes("remotePassword"));
+    val rd: StunMsg = stun_decode(resp);
+    println("response: same txid " + bool_to_str(hx(rd.txid) == hx(got.txid)) + " mapped " + stun_mapped_address(& rd) + " checks " + bool_to_str(stun_check_integrity(resp, str_bytes("remotePassword")) && stun_check_fingerprint(resp)));
+
+    // ICE candidates
+    val c1: IceCandidate = ice_parse_candidate("a=candidate:842163049 1 udp 1677729535 198.51.100.4 46154 typ srflx raddr 192.168.1.10 rport 46154 generation 0 network-cost 999");
+    println("candidate: ok " + bool_to_str(c1.ok) + " " + c1.typ + " " + c1.address + ":" + int_to_str(c1.port) + " base " + c1.raddr + ":" + int_to_str(c1.rport) + " ext [" + c1.ext + "]");
+    println("  back: " + ice_candidate_to_str(& c1));
+    println("  bad: " + bool_to_str(ice_parse_candidate("candidate:1 1 udp 5 1.2.3.4 9 type host").ok));
+    println("priority: host " + int_to_str(ice_priority(126, 65535, 1)) + " srflx " + int_to_str(ice_priority(ice_type_pref("srflx"), 65535, 1)) + " relay rtcp " + int_to_str(ice_priority(ice_type_pref("relay"), 65535, 2)));
+    println("pair: " + int_to_str(ice_pair_priority(2130706431, 1694498815)) + " " + int_to_str(ice_pair_priority(1694498815, 2130706431)));
+    var locals: Vec<IceCandidate> = Vec::new();
+    locals.push(ice_parse_candidate("candidate:1 1 udp 2130706431 192.168.1.10 46154 typ host"));
+    locals.push(ice_parse_candidate("candidate:2 1 udp 1694498815 198.51.100.4 46154 typ srflx raddr 192.168.1.10 rport 46154"));
+    locals.push(ice_parse_candidate("candidate:3 1 udp 2122260223 2001:db8::10 50000 typ host"));
+    locals.push(ice_parse_candidate("candidate:4 1 udp 16777215 203.0.113.50 3478 typ relay raddr 198.51.100.4 rport 46154"));
+    var remotes: Vec<IceCandidate> = Vec::new();
+    remotes.push(ice_parse_candidate("candidate:a 1 udp 2130706431 10.0.0.5 6000 typ host"));
+    remotes.push(ice_parse_candidate("candidate:b 1 udp 1694498815 192.0.2.9 6001 typ srflx raddr 10.0.0.5 rport 6000"));
+    remotes.push(ice_parse_candidate("candidate:c 1 udp 2122260223 2001:db8::99 6002 typ host"));
+    remotes.push(ice_parse_candidate("candidate:d 1 tcp 1518280447 192.0.2.9 9 typ host tcptype active"));
+    val pairs: Vec<IcePair> = ice_pairs(locals, remotes, true);
+    println("pairs: " + int_to_str(pairs.len()));
+    var i: i64 = 0;
+    while i < pairs.len() {
+        val p: IcePair = pairs.get(i);
+        println("  " + p.foundation + " " + locals.get(p.local).address + " -> " + remotes.get(p.remote).address + " " + int_to_str(p.priority));
+        i = i + 1;
+    }
+
+    // SDP
+    val offer_text: str = "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1 2\r\na=msid-semantic: WMS stream\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 103 0\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:EsAw\r\na=ice-pwd:P2uYro0UCOQ4zxjKXaWCBui1\r\na=fingerprint:sha-256 D2:FA:0E:C3:22:59:5E:14:95:69:92:3D:13:B4:84:24:2C:C2:A2:C0:3E:FD:34:8E:5E:EA:6F:AF:52:CE:E6:0F\r\na=setup:actpass\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=rtpmap:103 ISAC/16000\r\na=rtpmap:0 PCMU/8000\r\na=candidate:1 1 udp 2130706431 192.168.1.10 46154 typ host\r\nm=video 9 UDP/TLS/RTP/SAVPF 96 98\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:EsAw\r\na=ice-pwd:P2uYro0UCOQ4zxjKXaWCBui1\r\na=setup:actpass\r\na=mid:1\r\na=sendonly\r\na=rtcp-mux\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:98 VP9/90000\r\na=fmtp:98 profile-id=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:2\r\na=setup:actpass\r\na=sctp-port:5000\r\n";
+    val offer: Sdp = sdp_parse(offer_text);
+    println("offer: ok " + bool_to_str(offer.ok) + " " + int_to_str(offer.media.len()) + " sections, bundle " + sdp_attr(offer.names, offer.vals, "group") + ", round trip same " + bool_to_str(sdp_to_str(& offer) == offer_text));
+    i = 0;
+    while i < offer.media.len() {
+        val om: SdpMedia = offer.media.get(i);
+        println("  " + om.kind + " mid " + sdp_attr(om.names, om.vals, "mid") + " " + sdp_direction(& om) + " ufrag " + sdp_ice_ufrag(& offer, & om) + " codecs " + str_join(sdp_codecs(& om), ", ") + " candidates " + int_to_str(sdp_attrs(om.names, om.vals, "candidate").len()));
+        i = i + 1;
+    }
+    val cand: IceCandidate = ice_parse_candidate(sdp_attrs(offer.media.get(0).names, offer.media.get(0).vals, "candidate").get(0));
+    println("  first candidate: " + cand.address + ":" + int_to_str(cand.port) + " " + cand.typ);
+    var codecs: Vec<str> = Vec::new();
+    codecs.push("VP9");
+    codecs.push("opus");
+    codecs.push("PCMU");
+    val cfg: SdpAnswerConfig = SdpAnswerConfig { origin: "- 99 1 IN IP4 127.0.0.1", ufrag: "Ufr4", pwd: "an-answer-password-22c", fingerprint: "sha-256 AB:CD", codecs: codecs, data_channels: true };
+    val ans: Sdp = sdp_answer(& offer, cfg);
+    val ans_text: str = sdp_to_str(& ans);
+    val lines: Vec<str> = str_split(ans_text, "\r\n");
+    i = 0;
+    while i < lines.len() {
+        if str_len(lines.get(i)) > 0 {
+            println("| " + lines.get(i));
+        }
+        i = i + 1;
+    }
+    var cfg2: SdpAnswerConfig = cfg;
+    var only_h264: Vec<str> = Vec::new();
+    only_h264.push("H264");
+    cfg2.codecs = only_h264;
+    cfg2.data_channels = false;
+    val rej: Sdp = sdp_answer(& offer, cfg2);
+    println("nothing in common: ports " + int_to_str(rej.media.get(0).port) + " " + int_to_str(rej.media.get(1).port) + " " + int_to_str(rej.media.get(2).port) + ", bundle " + bool_to_str(sdp_has_attr(rej.names, "group")));
+    println("bad sdp: " + sdp_parse("v=0\r\nhello\r\n").error + "; " + sdp_parse("s=-\r\n").error);
+
+    // a peer connection between two endpoints in memory
+    peer_tests();
+    return 0;
+}

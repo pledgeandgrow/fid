@@ -1,0 +1,233 @@
+// RA9 (docs/roadmap/llvm-roadmap.md): the greedy allocator of
+// compiler/nat_ir.fd (ng_greedy_assign, FID_NAT_ON=greedy) on given hulls,
+// through nat_greedy_unit, on AArch64, RISC-V and x86-64:
+//   full      K+1 ranges over one span: the lightest is evicted, then
+//             spilled; every other range has a register
+//   evict     a long light range gives its register to a short heavy one
+//             that comes after it, and is spilled; a second short range
+//             after the first takes the freed register
+//   touch     K ranges ending where K others start: no spill (a range
+//             ending at an operation gives its register up there)
+//   random    120 ranges from a fixed generator: no two interfering
+//             ranges share a register, every register is in the pool, and
+//             the count of spills is the same on every run
+// Run:
+//   fid run tests/nattools/greedy_unit.fd
+// Expected output:
+// a64 full ok
+// a64 evict ok
+// a64 touch ok
+// a64 random ok
+// rv64 full ok
+// rv64 evict ok
+// rv64 touch ok
+// rv64 random ok
+// x64 full ok
+// x64 evict ok
+// x64 touch ok
+// x64 random ok
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn clash(alo: i64, ahi: i64, blo: i64, bhi: i64) -> bool {
+    if alo == blo {
+        return true;
+    }
+    return alo < bhi && blo < ahi;
+}
+
+/// Every two ranges that interfere have different registers; every
+/// register is one of the pool's (a spilled range is -1).
+fn sound(lo: & Vec<i64>, hi: & Vec<i64>, res: & Vec<i64>, pool: & Vec<i64>) -> bool {
+    var n: i64 = lo.len();
+    var i: i64 = 0;
+    var ok: bool = true;
+    while i < n {
+        var r: i64 = res.get(i);
+        if r < 0 - 1 {
+            ok = false;
+        }
+        if r >= 0 {
+            var inpool: bool = false;
+            var p: i64 = 0;
+            while p < pool.len() {
+                if pool.get(p) == r {
+                    inpool = true;
+                }
+                p = p + 1;
+            }
+            if !inpool {
+                ok = false;
+            }
+            var j: i64 = i + 1;
+            while j < n {
+                if res.get(j) == r && clash(lo.get(i), hi.get(i), lo.get(j), hi.get(j)) {
+                    ok = false;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return ok;
+}
+
+fn spills(res: & Vec<i64>, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if res.get(i) == 0 - 1 {
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The pool's registers: the registers the K overlapping ranges of `full`
+/// were given.
+fn pool_of(arch: i64, k: i64) -> Vec<i64> {
+    var lo: Vec<i64> = Vec::new();
+    var hi: Vec<i64> = Vec::new();
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < k {
+        lo.push(0);
+        hi.push(100);
+        w.push(10);
+        i = i + 1;
+    }
+    var res: Vec<i64> = nat_greedy_unit(arch, & lo, & hi, & w);
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < k {
+        out.push(res.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(arch: i64, name: str) {
+    var e: Vec<i64> = Vec::new();
+    var probe: Vec<i64> = nat_greedy_unit(arch, & e, & e, & e);
+    var k: i64 = probe.get(1);
+    var pool: Vec<i64> = pool_of(arch, k);
+
+    // full: K+1 ranges over [0, 100], range 0 the lightest
+    var lo: Vec<i64> = Vec::new();
+    var hi: Vec<i64> = Vec::new();
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i <= k {
+        lo.push(0);
+        hi.push(100);
+        w.push(i + 1);
+        i = i + 1;
+    }
+    var res: Vec<i64> = nat_greedy_unit(arch, & lo, & hi, & w);
+    var ok: bool = sound(& lo, & hi, & res, & pool) && res.get(0) == 0 - 1 && spills(& res, k + 1) == 1 && res.get(k + 1) == 1;
+    if ok {
+        println(name + " full ok");
+    } else {
+        println(name + " full FAILED: spills " + int_to_str(spills(& res, k + 1)) + ", evictions " + int_to_str(res.get(k + 1)));
+    }
+
+    // evict: K-1 heavy [0, 1000], one light [0, 999], heavy short
+    // [10, 20] and [30, 40]
+    lo = Vec::new();
+    hi = Vec::new();
+    w = Vec::new();
+    i = 0;
+    while i < k - 1 {
+        lo.push(0);
+        hi.push(1000);
+        w.push(1000);
+        i = i + 1;
+    }
+    var light: i64 = lo.len();
+    lo.push(0);
+    hi.push(999);
+    w.push(2);
+    var s1: i64 = lo.len();
+    lo.push(10);
+    hi.push(20);
+    w.push(50);
+    var s2: i64 = lo.len();
+    lo.push(30);
+    hi.push(40);
+    w.push(50);
+    var n: i64 = lo.len();
+    res = nat_greedy_unit(arch, & lo, & hi, & w);
+    ok = sound(& lo, & hi, & res, & pool) && res.get(light) == 0 - 1 && res.get(s1) >= 0 && res.get(s2) >= 0 && spills(& res, n) == 1 && res.get(n) == 1;
+    if ok {
+        println(name + " evict ok");
+    } else {
+        println(name + " evict FAILED: spills " + int_to_str(spills(& res, n)) + ", evictions " + int_to_str(res.get(n)));
+    }
+
+    // touch: K ranges [0, 5] and K ranges [5, 9]
+    lo = Vec::new();
+    hi = Vec::new();
+    w = Vec::new();
+    i = 0;
+    while i < k {
+        lo.push(0);
+        hi.push(5);
+        w.push(3);
+        lo.push(5);
+        hi.push(9);
+        w.push(3);
+        i = i + 1;
+    }
+    n = lo.len();
+    res = nat_greedy_unit(arch, & lo, & hi, & w);
+    ok = sound(& lo, & hi, & res, & pool) && spills(& res, n) == 0;
+    if ok {
+        println(name + " touch ok");
+    } else {
+        println(name + " touch FAILED: spills " + int_to_str(spills(& res, n)));
+    }
+
+    // random: 120 ranges, twice
+    lo = Vec::new();
+    hi = Vec::new();
+    w = Vec::new();
+    var seed: i64 = 12345;
+    i = 0;
+    while i < 120 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var a: i64 = seed % 800;
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var len: i64 = seed % 120;
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        lo.push(a);
+        hi.push(a + len);
+        w.push(1 + seed % 500);
+        i = i + 1;
+    }
+    res = nat_greedy_unit(arch, & lo, & hi, & w);
+    var again: Vec<i64> = nat_greedy_unit(arch, & lo, & hi, & w);
+    var same: bool = true;
+    i = 0;
+    while i < 122 {
+        if res.get(i) != again.get(i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    ok = sound(& lo, & hi, & res, & pool) && same;
+    if ok {
+        println(name + " random ok");
+    } else {
+        println(name + " random FAILED: spills " + int_to_str(spills(& res, 120)));
+    }
+}
+
+fn main() {
+    check(NAT_A64, "a64");
+    check(NAT_RV64, "rv64");
+    check(NAT_X64, "x64");
+}

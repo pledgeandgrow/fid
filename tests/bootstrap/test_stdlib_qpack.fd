@@ -1,0 +1,174 @@
+// stdlib/qpack (competitive SL2, part 3): QPACK field sections with the
+// static table only (RFC 9204), as stdlib/http3.fd uses them.
+//   - RFC 9204 Appendix B.1 byte for byte (literal with a static name
+//     reference), and the same field Huffman-coded (RFC 7541 C.4.1's
+//     "www.example.com" code);
+//   - every one of the 99 static entries as an indexed line and back;
+//   - a literal name, a never-indexed field, Huffman round trips;
+//   - the errors: a Required Insert Count, dynamic and post-base
+//     references, a cut-short section, bad Huffman padding, the size limit;
+//   - encoder- and decoder-stream instructions against a table of size 0.
+//
+// Expected output:
+// rfc 9204 b.1 ok
+// huffman literal ok
+// static table: 99 entries round trip
+// literal name ok
+// never indexed ok
+// huffman round trip ok
+// required insert count: 512
+// dynamic index: 512
+// post-base: 512
+// cut short: 512
+// bad padding: 512
+// too large: 48
+// encoder stream ok
+// decoder stream ok
+// qpack ok
+use qpack;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn hx(b: Vec<i64>) -> str {
+    val d: str = "0123456789abcdef";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(str_byte_at(d, (b.get(i) >> 4) & 15));
+        out.push(str_byte_at(d, b.get(i) & 15));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn one(n: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(n);
+    return v;
+}
+
+fn expect_fail(name: str, block: Vec<i64>) {
+    val r: QpackFields = qpack_decode(block, - 1);
+    if r.ok { p_panic(name + " decoded"); }
+    println(name + ": " + int_to_str(r.error));
+}
+
+fn main() -> i64 {
+    // B.1: :path=/index.html, no Huffman
+    val b1: Vec<i64> = qpack_encode(one(":path"), one("/index.html"), false);
+    if hx(b1) != "0000510b2f696e6465782e68746d6c" { p_panic("b.1 encode: " + hx(b1)); }
+    val d1: QpackFields = qpack_decode(b1, - 1);
+    if !d1.ok || d1.names.len() != 1 || d1.names.get(0) != ":path" || d1.values.get(0) != "/index.html" {
+        p_panic("b.1 decode: " + d1.why);
+    }
+    println("rfc 9204 b.1 ok");
+
+    // A Huffman-coded value with a static name reference (:authority, 0)
+    val hblock: Vec<i64> = qpack_encode(one(":authority"), one("www.example.com"), true);
+    if hx(hblock) != "0000508cf1e3c2e5f23a6ba0ab90f4ff" { p_panic("huffman encode: " + hx(hblock)); }
+    val hd: QpackFields = qpack_decode(hblock, - 1);
+    if !hd.ok || hd.values.get(0) != "www.example.com" { p_panic("huffman decode"); }
+    println("huffman literal ok");
+
+    // Every static entry is one indexed line
+    var i: i64 = 0;
+    var names: Vec<str> = Vec::new();
+    var values: Vec<str> = Vec::new();
+    while i < QPACK_STATIC_LEN {
+        val n: str = qpack_static_name(i);
+        val v: str = qpack_static_value(i);
+        if qpack_static_find(n, v) != i { p_panic("static entry " + int_to_str(i) + " is not unique"); }
+        val b: Vec<i64> = qpack_encode(one(n), one(v), true);
+        if i < 63 {
+            if b.len() != 3 || b.get(2) != (0xc0 | i) { p_panic("static entry " + int_to_str(i) + ": " + hx(b)); }
+        } else if b.len() != 4 || b.get(2) != 0xff || b.get(3) != i - 63 {
+            p_panic("static entry " + int_to_str(i) + ": " + hx(b));
+        }
+        names.push(n);
+        values.push(v);
+        i = i + 1;
+    }
+    if qpack_static_name(25) != ":status" || qpack_static_value(25) != "200" || qpack_static_value(98) != "sameorigin" {
+        p_panic("static table contents");
+    }
+    val all: QpackFields = qpack_decode(qpack_encode(names, values, true), - 1);
+    if !all.ok || all.names.len() != 99 { p_panic("static round trip: " + all.why); }
+    i = 0;
+    while i < 99 {
+        if all.names.get(i) != names.get(i) || all.values.get(i) != values.get(i) { p_panic("static " + int_to_str(i)); }
+        i = i + 1;
+    }
+    println("static table: " + int_to_str(all.names.len()) + " entries round trip");
+
+    // Literal name, 3-bit length prefix
+    val lb: Vec<i64> = qpack_encode(one("x-custom"), one("v1"), false);
+    if hx(lb) != "00002701782d637573746f6d027631" { p_panic("literal name: " + hx(lb)); }
+    val ld: QpackFields = qpack_decode(lb, - 1);
+    if !ld.ok || ld.names.get(0) != "x-custom" || ld.values.get(0) != "v1" { p_panic("literal name decode"); }
+    println("literal name ok");
+
+    // authorization: never indexed (N bit), name reference 84
+    val ab: Vec<i64> = qpack_encode(one("authorization"), one("secret"), false);
+    if hx(ab) != "00007f4506736563726574" { p_panic("never indexed: " + hx(ab)); }
+    val ad: QpackFields = qpack_decode(ab, - 1);
+    if !ad.ok || ad.names.get(0) != "authorization" || ad.values.get(0) != "secret" { p_panic("never indexed decode"); }
+    println("never indexed ok");
+
+    // Huffman round trips: literal names and values of all kinds
+    var hn: Vec<str> = Vec::new();
+    var hv: Vec<str> = Vec::new();
+    hn.push(":method");
+    hv.push("PATCH");
+    hn.push("user-agent");
+    hv.push("fides-test/1.0 (http3; qpack)");
+    hn.push("x-trace-id");
+    hv.push("0123456789abcdef0123456789abcdef");
+    hn.push("x-empty");
+    hv.push("");
+    hn.push("cookie");
+    hv.push("a=1; b=\"two\"; c=~!@#$%^&*()");
+    val hr: QpackFields = qpack_decode(qpack_encode(hn, hv, true), 4096);
+    if !hr.ok || hr.names.len() != 5 { p_panic("huffman round trip: " + hr.why); }
+    i = 0;
+    while i < 5 {
+        if hr.names.get(i) != hn.get(i) || hr.values.get(i) != hv.get(i) { p_panic("huffman field " + int_to_str(i)); }
+        i = i + 1;
+    }
+    if qpack_encode(hn, hv, true).len() >= qpack_encode(hn, hv, false).len() { p_panic("huffman is not shorter"); }
+    println("huffman round trip ok");
+
+    // Errors
+    expect_fail("required insert count", hb("0200d1"));
+    expect_fail("dynamic index", hb("000080"));
+    expect_fail("post-base", hb("000010"));
+    expect_fail("cut short", hb("0000510b2f"));
+    expect_fail("bad padding", hb("00005081" + "00"));
+    val big: QpackFields = qpack_decode(b1, 40);
+    if big.ok || !big.too_large { p_panic("size limit"); }
+    println("too large: " + int_to_str(big.size));
+
+    // Encoder stream: Set Dynamic Table Capacity 0 is fine
+    val e1: QpackScan = qpack_encoder_stream_scan(hb("2020"), 0, 0);
+    if e1.status != QPACK_SCAN_OK || e1.used != 2 { p_panic("set capacity 0"); }
+    val e2: QpackScan = qpack_encoder_stream_scan(hb("3fe11f"), 0, 0);
+    if e2.status != QPACK_SCAN_ERROR || e2.error != QPACK_ENCODER_STREAM_ERROR { p_panic("capacity 4096 taken"); }
+    val e3: QpackScan = qpack_encoder_stream_scan(hb("203f"), 0, 0);
+    if e3.status != QPACK_SCAN_MORE || e3.used != 1 { p_panic("cut short capacity"); }
+    val e4: QpackScan = qpack_encoder_stream_scan(hb("c00161"), 0, 0);
+    if e4.status != QPACK_SCAN_ERROR { p_panic("insertion taken"); }
+    val e5: QpackScan = qpack_encoder_stream_scan(hb("00"), 0, 0);
+    if e5.status != QPACK_SCAN_ERROR { p_panic("duplicate taken"); }
+    println("encoder stream ok");
+
+    // Decoder stream: Stream Cancellation is fine, nothing else is
+    val c1: QpackScan = qpack_decoder_stream_scan(hb("41447f"), 0);
+    if c1.status != QPACK_SCAN_MORE || c1.used != 2 { p_panic("stream cancellation"); }
+    val c2: QpackScan = qpack_decoder_stream_scan(hb("81"), 0);
+    if c2.status != QPACK_SCAN_ERROR || c2.error != QPACK_DECODER_STREAM_ERROR { p_panic("section ack taken"); }
+    val c3: QpackScan = qpack_decoder_stream_scan(hb("01"), 0);
+    if c3.status != QPACK_SCAN_ERROR { p_panic("insert count increment taken"); }
+    println("decoder stream ok");
+    println("qpack ok");
+    return 0;
+}

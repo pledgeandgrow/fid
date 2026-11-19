@@ -1,0 +1,90 @@
+// roadmap L4B: stdlib/unix_socket.fd over the runtime builtins
+// p_unix_listen / p_unix_connect (C runtime, pe_runtime, the machine
+// layer's Linux / macOS / --nat Windows runtime; `fid run` simulates them
+// in one process). A UnixListener and two UnixStreams talk in one process:
+// connect completes from the listen backlog, then accept takes it. Real
+// sockets need Linux, macOS or Windows 10 1803+ (AF_UNIX in ws2_32).
+// (tests/net/unix_echo.fd is the earlier, smaller version of this test.)
+//
+// Expected output:
+// no listener: true
+// bound
+// second bind refused: true
+// connected
+// server got: ping over AF_UNIX
+// client got: echo: ping over AF_UNIX
+// second client: two
+// closed
+// path removed: true
+use unix_socket;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    val tag: str = int_to_str(p_getpid());
+    val path: str = "fid_unix_" + tag + ".sock";
+    match UnixStream::connect("fid_unix_none_" + tag + ".sock") {
+        Option::Some(n) => {
+            var stray: UnixStream = n;
+            stray.close();
+            println("no listener: false");
+        }
+        Option::None => { println("no listener: true"); }
+    }
+    val lo: Option<UnixListener> = UnixListener::bind(path);
+    match lo {
+        Option::Some(l) => {
+            var lis: UnixListener = l;
+            println("bound");
+            // the path is taken while the listener holds it
+            val dup: i64 = p_unix_listen(path);
+            println("second bind refused: " + yes(dup < 0));
+            if dup >= 0 { p_socket_close(dup); }
+            match UnixStream::connect(path) {
+                Option::Some(c) => {
+                    var cli: UnixStream = c;
+                    println("connected");
+                    match lis.accept() {
+                        Option::Some(s) => {
+                            var srv: UnixStream = s;
+                            cli.write_str("ping over AF_UNIX");
+                            val got: str = srv.read_str();
+                            println("server got: " + got);
+                            srv.write_str("echo: " + got);
+                            println("client got: " + cli.read_str());
+                            srv.close();
+                        }
+                        Option::None => { println("accept failed"); }
+                    }
+                    cli.close();
+                }
+                Option::None => { println("connect failed"); }
+            }
+            // a second connection to the same listener
+            match UnixStream::connect(path) {
+                Option::Some(c2) => {
+                    var cli2: UnixStream = c2;
+                    match lis.accept() {
+                        Option::Some(s2) => {
+                            var srv2: UnixStream = s2;
+                            cli2.write_str("two");
+                            println("second client: " + srv2.read_str());
+                            srv2.close();
+                        }
+                        Option::None => { println("second accept failed"); }
+                    }
+                    cli2.close();
+                }
+                Option::None => { println("second connect failed"); }
+            }
+            lis.close();
+            println("closed");
+            println("path removed: " + yes(p_file_exists(path) == 0));
+        }
+        Option::None => { println("bind failed"); }
+    }
+    return 0;
+}

@@ -1,0 +1,199 @@
+// Roadmap Phase 16 "UEFI PE32+ emission in self-hosted PE emitter": the
+// UEFI path of compiler/pe_ir.fd (pe_ir_generate_uefi) on a small IR
+// module: main prints a string constant, a str-literal global (an absolute
+// address in .data: a DIR64 base relocation) and an integer, then returns 0.
+// The image's headers are read back here; tests/uefi/check_efi.py checks
+// the whole file and tests/uefi/run.sh boots it under QEMU with OVMF.
+// Run from the repository root:
+//   fid run tests/uefi/uefi_image_unit.fd [out.efi]
+// Expected output:
+// mz ok
+// machine 8664
+// magic 20b
+// subsystem 10
+// sections 3
+// entry 1000
+// first byte e9
+// prologue ok
+// reloc dir ok
+// dir64 1
+// slot ok
+// wrote ok
+use core;
+use vec;
+use string;
+use fs;
+use compiler::ast;
+use compiler::ir;
+use compiler::pe_ir_enc;
+use compiler::pe_ir_stubs;
+use compiler::pe_ir;
+
+fn u16_at(b: Vec, at: i64) -> i64 {
+    return b.get(at) + (b.get(at + 1) << 8);
+}
+
+fn u32_at(b: Vec, at: i64) -> i64 {
+    return u16_at(b, at) + (u16_at(b, at + 2) << 16);
+}
+
+fn u64_at(b: Vec, at: i64) -> i64 {
+    return u32_at(b, at) + (u32_at(b, at + 4) << 32);
+}
+
+fn hex(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    if v == 0 {
+        return "0";
+    }
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = str_slice(digits, x % 16, x % 16 + 1) + s;
+        x = x / 16;
+    }
+    return s;
+}
+
+/// File offset of RVA `rva` (the section that holds it), or -1
+fn file_off(b: Vec, rva: i64) -> i64 {
+    var nsec: i64 = u16_at(b, 64 + 4 + 2);
+    var sh: i64 = 64 + 4 + 20 + 240;
+    var i: i64 = 0;
+    while i < nsec {
+        var h: i64 = sh + 40 * i;
+        var vsize: i64 = u32_at(b, h + 8);
+        var va: i64 = u32_at(b, h + 12);
+        var raw: i64 = u32_at(b, h + 20);
+        if rva >= va && rva < va + vsize {
+            return raw + rva - va;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn str_ty() -> IrType {
+    return IrType::Ptr(Box::new(IrType::U8));
+}
+
+fn main() -> i64 {
+    var m: IrModule = IrModule_new();
+    m.globals.push(GlobalEntry_new("g_name", str_ty(), Expr::StringLit("Fides")));
+    var f: IrFunction = IrFunction_new("main", IrType::I64);
+    var b: i64 = IrFunction_new_block(&mut f);
+    f.entry = b;
+    var hello: i64 = IrFunction_emit(&mut f, Inst::ConstStr("hello from UEFI\n"));
+    IrFunction_emit(&mut f, Inst::Print(hello, str_ty()));
+    var ga: i64 = IrFunction_emit(&mut f, Inst::GlobalAddr("g_name", IrType::Ptr(Box::new(str_ty()))));
+    var gv: i64 = IrFunction_emit(&mut f, Inst::Load(ga, str_ty()));
+    IrFunction_emit(&mut f, Inst::Print(gv, str_ty()));
+    var nl: i64 = IrFunction_emit(&mut f, Inst::ConstStr("\n"));
+    IrFunction_emit(&mut f, Inst::Print(nl, str_ty()));
+    var k: i64 = IrFunction_emit(&mut f, Inst::ConstInt(6765, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Print(k, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Print(nl, str_ty()));
+    var z: i64 = IrFunction_emit(&mut f, Inst::ConstInt(0, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(z)));
+    m.functions.push(IrFunctionEntry_new("main", f));
+
+    var img: Vec = Vec::new();
+    match pe_ir_generate_uefi(m, "") {
+        ResultBytes::Err(errs) => {
+            var i: i64 = 0;
+            while i < errs.len() {
+                println("err: " + errs.get(i));
+                i = i + 1;
+            }
+            return 1;
+        }
+        ResultBytes::Ok(bytes) => {
+            img = bytes;
+        }
+    }
+
+    var wrote: bool = false;
+    var out: str = "uefi_unit.efi";
+    if p_argc() > 1 {
+        match arg_at(1) {
+            Option::Some(a) => {
+                out = a;
+            }
+            Option::None => {
+            }
+        }
+    }
+    if fs_write_bytes(out, img) {
+        wrote = true;
+    }
+    if u16_at(img, 0) == 0x5A4D && u32_at(img, 60) == 64 && u32_at(img, 64) == 0x4550 {
+        println("mz ok");
+    }
+    println("machine " + hex(u16_at(img, 68)));
+    var opt: i64 = 64 + 4 + 20;
+    println("magic " + hex(u16_at(img, opt)));
+    println("subsystem " + int_to_str(u16_at(img, opt + 68)));
+    println("sections " + int_to_str(u16_at(img, 70)));
+    var entry: i64 = u32_at(img, opt + 16);
+    println("entry " + hex(entry));
+    var eo: i64 = file_off(img, entry);
+    println("first byte " + hex(img.get(eo)));
+    // the jump lands on the UEFI entry: push rbx; push rbp; push rdi; push rsi
+    var rel: i64 = u32_at(img, eo + 1);
+    if rel >= 0x80000000 {
+        rel = rel - 0x100000000;
+    }
+    var to: i64 = file_off(img, entry + 5 + rel);
+    if to > 0 && img.get(to) == 0x53 && img.get(to + 1) == 0x55 && img.get(to + 2) == 0x57 && img.get(to + 3) == 0x56 {
+        println("prologue ok");
+    }
+    // directory 5: the base relocations, all DIR64 slots in .data
+    var image_base: i64 = u64_at(img, opt + 24);
+    var rdir: i64 = u32_at(img, opt + 112 + 40);
+    var rsize: i64 = u32_at(img, opt + 112 + 44);
+    var ro: i64 = file_off(img, rdir);
+    if ro > 0 && rsize >= 12 && rsize % 4 == 0 {
+        println("reloc dir ok");
+    }
+    var n64: i64 = 0;
+    var slot_ok: bool = true;
+    var p: i64 = 0;
+    while p < rsize {
+        var page: i64 = u32_at(img, ro + p);
+        var bsize: i64 = u32_at(img, ro + p + 4);
+        var q: i64 = 8;
+        while q < bsize {
+            var ent: i64 = u16_at(img, ro + p + q);
+            if (ent >> 12) == 10 {
+                n64 = n64 + 1;
+                // the slot holds the address of "Fides" linked at ImageBase
+                var so: i64 = file_off(img, page + (ent & 0xFFF));
+                if so < 0 {
+                    println("slot " + hex(page + (ent & 0xFFF)) + " outside the sections");
+                    slot_ok = false;
+                } else {
+                    var target: i64 = u64_at(img, so) - image_base;
+                    var to2: i64 = file_off(img, target);
+                    if to2 < 0 || img.get(to2) != 70 || img.get(to2 + 4) != 115 || img.get(to2 + 5) != 0 {
+                        println("slot " + hex(page + (ent & 0xFFF)) + " holds " + hex(target + image_base));
+                        slot_ok = false;
+                    }
+                }
+            }
+            q = q + 2;
+        }
+        if bsize < 8 {
+            p = rsize;
+        } else {
+            p = p + bsize;
+        }
+    }
+    println("dir64 " + int_to_str(n64));
+    if slot_ok && n64 > 0 {
+        println("slot ok");
+    }
+    if wrote {
+        println("wrote ok");
+    }
+    return 0;
+}

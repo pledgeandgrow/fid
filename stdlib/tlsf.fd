@@ -1,0 +1,383 @@
+// Fides TLSF allocator (Two-Level Segregated Fit, Masmano et al. 2004), pure Fides.
+//
+// A real-time allocator over one memory arena: malloc and free run in
+// bounded time (no search over a list): free blocks sit in segregated
+// lists indexed by a first level (the power of two of the size) and a
+// second level (16 linear subdivisions of that power), with a bitmap of
+// non-empty first levels and, per first level, a bitmap of non-empty
+// second levels. malloc rounds the request up to the next list start
+// (so any block in the list found fits: "good fit"), finds the first
+// non-empty list at or above it with two find-first-set operations,
+// splits off the remainder; free coalesces with free physical neighbours
+// immediately. Block layout (as the reference implementation, in 8-byte
+// words): [prev_phys offset][size | FREE | PREV_FREE] then the payload;
+// a free block keeps next_free/prev_free in its first payload words. A
+// zero-size used sentinel ends the arena.
+//
+// The arena here is a Vec<i64> of 8-byte words standing in for memory,
+// addresses are byte offsets into it (8-aligned); tlsf_check walks every
+// block and list and verifies the invariants. On a target the same
+// algorithm runs on a static buffer: the word reads and writes
+// (tlsf_rd/tlsf_wr) are the seam to replace with raw memory accesses, and
+// the find-first-set loops with CLZ/CTZ instructions.
+
+module tlsf;
+ use vec; use string;
+
+pub const TLSF_SL_LOG2: i64 = 4;
+pub const TLSF_SL_COUNT: i64 = 16;
+pub const TLSF_ALIGN: i64 = 8;
+pub const TLSF_FL_SHIFT: i64 = 7;
+pub const TLSF_SMALL: i64 = 128;
+pub const TLSF_FL_COUNT: i64 = 25;
+pub const TLSF_HDR: i64 = 16;
+pub const TLSF_MIN: i64 = 16;
+pub const TLSF_FREE: i64 = 1;
+pub const TLSF_PREV_FREE: i64 = 2;
+pub const TLSF_NIL: i64 = -1;
+
+pub struct Tlsf {
+    pub mem: Vec<i64>,
+    pub size: i64,
+    pub fl_bitmap: i64,
+    pub sl_bitmap: Vec<i64>,
+    pub heads: Vec<i64>,
+    pub allocs: i64,
+    pub frees: i64,
+}
+
+// ─── Bit scans ──────────────────────────────────────────────────────────
+
+/// Index of the most significant set bit (-1 for 0).
+pub fn tlsf_fls(x: i64) -> i64 {
+    if x <= 0 { return -1; }
+    var n: i64 = 0;
+    var v: i64 = x;
+    if v >= 0x100000000 { v = v >> 32; n = n + 32; }
+    if v >= 0x10000 { v = v >> 16; n = n + 16; }
+    if v >= 0x100 { v = v >> 8; n = n + 8; }
+    if v >= 0x10 { v = v >> 4; n = n + 4; }
+    if v >= 0x4 { v = v >> 2; n = n + 2; }
+    if v >= 0x2 { n = n + 1; }
+    return n;
+}
+
+/// Index of the least significant set bit (-1 for 0).
+pub fn tlsf_ffs(x: i64) -> i64 {
+    if x == 0 { return -1; }
+    return tlsf_fls(x & (0 - x));
+}
+
+/// (fl, sl) of a free block of `size` bytes, packed fl * 16 + sl.
+pub fn tlsf_mapping_insert(size: i64) -> i64 {
+    if size < TLSF_SMALL { return size / (TLSF_SMALL / TLSF_SL_COUNT); }
+    val f: i64 = tlsf_fls(size);
+    val sl: i64 = (size >> (f - TLSF_SL_LOG2)) ^ TLSF_SL_COUNT;
+    return (f - (TLSF_FL_SHIFT - 1)) * TLSF_SL_COUNT + sl;
+}
+
+/// The list to search for a request: rounded up so every block there fits.
+pub fn tlsf_mapping_search(size: i64) -> i64 {
+    var s: i64 = size;
+    if s >= TLSF_SMALL { s = s + (1 << (tlsf_fls(s) - TLSF_SL_LOG2)) - 1; }
+    return tlsf_mapping_insert(s);
+}
+
+// ─── Words ──────────────────────────────────────────────────────────────
+
+pub fn tlsf_rd(t: &Tlsf, off: i64) -> i64 {
+    return t.mem.get(off / 8);
+}
+
+pub fn tlsf_wr(t: &mut Tlsf, off: i64, v: i64) {
+    t.mem.set(off / 8, v);
+}
+
+fn bsize(t: &Tlsf, b: i64) -> i64 {
+    return tlsf_rd(t, b + 8) & ~3;
+}
+
+fn bflags(t: &Tlsf, b: i64) -> i64 {
+    return tlsf_rd(t, b + 8) & 3;
+}
+
+fn bset(t: &mut Tlsf, b: i64, size: i64, flags: i64) {
+    tlsf_wr(t, b + 8, size | flags);
+}
+
+fn bnext(t: &Tlsf, b: i64) -> i64 {
+    return b + TLSF_HDR + bsize(t, b);
+}
+
+fn bfree(t: &Tlsf, b: i64) -> bool {
+    return (bflags(t, b) & TLSF_FREE) != 0;
+}
+
+/// Set or clear PREV_FREE of the block after b, and its prev_phys link.
+fn link_next(t: &mut Tlsf, b: i64, free: bool) {
+    val n: i64 = bnext(t, b);
+    tlsf_wr(t, n, b);
+    var f: i64 = bflags(t, n) & ~TLSF_PREV_FREE;
+    if free { f = f | TLSF_PREV_FREE; }
+    bset(t, n, bsize(t, n), f);
+}
+
+// ─── Free lists ─────────────────────────────────────────────────────────
+
+fn list_insert(t: &mut Tlsf, b: i64) {
+    val m: i64 = tlsf_mapping_insert(bsize(t, b));
+    val fl: i64 = m / TLSF_SL_COUNT;
+    val sl: i64 = m % TLSF_SL_COUNT;
+    val head: i64 = t.heads.get(m);
+    tlsf_wr(t, b + TLSF_HDR, head);
+    tlsf_wr(t, b + TLSF_HDR + 8, TLSF_NIL);
+    if head != TLSF_NIL { tlsf_wr(t, head + TLSF_HDR + 8, b); }
+    t.heads.set(m, b);
+    t.fl_bitmap = t.fl_bitmap | (1 << fl);
+    t.sl_bitmap.set(fl, t.sl_bitmap.get(fl) | (1 << sl));
+}
+
+fn list_remove(t: &mut Tlsf, b: i64) {
+    val m: i64 = tlsf_mapping_insert(bsize(t, b));
+    val fl: i64 = m / TLSF_SL_COUNT;
+    val sl: i64 = m % TLSF_SL_COUNT;
+    val nx: i64 = tlsf_rd(t, b + TLSF_HDR);
+    val pv: i64 = tlsf_rd(t, b + TLSF_HDR + 8);
+    if nx != TLSF_NIL { tlsf_wr(t, nx + TLSF_HDR + 8, pv); }
+    if pv != TLSF_NIL {
+        tlsf_wr(t, pv + TLSF_HDR, nx);
+    } else {
+        t.heads.set(m, nx);
+        if nx == TLSF_NIL {
+            t.sl_bitmap.set(fl, t.sl_bitmap.get(fl) & ~(1 << sl));
+            if t.sl_bitmap.get(fl) == 0 { t.fl_bitmap = t.fl_bitmap & ~(1 << fl); }
+        }
+    }
+}
+
+// ─── Create, malloc, free ───────────────────────────────────────────────
+
+/// An allocator over an arena of `bytes` bytes (rounded down to 8).
+pub fn tlsf_new(bytes: i64) -> Tlsf {
+    val words: i64 = bytes / 8;
+    if words * 8 < 2 * TLSF_HDR + TLSF_MIN { p_panic("tlsf: arena too small"); }
+    var t: Tlsf = Tlsf {
+        mem: Vec::filled(words, 0), size: words * 8, fl_bitmap: 0, sl_bitmap: Vec::filled(TLSF_FL_COUNT, 0),
+        heads: Vec::filled(TLSF_FL_COUNT * TLSF_SL_COUNT, TLSF_NIL), allocs: 0, frees: 0
+    };
+    // One free block, then the sentinel.
+    val first_size: i64 = t.size - 2 * TLSF_HDR;
+    tlsf_wr(&mut t, 0, TLSF_NIL);
+    bset(&mut t, 0, first_size, TLSF_FREE);
+    val sent: i64 = TLSF_HDR + first_size;
+    tlsf_wr(&mut t, sent, 0);
+    bset(&mut t, sent, 0, TLSF_PREV_FREE);
+    list_insert(&mut t, 0);
+    return t;
+}
+
+fn tlsf_adjust(n: i64) -> i64 {
+    var s: i64 = (n + TLSF_ALIGN - 1) / TLSF_ALIGN * TLSF_ALIGN;
+    if s < TLSF_MIN { s = TLSF_MIN; }
+    return s;
+}
+
+/// Allocate `n` bytes; the payload's byte offset, -1 when no block fits.
+pub fn tlsf_malloc(t: &mut Tlsf, n: i64) -> i64 {
+    if n <= 0 { return -1; }
+    val size: i64 = tlsf_adjust(n);
+    val m: i64 = tlsf_mapping_search(size);
+    var fl: i64 = m / TLSF_SL_COUNT;
+    val sl: i64 = m % TLSF_SL_COUNT;
+    if fl >= TLSF_FL_COUNT { return -1; }
+    var slmap: i64 = t.sl_bitmap.get(fl) & (-1 << sl);
+    if slmap == 0 {
+        val flmap: i64 = t.fl_bitmap & (-1 << (fl + 1));
+        if flmap == 0 { return -1; }
+        fl = tlsf_ffs(flmap);
+        slmap = t.sl_bitmap.get(fl);
+    }
+    val b: i64 = t.heads.get(fl * TLSF_SL_COUNT + tlsf_ffs(slmap));
+    list_remove(t, b);
+    val bs: i64 = bsize(t, b);
+    val pflags: i64 = bflags(t, b) & TLSF_PREV_FREE;
+    if bs - size >= TLSF_HDR + TLSF_MIN {
+        // Split: the remainder becomes a free block.
+        bset(t, b, size, pflags);
+        val r: i64 = b + TLSF_HDR + size;
+        tlsf_wr(t, r, b);
+        bset(t, r, bs - size - TLSF_HDR, TLSF_FREE);
+        link_next(t, r, true);
+        list_insert(t, r);
+    } else {
+        bset(t, b, bs, pflags);
+        link_next(t, b, false);
+    }
+    t.allocs = t.allocs + 1;
+    return b + TLSF_HDR;
+}
+
+/// Free a payload offset from tlsf_malloc (panics on a double or bad free).
+pub fn tlsf_free(t: &mut Tlsf, p: i64) {
+    var b: i64 = p - TLSF_HDR;
+    if b < 0 || b >= t.size || bfree(t, b) { p_panic("tlsf: bad or double free at " + int_to_str(p)); }
+    var size: i64 = bsize(t, b);
+    // Merge with the previous block.
+    if (bflags(t, b) & TLSF_PREV_FREE) != 0 {
+        val pv: i64 = tlsf_rd(t, b);
+        list_remove(t, pv);
+        size = size + bsize(t, pv) + TLSF_HDR;
+        val pf: i64 = bflags(t, pv) & TLSF_PREV_FREE;
+        b = pv;
+        bset(t, b, size, pf | TLSF_FREE);
+    } else {
+        bset(t, b, size, (bflags(t, b) & TLSF_PREV_FREE) | TLSF_FREE);
+    }
+    // Merge with the next block.
+    val n: i64 = bnext(t, b);
+    if bfree(t, n) {
+        list_remove(t, n);
+        size = size + bsize(t, n) + TLSF_HDR;
+        bset(t, b, size, bflags(t, b));
+    }
+    link_next(t, b, true);
+    list_insert(t, b);
+    t.frees = t.frees + 1;
+}
+
+/// Usable bytes of an allocated payload.
+pub fn tlsf_usable(t: &Tlsf, p: i64) -> i64 {
+    return bsize(t, p - TLSF_HDR);
+}
+
+/// Resize: in place when the next physical block is free and large
+/// enough (or when shrinking), else allocate, copy and free. -1 on failure
+/// (the old block stays valid).
+pub fn tlsf_realloc(t: &mut Tlsf, p: i64, n: i64) -> i64 {
+    if p < 0 { return tlsf_malloc(t, n); }
+    val b: i64 = p - TLSF_HDR;
+    val cur: i64 = bsize(t, b);
+    val want: i64 = tlsf_adjust(n);
+    if want <= cur { return p; }
+    val nx: i64 = bnext(t, b);
+    if bfree(t, nx) && cur + TLSF_HDR + bsize(t, nx) >= want {
+        list_remove(t, nx);
+        val total: i64 = cur + TLSF_HDR + bsize(t, nx);
+        val pf: i64 = bflags(t, b) & TLSF_PREV_FREE;
+        if total - want >= TLSF_HDR + TLSF_MIN {
+            bset(t, b, want, pf);
+            val r: i64 = b + TLSF_HDR + want;
+            tlsf_wr(t, r, b);
+            bset(t, r, total - want - TLSF_HDR, TLSF_FREE);
+            link_next(t, r, true);
+            list_insert(t, r);
+        } else {
+            bset(t, b, total, pf);
+            link_next(t, b, false);
+        }
+        return p;
+    }
+    val q: i64 = tlsf_malloc(t, n);
+    if q < 0 { return -1; }
+    var i: i64 = 0;
+    while i < cur {
+        tlsf_wr(t, q + i, tlsf_rd(t, p + i));
+        i = i + 8;
+    }
+    tlsf_free(t, p);
+    return q;
+}
+
+// ─── Statistics and integrity ───────────────────────────────────────────
+
+pub struct TlsfStats {
+    pub free_bytes: i64,
+    pub used_bytes: i64,
+    pub free_blocks: i64,
+    pub used_blocks: i64,
+    pub largest_free: i64,
+}
+
+pub fn tlsf_stats(t: &Tlsf) -> TlsfStats {
+    var s: TlsfStats = TlsfStats { free_bytes: 0, used_bytes: 0, free_blocks: 0, used_blocks: 0, largest_free: 0 };
+    var b: i64 = 0;
+    while bsize(t, b) > 0 {
+        val n: i64 = bsize(t, b);
+        if bfree(t, b) {
+            s.free_bytes = s.free_bytes + n;
+            s.free_blocks = s.free_blocks + 1;
+            if n > s.largest_free { s.largest_free = n; }
+        } else {
+            s.used_bytes = s.used_bytes + n;
+            s.used_blocks = s.used_blocks + 1;
+        }
+        b = bnext(t, b);
+    }
+    return s;
+}
+
+/// Every invariant; "" when all hold, else the first violation.
+pub fn tlsf_check(t: &Tlsf) -> str {
+    var b: i64 = 0;
+    var prev: i64 = TLSF_NIL;
+    var prev_free: bool = false;
+    var nfree: i64 = 0;
+    while true {
+        if b < 0 || b + TLSF_HDR > t.size { return "block " + int_to_str(b) + " outside the arena"; }
+        val sz: i64 = bsize(t, b);
+        val fr: bool = bfree(t, b);
+        if ((bflags(t, b) & TLSF_PREV_FREE) != 0) != prev_free { return "PREV_FREE wrong at " + int_to_str(b); }
+        if prev_free && tlsf_rd(t, b) != prev { return "prev_phys wrong at " + int_to_str(b); }
+        if sz == 0 {
+            if b + TLSF_HDR != t.size { return "sentinel not at the end"; }
+            break;
+        }
+        if sz % TLSF_ALIGN != 0 || sz < TLSF_MIN { return "bad size at " + int_to_str(b); }
+        if fr && prev_free { return "two free blocks side by side at " + int_to_str(b); }
+        if fr {
+            nfree = nfree + 1;
+            // It must be in the list its size maps to.
+            val m: i64 = tlsf_mapping_insert(sz);
+            var x: i64 = t.heads.get(m);
+            var found: bool = false;
+            var guard: i64 = 0;
+            while x != TLSF_NIL && guard < 100000 {
+                if x == b { found = true; }
+                x = tlsf_rd(t, x + TLSF_HDR);
+                guard = guard + 1;
+            }
+            if !found { return "free block " + int_to_str(b) + " not in its list"; }
+        }
+        prev = b;
+        prev_free = fr;
+        b = bnext(t, b);
+    }
+    // Lists: each member free, mapped to this list, links consistent;
+    // bitmaps match non-empty lists.
+    var listed: i64 = 0;
+    var fl: i64 = 0;
+    while fl < TLSF_FL_COUNT {
+        var sl: i64 = 0;
+        while sl < TLSF_SL_COUNT {
+            val m: i64 = fl * TLSF_SL_COUNT + sl;
+            val h: i64 = t.heads.get(m);
+            val bit: bool = (t.sl_bitmap.get(fl) & (1 << sl)) != 0;
+            if bit != (h != TLSF_NIL) { return "sl bitmap wrong at " + int_to_str(fl) + "/" + int_to_str(sl); }
+            var x: i64 = h;
+            var pv: i64 = TLSF_NIL;
+            while x != TLSF_NIL {
+                if !bfree(t, x) { return "used block in a free list"; }
+                if tlsf_mapping_insert(bsize(t, x)) != m { return "block in the wrong list"; }
+                if tlsf_rd(t, x + TLSF_HDR + 8) != pv { return "prev_free link wrong"; }
+                listed = listed + 1;
+                pv = x;
+                x = tlsf_rd(t, x + TLSF_HDR);
+            }
+            sl = sl + 1;
+        }
+        if (((t.fl_bitmap >> fl) & 1) != 0) != (t.sl_bitmap.get(fl) != 0) { return "fl bitmap wrong at " + int_to_str(fl); }
+        fl = fl + 1;
+    }
+    if listed != nfree { return "lists hold " + int_to_str(listed) + " blocks, arena " + int_to_str(nfree); }
+    return "";
+}

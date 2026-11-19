@@ -1,0 +1,133 @@
+// roadmap L4B (streaming file handles): the runtime's positional reads and
+// binary-safe appends, on every backend: p_file_read_at(path, offset, n)
+// gives up to n bytes from byte `offset` (and reads only those), and
+// p_file_append_vec(path, bytes) appends bytes with zeros among them (which
+// p_file_append, a C string, cannot). p_file_mtime_ms is a file's last
+// write time. stdlib/core.fd declares the first two.
+//
+// Expected output:
+// append1 0
+// append2 0
+// size 8
+// all 104,105,0,255,10,0,65,66
+// mid 0,255,10
+// tail 65,66
+// end 0
+// past 0
+// zero 0
+// neg 0
+// missing 0
+// missing append -1
+// chunks 70000 8746781 18
+// across 235
+// mtime yes
+// mtime missing -1
+
+/// The runtime's Vec taken as a raw word and freed here (a builtin's Vec
+/// result is not a temporary the caller owns).
+fn read_at(path: str, off: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val raw: i64 = p_file_read_at(path, off, n) as i64;
+    if raw == 0 {
+        return out;
+    }
+    val len: i64 = Vec_len(raw);
+    var i: i64 = 0;
+    while i < len {
+        out.push(Vec_get(raw, i));
+        i = i + 1;
+    }
+    Vec_drop(raw);
+    return out;
+}
+
+fn show(v: & Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + ",";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val path: str = "test_file_read_at.tmp";
+    p_file_delete(path);
+    var a: Vec<i64> = Vec::new();
+    a.push(104);
+    a.push(105);
+    a.push(0);
+    a.push(255);
+    a.push(10);
+    println("append1 " + int_to_str(p_file_append_vec(path, a)));
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    b.push(65);
+    b.push(256 + 66);
+    println("append2 " + int_to_str(p_file_append_vec(path, b)));
+    println("size " + int_to_str(p_file_size(path)));
+    val all: Vec<i64> = read_at(path, 0, 100);
+    println("all " + show(& all));
+    val mid: Vec<i64> = read_at(path, 2, 3);
+    println("mid " + show(& mid));
+    val tail: Vec<i64> = read_at(path, 6, 10);
+    println("tail " + show(& tail));
+    println("end " + int_to_str(read_at(path, 8, 4).len()));
+    println("past " + int_to_str(read_at(path, 100, 4).len()));
+    println("zero " + int_to_str(read_at(path, 0, 0).len()));
+    println("neg " + int_to_str(read_at(path, 0 - 1, 4).len()));
+    println("missing " + int_to_str(read_at("no_such_file_rt10.bin", 0, 4).len()));
+    println("missing append " + int_to_str(p_file_append_vec("no_such_dir_rt10/x.bin", a)));
+
+    // 70000 bytes read back in 4000-byte pieces: more than one 64 KB read
+    // inside the runtime, and a short last piece
+    p_file_delete(path);
+    var big: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 70000 {
+        big.push(k % 251);
+        k = k + 1;
+    }
+    p_file_append_vec(path, big);
+    var total: i64 = 0;
+    var sum: i64 = 0;
+    var pieces: i64 = 0;
+    var off: i64 = 0;
+    var more: bool = true;
+    while more {
+        val piece: Vec<i64> = read_at(path, off, 4000);
+        if piece.len() == 0 {
+            more = false;
+        } else {
+            var j: i64 = 0;
+            while j < piece.len() {
+                sum = sum + piece.get(j);
+                j = j + 1;
+            }
+            total = total + piece.len();
+            off = off + piece.len();
+            pieces = pieces + 1;
+        }
+    }
+    println("chunks " + int_to_str(total) + " " + int_to_str(sum) + " " + int_to_str(pieces));
+    val across: Vec<i64> = read_at(path, 65530, 10);
+    var asum: i64 = 0;
+    var q: i64 = 0;
+    while q < across.len() {
+        asum = asum + across.get(q);
+        q = q + 1;
+    }
+    println("across " + int_to_str(asum));
+
+    if p_file_mtime_ms(path) > 1500000000000 {
+        println("mtime yes");
+    } else {
+        println("mtime no " + int_to_str(p_file_mtime_ms(path)));
+    }
+    println("mtime missing " + int_to_str(p_file_mtime_ms("no_such_file_rt10.bin")));
+    p_file_delete(path);
+}

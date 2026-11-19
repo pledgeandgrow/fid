@@ -1,7 +1,10 @@
 // Fides System standard library
 //
 // Low-level system information: architecture, platform, memory, CPU count.
-// Wraps runtime functions and environment variables.
+// Wraps runtime functions and environment variables. Linux and macOS go
+// through sysconf and the POSIX id functions (macOS's own _SC_ numbers),
+// Windows through GetSystemInfo, GlobalMemoryStatusEx and
+// GetCurrentProcessId (@cfg picks the host's; see sx_sysconf).
 //
 // Usage:
 //   use sys;
@@ -10,9 +13,11 @@
 //   println(sys_page_size());  // 4096
 
 module sys;
- use vec; use string; use os;
+ use vec; use os;
 // ─── FFI declarations ───────────────────────────────────────────────────
 
+// SAFETY: the prototypes come from <unistd.h>, checked by the C compiler;
+// every function takes and returns plain integers.
 extern "C" include "<unistd.h>" {
     fn sysconf as pledge_sysconf(name: i64) -> i64;
     fn getpagesize as pledge_getpagesize() -> i64;
@@ -22,23 +27,264 @@ extern "C" include "<unistd.h>" {
     fn getppid as pledge_getppid() -> i64;
 }
 
-// sysconf constants (POSIX)
+// SAFETY: kernel32 functions, declared by <windows.h>, which every
+// generated C file includes on Windows (`<stdint.h>` only makes the C
+// backend use the system's prototypes; native Windows imports them from
+// kernel32.dll). `info` is the address of a zeroed block this module
+// allocated, longer than the structure the function fills (SYSTEM_INFO
+// 48 bytes, MEMORYSTATUSEX 64). Only @cfg(windows) functions call them.
+extern "C" include "<stdint.h>" {
+    fn GetSystemInfo as sw_sysinfo(info: i64);
+    fn GlobalMemoryStatusEx as sw_memstatus(info: i64) -> i32;
+    fn GetCurrentProcessId as sw_getpid() -> i64;
+}
+
+// sysconf constants (Linux values; sx_sysconf maps them on other systems)
 pub const _SC_PAGESIZE: i64 = 30; pub const _SC_CLK_TCK: i64 = 2; pub const _SC_NPROCESSORS_ONLN: i64 = 84; pub const _SC_NPROCESSORS_CONF: i64 = 83; pub const _SC_PHYS_PAGES: i64 = 85; pub const _SC_AVPHYS_PAGES: i64 = 86;
+// ─── Per-system primitives (@cfg) ───────────────────────────────────────
+// sx_sysconf(name) takes the Linux _SC_ numbers above; -1 when the system
+// has no such figure. The POSIX functions are only called on Linux and
+// macOS (the Windows C library has no sysconf, getuid, ...); Windows has
+// no user or group ids (0) and no cheap parent process id (0).
+
+// A zeroed block of n bytes (0 when the allocation fails); freed by the
+// caller with p_free.
+fn sx_block(n: i64) -> i64 {
+    val b: i64 = p_malloc(n);
+    if b == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < n {
+        var p: * mut u8 = b + i;
+        // SAFETY: i < n, inside the block just allocated.
+        unsafe {
+            * p = 0 as u8;
+        }
+        i = i + 1;
+    }
+    return b;
+}
+
+// The little-endian unsigned value of `n` bytes at buf + off.
+fn sx_get(buf: i64, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var p: * mut u8 = buf + off + i;
+        var b: i64 = 0;
+        // SAFETY: every caller reads inside a block from sx_block.
+        unsafe {
+            b = (* p) as i64;
+        }
+        v = v | ((b & 255) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+// SYSTEM_INFO: dwPageSize at 4, dwNumberOfProcessors at 32.
+@cfg(windows)
+fn sx_sysinfo_field(off: i64) -> i64 {
+    val b: i64 = sx_block(64);
+    if b == 0 {
+        return - 1;
+    }
+    sw_sysinfo(b);
+    val v: i64 = sx_get(b, off, 4);
+    p_free(b);
+    return v;
+}
+
+// MEMORYSTATUSEX (dwLength 64 set first): ullTotalPhys at 8, ullAvailPhys
+// at 16.
+@cfg(windows)
+fn sx_memory_field(off: i64) -> i64 {
+    val b: i64 = sx_block(72);
+    if b == 0 {
+        return - 1;
+    }
+    var p: * mut u8 = b;
+    // SAFETY: the first byte of the 72-byte block (dwLength = 64).
+    unsafe {
+        * p = 64 as u8;
+    }
+    var v: i64 = - 1;
+    if sw_memstatus(b) != 0 {
+        v = sx_get(b, off, 8);
+    }
+    p_free(b);
+    return v;
+}
+
+@cfg(windows)
+fn sx_sysconf(name: i64) -> i64 {
+    if name == _SC_NPROCESSORS_ONLN || name == _SC_NPROCESSORS_CONF {
+        return sx_sysinfo_field(32);
+    }
+    if name == _SC_PAGESIZE {
+        return sx_sysinfo_field(4);
+    }
+    if name == _SC_PHYS_PAGES || name == _SC_AVPHYS_PAGES {
+        var off: i64 = 8;
+        if name == _SC_AVPHYS_PAGES {
+            off = 16;
+        }
+        val bytes: i64 = sx_memory_field(off);
+        val ps: i64 = sx_sysinfo_field(4);
+        if bytes < 0 || ps <= 0 {
+            return - 1;
+        }
+        return bytes / ps;
+    }
+    return - 1;
+}
+
+@cfg(windows)
+fn sx_pagesize() -> i64 {
+    return sx_sysinfo_field(4);
+}
+
+@cfg(windows)
+fn sx_getpid() -> i64 {
+    return sw_getpid() & 0xFFFFFFFF;
+}
+
+@cfg(windows)
+fn sx_getppid() -> i64 {
+    return 0;
+}
+
+@cfg(windows)
+fn sx_getuid() -> i64 {
+    return 0;
+}
+
+@cfg(windows)
+fn sx_getgid() -> i64 {
+    return 0;
+}
+
+@cfg(linux)
+fn sx_sysconf(name: i64) -> i64 {
+    return pledge_sysconf(name);
+}
+
+@cfg(linux)
+fn sx_pagesize() -> i64 {
+    return pledge_getpagesize();
+}
+
+@cfg(linux)
+fn sx_getpid() -> i64 {
+    return pledge_getpid();
+}
+
+@cfg(linux)
+fn sx_getppid() -> i64 {
+    return pledge_getppid();
+}
+
+@cfg(linux)
+fn sx_getuid() -> i64 {
+    return pledge_getuid();
+}
+
+@cfg(linux)
+fn sx_getgid() -> i64 {
+    return pledge_getgid();
+}
+
+// macOS numbers its _SC_ names differently (<unistd.h> of Darwin) and has
+// no _SC_AVPHYS_PAGES.
+@cfg(macos)
+fn sx_sysconf(name: i64) -> i64 {
+    var m: i64 = - 1;
+    if name == _SC_PAGESIZE {
+        m = 29;
+    } else if name == _SC_CLK_TCK {
+        m = 3;
+    } else if name == _SC_NPROCESSORS_CONF {
+        m = 57;
+    } else if name == _SC_NPROCESSORS_ONLN {
+        m = 58;
+    } else if name == _SC_PHYS_PAGES {
+        m = 200;
+    }
+    if m < 0 {
+        return - 1;
+    }
+    return pledge_sysconf(m);
+}
+
+@cfg(macos)
+fn sx_pagesize() -> i64 {
+    return pledge_getpagesize();
+}
+
+@cfg(macos)
+fn sx_getpid() -> i64 {
+    return pledge_getpid();
+}
+
+@cfg(macos)
+fn sx_getppid() -> i64 {
+    return pledge_getppid();
+}
+
+@cfg(macos)
+fn sx_getuid() -> i64 {
+    return pledge_getuid();
+}
+
+@cfg(macos)
+fn sx_getgid() -> i64 {
+    return pledge_getgid();
+}
 // ─── CPU / Architecture ─────────────────────────────────────────────────
 
-/// Get the CPU architecture (best-effort).
+/// Get the CPU architecture. @cfg resolves it for the build target
+/// (x86_64 on the host; aarch64/riscv64/wasm32 on cross targets);
+/// PLEDGE_ARCH overrides.
 pub fn sys_arch() -> str {
-    // Check environment or use compile-time constant
     var arch = os_getenv("PLEDGE_ARCH");
     if str_len(arch) > 0 {
         return arch;
     }
+    return sys_target_arch();
+}
+
+/// The architecture @cfg sees for this build ("x86_64" when unset, since
+/// fid runs on x86-64 hosts).
+@cfg(aarch64)
+fn sys_target_arch() -> str {
+    return "aarch64";
+}
+
+@cfg(riscv64)
+fn sys_target_arch() -> str {
+    return "riscv64";
+}
+
+@cfg(wasm32)
+fn sys_target_arch() -> str {
+    return "wasm32";
+}
+
+@cfg(x86_64)
+fn sys_target_arch() -> str {
     return "x86_64";
 }
 
 /// Get the number of processors currently online.
+///
+/// Example (native only):
+///   assert(sys_cpu_count() >= 1);
+///   assert(sys_page_size() >= 4096);
+///   assert(sys_pid() > 0);
+///   assert(str_len(sys_arch()) > 0);
 pub fn sys_cpu_count() -> i64 {
-    var n = pledge_sysconf(_SC_NPROCESSORS_ONLN);
+    var n = sx_sysconf(_SC_NPROCESSORS_ONLN);
     if n > 0 {
         return n;
     }
@@ -47,7 +293,7 @@ pub fn sys_cpu_count() -> i64 {
 
 /// Get the number of configured processors.
 pub fn sys_cpu_count_conf() -> i64 {
-    var n = pledge_sysconf(_SC_NPROCESSORS_CONF);
+    var n = sx_sysconf(_SC_NPROCESSORS_CONF);
     if n > 0 {
         return n;
     }
@@ -58,7 +304,7 @@ pub fn sys_cpu_count_conf() -> i64 {
 
 /// Get the system page size in bytes.
 pub fn sys_page_size() -> i64 {
-    var ps = pledge_getpagesize();
+    var ps = sx_pagesize();
     if ps > 0 {
         return ps;
     }
@@ -67,14 +313,20 @@ pub fn sys_page_size() -> i64 {
 
 /// Get total physical memory in bytes.
 pub fn sys_total_memory() -> i64 {
-    var pages = pledge_sysconf(_SC_PHYS_PAGES);
+    var pages = sx_sysconf(_SC_PHYS_PAGES);
+    if pages < 0 {
+        return 0;
+    }
     var page_size = sys_page_size();
     return pages * page_size;
 }
 
 /// Get available (free) physical memory in bytes.
 pub fn sys_available_memory() -> i64 {
-    var pages = pledge_sysconf(_SC_AVPHYS_PAGES);
+    var pages = sx_sysconf(_SC_AVPHYS_PAGES);
+    if pages < 0 {
+        return 0;
+    }
     var page_size = sys_page_size();
     return pages * page_size;
 }
@@ -98,29 +350,29 @@ pub fn sys_total_memory_gb() -> i64 {
 
 /// Get the current process ID.
 pub fn sys_pid() -> i64 {
-    return pledge_getpid();
+    return sx_getpid();
 }
 
-/// Get the parent process ID.
+/// Get the parent process ID (0 on Windows).
 pub fn sys_ppid() -> i64 {
-    return pledge_getppid();
+    return sx_getppid();
 }
 
-/// Get the user ID.
+/// Get the user ID (0 on Windows, which has none).
 pub fn sys_uid() -> i64 {
-    return pledge_getuid();
+    return sx_getuid();
 }
 
-/// Get the group ID.
+/// Get the group ID (0 on Windows, which has none).
 pub fn sys_gid() -> i64 {
-    return pledge_getgid();
+    return sx_getgid();
 }
 
 // ─── Clock ticks ────────────────────────────────────────────────────────
 
 /// Get the clock ticks per second.
 pub fn sys_clk_tck() -> i64 {
-    var tck = pledge_sysconf(_SC_CLK_TCK);
+    var tck = sx_sysconf(_SC_CLK_TCK);
     if tck > 0 {
         return tck;
     }
@@ -158,21 +410,24 @@ pub fn sys_is_32bit() -> bool {
 
 // ─── Endianness ─────────────────────────────────────────────────────────
 
-/// Check if the system is little-endian.
+/// Check if the system is little-endian. Every architecture fid can
+/// target (x86_64, aarch64, riscv64, wasm32) is little-endian, so this
+/// is true on all of them; kept as a function for forward compatibility.
 pub fn sys_is_little_endian() -> bool {
-    // x86 and ARM (usually) are little-endian
     var arch = sys_arch();
-    if str_contains(arch, "x86") {
-        return true;
+    if str_contains(arch, "mips") {
+        return false;
     }
-    if str_contains(arch, "arm") {
-        return true;
+    if str_contains(arch, "s390") {
+        return false;
     }
-    if str_contains(arch, "aarch") {
-        return true;
+    if str_contains(arch, "sparc") {
+        return false;
+    }
+    if str_contains(arch, "powerpc") || str_contains(arch, "ppc") {
+        return false;
     }
     return true;
-    // most systems are LE
 }
 
 /// Check if the system is big-endian.

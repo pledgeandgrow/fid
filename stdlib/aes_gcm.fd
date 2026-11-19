@@ -1,0 +1,439 @@
+// Fides AES (FIPS 197) and AES-GCM (NIST SP 800-38D), pure Fides
+//
+// What TLS 1.3 (TLS_AES_128_GCM_SHA256) and QUIC (RFC 9001: packet
+// protection with AEAD_AES_128_GCM, header protection with AES-ECB) need:
+//   - the AES block cipher for 128-, 192- and 256-bit keys (encryption
+//     only: GCM and the header-protection mask never decrypt a block)
+//   - AES-GCM with a 96-bit IV and a 16-byte tag: seal and open
+//
+// Checked against FIPS 197 Appendix C and the GCM specification's test
+// cases (McGrew and Viega, the vectors NIST's validation uses):
+// tests/bootstrap/test_stdlib_aes_gcm.fd; and through QUIC against RFC 9001
+// Appendix A (tests/bootstrap/test_stdlib_quic_protect.fd).
+//
+//   val sealed: Vec<i64> = aes_gcm_seal(key, iv, aad, plain);  // ct || tag
+//   val o: GcmOpened = aes_gcm_open(key, iv, aad, sealed);
+//   if o.ok { use(o.plain); }
+//
+// Bytes are Vec<i64> holding 0..255. Keys are `@secret` (complaint CO1):
+// the expanded key and keystream blocks are secret; seal, open and the
+// one-block ECB encryption are the audited releases (`@declassify`) of
+// what goes on and comes off the wire.
+//
+// Layout: the state, round keys and GHASH elements are 32-bit words held
+// in locals (big-endian: the first byte is the top byte), so a block costs
+// a few hundred Vec reads, not thousands; the S-box is 64 words of four
+// entries.
+//
+// Timing: GHASH is branch-free (masked XORs, no table indexed by a
+// secret) and the tag comparison runs over all 16 bytes. The S-box is a
+// table lookup indexed by key and state bytes, as in every byte-oriented
+// AES: it is not constant time against a cache-timing attacker on the
+// same machine. Use the OS crypto (tls_windows / tls_unix) where that
+// matters.
+
+module aes_gcm;
+ use vec;
+
+/// The open of a sealed message: `ok` is false when the tag does not
+/// match (or the key or IV has a wrong length); `plain` is then empty.
+pub struct GcmOpened {
+    pub ok: bool,
+    pub plain: Vec<i64>,
+}
+
+/// An expanded AES key: `nr` rounds (10, 12 or 14; 0 for a key of a wrong
+/// length), the round keys as 4 * (nr + 1) big-endian 32-bit words, and
+/// the S-box packed four entries to a word.
+pub struct AesKey {
+    pub nr: i64,
+    pub rk: Vec<i64>,
+    pub sbox: Vec<i64>,
+}
+
+/// The AES S-box (FIPS 197 Figure 7), entry x in byte (x & 3) of word x / 4.
+fn aes_sbox() -> Vec<i64> {
+    var sb: Vec<i64> = Vec::new();
+    sb.push(0x637C777B); sb.push(0xF26B6FC5); sb.push(0x3001672B); sb.push(0xFED7AB76);
+    sb.push(0xCA82C97D); sb.push(0xFA5947F0); sb.push(0xADD4A2AF); sb.push(0x9CA472C0);
+    sb.push(0xB7FD9326); sb.push(0x363FF7CC); sb.push(0x34A5E5F1); sb.push(0x71D83115);
+    sb.push(0x04C723C3); sb.push(0x1896059A); sb.push(0x071280E2); sb.push(0xEB27B275);
+    sb.push(0x09832C1A); sb.push(0x1B6E5AA0); sb.push(0x523BD6B3); sb.push(0x29E32F84);
+    sb.push(0x53D100ED); sb.push(0x20FCB15B); sb.push(0x6ACBBE39); sb.push(0x4A4C58CF);
+    sb.push(0xD0EFAAFB); sb.push(0x434D3385); sb.push(0x45F9027F); sb.push(0x503C9FA8);
+    sb.push(0x51A3408F); sb.push(0x929D38F5); sb.push(0xBCB6DA21); sb.push(0x10FFF3D2);
+    sb.push(0xCD0C13EC); sb.push(0x5F974417); sb.push(0xC4A77E3D); sb.push(0x645D1973);
+    sb.push(0x60814FDC); sb.push(0x222A9088); sb.push(0x46EEB814); sb.push(0xDE5E0BDB);
+    sb.push(0xE0323A0A); sb.push(0x4906245C); sb.push(0xC2D3AC62); sb.push(0x9195E479);
+    sb.push(0xE7C8376D); sb.push(0x8DD54EA9); sb.push(0x6C56F4EA); sb.push(0x657AAE08);
+    sb.push(0xBA78252E); sb.push(0x1CA6B4C6); sb.push(0xE8DD741F); sb.push(0x4BBD8B8A);
+    sb.push(0x703EB566); sb.push(0x4803F60E); sb.push(0x613557B9); sb.push(0x86C11D9E);
+    sb.push(0xE1F89811); sb.push(0x69D98E94); sb.push(0x9B1E87E9); sb.push(0xCE5528DF);
+    sb.push(0x8CA1890D); sb.push(0xBFE64268); sb.push(0x41992D0F); sb.push(0xB054BB16);
+    return sb;
+}
+
+/// S-box entry of byte x (0..255).
+fn aes_sb(sb: Vec<i64>, x: i64) -> i64 {
+    return (sb.get(x >> 2) >> (24 - 8 * (x & 3))) & 255;
+}
+
+/// SubWord: the S-box applied to each byte of a word.
+fn aes_subword(sb: Vec<i64>, t: i64) -> i64 {
+    return (aes_sb(sb, (t >> 24) & 255) << 24) | (aes_sb(sb, (t >> 16) & 255) << 16)
+        | (aes_sb(sb, (t >> 8) & 255) << 8) | aes_sb(sb, t & 255);
+}
+
+/// Multiplication by x in GF(2^8) mod x^8 + x^4 + x^3 + x + 1, branch-free.
+fn aes_xtime(a: i64) -> i64 {
+    return ((a << 1) ^ (((a >> 7) & 1) * 27)) & 255;
+}
+
+/// MixColumns of one column (bytes a0..a3, top to bottom) as a word.
+fn aes_mix(a0: i64, a1: i64, a2: i64, a3: i64) -> i64 {
+    val all: i64 = a0 ^ a1 ^ a2 ^ a3;
+    return ((a0 ^ all ^ aes_xtime(a0 ^ a1)) << 24) | ((a1 ^ all ^ aes_xtime(a1 ^ a2)) << 16)
+        | ((a2 ^ all ^ aes_xtime(a2 ^ a3)) << 8) | (a3 ^ all ^ aes_xtime(a3 ^ a0));
+}
+
+/// A big-endian word of `b` at `off`; bytes past the end read as 0.
+fn aes_word(b: Vec<i64>, off: i64) -> i64 {
+    var w: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        var v: i64 = 0;
+        if off + i < b.len() {
+            v = b.get(off + i) & 255;
+        }
+        w = (w << 8) | v;
+        i = i + 1;
+    }
+    return w;
+}
+
+fn aes_push_word(out: & mut Vec<i64>, w: i64) {
+    out.push((w >> 24) & 255);
+    out.push((w >> 16) & 255);
+    out.push((w >> 8) & 255);
+    out.push(w & 255);
+}
+
+/// Expand a 16-, 24- or 32-byte key (FIPS 197 §5.2). A key of another
+/// length gives `nr` 0, which every function here turns into a failure.
+@secret pub fn aes_key_expand(@secret key: Vec<i64>) -> AesKey {
+    val sb: Vec<i64> = aes_sbox();
+    var rk: Vec<i64> = Vec::new();
+    val klen: i64 = key.len();
+    if klen != 16 && klen != 24 && klen != 32 {
+        return AesKey { nr: 0, rk: rk, sbox: sb };
+    }
+    val nk: i64 = klen / 4;
+    val nr: i64 = nk + 6;
+    var i: i64 = 0;
+    while i < nk {
+        rk.push(aes_word(key, 4 * i));
+        i = i + 1;
+    }
+    var rcon: i64 = 1;
+    var last: i64 = rk.get(nk - 1);
+    var w: i64 = nk;
+    while w < 4 * (nr + 1) {
+        var t: i64 = last;
+        if w % nk == 0 {
+            // RotWord, SubWord, Rcon
+            t = aes_subword(sb, ((t << 8) & 0xFFFFFFFF) | (t >> 24)) ^ (rcon << 24);
+            rcon = aes_xtime(rcon);
+        } else if nk > 6 && w % nk == 4 {
+            t = aes_subword(sb, t);
+        }
+        last = rk.get(w - nk) ^ t;
+        rk.push(last);
+        w = w + 1;
+    }
+    return AesKey { nr: nr, rk: rk, sbox: sb };
+}
+
+/// Encrypt one block given as four big-endian words (FIPS 197 §5.1):
+/// the four output words.
+fn aes_block_w(k: AesKey, i0: i64, i1: i64, i2: i64, i3: i64) -> Vec<i64> {
+    val sb: Vec<i64> = k.sbox;
+    val rk: Vec<i64> = k.rk;
+    val nr: i64 = k.nr;
+    var w0: i64 = i0 ^ rk.get(0);
+    var w1: i64 = i1 ^ rk.get(1);
+    var w2: i64 = i2 ^ rk.get(2);
+    var w3: i64 = i3 ^ rk.get(3);
+    var r: i64 = 1;
+    while r <= nr {
+        // SubBytes and ShiftRows: row j of column c comes from column c + j.
+        val b00: i64 = aes_sb(sb, (w0 >> 24) & 255);
+        val b01: i64 = aes_sb(sb, (w1 >> 16) & 255);
+        val b02: i64 = aes_sb(sb, (w2 >> 8) & 255);
+        val b03: i64 = aes_sb(sb, w3 & 255);
+        val b10: i64 = aes_sb(sb, (w1 >> 24) & 255);
+        val b11: i64 = aes_sb(sb, (w2 >> 16) & 255);
+        val b12: i64 = aes_sb(sb, (w3 >> 8) & 255);
+        val b13: i64 = aes_sb(sb, w0 & 255);
+        val b20: i64 = aes_sb(sb, (w2 >> 24) & 255);
+        val b21: i64 = aes_sb(sb, (w3 >> 16) & 255);
+        val b22: i64 = aes_sb(sb, (w0 >> 8) & 255);
+        val b23: i64 = aes_sb(sb, w1 & 255);
+        val b30: i64 = aes_sb(sb, (w3 >> 24) & 255);
+        val b31: i64 = aes_sb(sb, (w0 >> 16) & 255);
+        val b32: i64 = aes_sb(sb, (w1 >> 8) & 255);
+        val b33: i64 = aes_sb(sb, w2 & 255);
+        var n0: i64 = 0;
+        var n1: i64 = 0;
+        var n2: i64 = 0;
+        var n3: i64 = 0;
+        if r != nr {
+            n0 = aes_mix(b00, b01, b02, b03);
+            n1 = aes_mix(b10, b11, b12, b13);
+            n2 = aes_mix(b20, b21, b22, b23);
+            n3 = aes_mix(b30, b31, b32, b33);
+        } else {
+            n0 = (b00 << 24) | (b01 << 16) | (b02 << 8) | b03;
+            n1 = (b10 << 24) | (b11 << 16) | (b12 << 8) | b13;
+            n2 = (b20 << 24) | (b21 << 16) | (b22 << 8) | b23;
+            n3 = (b30 << 24) | (b31 << 16) | (b32 << 8) | b33;
+        }
+        // AddRoundKey
+        w0 = n0 ^ rk.get(4 * r);
+        w1 = n1 ^ rk.get(4 * r + 1);
+        w2 = n2 ^ rk.get(4 * r + 2);
+        w3 = n3 ^ rk.get(4 * r + 3);
+        r = r + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(w0);
+    out.push(w1);
+    out.push(w2);
+    out.push(w3);
+    return out;
+}
+
+/// One 16-byte block as bytes.
+fn aes_block_bytes(k: AesKey, block: Vec<i64>) -> Vec<i64> {
+    val w: Vec<i64> = aes_block_w(k, aes_word(block, 0), aes_word(block, 4),
+        aes_word(block, 8), aes_word(block, 12));
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        aes_push_word(& mut out, w.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// One block under an expanded key: keystream, so `@secret` (CO1).
+/// An empty Vec for a bad key or a block that is not 16 bytes.
+@secret pub fn aes_encrypt_block(@secret k: AesKey, block: Vec<i64>) -> Vec<i64> {
+    if k.nr == 0 || block.len() != 16 {
+        var none: Vec<i64> = Vec::new();
+        return none;
+    }
+    return aes_block_bytes(k, block);
+}
+
+/// AES-ECB of one 16-byte block under a raw key: QUIC's header-protection
+/// mask (RFC 9001 §5.4.3). Released (`@declassify`): the mask is applied
+/// to bytes that go on the wire. Empty for a bad key or block length.
+@declassify pub fn aes_ecb_encrypt(@secret key: Vec<i64>, block: Vec<i64>) -> Vec<i64> {
+    val k: AesKey = aes_key_expand(key);
+    if k.nr == 0 || block.len() != 16 {
+        var none: Vec<i64> = Vec::new();
+        return none;
+    }
+    return aes_block_bytes(k, block);
+}
+
+// ─── GHASH (SP 800-38D §6.4) ────────────────────────────────────────────
+// An element of GF(2^128) is four 32-bit words, big-endian (word 0 holds
+// bytes 0..3; its top bit is the coefficient of x^0).
+
+/// y = (y ^ x) * H for one block; y and h hold four words; y is updated.
+fn gcm_mul_into(y: & mut Vec<i64>, x0: i64, x1: i64, x2: i64, x3: i64, h: Vec<i64>) {
+    var z0: i64 = 0;
+    var z1: i64 = 0;
+    var z2: i64 = 0;
+    var z3: i64 = 0;
+    var v0: i64 = h.get(0);
+    var v1: i64 = h.get(1);
+    var v2: i64 = h.get(2);
+    var v3: i64 = h.get(3);
+    var word: i64 = 0;
+    while word < 4 {
+        var aw: i64 = y.get(word);
+        if word == 0 { aw = aw ^ x0; }
+        if word == 1 { aw = aw ^ x1; }
+        if word == 2 { aw = aw ^ x2; }
+        if word == 3 { aw = aw ^ x3; }
+        var bit: i64 = 31;
+        while bit >= 0 {
+            val m: i64 = (0 - ((aw >> bit) & 1)) & 0xFFFFFFFF;
+            z0 = z0 ^ (v0 & m);
+            z1 = z1 ^ (v1 & m);
+            z2 = z2 ^ (v2 & m);
+            z3 = z3 ^ (v3 & m);
+            val red: i64 = 0xE1000000 & ((0 - (v3 & 1)) & 0xFFFFFFFF);
+            v3 = (v3 >> 1) | ((v2 & 1) << 31);
+            v2 = (v2 >> 1) | ((v1 & 1) << 31);
+            v1 = (v1 >> 1) | ((v0 & 1) << 31);
+            v0 = (v0 >> 1) ^ red;
+            bit = bit - 1;
+        }
+        word = word + 1;
+    }
+    y.set(0, z0);
+    y.set(1, z1);
+    y.set(2, z2);
+    y.set(3, z3);
+}
+
+/// GHASH over the AAD, zero-padded to whole blocks.
+fn gcm_absorb(y: & mut Vec<i64>, h: Vec<i64>, data: Vec<i64>) {
+    var off: i64 = 0;
+    while off < data.len() {
+        gcm_mul_into(y, aes_word(data, off), aes_word(data, off + 4),
+            aes_word(data, off + 8), aes_word(data, off + 12), h);
+        off = off + 16;
+    }
+}
+
+/// GCTR from counter 2 (SP 800-38D §6.5) over `data`, with GHASH run over
+/// the ciphertext on the way: `y` (holding GHASH of the AAD) is updated.
+/// `sealing`: data is plaintext (the output is hashed), else ciphertext
+/// (the input is hashed).
+fn gcm_ctr_hash(k: AesKey, iv: Vec<i64>, data: Vec<i64>, sealing: bool, y: & mut Vec<i64>, h: Vec<i64>) -> Vec<i64> {
+    val iv0: i64 = aes_word(iv, 0);
+    val iv1: i64 = aes_word(iv, 4);
+    val iv2: i64 = aes_word(iv, 8);
+    val n: i64 = data.len();
+    var out: Vec<i64> = Vec::new();
+    var ctr: i64 = 2;
+    var pos: i64 = 0;
+    while pos < n {
+        val ks: Vec<i64> = aes_block_w(k, iv0, iv1, iv2, ctr);
+        var c0: i64 = 0;
+        var c1: i64 = 0;
+        var c2: i64 = 0;
+        var c3: i64 = 0;
+        var j: i64 = 0;
+        while j < 4 {
+            val kw: i64 = ks.get(j);
+            var cw: i64 = 0;
+            var b: i64 = 0;
+            while b < 4 {
+                val at: i64 = pos + 4 * j + b;
+                var c: i64 = 0;
+                if at < n {
+                    val d: i64 = data.get(at) & 255;
+                    val o: i64 = d ^ ((kw >> (24 - 8 * b)) & 255);
+                    out.push(o);
+                    if sealing {
+                        c = o;
+                    } else {
+                        c = d;
+                    }
+                }
+                cw = (cw << 8) | c;
+                b = b + 1;
+            }
+            if j == 0 { c0 = cw; }
+            if j == 1 { c1 = cw; }
+            if j == 2 { c2 = cw; }
+            if j == 3 { c3 = cw; }
+            j = j + 1;
+        }
+        gcm_mul_into(y, c0, c1, c2, c3, h);
+        pos = pos + 16;
+        ctr = (ctr + 1) & 0xFFFFFFFF;
+    }
+    return out;
+}
+
+/// The hash subkey H = E(K, 0^128) as four words.
+fn gcm_subkey(k: AesKey) -> Vec<i64> {
+    return aes_block_w(k, 0, 0, 0, 0);
+}
+
+/// The tag from GHASH so far (`y`, AAD and ciphertext absorbed): the
+/// length block, then XOR E(K, IV || 1). Sixteen bytes.
+fn gcm_finish(k: AesKey, iv: Vec<i64>, y: & mut Vec<i64>, h: Vec<i64>, alen: i64, clen: i64) -> Vec<i64> {
+    val abits: i64 = alen * 8;
+    val cbits: i64 = clen * 8;
+    gcm_mul_into(y, (abits >> 32) & 0xFFFFFFFF, abits & 0xFFFFFFFF,
+        (cbits >> 32) & 0xFFFFFFFF, cbits & 0xFFFFFFFF, h);
+    val ek: Vec<i64> = aes_block_w(k, aes_word(iv, 0), aes_word(iv, 4), aes_word(iv, 8), 1);
+    var tag: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        aes_push_word(& mut tag, y.get(i) ^ ek.get(i));
+        i = i + 1;
+    }
+    return tag;
+}
+
+fn gcm_zero4() -> Vec<i64> {
+    var y: Vec<i64> = Vec::new();
+    y.push(0);
+    y.push(0);
+    y.push(0);
+    y.push(0);
+    return y;
+}
+
+/// AES-GCM encryption (SP 800-38D §7.1) with a 12-byte IV: the ciphertext
+/// followed by the 16-byte tag. The key is 16, 24 or 32 bytes. Empty for a
+/// key or IV of a wrong length.
+@declassify pub fn aes_gcm_seal(@secret key: Vec<i64>, iv: Vec<i64>, aad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    val k: AesKey = aes_key_expand(key);
+    if k.nr == 0 || iv.len() != 12 {
+        var none: Vec<i64> = Vec::new();
+        return none;
+    }
+    val h: Vec<i64> = gcm_subkey(k);
+    var y: Vec<i64> = gcm_zero4();
+    gcm_absorb(& mut y, h, aad);
+    var out: Vec<i64> = gcm_ctr_hash(k, iv, plain, true, & mut y, h);
+    val tag: Vec<i64> = gcm_finish(k, iv, & mut y, h, aad.len(), plain.len());
+    var i: i64 = 0;
+    while i < 16 {
+        out.push(tag.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// AES-GCM decryption (SP 800-38D §7.2): `sealed` is ciphertext || tag.
+/// The tag is compared over all 16 bytes; on a mismatch `ok` is false and
+/// `plain` is empty (nothing decrypted is returned).
+@declassify pub fn aes_gcm_open(@secret key: Vec<i64>, iv: Vec<i64>, aad: Vec<i64>, sealed: Vec<i64>) -> GcmOpened {
+    var none: Vec<i64> = Vec::new();
+    val k: AesKey = aes_key_expand(key);
+    if k.nr == 0 || iv.len() != 12 || sealed.len() < 16 {
+        return GcmOpened { ok: false, plain: none };
+    }
+    val n: i64 = sealed.len() - 16;
+    var ct: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        ct.push(sealed.get(i) & 255);
+        i = i + 1;
+    }
+    val h: Vec<i64> = gcm_subkey(k);
+    var y: Vec<i64> = gcm_zero4();
+    gcm_absorb(& mut y, h, aad);
+    val plain: Vec<i64> = gcm_ctr_hash(k, iv, ct, false, & mut y, h);
+    val tag: Vec<i64> = gcm_finish(k, iv, & mut y, h, aad.len(), n);
+    var diff: i64 = 0;
+    i = 0;
+    while i < 16 {
+        diff = diff | (tag.get(i) ^ (sealed.get(n + i) & 255));
+        i = i + 1;
+    }
+    if diff != 0 {
+        return GcmOpened { ok: false, plain: none };
+    }
+    return GcmOpened { ok: true, plain: plain };
+}

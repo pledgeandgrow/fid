@@ -13,9 +13,7 @@
 //   Box<T> -> Box<T>   Vec<T> -> Vec<T>  Option<T> -> Opt* enum
 //   Vec<(A,B)> -> Vec<PairStruct>
 
-module compiler::ast;
- use core; use vec; use string;
-// --- Pair / tuple helper structs -----------------------------------------
+module compiler::ast; use core; use vec; use string;  // --- Pair / tuple helper structs -----------------------------------------
 // Fides Vec holds a single element type, so Rust's Vec<(A, B)> is represented
 // as Vec<StructPair>.
 
@@ -148,6 +146,590 @@ pub enum BinOp {
     BitXor,
     Shl,
     Shr,
+}
+
+// OP15: the functions marked `@cold` (the unlikely side of a branch).
+// compiler.fd `cc_collect_cold_hints` fills the set from the program's
+// annotations before lowering; a native backend asks `is_cold_fn_hint(callee)`
+// for each call and lays a block that makes one out after the hot code
+// (pe_ir PeirGen_is_cold_fn / PeirGen_block_cold, nat_ir ng_cold_last).
+// `cold_path()` (core) is always one.
+var g_cold_fn_set: i64 = 0;
+
+pub fn cold_fn_mark(name: str) {
+    if g_cold_fn_set == 0 {
+        g_cold_fn_set = HashMap_new();
+    }
+    HashMap_insert(g_cold_fn_set, name, 1);
+}
+
+pub fn is_cold_fn_hint(name: str) -> bool {
+    if name == "cold_path" {
+        return true;
+    }
+    if g_cold_fn_set == 0 {
+        return false;
+    }
+    return HashMap_contains(g_cold_fn_set, name);
+}
+
+// `fn f() -> _` (reference §2.1): the return types the type checker
+// inferred (TypeChecker_check_func_body), by function name. The Program
+// keeps Type::Infer; the lowering (Lowerer_lower_program) gives each such
+// top-level function its inferred type, so a struct result is returned as a
+// struct (it was read as a word: s2_1_infer_return_struct printed 0). A
+// later check of the same name replaces the entry.
+var g_infer_ret_names: Vec<str> = Vec::new();
+var g_infer_ret_types: Vec<Type> = Vec::new();
+
+pub fn infer_ret_note(name: str, t: Type) {
+    var k: i64 = 0;
+    while k < g_infer_ret_names.len() {
+        if g_infer_ret_names.get(k) == name {
+            g_infer_ret_types.set(k, t);
+            return;
+        }
+        k = k + 1;
+    }
+    g_infer_ret_names.push(name);
+    g_infer_ret_types.push(t);
+}
+
+/// The return type the type checker inferred for `name`, if any.
+pub fn infer_ret_of(name: str) -> OptType {
+    var k: i64 = 0;
+    while k < g_infer_ret_names.len() {
+        if g_infer_ret_names.get(k) == name {
+            return OptType::Some(g_infer_ret_types.get(k));
+        }
+        k = k + 1;
+    }
+    return OptType::None;
+}
+
+// RT6: an untyped `var v = Vec::new()` typed by its first push. The type
+// checker (typechecker.fd TypeChecker_rt6_*) keeps one record per `let`
+// whose value is a bare Vec; the lowering (lower.fd Lowerer_rt6_let_type)
+// asks `rt6_elem_at` for the element type it found. A record: the function
+// (as the lowering names it: `S_m` for a method), the variable's name, the
+// line of its `let`, the scope depth it was declared at, its state, the
+// element type, and whether its scope has ended. States: 0 open (no push
+// seen yet), 1 typed, 2 left untyped (an integer or unknown value came
+// first, the variable was given another value, or the `let` is not an
+// untyped `Vec::new()`).
+var g_rt6_fns: Vec<str> = Vec::new();
+var g_rt6_names: Vec<str> = Vec::new();
+var g_rt6_lines: Vec<i64> = Vec::new();
+var g_rt6_depths: Vec<i64> = Vec::new();
+var g_rt6_states: Vec<i64> = Vec::new();
+var g_rt6_types: Vec<Type> = Vec::new();
+var g_rt6_closed: Vec<bool> = Vec::new();
+
+/// How many records there are (0: nothing to look up).
+pub fn rt6_count() -> i64 {
+    return g_rt6_names.len();
+}
+
+/// A new check starts (TypeChecker::new): an earlier check's records are
+/// not its own.
+pub fn rt6_reset() {
+    g_rt6_fns = Vec::new();
+    g_rt6_names = Vec::new();
+    g_rt6_lines = Vec::new();
+    g_rt6_depths = Vec::new();
+    g_rt6_states = Vec::new();
+    g_rt6_types = Vec::new();
+    g_rt6_closed = Vec::new();
+}
+
+pub fn rt6_add(key: str, name: str, line: i64, depth: i64, state: i64) {
+    g_rt6_fns.push(key);
+    g_rt6_names.push(name);
+    g_rt6_lines.push(line);
+    g_rt6_depths.push(depth);
+    g_rt6_states.push(state);
+    g_rt6_types.push(Type::Infer);
+    g_rt6_closed.push(false);
+}
+
+pub fn rt6_state(k: i64) -> i64 {
+    return g_rt6_states.get(k);
+}
+
+pub fn rt6_set_state(k: i64, state: i64) {
+    g_rt6_states.set(k, state);
+}
+
+/// Record `k` is typed: a Vec of `t`.
+pub fn rt6_set_typed(k: i64, t: Type) {
+    g_rt6_states.set(k, 1);
+    g_rt6_types.set(k, t);
+}
+
+/// The record of the bare Vec `name` names in function `key` (the latest
+/// one whose scope has not ended), or -1.
+pub fn rt6_find(key: str, name: str) -> i64 {
+    var k: i64 = g_rt6_names.len() - 1;
+    while k >= 0 {
+        if !g_rt6_closed.get(k) && g_rt6_names.get(k) == name && g_rt6_fns.get(k) == key {
+            return k;
+        }
+        k = k - 1;
+    }
+    return - 1;
+}
+
+/// A scope of function `key` ended, leaving `depth` scopes: the variables
+/// it declared are out of scope. The function's records are the last ones.
+pub fn rt6_close(key: str, depth: i64) {
+    var k: i64 = g_rt6_names.len() - 1;
+    while k >= 0 {
+        if g_rt6_fns.get(k) != key {
+            return;
+        }
+        if g_rt6_depths.get(k) > depth && !g_rt6_closed.get(k) {
+            g_rt6_closed.set(k, true);
+        }
+        k = k - 1;
+    }
+}
+
+/// The element type the first push gave the bare Vec of `var name =
+/// Vec::new()` at `line` in function `fname` (as the lowering names it; a
+/// generic function's copies are `fname__..`), if every check of that `let`
+/// typed it, and the same way.
+pub fn rt6_elem_at(fname: str, name: str, line: i64) -> OptType {
+    var found: bool = false;
+    var et: Type = Type::Infer;
+    var k: i64 = 0;
+    while k < g_rt6_names.len() {
+        if g_rt6_lines.get(k) == line && g_rt6_names.get(k) == name {
+            var key: str = g_rt6_fns.get(k);
+            if key == fname || str_starts_with(fname, key + "__") {
+                if g_rt6_states.get(k) != 1 {
+                    return OptType::None;
+                }
+                if found && type_to_str(et) != type_to_str(g_rt6_types.get(k)) {
+                    return OptType::None;
+                }
+                found = true;
+                et = g_rt6_types.get(k);
+            }
+        }
+        k = k + 1;
+    }
+    if found {
+        return OptType::Some(et);
+    }
+    return OptType::None;
+}
+
+// ST3: editions (docs/reference/stability.md). A file states its edition
+// with `#[edition(2026)]`; one that does not is in the default edition
+// (`--edition=N`, else ark.toml's `edition`, else 2026). compiler.fd records
+// each module's edition here; a check that differs between editions asks
+// `edition_of(module)`. Editions: 2026 (1.x, the stable language) and 2027
+// (the next edition, a preview: what it changes is listed in stability.md).
+var g_default_edition: i64 = 2026;
+var g_edition_mods: i64 = 0;
+
+pub fn edition_known(e: i64) -> bool {
+    return e == 2026 || e == 2027;
+}
+
+var g_edition_flag: bool = false;
+
+/// `--edition=N` (main.fd): wins over ark.toml's edition.
+pub fn set_default_edition(e: i64) {
+    g_default_edition = e;
+    g_edition_flag = true;
+}
+
+/// ark.toml's `edition` (compiler.fd), unless `--edition=N` was given.
+pub fn set_project_edition(e: i64) {
+    if g_edition_flag == false {
+        g_default_edition = e;
+    }
+}
+
+pub fn default_edition() -> i64 {
+    return g_default_edition;
+}
+
+pub fn edition_set(module: str, e: i64) {
+    if g_edition_mods == 0 {
+        g_edition_mods = HashMap_new();
+    }
+    HashMap_insert(g_edition_mods, module, e);
+}
+
+/// The edition of `module`'s file (the default when it states none).
+pub fn edition_of(module: str) -> i64 {
+    if g_edition_mods != 0 {
+        if HashMap_contains(g_edition_mods, module) {
+            return HashMap_get(g_edition_mods, module);
+        }
+    }
+    return g_default_edition;
+}
+
+/// The edition a program states (`#[edition(N)]`), 0 when none, -1 when the
+/// attribute has no number.
+pub fn program_edition(p: Program) -> i64 {
+    var i: i64 = 0;
+    while i < p.attributes.len() {
+        var a: Attribute = p.attributes.get(i);
+        if a.name == "edition" {
+            if a.args.len() != 1 {
+                return 0 - 1;
+            }
+            var v: str = a.args.get(0);
+            var n: i64 = 0;
+            var k: i64 = 0;
+            while k < str_len(v) {
+                var c: i64 = str_byte_at(v, k);
+                if c < 48 || c > 57 {
+                    return 0 - 1;
+                }
+                n = n * 10 + (c - 48);
+                k = k + 1;
+            }
+            if str_len(v) == 0 {
+                return 0 - 1;
+            }
+            return n;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// CL10: the method `a op b` calls when `a` is a struct ("" for an
+/// operator that is not overloadable): Rust's names, `%` is `rem`.
+pub fn binop_operator_method(op: BinOp) -> str {
+    match op {
+        BinOp::Add => {
+            return "add";
+        }
+        BinOp::Sub => {
+            return "sub";
+        }
+        BinOp::Mul => {
+            return "mul";
+        }
+        BinOp::Div => {
+            return "div";
+        }
+        BinOp::Mod => {
+            return "rem";
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// CL10: the operator of an arithmetic compound assignment (`x += e` is
+/// `x = x + e`), BinOp::BitAnd for any other kind (see assign_op_is_arith).
+pub fn assign_op_binop(op: AssignOp) -> BinOp {
+    match op {
+        AssignOp::AddAssign => {
+            return BinOp::Add;
+        }
+        AssignOp::SubAssign => {
+            return BinOp::Sub;
+        }
+        AssignOp::MulAssign => {
+            return BinOp::Mul;
+        }
+        AssignOp::DivAssign => {
+            return BinOp::Div;
+        }
+        AssignOp::ModAssign => {
+            return BinOp::Mod;
+        }
+        _ => {
+        }
+    }
+    return BinOp::BitAnd;
+}
+
+/// CL10: whether `x op= e` is `+=`, `-=`, `*=`, `/=` or `%=` (the operators
+/// a struct serves with a method).
+pub fn assign_op_is_arith(op: AssignOp) -> bool {
+    return str_len(binop_operator_method(assign_op_binop(op))) > 0;
+}
+
+/// Whether `e` is a variable or a field path of one (`p`, `self.pos`,
+/// `a.b.c`): reading it twice reads the same place and runs nothing (CL10:
+/// `obj.f += e` is rewritten to `obj.f = obj.f + e` only then).
+pub fn expr_is_place_path(e: Expr) -> bool {
+    match e {
+        Expr::Ident(_) => {
+            return true;
+        }
+        Expr::FieldAccess(inner, _) => {
+            return expr_is_place_path(box_expr_unbox(inner));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+// ─── CL10: units of measure, dimensions computed by the compiler ─────────
+// A struct marked `@dimension(m = 1, kg = 1, s = -2)` is a unit: it holds
+// one f64, and `*` / `/` on two units make the unit whose dimension is the
+// sum / difference of theirs (Newtons * Meters is Joules), with no function
+// per pair (typechecker TypeChecker_check_dim_operator, lower.fd
+// Lowerer_lower_dim_operator). A dimension is packed in one word: 4 bits
+// per SI base, the exponent + 8 (so -8..7), base i at 16^i. 0 is "not a
+// unit"; a dimensionless value (all exponents 0) is not 0.
+
+pub fn dim_base_count() -> i64 {
+    return 7;
+}
+
+/// The SI base `i` (packing order): m, kg, s, A, K, mol, cd.
+pub fn dim_base_name(i: i64) -> str {
+    if i == 0 {
+        return "m";
+    }
+    if i == 1 {
+        return "kg";
+    }
+    if i == 2 {
+        return "s";
+    }
+    if i == 3 {
+        return "A";
+    }
+    if i == 4 {
+        return "K";
+    }
+    if i == 5 {
+        return "mol";
+    }
+    if i == 6 {
+        return "cd";
+    }
+    return "";
+}
+
+pub fn dim_base_index(name: str) -> i64 {
+    var i: i64 = 0;
+    while i < dim_base_count() {
+        if dim_base_name(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn dim_place(i: i64) -> i64 {
+    var p: i64 = 1;
+    var k: i64 = 0;
+    while k < i {
+        p = p * 16;
+        k = k + 1;
+    }
+    return p;
+}
+
+/// The packed dimension with every exponent 0.
+pub fn dim_dimensionless() -> i64 {
+    var p: i64 = 0;
+    var i: i64 = 0;
+    while i < dim_base_count() {
+        p = p + 8 * dim_place(i);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// The exponent of base `i` in a packed dimension.
+pub fn dim_exp(packed: i64, i: i64) -> i64 {
+    return (packed / dim_place(i)) % 16 - 8;
+}
+
+fn dim_with(packed: i64, i: i64, e: i64) -> i64 {
+    return packed + (e - dim_exp(packed, i)) * dim_place(i);
+}
+
+/// `a * b` (sign 1) or `a / b` (sign -1): the dimension of the result, or
+/// -1 when an exponent leaves -8..7.
+pub fn dim_combine(a: i64, b: i64, sign: i64) -> i64 {
+    var r: i64 = dim_dimensionless();
+    var i: i64 = 0;
+    while i < dim_base_count() {
+        var e: i64 = dim_exp(a, i) + sign * dim_exp(b, i);
+        if e < 0 - 8 || e > 7 {
+            return 0 - 1;
+        }
+        r = dim_with(r, i, e);
+        i = i + 1;
+    }
+    return r;
+}
+
+/// A dimension as text: `m^2 kg s^-2`, `1` when dimensionless.
+pub fn dim_to_str(packed: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < dim_base_count() {
+        var e: i64 = dim_exp(packed, i);
+        if e != 0 {
+            if str_len(s) > 0 {
+                s = s + " ";
+            }
+            s = s + dim_base_name(i);
+            if e != 1 {
+                s = s + "^" + int_to_str(e);
+            }
+        }
+        i = i + 1;
+    }
+    if str_len(s) == 0 {
+        return "1";
+    }
+    return s;
+}
+
+/// The annotation that declares a dimension: `@dimension(m = 2, s = -1)`.
+pub fn dim_annotation_text(packed: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < dim_base_count() {
+        var e: i64 = dim_exp(packed, i);
+        if e != 0 {
+            if str_len(s) > 0 {
+                s = s + ", ";
+            }
+            s = s + dim_base_name(i) + " = " + int_to_str(e);
+        }
+        i = i + 1;
+    }
+    return "@dimension(" + s + ")";
+}
+
+/// An exponent written in `@dimension` ("2", "-2"), or -1000 when it is not
+/// a whole number.
+fn dim_parse_int(v: str) -> i64 {
+    var neg: bool = false;
+    var k: i64 = 0;
+    if str_len(v) > 0 && str_byte_at(v, 0) == 45 {
+        neg = true;
+        k = 1;
+    }
+    if k >= str_len(v) {
+        return 0 - 1000;
+    }
+    var n: i64 = 0;
+    while k < str_len(v) {
+        var c: i64 = str_byte_at(v, k);
+        if c < 48 || c > 57 {
+            return 0 - 1000;
+        }
+        n = n * 10 + (c - 48);
+        if n > 1000 {
+            return 0 - 1000;
+        }
+        k = k + 1;
+    }
+    if neg {
+        return 0 - n;
+    }
+    return n;
+}
+
+fn dim_eq_at(arg: str) -> i64 {
+    var k: i64 = 0;
+    while k < str_len(arg) {
+        if str_byte_at(arg, k) == 61 {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+pub struct DimRead {
+    pub packed: i64,
+    pub error: str,
+}
+
+fn dim_read_err(e: str) -> DimRead {
+    return DimRead {
+        packed: 0, error: e
+    };
+}
+
+/// One `@dimension(...)` read: the packed dimension, and the error ("" when
+/// it is well formed). `m` alone is `m = 1`.
+fn dim_read(a: Annotation) -> DimRead {
+    var p: i64 = dim_dimensionless();
+    var seen: i64 = 0;
+    var i: i64 = 0;
+    while i < a.args.len() {
+        var arg: str = a.args.get(i);
+        var name: str = arg;
+        var e: i64 = 1;
+        var eq: i64 = dim_eq_at(arg);
+        if eq >= 0 {
+            name = str_slice(arg, 0, eq);
+            e = dim_parse_int(str_slice(arg, eq + 1, str_len(arg)));
+            if e == 0 - 1000 {
+                return dim_read_err("the exponent of '" + name + "' must be a whole number, got '" + str_slice(arg, eq + 1, str_len(arg)) + "'");
+            }
+        }
+        var bi: i64 = dim_base_index(name);
+        if bi < 0 {
+            return dim_read_err("'" + name + "' is not an SI base; the bases are m, kg, s, A, K, mol and cd");
+        }
+        if e < 0 - 8 || e > 7 {
+            return dim_read_err("the exponent of '" + name + "' must be between -8 and 7, got " + int_to_str(e));
+        }
+        if (seen / dim_place(bi)) % 2 == 1 {
+            return dim_read_err("'" + name + "' is given twice");
+        }
+        seen = seen + dim_place(bi);
+        p = dim_with(p, bi, e);
+        i = i + 1;
+    }
+    return DimRead {
+        packed: p, error: ""
+    };
+}
+
+/// What is wrong with a struct's `@dimension(...)` ("" when it has none or
+/// it is well formed).
+pub fn dimension_annotation_error(anns: Vec<Annotation>) -> str {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == "dimension" {
+            return dim_read(anns.get(i)).error;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The packed dimension a struct's `@dimension(...)` declares, 0 when it
+/// has none (or a malformed one: the type checker reports it).
+pub fn struct_dimension(anns: Vec<Annotation>) -> i64 {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == "dimension" {
+            var r: DimRead = dim_read(anns.get(i));
+            if str_len(r.error) > 0 {
+                return 0;
+            }
+            return r.packed;
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 pub fn binop_eq(a: BinOp, b: BinOp) -> bool {
@@ -556,6 +1138,9 @@ pub struct Func {
     pub preconditions: Vec<Expr>,
     pub postconditions: Vec<Expr>,
     pub is_async: bool,
+    // TL2: the line of its `fn` (0 for a function the compiler made), so a
+    // diagnostic about the whole function gets a place and a caret
+    pub line: i64,
 }
 
 pub struct StructDef {
@@ -612,6 +1197,16 @@ pub struct TraitMethod {
     pub has_self: bool,
     pub is_pub: bool,
     pub default_body: OptStmts,
+    // LG3: `@lifetime("'a", ...)` when the result's type names lifetimes
+    // (`fn get<'a>(self: &'a Self) -> &'a T;`), as on a Func
+    pub annotations: Vec<Annotation>,
+    // LG4: a generic method's own type parameters (`fn m<U: Show>(..)`)
+    // and their bounds, as on a Func
+    pub type_params: Vec<str>,
+    pub type_param_bounds: Vec<StrPair>,
+    // LG14: `async fn m(..) -> Future<T> { .. }`: a default body filled into
+    // an impl is an async method (compiler.fd fill_default_trait_methods)
+    pub is_async: bool,
 }
 
 pub struct TraitDef {
@@ -1026,6 +1621,244 @@ pub fn type_to_str(t: Type) -> str {
     return box_type_to_str(Box::new(t));
 }
 
+// --- L8H: specialization ---------------------------------------------------
+// Several functions of one name in a file, one of them generic: the parser
+// keeps the name on the most general one and renames the others
+// `name__spec<k>` (pd_name_specializations). A call is typed against the
+// general one; an instantiation takes the body of the most specific
+// definition whose parameters take its types (mono `instantiate`), and two
+// that tie are an error (TypeChecker_check_generic_call).
+
+/// The name a specialization `name__spec<k>` specializes, or "".
+pub fn spec_base_name(name: str) -> str {
+    var at: i64 = str_rfind(name, "__spec");
+    if at <= 0 {
+        return "";
+    }
+    var n: i64 = str_len(name);
+    var i: i64 = at + 6;
+    if i >= n {
+        return "";
+    }
+    while i < n {
+        var c: i64 = str_byte_at(name, i);
+        if c < 48 || c > 57 {
+            return "";
+        }
+        i = i + 1;
+    }
+    return str_slice(name, 0, at);
+}
+
+/// Whether pattern `pat` (its type parameters `tps`) takes type `t`, with
+/// the bindings so far in `names`/`types` (a parameter bound twice must be
+/// the same type both times).
+pub fn spec_match(pat: Type, t: Type, tps: Vec<str>, names: & mut Vec<str>, types: & mut Vec<Type>) -> bool {
+    match pat {
+        Type::Named(pn) => {
+            if str_vec_contains(tps, pn) {
+                var i: i64 = 0;
+                while i < names.len() {
+                    if names.get(i) == pn {
+                        return type_to_str(types.get(i)) == type_to_str(t);
+                    }
+                    i = i + 1;
+                }
+                names.push(pn);
+                types.push(t);
+                return true;
+            }
+        }
+        Type::Generic(gn, gargs) => {
+            match t {
+                Type::Generic(tn, targs) => {
+                    if gn != tn || gargs.len() != targs.len() {
+                        return false;
+                    }
+                    var gi: i64 = 0;
+                    while gi < gargs.len() {
+                        if !spec_match(gargs.get(gi), targs.get(gi), tps, names, types) {
+                            return false;
+                        }
+                        gi = gi + 1;
+                    }
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        Type::Ref(pinner, pm) => {
+            match t {
+                Type::Ref(tinner, tm) => {
+                    return pm == tm && spec_match(box_type_unbox(pinner), box_type_unbox(tinner), tps, names, types);
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        Type::Array(pe, pn2) => {
+            match t {
+                Type::Array(te, tn2) => {
+                    return pn2 == tn2 && spec_match(box_type_unbox(pe), box_type_unbox(te), tps, names, types);
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        Type::Tuple(pts) => {
+            match t {
+                Type::Tuple(tts) => {
+                    if pts.len() != tts.len() {
+                        return false;
+                    }
+                    var ti: i64 = 0;
+                    while ti < pts.len() {
+                        if !spec_match(pts.get(ti), tts.get(ti), tps, names, types) {
+                            return false;
+                        }
+                        ti = ti + 1;
+                    }
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return type_to_str(pat) == type_to_str(t);
+}
+
+/// Whether the parameters `pats` (type parameters `tps`) take the argument
+/// types `args`.
+pub fn spec_takes(pats: Vec<Type>, tps: Vec<str>, args: Vec<Type>) -> bool {
+    if pats.len() != args.len() {
+        return false;
+    }
+    var names: Vec<str> = Vec::new();
+    var types: Vec<Type> = Vec::new();
+    var i: i64 = 0;
+    while i < pats.len() {
+        if !spec_match(pats.get(i), args.get(i), tps, & mut names, & mut types) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `t` with the type parameters `tps` renamed apart (`'T`), so that a
+/// definition's own parameters are read as fixed types when it is compared
+/// with another definition.
+pub fn spec_freshen(t: Type, tps: Vec<str>) -> Type {
+    match t {
+        Type::Named(n) => {
+            if str_vec_contains(tps, n) {
+                return Type::Named("'" + n);
+            }
+        }
+        Type::Generic(gn, gargs) => {
+            var na: Vec<Type> = Vec::new();
+            var i: i64 = 0;
+            while i < gargs.len() {
+                na.push(spec_freshen(gargs.get(i), tps));
+                i = i + 1;
+            }
+            return Type::Generic(gn, na);
+        }
+        Type::Ref(inner, m) => {
+            return Type::Ref(Box::new(spec_freshen(box_type_unbox(inner), tps)), m);
+        }
+        Type::Array(e, n) => {
+            return Type::Array(Box::new(spec_freshen(box_type_unbox(e), tps)), n);
+        }
+        Type::Tuple(ts) => {
+            var nt: Vec<Type> = Vec::new();
+            var j: i64 = 0;
+            while j < ts.len() {
+                nt.push(spec_freshen(ts.get(j), tps));
+                j = j + 1;
+            }
+            return Type::Tuple(nt);
+        }
+        _ => {
+        }
+    }
+    return t;
+}
+
+/// The parameter types of `f`.
+pub fn spec_param_types(f: Func) -> Vec<Type> {
+    var out: Vec<Type> = Vec::new();
+    var i: i64 = 0;
+    while i < f.params.len() {
+        out.push(f.params.get(i).ty);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Whether definition `a` is at least as specific as `b`: `b`'s parameters
+/// take `a`'s (with `a`'s own type parameters held fixed).
+pub fn spec_at_least(a: Func, b: Func) -> bool {
+    var ap: Vec<Type> = Vec::new();
+    var i: i64 = 0;
+    while i < a.params.len() {
+        ap.push(spec_freshen(a.params.get(i).ty, a.type_params));
+        i = i + 1;
+    }
+    return spec_takes(spec_param_types(b), b.type_params, ap);
+}
+
+/// Of the definitions `cands`, the one an instantiation with argument types
+/// `args` takes its body from: the most specific that takes them. -1 when
+/// none does; `tie` gets the index of a second, as specific, when two tie.
+pub fn spec_choose(cands: Vec<Func>, args: Vec<Type>, tie: & mut Vec<i64>) -> i64 {
+    var taking: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cands.len() {
+        var ci: Func = cands.get(i);
+        if spec_takes(spec_param_types(ci), ci.type_params, args) {
+            taking.push(i);
+        }
+        i = i + 1;
+    }
+    // the maximal ones: no other one is strictly more specific
+    var maximal: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < taking.len() {
+        var cj: Func = cands.get(taking.get(j));
+        var beaten: bool = false;
+        var k: i64 = 0;
+        while k < taking.len() && !beaten {
+            if k != j {
+                var ck: Func = cands.get(taking.get(k));
+                if spec_at_least(ck, cj) && !spec_at_least(cj, ck) {
+                    beaten = true;
+                }
+            }
+            k = k + 1;
+        }
+        if !beaten {
+            maximal.push(taking.get(j));
+        }
+        j = j + 1;
+    }
+    if maximal.len() == 0 {
+        return - 1;
+    }
+    if maximal.len() > 1 {
+        tie.push(maximal.get(1));
+    }
+    return maximal.get(0);
+}
+
 // --- Constructor functions ------------------------------------------------
 // The Fides parser only recognizes struct names defined in the current file
 // (or pre-populated from stdlib/already-loaded imports). Struct literals from
@@ -1075,6 +1908,28 @@ pub fn Param_new(name: str, ty: Type, is_pub: bool) -> Param {
     };
 }
 
+// CL5: `Config { port: 80, .. }` -- a struct literal whose fields left out
+// take the defaults written in the struct (`port: i64 = 8080`). The parser
+// keeps the bare `..` as this spread; the type checker checks that every
+// field left out has a default, and monomorphization (mono.fd
+// `mn_fill_struct_defaults`) writes the defaults in, so no later pass sees
+// it. A string literal, so a pass that scans the spread before then finds
+// nothing in it (no variable, no call).
+pub fn ast_spread_defaults() -> Expr {
+    return Expr::StringLit("..struct defaults..");
+}
+
+pub fn ast_is_spread_defaults(e: Expr) -> bool {
+    match e {
+        Expr::StringLit(s) => {
+            return s == "..struct defaults..";
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 pub fn Annotation_new(name: str, args: Vec<str>) -> Annotation {
     return Annotation {
         name: name, args: args
@@ -1113,14 +1968,14 @@ pub fn EnumVariant_new(name: str, data: OptParams) -> EnumVariant {
 
 pub fn Func_new(name: str, ret_ty: Type) -> Func {
     return Func {
-        name: name, type_params: Vec::new(), type_param_bounds: Vec::new(), const_params: Vec::new(), params: Vec::new(), ret_ty: ret_ty, body: Vec::new(), is_pub: false, is_comptime: false, declared_effects: Vec::new(), has_effect_annotation: false, is_interrupt: false, annotations: Vec::new(), preconditions: Vec::new(), postconditions: Vec::new(), is_async: false,
+        name: name, type_params: Vec::new(), type_param_bounds: Vec::new(), const_params: Vec::new(), params: Vec::new(), ret_ty: ret_ty, body: Vec::new(), is_pub: false, is_comptime: false, declared_effects: Vec::new(), has_effect_annotation: false, is_interrupt: false, annotations: Vec::new(), preconditions: Vec::new(), postconditions: Vec::new(), is_async: false, line: 0,
     };
 }
 
 /// Full constructor for Func with all fields specified.
 pub fn Func_new_full(name: str, params: Vec<Param>, ret_ty: Type, body: Vec<Stmt>, is_pub: bool) -> Func {
     return Func {
-        name: name, type_params: Vec::new(), type_param_bounds: Vec::new(), const_params: Vec::new(), params: params, ret_ty: ret_ty, body: body, is_pub: is_pub, is_comptime: false, declared_effects: Vec::new(), has_effect_annotation: false, is_interrupt: false, annotations: Vec::new(), preconditions: Vec::new(), postconditions: Vec::new(), is_async: false,
+        name: name, type_params: Vec::new(), type_param_bounds: Vec::new(), const_params: Vec::new(), params: params, ret_ty: ret_ty, body: body, is_pub: is_pub, is_comptime: false, declared_effects: Vec::new(), has_effect_annotation: false, is_interrupt: false, annotations: Vec::new(), preconditions: Vec::new(), postconditions: Vec::new(), is_async: false, line: 0,
     };
 }
 
@@ -1176,7 +2031,7 @@ pub fn ImplDef_new_full(struct_name: str, type_params: Vec<str>, methods: Vec<Fu
 
 pub fn TraitMethod_new(name: str, ret_ty: Type, has_self: bool) -> TraitMethod {
     return TraitMethod {
-        name: name, params: Vec::new(), ret_ty: ret_ty, has_self: has_self, is_pub: true, default_body: OptStmts::None,
+        name: name, params: Vec::new(), ret_ty: ret_ty, has_self: has_self, is_pub: true, default_body: OptStmts::None, annotations: Vec::new(), type_params: Vec::new(), type_param_bounds: Vec::new(), is_async: false,
     };
 }
 
@@ -1523,6 +2378,59 @@ pub fn EventHandlerDef_new(event_name: str) -> EventHandlerDef {
     return EventHandlerDef {
         event_name: event_name, params: Vec::new(), body: Vec::new(), is_pub: false,
     };
+}
+
+// --- Lifetimes (LG3) ---------------------------------------------------------
+// The parser keeps the lifetimes of `&'a T` as `@lifetime("'a", ...)`: on a
+// parameter, those its type writes; on a function, those of its result.
+
+/// The lifetimes an annotation list carries (none: empty).
+pub fn ann_lifetimes(anns: Vec<Annotation>) -> Vec<str> {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == "lifetime" {
+            return anns.get(i).args;
+        }
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+/// Whether `f`'s signature names its result's lifetimes (`-> &'a T`).
+pub fn func_has_lifetimes(f: Func) -> bool {
+    return ann_lifetimes(f.annotations).len() > 0;
+}
+
+/// The parameters (by index) `f`'s result borrows from by its signature:
+/// those whose type carries one of the result's lifetimes. `'static` ties
+/// the result to no parameter.
+pub fn func_lifetime_ties(f: Func) -> Vec<i64> {
+    return lifetime_ties(ann_lifetimes(f.annotations), f.params);
+}
+
+/// The same for a trait's method declaration (LG3).
+pub fn trait_method_lifetime_ties(tm: TraitMethod) -> Vec<i64> {
+    return lifetime_ties(ann_lifetimes(tm.annotations), tm.params);
+}
+
+/// The parameters (by index) carrying one of `ret_lts`.
+pub fn lifetime_ties(ret_lts: Vec<str>, params: Vec<Param>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < params.len() {
+        var pl: Vec<str> = ann_lifetimes(params.get(i).annotations);
+        var tied: bool = false;
+        var j: i64 = 0;
+        while j < pl.len() && !tied {
+            tied = pl.get(j) != "'static" && str_vec_contains(ret_lts, pl.get(j));
+            j = j + 1;
+        }
+        if tied {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 // Shared helper used across compiler modules.

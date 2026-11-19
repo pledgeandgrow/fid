@@ -1,0 +1,45 @@
+// TG15 (docs/roadmap/llvm-roadmap.md): system library functions through
+// import tables the machine layer writes itself, on every Linux target —
+// x86-64 (CI2), AArch64 and RISC-V 64. A C function the runtime does not
+// provide becomes a dynamic import: PT_INTERP names the target's glibc
+// loader (/lib64/ld-linux-x86-64.so.2, /lib/ld-linux-aarch64.so.1,
+// /lib/ld-linux-riscv64-lp64d.so.1), PT_DYNAMIC lists libc / libm, and
+// each GOT slot gets the target's binding relocation (R_X86_64_GLOB_DAT,
+// R_AARCH64_GLOB_DAT, R_RISCV_64); a stub per signature moves the
+// arguments to the C convention (compiler/nat_ir.fd ng_gen_ldyn,
+// ng_gen_ldyn_stubs, ng_gen_ldyn_stubs_risc). Here: integer and pointer
+// arguments, f64 arguments and results, an i32 result sign-extended.
+// Check (no program is run):
+//   fid emit tests/bootstrap/test_machine_ldyn_targets.fd --target <t> -o x
+//   python3 tests/nattools/ldyn_check.py x
+// and on each target (qemu-user with the target's glibc sysroot, -L):
+//   ./x      # prints what follows
+// Expected output:
+// 7
+// -123
+// 13
+// 42
+// 7
+// 24
+
+extern "C" link "m" {
+    fn hypot(x: f64, y: f64) -> f64;
+    fn ldexp(x: f64, e: i32) -> f64;
+}
+
+extern "C" {
+    fn abs(x: i32) -> i32;
+    fn atoi(s: str) -> i32;
+    fn labs(x: i64) -> i64;
+    fn strlen(s: str) -> i64;
+}
+
+@unsafe
+fn main() {
+    println(abs(0 - 7) as i64);
+    println(atoi("-123") as i64);
+    println(hypot(5.0, 12.0) as i64);
+    println(labs(0 - 42));
+    println(strlen("machine"));
+    println(ldexp(1.5, 4) as i64);
+}

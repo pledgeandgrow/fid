@@ -1,0 +1,48 @@
+// Miscompile M9 (docs/verification/miscompile-log.md): with the opt-in
+// interprocedural constant propagation (FID_IROPT_ON=ipcp, compiler/iropt.fd
+// iro_ipcp), `fn bump(v: &mut Vec<i64>)` with a push loop emitted a binary
+// that panicked "Invalid memory access (null or dangling pointer)": every
+// argument that was not an instruction (a parameter) was recorded as the
+// constant 0, so pointer parameters became null.
+//
+// The switch below makes scripts/verify/expect.py build it with ipcp on;
+// without the switch it checks the default pipeline, which must agree too.
+//@ env: FID_IROPT_ON=ipcp
+//
+// Expected output:
+// 10
+// 45
+// 15
+// ok
+
+fn bump(v: &mut Vec<i64>) {
+    var i: i64 = 0;
+    while i < 10 {
+        v.push(i);
+        i = i + 1;
+    }
+}
+
+fn sum(v: &mut Vec<i64>, from: i64) -> i64 {
+    // `from` is a varying argument at one call site and a constant at the
+    // other: it must not be specialised to either
+    var s: i64 = 0;
+    var i: i64 = from;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    bump(&mut v);
+    println(int_to_str(v.len()));
+    println(int_to_str(sum(&mut v, 0)));
+    var k: i64 = v.len() - 3;
+    // 7 + 8 + 9 - 9
+    println(int_to_str(sum(&mut v, k) - sum(&mut v, 9)));
+    println("ok");
+    return 0;
+}

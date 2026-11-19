@@ -1,0 +1,305 @@
+// CT6 (docs/roadmap/complaint-roadmap.md; llvm DB3/DB4): DWARF in `--nat`
+// Windows images (compiler/nat_enc.fd nat_pe_debug, nat_pe_add_sections,
+// nat_pe_symbols_pre, nat_dwarf_build). A stand-in image (a code page with
+// two framed functions, `main` of main.fd and `Point_len` of lib/util.fd
+// shown as Point::len, then 64 bytes of data) is written by nat_pe, then
+// given its debug sections. The test reads the PE back the way gdb and
+// lldb do: the headers grew to 1024 bytes, .text and .data moved down the
+// file with their addresses unchanged, the five DWARF sections follow
+// .data (page-aligned addresses, discardable, "/<n>" names resolved
+// through the COFF string table), the image size covers them, the
+// symbols follow the sections; then the compile unit of .debug_info and
+// the location list .debug_loc has for `n` (a parameter held in rcx,
+// DWARF register 2, over two code ranges). The last lines check that an
+// image without line rows can still be given symbols only, and that an
+// image of another layout comes back unchanged.
+// With FID_PE_DWARF_OUT=<path> the image is also written there, for
+// tests/nattools/pe_nat_dwarf_check.py and a DWARF reader
+// (x86_64-w64-mingw32-objdump --dwarf=decodedline,info,loc).
+// Run (from the repository root):
+//   fid run tests/nattools/pe_nat_dwarf_unit.fd
+// Expected output:
+// nsect 7
+// headers 1024
+// text raw 1024 rva 4096 size 4096
+// data raw 5120 rva 8192 size 64
+// code moved true
+// sect .debug_abbrev rva 12288 raw ok true discardable true
+// sect .debug_info rva 16384 raw ok true discardable true
+// sect .debug_line rva 20480 raw ok true discardable true
+// sect .debug_frame rva 24576 raw ok true discardable true
+// sect .debug_loc rva 28672 raw ok true discardable true
+// image size 32768
+// symbols 2 after sections true
+// sym main 0
+// sym Point_len 64
+// cu version 4 length ok true name main.fd low 4198400 size 128
+// loc 4198468 4198484 expr 82
+// loc 4198494 4198504 expr 82
+// loc end
+// symbols only nsect 2 headers 512 symbols 2
+// other image unchanged true
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn le16(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn le64(b: &Vec<i64>, at: i64) -> i64 {
+    return le32(b, at) | (le32(b, at + 4) << 32);
+}
+
+fn cstr_at(b: &Vec<i64>, at: i64) -> str {
+    var out: str = "";
+    var i: i64 = at;
+    while i < b.len() && b.get(i) != 0 {
+        out = out + char_to_str(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// A section header's name: 8 bytes, or "/<n>": offset n of the COFF
+// string table (after the symbols).
+fn sect_name(b: &Vec<i64>, h: i64) -> str {
+    var raw: str = "";
+    var i: i64 = 0;
+    while i < 8 && b.get(h + i) != 0 {
+        raw = raw + char_to_str(b.get(h + i));
+        i = i + 1;
+    }
+    if str_len(raw) > 1 && str_byte_at(raw, 0) == 47 {
+        var off: i64 = str_parse_int(str_slice(raw, 1, str_len(raw)));
+        var strtab: i64 = le32(b, 76) + 18 * le32(b, 80);
+        return cstr_at(b, strtab + off);
+    }
+    return raw;
+}
+
+// A code page: `main` at 0 and `Point_len` at 64, each `push rbp; mov
+// rbp, rsp`, nops, `pop rbp; ret`; then 64 bytes of data.
+fn image() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    while v.len() < 4096 + 64 {
+        v.push(0);
+    }
+    var f: i64 = 0;
+    while f < 2 {
+        var at: i64 = 64 * f;
+        v.set(at, 0x55);
+        v.set(at + 1, 0x48);
+        v.set(at + 2, 0x89);
+        v.set(at + 3, 0xE5);
+        var k: i64 = 4;
+        while k < 62 {
+            v.set(at + k, 0x90);
+            k = k + 1;
+        }
+        v.set(at + 62, 0x5D);
+        v.set(at + 63, 0xC3);
+        f = f + 1;
+    }
+    return v;
+}
+
+fn build(with_rows: bool) -> Vec<i64> {
+    nat_line_files_reset("main.fd");
+    var lib_ix: i64 = nat_line_file_index("lib/util.fd");
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("Point_len");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(64);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    ends.push(128);
+    var shown: Vec<str> = Vec::new();
+    shown.push("main");
+    shown.push("Point::len");
+    g_nat_dbg_shown = shown;
+    g_nat_dbg_ext = true;
+    // main: a variable in a frame slot; Point_len: a parameter in rcx
+    // (DWARF 2) over [4, 20) and [30, 40), a variable optimized out
+    var vars: Vec<str> = Vec::new();
+    vars.push("V\ttotal\ti64\t8\t5\tf-24");
+    vars.push("P\tn\ti64\t8\t5\tr2@4:20,30:40\nV\tgone\ti64\t8\t5\t");
+    g_nat_dbg_vars = vars;
+    var rows: Vec<i64> = Vec::new();
+    if with_rows {
+        rows.push(0);
+        rows.push(10);
+        rows.push(0);
+        rows.push(8);
+        rows.push(11);
+        rows.push(0);
+        rows.push(32);
+        rows.push(12);
+        rows.push(0);
+        rows.push(64);
+        rows.push(0);
+        rows.push(1);
+        rows.push(64);
+        rows.push(20);
+        rows.push(2 * lib_ix);
+        rows.push(80);
+        rows.push(21);
+        rows.push(2 * lib_ix);
+        rows.push(128);
+        rows.push(0);
+        rows.push(1);
+    }
+    var cfi: Vec<i64> = Vec::new();
+    var img: Vec<i64> = image();
+    var pe: Vec<i64> = nat_pe(img, 0, 4096, 4096, 0, 4096, 0);
+    var out: Vec<i64> = pe;
+    if with_rows {
+        out = nat_pe_debug(pe, img, names, starts, ends, "main.fd", rows, cfi);
+    } else {
+        nat_pe_symbols(& mut out, names, starts);
+    }
+    g_nat_dbg_shown = Vec::new();
+    g_nat_dbg_vars = Vec::new();
+    g_nat_dbg_ext = false;
+    return out;
+}
+
+fn show(b: &Vec<i64>, plain: &Vec<i64>) {
+    var nsect: i64 = le16(b, 70);
+    println("nsect " + int_to_str(nsect));
+    println("headers " + int_to_str(le32(b, 148)));
+    println("text raw " + int_to_str(le32(b, 328 + 20)) + " rva " + int_to_str(le32(b, 328 + 12)) + " size " + int_to_str(le32(b, 328 + 8)));
+    println("data raw " + int_to_str(le32(b, 368 + 20)) + " rva " + int_to_str(le32(b, 368 + 12)) + " size " + int_to_str(le32(b, 368 + 8)));
+    // the code and data of the plain image (at 0x200) at 0x400 now
+    var same: bool = true;
+    var i: i64 = 0;
+    while i < 4096 + 64 {
+        if b.get(0x400 + i) != plain.get(0x200 + i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    println("code moved " + bool_to_str(same));
+    var info_off: i64 = 0;
+    var info_size: i64 = 0;
+    var loc_off: i64 = 0;
+    var loc_size: i64 = 0;
+    var last_end: i64 = 0;
+    var last_va: i64 = 0;
+    var s: i64 = 2;
+    while s < nsect {
+        var h: i64 = 328 + 40 * s;
+        var nm: str = sect_name(b, h);
+        var vsize: i64 = le32(b, h + 8);
+        var rva: i64 = le32(b, h + 12);
+        var raw: i64 = le32(b, h + 16);
+        var pos: i64 = le32(b, h + 20);
+        var raw_ok: bool = pos % 512 == 0 && raw % 512 == 0 && raw >= vsize && vsize > 0 && pos + raw <= b.len();
+        println("sect " + nm + " rva " + int_to_str(rva) + " raw ok " + bool_to_str(raw_ok) + " discardable " + bool_to_str(le32(b, h + 36) == 0x42000040));
+        if nm == ".debug_info" {
+            info_off = pos;
+            info_size = vsize;
+        }
+        if nm == ".debug_loc" {
+            loc_off = pos;
+            loc_size = vsize;
+        }
+        last_end = pos + raw;
+        last_va = rva + ((vsize + 4095) & (0 - 4096));
+        s = s + 1;
+    }
+    var isz: i64 = le32(b, 144);
+    println("image size " + int_to_str(isz));
+    if isz != last_va {
+        println("image size does not cover the sections");
+    }
+    var nsyms: i64 = le32(b, 80);
+    println("symbols " + int_to_str(nsyms) + " after sections " + bool_to_str(le32(b, 76) == last_end));
+    var k: i64 = 0;
+    while k < nsyms {
+        var sa: i64 = le32(b, 76) + 18 * k;
+        var sn: str = "";
+        if le32(b, sa) == 0 {
+            sn = cstr_at(b, le32(b, 76) + 18 * nsyms + le32(b, sa + 4));
+        } else {
+            var c: i64 = 0;
+            while c < 8 && b.get(sa + c) != 0 {
+                sn = sn + char_to_str(b.get(sa + c));
+                c = c + 1;
+            }
+        }
+        println("sym " + sn + " " + int_to_str(le32(b, sa + 8)));
+        k = k + 1;
+    }
+    if info_off == 0 {
+        println("no .debug_info");
+        return;
+    }
+    // the compile unit: abbrev 1, producer, language, name, low_pc, size
+    var p: i64 = info_off + 11;
+    p = p + 1;
+    var producer: str = cstr_at(b, p);
+    p = p + str_len(producer) + 1 + 2;
+    var cuname: str = cstr_at(b, p);
+    p = p + str_len(cuname) + 1;
+    println("cu version " + int_to_str(le16(b, info_off + 4)) + " length ok " + bool_to_str(le32(b, info_off) == info_size - 4) + " name " + cuname + " low " + int_to_str(le64(b, p)) + " size " + int_to_str(le64(b, p + 8)));
+    var culow: i64 = le64(b, p);
+    // .debug_loc: begin, end (from the unit's low_pc), length, expression
+    var q: i64 = loc_off;
+    while loc_off > 0 && q + 16 <= loc_off + loc_size {
+        var lb: i64 = le64(b, q);
+        var lend: i64 = le64(b, q + 8);
+        q = q + 16;
+        if lb == 0 && lend == 0 {
+            println("loc end");
+            q = loc_off + loc_size;
+        } else {
+            var n: i64 = le16(b, q);
+            q = q + 2;
+            var e: str = "";
+            var j: i64 = 0;
+            while j < n {
+                e = e + int_to_str(b.get(q + j));
+                j = j + 1;
+            }
+            q = q + n;
+            println("loc " + int_to_str(culow + lb) + " " + int_to_str(culow + lend) + " expr " + e);
+        }
+    }
+}
+
+fn main() -> i64 {
+    var plain: Vec<i64> = build(false);
+    var dbg: Vec<i64> = build(true);
+    show(&dbg, &plain);
+    println("symbols only nsect " + int_to_str(le16(&plain, 70)) + " headers " + int_to_str(le32(&plain, 148)) + " symbols " + int_to_str(le32(&plain, 80)));
+    // an image of another layout (three sections) is not touched
+    var other: Vec<i64> = image();
+    var other_pe: Vec<i64> = nat_pe(other, 0, 4096, 4096, 0, 4096, 0);
+    other_pe.set(70, 3);
+    var sn: Vec<str> = Vec::new();
+    sn.push(".debug_line");
+    var parts: Vec<Vec<i64>> = Vec::new();
+    var one: Vec<i64> = Vec::new();
+    one.push(1);
+    parts.push(one);
+    var back: Vec<i64> = nat_pe_add_sections(other_pe, sn, parts);
+    println("other image unchanged " + bool_to_str(back.len() == other_pe.len() && le16(&back, 70) == 3));
+    match env_var("FID_PE_DWARF_OUT") {
+        Option::Some(path) => {
+            if str_len(path) > 0 {
+                p_file_write_vec(path, dbg);
+            }
+        }
+        Option::None => {
+        }
+    }
+    return 0;
+}

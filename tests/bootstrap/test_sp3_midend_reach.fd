@@ -1,0 +1,125 @@
+// SP3 (compiler/iropt.fd iro_mid_reach, iro_call_closure; rules.fd
+// rules_run; egraph.fd egraph_run): the mid-end's module passes, the rules
+// and the e-graph work only on the functions main reaches (and their
+// callees, for the facts they read about calls); FID_IROPT_OFF=midreach
+// runs them on every function as before. Each case prints a value a wrong
+// fact about a function outside that set would change:
+//   effects   `count` reads g_count and `bump` writes it, called in a loop:
+//             the masks (iro_effect_masks_in) must see bump's write, or
+//             LICM/readcse would reuse the first read
+//   gconst    g_limit is never written: its loads fold (in reached code);
+//             g_dead is written only in a function nothing calls, so it
+//             stays a load everywhere (the write scan still covers every
+//             function)
+//   hofspec   apply_all gets two closures with different captures: each
+//             clone (made for reached callers only) calls its own
+//   dynspec   measure's clones per dyn type (added to the set before
+//             inlining) give each type's own area
+//   by name   `tally` is started by name (task_go), reached only through
+//             the string, and writes g_count
+//
+// Expected output:
+// 25 5
+// 7 3
+// 25 31
+// 9 10
+// 4 8
+
+use task;
+
+var g_count: i64 = 0;
+var g_limit: i64 = 7;
+var g_dead: i64 = 3;
+
+fn bump(k: i64) {
+    g_count = g_count + k;
+}
+
+fn count() -> i64 {
+    return g_count;
+}
+
+fn limit() -> i64 {
+    return g_limit;
+}
+
+fn dead_value() -> i64 {
+    return g_dead;
+}
+
+fn never_called() -> i64 {
+    g_dead = 100;
+    return limit() + dead_value();
+}
+
+fn sum_with_bumps(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + count();
+        bump(1);
+        s = s + count();
+        i = i + 1;
+    }
+    return s;
+}
+
+fn apply_all(v: Vec<i64>, f: fn(i64) -> i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + f(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+cap Shape {
+    fn area(self) -> i64;
+}
+
+struct Sq { s: i64 }
+
+fn sq(x: i64) -> i64 {
+    return x * x;
+}
+
+impl Shape for Sq {
+    pub fn area(self: Sq) -> i64 { return sq(self.s); }
+}
+
+struct Rect { w: i64, h: i64 }
+
+impl Shape for Rect {
+    pub fn area(self: Rect) -> i64 { return self.w * self.h; }
+}
+
+fn measure(s: dyn Shape) -> i64 {
+    return s.area();
+}
+
+fn tally(x: i64) -> i64 {
+    bump(x);
+    return x + 1;
+}
+
+fn main() -> i64 {
+    val s = sum_with_bumps(5);
+    println(int_to_str(s) + " " + int_to_str(count()));
+    println(int_to_str(limit()) + " " + int_to_str(dead_value()));
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    val a = 2;
+    val b = 3;
+    val r1 = apply_all(v, fn(x: i64) -> i64 { return x * a + 1; });
+    val r2 = apply_all(v, fn(x: i64) -> i64 { return x * b + 4; });
+    // r1 = 3 + 5 + 7 = 15, + 10 = 25; r2 = 7 + 10 + 13 = 30, + 1 = 31
+    println(int_to_str(r1 + 10) + " " + int_to_str(r2 + 1));
+    println(int_to_str(measure(Sq { s: 3 } as dyn Shape)) + " " + int_to_str(measure(Rect { w: 2, h: 5 } as dyn Shape)));
+    val t = task_go("tally", 3);
+    task_run();
+    println(int_to_str(task_result(t)) + " " + int_to_str(count()));
+    return 0;
+}

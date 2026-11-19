@@ -1,0 +1,51 @@
+// Complaint CT3, the stdlib half: under a test run the clock and the
+// random seed can be fixed. dt_now() returns FIDES_TEST_NOW (unix seconds)
+// and random_seed_time() seeds with FIDES_TEST_SEED when they are set;
+// otherwise both read the clock as before. This file checks whichever case
+// it runs in, so it prints the same either way; scripts/verify/ct3_test_clock.sh
+// runs it with both variables set.
+//
+// Expected output:
+// now ok
+// seed ok
+// test clock ok
+use datetime;
+use time;
+use random;
+
+fn main() -> i64 {
+    match env_var("FIDES_TEST_NOW") {
+        Option::Some(s) => {
+            if dt_to_seconds(dt_now()) != str_parse_int(s) {
+                p_panic("dt_now ignored FIDES_TEST_NOW");
+            }
+        }
+        Option::None => {
+            if time_get_year(dt_now()) < 2024 {
+                p_panic("dt_now: the clock reads before 2024");
+            }
+        }
+    }
+    println("now ok");
+    match env_var("FIDES_TEST_SEED") {
+        Option::Some(s) => {
+            random_seed_time();
+            val a: i64 = random_int(1000000);
+            random_seed(str_parse_int(s));
+            val b: i64 = random_int(1000000);
+            if a != b {
+                p_panic("random_seed_time ignored FIDES_TEST_SEED");
+            }
+        }
+        Option::None => {
+            random_seed_time();
+            val r: i64 = random_int(6);
+            if r < 0 || r >= 6 {
+                p_panic("random_int out of range");
+            }
+        }
+    }
+    println("seed ok");
+    println("test clock ok");
+    return 0;
+}

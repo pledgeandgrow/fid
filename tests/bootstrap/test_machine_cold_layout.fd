@@ -1,0 +1,142 @@
+// test_machine_cold_layout.fd — competitive OP15 on the machine layer
+// (compiler/nat_ir.fd: Linux AArch64 / RISC-V / x86-64, macOS, `--nat`):
+// besides the panic paths (WP17), a block that calls a function marked
+// `@cold`, core's `cold_path()`, panic, or a function that only panics
+// (`fail` here) is laid out after the hot code of its function
+// (ng_mir_finish, ng_cold_last with ng_cold_call_labels). Such a block may
+// be fallen into (the else side of a test: a JMP to it is left behind) and
+// may fall out into the next block (it gets a JMP back): both are here, in
+// loops, so a wrong jump changes the numbers. FID_NAT_OFF=coldhint: only
+// the panic paths move; every build prints the same, and no panic happens.
+// Native check: NATIVE=1 bash scripts/cross-test.sh aarch64-linux
+// tests/bootstrap/test_machine_cold_layout.fd (and riscv64-linux,
+// x86_64-linux), also with FID_VERIFY=1 and FID_NAT_OFF=coldhint;
+// FID_NAT_DUMP=count_odd shows the cold_path() call after the hot blocks.
+//
+// Expected output:
+// 14850
+// 14
+// 4459
+// 3
+// 50 2450
+// 7 rare
+// 21
+// 1680
+
+fn fail(msg: str) {
+    panic(msg);
+}
+
+@cold
+fn note_rare(v: i64) -> i64 {
+    return v * 3 + 1;
+}
+
+fn checked_div(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        fail("division by zero");
+    }
+    return a / b;
+}
+
+fn sum_checked(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) < 0 {
+            fail("negative");
+        }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn pick(k: i64) -> i64 {
+    if k == 1 {
+        return 1;
+    } else if k == 2 {
+        return 2;
+    } else if k == 3 {
+        return 3;
+    }
+    fail("no such case");
+    return 0;
+}
+
+// The cold block falls out into the loop's next step (a JMP back)
+fn count_odd(n: i64) -> i64 {
+    var odd: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 2 == 1 {
+            cold_path();
+            odd = odd + 1;
+        }
+        i = i + 1;
+    }
+    return odd;
+}
+
+// The cold side is the else of the test (fallen into: a JMP to it stays)
+fn sum_sq(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i >= 0 {
+            s = s + i * 2;
+        } else {
+            cold_path();
+            s = s - 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// A call of a @cold function in a block that returns
+fn classify(v: i64) -> i64 {
+    if v > 1000 {
+        return note_rare(v);
+    }
+    return v + 1;
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 100 {
+        v.push(i * 3);
+        i = i + 1;
+    }
+    println(sum_checked(v));
+    println(checked_div(100, 7));
+    var t: i64 = 0;
+    var k: i64 = 1;
+    while k < 50 {
+        t = t + checked_div(1000, k);
+        k = k + 1;
+    }
+    println(t);
+    println(pick(3));
+    println(int_to_str(count_odd(100)) + " " + int_to_str(sum_sq(50)));
+    var rare: i64 = classify(2);
+    if classify(2000) == 6001 {
+        println(int_to_str(rare + 4) + " rare");
+    }
+    var c: i64 = 0;
+    var j: i64 = 0;
+    while j < 20 {
+        c = c + classify(j) - j;
+        j = j + 1;
+    }
+    println(c + 1);
+    var w: i64 = 0;
+    j = 0;
+    while j < 10 {
+        w = w + count_odd(j * 5) * 12;
+        j = j + 1;
+    }
+    println(w + 360);
+    return 0;
+}

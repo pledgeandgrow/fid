@@ -1,0 +1,371 @@
+// competitive-roadmap OP22: automatic loop vectorization on the machine
+// layer (compiler/nat_ir.fd, section "OP22: automatic loop vectorization",
+// ng_vz_*). `fid emit` gives counted loops over plain Vec<i64> / Vec<f64>
+// elements a vector loop in front (SSE2 / AVX2 under --cpu x86-64-v3,
+// NEON, RVV under --cpu rv64gcv) and keeps the original loop as the scalar
+// tail; `fid run` and the C path run every loop as written. The loops here:
+// i64 ^ | & reductions and a wrapping + reduction, f64 elementwise + - * /
+// with invariants splat into lanes (saxpy, a constant, a parameter), an
+// i64 elementwise mix in a @wrapping function, a store of an invariant, a
+// loop starting past 0 and stopping before the end, a Vec written in place
+// and a shared buffer written (copy on write: the vector loop is skipped at
+// run time). Loops the vectorizer must leave alone are here too, with the
+// same results: a checked i64 + (no @wrapping), an f64 sum (its rounding
+// depends on the order), a read after a write and the counter used in
+// arithmetic. An expression too wide for four vector registers (fn wide)
+// is vectorized too: its extra values go through spill slots (TG11).
+// Lengths 0..9, 33 and 1001 cover an empty input, a tail only, whole
+// vectors only and both. Checksums of f64 results are over their bits.
+// tests/nattools/vectorize_check.sh builds it for every target, checks the
+// `[vectorize]` lines and the vector operations, and compares the output
+// with FID_NAT_OFF=vectorize.
+// Expected output:
+// n=0 xor=0 or=0 and=-1 sum=0 bits=17
+// n=0 add=17 saxpy=17 div=17 scale=17 mix=17 fill=17
+// n=0 chk=17 fsum=0 raw=17 ctr=17 wide=17
+// n=1 xor=4025353432212273003 or=0 and=562964865788938083 sum=4025353432212273003 bits=562964865788938610
+// n=1 add=-4570559885502053873 saxpy=-4569352621734755825 div=-4591683702894886385 scale=-4584338965221342705 mix=1203677583516282847 fill=-4606900943823306225
+// n=1 chk=-233 fsum=-4582729280198279168 raw=3603 ctr=4025353432212273530 wide=4720502177443873295
+// n=2 xor=-662786157838814049 or=0 and=9007474266866179 sum=-643293366355412833 bits=774694458293816737
+// n=2 add=1341715347677396945 saxpy=-7744022572391448623 div=-8361897765276317446 scale=-8031554208903708719 mix=8541092319198877129 fill=153122387330613201
+// n=2 chk=30381 fsum=-4577214129873354752 raw=3052396541170870857 ctr=-2553252937645793727 wide=4165090165439610833
+// n=3 xor=1366754215958619210 or=0 and=5085242328131 sum=-1371247636511382476 bits=-4141293169795966926
+// n=3 add=2772380086530718287 saxpy=-9178069683888735665 div=3653022283936703491 scale=1874480958137678415 mix=-1491133714029953505 fill=139893063425702479
+// n=3 chk=-1036126 fsum=-4569845202944000000 raw=795624212109961595 ctr=1872670297517760388 wide=1570370079722027599
+// n=4 xor=1690043434448597740 or=0 and=2199023256595 sum=-2816194458766723342 bits=4009678729086524017
+// n=4 add=-49673736303964271 saxpy=9177317343073636241 div=-8993490669408652332 scale=-4593478105855717487 mix=-7326313270154262055 fill=-270215977626529903
+// n=4 chk=4598992 fsum=-4568957897060384768 raw=4909042330161876887 ctr=6004519250044874937 wide=6378272334729809809
+// n=5 xor=-8028252725855189837 or=0 and=8796093022211 sum=-7424753837193650991 bits=-5515553927512743550
+// n=5 add=127693982401716879 saxpy=-2854045487562857841 div=2719052673558153241 scale=-845380955005623665 mix=-2240715661090500321 fill=5463147823463817871
+// n=5 chk=-663366219 fsum=-4568901821967368192 raw=-8136826254027760219 ctr=2270312357904382486 wide=1810746626926862991
+// n=6 xor=5982583371312806563 or=1645788613595576533 and=18014398509481987 sum=5933494318292181241 bits=-3904863023963806063
+// n=6 add=-8311582213224665263 saxpy=6629817086309429073 div=-612239334265083236 scale=-7573996827963691183 mix=-5284888458953753151 fill=-1270015079830917295
+// n=6 chk=-18070994942 fsum=-4574984320292225024 raw=-6624805490667536781 ctr=-645825227666046087 wide=3811525905480281937
+// n=7 xor=6398121534088046938 or=-2601322474121725953 and=3 sum=1410843417673974466 bits=5774867831333362786
+// n=7 add=-8935608485430428977 saxpy=9186563054294530767 div=1909069361219031602 scale=-5639643160776541489 mix=1295818810355694927 fill=-7083880271162639665
+// n=7 chk=-1207395665251 fsum=-4565639570967756800 raw=-2094035297776118859 ctr=-5027481327121059792 wide=1324219360739064527
+// n=8 xor=-8551903417191565640 or=9187338635092426239 and=3 sum=-8937254143388244044 bits=-4444484321833041919
+// n=8 add=8311518112378478353 saxpy=3400784859844271889 div=-4712261576181355032 scale=-2349741355211989231 mix=-564276039828175711 fill=-2846260465350516975
+// n=8 chk=-6413852582265 fsum=-4565308068211982336 raw=7823764677500033357 ctr=-1890929412898660223 wide=3232001328752746257
+// n=9 xor=-8718056002048343957 or=-2305922182649219073 and=3 sum=8302622977441403527 bits=-2388695760494803502
+// n=9 add=-141190713825000689 saxpy=5623154300808102671 div=-5361869129765696326 scale=7985044640369771279 mix=7984466578634559775 fill=-607255001141574897
+// n=9 chk=-1891327934934994 fsum=-4564074965921431552 raw=-4522290289432620377 ctr=5061663866798343890 wide=-6255600147998211313
+// n=33 xor=-6728900382579209877 or=-1 and=3 sum=-36721752971277477 bits=-639756802353686094
+// n=33 add=-8666511058315508209 saxpy=2204714448249947663 div=-8482344003148579126 scale=-7178951540527593969 mix=-4361819587282748705 fill=-9101844545391557105
+// n=33 chk=-4537968895068621871 fsum=-4556781630416486400 raw=5842866262977657027 ctr=4770675631825687002 wide=4031441195222074895
+// n=1001 xor=-6612475865790329045 or=-1 and=3 sum=4498401566446889879 bits=-7060396535463091310
+// n=1001 add=-2956553707099455729 saxpy=-1127607648637092081 div=8803641524131597596 scale=-4409449471554289905 mix=524925674092494751 fill=-8239230440272494833
+// n=1001 chk=2818469624071021427 fsum=-4534648478529224704 raw=-6310175638910858825 ctr=-2814627004124888974 wide=5948784704449740559
+// shared 1006029531967678095 -1583540253770357105
+// kept 41 0
+// done
+
+@wrapping fn rnd(x: i64) -> i64 {
+    return x * 6364136223846793005 + 1442695040888963407;
+}
+
+/// n values over the whole i64 range
+fn ints(n: i64, seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = rnd(x);
+        v.push(x);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// n small values (a checked + of two of them cannot overflow)
+fn small(n: i64, seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = rnd(x);
+        v.push((x >> 40) % 1000 - 500);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// n multiples of 1/4 between -1300 and 700
+fn floats(n: i64, seed: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = rnd(x);
+        v.push(((x >> 44) % 4000) as f64 * 0.25 - 300.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// n divisors, none of them 0 (1.0 .. 7.0 in steps of 1/2)
+fn divisors(n: i64, seed: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = rnd(x);
+        v.push(((x >> 44) % 7 + 8) as f64 * 0.5);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn zeros_f(n: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn zeros_i(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// a wrapping checksum (it multiplies: never vectorized)
+@wrapping fn hash(v: Vec<i64>) -> i64 {
+    var h: i64 = 17;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = h * 31 + v.get(i);
+        i = i + 1;
+    }
+    return h;
+}
+
+/// a wrapping checksum of the bits of an f64 Vec
+@wrapping fn fhash(v: Vec<f64>) -> i64 {
+    var h: i64 = 17;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = h * 31 + p_f64_to_bits(v.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+// --- loops the vectorizer takes ------------------------------------------
+
+fn xor_all(a: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s ^ a.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// a start past 0 and a bound before the end
+fn or_range(a: Vec<i64>, from: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = from;
+    while i < n {
+        s = s | a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn and_all(a: Vec<i64>) -> i64 {
+    var s: i64 = 0 - 1;
+    for i in 0..a.len() {
+        s = s & a[i];
+    }
+    return s;
+}
+
+@wrapping fn sum_wrap(a: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    for i in 0..a.len() {
+        s = s + a[i];
+    }
+    return s;
+}
+
+fn add_f(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) + b.get(i));
+        i = i + 1;
+    }
+}
+
+fn saxpy(y: & mut Vec<f64>, x: Vec<f64>, k: f64) {
+    for i in 0..x.len() {
+        y.set(i, k * x.get(i) + y.get(i));
+    }
+}
+
+/// a constant inside the loop (splat) and a division
+fn div_sub(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, (a.get(i) - 1.5) / b.get(i));
+        i = i + 1;
+    }
+}
+
+/// in place: the Vec read is the Vec written, at the same index
+fn scale(v: & mut Vec<f64>, k: f64) {
+    var i: i64 = 0;
+    while i < v.len() {
+        v.set(i, v.get(i) * k);
+        i = i + 1;
+    }
+}
+
+@wrapping fn mix(c: & mut Vec<i64>, a: Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, ((a.get(i) ^ b.get(i)) + (a.get(i) & 255)) - b.get(i));
+        i = i + 1;
+    }
+}
+
+/// bitwise only (no @wrapping needed), two invariants
+fn bits(c: & mut Vec<i64>, a: Vec<i64>, m: i64) {
+    for i in 0..a.len() {
+        c[i] = (a[i] & m) | 3;
+    }
+}
+
+/// a store of an invariant
+fn fill(c: & mut Vec<f64>, k: f64) {
+    var i: i64 = 0;
+    while i < c.len() {
+        c.set(i, k);
+        i = i + 1;
+    }
+}
+
+// --- loops it must leave as they are -------------------------------------
+
+/// a checked + (it would panic on overflow)
+fn add_checked(c: & mut Vec<i64>, a: Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) + b.get(i));
+        i = i + 1;
+    }
+}
+
+/// an f64 sum: vector lanes would add in another order
+fn fsum(v: Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// a read after a write of the same Vec
+fn raw(v: & mut Vec<i64>, a: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        v.set(i, a.get(i) ^ 5);
+        s = s ^ v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// the counter in the arithmetic
+@wrapping fn ctr(c: & mut Vec<i64>, a: Vec<i64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) + i);
+        i = i + 1;
+    }
+}
+
+/// five values live at once: more than four vector registers, so the
+/// vector loop keeps the extra ones in spill slots (TG11)
+fn wide(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>, d: Vec<f64>, e: Vec<f64>, f: Vec<f64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) * (b.get(i) + (d.get(i) - (e.get(i) * (f.get(i) + a.get(i))))));
+        i = i + 1;
+    }
+}
+
+fn one(n: i64) {
+    var a: Vec<i64> = ints(n, 11 + n);
+    var b: Vec<i64> = ints(n, 23 + n);
+    var p: Vec<i64> = small(n, 5 + n);
+    var q: Vec<i64> = small(n, 7 + n);
+    var x: Vec<f64> = floats(n, 3 + n);
+    var y: Vec<f64> = floats(n, 9 + n);
+    var dv: Vec<f64> = divisors(n, 13 + n);
+    var lo: i64 = 3;
+    var hi: i64 = n - 2;
+    var bv: Vec<i64> = zeros_i(n);
+    bits(& mut bv, a, 0xFF00FF00FF00FF0);
+    println("n=" + int_to_str(n) + " xor=" + int_to_str(xor_all(a)) + " or=" + int_to_str(or_range(a, lo, hi)) + " and=" + int_to_str(and_all(bv)) + " sum=" + int_to_str(sum_wrap(a)) + " bits=" + int_to_str(hash(bv)));
+    var c1: Vec<f64> = zeros_f(n);
+    add_f(& mut c1, x, y);
+    var y2: Vec<f64> = floats(n, 9 + n);
+    saxpy(& mut y2, x, 2.5);
+    var c2: Vec<f64> = zeros_f(n);
+    div_sub(& mut c2, x, dv);
+    var s1: Vec<f64> = floats(n, 3 + n);
+    scale(& mut s1, 0.75);
+    var m1: Vec<i64> = zeros_i(n);
+    mix(& mut m1, a, b);
+    var f1: Vec<f64> = zeros_f(n);
+    fill(& mut f1, 0.0 - 4.25);
+    println("n=" + int_to_str(n) + " add=" + int_to_str(fhash(c1)) + " saxpy=" + int_to_str(fhash(y2)) + " div=" + int_to_str(fhash(c2)) + " scale=" + int_to_str(fhash(s1)) + " mix=" + int_to_str(hash(m1)) + " fill=" + int_to_str(fhash(f1)));
+    var k1: Vec<i64> = zeros_i(n);
+    add_checked(& mut k1, p, q);
+    var r1: Vec<i64> = zeros_i(n);
+    var rs: i64 = raw(& mut r1, a);
+    var t1: Vec<i64> = zeros_i(n);
+    ctr(& mut t1, a);
+    var w1: Vec<f64> = zeros_f(n);
+    wide(& mut w1, x, y, dv, x, y);
+    println("n=" + int_to_str(n) + " chk=" + int_to_str(hash(k1)) + " fsum=" + int_to_str(p_f64_to_bits(fsum(x))) + " raw=" + int_to_str(rs ^ hash(r1)) + " ctr=" + int_to_str(hash(t1)) + " wide=" + int_to_str(fhash(w1)));
+}
+
+fn main() {
+    var ns: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k <= 9 {
+        ns.push(k);
+        k = k + 1;
+    }
+    ns.push(33);
+    ns.push(1001);
+    var j: i64 = 0;
+    while j < ns.len() {
+        one(ns.get(j));
+        j = j + 1;
+    }
+    // a shared buffer written: copy on write, the original unchanged
+    var z: Vec<f64> = floats(37, 99);
+    var z2: Vec<f64> = z;
+    scale(& mut z2, 2.0);
+    println("shared " + int_to_str(fhash(z)) + " " + int_to_str(fhash(z2)));
+    // values kept across the vector code
+    var keep: i64 = 41;
+    var ks: Vec<i64> = ints(19, 5);
+    var kx: i64 = xor_all(ks);
+    println("kept " + int_to_str(keep) + " " + int_to_str(kx ^ xor_all(ks)));
+    println("done");
+}

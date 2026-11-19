@@ -1,0 +1,770 @@
+// DHCPv4 (RFC 2131 / RFC 2132): message codec with options, the client
+// state machine with its timers, and a server with a lease pool.
+//
+// What is real: the BOOTP/DHCP message layout (op, htype, xid, secs,
+// flags with the broadcast bit, ciaddr/yiaddr/siaddr/giaddr, chaddr,
+// sname, file, magic cookie 99.130.83.99, options, END, padding to 300
+// bytes) and option encoding/decoding (message type, subnet mask,
+// router, DNS, host name, domain, requested address, lease time, server
+// identifier, parameter request list, T1/T2, client identifier); the
+// client states INIT, SELECTING, REQUESTING, BOUND, RENEWING, REBINDING
+// with retransmission backoff (4, 8, 16, 32, 64 s), T1/T2 from the
+// server or 50% / 87.5% of the lease, unicast renewals, broadcast
+// rebinding, NAK handling, lease expiry, RELEASE and DECLINE; the server
+// side: a pool of addresses, offers that prefer the client's existing
+// lease or requested address, offer reservations that time out, ACK/NAK
+// rules for SELECTING, INIT-REBOOT, RENEWING and REBINDING requests,
+// RELEASE, DECLINE (address set aside), and reply addressing (broadcast
+// when the client has no address or asks for it, else unicast).
+//
+// The seam: the codec and state machines take and produce message bytes
+// with a destination address, and time arrives as explicit milliseconds.
+// dhcpc_poll / dhcps_poll connect them to UDP sockets (ports 68 / 67) of
+// stdlib tcpip; dhcpc_apply puts a bound lease into a tcpip stack. Other
+// transports call dhcpc_input / dhcps_handle directly.
+module dhcp;
+ use vec; use tcpip;
+
+pub const DHCP_DISCOVER: i64 = 1;
+pub const DHCP_OFFER: i64 = 2;
+pub const DHCP_REQUEST: i64 = 3;
+pub const DHCP_DECLINE: i64 = 4;
+pub const DHCP_ACK: i64 = 5;
+pub const DHCP_NAK: i64 = 6;
+pub const DHCP_RELEASE: i64 = 7;
+pub const DHCP_INFORM: i64 = 8;
+
+pub const OPT_PAD: i64 = 0;
+pub const OPT_SUBNET: i64 = 1;
+pub const OPT_ROUTER: i64 = 3;
+pub const OPT_DNS: i64 = 6;
+pub const OPT_HOSTNAME: i64 = 12;
+pub const OPT_DOMAIN: i64 = 15;
+pub const OPT_REQUESTED_IP: i64 = 50;
+pub const OPT_LEASE: i64 = 51;
+pub const OPT_MSG_TYPE: i64 = 53;
+pub const OPT_SERVER_ID: i64 = 54;
+pub const OPT_PARAM_LIST: i64 = 55;
+pub const OPT_MESSAGE: i64 = 56;
+pub const OPT_T1: i64 = 58;
+pub const OPT_T2: i64 = 59;
+pub const OPT_CLIENT_ID: i64 = 61;
+pub const OPT_END: i64 = 255;
+
+pub const DHCP_SERVER_PORT: i64 = 67;
+pub const DHCP_CLIENT_PORT: i64 = 68;
+pub const DHCP_BROADCAST: i64 = 0xFFFFFFFF;
+
+pub fn dhcp_type_name(t: i64) -> str {
+    if t == 1 { return "DISCOVER"; }
+    if t == 2 { return "OFFER"; }
+    if t == 3 { return "REQUEST"; }
+    if t == 4 { return "DECLINE"; }
+    if t == 5 { return "ACK"; }
+    if t == 6 { return "NAK"; }
+    if t == 7 { return "RELEASE"; }
+    if t == 8 { return "INFORM"; }
+    return "?";
+}
+
+// ─── Messages ───────────────────────────────────────────────────────────
+
+pub struct DhcpMsg {
+    pub op: i64,
+    // 1 request, 2 reply
+    pub xid: i64,
+    pub secs: i64,
+    pub flags: i64,
+    pub ciaddr: i64,
+    pub yiaddr: i64,
+    pub siaddr: i64,
+    pub giaddr: i64,
+    pub chaddr: Vec<i64>,
+    pub opt_codes: Vec<i64>,
+    pub opt_vals: Vec<Vec<i64>>,
+    pub ok: bool,
+}
+
+pub fn dhcp_msg_new(op: i64, xid: i64, mac: Vec<i64>) -> DhcpMsg {
+    return DhcpMsg { op: op, xid: xid, secs: 0, flags: 0, ciaddr: 0, yiaddr: 0, siaddr: 0, giaddr: 0, chaddr: mac, opt_codes: Vec::new(), opt_vals: Vec::new(), ok: true };
+}
+
+pub fn dhcp_opt_set(m: & mut DhcpMsg, code: i64, val: Vec<i64>) {
+    var i: i64 = 0;
+    while i < m.opt_codes.len() {
+        if m.opt_codes.get(i) == code {
+            m.opt_vals.set(i, val);
+            return;
+        }
+        i = i + 1;
+    }
+    m.opt_codes.push(code);
+    m.opt_vals.push(val);
+}
+
+pub fn dhcp_opt_u8(m: & mut DhcpMsg, code: i64, v: i64) {
+    var b: Vec<i64> = Vec::new();
+    b.push(v & 255);
+    dhcp_opt_set(m, code, b);
+}
+
+pub fn dhcp_opt_u32(m: & mut DhcpMsg, code: i64, v: i64) {
+    var b: Vec<i64> = Vec::new();
+    net_put32(&mut b, v);
+    dhcp_opt_set(m, code, b);
+}
+
+pub fn dhcp_opt_str(m: & mut DhcpMsg, code: i64, s: str) {
+    dhcp_opt_set(m, code, str_bytes(s));
+}
+
+/// Option value, empty when absent.
+pub fn dhcp_opt(m: & DhcpMsg, code: i64) -> Vec<i64> {
+    var i: i64 = 0;
+    while i < m.opt_codes.len() {
+        if m.opt_codes.get(i) == code {
+            return m.opt_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+pub fn dhcp_has(m: & DhcpMsg, code: i64) -> bool {
+    return m.opt_codes.contains(code);
+}
+
+/// First 4 bytes of an option as a 32-bit number, `missing` when absent.
+pub fn dhcp_opt_get_u32(m: & DhcpMsg, code: i64, missing: i64) -> i64 {
+    var v: Vec<i64> = dhcp_opt(m, code);
+    if v.len() < 4 {
+        return missing;
+    }
+    return net_be32(v, 0);
+}
+
+/// Addresses carried by an option (router, DNS lists).
+pub fn dhcp_opt_ips(m: & DhcpMsg, code: i64) -> Vec<i64> {
+    var v: Vec<i64> = dhcp_opt(m, code);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 4 <= v.len() {
+        out.push(net_be32(v, i));
+        i = i + 4;
+    }
+    return out;
+}
+
+pub fn dhcp_msg_type(m: & DhcpMsg) -> i64 {
+    var v: Vec<i64> = dhcp_opt(m, OPT_MSG_TYPE);
+    if v.len() < 1 {
+        return 0;
+    }
+    return v.get(0);
+}
+
+/// Wire bytes: 236-byte BOOTP header, cookie, options, END, padded to
+/// 300 bytes. Options longer than 255 bytes are split (RFC 3396).
+pub fn dhcp_encode(m: & DhcpMsg) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(m.op);
+    b.push(1);
+    b.push(6);
+    b.push(0);
+    net_put32(&mut b, m.xid);
+    net_put16(&mut b, m.secs);
+    net_put16(&mut b, m.flags);
+    net_put32(&mut b, m.ciaddr);
+    net_put32(&mut b, m.yiaddr);
+    net_put32(&mut b, m.siaddr);
+    net_put32(&mut b, m.giaddr);
+    var i: i64 = 0;
+    while i < 16 {
+        if i < m.chaddr.len() { b.push(m.chaddr.get(i)); } else { b.push(0); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < 192 {
+        b.push(0);
+        // sname and file
+        i = i + 1;
+    }
+    b.push(99);
+    b.push(130);
+    b.push(83);
+    b.push(99);
+    var k: i64 = 0;
+    while k < m.opt_codes.len() {
+        var v: Vec<i64> = m.opt_vals.get(k);
+        var off: i64 = 0;
+        var first: bool = true;
+        while first || off < v.len() {
+            first = false;
+            var n: i64 = v.len() - off;
+            if n > 255 { n = 255; }
+            b.push(m.opt_codes.get(k));
+            b.push(n);
+            var j: i64 = 0;
+            while j < n {
+                b.push(v.get(off + j));
+                j = j + 1;
+            }
+            off = off + n;
+        }
+        k = k + 1;
+    }
+    b.push(OPT_END);
+    while b.len() < 300 {
+        b.push(0);
+    }
+    return b;
+}
+
+/// Parse a message (ok = false when malformed or not DHCP). Repeated
+/// options are concatenated (RFC 3396).
+pub fn dhcp_decode(b: Vec<i64>) -> DhcpMsg {
+    var m: DhcpMsg = dhcp_msg_new(0, 0, Vec::new());
+    m.ok = false;
+    if b.len() < 240 || b.get(1) != 1 || b.get(2) != 6 {
+        return m;
+    }
+    if b.get(236) != 99 || b.get(237) != 130 || b.get(238) != 83 || b.get(239) != 99 {
+        return m;
+    }
+    m.op = b.get(0);
+    m.xid = net_be32(b, 4);
+    m.secs = net_be16(b, 8);
+    m.flags = net_be16(b, 10);
+    m.ciaddr = net_be32(b, 12);
+    m.yiaddr = net_be32(b, 16);
+    m.siaddr = net_be32(b, 20);
+    m.giaddr = net_be32(b, 24);
+    m.chaddr = net_slice(b, 28, 34);
+    var o: i64 = 240;
+    while o < b.len() {
+        var code: i64 = b.get(o);
+        if code == OPT_END {
+            m.ok = true;
+            return m;
+        }
+        if code == OPT_PAD {
+            o = o + 1;
+        } else {
+            if o + 1 >= b.len() || o + 2 + b.get(o + 1) > b.len() {
+                return m;
+            }
+            var n: i64 = b.get(o + 1);
+            var v: Vec<i64> = net_slice(b, o + 2, o + 2 + n);
+            var prev: Vec<i64> = dhcp_opt(&m, code);
+            if dhcp_has(&m, code) {
+                var j: i64 = 0;
+                while j < v.len() { prev.push(v.get(j)); j = j + 1; }
+                dhcp_opt_set(&mut m, code, prev);
+            } else {
+                dhcp_opt_set(&mut m, code, v);
+            }
+            o = o + 2 + n;
+        }
+    }
+    m.ok = true;
+    return m;
+}
+
+// ─── Client ─────────────────────────────────────────────────────────────
+
+pub const DHCPC_INIT: i64 = 0;
+pub const DHCPC_SELECTING: i64 = 1;
+pub const DHCPC_REQUESTING: i64 = 2;
+pub const DHCPC_BOUND: i64 = 3;
+pub const DHCPC_RENEWING: i64 = 4;
+pub const DHCPC_REBINDING: i64 = 5;
+
+pub fn dhcpc_state_name(s: i64) -> str {
+    if s == DHCPC_INIT { return "INIT"; }
+    if s == DHCPC_SELECTING { return "SELECTING"; }
+    if s == DHCPC_REQUESTING { return "REQUESTING"; }
+    if s == DHCPC_BOUND { return "BOUND"; }
+    if s == DHCPC_RENEWING { return "RENEWING"; }
+    return "REBINDING";
+}
+
+pub struct DhcpClient {
+    pub mac: Vec<i64>,
+    pub hostname: str,
+    pub state: i64,
+    pub xid: i64,
+    pub started: i64,
+    pub retry_at: i64,
+    pub backoff: i64,
+    pub offered: i64,
+    pub server: i64,
+    pub ip: i64,
+    pub mask: i64,
+    pub router: i64,
+    pub dns: Vec<i64>,
+    pub lease_s: i64,
+    pub bound_at: i64,
+    pub t1_at: i64,
+    pub t2_at: i64,
+    pub expire_at: i64,
+    pub out_dst: Vec<i64>,
+    pub out_msgs: Vec<Vec<i64>>,
+    pub log: Vec<str>,
+}
+
+pub fn dhcpc_new(mac: Vec<i64>, xid: i64, hostname: str) -> DhcpClient {
+    return DhcpClient {
+        mac: mac, hostname: hostname, state: DHCPC_INIT, xid: xid, started: 0, retry_at: -1, backoff: 4000, offered: 0, server: 0, ip: 0, mask: 0, router: 0, dns: Vec::new(), lease_s: 0, bound_at: 0, t1_at: -1, t2_at: -1, expire_at: -1, out_dst: Vec::new(), out_msgs: Vec::new(), log: Vec::new()
+    };
+}
+
+fn dhcpc_base(c: & DhcpClient, ty: i64, now: i64) -> DhcpMsg {
+    var m: DhcpMsg = dhcp_msg_new(1, c.xid, c.mac);
+    var secs: i64 = (now - c.started) / 1000;
+    if secs > 65535 { secs = 65535; }
+    m.secs = secs;
+    dhcp_opt_u8(&mut m, OPT_MSG_TYPE, ty);
+    var cid: Vec<i64> = Vec::new();
+    cid.push(1);
+    var i: i64 = 0;
+    while i < 6 { cid.push(c.mac.get(i)); i = i + 1; }
+    dhcp_opt_set(&mut m, OPT_CLIENT_ID, cid);
+    if str_len(c.hostname) > 0 {
+        dhcp_opt_str(&mut m, OPT_HOSTNAME, c.hostname);
+    }
+    if ty == DHCP_DISCOVER || ty == DHCP_REQUEST {
+        var pl: Vec<i64> = Vec::new();
+        pl.push(OPT_SUBNET);
+        pl.push(OPT_ROUTER);
+        pl.push(OPT_DNS);
+        pl.push(OPT_DOMAIN);
+        pl.push(OPT_LEASE);
+        pl.push(OPT_T1);
+        pl.push(OPT_T2);
+        dhcp_opt_set(&mut m, OPT_PARAM_LIST, pl);
+    }
+    return m;
+}
+
+fn dhcpc_out(c: & mut DhcpClient, dst: i64, m: DhcpMsg) {
+    c.out_dst.push(dst);
+    c.out_msgs.push(dhcp_encode(&m));
+    c.log.push("tx " + dhcp_type_name(dhcp_msg_type(&m)));
+}
+
+fn dhcpc_send_discover(c: & mut DhcpClient, now: i64) {
+    var m: DhcpMsg = dhcpc_base(c, DHCP_DISCOVER, now);
+    m.flags = 0x8000;
+    dhcpc_out(c, DHCP_BROADCAST, m);
+}
+
+fn dhcpc_send_request(c: & mut DhcpClient, now: i64) {
+    var m: DhcpMsg = dhcpc_base(c, DHCP_REQUEST, now);
+    if c.state == DHCPC_REQUESTING {
+        m.flags = 0x8000;
+        dhcp_opt_u32(&mut m, OPT_REQUESTED_IP, c.offered);
+        dhcp_opt_u32(&mut m, OPT_SERVER_ID, c.server);
+        dhcpc_out(c, DHCP_BROADCAST, m);
+        return;
+    }
+    // RENEWING: unicast to the server; REBINDING: broadcast, ciaddr set
+    m.ciaddr = c.ip;
+    if c.state == DHCPC_RENEWING {
+        dhcpc_out(c, c.server, m);
+    } else {
+        dhcpc_out(c, DHCP_BROADCAST, m);
+    }
+}
+
+/// Begin (or restart) acquisition: DISCOVER, then SELECTING.
+pub fn dhcpc_start(c: & mut DhcpClient, now: i64) {
+    c.state = DHCPC_SELECTING;
+    c.started = now;
+    c.xid = (c.xid * 1103515245 + 12345) & 0x7FFFFFFF;
+    c.backoff = 4000;
+    c.ip = 0;
+    c.retry_at = now + c.backoff;
+    dhcpc_send_discover(c, now);
+}
+
+/// Handle a message from a server.
+pub fn dhcpc_input(c: & mut DhcpClient, bytes: Vec<i64>, now: i64) {
+    var m: DhcpMsg = dhcp_decode(bytes);
+    if !m.ok || m.op != 2 || m.xid != c.xid {
+        return;
+    }
+    var i: i64 = 0;
+    while i < 6 {
+        if m.chaddr.get(i) != c.mac.get(i) {
+            return;
+        }
+        i = i + 1;
+    }
+    var ty: i64 = dhcp_msg_type(&m);
+    c.log.push("rx " + dhcp_type_name(ty));
+    if ty == DHCP_OFFER && c.state == DHCPC_SELECTING {
+        c.offered = m.yiaddr;
+        c.server = dhcp_opt_get_u32(&m, OPT_SERVER_ID, m.siaddr);
+        c.state = DHCPC_REQUESTING;
+        c.backoff = 4000;
+        c.retry_at = now + c.backoff;
+        dhcpc_send_request(c, now);
+        return;
+    }
+    var asking: bool = c.state == DHCPC_REQUESTING || c.state == DHCPC_RENEWING || c.state == DHCPC_REBINDING;
+    if ty == DHCP_ACK && asking {
+        c.ip = m.yiaddr;
+        c.mask = dhcp_opt_get_u32(&m, OPT_SUBNET, 0);
+        var r: Vec<i64> = dhcp_opt_ips(&m, OPT_ROUTER);
+        if r.len() > 0 { c.router = r.get(0); }
+        c.dns = dhcp_opt_ips(&m, OPT_DNS);
+        c.server = dhcp_opt_get_u32(&m, OPT_SERVER_ID, c.server);
+        c.lease_s = dhcp_opt_get_u32(&m, OPT_LEASE, 0);
+        var t1: i64 = dhcp_opt_get_u32(&m, OPT_T1, c.lease_s / 2);
+        var t2: i64 = dhcp_opt_get_u32(&m, OPT_T2, c.lease_s * 7 / 8);
+        c.bound_at = now;
+        c.t1_at = now + t1 * 1000;
+        c.t2_at = now + t2 * 1000;
+        c.expire_at = now + c.lease_s * 1000;
+        c.retry_at = -1;
+        c.state = DHCPC_BOUND;
+        return;
+    }
+    if ty == DHCP_NAK && asking {
+        c.ip = 0;
+        c.state = DHCPC_INIT;
+        dhcpc_start(c, now);
+    }
+}
+
+/// Timers: retransmissions with backoff, T1 -> RENEWING, T2 ->
+/// REBINDING, lease end -> back to INIT and a new DISCOVER.
+pub fn dhcpc_tick(c: & mut DhcpClient, now: i64) {
+    if c.state == DHCPC_BOUND || c.state == DHCPC_RENEWING || c.state == DHCPC_REBINDING {
+        if now >= c.expire_at {
+            c.log.push("lease expired");
+            dhcpc_start(c, now);
+            return;
+        }
+        if c.state != DHCPC_REBINDING && now >= c.t2_at {
+            c.state = DHCPC_REBINDING;
+            c.retry_at = -1;
+        }
+        if c.state == DHCPC_BOUND && now >= c.t1_at {
+            c.state = DHCPC_RENEWING;
+            c.retry_at = -1;
+        }
+        if (c.state == DHCPC_RENEWING || c.state == DHCPC_REBINDING) && (c.retry_at < 0 || now >= c.retry_at) {
+            dhcpc_send_request(c, now);
+            // RFC 2131 4.4.5: half the time to T2 (or expiry), at least 60 s
+            var until: i64 = c.t2_at;
+            if c.state == DHCPC_REBINDING { until = c.expire_at; }
+            var wait: i64 = (until - now) / 2;
+            if wait < 60000 { wait = 60000; }
+            c.retry_at = now + wait;
+        }
+        return;
+    }
+    if (c.state == DHCPC_SELECTING || c.state == DHCPC_REQUESTING) && c.retry_at >= 0 && now >= c.retry_at {
+        c.backoff = c.backoff * 2;
+        if c.backoff > 64000 { c.backoff = 64000; }
+        c.retry_at = now + c.backoff;
+        if c.state == DHCPC_SELECTING {
+            dhcpc_send_discover(c, now);
+        } else {
+            dhcpc_send_request(c, now);
+        }
+    }
+}
+
+/// Give the address back (unicast RELEASE) and return to INIT.
+pub fn dhcpc_release(c: & mut DhcpClient, now: i64) {
+    if c.ip == 0 {
+        return;
+    }
+    var m: DhcpMsg = dhcpc_base(c, DHCP_RELEASE, now);
+    m.ciaddr = c.ip;
+    dhcp_opt_u32(&mut m, OPT_SERVER_ID, c.server);
+    dhcpc_out(c, c.server, m);
+    c.ip = 0;
+    c.state = DHCPC_INIT;
+    c.retry_at = -1;
+}
+
+/// Refuse the offered/acked address (e.g. ARP showed it in use), restart.
+pub fn dhcpc_decline(c: & mut DhcpClient, now: i64) {
+    var m: DhcpMsg = dhcpc_base(c, DHCP_DECLINE, now);
+    dhcp_opt_u32(&mut m, OPT_REQUESTED_IP, c.ip);
+    dhcp_opt_u32(&mut m, OPT_SERVER_ID, c.server);
+    dhcpc_out(c, DHCP_BROADCAST, m);
+    dhcpc_start(c, now);
+}
+
+// ─── Server ─────────────────────────────────────────────────────────────
+
+pub struct DhcpLease {
+    pub mac: Vec<i64>,
+    pub ip: i64,
+    pub expires: i64,
+    pub bound: bool,
+    // false: only offered
+    pub declined: bool,
+}
+
+pub struct DhcpServer {
+    pub ip: i64,
+    pub mask: i64,
+    pub router: i64,
+    pub dns: Vec<i64>,
+    pub domain: str,
+    pub pool_start: i64,
+    pub pool_end: i64,
+    pub lease_s: i64,
+    pub offer_hold: i64,
+    pub leases: Vec<DhcpLease>,
+    pub log: Vec<str>,
+}
+
+pub fn dhcps_new(ip: i64, mask: i64, pool_start: i64, pool_end: i64, lease_s: i64) -> DhcpServer {
+    return DhcpServer { ip: ip, mask: mask, router: ip, dns: Vec::new(), domain: "", pool_start: pool_start, pool_end: pool_end, lease_s: lease_s, offer_hold: 60000, leases: Vec::new(), log: Vec::new() };
+}
+
+fn dhcps_mac_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < 6 {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dhcps_find_mac(s: & DhcpServer, mac: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < s.leases.len() {
+        var l: DhcpLease = s.leases.get(i);
+        if !l.declined && dhcps_mac_eq(l.mac, mac) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Lease holding ip that is still live (or declined), -1.
+fn dhcps_find_ip(s: & DhcpServer, ip: i64, now: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.leases.len() {
+        var l: DhcpLease = s.leases.get(i);
+        if l.ip == ip && (l.declined || l.expires > now) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn dhcps_in_pool(s: & DhcpServer, ip: i64) -> bool {
+    return ip >= s.pool_start && ip <= s.pool_end;
+}
+
+/// Address to offer a client: its current lease, the requested address
+/// if free, else the lowest free one; -1 when the pool is exhausted.
+fn dhcps_pick(s: & DhcpServer, mac: Vec<i64>, requested: i64, now: i64) -> i64 {
+    var li: i64 = dhcps_find_mac(s, mac);
+    if li >= 0 {
+        return s.leases.get(li).ip;
+    }
+    if requested > 0 && dhcps_in_pool(s, requested) && dhcps_find_ip(s, requested, now) < 0 {
+        return requested;
+    }
+    var ip: i64 = s.pool_start;
+    while ip <= s.pool_end {
+        if dhcps_find_ip(s, ip, now) < 0 {
+            return ip;
+        }
+        ip = ip + 1;
+    }
+    return -1;
+}
+
+fn dhcps_record(s: & mut DhcpServer, mac: Vec<i64>, ip: i64, expires: i64, bound: bool) {
+    var li: i64 = dhcps_find_mac(s, mac);
+    if li < 0 {
+        // drop a stale lease of that address first
+        var i: i64 = 0;
+        while i < s.leases.len() {
+            if s.leases.get(i).ip == ip && !s.leases.get(i).declined {
+                s.leases.remove(i);
+            } else {
+                i = i + 1;
+            }
+        }
+        s.leases.push(DhcpLease { mac: mac, ip: ip, expires: expires, bound: bound, declined: false });
+        return;
+    }
+    var l: DhcpLease = s.leases.get(li);
+    l.ip = ip;
+    l.expires = expires;
+    l.bound = bound;
+    s.leases.set(li, l);
+}
+
+fn dhcps_reply(s: & DhcpServer, req: & DhcpMsg, ty: i64, yiaddr: i64) -> DhcpMsg {
+    var r: DhcpMsg = dhcp_msg_new(2, req.xid, req.chaddr);
+    r.flags = req.flags;
+    r.giaddr = req.giaddr;
+    r.ciaddr = req.ciaddr;
+    r.yiaddr = yiaddr;
+    dhcp_opt_u8(&mut r, OPT_MSG_TYPE, ty);
+    dhcp_opt_u32(&mut r, OPT_SERVER_ID, s.ip);
+    if ty == DHCP_NAK {
+        r.yiaddr = 0;
+        r.ciaddr = 0;
+        return r;
+    }
+    r.siaddr = s.ip;
+    dhcp_opt_u32(&mut r, OPT_LEASE, s.lease_s);
+    dhcp_opt_u32(&mut r, OPT_T1, s.lease_s / 2);
+    dhcp_opt_u32(&mut r, OPT_T2, s.lease_s * 7 / 8);
+    dhcp_opt_u32(&mut r, OPT_SUBNET, s.mask);
+    dhcp_opt_u32(&mut r, OPT_ROUTER, s.router);
+    if s.dns.len() > 0 {
+        var d: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < s.dns.len() { net_put32(&mut d, s.dns.get(i)); i = i + 1; }
+        dhcp_opt_set(&mut r, OPT_DNS, d);
+    }
+    if str_len(s.domain) > 0 {
+        dhcp_opt_str(&mut r, OPT_DOMAIN, s.domain);
+    }
+    return r;
+}
+
+pub struct DhcpOut {
+    pub dst: i64,
+    // 0 when there is nothing to send
+    pub bytes: Vec<i64>,
+}
+
+fn dhcps_out(s: & mut DhcpServer, r: DhcpMsg) -> DhcpOut {
+    s.log.push(dhcp_type_name(dhcp_msg_type(&r)) + " " + ip_str(r.yiaddr));
+    var dst: i64 = DHCP_BROADCAST;
+    if r.giaddr != 0 {
+        dst = r.giaddr;
+    } else {
+        if dhcp_msg_type(&r) != DHCP_NAK && r.ciaddr != 0 {
+            dst = r.ciaddr;
+        }
+    }
+    return DhcpOut { dst: dst, bytes: dhcp_encode(&r) };
+}
+
+/// Handle one client message; the reply to send (dst 0: none).
+pub fn dhcps_handle(s: & mut DhcpServer, bytes: Vec<i64>, now: i64) -> DhcpOut {
+    var none: DhcpOut = DhcpOut { dst: 0, bytes: Vec::new() };
+    var m: DhcpMsg = dhcp_decode(bytes);
+    if !m.ok || m.op != 1 {
+        return none;
+    }
+    var ty: i64 = dhcp_msg_type(&m);
+    var requested: i64 = dhcp_opt_get_u32(&m, OPT_REQUESTED_IP, 0);
+    var sid: i64 = dhcp_opt_get_u32(&m, OPT_SERVER_ID, 0);
+    if ty == DHCP_DISCOVER {
+        var ip: i64 = dhcps_pick(s, m.chaddr, requested, now);
+        if ip < 0 {
+            s.log.push("pool exhausted");
+            return none;
+        }
+        var li: i64 = dhcps_find_mac(s, m.chaddr);
+        var keep_bound: bool = li >= 0 && s.leases.get(li).bound && s.leases.get(li).expires > now;
+        if !keep_bound {
+            dhcps_record(s, m.chaddr, ip, now + s.offer_hold, false);
+        }
+        return dhcps_out(s, dhcps_reply(s, &m, DHCP_OFFER, ip));
+    }
+    if ty == DHCP_REQUEST {
+        if sid != 0 && sid != s.ip {
+            // the client chose another server: drop our offer
+            var lo: i64 = dhcps_find_mac(s, m.chaddr);
+            if lo >= 0 && !s.leases.get(lo).bound { s.leases.remove(lo); }
+            return none;
+        }
+        var want: i64 = requested;
+        if want == 0 { want = m.ciaddr; }
+        var holder: i64 = dhcps_find_ip(s, want, now);
+        var mine: bool = holder >= 0 && dhcps_mac_eq(s.leases.get(holder).mac, m.chaddr) && !s.leases.get(holder).declined;
+        var free: bool = holder < 0 && dhcps_in_pool(s, want);
+        if want == 0 || (!mine && !free) || (sid == 0 && !mine && m.ciaddr != 0) {
+            return dhcps_out(s, dhcps_reply(s, &m, DHCP_NAK, 0));
+        }
+        dhcps_record(s, m.chaddr, want, now + s.lease_s * 1000, true);
+        return dhcps_out(s, dhcps_reply(s, &m, DHCP_ACK, want));
+    }
+    if ty == DHCP_RELEASE {
+        var lr: i64 = dhcps_find_mac(s, m.chaddr);
+        if lr >= 0 && s.leases.get(lr).ip == m.ciaddr {
+            s.leases.remove(lr);
+            s.log.push("released " + ip_str(m.ciaddr));
+        }
+        return none;
+    }
+    if ty == DHCP_DECLINE {
+        var ld: i64 = dhcps_find_mac(s, m.chaddr);
+        if ld >= 0 {
+            s.leases.remove(ld);
+        }
+        s.leases.push(DhcpLease { mac: Vec::filled(6, 0), ip: requested, expires: now + 3600000, bound: false, declined: true });
+        s.log.push("declined " + ip_str(requested));
+        return none;
+    }
+    return none;
+}
+
+/// Leases bound and not expired.
+pub fn dhcps_active(s: & DhcpServer, now: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < s.leases.len() {
+        var l: DhcpLease = s.leases.get(i);
+        if l.bound && !l.declined && l.expires > now { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ─── Glue to stdlib tcpip ───────────────────────────────────────────────
+
+/// Client side: feed datagrams from the port-68 socket, run the timers,
+/// send what the client queued.
+pub fn dhcpc_poll(c: & mut DhcpClient, net: & mut NetStack, sock: i64, now: i64) {
+    var d: UdpDatagram = udp_recv(net, sock);
+    while d.ok {
+        if d.sport == DHCP_SERVER_PORT {
+            dhcpc_input(c, d.data, now);
+        }
+        d = udp_recv(net, sock);
+    }
+    dhcpc_tick(c, now);
+    var i: i64 = 0;
+    while i < c.out_msgs.len() {
+        udp_sendto(net, sock, c.out_dst.get(i), DHCP_SERVER_PORT, c.out_msgs.get(i));
+        i = i + 1;
+    }
+    c.out_dst = Vec::new();
+    c.out_msgs = Vec::new();
+}
+
+/// Server side: answer every queued request on the port-67 socket.
+pub fn dhcps_poll(s: & mut DhcpServer, net: & mut NetStack, sock: i64, now: i64) {
+    var d: UdpDatagram = udp_recv(net, sock);
+    while d.ok {
+        var r: DhcpOut = dhcps_handle(s, d.data, now);
+        if r.dst != 0 {
+            udp_sendto(net, sock, r.dst, DHCP_CLIENT_PORT, r.bytes);
+        }
+        d = udp_recv(net, sock);
+    }
+}
+
+/// Configure a stack with the client's lease (address 0 when unbound).
+pub fn dhcpc_apply(c: & DhcpClient, net: & mut NetStack) {
+    net.ip = c.ip;
+    net.mask = c.mask;
+    net.gw = c.router;
+}

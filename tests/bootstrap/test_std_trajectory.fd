@@ -1,0 +1,127 @@
+// stdlib/trajectory: cubic and quintic polynomials (closed-form values), natural and clamped cubic splines (checked against scipy CubicSpline), trapezoidal and triangular profiles, jerk-limited S-curves (long and short moves) and time sampling
+// Expected output:
+// cubic p(1)=0.500000 v(1)=0.750000 a(0)=1.500000 end p=1.000000 v=0.000000
+// quintic p(0.5)=0.500000 v(0.5)=1.875000 a(0.25)=5.625000 jerk(0)=60.000000
+// quintic boundary a(0)=0.000000 a(1)=0.000000 v(1)=0.000000
+// natural 0.725352 1.150235 -1.802817 | -0.009390 -0.821596 2.366197 | ends v 1.600939 2.446009
+// clamped 0.487179 1.474359 0.102564 | -0.170940 -0.923077 3.538462 | ends v 0.000000 0.000000
+// spline passes the knots: true
+// trapezoid ta=2.000 tv=3.000 total=7.000 p(1)=0.500 p(3.5)=5.000 v(6)=1.000 p(7)=10.000
+// triangle vpeak=1.000 total=2.000 p(1)=0.500
+// reverse p(1)=9.500 v(1)=-1.000
+// scurve tj=0.500 ta=2.500 tv=2.500 total=7.500 vpeak=2.000 apeak=1.000
+// scurve v(2.5)=2.000 p(3.75)=5.000 p(7.5)=10.000
+// scurve samples 751 within limits: true monotone: true
+// short scurve vpeak=0.271442 apeak=0.736806 total=1.473613 end p=0.200000
+// short end by integration error < 1e-12: true
+// samples of the quintic every 0.3: 5 last t=1.000
+use math;
+use trajectory;
+
+fn f(x: f64, d: i64) -> str {
+    val neg: bool = x < 0.0;
+    var p: f64 = 1.0;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10.0;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if neg {
+        ax = 0.0 - x;
+    }
+    val v: i64 = math_floor(ax * p + 0.5) as i64;
+    val ip: i64 = p as i64;
+    var frac: str = int_to_str(v % ip);
+    while str_len(frac) < d {
+        frac = "0" + frac;
+    }
+    var s: str = int_to_str(v / ip) + "." + frac;
+    if neg && v != 0 {
+        s = "-" + s;
+    }
+    return s;
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    val c: TrajPoly = traj_cubic(0.0, 0.0, 1.0, 0.0, 2.0);
+    val c1: TrajState = traj_poly_eval(&c, 1.0);
+    val ce: TrajState = traj_poly_eval(&c, 2.0);
+    println("cubic p(1)=" + f(c1.p, 6) + " v(1)=" + f(c1.v, 6) + " a(0)=" + f(traj_poly_eval(&c, 0.0).a, 6) + " end p=" + f(ce.p, 6) + " v=" + f(ce.v, 6));
+    val q: TrajPoly = traj_quintic(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+    println("quintic p(0.5)=" + f(traj_poly_eval(&q, 0.5).p, 6) + " v(0.5)=" + f(traj_poly_eval(&q, 0.5).v, 6) + " a(0.25)=" + f(traj_poly_eval(&q, 0.25).a, 6) + " jerk(0)=" + f(traj_poly_jerk(&q, 0.0), 6));
+    println("quintic boundary a(0)=" + f(traj_poly_eval(&q, 0.0).a, 6) + " a(1)=" + f(traj_poly_eval(&q, 1.0).a, 6) + " v(1)=" + f(traj_poly_eval(&q, 1.0).v, 6));
+
+    var ts: Vec<f64> = Vec::new();
+    ts.push(0.0);
+    ts.push(1.0);
+    ts.push(2.5);
+    ts.push(3.0);
+    var ys: Vec<f64> = Vec::new();
+    ys.push(0.0);
+    ys.push(1.0);
+    ys.push(0.0);
+    ys.push(1.0);
+    val ns: TrajSpline = traj_spline_natural(&ts, &ys);
+    val a: TrajState = traj_spline_eval(&ns, 0.5);
+    val b: TrajState = traj_spline_eval(&ns, 2.0);
+    println("natural " + f(a.p, 6) + " " + f(a.v, 6) + " " + f(a.a, 6) + " | " + f(b.p, 6) + " " + f(b.v, 6) + " " + f(b.a, 6) + " | ends v " + f(traj_spline_eval(&ns, 0.0).v, 6) + " " + f(traj_spline_eval(&ns, 3.0).v, 6));
+    val cs: TrajSpline = traj_spline_clamped(&ts, &ys, 0.0, 0.0);
+    val a2: TrajState = traj_spline_eval(&cs, 0.5);
+    val b2: TrajState = traj_spline_eval(&cs, 2.0);
+    println("clamped " + f(a2.p, 6) + " " + f(a2.v, 6) + " " + f(a2.a, 6) + " | " + f(b2.p, 6) + " " + f(b2.v, 6) + " " + f(b2.a, 6) + " | ends v " + f(traj_spline_eval(&cs, 0.0).v, 6) + " " + f(traj_spline_eval(&cs, 3.0).v, 6));
+    var knots: bool = true;
+    var i: i64 = 0;
+    while i < 4 {
+        if math_fabs(traj_spline_eval(&ns, ts.get(i)).p - ys.get(i)) > 0.000000000001 || math_fabs(traj_spline_eval(&cs, ts.get(i)).p - ys.get(i)) > 0.000000000001 {
+            knots = false;
+        }
+        i = i + 1;
+    }
+    println("spline passes the knots: " + yes(knots));
+
+    val tr: TrajTrapezoid = traj_trapezoid(0.0, 10.0, 2.0, 1.0);
+    println("trapezoid ta=" + f(tr.ta, 3) + " tv=" + f(tr.tv, 3) + " total=" + f(tr.total, 3) + " p(1)=" + f(traj_trapezoid_eval(&tr, 1.0).p, 3) + " p(3.5)=" + f(traj_trapezoid_eval(&tr, 3.5).p, 3) + " v(6)=" + f(traj_trapezoid_eval(&tr, 6.0).v, 3) + " p(7)=" + f(traj_trapezoid_eval(&tr, 7.0).p, 3));
+    val tri: TrajTrapezoid = traj_trapezoid(0.0, 1.0, 2.0, 1.0);
+    println("triangle vpeak=" + f(tri.vpeak, 3) + " total=" + f(tri.total, 3) + " p(1)=" + f(traj_trapezoid_eval(&tri, 1.0).p, 3));
+    val rev: TrajTrapezoid = traj_trapezoid(10.0, 0.0, 2.0, 1.0);
+    println("reverse p(1)=" + f(traj_trapezoid_eval(&rev, 1.0).p, 3) + " v(1)=" + f(traj_trapezoid_eval(&rev, 1.0).v, 3));
+
+    val s: TrajSCurve = traj_scurve(0.0, 10.0, 2.0, 1.0, 2.0);
+    println("scurve tj=" + f(s.tj, 3) + " ta=" + f(s.ta, 3) + " tv=" + f(s.tv, 3) + " total=" + f(s.total, 3) + " vpeak=" + f(s.vpeak, 3) + " apeak=" + f(s.apeak, 3));
+    println("scurve v(2.5)=" + f(traj_scurve_eval(&s, 2.5).v, 3) + " p(3.75)=" + f(traj_scurve_eval(&s, 3.75).p, 3) + " p(7.5)=" + f(traj_scurve_eval(&s, 7.5).p, 3));
+    val pts: Vec<TrajState> = traj_sample_scurve(&s, 0.01);
+    var lim: bool = true;
+    var mono: bool = true;
+    i = 0;
+    while i < pts.len() {
+        val st: TrajState = pts.get(i);
+        if math_fabs(st.v) > 2.0 + 0.000000001 || math_fabs(st.a) > 1.0 + 0.000000001 {
+            lim = false;
+        }
+        if i > 0 && st.p < pts.get(i - 1).p - 0.000000000001 {
+            mono = false;
+        }
+        // jerk between samples stays within jmax
+        if i > 0 && math_fabs(st.a - pts.get(i - 1).a) > 2.0 * 0.01 + 0.000000001 {
+            lim = false;
+        }
+        i = i + 1;
+    }
+    println("scurve samples " + int_to_str(pts.len()) + " within limits: " + yes(lim) + " monotone: " + yes(mono));
+    val sh: TrajSCurve = traj_scurve(0.0, 0.2, 2.0, 1.0, 2.0);
+    println("short scurve vpeak=" + f(sh.vpeak, 6) + " apeak=" + f(sh.apeak, 6) + " total=" + f(sh.total, 6) + " end p=" + f(traj_scurve_eval(&sh, sh.total).p, 6));
+    // integrate to just before the end: the closed form lands on the target
+    val near: TrajState = traj_scurve_eval(&sh, sh.total - 0.0000000001);
+    println("short end by integration error < 1e-12: " + yes(math_fabs(near.p - 0.2) < 0.000000000001));
+    val qs: Vec<TrajState> = traj_sample_poly(&q, 0.3);
+    println("samples of the quintic every 0.3: " + int_to_str(qs.len()) + " last t=" + f(qs.get(qs.len() - 1).t, 3));
+    return 0;
+}

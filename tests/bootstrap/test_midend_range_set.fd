@@ -1,0 +1,104 @@
+// LF8 (llvm-roadmap, Nov 17): the range set. Each block carries several
+// range facts (compiler/checks.fd: PeirRanges.sf_*, peir_sf_inherit,
+// peir_join_set, peir_xs_save), so a branch's fact no longer replaces the
+// ones before it, a join keeps every fact all its ways in share (the hull
+// of their intervals), a store `y = 3` bounds y until the next store to
+// it, and a loop header holds several assumed facts (PeirBackFacts.m_*).
+// FID_IROPT_OFF=rangeset turns it off; the program prints the same.
+//
+// In `hull`, each way into the last block bounds i on both sides, but by
+// two branches each (i >= 0 then i <= 1000; i >= 10 then i <= 20): with
+// one fact per block the join kept only i <= 1000, so `i * 10^15` kept
+// its check; with the set i is in [0, 1000] there and the check goes.
+// In `pick`, y is 3 or 5 after the if (the stores' facts meet at the
+// join), although a later `y = big` makes its bounds over all stores say
+// nothing: `y * 10^12` loses its check.
+// In `walk2`, the loop header holds facts on both x (in [0, 52]) and y
+// (in [1, 73]); one fact per header covered only x, so `y * 100000` kept
+// its check.
+// test_midend_range_set_fail.fd and test_midend_range_set_loop_fail.fd:
+// the same with one way in unbounded / a large store in the loop: the
+// check stays, and it fires.
+//
+// Expected output:
+// 7000000000000000
+// 15000000000000000
+// 0
+// 1
+// 3000000000002
+// 4999999999998
+// 164700000
+// 42045
+// 18900000
+// 26029
+
+fn hull(i: i64, flag: bool) -> i64 {
+    if flag {
+        if i < 0 {
+            return 0;
+        }
+        if i > 1000 {
+            return 0;
+        }
+    } else {
+        if i < 10 {
+            return 1;
+        }
+        if i > 20 {
+            return 1;
+        }
+    }
+    // both ways in: i in [0, 1000]
+    return i * 1000000000000000;
+}
+
+fn pick(flag: bool, big: i64) -> i64 {
+    var y: i64 = 0;
+    if flag {
+        y = 3;
+    } else {
+        y = 5;
+    }
+    // y in [3, 5] here
+    var r: i64 = y * 1000000000000;
+    y = big;
+    return r + y % 7;
+}
+
+fn walk2(n: i64) -> i64 {
+    var x: i64 = 5;
+    var y: i64 = 1;
+    var s: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        s = s + x * 100000 + y * 100000;
+        if x < 50 {
+            x = x + 3;
+        } else {
+            x = 0;
+        }
+        if y < 70 {
+            y = y + 4;
+        } else {
+            y = 1;
+        }
+        k = k + 1;
+    }
+    var lx: i64 = x;
+    var ly: i64 = y;
+    x = s;
+    y = s;
+    println(x);
+    return lx * 1000 + ly;
+}
+
+fn main() {
+    println(hull(7, true));
+    println(hull(15, false));
+    println(hull(2000, true));
+    println(hull(25, false));
+    println(pick(true, 100));
+    println(pick(false, - 9));
+    println(walk2(30));
+    println(walk2(7));
+}

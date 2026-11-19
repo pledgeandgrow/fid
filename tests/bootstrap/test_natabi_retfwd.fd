@@ -1,0 +1,225 @@
+// test_natabi_retfwd.fd — competitive OP12, llvm ME27 / LF24: the caller's
+// half of small structs returned in registers. On the machine layer
+// (compiler/nat_ir.fd ng_rr_plan) a function returning a struct of one or
+// two words comes back in two registers; ng_rf_promote then keeps the
+// caller's result slot, and the locals it is copied to, in vregs: the two
+// result registers are moved, not stored, fields are read from the vregs
+// (a narrow field with a shift and an extension), field stores are masked
+// inserts. A local whose address goes anywhere else (passed by reference,
+// pushed into a Vec) stays in memory. The results do not change: every
+// backend prints the same, and `FID_NAT_OFF=retfwd` (or `retregs`) builds
+// the old code natively to compare (tests/nattools/machine_retfwd_check.sh).
+//
+// Expected output:
+// 7
+// 12 true 7
+// 2 false 7
+// 12 false 9
+// 6 12
+// found 2
+// none
+// ok 7
+// error: division by zero
+// 100
+// 15 true
+// 16 false
+// -6 false
+// 4 3
+// 30 40
+// big
+// 1 2 3 4
+// 11 22
+// 5
+// 21
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+struct Mixed {
+    n: i64,
+    flag: bool,
+    c: i32,
+}
+
+struct One {
+    v: i64,
+}
+
+struct Small {
+    lo: u8,
+    mid: i16,
+    hi: i32,
+}
+
+fn make_pair(a: i64, b: i64) -> Pair {
+    return Pair { a: a, b: b };
+}
+
+fn mixed(n: i64) -> Mixed {
+    return Mixed { n: n * 2, flag: n > 3, c: 7 };
+}
+
+fn one(v: i64) -> One {
+    return One { v: v * 10 };
+}
+
+struct Tagged {
+    v: i64,
+    ok: bool,
+}
+
+fn tagged(v: i64) -> Tagged {
+    return Tagged { v: v * 3, ok: v > 0 };
+}
+
+fn step(a: i64, b: i64, i: i64) -> Pair {
+    return Pair { a: a + i, b: b + i * 2 };
+}
+
+fn find(xs: Vec<i64>, x: i64) -> Option<i64> {
+    var i: i64 = 0;
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn safe_div(a: i64, b: i64) -> Result<i64, str> {
+    if b == 0 {
+        return Result::Err("division by zero");
+    }
+    return Result::Ok(a / b);
+}
+
+fn small(k: i64) -> Small {
+    return Small { lo: (k + 1) as u8, mid: (0 - k) as i16, hi: (k * 1000) as i32 };
+}
+
+fn flag_text(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn show_pair(p: & Pair) {
+    println(int_to_str(p.a) + " " + int_to_str(p.b));
+}
+
+fn noise(x: i64) -> i64 {
+    // a call between the result and its use (the words must live across it)
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < x {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    // the result slot copied to a local, both read from vregs
+    val p: Pair = make_pair(3, 4);
+    println(p.a + p.b);
+    // narrow fields in the second word
+    val m: Mixed = mixed(6);
+    println(int_to_str(m.n) + " " + flag_text(m.flag) + " " + int_to_str(m.c as i64));
+    val m2: Mixed = mixed(1);
+    println(int_to_str(m2.n) + " " + flag_text(m2.flag) + " " + int_to_str(m2.c as i64));
+    // field stores into the kept words (masked inserts)
+    var m3: Mixed = mixed(6);
+    m3.flag = false;
+    m3.c = 9;
+    println(int_to_str(m3.n) + " " + flag_text(m3.flag) + " " + int_to_str(m3.c as i64));
+    // a loop: each iteration's result copied over the local
+    var acc: Pair = make_pair(0, 0);
+    var i: i64 = 1;
+    while i <= 3 {
+        acc = step(acc.a, acc.b, i);
+        i = i + 1;
+    }
+    println(int_to_str(acc.a) + " " + int_to_str(acc.b));
+    // Option and Result matched where they come back
+    var xs: Vec<i64> = Vec::new();
+    xs.push(5);
+    xs.push(6);
+    xs.push(7);
+    match find(xs, 7) {
+        Option::Some(ix: i64) => {
+            println("found " + int_to_str(ix));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    match find(xs, 9) {
+        Option::Some(ix2: i64) => {
+            println("found " + int_to_str(ix2));
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    match safe_div(21, 3) {
+        Result::Ok(v: i64) => {
+            println("ok " + int_to_str(v));
+        }
+        Result::Err(e: str) => {
+            println("error: " + e);
+        }
+    }
+    match safe_div(1, 0) {
+        Result::Ok(v2: i64) => {
+            println("ok " + int_to_str(v2));
+        }
+        Result::Err(e2: str) => {
+            println("error: " + e2);
+        }
+    }
+    // one word
+    val o: One = one(10);
+    println(o.v);
+    // a byte in the second word (two words: in registers), changed in place
+    var tg: Tagged = tagged(5);
+    println(int_to_str(tg.v) + " " + flag_text(tg.ok));
+    tg.ok = false;
+    tg.v = tg.v + 1;
+    println(int_to_str(tg.v) + " " + flag_text(tg.ok));
+    val tg2: Tagged = tagged(0 - 2);
+    println(int_to_str(tg2.v) + " " + flag_text(tg2.ok));
+    // a local passed by reference stays in memory (and is still right)
+    val q: Pair = make_pair(4, 3);
+    show_pair(& q);
+    // a call between the result and its reads
+    val r: Pair = make_pair(30, 40);
+    val z: i64 = noise(10);
+    println(int_to_str(r.a + z - 45) + " " + int_to_str(r.b));
+    // fields read in other blocks
+    val t: Pair = make_pair(100, 1);
+    if t.a > 50 {
+        println("big");
+    } else {
+        println(int_to_str(t.b));
+    }
+    // three narrow fields in one word (u8, i16, i32: zero and sign
+    // extension)
+    val sm: Small = small(3);
+    val sm_mid: i64 = sm.mid as i64;
+    println(int_to_str(sm.lo as i64 - 3) + " " + int_to_str(0 - sm_mid - 1) + " " + int_to_str(sm.hi as i64 / 1000) + " " + int_to_str(sm.lo as i64));
+    // copies between two kept locals
+    var u: Pair = make_pair(11, 22);
+    val w: Pair = u;
+    u.a = 99;
+    println(int_to_str(w.a) + " " + int_to_str(w.b));
+    // the result read once, without a local
+    println(make_pair(2, 3).a + make_pair(2, 3).b);
+    // the result into a field of a struct held in memory
+    var ps: Vec<Pair> = Vec::new();
+    ps.push(make_pair(20, 1));
+    println(ps.get(0).a + ps.get(0).b);
+}

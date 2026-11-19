@@ -1,0 +1,180 @@
+// stdlib/http2 (competitive SL1): the h2c Upgrade of RFC 7540 section 3.2,
+// server side, driven by hand (no socket). HTTP2-Settings is base64url
+// (RFC 4648 section 5, the section 10 vectors); a request asking for the
+// Upgrade gets "101 Switching Protocols" and the server's SETTINGS, its
+// HTTP2-Settings are applied without an ACK, and it becomes stream 1,
+// answered over HTTP/2 once the client's SETTINGS come. Requests that ask
+// wrongly are refused with nothing sent (the server then answers over
+// HTTP/1.1, h2_h1_response). The client side (http2_get_upgrade) is
+// checked live in tests/net/http2_live.fd.
+//
+// Expected output:
+// base64url: [] [Zg] [Zm8] [Zm9v] [Zm9vYg] [Zm9vYmE] [Zm9vYmFy] [-_8]
+// decode: true foobar, padded true foo, bad char false, length 5 false
+// HTTP2-Settings: AAMAAABkAAQAEAAAAAYAAQAAAAIAAAAA
+// settings round trip: true
+// upgraded: true
+// sent first: HTTP/1.1 101 Switching Protocols | Connection: Upgrade | Upgrade: h2c
+// then: SETTINGS stream 0 flags 0 length 18 [3=100] [4=1048576] [6=65536]
+// then: WINDOW_UPDATE stream 0 flags 0 length 4: +16711681
+// stream 1 waiting: state 3, peer window 1048576
+// after the client's SETTINGS: ack
+// stream 1: HEADERS :status=200
+// stream 1: DATA "GET /up?x=1 host example.org accept */* body [] HTTP/2"
+// POST upgraded: true
+// stream 1: DATA "POST /form host example.org accept  body [hello] HTTP/2"
+// no HTTP2-Settings: false, 0 bytes sent
+// two HTTP2-Settings: false, 0 bytes sent
+// bad base64url: false, 0 bytes sent
+// settings of 5 bytes: false, 0 bytes sent
+// Connection without HTTP2-Settings: false, 0 bytes sent
+// Upgrade: websocket: false, 0 bytes sent
+// HTTP/1.1 answer: HTTP/1.1 200 OK | Connection: close | Content-Type: text/plain | Content-Length: 2 |  | hi
+// HTTP/1.1 HEAD answer: HTTP/1.1 200 OK | Connection: close | Content-Type: text/plain | Content-Length: 2 |  | (end)
+// HTTP/1.1 plain text: HTTP/1.1 200 OK | Connection: close | Content-Type: text/plain | Content-Length: 5 |  | plain
+use http;
+use http2;
+use hpack;
+use vec;
+use string;
+
+fn handler(req: HttpRequest) -> str {
+    return build_response(200, "text/plain", req.method + " " + req.target + " host " + http_header(req, "host") + " accept " + http_header(req, "accept") + " body [" + req.body + "] HTTP/" + req.version);
+}
+
+fn take(c: & mut H2Conn) -> Vec<i64> {
+    val out: Vec<i64> = c.out;
+    c.out = Vec::new();
+    return out;
+}
+
+fn bars(s: str) -> str {
+    return str_replace(s, "\r\n", " | ");
+}
+
+fn b64(s: str) -> str {
+    return "[" + h2_b64url_encode(str_bytes(s)) + "]";
+}
+
+// Feed frames to a server connection: process, then serve.
+fn feed(c: & mut H2Conn, b: Vec<i64>) {
+    val fs: Vec<H2Frame> = h2_frames_decode(b, 0);
+    var i: i64 = 0;
+    while i < fs.len() {
+        if h2_process(c, fs.get(i)) {
+            h2_server_step(c);
+        }
+        i = i + 1;
+    }
+}
+
+// Print what the server sent on stream 1 (HEADERS decoded with `dec`).
+fn show_stream1(out: Vec<i64>, dec: & mut Hpack) {
+    val fs: Vec<H2Frame> = h2_frames_decode(out, 0);
+    var i: i64 = 0;
+    while i < fs.len() {
+        val f: H2Frame = fs.get(i);
+        if f.ftype == H2_HEADERS {
+            val hl: HpackHeaders = hpack_decode(dec, h2_parse(f).data);
+            if f.stream == 1 {
+                println("stream 1: HEADERS " + hl.names.get(0) + "=" + hl.vals.get(0));
+            }
+        } else if f.ftype == H2_DATA && f.stream == 1 {
+            println("stream 1: DATA \"" + str_from_bytes(h2_parse(f).data) + "\"");
+        } else if f.ftype == H2_SETTINGS {
+            println("after the client's SETTINGS: " + str_slice(h2_frame_describe(f), str_find(h2_frame_describe(f), ": ") + 2, str_len(h2_frame_describe(f))));
+        }
+        i = i + 1;
+    }
+}
+
+fn upgrade_head(extra: str) -> HttpRequest {
+    return http_parse_head("GET /up?x=1 HTTP/1.1\r\nHost: example.org\r\n" + extra + "\r\n");
+}
+
+fn refused(label: str, req: HttpRequest) {
+    var c: H2Conn = h2_conn_new(- 1, false, "");
+    val ok: bool = h2_upgrade_request(& mut c, req, Vec::new());
+    println(label + ": " + bool_to_str(ok) + ", " + int_to_str(c.out.len()) + " bytes sent");
+}
+
+fn main() -> i64 {
+    var urlish: Vec<i64> = Vec::new();
+    urlish.push(251);
+    urlish.push(255);
+    println("base64url: " + b64("") + " " + b64("f") + " " + b64("fo") + " " + b64("foo") + " " + b64("foob") + " " + b64("fooba") + " " + b64("foobar") + " [" + h2_b64url_encode(urlish) + "]");
+    var d1: Vec<i64> = Vec::new();
+    val ok1: bool = h2_b64url_decode("Zm9vYmFy", & mut d1);
+    var d2: Vec<i64> = Vec::new();
+    val ok2: bool = h2_b64url_decode("Zm9v====", & mut d2);
+    var d3: Vec<i64> = Vec::new();
+    var d4: Vec<i64> = Vec::new();
+    println("decode: " + bool_to_str(ok1) + " " + str_from_bytes(d1) + ", padded " + bool_to_str(ok2) + " " + str_from_bytes(d2) + ", bad char " + bool_to_str(h2_b64url_decode("Zm9v!", & mut d3)) + ", length 5 " + bool_to_str(h2_b64url_decode("Zm9vY", & mut d4)));
+    val settings: str = h2_settings_header(true);
+    println("HTTP2-Settings: " + settings);
+    var back: Vec<i64> = Vec::new();
+    h2_b64url_decode(settings, & mut back);
+    val again: str = h2_b64url_encode(back);
+    println("settings round trip: " + bool_to_str(again == settings && back.len() == 24));
+
+    // An Upgrade: 101, the server's SETTINGS, the request as stream 1
+    http2_set_handler(handler);
+    var c: H2Conn = h2_conn_new(- 1, false, "");
+    val req: HttpRequest = upgrade_head("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: " + settings + "\r\nAccept: */*\r\n");
+    println("upgraded: " + bool_to_str(h2_upgrade_request(& mut c, req, Vec::new())));
+    val first: Vec<i64> = take(& mut c);
+    val text: str = str_from_bytes(first);
+    val end: i64 = str_find(text, "\r\n\r\n");
+    println("sent first: " + bars(str_slice(text, 0, end)));
+    var rest: Vec<i64> = Vec::new();
+    var i: i64 = end + 4;
+    while i < first.len() {
+        rest.push(first.get(i));
+        i = i + 1;
+    }
+    val fs: Vec<H2Frame> = h2_frames_decode(rest, 0);
+    i = 0;
+    while i < fs.len() {
+        println("then: " + h2_frame_describe(fs.get(i)));
+        i = i + 1;
+    }
+    val k: i64 = h2_stream_index(& c, 1);
+    println("stream 1 waiting: state " + int_to_str(c.streams.get(k).state) + ", peer window " + int_to_str(c.peer_window));
+    // The client's preface frames: its SETTINGS, the ACK of ours
+    var b: Vec<i64> = Vec::new();
+    h2_put_frame(& mut b, h2_settings_frame(Vec::new(), Vec::new()));
+    h2_put_frame(& mut b, h2_settings_ack());
+    feed(& mut c, b);
+    var dec: Hpack = hpack_new(4096);
+    show_stream1(take(& mut c), & mut dec);
+
+    // A POST with its body
+    var c2: H2Conn = h2_conn_new(- 1, false, "");
+    val post: HttpRequest = http_parse_head("POST /form HTTP/1.1\r\nHost: example.org\r\nContent-Length: 5\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: " + settings + "\r\n\r\n");
+    println("POST upgraded: " + bool_to_str(h2_upgrade_request(& mut c2, post, str_bytes("hello"))));
+    take(& mut c2);
+    feed(& mut c2, b);
+    var dec2: Hpack = hpack_new(4096);
+    val out2: Vec<i64> = take(& mut c2);
+    val fs2: Vec<H2Frame> = h2_frames_decode(out2, 0);
+    i = 0;
+    while i < fs2.len() {
+        if fs2.get(i).ftype == H2_DATA && fs2.get(i).stream == 1 {
+            println("stream 1: DATA \"" + str_from_bytes(h2_parse(fs2.get(i)).data) + "\"");
+        }
+        i = i + 1;
+    }
+
+    // Asking wrongly: nothing sent, the caller answers over HTTP/1.1
+    refused("no HTTP2-Settings", upgrade_head("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n"));
+    refused("two HTTP2-Settings", upgrade_head("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: " + settings + "\r\nHTTP2-Settings: " + settings + "\r\n"));
+    refused("bad base64url", upgrade_head("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAM+AAB/\r\n"));
+    refused("settings of 5 bytes", upgrade_head("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAAB\r\n"));
+    refused("Connection without HTTP2-Settings", upgrade_head("Connection: Upgrade\r\nUpgrade: h2c\r\nHTTP2-Settings: " + settings + "\r\n"));
+    refused("Upgrade: websocket", upgrade_head("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: websocket\r\nHTTP2-Settings: " + settings + "\r\n"));
+
+    println("HTTP/1.1 answer: " + bars(h2_h1_response(build_response(200, "text/plain", "hi"), false)));
+    println("HTTP/1.1 HEAD answer: " + bars(h2_h1_response(build_response(200, "text/plain", "hi"), true)) + "(end)");
+    println("HTTP/1.1 plain text: " + bars(h2_h1_response("plain", false)));
+    return 0;
+}

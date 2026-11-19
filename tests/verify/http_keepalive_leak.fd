@@ -1,0 +1,190 @@
+// VF16 / release I6: the per-request path of a kept-alive HTTP connection
+// (stdlib/http.fd http_conn_task with http_serve_scoped's dispatch) must
+// free everything a request makes. docs/verification/soak-http.md measured
+// ~95-265 bytes kept per request on a real socket; this program runs the
+// same connection task in one process, without a socket: the connection's
+// "TLS session" hooks (http_set_tls) hand it requests from memory and
+// swallow its responses, so `fid run --leaks` sees every block a request
+// leaves behind.
+//
+// The three request kinds of tests/verify/soak_http_service.fd, in turn on
+// one connection, the last one with "Connection: close": 900 requests, or
+// HTTP_KA_REQUESTS. The leak report must be the same for any count: what
+// stays is the program's one-time blocks (the function values its globals
+// and http_set_tls hold), never a request's. Before the fix each request
+// left its response (build_response, through the handler's function value)
+// and a POST its body (hc_text) behind: 1212 blocks for 900 requests.
+//
+//   fid run tests/verify/http_keepalive_leak.fd --leaks
+//   HTTP_KA_REQUESTS=90 fid run tests/verify/http_keepalive_leak.fd --leaks
+//   HTTP_KA_PLAIN=1 fid run ... --leaks   (an http_serve handler instead)
+//
+// Expected output:
+// requests 900
+// responses 900
+// ok 300 item 300 echo 300
+// bytes 80406
+// done
+
+use http;
+
+var fk_sent: i64 = 0;
+var fk_answers: i64 = 0;
+var fk_bytes: i64 = 0;
+var fk_ok: i64 = 0;
+var fk_item: i64 = 0;
+var fk_echo: i64 = 0;
+var fk_total: i64 = 900;
+
+fn soak_item(query: str) -> str {
+    var id: i64 = 0;
+    if str_starts_with(query, "id=") {
+        id = str_parse_int(str_slice(query, 3, str_len(query)));
+    }
+    return "{\"id\": " + int_to_str(id) + ", \"double\": " + int_to_str(id * 2)
+        + ", \"name\": \"item" + int_to_str(id % 997) + "\"}";
+}
+
+/// The same service as an http_serve handler (HTTP_KA_PLAIN=1): the
+/// non-scoped path of the connection task, through http_health_handler.
+fn plain_route(req: HttpRequest) -> str {
+    if req.method == "GET" && req.path == "/" {
+        return build_response(200, "text/plain", "ok
+");
+    }
+    if req.method == "GET" && req.path == "/item" {
+        return build_response(200, "application/json", soak_item(req.query));
+    }
+    if req.method == "POST" && req.path == "/echo" {
+        return build_response(200, "text/plain", req.body);
+    }
+    return build_response(404, "text/plain", "not found
+");
+}
+
+fn soak_route(req: ScopedRequest) -> str {
+    if req.method == "GET" && req.path == "/" {
+        return build_response(200, "text/plain", "ok\n");
+    }
+    if req.method == "GET" && req.path == "/item" {
+        return build_response(200, "application/json", soak_item(str_clone(req.query)));
+    }
+    if req.method == "POST" && req.path == "/echo" {
+        return build_response(200, "text/plain", str_clone(req.body));
+    }
+    return build_response(404, "text/plain", "not found\n");
+}
+
+/// Request number i: GET /, GET /item?id=i, POST /echo with a body, in turn.
+fn fk_request(i: i64) -> str {
+    var conn: str = "";
+    if i == fk_total - 1 {
+        conn = "Connection: close\r\n";
+    }
+    val kind: i64 = i % 3;
+    if kind == 0 {
+        return "GET / HTTP/1.1\r\nHost: soak\r\n" + conn + "\r\n";
+    }
+    if kind == 1 {
+        return "GET /item?id=" + int_to_str(i) + " HTTP/1.1\r\nHost: soak\r\nUser-Agent: fk\r\n" + conn + "\r\n";
+    }
+    val body: str = "echo body number " + int_to_str(i);
+    return "POST /echo HTTP/1.1\r\nHost: soak\r\nContent-Type: text/plain\r\nContent-Length: "
+        + int_to_str(str_len(body)) + "\r\n" + conn + "\r\n" + body;
+}
+
+fn fk_put_byte(addr: i64, v: i64) {
+    var p: * mut u8 = addr as * mut u8;
+    // SAFETY: addr is inside the connection's read buffer, below the room
+    // http's hc_fill offered (fk_recv copies at most n bytes).
+    unsafe {
+        * p = v as u8;
+    }
+}
+
+/// The connection's reads: one whole request per read, 0 (end of input)
+/// after the last.
+fn fk_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+    if fk_sent >= fk_total {
+        return 0;
+    }
+    val r: str = fk_request(fk_sent);
+    val len: i64 = str_len(r);
+    if len > n {
+        p_panic("http_keepalive_leak: request larger than the read buffer");
+    }
+    var i: i64 = 0;
+    while i < len {
+        fk_put_byte(buf + i, str_byte_at(r, i));
+        i = i + 1;
+    }
+    fk_sent = fk_sent + 1;
+    return len;
+}
+
+fn fk_byte(addr: i64) -> i64 {
+    var p: * mut u8 = addr as * mut u8;
+    var v: i64 = 0;
+    // SAFETY: addr is inside the response http_conn_write passes (below n).
+    unsafe {
+        v = (* p) as i64;
+    }
+    return v;
+}
+
+/// The connection's writes: count the responses and check their status.
+fn fk_send(tls: i64, buf: i64, n: i64) -> i64 {
+    fk_answers = fk_answers + 1;
+    fk_bytes = fk_bytes + n;
+    // "HTTP/1.1 200 OK\r\n": byte 9 is the status's first digit
+    if n > 12 && fk_byte(buf + 9) == 50 {
+        val kind: i64 = (fk_answers - 1) % 3;
+        if kind == 0 {
+            fk_ok = fk_ok + 1;
+        } else if kind == 1 {
+            fk_item = fk_item + 1;
+        } else {
+            fk_echo = fk_echo + 1;
+        }
+    }
+    return n;
+}
+
+fn fk_close(tls: i64) -> i64 {
+    return 0;
+}
+
+fn fk_accept(fd: i64) -> i64 {
+    return 1;
+}
+
+fn main() -> i64 {
+    match env_var("HTTP_KA_REQUESTS") {
+        Option::Some(n) => {
+            fk_total = str_parse_int(n);
+        }
+        Option::None => {
+        }
+    }
+    http_set_tls(fk_recv, fk_send, fk_close, fk_accept);
+    match env_var("HTTP_KA_PLAIN") {
+        Option::Some(_) => {
+            // the handler http_serve installs; the accept task this queues
+            // never runs (no task_run), the connection is driven below
+            http_listen_tasks(- 1, plain_route);
+        }
+        Option::None => {
+            http_set_scoped(soak_route);
+        }
+    }
+    // socket -1 (never touched: every read and write goes through the
+    // session hooks), session 1
+    val c: i64 = http_conn_new(- 1, 1);
+    http_conn_task(c);
+    println("requests " + int_to_str(fk_sent));
+    println("responses " + int_to_str(fk_answers));
+    println("ok " + int_to_str(fk_ok) + " item " + int_to_str(fk_item) + " echo " + int_to_str(fk_echo));
+    println("bytes " + int_to_str(fk_bytes));
+    println("done");
+    return 0;
+}

@@ -27,13 +27,29 @@
 //   var result = json_result(&json);  // {"name":"Player","x":100.0}
 
 module serialize;
- use vec; use string;
+ use vec;
 // ─── Binary Writer ───────────────────────────────────────────────────────
 
 pub struct SerializeWriter {
     pub data: Vec<i64>,
 }
 
+/// An empty byte writer.
+///
+/// Example:
+///   var w = serialize_writer_create();
+///   serialize_write_u8(&mut w, 7);
+///   serialize_write_i32(&mut w, -5);
+///   serialize_write_u16(&mut w, 513);
+///   serialize_write_bool(&mut w, true);
+///   serialize_write_str(&mut w, "hi");
+///   assert_eq(serialize_size(&w), 14);
+///   var r = serialize_reader_create(serialize_data(&w));
+///   assert_eq(serialize_read_u8(&mut r), 7);
+///   assert_eq(serialize_read_i32(&mut r), -5);
+///   assert_eq(serialize_read_u16(&mut r), 513);
+///   assert(serialize_read_bool(&mut r));
+///   assert_eq(serialize_read_str(&mut r), "hi");
 pub fn serialize_writer_create() -> SerializeWriter {
     return SerializeWriter {
         data: Vec::new()
@@ -163,7 +179,13 @@ pub fn serialize_read_i32(r: & mut SerializeReader) -> i64 {
     var b1 = serialize_read_u8(r);
     var b2 = serialize_read_u8(r);
     var b3 = serialize_read_u8(r);
-    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    var v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    // sign-extend: serialize_write_i32 stores the low 32 bits of a
+    // negative value, which read back as -5, not 4294967291
+    if v >= 2147483648 {
+        v = v - 4294967296;
+    }
+    return v;
 }
 
 pub fn serialize_read_f64(r: & mut SerializeReader) -> f64 {
@@ -185,14 +207,15 @@ pub fn serialize_read_str(r: & mut SerializeReader) -> str {
     if len <= 0 {
         return "";
     }
-    var result = "";
+    // the bytes as they are (UTF-8 stays UTF-8), one string at the end
+    // instead of a concatenation per byte
+    var bytes: Vec<i64> = Vec::new();
     var i = 0;
     while i < len {
-        var b = serialize_read_u8(r);
-        result = result + pledge_char_to_str(b);
+        bytes.push(serialize_read_u8(r));
         i = i + 1;
     }
-    return result;
+    return str_from_bytes(bytes);
 }
 
 pub fn serialize_read_bytes(r: & mut SerializeReader) -> Vec<i64> {
@@ -383,6 +406,8 @@ pub fn json_parse_bool(source: str, key: str) -> bool {
 
 // ─── Native Helpers ──────────────────────────────────────────────────────
 
+// SAFETY: pledge_serialize.h is the runtime's own header, checked by the C
+// compiler; data is a buffer of len bytes the caller allocated.
 extern "C" include "pledge_serialize.h" link "" {
     fn pledge_f64_to_bits(val: f64) -> i64;
     fn pledge_bits_to_f64(bits: i64) -> f64;

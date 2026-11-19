@@ -1,0 +1,73 @@
+// OP24 (competitive roadmap): facts that dominate a load, and a loop
+// condition on p * p as a fact on p (compiler/checks.fd peir_dom_narrow,
+// peir_square_local). In `sieve`, `p * p < n` bounds p in the outer body,
+// and that fact reaches the latch's `p = p + 1` and the inner loop's
+// `m = m + p` under `if flags.get(p) == 1` (blocks it dominates, with no
+// store to p on the way): p stays in [2, isqrt(n - 1) + 1], m below
+// n + p, so both multiplies `p * p`, `m + p` and `p + 1` lose their
+// overflow checks. `fid explain` on this file lists them as removed (range
+// analysis); FID_IROPT_OFF=rangedom keeps them.
+// test_opt_range_dom_fail.fd: a store to p under the fact keeps the check.
+//
+// Expected output:
+// 168
+// 1229
+// 60
+// 55
+
+fn sieve(n: i64) -> i64 {
+    var flags: Vec<u8> = Vec::filled(n, 1);
+    flags.set(0, 0);
+    flags.set(1, 0);
+    var p: i64 = 2;
+    while p * p < n {
+        if flags.get(p) == 1 {
+            var m: i64 = p * p;
+            while m < n {
+                flags.set(m, 0);
+                m = m + p;
+            }
+        }
+        p = p + 1;
+    }
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        count = count + (flags.get(i) as i64);
+        i = i + 1;
+    }
+    return count;
+}
+
+// The fact of `k < 10` reaches the sum under the inner branch and the step
+fn nested(limit: i64) -> i64 {
+    var k: i64 = 0;
+    var t: i64 = 0;
+    while k < 10 {
+        if limit > 3 {
+            if k % 2 == 0 {
+                t = t + k * 3;
+            }
+        }
+        k = k + 1;
+    }
+    return t;
+}
+
+// `q * q <= 100`: q in [0, 10] in the body
+fn squares() -> i64 {
+    var q: i64 = 0;
+    var s: i64 = 0;
+    while q * q <= 100 {
+        s = s + q;
+        q = q + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println(sieve(1000));
+    println(sieve(10000));
+    println(nested(5));
+    println(squares());
+}

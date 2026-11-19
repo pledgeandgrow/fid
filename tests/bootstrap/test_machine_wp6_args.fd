@@ -1,0 +1,142 @@
+// Track WP (docs/roadmap/llvm-roadmap.md), WP6: arguments in the registers
+// the caller already has them in. The machine layer (compiler/nat_ir.fd)
+// gets there through RA7's argument-register hints (ng_arg_hints) and RA3's
+// free argument registers (ng_arg_free), both on by default: a parameter
+// that no call or implicit register use (x86-64 division, shifts, copies)
+// separates from the call that passes it on stays in its argument
+// register, so the parameter copy and the operand copy become moves to
+// themselves and emit nothing. Functions called only directly use the
+// internal convention (WP6 `internal_conv`, iropt.fd iro_conv_mark: one
+// more argument register on x86-64, three on AArch64, one on RISC-V), so
+// `fwd5` passes its fifth argument in an extended register.
+// `fwd3` and `fwd5` pass their parameters on in the same positions after a
+// loop over them; `swap2` and `rot3` pass them in another order (a cycle of
+// moves); `twice` keeps its parameters across a first call (they cannot
+// stay in argument registers there). A value left in a register something
+// clobbered changes what is printed.
+// tests/nattools/wp6_args_check.sh builds it on every target with
+// FID_VERIFY=1 by default and with FID_NAT_OFF=arghint,argfree, runs it
+// where it can, and checks that the pass-through functions' moves
+// (`--stats`) go down with the hints.
+// The loop counts depend on the operands, so no function is inlined or
+// unrolled.
+// Expected output:
+// 4712
+// 61481
+// 14590
+// 95864
+// 19531
+// 55810
+// 19408
+// 71264
+// 52062
+// 178974
+// -43333
+
+fn sink2(a: i64, b: i64) -> i64 {
+    var s: i64 = a;
+    var i: i64 = 0;
+    var n: i64 = 2 + (a & 1);
+    while i < n {
+        s = (s * 17 + b + i) % 100003;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sink3(a: i64, b: i64, c: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = 2 + (c & 1);
+    while i < n {
+        s = (s * 31 + a * 7 + b * 3 + c + i) % 100003;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sink5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = 2 + (e & 1);
+    while i < n {
+        s = (s * 29 + a * 11 + b * 7 + c * 5 + d * 3 + e + i) % 100003;
+        i = i + 1;
+    }
+    return s;
+}
+
+// the loops below use no division, remainder, shift or copy: nothing in
+// them needs an argument register
+fn fwd3(a: i64, b: i64, c: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < (b & 3) + 1 {
+        t = t + (a & 255) + (c | 1) + i;
+        i = i + 1;
+    }
+    return sink3(a, b, c) + t;
+}
+
+fn fwd5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < (a & 3) + 1 {
+        t = t + (b & 127) + (c ^ d) + (e | 2) + i;
+        i = i + 1;
+    }
+    return sink5(a, b, c, d, e) + t;
+}
+
+fn swap2(a: i64, b: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < (a & 1) + 2 {
+        t = t + a - b + i;
+        i = i + 1;
+    }
+    return sink2(b, a) + t;
+}
+
+fn rot3(a: i64, b: i64, c: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < (c & 1) + 1 {
+        t = t + (a | b) + (c & 7) + i;
+        i = i + 1;
+    }
+    return sink3(c, a, b) + t;
+}
+
+fn twice(a: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    var t: i64 = 0;
+    while i < (b & 1) + 1 {
+        t = t + a + i;
+        i = i + 1;
+    }
+    var p: i64 = sink2(a, b);
+    var q: i64 = sink2(a + p, b);
+    return p + q + a * 3 + b + t;
+}
+
+fn main() {
+    // the operands come out of a Vec, so no call is folded away
+    var x: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k <= 40 {
+        x.push(k * 7 + 3);
+        k = k + 1;
+    }
+    println(int_to_str(fwd3(x.get(1), x.get(2), x.get(3))));
+    println(int_to_str(fwd3(x.get(30), x.get(11), x.get(25))));
+    println(int_to_str(fwd5(x.get(1), x.get(2), x.get(3), x.get(4), x.get(5))));
+    println(int_to_str(fwd5(x.get(40), x.get(9), x.get(17), x.get(22), x.get(6))));
+    println(int_to_str(swap2(x.get(4), x.get(9))));
+    println(int_to_str(swap2(x.get(33), x.get(2))));
+    println(int_to_str(rot3(x.get(5), x.get(6), x.get(7))));
+    println(int_to_str(rot3(x.get(19), x.get(3), x.get(36))));
+    println(int_to_str(twice(x.get(8), x.get(13))));
+    println(int_to_str(twice(x.get(0), x.get(39))));
+    println(int_to_str(fwd3(x.get(0) - 50, x.get(1) - 100, x.get(2) * 3)));
+}

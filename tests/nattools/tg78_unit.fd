@@ -1,0 +1,46 @@
+// TG7 / TG8 (docs/roadmap/llvm-roadmap.md): the machine layer's new
+// selections in compiler/nat_ir.fd on small cases, through
+// nat_tg78_unit_check, on AArch64, RISC-V and x86-64:
+//   x86-64   BMI1 BLSMSK (a ^ (a - 1)) and BLSI (a & -a, a & (0 - a)) as
+//            MO_BLSR kinds 1 and 2 from ng_fuse_bits under --cpu
+//            x86-64-v3, none without it, none for a ^ -a or for a - 1 read
+//            again; their bytes. ng_rmw_slot (`op [rsp + off], r` for a
+//            spilled destination sharing its left operand's slot; not for
+//            x + x, a multiply, two slots, a constant past 32 bits or a
+//            rematerialized value) and the bytes of ng_x64_rmw_slot and
+//            ng_x64_cmp_slot (a compare with a spilled operand's slot,
+//            swapped when the slot is the left side)
+//   AArch64  ng_wb_pair moves a pointer's step up to its load or store
+//            (over other operations and line rows; through a copy of the
+//            pointer) and not over a read of the step's result, a write of
+//            the pointer, a label, nor for another offset or a step past
+//            9 bits; ng_a64_wb_fuse makes post- and pre-indexed loads and
+//            stores (words checked against what clang assembles) and
+//            refuses t = n, a label between, another offset, a step past
+//            9 bits, sp as the base
+// Run:
+//   fid run tests/nattools/tg78_unit.fd
+// Expected output:
+// a64 ok
+// rv64 ok
+// x64 ok
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn report(name: str, arch: i64) {
+    val err: str = nat_tg78_unit_check(arch);
+    if err == "" {
+        println(name + " ok");
+    } else {
+        println(name + " " + err);
+    }
+}
+
+fn main() {
+    report("a64", NAT_A64);
+    report("rv64", NAT_RV64);
+    report("x64", NAT_X64);
+}

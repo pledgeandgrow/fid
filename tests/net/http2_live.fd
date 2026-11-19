@@ -1,0 +1,76 @@
+// stdlib/http2 (competitive SL1) over real sockets, server and clients in
+// one process: a cleartext server (http2_listen_tasks) that takes
+//   - prior knowledge (http2_get),
+//   - the h2c Upgrade from HTTP/1.1 (http2_get_upgrade: 101, then the
+//     response on stream 1 over HTTP/2),
+//   - a plain HTTP/1.1 request, answered over HTTP/1.1 (Connection: close),
+// and runs each handler on a task of its own: on one connection a slow
+// request (its handler sleeps 300 ms) and a fast one sent after it; the
+// fast one is answered while the slow one still runs.
+//
+// Needs tasks that run side by side: C and native builds (`fid run` runs a
+// task to its end when it starts), so it is not in tests/bootstrap.
+//   CC="zig cc" fid ccompile tests/net/http2_live.fd -o h2live && ./h2live
+//   fid emit tests/net/http2_live.fd -o h2live.exe && ./h2live.exe   (Windows)
+//
+// Expected output:
+// prior knowledge: 200 hello / over HTTP/2
+// upgrade: 200 stream 1 hello /up over HTTP/2
+// HTTP/1.1: 200 connection close, hello /plain over HTTP/1.1
+// fast answered while slow still running: true
+// fast: 200 hello /fast over HTTP/2
+// slow: 200 slow done
+use http;
+use http2;
+use task;
+use vec;
+use string;
+
+fn route(req: HttpRequest) -> str {
+    if req.path == "/slow" {
+        task_sleep(300);
+        return build_response(200, "text/plain", "slow done");
+    }
+    return build_response(200, "text/plain", "hello " + req.path + " over HTTP/" + req.version);
+}
+
+async fn client(port: i64) -> Future<i64> {
+    val r: Http2Response = http2_get("127.0.0.1", port, "/");
+    println("prior knowledge: " + int_to_str(r.status) + " " + r.body + r.error);
+    val u: Http2Response = http2_get_upgrade("127.0.0.1", port, "/up");
+    println("upgrade: " + int_to_str(u.status) + " stream " + int_to_str(u.stream) + " " + u.body + u.error);
+    val c1: i64 = http_conn_new(p_co_connect("127.0.0.1", port), 0);
+    http_conn_write(c1, "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n");
+    val m: HttpRequest = http_read_message(c1, 5000, false);
+    println("HTTP/1.1: " + m.target + " connection " + http_header(m, "connection") + ", " + m.body);
+    http_conn_close(c1);
+    // Two requests on one connection, the slow one first
+    var c: H2Conn = http2_connect("127.0.0.1", port);
+    val slow: i64 = http2_request(& mut c, "GET", "/slow", Vec::new(), Vec::new(), "");
+    val fast: i64 = http2_request(& mut c, "GET", "/fast", Vec::new(), Vec::new(), "");
+    val rf: Http2Response = http2_wait(& mut c, fast);
+    val k: i64 = h2_stream_index(& c, slow);
+    var running: bool = false;
+    if k >= 0 {
+        running = !c.streams.get(k).got_headers;
+    }
+    println("fast answered while slow still running: " + bool_to_str(running));
+    println("fast: " + int_to_str(rf.status) + " " + rf.body + rf.error);
+    val rs: Http2Response = http2_wait(& mut c, slow);
+    println("slow: " + int_to_str(rs.status) + " " + rs.body + rs.error);
+    http2_close(& mut c);
+    http2_stop();
+    return 0;
+}
+
+fn main() -> i64 {
+    var port: i64 = 18520;
+    var fd: i64 = p_socket_listen(port);
+    while fd < 0 && port < 18540 {
+        port = port + 1;
+        fd = p_socket_listen(port);
+    }
+    http2_listen_tasks(fd, route);
+    await client(port);
+    return 0;
+}

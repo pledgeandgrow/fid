@@ -1,0 +1,151 @@
+// ME20/ME21 (llvm-roadmap): inline2's limits and its scan
+// (compiler/iropt_me.fd ime_inline_function, on by default). The program
+// has what each rule of the cost model weighs:
+//  - `step` and `bump`: small callees of several blocks called at many
+//    sites, in loops and outside them (IME_INLINE_MAX / IME_INLINE_FLAT_MAX,
+//    charged to the module's growth budget);
+//  - `pick`: a callee whose size fits only with a constant argument
+//    (IME_CONST_ARG_BONUS);
+//  - `table`: called once, larger than any multi-site limit (the
+//    once-called rule, IME_INLINE_ONCE_MAX);
+//  - `mix`: several calls in one block, so after one is inlined the calls
+//    after it move to the block that continues it (the scan must still
+//    reach them: ME21's resumed scan, FID_IROPT_OFF=inlinescan to compare);
+//  - `inner`/`outer`: callees inlined into callees first (bottom-up).
+// tests/tooling/inline2-limits-check.sh emits it with the default limits,
+// with FID_INLINE2_LIMITS (none inlined, no growth budget, a caller limit
+// of 1), with FID_IROPT_OFF=inlinescan and with inline2 off: every build
+// prints the expected lines, the inline2 stats line follows the limits.
+//
+// Expected output:
+// 7 3 12
+// 1 2 3 0
+// 1150
+// 2048
+// 507
+// 106
+// 7754
+
+fn step(x: i64, k: i64) -> i64 {
+    if x < 0 {
+        return 0 - x;
+    }
+    if x > k {
+        return x - k;
+    }
+    return x + k;
+}
+
+fn bump(x: i64) -> i64 {
+    if x % 2 == 0 {
+        return x / 2;
+    }
+    return 3 * x + 1;
+}
+
+fn pick(mode: i64, a: i64, b: i64) -> i64 {
+    var r: i64 = 0;
+    if mode == 0 {
+        r = a + b;
+    } else if mode == 1 {
+        r = a - b;
+    } else if mode == 2 {
+        r = a * b;
+    } else if mode == 3 {
+        if b != 0 {
+            r = a / b;
+        }
+    } else if mode == 4 {
+        if b != 0 {
+            r = a % b;
+        }
+    } else if mode == 5 {
+        if a > b {
+            r = a;
+        } else {
+            r = b;
+        }
+    } else if mode == 6 {
+        if a < b {
+            r = a;
+        } else {
+            r = b;
+        }
+    } else {
+        r = 0 - a;
+    }
+    return r;
+}
+
+fn table(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var j: i64 = 0;
+        while j < 4 {
+            var v: i64 = i * 4 + j;
+            if v % 3 == 0 {
+                s = s + v;
+            } else if v % 3 == 1 {
+                s = s + v * 2;
+            } else {
+                s = s - v;
+            }
+            if s > 1000 {
+                s = s - 1000;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn inner(x: i64) -> i64 {
+    if x > 10 {
+        return x - 10;
+    }
+    return x + 1;
+}
+
+fn outer(x: i64) -> i64 {
+    var a: i64 = inner(x);
+    var b: i64 = inner(a + 5);
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn mix(x: i64) -> i64 {
+    var a: i64 = step(x, 4) + bump(x) + step(x + 1, 2) + bump(x + 3) + outer(x);
+    return a;
+}
+
+fn main() {
+    println(int_to_str(step(3, 4)) + " " + int_to_str(step(7, 4)) + " " + int_to_str(bump(24)));
+    println(int_to_str(pick(6, 1, 9)) + " " + int_to_str(pick(1, 5, 3)) + " " + int_to_str(pick(3, 9, 3)) + " " + int_to_str(pick(4, 8, 2)));
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 30 {
+        t = t + step(i, 10) + bump(i);
+        i = i + 1;
+    }
+    println(t);
+    var p: i64 = 1;
+    var k: i64 = 0;
+    while k < 11 {
+        p = pick(2, p, 2);
+        k = k + 1;
+    }
+    println(p);
+    println(table(10));
+    println(outer(3) + outer(40) + outer(17) + 59);
+    var m: i64 = 0;
+    var q: i64 = 0;
+    while q < 50 {
+        m = m + mix(q);
+        q = q + 1;
+    }
+    println(m);
+}

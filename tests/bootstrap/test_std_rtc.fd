@@ -1,0 +1,121 @@
+// stdlib/rtc: BCD, calendar and Unix time vectors, CMOS register snapshots in BCD/binary and 12/24-hour modes, set-clock write order, and alarm next-fire times.
+// Expected output:
+// bcd 59 -1 0x47
+// leap 2000 true 1900 false 2024 true, feb 2023 has 28 days
+// Thursday Thursday Wednesday
+// 946684800 2147483647
+// 2023-11-14T22:13:20 Tuesday
+// 1969-12-31T23:59:59
+// day of year 366
+// 2024-02-29T00:00:00 2024-03-01T00:00:00
+// cmos 12h BCD: 2024-02-29T13:30:45 Thursday
+// cmos 12 AM: 2024-02-29T00:05:00
+// cmos binary 24h: 1999-12-31T23:59:58
+// bad BCD: year 0
+// writes: 0B=82 00=45 02=30 04=13 06=05 07=29 08=02 09=24 32=20 0B=02
+// round trip 2024-02-29T13:30:45
+// agree true uip false differ false
+// flags periodic alarm, RS 6 = 1024 Hz
+// daily 07:30 -> 2024-03-01T07:30:00 match true
+// every minute :00 -> 2024-02-29T13:31:00
+// 13:30:00 again -> 2024-03-01T13:30:00
+// day 31 -> 2024-03-31T00:00:00
+// Monday 9h -> 2024-03-04T09:00:00
+// day 30 -> 2024-03-30T00:00:00
+// alarm regs C0 30 07
+// prescalers 32768 Hz: 127/255, 40000 Hz: 124/319
+use rtc;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn hx(b: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn snapshot() -> Vec<i64> {
+    var r: Vec<i64> = Vec::filled(0x33, 0);
+    r.set(CMOS_SECONDS, 0x45);
+    r.set(CMOS_MINUTES, 0x30);
+    r.set(CMOS_HOURS, 0x81);
+    r.set(CMOS_WEEKDAY, 0x05);
+    r.set(CMOS_DAY, 0x29);
+    r.set(CMOS_MONTH, 0x02);
+    r.set(CMOS_YEAR, 0x24);
+    r.set(CMOS_STATUS_B, 0x00);
+    r.set(CMOS_CENTURY, 0x20);
+    return r;
+}
+
+fn main() {
+    println("bcd " + int_to_str(rtc_bcd_to_bin(0x59)) + " " + int_to_str(rtc_bcd_to_bin(0x5A)) + " 0x" + hx(rtc_bin_to_bcd(47)));
+    println("leap 2000 " + bs(rtc_is_leap(2000)) + " 1900 " + bs(rtc_is_leap(1900)) + " 2024 " + bs(rtc_is_leap(2024))
+        + ", feb 2023 has " + int_to_str(rtc_days_in_month(2023, 2)) + " days");
+    println(rtc_weekday_name(rtc_weekday(1970, 1, 1)) + " " + rtc_weekday_name(rtc_weekday(2024, 2, 29)) + " " + rtc_weekday_name(rtc_weekday(2000, 3, 1)));
+    println(int_to_str(rtc_to_unix(rtc_time(2000, 1, 1, 0, 0, 0))) + " " + int_to_str(rtc_to_unix(rtc_time(2038, 1, 19, 3, 14, 7))));
+    val t1: RtcTime = rtc_from_unix(1700000000);
+    println(rtc_iso(t1) + " " + rtc_weekday_name(t1.weekday));
+    println(rtc_iso(rtc_from_unix(-1)));
+    println("day of year " + int_to_str(rtc_day_of_year(2024, 12, 31)));
+    val t2: RtcTime = rtc_time(2024, 2, 28, 23, 59, 59);
+    println(rtc_iso(rtc_add_seconds(t2, 1)) + " " + rtc_iso(rtc_add_seconds(t2, 86401)));
+
+    val snap: Vec<i64> = snapshot();
+    val c1: RtcTime = cmos_decode(snap);
+    println("cmos 12h BCD: " + rtc_iso(c1) + " " + rtc_weekday_name(c1.weekday));
+    var s2: Vec<i64> = snapshot();
+    s2.set(CMOS_HOURS, 0x12);
+    s2.set(CMOS_MINUTES, 0x05);
+    s2.set(CMOS_SECONDS, 0x00);
+    println("cmos 12 AM: " + rtc_iso(cmos_decode(s2)));
+    var s3: Vec<i64> = Vec::filled(0x0E, 0);
+    s3.set(CMOS_SECONDS, 58);
+    s3.set(CMOS_MINUTES, 59);
+    s3.set(CMOS_HOURS, 23);
+    s3.set(CMOS_DAY, 31);
+    s3.set(CMOS_MONTH, 12);
+    s3.set(CMOS_YEAR, 99);
+    s3.set(CMOS_STATUS_B, CMOS_B_BINARY | CMOS_B_24H);
+    println("cmos binary 24h: " + rtc_iso(cmos_decode(s3)));
+    var s4: Vec<i64> = snapshot();
+    s4.set(CMOS_DAY, 0x3A);
+    println("bad BCD: year " + int_to_str(cmos_decode(s4).year));
+
+    val w: Vec<i64> = cmos_encode(c1, CMOS_B_24H);
+    var ws: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < w.len() {
+        ws.push(hx(w.get(i) / 256) + "=" + hx(w.get(i) % 256));
+        i = i + 1;
+    }
+    println("writes: " + str_join(ws, " "));
+    var fresh: Vec<i64> = Vec::filled(0x33, 0);
+    cmos_apply(&mut fresh, w);
+    println("round trip " + rtc_iso(cmos_decode(fresh)));
+    var uip: Vec<i64> = snapshot();
+    uip.set(CMOS_STATUS_A, 0xA6);
+    var later: Vec<i64> = snapshot();
+    later.set(CMOS_SECONDS, 0x46);
+    println("agree " + bs(cmos_snapshots_agree(snapshot(), snapshot())) + " uip " + bs(cmos_snapshots_agree(uip, snapshot()))
+        + " differ " + bs(cmos_snapshots_agree(snapshot(), later)));
+    println("flags " + cmos_irq_flags(0x60) + ", RS 6 = " + int_to_str(cmos_periodic_hz(6)) + " Hz");
+
+    val daily: RtcAlarm = rtc_alarm(-1, -1, 7, 30, 0);
+    val n1: RtcTime = rtc_alarm_next(daily, c1);
+    println("daily 07:30 -> " + rtc_iso(n1) + " match " + bs(rtc_alarm_matches(daily, n1)));
+    println("every minute :00 -> " + rtc_iso(rtc_alarm_next(rtc_alarm(-1, -1, -1, -1, 0), c1)));
+    println("13:30:00 again -> " + rtc_iso(rtc_alarm_next(rtc_alarm(-1, -1, 13, 30, 0), c1)));
+    println("day 31 -> " + rtc_iso(rtc_alarm_next(rtc_alarm(31, -1, 0, 0, 0), c1)));
+    println("Monday 9h -> " + rtc_iso(rtc_alarm_next(rtc_alarm(-1, 1, 9, -1, -1), c1)));
+    println("day 30 -> " + rtc_iso(rtc_alarm_next(rtc_alarm(30, -1, -1, -1, -1), c1)));
+    val ar: Vec<i64> = cmos_alarm_regs(rtc_alarm(-1, -1, 7, 30, -1));
+    println("alarm regs " + hx(ar.get(0)) + " " + hx(ar.get(1)) + " " + hx(ar.get(2)));
+    val p1: i64 = rtc_prescalers(32768);
+    val p2: i64 = rtc_prescalers(40000);
+    println("prescalers 32768 Hz: " + int_to_str(p1 / 65536) + "/" + int_to_str(p1 % 65536) + ", 40000 Hz: " + int_to_str(p2 / 65536) + "/" + int_to_str(p2 % 65536));
+}

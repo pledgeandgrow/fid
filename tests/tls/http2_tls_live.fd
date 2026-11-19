@@ -1,0 +1,131 @@
+// HTTP/2 over TLS with ALPN (competitive SL1), server and clients in one
+// process: http2_tls_listen serves a local port with a self-signed
+// certificate and offers "h2" then "http/1.1" by ALPN. Clients:
+//   - raw TLS sessions offering ALPN lists, printing what the server chose
+//     (its preference wins; nothing in common: no protocol);
+//   - HTTP/1.1 over a session that chose "http/1.1" (module http answers);
+//   - HTTP/2 over TLS (http2_tls_get_unchecked: the server must choose h2).
+// Exits 1 unless every line is as below. Not in the suite: it needs a
+// certificate, and on Windows tls_server imports the .pfx key into the
+// user's key store (Schannel cannot use an in-memory key).
+//
+// A self-signed certificate (Git for Windows ships openssl):
+//   openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj /CN=localhost \
+//       -keyout key.pem -out cert.pem
+//   openssl pkcs12 -export -in cert.pem -inkey key.pem -out cert.pfx -passout pass:test
+//
+// Windows (Schannel, Windows 8.1 or later):
+//   fid emit tests/tls/http2_tls_live.fd -o h2tls.exe && ./h2tls.exe cert.pfx test
+// Linux / macOS (OpenSSL 1.0.2 or later):
+//   fid ccompile tests/tls/http2_tls_live.fd -o h2tls && ./h2tls cert.pem key.pem
+//
+// Expected output (exit 0; with Schannel the second line may say
+// http/1.1: Schannel orders the server's choice itself):
+//   offer h2,http/1.1: h2
+//   offer http/1.1,h2: h2
+//   offer http/1.1: http/1.1
+//   offer spdy/3: (none)
+//   HTTP/1.1 over TLS: 200 hello /one over HTTP/1.1
+//   h2 over TLS: 200 hello /two over HTTP/2
+//   ok
+use http;
+use http2;
+use http2_tls;
+use tls;
+use task;
+use vec;
+use string;
+
+var g_failed: bool = false;
+
+fn route(req: HttpRequest) -> str {
+    return build_response(200, "text/plain", "hello " + req.path + " over HTTP/" + req.version);
+}
+
+fn check(line: str, want: str) {
+    println(line);
+    if line != want {
+        g_failed = true;
+    }
+}
+
+// Either line will do (Schannel applies its own order to the server's
+// choice; OpenSSL here takes the server's first, RFC 7301 3.2)
+fn check2(line: str, want: str, also: str) {
+    println(line);
+    if line != want && line != also {
+        g_failed = true;
+    }
+}
+
+fn offer(port: i64, protos: str) -> str {
+    val s: i64 = tls_connect_alpn_unchecked("localhost", port, protos);
+    if s == 0 {
+        return "handshake failed";
+    }
+    var chosen: str = tls_session_alpn(s);
+    if chosen == "" {
+        chosen = "(none)";
+    }
+    val fd: i64 = tls_session_fd(s);
+    tls_session_close(s);
+    p_socket_close(fd);
+    return chosen;
+}
+
+async fn client(port: i64) -> Future<i64> {
+    check("offer h2,http/1.1: " + offer(port, "h2,http/1.1"), "offer h2,http/1.1: h2");
+    check2("offer http/1.1,h2: " + offer(port, "http/1.1,h2"), "offer http/1.1,h2: h2", "offer http/1.1,h2: http/1.1");
+    check("offer http/1.1: " + offer(port, "http/1.1"), "offer http/1.1: http/1.1");
+    check("offer spdy/3: " + offer(port, "spdy/3"), "offer spdy/3: (none)");
+    // HTTP/1.1 on a session that chose it: module http reads and writes it
+    val s: i64 = tls_connect_alpn_unchecked("localhost", port, "http/1.1");
+    if s == 0 {
+        check("HTTP/1.1 over TLS: handshake failed", "");
+    } else {
+        val c: i64 = http_conn_new(tls_session_fd(s), s);
+        http_conn_write(c, "GET /one HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        val m: HttpRequest = http_read_message(c, 10000, false);
+        check("HTTP/1.1 over TLS: " + m.target + " " + m.body, "HTTP/1.1 over TLS: 200 hello /one over HTTP/1.1");
+        http_conn_close(c);
+    }
+    val r: Http2Response = http2_tls_get_unchecked("localhost", port, "/two");
+    check("h2 over TLS: " + int_to_str(r.status) + " " + r.body + r.error, "h2 over TLS: 200 hello /two over HTTP/2");
+    http2_stop();
+    return 0;
+}
+
+fn main() -> i64 {
+    var a: str = "";
+    var b: str = "";
+    match arg_at(1) {
+        Option::Some(x) => { a = x; }
+        Option::None => {}
+    }
+    match arg_at(2) {
+        Option::Some(x) => { b = x; }
+        Option::None => {}
+    }
+    if a == "" {
+        println("usage: http2_tls_live <cert.pfx> <password>   (Windows)");
+        println("       http2_tls_live <cert.pem> <key.pem>    (OpenSSL)");
+        return 2;
+    }
+    var port: i64 = 18540;
+    var fd: i64 = p_socket_listen(port);
+    while fd < 0 && port < 18560 {
+        port = port + 1;
+        fd = p_socket_listen(port);
+    }
+    if !http2_tls_listen(fd, a, b, route) {
+        println("FAIL: the certificate could not be loaded, or ALPN not set");
+        return 1;
+    }
+    await client(port);
+    if g_failed {
+        println("FAIL");
+        return 1;
+    }
+    println("ok");
+    return 0;
+}

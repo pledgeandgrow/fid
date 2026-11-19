@@ -1,0 +1,564 @@
+# RL5: the module passes (iropt.fd: inline, inline2, inlineclo, ipcp, spec,
+# gconst, icf) and devirtualization. A pair holds every function of the
+# module before and after the pass; `check` names the one compared. The
+# pass's witness is tried first (tv.fd tv_mod_check), then runs on random
+# inputs in which calls into the module are run in the module before or
+# after the pass.
+
+# g(a) = a + 1 inlined into h(x) = g(x) * 3: the call is now a copy of g's
+# one block
+pair inline_copy
+pass inline
+expect accept
+check h
+before
+fn g(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn h(%0: i64) -> i64
+b0:
+  %1 = call i64 g(%0)
+  %2 = const i64 3
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+after
+fn g(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn h(%0: i64) -> i64
+b0:
+  %5 = const i64 1
+  %6 = add i64 %0 %5
+  %1 = bitcast i64 i64 %6
+  %2 = const i64 3
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+
+pair inline_wrong_copy
+pass inline
+expect reject
+check h
+before
+fn g(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn h(%0: i64) -> i64
+b0:
+  %1 = call i64 g(%0)
+  %2 = const i64 3
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+after
+fn g(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn h(%0: i64) -> i64
+b0:
+  %5 = const i64 1
+  %6 = sub i64 %0 %5
+  %1 = bitcast i64 i64 %6
+  %2 = const i64 3
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+
+# inline2 (iropt_me): a callee with a branch, inlined as its blocks
+pair inline2_blocks
+pass inline2
+expect accept
+check h
+before
+fn absv(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %2 = lt bool %0 %1
+  %3 = br %2 b1 b2
+b1:
+  %4 = neg i64 %0
+  %5 = ret %4
+b2:
+  %6 = ret %0
+fn h(%0: i64) -> i64
+b0:
+  %1 = call i64 absv(%0)
+  %2 = const i64 1
+  %3 = add i64 %1 %2
+  %4 = ret %3
+after
+fn absv(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %2 = lt bool %0 %1
+  %3 = br %2 b1 b2
+b1:
+  %4 = neg i64 %0
+  %5 = ret %4
+b2:
+  %6 = ret %0
+fn h(%0: i64) -> i64
+b0:
+  %5 = alloca i64
+  %6 = const i64 0
+  %7 = lt bool %0 %6
+  %8 = br %7 b1 b2
+b1:
+  %9 = neg i64 %0
+  %10 = store %5 %9
+  %11 = jump b3
+b2:
+  %12 = store %5 %0
+  %13 = jump b3
+b3:
+  %1 = load i64 %5
+  %2 = const i64 1
+  %3 = add i64 %1 %2
+  %4 = ret %3
+
+# ... with the two sides of the callee's branch swapped
+pair inline2_blocks_swapped
+pass inline2
+expect reject
+check h
+before
+fn absv(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %2 = lt bool %0 %1
+  %3 = br %2 b1 b2
+b1:
+  %4 = neg i64 %0
+  %5 = ret %4
+b2:
+  %6 = ret %0
+fn h(%0: i64) -> i64
+b0:
+  %1 = call i64 absv(%0)
+  %2 = const i64 1
+  %3 = add i64 %1 %2
+  %4 = ret %3
+after
+fn absv(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %2 = lt bool %0 %1
+  %3 = br %2 b1 b2
+b1:
+  %4 = neg i64 %0
+  %5 = ret %4
+b2:
+  %6 = ret %0
+fn h(%0: i64) -> i64
+b0:
+  %5 = alloca i64
+  %6 = const i64 0
+  %7 = lt bool %0 %6
+  %8 = br %7 b2 b1
+b1:
+  %9 = neg i64 %0
+  %10 = store %5 %9
+  %11 = jump b3
+b2:
+  %12 = store %5 %0
+  %13 = jump b3
+b3:
+  %1 = load i64 %5
+  %2 = const i64 1
+  %3 = add i64 %1 %2
+  %4 = ret %3
+
+# inlineclo: a closure called once (its env first) inlined like inline2
+pair inlineclo_copy
+pass inlineclo
+expect accept
+check run
+before
+fn __closure_0(%0: i64, %1: i64) -> i64
+b0:
+  %2 = const i64 2
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+fn run(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %2 = call i64 __closure_0(%1, %0)
+  %3 = ret %2
+after
+fn __closure_0(%0: i64, %1: i64) -> i64
+b0:
+  %2 = const i64 2
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+fn run(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %4 = const i64 2
+  %5 = mul i64 %0 %4
+  %2 = bitcast i64 i64 %5
+  %3 = ret %2
+
+pair inlineclo_wrong_param
+pass inlineclo
+expect reject
+check run
+before
+fn __closure_0(%0: i64, %1: i64) -> i64
+b0:
+  %2 = const i64 2
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+fn run(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %2 = call i64 __closure_0(%1, %0)
+  %3 = ret %2
+after
+fn __closure_0(%0: i64, %1: i64) -> i64
+b0:
+  %2 = const i64 2
+  %3 = mul i64 %1 %2
+  %4 = ret %3
+fn run(%0: i64) -> i64
+b0:
+  %1 = const i64 0
+  %4 = const i64 2
+  %5 = mul i64 %1 %4
+  %2 = bitcast i64 i64 %5
+  %3 = ret %2
+
+# ipcp: q(a, b) = a + b with b replaced by 5, which every call passes
+pair ipcp_agreed_constant
+pass ipcp
+expect accept
+check q
+before
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn m1() -> i64
+b0:
+  %0 = const i64 1
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+fn m2() -> i64
+b0:
+  %0 = const i64 2
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+after
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %4 = const i64 5
+  %2 = add i64 %0 %4
+  %3 = ret %2
+fn m1() -> i64
+b0:
+  %0 = const i64 1
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+fn m2() -> i64
+b0:
+  %0 = const i64 2
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+
+# ... when one call passes 6
+pair ipcp_calls_differ
+pass ipcp
+expect reject
+check q
+before
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn m1() -> i64
+b0:
+  %0 = const i64 1
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+fn m2() -> i64
+b0:
+  %0 = const i64 2
+  %1 = const i64 6
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+after
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %4 = const i64 5
+  %2 = add i64 %0 %4
+  %3 = ret %2
+fn m1() -> i64
+b0:
+  %0 = const i64 1
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+fn m2() -> i64
+b0:
+  %0 = const i64 2
+  %1 = const i64 6
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+
+# spec: m's call q(3, 5) sent to a clone of q whose b is the constant 5
+pair spec_clone
+pass spec
+expect accept
+check m
+before
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %2 = mul i64 %0 %1
+  %3 = ret %2
+fn m() -> i64
+b0:
+  %0 = const i64 3
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+after
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %2 = mul i64 %0 %1
+  %3 = ret %2
+fn m() -> i64
+b0:
+  %0 = const i64 3
+  %1 = const i64 5
+  %2 = call i64 q_sc1_5(%0, %1)
+  %3 = ret %2
+fn q_sc1_5(%0: i64, %1: i64) -> i64
+b0:
+  %4 = const i64 5
+  %2 = mul i64 %0 %4
+  %3 = ret %2
+
+pair spec_clone_other_constant
+pass spec
+expect reject
+check m
+before
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %2 = mul i64 %0 %1
+  %3 = ret %2
+fn m() -> i64
+b0:
+  %0 = const i64 3
+  %1 = const i64 5
+  %2 = call i64 q(%0, %1)
+  %3 = ret %2
+after
+fn q(%0: i64, %1: i64) -> i64
+b0:
+  %2 = mul i64 %0 %1
+  %3 = ret %2
+fn m() -> i64
+b0:
+  %0 = const i64 3
+  %1 = const i64 5
+  %2 = call i64 q_sc1_5(%0, %1)
+  %3 = ret %2
+fn q_sc1_5(%0: i64, %1: i64) -> i64
+b0:
+  %4 = const i64 6
+  %2 = mul i64 %0 %4
+  %3 = ret %2
+
+# gconst: a load of G (initializer 5) folded to 5
+pair gconst_unstored_global
+pass gconst
+expect accept
+check u
+global G i64 5
+before
+fn u() -> i64
+b0:
+  %0 = global i64 G
+  %1 = load i64 %0
+  %2 = ret %1
+after
+fn u() -> i64
+b0:
+  %0 = global i64 G
+  %1 = const i64 5
+  %2 = ret %1
+
+# ... while another function stores 9 into G
+pair gconst_stored_global
+pass gconst
+expect reject
+check u
+global G i64 5
+before
+fn u() -> i64
+b0:
+  %0 = global i64 G
+  %1 = load i64 %0
+  %2 = ret %1
+fn s() -> i64
+b0:
+  %0 = global i64 G
+  %1 = const i64 9
+  %2 = store %0 %1
+  %3 = ret %1
+after
+fn u() -> i64
+b0:
+  %0 = global i64 G
+  %1 = const i64 5
+  %2 = ret %1
+fn s() -> i64
+b0:
+  %0 = global i64 G
+  %1 = const i64 9
+  %2 = store %0 %1
+  %3 = ret %1
+
+# icf: a call of k1 sent to k2, which has the same body
+pair icf_same_body
+pass icf
+expect accept
+check c
+before
+fn k1(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn k2(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn c(%0: i64) -> i64
+b0:
+  %1 = call i64 k1(%0)
+  %2 = ret %1
+after
+fn k1(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn k2(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn c(%0: i64) -> i64
+b0:
+  %1 = call i64 k2(%0)
+  %2 = ret %1
+
+pair icf_other_body
+pass icf
+expect reject
+check c
+before
+fn k1(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn k2(%0: i64) -> i64
+b0:
+  %1 = const i64 2
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn c(%0: i64) -> i64
+b0:
+  %1 = call i64 k1(%0)
+  %2 = ret %1
+after
+fn k1(%0: i64) -> i64
+b0:
+  %1 = const i64 1
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn k2(%0: i64) -> i64
+b0:
+  %1 = const i64 2
+  %2 = add i64 %0 %1
+  %3 = ret %2
+fn c(%0: i64) -> i64
+b0:
+  %1 = call i64 k2(%0)
+  %2 = ret %1
+
+# devirt: a trait call on a value made from T is T's method, called with
+# the env 0 first
+pair devirt_known_type
+pass devirt
+expect accept
+check dv
+before
+fn T_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %1
+fn U_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %0
+fn dv(%0: i64) -> i64
+b0:
+  %1 = makedyn %0 T Tr
+  %2 = dyncall i64 Tr m(%1)
+  %3 = ret %2
+after
+fn T_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %1
+fn U_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %0
+fn dv(%0: i64) -> i64
+b0:
+  %1 = makedyn %0 T Tr
+  %4 = const i64 0
+  %2 = call i64 T_m(%4, %0)
+  %3 = ret %2
+
+pair devirt_other_type
+pass devirt
+expect reject
+why not T_m
+check dv
+before
+fn T_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %1
+fn U_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %0
+fn dv(%0: i64) -> i64
+b0:
+  %1 = makedyn %0 T Tr
+  %2 = dyncall i64 Tr m(%1)
+  %3 = ret %2
+after
+fn T_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %1
+fn U_m(%0: i64, %1: i64) -> i64
+b0:
+  %2 = ret %0
+fn dv(%0: i64) -> i64
+b0:
+  %1 = makedyn %0 T Tr
+  %4 = const i64 0
+  %2 = call i64 U_m(%4, %0)
+  %3 = ret %2

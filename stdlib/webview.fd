@@ -1,0 +1,391 @@
+// Fides web view bridge: JSON-RPC between JavaScript and Fides
+//
+// What is real (pure Fides, tested in the interpreter):
+//   - the message protocol, JSON-RPC 2.0: requests with ids, notifications
+//     without, results and errors (-32700 parse error, -32600 invalid
+//     request, -32601 method not found, -32602 invalid params, -32603
+//     internal error), batches; Fides handlers registered by method name
+//   - calls from Fides into JavaScript: ids, a pending table, responses
+//     matched back to their call, timeouts
+//   - events pushed to JavaScript (notifications)
+//   - the bridge script injected into the page (window.FidesBridge with
+//     call / notify / on, a Promise per call) for Android
+//     (addJavascriptInterface object) or iOS (WKScriptMessageHandler), and
+//     the evaluateJavascript text that delivers a message, with a JS string
+//     escape that also covers U+2028 / U+2029 and "</script>"
+//   - the origin allow-list: exact origins and "*." subdomains, default
+//     ports normalized, opaque "null" and file: origins refused unless
+//     listed
+//
+// The platform seam: creating the view and moving strings across is the
+// platform's (Android WebView through jni.fd, WKWebView through objc.fd);
+// the calls are given as data by `webview_android_calls` /
+// `webview_ios_calls`. The bridge object takes each incoming message text
+// with its origin (webview_receive) and returns the text to send back;
+// outgoing text is produced by webview_call_js / webview_emit.
+
+module webview;
+use vec;
+use string;
+use json;
+
+pub const RPC_PARSE_ERROR: i64 = -32700;
+pub const RPC_INVALID_REQUEST: i64 = -32600;
+pub const RPC_METHOD_NOT_FOUND: i64 = -32601;
+pub const RPC_INVALID_PARAMS: i64 = -32602;
+pub const RPC_INTERNAL_ERROR: i64 = -32603;
+pub const RPC_ORIGIN_REFUSED: i64 = -32000;
+
+// ─── Origins ───────────────────────────────────────────────────────────
+
+/// The origin of a URL ("scheme://host[:port]", default port dropped,
+/// lower case); "null" for opaque ones (data:, about:, blob: without an
+/// inner origin).
+pub fn webview_origin(url: str) -> str {
+    val c: i64 = str_find(url, "://");
+    if c <= 0 {
+        if str_starts_with(str_to_lower(url), "file:") { return "file://"; }
+        return "null";
+    }
+    val scheme: str = str_to_lower(str_slice(url, 0, c));
+    var rest: str = str_slice(url, c + 3, str_len(url));
+    var end: i64 = str_len(rest);
+    var k: i64 = 0;
+    while k < str_len(rest) {
+        val ch: i64 = str_byte_at(rest, k);
+        if ch == 47 || ch == 63 || ch == 35 { end = k; break; }
+        k = k + 1;
+    }
+    var auth: str = str_to_lower(str_slice(rest, 0, end));
+    val at: i64 = str_rfind(auth, "@");
+    if at >= 0 { auth = str_slice(auth, at + 1, str_len(auth)); }
+    if scheme == "file" { return "file://"; }
+    val pc: i64 = str_rfind(auth, ":");
+    if pc >= 0 && str_rfind(auth, "]") < pc {
+        val port: str = str_slice(auth, pc + 1, str_len(auth));
+        if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") || str_len(port) == 0 {
+            auth = str_slice(auth, 0, pc);
+        }
+    }
+    return scheme + "://" + auth;
+}
+
+/// Is `origin` allowed by the list? Entries are origins
+/// ("https://example.com", "app://local") or wildcards
+/// ("https://*.example.com" matches subdomains, not the bare domain).
+pub fn webview_origin_allowed(allow: &Vec<str>, origin: str) -> bool {
+    val o: str = webview_origin(origin);
+    var i: i64 = 0;
+    while i < allow.len() {
+        val a: str = str_to_lower(allow.get(i));
+        if str_contains(a, "://*.") {
+            val c: i64 = str_find(a, "://*.");
+            val scheme: str = str_slice(a, 0, c);
+            val suffix: str = str_slice(a, c + 4, str_len(a));   // ".example.com"
+            if str_starts_with(o, scheme + "://") {
+                val host: str = str_slice(o, str_len(scheme) + 3, str_len(o));
+                if str_ends_with(host, suffix) && str_len(host) > str_len(suffix) && !str_contains(host, "/") { return true; }
+            }
+        } else if webview_origin(a) == o {
+            if o != "null" || a == "null" { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── JSON-RPC messages ─────────────────────────────────────────────────
+
+/// An error result for a handler to return: dispatch turns it into a
+/// JSON-RPC error response.
+pub fn webview_error_result(code: i64, message: str) -> str {
+    return "{\"$error\":{\"code\":" + int_to_str(code) + ",\"message\":" + json_string(message) + "}}";
+}
+
+pub fn webview_response(id: str, result: str) -> str {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}";
+}
+
+pub fn webview_error_response(id: str, code: i64, message: str) -> str {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + int_to_str(code) + ",\"message\":" + json_string(message) + "}}";
+}
+
+pub fn webview_request(id: i64, method: str, params: str) -> str {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + int_to_str(id) + ",\"method\":" + json_string(method) + ",\"params\":" + params + "}";
+}
+
+pub fn webview_notification(method: str, params: str) -> str {
+    return "{\"jsonrpc\":\"2.0\",\"method\":" + json_string(method) + ",\"params\":" + params + "}";
+}
+
+// ─── The bridge ────────────────────────────────────────────────────────
+
+pub struct WebviewPending {
+    pub id: i64,
+    pub method: str,
+    pub sent_ms: i64,
+}
+
+/// A registered handler (a struct: a Vec of bare function values is not
+/// callable in the interpreter).
+pub struct WebviewHandler {
+    pub f: fn(str) -> str,
+}
+
+pub struct WebviewBridge {
+    pub allow: Vec<str>,
+    pub methods: Vec<str>,
+    pub handlers: Vec<WebviewHandler>,
+    pub next_id: i64,
+    pub pending: Vec<WebviewPending>,
+    pub resolved_ids: Vec<i64>,        // calls into JS answered, in order
+    pub resolved_vals: Vec<str>,       // their result (or error) JSON
+    pub resolved_ok: Vec<bool>,
+    pub refused: i64,                  // messages from origins not allowed
+}
+
+pub fn webview_bridge_new(allow: Vec<str>) -> WebviewBridge {
+    return WebviewBridge {
+        allow: allow, methods: Vec::new(), handlers: Vec::new(), next_id: 1, pending: Vec::new(),
+        resolved_ids: Vec::new(), resolved_vals: Vec::new(), resolved_ok: Vec::new(), refused: 0,
+    };
+}
+
+/// Register a Fides method JavaScript may call: the handler gets the
+/// params JSON ("null" when absent) and returns the result JSON, or a
+/// webview_error_result.
+pub fn webview_register(b: &mut WebviewBridge, method: str, handler: fn(str) -> str) {
+    var i: i64 = 0;
+    while i < b.methods.len() {
+        if b.methods.get(i) == method { b.handlers.set(i, WebviewHandler { f: handler }); return; }
+        i = i + 1;
+    }
+    b.methods.push(method);
+    b.handlers.push(WebviewHandler { f: handler });
+}
+
+fn wv_id_ok(raw: str) -> bool {
+    val t: str = json_type_safe(raw);
+    return t == "number" || t == "string" || t == "null";
+}
+
+// Handle one request object; "" for a notification (no reply).
+fn wv_one(b: &mut WebviewBridge, msg: str) -> str {
+    if json_type_safe(msg) != "object" { return webview_error_response("null", RPC_INVALID_REQUEST, "Invalid Request"); }
+    val has_id: bool = json_has(msg, "id");
+    val id: str = if has_id { json_get_safe(msg, "id") } else { "null" };
+    if has_id && !wv_id_ok(id) { return webview_error_response("null", RPC_INVALID_REQUEST, "Invalid Request"); }
+    // a response to one of our calls into JavaScript
+    if !json_has(msg, "method") && has_id && (json_has(msg, "result") || json_has(msg, "error")) {
+        wv_resolve(b, msg);
+        return "";
+    }
+    if json_get_safe(msg, "jsonrpc") != "\"2.0\"" || json_type_safe(json_get_safe(msg, "method")) != "string" {
+        return webview_error_response(id, RPC_INVALID_REQUEST, "Invalid Request");
+    }
+    val method: str = json_unescape(json_get_safe(msg, "method"));
+    var params: str = "null";
+    if json_has(msg, "params") {
+        params = json_get_safe(msg, "params");
+        val pt: str = json_type_safe(params);
+        if pt != "object" && pt != "array" { return webview_error_response(id, RPC_INVALID_PARAMS, "Invalid params"); }
+    }
+    var k: i64 = -1;
+    var i: i64 = 0;
+    while i < b.methods.len() {
+        if b.methods.get(i) == method { k = i; }
+        i = i + 1;
+    }
+    if k < 0 {
+        if !has_id { return ""; }
+        return webview_error_response(id, RPC_METHOD_NOT_FOUND, "Method not found");
+    }
+    val h: fn(str) -> str = b.handlers.get(k).f;
+    val result: str = h(params);
+    if !has_id { return ""; }
+    if !json_is_valid(result) { return webview_error_response(id, RPC_INTERNAL_ERROR, "Internal error"); }
+    if json_type_safe(result) == "object" && json_has(result, "$error") {
+        val e: str = json_get_safe(result, "$error");
+        return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":" + e + "}";
+    }
+    return webview_response(id, result);
+}
+
+/// Take a message JavaScript posted from `origin`; returns the text to
+/// send back ("" when there is nothing to send).
+pub fn webview_receive(b: &mut WebviewBridge, origin: str, text: str) -> str {
+    if !webview_origin_allowed(&b.allow, origin) {
+        b.refused = b.refused + 1;
+        return "";
+    }
+    if !json_is_valid(text) { return webview_error_response("null", RPC_PARSE_ERROR, "Parse error"); }
+    if json_type_safe(text) == "array" {
+        val n: i64 = json_len_safe(text);
+        if n == 0 { return webview_error_response("null", RPC_INVALID_REQUEST, "Invalid Request"); }
+        var out: str = "";
+        var i: i64 = 0;
+        while i < n {
+            val r: str = wv_one(b, json_at_safe(text, i));
+            if str_len(r) > 0 {
+                if str_len(out) > 0 { out = out + ","; }
+                out = out + r;
+            }
+            i = i + 1;
+        }
+        if str_len(out) == 0 { return ""; }
+        return "[" + out + "]";
+    }
+    return wv_one(b, text);
+}
+
+/// Call a JavaScript method registered with FidesBridge.on: returns the
+/// request text (deliver it with webview_js_eval); the answer arrives
+/// through webview_receive and lands in resolved_*.
+pub fn webview_call_js(b: &mut WebviewBridge, method: str, params: str, now_ms: i64) -> str {
+    val id: i64 = b.next_id;
+    b.next_id = b.next_id + 1;
+    b.pending.push(WebviewPending { id: id, method: method, sent_ms: now_ms });
+    return webview_request(id, method, params);
+}
+
+/// An event for JavaScript listeners (no answer expected).
+pub fn webview_emit(event: str, params: str) -> str { return webview_notification(event, params); }
+
+fn wv_resolve(b: &mut WebviewBridge, msg: str) {
+    val idraw: str = json_get_safe(msg, "id");
+    if json_type_safe(idraw) != "number" { return; }
+    val id: i64 = str_parse_int(idraw);
+    var i: i64 = 0;
+    while i < b.pending.len() {
+        if b.pending.get(i).id == id {
+            b.pending.remove(i);
+            b.resolved_ids.push(id);
+            if json_has(msg, "error") {
+                b.resolved_vals.push(json_get_safe(msg, "error"));
+                b.resolved_ok.push(false);
+            } else {
+                b.resolved_vals.push(json_get_safe(msg, "result"));
+                b.resolved_ok.push(true);
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// Drop calls into JavaScript older than `timeout_ms`; their ids.
+pub fn webview_expire(b: &mut WebviewBridge, now_ms: i64, timeout_ms: i64) -> Vec<i64> {
+    var gone: Vec<i64> = Vec::new();
+    var keep: Vec<WebviewPending> = Vec::new();
+    var i: i64 = 0;
+    while i < b.pending.len() {
+        val p: WebviewPending = b.pending.get(i);
+        if now_ms - p.sent_ms > timeout_ms { gone.push(p.id); } else { keep.push(p); }
+        i = i + 1;
+    }
+    b.pending = keep;
+    return gone;
+}
+
+// ─── JavaScript text ───────────────────────────────────────────────────
+
+/// A JavaScript string literal (double quotes) safe inside a script and
+/// an HTML <script> element: \, ", control characters, U+2028, U+2029 and
+/// "</" are escaped.
+pub fn webview_js_string(s: str) -> str {
+    var out: str = "\"";
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c == 92 { out = out + "\\\\"; }
+        else if c == 34 { out = out + "\\\""; }
+        else if c == 10 { out = out + "\\n"; }
+        else if c == 13 { out = out + "\\r"; }
+        else if c == 9 { out = out + "\\t"; }
+        else if c < 32 {
+            val h: str = "0123456789abcdef";
+            out = out + "\\u00" + str_slice(h, c >> 4, (c >> 4) + 1) + str_slice(h, c & 15, (c & 15) + 1);
+        }
+        else if c == 60 && i + 1 < b.len() && b.get(i + 1) == 47 { out = out + "<\\/"; i = i + 1; }
+        else if c == 0xE2 && i + 2 < b.len() && b.get(i + 1) == 0x80 && (b.get(i + 2) == 0xA8 || b.get(i + 2) == 0xA9) {
+            out = out + (if b.get(i + 2) == 0xA8 { "\\u2028" } else { "\\u2029" });
+            i = i + 2;
+        }
+        else {
+            // copy the byte run up to the next special byte as is
+            var j: i64 = i;
+            while j < b.len() && b.get(j) >= 32 && b.get(j) != 92 && b.get(j) != 34 && b.get(j) != 60 && b.get(j) != 0xE2 { j = j + 1; }
+            if j == i { j = i + 1; }
+            out = out + str_slice(s, i, j);
+            i = j - 1;
+        }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+/// The text to evaluate in the page to deliver `message` to the bridge.
+pub fn webview_js_eval(message: str) -> str {
+    return "window.FidesBridge&&window.FidesBridge._receive(" + webview_js_string(message) + ");";
+}
+
+pub const WEBVIEW_ANDROID: i64 = 0;
+pub const WEBVIEW_IOS: i64 = 1;
+
+/// The script injected at document start: window.FidesBridge.
+/// `channel` is the interface name (Android addJavascriptInterface) or the
+/// script message handler name (iOS).
+pub fn webview_bridge_script(platform: i64, channel: str) -> str {
+    var post: str = "";
+    if platform == WEBVIEW_ANDROID { post = "window." + channel + ".postMessage(t)"; }
+    else { post = "window.webkit.messageHandlers." + channel + ".postMessage(t)"; }
+    var s: str = "(function(){\n";
+    s = s + "if(window.FidesBridge)return;\n";
+    s = s + "var next=1,pending={},handlers={},listeners={};\n";
+    s = s + "function send(m){var t=JSON.stringify(m);" + post + ";}\n";
+    s = s + "window.FidesBridge={\n";
+    s = s + "call:function(method,params){return new Promise(function(ok,fail){var id=next++;pending[id]={ok:ok,fail:fail};send({jsonrpc:\"2.0\",id:id,method:method,params:params===undefined?null:params});});},\n";
+    s = s + "notify:function(method,params){send({jsonrpc:\"2.0\",method:method,params:params===undefined?null:params});},\n";
+    s = s + "handle:function(method,fn){handlers[method]=fn;},\n";
+    s = s + "on:function(event,fn){(listeners[event]=listeners[event]||[]).push(fn);},\n";
+    s = s + "_receive:function(text){var ms=JSON.parse(text);if(!Array.isArray(ms))ms=[ms];ms.forEach(function(m){\n";
+    s = s + "if(m.method===undefined){var p=pending[m.id];if(!p)return;delete pending[m.id];if(m.error)p.fail(m.error);else p.ok(m.result);return;}\n";
+    s = s + "if(m.id===undefined){(listeners[m.method]||[]).forEach(function(f){f(m.params);});return;}\n";
+    s = s + "var h=handlers[m.method];if(!h){send({jsonrpc:\"2.0\",id:m.id,error:{code:-32601,message:\"Method not found\"}});return;}\n";
+    s = s + "Promise.resolve().then(function(){return h(m.params);}).then(function(r){send({jsonrpc:\"2.0\",id:m.id,result:r===undefined?null:r});},function(e){send({jsonrpc:\"2.0\",id:m.id,error:{code:-32603,message:String(e)}});});\n";
+    s = s + "});}\n";
+    s = s + "};\n";
+    s = s + "})();\n";
+    return s;
+}
+
+// ─── Platform calls (as data) ──────────────────────────────────────────
+
+pub struct WebviewCall {
+    pub cls: str,
+    pub method: str,
+    pub sig: str,
+}
+
+pub fn webview_android_calls() -> Vec<WebviewCall> {
+    var v: Vec<WebviewCall> = Vec::new();
+    v.push(WebviewCall { cls: "android/webkit/WebView", method: "<init>", sig: "(Landroid/content/Context;)V" });
+    v.push(WebviewCall { cls: "android/webkit/WebView", method: "getSettings", sig: "()Landroid/webkit/WebSettings;" });
+    v.push(WebviewCall { cls: "android/webkit/WebSettings", method: "setJavaScriptEnabled", sig: "(Z)V" });
+    v.push(WebviewCall { cls: "android/webkit/WebView", method: "addJavascriptInterface", sig: "(Ljava/lang/Object;Ljava/lang/String;)V" });
+    v.push(WebviewCall { cls: "android/webkit/WebView", method: "loadUrl", sig: "(Ljava/lang/String;)V" });
+    v.push(WebviewCall { cls: "android/webkit/WebView", method: "evaluateJavascript", sig: "(Ljava/lang/String;Landroid/webkit/ValueCallback;)V" });
+    return v;
+}
+
+pub fn webview_ios_calls() -> Vec<WebviewCall> {
+    var v: Vec<WebviewCall> = Vec::new();
+    v.push(WebviewCall { cls: "WKUserContentController", method: "addScriptMessageHandler:name:", sig: "v@:@@" });
+    v.push(WebviewCall { cls: "WKUserScript", method: "initWithSource:injectionTime:forMainFrameOnly:", sig: "@@:@qB" });
+    v.push(WebviewCall { cls: "WKUserContentController", method: "addUserScript:", sig: "v@:@" });
+    v.push(WebviewCall { cls: "WKWebView", method: "initWithFrame:configuration:", sig: "@@:{CGRect={CGPoint=dd}{CGSize=dd}}@" });
+    v.push(WebviewCall { cls: "WKWebView", method: "evaluateJavaScript:completionHandler:", sig: "v@:@@?" });
+    v.push(WebviewCall { cls: "WKWebView", method: "loadRequest:", sig: "@@:@" });
+    return v;
+}

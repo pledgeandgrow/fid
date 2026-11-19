@@ -1,0 +1,549 @@
+// USB HID: report descriptor parser, report field extraction, and the
+// boot-protocol keyboard and mouse reports.
+//
+// What is real: the HID 1.11 item format (short items with 0/1/2/4 data
+// bytes, long items skipped), main / global / local items, the global
+// state table with Push and Pop, usages, usage ranges and extended
+// (32-bit, page:usage) usages, collections, report IDs, the bit layout of
+// input / output / feature reports (fields in descriptor order, report
+// ID byte first when IDs are used), signed logical ranges, value
+// extraction with sign extension, lookup of a field by usage, the
+// keyboard boot report (modifier byte, six key slots, ErrorRollOver)
+// with press/release tracking and US-layout ASCII for keyboard usages,
+// the LED output report, the mouse boot report, the HID descriptor inside
+// a configuration descriptor, and the class requests (GET_REPORT,
+// SET_REPORT, SET_IDLE, SET_PROTOCOL, GET_DESCRIPTOR for the report
+// descriptor) as 8-byte SETUP packets.
+//
+// The seam: none at run time — the bytes come from the device through
+// the USB stack (for example interrupt-IN transfers on stdlib xhci), and
+// SETUP packets go out through a control transfer the caller performs.
+module usb_hid;
+ use vec;
+
+pub const HID_INPUT: i64 = 0;
+pub const HID_OUTPUT: i64 = 1;
+pub const HID_FEATURE: i64 = 2;
+
+// Main item flag bits.
+pub const HID_CONSTANT: i64 = 0x01;
+pub const HID_VARIABLE: i64 = 0x02;
+pub const HID_RELATIVE: i64 = 0x04;
+
+// Usage pages.
+pub const HID_PAGE_DESKTOP: i64 = 0x01;
+pub const HID_PAGE_KEYBOARD: i64 = 0x07;
+pub const HID_PAGE_LED: i64 = 0x08;
+pub const HID_PAGE_BUTTON: i64 = 0x09;
+pub const HID_PAGE_CONSUMER: i64 = 0x0C;
+
+// Generic desktop usages.
+pub const HID_USAGE_POINTER: i64 = 0x01;
+pub const HID_USAGE_MOUSE: i64 = 0x02;
+pub const HID_USAGE_KEYBOARD: i64 = 0x06;
+pub const HID_USAGE_X: i64 = 0x30;
+pub const HID_USAGE_Y: i64 = 0x31;
+pub const HID_USAGE_WHEEL: i64 = 0x38;
+
+pub struct HidField {
+    pub report_id: i64,
+    pub kind: i64,
+    pub flags: i64,
+    pub usage_page: i64,
+    pub usages: Vec<i64>,
+    // full 32-bit usages (page << 16 | id), one per element or a list
+    pub usage_min: i64,
+    pub usage_max: i64,
+    // range (full usages), when usages is empty
+    pub bit_offset: i64,
+    // within the report, after the report ID byte
+    pub size: i64,
+    pub count: i64,
+    pub logical_min: i64,
+    pub logical_max: i64,
+    pub collection: i64,  // usage of the innermost application/physical collection
+}
+
+pub struct HidDescriptor {
+    pub fields: Vec<HidField>,
+    pub report_ids: Vec<i64>,
+    pub uses_ids: bool,
+    pub collections: Vec<i64>,
+    // application collection usages
+    pub error: str,
+}
+
+fn hid_sext(v: i64, nbytes: i64) -> i64 {
+    if nbytes == 1 && v >= 0x80 { return v - 0x100; }
+    if nbytes == 2 && v >= 0x8000 { return v - 0x10000; }
+    if nbytes == 4 && v >= 0x80000000 { return v - 0x100000000; }
+    return v;
+}
+
+fn hid_bits_index(ids: & Vec<i64>, id: i64, kind: i64) -> i64 {
+    var key: i64 = id * 4 + kind;
+    var i: i64 = 0;
+    while i < ids.len() {
+        if ids.get(i) == key {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Parse a report descriptor.
+pub fn hid_parse(d: Vec<i64>) -> HidDescriptor {
+    var out: HidDescriptor = HidDescriptor { fields: Vec::new(), report_ids: Vec::new(), uses_ids: false, collections: Vec::new(), error: "" };
+    // global state: page, lmin, lmax, size, count, report id
+    var g: Vec<i64> = Vec::filled(6, 0);
+    var stack: Vec<i64> = Vec::new();
+    var usages: Vec<i64> = Vec::new();
+    var umin: i64 = -1;
+    var umax: i64 = -1;
+    var coll_stack: Vec<i64> = Vec::new();
+    var keys: Vec<i64> = Vec::new();
+    // (report id * 4 + kind) of each running bit count
+    var bits: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < d.len() {
+        var pre: i64 = d.get(i);
+        if pre == 0xFE {
+            if i + 1 >= d.len() { out.error = "truncated long item"; return out; }
+            i = i + 3 + d.get(i + 1);
+            continue;
+        }
+        var sz: i64 = pre & 3;
+        if sz == 3 { sz = 4; }
+        var ty: i64 = (pre >> 2) & 3;
+        var tag: i64 = (pre >> 4) & 15;
+        if i + sz >= d.len() {
+            out.error = "truncated item";
+            return out;
+        }
+        var v: i64 = 0;
+        var k: i64 = sz - 1;
+        while k >= 0 {
+            v = v * 256 + d.get(i + 1 + k);
+            k = k - 1;
+        }
+        i = i + 1 + sz;
+        if ty == 1 {
+            if tag == 0 { g.set(0, v); }
+            if tag == 1 { g.set(1, hid_sext(v, sz)); }
+            if tag == 2 {
+                // a maximum that only fits unsigned (15 00 25 FF) is unsigned
+                var mx: i64 = hid_sext(v, sz);
+                if mx < 0 && g.get(1) >= 0 { mx = v; }
+                g.set(2, mx);
+            }
+            if tag == 7 { g.set(3, v); }
+            if tag == 8 {
+                g.set(5, v);
+                out.uses_ids = true;
+                if !out.report_ids.contains(v) { out.report_ids.push(v); }
+            }
+            if tag == 9 { g.set(4, v); }
+            if tag == 10 {
+                var s: i64 = 0;
+                while s < 6 { stack.push(g.get(s)); s = s + 1; }
+            }
+            if tag == 11 {
+                if stack.len() < 6 { out.error = "pop without push"; return out; }
+                var s2: i64 = 5;
+                while s2 >= 0 {
+                    g.set(s2, stack.get(stack.len() - 1));
+                    stack.remove(stack.len() - 1);
+                    s2 = s2 - 1;
+                }
+            }
+            continue;
+        }
+        if ty == 2 {
+            var full: i64 = v;
+            if sz < 4 { full = (g.get(0) << 16) | v; }
+            if tag == 0 { usages.push(full); }
+            if tag == 1 { umin = full; }
+            if tag == 2 { umax = full; }
+            continue;
+        }
+        if ty == 0 {
+            if tag == 10 {
+                var cu: i64 = 0;
+                if usages.len() > 0 { cu = usages.get(0); }
+                coll_stack.push(cu);
+                if v == 1 { out.collections.push(cu); }
+            }
+            if tag == 12 {
+                if coll_stack.len() == 0 { out.error = "unbalanced end collection"; return out; }
+                coll_stack.remove(coll_stack.len() - 1);
+            }
+            if tag == 8 || tag == 9 || tag == 11 {
+                var kind: i64 = HID_INPUT;
+                if tag == 9 { kind = HID_OUTPUT; }
+                if tag == 11 { kind = HID_FEATURE; }
+                var key: i64 = g.get(5) * 4 + kind;
+                var bi: i64 = hid_bits_index(&keys, g.get(5), kind);
+                if bi < 0 {
+                    keys.push(key);
+                    bits.push(0);
+                    bi = keys.len() - 1;
+                }
+                var cu2: i64 = 0;
+                if coll_stack.len() > 0 { cu2 = coll_stack.get(coll_stack.len() - 1); }
+                out.fields.push(HidField {
+                    report_id: g.get(5), kind: kind, flags: v, usage_page: g.get(0), usages: usages, usage_min: umin, usage_max: umax, bit_offset: bits.get(bi), size: g.get(3), count: g.get(4), logical_min: g.get(1), logical_max: g.get(2), collection: cu2
+                });
+                bits.set(bi, bits.get(bi) + g.get(3) * g.get(4));
+            }
+            // local items end with each main item
+            usages = Vec::new();
+            umin = -1;
+            umax = -1;
+            continue;
+        }
+    }
+    if coll_stack.len() != 0 {
+        out.error = "unclosed collection";
+    }
+    return out;
+}
+
+/// Bits of report `id` of a kind (without the report ID byte).
+pub fn hid_report_bits(h: & HidDescriptor, id: i64, kind: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < h.fields.len() {
+        var f: HidField = h.fields.get(i);
+        if f.report_id == id && f.kind == kind {
+            n = n + f.size * f.count;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Bytes on the wire, report ID byte included when IDs are used.
+pub fn hid_report_bytes(h: & HidDescriptor, id: i64, kind: i64) -> i64 {
+    var b: i64 = (hid_report_bits(h, id, kind) + 7) / 8;
+    if h.uses_ids {
+        b = b + 1;
+    }
+    return b;
+}
+
+/// Usage of element `idx` of a variable field.
+pub fn hid_field_usage(f: & HidField, idx: i64) -> i64 {
+    if f.usages.len() > 0 {
+        if idx < f.usages.len() {
+            return f.usages.get(idx);
+        }
+        return f.usages.get(f.usages.len() - 1);
+    }
+    if f.usage_min >= 0 {
+        return f.usage_min + idx;
+    }
+    return 0;
+}
+
+/// Raw bits at bit offset `off` (little-endian bit order), n <= 32.
+pub fn hid_bits(r: Vec<i64>, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        var bit: i64 = off + k;
+        var byte: i64 = bit / 8;
+        if byte < r.len() {
+            v = v | (((r.get(byte) >> (bit % 8)) & 1) << k);
+        }
+        k = k + 1;
+    }
+    return v;
+}
+
+/// Element idx of field f in report r (r starts with the report ID byte
+/// when the descriptor uses IDs); sign-extended when logical_min < 0.
+pub fn hid_field_value(h: & HidDescriptor, f: & HidField, r: Vec<i64>, idx: i64) -> i64 {
+    var base: i64 = 0;
+    if h.uses_ids {
+        base = 8;
+    }
+    var v: i64 = hid_bits(r, base + f.bit_offset + idx * f.size, f.size);
+    if f.logical_min < 0 && f.size < 64 && ((v >> (f.size - 1)) & 1) != 0 {
+        v = v - (1 << f.size);
+    }
+    return v;
+}
+
+/// Index of the field of `kind` carrying usage (page << 16 | id), -1.
+/// Array fields match when the usage is inside their range.
+pub fn hid_find(h: & HidDescriptor, kind: i64, usage: i64) -> i64 {
+    var i: i64 = 0;
+    while i < h.fields.len() {
+        var f: HidField = h.fields.get(i);
+        if f.kind == kind && (f.flags & HID_CONSTANT) == 0 {
+            if f.usages.contains(usage) {
+                return i;
+            }
+            if f.usage_min >= 0 && usage >= f.usage_min && usage <= f.usage_max {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Value of a variable usage in an input report (e.g. desktop X), or
+/// `missing` when the descriptor has no such field.
+pub fn hid_usage_value(h: & HidDescriptor, r: Vec<i64>, usage: i64, missing: i64) -> i64 {
+    var fi: i64 = hid_find(h, HID_INPUT, usage);
+    if fi < 0 {
+        return missing;
+    }
+    var f: HidField = h.fields.get(fi);
+    if h.uses_ids && r.get(0) != f.report_id {
+        return missing;
+    }
+    var idx: i64 = 0;
+    var j: i64 = 0;
+    while j < f.count {
+        if hid_field_usage(&f, j) == usage {
+            idx = j;
+        }
+        j = j + 1;
+    }
+    return hid_field_value(h, &f, r, idx);
+}
+
+// ─── Boot keyboard ──────────────────────────────────────────────────────
+
+pub const HID_MOD_LCTRL: i64 = 0x01;
+pub const HID_MOD_LSHIFT: i64 = 0x02;
+pub const HID_MOD_LALT: i64 = 0x04;
+pub const HID_MOD_LGUI: i64 = 0x08;
+pub const HID_MOD_RCTRL: i64 = 0x10;
+pub const HID_MOD_RSHIFT: i64 = 0x20;
+pub const HID_MOD_RALT: i64 = 0x40;
+pub const HID_MOD_RGUI: i64 = 0x80;
+
+pub const HID_KEY_ROLLOVER: i64 = 0x01;
+pub const HID_KEY_ENTER: i64 = 0x28;
+pub const HID_KEY_CAPS: i64 = 0x39;
+
+pub const HID_LED_NUM: i64 = 1;
+pub const HID_LED_CAPS: i64 = 2;
+pub const HID_LED_SCROLL: i64 = 4;
+
+/// US ASCII for keyboard usages 0x1E..0x38 (digits, Enter, Esc,
+/// Backspace, Tab, Space, punctuation), unshifted and shifted.
+pub const HID_KEYS_PLAIN: [i64; 27] = [49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 10, 27, 8, 9, 32, 45, 61, 91, 93, 92, 35, 59, 39, 96, 44, 46, 47];
+pub const HID_KEYS_SHIFT: [i64; 27] = [33, 64, 35, 36, 37, 94, 38, 42, 40, 41, 10, 27, 8, 9, 32, 95, 43, 123, 125, 124, 126, 58, 34, 126, 60, 62, 63];
+
+/// US ASCII of a keyboard usage, shifted or not; 0 when not printable.
+pub fn hid_key_ascii(usage: i64, shift: bool) -> i64 {
+    if usage >= 0x04 && usage <= 0x1D {
+        if shift { return 65 + usage - 4; }
+        return 97 + usage - 4;
+    }
+    if usage >= 0x1E && usage <= 0x38 {
+        if shift { return HID_KEYS_SHIFT[usage - 0x1E]; }
+        return HID_KEYS_PLAIN[usage - 0x1E];
+    }
+    return 0;
+}
+
+pub struct KeyboardReport {
+    pub mods: i64,
+    pub keys: Vec<i64>,
+    pub rollover: bool,
+}
+
+pub fn hid_kbd_decode(r: Vec<i64>) -> KeyboardReport {
+    var k: KeyboardReport = KeyboardReport { mods: r.get(0), keys: Vec::new(), rollover: false };
+    var i: i64 = 2;
+    while i < 8 && i < r.len() {
+        var c: i64 = r.get(i);
+        if c == HID_KEY_ROLLOVER { k.rollover = true; }
+        if c > 3 { k.keys.push(c); }
+        i = i + 1;
+    }
+    return k;
+}
+
+pub struct KeyboardState {
+    pub prev: KeyboardReport,
+    pub leds: i64,
+    pub pressed: Vec<i64>,
+    // keys that went down in the last report
+    pub released: Vec<i64>,
+    pub text: Vec<i64>,  // ASCII typed by the last report
+}
+
+pub fn hid_kbd_state_new() -> KeyboardState {
+    return KeyboardState { prev: KeyboardReport { mods: 0, keys: Vec::new(), rollover: false }, leds: 0, pressed: Vec::new(), released: Vec::new(), text: Vec::new() };
+}
+
+/// Apply a boot keyboard report: compute presses / releases against the
+/// previous one (a rollover report changes nothing), toggle Caps Lock,
+/// produce ASCII for new keys. Returns true when the LEDs changed (send
+/// hid_led_report).
+pub fn hid_kbd_update(s: & mut KeyboardState, r: Vec<i64>) -> bool {
+    var k: KeyboardReport = hid_kbd_decode(r);
+    s.pressed = Vec::new();
+    s.released = Vec::new();
+    s.text = Vec::new();
+    if k.rollover {
+        return false;
+    }
+    var leds_before: i64 = s.leds;
+    var shift: bool = (k.mods & (HID_MOD_LSHIFT | HID_MOD_RSHIFT)) != 0;
+    var ctrl: bool = (k.mods & (HID_MOD_LCTRL | HID_MOD_RCTRL)) != 0;
+    var i: i64 = 0;
+    while i < k.keys.len() {
+        var c: i64 = k.keys.get(i);
+        if !s.prev.keys.contains(c) {
+            s.pressed.push(c);
+            if c == HID_KEY_CAPS {
+                s.leds = s.leds ^ HID_LED_CAPS;
+            }
+            var caps: bool = (s.leds & HID_LED_CAPS) != 0;
+            var up: bool = shift;
+            if c >= 0x04 && c <= 0x1D && caps { up = !up; }
+            var a: i64 = hid_key_ascii(c, up);
+            if ctrl && a >= 64 && a < 128 { a = a & 0x1F; }
+            if a != 0 { s.text.push(a); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < s.prev.keys.len() {
+        var p: i64 = s.prev.keys.get(i);
+        if !k.keys.contains(p) {
+            s.released.push(p);
+        }
+        i = i + 1;
+    }
+    s.prev = k;
+    return s.leds != leds_before;
+}
+
+/// The one-byte LED output report.
+pub fn hid_led_report(leds: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    r.push(leds & 31);
+    return r;
+}
+
+// ─── Boot mouse ─────────────────────────────────────────────────────────
+
+pub struct MouseReport {
+    pub buttons: i64,
+    pub dx: i64,
+    pub dy: i64,
+    pub wheel: i64,
+}
+
+pub fn hid_mouse_decode(r: Vec<i64>) -> MouseReport {
+    var m: MouseReport = MouseReport { buttons: r.get(0) & 7, dx: hid_sext(r.get(1), 1), dy: hid_sext(r.get(2), 1), wheel: 0 };
+    if r.len() > 3 {
+        m.wheel = hid_sext(r.get(3), 1);
+    }
+    return m;
+}
+
+// ─── Class requests and descriptors ─────────────────────────────────────
+
+pub const HID_GET_REPORT: i64 = 0x01;
+pub const HID_GET_IDLE: i64 = 0x02;
+pub const HID_GET_PROTOCOL: i64 = 0x03;
+pub const HID_SET_REPORT: i64 = 0x09;
+pub const HID_SET_IDLE: i64 = 0x0A;
+pub const HID_SET_PROTOCOL: i64 = 0x0B;
+
+fn hid_setup(bm: i64, req: i64, value: i64, index: i64, length: i64) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    s.push(bm);
+    s.push(req);
+    s.push(value & 255);
+    s.push((value >> 8) & 255);
+    s.push(index & 255);
+    s.push((index >> 8) & 255);
+    s.push(length & 255);
+    s.push((length >> 8) & 255);
+    return s;
+}
+
+/// SET_PROTOCOL: 0 = boot, 1 = report.
+pub fn hid_req_set_protocol(iface: i64, protocol: i64) -> Vec<i64> {
+    return hid_setup(0x21, HID_SET_PROTOCOL, protocol, iface, 0);
+}
+
+/// SET_IDLE: duration in 4 ms units (0 = report only on change).
+pub fn hid_req_set_idle(iface: i64, report_id: i64, duration_4ms: i64) -> Vec<i64> {
+    return hid_setup(0x21, HID_SET_IDLE, (duration_4ms << 8) | report_id, iface, 0);
+}
+
+/// SET_REPORT; type 1 input, 2 output, 3 feature.
+pub fn hid_req_set_report(iface: i64, rtype: i64, report_id: i64, length: i64) -> Vec<i64> {
+    return hid_setup(0x21, HID_SET_REPORT, (rtype << 8) | report_id, iface, length);
+}
+
+pub fn hid_req_get_report(iface: i64, rtype: i64, report_id: i64, length: i64) -> Vec<i64> {
+    return hid_setup(0xA1, HID_GET_REPORT, (rtype << 8) | report_id, iface, length);
+}
+
+/// Standard GET_DESCRIPTOR for the report descriptor (type 0x22).
+pub fn hid_req_report_descriptor(iface: i64, length: i64) -> Vec<i64> {
+    return hid_setup(0x81, 6, 0x2200, iface, length);
+}
+
+pub struct HidInfo {
+    pub found: bool,
+    pub bcd_hid: i64,
+    pub country: i64,
+    pub report_len: i64,
+    pub iface: i64,
+    pub subclass: i64,
+    // 1 = boot interface
+    pub protocol: i64,  // 1 = keyboard, 2 = mouse
+}
+
+/// Find the first HID interface (class 3) in a configuration descriptor
+/// and its HID descriptor (type 0x21) with the report descriptor length.
+pub fn hid_find_in_config(c: Vec<i64>) -> HidInfo {
+    var info: HidInfo = HidInfo { found: false, bcd_hid: 0, country: 0, report_len: 0, iface: -1, subclass: 0, protocol: 0 };
+    var o: i64 = 0;
+    var in_hid: bool = false;
+    while o + 1 < c.len() {
+        var len: i64 = c.get(o);
+        var ty: i64 = c.get(o + 1);
+        if len < 2 {
+            return info;
+        }
+        if ty == 4 && o + 8 < c.len() {
+            in_hid = c.get(o + 5) == 3;
+            if in_hid && info.iface < 0 {
+                info.iface = c.get(o + 2);
+                info.subclass = c.get(o + 6);
+                info.protocol = c.get(o + 7);
+            }
+        }
+        if ty == 0x21 && in_hid && !info.found && o + 8 < c.len() {
+            info.found = true;
+            info.bcd_hid = c.get(o + 2) + c.get(o + 3) * 256;
+            info.country = c.get(o + 4);
+            var n: i64 = c.get(o + 5);
+            var k: i64 = 0;
+            while k < n {
+                var e: i64 = o + 6 + k * 3;
+                if c.get(e) == 0x22 {
+                    info.report_len = c.get(e + 1) + c.get(e + 2) * 256;
+                }
+                k = k + 1;
+            }
+        }
+        o = o + len;
+    }
+    return info;
+}

@@ -39,11 +39,20 @@ new edition.
 
 ## Editions
 
-A change that would break 1.x code goes into an edition (planned for 2.0, not
-yet built; item ST3). A file states its edition; the compiler accepts every
-edition it knows, and code of different editions links together. An edition
-changes syntax or defaults, never the meaning of compiled code across a module
-boundary.
+A change that would break 1.x code goes into an edition (item ST3). A file
+states its edition; the compiler accepts every edition it knows, and code of
+different editions links together. An edition changes syntax or defaults,
+never the meaning of compiled code across a module boundary.
+
+A file states its edition with `#[edition(2026)]` at the top level. A file that
+states none is in the default edition: `fid ... --edition=N`, else the
+`edition` of the project's `ark.toml` `[package]`, else 2026. An edition the
+compiler does not know is an error. `fid` knows:
+
+- **2026**: the 1.x language.
+- **2027**: the next edition, a preview (what it changes may still grow before
+  it is stable). A call of a `@deprecated` function is an error instead of a
+  warning.
 
 ## The two compilers
 

@@ -1,0 +1,145 @@
+// Fides ALPN (RFC 7301): the protocol names a TLS client offers and the
+// one the server picks, in the wire format both sides send ("protocol name
+// list": each name as one length byte, then its bytes).
+//
+// Module `tls` uses it on every platform (Schannel takes the list in a
+// SECBUFFER_APPLICATION_PROTOCOLS buffer, OpenSSL in SSL_set_alpn_protos
+// and the select callback); it has no FFI of its own, so the interpreter
+// runs it too.
+//
+// Usage:
+//   use tls_alpn;
+//   val wire: Vec<i64> = tls_alpn_wire("h2,http/1.1");   // 2 h 2 8 h t t p / 1 . 1
+//   val chosen: str = tls_alpn_pick("h2,http/1.1", wire); // "h2"
+
+module tls_alpn;
+
+/// A comma-separated list of protocol names ("h2,http/1.1") in ALPN's wire
+/// format. Spaces around a name are dropped; an empty name, or one longer
+/// than 255 bytes, is left out. Empty when no name is left.
+pub fn tls_alpn_wire(protos: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(protos);
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        var at_end: bool = i == n;
+        if !at_end {
+            at_end = str_byte_at(protos, i) == 44;
+        }
+        if at_end {
+            var a: i64 = start;
+            var b: i64 = i;
+            while a < b && str_byte_at(protos, a) == 32 {
+                a = a + 1;
+            }
+            while b > a && str_byte_at(protos, b - 1) == 32 {
+                b = b - 1;
+            }
+            if b > a && b - a <= 255 {
+                out.push(b - a);
+                var k: i64 = a;
+                while k < b {
+                    out.push(str_byte_at(protos, k));
+                    k = k + 1;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// True when `wire` is a well-formed protocol name list: entries of 1..255
+/// bytes that fill it exactly.
+pub fn tls_alpn_valid(wire: Vec<i64>) -> bool {
+    if wire.len() == 0 {
+        return false;
+    }
+    var at: i64 = 0;
+    while at < wire.len() {
+        val n: i64 = wire.get(at);
+        if n < 1 || at + 1 + n > wire.len() {
+            return false;
+        }
+        at = at + 1 + n;
+    }
+    return true;
+}
+
+/// The names of a wire-format list, in order (empty if it is malformed).
+pub fn tls_alpn_names(wire: Vec<i64>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if !tls_alpn_valid(wire) {
+        return out;
+    }
+    var at: i64 = 0;
+    while at < wire.len() {
+        val n: i64 = wire.get(at);
+        var b: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < n {
+            b.push(wire.get(at + 1 + k));
+            k = k + 1;
+        }
+        out.push(str_from_bytes(b));
+        at = at + 1 + n;
+    }
+    return out;
+}
+
+// Does entry `at` of list `a` equal entry `bt` of list `b`?
+fn ta_same(a: Vec<i64>, at: i64, b: Vec<i64>, bt: i64) -> bool {
+    val n: i64 = a.get(at);
+    if b.get(bt) != n {
+        return false;
+    }
+    var k: i64 = 1;
+    while k <= n {
+        if a.get(at + k) != b.get(bt + k) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// The server's choice (RFC 7301 3.2): the first of the server's names
+/// (`server`, wire format) that the client also offers (`client`, wire
+/// format). Returns the offset of that entry's length byte in `server`, or
+/// -1 when they share none or a list is malformed.
+pub fn tls_alpn_choose(server: Vec<i64>, client: Vec<i64>) -> i64 {
+    if !tls_alpn_valid(server) || !tls_alpn_valid(client) {
+        return - 1;
+    }
+    var at: i64 = 0;
+    while at < server.len() {
+        var ct: i64 = 0;
+        while ct < client.len() {
+            if ta_same(server, at, client, ct) {
+                return at;
+            }
+            ct = ct + 1 + client.get(ct);
+        }
+        at = at + 1 + server.get(at);
+    }
+    return - 1;
+}
+
+/// The protocol a server offering `server_protos` ("h2,http/1.1") picks
+/// from a client's wire-format list: "" when there is none in common.
+pub fn tls_alpn_pick(server_protos: str, client_wire: Vec<i64>) -> str {
+    val server: Vec<i64> = tls_alpn_wire(server_protos);
+    val at: i64 = tls_alpn_choose(server, client_wire);
+    if at < 0 {
+        return "";
+    }
+    var b: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < server.get(at) {
+        b.push(server.get(at + 1 + k));
+        k = k + 1;
+    }
+    return str_from_bytes(b);
+}

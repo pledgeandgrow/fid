@@ -1,0 +1,220 @@
+// stdlib/tls13 (competitive SL2, the crypto QUIC needs): the TLS 1.3 key
+// schedule against RFC 8448 §3 (the simple 1-RTT handshake), end to end:
+// the X25519 shared secret from both key shares (stdlib/x25519), the
+// transcript hashes from the handshake messages' bytes, every secret of the
+// schedule, the handshake and application traffic keys and IVs, and both
+// Finished messages; then HKDF-SHA256 (stdlib/tls_crypto) against RFC 5869
+// test cases 2 and 3 (case 1 is in test_crypto_tls_vectors). A wrong answer
+// panics on every backend.
+//
+// Expected output:
+// x25519 client ok
+// x25519 server ok
+// hash ch..sh ok
+// early secret ok
+// handshake secret ok
+// c hs traffic ok
+// s hs traffic ok
+// master secret ok
+// server hs key ok
+// server hs iv ok
+// client hs key ok
+// client hs iv ok
+// server finished ok
+// hash ch..sf ok
+// c ap traffic ok
+// s ap traffic ok
+// exp master ok
+// server ap key ok
+// server ap iv ok
+// client finished ok
+// hash ch..cf ok
+// res master ok
+// finished check: good accepted, bad rejected
+// hkdf case2 prk ok
+// hkdf case2 okm ok
+// hkdf case3 prk ok
+// hkdf case3 okm ok
+// tls13 schedule vectors ok
+use tls13;
+use tls_crypto;
+use x25519;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+/// The schedule's secrets are @secret (complaint CO1): the RFC vectors
+/// print them through this audited release.
+@declassify fn reveal(v: Vec<i64>) -> Vec<i64> { return v; }
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        out.push(a.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A Finished handshake message: type 20, length 32, verify_data.
+fn finished_msg(vd: Vec<i64>) -> Vec<i64> {
+    return cat(hb("14000020"), vd);
+}
+
+fn range(from: i64, to: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        v.push(i);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    // {client} and {server} ephemeral x25519 key pairs
+    val c_priv: Vec<i64> = hb("49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005");
+    val c_pub: Vec<i64> = hb("99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c");
+    val s_priv: Vec<i64> = hb("b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e");
+    val s_pub: Vec<i64> = hb("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f");
+    val ecdhe: str = "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d";
+    val shared: Vec<i64> = x25519_scalarmult(c_priv, s_pub);
+    check("x25519 client", he(shared), ecdhe);
+    check("x25519 server", he(x25519_scalarmult(s_priv, c_pub)), ecdhe);
+
+    val ch: Vec<i64> = hb("010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef" +
+        "6283024dece7000006130113031302010000910000000b000900000673657276" +
+        "6572ff01000100000a00140012001d0017001800190100010101020103010400" +
+        "230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e" +
+        "51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603" +
+        "020308040805080604010501060102010402050206020202002d00020101001c" +
+        "00024001");
+    val sh: Vec<i64> = hb("020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155" +
+        "772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdb" +
+        "f7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304");
+    val ee: Vec<i64> = hb("080000240022000a00140012001d00170018001901000101010201030104001c" +
+        "0002400100000000");
+    val cert: Vec<i64> = hb("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a" +
+        "864886f70d01010b0500300e310c300a06035504031303727361301e170d3136" +
+        "303733303031323335395a170d3236303733303031323335395a300e310c300a" +
+        "0603550403130372736130819f300d06092a864886f70d010101050003818d00" +
+        "30818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826" +
+        "d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced4312" +
+        "0998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda4308467480" +
+        "30530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a" +
+        "8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b060355" +
+        "1d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5" +
+        "b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a5" +
+        "8c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102" +
+        "702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0" +
+        "a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000");
+    val cv: Vec<i64> = hb("0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145a" +
+        "b3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248ee" +
+        "aaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c" +
+        "9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea2" +
+        "0d53dfacd42f74f3");
+
+    val hello: Vec<i64> = cat(ch, sh);
+    val hello_hash: Vec<i64> = tls13_transcript_hash(hello);
+    check("hash ch..sh", he(hello_hash),
+        "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+
+    var none: Vec<i64> = Vec::new();
+    val s1: Tls13Schedule = tls13_schedule_handshake(none, shared, hello_hash);
+    check("early secret", he(reveal(s1.early)),
+        "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a");
+    check("handshake secret", he(reveal(s1.handshake)),
+        "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+    check("c hs traffic", he(reveal(s1.client_hs)),
+        "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
+    check("s hs traffic", he(reveal(s1.server_hs)),
+        "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+    check("master secret", he(reveal(s1.master)),
+        "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919");
+
+    // {server} derive write traffic keys for handshake data (TLS_AES_128_GCM_SHA256)
+    val shk: Tls13TrafficKeys = tls13_traffic_keys(s1.server_hs, 16);
+    check("server hs key", he(reveal(shk.key)), "3fce516009c21727d0f2e4e86ee403bc");
+    check("server hs iv", he(reveal(shk.iv)), "5d313eb2671276ee13000b30");
+    val chk: Tls13TrafficKeys = tls13_traffic_keys(s1.client_hs, 16);
+    check("client hs key", he(reveal(chk.key)), "dbfaa693d1762c5b666af5d950258d01");
+    check("client hs iv", he(reveal(chk.iv)), "5bd3c71b836e0b76bb73265f");
+
+    // The server's Finished covers ClientHello..CertificateVerify
+    val to_cv: Vec<i64> = cat(cat(cat(hello, ee), cert), cv);
+    val s_vd: Vec<i64> = tls13_finished_verify_data(s1.server_hs, tls13_transcript_hash(to_cv));
+    check("server finished", he(s_vd),
+        "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718");
+    val to_sf: Vec<i64> = cat(to_cv, finished_msg(s_vd));
+    val sf_hash: Vec<i64> = tls13_transcript_hash(to_sf);
+    check("hash ch..sf", he(sf_hash),
+        "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+
+    val s2: Tls13Schedule = tls13_schedule_application(s1, sf_hash);
+    check("c ap traffic", he(reveal(s2.client_ap)),
+        "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+    check("s ap traffic", he(reveal(s2.server_ap)),
+        "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643");
+    check("exp master", he(reveal(s2.exporter)),
+        "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50");
+    val sak: Tls13TrafficKeys = tls13_traffic_keys(s2.server_ap, 16);
+    check("server ap key", he(reveal(sak.key)), "9f02283b6c9c07efc26bb9f2ac92e356");
+    check("server ap iv", he(reveal(sak.iv)), "cf782b88dd83549aadf1e984");
+
+    // The client's Finished covers ClientHello..server Finished
+    val c_vd: Vec<i64> = tls13_finished_verify_data(s1.client_hs, sf_hash);
+    check("client finished", he(c_vd),
+        "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61");
+    val cf_hash: Vec<i64> = tls13_transcript_hash(cat(to_sf, finished_msg(c_vd)));
+    check("hash ch..cf", he(cf_hash),
+        "209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d");
+    val s3: Tls13Schedule = tls13_schedule_resumption(s2, cf_hash);
+    check("res master", he(reveal(s3.resumption)),
+        "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c");
+
+    // The server checks the client's Finished; one flipped bit fails
+    if !tls13_finished_check(s1.client_hs, sf_hash, c_vd) {
+        p_panic("finished check: the RFC's Finished was rejected");
+    }
+    var bad: Vec<i64> = cat(none, c_vd);
+    bad.set(31, bad.get(31) ^ 1);
+    if tls13_finished_check(s1.client_hs, sf_hash, bad) {
+        p_panic("finished check: a tampered Finished was accepted");
+    }
+    if tls13_finished_check(s1.client_hs, sf_hash, hb("a8ec")) {
+        p_panic("finished check: a short Finished was accepted");
+    }
+    println("finished check: good accepted, bad rejected");
+
+    // RFC 5869 A.2: longer inputs; A.3: no salt, no info
+    val prk2: Vec<i64> = reveal(hkdf_extract(range(96, 176), range(0, 80)));
+    check("hkdf case2 prk", he(prk2),
+        "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244");
+    check("hkdf case2 okm", he(reveal(hkdf_expand(prk2, range(176, 256), 82))),
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c" +
+        "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71" +
+        "cc30c58179ec3e87c14c01d5c1f3434f1d87");
+    val prk3: Vec<i64> = reveal(hkdf_extract(none, hb("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")));
+    check("hkdf case3 prk", he(prk3),
+        "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04");
+    check("hkdf case3 okm", he(reveal(hkdf_expand(prk3, none, 42))),
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d" +
+        "9d201395faa4b61a96c8");
+    println("tls13 schedule vectors ok");
+    return 0;
+}

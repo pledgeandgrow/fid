@@ -1,0 +1,560 @@
+// Intel 8254x (e1000) gigabit Ethernet driver core: register map, the
+// EEPROM, legacy RX/TX descriptor rings in DMA memory, initialisation,
+// transmit, receive, interrupts and statistics.
+//
+// What is real: register offsets and bit fields of the 82540/82545/82574
+// family (CTRL, STATUS, EECD, EERD, ICR/IMS/IMC, RCTL, TCTL, TIPG, the
+// RX/TX ring registers, RAL/RAH, MTA, statistics); EEPROM reads through
+// EERD (both the 82540 layout and the 82541/82547 one) and by bit-banging
+// the Microwire interface through EECD; the MAC address and the 0xBABA
+// checksum; 16-byte legacy RX and TX descriptors with their status, error
+// and command bits; the initialisation sequence (mask, reset, set link
+// up, clear the multicast table, receive address with AV, RX ring and
+// RCTL, TX ring, TCTL and TIPG, interrupt mask); transmit with EOP, IFCS
+// and RS and reclaiming done descriptors; receive with DD/EOP, error
+// checks and giving buffers back through RDT; the multicast hash for MTA;
+// link state and speed decoding.
+//
+// The seams: registers through an E1000Bus of rd(offset) -> u32 and
+// wr(offset, u32) (BAR0 MMIO in a kernel); rings and packet buffers live
+// in a stdlib vmm PhysMem (fake RAM in tests, DMA memory through a direct
+// map in a kernel). Tests play the NIC's side with the same descriptor
+// functions.
+module e1000;
+ use vec; use vmm;
+
+pub const E1K_CTRL: i64 = 0x0000;
+pub const E1K_STATUS: i64 = 0x0008;
+pub const E1K_EECD: i64 = 0x0010;
+pub const E1K_EERD: i64 = 0x0014;
+pub const E1K_CTRL_EXT: i64 = 0x0018;
+pub const E1K_MDIC: i64 = 0x0020;
+pub const E1K_ICR: i64 = 0x00C0;
+pub const E1K_ITR: i64 = 0x00C4;
+pub const E1K_ICS: i64 = 0x00C8;
+pub const E1K_IMS: i64 = 0x00D0;
+pub const E1K_IMC: i64 = 0x00D8;
+pub const E1K_RCTL: i64 = 0x0100;
+pub const E1K_TCTL: i64 = 0x0400;
+pub const E1K_TIPG: i64 = 0x0410;
+pub const E1K_RDBAL: i64 = 0x2800;
+pub const E1K_RDBAH: i64 = 0x2804;
+pub const E1K_RDLEN: i64 = 0x2808;
+pub const E1K_RDH: i64 = 0x2810;
+pub const E1K_RDT: i64 = 0x2818;
+pub const E1K_RDTR: i64 = 0x2820;
+pub const E1K_TDBAL: i64 = 0x3800;
+pub const E1K_TDBAH: i64 = 0x3804;
+pub const E1K_TDLEN: i64 = 0x3808;
+pub const E1K_TDH: i64 = 0x3810;
+pub const E1K_TDT: i64 = 0x3818;
+pub const E1K_CRCERRS: i64 = 0x4000;
+pub const E1K_MPC: i64 = 0x4010;
+pub const E1K_GPRC: i64 = 0x4074;
+pub const E1K_GPTC: i64 = 0x4080;
+pub const E1K_GORCL: i64 = 0x4088;
+pub const E1K_GOTCL: i64 = 0x4090;
+pub const E1K_MTA: i64 = 0x5200;
+pub const E1K_RAL0: i64 = 0x5400;
+pub const E1K_RAH0: i64 = 0x5404;
+
+// CTRL
+pub const CTRL_FD: i64 = 0x1;
+pub const CTRL_LRST: i64 = 0x8;
+pub const CTRL_ASDE: i64 = 0x20;
+pub const CTRL_SLU: i64 = 0x40;
+pub const CTRL_ILOS: i64 = 0x80;
+pub const CTRL_RST: i64 = 0x4000000;
+pub const CTRL_VME: i64 = 0x40000000;
+pub const CTRL_PHY_RST: i64 = 0x80000000;
+
+// STATUS
+pub const STATUS_FD: i64 = 0x1;
+pub const STATUS_LU: i64 = 0x2;
+
+// EECD
+pub const EECD_SK: i64 = 0x1;
+pub const EECD_CS: i64 = 0x2;
+pub const EECD_DI: i64 = 0x4;
+pub const EECD_DO: i64 = 0x8;
+pub const EECD_REQ: i64 = 0x40;
+pub const EECD_GNT: i64 = 0x80;
+pub const EECD_PRES: i64 = 0x100;
+
+// Interrupt causes (ICR / IMS / IMC).
+pub const ICR_TXDW: i64 = 0x1;
+pub const ICR_TXQE: i64 = 0x2;
+pub const ICR_LSC: i64 = 0x4;
+pub const ICR_RXSEQ: i64 = 0x8;
+pub const ICR_RXDMT0: i64 = 0x10;
+pub const ICR_RXO: i64 = 0x40;
+pub const ICR_RXT0: i64 = 0x80;
+
+// RCTL
+pub const RCTL_EN: i64 = 0x2;
+pub const RCTL_SBP: i64 = 0x4;
+pub const RCTL_UPE: i64 = 0x8;
+pub const RCTL_MPE: i64 = 0x10;
+pub const RCTL_LPE: i64 = 0x20;
+pub const RCTL_BAM: i64 = 0x8000;
+pub const RCTL_BSEX: i64 = 0x2000000;
+pub const RCTL_SECRC: i64 = 0x4000000;
+
+// TCTL
+pub const TCTL_EN: i64 = 0x2;
+pub const TCTL_PSP: i64 = 0x8;
+
+// RX descriptor status / errors.
+pub const RXD_STAT_DD: i64 = 0x01;
+pub const RXD_STAT_EOP: i64 = 0x02;
+pub const RXD_STAT_IXSM: i64 = 0x04;
+pub const RXD_STAT_VP: i64 = 0x08;
+pub const RXD_STAT_TCPCS: i64 = 0x20;
+pub const RXD_STAT_IPCS: i64 = 0x40;
+pub const RXD_ERR_CE: i64 = 0x01;
+pub const RXD_ERR_SE: i64 = 0x02;
+pub const RXD_ERR_SEQ: i64 = 0x04;
+pub const RXD_ERR_CXE: i64 = 0x10;
+pub const RXD_ERR_TCPE: i64 = 0x20;
+pub const RXD_ERR_IPE: i64 = 0x40;
+pub const RXD_ERR_RXE: i64 = 0x80;
+
+// TX descriptor command / status.
+pub const TXD_CMD_EOP: i64 = 0x01;
+pub const TXD_CMD_IFCS: i64 = 0x02;
+pub const TXD_CMD_IC: i64 = 0x04;
+pub const TXD_CMD_RS: i64 = 0x08;
+pub const TXD_CMD_DEXT: i64 = 0x20;
+pub const TXD_CMD_VLE: i64 = 0x40;
+pub const TXD_CMD_IDE: i64 = 0x80;
+pub const TXD_STAT_DD: i64 = 0x01;
+
+/// RCTL.BSIZE bits for a receive buffer size (256..16384), with BSEX for
+/// the extended sizes; -1 when the size is not one the NIC supports.
+pub fn e1k_rctl_bsize(size: i64) -> i64 {
+    if size == 2048 { return 0; }
+    if size == 1024 { return 1 << 16; }
+    if size == 512 { return 2 << 16; }
+    if size == 256 { return 3 << 16; }
+    if size == 16384 { return (1 << 16) | RCTL_BSEX; }
+    if size == 8192 { return (2 << 16) | RCTL_BSEX; }
+    if size == 4096 { return (3 << 16) | RCTL_BSEX; }
+    return -1;
+}
+
+/// TCTL for full duplex: enable, pad short packets, collision threshold
+/// 15, collision distance 64 (512 for half duplex).
+pub fn e1k_tctl(full_duplex: bool) -> i64 {
+    var cold: i64 = 0x40;
+    if !full_duplex { cold = 0x200; }
+    return TCTL_EN | TCTL_PSP | (0x0F << 4) | (cold << 12);
+}
+
+/// TIPG for copper: IPGT 10, IPGR1 8, IPGR2 6.
+pub fn e1k_tipg() -> i64 {
+    return 10 | (8 << 10) | (6 << 20);
+}
+
+/// Link speed in Mb/s from STATUS bits 7:6.
+pub fn e1k_link_speed(status: i64) -> i64 {
+    var s: i64 = (status >> 6) & 3;
+    if s == 0 { return 10; }
+    if s == 1 { return 100; }
+    return 1000;
+}
+
+// ─── Bus ────────────────────────────────────────────────────────────────
+
+pub struct E1000Bus {
+    pub rd: fn(i64) -> i64,
+    pub wr: fn(i64, i64) -> void,
+}
+
+pub fn e1k_rd(b: & E1000Bus, off: i64) -> i64 {
+    val f = b.rd;
+    return f(off) & 0xFFFFFFFF;
+}
+
+pub fn e1k_wr(b: & E1000Bus, off: i64, v: i64) {
+    val f = b.wr;
+    f(off, v & 0xFFFFFFFF);
+}
+
+// ─── EEPROM ─────────────────────────────────────────────────────────────
+
+/// One EEPROM word through EERD. small = the 82541/82547 layout (DONE
+/// bit 1, address from bit 2); otherwise the 82540 one (DONE bit 4,
+/// address from bit 8). -1 when DONE never comes.
+pub fn e1k_eeprom_read(b: & E1000Bus, addr: i64, small: bool, spins: i64) -> i64 {
+    var done: i64 = 0x10;
+    var shift: i64 = 8;
+    if small {
+        done = 0x2;
+        shift = 2;
+    }
+    e1k_wr(b, E1K_EERD, 1 | (addr << shift));
+    var i: i64 = 0;
+    while i < spins {
+        var v: i64 = e1k_rd(b, E1K_EERD);
+        if (v & done) != 0 {
+            return (v >> 16) & 0xFFFF;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn e1k_ee_clock(b: & E1000Bus, v: i64) -> i64 {
+    e1k_wr(b, E1K_EECD, v | EECD_SK);
+    var r: i64 = e1k_rd(b, E1K_EECD);
+    e1k_wr(b, E1K_EECD, v & ~EECD_SK);
+    return r;
+}
+
+/// One word by bit-banging the Microwire EEPROM through EECD: request
+/// and wait for the grant, select, shift out READ (110b) and the address
+/// (abits bits, 6 for a 93C46), shift in 16 data bits (MSB first),
+/// deselect and release. -1 when the grant does not come.
+pub fn e1k_eeprom_read_bitbang(b: & E1000Bus, addr: i64, abits: i64, spins: i64) -> i64 {
+    var base: i64 = e1k_rd(b, E1K_EECD) & ~(EECD_SK | EECD_DI | EECD_CS);
+    e1k_wr(b, E1K_EECD, base | EECD_REQ);
+    var g: i64 = 0;
+    while (e1k_rd(b, E1K_EECD) & EECD_GNT) == 0 {
+        g = g + 1;
+        if g >= spins {
+            e1k_wr(b, E1K_EECD, base);
+            return -1;
+        }
+    }
+    var v: i64 = base | EECD_REQ | EECD_CS;
+    e1k_wr(b, E1K_EECD, v);
+    var cmd: i64 = (6 << abits) | (addr & ((1 << abits) - 1));
+    var n: i64 = 3 + abits;
+    var i: i64 = n - 1;
+    while i >= 0 {
+        var bit: i64 = (cmd >> i) & 1;
+        var d: i64 = v & ~EECD_DI;
+        if bit != 0 { d = d | EECD_DI; }
+        e1k_wr(b, E1K_EECD, d);
+        e1k_ee_clock(b, d);
+        i = i - 1;
+    }
+    var w: i64 = 0;
+    var k: i64 = 0;
+    v = v & ~EECD_DI;
+    while k < 16 {
+        var r: i64 = e1k_ee_clock(b, v);
+        w = (w << 1) | ((r >> 3) & 1);
+        k = k + 1;
+    }
+    e1k_wr(b, E1K_EECD, base | EECD_REQ);
+    e1k_wr(b, E1K_EECD, base);
+    return w;
+}
+
+/// The 64-word image is valid when its words sum to 0xBABA (mod 2^16).
+pub fn e1k_eeprom_checksum_ok(words: Vec<i64>) -> bool {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 64 && i < words.len() {
+        s = (s + words.get(i)) & 0xFFFF;
+        i = i + 1;
+    }
+    return s == 0xBABA;
+}
+
+/// Checksum word (word 0x3F) that makes words 0..0x3E valid.
+pub fn e1k_eeprom_checksum(words: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 63 && i < words.len() {
+        s = (s + words.get(i)) & 0xFFFF;
+        i = i + 1;
+    }
+    return (0xBABA - s) & 0xFFFF;
+}
+
+/// MAC address bytes from EEPROM words 0..2 (low byte first).
+pub fn e1k_mac_from_words(w0: i64, w1: i64, w2: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    m.push(w0 & 255);
+    m.push((w0 >> 8) & 255);
+    m.push(w1 & 255);
+    m.push((w1 >> 8) & 255);
+    m.push(w2 & 255);
+    m.push((w2 >> 8) & 255);
+    return m;
+}
+
+/// RAL / RAH values for a MAC (RAH bit 31 = address valid).
+pub fn e1k_ral(mac: Vec<i64>) -> i64 {
+    return mac.get(0) | (mac.get(1) << 8) | (mac.get(2) << 16) | (mac.get(3) << 24);
+}
+
+pub fn e1k_rah(mac: Vec<i64>) -> i64 {
+    return mac.get(4) | (mac.get(5) << 8) | 0x80000000;
+}
+
+/// MAC as "52:54:00:12:34:56".
+pub fn e1k_mac_str(mac: Vec<i64>) -> str {
+    var hexd: str = "0123456789abcdef";
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 6 {
+        if i > 0 { b.push(58); }
+        b.push(str_byte_at(hexd, (mac.get(i) >> 4) & 15));
+        b.push(str_byte_at(hexd, mac.get(i) & 15));
+        i = i + 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// Multicast table: bit index of a MAC with MO = 0 (bits 47:36 of the
+/// address), as register E1K_MTA + 4 * (bit >> 5), bit (bit & 31).
+pub fn e1k_mta_bit(mac: Vec<i64>) -> i64 {
+    return ((mac.get(4) >> 4) | (mac.get(5) << 4)) & 0xFFF;
+}
+
+// ─── Descriptors ────────────────────────────────────────────────────────
+
+pub struct RxDesc {
+    pub addr: i64,
+    pub len: i64,
+    pub csum: i64,
+    pub status: i64,
+    pub errors: i64,
+    pub special: i64,
+}
+
+pub struct TxDesc {
+    pub addr: i64,
+    pub len: i64,
+    pub cso: i64,
+    pub cmd: i64,
+    pub status: i64,
+    pub css: i64,
+    pub special: i64,
+}
+
+pub fn e1k_rx_desc_read(m: & PhysMem, pa: i64) -> RxDesc {
+    return RxDesc {
+        addr: phys_read64(m, pa), len: phys_read_le(m, pa + 8, 2), csum: phys_read_le(m, pa + 10, 2), status: phys_read8(m, pa + 12), errors: phys_read8(m, pa + 13), special: phys_read_le(m, pa + 14, 2)
+    };
+}
+
+pub fn e1k_rx_desc_write(m: & mut PhysMem, pa: i64, d: RxDesc) {
+    phys_write64(m, pa, d.addr);
+    phys_write_le(m, pa + 8, 2, d.len);
+    phys_write_le(m, pa + 10, 2, d.csum);
+    phys_write8(m, pa + 12, d.status);
+    phys_write8(m, pa + 13, d.errors);
+    phys_write_le(m, pa + 14, 2, d.special);
+}
+
+pub fn e1k_tx_desc_read(m: & PhysMem, pa: i64) -> TxDesc {
+    return TxDesc {
+        addr: phys_read64(m, pa), len: phys_read_le(m, pa + 8, 2), cso: phys_read8(m, pa + 10), cmd: phys_read8(m, pa + 11), status: phys_read8(m, pa + 12) & 15, css: phys_read8(m, pa + 13), special: phys_read_le(m, pa + 14, 2)
+    };
+}
+
+pub fn e1k_tx_desc_write(m: & mut PhysMem, pa: i64, d: TxDesc) {
+    phys_write64(m, pa, d.addr);
+    phys_write_le(m, pa + 8, 2, d.len);
+    phys_write8(m, pa + 10, d.cso);
+    phys_write8(m, pa + 11, d.cmd);
+    phys_write8(m, pa + 12, d.status & 15);
+    phys_write8(m, pa + 13, d.css);
+    phys_write_le(m, pa + 14, 2, d.special);
+}
+
+// ─── Driver ─────────────────────────────────────────────────────────────
+
+pub struct E1000 {
+    pub mac: Vec<i64>,
+    pub rx_ring: i64,
+    pub rx_count: i64,
+    pub rx_buf: i64,
+    pub buf_size: i64,
+    pub rx_next: i64,
+    pub tx_ring: i64,
+    pub tx_count: i64,
+    pub tx_buf: i64,
+    pub tx_tail: i64,
+    pub tx_clean: i64,
+    pub rx_packets: i64,
+    pub rx_errors: i64,
+    pub tx_packets: i64,
+}
+
+/// Memory plan: RX ring at mem_base, TX ring after it (both rings of n
+/// descriptors, n a multiple of 8), then n receive and n transmit buffers
+/// of buf_size bytes.
+pub fn e1k_new(mem_base: i64, n: i64, buf_size: i64) -> E1000 {
+    var rx_ring: i64 = mem_base;
+    var tx_ring: i64 = rx_ring + n * 16;
+    var rx_buf: i64 = tx_ring + n * 16;
+    var tx_buf: i64 = rx_buf + n * buf_size;
+    return E1000 { mac: Vec::new(), rx_ring: rx_ring, rx_count: n, rx_buf: rx_buf, buf_size: buf_size, rx_next: 0, tx_ring: tx_ring, tx_count: n, tx_buf: tx_buf, tx_tail: 0, tx_clean: 0, rx_packets: 0, rx_errors: 0, tx_packets: 0 };
+}
+
+/// Bytes of DMA memory e1k_new lays out.
+pub fn e1k_mem_size(n: i64, buf_size: i64) -> i64 {
+    return n * 32 + n * buf_size * 2;
+}
+
+/// Bring the NIC up. Reads the MAC from RAL0/RAH0 when the firmware set
+/// it (AV), else from the EEPROM. Returns false when the reset does not
+/// finish.
+pub fn e1k_init(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, promisc: bool, spins: i64) -> bool {
+    e1k_wr(b, E1K_IMC, 0xFFFFFFFF);
+    e1k_wr(b, E1K_CTRL, e1k_rd(b, E1K_CTRL) | CTRL_RST);
+    var i: i64 = 0;
+    while (e1k_rd(b, E1K_CTRL) & CTRL_RST) != 0 {
+        i = i + 1;
+        if i >= spins {
+            return false;
+        }
+    }
+    e1k_wr(b, E1K_IMC, 0xFFFFFFFF);
+    var ctrl: i64 = e1k_rd(b, E1K_CTRL);
+    ctrl = (ctrl | CTRL_SLU | CTRL_ASDE) & ~(CTRL_LRST | CTRL_PHY_RST | CTRL_ILOS | CTRL_VME);
+    e1k_wr(b, E1K_CTRL, ctrl);
+    var k: i64 = 0;
+    while k < 128 {
+        e1k_wr(b, E1K_MTA + 4 * k, 0);
+        k = k + 1;
+    }
+    var rah: i64 = e1k_rd(b, E1K_RAH0);
+    if (rah & 0x80000000) != 0 {
+        var ral: i64 = e1k_rd(b, E1K_RAL0);
+        e.mac = Vec::new();
+        e.mac.push(ral & 255);
+        e.mac.push((ral >> 8) & 255);
+        e.mac.push((ral >> 16) & 255);
+        e.mac.push((ral >> 24) & 255);
+        e.mac.push(rah & 255);
+        e.mac.push((rah >> 8) & 255);
+    } else {
+        e.mac = e1k_mac_from_words(e1k_eeprom_read(b, 0, false, spins), e1k_eeprom_read(b, 1, false, spins), e1k_eeprom_read(b, 2, false, spins));
+    }
+    e1k_wr(b, E1K_RAL0, e1k_ral(e.mac));
+    e1k_wr(b, E1K_RAH0, e1k_rah(e.mac));
+    // receive ring: every descriptor owns a buffer, all handed to the NIC
+    var d: i64 = 0;
+    while d < e.rx_count {
+        e1k_rx_desc_write(m, e.rx_ring + d * 16, RxDesc { addr: e.rx_buf + d * e.buf_size, len: 0, csum: 0, status: 0, errors: 0, special: 0 });
+        d = d + 1;
+    }
+    e1k_wr(b, E1K_RDBAL, e.rx_ring & 0xFFFFFFFF);
+    e1k_wr(b, E1K_RDBAH, (e.rx_ring >> 32) & 0xFFFFFFFF);
+    e1k_wr(b, E1K_RDLEN, e.rx_count * 16);
+    e1k_wr(b, E1K_RDH, 0);
+    e1k_wr(b, E1K_RDT, e.rx_count - 1);
+    var rctl: i64 = RCTL_EN | RCTL_BAM | RCTL_SECRC | e1k_rctl_bsize(e.buf_size);
+    if promisc {
+        rctl = rctl | RCTL_UPE | RCTL_MPE;
+    }
+    e1k_wr(b, E1K_RCTL, rctl);
+    d = 0;
+    while d < e.tx_count {
+        e1k_tx_desc_write(m, e.tx_ring + d * 16, TxDesc { addr: e.tx_buf + d * e.buf_size, len: 0, cso: 0, cmd: 0, status: TXD_STAT_DD, css: 0, special: 0 });
+        d = d + 1;
+    }
+    e1k_wr(b, E1K_TDBAL, e.tx_ring & 0xFFFFFFFF);
+    e1k_wr(b, E1K_TDBAH, (e.tx_ring >> 32) & 0xFFFFFFFF);
+    e1k_wr(b, E1K_TDLEN, e.tx_count * 16);
+    e1k_wr(b, E1K_TDH, 0);
+    e1k_wr(b, E1K_TDT, 0);
+    e1k_wr(b, E1K_TCTL, e1k_tctl(true));
+    e1k_wr(b, E1K_TIPG, e1k_tipg());
+    e1k_wr(b, E1K_IMS, ICR_RXT0 | ICR_RXO | ICR_RXDMT0 | ICR_LSC | ICR_TXDW);
+    e1k_rd(b, E1K_ICR);
+    e.rx_next = 0;
+    e.tx_tail = 0;
+    e.tx_clean = 0;
+    return true;
+}
+
+/// Reclaim transmitted descriptors (DD set); returns how many.
+pub fn e1k_tx_reclaim(e: & mut E1000, m: & PhysMem) -> i64 {
+    var n: i64 = 0;
+    while e.tx_clean != e.tx_tail {
+        var d: TxDesc = e1k_tx_desc_read(m, e.tx_ring + e.tx_clean * 16);
+        if (d.status & TXD_STAT_DD) == 0 {
+            return n;
+        }
+        e.tx_clean = (e.tx_clean + 1) % e.tx_count;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Queue one frame (bytes, without the FCS: the NIC appends it). Returns
+/// false when the ring is full or the frame does not fit a buffer.
+pub fn e1k_transmit(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem, frame: Vec<i64>) -> bool {
+    if frame.len() > e.buf_size || frame.len() == 0 {
+        return false;
+    }
+    e1k_tx_reclaim(e, m);
+    var next: i64 = (e.tx_tail + 1) % e.tx_count;
+    if next == e.tx_clean {
+        return false;
+    }
+    var buf: i64 = e.tx_buf + e.tx_tail * e.buf_size;
+    phys_write_bytes(m, buf, frame);
+    e1k_tx_desc_write(m, e.tx_ring + e.tx_tail * 16, TxDesc { addr: buf, len: frame.len(), cso: 0, cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS, status: 0, css: 0, special: 0 });
+    e.tx_tail = next;
+    e1k_wr(b, E1K_TDT, e.tx_tail);
+    e.tx_packets = e.tx_packets + 1;
+    return true;
+}
+
+pub struct RxResult {
+    pub got: bool,
+    pub frame: Vec<i64>,
+    pub status: i64,
+    pub errors: i64,
+}
+
+/// Take the next received frame, if any: copies it out, clears the
+/// descriptor and gives it back to the NIC through RDT. Frames with
+/// receive errors are dropped (got = true, frame empty, errors set);
+/// a frame larger than one buffer (no EOP) is dropped too.
+pub fn e1k_receive(e: & mut E1000, b: & E1000Bus, m: & mut PhysMem) -> RxResult {
+    var r: RxResult = RxResult { got: false, frame: Vec::new(), status: 0, errors: 0 };
+    var pa: i64 = e.rx_ring + e.rx_next * 16;
+    var d: RxDesc = e1k_rx_desc_read(m, pa);
+    if (d.status & RXD_STAT_DD) == 0 {
+        return r;
+    }
+    r.got = true;
+    r.status = d.status;
+    r.errors = d.errors;
+    var bad: i64 = RXD_ERR_CE | RXD_ERR_SE | RXD_ERR_SEQ | RXD_ERR_CXE | RXD_ERR_RXE;
+    if (d.errors & bad) == 0 && (d.status & RXD_STAT_EOP) != 0 {
+        r.frame = phys_read_bytes(m, d.addr, d.len);
+        e.rx_packets = e.rx_packets + 1;
+    } else {
+        e.rx_errors = e.rx_errors + 1;
+    }
+    e1k_rx_desc_write(m, pa, RxDesc { addr: d.addr, len: 0, csum: 0, status: 0, errors: 0, special: 0 });
+    e1k_wr(b, E1K_RDT, e.rx_next);
+    e.rx_next = (e.rx_next + 1) % e.rx_count;
+    return r;
+}
+
+/// Read and clear the interrupt causes.
+pub fn e1k_irq_causes(b: & E1000Bus) -> i64 {
+    return e1k_rd(b, E1K_ICR);
+}
+
+pub fn e1k_link_up(b: & E1000Bus) -> bool {
+    return (e1k_rd(b, E1K_STATUS) & STATUS_LU) != 0;
+}
+
+/// Set the multicast table bit for a group address.
+pub fn e1k_mta_add(b: & E1000Bus, mac: Vec<i64>) {
+    var bit: i64 = e1k_mta_bit(mac);
+    var reg: i64 = E1K_MTA + 4 * (bit >> 5);
+    e1k_wr(b, reg, e1k_rd(b, reg) | (1 << (bit & 31)));
+}

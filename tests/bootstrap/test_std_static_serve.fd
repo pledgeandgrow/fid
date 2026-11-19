@@ -1,0 +1,155 @@
+// stdlib/static_serve: path normalization and traversal refusal, index files, dotfiles, MIME types, ETag/Last-Modified with If-None-Match and If-Modified-Since (304), single and multiple Range requests (206, multipart/byteranges, 416), If-Range, precompressed .br/.gz chosen by Accept-Encoding q-values, HEAD and 405 - all over an in-memory FileStore.
+// Expected output:
+// normalize: /a/c.txt /docs/ /a b/A.txt [] [] [] [] [] []
+// date: Sun, 06 Nov 1994 08:49:37 GMT / parse: 784111777 784111777 784111777 -1
+// index: 200 | Content-Type: text/html; charset=utf-8 | Content-Length: 13 | ETag: "d-2ebc98a1" | Vary: Accept-Encoding | body <h1>home</h1>
+// text: 200 | Content-Type: text/plain; charset=utf-8 | Content-Length: 20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 0123456789abcdefghij
+// png: 200 | Content-Type: image/png | Content-Length: 3 | ETag: "3-6553f100" | Vary: Accept-Encoding | body PNG
+// traversal: 403 | Content-Type: text/plain; charset=utf-8 | Content-Length: 9 | body Forbidden
+// dotfile: 404 | Content-Type: text/plain; charset=utf-8 | Content-Length: 9 | body Not Found
+// missing: 404 | Content-Type: text/plain; charset=utf-8 | Content-Length: 9 | body Not Found
+// post: 405 | Content-Type: text/plain; charset=utf-8 | Content-Length: 18 | Allow: GET, HEAD | body Method Not Allowed
+// head: 200 | Content-Type: text/plain; charset=utf-8 | Content-Length: 20 | ETag: "14-6553f100" | Vary: Accept-Encoding
+// if-none-match: 304 | ETag: "14-6553f100" | Vary: Accept-Encoding
+// if-none-match other: 200 | Content-Type: text/plain; charset=utf-8 | Content-Length: 20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 0123456789abcdefghij
+// if-none-match *: 304 | ETag: "14-6553f100" | Vary: Accept-Encoding
+// if-modified-since later: 304 | ETag: "d-2ebc98a1" | Vary: Accept-Encoding
+// if-modified-since earlier: 200 | Content-Type: text/html; charset=utf-8 | Content-Length: 13 | ETag: "d-2ebc98a1" | Vary: Accept-Encoding | body <h1>home</h1>
+// inm beats ims: 200 | Content-Type: text/html; charset=utf-8 | Content-Length: 13 | ETag: "d-2ebc98a1" | Vary: Accept-Encoding | body <h1>home</h1>
+// range: 206 | Content-Type: text/plain; charset=utf-8 | Content-Length: 5 | Content-Range: bytes 0-4/20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 01234
+// range open: 206 | Content-Type: text/plain; charset=utf-8 | Content-Length: 5 | Content-Range: bytes 15-19/20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body fghij
+// range suffix: 206 | Content-Type: text/plain; charset=utf-8 | Content-Length: 3 | Content-Range: bytes 17-19/20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body hij
+// range clamp: 206 | Content-Type: text/plain; charset=utf-8 | Content-Length: 2 | Content-Range: bytes 18-19/20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body ij
+// ranges: 206 | Content-Type: multipart/byteranges; boundary=FIDES_BYTERANGES | Content-Length: 218 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 218 bytes
+//   multipart body: \r\n--FIDES_BYTERANGES\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 0-1/20\r\n\r\n01\r\n--FIDES_BYTERANGES\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 10-11/20\r\n\r\nab\r\n--FIDES_BYTERANGES--\r\n
+// unsatisfiable: 416 | Content-Length: 0 | Content-Range: bytes */20
+// malformed range: 200 | Content-Type: text/plain; charset=utf-8 | Content-Length: 20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 0123456789abcdefghij
+// if-range match: 206 | Content-Type: text/plain; charset=utf-8 | Content-Length: 2 | Content-Range: bytes 0-1/20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 01
+// if-range stale: 200 | Content-Type: text/plain; charset=utf-8 | Content-Length: 20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 0123456789abcdefghij
+// if-range date: 206 | Content-Type: text/plain; charset=utf-8 | Content-Length: 2 | Content-Range: bytes 0-1/20 | ETag: "14-6553f100" | Vary: Accept-Encoding | body 01
+// gzip+br: 200 | Content-Type: text/javascript; charset=utf-8 | Content-Length: 2 | Content-Encoding: br | ETag: "2-6553f100-br" | Vary: Accept-Encoding | body BR
+// gzip preferred: 200 | Content-Type: text/javascript; charset=utf-8 | Content-Length: 8 | Content-Encoding: gzip | ETag: "8-6553f100-gz" | Vary: Accept-Encoding | body GZIPDATA
+// gzip only: 200 | Content-Type: text/javascript; charset=utf-8 | Content-Length: 8 | Content-Encoding: gzip | ETag: "8-6553f100-gz" | Vary: Accept-Encoding | body GZIPDATA
+// br refused: 200 | Content-Type: text/javascript; charset=utf-8 | Content-Length: 8 | Content-Encoding: gzip | ETag: "8-6553f100-gz" | Vary: Accept-Encoding | body GZIPDATA
+// identity: 200 | Content-Type: text/javascript; charset=utf-8 | Content-Length: 28 | ETag: "1c-6553f100" | Vary: Accept-Encoding | body console.log('full version');
+// q values: 800 100 0
+use static_serve;
+use vec;
+use string;
+
+// an in-memory file system behind the FileStore seam
+var NAMES: Vec<str> = Vec::new();
+var DATA: Vec<str> = Vec::new();
+var MTIMES: Vec<i64> = Vec::new();
+
+fn add(path: str, data: str, mtime: i64) {
+    NAMES.push(path);
+    DATA.push(data);
+    MTIMES.push(mtime);
+}
+
+fn find(path: str) -> i64 {
+    var i: i64 = 0;
+    while i < NAMES.len() {
+        if NAMES.get(i) == path { return i; }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn mem_stat(path: str) -> str {
+    val i: i64 = find(path);
+    if i < 0 { return ""; }
+    return int_to_str(str_len(DATA.get(i))) + "|" + int_to_str(MTIMES.get(i));
+}
+
+fn mem_read(path: str, off: i64, n: i64) -> Vec<i64> {
+    val i: i64 = find(path);
+    var out: Vec<i64> = Vec::new();
+    if i < 0 { return out; }
+    val b: Vec<i64> = str_bytes(DATA.get(i));
+    var k: i64 = off;
+    while k < off + n && k < b.len() { out.push(b.get(k)); k = k + 1; }
+    return out;
+}
+
+fn show(label: str, r: ServeResponse) {
+    var line: str = label + ": " + int_to_str(r.status);
+    val keys: Vec<str> = str_split("Content-Type,Content-Length,Content-Range,Content-Encoding,ETag,Vary,Allow", ",");
+    var i: i64 = 0;
+    while i < keys.len() {
+        val v: str = serve_resp_header(& r, keys.get(i));
+        if str_len(v) > 0 { line = line + " | " + keys.get(i) + ": " + v; }
+        i = i + 1;
+    }
+    if r.body.len() > 0 && r.body.len() <= 40 {
+        line = line + " | body " + str_replace(str_replace(str_from_bytes(r.body), "\r", "\\r"), "\n", "\\n");
+    } else if r.body.len() > 40 {
+        line = line + " | body " + int_to_str(r.body.len()) + " bytes";
+    }
+    println(line);
+}
+
+fn get(store: & FileStore, cfg: & ServeConfig, method: str, path: str, hn: str, hv: str) -> ServeResponse {
+    var req: ServeRequest = serve_request(method, path);
+    if str_len(hn) > 0 {
+        val ns: Vec<str> = str_split(hn, "~");
+        val vs: Vec<str> = str_split(hv, "~");
+        var i: i64 = 0;
+        while i < ns.len() { serve_header(& mut req, ns.get(i), vs.get(i)); i = i + 1; }
+    }
+    return serve_static(cfg, store, & req);
+}
+
+fn main() -> i64 {
+    add("/www/index.html", "<h1>home</h1>", 784111777);
+    add("/www/docs/a.txt", "0123456789abcdefghij", 1700000000);
+    add("/www/app.js", "console.log('full version');", 1700000000);
+    add("/www/app.js.gz", "GZIPDATA", 1700000000);
+    add("/www/app.js.br", "BR", 1700000000);
+    add("/www/.env", "SECRET=1", 1700000000);
+    add("/www/logo.png", "PNG", 1700000000);
+    val store: FileStore = FileStore { stat: mem_stat, read: mem_read };
+    val cfg: ServeConfig = serve_config("/www");
+
+    println("normalize: " + serve_normalize("/a/./b/../c.txt?x=1#f") + " " + serve_normalize("/docs/") + " " + serve_normalize("/a%20b/%41.txt") + " [" + serve_normalize("/../etc/passwd") + "] [" + serve_normalize("/a/%2e%2e/%2e%2e/x") + "] [" + serve_normalize("/a%2fb") + "] [" + serve_normalize("/a%00") + "] [" + serve_normalize("/a\\b") + "] [" + serve_normalize("/%zz") + "]");
+    println("date: " + serve_http_date(784111777) + " / parse: " + int_to_str(serve_parse_date("Sun, 06 Nov 1994 08:49:37 GMT")) + " " + int_to_str(serve_parse_date("Sunday, 06-Nov-94 08:49:37 GMT")) + " " + int_to_str(serve_parse_date("Sun Nov  6 08:49:37 1994")) + " " + int_to_str(serve_parse_date("yesterday")));
+
+    show("index", get(& store, & cfg, "GET", "/", "", ""));
+    show("text", get(& store, & cfg, "GET", "/docs/a.txt", "", ""));
+    show("png", get(& store, & cfg, "GET", "/logo.png", "", ""));
+    show("traversal", get(& store, & cfg, "GET", "/../../etc/passwd", "", ""));
+    show("dotfile", get(& store, & cfg, "GET", "/.env", "", ""));
+    show("missing", get(& store, & cfg, "GET", "/nope.html", "", ""));
+    show("post", get(& store, & cfg, "POST", "/docs/a.txt", "", ""));
+    show("head", get(& store, & cfg, "HEAD", "/docs/a.txt", "", ""));
+
+    val etag: str = serve_resp_header(& get(& store, & cfg, "GET", "/docs/a.txt", "", ""), "ETag");
+    show("if-none-match", get(& store, & cfg, "GET", "/docs/a.txt", "If-None-Match", "\"x\", W/" + etag));
+    show("if-none-match other", get(& store, & cfg, "GET", "/docs/a.txt", "If-None-Match", "\"other\""));
+    show("if-none-match *", get(& store, & cfg, "GET", "/docs/a.txt", "If-None-Match", "*"));
+    show("if-modified-since later", get(& store, & cfg, "GET", "/index.html", "If-Modified-Since", "Sun, 06 Nov 1994 08:49:37 GMT"));
+    show("if-modified-since earlier", get(& store, & cfg, "GET", "/index.html", "If-Modified-Since", "Sat, 05 Nov 1994 08:49:37 GMT"));
+    show("inm beats ims", get(& store, & cfg, "GET", "/index.html", "If-None-Match~If-Modified-Since", "\"zzz\"~Sun, 06 Nov 1994 08:49:37 GMT"));
+
+    show("range", get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=0-4"));
+    show("range open", get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=15-"));
+    show("range suffix", get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=-3"));
+    show("range clamp", get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=18-100"));
+    val multi: ServeResponse = get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=0-1, 10-11");
+    show("ranges", multi);
+    println("  multipart body: " + str_replace(str_replace(str_from_bytes(multi.body), "\r", "\\r"), "\n", "\\n"));
+    show("unsatisfiable", get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=50-60"));
+    show("malformed range", get(& store, & cfg, "GET", "/docs/a.txt", "Range", "bytes=5-2"));
+    show("if-range match", get(& store, & cfg, "GET", "/docs/a.txt", "Range~If-Range", "bytes=0-1~" + etag));
+    show("if-range stale", get(& store, & cfg, "GET", "/docs/a.txt", "Range~If-Range", "bytes=0-1~\"old\""));
+    show("if-range date", get(& store, & cfg, "GET", "/docs/a.txt", "Range~If-Range", "bytes=0-1~" + serve_http_date(1700000000)));
+
+    show("gzip+br", get(& store, & cfg, "GET", "/app.js", "Accept-Encoding", "gzip, deflate, br"));
+    show("gzip preferred", get(& store, & cfg, "GET", "/app.js", "Accept-Encoding", "br;q=0.5, gzip"));
+    show("gzip only", get(& store, & cfg, "GET", "/app.js", "Accept-Encoding", "gzip"));
+    show("br refused", get(& store, & cfg, "GET", "/app.js", "Accept-Encoding", "*, br;q=0"));
+    show("identity", get(& store, & cfg, "GET", "/app.js", "", ""));
+    println("q values: " + int_to_str(serve_accept_q("gzip;q=0.8, *;q=0.1", "gzip")) + " " + int_to_str(serve_accept_q("gzip;q=0.8, *;q=0.1", "br")) + " " + int_to_str(serve_accept_q("br", "zstd")));
+    return 0;
+}

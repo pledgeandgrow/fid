@@ -1,0 +1,135 @@
+// Competitive roadmap OP23: the native runtimes' p_str_hash
+// (stdlib/pe_runtime/base.fd and stdlib/linux_runtime/base.fd
+// pert_str_hash) reads a word at a time, one page test per page; it must
+// give exactly the hash its definition gives: FNV over every whole 8-byte
+// group before the NUL (little-endian word), then over the last bytes one
+// at a time, the result's sign bit cleared. This program compares the
+// runtime's value with that definition, computed byte by byte here, for
+// every length 0..40 at every offset 0..15 of a buffer, and for strings
+// that end, start or cross a page boundary (where a whole-word read could
+// fault). Native builds only (tests/tooling/op23-memops-bench.sh): `fid
+// run` and the C back end have their own hash functions.
+//
+// Expected output (native):
+// lengths: 656 0
+// page edges: 840 0
+
+@unsafe
+fn put(p: i64, b: i64) {
+    var bp: * mut u8 = p as * mut u8;
+    // SAFETY: callers write inside the block they allocated.
+    unsafe {
+        * bp = b;
+    }
+}
+
+@unsafe
+fn get(p: i64) -> i64 {
+    var bp: * mut u8 = p as * mut u8;
+    var x: i64 = 0;
+    // SAFETY: callers read inside the block they allocated.
+    unsafe {
+        x = * bp;
+    }
+    return x;
+}
+
+/// The definition, a byte at a time.
+// SAFETY: (release M10: get is @unsafe) s is a NUL-terminated string the
+// caller owns.
+@unsafe
+@wrapping fn ref_hash(s: i64) -> i64 {
+    var hash: i64 = - 3750763034362895579;
+    var addr: i64 = s;
+    var going: bool = true;
+    while going {
+        var w: i64 = 0;
+        var k: i64 = 0;
+        var whole: bool = true;
+        while k < 8 && whole {
+            val b: i64 = get(addr + k);
+            if b == 0 {
+                whole = false;
+            }
+            w = w | (b << (k * 8));
+            k = k + 1;
+        }
+        if whole {
+            hash = hash ^ w;
+            hash = hash * 1099511628211;
+            addr = addr + 8;
+        } else {
+            going = false;
+        }
+    }
+    var last: i64 = get(addr);
+    while last != 0 {
+        hash = hash ^ last;
+        hash = hash * 1099511628211;
+        addr = addr + 1;
+        last = get(addr);
+    }
+    return hash & 9223372036854775807;
+}
+
+// SAFETY: (release M10: put, get and ref_hash are @unsafe) every address
+// they get is inside buf's 16384 bytes.
+@unsafe
+fn main() -> i64 {
+    var buf: i64 = 0;
+    // SAFETY: a block of 3 pages and more, freed at the end.
+    unsafe {
+        buf = p_malloc(16384);
+    }
+    var i: i64 = 0;
+    while i < 16384 {
+        // bytes 1..250, never 0 (some above 127)
+        put(buf + i, 1 + (i * 37) % 250);
+        i = i + 1;
+    }
+    // every length at every offset
+    var tried: i64 = 0;
+    var bad: i64 = 0;
+    var off: i64 = 0;
+    while off < 16 {
+        var n: i64 = 0;
+        while n <= 40 {
+            val s: i64 = buf + off;
+            val keep: i64 = get(s + n);
+            put(s + n, 0);
+            if p_str_hash(s) != ref_hash(s) {
+                bad = bad + 1;
+            }
+            put(s + n, keep);
+            tried = tried + 1;
+            n = n + 1;
+        }
+        off = off + 1;
+    }
+    println("lengths: " + int_to_str(tried) + " " + int_to_str(bad));
+    // strings around the second page boundary inside the block
+    val edge: i64 = ((buf + 4095) / 4096) * 4096 + 4096;
+    tried = 0;
+    bad = 0;
+    var start: i64 = edge - 20;
+    while start < edge + 8 {
+        var len: i64 = 0;
+        while len < 30 {
+            val keep2: i64 = get(start + len);
+            put(start + len, 0);
+            if p_str_hash(start) != ref_hash(start) {
+                bad = bad + 1;
+            }
+            put(start + len, keep2);
+            tried = tried + 1;
+            len = len + 1;
+        }
+        start = start + 1;
+    }
+    println("page edges: " + int_to_str(tried) + " " + int_to_str(bad));
+    // SAFETY: buf came from p_malloc above and is not used again.
+    unsafe {
+        p_free(buf);
+    }
+    return 0;
+}

@@ -1,0 +1,212 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG8), the machine layer
+// (compiler/nat_ir.fd): AArch64 loads and stores with writeback. A
+// pointer stepped by a constant in a loop (`a = a + 8` after `*a`) has its
+// step moved next to the access in the machine IR (ng_wb_pair); after
+// allocation the access and `add a, a, #c` are one post-indexed
+// (`ldr x, [a], #8`) or pre-indexed (`ldr x, [a, #8]!`) access
+// (ng_a64_wb_fuse). Loads of 8, 4 (signed), 2 and 1 bytes, stores, steps
+// down, and the offset equal to the step (pre-indexed). Every result is
+// the same with FID_NAT_OFF=wbidx and on every other target. The
+// functions are @wrapping (no overflow checks between the operations).
+// Run:
+//   bash tests/nattools/machine_tg78_check.sh
+//   NATIVE=1 bash scripts/cross-test.sh aarch64-linux
+// Expected output:
+// words 4950 -100
+// fill 0 7 14 693
+// bytes 32640 255
+// i32 -4950 5050
+// u16 4950
+// down 4950
+// pre 4950
+// copy 4950 99
+
+@unsafe @wrapping fn sum_words(base: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var a: i64 = base;
+    val end: i64 = base + n * 8;
+    while a < end {
+        var w: *mut i64 = a;
+        var x: i64 = 0;
+        unsafe { x = *w; }
+        s = s + x;
+        a = a + 8;
+    }
+    return s;
+}
+
+@unsafe @wrapping fn fill_words(base: i64, n: i64, step: i64) {
+    var a: i64 = base;
+    var v: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        var w: *mut i64 = a;
+        unsafe { *w = v; }
+        a = a + 8;
+        v = v + step;
+        k = k + 1;
+    }
+}
+
+@unsafe @wrapping fn word_at(base: i64, i: i64) -> i64 {
+    var w: *mut i64 = base + i * 8;
+    var x: i64 = 0;
+    unsafe { x = *w; }
+    return x;
+}
+
+@unsafe @wrapping fn fill_bytes(base: i64, n: i64) {
+    var a: i64 = base;
+    var k: i64 = 0;
+    while k < n {
+        var b: *mut u8 = a;
+        unsafe { *b = (k & 255) as u8; }
+        a = a + 1;
+        k = k + 1;
+    }
+}
+
+@unsafe @wrapping fn sum_bytes(base: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var a: i64 = base;
+    val end: i64 = base + n;
+    while a < end {
+        var b: *mut u8 = a;
+        var x: i64 = 0;
+        unsafe { x = (*b) as i64; }
+        s = s + x;
+        a = a + 1;
+    }
+    return s;
+}
+
+@unsafe @wrapping fn fill_i32(base: i64, n: i64) {
+    var a: i64 = base;
+    var k: i64 = 0;
+    while k < n {
+        var p: *mut i32 = a;
+        unsafe { *p = (0 - k) as i32; }
+        a = a + 4;
+        k = k + 1;
+    }
+}
+
+@unsafe @wrapping fn sum_i32(base: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var a: i64 = base;
+    val end: i64 = base + n * 4;
+    while a < end {
+        var p: *mut i32 = a;
+        var x: i64 = 0;
+        unsafe { x = (*p) as i64; }
+        s = s + x;
+        a = a + 4;
+    }
+    return s;
+}
+
+@unsafe @wrapping fn fill_u16(base: i64, n: i64) {
+    var a: i64 = base;
+    var k: i64 = 0;
+    while k < n {
+        var p: *mut u16 = a;
+        unsafe { *p = k as u16; }
+        a = a + 2;
+        k = k + 1;
+    }
+}
+
+@unsafe @wrapping fn sum_u16(base: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var a: i64 = base;
+    val end: i64 = base + n * 2;
+    while a < end {
+        var p: *mut u16 = a;
+        var x: i64 = 0;
+        unsafe { x = (*p) as i64; }
+        s = s + x;
+        a = a + 2;
+    }
+    return s;
+}
+
+// from the last word down to the first
+@unsafe @wrapping fn sum_down(base: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var a: i64 = base + (n - 1) * 8;
+    while a >= base {
+        var w: *mut i64 = a;
+        var x: i64 = 0;
+        unsafe { x = *w; }
+        s = s + x;
+        a = a - 8;
+    }
+    return s;
+}
+
+// the word after the pointer, then the pointer moved onto it
+@unsafe @wrapping fn sum_pre(base: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var a: i64 = base - 8;
+    val last: i64 = base + (n - 1) * 8;
+    while a < last {
+        var w: *mut i64 = a + 8;
+        var x: i64 = 0;
+        unsafe { x = *w; }
+        s = s + x;
+        a = a + 8;
+    }
+    return s;
+}
+
+// a load and a store stepping together
+@unsafe @wrapping fn copy_words(dst: i64, src: i64, n: i64) {
+    var d: i64 = dst;
+    var s: i64 = src;
+    var k: i64 = 0;
+    while k < n {
+        var ps: *mut i64 = s;
+        var pd: *mut i64 = d;
+        var x: i64 = 0;
+        unsafe { x = *ps; }
+        unsafe { *pd = x; }
+        s = s + 8;
+        d = d + 8;
+        k = k + 1;
+    }
+}
+
+@unsafe
+fn main() {
+    val n: i64 = 100;
+    val buf: i64 = p_malloc(n * 8);
+    fill_words(buf, n, 1);
+    val neg: i64 = p_malloc(n * 8);
+    fill_words(neg, n, 0 - 1);
+    // 0 + 1 + ... + 99, and (0 - 1 - 2 - 3 - 4) * 10
+    println("words " + int_to_str(sum_words(buf, n)) + " " + int_to_str(sum_words(neg, 5) * 10));
+    val tri: i64 = p_malloc(100 * 8);
+    fill_words(tri, 100, 7);
+    println("fill " + int_to_str(word_at(tri, 0)) + " " + int_to_str(word_at(tri, 1)) + " " + int_to_str(word_at(tri, 2)) + " " + int_to_str(word_at(tri, 99)));
+    val bytes: i64 = p_malloc(256);
+    fill_bytes(bytes, 256);
+    println("bytes " + int_to_str(sum_bytes(bytes, 256)) + " " + int_to_str(sum_bytes(bytes + 255, 1)));
+    val ints: i64 = p_malloc(101 * 4);
+    fill_i32(ints, 101);
+    println("i32 " + int_to_str(sum_i32(ints, 100)) + " " + int_to_str(0 - sum_i32(ints, 101)));
+    val halves: i64 = p_malloc(100 * 2);
+    fill_u16(halves, 100);
+    println("u16 " + int_to_str(sum_u16(halves, 100)));
+    println("down " + int_to_str(sum_down(buf, n)));
+    println("pre " + int_to_str(sum_pre(buf, n)));
+    val copy: i64 = p_malloc(n * 8);
+    copy_words(copy, buf, n);
+    println("copy " + int_to_str(sum_words(copy, n)) + " " + int_to_str(word_at(copy, 99)));
+    p_free(copy);
+    p_free(halves);
+    p_free(ints);
+    p_free(bytes);
+    p_free(tri);
+    p_free(neg);
+    p_free(buf);
+}

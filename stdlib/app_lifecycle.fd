@@ -1,0 +1,405 @@
+// Fides application lifecycle: one model for Android and iOS
+//
+// All of this is real, portable logic (no platform calls): the platform
+// layer (an Android Activity's callbacks through JNI or the NDK glue, a
+// UIApplicationDelegate / UISceneDelegate through objc) only has to call
+// `lifecycle_android(...)` or `lifecycle_ios(...)` with the callback's
+// name, and everything else happens here:
+//   - six states: not running, foreground active, foreground inactive,
+//     background, suspended, terminated
+//   - the transition table (which event moves which state where), strict
+//     application (invalid transitions are reported, not applied) and a
+//     tolerant dispatch that fills in skipped steps along the shortest
+//     path of the table (a platform that reports "entered background"
+//     while active has resigned active on the way)
+//   - observers with a mask of the states they care about, called in
+//     registration order with (from, to, event); removal by id
+//   - the mapping of each platform's callbacks to events: Activity
+//     onCreate/onStart/onResume/onPause/onStop/onDestroy/onTrimMemory and
+//     UIApplication/UIScene delegate methods
+//   - launch kinds (cold, warm, hot), time spent in each state from the
+//     timestamps the platform passes, memory warnings
+//
+// Usage:
+//   use app_lifecycle;
+//   var lc: Lifecycle = lifecycle_new();
+//   lifecycle_observe(&mut lc, LC_MASK_ALL, my_observer);
+//   lifecycle_ios(&mut lc, "applicationDidEnterBackground:", now_ms);
+
+module app_lifecycle;
+use vec;
+use string;
+
+// States
+pub const LC_NOT_RUNNING: i64 = 0;
+pub const LC_ACTIVE: i64 = 1;        // foreground, receiving events
+pub const LC_INACTIVE: i64 = 2;      // foreground, not receiving events
+pub const LC_BACKGROUND: i64 = 3;    // running, not visible
+pub const LC_SUSPENDED: i64 = 4;     // in memory, not running
+pub const LC_TERMINATED: i64 = 5;
+pub const LC_STATE_COUNT: i64 = 6;
+
+// Events
+pub const LC_EV_LAUNCH: i64 = 0;             // launched into the foreground
+pub const LC_EV_LAUNCH_BACKGROUND: i64 = 1;  // launched for background work
+pub const LC_EV_BECOME_ACTIVE: i64 = 2;
+pub const LC_EV_RESIGN_ACTIVE: i64 = 3;
+pub const LC_EV_ENTER_BACKGROUND: i64 = 4;
+pub const LC_EV_ENTER_FOREGROUND: i64 = 5;
+pub const LC_EV_SUSPEND: i64 = 6;
+pub const LC_EV_WAKE: i64 = 7;               // suspended app run in background
+pub const LC_EV_TERMINATE: i64 = 8;
+pub const LC_EV_MEMORY_WARNING: i64 = 9;     // no state change
+pub const LC_EV_NONE: i64 = -1;
+
+// Observer masks: one bit per state entered
+pub const LC_MASK_ALL: i64 = 63;
+
+pub fn lc_mask(state: i64) -> i64 { return 1 << state; }
+
+// Launch kinds
+pub const LC_LAUNCH_COLD: i64 = 0;   // process started
+pub const LC_LAUNCH_WARM: i64 = 1;   // process alive, UI rebuilt from background
+pub const LC_LAUNCH_HOT: i64 = 2;    // resumed from suspension
+
+pub fn lc_state_name(s: i64) -> str {
+    if s == LC_NOT_RUNNING { return "not-running"; }
+    if s == LC_ACTIVE { return "active"; }
+    if s == LC_INACTIVE { return "inactive"; }
+    if s == LC_BACKGROUND { return "background"; }
+    if s == LC_SUSPENDED { return "suspended"; }
+    if s == LC_TERMINATED { return "terminated"; }
+    return "?";
+}
+
+pub fn lc_event_name(e: i64) -> str {
+    val n: Vec<str> = str_split("launch,launch-background,become-active,resign-active,enter-background,enter-foreground,suspend,wake,terminate,memory-warning", ",");
+    if e < 0 || e >= n.len() { return "none"; }
+    return n.get(e);
+}
+
+/// The transition table: the state `event` moves `from` to, or -1 when
+/// the event is not valid there. A memory warning keeps any running state.
+pub fn lc_next(from: i64, event: i64) -> i64 {
+    if event == LC_EV_MEMORY_WARNING {
+        if from == LC_ACTIVE || from == LC_INACTIVE || from == LC_BACKGROUND { return from; }
+        return -1;
+    }
+    if event == LC_EV_TERMINATE {
+        if from == LC_NOT_RUNNING || from == LC_TERMINATED { return -1; }
+        return LC_TERMINATED;
+    }
+    if from == LC_NOT_RUNNING || from == LC_TERMINATED {
+        if event == LC_EV_LAUNCH { return LC_INACTIVE; }
+        if event == LC_EV_LAUNCH_BACKGROUND { return LC_BACKGROUND; }
+        return -1;
+    }
+    if from == LC_INACTIVE {
+        if event == LC_EV_BECOME_ACTIVE { return LC_ACTIVE; }
+        if event == LC_EV_ENTER_BACKGROUND { return LC_BACKGROUND; }
+        return -1;
+    }
+    if from == LC_ACTIVE {
+        if event == LC_EV_RESIGN_ACTIVE { return LC_INACTIVE; }
+        return -1;
+    }
+    if from == LC_BACKGROUND {
+        if event == LC_EV_ENTER_FOREGROUND { return LC_INACTIVE; }
+        if event == LC_EV_SUSPEND { return LC_SUSPENDED; }
+        return -1;
+    }
+    if from == LC_SUSPENDED {
+        if event == LC_EV_WAKE { return LC_BACKGROUND; }
+        if event == LC_EV_ENTER_FOREGROUND { return LC_INACTIVE; }
+        return -1;
+    }
+    return -1;
+}
+
+/// The events (shortest sequence of the table) that take `from` to `to`;
+/// empty when from == to or `to` cannot be reached. Termination and
+/// memory warnings are never inserted.
+pub fn lc_path(from: i64, to: i64) -> Vec<i64> { return lc_path_ex(from, to, true); }
+
+// The same without launch events when `allow_launch` is false: tolerant
+// dispatch never infers that the app was launched.
+fn lc_path_ex(from: i64, to: i64, allow_launch: bool) -> Vec<i64> {
+    var empty: Vec<i64> = Vec::new();
+    if from == to { return empty; }
+    // breadth-first search over states; prev_state/prev_event per state
+    var prev_s: Vec<i64> = Vec::new();
+    var prev_e: Vec<i64> = Vec::new();
+    var seen: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < LC_STATE_COUNT { prev_s.push(-1); prev_e.push(-1); seen.push(false); i = i + 1; }
+    var queue: Vec<i64> = Vec::new();
+    queue.push(from);
+    seen.set(from, true);
+    var qi: i64 = 0;
+    while qi < queue.len() {
+        val s: i64 = queue.get(qi);
+        qi = qi + 1;
+        var ev: i64 = 0;
+        while ev <= LC_EV_WAKE {
+            val n: i64 = lc_next(s, ev);
+            val launch: bool = ev == LC_EV_LAUNCH || ev == LC_EV_LAUNCH_BACKGROUND;
+            if n >= 0 && !seen.get(n) && (allow_launch || !launch) {
+                seen.set(n, true);
+                prev_s.set(n, s);
+                prev_e.set(n, ev);
+                queue.push(n);
+            }
+            ev = ev + 1;
+        }
+    }
+    if !seen.get(to) { return empty; }
+    var rev: Vec<i64> = Vec::new();
+    var cur: i64 = to;
+    while cur != from {
+        rev.push(prev_e.get(cur));
+        cur = prev_s.get(cur);
+    }
+    var out: Vec<i64> = Vec::new();
+    var k: i64 = rev.len() - 1;
+    while k >= 0 { out.push(rev.get(k)); k = k - 1; }
+    return out;
+}
+
+// ─── The lifecycle object ──────────────────────────────────────────────
+
+pub struct LcObserver {
+    pub id: i64,
+    pub mask: i64,
+    pub f: fn(i64, i64, i64) -> void,   // from, to, event
+}
+
+pub struct Lifecycle {
+    pub state: i64,
+    pub observers: Vec<LcObserver>,
+    pub next_id: i64,
+    pub history: Vec<i64>,       // events applied, in order
+    pub rejected: i64,           // invalid events seen
+    pub memory_warnings: i64,
+    pub launches: Vec<i64>,      // LC_LAUNCH_* of each return to the foreground
+    pub time_in: Vec<i64>,       // ms spent in each state
+    pub since: i64,              // timestamp of the last transition (-1: none yet)
+    pub was_suspended: bool,
+    pub cold_pending: bool,
+}
+
+pub fn lifecycle_new() -> Lifecycle {
+    var t: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < LC_STATE_COUNT { t.push(0); i = i + 1; }
+    return Lifecycle {
+        state: LC_NOT_RUNNING, observers: Vec::new(), next_id: 1, history: Vec::new(), rejected: 0,
+        memory_warnings: 0, launches: Vec::new(), time_in: t, since: -1, was_suspended: false, cold_pending: false,
+    };
+}
+
+/// Register an observer for transitions into the states of `mask`;
+/// returns its id.
+pub fn lifecycle_observe(lc: &mut Lifecycle, mask: i64, f: fn(i64, i64, i64) -> void) -> i64 {
+    val id: i64 = lc.next_id;
+    lc.next_id = lc.next_id + 1;
+    lc.observers.push(LcObserver { id: id, mask: mask, f: f });
+    return id;
+}
+
+/// Remove an observer; false when there is none with that id.
+pub fn lifecycle_unobserve(lc: &mut Lifecycle, id: i64) -> bool {
+    var i: i64 = 0;
+    while i < lc.observers.len() {
+        if lc.observers.get(i).id == id {
+            lc.observers.remove(i);
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lc_notify(lc: &Lifecycle, from: i64, to: i64, event: i64) {
+    var i: i64 = 0;
+    while i < lc.observers.len() {
+        val o: LcObserver = lc.observers.get(i);
+        if (o.mask & lc_mask(to)) != 0 {
+            val f: fn(i64, i64, i64) -> void = o.f;
+            f(from, to, event);
+        }
+        i = i + 1;
+    }
+}
+
+fn lc_account(lc: &mut Lifecycle, now: i64) {
+    if lc.since >= 0 && now >= lc.since {
+        lc.time_in.set(lc.state, lc.time_in.get(lc.state) + now - lc.since);
+    }
+    lc.since = now;
+}
+
+/// Apply one event strictly: false (and nothing changes) when the table
+/// has no such transition from the current state.
+pub fn lifecycle_apply(lc: &mut Lifecycle, event: i64, now: i64) -> bool {
+    val from: i64 = lc.state;
+    val to: i64 = lc_next(from, event);
+    if to < 0 {
+        lc.rejected = lc.rejected + 1;
+        return false;
+    }
+    if event == LC_EV_MEMORY_WARNING {
+        lc.memory_warnings = lc.memory_warnings + 1;
+        lc.history.push(event);
+        lc_notify(lc, from, to, event);
+        return true;
+    }
+    lc_account(lc, now);
+    // launch kinds: the first foreground entry after the process started
+    // (also when it started in the background) is cold, one after a
+    // suspension hot, any other return from the background warm
+    if from == LC_NOT_RUNNING || from == LC_TERMINATED { lc.cold_pending = true; }
+    if to == LC_SUSPENDED { lc.was_suspended = true; }
+    if to == LC_INACTIVE {
+        if lc.cold_pending { lc.launches.push(LC_LAUNCH_COLD); }
+        else if lc.was_suspended { lc.launches.push(LC_LAUNCH_HOT); }
+        else if from == LC_BACKGROUND { lc.launches.push(LC_LAUNCH_WARM); }
+        lc.cold_pending = false;
+        lc.was_suspended = false;
+    }
+    if to == LC_TERMINATED { lc.was_suspended = false; lc.cold_pending = false; }
+    lc.state = to;
+    lc.history.push(event);
+    lc_notify(lc, from, to, event);
+    return true;
+}
+
+/// Apply an event tolerantly: when it is not valid in the current state,
+/// first take the shortest path (without launching) to a state where it
+/// is, then apply it.
+/// Returns the number of events applied (0: impossible, nothing done).
+pub fn lifecycle_dispatch(lc: &mut Lifecycle, event: i64, now: i64) -> i64 {
+    if event == LC_EV_NONE { return 0; }
+    if lc_next(lc.state, event) >= 0 {
+        lifecycle_apply(lc, event, now);
+        return 1;
+    }
+    // the nearest state where the event applies
+    var best: Vec<i64> = Vec::new();
+    var found: bool = false;
+    var s: i64 = 0;
+    while s < LC_STATE_COUNT {
+        if lc_next(s, event) >= 0 {
+            val p: Vec<i64> = lc_path_ex(lc.state, s, false);
+            if p.len() > 0 && (!found || p.len() < best.len()) {
+                best = p;
+                found = true;
+            }
+        }
+        s = s + 1;
+    }
+    if !found {
+        lc.rejected = lc.rejected + 1;
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < best.len() {
+        lifecycle_apply(lc, best.get(i), now);
+        i = i + 1;
+    }
+    lifecycle_apply(lc, event, now);
+    return best.len() + 1;
+}
+
+/// Close the time accounting at `now` (e.g. before reporting).
+pub fn lifecycle_tick(lc: &mut Lifecycle, now: i64) { lc_account(lc, now); }
+
+pub fn lifecycle_is_foreground(lc: &Lifecycle) -> bool {
+    return lc.state == LC_ACTIVE || lc.state == LC_INACTIVE;
+}
+
+/// May the app run code now (not suspended, not terminated, launched)?
+pub fn lifecycle_is_running(lc: &Lifecycle) -> bool {
+    return lc.state == LC_ACTIVE || lc.state == LC_INACTIVE || lc.state == LC_BACKGROUND;
+}
+
+// ─── Platform callbacks ────────────────────────────────────────────────
+
+/// Android TRIM_MEMORY_* levels (ComponentCallbacks2).
+pub const ANDROID_TRIM_MEMORY_RUNNING_MODERATE: i64 = 5;
+pub const ANDROID_TRIM_MEMORY_RUNNING_LOW: i64 = 10;
+pub const ANDROID_TRIM_MEMORY_RUNNING_CRITICAL: i64 = 15;
+pub const ANDROID_TRIM_MEMORY_UI_HIDDEN: i64 = 20;
+pub const ANDROID_TRIM_MEMORY_BACKGROUND: i64 = 40;
+pub const ANDROID_TRIM_MEMORY_MODERATE: i64 = 60;
+pub const ANDROID_TRIM_MEMORY_COMPLETE: i64 = 80;
+
+/// The event of an Android Activity callback (LC_EV_NONE when it changes
+/// nothing: onRestart, onSaveInstanceState, a mild onTrimMemory). `arg`
+/// is the trim level for onTrimMemory.
+pub fn lc_android_event(callback: str, arg: i64) -> i64 {
+    if callback == "onCreate" { return LC_EV_LAUNCH_BACKGROUND; }
+    if callback == "onStart" { return LC_EV_ENTER_FOREGROUND; }
+    if callback == "onResume" { return LC_EV_BECOME_ACTIVE; }
+    if callback == "onPause" { return LC_EV_RESIGN_ACTIVE; }
+    if callback == "onStop" { return LC_EV_ENTER_BACKGROUND; }
+    if callback == "onDestroy" { return LC_EV_TERMINATE; }
+    if callback == "onLowMemory" { return LC_EV_MEMORY_WARNING; }
+    if callback == "onTrimMemory" {
+        if arg == ANDROID_TRIM_MEMORY_RUNNING_CRITICAL || arg >= ANDROID_TRIM_MEMORY_MODERATE { return LC_EV_MEMORY_WARNING; }
+        return LC_EV_NONE;
+    }
+    // the cached-apps freezer (Android 11+) stops a cached process
+    if callback == "freeze" { return LC_EV_SUSPEND; }
+    if callback == "unfreeze" { return LC_EV_WAKE; }
+    return LC_EV_NONE;
+}
+
+/// The event of a UIApplicationDelegate or UISceneDelegate method.
+/// `arg` for application:didFinishLaunchingWithOptions: is 1 when the
+/// app was launched into the background (applicationState background).
+pub fn lc_ios_event(method: str, arg: i64) -> i64 {
+    if method == "application:didFinishLaunchingWithOptions:" || method == "application:willFinishLaunchingWithOptions:" {
+        if arg != 0 { return LC_EV_LAUNCH_BACKGROUND; }
+        return LC_EV_LAUNCH;
+    }
+    if method == "applicationDidBecomeActive:" || method == "sceneDidBecomeActive:" { return LC_EV_BECOME_ACTIVE; }
+    if method == "applicationWillResignActive:" || method == "sceneWillResignActive:" { return LC_EV_RESIGN_ACTIVE; }
+    if method == "applicationDidEnterBackground:" || method == "sceneDidEnterBackground:" || method == "sceneDidDisconnect:" { return LC_EV_ENTER_BACKGROUND; }
+    if method == "applicationWillEnterForeground:" || method == "sceneWillEnterForeground:" { return LC_EV_ENTER_FOREGROUND; }
+    if method == "applicationWillTerminate:" { return LC_EV_TERMINATE; }
+    if method == "applicationDidReceiveMemoryWarning:" { return LC_EV_MEMORY_WARNING; }
+    // the system suspends the app after its background time expired
+    if method == "backgroundTimeExpired" { return LC_EV_SUSPEND; }
+    if method == "application:performFetchWithCompletionHandler:" { return LC_EV_WAKE; }
+    return LC_EV_NONE;
+}
+
+/// Feed an Android callback; returns the events applied.
+pub fn lifecycle_android(lc: &mut Lifecycle, callback: str, arg: i64, now: i64) -> i64 {
+    return lifecycle_dispatch(lc, lc_android_event(callback, arg), now);
+}
+
+/// Feed an iOS delegate method; returns the events applied.
+pub fn lifecycle_ios(lc: &mut Lifecycle, method: str, arg: i64, now: i64) -> i64 {
+    return lifecycle_dispatch(lc, lc_ios_event(method, arg), now);
+}
+
+/// One line: state, launches (c/w/h), ms per state, warnings, rejections.
+pub fn lifecycle_summary(lc: &Lifecycle) -> str {
+    var l: str = "";
+    var i: i64 = 0;
+    while i < lc.launches.len() {
+        val k: i64 = lc.launches.get(i);
+        l = l + (if k == LC_LAUNCH_COLD { "c" } else if k == LC_LAUNCH_WARM { "w" } else { "h" });
+        i = i + 1;
+    }
+    var t: str = "";
+    i = 1;
+    while i < LC_STATE_COUNT - 1 {
+        if i > 1 { t = t + "/"; }
+        t = t + int_to_str(lc.time_in.get(i));
+        i = i + 1;
+    }
+    return lc_state_name(lc.state) + " launches=" + l + " ms=" + t + " warnings=" + int_to_str(lc.memory_warnings)
+        + " rejected=" + int_to_str(lc.rejected);
+}

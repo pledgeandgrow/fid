@@ -34,6 +34,9 @@ module gl;
 // On Linux, they link against libGL.so. On Windows, opengl32.lib.
 // On macOS, the OpenGL framework.
 
+// SAFETY: the prototypes come from <GL/gl.h> (the include), so the C compiler
+// checks each call; the functions take values and GL object names, and
+// pointer arguments are buffers the caller sized for the call.
 extern "C" include "<GL/gl.h>" link "GL" {
     fn glClear as gl_clear(mask: i64) -> void;
     fn glClearColor as gl_clear_color(r: f64, g: f64, b: f64, a: f64) -> void;
@@ -72,6 +75,8 @@ extern "C" include "<GL/gl.h>" link "GL" {
 }
 
 // GLU (utility library)
+// SAFETY: the prototypes come from <GL/glu.h>, checked by the C compiler;
+// both functions take only doubles.
 extern "C" include "<GL/glu.h>" link "GLU" {
     fn gluPerspective as glu_perspective(fov: f64, aspect: f64, near: f64, far: f64) -> void;
     fn gluLookAt as glu_look_at(eye_x: f64, eye_y: f64, eye_z: f64, cx: f64, cy: f64, cz: f64, ux: f64, uy: f64, uz: f64) -> void;
@@ -186,6 +191,12 @@ pub fn gl_enable_blend() -> void {
 }
 
 /// Get error string from error code.
+///
+/// Example:
+///   assert_eq(gl_error_string(GL_NO_ERROR), "No error");
+///   assert_eq(gl_error_string(GL_INVALID_ENUM), "Invalid enum");
+///   assert_eq(gl_error_string(-1), "Unknown error");
+///   assert_eq(GL_INVALID_ENUM, 0x0500);
 pub fn gl_error_string(err: i64) -> str {
     if err == GL_NO_ERROR {
         return "No error";
@@ -212,6 +223,8 @@ pub fn gl_error_string(err: i64) -> str {
 // which are loaded via GLAD or GLEW on Linux/Windows.
 // For simplicity, we declare the core functions here.
 
+// SAFETY: the prototypes come from <GL/gl.h>, checked by the C compiler;
+// shader sources and logs are buffers the caller sized for the call.
 extern "C" include "<GL/gl.h>" link "GL" {
     fn glCreateShader as gl_create_shader(type: i64) -> i64;
     fn glShaderSource as gl_shader_source(shader: i64, count: i64, string: i64, length: i64) -> void;
@@ -243,6 +256,30 @@ extern "C" include "<GL/gl.h>" link "GL" {
 pub const GL_VERTEX_SHADER: i64 = 0x8B31; pub const GL_FRAGMENT_SHADER: i64 = 0x8B30;
 // Shader status constants
 pub const GL_COMPILE_STATUS: i64 = 0x8B81; pub const GL_LINK_STATUS: i64 = 0x8B82;
+/// An 8-byte block holding `first`: the address array glShaderSource reads,
+/// or the out-parameter a glGet*iv writes (a GLint in its low 4 bytes, so
+/// start it at 0). Read it with gl_out_word; free it with p_free.
+fn gl_out_block(first: i64) -> i64 {
+    val blk: i64 = p_malloc(8);
+    var p: * mut i64 = blk;
+    // SAFETY: the 8-byte block p_malloc just returned.
+    unsafe {
+        * p = first;
+    }
+    return blk;
+}
+
+/// The word in a block from gl_out_block.
+fn gl_out_word(blk: i64) -> i64 {
+    var p: * mut i64 = blk;
+    var v: i64 = 0;
+    // SAFETY: an 8-byte block from gl_out_block, not yet freed.
+    unsafe {
+        v = * p;
+    }
+    return v;
+}
+
 /// Compile a shader from source code. Returns shader ID or 0 on failure.
 pub fn gl_compile_shader_src(shader_type: i64, source: str) -> i64 {
     var shader = gl_create_shader(shader_type);
@@ -250,20 +287,20 @@ pub fn gl_compile_shader_src(shader_type: i64, source: str) -> i64 {
         return 0;
     }
 
-    // glShaderSource expects a pointer to a pointer to char.
-    // In native builds, the runtime wraps this.
-    // For now, we pass the source directly (the native runtime handles the indirection).
-    gl_shader_source(shader, 1, 0, 0);
-    // native: pass &source_ptr and &source_len
+    // glShaderSource takes an array of string pointers: here one, whose
+    // text ends in a NUL, so the array of lengths is null
+    val srcs: i64 = gl_out_block(source as i64);
+    gl_shader_source(shader, 1, srcs, 0);
+    p_free(srcs);
     gl_compile_shader(shader);
 
-    // Check compile status
-    var status: Vec<i64> = Vec::new();
-    status.push(0);
-    gl_get_shader_iv(shader, GL_COMPILE_STATUS, 0);
-    // native: pass &status[0]
+    // Check compile status (a GLint written into a zeroed word)
+    val status: i64 = gl_out_block(0);
+    gl_get_shader_iv(shader, GL_COMPILE_STATUS, status);
+    val compiled: i64 = gl_out_word(status);
+    p_free(status);
 
-    if status.get(0) == 0 {
+    if compiled == 0 {
         // Compilation failed
         gl_delete_shader(shader);
         return 0;
@@ -297,13 +334,13 @@ pub fn gl_create_program_from_src(vert_src: str, frag_src: str) -> i64 {
     gl_attach_shader(program, frag);
     gl_link_program(program);
 
-    // Check link status
-    var status: Vec<i64> = Vec::new();
-    status.push(0);
-    gl_get_program_iv(program, GL_LINK_STATUS, 0);
-    // native: pass &status[0]
+    // Check link status (a GLint written into a zeroed word)
+    val status: i64 = gl_out_block(0);
+    gl_get_program_iv(program, GL_LINK_STATUS, status);
+    val linked: i64 = gl_out_word(status);
+    p_free(status);
 
-    if status.get(0) == 0 {
+    if linked == 0 {
         // Linking failed
         gl_delete_program(program);
         gl_delete_shader(vert);

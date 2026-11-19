@@ -1,0 +1,344 @@
+// TL5 (docs/roadmap/competitive-roadmap.md): DWARF line tables in Mach-O
+// executables (compiler/nat_enc.fd nat_macho_debug, nat_macho_dwarf,
+// nat_macho_dwarf_seg, nat_debug_line_at). A stand-in image (a code page,
+// then a data page) with two functions, `main` of main.fd and a method
+// `Point_len` (shown as Point::len) of lib/util.fd, and their line rows is
+// written as a Mach-O; the test reads it back the way lldb does: the
+// load commands (a __DWARF segment between __DATA and __LINKEDIT, page
+// aligned, mapped read-only, its three sections inside it), then the
+// compile unit and the functions of __debug_info, and the rows of the
+// __debug_line program. The last part checks that an image without rows
+// is the plain one (12 load commands, no __DWARF).
+// Run (from the repository root):
+//   fid run tests/nattools/macho_dwarf_unit.fd
+// Expected output:
+// ncmds 13
+// seg __PAGEZERO fileoff 0
+// seg __TEXT fileoff 0
+// seg __DATA fileoff 32768
+// seg __DWARF fileoff 49152 filesize 16384 vmsize 16384 prot 1/1 nsects 3
+// sect __debug_abbrev size 54 inside true
+// sect __debug_info size 127 inside true
+// sect __debug_line size 111 inside true
+// seg __LINKEDIT fileoff 65536
+// linkedit last true
+// cu fid (Fides) lang 12 name main.fd low 0 size 128 version 4
+// fn main low 0 size 64 decl 1:10
+// fn Point::len link Point_len low 64 size 64 decl 2:20
+// file 1 main.fd
+// file 2 lib/util.fd
+// row 0 line 10 file 1
+// row 8 line 11 file 1
+// row 32 line 12 file 1
+// end 64
+// row 64 line 20 file 2
+// row 80 line 21 file 2
+// end 128
+// plain ncmds 12 dwarf false
+// x64 ncmds 13 dwarf true
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn le16(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn le64(b: &Vec<i64>, at: i64) -> i64 {
+    return le32(b, at) | (le32(b, at + 4) << 32);
+}
+
+fn cstr_at(b: &Vec<i64>, at: i64) -> str {
+    var out: str = "";
+    var i: i64 = at;
+    while i < b.len() && b.get(i) != 0 {
+        out = out + char_to_str(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn name16(b: &Vec<i64>, at: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < 16 && b.get(at + i) != 0 {
+        out = out + char_to_str(b.get(at + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// LEB128 at `at`; next.get(0) becomes the offset after it.
+fn leb_at(b: &Vec<i64>, at: i64, signed: bool, next: &mut Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var shift: i64 = 0;
+    var i: i64 = at;
+    var c: i64 = 0;
+    while true {
+        c = b.get(i);
+        v = v | ((c & 127) << shift);
+        shift = shift + 7;
+        i = i + 1;
+        if (c & 128) == 0 {
+            break;
+        }
+    }
+    if signed && (c & 64) != 0 && shift < 64 {
+        v = v - (1 << shift);
+    }
+    next.set(0, i);
+    return v;
+}
+
+// A stand-in image: `code` bytes of code, then 64 bytes of data.
+fn image(code: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    while v.len() < code + 64 {
+        v.push(0);
+    }
+    return v;
+}
+
+fn build(arch: i64, with_rows: bool) -> Vec<i64> {
+    nat_line_files_reset("main.fd");
+    var lib_ix: i64 = nat_line_file_index("lib/util.fd");
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("Point_len");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(0x40);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(0x40);
+    ends.push(0x80);
+    var shown: Vec<str> = Vec::new();
+    shown.push("main");
+    shown.push("Point::len");
+    g_nat_dbg_shown = shown;
+    var rows: Vec<i64> = Vec::new();
+    if with_rows {
+        rows.push(0);
+        rows.push(10);
+        rows.push(0);
+        rows.push(8);
+        rows.push(11);
+        rows.push(0);
+        rows.push(0x20);
+        rows.push(12);
+        rows.push(0);
+        rows.push(0x40);
+        rows.push(0);
+        rows.push(1);
+        rows.push(0x40);
+        rows.push(20);
+        rows.push(2 * lib_ix);
+        rows.push(0x50);
+        rows.push(21);
+        rows.push(2 * lib_ix);
+        rows.push(0x80);
+        rows.push(0);
+        rows.push(1);
+    }
+    var none: Vec<i64> = Vec::new();
+    var imps: Vec<str> = Vec::new();
+    imps.push("_write");
+    var offs: Vec<i64> = Vec::new();
+    offs.push(0x4000);
+    var m: Vec<i64> = nat_macho_debug(arch, image(0x4000), 0, 0x4000, none, imps, offs, names, starts, ends, "main.fd", rows);
+    g_nat_dbg_shown = Vec::new();
+    return m;
+}
+
+// Whether `m` has a __DWARF segment.
+fn has_dwarf(m: &Vec<i64>) -> bool {
+    var ncmds: i64 = le32(m, 16);
+    var at: i64 = 32;
+    var k: i64 = 0;
+    while k < ncmds {
+        if le32(m, at) == 0x19 && name16(m, at + 8) == "__DWARF" {
+            return true;
+        }
+        at = at + le32(m, at + 4);
+        k = k + 1;
+    }
+    return false;
+}
+
+fn show(m: &Vec<i64>) {
+    var ncmds: i64 = le32(m, 16);
+    println("ncmds " + int_to_str(ncmds));
+    var at: i64 = 32;
+    var k: i64 = 0;
+    var abbrev_off: i64 = 0;
+    var info_off: i64 = 0;
+    var info_size: i64 = 0;
+    var line_off: i64 = 0;
+    var line_size: i64 = 0;
+    var le_off: i64 = 0;
+    var le_size: i64 = 0;
+    var abase: i64 = 0;
+    while k < ncmds {
+        var cmd: i64 = le32(m, at);
+        var size: i64 = le32(m, at + 4);
+        if cmd == 0x19 {
+            var sname: str = name16(m, at + 8);
+            var vmaddr: i64 = le64(m, at + 24);
+            var vmsize: i64 = le64(m, at + 32);
+            var fileoff: i64 = le64(m, at + 40);
+            var filesize: i64 = le64(m, at + 48);
+            var nsects: i64 = le32(m, at + 64);
+            if sname == "__DWARF" {
+                println("seg " + sname + " fileoff " + int_to_str(fileoff) + " filesize " + int_to_str(filesize) + " vmsize " + int_to_str(vmsize) + " prot " + int_to_str(le32(m, at + 60)) + "/" + int_to_str(le32(m, at + 56)) + " nsects " + int_to_str(nsects));
+                var s: i64 = 0;
+                while s < nsects {
+                    var so: i64 = at + 72 + 80 * s;
+                    var xname: str = name16(m, so);
+                    var xaddr: i64 = le64(m, so + 32);
+                    var xsize: i64 = le64(m, so + 40);
+                    var xoff: i64 = le32(m, so + 48);
+                    var inside: bool = name16(m, so + 16) == "__DWARF" && xaddr >= vmaddr && xaddr + xsize <= vmaddr + vmsize && xoff - fileoff == xaddr - vmaddr && (le32(m, so + 64) & 0x02000000) != 0;
+                    println("sect " + xname + " size " + int_to_str(xsize) + " inside " + bool_to_str(inside));
+                    if xname == "__debug_abbrev" {
+                        abbrev_off = xoff;
+                    }
+                    if xname == "__debug_info" {
+                        info_off = xoff;
+                        info_size = xsize;
+                    }
+                    if xname == "__debug_line" {
+                        line_off = xoff;
+                        line_size = xsize;
+                    }
+                    s = s + 1;
+                }
+            } else {
+                println("seg " + sname + " fileoff " + int_to_str(fileoff));
+            }
+            if sname == "__LINKEDIT" {
+                le_off = fileoff;
+                le_size = filesize;
+            }
+            if sname == "__TEXT" {
+                abase = vmaddr + 0x4000;
+            }
+        }
+        at = at + size;
+        k = k + 1;
+    }
+    println("linkedit last " + bool_to_str(le_off + le_size == m.len()));
+    if abbrev_off == 0 || info_off == 0 || line_off == 0 {
+        println("no DWARF sections");
+        return;
+    }
+    // __debug_info: the compile unit (abbrev 1), then functions (2, 3)
+    var next: Vec<i64> = Vec::new();
+    next.push(0);
+    var p: i64 = info_off + 11;
+    var code: i64 = m.get(p);
+    p = p + 1;
+    var producer: str = cstr_at(m, p);
+    p = p + str_len(producer) + 1;
+    var lang: i64 = le16(m, p);
+    p = p + 2;
+    var cuname: str = cstr_at(m, p);
+    p = p + str_len(cuname) + 1;
+    var culow: i64 = le64(m, p);
+    var cusize: i64 = le64(m, p + 8);
+    p = p + 20;
+    println("cu " + producer + " lang " + int_to_str(lang) + " name " + cuname + " low " + int_to_str(culow - abase) + " size " + int_to_str(cusize) + " version " + int_to_str(le16(m, info_off + 4)));
+    if code != 1 || le32(m, info_off) != info_size - 4 {
+        println("bad compile unit");
+    }
+    while p < info_off + info_size {
+        code = m.get(p);
+        p = p + 1;
+        if code == 0 {
+            break;
+        }
+        var fname: str = cstr_at(m, p);
+        p = p + str_len(fname) + 1;
+        var link: str = "";
+        if code == 3 {
+            link = " link " + cstr_at(m, p);
+            p = p + str_len(link) - 6 + 1;
+        }
+        var flow: i64 = le64(m, p);
+        var fsize: i64 = le64(m, p + 8);
+        var dfile: i64 = le16(m, p + 16);
+        var dline: i64 = le32(m, p + 18);
+        p = p + 22;
+        println("fn " + fname + link + " low " + int_to_str(flow - abase) + " size " + int_to_str(fsize) + " decl " + int_to_str(dfile) + ":" + int_to_str(dline));
+    }
+    // __debug_line: the file table, then the program's rows
+    var hlen: i64 = le32(m, line_off + 6);
+    var q: i64 = line_off + 10 + 18;
+    while m.get(q) != 0 {
+        q = q + str_len(cstr_at(m, q)) + 1;
+    }
+    q = q + 1;
+    var nf: i64 = 0;
+    while m.get(q) != 0 {
+        var fnm: str = cstr_at(m, q);
+        nf = nf + 1;
+        println("file " + int_to_str(nf) + " " + fnm);
+        q = q + str_len(fnm) + 1;
+        leb_at(m, q, false, &mut next);
+        q = next.get(0);
+        leb_at(m, q, false, &mut next);
+        q = next.get(0);
+        leb_at(m, q, false, &mut next);
+        q = next.get(0);
+    }
+    q = line_off + 10 + hlen;
+    var addr: i64 = 0;
+    var line: i64 = 1;
+    var file: i64 = 1;
+    while q < line_off + line_size {
+        var op: i64 = m.get(q);
+        q = q + 1;
+        if op == 0 {
+            var elen: i64 = leb_at(m, q, false, &mut next);
+            q = next.get(0);
+            var eop: i64 = m.get(q);
+            if eop == 1 {
+                println("end " + int_to_str(addr - abase));
+                line = 1;
+                file = 1;
+            } else if eop == 2 {
+                addr = le64(m, q + 1);
+            } else {
+                println("unknown extended opcode " + int_to_str(eop));
+            }
+            q = q + elen;
+        } else if op == 1 {
+            println("row " + int_to_str(addr - abase) + " line " + int_to_str(line) + " file " + int_to_str(file));
+        } else if op == 2 {
+            addr = addr + leb_at(m, q, false, &mut next);
+            q = next.get(0);
+        } else if op == 3 {
+            line = line + leb_at(m, q, true, &mut next);
+            q = next.get(0);
+        } else if op == 4 {
+            file = leb_at(m, q, false, &mut next);
+            q = next.get(0);
+        } else {
+            println("unexpected opcode " + int_to_str(op));
+            break;
+        }
+    }
+}
+
+fn main() -> i64 {
+    var a: Vec<i64> = build(NAT_A64, true);
+    show(&a);
+    var plain: Vec<i64> = build(NAT_A64, false);
+    println("plain ncmds " + int_to_str(le32(&plain, 16)) + " dwarf " + bool_to_str(has_dwarf(&plain)));
+    var x: Vec<i64> = build(NAT_X64, true);
+    println("x64 ncmds " + int_to_str(le32(&x, 16)) + " dwarf " + bool_to_str(has_dwarf(&x)));
+    return 0;
+}

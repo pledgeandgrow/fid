@@ -1,0 +1,223 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG7), the machine layer
+// (compiler/nat_ir.fd): x86-64 selections that must not change a result.
+// - BMI1 under --cpu x86-64-v3|v4 (ng_fuse_bits, MO_BLSR's kinds):
+//     a & (a - 1) -> BLSR, a ^ (a - 1) -> BLSMSK, a & -a or a & (0 - a)
+//     -> BLSI (FID_NAT_OFF=blsr / blsmsk / blsi); a ^ -a stays as it is.
+// - Spilled operands (`pressure` keeps more values live across its loop
+//   than x86-64 has registers): a compare-and-branch or SETCC compares
+//   with the slot (`cmp r, [rsp + off]`, swapped when the slot is the left
+//   side, `cmp qword [rsp + off], 0` against zero: FID_NAT_OFF=cmpslot),
+//   and `x = x op y` / `x = x + c` on a spilled x works on the slot (`op
+//   [rsp + off], r`, `op qword [rsp + off], imm`: FID_NAT_OFF=rmwslot).
+// The functions are @wrapping (no overflow checks between the operations).
+// Every result is the same with each switch on or off, with and without
+// --cpu, on run / ccompile / emit. Run:
+//   bash tests/nattools/machine_tg78_check.sh
+//   NATIVE=1 bash scripts/cross-test.sh x86_64-linux (and x86_64-windows)
+// Expected output:
+// blsmsk 7 -1 -1 1 15 255
+// blsi 4 0 -9223372036854775808 8 32 1
+// blsr 8 0 0
+// xneg -8 0
+// pressure 0: 136
+// pressure 7: 753
+// pressure 300: 8555117
+// count 3 6 3 0
+// sums 535 -456
+
+@wrapping fn blsmsk(a: i64) -> i64 {
+    return a ^ (a - 1);
+}
+
+@wrapping fn blsmsk_r(a: i64) -> i64 {
+    return (a - 1) ^ a;
+}
+
+@wrapping fn blsmsk_add(a: i64) -> i64 {
+    return a ^ (a + (0 - 1));
+}
+
+@wrapping fn blsi(a: i64) -> i64 {
+    return a & (0 - a);
+}
+
+@wrapping fn blsi_neg(a: i64) -> i64 {
+    return a & -a;
+}
+
+@wrapping fn blsi_r(a: i64) -> i64 {
+    return (0 - a) & a;
+}
+
+@wrapping fn blsr(a: i64) -> i64 {
+    return a & (a - 1);
+}
+
+// not a BMI1 operation: kept as NEG and XOR
+@wrapping fn xneg(a: i64) -> i64 {
+    return a ^ (0 - a);
+}
+
+// sixteen values and the counters live across the loop
+@wrapping fn pressure(n: i64) -> i64 {
+    var a0: i64 = 1;
+    var a1: i64 = 2;
+    var a2: i64 = 3;
+    var a3: i64 = 4;
+    var a4: i64 = 5;
+    var a5: i64 = 6;
+    var a6: i64 = 7;
+    var a7: i64 = 8;
+    var a8: i64 = 9;
+    var a9: i64 = 10;
+    var a10: i64 = 11;
+    var a11: i64 = 12;
+    var a12: i64 = 13;
+    var a13: i64 = 14;
+    var a14: i64 = 15;
+    var a15: i64 = 16;
+    var hits: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        a0 = a0 + i;
+        a1 = a1 ^ (i * 3);
+        a2 = a2 - i;
+        a3 = a3 | (i << 2);
+        a4 = a4 & 1023;
+        a5 = a5 + 3;
+        a6 = a6 - 5;
+        a7 = a7 ^ a0;
+        a8 = a8 + a1;
+        a9 = a9 - a2;
+        a10 = a10 | a3;
+        a11 = a11 + a5;
+        a12 = a12 ^ 255;
+        a13 = a13 + a6;
+        a14 = a14 - 11;
+        a15 = a15 + a7;
+        if a3 < a10 {
+            hits = hits + 1;
+        }
+        if a12 > a0 {
+            hits = hits + 2;
+        }
+        if a9 >= a2 {
+            hits = hits + 4;
+        }
+        if a14 != a15 {
+            hits = hits + 8;
+        }
+        if a6 < 0 {
+            hits = hits + 16;
+        }
+        i = i + 1;
+    }
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + hits;
+}
+
+// counts of compares between values that stay live across the loop
+@wrapping fn count(v: Vec<i64>, lo: i64, hi: i64) -> Vec<i64> {
+    var below: i64 = 0;
+    var above: i64 = 0;
+    var inside: i64 = 0;
+    var zero: i64 = 0;
+    var b0: i64 = lo + 1;
+    var b1: i64 = hi - 1;
+    var b2: i64 = lo * 2;
+    var b3: i64 = hi * 2;
+    var b4: i64 = lo + hi;
+    var b5: i64 = hi - lo;
+    var b6: i64 = lo ^ hi;
+    var b7: i64 = lo | hi;
+    var b8: i64 = lo & hi;
+    var b9: i64 = lo + 7;
+    var b10: i64 = hi + 7;
+    var b11: i64 = lo - 7;
+    var b12: i64 = hi - 7;
+    var i: i64 = 0;
+    while i < v.len() {
+        val x: i64 = v.get(i);
+        if x < lo {
+            below = below + 1;
+        } else if x > hi {
+            above = above + 1;
+        } else {
+            inside = inside + 1;
+        }
+        if x == b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 + b10 + b11 + b12 {
+            zero = zero + 1;
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(below);
+    out.push(above);
+    out.push(inside);
+    out.push(zero);
+    return out;
+}
+
+// read-modify-writes of values that are live across the loop
+@wrapping fn sums(n: i64) -> Vec<i64> {
+    var s0: i64 = 0;
+    var s1: i64 = 0;
+    var s2: i64 = 0;
+    var s3: i64 = 0;
+    var s4: i64 = 0;
+    var s5: i64 = 0;
+    var s6: i64 = 0;
+    var s7: i64 = 0;
+    var s8: i64 = 0;
+    var s9: i64 = 0;
+    var s10: i64 = 0;
+    var s11: i64 = 0;
+    var s12: i64 = 0;
+    var s13: i64 = 0;
+    var s14: i64 = 0;
+    var s15: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s0 = s0 + i;
+        s1 = s1 - i;
+        s2 = s2 + 1;
+        s3 = s3 - 1;
+        s4 = s4 ^ i;
+        s5 = s5 | i;
+        s6 = s6 + 2;
+        s7 = s7 - 2;
+        s8 = s8 + i;
+        s9 = s9 - i;
+        s10 = s10 + 3;
+        s11 = s11 - 3;
+        s12 = s12 & i;
+        s13 = s13 + i;
+        s14 = s14 - i;
+        s15 = s15 + 4;
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(s0 + s2 + s4 + s5 + s6 + s8 + s10 + s12 + s13 + s15);
+    out.push(s1 + s3 + s7 + s9 + s11 + s14);
+    return out;
+}
+
+fn main() {
+    val m: i64 = 0 - 9223372036854775807 - 1;
+    println("blsmsk " + int_to_str(blsmsk(12)) + " " + int_to_str(blsmsk(0)) + " " + int_to_str(blsmsk_r(m)) + " " + int_to_str(blsmsk_add(1)) + " " + int_to_str(blsmsk(0 - 8)) + " " + int_to_str(blsmsk_r(128)));
+    println("blsi " + int_to_str(blsi(12)) + " " + int_to_str(blsi(0)) + " " + int_to_str(blsi_neg(m)) + " " + int_to_str(blsi_r(0 - 8)) + " " + int_to_str(blsi_neg(96)) + " " + int_to_str(blsi_r(7)));
+    println("blsr " + int_to_str(blsr(12)) + " " + int_to_str(blsr(0)) + " " + int_to_str(blsr(m)));
+    println("xneg " + int_to_str(xneg(12)) + " " + int_to_str(xneg(0)));
+    println("pressure 0: " + int_to_str(pressure(0)));
+    println("pressure 7: " + int_to_str(pressure(7)));
+    println("pressure 300: " + int_to_str(pressure(300)));
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 0 - 3;
+    while k < 9 {
+        v.push(k);
+        k = k + 1;
+    }
+    val c: Vec<i64> = count(v, 0, 2);
+    println("count " + int_to_str(c.get(0)) + " " + int_to_str(c.get(1)) + " " + int_to_str(c.get(2)) + " " + int_to_str(c.get(3)));
+    val s: Vec<i64> = sums(16);
+    println("sums " + int_to_str(s.get(0)) + " " + int_to_str(s.get(1)));
+}

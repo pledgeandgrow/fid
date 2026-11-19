@@ -1,0 +1,62 @@
+// Complaint CO2: span ids and parents (stdlib/trace.fd). The program
+// switches tracing on itself (trace_set_enabled), opens an outer span, and
+// checks that spans begun inside it, its own and those of the stdlib's
+// traced calls (file_write, file_read, fs_read_text, a File handle), get
+// it as their parent with no code change, then that switching off gives
+// no spans. The span lines go to stderr; stdout is deterministic.
+// Expected output:
+// {"span":"a","detail":"b","us":5,"ok":true,"id":2,"parent":1}
+// outer 1 parent 0
+// inner 2 parent 1
+// current after inner 1
+// stdlib spans 4
+// next 7 parent 1
+// current after outer 0
+// root 8 parent 0
+// off -1 current 0
+// trace spans ok
+use trace;
+use fs;
+
+fn main() -> i64 {
+    println(trace_span_line_ids("a", "b", 5, true, 2, 1));
+    trace_set_enabled(true);
+    val outer: i64 = trace_span_begin();
+    println("outer " + int_to_str(outer) + " parent " + int_to_str(trace_parent_of(outer)));
+    val inner: i64 = trace_span_begin();
+    println("inner " + int_to_str(inner) + " parent " + int_to_str(trace_parent_of(inner)));
+    trace_span_end(inner, "test.inner", "", true);
+    println("current after inner " + int_to_str(trace_current()));
+    // four traced stdlib calls inside `outer`: ids 3..6, each a child of it
+    val path: str = "_fides_test_trace_spans.txt";
+    file_write(path, "x");
+    val back: str = file_read(path);
+    val again: str = fs_read_text(path);
+    match File::open(path) {
+        Option::Some(f) => {
+            var h: File = f;
+            h.close();
+        }
+        Option::None => {
+            p_panic("File::open failed");
+        }
+    }
+    p_file_delete(path);
+    if back != "x" || again != "x" {
+        p_panic("read back the wrong text");
+    }
+    val next: i64 = trace_span_begin();
+    println("stdlib spans " + int_to_str(next - inner - 1));
+    println("next " + int_to_str(next) + " parent " + int_to_str(trace_parent_of(next)));
+    trace_span_end(next, "test.next", "", true);
+    trace_span_end(outer, "test.outer", "", true);
+    println("current after outer " + int_to_str(trace_current()));
+    val root: i64 = trace_span_begin_under(0);
+    println("root " + int_to_str(root) + " parent " + int_to_str(trace_parent_of(root)));
+    trace_span_end(root, "test.root", "", true);
+    trace_set_enabled(false);
+    println("off " + int_to_str(trace_span_begin()) + " current " + int_to_str(trace_current()));
+    trace_follow_env();
+    println("trace spans ok");
+    return 0;
+}

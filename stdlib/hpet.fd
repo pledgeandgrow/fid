@@ -1,0 +1,439 @@
+// HPET (High Precision Event Timer), TSC calibration and the PIT's
+// channel 2 — the clocks an x86 kernel measures time with at boot.
+//
+// What is real: the HPET register map (capabilities, configuration,
+// interrupt status, main counter, per-timer configuration, comparator and
+// FSB route registers) and every field of them; the counter frequency from
+// the period in femtoseconds; ns <-> tick conversion without overflow; the
+// one-shot and periodic comparator programming sequences (periodic uses
+// VAL_SET to load the accumulator); the ACPI "HPET" table (base address,
+// minimum tick, HPET number, via stdlib acpi); TSC calibration against any
+// reference counter (wraparound-safe deltas, best of several runs to
+// discard runs stretched by SMIs or preemption); Linux's
+// clocks_calc_mult_shift and the cycles -> ns conversion with a 128-bit
+// product; and the 8254 PIT: command bytes, divisors, and the port 0x61
+// gate sequence of a channel-2 calibration.
+//
+// The seam: HPET registers are reached through an HpetBus of
+// rd: fn(i64) -> i64 / wr: fn(i64, i64) over byte offsets of the 1-KiB
+// register block (64-bit volatile MMIO in a kernel); the TSC and a
+// reference counter are fn() -> i64 readers (rdtsc, the HPET main counter,
+// the ACPI PM timer); PIT port I/O is returned as a list of (port, value)
+// writes for the caller's outb, and polling takes an inb function.
+module hpet;
+ use vec; use acpi;
+
+pub const HPET_GCAP_ID: i64 = 0x000;
+pub const HPET_GEN_CONF: i64 = 0x010;
+pub const HPET_GINTR_STA: i64 = 0x020;
+pub const HPET_MAIN_CNT: i64 = 0x0F0;
+
+pub const HPET_ENABLE_CNF: i64 = 1;
+pub const HPET_LEG_RT_CNF: i64 = 2;
+
+// Timer N configuration bits.
+pub const HPET_TN_LEVEL: i64 = 0x2;
+pub const HPET_TN_INT_ENB: i64 = 0x4;
+pub const HPET_TN_PERIODIC: i64 = 0x8;
+pub const HPET_TN_PER_CAP: i64 = 0x10;
+pub const HPET_TN_SIZE_CAP: i64 = 0x20;
+pub const HPET_TN_VAL_SET: i64 = 0x40;
+pub const HPET_TN_32MODE: i64 = 0x100;
+pub const HPET_TN_FSB_EN: i64 = 0x4000;
+pub const HPET_TN_FSB_CAP: i64 = 0x8000;
+
+/// Largest legal period: 100 ns = 10^8 fs (counter at least 10 MHz).
+pub const HPET_MAX_PERIOD_FS: i64 = 100000000;
+
+pub fn hpet_tn_conf(n: i64) -> i64 {
+    return 0x100 + 0x20 * n;
+}
+
+pub fn hpet_tn_cmp(n: i64) -> i64 {
+    return 0x108 + 0x20 * n;
+}
+
+pub fn hpet_tn_fsb(n: i64) -> i64 {
+    return 0x110 + 0x20 * n;
+}
+
+// ─── Capabilities ───────────────────────────────────────────────────────
+
+pub struct HpetCaps {
+    pub rev: i64,
+    pub timers: i64,
+    pub counter64: bool,
+    pub legacy_capable: bool,
+    pub vendor: i64,
+    pub period_fs: i64,
+    pub valid: bool,  // period non-zero and at most 100 ns
+}
+
+pub fn hpet_caps_decode(v: i64) -> HpetCaps {
+    var p: i64 = (v >> 32) & 0xFFFFFFFF;
+    return HpetCaps {
+        rev: v & 255, timers: ((v >> 8) & 31) + 1, counter64: (v & 0x2000) != 0, legacy_capable: (v & 0x8000) != 0, vendor: (v >> 16) & 0xFFFF, period_fs: p, valid: p > 0 && p <= HPET_MAX_PERIOD_FS
+    };
+}
+
+/// Counter frequency in Hz: 10^15 / period.
+pub fn hpet_freq_hz(period_fs: i64) -> i64 {
+    return 1000000000000000 / period_fs;
+}
+
+/// Counter ticks in ns nanoseconds (1 ns = 10^6 fs), split to avoid
+/// overflowing the product.
+pub fn hpet_ns_to_ticks(ns: i64, period_fs: i64) -> i64 {
+    var q: i64 = ns / period_fs;
+    var r: i64 = ns % period_fs;
+    return q * 1000000 + r * 1000000 / period_fs;
+}
+
+/// Nanoseconds of `ticks` counter ticks.
+pub fn hpet_ticks_to_ns(ticks: i64, period_fs: i64) -> i64 {
+    return hpet_muldiv(ticks, period_fs, 1000000);
+}
+
+pub struct HpetTimerCaps {
+    pub periodic: bool,
+    pub wide: bool,
+    pub fsb: bool,
+    pub routes: i64,  // bitmap of IO APIC inputs the timer can drive
+}
+
+@wrapping pub fn hpet_timer_caps(conf: i64) -> HpetTimerCaps {
+    return HpetTimerCaps {
+        periodic: (conf & HPET_TN_PER_CAP) != 0, wide: (conf & HPET_TN_SIZE_CAP) != 0, fsb: (conf & HPET_TN_FSB_CAP) != 0, routes: (conf >> 32) & 0xFFFFFFFF
+    };
+}
+
+/// Lowest IO APIC input a timer may be routed to, -1 when none.
+pub fn hpet_first_route(routes: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 32 {
+        if ((routes >> i) & 1) != 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── 128-bit helpers ────────────────────────────────────────────────────
+// Products are kept in 30-bit limbs so that no partial sum overflows.
+
+fn hpet_limbs(a: i64) -> Vec<i64> {
+    var l: Vec<i64> = Vec::new();
+    l.push(a & 0x3FFFFFFF);
+    l.push((a >> 30) & 0x3FFFFFFF);
+    l.push((a >> 60) & 7);
+    return l;
+}
+
+/// a * b (both >= 0) as five 30-bit limbs, least significant first.
+fn hpet_mul_limbs(a: i64, b: i64) -> Vec<i64> {
+    var x: Vec<i64> = hpet_limbs(a);
+    var y: Vec<i64> = hpet_limbs(b);
+    var r: Vec<i64> = Vec::filled(6, 0);
+    var i: i64 = 0;
+    while i < 3 {
+        var j: i64 = 0;
+        while j < 3 {
+            r.set(i + j, r.get(i + j) + x.get(i) * y.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    var carry: i64 = 0;
+    while k < 6 {
+        var v: i64 = r.get(k) + carry;
+        r.set(k, v & 0x3FFFFFFF);
+        carry = v >> 30;
+        k = k + 1;
+    }
+    return r;
+}
+
+fn hpet_limb_bit(r: Vec<i64>, bit: i64) -> i64 {
+    return (r.get(bit / 30) >> (bit % 30)) & 1;
+}
+
+/// a * b / c exactly (a, b >= 0, c > 0) as long as the quotient fits in
+/// 63 bits — the product itself may not.
+@wrapping pub fn hpet_muldiv(a: i64, b: i64, c: i64) -> i64 {
+    var r: Vec<i64> = hpet_mul_limbs(a, b);
+    var q: i64 = 0;
+    var rem: i64 = 0;
+    var bit: i64 = 179;
+    while bit >= 0 {
+        var x: i64 = hpet_limb_bit(r, bit);
+        // rem' = 2 rem + x without overflow: rem < c, so test against c - rem
+        if rem >= c - rem - x {
+            rem = rem - (c - rem - x);
+            q = q * 2 + 1;
+        } else {
+            rem = rem * 2 + x;
+            q = q * 2;
+        }
+        bit = bit - 1;
+    }
+    return q;
+}
+
+/// (a * b) >> s, the result fitting in 63 bits.
+@wrapping pub fn hpet_mul_shift(a: i64, b: i64, s: i64) -> i64 {
+    var r: Vec<i64> = hpet_mul_limbs(a, b);
+    var q: i64 = 0;
+    var bit: i64 = 179;
+    while bit >= s {
+        q = q * 2 + hpet_limb_bit(r, bit);
+        bit = bit - 1;
+    }
+    return q;
+}
+
+// ─── Clock conversion (Linux clocks_calc_mult_shift) ────────────────────
+
+pub struct MultShift {
+    pub mult: i64,
+    pub shift: i64,
+}
+
+/// mult/shift converting a clock of `from` Hz to `to` Hz (to = 10^9 for
+/// ns) with values up to maxsec seconds not overflowing 64 bits.
+pub fn hpet_calc_mult_shift(from: i64, to: i64, maxsec: i64) -> MultShift {
+    var tmp: i64 = hpet_mul_shift(maxsec, from, 32);
+    var sftacc: i64 = 32;
+    while tmp != 0 {
+        tmp = tmp >> 1;
+        sftacc = sftacc - 1;
+    }
+    var sft: i64 = 32;
+    var t: i64 = 0;
+    while sft > 0 {
+        t = (hpet_muldiv(to, 1 << sft, 1) + from / 2) / from;
+        if (t >> sftacc) == 0 {
+            return MultShift { mult: t, shift: sft };
+        }
+        sft = sft - 1;
+    }
+    return MultShift { mult: t, shift: 0 };
+}
+
+/// ns for `cycles` with a mult/shift pair: (cycles * mult) >> shift.
+pub fn hpet_cyc2ns(cycles: i64, ms: MultShift) -> i64 {
+    return hpet_mul_shift(cycles, ms.mult, ms.shift);
+}
+
+// ─── HPET driver over the bus seam ──────────────────────────────────────
+
+pub struct HpetBus {
+    pub rd: fn(i64) -> i64,
+    pub wr: fn(i64, i64) -> void,
+}
+
+pub fn hpet_read(b: & HpetBus, off: i64) -> i64 {
+    val f = b.rd;
+    return f(off);
+}
+
+pub fn hpet_write(b: & HpetBus, off: i64, v: i64) {
+    val f = b.wr;
+    f(off, v);
+}
+
+pub fn hpet_caps(b: & HpetBus) -> HpetCaps {
+    return hpet_caps_decode(hpet_read(b, HPET_GCAP_ID));
+}
+
+/// Stop the main counter, zero it, then start it again (legacy
+/// replacement routing on request).
+pub fn hpet_restart(b: & HpetBus, legacy: bool) {
+    var conf: i64 = hpet_read(b, HPET_GEN_CONF) & ~(HPET_ENABLE_CNF | HPET_LEG_RT_CNF);
+    hpet_write(b, HPET_GEN_CONF, conf);
+    hpet_write(b, HPET_MAIN_CNT, 0);
+    if legacy {
+        conf = conf | HPET_LEG_RT_CNF;
+    }
+    hpet_write(b, HPET_GEN_CONF, conf | HPET_ENABLE_CNF);
+}
+
+pub fn hpet_counter(b: & HpetBus) -> i64 {
+    return hpet_read(b, HPET_MAIN_CNT);
+}
+
+/// Configuration value for timer n: interrupt to IO APIC input `route`
+/// (edge triggered), periodic or one-shot. Keeps the read-only bits out.
+pub fn hpet_tn_value(route: i64, periodic: bool, level: bool) -> i64 {
+    var v: i64 = HPET_TN_INT_ENB | ((route & 31) << 9);
+    if periodic { v = v | HPET_TN_PERIODIC | HPET_TN_VAL_SET; }
+    if level { v = v | HPET_TN_LEVEL; }
+    return v;
+}
+
+/// One-shot: fire when the main counter reaches now + ticks.
+@wrapping pub fn hpet_oneshot(b: & HpetBus, n: i64, route: i64, ticks: i64) -> i64 {
+    var conf: i64 = hpet_read(b, hpet_tn_conf(n));
+    var keep: i64 = conf & (HPET_TN_PER_CAP | HPET_TN_SIZE_CAP | HPET_TN_FSB_CAP);
+    hpet_write(b, hpet_tn_conf(n), keep | hpet_tn_value(route, false, false));
+    var target: i64 = hpet_counter(b) + ticks;
+    hpet_write(b, hpet_tn_cmp(n), target);
+    return target;
+}
+
+/// Periodic timer n every `period` ticks (timer must have PER_CAP):
+/// counter stopped and zeroed, VAL_SET written with the first deadline,
+/// a second comparator write sets the period accumulator, counter on.
+/// Returns false when the timer cannot run periodically.
+pub fn hpet_periodic(b: & HpetBus, n: i64, route: i64, period: i64) -> bool {
+    var conf: i64 = hpet_read(b, hpet_tn_conf(n));
+    if (conf & HPET_TN_PER_CAP) == 0 {
+        return false;
+    }
+    var g: i64 = hpet_read(b, HPET_GEN_CONF);
+    hpet_write(b, HPET_GEN_CONF, g & ~HPET_ENABLE_CNF);
+    hpet_write(b, HPET_MAIN_CNT, 0);
+    var keep: i64 = conf & (HPET_TN_PER_CAP | HPET_TN_SIZE_CAP | HPET_TN_FSB_CAP);
+    hpet_write(b, hpet_tn_conf(n), keep | hpet_tn_value(route, true, false));
+    hpet_write(b, hpet_tn_cmp(n), period);
+    hpet_write(b, hpet_tn_cmp(n), period);
+    hpet_write(b, HPET_GEN_CONF, g | HPET_ENABLE_CNF);
+    return true;
+}
+
+/// Acknowledge a level-triggered interrupt of timer n (write 1 to clear).
+pub fn hpet_ack(b: & HpetBus, n: i64) {
+    hpet_write(b, HPET_GINTR_STA, 1 << n);
+}
+
+// ─── ACPI HPET table ────────────────────────────────────────────────────
+
+pub struct HpetTable {
+    pub valid: bool,
+    pub block_id: i64,
+    pub address: i64,
+    pub space: i64,
+    // GAS address space: 0 = memory
+    pub number: i64,
+    pub min_tick: i64,
+}
+
+pub fn hpet_table_parse(t: Vec<i64>) -> HpetTable {
+    var h: SdtHeader = sdt_at(t, 0, "HPET");
+    if !h.valid || h.length < 56 {
+        return HpetTable { valid: false, block_id: 0, address: 0, space: 0, number: 0, min_tick: 0 };
+    }
+    return HpetTable {
+        valid: true, block_id: acpi_u32(t, 36), address: acpi_u64(t, 44), space: t.get(40), number: t.get(52), min_tick: acpi_u16(t, 53)
+    };
+}
+
+// ─── TSC calibration ────────────────────────────────────────────────────
+
+/// Frequency of a counter that advanced `delta` while the reference
+/// advanced ref_delta at ref_hz.
+pub fn tsc_freq_from(delta: i64, ref_delta: i64, ref_hz: i64) -> i64 {
+    return hpet_muldiv(delta, ref_hz, ref_delta);
+}
+
+/// Wraparound-safe difference of two readings of a counter of `bits` bits.
+@wrapping pub fn tsc_counter_delta(a: i64, b: i64, bits: i64) -> i64 {
+    if bits >= 64 {
+        return b - a;
+    }
+    return (b - a) & ((1 << bits) - 1);
+}
+
+/// One calibration run: wait until the reference counter (ref_bits wide,
+/// ref_hz) moved by ref_ticks, measuring the TSC across it. Returns Hz.
+pub fn tsc_calibrate_once(read_tsc: fn() -> i64, read_ref: fn() -> i64, ref_hz: i64, ref_bits: i64, ref_ticks: i64) -> i64 {
+    var r0: i64 = read_ref();
+    var t0: i64 = read_tsc();
+    var r: i64 = r0;
+    var spins: i64 = 0;
+    while tsc_counter_delta(r0, r, ref_bits) < ref_ticks && spins < 100000000 {
+        r = read_ref();
+        spins = spins + 1;
+    }
+    var t1: i64 = read_tsc();
+    return tsc_freq_from(t1 - t0, tsc_counter_delta(r0, r, ref_bits), ref_hz);
+}
+
+/// Several runs, keeping the lowest result: an interrupt or SMI inside a
+/// run only ever stretches the TSC side.
+pub fn tsc_calibrate(read_tsc: fn() -> i64, read_ref: fn() -> i64, ref_hz: i64, ref_bits: i64, ref_ticks: i64, runs: i64) -> i64 {
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i < runs {
+        var f: i64 = tsc_calibrate_once(read_tsc, read_ref, ref_hz, ref_bits, ref_ticks);
+        if best < 0 || f < best {
+            best = f;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// ─── 8254 PIT ───────────────────────────────────────────────────────────
+
+pub const PIT_HZ: i64 = 1193182;
+pub const PIT_PORT_CH0: i64 = 0x40;
+pub const PIT_PORT_CH2: i64 = 0x42;
+pub const PIT_PORT_CMD: i64 = 0x43;
+pub const PIT_PORT_GATE: i64 = 0x61;
+
+/// Command byte: channel (0..2), access (3 = lobyte then hibyte), mode
+/// (0..5), binary counting.
+pub fn pit_command(channel: i64, access: i64, mode: i64) -> i64 {
+    return ((channel & 3) << 6) | ((access & 3) << 4) | ((mode & 7) << 1);
+}
+
+/// Divisor for a periodic rate (rounded), clamped to 1..65536 (0 = 65536).
+pub fn pit_divisor(hz: i64) -> i64 {
+    var d: i64 = (PIT_HZ + hz / 2) / hz;
+    if d < 1 { d = 1; }
+    if d >= 65536 { d = 0; }
+    return d;
+}
+
+/// Reload value for a channel-2 calibration window of ms milliseconds.
+pub fn pit_ch2_latch(ms: i64) -> i64 {
+    return PIT_HZ / (1000 / ms);
+}
+
+/// Port writes, packed port * 256 + value, that start a channel-2
+/// one-shot count of `latch` with the speaker off, given the current
+/// value of port 0x61.
+pub fn pit_ch2_start(latch: i64, port61: i64) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    w.push(PIT_PORT_GATE * 256 + ((port61 & ~2) | 1));
+    w.push(PIT_PORT_CMD * 256 + pit_command(2, 3, 0));
+    w.push(PIT_PORT_CH2 * 256 + (latch & 255));
+    w.push(PIT_PORT_CH2 * 256 + ((latch >> 8) & 255));
+    return w;
+}
+
+/// Port writes for channel 0 as the periodic system tick (mode 2 rate
+/// generator) at hz.
+pub fn pit_ch0_periodic(hz: i64) -> Vec<i64> {
+    var d: i64 = pit_divisor(hz);
+    var w: Vec<i64> = Vec::new();
+    w.push(PIT_PORT_CMD * 256 + pit_command(0, 3, 2));
+    w.push(PIT_PORT_CH0 * 256 + (d & 255));
+    w.push(PIT_PORT_CH0 * 256 + ((d >> 8) & 255));
+    return w;
+}
+
+/// Poll port 0x61 until OUT2 (bit 5) rises; returns the number of polls,
+/// -1 after max_polls.
+pub fn pit_ch2_wait(inb61: fn() -> i64, max_polls: i64) -> i64 {
+    var i: i64 = 0;
+    while i < max_polls {
+        i = i + 1;
+        if (inb61() & 0x20) != 0 {
+            return i;
+        }
+    }
+    return -1;
+}

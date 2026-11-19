@@ -1,0 +1,161 @@
+// SP16 (llvm-roadmap): a blocker of `fid emit compiler/main.fd`. The
+// compiler's parser returns enums whose payload is another enum
+// (ParseResultExpr::Ok(Expr::Call(Box<Expr>, Vec<Expr>)), ...), matches the
+// result of a recursive call and moves the bound payload into a Box. Built
+// natively by the Nov 16 compiler (pe_ir `emit` and `emit --nat`) such a
+// program died with "Invalid memory access" in Vec_share / Vec_new, called
+// from an __own_dup_N: the iropt_me pass `sra` (on by default since Nov 16,
+// IME_DEFAULT_ON) took a struct copy apart wrongly. `FID_IROPT_OFF=sra` and
+// `--debug` (no mid-end) gave the right output, and so did `fid run` and
+// `ccompile`. The natively built front end of the compiler
+// (tests/nattools/selfhost_front_unit.fd) crashed the same way on hello.fd.
+// Check every backend, including the mid-end:
+//   $FID emit tests/bootstrap/test_native_enum_in_enum.fd -o t.exe && ./t.exe
+//   $FID emit tests/bootstrap/test_native_enum_in_enum.fd --nat -o t.exe && ./t.exe
+// Expected output:
+// calls: 1
+// size 0: 7
+// size 1: 13
+// size 2: 21
+// size 3: 31
+// total: 72
+// copies: 72
+// err: deep
+use core;
+
+enum Ex {
+    Lit(i64),
+    Name(str),
+    Call(Box<Ex>, Vec<Ex>),
+    Pair(str, Vec<str>, i64),
+}
+
+enum Res {
+    Ok(Ex),
+    Err(str),
+}
+
+struct Holder {
+    items: Vec<Ex>,
+    name: str,
+}
+
+fn build(n: i64) -> Res {
+    if n == 0 {
+        return Res::Ok(Ex::Lit(7));
+    }
+    if n > 50 {
+        return Res::Err("deep");
+    }
+    var args: Vec<Ex> = Vec::new();
+    args.push(Ex::Name("a" + int_to_str(n)));
+    args.push(Ex::Lit(n));
+    var tags: Vec<str> = Vec::new();
+    tags.push("x");
+    args.push(Ex::Pair("p", tags, n));
+    match build(n - 1) {
+        Res::Ok(inner) => {
+            return Res::Ok(Ex::Call(Box::new(inner), args));
+        }
+        Res::Err(e) => {
+            return Res::Err(e);
+        }
+    }
+    return Res::Err("no");
+}
+
+// The smallest form: one level, a Lit inside a Call
+fn build_small(n: i64) -> Res {
+    if n == 0 {
+        return Res::Ok(Ex::Lit(7));
+    }
+    var args: Vec<Ex> = Vec::new();
+    args.push(Ex::Lit(n));
+    match build_small(n - 1) {
+        Res::Ok(inner) => {
+            return Res::Ok(Ex::Call(Box::new(inner), args));
+        }
+        Res::Err(e) => {
+            return Res::Err(e);
+        }
+    }
+    return Res::Err("no");
+}
+
+fn size(e: Ex) -> i64 {
+    match e {
+        Ex::Lit(n) => {
+            return n;
+        }
+        Ex::Name(s) => {
+            return str_len(s);
+        }
+        Ex::Call(b, args) => {
+            var t: i64 = size(*b);
+            var i: i64 = 0;
+            while i < args.len() {
+                val a: Ex = args.get(i);
+                t = t + size(a);
+                i = i + 1;
+            }
+            return t;
+        }
+        Ex::Pair(s, v, k) => {
+            return str_len(s) + v.len() + k;
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    match build_small(2) {
+        Res::Ok(e) => {
+            match e {
+                Ex::Call(b, a) => {
+                    println("calls: " + int_to_str(a.len()));
+                }
+                _ => {
+                    println("calls: none");
+                }
+            }
+        }
+        Res::Err(m) => {
+            println("err: " + m);
+        }
+    }
+    var h: Holder = Holder { items: Vec::new(), name: "h" };
+    var i: i64 = 0;
+    while i < 4 {
+        match build(i) {
+            Res::Ok(e) => {
+                println("size " + int_to_str(i) + ": " + int_to_str(size(e)));
+                h.items.push(e);
+            }
+            Res::Err(m) => {
+                println(m);
+            }
+        }
+        i = i + 1;
+    }
+    var total: i64 = 0;
+    var copies: i64 = 0;
+    i = 0;
+    while i < h.items.len() {
+        val e: Ex = h.items.get(i);
+        val copy: Ex = e;
+        total = total + size(e);
+        copies = copies + size(copy);
+        i = i + 1;
+    }
+    println("total: " + int_to_str(total));
+    println("copies: " + int_to_str(copies));
+    match build(60) {
+        Res::Ok(e) => {
+            println("err: none");
+        }
+        Res::Err(m) => {
+            println("err: " + m);
+        }
+    }
+    return 0;
+}

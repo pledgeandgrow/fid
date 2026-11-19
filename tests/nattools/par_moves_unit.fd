@@ -1,0 +1,131 @@
+// RA11 (docs/roadmap/llvm-roadmap.md): the parallel-move sequencer of
+// compiler/nat_enc.fd (nat_par_moves) on swaps, longer cycles, two cycles
+// at once with a tree hanging off one, chains, fan-out and moves to
+// themselves. Each sequence is run on sixteen locations and compared with
+// the parallel meaning (every destination takes what its source held
+// before); location 15 is the scratch. Run:
+//   fid run tests/nattools/par_moves_unit.fd
+// Expected output:
+// swap 3 moves: 15<-1 1<-2 2<-15
+// swap ok
+// cycle3 4 moves ok
+// two-cycles-tree 8 moves ok
+// chain 3 moves ok
+// fanout-self 2 moves ok
+// reverse8 12 moves ok
+// repeated destination rejected
+// scratch named rejected
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn run_seq(seq: & Vec<i64>) -> Vec<i64> {
+    var regs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        regs.push(100 + i);
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k + 1 < seq.len() {
+        regs.set(seq.get(k), regs.get(seq.get(k + 1)));
+        k = k + 2;
+    }
+    return regs;
+}
+
+fn check(name: str, dst: Vec<i64>, src: Vec<i64>, show: bool) {
+    var seq: Vec<i64> = nat_par_moves(& dst, & src, 15);
+    var got: Vec<i64> = run_seq(& seq);
+    var ok: bool = true;
+    var r: i64 = 0;
+    while r < 15 {
+        var want: i64 = 100 + r;
+        var i: i64 = 0;
+        while i < dst.len() {
+            if dst.get(i) == r {
+                want = 100 + src.get(i);
+            }
+            i = i + 1;
+        }
+        if got.get(r) != want {
+            ok = false;
+        }
+        r = r + 1;
+    }
+    var line: str = name + " " + int_to_str(seq.len() / 2) + " moves";
+    if show {
+        line = line + ":";
+        var k: i64 = 0;
+        while k + 1 < seq.len() {
+            line = line + " " + int_to_str(seq.get(k)) + "<-" + int_to_str(seq.get(k + 1));
+            k = k + 2;
+        }
+        println(line);
+        if ok {
+            println(name + " ok");
+        } else {
+            println(name + " WRONG");
+        }
+        return;
+    }
+    if ok {
+        println(line + " ok");
+    } else {
+        println(line + " WRONG");
+    }
+}
+
+fn v2(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn v3(a: i64, b: i64, c: i64) -> Vec<i64> {
+    var v: Vec<i64> = v2(a, b);
+    v.push(c);
+    return v;
+}
+
+fn v6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> Vec<i64> {
+    var v: Vec<i64> = v3(a, b, c);
+    v.push(d);
+    v.push(e);
+    v.push(f);
+    return v;
+}
+
+fn main() {
+    check("swap", v2(1, 2), v2(2, 1), true);
+    check("cycle3", v3(1, 2, 3), v3(2, 3, 1), false);
+    // 1 <-> 2, 3 <- 4 <- 5 <- 3, and 6 <- 1 hanging off the first cycle
+    check("two-cycles-tree", v6(1, 2, 3, 4, 5, 6), v6(2, 1, 4, 5, 3, 1), false);
+    check("chain", v3(1, 2, 3), v3(2, 3, 4), false);
+    // 1 <- 1 is no move; 2 and 3 both take 1
+    check("fanout-self", v3(1, 2, 3), v3(1, 1, 1), false);
+    // 0..7 reversed: four swaps
+    var rd: Vec<i64> = Vec::new();
+    var rs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        rd.push(i);
+        rs.push(7 - i);
+        i = i + 1;
+    }
+    check("reverse8", rd, rs, false);
+    var bad: Vec<i64> = nat_par_moves(& v2(1, 1), & v2(2, 3), 15);
+    if bad.len() == 0 {
+        println("repeated destination rejected");
+    } else {
+        println("repeated destination accepted");
+    }
+    var bad2: Vec<i64> = nat_par_moves(& v2(1, 2), & v2(15, 1), 15);
+    if bad2.len() == 0 {
+        println("scratch named rejected");
+    } else {
+        println("scratch named accepted");
+    }
+}

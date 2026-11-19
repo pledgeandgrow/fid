@@ -1,0 +1,120 @@
+CS6 — the mid-end's per-function passes memoized across builds (Nov 17)
+=========================================================================
+
+Competitive roadmap CS6 asks for a one-line change to rebuild in under
+100 ms. The native code of each function is already cached (nat_ir.fd
+FID_FNCACHE, keyed by the IR after the mid-end), and the rules and the
+e-graph remember what they did to a function of the same IR (ir_ser.fd
+mec_*, FID_MECACHE). What ran in full on every build was iropt_native
+(compiler/iropt.fd). Its module passes (closuredevirt, hofspec, dynspec,
+fielddevirt, inline, inline2, conv_mark, envtrim, ipcp, spec, gconst,
+paramrange, the call facts) read and rewrite across the module, so a key
+of a function's own IR before them is unsound: a callee's change alters
+its callers' result. This change splits the work at the boundary the
+roadmap names: the module passes still run on every build; the
+per-function passes after them (iropt_me's passes, fold, simplify,
+branchfold, branchfacts, sccp, promote, devirt, closuredevirt, dse,
+quietcall, dce, tailcall, gvn, licm, iv, version) are memoized per
+function under a key that holds what they read.
+
+What was added
+  compiler/ir_ser.fd (the store, beside the rules/e-graph memo)
+    imc_begin / imc_lookup / imc_same / imc_take / imc_use / imc_note /
+    imc_verify_note / imc_finish, ImcEntry, imc_parse / imc_load / imc_path,
+    imc_check_of, imc_hs / imc_env_h / imc_env_set / imc_verify_on
+  compiler/iropt.fd (the keys, and the loop of iropt_native)
+    IroImc, iro_imc_prepare, iro_imc_refs, iro_imc_name, iro_imc_salt,
+    iro_imc_key, iro_imc_post, iro_imc_bit, iro_imc_empty
+  compiler/pgo.fd
+    pgo_active (a profile in use: the memo is off)
+  tests/bootstrap/test_irocache_closure.fd, tests/tooling/irocache-check.sh
+
+The key of function i (iro_imc_key), made before the loop changes anything
+  - mec_fn_hash of i's IR after the module passes (iw_irfunc covers every
+    field of IrFunction);
+  - the closure of i under "names": the functions its calls name, its
+    function references (ConstFnRef: closure devirtualization reads the
+    target's body and effects), and for its dyn calls every
+    `<Type>_<method>` of a type that implements the trait or that a MakeDyn
+    of i makes (devirt reads that function's effects). For each member, in
+    module order: its content hash before the passes, its name, a hash of
+    the names it uses that the module does not define (runtime functions:
+    their masks come from the name and the call site), whether the loop
+    runs on it, and which member is i. Order matters because the loop
+    rewrites functions in place: a member before i is read after its own
+    passes, one after i before them; with the order in the key, both are
+    determined by the closure.
+    Everything else the per-function passes read about other functions is
+    derived from the callees' IR transitively: the effect masks
+    (iro_effect_masks: a function's own instructions joined with its
+    callees'), the quiet set (iro_quiet_fns), the pure / no-write call
+    sets (ime_set_call_facts, from the masks), the reference-lending
+    facts (ime_note_ref_params, a greatest fixpoint over callees).
+  - the salt (iro_imc_salt): which passes are on (21 bits), FID_IROPT_OFF,
+    FID_IROPT_ON, FID_SWITCH, the trait tables, externs, C callbacks,
+    global and struct names;
+  - this compiler (mec_key folds inc_compiler_hash).
+
+The memo is off (the passes run, nothing read or written) when the passes
+read what the key does not hold: a profile (pgo_active), paramrange
+(LF10's ranges come from the callers), FID_LIBFACTS_IN (masks of library
+functions from a file); and when output depends on running every pass:
+FID_IROPT_STATS (its counters), --validate (tv.fd), inline remarks.
+
+A one-line change to function g misses for g and for every function whose
+closure holds g (its callers, transitively); every other function the loop
+runs on replays. On hello, the edited user function and main miss; core's
+and the runtime's functions hit.
+
+Store: <TEMP>/fid-imc-<hash of the compiler>.bin with FID_IROCACHE=1, or
+FID_IROCACHE=<file>; FIDES_NO_CACHE=1 or --no-cache: off. An entry is
+the function after the passes as iw_irfunc's bytes (or "unchanged": no
+bytes), with a check word over the header and the bytes. The file is read
+whole; an entry's bytes are decoded (ir_irfunc) only on a hit, after the
+check word. Writes go to a temporary file renamed over the old one; at most
+20,000 entries and 64 MB of function bytes are kept, the ones this build
+used or made first. A build that made no entry writes nothing. `fid serve`
+keeps the entries in memory between requests.
+
+Opt-in for now: it has not been built or measured (the rules of the run
+that wrote it). FID_IROCACHE_VERIFY=1 runs the passes on every hit as well
+and prints "[irocache] MISMATCH <function>" when the recorded result
+differs (the passes' result is used): that is the soundness check to run
+over the suite before the default changes.
+
+How to check (with the final compiler as $FID)
+  bash tests/tooling/irocache-check.sh                 (pe_ir)
+  NAT=1 bash tests/tooling/irocache-check.sh           (the machine layer)
+  SUITE=1 NAT=1 bash tests/tooling/irocache-check.sh   (step 5 on the suite)
+  TIME=1 NAT=1 bash tests/tooling/irocache-check.sh    (hello timings)
+  Exit 0 and "irocache-check: 0 failed". The script's header says what
+  each step expects. A dry run with the stage-0 compiler (which does not
+  have the memo) built every program, and its output and byte checks
+  passed: two builds without the memo are the same bytes, and each edit
+  changes the output.
+
+Measurements: none yet. To make (TIME=1 prints them): `emit hello.fd
+--nat --time` with FID_FNCACHE and FID_IROCACHE warm, against
+FID_IROCACHE=off; the "iropt" row of --time includes the memo's own
+pass row "irocache" (hashing every function the loop runs on, before the
+loop). If the hashing costs more than the passes it saves on hello, the
+memo stays opt-in and the next step is to chain hashes (the rules memo
+hashes every function again after iropt: imc_note's post hash could be
+handed to it as mec_chain_* hands the rules' to the e-graph).
+
+The other two parts of CS6 are in compiler/nat_ir.fd (another group's
+file):
+  - line-table rows for functions FID_FNCACHE replays: NcEntry.lrows /
+    cfi / dvars are recorded at capture and replayed by nc_replay, and
+    nc_skel_fn registers the function's source file where a fresh build
+    would (CS6/SP20 comments there): present.
+  - the cold-split order on a hit: nc_skel_fn's synthetic MIR keeps the
+    trap and call counts, the length and the call edges in order (label 0
+    is never a function's, so a call without an edge adds none), so the
+    postorder and WP17's only-panic list match a fresh build. One gap is
+    left: ng_cold_call_labels never counts a cache hit as a function that
+    only panics (its recorded MIR is a summary), so a fresh caller of a
+    cached `fn fail(..) { panic(..) }` lays the calling block out as hot,
+    where an all-fresh build moves it after the hot code. The fix (record
+    each entry's entry run: traps and the functions called before the
+    first branch, and use it for hits) is described in this run's report.

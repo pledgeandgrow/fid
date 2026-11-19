@@ -1,0 +1,130 @@
+// stdlib/wireguard: TAI64N, the RFC 6479 replay window, then two peers in memory: the initiation, response and first data packets byte-exact against a Node.js implementation (OpenSSL X25519/ChaCha20-Poly1305/BLAKE2s, MACs from Python's keyed BLAKE2s), data both ways with key confirmation, replayed packets and initiations refused, the timers over injected time (passive keepalive, rekey after 120 s, retransmission after 5 s, giving up after 90 s, keys refused after 180 s and erased after 540 s), and a cookie reply under load.
+// Expected output:
+// tai64n 400000006553f10a07000000
+// replay TTFTTFTFTTF
+// initiation 0100000044332211605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23cb0ad1c2a008cbf17a92c2505f52cf5d889bd051d7c22abe1d710ac2dc965a4f67bc5367c4ffd625c020f3f95b5225d5a939d8af16ca5b6ee2bd18ea856b8cd74ddb19e308d1f7315bd119c8bb046917b71206309cbab295d1f43e55800000000000000000000000000000000
+// initiator identified true
+// consume initiation true
+// response 020000008877665544332211dc2cca31e8e43bbd91dff7e475cca3347eb478107d5bd765aba4ae4a30c35d44cca2eb45b2e499b3ca3384c915b64528a62e43fac9bd1627678b648efaa6a53100000000000000000000000000000000
+// responder sends before confirmation: 0 bytes
+// consume response true
+// data 0400000088776655000000000000000064c645c27480ad0416fbb4617ff3f04f30d47a8aa159b8425966386eeaa78cd436c1a628044c2afc97e82593209501e4
+// b got hello over wireguard (32 bytes padded)
+// b timers at +11: action 2, a got keepalive true
+// a got reply from b
+// replayed data: replayed or too old
+// replayed initiation: replayed initiation
+// a timers at +13: action 0
+// a timers at +121: action 1, 148 bytes
+// a timers at +124: action 0
+// a timers at +126: action 1
+// a sends at +181: 0 bytes, no valid keys
+// a timers at +212: action 3
+// a timers at +540: action 4
+// under load without cookie: 2
+// cookie reply 64 bytes, taken true
+// under load with cookie: 0
+// bad mac1: 1
+// b accepts the new initiation true
+use wireguard;
+use noise_proto;
+use vec;
+use encoding;
+
+fn hb(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn seq(base: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 32 { o.push(base + i); i = i + 1; }
+    return o;
+}
+
+fn main() {
+    println("tai64n " + hex_encode_bytes(wg_tai64n(1700000000, 123456789)));
+
+    var w: WgReplay = wg_replay_new();
+    var marks: str = "";
+    var counters: Vec<i64> = Vec::new();
+    counters.push(0); counters.push(1); counters.push(1); counters.push(5); counters.push(3); counters.push(3);
+    counters.push(2100); counters.push(5); counters.push(2099); counters.push(100); counters.push(2099);
+    var ci: i64 = 0;
+    while ci < counters.len() {
+        if wg_replay_update(& mut w, counters.get(ci)) { marks = marks + "T"; } else { marks = marks + "F"; }
+        ci = ci + 1;
+    }
+    println("replay " + marks);
+
+    val t: i64 = 1700000000;
+    val sa: Vec<i64> = hb("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    val sb: Vec<i64> = hb("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    val pa: Vec<i64> = x25519_public_key(sa);
+    val pb: Vec<i64> = x25519_public_key(sb);
+    val psk: Vec<i64> = seq(0);
+    var a: WgPeer = wg_peer_new(sa, pb, psk);
+    var b: WgPeer = wg_peer_new(sb, pa, psk);
+    wg_set_next_ephemeral(& mut a, seq(160));
+    wg_set_next_index(& mut a, 0x11223344);
+    wg_set_next_ephemeral(& mut b, seq(192));
+    wg_set_next_index(& mut b, 0x55667788);
+
+    val init: Vec<i64> = wg_create_initiation(& mut a, t, 123456789);
+    println("initiation " + hex_encode_bytes(init));
+    println("initiator identified " + bool_to_str(hex_encode_bytes(wg_initiation_static(sb, init)) == hex_encode_bytes(pa)));
+    println("consume initiation " + bool_to_str(wg_consume_initiation(& mut b, init, t)));
+    val resp: Vec<i64> = wg_create_response(& mut b, t);
+    println("response " + hex_encode_bytes(resp));
+    println("responder sends before confirmation: " + int_to_str(wg_encrypt(& mut b, str_bytes("too early"), t).len()) + " bytes");
+    println("consume response " + bool_to_str(wg_consume_response(& mut a, resp, t)));
+    val data: Vec<i64> = wg_encrypt(& mut a, str_bytes("hello over wireguard"), t + 1);
+    println("data " + hex_encode_bytes(data));
+    val r1: WgReceived = wg_decrypt(& mut b, data, t + 1);
+    var text: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < 20 && j < r1.data.len() { text.push(r1.data.get(j)); j = j + 1; }
+    println("b got " + str_from_bytes(text) + " (" + int_to_str(r1.data.len()) + " bytes padded)");
+
+    // b heard a at +1 and sent nothing since: a passive keepalive at +11
+    val k1: WgTimerOut = wg_timers(& mut b, t + 11);
+    val ka: WgReceived = wg_decrypt(& mut a, k1.packet, t + 11);
+    println("b timers at +11: action " + int_to_str(k1.action) + ", a got keepalive " + bool_to_str(ka.ok && ka.keepalive));
+    val back: Vec<i64> = wg_encrypt(& mut b, str_bytes("reply from b"), t + 12);
+    val r2: WgReceived = wg_decrypt(& mut a, back, t + 12);
+    var t2: Vec<i64> = Vec::new();
+    j = 0;
+    while j < 12 && j < r2.data.len() { t2.push(r2.data.get(j)); j = j + 1; }
+    println("a got " + str_from_bytes(t2));
+    println("replayed data: " + wg_decrypt(& mut b, data, t + 12).err);
+    var b2: WgPeer = b;
+    wg_consume_initiation(& mut b2, init, t + 12);
+    println("replayed initiation: " + b2.err);
+
+    println("a timers at +13: action " + int_to_str(wg_timers(& mut a, t + 13).action));
+    val t3: WgTimerOut = wg_timers(& mut a, t + 121);
+    println("a timers at +121: action " + int_to_str(t3.action) + ", " + int_to_str(t3.packet.len()) + " bytes");
+    println("a timers at +124: action " + int_to_str(wg_timers(& mut a, t + 124).action));
+    println("a timers at +126: action " + int_to_str(wg_timers(& mut a, t + 126).action));
+    val late: Vec<i64> = wg_encrypt(& mut a, str_bytes("late"), t + 181);
+    println("a sends at +181: " + int_to_str(late.len()) + " bytes, " + a.err);
+    println("a timers at +212: action " + int_to_str(wg_timers(& mut a, t + 212).action));
+    println("a timers at +540: action " + int_to_str(wg_timers(& mut a, t + 540).action));
+
+    // cookies: b is under load
+    var chk: WgCookieChecker = wg_cookie_checker_new(pb);
+    wg_cookie_set_secret(& mut chk, seq(64), t + 2000);
+    var src: Vec<i64> = hb("c0a80001");
+    src.push(0x1f); src.push(0x90);
+    val i2: Vec<i64> = wg_create_initiation(& mut a, t + 2000, 0);
+    println("under load without cookie: " + int_to_str(wg_check_macs(& mut chk, i2, src, t + 2000, true)));
+    var nonce: Vec<i64> = Vec::new();
+    j = 0;
+    while j < 24 { nonce.push(j * 7); j = j + 1; }
+    val cr: Vec<i64> = wg_create_cookie_reply(& mut chk, i2, src, nonce, t + 2000);
+    println("cookie reply " + int_to_str(cr.len()) + " bytes, taken " + bool_to_str(wg_consume_cookie_reply(& mut a, cr, t + 2000)));
+    val i3: Vec<i64> = wg_create_initiation(& mut a, t + 2001, 0);
+    println("under load with cookie: " + int_to_str(wg_check_macs(& mut chk, i3, src, t + 2001, true)));
+    var bad: Vec<i64> = i3;
+    bad.set(120, bad.get(120) ^ 1);
+    println("bad mac1: " + int_to_str(wg_check_macs(& mut chk, bad, src, t + 2001, true)));
+    println("b accepts the new initiation " + bool_to_str(wg_consume_initiation(& mut b, i3, t + 2001)));
+}

@@ -1,0 +1,148 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), the machine layer's register
+// allocator (compiler/nat_ir.fd):
+//   RA6 copy coalescing so that `i = i + 1` is one instruction on every
+//       target: ng_fuse_addi turns an ADD (or SUB) of a register and a
+//       constant into MO_ADDI (x86-64 ADD r, imm / LEA, AArch64 ADD/SUB
+//       #imm12, RISC-V ADDI), and the second coalescing round over exact
+//       liveness (ng_classes_interfere) gives the loop counter and the
+//       sum's temporary one register, so the copies around the step are
+//       moves to themselves. `count_up`'s loop step is then one `addi`
+//       whose two registers are the same (FID_NAT_DUMP=count_up); `fid
+//       emit --stats` counts fewer moves than with
+//       FID_NAT_OFF=livecoal,addi (tests/nattools/machine_batch5_check.sh).
+//   The other functions keep the fusion honest: constants outside each
+//   target's immediate (5000 is beyond AArch64's and RISC-V's 12 bits,
+//   3000000000 beyond x86-64's 32), negative steps, the constant on the
+//   left, a constant minus a register (not fused: SUB's constant is its
+//   second operand only), the largest RISC-V immediates and the step of a
+//   counter that a later block still reads.
+// Expected output:
+// 45
+// 4950
+// 25000000
+// -30
+// 9000000000
+// 585
+// 2047
+// -2048
+// -4095
+// 4095
+// 27
+// 10
+// 1990
+
+fn count_up(n: i64) -> i64 {
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn big_steps(n: i64) -> i64 {
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n {
+        s = s + 5000;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn down(n: i64) -> i64 {
+    var i: i64 = n;
+    var s: i64 = 0;
+    while i > 0 {
+        s = s - 3;
+        i = i - 1;
+    }
+    return s;
+}
+
+fn huge(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + 3000000000;
+        i = 1 + i;
+    }
+    return s;
+}
+
+fn from_const(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + (100 - i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn edge_add(x: i64) -> i64 {
+    return x + 2047;
+}
+
+fn edge_sub(x: i64) -> i64 {
+    return x - 2048;
+}
+
+fn edge_a64_neg(x: i64) -> i64 {
+    return x - 4095;
+}
+
+fn edge_a64_pos(x: i64) -> i64 {
+    return x + 4095;
+}
+
+fn later_use(n: i64) -> i64 {
+    var i: i64 = 0;
+    var j: i64 = 0;
+    while i < n {
+        j = i;
+        i = i + 3;
+    }
+    return i + j;
+}
+
+fn nested(n: i64) -> i64 {
+    var t: i64 = 0;
+    var a: i64 = 0;
+    while a < n {
+        var b: i64 = 0;
+        while b < a {
+            t = t + 1;
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return t;
+}
+
+fn sub_loop(n: i64) -> i64 {
+    var s: i64 = 2000;
+    var i: i64 = 0;
+    while i < n {
+        s = s - 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println(count_up(10));
+    println(count_up(100));
+    println(big_steps(5000));
+    println(down(10));
+    println(huge(3));
+    println(from_const(6));
+    println(edge_add(0));
+    println(edge_sub(0));
+    println(edge_a64_neg(0));
+    println(edge_a64_pos(0));
+    println(later_use(13));
+    println(nested(5));
+    println(sub_loop(10));
+}

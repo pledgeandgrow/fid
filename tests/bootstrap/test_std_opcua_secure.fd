@@ -1,0 +1,472 @@
+// stdlib/opcua, secured: a client (UaClient) and a minimal server written here exchange, in memory, Hello/Acknowledge, OpenSecureChannel with SecurityPolicy Basic256Sha256 in mode SignAndEncrypt (RSA-OAEP-SHA1 encryption and RSA-PKCS1-SHA256 signatures of the OPN messages, P_SHA256 keys, AES-256-CBC + HMAC-SHA256 MSG chunks), CreateSession (server signature checked), ActivateSession with a user name and an RSA-OAEP encrypted password, a Read, a token renewal and a second Read, CloseSession and CloseSecureChannel, over RSA-2048 certificates made by OpenSSL 3.5 (embedded below); then a wrong password, a tampered OPN message and an untrusted client certificate are refused. RSA-2048 exceeds the interpreter's memory (docs/stdlib-agent-bugs.md 20, 52): run this test compiled (CC="zig cc" fid ccompile ... -o t.exe, then t.exe). When the test was written, an OPN request from this module was also checked with OpenSSL: its RSA-OAEP-SHA1 blocks decrypt with the server key and its RSA-SHA256 signature verifies with the client certificate.
+// Expected output:
+// certificates: CN=Fides OPC UA test client / CN=Fides OPC UA test server, 2048-bit keys
+// hello: client state 2 after the Acknowledge
+// opn request: 1 frame of 1458 bytes (512 encrypted), plaintext nonce not on the wire true
+// server: client certificate trusted true, channel 5 token 1
+// client: channel 5 token 1, state 3, keys agree true
+// session: ns=1;i=1001 server signature verified, user token policy user-b256
+// activate: server decrypted alice/wonderland true, client state 5, password not on the wire true
+// read: 21.5 and status 80340000, token 1
+// renew: needed at 75% true; token 2, server switched after the client's request: 2
+// read after renewal: 22.25 with token 2
+// close: session closed true, CLO opened true, client state 7, server sequence checks all passed true
+// wrong password: ActivateSession: service fault 801f0000
+// tampered OPN: RSA-OAEP decryption failed
+// untrusted client: server refuses the certificate true
+use opcua;
+use rsa;
+use x509;
+use pem;
+use kdf;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn der(pem_text: str, label: str) -> Vec<i64> {
+    return pem_decode(pem_text, label).der;
+}
+
+/// The minimal server: one channel, one session.
+struct Srv {
+    ch: UaChannel,
+    trusted: Vec<i64>,       // the client certificate this server trusts
+    trusted_ok: bool,
+    refused: bool,
+    inbox: Vec<i64>,
+    parts: Vec<Vec<i64>>,
+    nonce: Vec<i64>,         // session nonce
+    client_nonce: Vec<i64>,
+    auth: UaNodeId,
+    active: bool,
+    user_ok: bool,
+    closed: bool,
+    clo: bool,
+    errors: i64,
+    now: i64,
+    temperature: f64,
+}
+
+fn srv_new(cert: Vec<i64>, key: RsaPrivateKey, trusted: Vec<i64>) -> Srv {
+    return Srv {
+        ch: ua_channel(false, UA_POLICY_BASIC256SHA256, UA_MODE_SIGN_ENCRYPT, cert, key, Vec::new(), str_bytes("server seed")),
+        trusted: trusted, trusted_ok: false, refused: false, inbox: Vec::new(), parts: Vec::new(), nonce: Vec::new(), client_nonce: Vec::new(),
+        auth: ua_node_num(0, 0), active: false, user_ok: false, closed: false, clo: false, errors: 0, now: 0, temperature: 21.5,
+    };
+}
+
+fn push_all(out: & mut Vec<Vec<i64>>, more: & Vec<Vec<i64>>) {
+    var i: i64 = 0;
+    while i < more.len() {
+        out.push(more.get(i));
+        i = i + 1;
+    }
+}
+
+fn rh(s: & Srv, handle: i64, result: i64) -> UaResponseHeader {
+    return UaResponseHeader { timestamp: ua_datetime_from_unix_ms(s.now), handle: handle, result: result };
+}
+
+fn srv_feed(s: & mut Srv, bytes: & Vec<i64>) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < bytes.len() {
+        s.inbox.push(bytes.get(i));
+        i = i + 1;
+    }
+    loop {
+        val f: Vec<i64> = ua_take_frame(& mut s.inbox);
+        if f.len() == 0 {
+            return out;
+        }
+        val more: Vec<Vec<i64>> = srv_frame(s, f);
+        push_all(& mut out, & more);
+    }
+    return out;
+}
+
+fn srv_frame(s: & mut Srv, f: Vec<i64>) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    val mt: str = ua_message_type(& f);
+    if mt == "HEL" {
+        var a: UaHello = ua_decode_hello(f);
+        a.mtype = "ACK";
+        out.push(ua_encode_hello(& a));
+        return out;
+    }
+    if mt == "OPN" {
+        val o: UaOpened = ua_opn_open(& mut s.ch, f);
+        if !o.ok {
+            println("server: OPN refused: " + o.error);
+            s.errors = s.errors + 1;
+            return out;
+        }
+        s.trusted_ok = hx(o.sender_cert) == hx(s.trusted);
+        if !s.trusted_ok {
+            s.refused = true;    // a real server answers with an Error message
+            return out;
+        }
+        val q: UaOpnRequest = ua_decode_opn_request(o.body);
+        val p: UaOpnResponse = ua_channel_issue(& mut s.ch, & q, 5, s.now, 600000);
+        out.push(ua_opn_seal(& mut s.ch, o.request_id, & ua_encode_opn_response(& p)));
+        return out;
+    }
+    s.parts.push(f);
+    if f.get(3) == 67 {
+        return out;
+    }
+    val o: UaOpened = ua_sym_open(& mut s.ch, & s.parts);
+    s.parts = Vec::new();
+    if !o.ok {
+        println("server: " + mt + " refused: " + o.error);
+        s.errors = s.errors + 1;
+        return out;
+    }
+    if o.mtype == "CLO" {
+        s.clo = true;
+        return out;
+    }
+    val ty: i64 = ua_body_type(& o.body);
+    var resp: Vec<i64> = Vec::new();
+    if ty == UA_CREATE_SESSION_REQUEST_ID {
+        val q: UaCreateSessionRequest = ua_decode_create_session_request(o.body);
+        s.client_nonce = q.nonce;
+        s.nonce = ua_rng_bytes(& mut s.ch.rng, 32);
+        s.auth = ua_node_num(1, 5005);
+        var ep: UaEndpoint = UaEndpoint { url: q.endpoint_url, server_uri: "urn:fides:test:server", cert: s.ch.own_cert, mode: UA_MODE_SIGN_ENCRYPT, policy: UA_POLICY_BASIC256SHA256, token_ids: Vec::new(), token_types: Vec::new(), token_policies: Vec::new(), level: 3 };
+        ep.token_ids.push("anonymous");
+        ep.token_types.push(UA_TOKEN_ANONYMOUS);
+        ep.token_policies.push("");
+        ep.token_ids.push("user-b256");
+        ep.token_types.push(UA_TOKEN_USERNAME);
+        ep.token_policies.push(UA_POLICY_BASIC256SHA256);
+        var p: UaCreateSessionResponse = UaCreateSessionResponse {
+            hdr: rh(s, q.hdr.handle, UA_GOOD), session_id: ua_node_num(1, 1001), auth_token: s.auth, timeout: q.timeout, nonce: s.nonce, cert: s.ch.own_cert,
+            endpoints: Vec::new(), sig_alg: UA_ALG_RSA_SHA256, signature: ua_session_sign(s.ch.own_key, & q.cert, & q.nonce), max_request: 0, error: "",
+        };
+        p.endpoints.push(ep);
+        resp = ua_encode_create_session_response(& p);
+    } else if ty == UA_ACTIVATE_SESSION_REQUEST_ID {
+        val q: UaActivateSessionRequest = ua_decode_activate_session_request(o.body);
+        var result: i64 = UA_GOOD;
+        if !ua_nodeid_eq(& q.hdr.auth, & s.auth) {
+            result = UA_BAD_SESSION_ID_INVALID;
+        } else if !ua_session_verify(s.ch.peer_key, & s.ch.own_cert, & s.nonce, & q.signature) {
+            result = UA_BAD_SECURITY_CHECKS_FAILED;
+        } else if q.token_type == UA_USERNAME_TOKEN_ID {
+            val pw: RsaPlain = ua_password_decrypt(s.ch.own_key, & q.password, & s.nonce);
+            if !pw.ok || q.enc_alg != UA_ALG_RSA_OAEP {
+                result = UA_BAD_IDENTITY_TOKEN_INVALID;
+            } else if q.user != "alice" || str_from_bytes(pw.data) != "wonderland" {
+                result = UA_BAD_USER_ACCESS_DENIED;
+            } else {
+                s.user_ok = true;
+            }
+        }
+        if result != UA_GOOD {
+            resp = ua_encode_service_fault(& rh(s, q.hdr.handle, result));
+        } else {
+            s.active = true;
+            s.nonce = ua_rng_bytes(& mut s.ch.rng, 32);
+            resp = ua_encode_activate_session_response(& UaActivateSessionResponse { hdr: rh(s, q.hdr.handle, UA_GOOD), nonce: s.nonce, error: "" });
+        }
+    } else if ty == UA_READ_REQUEST_ID {
+        val q: UaReadRequest = ua_decode_read_request(o.body);
+        if !s.active || !ua_nodeid_eq(& q.auth_token, & s.auth) {
+            resp = ua_encode_service_fault(& rh(s, q.handle, UA_BAD_SESSION_ID_INVALID));
+        } else {
+            var p: UaReadResponse = ua_read_response(q.handle, ua_datetime_from_unix_ms(s.now));
+            var k: i64 = 0;
+            while k < q.nodes.len() {
+                val n: UaNodeId = q.nodes.get(k);
+                if ua_nodeid_text(& n) == "ns=2;s=Temperature" {
+                    var d: UaDataValue = ua_datavalue(ua_var_double(s.temperature));
+                    d.has_status = true;
+                    p.results.push(d);
+                } else {
+                    var d: UaDataValue = ua_datavalue(ua_variant(0));
+                    d.has_value = false;
+                    d.has_status = true;
+                    d.status = UA_BAD_NODE_ID_UNKNOWN;
+                    p.results.push(d);
+                }
+                k = k + 1;
+            }
+            resp = ua_encode_read_response(& p);
+        }
+    } else if ty == UA_CLOSE_SESSION_REQUEST_ID {
+        val h: UaRequestHeader = ua_decode_close_session_request(o.body);
+        s.active = false;
+        s.closed = true;
+        resp = ua_encode_close_session_response(& rh(s, h.handle, UA_GOOD));
+    } else {
+        resp = ua_encode_service_fault(& rh(s, 0, UA_BAD_SECURITY_CHECKS_FAILED));
+    }
+    return ua_sym_seal(& mut s.ch, "MSG", o.request_id, & resp, 8192);
+}
+
+/// Carry frames to the other side as one byte stream cut into 100-byte
+/// pieces (TCP may split anywhere).
+fn to_server(s: & mut Srv, frames: & Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+    var stream: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < frames.len() {
+        val f: Vec<i64> = frames.get(i);
+        var k: i64 = 0;
+        while k < f.len() {
+            stream.push(f.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var out: Vec<Vec<i64>> = Vec::new();
+    var pos: i64 = 0;
+    while pos < stream.len() {
+        var piece: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < 100 && pos < stream.len() {
+            piece.push(stream.get(pos));
+            pos = pos + 1;
+            k = k + 1;
+        }
+        val more: Vec<Vec<i64>> = srv_feed(s, & piece);
+        push_all(& mut out, & more);
+    }
+    return out;
+}
+
+fn to_client(c: & mut UaClient, frames: & Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < frames.len() {
+        val more: Vec<Vec<i64>> = ua_client_feed(c, & frames.get(i));
+        push_all(& mut out, & more);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Run frames back and forth until neither side has anything to send.
+fn pump(c: & mut UaClient, s: & mut Srv, first: Vec<Vec<i64>>) {
+    var up: Vec<Vec<i64>> = first;
+    while up.len() > 0 {
+        val down: Vec<Vec<i64>> = to_server(s, & up);
+        up = to_client(c, & down);
+    }
+}
+
+fn wire(frames: & Vec<Vec<i64>>) -> str {
+    var t: str = "";
+    var i: i64 = 0;
+    while i < frames.len() {
+        t = t + hx(frames.get(i));
+        i = i + 1;
+    }
+    return t;
+}
+
+fn new_client(ccert: Vec<i64>, ckey: RsaPrivateKey, scert: Vec<i64>, user: str, password: str) -> UaClient {
+    val ch: UaChannel = ua_channel(true, UA_POLICY_BASIC256SHA256, UA_MODE_SIGN_ENCRYPT, ccert, ckey, scert, str_bytes("client seed"));
+    var c: UaClient = ua_client("opc.tcp://localhost:4840", "urn:fides:test:client", ch, user, password);
+    c.now = 1700000000000;
+    return c;
+}
+
+fn main() {
+    val ccert: Vec<i64> = der(client_cert_pem(), "CERTIFICATE");
+    val scert: Vec<i64> = der(server_cert_pem(), "CERTIFICATE");
+    val ckey: RsaPrivateKey = rsa_private_from_pkcs8(der(client_key_pem(), "PRIVATE KEY"));
+    val skey: RsaPrivateKey = rsa_private_from_pkcs8(der(server_key_pem(), "PRIVATE KEY"));
+    println("certificates: " + x509_parse(ccert).subject + " / " + x509_parse(scert).subject + ", " + int_to_str(ckey.bits) + "-bit keys");
+
+    var s: Srv = srv_new(scert, skey, ccert);
+    s.now = 1700000000000;
+    var c: UaClient = new_client(ccert, ckey, scert, "alice", "wonderland");
+    // Hello / Acknowledge, step by step
+    val hel: Vec<Vec<i64>> = ua_client_start(& mut c);
+    val ack: Vec<Vec<i64>> = to_server(& mut s, & hel);
+    val opn: Vec<Vec<i64>> = to_client(& mut c, & ack);
+    println("hello: client state " + int_to_str(c.state) + " after the Acknowledge");
+    val nonce_hex: str = hx(c.ch.local_nonce);
+    val f0: Vec<i64> = opn.get(0);
+    println("opn request: " + int_to_str(opn.len()) + " frame of " + int_to_str(f0.len()) + " bytes (" + int_to_str(f0.len() - 8 - 4 - 4 - str_len(UA_POLICY_BASIC256SHA256) - 4 - ccert.len() - 4 - 20) + " encrypted), plaintext nonce not on the wire " + yes(!str_contains(hx(f0), nonce_hex)));
+    val opr: Vec<Vec<i64>> = to_server(& mut s, & opn);
+    println("server: client certificate trusted " + yes(s.trusted_ok) + ", channel " + int_to_str(s.ch.channel_id) + " token " + int_to_str(s.ch.token_id));
+    val cs: Vec<Vec<i64>> = to_client(& mut c, & opr);
+    println("client: channel " + int_to_str(c.ch.channel_id) + " token " + int_to_str(c.ch.token_id) + ", state " + int_to_str(c.state) + ", keys agree " + yes(hx(c.ch.send_keys.enc) == hx(s.ch.recv_keys.enc) && hx(c.ch.recv_keys.sign) == hx(s.ch.send_keys.sign)));
+    // CreateSession and ActivateSession
+    val csr: Vec<Vec<i64>> = to_server(& mut s, & cs);
+    val act: Vec<Vec<i64>> = to_client(& mut c, & csr);
+    println("session: " + ua_nodeid_text(& c.session_id) + " server signature verified, user token policy " + "user-b256");
+    val actw: str = wire(& act);
+    val acr: Vec<Vec<i64>> = to_server(& mut s, & act);
+    val fin: Vec<Vec<i64>> = to_client(& mut c, & acr);
+    println("activate: server decrypted alice/wonderland " + yes(s.user_ok) + ", client state " + int_to_str(c.state) + ", password not on the wire " + yes(!str_contains(actw, hx(str_bytes("wonderland"))) && !str_contains(actw, hx(str_bytes("alice")))));
+    // Read
+    var nodes: Vec<UaNodeId> = Vec::new();
+    nodes.push(ua_node_str(2, "Temperature"));
+    nodes.push(ua_node_num(0, 2258));
+    val out1: Vec<Vec<i64>> = ua_client_read(& mut c, & nodes);
+    pump(& mut c, & mut s, out1);
+    val r0: UaReadResponse = c.reads.get(0);
+    println("read: " + float_to_str(r0.results.get(0).value.floats.get(0)) + " and status " + int_to_hex(r0.results.get(1).status) + ", token " + int_to_str(c.ch.token_id));
+    // renewal at 75 % of the lifetime
+    c.now = c.now + 450000;
+    s.now = c.now;
+    val need: bool = ua_client_needs_renew(& c);
+    val out2: Vec<Vec<i64>> = ua_client_renew(& mut c);
+    pump(& mut c, & mut s, out2);
+    s.temperature = 22.25;
+    var one: Vec<UaNodeId> = Vec::new();
+    one.push(ua_node_str(2, "Temperature"));
+    val out3: Vec<Vec<i64>> = ua_client_read(& mut c, & one);
+    pump(& mut c, & mut s, out3);
+    println("renew: needed at 75% " + yes(need) + "; token " + int_to_str(c.ch.token_id) + ", server switched after the client's request: " + int_to_str(s.ch.token_id));
+    val r1: UaReadResponse = c.reads.get(1);
+    println("read after renewal: " + float_to_str(r1.results.get(0).value.floats.get(0)) + " with token " + int_to_str(c.ch.token_id));
+    // close
+    val out4: Vec<Vec<i64>> = ua_client_close(& mut c);
+    pump(& mut c, & mut s, out4);
+    println("close: session closed " + yes(s.closed) + ", CLO opened " + yes(s.clo) + ", client state " + int_to_str(c.state) + ", server sequence checks all passed " + yes(s.errors == 0));
+
+    // a wrong password
+    var s2: Srv = srv_new(scert, skey, ccert);
+    var c2: UaClient = new_client(ccert, ckey, scert, "alice", "rabbit");
+    val out5: Vec<Vec<i64>> = ua_client_start(& mut c2);
+    pump(& mut c2, & mut s2, out5);
+    println("wrong password: " + c2.error);
+    // a tampered OPN request
+    var s3: Srv = srv_new(scert, skey, ccert);
+    var c3: UaClient = new_client(ccert, ckey, scert, "", "");
+    val h3: Vec<Vec<i64>> = to_server(& mut s3, & ua_client_start(& mut c3));
+    val o3: Vec<Vec<i64>> = to_client(& mut c3, & h3);
+    var bad: Vec<i64> = o3.get(0);
+    bad.set(bad.len() - 5, bad.get(bad.len() - 5) ^ 64);
+    val b3: UaOpened = ua_opn_open(& mut s3.ch, bad);
+    println("tampered OPN: " + b3.error);
+    // a client whose certificate the server does not trust
+    var s4: Srv = srv_new(scert, skey, scert);
+    var c4: UaClient = new_client(ccert, ckey, scert, "", "");
+    val out6: Vec<Vec<i64>> = ua_client_start(& mut c4);
+    pump(& mut c4, & mut s4, out6);
+    println("untrusted client: server refuses the certificate " + yes(s4.refused && c4.state == UA_CL_OPENING));
+}
+
+fn client_cert_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDSTCCAjGgAwIBAgIUCuSJjpLXXaK/9PTmUo15NYOdlAgwDQYJKoZIhvcNAQEL\n"
+        + "BQAwIzEhMB8GA1UEAwwYRmlkZXMgT1BDIFVBIHRlc3QgY2xpZW50MB4XDTI2MTEx\n"
+        + "NzEzMzAyN1oXDTQ2MTExMjEzMzAyN1owIzEhMB8GA1UEAwwYRmlkZXMgT1BDIFVB\n"
+        + "IHRlc3QgY2xpZW50MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtVzZ\n"
+        + "0F4PqInPB0EsDNoePGPCxql5oQA4RNE8dloO0DcWfA5GTfytPo4lKInizt+JrFu/\n"
+        + "qa1+6JJ+VWQCjt45xxC4ATIr+LyAdkKjhr2Plvvy/hcy/5hupESb5qu2UVEKDO2E\n"
+        + "5Xfbw+JtLkIL8Atn3S1xAS4D31DOXZTcSmLipJviv+sGJ92rLGN0o14lHlIAqhBX\n"
+        + "UbmpGttpK098V5Vf4pfLFVkBuPvFdj+rgZNsu2AqWU+QqypkDTg41IUoEH+njj1/\n"
+        + "JWqGvO2YvxDIED0UmflkzY5X8ZYuiyvQlFtqNmIWYrHq6dQrM3iHzXjo6c/ynNdO\n"
+        + "E0VxPNdwSiOAon9eCwIDAQABo3UwczAdBgNVHQ4EFgQUgq9V2QS6XM6Nd+nzFYdQ\n"
+        + "vYKMeLwwHwYDVR0jBBgwFoAUgq9V2QS6XM6Nd+nzFYdQvYKMeLwwDwYDVR0TAQH/\n"
+        + "BAUwAwEB/zAgBgNVHREEGTAXhhV1cm46ZmlkZXM6dGVzdDpjbGllbnQwDQYJKoZI\n"
+        + "hvcNAQELBQADggEBALMSxrXdC2MrI+ozaRJMxa3L/E0HsXTHhaxbdJ5wy0uAj01x\n"
+        + "k5t1hyDG7AGZCvwC8KT1IbaPzUp8oPQOHPxQFyvibYvqwrMcnLD5KIc+R5ZYvWG0\n"
+        + "VEiox1OsC8IHgpXYjqajM33d3M/hzRTH7MHhej+ZorgJil2wtfkMqmQM/vpFEePX\n"
+        + "5hAAUMCi1XauXSGvYI0vHuwucOJOUisW0FOVg8pRtTCCWGvxdBqNiyB9ud5JBSzj\n"
+        + "ufyAcKnI3QNAxF9yo0NZ2uG3p9MgYB02Zy6bxVFbVjwNtTTvoLh0WOdeCiEin7WS\n"
+        + "OIzVEkEpjlKuEbH7A1/5qLV3Wjd37YEM/5TZCRc=\n"
+        + "-----END CERTIFICATE-----\n";
+}
+
+fn client_key_pem() -> str {
+    return "-----BEGIN PRIVATE KEY-----\n"
+        + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC1XNnQXg+oic8H\n"
+        + "QSwM2h48Y8LGqXmhADhE0Tx2Wg7QNxZ8DkZN/K0+jiUoieLO34msW7+prX7okn5V\n"
+        + "ZAKO3jnHELgBMiv4vIB2QqOGvY+W+/L+FzL/mG6kRJvmq7ZRUQoM7YTld9vD4m0u\n"
+        + "QgvwC2fdLXEBLgPfUM5dlNxKYuKkm+K/6wYn3assY3SjXiUeUgCqEFdRuaka22kr\n"
+        + "T3xXlV/il8sVWQG4+8V2P6uBk2y7YCpZT5CrKmQNODjUhSgQf6eOPX8laoa87Zi/\n"
+        + "EMgQPRSZ+WTNjlfxli6LK9CUW2o2YhZiserp1CszeIfNeOjpz/Kc104TRXE813BK\n"
+        + "I4Cif14LAgMBAAECggEAAZbC08KsiXH3ozJ3eSoEtMu885zy01hwpcMIMBNBk6Jq\n"
+        + "ldim1ge+LtDzqLjDM25y7X8k8o7HZgXj3x9QBGy+/db60wvbpcNlBA7jvDT3R+qE\n"
+        + "1PliuX7eN/M1Qx6YViW1xv+NDVjw+cox4a4IyRLDLLAOuuS/z5o3d0tsE1IYITq2\n"
+        + "nyNMrs//r7IfFVxUQjySQ6BD/9LZ2w6IQsJ/HYQFwHhpM+XY7L1mv5VzuLMUCCyf\n"
+        + "vFX3l4qP4JfejxGdh5eX8JudJXWGgeXTWzkc8gMhiMvm1I3uOsiSXkjmFr4/eUc/\n"
+        + "b9Dzebq3LR1C9pCM8Mq+eMQ0jWenZNQzg0QDWp6f3QKBgQDXn6B0OzYn/UTCJJ/p\n"
+        + "pseqKCyR9rQOmR0o2h+ZGo1Yrctqg3SHRs6OT7D9pUK40ZnJ4SdvPSoEW2axxVYs\n"
+        + "XD4EWxfCXXViAMUVqR4I3kCMqEUvju+5PXPyy1cMHYk/9e0wNm2gaE4CM7QvX+9C\n"
+        + "V+Oyoak8MbqrMnYabOgaqTf4DQKBgQDXUtuOO7bSKe35PywVnRGVNjpvfK1RIQpt\n"
+        + "OBqdwKX3rbQTJjGxGYb85dFZJzw9DV/eS43k3ODnBO+0RIkA9kN7IYMIUotqGd0y\n"
+        + "SdSmd+Dw5y4rYYDq7NjSN8xHMABdJJDRfGxv882KWPeo1coTW0vrMCim0xux1fLn\n"
+        + "+TxPnxNQdwKBgAet2asKCM23yWEYqNFLbUT0FVJFdPgoH8+6pPFw7qO/3MS4VcgT\n"
+        + "j3ul/umpnwyx+kYkTKE7jmmFT8z4+C6wQk0paVk0tt98o4g386fhMm9P9tbQwlzY\n"
+        + "gW6eK0V1L9QlUAMtjQ3vaQfPC5W8VusH8kYEV+Ca7Mj4DRi31DRO3n1pAoGAfG+j\n"
+        + "9pTH2LjmkC5T2cHF0YdfSeKxfrsrfWb46sXUpEg8Uvy1pvVrr2dZDr6/70B1cNAV\n"
+        + "FngXeSq/JFyfGHE5GkWJphud+hksXc2RGQsacd4ILoXQrPNnckVQxqsU6r8g+g9/\n"
+        + "00sAM72qkmXKvFj8jNRuCcrirGlKUYkVs6Xo0Y0CgYEAjhNjqMKQT2hFrIo+6fzn\n"
+        + "harUaaxarSgRrhimqaaQ1PhlbZz7fFwFfmqaN9MAadMutzD3BibdussiAEhdrrPu\n"
+        + "oMzeJhkEnIHMqp5Zptu8iibr3GM09EjkvLjm6/TlED28xgeIiZiUGF1hUC2brptr\n"
+        + "/jQOZ+1gmhArtpvTyMtQYlo=\n"
+        + "-----END PRIVATE KEY-----\n";
+}
+
+fn server_cert_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDSTCCAjGgAwIBAgIUJU7zwuLDcum3npiAQwyKSRNg69UwDQYJKoZIhvcNAQEL\n"
+        + "BQAwIzEhMB8GA1UEAwwYRmlkZXMgT1BDIFVBIHRlc3Qgc2VydmVyMB4XDTI2MTEx\n"
+        + "NzEzMzAyOFoXDTQ2MTExMjEzMzAyOFowIzEhMB8GA1UEAwwYRmlkZXMgT1BDIFVB\n"
+        + "IHRlc3Qgc2VydmVyMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsHfK\n"
+        + "b5Jtp/v2UELr4tLYpFjOsKs2flLWXDqf/3MvPNixo2Fweq/Q40F8PTzJaB2S1Tfw\n"
+        + "RdML7I/MqZI8Aq7T6RW/rGLNs9NGbPK1BkyF4raDEREWAv17KoRr9PwtRXQe2jhP\n"
+        + "RXHq8SVODMA6pta/iW2p8gtS4Aw0en+gTBDMNrvsIMJgH3RZYjGpKcXWOKbdAszu\n"
+        + "wLI8gBvVjb2oOX0GPpXSc/3z7N2/Bvj2fySixZXhWXkZyewJXjCseYmW892d3Okn\n"
+        + "vCYSaEJwaCIyu7xpNFcXr0LBuOlHRFDGcmTH/BUWITFNUDkU+iLNFtqJq5gv6QZH\n"
+        + "vY4iET/chiLLNEP3+wIDAQABo3UwczAdBgNVHQ4EFgQU3fMvpxqNqjiWv0QUqKAE\n"
+        + "q1BBmJgwHwYDVR0jBBgwFoAU3fMvpxqNqjiWv0QUqKAEq1BBmJgwDwYDVR0TAQH/\n"
+        + "BAUwAwEB/zAgBgNVHREEGTAXhhV1cm46ZmlkZXM6dGVzdDpzZXJ2ZXIwDQYJKoZI\n"
+        + "hvcNAQELBQADggEBADsTdVmZhydFSCdYNuKlesvqaHAIslBub2PjAs9mBffpCBNt\n"
+        + "bjaJg2P5O+IsdvH1YNnAu1g3+r9eTqP0/deqLu0fmIdjfalIfz2RJuqrke29rFrY\n"
+        + "5ZO6P3XUuR4SPAPYG4ASzikM7e1dR8aW0Wf1Lq7Fng0UKluCqm9M2d2lORxIh/hn\n"
+        + "8H39lFUP1MDCt2bA7z4d4SeXTG6azC57oFKd863245hRhNND5NjzmWI3lQIiQu0r\n"
+        + "tewc1Y4VvfGr8M/wC1nfBXRESEW71jQXwXJ117N1RrCQrD4OylORUD3CZtO/q0Yw\n"
+        + "4QzEg8EdLx0JpHZoBFoGKwV05qGr6wI1ZxAtM6Q=\n"
+        + "-----END CERTIFICATE-----\n";
+}
+
+fn server_key_pem() -> str {
+    return "-----BEGIN PRIVATE KEY-----\n"
+        + "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCwd8pvkm2n+/ZQ\n"
+        + "Quvi0tikWM6wqzZ+UtZcOp//cy882LGjYXB6r9DjQXw9PMloHZLVN/BF0wvsj8yp\n"
+        + "kjwCrtPpFb+sYs2z00Zs8rUGTIXitoMRERYC/XsqhGv0/C1FdB7aOE9FcerxJU4M\n"
+        + "wDqm1r+JbanyC1LgDDR6f6BMEMw2u+wgwmAfdFliMakpxdY4pt0CzO7AsjyAG9WN\n"
+        + "vag5fQY+ldJz/fPs3b8G+PZ/JKLFleFZeRnJ7AleMKx5iZbz3Z3c6Se8JhJoQnBo\n"
+        + "IjK7vGk0VxevQsG46UdEUMZyZMf8FRYhMU1QORT6Is0W2omrmC/pBke9jiIRP9yG\n"
+        + "Iss0Q/f7AgMBAAECggEACx5rzD6MV4/x+SSo+uW7bhTaZm9N7lpcf1CCUZ95qSUj\n"
+        + "gYkw2R9y00mGVnrEsKFhuxAx53RgxUsE44+p5aa2W3KvXQvsrMPx0AjgNxa4k4xZ\n"
+        + "vcg3JtZp3Z1HtWvzk54Ow5krWtN5W4W04UDLcUUJVH4VvdZ7e6UejrQJREGwBv1o\n"
+        + "Bm8AN/OGnGP3MWdKgBAyxKBliHwNIazef38wW3FyIFjalRRL0SmoBE9DFrVVzWg5\n"
+        + "OHCDAVUjGHDZgVJJWR4MzcOMzRaKP7Ry/DtXikz1c4P4aVQLotYrJq3QJ5ok/70H\n"
+        + "zATFGwT5xyOnh8EQMwKOEYjO7UAYNj7PTGon4lo8gQKBgQDnJEXO28G6x4PgGva1\n"
+        + "cpbPq5aYeqoeVfLx76edHumKWKMucS2eXr+A2qrKU6OjnHBeRkwha+r5HFAv9YkF\n"
+        + "j+x6Ww5qfiJEAZwz7ScHGCVyxHjUn6Idk8Ug33QYBKRwFMdY57aog2iZ6pmWw0Pu\n"
+        + "GNXot6tLjPNL6XX91o1IjydFcQKBgQDDckF3SpMMtp+tHcgwxGhSzqBBuBZ7tk+Q\n"
+        + "Rd2DNj0BnVoyuo4mbkj86iOOlEqTCTJTq1REtsXaGXWRdaHWsmyY5ZqZ0u1yQrCm\n"
+        + "aLvy/0/jzxZ5yNd301xRkq3Na994G2tcR/4BJSHaHQDnlmyJTPzmeWwmYm1dfbvN\n"
+        + "9C9SwMEuKwKBgQC+q69iWunO2DKzNcr6FxLNMPDDy7x11dTZOyb7d7qTQ1cpQnet\n"
+        + "Qt+avcdRq/k7SBtxyW+XylxFLtP/G/7yNa2PqXmU44QEsYdXVnRxZ7vMlsJOM3ka\n"
+        + "CQH+ghZUkc/MHXfsoQiOrggln98e/OkWiio7FPgbFKTGpEmPIePeTSjKIQKBgQCe\n"
+        + "1V+2nnhawJ+LhMSIPVW61gkO35gF+ec3DFA0rgNuKH6A83NKcB4IzA8RdBoW3EZ2\n"
+        + "EKpvHUo1MLOG/t4DKQVwTEgT8oLddK0yz7LOjAZU0JsnZb0VuEMyV82/P4dgiIf7\n"
+        + "etZF//M+2os9qdWSz2pHsy3dE+hlLiVN/r/mtJdJ+QKBgAc5PPNTGt3l5iFHss/F\n"
+        + "Yu97J3IZBbwTZCj8v9g8u8FoXnXE5iDLVZa8Ln075yT0st5vsWbxLXXdKdXhQ8iE\n"
+        + "lMoRP37hM4oDnw9DXqAFrYFIfnTHqGQeEYs/zbhN8ht/4n8oZWgXd/XW5bMN19Rr\n"
+        + "3P2a95gpXagh8Gqjoeb2ufee\n"
+        + "-----END PRIVATE KEY-----\n";
+}

@@ -1,0 +1,150 @@
+// stdlib/imu: Madgwick and Mahony (6 and 9 axes) converging to a known attitude from synthetic gravity and field vectors, yaw tracking from the gyro, gyro bias at rest, accelerometer 6-position and magnetometer min/max calibration, tilt-compensated heading, gravity removal
+// Expected output:
+// madgwick 9-axis: roll=0.3000 pitch=-0.2000 yaw=0.8000
+// madgwick 6-axis: roll=0.3000 pitch=-0.2000
+// mahony 9-axis: roll=0.3000 pitch=-0.2000 yaw=0.8000
+// mahony 6-axis: roll=0.3000 pitch=-0.2000
+// gyro yaw after 2 s at 0.5 rad/s: madgwick=1.0000 mahony=1.0000
+// mahony with gyro bias: roll=0.3000 pitch=-0.2000 bias estimate=(-0.0300, 0.0200, 0.0000)
+// bias estimates=1 bias=(0.0100, -0.0200, 0.0050) corrected=(0.0000, 0.0000, 0.0000)
+// accel cal offset=(0.0500, -0.0300, 0.1000) scale=(0.9804, 1.0204, 0.9901)
+// accel corrected=(5.8840, 0.0000, 7.8453)
+// mag offset=(20.0000, -10.0000, 5.0000) scale=(1.1250, 0.9000, 1.0000) samples=266 on sphere: true
+// heading=0.8000
+// linear accel earth=(1.0000, 0.0000, 0.0000) body norm=1.0000
+// tilt from accel: roll=0.3000 pitch=-0.2000
+use math;
+use quat;
+use imu;
+
+fn eul(q: quat, yaw: bool) -> str {
+    val e: EulerZYX = qt_to_euler_zyx(q);
+    var s: str = "roll=" + rmath_fmt(e.roll, 4) + " pitch=" + rmath_fmt(e.pitch, 4);
+    if yaw {
+        s = s + " yaw=" + rmath_fmt(e.yaw, 4);
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    val qt: quat = qt_from_euler_zyx(0.3, -0.2, 0.8);
+    val pi: f64 = rmath_pi();
+    val dip: f64 = pi / 3.0;
+    val me: vec3 = vec3(math_cos(dip), 0.0, 0.0 - math_sin(dip));
+    val ab: vec3 = qt_rotate(qt_conj(qt), vec3(0.0, 0.0, 9.80665));
+    val mb: vec3 = qt_rotate(qt_conj(qt), vec3(me.x * 48.0, 0.0, me.z * 48.0));
+    val zero: vec3 = vec3(0.0, 0.0, 0.0);
+
+    var m9: Madgwick = madgwick_new(0.5);
+    var m6: Madgwick = madgwick_new(0.5);
+    var h9: Mahony = mahony_new(2.0, 0.0);
+    var h6: Mahony = mahony_new(2.0, 0.0);
+    var i: i64 = 0;
+    while i < 6000 {
+        if i == 3000 {
+            // a fixed-size gradient step chatters by about beta * dt
+            // around the optimum: refine with a small beta
+            m9.beta = 0.002;
+            m6.beta = 0.002;
+        }
+        madgwick_update(&mut m9, zero, ab, mb, 0.01);
+        madgwick_update_imu(&mut m6, zero, ab, 0.01);
+        mahony_update(&mut h9, zero, ab, mb, 0.01);
+        mahony_update_imu(&mut h6, zero, ab, 0.01);
+        i = i + 1;
+    }
+    println("madgwick 9-axis: " + eul(m9.q, true));
+    println("madgwick 6-axis: " + eul(m6.q, false));
+    println("mahony 9-axis: " + eul(h9.q, true));
+    println("mahony 6-axis: " + eul(h6.q, false));
+
+    var mr: Madgwick = madgwick_new(0.1);
+    var hr: Mahony = mahony_new(1.0, 0.1);
+    val lev: vec3 = vec3(0.0, 0.0, 1.0);
+    i = 0;
+    while i < 200 {
+        madgwick_update_imu(&mut mr, vec3(0.0, 0.0, 0.5), lev, 0.01);
+        mahony_update_imu(&mut hr, vec3(0.0, 0.0, 0.5), lev, 0.01);
+        i = i + 1;
+    }
+    println("gyro yaw after 2 s at 0.5 rad/s: madgwick=" + rmath_fmt(qt_to_euler_zyx(mr.q).yaw, 4) + " mahony=" + rmath_fmt(qt_to_euler_zyx(hr.q).yaw, 4));
+
+    // a constant gyro bias: the integral term learns it (with the sign flipped)
+    var hb: Mahony = mahony_new(2.0, 0.5);
+    hb.q = qt;
+    i = 0;
+    while i < 6000 {
+        mahony_update(&mut hb, vec3(0.03, -0.02, 0.0), ab, mb, 0.01);
+        i = i + 1;
+    }
+    println("mahony with gyro bias: " + eul(hb.q, false) + " bias estimate=" + rmath_vec3_str(qt_rotate(qt_identity(), vec3(hb.ix, hb.iy, hb.iz)), 4));
+
+    var gb: GyroBias = gyro_bias_new(0.1, 0.5, 9.80665, 100);
+    var est: i64 = 0;
+    i = 0;
+    while i < 200 {
+        var gyro: vec3 = vec3(0.5, 0.0, 0.0);
+        if i >= 50 {
+            val n: f64 = 0.002 * (((i % 3) - 1) as f64);
+            gyro = vec3(0.01 + n, -0.02 - n, 0.005 + n);
+        }
+        if gyro_bias_feed(&mut gb, gyro, vec3(0.0, 0.0, 9.8)) {
+            est = est + 1;
+        }
+        i = i + 1;
+    }
+    println("bias estimates=" + int_to_str(est) + " bias=" + rmath_vec3_str(gb.bias, 4) + " corrected=" + rmath_vec3_str(gyro_bias_apply(&gb, vec3(0.01, -0.02, 0.005)), 4));
+
+    val g: f64 = 9.80665;
+    val up: vec3 = vec3(1.02 * g + 0.05, 0.98 * g - 0.03, 1.01 * g + 0.1);
+    val dn: vec3 = vec3(0.0 - 1.02 * g + 0.05, 0.0 - 0.98 * g - 0.03, 0.0 - 1.01 * g + 0.1);
+    val ac: AxisCal = accel_cal_from_6(up, dn, g);
+    println("accel cal offset=" + rmath_vec3_str(ac.offset, 4) + " scale=" + rmath_vec3_str(ac.scale, 4));
+    val raw: vec3 = vec3(1.02 * 0.6 * g + 0.05, -0.03, 1.01 * 0.8 * g + 0.1);
+    println("accel corrected=" + rmath_vec3_str(axiscal_apply(&ac, raw), 4));
+
+    var mm: MagMinMax = mag_minmax_new();
+    var samples: Vec<vec3> = Vec::new();
+    var ti: i64 = 0;
+    while ti <= 12 {
+        val th: f64 = pi * (ti as f64) / 12.0;
+        var pj: i64 = 0;
+        while pj < 24 {
+            val ph: f64 = pi * (pj as f64) / 12.0;
+            val s: vec3 = vec3(20.0 + 40.0 * math_sin(th) * math_cos(ph), -10.0 + 50.0 * math_sin(th) * math_sin(ph), 5.0 + 45.0 * math_cos(th));
+            if ti > 0 && ti < 12 || pj == 0 {
+                mag_minmax_feed(&mut mm, s);
+                samples.push(s);
+            }
+            pj = pj + 1;
+        }
+        ti = ti + 1;
+    }
+    val mc: AxisCal = mag_cal(&mm);
+    var on: bool = true;
+    var k: i64 = 0;
+    while k < samples.len() {
+        val c: vec3 = axiscal_apply(&mc, samples.get(k));
+        val r: f64 = math_sqrt(c.x * c.x + c.y * c.y + c.z * c.z);
+        if math_fabs(r - 45.0) > 0.000000001 {
+            on = false;
+        }
+        k = k + 1;
+    }
+    println("mag offset=" + rmath_vec3_str(mc.offset, 4) + " scale=" + rmath_vec3_str(mc.scale, 4) + " samples=" + int_to_str(mm.n) + " on sphere: " + bool_to_str_imu(on));
+    println("heading=" + rmath_fmt(mag_heading(qt, mb), 4));
+
+    val al: vec3 = qt_rotate(qt_conj(qt), vec3(1.0, 0.0, g));
+    val le: vec3 = imu_linear_accel_earth(qt, al, g);
+    val lb: vec3 = imu_linear_accel_body(qt, al, g);
+    println("linear accel earth=" + rmath_vec3_str(le, 4) + " body norm=" + rmath_fmt(math_sqrt(lb.x * lb.x + lb.y * lb.y + lb.z * lb.z), 4));
+    println("tilt from accel: " + eul(imu_tilt_from_accel(ab), false));
+    return 0;
+}
+
+fn bool_to_str_imu(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

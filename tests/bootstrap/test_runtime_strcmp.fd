@@ -1,0 +1,90 @@
+// Competitive roadmap OP23: string ordering (core's p_str_compare: the
+// bytes up to the first NUL of either, the first difference as a - b) a
+// word at a time in every runtime -- the C runtime's fast body
+// (compiler/codegen_c.fd: strlen, then 8-byte words), native Linux
+// (stdlib/linux_runtime/base.fd pert_str_compare: aligned words), native
+// Windows (stdlib/pe_runtime/base.fd: strlen, then msvcrt memcmp over
+// 64-byte runs). Every back end must give core's exact numbers: equal
+// strings of every length to 54 bytes, a difference at every position
+// (both orders), prefixes, bytes above 127, a zero byte inside both strings
+// (the comparison ends there), and HashMap printing, which sorts its keys
+// with it.
+//
+// Expected output:
+// equal 0..54: true
+// diff sum: 2756 antisymmetric: true
+// diff at 0 7 8 15 16 31 53: 81 64 72 -3 67 81 22
+// literal: 0 -9 9
+// prefix: -100 100 -97 97 0
+// high bytes: 100 -100
+// inner zero: 0
+// sorted:
+// {: 6, a: 5, apple: 4, apples: 3, item_1: 2, item_10: 1, item_2: 0}
+
+fn b2s(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    val base: str = "the quick brown fox jumps over the lazy dog 0123456789";
+    var eq_all: bool = true;
+    var n: i64 = 0;
+    while n <= 54 {
+        val a: str = str_slice(base, 0, n);
+        val b: str = str_slice(base, 0, n) + "";
+        if str_compare(a, b) != 0 {
+            eq_all = false;
+        }
+        n = n + 1;
+    }
+    println("equal 0..54: " + b2s(eq_all));
+
+    // '#' (35) in place of byte k: base - c is base[k] - 35
+    var sum: i64 = 0;
+    var anti: bool = true;
+    var picks: str = "";
+    var k: i64 = 0;
+    while k < 54 {
+        val c: str = str_slice(base, 0, k) + "#" + str_slice(base, k + 1, 54);
+        val d: i64 = str_compare(base, c);
+        if str_compare(c, base) != 0 - d {
+            anti = false;
+        }
+        sum = sum + d;
+        if k == 0 || k == 7 || k == 8 || k == 15 || k == 16 || k == 31 || k == 53 {
+            picks = picks + " " + int_to_str(d);
+        }
+        k = k + 1;
+    }
+    println("diff sum: " + int_to_str(sum) + " antisymmetric: " + b2s(anti));
+    println("diff at 0 7 8 15 16 31 53:" + picks);
+
+    // A literal against strings built at run time
+    val built: str = str_slice(base, 0, 40) + str_slice(base, 40, 54);
+    val cat: str = str_slice(base, 0, 35) + "cat" + str_slice(base, 38, 54);
+    println("literal: " + int_to_str(str_compare("the quick brown fox jumps over the lazy dog 0123456789", built)) + " " + int_to_str(str_compare(cat, base)) + " " + int_to_str(str_compare(base, cat)));
+
+    println("prefix: " + int_to_str(str_compare("abc", "abcd")) + " " + int_to_str(str_compare("abcd", "abc")) + " " + int_to_str(str_compare("", "a")) + " " + int_to_str(str_compare("a", "")) + " " + int_to_str(str_compare("", "")));
+
+    val hi: str = "a" + char_to_str(200);
+    val lo: str = "a" + char_to_str(100);
+    println("high bytes: " + int_to_str(str_compare(hi, lo)) + " " + int_to_str(str_compare(lo, hi)));
+
+    val z: str = char_to_str(0);
+    println("inner zero: " + int_to_str(str_compare("ab" + z + "xyz_long_tail_0123456789", "ab" + z + "y")));
+
+    var m: HashMap<str, i64> = HashMap::new();
+    m.insert("item_10", 1);
+    m.insert("item_2", 0);
+    m.insert("item_1", 2);
+    m.insert("apples", 3);
+    m.insert("apple", 4);
+    m.insert("a", 5);
+    m.insert("", 6);
+    println("sorted:");
+    println(m);
+    return 0;
+}

@@ -1,0 +1,339 @@
+// LF8 (llvm-roadmap, Nov 17): compiler/checks.fd's range analysis
+// (peir_range_ops) on functions built by hand in the lowered form (locals
+// in allocas, loads and stores), without a build of the compiler: the
+// range set (several facts per block) and several assumed facts per loop
+// header. Each case prints one line "<case> <mul>: unchecked|checked";
+// tests/tooling/range-set-check.sh builds this program (C backend), runs
+// it with the set on and with FID_IROPT_OFF=rangeset, and compares the
+// lines with what each mode must give:
+//
+//   case             set on      set off
+//   hull mul         unchecked   checked    (join of two-sided facts)
+//   hull_fail mul    checked     checked    (one way in unbounded above)
+//   hull_v mul       unchecked   checked    (the same on a value)
+//   pick mul         unchecked   checked    (stores' facts at a join)
+//   walk2 x*100000   unchecked   unchecked  (first assumption, as before)
+//   walk2 y*100000   unchecked   checked    (a second assumption)
+//   walk2_fail x     unchecked   unchecked
+//   walk2_fail y     checked     checked    (a large store: no assumption)
+//
+// Expected output (stdout, set on):
+// hull mul: unchecked
+// hull_fail mul: checked
+// hull_v mul: unchecked
+// pick mul: unchecked
+// walk2 x: unchecked
+// walk2 y: unchecked
+// walk2_fail x: unchecked
+// walk2_fail y: checked
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::checks;
+
+fn rs_param(f: & mut IrFunction, ty: IrType) -> i64 {
+    var id: i64 = IrFunction_new_value(f, ValueMeta_new(ty));
+    f.params.push(ValueIdType_new(id, ty));
+    return id;
+}
+
+fn rs_at(f: & mut IrFunction, b: i64) {
+    f.current_block_idx = b;
+}
+
+fn rs_slot(f: & mut IrFunction) -> i64 {
+    return IrFunction_emit(f, Inst::Alloca(IrType::I64, Region::Stack));
+}
+
+fn rs_ld(f: & mut IrFunction, slot: i64) -> i64 {
+    return IrFunction_emit(f, Inst::Load(slot, IrType::I64));
+}
+
+fn rs_st(f: & mut IrFunction, slot: i64, v: i64) {
+    IrFunction_emit(f, Inst::Store(slot, v, OptIrType::None));
+}
+
+fn rs_c(f: & mut IrFunction, v: i64) -> i64 {
+    return IrFunction_emit(f, Inst::ConstInt(v, IrType::I64));
+}
+
+fn rs_cmp(f: & mut IrFunction, op: BinOp, a: i64, b: i64) -> i64 {
+    return IrFunction_emit(f, Inst::BinOp(op, a, b, IrType::Bool));
+}
+
+fn rs_ar(f: & mut IrFunction, op: BinOp, a: i64, b: i64) -> i64 {
+    return IrFunction_emit(f, Inst::BinOp(op, a, b, IrType::I64));
+}
+
+fn rs_br(f: & mut IrFunction, c: i64, t: i64, e: i64) {
+    IrFunction_emit(f, Inst::Branch(c, t, e));
+}
+
+fn rs_jmp(f: & mut IrFunction, b: i64) {
+    IrFunction_emit(f, Inst::Jump(b));
+}
+
+fn rs_ret(f: & mut IrFunction, v: i64) {
+    IrFunction_emit(f, Inst::Return(OptValueId::Some(v)));
+}
+
+/// Is the overflow check of `id` removed (peir_range_ops bit 1)?
+fn rs_report(f: & IrFunction, name: str, id: i64) {
+    var nvals: i64 = f.next_value + 1;
+    var out: Vec<i64> = peir_zeros(nvals);
+    peir_range_ops(f, nvals, & mut out);
+    if (out.get(id) & 1) == 1 {
+        print(name + ": unchecked\n");
+    } else {
+        print(name + ": checked\n");
+    }
+}
+
+/// `hull` of tests/bootstrap/test_midend_range_set.fd (with `fail`: the
+/// second way in has no upper bound); the multiply's id.
+fn rs_hull(f: & mut IrFunction, fail: bool) -> i64 {
+    var pi: i64 = rs_param(f, IrType::I64);
+    var pf: i64 = rs_param(f, IrType::Bool);
+    var b1: i64 = IrFunction_new_block(f);
+    var r0: i64 = IrFunction_new_block(f);
+    var b2: i64 = IrFunction_new_block(f);
+    var r0b: i64 = IrFunction_new_block(f);
+    var b3: i64 = IrFunction_new_block(f);
+    var b5: i64 = IrFunction_new_block(f);
+    var r1: i64 = IrFunction_new_block(f);
+    var b6: i64 = IrFunction_new_block(f);
+    var r1b: i64 = IrFunction_new_block(f);
+    var b7: i64 = IrFunction_new_block(f);
+    var j: i64 = IrFunction_new_block(f);
+    rs_at(f, 0);
+    var ai: i64 = rs_slot(f);
+    rs_st(f, ai, pi);
+    rs_br(f, pf, b1, b5);
+    // then: if i < 0 { return 0 } if i > 1000 { return 0 }
+    rs_at(f, b1);
+    var l1: i64 = rs_ld(f, ai);
+    var z: i64 = rs_c(f, 0);
+    rs_br(f, rs_cmp(f, BinOp::Lt, l1, z), r0, b2);
+    rs_at(f, r0);
+    rs_ret(f, rs_c(f, 0));
+    rs_at(f, b2);
+    var l2: i64 = rs_ld(f, ai);
+    var k1000: i64 = rs_c(f, 1000);
+    rs_br(f, rs_cmp(f, BinOp::Gt, l2, k1000), r0b, b3);
+    rs_at(f, r0b);
+    rs_ret(f, rs_c(f, 0));
+    rs_at(f, b3);
+    rs_jmp(f, j);
+    // else: if i < 10 { return 1 } (and, unless `fail`, if i > 20 { return 1 })
+    rs_at(f, b5);
+    var l3: i64 = rs_ld(f, ai);
+    var k10: i64 = rs_c(f, 10);
+    rs_br(f, rs_cmp(f, BinOp::Lt, l3, k10), r1, b6);
+    rs_at(f, r1);
+    rs_ret(f, rs_c(f, 1));
+    rs_at(f, b6);
+    if fail {
+        rs_jmp(f, j);
+    } else {
+        var l4: i64 = rs_ld(f, ai);
+        var k20: i64 = rs_c(f, 20);
+        rs_br(f, rs_cmp(f, BinOp::Gt, l4, k20), r1b, b7);
+    }
+    rs_at(f, r1b);
+    rs_ret(f, rs_c(f, 1));
+    rs_at(f, b7);
+    rs_jmp(f, j);
+    rs_at(f, j);
+    var l5: i64 = rs_ld(f, ai);
+    var big: i64 = rs_c(f, 1000000000000000);
+    var m: i64 = rs_ar(f, BinOp::Mul, l5, big);
+    rs_ret(f, m);
+    return m;
+}
+
+/// `hull` as lowering gives it today: the parameter read as a value (no
+/// local), so every fact is on a value; the multiply's id.
+fn rs_hull_v(f: & mut IrFunction) -> i64 {
+    var pi: i64 = rs_param(f, IrType::I64);
+    var pf: i64 = rs_param(f, IrType::Bool);
+    var b1: i64 = IrFunction_new_block(f);
+    var r0: i64 = IrFunction_new_block(f);
+    var b2: i64 = IrFunction_new_block(f);
+    var r0b: i64 = IrFunction_new_block(f);
+    var b3: i64 = IrFunction_new_block(f);
+    var b5: i64 = IrFunction_new_block(f);
+    var r1: i64 = IrFunction_new_block(f);
+    var b6: i64 = IrFunction_new_block(f);
+    var r1b: i64 = IrFunction_new_block(f);
+    var b7: i64 = IrFunction_new_block(f);
+    var j: i64 = IrFunction_new_block(f);
+    rs_at(f, 0);
+    rs_br(f, pf, b1, b5);
+    rs_at(f, b1);
+    rs_br(f, rs_cmp(f, BinOp::Lt, pi, rs_c(f, 0)), r0, b2);
+    rs_at(f, r0);
+    rs_ret(f, rs_c(f, 0));
+    rs_at(f, b2);
+    rs_br(f, rs_cmp(f, BinOp::Gt, pi, rs_c(f, 1000)), r0b, b3);
+    rs_at(f, r0b);
+    rs_ret(f, rs_c(f, 0));
+    rs_at(f, b3);
+    rs_jmp(f, j);
+    rs_at(f, b5);
+    rs_br(f, rs_cmp(f, BinOp::Lt, pi, rs_c(f, 10)), r1, b6);
+    rs_at(f, r1);
+    rs_ret(f, rs_c(f, 1));
+    rs_at(f, b6);
+    rs_br(f, rs_cmp(f, BinOp::Gt, pi, rs_c(f, 20)), r1b, b7);
+    rs_at(f, r1b);
+    rs_ret(f, rs_c(f, 1));
+    rs_at(f, b7);
+    rs_jmp(f, j);
+    rs_at(f, j);
+    var m: i64 = rs_ar(f, BinOp::Mul, pi, rs_c(f, 1000000000000000));
+    rs_ret(f, m);
+    return m;
+}
+
+/// `pick` of tests/bootstrap/test_midend_range_set.fd; the multiply's id.
+fn rs_pick(f: & mut IrFunction) -> i64 {
+    var pf: i64 = rs_param(f, IrType::Bool);
+    var pbig: i64 = rs_param(f, IrType::I64);
+    var t: i64 = IrFunction_new_block(f);
+    var e: i64 = IrFunction_new_block(f);
+    var j: i64 = IrFunction_new_block(f);
+    rs_at(f, 0);
+    var ay: i64 = rs_slot(f);
+    var ar: i64 = rs_slot(f);
+    rs_st(f, ay, rs_c(f, 0));
+    rs_br(f, pf, t, e);
+    rs_at(f, t);
+    rs_st(f, ay, rs_c(f, 3));
+    rs_jmp(f, j);
+    rs_at(f, e);
+    rs_st(f, ay, rs_c(f, 5));
+    rs_jmp(f, j);
+    rs_at(f, j);
+    var ly: i64 = rs_ld(f, ay);
+    var m: i64 = rs_ar(f, BinOp::Mul, ly, rs_c(f, 1000000000000));
+    rs_st(f, ar, m);
+    rs_st(f, ay, pbig);
+    var lr: i64 = rs_ld(f, ar);
+    rs_ret(f, lr);
+    return m;
+}
+
+/// `walk2` of tests/bootstrap/test_midend_range_set.fd (with `fail`, y is
+/// also stored a large value in the loop); the two multiplies' ids in out.
+fn rs_walk2(f: & mut IrFunction, fail: bool, out: & mut Vec<i64>) {
+    var pn: i64 = rs_param(f, IrType::I64);
+    var h: i64 = IrFunction_new_block(f);
+    var b2: i64 = IrFunction_new_block(f);
+    var t1: i64 = IrFunction_new_block(f);
+    var e1: i64 = IrFunction_new_block(f);
+    var j1: i64 = IrFunction_new_block(f);
+    var t2: i64 = IrFunction_new_block(f);
+    var e2: i64 = IrFunction_new_block(f);
+    var j2: i64 = IrFunction_new_block(f);
+    var t3: i64 = IrFunction_new_block(f);
+    var j3: i64 = IrFunction_new_block(f);
+    var x: i64 = IrFunction_new_block(f);
+    rs_at(f, 0);
+    var an: i64 = rs_slot(f);
+    var ax: i64 = rs_slot(f);
+    var ay: i64 = rs_slot(f);
+    var as_: i64 = rs_slot(f);
+    var ak: i64 = rs_slot(f);
+    rs_st(f, an, pn);
+    rs_st(f, ax, rs_c(f, 5));
+    rs_st(f, ay, rs_c(f, 1));
+    rs_st(f, as_, rs_c(f, 0));
+    rs_st(f, ak, rs_c(f, 0));
+    rs_jmp(f, h);
+    // while k < n
+    rs_at(f, h);
+    var lk: i64 = rs_ld(f, ak);
+    var ln: i64 = rs_ld(f, an);
+    rs_br(f, rs_cmp(f, BinOp::Lt, lk, ln), b2, x);
+    // s = s + x * 100000 + y * 100000; if x < 50
+    rs_at(f, b2);
+    var ls: i64 = rs_ld(f, as_);
+    var lx: i64 = rs_ld(f, ax);
+    var m1: i64 = rs_ar(f, BinOp::Mul, lx, rs_c(f, 100000));
+    var a1: i64 = rs_ar(f, BinOp::Add, ls, m1);
+    var ly: i64 = rs_ld(f, ay);
+    var m2: i64 = rs_ar(f, BinOp::Mul, ly, rs_c(f, 100000));
+    var a2: i64 = rs_ar(f, BinOp::Add, a1, m2);
+    rs_st(f, as_, a2);
+    var lx2: i64 = rs_ld(f, ax);
+    rs_br(f, rs_cmp(f, BinOp::Lt, lx2, rs_c(f, 50)), t1, e1);
+    rs_at(f, t1);
+    var lx3: i64 = rs_ld(f, ax);
+    rs_st(f, ax, rs_ar(f, BinOp::Add, lx3, rs_c(f, 3)));
+    rs_jmp(f, j1);
+    rs_at(f, e1);
+    rs_st(f, ax, rs_c(f, 0));
+    rs_jmp(f, j1);
+    // if y < 70
+    rs_at(f, j1);
+    var ly2: i64 = rs_ld(f, ay);
+    rs_br(f, rs_cmp(f, BinOp::Lt, ly2, rs_c(f, 70)), t2, e2);
+    rs_at(f, t2);
+    var ly3: i64 = rs_ld(f, ay);
+    rs_st(f, ay, rs_ar(f, BinOp::Add, ly3, rs_c(f, 4)));
+    rs_jmp(f, j2);
+    rs_at(f, e2);
+    rs_st(f, ay, rs_c(f, 1));
+    rs_jmp(f, j2);
+    // (fail) if k == 5 { y = 92233720368548 }
+    rs_at(f, j2);
+    if fail {
+        var lk5: i64 = rs_ld(f, ak);
+        rs_br(f, rs_cmp(f, BinOp::Eq, lk5, rs_c(f, 5)), t3, j3);
+    } else {
+        rs_jmp(f, j3);
+    }
+    rs_at(f, t3);
+    rs_st(f, ay, rs_c(f, 92233720368548));
+    rs_jmp(f, j3);
+    // k = k + 1
+    rs_at(f, j3);
+    var lk2: i64 = rs_ld(f, ak);
+    rs_st(f, ak, rs_ar(f, BinOp::Add, lk2, rs_c(f, 1)));
+    rs_jmp(f, h);
+    // after the loop: x = s; y = s (their bounds over all stores: none)
+    rs_at(f, x);
+    var ls2: i64 = rs_ld(f, as_);
+    rs_st(f, ax, ls2);
+    rs_st(f, ay, ls2);
+    rs_ret(f, ls2);
+    out.push(m1);
+    out.push(m2);
+}
+
+fn main() {
+    var f1: IrFunction = IrFunction_new("hull", IrType::I64);
+    var m1: i64 = rs_hull(& mut f1, false);
+    rs_report(& f1, "hull mul", m1);
+    var f2: IrFunction = IrFunction_new("hull_fail", IrType::I64);
+    var m2: i64 = rs_hull(& mut f2, true);
+    rs_report(& f2, "hull_fail mul", m2);
+    var f6: IrFunction = IrFunction_new("hull_v", IrType::I64);
+    var m6: i64 = rs_hull_v(& mut f6);
+    rs_report(& f6, "hull_v mul", m6);
+    var f3: IrFunction = IrFunction_new("pick", IrType::I64);
+    var m3: i64 = rs_pick(& mut f3);
+    rs_report(& f3, "pick mul", m3);
+    var ids: Vec<i64> = Vec::new();
+    var f4: IrFunction = IrFunction_new("walk2", IrType::I64);
+    rs_walk2(& mut f4, false, & mut ids);
+    rs_report(& f4, "walk2 x", ids.get(0));
+    rs_report(& f4, "walk2 y", ids.get(1));
+    var ids2: Vec<i64> = Vec::new();
+    var f5: IrFunction = IrFunction_new("walk2_fail", IrType::I64);
+    rs_walk2(& mut f5, true, & mut ids2);
+    rs_report(& f5, "walk2_fail x", ids2.get(0));
+    rs_report(& f5, "walk2_fail y", ids2.get(1));
+}

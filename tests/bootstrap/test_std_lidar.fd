@@ -1,0 +1,106 @@
+// stdlib/lidar: simulated scans of a rectangular room, polar to Cartesian, validity and range filtering, a median filter removing a spike, split-and-merge line extraction recovering the four walls, and ICP scan matching of a scan taken from a moved pose
+// Expected output:
+// beams 180 valid 178
+// first point = (-2.0000, -1.5000) beam 1 = (-1.8610, -1.5000)
+// filtered to [0, 3]: valid 131
+// spike 9.0 -> 3.1
+// lines: 4
+// line r=1.5000 alpha=-90.0000 length 5.51
+// line r=4.0000 alpha=0.0000 length 3.44
+// line r=2.5000 alpha=90.0000 length 5.46
+// line r=2.0000 alpha=180.0000 length 3.70
+// match converged: true
+// match x=0.19 y=0.10 theta=8.06 deg
+// within 2 cm and 0.5 deg: true
+use math;
+use quat;
+use transform3d;
+use pointcloud;
+use lidar;
+
+// distance from (px, py) along a to the walls x = -2, x = 4, y = -1.5, y = 2.5
+fn room(px: f64, py: f64, a: f64) -> f64 {
+    val c: f64 = math_cos(a);
+    val s: f64 = math_sin(a);
+    var b: f64 = 1.0e9;
+    if c > 0.000000001 {
+        b = rmath_min(b, (4.0 - px) / c);
+    }
+    if c < -0.000000001 {
+        b = rmath_min(b, (-2.0 - px) / c);
+    }
+    if s > 0.000000001 {
+        b = rmath_min(b, (2.5 - py) / s);
+    }
+    if s < -0.000000001 {
+        b = rmath_min(b, (-1.5 - py) / s);
+    }
+    return b;
+}
+
+fn deg(r: f64) -> f64 {
+    return r * 180.0 / rmath_pi();
+}
+
+fn take_scan(px: f64, py: f64, th: f64, amin: f64, inc: f64) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 180 {
+        r.push(room(px, py, th + amin + inc * (i as f64)));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn main() -> i64 {
+    // the first beam points at the corner (-2, -1.5)
+    val amin: f64 = rmath_atan2(-1.5, -2.0);
+    val inc: f64 = rmath_pi() / 90.0;
+    var ra: Vec<f64> = take_scan(0.0, 0.0, 0.0, amin, inc);
+    ra.set(50, 0.0);
+    ra.set(120, 50.0);
+    val a: LaserScan = lidar_scan_new(amin, inc, 0.05, 10.0, ra);
+    println("beams " + int_to_str(lidar_len(&a)) + " valid " + int_to_str(lidar_valid_count(&a)));
+    val pa: Vec<vec2> = lidar_to_points(&a);
+    println("first point = (" + rmath_fmt(pa.get(0).x, 4) + ", " + rmath_fmt(pa.get(0).y, 4) + ") beam 1 = (" + rmath_fmt(pa.get(1).x, 4) + ", " + rmath_fmt(pa.get(1).y, 4) + ")");
+    val near: LaserScan = lidar_filter_range(&a, 0.0, 3.0);
+    println("filtered to [0, 3]: valid " + int_to_str(lidar_valid_count(&near)));
+
+    var rs: Vec<f64> = take_scan(0.0, 0.0, 0.0, amin, inc);
+    val before: f64 = rs.get(100);
+    rs.set(100, 9.0);
+    val spiky: LaserScan = lidar_scan_new(amin, inc, 0.05, 10.0, rs);
+    val smooth: LaserScan = lidar_median_filter(&spiky, 2);
+    println("spike 9.0 -> " + rmath_fmt(smooth.ranges.get(100), 1));
+    if math_fabs(smooth.ranges.get(100) - before) > 0.1 {
+        println("median far from the wall");
+    }
+
+    val lines: Vec<LineSeg> = lidar_extract_lines(&a, 0.5, 0.02, 5);
+    println("lines: " + int_to_str(lines.len()));
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: LineSeg = lines.get(i);
+        println("line r=" + rmath_fmt(l.r, 4) + " alpha=" + rmath_fmt(deg(l.alpha), 4) + " length " + rmath_fmt(lidar_seg_length(&l), 2));
+        i = i + 1;
+    }
+
+    // the sensor moved to (0.2, 0.1) and turned 8 degrees
+    val th: f64 = 8.0 * rmath_pi() / 180.0;
+    val b: LaserScan = lidar_scan_new(amin, inc, 0.05, 10.0, take_scan(0.2, 0.1, th, amin, inc));
+    val m: ScanMatch = lidar_match(&a, &b, 0.0, 0.0, 0.0, 0.5);
+    if m.converged {
+        println("match converged: true");
+    } else {
+        println("match converged: false");
+    }
+    println("match x=" + rmath_fmt(m.x, 2) + " y=" + rmath_fmt(m.y, 2) + " theta=" + rmath_fmt(deg(m.theta), 2) + " deg");
+    // point-to-point ICP between two scans sampled at different places on
+    // the walls is biased by about a centimetre
+    if math_fabs(m.x - 0.2) < 0.02 && math_fabs(m.y - 0.1) < 0.02 && math_fabs(deg(m.theta) - 8.0) < 0.5 {
+        println("within 2 cm and 0.5 deg: true");
+    } else {
+        println("within 2 cm and 0.5 deg: false");
+    }
+    return 0;
+}

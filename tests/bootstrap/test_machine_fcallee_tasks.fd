@@ -1,0 +1,39 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA18: callee-saved float
+// registers and tasks. The task switch (nat_ctx_swap) keeps only the
+// integer callee-saved registers, so a program that starts tasks keeps
+// every float off the callee-saved float registers (compiler/nat_ir.fd
+// ng_fcs_tasks, g_ng_fcs_block): here two tasks each keep floats live
+// across task_yield while the other runs and changes its own floats.
+// tests/nattools/machine_fcallee_check.sh checks that a build of it has
+// no "[fcallee]" line and prints this output on every target.
+// Expected output:
+// t1 1733
+// t2 588
+// done 2
+use string;
+use task;
+
+fn worker(seed: i64) -> i64 {
+    var a: f64 = (seed as f64) * 0.5;
+    var b: f64 = 1.25;
+    var c: f64 = 0.0;
+    var i: i64 = 0;
+    while i < 6 {
+        task_yield();
+        c = c + a * b;
+        a = a + 0.75;
+        b = b * 0.5 + (seed as f64) * 0.125;
+        i = i + 1;
+    }
+    val r: i64 = (c * 100.0) as i64;
+    return r;
+}
+
+fn main() {
+    val t1: i64 = task_go("worker", 3);
+    val t2: i64 = task_go("worker", 1);
+    val n: i64 = task_run();
+    println("t1 " + int_to_str(task_result(t1)));
+    println("t2 " + int_to_str(task_result(t2)));
+    println("done " + int_to_str(n));
+}

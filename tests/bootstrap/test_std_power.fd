@@ -1,0 +1,117 @@
+// stdlib/power: STM32F4 PLL solutions (168 MHz from 8 MHz, 84 MHz from 25 MHz), RCC_PLLCFGR, bus clocks and flash wait states, a clock tree with limit checks, and low-power mode transition rules with a duty-cycle current estimate.
+// Expected output:
+// 8 MHz -> 168 MHz: M4 N168 P2 Q7 vco 336000000 usb 48000000 cfgr 0x07402A04
+// 8 MHz -> 180 MHz: M4 N180 P2 Q8 usb 45000000
+// 25 MHz -> 84 MHz: M25 N336 P4 Q7 usb 48000000
+// 8 MHz -> 1 MHz: ok false; M2: VCO input 4000000 Hz out of 1..2 MHz
+// bus: hclk 168000000 pclk1 42000000 pclk2 84000000 tim 84000000/168000000 ws 5
+// apb1 /2: PCLK1 84000000 above 42000000; prescaler for 42 MHz: 4; ws at 1.8 V: 8
+// tree: SYSCLK 168000000 APB1 42000000 USART2 42000000 problems 0
+// tree: APB1 /2 -> APB1: 84000000 > 42000000
+// tree: USART2 gated 0, SYSCLK on HSI 16000000
+// enter SLEEP
+// wake from SLEEP: clocks unchanged
+// STOP: WFI returned at once (interrupt pending)
+// STOP refused: no EXTI or RTC wakeup enabled, only a reset would end it
+// enter STOP
+// wake from STOP: SYSCLK = HSI, restart the PLL
+// SYSCLK = PLL
+// enter SLEEP
+// STOP refused: only entered from RUN (now SLEEP)
+// wake from SLEEP: clocks unchanged
+// enter STANDBY
+// wake from STANDBY: reset, SRAM lost, WUF=true
+// STANDBY refused: clear the wakeup flag (WUF) first
+// rtc wake from STOP when not enabled: false; ram ok false, resets 1
+// average 81996 nA, 1000 mAh lasts 12195 h
+use power;
+use vec;
+use string;
+
+fn hex8(v: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    var out: str = "";
+    var i: i64 = 7;
+    while i >= 0 {
+        val n: i64 = (v >> (4 * i)) & 15;
+        out = out + str_slice(d, n, n + 1);
+        i = i - 1;
+    }
+    return "0x" + out;
+}
+
+fn cfg(c: PllConfig) -> str {
+    return "M" + int_to_str(c.m) + " N" + int_to_str(c.n) + " P" + int_to_str(c.p) + " Q" + int_to_str(c.q);
+}
+
+fn main() {
+    val c1: PllConfig = pll_solve(8000000, 168000000, 168000000);
+    println("8 MHz -> 168 MHz: " + cfg(c1) + " vco " + int_to_str(c1.vco) + " usb " + int_to_str(c1.usb) + " cfgr " + hex8(pll_cfgr(c1, true)));
+    val c2: PllConfig = pll_solve(8000000, 180000000, 180000000);
+    println("8 MHz -> 180 MHz: " + cfg(c2) + " usb " + int_to_str(c2.usb));
+    val c3: PllConfig = pll_solve(25000000, 84000000, 84000000);
+    println("25 MHz -> 84 MHz: " + cfg(c3) + " usb " + int_to_str(c3.usb));
+    println("8 MHz -> 1 MHz: ok " + bool_to_str(pll_solve(8000000, 1000000, 168000000).ok) + "; M2: " + pll_check(8000000, 2, 168, 2, 7, 168000000));
+    val b: BusClocks = bus_clocks(168000000, 1, 4, 2, 168000000, 42000000, 84000000, 3300);
+    println("bus: hclk " + int_to_str(b.hclk) + " pclk1 " + int_to_str(b.pclk1) + " pclk2 " + int_to_str(b.pclk2) + " tim " + int_to_str(b.tim1) + "/" + int_to_str(b.tim2)
+        + " ws " + int_to_str(b.wait_states));
+    val b2: BusClocks = bus_clocks(168000000, 1, 2, 2, 168000000, 42000000, 84000000, 3300);
+    println("apb1 /2: " + b2.why + "; prescaler for 42 MHz: " + int_to_str(apb_prescaler_for(168000000, 42000000)) + "; ws at 1.8 V: " + int_to_str(flash_wait_states(168000000, 1800)));
+
+    var t: ClockTree = clktree_new();
+    val hsi: i64 = clk_source(&mut t, "HSI", 16000000);
+    val hse: i64 = clk_source(&mut t, "HSE", 8000000);
+    val vco: i64 = clk_mul(&mut t, "VCO", hse, 168, 4, 432000000);
+    val pllp: i64 = clk_div(&mut t, "PLLP", vco, 2, 168000000);
+    var ps: Vec<i64> = Vec::new();
+    ps.push(hsi);
+    ps.push(pllp);
+    val sys: i64 = clk_mux(&mut t, "SYSCLK", ps, 1, 168000000);
+    val ahb: i64 = clk_div(&mut t, "AHB", sys, 1, 168000000);
+    val apb1: i64 = clk_div(&mut t, "APB1", ahb, 4, 42000000);
+    val usart: i64 = clk_gate(&mut t, "USART2", apb1, true);
+    println("tree: SYSCLK " + int_to_str(clk_freq(&t, sys)) + " APB1 " + int_to_str(clk_freq(&t, apb1)) + " USART2 " + int_to_str(clk_freq(&t, usart))
+        + " problems " + int_to_str(clk_check(&t).len()));
+    clk_set_ratio(&mut t, apb1, 1, 2);
+    println("tree: APB1 /2 -> " + str_join(clk_check(&t), "; "));
+    clk_set_ratio(&mut t, apb1, 1, 4);
+    clk_set(&mut t, usart, false);
+    clk_select(&mut t, clk_find(&t, "SYSCLK"), 0);
+    println("tree: USART2 gated " + int_to_str(clk_freq(&t, usart)) + ", SYSCLK on HSI " + int_to_str(clk_freq(&t, sys)));
+
+    var s: PowerSim = powersim_new();
+    power_enter(&mut s, PM_SLEEP);
+    power_wake(&mut s, WAKE_IRQ);
+    s.irq_pending = true;
+    power_enter(&mut s, PM_STOP);
+    s.irq_pending = false;
+    power_enter(&mut s, PM_STOP);
+    s.exti_enabled = true;
+    power_enter(&mut s, PM_STOP);
+    val rtcw: bool = power_wake(&mut s, WAKE_RTC);
+    power_wake(&mut s, WAKE_EXTI);
+    power_restore_pll(&mut s);
+    power_enter(&mut s, PM_SLEEP);
+    power_enter(&mut s, PM_STOP);
+    power_wake(&mut s, WAKE_EXTI);
+    s.wake_sources = s.wake_sources | WAKE_PIN;
+    power_enter(&mut s, PM_STANDBY);
+    power_wake(&mut s, WAKE_PIN);
+    power_enter(&mut s, PM_STANDBY);
+    var i: i64 = 0;
+    while i < s.log.len() {
+        println(s.log.get(i));
+        i = i + 1;
+    }
+    println("rtc wake from STOP when not enabled: " + bool_to_str(rtcw) + "; ram ok " + bool_to_str(s.ram_ok) + ", resets " + int_to_str(s.resets));
+    var modes: Vec<i64> = Vec::new();
+    modes.push(PM_RUN);
+    modes.push(PM_STOP);
+    var durs: Vec<i64> = Vec::new();
+    durs.push(2000);
+    durs.push(998000);
+    var cur: Vec<i64> = Vec::new();
+    cur.push(40000000); cur.push(10000000); cur.push(2000); cur.push(300);
+    val avg: i64 = power_average_na(modes, durs, cur);
+    println("average " + int_to_str(avg) + " nA, 1000 mAh lasts " + int_to_str(power_battery_hours(1000, avg)) + " h");
+}

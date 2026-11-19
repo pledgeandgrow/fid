@@ -1,0 +1,130 @@
+// Fides Unix domain sockets (roadmap L4B `UnixStream`): stream sockets
+// named by a path, on Linux, macOS and Windows 10 1803+ (AF_UNIX).
+//
+// Built on two runtime builtins, p_unix_listen(path) -> fd and
+// p_unix_connect(path) -> fd, each -1 on failure: the C runtime
+// (compiler/codegen_c.fd), native Windows (stdlib/pe_runtime/conc.fd), the
+// machine layer's Linux, macOS and --nat Windows (stdlib/linux_runtime/
+// sys.fd); `fid run` simulates them inside its one process (compiler/
+// interp.fd iux_*: no file at the path, no other process can connect).
+// Everything else is the TCP socket builtins, which work on any stream
+// socket: p_socket_accept, p_socket_write_str, p_socket_recv_str,
+// p_socket_close. Test: tests/bootstrap/test_unix_socket.fd.
+//
+// Usage:
+//   use unix_socket;
+//   match UnixListener::bind("/tmp/app.sock") {
+//       Option::Some(l) => {
+//           var lis: UnixListener = l;
+//           var c: Option<UnixStream> = lis.accept();
+//           ...
+//       }
+//       Option::None => { println("cannot bind"); }
+//   }
+//   match UnixStream::connect("/tmp/app.sock") { ... }
+
+module unix_socket;
+ use vec; use string;
+
+/// The longest socket path (sun_path is 108 bytes with its NUL on Linux
+/// and Windows, 104 on macOS).
+pub const UNIX_PATH_MAX: i64 = 103;
+
+/// A listening Unix socket bound to `path`.
+pub struct UnixListener {
+    pub fd: i64,
+    pub path: str,
+}
+
+/// A connected Unix stream socket.
+pub struct UnixStream {
+    pub fd: i64,
+}
+
+impl UnixListener {
+    /// Listen on `path`. A file left at `path` by an earlier run is
+    /// removed first (a socket path cannot be bound twice). None if the
+    /// path is too long or the socket cannot be bound.
+    pub fn bind(path: str) -> Option<UnixListener> {
+        if str_len(path) == 0 || str_len(path) > UNIX_PATH_MAX {
+            return Option::None;
+        }
+        if p_file_exists(path) != 0 {
+            p_file_delete(path);
+        }
+        val fd: i64 = p_unix_listen(path);
+        if fd < 0 {
+            return Option::None;
+        }
+        return Option::Some(UnixListener { fd: fd, path: path });
+    }
+
+    /// Wait for the next connection.
+    pub fn accept(self: & UnixListener) -> Option<UnixStream> {
+        if self.fd < 0 {
+            return Option::None;
+        }
+        val c: i64 = p_socket_accept(self.fd);
+        if c < 0 {
+            return Option::None;
+        }
+        return Option::Some(UnixStream { fd: c });
+    }
+
+    /// Stop listening and remove the socket's path.
+    pub fn close(self: & mut UnixListener) {
+        if self.fd >= 0 {
+            p_socket_close(self.fd);
+            self.fd = - 1;
+            p_file_delete(self.path);
+        }
+    }
+}
+
+impl UnixStream {
+    /// Connect to the listener at `path`; None if there is none.
+    pub fn connect(path: str) -> Option<UnixStream> {
+        if str_len(path) == 0 || str_len(path) > UNIX_PATH_MAX {
+            return Option::None;
+        }
+        val fd: i64 = p_unix_connect(path);
+        if fd < 0 {
+            return Option::None;
+        }
+        return Option::Some(UnixStream { fd: fd });
+    }
+
+    /// Send all of `s`; false if the connection failed.
+    pub fn write_str(self: & UnixStream, s: str) -> bool {
+        if self.fd < 0 {
+            return false;
+        }
+        var done: i64 = 0;
+        val n: i64 = str_len(s);
+        while done < n {
+            val w: i64 = p_socket_write_str(self.fd, str_slice(s, done, n));
+            if w <= 0 {
+                return false;
+            }
+            done = done + w;
+        }
+        return true;
+    }
+
+    /// What arrives next (waits for at least one byte); "" once the other
+    /// side has closed.
+    pub fn read_str(self: & UnixStream) -> str {
+        if self.fd < 0 {
+            return "";
+        }
+        return p_socket_recv_str(self.fd);
+    }
+
+    /// Close the connection.
+    pub fn close(self: & mut UnixStream) {
+        if self.fd >= 0 {
+            p_socket_close(self.fd);
+            self.fd = - 1;
+        }
+    }
+}

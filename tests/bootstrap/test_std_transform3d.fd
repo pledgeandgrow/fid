@@ -1,0 +1,118 @@
+// stdlib/transform3d: compose/invert/apply of rigid transforms, mat4 round trip, interpolation, and a frame tree (lookup through the common ancestor, update, reparent with cycle check); values checked against numpy
+// Expected output:
+// compose then inverse = identity: true
+// apply = (1.0000, 2.6414, 0.1586)
+// mat4 round trip: true
+// halfway = t=(0.5000, 1.0000, 0.0000) q=(0.9239, 0.0000, 0.0000, 0.3827)
+// frames: 5
+// world_T_gripper = t=(1.0000, 2.6414, 0.1586) q=(0.6533, -0.2706, 0.2706, 0.6533)
+// camera_T_gripper = t=(1.0000, -2.6414, 1.8414) q=(0.2706, 0.6533, -0.6533, 0.2706)
+// tip in camera = (1.0000, -2.7121, 1.9121)
+// gripper_T_camera * camera_T_gripper = identity: true
+// path = gripper -> arm -> base -> world -> camera
+// after moving base = t=(3.0000, -2.6414, 1.8414) q=(0.2706, 0.6533, -0.6533, 0.2706)
+// reparent base under gripper: cycle: gripper is base or below it
+// reparent camera under arm: ok, parent = arm
+// camera_T_arm after reparent = t=(0.0000, 0.0000, 0.0000) q=(1.0000, 0.0000, 0.0000, 0.0000)
+// unknown: unknown frame: lidar
+// duplicate: frame exists: arm
+use math;
+use quat;
+use transform3d;
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn show(r: Result<Transform3, str>) -> str {
+    match r {
+        Result::Ok(t) => {
+            return tf3_to_str(t, 4);
+        }
+        Result::Err(e) => {
+            return e;
+        }
+    }
+}
+
+fn main() -> i64 {
+    val pi: f64 = rmath_pi();
+    val wb: Transform3 = tf3_from_xyz_rpy(1.0, 2.0, 0.0, 0.0, 0.0, pi / 2.0);
+    val ba: Transform3 = tf3_from_xyz_rpy(0.5, 0.0, 0.3, 0.0, pi / 4.0, 0.0);
+    val ag: Transform3 = tf3_translation(vec3(0.2, 0.0, 0.0));
+    val wc: Transform3 = tf3_from_xyz_rpy(0.0, 0.0, 2.0, pi, 0.0, 0.0);
+
+    val wg: Transform3 = tf3_compose(wb, tf3_compose(ba, ag));
+    println("compose then inverse = identity: " + yes(tf3_approx_eq(tf3_compose(tf3_inverse(wg), wg), tf3_identity(), 0.000000001, 0.000000001)));
+    println("apply = " + rmath_vec3_str(tf3_apply(wg, vec3(0.0, 0.0, 0.0)), 4));
+    val back: Transform3 = tf3_from_mat4(tf3_to_mat4(wg));
+    println("mat4 round trip: " + yes(tf3_approx_eq(back, wg, 0.000000001, 0.000000001)));
+    println("halfway = " + tf3_to_str(tf3_interpolate(tf3_identity(), tf3_from_xyz_rpy(1.0, 2.0, 0.0, 0.0, 0.0, pi / 2.0), 0.5), 4));
+
+    var tree: FrameTree = ftree_new("world");
+    ftree_add(&mut tree, "base", "world", wb);
+    ftree_add(&mut tree, "arm", "base", ba);
+    ftree_add(&mut tree, "gripper", "arm", ag);
+    ftree_add(&mut tree, "camera", "world", wc);
+    println("frames: " + int_to_str(ftree_len(&tree)));
+    println("world_T_gripper = " + show(ftree_lookup(&tree, "world", "gripper")));
+    println("camera_T_gripper = " + show(ftree_lookup(&tree, "camera", "gripper")));
+    match ftree_transform_point(&tree, "camera", "gripper", vec3(0.1, 0.0, 0.0)) {
+        Result::Ok(p) => {
+            println("tip in camera = " + rmath_vec3_str(p, 4));
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    match ftree_lookup(&tree, "gripper", "camera") {
+        Result::Ok(gc) => {
+            match ftree_lookup(&tree, "camera", "gripper") {
+                Result::Ok(cg) => {
+                    println("gripper_T_camera * camera_T_gripper = identity: " + yes(tf3_approx_eq(tf3_compose(gc, cg), tf3_identity(), 0.000000001, 0.000000001)));
+                }
+                Result::Err(e) => {
+                    println(e);
+                }
+            }
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    println("path = " + ftree_path(&tree, "camera", "gripper"));
+
+    ftree_set_transform(&mut tree, "base", tf3_from_xyz_rpy(3.0, 2.0, 0.0, 0.0, 0.0, pi / 2.0));
+    println("after moving base = " + show(ftree_lookup(&tree, "camera", "gripper")));
+
+    match ftree_reparent(&mut tree, "base", "gripper", tf3_identity()) {
+        Result::Ok(id) => {
+            println("reparent base under gripper: ok");
+        }
+        Result::Err(e) => {
+            println("reparent base under gripper: " + e);
+        }
+    }
+    match ftree_reparent(&mut tree, "camera", "arm", tf3_identity()) {
+        Result::Ok(id) => {
+            println("reparent camera under arm: ok, parent = " + ftree_parent(&tree, "camera"));
+        }
+        Result::Err(e) => {
+            println("reparent camera under arm: " + e);
+        }
+    }
+    println("camera_T_arm after reparent = " + show(ftree_lookup(&tree, "camera", "arm")));
+    println("unknown: " + show(ftree_lookup(&tree, "lidar", "arm")));
+    match ftree_add(&mut tree, "arm", "world", tf3_identity()) {
+        Result::Ok(id) => {
+            println("duplicate: ok");
+        }
+        Result::Err(e) => {
+            println("duplicate: " + e);
+        }
+    }
+    return 0;
+}

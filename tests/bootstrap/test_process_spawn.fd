@@ -1,0 +1,199 @@
+// AD4: child processes with a time limit (stdlib/process.fd process_spawn,
+// process_spawn_to, process_spawn_files, process_wait, process_kill, process_release,
+// process_run_argv; the runtimes' fid_proc_*). Each child is a program the
+// system has (sh / cmd, sleep / ping), so the commands differ between
+// Windows and POSIX but the output does not. What it checks: an exit code
+// and output captured to a file; stdout and stderr to two files; the
+// environment added and removed and the working directory; a child still
+// running at the time limit, killed, then ended; three children running at
+// once; a program that does not exist; process_run_argv's capture and its
+// time limit.
+//
+// Expected output:
+//   exit code: 3
+//   output: hello
+//   separate stderr: true
+//   env and dir: true
+//   removed variable: true
+//   still running after 200 ms: true
+//   killed: true
+//   ended after kill: true
+//   parallel codes: 0 1 2
+//   missing program: true
+//   run_argv: 0 true
+//   run_argv time limit: true true
+//   done
+
+use process;
+
+fn temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TEMP");
+    names.push("TMP");
+    names.push("TMPDIR");
+    var i: i64 = 0;
+    while i < names.len() {
+        match env_var(names.get(i)) {
+            Option::Some(s) => {
+                if str_len(s) > 0 { return s; }
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+fn sep() -> str {
+    if process_is_windows() { return "\\"; }
+    return "/";
+}
+
+/// A shell running `posix` (sh -c) or `win` (cmd /c).
+fn shell(posix: str, win: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    if process_is_windows() {
+        v.push("cmd");
+        v.push("/d");
+        v.push("/c");
+        v.push(win);
+    } else {
+        v.push("sh");
+        v.push("-c");
+        v.push(posix);
+    }
+    return v;
+}
+
+/// A program that runs for about `secs` seconds and prints little.
+fn sleeper(secs: i64) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    if process_is_windows() {
+        v.push("ping");
+        v.push("-n");
+        v.push(int_to_str(secs + 1));
+        v.push("127.0.0.1");
+    } else {
+        v.push("sleep");
+        v.push(int_to_str(secs));
+    }
+    return v;
+}
+
+fn read_text(path: str) -> str {
+    match read_file(path) {
+        Option::Some(t) => { return t; }
+        Option::None => { }
+    }
+    return "";
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    val tmp: str = temp_dir();
+    val tag: str = int_to_str(p_getpid());
+    val out: str = tmp + sep() + "fid_spawn_" + tag + ".out";
+
+    // an exit code, and the output in a file
+    val h: i64 = process_spawn_to(shell("echo hello; exit 3", "echo hello& exit 3"), Vec::new(), "", out);
+    match process_wait(h, 30000) {
+        Option::Some(c) => { println("exit code: " + int_to_str(c)); }
+        Option::None => { println("exit code: none"); }
+    }
+    process_release(h);
+    println("output: " + str_trim(read_text(out)));
+
+    // stdout and stderr to two files
+    val err: str = tmp + sep() + "fid_spawn_" + tag + ".err";
+    val h1: i64 = process_spawn_files(shell("echo to-out; echo to-err >&2", "echo to-out& echo to-err 1>&2"), Vec::new(), "", out, err);
+    val w1: Option<i64> = process_wait(h1, 30000);
+    process_release(h1);
+    println("separate stderr: " + yes(str_trim(read_text(out)) == "to-out" && str_trim(read_text(err)) == "to-err"));
+    p_file_delete(err);
+
+    // environment and working directory
+    val dir: str = tmp + sep() + "fid_spawn_dir_" + tag;
+    p_mkdir(dir);
+    var env: Vec<str> = Vec::new();
+    env.push("FID_SPAWN_X=abc");
+    val h2: i64 = process_spawn_to(shell("echo $FID_SPAWN_X; pwd", "echo %FID_SPAWN_X%& cd"), env, dir, out);
+    val w2: Option<i64> = process_wait(h2, 30000);
+    process_release(h2);
+    val text2: str = read_text(out);
+    println("env and dir: " + yes(str_contains(text2, "abc") && str_contains(text2, "fid_spawn_dir_" + tag)));
+    var env2: Vec<str> = Vec::new();
+    var gone: str = "HOME";
+    if process_is_windows() { gone = "USERPROFILE"; }
+    env2.push(gone);
+    val h3: i64 = process_spawn_to(shell("if [ -n \"${HOME+x}\" ]; then echo set; else echo unset; fi",
+        "if defined USERPROFILE (echo set) else (echo unset)"), env2, "", out);
+    val w3: Option<i64> = process_wait(h3, 30000);
+    process_release(h3);
+    println("removed variable: " + yes(str_trim(read_text(out)) == "unset"));
+
+    // the time limit, and kill
+    val h4: i64 = process_spawn_to(sleeper(30), Vec::new(), "", out);
+    var running: bool = false;
+    match process_wait(h4, 200) {
+        Option::Some(_) => { }
+        Option::None => { running = true; }
+    }
+    println("still running after 200 ms: " + yes(running));
+    println("killed: " + yes(process_kill(h4)));
+    var ended: bool = false;
+    match process_wait(h4, 10000) {
+        Option::Some(c4) => { ended = c4 != 0; }
+        Option::None => { }
+    }
+    println("ended after kill: " + yes(ended));
+    process_release(h4);
+
+    // three at once
+    var hs: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 3 {
+        hs.push(process_spawn(shell("exit " + int_to_str(k), "exit " + int_to_str(k)), Vec::new(), ""));
+        k = k + 1;
+    }
+    var codes: str = "";
+    k = 0;
+    while k < 3 {
+        match process_wait(hs.get(k), 30000) {
+            Option::Some(c5) => { codes = codes + " " + int_to_str(c5); }
+            Option::None => { codes = codes + " none"; }
+        }
+        process_release(hs.get(k));
+        k = k + 1;
+    }
+    println("parallel codes:" + codes);
+
+    // a program that does not exist: no handle, or exit 127 (POSIX) / 9009
+    // (cmd, the interpreter on Windows)
+    var missing: Vec<str> = Vec::new();
+    missing.push("fid-no-such-program-" + tag);
+    val h6: i64 = process_spawn_to(missing, Vec::new(), "", out);
+    var missing_ok: bool = h6 == 0;
+    if h6 != 0 {
+        match process_wait(h6, 30000) {
+            Option::Some(c6) => { missing_ok = c6 == 127 || c6 == 9009; }
+            Option::None => { }
+        }
+        process_release(h6);
+    }
+    println("missing program: " + yes(missing_ok));
+
+    // process_run_argv
+    val r: ChildResult = process_run_argv(shell("echo captured", "echo captured"), Vec::new(), "", 30000);
+    println("run_argv: " + int_to_str(r.code) + " " + yes(str_trim(r.output) == "captured" && str_len(r.errors) == 0));
+    val r2: ChildResult = process_run_argv(sleeper(30), Vec::new(), "", 300);
+    println("run_argv time limit: " + yes(r2.started) + " " + yes(r2.timed_out));
+
+    p_file_delete(out);
+    p_rmdir(dir);
+    println("done");
+    return 0;
+}

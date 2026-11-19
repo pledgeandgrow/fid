@@ -1,0 +1,474 @@
+// Fides DMA building blocks, pure Fides.
+//
+//   - cache-line arithmetic: alignment, the line range a buffer covers,
+//     whether a device-to-memory buffer shares lines with other data (and
+//     so needs a bounce buffer: invalidating those lines would destroy the
+//     neighbours' writes), and the maintenance plan for a transfer
+//     (clean before memory-to-device, invalidate after device-to-memory);
+//   - scatter-gather lists: split a buffer at a segment limit and at an
+//     address boundary the engine cannot cross (64 KiB for many
+//     engines, 4 KiB pages), merge contiguous entries, count bytes;
+//   - a descriptor ring with ownership handoff: 16-byte descriptors
+//     {u64 buffer address, u32 control, u32 next/status}; the driver
+//     fills descriptors and sets OWN, the device clears OWN when done;
+//     multi-descriptor transfers are marked SOP..EOP; WRAP marks the last
+//     slot; the driver reaps completed transfers in order;
+//   - a channel state machine (idle, configured, running, paused, done,
+//     error) with the transitions engines allow.
+//
+// The seam: real descriptors live in DMA-coherent memory the device reads
+// and the doorbell is an MMIO write; here descriptors are values and
+// dmadesc_bytes() gives their exact in-memory bytes for the caller to copy.
+// DmaSimDevice is a software engine over a byte-array memory (DmaMem)
+// that consumes the ring exactly as hardware would, for tests.
+
+module dma;
+ use vec; use string;
+
+// ─── Cache lines ────────────────────────────────────────────────────────
+
+pub fn dma_align_up(x: i64, a: i64) -> i64 {
+    return (x + a - 1) / a * a;
+}
+
+pub fn dma_align_down(x: i64, a: i64) -> i64 {
+    return x / a * a;
+}
+
+pub fn dma_is_aligned(x: i64, a: i64) -> bool {
+    return x % a == 0;
+}
+
+/// First cache line address and number of lines [addr, addr+len) touches.
+pub fn dma_line_start(addr: i64, line: i64) -> i64 {
+    return dma_align_down(addr, line);
+}
+
+pub fn dma_line_count(addr: i64, len: i64, line: i64) -> i64 {
+    if len <= 0 { return 0; }
+    return (dma_align_up(addr + len, line) - dma_align_down(addr, line)) / line;
+}
+
+/// A device-to-memory buffer that does not start and end on line
+/// boundaries shares its first or last line with other data.
+pub fn dma_needs_bounce(addr: i64, len: i64, line: i64) -> bool {
+    return !dma_is_aligned(addr, line) || !dma_is_aligned(addr + len, line);
+}
+
+pub const DMA_TO_DEVICE: i64 = 1;
+pub const DMA_FROM_DEVICE: i64 = 2;
+pub const DMA_BIDIRECTIONAL: i64 = 3;
+
+/// The cache operations around a transfer, as text lines:
+/// "clean 0x...+N lines" before, "invalidate ..." after.
+pub fn dma_cache_plan(addr: i64, len: i64, line: i64, dir: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val s: i64 = dma_line_start(addr, line);
+    val n: i64 = dma_line_count(addr, len, line);
+    val what: str = int_to_str(s) + "+" + int_to_str(n) + " lines";
+    if dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL { out.push("before: clean " + what); }
+    if dir == DMA_FROM_DEVICE {
+        if dma_needs_bounce(addr, len, line) {
+            out.push("before: clean+invalidate " + what + " (shared lines)");
+        } else {
+            out.push("before: invalidate " + what);
+        }
+    }
+    if dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL { out.push("after: invalidate " + what); }
+    return out;
+}
+
+// ─── Scatter-gather ─────────────────────────────────────────────────────
+
+pub struct SgEntry {
+    pub addr: i64,
+    pub len: i64,
+}
+
+/// Split [addr, addr+len) into entries no longer than `max_seg` and not
+/// crossing a multiple of `boundary` (0: no boundary).
+pub fn dma_sg_split(addr: i64, len: i64, max_seg: i64, boundary: i64) -> Vec<SgEntry> {
+    var out: Vec<SgEntry> = Vec::new();
+    var a: i64 = addr;
+    var left: i64 = len;
+    while left > 0 {
+        var n: i64 = left;
+        if n > max_seg { n = max_seg; }
+        if boundary > 0 {
+            val to_b: i64 = dma_align_down(a, boundary) + boundary - a;
+            if n > to_b { n = to_b; }
+        }
+        out.push(SgEntry { addr: a, len: n });
+        a = a + n;
+        left = left - n;
+    }
+    return out;
+}
+
+/// Split every entry of a list (several buffers) with the same limits.
+pub fn dma_sg_split_all(list: Vec<SgEntry>, max_seg: i64, boundary: i64) -> Vec<SgEntry> {
+    var out: Vec<SgEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < list.len() {
+        val parts: Vec<SgEntry> = dma_sg_split(list.get(i).addr, list.get(i).len, max_seg, boundary);
+        var j: i64 = 0;
+        while j < parts.len() {
+            out.push(parts.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Merge entries where one ends where the next starts, while the merged
+/// entry stays within `max_seg` and does not cross `boundary`.
+pub fn dma_sg_coalesce(list: Vec<SgEntry>, max_seg: i64, boundary: i64) -> Vec<SgEntry> {
+    var out: Vec<SgEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < list.len() {
+        val e: SgEntry = list.get(i);
+        if out.len() > 0 {
+            var last: SgEntry = out.get(out.len() - 1);
+            val nl: i64 = last.len + e.len;
+            var crosses: bool = false;
+            if boundary > 0 {
+                crosses = dma_align_down(last.addr, boundary) != dma_align_down(last.addr + nl - 1, boundary);
+            }
+            if last.addr + last.len == e.addr && nl <= max_seg && !crosses {
+                last.len = nl;
+                out.set(out.len() - 1, last);
+                i = i + 1;
+                continue;
+            }
+        }
+        out.push(e);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn dma_sg_total(list: Vec<SgEntry>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < list.len() {
+        t = t + list.get(i).len;
+        i = i + 1;
+    }
+    return t;
+}
+
+pub fn dma_sg_to_str(list: Vec<SgEntry>) -> str {
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < list.len() {
+        parts.push(int_to_str(list.get(i).addr) + ":" + int_to_str(list.get(i).len));
+        i = i + 1;
+    }
+    return "[" + str_join(parts, " ") + "]";
+}
+
+// ─── Descriptors ────────────────────────────────────────────────────────
+
+// Control word: length 15:0, status 23:16 (written by the device),
+// EOP 24, SOP 25, IRQ 26 (interrupt on completion), WRAP 27, OWN 31.
+pub const DMAD_EOP: i64 = 0x01000000;
+pub const DMAD_SOP: i64 = 0x02000000;
+pub const DMAD_IRQ: i64 = 0x04000000;
+pub const DMAD_WRAP: i64 = 0x08000000;
+pub const DMAD_OWN: i64 = 0x80000000;
+pub const DMAD_MAX_LEN: i64 = 0xFFFF;
+
+/// Status codes in the control word after completion.
+pub const DMAS_OK: i64 = 0;
+pub const DMAS_BUS_ERROR: i64 = 1;
+pub const DMAS_TRUNCATED: i64 = 2;
+
+pub struct DmaDesc {
+    pub addr: i64,
+    pub ctrl: i64,
+    pub aux: i64,
+}
+
+pub fn dmadesc_len(d: DmaDesc) -> i64 {
+    return d.ctrl & 0xFFFF;
+}
+
+pub fn dmadesc_status(d: DmaDesc) -> i64 {
+    return (d.ctrl >> 16) & 0xFF;
+}
+
+pub fn dmadesc_owned(d: DmaDesc) -> bool {
+    return (d.ctrl & DMAD_OWN) != 0;
+}
+
+/// The 16 bytes of a descriptor in memory (little-endian).
+pub fn dmadesc_bytes(d: DmaDesc) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        out.push((d.addr >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 4 {
+        out.push((d.ctrl >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 4 {
+        out.push((d.aux >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse 16 bytes back into a descriptor.
+pub fn dmadesc_from_bytes(b: Vec<i64>, at: i64) -> DmaDesc {
+    var addr: i64 = 0;
+    var i: i64 = 7;
+    while i >= 0 {
+        addr = (addr << 8) | b.get(at + i);
+        i = i - 1;
+    }
+    var ctrl: i64 = 0;
+    i = 3;
+    while i >= 0 {
+        ctrl = (ctrl << 8) | b.get(at + 8 + i);
+        i = i - 1;
+    }
+    var aux: i64 = 0;
+    i = 3;
+    while i >= 0 {
+        aux = (aux << 8) | b.get(at + 12 + i);
+        i = i - 1;
+    }
+    return DmaDesc { addr: addr, ctrl: ctrl, aux: aux };
+}
+
+// ─── Ring ───────────────────────────────────────────────────────────────
+
+/// A ring of `size` descriptors (a power of two). `head` is the next slot
+/// the driver fills, `tail` the next one it reaps; `used` slots are in
+/// flight.
+pub struct DmaRing {
+    pub size: i64,
+    pub descs: Vec<DmaDesc>,
+    pub head: i64,
+    pub tail: i64,
+    pub used: i64,
+    pub doorbells: i64,
+}
+
+pub fn dmaring_new(size: i64) -> DmaRing {
+    if size < 2 || (size & (size - 1)) != 0 { p_panic("dma: ring size must be a power of two >= 2"); }
+    var r: DmaRing = DmaRing { size: size, descs: Vec::new(), head: 0, tail: 0, used: 0, doorbells: 0 };
+    var i: i64 = 0;
+    while i < size {
+        var c: i64 = 0;
+        if i == size - 1 { c = DMAD_WRAP; }
+        r.descs.push(DmaDesc { addr: 0, ctrl: c, aux: 0 });
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn dmaring_free(r: &DmaRing) -> i64 {
+    return r.size - r.used;
+}
+
+/// Queue one transfer made of the entries of `sg` (each <= DMAD_MAX_LEN).
+/// The first descriptor gets SOP, the last EOP (and IRQ when `irq`); OWN
+/// is set on the first descriptor last, so the device never sees a half
+/// written chain. Returns the first slot, -1 when the ring is too full.
+pub fn dmaring_submit(r: &mut DmaRing, sg: Vec<SgEntry>, irq: bool, tag: i64) -> i64 {
+    val n: i64 = sg.len();
+    if n == 0 || n > dmaring_free(r) { return -1; }
+    val first: i64 = r.head;
+    var k: i64 = n - 1;
+    while k >= 0 {
+        val e: SgEntry = sg.get(k);
+        if e.len <= 0 || e.len > DMAD_MAX_LEN { p_panic("dma: segment length " + int_to_str(e.len) + " out of range"); }
+        val slot: i64 = (first + k) & (r.size - 1);
+        var c: i64 = e.len | (r.descs.get(slot).ctrl & DMAD_WRAP);
+        if k == 0 { c = c | DMAD_SOP; }
+        if k == n - 1 {
+            c = c | DMAD_EOP;
+            if irq { c = c | DMAD_IRQ; }
+        }
+        if k != 0 { c = c | DMAD_OWN; }
+        r.descs.set(slot, DmaDesc { addr: e.addr, ctrl: c, aux: tag });
+        k = k - 1;
+    }
+    // Hand the chain over: OWN on the first descriptor, then the doorbell.
+    var d0: DmaDesc = r.descs.get(first);
+    d0.ctrl = d0.ctrl | DMAD_OWN;
+    r.descs.set(first, d0);
+    r.head = (first + n) & (r.size - 1);
+    r.used = r.used + n;
+    r.doorbells = r.doorbells + 1;
+    return first;
+}
+
+/// A completed transfer.
+pub struct DmaDone {
+    pub first: i64,
+    pub count: i64,
+    pub bytes: i64,
+    pub status: i64,
+    pub tag: i64,
+}
+
+/// Reap the oldest transfer if the device has given all its descriptors
+/// back (OWN clear from SOP to EOP). `count` 0: nothing completed yet.
+pub fn dmaring_reap(r: &mut DmaRing) -> DmaDone {
+    var none: DmaDone = DmaDone { first: r.tail, count: 0, bytes: 0, status: 0, tag: 0 };
+    if r.used == 0 { return none; }
+    var slot: i64 = r.tail;
+    var n: i64 = 0;
+    var bytes: i64 = 0;
+    var status: i64 = 0;
+    while n < r.used {
+        val d: DmaDesc = r.descs.get(slot);
+        if dmadesc_owned(d) { return none; }
+        n = n + 1;
+        bytes = bytes + dmadesc_len(d);
+        if dmadesc_status(d) != 0 { status = dmadesc_status(d); }
+        if (d.ctrl & DMAD_EOP) != 0 {
+            val done: DmaDone = DmaDone { first: r.tail, count: n, bytes: bytes, status: status, tag: d.aux };
+            r.tail = (r.tail + n) & (r.size - 1);
+            r.used = r.used - n;
+            return done;
+        }
+        slot = (slot + 1) & (r.size - 1);
+    }
+    return none;
+}
+
+// ─── A simulated engine ─────────────────────────────────────────────────
+
+/// Byte-addressed memory for the simulated engine.
+pub struct DmaMem {
+    pub base: i64,
+    pub bytes: Vec<i64>,
+}
+
+pub fn dmamem_new(base: i64, size: i64) -> DmaMem {
+    return DmaMem { base: base, bytes: Vec::filled(size, 0) };
+}
+
+pub fn dmamem_in_range(m: &DmaMem, addr: i64, len: i64) -> bool {
+    return addr >= m.base && addr + len <= m.base + m.bytes.len();
+}
+
+/// A memory-to-memory engine: each transfer copies its buffers, in order,
+/// into the destination stream starting at `dst`. `pos` is the device's
+/// next slot, `irqs` counts completion interrupts raised.
+pub struct DmaSimDevice {
+    pub pos: i64,
+    pub dst: i64,
+    pub irqs: i64,
+}
+
+pub fn dmasim_new(dst: i64) -> DmaSimDevice {
+    return DmaSimDevice { pos: 0, dst: dst, irqs: 0 };
+}
+
+/// Process up to `budget` descriptors the device owns, as hardware: copy,
+/// write status into the control word, clear OWN. A buffer outside
+/// memory completes with DMAS_BUS_ERROR. Returns descriptors processed.
+pub fn dmasim_run(dev: &mut DmaSimDevice, r: &mut DmaRing, m: &mut DmaMem, budget: i64) -> i64 {
+    var done: i64 = 0;
+    while done < budget {
+        var d: DmaDesc = r.descs.get(dev.pos);
+        if !dmadesc_owned(d) { return done; }
+        val len: i64 = dmadesc_len(d);
+        var st: i64 = DMAS_OK;
+        if !dmamem_in_range(m, d.addr, len) || !dmamem_in_range(m, dev.dst, len) {
+            st = DMAS_BUS_ERROR;
+        } else {
+            var i: i64 = 0;
+            while i < len {
+                m.bytes.set(dev.dst - m.base + i, m.bytes.get(d.addr - m.base + i));
+                i = i + 1;
+            }
+            dev.dst = dev.dst + len;
+        }
+        d.ctrl = (d.ctrl & ~DMAD_OWN & ~0xFF0000) | (st << 16);
+        r.descs.set(dev.pos, d);
+        if (d.ctrl & DMAD_EOP) != 0 && (d.ctrl & DMAD_IRQ) != 0 { dev.irqs = dev.irqs + 1; }
+        if (d.ctrl & DMAD_WRAP) != 0 { dev.pos = 0; } else { dev.pos = dev.pos + 1; }
+        done = done + 1;
+    }
+    return done;
+}
+
+// ─── Channel state machine ──────────────────────────────────────────────
+
+pub const DMACH_IDLE: i64 = 0;
+pub const DMACH_CONFIGURED: i64 = 1;
+pub const DMACH_RUNNING: i64 = 2;
+pub const DMACH_PAUSED: i64 = 3;
+pub const DMACH_DONE: i64 = 4;
+pub const DMACH_ERROR: i64 = 5;
+
+pub const DMAEV_CONFIGURE: i64 = 0;
+pub const DMAEV_START: i64 = 1;
+pub const DMAEV_PAUSE: i64 = 2;
+pub const DMAEV_RESUME: i64 = 3;
+pub const DMAEV_COMPLETE: i64 = 4;
+pub const DMAEV_FAULT: i64 = 5;
+pub const DMAEV_ABORT: i64 = 6;
+pub const DMAEV_RESET: i64 = 7;
+
+pub fn dmach_state_name(s: i64) -> str {
+    val n: Vec<str> = str_split("idle,configured,running,paused,done,error", ",");
+    if s >= 0 && s < n.len() { return n.get(s); }
+    return "?";
+}
+
+pub fn dmach_event_name(e: i64) -> str {
+    val n: Vec<str> = str_split("configure,start,pause,resume,complete,fault,abort,reset", ",");
+    if e >= 0 && e < n.len() { return n.get(e); }
+    return "?";
+}
+
+/// The next state, or -1 when the engine does not allow the event there.
+/// configure: idle/done -> configured; start: configured -> running;
+/// pause/resume between running and paused; complete: running -> done;
+/// fault: running/paused -> error; abort: configured/running/paused ->
+/// idle; reset: any -> idle.
+pub fn dmach_next(s: i64, e: i64) -> i64 {
+    if e == DMAEV_RESET { return DMACH_IDLE; }
+    if e == DMAEV_CONFIGURE && (s == DMACH_IDLE || s == DMACH_DONE) { return DMACH_CONFIGURED; }
+    if e == DMAEV_START && s == DMACH_CONFIGURED { return DMACH_RUNNING; }
+    if e == DMAEV_PAUSE && s == DMACH_RUNNING { return DMACH_PAUSED; }
+    if e == DMAEV_RESUME && s == DMACH_PAUSED { return DMACH_RUNNING; }
+    if e == DMAEV_COMPLETE && s == DMACH_RUNNING { return DMACH_DONE; }
+    if e == DMAEV_FAULT && (s == DMACH_RUNNING || s == DMACH_PAUSED) { return DMACH_ERROR; }
+    if e == DMAEV_ABORT && (s == DMACH_CONFIGURED || s == DMACH_RUNNING || s == DMACH_PAUSED) { return DMACH_IDLE; }
+    return -1;
+}
+
+pub struct DmaChannel {
+    pub state: i64,
+    pub history: Vec<str>,
+    pub rejected: i64,
+}
+
+pub fn dmach_new() -> DmaChannel {
+    return DmaChannel { state: DMACH_IDLE, history: Vec::new(), rejected: 0 };
+}
+
+/// Apply an event; false (state unchanged) when not allowed.
+pub fn dmach_event(c: &mut DmaChannel, e: i64) -> bool {
+    val n: i64 = dmach_next(c.state, e);
+    if n < 0 {
+        c.rejected = c.rejected + 1;
+        c.history.push(dmach_event_name(e) + "!");
+        return false;
+    }
+    c.history.push(dmach_event_name(e) + "->" + dmach_state_name(n));
+    c.state = n;
+    return true;
+}

@@ -1,0 +1,34 @@
+// Expected to fail at run time (complaint CA9): a panic in a task prints,
+// after the task's own stack trace, the chain of tasks it runs for. main
+// awaits a, a awaits b, b yields once (so it resumes from the scheduler,
+// with a waiting for it) and then panics. The C runtime prints
+//     Panic: b failed
+//     ...
+//     task chain: b <- a <- main
+// and the program exits with status 1; "after" is never printed
+// (tests/memprof/check.sh checks the chain line).
+
+async fn leaf(x: i64) -> Future<i64> {
+    return x;
+}
+
+async fn b(x: i64) -> Future<i64> {
+    val y: i64 = await leaf(x);
+    p_co_yield();
+    if y == 3 {
+        panic("b failed");
+    }
+    return y;
+}
+
+async fn a(x: i64) -> Future<i64> {
+    val r: i64 = await b(x);
+    return r + 1;
+}
+
+fn main() -> i64 {
+    println("start");
+    val r: i64 = await a(3);
+    println("after " + int_to_str(r));
+    return 0;
+}

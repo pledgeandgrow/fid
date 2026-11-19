@@ -1,0 +1,173 @@
+// RL3 (llvm roadmap): every rule family of the e-graph (compiler/egraph.fd
+// eg_round; native paths) has an operation here for it to rewrite, so the
+// pass matrix can turn each family off on its own (FID_EGRAPH_OFF=comm,
+// flip, fold, ident, zero, double, shift, reassoc, same, unaryfold, invol,
+// castfold, idcast, float, or all) and see the same lines.
+// tests/tooling/egraph-rules-off-check.sh emits it with each one off.
+//
+// Expected output:
+// 77
+// 15
+// 0
+// 43
+// 40
+// 3
+// 42
+// 40
+// 17
+// 125
+// -11
+// 1012
+// -7
+// 307
+// 42
+// 3037
+
+// comm: a + b and b + a are one value
+fn comm(a: i64, b: i64) -> i64 {
+    var x: i64 = a + b;
+    var y: i64 = b + a;
+    return x * 10 + y;
+}
+
+// flip: a < b is b > a, a <= b is b >= a
+fn flip(a: i64, b: i64) -> i64 {
+    var r: i64 = 0;
+    if a < b {
+        r = r + 1;
+    }
+    if b > a {
+        r = r + 2;
+    }
+    if a <= b {
+        r = r + 4;
+    }
+    if b >= a {
+        r = r + 8;
+    }
+    return r;
+}
+
+// fold: an operation of two constants
+fn fold(a: i64) -> i64 {
+    var c: i64 = 6;
+    var d: i64 = 7;
+    return c * d + a;
+}
+
+// ident: x + 0, x * 1, x - 0, x | 0, x ^ 0, x & -1, x << 0, x >> 0, x / 1
+fn ident(x: i64) -> i64 {
+    return (x + 0) * 1 + (x - 0) + (x | 0) + (x ^ 0) + (x & (0 - 1)) + (x << 0) + (x >> 0) + x / 1;
+}
+
+// zero: x * 0 and x & 0
+fn zero(x: i64) -> i64 {
+    return x * 0 + (x & 0) + 3;
+}
+
+// double: x * 2 = x + x
+fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+// shift: x * 8 = x << 3 where overflow wraps
+@wrapping
+fn shift(x: i64) -> i64 {
+    return x * 8;
+}
+
+// reassoc: (x + 3) + 4 = x + 7 where overflow wraps
+@wrapping
+fn reassoc(x: i64) -> i64 {
+    return (x + 3) + 4;
+}
+
+// same: x - x, x ^ x, x & x, x | x, x == x, x != x, x < x, x <= x
+fn same(x: i64) -> i64 {
+    var r: i64 = (x - x) + (x ^ x) + (x & x) + (x | x);
+    if x == x {
+        r = r + 100;
+    }
+    if x != x {
+        r = r + 1000;
+    }
+    if x < x {
+        r = r + 10000;
+    }
+    if x <= x {
+        r = r + 7;
+    }
+    return r;
+}
+
+// unaryfold: -c, ~c, !c of constants
+fn unaryfold() -> i64 {
+    var c: i64 = 5;
+    var b: bool = true;
+    var r: i64 = -c + ~c;
+    if !b {
+        r = r + 100;
+    }
+    return r;
+}
+
+// invol: ~~x = x, !!b = b
+fn invol(x: i64, b: bool) -> i64 {
+    var r: i64 = ~(~x);
+    if !(!b) {
+        r = r + 1000;
+    }
+    return r;
+}
+
+// invol: -(-x) = x where overflow wraps
+@wrapping
+fn wneg(x: i64) -> i64 {
+    return -(-x);
+}
+
+// castfold: casts of constants
+fn castfold() -> i64 {
+    var c: i32 = 300;
+    var d: i64 = c as i64;
+    var e: u8 = 7;
+    return d + (e as i64);
+}
+
+// idcast: a cast to the value's own type
+fn idcast(x: i64) -> i64 {
+    return (x as i64) + 1;
+}
+
+// float: a < b is b > a, x * 1.0 = x, x / 1.0 = x, x - 0.0 = x
+fn float(a: f64, b: f64) -> i64 {
+    var r: i64 = 0;
+    if a < b {
+        r = r + 1;
+    }
+    if b > a {
+        r = r + 2;
+    }
+    var c: f64 = a * 1.0 + b / 1.0 - 0.0;
+    return r * 1000 + (c * 10.0) as i64;
+}
+
+fn main() -> i64 {
+    println(comm(3, 4));
+    println(flip(3, 4));
+    println(flip(5, 4));
+    println(fold(1));
+    println(ident(5));
+    println(zero(9));
+    println(double(21));
+    println(shift(5));
+    println(reassoc(10));
+    println(same(9));
+    println(unaryfold());
+    println(invol(12, true));
+    println(wneg(0 - 7));
+    println(castfold());
+    println(idcast(41));
+    println(float(1.5, 2.25));
+    return 0;
+}

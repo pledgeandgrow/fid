@@ -1,0 +1,83 @@
+// stdlib/biometrics: availability codes of both platforms, authenticator
+// sets per API level, prompt checks, error mapping with the next action,
+// and the session state machine (failures to lockout, lockout expiry,
+// credential success, iOS replies). The platform calls are data here.
+// Expected output:
+// android available hw-unavailable not-enrolled no-hardware security-update unsupported unknown
+// ios available no-hardware not-enrolled locked-out passcode-not-set
+// kinds 1 2 3 0 fingerprint-first 1
+// authenticators strong true weak|cred true cred@29 false cred@30 true strong|cred@29 false strong|cred@31 true bad false
+// policy 1 2
+// android prompt ok 0
+// android prompt errors no negative button when the device credential is allowed | authenticators not supported on API 28
+// ios prompt errors localizedReason must not be empty | NSFaceIDUsageDescription missing from Info.plist
+// errors negative-button fallback/fallback user-canceled/give-up lockout/wait lockout-permanent/fallback timeout/retry
+// ios errors not-recognized user-canceled fallback system-canceled not-available lockout-permanent error
+// failures not-recognized x4 then lockout state 4 start@10000 false start@40001 true
+// credential success true state 2 failures 0
+// ios reply fallback state 3; success state 2
+// calls 7 canAuthenticate (I)I ios evaluatePolicy:localizedReason:reply: v@:q@@?
+use biometrics;
+use vec;
+use string;
+
+fn join(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() { if i > 0 { s = s + " | "; } s = s + v.get(i); i = i + 1; }
+    return s;
+}
+
+fn an(code: i64) -> str { return bio_availability_name(bio_android_availability(code)); }
+fn rn(r: i64) -> str { return bio_result_name(r); }
+
+fn main() {
+    println("android " + an(0) + " " + an(1) + " " + an(11) + " " + an(12) + " " + an(15) + " " + an(-2) + " " + an(-1));
+    println("ios " + bio_availability_name(bio_ios_availability(true, 0)) + " " + bio_availability_name(bio_ios_availability(false, -6)) + " "
+        + bio_availability_name(bio_ios_availability(false, -7)) + " " + bio_availability_name(bio_ios_availability(false, -8)) + " "
+        + bio_availability_name(bio_ios_availability(false, -5)));
+    println("kinds " + int_to_str(bio_ios_kind(1)) + " " + int_to_str(bio_ios_kind(2)) + " " + int_to_str(bio_ios_kind(4)) + " "
+        + int_to_str(bio_ios_kind(0)) + " fingerprint-first " + int_to_str(bio_android_kind(true, true, false)));
+    println("authenticators strong " + bool_to_str(bio_android_authenticators_ok(BIO_STRONG, 28))
+        + " weak|cred " + bool_to_str(bio_android_authenticators_ok(BIO_WEAK | BIO_DEVICE_CREDENTIAL, 28))
+        + " cred@29 " + bool_to_str(bio_android_authenticators_ok(BIO_DEVICE_CREDENTIAL, 29))
+        + " cred@30 " + bool_to_str(bio_android_authenticators_ok(BIO_DEVICE_CREDENTIAL, 30))
+        + " strong|cred@29 " + bool_to_str(bio_android_authenticators_ok(BIO_STRONG | BIO_DEVICE_CREDENTIAL, 29))
+        + " strong|cred@31 " + bool_to_str(bio_android_authenticators_ok(BIO_STRONG | BIO_DEVICE_CREDENTIAL, 31))
+        + " bad " + bool_to_str(bio_android_authenticators_ok(0x1000, 33)));
+    println("policy " + int_to_str(bio_ios_policy(BIO_STRONG)) + " " + int_to_str(bio_ios_policy(BIO_WEAK | BIO_DEVICE_CREDENTIAL)));
+    val p: BioPrompt = bio_prompt_new("Sign in", "Unlock your vault");
+    println("android prompt ok " + int_to_str(bio_prompt_check_android(&p, 33).len()));
+    var q: BioPrompt = bio_prompt_new("Pay", "");
+    q.authenticators = BIO_STRONG | BIO_DEVICE_CREDENTIAL;
+    println("android prompt errors " + join(bio_prompt_check_android(&q, 28)));
+    println("ios prompt errors " + join(bio_prompt_check_ios(&q, BIO_KIND_FACE, false)));
+    println("errors negative-button " + rn(bio_android_error(13)) + "/" + bio_next_action(bio_android_error(13))
+        + " " + rn(bio_android_error(10)) + "/" + bio_next_action(bio_android_error(10))
+        + " " + rn(bio_android_error(7)) + "/" + bio_next_action(bio_android_error(7))
+        + " " + rn(bio_android_error(9)) + "/" + bio_next_action(bio_android_error(9))
+        + " " + rn(bio_android_error(3)) + "/" + bio_next_action(bio_android_error(3)));
+    println("ios errors " + rn(bio_ios_error(-1)) + " " + rn(bio_ios_error(-2)) + " " + rn(bio_ios_error(-3)) + " "
+        + rn(bio_ios_error(-4)) + " " + rn(bio_ios_error(-7)) + " " + rn(bio_ios_error(-8)) + " " + rn(bio_ios_error(-10)));
+
+    var s: BioSession = bio_session_new();
+    bio_session_start(&mut s, 0);
+    var r: i64 = 0;
+    var k: i64 = 0;
+    while k < 4 { r = bio_session_android_failed(&mut s, 1000); k = k + 1; }
+    val r5: i64 = bio_session_android_failed(&mut s, 1000);
+    println("failures " + rn(r) + " x4 then " + rn(r5) + " state " + int_to_str(s.state) + " start@10000 "
+        + bool_to_str(bio_session_start(&mut s, 10000)) + " start@40001 " + bool_to_str(bio_session_start(&mut s, 40001)));
+    bio_session_android_succeeded(&mut s, 1, 41000);
+    println("credential success " + bool_to_str(s.used_credential) + " state " + int_to_str(s.state) + " failures " + int_to_str(s.failures));
+    var t: BioSession = bio_session_new();
+    bio_session_start(&mut t, 0);
+    val ir: i64 = bio_session_ios(&mut t, false, -3, 0);
+    val st1: i64 = t.state;
+    bio_session_start(&mut t, 1);
+    bio_session_ios(&mut t, true, 0, 2);
+    println("ios reply " + rn(ir) + " state " + int_to_str(st1) + "; success state " + int_to_str(t.state));
+    val ac: Vec<BioCall> = bio_android_calls();
+    val ic: Vec<BioCall> = bio_ios_calls();
+    println("calls " + int_to_str(ac.len()) + " " + ac.get(1).method + " " + ac.get(1).sig + " ios " + ic.get(2).method + " " + ic.get(2).sig);
+}

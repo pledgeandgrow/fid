@@ -1,0 +1,228 @@
+// RL11 (docs/roadmap/llvm-roadmap.md): mutation testing of the backend.
+// Every rewrite rule of compiler/rules.fd, and the identities the e-graph
+// (compiler/egraph.fd) knows, has an operation here whose result is
+// printed, on values the program only knows at run time (they come from a
+// Vec, so no pass can fold them first). A rule broken on purpose
+// (FID_NAT_MUTATE=rule<N>: a wrong result where the rule applies;
+// rulec<N>: the rule matching the wrong constant, `x + 0 = x` read as
+// `x + 1 = x`; eg<family>: an e-graph family broken) changes a line, so
+// scripts/mutation-check.sh sees the suite fail. On every backend the
+// lines below are what the program prints.
+//
+// Expected output:
+// 25
+// 25
+// 17
+// 42
+// 42
+// 10
+// 3
+// 3
+// 22
+// 22
+// 19
+// 19
+// 42
+// 9
+// 273
+// 0
+// 42
+// 164
+// 1
+// -6
+
+// rulec: the constant one past each identity's own
+fn add1(x: i64) -> i64 {
+    return x + 1;
+}
+
+fn one_add(x: i64) -> i64 {
+    return 1 + x;
+}
+
+fn sub1(x: i64) -> i64 {
+    return x - 1;
+}
+
+fn mul2(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn two_mul(x: i64) -> i64 {
+    return 2 * x;
+}
+
+fn div2(x: i64) -> i64 {
+    return x / 2;
+}
+
+fn and1(x: i64) -> i64 {
+    return x & 1;
+}
+
+fn one_and(x: i64) -> i64 {
+    return 1 & x;
+}
+
+fn or1(x: i64) -> i64 {
+    return x | 1;
+}
+
+fn one_or(x: i64) -> i64 {
+    return 1 | x;
+}
+
+fn xor1(x: i64) -> i64 {
+    return x ^ 1;
+}
+
+fn one_xor(x: i64) -> i64 {
+    return 1 ^ x;
+}
+
+fn shl1(x: i64) -> i64 {
+    return x << 1;
+}
+
+fn shr1(x: i64) -> i64 {
+    return x >> 1;
+}
+
+// rule<N>: each identity where it applies (13 forms of x, so 13 * x)
+fn idents(x: i64) -> i64 {
+    var m1: i64 = 0 - 1;
+    return (x + 0) + (0 + x) + (x - 0) + (x * 1) + (1 * x) + (x / 1) + (x & m1) + (x | 0) + (0 | x) + (x ^ 0) + (0 ^ x) + (x << 0) + (x >> 0);
+}
+
+// x * 0, 0 * x, x & 0, 0 & x are 0
+fn zeros(x: i64) -> i64 {
+    return (x * 0) + (0 * x) + (x & 0) + (0 & x);
+}
+
+// x - x = 0, x ^ x = 0, x & x = x, x | x = x: 2 * x
+fn sames(x: i64) -> i64 {
+    var a: i64 = x - x;
+    var b: i64 = x ^ x;
+    var c: i64 = x & x;
+    var d: i64 = x | x;
+    return a + b + c + d;
+}
+
+// x == x, x <= x, x >= x hold; x != x, x < x, x > x do not: 1 + 8 + 32
+fn cmps(x: i64) -> i64 {
+    var r: i64 = 0;
+    if x == x {
+        r = r + 1;
+    }
+    if x != x {
+        r = r + 2;
+    }
+    if x < x {
+        r = r + 4;
+    }
+    if x <= x {
+        r = r + 8;
+    }
+    if x > x {
+        r = r + 16;
+    }
+    if x >= x {
+        r = r + 32;
+    }
+    return r;
+}
+
+// e-graph: x * 2 = x + x and a constant fold the program cannot see
+// before the loop has run
+fn double_fold(x: i64, k: i64) -> i64 {
+    var c: i64 = k * 3;
+    var d: i64 = c + 4;
+    return x * 2 + d - k * 3 - 4;
+}
+
+// e-graph: a < b and b > a
+fn flips(a: i64, b: i64) -> i64 {
+    var r: i64 = 0;
+    if a < b {
+        r = r + 1;
+    }
+    if b > a {
+        r = r + 2;
+    }
+    return r - 3 + (a - b);
+}
+
+fn main() -> i64 {
+    var xs: Vec<i64> = Vec::new();
+    xs.push(5);
+    xs.push(0 - 3);
+    xs.push(12);
+    xs.push(7);
+    // each line: the sum over xs of f(x) (flips: weighted by i + 2)
+    var s_add1: i64 = 0;
+    var s_one_add: i64 = 0;
+    var s_sub1: i64 = 0;
+    var s_mul2: i64 = 0;
+    var s_two_mul: i64 = 0;
+    var s_div2: i64 = 0;
+    var s_and1: i64 = 0;
+    var s_one_and: i64 = 0;
+    var s_or1: i64 = 0;
+    var s_one_or: i64 = 0;
+    var s_xor1: i64 = 0;
+    var s_one_xor: i64 = 0;
+    var s_shl1: i64 = 0;
+    var s_shr1: i64 = 0;
+    var s_idents: i64 = 0;
+    var s_zeros: i64 = 0;
+    var s_sames: i64 = 0;
+    var s_cmps: i64 = 0;
+    var s_df: i64 = 0;
+    var s_flips: i64 = 0;
+    var i: i64 = 0;
+    while i < xs.len() {
+        var x: i64 = xs.get(i);
+        s_add1 = s_add1 + add1(x);
+        s_one_add = s_one_add + one_add(x);
+        s_sub1 = s_sub1 + sub1(x);
+        s_mul2 = s_mul2 + mul2(x);
+        s_two_mul = s_two_mul + two_mul(x);
+        s_div2 = s_div2 + div2(x);
+        s_and1 = s_and1 + and1(x);
+        s_one_and = s_one_and + one_and(x);
+        s_or1 = s_or1 + or1(x);
+        s_one_or = s_one_or + one_or(x);
+        s_xor1 = s_xor1 + xor1(x);
+        s_one_xor = s_one_xor + one_xor(x);
+        s_shl1 = s_shl1 + shl1(x);
+        s_shr1 = s_shr1 + shr1(x);
+        s_idents = s_idents + idents(x);
+        s_zeros = s_zeros + zeros(x);
+        s_sames = s_sames + sames(x);
+        s_cmps = s_cmps + cmps(x);
+        s_df = s_df + double_fold(x, i);
+        s_flips = s_flips + flips(x, xs.get(xs.len() - 1 - i)) * (i + 2);
+        i = i + 1;
+    }
+    println(s_add1);
+    println(s_one_add);
+    println(s_sub1);
+    println(s_mul2);
+    println(s_two_mul);
+    println(s_div2);
+    println(s_and1);
+    println(s_one_and);
+    println(s_or1);
+    println(s_one_or);
+    println(s_xor1);
+    println(s_one_xor);
+    println(s_shl1);
+    println(s_shr1);
+    println(s_idents);
+    println(s_zeros);
+    println(s_sames);
+    println(s_cmps);
+    println(s_df - s_mul2 + 1);
+    println(s_flips);
+    return 0;
+}

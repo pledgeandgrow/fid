@@ -1,0 +1,679 @@
+// Fides static file serving logic, pure Fides
+//
+// What a web server does for a GET or HEAD of a static file, as a function
+// from request data to response data (no socket):
+//   - path handling: the query and fragment dropped, percent-decoding,
+//     NUL / backslash / encoded-slash refusal, "." and ".." resolved with
+//     no way above the root (403), dotfiles hidden (404) unless allowed,
+//     a trailing "/" served as its index.html
+//   - Content-Type from the extension (stdlib mime; text types get
+//     "; charset=utf-8"), Content-Length, Cache-Control
+//   - validators: a strong ETag from size, modification time and encoding,
+//     Last-Modified as an IMF-fixdate
+//   - conditional requests (RFC 9110 §13.2.2 order): If-None-Match (weak
+//     comparison, lists, "*") gives 304; only without it, If-Modified-Since
+//     (IMF-fixdate, RFC 850 and asctime forms) gives 304
+//   - Range (RFC 9110 §14): "bytes=" with one or several ranges (a-b, a-,
+//     -suffix); one range is a 206 with Content-Range, several a 206
+//     multipart/byteranges body; none satisfiable a 416 with
+//     "Content-Range: bytes */size"; a malformed header or more than 16
+//     ranges is ignored (200); If-Range with an ETag (strong match) or a
+//     date (exact) decides whether Range applies
+//   - precompressed variants: with "precompressed" on, file.br or file.gz
+//     beside the file is served when Accept-Encoding allows it (q-values,
+//     "*", q=0 refusals; br preferred at equal q), with Content-Encoding
+//     and "Vary: Accept-Encoding"
+//   - other methods get 405 with "Allow: GET, HEAD"
+//
+// The seam is FileStore: function values `stat(path) -> str` ("size|mtime"
+// in bytes and Unix seconds, "" when there is no such regular file) and
+// `read(path, offset, length) -> Vec<i64>`. Bind them to the fs module (or
+// an archive, or memory, as the test does).
+//
+// Usage:
+//   val cfg: ServeConfig = serve_config("/var/www");
+//   var req: ServeRequest = serve_request("GET", "/docs/a.html");
+//   serve_header(& mut req, "Range", "bytes=0-99");
+//   val resp: ServeResponse = serve_static(& cfg, & store, & req);
+
+module static_serve;
+ use vec; use mime;
+
+pub struct FileStore {
+    pub stat: fn(str) -> str,
+    pub read: fn(str, i64, i64) -> Vec<i64>,
+}
+
+pub struct ServeConfig {
+    pub root: str,
+    pub index: str,
+    pub precompressed: bool,
+    pub allow_dotfiles: bool,
+    pub cache_control: str,
+    pub boundary: str,   // for multipart/byteranges
+}
+
+pub struct ServeRequest {
+    pub method: str,
+    pub path: str,
+    pub header_names: Vec<str>,
+    pub header_vals: Vec<str>,
+}
+
+pub struct ServeResponse {
+    pub status: i64,
+    pub header_names: Vec<str>,
+    pub header_vals: Vec<str>,
+    pub body: Vec<i64>,
+    pub file: str,   // the file served ("" when none)
+}
+
+pub fn serve_config(root: str) -> ServeConfig {
+    return ServeConfig { root: root, index: "index.html", precompressed: true, allow_dotfiles: false, cache_control: "public, max-age=0, must-revalidate", boundary: "FIDES_BYTERANGES" };
+}
+
+fn ss_lower(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c >= 65 && c <= 90 { c = c + 32; }
+        o = o + char_to_str(c);
+        i = i + 1;
+    }
+    return o;
+}
+
+pub fn serve_request(method: str, path: str) -> ServeRequest {
+    return ServeRequest { method: str_to_upper(method), path: path, header_names: Vec::new(), header_vals: Vec::new() };
+}
+
+pub fn serve_header(r: & mut ServeRequest, name: str, value: str) {
+    r.header_names.push(ss_lower(name));
+    r.header_vals.push(value);
+}
+
+fn ss_req_header(r: & ServeRequest, name: str) -> str {
+    var i: i64 = 0;
+    while i < r.header_names.len() {
+        if r.header_names.get(i) == name {
+            return r.header_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn ss_has_header(r: & ServeRequest, name: str) -> bool {
+    var i: i64 = 0;
+    while i < r.header_names.len() {
+        if r.header_names.get(i) == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A response header by name (case-insensitive), "" when absent.
+pub fn serve_resp_header(r: & ServeResponse, name: str) -> str {
+    val want: str = ss_lower(name);
+    var i: i64 = 0;
+    while i < r.header_names.len() {
+        if ss_lower(r.header_names.get(i)) == want {
+            return r.header_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn ss_resp(status: i64) -> ServeResponse {
+    return ServeResponse { status: status, header_names: Vec::new(), header_vals: Vec::new(), body: Vec::new(), file: "" };
+}
+
+fn ss_set(r: & mut ServeResponse, name: str, value: str) {
+    r.header_names.push(name);
+    r.header_vals.push(value);
+}
+
+fn ss_text(status: i64, msg: str) -> ServeResponse {
+    var r: ServeResponse = ss_resp(status);
+    r.body = str_bytes(msg);
+    ss_set(& mut r, "Content-Type", "text/plain; charset=utf-8");
+    ss_set(& mut r, "Content-Length", int_to_str(r.body.len()));
+    return r;
+}
+
+// ─── paths ──────────────────────────────────────────────────────────────
+
+fn ss_hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return - 1;
+}
+
+/// Normalize a request path to "/a/b.txt" form; "" when it must be
+/// refused (bad escape, NUL, backslash, an encoded '/', or ".." above the
+/// root). A trailing '/' is kept.
+pub fn serve_normalize(raw: str) -> str {
+    var p: str = raw;
+    val q: i64 = str_find(p, "?");
+    if q >= 0 { p = str_slice(p, 0, q); }
+    val h: i64 = str_find(p, "#");
+    if h >= 0 { p = str_slice(p, 0, h); }
+    // split on '/' first so an encoded %2F cannot make a separator
+    val raw_segs: Vec<str> = str_split(p, "/");
+    var segs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < raw_segs.len() {
+        val s: str = raw_segs.get(i);
+        var dec: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < str_len(s) {
+            val c: i64 = str_byte_at(s, k);
+            if c == 37 {
+                if k + 2 > str_len(s) - 1 {
+                    return "";
+                }
+                val a: i64 = ss_hexv(str_byte_at(s, k + 1));
+                val b: i64 = ss_hexv(str_byte_at(s, k + 2));
+                if a < 0 || b < 0 {
+                    return "";
+                }
+                val byte: i64 = a * 16 + b;
+                if byte == 0 || byte == 47 || byte == 92 {
+                    return "";
+                }
+                dec.push(byte);
+                k = k + 3;
+            } else {
+                if c == 0 || c == 92 {
+                    return "";
+                }
+                dec.push(c);
+                k = k + 1;
+            }
+        }
+        val seg: str = str_from_bytes(dec);
+        if seg == "" || seg == "." {
+            // skip
+        } else if seg == ".." {
+            if segs.len() == 0 {
+                return "";
+            }
+            segs.pop();
+        } else {
+            segs.push(seg);
+        }
+        i = i + 1;
+    }
+    var out: str = "";
+    i = 0;
+    while i < segs.len() {
+        out = out + "/" + segs.get(i);
+        i = i + 1;
+    }
+    val dir: bool = str_ends_with(p, "/") || str_ends_with(p, "/.") || str_ends_with(p, "/..");
+    if str_len(out) == 0 {
+        return "/";
+    }
+    if dir {
+        out = out + "/";
+    }
+    return out;
+}
+
+fn ss_has_dotfile(path: str) -> bool {
+    val segs: Vec<str> = str_split(path, "/");
+    var i: i64 = 0;
+    while i < segs.len() {
+        if str_starts_with(segs.get(i), ".") {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── HTTP dates ─────────────────────────────────────────────────────────
+
+fn ss_days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    var y: i64 = y0;
+    if m <= 2 { y = y - 1; }
+    val era: i64 = y / 400;
+    val yoe: i64 = y - era * 400;
+    var mp: i64 = m - 3;
+    if m <= 2 { mp = m + 9; }
+    val doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn ss_2(n: i64) -> str {
+    if n < 10 { return "0" + int_to_str(n); }
+    return int_to_str(n);
+}
+
+/// IMF-fixdate of Unix seconds (1970 and later).
+pub fn serve_http_date(ts: i64) -> str {
+    val days: i64 = ts / 86400;
+    val secs: i64 = ts % 86400;
+    val z: i64 = days + 719468;
+    val era: i64 = z / 146097;
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    val d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = mp + 3;
+    if mp >= 10 { m = mp - 9; }
+    var y: i64 = yoe + era * 400;
+    if m <= 2 { y = y + 1; }
+    val wd: Vec<str> = str_split("Thu,Fri,Sat,Sun,Mon,Tue,Wed", ",");
+    val mn: Vec<str> = str_split("Jan,Feb,Mar,Apr,May,Jun,Jul,Aug,Sep,Oct,Nov,Dec", ",");
+    return wd.get(days % 7) + ", " + ss_2(d) + " " + mn.get(m - 1) + " " + int_to_str(y) + " " + ss_2(secs / 3600) + ":" + ss_2((secs / 60) % 60) + ":" + ss_2(secs % 60) + " GMT";
+}
+
+fn ss_month(s: str) -> i64 {
+    val mn: Vec<str> = str_split("jan,feb,mar,apr,may,jun,jul,aug,sep,oct,nov,dec", ",");
+    val l: str = ss_lower(s);
+    var i: i64 = 0;
+    while i < 12 {
+        if str_starts_with(l, mn.get(i)) {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Parse an HTTP date (IMF-fixdate, RFC 850, asctime) to Unix seconds;
+/// -1 when it is not one.
+pub fn serve_parse_date(s: str) -> i64 {
+    // tokens split on space, comma and '-'
+    var toks: Vec<str> = Vec::new();
+    var cur: str = "";
+    var i: i64 = 0;
+    while i <= str_len(s) {
+        var c: i64 = 32;
+        if i < str_len(s) { c = str_byte_at(s, i); }
+        if c == 32 || c == 44 || c == 45 {
+            if str_len(cur) > 0 { toks.push(cur); }
+            cur = "";
+        } else {
+            cur = cur + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    var day: i64 = - 1;
+    var mon: i64 = 0;
+    var year: i64 = - 1;
+    var hh: i64 = - 1;
+    var mi: i64 = 0;
+    var ss: i64 = 0;
+    i = 0;
+    while i < toks.len() {
+        val t: str = toks.get(i);
+        if str_find(t, ":") > 0 {
+            val hms: Vec<str> = str_split(t, ":");
+            if hms.len() != 3 { return - 1; }
+            hh = str_parse_int(hms.get(0));
+            mi = str_parse_int(hms.get(1));
+            ss = str_parse_int(hms.get(2));
+        } else if ss_month(t) > 0 && str_len(t) == 3 {
+            mon = ss_month(t);
+        } else if str_len(t) > 0 && str_byte_at(t, 0) >= 48 && str_byte_at(t, 0) <= 57 {
+            val v: i64 = str_parse_int(t);
+            if str_len(t) <= 2 && day < 0 {
+                day = v;
+            } else {
+                year = v;
+                if str_len(t) == 2 {
+                    // RFC 850 two-digit years
+                    if v < 70 { year = 2000 + v; } else { year = 1900 + v; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if day < 1 || day > 31 || mon == 0 || year < 1970 || hh < 0 || hh > 23 || mi > 59 || ss > 60 {
+        return - 1;
+    }
+    return ss_days_from_civil(year, mon, day) * 86400 + hh * 3600 + mi * 60 + ss;
+}
+
+// ─── validators and conditions ──────────────────────────────────────────
+
+fn ss_hex(n: i64) -> str {
+    return int_to_hex(n);
+}
+
+/// The strong ETag of a file version: "size-mtime[-enc]" in hex.
+pub fn serve_etag(size: i64, mtime: i64, encoding: str) -> str {
+    var t: str = ss_hex(size) + "-" + ss_hex(mtime);
+    if str_len(encoding) > 0 {
+        t = t + "-" + encoding;
+    }
+    return "\"" + t + "\"";
+}
+
+fn ss_opaque(tag: str) -> str {
+    // a tag without its W/ prefix
+    var t: str = str_trim(tag);
+    if str_starts_with(t, "W/") { t = str_slice(t, 2, str_len(t)); }
+    return t;
+}
+
+/// If-None-Match against an ETag (weak comparison): true when it matches.
+pub fn serve_none_match(header: str, etag: str) -> bool {
+    if str_trim(header) == "*" {
+        return true;
+    }
+    val tags: Vec<str> = str_split(header, ",");
+    var i: i64 = 0;
+    while i < tags.len() {
+        if ss_opaque(tags.get(i)) == ss_opaque(etag) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ─── Accept-Encoding ────────────────────────────────────────────────────
+
+/// The quality (0..1000) Accept-Encoding gives `coding` ("*" counts when
+/// the coding is not named); identity is acceptable unless refused.
+pub fn serve_accept_q(header: str, coding: str) -> i64 {
+    var star: i64 = - 1;
+    val items: Vec<str> = str_split(header, ",");
+    var i: i64 = 0;
+    while i < items.len() {
+        val it: str = str_trim(items.get(i));
+        val semi: i64 = str_find(it, ";");
+        var name: str = it;
+        var q: i64 = 1000;
+        if semi >= 0 {
+            name = str_trim(str_slice(it, 0, semi));
+            val params: str = str_trim(str_slice(it, semi + 1, str_len(it)));
+            if str_starts_with(ss_lower(params), "q=") {
+                q = ss_qvalue(str_slice(params, 2, str_len(params)));
+            }
+        }
+        name = ss_lower(name);
+        if name == coding {
+            return q;
+        }
+        if name == "*" {
+            star = q;
+        }
+        i = i + 1;
+    }
+    if star >= 0 {
+        return star;
+    }
+    if coding == "identity" {
+        return 1;
+    }
+    return 0;
+}
+
+fn ss_qvalue(s: str) -> i64 {
+    // "1", "1.0", "0.5", "0.123" -> thousandths
+    val t: str = str_trim(s);
+    if str_len(t) == 0 { return 0; }
+    if str_byte_at(t, 0) == 49 { return 1000; }
+    var v: i64 = 0;
+    var digits: i64 = 0;
+    var i: i64 = 2;
+    while i < str_len(t) && digits < 3 {
+        v = v * 10 + (str_byte_at(t, i) - 48);
+        digits = digits + 1;
+        i = i + 1;
+    }
+    while digits < 3 { v = v * 10; digits = digits + 1; }
+    return v;
+}
+
+// ─── ranges ─────────────────────────────────────────────────────────────
+
+/// Parse a Range header for a body of `size` bytes: [start, end, start,
+/// end, ...] (inclusive ends) of the satisfiable ranges; ["-1"] encoded as
+/// [-1] when the header is malformed or has too many ranges (ignore it);
+/// [] when none is satisfiable.
+pub fn serve_parse_range(header: str, size: i64) -> Vec<i64> {
+    var bad: Vec<i64> = Vec::new();
+    bad.push(- 1);
+    val h: str = str_trim(header);
+    if !str_starts_with(ss_lower(h), "bytes=") {
+        return bad;
+    }
+    val specs: Vec<str> = str_split(str_slice(h, 6, str_len(h)), ",");
+    if specs.len() > 16 {
+        return bad;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < specs.len() {
+        val sp: str = str_trim(specs.get(i));
+        val dash: i64 = str_find(sp, "-");
+        if dash < 0 {
+            return bad;
+        }
+        val a: str = str_trim(str_slice(sp, 0, dash));
+        val b: str = str_trim(str_slice(sp, dash + 1, str_len(sp)));
+        if !ss_digits(a) || !ss_digits(b) || (str_len(a) == 0 && str_len(b) == 0) {
+            return bad;
+        }
+        if str_len(a) == 0 {
+            // suffix: the last b bytes
+            val n: i64 = str_parse_int(b);
+            if n > 0 && size > 0 {
+                var st: i64 = size - n;
+                if st < 0 { st = 0; }
+                out.push(st);
+                out.push(size - 1);
+            }
+        } else {
+            val st: i64 = str_parse_int(a);
+            var en: i64 = size - 1;
+            if str_len(b) > 0 {
+                en = str_parse_int(b);
+                if en < st {
+                    return bad;
+                }
+                if en > size - 1 { en = size - 1; }
+            }
+            if st < size {
+                out.push(st);
+                out.push(en);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ss_digits(s: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ss_push_str(o: & mut Vec<i64>, s: str) {
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+// ─── serving ────────────────────────────────────────────────────────────
+
+fn ss_content_type(path: str) -> str {
+    val t: str = mime_from_path(path);
+    if str_starts_with(t, "text/") || t == "application/json" || t == "application/xml" || t == "application/yaml" {
+        return t + "; charset=utf-8";
+    }
+    return t;
+}
+
+fn ss_stat(store: & FileStore, path: str) -> Vec<i64> {
+    // [size, mtime] or [] when missing
+    val f: fn(str) -> str = store.stat;
+    val s: str = f(path);
+    var out: Vec<i64> = Vec::new();
+    if str_len(s) == 0 {
+        return out;
+    }
+    val bar: i64 = str_find(s, "|");
+    out.push(str_parse_int(str_slice(s, 0, bar)));
+    out.push(str_parse_int(str_slice(s, bar + 1, str_len(s))));
+    return out;
+}
+
+/// Serve a request from a FileStore under the config's root.
+pub fn serve_static(cfg: & ServeConfig, store: & FileStore, req: & ServeRequest) -> ServeResponse {
+    if req.method != "GET" && req.method != "HEAD" {
+        var r: ServeResponse = ss_text(405, "Method Not Allowed");
+        ss_set(& mut r, "Allow", "GET, HEAD");
+        return r;
+    }
+    var rel: str = serve_normalize(req.path);
+    if str_len(rel) == 0 {
+        return ss_text(403, "Forbidden");
+    }
+    if !cfg.allow_dotfiles && ss_has_dotfile(rel) {
+        return ss_text(404, "Not Found");
+    }
+    if str_ends_with(rel, "/") {
+        rel = rel + cfg.index;
+    }
+    val full: str = cfg.root + rel;
+    val st: Vec<i64> = ss_stat(store, full);
+    if st.len() == 0 {
+        return ss_text(404, "Not Found");
+    }
+    // pick a precompressed variant
+    var serve_path: str = full;
+    var encoding: str = "";
+    var size: i64 = st.get(0);
+    val mtime: i64 = st.get(1);
+    if cfg.precompressed {
+        val ae: str = ss_req_header(req, "accept-encoding");
+        val qbr: i64 = serve_accept_q(ae, "br");
+        val qgz: i64 = serve_accept_q(ae, "gzip");
+        val sbr: Vec<i64> = ss_stat(store, full + ".br");
+        val sgz: Vec<i64> = ss_stat(store, full + ".gz");
+        if qbr > 0 && sbr.len() > 0 && qbr >= qgz {
+            serve_path = full + ".br";
+            encoding = "br";
+            size = sbr.get(0);
+        } else if qgz > 0 && sgz.len() > 0 {
+            serve_path = full + ".gz";
+            encoding = "gzip";
+            size = sgz.get(0);
+        } else if qbr > 0 && sbr.len() > 0 {
+            serve_path = full + ".br";
+            encoding = "br";
+            size = sbr.get(0);
+        }
+    }
+    var etag_enc: str = "";
+    if encoding == "br" { etag_enc = "br"; }
+    if encoding == "gzip" { etag_enc = "gz"; }
+    val etag: str = serve_etag(size, mtime, etag_enc);
+    val last_mod: str = serve_http_date(mtime);
+    var r: ServeResponse = ss_resp(200);
+    r.file = serve_path;
+    ss_set(& mut r, "ETag", etag);
+    ss_set(& mut r, "Last-Modified", last_mod);
+    ss_set(& mut r, "Cache-Control", cfg.cache_control);
+    if cfg.precompressed {
+        ss_set(& mut r, "Vary", "Accept-Encoding");
+    }
+    // conditionals
+    if ss_has_header(req, "if-none-match") {
+        if serve_none_match(ss_req_header(req, "if-none-match"), etag) {
+            r.status = 304;
+            return r;
+        }
+    } else if ss_has_header(req, "if-modified-since") {
+        val since: i64 = serve_parse_date(ss_req_header(req, "if-modified-since"));
+        if since >= 0 && mtime <= since {
+            r.status = 304;
+            return r;
+        }
+    }
+    val ctype: str = ss_content_type(full);
+    if str_len(encoding) > 0 {
+        ss_set(& mut r, "Content-Encoding", encoding);
+    }
+    ss_set(& mut r, "Accept-Ranges", "bytes");
+    val read: fn(str, i64, i64) -> Vec<i64> = store.read;
+    // ranges
+    var use_range: bool = ss_has_header(req, "range") && req.method == "GET";
+    if use_range && ss_has_header(req, "if-range") {
+        val ir: str = str_trim(ss_req_header(req, "if-range"));
+        if str_starts_with(ir, "\"") {
+            use_range = ir == etag;          // strong comparison
+        } else if str_starts_with(ir, "W/") {
+            use_range = false;
+        } else {
+            use_range = serve_parse_date(ir) == mtime;
+        }
+    }
+    if use_range {
+        val rs: Vec<i64> = serve_parse_range(ss_req_header(req, "range"), size);
+        if rs.len() == 0 {
+            var e: ServeResponse = ss_resp(416);
+            ss_set(& mut e, "Content-Range", "bytes */" + int_to_str(size));
+            ss_set(& mut e, "Content-Length", "0");
+            return e;
+        }
+        if rs.get(0) >= 0 {
+            r.status = 206;
+            if rs.len() == 2 {
+                val a: i64 = rs.get(0);
+                val b: i64 = rs.get(1);
+                r.body = read(serve_path, a, b - a + 1);
+                ss_set(& mut r, "Content-Type", ctype);
+                ss_set(& mut r, "Content-Range", "bytes " + int_to_str(a) + "-" + int_to_str(b) + "/" + int_to_str(size));
+                ss_set(& mut r, "Content-Length", int_to_str(r.body.len()));
+                return r;
+            }
+            var body: Vec<i64> = Vec::new();
+            var k: i64 = 0;
+            while k < rs.len() {
+                val a: i64 = rs.get(k);
+                val b: i64 = rs.get(k + 1);
+                ss_push_str(& mut body, "\r\n--" + cfg.boundary + "\r\nContent-Type: " + ctype + "\r\nContent-Range: bytes " + int_to_str(a) + "-" + int_to_str(b) + "/" + int_to_str(size) + "\r\n\r\n");
+                val part: Vec<i64> = read(serve_path, a, b - a + 1);
+                var j: i64 = 0;
+                while j < part.len() {
+                    body.push(part.get(j));
+                    j = j + 1;
+                }
+                k = k + 2;
+            }
+            ss_push_str(& mut body, "\r\n--" + cfg.boundary + "--\r\n");
+            r.body = body;
+            ss_set(& mut r, "Content-Type", "multipart/byteranges; boundary=" + cfg.boundary);
+            ss_set(& mut r, "Content-Length", int_to_str(body.len()));
+            return r;
+        }
+    }
+    ss_set(& mut r, "Content-Type", ctype);
+    ss_set(& mut r, "Content-Length", int_to_str(size));
+    if req.method == "GET" {
+        r.body = read(serve_path, 0, size);
+    }
+    return r;
+}

@@ -1,0 +1,652 @@
+// Fides wave function collapse (Gumin's WFC), simple tiled and overlapping
+// models, seeded.
+//
+// A model is T patterns with weights and, for each of the 4 directions
+// (0 = +x, 1 = +y, 2 = -x, 3 = -y), which pattern may sit next to which.
+//   - Simple tiled model: tiles and adjacency rules given directly
+//     (wfc_tiled_allow sets both directions of a rule).
+//   - Overlapping model: every N x N window of a sample image (colours are
+//     i64) is a pattern, weighted by how often it occurs (optionally with
+//     its rotations and reflections); two patterns may be neighbours when
+//     they agree on their overlap. The output pixel at (x, y) is the top-left
+//     colour of the pattern there; the last N-1 rows and columns come from
+//     the patterns' other pixels (non-periodic output).
+// The solver keeps, per cell, which patterns are still possible. Each step
+// observes the cell of lowest Shannon entropy (ties broken by seeded noise),
+// picks a pattern by weight, and propagates (a pattern is removed from a
+// neighbour when nothing left in the cell allows it there; repeated until
+// nothing changes). On a contradiction (a cell with no pattern left) it
+// backtracks: the state before the last choice comes back and that choice
+// is banned there; if that contradicts too it goes back further. It gives
+// up after `max_backtracks` or when every choice has been tried.
+//
+// Pure computation, no platform seam. Same model, size and seed give the
+// same result on every backend.
+//
+// Usage:
+//   use wfc;
+//   var m: WfcModel = wfc_tiled_new(3);
+//   wfc_tiled_allow(&mut m, 0, WFC_RIGHT, 1); ...
+//   var s: WfcSolver = wfc_solver_new(&m, 16, 16, false, 42);
+//   if wfc_run(&mut s, &m) == WFC_DONE { val t: i64 = wfc_cell(&s, x, y); }
+
+module wfc;
+use vec;
+use math;
+
+pub const WFC_RIGHT: i64 = 0;
+pub const WFC_DOWN: i64 = 1;
+pub const WFC_LEFT: i64 = 2;
+pub const WFC_UP: i64 = 3;
+
+pub const WFC_RUNNING: i64 = 0;
+pub const WFC_DONE: i64 = 1;
+pub const WFC_FAILED: i64 = 2;
+
+pub fn wfc_dx(d: i64) -> i64 {
+    if d == 0 {
+        return 1;
+    }
+    if d == 2 {
+        return - 1;
+    }
+    return 0;
+}
+
+pub fn wfc_dy(d: i64) -> i64 {
+    if d == 1 {
+        return 1;
+    }
+    if d == 3 {
+        return - 1;
+    }
+    return 0;
+}
+
+pub fn wfc_opposite(d: i64) -> i64 {
+    return (d + 2) % 4;
+}
+
+// n copies of x (Vec::filled with a float value is avoided: the
+// interpreter stores a wrong value for it).
+pub fn wfc_f64s(n: i64, x: f64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(x);
+        i = i + 1;
+    }
+    return v;
+}
+
+// ─── Models ────────────────────────────────────────────────────────────────
+
+pub struct WfcModel {
+    pub t: i64,
+    pub weights: Vec<f64>,
+    /// compat[(d * t + a) * t + b]: b may be at direction d of a.
+    pub compat: Vec<bool>,
+}
+
+/// A simple tiled model of `t` tiles, weight 1 each, nothing allowed yet.
+pub fn wfc_tiled_new(t: i64) -> WfcModel {
+    return WfcModel { t: t, weights: wfc_f64s(t, 1.0), compat: Vec::filled(4 * t * t, false) };
+}
+
+pub fn wfc_tiled_weight(m: &mut WfcModel, tile: i64, w: f64) {
+    m.weights.set(tile, w);
+}
+
+/// Allow tile b at direction d of tile a (and a at the opposite of b).
+pub fn wfc_tiled_allow(m: &mut WfcModel, a: i64, d: i64, b: i64) {
+    m.compat.set((d * m.t + a) * m.t + b, true);
+    m.compat.set((wfc_opposite(d) * m.t + b) * m.t + a, true);
+}
+
+/// Allow a and b side by side in all four directions.
+pub fn wfc_tiled_allow_all(m: &mut WfcModel, a: i64, b: i64) {
+    var d: i64 = 0;
+    while d < 4 {
+        wfc_tiled_allow(m, a, d, b);
+        d = d + 1;
+    }
+}
+
+pub fn wfc_allowed(m: &WfcModel, a: i64, d: i64, b: i64) -> bool {
+    return m.compat.get((d * m.t + a) * m.t + b);
+}
+
+/// Patterns of an overlapping model and the model itself.
+pub struct WfcPatterns {
+    pub n: i64,
+    /// Pattern p's pixel (x, y) is pixels[p * n * n + y * n + x].
+    pub pixels: Vec<i64>,
+    pub model: WfcModel,
+}
+
+fn wfc_pat_px(p: &WfcPatterns, pat: i64, x: i64, y: i64) -> i64 {
+    return p.pixels.get(pat * p.n * p.n + y * p.n + x);
+}
+
+// window of the sample at (x, y), transformed: rot quarter turns, then
+// mirrored in x when `flip`
+fn wfc_window(sample: &Vec<i64>, sw: i64, sh: i64, x: i64, y: i64, n: i64, rot: i64, flip: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < n {
+        var i: i64 = 0;
+        while i < n {
+            var u: i64 = i;
+            var v: i64 = j;
+            if flip {
+                u = n - 1 - u;
+            }
+            var r: i64 = 0;
+            while r < rot {
+                val nu: i64 = n - 1 - v;
+                v = u;
+                u = nu;
+                r = r + 1;
+            }
+            out.push(sample.get(((x + u) % sw) + sw * ((y + v) % sh)));
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    return out;
+}
+
+/// Extract the N x N patterns of a sw x sh sample. `periodic_input` lets
+/// windows wrap around the sample's edges; `symmetry` is 1 (as is), 2
+/// (plus mirror), 4 (rotations) or 8 (rotations and mirrors).
+pub fn wfc_overlapping(sample: &Vec<i64>, sw: i64, sh: i64, n: i64, periodic_input: bool, symmetry: i64) -> WfcPatterns {
+    var pixels: Vec<i64> = Vec::new();
+    var counts: Vec<f64> = Vec::new();
+    var keys: HashMap<str, i64> = HashMap::new();
+    var ymax: i64 = sh;
+    var xmax: i64 = sw;
+    if !periodic_input {
+        ymax = sh - n + 1;
+        xmax = sw - n + 1;
+    }
+    var y: i64 = 0;
+    while y < ymax {
+        var x: i64 = 0;
+        while x < xmax {
+            var s: i64 = 0;
+            while s < symmetry && s < 8 {
+                var rot: i64 = s / 2;
+                var flip: bool = s % 2 == 1;
+                if symmetry == 2 {
+                    rot = 0;
+                }
+                if symmetry == 4 {
+                    rot = s;
+                    flip = false;
+                }
+                val win: Vec<i64> = wfc_window(sample, sw, sh, x, y, n, rot, flip);
+                var key: str = "";
+                var k: i64 = 0;
+                while k < win.len() {
+                    key = key + int_to_str(win.get(k)) + ",";
+                    k = k + 1;
+                }
+                if keys.contains(key) {
+                    val idx: i64 = keys.get(key);
+                    counts.set(idx, counts.get(idx) + 1.0);
+                } else {
+                    keys.insert(key, counts.len());
+                    counts.push(1.0);
+                    k = 0;
+                    while k < win.len() {
+                        pixels.push(win.get(k));
+                        k = k + 1;
+                    }
+                }
+                s = s + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    val t: i64 = counts.len();
+    var m: WfcModel = WfcModel { t: t, weights: counts, compat: Vec::filled(4 * t * t, false) };
+    var p: WfcPatterns = WfcPatterns { n: n, pixels: pixels, model: m };
+    // agreement on the overlap for each direction
+    var d: i64 = 0;
+    while d < 4 {
+        val dx: i64 = wfc_dx(d);
+        val dy: i64 = wfc_dy(d);
+        var a: i64 = 0;
+        while a < t {
+            var b: i64 = 0;
+            while b < t {
+                var ok: bool = true;
+                var yy: i64 = 0;
+                while yy < n && ok {
+                    var xx: i64 = 0;
+                    while xx < n && ok {
+                        val bx: i64 = xx - dx;
+                        val by: i64 = yy - dy;
+                        if bx >= 0 && by >= 0 && bx < n && by < n {
+                            if wfc_pat_px(&p, a, xx, yy) != wfc_pat_px(&p, b, bx, by) {
+                                ok = false;
+                            }
+                        }
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                if ok {
+                    p.model.compat.set((d * t + a) * t + b, true);
+                }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        d = d + 1;
+    }
+    return p;
+}
+
+// ─── Solver ────────────────────────────────────────────────────────────────
+
+pub struct WfcSolver {
+    pub w: i64,
+    pub h: i64,
+    pub periodic: bool,
+    pub t: i64,
+    wave: Vec<bool>,
+    count: Vec<i64>,
+    sum_w: Vec<f64>,
+    sum_wlogw: Vec<f64>,
+    rng: i64,
+    // decision stack: the cell, the pattern, the state before
+    dec_cell: Vec<i64>,
+    dec_pat: Vec<i64>,
+    saved_wave: Vec<Vec<bool>>,
+    saved_count: Vec<Vec<i64>>,
+    saved_sw: Vec<Vec<f64>>,
+    saved_swl: Vec<Vec<f64>>,
+    pub status: i64,
+    pub observations: i64,
+    pub backtracks: i64,
+    pub max_backtracks: i64,
+}
+
+@wrapping
+fn wfc_next(s: &mut WfcSolver) -> i64 {
+    // splitmix64
+    s.rng = s.rng + 0x9E3779B97F4A7C15;
+    var z: i64 = s.rng;
+    z = (z ^ ((z >> 30) & 0x3FFFFFFFF)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ ((z >> 27) & 0x1FFFFFFFFF)) * 0x94D049BB133111EB;
+    z = z ^ ((z >> 31) & 0x1FFFFFFFF);
+    return z & 0x7FFFFFFFFFFFFFFF;
+}
+
+fn wfc_unit(s: &mut WfcSolver) -> f64 {
+    return ((wfc_next(s) >> 11) as f64) / 4503599627370496.0;
+}
+
+/// A solver for a w x h grid (periodic: the grid wraps around).
+pub fn wfc_solver_new(m: &WfcModel, w: i64, h: i64, periodic: bool, seed: i64) -> WfcSolver {
+    var s: WfcSolver = WfcSolver {
+        w: w, h: h, periodic: periodic, t: m.t,
+        wave: Vec::filled(w * h * m.t, true), count: Vec::filled(w * h, m.t),
+        sum_w: Vec::new(), sum_wlogw: Vec::new(), rng: seed,
+        dec_cell: Vec::new(), dec_pat: Vec::new(), saved_wave: Vec::new(), saved_count: Vec::new(),
+        saved_sw: Vec::new(), saved_swl: Vec::new(),
+        status: WFC_RUNNING, observations: 0, backtracks: 0, max_backtracks: 1000,
+    };
+    var sw: f64 = 0.0;
+    var swl: f64 = 0.0;
+    var p: i64 = 0;
+    while p < m.t {
+        val wt: f64 = m.weights.get(p);
+        sw = sw + wt;
+        if wt > 0.0 {
+            swl = swl + wt * math_log(wt);
+        }
+        p = p + 1;
+    }
+    s.sum_w = wfc_f64s(w * h, sw);
+    s.sum_wlogw = wfc_f64s(w * h, swl);
+    // patterns of weight 0 are never placed
+    var c: i64 = 0;
+    while c < w * h {
+        p = 0;
+        while p < m.t {
+            if m.weights.get(p) <= 0.0 {
+                wfc_ban(&mut s, m, c, p);
+            }
+            p = p + 1;
+        }
+        c = c + 1;
+    }
+    return s;
+}
+
+pub fn wfc_possible(s: &WfcSolver, cell: i64, p: i64) -> bool {
+    return s.wave.get(cell * s.t + p);
+}
+
+/// Patterns still possible at a cell.
+pub fn wfc_count(s: &WfcSolver, x: i64, y: i64) -> i64 {
+    return s.count.get(x + s.w * y);
+}
+
+fn wfc_ban(s: &mut WfcSolver, m: &WfcModel, cell: i64, p: i64) {
+    if !s.wave.get(cell * s.t + p) {
+        return;
+    }
+    s.wave.set(cell * s.t + p, false);
+    s.count.set(cell, s.count.get(cell) - 1);
+    val wt: f64 = m.weights.get(p);
+    s.sum_w.set(cell, s.sum_w.get(cell) - wt);
+    if wt > 0.0 {
+        s.sum_wlogw.set(cell, s.sum_wlogw.get(cell) - wt * math_log(wt));
+    }
+}
+
+// neighbour cell in direction d, or -1 past an edge (non-periodic)
+fn wfc_neighbour(s: &WfcSolver, cell: i64, d: i64) -> i64 {
+    var x: i64 = cell % s.w + wfc_dx(d);
+    var y: i64 = cell / s.w + wfc_dy(d);
+    if s.periodic {
+        x = (x + s.w) % s.w;
+        y = (y + s.h) % s.h;
+    } else if x < 0 || y < 0 || x >= s.w || y >= s.h {
+        return - 1;
+    }
+    return x + s.w * y;
+}
+
+// Propagate from the given cells; false on a contradiction.
+fn wfc_propagate(s: &mut WfcSolver, m: &WfcModel, start: Vec<i64>) -> bool {
+    var stack: Vec<i64> = start;
+    while stack.len() > 0 {
+        val c: i64 = stack.pop();
+        var d: i64 = 0;
+        while d < 4 {
+            val nb: i64 = wfc_neighbour(s, c, d);
+            if nb >= 0 {
+                var changed: bool = false;
+                var b: i64 = 0;
+                while b < s.t {
+                    if s.wave.get(nb * s.t + b) {
+                        var supported: bool = false;
+                        var a: i64 = 0;
+                        while a < s.t && !supported {
+                            if s.wave.get(c * s.t + a) && m.compat.get((d * s.t + a) * s.t + b) {
+                                supported = true;
+                            }
+                            a = a + 1;
+                        }
+                        if !supported {
+                            wfc_ban(s, m, nb, b);
+                            changed = true;
+                        }
+                    }
+                    b = b + 1;
+                }
+                if changed {
+                    if s.count.get(nb) == 0 {
+                        return false;
+                    }
+                    stack.push(nb);
+                }
+            }
+            d = d + 1;
+        }
+    }
+    return true;
+}
+
+/// Fix cell (x, y) to pattern p before running (or ban everything else).
+/// Returns false when that contradicts the rules.
+pub fn wfc_set(s: &mut WfcSolver, m: &WfcModel, x: i64, y: i64, p: i64) -> bool {
+    val cell: i64 = x + s.w * y;
+    var q: i64 = 0;
+    while q < s.t {
+        if q != p {
+            wfc_ban(s, m, cell, q);
+        }
+        q = q + 1;
+    }
+    if s.count.get(cell) == 0 {
+        s.status = WFC_FAILED;
+        return false;
+    }
+    var st: Vec<i64> = Vec::new();
+    st.push(cell);
+    if !wfc_propagate(s, m, st) {
+        s.status = WFC_FAILED;
+        return false;
+    }
+    return true;
+}
+
+/// Ban pattern p at (x, y) before running.
+pub fn wfc_forbid(s: &mut WfcSolver, m: &WfcModel, x: i64, y: i64, p: i64) -> bool {
+    val cell: i64 = x + s.w * y;
+    wfc_ban(s, m, cell, p);
+    var st: Vec<i64> = Vec::new();
+    st.push(cell);
+    if s.count.get(cell) == 0 || !wfc_propagate(s, m, st) {
+        s.status = WFC_FAILED;
+        return false;
+    }
+    return true;
+}
+
+/// Shannon entropy of a cell's remaining patterns.
+pub fn wfc_entropy(s: &WfcSolver, cell: i64) -> f64 {
+    val sw: f64 = s.sum_w.get(cell);
+    return math_log(sw) - s.sum_wlogw.get(cell) / sw;
+}
+
+// Undo to the last choice and ban it; repeat while that contradicts.
+fn wfc_backtrack(s: &mut WfcSolver, m: &WfcModel) -> bool {
+    while s.dec_cell.len() > 0 {
+        if s.backtracks >= s.max_backtracks {
+            return false;
+        }
+        s.backtracks = s.backtracks + 1;
+        val cell: i64 = s.dec_cell.pop();
+        val p: i64 = s.dec_pat.pop();
+        s.wave = s.saved_wave.pop();
+        s.count = s.saved_count.pop();
+        s.sum_w = s.saved_sw.pop();
+        s.sum_wlogw = s.saved_swl.pop();
+        wfc_ban(s, m, cell, p);
+        var st: Vec<i64> = Vec::new();
+        st.push(cell);
+        if s.count.get(cell) > 0 && wfc_propagate(s, m, st) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// One observation (and its propagation, and any backtracking). Returns
+/// the status: WFC_RUNNING, WFC_DONE or WFC_FAILED.
+pub fn wfc_step(s: &mut WfcSolver, m: &WfcModel) -> i64 {
+    if s.status != WFC_RUNNING {
+        return s.status;
+    }
+    var best: i64 = - 1;
+    var best_e: f64 = 0.0;
+    var c: i64 = 0;
+    while c < s.w * s.h {
+        val n: i64 = s.count.get(c);
+        if n == 0 {
+            if !wfc_backtrack(s, m) {
+                s.status = WFC_FAILED;
+            }
+            return s.status;
+        }
+        if n > 1 {
+            val e: f64 = wfc_entropy(s, c) + 0.000001 * wfc_unit(s);
+            if best < 0 || e < best_e {
+                best = c;
+                best_e = e;
+            }
+        }
+        c = c + 1;
+    }
+    if best < 0 {
+        s.status = WFC_DONE;
+        return s.status;
+    }
+    // weighted choice among what is left
+    var r: f64 = wfc_unit(s) * s.sum_w.get(best);
+    var pick: i64 = - 1;
+    var p: i64 = 0;
+    while p < s.t {
+        if s.wave.get(best * s.t + p) {
+            pick = p;
+            r = r - m.weights.get(p);
+            if r < 0.0 {
+                break;
+            }
+        }
+        p = p + 1;
+    }
+    s.dec_cell.push(best);
+    s.dec_pat.push(pick);
+    s.saved_wave.push(s.wave);
+    s.saved_count.push(s.count);
+    s.saved_sw.push(s.sum_w);
+    s.saved_swl.push(s.sum_wlogw);
+    s.observations = s.observations + 1;
+    p = 0;
+    while p < s.t {
+        if p != pick {
+            wfc_ban(s, m, best, p);
+        }
+        p = p + 1;
+    }
+    var st: Vec<i64> = Vec::new();
+    st.push(best);
+    if !wfc_propagate(s, m, st) {
+        if !wfc_backtrack(s, m) {
+            s.status = WFC_FAILED;
+        }
+    }
+    return s.status;
+}
+
+/// Run to the end; returns WFC_DONE or WFC_FAILED.
+pub fn wfc_run(s: &mut WfcSolver, m: &WfcModel) -> i64 {
+    while wfc_step(s, m) == WFC_RUNNING {
+    }
+    return s.status;
+}
+
+/// The pattern at (x, y) once decided, else -1.
+pub fn wfc_cell(s: &WfcSolver, x: i64, y: i64) -> i64 {
+    val c: i64 = x + s.w * y;
+    if s.count.get(c) != 1 {
+        return - 1;
+    }
+    var p: i64 = 0;
+    while p < s.t {
+        if s.wave.get(c * s.t + p) {
+            return p;
+        }
+        p = p + 1;
+    }
+    return - 1;
+}
+
+/// Does every pair of neighbouring cells follow the rules?
+pub fn wfc_valid(s: &WfcSolver, m: &WfcModel) -> bool {
+    var c: i64 = 0;
+    while c < s.w * s.h {
+        val a: i64 = wfc_cell(s, c % s.w, c / s.w);
+        if a < 0 {
+            return false;
+        }
+        var d: i64 = 0;
+        while d < 4 {
+            val nb: i64 = wfc_neighbour(s, c, d);
+            if nb >= 0 {
+                val b: i64 = wfc_cell(s, nb % s.w, nb / s.w);
+                if b < 0 || !wfc_allowed(m, a, d, b) {
+                    return false;
+                }
+            }
+            d = d + 1;
+        }
+        c = c + 1;
+    }
+    return true;
+}
+
+/// Output image of an overlapping model solved on a (w-n+1) x (h-n+1)
+/// non-periodic grid: w x h colours.
+pub fn wfc_overlapping_image(s: &WfcSolver, p: &WfcPatterns) -> Vec<i64> {
+    val n: i64 = p.n;
+    val w: i64 = s.w + n - 1;
+    val h: i64 = s.h + n - 1;
+    var out: Vec<i64> = Vec::new();
+    var y: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            var cx: i64 = x;
+            var cy: i64 = y;
+            if cx >= s.w {
+                cx = s.w - 1;
+            }
+            if cy >= s.h {
+                cy = s.h - 1;
+            }
+            val pat: i64 = wfc_cell(s, cx, cy);
+            if pat < 0 {
+                out.push(- 1);
+            } else {
+                out.push(wfc_pat_px(p, pat, x - cx, y - cy));
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return out;
+}
+
+/// Is every n x n window of a w x h image one of the patterns?
+pub fn wfc_image_windows_ok(img: &Vec<i64>, w: i64, h: i64, p: &WfcPatterns) -> bool {
+    val n: i64 = p.n;
+    var y: i64 = 0;
+    while y + n <= h {
+        var x: i64 = 0;
+        while x + n <= w {
+            var found: bool = false;
+            var pat: i64 = 0;
+            while pat < p.model.t && !found {
+                var same: bool = true;
+                var j: i64 = 0;
+                while j < n && same {
+                    var i: i64 = 0;
+                    while i < n && same {
+                        if img.get(x + i + w * (y + j)) != wfc_pat_px(p, pat, i, j) {
+                            same = false;
+                        }
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+                found = same;
+                pat = pat + 1;
+            }
+            if !found {
+                return false;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return true;
+}

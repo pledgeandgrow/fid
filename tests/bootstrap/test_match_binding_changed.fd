@@ -1,0 +1,136 @@
+// A match arm's struct binding that the arm changes is a variable of its
+// own (lower.fd Lowerer_mb_owns_copy): an owner of a copy of the payload,
+// dropped when the arm ends. Before, the binding was a copy that owned
+// nothing: replacing one of its fields (directly, or through `& mut p` in a
+// callee) dropped the payload's list, which the scrutinee dropped again
+// ("Double free"; the compiler itself crashed this way on
+// test_cross_module_specialization), and `p = q` changed nothing. The
+// scrutinee keeps its own value.
+//
+// Expected output:
+// b2
+// c3
+// z9
+// a1 after
+// 3 3
+// done
+
+struct P {
+    funcs: Vec<str>,
+    imps: Vec<str>,
+}
+
+enum PR {
+    Ok(P),
+    Err(str),
+}
+
+fn mk() -> PR {
+    var p: P = P { funcs: Vec::new(), imps: Vec::new() };
+    p.funcs.push("a" + int_to_str(1));
+    return PR::Ok(p);
+}
+
+fn change(user: & mut P) {
+    var nf: Vec<str> = Vec::new();
+    nf.push("b" + int_to_str(2));
+    user.funcs = nf;
+}
+
+// through `& mut` in a callee
+fn via_ref() -> i64 {
+    var r: PR = mk();
+    match r {
+        PR::Ok(user) => {
+            change(& mut user);
+            println(user.funcs.get(0));
+            return 1;
+        }
+        PR::Err(_) => {
+        }
+    }
+    return 0;
+}
+
+// a field replaced in the arm
+fn field_set() -> i64 {
+    var r: PR = mk();
+    match r {
+        PR::Ok(user) => {
+            var nf: Vec<str> = Vec::new();
+            nf.push("c" + int_to_str(3));
+            user.funcs = nf;
+            println(user.funcs.get(0));
+        }
+        PR::Err(_) => {
+        }
+    }
+    return 0;
+}
+
+// the binding given a new value
+fn whole_set() -> i64 {
+    var r: PR = mk();
+    match r {
+        PR::Ok(user) => {
+            user = P { funcs: Vec::new(), imps: Vec::new() };
+            user.funcs.push("z" + int_to_str(9));
+            println(user.funcs.get(0));
+        }
+        PR::Err(_) => {
+        }
+    }
+    return 0;
+}
+
+// the scrutinee is not changed by the arm's copy
+fn scrutinee_kept() -> i64 {
+    var r: PR = mk();
+    match r {
+        PR::Ok(user) => {
+            var nf: Vec<str> = Vec::new();
+            nf.push("other");
+            user.funcs = nf;
+        }
+        PR::Err(_) => {
+        }
+    }
+    match r {
+        PR::Ok(p2) => {
+            println(p2.funcs.get(0) + " after");
+        }
+        PR::Err(_) => {
+        }
+    }
+    return 0;
+}
+
+fn main() {
+    via_ref();
+    field_set();
+    whole_set();
+    scrutinee_kept();
+    // in a loop: each pass's copy is dropped at the arm's end
+    var n: i64 = 0;
+    var k: i64 = 0;
+    while k < 3 {
+        n = n + via_quiet();
+        k = k + 1;
+    }
+    println(int_to_str(n) + " " + int_to_str(k));
+    println("done");
+}
+
+fn via_quiet() -> i64 {
+    var r: PR = mk();
+    var got: i64 = 0;
+    match r {
+        PR::Ok(user) => {
+            change(& mut user);
+            got = user.funcs.len();
+        }
+        PR::Err(_) => {
+        }
+    }
+    return got;
+}

@@ -5,7 +5,7 @@
 // the runtime can poll or pool, and at compiler-emitted loop safepoints — so a
 // busy loop cannot starve the others. A dedicated poller thread owns socket
 // readiness; a small OS-thread pool runs syscalls that cannot be polled.
-// The interpreter has one call stack: there a task runs to its end when started.
+// The interpreter (fid run) interleaves tasks the same way (docs/interp-tasks.md).
 //
 // Usage:
 //   use task;
@@ -18,6 +18,16 @@ module task;
  use vec; use sync;
 /// Start the function `name`, which takes one i64, as a task. It starts on a
 /// worker as soon as one is free. Returns the task.
+///
+/// Example (native only):
+///   fn square(x: i64) -> i64 { return x * x; }
+///   fn main() -> i64 {
+///       val t = task_go("square", 7);
+///       task_run();
+///       assert(task_done(t));
+///       assert_eq(task_result(t), 49);
+///       return 0;
+///   }
 pub fn task_go(name: str, arg: i64) -> i64 {
     return p_co_go(name, arg);
 }
@@ -134,6 +144,11 @@ pub fn task_join_timeout(t: i64, ms: i64) -> i64 {
         if task_done(t) {
             return task_result(t);
         }
+        // CA8: a timeout block around the join that ran out stops it (its
+        // sleeps return at once then)
+        if task_slot_cancelled() {
+            return - 1;
+        }
         task_sleep(1);
         if ms >= 0 {
             left = left - 1;
@@ -171,4 +186,241 @@ pub fn task_scope_cancel_join(s: & mut TaskScope) -> Vec<i64> {
 /// result, or -1 on a timeout (the task keeps running).
 pub fn task_timeout(name: str, arg: i64, ms: i64) -> i64 {
     return task_join_timeout(task_go(name, arg), ms);
+}
+
+// --- Cancellation tokens and waits that respect them (competitive CA7) -----
+//
+// A token is a shared three-word cell: [cancelled (0/1)][deadline in ms on
+// clock_now_ms's clock, 0 for none][parent token, 0 for none; a token
+// counts as cancelled when its parent is]. task_token_cancel cancels it from any
+// task or thread; a token made by task_token_with_timeout cancels itself
+// once its time has passed (the library form of a `timeout(ms) { }` block,
+// CA8). The waits below give up as soon as the token is cancelled: a sleep,
+// a socket wait, a channel receive, a join. Cancellation is a checkpoint,
+// not a kill: a wait notices it within TASK_CANCEL_SLICE ms (it waits in
+// slices that short) and returns; the task then decides how to stop. The
+// same code runs on every backend (fid run included: its tasks interleave,
+// docs/interp-tasks.md).
+//
+// Usage:
+//   val tok: i64 = task_token_with_timeout(500);
+//   if !task_sleep_cancellable(2000, tok) { println("gave up"); }
+//
+// CA8: inside a `timeout(ms) { }` block, task_current_token() is the
+// block's token, and the runtime's own waits (p_co_sleep, so task_sleep,
+// await, channel and socket waits) look at it without being handed it:
+// docs/reference/timeout-blocks.md.
+
+/// How often a cancellable wait looks at its token, in ms.
+pub const TASK_CANCEL_SLICE: i64 = 10;
+
+/// A new token, not cancelled, with no deadline. Three words, as a
+/// `timeout(ms) { }` block's token: the third, its parent, is 0 (none).
+pub fn task_token_new() -> i64 {
+    var tok: i64 = p_shared_alloc(24);
+    p_atomic_store(tok, 0);
+    p_atomic_store(tok + 8, 0);
+    p_atomic_store(tok + 16, 0);
+    return tok;
+}
+
+/// The token of the innermost `timeout(ms) { }` block around the running
+/// code (its task's token slot), 0 outside any. Valid only inside that
+/// block: the block frees it at its end (docs/reference/timeout-blocks.md).
+pub fn task_current_token() -> i64 {
+    return p_task_token();
+}
+
+/// True once the timeout block around the running code (its token slot)
+/// is cancelled or past its deadline. The runtime's waits then return at
+/// once, so a wait loop built on them must stop too, or it spins (CA8).
+fn task_slot_cancelled() -> bool {
+    val st: i64 = p_task_token();
+    return st != 0 && task_token_cancelled(st);
+}
+
+/// A token that cancels itself `ms` milliseconds from now. Its deadline is
+/// on p_clock_mono_ms's clock (C6), as a timeout block's: a change of the
+/// wall clock neither fires it early nor holds it back.
+pub fn task_token_with_timeout(ms: i64) -> i64 {
+    var tok: i64 = task_token_new();
+    var d: i64 = ms;
+    if d < 0 {
+        d = 0;
+    }
+    p_atomic_store(tok + 8, p_clock_mono_ms() + d);
+    return tok;
+}
+
+/// Cancel the token: every wait on it returns.
+pub fn task_token_cancel(tok: i64) -> void {
+    if tok != 0 {
+        p_atomic_store(tok, 1);
+    }
+}
+
+/// True once the token, or a token it nests in (its parent chain: an
+/// inner timeout block's token names the outer one), is cancelled or past
+/// its deadline. The chain is followed 64 deep at most, as the runtimes do.
+pub fn task_token_cancelled(tok: i64) -> bool {
+    var t: i64 = tok;
+    var depth: i64 = 0;
+    while t != 0 && depth < 64 {
+        if p_atomic_load(t) != 0 {
+            return true;
+        }
+        val dl: i64 = p_atomic_load(t + 8);
+        if dl != 0 && p_clock_mono_ms() >= dl {
+            p_atomic_store(t, 1);
+            return true;
+        }
+        t = p_atomic_load(t + 16);
+        depth = depth + 1;
+    }
+    return false;
+}
+
+/// Milliseconds left before the nearest deadline of the token and the
+/// tokens it nests in (-1: no deadline; 0 once cancelled).
+pub fn task_token_remaining(tok: i64) -> i64 {
+    if task_token_cancelled(tok) {
+        return 0;
+    }
+    var best: i64 = - 1;
+    val now: i64 = p_clock_mono_ms();
+    var t: i64 = tok;
+    var depth: i64 = 0;
+    while t != 0 && depth < 64 {
+        val dl: i64 = p_atomic_load(t + 8);
+        if dl != 0 {
+            var r: i64 = dl - now;
+            if r < 0 {
+                r = 0;
+            }
+            if best < 0 || r < best {
+                best = r;
+            }
+        }
+        t = p_atomic_load(t + 16);
+        depth = depth + 1;
+    }
+    return best;
+}
+
+/// The next slice of a wait of `left` ms (-1: no limit) under `tok`.
+fn task_cancel_slice(left: i64, tok: i64) -> i64 {
+    var s: i64 = TASK_CANCEL_SLICE;
+    if left >= 0 && left < s {
+        s = left;
+    }
+    val r: i64 = task_token_remaining(tok);
+    if r >= 0 && r < s {
+        s = r;
+    }
+    return s;
+}
+
+/// Sleep `ms`, or less if the token is cancelled first. True when the
+/// whole time passed, false when the token stopped it.
+pub fn task_sleep_cancellable(ms: i64, tok: i64) -> bool {
+    val end: i64 = p_clock_mono_ms() + ms;
+    while true {
+        if task_token_cancelled(tok) || task_slot_cancelled() {
+            return false;
+        }
+        val left: i64 = end - p_clock_mono_ms();
+        if left <= 0 {
+            return true;
+        }
+        task_sleep(task_cancel_slice(left, tok));
+    }
+    return true;
+}
+
+/// Wait for socket `fd` (`write`: 0 to read, 1 to write), at most
+/// `timeout_ms` (-1: no limit): 1 ready, 0 timed out, -1 cancelled.
+fn task_wait_fd_cancellable(fd: i64, write: i64, timeout_ms: i64, tok: i64) -> i64 {
+    val start: i64 = p_clock_mono_ms();
+    while true {
+        if task_token_cancelled(tok) || task_slot_cancelled() {
+            return - 1;
+        }
+        var left: i64 = - 1;
+        if timeout_ms >= 0 {
+            left = timeout_ms - (p_clock_mono_ms() - start);
+            if left <= 0 {
+                return 0;
+            }
+        }
+        if p_co_wait_fd(fd, write, task_cancel_slice(left, tok)) != 0 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// task_wait_read that gives up when `tok` is cancelled: 1 the socket has
+/// data, 0 timed out, -1 cancelled.
+pub fn task_wait_read_cancellable(fd: i64, timeout_ms: i64, tok: i64) -> i64 {
+    return task_wait_fd_cancellable(fd, 0, timeout_ms, tok);
+}
+
+/// task_wait_write that gives up when `tok` is cancelled (1, 0, -1 as
+/// task_wait_read_cancellable).
+pub fn task_wait_write_cancellable(fd: i64, timeout_ms: i64, tok: i64) -> i64 {
+    return task_wait_fd_cancellable(fd, 1, timeout_ms, tok);
+}
+
+/// The next value of channel `ch`; None once the token is cancelled or the
+/// channel is closed and empty.
+pub fn task_recv_cancellable(ch: i64, tok: i64) -> Option<i64> {
+    while true {
+        val v: i64 = p_chan_try_recv(ch);
+        if v != SYNC_CHAN_PENDING {
+            if v == 0 && p_chan_is_closed(ch) != 0 {
+                return Option::None;
+            }
+            return Option::Some(v);
+        }
+        if task_token_cancelled(tok) || task_slot_cancelled() {
+            return Option::None;
+        }
+        task_sleep(1);
+    }
+    return Option::None;
+}
+
+/// Wait until task `t` finishes or the token is cancelled: true when it
+/// finished (task_result has its result).
+pub fn task_join_cancellable(t: i64, tok: i64) -> bool {
+    while true {
+        if task_done(t) {
+            return true;
+        }
+        if task_token_cancelled(tok) || task_slot_cancelled() {
+            return false;
+        }
+        task_sleep(1);
+    }
+    return false;
+}
+
+/// Sleep `ms` unless the scope is cancelled first: true when the whole time
+/// passed.
+pub fn task_scope_sleep(s: & TaskScope, ms: i64) -> bool {
+    val end: i64 = p_clock_mono_ms() + ms;
+    while true {
+        if sync_atomic_load(s.flag) != 0 || task_slot_cancelled() {
+            return false;
+        }
+        var left: i64 = end - p_clock_mono_ms();
+        if left <= 0 {
+            return true;
+        }
+        if left > TASK_CANCEL_SLICE {
+            left = TASK_CANCEL_SLICE;
+        }
+        task_sleep(left);
+    }
+    return true;
 }

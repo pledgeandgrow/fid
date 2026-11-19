@@ -1,0 +1,146 @@
+// stdlib/json indexed documents (competitive SL6): json_index scans once,
+// then jd_* lookups walk nodes without scanning the text again. Checked
+// against the string API on the same documents (json_get, json_at,
+// json_path, json_keys, json_type, json_len), validity against
+// json_is_valid on good and bad inputs, keys with escapes, repeated keys
+// (the first wins, as json_get does), every node kind, raw slices, and the
+// depth limit. A wrong answer panics on every backend.
+//
+// Expected output:
+// nodes 35
+// lookups ok
+// validity ok
+// depth ok
+// jsondoc ok
+use json;
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(label + ": got " + got + ", want " + want);
+        p_panic("jsondoc: wrong " + label);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    if got != want {
+        println(label + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+        p_panic("jsondoc: wrong " + label);
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("jsondoc: wrong " + label);
+    }
+}
+
+fn valid_same(text: str) {
+    val d: JsonDoc = json_index(text);
+    if d.ok != json_is_valid(text) {
+        p_panic("jsondoc: json_index and json_is_valid disagree on " + text);
+    }
+}
+
+fn main() -> i64 {
+    val text: str = "{\"server\": {\"host\": \"example.org\", \"port\": 8080, \"tls\": false},\n \"users\": [{\"name\": \"Ada\", \"id\": 1}, {\"name\": \"Grace \\\"G\\\"\", \"id\": 2}],\n \"ratio\": -2.5e1, \"none\": null, \"t\\u0061b\": \"escaped key\", \"dup\": 1, \"dup\": 2, \"empty\": [], \"obj\": \x7b\x7d}";
+    val d: JsonDoc = json_index(text);
+    check_b("ok", d.ok, true);
+    println("nodes " + int_to_str(jd_nodes(& d)));
+    val root: i64 = jd_root(& d);
+    check_i("root", root, 0);
+    check("root type", jd_type(& d, root), "object");
+    check_i("members", jd_len(& d, root), json_len(text));
+    // fields and paths, against the string API
+    val server: i64 = jd_get(& d, root, "server");
+    check("server raw", jd_raw(& d, server), json_get(text, "server"));
+    check("host", jd_str(& d, jd_get(& d, server, "host")), json_get_str(json_get(text, "server"), "host"));
+    check_i("port", jd_int(& d, jd_path(& d, root, "server.port"), 0), 8080);
+    check_b("tls", jd_bool(& d, jd_path(& d, root, "server.tls"), true), false);
+    val users: i64 = jd_get(& d, root, "users");
+    check_i("users", jd_len(& d, users), 2);
+    check("user 1 raw", jd_raw(& d, jd_at(& d, users, 1)), json_at(json_get(text, "users"), 1));
+    check("user 1 name", jd_str(& d, jd_path(& d, root, "users.1.name")), "Grace \"G\"");
+    check("user 1 name raw", jd_raw(& d, jd_path(& d, root, "users.1.name")), json_path(text, "users.1.name"));
+    check_i("user 0 id", jd_int(& d, jd_path(& d, root, "users.0.id"), - 1), 1);
+    check_i("ratio", jd_int(& d, jd_get(& d, root, "ratio"), 0), json_get_int(text, "ratio", 0));
+    check_b("ratio as float", jd_num(& d, jd_get(& d, root, "ratio"), 0.0) == str_parse_float(json_get(text, "ratio")), true);
+    check_b("none is null", jd_is_null(& d, jd_get(& d, root, "none")), true);
+    check_b("has none", jd_has(& d, root, "none"), true);
+    check_b("has nothing", jd_has(& d, root, "nothing"), false);
+    check("escaped key", jd_str(& d, jd_get(& d, root, "tab")), "escaped key");
+    check("first dup", jd_raw(& d, jd_get(& d, root, "dup")), json_get(text, "dup"));
+    check_i("empty array", jd_len(& d, jd_get(& d, root, "empty")), 0);
+    check("empty object", jd_type(& d, jd_get(& d, root, "obj")), "object");
+    check_i("empty object members", jd_len(& d, jd_get(& d, root, "obj")), 0);
+    // keys in document order, decoded, as json_keys gives them
+    val keys: Vec<str> = json_keys(text);
+    var k: i64 = 0;
+    while k < keys.len() {
+        check("key " + int_to_str(k), jd_key(& d, root, k), keys.get(k));
+        check("type of member " + int_to_str(k), jd_type(& d, jd_member(& d, root, k)), json_type(json_get(text, keys.get(k))));
+        k = k + 1;
+    }
+    check("key out of range", jd_key(& d, root, 99), "");
+    // misses are -1 and every function takes -1
+    check_i("missing field", jd_get(& d, root, "nope"), - 1);
+    check_i("index out of range", jd_at(& d, users, 2), - 1);
+    check_i("at on an object", jd_at(& d, root, 0), - 1);
+    check_i("get on an array", jd_get(& d, users, "name"), - 1);
+    check_i("path miss", jd_path(& d, root, "users.5.name"), - 1);
+    check_i("path through a number", jd_path(& d, root, "ratio.x"), - 1);
+    check("raw of no node", jd_raw(& d, - 1), "");
+    check_i("int of a string", jd_int(& d, jd_path(& d, root, "server.host"), 7), 7);
+    check("str of a number", jd_str(& d, jd_path(& d, root, "server.port")), "");
+    // a bare value is a document too
+    val leaf: JsonDoc = json_index("  \"just text\"  ");
+    check("leaf", jd_str(& leaf, jd_root(& leaf)), "just text");
+    val arr: JsonDoc = json_index("[1, [2, [3, [4]]], 5]");
+    check("nested", jd_raw(& arr, jd_path(& arr, 0, "1.1.1.0")), "4");
+    check_i("after a subtree", jd_int(& arr, jd_at(& arr, 0, 2), 0), 5);
+    println("lookups ok");
+
+    // ── validity: the same verdict as json_is_valid ──
+    valid_same("[1, 2, 3]");
+    valid_same("[1, 2, 3,]");
+    valid_same("{\"a\" 1}");
+    valid_same("{\"a\": 1,}");
+    valid_same("{1: 2}");
+    valid_same("[01]");
+    valid_same("[1.]");
+    valid_same("[-]");
+    valid_same("[1e5, -0.5E-3, 0]");
+    valid_same("\"bad \\x escape\"");
+    valid_same("\"\\u00e9\"");
+    valid_same("[true, false, null]");
+    valid_same("[tru]");
+    valid_same("nul");
+    valid_same("");
+    valid_same("   ");
+    valid_same("[1] [2]");
+    valid_same("[\"unterminated]");
+    valid_same("{\"a\": {\"b\": [1, {\"c\": null}]}}");
+    valid_same("{\"a\": {\"b\": [1, {\"c\": null}]}");
+    val bad: JsonDoc = json_index("{\"a\": }");
+    check_b("bad not ok", bad.ok, false);
+    check_i("bad root", jd_root(& bad), - 1);
+    check_i("bad lookup", jd_get(& bad, 0, "a"), - 1);
+    println("validity ok");
+
+    // ── depth: 512 levels are fine, 513 are refused ──
+    var deep: str = "";
+    var i: i64 = 0;
+    while i < 512 {
+        deep = deep + "[";
+        i = i + 1;
+    }
+    i = 0;
+    while i < 512 {
+        deep = deep + "]";
+        i = i + 1;
+    }
+    check_b("512 levels", json_index(deep).ok, true);
+    check_b("513 levels", json_index("[" + deep + "]").ok, false);
+    println("depth ok");
+    println("jsondoc ok");
+    return 0;
+}

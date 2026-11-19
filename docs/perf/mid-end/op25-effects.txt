@@ -1,0 +1,69 @@
+OP25 (competitive roadmap): effects drive optimization -- Nov 17
+=================================================================
+
+What each part is, where it lives, its switch, and how it is checked.
+Nothing here was built or run with the compiler that has it when this was
+written: tests/tooling/op25-check.sh is the check (see the end).
+
+1. Unused calls that end, never panic and write nothing go
+   compiler/iropt.fd iro_quiet_fns / iro_quiet_local / iro_quiet_inst (the
+   proof: no loop, no recursion, nothing that can trap), iro_dead_calls
+   (the removal, before dce). On by default since Nov 17 (was opt-in
+   FID_IROPT_ON=quietcall); FID_IROPT_OFF=quietcall turns it off.
+   Nov 17: a comparison counts as quiet only between words (integers,
+   bools, floats: iro_quiet_word); a comparison of strings reads their
+   bytes through the pointers, so a function doing one is not quiet (LICM
+   would otherwise compute it ahead of a null test).
+   The same proof lets iro_licm_loop move a call to a quiet function that
+   touches no memory out of any block of a loop (not only the header).
+
+2. Pure calls out of body blocks other than the header, under a guard
+   compiler/iropt_me.fd ime_guard_moves (the `licmguard` transform of OP9):
+   besides trapping integer arithmetic, a call to a program function with
+   no effect but a panic (transitively: iro_effect_masks) and an integer or
+   bool result moves out of the loop's first body block (or a deeper block
+   every pass reaches through quiet blocks) into the guard block G, which
+   runs exactly when the loop's first pass would reach the call; the call
+   in the loop becomes a load of the slot G stores. The set of such
+   functions comes from iropt_native (ime_set_call_facts), since iropt_me
+   sees one function at a time. Rides on licmguard (opt-in,
+   FID_IROPT_ON=licmguard); FID_IROPT_OFF=guardcall leaves calls out of it.
+   Stats: "iropt: guardcall N calls" (FID_IROPT_STATS=1).
+
+3. Memory facts kept across calls that write nothing (LF5, LF6)
+   compiler/iropt_me.fd ime_writes: a call to a program function that,
+   with everything it calls, writes nothing (iro_mask_no_write: reads and
+   a panic allowed) changes no place, so load hoisting (LF5), store
+   forwarding (LF6), match facts and vecdata keep what they know across
+   it. The names come from iropt_native (ime_set_call_facts). On whenever
+   those passes are (loadhoist, forward, matchfacts are on by default);
+   FID_IROPT_OFF=nowritecall turns it off. Stats: "nowritecall N facts
+   kept" on the same line as guardcall.
+
+4. Read-only calls merged (readcse, WP10)
+   compiler/rules.fd ru_pure_cse / ru_read_reuse, on the machine layer
+   (`emit --nat`, the Linux targets). On by default since Nov 17 (was
+   FID_RULES_ON=readcse); FID_NAT_OFF=readcse or FID_IROPT_OFF=readcse
+   turns it off. FID_RULE_STATS=1 prints "[rules] readcse: N".
+
+Runtime and backend functions (p_, pe_, pert_, nat_, __) are never in the
+name sets of 2 and 3, and a function without a body never is.
+
+Tests
+  tests/bootstrap/test_midend_quietcall.fd       (part 1)
+  tests/bootstrap/test_midend_guard_call.fd      (part 2)
+  tests/bootstrap/test_midend_guard_call_fail.fd (part 2: the panic's place)
+  tests/bootstrap/test_midend_nowrite_facts.fd   (parts 3 and 4)
+  tests/tooling/op25-check.sh                    (counters, outputs with each
+                                                  part on and off, SUITE=1:
+                                                  the whole suite both ways)
+
+Before the default can be called checked:
+  FID=$FID bash tests/tooling/op25-check.sh                 -> "0 failed"
+  FID=$FID SUITE=1 NAT=1 JOBS=4 bash tests/tooling/op25-check.sh -> "0 failed"
+If a suite line differs, the part goes back to opt-in:
+  quietcall:   iropt.fd `var on_quiet: bool = has_main && iro_pass_on("quietcall")`
+               gets `&& ime_on("quietcall")` back;
+  readcse:     rules.fd `g_ru_readcse = ...` gets `&& ru_opt_in`-style
+               FID_RULES_ON test back;
+  nowritecall: iropt.fd `on_nowrite` gets `&& ime_on("nowritecall")`.

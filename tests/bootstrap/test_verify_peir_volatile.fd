@@ -1,0 +1,98 @@
+// VF5, PEIR_VOLATILE_RA (compiler/pe_ir.fd): a value that no call crosses
+// may live in r10/r11 (or xmm2-xmm5), registers a call clobbers. Here
+// values stay live across operations that look like plain instructions but
+// run runtime code: a Vec push that grows the buffer, a bounds-checked get,
+// string concatenation and int_to_str, HashMap insert and get, division and
+// remainder by a variable (rax/rdx), and an f64 kept across a real call. If
+// the allocator took one of those for "no call", the runtime code would
+// overwrite the register and a sum below would change.
+//
+// Expected output:
+// 114750
+// 4560
+// 69
+// 6255
+// 14218
+// 13000
+
+fn twice(x: f64) -> f64 {
+    return x * 2.0;
+}
+
+fn main() -> i64 {
+    // Vec push (grows 100 times past its first buffer) and get
+    val a: i64 = 3;
+    val b: i64 = 5;
+    val c: i64 = 7;
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    var total: i64 = 0;
+    while k < 100 {
+        val x: i64 = a * k + 1;
+        val y: i64 = b * k + 2;
+        v.push(x + y);
+        val z: i64 = c * k + 3;
+        total = total + x + y + z + v.get(k);
+        k = k + 1;
+    }
+    println(total);
+
+    // strings: int_to_str and concatenation between a value's definition
+    // and its use
+    var s: str = "";
+    val p: i64 = 11;
+    val q: i64 = 13;
+    var acc: i64 = 0;
+    k = 0;
+    while k < 20 {
+        val m: i64 = p * k;
+        val n2: i64 = q * k;
+        s = s + int_to_str(m) + ",";
+        acc = acc + m + n2;
+        k = k + 1;
+    }
+    println(acc);
+    println(str_len(s));
+
+    // HashMap insert and get
+    var hm: HashMap<str, i64> = HashMap::new();
+    val u: i64 = 2;
+    val w: i64 = 9;
+    var hs: i64 = 0;
+    k = 0;
+    while k < 30 {
+        val before: i64 = u * k + w;
+        hm.insert("k" + int_to_str(k), before);
+        val after: i64 = w * k + u;
+        hs = hs + before + after + hm.get("k" + int_to_str(k));
+        k = k + 1;
+    }
+    println(hs);
+
+    // division and remainder by a variable: idiv takes rax and rdx
+    var dsum: i64 = 0;
+    k = 1;
+    while k <= 50 {
+        val keep1: i64 = k * 3;
+        val keep2: i64 = k + 100;
+        val qd: i64 = (keep2 * 7) / k;
+        val rm: i64 = (keep2 * 7) % (k + 1);
+        dsum = dsum + keep1 + keep2 + qd + rm;
+        k = k + 1;
+    }
+    println(dsum);
+
+    // an f64 defined before a call and used after it
+    var fx: f64 = 0.5;
+    var fs: f64 = 0.0;
+    k = 0;
+    while k < 16 {
+        val g1: f64 = fx + 1.0;
+        val g2: f64 = twice(fx);
+        fs = fs + g1 + g2;
+        fx = fx + 0.25;
+        k = k + 1;
+    }
+    println((fs * 100.0) as i64);
+    return 0;
+}

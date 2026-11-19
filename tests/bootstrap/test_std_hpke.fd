@@ -1,0 +1,85 @@
+// stdlib/hpke against RFC 9180 Appendix A.2.1 (DHKEM(X25519,
+// HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305, base mode): both key pairs
+// from ikmE/ikmR, enc, shared_secret, key_schedule_context, key,
+// base_nonce, exporter_secret, encryptions 0 and 1 and their opening, an
+// export; then psk and auth modes and single-shot seal/open round trip,
+// and the rejections (wrong info, wrong psk, wrong sender key).
+// Expected output:
+// skEm f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600
+// pkEm 1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a
+// skRm 8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb
+// pkRm 4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a
+// enc 1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a
+// shared_secret 0bbe78490412b4bbea4812666f7916932b828bba79942424abb65244930d69a7
+// context 00431df6cd95e11ff49d7013563baf7f11588c75a6611ee2a4404a49306ae4cfc5b69c5718a60cc5876c358d3f7fc31ddb598503f67be58ea1e798c0bb19eb9796
+// key ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91
+// base_nonce 5c4d98150661b848853b547f
+// exporter_secret a3b010d4994890e2c6968a36f64470d3c824c8f5029942feb11e7a74b2921922
+// seq0 1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28
+// seq1 6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e85285337cc95ba5f59992dc98c
+// opened Beauty is truth, truth beauty / Beauty is truth, truth beauty
+// export 4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e
+// psk mode true wrong psk false
+// auth mode true wrong sender false
+// single shot true wrong info false
+use hpke;
+use chacha20poly1305;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+fn hb(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn main() {
+    val info: Vec<i64> = hb("4f6465206f6e2061204772656369616e2055726e");
+    val e: HpkeKeyPair = hpke_derive_keypair(hb("909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b"));
+    val r: HpkeKeyPair = hpke_derive_keypair(hb("1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df"));
+    println("skEm " + hx(e.sk));
+    println("pkEm " + hx(e.pk));
+    println("skRm " + hx(r.sk));
+    println("pkRm " + hx(r.pk));
+    val ikm_e: Vec<i64> = hb("909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b");
+    val enc: HpkeEncap = hpke_encap(r.pk, ikm_e);
+    println("enc " + hx(enc.enc));
+    println("shared_secret " + hx(enc.shared_secret));
+    println("context " + hx(hpke_key_schedule_context(HPKE_MODE_BASE, info, Vec::new())));
+    val s: HpkeSender = hpke_setup_base_s(r.pk, info, ikm_e);
+    var sctx: HpkeContext = s.ctx;
+    println("key " + hx(sctx.key));
+    println("base_nonce " + hx(sctx.base_nonce));
+    println("exporter_secret " + hx(sctx.exporter_secret));
+    val pt: Vec<i64> = hb("4265617574792069732074727574682c20747275746820626561757479");
+    val c0: Vec<i64> = hpke_seal(& mut sctx, str_bytes("Count-0"), pt);
+    val c1: Vec<i64> = hpke_seal(& mut sctx, str_bytes("Count-1"), pt);
+    println("seq0 " + hx(c0));
+    println("seq1 " + hx(c1));
+    var rctx: HpkeContext = hpke_setup_base_r(s.enc, r.sk, info);
+    val o0: AeadOpened = hpke_open(& mut rctx, str_bytes("Count-0"), c0);
+    val o1: AeadOpened = hpke_open(& mut rctx, str_bytes("Count-1"), c1);
+    println("opened " + str_from_bytes(o0.data) + " / " + str_from_bytes(o1.data));
+    println("export " + hx(hpke_export(& rctx, Vec::new(), 32)));
+
+    val psk: Vec<i64> = str_bytes("a pre-shared key of 32 bytes!!!!");
+    val pid: Vec<i64> = str_bytes("psk id");
+    val ps: HpkeSender = hpke_setup_psk_s(r.pk, info, psk, pid, ikm_e);
+    var pctx: HpkeContext = ps.ctx;
+    val pc: Vec<i64> = hpke_seal(& mut pctx, Vec::new(), pt);
+    var pr: HpkeContext = hpke_setup_psk_r(ps.enc, r.sk, info, psk, pid);
+    var pbad: HpkeContext = hpke_setup_psk_r(ps.enc, r.sk, info, str_bytes("another pre-shared key of 32 b!!"), pid);
+    val po: AeadOpened = hpke_open(& mut pr, Vec::new(), pc);
+    val pb: AeadOpened = hpke_open(& mut pbad, Vec::new(), pc);
+    println("psk mode " + bool_to_str(po.ok) + " wrong psk " + bool_to_str(pb.ok));
+    val snd: HpkeKeyPair = hpke_derive_keypair(str_bytes("sender static key ikm"));
+    val asd: HpkeSender = hpke_setup_auth_s(r.pk, info, snd.sk, ikm_e);
+    var actx: HpkeContext = asd.ctx;
+    val ac: Vec<i64> = hpke_seal(& mut actx, Vec::new(), pt);
+    var ar: HpkeContext = hpke_setup_auth_r(asd.enc, r.sk, info, snd.pk);
+    var awrong: HpkeContext = hpke_setup_auth_r(asd.enc, r.sk, info, e.pk);
+    val ao: AeadOpened = hpke_open(& mut ar, Vec::new(), ac);
+    val aw: AeadOpened = hpke_open(& mut awrong, Vec::new(), ac);
+    println("auth mode " + bool_to_str(ao.ok) + " wrong sender " + bool_to_str(aw.ok));
+    val one: Vec<i64> = hpke_seal_base(r.pk, info, str_bytes("aad"), pt, str_bytes("another ephemeral ikm, 32 bytes."));
+    val back: AeadOpened = hpke_open_base(r.sk, info, str_bytes("aad"), one);
+    val bad: AeadOpened = hpke_open_base(r.sk, str_bytes("other info"), str_bytes("aad"), one);
+    println("single shot " + bool_to_str(back.ok && str_equal(hx(back.data), hx(pt))) + " wrong info " + bool_to_str(bad.ok));
+}

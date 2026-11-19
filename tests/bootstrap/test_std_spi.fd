@@ -1,0 +1,164 @@
+// stdlib/spi: spidev ioctl numbers, word packing, bit-banged modes 0-3 decoded by a slave, register and loopback fake devices, the spi_ioc_transfer image, a custom transport
+// Expected output:
+// SPI_IOC_MESSAGE(1): 40206b00
+// SPI_IOC_MESSAGE(2): 40406b00
+// WR_MODE: 40016b01
+// RD_MODE: 80016b01
+// WR_BITS_PER_WORD: 40016b03
+// WR_MAX_SPEED_HZ: 40046b04
+// WR_MODE32: 40046b05
+// pack 12-bit: bc0a2301
+// unpack 12-bit: 2748 291
+// mode 0 (CPOL=0, CPHA=0): 165 steps 17
+// mode 1 (CPOL=0, CPHA=1): 165 steps 16
+// mode 2 (CPOL=1, CPHA=0): 165 steps 17
+// mode 3 (CPOL=1, CPHA=1): 165 steps 16
+// mode 0 seen as mode 1: 75
+// lsb first: 165
+// reverse 0x01: 128
+// who am i: 51
+// write then read: true 71
+// burst: 0a0b0c
+// device saw: a8000000
+// loopback: 010203
+// words: 2748 2
+// no device: no device on chip select 2
+// image: 402000000000000041200000000000000100000000000000000000000000000042200000000000004320000000000000010000000000000000000000000000008f000000
+// image rx: 7700
+// custom: 0102
+// time: 32000
+use spi;
+use encoding;
+use string;
+
+fn custom_xfer(h: i64, req: Vec<i64>) -> Vec<i64> {
+    val xs: Vec<SpiXfer> = spi_decode_request(& req);
+    var out: Vec<i64> = Vec::new();
+    out.push(0);
+    var i: i64 = 0;
+    while i < xs.len() {
+        val x: SpiXfer = xs.get(i);
+        var j: i64 = 0;
+        while j < x.tx.len() {
+            out.push(h + j);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hex32(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push((v >> 24) & 0xFF);
+    b.push((v >> 16) & 0xFF);
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn main() {
+    println("SPI_IOC_MESSAGE(1): " + hex32(spi_ioc_message(1)));
+    println("SPI_IOC_MESSAGE(2): " + hex32(spi_ioc_message(2)));
+    println("WR_MODE: " + hex32(spi_ioc_wr_mode()));
+    println("RD_MODE: " + hex32(spi_ioc_rd_mode()));
+    println("WR_BITS_PER_WORD: " + hex32(spi_ioc_wr_bits_per_word()));
+    println("WR_MAX_SPEED_HZ: " + hex32(spi_ioc_wr_max_speed_hz()));
+    println("WR_MODE32: " + hex32(spi_ioc_wr_mode32()));
+
+    var w12: Vec<i64> = Vec::new();
+    w12.push(0xABC);
+    w12.push(0x123);
+    val packed: Vec<i64> = spi_pack_words(& w12, 12);
+    println("pack 12-bit: " + hex_encode_bytes(packed));
+    val un: Vec<i64> = spi_unpack_words(& packed, 12);
+    println("unpack 12-bit: " + int_to_str(un.get(0)) + " " + int_to_str(un.get(1)));
+
+    var m: i64 = 0;
+    while m < 4 {
+        val steps: Vec<SpiStep> = spi_bitbang_steps(m, 8, false, 0xA5);
+        val got: Vec<i64> = spi_slave_decode(m, 8, false, & steps);
+        println(spi_mode_name(m) + ": " + int_to_str(got.get(0)) + " steps " + int_to_str(steps.len()));
+        m = m + 1;
+    }
+    val s0: Vec<SpiStep> = spi_bitbang_steps(0, 8, false, 0xA5);
+    println("mode 0 seen as mode 1: " + int_to_str(spi_slave_decode(1, 8, false, & s0).get(0)));
+    val sl: Vec<SpiStep> = spi_bitbang_steps(3, 8, true, 0xA5);
+    println("lsb first: " + int_to_str(spi_slave_decode(3, 8, true, & sl).get(0)));
+    println("reverse 0x01: " + int_to_str(spi_reverse_bits(1, 8)));
+
+    var bus: SpiBus = spi_bus_fake(spi_config(SPI_MODE_3, 8, 1000000));
+    var dev: SpiFakeDev = spi_fake_regdev(0, 128);
+    spi_fake_set(& mut dev, 0x0F, hex_decode_bytes("33"));
+    spi_fake_set(& mut dev, 0x28, hex_decode_bytes("0a0b0c"));
+    spi_fake_add(& mut bus, dev);
+    spi_fake_add(& mut bus, spi_fake_loopback(1));
+    println("who am i: " + int_to_str(spi_read_reg8(& mut bus, 0x0F)));
+    val wok: bool = spi_write_regs(& mut bus, 0x20, hex_decode_bytes("47"));
+    println("write then read: " + bool_to_str(wok) + " " + int_to_str(spi_read_reg8(& mut bus, 0x20)));
+    match spi_read_regs(& mut bus, 0x28, 3) {
+        Result::Ok(b) => {
+            println("burst: " + hex_encode_bytes(b));
+        }
+        Result::Err(e) => {
+            println("burst: " + e);
+        }
+    }
+    val seen: SpiFakeDev = spi_fake_get(& bus, 0);
+    var last4: Vec<i64> = Vec::new();
+    var k: i64 = seen.written.len() - 4;
+    while k < seen.written.len() {
+        last4.push(seen.written.get(k));
+        k = k + 1;
+    }
+    println("device saw: " + hex_encode_bytes(last4));
+
+    spi_select(& mut bus, 1);
+    match spi_transfer(& mut bus, hex_decode_bytes("010203")) {
+        Result::Ok(b) => {
+            println("loopback: " + hex_encode_bytes(b));
+        }
+        Result::Err(e) => {
+            println("loopback: " + e);
+        }
+    }
+    bus.cfg.bits_per_word = 12;
+    var ws: Vec<i64> = Vec::new();
+    ws.push(0xABC);
+    match spi_transfer_words(& mut bus, ws) {
+        Result::Ok(w) => {
+            println("words: " + int_to_str(w.get(0)) + " " + int_to_str(spi_word_bytes(12)));
+        }
+        Result::Err(e) => {
+            println("words: " + e);
+        }
+    }
+    spi_select(& mut bus, 2);
+    match spi_transfer(& mut bus, hex_decode_bytes("00")) {
+        Result::Ok(_) => {
+            println("no device: answered");
+        }
+        Result::Err(e) => {
+            println("no device: " + e);
+        }
+    }
+
+    var xs: Vec<SpiXfer> = Vec::new();
+    xs.push(spi_xfer(hex_decode_bytes("8f")));
+    xs.push(spi_xfer(hex_decode_bytes("00")));
+    var img: Vec<i64> = spi_ioc_image(& xs, 0x2000);
+    println("image: " + hex_encode_bytes(img));
+    img.set(65, 0x77);
+    println("image rx: " + hex_encode_bytes(spi_ioc_rx(& xs, & img)));
+
+    var cb: SpiBus = spi_bus_custom(1, spi_config(SPI_MODE_0, 8, 500000), custom_xfer);
+    match spi_transfer(& mut cb, hex_decode_bytes("ffff")) {
+        Result::Ok(b) => {
+            println("custom: " + hex_encode_bytes(b));
+        }
+        Result::Err(e) => {
+            println("custom: " + e);
+        }
+    }
+    println("time: " + int_to_str(spi_transfer_ns(4, 8, 1000000)));
+}

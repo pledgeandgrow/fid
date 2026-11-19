@@ -1,0 +1,365 @@
+// Fides deferred ("compact") logging, pure Fides, in the manner of defmt
+// and Trice: the device never formats text.
+//
+//   - At registration every format string gets an index in a LogTable
+//     (on a target the table is built at compile time and kept on the
+//     host only, e.g. in an ELF section that is not loaded).
+//   - A log call sends a record: varint(index), varint(timestamp delta
+//     since the previous record), then each argument in the encoding its
+//     placeholder names. Integers are LEB128 varints (signed ones
+//     zigzag-encoded, so small negative numbers stay short).
+//   - The host decoder reads records with the same table (it knows each
+//     record's arguments from its format) and rebuilds the text.
+// Placeholders: {} signed decimal, {u} unsigned decimal, {x} hex,
+// {b} bool, {c} character, {s} string (varint length + bytes), {q}
+// Q16.16 fixed point shown with 4 decimals. "{{" and "}}" are literal
+// braces. The table can be exported to bytes and imported on the host.
+//
+// No platform seam: the record bytes go to whatever transport the caller
+// has (a UART ring, RTT, semihosting).
+
+module log_compact;
+ use vec; use string;
+
+pub const LOG_TRACE: i64 = 0;
+pub const LOG_DEBUG: i64 = 1;
+pub const LOG_INFO: i64 = 2;
+pub const LOG_WARN: i64 = 3;
+pub const LOG_ERROR: i64 = 4;
+
+pub fn log_level_name(l: i64) -> str {
+    val n: Vec<str> = str_split("TRACE,DEBUG,INFO,WARN,ERROR", ",");
+    if l >= 0 && l < n.len() { return n.get(l); }
+    return "L" + int_to_str(l);
+}
+
+// ─── Varints ────────────────────────────────────────────────────────────
+
+/// Unsigned LEB128 (the value is taken as a 64-bit unsigned pattern).
+pub fn log_put_uvarint(out: &mut Vec<i64>, v0: i64) {
+    var v: i64 = v0;
+    while true {
+        val b: i64 = v & 0x7F;
+        v = (v >> 7) & 0x01FFFFFFFFFFFFFF;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+@wrapping
+pub fn log_zigzag(v: i64) -> i64 {
+    return (v << 1) ^ (v >> 63);
+}
+
+pub fn log_unzigzag(z: i64) -> i64 {
+    return ((z >> 1) & 0x7FFFFFFFFFFFFFFF) ^ (0 - (z & 1));
+}
+
+pub fn log_put_svarint(out: &mut Vec<i64>, v: i64) {
+    log_put_uvarint(out, log_zigzag(v));
+}
+
+/// A cursor over received bytes.
+pub struct LogReader {
+    pub bytes: Vec<i64>,
+    pub pos: i64,
+    pub bad: bool,
+}
+
+pub fn log_reader(bytes: Vec<i64>) -> LogReader {
+    return LogReader { bytes: bytes, pos: 0, bad: false };
+}
+
+pub fn log_get_uvarint(r: &mut LogReader) -> i64 {
+    var v: i64 = 0;
+    var shift: i64 = 0;
+    while true {
+        if r.pos >= r.bytes.len() || shift > 63 {
+            r.bad = true;
+            return 0;
+        }
+        val b: i64 = r.bytes.get(r.pos);
+        r.pos = r.pos + 1;
+        v = v | ((b & 0x7F) << shift);
+        if (b & 0x80) == 0 { return v; }
+        shift = shift + 7;
+    }
+    return v;
+}
+
+pub fn log_get_svarint(r: &mut LogReader) -> i64 {
+    return log_unzigzag(log_get_uvarint(r));
+}
+
+// ─── Format strings ─────────────────────────────────────────────────────
+
+/// The argument kinds of a format, one letter each: d u x b c s q.
+pub fn log_arg_kinds(fmt: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    val n: i64 = str_len(fmt);
+    while i < n {
+        val c: i64 = str_byte_at(fmt, i);
+        if c == 123 && i + 1 < n && str_byte_at(fmt, i + 1) == 123 {
+            i = i + 2;
+            continue;
+        }
+        if c == 125 && i + 1 < n && str_byte_at(fmt, i + 1) == 125 {
+            i = i + 2;
+            continue;
+        }
+        if c == 123 {
+            val close: i64 = str_find(str_slice(fmt, i, n), "}");
+            if close < 0 { return "?"; }
+            val spec: str = str_slice(fmt, i + 1, i + close);
+            if str_len(spec) == 0 { out = out + "d"; }
+            else if str_equal(spec, "u") || str_equal(spec, "x") || str_equal(spec, "b") || str_equal(spec, "c")
+                || str_equal(spec, "s") || str_equal(spec, "q") { out = out + spec; }
+            else { return "?"; }
+            i = i + close + 1;
+            continue;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub struct LogTable {
+    pub formats: Vec<str>,
+    pub levels: Vec<i64>,
+    pub kinds: Vec<str>,
+    pub index: HashMap<str, i64>,
+}
+
+pub fn logtable_new() -> LogTable {
+    return LogTable { formats: Vec::new(), levels: Vec::new(), kinds: Vec::new(), index: HashMap::new() };
+}
+
+/// Intern a format string at a level; the same (level, format) gives the
+/// same index. Panics on a malformed placeholder.
+pub fn logtable_register(t: &mut LogTable, level: i64, fmt: str) -> i64 {
+    val key: str = int_to_str(level) + ":" + fmt;
+    if t.index.contains(key) { return t.index.get(key); }
+    val k: str = log_arg_kinds(fmt);
+    if str_equal(k, "?") { p_panic("log_compact: bad placeholder in \"" + fmt + "\""); }
+    t.formats.push(fmt);
+    t.levels.push(level);
+    t.kinds.push(k);
+    t.index.insert(key, t.formats.len() - 1);
+    return t.formats.len() - 1;
+}
+
+/// The table as bytes for the host: varint count, then per entry level,
+/// varint length and the UTF-8 bytes of the format.
+pub fn logtable_export(t: &LogTable) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    log_put_uvarint(&mut out, t.formats.len());
+    var i: i64 = 0;
+    while i < t.formats.len() {
+        out.push(t.levels.get(i));
+        val b: Vec<i64> = str_bytes(t.formats.get(i));
+        log_put_uvarint(&mut out, b.len());
+        out.extend(b);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn logtable_import(bytes: Vec<i64>) -> LogTable {
+    var t: LogTable = logtable_new();
+    var r: LogReader = log_reader(bytes);
+    val n: i64 = log_get_uvarint(&mut r);
+    var i: i64 = 0;
+    while i < n && !r.bad {
+        val lvl: i64 = r.bytes.get(r.pos);
+        r.pos = r.pos + 1;
+        val len: i64 = log_get_uvarint(&mut r);
+        var s: str = "";
+        var k: i64 = 0;
+        while k < len {
+            s = s + byte_to_str(r.bytes.get(r.pos + k));
+            k = k + 1;
+        }
+        r.pos = r.pos + len;
+        logtable_register(&mut t, lvl, s);
+        i = i + 1;
+    }
+    return t;
+}
+
+// ─── Device side: encoding ──────────────────────────────────────────────
+
+pub struct LogEncoder {
+    pub out: Vec<i64>,
+    pub last_ts: i64,
+    pub records: i64,
+    pub min_level: i64,
+    pub dropped: i64,
+}
+
+pub fn logenc_new(min_level: i64) -> LogEncoder {
+    return LogEncoder { out: Vec::new(), last_ts: 0, records: 0, min_level: min_level, dropped: 0 };
+}
+
+/// Emit one record for format `idx` at time `ts`. Integer-like
+/// arguments come from `ints`, {s} arguments from `strs`, each in order.
+pub fn logenc_emit(e: &mut LogEncoder, t: &LogTable, idx: i64, ts: i64, ints: Vec<i64>, strs: Vec<str>) {
+    if t.levels.get(idx) < e.min_level {
+        e.dropped = e.dropped + 1;
+        return;
+    }
+    val kinds: str = t.kinds.get(idx);
+    log_put_uvarint(&mut e.out, idx);
+    log_put_uvarint(&mut e.out, ts - e.last_ts);
+    e.last_ts = ts;
+    var ii: i64 = 0;
+    var si: i64 = 0;
+    var k: i64 = 0;
+    while k < str_len(kinds) {
+        val c: i64 = str_byte_at(kinds, k);
+        if c == 115 {
+            val b: Vec<i64> = str_bytes(strs.get(si));
+            si = si + 1;
+            log_put_uvarint(&mut e.out, b.len());
+            e.out.extend(b);
+        } else {
+            val v: i64 = ints.get(ii);
+            ii = ii + 1;
+            if c == 100 || c == 113 {
+                log_put_svarint(&mut e.out, v);
+            } else if c == 98 {
+                if v != 0 { e.out.push(1); } else { e.out.push(0); }
+            } else {
+                log_put_uvarint(&mut e.out, v);
+            }
+        }
+        k = k + 1;
+    }
+    e.records = e.records + 1;
+}
+
+// ─── Host side: decoding ────────────────────────────────────────────────
+
+fn log_hex(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    if v == 0 { return "0"; }
+    var out: str = "";
+    var x: i64 = v;
+    var n: i64 = 0;
+    while x != 0 && n < 16 {
+        out = str_slice(d, x & 15, (x & 15) + 1) + out;
+        x = (x >> 4) & 0x0FFFFFFFFFFFFFFF;
+        n = n + 1;
+    }
+    return out;
+}
+
+@wrapping
+fn log_udec(v: i64) -> str {
+    if v >= 0 { return int_to_str(v); }
+    // 64-bit unsigned: v = 2^64 + v; print via halves.
+    val hi: i64 = ((v >> 1) & 0x7FFFFFFFFFFFFFFF) / 5;
+    val lo: i64 = v - hi * 10;
+    return int_to_str(hi) + int_to_str(lo);
+}
+
+fn log_q16(v: i64) -> str {
+    var neg: bool = v < 0;
+    var a: i64 = v;
+    if neg { a = 0 - a; }
+    val ip: i64 = a >> 16;
+    var fr: i64 = ((a & 0xFFFF) * 10000 + 32768) >> 16;
+    var whole: i64 = ip;
+    if fr >= 10000 {
+        whole = whole + 1;
+        fr = fr - 10000;
+    }
+    var fs: str = int_to_str(fr);
+    while str_len(fs) < 4 { fs = "0" + fs; }
+    var out: str = int_to_str(whole) + "." + fs;
+    if neg && (whole != 0 || fr != 0) { out = "-" + out; }
+    return out;
+}
+
+/// One decoded record.
+pub struct LogLine {
+    pub ok: bool,
+    pub ts: i64,
+    pub level: i64,
+    pub text: str,
+}
+
+/// Decode the next record from `r` (absolute timestamp kept in `ts`).
+pub fn log_decode_one(t: &LogTable, r: &mut LogReader, ts: &mut i64) -> LogLine {
+    val idx: i64 = log_get_uvarint(r);
+    val dt: i64 = log_get_uvarint(r);
+    if r.bad { return LogLine { ok: false, ts: 0, level: 0, text: "truncated record" }; }
+    if idx >= t.formats.len() { return LogLine { ok: false, ts: 0, level: 0, text: "unknown format index " + int_to_str(idx) }; }
+    *ts = *ts + dt;
+    val fmt: str = t.formats.get(idx);
+    var out: str = "";
+    var i: i64 = 0;
+    val n: i64 = str_len(fmt);
+    while i < n {
+        val c: i64 = str_byte_at(fmt, i);
+        if (c == 123 || c == 125) && i + 1 < n && str_byte_at(fmt, i + 1) == c {
+            out = out + byte_to_str(c);
+            i = i + 2;
+            continue;
+        }
+        if c == 123 {
+            val close: i64 = str_find(str_slice(fmt, i, n), "}");
+            val spec: str = str_slice(fmt, i + 1, i + close);
+            if str_equal(spec, "s") {
+                val len: i64 = log_get_uvarint(r);
+                if r.pos + len > r.bytes.len() { r.bad = true; }
+                var k: i64 = 0;
+                while !r.bad && k < len {
+                    out = out + byte_to_str(r.bytes.get(r.pos + k));
+                    k = k + 1;
+                }
+                r.pos = r.pos + len;
+            } else if str_equal(spec, "b") {
+                if r.pos >= r.bytes.len() { r.bad = true; } else {
+                    if r.bytes.get(r.pos) != 0 { out = out + "true"; } else { out = out + "false"; }
+                    r.pos = r.pos + 1;
+                }
+            } else if str_len(spec) == 0 {
+                out = out + int_to_str(log_get_svarint(r));
+            } else if str_equal(spec, "q") {
+                out = out + log_q16(log_get_svarint(r));
+            } else {
+                val v: i64 = log_get_uvarint(r);
+                if str_equal(spec, "x") { out = out + "0x" + log_hex(v); }
+                else if str_equal(spec, "c") { out = out + byte_to_str(v & 0xFF); }
+                else { out = out + log_udec(v); }
+            }
+            if r.bad { return LogLine { ok: false, ts: 0, level: 0, text: "truncated record" }; }
+            i = i + close + 1;
+            continue;
+        }
+        out = out + byte_to_str(c);
+        i = i + 1;
+    }
+    return LogLine { ok: true, ts: *ts, level: t.levels.get(idx), text: out };
+}
+
+/// Decode a whole stream into lines "[ts] LEVEL text"; decoding stops at
+/// the first broken record (with an "!" line saying why).
+pub fn log_decode_all(t: &LogTable, bytes: Vec<i64>) -> Vec<str> {
+    var r: LogReader = log_reader(bytes);
+    var ts: i64 = 0;
+    var out: Vec<str> = Vec::new();
+    while r.pos < r.bytes.len() {
+        val l: LogLine = log_decode_one(t, &mut r, &mut ts);
+        if !l.ok {
+            out.push("! " + l.text);
+            return out;
+        }
+        out.push("[" + int_to_str(l.ts) + "] " + log_level_name(l.level) + " " + l.text);
+    }
+    return out;
+}

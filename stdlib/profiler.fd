@@ -16,7 +16,7 @@
 //   var fps = profiler_fps(&prof);
 
 module profiler;
- use vec; use string;
+ use vec;
 // ─── Profile Sample ──────────────────────────────────────────────────────
 
 pub struct ProfileSample {
@@ -64,6 +64,17 @@ pub struct Profiler {
 }
 
 /// Create a new profiler.
+///
+/// Example:
+///   var p = profiler_create();
+///   profiler_begin_frame(&mut p);
+///   profiler_count_draw_call(&mut p);
+///   profiler_count_draw_call(&mut p);
+///   profiler_count_triangles(&mut p, 12);
+///   profiler_end_frame(&mut p);
+///   assert_eq(profiler_draw_calls(&p), 2);
+///   assert_eq(profiler_triangles(&p), 12);
+///   assert(profiler_frame_time(&p) >= 0.0);
 pub fn profiler_create() -> Profiler {
     return Profiler {
         sample_names: Vec::new(), sample_starts: Vec::new(), sample_elapsed: Vec::new(), sample_depths: Vec::new(), sample_parents: Vec::new(), sample_stack: Vec::new(), hist_frame_times: Vec::new(), hist_draw_calls: Vec::new(), hist_triangles: Vec::new(), max_frames: 120, enabled: true, frame_count: 0, avg_fps: 0.0, min_frame_ms: 999999.0, max_frame_ms: 0.0, total_draw_calls: 0, current_depth: 0, cur_frame_number: 0, cur_frame_time: 0.0, cur_draw_calls: 0, cur_triangles: 0, cur_texture_binds: 0, cur_shader_switches: 0, cur_frame_start: 0.0,
@@ -138,7 +149,7 @@ pub fn profiler_begin(p: & mut Profiler, name: str) -> void {
 }
 
 /// End a profiled scope.
-pub fn profiler_end(p: & mut Profiler, name: str) -> void {
+pub fn profiler_end(p: & mut Profiler, _name: str) -> void {
     if !p.enabled {
         return;
     }
@@ -350,4 +361,44 @@ pub fn profiler_get_sample_idx(p: & Profiler, idx: i64) -> ProfileSample {
     return ProfileSample {
         name: p.sample_names.get(idx), start_ms: p.sample_starts.get(idx), elapsed_ms: p.sample_elapsed.get(idx), depth: p.sample_depths.get(idx), parent: p.sample_parents.get(idx),
     };
+}
+
+// ─── Sampling the running program (competitive SL15) ────────────────────
+// A sampling profiler the program starts and stops itself, with no
+// instrumentation: every millisecond of CPU time the program uses, the
+// runtime notes the function running ("self") and every function on its
+// stack ("total"). The same sampler as `FID_PROF=1 ./prog` on the native
+// backends (Linux: SIGPROF; Windows: a thread that suspends the sampled
+// threads), on the C backend a sampler thread (Windows) or SIGPROF (POSIX);
+// `fid run` counts calls instead (one sample per call). A service can
+// expose prof_report() on a control endpoint, or call prof_samples() for
+// the functions it watches.
+//
+//   use profiler;
+//   prof_start();
+//   work();
+//   prof_stop();
+//   prof_report();                 // the table, to stderr
+//   val n = prof_samples("work");  // samples with work on the stack
+
+/// Start sampling, from 0 (earlier samples are dropped). False when this
+/// build cannot sample (the C backend under tcc or WASI).
+pub fn prof_start() -> bool {
+    return p_prof_start() == 0;
+}
+
+/// Stop sampling; the samples taken (they stay until the next start).
+pub fn prof_stop() -> i64 {
+    return p_prof_stop();
+}
+
+/// The profile so far on stderr, most self time first (at most 40
+/// functions); the samples taken. Sampling goes on if it was on.
+pub fn prof_report() -> i64 {
+    return p_prof_report();
+}
+
+/// The samples taken with function `name` on the stack.
+pub fn prof_samples(name: str) -> i64 {
+    return p_prof_samples(name);
 }

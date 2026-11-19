@@ -1,0 +1,867 @@
+// Fides gRPC over HTTP/2: message framing, status and trailers, unary calls
+// and a service registry
+//
+// Real (pure computation, following the "gRPC over HTTP2" protocol spec):
+//   - Length-Prefixed-Message framing: a compressed flag byte, a 4-byte
+//     big-endian length, the message; a GrpcDeframer that takes bytes in
+//     any pieces (DATA frames split messages anywhere) and gives whole
+//     messages, rejecting oversize lengths and bad flag bytes;
+//   - status codes 0..16 with their names, the HTTP-status-to-gRPC mapping
+//     for responses without grpc-status, grpc-message percent-encoding,
+//     grpc-timeout values (n, u, m, S, M, H units, at most 8 digits);
+//   - request and response header lists (:method POST, :scheme, :path
+//     /package.Service/Method, :authority, content-type application/grpc,
+//     te: trailers, grpc-timeout, grpc-encoding, user metadata; :status 200,
+//     trailers grpc-status / grpc-message, Trailers-Only error responses);
+//   - those calls as HTTP/2 frames (stdlib http2 frames, stdlib hpack header
+//     blocks, CONTINUATION when a block is larger than the frame size) and
+//     back, on the client and the server side;
+//   - unary messages as stdlib protobuf bytes (PbWriter in, PbReader out);
+//     "gzip" message compression through stdlib compress;
+//   - GrpcServer: handlers registered by service and method name, dispatch
+//     by "/package.Service/Method" with the errors real servers give
+//     (UNIMPLEMENTED for unknown names, INTERNAL for a malformed or
+//     compressed-without-encoding message, UNIMPLEMENTED for an unknown
+//     grpc-encoding, HTTP 415 for a non-gRPC content type, 405 for not POST).
+//
+// The seam: no sockets here. The HTTP/2 connection (preface, SETTINGS, flow
+// control: stdlib http2's H2Conn, or any other) carries the frames that
+// grpc_client_frames / grpc_server_frames make and read. Streaming calls are
+// not driven by a state machine here; the framing and the deframer serve them.
+//
+// Usage (both sides, one stream):
+//   var w: PbWriter = pb_writer_new();
+//   pb_write_string(&mut w, 1, "world");
+//   val call: GrpcRequest = grpc_unary_request("/helloworld.Greeter/SayHello", "localhost", w.bytes);
+//   val frames: Vec<H2Frame> = grpc_client_frames(&mut enc, 1, call, 16384);
+//   ... server: var s: GrpcServer = grpc_server_new();
+//       grpc_server_add(&mut s, "helloworld.Greeter", "SayHello", say_hello);
+//       val out: Vec<H2Frame> = grpc_server_frames(&s, &mut dec, &mut enc2, frames, 16384);
+//   ... client: val resp: GrpcResponse = grpc_client_read(&mut dec2, out);
+
+module grpc;
+ use vec; use string; use http2; use hpack; use protobuf; use compress;
+
+// Status codes
+pub const GRPC_OK: i64 = 0;
+pub const GRPC_CANCELLED: i64 = 1;
+pub const GRPC_UNKNOWN: i64 = 2;
+pub const GRPC_INVALID_ARGUMENT: i64 = 3;
+pub const GRPC_DEADLINE_EXCEEDED: i64 = 4;
+pub const GRPC_NOT_FOUND: i64 = 5;
+pub const GRPC_ALREADY_EXISTS: i64 = 6;
+pub const GRPC_PERMISSION_DENIED: i64 = 7;
+pub const GRPC_RESOURCE_EXHAUSTED: i64 = 8;
+pub const GRPC_FAILED_PRECONDITION: i64 = 9;
+pub const GRPC_ABORTED: i64 = 10;
+pub const GRPC_OUT_OF_RANGE: i64 = 11;
+pub const GRPC_UNIMPLEMENTED: i64 = 12;
+pub const GRPC_INTERNAL: i64 = 13;
+pub const GRPC_UNAVAILABLE: i64 = 14;
+pub const GRPC_DATA_LOSS: i64 = 15;
+pub const GRPC_UNAUTHENTICATED: i64 = 16;
+
+/// The default largest message accepted (4 MiB, as gRPC implementations).
+pub const GRPC_MAX_MESSAGE: i64 = 4194304;
+
+pub fn grpc_status_name(code: i64) -> str {
+    if code == 0 { return "OK"; }
+    if code == 1 { return "CANCELLED"; }
+    if code == 2 { return "UNKNOWN"; }
+    if code == 3 { return "INVALID_ARGUMENT"; }
+    if code == 4 { return "DEADLINE_EXCEEDED"; }
+    if code == 5 { return "NOT_FOUND"; }
+    if code == 6 { return "ALREADY_EXISTS"; }
+    if code == 7 { return "PERMISSION_DENIED"; }
+    if code == 8 { return "RESOURCE_EXHAUSTED"; }
+    if code == 9 { return "FAILED_PRECONDITION"; }
+    if code == 10 { return "ABORTED"; }
+    if code == 11 { return "OUT_OF_RANGE"; }
+    if code == 12 { return "UNIMPLEMENTED"; }
+    if code == 13 { return "INTERNAL"; }
+    if code == 14 { return "UNAVAILABLE"; }
+    if code == 15 { return "DATA_LOSS"; }
+    if code == 16 { return "UNAUTHENTICATED"; }
+    return "CODE(" + int_to_str(code) + ")";
+}
+
+/// The status of a response that has an HTTP status but no grpc-status
+/// (the spec's "HTTP to gRPC Status Code Mapping").
+pub fn grpc_status_from_http(http_status: i64) -> i64 {
+    if http_status == 400 { return GRPC_INTERNAL; }
+    if http_status == 401 { return GRPC_UNAUTHENTICATED; }
+    if http_status == 403 { return GRPC_PERMISSION_DENIED; }
+    if http_status == 404 { return GRPC_UNIMPLEMENTED; }
+    if http_status == 429 || http_status == 502 || http_status == 503 || http_status == 504 {
+        return GRPC_UNAVAILABLE;
+    }
+    return GRPC_UNKNOWN;
+}
+
+// ─── Framing ──────────────────────────────────────────────────────────────
+
+/// A Length-Prefixed-Message: flag (1 = compressed), length, bytes.
+pub fn grpc_frame(msg: Vec<i64>, compressed: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if compressed {
+        out.push(1);
+    } else {
+        out.push(0);
+    }
+    val n: i64 = msg.len();
+    out.push((n >> 24) & 255);
+    out.push((n >> 16) & 255);
+    out.push((n >> 8) & 255);
+    out.push(n & 255);
+    var i: i64 = 0;
+    while i < n {
+        out.push(msg.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Takes the bytes of a stream's DATA frames as they come and gives the
+/// whole messages. ok false on a bad flag byte or a length over `max`.
+pub struct GrpcDeframer {
+    pub buf: Vec<i64>,
+    pub messages: Vec<Vec<i64>>,
+    pub compressed: Vec<bool>,
+    pub max: i64,
+    pub ok: bool,
+    pub error: str,
+}
+
+pub fn grpc_deframer_new(max: i64) -> GrpcDeframer {
+    return GrpcDeframer { buf: Vec::new(), messages: Vec::new(), compressed: Vec::new(), max: max, ok: true, error: "" };
+}
+
+pub fn grpc_deframer_feed(d: & mut GrpcDeframer, bytes: Vec<i64>) {
+    if !d.ok {
+        return;
+    }
+    var i: i64 = 0;
+    while i < bytes.len() {
+        d.buf.push(bytes.get(i));
+        i = i + 1;
+    }
+    var at: i64 = 0;
+    while d.buf.len() - at >= 5 {
+        val flag: i64 = d.buf.get(at);
+        if flag > 1 {
+            d.ok = false;
+            d.error = "bad compressed flag " + int_to_str(flag);
+            return;
+        }
+        val n: i64 = (d.buf.get(at + 1) << 24) | (d.buf.get(at + 2) << 16) | (d.buf.get(at + 3) << 8) | d.buf.get(at + 4);
+        if n > d.max {
+            d.ok = false;
+            d.error = "message of " + int_to_str(n) + " bytes is larger than " + int_to_str(d.max);
+            return;
+        }
+        if d.buf.len() - at - 5 < n {
+            break;
+        }
+        var m: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < n {
+            m.push(d.buf.get(at + 5 + k));
+            k = k + 1;
+        }
+        d.messages.push(m);
+        d.compressed.push(flag == 1);
+        at = at + 5 + n;
+    }
+    if at > 0 {
+        var rest: Vec<i64> = Vec::new();
+        var j: i64 = at;
+        while j < d.buf.len() {
+            rest.push(d.buf.get(j));
+            j = j + 1;
+        }
+        d.buf = rest;
+    }
+}
+
+/// Bytes held that are not a whole message yet (non-zero at the end of a
+/// stream means it was cut).
+pub fn grpc_deframer_pending(d: & GrpcDeframer) -> i64 {
+    return d.buf.len();
+}
+
+// ─── grpc-message and grpc-timeout ────────────────────────────────────────
+
+/// Percent-encode a status message: bytes outside 0x20..0x7E and '%'.
+pub fn grpc_message_encode(s: str) -> str {
+    val hx: str = "0123456789ABCDEF";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 32 || c > 126 || c == 37 {
+            out.push(37);
+            out.push(str_byte_at(hx, c >> 4));
+            out.push(str_byte_at(hx, c & 15));
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn gr_hex(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return 0 - 1;
+}
+
+/// Decode a grpc-message value; a bad escape is kept as it is (as the
+/// spec asks of receivers).
+pub fn grpc_message_decode(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 && i + 2 < n && gr_hex(str_byte_at(s, i + 1)) >= 0 && gr_hex(str_byte_at(s, i + 2)) >= 0 {
+            out.push(gr_hex(str_byte_at(s, i + 1)) * 16 + gr_hex(str_byte_at(s, i + 2)));
+            i = i + 3;
+        } else {
+            out.push(c);
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+/// A grpc-timeout value for `ms` milliseconds: "<n>m" while it fits in 8
+/// digits, else seconds, minutes, hours.
+pub fn grpc_timeout_encode(ms: i64) -> str {
+    if ms < 100000000 {
+        return int_to_str(ms) + "m";
+    }
+    val s: i64 = (ms + 999) / 1000;
+    if s < 100000000 {
+        return int_to_str(s) + "S";
+    }
+    val m: i64 = (s + 59) / 60;
+    if m < 100000000 {
+        return int_to_str(m) + "M";
+    }
+    return int_to_str((m + 59) / 60) + "H";
+}
+
+/// A grpc-timeout value in milliseconds (rounded up), or -1 when bad.
+pub fn grpc_timeout_parse(v: str) -> i64 {
+    val n: i64 = str_len(v);
+    if n < 2 || n > 9 {
+        return 0 - 1;
+    }
+    var x: i64 = 0;
+    var i: i64 = 0;
+    while i < n - 1 {
+        val c: i64 = str_byte_at(v, i);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        x = x * 10 + (c - 48);
+        i = i + 1;
+    }
+    val u: i64 = str_byte_at(v, n - 1);
+    if u == 72 { return x * 3600000; }
+    if u == 77 { return x * 60000; }
+    if u == 83 { return x * 1000; }
+    if u == 109 { return x; }
+    if u == 117 { return (x + 999) / 1000; }
+    if u == 110 { return (x + 999999) / 1000000; }
+    return 0 - 1;
+}
+
+// ─── Requests and responses ───────────────────────────────────────────────
+
+/// A call as headers and message bytes (before framing into HTTP/2).
+pub struct GrpcRequest {
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub body: Vec<i64>,
+}
+
+/// A unary request: `msg` is the protobuf encoding of the request message.
+pub fn grpc_unary_request(path: str, authority: str, msg: Vec<i64>) -> GrpcRequest {
+    var r: GrpcRequest = GrpcRequest { names: Vec::new(), vals: Vec::new(), body: grpc_frame(msg, false) };
+    r.names.push(":method");
+    r.vals.push("POST");
+    r.names.push(":scheme");
+    r.vals.push("http");
+    r.names.push(":path");
+    r.vals.push(path);
+    r.names.push(":authority");
+    r.vals.push(authority);
+    r.names.push("content-type");
+    r.vals.push("application/grpc");
+    r.names.push("te");
+    r.vals.push("trailers");
+    return r;
+}
+
+pub fn grpc_request_set_timeout(r: & mut GrpcRequest, ms: i64) {
+    r.names.push("grpc-timeout");
+    r.vals.push(grpc_timeout_encode(ms));
+}
+
+/// Custom metadata (lowercase name; a "-bin" name takes base64 values).
+pub fn grpc_request_add_metadata(r: & mut GrpcRequest, name: str, value: str) {
+    r.names.push(str_to_lower(name));
+    r.vals.push(value);
+}
+
+/// Send the message gzip-compressed (grpc-encoding: gzip).
+pub fn grpc_request_gzip(r: & mut GrpcRequest, msg: Vec<i64>) {
+    r.names.push("grpc-encoding");
+    r.vals.push("gzip");
+    r.body = grpc_frame(gzip_compress_bytes(msg), true);
+}
+
+fn gr_header(names: Vec<str>, vals: Vec<str>, name: str) -> str {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name {
+            return vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// A header block as HEADERS (+ CONTINUATION) frames no larger than `max`.
+fn gr_header_frames(out: & mut Vec<H2Frame>, stream: i64, block: Vec<i64>, end_stream: bool, max: i64) {
+    if block.len() <= max {
+        out.push(h2_headers_frame(stream, block, end_stream, true));
+        return;
+    }
+    var first: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < max {
+        first.push(block.get(i));
+        i = i + 1;
+    }
+    out.push(h2_headers_frame(stream, first, end_stream, false));
+    while i < block.len() {
+        var part: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < max && i < block.len() {
+            part.push(block.get(i));
+            i = i + 1;
+            k = k + 1;
+        }
+        out.push(h2_continuation_frame(stream, part, i >= block.len()));
+    }
+}
+
+// Data as DATA frames no larger than `max` (one empty frame for none).
+fn gr_data_frames(out: & mut Vec<H2Frame>, stream: i64, data: Vec<i64>, end_stream: bool, max: i64) {
+    var i: i64 = 0;
+    if data.len() == 0 {
+        out.push(h2_data_frame(stream, data, end_stream, 0));
+        return;
+    }
+    while i < data.len() {
+        var part: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < max && i < data.len() {
+            part.push(data.get(i));
+            i = i + 1;
+            k = k + 1;
+        }
+        out.push(h2_data_frame(stream, part, end_stream && i >= data.len(), 0));
+    }
+}
+
+/// The client's frames for a request on `stream`: HEADERS, then DATA with
+/// END_STREAM. `max_frame` is the peer's SETTINGS_MAX_FRAME_SIZE.
+pub fn grpc_client_frames(enc: & mut Hpack, stream: i64, r: GrpcRequest, max_frame: i64) -> Vec<H2Frame> {
+    var out: Vec<H2Frame> = Vec::new();
+    gr_header_frames(& mut out, stream, hpack_encode(enc, r.names, r.vals), false, max_frame);
+    gr_data_frames(& mut out, stream, r.body, true, max_frame);
+    return out;
+}
+
+/// What a client received. status is the gRPC status (from grpc-status,
+/// or mapped from :status when there is none); messages are decompressed.
+pub struct GrpcResponse {
+    pub ok: bool,
+    pub error: str,
+    pub http_status: i64,
+    pub status: i64,
+    pub message: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub trailer_names: Vec<str>,
+    pub trailer_vals: Vec<str>,
+    pub messages: Vec<Vec<i64>>,
+    pub trailers_only: bool,
+}
+
+// Gather the header blocks and data of one stream's frames:
+// blocks[i] is the i-th complete header block.
+struct GrStream {
+    blocks: Vec<Vec<i64>>,
+    block_end_stream: Vec<bool>,
+    data: Vec<i64>,
+    data_before_block: Vec<i64>,
+    ended: bool,
+    ok: bool,
+    error: str,
+}
+
+fn gr_collect(frames: Vec<H2Frame>) -> GrStream {
+    var s: GrStream = GrStream { blocks: Vec::new(), block_end_stream: Vec::new(), data: Vec::new(), data_before_block: Vec::new(), ended: false, ok: true, error: "" };
+    var cur: Vec<i64> = Vec::new();
+    var in_block: bool = false;
+    var cur_end: bool = false;
+    var i: i64 = 0;
+    while i < frames.len() && s.ok {
+        val f: H2Frame = frames.get(i);
+        val info: H2Info = h2_parse(f);
+        if !info.ok {
+            s.ok = false;
+            s.error = "bad frame: " + info.why;
+            return s;
+        }
+        if in_block && f.ftype != H2_CONTINUATION {
+            s.ok = false;
+            s.error = "header block not finished";
+            return s;
+        }
+        if f.ftype == H2_HEADERS || f.ftype == H2_CONTINUATION {
+            if f.ftype == H2_HEADERS {
+                cur = Vec::new();
+                cur_end = (f.flags & H2_FLAG_END_STREAM) != 0;
+            } else if !in_block {
+                s.ok = false;
+                s.error = "CONTINUATION without HEADERS";
+                return s;
+            }
+            var k: i64 = 0;
+            while k < info.data.len() {
+                cur.push(info.data.get(k));
+                k = k + 1;
+            }
+            in_block = (f.flags & H2_FLAG_END_HEADERS) == 0;
+            if !in_block {
+                s.blocks.push(cur);
+                s.block_end_stream.push(cur_end);
+                s.data_before_block.push(s.data.len());
+                if cur_end {
+                    s.ended = true;
+                }
+            }
+        } else if f.ftype == H2_DATA {
+            var k: i64 = 0;
+            while k < info.data.len() {
+                s.data.push(info.data.get(k));
+                k = k + 1;
+            }
+            if (f.flags & H2_FLAG_END_STREAM) != 0 {
+                s.ended = true;
+            }
+        } else if f.ftype == H2_RST_STREAM {
+            s.ok = false;
+            s.error = "stream reset: " + h2_error_name(info.code);
+            return s;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn gr_unpack(d: & GrpcDeframer, encoding: str, out: & mut Vec<Vec<i64>>) -> str {
+    var i: i64 = 0;
+    while i < d.messages.len() {
+        if d.compressed.get(i) {
+            if encoding != "gzip" {
+                return "compressed message without a known grpc-encoding";
+            }
+            out.push(gzip_decompress(d.messages.get(i)));
+        } else {
+            out.push(d.messages.get(i));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Read a response from the frames of its stream (in the order received).
+pub fn grpc_client_read(dec: & mut Hpack, frames: Vec<H2Frame>) -> GrpcResponse {
+    var r: GrpcResponse = GrpcResponse { ok: true, error: "", http_status: 0, status: GRPC_UNKNOWN, message: "", names: Vec::new(), vals: Vec::new(), trailer_names: Vec::new(), trailer_vals: Vec::new(), messages: Vec::new(), trailers_only: false };
+    val s: GrStream = gr_collect(frames);
+    if !s.ok {
+        r.ok = false;
+        r.error = s.error;
+        r.status = GRPC_INTERNAL;
+        return r;
+    }
+    if s.blocks.len() == 0 {
+        r.ok = false;
+        r.error = "no headers";
+        r.status = GRPC_INTERNAL;
+        return r;
+    }
+    val h: HpackHeaders = hpack_decode(dec, s.blocks.get(0));
+    if !h.ok {
+        r.ok = false;
+        r.error = "header block: " + h.error;
+        r.status = GRPC_INTERNAL;
+        return r;
+    }
+    r.names = h.names;
+    r.vals = h.vals;
+    r.http_status = str_parse_int(gr_header(h.names, h.vals, ":status"));
+    var tn: Vec<str> = h.names;
+    var tv: Vec<str> = h.vals;
+    if s.block_end_stream.get(0) {
+        r.trailers_only = true;
+    } else if s.blocks.len() >= 2 {
+        val t: HpackHeaders = hpack_decode(dec, s.blocks.get(1));
+        if !t.ok {
+            r.ok = false;
+            r.error = "trailer block: " + t.error;
+            r.status = GRPC_INTERNAL;
+            return r;
+        }
+        tn = t.names;
+        tv = t.vals;
+    } else {
+        tn = Vec::new();
+        tv = Vec::new();
+    }
+    r.trailer_names = tn;
+    r.trailer_vals = tv;
+    val gs: str = gr_header(tn, tv, "grpc-status");
+    if str_len(gs) == 0 {
+        if r.http_status != 200 {
+            r.status = grpc_status_from_http(r.http_status);
+            r.message = "HTTP status " + int_to_str(r.http_status);
+        } else {
+            r.status = GRPC_INTERNAL;
+            r.message = "no grpc-status in the trailers";
+        }
+        return r;
+    }
+    r.status = str_parse_int(gs);
+    r.message = grpc_message_decode(gr_header(tn, tv, "grpc-message"));
+    var d: GrpcDeframer = grpc_deframer_new(GRPC_MAX_MESSAGE);
+    grpc_deframer_feed(& mut d, s.data);
+    if !d.ok || grpc_deframer_pending(& d) != 0 {
+        r.ok = false;
+        r.status = GRPC_INTERNAL;
+        if !d.ok {
+            r.error = d.error;
+        } else {
+            r.error = "the stream ended inside a message";
+        }
+        return r;
+    }
+    var msgs: Vec<Vec<i64>> = Vec::new();
+    val err: str = gr_unpack(& d, gr_header(h.names, h.vals, "grpc-encoding"), & mut msgs);
+    if str_len(err) > 0 {
+        r.ok = false;
+        r.status = GRPC_INTERNAL;
+        r.error = err;
+        return r;
+    }
+    r.messages = msgs;
+    return r;
+}
+
+/// A reader over the response's first message (for a unary call).
+pub fn grpc_response_reader(r: & GrpcResponse) -> PbReader {
+    if r.messages.len() == 0 {
+        var e: Vec<i64> = Vec::new();
+        return pb_reader_new(e);
+    }
+    return pb_reader_new(r.messages.get(0));
+}
+
+// ─── Server ───────────────────────────────────────────────────────────────
+
+/// One call as a handler sees it. deadline_ms: the grpc-timeout in ms, or
+/// -1 when the client set none.
+pub struct GrpcCall {
+    pub path: str,
+    pub service: str,
+    pub method: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub message: Vec<i64>,
+    pub deadline_ms: i64,
+}
+
+/// What a handler answers: status, message, the response message's bytes
+/// and extra trailers (and initial metadata in names/vals).
+pub struct GrpcReply {
+    pub status: i64,
+    pub message: str,
+    pub body: Vec<i64>,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub trailer_names: Vec<str>,
+    pub trailer_vals: Vec<str>,
+}
+
+pub fn grpc_reply_new() -> GrpcReply {
+    return GrpcReply { status: GRPC_OK, message: "", body: Vec::new(), names: Vec::new(), vals: Vec::new(), trailer_names: Vec::new(), trailer_vals: Vec::new() };
+}
+
+/// Answer OK with a protobuf message.
+pub fn grpc_reply_ok(r: & mut GrpcReply, w: PbWriter) {
+    r.status = GRPC_OK;
+    r.body = w.bytes;
+}
+
+pub fn grpc_reply_error(r: & mut GrpcReply, code: i64, message: str) {
+    r.status = code;
+    r.message = message;
+}
+
+pub fn grpc_call_header(c: & GrpcCall, name: str) -> str {
+    return gr_header(c.names, c.vals, name);
+}
+
+struct GrpcMethod {
+    service: str,
+    method: str,
+    handler: fn(& GrpcCall, & mut GrpcReply) -> bool,
+}
+
+pub struct GrpcServer {
+    methods: Vec<GrpcMethod>,
+    pub max_message: i64,
+    pub calls: i64,
+}
+
+pub fn grpc_server_new() -> GrpcServer {
+    return GrpcServer { methods: Vec::new(), max_message: GRPC_MAX_MESSAGE, calls: 0 };
+}
+
+/// Register a handler for "/service/method" (service with its package:
+/// "helloworld.Greeter"). The handler fills the reply; its result is not
+/// used.
+pub fn grpc_server_add(s: & mut GrpcServer, service: str, method: str, handler: fn(& GrpcCall, & mut GrpcReply) -> bool) {
+    s.methods.push(GrpcMethod { service: service, method: method, handler: handler });
+}
+
+/// The services registered, each once, in order.
+pub fn grpc_server_services(s: & GrpcServer) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < s.methods.len() {
+        val m: GrpcMethod = s.methods.get(i);
+        var seen: bool = false;
+        var k: i64 = 0;
+        while k < out.len() {
+            if out.get(k) == m.service {
+                seen = true;
+            }
+            k = k + 1;
+        }
+        if !seen {
+            out.push(m.service);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The server's answer, before HTTP/2 framing: http_status other than 200
+/// means a plain HTTP error. trailers_only: no DATA, the status goes in the
+/// one header block.
+pub struct GrpcServerResponse {
+    pub http_status: i64,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub body: Vec<i64>,
+    pub trailer_names: Vec<str>,
+    pub trailer_vals: Vec<str>,
+    pub trailers_only: bool,
+    pub status: i64,
+}
+
+fn gr_error_response(code: i64, message: str) -> GrpcServerResponse {
+    var r: GrpcServerResponse = GrpcServerResponse { http_status: 200, names: Vec::new(), vals: Vec::new(), body: Vec::new(), trailer_names: Vec::new(), trailer_vals: Vec::new(), trailers_only: true, status: code };
+    r.names.push(":status");
+    r.vals.push("200");
+    r.names.push("content-type");
+    r.vals.push("application/grpc");
+    r.names.push("grpc-status");
+    r.vals.push(int_to_str(code));
+    if str_len(message) > 0 {
+        r.names.push("grpc-message");
+        r.vals.push(grpc_message_encode(message));
+    }
+    return r;
+}
+
+fn gr_http_error(status: i64) -> GrpcServerResponse {
+    var r: GrpcServerResponse = GrpcServerResponse { http_status: status, names: Vec::new(), vals: Vec::new(), body: Vec::new(), trailer_names: Vec::new(), trailer_vals: Vec::new(), trailers_only: true, status: grpc_status_from_http(status) };
+    r.names.push(":status");
+    r.vals.push(int_to_str(status));
+    return r;
+}
+
+/// Dispatch a request given as its header list and DATA bytes.
+pub fn grpc_server_handle(s: & mut GrpcServer, names: Vec<str>, vals: Vec<str>, data: Vec<i64>) -> GrpcServerResponse {
+    s.calls = s.calls + 1;
+    if gr_header(names, vals, ":method") != "POST" {
+        return gr_http_error(405);
+    }
+    val ctype: str = gr_header(names, vals, "content-type");
+    if !str_starts_with(ctype, "application/grpc") {
+        return gr_http_error(415);
+    }
+    val path: str = gr_header(names, vals, ":path");
+    val slash: i64 = str_rfind(path, "/");
+    if str_len(path) < 3 || str_byte_at(path, 0) != 47 || slash <= 1 {
+        return gr_error_response(GRPC_UNIMPLEMENTED, "malformed method name: " + path);
+    }
+    val service: str = str_slice(path, 1, slash);
+    val method: str = str_slice(path, slash + 1, str_len(path));
+    var found: i64 = 0 - 1;
+    var service_known: bool = false;
+    var i: i64 = 0;
+    while i < s.methods.len() {
+        val m: GrpcMethod = s.methods.get(i);
+        if m.service == service {
+            service_known = true;
+            if m.method == method {
+                found = i;
+            }
+        }
+        i = i + 1;
+    }
+    if found < 0 {
+        if !service_known {
+            return gr_error_response(GRPC_UNIMPLEMENTED, "unknown service " + service);
+        }
+        return gr_error_response(GRPC_UNIMPLEMENTED, "unknown method " + method + " for service " + service);
+    }
+    val enc: str = gr_header(names, vals, "grpc-encoding");
+    if str_len(enc) > 0 && enc != "identity" && enc != "gzip" {
+        var e: GrpcServerResponse = gr_error_response(GRPC_UNIMPLEMENTED, "grpc-encoding " + enc + " is not supported");
+        e.names.push("grpc-accept-encoding");
+        e.vals.push("identity,gzip");
+        return e;
+    }
+    var d: GrpcDeframer = grpc_deframer_new(s.max_message);
+    grpc_deframer_feed(& mut d, data);
+    if !d.ok {
+        return gr_error_response(GRPC_RESOURCE_EXHAUSTED, d.error);
+    }
+    if grpc_deframer_pending(& d) != 0 || d.messages.len() != 1 {
+        return gr_error_response(GRPC_INTERNAL, "a unary call takes exactly one whole message, got " + int_to_str(d.messages.len()));
+    }
+    var msgs: Vec<Vec<i64>> = Vec::new();
+    val err: str = gr_unpack(& d, enc, & mut msgs);
+    if str_len(err) > 0 {
+        return gr_error_response(GRPC_INTERNAL, err);
+    }
+    var deadline: i64 = 0 - 1;
+    val tmo: str = gr_header(names, vals, "grpc-timeout");
+    if str_len(tmo) > 0 {
+        deadline = grpc_timeout_parse(tmo);
+        if deadline < 0 {
+            return gr_error_response(GRPC_INTERNAL, "bad grpc-timeout " + tmo);
+        }
+    }
+    val call: GrpcCall = GrpcCall { path: path, service: service, method: method, names: names, vals: vals, message: msgs.get(0), deadline_ms: deadline };
+    var reply: GrpcReply = grpc_reply_new();
+    val m: GrpcMethod = s.methods.get(found);
+    val h: fn(& GrpcCall, & mut GrpcReply) -> bool = m.handler;
+    h(& call, & mut reply);
+    if reply.status != GRPC_OK {
+        var e: GrpcServerResponse = gr_error_response(reply.status, reply.message);
+        var k: i64 = 0;
+        while k < reply.trailer_names.len() {
+            e.names.push(reply.trailer_names.get(k));
+            e.vals.push(reply.trailer_vals.get(k));
+            k = k + 1;
+        }
+        return e;
+    }
+    var r: GrpcServerResponse = GrpcServerResponse { http_status: 200, names: Vec::new(), vals: Vec::new(), body: Vec::new(), trailer_names: Vec::new(), trailer_vals: Vec::new(), trailers_only: false, status: GRPC_OK };
+    r.names.push(":status");
+    r.vals.push("200");
+    r.names.push("content-type");
+    r.vals.push("application/grpc");
+    var k: i64 = 0;
+    while k < reply.names.len() {
+        r.names.push(reply.names.get(k));
+        r.vals.push(reply.vals.get(k));
+        k = k + 1;
+    }
+    if enc == "gzip" {
+        r.names.push("grpc-encoding");
+        r.vals.push("gzip");
+        r.body = grpc_frame(gzip_compress_bytes(reply.body), true);
+    } else {
+        r.body = grpc_frame(reply.body, false);
+    }
+    r.trailer_names.push("grpc-status");
+    r.trailer_vals.push("0");
+    k = 0;
+    while k < reply.trailer_names.len() {
+        r.trailer_names.push(reply.trailer_names.get(k));
+        r.trailer_vals.push(reply.trailer_vals.get(k));
+        k = k + 1;
+    }
+    return r;
+}
+
+/// The frames of a server response on `stream`.
+pub fn grpc_server_response_frames(enc: & mut Hpack, stream: i64, r: GrpcServerResponse, max_frame: i64) -> Vec<H2Frame> {
+    var out: Vec<H2Frame> = Vec::new();
+    if r.trailers_only {
+        gr_header_frames(& mut out, stream, hpack_encode(enc, r.names, r.vals), true, max_frame);
+        return out;
+    }
+    gr_header_frames(& mut out, stream, hpack_encode(enc, r.names, r.vals), false, max_frame);
+    gr_data_frames(& mut out, stream, r.body, false, max_frame);
+    gr_header_frames(& mut out, stream, hpack_encode(enc, r.trailer_names, r.trailer_vals), true, max_frame);
+    return out;
+}
+
+/// Serve one stream: its request frames in, the response frames out.
+/// A stream that does not end, or whose frames are malformed, is reset
+/// (RST_STREAM PROTOCOL_ERROR).
+pub fn grpc_server_frames(s: & mut GrpcServer, dec: & mut Hpack, enc: & mut Hpack, frames: Vec<H2Frame>, max_frame: i64) -> Vec<H2Frame> {
+    var out: Vec<H2Frame> = Vec::new();
+    var stream: i64 = 0;
+    if frames.len() > 0 {
+        stream = frames.get(0).stream;
+    }
+    val st: GrStream = gr_collect(frames);
+    if !st.ok || st.blocks.len() == 0 || !st.ended {
+        out.push(h2_rst_stream_frame(stream, H2_PROTOCOL_ERROR));
+        return out;
+    }
+    val h: HpackHeaders = hpack_decode(dec, st.blocks.get(0));
+    if !h.ok {
+        out.push(h2_rst_stream_frame(stream, H2_COMPRESSION_ERROR));
+        return out;
+    }
+    val r: GrpcServerResponse = grpc_server_handle(s, h.names, h.vals, st.data);
+    return grpc_server_response_frames(enc, stream, r, max_frame);
+}
+
+/// Frames as wire bytes (to write to the connection).
+pub fn grpc_frames_bytes(frames: Vec<H2Frame>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < frames.len() {
+        h2_put_frame(& mut out, frames.get(i));
+        i = i + 1;
+    }
+    return out;
+}

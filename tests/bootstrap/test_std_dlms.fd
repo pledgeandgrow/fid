@@ -1,0 +1,97 @@
+// stdlib/dlms: CRC-16/X-25 check value, OBIS parse/format/name, A-XDR
+// encode+decode of scalars/strings/structures/date-time, an HDLC frame round
+// trip with HCS+FCS verified, AARQ/AARE, and GET.request/GET.response.
+// Expected output:
+// crc 123456789: 906e
+// obis: 1-0:1.8.0.255 groups 1 0 1 8 0 255 name active energy import
+// axdr uint32 123456: 06 00 01 e2 40 ; decode tag 6 val 123456
+// axdr struct: tag 2 count 2 elem0 uint16 230 elem1 visible "kWh"
+// axdr datetime: 2024-11-17 13:45:30 (12 bytes)
+// hdlc: parse ok control 0x13 info 5 bytes, hcs+fcs verified
+// aare: result 0 diagnostic 0
+// get req: class 3 obis 1-0:1.8.0.255 attr 2
+// get resp data: invoke 1 value 123456; error resp: code 2
+use dlms;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hxs(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + " "; }
+        var h: str = int_to_hex(v.get(i));
+        if str_len(h) < 2 { h = "0" + h; }
+        s = s + h;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn hex2(n: i64) -> str {
+    return int_to_hex(n);
+}
+
+fn main() {
+    // CRC check value
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 9 { m.push(49 + i); i = i + 1; }
+    println("crc 123456789: " + int_to_hex(dlms_crc(& m, 0, 9)));
+
+    // OBIS
+    val o: ObisCode = dlms_obis_parse("1-0:1.8.0.255");
+    println("obis: " + dlms_obis_format(& o) + " groups " + int_to_str(o.a) + " " + int_to_str(o.b) + " " + int_to_str(o.c) + " " + int_to_str(o.d) + " " + int_to_str(o.e) + " " + int_to_str(o.f) + " name " + dlms_obis_name(& o));
+
+    // A-XDR uint32
+    val u: Vec<i64> = dlms_axdr_uint32(123456);
+    val ud: AxdrValue = dlms_decode(& u, 0);
+    println("axdr uint32 123456: " + hxs(u) + " ; decode tag " + int_to_str(ud.tag) + " val " + int_to_str(ud.ival));
+
+    // A-XDR structure { uint16 230, visible "kWh" }
+    var elems: Vec<Vec<i64>> = Vec::new();
+    elems.push(dlms_axdr_uint16(230));
+    elems.push(dlms_axdr_visible_string("kWh"));
+    val st: Vec<i64> = dlms_axdr_structure(& elems);
+    val sd: AxdrValue = dlms_decode(& st, 0);
+    val e0: AxdrValue = dlms_decode(& st, sd.content);
+    val e1: AxdrValue = dlms_decode(& st, e0.next);
+    println("axdr struct: tag " + int_to_str(sd.tag) + " count " + int_to_str(sd.count) + " elem0 uint16 " + int_to_str(e0.ival) + " elem1 visible \"" + e1.text + "\"");
+
+    // A-XDR date-time
+    val dt: Vec<i64> = dlms_axdr_datetime(2024, 11, 17, 7, 13, 45, 30);
+    val dtd: AxdrValue = dlms_decode(& dt, 0);
+    println("axdr datetime: 2024-11-17 13:45:30 (" + int_to_str(dtd.bytes.len()) + " bytes)");
+
+    // HDLC frame round trip
+    var info: Vec<i64> = Vec::new();
+    info.push(0xE6); info.push(0xE6); info.push(0x00); info.push(0xC0); info.push(0x01);
+    val frame: Vec<i64> = dlms_hdlc_frame(1, 1, 16, 1, 0x13, & info);
+    val hf: HdlcFrame = dlms_hdlc_parse(& frame);
+    var okstr: str = "FAIL " + hf.error;
+    if hf.ok { okstr = "ok"; }
+    println("hdlc: parse " + okstr + " control 0x" + int_to_hex(hf.control) + " info " + int_to_str(hf.info.len()) + " bytes, hcs+fcs verified");
+
+    // AARE
+    val aare: Vec<i64> = dlms_aare(0, 0);
+    val ap: Aare = dlms_aare_parse(& aare);
+    println("aare: result " + int_to_str(ap.result) + " diagnostic " + int_to_str(ap.diagnostic));
+
+    // GET request
+    val req: Vec<i64> = dlms_get_request(1, 3, & o, 2);
+    val rp: GetRequest = dlms_get_request_parse(& req);
+    println("get req: class " + int_to_str(rp.class_id) + " obis " + dlms_obis_format(& rp.obis) + " attr " + int_to_str(rp.attribute_id));
+
+    // GET response (data) and error
+    val resp: Vec<i64> = dlms_get_response(1, & dlms_axdr_uint32(123456));
+    val gr: GetResponse = dlms_get_response_parse(& resp);
+    val dv: AxdrValue = dlms_decode(& resp, gr.data_start);
+    val errresp: Vec<i64> = dlms_get_response_error(1, 2);
+    val er: GetResponse = dlms_get_response_parse(& errresp);
+    println("get resp data: invoke " + int_to_str(gr.invoke_id) + " value " + int_to_str(dv.ival) + "; error resp: code " + int_to_str(er.error_code));
+}

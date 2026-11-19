@@ -1,0 +1,964 @@
+// Fides world substitution for tests (complaint CT1): replace the file
+// system, the clock and the network for the code under test, with no
+// mocking framework and no change to that code.
+//
+// The standard library's effectful functions ask this module first: fs
+// (fs_read_text, fs_write_text, fs_append_text, fs_read_bytes,
+// fs_write_bytes, fs_exists, fs_is_file, fs_file_size, fs_delete,
+// fs_read_lines; fs's File::open/create/append handles and FileView;
+// directories: fs_list_dir, fs_is_dir, fs_mkdir, fs_mkdir_all, fs_rmdir,
+// fs_rmdir_all, fs_rename, fs_walk, fs_glob, fs_temp_file/dir; io's
+// Reader::open, Writer::create and Writer::append), the clock
+// (clock_now_ms/us/ns and the clock_elapsed_* functions in time, dt_now in
+// datetime), HTTP (every http_client request) and raw sockets (stdlib/net:
+// see Sockets below). A test
+// turns a fake on, seeds it, calls the real code, and checks the result
+// and what the code touched:
+//
+//   use world;
+//   fn test_report() {
+//       world_fake_files();
+//       world_file_put("in.csv", "a,1\nb,2\n");
+//       world_fake_clock(1700000000000);         // ms since the epoch
+//       world_fake_network(my_server);           // fn(host, port, raw request) -> raw response
+//       build_report("in.csv", "out.txt");       // the code under test, unchanged
+//       assert(str_equal(world_file_text("out.txt"), "..."));
+//       assert(world_net_count() == 1);
+//   }
+//
+// Each fake starts empty and lives until the process ends (`fid test`
+// runs every test in its own process) or until world_real_* turns it
+// off. With a fake on, nothing reaches the disk, the OS clock or a
+// socket: a missing file is missing, an unanswered host is a transport
+// failure (status 0). world_no_network() refuses every request, so a test
+// can show the code makes none. The fake file system is text: a NUL byte
+// ends a file written through fs_write_bytes.
+//
+// The effects say what a test has to replace: a function whose inferred
+// effects have neither IO nor Net touches none of this. A test marked
+// `@hermetic` is checked at compile time (compiler/typechecker.fd,
+// TypeChecker_verify_hermetic): everything it calls that has the IO or
+// Net effect must reach the files, the clock and the network only through
+// the functions above, which consult this module; a direct runtime call
+// (p_file_read, p_clock_now_ms, p_net_connect, ...) or core's read_file
+// on the way is an error naming the call path. world_hermetic() turns
+// every fake on at once.
+
+module world;
+
+// ─── Files ──────────────────────────────────────────────────────────────
+
+var world_fs_on: bool = false;
+var world_fs_paths: Vec<str> = Vec::new();
+var world_fs_data: Vec<str> = Vec::new();
+var world_fs_dirs: Vec<str> = Vec::new();   // directories made or seeded (see Directories)
+var world_fs_reads: i64 = 0;
+var world_fs_writes: i64 = 0;
+
+/// Replace the file system with an empty in-memory one.
+///
+/// Example:
+///   world_fake_files();
+///   assert(world_files_faked());
+///   world_file_put("./cfg/app.ini", "port = 1");
+///   assert(world_file_exists("cfg/app.ini"));
+///   assert_eq(world_file_text("cfg\\app.ini"), "port = 1");
+///   assert_eq(world_file_list().len(), 1);
+///   assert(world_file_remove("cfg/app.ini"));
+///   assert(!world_file_exists("cfg/app.ini"));
+///   world_real_files();
+///   assert(!world_files_faked());
+pub fn world_fake_files() -> void {
+    world_fs_on = true;
+    world_fs_paths = Vec::new();
+    world_fs_data = Vec::new();
+    world_fs_dirs = Vec::new();
+    world_fs_reads = 0;
+    world_fs_writes = 0;
+}
+
+/// Go back to the real file system (the fake's files are dropped).
+pub fn world_real_files() -> void {
+    world_fs_on = false;
+    world_fs_paths = Vec::new();
+    world_fs_data = Vec::new();
+    world_fs_dirs = Vec::new();
+}
+
+/// True while the file system is faked.
+pub fn world_files_faked() -> bool {
+    return world_fs_on;
+}
+
+// "./a/b" and "a/b", "a\\b" name the same fake file
+fn world_norm(path: str) -> str {
+    var p: str = str_replace(path, "\\", "/");
+    while str_starts_with(p, "./") { p = str_slice(p, 2, str_len(p)); }
+    return p;
+}
+
+fn world_fs_index(path: str) -> i64 {
+    val p: str = world_norm(path);
+    var i: i64 = 0;
+    while i < world_fs_paths.len() {
+        if str_equal(world_fs_paths.get(i), p) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Create or replace a fake file (seeding does not count as a write).
+pub fn world_file_put(path: str, content: str) -> void {
+    val i: i64 = world_fs_index(path);
+    if i >= 0 {
+        world_fs_data.set(i, content);
+        return;
+    }
+    world_fs_paths.push(world_norm(path));
+    world_fs_data.push(content);
+}
+
+/// True when the fake file `path` exists.
+pub fn world_file_exists(path: str) -> bool {
+    return world_fs_index(path) >= 0;
+}
+
+/// The fake file's text ("" when it does not exist).
+pub fn world_file_text(path: str) -> str {
+    val i: i64 = world_fs_index(path);
+    if i < 0 { return ""; }
+    return world_fs_data.get(i);
+}
+
+/// The fake file's text, None when it does not exist.
+pub fn world_file_get(path: str) -> Option<str> {
+    val i: i64 = world_fs_index(path);
+    if i < 0 { return Option::None; }
+    return Option::Some(world_fs_data.get(i));
+}
+
+/// Remove a fake file; false when it did not exist.
+pub fn world_file_remove(path: str) -> bool {
+    val i: i64 = world_fs_index(path);
+    if i < 0 { return false; }
+    world_fs_paths.remove(i);
+    world_fs_data.remove(i);
+    return true;
+}
+
+/// The fake files' paths, in creation order.
+pub fn world_file_list() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < world_fs_paths.len() {
+        out.push(world_fs_paths.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// How many reads / writes the code made through the fake (fs functions).
+pub fn world_file_reads() -> i64 {
+    return world_fs_reads;
+}
+
+pub fn world_file_writes() -> i64 {
+    return world_fs_writes;
+}
+
+// The hooks the fs module calls (a read or write the code makes).
+
+/// fs read hook: the file's text, None when missing.
+pub fn world_fs_read(path: str) -> Option<str> {
+    world_fs_reads = world_fs_reads + 1;
+    return world_file_get(path);
+}
+
+/// fs write hook: replace the file's text (false when `path` is a
+/// directory of the fake).
+pub fn world_fs_write(path: str, content: str) -> bool {
+    if world_fs_index(path) < 0 && world_dir_exists(path) { return false; }
+    world_fs_writes = world_fs_writes + 1;
+    world_file_put(path, content);
+    return true;
+}
+
+/// fs append hook: add to the file (creating it; false when `path` is a
+/// directory of the fake).
+pub fn world_fs_append(path: str, content: str) -> bool {
+    if world_fs_index(path) < 0 && world_dir_exists(path) { return false; }
+    world_fs_writes = world_fs_writes + 1;
+    world_file_put(path, world_file_text(path) + content);
+    return true;
+}
+
+// ─── Directories ────────────────────────────────────────────────────────
+// The fake file system has directories too: those the code makes
+// (fs_mkdir, fs_mkdir_all, fs_temp_dir), those a test seeds
+// (world_dir_put), and every directory a fake file's path passes through
+// ("logs/2023/a.txt" makes "logs" and "logs/2023"). "" and "." are the
+// current directory and "/" the root: they always exist. fs_list_dir,
+// fs_is_dir, fs_rmdir, fs_rmdir_all, fs_rename, fs_walk, fs_walk_files and
+// fs_glob see this view; a fake file may be written into a directory that
+// was never made (its path makes it). Making or removing a directory, and
+// a rename, count as writes.
+
+// "a/b/" and "./a/b" name the directory "a/b"; "." is ""
+fn world_dir_norm(path: str) -> str {
+    var p: str = world_norm(path);
+    while str_len(p) > 1 && str_ends_with(p, "/") { p = str_slice(p, 0, str_len(p) - 1); }
+    if str_equal(p, ".") { return ""; }
+    return p;
+}
+
+// the directory holding `p` (normalized): "" for "a", "/" for "/a"
+fn world_parent(p: str) -> str {
+    val i: i64 = str_rfind(p, "/");
+    if i < 0 { return ""; }
+    if i == 0 { return "/"; }
+    return str_slice(p, 0, i);
+}
+
+fn world_dir_index(p: str) -> i64 {
+    var i: i64 = 0;
+    while i < world_fs_dirs.len() {
+        if str_equal(world_fs_dirs.get(i), p) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// what names below directory p start with: "" for the current directory
+fn world_dir_prefix(p: str) -> str {
+    if str_len(p) == 0 { return ""; }
+    if str_equal(p, "/") { return "/"; }
+    return p + "/";
+}
+
+/// True when `path` is a directory of the fake file system.
+pub fn world_dir_exists(path: str) -> bool {
+    val p: str = world_dir_norm(path);
+    if str_len(p) == 0 || str_equal(p, "/") { return true; }
+    if world_fs_index(p) >= 0 { return false; }
+    if world_dir_index(p) >= 0 { return true; }
+    val pre: str = p + "/";
+    var i: i64 = 0;
+    while i < world_fs_paths.len() {
+        if str_starts_with(world_fs_paths.get(i), pre) { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < world_fs_dirs.len() {
+        if str_starts_with(world_fs_dirs.get(i), pre) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// add the first name after `pre` of every path in `paths` to `out`, once
+fn world_dir_collect(paths: Vec<str>, pre: str, out: & mut Vec<str>) -> void {
+    var i: i64 = 0;
+    while i < paths.len() {
+        val q: str = paths.get(i);
+        if str_len(q) > str_len(pre) && str_starts_with(q, pre) {
+            var rest: str = str_slice(q, str_len(pre), str_len(q));
+            val slash: i64 = str_find(rest, "/");
+            if slash >= 0 { rest = str_slice(rest, 0, slash); }
+            if str_len(rest) > 0 {
+                var seen: bool = false;
+                var k: i64 = 0;
+                while k < out.len() {
+                    if str_equal(out.get(k), rest) { seen = true; }
+                    k = k + 1;
+                }
+                if !seen { out.push(rest); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// sort names in place (byte order)
+fn world_sort_names(v: & mut Vec<str>) -> void {
+    var i: i64 = 1;
+    while i < v.len() {
+        var j: i64 = i;
+        while j > 0 && str_compare(v.get(j - 1), v.get(j)) > 0 {
+            val a: str = v.get(j - 1);
+            val b: str = v.get(j);
+            v.set(j - 1, b);
+            v.set(j, a);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// The names in fake directory `path` (files and directories, each once,
+/// sorted by name; no "." or ".."): empty when it is not a directory.
+pub fn world_dir_list(path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if !world_dir_exists(path) { return out; }
+    val pre: str = world_dir_prefix(world_dir_norm(path));
+    world_dir_collect(world_fs_paths, pre, & mut out);
+    world_dir_collect(world_fs_dirs, pre, & mut out);
+    world_sort_names(& mut out);
+    return out;
+}
+
+/// fs mkdir hook: make one directory; false when something already has
+/// that name or the directory holding it is missing (as mkdir).
+pub fn world_fs_mkdir(path: str) -> bool {
+    val p: str = world_dir_norm(path);
+    if str_len(p) == 0 || str_equal(p, "/") { return false; }
+    if world_fs_index(p) >= 0 || world_dir_exists(p) { return false; }
+    if !world_dir_exists(world_parent(p)) { return false; }
+    world_fs_writes = world_fs_writes + 1;
+    world_fs_dirs.push(p);
+    return true;
+}
+
+/// fs mkdir_all hook: make a directory and every missing one above it;
+/// true when it exists afterwards (false when a file is in the way).
+pub fn world_fs_mkdir_all(path: str) -> bool {
+    val p: str = world_dir_norm(path);
+    if str_len(p) == 0 { return false; }
+    if world_dir_exists(p) { return true; }
+    if world_fs_index(p) >= 0 { return false; }
+    val parent: str = world_parent(p);
+    if !world_dir_exists(parent) {
+        if !world_fs_mkdir_all(parent) { return false; }
+    }
+    return world_fs_mkdir(p);
+}
+
+/// Seed a directory (and those above it) without counting it as a write.
+pub fn world_dir_put(path: str) -> void {
+    val w: i64 = world_fs_writes;
+    world_fs_mkdir_all(path);
+    world_fs_writes = w;
+}
+
+/// fs rmdir hook: remove an empty directory; false when `path` is not a
+/// directory or still holds something.
+pub fn world_fs_rmdir(path: str) -> bool {
+    val p: str = world_dir_norm(path);
+    if str_len(p) == 0 || str_equal(p, "/") || !world_dir_exists(p) { return false; }
+    if world_dir_list(p).len() > 0 { return false; }
+    val i: i64 = world_dir_index(p);
+    if i < 0 { return false; }
+    world_fs_writes = world_fs_writes + 1;
+    world_fs_dirs.remove(i);
+    return true;
+}
+
+// `q` with its leading `old` (a directory) replaced by `new`
+fn world_reroot(q: str, old: str, new_dir: str) -> str {
+    return new_dir + str_slice(q, str_len(old), str_len(q));
+}
+
+/// fs rename hook: move a file (replacing a file of the new name), or a
+/// directory with everything in it; false when `old_path` does not exist
+/// or a directory is in the way.
+pub fn world_fs_rename(old_path: str, new_path: str) -> bool {
+    val o: str = world_dir_norm(old_path);
+    val n: str = world_dir_norm(new_path);
+    if str_len(n) == 0 || str_equal(n, "/") { return false; }
+    val fi: i64 = world_fs_index(o);
+    if fi >= 0 {
+        if world_fs_index(n) < 0 && world_dir_exists(n) { return false; }
+        val text: str = world_fs_data.get(fi);
+        world_fs_paths.remove(fi);
+        world_fs_data.remove(fi);
+        world_file_put(n, text);
+        world_fs_writes = world_fs_writes + 1;
+        return true;
+    }
+    if str_len(o) == 0 || str_equal(o, "/") || !world_dir_exists(o) { return false; }
+    if world_fs_index(n) >= 0 || world_dir_exists(n) { return false; }
+    val pre: str = o + "/";
+    var i: i64 = 0;
+    while i < world_fs_paths.len() {
+        val q: str = world_fs_paths.get(i);
+        if str_starts_with(q, pre) { world_fs_paths.set(i, world_reroot(q, o, n)); }
+        i = i + 1;
+    }
+    i = 0;
+    while i < world_fs_dirs.len() {
+        val d: str = world_fs_dirs.get(i);
+        if str_equal(d, o) {
+            world_fs_dirs.set(i, n);
+        } else if str_starts_with(d, pre) {
+            world_fs_dirs.set(i, world_reroot(d, o, n));
+        }
+        i = i + 1;
+    }
+    world_fs_writes = world_fs_writes + 1;
+    return true;
+}
+
+// ─── Clock ──────────────────────────────────────────────────────────────
+
+var world_clock_on: bool = false;
+var world_clock_now: i64 = 0;
+var world_clock_step: i64 = 0;
+var world_clock_reads: i64 = 0;
+
+/// Fix the clock at `ms` milliseconds since the Unix epoch. It moves only
+/// when the test advances it (or by the auto step, below).
+pub fn world_fake_clock(ms: i64) -> void {
+    world_clock_on = true;
+    world_clock_now = ms;
+    world_clock_step = 0;
+    world_clock_reads = 0;
+}
+
+/// How many times the code read the fake clock (clock_now_*, the
+/// clock_elapsed_* functions, dt_now).
+pub fn world_clock_read_count() -> i64 {
+    return world_clock_reads;
+}
+
+/// Advance the fake clock by `ms`.
+pub fn world_clock_advance(ms: i64) -> void {
+    world_clock_now = world_clock_now + ms;
+}
+
+/// Make every reading of the fake clock advance it by `ms` afterwards
+/// (code that waits for time to pass then sees it pass; 0 = frozen).
+pub fn world_clock_auto_step(ms: i64) -> void {
+    world_clock_step = ms;
+}
+
+/// Go back to the OS clock.
+pub fn world_real_clock() -> void {
+    world_clock_on = false;
+}
+
+/// True while the clock is faked.
+pub fn world_clock_faked() -> bool {
+    return world_clock_on;
+}
+
+/// The fake clock in milliseconds (the time hook; takes the auto step).
+pub fn world_clock_ms() -> i64 {
+    val t: i64 = world_clock_now;
+    world_clock_now = world_clock_now + world_clock_step;
+    world_clock_reads = world_clock_reads + 1;
+    return t;
+}
+
+/// The fake clock's current reading, without counting it as the code's
+/// read or taking the auto step (for the test's own checks).
+pub fn world_clock_peek() -> i64 {
+    return world_clock_now;
+}
+
+// ─── Network (HTTP) ─────────────────────────────────────────────────────
+
+var world_net_on: bool = false;
+var world_net_handler: fn(str, i64, str) -> str = world_net_refuse;
+var world_net_hosts: Vec<str> = Vec::new();
+var world_net_reqs: Vec<str> = Vec::new();
+
+/// The handler world_no_network installs: no answer (transport failure).
+pub fn world_net_refuse(_host: str, _port: i64, _request: str) -> str {
+    return "";
+}
+
+/// Answer every request with `handler(host, port, raw_request)`: the raw
+/// HTTP request text the client would send, and the raw response text it
+/// would read back ("" = connection failed). world_http_response builds
+/// one; world_req_method/path/body/header read the request.
+pub fn world_fake_network(handler: fn(str, i64, str) -> str) -> void {
+    world_net_on = true;
+    world_net_handler = handler;
+    world_net_hosts = Vec::new();
+    world_net_reqs = Vec::new();
+}
+
+/// Refuse every request (status 0), recording each attempt: a test that
+/// asserts world_net_count() == 0 shows the code made none.
+pub fn world_no_network() -> void {
+    world_fake_network(world_net_refuse);
+}
+
+/// Go back to the real network.
+pub fn world_real_network() -> void {
+    world_net_on = false;
+    world_net_handler = world_net_refuse;
+}
+
+/// True while the network is faked.
+pub fn world_network_faked() -> bool {
+    return world_net_on;
+}
+
+/// The network hook http_client calls: records the request, returns the
+/// handler's raw response.
+pub fn world_net_exchange(host: str, port: i64, request: str) -> str {
+    world_net_hosts.push(host + ":" + int_to_str(port));
+    world_net_reqs.push(request);
+    val handler: fn(str, i64, str) -> str = world_net_handler;
+    return handler(host, port, request);
+}
+
+/// Requests the code made through the fake network.
+pub fn world_net_count() -> i64 {
+    return world_net_reqs.len();
+}
+
+/// "host:port" of request `i`.
+pub fn world_net_host(i: i64) -> str {
+    if i < 0 || i >= world_net_hosts.len() { return ""; }
+    return world_net_hosts.get(i);
+}
+
+/// The raw text of request `i`.
+pub fn world_net_request(i: i64) -> str {
+    if i < 0 || i >= world_net_reqs.len() { return ""; }
+    return world_net_reqs.get(i);
+}
+
+/// A raw HTTP/1.1 response with `status`, a text/plain body and its length.
+pub fn world_http_response(status: i64, body: str) -> str {
+    var reason: str = "OK";
+    if status == 201 { reason = "Created"; }
+    if status == 204 { reason = "No Content"; }
+    if status == 400 { reason = "Bad Request"; }
+    if status == 404 { reason = "Not Found"; }
+    if status == 500 { reason = "Internal Server Error"; }
+    if status == 503 { reason = "Service Unavailable"; }
+    return "HTTP/1.1 " + int_to_str(status) + " " + reason + "\r\n"
+        + "Content-Type: text/plain\r\n"
+        + "Content-Length: " + int_to_str(str_len(body)) + "\r\n"
+        + "Connection: close\r\n\r\n" + body;
+}
+
+// the request line's words
+fn world_req_word(req: str, n: i64) -> str {
+    var line: str = req;
+    val e: i64 = str_find(req, "\r\n");
+    if e >= 0 { line = str_slice(req, 0, e); }
+    val parts: Vec<str> = str_split(line, " ");
+    if n < parts.len() { return parts.get(n); }
+    return "";
+}
+
+/// The method of a raw request ("GET").
+pub fn world_req_method(req: str) -> str {
+    return world_req_word(req, 0);
+}
+
+/// The path of a raw request ("/api/x?y=1").
+pub fn world_req_path(req: str) -> str {
+    return world_req_word(req, 1);
+}
+
+/// The body of a raw request (after the blank line).
+pub fn world_req_body(req: str) -> str {
+    val e: i64 = str_find(req, "\r\n\r\n");
+    if e < 0 { return ""; }
+    return str_slice(req, e + 4, str_len(req));
+}
+
+/// The value of header `name` in a raw request ("" when absent; the name
+/// is matched without regard to case).
+pub fn world_req_header(req: str, name: str) -> str {
+    val e: i64 = str_find(req, "\r\n\r\n");
+    var head: str = req;
+    if e >= 0 { head = str_slice(req, 0, e); }
+    val lines: Vec<str> = str_split(head, "\r\n");
+    val want: str = str_to_lower(name) + ":";
+    var i: i64 = 1;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        if str_starts_with(str_to_lower(l), want) {
+            return str_trim(str_slice(l, str_len(want), str_len(l)));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Sockets (net) ──────────────────────────────────────────────────────
+// stdlib/net's UDP and TCP sockets under a fake: net_socket_create(_tcp),
+// net_addr_create, net_bind, net_connect, net_send, net_send_bytes,
+// net_send_to, net_send_bytes_to, net_recv, net_recv_bytes, net_recv_from,
+// net_recv_bytes_from and net_close ask this module first, and no socket
+// is opened. A fake socket's descriptor is WORLD_SOCK_BASE + n. Every
+// datagram or stream write the code sends is recorded and handed to the
+// test's handler, `fn(proto, peer, bytes) -> reply bytes` (proto "udp" or
+// "tcp", peer "a.b.c.d:port"); a non-empty reply is queued for the sending
+// socket to receive, from that peer. A test can also hand bytes to a socket
+// itself (world_sock_deliver, world_sock_deliver_port: a client's datagram
+// reaching the code's server socket). A receive with nothing queued gets
+// nothing: -1 from net_recv and net_recv_from, [] from the _bytes forms
+// (what a timeout gives). A stream socket reads across queued writes; a
+// datagram socket reads one datagram per receive, cut to the size asked
+// for. world_no_sockets() refuses every connect and send (-1) and counts
+// the attempts.
+
+/// The first fake socket descriptor (2^40: no real descriptor is this big).
+pub const WORLD_SOCK_BASE: i64 = 1099511627776;
+
+var world_sk_on: bool = false;
+var world_sk_refusing: bool = false;
+var world_sk_refused: i64 = 0;
+var world_sk_handler: fn(str, str, Vec<i64>) -> Vec<i64> = world_sock_silent;
+// per socket, at descriptor - WORLD_SOCK_BASE
+var world_sk_proto: Vec<str> = Vec::new();
+var world_sk_port: Vec<i64> = Vec::new();     // bound port (0: none)
+var world_sk_peer: Vec<str> = Vec::new();     // connected peer ("": none)
+var world_sk_open: Vec<i64> = Vec::new();     // 1 while open
+// queued input, one entry per datagram or stream write
+var world_sk_in_sock: Vec<i64> = Vec::new();
+var world_sk_in_from: Vec<str> = Vec::new();
+var world_sk_in_pos: Vec<i64> = Vec::new();   // next unread byte in world_sk_in_bytes
+var world_sk_in_end: Vec<i64> = Vec::new();
+var world_sk_in_bytes: Vec<i64> = Vec::new();
+var world_sk_last_from: str = "";
+// what the code sent
+var world_sk_out_proto: Vec<str> = Vec::new();
+var world_sk_out_peer: Vec<str> = Vec::new();
+var world_sk_out_start: Vec<i64> = Vec::new();
+var world_sk_out_end: Vec<i64> = Vec::new();
+var world_sk_out_bytes: Vec<i64> = Vec::new();
+
+/// The handler world_no_sockets installs: never answers.
+pub fn world_sock_silent(_proto: str, _peer: str, _data: Vec<i64>) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    return none;
+}
+
+fn world_sock_reset() -> void {
+    world_sk_refused = 0;
+    world_sk_proto = Vec::new();
+    world_sk_port = Vec::new();
+    world_sk_peer = Vec::new();
+    world_sk_open = Vec::new();
+    world_sk_in_sock = Vec::new();
+    world_sk_in_from = Vec::new();
+    world_sk_in_pos = Vec::new();
+    world_sk_in_end = Vec::new();
+    world_sk_in_bytes = Vec::new();
+    world_sk_last_from = "";
+    world_sk_out_proto = Vec::new();
+    world_sk_out_peer = Vec::new();
+    world_sk_out_start = Vec::new();
+    world_sk_out_end = Vec::new();
+    world_sk_out_bytes = Vec::new();
+}
+
+/// Replace the sockets: every send goes to `handler(proto, peer, bytes)`,
+/// whose non-empty answer the sending socket then receives.
+pub fn world_fake_sockets(handler: fn(str, str, Vec<i64>) -> Vec<i64>) -> void {
+    world_sk_on = true;
+    world_sk_refusing = false;
+    world_sk_handler = handler;
+    world_sock_reset();
+}
+
+/// Fake sockets that reach nobody: every connect and send fails (-1) and
+/// is counted (world_sock_refused), so a test can show the code tried.
+pub fn world_no_sockets() -> void {
+    world_fake_sockets(world_sock_silent);
+    world_sk_refusing = true;
+}
+
+/// Go back to real sockets.
+pub fn world_real_sockets() -> void {
+    world_sk_on = false;
+    world_sk_refusing = false;
+    world_sk_handler = world_sock_silent;
+    world_sock_reset();
+}
+
+/// True while the sockets are faked.
+pub fn world_sockets_faked() -> bool {
+    return world_sk_on;
+}
+
+/// "a.b.c.d" as net_addr_create keeps it (inet_addr's value: the first
+/// number in the low byte); -1 when it is not four numbers 0..255.
+pub fn world_ip_value(ip: str) -> i64 {
+    val parts: Vec<str> = str_split(str_trim(ip), ".");
+    if parts.len() != 4 { return -1; }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        val t: str = str_trim(parts.get(i));
+        if str_len(t) == 0 || str_len(t) > 3 { return -1; }
+        var k: i64 = 0;
+        while k < str_len(t) {
+            val c: i64 = str_byte_at(t, k);
+            if c < 48 || c > 57 { return -1; }
+            k = k + 1;
+        }
+        val b: i64 = str_parse_int(t);
+        if b > 255 { return -1; }
+        v = v | (b << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The "a.b.c.d" text of an address value (world_ip_value's inverse).
+pub fn world_ip_text(ip: i64) -> str {
+    return int_to_str(ip & 255) + "." + int_to_str((ip >> 8) & 255) + "." + int_to_str((ip >> 16) & 255) + "." + int_to_str((ip >> 24) & 255);
+}
+
+// the socket's index, -1 when `sock` is not an open fake socket
+fn world_sock_at(sock: i64) -> i64 {
+    val i: i64 = sock - WORLD_SOCK_BASE;
+    if i < 0 || i >= world_sk_proto.len() { return -1; }
+    if world_sk_open.get(i) == 0 { return -1; }
+    return i;
+}
+
+/// net socket hook: a new fake socket ("tcp" when `tcp`, else "udp").
+pub fn world_sock_open(tcp: bool) -> i64 {
+    if tcp {
+        world_sk_proto.push("tcp");
+    } else {
+        world_sk_proto.push("udp");
+    }
+    world_sk_port.push(0);
+    world_sk_peer.push("");
+    world_sk_open.push(1);
+    return WORLD_SOCK_BASE + world_sk_proto.len() - 1;
+}
+
+/// net bind hook: 0, or -1 for a socket that is not a fake one or a port
+/// another open fake socket of the same kind holds.
+pub fn world_sock_bind(sock: i64, port: i64) -> i64 {
+    val i: i64 = world_sock_at(sock);
+    if i < 0 || port < 0 || port > 65535 { return -1; }
+    var k: i64 = 0;
+    while k < world_sk_port.len() {
+        if k != i && world_sk_open.get(k) == 1 && world_sk_port.get(k) == port && port != 0 && str_equal(world_sk_proto.get(k), world_sk_proto.get(i)) {
+            return -1;
+        }
+        k = k + 1;
+    }
+    world_sk_port.set(i, port);
+    return 0;
+}
+
+/// net connect hook: 0, or -1 (not a fake socket, or no sockets).
+pub fn world_sock_connect(sock: i64, ip: i64, port: i64) -> i64 {
+    val i: i64 = world_sock_at(sock);
+    if i < 0 { return -1; }
+    if world_sk_refusing {
+        world_sk_refused = world_sk_refused + 1;
+        return -1;
+    }
+    world_sk_peer.set(i, world_ip_text(ip) + ":" + int_to_str(port));
+    return 0;
+}
+
+fn world_sock_queue(i: i64, from: str, data: Vec<i64>) -> void {
+    world_sk_in_sock.push(i);
+    world_sk_in_from.push(from);
+    world_sk_in_pos.push(world_sk_in_bytes.len());
+    var k: i64 = 0;
+    while k < data.len() {
+        world_sk_in_bytes.push(data.get(k) & 255);
+        k = k + 1;
+    }
+    world_sk_in_end.push(world_sk_in_bytes.len());
+}
+
+fn world_sock_send_peer(i: i64, peer: str, data: Vec<i64>) -> i64 {
+    if world_sk_refusing {
+        world_sk_refused = world_sk_refused + 1;
+        return -1;
+    }
+    val proto: str = world_sk_proto.get(i);
+    world_sk_out_proto.push(proto);
+    world_sk_out_peer.push(peer);
+    world_sk_out_start.push(world_sk_out_bytes.len());
+    var k: i64 = 0;
+    while k < data.len() {
+        world_sk_out_bytes.push(data.get(k) & 255);
+        k = k + 1;
+    }
+    world_sk_out_end.push(world_sk_out_bytes.len());
+    val handler: fn(str, str, Vec<i64>) -> Vec<i64> = world_sk_handler;
+    val reply: Vec<i64> = handler(proto, peer, data);
+    if reply.len() > 0 { world_sock_queue(i, peer, reply); }
+    return data.len();
+}
+
+/// net send hook (a connected socket): the bytes sent, -1 when the socket
+/// is not a connected fake one or there are no sockets.
+pub fn world_sock_send(sock: i64, data: Vec<i64>) -> i64 {
+    val i: i64 = world_sock_at(sock);
+    if i < 0 { return -1; }
+    val peer: str = world_sk_peer.get(i);
+    if str_len(peer) == 0 { return -1; }
+    return world_sock_send_peer(i, peer, data);
+}
+
+/// net send_to hook (a datagram to ip:port): the bytes sent, or -1.
+pub fn world_sock_send_to(sock: i64, data: Vec<i64>, ip: i64, port: i64) -> i64 {
+    val i: i64 = world_sock_at(sock);
+    if i < 0 { return -1; }
+    return world_sock_send_peer(i, world_ip_text(ip) + ":" + int_to_str(port), data);
+}
+
+/// net recv hook: up to `max` queued bytes (empty when none are queued);
+/// world_sock_last_from then names the peer they came from.
+pub fn world_sock_recv(sock: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val i: i64 = world_sock_at(sock);
+    if i < 0 || max <= 0 { return out; }
+    val stream: bool = str_equal(world_sk_proto.get(i), "tcp");
+    var k: i64 = 0;
+    while k < world_sk_in_sock.len() && out.len() < max {
+        if world_sk_in_sock.get(k) == i && world_sk_in_pos.get(k) < world_sk_in_end.get(k) {
+            world_sk_last_from = world_sk_in_from.get(k);
+            var p: i64 = world_sk_in_pos.get(k);
+            val e: i64 = world_sk_in_end.get(k);
+            while p < e && out.len() < max {
+                out.push(world_sk_in_bytes.get(p));
+                p = p + 1;
+            }
+            if !stream {
+                // a datagram is read whole: what did not fit is dropped
+                world_sk_in_pos.set(k, e);
+                return out;
+            }
+            world_sk_in_pos.set(k, p);
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The peer ("a.b.c.d:port") the last bytes world_sock_recv gave came from.
+pub fn world_sock_last_from() -> str {
+    return world_sk_last_from;
+}
+
+/// The address value (world_ip_value) of world_sock_last_from.
+pub fn world_sock_last_ip() -> i64 {
+    val c: i64 = str_find(world_sk_last_from, ":");
+    if c < 0 { return 0; }
+    return world_ip_value(str_slice(world_sk_last_from, 0, c));
+}
+
+/// The port of world_sock_last_from.
+pub fn world_sock_last_port() -> i64 {
+    val c: i64 = str_find(world_sk_last_from, ":");
+    if c < 0 { return 0; }
+    return str_parse_int(str_slice(world_sk_last_from, c + 1, str_len(world_sk_last_from)));
+}
+
+/// net close hook: the socket reads and sends nothing afterwards, and what
+/// was queued for it is dropped. 0, or -1 for a socket that is not open.
+pub fn world_sock_close(sock: i64) -> i64 {
+    val i: i64 = world_sock_at(sock);
+    if i < 0 { return -1; }
+    world_sk_open.set(i, 0);
+    var k: i64 = 0;
+    while k < world_sk_in_sock.len() {
+        if world_sk_in_sock.get(k) == i { world_sk_in_pos.set(k, world_sk_in_end.get(k)); }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// Hand `data` to fake socket `sock` as if `from` ("a.b.c.d:port") sent
+/// it; false when `sock` is not an open fake socket.
+pub fn world_sock_deliver(sock: i64, from: str, data: Vec<i64>) -> bool {
+    val i: i64 = world_sock_at(sock);
+    if i < 0 { return false; }
+    world_sock_queue(i, from, data);
+    return true;
+}
+
+/// world_sock_deliver to the open fake socket bound to `port`; false when
+/// none is.
+pub fn world_sock_deliver_port(port: i64, from: str, data: Vec<i64>) -> bool {
+    var k: i64 = 0;
+    while k < world_sk_port.len() {
+        if world_sk_open.get(k) == 1 && world_sk_port.get(k) == port {
+            world_sock_queue(k, from, data);
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// Sends the code made through fake sockets (datagrams and stream writes).
+pub fn world_sock_sent_count() -> i64 {
+    return world_sk_out_peer.len();
+}
+
+/// "a.b.c.d:port" of send `i`.
+pub fn world_sock_sent_peer(i: i64) -> str {
+    if i < 0 || i >= world_sk_out_peer.len() { return ""; }
+    return world_sk_out_peer.get(i);
+}
+
+/// "udp" or "tcp": the kind of socket send `i` went through.
+pub fn world_sock_sent_proto(i: i64) -> str {
+    if i < 0 || i >= world_sk_out_proto.len() { return ""; }
+    return world_sk_out_proto.get(i);
+}
+
+/// The bytes of send `i`.
+pub fn world_sock_sent_bytes(i: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if i < 0 || i >= world_sk_out_peer.len() { return out; }
+    var k: i64 = world_sk_out_start.get(i);
+    while k < world_sk_out_end.get(i) {
+        out.push(world_sk_out_bytes.get(k));
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The bytes of send `i` as text.
+pub fn world_sock_sent_text(i: i64) -> str {
+    return str_from_bytes(world_sock_sent_bytes(i));
+}
+
+/// Connects and sends world_no_sockets refused.
+pub fn world_sock_refused() -> i64 {
+    return world_sk_refused;
+}
+
+/// Fake sockets still open (one the code forgot to close shows here).
+pub fn world_sock_open_count() -> i64 {
+    var n: i64 = 0;
+    var k: i64 = 0;
+    while k < world_sk_open.len() {
+        n = n + world_sk_open.get(k);
+        k = k + 1;
+    }
+    return n;
+}
+
+// ─── All at once ────────────────────────────────────────────────────────
+
+/// Turn every fake on: an empty file system, the clock fixed at the epoch
+/// (0 ms), a network that refuses every request and sockets that reach
+/// nobody. Code under test then cannot reach the real world through the
+/// stdlib; seed what it needs.
+pub fn world_hermetic() -> void {
+    world_fake_files();
+    world_fake_clock(0);
+    world_no_network();
+    world_no_sockets();
+}
+
+/// Turn every fake off again.
+pub fn world_real() -> void {
+    world_real_files();
+    world_real_clock();
+    world_real_network();
+    world_real_sockets();
+}

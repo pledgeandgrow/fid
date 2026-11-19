@@ -228,7 +228,11 @@ fn rc_collect_stmt(stmt: Stmt, names: i64) {
         }
         Stmt::LetUninit(_, _, _, _) => {
         }
-        Stmt::Assign(_, _, e, _) => {
+        Stmt::Assign(_, aop, e, _) => {
+            // `x op= e` on a struct calls its operator method (CL10)
+            if assign_op_is_arith(aop) {
+                rc_name(names, "#m:" + binop_operator_method(assign_op_binop(aop)));
+            }
             rc_collect_expr(e, names);
         }
         Stmt::IndexAssign(_, ix, _, e, _) => {
@@ -239,7 +243,10 @@ fn rc_collect_stmt(stmt: Stmt, names: i64) {
             rc_collect_expr(pe, names);
             rc_collect_expr(e, names);
         }
-        Stmt::FieldAssign(ob, _, _, e, _) => {
+        Stmt::FieldAssign(ob, _, aop, e, _) => {
+            if assign_op_is_arith(aop) {
+                rc_name(names, "#m:" + binop_operator_method(assign_op_binop(aop)));
+            }
             rc_collect_expr(ob, names);
             rc_collect_expr(e, names);
         }
@@ -351,7 +358,14 @@ fn rc_collect_expr(expr: Expr, names: i64) {
         Expr::Ident(n) => {
             rc_name(names, n);
         }
-        Expr::Binary(_, l, r) => {
+        Expr::Binary(op, l, r) => {
+            // an operator on a struct calls a method nothing names
+            // (`a / 4.0` is Meters_div): keep `div` and `rdiv` methods
+            var bom: str = binop_operator_method(op);
+            if str_len(bom) > 0 {
+                rc_name(names, "#m:" + bom);
+                rc_name(names, "#m:r" + bom);
+            }
             rc_collect_expr(box_expr_unbox(l), names);
             rc_collect_expr(box_expr_unbox(r), names);
         }

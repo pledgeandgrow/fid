@@ -1,0 +1,143 @@
+// Competitive RT9: the task context switch alone, apart from the scheduler.
+// Native Windows only (`fid emit`, pe_ir): it calls the runtime's machine-code
+// switch pe_ctx_swap (compiler/pe_ir_stubs.fd pe_ctx_swap_code) directly.
+//
+//   fid emit tests/ctx_switch/ctx_swap_bench.fd -o ctx.exe && ./ctx.exe [pairs]
+//
+// Two contexts ping-pong: main switches to a partner task, which switches
+// straight back, `pairs` times (2 switches each). The partner's stack is laid
+// out as pe_ctx_new (stdlib/pe_runtime/conc.fd) lays out a task's: the saved
+// xmm6-15, the TEB stack fields, the callee-saved registers and the
+// trampoline as return address; it starts in pert_thread_main, which calls
+// ctx_partner. Prints the time per switch, less the cost of the same loop
+// calling a one-instruction primitive instead (the loop and the call
+// themselves); exit code 0 when under 20 ns.
+extern "C" {
+    fn pe_ctx_swap(save: i64, sp: i64);
+    fn pe_ctx_tramp_addr() -> i64;
+    fn pe_thread_entry_addr() -> i64;
+    fn pe_fn_lookup(name: str) -> i64;
+    fn pe_atomic_load(addr: i64) -> i64;
+}
+
+var g_main_ctx: i64 = 0;
+var g_task_ctx: i64 = 0;
+var g_switches: i64 = 0;
+
+@unsafe
+fn ld(p: i64) -> i64 {
+    return *(p as *i64);
+}
+
+@unsafe
+fn st(p: i64, v: i64) {
+    *(p as *i64) = v;
+}
+
+@unsafe
+fn zeroed(words: i64) -> i64 {
+    var p: i64 = p_malloc(words * 8);
+    var i: i64 = 0;
+    while i < words {
+        st(p + i * 8, 0);
+        i = i + 1;
+    }
+    return p;
+}
+
+/// The partner task: back to main at once, forever
+@unsafe
+fn ctx_partner() -> i64 {
+    g_switches = 1;
+    while true {
+        pe_ctx_swap(g_task_ctx, *(g_main_ctx as *i64));
+    }
+    return 0;
+}
+
+@unsafe
+fn main() -> i64 {
+    var pairs: i64 = 10000000;
+    match arg_at(1) {
+        Option::Some(a) => {
+            pairs = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    // The partner's stack: 256 KB, 16-aligned top
+    val size: i64 = 262144;
+    var stack: i64 = p_malloc(size + 16);
+    var top: i64 = (stack + size) & (0 - 16);
+    var s: i64 = top - 256;
+    var i: i64 = 0;
+    while i < 32 {
+        st(s + i * 8, 0);
+        i = i + 1;
+    }
+    // pert_thread_main's block: [0] the function, [1] its argument count,
+    // [2..] the arguments, [80] done, [88] result, [96] 0 (not a task: it
+    // never leaves anyway)
+    var block: i64 = zeroed(16);
+    st(block, pe_fn_lookup("ctx_partner"));
+    // xmm6-15 [0, 160), StackBase, StackLimit, DeallocationStack, then r15
+    // r14 r13 (entry) r12 (its argument) rsi rdi rbx rbp, the return address
+    st(s + 160, top);
+    st(s + 168, stack);
+    st(s + 176, stack);
+    st(s + 200, pe_thread_entry_addr());
+    st(s + 208, block);
+    st(s + 248, pe_ctx_tramp_addr());
+    g_task_ctx = zeroed(4);
+    st(g_task_ctx, s);
+    g_main_ctx = zeroed(4);
+    // Warm up: the partner's first switch starts it
+    pe_ctx_swap(g_main_ctx, ld(g_task_ctx));
+    var t0: i64 = p_clock_now();
+    var k: i64 = 0;
+    var mc: i64 = g_main_ctx;
+    var tc: i64 = g_task_ctx;
+    while k < pairs {
+        pe_ctx_swap(mc, *(tc as *i64));
+        k = k + 1;
+    }
+    var t1: i64 = p_clock_now();
+    // The same loop with a call of a one-instruction primitive (a load)
+    // where each switch was: the loop's and the call's own cost
+    var b: i64 = 0;
+    var sink: i64 = 0;
+    var t2: i64 = p_clock_now();
+    while b < pairs * 2 {
+        sink = sink + pe_atomic_load(tc);
+        b = b + 1;
+    }
+    var t3: i64 = p_clock_now();
+    var ns_total: i64 = (t1 - t0) - (t3 - t2);
+    if sink == 0 {
+        print("(no load)
+");
+    }
+    print("loop and call: ");
+    print((t3 - t2) * 10 / (pairs * 2) / 10);
+    print(" ns per iteration
+");
+    // tenths of a nanosecond per switch
+    var tenths: i64 = ns_total * 10 / (pairs * 2);
+    print("switches: ");
+    print(pairs * 2);
+    print("\n");
+    print("partner started: ");
+    print(g_switches);
+    print("\n");
+    print("ns per switch: ");
+    print(tenths / 10);
+    print(".");
+    print(tenths % 10);
+    print("\n");
+    if tenths < 200 {
+        print("under 20 ns: yes\n");
+        return 0;
+    }
+    print("under 20 ns: no\n");
+    return 1;
+}

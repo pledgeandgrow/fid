@@ -1,0 +1,616 @@
+// Fides NMEA 0183: sentence framing, checksums, GGA, RMC, GSA, GSV, VTG
+//
+// Real (pure computation):
+//   - framing: "$" or "!", talker (GP, GN, GL, GA, BD ...) and sentence
+//     type, comma fields, the "*hh" checksum (XOR of every byte between
+//     the start character and '*'), checked when present; a line splitter
+//     for a byte stream (NmeaReader) that keeps partial lines;
+//   - GGA (fix data), RMC (recommended minimum, with date), GSA (DOP and
+//     active satellites), GSV (satellites in view, with an assembler for
+//     the multi-sentence group), VTG (course and speed); empty fields are
+//     reported as absent (`has_*` flags), not as zero;
+//   - coordinates: ddmm.mmmm / dddmm.mmmm with N/S/E/W to signed decimal
+//     degrees and back (nmea_ddmm), time of day, RMC date and time to Unix
+//     seconds; a GGA sentence builder and a fixed-point formatter.
+//
+// The seam: no serial port here. Give the bytes or lines a GPS receiver
+// sends (UART, USB CDC, a file) to nmea_reader_feed / nmea_parse.
+
+module nmea;
+ use vec; use string;
+
+// ─── Framing ─────────────────────────────────────────────────────────────
+
+/// XOR of the bytes of `body` (the text between '$' and '*').
+pub fn nmea_checksum(body: str) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(body) {
+        c = c ^ str_byte_at(body, i);
+        i = i + 1;
+    }
+    return c;
+}
+
+fn nm_hex2(v: i64) -> str {
+    val digits: str = "0123456789ABCDEF";
+    return str_slice(digits, (v >> 4) & 15, ((v >> 4) & 15) + 1) + str_slice(digits, v & 15, (v & 15) + 1);
+}
+
+/// "$" + body + "*" + checksum, e.g. nmea_sentence("GPVTG,...").
+pub fn nmea_sentence(body: str) -> str {
+    return "$" + body + "*" + nm_hex2(nmea_checksum(body));
+}
+
+/// A sentence split into fields. `fields` are the comma-separated fields
+/// after the address field; `talker` is "GP" and `kind` "GGA" for $GPGGA
+/// (a proprietary $P... sentence has talker "P" and the rest as kind).
+pub struct NmeaSentence {
+    pub ok: bool,
+    pub error: str,
+    pub talker: str,
+    pub kind: str,
+    pub fields: Vec<str>,
+    pub has_checksum: bool,
+}
+
+fn nm_hexval(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return - 1;
+}
+
+/// Parse one line (trailing CR/LF allowed). A checksum, when present, must
+/// match; `require_checksum` refuses lines without one.
+pub fn nmea_parse(line: str, require_checksum: bool) -> NmeaSentence {
+    var s: NmeaSentence = NmeaSentence {
+        ok: false, error: "", talker: "", kind: "", fields: Vec::new(), has_checksum: false
+    };
+    var n: i64 = str_len(line);
+    while n > 0 && (str_byte_at(line, n - 1) == 13 || str_byte_at(line, n - 1) == 10) {
+        n = n - 1;
+    }
+    if n < 2 || (str_byte_at(line, 0) != 36 && str_byte_at(line, 0) != 33) {
+        s.error = "no $ or ! at the start";
+        return s;
+    }
+    if n > 82 {
+        s.error = "longer than 82 characters";
+        return s;
+    }
+    var end: i64 = n;
+    val star: i64 = str_find(line, "*");
+    if star >= 0 && star < n {
+        if star + 3 != n {
+            s.error = "checksum is not two hex digits";
+            return s;
+        }
+        val hi: i64 = nm_hexval(str_byte_at(line, star + 1));
+        val lo: i64 = nm_hexval(str_byte_at(line, star + 2));
+        if hi < 0 || lo < 0 {
+            s.error = "checksum is not two hex digits";
+            return s;
+        }
+        val got: i64 = nmea_checksum(str_slice(line, 1, star));
+        if got != hi * 16 + lo {
+            s.error = "checksum mismatch: computed " + nm_hex2(got);
+            return s;
+        }
+        s.has_checksum = true;
+        end = star;
+    } else if require_checksum {
+        s.error = "no checksum";
+        return s;
+    }
+    val parts: Vec<str> = str_split(str_slice(line, 1, end), ",");
+    val addr: str = parts.get(0);
+    if str_len(addr) < 2 {
+        s.error = "address field too short";
+        return s;
+    }
+    if str_byte_at(addr, 0) == 80 {
+        s.talker = "P";
+        s.kind = str_slice(addr, 1, str_len(addr));
+    } else {
+        if str_len(addr) != 5 {
+            s.error = "address field is not talker + 3 letters";
+            return s;
+        }
+        s.talker = str_slice(addr, 0, 2);
+        s.kind = str_slice(addr, 2, 5);
+    }
+    var i: i64 = 1;
+    while i < parts.len() {
+        s.fields.push(parts.get(i));
+        i = i + 1;
+    }
+    s.ok = true;
+    return s;
+}
+
+/// Field i, or "" when the sentence has fewer fields.
+pub fn nmea_field(s: & NmeaSentence, i: i64) -> str {
+    if i < 0 || i >= s.fields.len() {
+        return "";
+    }
+    return s.fields.get(i);
+}
+
+/// Splits a byte stream into lines.
+pub struct NmeaReader {
+    pub buf: str,
+}
+
+pub fn nmea_reader_new() -> NmeaReader {
+    return NmeaReader {
+        buf: ""
+    };
+}
+
+/// Add received text; the complete lines in it (without CR/LF, empty
+/// lines dropped). A partial line waits for the rest.
+pub fn nmea_reader_feed(r: & mut NmeaReader, chunk: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val all: str = r.buf + chunk;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(all) {
+        val c: i64 = str_byte_at(all, i);
+        if c == 10 || c == 13 {
+            if i > start {
+                out.push(str_slice(all, start, i));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    r.buf = str_slice(all, start, str_len(all));
+    if str_len(r.buf) > 1024 {
+        r.buf = "";   // no line end for too long: garbage
+    }
+    return out;
+}
+
+// ─── Numbers and coordinates ─────────────────────────────────────────────
+
+/// Whether a field holds a decimal number (sign, digits, one point).
+pub fn nmea_is_number(f: str) -> bool {
+    val n: i64 = str_len(f);
+    if n == 0 {
+        return false;
+    }
+    var digits: i64 = 0;
+    var dots: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(f, i);
+        if c >= 48 && c <= 57 {
+            digits = digits + 1;
+        } else if c == 46 {
+            dots = dots + 1;
+        } else if !(i == 0 && (c == 45 || c == 43)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return digits > 0 && dots <= 1;
+}
+
+fn nm_num(f: str) -> f64 {
+    return str_parse_float(f);
+}
+
+fn nm_int(f: str) -> i64 {
+    return str_parse_int(f);
+}
+
+/// ddmm.mmmm (or dddmm.mmmm) and a hemisphere letter to signed degrees.
+/// `ok` false when the field or the letter is not valid.
+pub fn nmea_coord(field: str, hemi: str, ok: & mut bool) -> f64 {
+    if !nmea_is_number(field) {
+        *ok = false;
+        return 0.0;
+    }
+    val v: f64 = nm_num(field);
+    val deg: i64 = (v / 100.0) as i64;
+    val minutes: f64 = v - (deg as f64) * 100.0;
+    if minutes >= 60.0 || v < 0.0 {
+        *ok = false;
+        return 0.0;
+    }
+    var d: f64 = (deg as f64) + minutes / 60.0;
+    if hemi == "S" || hemi == "W" {
+        d = 0.0 - d;
+    } else if hemi != "N" && hemi != "E" {
+        *ok = false;
+    }
+    return d;
+}
+
+/// x rounded to `decimals` places, as text ("48.1173").
+pub fn nmea_fixed(x: f64, decimals: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < decimals {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg {
+        a = 0.0 - a;
+    }
+    val units: i64 = (a * (scale as f64) + 0.5) as i64;
+    if units == 0 {
+        neg = false;
+    }
+    var s: str = int_to_str(units / scale);
+    if decimals > 0 {
+        var frac: str = int_to_str(units % scale);
+        while str_len(frac) < decimals {
+            frac = "0" + frac;
+        }
+        s = s + "." + frac;
+    }
+    if neg {
+        return "-" + s;
+    }
+    return s;
+}
+
+/// Degrees back to the NMEA form: "4807.038" for 48.1173 (lat, 3 minute
+/// decimals) and the hemisphere; longitude has three degree digits.
+pub fn nmea_ddmm(deg: f64, is_lon: bool, decimals: i64) -> str {
+    var a: f64 = deg;
+    if a < 0.0 {
+        a = 0.0 - a;
+    }
+    var d: i64 = a as i64;
+    var m: f64 = (a - (d as f64)) * 60.0;
+    var ms: str = nmea_fixed(m, decimals);
+    if str_starts_with(ms, "60") {
+        d = d + 1;
+        ms = nmea_fixed(0.0, decimals);
+    }
+    if str_find(ms, ".") == 1 || (decimals == 0 && str_len(ms) == 1) {
+        ms = "0" + ms;
+    }
+    var ds: str = int_to_str(d);
+    var width: i64 = 2;
+    if is_lon {
+        width = 3;
+    }
+    while str_len(ds) < width {
+        ds = "0" + ds;
+    }
+    return ds + ms;
+}
+
+/// "hhmmss.ss" to seconds since midnight; -1 when not a time.
+pub fn nmea_time(f: str) -> f64 {
+    if str_len(f) < 6 || !nmea_is_number(f) {
+        return - 1.0;
+    }
+    val h: i64 = str_parse_int(str_slice(f, 0, 2));
+    val m: i64 = str_parse_int(str_slice(f, 2, 4));
+    val s: f64 = nm_num(str_slice(f, 4, str_len(f)));
+    if h > 23 || m > 59 || s >= 61.0 {
+        return - 1.0;
+    }
+    return (h * 3600 + m * 60) as f64 + s;
+}
+
+// days since 1970-01-01 of a civil date (proleptic Gregorian)
+fn nm_days(y: i64, m: i64, d: i64) -> i64 {
+    var yy: i64 = y;
+    if m <= 2 {
+        yy = yy - 1;
+    }
+    val era: i64 = yy / 400;
+    val yoe: i64 = yy - era * 400;
+    var mp: i64 = m - 3;
+    if m <= 2 {
+        mp = m + 9;
+    }
+    val doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// ─── Sentences ───────────────────────────────────────────────────────────
+
+/// GGA: time, position, fix quality (0 none, 1 GPS, 2 DGPS, 4 RTK fixed,
+/// 5 RTK float, 6 estimated), satellites, HDOP, altitude (m above mean sea
+/// level), geoid separation.
+pub struct NmeaGga {
+    pub ok: bool,
+    pub time: f64,
+    pub has_position: bool,
+    pub lat: f64,
+    pub lon: f64,
+    pub quality: i64,
+    pub sats: i64,
+    pub has_hdop: bool,
+    pub hdop: f64,
+    pub has_alt: bool,
+    pub alt: f64,
+    pub has_geoid: bool,
+    pub geoid: f64,
+}
+
+pub fn nmea_gga(s: & NmeaSentence) -> NmeaGga {
+    var g: NmeaGga = NmeaGga {
+        ok: false, time: - 1.0, has_position: false, lat: 0.0, lon: 0.0, quality: 0, sats: 0, has_hdop: false, hdop: 0.0, has_alt: false, alt: 0.0, has_geoid: false, geoid: 0.0,
+    };
+    if !s.ok || s.kind != "GGA" || s.fields.len() < 14 {
+        return g;
+    }
+    g.time = nmea_time(nmea_field(s, 0));
+    var pos_ok: bool = true;
+    g.lat = nmea_coord(nmea_field(s, 1), nmea_field(s, 2), & mut pos_ok);
+    g.lon = nmea_coord(nmea_field(s, 3), nmea_field(s, 4), & mut pos_ok);
+    g.has_position = pos_ok;
+    g.quality = nm_int(nmea_field(s, 5));
+    g.sats = nm_int(nmea_field(s, 6));
+    g.has_hdop = nmea_is_number(nmea_field(s, 7));
+    if g.has_hdop { g.hdop = nm_num(nmea_field(s, 7)); }
+    g.has_alt = nmea_is_number(nmea_field(s, 8));
+    if g.has_alt { g.alt = nm_num(nmea_field(s, 8)); }
+    g.has_geoid = nmea_is_number(nmea_field(s, 10));
+    if g.has_geoid { g.geoid = nm_num(nmea_field(s, 10)); }
+    g.ok = true;
+    return g;
+}
+
+/// RMC: time, status (A valid, V warning), position, speed over ground
+/// (knots), course (degrees true), date, magnetic variation, mode.
+pub struct NmeaRmc {
+    pub ok: bool,
+    pub time: f64,
+    pub valid: bool,
+    pub has_position: bool,
+    pub lat: f64,
+    pub lon: f64,
+    pub has_speed: bool,
+    pub speed_knots: f64,
+    pub has_course: bool,
+    pub course: f64,
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub has_magvar: bool,
+    pub magvar: f64,     // east positive
+    pub mode: str,
+}
+
+pub fn nmea_rmc(s: & NmeaSentence) -> NmeaRmc {
+    var r: NmeaRmc = NmeaRmc {
+        ok: false, time: - 1.0, valid: false, has_position: false, lat: 0.0, lon: 0.0, has_speed: false, speed_knots: 0.0, has_course: false, course: 0.0, year: 0, month: 0, day: 0, has_magvar: false, magvar: 0.0, mode: "",
+    };
+    if !s.ok || s.kind != "RMC" || s.fields.len() < 11 {
+        return r;
+    }
+    r.time = nmea_time(nmea_field(s, 0));
+    r.valid = nmea_field(s, 1) == "A";
+    var pos_ok: bool = true;
+    r.lat = nmea_coord(nmea_field(s, 2), nmea_field(s, 3), & mut pos_ok);
+    r.lon = nmea_coord(nmea_field(s, 4), nmea_field(s, 5), & mut pos_ok);
+    r.has_position = pos_ok;
+    r.has_speed = nmea_is_number(nmea_field(s, 6));
+    if r.has_speed { r.speed_knots = nm_num(nmea_field(s, 6)); }
+    r.has_course = nmea_is_number(nmea_field(s, 7));
+    if r.has_course { r.course = nm_num(nmea_field(s, 7)); }
+    val date: str = nmea_field(s, 8);
+    if str_len(date) == 6 && nmea_is_number(date) {
+        r.day = str_parse_int(str_slice(date, 0, 2));
+        r.month = str_parse_int(str_slice(date, 2, 4));
+        val yy: i64 = str_parse_int(str_slice(date, 4, 6));
+        r.year = 2000 + yy;
+        if yy >= 80 {
+            r.year = 1900 + yy;
+        }
+    }
+    r.has_magvar = nmea_is_number(nmea_field(s, 9));
+    if r.has_magvar {
+        r.magvar = nm_num(nmea_field(s, 9));
+        if nmea_field(s, 10) == "W" {
+            r.magvar = 0.0 - r.magvar;
+        }
+    }
+    r.mode = nmea_field(s, 11);
+    r.ok = true;
+    return r;
+}
+
+/// The RMC's date and time as seconds since 1970 (UTC); -1 without both.
+pub fn nmea_rmc_unix(r: & NmeaRmc) -> f64 {
+    if r.year == 0 || r.time < 0.0 {
+        return - 1.0;
+    }
+    return (nm_days(r.year, r.month, r.day) * 86400) as f64 + r.time;
+}
+
+/// GSA: selection mode (A/M), fix type (1 none, 2 2D, 3 3D), the PRNs of
+/// up to 12 satellites used, PDOP, HDOP, VDOP.
+pub struct NmeaGsa {
+    pub ok: bool,
+    pub mode: str,
+    pub fix: i64,
+    pub prns: Vec<i64>,
+    pub pdop: f64,
+    pub hdop: f64,
+    pub vdop: f64,
+}
+
+pub fn nmea_gsa(s: & NmeaSentence) -> NmeaGsa {
+    var g: NmeaGsa = NmeaGsa {
+        ok: false, mode: "", fix: 0, prns: Vec::new(), pdop: 0.0, hdop: 0.0, vdop: 0.0
+    };
+    if !s.ok || s.kind != "GSA" || s.fields.len() < 17 {
+        return g;
+    }
+    g.mode = nmea_field(s, 0);
+    g.fix = nm_int(nmea_field(s, 1));
+    var i: i64 = 2;
+    while i < 14 {
+        val f: str = nmea_field(s, i);
+        if nmea_is_number(f) {
+            g.prns.push(nm_int(f));
+        }
+        i = i + 1;
+    }
+    g.pdop = nm_num(nmea_field(s, 14));
+    g.hdop = nm_num(nmea_field(s, 15));
+    g.vdop = nm_num(nmea_field(s, 16));
+    g.ok = true;
+    return g;
+}
+
+/// GSV: sentence `num` of `total`, satellites in view, and up to four
+/// satellites (PRN, elevation, azimuth, SNR; -1 for an empty field).
+pub struct NmeaGsv {
+    pub ok: bool,
+    pub total: i64,
+    pub num: i64,
+    pub in_view: i64,
+    pub prns: Vec<i64>,
+    pub elevs: Vec<i64>,
+    pub azims: Vec<i64>,
+    pub snrs: Vec<i64>,
+}
+
+fn nm_int_or(f: str) -> i64 {
+    if nmea_is_number(f) {
+        return nm_int(f);
+    }
+    return - 1;
+}
+
+pub fn nmea_gsv(s: & NmeaSentence) -> NmeaGsv {
+    var g: NmeaGsv = NmeaGsv {
+        ok: false, total: 0, num: 0, in_view: 0, prns: Vec::new(), elevs: Vec::new(), azims: Vec::new(), snrs: Vec::new()
+    };
+    if !s.ok || s.kind != "GSV" || s.fields.len() < 3 {
+        return g;
+    }
+    g.total = nm_int(nmea_field(s, 0));
+    g.num = nm_int(nmea_field(s, 1));
+    g.in_view = nm_int(nmea_field(s, 2));
+    var i: i64 = 3;
+    while i + 3 < s.fields.len() {
+        val prn: str = nmea_field(s, i);
+        if prn != "" {
+            g.prns.push(nm_int(prn));
+            g.elevs.push(nm_int_or(nmea_field(s, i + 1)));
+            g.azims.push(nm_int_or(nmea_field(s, i + 2)));
+            g.snrs.push(nm_int_or(nmea_field(s, i + 3)));
+        }
+        i = i + 4;
+    }
+    g.ok = g.total >= 1 && g.num >= 1 && g.num <= g.total;
+    return g;
+}
+
+/// The satellites of a whole GSV group (sentences 1..total in order).
+pub struct NmeaSky {
+    pub talker: str,
+    pub expect: i64,      // next sentence number wanted
+    pub total: i64,
+    pub in_view: i64,
+    pub complete: bool,
+    pub prns: Vec<i64>,
+    pub elevs: Vec<i64>,
+    pub azims: Vec<i64>,
+    pub snrs: Vec<i64>,
+}
+
+pub fn nmea_sky_new() -> NmeaSky {
+    return NmeaSky {
+        talker: "", expect: 1, total: 0, in_view: 0, complete: false, prns: Vec::new(), elevs: Vec::new(), azims: Vec::new(), snrs: Vec::new()
+    };
+}
+
+/// Add a GSV sentence. A sentence out of order starts over (from its
+/// group's first sentence). True when the group became complete.
+pub fn nmea_sky_add(k: & mut NmeaSky, s: & NmeaSentence) -> bool {
+    val g: NmeaGsv = nmea_gsv(s);
+    if !g.ok {
+        return false;
+    }
+    if g.num == 1 {
+        k.prns = Vec::new();
+        k.elevs = Vec::new();
+        k.azims = Vec::new();
+        k.snrs = Vec::new();
+        k.total = g.total;
+        k.in_view = g.in_view;
+        k.talker = s.talker;
+        k.complete = false;
+    } else if g.num != k.expect || g.total != k.total || s.talker != k.talker {
+        k.expect = 1;
+        k.complete = false;
+        return false;
+    }
+    k.prns.extend(g.prns);
+    k.elevs.extend(g.elevs);
+    k.azims.extend(g.azims);
+    k.snrs.extend(g.snrs);
+    k.expect = g.num + 1;
+    if g.num == g.total {
+        k.complete = true;
+        k.expect = 1;
+        return true;
+    }
+    return false;
+}
+
+/// VTG: course (true and magnetic), speed in knots and km/h, mode.
+pub struct NmeaVtg {
+    pub ok: bool,
+    pub has_course: bool,
+    pub course_true: f64,
+    pub has_course_mag: bool,
+    pub course_mag: f64,
+    pub knots: f64,
+    pub kmh: f64,
+    pub mode: str,
+}
+
+pub fn nmea_vtg(s: & NmeaSentence) -> NmeaVtg {
+    var v: NmeaVtg = NmeaVtg {
+        ok: false, has_course: false, course_true: 0.0, has_course_mag: false, course_mag: 0.0, knots: 0.0, kmh: 0.0, mode: ""
+    };
+    if !s.ok || s.kind != "VTG" || s.fields.len() < 8 {
+        return v;
+    }
+    v.has_course = nmea_is_number(nmea_field(s, 0));
+    if v.has_course { v.course_true = nm_num(nmea_field(s, 0)); }
+    v.has_course_mag = nmea_is_number(nmea_field(s, 2));
+    if v.has_course_mag { v.course_mag = nm_num(nmea_field(s, 2)); }
+    v.knots = nm_num(nmea_field(s, 4));
+    v.kmh = nm_num(nmea_field(s, 6));
+    v.mode = nmea_field(s, 8);
+    v.ok = true;
+    return v;
+}
+
+/// Build a GGA sentence (talker "GP") from a fix: time "hhmmss", position
+/// with `decimals` minute digits, quality, satellites, HDOP, altitude and
+/// geoid separation with one decimal.
+pub fn nmea_build_gga(time: str, lat: f64, lon: f64, decimals: i64, quality: i64, sats: i64, hdop: f64, alt: f64, geoid: f64) -> str {
+    var ns: str = "N";
+    if lat < 0.0 {
+        ns = "S";
+    }
+    var ew: str = "E";
+    if lon < 0.0 {
+        ew = "W";
+    }
+    var satstr: str = int_to_str(sats);
+    if sats < 10 {
+        satstr = "0" + satstr;
+    }
+    val body: str = "GPGGA," + time + "," + nmea_ddmm(lat, false, decimals) + "," + ns + "," + nmea_ddmm(lon, true, decimals) + "," + ew + "," + int_to_str(quality) + "," + satstr + "," + nmea_fixed(hdop, 1) + "," + nmea_fixed(alt, 1) + ",M," + nmea_fixed(geoid, 1) + ",M,,";
+    return nmea_sentence(body);
+}

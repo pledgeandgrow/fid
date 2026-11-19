@@ -1,0 +1,98 @@
+// VF5, PEIR_ROTATE (compiler/pe_ir.fd): loop rotation copies a loop's test
+// to the end of its body. A wrong rotation runs the test a different number
+// of times (seen when the test has a side effect), runs the body once when
+// it should not run at all, or skips the test after `continue`. Each loop
+// below counts how often its test ran or its body ran.
+//
+// Expected output:
+// 10 9
+// 5 5
+// 1 0
+// 6
+// 100
+// 0
+// 7 21
+
+// the test's side effect: count the calls in v[0]
+fn bump(v: &mut Vec<i64>) -> i64 {
+    v.set(0, v.get(0) + 1);
+    return v.get(0);
+}
+
+fn main() -> i64 {
+    // a call in the test: 10 tests, 9 bodies
+    var c1: Vec<i64> = Vec::new();
+    c1.push(0);
+    var runs: i64 = 0;
+    while bump(&mut c1) < 10 {
+        runs = runs + 1;
+    }
+    println(int_to_str(c1.get(0)) + " " + int_to_str(runs));
+
+    // a call after `&&`: made only while the left side holds
+    var c2: Vec<i64> = Vec::new();
+    c2.push(0);
+    var i: i64 = 0;
+    while i < 5 && bump(&mut c2) > 0 {
+        i = i + 1;
+    }
+    println(int_to_str(c2.get(0)) + " " + int_to_str(i));
+
+    // a test that fails at once: one call, no body
+    var c3: Vec<i64> = Vec::new();
+    c3.push(0);
+    var never: i64 = 0;
+    while bump(&mut c3) > 100 {
+        never = never + 1;
+    }
+    println(int_to_str(c3.get(0)) + " " + int_to_str(never));
+
+    // an inner loop that runs zero times on most outer iterations
+    var inner: i64 = 0;
+    var o: i64 = 0;
+    while o < 6 {
+        var j: i64 = o;
+        while j < 3 {
+            inner = inner + 1;
+            j = j + 1;
+        }
+        o = o + 1;
+    }
+    println(inner);
+
+    // `continue` goes back to the test
+    var n: i64 = 0;
+    var s: i64 = 0;
+    while n < 20 {
+        n = n + 1;
+        if n % 2 == 0 {
+            continue;
+        }
+        s = s + n;
+    }
+    println(s);
+
+    // `break` on the first iteration
+    var k: i64 = 0;
+    while k < 10 {
+        if k == 0 {
+            break;
+        }
+        k = k + 1;
+    }
+    println(k);
+
+    // a test that reads what the body changes
+    var v: Vec<i64> = Vec::new();
+    while v.len() < 7 {
+        v.push(v.len());
+    }
+    var sum: i64 = 0;
+    var t: i64 = 0;
+    while t < v.len() {
+        sum = sum + v.get(t);
+        t = t + 1;
+    }
+    println(int_to_str(v.len()) + " " + int_to_str(sum));
+    return 0;
+}

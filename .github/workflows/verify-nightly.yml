@@ -1,0 +1,199 @@
+# Nightly verification (competitive roadmap Track VF): the fuzzers and the
+# sanitizers, every night on new random inputs. The quick checks of every
+# push are in ci.yml; the long runs (mutants, pass toggles, coverage, the
+# clean-tree bootstrap) are weekly, in verify-weekly.yml.
+#
+#   fuzz      VF1  scripts/fuzz/nightly.sh: random programs (plain and
+#                  --rich: structs, enums, strings, floats) on the
+#                  interpreter, the C path and the checked allocator, a
+#                  sample under ASan/UBSan
+#             VF2  scripts/fuzz/gen_vs_c.py: random programs against an
+#                  equivalent C program built by Clang (zig cc) and GCC at
+#                  -O0 and -O2, on run, ccompile (-O0, -O2) and the machine
+#                  layer (emit --target x86_64-linux)
+#             VF3  scripts/fuzz/fuzz_frontend.py: mutants of the suite
+#                  through `fid check`, and through `fid emit` (the IR
+#                  optimizer and the machine layer's passes)
+#             VF15 scripts/fuzz/fuzz_parsers.py: the stdlib parsers
+#   sanitize  VF14 scripts/sanitize.sh: the suite through C under ASan and
+#                  UBSan, and the threaded programs under ThreadSanitizer
+#   soak      I6   scripts/verify/soak_http.py: an HTTP service on a real
+#                  socket under wrk for 30 minutes, flat memory, no failure
+#
+# The seed is the date, so each night tries new inputs and a finding is
+# reproduced with that seed alone (see each script's header). Findings are
+# uploaded as the artifact of the run; a job fails when its step found one.
+# How to read and file one: docs/verification/README.md.
+
+name: Verify (nightly)
+
+on:
+  schedule:
+    - cron: "23 2 * * *"   # every day 02:23 UTC
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "seed (default: the date)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-nightly
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CC: zig cc
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: mold, clang, gcc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold clang gcc
+      - name: Seed
+        id: seed
+        run: |
+          s="${{ github.event.inputs.seed }}"
+          [ -n "$s" ] || s=$(date +%Y%m%d)
+          echo "seed=$s" >> "$GITHUB_OUTPUT"
+          echo "Seed: $s" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        run: ./scripts/build-selfhost.sh
+      - name: VF1 random programs, every backend
+        env:
+          SEED: ${{ steps.seed.outputs.seed }}
+          N: "300"
+        run: bash scripts/fuzz/nightly.sh
+      - name: VF2 random programs against C (Clang and GCC)
+        if: always()
+        run: |
+          python scripts/fuzz/gen_vs_c.py -n 150 --seed "${{ steps.seed.outputs.seed }}" \
+            --fid "$FID" --backends run,ccompile,ccompile-O2,emit:x86_64-linux \
+            --cc clang,gcc --keep build/fuzz-c
+      - name: VF2 random programs against C, with f64, str and enums (--ext)
+        if: always()
+        run: |
+          python scripts/fuzz/gen_vs_c.py -n 100 --seed "${{ steps.seed.outputs.seed }}" --ext \
+            --fid "$FID" --backends run,ccompile,ccompile-O2,emit:x86_64-linux \
+            --cc clang,gcc --keep build/fuzz-c-ext
+      - name: VF3 front end (check)
+        if: always()
+        run: |
+          python scripts/fuzz/fuzz_frontend.py --fid "$FID" -n 1500 \
+            --seed "${{ steps.seed.outputs.seed }}" --out build/fuzz-fe
+      - name: VF3 optimizer passes (emit --target x86_64-linux)
+        if: always()
+        run: |
+          python scripts/fuzz/fuzz_frontend.py --fid "$FID" -n 400 --mode emit \
+            --target x86_64-linux --timeout 120 \
+            --seed "${{ steps.seed.outputs.seed }}" --out build/fuzz-fe-emit
+      - name: VF15 stdlib parsers
+        if: always()
+        run: |
+          python scripts/fuzz/fuzz_parsers.py --fid "$FID" -n 3000 \
+            --seed "${{ steps.seed.outputs.seed }}" --out build/fuzz-parsers
+      - name: Findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ steps.seed.outputs.seed }}
+          path: |
+            build/fuzz*/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold, clang
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold clang
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: VF14 ASan + UBSan, the suite through C
+        env:
+          CC: clang
+          OUT: build/sanitize
+        run: bash scripts/sanitize.sh
+      - name: VF14 ThreadSanitizer, the threaded programs
+        if: always()
+        env:
+          CC: clang
+          SAN: thread
+          OUT: build/sanitize-thread
+        run: bash scripts/sanitize.sh
+      - name: Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitize-${{ github.run_id }}
+          path: |
+            build/sanitize*/*.san
+          if-no-files-found: ignore
+          retention-days: 30
+
+  soak:
+    # I6: tests/verify/soak_http_service.fd (http_serve_scoped) on a real
+    # socket under wrk, with a body-checking client beside it
+    # (scripts/verify/soak_http.py), for 30 minutes: no failed request,
+    # flat memory over the second half. The 24-hour run is
+    # `--duration 86400` by hand (docs/verification/soak-http.md).
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CC: zig cc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: mold, wrk, psutil
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold wrk
+          pip install --quiet psutil
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        run: ./scripts/build-selfhost.sh
+      - name: I6 socket soak, 30 minutes under wrk
+        run: python3 scripts/verify/soak_http.py --fid release/fid-dev --duration 1800 --loadgen wrk --out build/soak-http
+      - name: Samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-http-${{ github.run_id }}
+          path: |
+            build/soak-http/*.csv
+            build/soak-http/*.txt
+            build/soak-http/*.log
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,705 @@
+// Fides WireGuard (the WireGuard paper, Donenfeld 2017, §5-§6, and the
+// wire format of wireguard.com/protocol): the Noise_IKpsk2 handshake
+// (initiation and response messages with mac1/mac2), cookie replies
+// (XChaCha20-Poly1305 under a BLAKE2s-derived key, a rotating secret),
+// TAI64N timestamps with replay rejection, transport data messages with
+// 64-bit counters, zero padding to 16 bytes and a sliding replay window
+// (RFC 6479 bitmap), key derivation into send/receive keypairs with
+// current/previous/next slots and key confirmation, and the timer state
+// machine (rekey after time, retransmission and give-up, passive and
+// persistent keepalives, a new handshake when data goes unanswered, key
+// expiry).
+//
+// The handshake is noise_proto.fd's HandshakeState with protocol name
+// Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s, prologue "WireGuard v1 zx2c4
+// Jason@zx2c4.com" and BLAKE2s (written in noise_proto.fd); MACs are
+// keyed BLAKE2s-128, the cookie AEAD is chacha20poly1305.fd's XChaCha20.
+//
+// Pure computation over packets as bytes; the seams: UDP is the caller's
+// (packets in, packets out, the source address given as bytes), time is
+// injected (`now` in seconds, plus nanoseconds for the TAI64N
+// timestamp), and randomness (ephemeral keys, sender indices, the cookie
+// secret, cookie nonces) comes from crypto_random_bytes unless the caller
+// sets the next value (wg_set_next_ephemeral, wg_set_next_index,
+// wg_cookie_set_secret), as the tests do. One WgPeer is one configured
+// peer; a device with several peers finds the right one for an
+// initiation with wg_initiation_static and for data with wg_receiver_index.
+//
+// Limits: counters are i64, so REJECT_AFTER_MESSAGES is 2^62 instead of
+// 2^64 - 2^13 - 1 (rejecting earlier is safe); the handshake flood limit
+// (initiations per second) and roaming of endpoints are the device's job.
+//
+// Checked in tests/bootstrap/test_std_wireguard.fd: two peers handshake,
+// exchange data, rekey and handle a cookie reply in memory; the
+// initiation, response and first data packets are byte-exact against a
+// Node.js implementation (OpenSSL X25519/ChaCha20-Poly1305/BLAKE2s, MACs
+// by Python's keyed BLAKE2s).
+//
+// Usage:
+//   use wireguard;
+//   var a = wg_peer_new(a_secret, b_public, psk);   // psk: 32 bytes or empty
+//   var b = wg_peer_new(b_secret, a_public, psk);
+//   val init = wg_create_initiation(& mut a, now, nsec);
+//   wg_consume_initiation(& mut b, init, now);
+//   val resp = wg_create_response(& mut b, now);
+//   wg_consume_response(& mut a, resp, now);
+//   val pkt = wg_encrypt(& mut a, ip_packet, now);
+//   val r = wg_decrypt(& mut b, pkt, now);         // r.ok, r.data, r.keepalive
+//   val t = wg_timers(& mut a, now);               // t.action, t.packet
+
+module wireguard;
+use vec;
+use crypto;
+use x25519;
+use chacha20poly1305;
+use noise_proto;
+
+pub const WG_CONSTRUCTION: str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+pub const WG_IDENTIFIER: str = "WireGuard v1 zx2c4 Jason@zx2c4.com";
+pub const WG_REKEY_AFTER_MESSAGES: i64 = 1152921504606846976;
+pub const WG_REJECT_AFTER_MESSAGES: i64 = 4611686018427387904;
+pub const WG_REKEY_AFTER_TIME: i64 = 120;
+pub const WG_REJECT_AFTER_TIME: i64 = 180;
+pub const WG_REKEY_ATTEMPT_TIME: i64 = 90;
+pub const WG_REKEY_TIMEOUT: i64 = 5;
+pub const WG_KEEPALIVE_TIMEOUT: i64 = 10;
+pub const WG_COOKIE_LIFETIME: i64 = 120;
+/// Replay window: 64 words of 32 bits, 2016 counters behind the newest.
+pub const WG_WINDOW_WORDS: i64 = 64;
+
+pub const WG_MAC_OK: i64 = 0;
+pub const WG_MAC_BAD: i64 = 1;
+pub const WG_MAC_NEED_COOKIE: i64 = 2;
+
+pub const WG_TIMER_NONE: i64 = 0;
+pub const WG_TIMER_INITIATION: i64 = 1;
+pub const WG_TIMER_KEEPALIVE: i64 = 2;
+pub const WG_TIMER_GAVE_UP: i64 = 3;
+pub const WG_TIMER_EXPIRED: i64 = 4;
+
+/// A sliding replay window (RFC 6479): `last` is the highest counter
+/// accepted, -1 before the first.
+pub struct WgReplay {
+    pub last: i64,
+    pub bits: Vec<i64>,
+}
+
+/// Transport keys of one handshake.
+pub struct WgKeypair {
+    pub valid: bool,
+    pub send_key: Vec<i64>,
+    pub recv_key: Vec<i64>,
+    pub send_counter: i64,
+    pub replay: WgReplay,
+    pub local_index: i64,
+    pub remote_index: i64,
+    pub created: i64,
+    pub initiator: bool,
+}
+
+/// One peer as seen from this side.
+pub struct WgPeer {
+    pub s: Vec<i64>,
+    pub s_pub: Vec<i64>,
+    pub remote: Vec<i64>,
+    pub psk: Vec<i64>,
+    pub hs: NoiseHandshake,
+    pub hs_state: i64,
+    pub hs_local_index: i64,
+    pub hs_remote_index: i64,
+    pub hs_sent_at: i64,
+    pub hs_first_at: i64,
+    pub last_timestamp: Vec<i64>,
+    pub current: WgKeypair,
+    pub previous: WgKeypair,
+    pub next: WgKeypair,
+    pub last_sent: i64,
+    pub last_data_sent: i64,
+    pub last_received: i64,
+    pub persistent_keepalive: i64,
+    pub cookie: Vec<i64>,
+    pub cookie_time: i64,
+    pub last_mac1: Vec<i64>,
+    pub next_e: Vec<i64>,
+    pub next_index: i64,
+    pub err: str,
+}
+
+/// A received data packet: `data` keeps its zero padding (an IP packet
+/// carries its own length); `keepalive` when it was empty.
+pub struct WgReceived {
+    pub ok: bool,
+    pub err: str,
+    pub data: Vec<i64>,
+    pub keepalive: bool,
+}
+
+/// What the timers want sent now.
+pub struct WgTimerOut {
+    pub action: i64,
+    pub packet: Vec<i64>,
+}
+
+/// The responder side of cookies: the local static public key and the
+/// secret, renewed every two minutes.
+pub struct WgCookieChecker {
+    pub s_pub: Vec<i64>,
+    pub secret: Vec<i64>,
+    pub secret_time: i64,
+}
+
+// hs_state values
+const WG_HS_NONE: i64 = 0;
+const WG_HS_SENT_INITIATION: i64 = 1;
+const WG_HS_GOT_INITIATION: i64 = 2;
+
+// ─── Bytes, hashes, MACs, TAI64N ───────────────────────────────────────
+
+fn wg_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    return out;
+}
+
+fn wg_slice(v: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { o.push(v.get(i)); i = i + 1; }
+    return o;
+}
+
+fn wg_zeros(n: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { o.push(0); i = i + 1; }
+    return o;
+}
+
+fn wg_le32(v: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 { o.push((v >> (i * 8)) & 255); i = i + 1; }
+    return o;
+}
+
+fn wg_le64(v: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 { o.push((v >> (i * 8)) & 255); i = i + 1; }
+    return o;
+}
+
+fn wg_read_le32(v: & Vec<i64>, at: i64) -> i64 {
+    return v.get(at) | (v.get(at + 1) << 8) | (v.get(at + 2) << 16) | (v.get(at + 3) << 24);
+}
+
+/// A little-endian u64 counter; -1 when it does not fit below 2^62.
+fn wg_read_counter(v: & Vec<i64>, at: i64) -> i64 {
+    if v.get(at + 7) >= 64 { return -1; }
+    var x: i64 = 0;
+    var i: i64 = 7;
+    while i >= 0 {
+        x = (x << 8) | v.get(at + i);
+        i = i - 1;
+    }
+    return x;
+}
+
+fn wg_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() { d = d | (a.get(i) ^ b.get(i)); i = i + 1; }
+    return d == 0;
+}
+
+/// HASH(x) = BLAKE2s-256.
+pub fn wg_hash(data: Vec<i64>) -> Vec<i64> {
+    return noise_blake2s(Vec::new(), data, 32);
+}
+
+/// MAC(key, x) = keyed BLAKE2s with 16-byte output.
+pub fn wg_mac(key: Vec<i64>, data: Vec<i64>) -> Vec<i64> {
+    return noise_blake2s(key, data, 16);
+}
+
+/// The mac1 key HASH("mac1----" || public key) of the receiving side.
+pub fn wg_mac1_key(public_key: Vec<i64>) -> Vec<i64> {
+    return wg_hash(wg_cat(str_bytes("mac1----"), public_key));
+}
+
+/// The cookie key HASH("cookie--" || public key) of the receiving side.
+pub fn wg_cookie_key(public_key: Vec<i64>) -> Vec<i64> {
+    return wg_hash(wg_cat(str_bytes("cookie--"), public_key));
+}
+
+/// TAI64N of a Unix time: 8 bytes big-endian 2^62 + 10 + seconds, then 4
+/// bytes big-endian nanoseconds with the low 24 bits cleared (as
+/// wireguard-go and the Linux module, so the timestamp is no fine clock).
+pub fn wg_tai64n(unix_sec: i64, nsec: i64) -> Vec<i64> {
+    val label: i64 = 4611686018427387914 + unix_sec;
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 7;
+    while i >= 0 { o.push((label >> (i * 8)) & 255); i = i - 1; }
+    val n: i64 = nsec & 0x7f000000;
+    i = 3;
+    while i >= 0 { o.push((n >> (i * 8)) & 255); i = i - 1; }
+    return o;
+}
+
+fn wg_bytes_greater(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if b.len() == 0 { return true; }
+    var i: i64 = 0;
+    while i < a.len() && i < b.len() {
+        if a.get(i) != b.get(i) { return a.get(i) > b.get(i); }
+        i = i + 1;
+    }
+    return a.len() > b.len();
+}
+
+// ─── Replay window (RFC 6479) ──────────────────────────────────────────
+
+/// An empty window.
+pub fn wg_replay_new() -> WgReplay {
+    return WgReplay { last: -1, bits: wg_zeros(WG_WINDOW_WORDS) };
+}
+
+/// True when `counter` may still be accepted (not too old, not seen).
+pub fn wg_replay_check(w: & WgReplay, counter: i64) -> bool {
+    if counter < 0 { return false; }
+    if counter > w.last { return true; }
+    if w.last - counter >= (WG_WINDOW_WORDS - 1) * 32 { return false; }
+    val word: i64 = w.bits.get((counter >> 5) % WG_WINDOW_WORDS);
+    return ((word >> (counter & 31)) & 1) == 0;
+}
+
+/// Record `counter` (call after the packet authenticated); false when it
+/// is a replay or too old.
+pub fn wg_replay_update(w: & mut WgReplay, counter: i64) -> bool {
+    if !wg_replay_check(w, counter) { return false; }
+    if counter > w.last {
+        var cur: i64 = 0;
+        if w.last >= 0 { cur = w.last >> 5; } else { cur = -1; }
+        val target: i64 = counter >> 5;
+        var diff: i64 = target - cur;
+        if diff > WG_WINDOW_WORDS { diff = WG_WINDOW_WORDS; }
+        var i: i64 = 1;
+        while i <= diff {
+            w.bits.set((cur + i + WG_WINDOW_WORDS) % WG_WINDOW_WORDS, 0);
+            i = i + 1;
+        }
+        w.last = counter;
+    }
+    val idx: i64 = (counter >> 5) % WG_WINDOW_WORDS;
+    w.bits.set(idx, w.bits.get(idx) | (1 << (counter & 31)));
+    return true;
+}
+
+// ─── Peers ─────────────────────────────────────────────────────────────
+
+fn wg_no_keypair() -> WgKeypair {
+    return WgKeypair {
+        valid: false, send_key: Vec::new(), recv_key: Vec::new(), send_counter: 0,
+        replay: wg_replay_new(), local_index: -1, remote_index: -1, created: 0, initiator: false
+    };
+}
+
+/// A peer: our 32-byte static secret, the peer's static public key, and
+/// the pre-shared key (32 bytes, or empty for none = 32 zero bytes).
+pub fn wg_peer_new(secret: Vec<i64>, remote_public: Vec<i64>, psk: Vec<i64>) -> WgPeer {
+    var q: Vec<i64> = psk;
+    if q.len() != 32 { q = wg_zeros(32); }
+    return WgPeer {
+        s: secret, s_pub: x25519_public_key(secret), remote: remote_public, psk: q,
+        hs: noise_handshake_new(WG_CONSTRUCTION, true, Vec::new(), Vec::new(), Vec::new(), q),
+        hs_state: WG_HS_NONE, hs_local_index: -1, hs_remote_index: -1, hs_sent_at: 0, hs_first_at: -1,
+        last_timestamp: Vec::new(),
+        current: wg_no_keypair(), previous: wg_no_keypair(), next: wg_no_keypair(),
+        last_sent: -1, last_data_sent: -1, last_received: -1, persistent_keepalive: 0,
+        cookie: Vec::new(), cookie_time: -1, last_mac1: Vec::new(),
+        next_e: Vec::new(), next_index: -1, err: ""
+    };
+}
+
+/// Seam: the next ephemeral secret this peer uses (32 bytes).
+pub fn wg_set_next_ephemeral(p: & mut WgPeer, e: Vec<i64>) {
+    p.next_e = e;
+}
+
+/// Seam: the next sender index this peer announces.
+pub fn wg_set_next_index(p: & mut WgPeer, idx: i64) {
+    p.next_index = idx & 0xffffffff;
+}
+
+fn wg_take_index(p: & mut WgPeer) -> i64 {
+    if p.next_index >= 0 {
+        val i: i64 = p.next_index;
+        p.next_index = -1;
+        return i;
+    }
+    val r: Vec<i64> = crypto_random_bytes(4);
+    return wg_read_le32(& r, 0);
+}
+
+fn wg_new_handshake(p: & mut WgPeer, initiator: bool) -> NoiseHandshake {
+    var rs: Vec<i64> = Vec::new();
+    if initiator { rs = p.remote; }
+    var hs: NoiseHandshake = noise_handshake_new(WG_CONSTRUCTION, initiator, str_bytes(WG_IDENTIFIER), p.s, rs, p.psk);
+    if p.next_e.len() == 32 {
+        noise_set_ephemeral(& mut hs, p.next_e);
+        p.next_e = Vec::new();
+    }
+    return hs;
+}
+
+/// Append mac1 (keyed for `receiver_public`) and mac2 (with the cookie,
+/// if fresh) to a message body.
+fn wg_add_macs(p: & mut WgPeer, body: Vec<i64>, now: i64) -> Vec<i64> {
+    val mac1: Vec<i64> = wg_mac(wg_mac1_key(p.remote), body);
+    p.last_mac1 = mac1;
+    val with1: Vec<i64> = wg_cat(body, mac1);
+    if p.cookie.len() == 16 && now - p.cookie_time < WG_COOKIE_LIFETIME {
+        return wg_cat(with1, wg_mac(p.cookie, with1));
+    }
+    return wg_cat(with1, wg_zeros(16));
+}
+
+fn wg_mac1_ok(my_public: Vec<i64>, pkt: & Vec<i64>) -> bool {
+    val n: i64 = pkt.len();
+    val m: Vec<i64> = wg_mac(wg_mac1_key(my_public), wg_slice(pkt, 0, n - 32));
+    val got: Vec<i64> = wg_slice(pkt, n - 32, n - 16);
+    return wg_eq(& m, & got);
+}
+
+/// Handshake initiation (type 1, 148 bytes) carrying TAI64N(now, nsec).
+pub fn wg_create_initiation(p: & mut WgPeer, now: i64, nsec: i64) -> Vec<i64> {
+    var hs: NoiseHandshake = wg_new_handshake(p, true);
+    val m: Vec<i64> = noise_write_message(& mut hs, wg_tai64n(now, nsec));
+    if !hs.ok || m.len() != 108 {
+        p.err = hs.err;
+        return Vec::new();
+    }
+    val idx: i64 = wg_take_index(p);
+    var body: Vec<i64> = Vec::new();
+    body.push(1); body.push(0); body.push(0); body.push(0);
+    body = wg_cat(wg_cat(body, wg_le32(idx)), m);
+    val pkt: Vec<i64> = wg_add_macs(p, body, now);
+    p.hs = hs;
+    p.hs_state = WG_HS_SENT_INITIATION;
+    p.hs_local_index = idx;
+    p.hs_sent_at = now;
+    if p.hs_first_at < 0 { p.hs_first_at = now; }
+    p.last_sent = now;
+    return pkt;
+}
+
+/// The initiator's static public key inside an initiation addressed to
+/// `secret` (for a device choosing among its peers); empty when the
+/// message does not decrypt.
+pub fn wg_initiation_static(secret: Vec<i64>, pkt: Vec<i64>) -> Vec<i64> {
+    if pkt.len() != 148 || pkt.get(0) != 1 { return Vec::new(); }
+    var hs: NoiseHandshake = noise_handshake_new(WG_CONSTRUCTION, false, str_bytes(WG_IDENTIFIER), secret, Vec::new(), wg_zeros(32));
+    // the static key is decrypted before the psk is used, so any psk works
+    val r: NoiseBytes = noise_read_message(& mut hs, wg_slice(& pkt, 8, 116));
+    if hs.rs.len() == 32 { return hs.rs; }
+    return Vec::new();
+}
+
+/// Process a handshake initiation from this peer: mac1, the Noise
+/// message, the initiator's identity and a timestamp newer than the last.
+pub fn wg_consume_initiation(p: & mut WgPeer, pkt: Vec<i64>, now: i64) -> bool {
+    if pkt.len() != 148 || pkt.get(0) != 1 || pkt.get(1) != 0 || pkt.get(2) != 0 || pkt.get(3) != 0 {
+        p.err = "not an initiation";
+        return false;
+    }
+    if !wg_mac1_ok(p.s_pub, & pkt) {
+        p.err = "bad mac1";
+        return false;
+    }
+    var hs: NoiseHandshake = wg_new_handshake(p, false);
+    val r: NoiseBytes = noise_read_message(& mut hs, wg_slice(& pkt, 8, 116));
+    if !r.ok {
+        p.err = "handshake failed: " + hs.err;
+        return false;
+    }
+    if !wg_eq(& hs.rs, & p.remote) {
+        p.err = "unknown initiator";
+        return false;
+    }
+    if !wg_bytes_greater(& r.data, & p.last_timestamp) {
+        p.err = "replayed initiation";
+        return false;
+    }
+    p.last_timestamp = r.data;
+    p.hs = hs;
+    p.hs_state = WG_HS_GOT_INITIATION;
+    p.hs_remote_index = wg_read_le32(& pkt, 4);
+    p.last_received = now;
+    return true;
+}
+
+fn wg_keypair_from(hs: & NoiseHandshake, local: i64, remote: i64, now: i64) -> WgKeypair {
+    val t: NoiseTransport = noise_split(hs);
+    return WgKeypair {
+        valid: true, send_key: t.send.k, recv_key: t.recv.k, send_counter: 0,
+        replay: wg_replay_new(), local_index: local, remote_index: remote, created: now,
+        initiator: hs.initiator
+    };
+}
+
+/// Handshake response (type 2, 92 bytes) to the initiation just consumed.
+/// The new keys wait in the `next` slot until the initiator's first data
+/// message confirms them.
+pub fn wg_create_response(p: & mut WgPeer, now: i64) -> Vec<i64> {
+    if p.hs_state != WG_HS_GOT_INITIATION {
+        p.err = "no initiation to answer";
+        return Vec::new();
+    }
+    var hs: NoiseHandshake = p.hs;
+    if p.next_e.len() == 32 {
+        noise_set_ephemeral(& mut hs, p.next_e);
+        p.next_e = Vec::new();
+    }
+    val m: Vec<i64> = noise_write_message(& mut hs, Vec::new());
+    if !hs.ok || m.len() != 48 {
+        p.err = hs.err;
+        return Vec::new();
+    }
+    val idx: i64 = wg_take_index(p);
+    var body: Vec<i64> = Vec::new();
+    body.push(2); body.push(0); body.push(0); body.push(0);
+    body = wg_cat(wg_cat(wg_cat(body, wg_le32(idx)), wg_le32(p.hs_remote_index)), m);
+    val pkt: Vec<i64> = wg_add_macs(p, body, now);
+    p.next = wg_keypair_from(& hs, idx, p.hs_remote_index, now);
+    p.hs = hs;
+    p.hs_state = WG_HS_NONE;
+    p.last_sent = now;
+    return pkt;
+}
+
+/// Process the response to our initiation: the new keys become current.
+pub fn wg_consume_response(p: & mut WgPeer, pkt: Vec<i64>, now: i64) -> bool {
+    if pkt.len() != 92 || pkt.get(0) != 2 || pkt.get(1) != 0 || pkt.get(2) != 0 || pkt.get(3) != 0 {
+        p.err = "not a response";
+        return false;
+    }
+    if p.hs_state != WG_HS_SENT_INITIATION || wg_read_le32(& pkt, 8) != p.hs_local_index {
+        p.err = "unexpected response";
+        return false;
+    }
+    if !wg_mac1_ok(p.s_pub, & pkt) {
+        p.err = "bad mac1";
+        return false;
+    }
+    var hs: NoiseHandshake = p.hs;
+    val r: NoiseBytes = noise_read_message(& mut hs, wg_slice(& pkt, 12, 60));
+    if !r.ok || r.data.len() != 0 {
+        p.err = "handshake failed: " + hs.err;
+        return false;
+    }
+    p.previous = p.current;
+    p.current = wg_keypair_from(& hs, p.hs_local_index, wg_read_le32(& pkt, 4), now);
+    p.hs = hs;
+    p.hs_state = WG_HS_NONE;
+    p.hs_first_at = -1;
+    p.last_received = now;
+    return true;
+}
+
+/// The receiver index of a data packet (type 4), -1 for other packets.
+pub fn wg_receiver_index(pkt: & Vec<i64>) -> i64 {
+    if pkt.len() < 32 || pkt.get(0) != 4 { return -1; }
+    return wg_read_le32(pkt, 4);
+}
+
+// ─── Transport data (type 4) ───────────────────────────────────────────
+
+/// Encrypt one packet (zero-padded to a multiple of 16) under the current
+/// keys; empty when there are no usable keys (none yet, too old, or the
+/// counter is exhausted). An empty `plain` is a keepalive.
+pub fn wg_encrypt(p: & mut WgPeer, plain: Vec<i64>, now: i64) -> Vec<i64> {
+    var kp: WgKeypair = p.current;
+    if !kp.valid || now - kp.created >= WG_REJECT_AFTER_TIME || kp.send_counter >= WG_REJECT_AFTER_MESSAGES {
+        p.err = "no valid keys";
+        return Vec::new();
+    }
+    var padded: Vec<i64> = plain;
+    while padded.len() % 16 != 0 { padded.push(0); }
+    val ct: Vec<i64> = noise_encrypt_with_nonce(NOISE_CHACHAPOLY, kp.send_key, kp.send_counter, Vec::new(), padded);
+    var pkt: Vec<i64> = Vec::new();
+    pkt.push(4); pkt.push(0); pkt.push(0); pkt.push(0);
+    pkt = wg_cat(wg_cat(wg_cat(pkt, wg_le32(kp.remote_index)), wg_le64(kp.send_counter)), ct);
+    kp.send_counter = kp.send_counter + 1;
+    p.current = kp;
+    p.last_sent = now;
+    if plain.len() > 0 { p.last_data_sent = now; }
+    return pkt;
+}
+
+fn wg_recv_fail(err: str) -> WgReceived {
+    return WgReceived { ok: false, err: err, data: Vec::new(), keepalive: false };
+}
+
+fn wg_try_keypair(kp: & mut WgKeypair, pkt: & Vec<i64>, now: i64) -> WgReceived {
+    if now - kp.created >= WG_REJECT_AFTER_TIME { return wg_recv_fail("keys expired"); }
+    val counter: i64 = wg_read_counter(pkt, 8);
+    if counter < 0 || counter >= WG_REJECT_AFTER_MESSAGES { return wg_recv_fail("counter out of range"); }
+    if !wg_replay_check(& kp.replay, counter) { return wg_recv_fail("replayed or too old"); }
+    val o: NoiseBytes = noise_decrypt_with_nonce(NOISE_CHACHAPOLY, kp.recv_key, counter, Vec::new(), wg_slice(pkt, 16, pkt.len()));
+    if !o.ok { return wg_recv_fail("authentication failed"); }
+    var w: WgReplay = kp.replay;
+    if !wg_replay_update(& mut w, counter) { return wg_recv_fail("replayed or too old"); }
+    kp.replay = w;
+    return WgReceived { ok: true, err: "", data: o.data, keepalive: o.data.len() == 0 };
+}
+
+/// Decrypt a data packet with whichever keypair its receiver index names.
+/// The first packet under `next` keys promotes them to current.
+pub fn wg_decrypt(p: & mut WgPeer, pkt: Vec<i64>, now: i64) -> WgReceived {
+    val idx: i64 = wg_receiver_index(& pkt);
+    if idx < 0 { return wg_recv_fail("not a data packet"); }
+    var r: WgReceived = wg_recv_fail("unknown receiver index");
+    if p.current.valid && p.current.local_index == idx {
+        var c: WgKeypair = p.current;
+        r = wg_try_keypair(& mut c, & pkt, now);
+        p.current = c;
+    } else if p.next.valid && p.next.local_index == idx {
+        var nx: WgKeypair = p.next;
+        r = wg_try_keypair(& mut nx, & pkt, now);
+        if r.ok {
+            p.previous = p.current;
+            p.current = nx;
+            p.next = wg_no_keypair();
+        }
+    } else if p.previous.valid && p.previous.local_index == idx {
+        var pv: WgKeypair = p.previous;
+        r = wg_try_keypair(& mut pv, & pkt, now);
+        p.previous = pv;
+    }
+    if r.ok { p.last_received = now; }
+    return r;
+}
+
+// ─── Cookies (§5.4.7) ──────────────────────────────────────────────────
+
+/// A cookie checker for our static public key.
+pub fn wg_cookie_checker_new(s_pub: Vec<i64>) -> WgCookieChecker {
+    return WgCookieChecker { s_pub: s_pub, secret: Vec::new(), secret_time: -1000000 };
+}
+
+/// Seam: set the cookie secret (32 bytes) as of `now`.
+pub fn wg_cookie_set_secret(c: & mut WgCookieChecker, secret: Vec<i64>, now: i64) {
+    c.secret = secret;
+    c.secret_time = now;
+}
+
+fn wg_cookie_value(c: & mut WgCookieChecker, src: Vec<i64>, now: i64) -> Vec<i64> {
+    if c.secret.len() != 32 || now - c.secret_time >= WG_COOKIE_LIFETIME {
+        c.secret = crypto_random_bytes(32);
+        c.secret_time = now;
+    }
+    return wg_mac(c.secret, src);
+}
+
+/// Check the MACs of an initiation or response from address `src`
+/// (IP bytes || port bytes). Under load a valid mac2 (made with the
+/// cookie for that address) is required, else WG_MAC_NEED_COOKIE.
+pub fn wg_check_macs(c: & mut WgCookieChecker, pkt: Vec<i64>, src: Vec<i64>, now: i64, under_load: bool) -> i64 {
+    if pkt.len() < 32 { return WG_MAC_BAD; }
+    if !wg_mac1_ok(c.s_pub, & pkt) { return WG_MAC_BAD; }
+    if !under_load { return WG_MAC_OK; }
+    val n: i64 = pkt.len();
+    val want: Vec<i64> = wg_mac(wg_cookie_value(c, src, now), wg_slice(& pkt, 0, n - 16));
+    val got: Vec<i64> = wg_slice(& pkt, n - 16, n);
+    if wg_eq(& want, & got) { return WG_MAC_OK; }
+    return WG_MAC_NEED_COOKIE;
+}
+
+/// A cookie reply (type 3, 64 bytes) to `pkt` from `src`; `nonce24` is
+/// 24 random bytes.
+pub fn wg_create_cookie_reply(c: & mut WgCookieChecker, pkt: Vec<i64>, src: Vec<i64>, nonce24: Vec<i64>, now: i64) -> Vec<i64> {
+    if pkt.len() < 32 || nonce24.len() != 24 { return Vec::new(); }
+    val n: i64 = pkt.len();
+    val cookie: Vec<i64> = wg_cookie_value(c, src, now);
+    val mac1: Vec<i64> = wg_slice(& pkt, n - 32, n - 16);
+    val enc: Vec<i64> = aead_xchacha20poly1305_seal(wg_cookie_key(c.s_pub), nonce24, mac1, cookie);
+    var out: Vec<i64> = Vec::new();
+    out.push(3); out.push(0); out.push(0); out.push(0);
+    out = wg_cat(wg_cat(wg_cat(out, wg_slice(& pkt, 4, 8)), nonce24), enc);
+    return out;
+}
+
+/// Take the cookie from a reply to our last message; mac2 of the next
+/// messages uses it for two minutes.
+pub fn wg_consume_cookie_reply(p: & mut WgPeer, pkt: Vec<i64>, now: i64) -> bool {
+    if pkt.len() != 64 || pkt.get(0) != 3 || p.last_mac1.len() != 16 {
+        p.err = "not a cookie reply";
+        return false;
+    }
+    if wg_read_le32(& pkt, 4) != p.hs_local_index {
+        p.err = "cookie reply for another message";
+        return false;
+    }
+    val o: AeadOpened = aead_xchacha20poly1305_open(wg_cookie_key(p.remote), wg_slice(& pkt, 8, 32), p.last_mac1, wg_slice(& pkt, 32, 64));
+    if !o.ok || o.data.len() != 16 {
+        p.err = "cookie decryption failed";
+        return false;
+    }
+    p.cookie = o.data;
+    p.cookie_time = now;
+    return true;
+}
+
+// ─── Timers (§6) ───────────────────────────────────────────────────────
+
+fn wg_timer(action: i64, packet: Vec<i64>) -> WgTimerOut {
+    return WgTimerOut { action: action, packet: packet };
+}
+
+/// Run the timers at `now`: at most one packet to send (a fresh
+/// initiation or a keepalive), or a note that the handshake was given up
+/// or all keys were dropped.
+pub fn wg_timers(p: & mut WgPeer, now: i64) -> WgTimerOut {
+    // keys of three times the reject age are erased
+    if p.current.valid && now - p.current.created >= WG_REJECT_AFTER_TIME * 3 {
+        p.current = wg_no_keypair();
+        p.previous = wg_no_keypair();
+        p.next = wg_no_keypair();
+        return wg_timer(WG_TIMER_EXPIRED, Vec::new());
+    }
+    // an initiation without a response: retransmit, or give up
+    if p.hs_state == WG_HS_SENT_INITIATION {
+        if now - p.hs_first_at >= WG_REKEY_ATTEMPT_TIME {
+            p.hs_state = WG_HS_NONE;
+            p.hs_first_at = -1;
+            return wg_timer(WG_TIMER_GAVE_UP, Vec::new());
+        }
+        if now - p.hs_sent_at >= WG_REKEY_TIMEOUT {
+            return wg_timer(WG_TIMER_INITIATION, wg_create_initiation(p, now, 0));
+        }
+        return wg_timer(WG_TIMER_NONE, Vec::new());
+    }
+    if p.current.valid {
+        // the initiator of the current keys renews them after REKEY_AFTER_TIME
+        // or REKEY_AFTER_MESSAGES
+        val old: bool = now - p.current.created >= WG_REKEY_AFTER_TIME || p.current.send_counter >= WG_REKEY_AFTER_MESSAGES;
+        if p.current.initiator && old {
+            return wg_timer(WG_TIMER_INITIATION, wg_create_initiation(p, now, 0));
+        }
+        // data sent and nothing heard for KEEPALIVE + REKEY_TIMEOUT: new handshake
+        if p.last_data_sent >= 0 && p.last_data_sent > p.last_received && now - p.last_data_sent >= WG_KEEPALIVE_TIMEOUT + WG_REKEY_TIMEOUT {
+            p.last_data_sent = -1;
+            return wg_timer(WG_TIMER_INITIATION, wg_create_initiation(p, now, 0));
+        }
+        // passive keepalive: received something, sent nothing back for KEEPALIVE_TIMEOUT
+        if p.last_received > p.last_sent && now - p.last_received >= WG_KEEPALIVE_TIMEOUT {
+            return wg_timer(WG_TIMER_KEEPALIVE, wg_encrypt(p, Vec::new(), now));
+        }
+        // persistent keepalive
+        if p.persistent_keepalive > 0 && now - p.last_sent >= p.persistent_keepalive {
+            return wg_timer(WG_TIMER_KEEPALIVE, wg_encrypt(p, Vec::new(), now));
+        }
+    }
+    return wg_timer(WG_TIMER_NONE, Vec::new());
+}

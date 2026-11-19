@@ -31,14 +31,27 @@
 //   - comments (# after whitespace), "---" and "..." document markers,
 //     "%" directives (skipped), a byte order mark
 //   - anchors (&a) and aliases (*a): an alias copies the anchored node
+//   - explicit keys ("? key" then ": value" at the same indentation, the
+//     value null when no ": " line follows, as in a !!set): the key may be
+//     any node, a sequence or mapping too ("? - a\n  - b\n: v"); its path
+//     segment is the key written in flow style: a scalar as its text (the
+//     same segment as "key: v" gives; null as "null"), a sequence
+//     "[a, b]", a mapping "{k: v}", a string inside them double-quoted
+//     when it holds a flow indicator, quote, ':' or '#' or would read as
+//     another type ("? [a, b]\n: 1" gives the entry "[a, b]" = 1)
+//   - merge keys ("<<: *base", "<<: [*a, *b]", yaml_load only;
+//     https://yaml.org/type/merge.html): the keys of the merged mapping(s)
+//     are copied where "<<" stood, a key the mapping already has (or an
+//     earlier merged mapping gave) is kept; the "<<" entry itself goes.
+//     yaml_parse keeps "<<" as an ordinary key
 //   - core-schema typing: null (~ null Null NULL or nothing), bool (true
 //     True TRUE false False FALSE), int (decimal, 0o octal, 0x hex), float
 //     (1.5 1e3 .5 .inf -.inf .nan), anything else str; the tags !!str
 //     !!int !!float !!bool !!null set the kind, other tags are ignored
 // Not supported (yaml_load rejects them; yaml_parse skips the line):
-//   explicit "? " keys and other complex keys, "<<" merge keys (kept as an
-//   ordinary key), a mapping inside a flow sequence ("[a: b]"), tabs used
-//   as indentation. YAML 1.1 forms are read as YAML 1.2 reads them: yes,
+//   a ": value" with no "? " key before it, a mapping inside a flow
+//   sequence ("[a: b]"), "? " keys inside flow collections, tabs used as
+//   indentation. YAML 1.1 forms are read as YAML 1.2 reads them: yes,
 //   no, on, off and 1_000 are strings, 0777 is the decimal 777.
 // Rejected by yaml_load: a duplicate key, bad indentation, a key or "- "
 // where a scalar continues, unterminated quotes or flow collections,
@@ -523,10 +536,21 @@ fn y_spaces(n: i64) -> str {
 fn y_key_colon(s: str) -> i64 {
     var i: i64 = 0;
     var n: i64 = str_len(s);
-    var c0: i64 = y_at(s, 0);
+    // properties (&anchor, !tag) in front of a node: what follows them
+    // says whether it is a key ("- &a {x: 1}" is a flow mapping, not a key)
+    var st: i64 = 0;
+    while y_at(s, st) == 38 || y_at(s, st) == 33 {
+        while st < n && !y_space_at(s, st) {
+            st = st + 1;
+        }
+        while st < n && y_space_at(s, st) {
+            st = st + 1;
+        }
+    }
+    var c0: i64 = y_at(s, st);
     if c0 == 34 || c0 == 39 {
         // a quoted key: the colon must follow its closing quote
-        var j: i64 = 1;
+        var j: i64 = st + 1;
         while j < n {
             var c: i64 = str_byte_at(s, j);
             if c0 == 34 && c == 92 {
@@ -553,7 +577,9 @@ fn y_key_colon(s: str) -> i64 {
     }
     if c0 == 91 || c0 == 123 {
         return - 1;
-    } while i < n {
+    }
+    i = st;
+    while i < n {
         var c2: i64 = str_byte_at(s, i);
         if c2 == 58 {
             if i + 1 >= n || y_space_at(s, i + 1) {
@@ -626,6 +652,15 @@ fn y_is_item(content: str) -> bool {
     return str_equal(content, "-") || str_starts_with(content, "- ") || str_starts_with(content, "-\t");
 }
 
+// An explicit key ("? key") or its value (": value") starts this content.
+fn y_is_qkey(content: str) -> bool {
+    return y_at(content, 0) == 63 && (str_len(content) == 1 || y_space_at(content, 1));
+}
+
+fn y_is_qval(content: str) -> bool {
+    return y_at(content, 0) == 58 && (str_len(content) == 1 || y_space_at(content, 1));
+}
+
 // A node whose lines are indented more than `parent`; li at the line
 // after the one that introduced it.
 fn yp_node(p: & mut YP, path: str, parent: i64) {
@@ -650,12 +685,7 @@ fn yp_node(p: & mut YP, path: str, parent: i64) {
     }
     var nc: str = str_slice(content, 0, y_comment_end(content));
     var c0: i64 = y_at(content, 0);
-    if c0 == 63 && (str_len(content) == 1 || y_space_at(content, 1)) {
-        if yp_fail(p, "explicit '? ' keys are not supported") {
-            return;
-        }
-    }
-    if y_key_colon(nc) > 0 || (c0 == 58 && y_space_at(content, 1)) {
+    if y_is_qkey(content) || y_key_colon(nc) > 0 || (c0 == 58 && y_space_at(content, 1)) {
         yp_map(p, path, ind);
         return;
     }
@@ -682,7 +712,7 @@ fn yp_seq(p: & mut YP, path: str, ind: i64) {
         var content: str = str_slice(line, li_ind, str_len(line));
         if li_ind > ind || !y_is_item(content) {
             if li_ind == ind {
-                if y_key_colon(str_slice(content, 0, y_comment_end(content))) > 0 {
+                if y_key_colon(str_slice(content, 0, y_comment_end(content))) > 0 || y_is_qkey(content) {
                     return;
                 }
             }
@@ -761,15 +791,20 @@ fn yp_map(p: & mut YP, path: str, ind: i64) {
         if li_ind == ind && y_is_item(content) {
             return;
         }
+        if li_ind == ind && y_is_qkey(content) {
+            if !yp_explicit(p, path, ind, start) {
+                return;
+            }
+            continue;
+        }
         var nc: str = str_slice(content, 0, y_comment_end(content));
         var kc: i64 = y_key_colon(nc);
         if li_ind > ind || kc <= 0 {
             var msg: str = "expected a key ('key: value')";
             if li_ind > ind {
                 msg = "bad indentation of a mapping entry";
-            }
-            if str_starts_with(content, "? ") || str_equal(nc, "?") {
-                msg = "explicit '? ' keys are not supported";
+            } else if y_is_qval(content) {
+                msg = "a ': ' value needs a '? ' key on the line before";
             }
             if yp_fail(p, msg) {
                 return;
@@ -806,6 +841,332 @@ fn yp_map(p: & mut YP, path: str, ind: i64) {
         }
         yp_value(p, kpath, rest, li_ind + kc + 1 + lead, ind);
     }
+}
+
+// ─── Explicit keys and merge keys ───────────────────────────────────────
+
+// An explicit key ("? key", the current line, at indentation `ind`) of the
+// block mapping at `path` whose entries start at `start`, then its value
+// (": value" at the same indentation, or null when no such line follows).
+// The key may be any node: it is read like one (under the scratch path
+// "?"), written as its flow text (y_canon) for the path segment, and its
+// entries dropped. False when parsing must stop.
+fn yp_explicit(p: & mut YP, path: str, ind: i64, start: i64) -> bool {
+    var line: str = yp_line(p);
+    var rest: str = str_slice(line, ind + 1, str_len(line));
+    var lead: i64 = 0;
+    while lead < str_len(rest) && (str_byte_at(rest, lead) == 32 || str_byte_at(rest, lead) == 9) {
+        lead = lead + 1;
+    }
+    rest = str_slice(rest, lead, str_len(rest));
+    var mark: i64 = p.entries.len();
+    var amark: i64 = p.anames.len();
+    if y_blank(rest) {
+        p.li = p.li + 1;
+    } else {
+        // the key starts at its own column, as a sequence item's content
+        p.lines.set(p.li, y_spaces(ind + 1 + lead) + rest);
+    }
+    yp_node(p, "?", ind);
+    if !p.ok {
+        return false;
+    }
+    var key: str = "null";
+    if mark < p.entries.len() {
+        var parts: Vec<str> = Vec::new();
+        y_canon(p.entries, mark, true, & mut parts);
+        key = "";
+        var k: i64 = 0;
+        while k < parts.len() {
+            key = key + parts.get(k);
+            k = k + 1;
+        }
+    }
+    while p.entries.len() > mark {
+        p.entries.pop();
+    }
+    // anchors inside the key named entries that are gone
+    while p.anames.len() > amark {
+        p.anames.pop();
+        p.apaths.pop();
+    }
+    var kpath: str = y_join(path, key);
+    if p.strict && yp_has_key(p, kpath, start) {
+        if yp_fail(p, "duplicate key '" + key + "'") {
+            return false;
+        }
+    }
+    yp_skip_blank(p);
+    if p.li < p.lines.len() {
+        var vl: str = yp_line(p);
+        var vi: i64 = y_indent_of(vl);
+        var vc: str = str_slice(vl, vi, str_len(vl));
+        if vi == ind && y_is_qval(vc) {
+            var vr: str = str_slice(vc, 1, str_len(vc));
+            var vlead: i64 = 0;
+            while vlead < str_len(vr) && (str_byte_at(vr, vlead) == 32 || str_byte_at(vr, vlead) == 9) {
+                vlead = vlead + 1;
+            }
+            vr = str_slice(vr, vlead, str_len(vr));
+            if y_blank(vr) {
+                p.li = p.li + 1;
+                yp_skip_blank(p);
+                if p.li < p.lines.len() {
+                    var nl: str = yp_line(p);
+                    var ni: i64 = y_indent_of(nl);
+                    if ni == ind && y_is_item(str_slice(nl, ni, str_len(nl))) {
+                        yp_seq(p, kpath, ind);
+                        return p.ok;
+                    }
+                }
+                yp_node(p, kpath, ind);
+                return p.ok;
+            }
+            p.lines.set(p.li, y_spaces(ind + 1 + vlead) + vr);
+            yp_node(p, kpath, ind);
+            return p.ok;
+        }
+    }
+    yp_push(p, kpath, "null", "");
+    return p.ok;
+}
+
+// The index after the subtree of es[i] (its entries under a longer path).
+fn y_subtree_end(es: Vec<YamlEntry>, i: i64) -> i64 {
+    var sub: str = es.get(i).path + ".";
+    var k: i64 = i + 1;
+    while k < es.len() && str_starts_with(es.get(k).path, sub) {
+        k = k + 1;
+    }
+    return k;
+}
+
+// A string as a key's flow text writes it inside a collection: as it is,
+// or double-quoted when it would read as another type or holds a flow
+// indicator, a quote, a ':' or '#', a line break or edge spaces.
+fn y_canon_str(s: str) -> str {
+    var n: i64 = str_len(s);
+    var quote: bool = n == 0 || !str_equal(y_scalar(s).kind, "str");
+    if n > 0 && (y_space_at(s, 0) || y_space_at(s, n - 1)) {
+        quote = true;
+    }
+    var i: i64 = 0;
+    while i < n && !quote {
+        var c: i64 = str_byte_at(s, i);
+        if y_flow_ind(c) || c == 58 || c == 35 || c == 34 || c == 39 || c == 10 || c == 13 || c == 92 {
+            quote = true;
+        }
+        i = i + 1;
+    }
+    if !quote {
+        return s;
+    }
+    var out: str = "\"";
+    var j: i64 = 0;
+    var run: i64 = 0;
+    while j < n {
+        var c2: i64 = str_byte_at(s, j);
+        if c2 == 34 || c2 == 92 || c2 == 10 {
+            out = out + str_slice(s, run, j);
+            if c2 == 10 {
+                out = out + "\\n";
+            } else {
+                out = out + "\\";
+                out = out + str_slice(s, j, j + 1);
+            }
+            run = j + 1;
+        }
+        j = j + 1;
+    }
+    out = out + str_slice(s, run, n);
+    out = out + "\"";
+    return out;
+}
+
+// The flow text of the node at es[i] into `out` (pieces to join): a
+// sequence as "[a, b]", a mapping as "{k: v, k2: v2}", a scalar as its
+// text (null as "null"; inside a collection a string is quoted when
+// needed, y_canon_str). `top`: the node is the whole key. Returns the
+// index after the node's subtree.
+fn y_canon(es: Vec<YamlEntry>, i: i64, top: bool, out: & mut Vec<str>) -> i64 {
+    var e: YamlEntry = es.get(i);
+    var kind: str = e.value.kind;
+    if str_equal(kind, "list") || str_equal(kind, "map") {
+        var is_map: bool = str_equal(kind, "map");
+        if is_map {
+            out.push("{");
+        } else {
+            out.push("[");
+        }
+        var prefix: str = e.path + ".";
+        var j: i64 = i + 1;
+        var first: bool = true;
+        while j < es.len() && str_starts_with(es.get(j).path, prefix) {
+            if !first {
+                out.push(", ");
+            }
+            first = false;
+            if is_map {
+                var cp: str = es.get(j).path;
+                out.push(y_canon_str(str_slice(cp, str_len(prefix), str_len(cp))));
+                out.push(": ");
+            }
+            j = y_canon(es, j, false, out);
+        }
+        if is_map {
+            out.push("}");
+        } else {
+            out.push("]");
+        }
+        return j;
+    }
+    if str_equal(kind, "null") {
+        out.push("null");
+    } else if top || !str_equal(kind, "str") {
+        out.push(e.value.sval);
+    } else {
+        out.push(y_canon_str(e.value.sval));
+    }
+    return i + 1;
+}
+
+// Merge keys ("<<", https://yaml.org/type/merge.html; yaml_load only): each
+// copies into its mapping the keys of the mapping it holds, or of each
+// mapping of the sequence it holds, in order; a key the mapping already
+// has (written in it, or merged from an earlier one) stays as it is. The
+// merged keys take the "<<" entry's place. Nested merges go first (the
+// longest path), so a merged mapping brings its own merged keys.
+fn yp_merges(p: & mut YP) {
+    while p.ok {
+        var m: i64 = - 1;
+        var ml: i64 = - 1;
+        var i: i64 = 0;
+        while i < p.entries.len() {
+            var ep: str = p.entries.get(i).path;
+            if (str_equal(ep, "<<") || str_ends_with(ep, ".<<")) && str_len(ep) > ml {
+                m = i;
+                ml = str_len(ep);
+            }
+            i = i + 1;
+        }
+        if m < 0 {
+            return;
+        }
+        yp_merge_one(p, m);
+    }
+}
+
+fn y_has_str(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Resolve the merge entry p.entries[m] (see yp_merges); it always goes, so
+// yp_merges ends.
+fn yp_merge_one(p: & mut YP, m: i64) {
+    var mp: str = p.entries.get(m).path;
+    var parent: str = "";
+    if str_len(mp) > 2 {
+        parent = str_slice(mp, 0, str_len(mp) - 3);
+    }
+    var prefix: str = "";
+    if str_len(parent) > 0 {
+        prefix = parent + ".";
+    }
+    var mend: i64 = y_subtree_end(p.entries, m);
+    // the mappings to merge, in order
+    var srcs: Vec<i64> = Vec::new();
+    var kind: str = p.entries.get(m).value.kind;
+    var good: bool = true;
+    if str_equal(kind, "map") {
+        srcs.push(m);
+    } else if str_equal(kind, "list") {
+        var j: i64 = m + 1;
+        while j < mend {
+            if !str_equal(p.entries.get(j).value.kind, "map") {
+                good = false;
+            }
+            srcs.push(j);
+            j = y_subtree_end(p.entries, j);
+        }
+    } else {
+        good = false;
+    }
+    if !good {
+        yp_fail(p, "the value of a merge key '<<' (" + mp + ") must be a mapping or a sequence of mappings");
+        srcs = Vec::new();
+    }
+    // the keys the mapping has besides this merge: its direct children
+    var have: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    if str_len(parent) > 0 {
+        k = m - 1;
+        while k >= 0 && !str_equal(p.entries.get(k).path, parent) {
+            k = k - 1;
+        }
+        k = k + 1;
+    }
+    while k < p.entries.len() {
+        var cp: str = p.entries.get(k).path;
+        if str_len(prefix) > 0 && !str_starts_with(cp, prefix) {
+            break;
+        }
+        if k != m {
+            have.push(str_slice(cp, str_len(prefix), str_len(cp)));
+        }
+        k = y_subtree_end(p.entries, k);
+    }
+    var added: Vec<YamlEntry> = Vec::new();
+    var si: i64 = 0;
+    while si < srcs.len() {
+        var s: i64 = srcs.get(si);
+        var sp: str = p.entries.get(s).path + ".";
+        var send: i64 = y_subtree_end(p.entries, s);
+        var c: i64 = s + 1;
+        while c < send {
+            var cpath: str = p.entries.get(c).path;
+            var cend: i64 = y_subtree_end(p.entries, c);
+            var key: str = str_slice(cpath, str_len(sp), str_len(cpath));
+            if !y_has_str(have, key) {
+                have.push(key);
+                var q: i64 = c;
+                while q < cend {
+                    var e: YamlEntry = p.entries.get(q);
+                    added.push(YamlEntry {
+                        path: prefix + str_slice(e.path, str_len(sp), str_len(e.path)), value: YamlValue {
+                            kind: e.value.kind, sval: e.value.sval
+                        }
+                    });
+                    q = q + 1;
+                }
+            }
+            c = cend;
+        }
+        si = si + 1;
+    }
+    var out: Vec<YamlEntry> = Vec::new();
+    var a: i64 = 0;
+    while a < m {
+        out.push(p.entries.get(a));
+        a = a + 1;
+    }
+    var b: i64 = 0;
+    while b < added.len() {
+        out.push(added.get(b));
+        b = b + 1;
+    }
+    var r: i64 = mend;
+    while r < p.entries.len() {
+        out.push(p.entries.get(r));
+        r = r + 1;
+    }
+    p.entries = out;
 }
 
 // Take an anchor (&a) or tag (!t) in front of `text`: [what, rest].
@@ -859,12 +1220,12 @@ fn yp_alias(p: & mut YP, path: str, name: str) {
 
 // The value `text` (the rest of the current line from column `col`) of a
 // node at `path` whose parent has indentation `parent`.
-fn yp_value(p: & mut YP, path: str, text: str, col: i64, parent: i64) {
+fn yp_value(p: & mut YP, path: str, text: str, _col: i64, parent: i64) {
     var t: str = text;
     var tag: str = "";
     // properties: &anchor and !tag, in either order
-    var guard: i64 = 0;
-    while guard < 2 && (y_at(t, 0) == 38 || y_at(t, 0) == 33) {
+    var hops: i64 = 0;
+    while hops < 2 && (y_at(t, 0) == 38 || y_at(t, 0) == 33) {
         var pr: Vec<str> = Vec::new();
         y_prop(t, & mut pr);
         if y_at(t, 0) == 38 {
@@ -874,7 +1235,7 @@ fn yp_value(p: & mut YP, path: str, text: str, col: i64, parent: i64) {
             tag = pr.get(0);
         }
         t = pr.get(1);
-        guard = guard + 1;
+        hops = hops + 1;
     }
     if y_blank(t) {
         // the node itself is on the next lines
@@ -1512,6 +1873,9 @@ fn y_parse_doc(lines: Vec<str>, base: i64, strict: bool, flow: bool) -> YamlDoc 
             yp_skip_blank(& mut p);
         }
     }
+    if p.strict && p.ok {
+        yp_merges(& mut p);
+    }
     // a root scalar has path "": drop a null one (an empty document)
     if p.entries.len() == 1 && str_equal(p.entries.get(0).path, "") && str_equal(p.entries.get(0).value.kind, "null") {
         p.entries.pop();
@@ -1644,6 +2008,16 @@ fn y_find(doc: Vec<YamlEntry>, path: str) -> i64 {
 }
 
 /// Value at dotted `path`; kind "missing" when absent.
+///
+/// Example:
+///   val doc = yaml_parse("name: app\nserver:\n  port: 8080\n  debug: true\nitems:\n  - a\n  - b\n");
+///   assert_eq(yaml_get_str(doc, "name"), "app");
+///   assert_eq(yaml_get_int(doc, "server.port", 0), 8080);
+///   assert(yaml_get_bool(doc, "server.debug", false));
+///   assert_eq(yaml_list_len(doc, "items"), 2);
+///   assert(yaml_has(doc, "items"));
+///   assert(!yaml_has(doc, "nope"));
+///   assert_eq(yaml_get(doc, "nope").kind, "missing");
 pub fn yaml_get(doc: Vec<YamlEntry>, path: str) -> YamlValue {
     var i: i64 = y_find(doc, path);
     if i < 0 {

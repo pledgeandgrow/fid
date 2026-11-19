@@ -1,0 +1,138 @@
+// VF5, two module passes of compiler/iropt.fd: ipcp (a parameter every call
+// site passes the same constant for becomes that constant in the callee)
+// and gconst (a global with a constant initializer that is only ever loaded
+// has its loads folded to the initializer). Each case prints a value a
+// wrong pass changes:
+//   ipcp   `mix` gets 3 at one call site and 5 at another (both constants:
+//          the parameter varies and must stay a parameter); `tail` gets 7
+//          at every site (folding it is right) beside an argument that
+//          varies; `weigh` is also called through a function value, so its
+//          signature must stay
+//   gconst `limit` starts at 5 but one function stores 9 into it before
+//          another reads it (its loads must not be folded to 5); `base` is
+//          only read (folding it is right); `bump` writes `counter` through
+//          a loop (each read sees the last store)
+// The callees loop, so the inliner (16 instructions) leaves them as calls
+// and the module passes see the call sites. scripts/verify/variants.py has
+// a mutant for each pass (ipcp-first-constant-wins, gconst-stored-folded):
+// under either, this test's output changes. ipcp is opt-in, so the file
+// turns it on (expect.py and variants.py read the line below). gconst
+// folded nothing before miscompile M26 (finding O1) is fixed.
+//
+//@ env: FID_IROPT_ON=ipcp
+//
+// Expected output:
+// 3 5
+// 45 75
+// 77 84 91
+// 9
+// 100 105
+// 3
+// 12
+// 30
+
+var limit: i64 = 5;
+var base: i64 = 100;
+var counter: i64 = 0;
+
+fn mix(k: i64, x: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < x {
+        s = s + k;
+        i = i + 1;
+    }
+    if s > 1000000 {
+        println("unreachable");
+    }
+    return s;
+}
+
+fn tail(k: i64, x: i64) -> i64 {
+    var s: i64 = x * 7;
+    var i: i64 = 0;
+    while i < 3 {
+        s = s + k - k;
+        i = i + 1;
+    }
+    if s < 0 - 1000000 {
+        println("unreachable");
+    }
+    return s + k * 0;
+}
+
+fn weigh(k: i64, x: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < k {
+        s = s + x;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn call_through(f: fn(i64, i64) -> i64, x: i64) -> i64 {
+    return f(1, x);
+}
+
+fn set_limit(v: i64) {
+    var i: i64 = 0;
+    while i < 2 {
+        limit = v;
+        i = i + 1;
+    }
+}
+
+fn read_limit() -> i64 {
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        r = limit;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn read_base(d: i64) -> i64 {
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < 2 {
+        r = base + d;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn bump(n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        counter = counter + 1;
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    // ipcp: two different constants for k
+    println(int_to_str(mix(3, 1)) + " " + int_to_str(mix(5, 1)));
+    println(int_to_str(mix(3, 15)) + " " + int_to_str(mix(5, 15)));
+    // ipcp: k is 7 everywhere, x varies
+    var xs: Vec<i64> = Vec::new();
+    xs.push(11);
+    xs.push(12);
+    xs.push(13);
+    println(int_to_str(tail(7, xs.get(0))) + " " + int_to_str(tail(7, xs.get(1))) + " " + int_to_str(tail(7, xs.get(2))));
+    // gconst: limit is stored to before it is read
+    set_limit(9);
+    println(read_limit());
+    // gconst: base is only read
+    println(int_to_str(read_base(0)) + " " + int_to_str(read_base(5)));
+    // gconst: counter is written in a loop
+    bump(3);
+    println(counter);
+    bump(9);
+    println(counter);
+    // ipcp: weigh is called directly with 3 and through a function value
+    // with 1: k must stay a parameter
+    println(weigh(3, 9) + call_through(weigh, 3));
+    return 0;
+}

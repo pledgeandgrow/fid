@@ -1,0 +1,236 @@
+// HashMap control bytes (competitive roadmap RT4, stdlib/core.fd "Control
+// bytes"): a map probes groups of 8 slots through one control word each
+// (SWAR), and a removed slot whose group has an empty lane becomes empty
+// again. Each part runs a pseudo-random mix of inserts, removes and lookups
+// against a plain Vec model and panics at the first difference; a churn of
+// short-lived keys (the case removed-slot markers used to fill) and a copy
+// of a shared map (map_own copies the control bytes) are checked the same
+// way. The output is the same on every backend.
+//
+// Expected output:
+// int keys ok
+// string keys ok
+// churn ok
+// shared copy ok
+// clear ok
+// hashmap ctrl ok
+
+fn fail(what: str) {
+    println("hashmap ctrl: " + what);
+    p_panic("hashmap ctrl: " + what);
+}
+
+fn next_rand(seed: i64) -> i64 {
+    return (seed * 1103515245 + 12345) % 2147483648;
+}
+
+/// Integer keys 0..511 against a Vec model (-1: absent).
+fn int_keys() {
+    var m: HashMap<i64, i64> = HashMap::new();
+    var model: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 512 {
+        model.push(- 1);
+        i = i + 1;
+    }
+    var live: i64 = 0;
+    var seed: i64 = 7;
+    var step: i64 = 0;
+    while step < 20000 {
+        seed = next_rand(seed);
+        val k: i64 = (seed / 16) % 512;
+        val op: i64 = (seed / 8192) % 4;
+        if op == 0 || op == 1 {
+            val v: i64 = step;
+            if model.get(k) < 0 {
+                live = live + 1;
+            }
+            m.insert(k, v);
+            model.set(k, v);
+        } else if op == 2 {
+            if model.get(k) >= 0 {
+                live = live - 1;
+            }
+            m.remove(k);
+            model.set(k, - 1);
+        } else {
+            if m.contains(k) != (model.get(k) >= 0) {
+                fail("contains " + int_to_str(k));
+            }
+            if model.get(k) >= 0 && m.get(k) != model.get(k) {
+                fail("get " + int_to_str(k));
+            }
+        }
+        if m.len() != live {
+            fail("len at step " + int_to_str(step));
+        }
+        step = step + 1;
+    }
+    i = 0;
+    while i < 512 {
+        if m.contains(i) != (model.get(i) >= 0) {
+            fail("final contains " + int_to_str(i));
+        }
+        if m.get_or(i, - 1) != model.get(i) {
+            fail("final get " + int_to_str(i));
+        }
+        i = i + 1;
+    }
+    // keys outside the range were never inserted
+    if m.contains(512) || m.contains(- 5) || m.get_or(100000, 3) != 3 {
+        fail("absent int key found");
+    }
+    println("int keys ok");
+}
+
+/// String keys "k0".."k299" against a Vec model.
+fn string_keys() {
+    var m: HashMap<str, i64> = HashMap::new();
+    var model: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 {
+        model.push(- 1);
+        i = i + 1;
+    }
+    var live: i64 = 0;
+    var seed: i64 = 12345;
+    var step: i64 = 0;
+    while step < 8000 {
+        seed = next_rand(seed);
+        val k: i64 = (seed / 16) % 300;
+        val op: i64 = (seed / 8192) % 4;
+        val key: str = "k" + int_to_str(k);
+        if op == 0 || op == 1 {
+            if model.get(k) < 0 {
+                live = live + 1;
+            }
+            m.insert(key, step);
+            model.set(k, step);
+        } else if op == 2 {
+            if model.get(k) >= 0 {
+                live = live - 1;
+            }
+            m.remove(key);
+            model.set(k, - 1);
+        } else {
+            if m.contains(key) != (model.get(k) >= 0) {
+                fail("contains " + key);
+            }
+            if model.get(k) >= 0 && m.get(key) != model.get(k) {
+                fail("get " + key);
+            }
+        }
+        if m.len() != live {
+            fail("string len at step " + int_to_str(step));
+        }
+        step = step + 1;
+    }
+    i = 0;
+    while i < 300 {
+        val key2: str = "k" + int_to_str(i);
+        if m.contains(key2) != (model.get(i) >= 0) {
+            fail("final contains " + key2);
+        }
+        i = i + 1;
+    }
+    if m.contains("k300") || m.contains("") || m.contains("k") {
+        fail("absent string key found");
+    }
+    println("string keys ok");
+}
+
+/// Keys that live for a few steps only: 20,000 inserts and removes over
+/// a map that never holds more than 4 keys.
+fn churn() {
+    var m: HashMap<i64, i64> = HashMap::new();
+    var k: i64 = 0;
+    while k < 20000 {
+        m.insert(k, k * 3);
+        if k >= 4 {
+            m.remove(k - 4);
+        }
+        if m.len() > 4 {
+            fail("churn len");
+        }
+        if m.get(k) != k * 3 {
+            fail("churn get");
+        }
+        if k >= 4 && m.contains(k - 4) {
+            fail("churn removed key found");
+        }
+        k = k + 1;
+    }
+    if m.len() != 4 || m.get(19996) != 59988 || m.get(19999) != 59997 {
+        fail("churn end");
+    }
+    println("churn ok");
+}
+
+/// A second owner of a map changes its own copy only.
+fn shared_copy() {
+    var a: HashMap<i64, i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < 100 {
+        a.insert(i, i + 1000);
+        i = i + 1;
+    }
+    var b: HashMap<i64, i64> = a;
+    i = 0;
+    while i < 100 {
+        if i % 2 == 0 {
+            b.remove(i);
+        }
+        i = i + 1;
+    }
+    b.insert(500, 7);
+    if a.len() != 100 || b.len() != 51 {
+        fail("shared lengths");
+    }
+    i = 0;
+    while i < 100 {
+        if a.get(i) != i + 1000 {
+            fail("first owner changed");
+        }
+        if b.contains(i) != (i % 2 == 1) {
+            fail("copy contains");
+        }
+        i = i + 1;
+    }
+    if a.contains(500) || b.get(500) != 7 {
+        fail("shared insert");
+    }
+    println("shared copy ok");
+}
+
+/// A cleared map is empty and takes keys again.
+fn cleared() {
+    var m: HashMap<str, i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < 50 {
+        m.insert("c" + int_to_str(i), i);
+        i = i + 1;
+    }
+    m.clear();
+    if m.len() != 0 || m.contains("c3") {
+        fail("clear left keys");
+    }
+    i = 0;
+    while i < 50 {
+        m.insert("c" + int_to_str(i), i * 2);
+        i = i + 1;
+    }
+    if m.len() != 50 || m.get("c49") != 98 || m.get("c0") != 0 {
+        fail("insert after clear");
+    }
+    println("clear ok");
+}
+
+fn main() -> i64 {
+    int_keys();
+    string_keys();
+    churn();
+    shared_copy();
+    cleared();
+    println("hashmap ctrl ok");
+    return 0;
+}

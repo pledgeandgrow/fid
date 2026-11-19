@@ -1,0 +1,104 @@
+// ME25 (compiler/checks.fd peir_counted_loop): a counted loop may step by
+// any constant from 1 to 2^20, not only 1. In `while i < v.len() { ..
+// v.get(i) .. i = i + c }` every index read before the step is in [0,
+// v.len()), so the bounds checks go (`fid explain` on this file lists
+// get/set calls of stride2, stride3 and fill_every as removed), and so does
+// the step's overflow check, since i < v.len(). With loop versioning on
+// (FID_IROPT_ON=version) `sum_upto`'s loop, whose bound n is not v.len(),
+// gets a copy entered when 0 < n <= v.len(): its checks are proved the
+// same way. The results must not change; shrink_then_read's Vec is
+// shortened before the loop, whose test reads its length after that.
+//
+// Expected output:
+// 30
+// 18
+// 0 9 2 9 4 9 6 9 8 9 10
+// 30
+// 20
+// 0
+// 135
+// 84
+
+fn stride2(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        t = t + v.get(i);
+        i = i + 2;
+    }
+    return t;
+}
+
+fn stride3(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        t = t + v.get(i);
+        i = i + 3;
+    }
+    return t;
+}
+
+fn fill_every(v: & mut Vec<i64>, from: i64) {
+    var i: i64 = 1;
+    while i < v.len() {
+        v.set(i, from);
+        i = i + 2;
+    }
+}
+
+fn sum_upto(v: & Vec<i64>, n: i64) -> i64 {
+    // n is not v.len(): versioning's guard bounds it
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        t = t + v.get(i);
+        i = i + 2;
+    }
+    return t;
+}
+
+fn shrink_then_read(v: & mut Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    v.pop();
+    v.pop();
+    while i < v.len() {
+        t = t + v.get(i);
+        i = i + 4;
+    }
+    return t;
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 11 {
+        v.push(k);
+        k = k + 1;
+    }
+    println(stride2(& v));
+    println(stride3(& v));
+    fill_every(& mut v, 9);
+    var line: str = "";
+    k = 0;
+    while k < v.len() {
+        if k > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(v.get(k));
+        k = k + 1;
+    }
+    println(line);
+    println(sum_upto(& v, 11));
+    println(sum_upto(& v, 9));
+    println(sum_upto(& v, 0));
+    var w: Vec<i64> = Vec::new();
+    k = 0;
+    while k < 30 {
+        w.push(k);
+        k = k + 1;
+    }
+    println(stride3(& w));
+    println(shrink_then_read(& mut w));
+}

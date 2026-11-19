@@ -6,12 +6,27 @@
 // `host`. Reading and writing wait as tasks do: other tasks run meanwhile.
 //
 // A server key comes from PEM files: tls_server(cert_path, key_path).
+// tls_client13, tls_connect13 and tls_server13 refuse anything below TLS
+// 1.3; tls_session_version gives the version on both platforms
+// (tls_session_protocol, Schannel's own number, is Windows-only).
+//
+// ALPN (RFC 7301): tls_connect_alpn(host, port, "h2,http/1.1") offers
+// protocols (SSL_set_alpn_protos), tls_server_alpn(server, "h2,http/1.1")
+// makes a server pick one, its first the client offers (a select callback,
+// SSL_CTX_set_alpn_select_cb), tls_session_alpn(s) gives the choice
+// (SSL_get0_alpn_selected). OpenSSL 1.0.2 or later.
 
 module tls;
+ use tls_alpn;
+ // SAFETY: each declaration matches the OpenSSL libssl prototype it names
+ // (objects as i64 words, ints as i32 results, `str` where C takes const char
+ // *); every object passed is one libssl made here, and buffers come with
+ // their own length.
  extern "C" link "ssl" {
     fn TLS_client_method as ssl_client_method() -> i64;
     fn TLS_server_method as ssl_server_method() -> i64;
     fn SSL_CTX_new as ssl_ctx_new(method: i64) -> i64;
+    fn SSL_CTX_free as ssl_ctx_free(ctx: i64);
     fn SSL_CTX_set_default_verify_paths as ssl_ctx_default_paths(ctx: i64) -> i32;
     fn SSL_CTX_set_verify as ssl_ctx_set_verify(ctx: i64, mode: i64, callback: i64);
     fn SSL_CTX_use_certificate_chain_file as ssl_ctx_cert(ctx: i64, path: str) -> i32;
@@ -27,6 +42,22 @@ module tls;
     fn SSL_write as ssl_write(ssl: i64, buf: i64, n: i64) -> i32;
     fn SSL_shutdown as ssl_shutdown(ssl: i64) -> i32;
     fn SSL_get_error as ssl_get_error(ssl: i64, rc: i64) -> i32;
+    fn SSL_CTX_ctrl as ssl_ctx_ctrl(ctx: i64, cmd: i64, larg: i64, parg: i64) -> i64;
+    fn SSL_version as ssl_version(ssl: i64) -> i32;
+    // ALPN: the client's list (copied by OpenSSL; 0 on success), the
+    // server's select callback with its argument, and the choice (a pointer
+    // into OpenSSL's memory and an unsigned int length, written through
+    // the two pointers)
+    fn SSL_set_alpn_protos as ssl_set_alpn_protos(ssl: i64, protos: i64, n: i64) -> i32;
+    fn SSL_CTX_set_alpn_select_cb as ssl_ctx_set_alpn_select_cb(ctx: i64, cb: fn(i64, i64, i64, i64, u32, i64) -> i32, arg: i64);
+    fn SSL_get0_alpn_selected as ssl_get0_alpn_selected(ssl: i64, data: i64, len: i64);
+}
+
+// SSL_CTX_set_min_proto_version is the macro SSL_CTX_ctrl(ctx,
+// SSL_CTRL_SET_MIN_PROTO_VERSION = 123, version, NULL); TLS1_3_VERSION is
+// 0x0304. True when the context took it.
+fn ts_min_tls13(ctx: i64) -> bool {
+    return ssl_ctx_ctrl(ctx, 123, 772, 0) == 1;
 }
 
 const TS_WANT_READ: i64 = 2; const TS_WANT_WRITE: i64 = 3; const TS_ZERO_RETURN: i64 = 6; const TS_TIMEOUT: i64 = 30000;
@@ -35,6 +66,10 @@ const TS_SSL: i64 = 0; const TS_FD: i64 = 1;
  fn ts_get(p: i64) -> i64 {
     var a: * mut i64 = p;
     var v: i64 = 0;
+    // SAFETY: private helper; callers pass a word of a 2-word session block
+    // ts_session allocated. The public tls_session_* functions take the
+    // session handle as an i64: one not made by tls_connect/tls_accept is not
+    // caught (release M10, left).
     unsafe {
         v = * a;
     }
@@ -43,6 +78,8 @@ const TS_SSL: i64 = 0; const TS_FD: i64 = 1;
 
 fn ts_set(p: i64, v: i64) {
     var a: * mut i64 = p;
+    // SAFETY: private helper; as ts_get, a word of a session block this
+    // module allocated.
     unsafe {
         * a = v;
     }
@@ -53,6 +90,145 @@ fn ts_session(ssl: i64, fd: i64) -> i64 {
     ts_set(s, ssl);
     ts_set(s + 8, fd);
     return s;
+}
+
+// Bytes (0..255 each) in a block of their own, for C.
+fn ts_bytes_block(b: Vec<i64>) -> i64 {
+    val block: i64 = p_malloc(b.len() + 8);
+    var i: i64 = 0;
+    while i < b.len() {
+        p_volatile_store8(block + i, b.get(i));
+        i = i + 1;
+    }
+    return block;
+}
+
+// `n` bytes at `addr` (OpenSSL's memory) as a Vec.
+fn ts_read_bytes(addr: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(p_volatile_load8(addr + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// OpenSSL's ALPN select callback (SSL_CTX_set_alpn_select_cb), called in
+// SSL_accept on the accepting task: `inp`/`inlen` is the client's list in
+// wire format, `arg` the server's list as a block [length word][bytes]
+// (tls_server_alpn). The server's first name the client offers is chosen:
+// *out points at it inside the server's block (which lives as long as the
+// server) and *outlen (one byte) is its length; SSL_TLSEXT_ERR_OK (0).
+// Nothing in common: SSL_TLSEXT_ERR_NOACK (3), the handshake goes on
+// without ALPN.
+fn ts_alpn_select(ssl: i64, out: i64, outlen: i64, inp: i64, inlen: u32, arg: i64) -> i32 {
+    if arg == 0 {
+        // the server was closed (tls_server_close)
+        return 3;
+    }
+    val client: Vec<i64> = ts_read_bytes(inp, inlen as i64);
+    val server: Vec<i64> = ts_read_bytes(arg + 8, ts_get(arg));
+    val at: i64 = tls_alpn_choose(server, client);
+    if at < 0 {
+        return 3;
+    }
+    ts_set(out, arg + 8 + at + 1);
+    p_volatile_store8(outlen, server.get(at));
+    return 0;
+}
+
+/// Make the server `server` (tls_server, tls_server13) answer ALPN: of the
+/// protocols a client offers, it picks its first in `protos`
+/// (comma-separated, "h2,http/1.1"); a client offering none of them, or no
+/// ALPN, gets none. Call it once, before accepting. False when `protos`
+/// holds no name.
+pub fn tls_server_alpn(server: i64, protos: str) -> bool {
+    if server == 0 {
+        return false;
+    }
+    val wire: Vec<i64> = tls_alpn_wire(protos);
+    if wire.len() == 0 {
+        return false;
+    }
+    // [length word][bytes]; it lives as long as the server
+    val block: i64 = p_malloc(wire.len() + 16);
+    ts_set(block, wire.len());
+    var i: i64 = 0;
+    while i < wire.len() {
+        p_volatile_store8(block + 8 + i, wire.get(i));
+        i = i + 1;
+    }
+    ssl_ctx_set_alpn_select_cb(server, ts_alpn_select, block);
+    // tls_server_close frees it (a second call replaces the first block)
+    ts_note_alpn_block(server, block);
+    return true;
+}
+
+// The ALPN blocks of servers, as pairs (server context, block).
+var ts_alpn_blocks: Vec<i64> = Vec::new();
+
+fn ts_note_alpn_block(server: i64, block: i64) {
+    ts_drop_alpn_block(server);
+    ts_alpn_blocks.push(server);
+    ts_alpn_blocks.push(block);
+}
+
+// Free the ALPN block of `server`, if it has one.
+fn ts_drop_alpn_block(server: i64) {
+    var i: i64 = 0;
+    while i + 1 < ts_alpn_blocks.len() {
+        if ts_alpn_blocks.get(i) == server {
+            p_free(ts_alpn_blocks.get(i + 1));
+            // the last pair takes this one's place
+            val last: i64 = ts_alpn_blocks.len() - 2;
+            ts_alpn_blocks.set(i, ts_alpn_blocks.get(last));
+            ts_alpn_blocks.set(i + 1, ts_alpn_blocks.get(last + 1));
+            ts_alpn_blocks.pop();
+            ts_alpn_blocks.pop();
+            return;
+        }
+        i = i + 2;
+    }
+}
+
+/// Free the server `server` (tls_server, tls_server13) once no session is
+/// being accepted with it: its SSL_CTX (OpenSSL keeps it while sessions
+/// made from it are open) and its ALPN list. Returns 0.
+pub fn tls_server_close(server: i64) -> i64 {
+    if server == 0 {
+        return 0;
+    }
+    // no select callback may run after its block is freed
+    ssl_ctx_set_alpn_select_cb(server, ts_alpn_select, 0);
+    ts_drop_alpn_block(server);
+    ssl_ctx_free(server);
+    return 0;
+}
+
+/// The TLS library under `use tls`: "openssl" here, "schannel" on Windows.
+pub fn tls_library() -> str {
+    return "openssl";
+}
+
+/// The protocol ALPN chose for the session ("h2", "http/1.1"), "" when
+/// none was negotiated.
+pub fn tls_session_alpn(s: i64) -> str {
+    if s == 0 {
+        return "";
+    }
+    // const unsigned char *data; unsigned int len
+    val slots: i64 = p_malloc(16);
+    ts_set(slots, 0);
+    ts_set(slots + 8, 0);
+    ssl_get0_alpn_selected(ts_get(s), slots, slots + 8);
+    val data: i64 = ts_get(slots);
+    val n: i64 = ts_get(slots + 8) & 4294967295;
+    p_free(slots);
+    if data == 0 || n == 0 {
+        return "";
+    }
+    return str_from_bytes(ts_read_bytes(data, n));
 }
 
 /// After a call returned `rc`: wait if it only needs the socket to be ready.
@@ -80,6 +256,21 @@ var ts_client_ctx: i64 = 0;
 }
 
 fn ts_handshake(ctx: i64, fd: i64, host: str, server: bool) -> i64 {
+    return ts_handshake_alpn(ctx, fd, host, server, "");
+}
+
+var ts_sigpipe_noted: bool = false;
+
+// The handshake; a client offers the ALPN names `protos` ("": no ALPN).
+fn ts_handshake_alpn(ctx: i64, fd: i64, host: str, server: bool, protos: str) -> i64 {
+    if !ts_sigpipe_noted {
+        // OpenSSL writes with write(): on Linux a peer that has gone away
+        // raises SIGPIPE, which ends the process (the runtime's own socket
+        // writes hold it back, SSL_write does not). Noted instead
+        // (SIGPIPE = 13 on Linux and macOS), SSL_write fails with EPIPE.
+        p_signal_register(13);
+        ts_sigpipe_noted = true;
+    }
     val ssl: i64 = ssl_new(ctx);
     if ssl == 0 {
         return 0;
@@ -89,6 +280,13 @@ fn ts_handshake(ctx: i64, fd: i64, host: str, server: bool) -> i64 {
         // SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name
         ssl_ctrl(ssl, 55, 0, host);
         ssl_set_host(ssl, host);
+        val wire: Vec<i64> = tls_alpn_wire(protos);
+        if wire.len() > 0 {
+            val block: i64 = ts_bytes_block(wire);
+            // OpenSSL keeps its own copy
+            ssl_set_alpn_protos(ssl, block, wire.len());
+            p_free(block);
+        }
     }
     val s: i64 = ts_session(ssl, fd);
     while true {
@@ -150,10 +348,154 @@ pub fn tls_connect_unchecked(host: str, port: i64) -> i64 {
     return s;
 }
 
+/// As tls_client, offering the ALPN protocols `protos` (comma-separated,
+/// most wanted first: "h2,http/1.1"). tls_session_alpn tells what the
+/// server chose ("" when it chose none). Returns 0 on failure.
+pub fn tls_client_alpn(fd: i64, host: str, protos: str) -> i64 {
+    if ts_client_ctx == 0 {
+        // SSL_VERIFY_PEER
+        ts_client_ctx = ts_client_context(1);
+    }
+    if ts_client_ctx == 0 {
+        return 0;
+    }
+    return ts_handshake_alpn(ts_client_ctx, fd, host, false, protos);
+}
+
+/// As tls_connect, offering the ALPN protocols `protos`. Returns 0 on
+/// failure.
+pub fn tls_connect_alpn(host: str, port: i64, protos: str) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    val s: i64 = tls_client_alpn(fd, host, protos);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+var ts_unchecked_ctx: i64 = 0;
+
+/// As tls_connect_alpn, but accept any certificate: for checking a local
+/// server with a self-signed certificate only.
+pub fn tls_connect_alpn_unchecked(host: str, port: i64, protos: str) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    if ts_unchecked_ctx == 0 {
+        ts_unchecked_ctx = ts_client_context(0);
+    }
+    var s: i64 = 0;
+    if ts_unchecked_ctx != 0 {
+        s = ts_handshake_alpn(ts_unchecked_ctx, fd, host, false, protos);
+    }
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+var ts_client13_ctx: i64 = 0;
+
+/// A TLS 1.3-only session over the connected socket `fd`, checking `host`'s
+/// certificate (OpenSSL 1.1.1 or later). Returns 0 on failure.
+pub fn tls_client13(fd: i64, host: str) -> i64 {
+    if ts_client13_ctx == 0 {
+        // SSL_VERIFY_PEER, then no version below 1.3
+        val ctx: i64 = ts_client_context(1);
+        if ctx != 0 && ts_min_tls13(ctx) {
+            ts_client13_ctx = ctx;
+        }
+    }
+    if ts_client13_ctx == 0 {
+        return 0;
+    }
+    return ts_handshake(ts_client13_ctx, fd, host, false);
+}
+
+/// As tls_connect, but pinned to TLS 1.3. Returns 0 when the library or
+/// the peer lacks TLS 1.3.
+pub fn tls_connect13(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    val s: i64 = tls_client13(fd, host);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+var ts_unchecked13_ctx: i64 = 0;
+
+/// As tls_connect13, but accept any certificate: for checking a local
+/// TLS 1.3 server (tls_server13) with a self-signed certificate only.
+pub fn tls_connect13_unchecked(host: str, port: i64) -> i64 {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        return 0;
+    }
+    if ts_unchecked13_ctx == 0 {
+        // one context for every such session (it was a new one per call,
+        // never freed)
+        val made: i64 = ts_client_context(0);
+        if made != 0 && ts_min_tls13(made) {
+            ts_unchecked13_ctx = made;
+        } else if made != 0 {
+            ssl_ctx_free(made);
+        }
+    }
+    val ctx: i64 = ts_unchecked13_ctx;
+    if ctx == 0 {
+        p_socket_close(fd);
+        return 0;
+    }
+    val s: i64 = ts_handshake(ctx, fd, host, false);
+    if s == 0 {
+        p_socket_close(fd);
+    }
+    return s;
+}
+
+/// As tls_server, but every session it accepts is TLS 1.3. Returns 0 on
+/// failure.
+pub fn tls_server13(cert_path: str, key_path: str) -> i64 {
+    val ctx: i64 = tls_server(cert_path, key_path);
+    if ctx == 0 {
+        return 0;
+    }
+    if !ts_min_tls13(ctx) {
+        ssl_ctx_free(ctx);
+        return 0;
+    }
+    return ctx;
+}
+
+/// The negotiated TLS version as its wire number, the same on every
+/// platform: 772 (0x0304) for TLS 1.3, 771 for 1.2; -1 when unknown.
+pub fn tls_session_version(s: i64) -> i64 {
+    if s == 0 {
+        return - 1;
+    }
+    val v: i64 = ssl_version(ts_get(s));
+    if v <= 0 {
+        return - 1;
+    }
+    return v;
+}
+
 /// Server credentials from PEM files. Returns 0 on failure.
 pub fn tls_server(cert_path: str, key_path: str) -> i64 {
     val ctx: i64 = ssl_ctx_new(ssl_server_method());
-    if ctx == 0 || ssl_ctx_cert(ctx, cert_path) != 1 || ssl_ctx_key(ctx, key_path, 1) != 1 {
+    if ctx == 0 {
+        return 0;
+    }
+    if ssl_ctx_cert(ctx, cert_path) != 1 || ssl_ctx_key(ctx, key_path, 1) != 1 {
+        ssl_ctx_free(ctx);
         return 0;
     }
     return ctx;

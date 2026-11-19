@@ -1,0 +1,134 @@
+// stdlib/ros2_msg: XCDR1 little-endian bytes of std_msgs/String, Header, Twist and PoseStamped (alignment padding after a string), lengths of Imu/LaserScan/PointCloud2/Odometry/TransformStamped (checked with a Python struct encoder), round trips, float32 fields, a big-endian header, truncation detection
+// Expected output:
+// string: 00 01 00 00 06 00 00 00 68 65 6c 6c 6f 00
+// header: 00 01 00 00 01 00 00 00 02 00 00 00 04 00 00 00 6d 61 70 00
+// twist: len=52 00 01 00 00 00 00 00 00 00 00 e0 3f
+// pose stamped: len=84 bytes 16..35: 62 61 73 65 5f 6c 69 6e 6b 00 00 00 00 00 00 00 00 00 f0 3f
+// pose stamped back: ok=true frame=base_link t=100.500000000 p=(1.0, 2.0, 3.0) qz=0.7071
+// transform stamped: len=100 ok=true child=base_link tx=1.5 ty=-2.0 qw=1.0
+// imu: len=324 ok=true frame=imu_link acc z=9.81 cov[4]=0.01 gyro x=-0.5
+// scan: len=72 tail: 03 00 00 00 00 00 80 3f 00 00 20 40 cd cc cc 3d 00 00 00 00
+// scan back: ok=true n=3 r[2]=0.100000001 inc=0.100000001 max=30.0 intensities=0
+// cloud: len=145 ok=true width=3 fields=x,y,z step=12 dense=true p1=(-1.0, 0.5, 0.0) p2=(4.0, 4.0, 4.0)
+// odometry: len=724 ok=true child=base_link x=12.5 cov[35]=0.2 vx=0.3 twist cov[0]=0.05
+// big-endian header: ok=true sec=1 nanosec=2 frame=map
+// truncated twist: ok=false
+use math;
+use quat;
+use ros2_msg;
+
+fn slice(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn b2(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn v3(a: f64, b: f64, c: f64) -> str {
+    return "(" + rmath_fmt(a, 1) + ", " + rmath_fmt(b, 1) + ", " + rmath_fmt(c, 1) + ")";
+}
+
+fn main() -> i64 {
+    val s: Vec<i64> = ros_serialize_string("hello");
+    println("string: " + cdr_hex(&s));
+    val hd: RosHeader = ros_header(1, 2, "map");
+    val hb: Vec<i64> = ros_serialize_header(&hd);
+    println("header: " + cdr_hex(&hb));
+    val twm: RosTwist = ros_twist(ros_vec3(0.5, 0.0, 0.0), ros_vec3(0.0, 0.0, 0.2));
+    val tw: Vec<i64> = ros_serialize_twist(&twm);
+    println("twist: len=" + int_to_str(tw.len()) + " " + cdr_hex(&slice(&tw, 0, 12)));
+
+    val ps: RosPoseStamped = RosPoseStamped { header: ros_header(100, 500000000, "base_link"), pose: ros_pose(ros_vec3(1.0, 2.0, 3.0), ros_quat(0.0, 0.0, 0.7071067811865476, 0.7071067811865476)) };
+    val pb: Vec<i64> = ros_serialize_pose_stamped(&ps);
+    println("pose stamped: len=" + int_to_str(pb.len()) + " bytes 16..35: " + cdr_hex(&slice(&pb, 16, 36)));
+    var r1: CdrReader = cdr_reader(pb);
+    val pr: RosPoseStamped = ros_read_pose_stamped(&mut r1);
+    val t: f64 = (pr.header.stamp.sec as f64) + (pr.header.stamp.nanosec as f64) / 1000000000.0;
+    println("pose stamped back: ok=" + b2(r1.ok) + " frame=" + pr.header.frame_id + " t=" + rmath_fmt(t, 9) + " p=" + v3(pr.pose.position.x, pr.pose.position.y, pr.pose.position.z) + " qz=" + rmath_fmt(pr.pose.orientation.z, 4));
+
+    val tfs: RosTransformStamped = RosTransformStamped { header: ros_header(1, 2, "odom"), child_frame_id: "base_link", transform: RosTransform { translation: ros_vec3(1.5, -2.0, 0.0), rotation: ros_quat(0.0, 0.0, 0.0, 1.0) } };
+    val tb: Vec<i64> = ros_serialize_transform_stamped(&tfs);
+    val tlen: i64 = tb.len();
+    var r2: CdrReader = cdr_reader(tb);
+    val tr: RosTransformStamped = ros_read_transform_stamped(&mut r2);
+    println("transform stamped: len=" + int_to_str(tlen) + " ok=" + b2(r2.ok) + " child=" + tr.child_frame_id + " tx=" + rmath_fmt(tr.transform.translation.x, 1) + " ty=" + rmath_fmt(tr.transform.translation.y, 1) + " qw=" + rmath_fmt(tr.transform.rotation.w, 1));
+
+    var cov: Vec<f64> = ros_zeros(9);
+    cov.set(0, 0.01);
+    cov.set(4, 0.01);
+    cov.set(8, 0.01);
+    val imu: RosImu = RosImu { header: ros_header(5, 6, "imu_link"), orientation: ros_quat(0.0, 0.0, 0.0, 1.0), orientation_covariance: ros_zeros(9), angular_velocity: ros_vec3(-0.5, 0.0, 0.0), angular_velocity_covariance: cov, linear_acceleration: ros_vec3(0.0, 0.0, 9.81), linear_acceleration_covariance: ros_zeros(9) };
+    val ib: Vec<i64> = ros_serialize_imu(&imu);
+    val ilen: i64 = ib.len();
+    var r3: CdrReader = cdr_reader(ib);
+    val ir: RosImu = ros_read_imu(&mut r3);
+    println("imu: len=" + int_to_str(ilen) + " ok=" + b2(r3.ok) + " frame=" + ir.header.frame_id + " acc z=" + rmath_fmt(ir.linear_acceleration.z, 2) + " cov[4]=" + rmath_fmt(ir.angular_velocity_covariance.get(4), 2) + " gyro x=" + rmath_fmt(ir.angular_velocity.x, 1));
+
+    var ranges: Vec<f64> = Vec::new();
+    ranges.push(1.0);
+    ranges.push(2.5);
+    ranges.push(0.1);
+    val scan: RosLaserScan = RosLaserScan { header: ros_header(7, 8, "laser"), angle_min: -1.5, angle_max: 1.5, angle_increment: 0.1, time_increment: 0.0, scan_time: 0.1, range_min: 0.05, range_max: 30.0, ranges: ranges, intensities: Vec::new() };
+    val sb: Vec<i64> = ros_serialize_laser_scan(&scan);
+    println("scan: len=" + int_to_str(sb.len()) + " tail: " + cdr_hex(&slice(&sb, sb.len() - 20, sb.len())));
+    var r4: CdrReader = cdr_reader(sb);
+    val sr: RosLaserScan = ros_read_laser_scan(&mut r4);
+    println("scan back: ok=" + b2(r4.ok) + " n=" + int_to_str(sr.ranges.len()) + " r[2]=" + rmath_fmt(sr.ranges.get(2), 9) + " inc=" + rmath_fmt(sr.angle_increment, 9) + " max=" + rmath_fmt(sr.range_max, 1) + " intensities=" + int_to_str(sr.intensities.len()));
+
+    var xs: Vec<f64> = Vec::new();
+    var ys: Vec<f64> = Vec::new();
+    var zs: Vec<f64> = Vec::new();
+    xs.push(1.0); ys.push(2.0); zs.push(3.0);
+    xs.push(-1.0); ys.push(0.5); zs.push(0.0);
+    xs.push(4.0); ys.push(4.0); zs.push(4.0);
+    val cloud: RosPointCloud2 = ros_cloud_xyz(ros_header(9, 0, "map"), &xs, &ys, &zs);
+    val cb: Vec<i64> = ros_serialize_point_cloud2(&cloud);
+    val clen: i64 = cb.len();
+    var r5: CdrReader = cdr_reader(cb);
+    val cr: RosPointCloud2 = ros_read_point_cloud2(&mut r5);
+    var names: str = "";
+    var i: i64 = 0;
+    while i < cr.fields.len() {
+        if i > 0 {
+            names = names + ",";
+        }
+        names = names + cr.fields.get(i).name;
+        i = i + 1;
+    }
+    println("cloud: len=" + int_to_str(clen) + " ok=" + b2(r5.ok) + " width=" + int_to_str(cr.width) + " fields=" + names + " step=" + int_to_str(cr.point_step) + " dense=" + b2(cr.is_dense) + " p1=" + v3(ros_cloud_get_f32(&cr, 1, "x"), ros_cloud_get_f32(&cr, 1, "y"), ros_cloud_get_f32(&cr, 1, "z")) + " p2=" + v3(ros_cloud_get_f32(&cr, 2, "x"), ros_cloud_get_f32(&cr, 2, "y"), ros_cloud_get_f32(&cr, 2, "z")));
+
+    var pc: Vec<f64> = ros_zeros(36);
+    pc.set(35, 0.2);
+    var tc: Vec<f64> = ros_zeros(36);
+    tc.set(0, 0.05);
+    val od: RosOdometry = RosOdometry { header: ros_header(10, 11, "odom"), child_frame_id: "base_link", pose: RosPoseWithCov { pose: ros_pose(ros_vec3(12.5, 0.0, 0.0), ros_quat(0.0, 0.0, 0.0, 1.0)), covariance: pc }, twist: RosTwistWithCov { twist: ros_twist(ros_vec3(0.3, 0.0, 0.0), ros_vec3(0.0, 0.0, 0.0)), covariance: tc } };
+    val ob: Vec<i64> = ros_serialize_odometry(&od);
+    val olen: i64 = ob.len();
+    var r6: CdrReader = cdr_reader(ob);
+    val orr: RosOdometry = ros_read_odometry(&mut r6);
+    println("odometry: len=" + int_to_str(olen) + " ok=" + b2(r6.ok) + " child=" + orr.child_frame_id + " x=" + rmath_fmt(orr.pose.pose.position.x, 1) + " cov[35]=" + rmath_fmt(orr.pose.covariance.get(35), 1) + " vx=" + rmath_fmt(orr.twist.twist.linear.x, 1) + " twist cov[0]=" + rmath_fmt(orr.twist.covariance.get(0), 2));
+
+    var be: Vec<i64> = Vec::new();
+    be.push(0); be.push(0); be.push(0); be.push(0);
+    be.push(0); be.push(0); be.push(0); be.push(1);
+    be.push(0); be.push(0); be.push(0); be.push(2);
+    be.push(0); be.push(0); be.push(0); be.push(4);
+    be.push(109); be.push(97); be.push(112); be.push(0);
+    var r7: CdrReader = cdr_reader(be);
+    val bh: RosHeader = ros_read_header(&mut r7);
+    println("big-endian header: ok=" + b2(r7.ok) + " sec=" + int_to_str(bh.stamp.sec) + " nanosec=" + int_to_str(bh.stamp.nanosec) + " frame=" + bh.frame_id);
+    var r8: CdrReader = cdr_reader(slice(&tw, 0, 40));
+    ros_read_twist(&mut r8);
+    println("truncated twist: ok=" + b2(r8.ok));
+    return 0;
+}

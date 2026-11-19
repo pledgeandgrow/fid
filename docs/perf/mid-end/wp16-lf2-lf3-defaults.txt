@@ -1,0 +1,76 @@
+WP16, LF2, LF3 (llvm roadmap): closures inlined, lent references and a
+Vec's buffer as default facts of the mid-end (Nov 17)
+=======================================================================
+
+What changed (compiler/iropt_me.fd, compiler/iropt.fd)
+------------------------------------------------------
+IME_DEFAULT_ON now holds `inlineclo` and `lendref` as well:
+
+  ,loops,sra,loadhoist,forward,matchfacts,inline2,inlineclo,lendref,unroll,
+  linear,placefwd,vecalias,version,ssa,ssaexit,
+
+WP16 `inlineclo` (ime_inline_closures, written Nov 16): inline2's
+once-called rule for closures alone. A closure that closure
+devirtualization (iro_closure_devirt, LG5/LG6) or hofspec made a direct
+call to `__closure_N`, called at one site, is copied into its caller up to
+the once-called limit. iropt_native runs it only when inline2 is off;
+inline2 (on by default since OP5) takes such closures by its own
+once-called rule (ime_backend_named leaves `__closure_` names to it). So
+the closure part of WP16 is done by inline2 by default, and by inlineclo
+when inline2 is named off or leaves the default list (ME20's gate).
+inlineclo is now checked by the translation validator like inline2
+(tv_mod_before / tv_mod_after "inlineclo", with --validate).
+FID_IROPT_OFF=inlineclo turns it off.
+
+LF2 `lendref` (ime_note_ref_params, written Nov 16): the table of
+reference parameters no callee lets go of (greatest fixpoint over the
+call graph); ime_unescaped gives 2 to a local only lent to such calls, and
+ime_call_writes / ime_reads say a call reaches it only when given it.
+Hardened today: a function with no blocks proves nothing (mask 0).
+FID_IROPT_OFF=lendref turns it off.
+
+LF3 (Vec elements in the alias query) was finished earlier today as OP26
+(`vecalias`, docs/perf/mid-end/op26-alias-facts.txt): ime_addr kind 5,
+ime_vb_owners / ime_vb_compute (home slots), ime_vb_call_writes,
+ime_same_elem. Its soundness rests on copy-on-write at run time: a header
+of a home slot may reach Vec_share, __own_dup_N or a program function, and
+the other owner it makes has its own header; core's Vec_set / Vec_push
+call vec_own first (pe_ir's fast Vec_set path sends a shared buffer,
+capacity < 0, to the cold path that calls core), so a write through
+another name copies the buffer before it changes an element. A call given
+anything derived from the home slot (its header, its data pointer) still
+writes its elements.
+
+Measured with the compiler of Nov 16 (stage0, which has both passes
+opt-in), FID_VERIFY=1, pe_ir
+----------------------------------------------------------------------
+test_midend_lend_ref.fd, inline2/inlineclo/unroll off:
+  lendref off 1163 -> 1029 instructions, on 1163 -> 1026; same output
+test_midend_lend_ref_escape.fd (new; callees that keep the reference
+through unsafe code): 9 8 4 3 with lendref on and off, inlining on or off
+test_midend_inline_closure.fd, inline2 off:
+  inlineclo off: 1106 -> 960 instructions; on: 1161 -> 1010 (the bodies
+  copied; the closures' own functions stay); same output
+tests/tooling/lendref-check.sh with FID=stage0 and FID_IROPT_ON=lendref
+(the new default simulated): 7 PASS.
+Sample suite run, stage0, pe_ir: midend-pass-suite-check.sh PASS=lendref on
+40 programs that pass `&mut` locals to calls (every 5th of them): 30 the
+same, 0 DIFF / BUILD / VERIFY, 10 SKIP (build with neither: they need
+stdlib modules another session is still writing, or FFI). stage0 type-checks
+compiler/iropt.fd (with iropt_me.fd) after today's edits: no errors.
+
+Gates for the final compiler ($FID)
+-----------------------------------
+  FID=$FID bash tests/tooling/inlineclo-check.sh            (7 PASS)
+  FID=$FID TARGET=--nat bash tests/tooling/inlineclo-check.sh
+  FID=$FID SUITE=1 JOBS=4 bash tests/tooling/inlineclo-check.sh
+  FID=$FID SUITE=1 JOBS=4 TARGET=--nat OUT=build/inlineclo-nat \
+      bash tests/tooling/inlineclo-check.sh
+  FID=$FID bash tests/tooling/lendref-check.sh               (7 PASS)
+  FID=$FID TARGET=--nat OUT=build/lendref-nat bash tests/tooling/lendref-check.sh
+  FID=$FID SUITE=1 JOBS=4 bash tests/tooling/lendref-check.sh
+  FID=$FID SUITE=1 JOBS=4 TARGET=--nat OUT=build/lendref-nat2 \
+      bash tests/tooling/lendref-check.sh
+  FID=$FID bash tests/tooling/vecalias-check.sh               (LF3, OP26)
+If a suite run shows a DIFF / BUILD / VERIFY that cannot be fixed, the
+pass leaves IME_DEFAULT_ON in compiler/iropt_me.fd.

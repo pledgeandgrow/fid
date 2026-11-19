@@ -1,0 +1,126 @@
+// stdlib/zigbee: ZCL frames (On/Off, Read/Write Attributes, Report, Default Response, Configure Reporting, manufacturer specific), data types incl. single floats, an On/Off + Level + Temperature server endpoint with ZCL status codes, APS unicast and group headers, the radio seam
+// Expected output:
+// on: 010501
+// read on/off: 0006000000
+// server on: 18050b0100 state 1
+// toggle, no response: 0 bytes, state 0
+// read: 1807010000001000341286
+// write read-only: 180804880000
+// write transition: 18090400
+// write wrong type: 180a048d1000
+// move to level: 010b04800a00 -> 180b0b0400 level 128 on 1
+// level 255: 180c0b0087
+// unknown command: 180d0b1081
+// report: 18010a0000296608
+// report decoded: attr 0 type 29 value 2150
+// temperatures: 2150 -1013 -32768
+// configure reporting: 000a06000000290a00100e3200
+// manufacturer frame: 055f110102 mfr 4447 cmd 2
+// uint24: 563412 int24 -2: feffff int8 ff: -1 string: 03616263
+// invalid: 255 -32768 16777215
+// read rsp decoded: 0 ok 1 / 4660 status 86
+// single: 3f800000 41ac0000 bdcccccd 000116c2 7f800000
+// single back x100: 2150 -10
+// aps unicast: 000106000401012a010501
+// aps group: 0c010006000401012b010501
+// aps decoded: delivery 3 group 1 cluster 6 profile 260 counter 43 payload 010501
+// radio: counter 1 sent 000102040401010118020a0000296608
+use zigbee;
+use encoding;
+use string;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hexb(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn hex32(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push((v >> 24) & 0xFF);
+    b.push((v >> 16) & 0xFF);
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn val_hex(v: ZclValue) -> str {
+    var out: Vec<i64> = Vec::new();
+    zcl_put_value(& mut out, & v);
+    return hex_encode_bytes(out);
+}
+
+fn radio_tx(h: i64, frame: Vec<i64>) -> i64 {
+    println("radio: counter 1 sent " + hex_encode_bytes(frame));
+    return 0;
+}
+
+fn main() {
+    println("on: " + hx(zcl_encode(& zcl_on_off_command(5, ZCL_CMD_ON))));
+    var ids: Vec<i64> = Vec::new();
+    ids.push(ZCL_ATTR_ON_OFF);
+    println("read on/off: " + hx(zcl_encode(& zcl_read_attributes(6, & ids))));
+
+    var ep: ZclEndpoint = zcl_endpoint_light_sensor(1);
+    val r1: Vec<i64> = zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_ON_OFF, hex_decode_bytes("010501"));
+    println("server on: " + hx(r1) + " state " + int_to_str(zcl_get(& ep, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF)));
+    val r2: Vec<i64> = zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_ON_OFF, hex_decode_bytes("110602"));
+    println("toggle, no response: " + int_to_str(r2.len()) + " bytes, state " + int_to_str(zcl_get(& ep, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF)));
+    println("read: " + hx(zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_ON_OFF, hex_decode_bytes("00070000003412"))));
+    println("write read-only: " + hx(zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_ON_OFF, hex_decode_bytes("00080200001001"))));
+    var recs: Vec<ZclAttrRecord> = Vec::new();
+    recs.push(ZclAttrRecord { attr: 0x0010, status: 0, value: zcl_num(ZCL_UINT16, 10) });
+    val wf: Vec<i64> = zcl_encode(& zcl_write_attributes(9, & recs));
+    println("write transition: " + hx(zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_LEVEL, wf)));
+    println("write wrong type: " + hx(zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_LEVEL, hex_decode_bytes("000a0210002005"))));
+    val mv: Vec<i64> = zcl_encode(& zcl_move_to_level(11, 0x80, 10, true));
+    val mr: Vec<i64> = zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_LEVEL, mv);
+    println("move to level: " + hx(mv) + " -> " + hx(mr) + " level " + int_to_str(zcl_get(& ep, ZCL_CLUSTER_LEVEL, ZCL_ATTR_CURRENT_LEVEL)) + " on " + int_to_str(zcl_get(& ep, ZCL_CLUSTER_ON_OFF, ZCL_ATTR_ON_OFF)));
+    println("level 255: " + hx(zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_LEVEL, zcl_encode(& zcl_move_to_level(12, 0xFF, 0, false)))));
+    println("unknown command: " + hx(zcl_endpoint_handle(& mut ep, ZCL_CLUSTER_ON_OFF, hex_decode_bytes("010d10"))));
+
+    zcl_set(& mut ep, ZCL_CLUSTER_TEMPERATURE, ZCL_ATTR_MEASURED_VALUE, zcl_temperature_value(21.5));
+    val rep: Vec<i64> = zcl_report_of(& mut ep, ZCL_CLUSTER_TEMPERATURE, ZCL_ATTR_MEASURED_VALUE);
+    println("report: " + hx(rep));
+    val rf: ZclFrame = zcl_decode(& rep);
+    val rr: Vec<ZclAttrRecord> = zcl_decode_attr_values(& rf.payload);
+    val rr0: ZclAttrRecord = rr.get(0);
+    println("report decoded: attr " + int_to_str(rr0.attr) + " type " + hexb(rr0.value.dtype) + " value " + int_to_str(rr0.value.num));
+    val nan: f64 = 0.0 / 0.0;
+    println("temperatures: " + int_to_str(zcl_temperature_value(21.5)) + " " + int_to_str(zcl_temperature_value(-10.125)) + " " + int_to_str(zcl_temperature_value(nan)));
+    println("configure reporting: " + hx(zcl_encode(& zcl_configure_reporting(0x0a, 0, ZCL_INT16, 10, 3600, 50))));
+    var mf: ZclFrame = zcl_frame(ZCL_FRAME_CLUSTER, ZCL_DIR_TO_SERVER, 1, 2, Vec::new());
+    mf.manufacturer = 0x115F;
+    val mfb: Vec<i64> = zcl_encode(& mf);
+    val mfd: ZclFrame = zcl_decode(& mfb);
+    println("manufacturer frame: " + hx(mfb) + " mfr " + int_to_str(mfd.manufacturer) + " cmd " + int_to_str(mfd.command));
+
+    var nx: i64 = 0;
+    val i8v: ZclValue = zcl_get_value(& hex_decode_bytes("ff"), 0, ZCL_INT8, & mut nx);
+    println("uint24: " + val_hex(zcl_num(ZCL_UINT24, 0x123456)) + " int24 -2: " + val_hex(zcl_num(ZCL_INT24, -2)) + " int8 ff: " + int_to_str(i8v.num) + " string: " + val_hex(zcl_string("abc")));
+    println("invalid: " + int_to_str(zcl_invalid_value(ZCL_UINT8)) + " " + int_to_str(zcl_invalid_value(ZCL_INT16)) + " " + int_to_str(zcl_invalid_value(ZCL_UINT24)));
+    val rd: Vec<ZclAttrRecord> = zcl_decode_read_rsp(& hex_decode_bytes("0000001001341286"));
+    val rd0: ZclAttrRecord = rd.get(0);
+    val rd1: ZclAttrRecord = rd.get(1);
+    println("read rsp decoded: " + int_to_str(rd0.attr) + " ok " + int_to_str(rd0.value.num) + " / " + int_to_str(rd1.attr) + " status " + hexb(rd1.status));
+    println("single: " + hex32(zcl_f32_bits(1.0)) + " " + hex32(zcl_f32_bits(21.5)) + " " + hex32(zcl_f32_bits(-0.1)) + " " + hex32(zcl_f32_bits(1.0e-40)) + " " + hex32(zcl_f32_bits(1.0e39)));
+    val back1: f64 = zcl_f32_from_bits(0x41AC0000);
+    val back2: f64 = zcl_f32_from_bits(0xBDCCCCCD);
+    println("single back x100: " + int_to_str((back1 * 100.0) as i64) + " " + int_to_str((back2 * 100.0 - 0.5) as i64));
+
+    val on: Vec<i64> = hex_decode_bytes("010501");
+    println("aps unicast: " + hx(aps_encode(& aps_unicast(1, ZCL_CLUSTER_ON_OFF, ZIGBEE_PROFILE_HA, 1, 0x2a), & on)));
+    val gf: Vec<i64> = aps_encode(& aps_group(1, ZCL_CLUSTER_ON_OFF, ZIGBEE_PROFILE_HA, 1, 0x2b), & on);
+    println("aps group: " + hx(gf));
+    val gh: ApsHeader = aps_decode(& gf);
+    println("aps decoded: delivery " + int_to_str(gh.delivery) + " group " + int_to_str(gh.group) + " cluster " + int_to_str(gh.cluster) + " profile " + int_to_str(gh.profile) + " counter " + int_to_str(gh.counter) + " payload " + hx(aps_payload(& gf, & gh)));
+
+    var radio: ZigbeeRadio = ZigbeeRadio { tx: radio_tx, radio: 0, counter: 0 };
+    var recs2: Vec<ZclAttrRecord> = Vec::new();
+    recs2.push(ZclAttrRecord { attr: 0, status: 0, value: zcl_num(ZCL_INT16, 2150) });
+    zigbee_send_zcl(& mut radio, 1, ZCL_CLUSTER_TEMPERATURE, & zcl_report_attributes(2, & recs2));
+}

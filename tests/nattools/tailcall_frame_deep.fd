@@ -1,0 +1,54 @@
+// MI28 (docs/roadmap/llvm-roadmap.md): the deep half of
+// tests/bootstrap/test_machine_tailcall_frame.fd, natively only
+// (tests/nattools/machine_tailcall_frame_check.sh): self and mutual
+// recursion three million levels deep in functions that hand a struct
+// local to a helper by address (their frame's address is taken: an
+// MO_SLOTADDR). Their tail calls pass only numbers, so ng_tail_taint lets
+// them be jumps: each level reuses the frame. Without that (FID_NAT_OFF=
+// tailframe, or tailcall) every level keeps a frame and the stack
+// overflows; the mutual recursion needs the jumps even when the IR
+// optimizer turns the self-recursion into a loop. Run with and without
+// FID_IROPT_OFF=tailcall.
+// Expected output:
+// 32999997
+// 7500007
+// 9000020
+
+struct Acc { a: i64, b: i64, c: i64 }
+
+fn acc_sum(t: &Acc, d: i64) -> i64 {
+    if d <= 0 {
+        return t.a + t.b * 2 + t.c * 3;
+    }
+    return acc_sum(t, d - 1) + 1;
+}
+
+fn walk(n: i64, total: i64) -> i64 {
+    if n == 0 {
+        return total;
+    }
+    var t: Acc = Acc { a: n % 7, b: n % 5, c: 1 };
+    return walk(n - 1, total + acc_sum(&t, 1));
+}
+
+fn even_s(n: i64, k: i64) -> i64 {
+    if n == 0 {
+        return k;
+    }
+    var t: Acc = Acc { a: n % 3, b: 1, c: 0 };
+    return odd_s(n - 1, k + acc_sum(&t, 0));
+}
+
+fn odd_s(n: i64, k: i64) -> i64 {
+    if n == 0 {
+        return k * 2;
+    }
+    var t: Acc = Acc { a: 0, b: n % 2, c: 1 };
+    return even_s(n - 1, k + acc_sum(&t, 0) - 3);
+}
+
+fn main() {
+    println(walk(3000000, 0));
+    println(even_s(3000000, 7));
+    println(even_s(3000001, 7));
+}

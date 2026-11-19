@@ -210,11 +210,23 @@ pub enum OpEntry {
 // The names modules are imported under, for `module::name()`, and each
 // `module::name` called so far
 var g_import_set: i64 = HashMap_new(); var g_qualified_calls: Vec<str> = Vec::new();
+// LG15: the headers imported with @import: import path -> 1, or 3 when
+// marked `trusted` (compiler.fd's import loop reads it)
+var g_at_imports: i64 = HashMap_new();
+
+pub fn at_import_flags(path: str) -> i64 {
+    return HashMap_get(g_at_imports, path);
+}
+
 // The type arguments of each turbofish call `name::<T, U>(args)` (proposal
 // 0002), as Type::Generic("", [T, U]). The call is parsed as a call of
 // `name::<#k>`, k its index here; the turbofish pass (mono.fd) instantiates
 // `name` with them before type checking.
 var g_turbofish_types: Vec<Type> = Vec::new();
+/// Numbers the locals of called call results: `f(1)(5)` and
+/// `fs.get(1)(5)` parse as `{ val __pcall_k = f(1); __pcall_k(5) }`
+/// (stdlib-agent-bugs 38; parse_postfix).
+var g_pd_pcall_n: i64 = 0;
 /// Every turbofish call's type arguments, by number.
 pub fn turbofish_all() -> Vec<Type> {
     return g_turbofish_types;
@@ -280,6 +292,13 @@ pub struct Parser {
     pub errors: Vec<str>,
     pub expr_depth: i64,
     pub max_expr_depth: i64,
+    // F1 (VF3): nesting of brackets, blocks and prefix operators (parse_unary,
+    // parse_block); past 256 levels "nested too deeply" (nest_hit: reported)
+    pub nest_depth: i64,
+    pub nest_hit: bool,
+    // LG3: every lifetime name parse_type consumed (`&'a T`), in order; a
+    // signature reads the ones each parameter's and the result's type added
+    pub lt_seen: Vec<str>,
 }
 
 pub fn Parser_new(tokens: Vec<Token>) -> Parser {
@@ -363,7 +382,7 @@ pub fn Parser_new(tokens: Vec<Token>) -> Parser {
     }
 
     return Parser {
-        tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256,
+        tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(),
     };
 }
 
@@ -440,7 +459,7 @@ impl Parser {
             ei = ei + 1;
         }
         return Parser {
-            tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256,
+            tokens: tokens, pos: 0, struct_names: sn, enum_names: en, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(),
         };
     }
     fn peek(self: & Parser) -> TokenKind {
@@ -537,7 +556,7 @@ impl Parser {
             }
         }
         var tok: Token = self.peek_token();
-        return ParseResultUnit::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected " + msg + " but got '" + token_kind_to_str(tok.kind) + "'");
+        return ParseResultUnit::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected " + msg + " but got '" + token_kind_to_str(tok.kind) + "'\n    Fix: write " + msg + " here; often a `;`, `)` or `}` is missing just before this point");
     }
 
     fn expect_ident(self: & mut Parser) -> ParseResultStr {
@@ -550,7 +569,7 @@ impl Parser {
             _ => {
             }
         }
-        return ParseResultStr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected identifier but got '" + token_kind_to_str(tok.kind) + "'");
+        return ParseResultStr::Err(pd_expected_name_err(tok));
     }
 
     fn expect_ident_or_keyword(self: & mut Parser) -> ParseResultStr {
@@ -568,7 +587,7 @@ impl Parser {
             self.advance();
             return ParseResultStr::Ok(s);
         }
-        return ParseResultStr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected identifier but got '" + token_kind_to_str(tok.kind) + "'");
+        return ParseResultStr::Err(pd_expected_name_err(tok));
     }
 
     fn is_struct_name(self: & Parser, name: str) -> bool {
@@ -661,13 +680,21 @@ impl Parser {
             _ => {
             }
         }
-        return ParseResultStr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected type name but got '" + token_kind_to_str(tok.kind) + "'");
+        return ParseResultStr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected type name but got '" + token_kind_to_str(tok.kind) + "'\n    Fix: name a type here, as in `i64`, `str` or `Point`");
     }
 
     pub fn parse(self: & mut Parser) -> ParseResultProgram {
         var program: Program = program_new();
+        g_pd_impl_selfs = Vec::new();
+        g_pd_timpl_selfs = Vec::new();
 
         while !self.is_at_end() {
+            // CF1 (reference §1.10): a `;` after an item (`struct P { .. };`,
+            // `fn f() { .. };`) is consumed
+            if self.check(TokenKind::Semicolon) {
+                self.advance();
+                continue;
+            }
             var is_pub: bool = false;
             if self.check(TokenKind::Pub) {
                 self.advance();
@@ -678,7 +705,7 @@ impl Parser {
                 ParseResultUnit::Ok => {
                 }
                 ParseResultUnit::Err(e) => {
-                    self.errors.push(e);
+                    self.push_parse_error(e);
                     self.recover_to_sync_token();
                     if self.check(TokenKind::RBrace) {
                         self.advance();
@@ -689,6 +716,19 @@ impl Parser {
 
         if self.errors.len() > 0 {
             return ParseResultProgram::Err(vec_str_join(self.errors, "\n"));
+        }
+        // L8H: several definitions of a name, one generic: specializations
+        pd_name_specializations(& mut program);
+        // ... and methods of a narrower impl that a generic impl also has
+        pd_impl_specializations(& mut program, g_pd_impl_selfs);
+        // ... and a trait impl for a narrower type beside a generic one
+        // (`impl Show for Wrap<i64>` with `impl<T> Show for Wrap<T>`): it
+        // becomes a narrower impl of the struct whose methods specialize
+        // the generic trait impl's (after pd_impl_specializations, so its
+        // numbers `__spec<k>` follow those)
+        val tspec_errs: Vec<str> = pd_trait_impl_specializations(& mut program, g_pd_timpl_selfs);
+        if tspec_errs.len() > 0 {
+            return ParseResultProgram::Err(vec_str_join(tspec_errs, "\n"));
         }
         return ParseResultProgram::Ok(program);
     }
@@ -761,6 +801,23 @@ impl Parser {
             }
         }
 
+        // reference §2.6/§2.7: a module-level item is `const` or `var`;
+        // `val` exists only inside a function (bugs 9)
+        if token_kind_eq(k, TokenKind::Val) {
+            var vtok: Token = self.peek_token();
+            var vname: str = "NAME";
+            if self.pos + 1 < self.tokens.len() {
+                match self.tokens.get(self.pos + 1).kind {
+                    TokenKind::Ident(vn: str) => {
+                        vname = vn;
+                    }
+                    _ => {
+                    }
+                }
+            }
+            return ParseResultUnit::Err("Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) + ": `val` cannot declare a top-level item (reference §2.6, §2.7).\n    Fix: write `const " + vname + ": T = ...;` for a value fixed at compile time, or `var " + vname + ": T = ...;` for a global that is computed or changed.");
+        }
+
         if token_kind_eq(k, TokenKind::Var) || token_kind_eq(k, TokenKind::Static) {
             match self.parse_global_var() {
                 ParseResultGlobalVar::Ok(g) => {
@@ -808,8 +865,28 @@ impl Parser {
                 ParseResultImplOrTrait::Ok(imp) => {
                     if imp.tag == 0 {
                         program.impls.push(imp.struct_impl);
+                        // L8H: its self type, at the same index (Void: the
+                        // bare name)
+                        while g_pd_impl_selfs.len() < program.impls.len() - 1 {
+                            g_pd_impl_selfs.push(Type::Void);
+                        }
+                        if g_pd_last_impl_self.len() > 0 {
+                            g_pd_impl_selfs.push(g_pd_last_impl_self.get(0));
+                        } else {
+                            g_pd_impl_selfs.push(Type::Void);
+                        }
                     } else {
                         program.trait_impls.push(imp.trait_impl);
+                        // L8H: its `for` type, at the same index (Void: the
+                        // bare name)
+                        while g_pd_timpl_selfs.len() < program.trait_impls.len() - 1 {
+                            g_pd_timpl_selfs.push(Type::Void);
+                        }
+                        if g_pd_last_timpl_self.len() > 0 {
+                            g_pd_timpl_selfs.push(g_pd_last_timpl_self.get(0));
+                        } else {
+                            g_pd_timpl_selfs.push(Type::Void);
+                        }
                     }
                     return ParseResultUnit::Ok;
                 }
@@ -883,6 +960,12 @@ impl Parser {
                     ParseResultStructDef::Ok(sd) => {
                         var msd = sd;
                         msd.is_pub = item_is_pub;
+                        // keep the ones parse_struct made (LG3 `@lifetime`)
+                        var sa: i64 = 0;
+                        while sa < sd.annotations.len() {
+                            annotations.push(sd.annotations.get(sa));
+                            sa = sa + 1;
+                        }
                         msd.annotations = annotations;
                         program.structs.push(msd);
                         return ParseResultUnit::Ok;
@@ -892,10 +975,26 @@ impl Parser {
                     }
                 }
             } else {
+                // `@ann async fn` (as `async fn` without annotations); the
+                // checks of @redundant and @event reject it with a reason
+                var ann_async: bool = false;
+                if self.check(TokenKind::Async) {
+                    self.advance();
+                    ann_async = true;
+                }
                 match self.parse_func() {
                     ParseResultFunc::Ok(func) => {
                         var mfunc = func;
                         mfunc.is_pub = item_is_pub;
+                        if ann_async {
+                            mfunc.is_async = true;
+                        }
+                        // keep the ones parse_func made (LG3 `@lifetime`)
+                        var fa: i64 = 0;
+                        while fa < func.annotations.len() {
+                            annotations.push(func.annotations.get(fa));
+                            fa = fa + 1;
+                        }
                         mfunc.annotations = annotations;
                         program.funcs.push(mfunc);
                         return ParseResultUnit::Ok;
@@ -1178,16 +1277,52 @@ impl Parser {
         }
 
         var type_params: Vec<str> = Vec::new();
+        // LG3: lifetime parameters, `struct View<'a> { r: &'a i64 }`: the
+        // struct may hold references (compiler/escape.fd)
+        var struct_lts: Vec<str> = Vec::new();
         if self.check(TokenKind::Lt) {
             self.advance();
             if !self.check(TokenKind::Gt) {
                 loop {
+                    var s_lt: str = "";
+                    match self.peek() {
+                        TokenKind::Lifetime(sln: str) => {
+                            s_lt = sln;
+                        }
+                        _ => {
+                        }
+                    }
+                    if s_lt != "" {
+                        self.advance();
+                        if s_lt == "'static" {
+                            var st_tok: Token = self.peek_token();
+                            return ParseResultStructDef::Err("Parse error at " + int_to_str(st_tok.line) + ":" + int_to_str(st_tok.col) + ": 'static is not a lifetime parameter; declare a name, `struct " + name + "<'a>`\n    Fix: declare a named lifetime, as in `struct " + name + "<'a>`, and use it in the fields ('static needs no declaration)");
+                        }
+                        struct_lts.push(s_lt);
+                        if !self.match_tok(TokenKind::Comma) {
+                            break;
+                        }
+                        continue;
+                    }
+                    // L8A: a const parameter, `const N: usize` or `N: i64`:
+                    // a type parameter whose argument is a number
+                    // (`Matrix<i64, 3>`, the type `__const_3`)
+                    if self.match_tok(TokenKind::Const) {
+                    }
                     match self.expect_ident() {
                         ParseResultStr::Ok(tp) => {
                             type_params.push(tp);
                         }
                         ParseResultStr::Err(e) => {
                             return ParseResultStructDef::Err(e);
+                        }
+                    }
+                    if self.match_tok(TokenKind::Colon) {
+                        var sb_tok: Token = self.peek_token();
+                        if is_int_type_keyword(sb_tok.kind) || pd_size_type_tok(sb_tok.kind) {
+                            self.advance();
+                        } else {
+                            return ParseResultStructDef::Err("Parse error at " + int_to_str(sb_tok.line) + ":" + int_to_str(sb_tok.col) + ": expected an integer type (i64, usize, ...) after a struct's const parameter but got '" + token_kind_to_str(sb_tok.kind) + "'\n    Fix: give the const parameter an integer type, as in `struct Buf<const N: usize>`");
                         }
                     }
                     if !self.match_tok(TokenKind::Comma) {
@@ -1236,6 +1371,7 @@ impl Parser {
                 }
             }
             var fty: Type = Type::Void;
+            var f_lt_start: i64 = self.lt_seen.len();
             match self.parse_type() {
                 ParseResultType::Ok(t) => {
                     fty = t;
@@ -1244,7 +1380,35 @@ impl Parser {
                     return ParseResultStructDef::Err(e);
                 }
             }
-            fields.push(Param_new(fname, fty, is_pub));
+            var field: Param = Param_new(fname, fty, is_pub);
+            // LG3: a field's lifetimes are the struct's own
+            var f_lts: Vec<str> = pd_lt_since(self.lt_seen, f_lt_start);
+            var fli: i64 = 0;
+            while fli < f_lts.len() {
+                var flt: str = f_lts.get(fli);
+                if flt != "'static" && !str_vec_contains(struct_lts, flt) {
+                    var fl_tok: Token = self.peek_token();
+                    return ParseResultStructDef::Err("Parse error at " + int_to_str(fl_tok.line) + ":" + int_to_str(fl_tok.col) + ": lifetime " + flt + " of field '" + fname + "' is not declared; write `struct " + name + "<" + flt + ">`\n    Fix: declare the lifetime on the struct as shown, or remove it from the field's type");
+                }
+                fli = fli + 1;
+            }
+            if f_lts.len() > 0 {
+                field.annotations.push(Annotation_new("lifetime", f_lts));
+            }
+            // CL5: a default value, `port: i64 = 8080`, which a literal
+            // ending in `..` gives every field it leaves out
+            if self.match_tok(TokenKind::Eq) {
+                match self.parse_expr() {
+                    ParseResultExpr::Ok(dv) => {
+                        field.has_default = true;
+                        field.default_expr = dv;
+                    }
+                    ParseResultExpr::Err(e) => {
+                        return ParseResultStructDef::Err(e);
+                    }
+                }
+            }
+            fields.push(field);
             self.match_tok(TokenKind::Comma);
         }
         match self.expect(TokenKind::RBrace, "}") {
@@ -1260,6 +1424,9 @@ impl Parser {
         var __ret_StructDef: StructDef = StructDef_new(name, false);
         __ret_StructDef.fields = fields;
         __ret_StructDef.type_params = type_params;
+        if struct_lts.len() > 0 {
+            __ret_StructDef.annotations.push(Annotation_new("lifetime", struct_lts));
+        }
         return ParseResultStructDef::Ok(__ret_StructDef);
     }
 
@@ -1631,16 +1798,61 @@ impl Parser {
         }
 
         var type_params: Vec<str> = Vec::new();
+        // L8A: the impl's const parameters (`impl<T, const N: usize>
+        // Matrix<T, N>`, or `N: i64`): each method sees N as a constant
+        // (its const_params), which mono replaces by the receiver's number
+        var impl_consts: Vec<StrPair> = Vec::new();
+        g_pd_impl_lts = Vec::new();
         if self.check(TokenKind::Lt) {
             self.advance();
             if !self.check(TokenKind::Gt) {
                 loop {
+                    // LG3: `impl<'a> View<'a>`: a lifetime parameter names
+                    // the struct's; the methods write their own
+                    var impl_lt: bool = false;
+                    match self.peek() {
+                        TokenKind::Lifetime(_) => {
+                            impl_lt = true;
+                        }
+                        _ => {
+                        }
+                    }
+                    if impl_lt {
+                        match self.peek() {
+                            TokenKind::Lifetime(iltn: str) => {
+                                g_pd_impl_lts.push(iltn);
+                            }
+                            _ => {
+                            }
+                        }
+                        self.advance();
+                        if !self.match_tok(TokenKind::Comma) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if self.match_tok(TokenKind::Const) {
+                    }
+                    var itp: str = "";
                     match self.expect_ident() {
                         ParseResultStr::Ok(tp) => {
+                            itp = tp;
                             type_params.push(tp);
                         }
                         ParseResultStr::Err(e) => {
                             return ParseResultImplOrTrait::Err(e);
+                        }
+                    }
+                    if self.match_tok(TokenKind::Colon) {
+                        var ib_tok: Token = self.peek_token();
+                        if is_int_type_keyword(ib_tok.kind) {
+                            impl_consts.push(StrPair_new(itp, type_keyword_name(ib_tok.kind)));
+                            self.advance();
+                        } else if pd_size_type_tok(ib_tok.kind) {
+                            impl_consts.push(StrPair_new(itp, "i64"));
+                            self.advance();
+                        } else {
+                            return ParseResultImplOrTrait::Err("Parse error at " + int_to_str(ib_tok.line) + ":" + int_to_str(ib_tok.col) + ": expected an integer type (i64, usize, ...) after an impl's const parameter but got '" + token_kind_to_str(ib_tok.kind) + "'\n    Fix: give the const parameter an integer type, as in `impl<const N: usize> Buf<N>`");
                         }
                     }
                     if !self.match_tok(TokenKind::Comma) {
@@ -1666,8 +1878,26 @@ impl Parser {
                 return ParseResultImplOrTrait::Err(e);
             }
         }
-        // `impl<T> Slot<T>`: the type's arguments repeat the impl's parameters
+        // `impl<T> Slot<T>`: the type's arguments repeat the impl's parameters;
+        // L8H: `impl Slot<i64>` (or `impl<U> Slot<Vec<U>>`) names narrower
+        // ones, and its methods may specialize the generic impl's (the type
+        // is kept for pd_impl_specializations)
+        g_pd_last_impl_self = Vec::new();
+        var tparsed: bool = false;
         if self.check(TokenKind::Lt) {
+            val after_name: i64 = self.pos;
+            self.pos = after_name - 1;
+            match self.parse_type() {
+                ParseResultType::Ok(st) => {
+                    g_pd_last_impl_self.push(st);
+                    tparsed = true;
+                }
+                ParseResultType::Err(_) => {
+                    self.pos = after_name;
+                }
+            }
+        }
+        if self.check(TokenKind::Lt) && !tparsed {
             var tdepth: i64 = 0;
             var tscan: bool = true;
             while tscan {
@@ -1698,8 +1928,25 @@ impl Parser {
                 }
             }
             // `impl<T> Show for Slot<T>`: the type's arguments repeat the impl's
-            // parameters, as in `impl<T> Slot<T>` above
+            // parameters, as in `impl<T> Slot<T>` above; L8H: `impl Show for
+            // Slot<i64>` names narrower ones (kept for
+            // pd_trait_impl_specializations)
+            g_pd_last_timpl_self = Vec::new();
+            var fparsed: bool = false;
             if self.check(TokenKind::Lt) {
+                val after_tname: i64 = self.pos;
+                self.pos = after_tname - 1;
+                match self.parse_type() {
+                    ParseResultType::Ok(fst) => {
+                        g_pd_last_timpl_self.push(fst);
+                        fparsed = true;
+                    }
+                    ParseResultType::Err(_) => {
+                        self.pos = after_tname;
+                    }
+                }
+            }
+            if self.check(TokenKind::Lt) && !fparsed {
                 var fdepth: i64 = 0;
                 var fscan: bool = true;
                 while fscan {
@@ -1790,10 +2037,17 @@ impl Parser {
                         self.advance();
                         is_pub = true;
                     }
+                    // `async fn` in a trait impl (LG14)
+                    var ti_async: bool = false;
+                    if self.check(TokenKind::Async) {
+                        self.advance();
+                        ti_async = true;
+                    }
                     match self.parse_func() {
                         ParseResultFunc::Ok(func) => {
                             var mfunc = func;
                             mfunc.is_pub = is_pub;
+                            mfunc.is_async = ti_async;
                             methods.push(mfunc);
                         }
                         ParseResultFunc::Err(e) => {
@@ -1812,11 +2066,12 @@ impl Parser {
 
             var __ti: TraitImpl = TraitImpl_new(trait_name, type_name);
             __ti.type_params = type_params;
-            __ti.methods = pd_generic_self(methods, type_name, type_params);
+            __ti.methods = pd_impl_consts(pd_generic_self(methods, type_name, type_params), impl_consts);
             __ti.associated_types = associated_types;
             var __iot1: ImplOrTrait = ImplOrTrait {
                 tag: 1, struct_impl: ImplDef_new(""), trait_impl: __ti,
             };
+            g_pd_impl_lts = Vec::new();
             return ParseResultImplOrTrait::Ok(__iot1);
         }
 
@@ -1832,15 +2087,42 @@ impl Parser {
 
         var methods: Vec<Func> = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            // CU3: annotations on a method (`@deprecated(use = "m2") fn m`)
+            var m_annots: Vec<Annotation> = Vec::new();
+            while self.check(TokenKind::At) {
+                match self.parse_at_annotation() {
+                    ParseResultAnnotation::Ok(ma) => {
+                        m_annots.push(ma);
+                    }
+                    ParseResultAnnotation::Err(e) => {
+                        return ParseResultImplOrTrait::Err(e);
+                    }
+                }
+            }
             var is_pub: bool = false;
             if self.check(TokenKind::Pub) {
                 self.advance();
                 is_pub = true;
             }
+            // `async fn` in an impl block (LG14)
+            var m_async: bool = false;
+            if self.check(TokenKind::Async) {
+                self.advance();
+                m_async = true;
+            }
             match self.parse_func() {
                 ParseResultFunc::Ok(func) => {
                     var mfunc = func;
                     mfunc.is_pub = is_pub;
+                    mfunc.is_async = m_async;
+                    if m_annots.len() > 0 {
+                        var mfa: i64 = 0;
+                        while mfa < func.annotations.len() {
+                            m_annots.push(func.annotations.get(mfa));
+                            mfa = mfa + 1;
+                        }
+                        mfunc.annotations = m_annots;
+                    }
                     methods.push(mfunc);
                 }
                 ParseResultFunc::Err(e) => {
@@ -1858,10 +2140,11 @@ impl Parser {
 
         var __si: ImplDef = ImplDef_new(struct_name);
         __si.type_params = type_params;
-        __si.methods = pd_generic_self(methods, struct_name, type_params);
+        __si.methods = pd_impl_consts(pd_generic_self(methods, struct_name, type_params), impl_consts);
         var __iot0: ImplOrTrait = ImplOrTrait {
             tag: 0, struct_impl: __si, trait_impl: TraitImpl_new("", ""),
         };
+        g_pd_impl_lts = Vec::new();
         return ParseResultImplOrTrait::Ok(__iot0);
     }
 
@@ -1957,6 +2240,14 @@ impl Parser {
                     self.advance();
                     is_pub = true;
                 }
+                // `async fn m(..) -> Future<T>;` (LG14): the impls say async;
+                // the trait's signature is the Future<T> it returns; a default
+                // body is an async method's (TraitMethod.is_async)
+                var tm_async: bool = false;
+                if self.check(TokenKind::Async) {
+                    self.advance();
+                    tm_async = true;
+                }
                 match self.expect(TokenKind::Fn, "fn") {
                     ParseResultUnit::Err(e) => {
                         return ParseResultTraitDef::Err(e);
@@ -1973,17 +2264,74 @@ impl Parser {
                         return ParseResultTraitDef::Err(e);
                     }
                 }
-                // Generic type params (ignored -- just consumed)
+                // Generic type params (LG4: kept, with their bounds `U: A +
+                // B`, as a function's), lifetimes (`'a`, LG3) among them:
+                // those are kept to check the signature's lifetimes
+                // (pd_check_lifetimes)
+                var tm_lifetimes: Vec<str> = Vec::new();
+                var tm_tps: Vec<str> = Vec::new();
+                var tm_bounds: Vec<StrPair> = Vec::new();
                 if self.check(TokenKind::Lt) {
                     self.advance();
                     if !self.check(TokenKind::Gt) {
                         loop {
-                            match self.expect_ident() {
-                                ParseResultStr::Ok(_) => {
+                            var tm_lt: str = "";
+                            match self.peek() {
+                                TokenKind::Lifetime(tln: str) => {
+                                    tm_lt = tln;
                                 }
-                                ParseResultStr::Err(e) => {
-                                    return ParseResultTraitDef::Err(e);
+                                _ => {
                                 }
+                            }
+                            if tm_lt != "" {
+                                self.advance();
+                                tm_lifetimes.push(tm_lt);
+                                // `'b: 'a` bounds are accepted and not used
+                                if self.match_tok(TokenKind::Colon) {
+                                    loop {
+                                        var tm_is_lt: bool = false;
+                                        match self.peek() {
+                                            TokenKind::Lifetime(_) => {
+                                                tm_is_lt = true;
+                                            }
+                                            _ => {
+                                            }
+                                        }
+                                        if !tm_is_lt {
+                                            break;
+                                        }
+                                        self.advance();
+                                        if !self.match_tok(TokenKind::Plus) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                var tm_tp: str = "";
+                                match self.expect_ident() {
+                                    ParseResultStr::Ok(tpn) => {
+                                        tm_tp = tpn;
+                                    }
+                                    ParseResultStr::Err(e) => {
+                                        return ParseResultTraitDef::Err(e);
+                                    }
+                                }
+                                if self.match_tok(TokenKind::Colon) {
+                                    loop {
+                                        match self.expect_ident() {
+                                            ParseResultStr::Ok(tbn) => {
+                                                tm_bounds.push(StrPair_new(tm_tp, tbn));
+                                            }
+                                            ParseResultStr::Err(e) => {
+                                                return ParseResultTraitDef::Err(e);
+                                            }
+                                        }
+                                        if !self.match_tok(TokenKind::Plus) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                tm_tps.push(tm_tp);
                             }
                             if !self.match_tok(TokenKind::Comma) {
                                 break;
@@ -2028,6 +2376,7 @@ impl Parser {
                                 }
                             }
                             var ty: Type = Type::Void;
+                            var tp_lt_start: i64 = self.lt_seen.len();
                             match self.parse_type() {
                                 ParseResultType::Ok(t) => {
                                     ty = t;
@@ -2036,7 +2385,13 @@ impl Parser {
                                     return ParseResultTraitDef::Err(e);
                                 }
                             }
-                            params.push(Param_new(pname, ty, false));
+                            var tparam: Param = Param_new(pname, ty, false);
+                            // LG3: this parameter's lifetimes, as parse_params
+                            var tp_lts: Vec<str> = pd_lt_since(self.lt_seen, tp_lt_start);
+                            if tp_lts.len() > 0 {
+                                tparam.annotations.push(Annotation_new("lifetime", tp_lts));
+                            }
+                            params.push(tparam);
                         }
                         if !self.match_tok(TokenKind::Comma) {
                             break;
@@ -2052,6 +2407,7 @@ impl Parser {
                 }
 
                 var ret_ty: Type = Type::Void;
+                var tr_lt_start: i64 = self.lt_seen.len();
                 if self.match_tok(TokenKind::Arrow) {
                     match self.parse_type() {
                         ParseResultType::Ok(t) => {
@@ -2060,6 +2416,16 @@ impl Parser {
                         ParseResultType::Err(e) => {
                             return ParseResultTraitDef::Err(e);
                         }
+                    }
+                }
+                // LG3: the result's lifetimes, checked as a function's are
+                var tm_ret_lts: Vec<str> = pd_lt_since(self.lt_seen, tr_lt_start);
+                match pd_check_lifetimes(name + "::" + method_name, tm_lifetimes, params, tm_ret_lts) {
+                    OptStr::Some(tlt_err) => {
+                        var tlt_tok: Token = self.peek_token();
+                        return ParseResultTraitDef::Err("Parse error at " + int_to_str(tlt_tok.line) + ":" + int_to_str(tlt_tok.col) + ": " + tlt_err);
+                    }
+                    OptStr::None => {
                     }
                 }
 
@@ -2098,6 +2464,12 @@ impl Parser {
                 mtm.params = params;
                 mtm.is_pub = is_pub;
                 mtm.default_body = default_body;
+                mtm.type_params = tm_tps;
+                mtm.type_param_bounds = tm_bounds;
+                mtm.is_async = tm_async;
+                if tm_ret_lts.len() > 0 {
+                    mtm.annotations.push(Annotation_new("lifetime", tm_ret_lts));
+                }
                 methods.push(mtm);
             }
         }
@@ -2180,6 +2552,8 @@ impl Parser {
     }
 
     fn parse_func(self: & mut Parser) -> ParseResultFunc {
+        // TL2: the line of `fn`, for diagnostics about the whole function
+        val fn_line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Fn, "fn") {
             ParseResultUnit::Err(e) => {
                 return ParseResultFunc::Err(e);
@@ -2200,11 +2574,54 @@ impl Parser {
         var type_params: Vec<str> = Vec::new();
         var type_param_bounds: Vec<StrPair> = Vec::new();
         var const_params: Vec<StrPair> = Vec::new();
+        // LG3: lifetime parameters, `fn f<'a, 'b: 'a, T>(...)`
+        var lifetime_params: Vec<str> = Vec::new();
         if self.check(TokenKind::Lt) {
             self.advance();
             if !self.check(TokenKind::Gt) {
                 loop {
+                    var lt_name: str = "";
+                    match self.peek() {
+                        TokenKind::Lifetime(ln: str) => {
+                            lt_name = ln;
+                        }
+                        _ => {
+                        }
+                    }
+                    if lt_name != "" {
+                        self.advance();
+                        lifetime_params.push(lt_name);
+                        // `'b: 'a` (outlives bounds) are accepted and not
+                        // used: a result borrows from the parameters that
+                        // carry its lifetimes, whatever outlives what
+                        if self.match_tok(TokenKind::Colon) {
+                            loop {
+                                var is_lt: bool = false;
+                                match self.peek() {
+                                    TokenKind::Lifetime(_) => {
+                                        is_lt = true;
+                                    }
+                                    _ => {
+                                    }
+                                }
+                                if !is_lt {
+                                    break;
+                                }
+                                self.advance();
+                                if !self.match_tok(TokenKind::Plus) {
+                                    break;
+                                }
+                            }
+                        }
+                        if !self.match_tok(TokenKind::Comma) {
+                            break;
+                        }
+                        continue;
+                    }
                     var tp: str = "";
+                    // L8A: `const N: usize` is the same as `N: i64`
+                    if self.match_tok(TokenKind::Const) {
+                    }
                     match self.expect_ident() {
                         ParseResultStr::Ok(s) => {
                             tp = s;
@@ -2219,6 +2636,9 @@ impl Parser {
                             var ty_name: str = type_keyword_name(bound_tok.kind);
                             self.advance();
                             const_params.push(StrPair_new(tp, ty_name));
+                        } else if pd_size_type_tok(bound_tok.kind) {
+                            self.advance();
+                            const_params.push(StrPair_new(tp, "i64"));
                         } else {
                             var bound: str = "";
                             match self.expect_ident() {
@@ -2283,6 +2703,7 @@ impl Parser {
         }
 
         var ret_ty: Type = Type::Void;
+        var ret_lt_start: i64 = self.lt_seen.len();
         if self.match_tok(TokenKind::Arrow) {
             match self.parse_type() {
                 ParseResultType::Ok(t) => {
@@ -2291,6 +2712,23 @@ impl Parser {
                 ParseResultType::Err(e) => {
                     return ParseResultFunc::Err(e);
                 }
+            }
+        }
+        var ret_lts: Vec<str> = pd_lt_since(self.lt_seen, ret_lt_start);
+        // LG3: a method may use the lifetimes its `impl<'a>` declares
+        var gil: i64 = 0;
+        while gil < g_pd_impl_lts.len() {
+            if !str_vec_contains(lifetime_params, g_pd_impl_lts.get(gil)) {
+                lifetime_params.push(g_pd_impl_lts.get(gil));
+            }
+            gil = gil + 1;
+        }
+        match pd_check_lifetimes(name, lifetime_params, params, ret_lts) {
+            OptStr::Some(lt_err) => {
+                var lt_tok: Token = self.peek_token();
+                return ParseResultFunc::Err("Parse error at " + int_to_str(lt_tok.line) + ":" + int_to_str(lt_tok.col) + ": " + lt_err);
+            }
+            OptStr::None => {
             }
         }
 
@@ -2410,6 +2848,13 @@ impl Parser {
         mfunc.has_effect_annotation = has_effect_annotation;
         mfunc.preconditions = preconditions;
         mfunc.postconditions = postconditions;
+        mfunc.line = fn_line;
+        // LG3: the result's lifetimes, `@lifetime("'a")` on the function;
+        // the reference escape check ties the result to exactly the
+        // parameters carrying one of them (compiler/escape.fd)
+        if ret_lts.len() > 0 {
+            mfunc.annotations.push(Annotation_new("lifetime", ret_lts));
+        }
         return ParseResultFunc::Ok(mfunc);
     }
 
@@ -2459,6 +2904,7 @@ impl Parser {
                     }
                 }
                 var ty: Type = Type::Void;
+                var lt_start: i64 = self.lt_seen.len();
                 match self.parse_type() {
                     ParseResultType::Ok(t) => {
                         ty = t;
@@ -2466,6 +2912,12 @@ impl Parser {
                     ParseResultType::Err(e) => {
                         return ParseResultParams::Err(e);
                     }
+                }
+                // LG3: the lifetimes written in this parameter's type, kept
+                // as `@lifetime("'a", ...)` for the reference escape check
+                var p_lts: Vec<str> = pd_lt_since(self.lt_seen, lt_start);
+                if p_lts.len() > 0 {
+                    param_annotations.push(Annotation_new("lifetime", p_lts));
                 }
                 var param: Param = Param_new(name, ty, false);
                 param.is_variadic = is_variadic;
@@ -3194,6 +3646,11 @@ impl Parser {
             if s == "_" {
                 return ParseResultType::Ok(Type::Infer);
             }
+            // `q8` / `q4` (quantized, stored in i8) are type names, not
+            // keywords, so they may also name a variable (bugs 13)
+            if (s == "q8" || s == "q4") && !self.check(TokenKind::DoubleColon) {
+                return ParseResultType::Ok(Type::I8);
+            }
             // Associated type: T::Item or GAT T::Item<X>
             if self.check(TokenKind::DoubleColon) {
                 self.advance();
@@ -3305,14 +3762,41 @@ impl Parser {
                 }
 
                 var args: Vec<Type> = Vec::new();
+                var lt_args: i64 = 0;
                 if !self.check(TokenKind::Gt) {
                     loop {
-                        match self.parse_type() {
-                            ParseResultType::Ok(t) => {
-                                args.push(t);
+                        // L8A: a value argument of a const parameter
+                        // (`Matrix<i64, 3>`), the type `__const_3` (what
+                        // mono substitutes for N in `[T; N]`)
+                        var ctok: Token = self.peek_token();
+                        var const_arg: bool = false;
+                        match ctok.kind {
+                            TokenKind::IntLit(cn: i64) => {
+                                self.advance();
+                                args.push(Type::Named("__const_" + int_to_str(cn)));
+                                const_arg = true;
                             }
-                            ParseResultType::Err(e) => {
-                                return ParseResultType::Err(e);
+                            TokenKind::Lifetime(lta: str) => {
+                                // LG3: `View<'a>`: a lifetime argument is
+                                // not a type argument; the signature being
+                                // parsed records it (parse_params,
+                                // parse_func) as for `&'a T`
+                                self.advance();
+                                self.lt_seen.push(lta);
+                                lt_args = lt_args + 1;
+                                const_arg = true;
+                            }
+                            _ => {
+                            }
+                        }
+                        if !const_arg {
+                            match self.parse_type() {
+                                ParseResultType::Ok(t) => {
+                                    args.push(t);
+                                }
+                                ParseResultType::Err(e) => {
+                                    return ParseResultType::Err(e);
+                                }
                             }
                         }
                         if !self.match_tok(TokenKind::Comma) {
@@ -3326,6 +3810,9 @@ impl Parser {
                     }
                     ParseResultUnit::Ok => {
                     }
+                }
+                if lt_args > 0 && args.len() == 0 {
+                    return ParseResultType::Ok(Type::Named(s));
                 }
                 return ParseResultType::Ok(Type::Generic(s, args));
             }
@@ -3364,9 +3851,19 @@ impl Parser {
             return ParseResultType::Ok(Type::Tuple(types));
         }
 
-        // Reference type: &T or &mut T
+        // Reference type: &T or &mut T, with a lifetime: &'a T, &'a mut T
         if token_kind_eq(k, TokenKind::Ampersand) {
             self.advance();
+            match self.peek() {
+                TokenKind::Lifetime(lt: str) => {
+                    // LG3: the type stays Ref; the name is recorded for the
+                    // signature being parsed (parse_params, parse_func)
+                    self.lt_seen.push(lt);
+                    self.advance();
+                }
+                _ => {
+                }
+            }
             var is_mut: bool = self.match_tok(TokenKind::Mut);
             var inner: Type = Type::Void;
             match self.parse_type() {
@@ -3449,13 +3946,47 @@ impl Parser {
                 _ => {
                 }
             }
-            return ParseResultType::Err("Parse error at " + int_to_str(size_tok.line) + ":" + int_to_str(size_tok.col) + ": expected array size but got '" + token_kind_to_str(size_tok.kind) + "'");
+            return ParseResultType::Err("Parse error at " + int_to_str(size_tok.line) + ":" + int_to_str(size_tok.col) + ": expected array size but got '" + token_kind_to_str(size_tok.kind) + "'\n    Fix: write the size as an integer constant, as in `[i64; 4]`");
         }
 
-        return ParseResultType::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected type but got '" + token_kind_to_str(tok.kind) + "'");
+        return ParseResultType::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": expected type but got '" + token_kind_to_str(tok.kind) + "'\n    Fix: write a type here, as in `i64`, `&str`, `Vec<i64>` or `fn(i64) -> i64`");
+    }
+
+    // F1 (VF3): the parser recurses once per level of brackets, blocks and
+    // prefix operators; past 256 levels it stops with this error instead of
+    // overflowing the compiler's stack. It skips to the end of the file, so
+    // the enclosing levels' recovery does not report it once per level.
+    fn nest_too_deep(self: & mut Parser) -> str {
+        var t: Token = self.peek_token();
+        var msg: str = "Parse error at " + int_to_str(t.line) + ":" + int_to_str(t.col) + ": nested too deeply (more than 256 levels of brackets, blocks or prefix operators)\n    Fix: split the expression into named parts (`val` bindings) or into functions";
+        self.nest_hit = true;
+        while !self.is_at_end() {
+            self.advance();
+        }
+        return msg;
+    }
+
+    // An error to report; after "nested too deeply" (which skipped to the
+    // end of the file), one found at the end is a consequence of it (a
+    // missing `}` per level) and is left out.
+    fn push_parse_error(self: & mut Parser, e: str) {
+        if self.nest_hit && self.is_at_end() && !str_contains(e, "nested too deeply") {
+            return;
+        }
+        self.errors.push(e);
     }
 
     fn parse_block(self: & mut Parser) -> ParseResultStmts {
+        if self.nest_depth >= 256 {
+            return ParseResultStmts::Err(self.nest_too_deep());
+        }
+        self.nest_depth = self.nest_depth + 1;
+        var r: ParseResultStmts = self.parse_block_inner();
+        self.nest_depth = self.nest_depth - 1;
+        return r;
+    }
+
+    fn parse_block_inner(self: & mut Parser) -> ParseResultStmts {
         var stmts: Vec<Stmt> = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
             match self.parse_stmt() {
@@ -3463,7 +3994,7 @@ impl Parser {
                     stmts.push(stmt);
                 }
                 ParseResultStmt::Err(e) => {
-                    self.errors.push(e);
+                    self.push_parse_error(e);
                     self.recover_to_sync_token();
                 }
             }
@@ -3480,6 +4011,10 @@ impl Parser {
         if is_word_keyword(k) && self.pos + 1 < self.tokens.len() {
             var k2: TokenKind = self.tokens.get(self.pos + 1).kind;
             if token_kind_eq(k2, TokenKind::Eq) || token_kind_eq(k2, TokenKind::PlusEq) || token_kind_eq(k2, TokenKind::MinusEq) || token_kind_eq(k2, TokenKind::StarEq) || token_kind_eq(k2, TokenKind::SlashEq) || token_kind_eq(k2, TokenKind::PercentEq) || token_kind_eq(k2, TokenKind::AmpEq) || token_kind_eq(k2, TokenKind::PipeEq) || token_kind_eq(k2, TokenKind::CaretEq) || token_kind_eq(k2, TokenKind::ShlEq) || token_kind_eq(k2, TokenKind::ShrEq) {
+                return self.parse_assign_or_expr();
+            }
+            // nor a field access: `handle.fd = 3;`, `state.n += 1;` (bugs 36)
+            if token_kind_eq(k2, TokenKind::Dot) {
                 return self.parse_assign_or_expr();
             }
         }
@@ -3625,6 +4160,13 @@ impl Parser {
             return self.parse_use_stmt();
         }
         if token_kind_eq(k, TokenKind::Handle) {
+            // `handle(x);` calls a function named handle (reference §1.4);
+            // the handler statement is `handle {`
+            // and anything else not `handle {` uses a variable named handle
+            // (`handle[0] = 1`, `handle.fd`; bugs 36)
+            if self.pos + 1 < self.tokens.len() && !token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::LBrace) {
+                return self.parse_assign_or_expr();
+            }
             return self.parse_handle_stmt();
         }
         if token_kind_eq(k, TokenKind::Do) {
@@ -3758,6 +4300,9 @@ impl Parser {
                     return ParseResultStmt::Err(e);
                 }
             }
+            // LG9: `comptime splice { .. };` as a statement (a splice
+            // leaves its `;` to the expression around it)
+            self.match_tok(TokenKind::Semicolon);
             return ParseResultStmt::Ok(Stmt::Expr(expr, line));
         }
         if token_kind_eq(k, TokenKind::Guard) {
@@ -3770,6 +4315,12 @@ impl Parser {
                 TokenKind::Ident(s: str) => {
                     if s == "parallel" {
                         return self.parse_parallel_stmt();
+                    }
+                    // CA8: `timeout(ms) { .. }` (contextual: `timeout`, a
+                    // parenthesized expression, then `{`; a call `timeout(x);`
+                    // stays a call)
+                    if s == "timeout" && self.timeout_block_ahead() {
+                        return self.parse_timeout_stmt();
                     }
                     // `abort;` inside txn { }: roll the block back and leave it.
                     // A contextual keyword: parsed as a call of the builtin
@@ -3867,7 +4418,7 @@ impl Parser {
                         _ => {
                         }
                     }
-                    return ParseResultStmt::Err("Parse error: index assignment target must be an array variable");
+                    return ParseResultStmt::Err("Parse error: index assignment target must be an array variable\n    Fix: index a variable, `v[i] = x`; for a Vec in a field call set on it, `s.v.set(i, x)`");
                 }
                 Expr::Deref(ptr_expr) => {
                     var rhs: Expr = Expr::IntLit(0);
@@ -3899,8 +4450,7 @@ impl Parser {
                 }
             }
             var err_tok: Token = self.peek_token();
-            var err_msg: str = "Parse error: assignment target must be an identifier or array index at line ";
-            err_msg = err_msg + int_to_str(err_tok.line) + " col " + int_to_str(err_tok.col);
+            var err_msg: str = "Parse error: assignment target must be an identifier or array index at line " + int_to_str(err_tok.line) + " col " + int_to_str(err_tok.col) + "\n    Fix: assign to a variable, a field or an element: `x = v`, `p.x = v`, `a[i] = v`; a call's result cannot be assigned to";
             return ParseResultStmt::Err(err_msg);
         }
 
@@ -4432,7 +4982,7 @@ impl Parser {
                         branch.push(stmt);
                     }
                     ParseResultStmt::Err(e) => {
-                        self.errors.push(e);
+                        self.push_parse_error(e);
                         self.recover_to_sync_token();
                     }
                 }
@@ -5158,6 +5708,136 @@ impl Parser {
         return ParseResultStmt::Ok(Stmt::CancelScope(line));
     }
 
+    // CA8: at the identifier `timeout`: is it `timeout( .. ) {`? The `(`
+    // must follow at once and its `)` be followed by `{`; a `;` before the
+    // `)` closes means a call.
+    fn timeout_block_ahead(self: & Parser) -> bool {
+        if self.pos + 3 >= self.tokens.len() {
+            return false;
+        }
+        if !token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::LParen) {
+            return false;
+        }
+        var depth: i64 = 0;
+        var i: i64 = self.pos + 1;
+        while i < self.tokens.len() {
+            var tk: TokenKind = self.tokens.get(i).kind;
+            if token_kind_eq(tk, TokenKind::LParen) {
+                depth = depth + 1;
+            } else if token_kind_eq(tk, TokenKind::RParen) {
+                depth = depth - 1;
+                if depth == 0 {
+                    return i + 1 < self.tokens.len() && token_kind_eq(self.tokens.get(i + 1).kind, TokenKind::LBrace);
+                }
+            } else if token_kind_eq(tk, TokenKind::Semicolon) || token_kind_eq(tk, TokenKind::Eof) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // CA8: `timeout(ms) { body }`, optionally followed by `else { late }`.
+    // The body runs with a token that cancels itself `ms` milliseconds after
+    // the block starts installed in the running task's token slot, so every
+    // wait inside it that respects cancellation (stdlib/task.fd) gives up at
+    // the deadline without being handed the token; the slot gets its old
+    // token back when the body ends, however it ends. `late` runs after the
+    // body when the deadline passed (or the token was cancelled) while the
+    // body ran. Parsed to ordinary statements, so every pass sees ordinary
+    // code:
+    //     if __timeout_block(ms) { body }
+    // and with `else`:
+    //     if true { if __timeout_block(ms) { body } if __timeout_expired() { late } }
+    // The type checker types both markers as bool; lower.fd
+    // Lowerer_lower_timeout runs the body unconditionally with the token
+    // installed (docs/reference/timeout-blocks.md).
+    fn parse_timeout_stmt(self: & mut Parser) -> ParseResultStmt {
+        var line: i64 = self.peek_token().line;
+        self.advance();
+        match self.expect(TokenKind::LParen, "(") {
+            ParseResultUnit::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+            ParseResultUnit::Ok => {
+            }
+        }
+        var ms: Expr = Expr::IntLit(0);
+        match self.parse_expr() {
+            ParseResultExpr::Ok(e2) => {
+                ms = e2;
+            }
+            ParseResultExpr::Err(e2) => {
+                return ParseResultStmt::Err(e2);
+            }
+        }
+        match self.expect(TokenKind::RParen, ")") {
+            ParseResultUnit::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+            ParseResultUnit::Ok => {
+            }
+        }
+        match self.expect(TokenKind::LBrace, "{") {
+            ParseResultUnit::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+            ParseResultUnit::Ok => {
+            }
+        }
+        var body: Vec<Stmt> = Vec::new();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b) => {
+                body = b;
+            }
+            ParseResultStmts::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+            ParseResultUnit::Ok => {
+            }
+        }
+        var targs: Vec<Expr> = Vec::new();
+        targs.push(ms);
+        var guarded: Stmt = Stmt::If(Expr::Call("__timeout_block", targs), body, OptStmts::None, line);
+        if !self.check(TokenKind::Else) {
+            return ParseResultStmt::Ok(guarded);
+        }
+        self.advance();
+        match self.expect(TokenKind::LBrace, "{") {
+            ParseResultUnit::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+            ParseResultUnit::Ok => {
+            }
+        }
+        var late: Vec<Stmt> = Vec::new();
+        match self.parse_block() {
+            ParseResultStmts::Ok(b2) => {
+                late = b2;
+            }
+            ParseResultStmts::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+        }
+        match self.expect(TokenKind::RBrace, "}") {
+            ParseResultUnit::Err(e) => {
+                return ParseResultStmt::Err(e);
+            }
+            ParseResultUnit::Ok => {
+            }
+        }
+        var outer: Vec<Stmt> = Vec::new();
+        outer.push(guarded);
+        var no_args: Vec<Expr> = Vec::new();
+        outer.push(Stmt::If(Expr::Call("__timeout_expired", no_args), late, OptStmts::None, line));
+        return ParseResultStmt::Ok(Stmt::If(Expr::BoolLit(true), outer, OptStmts::None, line));
+    }
+
     fn parse_region_block(self: & mut Parser) -> ParseResultStmt {
         var line: i64 = self.peek_token().line;
         match self.expect(TokenKind::Region, "region") {
@@ -5489,7 +6169,7 @@ impl Parser {
                     _ => {
                     }
                 }
-                return ParseResultPattern::Err("Parse error at " + int_to_str(end_tok.line) + ":" + int_to_str(end_tok.col) + ": expected int after ..=");
+                return ParseResultPattern::Err("Parse error at " + int_to_str(end_tok.line) + ":" + int_to_str(end_tok.col) + ": expected int after ..=\n    Fix: end a range pattern with an integer literal, as in `0..=9`");
             }
             if self.check(TokenKind::DotDot) {
                 self.advance();
@@ -5502,7 +6182,7 @@ impl Parser {
                     _ => {
                     }
                 }
-                return ParseResultPattern::Err("Parse error at " + int_to_str(end_tok.line) + ":" + int_to_str(end_tok.col) + ": expected int after ..");
+                return ParseResultPattern::Err("Parse error at " + int_to_str(end_tok.line) + ":" + int_to_str(end_tok.col) + ": expected int after ..\n    Fix: end a range pattern with an integer literal, as in `0..10`");
             }
             return ParseResultPattern::Ok(Pattern::IntLit(n));
         }
@@ -5604,7 +6284,7 @@ impl Parser {
             return ParseResultPattern::Ok(Pattern::Ident(name));
         }
 
-        return ParseResultPattern::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": invalid pattern '" + token_kind_to_str(tok.kind) + "'");
+        return ParseResultPattern::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": invalid pattern '" + token_kind_to_str(tok.kind) + "'\n    Fix: a pattern is a literal, a name, `_`, a range `0..=9`, a tuple `(a, b)`, a struct or an enum variant `Some(x)`");
     }
 
     /// One argument inside `Ctor(...)`: either a plain `name [: ty]` binding
@@ -6217,11 +6897,34 @@ impl Parser {
     }
 
     fn parse_unary(self: & mut Parser) -> ParseResultExpr {
+        // F1: one level of nesting (see nest_too_deep)
+        if self.nest_depth >= 256 {
+            return ParseResultExpr::Err(self.nest_too_deep());
+        }
+        self.nest_depth = self.nest_depth + 1;
+        var r: ParseResultExpr = self.parse_unary_inner();
+        self.nest_depth = self.nest_depth - 1;
+        return r;
+    }
+
+    // F1: the operand of a prefix operator. Before a parenthesis the operator
+    // adds no level of its own: the parenthesis's expression is one
+    // (parse_unary counts it), so `-(-(-(x)))` nests one level per `-(`
+    // (test_verify_parser_nesting_ok.fd's 200 of them were counted as 400
+    // and rejected). Any other operand is a level, as before: `- - - x`.
+    fn parse_prefix_operand(self: & mut Parser) -> ParseResultExpr {
+        if self.check(TokenKind::LParen) {
+            return self.parse_unary_inner();
+        }
+        return self.parse_unary();
+    }
+
+    fn parse_unary_inner(self: & mut Parser) -> ParseResultExpr {
         var k: TokenKind = self.peek();
         if token_kind_eq(k, TokenKind::Minus) {
             self.advance();
             var expr: Expr = Expr::IntLit(0);
-            match self.parse_unary() {
+            match self.parse_prefix_operand() {
                 ParseResultExpr::Ok(e) => {
                     expr = e;
                 }
@@ -6234,7 +6937,7 @@ impl Parser {
         if token_kind_eq(k, TokenKind::Bang) {
             self.advance();
             var expr: Expr = Expr::IntLit(0);
-            match self.parse_unary() {
+            match self.parse_prefix_operand() {
                 ParseResultExpr::Ok(e) => {
                     expr = e;
                 }
@@ -6247,7 +6950,7 @@ impl Parser {
         if token_kind_eq(k, TokenKind::Tilde) {
             self.advance();
             var expr: Expr = Expr::IntLit(0);
-            match self.parse_unary() {
+            match self.parse_prefix_operand() {
                 ParseResultExpr::Ok(e) => {
                     expr = e;
                 }
@@ -6261,7 +6964,7 @@ impl Parser {
             self.advance();
             var is_mut: bool = self.match_tok(TokenKind::Mut);
             var expr: Expr = Expr::IntLit(0);
-            match self.parse_unary() {
+            match self.parse_prefix_operand() {
                 ParseResultExpr::Ok(e) => {
                     expr = e;
                 }
@@ -6274,7 +6977,7 @@ impl Parser {
         if token_kind_eq(k, TokenKind::Star) {
             self.advance();
             var expr: Expr = Expr::IntLit(0);
-            match self.parse_unary() {
+            match self.parse_prefix_operand() {
                 ParseResultExpr::Ok(e) => {
                     expr = e;
                 }
@@ -6315,6 +7018,67 @@ impl Parser {
             }
             self.match_tok(TokenKind::Semicolon);
             return ParseResultExpr::Ok(Expr::ComptimeBlock(stmts));
+        }
+        // LG9: comptime splice { block } -- the block runs at compile time
+        // and returns source text, which process_gen (comptime_eval.fd)
+        // parses as one expression and puts here, before type checking.
+        // The splice's line rides along as the second argument.
+        match self.peek() {
+            TokenKind::Ident(sp_name) => {
+                if sp_name == "splice" && token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::LBrace) {
+                    var sp_line: i64 = self.peek_token().line;
+                    self.advance();
+                    self.advance();
+                    var sp_block: Vec<Stmt> = Vec::new();
+                    match self.parse_block() {
+                        ParseResultStmts::Ok(b) => {
+                            sp_block = b;
+                        }
+                        ParseResultStmts::Err(e) => {
+                            return ParseResultExpr::Err(e);
+                        }
+                    }
+                    match self.expect(TokenKind::RBrace, "}") {
+                        ParseResultUnit::Err(e) => {
+                            return ParseResultExpr::Err(e);
+                        }
+                        ParseResultUnit::Ok => {
+                        }
+                    }
+                    g_saw_splice = true;
+                    var sp_args: Vec<Expr> = Vec::new();
+                    sp_args.push(Expr::ComptimeBlock(sp_block));
+                    sp_args.push(Expr::IntLit(sp_line));
+                    return ParseResultExpr::Ok(Expr::Call("__comptime_splice", sp_args));
+                }
+                // CL6: `comptime splice make(args)` -- a macro call in an
+                // expression: the call (a `comptime fn` returning source
+                // text) is the splice's block, `{ return make(args); }`.
+                // `comptime splice(x)` stays a comptime call of a function
+                // named splice (the word is followed by `(`, not a name).
+                if sp_name == "splice" && token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::Ident("")) {
+                    var spc_line: i64 = self.peek_token().line;
+                    self.advance();
+                    var spc_call: Expr = Expr::IntLit(0);
+                    match self.parse_postfix() {
+                        ParseResultExpr::Ok(ce) => {
+                            spc_call = ce;
+                        }
+                        ParseResultExpr::Err(e) => {
+                            return ParseResultExpr::Err(e);
+                        }
+                    }
+                    g_saw_splice = true;
+                    var spc_block: Vec<Stmt> = Vec::new();
+                    spc_block.push(Stmt::Return(OptBoxExpr::Some(Box::new(spc_call)), spc_line));
+                    var spc_args: Vec<Expr> = Vec::new();
+                    spc_args.push(Expr::ComptimeBlock(spc_block));
+                    spc_args.push(Expr::IntLit(spc_line));
+                    return ParseResultExpr::Ok(Expr::Call("__comptime_splice", spc_args));
+                }
+            }
+            _ => {
+            }
         }
         // comptime type_name(T) / is_struct(T) / ... -- compile-time reflection
         match self.peek() {
@@ -6463,6 +7227,12 @@ impl Parser {
         }
         loop {
             if self.match_tok(TokenKind::Dot) {
+                // `p.0`: reference §3.2/§5.1 reads a tuple by destructuring,
+                // there is no `.N` (bugs 16); say so
+                var dot_tok: Token = self.peek_token();
+                if token_kind_eq(dot_tok.kind, TokenKind::IntLit(0)) || token_kind_eq(dot_tok.kind, TokenKind::FloatLit(0.0)) {
+                    return ParseResultExpr::Err("Parse error at " + int_to_str(dot_tok.line) + ":" + int_to_str(dot_tok.col) + ": a tuple element is not read with `.N` (reference §5.1).\n    Fix: destructure it, `val (a, b) = p;`, or use a struct with named fields.");
+                }
                 var field: str = "";
                 match self.expect_ident_or_keyword() {
                     ParseResultStr::Ok(s) => {
@@ -6554,6 +7324,29 @@ impl Parser {
                     }
                 }
                 expr = Expr::QuantCast(Box::new(expr), target_ty);
+            } else if self.check(TokenKind::LParen) && self.pos > 0 && self.tokens.get(self.pos - 1).line == self.peek_token().line {
+                // Calling a call's (or any expression's) result, on the same
+                // line: `f(1)(5)`, `fs.get(1)(5)` (bugs 38). A call names
+                // its callee, so the value goes into a local first:
+                // `{ val __pcall_k = f(1); __pcall_k(5) }`. A `(` on the
+                // next line starts a statement (semicolons are optional).
+                var pc_line: i64 = self.peek_token().line;
+                self.advance();
+                var pc_name: str = "__pcall_" + int_to_str(g_pd_pcall_n);
+                g_pd_pcall_n = g_pd_pcall_n + 1;
+                var pc_call: Expr = Expr::IntLit(0);
+                match self.parse_call_expr(pc_name) {
+                    ParseResultExpr::Ok(ce) => {
+                        pc_call = ce;
+                    }
+                    ParseResultExpr::Err(e) => {
+                        return ParseResultExpr::Err(e);
+                    }
+                }
+                var pc_stmts: Vec<Stmt> = Vec::new();
+                pc_stmts.push(Stmt::Let(pc_name, OptType::None, expr, false, false, Vec::new(), pc_line));
+                pc_stmts.push(Stmt::Expr(pc_call, pc_line));
+                expr = Expr::Block(pc_stmts);
             } else {
                 break;
             }
@@ -6675,7 +7468,7 @@ impl Parser {
                 }
             }
             if scrut2 == "" {
-                return ParseResultExpr::Err("Parse error at " + int_to_str(pat_line) + ": nested patterns in match expressions need a variable scrutinee");
+                return ParseResultExpr::Err("Parse error at " + int_to_str(pat_line) + ": nested patterns in match expressions need a variable scrutinee\n    Fix: bind the value first, `val v = expr;`, then `match v { ... }`");
             }
             arms = self.pd_desugar_arms(scrut2, arms, nests, marks, 0, pat_line, true);
             return ParseResultExpr::Ok(Expr::Match(Box::new(Expr::Ident(scrut2)), arms));
@@ -6767,6 +7560,18 @@ impl Parser {
             loop {
                 if self.check(TokenKind::DotDot) {
                     self.advance();
+                    // CL5: a bare `..` (then `}` or `,`): the fields left out
+                    // take the struct's defaults
+                    if self.check(TokenKind::RBrace) || self.check(TokenKind::Comma) {
+                        spread = OptBoxExpr::Some(Box::new(ast_spread_defaults()));
+                        if !self.match_tok(TokenKind::Comma) {
+                            break;
+                        }
+                        if self.check(TokenKind::RBrace) {
+                            break;
+                        }
+                        continue;
+                    }
                     match self.parse_expr() {
                         ParseResultExpr::Ok(se) => {
                             spread = OptBoxExpr::Some(Box::new(se));
@@ -7268,6 +8073,28 @@ impl Parser {
         // Spawn
         if token_kind_eq(k, TokenKind::Spawn) {
             self.advance();
+            // CA6: `spawn detached f(x)` lets the task go by name (contextual:
+            // `detached` followed by a name; `spawn detached(x)` is still a
+            // call of a function named detached). It is the call
+            // `__spawn_detached(spawn f(x))`: the type checker accepts it
+            // without a kept handle, lowering lets the task go.
+            var detached: bool = false;
+            if self.pos + 1 < self.tokens.len() {
+                var dt0: Token = self.tokens.get(self.pos);
+                var dt1: Token = self.tokens.get(self.pos + 1);
+                match dt0.kind {
+                    TokenKind::Ident(dname) => {
+                        if dname == "detached" && token_kind_eq(dt1.kind, TokenKind::Ident("")) {
+                            detached = true;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            if detached {
+                self.advance();
+            }
             var e: Expr = Expr::IntLit(0);
             match self.parse_unary() {
                 ParseResultExpr::Ok(ae) => {
@@ -7276,6 +8103,11 @@ impl Parser {
                 ParseResultExpr::Err(e2) => {
                     return ParseResultExpr::Err(e2);
                 }
+            }
+            if detached {
+                var dargs: Vec<Expr> = Vec::new();
+                dargs.push(Expr::Spawn(Box::new(e)));
+                return ParseResultExpr::Ok(Expr::Call("__spawn_detached", dargs));
             }
             return ParseResultExpr::Ok(Expr::Spawn(Box::new(e)));
         }
@@ -7297,10 +8129,15 @@ impl Parser {
         if is_word_keyword(k) {
             var kw_str: str = token_kind_to_str(k);
             self.advance();
+            // reference §1.4: a word keyword may name a function, and
+            // `handle(x)` calls it (as for an identifier)
+            if self.match_tok(TokenKind::LParen) {
+                return self.parse_call_expr(kw_str);
+            }
             return ParseResultExpr::Ok(Expr::Ident(kw_str));
         }
         // Not a valid primary expression
-        return ParseResultExpr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": unexpected token '" + token_kind_to_str(k) + "'");
+        return ParseResultExpr::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": unexpected token '" + token_kind_to_str(k) + "'\n    Fix: an expression goes here; look for a missing operand, a stray symbol, or a `;` or `}` missing before it");
     }
 
     fn parse_asm(self: & mut Parser) -> ParseResultExpr {
@@ -7323,7 +8160,7 @@ impl Parser {
             }
         }
         if str_len(template) == 0 {
-            return ParseResultExpr::Err("Parse error: asm! first argument must be a string template");
+            return ParseResultExpr::Err("Parse error: asm! first argument must be a string template\n    Fix: give the instructions first, as a string: asm!(\"nop\"), then the operands");
         }
         // Operands
         var operands: Vec<AsmOperand> = Vec::new();
@@ -7353,7 +8190,7 @@ impl Parser {
                     }
                 }
                 if !got_dir {
-                    return ParseResultExpr::Err("Parse error: asm! operand must start with 'in', 'out', or 'clobber'");
+                    return ParseResultExpr::Err("Parse error: asm! operand must start with 'in', 'out', or 'clobber'\n    Fix: write each operand as in(\"reg\") value, out(\"reg\") variable or clobber(\"reg\")");
                 }
             }
             match self.expect(TokenKind::LParen, "(") {
@@ -7374,7 +8211,7 @@ impl Parser {
                 }
             }
             if str_len(reg) == 0 {
-                return ParseResultExpr::Err("Parse error: asm! register must be a string");
+                return ParseResultExpr::Err("Parse error: asm! register must be a string\n    Fix: name the register in quotes, as in in(\"rax\") x");
             }
             match self.expect(TokenKind::RParen, ")") {
                 ParseResultUnit::Err(e) => {
@@ -7644,6 +8481,10 @@ impl Parser {
         if self.pos + 2 >= self.tokens.len() {
             return false;
         }
+        // `Name { ..` (CL5 defaults, or `..base`): no block starts with `..`
+        if token_kind_eq(self.tokens.get(self.pos + 1).kind, TokenKind::DotDot) {
+            return true;
+        }
         var is_id: bool = false;
         match self.tokens.get(self.pos + 1).kind {
             TokenKind::Ident(_fi: str) => {
@@ -7651,6 +8492,11 @@ impl Parser {
             }
             _ => {
             }
+        }
+        // a word keyword names a field too (`BlockDev { handle: h, .. }`,
+        // bugs 11/24): no statement starts with `keyword :` either
+        if is_word_keyword(self.tokens.get(self.pos + 1).kind) {
+            is_id = true;
         }
         return is_id && token_kind_eq(self.tokens.get(self.pos + 2).kind, TokenKind::Colon);
     }
@@ -7688,10 +8534,36 @@ impl Parser {
             _ => {
             }
         }
-        if !ok || !str_ends_with(hpath, ".h") {
-            return ParseResultImportDef::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": @import takes a C header name, as in @import(\"foo.h\")");
+        // LG16: a C++ header too (`@import("lib.hpp")`: its extern "C" part)
+        var hext: i64 = 2;
+        if ok && str_ends_with(hpath, ".hpp") {
+            hext = 4;
+        } else if ok && str_ends_with(hpath, ".h") == false {
+            ok = false;
+        }
+        if !ok {
+            return ParseResultImportDef::Err("Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": @import takes a C header name, as in @import(\"foo.h\")\n    Fix: put the header's name in quotes inside the parentheses");
         }
         self.advance();
+        // LG15: `@import("foo.h", trusted)`: its functions are called
+        // without `unsafe` (the author vouches for the header)
+        var trusted: bool = false;
+        if self.match_tok(TokenKind::Comma) {
+            var ttok: Token = self.peek_token();
+            match ttok.kind {
+                TokenKind::Ident(tw: str) => {
+                    if tw == "trusted" {
+                        trusted = true;
+                    }
+                }
+                _ => {
+                }
+            }
+            if trusted == false {
+                return ParseResultImportDef::Err("Parse error at " + int_to_str(ttok.line) + ":" + int_to_str(ttok.col) + ": @import takes a header name and, optionally, `trusted`: @import(\"foo.h\", trusted)\n    Fix: after the header's name write only `, trusted`, or nothing");
+            }
+            self.advance();
+        }
         match self.expect(TokenKind::RParen, ")") {
             ParseResultUnit::Err(e) => {
                 return ParseResultImportDef::Err(e);
@@ -7700,8 +8572,16 @@ impl Parser {
             }
         }
         self.match_tok(TokenKind::Semicolon);
-        var base: str = str_slice(hpath, 0, str_len(hpath) - 2);
-        return ParseResultImportDef::Ok(ImportDef_new_full(str_replace(base, "/", "::"), Vec::new(), Vec::new(), OptStr::None, OptStr::None, false, false));
+        var base: str = str_slice(hpath, 0, str_len(hpath) - hext);
+        var ipath: str = str_replace(base, "/", "::");
+        // LG15: the import loop also looks in the system include directories
+        // for a header written as @import (flag 1), and marks a trusted one (2)
+        var iflags: i64 = 1;
+        if trusted {
+            iflags = 3;
+        }
+        HashMap_insert(g_at_imports, ipath, iflags);
+        return ParseResultImportDef::Ok(ImportDef_new_full(ipath, Vec::new(), Vec::new(), OptStr::None, OptStr::None, false, false));
     }
 
     fn parse_use(self: & mut Parser) -> ParseResultImportDef {
@@ -7834,7 +8714,7 @@ impl Parser {
                     version = OptStr::Some(s);
                 }
                 _ => {
-                    return ParseResultImportDef::Err("Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) + ": expected version string but got '" + token_kind_to_str(vtok.kind) + "'");
+                    return ParseResultImportDef::Err("Parse error at " + int_to_str(vtok.line) + ":" + int_to_str(vtok.col) + ": expected version string but got '" + token_kind_to_str(vtok.kind) + "'\n    Fix: write the version in quotes after `=`, as in = \"0.1.0\"");
                 }
             }
         }
@@ -7905,7 +8785,7 @@ impl Parser {
         }
         if str_len(name) == 0 {
             var ptok: Token = self.peek_token();
-            return ParseResultAnnotation::Err("Parse error at " + int_to_str(ptok.line) + ":" + int_to_str(ptok.col) + ": expected annotation name after '@'");
+            return ParseResultAnnotation::Err("Parse error at " + int_to_str(ptok.line) + ":" + int_to_str(ptok.col) + ": expected annotation name after '@'\n    Fix: write the annotation's name right after @, as in @inline");
         }
         var args: Vec<str> = Vec::new();
         if self.match_tok(TokenKind::LParen) {
@@ -7959,6 +8839,23 @@ impl Parser {
                 }
                 return ParseResultStr::Ok(arg);
             }
+            TokenKind::Use => {
+                // CU3: `@deprecated(use = "new_fn")` (`use` is a keyword)
+                self.advance();
+                arg = "use";
+                if self.match_tok(TokenKind::Eq) {
+                    arg = arg + "=";
+                    match self.parse_annotation_arg() {
+                        ParseResultStr::Ok(rest) => {
+                            arg = arg + rest;
+                        }
+                        ParseResultStr::Err(e) => {
+                            return ParseResultStr::Err(e);
+                        }
+                    }
+                }
+                return ParseResultStr::Ok(arg);
+            }
             TokenKind::IntLit(n: i64) => {
                 self.advance();
                 return ParseResultStr::Ok(int_to_str(n));
@@ -7966,6 +8863,24 @@ impl Parser {
             TokenKind::FloatLit(f: f64) => {
                 self.advance();
                 return ParseResultStr::Ok(float_to_str(f));
+            }
+            TokenKind::Minus => {
+                // CL10: a negative number (`@dimension(s = -2)`)
+                self.advance();
+                var ntok: Token = self.peek_token();
+                match ntok.kind {
+                    TokenKind::IntLit(nn: i64) => {
+                        self.advance();
+                        return ParseResultStr::Ok("-" + int_to_str(nn));
+                    }
+                    TokenKind::FloatLit(nf: f64) => {
+                        self.advance();
+                        return ParseResultStr::Ok("-" + float_to_str(nf));
+                    }
+                    _ => {
+                    }
+                }
+                return ParseResultStr::Err("Expected a number after '-' in an annotation argument, got '" + token_kind_to_str(ntok.kind) + "'");
             }
             TokenKind::StringLit(s: str) => {
                 self.advance();
@@ -8033,12 +8948,30 @@ impl Parser {
             if !self.check(TokenKind::RParen) {
                 loop {
                     var arg: str = "";
-                    match self.expect_ident() {
-                        ParseResultStr::Ok(s) => {
-                            arg = s;
+                    // ST3: a number or a string too (`#[edition(2026)]`)
+                    var lit_arg: bool = false;
+                    match self.peek() {
+                        TokenKind::IntLit(an: i64) => {
+                            arg = int_to_str(an);
+                            lit_arg = true;
                         }
-                        ParseResultStr::Err(e) => {
-                            return ParseResultAttribute::Err(e);
+                        TokenKind::StringLit(asv: str) => {
+                            arg = asv;
+                            lit_arg = true;
+                        }
+                        _ => {
+                        }
+                    }
+                    if lit_arg {
+                        self.advance();
+                    } else {
+                        match self.expect_ident() {
+                            ParseResultStr::Ok(s) => {
+                                arg = s;
+                            }
+                            ParseResultStr::Err(e) => {
+                                return ParseResultAttribute::Err(e);
+                            }
                         }
                     }
                     args.push(arg);
@@ -8143,7 +9076,7 @@ pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names:
         ei = ei + 1;
     }
     return Parser {
-        tokens: tokens, pos: 0, struct_names: struct_names, enum_names: enum_names, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256,
+        tokens: tokens, pos: 0, struct_names: struct_names, enum_names: enum_names, struct_name_set: sn_set, enum_name_set: en_set, alias_set: HashMap_new(), errors: Vec::new(), expr_depth: 0, max_expr_depth: 256, nest_depth: 0, nest_hit: false, lt_seen: Vec::new(),
     };
 }
 
@@ -8159,6 +9092,139 @@ pub fn vec_str_join(v: Vec<str>, sep: str) -> str {
         i = i + 1;
     }
     return result;
+}
+
+fn pd_has_cfg(f: Func) -> bool {
+    var i: i64 = 0;
+    while i < f.annotations.len() {
+        if f.annotations.get(i).name == "cfg" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// L8H: functions of one name in a file, at least one of them generic, are
+/// a definition and its specializations (`fn show<T>(x: T)` with
+/// `fn show(x: i64)`). The most general (the most type parameters, the
+/// first of those) keeps the name; each other one is renamed
+/// `name__spec<k>` (ast.fd spec_base_name), so it is no duplicate, and
+/// monomorphization takes an instantiation's body from the most specific
+/// one that takes its types. @cfg variants are not grouped.
+fn pd_name_specializations(program: & mut Program) {
+    val n: i64 = program.funcs.len();
+    if n < 2 {
+        return;
+    }
+    var count: i64 = HashMap_new();
+    var generic: i64 = HashMap_new();
+    var i: i64 = 0;
+    var any: bool = false;
+    while i < n {
+        if !pd_has_cfg(program.funcs.get(i)) {
+            val fname: str = program.funcs.get(i).name;
+            val c: i64 = HashMap_get(count, fname) + 1;
+            HashMap_insert(count, fname, c);
+            if program.funcs.get(i).type_params.len() > 0 {
+                HashMap_insert(generic, fname, 1);
+            }
+            if c > 1 && HashMap_get(generic, fname) != 0 {
+                any = true;
+            }
+        }
+        i = i + 1;
+    }
+    if !any {
+        // a generic seen after a second definition of its name
+        i = 0;
+        while i < n && !any {
+            val gname: str = program.funcs.get(i).name;
+            if HashMap_get(count, gname) > 1 && HashMap_get(generic, gname) != 0 {
+                any = true;
+            }
+            i = i + 1;
+        }
+    }
+    if !any {
+        HashMap_drop(count);
+        HashMap_drop(generic);
+        return;
+    }
+    // the definition that keeps the name (1 + its index): the first generic
+    // one whose parameters take every other one's (ast.fd spec_at_least),
+    // else the one with the most type parameters
+    var base_at: i64 = HashMap_new();
+    var base_tp: i64 = HashMap_new();
+    i = 0;
+    while i < n {
+        if !pd_has_cfg(program.funcs.get(i)) {
+            val bname: str = program.funcs.get(i).name;
+            if HashMap_get(count, bname) > 1 && HashMap_get(generic, bname) != 0 {
+                val cur: i64 = HashMap_get(base_tp, bname);
+                if cur == 0 || program.funcs.get(i).type_params.len() > program.funcs.get(cur - 1).type_params.len() {
+                    HashMap_insert(base_tp, bname, i + 1);
+                }
+                if HashMap_get(base_at, bname) == 0 && program.funcs.get(i).type_params.len() > 0 {
+                    var general: bool = true;
+                    var j: i64 = 0;
+                    while j < n && general {
+                        if j != i && program.funcs.get(j).name == bname && !pd_has_cfg(program.funcs.get(j)) {
+                            if !spec_at_least(program.funcs.get(j), program.funcs.get(i)) {
+                                general = false;
+                            }
+                        }
+                        j = j + 1;
+                    }
+                    if general {
+                        HashMap_insert(base_at, bname, i + 1);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        val tname: str = program.funcs.get(i).name;
+        if HashMap_get(base_at, tname) == 0 && HashMap_get(base_tp, tname) != 0 {
+            HashMap_insert(base_at, tname, HashMap_get(base_tp, tname));
+        }
+        i = i + 1;
+    }
+    HashMap_drop(base_tp);
+    var spec_n: i64 = HashMap_new();
+    var funcs: Vec<Func> = Vec::new();
+    i = 0;
+    while i < n {
+        var f: Func = program.funcs.get(i);
+        val at: i64 = HashMap_get(base_at, f.name);
+        if at != 0 && at != i + 1 && !pd_has_cfg(f) {
+            val k: i64 = HashMap_get(spec_n, f.name) + 1;
+            HashMap_insert(spec_n, f.name, k);
+            f.name = f.name + "__spec" + int_to_str(k);
+        }
+        funcs.push(f);
+        i = i + 1;
+    }
+    program.funcs = funcs;
+    HashMap_drop(count);
+    HashMap_drop(generic);
+    HashMap_drop(base_at);
+    HashMap_drop(spec_n);
+}
+
+/// L8A: `usize` / `isize` after a const parameter (`const N: usize`):
+/// words, not type keywords, read as i64.
+pub fn pd_size_type_tok(kind: TokenKind) -> bool {
+    match kind {
+        TokenKind::Ident(w: str) => {
+            return w == "usize" || w == "isize";
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 pub fn is_int_type_keyword(kind: TokenKind) -> bool {
@@ -8193,6 +9259,29 @@ pub fn is_int_type_keyword(kind: TokenKind) -> bool {
         return true;
     }
     return false;
+}
+
+/// The error for a name expected where a reserved type name stands
+/// (`val f32: i64 = 1;`): says the word is reserved (bugs 13/26), rather
+/// than "expected identifier but got 'F32'".
+pub fn pd_expected_name_err(tok: Token) -> str {
+    var w: str = type_keyword_name(tok.kind);
+    if token_kind_eq(tok.kind, TokenKind::F32) {
+        w = "f32";
+    } else if token_kind_eq(tok.kind, TokenKind::F64) {
+        w = "f64";
+    } else if token_kind_eq(tok.kind, TokenKind::Bool) {
+        w = "bool";
+    } else if token_kind_eq(tok.kind, TokenKind::Str) {
+        w = "str";
+    } else if token_kind_eq(tok.kind, TokenKind::Void) {
+        w = "void";
+    }
+    var at: str = "Parse error at " + int_to_str(tok.line) + ":" + int_to_str(tok.col) + ": ";
+    if str_len(w) > 0 {
+        return at + "expected a name but got the type name `" + w + "`: type names are reserved and cannot name a variable, parameter, field or function (reference §1.4); pick another name (`" + w + "_v`)";
+    }
+    return at + "expected identifier but got '" + token_kind_to_str(tok.kind) + "'";
 }
 
 pub fn type_keyword_name(kind: TokenKind) -> str {
@@ -8343,6 +9432,43 @@ var g_saw_secret: bool = false; pub fn parser_saw_secret() -> bool {
     return g_saw_secret;
 }
 
+// LG9: a `comptime splice { }` was parsed: process_gen (comptime_eval.fd)
+// has splices to expand (it walks the program only then).
+var g_saw_splice: bool = false; pub fn parser_saw_splice() -> bool {
+    return g_saw_splice;
+}
+
+/// LG9: the text a `comptime splice { }` block returned, parsed as exactly
+/// one expression. The tokens count lines from `line` (the splice's), so an
+/// error inside the generated expression points at the splice;
+/// `struct_names` / `enum_names` are the program's, so `Name { .. }` and
+/// `Name::V` in the text parse as they would in the source. Err: why the
+/// text is not one expression.
+pub fn parse_expression_source(source: str, line: i64, struct_names: Vec<str>, enum_names: Vec<str>) -> ParseResultExpr {
+    var lex: Lexer = Lexer::new(source);
+    lex.line = line;
+    var tokens: Vec<Token> = lex.tokenize();
+    if lex.errors.len() > 0 {
+        return ParseResultExpr::Err(lex.errors.get(0));
+    }
+    var p: Parser = Parser_with_names(tokens, struct_names, enum_names);
+    if p.is_at_end() {
+        return ParseResultExpr::Err("the text is empty");
+    }
+    match p.parse_expr() {
+        ParseResultExpr::Ok(e) => {
+            if !p.is_at_end() {
+                return ParseResultExpr::Err("text follows the expression, from '" + token_kind_to_str(p.peek()) + "' on");
+            }
+            return ParseResultExpr::Ok(e);
+        }
+        ParseResultExpr::Err(m) => {
+            return ParseResultExpr::Err(m);
+        }
+    }
+    return ParseResultExpr::Err("the text is not an expression");
+}
+
 /// RT6: `var v = Vec::new()` written without a type takes its element type
 /// from a later `v.push(x)` in the same block (nested blocks included) whose
 /// argument is a float, string or bool literal; without it the element was
@@ -8384,10 +9510,22 @@ fn pd_infer_vec_lets(stmts: Vec<Stmt>) -> Vec<Stmt> {
                 if untyped && pd_is_vec_new(init) {
                     var et: Type = Type::Infer;
                     var j: i64 = i + 1;
+                    // B19: a pushed variable declared earlier in this block
+                    // gives its type too (pd_arg_type)
+                    g_pd_decl_names = Vec::new();
+                    g_pd_decl_types = Vec::new();
+                    var dk: i64 = 0;
+                    while dk < i {
+                        pd_note_decl(stmts.get(dk));
+                        dk = dk + 1;
+                    }
                     while j < stmts.len() && type_eq_infer(et) {
                         et = pd_push_lit_type(stmts.get(j), name);
+                        pd_note_decl(stmts.get(j));
                         j = j + 1;
                     }
+                    g_pd_decl_names = Vec::new();
+                    g_pd_decl_types = Vec::new();
                     if !type_eq_infer(et) {
                         var targs: Vec<Type> = Vec::new();
                         targs.push(et);
@@ -8466,6 +9604,80 @@ fn pd_lit_type(e: Expr) -> Type {
     return Type::Infer;
 }
 
+// B19: the variables declared before the pushes pd_infer_vec_lets looks at
+// (in the same block) whose type is a float, string or bool: name, type
+var g_pd_decl_names: Vec<str> = Vec::new();
+var g_pd_decl_types: Vec<Type> = Vec::new();
+
+/// Whether `t` is a type pd_infer_vec_lets gives an untyped Vec from a
+/// pushed variable (an i64 one needs nothing; others are left to the
+/// type checker).
+fn pd_vec_elem_kind(t: Type) -> bool {
+    match t {
+        Type::F64 => {
+            return true;
+        }
+        Type::F32 => {
+            return true;
+        }
+        Type::Str => {
+            return true;
+        }
+        Type::Bool => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// Note the variable `st` declares, if any: `val x: bool = ..` (its type)
+/// or `val x = 1.5` (a literal's type). Any other declaration of a name
+/// hides an earlier one (Infer).
+fn pd_note_decl(st: Stmt) {
+    match st {
+        Stmt::Let(dn, dty, dinit, _, _, _, _) => {
+            var t: Type = Type::Infer;
+            match dty {
+                OptType::Some(ty) => {
+                    t = ty;
+                }
+                OptType::None => {
+                    t = pd_lit_type(dinit);
+                }
+            }
+            if !pd_vec_elem_kind(t) {
+                t = Type::Infer;
+            }
+            g_pd_decl_names.push(dn);
+            g_pd_decl_types.push(t);
+        }
+        _ => {
+        }
+    }
+}
+
+/// The type of a pushed value: a literal's, or that of a variable declared
+/// earlier in the block (g_pd_decl_names); Infer otherwise.
+fn pd_arg_type(e: Expr) -> Type {
+    match e {
+        Expr::Ident(n) => {
+            var k: i64 = g_pd_decl_names.len() - 1;
+            while k >= 0 {
+                if g_pd_decl_names.get(k) == n {
+                    return g_pd_decl_types.get(k);
+                }
+                k = k - 1;
+            }
+            return Type::Infer;
+        }
+        _ => {
+        }
+    }
+    return pd_lit_type(e);
+}
+
 /// The literal type pushed onto `name` by statement `st` (searching nested
 /// blocks), or Infer.
 fn pd_push_lit_type(st: Stmt, name: str) -> Type {
@@ -8477,7 +9689,7 @@ fn pd_push_lit_type(st: Stmt, name: str) -> Type {
                         match box_expr_deref(recv) {
                             Expr::Ident(rn) => {
                                 if rn == name {
-                                    return pd_lit_type(args.get(0));
+                                    return pd_arg_type(args.get(0));
                                 }
                             }
                             _ => {
@@ -8529,6 +9741,783 @@ fn pd_push_lit_type_block(stmts: Vec<Stmt>, name: str) -> Type {
     return Type::Infer;
 }
 
+// --- L8A / L8H: impls --------------------------------------------------------
+
+/// The self type parse_impl_or_trait_impl read last (none: the bare name),
+/// and the self type of each impl of the file, at its index (Void: none)
+var g_pd_last_impl_self: Vec<Type> = Vec::new();
+var g_pd_impl_selfs: Vec<Type> = Vec::new();
+/// L8H: the same for trait impls: the `for` type parse_impl_or_trait_impl
+/// read last, and that of each trait impl of the file, at its index
+var g_pd_last_timpl_self: Vec<Type> = Vec::new();
+var g_pd_timpl_selfs: Vec<Type> = Vec::new();
+/// LG3: the lifetimes `impl<'a> View<'a>` declares, which its methods may
+/// use without declaring them again (parse_func); empty outside an impl
+var g_pd_impl_lts: Vec<str> = Vec::new();
+
+/// L8A: `impl<T, const N: usize> Matrix<T, N>`: each method takes the
+/// impl's const parameters as its own (`const_params`), so its body reads N
+/// as a constant; mono replaces N by the receiver's number.
+fn pd_impl_consts(methods: Vec<Func>, consts: Vec<StrPair>) -> Vec<Func> {
+    if consts.len() == 0 {
+        return methods;
+    }
+    var out: Vec<Func> = Vec::new();
+    var i: i64 = 0;
+    while i < methods.len() {
+        var f: Func = methods.get(i);
+        var cps: Vec<StrPair> = f.const_params;
+        var k: i64 = 0;
+        while k < consts.len() {
+            var have: bool = false;
+            var j: i64 = 0;
+            while j < cps.len() {
+                if cps.get(j).a == consts.get(k).a {
+                    have = true;
+                }
+                j = j + 1;
+            }
+            if !have {
+                cps.push(consts.get(k));
+            }
+            k = k + 1;
+        }
+        f.const_params = cps;
+        out.push(f);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Whether the impl `imp` with self type `st` (Void: the bare name) is a
+/// generic impl over the whole type: `impl<T> Wrap<T>`.
+fn pd_impl_is_general(imp: ImplDef, st: Type) -> bool {
+    if imp.type_params.len() == 0 {
+        return false;
+    }
+    match st {
+        Type::Void => {
+            return true;
+        }
+        Type::Generic(gn, gargs) => {
+            if gn != imp.struct_name || gargs.len() != imp.type_params.len() {
+                return false;
+            }
+            var k: i64 = 0;
+            while k < gargs.len() {
+                match gargs.get(k) {
+                    Type::Named(an) => {
+                        if an != imp.type_params.get(k) {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        return false;
+                    }
+                }
+                k = k + 1;
+            }
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// Whether the impl names narrower arguments of its struct than its own
+/// parameters: `impl Wrap<i64>`, `impl<U> Wrap<Vec<U>>`.
+fn pd_impl_is_narrow(imp: ImplDef, st: Type) -> bool {
+    match st {
+        Type::Generic(gn, _) => {
+            return gn == imp.struct_name && !pd_impl_is_general(imp, st);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// `self` (or `self: &Self`, `self: &mut Self`) typed as `st`, also when
+/// pd_generic_self typed it as the struct over the impl's own parameters
+/// (`impl<U> Wrap<Vec<U>>` made it a `Wrap<U>`).
+fn pd_self_as(p: Param, st: Type, imp: ImplDef) -> Param {
+    var q: Param = p;
+    match p.ty {
+        Type::Named(n) => {
+            if n == "Self" {
+                q.ty = st;
+            }
+        }
+        Type::Generic(_, _) => {
+            if pd_impl_is_general(imp, p.ty) {
+                q.ty = st;
+            }
+        }
+        Type::Ref(inner, m) => {
+            match box_type_unbox(inner) {
+                Type::Named(rn) => {
+                    if rn == "Self" {
+                        q.ty = Type::Ref(Box::new(st), m);
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return q;
+}
+
+/// L8H: a method of a narrower impl (`impl Wrap<i64> { fn show(self) }`)
+/// that a generic impl of the same struct in the file also has (`impl<T>
+/// Wrap<T> { fn show(self) }`) specializes it: it is renamed
+/// `show__spec<k>` (ast.fd spec_base_name), so it is no second `show`, its
+/// `self` is typed as the narrower impl's type (`Wrap<i64>`), and mono
+/// gives each instantiation of `show` the body of the most specific impl's
+/// method whose type takes the receiver's (mono.fd mono_method_inst). The
+/// narrower impls move after the others, so the generic impl
+/// is the one whose parameters name the struct's (TypeChecker
+/// impl_tp_lists). Every method of a narrower impl has its `self` typed as
+/// the narrower type.
+fn pd_impl_specializations(program: & mut Program, selfs: Vec<Type>) {
+    val n: i64 = program.impls.len();
+    if n == 0 {
+        return;
+    }
+    var any_narrow: bool = false;
+    var i: i64 = 0;
+    while i < n {
+        if i < selfs.len() && pd_impl_is_narrow(program.impls.get(i), selfs.get(i)) {
+            any_narrow = true;
+        }
+        i = i + 1;
+    }
+    if !any_narrow {
+        return;
+    }
+    var spec_n: i64 = HashMap_new();
+    var moved: Vec<bool> = Vec::new();
+    var impls: Vec<ImplDef> = Vec::new();
+    i = 0;
+    while i < n {
+        var imp: ImplDef = program.impls.get(i);
+        // every narrower impl moves after the others (also one without a
+        // specialization: `impl<U> Wrap<Vec<U>>` first in the file must not
+        // be taken for the generic impl)
+        var is_narrow: bool = false;
+        if i < selfs.len() && pd_impl_is_narrow(imp, selfs.get(i)) {
+            is_narrow = true;
+            val st: Type = selfs.get(i);
+            // the generic impl of the struct
+            var g: i64 = - 1;
+            var j: i64 = 0;
+            while j < n && g < 0 {
+                if j != i && program.impls.get(j).struct_name == imp.struct_name {
+                    var gst: Type = Type::Void;
+                    if j < selfs.len() {
+                        gst = selfs.get(j);
+                    }
+                    if pd_impl_is_general(program.impls.get(j), gst) {
+                        g = j;
+                    }
+                }
+                j = j + 1;
+            }
+            // every method's `self` is the narrower type (as a generic
+            // impl's is `Wrap<T>`, pd_generic_self); one the generic impl
+            // also has is a specialization
+            var ms: Vec<Func> = Vec::new();
+            var mi: i64 = 0;
+            while mi < imp.methods.len() {
+                var m: Func = imp.methods.get(mi);
+                if m.params.len() > 0 && m.params.get(0).name == "self" {
+                    var in_general: bool = false;
+                    if g >= 0 {
+                        val gms: Vec<Func> = program.impls.get(g).methods;
+                        var gk: i64 = 0;
+                        while gk < gms.len() {
+                            if gms.get(gk).name == m.name {
+                                in_general = true;
+                            }
+                            gk = gk + 1;
+                        }
+                    }
+                    if in_general {
+                        val key: str = imp.struct_name + "." + m.name;
+                        val k: i64 = HashMap_get(spec_n, key) + 1;
+                        HashMap_insert(spec_n, key, k);
+                        m.name = m.name + "__spec" + int_to_str(k);
+                    }
+                    var ps: Vec<Param> = m.params;
+                    ps.set(0, pd_self_as(ps.get(0), st, imp));
+                    m.params = ps;
+                }
+                ms.push(m);
+                mi = mi + 1;
+            }
+            imp.methods = ms;
+        }
+        moved.push(is_narrow);
+        impls.push(imp);
+        i = i + 1;
+    }
+    HashMap_drop(spec_n);
+    var out: Vec<ImplDef> = Vec::new();
+    i = 0;
+    while i < n {
+        if !moved.get(i) {
+            out.push(impls.get(i));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        if moved.get(i) {
+            out.push(impls.get(i));
+        }
+        i = i + 1;
+    }
+    program.impls = out;
+}
+
+// --- L8H: trait impls for narrower types; specializations across modules ---
+
+/// Whether `t` is Void (no type written).
+fn pd_type_is_void(t: Type) -> bool {
+    match t {
+        Type::Void => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The number k of a specialization's name `name__spec<k>` (0: none).
+fn pd_spec_number(name: str) -> i64 {
+    if spec_base_name(name) == "" {
+        return 0;
+    }
+    val at: i64 = str_rfind(name, "__spec");
+    var k: i64 = 0;
+    var i: i64 = at + 6;
+    while i < str_len(name) {
+        k = k * 10 + (str_byte_at(name, i) - 48);
+        i = i + 1;
+    }
+    return k;
+}
+
+/// Into map `nums`: for each method `Type.name` of `impls` that is a
+/// specialization (`name__spec<k>`), the highest k (the next takes k + 1).
+fn pd_note_method_spec_numbers(nums: i64, impls: Vec<ImplDef>) {
+    var i: i64 = 0;
+    while i < impls.len() {
+        val ms: Vec<Func> = impls.get(i).methods;
+        var j: i64 = 0;
+        while j < ms.len() {
+            val k: i64 = pd_spec_number(ms.get(j).name);
+            if k > 0 {
+                val key: str = impls.get(i).struct_name + "." + spec_base_name(ms.get(j).name);
+                if k > HashMap_get(nums, key) {
+                    HashMap_insert(nums, key, k);
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// `methods` with `self` of each typed as `st` (pd_self_as).
+fn pd_selfs_as(methods: Vec<Func>, st: Type, shell: ImplDef) -> Vec<Func> {
+    var out: Vec<Func> = Vec::new();
+    var i: i64 = 0;
+    while i < methods.len() {
+        var m: Func = methods.get(i);
+        if m.params.len() > 0 && m.params.get(0).name == "self" {
+            var ps: Vec<Param> = m.params;
+            ps.set(0, pd_self_as(ps.get(0), st, shell));
+            m.params = ps;
+        }
+        out.push(m);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The method names of trait `trait_name` among `traits`, pushed to `out`;
+/// false when the trait is not there or inherits methods (`cap Sub:
+/// Super`: its impls may also define Super's).
+fn pd_trait_methods_of(traits: Vec<TraitDef>, trait_name: str, out: & mut Vec<str>) -> bool {
+    var i: i64 = 0;
+    while i < traits.len() {
+        if traits.get(i).name == trait_name {
+            if traits.get(i).supertraits.len() > 0 {
+                return false;
+            }
+            val ms: Vec<TraitMethod> = traits.get(i).methods;
+            var j: i64 = 0;
+            while j < ms.len() {
+                out.push(ms.get(j).name);
+                j = j + 1;
+            }
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// L8H: the narrower type the methods of an impl of `struct_name` (type
+/// parameters `tps`) take `self` as: `Wrap<i64>` for `impl Wrap<i64>` or
+/// `impl Show for Wrap<i64>` once their `self` is typed so
+/// (pd_impl_specializations, pd_trait_impl_specializations). Void when the
+/// impl is over the whole struct or has no method with `self`.
+pub fn pd_impl_narrow_self(struct_name: str, tps: Vec<str>, methods: Vec<Func>) -> Type {
+    val shell: ImplDef = ImplDef_new_full(struct_name, tps, Vec::new());
+    var i: i64 = 0;
+    while i < methods.len() {
+        val m: Func = methods.get(i);
+        if m.params.len() > 0 && m.params.get(0).name == "self" {
+            var st: Type = m.params.get(0).ty;
+            match st {
+                Type::Ref(inner, _) => {
+                    st = box_type_unbox(inner);
+                }
+                _ => {
+                }
+            }
+            match st {
+                Type::Generic(gn, _) => {
+                    if gn == struct_name && !pd_impl_is_general(shell, st) {
+                        return st;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return Type::Void;
+}
+
+/// L8H: whether `imp` is an impl for a narrower type than its struct's
+/// (`impl Wrap<i64>`, `impl<U> Wrap<Vec<U>>`), seen from its methods'
+/// `self`. merge_programs keeps a module's generic impl of the struct
+/// beside it (it is no replacement of that impl).
+pub fn pd_impl_is_narrowed(imp: ImplDef) -> bool {
+    return !pd_type_is_void(pd_impl_narrow_self(imp.struct_name, imp.type_params, imp.methods));
+}
+
+/// L8H: the narrower trait impl `ti` (`impl Show for Wrap<i64>`, `for` type
+/// `st`) of a trait that a generic impl implements for the whole type
+/// (`impl<T> Show for Wrap<T>`), as a narrower impl of the struct (`impl
+/// Wrap<i64>`) whose methods specialize the generic trait impl's: each
+/// renamed `name__spec<k>` (k one more than the last of `Type.name` in map
+/// `spec_n`), its `self` typed as `st`. The generic impl stays the trait's
+/// impl for every type (bounds, default methods); a call `w.show()` runs
+/// the most specific impl's method (mono.fd mono_method_inst, the checker's
+/// TypeChecker_check_mspec_call). Errors, to `errs`: associated types (the
+/// generic impl binds them for every type), a method without `self` (no
+/// receiver to choose by), a method the trait does not have (`trait_ms`,
+/// when `check_ms`).
+fn pd_timpl_as_spec_impl(ti: TraitImpl, st: Type, spec_n: i64, check_ms: bool, trait_ms: Vec<str>, errs: & mut Vec<str>) -> ImplDef {
+    val shell: ImplDef = ImplDef_new_full(ti.type_name, ti.type_params, Vec::new());
+    var what: str = "impl ";
+    if ti.type_params.len() > 0 {
+        what = what + "<" + vec_str_join(ti.type_params, ", ") + "> ";
+    }
+    what = what + ti.trait_name + " for " + type_to_str(st);
+    if ti.associated_types.len() > 0 {
+        errs.push("Type error: `" + what + "` binds associated types, so it cannot specialize the generic impl of " + ti.trait_name + " for " + ti.type_name + ".\n    Fix: bind them in the generic impl only.");
+    }
+    var ms: Vec<Func> = Vec::new();
+    var i: i64 = 0;
+    while i < ti.methods.len() {
+        var m: Func = ti.methods.get(i);
+        if m.params.len() == 0 || m.params.get(0).name != "self" {
+            errs.push("Type error: method '" + m.name + "' of `" + what + "` has no `self`: a specialization is chosen by the receiver's type.\n    Fix: keep '" + m.name + "' in the generic impl of " + ti.trait_name + " only.");
+        } else {
+            if check_ms && !str_vec_contains(trait_ms, m.name) {
+                errs.push("Type error: method '" + m.name + "' of `" + what + "` is not a method of trait '" + ti.trait_name + "'.\n    Fix: implement only the trait's methods here; put '" + m.name + "' in a plain `impl` block of the type");
+            }
+            var ps: Vec<Param> = m.params;
+            ps.set(0, pd_self_as(ps.get(0), st, shell));
+            m.params = ps;
+        }
+        if spec_base_name(m.name) == "" {
+            val key: str = ti.type_name + "." + m.name;
+            val k: i64 = HashMap_get(spec_n, key) + 1;
+            HashMap_insert(spec_n, key, k);
+            m.name = m.name + "__spec" + int_to_str(k);
+        }
+        ms.push(m);
+        i = i + 1;
+    }
+    return ImplDef_new_full(ti.type_name, ti.type_params, ms);
+}
+
+/// L8H: trait impls of one file for a narrower type (`impl Show for
+/// Wrap<i64>`, `impl<U> Show for Wrap<Vec<U>>`; `for` types in `selfs`,
+/// at each index) beside the generic impl of the trait for the whole type
+/// (`impl<T> Show for Wrap<T>`): each becomes a narrower impl of the struct
+/// whose methods specialize the generic one's (pd_timpl_as_spec_impl).
+/// Before, it was a second impl of the trait for the struct, whose methods
+/// replaced the generic impl's for every type. A narrower trait impl with
+/// no generic one in the file stays a trait impl, its `self` typed as its
+/// type (as in a narrower impl): a module importing a generic impl of the
+/// trait for the type turns it into a specialization
+/// (pd_cross_module_specializations). The errors found.
+fn pd_trait_impl_specializations(program: & mut Program, selfs: Vec<Type>) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    val n: i64 = program.trait_impls.len();
+    var any_narrow: bool = false;
+    var i: i64 = 0;
+    while i < n && i < selfs.len() {
+        val ti0: TraitImpl = program.trait_impls.get(i);
+        if pd_impl_is_narrow(ImplDef_new_full(ti0.type_name, ti0.type_params, Vec::new()), selfs.get(i)) {
+            any_narrow = true;
+        }
+        i = i + 1;
+    }
+    if !any_narrow {
+        return errs;
+    }
+    var spec_n: i64 = HashMap_new();
+    pd_note_method_spec_numbers(spec_n, program.impls);
+    var keep: Vec<TraitImpl> = Vec::new();
+    var added: Vec<ImplDef> = Vec::new();
+    i = 0;
+    while i < n {
+        var ti: TraitImpl = program.trait_impls.get(i);
+        var st: Type = Type::Void;
+        if i < selfs.len() {
+            st = selfs.get(i);
+        }
+        val shell: ImplDef = ImplDef_new_full(ti.type_name, ti.type_params, Vec::new());
+        if pd_impl_is_narrow(shell, st) {
+            // the generic impl of the trait for the type, in this file
+            var has_general: bool = false;
+            var j: i64 = 0;
+            while j < n {
+                val tj: TraitImpl = program.trait_impls.get(j);
+                if j != i && tj.trait_name == ti.trait_name && tj.type_name == ti.type_name {
+                    var gst: Type = Type::Void;
+                    if j < selfs.len() {
+                        gst = selfs.get(j);
+                    }
+                    if pd_impl_is_general(ImplDef_new_full(tj.type_name, tj.type_params, Vec::new()), gst) {
+                        has_general = true;
+                    }
+                }
+                j = j + 1;
+            }
+            if has_general {
+                var trait_ms: Vec<str> = Vec::new();
+                val check_ms: bool = pd_trait_methods_of(program.traits, ti.trait_name, & mut trait_ms);
+                added.push(pd_timpl_as_spec_impl(ti, st, spec_n, check_ms, trait_ms, & mut errs));
+            } else {
+                ti.methods = pd_selfs_as(ti.methods, st, shell);
+                keep.push(ti);
+            }
+        } else {
+            keep.push(ti);
+        }
+        i = i + 1;
+    }
+    HashMap_drop(spec_n);
+    program.trait_impls = keep;
+    if added.len() > 0 {
+        var impls: Vec<ImplDef> = program.impls;
+        var a: i64 = 0;
+        while a < added.len() {
+            impls.push(added.get(a));
+            a = a + 1;
+        }
+        program.impls = impls;
+    }
+    return errs;
+}
+
+/// Whether program `p` imports module `name` (`use a::b` for the module
+/// `a::b` or `b`, or an item of it, `use a::b::f`).
+fn pd_imports_module(p: Program, name: str) -> bool {
+    var i: i64 = 0;
+    while i < p.imports.len() {
+        val ip: str = p.imports.get(i).path;
+        if ip == name || path_last(name) == ip || path_last(ip) == name || str_starts_with(ip, name + "::") {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether one of the programs `progs` at the indexes `from` has a public
+/// generic function of `f`'s name whose parameters take `f`'s, `f` being
+/// strictly more specific (ast.fd spec_at_least).
+fn pd_cm_spec_of_fn(progs: Vec<Program>, from: Vec<i64>, f: Func) -> bool {
+    var i: i64 = 0;
+    while i < from.len() {
+        val fs: Vec<Func> = progs.get(from.get(i)).funcs;
+        var j: i64 = 0;
+        while j < fs.len() {
+            val g: Func = fs.get(j);
+            if g.name == f.name && g.is_pub && g.type_params.len() > 0 && !pd_has_cfg(g) {
+                if spec_at_least(f, g) && !spec_at_least(g, f) {
+                    return true;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether one of the programs at `from` has an impl of `struct_name` over
+/// the whole struct (`impl<T> Wrap<T>`) with a method `method`.
+fn pd_cm_spec_of_method(progs: Vec<Program>, from: Vec<i64>, struct_name: str, method: str) -> bool {
+    var i: i64 = 0;
+    while i < from.len() {
+        val imps: Vec<ImplDef> = progs.get(from.get(i)).impls;
+        var j: i64 = 0;
+        while j < imps.len() {
+            val imp: ImplDef = imps.get(j);
+            if imp.struct_name == struct_name && imp.type_params.len() > 0 && !pd_impl_is_narrowed(imp) {
+                var k: i64 = 0;
+                while k < imp.methods.len() {
+                    if imp.methods.get(k).name == method {
+                        return true;
+                    }
+                    k = k + 1;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether one of the programs at `from` has a generic impl of trait
+/// `trait_name` for the whole type `type_name` (`impl<T> Show for Wrap<T>`).
+fn pd_cm_spec_of_timpl(progs: Vec<Program>, from: Vec<i64>, trait_name: str, type_name: str) -> bool {
+    var i: i64 = 0;
+    while i < from.len() {
+        val tis: Vec<TraitImpl> = progs.get(from.get(i)).trait_impls;
+        var j: i64 = 0;
+        while j < tis.len() {
+            val ti: TraitImpl = tis.get(j);
+            if ti.trait_name == trait_name && ti.type_name == type_name && ti.type_params.len() > 0 {
+                if pd_type_is_void(pd_impl_narrow_self(ti.type_name, ti.type_params, ti.methods)) {
+                    return true;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// L8H across modules: a definition in one module specializes a generic
+/// definition of a module it imports (`use shapes;` with `fn area(s:
+/// Square)` beside shapes' `pub fn area<T>(s: T)`; `impl Wrap<i64> { fn
+/// show(self) }` beside `impl<T> Wrap<T> { fn show(self) }`; `impl Show
+/// for Wrap<i64>` beside `impl<T> Show for Wrap<T>`) when the generic one
+/// takes its types and it is strictly more specific: it is renamed
+/// `name__spec<k>` (k after every number of that name in any module), as
+/// pd_name_specializations / pd_impl_specializations /
+/// pd_trait_impl_specializations do within one file, so it is no duplicate
+/// definition (compiler.fd's checks) and no shadowing
+/// (cc_qualify_shadowed_imports): mono gives every instantiation the body
+/// of the most specific definition, wherever it is called from. A
+/// function's generic definition must be `pub`. `mods` are the imported
+/// modules (their names in `names`), `user` the program; called by
+/// compiler.fd before its duplicate checks. The errors found.
+pub fn pd_cross_module_specializations(mods: & mut Vec<Program>, names: Vec<str>, user: & mut Program) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    val nm: i64 = mods.len();
+    if nm == 0 || names.len() < nm {
+        return errs;
+    }
+    // every program: the modules, then the user's (index nm)
+    var progs: Vec<Program> = Vec::new();
+    var i: i64 = 0;
+    while i < nm {
+        progs.push(mods.get(i));
+        i = i + 1;
+    }
+    var up: Program = program_new();
+    up.funcs = user.funcs;
+    up.impls = user.impls;
+    up.trait_impls = user.trait_impls;
+    up.imports = user.imports;
+    up.traits = user.traits;
+    progs.push(up);
+    val total: i64 = nm + 1;
+    // the numbers already taken: `name` -> last k, `Type.name` -> last k
+    var fn_n: i64 = HashMap_new();
+    var m_n: i64 = HashMap_new();
+    var p: i64 = 0;
+    while p < total {
+        val pfs: Vec<Func> = progs.get(p).funcs;
+        var fi: i64 = 0;
+        while fi < pfs.len() {
+            val sk: i64 = pd_spec_number(pfs.get(fi).name);
+            if sk > 0 {
+                val base: str = spec_base_name(pfs.get(fi).name);
+                if sk > HashMap_get(fn_n, base) {
+                    HashMap_insert(fn_n, base, sk);
+                }
+            }
+            fi = fi + 1;
+        }
+        pd_note_method_spec_numbers(m_n, progs.get(p).impls);
+        p = p + 1;
+    }
+    var changed: Vec<bool> = Vec::new();
+    var s: i64 = 0;
+    while s < total {
+        var sp: Program = progs.get(s);
+        var ch: bool = false;
+        // the modules this one imports
+        var from: Vec<i64> = Vec::new();
+        var b: i64 = 0;
+        while b < nm {
+            if b != s && pd_imports_module(sp, names.get(b)) {
+                from.push(b);
+            }
+            b = b + 1;
+        }
+        if from.len() > 0 {
+            // functions
+            var fs: Vec<Func> = Vec::new();
+            var fi2: i64 = 0;
+            while fi2 < sp.funcs.len() {
+                var f: Func = sp.funcs.get(fi2);
+                if !pd_has_cfg(f) && spec_base_name(f.name) == "" && pd_cm_spec_of_fn(progs, from, f) {
+                    val fk: i64 = HashMap_get(fn_n, f.name) + 1;
+                    HashMap_insert(fn_n, f.name, fk);
+                    f.name = f.name + "__spec" + int_to_str(fk);
+                    ch = true;
+                }
+                fs.push(f);
+                fi2 = fi2 + 1;
+            }
+            // methods of narrower impls
+            var imps: Vec<ImplDef> = Vec::new();
+            var ii: i64 = 0;
+            while ii < sp.impls.len() {
+                var imp: ImplDef = sp.impls.get(ii);
+                if pd_impl_is_narrowed(imp) {
+                    var ms: Vec<Func> = Vec::new();
+                    var mi: i64 = 0;
+                    while mi < imp.methods.len() {
+                        var m: Func = imp.methods.get(mi);
+                        if m.params.len() > 0 && m.params.get(0).name == "self" && spec_base_name(m.name) == "" && pd_cm_spec_of_method(progs, from, imp.struct_name, m.name) {
+                            val key: str = imp.struct_name + "." + m.name;
+                            val mk: i64 = HashMap_get(m_n, key) + 1;
+                            HashMap_insert(m_n, key, mk);
+                            m.name = m.name + "__spec" + int_to_str(mk);
+                            ch = true;
+                        }
+                        ms.push(m);
+                        mi = mi + 1;
+                    }
+                    imp.methods = ms;
+                }
+                imps.push(imp);
+                ii = ii + 1;
+            }
+            // trait impls for a narrower type
+            var keep: Vec<TraitImpl> = Vec::new();
+            var ti_i: i64 = 0;
+            while ti_i < sp.trait_impls.len() {
+                val ti: TraitImpl = sp.trait_impls.get(ti_i);
+                val st: Type = pd_impl_narrow_self(ti.type_name, ti.type_params, ti.methods);
+                if !pd_type_is_void(st) && pd_cm_spec_of_timpl(progs, from, ti.trait_name, ti.type_name) {
+                    var trait_ms: Vec<str> = Vec::new();
+                    var check_ms: bool = pd_trait_methods_of(sp.traits, ti.trait_name, & mut trait_ms);
+                    var tf: i64 = 0;
+                    while tf < from.len() && !check_ms {
+                        check_ms = pd_trait_methods_of(progs.get(from.get(tf)).traits, ti.trait_name, & mut trait_ms);
+                        tf = tf + 1;
+                    }
+                    imps.push(pd_timpl_as_spec_impl(ti, st, m_n, check_ms, trait_ms, & mut errs));
+                    ch = true;
+                } else {
+                    keep.push(ti);
+                }
+                ti_i = ti_i + 1;
+            }
+            if ch {
+                sp.funcs = fs;
+                sp.impls = imps;
+                sp.trait_impls = keep;
+                progs.set(s, sp);
+            }
+        }
+        changed.push(ch);
+        s = s + 1;
+    }
+    HashMap_drop(fn_n);
+    HashMap_drop(m_n);
+    i = 0;
+    while i < nm {
+        if changed.get(i) {
+            mods.set(i, progs.get(i));
+        }
+        i = i + 1;
+    }
+    // The user's lists are refilled in place, not replaced: `user` is
+    // compiler.fd's match binding of the parse result, and a compiler built
+    // by a lowering from before the match-binding fix (lower.fd
+    // Lowerer_mb_owns_copy) dropped a replaced list that the parse result
+    // still held, then dropped it again with the result (Invalid memory
+    // access in vec_drop_range: test_cross_module_specialization).
+    if changed.get(nm) {
+        pd_refill_funcs(& mut user.funcs, progs.get(nm).funcs);
+        pd_refill_impls(& mut user.impls, progs.get(nm).impls);
+        pd_refill_timpls(& mut user.trait_impls, progs.get(nm).trait_impls);
+    }
+    return errs;
+}
+
+fn pd_refill_funcs(dst: & mut Vec<Func>, src: Vec<Func>) {
+    dst.clear();
+    var i: i64 = 0;
+    while i < src.len() {
+        dst.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+fn pd_refill_impls(dst: & mut Vec<ImplDef>, src: Vec<ImplDef>) {
+    dst.clear();
+    var i: i64 = 0;
+    while i < src.len() {
+        dst.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+fn pd_refill_timpls(dst: & mut Vec<TraitImpl>, src: Vec<TraitImpl>) {
+    dst.clear();
+    var i: i64 = 0;
+    while i < src.len() {
+        dst.push(src.get(i));
+        i = i + 1;
+    }
+}
+
 /// A bare `self` in `impl<T> Slot<T>` (or `impl<T> Tr for Slot<T>`) is a
 /// `Slot<T>`: typed as `Self`, it resolved to the bare struct, whose layout
 /// does not know T, and a field after a `T` field read the wrong word.
@@ -8567,4 +10556,66 @@ fn pd_generic_self(methods: Vec<Func>, type_name: str, type_params: Vec<str>) ->
         i = i + 1;
     }
     return out;
+}
+
+// --- Lifetimes (LG3) --------------------------------------------------------
+// `fn f<'a>(x: &'a T, y: &T) -> &'a T`: the type of each reference stays
+// `Ref`; the names go into `@lifetime(...)` annotations -- on a parameter the
+// lifetimes its type writes, on the function those of its result -- and the
+// reference escape check (compiler/escape.fd) ties the result to exactly the
+// parameters that carry one of the result's lifetimes. `'static` needs no
+// declaration and ties the result to no parameter.
+
+/// The lifetimes `seen` gained since index `start`.
+fn pd_lt_since(seen: Vec<str>, start: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = start;
+    while i < seen.len() {
+        out.push(seen.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The lifetimes a parameter's `@lifetime` annotation lists (none: empty).
+fn pd_param_lifetimes(p: Param) -> Vec<str> {
+    return ann_lifetimes(p.annotations);
+}
+
+/// A signature's lifetimes are declared in its `<...>` and each lifetime of
+/// the result is carried by some parameter; the first violation, or None.
+fn pd_check_lifetimes(fname: str, declared: Vec<str>, params: Vec<Param>, ret_lts: Vec<str>) -> OptStr {
+    var i: i64 = 0;
+    while i < params.len() {
+        var pl: Vec<str> = pd_param_lifetimes(params.get(i));
+        var j: i64 = 0;
+        while j < pl.len() {
+            var lt: str = pl.get(j);
+            if lt != "'static" && !str_vec_contains(declared, lt) {
+                return OptStr::Some("lifetime " + lt + " of parameter '" + params.get(i).name + "' is not declared; write `fn " + fname + "<" + lt + ">(...)`");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var r: i64 = 0;
+    while r < ret_lts.len() {
+        var rl: str = ret_lts.get(r);
+        if rl != "'static" {
+            if !str_vec_contains(declared, rl) {
+                return OptStr::Some("lifetime " + rl + " of the result of '" + fname + "' is not declared; write `fn " + fname + "<" + rl + ">(...)`");
+            }
+            var carried: bool = false;
+            var k: i64 = 0;
+            while k < params.len() && !carried {
+                carried = str_vec_contains(pd_param_lifetimes(params.get(k)), rl);
+                k = k + 1;
+            }
+            if !carried {
+                return OptStr::Some("the result of '" + fname + "' has lifetime " + rl + ", which no parameter carries: a reference can only be returned from a reference parameter");
+            }
+        }
+        r = r + 1;
+    }
+    return OptStr::None;
 }

@@ -1,0 +1,558 @@
+// Fides Cortex-M system peripherals (ARMv7-M), pure Fides over a bus seam.
+//
+// The System Control Space registers of ARMv7-M (ARM DDI 0403E, chapter
+// B3): NVIC (B3.4: enable, pending, active, priority), SysTick (B3.3),
+// SCB (B3.2: CPUID, ICSR, VTOR, AIRCR, SHPR, SHCSR, CFSR/HFSR/MMFAR/BFAR)
+// and the PMSAv7 MPU (B3.5: RBAR/RASR region encoding). Addresses, bit
+// fields and the CMSIS-style init sequences (SysTick_Config,
+// NVIC_SystemReset, NVIC_SetPriority, NVIC_EncodePriority) are real.
+//
+// The seam: every register access goes through a regmap.fd RegBus. On a
+// device use regbus_mmio() (volatile 32-bit and 8-bit loads and stores at
+// the SCS addresses); in tests use regbus_fake(), whose log shows the
+// exact writes. Decoders (fault status, CPUID, MPU regions) are pure
+// functions of register values. The DSB/ISB barriers the ARM ARM asks
+// for after an AIRCR reset write, a VTOR change or an MPU enable are the
+// caller's (inline asm on the target); the functions say where.
+
+module cortex_m;
+ use vec; use string; use regmap;
+
+// ─── System Control Space addresses (B3.2.2, B3.3.2, B3.4.3, B3.5.3) ────
+
+pub const SYST_CSR: i64 = 0xE000E010;
+pub const SYST_RVR: i64 = 0xE000E014;
+pub const SYST_CVR: i64 = 0xE000E018;
+pub const SYST_CALIB: i64 = 0xE000E01C;
+
+pub const NVIC_ISER: i64 = 0xE000E100;
+pub const NVIC_ICER: i64 = 0xE000E180;
+pub const NVIC_ISPR: i64 = 0xE000E200;
+pub const NVIC_ICPR: i64 = 0xE000E280;
+pub const NVIC_IABR: i64 = 0xE000E300;
+pub const NVIC_IPR: i64 = 0xE000E400;
+pub const NVIC_STIR: i64 = 0xE000EF00;
+
+pub const SCB_CPUID: i64 = 0xE000ED00;
+pub const SCB_ICSR: i64 = 0xE000ED04;
+pub const SCB_VTOR: i64 = 0xE000ED08;
+pub const SCB_AIRCR: i64 = 0xE000ED0C;
+pub const SCB_SCR: i64 = 0xE000ED10;
+pub const SCB_CCR: i64 = 0xE000ED14;
+pub const SCB_SHPR1: i64 = 0xE000ED18;
+pub const SCB_SHCSR: i64 = 0xE000ED24;
+pub const SCB_CFSR: i64 = 0xE000ED28;
+pub const SCB_HFSR: i64 = 0xE000ED2C;
+pub const SCB_DFSR: i64 = 0xE000ED30;
+pub const SCB_MMFAR: i64 = 0xE000ED34;
+pub const SCB_BFAR: i64 = 0xE000ED38;
+pub const SCB_CPACR: i64 = 0xE000ED88;
+
+pub const MPU_TYPE: i64 = 0xE000ED90;
+pub const MPU_CTRL: i64 = 0xE000ED94;
+pub const MPU_RNR: i64 = 0xE000ED98;
+pub const MPU_RBAR: i64 = 0xE000ED9C;
+pub const MPU_RASR: i64 = 0xE000EDA0;
+
+// SysTick CSR bits.
+pub const SYST_ENABLE: i64 = 1;
+pub const SYST_TICKINT: i64 = 2;
+pub const SYST_CLKSOURCE: i64 = 4;
+pub const SYST_COUNTFLAG: i64 = 0x10000;
+
+// ICSR bits.
+pub const ICSR_NMIPENDSET: i64 = 0x80000000;
+pub const ICSR_PENDSVSET: i64 = 0x10000000;
+pub const ICSR_PENDSVCLR: i64 = 0x08000000;
+pub const ICSR_PENDSTSET: i64 = 0x04000000;
+pub const ICSR_PENDSTCLR: i64 = 0x02000000;
+
+// AIRCR.
+pub const AIRCR_VECTKEY: i64 = 0x05FA0000;
+pub const AIRCR_SYSRESETREQ: i64 = 4;
+
+// Exception numbers (B1.5.2). IRQ n is exception 16 + n.
+pub const EXC_RESET: i64 = 1;
+pub const EXC_NMI: i64 = 2;
+pub const EXC_HARDFAULT: i64 = 3;
+pub const EXC_MEMMANAGE: i64 = 4;
+pub const EXC_BUSFAULT: i64 = 5;
+pub const EXC_USAGEFAULT: i64 = 6;
+pub const EXC_SVCALL: i64 = 11;
+pub const EXC_DEBUGMON: i64 = 12;
+pub const EXC_PENDSV: i64 = 14;
+pub const EXC_SYSTICK: i64 = 15;
+
+pub fn cm_exception_name(exc: i64) -> str {
+    if exc == 0 { return "Thread"; }
+    if exc == 1 { return "Reset"; }
+    if exc == 2 { return "NMI"; }
+    if exc == 3 { return "HardFault"; }
+    if exc == 4 { return "MemManage"; }
+    if exc == 5 { return "BusFault"; }
+    if exc == 6 { return "UsageFault"; }
+    if exc == 11 { return "SVCall"; }
+    if exc == 12 { return "DebugMonitor"; }
+    if exc == 14 { return "PendSV"; }
+    if exc == 15 { return "SysTick"; }
+    if exc >= 16 { return "IRQ" + int_to_str(exc - 16); }
+    return "Reserved" + int_to_str(exc);
+}
+
+// ─── NVIC ───────────────────────────────────────────────────────────────
+
+/// Word address and bit of IRQ `irq` in one of the NVIC bit arrays.
+pub fn nvic_word(base: i64, irq: i64) -> i64 {
+    return base + 4 * (irq >> 5);
+}
+
+pub fn nvic_bit(irq: i64) -> i64 {
+    return 1 << (irq & 31);
+}
+
+fn cm_check_irq(irq: i64) {
+    if irq < 0 || irq > 495 { p_panic("cortex_m: IRQ " + int_to_str(irq) + " out of range 0..495"); }
+}
+
+/// Enable IRQ `irq`: write its bit to ISER (writing 0 bits has no effect,
+/// so no read-modify-write).
+pub fn nvic_enable(bus: &mut RegBus, irq: i64) {
+    cm_check_irq(irq);
+    regbus_write(bus, nvic_word(NVIC_ISER, irq), 32, nvic_bit(irq));
+}
+
+/// Disable IRQ `irq` (ICER). The ARM ARM wants a DSB+ISB after it when the
+/// caller must be sure the IRQ can no longer fire.
+pub fn nvic_disable(bus: &mut RegBus, irq: i64) {
+    cm_check_irq(irq);
+    regbus_write(bus, nvic_word(NVIC_ICER, irq), 32, nvic_bit(irq));
+}
+
+pub fn nvic_set_pending(bus: &mut RegBus, irq: i64) {
+    cm_check_irq(irq);
+    regbus_write(bus, nvic_word(NVIC_ISPR, irq), 32, nvic_bit(irq));
+}
+
+pub fn nvic_clear_pending(bus: &mut RegBus, irq: i64) {
+    cm_check_irq(irq);
+    regbus_write(bus, nvic_word(NVIC_ICPR, irq), 32, nvic_bit(irq));
+}
+
+/// Enabled? (ISER reads back the enable state.)
+pub fn nvic_is_enabled(bus: &mut RegBus, irq: i64) -> bool {
+    cm_check_irq(irq);
+    return (regbus_read(bus, nvic_word(NVIC_ISER, irq), 32) & nvic_bit(irq)) != 0;
+}
+
+pub fn nvic_is_pending(bus: &mut RegBus, irq: i64) -> bool {
+    cm_check_irq(irq);
+    return (regbus_read(bus, nvic_word(NVIC_ISPR, irq), 32) & nvic_bit(irq)) != 0;
+}
+
+pub fn nvic_is_active(bus: &mut RegBus, irq: i64) -> bool {
+    cm_check_irq(irq);
+    return (regbus_read(bus, nvic_word(NVIC_IABR, irq), 32) & nvic_bit(irq)) != 0;
+}
+
+/// Trigger IRQ `irq` from software (STIR, needs USERSETMPEND for
+/// unprivileged code).
+pub fn nvic_trigger(bus: &mut RegBus, irq: i64) {
+    cm_check_irq(irq);
+    regbus_write(bus, NVIC_STIR, 32, irq);
+}
+
+/// The byte written to an 8-bit priority register for priority `prio`
+/// on a part implementing `bits` priority bits (they are the top bits).
+pub fn cm_prio_byte(prio: i64, bits: i64) -> i64 {
+    if bits < 3 || bits > 8 { p_panic("cortex_m: ARMv7-M implements 3..8 priority bits"); }
+    if prio < 0 || prio >= (1 << bits) { p_panic("cortex_m: priority " + int_to_str(prio) + " needs more than " + int_to_str(bits) + " bits"); }
+    return (prio << (8 - bits)) & 0xFF;
+}
+
+/// Address of the priority byte of exception number `exc` (IRQs: IPR,
+/// system handlers 4..15: SHPR1..3). 0 for fixed-priority exceptions.
+pub fn cm_prio_addr(exc: i64) -> i64 {
+    if exc >= 16 { return NVIC_IPR + (exc - 16); }
+    if exc >= 4 { return SCB_SHPR1 + (exc - 4); }
+    return 0;
+}
+
+/// Set the priority of exception `exc` (byte access, as the ARM ARM
+/// allows for IPR and SHPR).
+pub fn cm_set_priority(bus: &mut RegBus, exc: i64, prio: i64, bits: i64) {
+    val a: i64 = cm_prio_addr(exc);
+    if a == 0 { p_panic("cortex_m: " + cm_exception_name(exc) + " has a fixed priority"); }
+    regbus_write(bus, a, 8, cm_prio_byte(prio, bits));
+}
+
+pub fn cm_get_priority(bus: &mut RegBus, exc: i64, bits: i64) -> i64 {
+    val a: i64 = cm_prio_addr(exc);
+    if a == 0 {
+        if exc == EXC_RESET { return -3; }
+        if exc == EXC_NMI { return -2; }
+        return -1;
+    }
+    return regbus_read(bus, a, 8) >> (8 - bits);
+}
+
+/// NVIC_EncodePriority: with AIRCR.PRIGROUP = `group` (0..7), the
+/// priority byte splits into preempt bits [7:group+1] and sub bits
+/// [group:0]; on a part with `bits` implemented bits the result is the
+/// `bits`-wide priority value to give cm_set_priority.
+pub fn cm_encode_priority(group: i64, preempt: i64, sub: i64, bits: i64) -> i64 {
+    val g: i64 = group & 7;
+    var pre_bits: i64 = 7 - g;
+    if pre_bits > bits { pre_bits = bits; }
+    var sub_bits: i64 = g + bits - 7;
+    if sub_bits < 0 { sub_bits = 0; }
+    return ((preempt & ((1 << pre_bits) - 1)) << sub_bits) | (sub & ((1 << sub_bits) - 1));
+}
+
+/// The inverse: (preempt, sub) packed as preempt * 256 + sub.
+pub fn cm_decode_priority(prio: i64, group: i64, bits: i64) -> i64 {
+    val g: i64 = group & 7;
+    var pre_bits: i64 = 7 - g;
+    if pre_bits > bits { pre_bits = bits; }
+    var sub_bits: i64 = g + bits - 7;
+    if sub_bits < 0 { sub_bits = 0; }
+    val pre: i64 = (prio >> sub_bits) & ((1 << pre_bits) - 1);
+    val sb: i64 = prio & ((1 << sub_bits) - 1);
+    return pre * 256 + sb;
+}
+
+/// Set PRIGROUP: AIRCR must be written with VECTKEY; the other writable
+/// bits (VECTCLRACTIVE, SYSRESETREQ) are written 0.
+pub fn cm_set_priority_grouping(bus: &mut RegBus, group: i64) {
+    val old: i64 = regbus_read(bus, SCB_AIRCR, 32);
+    val v: i64 = AIRCR_VECTKEY | (old & 0x8000) | ((group & 7) << 8);
+    regbus_write(bus, SCB_AIRCR, 32, v);
+}
+
+pub fn cm_priority_grouping(bus: &mut RegBus) -> i64 {
+    return (regbus_read(bus, SCB_AIRCR, 32) >> 8) & 7;
+}
+
+/// NVIC_SystemReset: request a reset keeping PRIGROUP. On the target the
+/// caller issues DSB before and loops after (the reset is asynchronous).
+pub fn cm_system_reset(bus: &mut RegBus) {
+    val old: i64 = regbus_read(bus, SCB_AIRCR, 32);
+    regbus_write(bus, SCB_AIRCR, 32, AIRCR_VECTKEY | (old & 0x700) | AIRCR_SYSRESETREQ);
+}
+
+/// The value written to AIRCR by cm_system_reset for a given AIRCR.
+pub fn cm_reset_value(aircr: i64) -> i64 {
+    return AIRCR_VECTKEY | (aircr & 0x700) | AIRCR_SYSRESETREQ;
+}
+
+// ─── SysTick ────────────────────────────────────────────────────────────
+
+/// Reload value for `hz` interrupts per second from a `clk_hz` clock;
+/// -1 when it does not fit the 24-bit counter.
+pub fn systick_reload(clk_hz: i64, hz: i64) -> i64 {
+    if hz <= 0 { return -1; }
+    val ticks: i64 = clk_hz / hz;
+    if ticks < 1 || ticks - 1 > 0xFFFFFF { return -1; }
+    return ticks - 1;
+}
+
+/// SysTick_Config: reload, lowest priority for SysTick, clear the current
+/// value, then processor clock + interrupt + enable. False (nothing
+/// written) when the period does not fit.
+pub fn systick_config(bus: &mut RegBus, ticks: i64, prio_bits: i64) -> bool {
+    if ticks < 1 || ticks - 1 > 0xFFFFFF { return false; }
+    regbus_write(bus, SYST_RVR, 32, ticks - 1);
+    cm_set_priority(bus, EXC_SYSTICK, (1 << prio_bits) - 1, prio_bits);
+    regbus_write(bus, SYST_CVR, 32, 0);
+    regbus_write(bus, SYST_CSR, 32, SYST_CLKSOURCE | SYST_TICKINT | SYST_ENABLE);
+    return true;
+}
+
+pub fn systick_stop(bus: &mut RegBus) {
+    regbus_write(bus, SYST_CSR, 32, 0);
+}
+
+/// COUNTFLAG: set when the counter wrapped since the last CSR read (reading
+/// clears it on the hardware).
+pub fn systick_wrapped(bus: &mut RegBus) -> bool {
+    return (regbus_read(bus, SYST_CSR, 32) & SYST_COUNTFLAG) != 0;
+}
+
+/// SYST_CALIB decode: "TENMS=<n> SKEW=<0/1> NOREF=<0/1>".
+pub fn systick_calib_decode(v: i64) -> str {
+    return "TENMS=" + int_to_str(v & 0xFFFFFF) + " SKEW=" + int_to_str((v >> 30) & 1) + " NOREF=" + int_to_str((v >> 31) & 1);
+}
+
+/// Nanoseconds between two CVR samples (the counter counts down from
+/// RVR to 0 and reloads) at `clk_hz`.
+pub fn systick_elapsed_ns(start: i64, now: i64, reload: i64, clk_hz: i64) -> i64 {
+    var ticks: i64 = start - now;
+    if ticks < 0 { ticks = ticks + reload + 1; }
+    return ticks * 1000000000 / clk_hz;
+}
+
+// ─── SCB ────────────────────────────────────────────────────────────────
+
+/// Alignment the vector table needs for `n_vectors` entries: the size
+/// rounded up to a power of two, at least 128 bytes (B3.2.5).
+pub fn cm_vtor_align(n_vectors: i64) -> i64 {
+    var a: i64 = 128;
+    while a < n_vectors * 4 { a = a * 2; }
+    return a;
+}
+
+/// Move the vector table. False when `addr` is not aligned for it. The
+/// caller issues DSB; ISB after.
+pub fn cm_set_vtor(bus: &mut RegBus, addr: i64, n_vectors: i64) -> bool {
+    if (addr % cm_vtor_align(n_vectors)) != 0 { return false; }
+    regbus_write(bus, SCB_VTOR, 32, addr & 0xFFFFFF80);
+    return true;
+}
+
+/// Pend PendSV (the context-switch request of most RTOSes).
+pub fn cm_pend_sv(bus: &mut RegBus) {
+    regbus_write(bus, SCB_ICSR, 32, ICSR_PENDSVSET);
+}
+
+/// ICSR.VECTACTIVE: the exception number being handled (0: Thread mode).
+pub fn cm_icsr_active(icsr: i64) -> i64 {
+    return icsr & 0x1FF;
+}
+
+/// ICSR.VECTPENDING: the highest-priority pending exception.
+pub fn cm_icsr_pending(icsr: i64) -> i64 {
+    return (icsr >> 12) & 0x1FF;
+}
+
+/// Enable the configurable fault handlers (SHCSR MEMFAULTENA, BUSFAULTENA,
+/// USGFAULTENA) so faults do not escalate to HardFault.
+pub fn cm_enable_faults(bus: &mut RegBus) {
+    val old: i64 = regbus_read(bus, SCB_SHCSR, 32);
+    regbus_write(bus, SCB_SHCSR, 32, old | 0x70000);
+}
+
+/// Full access to coprocessors CP10/CP11 (the FPU) in CPACR.
+pub fn cm_enable_fpu(bus: &mut RegBus) {
+    val old: i64 = regbus_read(bus, SCB_CPACR, 32);
+    regbus_write(bus, SCB_CPACR, 32, old | (0xF << 20));
+}
+
+/// CPUID decode (B3.2.3): "ARM Cortex-M4 r0p1".
+pub fn cm_cpuid_decode(v: i64) -> str {
+    val impl_: i64 = (v >> 24) & 0xFF;
+    val variant: i64 = (v >> 20) & 0xF;
+    val part: i64 = (v >> 4) & 0xFFF;
+    val rev: i64 = v & 0xF;
+    var who: str = "implementer " + regmap_hex(impl_, 2);
+    if impl_ == 0x41 { who = "ARM"; }
+    var core: str = "part " + regmap_hex(part, 3);
+    if part == 0xC20 { core = "Cortex-M0"; }
+    if part == 0xC60 { core = "Cortex-M0+"; }
+    if part == 0xC21 { core = "Cortex-M1"; }
+    if part == 0xC23 { core = "Cortex-M3"; }
+    if part == 0xC24 { core = "Cortex-M4"; }
+    if part == 0xC27 { core = "Cortex-M7"; }
+    if part == 0xD20 { core = "Cortex-M23"; }
+    if part == 0xD21 { core = "Cortex-M33"; }
+    return who + " " + core + " r" + int_to_str(variant) + "p" + int_to_str(rev);
+}
+
+/// The fault flags set in CFSR (MMFSR bits 7:0, BFSR 15:8, UFSR 31:16).
+pub fn cm_cfsr_decode(cfsr: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var names: Vec<str> = Vec::new();
+    var bitsv: Vec<i64> = Vec::new();
+    names.push("IACCVIOL"); bitsv.push(0);
+    names.push("DACCVIOL"); bitsv.push(1);
+    names.push("MUNSTKERR"); bitsv.push(3);
+    names.push("MSTKERR"); bitsv.push(4);
+    names.push("MLSPERR"); bitsv.push(5);
+    names.push("MMARVALID"); bitsv.push(7);
+    names.push("IBUSERR"); bitsv.push(8);
+    names.push("PRECISERR"); bitsv.push(9);
+    names.push("IMPRECISERR"); bitsv.push(10);
+    names.push("UNSTKERR"); bitsv.push(11);
+    names.push("STKERR"); bitsv.push(12);
+    names.push("LSPERR"); bitsv.push(13);
+    names.push("BFARVALID"); bitsv.push(15);
+    names.push("UNDEFINSTR"); bitsv.push(16);
+    names.push("INVSTATE"); bitsv.push(17);
+    names.push("INVPC"); bitsv.push(18);
+    names.push("NOCP"); bitsv.push(19);
+    names.push("UNALIGNED"); bitsv.push(24);
+    names.push("DIVBYZERO"); bitsv.push(25);
+    var i: i64 = 0;
+    while i < names.len() {
+        if ((cfsr >> bitsv.get(i)) & 1) != 0 { out.push(names.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// HFSR flags: VECTTBL (bit 1), FORCED (30, escalated), DEBUGEVT (31).
+pub fn cm_hfsr_decode(hfsr: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if ((hfsr >> 1) & 1) != 0 { out.push("VECTTBL"); }
+    if ((hfsr >> 30) & 1) != 0 { out.push("FORCED"); }
+    if ((hfsr >> 31) & 1) != 0 { out.push("DEBUGEVT"); }
+    return out;
+}
+
+/// A one-line fault report from the fault registers: the flags, and the
+/// fault address when its VALID bit says MMFAR/BFAR holds one.
+pub fn cm_fault_report(cfsr: i64, hfsr: i64, mmfar: i64, bfar: i64) -> str {
+    var out: str = "";
+    val h: Vec<str> = cm_hfsr_decode(hfsr);
+    if h.len() > 0 { out = "HardFault(" + str_join(h, ",") + ") "; }
+    out = out + "CFSR=" + regmap_hex(cfsr, 8) + " [" + str_join(cm_cfsr_decode(cfsr), ",") + "]";
+    if ((cfsr >> 7) & 1) != 0 { out = out + " MMFAR=" + regmap_hex(mmfar, 8); }
+    if ((cfsr >> 15) & 1) != 0 { out = out + " BFAR=" + regmap_hex(bfar, 8); }
+    return out;
+}
+
+/// Read the fault registers through the bus and report.
+pub fn cm_read_fault(bus: &mut RegBus) -> str {
+    val cfsr: i64 = regbus_read(bus, SCB_CFSR, 32);
+    val hfsr: i64 = regbus_read(bus, SCB_HFSR, 32);
+    val mmfar: i64 = regbus_read(bus, SCB_MMFAR, 32);
+    val bfar: i64 = regbus_read(bus, SCB_BFAR, 32);
+    return cm_fault_report(cfsr, hfsr, mmfar, bfar);
+}
+
+/// Clear the fault flags (CFSR and HFSR are write-1-to-clear).
+pub fn cm_clear_faults(bus: &mut RegBus, cfsr: i64, hfsr: i64) {
+    regbus_write(bus, SCB_CFSR, 32, cfsr);
+    regbus_write(bus, SCB_HFSR, 32, hfsr);
+}
+
+/// The exception frame a fault pushes on the stack (8 words: r0-r3, r12,
+/// lr, pc, xPSR), as "pc=0x... lr=0x... xpsr=0x...".
+pub fn cm_frame_decode(frame: Vec<i64>) -> str {
+    if frame.len() < 8 { return "short frame"; }
+    return "r0=" + regmap_hex(frame.get(0), 8) + " r12=" + regmap_hex(frame.get(4), 8) + " lr=" + regmap_hex(frame.get(5), 8)
+        + " pc=" + regmap_hex(frame.get(6), 8) + " xpsr=" + regmap_hex(frame.get(7), 8);
+}
+
+/// EXC_RETURN decode: which stack and mode the exception returns to.
+pub fn cm_exc_return_decode(v: i64) -> str {
+    val low: i64 = v & 0xF;
+    var where_: str = "invalid";
+    if low == 0x1 { where_ = "Handler mode, MSP"; }
+    if low == 0x9 { where_ = "Thread mode, MSP"; }
+    if low == 0xD { where_ = "Thread mode, PSP"; }
+    if ((v >> 4) & 1) == 0 { where_ = where_ + ", FP frame"; }
+    return where_;
+}
+
+// ─── MPU (PMSAv7) ───────────────────────────────────────────────────────
+
+// RASR.AP values (B3.5.9, Table B3-15).
+pub const MPU_AP_NONE: i64 = 0;
+pub const MPU_AP_PRIV_RW: i64 = 1;
+pub const MPU_AP_PRIV_RW_USER_RO: i64 = 2;
+pub const MPU_AP_FULL: i64 = 3;
+pub const MPU_AP_PRIV_RO: i64 = 5;
+pub const MPU_AP_RO: i64 = 6;
+
+// Memory types as TEX<<2 | C<<1 | B (B3.5.10, Table B3-13). S is separate.
+pub const MPU_STRONGLY_ORDERED: i64 = 0;
+pub const MPU_DEVICE: i64 = 1;
+pub const MPU_NORMAL_WT: i64 = 2;
+pub const MPU_NORMAL_WB: i64 = 3;
+pub const MPU_NORMAL_NC: i64 = 4;
+pub const MPU_NORMAL_WBWA: i64 = 7;
+pub const MPU_DEVICE_NONSHARED: i64 = 8;
+
+/// RASR.SIZE for a region of `bytes` (a power of two >= 32): log2 - 1.
+/// -1 when invalid.
+pub fn mpu_size_field(bytes: i64) -> i64 {
+    if bytes < 32 { return -1; }
+    var n: i64 = 0;
+    var x: i64 = bytes;
+    while x > 1 {
+        if (x & 1) != 0 { return -1; }
+        x = x >> 1;
+        n = n + 1;
+    }
+    return n - 1;
+}
+
+/// RBAR for region `region` at `base` with VALID set (so RNR is written
+/// by the same store).
+pub fn mpu_rbar(base: i64, region: i64) -> i64 {
+    return (base & 0xFFFFFFE0) | 0x10 | (region & 0xF);
+}
+
+/// RASR: enable, size, sub-region disable mask, TEX/C/B memory type
+/// (`texcb` as TEX<<2 | C<<1 | B), shareable, access, execute-never.
+pub fn mpu_rasr(bytes: i64, ap: i64, texcb: i64, shareable: bool, xn: bool, srd: i64) -> i64 {
+    val sz: i64 = mpu_size_field(bytes);
+    if sz < 0 { p_panic("cortex_m: MPU region size " + int_to_str(bytes) + " is not a power of two >= 32"); }
+    var v: i64 = 1 | (sz << 1) | ((srd & 0xFF) << 8);
+    v = v | ((texcb & 1) << 16) | (((texcb >> 1) & 1) << 17) | (((texcb >> 2) & 7) << 19);
+    if shareable { v = v | (1 << 18); }
+    v = v | ((ap & 7) << 24);
+    if xn { v = v | (1 << 28); }
+    return v;
+}
+
+/// Check a region: base aligned to its size. Returns "" when fine.
+pub fn mpu_region_check(base: i64, bytes: i64) -> str {
+    if mpu_size_field(bytes) < 0 { return "size " + int_to_str(bytes) + " not a power of two >= 32"; }
+    if (base % bytes) != 0 { return "base " + regmap_hex(base, 8) + " not aligned to size " + int_to_str(bytes); }
+    return "";
+}
+
+/// Program region `region` (RBAR with VALID, then RASR). Enable the MPU
+/// with mpu_enable afterwards.
+pub fn mpu_set_region(bus: &mut RegBus, region: i64, base: i64, rasr: i64) {
+    regbus_write(bus, MPU_RBAR, 32, mpu_rbar(base, region));
+    regbus_write(bus, MPU_RASR, 32, rasr);
+}
+
+/// MPU_CTRL: ENABLE, plus PRIVDEFENA (privileged code sees the default map
+/// outside regions). DSB+ISB after, on the target.
+pub fn mpu_enable(bus: &mut RegBus, privdefena: bool) {
+    var v: i64 = 1;
+    if privdefena { v = v | 4; }
+    regbus_write(bus, MPU_CTRL, 32, v);
+}
+
+/// MPU_TYPE.DREGION: how many regions the MPU has.
+pub fn mpu_regions(type_: i64) -> i64 {
+    return (type_ >> 8) & 0xFF;
+}
+
+/// Decode a region: "base 0x20000000 size 64K full XN normal-WBWA S".
+pub fn mpu_region_decode(rbar: i64, rasr: i64) -> str {
+    if (rasr & 1) == 0 { return "disabled"; }
+    val sz: i64 = (rasr >> 1) & 0x1F;
+    val bytes: i64 = 1 << (sz + 1);
+    var szs: str = int_to_str(bytes) + "B";
+    if bytes >= 1024 && bytes < 1048576 { szs = int_to_str(bytes / 1024) + "K"; }
+    if bytes >= 1048576 && bytes < 1073741824 { szs = int_to_str(bytes / 1048576) + "M"; }
+    if bytes >= 1073741824 { szs = int_to_str(bytes / 1073741824) + "G"; }
+    val ap: i64 = (rasr >> 24) & 7;
+    var aps: str = "ap" + int_to_str(ap);
+    if ap == 0 { aps = "none"; }
+    if ap == 1 { aps = "priv-rw"; }
+    if ap == 2 { aps = "priv-rw/user-ro"; }
+    if ap == 3 { aps = "full"; }
+    if ap == 5 { aps = "priv-ro"; }
+    if ap == 6 || ap == 7 { aps = "ro"; }
+    val texcb: i64 = (((rasr >> 19) & 7) << 2) | (((rasr >> 17) & 1) << 1) | ((rasr >> 16) & 1);
+    var mt: str = "texcb" + int_to_str(texcb);
+    if texcb == 0 { mt = "strongly-ordered"; }
+    if texcb == 1 { mt = "device"; }
+    if texcb == 2 { mt = "normal-WT"; }
+    if texcb == 3 { mt = "normal-WB"; }
+    if texcb == 4 { mt = "normal-NC"; }
+    if texcb == 7 { mt = "normal-WBWA"; }
+    if texcb == 8 { mt = "device-nonshared"; }
+    var out: str = "base " + regmap_hex(rbar & 0xFFFFFFE0, 8) + " size " + szs + " " + aps;
+    if ((rasr >> 28) & 1) != 0 { out = out + " XN"; }
+    out = out + " " + mt;
+    if ((rasr >> 18) & 1) != 0 { out = out + " S"; }
+    val srd: i64 = (rasr >> 8) & 0xFF;
+    if srd != 0 { out = out + " SRD=" + regmap_hex(srd, 2); }
+    return out;
+}

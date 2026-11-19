@@ -1,0 +1,137 @@
+// RT8: a block p_malloc hands out again is zero in every byte asked for.
+// The C runtime zeroes a reused block's requested bytes (rounded up to 16)
+// with __p_zero: overlapping constant-size stores up to 256 bytes and
+// `rep stosb` beyond (compiler/codegen_c.fd), not the whole size class.
+// Each case fills a block with 0xFF bytes, frees it, asks for a block again
+// and counts the bytes of it that are not zero: every size from 0 to 300
+// (each length __p_zero has a branch for), larger ones up to a block of its
+// own pages (> 1 MB), and a smaller request after a larger one of the same
+// size class (the C runtime gives back the same block).
+//
+// Expected output:
+//   sizes 0..300 not zero: 0
+//   large sizes not zero: 0
+//   same class not zero: 0
+//   kept block intact: true
+
+// fill n bytes at p with 0xFF: whole words, then the bytes after them
+@unsafe
+fn fill(p: i64, n: i64) {
+    var i: i64 = 0;
+    while i + 8 <= n {
+        var w: *mut i64 = p + i;
+        unsafe { *w = -1; }
+        i = i + 8;
+    }
+    while i < n {
+        var b: *mut u8 = p + i;
+        unsafe { *b = 255; }
+        i = i + 1;
+    }
+}
+
+// the bytes of the n at p that are not zero
+@unsafe
+fn nonzero(p: i64, n: i64) -> i64 {
+    var bad: i64 = 0;
+    var i: i64 = 0;
+    while i + 8 <= n {
+        var w: *mut i64 = p + i;
+        var v: i64 = 0;
+        unsafe { v = *w; }
+        if v != 0 {
+            var j: i64 = 0;
+            while j < 8 {
+                var b: *mut u8 = p + i + j;
+                var x: i64 = 0;
+                unsafe { x = (*b) as i64; }
+                if x != 0 {
+                    bad = bad + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 8;
+    }
+    while i < n {
+        var b: *mut u8 = p + i;
+        var x: i64 = 0;
+        unsafe { x = (*b) as i64; }
+        if x != 0 {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+// fill a block of `size` bytes, free it, ask for `again` bytes: the bytes
+// of the new block that are not zero
+@unsafe
+fn reuse(size: i64, again: i64) -> i64 {
+    val a: i64 = p_malloc(size);
+    fill(a, size);
+    p_free(a);
+    val b: i64 = p_malloc(again);
+    val bad: i64 = nonzero(b, again);
+    p_free(b);
+    return bad;
+}
+
+@unsafe
+fn main() -> i64 {
+    // a block kept across all the cases, whose bytes must stay as written
+    val kept: i64 = p_malloc(40);
+    fill(kept, 40);
+
+    var bad: i64 = 0;
+    var s: i64 = 0;
+    while s <= 300 {
+        bad = bad + reuse(s, s);
+        s = s + 1;
+    }
+    println("sizes 0..300 not zero: " + int_to_str(bad));
+
+    bad = 0;
+    var big: Vec<i64> = Vec::new();
+    big.push(384);
+    big.push(500);
+    big.push(1000);
+    big.push(4096);
+    big.push(5000);
+    big.push(65536);
+    big.push(70000);
+    big.push(300000);
+    big.push(1100000);
+    var i: i64 = 0;
+    while i < big.len() {
+        bad = bad + reuse(big.get(i), big.get(i));
+        i = i + 1;
+    }
+    println("large sizes not zero: " + int_to_str(bad));
+
+    // 240 and 200 bytes are both in the C runtime's 256-byte class, 1000
+    // and 900 in the 1024-byte one, 100000 and 99000 in the 128 KB one, 20 and
+    // 18 in the 32-byte one
+    bad = reuse(240, 200) + reuse(1000, 900) + reuse(100000, 99000) + reuse(20, 18);
+    println("same class not zero: " + int_to_str(bad));
+
+    var intact: bool = true;
+    var k: i64 = 0;
+    while k < 40 {
+        var b: *mut u8 = kept + k;
+        var x: i64 = 0;
+        unsafe { x = (*b) as i64; }
+        if x != 255 {
+            intact = false;
+        }
+        k = k + 1;
+    }
+    p_free(kept);
+    if intact {
+        println("kept block intact: true");
+    } else {
+        println("kept block intact: false");
+    }
+    return 0;
+}

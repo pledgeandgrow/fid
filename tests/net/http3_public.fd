@@ -1,0 +1,64 @@
+// stdlib/http3 client against a public HTTP/3 server: one GET with
+// h3_udp_fetch (stdlib/http3_udp.fd) over the Internet. The server's
+// certificate is RSA or ECDSA, so the client runs without a pinned key
+// (stdlib/quic_tls.fd then accepts any server, like `curl -k`: this checks
+// the protocol, not the server's identity). The address may be IPv4 or
+// IPv6 text (stdlib/udp.fd).
+//
+// Not in the suite (needs the network). Build as
+// tests/net/http3_udp_loopback.fd says (output `hp`), then on Linux:
+//   ./hp $(getent ahostsv4 cloudflare-quic.com | head -1 | cut -d' ' -f1) cloudflare-quic.com /
+//   ./hp $(getent ahostsv4 www.google.com | head -1 | cut -d' ' -f1) www.google.com /
+// Arguments: the server's IPv4 address, its name (SNI and :authority),
+// the path. It prints the status, the body's size and the server field,
+// and exits 0 for a 2xx or 3xx response:
+//
+// Expected output (cloudflare-quic.com):
+// h3 GET https://cloudflare-quic.com/ -> 200
+// body bytes: (the page's size, over 0)
+// server: cloudflare
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use quic_udp;
+use http3;
+use http3_udp;
+
+fn arg_or(i: i64, d: str) -> str {
+    match arg_at(i) {
+        Option::Some(a) => {
+            return a;
+        }
+        Option::None => {}
+    }
+    return d;
+}
+
+fn main() -> i64 {
+    val ip: str = arg_or(1, "104.18.29.112");
+    val host: str = arg_or(2, "cloudflare-quic.com");
+    val path: str = arg_or(3, "/");
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    val cfg: QuicConfig = quic_config_client(alpn, host);
+    var names: Vec<str> = Vec::new();
+    var values: Vec<str> = Vec::new();
+    names.push("user-agent");
+    values.push("fides-http3/1.0");
+    names.push("accept");
+    values.push("*/*");
+    var none: Vec<i64> = Vec::new();
+    val m: H3Message = h3_udp_fetch(ip, 443, cfg, "GET", host, path, names, values, none, 15000);
+    if !m.ok {
+        println("h3 GET https://" + host + path + " failed: " + m.why);
+        return 1;
+    }
+    println("h3 GET https://" + host + path + " -> " + int_to_str(m.status));
+    println("body bytes: " + int_to_str(m.body.len()));
+    println("server: " + h3_field(& m, "server"));
+    if m.status >= 200 && m.status < 400 {
+        return 0;
+    }
+    return 1;
+}

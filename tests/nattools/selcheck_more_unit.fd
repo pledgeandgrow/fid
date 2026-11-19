@@ -1,0 +1,175 @@
+// RL6 (docs/roadmap/llvm-roadmap.md): translation validation of
+// instruction selection beyond the integer ALU (compiler/nat_ir.fd
+// nat_sel_check_more, which `FID_VERIFY=1` builds run from nat_sel_check):
+// float operations (MO_FBIN, MO_FCMP, MO_I2F, MO_F2I, f64 and f32), loads
+// and stores of every size and sign (MO_LOAD / MO_STORE / MO_LDX / MO_STX,
+// against a memory model), branches (MO_BRCC, MO_BNEZ / MO_BEQZ, MO_TBNZ:
+// taken or not) and calls (argument registers and outgoing stack slots,
+// MO_CALL / MO_CALLR), each selected alone and run by compiler/nat_enc.fd's
+// evaluator on edge and pseudo-random values; then the whole nat_sel_check.
+// Then the evaluator is shown to catch wrong code: mutated selections
+// (a wrong operation, a wrong size, a wrong condition, a missing argument)
+// must be rejected.
+// Run (a C compiler on PATH: zig cc, cl or tcc):
+//   fid ccompile tests/nattools/selcheck_more_unit.fd -o selcheck_more
+//   ./selcheck_more
+// and with FID_NAT_ON=fregs (float registers) and FID_NAT_OFF=isel (the
+// hand-written selection). Expected output:
+// a64 floats ok
+// a64 memory ok
+// a64 branches ok
+// a64 calls ok
+// a64 all ok
+// rv64 floats ok
+// rv64 memory ok
+// rv64 branches ok
+// rv64 calls ok
+// rv64 all ok
+// x64 floats ok
+// x64 memory ok
+// x64 branches ok
+// x64 calls ok
+// x64 all ok
+// x64 x86-64-v3 all ok
+// rv64 rva23u64 all ok
+// mutants caught: 12 of 12
+use core;
+use vec;
+use string;
+use compiler::mir;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn report(name: str, what: str, err: str) {
+    if err == "" {
+        println(name + " " + what + " ok");
+    } else {
+        println(name + " " + what + " FAIL: " + err);
+    }
+}
+
+fn check(name: str, arch: i64) {
+    report(name, "floats", nat_sel_check_more_part(arch, 0));
+    report(name, "memory", nat_sel_check_more_part(arch, 1));
+    report(name, "branches", nat_sel_check_more_part(arch, 2));
+    report(name, "calls", nat_sel_check_more_part(arch, 3));
+    report(name, "all", nat_sel_check(arch));
+}
+
+// The evaluator must reject wrong code: each mutant is a selection of one
+// operation evaluated as another (or a sequence missing a step).
+// 1 when evaluating mutant n gave an error (want_err) or none (!want_err)
+fn mutant(n: i64, err: str, want_err: bool) -> i64 {
+    if (err != "") == want_err {
+        return 1;
+    }
+    if want_err {
+        println("mutant " + int_to_str(n) + " not caught");
+    } else {
+        println("mutant " + int_to_str(n) + " rejected: " + err);
+    }
+    return 0;
+}
+
+fn mutants() -> i64 {
+    var caught: i64 = 0;
+    var e: NatEnc = NatEnc_new();
+    // x86-64: addsd evaluated as subsd
+    x64_movq_xr(& mut e, 0, 12, true);
+    x64_movq_xr(& mut e, 1, 13, true);
+    x64_sse(& mut e, 0xF2, 0x58, 0, 1);
+    x64_movq_rx(& mut e, 3, 0, true);
+    caught = caught + mutant(1, nat_sel_eval_float(NAT_X64, e.code, NSEL_FBIN, 3, 12, 13, 2, 0), true);
+    // x86-64: the f64 path used for an f32 (no conversion)
+    caught = caught + mutant(2, nat_sel_eval_float(NAT_X64, e.code, NSEL_FBIN, 3, 12, 13, 1, 1), true);
+    // x86-64: ucomisd + seta evaluated as GE (needs AE)
+    var e2: NatEnc = NatEnc_new();
+    x64_movq_xr(& mut e2, 0, 12, true);
+    x64_movq_xr(& mut e2, 1, 13, true);
+    x64_sse(& mut e2, 0x66, 0x2E, 0, 1);
+    x64_setcc(& mut e2, X64_A, 11);
+    x64_movx(& mut e2, 0xB6, 3, 11);
+    caught = caught + mutant(3, nat_sel_eval_float(NAT_X64, e2.code, NSEL_FCMP, 3, 12, 13, 5, 0), true);
+    // x86-64: EQ without the parity check (NaN == NaN would be true)
+    var e3: NatEnc = NatEnc_new();
+    x64_movq_xr(& mut e3, 0, 12, true);
+    x64_movq_xr(& mut e3, 1, 13, true);
+    x64_sse(& mut e3, 0x66, 0x2E, 0, 1);
+    x64_setcc(& mut e3, X64_E, 11);
+    x64_movx(& mut e3, 0xB6, 3, 11);
+    caught = caught + mutant(4, nat_sel_eval_float(NAT_X64, e3.code, NSEL_FCMP, 3, 12, 13, 0, 0), true);
+    // AArch64: a zero-extending load evaluated as a signed one
+    var e4: NatEnc = NatEnc_new();
+    a64_ldr_sized(& mut e4, 19, 20, 8, 2, false);
+    caught = caught + mutant(5, nat_sel_eval_mem(NAT_A64, e4.code, false, 19, 20, 0 - 1, 0, 8, 2, true), true);
+    // AArch64: an 8-byte store evaluated as a 4-byte one
+    var e5: NatEnc = NatEnc_new();
+    a64_str_sized(& mut e5, 19, 20, 8, 8);
+    caught = caught + mutant(6, nat_sel_eval_mem(NAT_A64, e5.code, true, 19, 20, 0 - 1, 0, 8, 4, false), true);
+    // RISC-V: a load at the wrong displacement
+    var e6: NatEnc = NatEnc_new();
+    rv_load(& mut e6, 18, 19, 16, 8, true);
+    caught = caught + mutant(7, nat_sel_eval_mem(NAT_RV64, e6.code, false, 18, 19, 0 - 1, 0, 8, 8, true), true);
+    // RISC-V: a signed branch for an unsigned compare (BLT for LTU)
+    var e7: NatEnc = NatEnc_new();
+    var l7: i64 = NatEnc_label(& mut e7);
+    rv_b_label(& mut e7, RV_BLT, 19, 20, l7);
+    var ft7: i64 = e7.code.len();
+    NatEnc_word(& mut e7, 0x13);
+    NatEnc_word(& mut e7, 0x13);
+    NatEnc_place(& mut e7, l7);
+    var tk7: i64 = e7.code.len();
+    NatEnc_word(& mut e7, 0x13);
+    NatEnc_resolve(& mut e7);
+    caught = caught + mutant(8, nat_sel_eval_branch(NAT_RV64, e7.code, ft7, tk7, NSEL_BRCC, 19, 20, 6, 0, 0), true);
+    // AArch64: CBZ evaluated as BNEZ
+    var e8: NatEnc = NatEnc_new();
+    var l8: i64 = NatEnc_label(& mut e8);
+    a64_cbz(& mut e8, 20, l8);
+    var ft8: i64 = e8.code.len();
+    NatEnc_word(& mut e8, 0xD503201F);
+    NatEnc_place(& mut e8, l8);
+    var tk8: i64 = e8.code.len();
+    NatEnc_word(& mut e8, 0xD503201F);
+    NatEnc_resolve(& mut e8);
+    caught = caught + mutant(9, nat_sel_eval_branch(NAT_A64, e8.code, ft8, tk8, NSEL_BNEZ, 20, 20, 0, 0, 31), true);
+    // x86-64: a call whose second argument was never set
+    var e9: NatEnc = NatEnc_new();
+    x64_li(& mut e9, 7, 11);
+    var l9: i64 = NatEnc_label(& mut e9);
+    x64_call(& mut e9, l9);
+    NatEnc_byte(& mut e9, 0x90);
+    NatEnc_place(& mut e9, l9);
+    var tk9: i64 = e9.code.len();
+    NatEnc_byte(& mut e9, 0x90);
+    NatEnc_resolve(& mut e9);
+    var wr: Vec<i64> = Vec::new();
+    wr.push(7);
+    wr.push(6);
+    var wv: Vec<i64> = Vec::new();
+    wv.push(11);
+    wv.push(22);
+    caught = caught + mutant(10, nat_sel_eval_call(NAT_X64, e9.code, Vec::new(), Vec::new(), wr, wv, Vec::new(), 4, 0x7FFE0000, tk9), true);
+    // x86-64: the right call, but to the wrong target
+    var wr1: Vec<i64> = Vec::new();
+    wr1.push(7);
+    var wv1: Vec<i64> = Vec::new();
+    wv1.push(11);
+    caught = caught + mutant(11, nat_sel_eval_call(NAT_X64, e9.code, Vec::new(), Vec::new(), wr1, wv1, Vec::new(), 4, 0x7FFE0000, tk9 + 1), true);
+    // ... and that same call accepted with the right target (no false alarm)
+    caught = caught + mutant(12, nat_sel_eval_call(NAT_X64, e9.code, Vec::new(), Vec::new(), wr1, wv1, Vec::new(), 4, 0x7FFE0000, tk9), false);
+    return caught;
+}
+
+fn main() {
+    check("a64", NAT_A64);
+    check("rv64", NAT_RV64);
+    check("x64", NAT_X64);
+    // the selections that differ by --cpu (BMI1/BMI2; Zba, Zbb, Zicond)
+    g_nat_cpu = "x86-64-v3";
+    report("x64 x86-64-v3", "all", nat_sel_check(NAT_X64));
+    g_nat_cpu = "rva23u64";
+    report("rv64 rva23u64", "all", nat_sel_check(NAT_RV64));
+    g_nat_cpu = "";
+    println("mutants caught: " + int_to_str(mutants()) + " of 12");
+}

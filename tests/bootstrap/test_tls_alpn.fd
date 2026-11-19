@@ -1,0 +1,57 @@
+// stdlib/tls_alpn (competitive SL1): ALPN's protocol name lists (RFC 7301
+// section 3.1) and the server's choice (3.2) that module `tls` uses on
+// every platform (Schannel's SECBUFFER_APPLICATION_PROTOCOLS block and
+// OpenSSL's select callback carry these bytes). No network.
+//
+// Expected output:
+// wire h2,http/1.1: 2 104 50 8 104 116 116 112 47 49 46 49
+// wire spaces: 2 104 50 8 104 116 116 112 47 49 46 49
+// wire empty names dropped: 2 104 50
+// wire nothing: 0 bytes
+// names: h2 | http/1.1
+// valid: true false false false
+// pick h2 first: h2
+// pick server order: http/1.1
+// pick none: []
+// pick malformed: []
+// choose offset: 3
+use tls_alpn;
+use vec;
+use string;
+
+fn show(b: Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + int_to_str(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    println("wire h2,http/1.1: " + show(tls_alpn_wire("h2,http/1.1")));
+    println("wire spaces: " + show(tls_alpn_wire(" h2 , http/1.1 ")));
+    println("wire empty names dropped: " + show(tls_alpn_wire(",h2,,")));
+    println("wire nothing: " + int_to_str(tls_alpn_wire(" , ").len()) + " bytes");
+    val names: Vec<str> = tls_alpn_names(tls_alpn_wire("h2,http/1.1"));
+    println("names: " + names.get(0) + " | " + names.get(1));
+    // A length running past the end, a zero length, an empty list
+    var cut: Vec<i64> = Vec::new();
+    cut.push(5);
+    cut.push(104);
+    var zero: Vec<i64> = Vec::new();
+    zero.push(0);
+    println("valid: " + bool_to_str(tls_alpn_valid(tls_alpn_wire("h2"))) + " " + bool_to_str(tls_alpn_valid(cut)) + " " + bool_to_str(tls_alpn_valid(zero)) + " " + bool_to_str(tls_alpn_valid(Vec::new())));
+    // The server's preference wins (RFC 7301 3.2)
+    println("pick h2 first: " + tls_alpn_pick("h2,http/1.1", tls_alpn_wire("http/1.1,h2")));
+    println("pick server order: " + tls_alpn_pick("http/1.1,h2", tls_alpn_wire("h2,http/1.1")));
+    println("pick none: [" + tls_alpn_pick("h2", tls_alpn_wire("spdy/3,http/1.1")) + "]");
+    println("pick malformed: [" + tls_alpn_pick("h2", cut) + "]");
+    // "http/1.1" sits after h2's 3 bytes in the server's list
+    println("choose offset: " + int_to_str(tls_alpn_choose(tls_alpn_wire("h2,http/1.1"), tls_alpn_wire("http/1.1"))));
+    return 0;
+}

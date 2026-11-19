@@ -35,16 +35,19 @@ extern "C" {
     fn TlsAlloc as pe_k_tls_alloc() -> u32;
     fn TlsGetValue as pe_k_tls_get(key: i64) -> i64;
     fn TlsSetValue as pe_k_tls_set(key: i64, value: i64) -> i32;
-    // Machine-code primitives (pe.rs)
-    fn pe_atomic_load(addr: i64) -> i64;
-    fn pe_atomic_store(addr: i64, value: i64);
-    fn pe_atomic_add(addr: i64, value: i64) -> i64;
-    fn pe_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool;
+    // Machine-code primitives (pe_ir_stubs.fd). MI20: the C name is the
+    // machine layer's interface name (prim_interface_names), the Fides
+    // name the one this runtime calls; pe_ir gives both the same bytes
+    // (PeirGen_nat_alias)
+    fn nat_atomic_load as pe_atomic_load(addr: i64) -> i64;
+    fn nat_atomic_store as pe_atomic_store(addr: i64, value: i64);
+    fn nat_atomic_add as pe_atomic_add(addr: i64, value: i64) -> i64;
+    fn nat_atomic_cas as pe_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool;
     fn pe_fn_lookup(name: str) -> i64;
-    fn pe_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
+    fn nat_call_fn as pe_call_fn(addr: i64, nargs: i64, argv: i64) -> i64;
     fn pe_thread_entry_addr() -> i64;
-    fn pe_ctx_swap(save: i64, sp: i64);
-    fn pe_ctx_tramp_addr() -> i64;
+    fn nat_ctx_swap as pe_ctx_swap(save: i64, sp: i64);
+    fn nat_ctx_tramp as pe_ctx_tramp_addr() -> i64;
 }
 
 // Readiness of a socket through its AFD driver, completed on an I/O
@@ -88,12 +91,18 @@ fn pe_pending() -> i64 {
 fn pe_load(addr: i64) -> i64 {
     var p: *mut i64 = addr;
     var v: i64 = 0;
+    // SAFETY: NOT checked here: every caller in this file reads a word of a
+    // block it allocated (thread/task blocks, contexts, queues, channels,
+    // the timer heap) or one the kernel filled (SYSTEM_INFO, addrinfo);
+    // the layouts are in each section's comment.
     unsafe { v = *p; }
     return v;
 }
 
 fn pe_store(addr: i64, value: i64) {
     var p: *mut i64 = addr;
+    // SAFETY: NOT checked here: as pe_load, a word of a block of this
+    // runtime's.
     unsafe { *p = value; }
 }
 
@@ -106,6 +115,176 @@ fn pe_zeroed(n: i64) -> i64 {
         i = i + 1;
     }
     return block;
+}
+
+// ─── Anonymous mappings (CU7, stdlib/mmap.fd) ────────────
+// As the C runtime's p_mmap_*: VirtualAlloc'd pages, and a table of 256
+// [address, length] pairs (made on first use) for p_mmap_len and
+// p_munmap. Like the C runtime's table, not shared safely between threads.
+
+var pe_mmap_tab: i64 = 0;
+
+fn pe_mmap_table() -> i64 {
+    if pe_mmap_tab == 0 {
+        pe_mmap_tab = pe_zeroed(512);
+    }
+    return pe_mmap_tab;
+}
+
+/// The table index of mapping `addr` (0: a free entry), -1 when none.
+fn pe_mmap_find(addr: i64) -> i64 {
+    var t: i64 = pe_mmap_table();
+    var i: i64 = 0;
+    while i < 256 {
+        if pe_load(t + i * 16) == addr {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// `len` zeroed read/write bytes of their own pages; 0 on failure.
+pub fn pert_mmap_anon(len: i64) -> i64 {
+    if len <= 0 {
+        return 0;
+    }
+    var s: i64 = pe_mmap_find(0);
+    if s < 0 {
+        return 0;
+    }
+    // MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE (pages read zero)
+    var p: i64 = pe_k_valloc(0, len, 12288, 4);
+    if p == 0 {
+        return 0;
+    }
+    var t: i64 = pe_mmap_table();
+    pe_store(t + s * 16, p);
+    pe_store(t + s * 16 + 8, len);
+    return p;
+}
+
+/// The length of mapping `addr`, 0 when it is not one.
+pub fn pert_mmap_len(addr: i64) -> i64 {
+    if addr == 0 {
+        return 0;
+    }
+    var s: i64 = pe_mmap_find(addr);
+    if s < 0 {
+        return 0;
+    }
+    return pe_load(pe_mmap_table() + s * 16 + 8);
+}
+
+/// Unmap `addr`: 0, or -1 when it is not a mapping.
+pub fn pert_munmap(addr: i64) -> i64 {
+    if addr == 0 {
+        return 0 - 1;
+    }
+    var s: i64 = pe_mmap_find(addr);
+    if s < 0 {
+        return 0 - 1;
+    }
+    var t: i64 = pe_mmap_table();
+    pe_store(t + s * 16, 0);
+    pe_store(t + s * 16 + 8, 0);
+    pe_k_vfree(addr, 0, 32768);
+    // MEM_RELEASE
+    return 0;
+}
+
+// ─── Random-choice scheduling (competitive RL17) ─────────
+// FIDES_SCHED_RANDOM=<seed> (a decimal number, not 0) turns it on, for
+// interleaving tests (scripts/verify/interleave.py --sched-random): one
+// worker thread, which takes the next task at random among all runnable
+// ones instead of the oldest; a task's loop safepoint (pert_co_tick) gives
+// up control one time in two whenever another task is runnable; threads
+// (p_thread_spawn), mutexes, atomics and channels sleep 0 or 1 ms one time
+// in four, so OS-thread interleavings vary too. The scheduler's choices
+// follow from the seed (the OS still schedules the threads). Off, each hook
+// costs one load. The same switch drives linux_runtime/conc.fd.
+var pert_rnd: i64 = 0;         // *i64: the xorshift state
+var pert_rnd_on: i64 = 0;      // 0 not read yet, 1 random mode, 2 off
+
+/// Random mode is on (FIDES_SCHED_RANDOM, read once).
+fn pe_rnd_enabled() -> bool {
+    if pert_rnd_on == 0 {
+        pe_rnd_init();
+    }
+    return pert_rnd_on == 1;
+}
+
+fn pe_rnd_byte(p: i64) -> i64 {
+    var bp: *mut u8 = p;
+    var b: i64 = 0;
+    // SAFETY: p is inside the NUL-terminated string getenv returned (the
+    // caller stops at its first byte that is not a digit, the NUL included).
+    unsafe { b = *bp; }
+    return b;
+}
+
+@wrapping
+fn pe_rnd_init() {
+    var s: i64 = pe_c_getenv("FIDES_SCHED_RANDOM") as i64;
+    var seed: i64 = 0;
+    if s != 0 {
+        var i: i64 = 0;
+        var b: i64 = pe_rnd_byte(s);
+        while b >= 48 && b <= 57 && i < 18 {
+            seed = seed * 10 + (b - 48);
+            i = i + 1;
+            b = pe_rnd_byte(s + i);
+        }
+    }
+    if seed == 0 {
+        pert_rnd_on = 2;
+        return;
+    }
+    // two threads may read it at once: each makes the same state
+    var st: i64 = pe_zeroed(1);
+    var x: i64 = seed * 2654435761 + 88172645463325252;
+    if x == 0 {
+        x = 1;
+    }
+    pe_store(st, x);
+    pert_rnd = st;
+    pert_rnd_on = 1;
+}
+
+/// The next number of the xorshift64 sequence (shared by every thread), >= 0.
+@wrapping
+fn pe_rnd_next() -> i64 {
+    while true {
+        var x: i64 = pe_atomic_load(pert_rnd);
+        var y: i64 = x ^ (x << 13);
+        y = y ^ ((y >> 7) & 0x01FFFFFFFFFFFFFF);
+        y = y ^ (y << 17);
+        if pe_atomic_cas(pert_rnd, x, y) == true {
+            return y & 0x7FFFFFFFFFFFFFFF;
+        }
+    }
+    return 0;
+}
+
+/// A random number in [0, n) (0 when n <= 1).
+fn pe_rnd_below(n: i64) -> i64 {
+    if n <= 1 {
+        return 0;
+    }
+    return pe_rnd_next() % n;
+}
+
+/// An OS-thread interleaving point: in random mode, sleep 1 ms one time in
+/// eight and give up the CPU one time in eight.
+fn pe_rnd_jitter() {
+    if pe_rnd_enabled() {
+        var r: i64 = pe_rnd_below(8);
+        if r == 0 {
+            pe_k_sleep(1);
+        } else if r == 1 {
+            pe_k_sleep(0);
+        }
+    }
 }
 
 // ─── The thread table ───────────────────────────────────────────────────
@@ -129,6 +308,10 @@ fn pe_thread_tables() {
 
 /// Start the program function `name` with argv[0..nargs) on a new thread.
 pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    // LG11: p_co_stack by name (the C runtime's handshake): -2 here
+    if name == "__p_co_stack" {
+        return pert_c_p_co_stack(0);
+    }
     var fn_addr: i64 = pe_fn_lookup(name);
     if fn_addr == 0 {
         return -1;
@@ -159,6 +342,12 @@ pub fn pert_executor_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
 
 /// Runs on the new thread: the function, then its result and done flag.
 pub fn pert_thread_main(block: i64) -> i64 {
+    pe_rnd_jitter();
+    // SL15: every OS thread is one the sampling profiler can look at (a
+    // task, entered here too, runs on a thread already registered)
+    if pe_load(block + 96) == 0 {
+        pe_pf_thread_start(pe_load(block));
+    }
     var result: i64 = pe_call_fn(pe_load(block), pe_load(block + 8), block + 16);
     pe_store(block + 88, result);
     pe_atomic_store(block + 80, 1);
@@ -188,9 +377,14 @@ var pert_stk_lock: i64 = 0;    // SRWLOCK of the stack cache
 var pert_stk_free: i64 = 0;    // cached stack bases
 var pert_stk_n: i64 = 0;
 
-/// The context of the running thread's own stack
+/// The context of the running thread's own stack. It has a fifth word: [4]
+/// the task that last left to it (pe_co_leave_as), which is not always the
+/// one the worker resumed: a yield can hand the worker straight to the next
+/// task (pe_co_handoff), and that one leaves to the scheduler later. [5] is
+/// the worker's id + 1 (0: not a worker's), so a yield finds its queue
+/// without a TLS lookup.
 fn pe_ctx_thread() -> i64 {
-    var ctx: i64 = pe_zeroed(4);
+    var ctx: i64 = pe_zeroed(6);
     pe_store(ctx + 16, 1);
     return ctx;
 }
@@ -295,7 +489,10 @@ fn pe_ctx_free(ctx: i64) {
 // blocking-pool job, [24] the wait state: 0 runnable-or-running, 1 blocked on a
 // wait in the registry (fd/join/pool), 2 already requeued by a wake, 3 blocked
 // on a deadline in the timer heap only, 4 blocked on a socket poll on the
-// completion port; [28] that poll (RT11).
+// completion port; [28] that poll (RT11); [30] its token slot (CA7/CA8,
+// "Token slot" below); (CA9) [31] its function's name, [32] the name of the
+// task that started it (0: started off a task), [33] the task awaiting it
+// (set while it waits).
 // [24] exists because two threads can requeue a task: its worker when it
 // yields runnable, the poller/pool when its wait ends. A yielded task leaves
 // with [24] = 0 and only its worker requeues it; a blocked task leaves with
@@ -305,9 +502,9 @@ fn pe_ctx_free(ctx: i64) {
 // A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
 //
 // M:N: `pert_nworkers` OS worker threads each run a scheduler context that pops
-// runnable tasks off one global run queue (`pert_wq`), so tasks migrate across
-// CPUs and there is no stealing to implement — the shared queue IS the work
-// distribution. A dedicated poller thread owns the fd-wait set (WSAPoll),
+// runnable tasks off its own lock-free ring (RT10), then the global queue
+// (`pert_wq`, for tasks woken off a worker), then steals half of a sibling's
+// ring, so tasks migrate across CPUs. A dedicated poller thread owns the fd-wait set (WSAPoll),
 // timers and task-join wakeups; a small pool runs blocking calls so a task in
 // a syscall never stalls its worker. Workers park on a condition variable when
 // the queue is empty.
@@ -320,13 +517,13 @@ var pert_co_total: i64 = 0;
 var pert_tls_cur: i64 = 0;     // TLS slot: current task on this thread
 var pert_tls_sched: i64 = 0;   // TLS slot: this thread's scheduler context
 var pert_tls_wid: i64 = 0;     // TLS slot: worker id + 1 (0 = not a worker)
-var pert_lq: i64 = 0;          // per-worker queues: [wid*16]=head [wid*16+8]=tail
-var pert_lq_any: i64 = 0;      // *i64 — count of tasks on all local queues
+var pert_lq: i64 = 0;          // per-worker rings: PE_LQ_REC bytes each (RT10)
 var pert_dl_streak: i64 = 0;   // consecutive dead-looking poller cycles
 
-var pert_wq: i64 = 0;          // [0] SRWLOCK [8] COND — guards head/tail
+var pert_wq: i64 = 0;          // [0] SRWLOCK [8] COND — guards head/tail/n
 var pert_wq_head: i64 = 0;
 var pert_wq_tail: i64 = 0;
+var pert_wq_n: i64 = 0;        // tasks on the global queue
 
 var pert_reg: i64 = 0;         // SRWLOCK guarding the task registry
 var pert_done: i64 = 0;        // [0] lock [8] cond — broadcast on task finish
@@ -336,6 +533,7 @@ var pert_pool_head: i64 = 0;
 var pert_pool_tail: i64 = 0;
 
 var pert_live: i64 = 0;        // *i64 — unfinished task count
+var pert_offq: i64 = 0;        // *i64 — tasks made but not yet queued or entered
 var pert_idle: i64 = 0;        // *i64 — workers parked on wq
 var pert_nworkers: i64 = 0;
 var pert_started: i64 = 0;     // *i64 — CAS-guarded one-time init
@@ -363,109 +561,569 @@ pub fn pe_co_cur() -> i64 {
     return pe_k_tls_get(pert_tls_cur);
 }
 
-// ─── Run queues: one global + one local per worker ─────────
-// Work pushed on a worker stays on its own queue (spawn locality);
-// a worker whose queue is dry pops the global queue, then steals
-// from a sibling. All run queues share `pert_wq`'s lock — the
-// critical sections are pointer swaps only.
+// ─── Run queues: one lock-free ring per worker + one global (RT10) ───
+// Work pushed on a worker stays on its own ring (spawn locality). Each ring
+// is a bounded Chase-Lev deque taken FIFO (as Go's runq and Tokio's local
+// queue): only its worker pushes, at `bottom`, with plain stores and one
+// fenced store that publishes the slot; its worker and the thieves take at
+// `top` by compare-and-swap, so each slot is claimed once and no lock is
+// taken. FIFO, not the owner-LIFO of the paper, so a task that yields goes
+// behind the others on its ring instead of running again at once. A worker
+// whose ring is dry takes the global queue's head and a share of the rest in
+// one lock hold, then steals half of a sibling's ring in one CAS (Go's
+// runqsteal: copy the slots, then claim them; a failed claim retries). A
+// full ring moves half of itself to the global queue at once. The global
+// queue (`pert_wq`'s lock) holds what threads that are not workers wake
+// (the poller, the blocking pool, main); its condition variable parks idle
+// workers. Indexes only grow (no ABA); a slot is `index & (PE_LQ_CAP - 1)`.
+// A worker's record (PE_LQ_REC bytes, its words on separate cache lines):
+// [0] top, [64] bottom, [128] the ring (PE_LQ_CAP words), [136] where its
+// next steal starts.
 
-// Append t to worker wid's local queue (wq lock held).
-fn pe_lq_push_locked(t: i64, wid: i64) {
-    var tail: i64 = pe_load(pert_lq + wid * 16 + 8);
-    pe_store(t + 176, 0);
-    if tail != 0 {
-        pe_store(tail + 176, t);
-    } else {
-        pe_store(pert_lq + wid * 16, t);
+const PE_LQ_CAP: i64 = 256;
+const PE_LQ_REC: i64 = 192;
+
+fn pe_lq_rec(wid: i64) -> i64 {
+    return pert_lq + wid * PE_LQ_REC;
+}
+
+/// Tasks on worker wid's ring, a snapshot (thieves may change it at once).
+fn pe_lq_size(wid: i64) -> i64 {
+    var q: i64 = pe_lq_rec(wid);
+    var t: i64 = pe_atomic_load(q);
+    var b: i64 = pe_atomic_load(q + 64);
+    if b > t {
+        return b - t;
     }
-    pe_store(pert_lq + wid * 16 + 8, t);
-    pe_atomic_add(pert_lq_any, 1);
+    return 0;
 }
 
-// Pop the head of worker wid's local queue (wq lock held). 0 if empty.
-fn pe_lq_pop_locked(wid: i64) -> i64 {
-    var t: i64 = pe_load(pert_lq + wid * 16);
-    if t == 0 { return 0; }
-    var nx: i64 = pe_load(t + 176);
-    pe_store(pert_lq + wid * 16, nx);
-    if nx == 0 { pe_store(pert_lq + wid * 16 + 8, 0); }
-    pe_store(t + 176, 0);
-    pe_store(t + 192, 0);
-    pe_atomic_add(pert_lq_any, 0 - 1);
-    return t;
-}
-
-// Steal one task from another worker's queue (wq lock held). 0 if none.
-fn pe_lq_steal_locked(wid: i64) -> i64 {
+/// Tasks on every worker's ring (the deadlock detector's snapshot).
+fn pe_lq_total() -> i64 {
+    var n: i64 = 0;
     var i: i64 = 0;
     while i < pert_nworkers {
-        if i != wid {
-            var t: i64 = pe_lq_pop_locked(i);
-            if t != 0 { return t; }
+        n = n + pe_lq_size(i);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Worker wid's thread only: put t on its ring. False when the ring is full.
+fn pe_lq_push(t: i64, wid: i64) -> bool {
+    var q: i64 = pe_lq_rec(wid);
+    var b: i64 = pe_load(q + 64);           // only this thread writes bottom
+    if b - pe_atomic_load(q) >= PE_LQ_CAP {
+        return false;
+    }
+    pe_store(pe_load(q + 128) + (b & (PE_LQ_CAP - 1)) * 8, t);
+    if pert_nworkers == 1 {
+        pe_store(q + 64, b + 1);             // no thief, nobody to wake
+    } else {
+        // xchg: the slot is visible before the index, and the caller's
+        // read of pert_idle after it cannot pass it (no lost wake-up)
+        pe_atomic_store(q + 64, b + 1);
+    }
+    return true;
+}
+
+/// Take the oldest task of worker wid's ring (its thread, or RL17's single
+/// worker). 0 if the ring is empty.
+fn pe_lq_pop(wid: i64) -> i64 {
+    var q: i64 = pe_lq_rec(wid);
+    var buf: i64 = pe_load(q + 128);
+    while true {
+        var t: i64 = pe_atomic_load(q);
+        var b: i64 = pe_atomic_load(q + 64);
+        if b - t <= 0 {
+            return 0;
+        }
+        // Read the slot, then claim it: if the owner reused it meanwhile,
+        // top moved and the claim fails
+        var task: i64 = pe_load(buf + (t & (PE_LQ_CAP - 1)) * 8);
+        if pert_nworkers == 1 {
+            pe_store(q, t + 1);
+            pe_store(task + 192, 0);
+            return task;
+        }
+        if pe_atomic_cas(q, t, t + 1) == true {
+            pe_store(task + 192, 0);
+            return task;
+        }
+    }
+    return 0;
+}
+
+/// Thief wid (its ring empty) takes half of worker v's ring, rounded up:
+/// the slots are copied to its own ring's unpublished end, then claimed on
+/// v's ring in one CAS. The last one is returned to run, the others are
+/// published on the thief's ring. 0 if v's ring is empty.
+fn pe_lq_steal_half(wid: i64, v: i64) -> i64 {
+    var q: i64 = pe_lq_rec(v);
+    var vbuf: i64 = pe_load(q + 128);
+    var mine: i64 = pe_lq_rec(wid);
+    var mbuf: i64 = pe_load(mine + 128);
+    var mb: i64 = pe_load(mine + 64);
+    var mask: i64 = PE_LQ_CAP - 1;
+    while true {
+        var t: i64 = pe_atomic_load(q);
+        var b: i64 = pe_atomic_load(q + 64);
+        var n: i64 = b - t;
+        if n <= 0 {
+            return 0;
+        }
+        n = n - n / 2;
+        if n > PE_LQ_CAP / 2 {
+            n = PE_LQ_CAP / 2;
+        }
+        var i: i64 = 0;
+        while i < n {
+            pe_store(mbuf + ((mb + i) & mask) * 8, pe_load(vbuf + ((t + i) & mask) * 8));
+            i = i + 1;
+        }
+        if pe_atomic_cas(q, t, t + n) == true {
+            var run: i64 = pe_load(mbuf + ((mb + n - 1) & mask) * 8);
+            if n > 1 {
+                pe_atomic_store(mine + 64, mb + n - 1);
+            }
+            pe_store(run + 192, 0);
+            return run;
+        }
+    }
+    return 0;
+}
+
+/// Worker wid's ring is dry: steal half of the first sibling's ring that has
+/// work, starting one further each time so thieves spread over victims.
+fn pe_lq_steal(wid: i64) -> i64 {
+    var n: i64 = pert_nworkers;
+    if n < 2 {
+        return 0;
+    }
+    var mine: i64 = pe_lq_rec(wid);
+    var start: i64 = pe_load(mine + 136);
+    pe_store(mine + 136, start + 1);
+    var i: i64 = 0;
+    while i < n {
+        var v: i64 = (wid + 1 + (start + i) % n) % n;
+        if v != wid {
+            var t: i64 = pe_lq_steal_half(wid, v);
+            if t != 0 {
+                return t;
+            }
         }
         i = i + 1;
     }
     return 0;
 }
 
-fn pe_wq_push(t: i64) {
-    pe_k_lock(pert_wq);
-    var wid: i64 = 0;
-    if pert_tls_wid != 0 { wid = pe_k_tls_get(pert_tls_wid); }
-    if wid != 0 {
-        pe_lq_push_locked(t, wid - 1);
+// Append t to the global queue (wq lock held).
+fn pe_gq_append_locked(t: i64) {
+    pe_store(t + 176, 0);
+    if pert_wq_tail != 0 {
+        pe_store(pert_wq_tail + 176, t);
     } else {
-        pe_store(t + 176, 0);
-        if pert_wq_tail != 0 {
-            pe_store(pert_wq_tail + 176, t);
-        } else {
-            pert_wq_head = t;
-        }
-        pert_wq_tail = t;
+        pert_wq_head = t;
     }
+    pert_wq_tail = t;
+    pert_wq_n = pert_wq_n + 1;
+}
+
+// Unlink the global queue's head (wq lock held). 0 if empty.
+fn pe_gq_pop_locked() -> i64 {
+    var t: i64 = pert_wq_head;
+    if t == 0 {
+        return 0;
+    }
+    pert_wq_head = pe_load(t + 176);
+    if pert_wq_head == 0 {
+        pert_wq_tail = 0;
+    }
+    pert_wq_n = pert_wq_n - 1;
+    pe_store(t + 176, 0);
+    return t;
+}
+
+/// Worker wid (its ring empty): the global queue's head to run, and its
+/// share of the rest (one worker's part, at most half a ring) moved onto
+/// its ring, so the lock is taken once per batch (wq lock held).
+fn pe_gq_take_locked(wid: i64) -> i64 {
+    var t: i64 = pe_gq_pop_locked();
+    if t == 0 {
+        return 0;
+    }
+    pe_store(t + 192, 0);
+    var k: i64 = pert_wq_n / pert_nworkers;
+    if k > PE_LQ_CAP / 2 {
+        k = PE_LQ_CAP / 2;
+    }
+    while k > 0 {
+        var u: i64 = pe_gq_pop_locked();
+        if u == 0 {
+            k = 0;
+        } else if pe_lq_push(u, wid) {
+            k = k - 1;
+        } else {
+            // ring full after all: back at the head
+            pe_store(u + 176, pert_wq_head);
+            if pert_wq_head == 0 {
+                pert_wq_tail = u;
+            }
+            pert_wq_head = u;
+            pert_wq_n = pert_wq_n + 1;
+            k = 0;
+        }
+    }
+    return t;
+}
+
+/// Worker wid's ring is full: move its older half and t to the global queue
+/// in one lock hold (a spawning loop takes the lock once per half ring).
+/// The half is claimed before it is read: only this thread writes its slots.
+fn pe_lq_spill(t: i64, wid: i64) {
+    var q: i64 = pe_lq_rec(wid);
+    var buf: i64 = pe_load(q + 128);
+    var b: i64 = pe_load(q + 64);
+    var top: i64 = pe_atomic_load(q);
+    var half: i64 = (b - top) / 2;
+    var claimed: bool = half <= 0;
+    while !claimed {
+        if pe_atomic_cas(q, top, top + half) == true {
+            claimed = true;
+        } else {
+            top = pe_atomic_load(q);
+            half = (b - top) / 2;
+            if half <= 0 {
+                half = 0;
+                claimed = true;
+            }
+        }
+    }
+    pe_k_lock(pert_wq);
+    var i: i64 = 0;
+    while i < half {
+        pe_gq_append_locked(pe_load(buf + ((top + i) & (PE_LQ_CAP - 1)) * 8));
+        i = i + 1;
+    }
+    pe_gq_append_locked(t);
     pe_k_cond_signal(pert_wq + 8);
     pe_k_unlock(pert_wq);
 }
 
-/// Requeue a task that yielded on worker `wid` (0-based): its own queue, which
-/// the worker pops next. Another worker is woken only for a backlog: waking
-/// one per yield made every yield an OS thread switch.
-fn pe_wq_push_yielded(t: i64, wid: i64) {
+/// Wake one parked worker.
+fn pe_wq_signal() {
     pe_k_lock(pert_wq);
-    var backlog: bool = pe_load(pert_lq + wid * 16 + 8) != 0 || pert_wq_head != 0;
-    pe_lq_push_locked(t, wid);
-    if backlog && pe_atomic_load(pert_idle) > 0 {
-        pe_k_cond_signal(pert_wq + 8);
-    }
+    pe_k_cond_signal(pert_wq + 8);
     pe_k_unlock(pert_wq);
 }
 
-fn pe_wq_pop(wid: i64) -> i64 {
-    pe_k_lock(pert_wq);
-    while true {
-        var t: i64 = pe_lq_pop_locked(wid);
-        if t != 0 { pe_k_unlock(pert_wq); return t; }
-        if pert_wq_head != 0 {
-            t = pert_wq_head;
-            pert_wq_head = pe_load(t + 176);
-            if pert_wq_head == 0 { pert_wq_tail = 0; }
-            pe_store(t + 192, 0);
-            pe_k_unlock(pert_wq);
-            return t;
+fn pe_wq_push(t: i64) {
+    var wid: i64 = 0;
+    if pert_tls_wid != 0 { wid = pe_k_tls_get(pert_tls_wid); }
+    if wid != 0 {
+        if !pe_lq_push(t, wid - 1) {
+            pe_lq_spill(t, wid - 1);
+        } else if pe_atomic_load(pert_idle) > 0 {
+            pe_wq_signal();
         }
-        t = pe_lq_steal_locked(wid);
-        if t != 0 { pe_k_unlock(pert_wq); return t; }
+        return;
+    }
+    pe_k_lock(pert_wq);
+    pe_gq_append_locked(t);
+    pe_k_cond_signal(pert_wq + 8);
+    pe_k_unlock(pert_wq);
+}
+
+/// Requeue a task that yielded on worker `wid` (0-based): its own ring, which
+/// the worker pops next. Another worker is woken only for a backlog: waking
+/// one per yield made every yield an OS thread switch.
+fn pe_wq_push_yielded(t: i64, wid: i64) {
+    var backlog: bool = pe_lq_size(wid) != 0 || pert_wq_head != 0;
+    if !pe_lq_push(t, wid) {
+        pe_lq_spill(t, wid);
+    } else if backlog && pe_atomic_load(pert_idle) > 0 {
+        pe_wq_signal();
+    }
+}
+
+/// RL17: take a random one of the tasks on worker wid's queue and the
+/// global queue (wq lock held). 0 if both are empty.
+fn pe_rnd_take_locked(wid: i64) -> i64 {
+    // RL17 runs one worker: no thief touches its ring
+    var q: i64 = pe_lq_rec(wid);
+    var buf: i64 = pe_load(q + 128);
+    var top: i64 = pe_load(q);
+    var nl: i64 = pe_load(q + 64) - top;
+    var ng: i64 = pert_wq_n;
+    if nl + ng == 0 {
+        return 0;
+    }
+    var k: i64 = pe_rnd_below(nl + ng);
+    var prev: i64 = 0;
+    var cur: i64 = 0;
+    var i: i64 = 0;
+    if k < nl {
+        // the k-th to the top, the ones before it one place down (their
+        // order kept), then take the top
+        var mask: i64 = PE_LQ_CAP - 1;
+        cur = pe_load(buf + ((top + k) & mask) * 8);
+        var j: i64 = k;
+        while j > 0 {
+            pe_store(buf + ((top + j) & mask) * 8, pe_load(buf + ((top + j - 1) & mask) * 8));
+            j = j - 1;
+        }
+        pe_store(buf + (top & mask) * 8, cur);
+        pe_atomic_store(q, top + 1);
+    } else {
+        cur = pert_wq_head;
+        while i < k - nl {
+            prev = cur;
+            cur = pe_load(cur + 176);
+            i = i + 1;
+        }
+        var nx2: i64 = pe_load(cur + 176);
+        if prev == 0 {
+            pert_wq_head = nx2;
+        } else {
+            pe_store(prev + 176, nx2);
+        }
+        if nx2 == 0 {
+            pert_wq_tail = prev;
+        }
+        pert_wq_n = pert_wq_n - 1;
+    }
+    pe_store(cur + 176, 0);
+    pe_store(cur + 192, 0);
+    return cur;
+}
+
+/// Worker wid's next task: its ring, then the global queue, then half of a
+/// sibling's ring; parked on the global queue's condition variable while
+/// all are empty. A worker counts itself idle before it looks a last time
+/// (the count's lock xadd is a barrier): a push publishes its slot before it
+/// reads the count, so either the pusher sees the idle worker and wakes it
+/// or the worker sees the task.
+fn pe_wq_pop(wid: i64) -> i64 {
+    while true {
+        if pert_rnd_on == 1 {
+            pe_k_lock(pert_wq);
+            var rt: i64 = pe_rnd_take_locked(wid);
+            pe_k_unlock(pert_wq);
+            if rt != 0 { return rt; }
+        }
+        var t: i64 = pe_lq_pop(wid);
+        if t != 0 { return t; }
+        if pert_wq_head != 0 {
+            pe_k_lock(pert_wq);
+            t = pe_gq_take_locked(wid);
+            pe_k_unlock(pert_wq);
+            if t != 0 { return t; }
+        }
+        t = pe_lq_steal(wid);
+        if t != 0 { return t; }
+        pe_k_lock(pert_wq);
         pe_atomic_add(pert_idle, 1);
-        pe_k_cond_wait(pert_wq + 8, pert_wq, pe_infinite(), 0);
+        if pert_wq_head == 0 && pe_lq_total() == 0 {
+            pe_k_cond_wait(pert_wq + 8, pert_wq, pe_infinite(), 0);
+        }
         pe_atomic_add(pert_idle, 0 - 1);
+        pe_k_unlock(pert_wq);
     }
     return 0;
+}
+
+// ─── Token slot (complaint CA7, CA8) ──────────────────────
+// A timeout block's token (compiler/lower.fd Lowerer_to_enter) is three
+// words: [cancelled][deadline on pert_clock_mono_ms's clock, 0 none][the
+// token the slot held before]. The slot is word [30] of the running task's
+// block, else a TLS slot of the thread (pert_tls_tok, made the first time
+// code outside tasks sets one): a new task starts with an empty one. The
+// builtin waits (sleep, await, channel send and receive, socket waits) look
+// at the slot's token, and at the ones it replaced, at least every 10 ms
+// (an await or a channel, every millisecond) and give up once one is
+// cancelled or past its deadline, as the C runtime's do. With an empty
+// slot they wait as before.
+
+var pert_tls_tok: i64 = 0;     // TLS slot + 1: the token outside tasks
+
+/// The TLS slot of the token of code outside tasks (made once).
+fn pe_tok_key() -> i64 {
+    if pert_tls_tok == 0 {
+        var init_lock: i64 = pe_k_create_mutex(0, 0, "fid_co_tok_init");
+        if init_lock != 0 {
+            pe_k_wait(init_lock, pe_infinite());
+        }
+        if pert_tls_tok == 0 {
+            var k: i64 = pe_k_tls_alloc() as i64;
+            pert_tls_tok = k + 1;
+        }
+        if init_lock != 0 {
+            pe_k_release_mutex(init_lock);
+            pe_k_close_handle(init_lock);
+        }
+    }
+    return pert_tls_tok - 1;
+}
+
+/// The token in the running task's slot (p_task_token), 0 if none.
+pub fn pert_task_token() -> i64 {
+    var c: i64 = pe_co_cur();
+    if c != 0 {
+        return pe_load(c + 240);
+    }
+    if pert_tls_tok == 0 {
+        return 0;
+    }
+    return pe_k_tls_get(pert_tls_tok - 1);
+}
+
+/// Put `tok` in the slot (p_task_set_token); the token it held.
+pub fn pert_task_set_token(tok: i64) -> i64 {
+    var c: i64 = pe_co_cur();
+    if c != 0 {
+        var old: i64 = pe_load(c + 240);
+        pe_store(c + 240, tok);
+        return old;
+    }
+    var key: i64 = pe_tok_key();
+    var old2: i64 = pe_k_tls_get(key);
+    pe_k_tls_set(key, tok);
+    return old2;
+}
+
+/// C6: milliseconds since the system started (GetTickCount64), the clock
+/// of deadlines (timeout blocks, tokens): a change of the wall clock does
+/// not move it.
+pub fn pert_clock_mono_ms() -> i64 {
+    return pe_k_ticks();
+}
+
+/// Whether `tok`, or a token it replaced, is cancelled or past its
+/// deadline (a token past its deadline is marked cancelled).
+fn pe_tok_cancelled(tok: i64) -> bool {
+    var t: i64 = tok;
+    var depth: i64 = 0;
+    var now: i64 = 0;
+    while t != 0 && depth < 64 {
+        if pe_atomic_load(t) != 0 {
+            return true;
+        }
+        var dl: i64 = pe_atomic_load(t + 8);
+        if dl != 0 {
+            if now == 0 {
+                now = pert_clock_mono_ms();
+            }
+            if now >= dl {
+                pe_atomic_store(t, 1);
+                return true;
+            }
+        }
+        t = pe_atomic_load(t + 16);
+        depth = depth + 1;
+    }
+    return false;
+}
+
+/// The next slice of a wait of `left` ms (-1: no limit) under `tok`: 10
+/// ms at most, and no later than the first deadline of its chain.
+fn pe_tok_slice(tok: i64, left: i64) -> i64 {
+    var s: i64 = 10;
+    if left >= 0 && left < s {
+        s = left;
+    }
+    var now: i64 = pert_clock_mono_ms();
+    var t: i64 = tok;
+    var depth: i64 = 0;
+    while t != 0 && depth < 64 {
+        var dl: i64 = pe_atomic_load(t + 8);
+        if dl != 0 {
+            var r: i64 = 0;
+            if dl > now {
+                r = dl - now;
+            }
+            if r < s {
+                s = r;
+            }
+        }
+        t = pe_atomic_load(t + 16);
+        depth = depth + 1;
+    }
+    return s;
+}
+
+// ─── Task chain of a panic (complaint CA9) ────────────────
+// A panic's trace shows only the running task's own stack. pert_task_chain
+// (called by pe_ir's p_panic stub, compiler/pe_ir_stubs.fd, after the
+// message) prints the tasks it runs for, as the C runtime's
+// __p_co_print_chain: the one awaiting it ([33]), else the one whose turn it
+// runs in ([15]; both are alive while they wait), up to the code outside
+// tasks (`main`), or to the task that started it and has not awaited it
+// (`(started by f)`):
+//     task chain: b <- a <- main
+
+var pe_tc_cell: i64 = 0;       // WriteFile's count for the chain's lines
+
+/// A task's name to stderr, without the `__task` of an adapted task
+/// function.
+fn pe_tc_name(h: i64, name: i64) {
+    if name == 0 {
+        return;
+    }
+    var n: i64 = pe_c_strlen(name);
+    if n > 6 {
+        var e: i64 = n - 6;
+        if pe_byte_at(name, e) == 95 && pe_byte_at(name, e + 1) == 95 && pe_byte_at(name, e + 2) == 116 && pe_byte_at(name, e + 3) == 97 && pe_byte_at(name, e + 4) == 115 && pe_byte_at(name, e + 5) == 107 {
+            n = e;
+        }
+    }
+    pe_cr_put(h, pe_tc_cell, name, n);
+}
+
+/// `task chain: ...` on stderr when a task is running; nothing otherwise.
+pub fn pert_task_chain() {
+    var c: i64 = pe_co_cur();
+    if c == 0 {
+        return;
+    }
+    if pe_tc_cell == 0 {
+        pe_tc_cell = pe_zeroed(1);
+    }
+    var h: i64 = pe_k_std_handle(0 - 12);
+    pe_cr_puts(h, pe_tc_cell, "task chain: " as i64);
+    var depth: i64 = 0;
+    var more: bool = true;
+    while more {
+        pe_tc_name(h, pe_load(c + 248));
+        var next: i64 = pe_load(c + 264);
+        if next == 0 {
+            next = pe_load(c + 120);
+        }
+        if next != 0 && depth < 64 {
+            pe_cr_puts(h, pe_tc_cell, " <- " as i64);
+            c = next;
+            depth = depth + 1;
+        } else {
+            var starter: i64 = pe_load(c + 256);
+            if next != 0 {
+                pe_cr_puts(h, pe_tc_cell, " <- ..." as i64);
+            } else if starter != 0 {
+                pe_cr_puts(h, pe_tc_cell, " (started by " as i64);
+                pe_tc_name(h, starter);
+                pe_cr_puts(h, pe_tc_cell, ")" as i64);
+            } else {
+                pe_cr_puts(h, pe_tc_cell, " <- main" as i64);
+            }
+            more = false;
+        }
+    }
+    pe_cr_puts(h, pe_tc_cell, "\n" as i64);
 }
 
 // ─── Task lifecycle ────────────────────────────────────────
 fn pe_co_new(name: str, nargs: i64, argv: i64) -> i64 {
     var block: i64 = pe_co_new_block(name, nargs, argv);
     pe_wq_push(block);
+    pe_atomic_add(pert_offq, 0 - 1);
     return block;
 }
 
@@ -477,9 +1135,15 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         p_panic("task: no such function");
     }
     pe_co_ensure();
-    var block: i64 = pe_zeroed(29);
+    var block: i64 = pe_zeroed(34);
     pe_store(block, fn_addr);
     pe_store(block + 8, nargs);
+    // CA9: its name and the task that started it, for a panic's task chain
+    pe_store(block + 248, name as i64);
+    var starter: i64 = pe_co_cur();
+    if starter != 0 {
+        pe_store(block + 256, pe_load(starter + 248));
+    }
     var a: i64 = 0;
     while a < nargs && a < 8 {
         pe_store(block + 16 + a * 8, pe_load(argv + a * 8));
@@ -513,9 +1177,13 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         pert_co_cap = cap;
     }
     pe_store(pert_co_blocks + pert_co_count * 8, block);
+    pe_store(block + 232, pert_co_count);
     pert_co_count = pert_co_count + 1;
     pert_co_total = pert_co_total + 1;
     pe_k_unlock(pert_reg);
+    // Live but on no queue until its creator queues or enters it: the
+    // deadlock detector must not count it as stuck (RT10)
+    pe_atomic_add(pert_offq, 1);
     pe_atomic_add(pert_live, 1);
     return block;
 }
@@ -561,6 +1229,7 @@ fn pe_co_ensure() {
     pe_k_lock_init(pert_poolq);
     pe_k_cond_init(pert_poolq + 8);
     pert_live = pe_zeroed(1);
+    pert_offq = pe_zeroed(1);
     pert_idle = pe_zeroed(1);
 
     // Logical CPU count: SYSTEM_INFO.dwNumberOfProcessors at offset 32.
@@ -574,9 +1243,34 @@ fn pe_co_ensure() {
     if n > 16 {
         n = 16;
     }
+    // FIDES_WORKERS=<n> (1-16): that many workers instead of one per CPU,
+    // for benchmarks of the switch itself (tests/ctx_switch) and for
+    // programs that want fewer threads
+    var wenv: i64 = pe_c_getenv("FIDES_WORKERS") as i64;
+    if wenv != 0 {
+        var wn: i64 = 0;
+        var wi: i64 = 0;
+        var wb: i64 = pe_rnd_byte(wenv);
+        while wb >= 48 && wb <= 57 && wi < 3 {
+            wn = wn * 10 + (wb - 48);
+            wi = wi + 1;
+            wb = pe_rnd_byte(wenv + wi);
+        }
+        if wn >= 1 && wn <= 16 {
+            n = wn;
+        }
+    }
+    // RL17: one worker, so the order tasks run in is the seed's choice
+    if pe_rnd_enabled() {
+        n = 1;
+    }
     pert_nworkers = n;
-    pert_lq = pe_zeroed(n * 16);
-    pert_lq_any = pe_zeroed(1);
+    pert_lq = pe_zeroed(n * (PE_LQ_REC / 8));
+    var ri: i64 = 0;
+    while ri < n {
+        pe_store(pe_lq_rec(ri) + 128, pe_zeroed(PE_LQ_CAP));
+        ri = ri + 1;
+    }
 
     var wid: i64 = 0;
     while wid < n {
@@ -629,6 +1323,8 @@ fn pe_co_leave_as(runnable: i64) {
         to = pe_load(back + 104);
     } else {
         pe_k_tls_set(pert_tls_cur, 0);
+        // a scheduler context (pe_ctx_thread, five words): who left
+        pe_store(to + 32, c);
     }
     pe_store(to + 24, runnable);
     pe_ctx_switch(pe_load(c + 104), to);
@@ -843,18 +1539,15 @@ fn pe_co_finish_task(block: i64) {
     pe_k_lock(pert_reg);
     pe_wait_remove(block);
     pe_timer_disarm(block);
-    var i: i64 = 0;
-    var found: i64 = -1;
-    while i < pert_co_count {
-        if pe_load(pert_co_blocks + i * 8) == block {
-            found = i;
-            i = pert_co_count;
-        }
-        i = i + 1;
-    }
-    if found >= 0 {
-        pe_store(pert_co_blocks + found * 8, pe_load(pert_co_blocks + (pert_co_count - 1) * 8));
+    // Its registry slot is in [29] (RT10: a scan per finished task made
+    // tasks finishing out of spawn order quadratic, 70 us a task at 200,000)
+    var found: i64 = pe_load(block + 232);
+    if found >= 0 && found < pert_co_count && pe_load(pert_co_blocks + found * 8) == block {
+        var last: i64 = pe_load(pert_co_blocks + (pert_co_count - 1) * 8);
+        pe_store(pert_co_blocks + found * 8, last);
+        pe_store(last + 232, found);
         pert_co_count = pert_co_count - 1;
+        pe_store(block + 232, 0 - 1);
     }
     pe_k_unlock(pert_reg);
     pe_ctx_free(pe_load(block + 104));
@@ -870,6 +1563,7 @@ fn pe_co_finish_task(block: i64) {
 /// Worker OS thread: scheduler context + pop-run loop forever.
 pub fn pert_worker_main(id: i64) -> i64 {
     var sched: i64 = pe_ctx_thread();
+    pe_store(sched + 40, id + 1);
     pe_k_tls_set(pert_tls_sched, sched);
     pe_k_tls_set(pert_tls_wid, id + 1);
     while true {
@@ -879,6 +1573,8 @@ pub fn pert_worker_main(id: i64) -> i64 {
         pe_k_tls_set(pert_tls_cur, t);
         pe_ctx_resume(sched, pe_load(t + 104));
         pe_k_tls_set(pert_tls_cur, 0);
+        // The task that left: t, or one t's yields handed the worker to
+        t = pe_load(sched + 32);
         if pe_load(t + 80) != 0 {
             pe_co_finish_task(t);
         } else if pe_load(sched + 24) != 0 {
@@ -952,14 +1648,17 @@ pub fn pert_poller_main(id: i64) -> i64 {
         waiters = waiters + pert_timer_n + pert_afd_n;
         var live_n: i64 = pe_atomic_load(pert_live);
         var idle_n: i64 = pe_atomic_load(pert_idle);
-        var queue_empty: bool = pert_wq_head == 0 && pe_atomic_load(pert_lq_any) == 0;
+        var queue_empty: bool = pert_wq_head == 0 && pe_lq_total() == 0;
         pe_k_unlock(pert_reg);
 
         // Deadlock: live tasks exist but nothing can ever run again —
         // queue empty, every worker parked, no fd/timer/join/pool waiters.
         // With per-worker queues a steal handoff can look empty for an
         // instant, so the state must persist across two poll cycles.
-        var looks_dead: bool = live_n > 0 && queue_empty && idle_n >= pert_nworkers && waiters == 0;
+        // A task still being made, or run inline by `async` on a thread that
+        // is not a worker, is not stuck: main spawning 200,000 tasks while
+        // the workers drained the queue panicked here (RT10 bench)
+        var looks_dead: bool = live_n > 0 && queue_empty && idle_n >= pert_nworkers && waiters == 0 && pe_atomic_load(pert_offq) == 0;
         if looks_dead {
             pert_dl_streak = pert_dl_streak + 1;
         } else {
@@ -1312,6 +2011,18 @@ pub fn pert_pool_main(id: i64) -> i64 {
     return 0;
 }
 
+/// LG11: the C runtime's `extern "C" fn p_co_stack(bytes) -> i64` (the
+/// stack of the tasks started from now on; also asked as
+/// p_thread_spawn("__p_co_stack", 1, bytes)). Here a task's stack has one
+/// size and tasks run on several workers at once: -2, nothing changes
+/// (fid run's interpreter then runs each task to its end when it starts).
+pub fn pert_c_p_co_stack(bytes: i64) -> i64 {
+    if bytes < 0 {
+        return - 2;
+    }
+    return - 2;
+}
+
 pub fn pert_co_go(name: str, arg: i64) -> i64 {
     var slot: i64 = pe_zeroed(1);
     pe_store(slot, arg);
@@ -1335,19 +2046,77 @@ pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
         // It yielded: queue it. A blocked one is the poller/pool's to wake.
         pe_wq_push(block);
     }
+    pe_atomic_add(pert_offq, 0 - 1);
     return block | (0x7FA5 << 48);
 }
 
 pub fn pert_co_yield() {
-    if pe_co_cur() != 0 {
-        pe_co_leave_as(1);
+    var c: i64 = pe_co_cur();
+    if c != 0 {
+        if !pe_co_handoff(c) {
+            pe_co_leave_as(1);
+        }
     }
+}
+
+/// A yield of task `c` on a worker without going through the scheduler
+/// (complaint CP5): the next task of this worker's queue (else of the global
+/// queue) runs at once, one switch instead of two, and `c` goes to the back
+/// of the worker's queue; when nothing else is runnable `c` goes on without a
+/// switch. The worker's scheduler context learns later which task left to it
+/// (its word [4], pe_co_leave_as). With one worker (FIDES_WORKERS=1) only the
+/// worker's thread touches its queue (wakes from the poller, the pool and
+/// non-worker threads go to the global queue), so the queue is used without
+/// the lock and the count of local tasks does not change. False: not on a
+/// worker, entered by another task (an async chain returns there first), or
+/// random scheduling (RL17): take the scheduler's way.
+fn pe_co_handoff(c: i64) -> bool {
+    if pert_rnd_on != 2 || pe_load(c + 120) != 0 {
+        return false;
+    }
+    // The scheduler context it runs under says which worker this is
+    var sched: i64 = pe_load(c + 168);
+    if sched == 0 {
+        return false;
+    }
+    var wid1: i64 = pe_load(sched + 40);
+    if wid1 == 0 {
+        return false;
+    }
+    var wid: i64 = wid1 - 1;
+    // Its ring first (no lock, RT10), then the global queue
+    var next: i64 = pe_lq_pop(wid);
+    if next == 0 && pert_wq_head != 0 {
+        pe_k_lock(pert_wq);
+        next = pe_gq_take_locked(wid);
+        pe_k_unlock(pert_wq);
+    }
+    if next == 0 {
+        return true;               // nothing else to run
+    }
+    var backlog: bool = pe_lq_size(wid) != 0 || pert_wq_head != 0;
+    if !pe_lq_push(c, wid) {
+        pe_lq_spill(c, wid);
+    } else if backlog && pe_atomic_load(pert_idle) > 0 {
+        pe_wq_signal();
+    }
+    // `c` is on a queue before its registers are saved: a worker that takes
+    // it waits in pe_ctx_claim until the switch below clears its busy word
+    var mine: i64 = pe_load(c + 104);
+    pe_ctx_claim(pe_load(next + 104));
+    pe_store(next + 168, sched);
+    pe_k_tls_set(pert_tls_cur, next);
+    pe_ctx_resume(mine, pe_load(next + 104));
+    return true;
 }
 
 /// Loop-backedge safepoint (M5): yield only when work is queued behind us,
 /// so tight loops can't starve other tasks but don't pay when uncontended.
 pub fn pert_co_tick() {
-    if pe_co_cur() != 0 && pert_wq_head != 0 {
+    if pert_wq_head != 0 && pe_co_cur() != 0 {
+        pe_co_leave_as(1);
+    } else if pert_rnd_on == 1 && pe_co_cur() != 0 && pe_lq_size(0) > 0 && pe_rnd_below(2) == 0 {
+        // RL17: a random preemption point while another task is runnable
         pe_co_leave_as(1);
     }
 }
@@ -1366,6 +2135,26 @@ pub fn pert_co_run() -> i64 {
 
 fn pe_co_await(f: i64) -> i64 {
     var c: i64 = f & 0xFFFFFFFFFFFF;
+    // CA9: the task awaiting it, for a panic's task chain
+    var me: i64 = pe_co_cur();
+    if me != 0 && pe_load(c + 80) == 0 {
+        pe_store(c + 264, me);
+    }
+    // CA7: with a token in the slot, wait in slices and give up (0) once it
+    // is cancelled; the task awaited goes on
+    var tok: i64 = pert_task_token();
+    if tok != 0 {
+        while pe_load(c + 80) == 0 {
+            if pe_tok_cancelled(tok) {
+                if me != 0 && pe_load(c + 264) == me {
+                    pe_store(c + 264, 0);
+                }
+                return 0;
+            }
+            pe_co_sleep_plain(1);
+        }
+        return pe_load(c + 88);
+    }
     while pe_load(c + 80) == 0 {
         var cur: i64 = pe_co_cur();
         if cur != 0 {
@@ -1389,7 +2178,32 @@ fn pe_is_co_future(f: i64) -> bool {
     return ((f >> 48) & 0xFFFF) == 0x7FA5;
 }
 
+/// CA7: sleep, in slices when the slot holds a token: 1 when the token
+/// stopped it, 0 when the whole time passed.
 pub fn pert_co_sleep(ms: i64) -> i64 {
+    var tok: i64 = pert_task_token();
+    if tok == 0 {
+        return pe_co_sleep_plain(ms);
+    }
+    var d0: i64 = ms;
+    if d0 < 0 {
+        d0 = 0;
+    }
+    var end: i64 = pert_clock_mono_ms() + d0;
+    while true {
+        if pe_tok_cancelled(tok) {
+            return 1;
+        }
+        var left: i64 = end - pert_clock_mono_ms();
+        if left <= 0 {
+            return 0;
+        }
+        pe_co_sleep_plain(pe_tok_slice(tok, left));
+    }
+    return 0;
+}
+
+fn pe_co_sleep_plain(ms: i64) -> i64 {
     var cur: i64 = pe_co_cur();
     if cur != 0 {
         var d: i64 = ms;
@@ -1411,7 +2225,33 @@ pub fn pert_co_sleep(ms: i64) -> i64 {
     return 0;
 }
 
+/// CA7: with a token in the slot, the wait goes in slices and gives 0 (not
+/// ready) once the token is cancelled.
 pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
+    var tok: i64 = pert_task_token();
+    if tok == 0 {
+        return pe_co_wait_fd_plain(fd, write, timeout_ms);
+    }
+    var start: i64 = pert_clock_mono_ms();
+    while true {
+        if pe_tok_cancelled(tok) {
+            return 0;
+        }
+        var left: i64 = 0 - 1;
+        if timeout_ms >= 0 {
+            left = timeout_ms - (pert_clock_mono_ms() - start);
+            if left <= 0 {
+                return 0;
+            }
+        }
+        if pe_co_wait_fd_plain(fd, write, pe_tok_slice(tok, left)) != 0 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn pe_co_wait_fd_plain(fd: i64, write: i64, timeout_ms: i64) -> i64 {
     var cur: i64 = pe_co_cur();
     if cur != 0 && pert_afd != 0 {
         return pe_afd_wait(cur, fd, write, timeout_ms);
@@ -1501,6 +2341,51 @@ pub fn pert_socket_listen(port: i64) -> i64 {
     p_free(addr);
     // SOMAXCONN: the system's longest queue of connections not yet accepted
     if bound != 0 || pe_w_listen(s, 0x7FFFFFFF) != 0 {
+        pe_w_close(s);
+        return -1;
+    }
+    return s;
+}
+
+/// roadmap L4B (stdlib/unix_socket.fd): a Unix-domain stream socket
+/// listening at `path`, or -1 (Windows 10 1803+ has AF_UNIX in ws2_32).
+/// pert_socket_accept / read / write / close work on it.
+pub fn pert_unix_listen(path: str) -> i64 {
+    return pe_unix_open(path, true);
+}
+
+/// A Unix-domain stream socket connected to the listener at `path`, or -1.
+pub fn pert_unix_connect(path: str) -> i64 {
+    return pe_unix_open(path, false);
+}
+
+/// socket(AF_UNIX, SOCK_STREAM), then bind + listen or connect to
+/// SOCKADDR_UN {16-bit family 1, 108 bytes of path}.
+fn pe_unix_open(path: str, listening: bool) -> i64 {
+    val n: i64 = str_len(path);
+    if n == 0 || n > 107 {
+        return -1;
+    }
+    pe_wsa();
+    var s: i64 = pe_w_socket(1, 1, 0);                         // AF_UNIX, SOCK_STREAM
+    if s == -1 {
+        return -1;
+    }
+    var sa: i64 = pe_zeroed(14);                               // 112 bytes
+    pe_set_byte(sa, 0, 1);
+    var i: i64 = 0;
+    while i < n {
+        pe_set_byte(sa, 2 + i, pe_byte_at(path as i64, i));
+        i = i + 1;
+    }
+    var ok: bool = false;
+    if listening {
+        ok = pe_w_bind(s, sa, 110) == 0 && pe_w_listen(s, 0x7FFFFFFF) == 0;
+    } else {
+        ok = pe_w_connect(s, sa, 110) == 0;
+    }
+    p_free(sa);
+    if !ok {
         pe_w_close(s);
         return -1;
     }
@@ -1860,15 +2745,18 @@ pub fn pert_shared_alloc(size: i64) -> i64 {
 }
 
 pub fn pert_atomic_load(addr: i64) -> i64 {
+    pe_rnd_jitter();
     return pe_atomic_load(addr);
 }
 
 pub fn pert_atomic_store(addr: i64, value: i64) {
+    pe_rnd_jitter();
     pe_atomic_store(addr, value);
 }
 
 /// The previous value.
 pub fn pert_atomic_add(addr: i64, value: i64) -> i64 {
+    pe_rnd_jitter();
     return pe_atomic_add(addr, value);
 }
 
@@ -1879,6 +2767,7 @@ pub fn pert_atomic_sub(addr: i64, value: i64) -> i64 {
 }
 
 pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
+    pe_rnd_jitter();
     return pe_atomic_cas(addr, expected, new_value);
 }
 
@@ -1891,11 +2780,13 @@ pub fn pert_mutex_init() -> i64 {
 }
 
 pub fn pert_mutex_lock(m: i64) {
+    pe_rnd_jitter();
     pe_k_lock(m);
 }
 
 pub fn pert_mutex_unlock(m: i64) {
     pe_k_unlock(m);
+    pe_rnd_jitter();
 }
 
 pub fn pert_tls_create() -> i64 {
@@ -1932,7 +2823,19 @@ pub fn pert_chan_send(ch: i64, value: i64) -> bool {
     if ch == 0 {
         return false;
     }
+    pe_rnd_jitter();
+    // CA7: with a token in the slot, wait in slices (a task gives its turn)
+    // and give up (false, as on a closed channel) once it is cancelled
+    var tok: i64 = pert_task_token();
     pe_k_lock(ch);
+    while tok != 0 && pe_load(ch + 40) == pe_load(ch + 48) && pe_load(ch + 56) == 0 {
+        pe_k_unlock(ch);
+        if pe_tok_cancelled(tok) {
+            return false;
+        }
+        pe_co_sleep_plain(1);
+        pe_k_lock(ch);
+    }
     while pe_load(ch + 40) == pe_load(ch + 48) && pe_load(ch + 56) == 0 {
         pe_k_cond_wait(ch + 16, ch, pe_infinite(), 0);
     }
@@ -1964,7 +2867,19 @@ pub fn pert_chan_recv(ch: i64) -> i64 {
     if ch == 0 {
         return 0;
     }
+    pe_rnd_jitter();
+    // CA7: as pert_chan_send; a cancelled receive gives what a closed,
+    // empty channel gives
+    var tok: i64 = pert_task_token();
     pe_k_lock(ch);
+    while tok != 0 && pe_load(ch + 40) == 0 && pe_load(ch + 56) == 0 {
+        pe_k_unlock(ch);
+        if pe_tok_cancelled(tok) {
+            return pe_pending();
+        }
+        pe_co_sleep_plain(1);
+        pe_k_lock(ch);
+    }
     while pe_load(ch + 40) == 0 && pe_load(ch + 56) == 0 {
         pe_k_cond_wait(ch + 8, ch, pe_infinite(), 0);
     }
@@ -2015,4 +2930,1578 @@ pub fn pert_chan_is_closed(ch: i64) -> bool {
     var closed: i64 = pe_load(ch + 56);
     pe_k_unlock(ch);
     return closed != 0;
+}
+
+// ─── Zero-copy file and socket I/O (competitive roadmap RT14) ───────────
+// fs.fd's fs_copy_file and FileView and net.fd's net_send_file call
+// p_fs_copy_file, p_fs_map / p_fs_unmap and p_net_send_file; on native
+// Windows these run instead of their portable bodies. The system copies
+// the file (CopyFileA), maps it (MapViewOfFile) or sends it from the file
+// cache (TransmitFile), so the bytes never pass through the program. What
+// it cannot do (a task's socket, which is non-blocking; a file of 2 GB or
+// more; a socket without TransmitFile; CopyFileA refused) goes through a
+// 64 KB buffer instead, with the same result. kernel32's functions beyond
+// the static import list and mswsock's TransmitFile are bound at start-up
+// by the program's DLL loader (pe_ir's `link` DLLs).
+
+extern "C" {
+    // kernel32.dll (static import list)
+    fn CreateFileA as pe_zc_open(path: str, access: i64, share: i64, sa: i64, disposition: i64, flags: i64, tmpl: i64) -> i64;
+}
+
+extern "C" link "kernel32.dll" {
+    fn CopyFileA as pe_zc_copy(src: str, dst: str, fail_if_exists: i64) -> i32;
+    fn GetFileSizeEx as pe_zc_size_ex(h: i64, out: i64) -> i32;
+    fn GetFileInformationByHandle as pe_zc_info(h: i64, out: i64) -> i32;
+    fn SetFilePointerEx as pe_zc_seek(h: i64, dist: i64, new_pos: i64, method: i64) -> i32;
+    fn CreateFileMappingA as pe_zc_mapping(h: i64, sa: i64, protect: i64, size_hi: i64, size_lo: i64, name: i64) -> i64;
+    fn MapViewOfFile as pe_zc_view(mapping: i64, access: i64, off_hi: i64, off_lo: i64, n: i64) -> i64;
+    fn UnmapViewOfFile as pe_zc_unview(addr: i64) -> i32;
+}
+
+extern "C" link "mswsock" {
+    fn TransmitFile as pe_zc_transmit(s: i64, file: i64, n: i64, per_send: i64, overlapped: i64, buffers: i64, flags: i64) -> i32;
+}
+
+/// CreateFileA of `path` with `access`: the handle, or -1.
+fn pe_zc_handle(path: str, access: i64, flags: i64) -> i64 {
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING
+    var h: i64 = pe_zc_open(path, access, 7, 0, 3, flags, 0);
+    if h == 0 {
+        return -1;
+    }
+    return h;
+}
+
+/// The size of the open file `h`, or -1.
+fn pe_zc_handle_size(h: i64) -> i64 {
+    var out: i64 = pe_zeroed(1);
+    var ok: bool = pe_zc_size_ex(h, out) != 0;
+    var n: i64 = pe_load(out);
+    p_free(out);
+    if !ok {
+        return -1;
+    }
+    return n;
+}
+
+/// The size of the file `path` (not a folder), or -1.
+fn pe_zc_path_size(path: str) -> i64 {
+    // FILE_READ_ATTRIBUTES, FILE_ATTRIBUTE_NORMAL
+    var h: i64 = pe_zc_handle(path, 128, 128);
+    if h == -1 {
+        return -1;
+    }
+    var n: i64 = pe_zc_handle_size(h);
+    pe_k_close_handle(h);
+    return n;
+}
+
+/// The volume serial number and file index of `path` (BY_HANDLE_FILE_INFORMATION:
+/// the serial at byte 28, the index's high half at 44, its low half at 48)
+/// into the two words at `out`; false when it cannot be opened.
+fn pe_zc_ident(path: str, out: i64) -> bool {
+    // FILE_READ_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS (a folder opens too)
+    var h: i64 = pe_zc_handle(path, 128, 33554432);
+    if h == -1 {
+        return false;
+    }
+    var info: i64 = pe_zeroed(7);
+    var ok: bool = pe_zc_info(h, info) != 0;
+    pe_k_close_handle(h);
+    if ok {
+        pe_store(out, (pe_load(info + 24) >> 32) & 4294967295);
+        pe_store(out + 8, (((pe_load(info + 40) >> 32) & 4294967295) << 32) | (pe_load(info + 48) & 4294967295));
+    }
+    p_free(info);
+    return ok;
+}
+
+/// Are `a` and `b` one file (by another name too)?
+fn pe_zc_same_file(a: str, b: str) -> bool {
+    var w: i64 = pe_zeroed(4);
+    var same: bool = pe_zc_ident(a, w) && pe_zc_ident(b, w + 16) && pe_load(w) == pe_load(w + 16) && pe_load(w + 8) == pe_load(w + 24);
+    p_free(w);
+    return same;
+}
+
+/// `src` to `dst` through a 64 KB buffer (msvcrt stdio): the bytes copied,
+/// or -1. No target is made when the source cannot be opened.
+fn pe_zc_copy_buffered(src: str, dst: str) -> i64 {
+    var inf: i64 = pe_c_fopen(src, "rb");
+    if inf == 0 {
+        return -1;
+    }
+    var outf: i64 = pe_c_fopen(dst, "wb");
+    if outf == 0 {
+        pe_c_fclose(inf);
+        return -1;
+    }
+    var buf: i64 = p_malloc(65536);
+    var bad: bool = buf == 0;
+    var total: i64 = 0;
+    var n: i64 = 0;
+    if !bad {
+        n = pe_c_fread(buf, 1, 65536, inf);
+    }
+    while !bad && n > 0 {
+        if pe_c_fwrite(buf, 1, n, outf) != n {
+            bad = true;
+        } else {
+            total = total + n;
+            n = pe_c_fread(buf, 1, 65536, inf);
+        }
+    }
+    if buf != 0 {
+        p_free(buf);
+    }
+    pe_c_fclose(inf);
+    if pe_c_fclose(outf) != 0 {
+        bad = true;
+    }
+    if bad {
+        return -1;
+    }
+    return total;
+}
+
+/// p_fs_copy_file: `src` to `dst` (created or emptied first; a file copied
+/// onto itself is left as it is): the bytes copied, or -1.
+pub fn pert_fs_copy_file(src: str, dst: str) -> i64 {
+    if (src as i64) == 0 || (dst as i64) == 0 {
+        return -1;
+    }
+    var size: i64 = pe_zc_path_size(src);
+    if size < 0 {
+        return -1;
+    }
+    if pe_zc_same_file(src, dst) {
+        return size;
+    }
+    if pe_zc_copy(src, dst, 0) != 0 {
+        var got: i64 = pe_zc_path_size(dst);
+        if got >= 0 {
+            return got;
+        }
+    }
+    return pe_zc_copy_buffered(src, dst);
+}
+
+/// All n bytes at buf on socket `sock` (a task waits while it is full): n,
+/// or -1.
+fn pe_zc_send_all(sock: i64, buf: i64, n: i64) -> i64 {
+    if pe_co_cur() != 0 {
+        pe_co_nonblock(sock);
+        return pert_co_send(sock, buf, n);
+    }
+    var done: i64 = 0;
+    while done < n {
+        var w: i64 = pe_w_send(sock, buf + done, n - done, 0);
+        if w > 0 {
+            done = done + w;
+        } else if w < 0 && (pe_w_last_error() as i64) == 10035 && pert_co_wait_fd(sock, 1, 30000) != 0 {
+            // WSAEWOULDBLOCK: a socket the program made non-blocking, now
+            // writable again
+        } else {
+            return -1;
+        }
+    }
+    return done;
+}
+
+/// p_net_send_file: the file at `path` on the connected socket `sock`: the
+/// bytes sent, or -1.
+pub fn pert_net_send_file(sock: i64, path: str) -> i64 {
+    if (path as i64) == 0 || sock < 0 {
+        return -1;
+    }
+    // GENERIC_READ; FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL
+    var f: i64 = pe_zc_handle(path, 2147483648, 134217856);
+    if f == -1 {
+        return -1;
+    }
+    var size: i64 = pe_zc_handle_size(f);
+    if size <= 0 {
+        pe_k_close_handle(f);
+        if size == 0 {
+            return 0;
+        }
+        return -1;
+    }
+    if pe_co_cur() == 0 && size < 2147483646 {
+        // the whole file, from the system's file cache
+        if pe_zc_transmit(sock, f, 0, 0, 0, 0, 0) != 0 {
+            pe_k_close_handle(f);
+            return size;
+        }
+        var e: i64 = pe_w_last_error() as i64;
+        // WSAEOPNOTSUPP, WSAENOTSOCK: no TransmitFile here, the buffer below
+        if e != 10045 && e != 10038 {
+            pe_k_close_handle(f);
+            return -1;
+        }
+        pe_zc_seek(f, 0, 0, 0);
+    }
+    var buf: i64 = p_malloc(65536);
+    var got: i64 = pe_zeroed(1);
+    var total: i64 = 0;
+    var bad: bool = buf == 0;
+    var going: bool = !bad;
+    while going {
+        pe_store(got, 0);
+        if pe_k_read_file(f, buf, 65536, got, 0) == 0 {
+            bad = true;
+            going = false;
+        } else {
+            var n: i64 = pe_load(got) & 4294967295;
+            if n == 0 {
+                going = false;
+            } else if pe_zc_send_all(sock, buf, n) != n {
+                bad = true;
+                going = false;
+            } else {
+                total = total + n;
+            }
+        }
+    }
+    if buf != 0 {
+        p_free(buf);
+    }
+    p_free(got);
+    pe_k_close_handle(f);
+    if bad {
+        return -1;
+    }
+    return total;
+}
+
+/// p_fs_map (fs.fd FileView): `size` bytes of the file `path` mapped
+/// read-only, or 0 (the file is not that size now, or cannot be mapped).
+/// The view keeps the mapping and the file open by itself.
+pub fn pert_fs_map(path: str, size: i64) -> i64 {
+    if (path as i64) == 0 || size <= 0 {
+        return 0;
+    }
+    // GENERIC_READ, FILE_ATTRIBUTE_NORMAL
+    var f: i64 = pe_zc_handle(path, 2147483648, 128);
+    if f == -1 {
+        return 0;
+    }
+    if pe_zc_handle_size(f) != size {
+        pe_k_close_handle(f);
+        return 0;
+    }
+    // PAGE_READONLY; FILE_MAP_READ
+    var m: i64 = pe_zc_mapping(f, 0, 2, 0, 0, 0);
+    pe_k_close_handle(f);
+    if m == 0 {
+        return 0;
+    }
+    var a: i64 = pe_zc_view(m, 4, 0, 0, 0);
+    pe_k_close_handle(m);
+    return a;
+}
+
+/// p_fs_unmap: undo pert_fs_map: 0, or -1.
+pub fn pert_fs_unmap(addr: i64, size: i64) -> i64 {
+    if addr == 0 || size <= 0 {
+        return -1;
+    }
+    if pe_zc_unview(addr) == 0 {
+        return -1;
+    }
+    return 0;
+}
+
+// ─── The sampling profiler (competitive SL15) ───────────────────────────
+// Native Windows (pe_ir), as linux_runtime/sys.fd's on Linux. A sampler
+// thread, every millisecond, looks at each thread registered here (every
+// OS thread pert_thread_main starts: the task workers, the poller, the
+// pool, p_thread_spawn's threads; and the thread that starts the profiler,
+// the main one under FID_PROF) and samples each that ran since its last
+// look (QueryThreadCycleTime: one sample per ms of its CPU time):
+// SuspendThread, GetThreadContext (rip, rsp, rbp), the function the pc is
+// in counted "self" and every function on its frame chain once "total",
+// ResumeThread. Nothing is allocated and no lock taken while a thread is
+// suspended (it may hold the heap's). Functions are named by nat_fn_names
+// (pe_ir's MI20 table of [address, name], made when this file reaches
+// it). pe_ir's functions all start `push rbp; mov rbp, rsp`, so the frame
+// chain is rbp's; it is followed only inside the stack the thread is on
+// (StackLimit..StackBase of its TEB, which a task switch keeps current).
+//
+// Control, the same as Linux: FID_PROF set (not empty, not "0") starts it
+// before main (pert_prof_boot, called by the entry point) and prints the
+// profile at exit (pert_prof_exit after main, pert_exit);
+// FID_PROF_EVERY=<s> prints it every s seconds while the program runs on.
+// In place of SIGUSR2: setting the named event Local\fid-prof-<pid> from
+// another process (PowerShell: [Threading.EventWaitHandle]::OpenExisting(
+// 'Local\fid-prof-1234').Set()), or Ctrl-Break in the program's console,
+// prints the profile so far (a watcher thread prints: printing allocates).
+// A program drives it itself with p_prof_start / p_prof_stop /
+// p_prof_report / p_prof_samples (stdlib/profiler.fd prof_*).
+
+extern "C" {
+    fn nat_fn_names() -> i64;
+}
+
+extern "C" link "kernel32.dll" {
+    fn OpenThread as pe_pf_open_thread(access: i64, inherit: i64, tid: i64) -> i64;
+    fn GetCurrentThreadId as pe_pf_thread_id() -> i64;
+    fn SuspendThread as pe_pf_suspend(h: i64) -> i64;
+    fn ResumeThread as pe_pf_resume(h: i64) -> i64;
+    fn GetThreadContext as pe_pf_get_context(h: i64, ctx: i64) -> i32;
+    fn QueryThreadCycleTime as pe_pf_cycles(h: i64, out: i64) -> i32;
+    fn CreateEventA as pe_pf_create_event(attrs: i64, manual: i64, initial: i64, name: str) -> i64;
+}
+
+extern "C" link "ntdll" {
+    fn NtQueryInformationThread as pe_pf_thread_info(h: i64, class: i64, buf: i64, len: i64, ret: i64) -> i32;
+    fn NtSetTimerResolution as pe_pf_timer_res(want: i64, set: i64, actual: i64) -> i32;
+}
+
+const PE_PF_MAXT: i64 = 64;       // threads the sampler can look at
+const PE_PF_DEPTH: i64 = 256;     // frames followed per sample
+
+var pe_pf_on: i64 = 0;          // 1 while samples are counted
+var pe_pf_m: i64 = 0;           // functions in nat_fn_names (0: no tables yet)
+var pe_pf_tab: i64 = 0;         // nat_fn_names(): [address, name]*, [end, 0]
+var pe_pf_self: i64 = 0;        // per bucket (m functions, primitives, other)
+var pe_pf_total: i64 = 0;       // per bucket: samples with it on the stack
+var pe_pf_stamp: i64 = 0;       // per bucket: the sample that counted it last
+var pe_pf_n: i64 = 0;           // samples taken (the sampler thread writes it)
+var pe_pf_prime: i64 = 0;       // 1: the next round only notes cycle counts
+var pe_pf_threads: i64 = 0;     // per thread: [handle][TEB][cycles][thread id]
+var pe_pf_tcount: i64 = 0;      // *i64: records claimed
+var pe_pf_up: i64 = 0;          // 1 once the sampler (and watcher) started
+var pe_pf_sampler_fn: i64 = 0;  // their entry points: not registered
+var pe_pf_watch_fn: i64 = 0;
+var pe_pf_req: i64 = 0;         // a report asked for (Ctrl-Break)
+
+fn pe_pf_ldb(p: i64) -> i64 {
+    var bp: *mut u8 = p;
+    var b: i64 = 0;
+    // SAFETY: NOT checked here: a byte of a function name of nat_fn_names'
+    // table, of the code at a function's start, or of an environment
+    // string, up to its NUL.
+    unsafe { b = *bp; }
+    return b;
+}
+
+/// The registry of threads, made once (a named mutex, as pe_co_ensure).
+fn pe_pf_reg_init() {
+    if pe_pf_threads != 0 {
+        return;
+    }
+    var lock: i64 = pe_k_create_mutex(0, 0, "fid_prof_registry");
+    if lock != 0 {
+        pe_k_wait(lock, pe_infinite());
+    }
+    if pe_pf_threads == 0 {
+        pe_pf_tcount = pe_zeroed(1);
+        pe_pf_threads = pe_zeroed(PE_PF_MAXT * 4);
+    }
+    if lock != 0 {
+        pe_k_release_mutex(lock);
+        pe_k_close_handle(lock);
+    }
+}
+
+/// Register the running thread with the sampler: a handle of its own
+/// (suspend, get context, query) and its TEB. Once per thread id.
+fn pe_pf_add_self() {
+    pe_pf_reg_init();
+    var n: i64 = pe_atomic_load(pe_pf_tcount);
+    if n >= PE_PF_MAXT {
+        return;
+    }
+    var tid: i64 = pe_pf_thread_id() & 4294967295;
+    var i: i64 = 0;
+    while i < n {
+        if pe_load(pe_pf_threads + i * 32 + 24) == tid {
+            return;
+        }
+        i = i + 1;
+    }
+    // THREAD_SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | QUERY_LIMITED
+    var h: i64 = pe_pf_open_thread(2 | 8 | 64 | 2048, 0, tid);
+    if h == 0 {
+        return;
+    }
+    // THREAD_BASIC_INFORMATION: TebBaseAddress at 8
+    var info: i64 = pe_zeroed(6);
+    var teb: i64 = 0;
+    if pe_pf_thread_info(h, 0, info, 48, 0) == 0 {
+        teb = pe_load(info + 8);
+    }
+    p_free(info);
+    var at: i64 = pe_atomic_add(pe_pf_tcount, 1);
+    if at >= PE_PF_MAXT {
+        pe_k_close_handle(h);
+        return;
+    }
+    var rec: i64 = pe_pf_threads + at * 32;
+    pe_store(rec + 8, teb);
+    pe_store(rec + 16, 0);
+    pe_store(rec + 24, tid);
+    pe_atomic_store(rec, h);
+}
+
+/// pert_thread_main, on each new OS thread running `entry`: registered,
+/// unless it is the sampler or the watcher.
+fn pe_pf_thread_start(entry: i64) {
+    if entry == pe_pf_sampler_fn || entry == pe_pf_watch_fn {
+        return;
+    }
+    if pe_pf_tcount != 0 && pe_atomic_load(pe_pf_tcount) >= PE_PF_MAXT {
+        return;
+    }
+    pe_pf_add_self();
+}
+
+/// The counting tables (a zeroed word per bucket: m functions, the code
+/// before the first, the rest), made once. False when the image has no
+/// function table.
+fn pe_pf_setup() -> bool {
+    if pe_pf_m != 0 {
+        return true;
+    }
+    var tab: i64 = nat_fn_names();
+    if tab == 0 {
+        return false;
+    }
+    var m: i64 = 0;
+    while pe_load(tab + m * 16 + 8) != 0 {
+        m = m + 1;
+    }
+    if m == 0 {
+        return false;
+    }
+    pe_pf_self = pe_zeroed(m + 2);
+    pe_pf_total = pe_zeroed(m + 2);
+    pe_pf_stamp = pe_zeroed(m + 2);
+    pe_pf_tab = tab;
+    pe_pf_m = m;
+    return true;
+}
+
+/// Every count back to 0.
+fn pe_pf_clear() {
+    var b: i64 = 0;
+    while b < pe_pf_m + 2 {
+        pe_store(pe_pf_self + b * 8, 0);
+        pe_store(pe_pf_total + b * 8, 0);
+        pe_store(pe_pf_stamp + b * 8, 0);
+        b = b + 1;
+    }
+    pe_pf_n = 0;
+}
+
+/// The bucket of code address pc: the function of nat_fn_names it is in;
+/// m before the first function, m + 1 past the code.
+fn pe_pf_bucket(pc: i64) -> i64 {
+    var tab: i64 = pe_pf_tab;
+    var m: i64 = pe_pf_m;
+    if pc < pe_load(tab) {
+        return m;
+    }
+    if pc >= pe_load(tab + m * 16) {
+        return m + 1;
+    }
+    var lo: i64 = 0;
+    var hi: i64 = m - 1;
+    while lo < hi {
+        var mid: i64 = (lo + hi + 1) / 2;
+        if pe_load(tab + mid * 16) <= pc {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+/// Bucket b is on the stack of sample `stamp`: counted once per sample.
+fn pe_pf_note(b: i64, stamp: i64) {
+    if pe_load(pe_pf_stamp + b * 8) != stamp {
+        pe_store(pe_pf_stamp + b * 8, stamp);
+        pe_store(pe_pf_total + b * 8, pe_load(pe_pf_total + b * 8) + 1);
+    }
+}
+
+/// The function at `at` starts with pe_ir's frame prologue: push rbp;
+/// mov rbp, rsp (55 48 89 E5).
+fn pe_pf_framed(at: i64) -> bool {
+    return pe_pf_ldb(at) == 85 && pe_pf_ldb(at + 1) == 72 && pe_pf_ldb(at + 2) == 137 && pe_pf_ldb(at + 3) == 229;
+}
+
+// FID_PROF=folded (llvm-roadmap DB9): whole stacks instead of the table,
+// as linux_runtime/sys.fd. A sample's stack (its buckets, innermost first,
+// at most PE_PF_FDEPTH) is hashed and counted in a table of PE_PF_STACKS
+// slots made before sampling starts, [key][count][depth][bucket]*; only
+// the sampler thread writes it. Printed root first, `main;work;fib 123`
+// (flamegraph.pl, speedscope).
+const PE_PF_STACKS: i64 = 4096;
+const PE_PF_FDEPTH: i64 = 96;
+const PE_PF_SLOT: i64 = 99;       // words per slot: 3 + PE_PF_FDEPTH
+var pe_pf_stk: i64 = 0;           // the stack table (0: not folded)
+var pe_pf_lost: i64 = 0;          // samples whose stack found no slot
+
+/// FID_PROF's value v is "folded": the stack table, made once.
+fn pe_pf_fold_init(v: i64) {
+    if v == 0 || pe_pf_stk != 0 {
+        return;
+    }
+    if pe_pf_ldb(v) != 102 || pe_pf_ldb(v + 1) != 111 || pe_pf_ldb(v + 2) != 108 || pe_pf_ldb(v + 3) != 100 {
+        return;
+    }
+    if pe_pf_ldb(v + 4) != 101 || pe_pf_ldb(v + 5) != 100 || pe_pf_ldb(v + 6) != 0 {
+        return;
+    }
+    pe_pf_stk = pe_zeroed(PE_PF_STACKS * PE_PF_SLOT);
+}
+
+/// Every stack back to 0.
+fn pe_pf_fold_clear() {
+    if pe_pf_stk == 0 {
+        return;
+    }
+    var i: i64 = 0;
+    while i < PE_PF_STACKS {
+        var s: i64 = pe_pf_stk + i * PE_PF_SLOT * 8;
+        pe_store(s, 0);
+        pe_store(s + 8, 0);
+        pe_store(s + 16, 0);
+        i = i + 1;
+    }
+    pe_pf_lost = 0;
+}
+
+/// The stack of one sample, walked as pe_pf_tick walks it (the bucket of
+/// pc, the caller of a frameless function or a prologue, each frame
+/// record's caller inside the thread's stack), at most PE_PF_FDEPTH
+/// buckets. slot 0: its key (a hash, > 0); else its buckets written at
+/// slot + 24 and their count.
+@wrapping
+fn pe_pf_chain(pc: i64, fp0: i64, sp: i64, teb: i64, slot: i64) -> i64 {
+    var m: i64 = pe_pf_m;
+    var h: i64 = 1469598103934665603;
+    var b: i64 = pe_pf_bucket(pc);
+    if slot != 0 {
+        pe_store(slot + 24, b);
+    }
+    h = (h ^ (b + 1)) * 1099511628211;
+    var d: i64 = 1;
+    var hi: i64 = 0;
+    var lo: i64 = 0;
+    if teb != 0 {
+        hi = pe_load(teb + 8);
+        lo = pe_load(teb + 16);
+    }
+    if teb != 0 && hi != 0 && sp >= lo && sp + 16 <= hi && (sp & 7) == 0 {
+        var start: i64 = 0;
+        if b < m {
+            start = pe_load(pe_pf_tab + b * 16);
+        }
+        if b >= m || !pe_pf_framed(start) || pc < start + 4 {
+            var ret: i64 = pe_load(sp);
+            if b < m && pc > start && pc < start + 4 {
+                ret = pe_load(sp + 8);
+            }
+            var lb: i64 = pe_pf_bucket(ret - 1);
+            if lb < m {
+                if slot != 0 {
+                    pe_store(slot + 24 + d * 8, lb);
+                }
+                h = (h ^ (lb + 1)) * 1099511628211;
+                d = d + 1;
+            }
+        }
+        var fp: i64 = fp0;
+        var low: i64 = sp;
+        var k: i64 = 0;
+        while fp != 0 && (fp & 7) == 0 && fp >= low && fp + 16 <= hi && k < PE_PF_DEPTH && d < PE_PF_FDEPTH {
+            var rb: i64 = pe_pf_bucket(pe_load(fp + 8) - 1);
+            if rb < m {
+                if slot != 0 {
+                    pe_store(slot + 24 + d * 8, rb);
+                }
+                h = (h ^ (rb + 1)) * 1099511628211;
+                d = d + 1;
+            }
+            low = fp + 8;
+            fp = pe_load(fp);
+            k = k + 1;
+        }
+    }
+    if slot != 0 {
+        return d;
+    }
+    h = h ^ d;
+    return (h & 0x7FFFFFFFFFFFFFFF) | 1;
+}
+
+/// Count one sample's stack in the stack table (the sampler thread, the
+/// thread still suspended: no allocation).
+fn pe_pf_fold(pc: i64, fp: i64, sp: i64, teb: i64) {
+    var key: i64 = pe_pf_chain(pc, fp, sp, teb, 0);
+    var i: i64 = 0;
+    while i < PE_PF_STACKS {
+        var s: i64 = pe_pf_stk + ((key + i) & (PE_PF_STACKS - 1)) * PE_PF_SLOT * 8;
+        var k: i64 = pe_load(s);
+        if k == 0 {
+            var d: i64 = pe_pf_chain(pc, fp, sp, teb, s);
+            pe_store(s + 8, 1);
+            pe_store(s, key);
+            pe_store(s + 16, d);
+            return;
+        }
+        if k == key {
+            pe_store(s + 8, pe_load(s + 8) + 1);
+            return;
+        }
+        i = i + 1;
+    }
+    pe_pf_lost = pe_pf_lost + 1;
+}
+
+/// The name of bucket b.
+fn pe_pf_bucket_name(b: i64) -> str {
+    if b < pe_pf_m {
+        return p_str_from_ptr(pe_load(pe_pf_tab + b * 16 + 8));
+    }
+    if b == pe_pf_m {
+        return "(runtime primitives)";
+    }
+    return "(outside the functions)";
+}
+
+/// FID_PROF=folded: every stack sampled, root first, and its samples, one
+/// line each, to stderr.
+fn pe_pf_print_folded() {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < PE_PF_STACKS {
+        var s: i64 = pe_pf_stk + i * PE_PF_SLOT * 8;
+        var d: i64 = pe_load(s + 16);
+        var c: i64 = pe_load(s + 8);
+        if d > 0 && c > 0 {
+            var line: str = "";
+            var j: i64 = d - 1;
+            while j >= 0 {
+                line = line + pe_pf_bucket_name(pe_load(s + 24 + j * 8));
+                if j > 0 {
+                    line = line + ";";
+                }
+                j = j - 1;
+            }
+            out = out + line + " " + int_to_str(c) + "\n";
+        }
+        i = i + 1;
+    }
+    if pe_pf_lost > 0 {
+        out = out + "(more stacks than the table holds) " + int_to_str(pe_pf_lost) + "\n";
+    }
+    p_eprint_str(out);
+}
+
+/// One sample of a suspended thread from its registers. Reads only its
+/// stack, inside [StackLimit, StackBase) of its TEB.
+fn pe_pf_tick(pc: i64, fp0: i64, sp: i64, teb: i64) {
+    if pe_pf_stk != 0 {
+        pe_pf_fold(pc, fp0, sp, teb);
+    }
+    pe_pf_n = pe_pf_n + 1;
+    var stamp: i64 = pe_pf_n;
+    var m: i64 = pe_pf_m;
+    var b: i64 = pe_pf_bucket(pc);
+    pe_store(pe_pf_self + b * 8, pe_load(pe_pf_self + b * 8) + 1);
+    pe_pf_note(b, stamp);
+    if teb == 0 {
+        return;
+    }
+    var hi: i64 = pe_load(teb + 8);
+    var lo: i64 = pe_load(teb + 16);
+    // mid-switch between two stacks, or no stack known: the pc only
+    if hi == 0 || sp < lo || sp + 16 > hi || (sp & 7) != 0 {
+        return;
+    }
+    // A function without a frame, or the pc still in the prologue: its
+    // caller's return address is on top of the stack (a word higher once
+    // rbp is pushed), and rbp is still the caller's
+    var start: i64 = 0;
+    if b < m {
+        start = pe_load(pe_pf_tab + b * 16);
+    }
+    if b >= m || !pe_pf_framed(start) || pc < start + 4 {
+        var ret: i64 = pe_load(sp);
+        if b < m && pc > start && pc < start + 4 {
+            ret = pe_load(sp + 8);
+        }
+        var lb: i64 = pe_pf_bucket(ret - 1);
+        if lb < m {
+            pe_pf_note(lb, stamp);
+        }
+    }
+    // The frame records ([rbp] the caller's rbp, [rbp + 8] the return
+    // address), upwards on this stack, at most PE_PF_DEPTH of them
+    var fp: i64 = fp0;
+    var low: i64 = sp;
+    var k: i64 = 0;
+    while fp != 0 && (fp & 7) == 0 && fp >= low && fp + 16 <= hi && k < PE_PF_DEPTH {
+        var rb: i64 = pe_pf_bucket(pe_load(fp + 8) - 1);
+        if rb < m {
+            pe_pf_note(rb, stamp);
+        }
+        low = fp + 8;
+        fp = pe_load(fp);
+        k = k + 1;
+    }
+}
+
+/// Suspend thread h, count a sample of it, resume it. ctx: a CONTEXT,
+/// 16-byte aligned (Rsp at 0x98, Rbp at 0xA0, Rip at 0xF8).
+fn pe_pf_sample(h: i64, teb: i64, ctx: i64) {
+    if (pe_pf_suspend(h) & 4294967295) == 4294967295 {
+        return;
+    }
+    // ContextFlags: CONTEXT_AMD64 | CONTROL | INTEGER
+    pe_store(ctx + 48, 1048579);
+    if pe_pf_get_context(h, ctx) != 0 {
+        pe_pf_tick(pe_load(ctx + 248), pe_load(ctx + 160), pe_load(ctx + 152), teb);
+    }
+    pe_pf_resume(h);
+}
+
+/// One look at every registered thread: a sample of each that ran since
+/// the last look (after a start, the first look only notes the counts).
+fn pe_pf_round(ctx: i64, cyc: i64) {
+    var prime: bool = pe_pf_prime != 0;
+    pe_pf_prime = 0;
+    var n: i64 = pe_atomic_load(pe_pf_tcount);
+    if n > PE_PF_MAXT {
+        n = PE_PF_MAXT;
+    }
+    var i: i64 = 0;
+    while i < n && pe_pf_on != 0 {
+        var rec: i64 = pe_pf_threads + i * 32;
+        var h: i64 = pe_atomic_load(rec);
+        if h != 0 && pe_pf_cycles(h, cyc) != 0 {
+            var c: i64 = pe_load(cyc);
+            if c != pe_load(rec + 16) {
+                pe_store(rec + 16, c);
+                if !prime {
+                    pe_pf_sample(h, pe_load(rec + 8), ctx);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// The sampler thread: a round every millisecond while the profiler is on
+/// (the timer resolution raised to 0.5 ms, as win.fd's), every 20 ms a
+/// look whether it is on again.
+pub fn pert_prof_sampler_main(id: i64) -> i64 {
+    var actual: i64 = pe_zeroed(1);
+    pe_pf_timer_res(5000, 1, actual);
+    p_free(actual);
+    var raw: i64 = p_malloc(1232 + 16);
+    var ctx: i64 = (raw + 15) & (0 - 16);
+    var cyc: i64 = pe_zeroed(1);
+    var alive: bool = true;
+    while alive {
+        if pe_pf_on == 0 {
+            pe_k_sleep(20);
+        } else {
+            pe_k_sleep(1);
+            if pe_pf_on != 0 && pe_pf_threads != 0 {
+                pe_pf_round(ctx, cyc);
+            }
+        }
+    }
+    return 0;
+}
+
+/// The decimal number at environment string v (0 when not set).
+fn pe_pf_env_num(v: i64) -> i64 {
+    var r: i64 = 0;
+    if v == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < 9 && pe_pf_ldb(v + i) >= 48 && pe_pf_ldb(v + i) <= 57 {
+        r = r * 10 + (pe_pf_ldb(v + i) - 48);
+        i = i + 1;
+    }
+    return r;
+}
+
+/// The watcher thread: the report on request (the named event
+/// Local\fid-prof-<pid>, Ctrl-Break) and every FID_PROF_EVERY seconds.
+pub fn pert_prof_watch_main(id: i64) -> i64 {
+    var every: i64 = pe_pf_env_num(pe_c_getenv("FID_PROF_EVERY") as i64);
+    // auto-reset, not set
+    var ev: i64 = pe_pf_create_event(0, 0, 0, "Local\\fid-prof-" + int_to_str(pe_k_getpid()));
+    var ticks: i64 = 0;
+    var alive: bool = true;
+    while alive {
+        var hit: bool = false;
+        if ev != 0 {
+            if (pe_k_wait(ev, 100) as i64) == 0 {
+                hit = true;
+            }
+        } else {
+            pe_k_sleep(100);
+        }
+        ticks = ticks + 1;
+        var due: bool = every > 0 && ticks >= every * 10;
+        if hit || pe_pf_req != 0 || due {
+            pe_pf_req = 0;
+            ticks = 0;
+            if pe_pf_on != 0 {
+                pe_pf_print();
+            }
+        }
+    }
+    return 0;
+}
+
+/// Start OS thread `entry(0)` (as pe_co_ensure starts its workers).
+fn pe_pf_spawn(entry: i64) -> bool {
+    var block: i64 = pe_zeroed(14);
+    pe_store(block, entry);
+    pe_store(block + 8, 1);
+    pe_store(block + 16, 0);
+    var h: i64 = pe_k_create_thread(0, 0, pe_thread_entry_addr(), block, 0, 0);
+    if h == 0 {
+        return false;
+    }
+    pe_k_close_handle(h);
+    return true;
+}
+
+/// Start counting (from 0) on every registered thread and the calling
+/// one: 0, or -1 when the image has no function table or no thread could
+/// be started.
+fn pe_pf_begin() -> i64 {
+    if !pe_pf_setup() {
+        return 0 - 1;
+    }
+    pe_pf_add_self();
+    pe_pf_on = 0;
+    pe_pf_clear();
+    // DB9: FID_PROF=folded keeps whole stacks
+    pe_pf_fold_init(pe_c_getenv("FID_PROF") as i64);
+    pe_pf_fold_clear();
+    pe_pf_prime = 1;
+    if pe_pf_up == 0 {
+        pe_pf_sampler_fn = pe_fn_lookup("pert_prof_sampler_main");
+        pe_pf_watch_fn = pe_fn_lookup("pert_prof_watch_main");
+        if pe_pf_sampler_fn == 0 || !pe_pf_spawn(pe_pf_sampler_fn) {
+            return 0 - 1;
+        }
+        if pe_pf_watch_fn != 0 {
+            pe_pf_spawn(pe_pf_watch_fn);
+        }
+        // Ctrl-Break asks for the report (base.fd pe_console_ctrl)
+        if pert_sig_installed == 0 {
+            if pe_k_set_ctrl_handler(pe_console_ctrl, 1) != 0 {
+                pert_sig_installed = 1;
+            }
+        }
+        pe_pf_up = 1;
+    }
+    pe_pf_on = 1;
+    return 0;
+}
+
+/// Bucket a goes before bucket b in the report: more self samples, then
+/// more total ones.
+fn pe_pf_before(a: i64, b: i64) -> bool {
+    var sa: i64 = pe_load(pe_pf_self + a * 8);
+    var sb: i64 = pe_load(pe_pf_self + b * 8);
+    if sa != sb {
+        return sa > sb;
+    }
+    return pe_load(pe_pf_total + a * 8) > pe_load(pe_pf_total + b * 8);
+}
+
+/// v right-aligned in `width` columns.
+fn pe_pf_num(v: i64, width: i64) -> str {
+    var s: str = int_to_str(v);
+    while str_len(s) < width {
+        s = " " + s;
+    }
+    return s;
+}
+
+/// v of n as a percentage with one decimal, in 8 columns.
+fn pe_pf_pct(v: i64, n: i64) -> str {
+    var p: i64 = v * 1000 / n;
+    return pe_pf_num(p / 10, 6) + "." + int_to_str(p % 10);
+}
+
+/// The table of the samples so far, most self time first, at most 40
+/// lines (to stderr; the format of linux_runtime/sys.fd pe_prof_print).
+fn pe_pf_print() {
+    if pe_pf_stk != 0 {
+        pe_pf_print_folded();
+        return;
+    }
+    var n: i64 = pe_pf_n;
+    var m: i64 = pe_pf_m;
+    p_eprint_str("profile (FID_PROF): " + int_to_str(n) + " samples, one per ms of CPU time\n");
+    if n == 0 || m == 0 {
+        return;
+    }
+    var out: str = "   self%     self  total%    total  function\n";
+    var shown: i64 = pe_zeroed(m + 2);
+    var row: i64 = 0;
+    while row < 40 {
+        var best: i64 = 0 - 1;
+        var b: i64 = 0;
+        while b < m + 2 {
+            if pe_load(shown + b * 8) == 0 && (pe_load(pe_pf_self + b * 8) > 0 || pe_load(pe_pf_total + b * 8) > 0) {
+                if best < 0 || pe_pf_before(b, best) {
+                    best = b;
+                }
+            }
+            b = b + 1;
+        }
+        if best < 0 {
+            row = 40;
+        } else {
+            pe_store(shown + best * 8, 1);
+            var s: i64 = pe_load(pe_pf_self + best * 8);
+            var t: i64 = pe_load(pe_pf_total + best * 8);
+            var name: str = "(outside the functions)";
+            if best < m {
+                name = p_str_from_ptr(pe_load(pe_pf_tab + best * 16 + 8));
+            } else if best == m {
+                name = "(runtime primitives)";
+            }
+            out = out + pe_pf_pct(s, n) + pe_pf_num(s, 9) + pe_pf_pct(t, n) + pe_pf_num(t, 9) + "  " + name + "\n";
+            row = row + 1;
+        }
+    }
+    p_free(shown);
+    p_eprint_str(out);
+}
+
+/// The NUL-terminated name at p is s.
+fn pe_pf_name_is(p: i64, s: str) -> bool {
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        if pe_pf_ldb(p + i) != str_byte_at(s, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return pe_pf_ldb(p + n) == 0;
+}
+
+/// Before main (the entry point): FID_PROF set, not empty and not "0",
+/// starts the profiler on the main thread.
+pub fn pert_prof_boot() {
+    var v: i64 = pe_c_getenv("FID_PROF") as i64;
+    if v == 0 || pe_pf_ldb(v) == 0 {
+        return;
+    }
+    if pe_pf_ldb(v) == 48 && pe_pf_ldb(v + 1) == 0 {
+        return;
+    }
+    pe_pf_begin();
+}
+
+/// At exit: the profiler stopped and its report printed, when it is on.
+fn pe_pf_at_exit() {
+    if pe_pf_on == 0 {
+        return;
+    }
+    pe_pf_on = 0;
+    pe_k_sleep(2);
+    pe_pf_print();
+}
+
+/// After main returns (the entry point): the report; main's result back.
+pub fn pert_prof_exit(code: i64) -> i64 {
+    pe_pf_at_exit();
+    return code;
+}
+
+/// p_prof_start(): count samples from now on (earlier ones are dropped):
+/// 0, or -1 when this program cannot be sampled.
+pub fn pert_prof_start() -> i64 {
+    return pe_pf_begin();
+}
+
+/// p_prof_stop(): stop counting; the samples taken.
+pub fn pert_prof_stop() -> i64 {
+    if pe_pf_on != 0 {
+        pe_pf_on = 0;
+        // a round in progress ends within it
+        pe_k_sleep(2);
+    }
+    return pe_pf_n;
+}
+
+/// p_prof_report(): the profile so far on stderr; the samples taken.
+pub fn pert_prof_report() -> i64 {
+    pe_pf_print();
+    return pe_pf_n;
+}
+
+/// p_prof_samples(name): the samples with function `name` on the stack.
+pub fn pert_prof_samples(name: str) -> i64 {
+    var m: i64 = pe_pf_m;
+    var r: i64 = 0;
+    var b: i64 = 0;
+    while b < m {
+        if pe_pf_name_is(pe_load(pe_pf_tab + b * 16 + 8), name) {
+            r = r + pe_load(pe_pf_total + b * 8);
+        }
+        b = b + 1;
+    }
+    return r;
+}
+
+// ─── Run-time resource limits (roadmap P12) ─────────────────────────────
+// Native Windows (pe_ir), as the C runtime's (codegen_c.fd
+// emit_limits_runtime) and linux_runtime/sys.fd's: read before main by
+// pert_limits_boot (the entry point calls it, as it calls pert_prof_boot:
+// compiler/pe_ir_stubs.fd, see docs/reference/runtime-limits.md).
+//   FID_MEM_LIMIT=<bytes>[K|M|G]: the live bytes of the heap. pe_ir's
+//     p_malloc / p_free are machine code (pe_ir_stubs.fd PeirGen_gen_malloc
+//     / gen_free): they call pert_lim_take(block bytes) and
+//     pert_lim_give(block bytes), which return at once with no limit set;
+//     past the limit "fid: memory limit of N bytes exceeded (FID_MEM_LIMIT):
+//     U bytes in use, A more asked for", exit code 125.
+//   FID_CPU_LIMIT=<seconds>: user plus kernel time of the whole process: a
+//     thread reads GetProcessTimes every 10 ms; past it "fid: CPU time
+//     limit of S seconds exceeded (FID_CPU_LIMIT)", exit code 124.
+// Unset, empty or 0: no limit; a value that is not a number: exit code 2.
+// Nothing here allocates once the program runs (the messages are written
+// with WriteFile from a scratch block made at boot), so a stop inside
+// p_malloc does not call p_malloc again.
+
+extern "C" link "kernel32.dll" {
+    fn GetProcessTimes as pe_lim_times(proc: i64, created: i64, exited: i64, kernel: i64, user: i64) -> i32;
+    fn GetCurrentProcess as pe_lim_self() -> i64;
+    fn TerminateProcess as pe_lim_kill(proc: i64, code: i64) -> i32;
+}
+
+var pe_lim_mem: i64 = 0;        // bytes; 0: no memory limit
+var pe_lim_used: i64 = 0;       // *i64: the live counted bytes (atomic)
+var pe_lim_cpu: i64 = 0;        // CPU time limit in 100 ns units; 0: none
+var pe_lim_cpu_text: i64 = 0;   // FID_CPU_LIMIT's text, for the message
+var pe_lim_scratch: i64 = 0;    // [0, 8) WriteFile's count, [8, 40) digits
+
+/// <digits>[.digits]; with `units`, then K, M or G (and a B), the value in
+/// bytes; without, in units of 100 ns (seconds). 0 for an empty string, -1
+/// when it is not a number (or too large).
+fn pe_lim_parse(s: i64, units: bool) -> i64 {
+    if pe_byte_at(s, 0) == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    var whole: i64 = 0;
+    var digits: i64 = 0;
+    while pe_byte_at(s, i) >= 48 && pe_byte_at(s, i) <= 57 {
+        if whole > 1000000000000000 {
+            return 0 - 1;
+        }
+        whole = whole * 10 + (pe_byte_at(s, i) - 48);
+        i = i + 1;
+        digits = digits + 1;
+    }
+    var frac: i64 = 0;      // millionths
+    if pe_byte_at(s, i) == 46 {
+        i = i + 1;
+        var scale: i64 = 100000;
+        while pe_byte_at(s, i) >= 48 && pe_byte_at(s, i) <= 57 {
+            frac = frac + (pe_byte_at(s, i) - 48) * scale;
+            scale = scale / 10;
+            i = i + 1;
+            digits = digits + 1;
+        }
+    }
+    if digits == 0 {
+        return 0 - 1;
+    }
+    if !units {
+        if pe_byte_at(s, i) != 0 || whole > 900000000000 {
+            return 0 - 1;
+        }
+        return whole * 10000000 + frac * 10;
+    }
+    var mult: i64 = 1;
+    var c: i64 = pe_byte_at(s, i);
+    if c == 75 || c == 107 {
+        mult = 1024;
+        i = i + 1;
+    } else if c == 77 || c == 109 {
+        mult = 1048576;
+        i = i + 1;
+    } else if c == 71 || c == 103 {
+        mult = 1073741824;
+        i = i + 1;
+    }
+    if pe_byte_at(s, i) == 66 || pe_byte_at(s, i) == 98 {
+        i = i + 1;
+    }
+    if pe_byte_at(s, i) != 0 || whole > 9223372036854775807 / mult / 2 {
+        return 0 - 1;
+    }
+    var v: i64 = whole * mult + (frac / 1000) * mult / 1000;
+    if v == 0 && (whole != 0 || frac != 0) {
+        v = 1;
+    }
+    return v;
+}
+
+/// The literal text at s to stderr (no allocation).
+fn pe_lim_say(s: i64) {
+    pe_cr_puts(pe_k_std_handle(0 - 12), pe_lim_scratch, s);
+}
+
+/// A malformed limit: stderr says so, exit code 2.
+fn pe_lim_bad(name: i64, v: i64, kind: i64) {
+    pe_lim_say("fid: " as i64);
+    pe_lim_say(name);
+    pe_lim_say(kind);
+    pe_lim_say(v);
+    pe_lim_say("'\n" as i64);
+    pe_k_exit_process(2);
+}
+
+/// Before main (the entry point): FID_MEM_LIMIT and FID_CPU_LIMIT.
+pub fn pert_limits_boot() {
+    pe_lim_scratch = pe_zeroed(8);
+    var m: i64 = pe_c_getenv("FID_MEM_LIMIT") as i64;
+    if m != 0 {
+        var mv: i64 = pe_lim_parse(m, true);
+        if mv < 0 {
+            pe_lim_bad("FID_MEM_LIMIT" as i64, m, " is not a size (bytes, or with K, M or G): '" as i64);
+        }
+        if mv > 0 {
+            pe_lim_used = pe_zeroed(1);
+            pe_lim_mem = mv;
+        }
+    }
+    var t: i64 = pe_c_getenv("FID_CPU_LIMIT") as i64;
+    if t == 0 {
+        return;
+    }
+    var cv: i64 = pe_lim_parse(t, false);
+    if cv < 0 {
+        pe_lim_bad("FID_CPU_LIMIT" as i64, t, " is not a number of seconds: '" as i64);
+    }
+    if cv == 0 {
+        return;
+    }
+    pe_lim_cpu_text = t;
+    pe_lim_cpu = cv;
+    var entry: i64 = pe_fn_lookup("pert_lim_watch_main");
+    if entry == 0 || !pe_pf_spawn(entry) {
+        pe_lim_cpu = 0;
+    }
+}
+
+/// The CPU watcher's thread: every 10 ms, the process's CPU time.
+pub fn pert_lim_watch_main(arg: i64) -> i64 {
+    var ft: i64 = pe_zeroed(4);
+    while true {
+        if pe_lim_times(pe_lim_self(), ft, ft + 8, ft + 16, ft + 24) != 0 {
+            if pe_load(ft + 16) + pe_load(ft + 24) >= pe_lim_cpu {
+                pe_lim_say("fid: CPU time limit of " as i64);
+                pe_lim_say(pe_lim_cpu_text);
+                pe_lim_say(" seconds exceeded (FID_CPU_LIMIT)\n" as i64);
+                pe_lim_kill(pe_lim_self(), 124);
+                pe_k_exit_process(124);
+            }
+        }
+        pe_k_sleep(10);
+    }
+    return 0;
+}
+
+/// p_malloc (machine code) takes a block of n bytes: with FID_MEM_LIMIT
+/// set, past the limit the program stops (exit code 125). Returns 0.
+pub fn pert_lim_take(n: i64) -> i64 {
+    if pe_lim_mem == 0 {
+        return 0;
+    }
+    var before: i64 = pe_atomic_add(pe_lim_used, n);
+    if before + n > pe_lim_mem {
+        pe_atomic_add(pe_lim_used, 0 - n);
+        var h: i64 = pe_k_std_handle(0 - 12);
+        pe_lim_say("fid: memory limit of " as i64);
+        pe_cr_put_int(h, pe_lim_scratch, pe_lim_scratch + 8, pe_lim_mem);
+        pe_lim_say(" bytes exceeded (FID_MEM_LIMIT): " as i64);
+        pe_cr_put_int(h, pe_lim_scratch, pe_lim_scratch + 8, before);
+        pe_lim_say(" bytes in use, " as i64);
+        pe_cr_put_int(h, pe_lim_scratch, pe_lim_scratch + 8, n);
+        pe_lim_say(" more asked for\n" as i64);
+        pe_k_exit_process(125);
+    }
+    return 0;
+}
+
+/// p_free (machine code) gives a block of n bytes back.
+pub fn pert_lim_give(n: i64) -> i64 {
+    if pe_lim_mem == 0 {
+        return 0;
+    }
+    pe_atomic_add(pe_lim_used, 0 - n);
+    return 0;
+}
+
+// ─── Tensor-parallel ranks (roadmap P6) ─────────────────────────────────
+// The OS half of tensor.fd "Tensor parallelism over several ranks", as the
+// C runtime's Windows half (codegen_c.fd cg_emit_tp_runtime). p_tp_init(n)
+// in rank 0 starts ranks 1..n-1 as copies of this program (CreateProcessA
+// of GetModuleFileNameA with GetCommandLineA). A pipe each way between
+// every pair of ranks, all made by rank 0 and not inheritable; a rank's
+// own ends are made inheritable for its start alone and named in its
+// FID_TP_LINKS ("b:in:out;" per other rank b, handles in decimal), so a
+// rank holds only its own pipes and sees another rank's exit as the end of
+// one. A started rank runs the program from the start with its standard
+// output and error on NUL; at its p_tp_init (pe_tp_os_attach) it takes its
+// links and the real output (FID_TP_STDIO "out:err"), so what the program
+// prints before p_tp_init is printed by rank 0 alone. FID_TP_RANK and
+// FID_TP_WORLD give the rank and the number of ranks; all four are removed
+// from the environment once read (and from rank 0's once the ranks run).
+
+// SAFETY: kernel32 functions pe_ir does not import by itself (`link`
+// makes them extra imports, bound at start-up when the program calls
+// them); prototypes as the Windows SDK's: handles and pointers are words,
+// BOOL and DWORD results an i32.
+extern "C" link "kernel32.dll" {
+    fn CreatePipe as pe_tpw_pipe(rd_out: i64, wr_out: i64, sa: i64, size: i64) -> i32;
+    fn SetHandleInformation as pe_tpw_set_info(h: i64, mask: i64, flags: i64) -> i32;
+    fn GetModuleFileNameA as pe_tpw_module_name(module: i64, buf: i64, size: i64) -> i32;
+    fn SetEnvironmentVariableA as pe_tpw_set_env(name: str, value: i64) -> i32;
+    fn SetStdHandle as pe_tpw_set_std(which: i64, h: i64) -> i32;
+}
+
+// SAFETY: GetCommandLineA is on pe_ir's kernel32 list; it returns the
+// process's command line, which this section only copies.
+extern "C" {
+    fn GetCommandLineA as pe_tpw_command_line() -> i64;
+}
+
+/// The decimal numbers in the NUL-ended string s, in order (any other
+/// byte separates them).
+fn pe_tpw_numbers(s: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var cur: i64 = 0;
+    var digits: i64 = 0;
+    var going: bool = true;
+    while going {
+        var c: i64 = pe_byte_at(s, i);
+        if c >= 48 && c <= 57 && digits < 18 {
+            cur = cur * 10 + c - 48;
+            digits = digits + 1;
+        } else {
+            if digits > 0 {
+                v.push(cur);
+            }
+            cur = 0;
+            digits = 0;
+            if c == 0 {
+                going = false;
+            }
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn pe_tpw_env_clear() {
+    pe_tpw_set_env("FID_TP_RANK", 0);
+    pe_tpw_set_env("FID_TP_WORLD", 0);
+    pe_tpw_set_env("FID_TP_LINKS", 0);
+    pe_tpw_set_env("FID_TP_STDIO", 0);
+}
+
+/// The standard handle n (-10, -11, -12), 0 when there is none.
+fn pe_tpw_std(n: i64) -> i64 {
+    var h: i64 = pe_k_std_handle(n);
+    if h == 0 - 1 {
+        return 0;
+    }
+    return h;
+}
+
+/// A rank rank 0 started: take the links named in FID_TP_LINKS and the
+/// real output. False in any other process.
+fn pe_tp_os_attach() -> bool {
+    var rs: i64 = pe_c_getenv("FID_TP_RANK") as i64;
+    if rs == 0 {
+        return false;
+    }
+    var ws: i64 = pe_c_getenv("FID_TP_WORLD") as i64;
+    var ls: i64 = pe_c_getenv("FID_TP_LINKS") as i64;
+    if ws == 0 || ls == 0 {
+        return false;
+    }
+    var rv: Vec<i64> = pe_tpw_numbers(rs);
+    var wv: Vec<i64> = pe_tpw_numbers(ws);
+    if rv.len() != 1 || wv.len() != 1 {
+        return false;
+    }
+    var rank: i64 = rv.get(0);
+    var n: i64 = wv.get(0);
+    if n < 2 || n > 32 || rank < 1 || rank >= n {
+        return false;
+    }
+    var lv: Vec<i64> = pe_tpw_numbers(ls);
+    var ss: i64 = pe_c_getenv("FID_TP_STDIO") as i64;
+    var sv: Vec<i64> = Vec::new();
+    if ss != 0 {
+        sv = pe_tpw_numbers(ss);
+    }
+    pe_tpw_env_clear();
+    if lv.len() != (n - 1) * 3 {
+        p_panic("tp: this rank was started with broken FID_TP_LINKS");
+    }
+    var k: i64 = 0;
+    while k + 2 < lv.len() {
+        var b: i64 = lv.get(k);
+        if b < 0 || b >= n || b == rank {
+            p_panic("tp: this rank was started with broken FID_TP_LINKS");
+        }
+        pe_tpw_set_info(lv.get(k + 1), 1, 0);
+        pe_tpw_set_info(lv.get(k + 2), 1, 0);
+        pet_tp_set_link(b, lv.get(k + 1), lv.get(k + 2));
+        k = k + 3;
+    }
+    if sv.len() == 2 {
+        // the real output: rank 0's standard output and error
+        var mute: i64 = pe_tpw_std(0 - 11);
+        pe_tpw_set_std(0 - 11, sv.get(0));
+        pe_tpw_set_std(0 - 12, sv.get(1));
+        if mute != 0 && mute != sv.get(0) && mute != sv.get(1) {
+            pe_k_close_handle(mute);
+        }
+    }
+    pet_tp_joined(rank, n, 0);
+    return true;
+}
+
+/// Rank 0: start ranks 1..n-1 with their pipes.
+fn pe_tp_os_spawn(n: i64) -> bool {
+    var nn: i64 = n * n;
+    var rd: i64 = p_malloc(nn * 8);
+    var wr: i64 = p_malloc(nn * 8);
+    pe_px_zero(rd, nn * 8);
+    pe_px_zero(wr, nn * 8);
+    // the pipe from a to b: read end rd[a * n + b], write end wr[a * n + b]
+    var a: i64 = 0;
+    while a < n {
+        var b: i64 = 0;
+        while b < n {
+            if a != b {
+                if (pe_tpw_pipe(rd + (a * n + b) * 8, wr + (a * n + b) * 8, 0, 1048576) as i64) == 0 {
+                    p_panic("tp_init: cannot create the pipes between ranks");
+                }
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    // our standard handles, inheritable: a rank writes its output there
+    var hin: i64 = pe_tpw_std(0 - 10);
+    var hout: i64 = pe_tpw_std(0 - 11);
+    var herr: i64 = pe_tpw_std(0 - 12);
+    var std_ok: bool = true;
+    if hin != 0 && (pe_tpw_set_info(hin, 1, 1) as i64) == 0 { std_ok = false; }
+    if hout != 0 && (pe_tpw_set_info(hout, 1, 1) as i64) == 0 { std_ok = false; }
+    if herr != 0 && (pe_tpw_set_info(herr, 1, 1) as i64) == 0 { std_ok = false; }
+    // NUL, inheritable: a rank's output until it reaches p_tp_init
+    var nul: i64 = 0 - 1;
+    if std_ok && hout != 0 && herr != 0 {
+        var sa: i64 = p_malloc(24);
+        pe_px_zero(sa, 24);
+        pe_px_st32(sa, 24);
+        pe_px_st32(sa + 16, 1);
+        // GENERIC_WRITE, share read|write, OPEN_EXISTING
+        nul = pe_cr_create("NUL" as i64, 1073741824, 3, sa, 3, 0, 0);
+        p_free(sa);
+    }
+    var mute: bool = nul != 0 - 1;
+    var exe: i64 = p_malloc(4096);
+    var el: i64 = (pe_tpw_module_name(0, exe, 4096) as i64) & 4294967295;
+    if el == 0 || el >= 4096 {
+        p_panic("tp_init: cannot find this program's file");
+    }
+    var cl: i64 = pe_tpw_command_line();
+    var cl_n: i64 = pe_c_strlen(cl);
+    var si: i64 = p_malloc(104);
+    var pi: i64 = p_malloc(24);
+    pe_c_fflush(0);
+    var r: i64 = 1;
+    while r < n {
+        var links: str = "";
+        var b2: i64 = 0;
+        while b2 < n {
+            if b2 != r {
+                var hi: i64 = pe_px_ld(rd + (b2 * n + r) * 8);
+                var ho: i64 = pe_px_ld(wr + (r * n + b2) * 8);
+                links = links + int_to_str(b2) + ":" + int_to_str(hi) + ":" + int_to_str(ho) + ";";
+                pe_tpw_set_info(hi, 1, 1);
+                pe_tpw_set_info(ho, 1, 1);
+            }
+            b2 = b2 + 1;
+        }
+        var rank_s: str = int_to_str(r);
+        var world_s: str = int_to_str(n);
+        pe_tpw_set_env("FID_TP_RANK", rank_s as i64);
+        pe_tpw_set_env("FID_TP_WORLD", world_s as i64);
+        pe_tpw_set_env("FID_TP_LINKS", links as i64);
+        var stdio_s: str = int_to_str(hout) + ":" + int_to_str(herr);
+        if mute {
+            pe_tpw_set_env("FID_TP_STDIO", stdio_s as i64);
+        }
+        // STARTUPINFOA: cb, dwFlags at 60, the standard handles at 80, 88, 96
+        pe_px_zero(si, 104);
+        pe_px_st32(si, 104);
+        if std_ok {
+            pe_px_st32(si + 60, 256);                   // STARTF_USESTDHANDLES
+            pe_px_st(si + 80, hin);
+            if mute {
+                pe_px_st(si + 88, nul);
+                pe_px_st(si + 96, nul);
+            } else {
+                pe_px_st(si + 88, hout);
+                pe_px_st(si + 96, herr);
+            }
+        }
+        pe_px_zero(pi, 24);
+        // CreateProcessA may write to the command line: a copy
+        var cmd: i64 = p_malloc(cl_n + 1);
+        pe_px_copy(cmd, cl, cl_n);
+        pe_set_byte(cmd, cl_n, 0);
+        var ok: i64 = pe_px_create(exe, cmd, 0, 0, 1, 0, 0, 0, si, pi) as i64;
+        p_free(cmd);
+        b2 = 0;
+        while b2 < n {
+            if b2 != r {
+                pe_tpw_set_info(pe_px_ld(rd + (b2 * n + r) * 8), 1, 0);
+                pe_tpw_set_info(pe_px_ld(wr + (r * n + b2) * 8), 1, 0);
+            }
+            b2 = b2 + 1;
+        }
+        if ok == 0 {
+            p_panic("tp_init: cannot start rank " + int_to_str(r));
+        }
+        pe_k_close_handle(pe_px_ld(pi + 8));
+        pet_tp_set_child(r, pe_px_ld(pi));
+        r = r + 1;
+    }
+    pe_tpw_env_clear();
+    if nul != 0 - 1 {
+        pe_k_close_handle(nul);
+    }
+    // rank 0 keeps the read ends of the pipes to it and the write ends of
+    // those from it; the others belong to the ranks now
+    var b3: i64 = 1;
+    while b3 < n {
+        pet_tp_set_link(b3, pe_px_ld(rd + (b3 * n) * 8), pe_px_ld(wr + b3 * 8));
+        b3 = b3 + 1;
+    }
+    a = 0;
+    while a < n {
+        var b4: i64 = 0;
+        while b4 < n {
+            if a != b4 {
+                if b4 != 0 {
+                    pe_k_close_handle(pe_px_ld(rd + (a * n + b4) * 8));
+                }
+                if a != 0 {
+                    pe_k_close_handle(pe_px_ld(wr + (a * n + b4) * 8));
+                }
+            }
+            b4 = b4 + 1;
+        }
+        a = a + 1;
+    }
+    p_free(rd);
+    p_free(wr);
+    p_free(exe);
+    p_free(si);
+    p_free(pi);
+    pet_tp_joined(0, n, n - 1);
+    return true;
+}
+
+/// All n bytes at buf into the pipe: false when the rank at its other end
+/// is gone.
+fn pe_tp_os_write(h: i64, buf: i64, n: i64) -> bool {
+    var cell: i64 = p_malloc(8);
+    var done: i64 = 0;
+    var ok: bool = true;
+    while ok && done < n {
+        var chunk: i64 = n - done;
+        if chunk > 1073741824 {
+            chunk = 1073741824;
+        }
+        pe_px_st(cell, 0);
+        var r: i64 = pe_cr_write_file(h, buf + done, chunk, cell, 0) as i64;
+        var w: i64 = pe_px_ld(cell) & 4294967295;
+        if r == 0 || w == 0 {
+            ok = false;
+        } else {
+            done = done + w;
+        }
+    }
+    p_free(cell);
+    return ok;
+}
+
+/// n bytes from the pipe into buf: false when it ended first.
+fn pe_tp_os_read(h: i64, buf: i64, n: i64) -> bool {
+    var cell: i64 = p_malloc(8);
+    var done: i64 = 0;
+    var ok: bool = true;
+    while ok && done < n {
+        var chunk: i64 = n - done;
+        if chunk > 1073741824 {
+            chunk = 1073741824;
+        }
+        pe_px_st(cell, 0);
+        var r: i64 = pe_k_read_file(h, buf + done, chunk, cell, 0) as i64;
+        var got: i64 = pe_px_ld(cell) & 4294967295;
+        if r == 0 || got == 0 {
+            ok = false;
+        } else {
+            done = done + got;
+        }
+    }
+    p_free(cell);
+    return ok;
+}
+
+fn pe_tp_os_close(inh: i64, outh: i64) {
+    pe_k_close_handle(inh);
+    if outh != inh {
+        pe_k_close_handle(outh);
+    }
+}
+
+/// The rank's exit code once it ended (-1 when it cannot be had).
+fn pe_tp_os_wait(h: i64) -> i64 {
+    pe_k_wait(h, 4294967295);
+    var cell: i64 = p_malloc(8);
+    pe_px_st(cell, 0);
+    var got: i64 = pe_px_exit_code(h, cell) as i64;
+    var code: i64 = pe_px_ld(cell) & 4294967295;
+    p_free(cell);
+    pe_k_close_handle(h);
+    if got == 0 {
+        return 0 - 1;
+    }
+    return code;
 }

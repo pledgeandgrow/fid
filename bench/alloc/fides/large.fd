@@ -1,0 +1,72 @@
+// alloc/large (competitive roadmap RT8; mimalloc-bench's malloc-large
+// shape): big blocks. 64 slots; 40,000 times a random slot's block is read
+// and freed and replaced by one of 64 KB to 4 MB (past fid's 1 MB pooled
+// classes, so both of its paths run). One word in each 4 KB page of the
+// block is written (the program touches what it asked for). Prints the sum
+// of the first words read back.
+
+// 31-bit LCG: no product passes 2^62, so no overflow check fires
+fn next(x: i64) -> i64 {
+    return (x * 1103515245 + 12345) % 2147483648;
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: *mut i64 = a;
+    *p = v;
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: *mut i64 = a;
+    return *p;
+}
+
+@unsafe
+fn make(n: i64, v: i64) -> i64 {
+    var b: i64 = p_malloc(n);
+    var o: i64 = 0;
+    while o < n {
+        st(b + o, v);
+        o = o + 4096;
+    }
+    return b;
+}
+
+@unsafe
+fn main() -> i64 {
+    val slots: i64 = 64;
+    val tab: i64 = p_malloc(slots * 8);
+    var seed: i64 = 11;
+    var i: i64 = 0;
+    while i < slots {
+        st(tab + i * 8, make(65536, i));
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < 40000 {
+        seed = next(seed);
+        val s: i64 = tab + ((seed >> 4) % slots) * 8;
+        val old: i64 = ld(s);
+        sum = sum + ld(old);
+        p_free(old);
+        seed = next(seed);
+        val e: i64 = (seed >> 8) % 6;
+        seed = next(seed);
+        val base: i64 = 65536 << e;
+        val n: i64 = (base + (seed >> 4) % base) & (0 - 8);
+        st(s, make(n, i & 4095));
+        i = i + 1;
+    }
+    i = 0;
+    while i < slots {
+        val old: i64 = ld(tab + i * 8);
+        sum = sum + ld(old);
+        p_free(old);
+        i = i + 1;
+    }
+    p_free(tab);
+    println(sum);
+    return 0;
+}

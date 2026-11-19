@@ -1,0 +1,128 @@
+// stdlib/sdcard: CRC7 command frames and CRC16 against known SD values, the SPI init flow on simulated SDHC, SDSC and v1 cards, block write/read round trips, address and CRC errors.
+// Expected output:
+// CMD0 40 00 00 00 00 95
+// CMD8 48 00 00 01 AA 87
+// CMD55 77 00 00 00 00 65
+// ACMD41 69 40 00 00 00 77
+// CMD58 7A 00 00 00 00 FD
+// CMD17 51 00 00 00 00 55
+// crc16 of 512 x FF: 0x7FA1, r1 0x05: idle,illegal-command
+// SDHC init ok true:
+//   80 clocks with CS high
+//   CMD0 -> idle
+//   CMD8 -> echo 426
+//   ACMD41 x4 -> ready
+//   CMD58 -> CCS=1: SDHC/SDXC, block addressing
+// write lba 7: ok, read back equal: true
+// out of range: CMD17: address-error
+// injected fault: data CRC mismatch, retry ok true
+// SDSC init ok true, last step: CMD16 512 -> ready, block 3 round trip true, card saw CMD24 CMD17 (byte address 1536)
+// v1 init ok true: CMD8 -> illegal: version 1 card / ACMD41 x1 -> ready / CMD16 512 -> ready
+// bad CRC on CMD0: crc-error
+// SDHC with HCS=0 after 5 ACMD41: idle
+use sdcard;
+use vec;
+use string;
+
+fn hx(b: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn hexs(v: Vec<i64>) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        p.push(hx(v.get(i)));
+        i = i + 1;
+    }
+    return str_join(p, " ");
+}
+
+fn pattern(seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 512 {
+        v.push((i * 7 + seed) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn okstr(s: str) -> str {
+    if str_len(s) == 0 { return "ok"; }
+    return s;
+}
+
+fn main() {
+    println("CMD0 " + hexs(sd_cmd_frame(0, 0)));
+    println("CMD8 " + hexs(sd_cmd_frame(8, 0x1AA)));
+    println("CMD55 " + hexs(sd_cmd_frame(55, 0)));
+    println("ACMD41 " + hexs(sd_cmd_frame(41, 0x40000000)));
+    println("CMD58 " + hexs(sd_cmd_frame(58, 0)));
+    println("CMD17 " + hexs(sd_cmd_frame(17, 0)));
+    println("crc16 of 512 x FF: 0x" + hx(sd_crc16(Vec::filled(512, 0xFF), 0, 512) >> 8) + hx(sd_crc16(Vec::filled(512, 0xFF), 0, 512) & 255)
+        + ", r1 0x05: " + sd_r1_decode(5));
+
+    var bus: SdBus = sdbus_new(sdsim_new(SD_V2_HC, 64, 3));
+    val d: SdDriver = sd_init(&mut bus, 10);
+    println("SDHC init ok " + bool_to_str(d.ok) + ":");
+    var i: i64 = 0;
+    while i < d.steps.len() {
+        println("  " + d.steps.get(i));
+        i = i + 1;
+    }
+    val w: str = sd_write_block(&mut bus, &d, 7, pattern(3));
+    val rb: SdBlock = sd_read_block(&mut bus, &d, 7);
+    println("write lba 7: " + okstr(w) + ", read back equal: " + bool_to_str(rb.ok && same(rb.data, pattern(3))));
+    println("out of range: " + sd_read_block(&mut bus, &d, 1000).error);
+    bus.card.corrupt_next_read = true;
+    val bad: SdBlock = sd_read_block(&mut bus, &d, 7);
+    val again: SdBlock = sd_read_block(&mut bus, &d, 7);
+    println("injected fault: " + bad.error + ", retry ok " + bool_to_str(again.ok && same(again.data, pattern(3))));
+
+    var bus2: SdBus = sdbus_new(sdsim_new(SD_V2_SC, 16, 1));
+    val d2: SdDriver = sd_init(&mut bus2, 10);
+    bus2.card.log.clear();
+    sd_write_block(&mut bus2, &d2, 3, pattern(9));
+    val r2: SdBlock = sd_read_block(&mut bus2, &d2, 3);
+    val inmem: bool = bus2.card.data.get(3 * 512 + 1) == (7 + 9);
+    println("SDSC init ok " + bool_to_str(d2.ok) + ", last step: " + d2.steps.get(d2.steps.len() - 1) + ", block 3 round trip " + bool_to_str(r2.ok && same(r2.data, pattern(9)) && inmem)
+        + ", card saw " + str_join(bus2.card.log, " ") + " (byte address " + int_to_str(3 * 512) + ")");
+
+    var bus3: SdBus = sdbus_new(sdsim_new(SD_V1, 8, 0));
+    val d3: SdDriver = sd_init(&mut bus3, 10);
+    println("v1 init ok " + bool_to_str(d3.ok) + ": " + d3.steps.get(2) + " / " + d3.steps.get(3) + " / " + d3.steps.get(4));
+
+    var bus4: SdBus = sdbus_new(sdsim_new(SD_V2_HC, 8, 0));
+    bus4.cs = true;
+    var f: Vec<i64> = sd_cmd_frame(0, 0);
+    f.set(5, 0x01);
+    sd_xfer(&mut bus4, 0xFF);
+    i = 0;
+    while i < 6 {
+        sd_xfer(&mut bus4, f.get(i));
+        i = i + 1;
+    }
+    sd_xfer(&mut bus4, 0xFF);
+    println("bad CRC on CMD0: " + sd_r1_decode(sd_xfer(&mut bus4, 0xFF)));
+    sd_command(&mut bus4, 0, 0);
+    var r41: i64 = 0;
+    i = 0;
+    while i < 5 {
+        sd_command(&mut bus4, 55, 0);
+        r41 = sd_command(&mut bus4, 41, 0);
+        i = i + 1;
+    }
+    println("SDHC with HCS=0 after 5 ACMD41: " + sd_r1_decode(r41));
+}

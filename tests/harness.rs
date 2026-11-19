@@ -64,6 +64,26 @@ fn is_skip_test(name: &str) -> bool {
         | "test_str_length.fd"
         | "test_vec_sized_layout.fd"
         | "test_parse_header_sqlite.fd"
+        // fid only: the sampling profiler's p_prof_* builtins (SL15;
+        // fidesc is frozen without them)
+        | "test_prof_sampling.fd"
+        // fid only: Unix-domain sockets (p_unix_listen) and a child's
+        // stdin/stdout as pipes (fid_proc_spawn_io); fidesc is frozen
+        // without them
+        | "test_unix_socket.fd"
+        | "test_process_pipes.fd"
+        // fid only: memory given back to the OS (p_mem_trim,
+        // p_mem_thread_exit, p_mem_resident; fidesc is frozen without them)
+        | "test_mem_return.fd"
+        | "test_alloc_threads_stress.fd"
+        // fid only, and compiled only (C and native): pure-Fides
+        // X25519/Ed25519/AES-GCM over seven QUIC handshakes is far too slow
+        // for the interpreter; the TLS 1.3 and RSA tests call the system's
+        // TLS/crypto library (Schannel/libssl, BCrypt/libcrypto) and run
+        // tasks side by side, which the interpreter cannot
+        | "test_stdlib_quic_more.fd"
+        | "test_tls13_local.fd"
+        | "test_crypto_bind_rsa.fd"
         // Borrow checker fail test is now in the expected-fail list
         // (borrow checking is on by default as of Phase 5).
     )

@@ -1,0 +1,167 @@
+// stdlib/migrate: parse migration files, checksum scripts, plan up/down to a target, refuse changed/missing/duplicate/out-of-order migrations, and run plans through the MigDb seam bound to an in-memory fake database with transactions (a failing step rolls back and stops).
+// Expected output:
+// file: v1 [create users] up=[CREATE TABLE users (id INT);] down=[DROP TABLE users;]
+// bad file: v-1
+// checksum: 68b436c2a3fd016a598062ca72ebb685
+// crlf same: true
+// plan all: up 1 create users, up 2 add o'reilly, up 3 create posts
+// plan to 2: up 1 create users, up 2 add o'reilly
+// record sql: INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (2, 'add o''reilly', 'ab', 99)
+// run to 2: ok=true version=2 tables=users,emails [up 1 create users; up 2 add o'reilly]
+// rows: 1|create users|68b436c2a3fd016a598062ca72ebb685|1000
+// 2|add o'reilly|44769db3d5de7f8d33d9687d1bdbbd5d|1000
+// status: 1 create users: applied, 2 add o'reilly: applied, 3 create posts: pending
+// run latest: ok=true version=3 tables=users,emails,posts,tags [up 3 create posts]
+// again (nothing): ok=true version=3 tables=users,emails,posts,tags
+// down to 1: ok=true version=1 tables=users [down 3 create posts; down 2 add o'reilly]
+// down to 0: ok=true version=0 tables=(none) [down 1 create users]
+// failing: ok=false version=1 tables=users [up 1 create users] error: up 2 (broken) failed: syntax error near FAIL
+// rolled back: true
+// edited: ok=false version=1 tables=users error: migration 1 (create users) was changed after it was applied: checksum 68b436c2a3fd016a598062ca72ebb685 recorded, 56123d3a06bed8a1cb9788e2d689d086 now
+// missing source: ok=false version=1 tables=users error: applied migration 1 (create users) has no source
+// duplicate: duplicate migration version 1
+// apply 4: ok=true version=4 tables=users,four [up 4 four]
+// out of order: ok=false version=4 tables=users,four error: pending migration 2 (late two) is older than applied version 4
+// allowed out of order: ok=true version=4 tables=users,four,two [up 2 late two]
+// unknown target: unknown target version 7
+use migrate;
+use vec;
+use string;
+
+// ─── a fake database: tables by name, the bookkeeping rows, transactions
+var TABLES: Vec<str> = Vec::new();
+var ROWS: Vec<str> = Vec::new();
+var SNAP_T: Vec<str> = Vec::new();
+var SNAP_R: Vec<str> = Vec::new();
+var LOG: Vec<str> = Vec::new();
+
+fn word_after(sql: str, kw: str) -> str {
+    val at: i64 = str_find(sql, kw);
+    if at < 0 { return ""; }
+    var rest: str = str_trim(str_slice(sql, at + str_len(kw), str_len(sql)));
+    if str_starts_with(rest, "IF NOT EXISTS ") { rest = str_slice(rest, 14, str_len(rest)); }
+    var i: i64 = 0;
+    while i < str_len(rest) && str_byte_at(rest, i) != 32 && str_byte_at(rest, i) != 40 && str_byte_at(rest, i) != 59 { i = i + 1; }
+    return str_slice(rest, 0, i);
+}
+
+fn copy(v: Vec<str>) -> Vec<str> {
+    var o: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() { o.push(v.get(i)); i = i + 1; }
+    return o;
+}
+
+fn without(v: Vec<str>, x: str) -> Vec<str> {
+    var o: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() { if v.get(i) != x { o.push(v.get(i)); } i = i + 1; }
+    return o;
+}
+
+fn fake_exec(sql: str) -> str {
+    LOG.push(sql);
+    if sql == "BEGIN" { SNAP_T = copy(TABLES); SNAP_R = copy(ROWS); return ""; }
+    if sql == "COMMIT" { return ""; }
+    if sql == "ROLLBACK" { TABLES = copy(SNAP_T); ROWS = copy(SNAP_R); return ""; }
+    if str_contains(sql, "FAIL") { return "syntax error near FAIL"; }
+    if str_starts_with(sql, "INSERT INTO schema_migrations") {
+        val inside: str = str_slice(sql, str_find(sql, "VALUES (") + 8, str_len(sql) - 1);
+        val f: Vec<str> = str_split(inside, ", ");
+        ROWS.push(f.get(0) + "|" + str_replace(str_slice(f.get(1), 1, str_len(f.get(1)) - 1), "''", "'") + "|" + str_slice(f.get(2), 1, str_len(f.get(2)) - 1) + "|" + f.get(3));
+        return "";
+    }
+    if str_starts_with(sql, "DELETE FROM schema_migrations WHERE version = ") {
+        val v: str = str_slice(sql, 46, str_len(sql));
+        var keep: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < ROWS.len() { if !str_starts_with(ROWS.get(i), v + "|") { keep.push(ROWS.get(i)); } i = i + 1; }
+        ROWS = keep;
+        return "";
+    }
+    // every statement of a script
+    val stmts: Vec<str> = str_split(sql, ";");
+    var i: i64 = 0;
+    while i < stmts.len() {
+        val s: str = str_trim(stmts.get(i));
+        if str_starts_with(s, "CREATE TABLE") {
+            val t: str = word_after(s, "CREATE TABLE ");
+            if t != "schema_migrations" { TABLES = without(TABLES, t); TABLES.push(t); }
+        } else if str_starts_with(s, "DROP TABLE") {
+            TABLES = without(TABLES, word_after(s, "DROP TABLE "));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn fake_applied() -> str { return str_join(ROWS, "\n"); }
+
+fn tables() -> str {
+    if TABLES.len() == 0 { return "(none)"; }
+    return str_join(TABLES, ",");
+}
+
+fn report(label: str, r: MigReport) {
+    var line: str = label + ": ok=" + bool_to_str(r.ok) + " version=" + int_to_str(r.version) + " tables=" + tables();
+    if r.done.len() > 0 { line = line + " [" + str_join(r.done, "; ") + "]"; }
+    if !r.ok { line = line + " error: " + r.error; }
+    println(line);
+}
+
+fn main() -> i64 {
+    val f1: Migration = migrate_parse_file("db/0001_create_users.sql", "-- +up\nCREATE TABLE users (id INT);\n-- +down\nDROP TABLE users;\n");
+    println("file: v" + int_to_str(f1.version) + " [" + f1.name + "] up=[" + f1.up + "] down=[" + f1.down + "]");
+    println("bad file: v" + int_to_str(migrate_parse_file("x.sql", "-- +up\nX").version));
+    println("checksum: " + migrate_checksum("CREATE TABLE users (id INT);"));
+    println("crlf same: " + bool_to_str(migrate_checksum("A;\r\nB;\r\n") == migrate_checksum("A;\nB;")));
+
+    var ms: Vec<Migration> = Vec::new();
+    ms.push(f1);
+    ms.push(migration_new(3, "create posts", "CREATE TABLE posts (id INT); CREATE TABLE tags (id INT)", "DROP TABLE tags; DROP TABLE posts"));
+    ms.push(migration_new(2, "add o'reilly", "CREATE TABLE emails (u INT)", "DROP TABLE emails"));
+
+    // planning without a database
+    val empty: Vec<Applied> = Vec::new();
+    println("plan all: " + str_join(migrate_plan_lines(& migrate_plan(& ms, empty, - 1, false)), ", "));
+    println("plan to 2: " + str_join(migrate_plan_lines(& migrate_plan(& ms, migrate_parse_applied(""), 2, false)), ", "));
+    println("record sql: " + migrate_record_sql(2, "add o'reilly", "ab", 99));
+
+    val db: MigDb = MigDb { exec: fake_exec, applied: fake_applied };
+    report("run to 2", migrate_run(& db, & ms, 2, 1000, false));
+    println("rows: " + fake_applied());
+    println("status: " + str_join(migrate_status(& ms, migrate_parse_applied(fake_applied())), ", "));
+    report("run latest", migrate_run(& db, & ms, - 1, 2000, false));
+    report("again (nothing)", migrate_run(& db, & ms, - 1, 3000, false));
+    report("down to 1", migrate_run(& db, & ms, 1, 4000, false));
+    report("down to 0", migrate_run(& db, & ms, 0, 5000, false));
+
+    // a failing step rolls back and stops
+    var bad: Vec<Migration> = Vec::new();
+    bad.push(f1);
+    bad.push(migration_new(2, "broken", "CREATE TABLE half (x INT); FAIL", "DROP TABLE half"));
+    bad.push(migration_new(3, "never", "CREATE TABLE never (x INT)", "DROP TABLE never"));
+    report("failing", migrate_run(& db, & bad, - 1, 6000, false));
+    println("rolled back: " + bool_to_str(LOG.get(LOG.len() - 1) == "ROLLBACK"));
+
+    // refusals
+    var edited: Vec<Migration> = Vec::new();
+    edited.push(migration_new(1, "create users", "CREATE TABLE users (id BIGINT);", "DROP TABLE users;"));
+    report("edited", migrate_run(& db, & edited, - 1, 7000, false));
+    var missing: Vec<Migration> = Vec::new();
+    missing.push(migration_new(5, "other", "SELECT 1", "SELECT 1"));
+    report("missing source", migrate_run(& db, & missing, - 1, 7000, false));
+    var dup: Vec<Migration> = Vec::new();
+    dup.push(f1);
+    dup.push(migration_new(1, "again", "SELECT 1", ""));
+    println("duplicate: " + migrate_plan(& dup, empty, - 1, false).error);
+    var late: Vec<Migration> = Vec::new();
+    late.push(f1);
+    late.push(migration_new(4, "four", "CREATE TABLE four (x INT)", "DROP TABLE four"));
+    report("apply 4", migrate_run(& db, & late, - 1, 8000, false));
+    late.push(migration_new(2, "late two", "CREATE TABLE two (x INT)", "DROP TABLE two"));
+    report("out of order", migrate_run(& db, & late, - 1, 9000, false));
+    report("allowed out of order", migrate_run(& db, & late, - 1, 9000, true));
+    println("unknown target: " + migrate_plan(& late, migrate_parse_applied(fake_applied()), 7, false).error);
+    return 0;
+}

@@ -49,7 +49,7 @@ pub fn arena_new() -> i64 {
 /// Allocate `size` bytes from the arena. Returns a raw pointer (i64).
 /// The memory is uninitialized. O(1) — just bumps a pointer.
 /// The memory is freed when the arena is restored or freed.
-pub fn arena_alloc(arena_mark: i64, size: i64) -> i64 {
+pub fn arena_alloc(_arena_mark: i64, size: i64) -> i64 {
     // The arena_mark is saved for later restore; allocation uses p_malloc
     // which in the C codegen uses the arena bump allocator.
     return p_malloc(size);
@@ -83,42 +83,130 @@ pub fn arena_free(arena_mark: i64) -> void {
 // Unlike arenas, regions support individual frees (region_free_one),
 // but the common case is bulk free at scope exit.
 
-/// Region header — tracks a linked list of allocations.
-/// Stored as a Vec of pointers for simplicity.
-/// The region itself is heap-allocated.
+/// Region header — a 16-byte block {head, count}. Every allocation made
+/// by region_alloc prepends a 16-byte node {next, size} to the list and
+/// returns the payload just past it, so region_free only has to walk the
+/// list and p_free each node — no side table, no Vec.
+///
+///   [header: head -> node -> node -> ...]
+///   node = { next: i64, size: i64, payload[size] }
 
-/// Create a new region. Returns a pointer to the region header.
-/// Use region_alloc to allocate within the region.
-/// Use region_free to free all allocations in the region.
+/// Create a new region. Returns a handle to use with region_alloc and
+/// region_free.
 pub fn region_new() -> i64 {
-    // The region is a Vec of pointers (i64 values).
-    // We store it as a heap-allocated Vec.
-    var ptrs: Vec<i64> = Vec::new();
-    // Return the Vec as a raw pointer (i64).
-    // In the interpreter, Vec values are boxed, so we can return the handle.
-    return p_malloc(0);
-    // placeholder — regions use p_malloc directly
+    var h: i64 = p_malloc(16);
+    if h == 0 {
+        p_panic("out of memory");
+    }
+    var p0: * mut i64 = h;
+    var p1: * mut i64 = h + 8;
+    // SAFETY: h is a live 16-byte block just allocated above.
+    unsafe {
+        * p0 = 0;
+        * p1 = 0;
+    }
+    return h;
 }
 
 /// Allocate `size` bytes within a region. Returns a raw pointer.
-/// The memory is freed when region_free is called.
+/// The memory is tracked and freed when region_free is called.
 pub fn region_alloc(region: i64, size: i64) -> i64 {
-    // For now, just use p_malloc. The region tracks allocations
-    // via the optimizer's region_pool pass which inserts p_region_free.
-    return p_malloc(size);
+    if region == 0 {
+        p_panic("region_alloc on a null region");
+    }
+    var node: i64 = p_malloc(size + 16);
+    if node == 0 {
+        p_panic("out of memory");
+    }
+    var headp: * mut i64 = region;
+    var countp: * mut i64 = region + 8;
+    var nextp: * mut i64 = node;
+    var sizep: * mut i64 = node + 8;
+    // SAFETY: `region` is a live region header ({head, count}); `node` is
+    // a live size+16 block whose first two words are the list link.
+    unsafe {
+        * nextp = * headp;
+        * sizep = size;
+        * headp = node;
+        * countp = * countp + 1;
+    }
+    return node + 16;
 }
 
-/// Free all allocations in a region. O(n) where n is the number of
-/// allocations, but typically called once at scope exit.
+/// Allocate `size` zeroed bytes within a region.
+pub fn region_alloc_zeroed(region: i64, size: i64) -> i64 {
+    var p: i64 = region_alloc(region, size);
+    p_memset(p, 0, size);
+    return p;
+}
+
+/// Free all allocations in a region, then the region header itself.
+/// O(n) where n is the number of live allocations — typically called once
+/// at scope exit. Every pointer from this region is invalid afterwards.
 pub fn region_free(region: i64) -> void {
-    p_region_free(region);
+    if region == 0 {
+        return;
+    }
+    var headp: * mut i64 = region;
+    var node: i64 = 0;
+    // SAFETY: `region` is a live header; every node it points to was
+    // allocated by region_alloc (16-byte link + payload).
+    unsafe {
+        node = * headp;
+    }
+    while node != 0 {
+        var np: * mut i64 = node;
+        var next: i64 = 0;
+        // SAFETY: node is a live list node; read its link before freeing.
+        unsafe {
+            next = * np;
+        }
+        p_free(node);
+        node = next;
+    }
+    p_free(region);
 }
 
-/// Free a single allocation within a region.
-/// This is a no-op for arena-based regions (individual frees aren't supported).
-/// For linked-list regions, this removes the allocation from the list and frees it.
+/// Free a single allocation within a region: unlinks its node and frees
+/// it. Freeing an untracked or null pointer is a no-op — it is NOT freed,
+/// so a pointer that belongs to another region stays safe.
 pub fn region_free_one(region: i64, ptr: i64) -> void {
-    p_free(ptr);
+    if region == 0 || ptr == 0 {
+        return;
+    }
+    var headp: * mut i64 = region;
+    var countp: * mut i64 = region + 8;
+    var prev: i64 = 0;
+    var node: i64 = 0;
+    // SAFETY: `region` is a live header; walk its node list.
+    unsafe {
+        node = * headp;
+    }
+    while node != 0 {
+        var np: * mut i64 = node;
+        var next: i64 = 0;
+        // SAFETY: node is a live list node.
+        unsafe {
+            next = * np;
+        }
+        if node + 16 == ptr {
+            var prevp: * mut i64 = prev;
+            // SAFETY: unlink `node`: head case writes the header, else the
+            // previous node's next word — both live.
+            unsafe {
+                if prev == 0 {
+                    * headp = next;
+                } else {
+                    * prevp = next;
+                }
+                * countp = * countp - 1;
+            }
+            p_free(node);
+            return;
+        }
+        prev = node;
+        node = next;
+    }
 }
 
 // ─── Convenience: scoped arena ───────────────────────────────────────────
@@ -148,11 +236,18 @@ pub fn with_arena(f: fn() -> i64) -> i64 {
 
 /// Copy `n` bytes from `src` to `dst`. Both must be valid pointers.
 /// Regions: src and dst can be in any region or the heap.
+/// @unsafe (release M10): outside the standard library, call it from an
+/// `unsafe` block or an @unsafe function.
+// SAFETY: the caller's promise: dst and src each hold n bytes the caller
+// owns (they may overlap only if dst <= src).
+@unsafe
 pub fn mem_copy(dst: i64, src: i64, n: i64) -> void {
     var i: i64 = 0;
     while i < n {
         var d: * mut u8 = dst + i;
         var s: * mut u8 = src + i;
+        // SAFETY: the function's @unsafe contract: dst and src each hold n
+        // bytes; i < n keeps the copy inside them.
         unsafe {
             * d = * s;
         }
@@ -161,30 +256,51 @@ pub fn mem_copy(dst: i64, src: i64, n: i64) -> void {
 }
 
 /// Fill `n` bytes at `dst` with zero. Useful for initializing allocated memory.
+/// @unsafe (release M10), as mem_copy.
+// SAFETY: the caller's promise: dst holds n writable bytes the caller owns.
+@unsafe
 pub fn mem_zero(dst: i64, n: i64) -> void {
     p_memset(dst, 0, n);
 }
 
 /// Fill `n` bytes at `dst` with byte `val`.
+/// @unsafe (release M10), as mem_copy.
+// SAFETY: the caller's promise: dst holds n writable bytes the caller owns.
+@unsafe
 pub fn mem_set(dst: i64, val: i64, n: i64) -> void {
     p_memset(dst, val, n);
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────
 
-/// Get the total number of bytes allocated in the arena.
-/// This is the current bump pointer offset.
+/// The current arena bump offset — equal to the total bytes the arena
+/// has handed out since its last restore (a save mark is that offset).
 pub fn arena_used() -> i64 {
-    // The arena doesn't expose its size directly.
-    // In the C codegen, __p_arena_cur->ptr - __p_arena_head->base would give this.
-    // For now, return 0 (not tracked in the runtime).
-    return 0;
+    return p_arena_save();
 }
 
-/// Get the number of allocations in a region.
-/// For arena-based regions, this is not tracked.
+/// Bytes handed out since `mark` was saved (0 when the arena has since
+/// been restored to or before the mark).
+pub fn arena_used_since(mark: i64) -> i64 {
+    var cur: i64 = p_arena_save();
+    if cur <= mark {
+        return 0;
+    }
+    return cur - mark;
+}
+
+/// Get the number of live allocations tracked by a region.
 pub fn region_count(region: i64) -> i64 {
-    return 0;
+    if region == 0 {
+        return 0;
+    }
+    var countp: * mut i64 = region + 8;
+    var n: i64 = 0;
+    // SAFETY: `region` is a live header; word 1 is the live count.
+    unsafe {
+        n = * countp;
+    }
+    return n;
 }
 
 // ─── Frame allocator ──────────────────────────────────────────────────────
@@ -287,7 +403,7 @@ pub fn http_request_arena_new() -> http_request_arena {
 
 /// Allocate `size` bytes within an HTTP request arena.
 /// The memory is freed when http_request_arena_free is called.
-pub fn http_request_alloc(arena: http_request_arena, size: i64) -> i64 {
+pub fn http_request_alloc(_arena: http_request_arena, size: i64) -> i64 {
     return p_malloc(size);
 }
 

@@ -13,20 +13,15 @@
 //   - Symbol table (nlist_64, 16 bytes each)
 //   - String table
 
-module compiler::macho;
- use core; use vec; use string; use compiler::elf64;
-// --- Constants ----------------------------------------------------------
+module compiler::macho; use core; use vec; use string; use compiler::elf64; use compiler::image_writer;  // --- Constants ----------------------------------------------------------
 
-pub const MH_MAGIC_64: i64 = 0xFEEDFACF; pub const CPU_TYPE_X86_64: i64 = 0x01000007; pub const CPU_SUBTYPE_ALL: i64 = 3; pub const MH_OBJECT: i64 = 1;
- pub const LC_SEGMENT_64: i64 = 0x19; pub const LC_SYMTAB: i64 = 0x2;
-// n_type values
+pub const MH_MAGIC_64: i64 = 0xFEEDFACF; pub const CPU_TYPE_X86_64: i64 = 0x01000007; pub const CPU_SUBTYPE_ALL: i64 = 3; pub const MH_OBJECT: i64 = 1; pub const LC_SEGMENT_64: i64 = 0x19; pub const LC_SYMTAB: i64 = 0x2;  // n_type values
 pub const N_UNDF_EXT: i64 = 0x01;  // undefined external
 pub const N_SECT: i64 = 0x0e;  // defined in section (local)
 pub const N_SECT_EXT: i64 = 0x0f;  // defined external
 
 // x86-64 relocation types
-pub const XR_UNSIGNED: i64 = 0; pub const XR_SIGNED: i64 = 1; pub const XR_BRANCH: i64 = 2;
-// --- Structs ------------------------------------------------------------
+pub const XR_UNSIGNED: i64 = 0; pub const XR_SIGNED: i64 = 1; pub const XR_BRANCH: i64 = 2;  // --- Structs ------------------------------------------------------------
 
 pub struct MachOSymbol {
     pub name: str,
@@ -78,28 +73,6 @@ pub fn MachOEmitter_new() -> MachOEmitter {
 pub enum ResultVec {
     Ok(Vec<i64>),
     Err(str)
-}
-
-// --- Helper: emit little-endian ---
-
-fn mo_emit_u16(t: & mut Vec, v: i64) {
-    t.push(v & 0xFF);
-    t.push((v >> 8) & 0xFF);
-}
-
-fn mo_emit_u32(t: & mut Vec, v: i64) {
-    t.push(v & 0xFF);
-    t.push((v >> 8) & 0xFF);
-    t.push((v >> 16) & 0xFF);
-    t.push((v >> 24) & 0xFF);
-}
-
-fn mo_emit_u64(t: & mut Vec, v: i64) {
-    var i: i64 = 0;
-    while i < 8 {
-        t.push((v >> (i * 8)) & 0xFF);
-        i = i + 1;
-    }
 }
 
 fn mo_sym_index(e: & MachOEmitter, name: str) -> i64 {
@@ -211,28 +184,6 @@ pub fn MachOEmitter_import(self: & mut MachOEmitter, em: & ElfEmitter) {
     }
 }
 
-fn MachOEmitter_add_string(self: & mut MachOEmitter, s: str) -> i64 {
-    var offset: i64 = self.string_table.len();
-    var i: i64 = 0;
-    while i < str_len(s) {
-        self.string_table.push(str_byte_at(s, i));
-        i = i + 1;
-    }
-    self.string_table.push(0);
-    return offset;
-}
-
-fn mo_sectname(buf: & mut Vec, name: str) {
-    var i: i64 = 0;
-    while i < str_len(name) {
-        buf.push(str_byte_at(name, i));
-        i = i + 1;
-    } while i < 16 {
-        buf.push(0);
-        i = i + 1;
-    }
-}
-
 fn mo_count_relocs_in(e: & MachOEmitter, sect: i64) -> i64 {
     var n: i64 = 0;
     var i: i64 = 0;
@@ -248,246 +199,151 @@ fn mo_count_relocs_in(e: & MachOEmitter, sect: i64) -> i64 {
 // --- Build Mach-O object file ---
 
 pub fn MachOEmitter_build_macho(self: & mut MachOEmitter) -> ResultVec {
-    var has_const: bool = self.const_bytes.len() > 0;
+    // TG13: the object from compiler/image_writer.fd (the old body wrote a
+    // malformed MH_OBJECT and is gone: docs/image-writer.md)
+    return MachOEmitter_build_macho_img(self);
+}
+
+/// Where symbol `s` goes in an object's symbol table: 0 local (N_SECT),
+/// 1 defined external (N_SECT | N_EXT), 2 undefined (N_UNDF | N_EXT).
+fn mo_sym_group(s: & MachOSymbol) -> i64 {
+    if s.section_number == 0 {
+        return 2;
+    }
+    if (s.sym_type & 1) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+/// The relocations of section `sect` (1 __text, 2 __const) as
+/// relocation_info records, symbols renumbered by `newidx`.
+fn mo_img_relocs(self: & MachOEmitter, sect: i64, newidx: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < self.relocations.len() {
+        var r: MachOReloc = self.relocations.get(i);
+        if r.section == sect {
+            var sym: i64 = 0;
+            if r.symbol_index >= 0 && r.symbol_index < newidx.len() {
+                sym = newidx.get(r.symbol_index);
+            }
+            img_macho_reloc(& mut out, r.offset, sym, r.is_pcrel, r.length, r.is_extern, r.rtype);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// TG13: the Mach-O relocatable object of the assembler path (`fid
+/// codegen --macho`) over image_writer. Unlike the old body above it is
+/// well-formed, so the bytes differ (docs/image-writer.md):
+///   - 80-byte section_64 headers in the right field order (offset,
+///     align, reloff, nreloc, flags; the old ones were 88 bytes with
+///     reloff and nreloc where align goes)
+///   - the section data together (__const at the next 8-byte address
+///     after __text, at the same distance in the file), then the
+///     relocations, the symbols and the strings
+///   - the one segment unnamed and rwx, as object files have it
+///   - LC_DYSYMTAB, and the symbols in its order: locals, defined
+///     externals, undefined (relocations renumbered to match)
+///   - a __const symbol's n_value its address (__const's address + its
+///     offset; the old body wrote the offset)
+///   - __text flagged S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+pub fn MachOEmitter_build_macho_img(self: & mut MachOEmitter) -> ResultVec {
+    var text_size: i64 = self.text_bytes.len();
+    var const_size: i64 = self.const_bytes.len();
+    // __const when there are bytes, symbols or relocations in it
+    var has_const: bool = const_size > 0 || mo_count_relocs_in(self, 2) > 0;
+    var si: i64 = 0;
+    while si < self.symbols.len() {
+        if self.symbols.get(si).section_number == 2 {
+            has_const = true;
+        }
+        si = si + 1;
+    }
     var nsects: i64 = 1;
     if has_const {
         nsects = 2;
     }
-
-    var header_size: i64 = 32;
-    var segment_cmd_size: i64 = 72;
-    var section_header_size: i64 = 80;
-    var symtab_cmd_size: i64 = 24;
-
-    var load_commands_size: i64 = segment_cmd_size + section_header_size * nsects + symtab_cmd_size;
-
-    var text_data_offset: i64 = header_size + load_commands_size;
-    var text_data_size: i64 = self.text_bytes.len();
-
-    var text_reloc_count: i64 = mo_count_relocs_in(self, 1);
-    var const_reloc_count: i64 = mo_count_relocs_in(self, 2);
-
-    var text_reloc_offset: i64 = text_data_offset + text_data_size;
-    var const_data_offset: i64 = text_reloc_offset + text_reloc_count * 8;
-    var const_data_size: i64 = 0;
+    var const_addr: i64 = img_round(text_size, 8);
+    var span: i64 = text_size;
     if has_const {
-        const_data_size = self.const_bytes.len();
+        span = const_addr + const_size;
     }
-    var const_reloc_offset: i64 = const_data_offset + const_data_size;
-
-    var symbol_table_offset: i64 = const_reloc_offset + const_reloc_count * 8;
-    var symbol_table_size: i64 = self.symbols.len() * 16;
-    var string_table_offset: i64 = symbol_table_offset + symbol_table_size;
-
-    // Initialize string table (index 0 = empty)
-    self.string_table.push(0);
-
-    // Build string table entries for symbols
-    var sym_string_offsets: Vec<i64> = Vec::new();
-    var si: i64 = 0;
-    while si < self.symbols.len() {
-        var name: str = self.symbols.get(si).name;
-        var offset: i64 = MachOEmitter_add_string(self, name);
-        sym_string_offsets.push(offset);
-        si = si + 1;
+    // The symbols in LC_DYSYMTAB's order; newidx: emitter index -> index
+    var n: i64 = self.symbols.len();
+    var newidx: Vec<i64> = Vec::new();
+    while newidx.len() < n {
+        newidx.push(0);
     }
-
-    var buf: Vec<i64> = Vec::new();
-
-    // -- Mach-O Header (32 bytes) --
-    mo_emit_u32(& mut buf, MH_MAGIC_64);
-    // magic
-    mo_emit_u32(& mut buf, CPU_TYPE_X86_64);
-    // cputype
-    mo_emit_u32(& mut buf, CPU_SUBTYPE_ALL);
-    // cpusubtype
-    mo_emit_u32(& mut buf, MH_OBJECT);
-    // filetype
-    mo_emit_u32(& mut buf, 2);
-    // ncmds (segment + symtab)
-    mo_emit_u32(& mut buf, load_commands_size);
-    // sizeofcmds
-    mo_emit_u32(& mut buf, 0);
-    // flags
-    mo_emit_u32(& mut buf, 0);
-    // reserved
-
-    // -- LC_SEGMENT_64 Load Command --
-    mo_emit_u32(& mut buf, LC_SEGMENT_64);
-    // cmd
-    mo_emit_u32(& mut buf, segment_cmd_size + section_header_size * nsects);
-    // cmdsize
-    mo_sectname(& mut buf, "__TEXT");
-    // segname
-    mo_emit_u64(& mut buf, 0);
-    // vmaddr
-    mo_emit_u64(& mut buf, text_data_size + const_data_size);
-    // vmsize
-    mo_emit_u64(& mut buf, text_data_offset);
-    // fileoff
-    mo_emit_u64(& mut buf, text_data_size + const_data_size);
-    // filesize
-    mo_emit_u32(& mut buf, 0);
-    // maxprot
-    mo_emit_u32(& mut buf, 0);
-    // initprot
-    mo_emit_u32(& mut buf, nsects);
-    // nsects
-    mo_emit_u32(& mut buf, 0);
-    // flags
-
-    // -- Section Header 1: __text (80 bytes) --
-    mo_sectname(& mut buf, "__text");
-    mo_sectname(& mut buf, "__TEXT");
-    mo_emit_u64(& mut buf, 0);
-    // addr
-    mo_emit_u64(& mut buf, text_data_size);
-    // size
-    mo_emit_u32(& mut buf, text_data_offset);
-    // offset
-    mo_emit_u32(& mut buf, text_reloc_offset);
-    // reloff
-    mo_emit_u32(& mut buf, text_reloc_count);
-    // nreloc
-    mo_emit_u32(& mut buf, 0);
-    // align
-    mo_emit_u32(& mut buf, 0);
-    // reserved
-    mo_emit_u32(& mut buf, 0);
-    // reserved
-    mo_emit_u32(& mut buf, 0);
-    // flags
-    mo_emit_u32(& mut buf, 0);
-    // reserved1
-    mo_emit_u32(& mut buf, 0);
-    // reserved2
-    mo_emit_u32(& mut buf, 0);
-    // reserved3
-
-    // -- Section Header 2: __const --
-    if has_const {
-        mo_sectname(& mut buf, "__const");
-        mo_sectname(& mut buf, "__TEXT");
-        mo_emit_u64(& mut buf, text_data_size);
-        // addr
-        mo_emit_u64(& mut buf, const_data_size);
-        // size
-        mo_emit_u32(& mut buf, const_data_offset);
-        // offset
-        mo_emit_u32(& mut buf, const_reloc_offset);
-        // reloff
-        mo_emit_u32(& mut buf, const_reloc_count);
-        // nreloc
-        mo_emit_u32(& mut buf, 0);
-        // align
-        mo_emit_u32(& mut buf, 0);
-        // reserved
-        mo_emit_u32(& mut buf, 0);
-        // reserved
-        mo_emit_u32(& mut buf, 0);
-        // flags
-        mo_emit_u32(& mut buf, 0);
-        // reserved1
-        mo_emit_u32(& mut buf, 0);
-        // reserved2
-        mo_emit_u32(& mut buf, 0);
-        // reserved3
-    }
-
-    // -- LC_SYMTAB Load Command (24 bytes) --
-    mo_emit_u32(& mut buf, LC_SYMTAB);
-    // cmd
-    mo_emit_u32(& mut buf, symtab_cmd_size);
-    // cmdsize
-    mo_emit_u32(& mut buf, symbol_table_offset);
-    // symoff
-    mo_emit_u32(& mut buf, self.symbols.len());
-    // nsyms
-    mo_emit_u32(& mut buf, string_table_offset);
-    // stroff
-    mo_emit_u32(& mut buf, self.string_table.len());
-    // strsize
-
-    // -- __text section data --
-    var ti: i64 = 0;
-    while ti < self.text_bytes.len() {
-        buf.push(self.text_bytes.get(ti));
-        ti = ti + 1;
-    }
-
-    // -- __text relocations (8 bytes each) --
-    var ri: i64 = 0;
-    while ri < self.relocations.len() {
-        var reloc: MachOReloc = self.relocations.get(ri);
-        if reloc.section == 1 {
-            mo_emit_u32(& mut buf, reloc.offset);
-            var packed: i64 = reloc.symbol_index & 0x00ffffff;
-            if reloc.is_pcrel {
-                packed = packed | (1 << 24);
-            }
-            packed = packed | ((reloc.length & 3) << 25);
-            if reloc.is_extern {
-                packed = packed | (1 << 27);
-            }
-            packed = packed | ((reloc.rtype & 0xf) << 28);
-            mo_emit_u32(& mut buf, packed);
-        }
-        ri = ri + 1;
-    }
-
-    // -- __const section data + relocations --
-    if has_const {
-        var di: i64 = 0;
-        while di < self.const_bytes.len() {
-            buf.push(self.const_bytes.get(di));
-            di = di + 1;
-        }
-        var rri: i64 = 0;
-        while rri < self.relocations.len() {
-            var rreloc: MachOReloc = self.relocations.get(rri);
-            if rreloc.section == 2 {
-                mo_emit_u32(& mut buf, rreloc.offset);
-                var rpacked: i64 = rreloc.symbol_index & 0x00ffffff;
-                if rreloc.is_pcrel {
-                    rpacked = rpacked | (1 << 24);
+    var counts: Vec<i64> = Vec::new();
+    var strtab: Vec<i64> = Vec::new();
+    strtab.push(0);
+    var nl: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 3 {
+        var c: i64 = 0;
+        var i: i64 = 0;
+        while i < n {
+            var s: MachOSymbol = self.symbols.get(i);
+            if mo_sym_group(& s) == k {
+                newidx.set(i, nl.len() / 16);
+                var value: i64 = s.value;
+                if s.section_number == 2 {
+                    value = const_addr + s.value;
+                } else if s.section_number == 0 {
+                    value = 0;
                 }
-                rpacked = rpacked | ((rreloc.length & 3) << 25);
-                if rreloc.is_extern {
-                    rpacked = rpacked | (1 << 27);
-                }
-                rpacked = rpacked | ((rreloc.rtype & 0xf) << 28);
-                mo_emit_u32(& mut buf, rpacked);
+                var strx: i64 = img_str_add(& mut strtab, s.name);
+                img_macho_nlist(& mut nl, strx, s.sym_type, s.section_number, s.description, value);
+                c = c + 1;
             }
-            rri = rri + 1;
+            i = i + 1;
         }
+        counts.push(c);
+        k = k + 1;
     }
-
-    // -- Symbol Table (nlist_64, 16 bytes each) --
-    var syi: i64 = 0;
-    while syi < self.symbols.len() {
-        var sym: MachOSymbol = self.symbols.get(syi);
-        var str_offset: i64 = sym_string_offsets.get(syi);
-        mo_emit_u32(& mut buf, str_offset);
-        // n_strx
-        buf.push(sym.sym_type);
-        // n_type
-        buf.push(sym.section_number);
-        // n_sect
-        mo_emit_u16(& mut buf, sym.description);
-        // n_desc
-        mo_emit_u64(& mut buf, sym.value);
-        // n_value
-        syi = syi + 1;
+    img_align(& mut strtab, 8);
+    var text_rel: Vec<i64> = mo_img_relocs(self, 1, & newidx);
+    var const_rel: Vec<i64> = mo_img_relocs(self, 2, & newidx);
+    // Layout: header, load commands, section data, relocations, symbols,
+    // strings
+    var cmds_size: i64 = 72 + 80 * nsects + 24 + 80;
+    var text_off: i64 = 32 + cmds_size;
+    var const_off: i64 = text_off + const_addr;
+    var text_rel_off: i64 = img_round(text_off + span, 8);
+    var const_rel_off: i64 = text_rel_off + text_rel.len();
+    var sym_off: i64 = const_rel_off + const_rel.len();
+    var str_off: i64 = sym_off + nl.len();
+    var out: Vec<i64> = Vec::new();
+    img_macho_header(& mut out, CPU_TYPE_X86_64, CPU_SUBTYPE_ALL, MH_OBJECT, 3, cmds_size, 0);
+    img_macho_segment(& mut out, "", 0, span, text_off, span, 7, 7, nsects);
+    var text_rel_at: i64 = 0;
+    if text_rel.len() > 0 {
+        text_rel_at = text_rel_off;
     }
-
-    // -- String Table --
-    var sti: i64 = 0;
-    while sti < self.string_table.len() {
-        buf.push(self.string_table.get(sti));
-        sti = sti + 1;
+    img_macho_section_rel(& mut out, "__text", "__TEXT", 0, text_size, text_off, 4, text_rel_at, text_rel.len() / 8, 0x80000400);
+    if has_const {
+        var const_rel_at: i64 = 0;
+        if const_rel.len() > 0 {
+            const_rel_at = const_rel_off;
+        }
+        img_macho_section_rel(& mut out, "__const", "__TEXT", const_addr, const_size, const_off, 3, const_rel_at, const_rel.len() / 8, 0);
     }
-
-    return ResultVec::Ok(buf);
+    img_macho_symtab_cmd(& mut out, sym_off, nl.len() / 16, str_off, strtab.len());
+    img_macho_dysymtab_cmd(& mut out, 0, counts.get(0), counts.get(0), counts.get(1), counts.get(0) + counts.get(1), counts.get(2));
+    img_append(& mut out, & self.text_bytes);
+    if has_const {
+        img_pad_to(& mut out, const_off);
+        img_append(& mut out, & self.const_bytes);
+    }
+    img_pad_to(& mut out, text_rel_off);
+    img_append(& mut out, & text_rel);
+    img_append(& mut out, & const_rel);
+    img_append(& mut out, & nl);
+    img_append(& mut out, & strtab);
+    return ResultVec::Ok(out);
 }
 
 // --- Public API ---

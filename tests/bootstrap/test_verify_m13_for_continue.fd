@@ -1,0 +1,72 @@
+// Miscompile log M13 (docs/verification/miscompile-log.md; repro
+// tests/verify/bugs/m13_for_continue_skips_increment.fd, promoted here,
+// VF20). `continue` in a `for` loop goes on with the next element (§5).
+// Before the fix every backend looped forever: compiler/lower.fd lowered
+// each `for` form (range, array, Vec, str; arrays are left out here, M5, and
+// strings: `for ch in s` ran no iteration at all with the Nov 16 stage-0
+// compiler, with or without `continue`) with `continue` jumping to the
+// condition, past the increment after the body (`while` loops, which carry
+// their own increment, were right). Found by scripts/fuzz/gen_vs_c.py
+// --backends all, seeds 5 and 10 (RL1).
+//
+// Expected output:
+// 5
+// 40
+// 3
+// 9
+// 4
+
+fn main() -> i64 {
+    var n: i64 = 0;
+    for k in 0..4 {
+        if k == 1 {
+            continue;
+        }
+        n = n + k;
+    }
+    println(n);
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    var s: i64 = 0;
+    for x in v {
+        if x == 20 {
+            continue;
+        }
+        s = s + x;
+    }
+    println(s);
+    // a range whose bounds are variables, continue on every other element
+    var lo: i64 = 1;
+    var hi: i64 = 7;
+    var c: i64 = 0;
+    for k2 in lo..hi {
+        if k2 % 2 == 0 {
+            continue;
+        }
+        c = c + 1;
+    }
+    println(c);
+    // inclusive range, continue on the last element
+    var t: i64 = 0;
+    for j in 0..=4 {
+        if j == 4 {
+            continue;
+        }
+        t = t + j + 0;
+    }
+    println(t + 3);
+    // nested: continue of the inner loop only
+    var cnt: i64 = 0;
+    for p in 0..2 {
+        for q in 0..3 {
+            if q == 1 {
+                continue;
+            }
+            cnt = cnt + 1;
+        }
+    }
+    println(cnt);
+    return 0;
+}

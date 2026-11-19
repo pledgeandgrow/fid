@@ -1,0 +1,205 @@
+// RT7: the allocator's per-thread caches under several threads at once.
+// Four threads churn strings and Vecs of many sizes (a few bytes to 1.5
+// MB: the small classes, the 384 KB class, blocks of their own pages), keep
+// some a while and drop them, and each makes a burst of 300 strings of 32
+// KB that makes the C runtime trim (__p_mem_trim) while the others
+// allocate; each result must be the one the same churn gives on the main
+// thread. Four more threads make 300 raw blocks each, numbered, which the
+// main thread checks and frees (blocks freed by another thread than the one
+// that made them, from the chunks of threads that have ended: the C
+// runtime hands those to the threads that stay, __p_mem_thread_exit), and
+// the blocks the main thread then gets again must read zero.
+//
+// Expected output:
+//   churn in 4 threads: as on one
+//   blocks from 4 threads: 1200 kept their numbers
+//   freed across threads and reused: zeroed
+
+/// 300 strings of 31744 bytes (the 32 KB class) held at once, then dropped.
+fn burst(seed: i64) -> i64 {
+    val k: str = str_repeat("burst-of-pieces!", 64);
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 {
+        v.push(str_repeat(k, 31));
+        i = i + 1;
+    }
+    return v.len() + seed % 5;
+}
+
+/// One thread's churn; the result depends only on `seed` and `rounds`.
+fn churn(seed: i64, rounds: i64) -> i64 {
+    val piece: str = str_repeat("0123456789abcdef", 4);
+    var keep: Vec<str> = Vec::new();
+    var j0: i64 = 0;
+    while j0 < 40 {
+        keep.push("");
+        j0 = j0 + 1;
+    }
+    var sum: i64 = 0;
+    var x: i64 = seed;
+    var r: i64 = 0;
+    while r < rounds {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        var pieces: i64 = 1 + x % 47;
+        if r % 97 == 13 {
+            // 256 to 320 KB: the 384 KB class
+            pieces = 4000 + x % 1000;
+        }
+        if r % 151 == 7 {
+            // 1.5 MB: a block of its own pages
+            pieces = 23500;
+        }
+        val s: str = str_repeat(piece, pieces);
+        sum = sum + str_len(s);
+        var v: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < x % 40 {
+            v.push(j + x);
+            j = j + 1;
+        }
+        sum = sum + v.len();
+        if r % 3 == 0 {
+            keep.set(r % 40, s);
+        }
+        if r == rounds / 2 {
+            sum = sum + burst(seed);
+        }
+        r = r + 1;
+    }
+    var k: i64 = 0;
+    while k < keep.len() {
+        sum = sum + str_len(keep.get(k));
+        k = k + 1;
+    }
+    return sum;
+}
+
+/// The size of raw block i of a thread's `seed`: 16 to 40008 bytes
+fn block_size(seed: i64, i: i64) -> i64 {
+    return 16 + ((seed + i * 7919) % 5000) * 8;
+}
+
+/// n raw blocks made on this thread, block i holding seed * 1000 + i; the
+/// address of the table of their addresses (a raw block too).
+@unsafe
+fn make_blocks(seed: i64, n: i64) -> i64 {
+    val tab: i64 = p_malloc(n * 8);
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = p_malloc(block_size(seed, i));
+        val bp: * mut i64 = b;
+        val tp: * mut i64 = tab + i * 8;
+        unsafe {
+            * bp = seed * 1000 + i;
+            * tp = b;
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+/// The blocks of `tab` holding their numbers; every block and the table
+/// freed.
+@unsafe
+fn check_and_free(tab: i64, seed: i64, n: i64) -> i64 {
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val tp: * mut i64 = tab + i * 8;
+        var b: i64 = 0;
+        unsafe {
+            b = * tp;
+        }
+        val bp: * mut i64 = b;
+        var w: i64 = 0;
+        unsafe {
+            w = * bp;
+        }
+        if w == seed * 1000 + i {
+            good = good + 1;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    p_free(tab);
+    return good;
+}
+
+/// The same sizes again on this thread: blocks of its free lists now, each
+/// of which must read zero at its start and end.
+@unsafe
+fn reuse_zeroed(seed: i64, n: i64) -> bool {
+    var ok: bool = true;
+    var i: i64 = 0;
+    while i < n {
+        val size: i64 = block_size(seed, i);
+        val b: i64 = p_malloc(size);
+        val first: * mut i64 = b;
+        val last: * mut i64 = b + size - 8;
+        var w0: i64 = 1;
+        var w1: i64 = 1;
+        unsafe {
+            w0 = * first;
+            w1 = * last;
+        }
+        if w0 != 0 || w1 != 0 {
+            ok = false;
+        }
+        p_free(b);
+        i = i + 1;
+    }
+    return ok;
+}
+
+@unsafe
+fn main() -> i64 {
+    val rounds: i64 = 300;
+    // what each thread must give: the same churn on this thread
+    val want0: i64 = churn(1, rounds);
+    val want1: i64 = churn(8, rounds);
+    val want2: i64 = churn(15, rounds);
+    val want3: i64 = churn(22, rounds);
+
+    val f0 = spawn churn(1, rounds);
+    val f1 = spawn churn(8, rounds);
+    val f2 = spawn churn(15, rounds);
+    val f3 = spawn churn(22, rounds);
+    val b0 = spawn make_blocks(1, 300);
+    val b1 = spawn make_blocks(2, 300);
+    val b2 = spawn make_blocks(3, 300);
+    val b3 = spawn make_blocks(4, 300);
+
+    val g0 = await f0;
+    val g1 = await f1;
+    val g2 = await f2;
+    val g3 = await f3;
+    if g0 == want0 && g1 == want1 && g2 == want2 && g3 == want3 {
+        println("churn in 4 threads: as on one");
+    } else {
+        println("churn in 4 threads: differs");
+    }
+
+    val t0 = await b0;
+    val t1 = await b1;
+    val t2 = await b2;
+    val t3 = await b3;
+    var good: i64 = 0;
+    good = good + check_and_free(t0, 1, 300);
+    good = good + check_and_free(t1, 2, 300);
+    good = good + check_and_free(t2, 3, 300);
+    good = good + check_and_free(t3, 4, 300);
+    println("blocks from 4 threads: " + int_to_str(good) + " kept their numbers");
+
+    var zeroed: bool = true;
+    if !reuse_zeroed(1, 300) { zeroed = false; }
+    if !reuse_zeroed(2, 300) { zeroed = false; }
+    if !reuse_zeroed(3, 300) { zeroed = false; }
+    if !reuse_zeroed(4, 300) { zeroed = false; }
+    if zeroed {
+        println("freed across threads and reused: zeroed");
+    } else {
+        println("freed across threads and reused: not zeroed");
+    }
+    return 0;
+}

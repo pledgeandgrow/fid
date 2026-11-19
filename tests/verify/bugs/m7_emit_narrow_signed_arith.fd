@@ -1,0 +1,41 @@
+// Miscompile log M7 (docs/verification/miscompile-log.md): a narrowing cast
+// to a signed type is not sign-extended on `fid emit` and `fid emit --nat`
+// (compiler/pe_ir.fd and compiler/nat_ir.fd lower `IntTrunc` to I8/I16/I32
+// with a zero extension). The values here are the reductions of
+// scripts/fuzz/gen_vs_c.py seeds 44, 47 and 50 (RL1 run of Nov 18,
+// docs/verification/rl1-gen-vs-c-2026-11-18.md): with the bug each one
+// panics with an integer overflow that C, `fid run` and `fid ccompile` do not
+// have, because the narrowed value is read as 254 / 199 / 252 instead of
+// -2 / -57 / -4.
+
+fn main() -> i64 {
+    // seed 44: u32 0xFFFFFFFE as i8 is -2; -2 * -2 = 4
+    var a: u32 = (~((5 as u32 ^ 2) / 7) & (4294967295 as u32));
+    val a8: i8 = a as i8;
+    println(a8);
+    println(a8 * a8);
+    // seed 47: u16 65479 (0xFFC7) as i8 is -57; -57 + 15 = -42
+    var b: u16 = 65479;
+    val b8: i8 = b as i8;
+    println(b8);
+    println(b8 + 15);
+    // seed 50: an i32 -4 as i8 is -4; 0 + -4 = -4
+    var c: i32 = 0 - 4;
+    var z: i64 = 0;
+    println(z as i8 + c as i8);
+    // i32 and i16 targets: 0x1FFFF as i16 is -1, (2^32 - 3) as i32 is -3
+    var d: i64 = 131071;
+    println(d as i16);
+    var e: u64 = 4294967293;
+    println(e as i32);
+    if (e as i32) < 0 { println(1); } else { println(0); }
+    return 0;
+}
+//> -2
+//> 4
+//> -57
+//> -42
+//> -4
+//> -1
+//> -3
+//> 1

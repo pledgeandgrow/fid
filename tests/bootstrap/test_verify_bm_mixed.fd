@@ -1,0 +1,129 @@
+// pe-roadmap item 89: bench/mixed/mixed.fd (the mixed workload timed by
+// bench/mixed.sh, C -O0 against `fid emit`) on small sizes, so the suite
+// checks the benchmark's code on every backend: mixed_sb(1000),
+// mixed_vec(10000), mixed_map(500), the folded total, then two rounds of
+// the map part and of the whole (mixed_rounds). The expected values are
+// bench/mixed/reference.py's (`python3 bench/mixed/reference.py 1000 10000
+// 500 --rounds=2`), computed in Python with the same operations.
+//
+// Expected output:
+// 491967602
+// 449985000
+// 27071375
+// 619732329
+// 483096004
+// 803591179
+
+const MIXED_P: i64 = 1000000007;
+
+// "0,1,2,...,(n-1)," built with a StringBuilder, then a hash of its bytes
+fn mixed_sb(n: i64) -> i64 {
+    var sb: StringBuilder = StringBuilder::new();
+    var i: i64 = 0;
+    while i < n {
+        sb.append_int(i);
+        sb.append_char(44);
+        i = i + 1;
+    }
+    val s: str = sb.to_str();
+    val len: i64 = str_len(s);
+    var h: i64 = 0;
+    var k: i64 = 0;
+    while k < len {
+        h = (h * 31 + str_byte_at(s, k)) % MIXED_P;
+        k = k + 1;
+    }
+    return (h * 1000003 + len) % MIXED_P;
+}
+
+// n pushes of i * 3 + 1, then n gets, in a scattered order (stride 7919,
+// a prime, so every index is read once when n is not a multiple of it)
+fn mixed_vec(n: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(i * 3 + 1);
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    var at: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        sum = (sum + v.get(at) * (k % 5 + 1)) % MIXED_P;
+        at = at + 7919;
+        if at >= n {
+            at = at - n;
+        }
+        k = k + 1;
+    }
+    return sum;
+}
+
+// n inserts of "k<i>" -> i * 7, then a lookup of every key and of n / 4
+// keys that are not there (contains)
+fn mixed_map(n: i64) -> i64 {
+    var m: HashMap<str, i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < n {
+        m.insert("k" + int_to_str(i), i * 7);
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < n {
+        sum = (sum + m.get("k" + int_to_str(i))) % MIXED_P;
+        i = i + 1;
+    }
+    var missing: i64 = 0;
+    i = 0;
+    while i < n / 4 {
+        if !m.contains("x" + int_to_str(i)) {
+            missing = missing + 1;
+        }
+        i = i + 1;
+    }
+    return (sum * 31 + missing + m.len()) % MIXED_P;
+}
+
+fn mixed(sb_n: i64, vec_n: i64, map_n: i64) -> i64 {
+    val a: i64 = mixed_sb(sb_n);
+    val b: i64 = mixed_vec(vec_n);
+    val c: i64 = mixed_map(map_n);
+    return ((a * 1000003 + b) % MIXED_P * 1000003 + c) % MIXED_P;
+}
+
+// One part ("sb", "vec", "map") or all of them ("all"), `rounds` times,
+// each round's checksum folded with its index (so a round that went wrong
+// shows even if another made up for it)
+fn mixed_rounds(phase: str, rounds: i64, sb_n: i64, vec_n: i64, map_n: i64) -> i64 {
+    var acc: i64 = 0;
+    var r: i64 = 0;
+    while r < rounds {
+        var x: i64 = 0;
+        if phase == "sb" {
+            x = mixed_sb(sb_n);
+        } else if phase == "vec" {
+            x = mixed_vec(vec_n);
+        } else if phase == "map" {
+            x = mixed_map(map_n);
+        } else {
+            x = mixed(sb_n, vec_n, map_n);
+        }
+        acc = (acc * 1000003 + x + r) % MIXED_P;
+        r = r + 1;
+    }
+    return acc;
+}
+
+fn main() -> i64 {
+    val a: i64 = mixed_sb(1000);
+    val b: i64 = mixed_vec(10000);
+    val c: i64 = mixed_map(500);
+    println(a);
+    println(b);
+    println(c);
+    println(mixed(1000, 10000, 500));
+    println(mixed_rounds("map", 2, 1000, 10000, 500));
+    println(mixed_rounds("all", 2, 1000, 10000, 500));
+    return 0;
+}

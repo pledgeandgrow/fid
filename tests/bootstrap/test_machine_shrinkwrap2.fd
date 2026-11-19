@@ -1,0 +1,169 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), the machine layer's register
+// allocator (compiler/nat_ir.fd):
+//   RA12 shrink wrapping beyond the early exit (ng_sw_plan): each
+//       callee-saved register is saved at the start of the block nearest
+//       the exits that dominates every block naming it, on no cycle, with
+//       every exit it reaches dominated by it; each exit restores only
+//       what was saved on every way to it. `rare` saves the registers of
+//       its rare path only when it takes it (its first block ends at a
+//       loop head, which the early-exit form never handled); `inloop`
+//       saves the registers of its loop body on the edge into the loop,
+//       not on each turn; `tailpath` leaves through a tail call on a path
+//       that saved nothing, so that jump must restore nothing; `twoguard`
+//       has two early exits before its slow path; `midrare` saves the
+//       registers of a rare region in its middle on entering it and gives
+//       them back on leaving it (ng_sw_rest), so its one exit restores
+//       none of them. The callers keep values
+//       live across the calls in their own callee-saved registers, so an
+//       exit that restored a register it never saved, or wrote one it did
+//       not save, changes what they print. `fid emit --stats` prints a
+//       `[shrinkwrap] <fn>:` line for each function that defers saves
+//       (none with FID_NAT_OFF=shrinkwrap; tests/nattools/
+//       machine_ra12_ra19_check.sh, with FID_VERIFY=1).
+// Expected output:
+// 11770
+// 45
+// 4
+// 836
+// 1403
+// 23
+// 203
+// 315
+// 0
+// 1
+// 439
+// 20450
+// 11
+// 41570
+// 306339
+// 750138
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+// A loop first (the first block ends at its head), then a rare path that
+// keeps five values across calls
+fn rare(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    if s == 4950 {
+        var a: i64 = fib(10);
+        var b: i64 = fib(11);
+        var c: i64 = fib(12);
+        var d: i64 = fib(13);
+        var e: i64 = fib(14);
+        return a + b * 3 + c * 5 + d * 7 + e * 11 + s;
+    }
+    return s;
+}
+
+// Values made and used inside the loop body, across calls: their
+// registers are saved on the way into the loop, once
+fn inloop(n: i64) -> i64 {
+    var t: i64 = n + 1;
+    if t > 5 {
+        var acc: i64 = 0;
+        var j: i64 = 0;
+        while j < n {
+            var u: i64 = fib(j % 12);
+            var w: i64 = fib((j + 1) % 12);
+            var x: i64 = fib((j + 2) % 12);
+            acc = acc + u * 2 + w * 3 + x;
+            j = j + 1;
+        }
+        return acc;
+    }
+    return t;
+}
+
+fn helper(m: i64) -> i64 {
+    if m > 100 {
+        return helper(m - 100) + 1;
+    }
+    return m * 2 + 1;
+}
+
+// The early path leaves through a call in tail position
+fn tailpath(n: i64, m: i64) -> i64 {
+    if n < 0 {
+        return helper(m);
+    }
+    var a: i64 = fib(n % 12);
+    var b: i64 = fib(m % 12);
+    var c: i64 = fib((n + m) % 12);
+    return a * 7 + b * 3 + c + n;
+}
+
+// Two early exits before the slow path
+fn twoguard(n: i64, m: i64) -> i64 {
+    if n < 0 {
+        return 0;
+    }
+    if m < 0 {
+        return 1;
+    }
+    var a: i64 = fib(n % 15);
+    var b: i64 = fib(m % 15);
+    var c: i64 = fib((n * 3 + m) % 15);
+    return a + b * 2 + c * 3 + n;
+}
+
+// A rare region in the middle: its registers are saved on entering it and
+// given back on leaving it, so the common exit restores none of them
+fn midrare(n: i64) -> i64 {
+    var r: i64 = n * 2;
+    if n == 77 {
+        var a: i64 = fib(15);
+        var b: i64 = fib(16);
+        var c: i64 = fib(17);
+        var d: i64 = fib(18);
+        r = r + a + b * 2 + c * 3 + d * 5;
+    }
+    return r + 1;
+}
+
+fn keep_live2(m: i64) -> i64 {
+    // values the caller holds across every call (its callee-saved
+    // registers): the callees must give them back unchanged
+    var u: i64 = m * 7;
+    var v: i64 = m * 11;
+    var w: i64 = m * 13;
+    var y: i64 = m * 17;
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        t = t + rare(i % 3) + inloop(i % 7);
+        t = t + tailpath(i % 4 - 2, i) + twoguard(i % 5 - 1, i % 3 - 1);
+        t = t + midrare(76 + i % 2);
+        t = t + u - v + w - y;
+        i = i + 1;
+    }
+    return t + u + v + w + y;
+}
+
+fn main() {
+    println(rare(100));
+    println(rare(10));
+    println(inloop(3));
+    println(inloop(10));
+    println(inloop(14));
+    println(tailpath(0 - 1, 11));
+    println(tailpath(0 - 3, 300));
+    println(tailpath(9, 8));
+    println(twoguard(0 - 1, 5));
+    println(twoguard(4, 0 - 2));
+    println(twoguard(13, 11));
+    println(midrare(77));
+    println(midrare(5));
+    println(keep_live2(5));
+    println(keep_live2(31));
+    println(keep_live2(77));
+}

@@ -1,0 +1,81 @@
+// stdlib/jose public-key algorithms that need the C backend (big-number
+// work runs out of memory in the interpreter, docs/stdlib-agent-bugs.md
+// 20): ES384 (P-384/SHA-384) and ES512 (P-521/SHA-512) tokens signed by
+// Node.js (OpenSSL, random nonces) verified, tampering rejected, our
+// deterministic tokens verified (Node.js verified them too when this test
+// was written); ES512 refused with a P-384 key; RSA-OAEP-256 + A256GCM
+// JWE made by Node.js decrypted, ours round trips (Node.js decrypted it
+// when written), a corrupted encrypted key gives the same error as a
+// corrupted ciphertext; ECDH-ES on P-384 and P-521 round trips.
+// Expected output:
+// es384 node verify true tampered false
+// es384 ours verify true
+// es512 node verify true tampered false
+// es512 ours verify true
+// es512 with p-384 key: key does not fit the algorithm
+// rsa-oaep-256 node decrypt true RSA-OAEP-256 from Node
+// rsa-oaep-256 ours round trip true
+// rsa-oaep-256 bad key: decryption failed bad ciphertext: decryption failed
+// ecdh-es p-384 true ECDH-ES on P-384
+// ecdh-es p-521 true ECDH-ES on P-521
+use jose;
+use vec;
+use string;
+use encoding;
+use json;
+
+fn bump(tok: str, at: i64) -> str {
+    var b: Vec<i64> = str_bytes(tok);
+    if b.get(at) == 65 { b.set(at, 66); } else { b.set(at, 65); }
+    return str_from_bytes(b);
+}
+
+fn main() {
+    val k384: Jwk = jwk_parse("{\"kty\":\"EC\",\"x\":\"NAZ-uC-LhekxSAGimXR7svzSq4EPHN7VMhdw1qrcbvtRfb8vHtMEynuPde_MPqkp\",\"y\":\"SFB82kLcL19jHIMN0kYHgc8YYe_hrJ0oNhWx3SnqIAEd2GmsH3Qm4PT8ihNVs5G3\",\"crv\":\"P-384\",\"d\":\"2CDbQHqP5AgdZydpWkrk5o9V5-0xL9HVACnH2ktvlyeEi4WqrSjon3-OkkRDWpld\"}");
+    val p384: Jwk = jwk_public(& k384);
+    val n384: str = "eyJhbGciOiJFUzM4NCJ9.eyJpc3MiOiJub2RlIn0.vYVeCPuSA4Zxf7DPzw9v3e-1J-26UJ8dG496hqwYhwXeJsF6j7WIuIeLNjX35-zMPii0JXlTxjUeBDZhke5R7KLj2n0qI35uWVjMKvF_C2vzYwSEFErksdUxRIOpsK2W";
+    println("es384 node verify " + bool_to_str(jws_verify(n384, & p384, "ES384").ok) + " tampered " + bool_to_str(jws_verify(bump(n384, str_len(n384) - 5), & p384, "ES384").ok));
+    val o384: str = jws_sign("{\"alg\":\"ES384\"}", str_bytes("{\"iss\":\"fides\"}"), & k384);
+    println("es384 ours verify " + bool_to_str(jws_verify(o384, & p384, "ES384").ok));
+    val k521: Jwk = jwk_parse("{\"kty\":\"EC\",\"x\":\"AUWct8hSCGsFpQmyWEUOsoclaaon6OGHLTa7NfGcx9PUX6MtG3boTwjgTfyzC-3KtqhvhMXIXXs-hXfltS3jZqA-\",\"y\":\"Afo_RfomlzSaVvcUiWnkBMGd32eyMd7ODLRaUwualYWY2mASKjKYXzA1-svodeUpkbvSu0eAgTOgzvxNGU_Unrc_\",\"crv\":\"P-521\",\"d\":\"AQmjFoAK6e4ShnhoJGFiBoXTANTO02GR2YB0CCgRktrZSA450-WW4rIkRGSGPgfM2BoAK9zogtachilVBMBfxNPQ\"}");
+    val p521: Jwk = jwk_public(& k521);
+    val n521: str = "eyJhbGciOiJFUzUxMiJ9.eyJpc3MiOiJub2RlIn0.ANGKxUtxRm1yDCbWOCCpeXp16ip560HawK4JNmv037FgwDry3zN5VAL1_tyrEqdr193T1ts0T26T8Ia6SwGovVbyAE-xjDsQ5MCP6sAmz6nTe8ZIs4vHsFn23j6Hdb0mrzYbsv7fpYZG7i7ETIBGRg_3UHWYPB2FcqgpIiN2B_pGfiKM";
+    println("es512 node verify " + bool_to_str(jws_verify(n521, & p521, "ES512").ok) + " tampered " + bool_to_str(jws_verify(bump(n521, 60), & p521, "ES512").ok));
+    val o521: str = jws_sign("{\"alg\":\"ES512\"}", str_bytes("{\"iss\":\"fides\"}"), & k521);
+    println("es512 ours verify " + bool_to_str(jws_verify(o521, & p521, "ES512").ok));
+    println("es512 with p-384 key: " + jws_verify(n521, & p384, "ES512").err);
+    match env_var("FIDES_JOSE_DUMP") {
+        Option::Some(x) => { println("dump " + o384); println("dump " + o521); }
+        Option::None => { }
+    }
+
+    val rk: Jwk = jwk_parse("{\"kty\":\"RSA\",\"n\":\"3_O1WIbq9-K8C7i9xDpiJeaGDuzW6Qv8_exymTlgvHLMRAxpWYZqm7p57DbgfxK4I9x7hzn5k9u96CM62dEKDnghS8EW7cQ3l7aPDE8LLPqGQ3ev_TRIP0YhcB2S9Q2uJ94Z6l1on9Ev9nFSdVc_O4Wg7lpsA5MOAorzqQzVs3DrVcTokbXI6VS2CJC6dTM6sCfID6UhXfmQZSHJLjd6oQW0lKHnNwmnmmf8RJaECPKOyFNLRdNrChl1pcpfJ12G2SsLmaWaut2Y5fqMUkWHaocpraopCB9kIBMhQSUxr1RFyy5Mi6saxn-7UHIuDI7AyQtSt24u79kmzTQHiDpXvQ\",\"e\":\"AQAB\",\"d\":\"0a6GR-XH9DwNt_KJRxdIL-ZQ6frhhH5NeQb1qXxgvoACkftLSGSXn7GPTi9CFptLhAVVdslepvyQihfa1IvjPS57R7h6YL3HOQfgIWJHF8drZpfo5JF4w2f0wzZwxP4uyRWLfBXTUll5WDiTWpXnkiJboJE7-6Ad2lM2TvFCy_I7NphfDauLmFRZcLZEhYpG-qG1h043Qlj0fszqwS3cewYmjKD-5nVcNL90PC4mhWiRxdxsNopTVGy12gHGKBhKNKl5-hODUWZQhn8yLJmr8s2sUSTksF6bCa-kzSR0N6nO_6OL3hO7LTL-TRE41uPWN3k0ARib0KjGKsQr9k-b\",\"p\":\"_UGdx_hY1UG-Ca9QArwV3-V7-HJFsEw_bypnH5g3_Koj68MD0goipBIUeileb7QQGS-GWhtTeTsd7Jhmyk_59YtoJNRuseeV-inAS_b0WZ7I2GRODAgEf4ywidUZFG1dXc0pjhdxG6t3w0hBfCGAj0Fkt5oEGr7ikVPXBJqu0C8\",\"q\":\"4mDRsimx2TRYmIsRxDhtEGvx6jzNPDmaqJL22-DVqLSwP_T9160e8UUSprF8-pONglhT-sTX3j1U9QYor7mqY68RxQxlgWdGAaj-yjAilibYlQxXpicO-6pVZ5P128m0B0QjW6YbW-9w9PUn99gvSn8O82tP_H307aqFC3SuD9M\",\"dp\":\"nrcwmtIZWg0JfChSjGQzkU3Qk7OJ2SLv3ktEtZg__ijiui5NhqSzcP-jtauXc4n1TNNr76yQc7mI123rfX8Bt9DWQ76eYQAyDcV8rh7mpAPO-05hW0jrCMSzHq5eOV8Q1GhvUo1-ZUjglZIC-DhGyYDCDg6H4_sdItbYOhp21CE\",\"dq\":\"oqCdZJmRe5GgaA3YOJe0ukxh4T3GzxIu6hWSJEm0FFuiFoBA7_UduoQ9ruTo_PaNfWtJAWjyD2UOKGxBRGRkZPJ7GI0cSsdPQpgOWmAUKLxFcWYJfYKnv-IRMrTXtgqEO4gWwptlIjm0czW_fcyfxKvcqMCaGLDACREsPRuYhCM\",\"qi\":\"-iMqcsQozGG5uZQ3Kkudg0NuwwcoZrvlRCN-wCsVxtKv0EIWIn7oIzx5O_-b0EKTzcG45zTMxNpSsL4Qe_4uNdT7cRyAbiC7udeP8SkOSwnZPA_zcm942sjmf4UsuD98rds8FVExbmeI8HmEEyIa1Q0crLoEaApNgOC9XoueDhw\"}");
+    val nr: str = "eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIn0.S6zimA-461oJg0blcd6rDrHB6lzRgjUHarYPvwMgqTcxc1MAg2pajnZIDGWzCa8AE_jSNfXUOcYdDOoRnpdGG0xsNDTkf4b88svwF6VED4ptZeMbWqnpq2akx-8VpSHwGtghFmLF8F5hBG6eM096WdlNnG_ZSxIKiT3o1DFmA4JEOcizPoqm4KSxGJnq11HNdlq8YRkY75CCZsKZjfEVb9jhMSjkdf5DdqqTxgBzejv8zDhoSpU5v9-0nwr4cZ1_e6W5ryt5b_Zti0nBI967E3it7xBIqMJrJozTNZL_x92L7IO6qwpxnCiwn8RsVaOoHRaifDKyHMXEWfDImzR_7Q.eyI50FLod6aoKBwW.TPKjGO_TYn6If1y9MUS2MUzb6ab2RQ.syipuexMX2gMC9EDmmsOhg";
+    val d1: JweDecrypted = jwe_decrypt(nr, & rk, "RSA-OAEP-256");
+    println("rsa-oaep-256 node decrypt " + bool_to_str(d1.ok) + " " + str_from_bytes(d1.plain));
+    val rpub: Jwk = jwk_public(& rk);
+    var cek: Vec<i64> = Vec::new();
+    var seed: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 32 { cek.push(i * 3); seed.push(200 - i); i = i + 1; }
+    val ours: str = jwe_encrypt_rsa_oaep("{\"alg\":\"RSA-OAEP-256\",\"enc\":\"A256GCM\"}", & rpub, str_bytes("RSA-OAEP-256 from Fides"), cek, hex_decode_bytes("a0a1a2a3a4a5a6a7a8a9aaab"), seed);
+    match env_var("FIDES_JOSE_DUMP") {
+        Option::Some(x) => { println("dump " + ours); }
+        Option::None => { }
+    }
+    val d2: JweDecrypted = jwe_decrypt(ours, & rk, "RSA-OAEP-256");
+    println("rsa-oaep-256 ours round trip " + bool_to_str(d2.ok && str_from_bytes(d2.plain) == "RSA-OAEP-256 from Fides"));
+    val parts: Vec<str> = str_split(nr, ".");
+    val bad_ek: str = parts.get(0) + "." + bump(parts.get(1), 10) + "." + parts.get(2) + "." + parts.get(3) + "." + parts.get(4);
+    val bad_ct: str = parts.get(0) + "." + parts.get(1) + "." + parts.get(2) + "." + bump(parts.get(3), 3) + "." + parts.get(4);
+    println("rsa-oaep-256 bad key: " + jwe_decrypt(bad_ek, & rk, "RSA-OAEP-256").err + " bad ciphertext: " + jwe_decrypt(bad_ct, & rk, "RSA-OAEP-256").err);
+
+    val r384: Jwk = jwk_ec_private("P-384", hex_decode_bytes("6e9bf0a5fcf19c17b188f0c782a2f4ed1d2b605bca2d8bbc437ba874fbf73fda3a88646f90ed3c22e78b4384026e58cb"));
+    val e384: str = jwe_encrypt_ecdh_es(& p384, "A192GCM", str_bytes("ECDH-ES on P-384"), r384.d, hex_decode_bytes("000102030405060708090a0b"), Vec::new(), Vec::new());
+    val d3: JweDecrypted = jwe_decrypt(e384, & k384, "ECDH-ES");
+    println("ecdh-es p-384 " + bool_to_str(d3.ok) + " " + str_from_bytes(d3.plain));
+    val r521: Jwk = jwk_ec_private("P-521", hex_decode_bytes("0116b6f34101dd3b64fa2972796ef576edebbcb92c62039020ba1c7ba787c5e1e1fe43129f799f994ddf6a48e9ef1d4ea04546c04bc01c6d4c709f822d592c592a17"));
+    val e521: str = jwe_encrypt_ecdh_es(& p521, "A128GCM", str_bytes("ECDH-ES on P-521"), r521.d, hex_decode_bytes("000102030405060708090a0b"), Vec::new(), Vec::new());
+    val d4: JweDecrypted = jwe_decrypt(e521, & k521, "ECDH-ES");
+    println("ecdh-es p-521 " + bool_to_str(d4.ok) + " " + str_from_bytes(d4.plain));
+}

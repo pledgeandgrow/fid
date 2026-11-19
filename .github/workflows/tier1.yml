@@ -1,0 +1,102 @@
+# PL2 (competitive-roadmap): tier 1 is Windows x64, Linux x64, macOS ARM64
+# and Linux ARM64, and on tier 1 the whole suite passes on every commit.
+# One job per platform builds fid in one stage from this commit and runs
+# scripts/tier1.sh: each test through the C path and through our own
+# backend against the interpreter, every lane agreeing, and every
+# expected-fail test refused. A platform is tier 1 while its job is green.
+#
+#   windows-x64  windows-latest     c, pe_ir (`fid emit`), `emit --nat`
+#   linux-x64    ubuntu-latest      c, nat_ir x86_64-linux
+#   linux-arm64  ubuntu-24.04-arm   c, nat_ir aarch64-linux (run natively)
+#   macos-arm64  macos-15           c (the host's clang), nat_ir aarch64-macos
+
+name: Tier 1 (PL2)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tier1:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+          - platform: linux-x64
+            os: ubuntu-latest
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+          - platform: macos-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUST_MIN_STACK: "268435456"
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold (Linux; the linker .cargo/config.toml asks for)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: coreutils (macOS; GNU timeout for the suite scripts)
+        if: runner.os == 'macOS'
+        run: |
+          brew install coreutils || true
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: The tier-1 scripts' own checks (no compiler)
+        run: |
+          py=python3; command -v python3 > /dev/null 2>&1 || py=python
+          "$py" tests/tooling/bin-target-check-selftest.py
+          # lane skips and qemu's dynamic loader (stand-in fid and qemu)
+          if [ "$RUNNER_OS" = Linux ]; then bash tests/tooling/pl2-lane-skips-check.sh; fi
+      - name: The compiler's sources parse with stage 0
+        run: bash scripts/stage0-names-check.sh
+      - name: Build the Rust bootstrap compiler (stage 0)
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: The whole suite on ${{ matrix.platform }}
+        env:
+          CC: zig cc
+          PLATFORM: ${{ matrix.platform }}
+          JOBS: "4"
+        run: |
+          x=""; [ "$RUNNER_OS" = Windows ] && x=".exe"
+          FID="release/fid-dev$x" bash scripts/tier1.sh
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier1-${{ matrix.platform }}-${{ github.run_id }}
+          path: |
+            build/tier1/summary.md
+            build/tier1/lanes.txt
+            build/tier1/rejected.txt
+            build/tier1/lanes/*/results.txt
+            build/tier1/lanes/*-native/results.txt
+            build/tier1/lanes/disagree.txt
+          if-no-files-found: ignore
+          retention-days: 14

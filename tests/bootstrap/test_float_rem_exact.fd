@@ -1,0 +1,51 @@
+// MI17: `%` on f64 and f32 is C's fmod / fmodf on every backend: the
+// exact remainder of a truncating division, with the sign of the dividend,
+// and NaN for a zero divisor. pe_ir (the default Windows `fid emit`)
+// stored nothing for a float `%` (7.5 % 2.0 printed whatever the slot
+// held) and the machine layer gave 0 (`--nat`, Linux targets). A
+// remainder computed as a - trunc(a / b) * b is wrong for a large
+// quotient (1e300 % 7.0 is 1: a / b is not exact there). The operands go
+// through functions so that no constant folding answers for the backend.
+//
+// Expected output:
+// 1.5
+// -1.5
+// 1.5
+// 0.25
+// 1
+// 2
+// nan
+// 0
+// 2.5
+// 2
+// -2.5
+fn rem64(a: f64, b: f64) -> f64 {
+    return a % b;
+}
+
+fn rem32(a: f32, b: f32) -> f32 {
+    return a % b;
+}
+
+fn main() -> i64 {
+    println(float_to_str(rem64(7.5, 2.0)));
+    println(float_to_str(rem64(0.0 - 7.5, 2.0)));
+    println(float_to_str(rem64(7.5, 0.0 - 2.0)));
+    println(float_to_str(rem64(5.25, 0.5)));
+    // a quotient of about 1.4e299: only an exact remainder gives 1
+    println(int_to_str(rem64(1.0e300, 7.0) as i64));
+    // 2^70 + 2^20 = 1180591620717412433920 (= 2 mod 3)
+    println(int_to_str(rem64(1180591620717412433920.0, 3.0) as i64));
+    val z: f64 = rem64(1.0, 0.0);
+    if z != z {
+        println("nan");
+    } else {
+        println("not nan: " + float_to_str(z));
+    }
+    println(int_to_str(rem64(1.0e18, 10.0) as i64));
+    println(float_to_str(rem32(10.5 as f32, 4.0 as f32) as f64));
+    // 2^34, exact in an f32 (= 2 mod 7)
+    println(int_to_str(rem32(17179869184.0 as f32, 7.0 as f32) as i64));
+    println(float_to_str(rem32((0.0 - 10.5) as f32, 4.0 as f32) as f64));
+    return 0;
+}

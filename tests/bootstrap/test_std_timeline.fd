@@ -1,0 +1,130 @@
+// stdlib/timeline: step/linear/cubic float and vec3 tracks, scrubbing, looping, events fired once per crossing
+// Expected output:
+// t=0.00 step 1.00 linear 10.00 cubic 0.0000
+// t=0.50 step 1.00 linear 10.00 cubic 0.6250
+// t=1.00 step 1.00 linear 10.00 cubic 1.0000
+// t=1.50 step 1.00 linear 7.50 cubic 0.4583
+// t=2.00 step 5.00 linear 5.00 cubic 0.0000
+// t=2.50 step 5.00 linear 2.50 cubic 0.3125
+// t=3.00 step 5.00 linear 0.00 cubic 0.8333
+// t=3.50 step 5.00 linear 0.00 cubic 1.4375
+// t=4.00 step 5.00 linear 0.00 cubic 2.0000
+// camera at 1.0: 2.00 0.50 8.00
+// find cubic 2 camera 0 none -1
+// t=0.5: start@0.0
+// t=1.0: door@1.0#7 drums@1.0
+// t=2.5: boom@2.5
+// t=4.0: end@4.0
+// finished yes at 4.0 cubic 2.00
+// scrub to 0.9, linear 10.00
+// advance 0.2: door@1.0#7 drums@1.0
+// loop 0 -> 3.5: a@0.0 b@1.0 c@3.0
+// loop 3.5 -> 1.5: a@0.0 b@1.0
+// loop 1.5 -> 1.5 + 9: c@3.0 a@0.0 b@1.0 c@3.0 a@0.0 b@1.0
+// time 2.50
+// back 2.5 -> 0.5: b@1.0
+// back 0.5 -> 3.5: a@0.0
+// time 3.50
+use timeline;
+use math;
+
+// x rounded to d decimals ("-" only when the rounded value is not zero)
+fn fx(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val n: i64 = (a * (scale as f64) + 0.5) as i64;
+    if n == 0 { neg = false; }
+    var s: str = int_to_str(n / scale);
+    if d > 0 {
+        var fr: str = int_to_str(n % scale);
+        while str_len(fr) < d { fr = "0" + fr; }
+        s = s + "." + fr;
+    }
+    if neg { return "-" + s; }
+    return s;
+}
+
+fn show(label: str, evs: Vec<TlFired>) {
+    var s: str = label + ":";
+    var i: i64 = 0;
+    while i < evs.len() {
+        val e: TlFired = evs.get(i);
+        s = s + " " + e.name + "@" + fx(e.time, 1);
+        if e.payload != 0 { s = s + "#" + int_to_str(e.payload); }
+        i = i + 1;
+    }
+    if evs.len() == 0 { s = s + " -"; }
+    println(s);
+}
+
+fn main() {
+    var tl: Timeline = timeline_new(4.0, false);
+    val st: i64 = timeline_add_float(&mut tl, "step");
+    timeline_key(&mut tl, st, 0.0, 1.0, TL_STEP);
+    timeline_key(&mut tl, st, 2.0, 5.0, TL_STEP);
+    val li: i64 = timeline_add_float(&mut tl, "linear");
+    timeline_key(&mut tl, li, 3.0, 0.0, TL_LINEAR);
+    timeline_key(&mut tl, li, 1.0, 10.0, TL_LINEAR);
+    val cu: i64 = timeline_add_float(&mut tl, "cubic");
+    timeline_key(&mut tl, cu, 0.0, 0.0, TL_CUBIC);
+    timeline_key(&mut tl, cu, 1.0, 1.0, TL_CUBIC);
+    timeline_key(&mut tl, cu, 2.0, 0.0, TL_CUBIC);
+    timeline_key(&mut tl, cu, 4.0, 2.0, TL_CUBIC);
+    var t: f64 = 0.0;
+    while t <= 4.01 {
+        println("t=" + fx(t, 2) + " step " + fx(timeline_sample_float(&tl, st, t), 2) + " linear " + fx(timeline_sample_float(&tl, li, t), 2) + " cubic " + fx(timeline_sample_float(&tl, cu, t), 4));
+        t = t + 0.5;
+    }
+    val cam: i64 = timeline_add_vec(&mut tl, "camera");
+    timeline_key_vec(&mut tl, cam, 0.0, vec3(0.0, 0.0, 10.0), TL_LINEAR);
+    timeline_key_vec(&mut tl, cam, 4.0, vec3(8.0, 2.0, 2.0), TL_LINEAR);
+    val c: vec3 = timeline_sample_vec(&tl, cam, 1.0);
+    println("camera at 1.0: " + fx(c.x, 2) + " " + fx(c.y, 2) + " " + fx(c.z, 2));
+    println("find cubic " + int_to_str(timeline_find(&tl, 0, "cubic")) + " camera " + int_to_str(timeline_find(&tl, 1, "camera")) + " none " + int_to_str(timeline_find(&tl, 2, "x")));
+
+    val ev: i64 = timeline_add_events(&mut tl, "sfx");
+    timeline_event(&mut tl, ev, 0.0, "start", 0);
+    timeline_event(&mut tl, ev, 1.0, "door", 7);
+    timeline_event(&mut tl, ev, 2.5, "boom", 0);
+    timeline_event(&mut tl, ev, 4.0, "end", 0);
+    val ev2: i64 = timeline_add_events(&mut tl, "music");
+    timeline_event(&mut tl, ev2, 1.0, "drums", 0);
+
+    // play once, 0.5 s steps: each event exactly once
+    var steps: i64 = 0;
+    while steps < 10 {
+        val f: Vec<TlFired> = timeline_advance(&mut tl, 0.5);
+        if f.len() > 0 { show("t=" + fx(tl.time, 1), f); }
+        steps = steps + 1;
+    }
+    println("finished " + if tl.finished { "yes" } else { "no" } + " at " + fx(tl.time, 1) + " cubic " + fx(timeline_float(&tl, cu), 2));
+
+    // scrubbing fires nothing; playing on from 0.9 fires the door
+    timeline_seek(&mut tl, 0.9);
+    println("scrub to 0.9, linear " + fx(timeline_float(&tl, li), 2));
+    show("advance 0.2", timeline_advance(&mut tl, 0.2));
+
+    // looping, big steps: wraps fire the rest of the lap then the start
+    var lp: Timeline = timeline_new(4.0, true);
+    val e3: i64 = timeline_add_events(&mut lp, "beats");
+    timeline_event(&mut lp, e3, 0.0, "a", 0);
+    timeline_event(&mut lp, e3, 1.0, "b", 0);
+    timeline_event(&mut lp, e3, 3.0, "c", 0);
+    show("loop 0 -> 3.5", timeline_advance(&mut lp, 3.5));
+    show("loop 3.5 -> 1.5", timeline_advance(&mut lp, 2.0));
+    show("loop 1.5 -> 1.5 + 9", timeline_advance(&mut lp, 9.0));
+    println("time " + fx(lp.time, 2));
+
+    // backwards
+    lp.speed = -1.0;
+    show("back 2.5 -> 0.5", timeline_advance(&mut lp, 2.0));
+    show("back 0.5 -> 3.5", timeline_advance(&mut lp, 1.0));
+    println("time " + fx(lp.time, 2));
+}

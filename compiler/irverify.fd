@@ -3,15 +3,13 @@
 // Checks what every pass after lowering relies on: each instruction of a
 // block exists and is in one block only, every operand is a parameter or an
 // instruction of the function, jumps and branches name blocks of the
-// function, and a value is defined before its use: earlier in the same block,
+// function (a Switch's targets too, one per distinct key), and a value is
+// defined before its use: earlier in the same block,
 // or in a block that dominates the use's block (dominators from iropt).
 // Unreachable blocks are not checked for dominance. Run on the native Linux
 // path with FID_VERIFY=1, after lowering and after each optimizer stage.
 
-module compiler::irverify;
- use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::iropt;
- const IV_MAX_ERRORS: i64 = 20;
-/// The problems of `module`, at most IV_MAX_ERRORS; empty when it is sound.
+module compiler::irverify; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::iropt; const IV_MAX_ERRORS: i64 = 20;  /// The problems of `module`, at most IV_MAX_ERRORS; empty when it is sound.
 /// `stage` names the point of the pipeline in each message.
 pub fn ir_verify(module: & IrModule, stage: str) -> Vec<str> {
     var errs: Vec<str> = Vec::new();
@@ -109,6 +107,25 @@ fn iv_function(f: & IrFunction, stage: str, errs: & mut Vec<str>) {
                         Inst::Branch(_, t1, t2) => {
                             iv_target(f, & cfg, t1, stage, errs);
                             iv_target(f, & cfg, t2, stage, errs);
+                        }
+                        Inst::Switch(_, sk, st, sd) => {
+                            // ME28: every target a block, one per key, keys distinct
+                            if sk.len() != st.len() {
+                                iv_err(errs, f, stage, "a switch with " + int_to_str(sk.len()) + " keys and " + int_to_str(st.len()) + " targets");
+                            }
+                            var si: i64 = 0;
+                            while si < st.len() {
+                                iv_target(f, & cfg, st.get(si), stage, errs);
+                                var sj: i64 = si + 1;
+                                while sj < sk.len() {
+                                    if si < sk.len() && sk.get(si) == sk.get(sj) {
+                                        iv_err(errs, f, stage, "a switch with key " + int_to_str(sk.get(si)) + " twice");
+                                    }
+                                    sj = sj + 1;
+                                }
+                                si = si + 1;
+                            }
+                            iv_target(f, & cfg, sd, stage, errs);
                         }
                         _ => {
                         }

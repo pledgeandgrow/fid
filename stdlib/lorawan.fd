@@ -1,0 +1,914 @@
+// Fides LoRaWAN 1.0.x MAC: join, keys, frames, MIC, encryption, ADR
+//
+// What is real (pure Fides, runs everywhere; LoRaWAN 1.0.3 / 1.0.4):
+//   - AES-CMAC (RFC 4493) over the AES-128 block cipher of stdlib aes_gcm
+//     (aes_ecb_encrypt), and the AES-128 inverse cipher (FIPS 197 5.3,
+//     written here: stdlib AES encrypts only) for the network side of the
+//     Join-Accept
+//   - Join-Request build/verify; Join-Accept encode (network side: MIC,
+//     then aes128_decrypt as the spec says) and decode (device side:
+//     aes128_encrypt, MIC check, fields, CFList); NwkSKey / AppSKey
+//     derivation
+//   - data frames: MHDR, FHDR (DevAddr, FCtrl for uplink and downlink,
+//     FCnt, FOpts), FPort, FRMPayload encryption (the A_i block keystream,
+//     NwkSKey on port 0, AppSKey otherwise), MIC over B0; encode, decode,
+//     verify and decrypt
+//   - frame counters: 32-bit reconstruction from the 16 bits on the air,
+//     the replay / MAX_FCNT_GAP check
+//   - MAC commands in FOpts / port 0 (LinkCheck, LinkADR, DutyCycle,
+//     RXParamSetup, DevStatus, NewChannel, RXTimingSetup, TxParamSetup,
+//     DlChannel) with their lengths per direction
+//   - ADR basics: the device's ADR_ACK_CNT backoff (ADR_ACK_LIMIT /
+//     ADR_ACK_DELAY) and the network's margin-based data rate / power
+//     step (as in Semtech's reference network server), EU868 data rates,
+//     LoRa time on air (Semtech AN1200.13 formula)
+//
+// The seam: the radio. Frames go out and come in as byte Vecs; the SX127x /
+// SX126x register work, RX windows timing and regional channel plans
+// beyond EU868 data rates are the caller's.
+module lorawan;
+ use vec;
+ use string;
+ use aes_gcm;
+
+pub const LW_JOIN_REQUEST: i64 = 0;
+pub const LW_JOIN_ACCEPT: i64 = 1;
+pub const LW_UNCONFIRMED_UP: i64 = 2;
+pub const LW_UNCONFIRMED_DOWN: i64 = 3;
+pub const LW_CONFIRMED_UP: i64 = 4;
+pub const LW_CONFIRMED_DOWN: i64 = 5;
+pub const LW_PROPRIETARY: i64 = 7;
+pub const LW_DIR_UP: i64 = 0;
+pub const LW_DIR_DOWN: i64 = 1;
+pub const LW_MAX_FCNT_GAP: i64 = 16384;
+pub const LW_ADR_ACK_LIMIT: i64 = 64;
+pub const LW_ADR_ACK_DELAY: i64 = 32;
+
+// ─── AES helpers ────────────────────────────────────────────────────────
+
+pub fn lw_aes_encrypt(key: & Vec<i64>, block: & Vec<i64>) -> Vec<i64> {
+    return aes_ecb_encrypt(lw_slice(key, 0, 16), lw_slice(block, 0, 16));
+}
+
+fn lw_xtime(a: i64) -> i64 {
+    var r: i64 = (a << 1) & 0xFF;
+    if (a & 0x80) != 0 {
+        r = r ^ 0x1B;
+    }
+    return r;
+}
+
+fn lw_gmul(a: i64, b: i64) -> i64 {
+    var x: i64 = a & 0xFF;
+    var y: i64 = b & 0xFF;
+    var r: i64 = 0;
+    while y != 0 {
+        if (y & 1) != 0 {
+            r = r ^ x;
+        }
+        x = lw_xtime(x);
+        y = y >> 1;
+    }
+    return r;
+}
+
+/// The AES S-box, computed: multiplicative inverse in GF(2^8), then the
+/// affine map (FIPS 197 5.1.1).
+pub fn lw_aes_sbox() -> Vec<i64> {
+    var s: Vec<i64> = Vec::filled(256, 0);
+    var x: i64 = 0;
+    while x < 256 {
+        // x^254 = x^-1 (0 maps to 0)
+        var inv: i64 = 1;
+        var base: i64 = x;
+        var e: i64 = 254;
+        while e > 0 {
+            if (e & 1) != 0 {
+                inv = lw_gmul(inv, base);
+            }
+            base = lw_gmul(base, base);
+            e = e >> 1;
+        }
+        if x == 0 {
+            inv = 0;
+        }
+        var b: i64 = inv;
+        var r: i64 = inv;
+        var k: i64 = 0;
+        while k < 4 {
+            b = ((b << 1) | (b >> 7)) & 0xFF;
+            r = r ^ b;
+            k = k + 1;
+        }
+        s.set(x, r ^ 0x63);
+        x = x + 1;
+    }
+    return s;
+}
+
+fn lw_round_keys(key: & Vec<i64>, sbox: & Vec<i64>) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        w.push(key.get(i) & 0xFF);
+        i = i + 1;
+    }
+    var rcon: i64 = 1;
+    i = 16;
+    while i < 176 {
+        var t0: i64 = w.get(i - 4);
+        var t1: i64 = w.get(i - 3);
+        var t2: i64 = w.get(i - 2);
+        var t3: i64 = w.get(i - 1);
+        if i % 16 == 0 {
+            val r0: i64 = sbox.get(t1) ^ rcon;
+            val r1: i64 = sbox.get(t2);
+            val r2: i64 = sbox.get(t3);
+            val r3: i64 = sbox.get(t0);
+            t0 = r0;
+            t1 = r1;
+            t2 = r2;
+            t3 = r3;
+            rcon = lw_xtime(rcon);
+        }
+        w.push(w.get(i - 16) ^ t0);
+        w.push(w.get(i - 15) ^ t1);
+        w.push(w.get(i - 14) ^ t2);
+        w.push(w.get(i - 13) ^ t3);
+        i = i + 4;
+    }
+    return w;
+}
+
+/// AES-128 inverse cipher of one block (FIPS 197 5.3).
+pub fn lw_aes_decrypt(key: & Vec<i64>, block: & Vec<i64>) -> Vec<i64> {
+    val sbox: Vec<i64> = lw_aes_sbox();
+    var inv: Vec<i64> = Vec::filled(256, 0);
+    var i: i64 = 0;
+    while i < 256 {
+        inv.set(sbox.get(i), i);
+        i = i + 1;
+    }
+    val w: Vec<i64> = lw_round_keys(key, & sbox);
+    var s: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 {
+        s.push((block.get(i) ^ w.get(160 + i)) & 0xFF);
+        i = i + 1;
+    }
+    var round: i64 = 9;
+    while round >= 0 {
+        // InvShiftRows: row r moves right by r (byte index = 4*col + row)
+        var t: Vec<i64> = Vec::filled(16, 0);
+        var c: i64 = 0;
+        while c < 4 {
+            var r: i64 = 0;
+            while r < 4 {
+                t.set(4 * ((c + r) % 4) + r, s.get(4 * c + r));
+                r = r + 1;
+            }
+            c = c + 1;
+        }
+        // InvSubBytes, AddRoundKey
+        i = 0;
+        while i < 16 {
+            s.set(i, inv.get(t.get(i)) ^ w.get(16 * round + i));
+            i = i + 1;
+        }
+        if round > 0 {
+            c = 0;
+            while c < 4 {
+                val a0: i64 = s.get(4 * c);
+                val a1: i64 = s.get(4 * c + 1);
+                val a2: i64 = s.get(4 * c + 2);
+                val a3: i64 = s.get(4 * c + 3);
+                s.set(4 * c, lw_gmul(a0, 14) ^ lw_gmul(a1, 11) ^ lw_gmul(a2, 13) ^ lw_gmul(a3, 9));
+                s.set(4 * c + 1, lw_gmul(a0, 9) ^ lw_gmul(a1, 14) ^ lw_gmul(a2, 11) ^ lw_gmul(a3, 13));
+                s.set(4 * c + 2, lw_gmul(a0, 13) ^ lw_gmul(a1, 9) ^ lw_gmul(a2, 14) ^ lw_gmul(a3, 11));
+                s.set(4 * c + 3, lw_gmul(a0, 11) ^ lw_gmul(a1, 13) ^ lw_gmul(a2, 9) ^ lw_gmul(a3, 14));
+                c = c + 1;
+            }
+        }
+        round = round - 1;
+    }
+    return s;
+}
+
+// ─── AES-CMAC (RFC 4493) ────────────────────────────────────────────────
+
+fn lw_shift1(b: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::filled(16, 0);
+    var i: i64 = 0;
+    while i < 16 {
+        var v: i64 = (b.get(i) << 1) & 0xFF;
+        if i < 15 {
+            v = v | ((b.get(i + 1) >> 7) & 1);
+        }
+        out.set(i, v);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The CMAC subkeys [K1 (16 bytes), K2 (16 bytes)].
+pub fn lw_cmac_subkeys(key: & Vec<i64>) -> Vec<i64> {
+    val l: Vec<i64> = lw_aes_encrypt(key, & Vec::filled(16, 0));
+    var k1: Vec<i64> = lw_shift1(& l);
+    if (l.get(0) & 0x80) != 0 {
+        k1.set(15, k1.get(15) ^ 0x87);
+    }
+    var k2: Vec<i64> = lw_shift1(& k1);
+    if (k1.get(0) & 0x80) != 0 {
+        k2.set(15, k2.get(15) ^ 0x87);
+    }
+    var out: Vec<i64> = k1;
+    var i: i64 = 0;
+    while i < 16 {
+        out.push(k2.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn lw_cmac(key: & Vec<i64>, msg: & Vec<i64>) -> Vec<i64> {
+    val sub: Vec<i64> = lw_cmac_subkeys(key);
+    var n: i64 = (msg.len() + 15) / 16;
+    var complete: bool = true;
+    if n == 0 {
+        n = 1;
+        complete = false;
+    } else if msg.len() % 16 != 0 {
+        complete = false;
+    }
+    var x: Vec<i64> = Vec::filled(16, 0);
+    var blk: i64 = 0;
+    while blk < n {
+        var y: Vec<i64> = Vec::filled(16, 0);
+        var i: i64 = 0;
+        while i < 16 {
+            val p: i64 = 16 * blk + i;
+            var m: i64 = 0;
+            if p < msg.len() {
+                m = msg.get(p) & 0xFF;
+            } else if p == msg.len() {
+                m = 0x80;
+            }
+            if blk == n - 1 {
+                if complete {
+                    m = m ^ sub.get(i);
+                } else {
+                    m = m ^ sub.get(16 + i);
+                }
+            }
+            y.set(i, x.get(i) ^ m);
+            i = i + 1;
+        }
+        x = lw_aes_encrypt(key, & y);
+        blk = blk + 1;
+    }
+    return x;
+}
+
+fn lw_mic4(key: & Vec<i64>, msg: & Vec<i64>) -> Vec<i64> {
+    val c: Vec<i64> = lw_cmac(key, msg);
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        m.push(c.get(i));
+        i = i + 1;
+    }
+    return m;
+}
+
+// ─── Bytes ──────────────────────────────────────────────────────────────
+
+fn lw_le(out: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn lw_get_le(b: & Vec<i64>, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        v = v | ((b.get(off + i) & 0xFF) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn lw_append(out: & mut Vec<i64>, d: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < d.len() {
+        out.push(d.get(i) & 0xFF);
+        i = i + 1;
+    }
+}
+
+/// A byte string reversed (EUIs are shown most significant byte first but
+/// sent least significant first).
+pub fn lw_reverse(b: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = b.len() - 1;
+    while i >= 0 {
+        out.push(b.get(i));
+        i = i - 1;
+    }
+    return out;
+}
+
+fn lw_slice(b: & Vec<i64>, a: i64, e: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < e && i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lw_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        d = d | ((a.get(i) ^ b.get(i)) & 0xFF);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+pub fn lw_mhdr(mtype: i64) -> i64 {
+    return (mtype & 7) << 5;
+}
+
+pub fn lw_mtype(frame: & Vec<i64>) -> i64 {
+    if frame.len() == 0 {
+        return 0 - 1;
+    }
+    return (frame.get(0) >> 5) & 7;
+}
+
+// ─── Join ───────────────────────────────────────────────────────────────
+
+/// Join-Request: MHDR | AppEUI | DevEUI | DevNonce | MIC. The EUIs are
+/// given as shown (most significant byte first).
+pub fn lw_join_request(app_key: & Vec<i64>, app_eui: & Vec<i64>, dev_eui: & Vec<i64>, dev_nonce: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    f.push(lw_mhdr(LW_JOIN_REQUEST));
+    lw_append(& mut f, & lw_reverse(app_eui));
+    lw_append(& mut f, & lw_reverse(dev_eui));
+    lw_le(& mut f, dev_nonce, 2);
+    val mic: Vec<i64> = lw_mic4(app_key, & f);
+    lw_append(& mut f, & mic);
+    return f;
+}
+
+/// The network's check of a Join-Request's length, type and MIC (read
+/// the EUIs and DevNonce with lw_join_request_eui / _nonce).
+pub fn lw_join_request_verify(app_key: & Vec<i64>, f: & Vec<i64>) -> bool {
+    if f.len() != 23 || lw_mtype(f) != LW_JOIN_REQUEST {
+        return false;
+    }
+    return lw_eq(& lw_mic4(app_key, & lw_slice(f, 0, 19)), & lw_slice(f, 19, 23));
+}
+
+/// AppEUI (which = 0) or DevEUI (which = 1) of a Join-Request, as shown.
+pub fn lw_join_request_eui(f: & Vec<i64>, which: i64) -> Vec<i64> {
+    return lw_reverse(& lw_slice(f, 1 + 8 * which, 9 + 8 * which));
+}
+
+pub fn lw_join_request_nonce(f: & Vec<i64>) -> i64 {
+    return lw_get_le(f, 17, 2);
+}
+
+pub struct LwJoinAccept {
+    pub ok: bool,
+    pub app_nonce: i64,
+    pub net_id: i64,
+    pub dev_addr: i64,
+    pub rx1_dr_offset: i64,
+    pub rx2_dr: i64,
+    pub rx_delay: i64,
+    pub cf_list: Vec<i64>,
+}
+
+/// Network side: the encrypted Join-Accept. cf_list is empty or 16 bytes.
+pub fn lw_join_accept_encode(app_key: & Vec<i64>, ja: & LwJoinAccept) -> Vec<i64> {
+    var plain: Vec<i64> = Vec::new();
+    plain.push(lw_mhdr(LW_JOIN_ACCEPT));
+    lw_le(& mut plain, ja.app_nonce, 3);
+    lw_le(& mut plain, ja.net_id, 3);
+    lw_le(& mut plain, ja.dev_addr, 4);
+    plain.push(((ja.rx1_dr_offset & 7) << 4) | (ja.rx2_dr & 0x0F));
+    plain.push(ja.rx_delay & 0xFF);
+    lw_append(& mut plain, & ja.cf_list);
+    val mic: Vec<i64> = lw_mic4(app_key, & plain);
+    lw_append(& mut plain, & mic);
+    var out: Vec<i64> = Vec::new();
+    out.push(plain.get(0));
+    var off: i64 = 1;
+    while off < plain.len() {
+        val blk: Vec<i64> = lw_aes_decrypt(app_key, & lw_slice(& plain, off, off + 16));
+        lw_append(& mut out, & blk);
+        off = off + 16;
+    }
+    return out;
+}
+
+/// Device side: decrypt (aes128_encrypt of each block), check the MIC and
+/// read the fields; ok=false on a bad length or MIC.
+pub fn lw_join_accept_decode(app_key: & Vec<i64>, f: & Vec<i64>) -> LwJoinAccept {
+    var ja: LwJoinAccept = LwJoinAccept { ok: false, app_nonce: 0, net_id: 0, dev_addr: 0, rx1_dr_offset: 0, rx2_dr: 0, rx_delay: 0, cf_list: Vec::new() };
+    if (f.len() != 17 && f.len() != 33) || lw_mtype(f) != LW_JOIN_ACCEPT {
+        return ja;
+    }
+    var plain: Vec<i64> = Vec::new();
+    plain.push(f.get(0));
+    var off: i64 = 1;
+    while off < f.len() {
+        lw_append(& mut plain, & lw_aes_encrypt(app_key, & lw_slice(f, off, off + 16)));
+        off = off + 16;
+    }
+    val n: i64 = plain.len();
+    if !lw_eq(& lw_mic4(app_key, & lw_slice(& plain, 0, n - 4)), & lw_slice(& plain, n - 4, n)) {
+        return ja;
+    }
+    ja.app_nonce = lw_get_le(& plain, 1, 3);
+    ja.net_id = lw_get_le(& plain, 4, 3);
+    ja.dev_addr = lw_get_le(& plain, 7, 4);
+    ja.rx1_dr_offset = (plain.get(11) >> 4) & 7;
+    ja.rx2_dr = plain.get(11) & 0x0F;
+    ja.rx_delay = plain.get(12);
+    if n == 33 {
+        ja.cf_list = lw_slice(& plain, 13, 29);
+    }
+    ja.ok = true;
+    return ja;
+}
+
+/// NwkSKey (kind 1) or AppSKey (kind 2):
+/// aes128_encrypt(AppKey, kind | AppNonce | NetID | DevNonce | pad16).
+pub fn lw_session_key(app_key: & Vec<i64>, kind: i64, app_nonce: i64, net_id: i64, dev_nonce: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(kind & 0xFF);
+    lw_le(& mut b, app_nonce, 3);
+    lw_le(& mut b, net_id, 3);
+    lw_le(& mut b, dev_nonce, 2);
+    while b.len() < 16 {
+        b.push(0);
+    }
+    return lw_aes_encrypt(app_key, & b);
+}
+
+/// The CFList of EU868-like regions: up to five extra channel frequencies
+/// (Hz), 3 bytes each in units of 100 Hz, then the CFListType byte 0.
+pub fn lw_cflist_freqs(freqs: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 5 {
+        var f: i64 = 0;
+        if i < freqs.len() {
+            f = freqs.get(i) / 100;
+        }
+        lw_le(& mut out, f, 3);
+        i = i + 1;
+    }
+    out.push(0);
+    return out;
+}
+
+pub fn lw_cflist_decode(cf: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if cf.len() < 15 {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < 5 {
+        val f: i64 = lw_get_le(cf, 3 * i, 3) * 100;
+        if f != 0 {
+            out.push(f);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Data frames ────────────────────────────────────────────────────────
+
+pub struct LwFrame {
+    pub mtype: i64,
+    pub dev_addr: i64,
+    pub adr: bool,
+    pub adr_ack_req: bool,
+    pub ack: bool,
+    pub fpending: bool,
+    pub fcnt: i64,
+    pub fopts: Vec<i64>,
+    pub fport: i64,
+    pub payload: Vec<i64>,
+    pub mic_ok: bool,
+    pub ok: bool,
+}
+
+pub fn lw_frame(mtype: i64, dev_addr: i64, fcnt: i64, fport: i64, payload: Vec<i64>) -> LwFrame {
+    return LwFrame { mtype: mtype, dev_addr: dev_addr, adr: false, adr_ack_req: false, ack: false, fpending: false, fcnt: fcnt, fopts: Vec::new(), fport: fport, payload: payload, mic_ok: false, ok: true };
+}
+
+pub fn lw_dir_of(mtype: i64) -> i64 {
+    if mtype == LW_UNCONFIRMED_DOWN || mtype == LW_CONFIRMED_DOWN {
+        return LW_DIR_DOWN;
+    }
+    return LW_DIR_UP;
+}
+
+/// FRMPayload encryption (symmetric): XOR with AES(K, A_i), A_i = 0x01 |
+/// 0^4 | Dir | DevAddr | FCnt (32) | 0x00 | i.
+pub fn lw_crypt_payload(key: & Vec<i64>, dir: i64, dev_addr: i64, fcnt: i64, data: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var blk: i64 = 1;
+    var off: i64 = 0;
+    while off < data.len() {
+        var a: Vec<i64> = Vec::new();
+        a.push(0x01);
+        lw_le(& mut a, 0, 4);
+        a.push(dir & 1);
+        lw_le(& mut a, dev_addr, 4);
+        lw_le(& mut a, fcnt, 4);
+        a.push(0);
+        a.push(blk & 0xFF);
+        val s: Vec<i64> = lw_aes_encrypt(key, & a);
+        var i: i64 = 0;
+        while i < 16 && off + i < data.len() {
+            out.push((data.get(off + i) ^ s.get(i)) & 0xFF);
+            i = i + 1;
+        }
+        off = off + 16;
+        blk = blk + 1;
+    }
+    return out;
+}
+
+/// MIC of a data frame: CMAC(NwkSKey, B0 | msg)[0..4], B0 = 0x49 | 0^4 |
+/// Dir | DevAddr | FCnt (32) | 0x00 | len(msg).
+pub fn lw_data_mic(nwk_skey: & Vec<i64>, dir: i64, dev_addr: i64, fcnt: i64, msg: & Vec<i64>) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0x49);
+    lw_le(& mut b, 0, 4);
+    b.push(dir & 1);
+    lw_le(& mut b, dev_addr, 4);
+    lw_le(& mut b, fcnt, 4);
+    b.push(0);
+    b.push(msg.len() & 0xFF);
+    lw_append(& mut b, msg);
+    return lw_mic4(nwk_skey, & b);
+}
+
+/// Encode a data frame. fcnt is the full 32-bit counter (its low 16 bits
+/// go on the air); fport < 0 sends no port and no payload.
+pub fn lw_data_encode(nwk_skey: & Vec<i64>, app_skey: & Vec<i64>, fr: & LwFrame) -> Vec<i64> {
+    val dir: i64 = lw_dir_of(fr.mtype);
+    var out: Vec<i64> = Vec::new();
+    out.push(lw_mhdr(fr.mtype));
+    lw_le(& mut out, fr.dev_addr, 4);
+    var fctrl: i64 = fr.fopts.len() & 0x0F;
+    if fr.adr {
+        fctrl = fctrl | 0x80;
+    }
+    if dir == LW_DIR_UP && fr.adr_ack_req {
+        fctrl = fctrl | 0x40;
+    }
+    if fr.ack {
+        fctrl = fctrl | 0x20;
+    }
+    if dir == LW_DIR_DOWN && fr.fpending {
+        fctrl = fctrl | 0x10;
+    }
+    out.push(fctrl);
+    lw_le(& mut out, fr.fcnt & 0xFFFF, 2);
+    lw_append(& mut out, & fr.fopts);
+    if fr.fport >= 0 {
+        out.push(fr.fport & 0xFF);
+        var key: Vec<i64> = lw_slice(app_skey, 0, 16);
+        if fr.fport == 0 {
+            key = lw_slice(nwk_skey, 0, 16);
+        }
+        lw_append(& mut out, & lw_crypt_payload(& key, dir, fr.dev_addr, fr.fcnt, & fr.payload));
+    }
+    val mic: Vec<i64> = lw_data_mic(nwk_skey, dir, fr.dev_addr, fr.fcnt, & out);
+    lw_append(& mut out, & mic);
+    return out;
+}
+
+/// Decode a data frame and decrypt its payload with the full counter
+/// fcnt32 (from lw_fcnt_extend). mic_ok tells whether the MIC matched.
+pub fn lw_data_decode(nwk_skey: & Vec<i64>, app_skey: & Vec<i64>, f: & Vec<i64>, fcnt32: i64) -> LwFrame {
+    var fr: LwFrame = lw_frame(0, 0, 0, 0 - 1, Vec::new());
+    fr.ok = false;
+    if f.len() < 12 {
+        return fr;
+    }
+    fr.mtype = lw_mtype(f);
+    if fr.mtype < LW_UNCONFIRMED_UP || fr.mtype > LW_CONFIRMED_DOWN {
+        return fr;
+    }
+    val dir: i64 = lw_dir_of(fr.mtype);
+    fr.dev_addr = lw_get_le(f, 1, 4);
+    val fctrl: i64 = f.get(5);
+    fr.adr = (fctrl & 0x80) != 0;
+    fr.adr_ack_req = dir == LW_DIR_UP && (fctrl & 0x40) != 0;
+    fr.ack = (fctrl & 0x20) != 0;
+    fr.fpending = dir == LW_DIR_DOWN && (fctrl & 0x10) != 0;
+    val folen: i64 = fctrl & 0x0F;
+    if 8 + folen + 4 > f.len() {
+        return fr;
+    }
+    fr.fcnt = fcnt32;
+    if (fcnt32 & 0xFFFF) != lw_get_le(f, 6, 2) {
+        fr.fcnt = lw_get_le(f, 6, 2);
+    }
+    fr.fopts = lw_slice(f, 8, 8 + folen);
+    val n: i64 = f.len();
+    fr.mic_ok = lw_eq(& lw_data_mic(nwk_skey, dir, fr.dev_addr, fr.fcnt, & lw_slice(f, 0, n - 4)), & lw_slice(f, n - 4, n));
+    var p: i64 = 8 + folen;
+    if p < n - 4 {
+        fr.fport = f.get(p);
+        var key: Vec<i64> = lw_slice(app_skey, 0, 16);
+        if fr.fport == 0 {
+            key = lw_slice(nwk_skey, 0, 16);
+        }
+        fr.payload = lw_crypt_payload(& key, dir, fr.dev_addr, fr.fcnt, & lw_slice(f, p + 1, n - 4));
+    }
+    fr.ok = true;
+    return fr;
+}
+
+/// The 32-bit counter a received 16-bit FCnt stands for, given the last
+/// accepted one (-1 before any): the smallest value above `last` with
+/// those low bits. -1 when it is a replay or beyond MAX_FCNT_GAP.
+pub fn lw_fcnt_extend(last: i64, fcnt16: i64) -> i64 {
+    val lo: i64 = fcnt16 & 0xFFFF;
+    if last < 0 {
+        return lo;
+    }
+    var c: i64 = (last & 0xFFFF0000) | lo;
+    if c <= last {
+        c = c + 0x10000;
+    }
+    if c - last > LW_MAX_FCNT_GAP {
+        return 0 - 1;
+    }
+    return c;
+}
+
+// ─── MAC commands ───────────────────────────────────────────────────────
+
+pub const LW_CID_LINK_CHECK: i64 = 0x02;
+pub const LW_CID_LINK_ADR: i64 = 0x03;
+pub const LW_CID_DUTY_CYCLE: i64 = 0x04;
+pub const LW_CID_RX_PARAM_SETUP: i64 = 0x05;
+pub const LW_CID_DEV_STATUS: i64 = 0x06;
+pub const LW_CID_NEW_CHANNEL: i64 = 0x07;
+pub const LW_CID_RX_TIMING_SETUP: i64 = 0x08;
+pub const LW_CID_TX_PARAM_SETUP: i64 = 0x09;
+pub const LW_CID_DL_CHANNEL: i64 = 0x0A;
+pub const LW_CID_DEVICE_TIME: i64 = 0x0D;
+
+/// Payload length of a MAC command in a direction (-1: unknown CID).
+pub fn lw_mac_len(cid: i64, dir: i64) -> i64 {
+    if dir == LW_DIR_DOWN {
+        if cid == LW_CID_LINK_CHECK {
+            return 2;
+        }
+        if cid == LW_CID_LINK_ADR {
+            return 4;
+        }
+        if cid == LW_CID_DUTY_CYCLE {
+            return 1;
+        }
+        if cid == LW_CID_RX_PARAM_SETUP {
+            return 4;
+        }
+        if cid == LW_CID_DEV_STATUS {
+            return 0;
+        }
+        if cid == LW_CID_NEW_CHANNEL {
+            return 5;
+        }
+        if cid == LW_CID_RX_TIMING_SETUP || cid == LW_CID_TX_PARAM_SETUP {
+            return 1;
+        }
+        if cid == LW_CID_DL_CHANNEL {
+            return 4;
+        }
+        if cid == LW_CID_DEVICE_TIME {
+            return 5;
+        }
+        return 0 - 1;
+    }
+    if cid == LW_CID_LINK_CHECK || cid == LW_CID_DUTY_CYCLE || cid == LW_CID_RX_TIMING_SETUP || cid == LW_CID_TX_PARAM_SETUP || cid == LW_CID_DEVICE_TIME {
+        return 0;
+    }
+    if cid == LW_CID_LINK_ADR || cid == LW_CID_RX_PARAM_SETUP || cid == LW_CID_NEW_CHANNEL || cid == LW_CID_DL_CHANNEL {
+        return 1;
+    }
+    if cid == LW_CID_DEV_STATUS {
+        return 2;
+    }
+    return 0 - 1;
+}
+
+pub struct LwMacCmd {
+    pub cid: i64,
+    pub args: Vec<i64>,
+}
+
+/// Split FOpts (or a port-0 payload) into commands; stops at an unknown
+/// CID (the rest cannot be parsed, as the spec says).
+pub fn lw_mac_parse(b: & Vec<i64>, dir: i64) -> Vec<LwMacCmd> {
+    var out: Vec<LwMacCmd> = Vec::new();
+    var p: i64 = 0;
+    while p < b.len() {
+        val cid: i64 = b.get(p);
+        val n: i64 = lw_mac_len(cid, dir);
+        if n < 0 || p + 1 + n > b.len() {
+            break;
+        }
+        out.push(LwMacCmd { cid: cid, args: lw_slice(b, p + 1, p + 1 + n) });
+        p = p + 1 + n;
+    }
+    return out;
+}
+
+pub fn lw_mac_encode(cmds: & Vec<LwMacCmd>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cmds.len() {
+        val c: LwMacCmd = cmds.get(i);
+        out.push(c.cid);
+        lw_append(& mut out, & c.args);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// LinkADRReq: data rate, TX power index, channel mask, ChMaskCntl, NbTrans.
+pub fn lw_link_adr_req(dr: i64, txpow: i64, ch_mask: i64, ch_mask_cntl: i64, nb_trans: i64) -> LwMacCmd {
+    var a: Vec<i64> = Vec::new();
+    a.push(((dr & 0x0F) << 4) | (txpow & 0x0F));
+    lw_le(& mut a, ch_mask, 2);
+    a.push(((ch_mask_cntl & 7) << 4) | (nb_trans & 0x0F));
+    return LwMacCmd { cid: LW_CID_LINK_ADR, args: a };
+}
+
+/// The device's LinkADRAns status bits: power ACK (bit 2), data rate ACK
+/// (bit 1), channel mask ACK (bit 0).
+pub fn lw_link_adr_ans(power_ok: bool, dr_ok: bool, mask_ok: bool) -> LwMacCmd {
+    var s: i64 = 0;
+    if power_ok {
+        s = s | 4;
+    }
+    if dr_ok {
+        s = s | 2;
+    }
+    if mask_ok {
+        s = s | 1;
+    }
+    var a: Vec<i64> = Vec::new();
+    a.push(s);
+    return LwMacCmd { cid: LW_CID_LINK_ADR, args: a };
+}
+
+// ─── ADR ────────────────────────────────────────────────────────────────
+
+/// EU868 data rate -> spreading factor (7..12), 0 for FSK (DR7).
+pub fn lw_eu868_sf(dr: i64) -> i64 {
+    if dr >= 0 && dr <= 5 {
+        return 12 - dr;
+    }
+    if dr == 6 {
+        return 7;
+    }
+    return 0;
+}
+
+pub fn lw_eu868_bw_khz(dr: i64) -> i64 {
+    if dr == 6 {
+        return 250;
+    }
+    return 125;
+}
+
+/// EU868 maximum MACPayload size M (bytes) per data rate (repeater-
+/// compatible N + 8 is the FRMPayload limit plus the FHDR/FPort).
+pub fn lw_eu868_max_payload(dr: i64) -> i64 {
+    if dr <= 2 {
+        return 59;
+    }
+    if dr == 3 {
+        return 123;
+    }
+    return 250;
+}
+
+/// The SNR (0.1 dB) a LoRa spreading factor needs for demodulation.
+pub fn lw_required_snr10(sf: i64) -> i64 {
+    return 0 - (75 + 25 * (sf - 7));
+}
+
+/// Network-side ADR step (Semtech's reference algorithm): from the best
+/// SNR (0.1 dB) of recent uplinks at data rate dr and TX power index, the
+/// new [dr, txpower index]. Each 3 dB of margin above required + margin
+/// raises the data rate (up to max_dr), then lowers power (raises the
+/// index up to max_tx_index); a negative margin raises power.
+pub fn lw_adr_network(snr_max10: i64, dr: i64, txpow: i64, margin10: i64, max_dr: i64, max_tx_index: i64) -> Vec<i64> {
+    val snr_margin: i64 = snr_max10 - lw_required_snr10(lw_eu868_sf(dr)) - margin10;
+    var nstep: i64 = 0;
+    if snr_margin >= 0 {
+        nstep = snr_margin / 30;
+    } else {
+        nstep = 0 - ((0 - snr_margin + 29) / 30);
+    }
+    var d: i64 = dr;
+    var p: i64 = txpow;
+    while nstep > 0 && d < max_dr {
+        d = d + 1;
+        nstep = nstep - 1;
+    }
+    while nstep > 0 && p < max_tx_index {
+        p = p + 1;
+        nstep = nstep - 1;
+    }
+    while nstep < 0 && p > 0 {
+        p = p - 1;
+        nstep = nstep + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(d);
+    out.push(p);
+    return out;
+}
+
+/// Device-side ADR backoff state.
+pub struct LwAdrDevice {
+    pub ack_cnt: i64,
+    pub dr: i64,
+    pub txpow: i64,
+}
+
+/// Count an uplink without any downlink; returns whether this uplink
+/// sets ADRACKReq. After ADR_ACK_LIMIT + ADR_ACK_DELAY uplinks without an
+/// answer the device first goes back to full power, then lowers the data
+/// rate one step per ADR_ACK_DELAY.
+pub fn lw_adr_uplink(a: & mut LwAdrDevice) -> bool {
+    a.ack_cnt = a.ack_cnt + 1;
+    if a.ack_cnt >= LW_ADR_ACK_LIMIT + LW_ADR_ACK_DELAY && (a.ack_cnt - LW_ADR_ACK_LIMIT) % LW_ADR_ACK_DELAY == 0 {
+        if a.txpow > 0 {
+            a.txpow = 0;
+        } else if a.dr > 0 {
+            a.dr = a.dr - 1;
+        }
+    }
+    return a.ack_cnt >= LW_ADR_ACK_LIMIT;
+}
+
+/// Any downlink resets the counter.
+pub fn lw_adr_downlink(a: & mut LwAdrDevice) {
+    a.ack_cnt = 0;
+}
+
+/// LoRa time on air in microseconds (Semtech AN1200.13): payload bytes,
+/// spreading factor, bandwidth in kHz, coding rate 1..4 (4/5..4/8),
+/// preamble symbols, explicit header, CRC on; low data rate optimization
+/// when the symbol lasts 16 ms or more.
+pub fn lw_time_on_air_us(pl: i64, sf: i64, bw_khz: i64, cr: i64, preamble: i64, explicit_header: bool, crc: bool) -> i64 {
+    // symbol time in ns: 2^sf / bw
+    val tsym_ns: i64 = ((1 << sf) * 1000000) / bw_khz;
+    var de: i64 = 0;
+    if tsym_ns >= 16000000 {
+        de = 1;
+    }
+    var ih: i64 = 1;
+    if explicit_header {
+        ih = 0;
+    }
+    var crc_bits: i64 = 0;
+    if crc {
+        crc_bits = 16;
+    }
+    val num: i64 = 8 * pl - 4 * sf + 28 + crc_bits - 20 * ih;
+    val den: i64 = 4 * (sf - 2 * de);
+    var nsym: i64 = 0;
+    if num > 0 {
+        nsym = ((num + den - 1) / den) * (cr + 4);
+    }
+    val payload_syms: i64 = 8 + nsym;
+    // preamble: (n + 4.25) symbols
+    val total_ns: i64 = (preamble * 4 + 17) * tsym_ns / 4 + payload_syms * tsym_ns;
+    return total_ns / 1000;
+}

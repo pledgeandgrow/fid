@@ -1,0 +1,166 @@
+// stdlib/syscall_abi: Linux syscall numbers and registers on three architectures, dispatch with user-pointer validation, errno mapping.
+// Expected output:
+// x86 write=1 openat=257 exit_group=231 getrandom=318 open=2
+// a64 write=64 openat=56 exit_group=94 getrandom=278 open=-1
+// rv write=64 openat=56 exit_group=94 getrandom=278 open=-1
+// x86 regs rax: rdi rsi rdx r10 r8 r9 -> rax (rcx, r11 clobbered) trap 0f05
+// a64 regs x8: x0 x1 x2 x3 x4 x5 -> x0 trap 010000d4
+// rv regs a7: a0 a1 a2 a3 a4 a5 -> a0 trap 73000000
+// x86 write -> 5
+// a64 write -> 5
+// rv write -> 5
+// out: hellohellohello
+// x86 getpid 42 openat 3 name openat
+// a64 nr 1024 -> -38 ENOSYS
+// bad buffer -14 EFAULT
+// read into read-only -14
+// bad fd -9 EBADF
+// across end -14, across adjacent regions 16
+// unterminated path -14, missing file -2 No such file or directory
+// clock_gettime 0 sec 5 nsec 250
+// nanosleep rem NULL 0, req NULL -14
+// errno EINVAL=22 name(110)=ETIMEDOUT libc(-2)=-1 errno 2 libc(7)=7 is_error(-4096)=false
+// calls 16 rejected 7
+use syscall_abi;
+use vec;
+use string;
+use encoding;
+
+// (one UserSpace in a Vec: fid run gives a global struct one slot only)
+var g_usv: Vec<UserSpace> = Vec::new();
+var g_out: str = "";
+
+fn us() -> UserSpace {
+    return g_usv.get(0);
+}
+
+fn le(v: i64, n: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        b.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn rd_le(b: Vec<i64>, o: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = n - 1;
+    while i >= 0 {
+        v = v * 256 + b.get(o + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+fn kern(name: str, a: Vec<i64>) -> i64 {
+    if name == "write" {
+        g_out = g_out + str_from_bytes(uaccess_read(&us(), a.get(1), a.get(2)));
+        return a.get(2);
+    }
+    if name == "read" { return 0; }
+    if name == "getpid" { return 42; }
+    if name == "nanosleep" { return 0; }
+    if name == "openat" {
+        val path: str = uaccess_str(&us(), a.get(1));
+        if path == "/etc/hosts" { return 3; }
+        return 0 - ENOENT;
+    }
+    if name == "clock_gettime" {
+        var ts: Vec<i64> = le(5, 8);
+        ts.extend(le(250, 8));
+        var u: UserSpace = us();
+        if !uaccess_write(&mut u, a.get(1), ts) { return 0 - EFAULT; }
+        g_usv.set(0, u);
+        return 0;
+    }
+    return 0 - ENOSYS;
+}
+
+fn args3(a: i64, b: i64, c: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    return v;
+}
+
+fn call(t: &mut SyscallTable, name: str, a: Vec<i64>) -> i64 {
+    var regs: Vec<i64> = sys_load_regs(t.arch, syscall_nr(t, name), a);
+    syscall_trap(t, &us(), &mut regs, kern);
+    return regs.get(sys_ret_reg(t.arch));
+}
+
+fn nums(label: str, t: &SyscallTable) {
+    println(label + " write=" + int_to_str(syscall_nr(t, "write")) + " openat=" + int_to_str(syscall_nr(t, "openat")) + " exit_group=" + int_to_str(syscall_nr(t, "exit_group")) + " getrandom=" + int_to_str(syscall_nr(t, "getrandom")) + " open=" + int_to_str(syscall_nr(t, "open")));
+}
+
+fn main() {
+    var us0: UserSpace = userspace_new();
+    userspace_map(&mut us0, 0x10000, 64, UPROT_READ | UPROT_WRITE);
+    userspace_map(&mut us0, 0x20000, 32, UPROT_READ);
+    userspace_load(&mut us0, 0x10000, str_bytes("hello"));
+    var path: Vec<i64> = str_bytes("/etc/hosts");
+    path.push(0);
+    userspace_load(&mut us0, 0x20000, path);
+    userspace_load(&mut us0, 0x2001D, str_bytes("abc"));
+    var nope: Vec<i64> = str_bytes("/nope");
+    nope.push(0);
+    userspace_load(&mut us0, 0x20010, nope);
+
+    g_usv.push(us0);
+    var tx: SyscallTable = syscall_table_linux(ABI_X86_64);
+    var ta: SyscallTable = syscall_table_linux(ABI_AARCH64);
+    var tr: SyscallTable = syscall_table_linux(ABI_RISCV64);
+    nums("x86", &tx);
+    nums("a64", &ta);
+    nums("rv", &tr);
+    println("x86 regs " + sys_reg_names(ABI_X86_64) + " trap " + hex_encode_bytes(sys_trap_bytes(ABI_X86_64)));
+    println("a64 regs " + sys_reg_names(ABI_AARCH64) + " trap " + hex_encode_bytes(sys_trap_bytes(ABI_AARCH64)));
+    println("rv regs " + sys_reg_names(ABI_RISCV64) + " trap " + hex_encode_bytes(sys_trap_bytes(ABI_RISCV64)));
+    println("x86 write -> " + int_to_str(call(&mut tx, "write", args3(1, 0x10000, 5))));
+    println("a64 write -> " + int_to_str(call(&mut ta, "write", args3(1, 0x10000, 5))));
+    println("rv write -> " + int_to_str(call(&mut tr, "write", args3(1, 0x10000, 5))));
+    println("out: " + g_out);
+    var oa: Vec<i64> = args3(-100, 0x20000, 0);
+    oa.push(0);
+    val fd: i64 = call(&mut tx, "openat", oa);
+    println("x86 getpid " + int_to_str(call(&mut tx, "getpid", Vec::new())) + " openat " + int_to_str(fd) + " name " + syscall_name(&tx, 257));
+    var regs: Vec<i64> = sys_load_regs(ABI_AARCH64, 1024, Vec::new());
+    val r: i64 = syscall_trap(&mut ta, &us(), &mut regs, kern);
+    println("a64 nr 1024 -> " + int_to_str(regs.get(0)) + " " + errno_name(sys_errno(r)));
+    val b1: i64 = call(&mut tx, "write", args3(1, 0x30000, 5));
+    println("bad buffer " + int_to_str(b1) + " " + errno_name(sys_errno(b1)));
+    println("read into read-only " + int_to_str(call(&mut tx, "read", args3(0, 0x20000, 4))));
+    val b3: i64 = call(&mut tx, "write", args3(-1, 0x10000, 5));
+    println("bad fd " + int_to_str(b3) + " " + errno_name(sys_errno(b3)));
+    val b4: i64 = call(&mut tx, "write", args3(1, 0x10000 + 60, 8));
+    var u2: UserSpace = us();
+    userspace_map(&mut u2, 0x10040, 64, UPROT_READ | UPROT_WRITE);
+    g_usv.set(0, u2);
+    val b5: i64 = call(&mut tx, "write", args3(1, 0x10000 + 56, 16));
+    println("across end " + int_to_str(b4) + ", across adjacent regions " + int_to_str(b5));
+    var ua: Vec<i64> = args3(-100, 0x2001D, 0);
+    ua.push(0);
+    var na: Vec<i64> = args3(-100, 0x20010, 0);
+    na.push(0);
+    val b6: i64 = call(&mut tr, "openat", ua);
+    val b7: i64 = call(&mut tr, "openat", na);
+    println("unterminated path " + int_to_str(b6) + ", missing file " + int_to_str(b7) + " " + errno_message(sys_errno(b7)));
+    var ca: Vec<i64> = Vec::new();
+    ca.push(1);
+    ca.push(0x10020);
+    val c0: i64 = call(&mut ta, "clock_gettime", ca);
+    val ts: Vec<i64> = uaccess_read(&us(), 0x10020, 16);
+    println("clock_gettime " + int_to_str(c0) + " sec " + int_to_str(rd_le(ts, 0, 8)) + " nsec " + int_to_str(rd_le(ts, 8, 8)));
+    var ns: Vec<i64> = Vec::new();
+    ns.push(0x10020);
+    ns.push(0);
+    var ns2: Vec<i64> = Vec::new();
+    ns2.push(0);
+    ns2.push(0x10020);
+    println("nanosleep rem NULL " + int_to_str(call(&mut tx, "nanosleep", ns)) + ", req NULL " + int_to_str(call(&mut tx, "nanosleep", ns2)));
+    println("errno EINVAL=" + int_to_str(errno_from_name("EINVAL")) + " name(110)=" + errno_name(110) + " libc(-2)=" + int_to_str(sys_libc_return(-2)) + " errno " + int_to_str(sys_errno(-2)) + " libc(7)=" + int_to_str(sys_libc_return(7)) + " is_error(-4096)=" + bool_to_str(sys_is_error(-4096)));
+    println("calls " + int_to_str(tx.calls + ta.calls + tr.calls) + " rejected " + int_to_str(tx.rejected + ta.rejected + tr.rejected));
+}

@@ -1,0 +1,49 @@
+// stdlib/unix_socket.fd: a UnixListener and a UnixStream echo a message
+// in one process (the client's connect completes from the listen
+// backlog before accept). Needs the runtime builtins p_unix_listen and
+// p_unix_connect (see the module's header); Windows 10 1803 or newer.
+//
+// Expected output:
+// bound
+// connected
+// server got: ping over AF_UNIX
+// client got: echo: ping over AF_UNIX
+// closed
+use unix_socket;
+
+fn main() -> i64 {
+    val path: str = "fid_test_unix.sock";
+    val lo: Option<UnixListener> = UnixListener::bind(path);
+    match lo {
+        Option::Some(l) => {
+            var lis: UnixListener = l;
+            println("bound");
+            val co: Option<UnixStream> = UnixStream::connect(path);
+            match co {
+                Option::Some(c) => {
+                    var cli: UnixStream = c;
+                    println("connected");
+                    cli.write_str("ping over AF_UNIX");
+                    val so: Option<UnixStream> = lis.accept();
+                    match so {
+                        Option::Some(s) => {
+                            var srv: UnixStream = s;
+                            val got: str = srv.read_str();
+                            println("server got: " + got);
+                            srv.write_str("echo: " + got);
+                            println("client got: " + cli.read_str());
+                            srv.close();
+                        }
+                        Option::None => { println("accept failed"); }
+                    }
+                    cli.close();
+                }
+                Option::None => { println("connect failed"); }
+            }
+            lis.close();
+            println("closed");
+        }
+        Option::None => { println("bind failed"); }
+    }
+    return 0;
+}

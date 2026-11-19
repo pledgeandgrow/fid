@@ -1,0 +1,114 @@
+// stdlib/audit_log: the first record's hash equals BLAKE3 of the
+// documented encoding built by hand; a five-record chain verifies, also
+// after a text round trip (with "|", "%" and a newline inside fields); and
+// verification reports a changed field, a removed record, two swapped
+// records, a truncated tail (against the anchored head), a forged record
+// whose hash was recomputed without the key, and a damaged line.
+// Expected output:
+// genesis matches true
+// chain ok true records 5
+// line 2|1700000120|
+// text round trip ok true same head true data a|b%c
+// changed false at 2 record contents changed
+// removed false at 2 sequence gap: record removed or reordered
+// swapped false at 1 sequence gap: record removed or reordered
+// truncated plain verify true anchored false record count differs from the anchor
+// keyed ok true wrong key false at 0 forged false at 3
+// damaged line false at 1
+use audit_log;
+use blake3;
+use vec;
+use encoding;
+
+fn le64(v: & mut Vec<i64>, x: i64) {
+    var i: i64 = 0;
+    while i < 8 { v.push((x >> (i * 8)) & 255); i = i + 1; }
+}
+
+fn field(v: & mut Vec<i64>, s: str) {
+    val b: Vec<i64> = str_bytes(s);
+    le64(v, b.len());
+    var i: i64 = 0;
+    while i < b.len() { v.push(b.get(i)); i = i + 1; }
+}
+
+fn show(name: str, c: AuditCheck) {
+    println(name + " " + bool_to_str(c.ok) + " at " + int_to_str(c.index) + " " + c.reason);
+}
+
+fn build(key: Vec<i64>) -> AuditLog {
+    var log: AuditLog = audit_new(key);
+    audit_append(& mut log, 1700000000, "alice", "login", "ip=10.0.0.1");
+    audit_append(& mut log, 1700000060, "alice", "read", "file=/etc/hosts");
+    audit_append(& mut log, 1700000120, "bob", "grant", "role=admin|scope=all");
+    audit_append(& mut log, 1700000180, "root", "config", "limit=50%\nretries=3");
+    audit_append(& mut log, 1700000240, "alice", "logout", "a|b%c");
+    return log;
+}
+
+fn main() {
+    val log: AuditLog = build(Vec::new());
+    var m: Vec<i64> = str_bytes("fides-audit-v1");
+    le64(& mut m, 0);
+    le64(& mut m, 1700000000);
+    field(& mut m, "alice");
+    field(& mut m, "login");
+    field(& mut m, "ip=10.0.0.1");
+    var z: i64 = 0;
+    while z < 32 { m.push(0); z = z + 1; }
+    println("genesis matches " + bool_to_str(str_equal(hex_encode_bytes(blake3_bytes(m)), hex_encode_bytes(log.records.get(0).hash))));
+    val c: AuditCheck = audit_verify(& log);
+    println("chain ok " + bool_to_str(c.ok) + " records " + int_to_str(log.records.len()));
+    val l2: str = audit_record_line(log.records.get(2));
+    println("line " + str_slice(l2, 0, 13));
+    val text: str = audit_to_text(& log);
+    val back: AuditLog = audit_from_text(text, Vec::new());
+    val cb: AuditCheck = audit_verify(& back);
+    println("text round trip ok " + bool_to_str(cb.ok) + " same head " + bool_to_str(str_equal(hex_encode_bytes(audit_head(& back)), hex_encode_bytes(audit_head(& log)))) + " data " + back.records.get(4).data);
+
+    var changed: AuditLog = back;
+    var r2: AuditRecord = changed.records.get(2);
+    r2.data = "role=user|scope=all";
+    changed.records.set(2, r2);
+    show("changed", audit_verify(& changed));
+    var removed: AuditLog = audit_new(Vec::new());
+    var i: i64 = 0;
+    while i < 5 {
+        if i != 2 { removed.records.push(log.records.get(i)); }
+        i = i + 1;
+    }
+    show("removed", audit_verify(& removed));
+    var swapped: AuditLog = audit_new(Vec::new());
+    swapped.records.push(log.records.get(0));
+    swapped.records.push(log.records.get(2));
+    swapped.records.push(log.records.get(1));
+    show("swapped", audit_verify(& swapped));
+    val anchor: Vec<i64> = audit_head(& log);
+    var trunc: AuditLog = audit_new(Vec::new());
+    i = 0;
+    while i < 4 { trunc.records.push(log.records.get(i)); i = i + 1; }
+    val ta: AuditCheck = audit_verify_anchored(& trunc, anchor, 5);
+    println("truncated plain verify " + bool_to_str(audit_verify(& trunc).ok) + " anchored " + bool_to_str(ta.ok) + " " + ta.reason);
+
+    var key: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 { key.push(i * 3 + 1); i = i + 1; }
+    val keyed: AuditLog = build(key);
+    val kt: str = audit_to_text(& keyed);
+    var other: Vec<i64> = key;
+    other.set(0, 99);
+    val wrong: AuditCheck = audit_verify(& audit_from_text(kt, other));
+    // An attacker without the key changes record 3 and recomputes the
+    // chain with plain BLAKE3: the keyed check still fails there.
+    var forged: AuditLog = audit_from_text(kt, key);
+    var r3: AuditRecord = forged.records.get(3);
+    r3.data = "limit=99%";
+    r3.hash = audit_record_hash(& Vec::new(), r3.seq, r3.time, r3.actor, r3.action, r3.data, & r3.prev);
+    forged.records.set(3, r3);
+    val fc: AuditCheck = audit_verify(& forged);
+    println("keyed ok " + bool_to_str(audit_verify(& audit_from_text(kt, key)).ok) + " wrong key " + bool_to_str(wrong.ok) + " at " + int_to_str(wrong.index) + " forged " + bool_to_str(fc.ok) + " at " + int_to_str(fc.index));
+    val lines: Vec<str> = str_lines(text);
+    val damaged: str = lines.get(0) + "\n" + "1|garbage\n" + lines.get(2) + "\n";
+    val dc: AuditCheck = audit_verify(& audit_from_text(damaged, Vec::new()));
+    println("damaged line " + bool_to_str(dc.ok) + " at " + int_to_str(dc.index));
+}

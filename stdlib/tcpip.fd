@@ -1,0 +1,1449 @@
+// A small TCP/IP stack independent of any OS: Ethernet, ARP, IPv4 with
+// fragmentation and reassembly, ICMP echo and port-unreachable, UDP
+// sockets and TCP connections.
+//
+// What is real:
+//   - RFC 1071 Internet checksum, pseudo-header checksums for UDP/TCP.
+//   - Ethernet II framing; ARP (RFC 826) requests, replies, a cache with
+//     timeouts, retries, and packets queued until their next hop resolves.
+//   - IPv4 (RFC 791): header build/parse and checksum, routing to the
+//     subnet or the gateway, fragmentation to the MTU (8-byte units),
+//     reassembly (fragments in any order, overlap-safe, 30 s timeout).
+//   - ICMP echo request/reply (ping) and destination unreachable (port).
+//   - UDP (RFC 768) sockets: bind, sendto, receive queue.
+//   - TCP (RFC 9293): three-way handshake (active and passive, listen +
+//     accept), MSS option, sequence arithmetic mod 2^32, sliding window
+//     flow control with window updates, segmentation, cumulative ACKs,
+//     out-of-order queue and reassembly, retransmission timer with RFC
+//     6298 RTT estimation, Karn's rule and exponential backoff, slow
+//     start (cwnd), FIN handshake in every order (FIN_WAIT_1/2, CLOSING,
+//     CLOSE_WAIT, LAST_ACK, TIME_WAIT with 2*MSL), RST on closed ports,
+//     RST handling (refused / reset), abort.
+// Not done: TCP options other than MSS (no window scaling, SACK or
+// timestamps), fast retransmit, delayed ACKs, urgent data, IP options,
+// IPv6.
+//
+// The seams: the network interface and the clock. Frames to send are
+// appended to s.tx (net_take_tx drains them); received frames are handed
+// to net_input(s, frame). Time is explicit: net_tick(s, now_ms) runs the
+// ARP, reassembly and TCP timers. A driver (e.g. stdlib e1000) moves the
+// frames; tests connect two stacks through an in-memory link.
+module tcpip;
+ use vec;
+
+// ─── Bytes and checksums ────────────────────────────────────────────────
+
+pub fn net_be16(b: Vec<i64>, o: i64) -> i64 {
+    return b.get(o) * 256 + b.get(o + 1);
+}
+
+pub fn net_be32(b: Vec<i64>, o: i64) -> i64 {
+    return net_be16(b, o) * 65536 + net_be16(b, o + 2);
+}
+
+pub fn net_put16(b: & mut Vec<i64>, v: i64) {
+    b.push((v >> 8) & 255);
+    b.push(v & 255);
+}
+
+pub fn net_put32(b: & mut Vec<i64>, v: i64) {
+    net_put16(b, (v >> 16) & 0xFFFF);
+    net_put16(b, v & 0xFFFF);
+}
+
+fn net_set16(b: & mut Vec<i64>, o: i64, v: i64) {
+    b.set(o, (v >> 8) & 255);
+    b.set(o + 1, v & 255);
+}
+
+pub fn net_slice(b: Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to && i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn net_append(a: & mut Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        a.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+/// Ones' complement sum of b[o .. o+n) folded to 16 bits, starting
+/// from `init` (not complemented).
+pub fn net_sum(b: Vec<i64>, o: i64, n: i64, init: i64) -> i64 {
+    var s: i64 = init;
+    var i: i64 = 0;
+    while i + 1 < n {
+        s = s + b.get(o + i) * 256 + b.get(o + i + 1);
+        i = i + 2;
+    }
+    if i < n {
+        s = s + b.get(o + i) * 256;
+    }
+    while s > 0xFFFF {
+        s = (s & 0xFFFF) + (s >> 16);
+    }
+    return s;
+}
+
+/// RFC 1071 Internet checksum of b[o .. o+n).
+pub fn net_checksum(b: Vec<i64>, o: i64, n: i64) -> i64 {
+    return (~net_sum(b, o, n, 0)) & 0xFFFF;
+}
+
+fn net_pseudo(src: i64, dst: i64, proto: i64, len: i64) -> i64 {
+    var s: i64 = (src >> 16) + (src & 0xFFFF) + (dst >> 16) + (dst & 0xFFFF) + proto + len;
+    while s > 0xFFFF {
+        s = (s & 0xFFFF) + (s >> 16);
+    }
+    return s;
+}
+
+/// UDP/TCP checksum with the IPv4 pseudo-header.
+pub fn net_l4_checksum(src: i64, dst: i64, proto: i64, seg: Vec<i64>) -> i64 {
+    return (~net_sum(seg, 0, seg.len(), net_pseudo(src, dst, proto, seg.len()))) & 0xFFFF;
+}
+
+pub fn ip4(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    return (a << 24) | (b << 16) | (c << 8) | d;
+}
+
+pub fn ip_str(ip: i64) -> str {
+    return int_to_str((ip >> 24) & 255) + "." + int_to_str((ip >> 16) & 255) + "." + int_to_str((ip >> 8) & 255) + "." + int_to_str(ip & 255);
+}
+
+// ─── Sequence numbers ───────────────────────────────────────────────────
+
+pub fn seq_add(a: i64, n: i64) -> i64 {
+    return (a + n) & 0xFFFFFFFF;
+}
+
+/// a - b as a signed 32-bit distance.
+pub fn seq_diff(a: i64, b: i64) -> i64 {
+    var d: i64 = (a - b) & 0xFFFFFFFF;
+    if d >= 0x80000000 {
+        return d - 0x100000000;
+    }
+    return d;
+}
+
+pub fn seq_lt(a: i64, b: i64) -> bool {
+    return seq_diff(a, b) < 0;
+}
+
+pub fn seq_le(a: i64, b: i64) -> bool {
+    return seq_diff(a, b) <= 0;
+}
+
+// ─── Constants ──────────────────────────────────────────────────────────
+
+pub const ETH_IPV4: i64 = 0x0800;
+pub const ETH_ARP: i64 = 0x0806;
+pub const IP_ICMP: i64 = 1;
+pub const IP_TCP: i64 = 6;
+pub const IP_UDP: i64 = 17;
+
+pub const TCP_FIN: i64 = 0x01;
+pub const TCP_SYN: i64 = 0x02;
+pub const TCP_RST: i64 = 0x04;
+pub const TCP_PSH: i64 = 0x08;
+pub const TCP_ACK: i64 = 0x10;
+
+pub const TCP_CLOSED: i64 = 0;
+pub const TCP_LISTEN: i64 = 1;
+pub const TCP_SYN_SENT: i64 = 2;
+pub const TCP_SYN_RCVD: i64 = 3;
+pub const TCP_ESTABLISHED: i64 = 4;
+pub const TCP_FIN_WAIT_1: i64 = 5;
+pub const TCP_FIN_WAIT_2: i64 = 6;
+pub const TCP_CLOSE_WAIT: i64 = 7;
+pub const TCP_CLOSING: i64 = 8;
+pub const TCP_LAST_ACK: i64 = 9;
+pub const TCP_TIME_WAIT: i64 = 10;
+
+pub fn tcp_state_name(st: i64) -> str {
+    if st == TCP_CLOSED { return "CLOSED"; }
+    if st == TCP_LISTEN { return "LISTEN"; }
+    if st == TCP_SYN_SENT { return "SYN_SENT"; }
+    if st == TCP_SYN_RCVD { return "SYN_RCVD"; }
+    if st == TCP_ESTABLISHED { return "ESTABLISHED"; }
+    if st == TCP_FIN_WAIT_1 { return "FIN_WAIT_1"; }
+    if st == TCP_FIN_WAIT_2 { return "FIN_WAIT_2"; }
+    if st == TCP_CLOSE_WAIT { return "CLOSE_WAIT"; }
+    if st == TCP_CLOSING { return "CLOSING"; }
+    if st == TCP_LAST_ACK { return "LAST_ACK"; }
+    return "TIME_WAIT";
+}
+
+// ─── State ──────────────────────────────────────────────────────────────
+
+pub struct ArpEntry {
+    pub ip: i64,
+    pub mac: Vec<i64>,
+    pub resolved: bool,
+    pub expires: i64,
+    pub asked_at: i64,
+    pub tries: i64,
+}
+
+pub struct PendingPkt {
+    pub hop: i64,
+    pub packet: Vec<i64>,
+}
+
+pub struct UdpSock {
+    pub port: i64,
+    pub q_src: Vec<i64>,
+    pub q_sport: Vec<i64>,
+    pub q_data: Vec<Vec<i64>>,
+}
+
+pub struct UdpDatagram {
+    pub ok: bool,
+    pub src: i64,
+    pub sport: i64,
+    pub data: Vec<i64>,
+}
+
+pub struct FragBuf {
+    pub src: i64,
+    pub dst: i64,
+    pub id: i64,
+    pub proto: i64,
+    pub offs: Vec<i64>,
+    pub datas: Vec<Vec<i64>>,
+    pub total: i64,
+    // payload length once the last fragment arrived, -1 before
+    pub deadline: i64,
+}
+
+pub struct TcpConn {
+    pub state: i64,
+    pub lport: i64,
+    pub rport: i64,
+    pub rip: i64,
+    pub listener: i64,
+    // local port it was accepted on, -1 for active opens
+    pub accepted: bool,
+    pub iss: i64,
+    pub irs: i64,
+    pub snd_una: i64,
+    pub snd_nxt: i64,
+    pub snd_wnd: i64,
+    pub snd_wl1: i64,
+    pub snd_wl2: i64,
+    pub rcv_nxt: i64,
+    pub rcv_cap: i64,
+    pub adv_wnd: i64,
+    // window last advertised
+    pub mss: i64,
+    pub cwnd: i64,
+    pub sendbuf: Vec<i64>,
+    // bytes from snd_una on (acked bytes are removed)
+    pub app_closed: bool,
+    pub fin_seq: i64,
+    // our FIN's sequence number, -1 before it is sent
+    pub peer_fin: i64,
+    // peer FIN's sequence number once seen, -1 before
+    pub recvbuf: Vec<i64>,
+    pub ooo_seq: Vec<i64>,
+    pub ooo_data: Vec<Vec<i64>>,
+    pub rto: i64,
+    pub srtt: i64,
+    pub rttvar: i64,
+    pub rtx_at: i64,
+    // retransmission deadline, -1 when off
+    pub rtx_count: i64,
+    pub rtt_seq: i64,
+    // sequence number being timed, -1 none
+    pub rtt_start: i64,
+    pub tw_at: i64,
+    pub error: str,
+    pub retransmits: i64,
+    pub ooo_segments: i64,
+    pub dup_acks: i64,
+}
+
+pub struct NetStack {
+    pub mac: Vec<i64>,
+    pub ip: i64,
+    pub mask: i64,
+    pub gw: i64,
+    pub mtu: i64,
+    pub now: i64,
+    pub arp: Vec<ArpEntry>,
+    pub pending: Vec<PendingPkt>,
+    pub tx: Vec<Vec<i64>>,
+    pub udp: Vec<UdpSock>,
+    pub tcp: Vec<TcpConn>,
+    pub listening: Vec<i64>,
+    pub frags: Vec<FragBuf>,
+    pub ip_id: i64,
+    pub isn_seed: i64,
+    pub conns_made: i64,
+    pub ping_ids: Vec<i64>,
+    pub ping_from: Vec<i64>,
+    pub ping_rtt: Vec<i64>,
+    pub ping_sent_at: Vec<i64>,
+    pub unreachable: Vec<i64>,
+    // ports reported unreachable to us
+    pub arp_timeout: i64,
+    pub tcp_rcvbuf: i64,
+    pub tcp_sndbuf: i64,
+    pub msl: i64,
+    pub rto_min: i64,
+    pub rx_frames: i64,
+    pub dropped: i64,
+    pub frag_timeouts: i64,
+    pub reassembled: i64,
+}
+
+pub fn net_new(mac: Vec<i64>, ip: i64, mask: i64, gw: i64) -> NetStack {
+    return NetStack {
+        mac: mac, ip: ip, mask: mask, gw: gw, mtu: 1500, now: 0, arp: Vec::new(), pending: Vec::new(), tx: Vec::new(), udp: Vec::new(), tcp: Vec::new(), listening: Vec::new(), frags: Vec::new(), ip_id: 1, isn_seed: net_be32(mac, 2), conns_made: 0, ping_ids: Vec::new(), ping_from: Vec::new(), ping_rtt: Vec::new(), ping_sent_at: Vec::new(), unreachable: Vec::new(), arp_timeout: 60000, tcp_rcvbuf: 8192, tcp_sndbuf: 65536, msl: 30000, rto_min: 1000, rx_frames: 0, dropped: 0, frag_timeouts: 0, reassembled: 0
+    };
+}
+
+/// Frames waiting for the interface; the queue is emptied.
+pub fn net_take_tx(s: & mut NetStack) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = s.tx;
+    s.tx = Vec::new();
+    return out;
+}
+
+fn net_bcast_mac() -> Vec<i64> {
+    return Vec::filled(6, 255);
+}
+
+fn net_mac_eq(a: Vec<i64>, o: i64, b: Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < 6 {
+        if a.get(o + i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn eth_send(s: & mut NetStack, dst: Vec<i64>, ty: i64, payload: Vec<i64>) {
+    var f: Vec<i64> = Vec::new();
+    net_append(&mut f, dst);
+    net_append(&mut f, s.mac);
+    net_put16(&mut f, ty);
+    net_append(&mut f, payload);
+    while f.len() < 60 {
+        f.push(0);
+        // minimum frame without FCS
+    }
+    s.tx.push(f);
+}
+
+// ─── ARP ────────────────────────────────────────────────────────────────
+
+fn arp_packet(op: i64, sha: Vec<i64>, spa: i64, tha: Vec<i64>, tpa: i64) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    net_put16(&mut p, 1);
+    net_put16(&mut p, ETH_IPV4);
+    p.push(6);
+    p.push(4);
+    net_put16(&mut p, op);
+    net_append(&mut p, sha);
+    net_put32(&mut p, spa);
+    net_append(&mut p, tha);
+    net_put32(&mut p, tpa);
+    return p;
+}
+
+fn arp_find(s: & NetStack, ip: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.arp.len() {
+        if s.arp.get(i).ip == ip {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// MAC of ip from the cache (empty when unknown or still resolving).
+pub fn arp_lookup(s: & NetStack, ip: i64) -> Vec<i64> {
+    var i: i64 = arp_find(s, ip);
+    if i < 0 || !s.arp.get(i).resolved {
+        return Vec::new();
+    }
+    return s.arp.get(i).mac;
+}
+
+pub fn arp_cache_size(s: & NetStack) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < s.arp.len() {
+        if s.arp.get(i).resolved { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn arp_request(s: & mut NetStack, ip: i64) {
+    eth_send(s, net_bcast_mac(), ETH_ARP, arp_packet(1, s.mac, s.ip, Vec::filled(6, 0), ip));
+}
+
+fn arp_learn(s: & mut NetStack, ip: i64, mac: Vec<i64>, create: bool) {
+    var i: i64 = arp_find(s, ip);
+    if i < 0 {
+        if !create {
+            return;
+        }
+        s.arp.push(ArpEntry { ip: ip, mac: mac, resolved: true, expires: s.now + s.arp_timeout, asked_at: 0, tries: 0 });
+    } else {
+        var e: ArpEntry = s.arp.get(i);
+        e.mac = mac;
+        e.resolved = true;
+        e.expires = s.now + s.arp_timeout;
+        e.tries = 0;
+        s.arp.set(i, e);
+    }
+    // send what waited for this hop
+    var k: i64 = 0;
+    while k < s.pending.len() {
+        var p: PendingPkt = s.pending.get(k);
+        if p.hop == ip {
+            eth_send(s, mac, ETH_IPV4, p.packet);
+            s.pending.remove(k);
+        } else {
+            k = k + 1;
+        }
+    }
+}
+
+fn arp_input(s: & mut NetStack, p: Vec<i64>) {
+    if p.len() < 28 || net_be16(p, 2) != ETH_IPV4 || p.get(4) != 6 || p.get(5) != 4 {
+        return;
+    }
+    var op: i64 = net_be16(p, 6);
+    var sha: Vec<i64> = net_slice(p, 8, 14);
+    var spa: i64 = net_be32(p, 14);
+    var tpa: i64 = net_be32(p, 24);
+    var for_us: bool = tpa == s.ip;
+    arp_learn(s, spa, sha, for_us);
+    if op == 1 && for_us {
+        eth_send(s, sha, ETH_ARP, arp_packet(2, s.mac, s.ip, sha, spa));
+    }
+}
+
+// ─── IPv4 ───────────────────────────────────────────────────────────────
+
+fn ip_header(s: & NetStack, dst: i64, proto: i64, plen: i64, id: i64, frag: i64) -> Vec<i64> {
+    var h: Vec<i64> = Vec::new();
+    h.push(0x45);
+    h.push(0);
+    net_put16(&mut h, 20 + plen);
+    net_put16(&mut h, id);
+    net_put16(&mut h, frag);
+    h.push(64);
+    h.push(proto);
+    net_put16(&mut h, 0);
+    net_put32(&mut h, s.ip);
+    net_put32(&mut h, dst);
+    net_set16(&mut h, 10, net_checksum(h, 0, 20));
+    return h;
+}
+
+fn ip_route(s: & NetStack, dst: i64) -> i64 {
+    if (dst & s.mask) == (s.ip & s.mask) || dst == 0xFFFFFFFF {
+        return dst;
+    }
+    return s.gw;
+}
+
+fn ip_emit(s: & mut NetStack, hop: i64, packet: Vec<i64>) {
+    if hop == 0xFFFFFFFF {
+        eth_send(s, net_bcast_mac(), ETH_IPV4, packet);
+        return;
+    }
+    var mac: Vec<i64> = arp_lookup(s, hop);
+    if mac.len() == 6 {
+        eth_send(s, mac, ETH_IPV4, packet);
+        return;
+    }
+    s.pending.push(PendingPkt { hop: hop, packet: packet });
+    var i: i64 = arp_find(s, hop);
+    if i < 0 {
+        s.arp.push(ArpEntry { ip: hop, mac: Vec::new(), resolved: false, expires: 0, asked_at: s.now, tries: 1 });
+        arp_request(s, hop);
+    }
+}
+
+/// Send an IP datagram, fragmenting it to the MTU. Returns the number of
+/// packets it took.
+pub fn ip_send(s: & mut NetStack, dst: i64, proto: i64, payload: Vec<i64>) -> i64 {
+    var hop: i64 = ip_route(s, dst);
+    var id: i64 = s.ip_id;
+    s.ip_id = (s.ip_id + 1) & 0xFFFF;
+    var room: i64 = s.mtu - 20;
+    if payload.len() <= room {
+        var pk: Vec<i64> = ip_header(s, dst, proto, payload.len(), id, 0x4000);
+        net_append(&mut pk, payload);
+        ip_emit(s, hop, pk);
+        return 1;
+    }
+    var chunk: i64 = room / 8 * 8;
+    var off: i64 = 0;
+    var n: i64 = 0;
+    while off < payload.len() {
+        var end: i64 = off + chunk;
+        var mf: i64 = 0x2000;
+        if end >= payload.len() {
+            end = payload.len();
+            mf = 0;
+        }
+        var part: Vec<i64> = net_slice(payload, off, end);
+        var fp: Vec<i64> = ip_header(s, dst, proto, part.len(), id, mf | (off / 8));
+        net_append(&mut fp, part);
+        ip_emit(s, hop, fp);
+        off = end;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Reassemble: store the fragment; returns the whole payload when every
+/// byte has arrived, an empty Vec before that.
+fn ip_reassemble(s: & mut NetStack, src: i64, dst: i64, id: i64, proto: i64, off: i64, more: bool, data: Vec<i64>) -> Vec<i64> {
+    var fi: i64 = -1;
+    var i: i64 = 0;
+    while i < s.frags.len() {
+        var f: FragBuf = s.frags.get(i);
+        if f.src == src && f.dst == dst && f.id == id && f.proto == proto {
+            fi = i;
+        }
+        i = i + 1;
+    }
+    if fi < 0 {
+        s.frags.push(FragBuf { src: src, dst: dst, id: id, proto: proto, offs: Vec::new(), datas: Vec::new(), total: -1, deadline: s.now + 30000 });
+        fi = s.frags.len() - 1;
+    }
+    var fb: FragBuf = s.frags.get(fi);
+    fb.offs.push(off);
+    fb.datas.push(data);
+    if !more {
+        fb.total = off + data.len();
+    }
+    s.frags.set(fi, fb);
+    if fb.total < 0 {
+        return Vec::new();
+    }
+    // walk the coverage from 0 upwards
+    var have: i64 = 0;
+    var progress: bool = true;
+    while progress && have < fb.total {
+        progress = false;
+        var k: i64 = 0;
+        while k < fb.offs.len() {
+            var o: i64 = fb.offs.get(k);
+            var e: i64 = o + fb.datas.get(k).len();
+            if o <= have && e > have {
+                have = e;
+                progress = true;
+            }
+            k = k + 1;
+        }
+    }
+    if have < fb.total {
+        return Vec::new();
+    }
+    var out: Vec<i64> = Vec::filled(fb.total, 0);
+    var k2: i64 = 0;
+    while k2 < fb.offs.len() {
+        var o2: i64 = fb.offs.get(k2);
+        var d2: Vec<i64> = fb.datas.get(k2);
+        var j: i64 = 0;
+        while j < d2.len() && o2 + j < fb.total {
+            out.set(o2 + j, d2.get(j));
+            j = j + 1;
+        }
+        k2 = k2 + 1;
+    }
+    s.frags.remove(fi);
+    s.reassembled = s.reassembled + 1;
+    return out;
+}
+
+fn ip_input(s: & mut NetStack, p: Vec<i64>) {
+    if p.len() < 20 || (p.get(0) >> 4) != 4 {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var ihl: i64 = (p.get(0) & 15) * 4;
+    var total: i64 = net_be16(p, 2);
+    if ihl < 20 || total > p.len() || total < ihl || net_checksum(p, 0, ihl) != 0 {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var dst: i64 = net_be32(p, 16);
+    if dst != s.ip && dst != 0xFFFFFFFF && dst != (s.ip | ~s.mask & 0xFFFFFFFF) {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var src: i64 = net_be32(p, 12);
+    var proto: i64 = p.get(9);
+    var frag: i64 = net_be16(p, 6);
+    var payload: Vec<i64> = net_slice(p, ihl, total);
+    if (frag & 0x2000) != 0 || (frag & 0x1FFF) != 0 {
+        payload = ip_reassemble(s, src, dst, net_be16(p, 4), proto, (frag & 0x1FFF) * 8, (frag & 0x2000) != 0, payload);
+        if payload.len() == 0 {
+            return;
+        }
+    }
+    if proto == IP_ICMP {
+        icmp_input(s, src, payload, p);
+    }
+    if proto == IP_UDP {
+        udp_input(s, src, dst, payload, p);
+    }
+    if proto == IP_TCP {
+        tcp_input(s, src, dst, payload);
+    }
+}
+
+/// Hand one received Ethernet frame to the stack.
+pub fn net_input(s: & mut NetStack, f: Vec<i64>) {
+    if f.len() < 14 {
+        return;
+    }
+    if !net_mac_eq(f, 0, s.mac) && !net_mac_eq(f, 0, net_bcast_mac()) {
+        return;
+    }
+    s.rx_frames = s.rx_frames + 1;
+    var ty: i64 = net_be16(f, 12);
+    var payload: Vec<i64> = net_slice(f, 14, f.len());
+    if ty == ETH_ARP {
+        arp_input(s, payload);
+    }
+    if ty == ETH_IPV4 {
+        ip_input(s, payload);
+    }
+}
+
+// ─── ICMP ───────────────────────────────────────────────────────────────
+
+fn icmp_send(s: & mut NetStack, dst: i64, ty: i64, code: i64, rest: i64, data: Vec<i64>) {
+    var m: Vec<i64> = Vec::new();
+    m.push(ty);
+    m.push(code);
+    net_put16(&mut m, 0);
+    net_put32(&mut m, rest);
+    net_append(&mut m, data);
+    net_set16(&mut m, 2, net_checksum(m, 0, m.len()));
+    ip_send(s, dst, IP_ICMP, m);
+}
+
+/// Send an echo request (ping) with id/seq and payload.
+pub fn icmp_ping(s: & mut NetStack, dst: i64, id: i64, seq: i64, data: Vec<i64>) {
+    s.ping_sent_at.push(s.now);
+    icmp_send(s, dst, 8, 0, (id << 16) | seq, data);
+}
+
+fn icmp_input(s: & mut NetStack, src: i64, m: Vec<i64>, ippkt: Vec<i64>) {
+    if m.len() < 8 || net_checksum(m, 0, m.len()) != 0 {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var ty: i64 = m.get(0);
+    var rest: i64 = net_be32(m, 4);
+    if ty == 8 {
+        icmp_send(s, src, 0, 0, rest, net_slice(m, 8, m.len()));
+    }
+    if ty == 0 {
+        s.ping_ids.push(rest);
+        s.ping_from.push(src);
+        var sent: i64 = s.now;
+        if s.ping_sent_at.len() > 0 {
+            sent = s.ping_sent_at.get(0);
+            s.ping_sent_at.remove(0);
+        }
+        s.ping_rtt.push(s.now - sent);
+    }
+    if ty == 3 && m.get(1) == 3 && m.len() >= 8 + 20 + 4 {
+        // port unreachable: the original header and 8 bytes follow
+        var ihl: i64 = (m.get(8) & 15) * 4;
+        s.unreachable.push(net_be16(m, 8 + ihl + 2));
+    }
+}
+
+// ─── UDP ────────────────────────────────────────────────────────────────
+
+/// Open a socket on port; returns its handle (-1 when the port is taken).
+pub fn udp_bind(s: & mut NetStack, port: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.udp.len() {
+        if s.udp.get(i).port == port {
+            return -1;
+        }
+        i = i + 1;
+    }
+    s.udp.push(UdpSock { port: port, q_src: Vec::new(), q_sport: Vec::new(), q_data: Vec::new() });
+    return s.udp.len() - 1;
+}
+
+pub fn udp_sendto(s: & mut NetStack, sock: i64, dst: i64, dport: i64, data: Vec<i64>) -> i64 {
+    var sport: i64 = s.udp.get(sock).port;
+    var d: Vec<i64> = Vec::new();
+    net_put16(&mut d, sport);
+    net_put16(&mut d, dport);
+    net_put16(&mut d, 8 + data.len());
+    net_put16(&mut d, 0);
+    net_append(&mut d, data);
+    var c: i64 = net_l4_checksum(s.ip, dst, IP_UDP, d);
+    if c == 0 { c = 0xFFFF; }
+    net_set16(&mut d, 6, c);
+    return ip_send(s, dst, IP_UDP, d);
+}
+
+/// Next queued datagram of the socket (ok = false when none).
+pub fn udp_recv(s: & mut NetStack, sock: i64) -> UdpDatagram {
+    var u: UdpSock = s.udp.get(sock);
+    if u.q_data.len() == 0 {
+        return UdpDatagram { ok: false, src: 0, sport: 0, data: Vec::new() };
+    }
+    var r: UdpDatagram = UdpDatagram { ok: true, src: u.q_src.get(0), sport: u.q_sport.get(0), data: u.q_data.get(0) };
+    u.q_src.remove(0);
+    u.q_sport.remove(0);
+    u.q_data.remove(0);
+    s.udp.set(sock, u);
+    return r;
+}
+
+fn udp_input(s: & mut NetStack, src: i64, dst: i64, d: Vec<i64>, ippkt: Vec<i64>) {
+    if d.len() < 8 || net_be16(d, 4) > d.len() || net_be16(d, 4) < 8 {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var ulen: i64 = net_be16(d, 4);
+    var dgram: Vec<i64> = net_slice(d, 0, ulen);
+    if net_be16(d, 6) != 0 && net_l4_checksum(src, dst, IP_UDP, dgram) != 0 {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var dport: i64 = net_be16(d, 2);
+    var i: i64 = 0;
+    while i < s.udp.len() {
+        var u: UdpSock = s.udp.get(i);
+        if u.port == dport {
+            u.q_src.push(src);
+            u.q_sport.push(net_be16(d, 0));
+            u.q_data.push(net_slice(dgram, 8, ulen));
+            s.udp.set(i, u);
+            return;
+        }
+        i = i + 1;
+    }
+    if dst == s.ip {
+        var ihl: i64 = (ippkt.get(0) & 15) * 4;
+        icmp_send(s, src, 3, 3, 0, net_slice(ippkt, 0, ihl + 8));
+    }
+}
+
+// ─── TCP ────────────────────────────────────────────────────────────────
+
+pub struct TcpSeg {
+    pub ok: bool,
+    pub sport: i64,
+    pub dport: i64,
+    pub seq: i64,
+    pub ack: i64,
+    pub flags: i64,
+    pub window: i64,
+    pub mss: i64,
+    // MSS option, 0 when absent
+    pub data: Vec<i64>,
+}
+
+/// Build a TCP segment (checksummed for src -> dst).
+pub fn tcp_build(src: i64, dst: i64, sport: i64, dport: i64, seq: i64, ack: i64, flags: i64, window: i64, mss: i64, data: Vec<i64>) -> Vec<i64> {
+    var t: Vec<i64> = Vec::new();
+    net_put16(&mut t, sport);
+    net_put16(&mut t, dport);
+    net_put32(&mut t, seq);
+    net_put32(&mut t, ack);
+    var hl: i64 = 20;
+    if mss > 0 { hl = 24; }
+    t.push((hl / 4) << 4);
+    t.push(flags);
+    net_put16(&mut t, window);
+    net_put16(&mut t, 0);
+    net_put16(&mut t, 0);
+    if mss > 0 {
+        t.push(2);
+        t.push(4);
+        net_put16(&mut t, mss);
+    }
+    net_append(&mut t, data);
+    net_set16(&mut t, 16, net_l4_checksum(src, dst, IP_TCP, t));
+    return t;
+}
+
+pub fn tcp_parse(src: i64, dst: i64, t: Vec<i64>) -> TcpSeg {
+    var g: TcpSeg = TcpSeg { ok: false, sport: 0, dport: 0, seq: 0, ack: 0, flags: 0, window: 0, mss: 0, data: Vec::new() };
+    if t.len() < 20 {
+        return g;
+    }
+    var hl: i64 = (t.get(12) >> 4) * 4;
+    if hl < 20 || hl > t.len() || net_l4_checksum(src, dst, IP_TCP, t) != 0 {
+        return g;
+    }
+    g.sport = net_be16(t, 0);
+    g.dport = net_be16(t, 2);
+    g.seq = net_be32(t, 4);
+    g.ack = net_be32(t, 8);
+    g.flags = t.get(13);
+    g.window = net_be16(t, 14);
+    var o: i64 = 20;
+    while o < hl {
+        var kind: i64 = t.get(o);
+        if kind == 0 {
+            o = hl;
+        } else {
+            if kind == 1 {
+                o = o + 1;
+            } else {
+                if o + 1 >= hl { o = hl; } else {
+                    var ol: i64 = t.get(o + 1);
+                    if kind == 2 && ol == 4 { g.mss = net_be16(t, o + 2); }
+                    if ol < 2 { o = hl; } else { o = o + ol; }
+                }
+            }
+        }
+    }
+    g.data = net_slice(t, hl, t.len());
+    g.ok = true;
+    return g;
+}
+
+fn tcp_new_conn(s: & mut NetStack, lport: i64, rip: i64, rport: i64, state: i64) -> i64 {
+    var iss: i64 = (s.isn_seed + s.now * 250 + s.conns_made * 64000) & 0xFFFFFFFF;
+    s.conns_made = s.conns_made + 1;
+    var mss: i64 = s.mtu - 40;
+    s.tcp.push(TcpConn {
+        state: state, lport: lport, rport: rport, rip: rip, listener: -1, accepted: false, iss: iss, irs: 0, snd_una: iss, snd_nxt: iss, snd_wnd: 0, snd_wl1: 0, snd_wl2: 0, rcv_nxt: 0, rcv_cap: s.tcp_rcvbuf, adv_wnd: s.tcp_rcvbuf, mss: mss, cwnd: 4 * mss, sendbuf: Vec::new(), app_closed: false, fin_seq: -1, peer_fin: -1, recvbuf: Vec::new(), ooo_seq: Vec::new(), ooo_data: Vec::new(), rto: s.rto_min, srtt: -1, rttvar: 0, rtx_at: -1, rtx_count: 0, rtt_seq: -1, rtt_start: 0, tw_at: -1, error: "", retransmits: 0, ooo_segments: 0, dup_acks: 0
+    });
+    return s.tcp.len() - 1;
+}
+
+fn tcp_window(c: & TcpConn) -> i64 {
+    var w: i64 = c.rcv_cap - c.recvbuf.len();
+    if w < 0 { w = 0; }
+    if w > 65535 { w = 65535; }
+    return w;
+}
+
+fn tcp_emit(s: & mut NetStack, ci: i64, seq: i64, flags: i64, data: Vec<i64>) {
+    var c: TcpConn = s.tcp.get(ci);
+    var mss: i64 = 0;
+    if (flags & TCP_SYN) != 0 { mss = s.mtu - 40; }
+    var ack: i64 = 0;
+    if (flags & TCP_ACK) != 0 { ack = c.rcv_nxt; }
+    c.adv_wnd = tcp_window(&c);
+    s.tcp.set(ci, c);
+    ip_send(s, c.rip, IP_TCP, tcp_build(s.ip, c.rip, c.lport, c.rport, seq, ack, flags, c.adv_wnd, mss, data));
+}
+
+fn tcp_ack_now(s: & mut NetStack, ci: i64) {
+    var c: TcpConn = s.tcp.get(ci);
+    tcp_emit(s, ci, c.snd_nxt, TCP_ACK, Vec::new());
+}
+
+fn tcp_arm(s: & mut NetStack, ci: i64) {
+    var c: TcpConn = s.tcp.get(ci);
+    if c.rtx_at < 0 {
+        c.rtx_at = s.now + c.rto;
+        s.tcp.set(ci, c);
+    }
+}
+
+/// Send what the windows allow, then the FIN once the application closed
+/// and every byte went out.
+fn tcp_output(s: & mut NetStack, ci: i64) {
+    var c: TcpConn = s.tcp.get(ci);
+    if c.state != TCP_ESTABLISHED && c.state != TCP_CLOSE_WAIT && c.state != TCP_FIN_WAIT_1 && c.state != TCP_LAST_ACK && c.state != TCP_CLOSING {
+        return;
+    }
+    var wnd: i64 = c.snd_wnd;
+    if c.cwnd < wnd { wnd = c.cwnd; }
+    var guard: i64 = 0;
+    while guard < 1000 {
+        guard = guard + 1;
+        c = s.tcp.get(ci);
+        var inflight: i64 = seq_diff(c.snd_nxt, c.snd_una);
+        var sent: i64 = inflight;
+        if c.fin_seq >= 0 { sent = sent - 1; }
+        var left: i64 = c.sendbuf.len() - sent;
+        if left <= 0 || c.fin_seq >= 0 {
+            guard = 1000;
+        } else {
+            var n: i64 = c.mss;
+            if left < n { n = left; }
+            if wnd - inflight < n { n = wnd - inflight; }
+            if n <= 0 {
+                guard = 1000;
+            } else {
+                var flags: i64 = TCP_ACK;
+                if n == left { flags = flags | TCP_PSH; }
+                var seq: i64 = c.snd_nxt;
+                c.snd_nxt = seq_add(c.snd_nxt, n);
+                if c.rtt_seq < 0 {
+                    c.rtt_seq = seq;
+                    c.rtt_start = s.now;
+                }
+                s.tcp.set(ci, c);
+                tcp_emit(s, ci, seq, flags, net_slice(c.sendbuf, sent, sent + n));
+                tcp_arm(s, ci);
+            }
+        }
+    }
+    c = s.tcp.get(ci);
+    var unsent: i64 = c.sendbuf.len() - seq_diff(c.snd_nxt, c.snd_una);
+    if c.app_closed && c.fin_seq < 0 && unsent <= 0 && (c.state == TCP_ESTABLISHED || c.state == TCP_CLOSE_WAIT) {
+        c.fin_seq = c.snd_nxt;
+        c.snd_nxt = seq_add(c.snd_nxt, 1);
+        if c.state == TCP_ESTABLISHED {
+            c.state = TCP_FIN_WAIT_1;
+        } else {
+            c.state = TCP_LAST_ACK;
+        }
+        s.tcp.set(ci, c);
+        tcp_emit(s, ci, c.fin_seq, TCP_FIN | TCP_ACK, Vec::new());
+        tcp_arm(s, ci);
+    }
+}
+
+/// Start listening on a port.
+pub fn tcp_listen(s: & mut NetStack, port: i64) {
+    if !s.listening.contains(port) {
+        s.listening.push(port);
+    }
+}
+
+/// Active open; returns the connection handle.
+pub fn tcp_connect(s: & mut NetStack, dst: i64, dport: i64, lport: i64) -> i64 {
+    var ci: i64 = tcp_new_conn(s, lport, dst, dport, TCP_SYN_SENT);
+    var c: TcpConn = s.tcp.get(ci);
+    c.snd_nxt = seq_add(c.iss, 1);
+    s.tcp.set(ci, c);
+    tcp_emit(s, ci, c.iss, TCP_SYN, Vec::new());
+    tcp_arm(s, ci);
+    return ci;
+}
+
+/// An established connection on a listening port not yet accepted, or -1.
+pub fn tcp_accept(s: & mut NetStack, port: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.tcp.len() {
+        var c: TcpConn = s.tcp.get(i);
+        if c.listener == port && !c.accepted && (c.state == TCP_ESTABLISHED || c.state == TCP_CLOSE_WAIT) {
+            c.accepted = true;
+            s.tcp.set(i, c);
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn tcp_state(s: & NetStack, ci: i64) -> i64 {
+    return s.tcp.get(ci).state;
+}
+
+pub fn tcp_conn(s: & NetStack, ci: i64) -> TcpConn {
+    return s.tcp.get(ci);
+}
+
+/// Queue bytes for sending; returns how many fit the send buffer.
+pub fn tcp_send(s: & mut NetStack, ci: i64, data: Vec<i64>) -> i64 {
+    var c: TcpConn = s.tcp.get(ci);
+    if c.app_closed || (c.state != TCP_ESTABLISHED && c.state != TCP_CLOSE_WAIT && c.state != TCP_SYN_SENT && c.state != TCP_SYN_RCVD) {
+        return -1;
+    }
+    var room: i64 = s.tcp_sndbuf - c.sendbuf.len();
+    var n: i64 = data.len();
+    if n > room { n = room; }
+    var i: i64 = 0;
+    while i < n {
+        c.sendbuf.push(data.get(i));
+        i = i + 1;
+    }
+    s.tcp.set(ci, c);
+    tcp_output(s, ci);
+    return n;
+}
+
+/// Take up to max received bytes. Sends a window update when reading
+/// reopened the window by at least one MSS.
+pub fn tcp_recv(s: & mut NetStack, ci: i64, max: i64) -> Vec<i64> {
+    var c: TcpConn = s.tcp.get(ci);
+    var n: i64 = c.recvbuf.len();
+    if n > max { n = max; }
+    var out: Vec<i64> = net_slice(c.recvbuf, 0, n);
+    c.recvbuf = net_slice(c.recvbuf, n, c.recvbuf.len());
+    s.tcp.set(ci, c);
+    if n > 0 && tcp_window(&c) - c.adv_wnd >= c.mss && c.state != TCP_CLOSED {
+        tcp_ack_now(s, ci);
+    }
+    return out;
+}
+
+/// Bytes waiting to be read.
+pub fn tcp_available(s: & NetStack, ci: i64) -> i64 {
+    return s.tcp.get(ci).recvbuf.len();
+}
+
+/// Whether the peer closed its side (FIN received).
+pub fn tcp_peer_closed(s: & NetStack, ci: i64) -> bool {
+    var st: i64 = s.tcp.get(ci).state;
+    return st == TCP_CLOSE_WAIT || st == TCP_LAST_ACK || st == TCP_CLOSING || st == TCP_TIME_WAIT || (st == TCP_CLOSED && s.tcp.get(ci).peer_fin >= 0);
+}
+
+/// Close our side: FIN after the queued data.
+pub fn tcp_close(s: & mut NetStack, ci: i64) {
+    var c: TcpConn = s.tcp.get(ci);
+    if c.state == TCP_SYN_SENT || c.state == TCP_LISTEN {
+        c.state = TCP_CLOSED;
+        c.rtx_at = -1;
+        s.tcp.set(ci, c);
+        return;
+    }
+    c.app_closed = true;
+    s.tcp.set(ci, c);
+    tcp_output(s, ci);
+}
+
+/// Abort with a RST.
+pub fn tcp_abort(s: & mut NetStack, ci: i64) {
+    var c: TcpConn = s.tcp.get(ci);
+    if c.state != TCP_CLOSED && c.state != TCP_SYN_SENT {
+        tcp_emit(s, ci, c.snd_nxt, TCP_RST | TCP_ACK, Vec::new());
+    }
+    c = s.tcp.get(ci);
+    c.state = TCP_CLOSED;
+    c.rtx_at = -1;
+    c.error = "aborted";
+    s.tcp.set(ci, c);
+}
+
+fn tcp_find(s: & NetStack, lport: i64, rip: i64, rport: i64) -> i64 {
+    var i: i64 = 0;
+    while i < s.tcp.len() {
+        var c: TcpConn = s.tcp.get(i);
+        if c.lport == lport && c.rip == rip && c.rport == rport && c.state != TCP_CLOSED {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn tcp_reset_reply(s: & mut NetStack, src: i64, g: TcpSeg) {
+    if (g.flags & TCP_RST) != 0 {
+        return;
+    }
+    var seglen: i64 = g.data.len();
+    if (g.flags & TCP_SYN) != 0 { seglen = seglen + 1; }
+    if (g.flags & TCP_FIN) != 0 { seglen = seglen + 1; }
+    if (g.flags & TCP_ACK) != 0 {
+        ip_send(s, src, IP_TCP, tcp_build(s.ip, src, g.dport, g.sport, g.ack, 0, TCP_RST, 0, 0, Vec::new()));
+    } else {
+        ip_send(s, src, IP_TCP, tcp_build(s.ip, src, g.dport, g.sport, 0, seq_add(g.seq, seglen), TCP_RST | TCP_ACK, 0, 0, Vec::new()));
+    }
+}
+
+fn tcp_rtt_sample(s: & NetStack, c: & mut TcpConn, r: i64) {
+    if c.srtt < 0 {
+        c.srtt = r;
+        c.rttvar = r / 2;
+    } else {
+        var d: i64 = c.srtt - r;
+        if d < 0 { d = 0 - d; }
+        c.rttvar = (3 * c.rttvar + d) / 4;
+        c.srtt = (7 * c.srtt + r) / 8;
+    }
+    var k: i64 = 4 * c.rttvar;
+    if k < 1 { k = 1; }
+    c.rto = c.srtt + k;
+    if c.rto < s.rto_min { c.rto = s.rto_min; }
+    if c.rto > 60000 { c.rto = 60000; }
+}
+
+/// Deliver in-order data and whatever the out-of-order queue now fills.
+fn tcp_take_data(c: & mut TcpConn, seq0: i64, data: Vec<i64>) {
+    var seq: i64 = seq0;
+    var d: Vec<i64> = data;
+    var skip: i64 = seq_diff(c.rcv_nxt, seq);
+    if skip > 0 {
+        if skip >= d.len() {
+            return;
+        }
+        d = net_slice(d, skip, d.len());
+        seq = c.rcv_nxt;
+    }
+    var room: i64 = c.rcv_cap - c.recvbuf.len();
+    if seq != c.rcv_nxt {
+        // beyond a hole: keep it for later if it lies inside the window
+        if seq_diff(seq, c.rcv_nxt) < room && !c.ooo_seq.contains(seq) {
+            c.ooo_seq.push(seq);
+            c.ooo_data.push(d);
+            c.ooo_segments = c.ooo_segments + 1;
+        }
+        return;
+    }
+    var n: i64 = d.len();
+    if n > room { n = room; }
+    net_append(&mut c.recvbuf, net_slice(d, 0, n));
+    c.rcv_nxt = seq_add(c.rcv_nxt, n);
+    var progress: bool = true;
+    while progress {
+        progress = false;
+        var i: i64 = 0;
+        while i < c.ooo_seq.len() {
+            var q: i64 = c.ooo_seq.get(i);
+            var qd: Vec<i64> = c.ooo_data.get(i);
+            var end: i64 = seq_add(q, qd.len());
+            if seq_le(q, c.rcv_nxt) {
+                if seq_lt(c.rcv_nxt, end) {
+                    var from: i64 = seq_diff(c.rcv_nxt, q);
+                    var part: Vec<i64> = net_slice(qd, from, qd.len());
+                    var room2: i64 = c.rcv_cap - c.recvbuf.len();
+                    if part.len() > room2 { part = net_slice(part, 0, room2); }
+                    net_append(&mut c.recvbuf, part);
+                    c.rcv_nxt = seq_add(c.rcv_nxt, part.len());
+                    progress = true;
+                }
+                c.ooo_seq.remove(i);
+                c.ooo_data.remove(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn tcp_input(s: & mut NetStack, src: i64, dst: i64, t: Vec<i64>) {
+    var g: TcpSeg = tcp_parse(src, dst, t);
+    if !g.ok {
+        s.dropped = s.dropped + 1;
+        return;
+    }
+    var ci: i64 = tcp_find(s, g.dport, src, g.sport);
+    if ci < 0 {
+        if (g.flags & TCP_SYN) != 0 && (g.flags & TCP_ACK) == 0 && s.listening.contains(g.dport) {
+            var ni: i64 = tcp_new_conn(s, g.dport, src, g.sport, TCP_SYN_RCVD);
+            var n: TcpConn = s.tcp.get(ni);
+            n.listener = g.dport;
+            n.irs = g.seq;
+            n.rcv_nxt = seq_add(g.seq, 1);
+            n.snd_wnd = g.window;
+            n.snd_wl1 = g.seq;
+            if g.mss > 0 && g.mss < n.mss { n.mss = g.mss; }
+            n.cwnd = 4 * n.mss;
+            n.snd_nxt = seq_add(n.iss, 1);
+            s.tcp.set(ni, n);
+            tcp_emit(s, ni, n.iss, TCP_SYN | TCP_ACK, Vec::new());
+            tcp_arm(s, ni);
+            return;
+        }
+        tcp_reset_reply(s, src, g);
+        return;
+    }
+    var c: TcpConn = s.tcp.get(ci);
+    if c.state == TCP_SYN_SENT {
+        var ack_ok: bool = (g.flags & TCP_ACK) != 0 && g.ack == c.snd_nxt;
+        if (g.flags & TCP_ACK) != 0 && !ack_ok {
+            tcp_reset_reply(s, src, g);
+            return;
+        }
+        if (g.flags & TCP_RST) != 0 {
+            if ack_ok {
+                c.state = TCP_CLOSED;
+                c.rtx_at = -1;
+                c.error = "connection refused";
+                s.tcp.set(ci, c);
+            }
+            return;
+        }
+        if (g.flags & TCP_SYN) != 0 && ack_ok {
+            c.irs = g.seq;
+            c.rcv_nxt = seq_add(g.seq, 1);
+            c.snd_una = g.ack;
+            c.snd_wnd = g.window;
+            c.snd_wl1 = g.seq;
+            c.snd_wl2 = g.ack;
+            if g.mss > 0 && g.mss < c.mss { c.mss = g.mss; }
+            c.cwnd = 4 * c.mss;
+            if c.rtx_count == 0 {
+                var sample: i64 = s.now - (c.rtx_at - c.rto);
+                tcp_rtt_sample(s, &mut c, sample);
+            }
+            c.rtx_at = -1;
+            c.rtx_count = 0;
+            c.state = TCP_ESTABLISHED;
+            s.tcp.set(ci, c);
+            tcp_ack_now(s, ci);
+            tcp_output(s, ci);
+        }
+        return;
+    }
+    // sequence acceptability (RFC 9293 3.10.7.4)
+    var seglen: i64 = g.data.len();
+    if (g.flags & TCP_SYN) != 0 { seglen = seglen + 1; }
+    if (g.flags & TCP_FIN) != 0 { seglen = seglen + 1; }
+    var wnd: i64 = tcp_window(&c);
+    var off: i64 = seq_diff(g.seq, c.rcv_nxt);
+    var acceptable: bool = false;
+    if seglen == 0 {
+        acceptable = off == 0 || (off >= 0 && off < wnd) || (wnd == 0 && off == 0);
+    } else {
+        if wnd > 0 {
+            var last: i64 = off + seglen - 1;
+            acceptable = (off >= 0 && off < wnd) || (last >= 0 && last < wnd);
+        }
+    }
+    if !acceptable {
+        if (g.flags & TCP_RST) == 0 {
+            tcp_ack_now(s, ci);
+        }
+        return;
+    }
+    if (g.flags & TCP_RST) != 0 {
+        c.state = TCP_CLOSED;
+        c.rtx_at = -1;
+        c.error = "connection reset";
+        s.tcp.set(ci, c);
+        return;
+    }
+    if (g.flags & TCP_SYN) != 0 && c.state != TCP_SYN_RCVD {
+        tcp_ack_now(s, ci);
+        return;
+    }
+    if (g.flags & TCP_ACK) == 0 {
+        return;
+    }
+    if c.state == TCP_SYN_RCVD {
+        if seq_lt(c.snd_una, g.ack) && seq_le(g.ack, c.snd_nxt) {
+            c.state = TCP_ESTABLISHED;
+            c.snd_wnd = g.window;
+            c.snd_wl1 = g.seq;
+            c.snd_wl2 = g.ack;
+        } else {
+            s.tcp.set(ci, c);
+            tcp_reset_reply(s, src, g);
+            return;
+        }
+    }
+    // ACK processing
+    if seq_lt(c.snd_una, g.ack) && seq_le(g.ack, c.snd_nxt) {
+        var acked: i64 = seq_diff(g.ack, c.snd_una);
+        var data_acked: i64 = acked;
+        if seq_diff(c.snd_una, c.iss) == 0 {
+            data_acked = data_acked - 1;
+            // our SYN
+        }
+        if c.fin_seq >= 0 && seq_lt(c.fin_seq, g.ack) {
+            data_acked = data_acked - 1;
+        }
+        if data_acked > c.sendbuf.len() { data_acked = c.sendbuf.len(); }
+        if data_acked > 0 {
+            c.sendbuf = net_slice(c.sendbuf, data_acked, c.sendbuf.len());
+        }
+        c.snd_una = g.ack;
+        if c.rtt_seq >= 0 && seq_lt(c.rtt_seq, g.ack) {
+            tcp_rtt_sample(s, &mut c, s.now - c.rtt_start);
+            c.rtt_seq = -1;
+        }
+        c.cwnd = c.cwnd + c.mss;
+        c.rtx_count = 0;
+        c.dup_acks = 0;
+        if c.snd_una == c.snd_nxt {
+            c.rtx_at = -1;
+        } else {
+            c.rtx_at = s.now + c.rto;
+        }
+    } else {
+        if seq_lt(c.snd_nxt, g.ack) {
+            s.tcp.set(ci, c);
+            tcp_ack_now(s, ci);
+            return;
+        }
+        if g.ack == c.snd_una && g.data.len() == 0 && c.snd_una != c.snd_nxt {
+            c.dup_acks = c.dup_acks + 1;
+        }
+    }
+    if seq_lt(c.snd_wl1, g.seq) || (c.snd_wl1 == g.seq && seq_le(c.snd_wl2, g.ack)) {
+        c.snd_wnd = g.window;
+        c.snd_wl1 = g.seq;
+        c.snd_wl2 = g.ack;
+    }
+    var fin_acked: bool = c.fin_seq >= 0 && seq_lt(c.fin_seq, c.snd_una);
+    if fin_acked {
+        if c.state == TCP_FIN_WAIT_1 { c.state = TCP_FIN_WAIT_2; }
+        if c.state == TCP_CLOSING {
+            c.state = TCP_TIME_WAIT;
+            c.tw_at = s.now + 2 * s.msl;
+        }
+        if c.state == TCP_LAST_ACK {
+            c.state = TCP_CLOSED;
+            c.rtx_at = -1;
+            s.tcp.set(ci, c);
+            return;
+        }
+    }
+    var need_ack: bool = false;
+    if g.data.len() > 0 && (c.state == TCP_ESTABLISHED || c.state == TCP_FIN_WAIT_1 || c.state == TCP_FIN_WAIT_2) {
+        tcp_take_data(&mut c, g.seq, g.data);
+        need_ack = true;
+    }
+    if (g.flags & TCP_FIN) != 0 && c.peer_fin < 0 {
+        c.peer_fin = seq_add(g.seq, g.data.len());
+    }
+    if c.peer_fin >= 0 && c.rcv_nxt == c.peer_fin {
+        c.rcv_nxt = seq_add(c.rcv_nxt, 1);
+        need_ack = true;
+        if c.state == TCP_ESTABLISHED || c.state == TCP_SYN_RCVD { c.state = TCP_CLOSE_WAIT; }
+        if c.state == TCP_FIN_WAIT_1 {
+            if fin_acked {
+                c.state = TCP_TIME_WAIT;
+                c.tw_at = s.now + 2 * s.msl;
+            } else {
+                c.state = TCP_CLOSING;
+            }
+        }
+        if c.state == TCP_FIN_WAIT_2 {
+            c.state = TCP_TIME_WAIT;
+            c.tw_at = s.now + 2 * s.msl;
+        }
+    } else {
+        if (g.flags & TCP_FIN) != 0 {
+            need_ack = true;
+        }
+    }
+    s.tcp.set(ci, c);
+    if need_ack {
+        tcp_ack_now(s, ci);
+    }
+    tcp_output(s, ci);
+}
+
+fn tcp_retransmit(s: & mut NetStack, ci: i64) {
+    var c: TcpConn = s.tcp.get(ci);
+    c.rtx_count = c.rtx_count + 1;
+    c.retransmits = c.retransmits + 1;
+    if c.rtx_count > 8 {
+        c.state = TCP_CLOSED;
+        c.rtx_at = -1;
+        c.error = "timed out";
+        s.tcp.set(ci, c);
+        return;
+    }
+    c.rto = c.rto * 2;
+    if c.rto > 60000 { c.rto = 60000; }
+    c.rtx_at = s.now + c.rto;
+    c.rtt_seq = -1;
+    // Karn: no RTT sample from a retransmitted segment
+    c.cwnd = c.mss;
+    s.tcp.set(ci, c);
+    if c.state == TCP_SYN_SENT {
+        tcp_emit(s, ci, c.iss, TCP_SYN, Vec::new());
+        return;
+    }
+    if c.state == TCP_SYN_RCVD {
+        tcp_emit(s, ci, c.iss, TCP_SYN | TCP_ACK, Vec::new());
+        return;
+    }
+    var unacked: i64 = seq_diff(c.snd_nxt, c.snd_una);
+    var fin_out: bool = c.fin_seq >= 0 && seq_le(c.snd_una, c.fin_seq);
+    var data_out: i64 = unacked;
+    if fin_out { data_out = data_out - 1; }
+    if data_out > 0 {
+        var n: i64 = c.mss;
+        if data_out < n { n = data_out; }
+        tcp_emit(s, ci, c.snd_una, TCP_ACK | TCP_PSH, net_slice(c.sendbuf, 0, n));
+        return;
+    }
+    if fin_out {
+        tcp_emit(s, ci, c.fin_seq, TCP_FIN | TCP_ACK, Vec::new());
+        return;
+    }
+    if c.snd_wnd == 0 && c.sendbuf.len() > 0 {
+        // zero-window probe: one byte beyond the window
+        c = s.tcp.get(ci);
+        c.snd_nxt = seq_add(c.snd_una, 1);
+        s.tcp.set(ci, c);
+        tcp_emit(s, ci, c.snd_una, TCP_ACK, net_slice(c.sendbuf, 0, 1));
+    }
+}
+
+// ─── Clock ──────────────────────────────────────────────────────────────
+
+/// Advance the stack's clock and run its timers.
+pub fn net_tick(s: & mut NetStack, now: i64) {
+    s.now = now;
+    // ARP: expire entries, retry pending requests (1 s, 3 tries)
+    var i: i64 = 0;
+    while i < s.arp.len() {
+        var e: ArpEntry = s.arp.get(i);
+        if e.resolved && e.expires <= now {
+            s.arp.remove(i);
+        } else {
+            if !e.resolved && now - e.asked_at >= 1000 {
+                if e.tries >= 3 {
+                    s.arp.remove(i);
+                    var k: i64 = 0;
+                    while k < s.pending.len() {
+                        if s.pending.get(k).hop == e.ip {
+                            s.pending.remove(k);
+                            s.dropped = s.dropped + 1;
+                        } else {
+                            k = k + 1;
+                        }
+                    }
+                } else {
+                    e.tries = e.tries + 1;
+                    e.asked_at = now;
+                    s.arp.set(i, e);
+                    arp_request(s, e.ip);
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    // reassembly timeouts
+    i = 0;
+    while i < s.frags.len() {
+        if s.frags.get(i).deadline <= now {
+            s.frags.remove(i);
+            s.frag_timeouts = s.frag_timeouts + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    // TCP retransmission and TIME_WAIT
+    i = 0;
+    while i < s.tcp.len() {
+        var c: TcpConn = s.tcp.get(i);
+        if c.state == TCP_TIME_WAIT && c.tw_at >= 0 && c.tw_at <= now {
+            c.state = TCP_CLOSED;
+            s.tcp.set(i, c);
+        }
+        if c.state != TCP_CLOSED && c.state != TCP_TIME_WAIT && c.rtx_at >= 0 && c.rtx_at <= now {
+            tcp_retransmit(s, i);
+        }
+        i = i + 1;
+    }
+}

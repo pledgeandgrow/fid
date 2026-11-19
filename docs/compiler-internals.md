@@ -25,14 +25,15 @@ source .fd
      codegen_c.fd                   C text -> zig cc / cl / tcc      (`fid ccompile`)
      pe_ir.fd / pe_ir_stubs.fd      direct PE .exe, Windows          (`fid emit`, default)
      nat_ir.fd / nat_enc.fd         direct ELF, x86_64/aarch64/riscv64 Linux (`emit --target *-linux`)
-     codegen_x64/arm64/riscv.fd     asm text paths (`fid codegen --target`)
+     (`fid codegen --target` / `fid disasm` print the machine layer's code;
+      codegen_x64/arm64/riscv.fd, the old asm text paths, are no longer reached)
      wasm.fd                        WASM/WAT (`fid wasm`)
    runtime: runtime.fd (shared), runtime_linux.fd (nat syscalls), pe_runtime/
    linker: linker.fd, elf64.fd, coff.fd, macho.fd
 ```
 
 Entry point: `compiler/main.fd` — command dispatch (`run`, `emit`, `build`,
-`ccompile`, `codegen`, `wasm`, `ir`, `pir`, `dump-*`, `ark`, `scribe`,
+`ccompile`, `codegen`, `wasm`, `ir`, `opt`, `dump-*`, `ark`, `scribe`,
 `veil`, `audit`, `qualify`, `parse-header`, ...). `compiler/compiler.fd`
 holds `build_program*` — lex/parse/check/mono driver.
 

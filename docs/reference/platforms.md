@@ -15,6 +15,13 @@ expected-fail 89/89); Linux CI last ran green in session 37. The Nov 4–6
 changes were checked with `fid run`, `fid ccompile` and `fid emit` on their
 tests. The table lists what Tier 1 covered when CI ran.
 
+Nov 17: [.github/workflows/tier1.yml](../../.github/workflows/tier1.yml)
+runs `scripts/tier1.sh` (lanes, expected failures, binaries) on
+windows-latest, ubuntu-latest, ubuntu-24.04-arm and macos-15; what each
+lane checks, and what a target skips, is in
+[tier-checks.md](tier-checks.md). A platform counts as Tier 1 once its job
+is green.
+
 | Platform | Backends | What CI runs |
 |---|---|---|
 | Windows x64 | interpreter, C, native (PE, `fid emit`) | the suite on all three, expected failures, every stdlib module, the native fixpoint, an installed `fid`. Native async/tasks worked on Nov 6 and broke in builds of Nov 9 afternoon (iropt passes; fixed again in the evening's fid31, known-bugs 2f.2); the interpreters run an `async fn` to the end at the call (`test_async_suspend`) |
@@ -33,7 +40,7 @@ every commit.
 | Linux RISC-V 64 | C (`--target riscv64-linux`) | same path as ARM64; sample programs run under qemu-riscv64; the full suite has not completed (release F8) |
 | Linux ARM64, RISC-V 64 native | `fid emit --target aarch64-linux` / `riscv64-linux` | static ELF, no C compiler or linker (compiler/nat_ir.fd: a machine IR and one register allocator for the three Linux targets; stdlib/linux_runtime: threads, M:N tasks, channels, sockets, processes, musl's math, panics with traces, guard pages); under QEMU 273 (ARM64) and 271 (RISC-V) of 317 suite tests match the interpreter (Nov 9); most of the rest are references the 19:03 interpreter could not produce (release F8) |
 | macOS x64 and ARM64 | C (`--target x86_64-macos`, `aarch64-macos`) | Mach-O executables build from any host with `zig cc`, and so does the compiler itself; not run (no Mac); CI job written in `scripts/ci/cross.yml` (release F5) |
-| WebAssembly (WASI) | C (`--target wasm32-wasi`) | `.wasm` from `zig cc`, run with `node scripts/wasm-run.mjs`; sample programs run; tasks run to their end when entered, no processes, signals or socket creation; the full suite has not completed (release F9) |
+| WebAssembly (WASI) | C (`--target wasm32-wasi`) | `.wasm` from `zig cc`, run with `node scripts/wasm-run.mjs`; sample programs run; tasks and `spawn` run to their end when entered; starting a process panics (`not available in WebAssembly: processes (...)`), no signals or socket creation; typed fixed-size array bindings compile (CI5); the full suite has not completed (release F9) |
 
 Run a target's suite with `scripts/cross-test.sh <target>`: it builds every
 test through C for the target, runs it (qemu-user in WSL or on Linux, Node for
@@ -42,12 +49,16 @@ exit code with the interpreter's. `NATIVE=1` builds with the native backend
 (`fid emit --target aarch64-linux|riscv64-linux|x86_64-linux`, and `--nat`
 for `x86_64-windows`) instead of C.
 
+Which commands need a C toolchain to cross-compile (only `ccompile --target`,
+through zig) and which need none (`fid build`/`emit --target`, any host):
+docs/reference/cross-compilation.md.
+
 ## Tier 3: present, not supported
 
 | Platform | Backends | Status |
 |---|---|---|
-| WebAssembly native | `fid wasm` | its modules fail validation; no collections (release F9) |
-| macOS native | Mach-O objects | no executables yet (release F7) |
+| WebAssembly native | `fid wasm` | Nov 15: valid modules over WASI preview 1, no C compiler (compiler/wasm.fd, stdlib/linux_runtime/wasi.fd); 316 of 344 suite tests match `fid run` (scripts/wasm-test.sh `ALL=1`, Nov 15). Nov 18: tasks switch stacks (asyncify-style, compiler/wasm.fd "Tasks"; threads still run to their end), structured control flow (TG16), an index into a fixed-size array checked as the interpreter does; processes are a clear panic `not available in WebAssembly: processes (...)`, C functions without a WebAssembly version panic when called, bare-metal builtins do nothing (release F9) |
+| macOS native | `fid emit --target x86_64-macos\|aarch64-macos` (machine layer) | Mach-O executables (PIE, dyld binds into a GOT, ad-hoc code signature, a symbol table; compiler/nat_enc.fd `nat_macho`, runtime stdlib/linux_runtime/darwin.fd) build from any host and pass scripts/macho-check.py; not run on a Mac yet (release F7) |
 | Bare metal | `emit --bare`, `--boot` | `fid emit --bare` writes flat binaries since Nov 6 (release G2); run on a hosted test runner, not yet under QEMU (G1) |
 | Old PIR backends | `build --native` (default target), `build-x86`, `codegen --target x86-64\|arm64\|riscv`, `codegen --elf\|--coff\|--macho`, `emit --boot` | Nov 9: `build --native` panics in the PIR optimizer, `build-x86` writes an exe that segfaults, `emit --boot` panics; `codegen` prints assembly (ARM64/RISC-V assembly is wrong: `return` for `ret`); COFF objects are valid, Mach-O headers correct but never linked, x86-64 ELF objects have malformed section headers (known-bugs 2g.16) |
 | Android, iOS | none | not started (PL6) |

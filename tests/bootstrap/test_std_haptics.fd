@@ -1,0 +1,73 @@
+// stdlib/haptics: a pattern rendered as an Android createWaveform (gaps,
+// pulse lengths from sharpness, merging, repeat index), the on/off form,
+// validation, the AHAP JSON of Core Haptics and its parse/regenerate
+// round trip, and the impact styles.
+// Expected output:
+// duration 520
+// timings 5 95 300 100 20
+// amplitudes 255 0 128 0 77
+// repeat 2
+// onoff 0 5 95 300 120
+// valid 0
+// {"Version":1.0,"Pattern":[{"Event":{"Time":0.0,"EventType":"HapticTransient","EventParameters":[{"ParameterID":"HapticIntensity","ParameterValue":1.0},{"ParameterID":"HapticSharpness","ParameterValue":1.0}]}},{"Event":{"Time":0.1,"EventType":"HapticContinuous","EventDuration":0.3,"EventParameters":[{"ParameterID":"HapticIntensity","ParameterValue":0.5},{"ParameterID":"HapticSharpness","ParameterValue":0.2}]}},{"Event":{"Time":0.5,"EventType":"HapticTransient","EventParameters":[{"ParameterID":"HapticIntensity","ParameterValue":0.3},{"ParameterID":"HapticSharpness","ParameterValue":0.0}]}},{"ParameterCurve":{"ParameterID":"HapticIntensityControl","Time":0.1,"ParameterCurveControlPoints":[{"Time":0.0,"ParameterValue":0.2},{"Time":0.3,"ParameterValue":1.0}]}}]}
+// json valid true parsed true events 3 curves 1 round trip true
+// errors 3
+// event at 3 ms: intensity outside 0..1
+// event at 3 ms: overlaps the previous event
+// event at 40 ms: continuous event longer than 30 s
+// impact medium 12 ms amp 179 android effect heavy 5
+// numbers 0.25 1.0 0.333 -0.5
+// calls android/os/VibrationEffect.createWaveform ([J[II)Landroid/os/VibrationEffect; CHHapticEngine.playPatternFromData:error:
+use haptics;
+use vec;
+use string;
+use json;
+
+fn ints(label: str, v: Vec<i64>) -> str {
+    var s: str = label;
+    var i: i64 = 0;
+    while i < v.len() { s = s + " " + int_to_str(v.get(i)); i = i + 1; }
+    return s;
+}
+
+fn main() {
+    var p: HapticPattern = haptic_pattern_new();
+    haptic_add_continuous(&mut p, 100, 300, 0.5, 0.2);
+    haptic_add_transient(&mut p, 500, 0.3, 0.0);
+    haptic_add_transient(&mut p, 0, 1.0, 1.0);
+    var ct: Vec<i64> = Vec::new();
+    ct.push(0); ct.push(300);
+    var cv: Vec<f64> = Vec::new();
+    cv.push(0.2); cv.push(1.0);
+    haptic_add_curve(&mut p, 100, ct, cv);
+    println("duration " + int_to_str(haptic_duration(&p)));
+    val w: Waveform = haptic_android_waveform(&p, 100);
+    println(ints("timings", w.timings));
+    println(ints("amplitudes", w.amplitudes));
+    println("repeat " + int_to_str(w.repeat));
+    println(ints("onoff", haptic_android_onoff(&w, 100)));
+    println("valid " + int_to_str(haptic_validate(&p).len()));
+    val ahap: str = haptic_ahap(&p);
+    println(ahap);
+    val back: AhapParsed = haptic_parse_ahap(ahap);
+    println("json valid " + bool_to_str(json_is_valid(ahap)) + " parsed " + bool_to_str(back.ok) + " events "
+        + int_to_str(back.pattern.events.len()) + " curves " + int_to_str(back.pattern.curves.len())
+        + " round trip " + bool_to_str(haptic_ahap(&back.pattern) == ahap));
+
+    var bad: HapticPattern = haptic_pattern_new();
+    haptic_add_transient(&mut bad, 0, 1.0, 1.0);
+    haptic_add_transient(&mut bad, 3, 1.5, 0.5);
+    haptic_add_continuous(&mut bad, 40, 31000, 0.5, 0.5);
+    val errs: Vec<str> = haptic_validate(&bad);
+    println("errors " + int_to_str(errs.len()));
+    var i: i64 = 0;
+    while i < errs.len() { println(errs.get(i)); i = i + 1; }
+
+    val im: Waveform = haptic_android_waveform(&haptic_impact_pattern(IOS_IMPACT_MEDIUM), -1);
+    println("impact medium " + int_to_str(im.timings.get(0)) + " ms amp " + int_to_str(im.amplitudes.get(0))
+        + " android effect heavy " + int_to_str(haptic_impact_android_effect(IOS_IMPACT_HEAVY)));
+    println("numbers " + haptic_num(0.25) + " " + haptic_num(1.0) + " " + haptic_num(0.3333) + " " + haptic_num(-0.5));
+    val ac: Vec<HapticCall> = haptic_android_calls();
+    val ic: Vec<HapticCall> = haptic_ios_calls();
+    println("calls " + ac.get(0).cls + "." + ac.get(0).method + " " + ac.get(0).sig + " " + ic.get(2).cls + "." + ic.get(2).method);
+}

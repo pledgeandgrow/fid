@@ -1,0 +1,691 @@
+// Fides motor control library (robotics / devices)
+//
+// The computation behind the usual motor drivers:
+//   - DC motor on an H-bridge: a signed command -> bridge inputs (IN1/IN2,
+//     sign-magnitude PWM), coast or brake at zero, a deadband, a maximum
+//     duty, and a current limit that folds the duty back while the
+//     measured current is over the limit and recovers slowly after. A DC
+//     motor model (R, L, Ke, Kt, J, b) to simulate a loop.
+//   - Stepper motors: wave, full (two phases on) and half step coil tables,
+//     sine/cosine microstepping, the 4-wire unipolar (ULN2003) half-step bit
+//     patterns, exact step timing of a trapezoidal or triangular move
+//     (t_k = sqrt(2 k / a) while accelerating), and the real-time step
+//     delay generator of D. Austin ("Generate stepper-motor speed profiles
+//     in real time", 2005) as AccelStepper runs it: c_n = c_{n-1} -
+//     2 c_{n-1} / (4 n + 1), with deceleration started when the steps
+//     needed to stop reach the steps left.
+//   - Hobby servos: angle <-> pulse width, pulse width <-> timer compare.
+//   - BLDC six-step commutation: Hall code -> sector -> which phase is high,
+//     low or floating, forward and reverse.
+//   - The FOC math core: Clarke (amplitude invariant) and Park transforms
+//     and their inverses, and space-vector PWM by min-max zero-sequence
+//     injection (the same duties as the classic sector/dwell-time SVPWM),
+//     with the sector number and overmodulation limited to the inscribed
+//     circle (|v| <= Vdc / sqrt 3).
+//   - Quadrature encoders: the 16-entry transition table (x4 decoding),
+//     illegal transitions counted as errors, counts -> angle and speed.
+//
+// Everything is pure computation. The seam is the caller: it writes the
+// returned `HBridge` levels and duty, `StepCoils` currents, compare values
+// or `PhaseDrive` to its timer/GPIO registers, and feeds measured currents,
+// Hall codes and encoder A/B levels back in.
+//
+// Usage:
+//   use motor;
+//   var m: DcMotor = dcm_new(0.95, 2.0);
+//   val hb: HBridge = dcm_command(&mut m, -0.5, measured_amps);
+//   // drive IN1 = hb.in1, IN2 = hb.in2 with PWM duty hb.duty
+
+module motor;
+use math;
+use quat;
+
+// ─── DC motor on an H-bridge ───
+
+pub const MOTOR_COAST: i64 = 0;
+pub const MOTOR_FORWARD: i64 = 1;
+pub const MOTOR_REVERSE: i64 = 2;
+pub const MOTOR_BRAKE: i64 = 3;
+
+/// Settings and current-limit state of one DC motor channel.
+pub struct DcMotor {
+    pub max_duty: f64,
+    pub deadband: f64,
+    pub current_limit: f64,
+    // how fast the fold-back recovers per update (fraction of full duty)
+    pub recover: f64,
+    // fold-back factor now (1: no limiting)
+    pub scale: f64,
+    // brake (both low-side on) instead of coasting at zero command
+    pub brake_at_zero: bool,
+    pub limited: bool,
+}
+
+/// What to put on the bridge: the logic level of each input while the PWM
+/// is on, the PWM duty in [0, 1] and the mode (MOTOR_*).
+pub struct HBridge {
+    pub in1: bool,
+    pub in2: bool,
+    pub duty: f64,
+    pub mode: i64,
+}
+
+/// A motor with a maximum duty and a current limit (amps; <= 0: none).
+pub fn dcm_new(max_duty: f64, current_limit: f64) -> DcMotor {
+    return DcMotor { max_duty: max_duty, deadband: 0.0, current_limit: current_limit, recover: 0.05, scale: 1.0, brake_at_zero: false, limited: false };
+}
+
+/// Commands with |cmd| <= db give zero output.
+pub fn dcm_set_deadband(m: & mut DcMotor, db: f64) {
+    m.deadband = db;
+}
+
+/// Brake (true) or coast (false) when the command is zero.
+pub fn dcm_set_brake_at_zero(m: & mut DcMotor, on: bool) {
+    m.brake_at_zero = on;
+}
+
+/// Bridge levels for a command in [-1, 1] given the measured current.
+/// Over the limit the duty is scaled by limit / current (cumulatively);
+/// under it the scale recovers by `recover` per call up to 1.
+pub fn dcm_command(m: & mut DcMotor, cmd: f64, current: f64) -> HBridge {
+    var c: f64 = rmath_clamp(cmd, - 1.0, 1.0);
+    val ia: f64 = math_fabs(current);
+    m.limited = false;
+    if m.current_limit > 0.0 && ia > m.current_limit {
+        m.scale = m.scale * m.current_limit / ia;
+        m.limited = true;
+    } else {
+        m.scale = rmath_min(1.0, m.scale + m.recover);
+    }
+    if math_fabs(c) <= m.deadband {
+        if m.brake_at_zero {
+            return HBridge { in1: true, in2: true, duty: 1.0, mode: MOTOR_BRAKE };
+        }
+        return HBridge { in1: false, in2: false, duty: 0.0, mode: MOTOR_COAST };
+    }
+    val duty: f64 = math_fabs(c) * m.max_duty * m.scale;
+    if c > 0.0 {
+        return HBridge { in1: true, in2: false, duty: duty, mode: MOTOR_FORWARD };
+    }
+    return HBridge { in1: false, in2: true, duty: duty, mode: MOTOR_REVERSE };
+}
+
+/// An explicit brake (both inputs high, full duty).
+pub fn dcm_brake() -> HBridge {
+    return HBridge { in1: true, in2: true, duty: 1.0, mode: MOTOR_BRAKE };
+}
+
+/// The timer compare value for a duty, rounded, in [0, period].
+pub fn motor_pwm_compare(duty: f64, period: i64) -> i64 {
+    val d: f64 = rmath_clamp(duty, 0.0, 1.0);
+    return math_floor(d * (period as f64) + 0.5) as i64;
+}
+
+/// A brushed DC motor: V = R i + L di/dt + Ke w; J dw/dt = Kt i - b w - load.
+pub struct DcModel {
+    pub r: f64,
+    pub l: f64,
+    pub ke: f64,
+    pub kt: f64,
+    pub j: f64,
+    pub b: f64,
+    pub i: f64,
+    pub w: f64,
+    pub theta: f64,
+}
+
+pub fn dcmodel_new(r: f64, l: f64, ke: f64, kt: f64, j: f64, b: f64) -> DcModel {
+    return DcModel { r: r, l: l, ke: ke, kt: kt, j: j, b: b, i: 0.0, w: 0.0, theta: 0.0 };
+}
+
+/// Advance the model by dt with voltage v and load torque, in `sub` equal
+/// semi-implicit Euler substeps.
+pub fn dcmodel_step(m: & mut DcModel, v: f64, load: f64, dt: f64, sub: i64) {
+    var n: i64 = sub;
+    if n < 1 {
+        n = 1;
+    }
+    val h: f64 = dt / (n as f64);
+    var k: i64 = 0;
+    while k < n {
+        m.i = m.i + h * (v - m.r * m.i - m.ke * m.w) / m.l;
+        m.w = m.w + h * (m.kt * m.i - m.b * m.w - load) / m.j;
+        m.theta = m.theta + h * m.w;
+        k = k + 1;
+    }
+}
+
+/// The steady-state speed at voltage v with no load.
+pub fn dcmodel_steady_speed(m: & DcModel, v: f64) -> f64 {
+    return v * m.kt / (m.r * m.b + m.kt * m.ke);
+}
+
+// ─── Steppers ───
+
+pub const STEP_WAVE: i64 = 0;
+pub const STEP_FULL: i64 = 1;
+pub const STEP_HALF: i64 = 2;
+pub const STEP_MICRO: i64 = 3;
+
+/// Coil currents of a two-phase stepper, each in [-1, 1].
+pub struct StepCoils {
+    pub a: f64,
+    pub b: f64,
+}
+
+/// Positions per electrical cycle (4 full steps) in a mode.
+pub fn stp_cycle_len(mode: i64, micro: i64) -> i64 {
+    if mode == STEP_HALF {
+        return 8;
+    }
+    if mode == STEP_MICRO {
+        return 4 * micro;
+    }
+    return 4;
+}
+
+fn stp_sgn_round(x: f64) -> f64 {
+    if math_fabs(x) < 0.000000000001 {
+        return 0.0;
+    }
+    return x;
+}
+
+/// The coil currents at position `pos` (any integer, taken modulo the
+/// cycle) in a mode; `micro` microsteps per full step for STEP_MICRO.
+/// Wave and micro start with phase A alone; full drives both phases.
+pub fn stp_coils(mode: i64, pos: i64, micro: i64) -> StepCoils {
+    val n: i64 = stp_cycle_len(mode, micro);
+    var p: i64 = pos % n;
+    if p < 0 {
+        p = p + n;
+    }
+    if mode == STEP_FULL {
+        if p == 0 {
+            return StepCoils { a: 1.0, b: 1.0 };
+        }
+        if p == 1 {
+            return StepCoils { a: - 1.0, b: 1.0 };
+        }
+        if p == 2 {
+            return StepCoils { a: - 1.0, b: - 1.0 };
+        }
+        return StepCoils { a: 1.0, b: - 1.0 };
+    }
+    if mode == STEP_HALF {
+        val ha: Vec<f64> = stp_half_a();
+        val hb: Vec<f64> = stp_half_b();
+        return StepCoils { a: ha.get(p), b: hb.get(p) };
+    }
+    // wave = micro with one microstep per full step
+    var m: i64 = micro;
+    if mode == STEP_WAVE {
+        m = 1;
+    }
+    val th: f64 = 2.0 * rmath_pi() * (p as f64) / ((4 * m) as f64);
+    return StepCoils { a: stp_sgn_round(math_cos(th)), b: stp_sgn_round(math_sin(th)) };
+}
+
+fn stp_half_a() -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    v.push(1.0); v.push(1.0); v.push(0.0); v.push(- 1.0);
+    v.push(- 1.0); v.push(- 1.0); v.push(0.0); v.push(1.0);
+    return v;
+}
+
+fn stp_half_b() -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    v.push(0.0); v.push(1.0); v.push(1.0); v.push(1.0);
+    v.push(0.0); v.push(- 1.0); v.push(- 1.0); v.push(- 1.0);
+    return v;
+}
+
+/// DAC values (-imax..imax, rounded) of the coil currents.
+pub fn stp_dac(c: StepCoils, imax: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val s: f64 = imax as f64;
+    out.push(motor_round(c.a * s));
+    out.push(motor_round(c.b * s));
+    return out;
+}
+
+/// Round half away from zero.
+pub fn motor_round(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (math_floor(0.0 - x + 0.5) as i64);
+    }
+    return math_floor(x + 0.5) as i64;
+}
+
+/// The 4 coil bits (bit 0 = IN1 .. bit 3 = IN4) of a unipolar motor
+/// (28BYJ-48 on a ULN2003) in half-step mode at position pos.
+pub fn stp_unipolar_half_bits(pos: i64) -> i64 {
+    var p: i64 = pos % 8;
+    if p < 0 {
+        p = p + 8;
+    }
+    if p == 0 {
+        return 1;
+    }
+    if p == 1 {
+        return 3;
+    }
+    if p == 2 {
+        return 2;
+    }
+    if p == 3 {
+        return 6;
+    }
+    if p == 4 {
+        return 4;
+    }
+    if p == 5 {
+        return 12;
+    }
+    if p == 6 {
+        return 8;
+    }
+    return 9;
+}
+
+/// Exact step delays (seconds) of a move of n steps that accelerates at
+/// `accel` steps/s^2 up to `vmax` steps/s, cruises, and decelerates at the
+/// same rate (a triangle when vmax is not reached). Delay k is the time
+/// between step k-1 and step k (step 0 at t = 0 is the start).
+pub fn stp_plan_exact(n: i64, accel: f64, vmax: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    if n <= 0 {
+        return out;
+    }
+    val nf: f64 = n as f64;
+    var na: f64 = vmax * vmax / (2.0 * accel);
+    if na > nf / 2.0 {
+        na = nf / 2.0;
+    }
+    val ta: f64 = math_sqrt(2.0 * na / accel);
+    val vpk: f64 = accel * ta;
+    val tc: f64 = (nf - 2.0 * na) / vpk;
+    val ttotal: f64 = 2.0 * ta + tc;
+    var prev: f64 = 0.0;
+    var k: i64 = 1;
+    while k <= n {
+        val s: f64 = k as f64;
+        var t: f64 = 0.0;
+        if s <= na {
+            t = math_sqrt(2.0 * s / accel);
+        } else if s <= nf - na {
+            t = ta + (s - na) / vpk;
+        } else {
+            t = ttotal - math_sqrt(2.0 * (nf - s) / accel);
+        }
+        out.push(t - prev);
+        prev = t;
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The real-time step generator (Austin's recurrence, AccelStepper's
+/// algorithm). Position and target are in steps; call `stepgen_next`
+/// after each step to get the delay before the next one.
+pub struct StepGen {
+    pub accel: f64,
+    pub vmax: f64,
+    pub pos: i64,
+    pub target: i64,
+    // signed step counter of the ramp: > 0 accelerating, < 0 decelerating
+    pub n: i64,
+    pub c0: f64,
+    pub cn: f64,
+    pub cmin: f64,
+    // steps/s, signed
+    pub speed: f64,
+    // 1 or -1
+    pub dir: i64,
+}
+
+pub fn stepgen_new(accel: f64, vmax: f64) -> StepGen {
+    return StepGen { accel: accel, vmax: vmax, pos: 0, target: 0, n: 0, c0: 0.676 * math_sqrt(2.0 / accel), cn: 0.0, cmin: 1.0 / vmax, speed: 0.0, dir: 1 };
+}
+
+pub fn stepgen_move_to(g: & mut StepGen, target: i64) {
+    g.target = target;
+}
+
+/// Compute the delay before the next step and take it: returns the delay
+/// in seconds, or 0.0 when the motor is at its target and stopped.
+pub fn stepgen_next(g: & mut StepGen) -> f64 {
+    val dist: i64 = g.target - g.pos;
+    val to_stop: i64 = math_floor(g.speed * g.speed / (2.0 * g.accel)) as i64;
+    if dist == 0 && to_stop <= 1 {
+        g.speed = 0.0;
+        g.n = 0;
+        return 0.0;
+    }
+    if dist > 0 {
+        if g.n > 0 {
+            if to_stop >= dist || g.dir < 0 {
+                g.n = 0 - to_stop;
+            }
+        } else if g.n < 0 {
+            if to_stop < dist && g.dir > 0 {
+                g.n = 0 - g.n;
+            }
+        }
+    } else if dist < 0 {
+        if g.n > 0 {
+            if to_stop >= 0 - dist || g.dir > 0 {
+                g.n = 0 - to_stop;
+            }
+        } else if g.n < 0 {
+            if to_stop < 0 - dist && g.dir < 0 {
+                g.n = 0 - g.n;
+            }
+        }
+    }
+    if g.n == 0 {
+        g.cn = g.c0;
+        if dist > 0 {
+            g.dir = 1;
+        } else {
+            g.dir = - 1;
+        }
+    } else {
+        g.cn = g.cn - 2.0 * g.cn / ((4 * g.n + 1) as f64);
+        if g.cn < g.cmin {
+            g.cn = g.cmin;
+        }
+    }
+    g.n = g.n + 1;
+    g.speed = (g.dir as f64) / g.cn;
+    g.pos = g.pos + g.dir;
+    return g.cn;
+}
+
+// ─── Hobby servos ───
+
+/// Pulse range for an angle range (standard: 1000..2000 us for 0..180 deg).
+pub struct Servo {
+    pub min_us: f64,
+    pub max_us: f64,
+    pub min_deg: f64,
+    pub max_deg: f64,
+}
+
+pub fn servo_new(min_us: f64, max_us: f64, min_deg: f64, max_deg: f64) -> Servo {
+    return Servo { min_us: min_us, max_us: max_us, min_deg: min_deg, max_deg: max_deg };
+}
+
+/// The pulse width (us) for an angle, clamped to the range.
+pub fn servo_pulse_us(s: & Servo, deg: f64) -> f64 {
+    val d: f64 = rmath_clamp(deg, s.min_deg, s.max_deg);
+    return s.min_us + (d - s.min_deg) * (s.max_us - s.min_us) / (s.max_deg - s.min_deg);
+}
+
+/// The angle a pulse width commands, clamped to the range.
+pub fn servo_angle(s: & Servo, us: f64) -> f64 {
+    val p: f64 = rmath_clamp(us, s.min_us, s.max_us);
+    return s.min_deg + (p - s.min_us) * (s.max_deg - s.min_deg) / (s.max_us - s.min_us);
+}
+
+/// Timer ticks of a pulse for a timer counting at `timer_hz`.
+pub fn servo_ticks(us: f64, timer_hz: f64) -> i64 {
+    return motor_round(us * timer_hz / 1000000.0);
+}
+
+// ─── BLDC six-step commutation ───
+
+/// Which way each phase is driven: 1 high side on, -1 low side on, 0 floating.
+pub struct PhaseDrive {
+    pub a: i64,
+    pub b: i64,
+    pub c: i64,
+}
+
+/// The sector (0..5) of a Hall code (bit 0 = Hall A, bit 1 = B, bit 2 = C)
+/// for sensors 120 degrees apart; -1 for the illegal codes 0 and 7.
+/// Forward rotation sees the codes 1, 3, 2, 6, 4, 5 (sectors 0..5).
+pub fn bldc_sector_from_hall(hall: i64) -> i64 {
+    if hall == 1 {
+        return 0;
+    }
+    if hall == 3 {
+        return 1;
+    }
+    if hall == 2 {
+        return 2;
+    }
+    if hall == 6 {
+        return 3;
+    }
+    if hall == 4 {
+        return 4;
+    }
+    if hall == 5 {
+        return 5;
+    }
+    return - 1;
+}
+
+/// The drive of sector s (0..5): A+B-, A+C-, B+C-, B+A-, C+A-, C+B-.
+/// Reverse uses the opposite currents (the sector three steps on).
+/// An illegal sector (< 0) floats every phase.
+pub fn bldc_drive(sector: i64, forward: bool) -> PhaseDrive {
+    if sector < 0 || sector > 5 {
+        return PhaseDrive { a: 0, b: 0, c: 0 };
+    }
+    var s: i64 = sector;
+    if !forward {
+        s = (s + 3) % 6;
+    }
+    if s == 0 {
+        return PhaseDrive { a: 1, b: - 1, c: 0 };
+    }
+    if s == 1 {
+        return PhaseDrive { a: 1, b: 0, c: - 1 };
+    }
+    if s == 2 {
+        return PhaseDrive { a: 0, b: 1, c: - 1 };
+    }
+    if s == 3 {
+        return PhaseDrive { a: - 1, b: 1, c: 0 };
+    }
+    if s == 4 {
+        return PhaseDrive { a: - 1, b: 0, c: 1 };
+    }
+    return PhaseDrive { a: 0, b: - 1, c: 1 };
+}
+
+/// The drive for a Hall code.
+pub fn bldc_commutate(hall: i64, forward: bool) -> PhaseDrive {
+    return bldc_drive(bldc_sector_from_hall(hall), forward);
+}
+
+/// "A+B-" style text of a drive ("off" when all float).
+pub fn bldc_drive_str(d: PhaseDrive) -> str {
+    var hi: str = "";
+    var lo: str = "";
+    if d.a == 1 { hi = "A"; }
+    if d.b == 1 { hi = "B"; }
+    if d.c == 1 { hi = "C"; }
+    if d.a == - 1 { lo = "A"; }
+    if d.b == - 1 { lo = "B"; }
+    if d.c == - 1 { lo = "C"; }
+    if str_len(hi) == 0 {
+        return "off";
+    }
+    return hi + "+" + lo + "-";
+}
+
+// ─── FOC math core ───
+
+/// A two-axis value (alpha/beta or d/q).
+pub struct Ab {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Three phase values.
+pub struct Abc {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+}
+
+/// Clarke transform, amplitude invariant, from two phase currents
+/// (a + b + c = 0): alpha = a, beta = (a + 2 b) / sqrt 3.
+pub fn foc_clarke(a: f64, b: f64) -> Ab {
+    return Ab { x: a, y: (a + 2.0 * b) / math_sqrt(3.0) };
+}
+
+/// Clarke transform from all three phases: alpha = (2a - b - c) / 3,
+/// beta = (b - c) / sqrt 3.
+pub fn foc_clarke3(v: Abc) -> Ab {
+    return Ab { x: (2.0 * v.a - v.b - v.c) / 3.0, y: (v.b - v.c) / math_sqrt(3.0) };
+}
+
+/// Inverse Clarke transform.
+pub fn foc_inv_clarke(ab: Ab) -> Abc {
+    val s3: f64 = math_sqrt(3.0) / 2.0;
+    return Abc { a: ab.x, b: 0.0 - 0.5 * ab.x + s3 * ab.y, c: 0.0 - 0.5 * ab.x - s3 * ab.y };
+}
+
+/// Park transform at electrical angle theta: alpha/beta -> d/q.
+pub fn foc_park(ab: Ab, theta: f64) -> Ab {
+    val c: f64 = math_cos(theta);
+    val s: f64 = math_sin(theta);
+    return Ab { x: ab.x * c + ab.y * s, y: 0.0 - ab.x * s + ab.y * c };
+}
+
+/// Inverse Park transform: d/q -> alpha/beta.
+pub fn foc_inv_park(dq: Ab, theta: f64) -> Ab {
+    val c: f64 = math_cos(theta);
+    val s: f64 = math_sin(theta);
+    return Ab { x: dq.x * c - dq.y * s, y: dq.x * s + dq.y * c };
+}
+
+/// Space-vector PWM: the phase duties (0..1, centre-aligned) for a voltage
+/// vector (alpha, beta) on a bus of vdc. A vector longer than vdc / sqrt 3
+/// (the linear range) is scaled down onto that circle.
+pub fn foc_svpwm(vab: Ab, vdc: f64) -> Abc {
+    var x: f64 = vab.x;
+    var y: f64 = vab.y;
+    val mag: f64 = math_sqrt(x * x + y * y);
+    val lim: f64 = vdc / math_sqrt(3.0);
+    if mag > lim {
+        x = x * lim / mag;
+        y = y * lim / mag;
+    }
+    val v: Abc = foc_inv_clarke(Ab { x: x, y: y });
+    val vmax: f64 = rmath_max(v.a, rmath_max(v.b, v.c));
+    val vmin: f64 = rmath_min(v.a, rmath_min(v.b, v.c));
+    val off: f64 = 0.0 - (vmax + vmin) / 2.0;
+    return Abc { a: 0.5 + (v.a + off) / vdc, b: 0.5 + (v.b + off) / vdc, c: 0.5 + (v.c + off) / vdc };
+}
+
+/// The SVPWM sector (1..6, 60 degrees each, sector 1 from 0 to 60 degrees).
+pub fn foc_sector(vab: Ab) -> i64 {
+    var a: f64 = rmath_atan2(vab.y, vab.x);
+    if a < 0.0 {
+        a = a + 2.0 * rmath_pi();
+    }
+    var s: i64 = (math_floor(a / (rmath_pi() / 3.0)) as i64) + 1;
+    if s > 6 {
+        s = 6;
+    }
+    return s;
+}
+
+// ─── Quadrature encoders ───
+
+/// The count change of a transition prev -> cur of the 2-bit state
+/// (A << 1) | B; forward is 00 -> 01 -> 11 -> 10. 2 marks an illegal
+/// transition (both lines changed).
+pub fn qenc_delta(prev: i64, cur: i64) -> i64 {
+    val idx: i64 = ((prev & 3) << 2) | (cur & 3);
+    // prev 0: 0 +1 -1 x; prev 1: -1 0 x +1; prev 2: +1 x 0 -1; prev 3: x -1 +1 0
+    if idx == 0 || idx == 5 || idx == 10 || idx == 15 {
+        return 0;
+    }
+    if idx == 1 || idx == 7 || idx == 8 || idx == 14 {
+        return 1;
+    }
+    if idx == 2 || idx == 4 || idx == 11 || idx == 13 {
+        return - 1;
+    }
+    return 2;
+}
+
+/// A x4 quadrature decoder.
+pub struct QuadEnc {
+    // lines per revolution (counts per revolution = 4 * cpr)
+    pub cpr: i64,
+    pub state: i64,
+    pub count: i64,
+    pub errors: i64,
+    pub last_count: i64,
+    pub speed: f64,
+}
+
+/// A decoder whose lines start at levels a, b.
+pub fn qenc_new(cpr: i64, a: bool, b: bool) -> QuadEnc {
+    return QuadEnc { cpr: cpr, state: qenc_state(a, b), count: 0, errors: 0, last_count: 0, speed: 0.0 };
+}
+
+fn qenc_state(a: bool, b: bool) -> i64 {
+    var s: i64 = 0;
+    if a {
+        s = 2;
+    }
+    if b {
+        s = s + 1;
+    }
+    return s;
+}
+
+/// Feed the current A/B levels; returns the count change (0, 1, -1; an
+/// illegal transition counts an error and changes nothing).
+pub fn qenc_update(e: & mut QuadEnc, a: bool, b: bool) -> i64 {
+    val cur: i64 = qenc_state(a, b);
+    val d: i64 = qenc_delta(e.state, cur);
+    e.state = cur;
+    if d == 2 {
+        e.errors = e.errors + 1;
+        return 0;
+    }
+    e.count = e.count + d;
+    return d;
+}
+
+/// The shaft angle in radians (count / (4 cpr) turns).
+pub fn qenc_angle(e: & QuadEnc) -> f64 {
+    return (e.count as f64) * 2.0 * rmath_pi() / ((4 * e.cpr) as f64);
+}
+
+/// The speed (rad/s) from the counts since the previous call, dt seconds ago.
+pub fn qenc_speed(e: & mut QuadEnc, dt: f64) -> f64 {
+    val d: i64 = e.count - e.last_count;
+    e.last_count = e.count;
+    e.speed = (d as f64) * 2.0 * rmath_pi() / ((4 * e.cpr) as f64) / dt;
+    return e.speed;
+}
+
+/// The A/B levels at quadrature position k (forward sequence 00 01 11 10),
+/// to drive a decoder in tests or simulations: bit 1 = A, bit 0 = B.
+pub fn qenc_pattern(k: i64) -> i64 {
+    var p: i64 = k % 4;
+    if p < 0 {
+        p = p + 4;
+    }
+    if p == 0 {
+        return 0;
+    }
+    if p == 1 {
+        return 1;
+    }
+    if p == 2 {
+        return 3;
+    }
+    return 2;
+}

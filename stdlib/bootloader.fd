@@ -1,0 +1,420 @@
+// Fides A/B bootloader logic, pure Fides.
+//
+// An image is a 48-byte header, a 64-byte Ed25519 signature (RFC 8032,
+// stdlib/ed25519.fd) and the payload:
+//   0  "FDIM" magic          4  header format (1)   5  flags
+//   6  u16 reserved (0)      8  u8 major  9 u8 minor  10 u16 patch
+//   12 u32 build             16 u32 security counter (anti-rollback)
+//   20 u32 payload size      24 u32 load address    28 u32 entry offset
+//   32 u32 CRC-32 of the payload                    36..47 reserved (0)
+// The signature covers header || payload, so changing any header field
+// (the version, the counter) or any payload byte invalidates it. The CRC
+// is a cheap first check before the signature.
+//
+// Slot metadata (per slot: state, remaining trial boots, and the version
+// and counter of the image last installed) and the global minimum
+// security counter are kept in two copies, each with a generation number
+// and a CRC-32 (bl_meta_encode / bl_meta_pick): an update writes the copy
+// with the older generation, so a power cut while writing leaves the
+// other copy valid.
+//
+// Boot decision (bl_decide), the usual A/B scheme (MCUboot "test" swap,
+// Android A/B): a PENDING slot is tried first while it has trial boots
+// left (each attempt uses one); when it runs out without the application
+// having called bl_confirm, it becomes BAD and the confirmed slot boots
+// again (rollback). Among confirmed slots the higher version wins. A slot
+// boots only when its image verifies (magic, size, CRC, signature, the
+// public key given) and its security counter is at least the stored
+// minimum; bl_confirm raises the minimum to the confirmed image's counter,
+// so older images cannot be booted afterwards.
+//
+// The seam: reading slots from flash and jumping to the entry point are
+// the board's; this module takes slot contents as byte vectors and
+// returns the decision and the metadata to write back.
+
+module bootloader;
+ use vec; use string; use ed25519;
+
+pub const BL_HDR_SIZE: i64 = 48;
+pub const BL_SIG_SIZE: i64 = 64;
+
+pub const SLOT_EMPTY: i64 = 0;
+pub const SLOT_PENDING: i64 = 1;
+pub const SLOT_CONFIRMED: i64 = 2;
+pub const SLOT_BAD: i64 = 3;
+
+pub fn bl_state_name(s: i64) -> str {
+    if s == SLOT_EMPTY { return "empty"; }
+    if s == SLOT_PENDING { return "pending"; }
+    if s == SLOT_CONFIRMED { return "confirmed"; }
+    if s == SLOT_BAD { return "bad"; }
+    return "?";
+}
+
+// ─── Byte helpers and CRC-32 ────────────────────────────────────────────
+
+fn bl_put(out: &mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn bl_get(b: Vec<i64>, at: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = n - 1;
+    while i >= 0 {
+        v = (v << 8) | (b.get(at + i) & 0xFF);
+        i = i - 1;
+    }
+    return v;
+}
+
+/// CRC-32 (IEEE, as zlib) of bytes[from..from+n).
+@wrapping
+pub fn bl_crc32(bytes: Vec<i64>, from: i64, n: i64) -> i64 {
+    var c: i64 = 0xFFFFFFFF;
+    var i: i64 = 0;
+    while i < n {
+        c = c ^ (bytes.get(from + i) & 0xFF);
+        var k: i64 = 0;
+        while k < 8 {
+            if (c & 1) != 0 { c = (c >> 1) ^ 0xEDB88320; } else { c = c >> 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// ─── Image header ───────────────────────────────────────────────────────
+
+pub struct ImageHeader {
+    pub major: i64,
+    pub minor: i64,
+    pub patch: i64,
+    pub build: i64,
+    pub counter: i64,
+    pub size: i64,
+    pub load_addr: i64,
+    pub entry: i64,
+    pub crc: i64,
+    pub flags: i64,
+}
+
+/// Version as one comparable number.
+pub fn bl_version_key(h: ImageHeader) -> i64 {
+    return h.major * 0x10000000000 + h.minor * 0x100000000 + h.patch * 0x10000 + (h.build & 0xFFFF);
+}
+
+pub fn bl_version_str(h: ImageHeader) -> str {
+    return int_to_str(h.major) + "." + int_to_str(h.minor) + "." + int_to_str(h.patch) + "+" + int_to_str(h.build);
+}
+
+pub fn bl_header_bytes(h: ImageHeader) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(70); b.push(68); b.push(73); b.push(77);
+    b.push(1);
+    b.push(h.flags & 0xFF);
+    bl_put(&mut b, 0, 2);
+    b.push(h.major & 0xFF);
+    b.push(h.minor & 0xFF);
+    bl_put(&mut b, h.patch, 2);
+    bl_put(&mut b, h.build, 4);
+    bl_put(&mut b, h.counter, 4);
+    bl_put(&mut b, h.size, 4);
+    bl_put(&mut b, h.load_addr, 4);
+    bl_put(&mut b, h.entry, 4);
+    bl_put(&mut b, h.crc, 4);
+    while b.len() < BL_HDR_SIZE { b.push(0); }
+    return b;
+}
+
+/// Parsed header; `ok` false (and `why`) when it is not one.
+pub struct ImageCheck {
+    pub ok: bool,
+    pub why: str,
+    pub hdr: ImageHeader,
+}
+
+fn bl_blank_header() -> ImageHeader {
+    return ImageHeader { major: 0, minor: 0, patch: 0, build: 0, counter: 0, size: 0, load_addr: 0, entry: 0, crc: 0, flags: 0 };
+}
+
+pub fn bl_parse_header(img: Vec<i64>) -> ImageCheck {
+    var c: ImageCheck = ImageCheck { ok: false, why: "", hdr: bl_blank_header() };
+    if img.len() < BL_HDR_SIZE + BL_SIG_SIZE { c.why = "too short"; return c; }
+    if img.get(0) != 70 || img.get(1) != 68 || img.get(2) != 73 || img.get(3) != 77 { c.why = "bad magic"; return c; }
+    if img.get(4) != 1 { c.why = "unknown header format " + int_to_str(img.get(4)); return c; }
+    c.hdr = ImageHeader {
+        major: img.get(8), minor: img.get(9), patch: bl_get(img, 10, 2), build: bl_get(img, 12, 4),
+        counter: bl_get(img, 16, 4), size: bl_get(img, 20, 4), load_addr: bl_get(img, 24, 4),
+        entry: bl_get(img, 28, 4), crc: bl_get(img, 32, 4), flags: img.get(5)
+    };
+    if img.len() != BL_HDR_SIZE + BL_SIG_SIZE + c.hdr.size { c.why = "size mismatch"; return c; }
+    if c.hdr.entry >= c.hdr.size { c.why = "entry outside the image"; return c; }
+    c.ok = true;
+    return c;
+}
+
+/// Build a signed image: the header is completed with the payload size
+/// and CRC, then header || payload is signed with the 32-byte seed.
+pub fn bl_build_image(h0: ImageHeader, payload: Vec<i64>, seed: Vec<i64>) -> Vec<i64> {
+    var h: ImageHeader = h0;
+    h.size = payload.len();
+    h.crc = bl_crc32(payload, 0, payload.len());
+    val hb: Vec<i64> = bl_header_bytes(h);
+    var msg: Vec<i64> = hb.clone();
+    var i: i64 = 0;
+    while i < payload.len() {
+        msg.push(payload.get(i));
+        i = i + 1;
+    }
+    val sig: Vec<i64> = ed25519_sign(seed, msg);
+    var img: Vec<i64> = hb;
+    i = 0;
+    while i < BL_SIG_SIZE {
+        img.push(sig.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < payload.len() {
+        img.push(payload.get(i));
+        i = i + 1;
+    }
+    return img;
+}
+
+/// Full check of an image: header, CRC, then the Ed25519 signature.
+pub fn bl_verify_image(img: Vec<i64>, public_key: Vec<i64>) -> ImageCheck {
+    var c: ImageCheck = bl_parse_header(img);
+    if !c.ok { return c; }
+    val off: i64 = BL_HDR_SIZE + BL_SIG_SIZE;
+    if bl_crc32(img, off, c.hdr.size) != c.hdr.crc {
+        c.ok = false;
+        c.why = "payload CRC mismatch";
+        return c;
+    }
+    var msg: Vec<i64> = Vec::new();
+    var sig: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < BL_HDR_SIZE {
+        msg.push(img.get(i));
+        i = i + 1;
+    }
+    while i < off {
+        sig.push(img.get(i));
+        i = i + 1;
+    }
+    while i < img.len() {
+        msg.push(img.get(i));
+        i = i + 1;
+    }
+    if !ed25519_verify(public_key, msg, sig) {
+        c.ok = false;
+        c.why = "bad signature";
+    }
+    return c;
+}
+
+// ─── Metadata ───────────────────────────────────────────────────────────
+
+pub struct SlotMeta {
+    pub state: i64,
+    pub tries: i64,
+    pub version: i64,
+    pub counter: i64,
+}
+
+pub struct BootMeta {
+    pub generation: i64,
+    pub min_counter: i64,
+    pub slots: Vec<SlotMeta>,
+    pub boots: i64,
+}
+
+pub fn bl_meta_new(nslots: i64) -> BootMeta {
+    var m: BootMeta = BootMeta { generation: 0, min_counter: 0, slots: Vec::new(), boots: 0 };
+    var i: i64 = 0;
+    while i < nslots {
+        m.slots.push(SlotMeta { state: SLOT_EMPTY, tries: 0, version: 0, counter: 0 });
+        i = i + 1;
+    }
+    return m;
+}
+
+/// Record that `img` was written to `slot`: pending with `tries` trial
+/// boots (tries 0: install as confirmed, for factory images).
+pub fn bl_install(m: &mut BootMeta, slot: i64, img: Vec<i64>, tries: i64) {
+    val c: ImageCheck = bl_parse_header(img);
+    var s: SlotMeta = SlotMeta { state: SLOT_PENDING, tries: tries, version: bl_version_key(c.hdr), counter: c.hdr.counter };
+    if tries == 0 { s.state = SLOT_CONFIRMED; }
+    if !c.ok { s.state = SLOT_BAD; }
+    m.slots.set(slot, s);
+}
+
+/// Serialized metadata copy: "FDBM", generation, min counter, boots,
+/// slot count, per slot state/tries/version/counter, CRC-32 of the rest.
+pub fn bl_meta_encode(m: BootMeta) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(70); b.push(68); b.push(66); b.push(77);
+    bl_put(&mut b, m.generation, 4);
+    bl_put(&mut b, m.min_counter, 4);
+    bl_put(&mut b, m.boots, 4);
+    b.push(m.slots.len());
+    var i: i64 = 0;
+    while i < m.slots.len() {
+        val s: SlotMeta = m.slots.get(i);
+        b.push(s.state);
+        b.push(s.tries);
+        bl_put(&mut b, s.version, 6);
+        bl_put(&mut b, s.counter, 4);
+        i = i + 1;
+    }
+    bl_put(&mut b, bl_crc32(b, 0, b.len()), 4);
+    return b;
+}
+
+pub struct MetaRead {
+    pub ok: bool,
+    pub meta: BootMeta,
+}
+
+pub fn bl_meta_decode(b: Vec<i64>) -> MetaRead {
+    var bad: MetaRead = MetaRead { ok: false, meta: bl_meta_new(0) };
+    if b.len() < 21 { return bad; }
+    if b.get(0) != 70 || b.get(1) != 68 || b.get(2) != 66 || b.get(3) != 77 { return bad; }
+    val n: i64 = b.get(16);
+    val total: i64 = 17 + n * 12 + 4;
+    if b.len() < total { return bad; }
+    if bl_crc32(b, 0, total - 4) != bl_get(b, total - 4, 4) { return bad; }
+    var m: BootMeta = BootMeta { generation: bl_get(b, 4, 4), min_counter: bl_get(b, 8, 4), slots: Vec::new(), boots: bl_get(b, 12, 4) };
+    var i: i64 = 0;
+    while i < n {
+        val o: i64 = 17 + i * 12;
+        m.slots.push(SlotMeta { state: b.get(o), tries: b.get(o + 1), version: bl_get(b, o + 2, 6), counter: bl_get(b, o + 8, 4) });
+        i = i + 1;
+    }
+    return MetaRead { ok: true, meta: m };
+}
+
+/// The valid copy with the newest generation; index 0 or 1 in `which`,
+/// -1 when neither is valid.
+pub struct MetaPick {
+    pub which: i64,
+    pub meta: BootMeta,
+}
+
+pub fn bl_meta_pick(copy0: Vec<i64>, copy1: Vec<i64>) -> MetaPick {
+    val a: MetaRead = bl_meta_decode(copy0);
+    val b: MetaRead = bl_meta_decode(copy1);
+    if a.ok && (!b.ok || a.meta.generation >= b.meta.generation) { return MetaPick { which: 0, meta: a.meta }; }
+    if b.ok { return MetaPick { which: 1, meta: b.meta }; }
+    return MetaPick { which: -1, meta: bl_meta_new(2) };
+}
+
+/// Which copy an update should overwrite: the one not picked, so the
+/// picked copy survives a power cut during the write.
+pub fn bl_meta_next_copy(p: MetaPick) -> i64 {
+    if p.which == 0 { return 1; }
+    return 0;
+}
+
+// ─── Boot decision ──────────────────────────────────────────────────────
+
+pub struct BootDecision {
+    pub slot: i64,
+    pub trial: bool,
+    pub reason: str,
+    pub meta: BootMeta,
+    pub log: Vec<str>,
+}
+
+fn bl_slot_ok(m: &BootMeta, img: Vec<i64>, pk: Vec<i64>, log: &mut Vec<str>, slot: i64) -> bool {
+    val c: ImageCheck = bl_verify_image(img, pk);
+    if !c.ok {
+        log.push("slot " + int_to_str(slot) + ": " + c.why);
+        return false;
+    }
+    if c.hdr.counter < m.min_counter {
+        log.push("slot " + int_to_str(slot) + ": security counter " + int_to_str(c.hdr.counter) + " < " + int_to_str(m.min_counter) + " (rollback)");
+        return false;
+    }
+    return true;
+}
+
+/// Decide what to boot from slot images `imgs` and the metadata. Returns
+/// the slot (-1: nothing bootable, stay in recovery), whether it is a
+/// trial boot, why, and the metadata to write back (generation advanced,
+/// trial counts used, failed slots marked bad).
+pub fn bl_decide(m0: BootMeta, imgs: Vec<Vec<i64>>, pk: Vec<i64>) -> BootDecision {
+    var m: BootMeta = m0;
+    m.generation = m.generation + 1;
+    m.boots = m.boots + 1;
+    var log: Vec<str> = Vec::new();
+    // 1. A pending slot with trial boots left.
+    var i: i64 = 0;
+    while i < m.slots.len() {
+        var s: SlotMeta = m.slots.get(i);
+        if s.state == SLOT_PENDING {
+            if s.tries <= 0 {
+                s.state = SLOT_BAD;
+                m.slots.set(i, s);
+                log.push("slot " + int_to_str(i) + ": trial boots used up without confirm, marked bad");
+            } else if bl_slot_ok(&m, imgs.get(i), pk, &mut log, i) {
+                s.tries = s.tries - 1;
+                m.slots.set(i, s);
+                return BootDecision { slot: i, trial: true, reason: "trial boot of slot " + int_to_str(i) + ", " + int_to_str(s.tries) + " tries left", meta: m, log: log };
+            } else {
+                s.state = SLOT_BAD;
+                m.slots.set(i, s);
+            }
+        }
+        i = i + 1;
+    }
+    // 2. Confirmed slots, highest version first.
+    var tried: Vec<bool> = Vec::filled(m.slots.len(), false);
+    while true {
+        var best: i64 = -1;
+        i = 0;
+        while i < m.slots.len() {
+            val s: SlotMeta = m.slots.get(i);
+            if s.state == SLOT_CONFIRMED && !tried.get(i) && (best < 0 || s.version > m.slots.get(best).version) { best = i; }
+            i = i + 1;
+        }
+        if best < 0 { break; }
+        tried.set(best, true);
+        if bl_slot_ok(&m, imgs.get(best), pk, &mut log, best) {
+            return BootDecision { slot: best, trial: false, reason: "boot confirmed slot " + int_to_str(best), meta: m, log: log };
+        }
+        var sb: SlotMeta = m.slots.get(best);
+        sb.state = SLOT_BAD;
+        m.slots.set(best, sb);
+    }
+    return BootDecision { slot: -1, trial: false, reason: "no bootable image", meta: m, log: log };
+}
+
+/// The running image in `slot` is healthy: confirm it and raise the
+/// anti-rollback minimum to its security counter.
+pub fn bl_confirm(m0: BootMeta, slot: i64) -> BootMeta {
+    var m: BootMeta = m0;
+    var s: SlotMeta = m.slots.get(slot);
+    s.state = SLOT_CONFIRMED;
+    s.tries = 0;
+    m.slots.set(slot, s);
+    if s.counter > m.min_counter { m.min_counter = s.counter; }
+    m.generation = m.generation + 1;
+    return m;
+}
+
+pub fn bl_meta_str(m: BootMeta) -> str {
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < m.slots.len() {
+        val s: SlotMeta = m.slots.get(i);
+        parts.push(int_to_str(i) + ":" + bl_state_name(s.state) + "/" + int_to_str(s.tries));
+        i = i + 1;
+    }
+    return "gen " + int_to_str(m.generation) + " min " + int_to_str(m.min_counter) + " [" + str_join(parts, " ") + "]";
+}

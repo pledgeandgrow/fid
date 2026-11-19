@@ -1,7 +1,7 @@
 // Fides HTTP Client standard library
 //
 // HTTP/1.1 client built on the runtime socket builtins
-// (p_net_connect / p_socket_write / p_socket_read). No external FFI
+// (p_co_connect / p_co_send / p_co_recv, each bounded by HC_TIMEOUT_MS). No external FFI
 // required — works on every native backend.
 //
 // LIMITATIONS (honest): HTTP only — no TLS, so no https:// URLs.
@@ -16,7 +16,7 @@
 //   println(r.body);
 
 module http_client;
- use vec; use string; use url; use dns; use mime;
+ use vec; use string; use dns; use mime; use trace; use url; use world;
 // ─── Response model ─────────────────────────────────────────────────────
 
 /// A parsed HTTP response. `status` 0 = transport failure.
@@ -50,12 +50,17 @@ pub fn http_resp_header(r: HttpResponse, name: str) -> str {
 
 // ─── Wire helpers ───────────────────────────────────────────────────────
 
+/// How long the connect and each read may wait (ms), as stdlib/https.fd.
+const HC_TIMEOUT_MS: i64 = 30000;
+
 fn hc_read_all(fd: i64) -> str {
     var out: str = "";
     var buf: i64 = p_malloc(8192);
     var bytes: Vec = Vec::new();
     while true {
-        var n: i64 = p_socket_read(fd, buf, 8192);
+        // C1: a read that waits past HC_TIMEOUT_MS (-2) ends the body as
+        // the end of the stream (0) and an error (-1) do
+        var n: i64 = p_co_recv(fd, buf, 8192, HC_TIMEOUT_MS);
         if n <= 0 {
             break;
         }
@@ -178,16 +183,18 @@ fn hc_parse(raw: str) -> HttpResponse {
 /// dns_lookup) or dotted IP. `extra_headers` may be "" or complete
 /// "K: v\r\nK2: v2\r\n" strings. `body` may be "".
 /// Returns HttpResponse with status 0 on transport failure.
+/// Under FIDES_TRACE each request is an "http.request" span (complaint CO2).
 pub fn http_request(method: str, host: str, port: i64, path: str, extra_headers: str, body: str) -> HttpResponse {
-    var ip: str = dns_lookup(host);
-    if str_len(ip) == 0 {
-        return hc_response(0);
+    val t0: i64 = trace_span_begin();
+    val r: HttpResponse = hc_request(method, host, port, path, extra_headers, body);
+    if t0 >= 0 {
+        trace_span_end(t0, "http.request", method + " " + host + ":" + int_to_str(port) + path, r.status > 0);
     }
-    var fd: i64 = p_net_connect(ip, port);
-    if fd < 0 {
-        return hc_response(0);
-    }
+    return r;
+}
 
+/// http_request's work, untraced.
+fn hc_request(method: str, host: str, port: i64, path: str, extra_headers: str, body: str) -> HttpResponse {
     var p: str = path;
     if str_len(p) == 0 {
         p = "/";
@@ -208,7 +215,40 @@ pub fn http_request(method: str, host: str, port: i64, path: str, extra_headers:
         req = req + body;
     }
 
-    p_socket_write_str(fd, req);
+    // a test's fake network (stdlib/world.fd, CT1): the same request
+    // text goes to the test's handler instead of a socket
+    if world_network_faked() {
+        var fake: str = world_net_exchange(host, port, req);
+        if str_len(fake) == 0 {
+            return hc_response(0);
+        }
+        return hc_parse(fake);
+    }
+
+    var ip: str = dns_lookup(host);
+    if str_len(ip) == 0 {
+        return hc_response(0);
+    }
+    // C1: the connect is bounded (a silent host would hold it for the
+    // system's limit), and so is each read (hc_read_all)
+    var fd: i64 = 0 - 1;
+    timeout(HC_TIMEOUT_MS) {
+        fd = p_co_connect(ip, port);
+    } else {
+        if fd >= 0 {
+            p_socket_close(fd);
+        }
+        return hc_response(0);
+    }
+    if fd < 0 {
+        return hc_response(0);
+    }
+    // the socket p_co_connect gives does not block: p_co_send writes all
+    // of it, waiting while the send buffer is full
+    if p_co_send(fd, req as i64, str_len(req)) != str_len(req) {
+        p_socket_close(fd);
+        return hc_response(0);
+    }
     var raw: str = hc_read_all(fd);
     p_socket_close(fd);
     if str_len(raw) == 0 {

@@ -121,16 +121,46 @@ node scripts/wasm-run.mjs out.wasm
 .\release\fid.exe emit <file.fd> --target aarch64-linux -o out
 .\release\fid.exe emit <file.fd> --target x86_64-linux -o out
 # Windows x64 on the same machine layer (opt-in; pe_ir stays the default):
-# a PE, the Linux runtime over kernel32/ws2_32 (stdlib/linux_runtime/win.fd)
+# a PE, the Linux runtime over kernel32/ws2_32 (stdlib/linux_runtime/win.fd);
+# floats in xmm2..xmm11 (MI14), vector registers xmm12..xmm15, the
+# exception handler keeps xmm6..xmm15
 .\release\fid.exe emit <file.fd> --nat -o out.exe
 NATIVE=1 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh x86_64-windows
 # Checks of the own backend (docs/roadmap/llvm-roadmap.md): FID_VERIFY=1 runs
 # the IR verifier and the register-allocation checker; FID_NAT_OFF=<passes>
 # turns native passes off (nat_ir: mir, promote, ipra, fold, hint, coalesce,
-# remat, weights, vecinline, unchecked, panicline, xmmcache, debug; rules.fd:
-# rules, purecse; egraph.fd: egraph, forward); FID_NAT_DUMP=<function> prints
+# remat (a spilled rematerialized value has no slot), rematmov (moves
+# between coalesced vregs do not count as definitions), weights,
+# segscan (RA2: the scan over hulls), uselive (RA2: liveness to a block
+# fixed point), holes (RA2: hulls throughout), split, splitprune (RA4
+# live-range splitting; splitfloat: spilled floats not split, MI14),
+# arghint (RA7 argument-register hints, on by default), argfree, argtrade
+# (RA3: argument registers for spilled ranges no call crosses, and the
+# trade of callee-saved registers; docs/reference/argument-registers.md),
+# fcallee (RA18: floats across calls in callee-saved float registers),
+# fregs (floats in
+# float registers, on by default on every target, --nat Windows included),
+# winfregs (MI14: no float registers on --nat Windows only), coldhint
+# (blocks calling @cold, cold_path() or never-returning functions laid out
+# last), pgolayout (blocks a --profile-use profile never or rarely entered
+# laid out last), vecinline, unchecked, panicline, xmmcache, debug, probe,
+# coldpanic, brfuse, addshl, asm, cmpslot, rmwslot (TG7: compares and
+# read-modify-writes on a spilled value's slot), blsmsk, blsi (TG7 BMI1
+# under --cpu x86-64-v3|v4), wbidx (TG8: AArch64 pre/post-indexed loads
+# and stores in loops), vzsimd, vzunroll (K10: @simd's checked-op
+# vectorization and 2x unroll; docs/reference/simd-annotation.md),
+# dbgscopes (DB4: lexical scopes in the debug info for a name bound more
+# than once), dbgbraces (DB4: a scope runs to its block's `}`; off: only
+# the lines that define or read it); rules.fd:
+# rules, purecse; egraph.fd: egraph, forward); FID_NAT_ON=greedy uses the
+# greedy allocator in place of the linear scan, FID_NAT_ON=greedycmp (with
+# --stats) prints an [ra9] line per function comparing the two (RA9,
+# docs/reference/greedy-allocator.md); pe_ir (default Windows `emit`):
+# FID_PE_OFF=<asm,wipe,tail,layout,ra,...> (ra: no pe_ir register
+# allocator, RA1, every value in its frame slot); the full list of switches is
+# docs/verification/kill-switches.md. FID_NAT_DUMP=<function> prints
 # its machine IR. IR optimizer (compiler/iropt.fd): FID_IROPT_OFF=<passes>,
-# FID_IROPT_ON=<opt-in passes>|all, FID_IROPT_STATS=1; FID_RULES_ON=readcse.
+# FID_IROPT_ON=<opt-in passes>|all, FID_IROPT_STATS=1; FID_NAT_OFF=readcse.
 # The C path (ccompile, dump-c) runs no IR optimizer.
 # Compile time (output unchanged; each has a switch to compare against):
 # the checked-library stamp (D9) skips the bodies of core and the merged
@@ -142,6 +172,10 @@ python3 scripts/enc-oracle.py --fid release/fid.exe   # encoders vs clang's asse
 .\release\fid.exe test-rules                          # rewrite rules on values
 bash scripts/rules-smt.sh release/fid.exe              # rules proved by z3 (pip install z3-solver)
 NATIVE=1 bash scripts/pass-matrix.sh aarch64-linux     # each pass off: same results
+bash tests/nattools/machine_split_check.sh             # RA4 splitting: checker, mutation
+bash tests/nattools/sw_unwind_check.sh                 # RA12/DB6: unwinding under qemu's gdb stub
+bash tests/nattools/ra14_fast_alloc_time.sh            # RA14: allocation time of the fast allocator
+bash tests/nattools/win_callback_regs_check.sh         # --nat Windows: the exception handler keeps rdi/rsi/xmm6-15 (RA7/RA3)
 NATIVE=1 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh riscv64-linux
 FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
@@ -246,7 +280,8 @@ WINDOWS INSTALLER (v1.0.0):
                  on Linux/Windows, a one-stage fid build, hello and the
                  leak gate. The full suite and cross targets run before a
                  release (docs/reference/releasing.md, scripts/ci/cross.yml)
-  Output:        Fides-Setup-1.0.0.exe (2.5 MB, tested on Windows)
+  Output:        Fid-Setup-<version>.exe (named Fides-Setup up to
+                 0.8.0; Fides-Setup-1.0.0.exe was 2.5 MB, tested on Windows)
   Ships:         fid.exe = self-hosted (release/fid.exe), fidesc.exe =
                  Rust compiler, stdlib/ and examples/ beside them
 
@@ -406,7 +441,7 @@ touching them.
 | `src/comptime.rs` | **LOW** | Comptime evaluation engine. Evaluates `comptime <expr>`, `comptime { block }`, `comptime reflect_op(T)`, `comptime gen { block }` at compile time. I-5A: Aggressive comptime evaluation — auto-evaluates calls to `comptime fn` functions with all-literal args (no explicit `comptime` wrapper needed). I-5D: Comptime loop unrolling — unrolls `for` loops with literal bounds (≤16 iterations, ≤16 body stmts) at AST level. Also eliminates dead `if` branches with literal conditions. |
 | `src/runtime_linux.rs` | **HIGH** | Hand-encoded x86-64 machine code (raw bytes). No assembler — every byte is manual. |
 | `src/linker.rs` | **MEDIUM** | Relocation resolution. Wrong offset = crash or silent corruption. |
-| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines, Nov 9) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls, `sysconf`, interleaving tasks or blocking channel receives. |
+| `src/interp.rs` | **MEDIUM** | The reference oracle (~6060 LOC). If this is wrong, all backends "match" but produce wrong results. `p_vec_new` uses `vec_side_table` to separate raw struct fields from `Value::Vec`. `run_function` auto-detects missing `__env` param and inserts dummy. Self-hosted port in `compiler/interp.fd` (7,456 lines, Nov 9) ran every test program `fidesc run` did (Oct 27); it cannot run FFI other than a few libc calls or `sysconf`; tasks interleave (LG11, docs/interp-tasks.md). |
 
 ## LOWER-RISK FILES
 
@@ -443,11 +478,12 @@ touching them.
    tests are rejected. The rest:
    - `test_sqlite` needs libsqlite3 and `examples/minimal_game` needs SDL2
      (the Rust compiler fails the same way without them).
-   - `build --native` with the default target (`x86-64`) goes to the old PIR
-     path (compiler.fd `build_executable`: opt, codegen_x64, elf64, linker)
-     and crashes in opt.fd `pass_jump_thread` (Vec index out of bounds); with
-     `--no-opt` it fails at link. `--native --target arm64|riscv64|x64` goes
-     to nat_ir. `fid emit` (pe_ir on Windows, nat_ir for Linux targets) is
+   - `build --native` went to the old PIR path (compiler.fd
+     `build_executable`: opt, codegen_x64, elf64, linker), which crashed in
+     opt.fd `pass_jump_thread`. `build_executable` was removed on Nov 17
+     (MI18): `--native` is now the machine layer (nat_ir) on every target,
+     the default `x86-64` being `x86_64-linux`; a target it has no code for
+     is an error. `fid emit` (pe_ir on Windows, nat_ir for Linux targets) is
      the working native path; compiler/pe.fd is reached only by `emit --boot`,
      which panics.
    Fixed Oct 25–27 (docs/reference/known-bugs.md §2e): block jumps ended

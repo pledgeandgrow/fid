@@ -1,0 +1,42 @@
+// Log OW2 (docs/verification/miscompile-log.md; VF11,
+// scripts/verify/own_diff.py, the model's callee f1). Proposal 0004 rule 3:
+// an assignment drops the old value. `*p = v` through a `&mut` does not,
+// whether p is a parameter (here) or a local (`var q: &mut Bx = &mut a;
+// *q = ...` leaks the same way, at top level and in a block): with stage 0
+// of Nov 16, `fid run --leaks` on this program reports the Vec of each old
+// value (40 bytes, allocated on the line of `var a` / `var b`, plus b's
+// pushed element) never freed; the values printed are right.
+// Check: fid run tests/verify/bugs/ow2_assign_through_mut_param_leaks.fd --leaks
+// must print the two lines below and "fid --leaks: every block was freed".
+//> (0)
+//> (0)
+
+struct Bx {
+    n: i64,
+    kids: Vec<Bx>,
+}
+
+fn bx_show(b: &Bx) -> str {
+    var s: str = "(" + int_to_str(b.n);
+    var i: i64 = 0;
+    while i < b.kids.len() {
+        s = s + " " + bx_show(&b.kids.get(i));
+        i = i + 1;
+    }
+    return s + ")";
+}
+
+fn reset(p: &mut Bx) {
+    *p = Bx { n: 0, kids: Vec::new() };
+}
+
+fn main() -> i64 {
+    var a: Bx = Bx { n: 5, kids: Vec::new() };
+    reset(&mut a);
+    println(bx_show(&a));
+    var b: Bx = Bx { n: 1, kids: Vec::new() };
+    b.kids.push(b);
+    reset(&mut b);
+    println(bx_show(&b));
+    return 0;
+}

@@ -9,6 +9,7 @@
 #
 #   ./scripts/leak-check.sh                       # release/fid.exe, tests/leaks
 #   ./scripts/leak-check.sh release/fid-dev.exe tests/bootstrap/test_x.fd
+#   NATIVE=aarch64-linux RUNNER=qemu-aarch64 ./scripts/leak-check.sh   # RL16
 set -u
 FID="${1:-release/fid.exe}"
 shift || true
@@ -21,7 +22,18 @@ check_one() {
     local fid="$1" f="$2" out="$3"
     local name; name=$(basename "$f" .fd)
     local dir; dir=$(dirname "$f")
-    "$fid" run "$f" --leaks 2> "$out/$name.err" | grep -v -e '^Built native executable' -e '^Reused cached artifact' > "$out/$name.out"
+    if [ -n "${NATIVE:-}" ]; then
+        # RL16: NATIVE=<target> (x86_64-linux, aarch64-linux, ...): the
+        # machine layer's runtime (fid emit --leaks), run through RUNNER
+        # (qemu-aarch64 and so on; empty on a host of that target)
+        if ! "$fid" emit "$f" --target "$NATIVE" --leaks -o "$out/$name.bin" > "$out/$name.build" 2>&1; then
+            echo "build failed: $(head -c 300 "$out/$name.build")" > "$out/$name.status"
+            return
+        fi
+        ${RUNNER:-} "$out/$name.bin" < /dev/null 2> "$out/$name.err" > "$out/$name.out"
+    else
+        "$fid" run "$f" --leaks 2> "$out/$name.err" | grep -v -e '^Built native executable' -e '^Reused cached artifact' > "$out/$name.out"
+    fi
     local status="ok"
     if [ -f "$dir/$name.expected" ] && ! diff -q --strip-trailing-cr "$dir/$name.expected" "$out/$name.out" > /dev/null; then
         status="output differs"

@@ -1,0 +1,244 @@
+// stdlib/objc: type encodings (names, method types, sizes, the runtime's
+// offset-annotated form), selector checks, delegate class specs, and the
+// Foundation conversions and class registration run against a fake
+// runtime behind the ObjcRuntime seam (libobjc needs iOS or macOS).
+// Expected output:
+// enc v @ : # B q Q d ^v @ ^i ^@ *
+// enc rect {CGRect={CGPoint=dd}{CGSize=dd}} x86 BOOL c
+// types v@:@ B@:@@ v@:{CGRect={CGPoint=dd}{CGSize=dd}}q
+// annotate v24@0:8@16 B32@0:8@16@24 {CGRect={CGPoint=dd}{CGSize=dd}}16@0:8 v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16
+// sizes 16 16 16 8 8 8 8 8 1 -1 0
+// parse v24@0:8@16 -> 4 v|@|:|@ ok
+// parse block v@:@? -> 4 bad {x=i false
+// selector 2 true false true 0
+// check ok
+// check tap: takes 1 arguments, types give 0
+// check self must be @
+// spec errors 2: duplicate tap: | bad class name 9Bad
+// class 501 registered FidesDelegate true
+// taken 0
+// nsstring caf\u{e9} -> café len 5
+// number 42
+// array 3 items a,b,c
+// dict city=Paris missing=
+// kvc alpha 0.75
+// msgs 41
+use objc;
+use vec;
+use string;
+use encoding;
+
+// ─── A fake runtime ────────────────────────────────────────────────────
+
+var classes: Vec<str> = Vec::new();
+var registered: Vec<bool> = Vec::new();
+var sels: Vec<str> = Vec::new();
+var obj_kind: Vec<str> = Vec::new();
+var obj_text: Vec<str> = Vec::new();
+var obj_int: Vec<i64> = Vec::new();
+var arr_owner: Vec<i64> = Vec::new();
+var arr_item: Vec<i64> = Vec::new();
+var kv_owner: Vec<i64> = Vec::new();
+var kv_key: Vec<str> = Vec::new();
+var kv_val: Vec<i64> = Vec::new();
+var msgs: i64 = 0;
+
+fn cbuf(s: str) -> i64 {
+    val b: Vec<i64> = str_bytes(s);
+    var buf: i64 = 0;
+    unsafe {
+        buf = p_malloc(b.len() + 1);
+        var i: i64 = 0;
+        while i < b.len() {
+            val p: *mut u8 = buf + i;
+            *p = b.get(i);
+            i = i + 1;
+        }
+        val z: *mut u8 = buf + b.len();
+        *z = 0;
+    }
+    return buf;
+}
+
+fn find_class(name: str) -> i64 {
+    var i: i64 = 0;
+    while i < classes.len() {
+        if classes.get(i) == name { return 500 + i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn f_get_class(name: str) -> i64 {
+    val c: i64 = find_class(name);
+    if c != 0 { return c; }
+    if name == "NSObject" || name == "NSString" || name == "NSNumber" || name == "NSMutableArray"
+        || name == "NSMutableDictionary" || name == "NSDecimalNumber" || name == "UIView" {
+        classes.push(name);
+        registered.push(true);
+        return 500 + classes.len() - 1;
+    }
+    return 0;
+}
+
+fn f_sel(name: str) -> i64 {
+    var i: i64 = 0;
+    while i < sels.len() {
+        if sels.get(i) == name { return 2000 + i; }
+        i = i + 1;
+    }
+    sels.push(name);
+    return 2000 + sels.len() - 1;
+}
+
+fn new_obj(kind: str, text: str, n: i64) -> i64 {
+    obj_kind.push(kind);
+    obj_text.push(text);
+    obj_int.push(n);
+    return 1000 + obj_kind.len() - 1;
+}
+
+fn text_of(o: i64) -> str { return obj_text.get(o - 1000); }
+
+fn f_send(recv: i64, sel: i64, a: Vec<i64>) -> i64 {
+    msgs = msgs + 1;
+    val s: str = sels.get(sel - 2000);
+    if s == "stringWithUTF8String:" { return new_obj("NSString", objc_cstr_read(a.get(0)), 0); }
+    if s == "UTF8String" { return cbuf(text_of(recv)); }
+    if s == "stringValue" { return new_obj("NSString", text_of(recv), 0); }
+    if s == "length" { return utf8_len(text_of(recv)); }
+    if s == "numberWithLongLong:" { return new_obj("NSNumber", int_to_str(a.get(0)), a.get(0)); }
+    if s == "longLongValue" { return obj_int.get(recv - 1000); }
+    if s == "arrayWithCapacity:" || s == "dictionary" { return new_obj("coll", "", 0); }
+    if s == "addObject:" { arr_owner.push(recv); arr_item.push(a.get(0)); return 0; }
+    if s == "count" {
+        var n: i64 = 0;
+        var i: i64 = 0;
+        while i < arr_owner.len() { if arr_owner.get(i) == recv { n = n + 1; } i = i + 1; }
+        return n;
+    }
+    if s == "objectAtIndex:" {
+        var n: i64 = 0;
+        var i: i64 = 0;
+        while i < arr_owner.len() {
+            if arr_owner.get(i) == recv {
+                if n == a.get(0) { return arr_item.get(i); }
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if s == "setObject:forKey:" || s == "setValue:forKey:" {
+        kv_owner.push(recv); kv_key.push(text_of(a.get(1))); kv_val.push(a.get(0));
+        return 0;
+    }
+    if s == "objectForKey:" || s == "valueForKey:" {
+        var i: i64 = kv_owner.len() - 1;
+        while i >= 0 {
+            if kv_owner.get(i) == recv && kv_key.get(i) == text_of(a.get(0)) { return kv_val.get(i); }
+            i = i - 1;
+        }
+        return 0;
+    }
+    if s == "decimalNumberWithString:" { return new_obj("NSDecimalNumber", text_of(a.get(0)), 0); }
+    if s == "alloc" { return new_obj(classes.get(recv - 500), "", 0); }
+    if s == "init" { return recv; }
+    println("fake runtime: unexpected " + s);
+    return 0;
+}
+
+fn f_allocate(sup: i64, name: str) -> i64 {
+    if find_class(name) != 0 { return 0; }
+    classes.push(name);
+    registered.push(false);
+    return 500 + classes.len() - 1;
+}
+
+fn f_register(cls: i64) { registered.set(cls - 500, true); }
+fn f_protocol(name: str) -> i64 { if name == "UIApplicationDelegate" { return 900; } return 0; }
+fn f_add_protocol(cls: i64, p: i64) -> i64 { return 1; }
+
+fn join(v: Vec<str>, sep: str) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() { if i > 0 { s = s + sep; } s = s + v.get(i); i = i + 1; }
+    return s;
+}
+
+fn sv(a: str) -> Vec<str> { var v: Vec<str> = Vec::new(); v.push(a); return v; }
+
+fn main() {
+    println("enc " + objc_encode_type("void") + " " + objc_encode_type("id") + " " + objc_encode_type("SEL") + " "
+        + objc_encode_type("Class") + " " + objc_encode_type("BOOL") + " " + objc_encode_type("NSInteger") + " "
+        + objc_encode_type("NSUInteger") + " " + objc_encode_type("CGFloat") + " " + objc_encode_type("void*") + " "
+        + objc_encode_type("UIView*") + " " + objc_encode_type("int*") + " " + objc_encode_type("id*") + " "
+        + objc_encode_type("const char*"));
+    println("enc rect " + objc_encode_type("CGRect") + " x86 BOOL " + objc_bool_encoding(false));
+    var a2: Vec<str> = Vec::new();
+    a2.push("UIApplication*"); a2.push("NSDictionary*");
+    var a3: Vec<str> = Vec::new();
+    a3.push("CGRect"); a3.push("long");
+    println("types " + objc_method_types("void", sv("id")) + " " + objc_method_types("BOOL", a2) + " " + objc_method_types("void", a3));
+    println("annotate " + objc_annotate_types("v@:@") + " " + objc_annotate_types("B@:@@") + " "
+        + objc_annotate_types(OBJC_ENC_CGRECT + "@:") + " " + objc_annotate_types("v@:" + OBJC_ENC_CGRECT));
+    println("sizes " + int_to_str(objc_type_size(OBJC_ENC_NSRANGE)) + " " + int_to_str(objc_type_size("[4i]")) + " "
+        + int_to_str(objc_type_size("{s=cid}")) + " " + int_to_str(objc_type_size("(u=cd)")) + " "
+        + int_to_str(objc_type_size("^{CGRect}")) + " " + int_to_str(objc_type_size("r*")) + " "
+        + int_to_str(objc_type_size("@?")) + " " + int_to_str(objc_type_size("@\"NSString\"")) + " "
+        + int_to_str(objc_type_size("b3")) + " " + int_to_str(objc_type_size("{x=i")) + " "
+        + int_to_str(objc_type_size("v")));
+    val p: ObjcTypes = objc_parse_types("v24@0:8@16");
+    var encs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < p.types.len() { encs.push(p.types.get(i).enc); i = i + 1; }
+    println("parse v24@0:8@16 -> " + int_to_str(p.types.len()) + " " + join(encs, "|") + " " + (if p.ok { "ok" } else { "bad" }));
+    println("parse block v@:@? -> " + int_to_str(objc_parse_types("v@:@?").types.len()) + " bad {x=i " + bool_to_str(objc_parse_types("{x=i").ok));
+    println("selector " + int_to_str(objc_selector_args("tableView:cellForRowAtIndexPath:")) + " "
+        + bool_to_str(objc_selector_valid("tableView:cellForRowAtIndexPath:")) + " " + bool_to_str(objc_selector_valid("a:b"))
+        + " " + bool_to_str(objc_selector_valid("init")) + " " + int_to_str(objc_selector_args("init")));
+    val c1: str = objc_method_check("application:didFinishLaunchingWithOptions:", "B@:@@");
+    println("check " + (if str_len(c1) == 0 { "ok" } else { c1 }));
+    println("check " + objc_method_check("tap:", "v@:"));
+    println("check " + objc_method_check("tap:", "v::@"));
+    var bad: ObjcClassSpec = objc_class_spec("9Bad", "NSObject");
+    objc_spec_add_method(&mut bad, "tap:", "v@:@");
+    objc_spec_add_method(&mut bad, "tap:", "v@:@");
+    val errs: Vec<str> = objc_spec_check(&bad);
+    println("spec errors " + int_to_str(errs.len()) + ": " + errs.get(1) + " | " + errs.get(0));
+
+    val rt: ObjcRuntime = ObjcRuntime {
+        get_class: f_get_class, sel: f_sel, send: f_send, allocate_class: f_allocate,
+        register_class: f_register, get_protocol: f_protocol, add_protocol: f_add_protocol,
+    };
+    var spec: ObjcClassSpec = objc_class_spec("FidesDelegate", "NSObject");
+    spec.protocols.push("UIApplicationDelegate");
+    objc_spec_add_method(&mut spec, "application:didFinishLaunchingWithOptions:", "B@:@@");
+    objc_spec_add_method(&mut spec, "buttonTapped:", objc_method_types("void", sv("id")));
+    val cls: i64 = objc_class_begin(&rt, &spec);
+    objc_class_end(&rt, cls);
+    println("class " + int_to_str(cls) + " registered " + classes.get(cls - 500) + " " + bool_to_str(registered.get(cls - 500)));
+    println("taken " + int_to_str(objc_class_begin(&rt, &spec)));
+    val txt: str = "caf\u{e9}";
+    val ns: i64 = objc_nsstring(&rt, txt);
+    println("nsstring caf\\u{e9} -> " + objc_str(&rt, ns) + " len " + int_to_str(str_len(objc_str(&rt, ns))));
+    println("number " + int_to_str(objc_nsnumber_value(&rt, objc_nsnumber_int(&rt, 42))));
+    var objs: Vec<i64> = Vec::new();
+    objs.push(objc_nsstring(&rt, "a")); objs.push(objc_nsstring(&rt, "b")); objs.push(objc_nsstring(&rt, "c"));
+    val arr: i64 = objc_nsarray(&rt, objs);
+    val items: Vec<i64> = objc_nsarray_items(&rt, arr);
+    var names: Vec<str> = Vec::new();
+    i = 0;
+    while i < items.len() { names.push(objc_str(&rt, items.get(i))); i = i + 1; }
+    println("array " + int_to_str(items.len()) + " items " + join(names, ","));
+    var ks: Vec<str> = Vec::new();
+    ks.push("city"); ks.push("zip");
+    var vs: Vec<str> = Vec::new();
+    vs.push("Paris"); vs.push("75001");
+    val d: i64 = objc_nsdictionary_strs(&rt, ks, vs);
+    println("dict city=" + objc_dict_get_str(&rt, d, "city") + " missing=" + objc_dict_get_str(&rt, d, "country"));
+    val view: i64 = objc_new(&rt, "UIView");
+    objc_set_double(&rt, view, "alpha", 0.75);
+    println("kvc alpha " + float_to_str(objc_get_double(&rt, view, "alpha")));
+    println("msgs " + int_to_str(msgs));
+}

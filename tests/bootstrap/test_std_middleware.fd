@@ -1,0 +1,248 @@
+// stdlib/middleware: response parsing, Accept-Encoding negotiation, the fixed-Huffman DEFLATE compressor read back by stdlib compress's inflate (raw, gzip, zlib), CORS preflight and simple requests, request ids, token-bucket rate limiting on an injected clock, Basic and Bearer auth (RFC 7617 example), timeouts, custom hooks and the log, in one chain.
+// Expected output:
+// parse: 201 Created /x/1 {"id":1}
+// build: HTTP/1.1 201 Created|Content-Type: application/json|Location: /x/1|Content-Length: 8||{"id":1}
+// negotiate: [gzip] [deflate] [] [gzip] [] []
+// deflate: 1710 -> 63 bytes, inflate same: true
+// deflate binary: inflate same: true, empty: 0300
+// gzip: hello hello hello hello (27 bytes)
+// zlib: deflate deflate deflate
+// basic: Aladdin / open sesame, bad: 0, bearer: mF_9.B5f-4.1JqM
+// bucket: yyynnn retry 500 ms, after 500 ms: true
+// simple: 200 Access-Control-Allow-Origin=https://app.example Vary=Accept-Encoding, Origin hi  id=9857fb32c9efb5e4
+//   200 Access-Control-Allow-Credentials=true Access-Control-Expose-Headers=X-Request-Id 200 X-Powered-By=fides RateLimit-Remaining=1 200 X-Seen=yes
+// preflight: 204 Access-Control-Allow-Origin=https://admin.example Access-Control-Allow-Methods=GET, HEAD, POST, PUT, PATCH, DELETE
+//   204 Access-Control-Allow-Headers=Content-Type, Authorization Access-Control-Max-Age=600 has length: false
+// preflight other origin: 204 Vary=Origin
+// kept id: hi  id=req-from-client
+// limited: 429 Retry-After=1 RateLimit-Remaining=0 429
+// other key: 200 RateLimit-Remaining=1
+// refilled: 200 RateLimit-Remaining=0
+// before hook: 403 X-Powered-By=fides forbidden
+// gzip: 200 Content-Encoding=gzip Vary=Accept-Encoding 74 bytes, unzips to 1720
+// deflate: 200 Content-Encoding=deflate unzips to 1720
+// image: 200 600 bytes
+// timeout: 503 X-Request-Id=a0d28950601a0784 Service Unavailable: the handler took 300 ms, the limit is 250 ms
+// log: 9857fb32c9efb5e4 GET /hello 200 23 0ms
+// log: 227ecdab4a71bce4 OPTIONS /hello 204 0 0ms
+// log: cb06f8beac0ecc1f OPTIONS /hello 204 0 0ms
+// log: req-from-client GET /hello 200 22 0ms
+// log: 6fed636fc9c63505 GET /hello 429 18 0ms
+// log: 0a62211e836c980f GET /hello 200 23 0ms
+// log: 66ad0efb22ad605d GET /hello 200 23 0ms
+// log: a086fbd22710e4ad GET /admin/users 403 10 0ms
+// log: e563a32ca05951be GET /big 200 74 0ms
+// log: a30edf7388a04467 GET /big 200 62 0ms
+// log: 321a447a25edfaa0 GET /png 200 600 0ms
+// log: a0d28950601a0784 GET /hello 503 66 300ms
+// basic none: 401 WWW-Authenticate=Basic realm="WallyWorld"
+// basic bad: 401 WWW-Authenticate=Basic realm="WallyWorld"
+// basic good: hi Aladdin id=
+// bearer none: 401 WWW-Authenticate=Bearer realm="example"
+// bearer bad: 401 WWW-Authenticate=Bearer realm="example", error="invalid_token"
+// bearer good: 200
+// serve fn: 200 429
+use middleware;
+use http;
+use compress;
+use encoding;
+use vec;
+use string;
+
+var NOW: i64 = 1000;
+var WORK_MS: i64 = 0;
+
+fn clock() -> i64 {
+    return NOW;
+}
+
+fn app(req: HttpRequest) -> str {
+    NOW = NOW + WORK_MS;
+    if req.path == "/big" {
+        return build_response(200, "text/html", str_repeat("<p>hello middleware, hello compression</p>\n", 40));
+    }
+    if req.path == "/png" {
+        return build_response(200, "image/png", str_repeat("x", 600));
+    }
+    return build_response(200, "text/plain", "hi " + http_header(req, "x-auth-user") + " id=" + http_header(req, "x-request-id"));
+}
+
+fn check_user(user: str, pass: str) -> bool {
+    return user == "Aladdin" && pass == "open sesame";
+}
+
+fn check_token(t: str) -> bool {
+    return t == "mF_9.B5f-4.1JqM";
+}
+
+fn block_admin(req: & mut HttpRequest, resp: & mut MwResponse) -> bool {
+    if str_starts_with(req.path, "/admin") {
+        *resp = mw_response_new(403, "text/plain", "forbidden\n");
+        return false;
+    }
+    req.names.push("X-Seen");
+    req.vals.push("yes");
+    return true;
+}
+
+fn stamp(req: HttpRequest, resp: & mut MwResponse) -> bool {
+    val seen: str = http_header(req, "x-seen");
+    mw_response_set_header(resp, "X-Powered-By", "fides");
+    if str_len(seen) > 0 {
+        mw_response_set_header(resp, "X-Seen", seen);
+    }
+    return true;
+}
+
+fn rq(method: str, target: str, headers: str) -> HttpRequest {
+    return http_parse_head(method + " " + target + " HTTP/1.1\r\nHost: api.test\r\n" + headers + "\r\n");
+}
+
+fn brief(raw: str, names: Vec<str>) -> str {
+    val r: MwResponse = mw_response_parse(raw);
+    var out: str = int_to_str(r.status);
+    var i: i64 = 0;
+    while i < names.len() {
+        val v: str = mw_response_header(& r, names.get(i));
+        if str_len(v) > 0 {
+            out = out + " " + names.get(i) + "=" + v;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn names1(a: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    return v;
+}
+
+fn names2(a: str, b: str) -> Vec<str> {
+    var v: Vec<str> = names1(a);
+    v.push(b);
+    return v;
+}
+
+fn main() -> i64 {
+    // Responses
+    val r0: MwResponse = mw_response_parse(build_response_headers(201, "application/json", "Location: /x/1\r\n", "{\"id\":1}"));
+    println("parse: " + int_to_str(r0.status) + " " + r0.reason + " " + mw_response_header(& r0, "location") + " " + r0.body);
+    println("build: " + str_replace(mw_response_build(& r0), "\r\n", "|"));
+
+    // Negotiation
+    println("negotiate: [" + mw_negotiate_encoding("gzip, deflate, br") + "] [" + mw_negotiate_encoding("deflate;q=1.0, gzip;q=0.5") + "] [" + mw_negotiate_encoding("gzip;q=0, deflate;q=0") + "] [" + mw_negotiate_encoding("*;q=0.3") + "] [" + mw_negotiate_encoding("identity") + "] [" + mw_negotiate_encoding("") + "]");
+
+    // DEFLATE round trips through stdlib compress
+    val text: Vec<i64> = str_bytes(str_repeat("abcabcabcabc the quick brown fox jumps over the lazy dog ", 30));
+    val raw: Vec<i64> = mw_deflate(text);
+    val back: Vec<i64> = inflate(raw);
+    println("deflate: " + int_to_str(text.len()) + " -> " + int_to_str(raw.len()) + " bytes, inflate same: " + bool_to_str(hex_encode_bytes(back) == hex_encode_bytes(text)));
+    var all: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 600 {
+        all.push((k * 7 + k / 13) & 255);
+        k = k + 1;
+    }
+    println("deflate binary: inflate same: " + bool_to_str(hex_encode_bytes(inflate(mw_deflate(all))) == hex_encode_bytes(all)) + ", empty: " + hex_encode_bytes(mw_deflate(Vec::new())));
+    val gz: Vec<i64> = mw_gzip(str_bytes("hello hello hello hello"));
+    println("gzip: " + gzip_decompress_str(gz) + " (" + int_to_str(gz.len()) + " bytes)");
+    println("zlib: " + zlib_decompress_str(mw_zlib(str_bytes("deflate deflate deflate"))));
+
+    // Auth helpers (RFC 7617 section 2's example)
+    val creds: Vec<str> = mw_basic_credentials("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    println("basic: " + creds.get(0) + " / " + creds.get(1) + ", bad: " + int_to_str(mw_basic_credentials("Basic !!!").len()) + ", bearer: " + mw_bearer_token("Bearer mF_9.B5f-4.1JqM"));
+
+    // Rate limiter on its own
+    var rl: MwRateLimiter = mw_rate_limiter_new(3.0, 2.0, "");
+    var seq: str = "";
+    var t: i64 = 0;
+    while t < 6 {
+        if mw_rate_take(& mut rl, "k", 0) {
+            seq = seq + "y";
+        } else {
+            seq = seq + "n";
+        }
+        t = t + 1;
+    }
+    val wait: i64 = mw_rate_retry_ms(& mut rl, "k", 0);
+    val after: bool = mw_rate_take(& mut rl, "k", 500);
+    println("bucket: " + seq + " retry " + int_to_str(wait) + " ms, after 500 ms: " + bool_to_str(after));
+
+    // A chain
+    var c: MwChain = mw_chain_new(app);
+    mw_chain_set_clock(& mut c, clock);
+    mw_use_log(& mut c, false);
+    mw_use_request_id(& mut c, 12345);
+    var cors: MwCors = mw_cors_default();
+    cors.origins = names2("https://app.example", "https://admin.example");
+    cors.credentials = true;
+    cors.expose = "X-Request-Id";
+    mw_use_cors(& mut c, cors);
+    mw_use_timeout(& mut c, 250);
+    mw_use_rate_limit(& mut c, 2.0, 1.0, "x-api-key");
+    mw_use_after(& mut c, stamp);
+    mw_use_before(& mut c, block_admin);
+    mw_use_compress(& mut c, 256);
+
+    val a1: str = mw_chain_handle(& mut c, rq("GET", "/hello", "X-Api-Key: alice\r\nOrigin: https://app.example\r\n"));
+    println("simple: " + brief(a1, names2("Access-Control-Allow-Origin", "Vary")) + " " + mw_response_parse(a1).body);
+    println("  " + brief(a1, names2("Access-Control-Allow-Credentials", "Access-Control-Expose-Headers")) + " " + brief(a1, names2("X-Powered-By", "RateLimit-Remaining")) + " " + brief(a1, names1("X-Seen")));
+    val a2: str = mw_chain_handle(& mut c, rq("OPTIONS", "/hello", "Origin: https://admin.example\r\nAccess-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: content-type\r\n"));
+    println("preflight: " + brief(a2, names2("Access-Control-Allow-Origin", "Access-Control-Allow-Methods")));
+    println("  " + brief(a2, names2("Access-Control-Allow-Headers", "Access-Control-Max-Age")) + " has length: " + bool_to_str(str_contains(a2, "Content-Length")));
+    val a3: str = mw_chain_handle(& mut c, rq("OPTIONS", "/hello", "Origin: https://evil.example\r\nAccess-Control-Request-Method: PUT\r\n"));
+    println("preflight other origin: " + brief(a3, names2("Access-Control-Allow-Origin", "Vary")));
+    val a4: str = mw_chain_handle(& mut c, rq("GET", "/hello", "X-Api-Key: alice\r\nX-Request-Id: req-from-client\r\n"));
+    println("kept id: " + mw_response_parse(a4).body);
+    val a5: str = mw_chain_handle(& mut c, rq("GET", "/hello", "X-Api-Key: alice\r\n"));
+    println("limited: " + brief(a5, names2("Retry-After", "RateLimit-Remaining")) + " " + brief(a5, names1("X-Powered-By")));
+    val a6: str = mw_chain_handle(& mut c, rq("GET", "/hello", "X-Api-Key: bob\r\n"));
+    println("other key: " + brief(a6, names1("RateLimit-Remaining")));
+    NOW = NOW + 1000;
+    val a7: str = mw_chain_handle(& mut c, rq("GET", "/hello", "X-Api-Key: alice\r\n"));
+    println("refilled: " + brief(a7, names1("RateLimit-Remaining")));
+    val a8: str = mw_chain_handle(& mut c, rq("GET", "/admin/users", "X-Api-Key: carol\r\n"));
+    println("before hook: " + brief(a8, names1("X-Powered-By")) + " " + str_trim(mw_response_parse(a8).body));
+    val a9: str = mw_chain_handle(& mut c, rq("GET", "/big", "X-Api-Key: dave\r\nAccept-Encoding: gzip, deflate\r\n"));
+    val g9: MwResponse = mw_response_parse(a9);
+    println("gzip: " + brief(a9, names2("Content-Encoding", "Vary")) + " " + int_to_str(str_len(g9.body)) + " bytes, unzips to " + int_to_str(str_len(gzip_decompress_str(str_bytes(g9.body)))));
+    val a10: str = mw_chain_handle(& mut c, rq("GET", "/big", "X-Api-Key: erin\r\nAccept-Encoding: deflate\r\n"));
+    val g10: MwResponse = mw_response_parse(a10);
+    println("deflate: " + brief(a10, names1("Content-Encoding")) + " unzips to " + int_to_str(str_len(zlib_decompress_str(str_bytes(g10.body)))));
+    val a11: str = mw_chain_handle(& mut c, rq("GET", "/png", "X-Api-Key: fay\r\nAccept-Encoding: gzip\r\n"));
+    println("image: " + brief(a11, names1("Content-Encoding")) + " " + int_to_str(str_len(mw_response_parse(a11).body)) + " bytes");
+    WORK_MS = 300;
+    val a12: str = mw_chain_handle(& mut c, rq("GET", "/hello", "X-Api-Key: gus\r\n"));
+    println("timeout: " + brief(a12, names1("X-Request-Id")) + " " + str_trim(mw_response_parse(a12).body));
+    WORK_MS = 0;
+    val log: Vec<str> = mw_chain_take_log(& mut c);
+    var i: i64 = 0;
+    while i < log.len() {
+        println("log: " + log.get(i));
+        i = i + 1;
+    }
+
+    // Auth chains
+    var b: MwChain = mw_chain_new(app);
+    mw_chain_set_clock(& mut b, clock);
+    mw_use_basic_auth(& mut b, "WallyWorld", check_user);
+    println("basic none: " + brief(mw_chain_handle(& mut b, rq("GET", "/", "")), names1("WWW-Authenticate")));
+    println("basic bad: " + brief(mw_chain_handle(& mut b, rq("GET", "/", "Authorization: Basic QWxhZGRpbjp3cm9uZw==\r\n")), names1("WWW-Authenticate")));
+    println("basic good: " + mw_response_parse(mw_chain_handle(& mut b, rq("GET", "/", "Authorization: basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n"))).body);
+    var be: MwChain = mw_chain_new(app);
+    mw_use_bearer_auth(& mut be, "example", check_token);
+    println("bearer none: " + brief(mw_chain_handle(& mut be, rq("GET", "/", "")), names1("WWW-Authenticate")));
+    println("bearer bad: " + brief(mw_chain_handle(& mut be, rq("GET", "/", "Authorization: Bearer nope\r\n")), names1("WWW-Authenticate")));
+    println("bearer good: " + brief(mw_chain_handle(& mut be, rq("GET", "/", "Authorization: Bearer mF_9.B5f-4.1JqM\r\n")), names1("WWW-Authenticate")));
+
+    // The http_serve adapter keeps the chain's state between requests
+    var s: MwChain = mw_chain_new(app);
+    mw_chain_set_clock(& mut s, clock);
+    mw_use_rate_limit(& mut s, 1.0, 0.0, "");
+    val serve: fn(HttpRequest) -> str = mw_chain_serve_fn(s);
+    val s1: str = serve(rq("GET", "/", ""));
+    val s2: str = serve(rq("GET", "/", ""));
+    println("serve fn: " + str_slice(s1, 9, 12) + " " + str_slice(s2, 9, 12));
+    return 0;
+}

@@ -1,0 +1,122 @@
+// stdlib/geolocation: haversine, bearings, destination and midpoint
+// (checked against the same formulas in Python's math), Vincenty on WGS-84
+// against the Flinders Peak - Buninyong example (54972.271 m,
+// 306 52 05.37, reverse 127 10 25.07), geohash (u4pruydqqvj and ezs42 of
+// Wikipedia), circle and polygon geofences with hysteresis, and the
+// Kalman location filter (values from a Python run of the same filter).
+// Expected output:
+// atan2 135.000000000 asin 30.000000000 atan 45.000000000
+// haversine Paris-London 343556.535 m
+// bearing 330.021093 final 328.115617
+// destination 49.488411 3.331139
+// midpoint 50.188595 1.146618
+// vincenty 54972.271 m az1 306 52 05.37 az2 307 10 25.07 ok true
+// vincenty antipodal ok false
+// vincenty same point 0.000
+// geohash u4pruydqqvj
+// ezs42 center 42.604980 -5.603027 cell 0.043945 x 0.043945
+// neighbor north ezs48 back ezs42 east ezs43 west ezefr south ezs40
+// bad hash false
+// circle events 0 0 1 0 0 2 inside false
+// polygon contains true false events 1 2
+// kf 48.0000000 2.0000000 10.0000
+// kf 48.0000522 2.0000522 7.2217
+// kf 48.0000718 2.0000452 7.2831
+// kf 48.0001275 2.0000486 4.2213
+use geolocation;
+use vec;
+use string;
+use math;
+
+fn fmt(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d { scale = scale * 10; i = i + 1; }
+    var neg: bool = x < 0.0;
+    var ax: f64 = if neg { 0.0 - x } else { x };
+    val n: i64 = (ax * (scale as f64) + 0.5) as i64;
+    val ip: i64 = n / scale;
+    var fp: str = int_to_str(n % scale);
+    while str_len(fp) < d { fp = "0" + fp; }
+    var s: str = int_to_str(ip);
+    if d > 0 { s = s + "." + fp; }
+    if neg && n != 0 { s = "-" + s; }
+    return s;
+}
+
+fn dms(x: f64) -> str {
+    val total: i64 = (x * 360000.0 + 0.5) as i64;   // hundredths of a second
+    val deg: i64 = total / 360000;
+    val min: i64 = (total / 6000) % 60;
+    val cs: i64 = total % 6000;
+    var sec: str = int_to_str(cs / 100);
+    if str_len(sec) < 2 { sec = "0" + sec; }
+    var frac: str = int_to_str(cs % 100);
+    if str_len(frac) < 2 { frac = "0" + frac; }
+    return int_to_str(deg) + " " + int_to_str(min) + " " + sec + "." + frac;
+}
+
+fn main() {
+    println("atan2 " + fmt(geo_deg(geo_atan2(1.0, -1.0)), 9) + " asin " + fmt(geo_deg(geo_asin(0.5)), 9)
+        + " atan " + fmt(geo_deg(geo_atan(1.0)), 9));
+    val paris: GeoPoint = geo_point(48.8566, 2.3522);
+    val london: GeoPoint = geo_point(51.5074, -0.1278);
+    println("haversine Paris-London " + fmt(geo_haversine(paris, london), 3) + " m");
+    println("bearing " + fmt(geo_bearing(paris, london), 6) + " final " + fmt(geo_final_bearing(paris, london), 6));
+    val d: GeoPoint = geo_destination(paris, 45.0, 100000.0);
+    println("destination " + fmt(d.lat, 6) + " " + fmt(d.lon, 6));
+    val m: GeoPoint = geo_midpoint(paris, london);
+    println("midpoint " + fmt(m.lat, 6) + " " + fmt(m.lon, 6));
+
+    val flinders: GeoPoint = geo_point(geo_dms(-37, 57, 3.72030), geo_dms(144, 25, 29.52440));
+    val buninyong: GeoPoint = geo_point(geo_dms(-37, 39, 10.15610), geo_dms(143, 55, 35.38390));
+    val v: GeoInverse = geo_vincenty(flinders, buninyong);
+    println("vincenty " + fmt(v.distance, 3) + " m az1 " + dms(v.azimuth1) + " az2 " + dms(v.azimuth2) + " ok " + bool_to_str(v.ok));
+    val anti: GeoInverse = geo_vincenty(geo_point(0.0, 0.0), geo_point(0.5, 179.7));
+    println("vincenty antipodal ok " + bool_to_str(anti.ok));
+    println("vincenty same point " + fmt(geo_vincenty(paris, paris).distance, 3));
+
+    println("geohash " + geohash_encode(57.64911, 10.40744, 11));
+    val b: GeohashBox = geohash_decode("ezs42");
+    println("ezs42 center " + fmt(b.lat, 6) + " " + fmt(b.lon, 6) + " cell " + fmt(b.lat_hi - b.lat_lo, 6) + " x " + fmt(b.lon_hi - b.lon_lo, 6));
+    val north: str = geohash_neighbor("ezs42", 1, 0);
+    println("neighbor north " + north + " back " + geohash_neighbor(north, -1, 0) + " east " + geohash_neighbor("ezs42", 0, 1)
+        + " west " + geohash_neighbor("ezs42", 0, -1) + " south " + geohash_neighbor("ezs42", -1, 0));
+    println("bad hash " + bool_to_str(geohash_decode("ezsa2").ok));
+
+    var c: Geofence = geofence_circle("home", paris, 100.0, 10.0);
+    var ev: str = "circle events";
+    var dists: Vec<f64> = Vec::new();
+    dists.push(200.0); dists.push(105.0); dists.push(85.0); dists.push(95.0); dists.push(105.0); dists.push(115.0);
+    var i: i64 = 0;
+    while i < dists.len() {
+        ev = ev + " " + int_to_str(geofence_update(&mut c, geo_destination(paris, 0.0, dists.get(i))));
+        i = i + 1;
+    }
+    println(ev + " inside " + bool_to_str(c.inside));
+    var lats: Vec<f64> = Vec::new();
+    var lons: Vec<f64> = Vec::new();
+    lats.push(48.8556); lons.push(2.3512);
+    lats.push(48.8556); lons.push(2.3532);
+    lats.push(48.8576); lons.push(2.3532);
+    lats.push(48.8576); lons.push(2.3512);
+    var poly: Geofence = geofence_polygon("square", lats, lons, 5.0);
+    val out_pt: GeoPoint = geo_point(48.8566, 2.3533);
+    val e1: i64 = geofence_update(&mut poly, paris);
+    val e2: i64 = geofence_update(&mut poly, out_pt);
+    println("polygon contains " + bool_to_str(geo_polygon_contains(&lats, &lons, paris)) + " "
+        + bool_to_str(geo_polygon_contains(&lats, &lons, out_pt)) + " events " + int_to_str(e1) + " " + int_to_str(e2));
+
+    var f: GeoFilter = geo_filter_new(3.0);
+    var fixes: Vec<GeoFix> = Vec::new();
+    fixes.push(GeoFix { lat: 48.0, lon: 2.0, accuracy: 10.0, time_ms: 0 });
+    fixes.push(GeoFix { lat: 48.0001, lon: 2.0001, accuracy: 10.0, time_ms: 1000 });
+    fixes.push(GeoFix { lat: 48.0002, lon: 2.0, accuracy: 20.0, time_ms: 2000 });
+    fixes.push(GeoFix { lat: 48.00015, lon: 2.00005, accuracy: 5.0, time_ms: 3000 });
+    i = 0;
+    while i < fixes.len() {
+        val p: GeoPoint = geo_filter_update(&mut f, fixes.get(i));
+        println("kf " + fmt(p.lat, 7) + " " + fmt(p.lon, 7) + " " + fmt(geo_filter_accuracy(&f), 4));
+        i = i + 1;
+    }
+}

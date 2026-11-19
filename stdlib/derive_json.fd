@@ -1,0 +1,285 @@
+// derive_json.fd -- the JSON readers behind @derive(Deserialize) (complaint
+// roadmap CL1). The compiler adds these functions to a program that derives
+// Deserialize (compiler.fd process_derive); a program does not import them.
+//
+// For `@derive(Deserialize) struct S { a: i64, b: str, c: Inner }`:
+//   S_from_json(json) -> S        each field read from its key; a missing
+//                                 key, or a value of another type, leaves
+//                                 the field's default (0, 0.0, false, "")
+//   S_from_json_error(json) -> str  "" when every key is there with a value
+//                                 of its field's type, else what is wrong:
+//                                 "missing key 'b'", "key 'a' is not a
+//                                 number", "key 'c': missing key 'x'"
+//
+// Only the object's own keys are read (a key inside a nested value is not
+// taken for one of the object's). Keys are compared as written, without
+// unescaping; string values are unescaped (\" \\ \/ \n \t \r \b \f \uXXXX).
+
+module derive_json;
+
+/// The first index at or after i that is not JSON white space.
+pub fn djson_ws(j: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(j) {
+        val c: i64 = str_byte_at(j, k);
+        if c != 32 && c != 9 && c != 10 && c != 13 {
+            return k;
+        }
+        k = k + 1;
+    }
+    return k;
+}
+
+/// The index just after the JSON value that starts at i (a string, an
+/// object, an array, or a number or literal).
+pub fn djson_end(j: str, i: i64) -> i64 {
+    val n: i64 = str_len(j);
+    if i >= n {
+        return n;
+    }
+    val c: i64 = str_byte_at(j, i);
+    var k: i64 = i + 1;
+    if c == 34 {
+        while k < n {
+            val d: i64 = str_byte_at(j, k);
+            if d == 92 {
+                k = k + 2;
+            } else if d == 34 {
+                return k + 1;
+            } else {
+                k = k + 1;
+            }
+        }
+        return n;
+    }
+    if c == 123 || c == 91 {
+        var depth: i64 = 1;
+        while k < n {
+            val e: i64 = str_byte_at(j, k);
+            if e == 34 {
+                k = djson_end(j, k);
+            } else {
+                if e == 123 || e == 91 {
+                    depth = depth + 1;
+                } else if e == 125 || e == 93 {
+                    depth = depth - 1;
+                    if depth == 0 {
+                        return k + 1;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        return n;
+    }
+    k = i;
+    while k < n {
+        val f: i64 = str_byte_at(j, k);
+        if f == 44 || f == 125 || f == 93 || f == 32 || f == 9 || f == 10 || f == 13 {
+            return k;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The index of the value of the object's own key `key`, or -1.
+pub fn djson_find(j: str, key: str) -> i64 {
+    val n: i64 = str_len(j);
+    var i: i64 = djson_ws(j, 0);
+    if i >= n {
+        return 0 - 1;
+    }
+    if str_byte_at(j, i) != 123 {
+        return 0 - 1;
+    }
+    i = djson_ws(j, i + 1);
+    while i < n {
+        if str_byte_at(j, i) != 34 {
+            return 0 - 1;
+        }
+        val kend: i64 = djson_end(j, i);
+        val k: str = str_slice(j, i + 1, kend - 1);
+        i = djson_ws(j, kend);
+        if i >= n {
+            return 0 - 1;
+        }
+        if str_byte_at(j, i) != 58 {
+            return 0 - 1;
+        }
+        i = djson_ws(j, i + 1);
+        if k == key {
+            return i;
+        }
+        i = djson_ws(j, djson_end(j, i));
+        if i < n {
+            if str_byte_at(j, i) == 44 {
+                i = djson_ws(j, i + 1);
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+/// The text of the value of `key` ("" when the key is missing).
+///
+/// Example:
+///   val j = "{\"id\": 7, \"name\": \"ab\\u00e9\", \"ok\": true, \"x\": 1.5, \"tags\": [1, 2]}";
+///   assert_eq(djson_raw(j, "tags"), "[1, 2]");
+///   assert_eq(djson_raw(j, "missing"), "");
+///   assert_eq(djson_int(j, "id"), 7);
+///   assert(djson_float(j, "x") == 1.5);
+///   assert(djson_bool(j, "ok"));
+///   assert_eq(str_len(djson_str(j, "name")), 4);
+///   assert_eq(djson_object_error(j), "");
+pub fn djson_raw(j: str, key: str) -> str {
+    val at: i64 = djson_find(j, key);
+    if at < 0 {
+        return "";
+    }
+    return str_slice(j, at, djson_end(j, at));
+}
+
+/// Does `r` start like a JSON number?
+pub fn djson_is_number(r: str) -> bool {
+    if str_len(r) == 0 {
+        return false;
+    }
+    val c: i64 = str_byte_at(r, 0);
+    return c == 45 || (c >= 48 && c <= 57);
+}
+
+pub fn djson_int(j: str, key: str) -> i64 {
+    val r: str = djson_raw(j, key);
+    if djson_is_number(r) == false {
+        return 0;
+    }
+    return str_parse_int(r);
+}
+
+pub fn djson_float(j: str, key: str) -> f64 {
+    val r: str = djson_raw(j, key);
+    if djson_is_number(r) == false {
+        return 0.0;
+    }
+    return str_parse_float(r);
+}
+
+pub fn djson_bool(j: str, key: str) -> bool {
+    val r: str = djson_raw(j, key);
+    return r == "true";
+}
+
+/// Code point `cp` as UTF-8.
+pub fn djson_utf8(cp: i64) -> str {
+    if cp < 128 {
+        return byte_to_str(cp);
+    }
+    if cp < 2048 {
+        return byte_to_str(192 + cp / 64) + byte_to_str(128 + cp % 64);
+    }
+    return byte_to_str(224 + cp / 4096) + byte_to_str(128 + (cp / 64) % 64) + byte_to_str(128 + cp % 64);
+}
+
+/// The string value of `key`, unescaped ("" when missing or not a string).
+pub fn djson_str(j: str, key: str) -> str {
+    val r: str = djson_raw(j, key);
+    val n: i64 = str_len(r);
+    if n < 2 {
+        return "";
+    }
+    if str_byte_at(r, 0) != 34 {
+        return "";
+    }
+    var out: str = "";
+    var start: i64 = 1;
+    var i: i64 = 1;
+    while i < n - 1 {
+        val c: i64 = str_byte_at(r, i);
+        if c == 92 && i + 1 < n - 1 {
+            out = out + str_slice(r, start, i);
+            val e: i64 = str_byte_at(r, i + 1);
+            i = i + 2;
+            if e == 110 {
+                out = out + byte_to_str(10);
+            } else if e == 116 {
+                out = out + byte_to_str(9);
+            } else if e == 114 {
+                out = out + byte_to_str(13);
+            } else if e == 98 {
+                out = out + byte_to_str(8);
+            } else if e == 102 {
+                out = out + byte_to_str(12);
+            } else if e == 117 && i + 4 <= n - 1 {
+                out = out + djson_utf8(str_parse_hex(str_slice(r, i, i + 4)));
+                i = i + 4;
+            } else {
+                out = out + byte_to_str(e);
+            }
+            start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+    if start < n - 1 {
+        out = out + str_slice(r, start, n - 1);
+    }
+    return out;
+}
+
+/// "" when `j` is a JSON object, else the error.
+pub fn djson_object_error(j: str) -> str {
+    val i: i64 = djson_ws(j, 0);
+    if i >= str_len(j) {
+        return "not a JSON object";
+    }
+    if str_byte_at(j, i) != 123 {
+        return "not a JSON object";
+    }
+    return "";
+}
+
+/// The first error so far (`e`), or what is wrong with key `key`: kind 1 an
+/// integer, 2 a float, 3 a bool, 4 a string, 5 an object, 0 any value.
+pub fn djson_need(e: str, j: str, key: str, kind: i64) -> str {
+    if str_len(e) > 0 {
+        return e;
+    }
+    val r: str = djson_raw(j, key);
+    if str_len(r) == 0 {
+        return "missing key '" + key + "'";
+    }
+    val c: i64 = str_byte_at(r, 0);
+    if kind == 1 || kind == 2 {
+        if djson_is_number(r) == false {
+            return "key '" + key + "' is not a number";
+        }
+    }
+    if kind == 3 {
+        if r != "true" && r != "false" {
+            return "key '" + key + "' is not true or false";
+        }
+    }
+    if kind == 4 {
+        if c != 34 {
+            return "key '" + key + "' is not a string";
+        }
+    }
+    if kind == 5 {
+        if c != 123 {
+            return "key '" + key + "' is not an object";
+        }
+    }
+    return "";
+}
+
+/// The first error so far, or a nested struct's own error under its key.
+pub fn djson_nest(e: str, key: str, inner: str) -> str {
+    if str_len(e) > 0 {
+        return e;
+    }
+    if str_len(inner) > 0 {
+        return "key '" + key + "': " + inner;
+    }
+    return "";
+}

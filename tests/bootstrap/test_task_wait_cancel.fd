@@ -1,0 +1,161 @@
+// The builtin waits respect the running task's token slot (complaint-roadmap
+// CA7): p_co_sleep, an await, a channel receive and a socket wait look at
+// the token in the slot (p_task_token / p_task_set_token, the slot a
+// `timeout(ms) { }` block fills, CA8) and at the tokens it replaced, and
+// give up once one is cancelled or past its deadline; with an empty slot
+// they wait as before. A token is three words: [cancelled][deadline on
+// p_clock_mono_ms's clock (C6), 0 none][the token the slot held before]. The
+// tokens here are made by hand, so the test needs no timeout block.
+//
+// Expected output:
+// empty slot sleep: 0
+// deadline sleep: 1 fast true
+// cancelled sleep: 1 fast true
+// live sleep: 0
+// parent deadline: 1 fast true
+// cancel from a task: 1 fast true
+// recv: 9
+// recv stopped: true fast true
+// await stopped: 0 fast true
+// awaited task: 101
+// wait_fd stopped: 0
+// child slot: 0
+// slot restored: true
+use string;
+use task;
+use sync;
+
+/// A token: cancelled after `ms` (-1: no deadline), replacing `parent`.
+fn make_token(ms: i64, parent: i64) -> i64 {
+    var tok: i64 = 0;
+    // SAFETY: a block of three words, written and read through p_atomic_*
+    // only; never freed (a few tokens for the program's life)
+    unsafe {
+        tok = p_malloc(24);
+    }
+    p_atomic_store(tok, 0);
+    var dl: i64 = 0;
+    if ms >= 0 {
+        dl = p_clock_mono_ms() + ms;
+    }
+    p_atomic_store(tok + 8, dl);
+    p_atomic_store(tok + 16, parent);
+    return tok;
+}
+
+/// A task that cancels token `tok` after 30 ms.
+fn canceller(tok: i64) -> i64 {
+    task_sleep(30);
+    p_atomic_store(tok, 1);
+    return 0;
+}
+
+/// Sleeps 5 s under its own token `tok`: 100 + what the sleep gave, in
+/// `cell`.
+async fn slow(tok: i64, cell: i64) -> Future<i64> {
+    p_task_set_token(tok);
+    val r: i64 = p_co_sleep(5000);
+    p_task_set_token(0);
+    p_atomic_store(cell, 100 + r);
+    return 7;
+}
+
+/// The token in a new task's slot, in `cell`.
+async fn peek(cell: i64) -> Future<i64> {
+    p_atomic_store(cell, p_task_token());
+    return 0;
+}
+
+fn fast(t0: i64) -> str {
+    return bool_to_str(p_clock_now_ms() - t0 < 2000);
+}
+
+fn main() -> i64 {
+    println("empty slot sleep: " + int_to_str(p_co_sleep(5)));
+
+    // a deadline stops a long sleep
+    val d: i64 = make_token(30, 0);
+    p_task_set_token(d);
+    val t0: i64 = p_clock_now_ms();
+    val r0: i64 = p_co_sleep(5000);
+    p_task_set_token(0);
+    println("deadline sleep: " + int_to_str(r0) + " fast " + fast(t0));
+
+    // a cancelled token stops it at once
+    val c: i64 = make_token(0 - 1, 0);
+    p_atomic_store(c, 1);
+    p_task_set_token(c);
+    val t1: i64 = p_clock_now_ms();
+    val r1: i64 = p_co_sleep(5000);
+    p_task_set_token(0);
+    println("cancelled sleep: " + int_to_str(r1) + " fast " + fast(t1));
+
+    // a live token lets a short sleep run to its end
+    val live: i64 = make_token(0 - 1, 0);
+    p_task_set_token(live);
+    println("live sleep: " + int_to_str(p_co_sleep(15)));
+    p_task_set_token(0);
+
+    // the deadline of the token it replaced (an outer block's) counts too
+    val outer: i64 = make_token(30, 0);
+    val inner: i64 = make_token(0 - 1, outer);
+    p_task_set_token(inner);
+    val t2: i64 = p_clock_now_ms();
+    val r2: i64 = p_co_sleep(5000);
+    p_task_set_token(0);
+    println("parent deadline: " + int_to_str(r2) + " fast " + fast(t2));
+
+    // another task cancels the token
+    val shared: i64 = make_token(0 - 1, 0);
+    val ct: i64 = task_go("canceller", shared);
+    task_detach(ct);
+    p_task_set_token(shared);
+    val t3: i64 = p_clock_now_ms();
+    val r3: i64 = p_co_sleep(5000);
+    p_task_set_token(0);
+    println("cancel from a task: " + int_to_str(r3) + " fast " + fast(t3));
+
+    // a receive: a value that is there comes; on an empty channel the
+    // deadline stops the wait, with what a closed, empty channel gives
+    val ch: i64 = sync_channel_create(2);
+    sync_channel_send(ch, 9);
+    val rd: i64 = make_token(30, 0);
+    p_task_set_token(rd);
+    println("recv: " + int_to_str(sync_channel_recv(ch)));
+    val t4: i64 = p_clock_now_ms();
+    val none: i64 = sync_channel_recv(ch);
+    p_task_set_token(0);
+    println("recv stopped: " + bool_to_str(none == SYNC_CHAN_PENDING) + " fast " + fast(t4));
+
+    // an await gives up (0) at the deadline; the task awaited goes on
+    val cell: i64 = p_shared_alloc(8);
+    p_atomic_store(cell, 0);
+    val own: i64 = make_token(0 - 1, 0);
+    val ad: i64 = make_token(40, 0);
+    p_task_set_token(ad);
+    val t5: i64 = p_clock_now_ms();
+    val got: i64 = await slow(own, cell);
+    p_task_set_token(0);
+    println("await stopped: " + int_to_str(got) + " fast " + fast(t5));
+    p_atomic_store(own, 1);
+    task_run();
+    println("awaited task: " + int_to_str(p_atomic_load(cell)));
+
+    // a socket wait under a cancelled token: not ready
+    val wc: i64 = make_token(0 - 1, 0);
+    p_atomic_store(wc, 1);
+    p_task_set_token(wc);
+    val w: i64 = p_co_wait_fd(0 - 1, 0, 5000);
+    p_task_set_token(0);
+    println("wait_fd stopped: " + int_to_str(w));
+
+    // a task starts with an empty slot, whatever the starter's holds
+    val pc: i64 = p_shared_alloc(8);
+    p_atomic_store(pc, 0 - 1);
+    p_task_set_token(live);
+    val pz: i64 = await peek(pc);
+    p_task_set_token(0);
+    println("child slot: " + int_to_str(p_atomic_load(pc) + pz));
+    println("slot restored: " + bool_to_str(p_task_token() == 0));
+    return 0;
+}

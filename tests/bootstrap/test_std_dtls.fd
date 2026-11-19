@@ -1,0 +1,264 @@
+// stdlib/dtls: the TLS 1.2 PRF vector, OpenSSL's SHA-256 fingerprint of an OpenSSL-made P-256 certificate, then DTLS 1.2 handshakes between a client and a server in memory (OpenSSL-made self-signed P-256 certificates checked by fingerprint): clean, then with 100- and 200-byte MTUs (fragmented ClientHello and certificates) over a channel that drops and reorders datagrams, SRTP keys equal on both sides and used, application data, tampered and replayed records, a wrong fingerprint, no common SRTP profile, an unanswered client timing out, close_notify. P-256 is too slow for the interpreter (docs/stdlib-agent-bugs.md 20, 51): run it through the C backend.
+// Expected output:
+// prf e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66
+// fingerprint a sha-256 37:EE:79:9A:11:0B:4E:A5:13:09:08:CD:82:D0:8A:73:24:02:D2:60:B6:08:D6:E9:32:E0:54:64:D9:78:4D:7D
+// fingerprint b sha-256 1A:D7:57:7C:F8:74:C9:88:C8:09:D9:46:08:A2:92:F9:27:94:10:97:38:86:33:A0:50:8E:18:F6:55:AC:4D:33
+// clean: client connected, server connected, hello verify 1/1, profile SRTP_AEAD_AES_128_GCM, ems true true, retransmissions 0/0
+// clean: srtp keys equal true (16+12 each way), exporter equal true, peer fingerprints true true
+// app data: server read ping, client read pong
+// lossy: client connected, server connected, profile SRTP_AES128_CM_HMAC_SHA1_80
+// lossy: dropped 10, reordered 9, retransmissions 5/3, largest datagram 200, srtp keys equal true
+// srtp with dtls keys: client to server true, server to client true
+// tampered record dropped true, replayed record dropped true, still connected true
+// wrong fingerprint: client failed (certificate fingerprint does not match), server failed (alert 42 from peer)
+// no common profile: server failed (no common SRTP profile), client failed (alert 40 from peer)
+// unanswered: client failed (handshake timed out) at 243000 ms after 8 retransmissions
+// close: client closed, server closed (closed by peer)
+use dtls;
+use encoding;
+use srtp;
+use string;
+use vec;
+
+fn hb(h: str) -> Vec<i64> {
+    return hex_decode_bytes(h);
+}
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn cert_a() -> str {
+    return "-----BEGIN CERTIFICATE-----
+MIIBijCCAS+gAwIBAgIUCHxZir9785/S5itlOHU0H9A/ALwwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOZmlkZXMtd2VicnRjLWEwIBcNMjYxMTE3MTI1NDI4WhgPMjEy
+NjEwMjQxMjU0MjhaMBkxFzAVBgNVBAMMDmZpZGVzLXdlYnJ0Yy1hMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAE7GH3n0uqZR4gvasJ3qV/74ehakkuDJHuwplvRdAC
+vMpUM68RU5N96vIOc3K2BKNgulrSTUJ+ByKqmqCmQneNoKNTMFEwHQYDVR0OBBYE
+FBoZ55wljiyOyGz5PRA06kr4qkaUMB8GA1UdIwQYMBaAFBoZ55wljiyOyGz5PRA0
+6kr4qkaUMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAKqaX9FD
+dqjyHMXX7m7mlg5d4RSJGRKZQK7EyvTE0L85AiEAo3kiN2CsQn9Gzl7ubHC3KXBk
+gk0vhA+YQ9d/IoXfI7g=
+-----END CERTIFICATE-----
+";
+}
+
+fn key_a() -> str {
+    return "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgBteegdhCSfZ0TYmh
+LJ3pvB/Q/BNrubTy9qj/lcCAwrWhRANCAATsYfefS6plHiC9qwnepX/vh6FqSS4M
+ke7CmW9F0AK8ylQzrxFTk33q8g5zcrYEo2C6WtJNQn4HIqqaoKZCd42g
+-----END PRIVATE KEY-----
+";
+}
+
+fn cert_b() -> str {
+    return "-----BEGIN CERTIFICATE-----
+MIIBijCCAS+gAwIBAgIURELEswHdMI4PSM21hWI/fnBZC80wCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOZmlkZXMtd2VicnRjLWIwIBcNMjYxMTE3MTI1NDI5WhgPMjEy
+NjEwMjQxMjU0MjlaMBkxFzAVBgNVBAMMDmZpZGVzLXdlYnJ0Yy1iMFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEEl87SExeJTzUgLBDfpSPQXjzeKaZKCPMy5SswdEf
+gn7myeZqVOl8hP+jAs4grvmmCBQoRrUWKKgfpC66NZv8V6NTMFEwHQYDVR0OBBYE
+FE1+NvlOV0DPAEBkypVk7ePXXNfHMB8GA1UdIwQYMBaAFE1+NvlOV0DPAEBkypVk
+7ePXXNfHMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAM/4091C
+ujjifn9kZzlEk6cLxorXAO/POAll6KNTqE6DAiEAuuoiKp+A0vRklI616/+Ylvic
+hS+fC87fWH+66Pq3MEg=
+-----END CERTIFICATE-----
+";
+}
+
+fn key_b() -> str {
+    return "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgbOh4mGuNC43Rwg07
+tCxk5SLl+yPTGMlthSXRffL3biGhRANCAAQSXztITF4lPNSAsEN+lI9BePN4ppko
+I8zLlKzB0R+CfubJ5mpU6XyE/6MCziCu+aYIFChGtRYoqB+kLro1m/xX
+-----END PRIVATE KEY-----
+";
+}
+
+fn der_of(pem_text: str) -> Vec<i64> {
+    val c: DtlsConfig = dtls_config(false, pem_text, key_a(), "");
+    return c.cert_der;
+}
+
+fn mk(is_server: bool, cert: str, key: str, remote_fp: str, mtu: i64, seed: i64) -> DtlsConfig {
+    var c: DtlsConfig = dtls_config(is_server, cert, key, remote_fp);
+    c.mtu = mtu;
+    c.seed = Vec::filled(32, seed);
+    c.cookie_secret = Vec::filled(32, 9);
+    c.peer = "192.0.2.1:5000";
+    return c;
+}
+
+// st: [datagrams seen, dropped, reordered batches, largest datagram]
+fn deliver(to: & mut DtlsConn, dgs: Vec<Vec<i64>>, now: i64, lossy: bool, st: & mut Vec<i64>) {
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < dgs.len() {
+        if lossy {
+            order.insert(0, i);
+        } else {
+            order.push(i);
+        }
+        i = i + 1;
+    }
+    if lossy && dgs.len() > 1 {
+        st.set(2, st.get(2) + 1);
+    }
+    i = 0;
+    while i < order.len() {
+        val dg: Vec<i64> = dgs.get(order.get(i));
+        val n: i64 = st.get(0);
+        st.set(0, n + 1);
+        if dg.len() > st.get(3) {
+            st.set(3, dg.len());
+        }
+        if lossy && n < 40 && n % 4 == 1 {
+            st.set(1, st.get(1) + 1);
+        } else {
+            dtls_receive(to, dg, now);
+        }
+        i = i + 1;
+    }
+}
+
+fn done(c: & DtlsConn) -> bool {
+    return c.state != DTLS_CONNECTING && c.state != DTLS_NEW;
+}
+
+// run both ends until both are connected or one fails; returns the time
+fn run(cli: & mut DtlsConn, srv: & mut DtlsConn, lossy: bool, st: & mut Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    dtls_start(srv, t);
+    dtls_start(cli, t);
+    while t < 300000 && !(done(cli) && done(srv)) {
+        val a: Vec<Vec<i64>> = dtls_drain(cli);
+        val b: Vec<Vec<i64>> = dtls_drain(srv);
+        deliver(srv, a, t, lossy, st);
+        deliver(cli, b, t, lossy, st);
+        if cli.state == DTLS_FAILED || srv.state == DTLS_FAILED {
+            // let the alert through
+            deliver(srv, dtls_drain(cli), t, false, st);
+            deliver(cli, dtls_drain(srv), t, false, st);
+            return t;
+        }
+        t = t + 100;
+        dtls_poll(cli, t);
+        dtls_poll(srv, t);
+    }
+    return t;
+}
+
+fn keys_equal(a: & DtlsSrtpKeys, b: & DtlsSrtpKeys) -> bool {
+    return a.ok && b.ok && a.profile == b.profile && hx(a.client_key) == hx(b.client_key) && hx(a.server_key) == hx(b.server_key) && hx(a.client_salt) == hx(b.client_salt) && hx(a.server_salt) == hx(b.server_salt) && hx(a.client_key) != hx(a.server_key);
+}
+
+fn main() -> i64 {
+    println("prf " + hx(dtls_prf(hb("9bbe436ba940f017b17652849a71db35"), "test label", hb("a0ba9f936cda311827a6f796ffd5198c"), 100)));
+    val fa: str = dtls_fingerprint(der_of(cert_a()));
+    val fb: str = dtls_fingerprint(der_of(cert_b()));
+    println("fingerprint a " + fa);
+    println("fingerprint b " + fb);
+
+    // clean handshake: the client has certificate b, the server a
+    var st: Vec<i64> = Vec::filled(4, 0);
+    var cli: DtlsConn = dtls_new(mk(false, cert_b(), key_b(), fa, 1200, 1));
+    var srv: DtlsConn = dtls_new(mk(true, cert_a(), key_a(), fb, 1200, 2));
+    run(& mut cli, & mut srv, false, & mut st);
+    println("clean: client " + dtls_state_name(cli.state) + ", server " + dtls_state_name(srv.state) + ", hello verify " + int_to_str(cli.hello_verify) + "/" + int_to_str(srv.hello_verify) + ", profile " + srtp_profile_name(cli.srtp_profile) + ", ems " + bool_to_str(cli.ems) + " " + bool_to_str(srv.ems) + ", retransmissions " + int_to_str(cli.retransmissions) + "/" + int_to_str(srv.retransmissions));
+    val kc: DtlsSrtpKeys = dtls_srtp_keys(& cli);
+    val ks: DtlsSrtpKeys = dtls_srtp_keys(& srv);
+    val ex_same: bool = hx(dtls_export(& cli, "EXPORTER-test", 20)) == hx(dtls_export(& srv, "EXPORTER-test", 20));
+    println("clean: srtp keys equal " + bool_to_str(keys_equal(& kc, & ks)) + " (" + int_to_str(kc.client_key.len()) + "+" + int_to_str(kc.client_salt.len()) + " each way), exporter equal " + bool_to_str(ex_same) + ", peer fingerprints " + bool_to_str(dtls_peer_fingerprint(& cli) == fa) + " " + bool_to_str(dtls_peer_fingerprint(& srv) == fb));
+    dtls_send_app(& mut cli, str_bytes("ping"));
+    deliver(& mut srv, dtls_drain(& mut cli), 0, false, & mut st);
+    val got_s: Vec<Vec<i64>> = dtls_read_app(& mut srv);
+    dtls_send_app(& mut srv, str_bytes("pong"));
+    deliver(& mut cli, dtls_drain(& mut srv), 0, false, & mut st);
+    val got_c: Vec<Vec<i64>> = dtls_read_app(& mut cli);
+    var rs: str = "";
+    var rc: str = "";
+    if got_s.len() == 1 {
+        rs = str_from_bytes(got_s.get(0));
+    }
+    if got_c.len() == 1 {
+        rc = str_from_bytes(got_c.get(0));
+    }
+    println("app data: server read " + rs + ", client read " + rc);
+
+    // lossy: MTU 100 for the client (its ClientHello in fragments), 200 for
+    // the server (certificates in fragments), drops and reordering
+    var st2: Vec<i64> = Vec::filled(4, 0);
+    var lc: DtlsConfig = mk(false, cert_b(), key_b(), fa, 100, 3);
+    var ls: DtlsConfig = mk(true, cert_a(), key_a(), fb, 200, 4);
+    var only80: Vec<i64> = Vec::new();
+    only80.push(SRTP_AES128_CM_SHA1_80);
+    ls.srtp_profiles = only80;
+    var cli2: DtlsConn = dtls_new(lc);
+    var srv2: DtlsConn = dtls_new(ls);
+    run(& mut cli2, & mut srv2, true, & mut st2);
+    println("lossy: client " + dtls_state_name(cli2.state) + ", server " + dtls_state_name(srv2.state) + ", profile " + srtp_profile_name(srv2.srtp_profile));
+    val k2c: DtlsSrtpKeys = dtls_srtp_keys(& cli2);
+    val k2s: DtlsSrtpKeys = dtls_srtp_keys(& srv2);
+    println("lossy: dropped " + int_to_str(st2.get(1)) + ", reordered " + int_to_str(st2.get(2)) + ", retransmissions " + int_to_str(cli2.retransmissions) + "/" + int_to_str(srv2.retransmissions) + ", largest datagram " + int_to_str(st2.get(3)) + ", srtp keys equal " + bool_to_str(keys_equal(& k2c, & k2s)));
+
+    // the keys protect media: client -> server with the client write key
+    var ctx_tx: SrtpContext = srtp_context_new(k2c.profile, k2c.client_key, k2c.client_salt);
+    var srx: SrtpContext = srtp_context_new(k2s.profile, k2s.client_key, k2s.client_salt);
+    var stx: SrtpContext = srtp_context_new(k2s.profile, k2s.server_key, k2s.server_salt);
+    var crx: SrtpContext = srtp_context_new(k2c.profile, k2c.server_key, k2c.server_salt);
+    val rtp: Vec<i64> = hb("80600001000000640000beef" + "68656c6c6f");
+    val p1: SrtpResult = srtp_unprotect(& mut srx, srtp_protect(& mut ctx_tx, rtp).data);
+    val p2: SrtpResult = srtp_unprotect(& mut crx, srtp_protect(& mut stx, rtp).data);
+    println("srtp with dtls keys: client to server " + bool_to_str(p1.ok && hx(p1.data) == hx(rtp)) + ", server to client " + bool_to_str(p2.ok && hx(p2.data) == hx(rtp)));
+
+    // a tampered record and a replayed one are dropped silently
+    dtls_send_app(& mut cli, str_bytes("one"));
+    val one: Vec<Vec<i64>> = dtls_drain(& mut cli);
+    var bad: Vec<i64> = one.get(0);
+    bad.set(bad.len() - 1, bad.get(bad.len() - 1) ^ 1);
+    val before: i64 = srv.records_dropped;
+    dtls_receive(& mut srv, bad, 0);
+    val tampered_dropped: bool = srv.records_dropped == before + 1 && dtls_read_app(& mut srv).len() == 0;
+    dtls_receive(& mut srv, one.get(0), 0);
+    dtls_receive(& mut srv, one.get(0), 0);
+    val replay_dropped: bool = dtls_read_app(& mut srv).len() == 1;
+    println("tampered record dropped " + bool_to_str(tampered_dropped) + ", replayed record dropped " + bool_to_str(replay_dropped) + ", still connected " + bool_to_str(srv.state == DTLS_CONNECTED));
+
+    // the client expects the server to hold certificate b
+    var st3: Vec<i64> = Vec::filled(4, 0);
+    var cli3: DtlsConn = dtls_new(mk(false, cert_b(), key_b(), fb, 1200, 5));
+    var srv3: DtlsConn = dtls_new(mk(true, cert_a(), key_a(), fb, 1200, 6));
+    run(& mut cli3, & mut srv3, false, & mut st3);
+    println("wrong fingerprint: client " + dtls_state_name(cli3.state) + " (" + cli3.err + "), server " + dtls_state_name(srv3.state) + " (" + srv3.err + ")");
+
+    var st4: Vec<i64> = Vec::filled(4, 0);
+    var c4: DtlsConfig = mk(false, cert_b(), key_b(), fa, 1200, 7);
+    var s4: DtlsConfig = mk(true, cert_a(), key_a(), fb, 1200, 8);
+    var p32: Vec<i64> = Vec::new();
+    p32.push(SRTP_AES128_CM_SHA1_32);
+    c4.srtp_profiles = p32;
+    var pg: Vec<i64> = Vec::new();
+    pg.push(SRTP_AEAD_AES_128_GCM);
+    s4.srtp_profiles = pg;
+    var cli4: DtlsConn = dtls_new(c4);
+    var srv4: DtlsConn = dtls_new(s4);
+    run(& mut cli4, & mut srv4, false, & mut st4);
+    println("no common profile: server " + dtls_state_name(srv4.state) + " (" + srv4.err + "), client " + dtls_state_name(cli4.state) + " (" + cli4.err + ")");
+
+    // nobody answers: 1 s, doubled up to 60 s, 8 retransmissions, then give up
+    var lone: DtlsConn = dtls_new(mk(false, cert_b(), key_b(), fa, 1200, 9));
+    dtls_start(& mut lone, 0);
+    var t: i64 = 0;
+    while lone.state == DTLS_CONNECTING && t < 400000 {
+        dtls_drain(& mut lone);
+        t = t + 100;
+        dtls_poll(& mut lone, t);
+    }
+    println("unanswered: client " + dtls_state_name(lone.state) + " (" + lone.err + ") at " + int_to_str(t) + " ms after " + int_to_str(lone.retransmissions) + " retransmissions");
+
+    dtls_close(& mut cli);
+    deliver(& mut srv, dtls_drain(& mut cli), 0, false, & mut st);
+    println("close: client " + dtls_state_name(cli.state) + ", server " + dtls_state_name(srv.state) + " (" + srv.err + ")");
+    return 0;
+}

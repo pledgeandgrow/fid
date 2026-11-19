@@ -1,0 +1,121 @@
+// OP14 (compiler/iropt.fd iro_field_devirt, pass `fielddevirt`, on the
+// native paths; FID_IROPT_OFF=fielddevirt turns it off): a `dyn` value or
+// a closure that reaches its call through a struct field. Every store of
+// `Holder.sh` in the program stores `x as dyn Shape` of type Sq, so
+// `h.sh.area()` in `use_h` (h a parameter) is a direct call to `Sq_area`
+// with the receiver read from the dyn value; every store of `Ops.f` stores
+// one closure, so `f(x)` in `apply` (through a local copy of the field) is
+// a direct call to it. `Mixed.sh` is stored with two types and `Ops.g`
+// with two closures: those calls must keep their dispatch (a wrong fact
+// would print Sq's or the first closure's result for both). `steps` is a
+// closure of several blocks (a loop and a branch), which inline2 may copy
+// into its caller once it is a direct call.
+//
+// Expected output:
+// 10
+// 26
+// 17
+// 21
+// 9
+// 10
+// 7
+// 20
+// 13
+// 30
+// 10
+
+cap Shape {
+    fn area(self) -> i64;
+    fn grow(self, k: i64) -> i64;
+}
+
+struct Sq { s: i64 }
+
+impl Shape for Sq {
+    pub fn area(self: Sq) -> i64 { return self.s * self.s; }
+    pub fn grow(self: Sq, k: i64) -> i64 { return (self.s + k) * (self.s + k); }
+}
+
+struct Rect { w: i64, h: i64 }
+
+impl Shape for Rect {
+    pub fn area(self: Rect) -> i64 { return self.w * self.h; }
+    pub fn grow(self: Rect, k: i64) -> i64 { return (self.w + k) * (self.h + k); }
+}
+
+struct Holder { sh: dyn Shape, k: i64 }
+
+struct Mixed { sh: dyn Shape }
+
+struct Ops { f: fn(i64) -> i64, g: fn(i64) -> i64 }
+
+fn use_h(h: Holder) -> i64 {
+    return h.sh.area() + h.k;
+}
+
+fn grow_h(h: Holder, k: i64) -> i64 {
+    val s = h.sh;
+    return s.grow(k);
+}
+
+fn use_m(m: Mixed) -> i64 {
+    return m.sh.area();
+}
+
+fn apply(o: Ops, x: i64) -> i64 {
+    val f = o.f;
+    return f(x);
+}
+
+fn apply_g(o: Ops, x: i64) -> i64 {
+    val g = o.g;
+    return g(x);
+}
+
+fn plus1(x: i64) -> i64 { return x + 1; }
+
+fn twice(x: i64) -> i64 { return x * 2; }
+
+fn main() -> i64 {
+    val h = Holder { sh: Sq { s: 3 } as dyn Shape, k: 1 };
+    println(use_h(h));
+    val q = Sq { s: 5 };
+    val h2 = Holder { sh: q as dyn Shape, k: 1 };
+    println(use_h(h2));
+    println(grow_h(h, 1) + 1);
+    // a field read in the function that built the struct
+    println(h2.sh.area() - 4);
+    val m1 = Mixed { sh: Sq { s: 3 } as dyn Shape };
+    val m2 = Mixed { sh: Rect { w: 2, h: 5 } as dyn Shape };
+    println(use_m(m1));
+    println(use_m(m2));
+    val base: i64 = 4;
+    // a closure of several blocks: a loop and a branch
+    val steps = fn(x: i64) -> i64 {
+        var n: i64 = x;
+        var c: i64 = 0;
+        while n != 1 {
+            if n % 2 == 0 {
+                n = n / 2;
+            } else {
+                n = 3 * n + 1;
+            }
+            c = c + 1;
+        }
+        return c + base - 4;
+    };
+    val o1 = Ops { f: steps, g: plus1 };
+    val o2 = Ops { f: steps, g: twice };
+    println(apply(o1, 3));
+    println(apply(o2, 6) + 12);
+    println(apply_g(o1, 12));
+    println(apply_g(o2, 15));
+    var t: i64 = 0;
+    var i: i64 = 1;
+    while i <= 4 {
+        t = t + apply(o1, i);
+        i = i + 1;
+    }
+    println(t);
+    return 0;
+}

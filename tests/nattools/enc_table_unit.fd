@@ -1,0 +1,716 @@
+// TG5 (docs/roadmap/llvm-roadmap.md): the one table of encoding forms
+// (compiler/disasm.fd, "The encoding forms: one table") against both its
+// readers. For each encoder of compiler/nat_enc.fd listed here, the word
+// (or bytes) it writes must be the word the table builds for its row from
+// the same operands (ef_word, ef_x64_rr), and that word must decode, through
+// the same table, to the expected text (dsm_a64, dsm_rv, dsm_x64). An
+// encoder changed without its row, or a row without its encoder, fails
+// here. ef_check() checks the table itself (fields inside the free bits,
+// no row shadowed). Run:
+//   fid run tests/nattools/enc_table_unit.fd
+// Expected output:
+// table ok
+// a64 ok
+// rv64 ok
+// x64 ok
+use compiler::nat_enc;
+use compiler::disasm;
+
+var g_fails: i64 = 0;
+var g_checks: i64 = 0;
+
+fn tfail(msg: str) {
+    g_fails = g_fails + 1;
+    println(msg);
+}
+
+fn hex_of(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var x: i64 = v & 0xFFFFFFFF;
+    var n: i64 = 0;
+    while n < 8 {
+        out = str_slice(digits, x & 15, (x & 15) + 1) + out;
+        x = x >> 4;
+        n = n + 1;
+    }
+    return out;
+}
+
+/// The 32-bit word the encoder wrote last.
+fn last_word(e: & NatEnc) -> i64 {
+    var n: i64 = e.code.len();
+    return (e.code.get(n - 4) & 255) | ((e.code.get(n - 3) & 255) << 8) | ((e.code.get(n - 2) & 255) << 16) | ((e.code.get(n - 1) & 255) << 24);
+}
+
+/// A fixed-width form: the encoder's word `got`, the row `tmpl` with
+/// operands a..d, the text it must decode to (at address 0x1000).
+fn chk_w(arch: i64, got: i64, tmpl: str, a: i64, b: i64, c: i64, d: i64, want: str) {
+    g_checks = g_checks + 1;
+    var id: i64 = ef_id(arch, tmpl);
+    if id < 0 {
+        tfail("no row `" + tmpl + "`");
+        return;
+    }
+    var w: i64 = ef_word(id, a, b, c, d);
+    if w != got {
+        tfail("DRIFT `" + tmpl + "`: encoder " + hex_of(got) + ", table " + hex_of(w));
+    }
+    var text: str = "";
+    if arch == DSM_A64 {
+        text = dsm_a64(got, 0x1000);
+    } else {
+        text = dsm_rv(got, 0x1000);
+    }
+    if text != want {
+        tfail("TEXT `" + tmpl + "`: " + hex_of(got) + " decodes to `" + text + "`, not `" + want + "`");
+    }
+}
+
+fn a64(e: & NatEnc, tmpl: str, a: i64, b: i64, c: i64, d: i64, want: str) {
+    chk_w(DSM_A64, last_word(e), tmpl, a, b, c, d, want);
+}
+
+fn rv(e: & NatEnc, tmpl: str, a: i64, b: i64, c: i64, d: i64, want: str) {
+    chk_w(DSM_RV64, last_word(e), tmpl, a, b, c, d, want);
+}
+
+fn bytes_text(v: & Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + str_slice(hex_of(v.get(i)), 6, 8);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// An x86-64 form: the bytes the encoder wrote from `from` on, the row's
+/// bytes from ef_x64_rr followed by the immediate bytes `imm`, the text.
+fn x64(e: & NatEnc, from: i64, tmpl: str, reg: i64, rm: i64, v: i64, w: bool, l256: bool, imm: Vec<i64>, want: str) {
+    g_checks = g_checks + 1;
+    var got: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < e.code.len() {
+        got.push(e.code.get(i) & 255);
+        i = i + 1;
+    }
+    var id: i64 = ef_id(DSM_X64, tmpl);
+    if id < 0 {
+        tfail("no row `" + tmpl + "`");
+        return;
+    }
+    var row: Vec<i64> = ef_x64_rr(id, reg, rm, v, w, l256);
+    var k: i64 = 0;
+    while k < imm.len() {
+        row.push(imm.get(k) & 255);
+        k = k + 1;
+    }
+    if bytes_text(& row) != bytes_text(& got) {
+        tfail("DRIFT `" + tmpl + "`: encoder " + bytes_text(& got) + ", table " + bytes_text(& row));
+    }
+    var ins: DsmInsn = dsm_x64(& got, 0, 0x1000);
+    if ins.text != want || ins.len != got.len() {
+        tfail("TEXT `" + tmpl + "`: " + bytes_text(& got) + " decodes to `" + ins.text + "` (" + int_to_str(ins.len) + " bytes), not `" + want + "`");
+    }
+}
+
+fn no_imm() -> Vec<i64> {
+    return Vec::new();
+}
+
+fn imm1(v: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(v & 255);
+    return out;
+}
+
+fn imm4(v: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 4 {
+        out.push((v >> (k * 8)) & 255);
+        k = k + 1;
+    }
+    return out;
+}
+
+fn imm8(v: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 8 {
+        out.push((v >> (k * 8)) & 255);
+        k = k + 1;
+    }
+    return out;
+}
+
+fn check_a64() {
+    var e: NatEnc = NatEnc_new();
+    a64_add(& mut e, 1, 2, 3);
+    a64(& e, "add {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "add x1, x2, x3");
+    a64_adds(& mut e, 1, 2, 3);
+    a64(& e, "adds {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "adds x1, x2, x3");
+    a64_sub(& mut e, 1, 2, 3);
+    a64(& e, "sub {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "sub x1, x2, x3");
+    a64_subs(& mut e, 1, 2, 3);
+    a64(& e, "subs {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "subs x1, x2, x3");
+    a64_and(& mut e, 1, 2, 3);
+    a64(& e, "and {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "and x1, x2, x3");
+    a64_orr(& mut e, 1, 2, 3);
+    a64(& e, "orr {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "orr x1, x2, x3");
+    a64_eor(& mut e, 1, 2, 3);
+    a64(& e, "eor {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "eor x1, x2, x3");
+    a64_bic(& mut e, 1, 2, 3);
+    a64(& e, "bic {xd}, {xn}, {xm}{shift}", 1, 2, 3, 0, "bic x1, x2, x3");
+    a64_add_lsl(& mut e, 1, 2, 3, 3);
+    a64(& e, "add {xd}, {xn}, {xm}{shift}", 1, 2, 3, 3, "add x1, x2, x3, lsl #3");
+    a64_mul(& mut e, 1, 2, 3);
+    a64(& e, "mul {xd}, {xn}, {xm}", 1, 2, 3, 0, "mul x1, x2, x3");
+    a64_smulh(& mut e, 1, 2, 3);
+    a64(& e, "smulh {xd}, {xn}, {xm}", 1, 2, 3, 0, "smulh x1, x2, x3");
+    a64_umulh(& mut e, 1, 2, 3);
+    a64(& e, "umulh {xd}, {xn}, {xm}", 1, 2, 3, 0, "umulh x1, x2, x3");
+    a64_sdiv(& mut e, 1, 2, 3);
+    a64(& e, "sdiv {xd}, {xn}, {xm}", 1, 2, 3, 0, "sdiv x1, x2, x3");
+    a64_udiv(& mut e, 1, 2, 3);
+    a64(& e, "udiv {xd}, {xn}, {xm}", 1, 2, 3, 0, "udiv x1, x2, x3");
+    a64_lslv(& mut e, 1, 2, 3);
+    a64(& e, "lsl {xd}, {xn}, {xm}", 1, 2, 3, 0, "lsl x1, x2, x3");
+    a64_lsrv(& mut e, 1, 2, 3);
+    a64(& e, "lsr {xd}, {xn}, {xm}", 1, 2, 3, 0, "lsr x1, x2, x3");
+    a64_asrv(& mut e, 1, 2, 3);
+    a64(& e, "asr {xd}, {xn}, {xm}", 1, 2, 3, 0, "asr x1, x2, x3");
+    a64_msub(& mut e, 1, 2, 3, 4);
+    a64(& e, "msub {xd}, {xn}, {xm}, {xa}", 1, 2, 3, 4, "msub x1, x2, x3, x4");
+    a64_madd(& mut e, 1, 2, 3, 4);
+    a64(& e, "madd {xd}, {xn}, {xm}, {xa}", 1, 2, 3, 4, "madd x1, x2, x3, x4");
+    a64_add_imm(& mut e, 1, 2, 100);
+    a64(& e, "add {xds}, {xns}, #{imm12}{sh12}", 1, 2, 100, 0, "add x1, x2, #100");
+    a64_sub_imm(& mut e, 31, 31, 32);
+    a64(& e, "sub {xds}, {xns}, #{imm12}{sh12}", 31, 31, 32, 0, "sub sp, sp, #32");
+    a64_sub_imm_lsl12(& mut e, 31, 31, 1);
+    a64(& e, "sub {xds}, {xns}, #{imm12}{sh12}", 31, 31, 1, 1, "sub sp, sp, #1, lsl #12");
+    a64_add_ext(& mut e, 31, 31, 3);
+    a64(& e, "add {xds}, {xns}, {xm}", 31, 31, 3, 0, "add sp, sp, x3");
+    a64_sub_ext(& mut e, 1, 31, 3);
+    a64(& e, "sub {xds}, {xns}, {xm}", 1, 31, 3, 0, "sub x1, sp, x3");
+    a64_mov(& mut e, 1, 2);
+    a64(& e, "mov {xd}, {xm}", 1, 2, 0, 0, "mov x1, x2");
+    a64_mvn(& mut e, 1, 2);
+    a64(& e, "mvn {xd}, {xm}", 1, 2, 0, 0, "mvn x1, x2");
+    a64_neg(& mut e, 1, 2);
+    a64(& e, "neg {xd}, {xm}{shift}", 1, 2, 0, 0, "neg x1, x2");
+    a64_negs(& mut e, 1, 2);
+    a64(& e, "negs {xd}, {xm}{shift}", 1, 2, 0, 0, "negs x1, x2");
+    a64_cmp(& mut e, 1, 2);
+    a64(& e, "cmp {xn}, {xm}{shift}", 1, 2, 0, 0, "cmp x1, x2");
+    a64_cmp_asr63(& mut e, 1, 2);
+    a64(& e, "cmp {xn}, {xm}{shift}", 1, 2, 63 | (2 << 6), 0, "cmp x1, x2, asr #63");
+    a64_cset(& mut e, 1, A64_EQ);
+    a64(& e, "cset {xd}, {ncond}", 1, A64_EQ, 0, 0, "cset x1, eq");
+    a64_csel(& mut e, 1, 2, 3, A64_NE);
+    a64(& e, "csel {xd}, {xn}, {xm}, {cond}", 1, 2, 3, A64_NE, "csel x1, x2, x3, ne");
+    a64_sxtb(& mut e, 1, 2);
+    a64(& e, "sxtb {xd}, {wn}", 1, 2, 0, 0, "sxtb x1, w2");
+    a64_sxth(& mut e, 1, 2);
+    a64(& e, "sxth {xd}, {wn}", 1, 2, 0, 0, "sxth x1, w2");
+    a64_sxtw(& mut e, 1, 2);
+    a64(& e, "sxtw {xd}, {wn}", 1, 2, 0, 0, "sxtw x1, w2");
+    a64_uxtb(& mut e, 1, 2);
+    a64(& e, "ubfx {xd}, {xn}, #0, #8", 1, 2, 0, 0, "ubfx x1, x2, #0, #8");
+    a64_uxth(& mut e, 1, 2);
+    a64(& e, "ubfx {xd}, {xn}, #0, #16", 1, 2, 0, 0, "ubfx x1, x2, #0, #16");
+    a64_uxtw(& mut e, 1, 2);
+    a64(& e, "ubfx {xd}, {xn}, #0, #32", 1, 2, 0, 0, "ubfx x1, x2, #0, #32");
+    a64_asr63(& mut e, 1, 2);
+    a64(& e, "asr {xd}, {xn}, #{immr}", 1, 2, 63, 0, "asr x1, x2, #63");
+    a64_shift_imm(& mut e, 0, 1, 2, 3);
+    a64(& e, "lsl {xd}, {xn}, #{lsl6}", 1, 2, 3, 0, "lsl x1, x2, #3");
+    a64_shift_imm(& mut e, 1, 1, 2, 3);
+    a64(& e, "asr {xd}, {xn}, #{immr}", 1, 2, 3, 0, "asr x1, x2, #3");
+    a64_shift_imm(& mut e, 2, 1, 2, 3);
+    a64(& e, "lsr {xd}, {xn}, #{immr}", 1, 2, 3, 0, "lsr x1, x2, #3");
+    a64_movz_hw(& mut e, 1, 0x1234, 1);
+    a64(& e, "movz {xd}, #{imm16}{hw}", 1, 0x1234, 16, 0, "movz x1, #0x1234, lsl #16");
+    a64_movn_hw(& mut e, 1, 0x1234, 0);
+    a64(& e, "movn {xd}, #{imm16}{hw}", 1, 0x1234, 0, 0, "movn x1, #0x1234");
+    a64_ldr_sized(& mut e, 1, 2, 16, 8, false);
+    a64(& e, "ldr {xd}, [{xns}{uoff}]", 1, 2, 16, 0, "ldr x1, [x2, #16]");
+    a64_ldr_sized(& mut e, 1, 31, 3, 1, false);
+    a64(& e, "ldrb {wd}, [{xns}{uoff}]", 1, 31, 3, 0, "ldrb w1, [sp, #3]");
+    a64_ldr_sized(& mut e, 1, 2, 8, 4, true);
+    a64(& e, "ldrsw {xd}, [{xns}{uoff}]", 1, 2, 8, 0, "ldrsw x1, [x2, #8]");
+    a64_ldr_sized(& mut e, 1, 2, 0, 2, true);
+    a64(& e, "ldrsh {xd}, [{xns}{uoff}]", 1, 2, 0, 0, "ldrsh x1, [x2]");
+    a64_str_sized(& mut e, 1, 2, 6, 2);
+    a64(& e, "strh {wd}, [{xns}{uoff}]", 1, 2, 6, 0, "strh w1, [x2, #6]");
+    a64_str_sized(& mut e, 1, 31, 24, 8);
+    a64(& e, "str {xd}, [{xns}{uoff}]", 1, 31, 24, 0, "str x1, [sp, #24]");
+    a64_ldr_roff(& mut e, 1, 2, 3, 8, false, true);
+    a64(& e, "ldr {xd}, [{xns}, {xm}{rsc}]", 1, 2, 3, 1, "ldr x1, [x2, x3, lsl #3]");
+    a64_str_roff(& mut e, 1, 2, 3, 1, false);
+    a64(& e, "strb {wd}, [{xns}, {xm}{rsc}]", 1, 2, 3, 0, "strb w1, [x2, x3]");
+    a64_stp(& mut e, 29, 30, 31, 16);
+    a64(& e, "stp {xd}, {xt2}, [{xns}, #{simm7}]", 29, 30, 31, 16, "stp x29, x30, [sp, #16]");
+    a64_ldp(& mut e, 29, 30, 31, 0 - 16);
+    a64(& e, "ldp {xd}, {xt2}, [{xns}, #{simm7}]", 29, 30, 31, 0 - 16, "ldp x29, x30, [sp, #-16]");
+    a64_ret(& mut e);
+    a64(& e, "ret", 0, 0, 0, 0, "ret");
+    a64_brk(& mut e);
+    a64(& e, "brk #{imm16d}", 0, 0, 0, 0, "brk #0");
+    a64_svc0(& mut e);
+    a64(& e, "svc #0", 0, 0, 0, 0, "svc #0");
+    a64_blr(& mut e, 5);
+    a64(& e, "blr {xn}", 5, 0, 0, 0, "blr x5");
+    a64_br(& mut e, 5);
+    a64(& e, "br {xn}", 5, 0, 0, 0, "br x5");
+    a64_bcond_words(& mut e, A64_NE, 2);
+    a64(& e, "b.{cond0} {b19}", A64_NE, 2, 0, 0, "b.ne 0x1008");
+    a64_cbnz_words(& mut e, 3, 3);
+    a64(& e, "cbnz {xd}, {b19}", 3, 3, 0, 0, "cbnz x3, 0x100c");
+    a64_cbnz_w_words(& mut e, 3, 0 - 1);
+    a64(& e, "cbnz {wd}, {b19}", 3, 0 - 1, 0, 0, "cbnz w3, 0xffc");
+    a64_tbz_words(& mut e, 3, 37, true, 2);
+    a64(& e, "tbnz {tbr}, #{tbit}, {b14}", 3, 37, 2, 0, "tbnz x3, #37, 0x1008");
+    a64_tbz_words(& mut e, 3, 5, false, 2);
+    a64(& e, "tbz {tbr}, #{tbit}, {b14}", 3, 5, 2, 0, "tbz w3, #5, 0x1008");
+    a64_fmov_dx(& mut e, 1, 2);
+    a64(& e, "fmov {dd}, {xn}", 1, 2, 0, 0, "fmov d1, x2");
+    a64_fmov_xd(& mut e, 1, 2);
+    a64(& e, "fmov {xd}, {dn}", 1, 2, 0, 0, "fmov x1, d2");
+    a64_fmov_sw(& mut e, 1, 2);
+    a64(& e, "fmov {sd}, {wn}", 1, 2, 0, 0, "fmov s1, w2");
+    a64_fmov_ws(& mut e, 1, 2);
+    a64(& e, "fmov {wd}, {sn}", 1, 2, 0, 0, "fmov w1, s2");
+    a64_fadd(& mut e, 1, 2, 3);
+    a64(& e, "fadd {dd}, {dn}, {dm}", 1, 2, 3, 0, "fadd d1, d2, d3");
+    a64_fsub(& mut e, 1, 2, 3);
+    a64(& e, "fsub {dd}, {dn}, {dm}", 1, 2, 3, 0, "fsub d1, d2, d3");
+    a64_fmul(& mut e, 1, 2, 3);
+    a64(& e, "fmul {dd}, {dn}, {dm}", 1, 2, 3, 0, "fmul d1, d2, d3");
+    a64_fdiv(& mut e, 1, 2, 3);
+    a64(& e, "fdiv {dd}, {dn}, {dm}", 1, 2, 3, 0, "fdiv d1, d2, d3");
+    a64_fcmp(& mut e, 1, 2);
+    a64(& e, "fcmp {dn}, {dm}", 1, 2, 0, 0, "fcmp d1, d2");
+    a64_fcvt_ds(& mut e, 1, 2);
+    a64(& e, "fcvt {dd}, {sn}", 1, 2, 0, 0, "fcvt d1, s2");
+    a64_fcvt_sd(& mut e, 1, 2);
+    a64(& e, "fcvt {sd}, {dn}", 1, 2, 0, 0, "fcvt s1, d2");
+    a64_scvtf(& mut e, 1, 2);
+    a64(& e, "scvtf {dd}, {xn}", 1, 2, 0, 0, "scvtf d1, x2");
+    a64_fcvtzs(& mut e, 1, 2);
+    a64(& e, "fcvtzs {xd}, {dn}", 1, 2, 0, 0, "fcvtzs x1, d2");
+    a64_fsqrt(& mut e, 1, 2);
+    a64(& e, "fsqrt {dd}, {dn}", 1, 2, 0, 0, "fsqrt d1, d2");
+    a64_fabs(& mut e, 1, 2);
+    a64(& e, "fabs {dd}, {dn}", 1, 2, 0, 0, "fabs d1, d2");
+    a64_frintm(& mut e, 1, 2);
+    a64(& e, "frintm {dd}, {dn}", 1, 2, 0, 0, "frintm d1, d2");
+    a64_frintp(& mut e, 1, 2);
+    a64(& e, "frintp {dd}, {dn}", 1, 2, 0, 0, "frintp d1, d2");
+    a64_frintz(& mut e, 1, 2);
+    a64(& e, "frintz {dd}, {dn}", 1, 2, 0, 0, "frintz d1, d2");
+    a64_frinta(& mut e, 1, 2);
+    a64(& e, "frinta {dd}, {dn}", 1, 2, 0, 0, "frinta d1, d2");
+    a64_ldaxr(& mut e, 1, 2);
+    a64(& e, "ldaxr {xd}, [{xns}]", 1, 2, 0, 0, "ldaxr x1, [x2]");
+    a64_stlxr(& mut e, 3, 1, 2);
+    a64(& e, "stlxr {wm}, {xd}, [{xns}]", 3, 1, 2, 0, "stlxr w3, x1, [x2]");
+    a64_ldar(& mut e, 1, 2);
+    a64(& e, "ldar {xd}, [{xns}]", 1, 2, 0, 0, "ldar x1, [x2]");
+    a64_stlr(& mut e, 1, 2);
+    a64(& e, "stlr {xd}, [{xns}]", 1, 2, 0, 0, "stlr x1, [x2]");
+    a64_clrex(& mut e);
+    a64(& e, "clrex", 0, 0, 0, 0, "clrex");
+    a64_dmb(& mut e);
+    a64(& e, "dmb ish", 0, 0, 0, 0, "dmb ish");
+    a64_vec(& mut e, NVK_ADD64, 1, 2, 3);
+    a64(& e, "add {vd}.2d, {vn}.2d, {vm}.2d", 1, 2, 3, 0, "add v1.2d, v2.2d, v3.2d");
+    a64_vec(& mut e, NVK_MUL32, 1, 2, 3);
+    a64(& e, "mul {vd}.4s, {vn}.4s, {vm}.4s", 1, 2, 3, 0, "mul v1.4s, v2.4s, v3.4s");
+    a64_vec(& mut e, NVK_XOR, 1, 2, 3);
+    a64(& e, "eor {vd}.16b, {vn}.16b, {vm}.16b", 1, 2, 3, 0, "eor v1.16b, v2.16b, v3.16b");
+    a64_vec(& mut e, NVK_FDIV64, 1, 2, 3);
+    a64(& e, "fdiv {vd}.2d, {vn}.2d, {vm}.2d", 1, 2, 3, 0, "fdiv v1.2d, v2.2d, v3.2d");
+    a64_ldr_q(& mut e, 1, 2, 32);
+    a64(& e, "ldr {qd}, [{xns}{uoff}]", 1, 2, 32, 0, "ldr q1, [x2, #32]");
+    a64_str_q(& mut e, 1, 31, 16);
+    a64(& e, "str {qd}, [{xns}{uoff}]", 1, 31, 16, 0, "str q1, [sp, #16]");
+    a64_dup_2d(& mut e, 1, 2);
+    a64(& e, "dup {vd}.2d, {xn}", 1, 2, 0, 0, "dup v1.2d, x2");
+    a64_addp_d(& mut e, 1, 2);
+    a64(& e, "addp {dd}, {vn}.2d", 1, 2, 0, 0, "addp d1, v2.2d");
+    a64_umov_d(& mut e, 1, 2, 1);
+    a64(& e, "mov {xd}, {vn}.d[{idx1}]", 1, 2, 1, 0, "mov x1, v2.d[1]");
+    a64_ins_d(& mut e, 1, 0, 2);
+    a64(& e, "mov {vd}.d[{idx1}], {xn}", 1, 0, 2, 0, "mov v1.d[0], x2");
+    a64_fcmeq_zero_2d(& mut e, 1, 2);
+    a64(& e, "fcmeq {vd}.2d, {vn}.2d, #0.0", 1, 2, 0, 0, "fcmeq v1.2d, v2.2d, #0.0");
+}
+
+fn check_rv() {
+    var e: NatEnc = NatEnc_new();
+    rv_add(& mut e, 10, 11, 12);
+    rv(& e, "add {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "add a0, a1, a2");
+    rv_sub(& mut e, 10, 11, 12);
+    rv(& e, "sub {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "sub a0, a1, a2");
+    rv_sll(& mut e, 10, 11, 12);
+    rv(& e, "sll {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "sll a0, a1, a2");
+    rv_slt(& mut e, 10, 11, 12);
+    rv(& e, "slt {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "slt a0, a1, a2");
+    rv_sltu(& mut e, 10, 11, 12);
+    rv(& e, "sltu {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "sltu a0, a1, a2");
+    rv_xor(& mut e, 10, 11, 12);
+    rv(& e, "xor {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "xor a0, a1, a2");
+    rv_srl(& mut e, 10, 11, 12);
+    rv(& e, "srl {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "srl a0, a1, a2");
+    rv_sra(& mut e, 10, 11, 12);
+    rv(& e, "sra {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "sra a0, a1, a2");
+    rv_or(& mut e, 10, 11, 12);
+    rv(& e, "or {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "or a0, a1, a2");
+    rv_and(& mut e, 10, 11, 12);
+    rv(& e, "and {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "and a0, a1, a2");
+    rv_mul(& mut e, 10, 11, 12);
+    rv(& e, "mul {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "mul a0, a1, a2");
+    rv_mulh(& mut e, 10, 11, 12);
+    rv(& e, "mulh {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "mulh a0, a1, a2");
+    rv_mulhu(& mut e, 10, 11, 12);
+    rv(& e, "mulhu {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "mulhu a0, a1, a2");
+    rv_div(& mut e, 10, 11, 12);
+    rv(& e, "div {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "div a0, a1, a2");
+    rv_divu(& mut e, 10, 11, 12);
+    rv(& e, "divu {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "divu a0, a1, a2");
+    rv_rem(& mut e, 10, 11, 12);
+    rv(& e, "rem {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "rem a0, a1, a2");
+    rv_remu(& mut e, 10, 11, 12);
+    rv(& e, "remu {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "remu a0, a1, a2");
+    rv_addi(& mut e, 10, 11, 0 - 5);
+    rv(& e, "addi {rd}, {rs1}, {immi}", 10, 11, 0 - 5, 0, "addi a0, a1, -5");
+    rv_addi(& mut e, 10, 0, 42);
+    rv(& e, "li {rd}, {immi}", 10, 42, 0, 0, "li a0, 42");
+    rv_xori(& mut e, 10, 11, 7);
+    rv(& e, "xori {rd}, {rs1}, {immi}", 10, 11, 7, 0, "xori a0, a1, 7");
+    rv_andi(& mut e, 10, 11, 255);
+    rv(& e, "andi {rd}, {rs1}, {immi}", 10, 11, 255, 0, "andi a0, a1, 255");
+    rv_sltiu(& mut e, 10, 11, 5);
+    rv(& e, "sltiu {rd}, {rs1}, {immi}", 10, 11, 5, 0, "sltiu a0, a1, 5");
+    rv_sltiu(& mut e, 10, 11, 1);
+    rv(& e, "seqz {rd}, {rs1}", 10, 11, 0, 0, "seqz a0, a1");
+    rv_slli(& mut e, 10, 11, 3);
+    rv(& e, "slli {rd}, {rs1}, {shamt6}", 10, 11, 3, 0, "slli a0, a1, 3");
+    rv_srli(& mut e, 10, 11, 40);
+    rv(& e, "srli {rd}, {rs1}, {shamt6}", 10, 11, 40, 0, "srli a0, a1, 40");
+    rv_srai(& mut e, 10, 11, 63);
+    rv(& e, "srai {rd}, {rs1}, {shamt6}", 10, 11, 63, 0, "srai a0, a1, 63");
+    rv_addiw(& mut e, 10, 11, 4);
+    rv(& e, "addiw {rd}, {rs1}, {immi}", 10, 11, 4, 0, "addiw a0, a1, 4");
+    rv_addiw(& mut e, 10, 11, 0);
+    rv(& e, "sext.w {rd}, {rs1}", 10, 11, 0, 0, "sext.w a0, a1");
+    rv_addw(& mut e, 10, 11, 12);
+    rv(& e, "addw {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "addw a0, a1, a2");
+    rv_subw(& mut e, 5, 6, 7);
+    rv(& e, "subw {rd}, {rs1}, {rs2}", 5, 6, 7, 0, "subw t0, t1, t2");
+    rv_mulw(& mut e, 10, 11, 12);
+    rv(& e, "mulw {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "mulw a0, a1, a2");
+    rv_mv(& mut e, 10, 11);
+    rv(& e, "mv {rd}, {rs1}", 10, 11, 0, 0, "mv a0, a1");
+    rv_shadd(& mut e, 10, 11, 12, 2);
+    rv(& e, "sh2add {rd}, {rs1}, {rs2}", 10, 12, 11, 0, "sh2add a0, a2, a1");
+    rv_zext_w(& mut e, 10, 11);
+    rv(& e, "zext.w {rd}, {rs1}", 10, 11, 0, 0, "zext.w a0, a1");
+    rv_sext_b(& mut e, 10, 11);
+    rv(& e, "sext.b {rd}, {rs1}", 10, 11, 0, 0, "sext.b a0, a1");
+    rv_sext_h(& mut e, 10, 11);
+    rv(& e, "sext.h {rd}, {rs1}", 10, 11, 0, 0, "sext.h a0, a1");
+    rv_zext_h(& mut e, 10, 11);
+    rv(& e, "zext.h {rd}, {rs1}", 10, 11, 0, 0, "zext.h a0, a1");
+    rv_andn(& mut e, 10, 11, 12);
+    rv(& e, "andn {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "andn a0, a1, a2");
+    rv_czero_eqz(& mut e, 10, 11, 12);
+    rv(& e, "czero.eqz {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "czero.eqz a0, a1, a2");
+    rv_czero_nez(& mut e, 10, 11, 12);
+    rv(& e, "czero.nez {rd}, {rs1}, {rs2}", 10, 11, 12, 0, "czero.nez a0, a1, a2");
+    rv_lui(& mut e, 10, 0x12345);
+    rv(& e, "lui {rd}, {uimm20}", 10, 0x12345, 0, 0, "lui a0, 0x12345");
+    rv_jalr(& mut e, 1, 5, 0);
+    rv(& e, "jalr {rs1}", 5, 0, 0, 0, "jalr t0");
+    rv_jalr(& mut e, 0, 1, 0);
+    rv(& e, "ret", 0, 0, 0, 0, "ret");
+    rv_ecall(& mut e);
+    rv(& e, "ecall", 0, 0, 0, 0, "ecall");
+    rv_ebreak(& mut e);
+    rv(& e, "ebreak", 0, 0, 0, 0, "ebreak");
+    rv_fence(& mut e);
+    rv(& e, "fence rw, rw", 0, 0, 0, 0, "fence rw, rw");
+    rv_load(& mut e, 10, 2, 16, 8, true);
+    rv(& e, "ld {rd}, {immi}({rs1})", 10, 16, 2, 0, "ld a0, 16(sp)");
+    rv_load(& mut e, 10, 11, 0 - 1, 1, false);
+    rv(& e, "lbu {rd}, {immi}({rs1})", 10, 0 - 1, 11, 0, "lbu a0, -1(a1)");
+    rv_load(& mut e, 10, 11, 4, 4, true);
+    rv(& e, "lw {rd}, {immi}({rs1})", 10, 4, 11, 0, "lw a0, 4(a1)");
+    rv_store(& mut e, 10, 2, 0 - 8, 8);
+    rv(& e, "sd {rs2}, {immst}({rs1})", 10, 0 - 8, 2, 0, "sd a0, -8(sp)");
+    rv_store(& mut e, 10, 11, 100, 1);
+    rv(& e, "sb {rs2}, {immst}({rs1})", 10, 100, 11, 0, "sb a0, 100(a1)");
+    rv_b_off(& mut e, RV_BLT, 10, 11, 16);
+    rv(& e, "blt {rs1}, {rs2}, {boff}", 10, 11, 16, 0, "blt a0, a1, 0x1010");
+    rv_b_off(& mut e, RV_BEQ, 10, 0, 0 - 8);
+    rv(& e, "beqz {rs1}, {boff}", 10, 0 - 8, 0, 0, "beqz a0, 0xff8");
+    rv_b_off(& mut e, RV_BGEU, 10, 11, 2048);
+    rv(& e, "bgeu {rs1}, {rs2}, {boff}", 10, 11, 2048, 0, "bgeu a0, a1, 0x1800");
+    rv_fmv_dx(& mut e, 1, 10);
+    rv(& e, "fmv.d.x {fd}, {rs1}", 1, 10, 0, 0, "fmv.d.x f1, a0");
+    rv_fmv_xd(& mut e, 10, 1);
+    rv(& e, "fmv.x.d {rd}, {fs1}", 10, 1, 0, 0, "fmv.x.d a0, f1");
+    rv_fmv_wx(& mut e, 1, 10);
+    rv(& e, "fmv.w.x {fd}, {rs1}", 1, 10, 0, 0, "fmv.w.x f1, a0");
+    rv_fmv_xw(& mut e, 10, 1);
+    rv(& e, "fmv.x.w {rd}, {fs1}", 10, 1, 0, 0, "fmv.x.w a0, f1");
+    rv_fadd_d(& mut e, 1, 2, 3);
+    rv(& e, "fadd.d {fd}, {fs1}, {fs2}{rmd}", 1, 2, 3, 7, "fadd.d f1, f2, f3");
+    rv_fsub_d(& mut e, 1, 2, 3);
+    rv(& e, "fsub.d {fd}, {fs1}, {fs2}{rmd}", 1, 2, 3, 7, "fsub.d f1, f2, f3");
+    rv_fmul_d(& mut e, 1, 2, 3);
+    rv(& e, "fmul.d {fd}, {fs1}, {fs2}{rmd}", 1, 2, 3, 7, "fmul.d f1, f2, f3");
+    rv_fdiv_d(& mut e, 1, 2, 3);
+    rv(& e, "fdiv.d {fd}, {fs1}, {fs2}{rmd}", 1, 2, 3, 7, "fdiv.d f1, f2, f3");
+    rv_fsqrt_d(& mut e, 1, 2);
+    rv(& e, "fsqrt.d {fd}, {fs1}{rmd}", 1, 2, 7, 0, "fsqrt.d f1, f2");
+    rv_feq_d(& mut e, 10, 1, 2);
+    rv(& e, "feq.d {rd}, {fs1}, {fs2}", 10, 1, 2, 0, "feq.d a0, f1, f2");
+    rv_flt_d(& mut e, 10, 1, 2);
+    rv(& e, "flt.d {rd}, {fs1}, {fs2}", 10, 1, 2, 0, "flt.d a0, f1, f2");
+    rv_fle_d(& mut e, 10, 1, 2);
+    rv(& e, "fle.d {rd}, {fs1}, {fs2}", 10, 1, 2, 0, "fle.d a0, f1, f2");
+    rv_fcvt_dl(& mut e, 1, 10);
+    rv(& e, "fcvt.d.l {fd}, {rs1}{rmd}", 1, 10, 7, 0, "fcvt.d.l f1, a0");
+    rv_fcvt_ld(& mut e, 10, 1);
+    rv(& e, "fcvt.l.d {rd}, {fs1}, {rm}", 10, 1, 1, 0, "fcvt.l.d a0, f1, rtz");
+    rv_fcvt_ds(& mut e, 1, 2);
+    rv(& e, "fcvt.d.s {fd}, {fs1}", 1, 2, 0, 0, "fcvt.d.s f1, f2");
+    rv_fcvt_sd(& mut e, 1, 2);
+    rv(& e, "fcvt.s.d {fd}, {fs1}{rmd}", 1, 2, 7, 0, "fcvt.s.d f1, f2");
+    rv_fsgnj_d(& mut e, 1, 2, 2);
+    rv(& e, "fmv.d {fd}, {fsame}", 1, 2, 0, 0, "fmv.d f1, f2");
+    rv_fsgnjx_d(& mut e, 1, 2, 3);
+    rv(& e, "fsgnjx.d {fd}, {fs1}, {fs2}", 1, 2, 3, 0, "fsgnjx.d f1, f2, f3");
+    rv_amoadd_d(& mut e, 10, 11, 12);
+    rv(& e, "amoadd.d{aqrl} {rd}, {rs2}, ({rs1})", 3, 10, 11, 12, "amoadd.d.aqrl a0, a1, (a2)");
+    rv_lr_d(& mut e, 10, 12);
+    rv(& e, "lr.d{aqrl} {rd}, ({rs1})", 3, 10, 12, 0, "lr.d.aqrl a0, (a2)");
+    rv_sc_d(& mut e, 10, 11, 12);
+    rv(& e, "sc.d{aqrl} {rd}, {rs2}, ({rs1})", 3, 10, 11, 12, "sc.d.aqrl a0, a1, (a2)");
+    rv_vsetvli(& mut e, 10, 11, 0xD8);
+    rv(& e, "vsetvli {rd}, {rs1}, {vtype}", 10, 11, 0xD8, 0, "vsetvli a0, a1, e64, m1, ta, ma");
+    rv_vle(& mut e, 1, 10, 64);
+    rv(& e, "vle64.v {rvd}, ({rs1})", 1, 10, 0, 0, "vle64.v v1, (a0)");
+    rv_vse(& mut e, 1, 10, 32);
+    rv(& e, "vse32.v {rvd}, ({rs1})", 1, 10, 0, 0, "vse32.v v1, (a0)");
+    rv_vec(& mut e, NVK_ADD64, 1, 2, 3);
+    rv(& e, "vadd.vv {rvd}, {rvs2}, {rvs1}", 1, 2, 3, 0, "vadd.vv v1, v2, v3");
+    rv_vec(& mut e, NVK_MUL32, 1, 2, 3);
+    rv(& e, "vmul.vv {rvd}, {rvs2}, {rvs1}", 1, 2, 3, 0, "vmul.vv v1, v2, v3");
+    rv_vec(& mut e, NVK_FDIV64, 1, 2, 3);
+    rv(& e, "vfdiv.vv {rvd}, {rvs2}, {rvs1}", 1, 2, 3, 0, "vfdiv.vv v1, v2, v3");
+    rv_vredsum(& mut e, 1, 2, 3);
+    rv(& e, "vredsum.vs {rvd}, {rvs2}, {rvs1}", 1, 2, 3, 0, "vredsum.vs v1, v2, v3");
+    rv_vmv_x_s(& mut e, 10, 2);
+    rv(& e, "vmv.x.s {rd}, {rvs2}", 10, 2, 0, 0, "vmv.x.s a0, v2");
+    rv_vmv_v_x(& mut e, 1, 10);
+    rv(& e, "vmv.v.x {rvd}, {rs1}", 1, 10, 0, 0, "vmv.v.x v1, a0");
+}
+
+fn check_x64() {
+    var e: NatEnc = NatEnc_new();
+    var at: i64 = e.code.len();
+    x64_mov(& mut e, 0, 3);
+    x64(& e, at, "mov {rm}, {r}", 3, 0, 0, true, false, no_imm(), "mov rax, rbx");
+    at = e.code.len();
+    x64_mov(& mut e, 12, 9);
+    x64(& e, at, "mov {rm}, {r}", 9, 12, 0, true, false, no_imm(), "mov r12, r9");
+    at = e.code.len();
+    x64_mov32(& mut e, 0, 3);
+    x64(& e, at, "mov {rm}, {r}", 3, 0, 0, false, false, no_imm(), "mov eax, ebx");
+    at = e.code.len();
+    x64_li_zero(& mut e, 3);
+    x64(& e, at, "xor {rm}, {r}", 3, 3, 0, false, false, no_imm(), "xor ebx, ebx  ; = 0");
+    at = e.code.len();
+    x64_li_u32(& mut e, 3, 0x1234);
+    x64(& e, at, "mov {oreg}, {uz}", 0, 3, 0, false, false, imm4(0x1234), "mov ebx, 0x1234");
+    at = e.code.len();
+    x64_li_abs(& mut e, 9, 0x123456789A);
+    x64(& e, at, "mov {oreg}, {iq}", 0, 9, 0, true, false, imm8(0x123456789A), "mov r9, 0x123456789a");
+    at = e.code.len();
+    x64_li_s32(& mut e, 3, 0 - 5);
+    x64(& e, at, "mov {rms}, {sz}", 0, 3, 0, true, false, imm4(0 - 5), "mov rbx, -0x5");
+    at = e.code.len();
+    x64_alu(& mut e, 0x01, 0, 3);
+    x64(& e, at, "add {rm}, {r}", 3, 0, 0, true, false, no_imm(), "add rax, rbx");
+    at = e.code.len();
+    x64_alu(& mut e, 0x29, 8, 3);
+    x64(& e, at, "sub {rm}, {r}", 3, 8, 0, true, false, no_imm(), "sub r8, rbx");
+    at = e.code.len();
+    x64_alu(& mut e, 0x31, 0, 3);
+    x64(& e, at, "xor {rm}, {r}", 3, 0, 0, true, false, no_imm(), "xor rax, rbx");
+    at = e.code.len();
+    x64_alu(& mut e, 0x39, 1, 2);
+    x64(& e, at, "cmp {rm}, {r}", 2, 1, 0, true, false, no_imm(), "cmp rcx, rdx");
+    at = e.code.len();
+    x64_imul(& mut e, 0, 3);
+    x64(& e, at, "imul {r}, {rm}", 0, 3, 0, true, false, no_imm(), "imul rax, rbx");
+    at = e.code.len();
+    x64_f7(& mut e, 3, 1);
+    x64(& e, at, "neg {rms}", 0, 1, 0, true, false, no_imm(), "neg rcx");
+    at = e.code.len();
+    x64_f7(& mut e, 7, 1);
+    x64(& e, at, "idiv {rms}", 0, 1, 0, true, false, no_imm(), "idiv rcx");
+    at = e.code.len();
+    x64_shift_cl(& mut e, 4, 1);
+    x64(& e, at, "shl {rms}, cl", 0, 1, 0, true, false, no_imm(), "shl rcx, cl");
+    at = e.code.len();
+    x64_shift_imm(& mut e, 7, 1, 5);
+    x64(& e, at, "sar {rms}, {ib}", 0, 1, 0, true, false, imm1(5), "sar rcx, 5");
+    at = e.code.len();
+    x64_add_imm(& mut e, 1, 16);
+    x64(& e, at, "add {rms}, {sb}", 0, 1, 0, true, false, imm1(16), "add rcx, 0x10");
+    at = e.code.len();
+    x64_sub_imm(& mut e, 1, 1000);
+    x64(& e, at, "sub {rms}, {sz}", 0, 1, 0, true, false, imm4(1000), "sub rcx, 0x3e8");
+    at = e.code.len();
+    x64_setcc(& mut e, X64_E, 1);
+    x64(& e, at, "sete {rm8s}", 0, 1, 0, false, false, no_imm(), "sete cl");
+    at = e.code.len();
+    x64_movx(& mut e, 0xB6, 0, 1);
+    x64(& e, at, "movzx {r}, {rm8s}", 0, 1, 0, true, false, no_imm(), "movzx rax, cl");
+    at = e.code.len();
+    x64_movx(& mut e, 0xBF, 0, 1);
+    x64(& e, at, "movsx {r}, {rm16s}", 0, 1, 0, true, false, no_imm(), "movsx rax, cx");
+    at = e.code.len();
+    x64_movx(& mut e, 0x63, 0, 1);
+    x64(& e, at, "movsxd {r64}, {rm32s}", 0, 1, 0, true, false, no_imm(), "movsxd rax, ecx");
+    at = e.code.len();
+    x64_test(& mut e, 0, 1);
+    x64(& e, at, "test {rm}, {r}", 1, 0, 0, true, false, no_imm(), "test rax, rcx");
+    at = e.code.len();
+    x64_test_bit(& mut e, 1, 3);
+    x64(& e, at, "test {rm8s}, {ibx}", 0, 1, 0, false, false, imm1(8), "test cl, 0x8");
+    at = e.code.len();
+    x64_test_bit(& mut e, 0, 3);
+    x64(& e, at, "test al, {ibx}", 0, 0, 0, false, false, imm1(8), "test al, 0x8");
+    at = e.code.len();
+    x64_test_bit(& mut e, 1, 40);
+    x64(& e, at, "bt {rm}, {ib}", 0, 1, 0, true, false, imm1(40), "bt rcx, 40");
+    at = e.code.len();
+    x64_cmov(& mut e, X64_NE, 0, 1);
+    x64(& e, at, "cmovne {r}, {rm}", 0, 1, 0, true, false, no_imm(), "cmovne rax, rcx");
+    at = e.code.len();
+    x64_movq_xr(& mut e, 1, 0, true);
+    x64(& e, at, "mov{dq} {x}, {rmw}", 1, 0, 0, true, false, no_imm(), "movq xmm1, rax");
+    at = e.code.len();
+    x64_movq_rx(& mut e, 0, 1, false);
+    x64(& e, at, "mov{dq} {rmw}, {x}", 1, 0, 0, false, false, no_imm(), "movd eax, xmm1");
+    at = e.code.len();
+    x64_sse(& mut e, 0xF2, 0x58, 1, 2);
+    x64(& e, at, "addsd {x}, {xrm}", 1, 2, 0, false, false, no_imm(), "addsd xmm1, xmm2");
+    at = e.code.len();
+    x64_sse(& mut e, 0xF2, 0x51, 1, 10);
+    x64(& e, at, "sqrtsd {x}, {xrm}", 1, 10, 0, false, false, no_imm(), "sqrtsd xmm1, xmm10");
+    at = e.code.len();
+    x64_sse(& mut e, 0xF3, 0x5A, 1, 2);
+    x64(& e, at, "cvtss2sd {x}, {xrm}", 1, 2, 0, false, false, no_imm(), "cvtss2sd xmm1, xmm2");
+    at = e.code.len();
+    x64_sse(& mut e, 0x66, 0x2E, 1, 2);
+    x64(& e, at, "ucomisd {x}, {xrm}", 1, 2, 0, false, false, no_imm(), "ucomisd xmm1, xmm2");
+    at = e.code.len();
+    x64_cvtsi2sd(& mut e, 1, 0);
+    x64(& e, at, "cvtsi2sd {x}, {rmws}", 1, 0, 0, true, false, no_imm(), "cvtsi2sd xmm1, rax");
+    at = e.code.len();
+    x64_cvttsd2si(& mut e, 0, 1);
+    x64(& e, at, "cvttsd2si {rw}, {xrm}", 0, 1, 0, true, false, no_imm(), "cvttsd2si rax, xmm1");
+    at = e.code.len();
+    x64_roundsd(& mut e, 1, 2, 3);
+    x64(& e, at, "roundsd {x}, {xrm}, {ib}", 1, 2, 0, false, false, imm1(3), "roundsd xmm1, xmm2, 3");
+    at = e.code.len();
+    x64_vec(& mut e, NVK_ADD64, 1, 2);
+    x64(& e, at, "paddq {x}, {xrm}", 1, 2, 0, false, false, no_imm(), "paddq xmm1, xmm2");
+    at = e.code.len();
+    x64_vec(& mut e, NVK_MUL32, 1, 9);
+    x64(& e, at, "pmulld {x}, {xrm}", 1, 9, 0, false, false, no_imm(), "pmulld xmm1, xmm9");
+    at = e.code.len();
+    x64_vec(& mut e, NVK_FADD64, 1, 2);
+    x64(& e, at, "addpd {x}, {xrm}", 1, 2, 0, false, false, no_imm(), "addpd xmm1, xmm2");
+    at = e.code.len();
+    x64_pshufd(& mut e, 1, 2, 0x4E);
+    x64(& e, at, "pshufd {x}, {xrm}, {ib}", 1, 2, 0, false, false, imm1(0x4E), "pshufd xmm1, xmm2, 78");
+    at = e.code.len();
+    x64_punpcklqdq(& mut e, 1, 2);
+    x64(& e, at, "punpcklqdq {x}, {xrm}", 1, 2, 0, false, false, no_imm(), "punpcklqdq xmm1, xmm2");
+    at = e.code.len();
+    x64_cmppd(& mut e, 1, 2, 4);
+    x64(& e, at, "cmppd {x}, {xrm}, {ib}", 1, 2, 0, false, false, imm1(4), "cmppd xmm1, xmm2, 4");
+    at = e.code.len();
+    x64_shiftx(& mut e, 1, 0, 1, 2);
+    x64(& e, at, "shlx {r64}, {rm64}, {gv}", 0, 1, 2, true, false, no_imm(), "shlx rax, rcx, rdx");
+    at = e.code.len();
+    x64_shiftx(& mut e, 3, 8, 9, 10);
+    x64(& e, at, "shrx {r64}, {rm64}, {gv}", 8, 9, 10, true, false, no_imm(), "shrx r8, r9, r10");
+    at = e.code.len();
+    x64_andn(& mut e, 0, 1, 2);
+    x64(& e, at, "andn {r64}, {gv}, {rm64}", 0, 2, 1, true, false, no_imm(), "andn rax, rcx, rdx");
+    at = e.code.len();
+    x64_blsr(& mut e, 0, 1);
+    x64(& e, at, "blsr {gv}, {rm64}", 0, 1, 0, true, false, no_imm(), "blsr rax, rcx");
+    at = e.code.len();
+    x64_vfmadd213sd_012(& mut e);
+    x64(& e, at, "vfmadd213sd {x}, {xv}, {xrm}", 0, 2, 1, true, false, no_imm(), "vfmadd213sd xmm0, xmm1, xmm2");
+    at = e.code.len();
+    x64_vvec(& mut e, NVK_ADD64, 1, 2, 3, true);
+    x64(& e, at, "vpaddq {v}, {vv}, {vrm}", 1, 3, 2, false, true, no_imm(), "vpaddq ymm1, ymm2, ymm3");
+    at = e.code.len();
+    x64_vvec(& mut e, NVK_FMUL64, 1, 2, 3, false);
+    x64(& e, at, "vmulpd {v}, {vv}, {vrm}", 1, 3, 2, false, false, no_imm(), "vmulpd xmm1, xmm2, xmm3");
+    at = e.code.len();
+    x64_vvec(& mut e, NVK_MUL32, 1, 2, 3, true);
+    x64(& e, at, "vpmulld {v}, {vv}, {vrm}", 1, 3, 2, false, true, no_imm(), "vpmulld ymm1, ymm2, ymm3");
+    at = e.code.len();
+    x64_vcmppd(& mut e, 1, 2, 3, 4, true);
+    x64(& e, at, "vcmppd {v}, {vv}, {vrm}, {ib}", 1, 3, 2, false, true, imm1(4), "vcmppd ymm1, ymm2, ymm3, 4");
+    at = e.code.len();
+    x64_vpbroadcastq(& mut e, 1, 2, true);
+    x64(& e, at, "vpbroadcastq {v}, {xrm}", 1, 2, 0, false, true, no_imm(), "vpbroadcastq ymm1, xmm2");
+}
+
+fn main() -> i64 {
+    var problems: Vec<str> = ef_check();
+    var i: i64 = 0;
+    while i < problems.len() {
+        println("table: " + problems.get(i));
+        i = i + 1;
+    }
+    if problems.len() == 0 {
+        println("table ok");
+    }
+    var before: i64 = g_fails;
+    check_a64();
+    if g_fails == before {
+        println("a64 ok");
+    }
+    before = g_fails;
+    check_rv();
+    if g_fails == before {
+        println("rv64 ok");
+    }
+    before = g_fails;
+    check_x64();
+    if g_fails == before {
+        println("x64 ok");
+    }
+    if g_fails > 0 || problems.len() > 0 {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,114 @@
+// CS5: the pieces of the parallel reporting pass of the escape and @secret
+// checks (compiler/escape.fd "Parallel reporting pass") that decide what
+// each worker gets: the chunks never split an impl block or the trait
+// impls, there are at most as many as workers, and they cover every unit
+// in order; a worker's copy of a string or table shares no buffer with the
+// original.
+//
+// Expected output:
+// groups: |impl:S|trait:|
+// bounds 4: 0 3 3 6 6 9 9 12
+// bounds impl: 0 4 4 6
+// bounds trait: 0 2 2 7
+// bounds 16 of 5: 0 1 1 2 2 3 3 4 4 5
+// bounds 1: 0 12
+// copy: abc true
+// copy empty: 0
+// copies: 3 7 1
+// cover ok
+// esc workers: 1
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::escape;
+
+fn show(label: str, b: Vec<i64>) {
+    var s: str = label + ":";
+    var i: i64 = 0;
+    while i < b.len() {
+        s = s + " " + int_to_str(b.get(i));
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn fns(n: i64) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push("fn:f" + int_to_str(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    println("groups: " + par_unit_group("fn:a") + "|" + par_unit_group("impl:S:m") + "|" + par_unit_group("trait:T:m") + "|");
+    // free functions: any boundary
+    show("bounds 4", par_chunk_bounds(fns(12), 4));
+    // an impl block of four methods is never split
+    var k: Vec<str> = Vec::new();
+    k.push("fn:a");
+    k.push("impl:S:m1");
+    k.push("impl:S:m2");
+    k.push("impl:S:m3");
+    k.push("fn:b");
+    k.push("fn:c");
+    show("bounds impl", par_chunk_bounds(k, 3));
+    // the trait impls' methods are one chunk
+    var t: Vec<str> = Vec::new();
+    t.push("fn:a");
+    t.push("fn:b");
+    t.push("trait:A:x");
+    t.push("trait:B:x");
+    t.push("trait:B:y");
+    t.push("trait:C:x");
+    t.push("trait:C:z");
+    show("bounds trait", par_chunk_bounds(t, 4));
+    // more workers than units: one unit each, never more chunks than units
+    show("bounds 16 of 5", par_chunk_bounds(fns(5), 16));
+    show("bounds 1", par_chunk_bounds(fns(12), 1));
+    // a copy is the same text in another buffer
+    var src: str = "ab" + "c";
+    var cp: str = par_own_str(src);
+    println("copy: " + cp + " " + bool_to_str((cp as i64) != (src as i64)));
+    println("copy empty: " + int_to_str(str_len(par_own_str(""))));
+    var vv: Vec<Vec<i64>> = Vec::new();
+    var a: Vec<i64> = Vec::new();
+    a.push(3);
+    a.push(7);
+    vv.push(a);
+    var vc: Vec<Vec<i64>> = par_own_i64ss(vv);
+    println("copies: " + int_to_str(vc.get(0).get(0)) + " " + int_to_str(vc.get(0).get(1)) + " " + int_to_str(vc.len()));
+    // every unit in exactly one chunk, in order, for many sizes
+    var ok: bool = true;
+    var n: i64 = 1;
+    while n < 70 {
+        var w: i64 = 1;
+        while w < 17 {
+            var b: Vec<i64> = par_chunk_bounds(fns(n), w);
+            if b.len() / 2 > w || b.get(0) != 0 || b.get(b.len() - 1) != n {
+                ok = false;
+            }
+            var j: i64 = 2;
+            while j < b.len() {
+                if b.get(j) != b.get(j - 1) {
+                    ok = false;
+                }
+                j = j + 2;
+            }
+            w = w + 1;
+        }
+        n = n + 1;
+    }
+    if ok {
+        println("cover ok");
+    } else {
+        println("cover FAILED");
+    }
+    // FID_PAR unset: the sequential pass
+    println("esc workers: " + int_to_str(esc_par_workers()));
+    return 0;
+}

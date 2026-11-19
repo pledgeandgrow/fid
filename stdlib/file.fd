@@ -7,42 +7,69 @@
 // In native builds, these use Linux syscalls (open/read/write/close).
 
 module file;
+ use trace;
 /// Read the entire contents of a file as a string.
 /// Returns empty string if the file doesn't exist or can't be read.
+///
+/// Example:
+///   val p = "fid_doctest_file.tmp";
+///   file_write(p, "one\n");
+///   file_append(p, "two\n");
+///   assert(file_exists(p));
+///   assert_eq(file_read(p), "one\ntwo\n");
+///   assert_eq(file_size(p), 8);
+///   file_delete(p);
+///   assert(!file_exists(p));
+///   assert_eq(file_read(p), "");
 pub fn file_read(path: str) -> str {
+    // CO2: a "file.read" span under FIDES_TRACE (the path)
+    val t0: i64 = trace_span_begin();
     match read_file(path) {
         Option::Some(content) => {
+            trace_span_end(t0, "file.read", path, true);
             return content;
         }
         Option::None => {
         }
     }
+    trace_span_end(t0, "file.read", path, false);
     return "";
 }
 
 /// Read the entire contents of a file: Err("cannot read <path>") when it
 /// does not exist or cannot be read.
 pub fn file_read_result(path: str) -> Result<str, str> {
+    val t0: i64 = trace_span_begin();
     match read_file(path) {
         Option::Some(content) => {
+            trace_span_end(t0, "file.read", path, true);
             return Result::Ok(content);
         }
         Option::None => {
         }
     }
+    trace_span_end(t0, "file.read", path, false);
     return Result::Err("cannot read " + path);
 }
 
 /// Write content to a file (overwrites existing content).
 /// Returns 0 on success, -1 on error.
 pub fn file_write(path: str, content: str) -> i64 {
-    return p_file_write(path, content);
+    // CO2: a "file.write" span under FIDES_TRACE (the path, not the content)
+    val t0: i64 = trace_span_begin();
+    val r: i64 = p_file_write(path, content);
+    trace_span_end(t0, "file.write", path, r == 0);
+    return r;
 }
 
 /// Append content to a file (creates if it doesn't exist).
 /// Returns 0 on success, -1 on error.
 pub fn file_append(path: str, content: str) -> i64 {
-    return p_file_append(path, content);
+    // CO2: a "file.append" span under FIDES_TRACE (the path, not the content)
+    val t0: i64 = trace_span_begin();
+    val r: i64 = p_file_append(path, content);
+    trace_span_end(t0, "file.append", path, r == 0);
+    return r;
 }
 
 /// Check if a file exists.
@@ -68,7 +95,11 @@ pub fn file_write_bytes(path: str, bytes: Vec<i64>) -> i64 {
 /// Binary-safe: p_file_read_bytes preserves bytes past a 0x00 (unlike
 /// p_file_read + str_bytes, which truncate at the first NUL).
 pub fn file_read_bytes(path: str) -> Vec<i64> {
-    return p_file_read_bytes(path);
+    val t0: i64 = trace_span_begin();
+    val bytes: Vec<i64> = p_file_read_bytes(path);
+    // an empty result is a missing file or an empty one: ok when it exists
+    trace_span_end(t0, "file.read", path, bytes.len() > 0 || p_file_exists(path) != 0);
+    return bytes;
 }
 
 /// Write a raw string to a file in binary mode (no newline translation).

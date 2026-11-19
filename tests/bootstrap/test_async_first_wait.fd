@@ -1,0 +1,55 @@
+// CA1: an `async fn` call runs the function as a task until it first
+// waits (a sleep, a yield, an await); then its caller goes on, and the
+// task resumes later. Callers do not change: `outer` awaits two futures
+// it started, `main` awaits `outer`. The same order on every backend:
+// `fid run` since its tasks interleave (compiler/interp.fd, "Interleaved
+// tasks"; before, the interpreter ran an async fn to its end at the call,
+// which printed "slow 1 done" before "slow 2" and "main goes on" last).
+//
+// Expected output:
+// slow 1
+// slow 2
+// main goes on
+// slow 2 done
+// slow 1 done
+// outer 6
+// before yield hi
+// after call
+// hi!
+// 54321
+use task;
+
+async fn slow(id: i64, ms: i64) -> Future<i64> {
+    println("slow " + int_to_str(id));
+    task_sleep(ms);
+    println("slow " + int_to_str(id) + " done");
+    return id * 2;
+}
+
+async fn outer(id: i64) -> Future<i64> {
+    val a = slow(id, 300);
+    val b = slow(id + 1, 5);
+    return (await a) + (await b);
+}
+
+async fn word(s: str) -> Future<str> {
+    println("before yield " + s);
+    task_yield();
+    return s + "!";
+}
+
+async fn five(a: i64, b: i64, c: i64, d: i64, e: i64) -> Future<i64> {
+    task_yield();
+    return a + b * 10 + c * 100 + d * 1000 + e * 10000;
+}
+
+fn main() -> i64 {
+    val f = outer(1);
+    println("main goes on");
+    println("outer " + int_to_str(await f));
+    val w = word("hi");
+    println("after call");
+    println(await w);
+    println(int_to_str(await five(1, 2, 3, 4, 5)));
+    return 0;
+}

@@ -23,7 +23,7 @@
 //   asset_shutdown();
 
 module asset;
- use vec; use string; use file;
+ use vec; use file; use image;
 // ─── Asset Types ─────────────────────────────────────────────────────────
 
 pub const ASSET_TEXTURE: i64 = 0; pub const ASSET_SOUND: i64 = 1; pub const ASSET_FONT: i64 = 2; pub const ASSET_MESH: i64 = 3; pub const ASSET_TEXT: i64 = 4; pub const ASSET_DATA: i64 = 5;
@@ -55,6 +55,21 @@ var g_asset_mgr: AssetManager = AssetManager {
     assets: Vec::new(), root_path: "", auto_reload: false, total_loaded: 0, total_memory: 0,
 };
 /// Initialize the asset manager.
+///
+/// Example:
+///   use file;
+///   val p = "fid_doctest_asset.tmp";
+///   file_write(p, "hello\n");
+///   asset_init();
+///   assert_eq(asset_count(), 0);
+///   assert_eq(asset_load_text("fid_doctest_asset_missing.tmp"), -1);
+///   val a = asset_load_text(p);
+///   assert(a >= 0);
+///   assert_eq(asset_type(a), ASSET_TEXT);
+///   assert_eq(asset_path(a), p);
+///   assert_eq(asset_load_text(p), a);
+///   assert_eq(asset_count(), 1);
+///   file_delete(p);
 pub fn asset_init() -> void {
     g_asset_mgr.assets.clear();
     g_asset_mgr.total_loaded = 0;
@@ -174,6 +189,14 @@ pub fn asset_load_mesh(path: str) -> i64 {
     g_asset_mgr.assets.push(entry);
     g_asset_mgr.total_loaded = g_asset_mgr.total_loaded + 1;
     return g_asset_mgr.assets.len() - 1;
+}
+
+/// Load and decode an image file (PNG or BMP) directly.
+/// Unlike asset_load_texture (a native-handle seam that returns -1 without
+/// the SDL runtime), this decodes in pure Fides and returns the pixels.
+/// `width` is 0 on failure.
+pub fn asset_load_image(path: str) -> Image {
+    return image_load(path);
 }
 
 /// Load a text file asset (shaders, configs).
@@ -336,6 +359,8 @@ pub fn asset_shutdown() -> void {
 
 // ─── Native Runtime Helpers ──────────────────────────────────────────────
 
+// SAFETY: pledge_asset.h is the runtime's own header, checked by the C
+// compiler; the helpers take NUL-terminated paths and return opaque handles.
 extern "C" include "pledge_asset.h" link "" {
     fn pledge_asset_load_texture(path: str) -> i64;
     fn pledge_asset_load_sound(path: str) -> i64;

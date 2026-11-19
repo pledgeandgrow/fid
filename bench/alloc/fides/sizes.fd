@@ -1,0 +1,75 @@
+// alloc/sizes (competitive roadmap RT8; mimalloc-bench's sh6bench and
+// sh8bench shape): many size classes at once. 20,000 slots; 4 million times
+// a random slot's block is read and freed and replaced by one of a random
+// size between 8 bytes and 64 KB (log-uniform: as many blocks of 8..15 bytes
+// as of 32..64 KB). The first and last words of each block are written and
+// read back. Prints their sum.
+
+// 31-bit LCG: no product passes 2^62, so no overflow check fires
+fn next(x: i64) -> i64 {
+    return (x * 1103515245 + 12345) % 2147483648;
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: *mut i64 = a;
+    *p = v;
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: *mut i64 = a;
+    return *p;
+}
+
+/// A block of `n` bytes (n >= 8, a multiple of 8) with `v` in its first and
+/// last words
+@unsafe
+fn make(n: i64, v: i64) -> i64 {
+    var b: i64 = p_malloc(n);
+    st(b, v);
+    st(b + n - 8, v);
+    return b;
+}
+
+@unsafe
+fn main() -> i64 {
+    val slots: i64 = 20000;
+    // each slot: the block, its size
+    val tab: i64 = p_malloc(slots * 16);
+    var seed: i64 = 3;
+    var i: i64 = 0;
+    while i < slots {
+        st(tab + i * 16, make(8, i & 4095));
+        st(tab + i * 16 + 8, 8);
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < 4000000 {
+        seed = next(seed);
+        val s: i64 = tab + ((seed >> 4) % slots) * 16;
+        val old: i64 = ld(s);
+        val on: i64 = ld(s + 8);
+        sum = sum + ld(old) + ld(old + on - 8);
+        p_free(old);
+        seed = next(seed);
+        val e: i64 = (seed >> 8) % 13;
+        seed = next(seed);
+        val base: i64 = 8 << e;
+        val n: i64 = (base + (seed >> 6) % base) & (0 - 8);
+        st(s, make(n, i & 4095));
+        st(s + 8, n);
+        i = i + 1;
+    }
+    i = 0;
+    while i < slots {
+        val old: i64 = ld(tab + i * 16);
+        sum = sum + ld(old);
+        p_free(old);
+        i = i + 1;
+    }
+    p_free(tab);
+    println(sum);
+    return 0;
+}

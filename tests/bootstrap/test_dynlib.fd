@@ -1,0 +1,89 @@
+// roadmap L6C: stdlib/dynlib.fd, a C library loaded at run time through
+// the OS loader (LoadLibrary / GetProcAddress on Windows, dlopen / dlsym
+// elsewhere): Library::open / open_first -> Option<Library>, symbol(name)
+// -> Option<i64>, dynlib_call through a found symbol, close. `fid run`
+// loads through the loader of the fid running it, `fid ccompile` and
+// `fid emit` on Windows (pe_ir) through the OS. (A static Linux `fid emit`
+// executable has no loader: it prints "libc: none" and stops.)
+//
+// Expected output:
+//     missing: none
+//     empty path: none
+//     libc: loaded
+//     open: true
+//     llabs: found
+//     llabs(-42) = 42
+//     llabs(1234567890123) = 1234567890123
+//     labs found again: true
+//     no_such_symbol_xyz: none
+//     empty name: none
+//     has llabs: true
+//     close: true
+//     open after close: false
+//     llabs after close: none
+//     close again: false
+
+use dynlib;
+
+fn yn(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn show(lib: & Library, name: str) -> i64 {
+    match lib.symbol(name) {
+        Option::Some(p) => {
+            println(name + ": found");
+            return p;
+        }
+        Option::None => {
+            println(name + ": none");
+        }
+    }
+    return 0;
+}
+
+fn main() {
+    match Library::open("no_such_library_xyz.so") {
+        Option::Some(_) => { println("missing: loaded"); }
+        Option::None => { println("missing: none"); }
+    }
+    match Library::open("") {
+        Option::Some(_) => { println("empty path: loaded"); }
+        Option::None => { println("empty path: none"); }
+    }
+    match Library::open_first(dynlib_libc_names()) {
+        Option::Some(found) => {
+            println("libc: loaded");
+            var lib: Library = found;
+            println("open: " + yn(lib.is_open()));
+            val f: i64 = show(& lib, "llabs");
+            if f != 0 {
+                println("llabs(-42) = " + int_to_str(dynlib_call(f, 0 - 42)));
+                println("llabs(1234567890123) = " + int_to_str(dynlib_call(f, 0 - 1234567890123)));
+            }
+            // the same address for the same name
+            var again: bool = false;
+            match lib.symbol("llabs") {
+                Option::Some(g) => { again = g == f; }
+                Option::None => { }
+            }
+            println("labs found again: " + yn(again));
+            show(& lib, "no_such_symbol_xyz");
+            match lib.symbol("") {
+                Option::Some(_) => { println("empty name: found"); }
+                Option::None => { println("empty name: none"); }
+            }
+            println("has llabs: " + yn(lib.has("llabs")));
+            println("close: " + yn(lib.close()));
+            println("open after close: " + yn(lib.is_open()));
+            show(& lib, "llabs after close");
+            println("close again: " + yn(lib.close()));
+        }
+        Option::None => {
+            println("libc: none");
+        }
+    }
+}

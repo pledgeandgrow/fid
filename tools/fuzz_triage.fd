@@ -1,0 +1,547 @@
+// tools/fuzz_triage.fd — summarise the failures a fuzz run kept
+// (scripts/fuzz/gen_vs_c.py): the Fides port of scripts/fuzz/triage.py
+// (roadmap AD4). Same argument, same output:
+//
+//   fid ccompile tools/fuzz_triage.fd -o fuzz_triage.exe
+//   fuzz_triage.exe <keep dir>
+//   fid run tools/fuzz_triage.fd <keep dir>
+//
+// For each kept seed (a <seed>.want file: "exit: <code>" then the C
+// oracle's output), each <seed>.<backend>.out ("exit: <code>", the output,
+// then "--- stderr ---" and the error text) that differs from it: how it
+// differs, the first line that differs, and the line of stderr that names
+// the problem (a panic message, a compile error) with its numbers as N.
+// Seeds are grouped by that signature, most frequent first, so one bug that
+// many programs hit shows once with its count and up to four examples.
+//
+// Files are read as the script reads them: UTF-8 with each bad sequence as
+// U+FFFD, "\r\n" and "\r" as "\n"; lines are quoted as Python's repr()
+// quotes them. Differences, none of which a fuzz run's files reach: repr
+// and strip know the non-printable and space characters of Latin-1 and the
+// common Unicode ones (not all of Unicode's tables), \d is ASCII and
+// fullwidth digits only, a seed that is not a plain integer is an error
+// message (the script raises ValueError), file names match case-sensitively
+// (the script's glob does not on Windows), a missing directory prints
+// nothing, and the output ends lines with "\n" (Python on Windows writes
+// "\r\n").
+
+use core;
+use args;
+use fs;
+use io;
+
+// ─── Text as Python sees it ───
+
+/// The code points of UTF-8 `b`, each invalid sequence (its maximal
+/// valid prefix) as U+FFFD, as bytes.decode("utf-8", "replace") gives them.
+pub fn tr_decode(b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = b.len();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(i);
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+            continue;
+        }
+        var need: i64 = 0;
+        var cp: i64 = 0;
+        var lo: i64 = 128;
+        var hi: i64 = 191;
+        if c >= 194 && c <= 223 {
+            need = 1;
+            cp = c & 31;
+        } else if c >= 224 && c <= 239 {
+            need = 2;
+            cp = c & 15;
+            if c == 224 { lo = 160; }
+            if c == 237 { hi = 159; }
+        } else if c >= 240 && c <= 244 {
+            need = 3;
+            cp = c & 7;
+            if c == 240 { lo = 144; }
+            if c == 244 { hi = 143; }
+        } else {
+            out.push(65533);
+            i = i + 1;
+            continue;
+        }
+        var j: i64 = 1;
+        var ok: bool = true;
+        while j <= need {
+            if i + j >= n {
+                ok = false;
+                break;
+            }
+            val d: i64 = b.get(i + j);
+            var l: i64 = 128;
+            var h: i64 = 191;
+            if j == 1 {
+                l = lo;
+                h = hi;
+            }
+            if d < l || d > h {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | (d & 63);
+            j = j + 1;
+        }
+        if ok {
+            out.push(cp);
+            i = i + need + 1;
+        } else {
+            out.push(65533);
+            i = i + j;
+        }
+    }
+    return out;
+}
+
+/// Code points as text: UTF-8, with U+0000 as the bytes C0 80 (a str does
+/// not hold a NUL on every backend; tr_print writes it back as a 0).
+pub fn tr_encode(cps: Vec<i64>, from: i64, to: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        val c: i64 = cps.get(i);
+        if c == 0 {
+            b.push(192);
+            b.push(128);
+        } else if c < 128 {
+            b.push(c);
+        } else if c < 2048 {
+            b.push(192 | (c >> 6));
+            b.push(128 | (c & 63));
+        } else if c < 65536 {
+            b.push(224 | (c >> 12));
+            b.push(128 | ((c >> 6) & 63));
+            b.push(128 | (c & 63));
+        } else {
+            b.push(240 | (c >> 18));
+            b.push(128 | ((c >> 12) & 63));
+            b.push(128 | ((c >> 6) & 63));
+            b.push(128 | (c & 63));
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// The code points of text made by tr_encode.
+pub fn tr_cps(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c < 128 {
+            out.push(c);
+            i = i + 1;
+        } else if c < 224 {
+            out.push(((c & 31) << 6) | (str_byte_at(s, i + 1) & 63));
+            i = i + 2;
+        } else if c < 240 {
+            out.push(((c & 15) << 12) | ((str_byte_at(s, i + 1) & 63) << 6) | (str_byte_at(s, i + 2) & 63));
+            i = i + 3;
+        } else {
+            out.push(((c & 7) << 18) | ((str_byte_at(s, i + 1) & 63) << 12) | ((str_byte_at(s, i + 2) & 63) << 6) | (str_byte_at(s, i + 3) & 63));
+            i = i + 4;
+        }
+    }
+    return out;
+}
+
+/// A file as Python's open(p, encoding="utf-8", errors="replace").read()
+/// gives it: decoded, newlines translated.
+pub fn tr_read(path: str) -> str {
+    val cps: Vec<i64> = tr_decode(fs_read_bytes(path));
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cps.len() {
+        val c: i64 = cps.get(i);
+        if c == 13 {
+            out.push(10);
+            if i + 1 < cps.len() && cps.get(i + 1) == 10 { i = i + 1; }
+        } else {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return tr_encode(out, 0, out.len());
+}
+
+/// Python's str.isspace() (what strip() removes).
+fn tr_space(c: i64) -> bool {
+    if (c >= 9 && c <= 13) || (c >= 28 && c <= 32) || c == 133 || c == 160 || c == 5760 { return true; }
+    if (c >= 8192 && c <= 8202) || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288 { return true; }
+    return false;
+}
+
+/// Python's str.strip().
+pub fn tr_strip(s: str) -> str {
+    val cps: Vec<i64> = tr_cps(s);
+    var a: i64 = 0;
+    var b: i64 = cps.len();
+    while a < b && tr_space(cps.get(a)) { a = a + 1; }
+    while b > a && tr_space(cps.get(b - 1)) { b = b - 1; }
+    return tr_encode(cps, a, b);
+}
+
+/// s.rstrip("\n")
+fn tr_rstrip_nl(s: str) -> str {
+    var e: i64 = str_len(s);
+    while e > 0 && str_byte_at(s, e - 1) == 10 { e = e - 1; }
+    return str_slice(s, 0, e);
+}
+
+/// s.partition(sep): [head, tail] (tail "" when sep is not there).
+fn tr_partition(s: str, sep: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    val k: i64 = str_find(s, sep);
+    if k < 0 {
+        r.push(s);
+        r.push("");
+        return r;
+    }
+    r.push(str_slice(s, 0, k));
+    r.push(str_slice(s, k + str_len(sep), str_len(s)));
+    return r;
+}
+
+/// s.split("\n") (keeps empty pieces).
+fn tr_lines(s: str) -> Vec<str> {
+    var r: Vec<str> = Vec::new();
+    var start: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        if str_byte_at(s, i) == 10 {
+            r.push(str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    r.push(str_slice(s, start, n));
+    return r;
+}
+
+/// Not printable for Python's repr(): Cc, Cf, Zs (but space), Zl, Zp, Co,
+/// as far as Latin-1 and the common ranges go.
+fn tr_unprintable(c: i64) -> bool {
+    if c < 32 || (c >= 127 && c <= 160) || c == 173 { return true; }
+    if c == 5760 || (c >= 8192 && c <= 8207) || (c >= 8232 && c <= 8239) || c == 8287 { return true; }
+    if (c >= 8288 && c <= 8303) || c == 12288 || c == 65279 || (c >= 65529 && c <= 65531) { return true; }
+    if (c >= 1536 && c <= 1541) || c == 1564 || c == 1757 || c == 1807 || c == 6158 { return true; }
+    if (c >= 57344 && c <= 63743) || (c >= 55296 && c <= 57343) { return true; }
+    return false;
+}
+
+fn tr_hex(c: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var b: Vec<i64> = Vec::new();
+    var k: i64 = width - 1;
+    while k >= 0 {
+        b.push(str_byte_at(digits, (c >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// Python's repr() of a str.
+pub fn tr_repr(s: str) -> str {
+    val cps: Vec<i64> = tr_cps(s);
+    var q: i64 = 39;
+    if str_contains(s, "'") && !str_contains(s, "\"") { q = 34; }
+    var out: Vec<i64> = Vec::new();
+    out.push(q);
+    var i: i64 = 0;
+    while i < cps.len() {
+        val c: i64 = cps.get(i);
+        i = i + 1;
+        if c == q || c == 92 {
+            out.push(92);
+            out.push(c);
+            continue;
+        }
+        var esc: str = "";
+        if c == 9 {
+            esc = "\\t";
+        } else if c == 10 {
+            esc = "\\n";
+        } else if c == 13 {
+            esc = "\\r";
+        } else if tr_unprintable(c) {
+            if c < 256 {
+                esc = "\\x" + tr_hex(c, 2);
+            } else if c < 65536 {
+                esc = "\\u" + tr_hex(c, 4);
+            } else {
+                esc = "\\U" + tr_hex(c, 8);
+            }
+        }
+        if str_len(esc) > 0 {
+            var k: i64 = 0;
+            while k < str_len(esc) {
+                out.push(str_byte_at(esc, k));
+                k = k + 1;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push(q);
+    // out holds code points: encode them
+    return tr_encode(out, 0, out.len());
+}
+
+/// \d of Python's re (ASCII, fullwidth, Arabic-Indic digits).
+fn tr_digit(c: i64) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65296 && c <= 65305) || (c >= 1632 && c <= 1641) || (c >= 1776 && c <= 1785);
+}
+
+/// re.sub(r"\d+", "N", s)[:110]
+fn tr_squash(s: str) -> str {
+    val cps: Vec<i64> = tr_cps(s);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cps.len() {
+        if tr_digit(cps.get(i)) {
+            while i < cps.len() && tr_digit(cps.get(i)) { i = i + 1; }
+            out.push(78);
+        } else {
+            out.push(cps.get(i));
+            i = i + 1;
+        }
+    }
+    var n: i64 = out.len();
+    if n > 110 { n = 110; }
+    return tr_encode(out, 0, n);
+}
+
+/// The stderr line that names the problem, or "".
+pub fn tr_key_line(err: str) -> str {
+    val ls: Vec<str> = tr_lines(err);
+    var i: i64 = 0;
+    while i < ls.len() {
+        val s: str = tr_strip(ls.get(i));
+        i = i + 1;
+        if str_len(s) == 0 || str_starts_with(s, "[") || str_starts_with(s, "-->") || str_starts_with(s, "|") { continue; }
+        if str_contains(s, "Panic") || str_contains(s, "error") || str_contains(s, "Error") || str_contains(s, "OOM") || str_contains(s, "CRASH") || str_contains(s, "violation") || str_contains(s, "overflow") {
+            return tr_squash(s);
+        }
+    }
+    return "";
+}
+
+/// "exit: 3" -> "3"
+fn tr_rc(head: str) -> str {
+    return tr_strip(str_replace(head, "exit: ", ""));
+}
+
+/// Write text made by tr_encode, a C0 80 as the byte 0.
+fn tr_print(s: str) {
+    if !str_contains(s, tr_encode(Vec::filled(1, 0), 0, 1)) {
+        println(s);
+        return;
+    }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 192 {
+            io_putc(0);
+            i = i + 2;
+        } else {
+            io_putc(c);
+            i = i + 1;
+        }
+    }
+    io_putc(10);
+}
+
+// ─── Files of the keep directory ───
+
+/// Byte order (Python's order of these names).
+fn tr_lt(a: str, b: str) -> bool {
+    val la: i64 = str_len(a);
+    val lb: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < la && i < lb {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return la < lb;
+}
+
+fn tr_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && tr_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+/// The integer a seed name is, or -1 when it is not plain digits.
+fn tr_seed_num(s: str) -> i64 {
+    if str_len(s) == 0 || str_len(s) > 18 { return -1; }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 { return -1; }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Directory and name joined as os.path.join does here.
+fn tr_join(d: str, n: str) -> str {
+    if str_ends_with(d, "/") || str_ends_with(d, "\\") { return d + n; }
+    if str_contains(d, "\\") && !str_contains(d, "/") { return d + "\\" + n; }
+    return d + "/" + n;
+}
+
+/// Python's f"{n:3}"
+fn tr_w3(n: i64) -> str {
+    var s: str = int_to_str(n);
+    while str_len(s) < 3 { s = " " + s; }
+    return s;
+}
+
+fn main() -> i64 {
+    val av: Vec<str> = args_all();
+    var first: i64 = 1;
+    if av.len() >= 3 && av.get(1) == "run" && str_ends_with(av.get(2), ".fd") { first = 3; }
+    if av.len() <= first {
+        io_eprintln("usage: fuzz_triage <keep dir>");
+        return 1;
+    }
+    val d: str = av.get(first);
+    var names: Vec<str> = fs_list_dir(d);
+    tr_sort(&mut names);
+    // the .want files (glob skips names starting with "."), by seed number;
+    // the sort is stable, as Python's is
+    var wants: Vec<str> = Vec::new();
+    var nums: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() {
+        val n: str = names.get(i);
+        i = i + 1;
+        if !str_ends_with(n, ".want") || str_starts_with(n, ".") { continue; }
+        val seed: str = tr_partition(n, ".").get(0);
+        val num: i64 = tr_seed_num(seed);
+        if num < 0 {
+            io_eprintln("fuzz_triage: seed of " + n + " is not an integer");
+            return 1;
+        }
+        var j: i64 = wants.len();
+        wants.push(n);
+        nums.push(num);
+        while j > 0 && nums.get(j - 1) > num {
+            wants.set(j, wants.get(j - 1));
+            nums.set(j, nums.get(j - 1));
+            j = j - 1;
+        }
+        wants.set(j, n);
+        nums.set(j, num);
+    }
+    var sigs: Vec<str> = Vec::new();
+    var groups: Vec<Vec<str>> = Vec::new();
+    var wi: i64 = 0;
+    while wi < wants.len() {
+        val wname: str = wants.get(wi);
+        wi = wi + 1;
+        val seed: str = tr_partition(wname, ".").get(0);
+        val w: Vec<str> = tr_partition(tr_read(tr_join(d, wname)), "\n");
+        val wrc: str = tr_rc(w.get(0));
+        val wbody: str = w.get(1);
+        var oi: i64 = 0;
+        while oi < names.len() {
+            val on: str = names.get(oi);
+            oi = oi + 1;
+            // glob f"{seed}.*.out"
+            if !str_starts_with(on, seed + ".") || !str_ends_with(on, ".out") || str_len(on) < str_len(seed) + 5 { continue; }
+            val stem: str = str_slice(on, 0, str_len(on) - 4);
+            var k: i64 = str_len(stem) - 1;
+            while k >= 0 && str_byte_at(stem, k) != 46 { k = k - 1; }
+            val b: str = str_slice(stem, k + 1, str_len(stem));
+            val parts: Vec<str> = tr_partition(tr_read(tr_join(d, on)), "\n--- stderr ---\n");
+            val hb: Vec<str> = tr_partition(parts.get(0), "\n");
+            val rc: str = tr_rc(hb.get(0));
+            val body: str = hb.get(1);
+            val err: str = parts.get(1);
+            if rc == wrc && tr_rstrip_nl(body) == tr_rstrip_nl(wbody) { continue; }
+            val wl: Vec<str> = tr_lines(wbody);
+            val gl: Vec<str> = tr_lines(body);
+            var m: i64 = wl.len();
+            if gl.len() > m { m = gl.len(); }
+            var line: i64 = 0;
+            var x: i64 = 0;
+            while x < m {
+                if x >= wl.len() || x >= gl.len() || wl.get(x) != gl.get(x) {
+                    line = x;
+                    break;
+                }
+                x = x + 1;
+            }
+            var kind: str = "other output";
+            if rc == "build-failed" {
+                kind = "does not compile";
+            } else if rc != wrc {
+                kind = "exit " + rc + ", C exits " + wrc;
+            }
+            val sig: str = b + ": " + kind + ": " + tr_key_line(err);
+            var wv: str = "<end>";
+            if line < wl.len() { wv = wl.get(line); }
+            var gv: str = "<end>";
+            if line < gl.len() { gv = gl.get(line); }
+            val detail: str = "line " + int_to_str(line + 1) + ": C " + tr_repr(wv) + ", " + b + " " + tr_repr(gv);
+            var g: i64 = 0;
+            while g < sigs.len() && sigs.get(g) != sig { g = g + 1; }
+            if g == sigs.len() {
+                sigs.push(sig);
+                groups.push(Vec::new());
+            }
+            var seeds: Vec<str> = groups.get(g);
+            seeds.push(seed + " (" + detail + ")");
+            groups.set(g, seeds);
+        }
+    }
+    // most seeds first; equal counts keep their first-seen order
+    var order: Vec<i64> = Vec::new();
+    i = 0;
+    while i < sigs.len() {
+        val c: i64 = groups.get(i).len();
+        var j: i64 = order.len();
+        order.push(i);
+        while j > 0 && groups.get(order.get(j - 1)).len() < c {
+            order.set(j, order.get(j - 1));
+            j = j - 1;
+        }
+        order.set(j, i);
+        i = i + 1;
+    }
+    i = 0;
+    while i < order.len() {
+        val g: i64 = order.get(i);
+        val seeds: Vec<str> = groups.get(g);
+        tr_print(tr_w3(seeds.len()) + "  " + sigs.get(g));
+        var k: i64 = 0;
+        while k < seeds.len() && k < 4 {
+            tr_print("       " + seeds.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}

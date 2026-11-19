@@ -1,0 +1,30 @@
+// stdlib/postgres: the SCRAM-SHA-256 example of RFC 7677 §3 (user "user",
+// password "pencil", 4096 iterations): the client-final-message with its
+// proof byte-exact, and the server's signature accepted. 4096 PBKDF2
+// rounds take a moment compiled (C or native) but far too long for the
+// interpreter: run this one compiled. A wrong answer panics.
+//
+// Expected output:
+// n,,n=user,r=rOprNGfwEbeRWgbNEkqO
+// c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=
+// server signature ok
+use postgres;
+
+fn main() -> i64 {
+    var s: PgScram = pg_scram_new("user", "pencil", "rOprNGfwEbeRWgbNEkqO");
+    val first: str = pg_scram_client_first(& mut s);
+    println(first);
+    if !str_equal(first, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO") {
+        p_panic("scram: wrong client-first-message");
+    }
+    val fin: str = pg_scram_client_final(& mut s, "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    println(fin);
+    if !str_equal(fin, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=") {
+        p_panic("scram: wrong client-final-message");
+    }
+    if !pg_scram_verify_server(& s, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=") {
+        p_panic("scram: server signature refused");
+    }
+    println("server signature ok");
+    return 0;
+}

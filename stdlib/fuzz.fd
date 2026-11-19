@@ -1,0 +1,643 @@
+// Fides fuzzing harness: coverage-guided mutation fuzzing, pure Fides
+//
+// The pieces of a libFuzzer/AFL-style loop, over a target given as a
+// function value:
+//   - FuzzRng: a deterministic generator (splitmix64), so a run with the
+//     same seed, corpus and target repeats exactly
+//   - mutators over byte vectors (Vec<i64>, 0..255): bit flip, byte
+//     replace, byte insert, byte delete, chunk delete, chunk duplicate,
+//     small add/subtract, "interesting" 8/16/32-bit values (0, -1, 0x7f,
+//     0x80, 0xff, 0x7fff, 0x8000, 0xffff, ...) in either byte order,
+//     dictionary insert and overwrite, splice with another corpus entry
+//   - a corpus: inputs kept because they reached new coverage, deduplicated
+//     by content, with corpus minimization (a greedy set cover keeping the
+//     smallest inputs that together reach every edge seen)
+//   - the loop: pick an input, apply 1..4 stacked mutations, run the
+//     target, keep the input when it reports an edge id not seen before,
+//     record crashes
+//   - crash minimization by delta debugging (Zeller's ddmin over byte
+//     chunks, then single bytes), keeping inputs that still crash with the
+//     same crash code
+//
+// The target is `fn(Vec<i64>) -> Vec<i64>`: it runs the code under test on
+// one input and returns the edges it reached (ids >= 0, e.g. one per branch
+// taken) and, when it crashed, a negative crash code -k (k >= 1 names the
+// kind of crash; fuzz_crash_code reads it). Fides has no compiler
+// instrumentation for coverage yet and no way to catch a panic, so the
+// target reports both itself: a harness checks the conditions that would
+// panic and reports a crash code instead. That reporting is the seam;
+// everything else is real. (The result is a Vec rather than a struct
+// because a struct returned through a function value comes back wrong in
+// `fid run` today.)
+//
+// Usage:
+//   var f: Fuzzer = fuzz_new(1234);
+//   fuzz_add_seed(& mut f, str_bytes("[1]"));
+//   fuzz_add_dict(& mut f, str_bytes("["));
+//   val rep: FuzzReport = fuzz_run(& mut f, my_target, 5000);
+//   if rep.crashed { val small: Vec<i64> = fuzz_minimize(my_target, rep.crash_input); }
+//
+//   fn my_target(data: Vec<i64>) -> Vec<i64> {
+//       var cov: Vec<i64> = Vec::new();
+//       if data.len() > 2 { cov.push(1); ... }
+//       if bad { cov.push(- 1); }        // crash code 1
+//       return cov;
+//   }
+
+module fuzz;
+ use vec;
+
+/// The deterministic generator: splitmix64.
+pub struct FuzzRng {
+    pub state: u64,
+}
+
+pub struct Fuzzer {
+    pub rng: FuzzRng,
+    pub corpus: Vec<Vec<i64>>,
+    pub corpus_edges: Vec<Vec<i64>>,
+    pub seen: HashMap<i64, i64>,
+    pub hashes: HashMap<i64, i64>,
+    pub dict: Vec<Vec<i64>>,
+    pub max_len: i64,
+    pub execs: i64,
+    pub crashes: Vec<Vec<i64>>,
+    pub crash_codes: Vec<i64>,
+    pub stop_on_crash: bool,
+}
+
+/// The outcome of fuzz_run. `crash_input` is the first crash of this run.
+pub struct FuzzReport {
+    pub execs: i64,
+    pub edges: i64,
+    pub corpus: i64,
+    pub crashed: bool,
+    pub crash_input: Vec<i64>,
+    pub crash_code: i64,
+    pub crash_exec: i64,
+}
+
+// ─── deterministic RNG ──────────────────────────────────────────────────
+
+pub fn fuzz_rng_new(seed: i64) -> FuzzRng {
+    return FuzzRng { state: seed as u64 };
+}
+
+@wrapping fn fz_mix(x: u64) -> u64 {
+    var z: u64 = x;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+}
+
+@wrapping fn fz_step(s: u64) -> u64 {
+    return s + 0x9e3779b97f4a7c15;
+}
+
+/// The next 64 random bits.
+pub fn fuzz_rng_next(r: & mut FuzzRng) -> u64 {
+    r.state = fz_step(r.state);
+    return fz_mix(r.state);
+}
+
+/// A number in 0..n-1 (n >= 1).
+pub fn fuzz_rng_below(r: & mut FuzzRng, n: i64) -> i64 {
+    if n <= 1 {
+        return 0;
+    }
+    val x: u64 = fuzz_rng_next(r) >> 1;
+    return (x % (n as u64)) as i64;
+}
+
+// ─── mutators ───────────────────────────────────────────────────────────
+
+fn fz_copy(b: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn fz_splice_in(b: & Vec<i64>, at: i64, piece: & Vec<i64>, replace: i64) -> Vec<i64> {
+    // b[..at] + piece + b[at + replace..]
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < at && i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while j < piece.len() {
+        o.push(piece.get(j) & 255);
+        j = j + 1;
+    }
+    i = at + replace;
+    while i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Flip one bit.
+pub fn fuzz_mut_bitflip(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = fz_copy(b);
+    if o.len() == 0 {
+        o.push(fuzz_rng_below(r, 256));
+        return o;
+    }
+    val i: i64 = fuzz_rng_below(r, o.len());
+    o.set(i, o.get(i) ^ (1 << fuzz_rng_below(r, 8)));
+    return o;
+}
+
+/// Replace one byte with a random one.
+pub fn fuzz_mut_byte(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = fz_copy(b);
+    if o.len() == 0 {
+        o.push(fuzz_rng_below(r, 256));
+        return o;
+    }
+    o.set(fuzz_rng_below(r, o.len()), fuzz_rng_below(r, 256));
+    return o;
+}
+
+/// Insert a random byte.
+pub fn fuzz_mut_insert(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    var one: Vec<i64> = Vec::new();
+    one.push(fuzz_rng_below(r, 256));
+    return fz_splice_in(b, fuzz_rng_below(r, b.len() + 1), & one, 0);
+}
+
+/// Delete one byte.
+pub fn fuzz_mut_delete(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    if b.len() <= 1 {
+        return fz_copy(b);
+    }
+    val none: Vec<i64> = Vec::new();
+    return fz_splice_in(b, fuzz_rng_below(r, b.len()), & none, 1);
+}
+
+/// Delete a chunk of 1..len/2 bytes.
+pub fn fuzz_mut_delete_chunk(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    if b.len() <= 2 {
+        return fz_copy(b);
+    }
+    val n: i64 = 1 + fuzz_rng_below(r, b.len() / 2);
+    val none: Vec<i64> = Vec::new();
+    return fz_splice_in(b, fuzz_rng_below(r, b.len() - n + 1), & none, n);
+}
+
+/// Copy a chunk of the input to another place in it.
+pub fn fuzz_mut_dup_chunk(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    if b.len() == 0 {
+        return fz_copy(b);
+    }
+    val n: i64 = 1 + fuzz_rng_below(r, b.len());
+    val from: i64 = fuzz_rng_below(r, b.len() - n + 1);
+    var piece: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        piece.push(b.get(from + i));
+        i = i + 1;
+    }
+    return fz_splice_in(b, fuzz_rng_below(r, b.len() + 1), & piece, 0);
+}
+
+/// Add or subtract 1..16 from one byte (mod 256).
+pub fn fuzz_mut_arith(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = fz_copy(b);
+    if o.len() == 0 {
+        return o;
+    }
+    val i: i64 = fuzz_rng_below(r, o.len());
+    var d: i64 = 1 + fuzz_rng_below(r, 16);
+    if fuzz_rng_below(r, 2) == 0 {
+        d = 256 - d;
+    }
+    o.set(i, (o.get(i) + d) & 255);
+    return o;
+}
+
+/// The interesting values of AFL, as unsigned numbers of 1, 2 or 4 bytes.
+pub fn fuzz_interesting(width: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0); v.push(1); v.push(16); v.push(32); v.push(64); v.push(100); v.push(127);
+    if width == 1 {
+        v.push(128); v.push(255); v.push(254);
+        return v;
+    }
+    v.push(128); v.push(255); v.push(256); v.push(512); v.push(1000); v.push(1024); v.push(4096);
+    v.push(32767); v.push(32768); v.push(65535); v.push(65534);
+    if width == 4 {
+        v.push(65536); v.push(100663045); v.push(2147483647); v.push(2147483648); v.push(4294967295); v.push(4294967294);
+    }
+    return v;
+}
+
+/// Overwrite 1, 2 or 4 bytes with an interesting value (random byte order).
+pub fn fuzz_mut_interesting(r: & mut FuzzRng, b: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = fz_copy(b);
+    var w: i64 = 1 << fuzz_rng_below(r, 3);
+    while w > o.len() && w > 1 {
+        w = w / 2;
+    }
+    if o.len() == 0 {
+        o.push(0);
+    }
+    val vals: Vec<i64> = fuzz_interesting(w);
+    val v: i64 = vals.get(fuzz_rng_below(r, vals.len()));
+    val be: bool = fuzz_rng_below(r, 2) == 0;
+    val at: i64 = fuzz_rng_below(r, o.len() - w + 1);
+    var k: i64 = 0;
+    while k < w {
+        var sh: i64 = k * 8;
+        if be {
+            sh = (w - 1 - k) * 8;
+        }
+        o.set(at + k, (v >> sh) & 255);
+        k = k + 1;
+    }
+    return o;
+}
+
+/// Insert a dictionary token (or overwrite with it, half the time).
+pub fn fuzz_mut_dict(r: & mut FuzzRng, b: & Vec<i64>, dict: & Vec<Vec<i64>>) -> Vec<i64> {
+    if dict.len() == 0 {
+        return fuzz_mut_insert(r, b);
+    }
+    val tok: Vec<i64> = dict.get(fuzz_rng_below(r, dict.len()));
+    if fuzz_rng_below(r, 2) == 0 && b.len() >= tok.len() {
+        return fz_splice_in(b, fuzz_rng_below(r, b.len() - tok.len() + 1), & tok, tok.len());
+    }
+    return fz_splice_in(b, fuzz_rng_below(r, b.len() + 1), & tok, 0);
+}
+
+/// The head of `a` and the tail of `b`, cut at random points.
+pub fn fuzz_mut_splice(r: & mut FuzzRng, a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    val ca: i64 = fuzz_rng_below(r, a.len() + 1);
+    val cb: i64 = fuzz_rng_below(r, b.len() + 1);
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < ca {
+        o.push(a.get(i));
+        i = i + 1;
+    }
+    i = cb;
+    while i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// One random mutation (corpus gives splice partners).
+pub fn fuzz_mutate_once(r: & mut FuzzRng, b: & Vec<i64>, dict: & Vec<Vec<i64>>, corpus: & Vec<Vec<i64>>) -> Vec<i64> {
+    val k: i64 = fuzz_rng_below(r, 11);
+    if k == 0 { return fuzz_mut_bitflip(r, b); }
+    if k == 1 { return fuzz_mut_byte(r, b); }
+    if k == 2 { return fuzz_mut_insert(r, b); }
+    if k == 3 { return fuzz_mut_delete(r, b); }
+    if k == 4 { return fuzz_mut_delete_chunk(r, b); }
+    if k == 5 { return fuzz_mut_dup_chunk(r, b); }
+    if k == 6 { return fuzz_mut_arith(r, b); }
+    if k == 7 { return fuzz_mut_interesting(r, b); }
+    if k == 8 && corpus.len() > 1 {
+        return fuzz_mut_splice(r, b, & corpus.get(fuzz_rng_below(r, corpus.len())));
+    }
+    return fuzz_mut_dict(r, b, dict);
+}
+
+// ─── corpus ─────────────────────────────────────────────────────────────
+
+/// FNV-1a over the bytes (corpus deduplication).
+@wrapping pub fn fuzz_hash(b: & Vec<i64>) -> i64 {
+    var h: u64 = 0xcbf29ce484222325;
+    var i: i64 = 0;
+    while i < b.len() {
+        h = (h ^ ((b.get(i) & 255) as u64)) * 0x100000001b3;
+        i = i + 1;
+    }
+    return (h >> 1) as i64;
+}
+
+pub fn fuzz_new(seed: i64) -> Fuzzer {
+    return Fuzzer { rng: fuzz_rng_new(seed), corpus: Vec::new(), corpus_edges: Vec::new(), seen: HashMap::new(), hashes: HashMap::new(), dict: Vec::new(), max_len: 4096, execs: 0, crashes: Vec::new(), crash_codes: Vec::new(), stop_on_crash: true };
+}
+
+/// Add a seed input (kept even before it is run; its edges are recorded
+/// the first time fuzz_run sees it).
+pub fn fuzz_add_seed(f: & mut Fuzzer, b: Vec<i64>) {
+    val h: i64 = fuzz_hash(& b);
+    if f.hashes.contains(h) {
+        return;
+    }
+    f.hashes.insert(h, 1);
+    f.corpus.push(b);
+    f.corpus_edges.push(Vec::new());
+}
+
+pub fn fuzz_add_dict(f: & mut Fuzzer, token: Vec<i64>) {
+    if token.len() > 0 {
+        f.dict.push(token);
+    }
+}
+
+/// The number of distinct edges seen.
+pub fn fuzz_edge_count(f: & Fuzzer) -> i64 {
+    return f.seen.len();
+}
+
+/// The crash code a target reported (0: no crash).
+pub fn fuzz_crash_code(res: & Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < res.len() {
+        if res.get(i) < 0 {
+            return 0 - res.get(i);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// The edges a target reported (its non-negative ids).
+pub fn fuzz_edges_of(res: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < res.len() {
+        if res.get(i) >= 0 {
+            o.push(res.get(i));
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn fz_new_edges(f: & mut Fuzzer, edges: & Vec<i64>) -> bool {
+    var fresh: bool = false;
+    var i: i64 = 0;
+    while i < edges.len() {
+        val e: i64 = edges.get(i);
+        if e >= 0 && !f.seen.contains(e) {
+            f.seen.insert(e, 1);
+            fresh = true;
+        }
+        i = i + 1;
+    }
+    return fresh;
+}
+
+fn fz_report(f: & Fuzzer, n: i64) -> FuzzReport {
+    return FuzzReport { execs: n, edges: f.seen.len(), corpus: f.corpus.len(), crashed: false, crash_input: Vec::new(), crash_code: 0, crash_exec: - 1 };
+}
+
+/// Run `iterations` mutated inputs (the seeds are run first). Stops at the
+/// first crash when `stop_on_crash` (the default).
+pub fn fuzz_run(f: & mut Fuzzer, target: fn(Vec<i64>) -> Vec<i64>, iterations: i64) -> FuzzReport {
+    var rep: FuzzReport = fz_report(f, 0);
+    if f.corpus.len() == 0 {
+        fuzz_add_seed(f, Vec::new());
+    }
+    // the seeds' coverage
+    var i: i64 = 0;
+    while i < f.corpus.len() {
+        if f.corpus_edges.get(i).len() == 0 {
+            val ex: Vec<i64> = target(f.corpus.get(i));
+            val code: i64 = fuzz_crash_code(& ex);
+            f.execs = f.execs + 1;
+            rep.execs = rep.execs + 1;
+            fz_new_edges(f, & ex);
+            f.corpus_edges.set(i, fuzz_edges_of(& ex));
+            if code > 0 {
+                f.crashes.push(f.corpus.get(i));
+                f.crash_codes.push(code);
+                if !rep.crashed {
+                    rep.crashed = true;
+                    rep.crash_input = f.corpus.get(i);
+                    rep.crash_code = code;
+                    rep.crash_exec = f.execs;
+                }
+                if f.stop_on_crash {
+                    rep.edges = f.seen.len();
+                    rep.corpus = f.corpus.len();
+                    return rep;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    var it: i64 = 0;
+    while it < iterations {
+        // newer entries (more coverage) are picked more often: half the
+        // time one of the last four
+        var pick: i64 = fuzz_rng_below(& mut f.rng, f.corpus.len());
+        if fuzz_rng_below(& mut f.rng, 2) == 0 && f.corpus.len() > 4 {
+            pick = f.corpus.len() - 1 - fuzz_rng_below(& mut f.rng, 4);
+        }
+        var cand: Vec<i64> = f.corpus.get(pick);
+        val stack: i64 = 1 + fuzz_rng_below(& mut f.rng, 4);
+        var s: i64 = 0;
+        while s < stack {
+            cand = fuzz_mutate_once(& mut f.rng, & cand, & f.dict, & f.corpus);
+            s = s + 1;
+        }
+        if cand.len() > f.max_len {
+            cand.truncate(f.max_len);
+        }
+        val ex: Vec<i64> = target(fz_copy(& cand));
+        val code: i64 = fuzz_crash_code(& ex);
+        f.execs = f.execs + 1;
+        rep.execs = rep.execs + 1;
+        if code > 0 {
+            f.crashes.push(cand);
+            f.crash_codes.push(code);
+            if !rep.crashed {
+                rep.crashed = true;
+                rep.crash_input = cand;
+                rep.crash_code = code;
+                rep.crash_exec = f.execs;
+            }
+            if f.stop_on_crash {
+                break;
+            }
+        } else if fz_new_edges(f, & ex) {
+            val h: i64 = fuzz_hash(& cand);
+            if !f.hashes.contains(h) {
+                f.hashes.insert(h, 1);
+                f.corpus.push(cand);
+                f.corpus_edges.push(fuzz_edges_of(& ex));
+            }
+        }
+        it = it + 1;
+    }
+    rep.edges = f.seen.len();
+    rep.corpus = f.corpus.len();
+    return rep;
+}
+
+/// The indexes of a smallest-first greedy cover of every edge the corpus
+/// reaches: keep these and drop the rest.
+pub fn fuzz_corpus_cover(f: & Fuzzer) -> Vec<i64> {
+    // order by length (stable insertion sort of indexes)
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.corpus.len() {
+        var j: i64 = order.len();
+        order.push(i);
+        while j > 0 && f.corpus.get(order.get(j - 1)).len() > f.corpus.get(i).len() {
+            order.set(j, order.get(j - 1));
+            j = j - 1;
+        }
+        order.set(j, i);
+        i = i + 1;
+    }
+    var covered: HashMap<i64, i64> = HashMap::new();
+    var keep: Vec<i64> = Vec::new();
+    i = 0;
+    while i < order.len() {
+        val es: Vec<i64> = f.corpus_edges.get(order.get(i));
+        var adds: bool = false;
+        var k: i64 = 0;
+        while k < es.len() {
+            if !covered.contains(es.get(k)) {
+                covered.insert(es.get(k), 1);
+                adds = true;
+            }
+            k = k + 1;
+        }
+        if adds {
+            keep.push(order.get(i));
+        }
+        i = i + 1;
+    }
+    return keep;
+}
+
+/// Replace the corpus with its cover; returns how many inputs were dropped.
+pub fn fuzz_corpus_minimize(f: & mut Fuzzer) -> i64 {
+    val keep: Vec<i64> = fuzz_corpus_cover(f);
+    var c: Vec<Vec<i64>> = Vec::new();
+    var e: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < keep.len() {
+        c.push(f.corpus.get(keep.get(i)));
+        e.push(f.corpus_edges.get(keep.get(i)));
+        i = i + 1;
+    }
+    val dropped: i64 = f.corpus.len() - c.len();
+    f.corpus = c;
+    f.corpus_edges = e;
+    return dropped;
+}
+
+// ─── crash minimization (delta debugging) ───────────────────────────────
+
+fn fz_still(target: fn(Vec<i64>) -> Vec<i64>, b: & Vec<i64>, code: i64) -> bool {
+    val ex: Vec<i64> = target(fz_copy(b));
+    return fuzz_crash_code(& ex) == code;
+}
+
+fn fz_without(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        if i < from || i >= to {
+            o.push(b.get(i));
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn fz_range(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to && i < b.len() {
+        o.push(b.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// The smallest input ddmin finds that still crashes with the same code
+/// (1-minimal: removing any single byte loses the crash). Returns the input
+/// unchanged when it does not crash.
+pub fn fuzz_minimize(target: fn(Vec<i64>) -> Vec<i64>, input: Vec<i64>) -> Vec<i64> {
+    val first: Vec<i64> = target(fz_copy(& input));
+    val msg: i64 = fuzz_crash_code(& first);
+    if msg == 0 {
+        return input;
+    }
+    var cur: Vec<i64> = input;
+    var n: i64 = 2;
+    while cur.len() >= 2 {
+        val chunk: i64 = (cur.len() + n - 1) / n;
+        var reduced: bool = false;
+        // a subset alone
+        var start: i64 = 0;
+        while start < cur.len() && !reduced {
+            val sub: Vec<i64> = fz_range(& cur, start, start + chunk);
+            if sub.len() < cur.len() && fz_still(target, & sub, msg) {
+                cur = sub;
+                n = 2;
+                reduced = true;
+            }
+            start = start + chunk;
+        }
+        // a complement
+        start = 0;
+        while start < cur.len() && !reduced {
+            val comp: Vec<i64> = fz_without(& cur, start, start + chunk);
+            if comp.len() < cur.len() && fz_still(target, & comp, msg) {
+                cur = comp;
+                if n > 2 {
+                    n = n - 1;
+                }
+                reduced = true;
+            }
+            start = start + chunk;
+        }
+        if !reduced {
+            if n >= cur.len() {
+                break;
+            }
+            n = n * 2;
+            if n > cur.len() {
+                n = cur.len();
+            }
+        }
+    }
+    return cur;
+}
+
+/// Crash minimization by byte simplification after ddmin: each byte that
+/// can become `fill` (e.g. '0') while still crashing does.
+pub fn fuzz_simplify(target: fn(Vec<i64>) -> Vec<i64>, input: Vec<i64>, fill: i64) -> Vec<i64> {
+    val first: Vec<i64> = target(fz_copy(& input));
+    val code: i64 = fuzz_crash_code(& first);
+    if code == 0 {
+        return input;
+    }
+    var cur: Vec<i64> = input;
+    var i: i64 = 0;
+    while i < cur.len() {
+        if cur.get(i) != fill {
+            var t: Vec<i64> = fz_copy(& cur);
+            t.set(i, fill);
+            if fz_still(target, & t, code) {
+                cur = t;
+            }
+        }
+        i = i + 1;
+    }
+    return cur;
+}
+
+/// A coverage helper for targets: an edge id from a source location id and
+/// the previous location (AFL's prev ^ cur).
+pub fn fuzz_edge(prev: i64, cur: i64) -> i64 {
+    return ((prev >> 1) ^ cur) & 0xFFFFFF;
+}

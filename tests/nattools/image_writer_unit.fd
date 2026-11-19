@@ -1,0 +1,562 @@
+// TG13 (docs/roadmap/llvm-roadmap.md): the machine layer's image writers
+// (compiler/nat_enc.fd) as layouts over compiler/image_writer.fd. Until
+// Nov 17 each writer kept its old body behind FID_IMG_OLD=1 and this test
+// compared old and new byte for byte on the stand-in images below; every
+// one was the same (the debug ELF too, with FID_NAT_OFF=ehframe: DB6's
+// .eh_frame was only ever in the new body). The old bodies are gone now,
+// so each output is compared with the digest the old bodies' bytes had
+// (golden): "same" means the bytes did not change (the two "pie ldyn"
+// images: since TG14 gave them a PT_PHDR, checked with readelf). Each writer runs twice
+// (the two runs must agree), and a few fields are checked by value too.
+// An intended layout change shows "CHANGED: digest N": check the new bytes
+// (readelf, llvm-objdump, a run of tests/nattools/image_same_check.sh) and
+// put N in golden(). Run (FID_NAT_OFF unset; with FID_NAT_OFF=ehframe the
+// debug lines say shnum 9):
+//   fid run tests/nattools/image_writer_unit.fd
+// Expected output:
+// elf x64 same
+// elf x64 phnum 1
+// elf x64 split pie ldyn same
+// elf x64 split pie ldyn phnum 6
+// elf x64 split pie ldyn PT_PHDR first
+// elf a64 pie ldyn same
+// elf rv64 split same
+// elf rv64 flags 4
+// pe same
+// pe symbols same
+// pe nsyms 3
+// elf debug x64 same
+// elf debug x64 shnum 11 shstrndx 7
+// elf debug a64 same
+// elf debug ldyn .interp ok
+// elf debug ldyn .dynamic ok
+// elf debug ldyn .dynstr ok
+// macho a64 same
+// macho x64 same
+// macho ncmds 12
+// macho fat same
+// elf object x64 same
+// elf object x64 shnum 7 shstrndx 6
+// elf object a64 same
+// elf object rv64 same
+// records ok
+use core;
+use vec;
+use string;
+use compiler::image_writer;
+use compiler::nat_enc;
+
+fn stand_in(n: i64, seed: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((i * 37 + seed) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// x86-64 frame records (push rbp; mov rbp, rsp) at `at`, so the debug
+/// writer gives those functions a CFI body.
+fn put_x64_frame(v: & mut Vec<i64>, at: i64) {
+    v.set(at, 0x55);
+    v.set(at + 1, 0x48);
+    v.set(at + 2, 0x89);
+    v.set(at + 3, 0xE5);
+}
+
+fn put_le32(v: & mut Vec<i64>, at: i64, w: i64) {
+    var i: i64 = 0;
+    while i < 4 {
+        v.set(at + i, (w >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn first_diff(a: & Vec<i64>, b: & Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < a.len() && i < b.len() {
+        if a.get(i) != b.get(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    if a.len() != b.len() {
+        return i;
+    }
+    return 0 - 1;
+}
+
+/// Two independent sums of the bytes (no overflow: each stays below 2^30).
+fn img_digest(b: & Vec<i64>) -> i64 {
+    var h1: i64 = 0;
+    var h2: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        h1 = (h1 * 257 + b.get(i) + 1) % 1000000007;
+        h2 = (h2 * 131 + b.get(i) + 7) % 998244353;
+        i = i + 1;
+    }
+    return h1 * 1000000000 + h2;
+}
+
+/// The digest of each writer's bytes when they were checked against the old
+/// bodies (Nov 17); 0 for a label without one.
+fn golden(label: str) -> i64 {
+    if label == "elf x64" {
+        return 130001026237215568;
+    }
+    // TG14: a position-independent image with a dynamic loader starts its
+    // program headers with PT_PHDR (Nov 17); the old body's bytes, without
+    // it, were 274365662202507883 and 99042201835286553
+    if label == "elf x64 split pie ldyn" {
+        return 169243932335052699;
+    }
+    if label == "elf a64 pie ldyn" {
+        return 815813348441740387;
+    }
+    if label == "elf rv64 split" {
+        return 599549681790872663;
+    }
+    if label == "pe" {
+        return 911656409269957799;
+    }
+    if label == "pe symbols" {
+        return 996680946884828016;
+    }
+    // with DB6's .eh_frame (5928 bytes), else the old body's 5608
+    if label == "elf debug x64" {
+        if nat_eh_frame_on() {
+            return 103528849593652348;
+        }
+        return 148963611592793383;
+    }
+    if label == "elf debug a64" {
+        if nat_eh_frame_on() {
+            return 214522749423326089;
+        }
+        return 621034307847277046;
+    }
+    if label == "macho a64" {
+        return 119323554340487033;
+    }
+    if label == "macho x64" {
+        return 9335469977146102;
+    }
+    if label == "macho fat" {
+        return 862344641428611470;
+    }
+    if label == "elf object x64" {
+        return 911343819620639144;
+    }
+    if label == "elf object a64" {
+        return 972482032131239635;
+    }
+    if label == "elf object rv64" {
+        return 469988944267409264;
+    }
+    return 0;
+}
+
+/// `a` and `b`: two runs of a writer on the same input.
+fn report(label: str, a: & Vec<i64>, b: & Vec<i64>) {
+    var d: i64 = first_diff(a, b);
+    var got: i64 = img_digest(b);
+    if b.len() == 0 {
+        println(label + " EMPTY");
+    } else if d >= 0 {
+        println(label + " NONDETERMINISTIC: the two runs differ at " + int_to_str(d));
+    } else if got == golden(label) {
+        println(label + " same");
+    } else {
+        println(label + " CHANGED: digest " + int_to_str(got) + " (" + int_to_str(b.len()) + " bytes), golden " + int_to_str(golden(label)));
+    }
+}
+
+fn u16_at(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn u32_at(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn reset_elf_state() {
+    g_nat_pie = false;
+    g_nat_elf_data_off = 0 - 1;
+    g_nat_ldyn_interp = 0 - 1;
+    g_nat_ldyn_interp_len = 0;
+    g_nat_ldyn_dyn = 0 - 1;
+    g_nat_ldyn_dyn_len = 0;
+}
+
+fn check_elf() {
+    reset_elf_state();
+    var img: Vec<i64> = stand_in(300, 11);
+    var a: Vec<i64> = nat_elf(NAT_X64, img, 16);
+    var b: Vec<i64> = nat_elf(NAT_X64, img, 16);
+    report("elf x64", & a, & b);
+    println("elf x64 phnum " + int_to_str(u16_at(& b, 0x38)));
+    // x86-64: the data from 0x1000 (a 4 KB page), position-independent,
+    // with PT_INTERP and PT_DYNAMIC
+    var big: Vec<i64> = stand_in(0x1000 + 200, 5);
+    g_nat_pie = true;
+    g_nat_elf_data_off = 0x1000;
+    g_nat_ldyn_interp = 0x1000 + 8;
+    g_nat_ldyn_interp_len = 28;
+    g_nat_ldyn_dyn = 0x1000 + 64;
+    g_nat_ldyn_dyn_len = 96;
+    a = nat_elf(NAT_X64, big, 0);
+    b = nat_elf(NAT_X64, big, 0);
+    report("elf x64 split pie ldyn", & a, & b);
+    println("elf x64 split pie ldyn phnum " + int_to_str(u16_at(& b, 0x38)));
+    // TG14: PT_PHDR first, at file offset 64, covering the 6 headers
+    if u32_at(& b, 64) == 6 && u32_at(& b, 64 + 8) == 64 && u32_at(& b, 64 + 32) == 56 * 6 {
+        println("elf x64 split pie ldyn PT_PHDR first");
+    } else {
+        println("elf x64 split pie ldyn PT_PHDR MISSING");
+    }
+    // AArch64: one segment (its split needs a 64 KB page), with PT_INTERP
+    g_nat_elf_data_off = 0 - 1;
+    a = nat_elf(NAT_A64, big, 8);
+    b = nat_elf(NAT_A64, big, 8);
+    report("elf a64 pie ldyn", & a, & b);
+    reset_elf_state();
+    var rv: Vec<i64> = stand_in(0x1000 + 40, 3);
+    g_nat_elf_data_off = 0x1000;
+    a = nat_elf(NAT_RV64, rv, 4);
+    b = nat_elf(NAT_RV64, rv, 4);
+    report("elf rv64 split", & a, & b);
+    println("elf rv64 flags " + int_to_str(u32_at(& b, 0x30)));
+    reset_elf_state();
+}
+
+fn check_pe() {
+    var img: Vec<i64> = stand_in(0x1000 + 700, 9);
+    var a: Vec<i64> = nat_pe(img, 32, 0x1000, 0x1100, 40, 0x1200, 24);
+    var b: Vec<i64> = nat_pe(img, 32, 0x1000, 0x1100, 40, 0x1200, 24);
+    report("pe", & a, & b);
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("a_rather_long_function_name");
+    names.push("exactly8");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(64);
+    starts.push(200);
+    nat_pe_symbols(& mut a, names, starts);
+    nat_pe_symbols(& mut b, names, starts);
+    report("pe symbols", & a, & b);
+    println("pe nsyms " + int_to_str(u32_at(& b, 80)));
+}
+
+fn check_debug() {
+    reset_elf_state();
+    var img: Vec<i64> = stand_in(400, 21);
+    put_x64_frame(& mut img, 0);
+    put_x64_frame(& mut img, 120);
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("helper");
+    names.push("leaf");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(120);
+    starts.push(300);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(120);
+    ends.push(300);
+    ends.push(400);
+    var rows: Vec<i64> = Vec::new();
+    rows.push(0);
+    rows.push(1);
+    rows.push(0);
+    rows.push(10);
+    rows.push(2);
+    rows.push(0);
+    rows.push(130);
+    rows.push(7);
+    rows.push(0);
+    var cfi: Vec<i64> = Vec::new();
+    var a: Vec<i64> = nat_elf_debug(NAT_X64, img, 0, names, starts, ends, "t.fd", rows, cfi);
+    var b: Vec<i64> = nat_elf_debug(NAT_X64, img, 0, names, starts, ends, "t.fd", rows, cfi);
+    report("elf debug x64", & a, & b);
+    println("elf debug x64 shnum " + int_to_str(u16_at(& b, 0x3C)) + " shstrndx " + int_to_str(u16_at(& b, 0x3E)));
+    var aimg: Vec<i64> = stand_in(400, 2);
+    put_le32(& mut aimg, 0, 0xA9BF7BFD);
+    a = nat_elf_debug(NAT_A64, aimg, 0, names, starts, ends, "", rows, cfi);
+    b = nat_elf_debug(NAT_A64, aimg, 0, names, starts, ends, "", rows, cfi);
+    report("elf debug a64", & a, & b);
+}
+
+/// The section header of type `typ` whose file offset and size are those
+/// of the program header of type `ptype`: "ok", or what is wrong.
+fn seg_section(b: & Vec<i64>, ptype: i64, typ: i64) -> str {
+    var phoff: i64 = u32_at(b, 0x20);
+    var phnum: i64 = u16_at(b, 0x38);
+    var poff: i64 = 0 - 1;
+    var psize: i64 = 0;
+    var pva: i64 = 0;
+    var i: i64 = 0;
+    while i < phnum {
+        var p: i64 = phoff + 56 * i;
+        if u32_at(b, p) == ptype {
+            poff = u32_at(b, p + 8);
+            pva = u32_at(b, p + 16);
+            psize = u32_at(b, p + 32);
+        }
+        i = i + 1;
+    }
+    if poff < 0 {
+        return "no program header";
+    }
+    var shoff: i64 = u32_at(b, 0x28);
+    var shnum: i64 = u16_at(b, 0x3C);
+    i = 0;
+    while i < shnum {
+        var s: i64 = shoff + 64 * i;
+        if u32_at(b, s + 4) == typ && u32_at(b, s + 24) == poff {
+            if u32_at(b, s + 32) != psize || u32_at(b, s + 16) != pva {
+                return "section size or address differs from the segment";
+            }
+            return "ok";
+        }
+        i = i + 1;
+    }
+    return "MISSING";
+}
+
+/// TG13: a dynamically linked image with debug sections names its
+/// PT_INTERP and PT_DYNAMIC as .interp and .dynamic (readelf: "no .dynamic
+/// section in the dynamic segment" without them).
+fn check_debug_ldyn() {
+    reset_elf_state();
+    var big: Vec<i64> = stand_in(0x1000 + 200, 7);
+    put_x64_frame(& mut big, 0);
+    g_nat_elf_data_off = 0x1000;
+    g_nat_ldyn_interp = 0x1000 + 8;
+    g_nat_ldyn_interp_len = 28;
+    g_nat_ldyn_dyn = 0x1000 + 64;
+    g_nat_ldyn_dyn_len = 96;
+    // the dynamic section as ng_gen_ldyn starts it: DT_STRTAB (the string
+    // table at image offset 0x10A0), DT_STRSZ 8, DT_NULL
+    var e: i64 = 0x1000 + 64;
+    var k: i64 = 0;
+    while k < 96 {
+        big.set(e + k, 0);
+        k = k + 1;
+    }
+    put_le32(& mut big, e, 5);
+    put_le32(& mut big, e + 8, nat_elf_image_base() + 0x10A0);
+    put_le32(& mut big, e + 16, 10);
+    put_le32(& mut big, e + 24, 8);
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(0x100);
+    var rows: Vec<i64> = Vec::new();
+    var cfi: Vec<i64> = Vec::new();
+    var b: Vec<i64> = nat_elf_debug(NAT_X64, big, 0, names, starts, ends, "t.fd", rows, cfi);
+    println("elf debug ldyn .interp " + seg_section(& b, 3, 1));
+    println("elf debug ldyn .dynamic " + seg_section(& b, 2, 6));
+    // .dynamic's sh_link: the STRTAB at file offset 0x1000 + 0x10A0, 8 bytes
+    var shoff: i64 = u32_at(& b, 0x28);
+    var shnum: i64 = u16_at(& b, 0x3C);
+    var link: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < shnum {
+        if u32_at(& b, shoff + 64 * i + 4) == 6 {
+            link = u32_at(& b, shoff + 64 * i + 40);
+        }
+        i = i + 1;
+    }
+    var ls: i64 = shoff + 64 * link;
+    if link > 0 && link < shnum && u32_at(& b, ls + 4) == 3 && u32_at(& b, ls + 24) == 0x1000 + 0x10A0 && u32_at(& b, ls + 32) == 8 {
+        println("elf debug ldyn .dynstr ok");
+    } else {
+        println("elf debug ldyn .dynstr WRONG (link " + int_to_str(link) + ")");
+    }
+    reset_elf_state();
+}
+
+fn macho_pair(arch: i64) -> Vec<Vec<i64>> {
+    var img: Vec<i64> = stand_in(0x400 + 300, 13);
+    var rebase: Vec<i64> = Vec::new();
+    rebase.push(0x400 + 8);
+    rebase.push(0x400 + 200);
+    var imps: Vec<str> = Vec::new();
+    imps.push("_write");
+    imps.push("_exit");
+    var imp_offs: Vec<i64> = Vec::new();
+    imp_offs.push(0x400 + 240);
+    imp_offs.push(0x400 + 248);
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("f");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(0x100);
+    var r: Vec<Vec<i64>> = Vec::new();
+    r.push(nat_macho(arch, img, 0, 0x400, rebase, imps, imp_offs, names, starts));
+    r.push(nat_macho(arch, img, 0, 0x400, rebase, imps, imp_offs, names, starts));
+    return r;
+}
+
+fn check_macho() {
+    var p: Vec<Vec<i64>> = macho_pair(NAT_A64);
+    var a1: Vec<i64> = p.get(0);
+    var b1: Vec<i64> = p.get(1);
+    report("macho a64", & a1, & b1);
+    var q: Vec<Vec<i64>> = macho_pair(NAT_X64);
+    var a2: Vec<i64> = q.get(0);
+    var b2: Vec<i64> = q.get(1);
+    report("macho x64", & a2, & b2);
+    println("macho ncmds " + int_to_str(u32_at(& b2, 16)));
+    var fa: Vec<i64> = nat_macho_fat(a2, a1);
+    var fb: Vec<i64> = nat_macho_fat(b2, b1);
+    report("macho fat", & fa, & fb);
+}
+
+fn object_pair(arch: i64, label: str, show: bool) {
+    var img: Vec<i64> = stand_in(256, 17);
+    var fix: Vec<NatFix> = Vec::new();
+    // two absolute words: the image's own addresses (base + offset)
+    var w: i64 = g_nat_abs_base + 0x40;
+    var k: i64 = 0;
+    while k < 8 {
+        img.set(128 + k, (w >> (k * 8)) & 255);
+        img.set(192 + k, ((w + 0x20) >> (k * 8)) & 255);
+        k = k + 1;
+    }
+    fix.push(NatFix {
+        pos: 128, label: 1, kind: NATFIX_ABS64
+    });
+    fix.push(NatFix {
+        pos: 192, label: 2, kind: NATFIX_ABS64
+    });
+    fix.push(NatFix {
+        pos: 20, label: 3, kind: NATFIX_A64_B26
+    });
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("g");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(64);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    ends.push(128);
+    var a: Vec<i64> = nat_elf_object(arch, img, 32, names, starts, ends, fix);
+    var b: Vec<i64> = nat_elf_object(arch, img, 32, names, starts, ends, fix);
+    report(label, & a, & b);
+    if show {
+        println(label + " shnum " + int_to_str(u16_at(& b, 0x3C)) + " shstrndx " + int_to_str(u16_at(& b, 0x3E)));
+    }
+}
+
+fn check_object() {
+    object_pair(NAT_X64, "elf object x64", true);
+    object_pair(NAT_A64, "elf object a64", false);
+    object_pair(NAT_RV64, "elf object rv64", false);
+}
+
+/// The shared records by value (they would be wrong in all three formats).
+fn check_records() -> bool {
+    var ok: bool = true;
+    var r: Vec<i64> = Vec::new();
+    img_elf_rela(& mut r, 0x10, 3, 1, 0 - 2);
+    // r_info = 3 << 32 | 1: bytes 8..15 are 01 00 00 00 03 00 00 00
+    if r.len() != 24 || r.get(8) != 1 || r.get(12) != 3 || r.get(16) != 0xFE || r.get(23) != 0xFF {
+        println("records: rela wrong");
+        ok = false;
+    }
+    var relocs: Vec<i64> = Vec::new();
+    relocs.push(0x2010);
+    relocs.push(0x1008);
+    relocs.push(0x1000);
+    var blk: Vec<i64> = img_pe_base_relocs(& relocs, 0x1000);
+    // page 0x1000: 2 entries (12 bytes), page 0x2000: 1 entry + padding (12)
+    if blk.len() != 24 || u32_at(& blk, 0) != 0x1000 || u32_at(& blk, 4) != 12 || u16_at(& blk, 8) != 0xA000 || u16_at(& blk, 10) != 0xA008 || u32_at(& blk, 12) != 0x2000 || u16_at(& blk, 20) != 0xA010 {
+        println("records: base relocations wrong");
+        ok = false;
+    }
+    var empty: Vec<i64> = Vec::new();
+    var none: Vec<i64> = img_pe_base_relocs(& empty, 0x1000);
+    if none.len() != 12 || u32_at(& none, 4) != 12 {
+        println("records: empty base relocations wrong");
+        ok = false;
+    }
+    var syms: Vec<ImgSym> = Vec::new();
+    syms.push(img_sym("", 0, 0, 1, IMG_SYM_SECTION, IMG_LOCAL));
+    syms.push(img_sym("f", 8, 4, 1, IMG_SYM_FUNC, IMG_LOCAL));
+    syms.push(img_sym("g", 16, 4, 1, IMG_SYM_FUNC, IMG_GLOBAL));
+    if img_elf_first_global(& syms) != 3 {
+        println("records: first global wrong");
+        ok = false;
+    }
+    var st: Vec<i64> = Vec::new();
+    st.push(0);
+    var tab: Vec<i64> = img_elf_symtab(& syms, & mut st);
+    // null + 3 symbols; "f" at 1, "g" at 3; g is GLOBAL FUNC (0x12)
+    if tab.len() != 96 || u32_at(& tab, 24) != 0 || tab.get(28) != 3 || u32_at(& tab, 48) != 1 || u32_at(& tab, 72) != 3 || tab.get(76) != 0x12 || st.len() != 5 {
+        println("records: ELF symbols wrong");
+        ok = false;
+    }
+    var co: Vec<i64> = stand_in(100, 0);
+    var pre: Vec<str> = Vec::new();
+    pre.push(".debug_info");
+    var cs: Vec<ImgSym> = Vec::new();
+    cs.push(img_sym("short", 4, 0, 1, IMG_SYM_FUNC, IMG_GLOBAL));
+    cs.push(img_sym("much_longer_name", 8, 0, 1, IMG_SYM_FUNC, IMG_LOCAL));
+    img_coff_symbols(& mut co, & pre, & cs, 76, 80);
+    // records at 100 and 118; the long name at string table offset 4 + 12
+    if u32_at(& co, 76) != 100 || u32_at(& co, 80) != 2 || co.get(100) != 115 || u32_at(& co, 118) != 0 || u32_at(& co, 122) != 16 || co.get(118 + 16) != 3 || co.get(100 + 16) != 2 || u32_at(& co, 136) != 4 + 12 + 17 {
+        println("records: COFF symbols wrong");
+        ok = false;
+    }
+    var nl: Vec<i64> = Vec::new();
+    nl.push(0);
+    var ms: Vec<i64> = img_macho_symtab(& cs, & mut nl);
+    // 16 bytes each; "_short" at 1, "_much_longer_name" at 8; N_SECT|N_EXT
+    // for the global, N_SECT for the local
+    if ms.len() != 32 || u32_at(& ms, 0) != 1 || ms.get(4) != 0x0F || u32_at(& ms, 16) != 8 || ms.get(20) != 0x0E || nl.get(1) != 95 {
+        println("records: Mach-O symbols wrong");
+        ok = false;
+    }
+    var offs: Vec<i64> = Vec::new();
+    offs.push(0x408);
+    var rb: Vec<i64> = img_macho_rebase(& offs, 2, 0x400);
+    if rb.len() != 6 || rb.get(0) != 0x11 || rb.get(1) != 0x22 || rb.get(2) != 8 || rb.get(3) != 0x60 || rb.get(4) != 1 || rb.get(5) != 0 {
+        println("records: Mach-O rebase wrong");
+        ok = false;
+    }
+    var secs: Vec<ImgSec> = Vec::new();
+    secs.push(img_sec("", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    secs.push(img_sec(".text", 1, 6, 0, 64, 10, 0, 0, 16, 0));
+    secs.push(img_sec(".shstrtab", 3, 0, 0, 74, 17, 0, 0, 1, 0));
+    var names: Vec<str> = img_sec_names(& secs);
+    var shs: Vec<i64> = img_elf_shstrtab(& names);
+    var e: Vec<i64> = Vec::new();
+    img_elf_header(& mut e, 1, 62, 0, 0, 0, 0, 0, 0, 0, 0);
+    img_elf_sections(& mut e, & secs);
+    // names at 1 (.text) and 7 (.shstrtab); 3 headers of 64 bytes at 64
+    if shs.len() != 17 || e.len() != 64 + 192 || u32_at(& e, 0x28) != 64 || u16_at(& e, 0x3C) != 3 || u16_at(& e, 0x3E) != 2 || u32_at(& e, 128) != 1 || u32_at(& e, 192) != 7 {
+        println("records: ELF sections wrong");
+        ok = false;
+    }
+    return ok;
+}
+
+fn main() {
+    check_elf();
+    check_pe();
+    check_debug();
+    check_debug_ldyn();
+    check_macho();
+    check_object();
+    if check_records() {
+        println("records ok");
+    }
+}

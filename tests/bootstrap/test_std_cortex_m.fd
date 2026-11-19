@@ -1,0 +1,108 @@
+// stdlib/cortex_m: NVIC, SysTick, SCB and MPU register math and write sequences on a fake bus (ARMv7-M addresses).
+// Expected output:
+// W 0xE000E104 <- 0x00000004
+// W 0xE000E180 <- 0x00000008
+// enabled 34: true pending 34: false
+// W 0xE000E422 <- 0x50
+// systick reload 72MHz/1kHz: 71999 too slow: -1
+// W 0xE000E014 <- 0x0001193F
+// W 0xE000ED23 <- 0xF0
+// W 0xE000E018 <- 0x00000000
+// W 0xE000E010 <- 0x00000007
+// prio 34: 5 SysTick: 15 NMI: -2
+// W 0xE000ED0C <- 0x05FA0500
+// grouping 5, encode(3,1)=13 decode=3/1
+// W 0xE000ED0C <- 0x05FA0504
+// reset value from 0xFA050300: 0x05FA0304
+// vtor align 84 vectors: 512 ok: true misaligned: false
+// ARM Cortex-M4 r0p1
+// ARM Cortex-M7 r1p2
+// HardFault(FORCED) CFSR=0x00008200 [PRECISERR,BFARVALID] BFAR=0x20030000
+// CFSR=0x02000000 [DIVBYZERO]
+// CFSR=0x00000082 [DACCVIOL,MMARVALID] MMFAR=0x00000000
+// TENMS=9000 SKEW=0 NOREF=1
+// elapsed 11 ticks after wrap at 72MHz: 152 ns
+// Thread mode, PSP / Thread mode, MSP, FP frame / Handler mode, MSP
+// rasr flash 0x06020025 sram 0x130F0021 periph 0x13050039
+// rbar 0x20000011
+// base 0x08000000 size 512K ro normal-WT
+// base 0x20000000 size 128K full XN normal-WBWA S
+// base 0x40000000 size 512M full XN device S
+// check: base 0x20001000 not aligned to size 65536
+// size field 32: 4 48: -1 4G: 31
+// W 0xE000ED9C <- 0x20000011
+// W 0xE000EDA0 <- 0x130F0021
+// W 0xE000ED94 <- 0x00000005
+use cortex_m;
+use regmap;
+use vec;
+use string;
+
+fn flush(bus: &mut RegBus) {
+    var i: i64 = 0;
+    while i < bus.log.len() {
+        if str_starts_with(bus.log.get(i), "W") { println(bus.log.get(i)); }
+        i = i + 1;
+    }
+    bus.log.clear();
+}
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() {
+    var bus: RegBus = regbus_fake();
+    nvic_enable(&mut bus, 34);
+    nvic_disable(&mut bus, 3);
+    flush(&mut bus);
+    println("enabled 34: " + bs(nvic_is_enabled(&mut bus, 34)) + " pending 34: " + bs(nvic_is_pending(&mut bus, 34)));
+    bus.log.clear();
+    cm_set_priority(&mut bus, 16 + 34, 5, 4);
+    flush(&mut bus);
+
+    println("systick reload 72MHz/1kHz: " + int_to_str(systick_reload(72000000, 1000)) + " too slow: " + int_to_str(systick_reload(72000000, 1)));
+    systick_config(&mut bus, 72000, 4);
+    flush(&mut bus);
+    println("prio 34: " + int_to_str(cm_get_priority(&mut bus, 50, 4)) + " SysTick: " + int_to_str(cm_get_priority(&mut bus, EXC_SYSTICK, 4))
+        + " NMI: " + int_to_str(cm_get_priority(&mut bus, EXC_NMI, 4)));
+    bus.log.clear();
+
+    cm_set_priority_grouping(&mut bus, 5);
+    flush(&mut bus);
+    val enc: i64 = cm_encode_priority(cm_priority_grouping(&mut bus), 3, 1, 4);
+    val dec: i64 = cm_decode_priority(enc, 5, 4);
+    println("grouping 5, encode(3,1)=" + int_to_str(enc) + " decode=" + int_to_str(dec / 256) + "/" + int_to_str(dec % 256));
+    bus.log.clear();
+    cm_system_reset(&mut bus);
+    flush(&mut bus);
+    println("reset value from 0xFA050300: " + regmap_hex(cm_reset_value(0xFA050300), 8));
+
+    println("vtor align 84 vectors: " + int_to_str(cm_vtor_align(84)) + " ok: " + bs(cm_set_vtor(&mut bus, 0x08004000, 84))
+        + " misaligned: " + bs(cm_set_vtor(&mut bus, 0x08004100, 84)));
+    bus.log.clear();
+
+    println(cm_cpuid_decode(0x410FC241));
+    println(cm_cpuid_decode(0x411FC272));
+    println(cm_fault_report(0x00008200, 0x40000000, 0, 0x20030000));
+    println(cm_fault_report(0x02000000, 0, 0, 0));
+    println(cm_fault_report(0x00000082, 0, 0, 0));
+    println(systick_calib_decode(0x80002328));
+    println("elapsed 11 ticks after wrap at 72MHz: " + int_to_str(systick_elapsed_ns(5, 71994, 71999, 72000000)) + " ns");
+    println(cm_exc_return_decode(0xFFFFFFFD) + " / " + cm_exc_return_decode(0xFFFFFFE9) + " / " + cm_exc_return_decode(0xFFFFFFF1));
+
+    val r0: i64 = mpu_rasr(512 * 1024, MPU_AP_RO, MPU_NORMAL_WT, false, false, 0);
+    val r1: i64 = mpu_rasr(128 * 1024, MPU_AP_FULL, MPU_NORMAL_WBWA, true, true, 0);
+    val r2: i64 = mpu_rasr(512 * 1024 * 1024, MPU_AP_FULL, MPU_DEVICE, true, true, 0);
+    println("rasr flash " + regmap_hex(r0, 8) + " sram " + regmap_hex(r1, 8) + " periph " + regmap_hex(r2, 8));
+    println("rbar " + regmap_hex(mpu_rbar(0x20000000, 1), 8));
+    println(mpu_region_decode(mpu_rbar(0x08000000, 0), r0));
+    println(mpu_region_decode(mpu_rbar(0x20000000, 1), r1));
+    println(mpu_region_decode(mpu_rbar(0x40000000, 2), r2));
+    println("check: " + mpu_region_check(0x20001000, 65536));
+    println("size field 32: " + int_to_str(mpu_size_field(32)) + " 48: " + int_to_str(mpu_size_field(48)) + " 4G: " + int_to_str(mpu_size_field(4294967296)));
+    mpu_set_region(&mut bus, 1, 0x20000000, r1);
+    mpu_enable(&mut bus, true);
+    flush(&mut bus);
+}

@@ -1,0 +1,52 @@
+// Test: two C-path and interpreter fixes (compiler/codegen_c.fd,
+// compiler/interp.fd).
+// 1. A `dyn` call dispatches only to functions of dyn types that take the
+//    call's arguments (cg_dyn_candidate). The C generator tried every
+//    function named `<anything>_<method>`: for `remove` and `grow` it wrote
+//    `v = HashMap_remove(NULL, _recv, i)` (a void function of a str key)
+//    and `HashMap_grow(NULL, _recv, k)` (one argument too many), which C
+//    rejects (test_midend_devirt_field).
+// 2. A `[T; N]` struct field is one word, the array's address: the C
+//    struct declared it `int64_t[3] field_0;` (not C), and the
+//    interpreter's Load of an array type gave the field's own address, so
+//    `c.cells[1]` read the word after it (test_wasm_array_index).
+// Expected output:
+// 7
+// 15
+// 5
+// 115
+// 9
+
+cap Store {
+    fn remove(self, i: i64) -> i64;
+    fn grow(self, k: i64) -> i64;
+}
+
+struct Shelf { n: i64 }
+
+impl Store for Shelf {
+    pub fn remove(self: Shelf, i: i64) -> i64 { return self.n - i; }
+    pub fn grow(self: Shelf, k: i64) -> i64 { return self.n + k; }
+}
+
+struct Cells { cells: [i64; 3], tag: i64 }
+
+fn total(c: Cells) -> i64 {
+    var t: i64 = 0;
+    for k in 0..3 {
+        t = t + c.cells[k];
+    }
+    return t + c.tag;
+}
+
+fn main() {
+    val s = Shelf { n: 10 } as dyn Store;
+    println(s.remove(3));
+    println(s.grow(5));
+    val c = Cells { cells: [4, 5, 6], tag: 100 };
+    println(c.cells[1]);
+    println(total(c));
+    var d = Cells { cells: [1, 2, 6], tag: 3 };
+    d.tag = d.tag + d.cells[0];
+    println(d.cells[2] + d.tag - 1);
+}

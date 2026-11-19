@@ -1,0 +1,89 @@
+// stdlib/pv_model: Michalsky solar position, POA irradiance, cell temperature, single diode, inverters
+// Solar position: the example of the NREL SPA report (Reda & Andreas 2008,
+// NREL/TP-560-34302): 17 Oct 2003 12:30:30 MST (19:30:30 UT), 39.742476 N,
+// 105.1786 W, 820 hPa, 11 C; SPA gives zenith 50.11162 and azimuth
+// 194.34024 deg. Michalsky's algorithm agrees to 0.01 deg. Single diode: the
+// Kyocera KC200GT parameters of Villalva, Gazoli & Filho (IEEE Trans. Power
+// Electronics 24(5), 2009): IL 8.214 A, I0 9.825e-8 A, Rs 0.221, Rsh 415.405,
+// a 1.3, 54 cells; the paper gives Isc 8.21 A, Voc 32.9 V, Vmp 26.3 V,
+// Imp 7.61 A, Pmax 200.14 W. POA, De Soto and Sandia values were checked with
+// an independent Python implementation of the same formulas.
+// Expected output:
+// jd 2452930.312847 doy 290
+// spa example: zenith 50.11 azimuth 194.34 (|dz| < 0.01: true, |daz| < 0.01: true) declination -9.316
+// extraterrestrial 1370.65 W/m2, air mass 1.5569
+// aoi 22.014, isotropic poa 889.66 (beam 741.67 sky 139.95 ground 8.04), hay-davies 934.54
+// cell temp noct 45.00 C, faiman 50.85 C
+// kc200gt: isc 8.2096 voc 32.8834 vmp 26.349 imp 7.5956 pmp 200.136 ff 0.7414
+// kc200gt at 800 W/m2 50 C: il 6.6352 isc 6.6324 voc 27.6292 pmp 129.554
+// sandia: 1953.11 W at 380 V, 1950.93 W at 420 V, clipped 3800.00 W, night -1.00 W
+// efficiency curve at 40%: 0.97250, cec 0.97084, euro 0.96680
+use pv_model;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn main() {
+    val hour: f64 = 19.0 + 30.0 / 60.0 + 30.0 / 3600.0;
+    println("jd " + fx(pv_julian_day(2003, 10, 17, hour), 6) + " doy " + int_to_str(pv_day_of_year(2003, 10, 17)));
+    val sp = pv_solar_position(2003, 10, 17, hour, 39.742476, -105.1786, 820.0, 11.0);
+    println("spa example: zenith " + fx(sp.zenith, 2) + " azimuth " + fx(sp.azimuth, 2) + " (|dz| < 0.01: " + bool_to_str(math_fabs(sp.zenith - 50.11162) < 0.01) + ", |daz| < 0.01: " + bool_to_str(math_fabs(sp.azimuth - 194.34024) < 0.01) + ") declination " + fx(sp.declination, 3));
+    val extra = pv_extraterrestrial(290);
+    println("extraterrestrial " + fx(extra, 2) + " W/m2, air mass " + fx(pv_airmass(sp.zenith), 4));
+    val iso = pv_poa_isotropic(sp.zenith, sp.azimuth, 30.0, 180.0, 800.0, 600.0, 150.0, 0.2);
+    val hd = pv_poa_hay_davies(sp.zenith, sp.azimuth, 30.0, 180.0, 800.0, 600.0, 150.0, 0.2, extra);
+    println("aoi " + fx(iso.aoi, 3) + ", isotropic poa " + fx(iso.total, 2) + " (beam " + fx(iso.beam, 2) + " sky " + fx(iso.sky_diffuse, 2) + " ground " + fx(iso.ground, 2) + "), hay-davies " + fx(hd.total, 2));
+    println("cell temp noct " + fx(pv_cell_temp_noct(20.0, 800.0, 45.0), 2) + " C, faiman " + fx(pv_cell_temp_faiman(25.0, 1000.0, 2.0, 25.0, 6.84), 2) + " C");
+
+    val kc = pv_diode_params(8.214, 0.00000009825, 0.221, 415.405, 1.3, 54, 25.0);
+    val mpp = pv_mpp(&kc);
+    println("kc200gt: isc " + fx(pv_isc(&kc), 4) + " voc " + fx(pv_voc(&kc), 4) + " vmp " + fx(mpp.v, 3) + " imp " + fx(mpp.i, 4) + " pmp " + fx(mpp.p, 3) + " ff " + fx(pv_fill_factor(&kc), 4));
+    val hot = pv_desoto(&kc, 0.0032, 1.121, 800.0, 50.0);
+    println("kc200gt at 800 W/m2 50 C: il " + fx(hot.il, 4) + " isc " + fx(pv_isc(&hot), 4) + " voc " + fx(pv_voc(&hot), 4) + " pmp " + fx(pv_mpp(&hot).p, 3));
+
+    val inv = SandiaInverter { paco: 3800.0, pdco: 3950.0, vdco: 380.0, pso: 20.0, c0: -0.00001, c1: 0.00002, c2: 0.001, c3: -0.0002, pnt: 1.0 };
+    println("sandia: " + fx(pv_sandia_inverter(&inv, 2000.0, 380.0), 2) + " W at 380 V, " + fx(pv_sandia_inverter(&inv, 2000.0, 420.0), 2) + " W at 420 V, clipped " + fx(pv_sandia_inverter(&inv, 5000.0, 380.0), 2) + " W, night " + fx(pv_sandia_inverter(&inv, 10.0, 380.0), 2) + " W");
+    var load: Vec<f64> = Vec::new();
+    var eff: Vec<f64> = Vec::new();
+    load.push(0.05);
+    eff.push(0.90);
+    load.push(0.10);
+    eff.push(0.94);
+    load.push(0.20);
+    eff.push(0.96);
+    load.push(0.30);
+    eff.push(0.97);
+    load.push(0.50);
+    eff.push(0.975);
+    load.push(0.75);
+    eff.push(0.973);
+    load.push(1.00);
+    eff.push(0.968);
+    println("efficiency curve at 40%: " + fx(pv_efficiency_curve(&load, &eff, 0.4), 5) + ", cec " + fx(pv_cec_efficiency(&load, &eff), 5) + ", euro " + fx(pv_euro_efficiency(&load, &eff), 5));
+}

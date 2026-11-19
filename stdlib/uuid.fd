@@ -10,7 +10,7 @@
 //   println(uuid_to_string(u));  // "550e8400-e29b-41d4-a716-446655440000"
 
 module uuid;
- use vec; use string; use random;
+ use vec; use random; use kdf;
 // ─── UUID struct ────────────────────────────────────────────────────────
 
 /// A 128-bit UUID stored as 16 bytes in a Vec.
@@ -21,7 +21,8 @@ pub struct UUID {
 // ─── Generation ─────────────────────────────────────────────────────────
 
 /// Generate a random UUID v4.
-/// Uses random_int_range for each byte, then sets the version and variant bits.
+/// Bytes come from the OS entropy source (p_os_random_u64), so sequences
+/// differ across processes and are not reproducible from random_seed().
 ///
 /// Example:
 ///   var u = uuid_v4();
@@ -33,9 +34,15 @@ pub struct UUID {
 ///   assert(!uuid_equal(u, uuid_v4()));
 pub fn uuid_v4() -> UUID {
     var bytes = Vec::new();
+    var hi: i64 = p_os_random_u64();
+    var lo: i64 = p_os_random_u64();
     var i = 0;
+    while i < 8 {
+        bytes.push((hi >> (i * 8)) & 255);
+        i = i + 1;
+    }
     while i < 16 {
-        bytes.push(random_int_range(0, 255));
+        bytes.push((lo >> ((i - 8) * 8)) & 255);
         i = i + 1;
     }
     // Set version 4 (bits 12-15 of byte 6)
@@ -130,7 +137,9 @@ pub fn uuid_to_urn(u: UUID) -> str {
 
 // ─── Parsing ────────────────────────────────────────────────────────────
 
-/// Parse a UUID string (with or without hyphens).
+/// Parse a UUID string strictly: either the 36-char hyphenated form
+/// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" or the 32-char bare hex form.
+/// An optional "urn:uuid:" prefix and surrounding braces are accepted.
 /// Returns a UUID, or nil UUID if invalid.
 ///
 /// Example:
@@ -138,41 +147,72 @@ pub fn uuid_to_urn(u: UUID) -> str {
 ///   assert_eq(uuid_version(u), 1);
 ///   assert(uuid_is_nil(uuid_parse("not-a-uuid")));
 pub fn uuid_parse(s: str) -> UUID {
+    match uuid_parse_opt(s) {
+        Option::Some(u) => { return u; }
+        Option::None => { return uuid_nil(); }
+    }
+}
+
+/// Strict parse returning Option::None on any malformed input instead of
+/// silently skipping non-hex characters.
+///
+/// Example:
+///   match uuid_parse_opt("zz") {
+///     Option::Some(u) => println("bad"),
+///     Option::None => println("ok")
+///   }
+pub fn uuid_parse_opt(s: str) -> Option<UUID> {
+    var len = str_len(s);
+    var start = 0;
+    // Strip "urn:uuid:" prefix.
+    if len >= 9 && str_starts_with(s, "urn:uuid:") {
+        start = 9;
+        len = len - 9;
+    }
+    // Strip surrounding braces.
+    if len >= 2 && str_byte_at(s, start) == 123 && str_byte_at(s, start + len - 1) == 125 {
+        start = start + 1;
+        len = len - 2;
+    }
+    var hex_len = len;
+    var hyphenated = false;
+    if len == 36 {
+        hyphenated = true;
+        // Hyphens must be exactly at positions 8, 13, 18, 23.
+        if str_byte_at(s, start + 8) != 45 || str_byte_at(s, start + 13) != 45
+            || str_byte_at(s, start + 18) != 45 || str_byte_at(s, start + 23) != 45 {
+            return Option::None;
+        }
+        hex_len = 32;
+    } else if len != 32 {
+        return Option::None;
+    }
     var bytes = Vec::new();
     var i = 0;
-    var count = 0;
-    var len = str_len(s);
-    while i < len && count < 16 {
-        var ch = str_byte_at(s, i);
-        var nibble = hex_char_to_val(ch);
-        if nibble >= 0 {
-            i = i + 1;
-            var hi = nibble;
-            var lo = 0;
-            if i < len {
-                var ch2 = str_byte_at(s, i);
-                var nibble2 = hex_char_to_val(ch2);
-                if nibble2 >= 0 {
-                    lo = nibble2;
-                    i = i + 1;
-                }
-            }
-            bytes.push((hi << 4) | lo);
-            count = count + 1;
-            // Skip hyphens
-            if i < len && str_byte_at(s, i) == 45 {
-                i = i + 1;
-            }
-        } else {
-            i = i + 1;
+    var pos = start;
+    var digits = 0;
+    while digits < 32 {
+        var ch = str_byte_at(s, pos);
+        if hyphenated && ch == 45 && (pos - start == 8 || pos - start == 13
+            || pos - start == 18 || pos - start == 23) {
+            pos = pos + 1;
+            ch = str_byte_at(s, pos);
         }
+        var nibble = hex_char_to_val(ch);
+        if nibble < 0 {
+            return Option::None;
+        }
+        if digits % 2 == 0 {
+            bytes.push(nibble << 4);
+        } else {
+            bytes.set(digits / 2, bytes.get(digits / 2) | nibble);
+        }
+        digits = digits + 1;
+        pos = pos + 1;
     }
-    if count != 16 {
-        return uuid_nil();
-    }
-    return UUID {
+    return Option::Some(UUID {
         bytes: bytes
-    };
+    });
 }
 
 // ─── Comparison ─────────────────────────────────────────────────────────
@@ -234,6 +274,110 @@ pub fn uuid_variant(u: UUID) -> i64 {
         return 2;
     }
     return 3;
+}
+
+// ─── Versions 5 and 7 ───────────────────────────────────────────────────
+
+/// The RFC 4122 DNS namespace UUID.
+pub fn uuid_ns_dns() -> UUID {
+    return uuid_parse("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+}
+
+/// The RFC 4122 URL namespace UUID.
+pub fn uuid_ns_url() -> UUID {
+    return uuid_parse("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
+}
+
+/// The RFC 4122 OID namespace UUID.
+pub fn uuid_ns_oid() -> UUID {
+    return uuid_parse("6ba7b812-9dad-11d1-80b4-00c04fd430c8");
+}
+
+/// The RFC 4122 X.500 namespace UUID.
+pub fn uuid_ns_x500() -> UUID {
+    return uuid_parse("6ba7b814-9dad-11d1-80b4-00c04fd430c8");
+}
+
+/// Generate a name-based UUID v5 (SHA-1 of namespace bytes + name).
+/// Deterministic: the same namespace and name always give the same UUID.
+///
+/// Example:
+///   var u = uuid_v5(uuid_ns_dns(), "example.com");
+///   assert_eq(uuid_to_string(u), "cfbff0d1-9375-5685-968c-48ce8b15ae17");
+pub fn uuid_v5(ns: UUID, name: str) -> UUID {
+    var data: Vec<i64> = Vec::new();
+    var i = 0;
+    while i < 16 {
+        data.push(ns.bytes.get(i) & 255);
+        i = i + 1;
+    }
+    var n = str_len(name);
+    i = 0;
+    while i < n {
+        data.push(str_byte_at(name, i) & 255);
+        i = i + 1;
+    }
+    var digest = kdf_sha1(data);
+    var bytes = Vec::new();
+    i = 0;
+    while i < 16 {
+        bytes.push(digest.get(i) & 255);
+        i = i + 1;
+    }
+    bytes.set(6, (bytes.get(6) & 0x0F) | 0x50);
+    bytes.set(8, (bytes.get(8) & 0x3F) | 0x80);
+    return UUID {
+        bytes: bytes
+    };
+}
+
+/// Generate a time-ordered UUID v7 (RFC 9562): 48-bit unix epoch
+/// milliseconds, then version/variant and random bits from OS entropy.
+/// v7s sort by creation time to millisecond granularity.
+///
+/// Example:
+///   var u = uuid_v7();
+///   assert_eq(uuid_version(u), 7);
+///   assert_eq(uuid_variant(u), 1);
+///   assert_eq(str_len(uuid_to_string(u)), 36);
+pub fn uuid_v7() -> UUID {
+    var ms: i64 = p_clock_now_ms() & 281474976710655; // 48 bits
+    var r1: i64 = p_os_random_u64();
+    var r2: i64 = p_os_random_u64();
+    var bytes = Vec::new();
+    var i = 0;
+    while i < 6 {
+        bytes.push((ms >> ((5 - i) * 8)) & 255);
+        i = i + 1;
+    }
+    bytes.push(0x70 | (r1 & 15));                 // ver 7 + rand_a high
+    bytes.push((r1 >> 4) & 255);                  // rand_a low
+    bytes.push(0x80 | ((r1 >> 12) & 63));         // variant + rand_b high
+    bytes.push((r1 >> 20) & 255);
+    bytes.push((r1 >> 28) & 255);
+    bytes.push((r1 >> 36) & 255);
+    bytes.push((r1 >> 44) & 255);
+    bytes.push((r1 >> 52) & 255);
+    bytes.push(r2 & 255);
+    bytes.push((r2 >> 8) & 255);
+    return UUID {
+        bytes: bytes
+    };
+}
+
+/// The 48-bit unix epoch milliseconds inside a v7 UUID (0 for other
+/// versions).
+pub fn uuid_v7_time_ms(u: UUID) -> i64 {
+    if uuid_version(u) != 7 {
+        return 0;
+    }
+    var ms: i64 = 0;
+    var i = 0;
+    while i < 6 {
+        ms = (ms << 8) | (u.bytes.get(i) & 255);
+        i = i + 1;
+    }
+    return ms;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

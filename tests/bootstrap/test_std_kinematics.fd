@@ -1,0 +1,161 @@
+// stdlib/kinematics: DH forward kinematics (PUMA 560 pose checked against numpy), geometric Jacobian against finite differences, damped-least-squares IK (full pose and position only), the two-link planar arm in closed form
+// Expected output:
+// planar fk = (1.245223, 1.041151) dh fk = (1.245223, 1.041151, 0.000000)
+// ik elbow down = 0.300000 0.900000
+// ik elbow up = 1.092757 -0.900000 fk = (1.245223, 1.041151)
+// out of reach: planar2_ik: target out of reach
+// numeric ik converged: true q2 > 0: true tip error < 1e-9: true
+// planar jacobian matches dh: true
+// puma home tip = (0.452100, -0.150050, 0.431800)
+// puma fk = t=(0.497180, -0.100919, 0.212144) q=(0.968476, 0.105594, -0.180961, 0.134751)
+// jacobian vs finite differences < 1e-6: true
+// puma ik converged: true
+// puma ik pose error < 1e-9: true
+// limited ik stays in limits: true
+// prismatic: (0.000000, 0.000000, 1.250000) jacobian z column = (0.000000, 0.000000, 1.000000)
+use math;
+use quat;
+use transform3d;
+use lqr;
+use kinematics;
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn v2(a: f64, b: f64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn puma() -> DhChain {
+    val pi: f64 = rmath_pi();
+    var c: DhChain = dh_chain_new();
+    dh_chain_add(&mut c, dh_revolute(0.0, pi / 2.0, 0.0, 0.0));
+    dh_chain_add(&mut c, dh_revolute(0.4318, 0.0, 0.0, 0.0));
+    dh_chain_add(&mut c, dh_revolute(0.0203, 0.0 - pi / 2.0, 0.15005, 0.0));
+    dh_chain_add(&mut c, dh_revolute(0.0, pi / 2.0, 0.4318, 0.0));
+    dh_chain_add(&mut c, dh_revolute(0.0, 0.0 - pi / 2.0, 0.0, 0.0));
+    dh_chain_add(&mut c, dh_revolute(0.0, 0.0, 0.0, 0.0));
+    return c;
+}
+
+fn six(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    v.push(e);
+    v.push(f);
+    return v;
+}
+
+fn main() -> i64 {
+    // two-link planar arm
+    var arm: DhChain = dh_chain_new();
+    dh_chain_add(&mut arm, dh_revolute(1.0, 0.0, 0.0, 0.0));
+    dh_chain_add(&mut arm, dh_revolute(0.8, 0.0, 0.0, 0.0));
+    val tip: vec2 = planar2_fk(1.0, 0.8, 0.3, 0.9);
+    val pose: Transform3 = dh_fk(&arm, &v2(0.3, 0.9));
+    println("planar fk = (" + rmath_fmt(tip.x, 6) + ", " + rmath_fmt(tip.y, 6) + ") dh fk = " + rmath_vec3_str(pose.trans, 6));
+    match planar2_ik(1.0, 0.8, tip.x, tip.y, false) {
+        Result::Ok(s) => {
+            println("ik elbow down = " + rmath_fmt(s.x, 6) + " " + rmath_fmt(s.y, 6));
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    match planar2_ik(1.0, 0.8, tip.x, tip.y, true) {
+        Result::Ok(s) => {
+            val p: vec2 = planar2_fk(1.0, 0.8, s.x, s.y);
+            println("ik elbow up = " + rmath_fmt(s.x, 6) + " " + rmath_fmt(s.y, 6) + " fk = (" + rmath_fmt(p.x, 6) + ", " + rmath_fmt(p.y, 6) + ")");
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    match planar2_ik(1.0, 0.8, 2.0, 0.0, true) {
+        Result::Ok(s) => {
+            println("out of reach: solved?");
+        }
+        Result::Err(e) => {
+            println("out of reach: " + e);
+        }
+    }
+    var opt: IkOptions = dh_ik_defaults();
+    opt.position_only = true;
+    val r: IkResult = dh_ik(&arm, pose, &v2(0.0, 0.5), opt);
+    val got: Transform3 = dh_fk(&arm, &r.q);
+    println("numeric ik converged: " + yes(r.converged) + " q2 > 0: " + yes(r.q.get(1) > 0.0) + " tip error < 1e-9: " + yes(got.trans.sub(pose.trans).length() < 0.000000001));
+    val jp: DMat = planar2_jacobian(1.0, 0.8, 0.3, 0.9);
+    val jd: DMat = dh_jacobian(&arm, &v2(0.3, 0.9));
+    val jd2: DMat = dm_block(&jd, 0, 0, 2, 2);
+    println("planar jacobian matches dh: " + yes(dm_max_diff(&jp, &jd2) < 0.000000000001));
+
+    // PUMA 560
+    val pu: DhChain = puma();
+    println("puma home tip = " + rmath_vec3_str(dh_fk(&pu, &six(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)).trans, 6));
+    val q: Vec<f64> = six(0.1, -0.5, 0.3, 0.4, 0.6, -0.2);
+    val tp: Transform3 = dh_fk(&pu, &q);
+    println("puma fk = " + tf3_to_str(tp, 6));
+    // Jacobian columns against central differences of position and rotation
+    val jac: DMat = dh_jacobian(&pu, &q);
+    var worst: f64 = 0.0;
+    val h: f64 = 0.000001;
+    var i: i64 = 0;
+    while i < 6 {
+        var qp: Vec<f64> = Vec::new();
+        var qm: Vec<f64> = Vec::new();
+        var k: i64 = 0;
+        while k < 6 {
+            if k == i {
+                qp.push(q.get(k) + h);
+                qm.push(q.get(k) - h);
+            } else {
+                qp.push(q.get(k));
+                qm.push(q.get(k));
+            }
+            k = k + 1;
+        }
+        val tpp: Transform3 = dh_fk(&pu, &qp);
+        val tmm: Transform3 = dh_fk(&pu, &qm);
+        val dpos: vec3 = tpp.trans.sub(tmm.trans).scale(1.0 / (2.0 * h));
+        val drot: vec3 = qt_to_rotvec(qt_mul(tpp.rot, qt_conj(tmm.rot))).scale(1.0 / (2.0 * h));
+        worst = rmath_max(worst, math_fabs(dpos.x - dm_get(&jac, 0, i)));
+        worst = rmath_max(worst, math_fabs(dpos.y - dm_get(&jac, 1, i)));
+        worst = rmath_max(worst, math_fabs(dpos.z - dm_get(&jac, 2, i)));
+        worst = rmath_max(worst, math_fabs(drot.x - dm_get(&jac, 3, i)));
+        worst = rmath_max(worst, math_fabs(drot.y - dm_get(&jac, 4, i)));
+        worst = rmath_max(worst, math_fabs(drot.z - dm_get(&jac, 5, i)));
+        i = i + 1;
+    }
+    println("jacobian vs finite differences < 1e-6: " + yes(worst < 0.000001));
+    val start: Vec<f64> = six(0.3, -0.2, 0.1, 0.7, 0.3, 0.1);
+    val sol: IkResult = dh_ik(&pu, tp, &start, dh_ik_defaults());
+    println("puma ik converged: " + yes(sol.converged));
+    val back: Transform3 = dh_fk(&pu, &sol.q);
+    println("puma ik pose error < 1e-9: " + yes(tf3_approx_eq(back, tp, 0.000000001, 0.000000001)));
+
+    // joint limits: joint 1 of the planar arm limited to [0, 0.2]
+    var lim: DhChain = dh_chain_new();
+    dh_chain_add(&mut lim, dh_with_limits(dh_revolute(1.0, 0.0, 0.0, 0.0), 0.0, 0.2));
+    dh_chain_add(&mut lim, dh_revolute(0.8, 0.0, 0.0, 0.0));
+    val lr: IkResult = dh_ik(&lim, pose, &v2(0.1, 0.1), opt);
+    println("limited ik stays in limits: " + yes(lr.q.get(0) >= 0.0 && lr.q.get(0) <= 0.2));
+
+    // a prismatic joint along z
+    var pr: DhChain = dh_chain_new();
+    dh_chain_add(&mut pr, dh_prismatic(0.0, 0.0, 0.0, 0.25));
+    var one: Vec<f64> = Vec::new();
+    one.push(1.0);
+    val jz: DMat = dh_jacobian(&pr, &one);
+    println("prismatic: " + rmath_vec3_str(dh_fk(&pr, &one).trans, 6) + " jacobian z column = (" + rmath_fmt(dm_get(&jz, 0, 0), 6) + ", " + rmath_fmt(dm_get(&jz, 1, 0), 6) + ", " + rmath_fmt(dm_get(&jz, 2, 0), 6) + ")");
+    return 0;
+}

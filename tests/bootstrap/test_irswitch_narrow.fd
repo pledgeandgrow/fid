@@ -1,0 +1,227 @@
+// ME28: a `match` on a narrow integer (u8, u16, i16, i32, u32) with four
+// or more keys becomes one Inst::Switch like a match on an i64 (ir.fd
+// IrFunction_form_switches, ir_sw_word): a C `switch` on the C path; on
+// nat_ir a jump table (MI27: digit, opcode, small_dense), a bit test
+// (is_space) or a tree of compares (sparse16, big32). Every backend holds a
+// narrow value in its canonical form (zero-extended when unsigned,
+// sign-extended when signed) and compares the whole word, so the switch
+// gives what the compare chain gives. Keys out of the type's range never
+// match. Every backend must print the same; FID_SWITCH=off turns the
+// forming off (tests/nattools/machine_switch_narrow_check.sh).
+// Expected output:
+// 0 1 2 3 4 5 6 7 8 9 -1 -1
+// 1 1 1 1 0 0
+// 10 20 30 40 0 0
+// add sub mul div mod ? ?
+// 7 8 9 10 0 0
+// 1 2 3 4 0
+// 2 3 1 -1
+// 15 -1
+
+struct Op {
+    code: u8,
+    width: u16,
+}
+
+/// Ten keys in a span of ten (48..57): a jump table
+fn digit(c: u8) -> i64 {
+    match c {
+        48 => {
+            return 0;
+        }
+        49 => {
+            return 1;
+        }
+        50 => {
+            return 2;
+        }
+        51 => {
+            return 3;
+        }
+        52 => {
+            return 4;
+        }
+        53 => {
+            return 5;
+        }
+        54 => {
+            return 6;
+        }
+        55 => {
+            return 7;
+        }
+        56 => {
+            return 8;
+        }
+        57 => {
+            return 9;
+        }
+        _ => {
+            return 0 - 1;
+        }
+    }
+}
+
+/// Four keys within 64 values going to one block: a bit test
+fn is_space(c: u8) -> i64 {
+    match c {
+        32 => {
+            return 1;
+        }
+        9 => {
+            return 1;
+        }
+        10 => {
+            return 1;
+        }
+        13 => {
+            return 1;
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+/// Far apart keys of a u16 (the largest one included): a tree
+fn sparse16(w: u16) -> i64 {
+    match w {
+        1 => {
+            return 10;
+        }
+        1000 => {
+            return 20;
+        }
+        30000 => {
+            return 30;
+        }
+        65535 => {
+            return 40;
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+/// The value read from a u8 field of a struct
+fn opcode(op: Op) -> str {
+    match op.code {
+        1 => {
+            return "add";
+        }
+        2 => {
+            return "sub";
+        }
+        3 => {
+            return "mul";
+        }
+        4 => {
+            return "div";
+        }
+        5 => {
+            return "mod";
+        }
+        _ => {
+            return "?";
+        }
+    }
+}
+
+/// i16, dense, a value that went through arithmetic
+fn small_dense(x: i16) -> i64 {
+    match x + 1 {
+        101 => {
+            return 7;
+        }
+        102 => {
+            return 8;
+        }
+        103 => {
+            return 9;
+        }
+        104 => {
+            return 10;
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+/// i32 and u32 keys, one above i32's range
+fn big32(x: u32) -> i64 {
+    match x {
+        7 => {
+            return 1;
+        }
+        70000 => {
+            return 2;
+        }
+        3000000000 => {
+            return 3;
+        }
+        4294967295 => {
+            return 4;
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+fn signed32(x: i32) -> i64 {
+    match x {
+        5 => {
+            return 1;
+        }
+        6 => {
+            return 2;
+        }
+        7 => {
+            return 3;
+        }
+        2147483647 => {
+            return 4;
+        }
+        _ => {
+            return 0 - 1;
+        }
+    }
+}
+
+fn main() {
+    var line: str = "";
+    var c: i64 = 48;
+    while c <= 57 {
+        line = line + int_to_str(digit(c as u8)) + " ";
+        c = c + 1;
+    }
+    println(line + int_to_str(digit(47 as u8)) + " " + int_to_str(digit(255 as u8)));
+    println(int_to_str(is_space(32 as u8)) + " " + int_to_str(is_space(9 as u8)) + " " + int_to_str(is_space(10 as u8)) + " " + int_to_str(is_space(13 as u8)) + " " + int_to_str(is_space(11 as u8)) + " " + int_to_str(is_space(160 as u8)));
+    println(int_to_str(sparse16(1 as u16)) + " " + int_to_str(sparse16(1000 as u16)) + " " + int_to_str(sparse16(30000 as u16)) + " " + int_to_str(sparse16(65535 as u16)) + " " + int_to_str(sparse16(2 as u16)) + " " + int_to_str(sparse16(0 as u16)));
+    var ops: str = "";
+    var k: i64 = 1;
+    while k <= 7 {
+        val op: Op = Op { code: k as u8, width: 8 as u16 };
+        ops = ops + opcode(op);
+        if k < 7 {
+            ops = ops + " ";
+        }
+        k = k + 1;
+    }
+    println(ops);
+    println(int_to_str(small_dense(100 as i16)) + " " + int_to_str(small_dense(101 as i16)) + " " + int_to_str(small_dense(102 as i16)) + " " + int_to_str(small_dense(103 as i16)) + " " + int_to_str(small_dense(99 as i16)) + " " + int_to_str(small_dense(104 as i16)));
+    println(int_to_str(big32(7 as u32)) + " " + int_to_str(big32(70000 as u32)) + " " + int_to_str(big32(3000000000 as u32)) + " " + int_to_str(big32(4294967295 as u32)) + " " + int_to_str(big32(8 as u32)));
+    println(int_to_str(signed32(6 as i32)) + " " + int_to_str(signed32(7 as i32)) + " " + int_to_str(signed32(5 as i32)) + " " + int_to_str(signed32((0 - 6) as i32)));
+    // a byte that went through u8 additions (250..254: no key)
+    var b: u8 = 250 as u8;
+    var s: i64 = 0;
+    var j: i64 = 0;
+    while j < 5 {
+        s = s + is_space(b);
+        b = b + (1 as u8);
+        j = j + 1;
+    }
+    println(int_to_str(digit(53 as u8) * 3) + " " + int_to_str(s - 1));
+}

@@ -38,7 +38,7 @@ when no exploit is shown:
 - **The standard library's parsers and network code**: HTTP, TLS, WebSocket,
   JSON, compression decoders and the like, given hostile input.
 - **The installer and release artifacts**: anything that lets a release or
-  `Fides-Setup-*.exe` run code the user did not ask for.
+  `Fid-Setup-*.exe` (`Fides-Setup-*.exe` up to 0.8.0) run code the user did not ask for.
 - **The compiler itself** on hostile source: a crash is a normal bug, but
   code execution, writing files outside the output path, or reading secrets
   is a security bug.

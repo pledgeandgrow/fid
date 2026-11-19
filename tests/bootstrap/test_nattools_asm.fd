@@ -1,0 +1,74 @@
+// competitive-roadmap LG13: `asm!` in a normal process on the machine-layer
+// targets (Linux x86-64/AArch64/RISC-V, --nat), by the rule pe_ir already
+// follows: nat_ir.fd runs each template in a thunk of its own (nat_enc.fd
+// nat_asm_thunk: the callee-saved registers saved, the inputs moved into
+// the named registers, an output that is not an input set to 0 first, the
+// output back): x86-64 through pe_asm_encode, AArch64 and RISC-V through
+// nat_enc.fd nat_asm_encode. A privileged or unknown instruction gives 0
+// (so test_asm.fd, which writes `hlt`, keeps working); FID_NAT_OFF=asm
+// gives 0 always, as does the interpreter. The C path runs the template too
+// (codegen_c.fd CCodeGen_gen_asm, GNU inline asm). Both results print
+// "ok" here: 42 and 38 where the template runs, 0 where it does not.
+// Native check: NATIVE=1 bash scripts/cross-test.sh x86_64-linux (and
+// aarch64-linux, riscv64-linux); scripts/nat-tools-check.sh runs the
+// x86-64 build and checks the values.
+// Expected output:
+// asm add ok
+// asm sub ok
+
+@cfg(arch = "x86_64")
+fn add_asm(a: i64, b: i64) -> i64 {
+    return asm!("mov rax, rdi; add rax, rsi", in("rdi") a, in("rsi") b, out("rax") a);
+}
+
+@cfg(arch = "x86_64")
+fn sub_asm(a: i64, b: i64) -> i64 {
+    // the inputs in other registers than they arrive in, rbx callee-saved
+    return asm!("mov rbx, rcx; sub rbx, rdx; mov rax, rbx", in("rcx") a, in("rdx") b, out("rax") a);
+}
+
+@cfg(arch = "aarch64")
+fn add_asm(a: i64, b: i64) -> i64 {
+    return asm!("add x0, x1, x2", in("x1") a, in("x2") b, out("x0") a);
+}
+
+@cfg(arch = "aarch64")
+fn sub_asm(a: i64, b: i64) -> i64 {
+    return asm!("sub x19, x4, x5; mov x3, x19", in("x4") a, in("x5") b, out("x3") a);
+}
+
+@cfg(arch = "riscv64")
+fn add_asm(a: i64, b: i64) -> i64 {
+    return asm!("add a0, a1, a2", in("a1") a, in("a2") b, out("a0") a);
+}
+
+@cfg(arch = "riscv64")
+fn sub_asm(a: i64, b: i64) -> i64 {
+    return asm!("sub s2, s3, s4; mv t3, s2", in("s3") a, in("s4") b, out("t3") a);
+}
+
+// WebAssembly has no inline assembly: the 0 of the default
+@cfg(arch = "wasm32")
+fn add_asm(a: i64, b: i64) -> i64 {
+    return 0;
+}
+
+@cfg(arch = "wasm32")
+fn sub_asm(a: i64, b: i64) -> i64 {
+    return 0;
+}
+
+fn check(name: str, r: i64, want: i64) {
+    if r == 0 || r == want {
+        print(name + " ok\n");
+    } else {
+        print(name + " wrong: ");
+        print(r);
+        print("\n");
+    }
+}
+
+fn main() {
+    check("asm add", add_asm(40, 2), 42);
+    check("asm sub", sub_asm(40, 2), 38);
+}

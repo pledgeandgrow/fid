@@ -1,0 +1,95 @@
+SP3: the mid-end works on what main reaches
+===========================================
+llvm-roadmap Track SP (SP3: `fid emit` of hello under 0.5 s, then under
+0.1 s). Nov 17. Code in compiler/iropt.fd, compiler/rules.fd,
+compiler/egraph.fd; test tests/bootstrap/test_sp3_midend_reach.fd; check
+tests/tooling/sp3-hello-check.sh. Written, type-checked with the stage-0
+compiler (`fid check` of the three files: no errors); not built yet.
+
+Where hello's time went (stage-0 compiler, -O0, before this change)
+-------------------------------------------------------------------
+`emit tests/bootstrap/hello.fd --time` (pe_ir, the Windows default):
+  total 6555 ms: inc check 237, stdlib 313, typecheck 516, mono 370,
+  front end 1459, lower 2164, iropt 1247, native code 1446.
+  iropt's rows: hofspec 498, inline 167, licmcall 130, gconst 79,
+  closuredevirt 73, every per-function pass together under 150.
+  FID_IROPT_STATS=1: the per-function passes ran on 24 functions (991
+  instructions); the module passes above ran on every function of the
+  module (the whole merged runtime and core's p_* functions, which the
+  PE88 prune keeps because machine code may call them by name).
+`--target x86_64-linux` (nat_ir; the rules and the e-graph run there):
+  iropt 3260 (hofspec 915, inline 233, licmcall 222, gconst 116,
+  closuredevirt 118), rules 444, egraph 1670, total 12206.
+The roadmap's -O2 numbers (631 ms: front end 138, lower 185, mid-end 256,
+native 43) have the same shape: the mid-end's time was mostly module
+passes over functions hello never runs.
+
+What changed
+------------
+iropt.fd, the CS1 rule ("only what main reaches is worth optimizing") now
+holds for the whole mid-end, not only for iropt's per-function loop:
+  - iro_mid_reach(module): a table of what main reaches
+    (pe_ir_reachable_functions), 0 (every function) without main or with
+    FID_IROPT_OFF=midreach. iro_in_reach(reach, name).
+  - iropt_native computes it first (`reach0`, a `midreach` row in the
+    timing table) and gives it to closuredevirt's loop, hofspec
+    (iro_hof_specialize_in) and inline (iro_inline_in). Functions added
+    after it (hofspec's and dynspec's clones) join it before inlining.
+  - gconst (iro_const_globals_in): which globals are never written is
+    still decided over every function (a runtime function machine code
+    calls may store one); the loads are folded in reached functions only.
+    A function that takes no candidate global's address costs one scan
+    and no tables (it allocated two value-sized tables per function per
+    phase).
+  - The effect masks (iro_effect_masks_in) and the quiet functions
+    (iro_quiet_fns_in) are computed for the reached functions and their
+    callees, transitively (iro_call_closure, following Inst::Call through
+    IrModule_fn_pos exactly as iro_local_ext_mask and iro_quiet_inst find
+    callees): those get the same answer as over the whole module; the
+    rest get IRO_EB_ALL (every effect) and "not quiet". iro_effect_masks
+    and iro_quiet_fns keep their old meaning (every function).
+  - hofspec: the exclusion sets (taken, dyn targets, externs) are tables
+    (were list searches per call of every function), and only a caller
+    that calls a function containing a CallPtr is examined (its use lists
+    built); every other function had iro_uses built for nothing.
+rules.fd rules_run and egraph.fd egraph_run: skip what iro_mid_reach
+  leaves out (the rules' masks through iro_effect_masks_in; a skipped
+  function pushes an "unknown" entry on the memo chain, so the e-graph's
+  chain stays aligned).
+
+Why it is sound
+---------------
+Every pass touched is an optimization of one function at a time, so a
+function left out is correct, only less optimized. The facts these passes
+read about other functions (masks, quiet, never-written globals) are, for
+every function they change, the same as before: its callees are in the
+closure, and the global write scan still covers everything. The native
+backends compile what main reaches plus the runtime functions machine code
+starts by name (pe_rt_init, ...); iropt's per-function passes already
+left those out (CS1), now the module passes, rules and e-graph do too.
+FID_IROPT_OFF=midreach restores the old behaviour exactly.
+
+How to validate (with the final compiler, $FID)
+-----------------------------------------------
+  FID=$FID bash tests/tooling/sp3-hello-check.sh
+    every line OK: the new test and hello print their expected output on
+    pe_ir and --nat, default and FID_IROPT_OFF=midreach (FID_VERIFY=1);
+    "[egraph] functions" on hello --nat smaller by default.
+  FID=$FID TIME=1 bash tests/tooling/sp3-hello-check.sh   (quiet machine,
+    release -O2 compiler)
+    the best warm total under 500 ms is the first SP3 target; the INFO
+    lines give the rows to record here and in the roadmap.
+  FID=$FID SUITE=1 NAT=1 JOBS=4 bash tests/tooling/sp3-hello-check.sh
+    both suite lines end "0 differ".
+
+What is left for SP3 (not in the mid-end's files)
+-------------------------------------------------
+  - Lowering (lower 185 ms of 631 at -O2) lowers every core and runtime
+    function: main.fd lw_keep_set roots every core name in reach.fd,
+    because lowering emits calls to core functions by name. A cache of
+    lowered core/runtime functions next to the binary stdlib (keyed like
+    astcache: library hashes + compiler hash) needs compiler.fd/main.fd/
+    lower.fd (driver and lowering groups); ir_ser.fd already serializes IR.
+  - The front end (typecheck, mono), `inc check` (hashing the compiler's
+    executable, inc.fd), stdlib load: other groups.
+  - Both targets are to be measured with the final -O2 compiler.

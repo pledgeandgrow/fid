@@ -1,0 +1,68 @@
+// stdlib/entropy: the worked examples of NIST SP 800-22 (§2.1.8 monobit,
+// §2.2.8 block frequency, §2.3.8 runs, §2.4.8 longest run, §2.13.8
+// cumulative sums: the 10-bit and 100-bit examples), erfc and log-gamma
+// against Python's math module, and the byte statistics (Shannon entropy,
+// SP 800-90B most-common-value min-entropy, chi-square and its p-value,
+// mean, serial correlation) on fixed data and on 4096 SHA-256 counter
+// bytes, all checked against a Python model of the same formulas. (The
+// longest-run example prints 0.180598; SP 800-22 rounds it to 0.180609
+// from its 4-digit class probabilities.)
+// Expected output:
+// monobit 0.527089 0.109599
+// block 0.801252 0.706438
+// runs 0.147232 0.500798
+// longest 0.180598
+// cusum 0.411659 0.219194 0.114866
+// erfc 0.671373240541 0.016209541409 1.924906e-13 1.742100964708
+// lgamma 489.130370430643
+// shannon 0.918296 8.000000 7.997152
+// mcv 6.573891 chi 4.000000 p 1.000000
+// mean 126.500000 serial 0.839465
+// sha256 stream 7.956372 6.579630 241.000000 0.726410
+// sha256 bits 0.558163 0.471490 0.086262 0.768464 0.614945
+// constant shannon 0.000000 min 0.000000
+use entropy;
+use crypto;
+use vec;
+
+fn main() {
+    val e10: Vec<i64> = entropy_bits_from_str("1011010101");
+    val e100: Vec<i64> = entropy_bits_from_str("1100100100001111110110101010001000100001011010001100001000110100110001001100011001100010100010111000");
+    val e128: Vec<i64> = entropy_bits_from_str("11001100000101010110110001001100111000000000001001001101010100010001001111010110100000001101011111001100111001101101100010110010");
+    println("monobit " + entropy_fmt(entropy_monobit(e10), 6) + " " + entropy_fmt(entropy_monobit(e100), 6));
+    println("block " + entropy_fmt(entropy_block_frequency(entropy_bits_from_str("0110011010"), 3), 6) + " " + entropy_fmt(entropy_block_frequency(e100, 10), 6));
+    println("runs " + entropy_fmt(entropy_runs(entropy_bits_from_str("1001101011")), 6) + " " + entropy_fmt(entropy_runs(e100), 6));
+    println("longest " + entropy_fmt(entropy_longest_run(e128), 6));
+    println("cusum " + entropy_fmt(entropy_cusum(entropy_bits_from_str("1011010111"), false), 6) + " " + entropy_fmt(entropy_cusum(e100, false), 6) + " " + entropy_fmt(entropy_cusum(e100, true), 6));
+    val tiny: f64 = entropy_erfc(5.2) * 1000000000000000000.0;
+    println("erfc " + entropy_fmt(entropy_erfc(0.3), 12) + " " + entropy_fmt(entropy_erfc(1.7), 12) + " " + entropy_fmt(tiny / 100000.0, 6) + "e-13 " + entropy_fmt(entropy_erfc(-0.8), 12));
+    println("lgamma " + entropy_fmt(entropy_lgamma(127.5), 12));
+    var aab: Vec<i64> = Vec::new();
+    aab.push(97); aab.push(97); aab.push(98);
+    var all: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { all.push(i); i = i + 1; }
+    var data: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 1024 { data.push((i * 7 + (i >> 3)) & 255); i = i + 1; }
+    println("shannon " + entropy_fmt(entropy_shannon(aab), 6) + " " + entropy_fmt(entropy_shannon(all), 6) + " " + entropy_fmt(entropy_shannon(data), 6));
+    println("mcv " + entropy_fmt(entropy_min_mcv(data), 6) + " chi " + entropy_fmt(entropy_chi_square(data), 6) + " p " + entropy_fmt(entropy_chi_square_p(data), 6));
+    println("mean " + entropy_fmt(entropy_mean(data), 6) + " serial " + entropy_fmt(entropy_serial_correlation(data), 6));
+    var rd: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 128 {
+        var m: Vec<i64> = str_bytes("entropy test ");
+        m.push(i);
+        val d: Vec<i64> = crypto_sha256_bytes(m);
+        var k: i64 = 0;
+        while k < 32 { rd.push(d.get(k)); k = k + 1; }
+        i = i + 1;
+    }
+    println("sha256 stream " + entropy_fmt(entropy_shannon(rd), 6) + " " + entropy_fmt(entropy_min_mcv(rd), 6) + " " + entropy_fmt(entropy_chi_square(rd), 6) + " " + entropy_fmt(entropy_chi_square_p(rd), 6));
+    val b: Vec<i64> = entropy_bits(rd);
+    println("sha256 bits " + entropy_fmt(entropy_monobit(b), 6) + " " + entropy_fmt(entropy_runs(b), 6) + " " + entropy_fmt(entropy_block_frequency(b, 128), 6) + " " + entropy_fmt(entropy_cusum(b, false), 6) + " " + entropy_fmt(entropy_longest_run(b), 6));
+    var con: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 100 { con.push(42); i = i + 1; }
+    println("constant shannon " + entropy_fmt(entropy_shannon(con), 6) + " min " + entropy_fmt(entropy_min_mcv(con), 6));
+}

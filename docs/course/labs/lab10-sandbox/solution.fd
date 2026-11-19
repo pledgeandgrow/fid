@@ -1,0 +1,55 @@
+// Lab 10 solution: running untrusted scoring code in a sandbox.
+//! lab: 10
+//! check: runs
+//! playground: yes
+
+struct Ranking { scores: Vec<i64>, log: Vec<str> }
+
+fn vowel_score(w: str) -> i64 {
+    var n: i64 = 0;
+    for i in 0..str_len(w) {
+        val c: i64 = str_byte_at(w, i);
+        if c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' { n = n + 1; }
+    }
+    return n * 10 + str_len(w);
+}
+
+// The plugin's log is data it returns, not output it performs: the
+// sandbox grants no capability, and the host decides what to print.
+fn ranked(words: Vec<str>) -> Ranking {
+    var out: Vec<i64> = Vec::new();
+    var log: Vec<str> = Vec::new();
+    for w in words {
+        out.push(vowel_score(w));
+        log.push("scored " + w);
+    }
+    out.sort();
+    return Ranking { scores: out, log: log };
+}
+
+@wrapping
+fn mix(h: i64, c: i64) -> i64 { return h * 31 + c; }
+
+// The one place where a value derived from the secret may reach output.
+@declassify
+fn fingerprint(@secret key: str) -> i64 {
+    var h: i64 = 7;
+    for i in 0..str_len(key) { h = mix(h, str_byte_at(key, i)); }
+    return h % 100000;
+}
+
+fn main() -> i64 {
+    var words: Vec<str> = Vec::new();
+    words.push("audio");
+    words.push("rhythm");
+    words.push("queue");
+    var r: Ranking = Ranking { scores: Vec::new(), log: Vec::new() };
+    sandbox {
+        r = ranked(words);
+    }
+    for line in r.log { println("plugin: " + line); }
+    for s in r.scores { println(int_to_str(s)); }
+    @secret val key: str = "hunter2";
+    println("key fingerprint " + int_to_str(fingerprint(key)));
+    return 0;
+}

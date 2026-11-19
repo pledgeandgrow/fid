@@ -1,0 +1,409 @@
+// regex (roadmap BM4, real work): a regex matcher written by hand, the same
+// algorithm in every language (Rust's standard library has no regex and
+// run.sh fetches no crates; Go and C++ do not use regexp / std::regex).
+// The matcher is Thompson's: a recursive-descent parser turns a pattern
+// (bytes, `.`, classes `[a-z]` `[^u]`, `\d` `\w` `\s`, groups, `|`, `*` `+`
+// `?`) into NFA states; a simulation over two state lists, with a mark per
+// state, tells whether a line holds a match anywhere (a new thread starts at
+// every byte), in time linear in the line. The text is 200000 lines (7.2
+// MB) of words, numbers, dictionary words and dashed numbers from a fixed
+// linear congruential generator. Prints the sum over the 8 patterns of
+// (pattern number) * (lines that match): 1368014.
+// tests/bootstrap/test_verify_bm_regex.fd: 12 lines written by hand (45), then
+// 20 generated lines (146).
+
+fn rnd(s: &mut Vec<i64>) -> i64 {
+    val x: i64 = (s.get(0) * 1103515245 + 12345) % 2147483648;
+    s.set(0, x);
+    return x >> 8;
+}
+
+fn dict_word(k: i64) -> str {
+    if k == 0 { return "cat"; }
+    if k == 1 { return "dogs"; }
+    if k == 2 { return "fox"; }
+    if k == 3 { return "bird"; }
+    if k == 4 { return "king"; }
+    if k == 5 { return "queen"; }
+    if k == 6 { return "xyz"; }
+    return "banana";
+}
+
+fn pattern(k: i64) -> str {
+    if k == 0 { return "ab+c"; }
+    if k == 1 { return "(cat|dogs?|fox) [a-z]+"; }
+    if k == 2 { return "[0-9][0-9]-[0-9]+"; }
+    if k == 3 { return "x.*y.*z"; }
+    if k == 4 { return "q[^u]"; }
+    if k == 5 { return "[aeiou][aeiou][aeiou]"; }
+    if k == 6 { return "k(e|i)?ng"; }
+    return "\\d+-\\d\\d\\d\\d";
+}
+
+fn gen_text(lines: i64) -> Vec<u8> {
+    var o: Vec<u8> = Vec::new();
+    var s: Vec<i64> = Vec::new();
+    s.push(1);
+    var l: i64 = 0;
+    while l < lines {
+        val w: i64 = 3 + rnd(&mut s) % 8;
+        var j: i64 = 0;
+        while j < w {
+            if j > 0 {
+                o.push(32);
+            }
+            val k: i64 = rnd(&mut s) % 10;
+            if k < 6 {
+                val n: i64 = 2 + rnd(&mut s) % 7;
+                var i: i64 = 0;
+                while i < n {
+                    o.push((97 + rnd(&mut s) % 26) as u8);
+                    i = i + 1;
+                }
+            } else if k < 8 {
+                val n: i64 = 1 + rnd(&mut s) % 5;
+                var i: i64 = 0;
+                while i < n {
+                    o.push((48 + rnd(&mut s) % 10) as u8);
+                    i = i + 1;
+                }
+            } else if k == 8 {
+                val wd: str = dict_word(rnd(&mut s) % 8);
+                val wn: i64 = str_len(wd);
+                var i: i64 = 0;
+                while i < wn {
+                    o.push(str_byte_at(wd, i) as u8);
+                    i = i + 1;
+                }
+            } else {
+                val n: i64 = 1 + rnd(&mut s) % 3;
+                var i: i64 = 0;
+                while i < n {
+                    o.push((48 + rnd(&mut s) % 10) as u8);
+                    i = i + 1;
+                }
+                o.push(45);
+                val n2: i64 = 1 + rnd(&mut s) % 4;
+                i = 0;
+                while i < n2 {
+                    o.push((48 + rnd(&mut s) % 10) as u8);
+                    i = i + 1;
+                }
+            }
+            j = j + 1;
+        }
+        o.push(10);
+        l = l + 1;
+    }
+    return o;
+}
+
+// NFA states. Kinds: 0 byte `arg`, 1 any byte but newline, 2 class `arg`
+// (256 entries of `cls` from arg * 256), 3 split (out1 and out2), 4 empty
+// (out1), 5 match. A fragment is a start state and an end state, an empty
+// state whose out1 is set when the fragment is joined to what follows; it
+// travels packed as start * 65536 + end.
+struct Nfa {
+    pat: str,
+    pos: i64,
+    kind: Vec<i64>,
+    arg: Vec<i64>,
+    out1: Vec<i64>,
+    out2: Vec<i64>,
+    cls: Vec<u8>,
+}
+
+fn nfa_st(n: &mut Nfa, k: i64, a: i64, o1: i64, o2: i64) -> i64 {
+    n.kind.push(k);
+    n.arg.push(a);
+    n.out1.push(o1);
+    n.out2.push(o2);
+    return n.kind.len() - 1;
+}
+
+fn frag(s: i64, e: i64) -> i64 {
+    return s * 65536 + e;
+}
+
+fn frag_start(f: i64) -> i64 {
+    return f / 65536;
+}
+
+fn frag_end(f: i64) -> i64 {
+    return f % 65536;
+}
+
+fn pat_at(n: &Nfa, i: i64) -> i64 {
+    return str_byte_at(n.pat, i);
+}
+
+fn nfa_new_class(n: &mut Nfa) -> i64 {
+    val id: i64 = n.cls.len() / 256;
+    var i: i64 = 0;
+    while i < 256 {
+        n.cls.push(0);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn class_add_esc(n: &mut Nfa, base: i64, e: i64) {
+    if e == 100 {
+        var c: i64 = 48;
+        while c < 58 {
+            n.cls.set(base + c, 1);
+            c = c + 1;
+        }
+    } else if e == 119 {
+        var c: i64 = 0;
+        while c < 256 {
+            if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 {
+                n.cls.set(base + c, 1);
+            }
+            c = c + 1;
+        }
+    } else if e == 115 {
+        n.cls.set(base + 32, 1);
+        n.cls.set(base + 9, 1);
+        n.cls.set(base + 10, 1);
+        n.cls.set(base + 13, 1);
+    } else {
+        n.cls.set(base + e, 1);
+    }
+}
+
+fn re_atom(n: &mut Nfa) -> i64 {
+    val c: i64 = pat_at(n, n.pos);
+    if c == 40 {
+        n.pos = n.pos + 1;
+        val f: i64 = re_alt(n);
+        // ')'
+        n.pos = n.pos + 1;
+        return f;
+    }
+    val e: i64 = nfa_st(n, 4, 0, -1, -1);
+    if c == 46 {
+        n.pos = n.pos + 1;
+        return frag(nfa_st(n, 1, 0, e, -1), e);
+    }
+    if c == 91 {
+        n.pos = n.pos + 1;
+        val id: i64 = nfa_new_class(n);
+        val base: i64 = id * 256;
+        var neg: bool = false;
+        if pat_at(n, n.pos) == 94 {
+            neg = true;
+            n.pos = n.pos + 1;
+        }
+        val plen: i64 = str_len(n.pat);
+        while pat_at(n, n.pos) != 93 {
+            val a: i64 = pat_at(n, n.pos);
+            if a == 92 {
+                class_add_esc(n, base, pat_at(n, n.pos + 1));
+                n.pos = n.pos + 2;
+            } else if n.pos + 2 < plen && pat_at(n, n.pos + 1) == 45 && pat_at(n, n.pos + 2) != 93 {
+                val b: i64 = pat_at(n, n.pos + 2);
+                var x: i64 = a;
+                while x <= b {
+                    n.cls.set(base + x, 1);
+                    x = x + 1;
+                }
+                n.pos = n.pos + 3;
+            } else {
+                n.cls.set(base + a, 1);
+                n.pos = n.pos + 1;
+            }
+        }
+        n.pos = n.pos + 1;
+        if neg {
+            var x: i64 = 0;
+            while x < 256 {
+                n.cls.set(base + x, (1 - (n.cls.get(base + x) as i64)) as u8);
+                x = x + 1;
+            }
+            n.cls.set(base + 10, 0);
+        }
+        return frag(nfa_st(n, 2, id, e, -1), e);
+    }
+    if c == 92 {
+        val esc: i64 = pat_at(n, n.pos + 1);
+        n.pos = n.pos + 2;
+        if esc == 100 || esc == 119 || esc == 115 {
+            val id: i64 = nfa_new_class(n);
+            class_add_esc(n, id * 256, esc);
+            return frag(nfa_st(n, 2, id, e, -1), e);
+        }
+        return frag(nfa_st(n, 0, esc, e, -1), e);
+    }
+    n.pos = n.pos + 1;
+    return frag(nfa_st(n, 0, c, e, -1), e);
+}
+
+fn re_repeat(n: &mut Nfa) -> i64 {
+    var f: i64 = re_atom(n);
+    val plen: i64 = str_len(n.pat);
+    while n.pos < plen && (pat_at(n, n.pos) == 42 || pat_at(n, n.pos) == 43 || pat_at(n, n.pos) == 63) {
+        val op: i64 = pat_at(n, n.pos);
+        n.pos = n.pos + 1;
+        val e: i64 = nfa_st(n, 4, 0, -1, -1);
+        val s: i64 = nfa_st(n, 3, 0, frag_start(f), e);
+        if op == 42 {
+            n.out1.set(frag_end(f), s);
+            f = frag(s, e);
+        } else if op == 43 {
+            n.out1.set(frag_end(f), s);
+            f = frag(frag_start(f), e);
+        } else {
+            n.out1.set(frag_end(f), e);
+            f = frag(s, e);
+        }
+    }
+    return f;
+}
+
+fn re_concat(n: &mut Nfa) -> i64 {
+    var f: i64 = -1;
+    val plen: i64 = str_len(n.pat);
+    while n.pos < plen && pat_at(n, n.pos) != 124 && pat_at(n, n.pos) != 41 {
+        val g: i64 = re_repeat(n);
+        if f < 0 {
+            f = g;
+        } else {
+            n.out1.set(frag_end(f), frag_start(g));
+            f = frag(frag_start(f), frag_end(g));
+        }
+    }
+    if f < 0 {
+        val e: i64 = nfa_st(n, 4, 0, -1, -1);
+        f = frag(e, e);
+    }
+    return f;
+}
+
+fn re_alt(n: &mut Nfa) -> i64 {
+    var f: i64 = re_concat(n);
+    val plen: i64 = str_len(n.pat);
+    while n.pos < plen && pat_at(n, n.pos) == 124 {
+        n.pos = n.pos + 1;
+        val g: i64 = re_concat(n);
+        val e: i64 = nfa_st(n, 4, 0, -1, -1);
+        val s: i64 = nfa_st(n, 3, 0, frag_start(f), frag_start(g));
+        n.out1.set(frag_end(f), e);
+        n.out1.set(frag_end(g), e);
+        f = frag(s, e);
+    }
+    return f;
+}
+
+// The simulation's state: mark[s] == gen when s is already in the list
+// being built; the two lists live in `lists` (list w from w * m, `lens`
+// holds their lengths), so they are swapped by flipping an index.
+struct RSim {
+    m: i64,
+    gen: i64,
+    matched: bool,
+    mark: Vec<i64>,
+    lists: Vec<i64>,
+    lens: Vec<i64>,
+}
+
+fn addstate(n: &Nfa, sim: &mut RSim, w: i64, s: i64) {
+    if s < 0 {
+        return;
+    }
+    if sim.mark.get(s) == sim.gen {
+        return;
+    }
+    sim.mark.set(s, sim.gen);
+    val k: i64 = n.kind.get(s);
+    if k == 3 {
+        addstate(n, sim, w, n.out1.get(s));
+        addstate(n, sim, w, n.out2.get(s));
+    } else if k == 4 {
+        addstate(n, sim, w, n.out1.get(s));
+    } else if k == 5 {
+        sim.matched = true;
+    } else {
+        val len: i64 = sim.lens.get(w);
+        sim.lists.set(w * sim.m + len, s);
+        sim.lens.set(w, len + 1);
+    }
+}
+
+fn match_line(n: &Nfa, start: i64, sim: &mut RSim, t: &Vec<u8>, a: i64, b: i64) -> bool {
+    sim.gen = sim.gen + 1;
+    sim.matched = false;
+    var cur: i64 = 0;
+    sim.lens.set(0, 0);
+    var i: i64 = a;
+    while true {
+        addstate(n, sim, cur, start);
+        if sim.matched {
+            return true;
+        }
+        if i == b {
+            return false;
+        }
+        val c: i64 = t.get(i) as i64;
+        sim.gen = sim.gen + 1;
+        val nxt: i64 = 1 - cur;
+        sim.lens.set(nxt, 0);
+        val cnt: i64 = sim.lens.get(cur);
+        var j: i64 = 0;
+        while j < cnt {
+            val s: i64 = sim.lists.get(cur * sim.m + j);
+            val k: i64 = n.kind.get(s);
+            val arg: i64 = n.arg.get(s);
+            if (k == 0 && arg == c) || (k == 1 && c != 10) || (k == 2 && (n.cls.get(arg * 256 + c) as i64) == 1) {
+                addstate(n, sim, nxt, n.out1.get(s));
+            }
+            j = j + 1;
+        }
+        if sim.matched {
+            return true;
+        }
+        cur = nxt;
+        i = i + 1;
+    }
+    return false;
+}
+
+fn re_count(p: str, t: &Vec<u8>) -> i64 {
+    var n: Nfa = Nfa { pat: p, pos: 0, kind: Vec::new(), arg: Vec::new(), out1: Vec::new(), out2: Vec::new(), cls: Vec::new() };
+    val f: i64 = re_alt(&mut n);
+    val ms: i64 = nfa_st(&mut n, 5, 0, -1, -1);
+    n.out1.set(frag_end(f), ms);
+    val start: i64 = frag_start(f);
+    val m: i64 = n.kind.len();
+    var sim: RSim = RSim { m: m, gen: 0, matched: false, mark: Vec::filled(m, 0), lists: Vec::filled(2 * m, 0), lens: Vec::filled(2, 0) };
+    var cnt: i64 = 0;
+    var a: i64 = 0;
+    val len: i64 = t.len();
+    while a < len {
+        var b: i64 = a;
+        while (t.get(b) as i64) != 10 {
+            b = b + 1;
+        }
+        if match_line(&n, start, &mut sim, t, a, b) {
+            cnt = cnt + 1;
+        }
+        a = b + 1;
+    }
+    return cnt;
+}
+
+fn regex_run(lines: i64) -> i64 {
+    val t: Vec<u8> = gen_text(lines);
+    var total: i64 = 0;
+    var k: i64 = 0;
+    while k < 8 {
+        total = total + (k + 1) * re_count(pattern(k), &t);
+        k = k + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    println(regex_run(200000));
+    return 0;
+}

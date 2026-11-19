@@ -1,0 +1,51 @@
+// stdlib/sprite's controller and stdlib/streaming's chunk writes keep what
+// they change (release-roadmap N5: the lint's unused-parameter warnings on
+// sprite_controller_update's dt and streaming_set_chunk_data's value showed
+// both threw the change away; sprite_controller_play did not start the
+// track either).
+//
+// Expected output:
+// frames 0 1 2 0
+// track 1 frame 0
+// chunk 42 7 0
+// sprite and streaming ok
+use sprite;
+use streaming;
+
+fn check(label: str, ok: bool) {
+    if !ok {
+        p_panic("sprite/streaming: wrong " + label);
+    }
+}
+
+fn main() -> i64 {
+    var ctl = sprite_controller_create();
+    val walk = sprite_controller_add(& mut ctl, sprite_anim_create(3, 0.1));
+    val idle = sprite_controller_add(& mut ctl, sprite_anim_create(2, 0.5));
+    sprite_controller_play(& mut ctl, walk);
+    val f0 = sprite_controller_update(& mut ctl, 0.05);
+    val f1 = sprite_controller_update(& mut ctl, 0.06);
+    val f2 = sprite_controller_update(& mut ctl, 0.1);
+    val f3 = sprite_controller_update(& mut ctl, 0.1);
+    check("frames", f0 == 0 && f1 == 1 && f2 == 2 && f3 == 0);
+    println("frames " + int_to_str(f0) + " " + int_to_str(f1) + " " + int_to_str(f2) + " " + int_to_str(f3));
+    sprite_controller_play(& mut ctl, idle);
+    val g0 = sprite_controller_update(& mut ctl, 0.2);
+    check("track", sprite_controller_current_track(ctl) == idle && g0 == 0);
+    println("track " + int_to_str(sprite_controller_current_track(ctl)) + " frame " + int_to_str(g0));
+
+    var mgr = streaming_create(4, 1);
+    streaming_set_focus(& mut mgr, 0, 0);
+    streaming_update(& mut mgr);
+    check("loaded", streaming_is_chunk_loaded(mgr, 0, 0));
+    streaming_set_chunk_data(& mut mgr, 0, 0, 1, 2, 42);
+    streaming_set_chunk_data(& mut mgr, 0, 0, 3, 3, 7);
+    streaming_set_chunk_data(& mut mgr, 0, 0, 9, 0, 5);
+    val a = streaming_get_chunk_data(mgr, 0, 0, 1, 2);
+    val b = streaming_get_chunk_data(mgr, 0, 0, 3, 3);
+    val c = streaming_get_chunk_data(mgr, 0, 0, 0, 0);
+    check("chunk", a == 42 && b == 7 && c == 0);
+    println("chunk " + int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c));
+    println("sprite and streaming ok");
+    return 0;
+}

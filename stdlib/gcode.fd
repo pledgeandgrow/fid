@@ -1,0 +1,669 @@
+// Fides G-code library (robotics / CNC / 3D printing)
+//
+// A G-code interpreter front end and a toolpath generator:
+//   - Line parser: words (letter + number), `;` comments and `( )`
+//     comments, line numbers `N..` and the RepRap/Marlin checksum `*NN`
+//     (XOR of every byte before the `*`), case-insensitive letters,
+//     errors for a letter without a number or a bad checksum. The
+//     host-side sequence rule (each N is the previous plus one; M110 Nn
+//     sets the next number) is in `gcode_seq_check`.
+//   - Modal state: G90/G91 (absolute/relative XYZ), M82/M83 (absolute/
+//     relative E), G20/G21 (inches/mm, positions stored in mm), feed rate F
+//     (sticky), motion mode G0/G1/G2/G3 (sticky: "X5" after G1 is a G1),
+//     plane G17/G18/G19, G92 (set the current position), G28 (home: to 0).
+//   - Motion: G0/G1 as one linear move each; G2 (clockwise) and G3
+//     (counter-clockwise) arcs given by the centre offset (I J K) or the
+//     radius R (negative R: the arc longer than 180 degrees, as grbl and
+//     LinuxCNC read it), full circles when the end point is the start,
+//     helical arcs (the axis normal to the plane moves linearly), all cut
+//     into segments of at most `seg_mm` along the arc (Marlin's
+//     MM_PER_ARC_SEGMENT, default 1 mm). Every point is computed directly
+//     from the angle, so no error accumulates; the last point is the
+//     programmed end.
+//   - Generator: numbers in G-code style (up to 4 decimals, no trailing
+//     zeros), a line with N and checksum, and polylines/rectangles to
+//     G-code programs.
+//
+// Pure computation. The seam: a host sends the generated lines to a
+// machine over a serial port (stdlib/uart), and firmware feeds the
+// resulting `GMove`s to its planner and step generator (stdlib/motor).
+//
+// Usage:
+//   use gcode;
+//   var st: GState = gcode_state_new();
+//   val moves: Vec<GMove> = gcode_run_line(&mut st, "G2 X10 Y0 I5 J0 F600");
+
+module gcode;
+use math;
+use quat;
+
+// ─── Parsing ───
+
+/// One parsed line. `letters` holds the upper-case letter codes ('G' = 71)
+/// in order and `values` their numbers.
+pub struct GLine {
+    pub ok: bool,
+    pub error: str,
+    pub line_no: i64,
+    pub has_checksum: bool,
+    pub checksum: i64,
+    pub letters: Vec<i64>,
+    pub values: Vec<f64>,
+    pub comment: str,
+}
+
+/// XOR of the bytes of s (the RepRap checksum of what precedes the `*`).
+pub fn gcode_checksum(s: str) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        c = c ^ str_byte_at(s, i);
+        i = i + 1;
+    }
+    return c;
+}
+
+/// "N<n> <cmd>*<checksum>", the form a host sends to Marlin/RepRap firmware.
+pub fn gcode_with_checksum(n: i64, cmd: str) -> str {
+    val body: str = "N" + int_to_str(n) + " " + cmd;
+    return body + "*" + int_to_str(gcode_checksum(body));
+}
+
+fn gc_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn gc_is_space(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 13 || c == 10;
+}
+
+fn gc_err(msg: str) -> GLine {
+    return GLine { ok: false, error: msg, line_no: - 1, has_checksum: false, checksum: 0, letters: Vec::new(), values: Vec::new(), comment: "" };
+}
+
+/// Parse one line of G-code.
+pub fn gcode_parse_line(text: str) -> GLine {
+    var out: GLine = gc_err("");
+    out.ok = true;
+    val n: i64 = str_len(text);
+    // the checksum covers everything before the first '*' outside comments
+    var star: i64 = - 1;
+    var i: i64 = 0;
+    var in_paren: bool = false;
+    while i < n {
+        val c: i64 = str_byte_at(text, i);
+        if in_paren {
+            if c == 41 {
+                in_paren = false;
+            }
+        } else if c == 40 {
+            in_paren = true;
+        } else if c == 59 {
+            i = n;
+        } else if c == 42 {
+            star = i;
+            i = n;
+        }
+        i = i + 1;
+    }
+    var end: i64 = n;
+    if star >= 0 {
+        var j: i64 = star + 1;
+        var cs: i64 = 0;
+        var digits: i64 = 0;
+        while j < n && gc_is_digit(str_byte_at(text, j)) {
+            cs = cs * 10 + (str_byte_at(text, j) - 48);
+            digits = digits + 1;
+            j = j + 1;
+        }
+        if digits == 0 {
+            return gc_err("checksum without digits");
+        }
+        out.has_checksum = true;
+        out.checksum = cs;
+        if gcode_checksum(str_slice(text, 0, star)) != cs {
+            return gc_err("checksum mismatch: line says " + int_to_str(cs) + ", computed " + int_to_str(gcode_checksum(str_slice(text, 0, star))));
+        }
+        end = star;
+    }
+    i = 0;
+    while i < end {
+        val c: i64 = str_byte_at(text, i);
+        if gc_is_space(c) {
+            i = i + 1;
+        } else if c == 59 {
+            out.comment = str_trim(str_slice(text, i + 1, end));
+            i = end;
+        } else if c == 40 {
+            var j: i64 = i + 1;
+            while j < end && str_byte_at(text, j) != 41 {
+                j = j + 1;
+            }
+            if j >= end {
+                return gc_err("unclosed comment");
+            }
+            out.comment = str_trim(str_slice(text, i + 1, j));
+            i = j + 1;
+        } else {
+            var letter: i64 = c;
+            if letter >= 97 && letter <= 122 {
+                letter = letter - 32;
+            }
+            if letter < 65 || letter > 90 {
+                return gc_err("unexpected character '" + char_to_str(c) + "'");
+            }
+            var j: i64 = i + 1;
+            while j < end && gc_is_space(str_byte_at(text, j)) {
+                j = j + 1;
+            }
+            val start: i64 = j;
+            if j < end && (str_byte_at(text, j) == 45 || str_byte_at(text, j) == 43) {
+                j = j + 1;
+            }
+            var nd: i64 = 0;
+            while j < end && (gc_is_digit(str_byte_at(text, j)) || str_byte_at(text, j) == 46) {
+                if str_byte_at(text, j) != 46 {
+                    nd = nd + 1;
+                }
+                j = j + 1;
+            }
+            if nd == 0 {
+                return gc_err("letter " + char_to_str(letter) + " without a number");
+            }
+            val v: f64 = str_parse_float(str_slice(text, start, j));
+            if letter == 78 && out.letters.len() == 0 {
+                out.line_no = math_floor(v) as i64;
+            } else {
+                out.letters.push(letter);
+                out.values.push(v);
+            }
+            i = j;
+        }
+    }
+    if out.has_checksum && out.line_no < 0 {
+        return gc_err("checksum without a line number");
+    }
+    return out;
+}
+
+/// Whether the line has a word with this letter ("G" etc.).
+pub fn gline_has(l: & GLine, letter: str) -> bool {
+    return gline_index(l, letter) >= 0;
+}
+
+fn gline_index(l: & GLine, letter: str) -> i64 {
+    val c: i64 = str_byte_at(letter, 0);
+    var i: i64 = 0;
+    while i < l.letters.len() {
+        if l.letters.get(i) == c {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The value of the first word with this letter, or `def`.
+pub fn gline_get(l: & GLine, letter: str, def: f64) -> f64 {
+    val i: i64 = gline_index(l, letter);
+    if i < 0 {
+        return def;
+    }
+    return l.values.get(i);
+}
+
+/// Whether the line holds the code letter+number (e.g. "G", 91; "M", 83).
+pub fn gline_has_code(l: & GLine, letter: str, num: f64) -> bool {
+    val c: i64 = str_byte_at(letter, 0);
+    var i: i64 = 0;
+    while i < l.letters.len() {
+        if l.letters.get(i) == c && math_fabs(l.values.get(i) - num) < 0.0001 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The host-side line-number rule: tracks the expected next N.
+pub struct GSeq {
+    pub expected: i64,
+}
+
+pub fn gcode_seq_new() -> GSeq {
+    return GSeq { expected: 1 };
+}
+
+/// Check a parsed line's number: "" when it is the next one (or the line
+/// has none and no checksum), else the error (Marlin answers "Resend: n").
+/// M110 resets the counter to its N (the next line is N + 1).
+pub fn gcode_seq_check(s: & mut GSeq, l: & GLine) -> str {
+    if l.line_no < 0 {
+        return "";
+    }
+    if gline_has_code(l, "M", 110.0) {
+        s.expected = l.line_no + 1;
+        return "";
+    }
+    if l.line_no != s.expected {
+        return "Resend: " + int_to_str(s.expected);
+    }
+    s.expected = s.expected + 1;
+    return "";
+}
+
+// ─── Modal state and motion ───
+
+/// One linear move to an absolute machine position (mm), with its feed
+/// (mm/min) and whether it is a rapid (G0).
+pub struct GMove {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub e: f64,
+    pub f: f64,
+    pub rapid: bool,
+}
+
+pub struct GState {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub e: f64,
+    pub feed: f64,
+    pub absolute: bool,
+    pub e_absolute: bool,
+    // 1.0 for mm, 25.4 for inches
+    pub unit: f64,
+    // 0, 1, 2 or 3
+    pub motion: i64,
+    // 17, 18 or 19
+    pub plane: i64,
+    pub seg_mm: f64,
+    pub error: str,
+}
+
+pub fn gcode_state_new() -> GState {
+    return GState { x: 0.0, y: 0.0, z: 0.0, e: 0.0, feed: 0.0, absolute: true, e_absolute: true, unit: 1.0, motion: 0, plane: 17, seg_mm: 1.0, error: "" };
+}
+
+/// Parse and execute one line; the moves it makes (empty on error, with
+/// st.error set).
+pub fn gcode_run_line(st: & mut GState, text: str) -> Vec<GMove> {
+    val l: GLine = gcode_parse_line(text);
+    if !l.ok {
+        st.error = l.error;
+        return Vec::new();
+    }
+    return gcode_exec(st, &l);
+}
+
+fn gc_target(st: & GState, l: & GLine, letter: str, cur: f64) -> f64 {
+    if !gline_has(l, letter) {
+        return cur;
+    }
+    val v: f64 = gline_get(l, letter, 0.0) * st.unit;
+    if st.absolute {
+        return v;
+    }
+    return cur + v;
+}
+
+/// Execute a parsed line.
+pub fn gcode_exec(st: & mut GState, l: & GLine) -> Vec<GMove> {
+    var moves: Vec<GMove> = Vec::new();
+    st.error = "";
+    // modal codes first, as in the order of execution of RS274
+    var i: i64 = 0;
+    var has_motion: bool = false;
+    var non_modal: i64 = - 1;
+    while i < l.letters.len() {
+        val c: i64 = l.letters.get(i);
+        val v: f64 = l.values.get(i);
+        val code: i64 = math_floor(v + 0.5) as i64;
+        if c == 71 {
+            if code == 0 || code == 1 || code == 2 || code == 3 {
+                st.motion = code;
+                has_motion = true;
+            } else if code == 17 || code == 18 || code == 19 {
+                st.plane = code;
+            } else if code == 20 {
+                st.unit = 25.4;
+            } else if code == 21 {
+                st.unit = 1.0;
+            } else if code == 90 {
+                st.absolute = true;
+            } else if code == 91 {
+                st.absolute = false;
+            } else if code == 92 || code == 28 || code == 4 {
+                non_modal = code;
+            } else {
+                st.error = "unsupported G" + int_to_str(code);
+                return moves;
+            }
+        } else if c == 77 {
+            if code == 82 {
+                st.e_absolute = true;
+            } else if code == 83 {
+                st.e_absolute = false;
+            }
+        } else if c == 70 {
+            st.feed = v * st.unit;
+        }
+        i = i + 1;
+    }
+    if non_modal == 92 {
+        // set the position of the named axes (no axis: all to 0)
+        val any: bool = gline_has(l, "X") || gline_has(l, "Y") || gline_has(l, "Z") || gline_has(l, "E");
+        if !any {
+            st.x = 0.0;
+            st.y = 0.0;
+            st.z = 0.0;
+            st.e = 0.0;
+        }
+        if gline_has(l, "X") { st.x = gline_get(l, "X", 0.0) * st.unit; }
+        if gline_has(l, "Y") { st.y = gline_get(l, "Y", 0.0) * st.unit; }
+        if gline_has(l, "Z") { st.z = gline_get(l, "Z", 0.0) * st.unit; }
+        if gline_has(l, "E") { st.e = gline_get(l, "E", 0.0) * st.unit; }
+        return moves;
+    }
+    if non_modal == 28 {
+        val all: bool = !(gline_has(l, "X") || gline_has(l, "Y") || gline_has(l, "Z"));
+        var tx: f64 = st.x;
+        var ty: f64 = st.y;
+        var tz: f64 = st.z;
+        if all || gline_has(l, "X") { tx = 0.0; }
+        if all || gline_has(l, "Y") { ty = 0.0; }
+        if all || gline_has(l, "Z") { tz = 0.0; }
+        moves.push(GMove { x: tx, y: ty, z: tz, e: st.e, f: st.feed, rapid: true });
+        st.x = tx;
+        st.y = ty;
+        st.z = tz;
+        return moves;
+    }
+    if non_modal == 4 {
+        // dwell: no motion
+        return moves;
+    }
+    val axis_words: bool = gline_has(l, "X") || gline_has(l, "Y") || gline_has(l, "Z") || gline_has(l, "E");
+    if !axis_words && !(has_motion && (st.motion == 2 || st.motion == 3) && (gline_has(l, "I") || gline_has(l, "J") || gline_has(l, "K"))) {
+        return moves;
+    }
+    val tx: f64 = gc_target(st, l, "X", st.x);
+    val ty: f64 = gc_target(st, l, "Y", st.y);
+    val tz: f64 = gc_target(st, l, "Z", st.z);
+    var te: f64 = st.e;
+    if gline_has(l, "E") {
+        val ev: f64 = gline_get(l, "E", 0.0) * st.unit;
+        if st.e_absolute && st.absolute {
+            te = ev;
+        } else {
+            te = st.e + ev;
+        }
+    }
+    if st.motion == 0 || st.motion == 1 {
+        moves.push(GMove { x: tx, y: ty, z: tz, e: te, f: st.feed, rapid: st.motion == 0 });
+    } else {
+        moves = gc_arc(st, l, tx, ty, tz, te);
+        if str_len(st.error) > 0 {
+            return moves;
+        }
+    }
+    st.x = tx;
+    st.y = ty;
+    st.z = tz;
+    st.e = te;
+    return moves;
+}
+
+// Arc in the active plane. Axes p, q span the plane, r is the normal:
+// G17: (X, Y, Z) with offsets I, J; G18: (Z, X, Y) with K, I;
+// G19: (Y, Z, X) with J, K.
+fn gc_arc(st: & mut GState, l: & GLine, tx: f64, ty: f64, tz: f64, te: f64) -> Vec<GMove> {
+    var out: Vec<GMove> = Vec::new();
+    var p0: f64 = st.x;
+    var q0: f64 = st.y;
+    var r0: f64 = st.z;
+    var p1: f64 = tx;
+    var q1: f64 = ty;
+    var r1: f64 = tz;
+    var lp: str = "I";
+    var lq: str = "J";
+    if st.plane == 18 {
+        p0 = st.z; q0 = st.x; r0 = st.y;
+        p1 = tz; q1 = tx; r1 = ty;
+        lp = "K"; lq = "I";
+    } else if st.plane == 19 {
+        p0 = st.y; q0 = st.z; r0 = st.x;
+        p1 = ty; q1 = tz; r1 = tx;
+        lp = "J"; lq = "K";
+    }
+    val cw: bool = st.motion == 2;
+    var oi: f64 = 0.0;
+    var oj: f64 = 0.0;
+    if gline_has(l, "R") {
+        var rad: f64 = gline_get(l, "R", 0.0) * st.unit;
+        val dx: f64 = p1 - p0;
+        val dy: f64 = q1 - q0;
+        val d: f64 = rmath_hypot(dx, dy);
+        if d == 0.0 {
+            st.error = "R arc with the same start and end";
+            return out;
+        }
+        var h: f64 = 4.0 * rad * rad - dx * dx - dy * dy;
+        if h < 0.0 {
+            if h > 0.0 - 0.0000001 * rad * rad {
+                h = 0.0;
+            } else {
+                st.error = "R arc: radius too small for the distance";
+                return out;
+            }
+        }
+        var hd: f64 = 0.0 - math_sqrt(h) / d;
+        if !cw {
+            hd = 0.0 - hd;
+        }
+        if rad < 0.0 {
+            hd = 0.0 - hd;
+            rad = 0.0 - rad;
+        }
+        oi = 0.5 * (dx - dy * hd);
+        oj = 0.5 * (dy + dx * hd);
+    } else {
+        oi = gline_get(l, lp, 0.0) * st.unit;
+        oj = gline_get(l, lq, 0.0) * st.unit;
+    }
+    val cp: f64 = p0 + oi;
+    val cq: f64 = q0 + oj;
+    val radius: f64 = rmath_hypot(oi, oj);
+    if radius == 0.0 {
+        st.error = "arc with zero radius";
+        return out;
+    }
+    val rp: f64 = 0.0 - oi;
+    val rq: f64 = 0.0 - oj;
+    val tp: f64 = p1 - cp;
+    val tq: f64 = q1 - cq;
+    var travel: f64 = rmath_atan2(rp * tq - rq * tp, rp * tp + rq * tq);
+    val same: bool = math_fabs(p1 - p0) < 0.000001 && math_fabs(q1 - q0) < 0.000001;
+    if same {
+        travel = 0.0;
+    }
+    if travel < 0.0 || (travel == 0.0 && !cw) {
+        travel = travel + 2.0 * rmath_pi();
+    }
+    if cw {
+        travel = travel - 2.0 * rmath_pi();
+    }
+    // the end radius may differ a little (rounded input): check it
+    val rend: f64 = rmath_hypot(tp, tq);
+    if math_fabs(rend - radius) > 0.002 * rmath_max(1.0, radius) {
+        st.error = "arc end point is not on the circle";
+        return out;
+    }
+    val flat: f64 = radius * math_fabs(travel);
+    val lin: f64 = r1 - r0;
+    val length: f64 = rmath_hypot(flat, lin);
+    var segs: i64 = math_floor(length / st.seg_mm) as i64;
+    if segs < 1 {
+        segs = 1;
+    }
+    val a0: f64 = rmath_atan2(rq, rp);
+    var k: i64 = 1;
+    while k <= segs {
+        var pp: f64 = p1;
+        var qq: f64 = q1;
+        var rr: f64 = r1;
+        var ee: f64 = te;
+        if k < segs {
+            val t: f64 = (k as f64) / (segs as f64);
+            val a: f64 = a0 + travel * t;
+            pp = cp + radius * math_cos(a);
+            qq = cq + radius * math_sin(a);
+            rr = r0 + lin * t;
+            ee = st.e + (te - st.e) * t;
+        }
+        if st.plane == 18 {
+            out.push(GMove { x: qq, y: rr, z: pp, e: ee, f: st.feed, rapid: false });
+        } else if st.plane == 19 {
+            out.push(GMove { x: rr, y: pp, z: qq, e: ee, f: st.feed, rapid: false });
+        } else {
+            out.push(GMove { x: pp, y: qq, z: rr, e: ee, f: st.feed, rapid: false });
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+/// Run a whole program (lines separated by newlines); stops at the first
+/// error, which is left in st.error with the line number (1-based) before it.
+pub fn gcode_run(st: & mut GState, program: str) -> Vec<GMove> {
+    var all: Vec<GMove> = Vec::new();
+    val lines: Vec<str> = str_split(program, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val ms: Vec<GMove> = gcode_run_line(st, lines.get(i));
+        if str_len(st.error) > 0 {
+            st.error = "line " + int_to_str(i + 1) + ": " + st.error;
+            return all;
+        }
+        var k: i64 = 0;
+        while k < ms.len() {
+            all.push(ms.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return all;
+}
+
+// ─── Generator ───
+
+/// A number in G-code style: rounded to 4 decimals, trailing zeros and a
+/// trailing point removed ("10", "-2.5", "0.125").
+pub fn gcode_num(x: f64) -> str {
+    var s: str = rmath_fmt(x, 4);
+    if str_contains(s, ".") {
+        var n: i64 = str_len(s);
+        while n > 0 && str_byte_at(s, n - 1) == 48 {
+            n = n - 1;
+        }
+        if n > 0 && str_byte_at(s, n - 1) == 46 {
+            n = n - 1;
+        }
+        s = str_slice(s, 0, n);
+    }
+    if s == "-0" {
+        return "0";
+    }
+    return s;
+}
+
+/// "G1 X.. Y.. F.." for a move (F only when feed > 0).
+pub fn gcode_move_str(rapid: bool, x: f64, y: f64, feed: f64) -> str {
+    var s: str = "G1";
+    if rapid {
+        s = "G0";
+    }
+    s = s + " X" + gcode_num(x) + " Y" + gcode_num(y);
+    if feed > 0.0 {
+        s = s + " F" + gcode_num(feed);
+    }
+    return s;
+}
+
+/// A program that follows a polyline (xs, ys) at depth z: a rapid to the
+/// first point at the safe height, plunge, cut along the points, retract.
+pub fn gcode_polyline(xs: & Vec<f64>, ys: & Vec<f64>, z: f64, safe_z: f64, feed: f64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    out.push("G21");
+    out.push("G90");
+    out.push("G0 Z" + gcode_num(safe_z));
+    if xs.len() == 0 {
+        return out;
+    }
+    out.push(gcode_move_str(true, xs.get(0), ys.get(0), 0.0));
+    out.push("G1 Z" + gcode_num(z) + " F" + gcode_num(feed));
+    var i: i64 = 1;
+    while i < xs.len() {
+        out.push(gcode_move_str(false, xs.get(i), ys.get(i), 0.0));
+        i = i + 1;
+    }
+    out.push("G0 Z" + gcode_num(safe_z));
+    return out;
+}
+
+/// A rectangle with rounded corners of radius r (r > 0: G3 arcs, counter-
+/// clockwise) from (x0, y0) to (x1, y1) at depth z.
+pub fn gcode_rounded_rect(x0: f64, y0: f64, x1: f64, y1: f64, r: f64, z: f64, safe_z: f64, feed: f64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    out.push("G21");
+    out.push("G90");
+    out.push("G17");
+    out.push("G0 Z" + gcode_num(safe_z));
+    out.push(gcode_move_str(true, x0 + r, y0, 0.0));
+    out.push("G1 Z" + gcode_num(z) + " F" + gcode_num(feed));
+    out.push(gcode_move_str(false, x1 - r, y0, 0.0));
+    out.push("G3 X" + gcode_num(x1) + " Y" + gcode_num(y0 + r) + " I0 J" + gcode_num(r));
+    out.push(gcode_move_str(false, x1, y1 - r, 0.0));
+    out.push("G3 X" + gcode_num(x1 - r) + " Y" + gcode_num(y1) + " I" + gcode_num(0.0 - r) + " J0");
+    out.push(gcode_move_str(false, x0 + r, y1, 0.0));
+    out.push("G3 X" + gcode_num(x0) + " Y" + gcode_num(y1 - r) + " I0 J" + gcode_num(0.0 - r));
+    out.push(gcode_move_str(false, x0, y0 + r, 0.0));
+    out.push("G3 X" + gcode_num(x0 + r) + " Y" + gcode_num(y0) + " I" + gcode_num(r) + " J0");
+    out.push("G0 Z" + gcode_num(safe_z));
+    return out;
+}
+
+/// Number and checksum every line, starting at N1 after an "M110 N0".
+pub fn gcode_number_lines(lines: & Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    out.push(gcode_with_checksum(0, "M110"));
+    var i: i64 = 0;
+    while i < lines.len() {
+        out.push(gcode_with_checksum(i + 1, lines.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The total path length of moves starting from (x, y, z).
+pub fn gcode_path_length(moves: & Vec<GMove>, x: f64, y: f64, z: f64) -> f64 {
+    var px: f64 = x;
+    var py: f64 = y;
+    var pz: f64 = z;
+    var total: f64 = 0.0;
+    var i: i64 = 0;
+    while i < moves.len() {
+        val m: GMove = moves.get(i);
+        val dx: f64 = m.x - px;
+        val dy: f64 = m.y - py;
+        val dz: f64 = m.z - pz;
+        total = total + math_sqrt(dx * dx + dy * dy + dz * dz);
+        px = m.x;
+        py = m.y;
+        pz = m.z;
+        i = i + 1;
+    }
+    return total;
+}

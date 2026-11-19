@@ -21,9 +21,7 @@
 //
 // Dependencies: compiler::ast (for BinOp, UnaryOp, Type, ExternDecl)
 
-module compiler::ir;
- use core; use vec; use string; use compiler::ast;
-// --- Local helper: Vec<str> contains -------------------------------------
+module compiler::ir; use core; use vec; use string; use compiler::ast;  // --- Local helper: Vec<str> contains -------------------------------------
 fn ir_c_str_vec_contains(vec: Vec<str>, s: str) -> bool {
     var i: i64 = 0;
     while i < vec.len() {
@@ -1680,6 +1678,10 @@ pub enum Inst {
     // --- Control Flow ---
     Jump(i64),
     Branch(i64, i64, i64),
+    // ME28/MI27: multi-way branch on an integer: (value, keys, targets,
+    // default); keys distinct, targets[i] is the block for keys[i]. Formed
+    // from compare chains by IrFunction_form_switches, after the mid-end.
+    Switch(i64, Vec<i64>, Vec<i64>, i64),
     Return(OptValueId),
     Unreachable,
 
@@ -1777,6 +1779,9 @@ pub fn inst_result_type(inst: Inst) -> IrType {
             return IrType::Void;
         }
         Inst::Branch(_, _, _) => {
+            return IrType::Void;
+        }
+        Inst::Switch(_, _, _, _) => {
             return IrType::Void;
         }
         Inst::Return(_) => {
@@ -1995,6 +2000,9 @@ pub fn inst_kind_name(inst: & Inst) -> str {
         Inst::Branch(_, _, _) => {
             return "Branch";
         }
+        Inst::Switch(_, _, _, _) => {
+            return "Switch";
+        }
         Inst::Return(_) => {
             return "Return";
         }
@@ -2088,6 +2096,9 @@ pub fn inst_is_terminator(inst: Inst) -> bool {
         Inst::Branch(_, _, _) => {
             return true;
         }
+        Inst::Switch(_, _, _, _) => {
+            return true;
+        }
         Inst::Return(_) => {
             return true;
         }
@@ -2157,6 +2168,9 @@ pub fn inst_value_refs(inst: & Inst) -> Vec<i64> {
         Inst::Branch(cond, _, _) => {
             refs.push(cond);
         }
+        Inst::Switch(sv, _, _, _) => {
+            refs.push(sv);
+        }
         Inst::Return(opt_val) => {
             match opt_val {
                 OptValueId::Some(v) => {
@@ -2215,7 +2229,10 @@ pub fn inst_value_refs(inst: & Inst) -> Vec<i64> {
         Inst::Asm(_, inputs, outputs, _) => {
             var i: i64 = 0;
             while i < inputs.len() {
-                refs.push(inputs.get(i).id);
+                // a clobber travels as an input with id -1 (2g.53)
+                if inputs.get(i).id >= 0 {
+                    refs.push(inputs.get(i).id);
+                }
                 i = i + 1;
             }
             i = 0;
@@ -2306,6 +2323,11 @@ pub struct IrFunction {
     pub internal_conv: bool,
     // WP6: internal-only function — may use the extended calling convention
     pub is_constant_time: bool,  // J7: @constant_time — native backends check the emitted code
+    // LF20: holds a @secret / @sensitive value (the function, a parameter or
+    // a local is annotated) or a @zeroize local: nat_ir wipes its frame at exit
+    pub has_secret: bool,
+    // LF20: the parameters' values and the locals' slots that are @secret / @sensitive / @zeroize (nat_ir ng_secret_ids)
+    pub secret_values: Vec<i64>,
 }
 
 pub struct ValueIdMeta {
@@ -2332,7 +2354,7 @@ pub fn ValueIdInst_new(id: i64, inst: Inst) -> ValueIdInst {
 
 pub fn IrFunction_new(name: str, ret_ty: IrType) -> IrFunction {
     var func: IrFunction = IrFunction {
-        name: name, params: Vec::new(), ret_ty: ret_ty, blocks: Vec::new(), value_metas: Vec::new(), insts: Vec::new(), inst_at: Vec::new(), effects: EffectSet_new(), next_value: 0, next_block: 0, current_block_idx: 0, entry: 0, locals: Vec::new(), is_interrupt: false, interrupt_vector: - 1, persist_vars: Vec::new(), drop_locals: Vec::new(), is_wrapping: false, is_deterministic: false, is_crashfree: false, gas_limit: OptU64::None, is_no_alloc: false, is_medical: false, is_kernel: false, internal_conv: false, workgroup_size: Vec::new(), is_simd: false, zeroize_locals: Vec::new(), is_constant_time: false,
+        name: name, params: Vec::new(), ret_ty: ret_ty, blocks: Vec::new(), value_metas: Vec::new(), insts: Vec::new(), inst_at: Vec::new(), effects: EffectSet_new(), next_value: 0, next_block: 0, current_block_idx: 0, entry: 0, locals: Vec::new(), is_interrupt: false, interrupt_vector: - 1, persist_vars: Vec::new(), drop_locals: Vec::new(), is_wrapping: false, is_deterministic: false, is_crashfree: false, gas_limit: OptU64::None, is_no_alloc: false, is_medical: false, is_kernel: false, internal_conv: false, workgroup_size: Vec::new(), is_simd: false, zeroize_locals: Vec::new(), is_constant_time: false, has_secret: false, secret_values: Vec::new(),
     };
     func.workgroup_size.push(1);
     func.workgroup_size.push(1);
@@ -2360,15 +2382,29 @@ pub fn IrFunction_current_block(self: & IrFunction) -> i64 {
 }
 
 pub fn IrFunction_emit(self: & mut IrFunction, inst: Inst) -> i64 {
+    return IrFunction_emit_line(self, inst, OptU64::None);
+}
+
+/// IrFunction_emit with the value's source line set to `line` (when the
+/// value's meta lands at index `id` of value_metas, as it does when
+/// value_metas holds one meta per value so far).
+pub fn IrFunction_emit_line(self: & mut IrFunction, inst: Inst, line: OptU64) -> i64 {
     var ty: IrType = inst_result_type(inst);
     var effects: EffectSet = inst_effects(& inst);
     var is_term: bool = inst_is_terminator(inst);
+    var src_line: OptU64 = OptU64::None;
+    if self.value_metas.len() == self.next_value {
+        src_line = line;
+    }
     var meta: ValueMeta = ValueMeta {
-        ty: ty, region: Region::Stack, effects: effects, source_line: OptU64::None, in_sandbox: false, is_linear: false, borrow_kind: BorrowKind::None,
+        ty: ty, region: Region::Stack, effects: effects, source_line: src_line, in_sandbox: false, is_linear: false, borrow_kind: BorrowKind::None,
     };
     var id: i64 = IrFunction_new_value(self, meta);
     var block_idx: i64 = self.current_block_idx;
     var blk: BasicBlock = self.blocks.get(block_idx);
+    // CS4: leave an empty block in the slot so `blk` holds the only owner
+    // of its instruction list and the push does not copy it
+    self.blocks.set(block_idx, BasicBlock_new(block_idx));
     blk.instructions.push(id);
     self.blocks.set(block_idx, blk);
     while self.inst_at.len() <= id {
@@ -2385,6 +2421,7 @@ pub fn IrFunction_add_block_param(self: & mut IrFunction, block: i64, ty: IrType
     };
     var id: i64 = IrFunction_new_value(self, meta);
     var blk: BasicBlock = self.blocks.get(block);
+    self.blocks.set(block, BasicBlock_new(block));
     blk.params.push(ValueIdType_new(id, ty));
     self.blocks.set(block, blk);
     return id;
@@ -2526,6 +2563,9 @@ pub struct IrModule {
     pub linear_structs: Vec<str>,
     // Module-level mutable global variables: maps name -> (type, initializer expr)
     pub globals: Vec<GlobalEntry>,
+    // SP10: name -> position in globals + 1, and "#n" -> positions indexed
+    // + 1; filled by IrModule_global_pos
+    pub global_index: i64,
 }
 
 pub struct IrFunctionEntry {
@@ -2586,16 +2626,69 @@ pub fn GlobalEntry_new(name: str, ty: IrType, init: Expr) -> GlobalEntry {
 }
 
 // Lookup a global by name. Returns OptIrType::Some(ty) if found, None otherwise.
+// SP10: through global_index (IrModule_global_pos), not a scan of every
+// global: the lowering asks for each name it resolves.
 pub fn IrModule_get_global(self: & IrModule, name: str) -> OptGlobalLookup {
-    var i: i64 = 0;
-    while i < self.globals.len() {
-        var entry: GlobalEntry = self.globals.get(i);
-        if entry.name == name {
-            return OptGlobalLookup::Some(entry.ty, entry.init);
-        }
-        i = i + 1;
+    var at: i64 = IrModule_global_pos(self, name);
+    if at < 0 {
+        return OptGlobalLookup::None;
     }
-    return OptGlobalLookup::None;
+    var entry: GlobalEntry = self.globals.get(at);
+    return OptGlobalLookup::Some(entry.ty, entry.init);
+}
+
+/// SP10: the position of global `name` in `self.globals`, or -1: the first
+/// of that name, as a scan from the front finds it. The index is lazy:
+/// entries pushed since the last lookup are indexed first ("#n" counts the
+/// positions indexed). It is not trusted when the list shrank, when the
+/// last entry it indexed is no longer where it says (the list was replaced,
+/// or a copy of the module pushed to the shared index), or when a hit's
+/// position holds another name: then it is rebuilt from the front.
+pub fn IrModule_global_pos(self: & IrModule, name: str) -> i64 {
+    var idx: i64 = self.global_index;
+    var n: i64 = self.globals.len();
+    var cnt: i64 = HashMap_get(idx, "#n") - 1;
+    var fresh: bool = cnt >= 0 && cnt <= n;
+    if fresh && cnt > 0 {
+        var last: str = self.globals.get(cnt - 1).name;
+        var lp: i64 = HashMap_get(idx, last);
+        fresh = lp > 0 && lp <= n && self.globals.get(lp - 1).name == last;
+    }
+    if !fresh {
+        HashMap_clear(idx);
+        cnt = 0;
+    }
+    if cnt != n || !fresh {
+        var i: i64 = cnt;
+        while i < n {
+            var key: str = self.globals.get(i).name;
+            if HashMap_get(idx, key) == 0 {
+                HashMap_insert(idx, key, i + 1);
+            }
+            i = i + 1;
+        }
+        HashMap_insert(idx, "#n", n + 1);
+    }
+    var at: i64 = HashMap_get(idx, name);
+    if at == 0 {
+        return 0 - 1;
+    }
+    if at <= n && self.globals.get(at - 1).name == name {
+        return at - 1;
+    }
+    // A stale entry: index the list again from the front
+    HashMap_clear(idx);
+    var j: i64 = 0;
+    while j < n {
+        var key2: str = self.globals.get(j).name;
+        if HashMap_get(idx, key2) == 0 {
+            HashMap_insert(idx, key2, j + 1);
+        }
+        j = j + 1;
+    }
+    HashMap_insert(idx, "#n", n + 1);
+    var at2: i64 = HashMap_get(idx, name);
+    return at2 - 1;
 }
 
 pub enum OptGlobalLookup {
@@ -2605,9 +2698,13 @@ pub enum OptGlobalLookup {
 
 pub fn IrModule_new() -> IrModule {
     return IrModule {
-        functions: Vec::new(), fn_index: HashMap_new(), struct_layouts: Vec::new(), struct_index: HashMap_new(), string_constants: Vec::new(), str_index: HashMap_new(), extern_functions: Vec::new(), function_effects: Vec::new(), extern_decls: Vec::new(), c_callbacks: Vec::new(), trait_methods: Vec::new(), trait_impls: Vec::new(), linear_structs: Vec::new(), globals: Vec::new(),
+        functions: Vec::new(), fn_index: HashMap_new(), struct_layouts: Vec::new(), struct_index: HashMap_new(), string_constants: Vec::new(), str_index: HashMap_new(), extern_functions: Vec::new(), function_effects: Vec::new(), extern_decls: Vec::new(), c_callbacks: Vec::new(), trait_methods: Vec::new(), trait_impls: Vec::new(), linear_structs: Vec::new(), globals: Vec::new(), global_index: HashMap_new(),
     };
 }
+
+/// CI7: the functions marked `@export` (",a,b,"), which lower.fd collects;
+/// a library build (codegen_c.fd cg_lib_collect) gives them C names.
+pub var g_ir_exports: str = ",";
 
 /// A `ConstFnRef` of this prefix and a function name is the address of the
 /// function's adapter, which C can call: it supplies the `__env` Fides takes.
@@ -2716,25 +2813,21 @@ pub fn IrModule_add_function(self: & mut IrModule, func: IrFunction) {
     // Check if a function with the same name already exists.
     // If so, replace it instead of creating a duplicate (which would
     // cause C codegen to emit two definitions with the same name).
-    var i: i64 = 0;
-    while i < self.functions.len() {
-        if self.functions.get(i).name == func.name {
-            self.functions.set(i, IrFunctionEntry_new(func.name, func));
-            return;
-        }
-        i = i + 1;
+    // SP10: found through fn_index, not a scan of every function (the
+    // lowering adds each function this way: the scan was quadratic).
+    var at: i64 = IrModule_fn_pos(self, func.name);
+    if at >= 0 {
+        self.functions.set(at, IrFunctionEntry_new(func.name, func));
+        return;
     }
     self.functions.push(IrFunctionEntry_new(func.name, func));
 }
 
 pub fn IrModule_replace_function(self: & mut IrModule, func: IrFunction) {
-    var i: i64 = 0;
-    while i < self.functions.len() {
-        if self.functions.get(i).name == func.name {
-            self.functions.set(i, IrFunctionEntry_new(func.name, func));
-            return;
-        }
-        i = i + 1;
+    var at: i64 = IrModule_fn_pos(self, func.name);
+    if at >= 0 {
+        self.functions.set(at, IrFunctionEntry_new(func.name, func));
+        return;
     }
     // Not found -- add it
     self.functions.push(IrFunctionEntry_new(func.name, func));
@@ -2743,13 +2836,10 @@ pub fn IrModule_replace_function(self: & mut IrModule, func: IrFunction) {
 // Like replace_function, but takes the name separately to avoid
 // string corruption when the IrFunction is moved from a struct field.
 pub fn IrModule_replace_function_named(self: & mut IrModule, func: IrFunction, name: str) {
-    var i: i64 = 0;
-    while i < self.functions.len() {
-        if self.functions.get(i).name == name {
-            self.functions.set(i, IrFunctionEntry_new(name, func));
-            return;
-        }
-        i = i + 1;
+    var at: i64 = IrModule_fn_pos(self, name);
+    if at >= 0 {
+        self.functions.set(at, IrFunctionEntry_new(name, func));
+        return;
     }
     // Not found -- add it
     self.functions.push(IrFunctionEntry_new(name, func));
@@ -2770,6 +2860,43 @@ pub fn IrModule_get_function(self: & IrModule, name: str) -> OptIrFunction {
         return OptIrFunction::None;
     }
     return OptIrFunction::Some(self.functions.get(at - 1).func);
+}
+
+/// SP10 (own-backend roadmap): the position of function `name` in
+/// `self.functions`, or -1, through `fn_index` (the lazy index that
+/// IrModule_get_function keeps: entries pushed since the last lookup are
+/// indexed first, the first function of a name wins, as a scan from the
+/// front would find it). An entry whose position no longer holds that name
+/// (the list was changed without HashMap_clear, AGENTS.md item 14) is not
+/// trusted: the index is rebuilt and the name looked up again.
+pub fn IrModule_fn_pos(self: & IrModule, name: str) -> i64 {
+    var i: i64 = HashMap_len(self.fn_index);
+    while i < self.functions.len() {
+        var key: str = self.functions.get(i).name;
+        if HashMap_get(self.fn_index, key) == 0 {
+            HashMap_insert(self.fn_index, key, i + 1);
+        }
+        i = i + 1;
+    }
+    var at: i64 = HashMap_get(self.fn_index, name);
+    if at == 0 {
+        return 0 - 1;
+    }
+    if at <= self.functions.len() && self.functions.get(at - 1).name == name {
+        return at - 1;
+    }
+    // A stale entry: index the list again from the front
+    HashMap_clear(self.fn_index);
+    i = 0;
+    while i < self.functions.len() {
+        var key2: str = self.functions.get(i).name;
+        if HashMap_get(self.fn_index, key2) == 0 {
+            HashMap_insert(self.fn_index, key2, i + 1);
+        }
+        i = i + 1;
+    }
+    var at2: i64 = HashMap_get(self.fn_index, name);
+    return at2 - 1;
 }
 
 // --- Type Lowering (AST -> IR) --------------------------------------------
@@ -3017,21 +3144,48 @@ pub fn pe_strs_contains(v: Vec<str>, s: str) -> bool {
     return false;
 }
 
-/// Insertion-sort a Vec<str> with str_compare (deterministic BTree order).
+/// Sort a Vec<str> with str_compare (deterministic BTree order). A
+/// bottom-up merge sort since Nov 17 (WP15: the reachable set of a whole
+/// program is thousands of names, and insertion sort was quadratic); the
+/// order is the same as before.
 pub fn pe_sort_strs(v: Vec<str>) -> Vec<str> {
-    var v = v;
-    var i: i64 = 1;
+    var a: Vec<str> = Vec::new();
+    var i: i64 = 0;
     while i < v.len() {
-        var key: str = v.get(i);
-        var j: i64 = i - 1;
-        while j >= 0 && str_compare(v.get(j), key) > 0 {
-            v.set(j + 1, v.get(j));
-            j = j - 1;
-        }
-        v.set(j + 1, key);
+        a.push(v.get(i));
         i = i + 1;
     }
-    return v;
+    var n: i64 = a.len();
+    var w: i64 = 1;
+    while w < n {
+        var b: Vec<str> = Vec::new();
+        var lo: i64 = 0;
+        while lo < n {
+            var mid: i64 = lo + w;
+            if mid > n {
+                mid = n;
+            }
+            var hi: i64 = lo + 2 * w;
+            if hi > n {
+                hi = n;
+            }
+            var x: i64 = lo;
+            var y: i64 = mid;
+            while x < mid || y < hi {
+                if y >= hi || (x < mid && str_compare(a.get(x), a.get(y)) <= 0) {
+                    b.push(a.get(x));
+                    x = x + 1;
+                } else {
+                    b.push(a.get(y));
+                    y = y + 1;
+                }
+            }
+            lo = hi;
+        }
+        a = b;
+        w = w * 2;
+    }
+    return a;
 }
 
 /// Machine code that only exists with the Fides function it hands over to:
@@ -3168,14 +3322,8 @@ pub fn pe_runtime_alias_target(name: str) -> bool {
 
 /// Does the module define a function `name`?
 pub fn pe_module_has_fn(module: & IrModule, name: str) -> bool {
-    var i: i64 = 0;
-    while i < module.functions.len() {
-        if module.functions.get(i).name == name {
-            return true;
-        }
-        i = i + 1;
-    }
-    return false;
+    // SP10: a table lookup, not a scan of every function
+    return IrModule_fn_pos(module, name) >= 0;
 }
 
 /// A C library function the Fides runtime implements itself, for `extern
@@ -3285,12 +3433,18 @@ pub fn pe_ir_autograd_builtin(inst: Inst) -> str {
 /// names the native backends may emit a call for.
 pub fn pe_ir_reachable_from(module: & IrModule, roots: Vec<str>) -> Vec<str> {
     var seen: Vec<str> = Vec::new();
+    // WP15 (Nov 17): membership through a table, and each dyn method's
+    // candidates looked up once (a list scan per name made this, and so
+    // deadf and every caller, quadratic in the module's functions)
+    var seen_set: i64 = HashMap_new();
+    var dyn_done: i64 = HashMap_new();
     var work: Vec<str> = roots;
     var deps: Vec<PeirStrPair> = pe_stub_deps();
     var prints: Vec<str> = pe_print_builtins();
     while work.len() > 0 {
         var f: str = work.pop();
-        if !pe_strs_contains(seen, f) {
+        if !HashMap_contains(seen_set, f) {
+            HashMap_insert(seen_set, f, 1);
             seen.push(f);
             // A stub that hands over to the Fides runtime needs that function
             var di: i64 = 0;
@@ -3300,6 +3454,13 @@ pub fn pe_ir_reachable_from(module: & IrModule, roots: Vec<str>) -> Vec<str> {
                     work.push(dep.b);
                 }
                 di = di + 1;
+            }
+            // CA9: p_panic prints the task chain (pe_ir_stubs.fd
+            // PeirGen_gen_panic) of programs that start tasks: every task
+            // creation reaches pe_co_new_block. Not in pe_stub_deps: pe_ir's
+            // loop over those pairs would give p_panic a new label.
+            if f == "pe_co_new_block" {
+                work.push("pert_task_chain");
             }
             match IrModule_get_function(module, f) {
                 OptIrFunction::Some(func) => {
@@ -3366,14 +3527,17 @@ pub fn pe_ir_reachable_from(module: & IrModule, roots: Vec<str>) -> Vec<str> {
                                 }
                             }
                             Inst::DynCall(_, method, _, _, _) => {
-                                var suffix: str = "_" + method;
-                                var fi: i64 = 0;
-                                while fi < module.functions.len() {
-                                    var fn_name: str = module.functions.get(fi).name;
-                                    if str_ends_with(fn_name, suffix) {
-                                        work.push(fn_name);
+                                if !HashMap_contains(dyn_done, method) {
+                                    HashMap_insert(dyn_done, method, 1);
+                                    var suffix: str = "_" + method;
+                                    var fi: i64 = 0;
+                                    while fi < module.functions.len() {
+                                        var fn_name: str = module.functions.get(fi).name;
+                                        if str_ends_with(fn_name, suffix) {
+                                            work.push(fn_name);
+                                        }
+                                        fi = fi + 1;
                                     }
-                                    fi = fi + 1;
                                 }
                             }
                             _ => {
@@ -3387,6 +3551,8 @@ pub fn pe_ir_reachable_from(module: & IrModule, roots: Vec<str>) -> Vec<str> {
             }
         }
     }
+    HashMap_drop(seen_set);
+    HashMap_drop(dyn_done);
     return pe_sort_strs(seen);
 }
 
@@ -3402,6 +3568,31 @@ pub fn pe_ir_needed_functions(module: & IrModule) -> Vec<str> {
             roots.push(n);
         }
         i = i + 1;
+    }
+    // SL15: the hosted entry point calls the profiler's start and exit
+    // hooks (PeirGen_gen_entry_point) when the runtime has them
+    if pe_module_has_fn(module, "pert_prof_boot") {
+        roots.push("pert_prof_boot");
+    }
+    if pe_module_has_fn(module, "pert_prof_exit") {
+        roots.push("pert_prof_exit");
+    }
+    // CO9: the p_panic stub calls the crash report (PeirGen_gen_panic); it
+    // brings in nat_fn_names' table. Only hosted images merge pe_runtime,
+    // so a bare build never has it.
+    if pe_module_has_fn(module, "pert_crash_report") {
+        roots.push("pert_crash_report");
+    }
+    // P12: the entry point calls pert_limits_boot; p_malloc / p_free call
+    // pert_lim_take / pert_lim_give (PeirGen_gen_lim_call)
+    if pe_module_has_fn(module, "pert_limits_boot") {
+        roots.push("pert_limits_boot");
+    }
+    if pe_module_has_fn(module, "pert_lim_take") {
+        roots.push("pert_lim_take");
+    }
+    if pe_module_has_fn(module, "pert_lim_give") {
+        roots.push("pert_lim_give");
     }
     return pe_ir_reachable_from(module, roots);
 }
@@ -3424,6 +3615,254 @@ pub fn pe_ir_reachable_functions(module: & IrModule) -> Vec<str> {
     return pe_ir_reachable_from(module, roots);
 }
 
+/// WP15: a function dead function elimination keeps whatever calls it:
+/// `main`, `main_entry`, the p_* builtins and `__` helpers (the C runtime
+/// and the native stubs call them), the Fides runtime's pe_/pert_/pet_/ped_
+/// functions (machine code calls pe_rt_init, pe_win_start, pe_on_signal and
+/// others by name: is_pe_runtime_fn), nat_* (nat_ir's TLS helpers), core's
+/// Vec_* and vec_raw_* stand-ins that p_vec_* builtins become
+/// (pe_runtime_alias_target), the collection printers, and the bare
+/// image's syscall entry points. Interrupt handlers and GPU kernels are
+/// installed by name too (the caller adds them). WP7 (Nov 17): also core's
+/// `vec_buf_alloc`, which nat_ir's vector loops (ng_simd_call, OP21) call
+/// by name with a null env first: envtrim must not drop that env, WP6 must
+/// keep its platform convention.
+pub fn ir_dfe_root(name: str) -> bool {
+    if name == "main" || name == "main_entry" || str_starts_with(name, "p_") || str_starts_with(name, "__") {
+        return true;
+    }
+    if is_pe_runtime_fn(name) || str_starts_with(name, "nat_") || pe_runtime_alias_target(name) {
+        return true;
+    }
+    return name == "Vec_to_str" || name == "HashMap_to_str" || name == "vec_buf_alloc" || name == "syscall_dispatch" || name == "syscall_handler";
+}
+
+/// WP7/WP15: the functions the module's data names (a string constant or a
+/// global's string initializer equal to a function's name): a task or
+/// thread entry looked up by name at run time. Their signature must stay
+/// (envtrim, WP6) and they stay alive (deadf), as pe88 roots them.
+pub fn ir_data_named_fns(module: & IrModule) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < module.string_constants.len() {
+        var s: str = module.string_constants.get(i).key;
+        if str_len(s) > 0 && !HashMap_contains(seen, s) && IrModule_fn_pos(module, s) >= 0 {
+            HashMap_insert(seen, s, 1);
+            out.push(s);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.globals.len() {
+        match module.globals.get(i).init {
+            Expr::StringLit(gs) => {
+                if str_len(gs) > 0 && !HashMap_contains(seen, gs) && IrModule_fn_pos(module, gs) >= 0 {
+                    HashMap_insert(seen, gs, 1);
+                    out.push(gs);
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    HashMap_drop(seen);
+    return out;
+}
+
+/// WP15: globals nothing reads. A global whose address is only ever stored
+/// through (never loaded, never passed on, in no function) and whose
+/// initializer is a literal is removed, with those stores and its
+/// GlobalAddr instructions: nothing can see its value. (A str/Vec/map
+/// global is read by every assignment, which drops the old value, so only
+/// scalars qualify.) Returns how many were removed.
+pub fn IrModule_dead_global_elimination(self: & mut IrModule) -> i64 {
+    if self.globals.len() == 0 {
+        return 0;
+    }
+    var gidx: i64 = HashMap_new();
+    var dead: Vec<i64> = Vec::new();
+    var gi: i64 = 0;
+    while gi < self.globals.len() {
+        var lit: bool = false;
+        match self.globals.get(gi).init {
+            Expr::IntLit(_) => {
+                lit = true;
+            }
+            Expr::BoolLit(_) => {
+                lit = true;
+            }
+            Expr::FloatLit(_) => {
+                lit = true;
+            }
+            _ => {
+            }
+        }
+        if lit {
+            dead.push(1);
+        } else {
+            dead.push(0);
+        }
+        HashMap_insert(gidx, self.globals.get(gi).name, gi + 1);
+        gi = gi + 1;
+    }
+    // Phase 1: any use of a global's address but as a Store's pointer
+    // keeps it
+    var fi: i64 = 0;
+    while fi < self.functions.len() {
+        var f: IrFunction = self.functions.get(fi).func;
+        var gof: Vec<i64> = Vec::new();
+        while gof.len() <= f.next_value {
+            gof.push(0);
+        }
+        var any: bool = false;
+        var ii: i64 = 0;
+        while ii < f.insts.len() {
+            var ve: ValueIdInst = f.insts.get(ii);
+            match ve.inst {
+                Inst::GlobalAddr(gn, _) => {
+                    if HashMap_contains(gidx, gn) && ve.id >= 0 && ve.id < gof.len() {
+                        gof.set(ve.id, HashMap_get(gidx, gn));
+                        any = true;
+                    }
+                }
+                // WP15 (Nov 17): inline assembly may read a global by its
+                // symbol name: one its text names stays
+                Inst::Asm(tpl, _, _, _) => {
+                    var ag: i64 = 0;
+                    while ag < self.globals.len() {
+                        if dead.get(ag) == 1 && str_contains(tpl, self.globals.get(ag).name) {
+                            dead.set(ag, 0);
+                        }
+                        ag = ag + 1;
+                    }
+                }
+                _ => {
+                }
+            }
+            ii = ii + 1;
+        }
+        if any {
+            ii = 0;
+            while ii < f.insts.len() {
+                var ve2: ValueIdInst = f.insts.get(ii);
+                var refs: Vec<i64> = inst_value_refs(& ve2.inst);
+                var ri: i64 = 0;
+                while ri < refs.len() {
+                    var o: i64 = refs.get(ri);
+                    if o >= 0 && o < gof.len() && gof.get(o) > 0 {
+                        var only_ptr: bool = false;
+                        match ve2.inst {
+                            Inst::Store(sp, sv, _) => {
+                                only_ptr = sp == o && sv != o;
+                            }
+                            _ => {
+                            }
+                        }
+                        if !only_ptr {
+                            dead.set(gof.get(o) - 1, 0);
+                        }
+                    }
+                    ri = ri + 1;
+                }
+                ii = ii + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    var removed: i64 = 0;
+    gi = 0;
+    while gi < dead.len() {
+        removed = removed + dead.get(gi);
+        gi = gi + 1;
+    }
+    if removed == 0 {
+        HashMap_drop(gidx);
+        return 0;
+    }
+    // Phase 2: drop the stores and addresses of the dead ones from the blocks
+    fi = 0;
+    while fi < self.functions.len() {
+        var ent: IrFunctionEntry = self.functions.get(fi);
+        var f2: IrFunction = ent.func;
+        var gaddr: Vec<i64> = Vec::new();
+        while gaddr.len() <= f2.next_value {
+            gaddr.push(0);
+        }
+        var touched: bool = false;
+        var jj: i64 = 0;
+        while jj < f2.insts.len() {
+            var ve3: ValueIdInst = f2.insts.get(jj);
+            match ve3.inst {
+                Inst::GlobalAddr(gn2, _) => {
+                    if HashMap_contains(gidx, gn2) && ve3.id >= 0 && ve3.id < gaddr.len() {
+                        if dead.get(HashMap_get(gidx, gn2) - 1) == 1 {
+                            gaddr.set(ve3.id, 1);
+                            touched = true;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            jj = jj + 1;
+        }
+        if touched {
+            var bi: i64 = 0;
+            while bi < f2.blocks.len() {
+                var blk: BasicBlock = f2.blocks.get(bi);
+                var keep: Vec<i64> = Vec::new();
+                var k: i64 = 0;
+                while k < blk.instructions.len() {
+                    var id: i64 = blk.instructions.get(k);
+                    var gone: bool = id >= 0 && id < gaddr.len() && gaddr.get(id) == 1;
+                    match IrFunction_get_inst(& f2, id) {
+                        OptInst::Some(si) => {
+                            match si {
+                                Inst::Store(sp2, _, _) => {
+                                    if sp2 >= 0 && sp2 < gaddr.len() && gaddr.get(sp2) == 1 {
+                                        gone = true;
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        OptInst::None => {
+                        }
+                    }
+                    if !gone {
+                        keep.push(id);
+                    }
+                    k = k + 1;
+                }
+                if keep.len() != blk.instructions.len() {
+                    blk.instructions = keep;
+                    f2.blocks.set(bi, blk);
+                }
+                bi = bi + 1;
+            }
+            ent.func = f2;
+            self.functions.set(fi, ent);
+        }
+        fi = fi + 1;
+    }
+    var kept: Vec<GlobalEntry> = Vec::new();
+    gi = 0;
+    while gi < self.globals.len() {
+        if dead.get(gi) == 0 {
+            kept.push(self.globals.get(gi));
+        }
+        gi = gi + 1;
+    }
+    self.globals = kept;
+    // SP10: the positions changed
+    HashMap_clear(self.global_index);
+    HashMap_drop(gidx);
+    return removed;
+}
+
 /// Remove functions that are never called (except `main` and `p_*` runtime stubs).
 /// This reduces the size of the generated C code significantly.
 ///
@@ -3438,12 +3877,15 @@ pub fn IrModule_dead_function_elimination(self: & mut IrModule) -> i64 {
     }
 
     // Roots: main, the p_* runtime functions (they may be called from the C
-    // runtime), functions handed to C as callbacks, and extern functions.
+    // runtime), functions handed to C as callbacks, extern functions, and
+    // (WP15) every function machine code calls by name, not through an IR
+    // call: see ir_dfe_root.
     var roots: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < self.functions.len() {
         var name: str = self.functions.get(i).name;
-        if name == "main" || name == "main_entry" || (str_len(name) >= 2 && str_byte_at(name, 0) == 112 && str_byte_at(name, 1) == 95) {
+        var rf: IrFunction = self.functions.get(i).func;
+        if ir_dfe_root(name) || rf.is_interrupt || rf.is_kernel {
             roots.push(name);
         }
         i = i + 1;
@@ -3458,8 +3900,23 @@ pub fn IrModule_dead_function_elimination(self: & mut IrModule) -> i64 {
         roots.push(self.extern_functions.get(i).name);
         i = i + 1;
     }
+    // WP15 (Nov 17): a function the module's data names (a string constant
+    // or a global's string initializer: a task entry looked up at run time)
+    var named: Vec<str> = ir_data_named_fns(self);
+    i = 0;
+    while i < named.len() {
+        roots.push(named.get(i));
+        i = i + 1;
+    }
 
     var reachable: Vec<str> = pe_ir_reachable_from(self, roots);
+    // WP15 (Nov 17): a table, not a list scan per function
+    var keep: i64 = HashMap_new();
+    i = 0;
+    while i < reachable.len() {
+        HashMap_insert(keep, reachable.get(i), 1);
+        i = i + 1;
+    }
 
     // Remove unreachable functions
     var removed: i64 = 0;
@@ -3467,13 +3924,14 @@ pub fn IrModule_dead_function_elimination(self: & mut IrModule) -> i64 {
     i = 0;
     while i < self.functions.len() {
         var entry: IrFunctionEntry = self.functions.get(i);
-        if ir_c_str_vec_contains(reachable, entry.name) {
+        if HashMap_contains(keep, entry.name) {
             new_functions.push(entry);
         } else {
             removed = removed + 1;
         }
         i = i + 1;
     }
+    HashMap_drop(keep);
 
     if removed > 0 {
         self.functions = new_functions;
@@ -3830,6 +4288,19 @@ pub fn IrModule_verify(self: & IrModule) -> VerificationResult {
                                     result.errors.push("function '" + name + "': block " + int_to_str(block.id) + " branches to invalid else-block " + int_to_str(else_b));
                                 }
                             }
+                            Inst::Switch(_, sw_keys, sw_targets, sw_dflt) => {
+                                var swt: Vec<i64> = switch_succ_blocks(sw_targets, sw_dflt);
+                                var swi: i64 = 0;
+                                while swi < swt.len() {
+                                    if !vec_contains(valid_blocks, swt.get(swi)) {
+                                        result.errors.push("function '" + name + "': block " + int_to_str(block.id) + " switches to invalid block " + int_to_str(swt.get(swi)));
+                                    }
+                                    swi = swi + 1;
+                                }
+                                if sw_keys.len() != sw_targets.len() {
+                                    result.errors.push("function '" + name + "': block " + int_to_str(block.id) + " has a switch with " + int_to_str(sw_keys.len()) + " keys and " + int_to_str(sw_targets.len()) + " targets");
+                                }
+                            }
                             _ => {
                             }
                         }
@@ -4027,6 +4498,346 @@ pub fn IrModule_to_str(self: & IrModule) -> str {
     return out;
 }
 
+// --- DB7: one function's IR with its operands -----------------------------
+// `fid explain <file> --stages <fn>` (main.fd) prints a function after each
+// stage of the native pipeline. The module printer above names only each
+// instruction's kind; this one shows operands, types and source lines.
+
+/// A binary operator as the IR printer shows it.
+pub fn ir_binop_str(op: BinOp) -> str {
+    match op {
+        BinOp::Add => {
+            return "add";
+        }
+        BinOp::Sub => {
+            return "sub";
+        }
+        BinOp::Mul => {
+            return "mul";
+        }
+        BinOp::Div => {
+            return "div";
+        }
+        BinOp::Mod => {
+            return "mod";
+        }
+        BinOp::Eq => {
+            return "eq";
+        }
+        BinOp::Neq => {
+            return "ne";
+        }
+        BinOp::Lt => {
+            return "lt";
+        }
+        BinOp::Gt => {
+            return "gt";
+        }
+        BinOp::LtEq => {
+            return "le";
+        }
+        BinOp::GtEq => {
+            return "ge";
+        }
+        BinOp::And => {
+            return "and";
+        }
+        BinOp::Or => {
+            return "or";
+        }
+        BinOp::BitAnd => {
+            return "bitand";
+        }
+        BinOp::BitOr => {
+            return "bitor";
+        }
+        BinOp::BitXor => {
+            return "xor";
+        }
+        BinOp::Shl => {
+            return "shl";
+        }
+        BinOp::Shr => {
+            return "shr";
+        }
+    }
+    return "?";
+}
+
+/// A unary operator as the IR printer shows it.
+pub fn ir_unop_str(op: UnaryOp) -> str {
+    match op {
+        UnaryOp::Neg => {
+            return "neg";
+        }
+        UnaryOp::Not => {
+            return "not";
+        }
+        UnaryOp::BitNot => {
+            return "bitnot";
+        }
+    }
+    return "?";
+}
+
+/// Value ids as `%a, %b`.
+fn ir_ids_str(ids: Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < ids.len() {
+        if i > 0 {
+            out = out + ", ";
+        }
+        out = out + value_id_to_str(ids.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Text with its line breaks written as `\n`, for one-line output.
+fn ir_one_line(s: str) -> str {
+    return str_replace(s, "\n", "\\n");
+}
+
+/// One instruction with its operands, e.g. `add %3, %4: i64`.
+pub fn inst_detail_str(inst: Inst) -> str {
+    match inst {
+        Inst::ConstInt(v, t) => {
+            return "const " + int_to_str(v) + ": " + ir_type_to_str(t);
+        }
+        Inst::ConstFloat(v, t) => {
+            return "const " + float_to_str(v) + ": " + ir_type_to_str(t);
+        }
+        Inst::ConstBool(b) => {
+            if b {
+                return "const true";
+            }
+            return "const false";
+        }
+        Inst::ConstStr(s) => {
+            return "const \"" + ir_one_line(s) + "\"";
+        }
+        Inst::ConstFnRef(f) => {
+            return "fnref " + f;
+        }
+        Inst::ConstNull(t) => {
+            return "null: " + ir_type_to_str(t);
+        }
+        Inst::GlobalAddr(g, t) => {
+            return "global " + g + ": " + ir_type_to_str(t);
+        }
+        Inst::BinOp(op, a, b, t) => {
+            return ir_binop_str(op) + " " + value_id_to_str(a) + ", " + value_id_to_str(b) + ": " + ir_type_to_str(t);
+        }
+        Inst::UnaryOp(op, a, t) => {
+            return ir_unop_str(op) + " " + value_id_to_str(a) + ": " + ir_type_to_str(t);
+        }
+        Inst::Alloca(t, r) => {
+            return "alloca " + ir_type_to_str(t) + " in " + region_to_str(r);
+        }
+        Inst::Load(p, t) => {
+            return "load " + value_id_to_str(p) + ": " + ir_type_to_str(t);
+        }
+        Inst::Store(p, v, _) => {
+            return "store " + value_id_to_str(v) + " -> " + value_id_to_str(p);
+        }
+        Inst::GetFieldPtr(p, f, t) => {
+            return "fieldptr " + value_id_to_str(p) + ", field " + int_to_str(f) + ": " + ir_type_to_str(t);
+        }
+        Inst::GetElemPtr(p, ix, t) => {
+            return "elemptr " + value_id_to_str(p) + "[" + value_id_to_str(ix) + "]: " + ir_type_to_str(t);
+        }
+        Inst::Jump(b) => {
+            return "jump " + block_id_to_str(b);
+        }
+        Inst::Branch(c, a, b) => {
+            return "branch " + value_id_to_str(c) + ", " + block_id_to_str(a) + ", " + block_id_to_str(b);
+        }
+        Inst::Switch(sv, keys, targets, dflt) => {
+            var st: str = "switch " + value_id_to_str(sv) + " [";
+            var si: i64 = 0;
+            while si < keys.len() && si < targets.len() {
+                if si > 0 {
+                    st = st + ", ";
+                }
+                st = st + int_to_str(keys.get(si)) + ": " + block_id_to_str(targets.get(si));
+                si = si + 1;
+            }
+            return st + "], default " + block_id_to_str(dflt);
+        }
+        Inst::Return(rv) => {
+            match rv {
+                OptValueId::Some(v) => {
+                    return "return " + value_id_to_str(v);
+                }
+                OptValueId::None => {
+                    return "return";
+                }
+            }
+        }
+        Inst::Unreachable => {
+            return "unreachable";
+        }
+        Inst::Call(f, args, t, _) => {
+            return "call " + f + "(" + ir_ids_str(args) + "): " + ir_type_to_str(t);
+        }
+        Inst::CallPtr(fp, args, t, _, _) => {
+            return "callptr " + value_id_to_str(fp) + "(" + ir_ids_str(args) + "): " + ir_type_to_str(t);
+        }
+        Inst::DynCall(tr, m, args, t, _) => {
+            return "dyncall " + tr + "::" + m + "(" + ir_ids_str(args) + "): " + ir_type_to_str(t);
+        }
+        Inst::MakeDyn(v, tn, tr) => {
+            return "makedyn " + value_id_to_str(v) + " as " + tn + ": dyn " + tr;
+        }
+        Inst::BitCast(v, from, to) => {
+            return "bitcast " + value_id_to_str(v) + ": " + ir_type_to_str(from) + " -> " + ir_type_to_str(to);
+        }
+        Inst::IntExtend(v, from, to) => {
+            return "extend " + value_id_to_str(v) + ": " + ir_type_to_str(from) + " -> " + ir_type_to_str(to);
+        }
+        Inst::IntTrunc(v, from, to) => {
+            return "trunc " + value_id_to_str(v) + ": " + ir_type_to_str(from) + " -> " + ir_type_to_str(to);
+        }
+        Inst::IntToFloat(v, from, to) => {
+            return "itof " + value_id_to_str(v) + ": " + ir_type_to_str(from) + " -> " + ir_type_to_str(to);
+        }
+        Inst::FloatToInt(v, from, to) => {
+            return "ftoi " + value_id_to_str(v) + ": " + ir_type_to_str(from) + " -> " + ir_type_to_str(to);
+        }
+        Inst::TryUnwrap(v, ok_dst, err_b, ok_b) => {
+            return "try " + value_id_to_str(v) + " -> " + value_id_to_str(ok_dst) + ", err " + block_id_to_str(err_b) + ", ok " + block_id_to_str(ok_b);
+        }
+        Inst::Print(v, t) => {
+            return "print " + value_id_to_str(v) + ": " + ir_type_to_str(t);
+        }
+        Inst::Panic(m) => {
+            return "panic \"" + ir_one_line(m) + "\"";
+        }
+        Inst::Asm(tpl, _, _, t) => {
+            return "asm \"" + ir_one_line(tpl) + "\": " + ir_type_to_str(t);
+        }
+        Inst::RegionBegin(rn, _, _, _) => {
+            return "region begin " + rn;
+        }
+        Inst::RegionEnd(rn, _, _) => {
+            return "region end " + rn;
+        }
+        Inst::PersistLoad(pn, v, t) => {
+            return "persist load " + pn + ", " + value_id_to_str(v) + ": " + ir_type_to_str(t);
+        }
+        Inst::PersistSave(pn, v) => {
+            return "persist save " + pn + ", " + value_id_to_str(v);
+        }
+        Inst::TxnBegin => {
+            return "txn begin";
+        }
+        Inst::TxnEnd => {
+            return "txn end";
+        }
+        Inst::UnsafeBegin => {
+            return "unsafe begin";
+        }
+        Inst::UnsafeEnd => {
+            return "unsafe end";
+        }
+        Inst::GradBegin(gn) => {
+            return "grad begin " + gn;
+        }
+        Inst::GradEnd => {
+            return "grad end";
+        }
+        Inst::Backward(v) => {
+            return "backward " + value_id_to_str(v);
+        }
+        Inst::StructCopy(d, s, t) => {
+            return "structcopy " + value_id_to_str(s) + " -> " + value_id_to_str(d) + ": " + ir_type_to_str(t);
+        }
+    }
+    return "?";
+}
+
+/// One function with every instruction's operands and source line.
+pub fn IrFunction_detail_str(func: & IrFunction, name: str) -> str {
+    var out: str = "fn " + name + "(";
+    var j: i64 = 0;
+    while j < func.params.len() {
+        if j > 0 {
+            out = out + ", ";
+        }
+        out = out + value_id_to_str(func.params.get(j).id) + ": " + ir_type_to_str(func.params.get(j).ty);
+        j = j + 1;
+    }
+    out = out + ") -> " + ir_type_to_str(func.ret_ty) + " " + EffectSet_to_str(& func.effects) + "\n";
+    var n_insts: i64 = 0;
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        out = out + "  " + block_id_to_str(block.id) + ":";
+        var pi: i64 = 0;
+        while pi < block.params.len() {
+            if pi == 0 {
+                out = out + " (";
+            } else {
+                out = out + ", ";
+            }
+            out = out + value_id_to_str(block.params.get(pi).id) + ": " + ir_type_to_str(block.params.get(pi).ty);
+            pi = pi + 1;
+        }
+        if block.params.len() > 0 {
+            out = out + ")";
+        }
+        out = out + "\n";
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var inst_id: i64 = block.instructions.get(ii);
+            var text: str = "???";
+            var lhs: str = value_id_to_str(inst_id) + " = ";
+            match IrFunction_get_inst(func, inst_id) {
+                OptInst::Some(inst) => {
+                    if inst_is_terminator(inst) {
+                        lhs = "";
+                    }
+                    text = inst_detail_str(inst);
+                }
+                OptInst::None => {
+                }
+            }
+            var line_str: str = "";
+            match IrFunction_get_meta(func, inst_id) {
+                OptValueMeta::Some(meta) => {
+                    match meta.source_line {
+                        OptU64::Some(ln) => {
+                            line_str = "    ; line " + int_to_str(ln);
+                        }
+                        OptU64::None => {
+                        }
+                    }
+                }
+                OptValueMeta::None => {
+                }
+            }
+            out = out + "    " + lhs + text + line_str + "\n";
+            n_insts = n_insts + 1;
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    out = out + "  ; " + int_to_str(func.blocks.len()) + " block(s), " + int_to_str(n_insts) + " instruction(s)\n";
+    return out;
+}
+
+/// Function `name` of the module as IrFunction_detail_str prints it, or ""
+/// when the module has no such function (inlined away, or never reached).
+pub fn IrModule_function_detail_str(self: & IrModule, name: str) -> str {
+    var at: i64 = IrModule_fn_pos(self, name);
+    if at < 0 {
+        return "";
+    }
+    var entry: IrFunctionEntry = self.functions.get(at);
+    return IrFunction_detail_str(& entry.func, entry.name);
+}
+
 // --- SourceMap generation ------------------------------------------------
 
 pub fn IrModule_source_map(self: & IrModule) -> SourceMap {
@@ -4096,4 +4907,1085 @@ pub fn c_vec1(s: str) -> Vec<str> {
 /// Check if a file exists.
 pub fn c_file_exists(path: str) -> bool {
     return p_file_exists(path) != 0;
+}
+
+// --- DB1: the source file of each function --------------------------------
+// The import loops (compiler.fd) and main.fd's native path record, for each
+// function a file defines (methods as `Type_method`, the IR's name), the
+// file's path; nat_ir.fd's line table writes that function's rows against
+// it. Functions of core and the runtime are recorded apart (ir_note_lib_*,
+// below: compiler.fd as it parses the library, or from the binary
+// artifact), monomorphized instances take their generic's file
+// (ir_fn_src_file) and code inlined from another file keeps its own
+// (ir_copy_value_file, ir_value_file).
+var g_ir_fn_files: i64 = 0;  // function name -> path
+var g_ir_lib_files: i64 = 0;  // a library function's name -> path
+var g_ir_lib_pairs: Vec<str> = Vec::new();  // name, path, ... as recorded
+var g_ir_val_files: i64 = 0;  // "<function>@<id>" -> path of inlined code
+var g_ir_val_fns: i64 = 0;  // function -> 1 when it has g_ir_val_files entries
+var g_ir_fn_alias: i64 = 0;  // a clone's name -> the function it was cloned from
+
+pub fn ir_note_fn_file(name: str, path: str) {
+    if g_ir_fn_files == 0 {
+        g_ir_fn_files = HashMap_new();
+    }
+    HashMap_insert(g_ir_fn_files, name, path);
+}
+
+/// The file `name` was recorded from, or "": the program's own files
+/// first, then the library's (a function the program defines again is the
+/// program's, as in the merge).
+pub fn ir_fn_file(name: str) -> str {
+    if g_ir_fn_files != 0 {
+        if HashMap_contains(g_ir_fn_files, name) {
+            var p: str = HashMap_get(g_ir_fn_files, name);
+            return p;
+        }
+    }
+    if g_ir_lib_files != 0 {
+        if HashMap_contains(g_ir_lib_files, name) {
+            var lp: str = HashMap_get(g_ir_lib_files, name);
+            return lp;
+        }
+    }
+    return "";
+}
+
+/// Record every function and method of `prog` as defined in `path`.
+pub fn ir_note_program_files(prog: & Program, path: str) {
+    if str_len(path) == 0 {
+        return;
+    }
+    var i: i64 = 0;
+    while i < prog.funcs.len() {
+        ir_note_fn_file(prog.funcs.get(i).name, path);
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.impls.len() {
+        var imp: ImplDef = prog.impls.get(i);
+        var k: i64 = 0;
+        while k < imp.methods.len() {
+            ir_note_fn_file(imp.struct_name + "_" + imp.methods.get(k).name, path);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.trait_impls.len() {
+        var ti: TraitImpl = prog.trait_impls.get(i);
+        var t: i64 = 0;
+        while t < ti.methods.len() {
+            ir_note_fn_file(ti.type_name + "_" + ti.methods.get(t).name, path);
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// --- DB1: the library's files ----------------------------------------------
+// core and the runtime files merged into it: compiler.fd records them as it
+// parses them (core first), and stores the pairs in the binary artifact so
+// an artifact hit restores them (ir_lib_file_pairs, ir_note_lib_pairs). The
+// first record of a name wins: core's definition over a runtime file's, an
+// earlier runtime file over a later one, as the merge keeps them. The
+// program's own files (ir_note_fn_file) win over all of them (ir_fn_file).
+
+fn ir_note_lib_fn(name: str, path: str) {
+    if g_ir_lib_files == 0 {
+        g_ir_lib_files = HashMap_new();
+    }
+    if HashMap_contains(g_ir_lib_files, name) {
+        return;
+    }
+    HashMap_insert(g_ir_lib_files, name, path);
+    g_ir_lib_pairs.push(name);
+    g_ir_lib_pairs.push(path);
+}
+
+/// Record every function and method of the library file `prog` (core, a
+/// runtime file) as defined in `path`.
+pub fn ir_note_lib_program(prog: & Program, path: str) {
+    if str_len(path) == 0 {
+        return;
+    }
+    var i: i64 = 0;
+    while i < prog.funcs.len() {
+        ir_note_lib_fn(prog.funcs.get(i).name, path);
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.impls.len() {
+        var imp: ImplDef = prog.impls.get(i);
+        var k: i64 = 0;
+        while k < imp.methods.len() {
+            ir_note_lib_fn(imp.struct_name + "_" + imp.methods.get(k).name, path);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.trait_impls.len() {
+        var ti: TraitImpl = prog.trait_impls.get(i);
+        var t: i64 = 0;
+        while t < ti.methods.len() {
+            ir_note_lib_fn(ti.type_name + "_" + ti.methods.get(t).name, path);
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// The library's records as pairs: name, path, name, path, ... (what the
+/// binary artifact stores).
+pub fn ir_lib_file_pairs() -> Vec<str> {
+    return g_ir_lib_pairs;
+}
+
+/// Restore library records from pairs name, path (an artifact hit).
+pub fn ir_note_lib_pairs(pairs: Vec<str>) {
+    var i: i64 = 0;
+    while i + 1 < pairs.len() {
+        ir_note_lib_fn(pairs.get(i), pairs.get(i + 1));
+        i = i + 2;
+    }
+}
+
+/// The library file `name` was recorded from, or "" (tests, tools).
+pub fn ir_lib_fn_file(name: str) -> str {
+    if g_ir_lib_files == 0 {
+        return "";
+    }
+    if !HashMap_contains(g_ir_lib_files, name) {
+        return "";
+    }
+    var p: str = HashMap_get(g_ir_lib_files, name);
+    return p;
+}
+
+// --- DB1: generated functions and inlined code ------------------------------
+
+/// `copy_name` is a copy of function `orig` under a new name (iropt.fd
+/// iro_clone_function: a specialization): same instructions, same ids, so
+/// its rows take the files `orig`'s take.
+pub fn ir_note_fn_clone(orig: str, copy_name: str) {
+    if orig == copy_name {
+        return;
+    }
+    if g_ir_fn_alias == 0 {
+        g_ir_fn_alias = HashMap_new();
+    }
+    HashMap_insert(g_ir_fn_alias, copy_name, orig);
+}
+
+/// The function `name` was cloned from, or "".
+fn ir_fn_alias_of(name: str) -> str {
+    if g_ir_fn_alias == 0 {
+        return "";
+    }
+    if !HashMap_contains(g_ir_fn_alias, name) {
+        return "";
+    }
+    var o: str = HashMap_get(g_ir_fn_alias, name);
+    return o;
+}
+
+/// The file of function `name` for its line rows: ir_fn_file; for a clone
+/// (ir_note_fn_clone) the file of the function cloned; for a
+/// monomorphized instance (mono.fd mangle: `f__T1_T2`, mangle_method:
+/// `Type__m__T1`) or a function the optimizer made from another
+/// (`f__cdev_g`, `f__dyn0_T`) the file of the function it was made from.
+/// "" when none is known (a compiler-made `__name`).
+pub fn ir_fn_src_file(name: str) -> str {
+    var p: str = ir_fn_file(name);
+    if str_len(p) > 0 {
+        return p;
+    }
+    var cur: str = name;
+    var depth: i64 = 0;
+    while depth < 8 {
+        var orig: str = ir_fn_alias_of(cur);
+        if str_len(orig) == 0 {
+            break;
+        }
+        var op: str = ir_fn_file(orig);
+        if str_len(op) > 0 {
+            return op;
+        }
+        cur = orig;
+        depth = depth + 1;
+    }
+    var a: i64 = str_find(cur, "__");
+    if a <= 0 {
+        return "";
+    }
+    var base: str = str_slice(cur, 0, a);
+    var rest: str = str_slice(cur, a + 2, str_len(cur));
+    var b: i64 = str_find(rest, "__");
+    if b > 0 {
+        var mp: str = ir_fn_file(base + "_" + str_slice(rest, 0, b));
+        if str_len(mp) > 0 {
+            return mp;
+        }
+    }
+    return ir_fn_file(base);
+}
+
+/// The file recorded for instruction `id` of function `fname` by
+/// ir_copy_value_file (or for the same instruction of the function `fname`
+/// was cloned from), or "": the function's own file.
+pub fn ir_value_file_rec(fname: str, id: i64) -> str {
+    if g_ir_val_files == 0 {
+        return "";
+    }
+    var cur: str = fname;
+    var depth: i64 = 0;
+    while depth < 8 {
+        var key: str = cur + "@" + int_to_str(id);
+        if HashMap_contains(g_ir_val_files, key) {
+            var p: str = HashMap_get(g_ir_val_files, key);
+            return p;
+        }
+        var orig: str = ir_fn_alias_of(cur);
+        if str_len(orig) == 0 {
+            return "";
+        }
+        cur = orig;
+        depth = depth + 1;
+    }
+    return "";
+}
+
+/// Whether any instruction of `fname` (or of the function it was cloned
+/// from) has a file of its own (nat_ir.fd asks once per instruction).
+pub fn ir_fn_has_value_files(fname: str) -> bool {
+    if g_ir_val_fns == 0 {
+        return false;
+    }
+    var cur: str = fname;
+    var depth: i64 = 0;
+    while depth < 8 {
+        if HashMap_contains(g_ir_val_fns, cur) {
+            return true;
+        }
+        var orig: str = ir_fn_alias_of(cur);
+        if str_len(orig) == 0 {
+            return false;
+        }
+        cur = orig;
+        depth = depth + 1;
+    }
+    return false;
+}
+
+/// The source file of instruction `id` of function `fname`: the file of
+/// the code it was inlined from, else the function's own.
+pub fn ir_value_file(fname: str, id: i64) -> str {
+    var p: str = ir_value_file_rec(fname, id);
+    if str_len(p) > 0 {
+        return p;
+    }
+    return ir_fn_src_file(fname);
+}
+
+/// Instruction `to` of function `dst` is a copy of instruction `from` of
+/// function `src` (inlined: iropt.fd iro_copy_line, iropt_me.fd
+/// ime_copy_line; or copied within one function: ime_copy_line_self). The
+/// copy keeps the source line (those helpers) and, here, the file of the
+/// code it came from, recorded only when that is not `dst`'s own file: a
+/// function with no code from elsewhere has no entries. A copy from a
+/// function of no known file stays on `dst`'s.
+pub fn ir_copy_value_file(src: str, from: i64, dst: str, to: i64) {
+    var path: str = ir_value_file(src, from);
+    var key: str = dst + "@" + int_to_str(to);
+    if str_len(path) == 0 || path == ir_fn_src_file(dst) {
+        // dst's own file: forget an older record of the same id
+        if g_ir_val_files != 0 {
+            if HashMap_contains(g_ir_val_files, key) {
+                HashMap_insert(g_ir_val_files, key, "");
+            }
+        }
+        return;
+    }
+    if g_ir_val_files == 0 {
+        g_ir_val_files = HashMap_new();
+    }
+    if g_ir_val_fns == 0 {
+        g_ir_val_fns = HashMap_new();
+    }
+    HashMap_insert(g_ir_val_files, key, path);
+    HashMap_insert(g_ir_val_fns, dst, 1);
+}
+
+/// Forget the records of inlined code and clones (a new module is about to
+/// be optimized: in a long-lived process, `fid serve` or the LSP, an
+/// earlier build's ids would otherwise name instructions of this one).
+pub fn ir_value_files_reset() {
+    g_ir_val_files = 0;
+    g_ir_val_fns = 0;
+    g_ir_fn_alias = 0;
+}
+
+// ===========================================================================
+// Multi-way branches (ME28, MI27)
+//
+// Inst::Switch(value, keys, targets, default) is formed from the compare
+// chains `match` lowers to (`x == k1 -> T1 else x == k2 -> T2 ... -> D`) by
+// IrFunction_form_switches, on the final IR of a backend that handles it:
+// codegen_c (a C `switch`) and nat_ir (a tree of compares and bit tests,
+// ir_switch_plan). The mid-end (iropt, iropt_me, rules, egraph) runs before
+// and never sees one; a backend that cannot handle it (pe_ir) gets
+// IrFunction_without_switches, which turns every Switch back into a chain.
+// lower.fd's LOWER_SWITCH (off) would form them right after lowering.
+// FID_SWITCH=off: no switches are formed.
+// ===========================================================================
+
+var g_ir_switch_state: i64 = 0;  /// Fewest distinct keys a chain needs to become a Switch.
+const IR_SWITCH_MIN: i64 = 4;  /// Whether switches are formed (FID_SWITCH=off or 0: no).
+pub fn ir_switch_on() -> bool {
+    if g_ir_switch_state == 0 {
+        g_ir_switch_state = 1;
+        var e: str = p_getenv("FID_SWITCH");
+        if (e as i64) != 0 && (e == "off" || e == "0") {
+            g_ir_switch_state = 2;
+        }
+    }
+    return g_ir_switch_state == 1;
+}
+
+/// The blocks a Switch may go to: each target once, then the default.
+pub fn switch_succ_blocks(targets: Vec<i64>, dflt: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < targets.len() {
+        if !vec_contains(out, targets.get(i)) {
+            out.push(targets.get(i));
+        }
+        i = i + 1;
+    }
+    if !vec_contains(out, dflt) {
+        out.push(dflt);
+    }
+    return out;
+}
+
+/// The blocks a terminator may go to (each once): Jump, Branch, Switch;
+/// empty for anything else.
+pub fn inst_succ_blocks(inst: Inst) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    match inst {
+        Inst::Jump(t) => {
+            out.push(t);
+        }
+        Inst::Branch(_, t, e) => {
+            out.push(t);
+            if e != t {
+                out.push(e);
+            }
+        }
+        Inst::Switch(_, _, targets, dflt) => {
+            return switch_succ_blocks(targets, dflt);
+        }
+        _ => {
+        }
+    }
+    return out;
+}
+
+fn ir_sw_inst(f: & IrFunction, id: i64) -> Inst {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(i) => {
+            return i;
+        }
+        OptInst::None => {
+            return Inst::Unreachable;
+        }
+    }
+}
+
+/// A value switches when it is an integer: every backend holds a narrow
+/// one in canonical form (zero- or sign-extended) and compares whole
+/// words, as the compare chain does (ME28: match on u8 etc.).
+fn ir_sw_word(f: & IrFunction, x: i64) -> bool {
+    var ty: IrType = IrType::Void;
+    var found: bool = false;
+    var i: i64 = 0;
+    while i < f.params.len() {
+        if f.params.get(i).id == x {
+            ty = f.params.get(i).ty;
+            found = true;
+        }
+        i = i + 1;
+    }
+    if !found {
+        match IrFunction_get_meta(f, x) {
+            OptValueMeta::Some(m) => {
+                ty = m.ty;
+            }
+            OptValueMeta::None => {
+                return false;
+            }
+        }
+    }
+    match ty {
+        IrType::I64 => {
+            return true;
+        }
+        IrType::U64 => {
+            return true;
+        }
+        IrType::I8 => {
+            return true;
+        }
+        IrType::I16 => {
+            return true;
+        }
+        IrType::I32 => {
+            return true;
+        }
+        IrType::U8 => {
+            return true;
+        }
+        IrType::U16 => {
+            return true;
+        }
+        IrType::U32 => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// The test `c` of a chain link: `x == k` (either side constant) with x a
+/// word. Returns [x, k], or [] when `c` is no such test.
+fn ir_sw_case(f: & IrFunction, c: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    match ir_sw_inst(f, c) {
+        Inst::BinOp(op, l, r, _) => {
+            match op {
+                BinOp::Eq => {
+                }
+                _ => {
+                    return out;
+                }
+            }
+            var x: i64 = - 1;
+            var k: i64 = 0;
+            match ir_sw_inst(f, r) {
+                Inst::ConstInt(kv, _) => {
+                    x = l;
+                    k = kv;
+                }
+                _ => {
+                    match ir_sw_inst(f, l) {
+                        Inst::ConstInt(kv2, _) => {
+                            x = r;
+                            k = kv2;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+            }
+            if x >= 0 && ir_sw_word(f, x) {
+                out.push(x);
+                out.push(k);
+            }
+        }
+        _ => {
+        }
+    }
+    return out;
+}
+
+/// What a load `x` reads, as a key two loads share when they read the same
+/// word: "p<ptr>" for a load through pointer value ptr, "f<base>.<field>"
+/// for a load through a field address; "" when x is no load.
+fn ir_sw_mem_key(f: & IrFunction, x: i64) -> str {
+    match ir_sw_inst(f, x) {
+        Inst::Load(p, _) => {
+            match ir_sw_inst(f, p) {
+                Inst::GetFieldPtr(b, fi, _) => {
+                    return "f" + int_to_str(b) + "." + int_to_str(fi);
+                }
+                _ => {
+                    return "p" + int_to_str(p);
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// An instruction a chain link may hold besides its test: computes, reads
+/// at most, and cannot trap in a way the chain's first test would not.
+fn ir_sw_link_inst(inst: Inst) -> bool {
+    match inst {
+        Inst::ConstInt(_, _) => {
+            return true;
+        }
+        Inst::ConstBool(_) => {
+            return true;
+        }
+        Inst::ConstNull(_) => {
+            return true;
+        }
+        Inst::Load(_, _) => {
+            return true;
+        }
+        Inst::GetFieldPtr(_, _, _) => {
+            return true;
+        }
+        Inst::IntExtend(_, _, _) => {
+            return true;
+        }
+        Inst::IntTrunc(_, _, _) => {
+            return true;
+        }
+        Inst::BitCast(_, _, _) => {
+            return true;
+        }
+        Inst::BinOp(op, _, _, _) => {
+            match op {
+                BinOp::Eq => {
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// Is `x` a load in block `ids` with nothing after it that could write?
+fn ir_sw_late_load(f: & IrFunction, ids: Vec<i64>, x: i64) -> bool {
+    var at: i64 = - 1;
+    var i: i64 = 0;
+    while i < ids.len() {
+        if ids.get(i) == x {
+            at = i;
+        }
+        i = i + 1;
+    }
+    if at < 0 {
+        return false;
+    }
+    i = at + 1;
+    while i + 1 < ids.len() {
+        if !ir_sw_link_inst(ir_sw_inst(f, ids.get(i))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Replace compare chains of `f` on one value by Switch terminators. A
+/// link (every test after the first) must be a block entered only from the
+/// previous test, holding nothing but its test (ir_sw_link_inst), whose
+/// values nothing outside it uses, and testing the same value: the same
+/// value id, or a load of the same word when the first test's value is a
+/// load with nothing that writes after it in its block. Links become
+/// unreachable blocks (one Unreachable). Returns how many were formed.
+/// Never in @constant_time code (LF18).
+pub fn IrFunction_form_switches(f: & mut IrFunction) -> i64 {
+    if f.is_constant_time {
+        return 0;
+    }
+    var n: i64 = f.blocks.len();
+    if n < IR_SWITCH_MIN + 1 {
+        return 0;
+    }
+    var max_id: i64 = 0;
+    var b: i64 = 0;
+    while b < n {
+        if f.blocks.get(b).id > max_id {
+            max_id = f.blocks.get(b).id;
+        }
+        b = b + 1;
+    }
+    var index: Vec<i64> = Vec::new();
+    while index.len() <= max_id {
+        index.push(- 1);
+    }
+    b = 0;
+    while b < n {
+        index.set(f.blocks.get(b).id, b);
+        b = b + 1;
+    }
+    // Ways into each block, and uses of each value
+    var npred: Vec<i64> = Vec::new();
+    var absorbed: Vec<i64> = Vec::new();
+    b = 0;
+    while b < n {
+        npred.push(0);
+        absorbed.push(0);
+        b = b + 1;
+    }
+    var nvals: i64 = f.next_value + 1;
+    var uses: Vec<i64> = Vec::new();
+    while uses.len() < nvals {
+        uses.push(0);
+    }
+    var any: bool = false;
+    b = 0;
+    while b < n {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var j: i64 = 0;
+        while j < ids.len() {
+            var inst: Inst = ir_sw_inst(f, ids.get(j));
+            var refs: Vec<i64> = inst_value_refs(& inst);
+            var r: i64 = 0;
+            while r < refs.len() {
+                var u: i64 = refs.get(r);
+                if u >= 0 && u < nvals {
+                    uses.set(u, uses.get(u) + 1);
+                }
+                r = r + 1;
+            }
+            if j == ids.len() - 1 {
+                match inst {
+                    Inst::Branch(_, _, _) => {
+                        any = true;
+                    }
+                    _ => {
+                    }
+                }
+                var succ: Vec<i64> = inst_succ_blocks(inst);
+                var s: i64 = 0;
+                while s < succ.len() {
+                    var t: i64 = succ.get(s);
+                    if t >= 0 && t <= max_id && index.get(t) >= 0 {
+                        npred.set(index.get(t), npred.get(index.get(t)) + 1);
+                    }
+                    s = s + 1;
+                }
+            }
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+    if !any {
+        return 0;
+    }
+    var formed: i64 = 0;
+    var a: i64 = 0;
+    while a < n {
+        if absorbed.get(a) != 0 {
+            a = a + 1;
+            continue;
+        }
+        var hids: Vec<i64> = f.blocks.get(a).instructions;
+        if hids.len() == 0 {
+            a = a + 1;
+            continue;
+        }
+        var term: i64 = hids.get(hids.len() - 1);
+        var c: i64 = - 1;
+        var t0: i64 = - 1;
+        var e0: i64 = - 1;
+        match ir_sw_inst(f, term) {
+            Inst::Branch(bc, bt, be) => {
+                c = bc;
+                t0 = bt;
+                e0 = be;
+            }
+            _ => {
+            }
+        }
+        if c < 0 {
+            a = a + 1;
+            continue;
+        }
+        var first: Vec<i64> = ir_sw_case(f, c);
+        if first.len() != 2 {
+            a = a + 1;
+            continue;
+        }
+        var x: i64 = first.get(0);
+        // the word the first test read, when later links may reload it
+        var mkey: str = "";
+        if ir_sw_late_load(f, hids, x) {
+            mkey = ir_sw_mem_key(f, x);
+        }
+        var keys: Vec<i64> = Vec::new();
+        var targets: Vec<i64> = Vec::new();
+        var links: Vec<i64> = Vec::new();
+        keys.push(first.get(1));
+        targets.push(t0);
+        var next: i64 = e0;
+        var going: bool = true;
+        while going && links.len() < 4096 {
+            going = false;
+            if next < 0 || next > max_id || index.get(next) < 0 {
+                break;
+            }
+            var ni: i64 = index.get(next);
+            // (a block a key goes to stays: a Branch whose two edges are one
+            // block counts as one way in)
+            if ni == 0 || ni == a || absorbed.get(ni) != 0 || npred.get(ni) != 1 || f.blocks.get(ni).params.len() > 0 || vec_contains(links, ni) || vec_contains(targets, next) {
+                break;
+            }
+            var nids: Vec<i64> = f.blocks.get(ni).instructions;
+            if nids.len() < 2 {
+                break;
+            }
+            var ok: bool = true;
+            var q: i64 = 0;
+            while q < nids.len() - 1 && ok {
+                if !ir_sw_link_inst(ir_sw_inst(f, nids.get(q))) {
+                    ok = false;
+                }
+                q = q + 1;
+            }
+            if !ok {
+                break;
+            }
+            // nothing outside the link reads what it computes
+            var local: Vec<i64> = Vec::new();
+            q = 0;
+            while q < nids.len() {
+                var li: Inst = ir_sw_inst(f, nids.get(q));
+                var lrefs: Vec<i64> = inst_value_refs(& li);
+                var lr: i64 = 0;
+                while lr < lrefs.len() {
+                    local.push(lrefs.get(lr));
+                    lr = lr + 1;
+                }
+                q = q + 1;
+            }
+            q = 0;
+            while q < nids.len() - 1 && ok {
+                var d: i64 = nids.get(q);
+                var inside: i64 = 0;
+                var lq: i64 = 0;
+                while lq < local.len() {
+                    if local.get(lq) == d {
+                        inside = inside + 1;
+                    }
+                    lq = lq + 1;
+                }
+                if d < 0 || d >= nvals || uses.get(d) != inside {
+                    ok = false;
+                }
+                q = q + 1;
+            }
+            if !ok {
+                break;
+            }
+            var c2: i64 = - 1;
+            var t2: i64 = - 1;
+            var e2: i64 = - 1;
+            match ir_sw_inst(f, nids.get(nids.len() - 1)) {
+                Inst::Branch(bc2, bt2, be2) => {
+                    c2 = bc2;
+                    t2 = bt2;
+                    e2 = be2;
+                }
+                _ => {
+                }
+            }
+            if c2 < 0 {
+                break;
+            }
+            var cs: Vec<i64> = ir_sw_case(f, c2);
+            if cs.len() != 2 {
+                break;
+            }
+            var same: bool = cs.get(0) == x;
+            if !same && str_len(mkey) > 0 && vec_contains(nids, cs.get(0)) && ir_sw_mem_key(f, cs.get(0)) == mkey {
+                same = true;
+            }
+            if !same {
+                break;
+            }
+            if !vec_contains(keys, cs.get(1)) {
+                keys.push(cs.get(1));
+                targets.push(t2);
+            }
+            links.push(ni);
+            next = e2;
+            going = true;
+        }
+        if keys.len() < IR_SWITCH_MIN {
+            a = a + 1;
+            continue;
+        }
+        // the first block switches; its compare goes when only the branch read it
+        IrFunction_set_inst(f, term, Inst::Switch(x, keys, targets, next));
+        if c >= 0 && c < nvals && uses.get(c) == 1 && vec_contains(hids, c) {
+            var nh: Vec<i64> = Vec::new();
+            var hi: i64 = 0;
+            while hi < hids.len() {
+                if hids.get(hi) != c {
+                    nh.push(hids.get(hi));
+                }
+                hi = hi + 1;
+            }
+            var hblk: BasicBlock = f.blocks.get(a);
+            hblk.instructions = nh;
+            f.blocks.set(a, hblk);
+        }
+        // each link keeps only its last instruction, now Unreachable
+        var k: i64 = 0;
+        while k < links.len() {
+            var lb: i64 = links.get(k);
+            absorbed.set(lb, 1);
+            var lblk: BasicBlock = f.blocks.get(lb);
+            var lterm: i64 = lblk.instructions.get(lblk.instructions.len() - 1);
+            IrFunction_set_inst(f, lterm, Inst::Unreachable);
+            var only: Vec<i64> = Vec::new();
+            only.push(lterm);
+            lblk.instructions = only;
+            f.blocks.set(lb, lblk);
+            k = k + 1;
+        }
+        absorbed.set(a, 1);
+        formed = formed + 1;
+        a = a + 1;
+    }
+    return formed;
+}
+
+/// IrFunction_form_switches on every function; returns how many formed.
+pub fn IrModule_form_switches(self: & mut IrModule) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < self.functions.len() {
+        var entry: IrFunctionEntry = self.functions.get(i);
+        var f: IrFunction = entry.func;
+        var k: i64 = IrFunction_form_switches(& mut f);
+        if k > 0 {
+            entry.func = f;
+            self.functions.set(i, entry);
+            total = total + k;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+/// An instruction with a value id but in no block (the caller places it).
+fn ir_sw_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+    var saved: i64 = f.current_block_idx;
+    if saved < 0 || saved >= f.blocks.len() {
+        f.current_block_idx = 0;
+    }
+    var id: i64 = IrFunction_emit(f, inst);
+    var cb: i64 = f.current_block_idx;
+    var blk: BasicBlock = f.blocks.get(cb);
+    blk.instructions.pop();
+    f.blocks.set(cb, blk);
+    f.current_block_idx = saved;
+    return id;
+}
+
+/// Does `f` hold a Switch?
+pub fn IrFunction_has_switch(f: & IrFunction) -> bool {
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        if ids.len() > 0 {
+            match ir_sw_inst(f, ids.get(ids.len() - 1)) {
+                Inst::Switch(_, _, _, _) => {
+                    return true;
+                }
+                _ => {
+                }
+            }
+        }
+        b = b + 1;
+    }
+    return false;
+}
+
+/// Turn every Switch of `f` back into a chain of `x == k` tests (new
+/// blocks), for code that knows only Jump and Branch. Returns how many.
+pub fn IrFunction_expand_switches(f: & mut IrFunction) -> i64 {
+    var done: i64 = 0;
+    var n: i64 = f.blocks.len();
+    var b: i64 = 0;
+    while b < n {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        if ids.len() > 0 {
+            var term: i64 = ids.get(ids.len() - 1);
+            match ir_sw_inst(f, term) {
+                Inst::Switch(x, keys, targets, dflt) => {
+                    if keys.len() == 0 {
+                        IrFunction_set_inst(f, term, Inst::Jump(dflt));
+                    } else {
+                        // the tests from the last back: each falls to the one after it
+                        var after: i64 = dflt;
+                        var k: i64 = keys.len() - 1;
+                        while k >= 1 {
+                            var nid: i64 = IrFunction_new_block(f);
+                            var ni: i64 = f.blocks.len() - 1;
+                            var kc: i64 = ir_sw_detached(f, Inst::ConstInt(keys.get(k), IrType::I64));
+                            var eq: i64 = ir_sw_detached(f, Inst::BinOp(BinOp::Eq, x, kc, IrType::Bool));
+                            var br: i64 = ir_sw_detached(f, Inst::Branch(eq, targets.get(k), after));
+                            var nblk: BasicBlock = f.blocks.get(ni);
+                            nblk.instructions.push(kc);
+                            nblk.instructions.push(eq);
+                            nblk.instructions.push(br);
+                            f.blocks.set(ni, nblk);
+                            after = nid;
+                            k = k - 1;
+                        }
+                        var kc0: i64 = ir_sw_detached(f, Inst::ConstInt(keys.get(0), IrType::I64));
+                        var eq0: i64 = ir_sw_detached(f, Inst::BinOp(BinOp::Eq, x, kc0, IrType::Bool));
+                        IrFunction_set_inst(f, term, Inst::Branch(eq0, targets.get(0), after));
+                        var hblk: BasicBlock = f.blocks.get(b);
+                        hblk.instructions.pop();
+                        hblk.instructions.push(kc0);
+                        hblk.instructions.push(eq0);
+                        hblk.instructions.push(term);
+                        f.blocks.set(b, hblk);
+                    }
+                    done = done + 1;
+                }
+                _ => {
+                }
+            }
+        }
+        b = b + 1;
+    }
+    return done;
+}
+
+/// `f` as code that knows only Jump and Branch sees it: itself when it has
+/// no Switch, else a copy with every Switch expanded (pe_ir).
+pub fn IrFunction_without_switches(f: IrFunction) -> IrFunction {
+    if !IrFunction_has_switch(& f) {
+        return f;
+    }
+    var g: IrFunction = f;
+    IrFunction_expand_switches(& mut g);
+    return g;
+}
+
+// --- How a backend tests the keys (ir_switch_plan) ---------------------------
+// A flat list: word 0 is how many local labels the plan uses, then records
+// of four words [op, a, b, c]:
+//   SWP_EQ    if x == a goto block b
+//   SWP_LT    if x < a (signed) goto local label b
+//   SWP_BITS  [SWP_BITS, lo, mask, block]: if x - lo <=u 63 and bit
+//             (x - lo) of mask is set, goto block (the backend checks the
+//             span before it shifts)
+//   SWP_LABEL place local label a
+//   SWP_JMP   goto block a
+// Sorted keys; a range of up to 3 keys tests each; a range whose keys span
+// fewer than 64 values and go to at most 3 blocks is one bit test per
+// block; anything larger splits at its middle key (a balanced tree: log2(n)
+// compares). Every range ends in a jump to the default.
+
+pub const SWP_EQ: i64 = 1;
+pub const SWP_LT: i64 = 2;
+pub const SWP_BITS: i64 = 3;
+pub const SWP_LABEL: i64 = 4;
+pub const SWP_JMP: i64 = 5;
+
+fn ir_swp_rec(out: & mut Vec<i64>, op: i64, a: i64, b: i64, c: i64) {
+    out.push(op);
+    out.push(a);
+    out.push(b);
+    out.push(c);
+}
+
+/// The tests for sorted keys ks[lo..hi) (targets ts), default `dflt`.
+/// Wrapping: a mask with bit 63 is a negative word.
+@wrapping fn ir_swp_range(out: & mut Vec<i64>, nlab: & mut Vec<i64>, ks: Vec<i64>, ts: Vec<i64>, lo: i64, hi: i64, dflt: i64) {
+    var cnt: i64 = hi - lo;
+    if cnt <= 3 {
+        var i: i64 = lo;
+        while i < hi {
+            ir_swp_rec(out, SWP_EQ, ks.get(i), ts.get(i), 0);
+            i = i + 1;
+        }
+        ir_swp_rec(out, SWP_JMP, dflt, 0, 0);
+        return;
+    }
+    // bit tests: keys within 64 of the lowest, to at most 3 blocks
+    var base: i64 = ks.get(lo);
+    var span_ok: bool = base >= - 4611686018427387904 && ks.get(hi - 1) <= 4611686018427387903 && ks.get(hi - 1) - base <= 63;
+    var blocks: Vec<i64> = Vec::new();
+    if span_ok {
+        var j: i64 = lo;
+        while j < hi {
+            if !vec_contains(blocks, ts.get(j)) {
+                blocks.push(ts.get(j));
+            }
+            j = j + 1;
+        }
+    }
+    if span_ok && blocks.len() <= 3 {
+        var bi: i64 = 0;
+        while bi < blocks.len() {
+            var mask: i64 = 0;
+            var j2: i64 = lo;
+            while j2 < hi {
+                if ts.get(j2) == blocks.get(bi) {
+                    mask = mask | (1 << (ks.get(j2) - base));
+                }
+                j2 = j2 + 1;
+            }
+            ir_swp_rec(out, SWP_BITS, base, mask, blocks.get(bi));
+            bi = bi + 1;
+        }
+        ir_swp_rec(out, SWP_JMP, dflt, 0, 0);
+        return;
+    }
+    var mid: i64 = (lo + hi) / 2;
+    var lab: i64 = nlab.get(0);
+    nlab.set(0, lab + 1);
+    ir_swp_rec(out, SWP_LT, ks.get(mid), lab, 0);
+    ir_swp_range(out, nlab, ks, ts, mid, hi, dflt);
+    ir_swp_rec(out, SWP_LABEL, lab, 0, 0);
+    ir_swp_range(out, nlab, ks, ts, lo, mid, dflt);
+}
+
+/// The plan for Switch(_, keys, targets, dflt) (see above).
+pub fn ir_switch_plan(keys: Vec<i64>, targets: Vec<i64>, dflt: i64) -> Vec<i64> {
+    // sort the cases by key (signed)
+    var ks: Vec<i64> = Vec::new();
+    var ts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < keys.len() && i < targets.len() {
+        ks.push(keys.get(i));
+        ts.push(targets.get(i));
+        i = i + 1;
+    }
+    i = 1;
+    while i < ks.len() {
+        var j: i64 = i;
+        while j > 0 && ks.get(j - 1) > ks.get(j) {
+            var k1: i64 = ks.get(j - 1);
+            ks.set(j - 1, ks.get(j));
+            ks.set(j, k1);
+            var t1: i64 = ts.get(j - 1);
+            ts.set(j - 1, ts.get(j));
+            ts.set(j, t1);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    var body: Vec<i64> = Vec::new();
+    var nlab: Vec<i64> = Vec::new();
+    nlab.push(0);
+    ir_swp_range(& mut body, & mut nlab, ks, ts, 0, ks.len(), dflt);
+    var out: Vec<i64> = Vec::new();
+    out.push(nlab.get(0));
+    i = 0;
+    while i < body.len() {
+        out.push(body.get(i));
+        i = i + 1;
+    }
+    return out;
 }

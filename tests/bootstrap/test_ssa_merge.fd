@@ -1,0 +1,169 @@
+// The SSA round trip of the mid-end (compiler/ssa.fd, llvm-roadmap ME3,
+// ME15, ME23): locals become values with phis where paths merge (if/else,
+// loop headers), dead phis and stores go, the variable of a counted loop
+// with constant bounds is a constant after the loop, and everything goes
+// back to slots before the backend reads the IR. The switches below make
+// scripts/verify/expect.py build it with the pass on (native `emit` only:
+// `run` and the C path run no IR optimizer); without them the default
+// pipeline must print the same.
+//@ env: FID_IROPT_ON=ssa,ssaexit
+//
+// Expected output:
+// 11
+// 22
+// 25
+// 55
+// 1045
+// 8
+// 20
+// 10
+// 8
+// 8
+// b
+// a
+// 5
+// 6
+
+fn pick(c: bool, a: i64, b: i64) -> i64 {
+    // a merge of two stores: a phi at the join
+    var r: i64 = 0;
+    if c {
+        r = a * 2;
+    } else {
+        r = b + 1;
+    }
+    return r + 1;
+}
+
+fn sum_odd(n: i64) -> i64 {
+    // a phi in the loop header and one after the inner if
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 2 == 1 {
+            s = s + i;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn fib(n: i64) -> i64 {
+    // two phis that read each other (the swap problem out of SSA)
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var i: i64 = 0;
+    while i < n {
+        var t: i64 = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn count_to_ten() -> i64 {
+    // ME23: after the loop i is the constant 10
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < 10 {
+        s = s + i;
+        i = i + 1;
+    }
+    return i * 100 + s;
+}
+
+fn up_to_seven() -> i64 {
+    // `<=`: the exit value is the bound + 1
+    var j: i64 = 3;
+    while j <= 7 {
+        j = j + 1;
+    }
+    return j;
+}
+
+fn not_entered() -> i64 {
+    // the loop never runs: the exit value is the start
+    var k: i64 = 20;
+    while k < 10 {
+        k = k + 1;
+    }
+    return k;
+}
+
+fn grid(n: i64) -> i64 {
+    // nested loops, the inner bound not a constant
+    var total: i64 = 0;
+    var x: i64 = 0;
+    while x < n {
+        var y: i64 = 0;
+        while y < x {
+            total = total + y;
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    return total;
+}
+
+fn first_over(limit: i64) -> i64 {
+    // a second way out of the loop: no exit value
+    var i: i64 = 0;
+    while i < 100 {
+        if i * i > limit {
+            break;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn first_over_flag(limit: i64) -> i64 {
+    // a bool local merged in the header
+    var i: i64 = 0;
+    var found: bool = false;
+    while i < 100 && !found {
+        if i * i > limit {
+            found = true;
+        } else {
+            i = i + 1;
+        }
+    }
+    return i;
+}
+
+fn name_of(c: bool) -> str {
+    var name: str = "a";
+    if c {
+        name = "b";
+    }
+    return name;
+}
+
+fn dead_stores(x: i64) -> i64 {
+    // ME15: the first store to t is overwritten before any read, u is
+    // never read
+    var t: i64 = x * 3;
+    t = x + 1;
+    var u: i64 = 7;
+    u = u + x;
+    return t;
+}
+
+fn main() -> i64 {
+    println(pick(true, 5, 9));
+    println(pick(false, 5, 20));
+    println(sum_odd(10));
+    println(fib(10));
+    println(count_to_ten());
+    println(up_to_seven());
+    println(not_entered());
+    println(grid(5));
+    println(first_over(50));
+    println(first_over_flag(50));
+    println(name_of(true));
+    println(name_of(false));
+    println(dead_stores(4));
+    println(dead_stores(5));
+    return 0;
+}

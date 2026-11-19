@@ -1,0 +1,128 @@
+// RL9 (docs/roadmap/llvm-roadmap.md): writes a machine-layer ELF
+// executable again with this tree's compiler/nat_enc.fd nat_elf_debug (the
+// writer `fid emit --target <arch>-linux` uses), from the loaded image of
+// one an earlier compiler wrote. This puts this tree's section headers (the
+// .interp / .dynstr / .dynamic headers of a dynamically linked image, TG13)
+// on a real program before the compiler is rebuilt, so readelf and
+// scripts/image-lint.py can check them; with the rebuilt compiler, `fid
+// emit` writes the same thing itself (tests/nattools/rl9_writer_check.sh
+// checks both).
+//
+// Usage (after `fid ccompile tests/nattools/rl9_rewrite.fd -o rw`):
+//   python3 tests/nattools/rl9_elf_params.py in.elf > p.txt
+//   FID_NAT_OFF=ehframe ./rw p.txt in.elf out.elf
+// prints "rl9_rewrite: <n> bytes, <k> functions" and exits 0, or names
+// what it could not read and exits 1. With FID_NAT_OFF=ehframe the loaded
+// bytes of out.elf (file offset 0 to the end of the image) are the input's
+// when the input's compiler wrote the same headers (the program headers
+// come from the same parameters); the section headers after them are this
+// tree's.
+//
+// No expected output here: it is a tool of rl9_writer_check.sh.
+use core;
+use vec;
+use string;
+use file;
+use compiler::image_writer;
+use compiler::nat_enc;
+
+fn num(parts: & Vec<str>, i: i64) -> i64 {
+    if i >= parts.len() {
+        return 0;
+    }
+    return str_parse_int(parts.get(i));
+}
+
+fn main() -> i64 {
+    var ppath: str = "";
+    var inpath: str = "";
+    var outpath: str = "";
+    match arg_at(1) {
+        Option::Some(a) => {
+            ppath = a;
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(2) {
+        Option::Some(a) => {
+            inpath = a;
+        }
+        Option::None => {
+        }
+    }
+    match arg_at(3) {
+        Option::Some(a) => {
+            outpath = a;
+        }
+        Option::None => {
+        }
+    }
+    if outpath == "" {
+        println("usage: rl9_rewrite <params.txt> <in.elf> <out.elf>");
+        return 1;
+    }
+    var text: str = "";
+    match read_file(ppath) {
+        Option::Some(t) => {
+            text = t;
+        }
+        Option::None => {
+            println("rl9_rewrite: cannot read " + ppath);
+            return 1;
+        }
+    }
+    var lines: Vec<str> = str_split(text, "\n");
+    if lines.len() == 0 {
+        println("rl9_rewrite: empty parameters");
+        return 1;
+    }
+    var head: Vec<str> = str_split(str_trim(lines.get(0)), " ");
+    if head.len() < 10 {
+        println("rl9_rewrite: the first line needs 10 numbers");
+        return 1;
+    }
+    var arch: i64 = num(& head, 0);
+    var entry: i64 = num(& head, 1);
+    g_nat_pie = num(& head, 2) == 1;
+    g_nat_elf_data_off = num(& head, 3);
+    g_nat_ldyn_interp = num(& head, 4);
+    g_nat_ldyn_interp_len = num(& head, 5);
+    g_nat_ldyn_dyn = num(& head, 6);
+    g_nat_ldyn_dyn_len = num(& head, 7);
+    g_nat_rvc = num(& head, 8) == 1;
+    var img_len: i64 = num(& head, 9);
+    var elf: Vec<i64> = file_read_bytes(inpath);
+    if elf.len() < 0x1000 + img_len {
+        println("rl9_rewrite: " + inpath + " is shorter than its image");
+        return 1;
+    }
+    var image: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < img_len {
+        image.push(elf.get(0x1000 + i));
+        i = i + 1;
+    }
+    var names: Vec<str> = Vec::new();
+    var starts: Vec<i64> = Vec::new();
+    var ends: Vec<i64> = Vec::new();
+    var li: i64 = 1;
+    while li < lines.len() {
+        var f: Vec<str> = str_split(str_trim(lines.get(li)), " ");
+        if f.len() == 3 {
+            names.push(f.get(0));
+            starts.push(num(& f, 1));
+            ends.push(num(& f, 2));
+        }
+        li = li + 1;
+    }
+    var rows: Vec<i64> = Vec::new();
+    var cfi: Vec<i64> = Vec::new();
+    var out: Vec<i64> = nat_elf_debug(arch, image, entry, names, starts, ends, "rl9.fd", rows, cfi);
+    if file_write_bytes(outpath, out) != 0 {
+        println("rl9_rewrite: cannot write " + outpath);
+        return 1;
+    }
+    println("rl9_rewrite: " + int_to_str(out.len()) + " bytes, " + int_to_str(names.len()) + " functions");
+    return 0;
+}

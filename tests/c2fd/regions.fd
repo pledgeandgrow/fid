@@ -1,0 +1,102 @@
+// Translated from regions.c by c2fd (C to Fid, best effort): review it before use.
+// C headers: <stdio.h>, <stdlib.h> (their calls are mapped to Fid's).
+
+// Memory malloc'd and freed in the same block: c2fd makes each lifetime a
+// Fid region (several freed together share one, like an arena).
+
+// A scratch array that lives for part of a function.
+fn sum_of_squares(n: i64) -> i64 {
+    var total: i64 = 0;
+    // sq: malloc'd here and freed at the end of this region
+    region r_sq {
+        var sq: Vec<i64> = Vec::filled(n, 0);
+        for i in 0..n {
+            sq[i] = i * i;
+        }
+        for i in 0..n {
+            total += sq[i];
+        }
+        // free(sq): the end of the region frees it
+    }
+    return total;
+}
+
+// Two buffers freed together; a result declared inside is used after.
+fn dot_twice(n: i64) -> i64 {
+    var dot: i64 = 0;
+    // a, b: malloc'd here and freed together (one region, like an arena)
+    region r_a {
+        var a: Vec<i64> = Vec::filled(n, 0);
+        var b: Vec<i64> = Vec::filled(n, 0);
+        for i in 0..n {
+            a[i] = i + 1;
+            b[i] = 2 * (i + 1);
+        }
+        dot = 0;
+        for i in 0..n {
+            dot += a[i] * b[i];
+        }
+        // free(a): the end of the region frees it
+        // free(b): the end of the region frees it
+    }
+    return dot * 2;
+}
+
+// A buffer per loop iteration, with an early exit from the loop.
+fn first_with_sum(limit: i64) -> i64 {
+    var found: i64 = -1;
+    for k in 1..20 {
+        // row: malloc'd here and freed at the end of this region
+        region r_row {
+            var row: Vec<i64> = Vec::filled(k, 0);
+            var s: i64 = 0;
+            for i in 0..k {
+                row[i] = i * k;
+                s += row[i];
+            }
+            if s > limit {
+                found = k;
+                // free(row): the end of the region frees it
+                break;
+            }
+            // free(row): the end of the region frees it
+        }
+    }
+    return found;
+}
+
+// A char buffer filled and printed.
+fn stars(n: i64) {
+    // line: malloc'd here and freed at the end of this region
+    region r_line {
+        var line: Vec<i64> = Vec::filled(n + 1, 0);
+        for i in 0..n {
+            line[i] = '*';
+        }
+        line[n] = '\0';
+        println(c_cstr(&line));
+        // free(line): the end of the region frees it
+    }
+}
+
+fn main() -> i64 {
+    println(sum_of_squares(10));
+    println(dot_twice(4));
+    println(first_with_sum(100));
+    stars(5);
+    stars(2);
+    return 0;
+}
+
+// --- c2fd helpers: the C library behaviour this translation relies on ---
+
+/// The C string in a char array, as a str.
+fn c_cstr(b: &Vec<i64>) -> str {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() && b[i] != 0 {
+        v.push(b[i]);
+        i += 1;
+    }
+    return str_from_bytes(v);
+}

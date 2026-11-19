@@ -1,0 +1,156 @@
+// Translated from musl_bits.c by c2fd (C to Fid, best effort): review it before use.
+// C headers: <stdio.h>, <stdlib.h>, <ctype.h>, <string.h>, <string.h>, <stdlib.h>, <stdint.h> (their calls are mapped to Fid's).
+
+// Real-world input for c2fd: four functions of musl libc, copied unchanged
+// (only the #defines below rename them, so that they do not clash with the
+// C library this file is linked with), and a small driver.
+//
+// Sources (musl git, master):
+// https://git.musl-libc.org/cgit/musl/plain/src/stdlib/atoi.c
+// https://git.musl-libc.org/cgit/musl/plain/src/string/strcmp.c
+// https://git.musl-libc.org/cgit/musl/plain/src/string/strncmp.c
+// https://git.musl-libc.org/cgit/musl/plain/src/prng/rand.c
+//
+// musl as a whole is licensed under the following standard MIT license:
+//
+// Copyright (c) 2005-2020 Rich Felker, et al.
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+// CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+// TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+// SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// c2fd: #define atoi musl_atoi  (expanded where it is used)
+// c2fd: #define strcmp musl_strcmp  (expanded where it is used)
+// c2fd: #define strncmp musl_strncmp  (expanded where it is used)
+// c2fd: #define srand musl_srand  (expanded where it is used)
+// c2fd: #define rand musl_rand  (expanded where it is used)
+
+// ---- src/stdlib/atoi.c ----
+
+fn musl_atoi(s: str) -> i64 {
+    var n: i64 = 0;
+    var neg: i64 = 0;
+    while c_isspace(c_char(s, 0)) {
+        s = c_skip(s, 1);
+    }
+    val _t1: i64 = c_char(s, 0);
+    if _t1 == '-' {
+        // c2fd: falls through to the next case (its statements are repeated here)
+        neg = 1;
+        s = c_skip(s, 1);
+    } else if _t1 == '+' {
+        s = c_skip(s, 1);
+    }
+    // Compute n as a negative number to avoid overflow on INT_MIN
+    while char_is_digit(c_char(s, 0)) {
+        val _t2: str = s;
+        s = c_skip(s, 1);
+        n = 10 * n - (c_char(_t2, 0) - '0');
+    }
+    return if neg != 0 { n } else { -n };
+}
+
+// ---- src/string/strcmp.c ----
+
+fn musl_strcmp(l: str, r: str) -> i64 {
+    while c_char(l, 0) == c_char(r, 0) && c_char(l, 0) != 0 {
+        l = c_skip(l, 1);
+        r = c_skip(r, 1);
+    }
+    return c_char(l, 0) - c_char(r, 0);
+}
+
+// ---- src/string/strncmp.c ----
+
+@wrapping
+fn musl_strncmp(_l: str, _r: str, n: u64) -> i64 {
+    var l: str = _l;
+    var r: str = _r;
+    val _t1: u64 = n;
+    n -= 1;
+    if _t1 == 0 {
+        return 0;
+    }
+    while c_char(l, 0) != 0 && c_char(r, 0) != 0 && n != 0 && c_char(l, 0) == c_char(r, 0) {
+        l = c_skip(l, 1);
+        r = c_skip(r, 1);
+        n -= 1;
+    }
+    return c_char(l, 0) - c_char(r, 0);
+}
+
+// ---- src/prng/rand.c ----
+
+var seed: u64 = 0;
+
+@wrapping
+fn musl_srand(s: u32) {
+    seed = (s - 1) as u64;
+}
+
+@wrapping
+fn musl_rand() -> i64 {
+    seed = 6364136223846793005 * (seed as u64) + 1;
+    return ((seed as u64) >> 33) as i64;
+}
+
+// ---- driver (not from musl) ----
+fn main() -> i64 {
+    var numbers: Vec<str> = Vec::new();
+    numbers.push("42");
+    numbers.push("  -17");
+    numbers.push("+8x");
+    numbers.push("007");
+    numbers.push("");
+    numbers.push("-2147483648");
+    for i in 0..6 {
+        println(f"atoi(\"{numbers[i]}\") = {musl_atoi(numbers[i])}");
+    }
+
+    println("strcmp: " + int_to_str(musl_strcmp("apple", "apple")) + " " + int_to_str(musl_strcmp("apple", "apply")) + " " + int_to_str(musl_strcmp("b", "abc")));
+    println("strncmp: " + int_to_str(musl_strncmp("apple", "apply", 4)) + " " + int_to_str(musl_strncmp("apple", "apply", 5)) + " " + int_to_str(musl_strncmp("x", "y", 0)));
+
+    musl_srand(1);
+    for i in 0..5 {
+        println(f"rand {i}: {musl_rand()}");
+    }
+    musl_srand(2026);
+    println(f"rand after srand(2026): {musl_rand()}");
+    return 0;
+}
+
+// --- c2fd helpers: the C library behaviour this translation relies on ---
+
+/// s[i] of a C string: its NUL (0) at the end.
+fn c_char(s: str, i: i64) -> i64 {
+    if i < 0 || i >= str_len(s) {
+        return 0;
+    }
+    return str_byte_at(s, i);
+}
+
+/// s + n for a C string: what follows its first n bytes.
+fn c_skip(s: str, n: i64) -> str {
+    if n >= str_len(s) {
+        return "";
+    }
+    return str_slice(s, n, str_len(s));
+}
+
+fn c_isspace(c: i64) -> bool {
+    return c == ' ' || (c >= 9 && c <= 13);
+}

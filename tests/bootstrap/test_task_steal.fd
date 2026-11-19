@@ -1,0 +1,88 @@
+// Competitive RT10: per-worker lock-free run queues with steal-half batching
+// (stdlib/pe_runtime/conc.fd "Run queues"). Every task must run exactly once
+// whichever queue it went through:
+//   - fan-out: one task spawns 5,000 tasks on its worker's ring (256 slots),
+//     so the ring spills half of itself to the global queue again and again
+//     and the other workers steal halves of it;
+//   - tree: each task spawns two more (8,191 tasks), so every worker's ring
+//     gets work and thieves take from all of them;
+//   - global: main (not a worker) spawns 3,000 tasks onto the global queue,
+//     which workers take in batches onto their rings.
+// Each task yields once in the middle, so it is also requeued on the ring of
+// whichever worker it ran on. A task lost or run twice changes a count or a
+// sum; a lost wake-up of a parked worker shows as a hang or a false
+// "deadlocked" panic. Natively: run it many times (scripts in
+// docs/perf/work-stealing.md).
+//
+// Expected output:
+// fan-out: 5000 tasks, sum 12502500
+// tree: 8191 tasks
+// global: 3000 tasks, sum 4501500
+// yields: 16191
+use task;
+use sync;
+
+var g_sum: i64 = 0;
+var g_cnt: i64 = 0;
+var g_yields: i64 = 0;
+
+fn leaf(i: i64) -> i64 {
+    sync_atomic_add(g_sum, i);
+    task_yield();
+    sync_atomic_add(g_yields, 1);
+    sync_atomic_add(g_cnt, 1);
+    return i;
+}
+
+fn fan_out(n: i64) -> i64 {
+    var last: i64 = 0;
+    var i: i64 = 1;
+    while i <= n {
+        last = task_go("leaf", i);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn tree(depth: i64) -> i64 {
+    sync_atomic_add(g_cnt, 1);
+    var last: i64 = 0;
+    if depth > 0 {
+        last = task_go("tree", depth - 1);
+        last = task_go("tree", depth - 1);
+    }
+    task_yield();
+    sync_atomic_add(g_yields, 1);
+    return depth;
+}
+
+fn reset() -> void {
+    sync_atomic_store(g_sum, 0);
+    sync_atomic_store(g_cnt, 0);
+}
+
+fn main() -> i64 {
+    g_sum = sync_atomic_alloc(0);
+    g_cnt = sync_atomic_alloc(0);
+    g_yields = sync_atomic_alloc(0);
+
+    var root: i64 = task_go("fan_out", 5000);
+    task_run();
+    println("fan-out: " + int_to_str(sync_atomic_load(g_cnt)) + " tasks, sum " + int_to_str(sync_atomic_load(g_sum)));
+
+    reset();
+    root = task_go("tree", 12);
+    task_run();
+    println("tree: " + int_to_str(sync_atomic_load(g_cnt)) + " tasks");
+
+    reset();
+    var i: i64 = 1;
+    while i <= 3000 {
+        root = task_go("leaf", i);
+        i = i + 1;
+    }
+    task_run();
+    println("global: " + int_to_str(sync_atomic_load(g_cnt)) + " tasks, sum " + int_to_str(sync_atomic_load(g_sum)));
+    println("yields: " + int_to_str(sync_atomic_load(g_yields)));
+    return 0;
+}

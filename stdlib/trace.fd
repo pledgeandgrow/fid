@@ -1,0 +1,241 @@
+// Fides tracing standard library (complaint CO2)
+//
+// Spans for the stdlib's network, database and file-write calls, switched
+// on from outside the program: no code change.
+//
+//   FIDES_TRACE=1 ./app
+//
+// prints one JSON line on stderr per span when it ends:
+//
+//   {"span":"http.request","detail":"GET example.com:80/","us":1834,"ok":true,"id":2,"parent":1}
+//
+// Traced today: http_client's http_request (and every helper built on it),
+// the HTTP server's requests (http.fd, "http.server"), postgres pg_query /
+// pg_query_params, sqlite exec / query ("sqlite.exec", "sqlite.query"),
+// net.fd's sockets ("net.connect", "net.bind", "net.send", "net.recv",
+// "net.send_to", "net.recv_from"), file.fd and fs.fd reads and writes
+// ("file.read", "file.write", "file.append") and fs File handles. Unset
+// (or "0"), tracing costs one environment lookup per traced call.
+//
+// The same two calls trace a program's own code:
+//
+//   use trace;
+//   val t0: i64 = trace_span_begin();
+//   ... the work ...
+//   trace_span_end(t0, "orders.import", path, ok);
+
+module trace;
+ use world;
+/// The clock spans are timed with, in microseconds: the OS clock, or under
+/// a test's fake clock (stdlib/world, complaint CT1) the fake one's reading
+/// (not counted as a read of the code under test). Through it a @hermetic
+/// test may reach traced stdlib code: no span reads the OS clock directly.
+fn trace_now_us() -> i64 {
+    if world_clock_faked() {
+        return world_clock_peek() * 1000;
+    }
+    return p_clock_now_us();
+}
+
+/// Whether FIDES_TRACE is set (to anything but "" or "0"), unless
+/// trace_set_enabled switched tracing on or off. Read on each call, not
+/// cached in a global: the traced calls run on any thread, and a global
+/// written from a spawned task is a race the compiler rejects.
+pub fn trace_enabled() -> bool {
+    if trace_st != 0 {
+        val forced: i64 = p_atomic_load(trace_st + 16);
+        if forced == 1 {
+            return true;
+        }
+        if forced == 2 {
+            return false;
+        }
+    }
+    match env_var("FIDES_TRACE") {
+        Option::Some(v) => {
+            return str_len(v) > 0 && v != "0";
+        }
+        Option::None => {
+        }
+    }
+    return false;
+}
+
+// ─── Span ids and parents ───────────────────────────────────────────────
+//
+// Every span has an id (1, 2, 3, ... per process) and a parent: the span
+// that was open, innermost, when it began (0: none). A span begun inside
+// another one (a file read in an HTTP handler, a query in a traced
+// function of the program) is its child with no code change.
+//
+// The state is shared memory touched only through atomic words, allocated
+// before main by the global's initializer and never reassigned, so the
+// traced calls stay callable from any task:
+//   [0] the last id handed out, [8] the innermost open span,
+//   [16] trace_set_enabled's switch (0: follow FIDES_TRACE, 1 on, 2 off),
+//   [24 + 24*k] slot k = id % TRACE_SLOTS: {id, parent, start time}.
+// Up to TRACE_SLOTS spans can be open at once; tasks that interleave share
+// one "innermost open span", so a span of one task can get another task's
+// open span as its parent (trace_span_begin_under names it explicitly).
+
+pub const TRACE_SLOTS: i64 = 64;
+var trace_st: i64 = trace_state_new();
+
+fn trace_state_new() -> i64 {
+    var st: i64 = 0;
+    // SAFETY: p_shared_alloc hands out raw memory; these 24 + 24 * 64
+    // bytes live as long as the program and are only touched as atomic
+    // words at the offsets above
+    unsafe {
+        st = p_shared_alloc(24 + 24 * TRACE_SLOTS);
+    }
+    if st == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < 3 + 3 * TRACE_SLOTS {
+        p_atomic_store(st + 8 * i, 0);
+        i = i + 1;
+    }
+    return st;
+}
+
+fn trace_slot(id: i64) -> i64 {
+    return trace_st + 24 + 24 * (id % TRACE_SLOTS);
+}
+
+/// Switch tracing on (true) or off (false) for the whole process, whatever
+/// FIDES_TRACE says: for a driver flag or a test. Safe from any task.
+pub fn trace_set_enabled(on: bool) {
+    if trace_st == 0 {
+        return;
+    }
+    if on {
+        p_atomic_store(trace_st + 16, 1);
+    } else {
+        p_atomic_store(trace_st + 16, 2);
+    }
+}
+
+/// Follow FIDES_TRACE again after trace_set_enabled.
+pub fn trace_follow_env() {
+    if trace_st != 0 {
+        p_atomic_store(trace_st + 16, 0);
+    }
+}
+
+/// Start a span: a token for trace_span_end (the span's id), or -1 when
+/// tracing is off (trace_span_end then does nothing). Its parent is the
+/// innermost span open now.
+pub fn trace_span_begin() -> i64 {
+    if !trace_enabled() || trace_st == 0 {
+        return - 1;
+    }
+    return trace_span_begin_under(p_atomic_load(trace_st + 8));
+}
+
+/// Start a span whose parent is `parent` (a token of trace_span_begin, or
+/// 0 for a root span): for work handed to another task.
+pub fn trace_span_begin_under(parent: i64) -> i64 {
+    if !trace_enabled() || trace_st == 0 {
+        return - 1;
+    }
+    var p: i64 = parent;
+    if p < 0 {
+        p = 0;
+    }
+    val id: i64 = p_atomic_add(trace_st, 1) + 1;
+    val slot: i64 = trace_slot(id);
+    p_atomic_store(slot, id);
+    p_atomic_store(slot + 8, p);
+    p_atomic_store(slot + 16, trace_now_us());
+    p_atomic_store(trace_st + 8, id);
+    return id;
+}
+
+/// The innermost open span's token (0: none, or tracing off).
+pub fn trace_current() -> i64 {
+    if trace_st == 0 || !trace_enabled() {
+        return 0;
+    }
+    return p_atomic_load(trace_st + 8);
+}
+
+/// The parent of the open span `tok` (0: a root span or not open).
+pub fn trace_parent_of(tok: i64) -> i64 {
+    if tok <= 0 || trace_st == 0 {
+        return 0;
+    }
+    val slot: i64 = trace_slot(tok);
+    if p_atomic_load(slot) != tok {
+        return 0;
+    }
+    return p_atomic_load(slot + 8);
+}
+
+/// End the span `tok` (trace_span_begin's result): prints its JSON line on
+/// stderr when tracing is on, and makes its parent the innermost open span
+/// again.
+pub fn trace_span_end(tok: i64, span: str, detail: str, ok: bool) {
+    if tok < 0 || trace_st == 0 {
+        return;
+    }
+    val slot: i64 = trace_slot(tok);
+    var parent: i64 = 0;
+    var us: i64 = 0;
+    if p_atomic_load(slot) == tok {
+        parent = p_atomic_load(slot + 8);
+        us = trace_now_us() - p_atomic_load(slot + 16);
+        p_atomic_store(slot, 0);
+    }
+    p_atomic_cas(trace_st + 8, tok, parent);
+    p_eprint_str(trace_span_line_ids(span, detail, us, ok, tok, parent) + "\n");
+}
+
+/// The JSON line of one span with its id and parent (without the newline):
+/// trace_span_line's fields, then "id" and "parent" (0: a root span).
+pub fn trace_span_line_ids(span: str, detail: str, us: i64, ok: bool, id: i64, parent: i64) -> str {
+    val base: str = trace_span_line(span, detail, us, ok);
+    return str_slice(base, 0, str_len(base) - 1) + ",\"id\":" + int_to_str(id) + ",\"parent\":" + int_to_str(parent) + "}";
+}
+
+/// The JSON line of one span (without the newline).
+///
+/// Example:
+///   assert_eq(trace_span_line("db", "q\"1", 12, true), "{\"span\":\"db\",\"detail\":\"q\\\"1\",\"us\":12,\"ok\":true}");
+///   assert_eq(trace_span_line_ids("a", "", 1, false, 3, 0), "{\"span\":\"a\",\"detail\":\"\",\"us\":1,\"ok\":false,\"id\":3,\"parent\":0}");
+///   trace_set_enabled(false);
+///   assert(!trace_enabled());
+pub fn trace_span_line(span: str, detail: str, us: i64, ok: bool) -> str {
+    var okw: str = "false";
+    if ok {
+        okw = "true";
+    }
+    return "{\"span\":\"" + trace_json_escape(span) + "\",\"detail\":\"" + trace_json_escape(detail) + "\",\"us\":" + int_to_str(us) + ",\"ok\":" + okw + "}";
+}
+
+/// `s` as the inside of a JSON string: `"` and `\` escaped, control
+/// bytes as \u00XX.
+pub fn trace_json_escape(s: str) -> str {
+    val hex: str = "0123456789abcdef";
+    val n: i64 = str_len(s);
+    var out: str = "";
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = str_byte_at(s, i);
+        if b == 34 || b == 92 || b < 32 {
+            out = out + str_slice(s, start, i);
+            if b == 34 {
+                out = out + "\\\"";
+            } else if b == 92 {
+                out = out + "\\\\";
+            } else {
+                out = out + "\\u00" + str_slice(hex, b / 16, b / 16 + 1) + str_slice(hex, b % 16, b % 16 + 1);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out + str_slice(s, start, n);
+}

@@ -17,9 +17,7 @@
 // 4. L2Module -> IrModule (our ccompile pipeline uses IR, not L2)
 // 5. u64 -> i64 (Fides uses i64 for all integers)
 
-module compiler::inc;
- use core; use vec; use string; use http_client; use compiler::ir;
-// --- FNV-1a 64-bit hash --------------------------------------------------
+module compiler::inc; use core; use vec; use string; use http_client; use compiler::ir; use compiler::build_info;  // --- FNV-1a 64-bit hash --------------------------------------------------
 
 /// Compute a hash of the source content (FNV-1a 64-bit).
 @wrapping pub fn hash_source(source: str) -> i64 {
@@ -53,8 +51,7 @@ pub fn hash_str(s: str) -> i64 {
 // same C as the last one skips the C compiler. The
 // in-memory cache above checks the same inputs before reusing a module.
 
-var g_dep_files: Vec<str> = Vec::new(); var g_dep_hashes: Vec<i64> = Vec::new(); var g_dep_absent: Vec<str> = Vec::new(); var g_deps_init: bool = false;
- fn inc_deps_ensure() {
+var g_dep_files: Vec<str> = Vec::new(); var g_dep_hashes: Vec<i64> = Vec::new(); var g_dep_absent: Vec<str> = Vec::new(); var g_deps_init: bool = false; fn inc_deps_ensure() {
     if !g_deps_init {
         var files: Vec<str> = Vec::new();
         var hashes: Vec<i64> = Vec::new();
@@ -147,6 +144,14 @@ fn IncStamp_none() -> IncStamp {
 /// An environment variable's value, "" when it is not set (p_getenv
 /// returns null then, which crashes string concatenation and str_len).
 pub fn env_or_empty(name: str) -> str {
+    // SP13/SP18: a value the driver gave the variable for this build
+    var oi: i64 = 0;
+    while oi < g_env_ovr_names.len() {
+        if g_env_ovr_names.get(oi) == name {
+            return g_env_ovr_vals.get(oi);
+        }
+        oi = oi + 1;
+    }
     var value = p_getenv(name);
     if (value as i64) == 0 {
         return "";
@@ -154,13 +159,130 @@ pub fn env_or_empty(name: str) -> str {
     return value;
 }
 
+// SP13/SP18: values the driver gives environment variables inside this
+// process only (no child process sees them), read by env_or_empty before
+// the real environment: a debug build turns the per-function caches on
+// beside its output (main.fd debug_cache_setup) without the user setting
+// FID_FNCACHE or FID_IRCACHE, and `fid serve` takes them back after each
+// request (env_override_clear). "" stands for "not set".
+var g_env_ovr_names: Vec<str> = Vec::new(); var g_env_ovr_vals: Vec<str> = Vec::new();
+
+/// Give `name` the value `value` for env_or_empty (replacing an earlier one).
+pub fn env_override_set(name: str, value: str) {
+    var i: i64 = 0;
+    while i < g_env_ovr_names.len() {
+        if g_env_ovr_names.get(i) == name {
+            g_env_ovr_vals.set(i, value);
+            return;
+        }
+        i = i + 1;
+    }
+    g_env_ovr_names.push(name);
+    g_env_ovr_vals.push(value);
+}
+
+/// Forget every value env_override_set gave.
+pub fn env_override_clear() {
+    g_env_ovr_names = Vec::new();
+    g_env_ovr_vals = Vec::new();
+}
+
+// SP18: while `fid serve` runs an `emit` or `ccompile` request, the
+// command's arguments are the request's words, not the process's: the
+// command handlers (main.fd has_flag, get_flag_value, find_output_arg,
+// cmd_build, cmd_ccompile) and the build key read them through argv_at.
+var g_argv_req_on: bool = false; var g_argv_req: Vec<str> = Vec::new();
+
+/// argv[i]: the process's, or, while a `fid serve` request runs, the
+/// request's words (index 0 stays the executable, as for a one-shot run).
+pub fn argv_at(i: i64) -> str {
+    if g_argv_req_on && i > 0 {
+        if i < g_argv_req.len() {
+            return g_argv_req.get(i);
+        }
+        return "";
+    }
+    return p_argv(i);
+}
+
+/// SP18: the words of a request ([exe, command, file, flags...]) stand for
+/// argv until argv_request_clear.
+pub fn argv_request_set(words: Vec<str>) {
+    g_argv_req = Vec::new();
+    var i: i64 = 0;
+    while i < words.len() {
+        g_argv_req.push(words.get(i));
+        i = i + 1;
+    }
+    g_argv_req_on = true;
+}
+
+/// argc to go with argv_at: the request's word count while one runs.
+pub fn argv_count() -> i64 {
+    if g_argv_req_on {
+        return g_argv_req.len();
+    }
+    return p_argc();
+}
+
+pub fn argv_request_clear() {
+    g_argv_req_on = false;
+    g_argv_req = Vec::new();
+}
+
+/// The hash of a file's bytes (p_file_hash; 0 when it cannot be read),
+/// remembered in the temporary directory under the file's path, size and
+/// time of last write (p_file_mtime_ms), so this compiler's executable is
+/// not read whole on every command (30 ms for 8 MB, ~200 ms for 41 MB).
+/// A rebuilt executable has another time, so its hash is taken again.
+/// FIDES_SELF_HASH_MEMO=off: always read the file.
+fn inc_file_hash_memo(path: str) -> i64 {
+    var size: i64 = p_file_size(path);
+    if size <= 0 || env_or_empty("FIDES_SELF_HASH_MEMO") == "off" {
+        return p_file_hash(path);
+    }
+    var mtime: i64 = p_file_mtime_ms(path);
+    if mtime <= 0 {
+        return p_file_hash(path);
+    }
+    var key: str = "fid-selfhash 1 " + int_to_str(size) + " " + int_to_str(mtime) + " " + path;
+    var dir: str = env_or_empty("TEMP");
+    if dir == "" {
+        dir = env_or_empty("TMPDIR");
+    }
+    if dir == "" {
+        dir = "/tmp";
+    }
+    var name: str = int_to_str(hash_source(key));
+    if str_starts_with(name, "-") {
+        name = "n" + str_slice(name, 1, str_len(name));
+    }
+    var memo: str = dir + "/fid-selfhash-" + name;
+    if p_file_exists(memo) != 0 {
+        var text: str = p_file_read(memo);
+        var lines: Vec<str> = str_split(text, "\n");
+        // the whole key is in the file: two keys with one file name differ
+        if lines.len() >= 2 && lines.get(0) == key {
+            var hm: i64 = str_parse_int(lines.get(1));
+            if hm != 0 {
+                return hm;
+            }
+        }
+    }
+    var h: i64 = p_file_hash(path);
+    if h != 0 {
+        p_file_write(memo, key + "\n" + int_to_str(h) + "\n");
+    }
+    return h;
+}
+
 /// Hash of this compiler's executable: at argv[0], or (started by name) in
 /// the PATH entry that holds it. A rebuilt compiler must invalidate stamps.
 fn inc_self_hash() -> i64 {
     var exe: str = p_argv(0);
-    var h: i64 = p_file_hash(exe);
+    var h: i64 = inc_file_hash_memo(exe);
     if h == 0 {
-        h = p_file_hash(exe + ".exe");
+        h = inc_file_hash_memo(exe + ".exe");
     }
     if h != 0 {
         return h;
@@ -174,9 +296,9 @@ fn inc_self_hash() -> i64 {
     var i: i64 = 0;
     while i < dirs.len() {
         var d: str = dirs.get(i) + "/" + exe;
-        h = p_file_hash(d);
+        h = inc_file_hash_memo(d);
         if h == 0 {
-            h = p_file_hash(d + ".exe");
+            h = inc_file_hash_memo(d + ".exe");
         }
         if h != 0 {
             return h;
@@ -186,14 +308,89 @@ fn inc_self_hash() -> i64 {
     return 0;
 }
 
-var g_self_hash: i64 = 0; var g_self_hash_done: bool = false;
-/// inc_self_hash, computed once per run (it reads the whole executable).
+/// D9: the size in bytes of this compiler's executable, found where
+/// inc_self_hash looks (argv[0], with ".exe", then the PATH entries);
+/// -1 when it cannot be found. One seek, no read.
+fn inc_self_size() -> i64 {
+    var exe: str = p_argv(0);
+    var s: i64 = p_file_size(exe);
+    if s <= 0 {
+        s = p_file_size(exe + ".exe");
+    }
+    if s > 0 {
+        return s;
+    }
+    var path: str = env_or_empty("PATH");
+    var sep: str = ":";
+    if str_contains(path, ";") {
+        sep = ";";
+    }
+    var dirs: Vec<str> = str_split(path, sep);
+    var i: i64 = 0;
+    while i < dirs.len() {
+        var d: str = dirs.get(i) + "/" + exe;
+        s = p_file_size(d);
+        if s <= 0 {
+            s = p_file_size(d + ".exe");
+        }
+        if s > 0 {
+            return s;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// D9 (release-roadmap): what inc_compiler_hash, the key of every build
+/// cache, is made of:
+///   "src"  a release build (scripts/build-info.sh wrote fid_build_source,
+///          the hash of the compiler's and the stdlib's source): that hash
+///          with the executable's size. Nothing of the executable is read,
+///          where "exe" read all of it (50 MB, 0.3 s on a -O0 build) on
+///          every command that consults a cache.
+///   "exe"  a development build, or FIDES_SELF_HASH=exe: the hash of the
+///          executable's bytes (inc_self_hash), as before.
+/// The size tells apart the stages of a bootstrap (each built from the same
+/// source by another compiler); FIDES_SELF_HASH=exe keeps them strictly
+/// apart.
+pub fn inc_compiler_identity() -> str {
+    if str_len(fid_build_source()) > 0 && env_or_empty("FIDES_SELF_HASH") != "exe" {
+        return "src";
+    }
+    return "exe";
+}
+
+var g_self_hash: i64 = 0; var g_self_hash_done: bool = false;  /// inc_compiler_hash, computed once per run.
 pub fn inc_compiler_hash() -> i64 {
     if !g_self_hash_done {
-        g_self_hash = inc_self_hash();
+        if inc_compiler_identity() == "src" {
+            var exe_size: i64 = inc_self_size();
+            if exe_size > 0 {
+                g_self_hash = hash_source("fid-src " + fid_build_source() + " " + int_to_str(exe_size));
+            } else {
+                g_self_hash = 0;
+            }
+        } else {
+            g_self_hash = inc_self_hash();
+        }
         g_self_hash_done = true;
     }
     return g_self_hash;
+}
+
+var g_exe_hash: i64 = 0; var g_exe_hash_done: bool = false;  /// inc_exe_hash, computed once per run.
+/// N12: the hash of this executable's bytes, whatever inc_compiler_hash is
+/// made of (`fid version` names the exact build by it).
+pub fn inc_exe_hash() -> i64 {
+    if !g_exe_hash_done {
+        if inc_compiler_identity() == "exe" {
+            g_exe_hash = inc_compiler_hash();
+        } else {
+            g_exe_hash = inc_self_hash();
+        }
+        g_exe_hash_done = true;
+    }
+    return g_exe_hash;
 }
 
 // --- Checked core (release D9) ----------------------------------------------
@@ -243,18 +440,65 @@ pub fn inc_build_key(command: str, n: i64, start: i64) -> i64 {
     var k: str = int_to_str(inc_compiler_hash()) + " " + command;
     var i: i64 = start + 1;
     while i < n {
-        var a: str = p_argv(i);
+        var a: str = argv_at(i);
         if a != "--no-cache" {
             k = k + " " + a;
         }
         i = i + 1;
     }
-    k = k + " CC=" + env_or_empty("CC") + " FIDES_CC_OPT=" + env_or_empty("FIDES_CC_OPT");
     k = k + " FID_HOME=" + env_or_empty("FID_HOME");
+    return hash_source(k + inc_key_env(true));
+}
+
+/// B6: the key of a build as far as one IR unit's object goes: what
+/// inc_build_key holds but the input's and the output's names (argument
+/// `start + 1` and `-o <output>`), `--inc`, `--seed-store <dir>`, CC and
+/// FID_HOME (the other arguments in their order).
+/// The unit's key holds its functions, so where they came from does not
+/// matter, and a unit of the stdlib gets the same key in every program.
+/// `keep_paths`: the build writes the input's name into the C (-g,
+/// --leaks, --mem): keep the names.
+pub fn inc_unit_build_key(command: str, n: i64, start: i64, keep_paths: bool) -> i64 {
+    var k: str = int_to_str(inc_compiler_hash()) + " unit " + command;
+    var i: i64 = start + 1;
+    while i < n {
+        var a: str = argv_at(i);
+        if a == "--seed-store" {
+            i = i + 1;
+        } else if !keep_paths && a == "-o" {
+            i = i + 1;
+        } else if !keep_paths && i == start + 1 {
+        } else if a != "--no-cache" && a != "--inc" {
+            k = k + " " + a;
+        }
+        i = i + 1;
+    }
+    return hash_source(k + inc_key_env(false));
+}
+
+/// The environment a build's key holds (inc_build_key, inc_unit_build_key;
+/// a unit's object is stored under the C compiler's name already, so its
+/// key leaves CC out: `with_cc` false).
+fn inc_key_env(with_cc: bool) -> str {
+    var k: str = " FIDES_CC_OPT=" + env_or_empty("FIDES_CC_OPT");
+    if with_cc {
+        k = " CC=" + env_or_empty("CC") + k;
+    }
     // Pass-selection env vars change the emitted code: a stamp written under
     // one FID_IROPT_OFF/FID_IROPT_ON/FID_NAT_OFF set is not the same build.
     k = k + " FID_IROPT_OFF=" + env_or_empty("FID_IROPT_OFF") + " FID_IROPT_ON=" + env_or_empty("FID_IROPT_ON") + " FID_NAT_OFF=" + env_or_empty("FID_NAT_OFF");
-    return hash_source(k);
+    // RL5/VF6: a validated build (compiler/tv.fd) is not an unvalidated one
+    k = k + " FID_VALIDATE=" + env_or_empty("FID_VALIDATE");
+    // RL5: a build that runs the pairs of tests/verify/tv is not one that does not
+    k = k + " FID_TV_PAIRS=" + env_or_empty("FID_TV_PAIRS");
+    // VF6: the fault put in on purpose decides what the validation sees
+    k = k + " FID_TV_INJECT=" + env_or_empty("FID_TV_INJECT") + " FID_TV_INJECT_IN=" + env_or_empty("FID_TV_INJECT_IN");
+    // regions freed in one step (proposal 0005) change the lowering
+    k = k + " FID_REGION_ARENA=" + env_or_empty("FID_REGION_ARENA");
+    // pe_ir's switches (compiler/pe_ir.fd): passes off, the J7 check, the
+    // COFF symbols, a debug build's line tables
+    k = k + " FID_PE_OFF=" + env_or_empty("FID_PE_OFF") + " FID_PE_CT_OFF=" + env_or_empty("FID_PE_CT_OFF") + " FID_PE_SYMS=" + env_or_empty("FID_PE_SYMS") + " FID_PE_DEBUG=" + env_or_empty("FID_PE_DEBUG");
+    return k;
 }
 
 /// Read `<output>.fides-stamp` (ok = false when missing or unreadable).
@@ -473,8 +717,7 @@ pub fn IncrementalCache_is_empty(self: & IncrementalCache) -> bool {
 // So we use lazy initialization: on first access, if the cache is empty,
 // we initialize it. This matches the Rust compiler's OnceLock approach.
 
-pub var g_cache: IncrementalCache = IncrementalCache_new(); var g_cache_init: bool = false;
-/// Ensure the global cache is initialized (lazy init for C backend).
+pub var g_cache: IncrementalCache = IncrementalCache_new(); var g_cache_init: bool = false;  /// Ensure the global cache is initialized (lazy init for C backend).
 fn ensure_cache_init() -> void {
     if !g_cache_init {
         g_cache = IncrementalCache_new();
@@ -743,6 +986,55 @@ fn inc_mark_def(d: i64, live: & mut Vec<i64>, work: & mut Vec<i64>, same_prev: V
 }
 
 pub fn inc_canon_hash(src: str) -> i64 {
+    return inc_canon_hash_ex(src, false);
+}
+
+/// Key hash of one `ccompile --inc` unit's object file (inc-roadmap B7/B8).
+/// Like `inc_canon_hash`, except that a function with external linkage (a
+/// definition not marked `static`) keeps its own name and is always live:
+/// other units link against that name, so it is part of what the object
+/// is. With the plain canonical hash, renaming an exported function whose
+/// unit holds no string naming it (the `__p_fns` table is in the owner
+/// unit only) reused the old object, and two modules whose code differed
+/// only in their function names shared one object: either way the link
+/// failed (undefined or duplicate symbol). `static` helpers are still
+/// renamed positionally: nothing outside the unit can see their names.
+pub fn inc_unit_hash(src: str) -> i64 {
+    return inc_canon_hash_ex(src, true);
+}
+
+/// `name` (a module name such as `compiler::lexer`) as a file name: every
+/// byte other than a letter, digit or `_` becomes `_` (as fidesc does).
+pub fn inc_unit_file_name(name: str) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(name) {
+        var c: i64 = str_byte_at(name, i);
+        if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 {
+            bytes.push(c);
+        } else {
+            bytes.push(95);
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(bytes);
+}
+
+/// Definition `d` is `static` (internal linkage): the word `static` comes
+/// before its name.
+fn inc_def_is_static(src: str, t: & CTokens, defs: & CDefs, d: i64) -> bool {
+    var slen: i64 = str_len(src);
+    var k: i64 = defs.start_toks.get(d);
+    while k < defs.name_toks.get(d) {
+        if t.is_ident.get(k) == 1 && str_slice_len(src, slen, t.starts.get(k), t.ends.get(k)) == "static" {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+fn inc_canon_hash_ex(src: str, keep_linked: bool) -> i64 {
     var t: CTokens = inc_lex_c(src);
     var defs: CDefs = inc_find_c_defs(src, & t);
     var n: i64 = t.starts.len();
@@ -780,6 +1072,19 @@ pub fn inc_canon_hash(src: str) -> i64 {
     if main_slot != 0 {
         inc_mark_def(main_slot - 1, & mut live, & mut work, same_prev);
     }
+    // Unit keys: every externally linked definition is a root and keeps
+    // its name (a name with any non-static definition counts as linked).
+    var linked: i64 = HashMap_new();
+    if keep_linked {
+        di = 0;
+        while di < defs.names.len() {
+            if !inc_def_is_static(src, & t, & defs, di) {
+                HashMap_insert(linked, defs.names.get(di), 1);
+                inc_mark_def(di, & mut live, & mut work, same_prev);
+            }
+            di = di + 1;
+        }
+    }
     i = 0;
     while i < n {
         if t.is_ident.get(i) == 1 && in_body.get(i) < 0 {
@@ -803,6 +1108,10 @@ pub fn inc_canon_hash(src: str) -> i64 {
         }
     }
     // Alpha-rename defined functions positionally; hash the kept tokens.
+    // (String constants `_strN` keep their names: their contents are in
+    // `#define` lines hashed verbatim, so renaming a use positionally
+    // would let a unit that switched from one literal to another reuse
+    // the object of the old one.)
     var numbers: i64 = HashMap_new();
     var next: i64 = 1;
     var h: i64 = 8834263827529598795;
@@ -815,7 +1124,7 @@ pub fn inc_canon_hash(src: str) -> i64 {
             var renamed: i64 = 0;
             if t.is_ident.get(i) == 1 {
                 var name: str = str_slice_len(src, slen, s, e);
-                if name != "main" && HashMap_get(def_index, name) != 0 {
+                if name != "main" && HashMap_get(def_index, name) != 0 && HashMap_get(linked, name) == 0 {
                     renamed = HashMap_get(numbers, name);
                     if renamed == 0 {
                         renamed = next;
@@ -892,12 +1201,16 @@ pub fn inc_artifact_path(output: str, canon: i64, tool: str, flags: str) -> str 
 }
 
 /// Copy `path` to `dest` if the artifact exists — local `.fidcache` first,
+/// then the seeded store shipped with the toolchain (B6, inc_seed_get),
 /// then the remote CAS (`FIDES_CAS`, served by tools/cas.fd). A remote hit
 /// is also written back into the local store.
 pub fn inc_artifact_get(path: str, dest: str) -> bool {
     if p_file_exists(path) != 0 {
         inc_lru_touch(path);
         return p_file_write_vec(dest, p_file_read_bytes(path)) >= 0;
+    }
+    if inc_seed_get(inc_base_name(path), dest) {
+        return true;
     }
     var body: str = inc_cas_get(inc_base_name(path));
     if str_len(body) == 0 {
@@ -927,6 +1240,90 @@ pub fn inc_artifact_put(path: str, source: str) {
     inc_lru_touch(path);
     inc_cache_evict(inc_dir_of(path));
     inc_cas_put(inc_base_name(path), source);
+}
+
+// --- Seeded store (inc-roadmap B6) -----------------------------------------
+//
+// A read-only store of unit objects shipped with the toolchain:
+// `<fid dir>/cache/` (main.fd sets it from compiler.fd fid_seed_store_dir),
+// filled by `fid ccompile --inc --seed-store <dir>` builds of the examples
+// (installer/build-installer.sh). An object there is named as in a
+// `.fidcache` (inc_artifact_path: the key of the unit's input, the C
+// compiler and its flags), so a fresh project's core and stdlib units are
+// found there and not compiled. Looked up after the local `.fidcache` and
+// before FIDES_CAS; never written to by a build, never evicted.
+// FIDES_SEED_STORE=<dir> names another store, FIDES_SEED_STORE=off none.
+
+var g_inc_seed_dir: str = ""; var g_inc_seed_hits: i64 = 0;  /// The seeded store of this toolchain ("" = none).
+/// (Once per build: the hit count starts again.)
+pub fn inc_set_seed_dir(dir: str) {
+    g_inc_seed_dir = dir;
+    g_inc_seed_hits = 0;
+}
+
+/// How many artifacts this run took from the seeded store.
+pub fn inc_seed_hits() -> i64 {
+    return g_inc_seed_hits;
+}
+
+/// The seeded store's directory, "" when there is none.
+fn inc_seed_dir() -> str {
+    var e: str = env_or_empty("FIDES_SEED_STORE");
+    if e == "off" {
+        return "";
+    }
+    if str_len(e) > 0 {
+        return e;
+    }
+    return g_inc_seed_dir;
+}
+
+/// Copy the seeded store's artifact `name` to `dest`; false on a miss.
+fn inc_seed_get(name: str, dest: str) -> bool {
+    var dir: str = inc_seed_dir();
+    if str_len(dir) == 0 {
+        return false;
+    }
+    var p: str = dir + "/" + name;
+    if p_file_exists(p) == 0 {
+        return false;
+    }
+    var bytes: Vec<i64> = p_file_read_bytes(p);
+    if bytes.len() == 0 {
+        return false;
+    }
+    if p_file_write_vec(dest, bytes) < 0 {
+        return false;
+    }
+    g_inc_seed_hits = g_inc_seed_hits + 1;
+    // tests/tooling/inc-seed-store-check.sh reads this line
+    if str_len(env_or_empty("FIDES_INC_DEBUG")) > 0 {
+        p_eprint_str("[inc] seeded store: " + name + "\n");
+    }
+    return true;
+}
+
+/// Store the object `source` in the seeded store `dir` under the name of
+/// artifact `path` (`ccompile --inc --seed-store <dir>`). An object already
+/// there has the same key, so the same content: it is kept.
+pub fn inc_seed_put(dir: str, path: str, source: str) {
+    if str_len(dir) == 0 || str_len(path) == 0 {
+        return;
+    }
+    p_mkdir(dir);
+    var dest: str = dir + "/" + inc_base_name(path);
+    if p_file_exists(dest) != 0 {
+        return;
+    }
+    var bytes: Vec<i64> = p_file_read_bytes(source);
+    if bytes.len() == 0 {
+        return;
+    }
+    var tmp: str = dest + ".tmp";
+    p_file_write_vec(tmp, bytes);
+    if p_rename(tmp, dest) != 0 {
+        p_file_delete(tmp);
+    }
 }
 
 // --- Remote cache (inc-roadmap A11) ----------------------------------------
@@ -984,8 +1381,7 @@ fn inc_cas_put(name: str, source: str) {
 // counts). Past INC_CACHE_MAX_FILES artifacts or INC_CACHE_MAX_BYTES bytes,
 // the least recently used are deleted and the list is rewritten.
 
-const INC_CACHE_MAX_FILES: i64 = 64; const INC_CACHE_MAX_BYTES: i64 = 1073741824;
-/// The file name part of `path`.
+const INC_CACHE_MAX_FILES: i64 = 64; const INC_CACHE_MAX_BYTES: i64 = 1073741824;  /// The file name part of `path`.
 fn inc_base_name(path: str) -> str {
     var i: i64 = str_len(path) - 1;
     while i >= 0 {
@@ -1083,4 +1479,273 @@ pub fn inc_cache_evict(dir: str) {
         i = i - 1;
     }
     p_file_write(dir + "/lru", text);
+}
+
+// --- SP11: arenas for one function's compiler data -----------------------
+// The data the compiler makes for one function (its machine IR, the
+// allocator's tables, one pass's analyses) can live in a window that one
+// step gives back: fn_arena_begin takes the C runtime's allocator mark
+// (p_arena_save), fn_arena_end goes back to it (p_arena_restore), which
+// returns every arena chunk taken since to the system and resets the bump
+// pointer, so the next function's data reuses the same memory.
+//
+// Opt-in: FID_FN_ARENA=1 in the compiler's environment, and only where the
+// runtime has marks (the C runtime). p_arena_save is 0 in the interpreter,
+// pe_ir and the machine layer: fn_arena_begin then returns 0 and the call
+// site runs its work as usual. No window opens while a region (proposal
+// 0005) is open, nor inside another window.
+//
+// A window is sound only when nothing made in it is reachable after its
+// end. The rule for a call site:
+//   - the work is calls whose arguments they only read; they change no
+//     global and nothing outside their own locals (no push, insert or set
+//     on a container they were given, no table built lazily on first use);
+//   - taking an owner of a Vec or map made before the window (a `let` of
+//     `t.get(i)`, a struct copy that holds one) is a change too: the first
+//     share of a container makes its share box (core Vec_share,
+//     HashMap_share), and a box made inside the window is given back at
+//     its end while the container outside still points to it (a later
+//     change of that container then frees garbage: "Double free" in
+//     vec_own). Every container outside the work keeps must be shared
+//     once before fn_arena_begin and that owner kept until after
+//     fn_arena_end (a pin: `var pin: Vec<i64> = t.get(i);`); a share
+//     inside the window then only counts the existing box up and down.
+//     Reading elements and lengths through a reference is fine; so is a
+//     string (its count is in its own header);
+//   - every variable the call site assigns after the window is declared
+//     before fn_arena_begin (a `Vec::new()` made inside the window is given
+//     back at its end);
+//   - each result is handed to fn_arena_keep_* in the statement that makes
+//     it (the temporary is dropped at the end of that statement, inside the
+//     window), and taken back with fn_arena_take_* after fn_arena_end, in
+//     the order kept:
+//         var m: i64 = fn_arena_begin();
+//         if m == 0 {
+//             res = work(x);
+//         } else {
+//             fn_arena_keep_words(work(x));
+//             fn_arena_end(m);
+//             res = fn_arena_take_words();
+//         }
+// What is kept is copied into the hold block: a block of at least 2 MB,
+// which the C runtime takes from calloc, outside every arena chunk, so a
+// restore never gives it back (it grows the same way inside a window).
+// The C runtime's p_arena_restore empties its free lists, blocks freed
+// before the window included: those are not reused afterwards.
+// tests/tooling/fn_arena_unit.fd and fn-arena-check.sh check the rule's
+// results on the C path.
+
+const FNA_HOLD_MIN: i64 = 262144;  // words (2 MB): over the 1 MB of pooled blocks
+const FNA_CHUNK: i64 = 4194304;    // the C runtime's arena chunk (__P_ARENA_CHUNK_SIZE)
+var g_fna_state: i64 = 0 - 1;      // FID_FN_ARENA: -1 not read yet, 0 off, 1 on
+var g_fna_hold: i64 = 0;           // the hold block (0: none yet)
+var g_fna_cap: i64 = 0;            // its size in words
+var g_fna_len: i64 = 0;            // words kept since the last fn_arena_begin
+var g_fna_pos: i64 = 0;            // the next word fn_arena_take_* reads
+var g_fna_open: i64 = 0;           // the mark of the open window (0: none)
+var g_fna_windows: i64 = 0;        // windows ended
+var g_fna_bytes: i64 = 0;          // bytes their ends gave back (about)
+var g_fna_missed: i64 = 0;         // ends that did not get back to their mark
+
+/// Per-function arenas are on: FID_FN_ARENA set (not "0") and the runtime
+/// has allocator marks.
+pub fn fn_arena_on() -> bool {
+    if g_fna_state < 0 {
+        g_fna_state = 0;
+        var v: str = env_or_empty("FID_FN_ARENA");
+        if str_len(v) > 0 && v != "0" && p_arena_save() != 0 {
+            g_fna_state = 1;
+        }
+    }
+    return g_fna_state == 1;
+}
+
+/// Open a window: its mark, or 0 when none opens (arenas off, a window or
+/// a region already open). Empties the hold block.
+pub fn fn_arena_begin() -> i64 {
+    if g_fna_open != 0 || !fn_arena_on() {
+        return 0;
+    }
+    if p_region_word(0, 0) != 0 {
+        return 0;
+    }
+    if g_fna_hold == 0 {
+        fna_hold_grow(FNA_HOLD_MIN);
+    }
+    g_fna_len = 0;
+    g_fna_pos = 0;
+    var m: i64 = p_arena_save();
+    g_fna_open = m;
+    return m;
+}
+
+/// Close the window `mark` (fn_arena_begin's): everything allocated in it
+/// from the arena goes back at once. The kept values stay in the hold
+/// block for fn_arena_take_*. Does nothing for 0.
+pub fn fn_arena_end(mark: i64) {
+    if mark == 0 || mark != g_fna_open {
+        return;
+    }
+    var now: i64 = p_arena_save();
+    g_fna_bytes = g_fna_bytes + fna_distance(mark, now);
+    p_arena_restore(mark);
+    g_fna_open = 0;
+    g_fna_windows = g_fna_windows + 1;
+    if p_arena_save() != mark {
+        g_fna_missed = g_fna_missed + 1;
+    }
+}
+
+/// Bytes from arena position `a` to `b` (marks: chunk number << 32 | offset).
+fn fna_distance(a: i64, b: i64) -> i64 {
+    var ca: i64 = a / 4294967296;
+    var cb: i64 = b / 4294967296;
+    var d: i64 = (cb - ca) * FNA_CHUNK + (b - cb * 4294967296) - (a - ca * 4294967296);
+    if d < 0 {
+        return 0;
+    }
+    return d;
+}
+
+/// Room for `need` words in the hold block. A new block is over 1 MB, so
+/// the C runtime takes it from calloc (never from an arena chunk), inside
+/// a window or not.
+fn fna_hold_grow(need: i64) {
+    var cap: i64 = g_fna_cap * 2;
+    if cap < FNA_HOLD_MIN {
+        cap = FNA_HOLD_MIN;
+    }
+    while cap < need {
+        cap = cap * 2;
+    }
+    var nb: i64 = p_malloc(cap * 8);
+    if g_fna_hold != 0 {
+        p_mem_copy(nb, g_fna_hold, g_fna_len * 8);
+        p_free(g_fna_hold);
+    }
+    g_fna_hold = nb;
+    g_fna_cap = cap;
+}
+
+fn fna_put(w: i64) {
+    if g_fna_len >= g_fna_cap {
+        fna_hold_grow(g_fna_len + 1);
+    }
+    var p: * mut i64 = g_fna_hold + g_fna_len * 8;
+    // SAFETY: g_fna_len < g_fna_cap: a word of the hold block, which holds
+    // g_fna_cap words.
+    unsafe {
+        * p = w;
+    }
+    g_fna_len = g_fna_len + 1;
+}
+
+fn fna_get() -> i64 {
+    var w: i64 = 0;
+    if g_fna_pos < g_fna_len {
+        var p: * mut i64 = g_fna_hold + g_fna_pos * 8;
+        // SAFETY: g_fna_pos < g_fna_len <= g_fna_cap: a word of the hold
+        // block that fna_put wrote.
+        unsafe {
+            w = * p;
+        }
+    }
+    g_fna_pos = g_fna_pos + 1;
+    return w;
+}
+
+/// Keep one word past the window's end.
+pub fn fn_arena_keep_word(w: i64) {
+    fna_put(w);
+}
+
+/// Keep a copy of `v`'s elements past the window's end.
+pub fn fn_arena_keep_words(v: Vec<i64>) {
+    var n: i64 = v.len();
+    if g_fna_len + n + 1 > g_fna_cap {
+        fna_hold_grow(g_fna_len + n + 1);
+    }
+    fna_put(n);
+    var i: i64 = 0;
+    while i < n {
+        fna_put(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// Keep a copy of `s`'s bytes past the window's end.
+pub fn fn_arena_keep_str(s: str) {
+    var n: i64 = str_len(s);
+    var nw: i64 = (n + 7) / 8;
+    if g_fna_len + nw + 1 > g_fna_cap {
+        fna_hold_grow(g_fna_len + nw + 1);
+    }
+    fna_put(n);
+    if n > 0 {
+        p_mem_copy(g_fna_hold + g_fna_len * 8, s as i64, n);
+    }
+    g_fna_len = g_fna_len + nw;
+}
+
+/// The next kept word (0 past the last).
+pub fn fn_arena_take_word() -> i64 {
+    return fna_get();
+}
+
+/// The next kept Vec<i64>, made outside the window.
+pub fn fn_arena_take_words() -> Vec<i64> {
+    var n: i64 = fna_get();
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(fna_get());
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The next kept string, made outside the window ("" past the last).
+pub fn fn_arena_take_str() -> str {
+    var n: i64 = fna_get();
+    var nw: i64 = (n + 7) / 8;
+    if n <= 0 || g_fna_pos + nw > g_fna_len {
+        return "";
+    }
+    var r: i64 = p_str_buf(n);
+    p_mem_copy(r, g_fna_hold + g_fna_pos * 8, n);
+    g_fna_pos = g_fna_pos + nw;
+    return r as str;
+}
+
+/// Windows ended so far, bytes their ends gave back, and ends that did
+/// not find the arena back at their mark (0 when every window was sound).
+pub fn fn_arena_windows() -> i64 {
+    return g_fna_windows;
+}
+
+pub fn fn_arena_released() -> i64 {
+    return g_fna_bytes;
+}
+
+pub fn fn_arena_missed() -> i64 {
+    return g_fna_missed;
+}
+
+/// One line for --time: "" when no window was used.
+pub fn fn_arena_report() -> str {
+    if g_fna_windows == 0 {
+        return "";
+    }
+    return "fn arenas: " + int_to_str(g_fna_windows) + " windows, " + int_to_str(g_fna_bytes / 1048576) + " MB given back at their ends, " + int_to_str(g_fna_missed) + " not back at their mark";
+}
+
+/// Give the hold block back (at exit, for --leaks builds of the compiler).
+pub fn fn_arena_close() {
+    if g_fna_hold != 0 && g_fna_open == 0 {
+        p_free(g_fna_hold);
+        g_fna_hold = 0;
+        g_fna_cap = 0;
+        g_fna_len = 0;
+        g_fna_pos = 0;
+    }
 }

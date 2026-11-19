@@ -1,0 +1,280 @@
+// Fides wheel odometry library (robotics)
+//
+// Planar odometry for the three common drive types:
+//   - differential drive: wheel speeds <-> (v, w), wheel distances -> pose;
+//   - mecanum (four wheels, rollers at 45 degrees, the usual X layout:
+//     front-left, front-right, rear-left, rear-right): wheel speeds <->
+//     body velocity (vx, vy, wz);
+//   - Ackermann steering as the bicycle model: (v, steering angle) <->
+//     (v, w), the inner and outer front wheel angles and the rear wheel
+//     speeds of a car with a given track.
+// Poses integrate exactly over a step with constant body velocity (the
+// SE(2) exponential: an arc of radius v / w, a straight line when w = 0),
+// so the result does not depend on how a constant-velocity interval is
+// split into steps. Covariance propagation follows Siegwart & Nourbakhsh
+// (Introduction to Autonomous Mobile Robots, 5.2.4): wheel noise
+// Q = diag(kr |dr|, kl |dl|), P' = Fp P Fp' + Frl Q Frl', with the
+// Jacobians at the midpoint heading of the step.
+//
+// Angles in radians, lengths in metres, wheel speeds in rad/s. The seam is
+// the caller: it reads encoder distances or wheel speeds and passes them in.
+//
+// Usage:
+//   use odometry;
+//   var o: DiffOdom = odom_diff_new(0.3, 0.01, 0.01);
+//   odom_diff_update(&mut o, left_m, right_m);     // each control cycle
+//   println(pose2_to_str(o.pose, 3));
+
+module odometry;
+use math;
+use quat;
+use lqr;
+
+/// A planar pose.
+pub struct Pose2 {
+    pub x: f64,
+    pub y: f64,
+    pub th: f64,
+}
+
+/// A planar body velocity: vx forward, vy left, wz counter-clockwise.
+pub struct Twist2 {
+    pub vx: f64,
+    pub vy: f64,
+    pub wz: f64,
+}
+
+pub fn pose2(x: f64, y: f64, th: f64) -> Pose2 {
+    return Pose2 { x: x, y: y, th: th };
+}
+
+pub fn pose2_to_str(p: Pose2, dp: i64) -> str {
+    return "(" + rmath_fmt(p.x, dp) + ", " + rmath_fmt(p.y, dp) + ", " + rmath_fmt(p.th, dp) + ")";
+}
+
+/// a then b expressed in a's frame (a (+) b).
+pub fn pose2_compose(a: Pose2, b: Pose2) -> Pose2 {
+    val c: f64 = math_cos(a.th);
+    val s: f64 = math_sin(a.th);
+    return Pose2 { x: a.x + c * b.x - s * b.y, y: a.y + s * b.x + c * b.y, th: rmath_wrap_angle(a.th + b.th) };
+}
+
+/// The motion over dt at a constant body twist, in the body frame at the
+/// start (the SE(2) exponential).
+pub fn odom_exp(t: Twist2, dt: f64) -> Pose2 {
+    val dth: f64 = t.wz * dt;
+    if math_fabs(dth) < 0.000000001 {
+        // second-order series of sin(x)/x and (1 - cos x)/x
+        val a: f64 = 1.0 - dth * dth / 6.0;
+        val b: f64 = dth / 2.0;
+        return Pose2 { x: (a * t.vx - b * t.vy) * dt, y: (b * t.vx + a * t.vy) * dt, th: dth };
+    }
+    val s: f64 = math_sin(dth) / t.wz;
+    val c: f64 = (1.0 - math_cos(dth)) / t.wz;
+    return Pose2 { x: s * t.vx - c * t.vy, y: c * t.vx + s * t.vy, th: dth };
+}
+
+/// The pose after moving at a constant body twist for dt.
+pub fn odom_integrate(p: Pose2, t: Twist2, dt: f64) -> Pose2 {
+    return pose2_compose(p, odom_exp(t, dt));
+}
+
+/// The pose after dt at forward speed v and turn rate w (an exact arc).
+pub fn odom_integrate_vw(p: Pose2, v: f64, w: f64, dt: f64) -> Pose2 {
+    return odom_integrate(p, Twist2 { vx: v, vy: 0.0, wz: w }, dt);
+}
+
+/// One explicit Euler step (for comparison; drifts on curves).
+pub fn odom_integrate_euler(p: Pose2, v: f64, w: f64, dt: f64) -> Pose2 {
+    return Pose2 { x: p.x + v * dt * math_cos(p.th), y: p.y + v * dt * math_sin(p.th), th: rmath_wrap_angle(p.th + w * dt) };
+}
+
+// ─── Differential drive ───
+
+/// Wheel radius and track width (distance between the wheels).
+pub struct DiffDrive {
+    pub r: f64,
+    pub track: f64,
+}
+
+/// (v, w) from left and right wheel speeds (rad/s).
+pub fn diff_forward(d: & DiffDrive, wl: f64, wr: f64) -> Twist2 {
+    return Twist2 { vx: d.r * (wl + wr) / 2.0, vy: 0.0, wz: d.r * (wr - wl) / d.track };
+}
+
+/// Left and right wheel speeds (rad/s) for (v, w): [left, right].
+pub fn diff_inverse(d: & DiffDrive, v: f64, w: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    out.push((v - w * d.track / 2.0) / d.r);
+    out.push((v + w * d.track / 2.0) / d.r);
+    return out;
+}
+
+/// Odometry state of a differential drive: pose, covariance and the wheel
+/// noise constants (variance per metre travelled by each wheel).
+pub struct DiffOdom {
+    pub track: f64,
+    pub kl: f64,
+    pub kr: f64,
+    pub pose: Pose2,
+    pub cov: DMat,
+    pub dist: f64,
+}
+
+pub fn odom_diff_new(track: f64, kl: f64, kr: f64) -> DiffOdom {
+    return DiffOdom { track: track, kl: kl, kr: kr, pose: pose2(0.0, 0.0, 0.0), cov: dm_zeros(3, 3), dist: 0.0 };
+}
+
+/// The pose after the wheels travelled dl and dr metres (an exact arc).
+pub fn odom_diff_step(p: Pose2, track: f64, dl: f64, dr: f64) -> Pose2 {
+    val ds: f64 = (dl + dr) / 2.0;
+    val dth: f64 = (dr - dl) / track;
+    return pose2_compose(p, odom_exp(Twist2 { vx: ds, vy: 0.0, wz: dth }, 1.0));
+}
+
+/// Advance the pose and its covariance by wheel distances dl, dr.
+pub fn odom_diff_update(o: & mut DiffOdom, dl: f64, dr: f64) {
+    val ds: f64 = (dl + dr) / 2.0;
+    val dth: f64 = (dr - dl) / o.track;
+    val a: f64 = o.pose.th + dth / 2.0;
+    val ca: f64 = math_cos(a);
+    val sa: f64 = math_sin(a);
+    val b: f64 = o.track;
+    var fp: DMat = dm_identity(3);
+    dm_set(&mut fp, 0, 2, 0.0 - ds * sa);
+    dm_set(&mut fp, 1, 2, ds * ca);
+    // columns: dr, dl
+    var frl: DMat = dm_zeros(3, 2);
+    dm_set(&mut frl, 0, 0, 0.5 * ca - ds / (2.0 * b) * sa);
+    dm_set(&mut frl, 0, 1, 0.5 * ca + ds / (2.0 * b) * sa);
+    dm_set(&mut frl, 1, 0, 0.5 * sa + ds / (2.0 * b) * ca);
+    dm_set(&mut frl, 1, 1, 0.5 * sa - ds / (2.0 * b) * ca);
+    dm_set(&mut frl, 2, 0, 1.0 / b);
+    dm_set(&mut frl, 2, 1, 0.0 - 1.0 / b);
+    var q: DMat = dm_zeros(2, 2);
+    dm_set(&mut q, 0, 0, o.kr * math_fabs(dr));
+    dm_set(&mut q, 1, 1, o.kl * math_fabs(dl));
+    val fpt: DMat = dm_transpose(&fp);
+    val frlt: DMat = dm_transpose(&frl);
+    val t1: DMat = dm_mul(&fp, &o.cov);
+    val p1: DMat = dm_mul(&t1, &fpt);
+    val t2: DMat = dm_mul(&frl, &q);
+    val p2: DMat = dm_mul(&t2, &frlt);
+    o.cov = dm_symmetrize(&dm_add(&p1, &p2));
+    o.pose = odom_diff_step(o.pose, o.track, dl, dr);
+    o.dist = o.dist + math_fabs(ds);
+}
+
+/// Wheel distance (metres) from encoder ticks.
+pub fn odom_ticks_to_m(ticks: i64, ticks_per_rev: i64, wheel_radius: f64) -> f64 {
+    return (ticks as f64) * 2.0 * rmath_pi() * wheel_radius / (ticks_per_rev as f64);
+}
+
+// ─── Mecanum ───
+
+/// Wheel radius, half wheelbase lx (front-rear) and half track ly.
+pub struct Mecanum {
+    pub r: f64,
+    pub lx: f64,
+    pub ly: f64,
+}
+
+/// Body twist from the wheel speeds [fl, fr, rl, rr] (rad/s).
+pub fn mecanum_forward(m: & Mecanum, w: & Vec<f64>) -> Twist2 {
+    val w1: f64 = w.get(0);
+    val w2: f64 = w.get(1);
+    val w3: f64 = w.get(2);
+    val w4: f64 = w.get(3);
+    val k: f64 = m.r / 4.0;
+    return Twist2 { vx: k * (w1 + w2 + w3 + w4), vy: k * (0.0 - w1 + w2 + w3 - w4), wz: k * (0.0 - w1 + w2 - w3 + w4) / (m.lx + m.ly) };
+}
+
+/// Wheel speeds [fl, fr, rl, rr] (rad/s) for a body twist.
+pub fn mecanum_inverse(m: & Mecanum, t: Twist2) -> Vec<f64> {
+    val l: f64 = (m.lx + m.ly) * t.wz;
+    var out: Vec<f64> = Vec::new();
+    out.push((t.vx - t.vy - l) / m.r);
+    out.push((t.vx + t.vy + l) / m.r);
+    out.push((t.vx + t.vy - l) / m.r);
+    out.push((t.vx - t.vy + l) / m.r);
+    return out;
+}
+
+/// Scale wheel speeds so none exceeds wmax, keeping their ratios (the
+/// direction of motion is kept when a command is too fast).
+pub fn mecanum_saturate(w: & Vec<f64>, wmax: f64) -> Vec<f64> {
+    var m: f64 = 0.0;
+    var i: i64 = 0;
+    while i < w.len() {
+        m = rmath_max(m, math_fabs(w.get(i)));
+        i = i + 1;
+    }
+    var s: f64 = 1.0;
+    if m > wmax {
+        s = wmax / m;
+    }
+    var out: Vec<f64> = Vec::new();
+    i = 0;
+    while i < w.len() {
+        out.push(w.get(i) * s);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Ackermann (bicycle model) ───
+
+/// Wheelbase (front to rear axle) and track (between the front wheels).
+pub struct Ackermann {
+    pub wheelbase: f64,
+    pub track: f64,
+    pub max_steer: f64,
+}
+
+/// Body twist for speed v (at the rear axle) and steering angle delta.
+pub fn ackermann_forward(a: & Ackermann, v: f64, delta: f64) -> Twist2 {
+    return Twist2 { vx: v, vy: 0.0, wz: v * rmath_tan(delta) / a.wheelbase };
+}
+
+/// The steering angle for speed v and turn rate w, clamped to max_steer
+/// (0 when v = 0).
+pub fn ackermann_inverse(a: & Ackermann, v: f64, w: f64) -> f64 {
+    if v == 0.0 {
+        return 0.0;
+    }
+    return rmath_clamp(rmath_atan(w * a.wheelbase / v), 0.0 - a.max_steer, a.max_steer);
+}
+
+/// The turning radius at the rear axle centre (1e300 when straight).
+pub fn ackermann_radius(a: & Ackermann, delta: f64) -> f64 {
+    val t: f64 = rmath_tan(delta);
+    if math_fabs(t) < 0.000000000001 {
+        return 1.0e300;
+    }
+    return a.wheelbase / t;
+}
+
+/// The front wheel angles [left, right] of true Ackermann geometry for a
+/// bicycle steering angle delta (the inner wheel turns more).
+pub fn ackermann_wheel_angles(a: & Ackermann, delta: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    val r: f64 = ackermann_radius(a, delta);
+    if r > 1.0e299 {
+        out.push(0.0);
+        out.push(0.0);
+        return out;
+    }
+    // r > 0: turning left, the left wheel is inside
+    out.push(rmath_atan(a.wheelbase / (r - a.track / 2.0)));
+    out.push(rmath_atan(a.wheelbase / (r + a.track / 2.0)));
+    return out;
+}
+
+/// Rear wheel ground speeds [left, right] for speed v at the axle centre.
+pub fn ackermann_rear_speeds(a: & Ackermann, v: f64, delta: f64) -> Vec<f64> {
+    val w: f64 = v * rmath_tan(delta) / a.wheelbase;
+    var out: Vec<f64> = Vec::new();
+    out.push(v - w * a.track / 2.0);
+    out.push(v + w * a.track / 2.0);
+    return out;
+}

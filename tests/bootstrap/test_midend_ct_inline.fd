@@ -1,0 +1,54 @@
+// LF18 (compiler/iropt.fd iro_body, compiler/iropt_me.fd
+// ime_inline_function and ime_function_passes): the mid-end keeps
+// @constant_time code where the backends verify it. A @constant_time
+// function is not inlined into a caller without the annotation (its copy
+// would not be checked); a @constant_time caller may still take in its
+// @constant_time helpers, and they are checked with it. Switch lowering,
+// which adds comparisons on the tested value, is not run on @constant_time
+// functions. The program must build on every backend and print the same
+// with the passes on (FID_IROPT_ON=all) and off.
+//
+// Expected output:
+// 100
+// 200
+// 1
+// 0
+// 1
+// 0
+// 7
+
+@constant_time
+@wrapping
+fn ct_select(condition: i64, a: i64, b: i64) -> i64 {
+    val mask = 0 - condition;
+    return (a & mask) | (b & ~mask);
+}
+
+@constant_time
+@wrapping
+fn ct_is_nonzero(x: i64) -> i64 {
+    val folded = x | (0 - x);
+    return (folded >> 63) & 1;
+}
+
+@constant_time
+@wrapping
+fn ct_eq(a: i64, b: i64) -> i64 {
+    // a @constant_time helper inside a @constant_time function
+    return 1 - ct_is_nonzero(a ^ b);
+}
+
+fn pick(c: i64) -> i64 {
+    // a caller without the annotation: ct_select stays a call
+    return ct_select(c, 100, 200);
+}
+
+fn main() {
+    println(pick(1));
+    println(pick(0));
+    println(ct_eq(5, 5));
+    println(ct_eq(5, 6));
+    println(ct_is_nonzero(- 7));
+    println(ct_is_nonzero(0));
+    println(ct_select(1, 7, 9));
+}

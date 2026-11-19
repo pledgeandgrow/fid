@@ -1,0 +1,680 @@
+// stdlib/calendar's lunar calendars and datetime's localized names
+// (competitive SL8): the tabular Islamic calendar with its four leap-year
+// rules and both epochs, the Hebrew calendar (molad, postponements,
+// Adar I/II), and the month and weekday names of fr de es it pt ar in
+// dt_format_lang / dt_parse_format_lang.
+//
+// Expected values (generated, not computed by Fid): ICU 77.1 through Node
+// 24 (islamic-civil, islamic-tbla, CLDR 47 names: the CLDR babel 2.17
+// ships); .NET's HebrewCalendar and HijriCalendar; the other Islamic rules
+// counted year by year from their lists of leap years; the molad of Tishri
+// 5786..5790 as chabad.org publishes it. (ICU's Hebrew calendar is not
+// used: it puts 1 Tishri 5807 on 2046-10-02, a day after .NET, Reingold's
+// algorithm and the four postponements.) A wrong answer panics.
+//
+// Expected output:
+// islamic ok
+// hebrew ok
+// names ok
+// lunar calendars ok
+use calendar;
+use datetime;
+use time;
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(label + ": got " + got + ", want " + want);
+        p_panic("lunar: wrong " + label);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    if got != want {
+        println(label + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+        p_panic("lunar: wrong " + label);
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("lunar: wrong " + label);
+    }
+}
+
+// ── Islamic helpers ──
+
+fn isl(g: str, z: i64, civil: str, astro: str) {
+    check("gregorian " + g, cal_date_str(cal_civil_from_days(z)), g);
+    val c: CalDate = cal_days_to_islamic(z);
+    check("civil islamic of " + g, cal_date_str(c), civil);
+    check_i("civil islamic back " + g, cal_islamic_to_days(c.year, c.month, c.day), z);
+    val a: CalDate = cal_days_to_islamic_rule(z, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL);
+    check("astronomical islamic of " + g, cal_date_str(a), astro);
+    check_i("astronomical islamic back " + g, cal_islamic_to_days_rule(a.year, a.month, a.day, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), z);
+}
+
+fn islamic_year_length(y: i64, rule: i64) -> i64 {
+    return cal_islamic_to_days_rule(y + 1, 1, 1, rule, CAL_ISLAMIC_EPOCH_CIVIL) - cal_islamic_to_days_rule(y, 1, 1, rule, CAL_ISLAMIC_EPOCH_CIVIL);
+}
+
+fn leap_years(name: str, rule: i64, want: str) {
+    var s: str = "";
+    var y: i64 = 1;
+    while y <= 30 {
+        if cal_islamic_is_leap_rule(y, rule) {
+            if str_len(s) > 0 {
+                s = s + " ";
+            }
+            s = s + int_to_str(y);
+        }
+        // the cycle repeats, below year 1 too
+        check_b(name + " cycle", cal_islamic_is_leap_rule(y + 1410, rule), cal_islamic_is_leap_rule(y, rule));
+        check_b(name + " cycle below 1", cal_islamic_is_leap_rule(y - 60, rule), cal_islamic_is_leap_rule(y, rule));
+        var ylen: i64 = 354;
+        if cal_islamic_is_leap_rule(y, rule) {
+            ylen = 355;
+        }
+        check_i(name + " year length", islamic_year_length(y, rule), ylen);
+        y = y + 1;
+    }
+    check(name + " leap years", s, want);
+    // a 30-year cycle is 10631 days
+    check_i(name + " cycle length", cal_islamic_to_days_rule(1471, 1, 1, rule, CAL_ISLAMIC_EPOCH_CIVIL) - cal_islamic_to_days_rule(1441, 1, 1, rule, CAL_ISLAMIC_EPOCH_CIVIL), 10631);
+}
+
+fn islamic_round_trip(name: str, rule: i64) {
+    var z: i64 = cal_islamic_to_days_rule(1445, 1, 1, rule, CAL_ISLAMIC_EPOCH_CIVIL);
+    val stop: i64 = cal_islamic_to_days_rule(1448, 1, 1, rule, CAL_ISLAMIC_EPOCH_CIVIL);
+    var firsts: i64 = 0;
+    while z < stop {
+        val d: CalDate = cal_days_to_islamic_rule(z, rule, CAL_ISLAMIC_EPOCH_CIVIL);
+        if !cal_islamic_is_valid_rule(d.year, d.month, d.day, rule) {
+            p_panic("lunar: " + name + ": invalid date " + cal_date_str(d));
+        }
+        if cal_islamic_to_days_rule(d.year, d.month, d.day, rule, CAL_ISLAMIC_EPOCH_CIVIL) != z {
+            p_panic("lunar: " + name + ": round trip broke at day " + int_to_str(z));
+        }
+        if d.day == 1 {
+            firsts = firsts + 1;
+        }
+        z = z + 1;
+    }
+    check_i(name + " months in 3 years", firsts, 36);
+}
+
+// ── Hebrew helpers ──
+
+fn hny(y: i64, want: str, len: i64) {
+    check("1 Tishri " + int_to_str(y), cal_date_str(cal_civil_from_days(cal_hebrew_new_year(y))), want);
+    check_i("length of " + int_to_str(y), cal_hebrew_year_length(y), len);
+    check_i("1 Tishri " + int_to_str(y) + " as a date", cal_hebrew_to_days(y, 7, 1), cal_hebrew_new_year(y));
+}
+
+fn heb(y: i64, m: i64, d: i64, want: str) {
+    val g: str = cal_date_str(cal_date_of(y, m, d));
+    val h: CalDate = cal_gregorian_to_hebrew(y, m, d);
+    check("hebrew of " + g, cal_date_str(h), want);
+    check("gregorian of " + want, cal_date_str(cal_hebrew_to_gregorian(h.year, h.month, h.day)), g);
+}
+
+fn cal_date_of(y: i64, m: i64, d: i64) -> CalDate {
+    return cal_civil_from_days(cal_days_from_civil(y, m, d));
+}
+
+fn molad(y: i64, day: str, parts: i64) {
+    var(md, mp) = cal_hebrew_molad(y);
+    check("molad day " + int_to_str(y), cal_date_str(cal_civil_from_days(md)), day);
+    check_i("molad parts " + int_to_str(y), mp, parts);
+}
+
+// ── Name helpers ──
+
+fn names(lang: str, y: i64, m: i64, d: i64, want: str) {
+    check(lang + " names of " + int_to_str(m) + "/" + int_to_str(d), dt_format_lang(time_from_date(y, m, d), "%A|%B|%a|%b", lang), want);
+}
+
+fn parsed_lang(label: str, s: str, fmt: str, lang: str, want: i64) {
+    var(ok, ts) = dt_parse_format_lang(s, fmt, lang);
+    if !ok {
+        p_panic("lunar: " + label + ": \"" + s + "\" was refused");
+    }
+    check_i(label, ts, want);
+}
+
+fn refused_lang(label: str, s: str, fmt: str, lang: str) {
+    var(ok, ts) = dt_parse_format_lang(s, fmt, lang);
+    if ok {
+        p_panic("lunar: " + label + ": \"" + s + "\" was accepted as " + int_to_str(ts));
+    }
+}
+
+fn main() -> i64 {
+    // ── Islamic ──
+    // the civil calendar (ICU islamic-civil) and the astronomical one (ICU islamic-tbla, .NET HijriCalendar)
+    isl("0622-07-19", -492148, "0001-01-01", "0001-01-02");
+    isl("0622-07-18", -492149, "0000-12-29", "0001-01-01");
+    isl("1900-01-01", -25567, "1317-08-28", "1317-08-29");
+    isl("1970-01-01", 0, "1389-10-22", "1389-10-23");
+    isl("2000-01-01", 10957, "1420-09-24", "1420-09-25");
+    isl("2024-03-11", 19793, "1445-09-01", "1445-09-02");
+    isl("2026-02-18", 20502, "1447-09-01", "1447-09-02");
+    isl("2026-03-20", 20532, "1447-10-01", "1447-10-02");
+    isl("2026-11-17", 20774, "1448-06-06", "1448-06-07");
+    isl("2027-05-16", 20954, "1448-12-09", "1448-12-10");
+    isl("2052-02-20", 30000, "1474-06-19", "1474-06-20");
+    isl("1582-10-15", -141427, "0990-09-17", "0990-09-18");
+    isl("1000-01-01", -354285, "0390-01-15", "0390-01-16");
+    isl("2100-12-31", 47846, "1524-10-29", "1524-11-01");
+    isl("2077-11-16", 39401, "1500-12-29", "1501-01-01");
+    // 1 Muharram by .NET HijriCalendar (the Thursday epoch) and the year lengths
+    check_i("hijri new year 1", cal_islamic_to_days_rule(1, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), -492149);
+    check_i("hijri year length 1", islamic_year_length(1, CAL_ISLAMIC_II), 354);
+    check_i("hijri new year 2", cal_islamic_to_days_rule(2, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), -491795);
+    check_i("hijri year length 2", islamic_year_length(2, CAL_ISLAMIC_II), 355);
+    check_i("hijri new year 100", cal_islamic_to_days_rule(100, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), -457067);
+    check_i("hijri year length 100", islamic_year_length(100, CAL_ISLAMIC_II), 355);
+    check_i("hijri new year 1000", cal_islamic_to_days_rule(1000, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), -138137);
+    check_i("hijri year length 1000", islamic_year_length(1000, CAL_ISLAMIC_II), 355);
+    check_i("hijri new year 1389", cal_islamic_to_days_rule(1389, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), -288);
+    check_i("hijri year length 1389", islamic_year_length(1389, CAL_ISLAMIC_II), 354);
+    check_i("hijri new year 1444", cal_islamic_to_days_rule(1444, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), 19202);
+    check_i("hijri year length 1444", islamic_year_length(1444, CAL_ISLAMIC_II), 354);
+    check_i("hijri new year 1445", cal_islamic_to_days_rule(1445, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), 19556);
+    check_i("hijri year length 1445", islamic_year_length(1445, CAL_ISLAMIC_II), 355);
+    check_i("hijri new year 1446", cal_islamic_to_days_rule(1446, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), 19911);
+    check_i("hijri year length 1446", islamic_year_length(1446, CAL_ISLAMIC_II), 354);
+    check_i("hijri new year 1447", cal_islamic_to_days_rule(1447, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), 20265);
+    check_i("hijri year length 1447", islamic_year_length(1447, CAL_ISLAMIC_II), 355);
+    check_i("hijri new year 1448", cal_islamic_to_days_rule(1448, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), 20620);
+    check_i("hijri year length 1448", islamic_year_length(1448, CAL_ISLAMIC_II), 354);
+    check_i("hijri new year 1500", cal_islamic_to_days_rule(1500, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_ASTRONOMICAL), 39047);
+    check_i("hijri year length 1500", islamic_year_length(1500, CAL_ISLAMIC_II), 354);
+    // the other leap-year rules: 1 Muharram counted year by year from the lists of leap years
+    leap_years("CAL_ISLAMIC_I", CAL_ISLAMIC_I, "2 5 7 10 13 15 18 21 24 26 29");
+    check_i("CAL_ISLAMIC_I 1 Muharram 2", cal_islamic_to_days_rule(2, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), -491794);
+    check_i("CAL_ISLAMIC_I 1 Muharram 9", cal_islamic_to_days_rule(9, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), -489313);
+    check_i("CAL_ISLAMIC_I 1 Muharram 30", cal_islamic_to_days_rule(30, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), -481871);
+    check_i("CAL_ISLAMIC_I 1 Muharram 31", cal_islamic_to_days_rule(31, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), -481517);
+    check_i("CAL_ISLAMIC_I 1 Muharram 61", cal_islamic_to_days_rule(61, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), -470886);
+    check_i("CAL_ISLAMIC_I 1 Muharram 1000", cal_islamic_to_days_rule(1000, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), -138136);
+    check_i("CAL_ISLAMIC_I 1 Muharram 1445", cal_islamic_to_days_rule(1445, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), 19557);
+    check_i("CAL_ISLAMIC_I 1 Muharram 1446", cal_islamic_to_days_rule(1446, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), 19912);
+    check_i("CAL_ISLAMIC_I 1 Muharram 1447", cal_islamic_to_days_rule(1447, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), 20266);
+    check_i("CAL_ISLAMIC_I 1 Muharram 1448", cal_islamic_to_days_rule(1448, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), 20621);
+    check_i("CAL_ISLAMIC_I 1 Muharram 1450", cal_islamic_to_days_rule(1450, 1, 1, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL), 21329);
+    check("CAL_ISLAMIC_I day after 29 Dhu al-Hijjah 1447", cal_date_str(cal_days_to_islamic_rule(20620, CAL_ISLAMIC_I, CAL_ISLAMIC_EPOCH_CIVIL)), "1447-12-30");
+    leap_years("CAL_ISLAMIC_II", CAL_ISLAMIC_II, "2 5 7 10 13 16 18 21 24 26 29");
+    check_i("CAL_ISLAMIC_II 1 Muharram 2", cal_islamic_to_days_rule(2, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), -491794);
+    check_i("CAL_ISLAMIC_II 1 Muharram 9", cal_islamic_to_days_rule(9, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), -489313);
+    check_i("CAL_ISLAMIC_II 1 Muharram 30", cal_islamic_to_days_rule(30, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), -481871);
+    check_i("CAL_ISLAMIC_II 1 Muharram 31", cal_islamic_to_days_rule(31, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), -481517);
+    check_i("CAL_ISLAMIC_II 1 Muharram 61", cal_islamic_to_days_rule(61, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), -470886);
+    check_i("CAL_ISLAMIC_II 1 Muharram 1000", cal_islamic_to_days_rule(1000, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), -138136);
+    check_i("CAL_ISLAMIC_II 1 Muharram 1445", cal_islamic_to_days_rule(1445, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), 19557);
+    check_i("CAL_ISLAMIC_II 1 Muharram 1446", cal_islamic_to_days_rule(1446, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), 19912);
+    check_i("CAL_ISLAMIC_II 1 Muharram 1447", cal_islamic_to_days_rule(1447, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), 20266);
+    check_i("CAL_ISLAMIC_II 1 Muharram 1448", cal_islamic_to_days_rule(1448, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), 20621);
+    check_i("CAL_ISLAMIC_II 1 Muharram 1450", cal_islamic_to_days_rule(1450, 1, 1, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL), 21329);
+    check("CAL_ISLAMIC_II day after 29 Dhu al-Hijjah 1447", cal_date_str(cal_days_to_islamic_rule(20620, CAL_ISLAMIC_II, CAL_ISLAMIC_EPOCH_CIVIL)), "1447-12-30");
+    leap_years("CAL_ISLAMIC_III", CAL_ISLAMIC_III, "2 5 8 10 13 16 19 21 24 27 29");
+    check_i("CAL_ISLAMIC_III 1 Muharram 2", cal_islamic_to_days_rule(2, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), -491794);
+    check_i("CAL_ISLAMIC_III 1 Muharram 9", cal_islamic_to_days_rule(9, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), -489313);
+    check_i("CAL_ISLAMIC_III 1 Muharram 30", cal_islamic_to_days_rule(30, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), -481871);
+    check_i("CAL_ISLAMIC_III 1 Muharram 31", cal_islamic_to_days_rule(31, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), -481517);
+    check_i("CAL_ISLAMIC_III 1 Muharram 61", cal_islamic_to_days_rule(61, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), -470886);
+    check_i("CAL_ISLAMIC_III 1 Muharram 1000", cal_islamic_to_days_rule(1000, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), -138136);
+    check_i("CAL_ISLAMIC_III 1 Muharram 1445", cal_islamic_to_days_rule(1445, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), 19557);
+    check_i("CAL_ISLAMIC_III 1 Muharram 1446", cal_islamic_to_days_rule(1446, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), 19912);
+    check_i("CAL_ISLAMIC_III 1 Muharram 1447", cal_islamic_to_days_rule(1447, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), 20266);
+    check_i("CAL_ISLAMIC_III 1 Muharram 1448", cal_islamic_to_days_rule(1448, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), 20620);
+    check_i("CAL_ISLAMIC_III 1 Muharram 1450", cal_islamic_to_days_rule(1450, 1, 1, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL), 21329);
+    check("CAL_ISLAMIC_III day after 29 Dhu al-Hijjah 1447", cal_date_str(cal_days_to_islamic_rule(20620, CAL_ISLAMIC_III, CAL_ISLAMIC_EPOCH_CIVIL)), "1448-01-01");
+    leap_years("CAL_ISLAMIC_IV", CAL_ISLAMIC_IV, "2 5 8 11 13 16 19 21 24 27 30");
+    check_i("CAL_ISLAMIC_IV 1 Muharram 2", cal_islamic_to_days_rule(2, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), -491794);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 9", cal_islamic_to_days_rule(9, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), -489313);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 30", cal_islamic_to_days_rule(30, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), -481872);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 31", cal_islamic_to_days_rule(31, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), -481517);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 61", cal_islamic_to_days_rule(61, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), -470886);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 1000", cal_islamic_to_days_rule(1000, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), -138136);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 1445", cal_islamic_to_days_rule(1445, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), 19557);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 1446", cal_islamic_to_days_rule(1446, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), 19912);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 1447", cal_islamic_to_days_rule(1447, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), 20266);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 1448", cal_islamic_to_days_rule(1448, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), 20620);
+    check_i("CAL_ISLAMIC_IV 1 Muharram 1450", cal_islamic_to_days_rule(1450, 1, 1, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL), 21329);
+    check("CAL_ISLAMIC_IV day after 29 Dhu al-Hijjah 1447", cal_date_str(cal_days_to_islamic_rule(20620, CAL_ISLAMIC_IV, CAL_ISLAMIC_EPOCH_CIVIL)), "1448-01-01");
+    check("1 Ramadan 1447", cal_date_str(cal_gregorian_to_islamic(2026, 2, 18)), "1447-09-01");
+    check("1 Shawwal 1447", cal_date_str(cal_islamic_to_gregorian(1447, 10, 1)), "2026-03-20");
+    check_b("1445 leap", cal_islamic_is_leap(1445), true);
+    check_b("1446 common", cal_islamic_is_leap(1446), false);
+    check_b("30 Dhu al-Hijjah 1445", cal_islamic_is_valid(1445, 12, 30), true);
+    check_b("30 Dhu al-Hijjah 1446", cal_islamic_is_valid(1446, 12, 30), false);
+    check_b("30 Safar", cal_islamic_is_valid(1446, 2, 30), false);
+    check_b("30 Muharram", cal_islamic_is_valid(1446, 1, 30), true);
+    check_b("month 13", cal_islamic_is_valid(1446, 13, 1), false);
+    check_b("rule IV year 30", cal_islamic_is_valid_rule(1440, 12, 30, CAL_ISLAMIC_IV), true);
+    check_b("rule II year 30", cal_islamic_is_valid_rule(1440, 12, 30, CAL_ISLAMIC_II), false);
+    check_i("days in Ramadan", cal_islamic_days_in_month(1447, 9), 30);
+    check_i("days in Shawwal", cal_islamic_days_in_month(1447, 10), 29);
+    check("month 9", cal_islamic_month_name(9), "Ramadan");
+    check("month 12", cal_islamic_month_name(12), "Dhuʻl-Hijjah");
+    check("month 13 name", cal_islamic_month_name(13), "");
+    check_i("civil epoch", cal_jdn_from_days(cal_islamic_to_days(1, 1, 1)), CAL_ISLAMIC_EPOCH_CIVIL);
+    check("the epoch is Julian 622-07-16", cal_date_str(cal_days_to_julian(cal_islamic_to_days(1, 1, 1))), "0622-07-16");
+    check_i("the epoch is a Friday", cal_iso_weekday(cal_islamic_to_days(1, 1, 1)), 5);
+    check("the day before the epoch", cal_date_str(cal_days_to_islamic(cal_islamic_to_days(1, 1, 1) - 1)), "0000-12-29");
+    islamic_round_trip("rule I", CAL_ISLAMIC_I);
+    islamic_round_trip("rule II", CAL_ISLAMIC_II);
+    islamic_round_trip("rule III", CAL_ISLAMIC_III);
+    islamic_round_trip("rule IV", CAL_ISLAMIC_IV);
+    println("islamic ok");
+
+    // ── Hebrew ──
+    // 1 Tishri and the year length by .NET HebrewCalendar
+    hny(5770, "2009-09-19", 355);
+    hny(5771, "2010-09-09", 385);
+    hny(5772, "2011-09-29", 354);
+    hny(5773, "2012-09-17", 353);
+    hny(5774, "2013-09-05", 385);
+    hny(5775, "2014-09-25", 354);
+    hny(5776, "2015-09-14", 385);
+    hny(5777, "2016-10-03", 353);
+    hny(5778, "2017-09-21", 354);
+    hny(5779, "2018-09-10", 385);
+    hny(5780, "2019-09-30", 355);
+    hny(5781, "2020-09-19", 353);
+    hny(5782, "2021-09-07", 384);
+    hny(5783, "2022-09-26", 355);
+    hny(5784, "2023-09-16", 383);
+    hny(5785, "2024-10-03", 355);
+    hny(5786, "2025-09-23", 354);
+    hny(5787, "2026-09-12", 385);
+    hny(5788, "2027-10-02", 355);
+    hny(5789, "2028-09-21", 354);
+    hny(5790, "2029-09-10", 383);
+    hny(5791, "2030-09-28", 355);
+    hny(5792, "2031-09-18", 354);
+    hny(5793, "2032-09-06", 383);
+    hny(5794, "2033-09-24", 355);
+    hny(5795, "2034-09-14", 385);
+    hny(5796, "2035-10-04", 354);
+    hny(5797, "2036-09-22", 353);
+    hny(5798, "2037-09-10", 385);
+    hny(5799, "2038-09-30", 354);
+    hny(5800, "2039-09-19", 355);
+    hny(5344, "1583-09-17", 355);
+    hny(5500, "1739-10-03", 355);
+    hny(5806, "2045-09-12", 384);
+    hny(5807, "2046-10-01", 355);
+    hny(5999, "2238-09-10", 385);
+    // dates by .NET HebrewCalendar (its month 1 is Tishri; here Nisan is 1)
+    heb(1583, 1, 1, "5343-10-07");
+    heb(1900, 3, 1, "5660-12-30");
+    heb(1970, 1, 1, "5730-10-23");
+    heb(2000, 1, 1, "5760-10-23");
+    heb(2023, 9, 16, "5784-07-01");
+    heb(2024, 2, 10, "5784-12-01");
+    heb(2024, 3, 11, "5784-13-01");
+    heb(2024, 3, 24, "5784-13-14");
+    heb(2024, 4, 23, "5784-01-15");
+    heb(2025, 3, 14, "5785-12-14");
+    heb(2025, 9, 22, "5785-06-29");
+    heb(2025, 9, 23, "5786-07-01");
+    heb(2025, 11, 21, "5786-09-01");
+    heb(2025, 12, 21, "5786-10-01");
+    heb(2026, 11, 17, "5787-09-07");
+    heb(2027, 3, 23, "5787-13-14");
+    heb(2045, 11, 12, "5806-09-03");
+    heb(2046, 10, 1, "5807-07-01");
+    heb(2100, 12, 31, "5861-09-29");
+    heb(2239, 9, 29, "5999-06-29");
+    // the molad of Tishri, as chabad.org publishes it (Jerusalem time):
+    // 5786 Monday 18 h 187 p (from 6 p.m. Sunday), 5787 Friday 2026-09-11 8:59 p.m. and 1 part,
+    // 5788 Thursday 2027-09-30 6:31 p.m. and 14, 5789 Tuesday 2028-09-19 3:20 a.m. and 8,
+    // 5790 Saturday 2029-09-08 12:09 p.m. and 2 (a minute is 18 parts)
+    molad(5786, "2025-09-22", 19627);
+    molad(5787, "2026-09-12", 3223);
+    molad(5788, "2027-10-01", 572);
+    molad(5789, "2028-09-19", 10088);
+    molad(5790, "2029-09-08", 19604);
+    check_b("5784 leap", cal_hebrew_is_leap(5784), true);
+    check_b("5785 common", cal_hebrew_is_leap(5785), false);
+    check_b("5787 leap", cal_hebrew_is_leap(5787), true);
+    check_i("months of 5784", cal_hebrew_months_in_year(5784), 13);
+    check_i("months of 5785", cal_hebrew_months_in_year(5785), 12);
+    check("Adar I", cal_hebrew_month_name(5784, 12), "Adar I");
+    check("Adar II", cal_hebrew_month_name(5784, 13), "Adar II");
+    check("Adar", cal_hebrew_month_name(5785, 12), "Adar");
+    check("no Adar II", cal_hebrew_month_name(5785, 13), "");
+    check("Tishri", cal_hebrew_month_name(5785, 7), "Tishri");
+    check_b("13th month of a common year", cal_hebrew_is_valid(5785, 13, 1), false);
+    check_b("30 Adar I", cal_hebrew_is_valid(5784, 12, 30), true);
+    check_b("30 Adar", cal_hebrew_is_valid(5785, 12, 30), false);
+    // 5785 is complete (355 days): Heshvan and Kislev have 30; 5784 is deficient (383): both 29
+    check_i("Heshvan 5785", cal_hebrew_days_in_month(5785, 8), 30);
+    check_i("Kislev 5785", cal_hebrew_days_in_month(5785, 9), 30);
+    check_i("Heshvan 5784", cal_hebrew_days_in_month(5784, 8), 29);
+    check_i("Kislev 5784", cal_hebrew_days_in_month(5784, 9), 29);
+    check_i("Elul", cal_hebrew_days_in_month(5785, 6), 29);
+    check_i("month 0", cal_hebrew_days_in_month(5785, 0), 0);
+    check_i("epoch", cal_jdn_from_days(cal_hebrew_new_year(1)), CAL_HEBREW_EPOCH_JDN);
+    check("epoch in Julian", cal_date_str(cal_days_to_julian(cal_hebrew_new_year(1))), "-3760-10-07");
+    // a Rosh Hashanah is never on a Sunday, Wednesday or Friday, and every
+    // year is 353..355 or 383..385 days, its months adding up to it
+    var y: i64 = 5600;
+    while y < 5900 {
+        val wd: i64 = cal_iso_weekday(cal_hebrew_new_year(y));
+        if wd == 7 || wd == 3 || wd == 5 {
+            p_panic("lunar: Rosh Hashanah " + int_to_str(y) + " on weekday " + int_to_str(wd));
+        }
+        val len: i64 = cal_hebrew_year_length(y);
+        var want_months: i64 = 12;
+        if cal_hebrew_is_leap(y) {
+            want_months = 13;
+        }
+        if !((len >= 353 && len <= 355 && want_months == 12) || (len >= 383 && len <= 385 && want_months == 13)) {
+            p_panic("lunar: year " + int_to_str(y) + " has " + int_to_str(len) + " days");
+        }
+        if y % 10 == 0 {
+            var sum: i64 = 0;
+            var m: i64 = 1;
+            while m <= want_months {
+                sum = sum + cal_hebrew_days_in_month(y, m);
+                m = m + 1;
+            }
+            check_i("months of " + int_to_str(y), sum, len);
+        }
+        y = y + 1;
+    }
+    // every day of five years, 5783..5787, round trips
+    var z: i64 = cal_hebrew_new_year(5783);
+    val stop: i64 = cal_hebrew_new_year(5788);
+    var firsts: i64 = 0;
+    while z < stop {
+        val h: CalDate = cal_days_to_hebrew(z);
+        if !cal_hebrew_is_valid(h.year, h.month, h.day) {
+            p_panic("lunar: invalid Hebrew date " + cal_date_str(h));
+        }
+        if cal_hebrew_to_days(h.year, h.month, h.day) != z {
+            p_panic("lunar: Hebrew round trip broke at day " + int_to_str(z));
+        }
+        if h.day == 1 {
+            firsts = firsts + 1;
+        }
+        z = z + 1;
+    }
+    // 5784 and 5787 are leap years
+    check_i("months in five years", firsts, 62);
+    println("hebrew ok");
+
+    // ── Localized names ──
+    val aug15: LogicalTime = time_from_date(2026, 8, 15);
+    // every month and weekday name, full and abbreviated (CLDR 47 through ICU 77, the data of babel 2.17)
+    names("fr", 2026, 1, 11, "dimanche|janvier|dim.|janv.");
+    parsed_lang("fr 2026-01-11", "dimanche 11 janvier 2026", "%A %d %B %Y", "fr", 1768089600);
+    parsed_lang("fr 2026-01-11 short", "dim. 11 janv. 2026", "%a %d %b %Y", "fr", 1768089600);
+    names("fr", 2026, 2, 16, "lundi|février|lun.|févr.");
+    parsed_lang("fr 2026-02-16", "lundi 16 février 2026", "%A %d %B %Y", "fr", 1771200000);
+    parsed_lang("fr 2026-02-16 short", "lun. 16 févr. 2026", "%a %d %b %Y", "fr", 1771200000);
+    names("fr", 2026, 3, 10, "mardi|mars|mar.|mars");
+    parsed_lang("fr 2026-03-10", "mardi 10 mars 2026", "%A %d %B %Y", "fr", 1773100800);
+    parsed_lang("fr 2026-03-10 short", "mar. 10 mars 2026", "%a %d %b %Y", "fr", 1773100800);
+    names("fr", 2026, 4, 15, "mercredi|avril|mer.|avr.");
+    parsed_lang("fr 2026-04-15", "mercredi 15 avril 2026", "%A %d %B %Y", "fr", 1776211200);
+    parsed_lang("fr 2026-04-15 short", "mer. 15 avr. 2026", "%a %d %b %Y", "fr", 1776211200);
+    names("fr", 2026, 5, 14, "jeudi|mai|jeu.|mai");
+    parsed_lang("fr 2026-05-14", "jeudi 14 mai 2026", "%A %d %B %Y", "fr", 1778716800);
+    parsed_lang("fr 2026-05-14 short", "jeu. 14 mai 2026", "%a %d %b %Y", "fr", 1778716800);
+    names("fr", 2026, 6, 12, "vendredi|juin|ven.|juin");
+    parsed_lang("fr 2026-06-12", "vendredi 12 juin 2026", "%A %d %B %Y", "fr", 1781222400);
+    parsed_lang("fr 2026-06-12 short", "ven. 12 juin 2026", "%a %d %b %Y", "fr", 1781222400);
+    names("fr", 2026, 7, 11, "samedi|juillet|sam.|juil.");
+    parsed_lang("fr 2026-07-11", "samedi 11 juillet 2026", "%A %d %B %Y", "fr", 1783728000);
+    parsed_lang("fr 2026-07-11 short", "sam. 11 juil. 2026", "%a %d %b %Y", "fr", 1783728000);
+    names("fr", 2026, 8, 16, "dimanche|août|dim.|août");
+    parsed_lang("fr 2026-08-16", "dimanche 16 août 2026", "%A %d %B %Y", "fr", 1786838400);
+    parsed_lang("fr 2026-08-16 short", "dim. 16 août 2026", "%a %d %b %Y", "fr", 1786838400);
+    names("fr", 2026, 9, 14, "lundi|septembre|lun.|sept.");
+    parsed_lang("fr 2026-09-14", "lundi 14 septembre 2026", "%A %d %B %Y", "fr", 1789344000);
+    parsed_lang("fr 2026-09-14 short", "lun. 14 sept. 2026", "%a %d %b %Y", "fr", 1789344000);
+    names("fr", 2026, 10, 13, "mardi|octobre|mar.|oct.");
+    parsed_lang("fr 2026-10-13", "mardi 13 octobre 2026", "%A %d %B %Y", "fr", 1791849600);
+    parsed_lang("fr 2026-10-13 short", "mar. 13 oct. 2026", "%a %d %b %Y", "fr", 1791849600);
+    names("fr", 2026, 11, 11, "mercredi|novembre|mer.|nov.");
+    parsed_lang("fr 2026-11-11", "mercredi 11 novembre 2026", "%A %d %B %Y", "fr", 1794355200);
+    parsed_lang("fr 2026-11-11 short", "mer. 11 nov. 2026", "%a %d %b %Y", "fr", 1794355200);
+    names("fr", 2026, 12, 10, "jeudi|décembre|jeu.|déc.");
+    parsed_lang("fr 2026-12-10", "jeudi 10 décembre 2026", "%A %d %B %Y", "fr", 1796860800);
+    parsed_lang("fr 2026-12-10 short", "jeu. 10 déc. 2026", "%a %d %b %Y", "fr", 1796860800);
+    names("de", 2026, 1, 11, "Sonntag|Januar|So.|Jan.");
+    parsed_lang("de 2026-01-11", "Sonntag 11 Januar 2026", "%A %d %B %Y", "de", 1768089600);
+    parsed_lang("de 2026-01-11 short", "So. 11 Jan. 2026", "%a %d %b %Y", "de", 1768089600);
+    names("de", 2026, 2, 16, "Montag|Februar|Mo.|Feb.");
+    parsed_lang("de 2026-02-16", "Montag 16 Februar 2026", "%A %d %B %Y", "de", 1771200000);
+    parsed_lang("de 2026-02-16 short", "Mo. 16 Feb. 2026", "%a %d %b %Y", "de", 1771200000);
+    names("de", 2026, 3, 10, "Dienstag|März|Di.|März");
+    parsed_lang("de 2026-03-10", "Dienstag 10 März 2026", "%A %d %B %Y", "de", 1773100800);
+    parsed_lang("de 2026-03-10 short", "Di. 10 März 2026", "%a %d %b %Y", "de", 1773100800);
+    names("de", 2026, 4, 15, "Mittwoch|April|Mi.|Apr.");
+    parsed_lang("de 2026-04-15", "Mittwoch 15 April 2026", "%A %d %B %Y", "de", 1776211200);
+    parsed_lang("de 2026-04-15 short", "Mi. 15 Apr. 2026", "%a %d %b %Y", "de", 1776211200);
+    names("de", 2026, 5, 14, "Donnerstag|Mai|Do.|Mai");
+    parsed_lang("de 2026-05-14", "Donnerstag 14 Mai 2026", "%A %d %B %Y", "de", 1778716800);
+    parsed_lang("de 2026-05-14 short", "Do. 14 Mai 2026", "%a %d %b %Y", "de", 1778716800);
+    names("de", 2026, 6, 12, "Freitag|Juni|Fr.|Juni");
+    parsed_lang("de 2026-06-12", "Freitag 12 Juni 2026", "%A %d %B %Y", "de", 1781222400);
+    parsed_lang("de 2026-06-12 short", "Fr. 12 Juni 2026", "%a %d %b %Y", "de", 1781222400);
+    names("de", 2026, 7, 11, "Samstag|Juli|Sa.|Juli");
+    parsed_lang("de 2026-07-11", "Samstag 11 Juli 2026", "%A %d %B %Y", "de", 1783728000);
+    parsed_lang("de 2026-07-11 short", "Sa. 11 Juli 2026", "%a %d %b %Y", "de", 1783728000);
+    names("de", 2026, 8, 16, "Sonntag|August|So.|Aug.");
+    parsed_lang("de 2026-08-16", "Sonntag 16 August 2026", "%A %d %B %Y", "de", 1786838400);
+    parsed_lang("de 2026-08-16 short", "So. 16 Aug. 2026", "%a %d %b %Y", "de", 1786838400);
+    names("de", 2026, 9, 14, "Montag|September|Mo.|Sept.");
+    parsed_lang("de 2026-09-14", "Montag 14 September 2026", "%A %d %B %Y", "de", 1789344000);
+    parsed_lang("de 2026-09-14 short", "Mo. 14 Sept. 2026", "%a %d %b %Y", "de", 1789344000);
+    names("de", 2026, 10, 13, "Dienstag|Oktober|Di.|Okt.");
+    parsed_lang("de 2026-10-13", "Dienstag 13 Oktober 2026", "%A %d %B %Y", "de", 1791849600);
+    parsed_lang("de 2026-10-13 short", "Di. 13 Okt. 2026", "%a %d %b %Y", "de", 1791849600);
+    names("de", 2026, 11, 11, "Mittwoch|November|Mi.|Nov.");
+    parsed_lang("de 2026-11-11", "Mittwoch 11 November 2026", "%A %d %B %Y", "de", 1794355200);
+    parsed_lang("de 2026-11-11 short", "Mi. 11 Nov. 2026", "%a %d %b %Y", "de", 1794355200);
+    names("de", 2026, 12, 10, "Donnerstag|Dezember|Do.|Dez.");
+    parsed_lang("de 2026-12-10", "Donnerstag 10 Dezember 2026", "%A %d %B %Y", "de", 1796860800);
+    parsed_lang("de 2026-12-10 short", "Do. 10 Dez. 2026", "%a %d %b %Y", "de", 1796860800);
+    names("es", 2026, 1, 11, "domingo|enero|dom|ene");
+    parsed_lang("es 2026-01-11", "domingo 11 enero 2026", "%A %d %B %Y", "es", 1768089600);
+    parsed_lang("es 2026-01-11 short", "dom 11 ene 2026", "%a %d %b %Y", "es", 1768089600);
+    names("es", 2026, 2, 16, "lunes|febrero|lun|feb");
+    parsed_lang("es 2026-02-16", "lunes 16 febrero 2026", "%A %d %B %Y", "es", 1771200000);
+    parsed_lang("es 2026-02-16 short", "lun 16 feb 2026", "%a %d %b %Y", "es", 1771200000);
+    names("es", 2026, 3, 10, "martes|marzo|mar|mar");
+    parsed_lang("es 2026-03-10", "martes 10 marzo 2026", "%A %d %B %Y", "es", 1773100800);
+    parsed_lang("es 2026-03-10 short", "mar 10 mar 2026", "%a %d %b %Y", "es", 1773100800);
+    names("es", 2026, 4, 15, "miércoles|abril|mié|abr");
+    parsed_lang("es 2026-04-15", "miércoles 15 abril 2026", "%A %d %B %Y", "es", 1776211200);
+    parsed_lang("es 2026-04-15 short", "mié 15 abr 2026", "%a %d %b %Y", "es", 1776211200);
+    names("es", 2026, 5, 14, "jueves|mayo|jue|may");
+    parsed_lang("es 2026-05-14", "jueves 14 mayo 2026", "%A %d %B %Y", "es", 1778716800);
+    parsed_lang("es 2026-05-14 short", "jue 14 may 2026", "%a %d %b %Y", "es", 1778716800);
+    names("es", 2026, 6, 12, "viernes|junio|vie|jun");
+    parsed_lang("es 2026-06-12", "viernes 12 junio 2026", "%A %d %B %Y", "es", 1781222400);
+    parsed_lang("es 2026-06-12 short", "vie 12 jun 2026", "%a %d %b %Y", "es", 1781222400);
+    names("es", 2026, 7, 11, "sábado|julio|sáb|jul");
+    parsed_lang("es 2026-07-11", "sábado 11 julio 2026", "%A %d %B %Y", "es", 1783728000);
+    parsed_lang("es 2026-07-11 short", "sáb 11 jul 2026", "%a %d %b %Y", "es", 1783728000);
+    names("es", 2026, 8, 16, "domingo|agosto|dom|ago");
+    parsed_lang("es 2026-08-16", "domingo 16 agosto 2026", "%A %d %B %Y", "es", 1786838400);
+    parsed_lang("es 2026-08-16 short", "dom 16 ago 2026", "%a %d %b %Y", "es", 1786838400);
+    names("es", 2026, 9, 14, "lunes|septiembre|lun|sept");
+    parsed_lang("es 2026-09-14", "lunes 14 septiembre 2026", "%A %d %B %Y", "es", 1789344000);
+    parsed_lang("es 2026-09-14 short", "lun 14 sept 2026", "%a %d %b %Y", "es", 1789344000);
+    names("es", 2026, 10, 13, "martes|octubre|mar|oct");
+    parsed_lang("es 2026-10-13", "martes 13 octubre 2026", "%A %d %B %Y", "es", 1791849600);
+    parsed_lang("es 2026-10-13 short", "mar 13 oct 2026", "%a %d %b %Y", "es", 1791849600);
+    names("es", 2026, 11, 11, "miércoles|noviembre|mié|nov");
+    parsed_lang("es 2026-11-11", "miércoles 11 noviembre 2026", "%A %d %B %Y", "es", 1794355200);
+    parsed_lang("es 2026-11-11 short", "mié 11 nov 2026", "%a %d %b %Y", "es", 1794355200);
+    names("es", 2026, 12, 10, "jueves|diciembre|jue|dic");
+    parsed_lang("es 2026-12-10", "jueves 10 diciembre 2026", "%A %d %B %Y", "es", 1796860800);
+    parsed_lang("es 2026-12-10 short", "jue 10 dic 2026", "%a %d %b %Y", "es", 1796860800);
+    names("it", 2026, 1, 11, "domenica|gennaio|dom|gen");
+    parsed_lang("it 2026-01-11", "domenica 11 gennaio 2026", "%A %d %B %Y", "it", 1768089600);
+    parsed_lang("it 2026-01-11 short", "dom 11 gen 2026", "%a %d %b %Y", "it", 1768089600);
+    names("it", 2026, 2, 16, "lunedì|febbraio|lun|feb");
+    parsed_lang("it 2026-02-16", "lunedì 16 febbraio 2026", "%A %d %B %Y", "it", 1771200000);
+    parsed_lang("it 2026-02-16 short", "lun 16 feb 2026", "%a %d %b %Y", "it", 1771200000);
+    names("it", 2026, 3, 10, "martedì|marzo|mar|mar");
+    parsed_lang("it 2026-03-10", "martedì 10 marzo 2026", "%A %d %B %Y", "it", 1773100800);
+    parsed_lang("it 2026-03-10 short", "mar 10 mar 2026", "%a %d %b %Y", "it", 1773100800);
+    names("it", 2026, 4, 15, "mercoledì|aprile|mer|apr");
+    parsed_lang("it 2026-04-15", "mercoledì 15 aprile 2026", "%A %d %B %Y", "it", 1776211200);
+    parsed_lang("it 2026-04-15 short", "mer 15 apr 2026", "%a %d %b %Y", "it", 1776211200);
+    names("it", 2026, 5, 14, "giovedì|maggio|gio|mag");
+    parsed_lang("it 2026-05-14", "giovedì 14 maggio 2026", "%A %d %B %Y", "it", 1778716800);
+    parsed_lang("it 2026-05-14 short", "gio 14 mag 2026", "%a %d %b %Y", "it", 1778716800);
+    names("it", 2026, 6, 12, "venerdì|giugno|ven|giu");
+    parsed_lang("it 2026-06-12", "venerdì 12 giugno 2026", "%A %d %B %Y", "it", 1781222400);
+    parsed_lang("it 2026-06-12 short", "ven 12 giu 2026", "%a %d %b %Y", "it", 1781222400);
+    names("it", 2026, 7, 11, "sabato|luglio|sab|lug");
+    parsed_lang("it 2026-07-11", "sabato 11 luglio 2026", "%A %d %B %Y", "it", 1783728000);
+    parsed_lang("it 2026-07-11 short", "sab 11 lug 2026", "%a %d %b %Y", "it", 1783728000);
+    names("it", 2026, 8, 16, "domenica|agosto|dom|ago");
+    parsed_lang("it 2026-08-16", "domenica 16 agosto 2026", "%A %d %B %Y", "it", 1786838400);
+    parsed_lang("it 2026-08-16 short", "dom 16 ago 2026", "%a %d %b %Y", "it", 1786838400);
+    names("it", 2026, 9, 14, "lunedì|settembre|lun|set");
+    parsed_lang("it 2026-09-14", "lunedì 14 settembre 2026", "%A %d %B %Y", "it", 1789344000);
+    parsed_lang("it 2026-09-14 short", "lun 14 set 2026", "%a %d %b %Y", "it", 1789344000);
+    names("it", 2026, 10, 13, "martedì|ottobre|mar|ott");
+    parsed_lang("it 2026-10-13", "martedì 13 ottobre 2026", "%A %d %B %Y", "it", 1791849600);
+    parsed_lang("it 2026-10-13 short", "mar 13 ott 2026", "%a %d %b %Y", "it", 1791849600);
+    names("it", 2026, 11, 11, "mercoledì|novembre|mer|nov");
+    parsed_lang("it 2026-11-11", "mercoledì 11 novembre 2026", "%A %d %B %Y", "it", 1794355200);
+    parsed_lang("it 2026-11-11 short", "mer 11 nov 2026", "%a %d %b %Y", "it", 1794355200);
+    names("it", 2026, 12, 10, "giovedì|dicembre|gio|dic");
+    parsed_lang("it 2026-12-10", "giovedì 10 dicembre 2026", "%A %d %B %Y", "it", 1796860800);
+    parsed_lang("it 2026-12-10 short", "gio 10 dic 2026", "%a %d %b %Y", "it", 1796860800);
+    names("pt", 2026, 1, 11, "domingo|janeiro|dom.|jan.");
+    parsed_lang("pt 2026-01-11", "domingo 11 janeiro 2026", "%A %d %B %Y", "pt", 1768089600);
+    parsed_lang("pt 2026-01-11 short", "dom. 11 jan. 2026", "%a %d %b %Y", "pt", 1768089600);
+    names("pt", 2026, 2, 16, "segunda-feira|fevereiro|seg.|fev.");
+    parsed_lang("pt 2026-02-16", "segunda-feira 16 fevereiro 2026", "%A %d %B %Y", "pt", 1771200000);
+    parsed_lang("pt 2026-02-16 short", "seg. 16 fev. 2026", "%a %d %b %Y", "pt", 1771200000);
+    names("pt", 2026, 3, 10, "terça-feira|março|ter.|mar.");
+    parsed_lang("pt 2026-03-10", "terça-feira 10 março 2026", "%A %d %B %Y", "pt", 1773100800);
+    parsed_lang("pt 2026-03-10 short", "ter. 10 mar. 2026", "%a %d %b %Y", "pt", 1773100800);
+    names("pt", 2026, 4, 15, "quarta-feira|abril|qua.|abr.");
+    parsed_lang("pt 2026-04-15", "quarta-feira 15 abril 2026", "%A %d %B %Y", "pt", 1776211200);
+    parsed_lang("pt 2026-04-15 short", "qua. 15 abr. 2026", "%a %d %b %Y", "pt", 1776211200);
+    names("pt", 2026, 5, 14, "quinta-feira|maio|qui.|mai.");
+    parsed_lang("pt 2026-05-14", "quinta-feira 14 maio 2026", "%A %d %B %Y", "pt", 1778716800);
+    parsed_lang("pt 2026-05-14 short", "qui. 14 mai. 2026", "%a %d %b %Y", "pt", 1778716800);
+    names("pt", 2026, 6, 12, "sexta-feira|junho|sex.|jun.");
+    parsed_lang("pt 2026-06-12", "sexta-feira 12 junho 2026", "%A %d %B %Y", "pt", 1781222400);
+    parsed_lang("pt 2026-06-12 short", "sex. 12 jun. 2026", "%a %d %b %Y", "pt", 1781222400);
+    names("pt", 2026, 7, 11, "sábado|julho|sáb.|jul.");
+    parsed_lang("pt 2026-07-11", "sábado 11 julho 2026", "%A %d %B %Y", "pt", 1783728000);
+    parsed_lang("pt 2026-07-11 short", "sáb. 11 jul. 2026", "%a %d %b %Y", "pt", 1783728000);
+    names("pt", 2026, 8, 16, "domingo|agosto|dom.|ago.");
+    parsed_lang("pt 2026-08-16", "domingo 16 agosto 2026", "%A %d %B %Y", "pt", 1786838400);
+    parsed_lang("pt 2026-08-16 short", "dom. 16 ago. 2026", "%a %d %b %Y", "pt", 1786838400);
+    names("pt", 2026, 9, 14, "segunda-feira|setembro|seg.|set.");
+    parsed_lang("pt 2026-09-14", "segunda-feira 14 setembro 2026", "%A %d %B %Y", "pt", 1789344000);
+    parsed_lang("pt 2026-09-14 short", "seg. 14 set. 2026", "%a %d %b %Y", "pt", 1789344000);
+    names("pt", 2026, 10, 13, "terça-feira|outubro|ter.|out.");
+    parsed_lang("pt 2026-10-13", "terça-feira 13 outubro 2026", "%A %d %B %Y", "pt", 1791849600);
+    parsed_lang("pt 2026-10-13 short", "ter. 13 out. 2026", "%a %d %b %Y", "pt", 1791849600);
+    names("pt", 2026, 11, 11, "quarta-feira|novembro|qua.|nov.");
+    parsed_lang("pt 2026-11-11", "quarta-feira 11 novembro 2026", "%A %d %B %Y", "pt", 1794355200);
+    parsed_lang("pt 2026-11-11 short", "qua. 11 nov. 2026", "%a %d %b %Y", "pt", 1794355200);
+    names("pt", 2026, 12, 10, "quinta-feira|dezembro|qui.|dez.");
+    parsed_lang("pt 2026-12-10", "quinta-feira 10 dezembro 2026", "%A %d %B %Y", "pt", 1796860800);
+    parsed_lang("pt 2026-12-10 short", "qui. 10 dez. 2026", "%a %d %b %Y", "pt", 1796860800);
+    names("ar", 2026, 1, 11, "الأحد|يناير|الأحد|يناير");
+    parsed_lang("ar 2026-01-11", "الأحد 11 يناير 2026", "%A %d %B %Y", "ar", 1768089600);
+    parsed_lang("ar 2026-01-11 short", "الأحد 11 يناير 2026", "%a %d %b %Y", "ar", 1768089600);
+    names("ar", 2026, 2, 16, "الاثنين|فبراير|الاثنين|فبراير");
+    parsed_lang("ar 2026-02-16", "الاثنين 16 فبراير 2026", "%A %d %B %Y", "ar", 1771200000);
+    parsed_lang("ar 2026-02-16 short", "الاثنين 16 فبراير 2026", "%a %d %b %Y", "ar", 1771200000);
+    names("ar", 2026, 3, 10, "الثلاثاء|مارس|الثلاثاء|مارس");
+    parsed_lang("ar 2026-03-10", "الثلاثاء 10 مارس 2026", "%A %d %B %Y", "ar", 1773100800);
+    parsed_lang("ar 2026-03-10 short", "الثلاثاء 10 مارس 2026", "%a %d %b %Y", "ar", 1773100800);
+    names("ar", 2026, 4, 15, "الأربعاء|أبريل|الأربعاء|أبريل");
+    parsed_lang("ar 2026-04-15", "الأربعاء 15 أبريل 2026", "%A %d %B %Y", "ar", 1776211200);
+    parsed_lang("ar 2026-04-15 short", "الأربعاء 15 أبريل 2026", "%a %d %b %Y", "ar", 1776211200);
+    names("ar", 2026, 5, 14, "الخميس|مايو|الخميس|مايو");
+    parsed_lang("ar 2026-05-14", "الخميس 14 مايو 2026", "%A %d %B %Y", "ar", 1778716800);
+    parsed_lang("ar 2026-05-14 short", "الخميس 14 مايو 2026", "%a %d %b %Y", "ar", 1778716800);
+    names("ar", 2026, 6, 12, "الجمعة|يونيو|الجمعة|يونيو");
+    parsed_lang("ar 2026-06-12", "الجمعة 12 يونيو 2026", "%A %d %B %Y", "ar", 1781222400);
+    parsed_lang("ar 2026-06-12 short", "الجمعة 12 يونيو 2026", "%a %d %b %Y", "ar", 1781222400);
+    names("ar", 2026, 7, 11, "السبت|يوليو|السبت|يوليو");
+    parsed_lang("ar 2026-07-11", "السبت 11 يوليو 2026", "%A %d %B %Y", "ar", 1783728000);
+    parsed_lang("ar 2026-07-11 short", "السبت 11 يوليو 2026", "%a %d %b %Y", "ar", 1783728000);
+    names("ar", 2026, 8, 16, "الأحد|أغسطس|الأحد|أغسطس");
+    parsed_lang("ar 2026-08-16", "الأحد 16 أغسطس 2026", "%A %d %B %Y", "ar", 1786838400);
+    parsed_lang("ar 2026-08-16 short", "الأحد 16 أغسطس 2026", "%a %d %b %Y", "ar", 1786838400);
+    names("ar", 2026, 9, 14, "الاثنين|سبتمبر|الاثنين|سبتمبر");
+    parsed_lang("ar 2026-09-14", "الاثنين 14 سبتمبر 2026", "%A %d %B %Y", "ar", 1789344000);
+    parsed_lang("ar 2026-09-14 short", "الاثنين 14 سبتمبر 2026", "%a %d %b %Y", "ar", 1789344000);
+    names("ar", 2026, 10, 13, "الثلاثاء|أكتوبر|الثلاثاء|أكتوبر");
+    parsed_lang("ar 2026-10-13", "الثلاثاء 13 أكتوبر 2026", "%A %d %B %Y", "ar", 1791849600);
+    parsed_lang("ar 2026-10-13 short", "الثلاثاء 13 أكتوبر 2026", "%a %d %b %Y", "ar", 1791849600);
+    names("ar", 2026, 11, 11, "الأربعاء|نوفمبر|الأربعاء|نوفمبر");
+    parsed_lang("ar 2026-11-11", "الأربعاء 11 نوفمبر 2026", "%A %d %B %Y", "ar", 1794355200);
+    parsed_lang("ar 2026-11-11 short", "الأربعاء 11 نوفمبر 2026", "%a %d %b %Y", "ar", 1794355200);
+    names("ar", 2026, 12, 10, "الخميس|ديسمبر|الخميس|ديسمبر");
+    parsed_lang("ar 2026-12-10", "الخميس 10 ديسمبر 2026", "%A %d %B %Y", "ar", 1796860800);
+    parsed_lang("ar 2026-12-10 short", "الخميس 10 ديسمبر 2026", "%a %d %b %Y", "ar", 1796860800);
+    // whole dates in each language's CLDR long and medium patterns (Saturday 2026-08-15)
+    check("fr long", dt_format_lang(aug15, "%A %d %B %Y", "fr"), "samedi 15 août 2026");
+    check("fr medium", dt_format_lang(aug15, "%a %d %b %Y", "fr"), "sam. 15 août 2026");
+    parsed_lang("fr long back", "samedi 15 août 2026", "%A %d %B %Y", "fr", 1786752000);
+    parsed_lang("fr medium back", "sam. 15 août 2026", "%a %d %b %Y", "fr", 1786752000);
+    check("de long", dt_format_lang(aug15, "%A, %d. %B %Y", "de"), "Samstag, 15. August 2026");
+    check("de medium", dt_format_lang(aug15, "%a, %d. %b %Y", "de"), "Sa., 15. Aug. 2026");
+    parsed_lang("de long back", "Samstag, 15. August 2026", "%A, %d. %B %Y", "de", 1786752000);
+    parsed_lang("de medium back", "Sa., 15. Aug. 2026", "%a, %d. %b %Y", "de", 1786752000);
+    check("es long", dt_format_lang(aug15, "%A, %d de %B de %Y", "es"), "sábado, 15 de agosto de 2026");
+    check("es medium", dt_format_lang(aug15, "%a, %d %b %Y", "es"), "sáb, 15 ago 2026");
+    parsed_lang("es long back", "sábado, 15 de agosto de 2026", "%A, %d de %B de %Y", "es", 1786752000);
+    parsed_lang("es medium back", "sáb, 15 ago 2026", "%a, %d %b %Y", "es", 1786752000);
+    check("it long", dt_format_lang(aug15, "%A %d %B %Y", "it"), "sabato 15 agosto 2026");
+    check("it medium", dt_format_lang(aug15, "%a %d %b %Y", "it"), "sab 15 ago 2026");
+    parsed_lang("it long back", "sabato 15 agosto 2026", "%A %d %B %Y", "it", 1786752000);
+    parsed_lang("it medium back", "sab 15 ago 2026", "%a %d %b %Y", "it", 1786752000);
+    check("pt long", dt_format_lang(aug15, "%A, %d de %B de %Y", "pt"), "sábado, 15 de agosto de 2026");
+    check("pt medium", dt_format_lang(aug15, "%a, %d de %b de %Y", "pt"), "sáb., 15 de ago. de 2026");
+    parsed_lang("pt long back", "sábado, 15 de agosto de 2026", "%A, %d de %B de %Y", "pt", 1786752000);
+    parsed_lang("pt medium back", "sáb., 15 de ago. de 2026", "%a, %d de %b de %Y", "pt", 1786752000);
+    check("english", dt_format_lang(aug15, "%A %B %a %b %h", "en"), "Saturday August Sat Aug Aug");
+    check("english is dt_format", dt_format_lang(aug15, "%A %d %B %Y", "en-GB"), dt_format(aug15, "%A %d %B %Y"));
+    check("unknown language", dt_format_lang(aug15, "%A %B", "xx"), "Saturday August");
+    check("region", dt_format_lang(aug15, "%A %B", "fr-CA"), "samedi août");
+    check("region underscore", dt_format_lang(aug15, "%A %B", "DE_at"), "Samstag August");
+    check("other codes unchanged", dt_format_lang(time_new(2026, 8, 15, 14, 5, 9), "%F %T %p %j %u", "es"), "2026-08-15 14:05:09 PM 227 6");
+    check_b("fr supported", dt_lang_supported("fr"), true);
+    check_b("en-US supported", dt_lang_supported("en-US"), true);
+    check_b("ar supported", dt_lang_supported("ar"), true);
+    check_b("xx not supported", dt_lang_supported("xx"), false);
+    check("fr month 13", dt_month_name_in("fr", 13), "?");
+    check("de weekday 7", dt_weekday_name_in("de", 7), "?");
+    check("de März short", dt_month_short_in("de", 3), "März");
+    check("es miércoles", dt_weekday_name_in("es", 3), "miércoles");
+    check("pt sexta-feira", dt_weekday_name_in("pt", 5), "sexta-feira");
+    check("ar weekday", dt_weekday_name_in("ar", 5), "الجمعة");
+    parsed_lang("fr dot optional", "janv 2026", "%b %Y", "fr", 1767225600);
+    parsed_lang("fr with dot", "janv. 2026", "%b %Y", "fr", 1767225600);
+    parsed_lang("fr ASCII case", "SAMEDI 15 août 2026", "%A %d %B %Y", "fr", 1786752000);
+    parsed_lang("de März", "15. März 2026", "%d. %b %Y", "de", 1773532800);
+    parsed_lang("es miércoles", "miércoles, 4 de febrero de 2026", "%A, %e de %B de %Y", "es", 1770163200);
+    parsed_lang("pt full weekday over short", "sábado, 15 de agosto de 2026", "%A, %d de %B de %Y", "pt", 1786752000);
+    parsed_lang("ar", "السبت 15 أغسطس 2026", "%A %d %B %Y", "ar", 1786752000);
+    parsed_lang("english still", "Sat, 15 Aug 2026 00:00:00 +0000", "%a, %d %b %Y %T %z", "en", 1786752000);
+    refused_lang("fr wrong weekday", "dimanche 15 août 2026", "%A %d %B %Y", "fr");
+    refused_lang("fr English month", "15 August 2026", "%d %B %Y", "fr");
+    refused_lang("fr non-ASCII case", "15 AOÛT 2026", "%d %B %Y", "fr");
+    refused_lang("de unknown month", "15. Mär 2026", "%d. %b %Y", "de");
+    println("names ok");
+    println("lunar calendars ok");
+    return 0;
+}

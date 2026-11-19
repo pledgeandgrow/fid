@@ -1,0 +1,166 @@
+// stdlib/gamepad: SDL GameControllerDB mapping parse/apply (buttons, hats, inverted axes, half axes on triggers and sticks), GUID decode, mapping round trip and errors, normalisation, axial/radial dead zones, response curve, rumble mixing with envelopes, hotplug player slots. No SDL call is made (needs SDL2 and a controller).
+// Expected output:
+// xinput: 21 bindings, platform Windows, bus 3 vendor 0x45e product 0x28e driver r
+// pressed: a start dpdown dpright
+// axes: leftx 16000, lefty 32767, rightx 0, righty 100, lefttrigger 0, righttrigger 32767
+// dinput a2=20000: lefttrigger 20000 righttrigger 0; a2=-10000: lefttrigger 0 righttrigger 10000
+// dinput b5: leftx 32767; b4: leftx -32767; a: true
+// round trip: 03000000790000000600000000000000,Generic DInput,a:b2,lefttrigger:+a2,righttrigger:-a2,+leftx:b5,-leftx:b4,platform:Linux,
+// round trip stable: true
+// error: GUID must be 32 hex digits
+// error: bad source 'q1' for a
+// unknown target skipped: 1 binding
+// norm: -1.0000 1.0000 0.5000, trigger 1.0000
+// axial: 0.0000 0.5000 -1.0000
+// radial: (0.2250, 0.3000), inside (0.0000, 0.0000); per-axis (0.0000, 0.8750); curve -0.2500
+// rumble t=50: 32768 16384
+// rumble t=550: 65535 52428
+// rumble t=900: 32768 16384, effects left 1
+// rumble t=1000: 0 0, effects left 0
+// hotplug: slots 0 1 2, removed 11 from 1, new 13 -> 3, returning B 14 -> 1
+// hotplug: duplicate -1, unknown removal -1, full -1, connected 4
+// event connected player 0 instance 10
+// event connected player 1 instance 11
+// event connected player 2 instance 12
+// event disconnected player 1 instance 11
+// event connected player 3 instance 13
+// event reconnected player 1 instance 14
+use gamepad;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn f4(x: f64) -> str {
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val v: i64 = (a * 10000.0 + 0.5) as i64;
+    var fr: str = int_to_str(v % 10000);
+    while str_len(fr) < 4 { fr = "0" + fr; }
+    var out: str = int_to_str(v / 10000) + "." + fr;
+    if neg && v != 0 { out = "-" + out; }
+    return out;
+}
+
+fn hexn(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = byte_to_str(str_byte_at(d, x & 15)) + s;
+        x = x >> 4;
+    }
+    return "0x" + s;
+}
+
+fn raw(nb: i64, na: i64) -> GpRaw {
+    return GpRaw { buttons: Vec::filled(nb, false), axes: Vec::filled(na, 0), hats: Vec::filled(1, 0) };
+}
+
+fn mix(m: &mut GpRumbleMixer, t: i64) -> str {
+    val v: Vec<i64> = gp_rumble_mix(m, t);
+    return int_to_str(v.get(0)) + " " + int_to_str(v.get(1));
+}
+
+fn kind_name(k: i64) -> str {
+    if k == GP_EVENT_CONNECTED { return "connected"; }
+    if k == GP_EVENT_DISCONNECTED { return "disconnected"; }
+    return "reconnected";
+}
+
+fn main() {
+    val xl: str = "030000005e0400008e02000000007200,XInput Controller,a:b0,b:b1,back:b6,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b10,leftshoulder:b4,leftstick:b8,lefttrigger:a2,leftx:a0,lefty:a1~,rightshoulder:b5,rightstick:b9,righttrigger:a5,rightx:a3,righty:a4,start:b7,x:b2,y:b3,platform:Windows,";
+    val xm: GpMapping = gp_mapping_parse(xl).unwrap();
+    val g: GpGuid = gp_guid_decode(xm.guid).unwrap();
+    println("xinput: " + int_to_str(xm.bindings.len()) + " bindings, platform " + xm.platform + ", bus " + int_to_str(g.bus) + " vendor " + hexn(g.vendor) + " product " + hexn(g.product) + " driver " + byte_to_str(g.driver));
+    var r: GpRaw = raw(11, 6);
+    r.buttons.set(0, true);
+    r.buttons.set(7, true);
+    r.axes.set(0, 16000);
+    r.axes.set(1, 0 - 32768);
+    r.axes.set(2, 0 - 32768);
+    r.axes.set(5, 32767);
+    r.axes.set(4, 100);
+    r.hats.set(0, 6);
+    val s: GpState = gp_apply(&xm, &r);
+    var pressed: str = "pressed:";
+    var i: i64 = 0;
+    while i < GP_BUTTON_COUNT {
+        if s.buttons.get(i) { pressed = pressed + " " + gp_button_name(i); }
+        i = i + 1;
+    }
+    println(pressed);
+    var axes: str = "axes:";
+    i = 0;
+    while i < GP_AXIS_COUNT {
+        if i > 0 { axes = axes + ","; }
+        axes = axes + " " + gp_axis_name(i) + " " + int_to_str(s.axes.get(i));
+        i = i + 1;
+    }
+    println(axes);
+
+    val dl: str = "03000000790000000600000000000000,Generic DInput,a:b2,lefttrigger:+a2,righttrigger:-a2,+leftx:b5,-leftx:b4,platform:Linux,";
+    val dm: GpMapping = gp_mapping_parse(dl).unwrap();
+    var d1: GpRaw = raw(6, 3);
+    d1.axes.set(2, 20000);
+    val s1: GpState = gp_apply(&dm, &d1);
+    var d2: GpRaw = raw(6, 3);
+    d2.axes.set(2, 0 - 10000);
+    val s2: GpState = gp_apply(&dm, &d2);
+    println("dinput a2=20000: lefttrigger " + int_to_str(s1.axes.get(GP_AXIS_TRIGGERLEFT)) + " righttrigger " + int_to_str(s1.axes.get(GP_AXIS_TRIGGERRIGHT)) + "; a2=-10000: lefttrigger " + int_to_str(s2.axes.get(GP_AXIS_TRIGGERLEFT)) + " righttrigger " + int_to_str(s2.axes.get(GP_AXIS_TRIGGERRIGHT)));
+    var d3: GpRaw = raw(6, 3);
+    d3.buttons.set(5, true);
+    d3.buttons.set(2, true);
+    val s3: GpState = gp_apply(&dm, &d3);
+    var d4: GpRaw = raw(6, 3);
+    d4.buttons.set(4, true);
+    val s4: GpState = gp_apply(&dm, &d4);
+    println("dinput b5: leftx " + int_to_str(s3.axes.get(GP_AXIS_LEFTX)) + "; b4: leftx " + int_to_str(s4.axes.get(GP_AXIS_LEFTX)) + "; a: " + yes(s3.buttons.get(GP_BUTTON_A)));
+    val rt: str = gp_mapping_to_str(&dm);
+    println("round trip: " + rt);
+    println("round trip stable: " + yes(gp_mapping_to_str(&gp_mapping_parse(rt).unwrap()) == rt));
+    match gp_mapping_parse("xyz,Name,a:b0") {
+        Result::Ok(_) => { println("error: accepted"); }
+        Result::Err(e) => { println("error: " + e); }
+    }
+    match gp_mapping_parse("03000000790000000600000000000000,Pad,a:q1") {
+        Result::Ok(_) => { println("error: accepted"); }
+        Result::Err(e) => { println("error: " + e); }
+    }
+    val um: GpMapping = gp_mapping_parse("03000000790000000600000000000000,Pad,foo:b1,b:b2,").unwrap();
+    println("unknown target skipped: " + int_to_str(um.bindings.len()) + " binding");
+
+    println("norm: " + f4(gp_axis_norm(0 - 32768)) + " " + f4(gp_axis_norm(32767)) + " " + f4(gp_axis_norm(16384)) + ", trigger " + f4(gp_trigger_norm(32767)));
+    println("axial: " + f4(gp_deadzone_axial(0.1, 0.2, 1.0)) + " " + f4(gp_deadzone_axial(0.6, 0.2, 1.0)) + " " + f4(gp_deadzone_axial(0.0 - 0.95, 0.2, 0.9)));
+    val rd: GpStick = gp_deadzone_radial(0.3, 0.4, 0.2, 1.0);
+    val ri: GpStick = gp_deadzone_radial(0.1, 0.1, 0.2, 1.0);
+    val ax: GpStick = gp_deadzone_axial2(0.15, 0.9, 0.2, 1.0);
+    println("radial: (" + f4(rd.x) + ", " + f4(rd.y) + "), inside (" + f4(ri.x) + ", " + f4(ri.y) + "); per-axis (" + f4(ax.x) + ", " + f4(ax.y) + "); curve " + f4(gp_curve(0.0 - 0.5, 2.0)));
+
+    var mx: GpRumbleMixer = gp_rumble_mixer_new();
+    gp_rumble_play(&mut mx, 1.0, 0.5, 0, 1000, 100, 200);
+    gp_rumble_play(&mut mx, 0.0, 0.8, 500, 100, 0, 0);
+    println("rumble t=50: " + mix(&mut mx, 50));
+    println("rumble t=550: " + mix(&mut mx, 550));
+    println("rumble t=900: " + mix(&mut mx, 900) + ", effects left " + int_to_str(mx.effects.len()));
+    println("rumble t=1000: " + mix(&mut mx, 1000) + ", effects left " + int_to_str(mx.effects.len()));
+
+    var h: GpHub = gp_hub_new(4);
+    val p0: i64 = gp_hub_added(&mut h, 10, "A");
+    val p1: i64 = gp_hub_added(&mut h, 11, "B");
+    val p2: i64 = gp_hub_added(&mut h, 12, "C");
+    val rm: i64 = gp_hub_removed(&mut h, 11);
+    val p3: i64 = gp_hub_added(&mut h, 13, "D");
+    val p4: i64 = gp_hub_added(&mut h, 14, "B");
+    println("hotplug: slots " + int_to_str(p0) + " " + int_to_str(p1) + " " + int_to_str(p2) + ", removed 11 from " + int_to_str(rm) + ", new 13 -> " + int_to_str(p3) + ", returning B 14 -> " + int_to_str(p4));
+    println("hotplug: duplicate " + int_to_str(gp_hub_added(&mut h, 10, "A")) + ", unknown removal " + int_to_str(gp_hub_removed(&mut h, 99)) + ", full " + int_to_str(gp_hub_added(&mut h, 15, "E")) + ", connected " + int_to_str(gp_hub_connected(&h)));
+    val ev: Vec<GpEvent> = gp_hub_take(&mut h);
+    i = 0;
+    while i < ev.len() {
+        val e: GpEvent = ev.get(i);
+        println("event " + kind_name(e.kind) + " player " + int_to_str(e.player) + " instance " + int_to_str(e.instance));
+        i = i + 1;
+    }
+}

@@ -1,0 +1,46 @@
+// Miscompile log M25 (VF1, found by scripts/fuzz/gen_programs.py --rich
+// seed 20261164 on the `checked` backend, reduced by hand, Nov 17).
+// Under `fid run --checked-alloc` (release M7) a Vec<i64> that grows past
+// 512 elements stops with "Panic: Invalid memory access (null or dangling
+// pointer) at 0x...FFE8" in Vec_push (stage 0 of Nov 16; 512 pushes
+// work, the 513th fails). `run`, `ccompile` and `emit` print the right
+// values.
+// Cause (from the C runtime, not yet confirmed in a debugger): growing frees
+// the old 4096-byte buffer with __p_vbuf_free, whose P_VBUF_TAGGED(d)
+// reads d[-3], 24 bytes before the buffer, to see whether core's
+// vec_buf_alloc put a box there. The checked allocator puts a block of
+// exactly a page at the start of its own mapping, so d[-3] is on an
+// unmapped page. With the ordinary allocator the read lands in the
+// previous block and goes unnoticed: an out-of-bounds read on every free
+// of an untagged buffer (the same kind of probe as VF14's S1).
+
+fn main() -> i64 {
+    var xs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 513 {
+        xs.push(i);
+        i = i + 1;
+    }
+    println(xs.len());
+    var sum: i64 = 0;
+    var j: i64 = 0;
+    while j < xs.len() {
+        sum = sum + xs.get(j);
+        j = j + 1;
+    }
+    println(sum);
+    // a second Vec through two more page-sized buffers (1024 and 2048
+    // elements: 8 KiB, 16 KiB)
+    var ys: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 2100 {
+        ys.push(k * 2);
+        k = k + 1;
+    }
+    println(ys.get(2099));
+    return 0;
+}
+//@ backends: run,ccompile,emit,checked
+//> 513
+//> 131328
+//> 4198

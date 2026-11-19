@@ -1,0 +1,68 @@
+// sp12_lower_bench.fd -- SP12: time compiler/lower.fd's `lower` (with its
+// post-lowering passes) on one program, inside one process, without the
+// type checker, mono or C generation around it. Built from the tree's own
+// compiler sources, so it measures the lowering as it is now:
+//
+//     fid ccompile tests/perf/sp12_lower_bench.fd -o lb.exe
+//     python tests/perf/sp12_gen.py 100 > g100.fd
+//     ./lb.exe g100.fd
+//
+// prints (stdout) `functions <n> instructions <m>` and (stderr)
+// `lower ms <t>`. tests/perf/sp12_scaling.sh runs it on programs of two
+// sizes: a lowering that grows with the square of a function's length
+// shows as about 4x the time for 2x the statements.
+use core;
+use vec;
+use string;
+use compiler::lexer;
+use compiler::token;
+use compiler::ast;
+use compiler::parser;
+use compiler::ir;
+use compiler::lower;
+
+fn main() -> i64 {
+    var path: str = "";
+    match arg_at(1) {
+        Option::Some(p) => {
+            path = p;
+        }
+        Option::None => {
+            print("usage: sp12_lower_bench <file.fd>\n");
+            return 2;
+        }
+    }
+    var src: str = "";
+    match read_file(path) {
+        Option::Some(s) => {
+            src = s;
+        }
+        Option::None => {
+            print("cannot read " + path + "\n");
+            return 2;
+        }
+    }
+    var lex: Lexer = Lexer::new(src);
+    var tokens: Vec<Token> = lex.tokenize();
+    var p: Parser = Parser::new(tokens);
+    match p.parse() {
+        ParseResultProgram::Ok(program) => {
+            var t0: i64 = p_clock_now_ms();
+            var m: IrModule = lower(program);
+            var t1: i64 = p_clock_now_ms();
+            var insts: i64 = 0;
+            var i: i64 = 0;
+            while i < m.functions.len() {
+                insts = insts + m.functions.get(i).func.insts.len();
+                i = i + 1;
+            }
+            print("functions " + int_to_str(m.functions.len()) + " instructions " + int_to_str(insts) + "\n");
+            p_eprint_str("lower ms " + int_to_str(t1 - t0) + "\n");
+        }
+        ParseResultProgram::Err(e) => {
+            print("Parse error: " + e + "\n");
+            return 1;
+        }
+    }
+    return 0;
+}

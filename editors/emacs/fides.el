@@ -3,7 +3,9 @@
   "Major mode for Fides (.fd) files."
   (setq-local comment-start "// ")
   (setq-local comment-end ""))
-(add-to-list 'auto-mode-alist '("\.fd\'" . fides-mode))
+;; "\\.fd\\'" reads as the regexp \.fd\' (a literal dot, end of name);
+;; "\.fd\'" read as .fd' and never matched a file name
+(add-to-list 'auto-mode-alist '("\\.fd\\'" . fides-mode))
 (with-eval-after-load 'eglot
   (add-to-list 'eglot-server-programs '(fides-mode . ("fid" "lsp"))))
 (add-hook 'fides-mode-hook #'eglot-ensure)

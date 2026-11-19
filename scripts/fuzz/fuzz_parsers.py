@@ -2,7 +2,7 @@
 """Fuzz the stdlib parsers (roadmap VF15).
 
     python scripts/fuzz/fuzz_parsers.py --fid release/fid.exe [-n 2000] [--seed 1]
-        [--parsers json,regex,http,csv,toml,xml,url,uuid] [--out build/fuzz-parsers]
+        [--parsers json,regex,http,csv,toml,xml,url,uuid,tls] [--out build/fuzz-parsers]
         [--backend ccompile|emit]
 
 tests/fuzz/parsers.fd is built once (through C by default, the fastest
@@ -13,8 +13,10 @@ finding is any panic, crash or hang (--timeout). Findings are kept as
 <out>/<parser>-<n>.txt with the output beside it; one is kept per distinct
 first line of the error.
 
-The TLS record layer is not here: the stdlib has none yet (tls_crypto.fd:
-"What remains for full TLS 1.3: the record layer").
+"tls" is the TLS 1.3 record layer (stdlib/tls_record.fd): the input's bytes
+are a stream of records; the handshake messages, alerts and protected
+records in it are parsed and opened too. Its seeds are byte strings (each
+character one byte, written as latin-1).
 """
 import argparse
 import os
@@ -42,7 +44,17 @@ SEEDS = {
             "mailto:me@x.com", "file:///c:/x/y", "/relative/path?a=b", "http://h/%zz%4"],
     "uuid": ["123e4567-e89b-12d3-a456-426614174000", "00000000-0000-0000-0000-000000000000",
              "{123E4567-E89B-12D3-A456-426614174000}", "123e4567e89b12d3a456426614174000"],
+    # records: a ClientHello-like handshake record, an alert, a CCS, a
+    # protected record (17 bytes: type + tag), and a stream split mid-record
+    "tls": ["\x16\x03\x01\x00\x0b\x01\x00\x00\x07\x03\x03\x00\x01\x02\x03\x04",
+            "\x15\x03\x03\x00\x02\x02\x28",
+            "\x14\x03\x03\x00\x01\x01\x17\x03\x03\x00\x11" + "\x00" * 17,
+            "\x16\x03\x03\x00\x08\x14\x00\x00\x04abcd\x16\x03\x03\x00",
+            "\x17\x03\x03\x40\x00" + "x" * 64],
 }
+
+# formats whose seeds are bytes, not text: written as latin-1
+BINARY = {"tls"}
 
 INTERESTING = ["\x00", "\\", '"', "'", "<", ">", "&", "%", "{", "}", "[", "]", "\r", "\n", ",", ";", "=",
                "-", "+", ".", "e", "9" * 30, "\\u", "\\ud800", "\xff", "\xe9", "(", ")", "*", "?", "|", "^", "$",
@@ -101,7 +113,10 @@ def main():
         which = parsers[i % len(parsers)]
         s = mutate(r, r.choice(SEEDS[which]))
         with open(inp, "wb") as f:
-            f.write(s.encode("utf-8", "surrogatepass"))
+            if which in BINARY:
+                f.write(s.encode("latin-1", "replace"))
+            else:
+                f.write(s.encode("utf-8", "surrogatepass"))
         try:
             q = subprocess.run([exe, which, inp], capture_output=True, timeout=a.timeout)
             rc = q.returncode

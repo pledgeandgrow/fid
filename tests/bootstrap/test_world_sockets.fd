@@ -1,0 +1,104 @@
+// stdlib/world (complaint CT1), raw sockets: a test replaces stdlib/net's
+// UDP and TCP sockets for code it does not change. `serve_once` is a UDP
+// server (net_socket_create, net_bind, net_recv_bytes_from,
+// net_send_bytes_to) and `fetch_status` a TCP client (net_socket_create_tcp,
+// net_addr_create, net_connect, net_send_bytes, net_recv_bytes, net_close).
+// The test hands datagrams to the server's port, answers the client from
+// an in-process handler, reads what the code sent, and shows what the code
+// does with no network at all. No socket is opened.
+// (Needs the stdlib/world hooks in stdlib/net.fd.)
+//
+// Expected output:
+// bind = 0
+// bind again = -1
+// served = 2
+// to 0 = udp 10.0.0.5:5000 welcome ada #1
+// to 1 = udp 10.0.0.6:5001 welcome linus #2
+// status = up 42|players
+// request = tcp 192.168.1.9:8080 STATUS
+// sends = 3
+// open = 2
+// offline = connect failed
+// refused = 1
+// ip = 127.0.0.1
+// faked = false
+use net;
+use world;
+
+// ─── the code under test: no test hooks, no parameters for fakes ─────────
+
+var joined: Vec<str> = Vec::new();
+
+// answer one "join NAME" datagram: 1 when one was served
+fn serve_once(sock: i64) -> i64 {
+    var from: NetAddr = net_addr_none();
+    val got: Vec<i64> = net_recv_bytes_from(sock, 64, & mut from);
+    if got.len() == 0 { return 0; }
+    val msg: str = str_from_bytes(got);
+    if !str_starts_with(msg, "join ") { return 0; }
+    val name: str = str_slice(msg, 5, str_len(msg));
+    joined.push(name);
+    net_send_bytes_to(sock, str_bytes("welcome " + name + " #" + int_to_str(joined.len())), & from);
+    return 1;
+}
+
+// ask a status server over TCP; the reply is read in two parts
+fn fetch_status(ip: str, port: i64) -> str {
+    val s: i64 = net_socket_create_tcp();
+    if s < 0 { return "no socket"; }
+    val addr: NetAddr = net_addr_create(ip, port);
+    if net_connect(s, & addr) != 0 {
+        net_close(s);
+        return "connect failed";
+    }
+    net_send_bytes(s, str_bytes("STATUS\n"));
+    val head: Vec<i64> = net_recv_bytes(s, 5);
+    val rest: Vec<i64> = net_recv_bytes(s, 100);
+    net_close(s);
+    return str_from_bytes(head) + "|" + str_trim(str_from_bytes(rest));
+}
+
+// ─── the test's fake peers ───────────────────────────────────────────────
+
+fn peers(proto: str, peer: str, data: Vec<i64>) -> Vec<i64> {
+    if str_equal(proto, "tcp") && str_equal(peer, "192.168.1.9:8080") && str_equal(str_from_bytes(data), "STATUS\n") {
+        return str_bytes("up 42 players\n");
+    }
+    var none: Vec<i64> = Vec::new();
+    return none;
+}
+
+fn sent(i: i64) -> str {
+    return world_sock_sent_proto(i) + " " + world_sock_sent_peer(i) + " " + str_trim(world_sock_sent_text(i));
+}
+
+fn main() -> i64 {
+    world_fake_sockets(peers);
+
+    val srv: i64 = net_socket_create();
+    println("bind = " + int_to_str(net_bind(srv, 7777)));
+    val other: i64 = net_socket_create();
+    println("bind again = " + int_to_str(net_bind(other, 7777)));
+
+    world_sock_deliver_port(7777, "10.0.0.5:5000", str_bytes("join ada"));
+    world_sock_deliver_port(7777, "10.0.0.6:5001", str_bytes("join linus"));
+    val served: i64 = serve_once(srv) + serve_once(srv) + serve_once(srv);
+    println("served = " + int_to_str(served));
+    println("to 0 = " + sent(0));
+    println("to 1 = " + sent(1));
+
+    println("status = " + fetch_status("192.168.1.9", 8080));
+    println("request = " + sent(2));
+    println("sends = " + int_to_str(world_sock_sent_count()));
+    println("open = " + int_to_str(world_sock_open_count()));
+
+    // no network: the client's connect fails, and the test sees it tried
+    world_no_sockets();
+    println("offline = " + fetch_status("192.168.1.9", 8080));
+    println("refused = " + int_to_str(world_sock_refused()));
+
+    println("ip = " + world_ip_text(net_addr_create("127.0.0.1", 80).ip));
+    world_real_sockets();
+    println("faked = " + (if world_sockets_faked() { "true" } else { "false" }));
+    return 0;
+}

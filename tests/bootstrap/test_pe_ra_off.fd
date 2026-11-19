@@ -1,0 +1,182 @@
+// RA1: pe_ir (the default Windows `fid emit`) has its own register
+// allocator (peir_pick_reg_vars, peir_global_ra: callee-saved registers
+// over live intervals, copy coalescing, r10/r11 and xmm2-xmm5 for values no
+// call crosses). It is to be deleted once the Windows default moves to the
+// machine layer (MI17), whose one allocator is nat_ir.fd ng_mir_alloc.
+// FID_PE_OFF=ra builds without it (every value in its frame slot), and
+// tests/nattools/ra1_pe_ra_off_check.sh compares the two builds.
+//
+// This program puts pressure on what the allocator does: more live
+// integers than callee-saved registers, values live across calls, f64
+// values in loops (divisions by a power of two, so every result is exact), locals whose loads and stores are coalesced, a value
+// computed in place (`add rA, x`), and recursion. Every backend, with the
+// allocator or without it, prints the same lines.
+//
+// Expected output:
+// 4950
+// 328350
+// 87
+// 568
+// 1000000
+// 51
+// 55
+// 6765
+// 12 34 56
+// 17711
+// 100
+// ok
+
+fn bump(x: i64) -> i64 {
+    return x + 1;
+}
+
+fn sum_to(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn squares(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i * i;
+        i = i + 1;
+    }
+    return s;
+}
+
+// Ten values live across calls: more than the seven callee-saved
+// registers, so some stay in memory and the rest are restored after each call
+fn pressure(seed: i64) -> i64 {
+    var a: i64 = seed + 1;
+    var b: i64 = seed + 2;
+    var c: i64 = seed + 3;
+    var d: i64 = seed + 4;
+    var e: i64 = seed + 5;
+    var f: i64 = seed + 6;
+    var g: i64 = seed + 7;
+    var h: i64 = seed + 8;
+    var k: i64 = seed + 9;
+    var m: i64 = seed + 10;
+    a = bump(a);
+    b = bump(b);
+    c = bump(c);
+    d = bump(d);
+    e = bump(e);
+    return a + b + c + d + e + f + g + h + k + m - 3;
+}
+
+// The same, inside a loop: the values are live around the back edge
+fn pressure_loop(n: i64) -> i64 {
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var c: i64 = 2;
+    var d: i64 = 3;
+    var e: i64 = 4;
+    var f: i64 = 5;
+    var g: i64 = 6;
+    var h: i64 = 7;
+    var i: i64 = 0;
+    while i < n {
+        a = a + b;
+        b = bump(b) - 1;
+        c = c + d - 3;
+        d = d + 0;
+        e = bump(e) - 1;
+        f = f + g - 6;
+        g = g + h - 7;
+        h = h + 0;
+        i = i + 1;
+    }
+    return a + b + c + d + e + f + g + h + i;
+}
+
+fn fsum(n: i64) -> f64 {
+    var s: f64 = 0.0;
+    var x: f64 = 1.0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + x * x;
+        x = x + 0.0;
+        i = i + 1;
+    }
+    return s * 1000.0;
+}
+
+fn fharm(n: i64) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 1;
+    while i <= n {
+        var t: f64 = (i as f64) * (i as f64);
+        s = s + t / (n as f64);
+        i = i + 1;
+    }
+    return s / (n as f64);
+}
+
+fn fib_iter(n: i64) -> i64 {
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var i: i64 = 0;
+    while i < n {
+        var t: i64 = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn fib_rec(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib_rec(n - 1) + fib_rec(n - 2);
+}
+
+struct Trio {
+    x: i64,
+    y: i64,
+    z: i64,
+}
+
+fn trio_line(t: Trio) -> str {
+    return int_to_str(t.x) + " " + int_to_str(t.y) + " " + int_to_str(t.z);
+}
+
+fn count_up(v: Vec<i64>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        n = n + v.get(i);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    println(int_to_str(sum_to(100)));
+    println(int_to_str(squares(100)));
+    println(int_to_str(pressure(3)));
+    println(int_to_str(pressure_loop(100) + 340));
+    println(int_to_str(fsum(1000) as i64));
+    println(int_to_str((fharm(8) * 16.0) as i64));
+    println(int_to_str(fib_iter(10)));
+    println(int_to_str(fib_iter(20)));
+    println(trio_line(Trio { x: 12, y: 34, z: 56 }));
+    println(int_to_str(fib_rec(22)));
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 100 {
+        v.push(1);
+        i = i + 1;
+    }
+    println(int_to_str(count_up(v)));
+    println("ok");
+    return 0;
+}

@@ -1,0 +1,230 @@
+// SP11 (llvm-roadmap): arenas for one function's compiler data, given back
+// in one step (compiler/inc.fd fn_arena_*). Each "function" here makes the
+// kind of data the compiler makes for one function (rows of numbers, names,
+// an index), keeps a result (a Vec<i64> and a string) through the hold block,
+// and the window's end goes back to the allocator mark. With FID_FN_ARENA=1
+// on the C path, every window must end back at its mark, the results must
+// be those of the plain run, and the arena must not grow with the number of
+// functions; anywhere else (fid run, pe_ir, the machine layer, or without
+// FID_FN_ARENA) no window opens and the output is the same.
+// tests/tooling/fn-arena-check.sh runs it both ways.
+//
+// stderr: "windows: <n> opened, <n> back at their mark, arena chunk <k>"
+//
+// Expected output:
+// functions: 120
+// checksum: 16940053
+// first: fn_0_0
+// last: fn_119_14161
+// big: 300000 135001650000
+// nested window: 0
+// pinned rows: 39800 200 10200
+// every window back at its mark: yes
+use core;
+use compiler::inc;
+
+/// One function's data: rows of numbers, names and an index, all dropped at
+/// the end; the result is a row of numbers.
+fn work(seed: i64, n: i64) -> Vec<i64> {
+    var rows: Vec<Vec<i64>> = Vec::new();
+    var names: Vec<str> = Vec::new();
+    var index: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        var row: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < 12 {
+            row.push(seed * 31 + i * 7 + j);
+            j = j + 1;
+        }
+        rows.push(row);
+        var name: str = "v" + int_to_str(seed) + "_" + int_to_str(i);
+        names.push(name);
+        index.push(i);
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        val r: Vec<i64> = rows.get(i);
+        out.push(r.get(i % 12) + str_len(names.get(i)) + index.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn label(seed: i64) -> str {
+    return "fn_" + int_to_str(seed) + "_" + int_to_str(seed * seed);
+}
+
+/// A result larger than the hold block's first 2 MB (it grows inside the
+/// window).
+fn big(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(i * 3 + 7);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// A row of a table, handed over to the table (so it is not shared yet:
+/// no share box).
+fn make_row(i: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < 50 {
+        r.push(i + j);
+        j = j + 1;
+    }
+    return r;
+}
+
+/// Work that keeps a row of a table made before the window (takes an
+/// owner of it: its first share makes the row's share box).
+fn keep_row(t: & Vec<Vec<i64>>, i: i64) -> Vec<i64> {
+    var row: Vec<i64> = t.get(i);
+    var out: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < row.len() {
+        out.push(row.get(j) * 2);
+        j = j + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    var sums: Vec<i64> = Vec::new();
+    var labels: Vec<str> = Vec::new();
+    var opened: i64 = 0;
+    var back: i64 = 0;
+    var k: i64 = 0;
+    while k < 120 {
+        var n: i64 = 20 + (k % 7) * 15;
+        var res: Vec<i64> = Vec::new();
+        var lab: str = "";
+        var m: i64 = fn_arena_begin();
+        if m == 0 {
+            res = work(k, n);
+            lab = label(k);
+        } else {
+            opened = opened + 1;
+            fn_arena_keep_words(work(k, n));
+            fn_arena_keep_str(label(k));
+            fn_arena_keep_word(k * 1000 + n);
+            fn_arena_end(m);
+            if p_arena_save() == m {
+                back = back + 1;
+            }
+            res = fn_arena_take_words();
+            lab = fn_arena_take_str();
+            if fn_arena_take_word() != k * 1000 + n {
+                println("kept word lost at function " + int_to_str(k));
+            }
+        }
+        var s: i64 = 0;
+        var i: i64 = 0;
+        while i < res.len() {
+            s = s + res.get(i);
+            i = i + 1;
+        }
+        sums.push(s);
+        labels.push(lab);
+        k = k + 1;
+    }
+    var total: i64 = 0;
+    k = 0;
+    while k < sums.len() {
+        total = total + sums.get(k);
+        k = k + 1;
+    }
+    println("functions: " + int_to_str(sums.len()));
+    println("checksum: " + int_to_str(total));
+    println("first: " + labels.get(0));
+    println("last: " + labels.get(labels.len() - 1));
+    // a result bigger than the hold block: it grows inside the window
+    var bv: Vec<i64> = Vec::new();
+    var bm: i64 = fn_arena_begin();
+    var nested: i64 = 0;
+    if bm == 0 {
+        bv = big(300000);
+    } else {
+        opened = opened + 1;
+        // a window inside a window does not open
+        nested = fn_arena_begin();
+        fn_arena_keep_words(big(300000));
+        fn_arena_end(bm);
+        if p_arena_save() == bm {
+            back = back + 1;
+        }
+        bv = fn_arena_take_words();
+    }
+    var bs: i64 = 0;
+    k = 0;
+    while k < bv.len() {
+        bs = bs + bv.get(k);
+        k = k + 1;
+    }
+    println("big: " + int_to_str(bv.len()) + " " + int_to_str(bs));
+    println("nested window: " + int_to_str(nested));
+    // inc.fd's rule for outside containers the work keeps: shared once
+    // before the window (the pin), so the share box is made outside it.
+    // Without the pin the box is made inside, given back at the window's
+    // end, and the change of every row below fails ("Double free").
+    var table: Vec<Vec<i64>> = Vec::new();
+    k = 0;
+    while k < 200 {
+        table.push(make_row(k));
+        k = k + 1;
+    }
+    var first_sum: i64 = 0;
+    k = 0;
+    while k < 200 {
+        var pr: Vec<i64> = Vec::new();
+        var pin: Vec<i64> = table.get(k);
+        var pm: i64 = fn_arena_begin();
+        if pm == 0 {
+            pr = keep_row(& table, k);
+        } else {
+            opened = opened + 1;
+            fn_arena_keep_words(keep_row(& table, k));
+            fn_arena_end(pm);
+            if p_arena_save() == pm {
+                back = back + 1;
+            }
+            pr = fn_arena_take_words();
+        }
+        first_sum = first_sum + pr.get(0);
+        // new blocks over what the window gave back
+        var junk: Vec<Vec<i64>> = Vec::new();
+        var jk: i64 = 0;
+        while jk < 20 {
+            junk.push(make_row(jk));
+            jk = jk + 1;
+        }
+        k = k + 1;
+    }
+    var grown: i64 = 0;
+    k = 0;
+    while k < 200 {
+        var row: Vec<i64> = table.get(k);
+        row.push(1);
+        grown = grown + row.len();
+        k = k + 1;
+    }
+    // first elements 2 * k: 39800; each copy of a row grows to 51
+    println("pinned rows: " + int_to_str(first_sum) + " " + int_to_str(table.len()) + " " + int_to_str(grown));
+    if opened == back && fn_arena_missed() == 0 {
+        println("every window back at its mark: yes");
+    } else {
+        println("every window back at its mark: no (" + int_to_str(back) + " of " + int_to_str(opened) + ")");
+    }
+    p_eprint_str("windows: " + int_to_str(opened) + " opened, " + int_to_str(back) + " back at their mark, arena chunk " + int_to_str(p_arena_save() / 4294967296) + "\n");
+    var rep: str = fn_arena_report();
+    if str_len(rep) > 0 {
+        p_eprint_str(rep + "\n");
+    }
+    fn_arena_close();
+    return 0;
+}

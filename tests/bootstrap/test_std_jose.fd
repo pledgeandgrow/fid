@@ -1,0 +1,183 @@
+// stdlib/jose: RFC 7515 A.1 (HS256) byte-exact and verified, RFC 8037 A.4 (EdDSA) byte-exact, RFC 7638 §3.1 thumbprint, RS256 and PS256 tokens made by Node.js verified through a JWKS with JWT claim checks at an injected time, the alg-confusion and "none" rejections, RFC 7518 Appendix C Concat KDF, JWE dir/A256GCM and ECDH-ES/X25519/A256GCM byte-exact against Node.js and decrypted. ES256 and P-256 ECDH-ES are not run here: P-256 in the interpreter takes minutes per operation (checked with a C build instead, as is RS256 signing byte-exact against Node.js: the interpreter runs out of memory after a few RSA private-key operations). Added: RFC 3394 §4.1/§4.6 AES key wrap, HS384 byte-exact against Node.js, JWE A128KW/A128GCM byte-exact against Node.js and A256KW/A256GCM from Node.js decrypted; ES384, ES512 and RSA-OAEP-256 are in test_std_jose_pk.fd (C backend).
+// Expected output:
+// b64url AAECA_7_ round trip true
+// strict padding false bad bits false bad char false
+// hs256 eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+// hs256 verify true iss joe tampered false
+// hs256 claims at 1300819000: ok; at 1300819500: token expired
+// eddsa eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg
+// eddsa verify true payload Example of Ed25519 signing
+// eddsa thumbprint kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+// rfc7638 NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs
+// jwks keys 2 rsa1 at 0
+// rs256 jwt true sub "bob"
+// ps256 jwt true
+// wrong audience: wrong audience
+// not yet valid: token not yet valid
+// wrong issuer: wrong issuer
+// expired: token expired
+// audience api, any issuer: true
+// alg not allowed: algorithm not allowed
+// hs256 with rsa key: key does not fit the algorithm
+// alg none: algorithm not allowed
+// crit: unsupported critical header
+// concat kdf VqqN6vgjbSBcIijNcacQGg
+// jwe dir same as node true
+// jwe dir decrypt true The true sign of intelligence is not knowledge but imagination.
+// jwe dir wrong key false decryption failed
+// jwe ecdh-es same as node true
+// jwe ecdh-es decrypt true ECDH-ES over X25519
+// jwk json {"kty":"OKP","crv":"X25519","x":"hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo","kid":"x1"}
+// rfc3394 128 1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5 unwrap true
+// rfc3394 256 28c9f404c4b810f4cbccb35cfb87f8263f5786e2d80ed326cbc7f0e71a99f43bfb988b9b7a02dd21 unwrap true wrong kek false
+// hs384 same as node true verify true
+// hs384 with a 32-byte key: key does not fit the algorithm
+// jwe a128kw same as node true
+// jwe a128kw decrypt true Live long and prosper.
+// jwe a256kw node decrypt true A256KW from Node
+// jwe a256kw wrong kek false decryption failed
+// jwe a256kw not allowed: algorithm not allowed
+use jose;
+use vec;
+use string;
+use encoding;
+use json;
+
+fn main() {
+    // base64url
+    var raw: Vec<i64> = Vec::new();
+    raw.push(0); raw.push(1); raw.push(2); raw.push(3); raw.push(254); raw.push(255);
+    val enc: str = jose_b64url_encode(raw);
+    val back: JoseBytes = jose_b64url_decode(enc);
+    println("b64url " + enc + " round trip " + bool_to_str(back.ok && hex_encode_bytes(back.data) == hex_encode_bytes(raw)));
+    println("strict padding " + bool_to_str(jose_b64url_decode("AAE=").ok) + " bad bits " + bool_to_str(jose_b64url_decode("AAF").ok) + " bad char " + bool_to_str(jose_b64url_decode("AA+B").ok));
+
+    // RFC 7515 A.1
+    val hk: Jwk = jwk_parse("{\"kty\":\"oct\",\"k\":\"AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow\"}");
+    val hdr: str = "{\"typ\":\"JWT\",\r\n \"alg\":\"HS256\"}";
+    val pl: str = "{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}";
+    val tok: str = jws_sign(hdr, str_bytes(pl), & hk);
+    println("hs256 " + tok);
+    val v1: JwsVerified = jws_verify(tok, & hk, "HS256");
+    val bad: str = str_replace(tok, "dBjf", "dBjg");
+    println("hs256 verify " + bool_to_str(v1.ok) + " iss " + json_get_str(str_from_bytes(v1.payload), "iss") + " tampered " + bool_to_str(jws_verify(bad, & hk, "HS256").ok));
+    var o1: JwtOptions = jwt_options(1300819000, "joe", "");
+    val r1: JwtResult = jwt_verify(tok, & hk, "HS256", & o1);
+    o1.now = 1300819500;
+    val r2: JwtResult = jwt_verify(tok, & hk, "HS256", & o1);
+    var r1s: str = r1.err;
+    if r1.ok { r1s = "ok"; }
+    println("hs256 claims at 1300819000: " + r1s + "; at 1300819500: " + r2.err);
+
+    // RFC 8037 A.4
+    val ek: Jwk = jwk_parse("{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}");
+    val et: str = jws_sign("{\"alg\":\"EdDSA\"}", str_bytes("Example of Ed25519 signing"), & ek);
+    println("eddsa " + et);
+    val epub: Jwk = jwk_public(& ek);
+    val v2: JwsVerified = jws_verify(et, & epub, "EdDSA");
+    println("eddsa verify " + bool_to_str(v2.ok) + " payload " + str_from_bytes(v2.payload));
+    println("eddsa thumbprint " + jwk_thumbprint_b64(& epub));
+
+    // RFC 7638 §3.1
+    val tk: Jwk = jwk_parse("{\"kty\":\"RSA\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\",\"alg\":\"RS256\",\"kid\":\"2011-04-29\"}");
+    println("rfc7638 " + jwk_thumbprint_b64(& tk));
+
+    // RSA keys and tokens from Node.js (OpenSSL), checked through a JWKS
+    val rsa_priv: str = "{\"kty\":\"RSA\",\"kid\":\"rsa1\",\"n\":\"u1QPJpai6yCD3ve6ef_WsK2uDjXlQEWUtUS6K_JVtznJFaQ_MwHrFtv-Y9JDV0IrN1KeMXg_92YVVllcL5TTUFrpkdOvvT7OxhV1LP93Y-NLe5sQ5th1IyWnlFXK6WkO2Ka7cAlNavxLH9tEpYNB3BgYPo04UXraemMuOWWKJk0\",\"e\":\"AQAB\",\"p\":\"7BLaQ_kKCyP0_mTXMqFTOXwBC79GFLtKCuUN5Q_5D7urvVsRIQNtg8FstjA9FBKWIsdlvHrzefPZ_-kJ0IS3nQ\",\"q\":\"yyPnhB6SMsZQj4okis3rEv1i3T-cBogdPUhQGEAHGIfIlZ5rGzh0nZVq0NK8SvjtUX2KfMYcYr3mzE2r9udicQ\"}";
+    val rk: Jwk = jwk_parse(rsa_priv);
+    var set: Vec<Jwk> = Vec::new();
+    set.push(jwk_public(& hk));
+    set.push(jwk_public(& rk));
+    set.push(epub);
+    val jwks_text: str = jwks_to_json(& set);
+    val keys: Vec<Jwk> = jwks_parse(jwks_text);
+    println("jwks keys " + int_to_str(keys.len()) + " rsa1 at " + int_to_str(jwks_find(& keys, "rsa1")));
+    val claims: str = "{\"iss\":\"https://idp.example\",\"sub\":\"bob\",\"aud\":[\"client-1\",\"api\"],\"exp\":2000000000,\"nbf\":1600000000,\"iat\":1700000000}";
+    val rs_node: str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoiYm9iIiwiYXVkIjpbImNsaWVudC0xIiwiYXBpIl0sImV4cCI6MjAwMDAwMDAwMCwibmJmIjoxNjAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDB9.R76RxhZrys6uGUQCwe-gx87GrBRSq5o5sIO0jVUcgQipzvch_G610H15eDQaAVOjEUwqH9mkOl_8waiIj4-gusPR1hq5Bfh1dwRnfITJWd_v7NlwAs6Afkrror93aUz3SOtxro5ymeNxlUiOivP4SMZArDIlusN1AuRIRzWo7Bk";
+    var o2: JwtOptions = jwt_options(1700000100, "https://idp.example", "client-1");
+    val r3: JwtResult = jwt_verify_jwks(rs_node, & keys, "RS256,PS256,EdDSA", & o2);
+    println("rs256 jwt " + bool_to_str(r3.ok) + " sub " + json_get(r3.claims, "sub"));
+    val ps_node: str = "eyJhbGciOiJQUzI1NiIsImtpZCI6InJzYTEifQ.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoiYm9iIiwiYXVkIjpbImNsaWVudC0xIiwiYXBpIl0sImV4cCI6MjAwMDAwMDAwMCwibmJmIjoxNjAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDB9.Pd1-jbRIxeBHFgC4sLgCNLy3GSVmYJuO68tf9RUxQb7iLEn9igFYKDpE4Ubvxw_Hu5ijtR6ku8znfTrslzmrJMcNT3UdRRh2Kd-OmhGrrQTG60zf67af63ZzhRwM9c9LZZKO-M1swmiDBqIJE6s271mYGIrjHL7HHwEb7a85KMo";
+    println("ps256 jwt " + bool_to_str(jwt_verify_jwks(ps_node, & keys, "PS256", & o2).ok));
+    // claim checks on the same claims, HMAC-signed (cheaper than RSA in the interpreter)
+    val hs_claims: str = jwt_sign(claims, & hk, "HS256");
+    var o3: JwtOptions = jwt_options(1700000100, "https://idp.example", "client-2");
+    println("wrong audience: " + jwt_verify(hs_claims, & hk, "HS256", & o3).err);
+    var o4: JwtOptions = jwt_options(1500000000, "https://idp.example", "api");
+    println("not yet valid: " + jwt_verify(hs_claims, & hk, "HS256", & o4).err);
+    var o5: JwtOptions = jwt_options(1700000100, "https://other.example", "api");
+    println("wrong issuer: " + jwt_verify(hs_claims, & hk, "HS256", & o5).err);
+    var o6: JwtOptions = jwt_options(2000000100, "https://idp.example", "api");
+    println("expired: " + jwt_verify(hs_claims, & hk, "HS256", & o6).err);
+    var o7: JwtOptions = jwt_options(1700000100, "", "api");
+    println("audience api, any issuer: " + bool_to_str(jwt_verify(hs_claims, & hk, "HS256", & o7).ok));
+    println("alg not allowed: " + jwt_verify_jwks(rs_node, & keys, "ES256", & o2).err);
+    // alg confusion: an HS256 token keyed with the RSA public key's bytes
+    val confused: Jwk = jwk_oct(str_bytes(jwk_to_json(& rk, false)));
+    val ct: str = jws_sign("{\"alg\":\"HS256\",\"kid\":\"rsa1\"}", str_bytes(claims), & confused);
+    println("hs256 with rsa key: " + jwt_verify_jwks(ct, & keys, "RS256,HS256", & o2).err);
+    val none_tok: str = jose_b64url_str("{\"alg\":\"none\"}") + "." + jose_b64url_str(claims) + ".";
+    println("alg none: " + jws_verify(none_tok, & hk, "HS256,none").err);
+    val crit_tok: str = jws_sign("{\"alg\":\"HS256\",\"crit\":[\"exp\"],\"exp\":1}", str_bytes(claims), & hk);
+    println("crit: " + jws_verify(crit_tok, & hk, "HS256").err);
+
+    // RFC 7518 Appendix C: Z of Alice's and Bob's P-256 keys (from Node.js)
+    val z: Vec<i64> = hex_decode_bytes("9e56d91d817135d372834283bf84269cfb316ea3da806a48f6daa7798cfe90c4");
+    println("concat kdf " + jose_b64url_encode(jwe_concat_kdf(z, "A128GCM", str_bytes("Alice"), str_bytes("Bob"), 16)));
+
+    // JWE dir + A256GCM
+    val sym: Jwk = jwk_oct(hex_decode_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    val msg: str = "The true sign of intelligence is not knowledge but imagination.";
+    val jd: str = jwe_encrypt_dir("{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"sym1\"}", & sym, str_bytes(msg), hex_decode_bytes("e0e1e2e3e4e5e6e7e8e9eaeb"));
+    val jd_node: str = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoic3ltMSJ9..4OHi4-Tl5ufo6err.YKqso4Gy_07gcBcpMDyX5eXMVZOb6KFx--QEHmkRQflzjI6GWc6WD0aiwNRcPyPjESbwLnCCfPmt2M3Ondmk.Q3FhEjkeJparPQTwfGe81Q";
+    println("jwe dir same as node " + bool_to_str(jd == jd_node));
+    val d1: JweDecrypted = jwe_decrypt(jd_node, & sym, "dir");
+    println("jwe dir decrypt " + bool_to_str(d1.ok) + " " + str_from_bytes(d1.plain));
+    val wrong: Jwk = jwk_oct(hex_decode_bytes("ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"));
+    val d2: JweDecrypted = jwe_decrypt(jd_node, & wrong, "dir");
+    println("jwe dir wrong key " + bool_to_str(d2.ok) + " " + d2.err);
+
+    // JWE ECDH-ES with X25519 (RFC 7748 §6.1 keys as recipient and ephemeral)
+    var xr: Jwk = jwk_x25519_private(hex_decode_bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"));
+    val xpub: Jwk = jwk_public(& xr);
+    val jx: str = jwe_encrypt_ecdh_es(& xpub, "A256GCM", str_bytes("ECDH-ES over X25519"), hex_decode_bytes("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"), hex_decode_bytes("101112131415161718191a1b"), Vec::new(), Vec::new());
+    val jx_node: str = "eyJhbGciOiJFQ0RILUVTIiwiZW5jIjoiQTI1NkdDTSIsImVwayI6eyJrdHkiOiJPS1AiLCJjcnYiOiJYMjU1MTkiLCJ4IjoiM3A3YmZYdDl3YlRUVzJIQzdPUTFOei1EUThoYmVHZE5yZngtRkctSUswOCJ9fQ..EBESExQVFhcYGRob.tJBzuijjmiIXQtuLovjYmC_Yig.Aqx5ScF3YSrK9vZOVkJq4w";
+    println("jwe ecdh-es same as node " + bool_to_str(jx == jx_node));
+    val d3: JweDecrypted = jwe_decrypt(jx_node, & xr, "ECDH-ES");
+    println("jwe ecdh-es decrypt " + bool_to_str(d3.ok) + " " + str_from_bytes(d3.plain));
+    xr.kid = "x1";
+    println("jwk json " + jwk_to_json(& xr, false));
+
+    // RFC 3394 §4.1 and §4.6: AES key wrap
+    val kek1: Vec<i64> = hex_decode_bytes("000102030405060708090a0b0c0d0e0f");
+    val w1: Vec<i64> = jose_aes_kw_wrap(kek1, hex_decode_bytes("00112233445566778899aabbccddeeff"));
+    val u1: JoseBytes = jose_aes_kw_unwrap(kek1, w1);
+    println("rfc3394 128 " + hex_encode_bytes(w1) + " unwrap " + bool_to_str(u1.ok && hex_encode_bytes(u1.data) == "00112233445566778899aabbccddeeff"));
+    val kek2: Vec<i64> = hex_decode_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    val data2: str = "00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f";
+    val w2: Vec<i64> = jose_aes_kw_wrap(kek2, hex_decode_bytes(data2));
+    val u2: JoseBytes = jose_aes_kw_unwrap(kek2, w2);
+    println("rfc3394 256 " + hex_encode_bytes(w2) + " unwrap " + bool_to_str(u2.ok && hex_encode_bytes(u2.data) == data2) + " wrong kek " + bool_to_str(jose_aes_kw_unwrap(kek1, w2).ok));
+
+    // HS384, compared with Node.js
+    val h384: Jwk = jwk_parse("{\"kty\":\"oct\",\"k\":\"AQYLEBUaHyQpLjM4PUJHTFFWW2Blam90eX6DiI2Sl5yhpquwtbq_xMnO09jd4ufs\"}");
+    val t384: str = jws_sign("{\"alg\":\"HS384\",\"typ\":\"JWT\"}", str_bytes("{\"sub\":\"alice\",\"exp\":2000000000}"), & h384);
+    val t384_node: str = "eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSIsImV4cCI6MjAwMDAwMDAwMH0.2aeRt7osF-y65GrumkIbcJ7iIEVC9OHG4IPrJzzNQf3sacMu_OyOaRHfdWuHUPai";
+    println("hs384 same as node " + bool_to_str(t384 == t384_node) + " verify " + bool_to_str(jws_verify(t384_node, & h384, "HS384").ok));
+    println("hs384 with a 32-byte key: " + jws_verify(t384_node, & sym, "HS384").err);
+
+    // JWE A128KW + A128GCM and A256KW + A256GCM, made with Node.js
+    val kw1: Jwk = jwk_oct(kek1);
+    val jk: str = jwe_encrypt_kw("{\"alg\":\"A128KW\",\"enc\":\"A128GCM\"}", & kw1, str_bytes("Live long and prosper."), hex_decode_bytes("f0e1d2c3b4a5968778695a4b3c2d1e0f"), hex_decode_bytes("0102030405060708090a0b0c"));
+    val jk_node: str = "eyJhbGciOiJBMTI4S1ciLCJlbmMiOiJBMTI4R0NNIn0.chnJzTxvM6RxSU9VS35_RJ3c4eSCs-d6.AQIDBAUGBwgJCgsM.V56KO1kakNDw5o0KenwQBaai_9Lp9w.F_m-pLy9XHUFNfoyGxuQtQ";
+    println("jwe a128kw same as node " + bool_to_str(jk == jk_node));
+    val d4: JweDecrypted = jwe_decrypt(jk_node, & kw1, "A128KW");
+    println("jwe a128kw decrypt " + bool_to_str(d4.ok) + " " + str_from_bytes(d4.plain));
+    val kw2: Jwk = jwk_parse("{\"kty\":\"oct\",\"k\":\"__79_Pv6-fj39vX08_Lx8O_u7ezr6uno5-bl5OPi4eA\"}");
+    val jk2_node: str = "eyJhbGciOiJBMjU2S1ciLCJlbmMiOiJBMjU2R0NNIn0.naClAOHGG9GwO_nMW27UG7C2xqRLTNfkfeC56KjD2pD5bFA_OWoJfg.9QqN7i4Q4LXver-_.2zovCnwcmE52Z7irvjvcFg.G0QGMZX5z4cu8My1p4FjCQ";
+    val d5: JweDecrypted = jwe_decrypt(jk2_node, & kw2, "A256KW");
+    println("jwe a256kw node decrypt " + bool_to_str(d5.ok) + " " + str_from_bytes(d5.plain));
+    val d6: JweDecrypted = jwe_decrypt(jk2_node, & sym, "A256KW");
+    println("jwe a256kw wrong kek " + bool_to_str(d6.ok) + " " + d6.err);
+    println("jwe a256kw not allowed: " + jwe_decrypt(jk2_node, & kw2, "dir,A128KW").err);
+}

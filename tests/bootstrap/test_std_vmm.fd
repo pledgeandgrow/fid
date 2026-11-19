@@ -1,0 +1,137 @@
+// stdlib/vmm: page tables over fake RAM for x86-64, AArch64, Sv39 and Sv48 (entry bits, map/translate/unmap, large pages, root registers).
+// Expected output:
+// x86 root 0x0000000000100000 tables 1
+// x86 map 4K: 1 tables 4
+// x86 t 0x0000000000005abc size 4096 level 0 rw--g---
+// x86 leaf 0x8000000000005103
+// x86 map range: 5 tables 7
+// x86 t2 0x00000000401fffff size 2097152 rwxu----
+// x86 pde 0x0000000040000087
+// x86 t3 0x0000000040401234 size 4096
+// x86 noncanon -4 exists -2 align -3
+// x86 unmap 4096 4096 4096 tables 6
+// x86 unmap 2097152 2097152 tables 4 used 4
+// x86 gone false
+// x86 protect 0x8000000000005101 r---g---
+// x86 cr3 0x0000000000100005
+// x86 decode valid true leaf true pa 0x0000000000005000
+// a64 roots 0x0000000000100000 0x0000000000101000
+// a64 block 0x0060000040200701
+// a64 t 0x0000000040212345 size 2097152 level 1 rw--g-a-
+// a64 user 0x0020000000080fc3
+// a64 tu 0x0000000000080010 r-xu--a-
+// a64 ttbr1 0x0007000000101000 mair 0x00000000000004ff
+// a64 tcr 0x00000005b5103510
+// sv39 giga 0x00000000200000ef
+// sv39 t 0x0000000080123456 size 1073741824 level 2 rwx-g-ad
+// sv39 uart 0x40000000040000c7 rw---cad
+// sv39 satp 0x8000000000080000
+// sv39 noncanon false true
+// sv48 best 549755813888 map 1 t 0x0000007f12345678
+// sv48 satp 0x9000000000080000
+use vmm;
+use vec;
+use string;
+
+fn hx(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: Vec<i64> = Vec::new();
+    out.push(48);
+    out.push(120);
+    var i: i64 = 15;
+    while i >= 0 {
+        out.push(str_byte_at(digits, (v >> (i * 4)) & 15));
+        i = i - 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn x86() {
+    var mem: PhysMem = physmem_fake(0x100000, 16);
+    var fa: FrameAlloc = framealloc_new(0x100000, 16);
+    var a: AddrSpace = vmm_new(VMM_X86_64, &mut mem, &mut fa);
+    println("x86 root " + hx(a.root) + " tables " + int_to_str(a.tables));
+    val hi: i64 = 0xFFFF800000201000;
+    val r: i64 = vmm_map(&mut a, &mut mem, &mut fa, hi, 0x5000, 4096, VM_READ | VM_WRITE | VM_GLOBAL);
+    println("x86 map 4K: " + int_to_str(r) + " tables " + int_to_str(a.tables));
+    val t: Translation = vmm_translate(&a, &mem, hi + 0xABC);
+    println("x86 t " + hx(t.pa) + " size " + int_to_str(t.page_size) + " level " + int_to_str(t.level) + " " + vmm_flags_str(t.flags));
+    println("x86 leaf " + hx(phys_read64(&mem, t.entry_pa)));
+    val r2: i64 = vmm_map(&mut a, &mut mem, &mut fa, 0x200000, 0x40000000, 0x403000, VM_READ | VM_EXEC | VM_USER | VM_WRITE);
+    println("x86 map range: " + int_to_str(r2) + " tables " + int_to_str(a.tables));
+    val t2: Translation = vmm_translate(&a, &mem, 0x3FFFFF);
+    println("x86 t2 " + hx(t2.pa) + " size " + int_to_str(t2.page_size) + " " + vmm_flags_str(t2.flags));
+    println("x86 pde " + hx(phys_read64(&mem, t2.entry_pa)));
+    val t3: Translation = vmm_translate(&a, &mem, 0x601234);
+    println("x86 t3 " + hx(t3.pa) + " size " + int_to_str(t3.page_size));
+    val e1: i64 = vmm_map_page(&mut a, &mut mem, &mut fa, 0x0000800000000000, 0, 4096, VM_READ);
+    val e2: i64 = vmm_map_page(&mut a, &mut mem, &mut fa, 0x601000, 0, 4096, VM_READ);
+    val e3: i64 = vmm_map_page(&mut a, &mut mem, &mut fa, 0x800000, 0x1000, 2097152, VM_READ);
+    println("x86 noncanon " + int_to_str(e1) + " exists " + int_to_str(e2) + " align " + int_to_str(e3));
+    val u1: i64 = vmm_unmap(&mut a, &mut mem, &mut fa, 0x601000);
+    val u2: i64 = vmm_unmap(&mut a, &mut mem, &mut fa, 0x602FFF);
+    val u3: i64 = vmm_unmap(&mut a, &mut mem, &mut fa, 0x600000);
+    println("x86 unmap " + int_to_str(u1) + " " + int_to_str(u2) + " " + int_to_str(u3) + " tables " + int_to_str(a.tables));
+    val u4: i64 = vmm_unmap(&mut a, &mut mem, &mut fa, 0x200000);
+    val u5: i64 = vmm_unmap(&mut a, &mut mem, &mut fa, 0x400000);
+    println("x86 unmap " + int_to_str(u4) + " " + int_to_str(u5) + " tables " + int_to_str(a.tables) + " used " + int_to_str(framealloc_used(&fa)));
+    println("x86 gone " + bool_to_str(vmm_translate(&a, &mem, 0x200000).ok));
+    vmm_protect(&mut a, &mut mem, hi, VM_READ | VM_GLOBAL);
+    val t4: Translation = vmm_translate(&a, &mem, hi);
+    println("x86 protect " + hx(phys_read64(&mem, t4.entry_pa)) + " " + vmm_flags_str(t4.flags));
+    println("x86 cr3 " + hx(vmm_cr3(&a, 5)));
+    val d: VmEntry = vmm_entry_decode(VMM_X86_64, 0, 0x8000000000005103);
+    println("x86 decode valid " + bool_to_str(d.valid) + " leaf " + bool_to_str(d.leaf) + " pa " + hx(d.pa));
+}
+
+fn a64() {
+    var mem: PhysMem = physmem_fake(0x100000, 12);
+    var fa: FrameAlloc = framealloc_new(0x100000, 12);
+    var a: AddrSpace = vmm_new(VMM_AARCH64, &mut mem, &mut fa);
+    println("a64 roots " + hx(a.root) + " " + hx(a.root_hi));
+    val hi: i64 = 0xFFFF000000400000;
+    vmm_map(&mut a, &mut mem, &mut fa, hi, 0x40200000, 2097152, VM_READ | VM_WRITE | VM_GLOBAL);
+    val t: Translation = vmm_translate(&a, &mem, hi + 0x12345);
+    println("a64 block " + hx(phys_read64(&mem, t.entry_pa)));
+    println("a64 t " + hx(t.pa) + " size " + int_to_str(t.page_size) + " level " + int_to_str(t.level) + " " + vmm_flags_str(t.flags));
+    vmm_map(&mut a, &mut mem, &mut fa, 0x400000, 0x80000, 4096, VM_READ | VM_EXEC | VM_USER);
+    val tu: Translation = vmm_translate(&a, &mem, 0x400010);
+    println("a64 user " + hx(phys_read64(&mem, tu.entry_pa)));
+    println("a64 tu " + hx(tu.pa) + " " + vmm_flags_str(tu.flags));
+    println("a64 ttbr1 " + hx(vmm_ttbr(a.root_hi, 7)) + " mair " + hx(vmm_mair_el1()));
+    println("a64 tcr " + hx(vmm_tcr_el1(48)));
+}
+
+fn sv39() {
+    var mem: PhysMem = physmem_fake(0x80000000, 8);
+    var fa: FrameAlloc = framealloc_new(0x80000000, 8);
+    var a: AddrSpace = vmm_new(VMM_SV39, &mut mem, &mut fa);
+    val hi: i64 = 0xFFFFFFC000000000;
+    vmm_map(&mut a, &mut mem, &mut fa, hi, 0x80000000, 1073741824, VM_READ | VM_WRITE | VM_EXEC | VM_GLOBAL);
+    val t: Translation = vmm_translate(&a, &mem, hi + 0x123456);
+    println("sv39 giga " + hx(phys_read64(&mem, t.entry_pa)));
+    println("sv39 t " + hx(t.pa) + " size " + int_to_str(t.page_size) + " level " + int_to_str(t.level) + " " + vmm_flags_str(t.flags));
+    vmm_map(&mut a, &mut mem, &mut fa, 0x10000, 0x10000000, 4096, VM_READ | VM_WRITE | VM_NOCACHE);
+    val tu: Translation = vmm_translate(&a, &mem, 0x10000);
+    println("sv39 uart " + hx(phys_read64(&mem, tu.entry_pa)) + " " + vmm_flags_str(tu.flags));
+    println("sv39 satp " + hx(vmm_satp(&a)));
+    println("sv39 noncanon " + bool_to_str(vmm_canonical(VMM_SV39, 0x0000004000000000)) + " " + bool_to_str(vmm_canonical(VMM_SV48, 0x0000004000000000)));
+}
+
+fn sv48() {
+    var mem: PhysMem = physmem_fake(0x80000000, 4);
+    var fa: FrameAlloc = framealloc_new(0x80000000, 4);
+    var a: AddrSpace = vmm_new(VMM_SV48, &mut mem, &mut fa);
+    val big: i64 = 549755813888;
+    val n: i64 = vmm_map(&mut a, &mut mem, &mut fa, 0, 0, big, VM_READ | VM_WRITE);
+    val t: Translation = vmm_translate(&a, &mem, 0x7F12345678);
+    println("sv48 best " + int_to_str(vmm_best_size(VMM_SV48, 0, 0, big)) + " map " + int_to_str(n) + " t " + hx(t.pa));
+    println("sv48 satp " + hx(vmm_satp(&a)));
+}
+
+fn main() {
+    x86();
+    a64();
+    sv39();
+    sv48();
+}

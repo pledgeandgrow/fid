@@ -1,0 +1,480 @@
+// Fides geolocation: positions, geodesy, geohash, geofences, filtering
+//
+// All of this is real, portable computation (no platform calls). The
+// platform layer (Android FusedLocationProviderClient through jni.fd,
+// iOS CLLocationManager through objc.fd) only feeds `GeoFix` values
+// (latitude, longitude, horizontal accuracy, time) into the filter and
+// the geofences; the OS geofencing APIs are not needed for these.
+//
+//   - great-circle (haversine) distance on the mean Earth radius, initial
+//     and final bearings, destination point, midpoint
+//   - Vincenty's inverse formula on the WGS-84 ellipsoid (distance and
+//     both azimuths, iterated to 1e-12 rad; reports non-convergence for
+//     nearly antipodal points)
+//   - geohash encode / decode (bounding box and center) and neighbours
+//   - geofences: circles and polygons (ray casting; distance to the edge in
+//     a local equirectangular projection), enter / exit events with a
+//     hysteresis margin so a fix wandering on the boundary does not flap
+//   - a location filter: a Kalman filter on latitude / longitude whose
+//     process noise grows with time and whose measurement noise is the
+//     fix's reported accuracy
+//
+// Angles are degrees in the API, radians inside. atan2/asin are computed
+// here (argument halving and a Taylor series) since math.fd has none.
+
+module geolocation;
+use vec;
+use string;
+use math;
+
+pub const GEO_EARTH_RADIUS_M: f64 = 6371008.8;      // IUGG mean radius
+pub const GEO_WGS84_A: f64 = 6378137.0;
+pub const GEO_WGS84_F: f64 = 0.0033528106647474805; // 1 / 298.257223563
+
+pub struct GeoPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+pub fn geo_point(lat: f64, lon: f64) -> GeoPoint { return GeoPoint { lat: lat, lon: lon }; }
+
+// ─── Trigonometry ──────────────────────────────────────────────────────
+
+pub fn geo_pi() -> f64 { return 3.141592653589793; }
+pub fn geo_rad(d: f64) -> f64 { return d * 0.017453292519943295; }
+pub fn geo_deg(r: f64) -> f64 { return r * 57.29577951308232; }
+
+/// atan(x), accurate to about 1e-15.
+pub fn geo_atan(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - geo_atan(0.0 - x); }
+    if x > 1.0 { return geo_pi() / 2.0 - geo_atan(1.0 / x); }
+    // two halvings: atan(x) = 2 atan(x / (1 + sqrt(1 + x^2)))
+    var y: f64 = x / (1.0 + math_sqrt(1.0 + x * x));
+    y = y / (1.0 + math_sqrt(1.0 + y * y));
+    val y2: f64 = y * y;
+    var term: f64 = y;
+    var sum: f64 = 0.0;
+    var k: i64 = 0;
+    while k < 14 {
+        val d: f64 = (2 * k + 1) as f64;
+        if k % 2 == 0 { sum = sum + term / d; } else { sum = sum - term / d; }
+        term = term * y2;
+        k = k + 1;
+    }
+    return 4.0 * sum;
+}
+
+/// atan2(y, x) in (-pi, pi]; 0 for (0, 0).
+pub fn geo_atan2(y: f64, x: f64) -> f64 {
+    if x > 0.0 { return geo_atan(y / x); }
+    if x < 0.0 {
+        if y >= 0.0 { return geo_atan(y / x) + geo_pi(); }
+        return geo_atan(y / x) - geo_pi();
+    }
+    if y > 0.0 { return geo_pi() / 2.0; }
+    if y < 0.0 { return 0.0 - geo_pi() / 2.0; }
+    return 0.0;
+}
+
+/// asin(x), x clamped to [-1, 1].
+pub fn geo_asin(x: f64) -> f64 {
+    var c: f64 = x;
+    if c > 1.0 { c = 1.0; }
+    if c < -1.0 { c = -1.0; }
+    return geo_atan2(c, math_sqrt(1.0 - c * c));
+}
+
+/// Normalize degrees to [0, 360).
+pub fn geo_norm360(d: f64) -> f64 {
+    var x: f64 = d - 360.0 * math_floor(d / 360.0);
+    if x >= 360.0 { x = x - 360.0; }
+    return x;
+}
+
+/// Normalize a longitude to [-180, 180).
+pub fn geo_norm180(d: f64) -> f64 { return geo_norm360(d + 180.0) - 180.0; }
+
+// ─── Sphere ────────────────────────────────────────────────────────────
+
+/// Great-circle distance in meters (haversine).
+pub fn geo_haversine(a: GeoPoint, b: GeoPoint) -> f64 {
+    val p1: f64 = geo_rad(a.lat);
+    val p2: f64 = geo_rad(b.lat);
+    val dp: f64 = geo_rad(b.lat - a.lat);
+    val dl: f64 = geo_rad(b.lon - a.lon);
+    val s1: f64 = math_sin(dp / 2.0);
+    val s2: f64 = math_sin(dl / 2.0);
+    val h: f64 = s1 * s1 + math_cos(p1) * math_cos(p2) * s2 * s2;
+    return 2.0 * GEO_EARTH_RADIUS_M * geo_atan2(math_sqrt(h), math_sqrt(1.0 - h));
+}
+
+/// Initial great-circle bearing from a to b, degrees in [0, 360).
+pub fn geo_bearing(a: GeoPoint, b: GeoPoint) -> f64 {
+    val p1: f64 = geo_rad(a.lat);
+    val p2: f64 = geo_rad(b.lat);
+    val dl: f64 = geo_rad(b.lon - a.lon);
+    val y: f64 = math_sin(dl) * math_cos(p2);
+    val x: f64 = math_cos(p1) * math_sin(p2) - math_sin(p1) * math_cos(p2) * math_cos(dl);
+    return geo_norm360(geo_deg(geo_atan2(y, x)));
+}
+
+/// Final bearing on arrival at b, degrees in [0, 360).
+pub fn geo_final_bearing(a: GeoPoint, b: GeoPoint) -> f64 {
+    return geo_norm360(geo_bearing(b, a) + 180.0);
+}
+
+/// The point `dist` meters from `a` along initial bearing `brg` degrees.
+pub fn geo_destination(a: GeoPoint, brg: f64, dist: f64) -> GeoPoint {
+    val d: f64 = dist / GEO_EARTH_RADIUS_M;
+    val t: f64 = geo_rad(brg);
+    val p1: f64 = geo_rad(a.lat);
+    val l1: f64 = geo_rad(a.lon);
+    val sp2: f64 = math_sin(p1) * math_cos(d) + math_cos(p1) * math_sin(d) * math_cos(t);
+    val p2: f64 = geo_asin(sp2);
+    val l2: f64 = l1 + geo_atan2(math_sin(t) * math_sin(d) * math_cos(p1), math_cos(d) - math_sin(p1) * sp2);
+    return GeoPoint { lat: geo_deg(p2), lon: geo_norm180(geo_deg(l2)) };
+}
+
+/// The great-circle midpoint of a and b.
+pub fn geo_midpoint(a: GeoPoint, b: GeoPoint) -> GeoPoint {
+    val p1: f64 = geo_rad(a.lat);
+    val p2: f64 = geo_rad(b.lat);
+    val l1: f64 = geo_rad(a.lon);
+    val dl: f64 = geo_rad(b.lon - a.lon);
+    val bx: f64 = math_cos(p2) * math_cos(dl);
+    val by: f64 = math_cos(p2) * math_sin(dl);
+    val pm: f64 = geo_atan2(math_sin(p1) + math_sin(p2), math_sqrt((math_cos(p1) + bx) * (math_cos(p1) + bx) + by * by));
+    val lm: f64 = l1 + geo_atan2(by, math_cos(p1) + bx);
+    return GeoPoint { lat: geo_deg(pm), lon: geo_norm180(geo_deg(lm)) };
+}
+
+// ─── Vincenty on WGS-84 ────────────────────────────────────────────────
+
+pub struct GeoInverse {
+    pub ok: bool,           // false: did not converge (nearly antipodal)
+    pub distance: f64,      // meters
+    pub azimuth1: f64,      // initial bearing at a, degrees
+    pub azimuth2: f64,      // forward bearing at b, degrees
+    pub iterations: i64,
+}
+
+/// Vincenty's inverse problem on the WGS-84 ellipsoid.
+pub fn geo_vincenty(a: GeoPoint, b: GeoPoint) -> GeoInverse {
+    val ea: f64 = GEO_WGS84_A;
+    val f: f64 = GEO_WGS84_F;
+    val eb: f64 = ea * (1.0 - f);
+    val l: f64 = geo_rad(b.lon - a.lon);
+    val u1: f64 = geo_atan((1.0 - f) * math_sin(geo_rad(a.lat)) / math_cos(geo_rad(a.lat)));
+    val u2: f64 = geo_atan((1.0 - f) * math_sin(geo_rad(b.lat)) / math_cos(geo_rad(b.lat)));
+    val su1: f64 = math_sin(u1);
+    val cu1: f64 = math_cos(u1);
+    val su2: f64 = math_sin(u2);
+    val cu2: f64 = math_cos(u2);
+    var lambda: f64 = l;
+    var iter: i64 = 0;
+    var sin_sigma: f64 = 0.0;
+    var cos_sigma: f64 = 1.0;
+    var sigma: f64 = 0.0;
+    var cos2_alpha: f64 = 1.0;
+    var cos_2sm: f64 = 0.0;
+    var converged: bool = false;
+    while iter < 200 {
+        iter = iter + 1;
+        val sl: f64 = math_sin(lambda);
+        val cl: f64 = math_cos(lambda);
+        val t1: f64 = cu2 * sl;
+        val t2: f64 = cu1 * su2 - su1 * cu2 * cl;
+        sin_sigma = math_sqrt(t1 * t1 + t2 * t2);
+        if sin_sigma == 0.0 {
+            return GeoInverse { ok: true, distance: 0.0, azimuth1: 0.0, azimuth2: 0.0, iterations: iter };
+        }
+        cos_sigma = su1 * su2 + cu1 * cu2 * cl;
+        sigma = geo_atan2(sin_sigma, cos_sigma);
+        val sin_alpha: f64 = cu1 * cu2 * sl / sin_sigma;
+        cos2_alpha = 1.0 - sin_alpha * sin_alpha;
+        cos_2sm = if cos2_alpha != 0.0 { cos_sigma - 2.0 * su1 * su2 / cos2_alpha } else { 0.0 };
+        val c: f64 = f / 16.0 * cos2_alpha * (4.0 + f * (4.0 - 3.0 * cos2_alpha));
+        val prev: f64 = lambda;
+        lambda = l + (1.0 - c) * f * sin_alpha * (sigma + c * sin_sigma * (cos_2sm + c * cos_sigma * (-1.0 + 2.0 * cos_2sm * cos_2sm)));
+        if math_fabs(lambda - prev) < 0.000000000001 {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        return GeoInverse { ok: false, distance: 0.0, azimuth1: 0.0, azimuth2: 0.0, iterations: iter };
+    }
+    val u_sq: f64 = cos2_alpha * (ea * ea - eb * eb) / (eb * eb);
+    val ca: f64 = 1.0 + u_sq / 16384.0 * (4096.0 + u_sq * (-768.0 + u_sq * (320.0 - 175.0 * u_sq)));
+    val cb: f64 = u_sq / 1024.0 * (256.0 + u_sq * (-128.0 + u_sq * (74.0 - 47.0 * u_sq)));
+    val ds: f64 = cb * sin_sigma * (cos_2sm + cb / 4.0 * (cos_sigma * (-1.0 + 2.0 * cos_2sm * cos_2sm)
+        - cb / 6.0 * cos_2sm * (-3.0 + 4.0 * sin_sigma * sin_sigma) * (-3.0 + 4.0 * cos_2sm * cos_2sm)));
+    val s: f64 = eb * ca * (sigma - ds);
+    val sl2: f64 = math_sin(lambda);
+    val cl2: f64 = math_cos(lambda);
+    val a1: f64 = geo_atan2(cu2 * sl2, cu1 * su2 - su1 * cu2 * cl2);
+    val a2: f64 = geo_atan2(cu1 * sl2, 0.0 - su1 * cu2 + cu1 * su2 * cl2);
+    return GeoInverse { ok: true, distance: s, azimuth1: geo_norm360(geo_deg(a1)), azimuth2: geo_norm360(geo_deg(a2)), iterations: iter };
+}
+
+/// Degrees from degrees, minutes, seconds (negative degrees: south/west).
+pub fn geo_dms(d: i64, m: i64, s: f64) -> f64 {
+    val mag: f64 = (if d < 0 { 0 - d } else { d }) as f64 + (m as f64) / 60.0 + s / 3600.0;
+    if d < 0 { return 0.0 - mag; }
+    return mag;
+}
+
+// ─── Geohash ───────────────────────────────────────────────────────────
+
+fn geo_b32() -> str { return "0123456789bcdefghjkmnpqrstuvwxyz"; }
+
+/// Geohash of a point with `precision` characters (1..12).
+pub fn geohash_encode(lat: f64, lon: f64, precision: i64) -> str {
+    var lat_lo: f64 = -90.0;
+    var lat_hi: f64 = 90.0;
+    var lon_lo: f64 = -180.0;
+    var lon_hi: f64 = 180.0;
+    var out: str = "";
+    var bits: i64 = 0;
+    var nbits: i64 = 0;
+    var even: bool = true;
+    val alphabet: str = geo_b32();
+    while str_len(out) < precision {
+        if even {
+            val mid: f64 = (lon_lo + lon_hi) / 2.0;
+            if lon >= mid { bits = bits * 2 + 1; lon_lo = mid; } else { bits = bits * 2; lon_hi = mid; }
+        } else {
+            val mid: f64 = (lat_lo + lat_hi) / 2.0;
+            if lat >= mid { bits = bits * 2 + 1; lat_lo = mid; } else { bits = bits * 2; lat_hi = mid; }
+        }
+        even = !even;
+        nbits = nbits + 1;
+        if nbits == 5 {
+            out = out + str_slice(alphabet, bits, bits + 1);
+            bits = 0;
+            nbits = 0;
+        }
+    }
+    return out;
+}
+
+/// A decoded geohash: its cell and the cell's center.
+pub struct GeohashBox {
+    pub ok: bool,
+    pub lat_lo: f64,
+    pub lat_hi: f64,
+    pub lon_lo: f64,
+    pub lon_hi: f64,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+pub fn geohash_decode(h: str) -> GeohashBox {
+    var lat_lo: f64 = -90.0;
+    var lat_hi: f64 = 90.0;
+    var lon_lo: f64 = -180.0;
+    var lon_hi: f64 = 180.0;
+    var even: bool = true;
+    val alphabet: str = geo_b32();
+    var i: i64 = 0;
+    while i < str_len(h) {
+        val c: str = str_to_lower(str_slice(h, i, i + 1));
+        val v: i64 = str_find(alphabet, c);
+        if v < 0 || str_len(h) == 0 {
+            return GeohashBox { ok: false, lat_lo: 0.0, lat_hi: 0.0, lon_lo: 0.0, lon_hi: 0.0, lat: 0.0, lon: 0.0 };
+        }
+        var b: i64 = 4;
+        while b >= 0 {
+            val bit: i64 = (v >> b) & 1;
+            if even {
+                val mid: f64 = (lon_lo + lon_hi) / 2.0;
+                if bit == 1 { lon_lo = mid; } else { lon_hi = mid; }
+            } else {
+                val mid: f64 = (lat_lo + lat_hi) / 2.0;
+                if bit == 1 { lat_lo = mid; } else { lat_hi = mid; }
+            }
+            even = !even;
+            b = b - 1;
+        }
+        i = i + 1;
+    }
+    return GeohashBox {
+        ok: str_len(h) > 0, lat_lo: lat_lo, lat_hi: lat_hi, lon_lo: lon_lo, lon_hi: lon_hi,
+        lat: (lat_lo + lat_hi) / 2.0, lon: (lon_lo + lon_hi) / 2.0,
+    };
+}
+
+/// The neighbouring cell of the same precision: dlat, dlon in -1..1
+/// (north is dlat 1). Longitude wraps; "" past a pole.
+pub fn geohash_neighbor(h: str, dlat: i64, dlon: i64) -> str {
+    val b: GeohashBox = geohash_decode(h);
+    if !b.ok { return ""; }
+    val lat: f64 = b.lat + (dlat as f64) * (b.lat_hi - b.lat_lo);
+    if lat > 90.0 || lat < -90.0 { return ""; }
+    val lon: f64 = geo_norm180(b.lon + (dlon as f64) * (b.lon_hi - b.lon_lo));
+    return geohash_encode(lat, lon, str_len(h));
+}
+
+// ─── Geofences ─────────────────────────────────────────────────────────
+
+pub const GEOFENCE_CIRCLE: i64 = 0;
+pub const GEOFENCE_POLYGON: i64 = 1;
+pub const GEOFENCE_ENTER: i64 = 1;
+pub const GEOFENCE_EXIT: i64 = 2;
+
+pub struct Geofence {
+    pub id: str,
+    pub kind: i64,
+    pub center: GeoPoint,
+    pub radius: f64,
+    pub lats: Vec<f64>,       // polygon vertices
+    pub lons: Vec<f64>,
+    pub hysteresis: f64,      // meters on each side of the boundary
+    pub inside: bool,
+    pub known: bool,          // has a fix decided the state yet
+}
+
+pub fn geofence_circle(id: str, center: GeoPoint, radius: f64, hysteresis: f64) -> Geofence {
+    return Geofence {
+        id: id, kind: GEOFENCE_CIRCLE, center: center, radius: radius, lats: Vec::new(), lons: Vec::new(),
+        hysteresis: hysteresis, inside: false, known: false,
+    };
+}
+
+pub fn geofence_polygon(id: str, lats: Vec<f64>, lons: Vec<f64>, hysteresis: f64) -> Geofence {
+    return Geofence {
+        id: id, kind: GEOFENCE_POLYGON, center: GeoPoint { lat: 0.0, lon: 0.0 }, radius: 0.0, lats: lats, lons: lons,
+        hysteresis: hysteresis, inside: false, known: false,
+    };
+}
+
+/// Is p inside the polygon (ray casting in latitude / longitude)?
+pub fn geo_polygon_contains(lats: &Vec<f64>, lons: &Vec<f64>, p: GeoPoint) -> bool {
+    val n: i64 = lats.len();
+    var inside: bool = false;
+    var i: i64 = 0;
+    var j: i64 = n - 1;
+    while i < n {
+        val yi: f64 = lats.get(i);
+        val yj: f64 = lats.get(j);
+        val xi: f64 = lons.get(i);
+        val xj: f64 = lons.get(j);
+        if (yi > p.lat) != (yj > p.lat) {
+            val x: f64 = xi + (p.lat - yi) * (xj - xi) / (yj - yi);
+            if p.lon < x { inside = !inside; }
+        }
+        j = i;
+        i = i + 1;
+    }
+    return inside;
+}
+
+// Distance in meters from p to the polygon's boundary (local projection).
+fn geo_polygon_edge_distance(lats: &Vec<f64>, lons: &Vec<f64>, p: GeoPoint) -> f64 {
+    val ky: f64 = geo_rad(1.0) * GEO_EARTH_RADIUS_M;
+    val kx: f64 = ky * math_cos(geo_rad(p.lat));
+    var best: f64 = -1.0;
+    val n: i64 = lats.len();
+    var i: i64 = 0;
+    while i < n {
+        val j: i64 = (i + 1) % n;
+        val ax: f64 = (lons.get(i) - p.lon) * kx;
+        val ay: f64 = (lats.get(i) - p.lat) * ky;
+        val bx: f64 = (lons.get(j) - p.lon) * kx;
+        val by: f64 = (lats.get(j) - p.lat) * ky;
+        val dx: f64 = bx - ax;
+        val dy: f64 = by - ay;
+        val len2: f64 = dx * dx + dy * dy;
+        var t: f64 = 0.0;
+        if len2 > 0.0 { t = (0.0 - ax * dx - ay * dy) / len2; }
+        if t < 0.0 { t = 0.0; }
+        if t > 1.0 { t = 1.0; }
+        val cx: f64 = ax + t * dx;
+        val cy: f64 = ay + t * dy;
+        val d: f64 = math_sqrt(cx * cx + cy * cy);
+        if best < 0.0 || d < best { best = d; }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// How far inside the fence p is, in meters (negative: outside).
+pub fn geofence_depth(g: &Geofence, p: GeoPoint) -> f64 {
+    if g.kind == GEOFENCE_CIRCLE { return g.radius - geo_haversine(g.center, p); }
+    val d: f64 = geo_polygon_edge_distance(&g.lats, &g.lons, p);
+    if geo_polygon_contains(&g.lats, &g.lons, p) { return d; }
+    return 0.0 - d;
+}
+
+/// Feed a fix: GEOFENCE_ENTER, GEOFENCE_EXIT or 0. A fence changes state
+/// only once the point is more than `hysteresis` meters past the
+/// boundary; the first fix decides the initial state (an ENTER when it is
+/// inside, nothing when outside).
+pub fn geofence_update(g: &mut Geofence, p: GeoPoint) -> i64 {
+    val depth: f64 = geofence_depth(g, p);
+    if !g.known {
+        if depth > g.hysteresis {
+            g.known = true;
+            g.inside = true;
+            return GEOFENCE_ENTER;
+        }
+        if depth < 0.0 - g.hysteresis { g.known = true; }
+        return 0;
+    }
+    if !g.inside && depth > g.hysteresis { g.inside = true; return GEOFENCE_ENTER; }
+    if g.inside && depth < 0.0 - g.hysteresis { g.inside = false; return GEOFENCE_EXIT; }
+    return 0;
+}
+
+// ─── Location filter ───────────────────────────────────────────────────
+
+/// A fix as the platform reports it.
+pub struct GeoFix {
+    pub lat: f64,
+    pub lon: f64,
+    pub accuracy: f64,   // meters (1 sigma)
+    pub time_ms: i64,
+}
+
+/// Kalman filter on latitude / longitude with a variance in m^2.
+pub struct GeoFilter {
+    pub lat: f64,
+    pub lon: f64,
+    pub variance: f64,   // < 0: no fix yet
+    pub time_ms: i64,
+    pub q: f64,          // process noise, meters per second
+    pub min_accuracy: f64,
+}
+
+pub fn geo_filter_new(q_meters_per_sec: f64) -> GeoFilter {
+    return GeoFilter { lat: 0.0, lon: 0.0, variance: -1.0, time_ms: 0, q: q_meters_per_sec, min_accuracy: 1.0 };
+}
+
+/// Fold a fix in; returns the filtered position.
+pub fn geo_filter_update(f: &mut GeoFilter, fix: GeoFix) -> GeoPoint {
+    var acc: f64 = fix.accuracy;
+    if acc < f.min_accuracy { acc = f.min_accuracy; }
+    if f.variance < 0.0 {
+        f.lat = fix.lat;
+        f.lon = fix.lon;
+        f.variance = acc * acc;
+        f.time_ms = fix.time_ms;
+        return GeoPoint { lat: f.lat, lon: f.lon };
+    }
+    val dt: i64 = fix.time_ms - f.time_ms;
+    if dt > 0 {
+        f.variance = f.variance + (dt as f64) * f.q * f.q / 1000.0;
+        f.time_ms = fix.time_ms;
+    }
+    val k: f64 = f.variance / (f.variance + acc * acc);
+    f.lat = f.lat + k * (fix.lat - f.lat);
+    f.lon = f.lon + k * (fix.lon - f.lon);
+    f.variance = (1.0 - k) * f.variance;
+    return GeoPoint { lat: f.lat, lon: f.lon };
+}
+
+/// The filter's current 1-sigma accuracy in meters.
+pub fn geo_filter_accuracy(f: &GeoFilter) -> f64 {
+    if f.variance < 0.0 { return -1.0; }
+    return math_sqrt(f.variance);
+}

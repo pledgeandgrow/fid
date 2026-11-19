@@ -1,0 +1,46 @@
+# me3-promote-retired: iropt's `promote` (compiler/iropt.fd iro_promote)
+# after the SSA round trip (compiler/ssa.fd, `ssa`, on by default since
+# OP2), llvm-roadmap ME3.
+#
+# Compiler: the one-stage fid of Nov 16 (scratchpad ws/stage0.exe; its ssa
+# is opt-in, so "ssa on" below names it: FID_IROPT_ON=ssa,ssaexit).
+# Windows x64, `fid emit` (pe_ir), FID_IROPT_STATS=1.
+#
+# 1. promote's "functions changed", ssa named on vs ssa off:
+#      test_mem2reg_promote   ssa on 0   ssa off 37
+#      test_collections       ssa on 2   ssa off 79
+#      test_lang_features     ssa on 0   ssa off 40
+#      test_hashmap           ssa on 2   ssa off 52
+#      test_lib_bigint        ssa on 4   ssa off 58
+#
+# 2. ssa named on, promote on vs FID_IROPT_OFF=promote (instructions after
+#    iropt; the executables print the same and have the same size):
+#      test_hashmap       6276 vs 6282
+#      test_lib_bigint    9161 vs 9166
+#      test_collections   9946 vs 9952
+#    promote's time after ssa, test_collections: 191 ms of 3,984 ms in
+#    iropt (195 calls), for 6 instructions.
+#
+# Decision (Nov 17): promote is retired where ssa runs. iropt.fd
+# iro_promote_here: with ssa on, promote runs only on the functions ssa
+# does not take (ssa.fd ssa_takes: @constant_time, a TryUnwrap or Asm, an
+# entry block with predecessors), so none of those loses the forwarding it
+# had; FID_IROPT_ON=promote runs it on every function again (to compare),
+# FID_IROPT_OFF=ssa brings back the pipeline before ssa (promote
+# everywhere). The 5-6 instructions per program promote still found after
+# ssa are, most likely (not traced per function), loads of locals ssa
+# keeps in memory (owned str/Vec locals the backend drops at scope end,
+# non-scalar slots, a local a read of which can see no store): those are
+# left to the forwarding after it (iropt_me `forward`, egraph.fd).
+#
+# Gate (with the final compiler):
+#   FID=$FID bash tests/tooling/promote-retired-check.sh
+# every test OK: the default, FID_IROPT_ON=promote and
+# FID_IROPT_OFF=ssa,ssaexit builds print the same, no IR verifier error,
+# promote changes 0 functions by default on the programs without
+# @constant_time/asm (RETIRED), the default's instructions within 1% of
+# promote named (COST). With the Nov 16 compiler (promote not retired) the
+# check fails on test_hashmap: "RETIRED pe test_hashmap (promote changed 52
+# functions in the default build ...)".
+# If COST fails, promote goes back for every function (iro_promote_here
+# returns true) until ssa covers what it finds.

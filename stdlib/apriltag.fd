@@ -1,0 +1,959 @@
+// Fides AprilTag detection (robotics / perception)
+//
+// Detection of AprilTag tag36h11 markers (the family ROS, OpenCV and most
+// robots use), on stdlib/vision:
+//   - the tag36h11 family: all 587 codes and the bit layout (bit i at cell
+//     (bit_x[i], bit_y[i]) of the 8x8 grid inside the white border, most
+//     significant bit first), copied from AprilTag 3's tag36h11.c (see the
+//     notice below); a code turned by 90 degrees through that layout;
+//   - rendering a tag (10 x 10 cells: white border, black border, 6 x 6
+//     data) into an image through any homography, with 4x4 supersampling,
+//     to build test scenes; the homography of a tag at a known pose;
+//   - detection: Otsu threshold, dark connected components, the outer
+//     boundary of each (flood fill of the outside within its bounding box),
+//     sub-pixel boundary points (interpolated threshold crossings), four
+//     corners from extreme points, refined by total-least-squares lines
+//     through each side, the homography from the tag square [-1, 1]^2 to
+//     the corners (vision's DLT), cell sampling (bilinear), a threshold
+//     between the black border and the white quiet zone, a check of the
+//     black border, and the 6 x 6 data bits in all four rotations matched
+//     to the code table by Hamming distance;
+//   - pose from the homography with a known tag size and camera (corners
+//     undistorted first): H in normalized coordinates ~ [s r1, s r2, t],
+//     scale from the first two columns, r1 and r2 made orthonormal
+//     symmetrically, r3 = r1 x r2; the tag frame has x right, y down and
+//     z into the tag, as in AprilTag.
+// Corners are reported in the tag's own order (AprilTag's): the corners at
+// tag coordinates (-1,-1), (1,-1), (1,1), (-1,1).
+// Not done: the decimation, adaptive thresholding and gradient-based
+// clustering of the full AprilTag 3 detector, so this needs fair contrast
+// and tags apart from each other. No platform seam: images come from
+// stdlib/vision.
+//
+// The tag36h11 code table and bit layout are from AprilTag
+// (https://github.com/AprilRobotics/apriltag, tag36h11.c):
+//   Copyright (C) 2013-2016, The Regents of The University of Michigan.
+//   All rights reserved. This software was developed in the APRIL Robotics
+//   Lab under the direction of Edwin Olson, ebolson@umich.edu.
+//   Redistribution and use in source and binary forms, with or without
+//   modification, are permitted provided that the following conditions are
+//   met: 1. Redistributions of source code must retain the above copyright
+//   notice, this list of conditions and the following disclaimer.
+//   2. Redistributions in binary form must reproduce the above copyright
+//   notice, this list of conditions and the following disclaimer in the
+//   documentation and/or other materials provided with the distribution.
+//   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+//   IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+//   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+//   PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+//   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+//   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+//   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+//   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+//   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+//   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+//   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Usage:
+//   use apriltag;
+//   val dets: Vec<AtagDetection> = atag_detect(&gray, 2);
+//   val pose: AtagPose = atag_pose(&dets.get(0), &camera, 0.16);
+
+module apriltag;
+use math;
+use quat;
+use vision;
+
+// ─── The tag36h11 family ───
+
+var atag_table: Vec<i64> = Vec::new();
+
+/// The 587 codes of tag36h11 (36 bits each), id = index.
+pub fn atag36h11_codes() -> Vec<i64> {
+    if atag_table.len() == 587 {
+        return atag_table;
+    }
+    var t: Vec<i64> = Vec::new();
+    t.push(0xd7e00984b); t.push(0xdda664ca7); t.push(0xdc4a1c821); t.push(0xe17b470e9);
+    t.push(0xef91d01b1); t.push(0xf429cdd73); t.push(0x05da29225); t.push(0x1106cba43);
+    t.push(0x223bed79d); t.push(0x21f51213c); t.push(0x33eb19ca6); t.push(0x3f76eb0f8);
+    t.push(0x469a97414); t.push(0x45dcfe0b0); t.push(0x4a6465f72); t.push(0x51801db96);
+    t.push(0x5eb946b4e); t.push(0x68a7cc2ec); t.push(0x6f0ba2652); t.push(0x78765559d);
+    t.push(0x87b83d129); t.push(0x86cc4a5c5); t.push(0x8b64df90f); t.push(0x9c577b611);
+    t.push(0xa3810f2f5); t.push(0xaf4d75b83); t.push(0xb59a03fef); t.push(0xbb1096f85);
+    t.push(0xd1b92fc76); t.push(0xd0dd509d2); t.push(0xe2cfda160); t.push(0x2ff497c63);
+    t.push(0x47240671b); t.push(0x5047a2e55); t.push(0x635ca87c7); t.push(0x691254166);
+    t.push(0x68f43d94a); t.push(0x6ef24bdb6); t.push(0x8cdd8f886); t.push(0x9de96b718);
+    t.push(0xaff6e5a8a); t.push(0xbae46f029); t.push(0xd225b6d59); t.push(0xdf8ba8c01);
+    t.push(0xe3744a22f); t.push(0xfbb59375d); t.push(0x18a916828); t.push(0x22f29c1ba);
+    t.push(0x286887d58); t.push(0x41392322e); t.push(0x75d18ecd1); t.push(0x87c302743);
+    t.push(0x8c6317ba9); t.push(0x9e40f36d7); t.push(0xc0e5a806a); t.push(0xcc78cb87c);
+    t.push(0x12d2f2d01); t.push(0x379f36a21); t.push(0x6973f59ac); t.push(0x7789ea9f4);
+    t.push(0x8f1c73e84); t.push(0x8dd287a20); t.push(0x94a4eee4c); t.push(0xa455379b5);
+    t.push(0xa9e92987d); t.push(0xbd25cb40b); t.push(0xbe98d3582); t.push(0xd3d5972b2);
+    t.push(0x14c53d7c7); t.push(0x4f1796936); t.push(0x4e71fed1a); t.push(0x66d46fae0);
+    t.push(0xa55abb933); t.push(0xebee1acca); t.push(0x1ad4ba6a4); t.push(0x305b17571);
+    t.push(0x553611351); t.push(0x59ca62775); t.push(0x7819cb6a1); t.push(0xedb7bc9eb);
+    t.push(0x5b2694212); t.push(0x72e12d185); t.push(0xed6152e2c); t.push(0x5bcdadbf3);
+    t.push(0x78e0aa0c6); t.push(0xc60a0b909); t.push(0xef9a34b0d); t.push(0x398a6621a);
+    t.push(0xa8a27c944); t.push(0x4b564304e); t.push(0x52902b4e2); t.push(0x857280b56);
+    t.push(0xa91b2c84b); t.push(0xe91df939b); t.push(0x1fa405f28); t.push(0x23793ab86);
+    t.push(0x68c17729f); t.push(0x9fbf3b840); t.push(0x36922413c); t.push(0x4eb5f946e);
+    t.push(0x533fe2404); t.push(0x63de7d35e); t.push(0x925eddc72); t.push(0x99b8b3896);
+    t.push(0xaace4c708); t.push(0xc22994af0); t.push(0x8f1eae41b); t.push(0xd95fb486c);
+    t.push(0x13fb77857); t.push(0x4fe0983a3); t.push(0xd559bf8a9); t.push(0xe1855d78d);
+    t.push(0xfec8daaad); t.push(0x71ecb6d95); t.push(0xdc9e50e4c); t.push(0xca3a4c259);
+    t.push(0x740d12bbf); t.push(0xaeedd18e0); t.push(0xb509b9c8e); t.push(0x5232fea1c);
+    t.push(0x19282d18b); t.push(0x76c22d67b); t.push(0x936beb34b); t.push(0x08a5ea8dd);
+    t.push(0x679eadc28); t.push(0xa08e119c5); t.push(0x20a6e3e24); t.push(0x7eab9c239);
+    t.push(0x96632c32e); t.push(0x470d06e44); t.push(0x8a70212fb); t.push(0x0a7e4251b);
+    t.push(0x9ec762cc0); t.push(0xd8a3a1f48); t.push(0xdb680f346); t.push(0x4a1e93a9d);
+    t.push(0x638ddc04f); t.push(0x4c2fcc993); t.push(0x01ef28c95); t.push(0xbf0d9792d);
+    t.push(0x6d27557c3); t.push(0x623f977f4); t.push(0x35b43be57); t.push(0xbb0c428d5);
+    t.push(0xa6f01474d); t.push(0x5a70c9749); t.push(0x20ddabc3b); t.push(0x2eabd78cf);
+    t.push(0x90aa18f88); t.push(0xa9ea89350); t.push(0x3cdb39b22); t.push(0x839a08f34);
+    t.push(0x169bb814e); t.push(0x1a575ab08); t.push(0xa04d3d5a2); t.push(0xbf7902f2b);
+    t.push(0x095a5e65c); t.push(0x92e8fce94); t.push(0x67ef48d12); t.push(0x6400dbcac);
+    t.push(0xb12d8fb9f); t.push(0x0347f45d3); t.push(0xb35826f56); t.push(0xc546ac6e4);
+    t.push(0x81cc35b66); t.push(0x41d14bd57); t.push(0x0c052b168); t.push(0x7d6ce5018);
+    t.push(0xab4ed5ede); t.push(0x5af817119); t.push(0xd1454b182); t.push(0x2badb090b);
+    t.push(0x03fcb4c0c); t.push(0x2f1c28fd8); t.push(0x93608c6f7); t.push(0x4c93ba2b5);
+    t.push(0x07d950a5d); t.push(0xe54b3d3fc); t.push(0x15560cf9d); t.push(0x189e4958a);
+    t.push(0x62140e9d2); t.push(0x723bc1cdb); t.push(0x2063f26fa); t.push(0xfa08ab19f);
+    t.push(0x7955641db); t.push(0x646b01daa); t.push(0x71cd427cc); t.push(0x09a42f7d4);
+    t.push(0x717edc643); t.push(0x15eb94367); t.push(0x8392e6bb2); t.push(0x832408542);
+    t.push(0x2b9b874be); t.push(0xb21f4730d); t.push(0xb5d8f24c9); t.push(0x7dbaf6931);
+    t.push(0x1b4e33629); t.push(0x13452e710); t.push(0xe974af612); t.push(0x1df61d29a);
+    t.push(0x99f2532ad); t.push(0xe50ec71b4); t.push(0x5df0a36e8); t.push(0x4934e4cea);
+    t.push(0xe34a0b4bd); t.push(0xb7b26b588); t.push(0x0f255118d); t.push(0xd0c8fa31e);
+    t.push(0x06a50c94f); t.push(0xf28aa9f06); t.push(0x131d194d8); t.push(0x622e3da79);
+    t.push(0xac7478303); t.push(0xc8f2521d7); t.push(0x6c9c881f5); t.push(0x49e38b60a);
+    t.push(0x513d8df65); t.push(0xd7c2b0785); t.push(0x9f6f9d75a); t.push(0x9f6966020);
+    t.push(0x1e1a54e33); t.push(0xc04d63419); t.push(0x946e04cd7); t.push(0x1bdac5902);
+    t.push(0x56469b830); t.push(0xffad59569); t.push(0x86970e7d8); t.push(0x8a4b41e12);
+    t.push(0xad4688e3b); t.push(0x85f8f5df4); t.push(0xd833a0893); t.push(0x2a36fdd7c);
+    t.push(0xd6a857cf2); t.push(0x8829bc35c); t.push(0x5e50d79bc); t.push(0xfbb8035e4);
+    t.push(0xc1a95bebf); t.push(0x036b0baf8); t.push(0xe0da964ea); t.push(0xb6483689b);
+    t.push(0x7c8e2f4c1); t.push(0x5b856a23b); t.push(0x2fc183995); t.push(0xe914b6d70);
+    t.push(0xb31041969); t.push(0x1bb478493); t.push(0x063e2b456); t.push(0xf2a082b9c);
+    t.push(0x8e5e646ea); t.push(0x08172f8f6); t.push(0x0dacd923e); t.push(0xe5dcf0e2e);
+    t.push(0xbf9446bae); t.push(0x4822d50d1); t.push(0x26e710bf5); t.push(0xb90ba2a24);
+    t.push(0xf3b25aa73); t.push(0x809ad589b); t.push(0x94cc1e254); t.push(0x5334a3adb);
+    t.push(0x592886b2f); t.push(0xbf64704aa); t.push(0x566dbf24c); t.push(0x72203e692);
+    t.push(0x64e61e809); t.push(0xd7259aad6); t.push(0x7b924aedc); t.push(0x2df2184e8);
+    t.push(0x353d1eca7); t.push(0xfce30d7ce); t.push(0xf7b0f436e); t.push(0x57e8d8f68);
+    t.push(0x8c79e60db); t.push(0x9c8362b2b); t.push(0x63a5804f2); t.push(0x9298353dc);
+    t.push(0x6f98a71c8); t.push(0xa5731f693); t.push(0x21ca5c870); t.push(0x1c2107fd3);
+    t.push(0x6181f6c39); t.push(0x19e574304); t.push(0x329937606); t.push(0x043d5c70d);
+    t.push(0x9b18ff162); t.push(0x8e2ccfebf); t.push(0x72b7b9b54); t.push(0x9b71f4f3c);
+    t.push(0x935d7393e); t.push(0x65938881a); t.push(0x6a5bd6f2d); t.push(0xa19783306);
+    t.push(0xe6472f4d7); t.push(0x81163df5a); t.push(0xa838e1cbd); t.push(0x982748477);
+    t.push(0x050c54feb); t.push(0x0d82fbb58); t.push(0x2c4c72799); t.push(0x97d259ad6);
+    t.push(0x22d9a43ed); t.push(0xfdb162a9f); t.push(0x0cb4a727d); t.push(0x4fae2e371);
+    t.push(0x535b5be8b); t.push(0x48795908a); t.push(0xce7c18962); t.push(0x4ea154d80);
+    t.push(0x50c064889); t.push(0x8d97fc75d); t.push(0xc8bd9ec61); t.push(0x83ee8e8bb);
+    t.push(0xc8431419a); t.push(0x1aa78079d); t.push(0x8111aa4a5); t.push(0xdfa3a69fe);
+    t.push(0x51630d83f); t.push(0x2d930fb3f); t.push(0x2133116e5); t.push(0xae5395522);
+    t.push(0xbc07a4e8a); t.push(0x57bf08ba0); t.push(0x6cb18036a); t.push(0xf0e2e4b75);
+    t.push(0x3eb692b6f); t.push(0xd8178a3fa); t.push(0x238cce6a6); t.push(0xe97d5cdd7);
+    t.push(0xfe10d8d5e); t.push(0xb39584a1d); t.push(0xca03536fd); t.push(0xaa61f3998);
+    t.push(0x72ff23ec2); t.push(0x15aa7d770); t.push(0x57a3a1282); t.push(0xd1f3902dc);
+    t.push(0x6554c9388); t.push(0xfd01283c7); t.push(0xe8baa42c5); t.push(0x72cee6adf);
+    t.push(0xf6614b3fa); t.push(0x95c3778a2); t.push(0x7da4cea7a); t.push(0xd18a5912c);
+    t.push(0xd116426e5); t.push(0x27c17bc1c); t.push(0xb95b53bc1); t.push(0xc8f937a05);
+    t.push(0xed220c9bd); t.push(0x0c97d72ab); t.push(0x8fb1217ae); t.push(0x25ca8a5a1);
+    t.push(0xb261b871b); t.push(0x1bef0a056); t.push(0x806a51179); t.push(0xeed249145);
+    t.push(0x3f82aeceb); t.push(0xcc56e9acf); t.push(0x2e78d01eb); t.push(0x102cee17f);
+    t.push(0x37caad3d5); t.push(0x16ac5b1ee); t.push(0x2af164ece); t.push(0xd4cd81dc9);
+    t.push(0x12263a7e7); t.push(0x57ac7d117); t.push(0x9391d9740); t.push(0x7aedaa77f);
+    t.push(0x9675a3c72); t.push(0x277f25191); t.push(0xebb6e64b9); t.push(0x7ad3ef747);
+    t.push(0x12759b181); t.push(0x948257d4d); t.push(0xb63a850f6); t.push(0x3a52a8f75);
+    t.push(0x4a019532c); t.push(0xa021a7529); t.push(0xcc661876d); t.push(0x4085afd05);
+    t.push(0xe7048e089); t.push(0x3f979cdc6); t.push(0xd9da9071b); t.push(0xed2fc5b68);
+    t.push(0x79d64c3a1); t.push(0xfd44e2361); t.push(0x8eea46a74); t.push(0x42233b9c2);
+    t.push(0xae4d1765d); t.push(0x7303a094c); t.push(0x2d7033abe); t.push(0x3dcc2b0b4);
+    t.push(0x0f0967d09); t.push(0x06f0cd7de); t.push(0x09807aca0); t.push(0x3a295cad3);
+    t.push(0x2b106b202); t.push(0x3f38a828e); t.push(0x78af46596); t.push(0xbda2dc713);
+    t.push(0x9a8c8c9d9); t.push(0x6a0f2ddce); t.push(0xa76af6fe2); t.push(0x086f66fa4);
+    t.push(0xd52d63f8d); t.push(0x89f7a6e73); t.push(0xcc6b23362); t.push(0xb4ebf3c39);
+    t.push(0x564f300fa); t.push(0xe8de3a706); t.push(0x79a033b61); t.push(0x765e160c5);
+    t.push(0xa266a4f85); t.push(0xa68c38c24); t.push(0xdca0711fb); t.push(0x85fba85ba);
+    t.push(0x37a207b46); t.push(0x158fcc4d0); t.push(0x0569d79b3); t.push(0x7b1a25555);
+    t.push(0xa8ae22468); t.push(0x7c592bdfd); t.push(0x0c59a5f66); t.push(0xb1115daa3);
+    t.push(0xf17c87177); t.push(0x6769d766b); t.push(0x2b637356d); t.push(0x13d8685ac);
+    t.push(0xf24cb6ec0); t.push(0x0bd0b56d1); t.push(0x42ff0e26d); t.push(0xb41609267);
+    t.push(0x96f9518af); t.push(0xc56f96636); t.push(0x4a8e10349); t.push(0x863512171);
+    t.push(0xea455d86c); t.push(0xbd0e25279); t.push(0xe65e3f761); t.push(0x36c84a922);
+    t.push(0x85fd1b38f); t.push(0x657c91539); t.push(0x15033fe04); t.push(0x09051c921);
+    t.push(0xab27d80d8); t.push(0xf92f7d0a1); t.push(0x8eb6bb737); t.push(0x10b5b0f63);
+    t.push(0x6c9c7ad63); t.push(0xf66fe70ae); t.push(0xca579bd92); t.push(0x956198e4d);
+    t.push(0x29e4405e5); t.push(0xe44eb885c); t.push(0x41612456c); t.push(0xea45e0abf);
+    t.push(0xd326529bd); t.push(0x7b2c33cef); t.push(0x80bc9b558); t.push(0x7169b9740);
+    t.push(0xc37f99209); t.push(0x31ff6dab9); t.push(0xc795190ed); t.push(0xa7636e95f);
+    t.push(0x9df075841); t.push(0x55a083932); t.push(0xa7cbdf630); t.push(0x409ea4ef0);
+    t.push(0x92a1991b6); t.push(0x4b078dee9); t.push(0xae18ce9e4); t.push(0x5a6e1ef35);
+    t.push(0x1a403bd59); t.push(0x31ea70a83); t.push(0x2bc3c4f3a); t.push(0x5c921b3cb);
+    t.push(0x042da05c5); t.push(0x1f667d16b); t.push(0x416a368cf); t.push(0xfbc0a7a3b);
+    t.push(0x9419f0c7c); t.push(0x81be2fa03); t.push(0x34e2c172f); t.push(0x28648d8ae);
+    t.push(0xc7acbb885); t.push(0x45f31eb6a); t.push(0xd1cfc0a7b); t.push(0x42c4d260d);
+    t.push(0xcf6584097); t.push(0x94b132b14); t.push(0x3c5c5df75); t.push(0x8ae596fef);
+    t.push(0xaea8054eb); t.push(0x0ae9cc573); t.push(0x496fb731b); t.push(0xebf105662);
+    t.push(0xaf9c83a37); t.push(0xc0d64cd6b); t.push(0x7b608159a); t.push(0xe74431642);
+    t.push(0xd6fb9d900); t.push(0x291e99de0); t.push(0x10500ba9a); t.push(0x5cd05d037);
+    t.push(0xa87254fb2); t.push(0x9d7824a37); t.push(0x8b2c7b47c); t.push(0x30c788145);
+    t.push(0x2f4e5a8be); t.push(0xbadb884da); t.push(0x026e0d5c9); t.push(0x6fdbaa32e);
+    t.push(0x34758eb31); t.push(0x565cd1b4f); t.push(0x2bfd90fb0); t.push(0x093052a6b);
+    t.push(0xd3c13c4b9); t.push(0x2daea43bf); t.push(0xa279762bc); t.push(0xf1bd9f22c);
+    t.push(0x4b7fec94f); t.push(0x545761d5a); t.push(0x7327df411); t.push(0x1b52a442e);
+    t.push(0x49b0ce108); t.push(0x24c764bc8); t.push(0x374563045); t.push(0xa3e8f91c6);
+    t.push(0x0e6bd2241); t.push(0xe0e52ee3c); t.push(0x07e8e3caa); t.push(0x96c2b7372);
+    t.push(0x33acbdfda); t.push(0xb15d91e54); t.push(0x464759ac1); t.push(0x6886a1998);
+    t.push(0x57f5d3958); t.push(0x5a1f5c1f5); t.push(0x0b58158ad); t.push(0xe712053fb);
+    t.push(0x5352ddb25); t.push(0x414b98ea0); t.push(0x74f89f546); t.push(0x38a56b3c3);
+    t.push(0x38db0dc17); t.push(0xaa016a755); t.push(0xdc72366f5); t.push(0x0cee93d75);
+    t.push(0xb2fe7a56b); t.push(0xa847ed390); t.push(0x8713ef88c); t.push(0xa217cc861);
+    t.push(0x8bca25d7b); t.push(0x455526818); t.push(0xea3a7a180); t.push(0xa9536e5e0);
+    t.push(0x9b64a1975); t.push(0x5bfc756bc); t.push(0x046aa169b); t.push(0x53a17f76f);
+    t.push(0x4d6815274); t.push(0xcca9cf3f6); t.push(0x4013fcb8b); t.push(0x3d26cdfa5);
+    t.push(0x5786231f7); t.push(0x7d4ab09ab); t.push(0x960b5ffbc); t.push(0x8914df0d4);
+    t.push(0x2fc6f2213); t.push(0xac235637e); t.push(0x151b28ed3); t.push(0x46f79b6db);
+    t.push(0x1382e0c9f); t.push(0x53abf983a); t.push(0x383c47ade); t.push(0x3fcf88978);
+    t.push(0xeb9079df7); t.push(0x09af0714d); t.push(0xda19d1bb7); t.push(0x9a02749f8);
+    t.push(0x1c62dab9b); t.push(0x1a137e44b); t.push(0x2867718c7); t.push(0x35815525b);
+    t.push(0x7cd35c550); t.push(0x2164f73a0); t.push(0xe8b772fe0);
+    atag_table = t;
+    return t;
+}
+
+/// Cell x of bit i (0 = most significant) in the 8x8 grid.
+pub fn atag36h11_bit_x() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(1); v.push(2); v.push(3); v.push(4); v.push(5); v.push(2); v.push(3); v.push(4); v.push(3);
+    v.push(6); v.push(6); v.push(6); v.push(6); v.push(6); v.push(5); v.push(5); v.push(5); v.push(4);
+    v.push(6); v.push(5); v.push(4); v.push(3); v.push(2); v.push(5); v.push(4); v.push(3); v.push(4);
+    v.push(1); v.push(1); v.push(1); v.push(1); v.push(1); v.push(2); v.push(2); v.push(2); v.push(3);
+    return v;
+}
+
+/// Cell y of bit i in the 8x8 grid.
+pub fn atag36h11_bit_y() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(1); v.push(1); v.push(1); v.push(1); v.push(1); v.push(2); v.push(2); v.push(2); v.push(3);
+    v.push(1); v.push(2); v.push(3); v.push(4); v.push(5); v.push(2); v.push(3); v.push(4); v.push(3);
+    v.push(6); v.push(6); v.push(6); v.push(6); v.push(6); v.push(5); v.push(5); v.push(5); v.push(4);
+    v.push(6); v.push(5); v.push(4); v.push(3); v.push(2); v.push(5); v.push(4); v.push(3); v.push(4);
+    return v;
+}
+
+/// Bits that differ between two 36-bit codes.
+pub fn atag_hamming(a: i64, b: i64) -> i64 {
+    var x: i64 = (a ^ b) & 68719476735;
+    var n: i64 = 0;
+    while x != 0 {
+        x = x & (x - 1);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// The code of the tag turned 90 degrees (cell (x, y) -> (7 - y, x)).
+pub fn atag_rotate_code(code: i64) -> i64 {
+    val bx: Vec<i64> = atag36h11_bit_x();
+    val by: Vec<i64> = atag36h11_bit_y();
+    var out: i64 = 0;
+    var i: i64 = 0;
+    while i < 36 {
+        if ((code >> (35 - i)) & 1) == 1 {
+            val nx: i64 = 7 - by.get(i);
+            val ny: i64 = bx.get(i);
+            var j: i64 = 0;
+            while j < 36 {
+                if bx.get(j) == nx && by.get(j) == ny {
+                    out = out | (1 << (35 - j));
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The table entry nearest to a code: [id, hamming distance].
+pub fn atag_lookup(code: i64) -> Vec<i64> {
+    val t: Vec<i64> = atag36h11_codes();
+    var best: i64 = - 1;
+    var bd: i64 = 99;
+    var i: i64 = 0;
+    while i < t.len() {
+        val d: i64 = atag_hamming(code, t.get(i));
+        if d < bd {
+            bd = d;
+            best = i;
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(best);
+    out.push(bd);
+    return out;
+}
+
+/// The color (0 black, 255 white) of cell (cx, cy), 0..9, of tag `id`
+/// (10 x 10 cells including the white border).
+pub fn atag_cell(id: i64, cx: i64, cy: i64) -> i64 {
+    if cx <= 0 || cy <= 0 || cx >= 9 || cy >= 9 {
+        return 255;
+    }
+    if cx == 1 || cy == 1 || cx == 8 || cy == 8 {
+        return 0;
+    }
+    val code: i64 = atag36h11_codes().get(id);
+    val bx: Vec<i64> = atag36h11_bit_x();
+    val by: Vec<i64> = atag36h11_bit_y();
+    var i: i64 = 0;
+    while i < 36 {
+        if bx.get(i) + 1 == cx && by.get(i) + 1 == cy {
+            if ((code >> (35 - i)) & 1) == 1 {
+                return 255;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// All 100 cells of tag `id`, row by row (0 black, 255 white).
+pub fn atag_cells(id: i64) -> Vec<i64> {
+    var cells: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 100 {
+        val x: i64 = i % 10;
+        val y: i64 = i / 10;
+        if x == 0 || y == 0 || x == 9 || y == 9 {
+            cells.push(255);
+        } else {
+            cells.push(0);
+        }
+        i = i + 1;
+    }
+    val code: i64 = atag36h11_codes().get(id);
+    val bx: Vec<i64> = atag36h11_bit_x();
+    val by: Vec<i64> = atag36h11_bit_y();
+    i = 0;
+    while i < 36 {
+        if ((code >> (35 - i)) & 1) == 1 {
+            cells.set((by.get(i) + 1) * 10 + bx.get(i) + 1, 255);
+        }
+        i = i + 1;
+    }
+    return cells;
+}
+
+/// The 10 x 10 cell picture of a tag as text rows ('#' black, '.' white).
+pub fn atag_ascii(id: i64) -> Vec<str> {
+    val cells: Vec<i64> = atag_cells(id);
+    var rows: Vec<str> = Vec::new();
+    var y: i64 = 0;
+    while y < 10 {
+        var s: str = "";
+        var x: i64 = 0;
+        while x < 10 {
+            if cells.get(y * 10 + x) == 0 {
+                s = s + "#";
+            } else {
+                s = s + ".";
+            }
+            x = x + 1;
+        }
+        rows.push(s);
+        y = y + 1;
+    }
+    return rows;
+}
+
+/// Draw tag `id` into an image: `h` maps tag coordinates (the black square
+/// is [-1, 1]^2, the white border reaches +-1.25) to pixels. Each pixel
+/// averages 4x4 samples; pixels outside the tag are left alone.
+pub fn atag_render(img: & mut GrayImg, id: i64, h: & Vec<f64>) {
+    val hinv: Vec<f64> = vis_mat3_inverse(h);
+    if hinv.len() == 0 {
+        return;
+    }
+    val cells: Vec<i64> = atag_cells(id);
+    // the pixels the tag can cover: the bounding box of its corners
+    var x0: f64 = 1.0e9;
+    var y0: f64 = 1.0e9;
+    var x1: f64 = - 1.0e9;
+    var y1: f64 = - 1.0e9;
+    var k: i64 = 0;
+    while k < 4 {
+        var u: f64 = - 1.25;
+        var v: f64 = - 1.25;
+        if k == 1 || k == 2 {
+            u = 1.25;
+        }
+        if k >= 2 {
+            v = 1.25;
+        }
+        val p: vec2 = vis_hom_apply(h, u, v);
+        x0 = rmath_min(x0, p.x);
+        y0 = rmath_min(y0, p.y);
+        x1 = rmath_max(x1, p.x);
+        y1 = rmath_max(y1, p.y);
+        k = k + 1;
+    }
+    var py: i64 = rmath_max(0.0, math_floor(y0) - 1.0) as i64;
+    val pye: i64 = rmath_min((img.h - 1) as f64, math_ceil(y1) + 1.0) as i64;
+    val pxs: i64 = rmath_max(0.0, math_floor(x0) - 1.0) as i64;
+    val pxe: i64 = rmath_min((img.w - 1) as f64, math_ceil(x1) + 1.0) as i64;
+    while py <= pye {
+        var px: i64 = pxs;
+        while px <= pxe {
+            var sum: i64 = 0;
+            var inside: i64 = 0;
+            var sy: i64 = 0;
+            while sy < 4 {
+                var sx: i64 = 0;
+                while sx < 4 {
+                    val q: vec2 = vis_hom_apply(&hinv, (px as f64) - 0.375 + 0.25 * (sx as f64), (py as f64) - 0.375 + 0.25 * (sy as f64));
+                    val cx: f64 = math_floor((q.x + 1.25) / 0.25);
+                    val cy: f64 = math_floor((q.y + 1.25) / 0.25);
+                    if cx >= 0.0 && cy >= 0.0 && cx < 10.0 && cy < 10.0 {
+                        inside = inside + 1;
+                        sum = sum + cells.get((cy as i64) * 10 + (cx as i64));
+                    } else {
+                        sum = sum + vis_get(img, px, py);
+                    }
+                    sx = sx + 1;
+                }
+                sy = sy + 1;
+            }
+            if inside > 0 {
+                vis_set(img, px, py, (sum + 8) / 16);
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+/// The homography of a tag of side `size` (metres, black square) at pose
+/// (r = rotation tag -> camera, t = tag centre in the camera frame) seen by
+/// a pinhole camera (distortion ignored).
+pub fn atag_pose_homography(cam: & Camera, r: Mat3, t: vec3, size: f64) -> Vec<f64> {
+    val s: f64 = size / 2.0;
+    var h: Vec<f64> = Vec::new();
+    // K [s r1, s r2, t]
+    val c1: vec3 = vec3(r.m00 * s, r.m10 * s, r.m20 * s);
+    val c2: vec3 = vec3(r.m01 * s, r.m11 * s, r.m21 * s);
+    h.push(cam.fx * c1.x + cam.cx * c1.z);
+    h.push(cam.fx * c2.x + cam.cx * c2.z);
+    h.push(cam.fx * t.x + cam.cx * t.z);
+    h.push(cam.fy * c1.y + cam.cy * c1.z);
+    h.push(cam.fy * c2.y + cam.cy * c2.z);
+    h.push(cam.fy * t.y + cam.cy * t.z);
+    h.push(c1.z);
+    h.push(c2.z);
+    h.push(t.z);
+    return h;
+}
+
+// ─── Detection ───
+
+pub struct AtagDetection {
+    pub id: i64,
+    pub hamming: i64,
+    // quarter turns between the tag as found and its canonical orientation
+    pub rotation: i64,
+    // corners in the tag's order: (-1,-1), (1,-1), (1,1), (-1,1)
+    pub cx: Vec<f64>,
+    pub cy: Vec<f64>,
+    pub center: vec2,
+    // tag coordinates -> pixels
+    pub h: Vec<f64>,
+    // white - black contrast found when decoding
+    pub contrast: f64,
+}
+
+pub struct AtagPose {
+    pub r: Mat3,
+    pub t: vec3,
+    pub q: quat,
+}
+
+fn atag_unit_x() -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    v.push(- 1.0); v.push(1.0); v.push(1.0); v.push(- 1.0);
+    return v;
+}
+
+fn atag_unit_y() -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    v.push(- 1.0); v.push(- 1.0); v.push(1.0); v.push(1.0);
+    return v;
+}
+
+// A line through points by total least squares: [nx, ny, c] with
+// nx x + ny y = c and (nx, ny) a unit normal; empty with fewer than 2.
+fn atag_fit_line(xs: & Vec<f64>, ys: & Vec<f64>) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    val n: i64 = xs.len();
+    if n < 2 {
+        return out;
+    }
+    var mx: f64 = 0.0;
+    var my: f64 = 0.0;
+    var i: i64 = 0;
+    while i < n {
+        mx = mx + xs.get(i);
+        my = my + ys.get(i);
+        i = i + 1;
+    }
+    mx = mx / (n as f64);
+    my = my / (n as f64);
+    var sxx: f64 = 0.0;
+    var sxy: f64 = 0.0;
+    var syy: f64 = 0.0;
+    i = 0;
+    while i < n {
+        val dx: f64 = xs.get(i) - mx;
+        val dy: f64 = ys.get(i) - my;
+        sxx = sxx + dx * dx;
+        sxy = sxy + dx * dy;
+        syy = syy + dy * dy;
+        i = i + 1;
+    }
+    // direction of largest spread: angle 0.5 atan2(2 sxy, sxx - syy)
+    val a: f64 = 0.5 * rmath_atan2(2.0 * sxy, sxx - syy);
+    val nx: f64 = 0.0 - math_sin(a);
+    val ny: f64 = math_cos(a);
+    out.push(nx);
+    out.push(ny);
+    out.push(nx * mx + ny * my);
+    return out;
+}
+
+// Intersection of two lines [nx, ny, c]; empty when parallel.
+fn atag_intersect(a: & Vec<f64>, b: & Vec<f64>) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    val det: f64 = a.get(0) * b.get(1) - a.get(1) * b.get(0);
+    if math_fabs(det) < 0.000000001 {
+        return out;
+    }
+    out.push((a.get(2) * b.get(1) - a.get(1) * b.get(2)) / det);
+    out.push((a.get(0) * b.get(2) - a.get(2) * b.get(0)) / det);
+    return out;
+}
+
+// Distance from (x, y) to the line through (ax, ay), (bx, by), signed.
+fn atag_side(ax: f64, ay: f64, bx: f64, by: f64, x: f64, y: f64) -> f64 {
+    val dx: f64 = bx - ax;
+    val dy: f64 = by - ay;
+    val l: f64 = math_sqrt(dx * dx + dy * dy);
+    if l == 0.0 {
+        return 0.0;
+    }
+    return (dx * (y - ay) - dy * (x - ax)) / l;
+}
+
+// Sample the cell at grid position (gx, gy) of the 8x8 grid (fractional
+// positions allowed; -1 and 8 are the white quiet zone).
+fn atag_sample(f: & FImg, h: & Vec<f64>, gx: f64, gy: f64) -> f64 {
+    val p: vec2 = vis_hom_apply(h, (gx + 0.5) / 4.0 - 1.0, (gy + 0.5) / 4.0 - 1.0);
+    return vis_bilinear(f, p.x, p.y);
+}
+
+/// Find the tag36h11 tags in a gray image, accepting codes at most
+/// `max_hamming` bits from a table entry.
+pub fn atag_detect(g: & GrayImg, max_hamming: i64) -> Vec<AtagDetection> {
+    var out: Vec<AtagDetection> = Vec::new();
+    val f: FImg = vis_to_float(g);
+    val thr: i64 = vis_otsu(g);
+    val thf: f64 = (thr as f64) + 0.5;
+    // dark pixels
+    var dark: GrayImg = vis_gray_new(g.w, g.h, 0);
+    var i: i64 = 0;
+    while i < g.data.len() {
+        if g.data.get(i) <= thr {
+            dark.data.set(i, 255);
+        }
+        i = i + 1;
+    }
+    val comps: Components = vis_components(&dark, false);
+    var c: i64 = 0;
+    while c < comps.count {
+        val bx0: i64 = comps.min_x.get(c);
+        val by0: i64 = comps.min_y.get(c);
+        val bx1: i64 = comps.max_x.get(c);
+        val by1: i64 = comps.max_y.get(c);
+        val big: bool = comps.area.get(c) >= 24 && bx1 - bx0 >= 7 && by1 - by0 >= 7;
+        val inner: bool = bx0 > 0 && by0 > 0 && bx1 < g.w - 1 && by1 < g.h - 1;
+        if big && inner {
+            val det: AtagDetection = atag_try_component(g, &f, &comps, c + 1, thf, max_hamming);
+            if det.id >= 0 {
+                out.push(det);
+            }
+        }
+        c = c + 1;
+    }
+    return out;
+}
+
+fn atag_none() -> AtagDetection {
+    return AtagDetection { id: - 1, hamming: 99, rotation: 0, cx: Vec::new(), cy: Vec::new(), center: vec2(0.0, 0.0), h: Vec::new(), contrast: 0.0 };
+}
+
+fn atag_try_component(g: & GrayImg, f: & FImg, comps: & Components, label: i64, thf: f64, max_hamming: i64) -> AtagDetection {
+    val w: i64 = g.w;
+    // the outside of the component within its bounding box grown by 1
+    val x0: i64 = comps.min_x.get(label - 1) - 1;
+    val y0: i64 = comps.min_y.get(label - 1) - 1;
+    val x1: i64 = comps.max_x.get(label - 1) + 1;
+    val y1: i64 = comps.max_y.get(label - 1) + 1;
+    val bw: i64 = x1 - x0 + 1;
+    val bh: i64 = y1 - y0 + 1;
+    var outside: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < bw * bh {
+        outside.push(false);
+        i = i + 1;
+    }
+    var stack: Vec<i64> = Vec::new();
+    i = 0;
+    while i < bw * bh {
+        val lx: i64 = i % bw;
+        val ly: i64 = i / bw;
+        if lx == 0 || ly == 0 || lx == bw - 1 || ly == bh - 1 {
+            outside.set(i, true);
+            stack.push(i);
+        }
+        i = i + 1;
+    }
+    while stack.len() > 0 {
+        val p: i64 = stack.pop();
+        val px: i64 = p % bw;
+        val py: i64 = p / bw;
+        var d: i64 = 0;
+        while d < 4 {
+            var qx: i64 = px;
+            var qy: i64 = py;
+            if d == 0 { qx = px + 1; }
+            if d == 1 { qx = px - 1; }
+            if d == 2 { qy = py + 1; }
+            if d == 3 { qy = py - 1; }
+            if qx >= 0 && qy >= 0 && qx < bw && qy < bh {
+                val q: i64 = qy * bw + qx;
+                if !outside.get(q) && comps.labels.get((qy + y0) * w + qx + x0) != label {
+                    outside.set(q, true);
+                    stack.push(q);
+                }
+            }
+            d = d + 1;
+        }
+    }
+    // sub-pixel points of the outer boundary
+    var ex: Vec<f64> = Vec::new();
+    var ey: Vec<f64> = Vec::new();
+    var y: i64 = y0 + 1;
+    while y < y1 {
+        var x: i64 = x0 + 1;
+        while x < x1 {
+            if comps.labels.get(y * w + x) == label {
+                var d: i64 = 0;
+                while d < 4 {
+                    var dx: i64 = 0;
+                    var dy: i64 = 0;
+                    if d == 0 { dx = 1; }
+                    if d == 1 { dx = - 1; }
+                    if d == 2 { dy = 1; }
+                    if d == 3 { dy = - 1; }
+                    if outside.get((y + dy - y0) * bw + x + dx - x0) {
+                        val vp: f64 = vis_fget(f, x, y);
+                        val vq: f64 = vis_fget(f, x + dx, y + dy);
+                        var t: f64 = 0.5;
+                        if vq - vp > 0.5 {
+                            t = rmath_clamp((thf - vp) / (vq - vp), 0.0, 1.0);
+                        }
+                        ex.push((x as f64) + t * (dx as f64));
+                        ey.push((y as f64) + t * (dy as f64));
+                    }
+                    d = d + 1;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    val n: i64 = ex.len();
+    if n < 16 {
+        return atag_none();
+    }
+    // corners from extreme points
+    var mx: f64 = 0.0;
+    var my: f64 = 0.0;
+    i = 0;
+    while i < n {
+        mx = mx + ex.get(i);
+        my = my + ey.get(i);
+        i = i + 1;
+    }
+    mx = mx / (n as f64);
+    my = my / (n as f64);
+    var a: i64 = 0;
+    var best: f64 = - 1.0;
+    i = 0;
+    while i < n {
+        val d2: f64 = (ex.get(i) - mx) * (ex.get(i) - mx) + (ey.get(i) - my) * (ey.get(i) - my);
+        if d2 > best {
+            best = d2;
+            a = i;
+        }
+        i = i + 1;
+    }
+    var b: i64 = 0;
+    best = - 1.0;
+    i = 0;
+    while i < n {
+        val d2: f64 = (ex.get(i) - ex.get(a)) * (ex.get(i) - ex.get(a)) + (ey.get(i) - ey.get(a)) * (ey.get(i) - ey.get(a));
+        if d2 > best {
+            best = d2;
+            b = i;
+        }
+        i = i + 1;
+    }
+    var cpos: i64 = - 1;
+    var cneg: i64 = - 1;
+    var spos: f64 = 0.0;
+    var sneg: f64 = 0.0;
+    i = 0;
+    while i < n {
+        val s: f64 = atag_side(ex.get(a), ey.get(a), ex.get(b), ey.get(b), ex.get(i), ey.get(i));
+        if s > spos {
+            spos = s;
+            cpos = i;
+        }
+        if s < sneg {
+            sneg = s;
+            cneg = i;
+        }
+        i = i + 1;
+    }
+    if cpos < 0 || cneg < 0 {
+        return atag_none();
+    }
+    // the four corners in order of angle around the centre (clockwise on
+    // screen, y down)
+    var qx: Vec<f64> = Vec::new();
+    var qy: Vec<f64> = Vec::new();
+    var qa: Vec<f64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    idx.push(a); idx.push(cpos); idx.push(b); idx.push(cneg);
+    i = 0;
+    while i < 4 {
+        val px: f64 = ex.get(idx.get(i));
+        val py: f64 = ey.get(idx.get(i));
+        val ang: f64 = rmath_atan2(py - my, px - mx);
+        var at: i64 = qa.len();
+        var k: i64 = 0;
+        while k < qa.len() {
+            if ang < qa.get(k) && at == qa.len() {
+                at = k;
+            }
+            k = k + 1;
+        }
+        qa.insert(at, ang);
+        qx.insert(at, px);
+        qy.insert(at, py);
+        i = i + 1;
+    }
+    // refine: fit a line to the points of each side (away from corners)
+    var lines: Vec<Vec<f64>> = Vec::new();
+    var sidei: i64 = 0;
+    while sidei < 4 {
+        val j: i64 = (sidei + 1) % 4;
+        val ax: f64 = qx.get(sidei);
+        val ay: f64 = qy.get(sidei);
+        val bxx: f64 = qx.get(j);
+        val byy: f64 = qy.get(j);
+        val len: f64 = math_sqrt((bxx - ax) * (bxx - ax) + (byy - ay) * (byy - ay));
+        var lx: Vec<f64> = Vec::new();
+        var ly: Vec<f64> = Vec::new();
+        i = 0;
+        while i < n {
+            val px: f64 = ex.get(i);
+            val py: f64 = ey.get(i);
+            val along: f64 = ((px - ax) * (bxx - ax) + (py - ay) * (byy - ay)) / len;
+            val off: f64 = math_fabs(atag_side(ax, ay, bxx, byy, px, py));
+            if along > 0.15 * len && along < 0.85 * len && off < 2.0 {
+                lx.push(px);
+                ly.push(py);
+            }
+            i = i + 1;
+        }
+        val ln: Vec<f64> = atag_fit_line(&lx, &ly);
+        if ln.len() == 0 {
+            return atag_none();
+        }
+        lines.push(ln);
+        sidei = sidei + 1;
+    }
+    var cx: Vec<f64> = Vec::new();
+    var cy: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 4 {
+        val prev: i64 = (i + 3) % 4;
+        val p: Vec<f64> = atag_intersect(&lines.get(prev), &lines.get(i));
+        if p.len() == 0 {
+            return atag_none();
+        }
+        cx.push(p.get(0));
+        cy.push(p.get(1));
+        i = i + 1;
+    }
+    val ux: Vec<f64> = atag_unit_x();
+    val uy: Vec<f64> = atag_unit_y();
+    val hm: Homography = vis_homography(&ux, &uy, &cx, &cy);
+    if !hm.ok {
+        return atag_none();
+    }
+    // reference levels: black border (cells 0 and 7), white quiet zone
+    // (just outside the black square)
+    var black: f64 = 0.0;
+    var white: f64 = 0.0;
+    var k: i64 = 0;
+    while k < 8 {
+        val kf: f64 = k as f64;
+        black = black + atag_sample(f, &hm.h, kf, 0.0) + atag_sample(f, &hm.h, kf, 7.0) + atag_sample(f, &hm.h, 0.0, kf) + atag_sample(f, &hm.h, 7.0, kf);
+        white = white + atag_sample(f, &hm.h, kf, - 0.5) + atag_sample(f, &hm.h, kf, 7.5) + atag_sample(f, &hm.h, - 0.5, kf) + atag_sample(f, &hm.h, 7.5, kf);
+        k = k + 1;
+    }
+    black = black / 32.0;
+    white = white / 32.0;
+    val contrast: f64 = white - black;
+    if contrast < 20.0 {
+        return atag_none();
+    }
+    val cut: f64 = (black + white) / 2.0;
+    // the border must be dark
+    var bad: i64 = 0;
+    k = 0;
+    while k < 8 {
+        val kf: f64 = k as f64;
+        if atag_sample(f, &hm.h, kf, 0.0) > cut { bad = bad + 1; }
+        if atag_sample(f, &hm.h, kf, 7.0) > cut { bad = bad + 1; }
+        if atag_sample(f, &hm.h, 0.0, kf) > cut { bad = bad + 1; }
+        if atag_sample(f, &hm.h, 7.0, kf) > cut { bad = bad + 1; }
+        k = k + 1;
+    }
+    if bad > 3 {
+        return atag_none();
+    }
+    // the 6 x 6 data cells, then the code in each rotation
+    var grid: Vec<i64> = Vec::new();
+    var gy: i64 = 0;
+    while gy < 8 {
+        var gx: i64 = 0;
+        while gx < 8 {
+            if atag_sample(f, &hm.h, gx as f64, gy as f64) > cut {
+                grid.push(1);
+            } else {
+                grid.push(0);
+            }
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    val bitx: Vec<i64> = atag36h11_bit_x();
+    val bity: Vec<i64> = atag36h11_bit_y();
+    var best_id: i64 = - 1;
+    var best_d: i64 = 99;
+    var best_r: i64 = 0;
+    var r: i64 = 0;
+    while r < 4 {
+        var code: i64 = 0;
+        var bit: i64 = 0;
+        while bit < 36 {
+            // the canonical cell (x, y) appears at rot^r(x, y)
+            var px: i64 = bitx.get(bit);
+            var py: i64 = bity.get(bit);
+            var t: i64 = 0;
+            while t < r {
+                val nx: i64 = 7 - py;
+                py = px;
+                px = nx;
+                t = t + 1;
+            }
+            code = (code << 1) | grid.get(py * 8 + px);
+            bit = bit + 1;
+        }
+        val m: Vec<i64> = atag_lookup(code);
+        if m.get(1) < best_d {
+            best_d = m.get(1);
+            best_id = m.get(0);
+            best_r = r;
+        }
+        r = r + 1;
+    }
+    if best_d > max_hamming {
+        return atag_none();
+    }
+    // canonical corner k sits at our corner (k + r) % 4
+    var ox: Vec<f64> = Vec::new();
+    var oy: Vec<f64> = Vec::new();
+    k = 0;
+    while k < 4 {
+        ox.push(cx.get((k + best_r) % 4));
+        oy.push(cy.get((k + best_r) % 4));
+        k = k + 1;
+    }
+    val hc: Homography = vis_homography(&ux, &uy, &ox, &oy);
+    val ctr: vec2 = vis_hom_apply(&hc.h, 0.0, 0.0);
+    return AtagDetection { id: best_id, hamming: best_d, rotation: best_r, cx: ox, cy: oy, center: ctr, h: hc.h, contrast: contrast };
+}
+
+// ─── Pose ───
+
+/// The tag's pose in the camera frame from its corners, for a tag whose
+/// black square has side `size` (metres).
+pub fn atag_pose(d: & AtagDetection, cam: & Camera, size: f64) -> AtagPose {
+    var nx: Vec<f64> = Vec::new();
+    var ny: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        val p: vec2 = cam_pixel_to_norm(cam, d.cx.get(i), d.cy.get(i));
+        nx.push(p.x);
+        ny.push(p.y);
+        i = i + 1;
+    }
+    val ux: Vec<f64> = atag_unit_x();
+    val uy: Vec<f64> = atag_unit_y();
+    val hm: Homography = vis_homography(&ux, &uy, &nx, &ny);
+    val h: Vec<f64> = hm.h;
+    val m1: vec3 = vec3(h.get(0), h.get(3), h.get(6));
+    val m2: vec3 = vec3(h.get(1), h.get(4), h.get(7));
+    val m3: vec3 = vec3(h.get(2), h.get(5), h.get(8));
+    val l1: f64 = math_sqrt(m1.x * m1.x + m1.y * m1.y + m1.z * m1.z);
+    val l2: f64 = math_sqrt(m2.x * m2.x + m2.y * m2.y + m2.z * m2.z);
+    // H ~ [s r1, s r2, t] with s = size / 2
+    var mu: f64 = (l1 + l2) / size;
+    if m3.z < 0.0 {
+        mu = 0.0 - mu;
+    }
+    val s: f64 = size / 2.0;
+    val r1: vec3 = vec3(m1.x / (mu * s), m1.y / (mu * s), m1.z / (mu * s));
+    val r2: vec3 = vec3(m2.x / (mu * s), m2.y / (mu * s), m2.z / (mu * s));
+    val t: vec3 = vec3(m3.x / mu, m3.y / mu, m3.z / mu);
+    // nearest rotation: make r1, r2 orthonormal symmetrically
+    val a: vec3 = vec3(r1.x + r2.x, r1.y + r2.y, r1.z + r2.z);
+    val b: vec3 = vec3(r1.x - r2.x, r1.y - r2.y, r1.z - r2.z);
+    val la: f64 = math_sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    val lb: f64 = math_sqrt(b.x * b.x + b.y * b.y + b.z * b.z);
+    val k: f64 = 0.7071067811865476;
+    val e1: vec3 = vec3(k * (a.x / la + b.x / lb), k * (a.y / la + b.y / lb), k * (a.z / la + b.z / lb));
+    val e2: vec3 = vec3(k * (a.x / la - b.x / lb), k * (a.y / la - b.y / lb), k * (a.z / la - b.z / lb));
+    val e3: vec3 = vec3(e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x);
+    val r: Mat3 = mat3_from_rows(vec3(e1.x, e2.x, e3.x), vec3(e1.y, e2.y, e3.y), vec3(e1.z, e2.z, e3.z));
+    return AtagPose { r: r, t: t, q: qt_from_mat3(r) };
+}

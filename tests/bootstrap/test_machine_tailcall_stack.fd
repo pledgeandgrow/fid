@@ -1,0 +1,90 @@
+// Track MI (docs/roadmap/llvm-roadmap.md), the machine layer
+// (compiler/nat_ir.fd):
+//   MI28 tail calls as jumps with arguments on the stack: `return g(..)`
+//        whose stack arguments fit this function's own incoming argument
+//        area (no more of them than it was passed) stores them there
+//        (ng_st_incoming) and jumps (ng_tail_stack_ok, ng_epilogue_tail),
+//        so mutual recursion with many parameters runs in constant stack
+//        on every machine-layer target, self-recursion too whatever the IR
+//        optimizer does (FID_IROPT_OFF=tailcall). A callee with more stack
+//        arguments than the caller has stays a call. Twelve parameters
+//        put arguments on the stack everywhere (x86-64 passes five in
+//        registers, RISC-V nine, AArch64 eleven, counting the hidden
+//        environment). The depths stay under the interpreter's limit;
+//        tests/nattools/tailcall_deep.fd (machine_batch4_check.sh) runs
+//        millions of levels deep natively. FID_NAT_OFF=tailcall: calls.
+// Expected output:
+// 466
+// 469
+// 66
+// 1
+// 0
+// 451
+// 32
+
+fn ping(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> i64 {
+    if n == 0 {
+        return a + b + c + d + e + f + g + h + i + j + k;
+    }
+    return pong(n - 1, b, c, d, e, f, g, h, i, j, k, a + 1);
+}
+
+fn pong(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> i64 {
+    if n == 0 {
+        return a * 2 + b + c + d + e + f + g + h + i + j + k;
+    }
+    return ping(n - 1, k, a, b, c, d, e, f, g, h, i, j);
+}
+
+// self-recursion with every argument moving one place (the new values all
+// come from the old ones)
+fn rotate(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> i64 {
+    if n == 0 {
+        return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10 + k * 11;
+    }
+    return rotate(n - 1, k, a, b, c, d, e, f, g, h, i, j);
+}
+
+fn few(n: i64, a: i64) -> i64 {
+    if n <= 0 {
+        return a;
+    }
+    // more stack arguments than `few` was passed: stays a call
+    return many(n - 1, a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+}
+
+fn many(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> i64 {
+    return few(n - 1, a + b + c + d + e + f + g + h + i + j + k - 54);
+}
+
+fn is_even12(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd12(n - 1, a, b, c, d, e, f, g, h, i, j, k);
+}
+
+fn is_odd12(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even12(n - 1, a, b, c, d, e, f, g, h, i, j, k);
+}
+
+fn main() {
+    println(ping(800, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11));
+    println(ping(801, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11));
+    println(rotate(0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1));
+    if is_even12(900, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) {
+        println(1);
+    } else {
+        println(0);
+    }
+    if is_even12(899, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) {
+        println(1);
+    } else {
+        println(0);
+    }
+    println(rotate(901, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) - 0);
+    println(few(40, 12));
+}

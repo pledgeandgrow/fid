@@ -16,6 +16,8 @@ use toml;
 use xml;
 use url;
 use uuid;
+use fs;
+use tls_record;
 
 fn xml_count(n: XmlNode) -> i64 {
     var total: i64 = 1;
@@ -64,6 +66,34 @@ fn main() -> i64 {
         val u = url_parse(text);
         println(str_len(u.host) + u.port);
         println(str_len(url::url_decode(text)));  // encoding.fd (through http) has one too
+    } else if which == "tls" {
+        // the file's bytes as a TLS stream: records, then the handshake
+        // messages and alerts in them, then each application_data record
+        // opened under a fixed key (all fail to authenticate: no panic)
+        val bytes: Vec<i64> = fs_read_bytes(path);
+        val rs: TlsRecords = tls_records_parse(bytes);
+        println(rs.records.len() + rs.consumed + rs.error);
+        var hsdata: Vec<i64> = Vec::new();
+        var key: Vec<i64> = Vec::new();
+        var iv: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < 32 { key.push(k); if k < 12 { iv.push(k); } k = k + 1; }
+        var ri: i64 = 0;
+        while ri < rs.records.len() {
+            val rec: TlsRecord = rs.records.get(ri);
+            if rec.ctype == TLS_CT_HANDSHAKE {
+                var j: i64 = 0;
+                while j < rec.fragment.len() { hsdata.push(rec.fragment.get(j)); j = j + 1; }
+            } else if rec.ctype == TLS_CT_ALERT {
+                println(tls_alert_parse(rec.fragment).error);
+            } else if rec.ctype == TLS_CT_APPLICATION_DATA {
+                println(tls_record_open(key, iv, ri, rec).error);
+                println(tls_inner_parse(rec.fragment).error);
+            }
+            ri = ri + 1;
+        }
+        val hm: TlsHandshakes = tls_handshake_parse(hsdata);
+        println(hm.messages.len() + hm.consumed + hm.error);
     } else if which == "uuid" {
         val id = uuid_parse(text);
         println(id.bytes.len());

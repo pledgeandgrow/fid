@@ -1,0 +1,60 @@
+// OP26 (compiler/iropt_me.fd: ime_unescaped, ime_may_alias,
+// ime_call_writes; opt-in FID_IROPT_ON=linear, with FID_IROPT_ON=placefwd
+// for ime_forward's same-place loads): a @linear struct parameter is held
+// by its function alone, so while its address goes nowhere but loads and
+// field addresses, no call and no other pointer reaches it.
+// - spend: `t.a` is read, then `v.push` runs (a call, given a pointer
+//   loaded from memory), then `t.a` is read twice more: with the linear
+//   fact the call cannot have written t, so the later reads reuse the
+//   first (tests/tooling/linear-alias-check.sh: fewer instructions).
+// - leak_then_read: t is copied into a local whose address goes to
+//   `bump`: the fact is gone for t (its address went to the copy) and
+//   the read after the call sees bump's write (7 + 100 + 1).
+// The program prints the same with the passes on and off.
+//
+// Expected output:
+// 39
+// 2
+// 108
+// 3
+
+@linear
+struct Tok {
+    a: i64,
+    b: i64,
+}
+
+fn spend(t: Tok, v: &mut Vec<i64>) -> i64 {
+    var x: i64 = t.a;
+    v.push(x);
+    var y: i64 = t.a + t.b;
+    v.push(y);
+    return x + y + t.a + t.b;
+}
+
+fn bump(p: &mut Tok) {
+    p.a = p.a + 100;
+}
+
+fn take(t: Tok) -> i64 {
+    return t.a + t.b;
+}
+
+fn leak_then_read(t: Tok, v: &mut Vec<i64>) -> i64 {
+    var x: i64 = t.a;
+    var u: Tok = t;
+    bump(& mut u);
+    v.push(x);
+    return take(u);
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var t: Tok = Tok { a: 5, b: 7 };
+    // x = 5, y = 12: 5 + 12 + 5 + 7 = 29, and 10
+    println(spend(t, & mut v) + 10);
+    println(v.len());
+    var t2: Tok = Tok { a: 7, b: 1 };
+    println(leak_then_read(t2, & mut v));
+    println(v.len());
+}

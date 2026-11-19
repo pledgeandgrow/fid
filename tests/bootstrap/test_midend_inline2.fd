@@ -1,0 +1,64 @@
+// ME20/ME21 (llvm-roadmap): the cost-model inliner (compiler/iropt_me.fd
+// ime_inline, `inline2`, opt-in: FID_IROPT_ON=inline2). `clamp` and
+// `classify` have several blocks (iropt's own inliner takes only one-block
+// callees): inline2 splits the caller's block at the call and the callee's
+// returns jump to the rest. `walk` is called once and is larger than
+// IME_INLINE_MAX (the once-called rule). Since Nov 16 it inlines only into
+// functions main reaches (ime_inline_reached). tests/tooling/inline2-check.sh
+// emits it with inline2 on (FID_VERIFY=1) and off: inline2 runs only in the
+// first, and both print the expected lines.
+//
+// Expected output:
+// 0 5 10
+// 3 1 2 3
+// 4950
+// 1381
+
+fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+fn classify(x: i64) -> i64 {
+    if x < 0 {
+        return 1;
+    } else if x == 0 {
+        return 2;
+    }
+    return 3;
+}
+
+fn walk(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = clamp(i * 7 - 50, 0 - 20, 20);
+        if c > 0 {
+            s = s + c * classify(c);
+        } else if c == 0 {
+            s = s + 1;
+        } else {
+            s = s - c;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println(int_to_str(clamp(0 - 3, 0, 10)) + " " + int_to_str(clamp(5, 0, 10)) + " " + int_to_str(clamp(42, 0, 10)));
+    println(int_to_str(classify(9)) + " " + int_to_str(classify(0 - 9)) + " " + int_to_str(classify(0)) + " " + int_to_str(classify(1)));
+    var t: i64 = 0;
+    var k: i64 = 0;
+    while k < 100 {
+        t = t + clamp(k, 0, 1000);
+        k = k + 1;
+    }
+    println(t);
+    println(walk(30));
+}

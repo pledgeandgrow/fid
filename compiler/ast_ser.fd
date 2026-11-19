@@ -5,8 +5,7 @@
 // length prefix then items. Everything is tagged so a stale or partial
 // artifact fails the read and the caller falls back to source.
 
-use core; use vec; use string; use compiler::ast;
- pub struct AwBuf {
+use core; use vec; use string; use compiler::ast; pub struct AwBuf {
     pub bytes: Vec<i64>,
 }
 
@@ -61,25 +60,21 @@ pub fn ar_u8(r: & mut ArBuf) -> i64 {
     return v;
 }
 
+/// A little-endian two's-complement word, decoded in place (CS1/CS2: no
+/// Vec per word read; compiler/ir_ser.fd mec_rd is the same code). 0, with
+/// r.ok false, past the end; 0 once an earlier read failed, as before.
 @wrapping pub fn ar_i64(r: & mut ArBuf) -> i64 {
-    var bytes: Vec<i64> = Vec::new();
-    var i: i64 = 0;
-    while i < 8 {
-        bytes.push(ar_u8(r));
-        i = i + 1;
-    }
-    if !r.ok {
+    if !r.ok || r.pos < 0 || r.pos + 8 > r.v.len() {
+        r.ok = false;
         return 0;
     }
-    var v: i64 = bytes.get(7);
-    if v >= 128 {
-        v = v - 256;
-    }
-    var j: i64 = 6;
+    var v: i64 = 0;
+    var j: i64 = 7;
     while j >= 0 {
-        v = v * 256 + bytes.get(j);
+        v = (v << 8) | (r.v.get(r.pos + j) & 255);
         j = j - 1;
     }
+    r.pos = r.pos + 8;
     return v;
 }
 
@@ -1955,6 +1950,8 @@ pub fn aw_func(b: & mut AwBuf, f: Func) {
     aw_exprs(b, f.preconditions);
     aw_exprs(b, f.postconditions);
     aw_bool(b, f.is_async);
+    // TL2: the line of its `fn`
+    aw_i64(b, f.line);
 }
 
 pub fn ar_func(r: & mut ArBuf) -> Func {
@@ -1988,6 +1985,7 @@ pub fn ar_func(r: & mut ArBuf) -> Func {
     f.preconditions = ar_exprs(r);
     f.postconditions = ar_exprs(r);
     f.is_async = ar_bool(r);
+    f.line = ar_i64(r);
     return f;
 }
 
@@ -2131,6 +2129,12 @@ pub fn aw_traitmethod(b: & mut AwBuf, m: TraitMethod) {
     aw_bool(b, m.has_self);
     aw_bool(b, m.is_pub);
     aw_optstmts(b, m.default_body);
+    // LG3: m.annotations (a result's `@lifetime`) is not written: the
+    // artifact holds only the library, whose traits name no lifetimes, and
+    // its format (compiler.fd astcache_save, version 3) stays as it is.
+    // LG4: m.type_params / m.type_param_bounds (a generic trait method's)
+    // likewise: no library trait has a generic method. LG14: m.is_async
+    // likewise: no library trait has an async method
 }
 
 pub fn ar_traitmethod(r: & mut ArBuf) -> TraitMethod {
@@ -2637,8 +2641,8 @@ pub fn ast_ser_program(p: Program) -> Vec<i64> {
     };
     aw_i64(& mut b, 4473414);
     // "FID" magic (versioned below)
-    aw_i64(& mut b, 2);
-    // format version
+    aw_i64(& mut b, 3);
+    // format version (3: Func.line, TL2)
     aw_program(& mut b, p);
     return b.bytes;
 }
@@ -2650,7 +2654,7 @@ pub fn ast_deser_program(v: Vec<i64>) -> Program {
     };
     var magic: i64 = ar_i64(& mut r);
     var ver: i64 = ar_i64(& mut r);
-    if magic != 4473414 || ver != 2 {
+    if magic != 4473414 || ver != 3 {
         r.ok = false;
         return program_new();
     }
@@ -2667,7 +2671,7 @@ pub fn ast_deser_ok(v: Vec<i64>) -> bool {
     };
     var magic: i64 = ar_i64(& mut r);
     var ver: i64 = ar_i64(& mut r);
-    return magic == 4473414 && ver == 2 && r.ok;
+    return magic == 4473414 && ver == 3 && r.ok;
 }
 
 pub fn awbuf_new() -> AwBuf {

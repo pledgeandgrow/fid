@@ -1,0 +1,147 @@
+// stdlib/process Command builder (roadmap L4H): a child with its own
+// environment variable, working directory (with a space in its name),
+// data on standard input, a pipe into a second program, merged stderr,
+// an exit code, and arguments holding shell characters. The programs
+// differ between cmd and sh; the output is normalized, so it is the same
+// on both.
+//
+// Expected output:
+// env = hello & world
+// removed = gone
+// cwd file = marker in dir
+// bad cwd fails = true
+// sorted = apple,fig,pear
+// piped = apple,pear
+// merged = oops
+// code = 3
+// status = 0
+// arg = a&b|c;d
+use process;
+
+fn lines_joined(s: str) -> str {
+    val parts: Vec<str> = str_lines(str_replace(s, "\r", ""));
+    var out: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = str_trim(parts.get(i));
+        if str_len(p) > 0 {
+            if str_len(out) > 0 { out = out + ","; }
+            out = out + p;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn run_out(c: & Command) -> str {
+    val h: i64 = c.output();
+    if h == 0 { return "<no start>"; }
+    var s: str = process_stdout(h);
+    process_close(h);
+    return s;
+}
+
+fn main() -> i64 {
+    val win: bool = process_is_windows();
+
+    // an environment variable only the child sees
+    var e = Command::new("sh");
+    if win {
+        e = Command::new("cmd");
+        e.arg("/C");
+        e.arg("set FIDES_CMD_TEST_VAR");
+    } else {
+        e.arg("-c");
+        e.arg("echo FIDES_CMD_TEST_VAR=$FIDES_CMD_TEST_VAR");
+    }
+    e.env("FIDES_CMD_TEST_VAR", "hello & world");
+    var got: str = str_trim(str_replace(run_out(& e), "\r", ""));
+    println("env = " + str_replace(got, "FIDES_CMD_TEST_VAR=", ""));
+
+    // removing a variable the parent has (OS on Windows, HOME on sh)
+    var r = Command::new("sh");
+    if win {
+        r = Command::new("cmd");
+        r.arg("/C");
+        r.arg("if defined OS (echo present) else (echo gone)");
+        r.env_remove("OS");
+    } else {
+        r.arg("-c");
+        r.arg("if [ -n \"$HOME\" ]; then echo present; else echo gone; fi");
+        r.env_remove("HOME");
+    }
+    println("removed = " + str_trim(str_replace(run_out(& r), "", "")));
+
+    // a working directory with a space in its name
+    var tmp: str = "/tmp";
+    match env_var("TEMP") {
+        Option::Some(s) => { tmp = s; }
+        Option::None => { }
+    }
+    val dir: str = tmp + "/fides cmd dir " + int_to_str(p_getpid());
+    p_mkdir(dir);
+    p_file_write(dir + "/marker.txt", "marker in dir\n");
+    var t = Command::new("cat");
+    if win { t = Command::new("type"); }
+    t.arg("marker.txt");
+    t.cwd(dir);
+    println("cwd file = " + str_trim(str_replace(run_out(& t), "\r", "")));
+    p_file_delete(dir + "/marker.txt");
+    p_rmdir(dir);
+
+    var bad = Command::new("cat");
+    if win { bad = Command::new("type"); }
+    bad.arg("marker.txt");
+    bad.cwd(dir + "/no such dir");
+    if bad.status() != 0 { println("bad cwd fails = true"); } else { println("bad cwd fails = false"); }
+
+    // standard input from a string
+    var s = Command::new("sort");
+    s.stdin("pear\napple\nfig\n");
+    println("sorted = " + lines_joined(run_out(& s)));
+
+    // a pipe: sort | grep p
+    var s2 = Command::new("sort");
+    s2.stdin("pear\napple\nfig\n");
+    var g = Command::new("grep");
+    if win { g = Command::new("findstr"); }
+    g.arg("p");
+    s2.pipe(& g);
+    println("piped = " + lines_joined(run_out(& s2)));
+
+    // stderr into stdout, and an exit code
+    var m = Command::new("sh");
+    if win {
+        m = Command::new("cmd");
+        m.arg("/C");
+        m.arg("echo oops 1>&2 & exit 3");
+    } else {
+        m.arg("-c");
+        m.arg("echo oops 1>&2; exit 3");
+    }
+    m.stderr_to_stdout();
+    val hm: i64 = m.output();
+    println("merged = " + str_trim(str_replace(process_stdout(hm), "\r", "")));
+    println("code = " + int_to_str(process_code(hm)));
+    process_close(hm);
+
+    var ok = Command::new("sort");
+    ok.stdin("b\na\n");
+    println("status = " + int_to_str(ok.status()));
+
+    // shell characters in an argument reach the program as one word
+    var a = Command::new("sh");
+    if win {
+        // findstr echoes the matching stdin line
+        a = Command::new("findstr");
+        a.arg("/L");
+        a.arg("/C:a&b|c;d");
+        a.stdin("a&b|c;d\nnothing\n");
+    } else {
+        a.arg("-c");
+        a.arg("printf '%s\\n' \"$0\"");
+        a.arg("a&b|c;d");
+    }
+    println("arg = " + str_trim(str_replace(run_out(& a), "\r", "")));
+    return 0;
+}

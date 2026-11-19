@@ -1,0 +1,49 @@
+// Miscompile log M20 (VF9, docs/verification/semantics-2.md §13 D-make).
+// `p as dyn Show` keeps the address of the local `p`, not a copy of the
+// struct: a `dyn` returned from the function that made it points into a
+// dead stack frame. `fid emit` printed 910 for the first object (the
+// second call's frame), `fid ccompile` garbage (1800, 80846648100);
+// `fid run` is right. Also, a dyn made from a variable sees later
+// assignments to it (reference §8.1: structs are values).
+
+cap Show {
+    fn show(self) -> i64;
+}
+
+struct Pt { x: i64, y: i64 }
+
+impl Show for Pt {
+    pub fn show(self: Pt) -> i64 { return self.x * 100 + self.y; }
+}
+
+fn mk(n: i64) -> dyn Show {
+    val p = Pt { x: n, y: n + 1 };
+    return p as dyn Show;
+}
+
+fn clobber(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(a * b);
+    v.push(c * d);
+    return v.get(0) + v.get(1);
+}
+
+fn use_dyn(d: dyn Show) -> i64 { return d.show(); }
+
+fn main() -> i64 {
+    val d1 = mk(7);
+    val d2 = mk(9);
+    val z = clobber(11, 12, 13, 14);
+    println(use_dyn(d1));
+    println(use_dyn(d2));
+    println(z);
+    var pm = Pt { x: 1, y: 2 };
+    val dp = pm as dyn Show;
+    pm.x = 5;
+    println(use_dyn(dp));
+    return 0;
+}
+//> 708
+//> 910
+//> 314
+//> 102

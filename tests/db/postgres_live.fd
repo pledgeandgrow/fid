@@ -1,0 +1,128 @@
+// stdlib/postgres against a real PostgreSQL server (competitive SL12). Not
+// in the suite: it needs a server. tests/db/postgres_live.sh starts a
+// private one (the distribution's PostgreSQL, a throwaway cluster on port
+// 55432, SCRAM-SHA-256 passwords, TLS with a self-signed certificate for
+// "localhost") and runs this program in clear and over TLS.
+//
+// Settings from the environment: PGT_HOST (127.0.0.1), PGT_PORT (55432),
+// PGT_USER (fides), PGT_PASSWORD (fides-pw), PGT_DB (postgres) and
+// PGT_SSLMODE: disable, prefer or require (disable). For require the
+// server's certificate must be trusted (OpenSSL: SSL_CERT_FILE=cert.pem)
+// and name PGT_HOST.
+//
+// Expected output (exit 0; "tls true" under prefer and require when the
+// server has TLS):
+//   connected auth SCRAM-SHA-256 tls <false|true>
+//   server ssl <false|true>
+//   created
+//   inserted 3
+//   rows [{"id":1,"name":"Ada","note":null},{"id":2,"name":"O'Brien","note":"x"},{"id":3,"name":"Robert'); DROP TABLE fides_live;--","note":null}]
+//   one {"n":3}
+//   null param [{"is_null":true}]
+//   error 42P01
+//   database 2
+//   ok
+use postgres;
+use postgres_tls;
+use postgres_db;
+use db;
+
+fn setting(name: str, default: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+            return default;
+        }
+    }
+    return default;
+}
+
+fn fail(what: str) -> i64 {
+    println("FAILED: " + what);
+    return 1;
+}
+
+fn main() -> i64 {
+    val host: str = setting("PGT_HOST", "127.0.0.1");
+    val port: i64 = str_parse_int(setting("PGT_PORT", "55432"));
+    val mode_name: str = setting("PGT_SSLMODE", "disable");
+    var mode: i64 = PG_SSL_DISABLE;
+    if str_equal(mode_name, "prefer") {
+        mode = PG_SSL_PREFER;
+    } else if str_equal(mode_name, "require") {
+        mode = PG_SSL_REQUIRE;
+    }
+    var c: PgConn = pg_connect_tls(host, port, setting("PGT_USER", "fides"), setting("PGT_PASSWORD", "fides-pw"), setting("PGT_DB", "postgres"), mode);
+    if !c.ok {
+        return fail("connect: " + c.error);
+    }
+    var tls_text: str = "false";
+    if c.tls {
+        tls_text = "true";
+    }
+    println("connected auth " + c.auth + " tls " + tls_text);
+    // What the server says about this session's encryption
+    val ssl: PgResult = pg_query(& c, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()");
+    if !ssl.ok {
+        return fail("pg_stat_ssl: " + ssl.error);
+    }
+    if str_equal(ssl.rows, "[{\"ssl\":true}]") {
+        println("server ssl true");
+    } else if str_equal(ssl.rows, "[{\"ssl\":false}]") {
+        println("server ssl false");
+    } else {
+        return fail("pg_stat_ssl rows " + ssl.rows);
+    }
+    pg_exec(& c, "DROP TABLE IF EXISTS fides_live");
+    if pg_exec(& c, "CREATE TABLE fides_live (id int PRIMARY KEY, name text NOT NULL, note text)") < 0 {
+        return fail("create");
+    }
+    println("created");
+    // Parameters, a NULL among them; quotes and SQL in values stay data
+    var total: i64 = 0;
+    var p1: Vec<str> = Vec::new();
+    p1.push("1");
+    p1.push("Ada");
+    p1.push("");
+    var n1: Vec<bool> = Vec::new();
+    n1.push(false);
+    n1.push(false);
+    n1.push(true);
+    total = total + pg_query_params_nulls(& c, "INSERT INTO fides_live VALUES ($1, $2, $3)", p1, n1).affected;
+    var p2: Vec<str> = Vec::new();
+    p2.push("2");
+    p2.push("O'Brien");
+    p2.push("x");
+    total = total + pg_query_params(& c, "INSERT INTO fides_live VALUES ($1, $2, $3)", p2).affected;
+    var p3: Vec<str> = Vec::new();
+    p3.push("3");
+    p3.push("Robert'); DROP TABLE fides_live;--");
+    p3.push("");
+    var n3: Vec<bool> = Vec::new();
+    n3.push(false);
+    n3.push(false);
+    n3.push(true);
+    total = total + pg_query_params_nulls(& c, "INSERT INTO fides_live VALUES ($1, $2, $3)", p3, n3).affected;
+    println("inserted " + int_to_str(total));
+    val rows: PgResult = pg_query(& c, "SELECT id, name, note FROM fides_live ORDER BY id");
+    if !rows.ok {
+        return fail("select: " + rows.error);
+    }
+    println("rows " + rows.rows);
+    // The Database capability over the same connection
+    println("one " + query_one(c, "SELECT count(*)::int AS n FROM fides_live"));
+    var pn: Vec<str> = Vec::new();
+    pn.push("");
+    var nn: Vec<bool> = Vec::new();
+    nn.push(true);
+    println("null param " + pg_query_params_nulls(& c, "SELECT $1::text IS NULL AS is_null", pn, nn).rows);
+    val bad: PgResult = pg_query(& c, "SELECT * FROM fides_no_such_table");
+    println("error " + bad.sqlstate);
+    println("database " + int_to_str(c.exec("DELETE FROM fides_live WHERE note IS NULL")));
+    pg_exec(& c, "DROP TABLE fides_live");
+    pg_close(& mut c);
+    println("ok");
+    return 0;
+}

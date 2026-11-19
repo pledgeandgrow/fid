@@ -1,0 +1,100 @@
+// Competitive OP20 on the default Windows backend (compiler/pe_ir.fd):
+// `fid emit --cpu x86-64-v3|v4` turns on the BMI forms there:
+//   a 64-bit shift by a variable count -> SHLX / SARX / SHRX
+//                                         (PeirGen_shift_bmi)
+//   a 64-bit x & (x - 1)               -> BLSR (peir_blsr_src)
+// Without --cpu (the safe default, also `baseline` and `native`) neither
+// is used. The results must be the same either way and on every backend;
+// tests/nattools/pe_cpu_check.sh builds this file with and without --cpu,
+// runs both, compares their output with the block below and counts the
+// VEX forms in the two images.
+// Expected output:
+// 40
+// 1280
+// -4
+// -1
+// 4611686018427387903
+// 1
+// 12
+// 5
+// 96
+// 0
+// 0
+// -16
+// 4
+// 4
+// 18
+// 10
+// 64
+
+fn shl(a: i64, n: i64) -> i64 {
+    return a << n;
+}
+
+fn sar(a: i64, n: i64) -> i64 {
+    return a >> n;
+}
+
+fn shr(a: u64, n: u64) -> u64 {
+    return a >> n;
+}
+
+fn clear_low(x: i64) -> i64 {
+    return x & (x - 1);
+}
+
+fn clear_low_u(x: u64) -> u64 {
+    return (x - 1) & x;
+}
+
+// the number of set bits of x0 >= 0, one BLSR a step (a negative x0
+// would reach i64::MIN, whose x - 1 overflows)
+fn popcount(x0: i64) -> i64 {
+    var x: i64 = x0;
+    var n: i64 = 0;
+    while x != 0 {
+        x = x & (x - 1);
+        n = n + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    var counts: Vec<i64> = Vec::new();
+    counts.push(3);
+    counts.push(8);
+    counts.push(2);
+    counts.push(63);
+    println(shl(5, counts.get(0)));
+    println(shl(5, counts.get(1)));
+    println(sar(0 - 16, counts.get(2)));
+    println(sar(0 - 1, counts.get(3)));
+    var big: u64 = (0 - 1) as u64;
+    println(shr(big, 2 as u64));
+    println(shr(big, counts.get(3) as u64));
+    println(shl(3, counts.get(2)));
+    // a count from a loop, so it is not a constant
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        acc = acc + sar(40, i + 1);
+        i = i + 1;
+    }
+    println(acc - 30);
+    println(clear_low(112));
+    println(clear_low(0));
+    println(clear_low(1));
+    println(clear_low(0 - 8));
+    println(clear_low_u(6 as u64) as i64);
+    println(clear_low_u(12 as u64) as i64 - 4);
+    println(popcount(1023) + popcount(255));
+    var total: i64 = 0;
+    var k: i64 = 0;
+    while k < counts.len() {
+        total = total + popcount(counts.get(k));
+        k = k + 1;
+    }
+    println(total);
+    println(shl(1, counts.get(0) + counts.get(0)));
+    return 0;
+}

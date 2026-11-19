@@ -1,0 +1,29 @@
+// expect-error: needs a named function
+// CI3: a closure that captures cannot be a C callback: C calls a plain
+// function pointer, with no place for the captures. fid's error names them
+// ("a closure that captures calls, sign cannot be a C callback") and says
+// to pass the state through the C function's user data pointer
+// (test_c_callback_user_data.fd does that). The line above is the part
+// fidesc (frozen) also prints.
+extern "C" include "<stdlib.h>" {
+    fn qsort_s as c_qsort_s(base: *u8, n: i64, size: i64, cmp: fn(*u8, *u8, *u8) -> i32, ctx: *u8);
+}
+
+@unsafe
+fn main() -> i64 {
+    var calls: i64 = 0;
+    val sign: i64 = 0 - 1;
+    val base: *u8 = p_malloc(16);
+    *(base as *i64) = 1;
+    *((base as i64 + 8) as *i64) = 2;
+    c_qsort_s(base, 2, 8, fn(ctx: *u8, a: *u8, b: *u8) -> i32 {
+        calls = calls + 1;
+        val x: i64 = *(a as *i64) * sign;
+        val y: i64 = *(b as *i64) * sign;
+        if x < y { return -1; }
+        if x > y { return 1; }
+        return 0;
+    }, 0 as *u8);
+    p_free(base);
+    return calls;
+}

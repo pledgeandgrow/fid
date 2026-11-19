@@ -15,6 +15,10 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # weekly too, so a fides-os change the compiler cannot build shows up
+  # even in a week with no compiler push (AD3)
+  schedule:
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -59,3 +63,52 @@ jobs:
             echo "$name: exit $rc"
             [ "$rc" = "$want" ]
           done
+
+  # fides-os as a standing test of bare-metal work (competitive-roadmap AD3,
+  # release G4): the OS's kernels (pledgeandgrow/fides-os, main) built with
+  # this commit's fid and booted under QEMU to a known COM1 output
+  # (scripts/fides-os-boot.sh: minimal prints exactly "Hello from Fides
+  # OS!", shell its "Fides OS v0.1" banner and reaches its prompt, and
+  # shell-input types `echo hi` and `mem` through the PS/2 keyboard and
+  # checks the replies and a ticking timer). If fides-os is private, give
+  # this repository a secret FIDES_OS_TOKEN with read access to it.
+  fides-os:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pledgeandgrow/fides-os
+          ref: main
+          path: fides-os
+          token: ${{ secrets.FIDES_OS_TOKEN || github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold, QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mold qemu-system-x86
+      # only what building fid reads: a stdlib module the build never parses
+      # does not stop this job (ci.yml's F5 step checks the whole tree)
+      - name: The compiler's sources parse with stage 0
+        run: FROM=compiler/main.fd bash scripts/stage0-names-check.sh
+      - name: The boot test's own checks
+        run: SELFTEST=1 bash scripts/fides-os-boot.sh
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: Build and boot fides-os
+        env:
+          FID: release/fid-dev
+          FIDES_OS: fides-os
+          OUT: ${{ runner.temp }}/fides-os
+        run: bash scripts/fides-os-boot.sh
+      - name: Logs
+        if: failure()
+        run: tail -n 40 "$RUNNER_TEMP"/fides-os/*.log || true

@@ -1,5 +1,11 @@
 # Fides Quick Start
 
+<!-- CI follows this guide step by step (scripts/guide-check.py, release
+roadmap N2): each fides code block is saved under the file name its
+"Create" line gives, each bash block of fid/fides commands is run, and an
+"Output:" block must match what the step before it printed. Keep every
+step runnable. -->
+
 ## Installation
 
 ### Windows (recommended)
@@ -89,6 +95,8 @@ fides run hello.fd
 
 ## Use the Standard Library
 
+Create `vec.fd`:
+
 ```fides
 fn main() -> void {
     var v: Vec<i64> = Vec::new();
@@ -96,9 +104,21 @@ fn main() -> void {
     v.push(2);
     v.push(3);
 
-    print("Vec size: " + int_to_str(v.len()));
-    print("Sum: " + int_to_str(v.get(0) + v.get(1) + v.get(2)));
+    println("Vec size: " + int_to_str(v.len()));
+    println("Sum: " + int_to_str(v.get(0) + v.get(1) + v.get(2)));
 }
+```
+
+`print` writes its text as it is; `println` ends it with a new line. Run it:
+
+```bash
+fid run vec.fd
+```
+
+Output:
+```
+Vec size: 3
+Sum: 6
 ```
 
 ## Windows Installer Details

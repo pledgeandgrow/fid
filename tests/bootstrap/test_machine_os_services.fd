@@ -1,0 +1,57 @@
+// F7 (release-roadmap), the runtime services darwin.fd now gives a native
+// macOS program, checked the same way on every backend: a failed open is
+// a failure (errno, not a crash), a directory lists the files written
+// into it (getdents64 over readdir), and the shell runs commands with
+// their exit status (fork, execve, wait4). tests/nattools/
+// machine_batch8_check.sh emits this for both macOS targets and, on a
+// Mac, runs it against `fid run`; on Linux and Windows `--nat` too.
+//
+// Expected output:
+// missing: none
+// dir entries: 2
+// has a.txt: true
+// has b.txt: true
+// a.txt: alpha
+// status 3: 3
+// status 0: 0
+// status 7: 7
+// removed: true
+fn main() -> i64 {
+    match read_file("no such directory/no such file.txt") {
+        Some(t) => { println("missing: " + t); }
+        None => { println("missing: none"); }
+    }
+    val dir: str = "build_os_services_" + int_to_str(p_getpid());
+    p_mkdir(dir);
+    p_file_write(dir + "/a.txt", "alpha");
+    p_file_write(dir + "/b.txt", "beta");
+    val listing: str = p_dir_list(dir);
+    var n: i64 = 0;
+    if str_contains(listing, "a.txt") { n = n + 1; }
+    if str_contains(listing, "b.txt") { n = n + 1; }
+    println("dir entries: " + int_to_str(n));
+    println("has a.txt: " + yes_no(str_contains(listing, "a.txt")));
+    println("has b.txt: " + yes_no(str_contains(listing, "b.txt")));
+    match read_file(dir + "/a.txt") {
+        Some(t) => { println("a.txt: " + t); }
+        None => { println("a.txt: none"); }
+    }
+    println("status 3: " + int_to_str(p_system("exit 3")));
+    println("status 0: " + int_to_str(p_system("exit 0")));
+    println("status 7: " + int_to_str(p_system("exit 7")));
+    p_file_delete(dir + "/a.txt");
+    p_file_delete(dir + "/b.txt");
+    p_rmdir(dir);
+    var gone: bool = true;
+    match read_file(dir + "/a.txt") {
+        Some(t) => { gone = false; }
+        None => { gone = true; }
+    }
+    println("removed: " + yes_no(gone));
+    return 0;
+}
+
+fn yes_no(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}

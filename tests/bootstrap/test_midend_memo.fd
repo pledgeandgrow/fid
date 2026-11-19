@@ -1,0 +1,194 @@
+// CS1 (competitive roadmap): the mid-end's per-function memo
+// (compiler/ir_ser.fd mec_*), used the way rules_run and egraph_run use it.
+// A pass's rewrite of one function is recorded under the function's
+// content hash, written to the memo's file, read back by a later build and
+// replayed: the replay gives the pass's own result (the same hash) and its
+// counts. A function the pass left alone is recorded with no change; a
+// function of other content misses; an entry whose change does not fit the
+// function is refused and leaves it as it was; a damaged file is ignored;
+// FID_MECACHE=off turns the memo off. Without the memo (or with a replay
+// that loses the rewrite) the "replay matches" and "hit" lines go.
+//
+// Expected output:
+// memo on
+// miss before the pass
+// recorded 1
+// unchanged recorded
+// hit after reload
+// replay matches
+// counts 1 0 0
+// unchanged hit
+// other function misses
+// stale entry refused
+// damaged file ignored
+// memo off
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::ast_ser;
+use compiler::inc;
+use compiler::ir_ser;
+
+fn tmp_dir() -> str {
+    var d: str = env_or_empty("TEMP");
+    if d == "" {
+        d = env_or_empty("TMPDIR");
+    }
+    if d == "" {
+        d = "/tmp";
+    }
+    return d;
+}
+
+/// k + 0, returned: the pass below rewrites the addition into a move.
+fn make_add(name: str, k: i64) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var a: i64 = IrFunction_emit(& mut f, Inst::ConstInt(k, IrType::I64));
+    var z: i64 = IrFunction_emit(& mut f, Inst::ConstInt(0, IrType::I64));
+    var s: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Add, a, z, IrType::I64));
+    var _r: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(s)));
+    return f;
+}
+
+/// k, returned: nothing for the pass to do.
+fn make_plain(name: str, k: i64) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var a: i64 = IrFunction_emit(& mut f, Inst::ConstInt(k, IrType::I64));
+    var _r: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(a)));
+    return f;
+}
+
+fn is_zero(f: & IrFunction, id: i64) -> bool {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(x) => {
+            match x {
+                Inst::ConstInt(v, _t) => {
+                    return v == 0;
+                }
+                _ => {
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    return false;
+}
+
+/// x + 0 = x as a move, logging each write as rules.fd ru_set_inst does.
+fn fake_pass(f: & mut IrFunction) -> i64 {
+    var count: i64 = 0;
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var ve: ValueIdInst = f.insts.get(i);
+        match ve.inst {
+            Inst::BinOp(op, a, b, ty) => {
+                match op {
+                    BinOp::Add => {
+                        if is_zero(f, b) {
+                            f.insts.set(i, ValueIdInst_new(ve.id, Inst::BitCast(a, ty, ty)));
+                            mec_log_inst(i);
+                            count = count + 1;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Make the next mec_begin read `path` again.
+fn reload(path: str) {
+    env_override_set("FID_MECACHE", path + ".none");
+    var _a: bool = mec_begin();
+    env_override_set("FID_MECACHE", path);
+    var _b: bool = mec_begin();
+}
+
+fn main() {
+    var path: str = tmp_dir() + "/fid-mec-test-" + int_to_str(p_getpid()) + ".bin";
+    p_file_delete(path);
+    env_override_set("FID_MECACHE", path);
+    if mec_begin() {
+        println("memo on");
+    }
+    mec_pass_begin();
+    // a function the pass rewrites
+    var f: IrFunction = make_add("probe", 5);
+    var pre_h: i64 = mec_fn_hash(f);
+    var key: i64 = mec_key(MEC_RULES, pre_h, 99);
+    if mec_lookup(key, f.name) == 0 {
+        println("miss before the pass");
+    }
+    var pre: IrFunction = f;
+    mec_log_begin();
+    var c: i64 = fake_pass(& mut f);
+    mec_log_end();
+    var post_h: i64 = mec_note(key, pre, pre_h, f, c > 0, c, 0, 0);
+    if post_h == mec_fn_hash(f) && post_h != pre_h {
+        println("recorded " + int_to_str(c));
+    }
+    // a function it leaves alone
+    var g: IrFunction = make_plain("plain", 7);
+    var g_h: i64 = mec_fn_hash(g);
+    var g_key: i64 = mec_key(MEC_RULES, g_h, 99);
+    var g_pre: IrFunction = g;
+    mec_log_begin();
+    var gc: i64 = fake_pass(& mut g);
+    mec_log_end();
+    if gc == 0 && mec_note(g_key, g_pre, g_h, g, false, 0, 0, 0) == g_h {
+        println("unchanged recorded");
+    }
+    mec_finish();
+    // a later build: the file read again
+    reload(path);
+    var f2: IrFunction = make_add("probe", 5);
+    var key2: i64 = mec_key(MEC_RULES, mec_fn_hash(f2), 99);
+    var at: i64 = mec_lookup(key2, f2.name);
+    if key2 == key && at > 0 {
+        println("hit after reload");
+        if mec_apply_at(at, & mut f2) && mec_fn_hash(f2) == post_h && mec_entry(at).post == post_h {
+            println("replay matches");
+        }
+        var e: MecEntry = mec_entry(at);
+        println("counts " + int_to_str(e.c1) + " " + int_to_str(e.c2) + " " + int_to_str(e.c3));
+    }
+    var g2: IrFunction = make_plain("plain", 7);
+    var g_at: i64 = mec_lookup(mec_key(MEC_RULES, mec_fn_hash(g2), 99), g2.name);
+    if g_at > 0 && mec_apply_at(g_at, & mut g2) && mec_fn_hash(g2) == g_h {
+        println("unchanged hit");
+    }
+    var other: IrFunction = make_add("probe", 6);
+    if mec_lookup(mec_key(MEC_RULES, mec_fn_hash(other), 99), other.name) == 0 && mec_lookup(mec_key(MEC_EGRAPH, pre_h, 99), "probe") == 0 {
+        println("other function misses");
+    }
+    // the entry's change does not fit a function of other shape
+    var empty: IrFunction = IrFunction_new("probe", IrType::I64);
+    var n0: i64 = empty.insts.len();
+    if at > 0 && !mec_apply_at(at, & mut empty) && empty.insts.len() == n0 {
+        println("stale entry refused");
+    }
+    // a damaged file: the check word of its first entry no longer matches
+    var bytes: Vec<i64> = p_file_read_bytes(path);
+    if bytes.len() > 48 {
+        bytes.set(44, (bytes.get(44) + 1) & 255);
+        p_file_write_vec(path, bytes);
+        reload(path);
+        if mec_lookup(key, "probe") == 0 {
+            println("damaged file ignored");
+        }
+    }
+    env_override_set("FID_MECACHE", "off");
+    if !mec_begin() {
+        println("memo off");
+    }
+    p_file_delete(path);
+}

@@ -1,0 +1,303 @@
+// stdlib/matter: the TLV examples of the Matter spec (Appendix A: integers, strings, floats, containers, all tag forms) encoded and decoded, decode errors, a node answering ReadRequest with ReportData (wildcards, data versions, status codes), the protocol header, manual pairing codes (spec example 34970112332, Verhoeff) and QR payloads (the SDK examples' MT:-24J042C00KA0648G00)
+// Expected output:
+// bool: 08 09
+// ints: 002a 00ef 042a 01a601 02f067fdff 0300902f5009000000
+// strings: 0c0648656c6c6f21 0c0754736368c3bc73 10050001020304 14
+// floats: 0a00000000 0aabaaaa3e 0a33338f41 0a0000807f 0a000080ff
+// doubles: 0b0000000000000000 0b555555555555d53f 0b6666666666e63140 0b000000000000f07f
+// empty: 1518 1618 1718
+// struct: 1520002a2001ef18 {0 = 42, 1 = -17}
+// array: 160000000100020003000418 [0, 1, 2, 3, 4]
+// list: 17000120002a000200032000ef18 [[1, 0 = 42, 2, 3, 0 = -17]]
+// mixed: 16002a02f067fdff15180a33338f410c0648656c6c6f2118
+// mixed decoded: 5 elements, float 17.9 double back 17.9
+// tags: 24012a 4401002a 64a08601002a c4f1ffedde01002a e4f1ffeddeedfe55aa2a
+// tag text: 1 = 42U, Matter::100000 = 42U, 65521::57069:2857762541 = 42U
+// full struct: d5f1ffedde0100c4f1ffedde55aa2a18 65521::57069:1 = {65521::57069:43605 = 42U}
+// errors: truncated string / unexpected end of container / unterminated container / reserved element type 25
+// read request: 153600172402012403062404001818290324ff0b18
+// parsed paths: 1 6 0
+// report: 1536011535012400643701240201240306240400182802181818290424ff0b18
+// wildcard: 1/6/0 v100 false
+// wildcard: 1/6/65533 v100 4U
+// wildcard: 1/1026/0 v200 2150
+// missing: 5/6/0 status 127
+// missing: 1/8/0 status 195
+// missing: 1/6/16384 status 134
+// after change: 1/6/0 v101 true
+// basic info: 0/40/1 v1 "Fides"
+// header read: 050234120100
+// header report: 06053412010004030201
+// verhoeff: 3 true false
+// manual: 34970112332 749701123365521327694
+// parsed manual: true 20202021 3840 / true 65521 32769 / bad check false
+// qr: MT:-24J042C00KA0648G00 MT:Y.K9042C00KA0648G00 MT:-24J0AFN00KA0648G00
+// parsed qr: true 65521 32769 flow 0 caps 2 disc 3840 pass 20202021
+// passcodes: false true false
+use matter;
+use encoding;
+use string;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn text_of(b: Vec<i64>) -> str {
+    match tlv_decode(& b) {
+        Result::Ok(es) => {
+            return tlv_text(& es);
+        }
+        Result::Err(e) => {
+            return "error " + e;
+        }
+    }
+}
+
+fn err_of(h: str) -> str {
+    match tlv_decode(& hex_decode_bytes(h)) {
+        Result::Ok(_) => {
+            return "ok";
+        }
+        Result::Err(e) => {
+            return e;
+        }
+    }
+}
+
+fn one_uint(tag: TlvTag) -> Vec<i64> {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_uint(& mut w, tag, 42);
+    return w.out;
+}
+
+fn show_reports(label: str, b: & Vec<i64>) {
+    match matter_parse_report(b) {
+        Result::Ok(rs) => {
+            var i: i64 = 0;
+            while i < rs.len() {
+                val r: MatterReport = rs.get(i);
+                val p: str = int_to_str(r.path.endpoint) + "/" + int_to_str(r.path.cluster) + "/" + int_to_str(r.path.attribute);
+                if r.status >= 0 {
+                    println(label + ": " + p + " status " + int_to_str(r.status));
+                } else {
+                    println(label + ": " + p + " v" + int_to_str(r.version) + " " + r.value_text);
+                }
+                i = i + 1;
+            }
+        }
+        Result::Err(e) => {
+            println(label + ": " + e);
+        }
+    }
+}
+
+fn read_one(n: & MatterNode, label: str, ep: i64, cl: i64, at: i64) {
+    var ps: Vec<MatterPath> = Vec::new();
+    ps.push(matter_path(ep, cl, at));
+    match matter_node_read(n, & matter_read_request(& ps, true)) {
+        Result::Ok(b) => {
+            show_reports(label, & b);
+        }
+        Result::Err(e) => {
+            println(label + ": " + e);
+        }
+    }
+}
+
+fn main() {
+    var w: TlvWriter = tlv_writer();
+    tlv_put_bool(& mut w, tlv_anon(), false);
+    var w2: TlvWriter = tlv_writer();
+    tlv_put_bool(& mut w2, tlv_anon(), true);
+    println("bool: " + hx(w.out) + " " + hx(w2.out));
+
+    var ints: str = "ints:";
+    var iv: Vec<i64> = Vec::new();
+    iv.push(42);
+    iv.push(-17);
+    iv.push(422);
+    iv.push(-170000);
+    iv.push(40000000000);
+    var k: i64 = 0;
+    while k < iv.len() {
+        var wi: TlvWriter = tlv_writer();
+        if k == 1 {
+            tlv_put_int(& mut wi, tlv_anon(), iv.get(k));
+            ints = ints + " " + hx(wi.out);
+            var wu: TlvWriter = tlv_writer();
+            tlv_put_uint(& mut wu, tlv_anon(), 42);
+            ints = ints + " " + hx(wu.out);
+        } else {
+            tlv_put_int(& mut wi, tlv_anon(), iv.get(k));
+            ints = ints + " " + hx(wi.out);
+        }
+        k = k + 1;
+    }
+    println(ints);
+
+    var ws: TlvWriter = tlv_writer();
+    tlv_put_utf8(& mut ws, tlv_anon(), "Hello!");
+    var wt: TlvWriter = tlv_writer();
+    tlv_put_utf8(& mut wt, tlv_anon(), "Tschüs");
+    var wb: TlvWriter = tlv_writer();
+    tlv_put_bytes(& mut wb, tlv_anon(), & hex_decode_bytes("0001020304"));
+    var wn: TlvWriter = tlv_writer();
+    tlv_put_null(& mut wn, tlv_anon());
+    println("strings: " + hx(ws.out) + " " + hx(wt.out) + " " + hx(wb.out) + " " + hx(wn.out));
+
+    val inf: f64 = 1.0 / 0.0;
+    var fl: Vec<f64> = Vec::new();
+    fl.push(0.0);
+    fl.push(1.0 / 3.0);
+    fl.push(17.9);
+    fl.push(inf);
+    fl.push(0.0 - inf);
+    var fs: str = "floats:";
+    var ds: str = "doubles:";
+    k = 0;
+    while k < fl.len() {
+        var wf: TlvWriter = tlv_writer();
+        tlv_put_float(& mut wf, tlv_anon(), fl.get(k));
+        fs = fs + " " + hx(wf.out);
+        if k < 4 {
+            var wd: TlvWriter = tlv_writer();
+            tlv_put_double(& mut wd, tlv_anon(), fl.get(k));
+            ds = ds + " " + hx(wd.out);
+        }
+        k = k + 1;
+    }
+    println(fs);
+    println(ds);
+
+    var e1: TlvWriter = tlv_writer();
+    tlv_start_struct(& mut e1, tlv_anon());
+    tlv_end(& mut e1);
+    var e2: TlvWriter = tlv_writer();
+    tlv_start_array(& mut e2, tlv_anon());
+    tlv_end(& mut e2);
+    var e3: TlvWriter = tlv_writer();
+    tlv_start_list(& mut e3, tlv_anon());
+    tlv_end(& mut e3);
+    println("empty: " + hx(e1.out) + " " + hx(e2.out) + " " + hx(e3.out));
+
+    var st: TlvWriter = tlv_writer();
+    tlv_start_struct(& mut st, tlv_anon());
+    tlv_put_int(& mut st, tlv_ctx(0), 42);
+    tlv_put_int(& mut st, tlv_ctx(1), -17);
+    tlv_end(& mut st);
+    println("struct: " + hx(st.out) + " " + text_of(st.out));
+    var ar: TlvWriter = tlv_writer();
+    tlv_start_array(& mut ar, tlv_anon());
+    k = 0;
+    while k < 5 {
+        tlv_put_int(& mut ar, tlv_anon(), k);
+        k = k + 1;
+    }
+    tlv_end(& mut ar);
+    println("array: " + hx(ar.out) + " " + text_of(ar.out));
+    var li: TlvWriter = tlv_writer();
+    tlv_start_list(& mut li, tlv_anon());
+    tlv_put_int(& mut li, tlv_anon(), 1);
+    tlv_put_int(& mut li, tlv_ctx(0), 42);
+    tlv_put_int(& mut li, tlv_anon(), 2);
+    tlv_put_int(& mut li, tlv_anon(), 3);
+    tlv_put_int(& mut li, tlv_ctx(0), -17);
+    tlv_end(& mut li);
+    println("list: " + hx(li.out) + " " + text_of(li.out));
+    var mx: TlvWriter = tlv_writer();
+    tlv_start_array(& mut mx, tlv_anon());
+    tlv_put_int(& mut mx, tlv_anon(), 42);
+    tlv_put_int(& mut mx, tlv_anon(), -170000);
+    tlv_start_struct(& mut mx, tlv_anon());
+    tlv_end(& mut mx);
+    tlv_put_float(& mut mx, tlv_anon(), 17.9);
+    tlv_put_utf8(& mut mx, tlv_anon(), "Hello!");
+    tlv_end(& mut mx);
+    println("mixed: " + hx(mx.out));
+    match tlv_decode(& mx.out) {
+        Result::Ok(es) => {
+            val f: TlvElem = es.get(5);
+            var wd: TlvWriter = tlv_writer();
+            tlv_put_double(& mut wd, tlv_anon(), 17.9);
+            var dback: f64 = 0.0;
+            match tlv_decode(& wd.out) {
+                Result::Ok(des) => {
+                    dback = des.get(0).fval;
+                }
+                Result::Err(_) => {
+                }
+            }
+            println("mixed decoded: " + int_to_str(tlv_members(& es, 0).len()) + " elements, float " + int_to_str((f.fval * 10.0 + 0.5) as i64 / 10) + "." + int_to_str(((f.fval * 10.0 + 0.5) as i64) % 10) + " double back " + float_to_str(dback));
+        }
+        Result::Err(e) => {
+            println("mixed decoded: " + e);
+        }
+    }
+
+    println("tags: " + hx(one_uint(tlv_ctx(1))) + " " + hx(one_uint(tlv_common(1))) + " " + hx(one_uint(tlv_common(100000))) + " " + hx(one_uint(tlv_full(0xFFF1, 0xDEED, 1))) + " " + hx(one_uint(tlv_full(0xFFF1, 0xDEED, 0xAA55FEED))));
+    println("tag text: " + text_of(one_uint(tlv_ctx(1))) + ", " + text_of(one_uint(tlv_common(100000))) + ", " + text_of(one_uint(tlv_full(0xFFF1, 0xDEED, 0xAA55FEED))));
+    var fq: TlvWriter = tlv_writer();
+    tlv_start_struct(& mut fq, tlv_full(0xFFF1, 0xDEED, 1));
+    tlv_put_uint(& mut fq, tlv_full(0xFFF1, 0xDEED, 0xAA55), 42);
+    tlv_end(& mut fq);
+    println("full struct: " + hx(fq.out) + " " + text_of(fq.out));
+    println("errors: " + err_of("0c05414243") + " / " + err_of("18") + " / " + err_of("15") + " / " + err_of("19"));
+
+    var node: MatterNode = matter_node(0x1122334455667788);
+    matter_add_cluster(& mut node, 0, MATTER_CLUSTER_BASIC_INFORMATION, 1);
+    matter_set_attr(& mut node, 0, MATTER_CLUSTER_BASIC_INFORMATION, 1, matter_value_utf8("Fides"));
+    matter_set_attr(& mut node, 0, MATTER_CLUSTER_BASIC_INFORMATION, 2, matter_value_uint(0xFFF1));
+    matter_add_cluster(& mut node, 1, MATTER_CLUSTER_ON_OFF, 100);
+    matter_set_attr(& mut node, 1, MATTER_CLUSTER_ON_OFF, 0, matter_value_bool(false));
+    matter_set_attr(& mut node, 1, MATTER_CLUSTER_ON_OFF, MATTER_ATTR_CLUSTER_REVISION, matter_value_uint(4));
+    matter_add_cluster(& mut node, 1, MATTER_CLUSTER_TEMPERATURE, 200);
+    matter_set_attr(& mut node, 1, MATTER_CLUSTER_TEMPERATURE, 0, matter_value_int(2150));
+
+    var ps: Vec<MatterPath> = Vec::new();
+    ps.push(matter_path(1, MATTER_CLUSTER_ON_OFF, 0));
+    val rq: Vec<i64> = matter_read_request(& ps, true);
+    println("read request: " + hx(rq));
+    match matter_parse_read_request(& rq) {
+        Result::Ok(pp) => {
+            val p0: MatterPath = pp.get(0);
+            println("parsed paths: " + int_to_str(p0.endpoint) + " " + int_to_str(p0.cluster) + " " + int_to_str(p0.attribute));
+        }
+        Result::Err(e) => {
+            println("parsed paths: " + e);
+        }
+    }
+    match matter_node_read(& node, & rq) {
+        Result::Ok(b) => {
+            println("report: " + hx(b));
+        }
+        Result::Err(e) => {
+            println("report: " + e);
+        }
+    }
+    read_one(& node, "wildcard", 1, 0 - 1, 0 - 1);
+    read_one(& node, "missing", 5, MATTER_CLUSTER_ON_OFF, 0);
+    read_one(& node, "missing", 1, MATTER_CLUSTER_LEVEL, 0);
+    read_one(& node, "missing", 1, MATTER_CLUSTER_ON_OFF, 0x4000);
+    matter_set_attr(& mut node, 1, MATTER_CLUSTER_ON_OFF, 0, matter_value_bool(true));
+    read_one(& node, "after change", 1, MATTER_CLUSTER_ON_OFF, 0);
+    read_one(& node, "basic info", 0, MATTER_CLUSTER_BASIC_INFORMATION, 1);
+    println("header read: " + hx(matter_protocol_header(MATTER_OP_READ_REQUEST, 0x1234, true, true, 0 - 1)));
+    println("header report: " + hx(matter_protocol_header(MATTER_OP_REPORT_DATA, 0x1234, false, true, 0x01020304)));
+
+    println("verhoeff: " + int_to_str(verhoeff_check_digit("236")) + " " + bool_to_str(verhoeff_valid("2363")) + " " + bool_to_str(verhoeff_valid("2364")));
+    val setup: MatterSetup = MatterSetup { version: 0, vendor_id: 0xFFF1, product_id: 0x8001, flow: 0, discovery: MATTER_DISCOVERY_BLE, discriminator: 3840, passcode: 20202021, ok: true };
+    println("manual: " + matter_manual_code(& setup, false) + " " + matter_manual_code(& setup, true));
+    val m1: MatterSetup = matter_parse_manual_code("3497-011-2332");
+    val m2: MatterSetup = matter_parse_manual_code(matter_manual_code(& setup, true));
+    val m3: MatterSetup = matter_parse_manual_code("34970112331");
+    println("parsed manual: " + bool_to_str(m1.ok) + " " + int_to_str(m1.passcode) + " " + int_to_str(m1.discriminator) + " / " + bool_to_str(m2.ok) + " " + int_to_str(m2.vendor_id) + " " + int_to_str(m2.product_id) + " / bad check " + bool_to_str(m3.ok));
+    var s2: MatterSetup = setup;
+    s2.product_id = 0x8000;
+    var s3: MatterSetup = setup;
+    s3.discovery = MATTER_DISCOVERY_ON_NETWORK;
+    val qr: str = matter_qr_payload(& setup);
+    println("qr: " + qr + " " + matter_qr_payload(& s2) + " " + matter_qr_payload(& s3));
+    val q: MatterSetup = matter_parse_qr(qr);
+    println("parsed qr: " + bool_to_str(q.ok) + " " + int_to_str(q.vendor_id) + " " + int_to_str(q.product_id) + " flow " + int_to_str(q.flow) + " caps " + int_to_str(q.discovery) + " disc " + int_to_str(q.discriminator) + " pass " + int_to_str(q.passcode));
+    println("passcodes: " + bool_to_str(matter_passcode_valid(12345678)) + " " + bool_to_str(matter_passcode_valid(20202021)) + " " + bool_to_str(matter_passcode_valid(0)));
+}

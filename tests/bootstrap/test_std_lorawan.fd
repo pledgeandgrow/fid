@@ -1,0 +1,209 @@
+// stdlib/lorawan: AES-128 inverse cipher (FIPS 197 C.1), AES-CMAC (RFC 4493 subkeys and all four examples), a known uplink (lora-packet's 40F17DBE49..., "test"), join request/accept round trips, session keys, frame counters, MAC commands, ADR steps, LoRa time on air
+// Expected output:
+// sbox: 63 7c16
+// aes decrypt: 00112233445566778899aabbccddeeff
+// cmac K1: fbeed618357133667c85e08f7236a8de
+// cmac K2: f7ddac306ae266ccf90bc11ee46d513b
+// cmac 0: bb1d6929e95937287fa37d129b756746
+// cmac 16: 070a16b46b4d4144f79bdd9dd04a287c
+// cmac 40: dfa66747de9ae63030ca32611497c827
+// cmac 64: 51f0bebf7e3b9d92fc49741779363cfe
+// uplink: type 2 devaddr 49be7df1 fcnt 2 port 1 mic true payload test
+// re-encoded: 40f17dbe4900020001954378762b11ff0d
+// join request: 00000000d07ed5b37030051c000ba304003412dc7fda4e (23)
+// join verify: true tampered false
+// join fields: 70b3d57ed0000000 0004a30b001c0530 4660
+// join accept: 33 bytes ok true nonce 658188 net 19 addr 26011bda rx1 1 rx2 3 delay 1
+// cflist: 867100000 867300000 867500000 867700000 867900000
+// join accept tampered: false
+// join accept short: 17 ok true
+// keys differ: true 16 16
+// fcnt: 5 131074 -1 65539 70000
+// uplink 70000: mic true port 2 adr true payload hello
+// wrong counter: mic false
+// downlink: type 5 ack true pending true fopts 0602 port 0 mac 035207000106021402
+// mac: 3 [52 07 00 01] 6 [] 2 [14 02]
+// mac up: 3 [07] 6 [ff 14]
+// adr network: 5 0 / 5 0 / 5 2
+// adr device: false true 0 4 false
+// eu868: sf 12 7 7 bw 250 max 59 250
+// time on air us: 61696 1482752 328704
+use lorawan;
+use encoding;
+use string;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn cut(v: & Vec<i64>, n: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        o.push(v.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn hex32(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push((v >> 24) & 0xFF);
+    b.push((v >> 16) & 0xFF);
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn macs(cmds: & Vec<LwMacCmd>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < cmds.len() {
+        val c: LwMacCmd = cmds.get(i);
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(c.cid) + " [";
+        var j: i64 = 0;
+        while j < c.args.len() {
+            if j > 0 {
+                s = s + " ";
+            }
+            var one: Vec<i64> = Vec::new();
+            one.push(c.args.get(j));
+            s = s + hx(one);
+            j = j + 1;
+        }
+        s = s + "]";
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val sb: Vec<i64> = lw_aes_sbox();
+    var s3: Vec<i64> = Vec::new();
+    s3.push(sb.get(0));
+    s3.push(sb.get(1));
+    s3.push(sb.get(255));
+    println("sbox: " + hx(cut(& s3, 1)) + " " + hx(lw_reverse(& cut(& lw_reverse(& s3), 2))));
+    val fk: Vec<i64> = hex_decode_bytes("000102030405060708090a0b0c0d0e0f");
+    println("aes decrypt: " + hx(lw_aes_decrypt(& fk, & hex_decode_bytes("69c4e0d86a7b0430d8cdb78070b4c55a"))));
+
+    val ck: Vec<i64> = hex_decode_bytes("2b7e151628aed2a6abf7158809cf4f3c");
+    val sub: Vec<i64> = lw_cmac_subkeys(& ck);
+    println("cmac K1: " + hx(cut(& sub, 16)));
+    println("cmac K2: " + hx(lw_reverse(& cut(& lw_reverse(& sub), 16))));
+    val m64: Vec<i64> = hex_decode_bytes("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+    val empty: Vec<i64> = Vec::new();
+    println("cmac 0: " + hx(lw_cmac(& ck, & empty)));
+    println("cmac 16: " + hx(lw_cmac(& ck, & cut(& m64, 16))));
+    println("cmac 40: " + hx(lw_cmac(& ck, & cut(& m64, 40))));
+    println("cmac 64: " + hx(lw_cmac(& ck, & m64)));
+
+    val nwk: Vec<i64> = hex_decode_bytes("44024241ed4ce9a68c6a8bc055233fd3");
+    val app: Vec<i64> = hex_decode_bytes("ec925802ae430ca77fd3dd73cb2cc588");
+    val pkt: Vec<i64> = hex_decode_bytes("40F17DBE4900020001954378762B11FF0D");
+    val up: LwFrame = lw_data_decode(& nwk, & app, & pkt, lw_fcnt_extend(0 - 1, 2));
+    println("uplink: type " + int_to_str(up.mtype) + " devaddr " + hex32(up.dev_addr) + " fcnt " + int_to_str(up.fcnt) + " port " + int_to_str(up.fport) + " mic " + bool_to_str(up.mic_ok) + " payload " + str_from_bytes(up.payload));
+    val again: LwFrame = lw_frame(LW_UNCONFIRMED_UP, 0x49BE7DF1, 2, 1, str_bytes("test"));
+    println("re-encoded: " + hx(lw_data_encode(& nwk, & app, & again)));
+
+    val appkey: Vec<i64> = hex_decode_bytes("00112233445566778899aabbccddeeff");
+    val appeui: Vec<i64> = hex_decode_bytes("70b3d57ed0000000");
+    val deveui: Vec<i64> = hex_decode_bytes("0004a30b001c0530");
+    val jr: Vec<i64> = lw_join_request(& appkey, & appeui, & deveui, 0x1234);
+    println("join request: " + hx(jr) + " (" + int_to_str(jr.len()) + ")");
+    var bad: Vec<i64> = jr;
+    bad.set(5, bad.get(5) ^ 1);
+    println("join verify: " + bool_to_str(lw_join_request_verify(& appkey, & jr)) + " tampered " + bool_to_str(lw_join_request_verify(& appkey, & bad)));
+    println("join fields: " + hx(lw_join_request_eui(& jr, 0)) + " " + hx(lw_join_request_eui(& jr, 1)) + " " + int_to_str(lw_join_request_nonce(& jr)));
+
+    var freqs: Vec<i64> = Vec::new();
+    freqs.push(867100000);
+    freqs.push(867300000);
+    freqs.push(867500000);
+    freqs.push(867700000);
+    freqs.push(867900000);
+    val ja: LwJoinAccept = LwJoinAccept { ok: true, app_nonce: 0x0A0B0C, net_id: 0x13, dev_addr: 0x26011BDA, rx1_dr_offset: 1, rx2_dr: 3, rx_delay: 1, cf_list: lw_cflist_freqs(& freqs) };
+    val jab: Vec<i64> = lw_join_accept_encode(& appkey, & ja);
+    val jd: LwJoinAccept = lw_join_accept_decode(& appkey, & jab);
+    println("join accept: " + int_to_str(jab.len()) + " bytes ok " + bool_to_str(jd.ok) + " nonce " + int_to_str(jd.app_nonce) + " net " + int_to_str(jd.net_id) + " addr " + hex32(jd.dev_addr) + " rx1 " + int_to_str(jd.rx1_dr_offset) + " rx2 " + int_to_str(jd.rx2_dr) + " delay " + int_to_str(jd.rx_delay));
+    val cf: Vec<i64> = lw_cflist_decode(& jd.cf_list);
+    var cfs: str = "";
+    var i: i64 = 0;
+    while i < cf.len() {
+        if i > 0 {
+            cfs = cfs + " ";
+        }
+        cfs = cfs + int_to_str(cf.get(i));
+        i = i + 1;
+    }
+    println("cflist: " + cfs);
+    var jbad: Vec<i64> = jab;
+    jbad.set(3, jbad.get(3) ^ 0x10);
+    println("join accept tampered: " + bool_to_str(lw_join_accept_decode(& appkey, & jbad).ok));
+    var ja2: LwJoinAccept = ja;
+    ja2.cf_list = Vec::new();
+    val jab2: Vec<i64> = lw_join_accept_encode(& appkey, & ja2);
+    println("join accept short: " + int_to_str(jab2.len()) + " ok " + bool_to_str(lw_join_accept_decode(& appkey, & jab2).ok));
+
+    val nk: Vec<i64> = lw_session_key(& appkey, 1, jd.app_nonce, jd.net_id, 0x1234);
+    val ak: Vec<i64> = lw_session_key(& appkey, 2, jd.app_nonce, jd.net_id, 0x1234);
+    println("keys differ: " + bool_to_str(hx(nk) != hx(ak)) + " " + int_to_str(nk.len()) + " " + int_to_str(ak.len()));
+
+    println("fcnt: " + int_to_str(lw_fcnt_extend(0 - 1, 5)) + " " + int_to_str(lw_fcnt_extend(0x1FFFF, 2)) + " " + int_to_str(lw_fcnt_extend(10, 10)) + " " + int_to_str(lw_fcnt_extend(0xFFFE, 3)) + " " + int_to_str(lw_fcnt_extend(65535, 70000 & 0xFFFF)));
+    var u2: LwFrame = lw_frame(LW_CONFIRMED_UP, jd.dev_addr, 70000, 2, str_bytes("hello"));
+    u2.adr = true;
+    val u2b: Vec<i64> = lw_data_encode(& nk, & ak, & u2);
+    val u2d: LwFrame = lw_data_decode(& nk, & ak, & u2b, lw_fcnt_extend(65535, u2b.get(6) | (u2b.get(7) << 8)));
+    println("uplink 70000: mic " + bool_to_str(u2d.mic_ok) + " port " + int_to_str(u2d.fport) + " adr " + bool_to_str(u2d.adr) + " payload " + str_from_bytes(u2d.payload));
+    val u2w: LwFrame = lw_data_decode(& nk, & ak, & u2b, 70000 & 0xFFFF);
+    println("wrong counter: mic " + bool_to_str(u2w.mic_ok));
+
+    var cmds: Vec<LwMacCmd> = Vec::new();
+    cmds.push(lw_link_adr_req(5, 2, 0x0007, 0, 1));
+    cmds.push(LwMacCmd { cid: LW_CID_DEV_STATUS, args: Vec::new() });
+    cmds.push(LwMacCmd { cid: LW_CID_LINK_CHECK, args: hex_decode_bytes("1402") });
+    val macb: Vec<i64> = lw_mac_encode(& cmds);
+    var dn: LwFrame = lw_frame(LW_CONFIRMED_DOWN, jd.dev_addr, 7, 0, macb);
+    dn.ack = true;
+    dn.fpending = true;
+    dn.fopts = hex_decode_bytes("0602");
+    val dnb: Vec<i64> = lw_data_encode(& nk, & ak, & dn);
+    val dnd: LwFrame = lw_data_decode(& nk, & ak, & dnb, 7);
+    println("downlink: type " + int_to_str(dnd.mtype) + " ack " + bool_to_str(dnd.ack) + " pending " + bool_to_str(dnd.fpending) + " fopts " + hx(dnd.fopts) + " port " + int_to_str(dnd.fport) + " mac " + hx(dnd.payload));
+    var withjunk: Vec<i64> = dnd.payload;
+    withjunk.push(0x80);
+    withjunk.push(0x01);
+    println("mac: " + macs(& lw_mac_parse(& withjunk, LW_DIR_DOWN)));
+    var ups: Vec<LwMacCmd> = Vec::new();
+    ups.push(lw_link_adr_ans(true, true, true));
+    ups.push(LwMacCmd { cid: LW_CID_DEV_STATUS, args: hex_decode_bytes("ff14") });
+    println("mac up: " + macs(& lw_mac_parse(& lw_mac_encode(& ups), LW_DIR_UP)));
+
+    val a1: Vec<i64> = lw_adr_network(50, 0, 0, 100, 5, 7);
+    val a2: Vec<i64> = lw_adr_network(0 - 150, 5, 3, 100, 5, 7);
+    val a3: Vec<i64> = lw_adr_network(100, 5, 0, 100, 5, 7);
+    println("adr network: " + int_to_str(a1.get(0)) + " " + int_to_str(a1.get(1)) + " / " + int_to_str(a2.get(0)) + " " + int_to_str(a2.get(1)) + " / " + int_to_str(a3.get(0)) + " " + int_to_str(a3.get(1)));
+    var dev: LwAdrDevice = LwAdrDevice { ack_cnt: 0, dr: 5, txpow: 3 };
+    var req63: bool = false;
+    var k: i64 = 0;
+    while k < 63 {
+        req63 = lw_adr_uplink(& mut dev);
+        k = k + 1;
+    }
+    val req64: bool = lw_adr_uplink(& mut dev);
+    k = k + 1;
+    while k < 128 {
+        lw_adr_uplink(& mut dev);
+        k = k + 1;
+    }
+    val pow_after: i64 = dev.txpow;
+    val dr_after: i64 = dev.dr;
+    lw_adr_downlink(& mut dev);
+    val after_dl: bool = lw_adr_uplink(& mut dev);
+    println("adr device: " + bool_to_str(req63) + " " + bool_to_str(req64) + " " + int_to_str(pow_after) + " " + int_to_str(dr_after) + " " + bool_to_str(after_dl));
+    println("eu868: sf " + int_to_str(lw_eu868_sf(0)) + " " + int_to_str(lw_eu868_sf(5)) + " " + int_to_str(lw_eu868_sf(6)) + " bw " + int_to_str(lw_eu868_bw_khz(6)) + " max " + int_to_str(lw_eu868_max_payload(0)) + " " + int_to_str(lw_eu868_max_payload(5)));
+    println("time on air us: " + int_to_str(lw_time_on_air_us(23, 7, 125, 1, 8, true, true)) + " " + int_to_str(lw_time_on_air_us(23, 12, 125, 1, 8, true, true)) + " " + int_to_str(lw_time_on_air_us(51, 9, 125, 1, 8, true, true)));
+}

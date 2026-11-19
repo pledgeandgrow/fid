@@ -1,0 +1,33 @@
+// Miscompile log V1b (docs/verification/miscompile-log.md, V1 reduced on
+// Nov 17). A cast from a signed integer type to an unsigned one of the same
+// or a greater width below 64 bits keeps the sign on run, emit and --nat:
+// `(0 - 64) as i8 as u16` prints -64 instead of 65472, compares as -64
+// (a branch flips), and `(a as u16) - 65000` panics (-64 - 65000) where it
+// is 472. `(0 - 1) as i32 as u32 > 0` is false. ccompile is right. It is M1
+// the other way round (M1: unsigned to signed of one width), and it is not
+// stepped around by gen_vs_c.py's --avoid (a cast to a wider type is always
+// generated). Found by scripts/fuzz/gen_vs_c.py --seed 100 --avoid
+// nested-if-value: seeds 140 and 102 (VF2).
+
+fn main() -> i64 {
+    var a: i8 = 0 - 64;
+    println(a as u16);
+    println(a as u32);
+    var b: i16 = 0 - 2;
+    println(b as u32);
+    var c: i32 = 0 - 1;
+    if c as u32 > 0 { println(1); } else { println(0); }
+    var d: u16 = a as u16;
+    if d > 100 { println(1); } else { println(0); }
+    println((a as u16) as i64);
+    var e: u16 = (a as u16) - 65000;
+    println(e);
+    return 0;
+}
+//> 65472
+//> 4294967232
+//> 4294967294
+//> 1
+//> 1
+//> 65472
+//> 472

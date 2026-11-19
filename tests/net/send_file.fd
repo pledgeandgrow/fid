@@ -1,0 +1,78 @@
+// net_send_file (stdlib/net.fd, competitive roadmap RT14): a file sent on
+// a TCP connection in one process (the client's connect completes from the
+// listen backlog before accept; 30000 bytes fit in the loopback buffers, so
+// the send ends before the client reads). The kernel sends the file itself
+// where the system allows it: sendfile on Linux (C: compiler/codegen_c.fd
+// __p_zc_send_file; native: stdlib/linux_runtime/sys.fd
+// pert_net_send_file) and macOS, TransmitFile on Windows (C); the portable
+// body p_net_send_file reads and sends on the Windows native runtime.
+// Every back end must put the same bytes on the wire. C and native builds
+// only: `fid run` simulates sockets.
+//
+// Expected output:
+// listening: true
+// sent: 30000
+// received: 30000 true
+// empty: 0
+// missing: -1
+use net;
+use fs;
+use string;
+
+fn b2s(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+/// Everything the peer sends until it closes.
+fn read_all(fd: i64) -> str {
+    var got: str = "";
+    var more: bool = true;
+    while more {
+        val part: str = p_socket_recv_str(fd);
+        if str_len(part) == 0 {
+            more = false;
+        } else {
+            got = got + part;
+        }
+    }
+    return got;
+}
+
+fn main() -> i64 {
+    val path: str = "fid_zc_send.tmp";
+    val empty: str = "fid_zc_send_empty.tmp";
+    val text: str = str_slice(str_repeat("0123456789abcdefghijklmnopqrstuvwxyz\n", 811), 0, 30000);
+    fs_write_text(path, text);
+    fs_write_text(empty, "");
+    var port: i64 = 47411;
+    var lfd: i64 = 0 - 1;
+    while lfd < 0 && port < 47431 {
+        lfd = p_socket_listen(port);
+        if lfd < 0 {
+            port = port + 2;
+        }
+    }
+    println("listening: " + b2s(lfd >= 0));
+
+    val cfd: i64 = p_net_connect("127.0.0.1", port);
+    val sfd: i64 = p_socket_accept(lfd);
+    println("sent: " + int_to_str(net_send_file(sfd, path)));
+    p_socket_close(sfd);
+    val got: str = read_all(cfd);
+    println("received: " + int_to_str(str_len(got)) + " " + b2s(got == text));
+    p_net_close(cfd);
+
+    val cfd2: i64 = p_net_connect("127.0.0.1", port);
+    val sfd2: i64 = p_socket_accept(lfd);
+    println("empty: " + int_to_str(net_send_file(sfd2, empty)));
+    println("missing: " + int_to_str(net_send_file(sfd2, "fid_zc_no_such_file.tmp")));
+    p_socket_close(sfd2);
+    p_net_close(cfd2);
+    p_socket_close(lfd);
+    fs_delete(path);
+    fs_delete(empty);
+    return 0;
+}

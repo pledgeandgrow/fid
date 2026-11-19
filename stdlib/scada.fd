@@ -110,9 +110,11 @@ pub struct ModbusFrame {
 /// Compute CRC-16 (Modbus) over a Vec of bytes.
 @deterministic @crashfree pub fn modbus_crc16(data: Vec<i64>) -> i64 {
     var crc = 0xFFFF;
-    for i in 0..data.len() {
-        crc = crc ^ data.get(i);
-        for j in 0..8 {
+    // Vec_len, not data.len(): the safety check resolves `.len()` by name
+    // and finds StringBuilder's (needs-other in CD2's report)
+    for i in 0..Vec_len(data) {
+        crc = crc ^ vec_get_or(data, i, 0);
+        for _j in 0..8 {
             if (crc & 1) == 1 {
                 crc = (crc >> 1) ^ 0xA001;
             } else {
@@ -125,10 +127,10 @@ pub struct ModbusFrame {
 
 /// Verify CRC-16 of a complete frame (including CRC bytes).
 @deterministic @crashfree @wrapping pub fn modbus_crc_verify(data: Vec<i64>) -> bool {
-    if data.len() < 2 {
+    var n = Vec_len(data);
+    if n < 2 {
         return false;
     }
-    var n = data.len();
     var received_crc = vec_get_or(data, n - 2, 0) | (vec_get_or(data, n - 1, 0) << 8);
     var payload = Vec::new();
     for i in 0..n - 2 {
@@ -144,6 +146,18 @@ pub struct ModbusFrame {
 /// slave_addr: Modbus slave address (1-247)
 /// start_addr: starting register address (0-65535)
 /// quantity: number of registers to read (1-125)
+///
+/// Example:
+///   val f = modbus_read_holding_registers(1, 0, 10);
+///   val b = modbus_frame_serialize(f);
+///   assert_eq(b.len(), 8);
+///   assert_eq(b.get(1), 3);
+///   assert_eq(b.get(5), 10);
+///   assert_eq(b.get(6), 0xC5);
+///   assert_eq(b.get(7), 0xCD);
+///   val back = modbus_frame_deserialize(b);
+///   assert_eq(back.function_code, 3);
+///   assert(!back.is_exception);
 pub fn modbus_read_holding_registers(slave_addr: i64, start_addr: i64, quantity: i64) -> ModbusFrame {
     var data = Vec::new();
     data.push((start_addr >> 8) & 0xFF);
@@ -274,7 +288,7 @@ pub fn modbus_decode_registers(frame: ModbusFrame) -> Vec<i64> {
     if frame.data.len() < 1 {
         return Vec::new();
     }
-    var byte_count = frame.data.get(0);
+    var _byte_count = frame.data.get(0);
     var result = Vec::new();
     var i = 1;
     while i + 1 < frame.data.len() {

@@ -1,0 +1,146 @@
+// CT6 / DB4 / CT9 (docs/roadmap/complaint-roadmap.md, llvm-roadmap.md):
+// what a debugger sees in a native Linux build, checked by running it
+// under qemu-user's gdb stub (tests/nattools/dbg_run_check.py speaks the
+// GDB remote protocol; no gdb needed):
+//   fid emit tests/bootstrap/test_machine_dbg_run.fd --target x86_64-linux -o t
+//   python3 tests/nattools/dbg_run_check.py t tests/bootstrap/test_machine_dbg_run.fd
+//   fid emit ... --debug -o td; python3 ... td ... --strict
+// (also aarch64-linux, riscv64-linux). A `// @name` marks a line to stop
+// on; a `// dbg name#hit var=value` line says what the variables hold
+// there (`!`: available even in the optimized build); `// dbg-fn` and
+// `// dbg-type` name what .debug_info must describe as Fides writes it,
+// `// dbg-vtype fn var Type` the type a variable shows with (str as `str`,
+// a struct held by its address as the struct).
+// gdb: `break test_machine_dbg_run.fd:<line>`, `info args`, `info locals`,
+// `print p`, `ptype struct Seg`, `break 'Point::len2'`.
+// Expected output:
+// 42
+// 120
+// 25
+// 12
+// 77
+// 1250
+// 9
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+struct Seg {
+    a: Point,
+    b: Point,
+    tag: u8,
+}
+
+impl Point {
+    fn len2(self) -> i64 {
+        var sq: i64 = self.x * self.x + self.y * self.y;
+        if sq > 1000000 {
+            println(sq);
+        }
+        return sq;
+    }
+}
+
+fn scale(base: i64, factor: i64) -> i64 {
+    var acc: i64 = 0;
+    var step: i64 = 0;
+    while step < factor {
+        acc = acc + base; // @loop
+        if acc > 1000000 {
+            println(acc);
+        }
+        step = step + 1;
+    }
+    return acc; // @ret
+}
+
+fn fact(n: i64) -> i64 {
+    if n <= 1 { // @fact
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+fn count_bytes(s: str, skip: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) != skip { // @bytes
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn mix(x: i64, flag: bool) -> i64 {
+    var out: i64 = x;
+    if flag {
+        out = out * 7; // @mix
+        if out > 1000000 {
+            println(out);
+        }
+    }
+    return out;
+}
+
+fn seg_span(s: Seg) -> i64 {
+    var dx: i64 = s.b.x - s.a.x;
+    var dy: i64 = s.b.y - s.a.y;
+    if dx > 1000000 {
+        println(dx);
+    }
+    return dx * dy + s.tag as i64; // @span
+}
+
+// A generic function: its i64 instance (symbol pick__i64) is named
+// pick<i64> in .debug_info (CT9)
+fn pick<T>(a: T, b: T, n: i64) -> T {
+    var out: T = a;
+    var k: i64 = 0;
+    while k < n {
+        out = b;
+        if k > 1000000 { // @pick
+            println(k);
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// dbg loop#1 !base=6 !factor=7 !acc=0 !step=0
+// dbg loop#3 base=6 factor=7 acc=12 step=2
+// dbg ret#1 acc=42
+// dbg fact#1 !n=5
+// dbg fact#2 !n=4
+// dbg fact#5 !n=1
+// dbg bytes#1 s="hello  world !" skip=32 !n=0 !i=0
+// dbg bytes#3 n=2 i=2
+// dbg mix#1 x=11 flag=true
+// dbg span#1 !dx=7 !dy=7 s.a.x=1 s.b.y=9 s.tag=1
+// dbg pick#1 !k=0 n=2
+// dbg pick#2 k=1
+// dbg-fn Point::len2
+// dbg-fn scale
+// dbg-fn pick<i64>
+// dbg-vtype count_bytes s str
+// dbg-vtype seg_span s Seg
+// dbg-vtype Point::len2 self Point
+// dbg-vtype scale acc i64
+// dbg-type Seg a.x a.y b.x b.y tag
+// dbg-type Point x y
+
+fn main() {
+    var total: i64 = scale(6, 7);
+    println(total);
+    println(fact(5));
+    val p: Point = Point { x: 3, y: 4 };
+    println(p.len2());
+    println(count_bytes("hello  world !", 32) + 1);
+    println(mix(11, true));
+    val s: Seg = Seg { a: Point { x: 1, y: 2 }, b: Point { x: 8, y: 9 }, tag: 1 };
+    println(seg_span(s) + 1200);
+    println(pick(3, 9, 2));
+}

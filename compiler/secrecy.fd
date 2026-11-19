@@ -64,6 +64,12 @@ pub struct SecrecyChecker {
     pub line: i64,
     pub report: bool,
     pub errors: Vec<str>,
+    // CS5: what a call needs of its callee (index as `all`), so no analysis
+    // copies another function's Func (a parallel worker must not touch what
+    // another worker's function owns): its parameters' names, and its
+    // annotations as bits (1 @secret, 2 @sensitive, 4 @declassify).
+    pub param_names: Vec<Vec<str>>,
+    pub fn_anns: Vec<i64>,
 }
 
 // --- Labels ---------------------------------------------------------------
@@ -139,6 +145,50 @@ fn sec_has_annotation(anns: Vec<Annotation>, name: str) -> bool {
 
 // --- Setup ----------------------------------------------------------------
 
+// The type names a free function `T_m` can be a method of (2g.71): the
+// program's structs and enums, and the builtin types core and the stdlib
+// give methods by name (`Vec_push`, `HashMap_get`, `str_split`, ...).
+fn sec_type_names(program: Program) -> i64 {
+    var names: i64 = HashMap_new();
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        HashMap_insert(names, program.structs.get(si).name, 1);
+        si = si + 1;
+    }
+    var ei: i64 = 0;
+    while ei < program.enums.len() {
+        HashMap_insert(names, program.enums.get(ei).name, 1);
+        ei = ei + 1;
+    }
+    HashMap_insert(names, "Vec", 1);
+    HashMap_insert(names, "HashMap", 1);
+    HashMap_insert(names, "str", 1);
+    HashMap_insert(names, "Str", 1);
+    HashMap_insert(names, "String", 1);
+    HashMap_insert(names, "StringBuilder", 1);
+    HashMap_insert(names, "Option", 1);
+    HashMap_insert(names, "Result", 1);
+    HashMap_insert(names, "Box", 1);
+    HashMap_insert(names, "Rc", 1);
+    HashMap_insert(names, "Arc", 1);
+    HashMap_insert(names, "i64", 1);
+    HashMap_insert(names, "u64", 1);
+    HashMap_insert(names, "f64", 1);
+    HashMap_insert(names, "bool", 1);
+    return names;
+}
+
+// method name -> one more key it may call
+fn sec_index_method(method_index: i64, method_keys: & mut Vec<Vec<str>>, method: str, key: str) {
+    var slot: i64 = HashMap_get(method_index, method);
+    if slot == 0 {
+        method_keys.push(Vec::new());
+        slot = method_keys.len();
+        HashMap_insert(method_index, method, slot);
+    }
+    method_keys.get(slot - 1).push(key);
+}
+
 pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
     var all: Vec<SecFunc> = Vec::new();
     var i: i64 = 0;
@@ -178,25 +228,30 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
     var func_index: i64 = HashMap_new();
     var method_index: i64 = HashMap_new();
     var method_keys: Vec<Vec<str>> = Vec::new();
+    // 2g.71: what `x.m(..)` can call. An impl or trait method is found by
+    // its own name; a free function `T_m` only when `T` names a type (a
+    // struct, an enum, or a builtin one such as core's `Vec_push`). Every
+    // `_`-suffix of every name used to count, so on a native build, where
+    // the runtime is merged into the program, `v.push(x)` also reached
+    // pe_runtime's `pe_wq_push(t)` (it writes a global, an output) and
+    // crypto_hmac_sha256 failed the @secret check there and nowhere else.
+    var type_names: i64 = sec_type_names(program);
     var k: i64 = 0;
     while k < all.len() {
         var key: str = all.get(k).key;
         if HashMap_get(func_index, key) == 0 {
             HashMap_insert(func_index, key, k + 1);
         }
-        var p: i64 = 0;
-        while p < str_len(key) {
-            if str_byte_at(key, p) == 95 {
-                var suffix: str = str_slice(key, p + 1, str_len(key));
-                var slot: i64 = HashMap_get(method_index, suffix);
-                if slot == 0 {
-                    method_keys.push(Vec::new());
-                    slot = method_keys.len();
-                    HashMap_insert(method_index, suffix, slot);
+        if !str_starts_with(all.get(k).skey, "fn:") {
+            sec_index_method(method_index, & mut method_keys, all.get(k).func.name, key);
+        } else {
+            var p: i64 = 0;
+            while p < str_len(key) {
+                if str_byte_at(key, p) == 95 && p > 0 && HashMap_get(type_names, str_slice(key, 0, p)) != 0 {
+                    sec_index_method(method_index, & mut method_keys, str_slice(key, p + 1, str_len(key)), key);
                 }
-                method_keys.get(slot - 1).push(key);
+                p = p + 1;
             }
-            p = p + 1;
         }
         k = k + 1;
     }
@@ -211,8 +266,33 @@ pub fn SecrecyChecker_new(program: Program) -> SecrecyChecker {
         HashMap_insert(globals, program.consts.get(ci).name, 1);
         ci = ci + 1;
     }
+    var param_names: Vec<Vec<str>> = Vec::new();
+    var fn_anns: Vec<i64> = Vec::new();
+    var fk: i64 = 0;
+    while fk < all.len() {
+        var ff: Func = all.get(fk).func;
+        var pn: Vec<str> = Vec::new();
+        var pj: i64 = 0;
+        while pj < ff.params.len() {
+            pn.push(ff.params.get(pj).name);
+            pj = pj + 1;
+        }
+        param_names.push(pn);
+        var bits: i64 = 0;
+        if sec_has_annotation(ff.annotations, "secret") {
+            bits = bits + 1;
+        }
+        if sec_has_annotation(ff.annotations, "sensitive") {
+            bits = bits + 2;
+        }
+        if sec_has_annotation(ff.annotations, "declassify") {
+            bits = bits + 4;
+        }
+        fn_anns.push(bits);
+        fk = fk + 1;
+    }
     return SecrecyChecker {
-        all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), var_index: HashMap_new(), var_labels: Vec::new(), ref_params: Vec::new(), pc: Vec::new(), func_name: "", may_return_secret: false, may_return_sensitive: false, declassify: false, cur_leaks: Vec::new(), cur_returns: Vec::new(), cur_outputs: false, changed: false, line: 0, report: false, errors: Vec::new(),
+        param_names: param_names, fn_anns: fn_anns, all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), var_index: HashMap_new(), var_labels: Vec::new(), ref_params: Vec::new(), pc: Vec::new(), func_name: "", may_return_secret: false, may_return_sensitive: false, declassify: false, cur_leaks: Vec::new(), cur_returns: Vec::new(), cur_outputs: false, changed: false, line: 0, report: false, errors: Vec::new(),
     };
 }
 
@@ -374,7 +454,9 @@ fn sec_ret(self: & mut SecrecyChecker, l: Vec<i64>) {
 
 fn sec_analyze_func(self: & mut SecrecyChecker, key: str, f: Func) {
     self.func_name = f.name;
-    self.line = 0;
+    // TL2: what is reported before its first statement is placed at its
+    // `fn`, not at "line 0"
+    self.line = f.line;
     self.may_return_secret = sec_has_annotation(f.annotations, "secret");
     self.may_return_sensitive = sec_has_annotation(f.annotations, "sensitive");
     self.declassify = sec_has_annotation(f.annotations, "declassify");
@@ -429,9 +511,13 @@ fn sec_analyze_func(self: & mut SecrecyChecker, key: str, f: Func) {
         }
         pass = pass + 1;
     }
-    sec_set_summary(self, key, SecSummary {
-        leaks: self.cur_leaks, returns: self.cur_returns, outputs: self.cur_outputs
-    });
+    // CS5: the reporting pass starts from the fixpoint's summaries, which
+    // it cannot grow; it writes none (a parallel worker of it must not)
+    if !self.report {
+        sec_set_summary(self, key, SecSummary {
+            leaks: self.cur_leaks, returns: self.cur_returns, outputs: self.cur_outputs
+        });
+    }
 }
 
 // --- Statements -----------------------------------------------------------
@@ -993,20 +1079,24 @@ fn sec_call(self: & mut SecrecyChecker, callee: str, args: Vec<Expr>) -> Vec<i64
         // A builtin computes its result from its arguments.
         return all;
     }
-    var f: Func = self.all.get(slot - 1).func;
-    return sec_apply_summary(self, callee, f, sec_summary(self, callee), ls, pc);
+    return sec_apply_summary(self, callee, slot, sec_summary(self, callee), ls, pc);
 }
 
-/// Apply callee `f`'s summary to argument labels `ls` (`ls[i]` is parameter `i`).
-fn sec_apply_summary(self: & mut SecrecyChecker, name: str, f: Func, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
+/// Apply the summary of the callee at `slot` (index + 1 into `all`) to
+/// argument labels `ls` (`ls[i]` is parameter `i`). CS5: the callee's
+/// parameter names and annotations come from the tables
+/// SecrecyChecker_new made, not from a copy of its Func.
+fn sec_apply_summary(self: & mut SecrecyChecker, name: str, slot: i64, summ: SecSummary, ls: Vec<Vec<i64>>, pc: Vec<i64>) -> Vec<i64> {
+    var pnames: Vec<str> = self.param_names.get(slot - 1);
+    var anns: i64 = self.fn_anns.get(slot - 1);
     var li: i64 = 0;
     while li < summ.leaks.len() {
         var i: i64 = summ.leaks.get(li);
         if i < ls.len() {
             var l: Vec<i64> = ls.get(i);
             var pname: str = "";
-            if i < f.params.len() {
-                pname = f.params.get(i).name;
+            if i < pnames.len() {
+                pname = pnames.get(i);
             }
             if sec_has(l, - 1) {
                 sec_error(self, "@secret", "a secret value is passed to '" + name + "', which outputs its parameter '" + pname + "'");
@@ -1047,13 +1137,13 @@ fn sec_apply_summary(self: & mut SecrecyChecker, name: str, f: Func, summ: SecSu
         }
         ri = ri + 1;
     }
-    if sec_has_annotation(f.annotations, "secret") {
+    if (anns & 1) != 0 {
         out = sec_union(out, sec_one(- 1));
     }
-    if sec_has_annotation(f.annotations, "sensitive") {
+    if (anns & 2) != 0 {
         out = sec_union(out, sec_one(- 2));
     }
-    if sec_has_annotation(f.annotations, "declassify") {
+    if (anns & 4) != 0 {
         out = sec_none();
     }
     return out;
@@ -1093,14 +1183,108 @@ fn sec_method_call(self: & mut SecrecyChecker, receiver: Expr, method: str, args
     var k: i64 = 0;
     while k < keys.len() {
         var key: str = keys.get(k);
-        var f: Func = self.all.get(HashMap_get(self.func_index, key) - 1).func;
-        out = sec_union(out, sec_apply_summary(self, method, f, sec_summary(self, key), ls, pc));
+        out = sec_union(out, sec_apply_summary(self, method, HashMap_get(self.func_index, key), sec_summary(self, key), ls, pc));
         k = k + 1;
     }
     return out;
 }
 
 // --- Entry point ----------------------------------------------------------
+
+// --- Parallel reporting pass (CS5) ----------------------------------------
+// FID_PAR=N, as for the escape check (escape.fd "Parallel reporting pass",
+// which says why this is safe and gives the same output): the summaries are
+// final before the reporting pass and it writes none (sec_analyze_func), so
+// each worker checks a contiguous chunk with a checker of its own, copied
+// from the master's (only read: nothing of it is kept, which would copy
+// it), no analysis keeps another function's Func (sec_apply_summary reads
+// the tables), and the chunks' messages are merged in order with
+// sec_error's rule.
+pub var g_sec_par_units: Vec<SecFunc> = Vec::new();
+pub var g_sec_par_master: Vec<SecrecyChecker> = Vec::new();
+
+/// Copies of the summaries `v` in buffers of their own (`v` is only read).
+fn sec_own_summaries(v: Vec<SecSummary>) -> Vec<SecSummary> {
+    var out: Vec<SecSummary> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(SecSummary {
+            leaks: par_own_i64s(v.get(i).leaks), returns: par_own_i64s(v.get(i).returns), outputs: v.get(i).outputs
+        });
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A worker's checker: the tables of `c` (the master, only read) in
+/// buffers of its own.
+fn sec_par_copy(c: SecrecyChecker) -> SecrecyChecker {
+    var no_all: Vec<SecFunc> = Vec::new();
+    var no_labels: Vec<Vec<i64>> = Vec::new();
+    var no_refs: Vec<str> = Vec::new();
+    var no_pc: Vec<Vec<i64>> = Vec::new();
+    var no_leaks: Vec<i64> = Vec::new();
+    var no_returns: Vec<i64> = Vec::new();
+    var no_errors: Vec<str> = Vec::new();
+    return SecrecyChecker {
+        all: no_all, func_index: c.func_index, method_index: c.method_index, method_keys: par_own_strss(c.method_keys), globals: c.globals, summary_index: c.summary_index, summaries: sec_own_summaries(c.summaries), var_index: HashMap_new(), var_labels: no_labels, ref_params: no_refs, pc: no_pc, func_name: "", may_return_secret: false, may_return_sensitive: false, declassify: false, cur_leaks: no_leaks, cur_returns: no_returns, cur_outputs: false, changed: false, line: 0, report: true, errors: no_errors, param_names: par_own_strss(c.param_names), fn_anns: par_own_i64s(c.fn_anns),
+    };
+}
+
+/// A worker: units s..e of g_sec_par_units with a checker of its own; its
+/// messages in order. The units are passed, never kept.
+pub fn sec_par_worker(s: i64, e: i64) -> Vec<str> {
+    var c: SecrecyChecker = sec_par_copy(g_sec_par_master.get(0));
+    var i: i64 = s;
+    while i < e {
+        sec_analyze_func(& mut c, g_sec_par_units.get(i).key, g_sec_par_units.get(i).func);
+        i = i + 1;
+    }
+    var out: Vec<str> = c.errors;
+    return out;
+}
+
+/// The reporting pass over `units` in up to `nw` threads, with `c` (after
+/// the fixpoint) as the master: the workers' messages in order. The caller
+/// merges them into c.errors by sec_error's rule.
+fn sec_par_report(c: SecrecyChecker, units: Vec<SecFunc>, nw: i64) -> Vec<str> {
+    var skeys: Vec<str> = Vec::new();
+    var ui: i64 = 0;
+    while ui < units.len() {
+        skeys.push(units.get(ui).skey);
+        ui = ui + 1;
+    }
+    var bounds: Vec<i64> = par_chunk_bounds(skeys, nw);
+    var nch: i64 = bounds.len() / 2;
+    var master: Vec<SecrecyChecker> = Vec::new();
+    master.push(c);
+    g_sec_par_master = master;
+    g_sec_par_units = units;
+    var futs: Vec<Future<Vec<str>> > = Vec::new();
+    var wi: i64 = 0;
+    while wi < nch {
+        var s: i64 = bounds.get(2 * wi);
+        var e: i64 = bounds.get(2 * wi + 1);
+        futs.push(spawn sec_par_worker(s, e));
+        wi = wi + 1;
+    }
+    var out: Vec<str> = Vec::new();
+    wi = 0;
+    while wi < futs.len() {
+        var errs: Vec<str> = await futs.get(wi);
+        var ei: i64 = 0;
+        while ei < errs.len() {
+            out.push(errs.get(ei));
+            ei = ei + 1;
+        }
+        wi = wi + 1;
+    }
+    var no_master: Vec<SecrecyChecker> = Vec::new();
+    g_sec_par_master = no_master;
+    var no_units: Vec<SecFunc> = Vec::new();
+    g_sec_par_units = no_units;
+    return out;
+}
 
 /// Run the @secret check over every function of `program`.
 pub fn secrecy_check(program: Program) -> Vec<str> {
@@ -1127,6 +1311,32 @@ pub fn secrecy_check_skipped(program: Program, skip: i64) -> Vec<str> {
         }
     }
     c.report = true;
+    // CS5: FID_PAR=N checks the bodies in N threads (the same messages in
+    // the same order)
+    var nw: i64 = esc_par_workers();
+    if nw > 1 {
+        var punits: Vec<SecFunc> = Vec::new();
+        var pj: i64 = 0;
+        while pj < c.all.len() {
+            var psf: SecFunc = c.all.get(pj);
+            if skip == 0 || !HashMap_contains(skip, psf.skey) {
+                punits.push(psf);
+            }
+            pj = pj + 1;
+        }
+        if punits.len() >= 64 {
+            var perrs: Vec<str> = sec_par_report(c, punits, nw);
+            var pe: i64 = 0;
+            while pe < perrs.len() {
+                var pm: str = perrs.get(pe);
+                if !str_vec_contains(c.errors, pm) {
+                    c.errors.push(pm);
+                }
+                pe = pe + 1;
+            }
+            return c.errors;
+        }
+    }
     var j: i64 = 0;
     while j < c.all.len() {
         var sf2: SecFunc = c.all.get(j);

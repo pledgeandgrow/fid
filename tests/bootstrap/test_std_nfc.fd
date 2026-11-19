@@ -1,0 +1,120 @@
+// stdlib/nfc: NDEF records against the NFC Forum examples (URI
+// "http://www.nfc.com" = D1 01 08 55 01 6E 66 63 2E 63 6F 6D, Text
+// "Hello, world!" en), URI prefix choice, multi-record flags, normal
+// (4-byte) lengths, chunked records, UTF-16 text in both byte orders,
+// smart posters, Android application records, decode errors, and Type 2
+// TLVs. Tag access needs a device: only the bytes are tested.
+// Expected output:
+// uri d1010855016e66632e636f6d
+// text d101105402656e48656c6c6f2c20776f726c6421
+// decoded http://www.nfc.com | en Hello, world!
+// prefixes 5 4 2 6 0 tel:+15551234
+// two records 91 51 2
+// long c2 0000012c 300 ok true
+// chunked b2 36 56 decoded 1 10 type text/plain
+// utf16 826672006800e9 -> hé fr true; le hi
+// poster https://nfc-forum.org NFC Forum en action 1 size 1024 type text/html
+// app d4 0f android.com:pkg com.example.app
+// errors no ME record | first record without MB | record longer than the message | unchanged TNF outside a chunk
+// tlv 0314 ... fe found 20 long 03ff012c
+// cc e1 10 06 00
+// calls getNdefMessage beginSession
+use nfc;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn bytes_n(n: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push((b + i) & 255); i = i + 1; }
+    return v;
+}
+
+fn one(r: NdefRecord) -> Vec<i64> {
+    var v: Vec<NdefRecord> = Vec::new();
+    v.push(r);
+    return ndef_encode(v, 0);
+}
+
+fn main() {
+    val u: Vec<i64> = one(ndef_uri_record("http://www.nfc.com"));
+    println("uri " + hx(u));
+    val t: Vec<i64> = one(ndef_text_record("Hello, world!", "en", false));
+    println("text " + hx(t));
+    val du: NdefMessage = ndef_decode(u);
+    val dt: NdefMessage = ndef_decode(t);
+    val tt: NdefText = ndef_text(&dt.records.get(0));
+    println("decoded " + ndef_uri(&du.records.get(0)) + " | " + tt.lang + " " + tt.text);
+    println("prefixes " + int_to_str(ndef_uri_record("tel:+15551234").payload.get(0)) + " "
+        + int_to_str(ndef_uri_record("https://example.com").payload.get(0)) + " "
+        + int_to_str(ndef_uri_record("https://www.example.com").payload.get(0)) + " "
+        + int_to_str(ndef_uri_record("mailto:a@b.c").payload.get(0)) + " "
+        + int_to_str(ndef_uri_record("geo:1,2").payload.get(0)) + " " + ndef_uri(&ndef_uri_record("tel:+15551234")));
+    var two: Vec<NdefRecord> = Vec::new();
+    two.push(ndef_uri_record("http://www.nfc.com"));
+    two.push(ndef_text_record("Hi", "en", false));
+    val tb: Vec<i64> = ndef_encode(two, 0);
+    println("two records " + int_to_hex(tb.get(0)) + " " + int_to_hex(tb.get(12)) + " " + int_to_str(ndef_decode(tb).records.len()));
+    val big: Vec<i64> = one(ndef_mime_record("application/octet-stream", bytes_n(300, 0)));
+    var lenb: Vec<i64> = Vec::new();
+    lenb.push(big.get(2)); lenb.push(big.get(3)); lenb.push(big.get(4)); lenb.push(big.get(5));
+    val dbig: NdefMessage = ndef_decode(big);
+    println("long " + int_to_hex(big.get(0)) + " " + hx(lenb) + " " + int_to_str(dbig.records.get(0).payload.len()) + " ok " + bool_to_str(dbig.ok));
+    var ch: Vec<NdefRecord> = Vec::new();
+    ch.push(ndef_mime_record("text/plain", bytes_n(10, 65)));
+    val cb: Vec<i64> = ndef_encode(ch, 4);
+    // chunk headers: first (type "text/plain", 4 bytes), middle, last
+    val h2: i64 = cb.get(3 + 10 + 4);
+    val h3: i64 = cb.get(3 + 10 + 4 + 3 + 4);
+    val dc: NdefMessage = ndef_decode(cb);
+    println("chunked " + int_to_hex(cb.get(0)) + " " + int_to_hex(h2) + " " + int_to_hex(h3) + " decoded " + int_to_str(dc.records.len()) + " "
+        + int_to_str(dc.records.get(0).payload.len()) + " type " + enc_bytes_to_str(dc.records.get(0).rtype));
+    val rec16: NdefRecord = ndef_text_record("h\u{e9}", "fr", true);
+    val ut: NdefText = ndef_text(&rec16);
+    var le: Vec<i64> = Vec::new();
+    le.push(0x82); le.push(101); le.push(110); le.push(0xFF); le.push(0xFE); le.push(104); le.push(0); le.push(105); le.push(0);
+    val lt: NdefText = ndef_text(&ndef_record(TNF_WELL_KNOWN, "T", le));
+    println("utf16 " + hx(rec16.payload) + " -> " + ut.text + " " + ut.lang + " " + bool_to_str(ut.utf16) + "; le " + lt.text);
+    var sp: SmartPoster = smart_poster_new("https://nfc-forum.org");
+    smart_poster_title(&mut sp, "en", "NFC Forum");
+    sp.action = NFC_ACTION_SAVE;
+    sp.size = 1024;
+    sp.mime = "text/html";
+    val spb: Vec<i64> = one(ndef_smart_poster_record(&sp));
+    val back: SmartPoster = ndef_smart_poster(&ndef_decode(spb).records.get(0));
+    println("poster " + back.uri + " " + back.titles.get(0) + " " + back.langs.get(0) + " action " + int_to_str(back.action)
+        + " size " + int_to_str(back.size) + " type " + back.mime);
+    val app: Vec<i64> = one(ndef_android_app_record("com.example.app"));
+    val dapp: NdefMessage = ndef_decode(app);
+    println("app " + int_to_hex(app.get(0)) + " " + hex_encode_bytes(bytes_n(1, app.get(1))) + " " + enc_bytes_to_str(dapp.records.get(0).rtype)
+        + " " + enc_bytes_to_str(dapp.records.get(0).payload));
+
+    var noend: Vec<i64> = u;
+    noend.set(0, 0x91);
+    var nomb: Vec<i64> = u;
+    nomb.set(0, 0x51);
+    var trunc: Vec<i64> = u;
+    trunc.pop();
+    var unch: Vec<i64> = u;
+    unch.set(0, 0xD6);
+    println("errors " + ndef_decode(noend).error + " | " + ndef_decode(nomb).error + " | " + ndef_decode(trunc).error + " | " + ndef_decode(unch).error);
+    val tlv: Vec<i64> = nfc_tlv_wrap(t);
+    var area: Vec<i64> = Vec::new();
+    area.push(0); area.push(0);
+    var i: i64 = 0;
+    while i < tlv.len() { area.push(tlv.get(i)); i = i + 1; }
+    area.push(0); area.push(0);
+    val found: Vec<i64> = nfc_tlv_find(area);
+    val ltlv: Vec<i64> = nfc_tlv_wrap(bytes_n(300, 0));
+    var lh: Vec<i64> = Vec::new();
+    lh.push(ltlv.get(0)); lh.push(ltlv.get(1)); lh.push(ltlv.get(2)); lh.push(ltlv.get(3));
+    println("tlv " + hex_encode_bytes(bytes_n(1, 3)) + int_to_hex(tlv.get(1)) + " ... " + int_to_hex(tlv.get(tlv.len() - 1)) + " found "
+        + int_to_str(found.len()) + " long " + hx(lh));
+    val cc: Vec<i64> = nfc_type2_cc(48);
+    println("cc " + hex_encode_bytes(bytes_n(1, cc.get(0))) + " " + hex_encode_bytes(bytes_n(1, cc.get(1))) + " "
+        + hex_encode_bytes(bytes_n(1, cc.get(2))) + " " + hex_encode_bytes(bytes_n(1, cc.get(3))));
+    println("calls " + nfc_android_calls().get(3).method + " " + nfc_ios_calls().get(1).method);
+}

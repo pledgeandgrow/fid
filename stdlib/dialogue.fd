@@ -1,0 +1,635 @@
+// Fides dialogue standard library
+//
+// Branching game dialogue, pure computation (no seam):
+//   - a graph of nodes; a node has lines (each with an optional speaker),
+//     effects run when the node is entered, choices, and an optional `next`
+//     node taken when it has no choices;
+//   - choices carry conditions on integer variables (all must hold for the
+//     choice to be offered) and effects run when picked;
+//   - effects set a variable or add to it; `{name}` in a line or a choice
+//     is replaced by the variable's value when shown;
+//   - a runner state machine: DLG_LINE (a line is showing; advance), then
+//     DLG_CHOICE (waiting for a choice; only offered choices count), until
+//     DLG_END. Variables live in the runner, so one graph serves many runs.
+//
+// Script format (one statement per line; leading/trailing blanks ignored):
+//   # comment                      ignored, as are blank lines
+//   = node_id                      starts a node (the first node is the start)
+//   Speaker: text                  a line spoken by Speaker (the speaker is a
+//                                  single word before ':'), or just `text`
+//   ~ set name 5   /   ~ add name -2
+//                                  effect run when the node is entered
+//   * [cond, cond] text -> target {set a 1; add b 2}
+//                                  a choice; `[...]` and `{...}` optional;
+//                                  cond is `name op value`, op one of
+//                                  == != < <= > >=; target a node id or END
+//   -> target                      the node after this one when it has no
+//                                  choices (END, or no `->`, ends there)
+// Values are integers (an optional leading '-'). A missing variable is 0.
+//
+// Usage:
+//   use dialogue;
+//   val p: DlgParse = dlg_parse(script);
+//   var r: DlgRunner = dlg_runner(&p.graph);
+//   dlg_start(&mut r, &p.graph, "");
+//   while r.state == DLG_LINE { println(dlg_line_text(&r, &p.graph)); dlg_advance(&mut r, &p.graph); }
+
+module dialogue;
+use vec;
+use string;
+
+pub const DLG_EQ: i64 = 0;
+pub const DLG_NE: i64 = 1;
+pub const DLG_LT: i64 = 2;
+pub const DLG_LE: i64 = 3;
+pub const DLG_GT: i64 = 4;
+pub const DLG_GE: i64 = 5;
+
+pub const DLG_SET: i64 = 0;
+pub const DLG_ADD: i64 = 1;
+
+pub const DLG_LINE: i64 = 0;
+pub const DLG_CHOICE: i64 = 1;
+pub const DLG_END: i64 = 2;
+
+pub struct DlgCond {
+    pub var_name: str,
+    pub op: i64,
+    pub value: i64,
+}
+
+pub struct DlgEffect {
+    pub var_name: str,
+    pub kind: i64,
+    pub value: i64,
+}
+
+pub struct DlgChoice {
+    pub text: str,
+    pub target: str,
+    // node id, or "END"
+    pub conds: Vec<DlgCond>,
+    pub effects: Vec<DlgEffect>,
+}
+
+pub struct DlgNode {
+    pub id: str,
+    pub speakers: Vec<str>,
+    pub lines: Vec<str>,
+    pub effects: Vec<DlgEffect>,
+    pub choices: Vec<DlgChoice>,
+    pub next: str,  // "" or "END": the dialogue ends after the lines
+}
+
+pub struct DlgGraph {
+    pub nodes: Vec<DlgNode>,
+}
+
+pub fn dlg_graph() -> DlgGraph {
+    return DlgGraph { nodes: Vec::new() };
+}
+
+pub fn dlg_node(id: str) -> DlgNode {
+    return DlgNode { id: id, speakers: Vec::new(), lines: Vec::new(), effects: Vec::new(), choices: Vec::new(), next: "" };
+}
+
+pub fn dlg_node_line(n: &mut DlgNode, speaker: str, text: str) {
+    n.speakers.push(speaker);
+    n.lines.push(text);
+}
+
+pub fn dlg_choice(text: str, target: str) -> DlgChoice {
+    return DlgChoice { text: text, target: target, conds: Vec::new(), effects: Vec::new() };
+}
+
+pub fn dlg_add_node(g: &mut DlgGraph, n: DlgNode) {
+    g.nodes.push(n);
+}
+
+/// Index of node `id`, -1 when there is none.
+pub fn dlg_find(g: &DlgGraph, id: str) -> i64 {
+    var i: i64 = 0;
+    while i < g.nodes.len() {
+        if g.nodes.get(i).id == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Every target (choice or next) that names no node, as "from -> to".
+pub fn dlg_check(g: &DlgGraph) -> Vec<str> {
+    var bad: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < g.nodes.len() {
+        val n: DlgNode = g.nodes.get(i);
+        if n.next != "" && n.next != "END" && dlg_find(g, n.next) < 0 {
+            bad.push(n.id + " -> " + n.next);
+        }
+        var k: i64 = 0;
+        while k < n.choices.len() {
+            val t: str = n.choices.get(k).target;
+            if t != "END" && dlg_find(g, t) < 0 {
+                bad.push(n.id + " -> " + t);
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+// ─── Runner ───────────────────────────────────────────────────────────────
+
+pub struct DlgRunner {
+    pub var_names: Vec<str>,
+    pub var_vals: Vec<i64>,
+    pub node: i64,
+    pub line: i64,
+    pub state: i64,
+    pub visited: Vec<i64>,  // times each node was entered
+}
+
+pub fn dlg_runner(g: &DlgGraph) -> DlgRunner {
+    var r = DlgRunner { var_names: Vec::new(), var_vals: Vec::new(), node: - 1, line: 0, state: DLG_END, visited: Vec::new() };
+    var i: i64 = 0;
+    while i < g.nodes.len() {
+        r.visited.push(0);
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn dlg_get(r: &DlgRunner, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < r.var_names.len() {
+        if r.var_names.get(i) == name {
+            return r.var_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub fn dlg_set(r: &mut DlgRunner, name: str, value: i64) {
+    var i: i64 = 0;
+    while i < r.var_names.len() {
+        if r.var_names.get(i) == name {
+            r.var_vals.set(i, value);
+            return;
+        }
+        i = i + 1;
+    }
+    r.var_names.push(name);
+    r.var_vals.push(value);
+}
+
+pub fn dlg_cond_holds(r: &DlgRunner, c: &DlgCond) -> bool {
+    val v: i64 = dlg_get(r, c.var_name);
+    if c.op == DLG_EQ { return v == c.value; }
+    if c.op == DLG_NE { return v != c.value; }
+    if c.op == DLG_LT { return v < c.value; }
+    if c.op == DLG_LE { return v <= c.value; }
+    if c.op == DLG_GT { return v > c.value; }
+    return v >= c.value;
+}
+
+fn dg_run_effects(r: &mut DlgRunner, effects: &Vec<DlgEffect>) {
+    var i: i64 = 0;
+    while i < effects.len() {
+        val e: DlgEffect = effects.get(i);
+        if e.kind == DLG_SET {
+            dlg_set(r, e.var_name, e.value);
+        } else {
+            dlg_set(r, e.var_name, dlg_get(r, e.var_name) + e.value);
+        }
+        i = i + 1;
+    }
+}
+
+// Enter node `target` (an id; "" or "END" ends the dialogue). `depth`
+// counts nodes passed through without stopping: a cycle of nodes with no
+// lines and no choices ends the dialogue instead of looping forever.
+fn dg_enter(r: &mut DlgRunner, g: &DlgGraph, target: str, depth: i64) {
+    if target == "" || target == "END" || depth > g.nodes.len() {
+        r.state = DLG_END;
+        r.node = - 1;
+        return;
+    }
+    val idx: i64 = dlg_find(g, target);
+    if idx < 0 {
+        r.state = DLG_END;
+        r.node = - 1;
+        return;
+    }
+    r.node = idx;
+    r.line = 0;
+    r.visited.set(idx, r.visited.get(idx) + 1);
+    val n: DlgNode = g.nodes.get(idx);
+    dg_run_effects(r, &n.effects);
+    dg_settle(r, g, depth);
+}
+
+// After entering or finishing lines: show a line, wait for a choice, or
+// move on.
+fn dg_settle(r: &mut DlgRunner, g: &DlgGraph, depth: i64) {
+    val n: DlgNode = g.nodes.get(r.node);
+    if r.line < n.lines.len() {
+        r.state = DLG_LINE;
+        return;
+    }
+    if n.choices.len() > 0 {
+        r.state = DLG_CHOICE;
+        return;
+    }
+    dg_enter(r, g, n.next, depth + 1);
+}
+
+/// Start at node `id` ("" = the first node).
+pub fn dlg_start(r: &mut DlgRunner, g: &DlgGraph, id: str) {
+    if id == "" {
+        if g.nodes.len() == 0 {
+            r.state = DLG_END;
+            return;
+        }
+        dg_enter(r, g, g.nodes.get(0).id, 0);
+        return;
+    }
+    dg_enter(r, g, id, 0);
+}
+
+/// Replace every `{name}` with the variable's value.
+pub fn dlg_interpolate(r: &DlgRunner, text: str) -> str {
+    var out: str = "";
+    val n: i64 = str_len(text);
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(text, i);
+        if c == 123 {
+            var j: i64 = i + 1;
+            while j < n && str_byte_at(text, j) != 125 {
+                j = j + 1;
+            }
+            if j < n {
+                out = out + int_to_str(dlg_get(r, str_slice(text, i + 1, j)));
+                i = j + 1;
+                continue;
+            }
+        }
+        out = out + char_to_str(c);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The speaker of the current line ("" when none or not on a line).
+pub fn dlg_speaker(r: &DlgRunner, g: &DlgGraph) -> str {
+    if r.state != DLG_LINE {
+        return "";
+    }
+    return g.nodes.get(r.node).speakers.get(r.line);
+}
+
+/// The current line with variables filled in ("" when not on a line).
+pub fn dlg_line_text(r: &DlgRunner, g: &DlgGraph) -> str {
+    if r.state != DLG_LINE {
+        return "";
+    }
+    return dlg_interpolate(r, g.nodes.get(r.node).lines.get(r.line));
+}
+
+/// Go past the current line.
+pub fn dlg_advance(r: &mut DlgRunner, g: &DlgGraph) {
+    if r.state != DLG_LINE {
+        return;
+    }
+    r.line = r.line + 1;
+    dg_settle(r, g, 0);
+}
+
+/// Indexes (into the node's choices) of the choices offered now.
+pub fn dlg_options(r: &DlgRunner, g: &DlgGraph) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if r.state != DLG_CHOICE {
+        return out;
+    }
+    val n: DlgNode = g.nodes.get(r.node);
+    var i: i64 = 0;
+    while i < n.choices.len() {
+        val ch: DlgChoice = n.choices.get(i);
+        var ok: bool = true;
+        var k: i64 = 0;
+        while k < ch.conds.len() {
+            val c: DlgCond = ch.conds.get(k);
+            if !dlg_cond_holds(r, &c) {
+                ok = false;
+            }
+            k = k + 1;
+        }
+        if ok {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The text of option `k` of `dlg_options` with variables filled in.
+pub fn dlg_option_text(r: &DlgRunner, g: &DlgGraph, k: i64) -> str {
+    val opts: Vec<i64> = dlg_options(r, g);
+    if k < 0 || k >= opts.len() {
+        return "";
+    }
+    return dlg_interpolate(r, g.nodes.get(r.node).choices.get(opts.get(k)).text);
+}
+
+/// Pick option `k` of `dlg_options`: run its effects, go to its target.
+/// False (nothing happens) when `k` is not offered.
+pub fn dlg_choose(r: &mut DlgRunner, g: &DlgGraph, k: i64) -> bool {
+    val opts: Vec<i64> = dlg_options(r, g);
+    if k < 0 || k >= opts.len() {
+        return false;
+    }
+    val ch: DlgChoice = g.nodes.get(r.node).choices.get(opts.get(k));
+    dg_run_effects(r, &ch.effects);
+    dg_enter(r, g, ch.target, 0);
+    return true;
+}
+
+// ─── Script parser ────────────────────────────────────────────────────────
+
+pub struct DlgParse {
+    pub ok: bool,
+    pub error: str,
+    // "line N: what"
+    pub graph: DlgGraph,
+}
+
+fn dg_is_ident(s: str) -> bool {
+    if str_len(s) == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if !(char_is_alpha(c) || char_is_digit(c) || c == 95 || c == 46) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// a decimal integer with an optional '-'; ok false on anything else
+struct DgInt {
+    ok: bool,
+    value: i64,
+}
+
+fn dg_int(s: str) -> DgInt {
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    var neg: bool = false;
+    if n > 0 && str_byte_at(s, 0) == 45 {
+        neg = true;
+        i = 1;
+    }
+    if i >= n {
+        return DgInt { ok: false, value: 0 };
+    }
+    var v: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if !char_is_digit(c) || v > 100000000000000 {
+            return DgInt { ok: false, value: 0 };
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if neg {
+        v = - v;
+    }
+    return DgInt { ok: true, value: v };
+}
+
+// words separated by runs of blanks
+fn dg_words(s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        while i < n && (str_byte_at(s, i) == 32 || str_byte_at(s, i) == 9) {
+            i = i + 1;
+        }
+        var j: i64 = i;
+        while j < n && str_byte_at(s, j) != 32 && str_byte_at(s, j) != 9 {
+            j = j + 1;
+        }
+        if j > i {
+            out.push(str_slice(s, i, j));
+        }
+        i = j;
+    }
+    return out;
+}
+
+struct DgEff {
+    ok: bool,
+    error: str,
+    eff: DlgEffect,
+}
+
+// "set name 5" / "add name -1"
+fn dg_effect(s: str) -> DgEff {
+    val w: Vec<str> = dg_words(str_trim(s));
+    val none = DlgEffect { var_name: "", kind: 0, value: 0 };
+    if w.len() != 3 {
+        return DgEff { ok: false, error: "effect must be 'set|add name value'", eff: none };
+    }
+    var kind: i64 = DLG_SET;
+    if w.get(0) == "add" {
+        kind = DLG_ADD;
+    } else if w.get(0) != "set" {
+        return DgEff { ok: false, error: "unknown effect '" + w.get(0) + "'", eff: none };
+    }
+    if !dg_is_ident(w.get(1)) {
+        return DgEff { ok: false, error: "bad variable name '" + w.get(1) + "'", eff: none };
+    }
+    val v: DgInt = dg_int(w.get(2));
+    if !v.ok {
+        return DgEff { ok: false, error: "bad number '" + w.get(2) + "'", eff: none };
+    }
+    return DgEff { ok: true, error: "", eff: DlgEffect { var_name: w.get(1), kind: kind, value: v.value } };
+}
+
+struct DgCnd {
+    ok: bool,
+    error: str,
+    cond: DlgCond,
+}
+
+fn dg_cond(s0: str) -> DgCnd {
+    val s: str = str_trim(s0);
+    val none = DlgCond { var_name: "", op: 0, value: 0 };
+    // find the operator
+    var at: i64 = - 1;
+    var oplen: i64 = 0;
+    var op: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) && at < 0 {
+        val c: i64 = str_byte_at(s, i);
+        var c2: i64 = 0;
+        if i + 1 < str_len(s) {
+            c2 = str_byte_at(s, i + 1);
+        }
+        if c == 61 && c2 == 61 { at = i; oplen = 2; op = DLG_EQ; }
+        else if c == 33 && c2 == 61 { at = i; oplen = 2; op = DLG_NE; }
+        else if c == 60 && c2 == 61 { at = i; oplen = 2; op = DLG_LE; }
+        else if c == 62 && c2 == 61 { at = i; oplen = 2; op = DLG_GE; }
+        else if c == 60 { at = i; oplen = 1; op = DLG_LT; }
+        else if c == 62 { at = i; oplen = 1; op = DLG_GT; }
+        i = i + 1;
+    }
+    if at < 0 {
+        return DgCnd { ok: false, error: "condition needs == != < <= > or >=", cond: none };
+    }
+    val name: str = str_trim(str_slice(s, 0, at));
+    val num: str = str_trim(str_slice(s, at + oplen, str_len(s)));
+    if !dg_is_ident(name) {
+        return DgCnd { ok: false, error: "bad variable name '" + name + "'", cond: none };
+    }
+    val v: DgInt = dg_int(num);
+    if !v.ok {
+        return DgCnd { ok: false, error: "bad number '" + num + "'", cond: none };
+    }
+    return DgCnd { ok: true, error: "", cond: DlgCond { var_name: name, op: op, value: v.value } };
+}
+
+fn dg_fail(line: i64, msg: str) -> DlgParse {
+    return DlgParse { ok: false, error: "line " + int_to_str(line) + ": " + msg, graph: dlg_graph() };
+}
+
+/// Parse a dialogue script (format in the header). Targets that name no
+/// node are an error.
+pub fn dlg_parse(src: str) -> DlgParse {
+    var g: DlgGraph = dlg_graph();
+    var cur: DlgNode = dlg_node("");
+    var have: bool = false;
+    val lines: Vec<str> = str_lines(src);
+    var ln: i64 = 0;
+    while ln < lines.len() {
+        val no: i64 = ln + 1;
+        val t: str = str_trim(str_trim_end_char(lines.get(ln), 13));
+        ln = ln + 1;
+        if str_len(t) == 0 || str_starts_with(t, "#") {
+            continue;
+        }
+        if str_starts_with(t, "=") {
+            val id: str = str_trim(str_slice(t, 1, str_len(t)));
+            if !dg_is_ident(id) || id == "END" {
+                return dg_fail(no, "bad node id '" + id + "'");
+            }
+            if dlg_find(&g, id) >= 0 || (have && cur.id == id) {
+                return dg_fail(no, "node '" + id + "' defined twice");
+            }
+            if have {
+                g.nodes.push(cur);
+            }
+            cur = dlg_node(id);
+            have = true;
+            continue;
+        }
+        if !have {
+            return dg_fail(no, "text before the first '= node'");
+        }
+        if str_starts_with(t, "~") {
+            val e: DgEff = dg_effect(str_slice(t, 1, str_len(t)));
+            if !e.ok {
+                return dg_fail(no, e.error);
+            }
+            cur.effects.push(e.eff);
+            continue;
+        }
+        if str_starts_with(t, "->") {
+            val target: str = str_trim(str_slice(t, 2, str_len(t)));
+            if !dg_is_ident(target) {
+                return dg_fail(no, "bad target '" + target + "'");
+            }
+            cur.next = target;
+            continue;
+        }
+        if str_starts_with(t, "*") {
+            var rest: str = str_trim(str_slice(t, 1, str_len(t)));
+            var conds: Vec<DlgCond> = Vec::new();
+            var effs: Vec<DlgEffect> = Vec::new();
+            if str_starts_with(rest, "[") {
+                val close: i64 = str_find(rest, "]");
+                if close < 0 {
+                    return dg_fail(no, "missing ']'");
+                }
+                val parts: Vec<str> = str_split(str_slice(rest, 1, close), ",");
+                var k: i64 = 0;
+                while k < parts.len() {
+                    if str_len(str_trim(parts.get(k))) > 0 {
+                        val c: DgCnd = dg_cond(parts.get(k));
+                        if !c.ok {
+                            return dg_fail(no, c.error);
+                        }
+                        conds.push(c.cond);
+                    }
+                    k = k + 1;
+                }
+                rest = str_trim(str_slice(rest, close + 1, str_len(rest)));
+            }
+            val brace: i64 = str_find(rest, "{");
+            if brace >= 0 {
+                if !str_ends_with(rest, "}") {
+                    return dg_fail(no, "missing '}'");
+                }
+                val parts: Vec<str> = str_split(str_slice(rest, brace + 1, str_len(rest) - 1), ";");
+                var k: i64 = 0;
+                while k < parts.len() {
+                    if str_len(str_trim(parts.get(k))) > 0 {
+                        val e: DgEff = dg_effect(parts.get(k));
+                        if !e.ok {
+                            return dg_fail(no, e.error);
+                        }
+                        effs.push(e.eff);
+                    }
+                    k = k + 1;
+                }
+                rest = str_trim(str_slice(rest, 0, brace));
+            }
+            val arrow: i64 = str_rfind(rest, "->");
+            if arrow < 0 {
+                return dg_fail(no, "choice needs '-> target'");
+            }
+            val text: str = str_trim(str_slice(rest, 0, arrow));
+            val target: str = str_trim(str_slice(rest, arrow + 2, str_len(rest)));
+            if str_len(text) == 0 {
+                return dg_fail(no, "choice without text");
+            }
+            if !dg_is_ident(target) {
+                return dg_fail(no, "bad target '" + target + "'");
+            }
+            cur.choices.push(DlgChoice { text: text, target: target, conds: conds, effects: effs });
+            continue;
+        }
+        // a line, maybe "Speaker: text"
+        val colon: i64 = str_find(t, ":");
+        if colon > 0 && dg_is_ident(str_slice(t, 0, colon)) {
+            dlg_node_line(&mut cur, str_slice(t, 0, colon), str_trim(str_slice(t, colon + 1, str_len(t))));
+        } else {
+            dlg_node_line(&mut cur, "", t);
+        }
+    }
+    if have {
+        g.nodes.push(cur);
+    }
+    val bad: Vec<str> = dlg_check(&g);
+    if bad.len() > 0 {
+        return DlgParse { ok: false, error: "unknown target: " + bad.get(0), graph: g };
+    }
+    return DlgParse { ok: true, error: "", graph: g };
+}

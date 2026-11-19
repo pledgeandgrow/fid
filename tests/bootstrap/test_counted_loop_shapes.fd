@@ -1,0 +1,175 @@
+// LF7 (compiler/checks.fd peir_counted_loop, peir_counted_down,
+// peir_len_minus, peir_loop_index): counted loops of more shapes need no
+// bounds checks on their `v.get(..)` / `v.set(..)`:
+//   conditions written the other way round: `0 < i`, `v.len() > i`,
+//   `last >= i` (last = v.len() - 1);
+//   a bound that is a length minus a constant, `i < v.len() - d` (directly
+//   or through a local set once before the loop), with reads at `i + e`
+//   for 0 <= e <= d (pair_products, window3, for_pairs);
+//   loops counting down by a constant other than 1 (step_down2, down3) and
+//   tests against a constant other than 0 (down3: `i >= 3`), with reads
+//   at an offset from i that stays in [0, v.len()) (pre_down: `v.get(i - 1)`
+//   before the decrement of a `while i > 0` loop).
+// `fid explain` on this file lists every get/set of sum_zero_lt,
+// sum_len_gt, sum_last_ge, pair_products, window3, step_down2, pre_down,
+// down3 and for_pairs as removed (counted loop) and keeps keep_odd's (its
+// decrement by 2 from a test `i > 0` can make i negative; the read is
+// guarded by hand). The results must not change, also for an empty Vec.
+//
+// Expected output:
+// 15
+// 0
+// 15
+// 0
+// 15
+// 0
+// 40
+// 0
+// 27
+// 0
+// 531
+// 0
+// 55
+// 0
+// 8
+// 0
+// 4
+// 0
+// 6
+// 0
+
+fn sum_zero_lt(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = v.len();
+    while 0 < i {
+        i = i - 1;
+        t = t + v.get(i);
+    }
+    return t;
+}
+
+fn sum_len_gt(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while v.len() > i {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn sum_last_ge(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var last: i64 = v.len() - 1;
+    var i: i64 = 0;
+    while last >= i {
+        t = t + v.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn pair_products(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() - 1 {
+        t = t + v.get(i) * v.get(i + 1);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn window3(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var n: i64 = v.len() - 2;
+    var i: i64 = 0;
+    while i < n {
+        t = t + v.get(i) + v.get(i + 1) + v.get(i + 2);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn step_down2(v: & Vec<i64>) -> i64 {
+    // reads before the decrement: i in [0, v.len() - 1]
+    var r: i64 = 0;
+    var i: i64 = v.len() - 1;
+    while i >= 0 {
+        r = r * 10 + v.get(i);
+        i = i - 2;
+    }
+    return r;
+}
+
+fn pre_down(v: & Vec<i64>) -> i64 {
+    // i in [1, v.len()] before the decrement: i - 1 is an index
+    var t: i64 = 0;
+    var i: i64 = v.len();
+    while i > 0 {
+        t = t + v.get(i - 1) * i;
+        i = i - 1;
+    }
+    return t;
+}
+
+fn down3(v: & Vec<i64>) -> i64 {
+    // i in [3, v.len()] at the test, [0, v.len() - 3] after the decrement
+    var t: i64 = 0;
+    var i: i64 = v.len();
+    while i >= 3 {
+        i = i - 3;
+        t = t + v.get(i) + v.get(i + 2);
+    }
+    return t;
+}
+
+fn for_pairs(v: & Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    for i in 0..v.len() - 1 {
+        t = t + v.get(i + 1) - v.get(i);
+    }
+    return t;
+}
+
+fn keep_odd(v: & Vec<i64>) -> i64 {
+    // not proved: i > 0 at the test lets i - 2 be -1
+    var t: i64 = 0;
+    var i: i64 = v.len();
+    while i > 0 {
+        i = i - 2;
+        if i >= 0 {
+            t = t + v.get(i);
+        }
+    }
+    return t;
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var j: i64 = 1;
+    while j <= 5 {
+        v.push(j);
+        j = j + 1;
+    }
+    var e: Vec<i64> = Vec::new();
+    println(sum_zero_lt(& v));
+    println(sum_zero_lt(& e));
+    println(sum_len_gt(& v));
+    println(sum_len_gt(& e));
+    println(sum_last_ge(& v));
+    println(sum_last_ge(& e));
+    println(pair_products(& v));
+    println(pair_products(& e));
+    println(window3(& v));
+    println(window3(& e));
+    println(step_down2(& v));
+    println(step_down2(& e));
+    println(pre_down(& v));
+    println(pre_down(& e));
+    println(down3(& v));
+    println(down3(& e));
+    println(for_pairs(& v));
+    println(for_pairs(& e));
+    println(keep_odd(& v));
+    println(keep_odd(& e));
+}

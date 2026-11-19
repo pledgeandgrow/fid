@@ -1,0 +1,100 @@
+// llvm-roadmap RL6: translation validation of instruction selection beyond
+// the integer ALU. With FID_VERIFY=1 every machine-layer build first runs
+// nat_ir.fd nat_sel_check, which now also runs nat_sel_check_more: float
+// operations (MO_FBIN, MO_FCMP, MO_I2F, MO_F2I; f64 and f32; general and
+// float registers), loads and stores of every size and sign (against a
+// memory model), branches (taken or not) and calls (argument registers and
+// outgoing stack slots) are selected alone and run by nat_enc.fd's
+// evaluator on edge and pseudo-random values. This program uses those
+// operations; check it with
+//   FID_VERIFY=1 NATIVE=1 bash scripts/cross-test.sh x86_64-linux
+// (and aarch64-linux, riscv64-linux) and scripts/nat-tools-check.sh.
+// tests/nattools/selcheck_more_unit.fd runs the check directly. Same
+// output on every backend.
+// Expected output:
+// 7.5
+// -2.25
+// 1
+// 0
+// 1
+// 1
+// -7
+// 3
+// 5
+// 200
+// -56
+// 60000
+// -5536
+// 4000000000
+// -294967296
+// 1234567890123
+// 21
+// 28
+// 45
+
+struct Rec { b: u8, c: i8, h: u16, s: i16, w: u32, i: i32, q: i64 }
+
+fn fsum(a: f64, b: f64) -> f64 {
+    return a + b * 2.0;
+}
+
+fn fneg(a: f64, b: f64) -> f64 {
+    return (a - b) / 2.0;
+}
+
+fn lt(a: f64, b: f64) -> i64 {
+    if a < b {
+        return 1;
+    }
+    return 0;
+}
+
+fn eq(a: f64, b: f64) -> i64 {
+    if a == b {
+        return 1;
+    }
+    return 0;
+}
+
+fn many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64, k: i64) -> i64 {
+    return a + b + c + d + e + f + g + h + i + j + k - 21;
+}
+
+fn bits(x: i64) -> i64 {
+    var n: i64 = 0;
+    var k: i64 = 0;
+    while k < 64 {
+        if ((x >> k) & 1) == 1 {
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+fn main() {
+    println(fsum(1.5, 3.0));
+    println(fneg(0.5, 5.0));
+    println(lt(1.0, 2.0));
+    println(lt(2.0, 1.0));
+    println(eq(0.0, 0.0 - 0.0));
+    var nan: f64 = 0.0 / 0.0;
+    println(1 - eq(nan, nan));
+    var x: f64 = 0.0 - 7.9;
+    println(x as i64);
+    var y: f32 = 3.75;
+    println(y as i64);
+    var z: f32 = 1.25;
+    println((z * 4.0) as i64);
+    var r: Rec = Rec { b: 200, c: -56, h: 60000, s: -5536, w: 4000000000, i: -294967296, q: 1234567890123 };
+    println(r.b as i64);
+    println(r.c as i64);
+    println(r.h as i64);
+    println(r.s as i64);
+    println(r.w as i64);
+    println(r.i as i64);
+    println(r.q);
+    println(many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) - 24);
+    println(bits(0x0FF0F000000000FF) + 8);
+    println(bits(0 - 1) - 19);
+}

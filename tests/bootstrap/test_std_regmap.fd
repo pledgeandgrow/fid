@@ -1,0 +1,117 @@
+// stdlib/regmap: a UART-like block on the fake register file: field math, RO/W1C/WO rules, W1C-safe read-modify-write, consistency check, dump.
+// Expected output:
+// check: 0 problems
+// CTRL addr 0x40001000
+// MODE mask 0x00000006
+// set PRESC=0x2A: 0x00002A00
+// enum FAST=2 name(2)=FAST
+// CTRL after EN=1, MODE=FAST: 0x00002A05
+// STATUS before: 0x0000000B
+// rmw of IE clears no flag: 0x0000010B
+// clear OVR: 0x00000103
+// RO TXE kept after write 0: 1
+// CMD reads back 0, holds 0x00000055
+// waited RXNE=0: false
+// DATA after poke: 0x41
+// log: 17 entries, first R 0x40001000 -> 0x00000000
+// bad block: 3 problems
+//   CTRL.EN: overlaps another field
+//   CTRL.TOP: bits outside the register
+//   A and B overlap
+// UART0 @ 0x40001000
+//   CTRL   +0x000 RW  = 0x00002A05  [EN=1 MODE=FAST(2) PRESC=0x2A]
+//   STATUS +0x004 RW  = 0x00000103  [RXNE=1 TXE=1 OVR=0 IE=1]
+//   DATA   +0x008 RW  = 0x00000041
+//   CMD    +0x00C WO  = --
+use regmap;
+use vec;
+use string;
+
+fn uart_block() -> RegBlock {
+    var blk: RegBlock = regblock_new("UART0", 0x40001000);
+    var ctrl: RegDesc = regdesc_new("CTRL", 0x00, 32, REG_RW, 0);
+    regdesc_add_field(&mut ctrl, regfield_new("EN", 0, 1, REG_RW));
+    var mode: RegField = regfield_new("MODE", 1, 2, REG_RW);
+    regfield_add_enum(&mut mode, "OFF", 0);
+    regfield_add_enum(&mut mode, "SLOW", 1);
+    regfield_add_enum(&mut mode, "FAST", 2);
+    regdesc_add_field(&mut ctrl, mode);
+    regdesc_add_field(&mut ctrl, regfield_new("PRESC", 8, 8, REG_RW));
+    regblock_add(&mut blk, ctrl);
+    var st: RegDesc = regdesc_new("STATUS", 0x04, 32, REG_RW, 0);
+    regdesc_add_field(&mut st, regfield_new("RXNE", 0, 1, REG_W1C));
+    regdesc_add_field(&mut st, regfield_new("TXE", 1, 1, REG_RO));
+    regdesc_add_field(&mut st, regfield_new("OVR", 3, 1, REG_W1C));
+    regdesc_add_field(&mut st, regfield_new("IE", 8, 1, REG_RW));
+    regblock_add(&mut blk, st);
+    regblock_add(&mut blk, regdesc_new("DATA", 0x08, 32, REG_RW, 0));
+    regblock_add(&mut blk, regdesc_new("CMD", 0x0C, 32, REG_WO, 0));
+    return blk;
+}
+
+fn main() {
+    val blk: RegBlock = uart_block();
+    println("check: " + int_to_str(regblock_check(&blk).len()) + " problems");
+    println("CTRL addr " + regmap_hex(regblock_addr(&blk, "CTRL"), 8));
+    val ctrl: RegDesc = blk.regs.get(0);
+    val modef: RegField = ctrl.fields.get(1);
+    println("MODE mask " + regmap_hex(regfield_mask(&modef), 8));
+    val presc: RegField = ctrl.fields.get(2);
+    println("set PRESC=0x2A: " + regmap_hex(regfield_set(&presc, 0, 0x2A), 8));
+    println("enum FAST=" + int_to_str(regfield_enum_value(&modef, "FAST")) + " name(2)=" + regfield_enum_name(&modef, 2));
+
+    var bus: RegBus = regbus_fake();
+    regbus_attach(&mut bus, blk);
+    regmap_write_fields(&mut bus, blk, "CTRL", str_split("PRESC,EN", ","), regmap_test_vals());
+    regmap_write_enum(&mut bus, blk, "CTRL", "MODE", "FAST");
+    println("CTRL after EN=1, MODE=FAST: " + regmap_hex(regmap_read(&mut bus, blk, "CTRL"), 8));
+
+    // Hardware raises RXNE, TXE and OVR.
+    val sa: i64 = regblock_addr(&blk, "STATUS");
+    regbus_poke(&mut bus, sa, 0x0B);
+    println("STATUS before: " + regmap_hex(regbus_peek(&bus, sa), 8));
+    regmap_write_field(&mut bus, blk, "STATUS", "IE", 1);
+    println("rmw of IE clears no flag: " + regmap_hex(regbus_peek(&bus, sa), 8));
+    regmap_write_field(&mut bus, blk, "STATUS", "OVR", 1);
+    println("clear OVR: " + regmap_hex(regbus_peek(&bus, sa), 8));
+    regmap_write(&mut bus, blk, "STATUS", 0x100);
+    println("RO TXE kept after write 0: " + int_to_str(regmap_read_field(&mut bus, blk, "STATUS", "TXE")));
+    // RXNE was not written 1 by that write: still set; IE stays 1.
+
+    regmap_write(&mut bus, blk, "CMD", 0x55);
+    println("CMD reads back " + int_to_str(regmap_read(&mut bus, blk, "CMD")) + ", holds " + regmap_hex(regbus_peek(&bus, regblock_addr(&blk, "CMD")), 8));
+    println("waited RXNE=0: " + bool_str(regmap_wait_field(&mut bus, blk, "STATUS", "RXNE", 0, 3)));
+    regbus_poke(&mut bus, regblock_addr(&blk, "DATA"), 0x41);
+    println("DATA after poke: " + regmap_hex(regmap_read(&mut bus, blk, "DATA"), 2));
+    println("log: " + int_to_str(bus.log.len()) + " entries, first " + bus.log.get(0));
+
+    var bad: RegBlock = regblock_new("BAD", 0);
+    var c2: RegDesc = regdesc_new("CTRL", 0, 8, REG_RW, 0);
+    regdesc_add_field(&mut c2, regfield_new("MODE", 0, 3, REG_RW));
+    regdesc_add_field(&mut c2, regfield_new("EN", 2, 1, REG_RW));
+    regdesc_add_field(&mut c2, regfield_new("TOP", 6, 4, REG_RW));
+    regblock_add(&mut bad, c2);
+    regblock_add(&mut bad, regdesc_new("A", 4, 32, REG_RW, 0));
+    regblock_add(&mut bad, regdesc_new("B", 6, 16, REG_RW, 0));
+    val errs: Vec<str> = regblock_check(&bad);
+    println("bad block: " + int_to_str(errs.len()) + " problems");
+    var i: i64 = 0;
+    while i < errs.len() {
+        println("  " + errs.get(i));
+        i = i + 1;
+    }
+    bus.logging = false;
+    print(regmap_dump(&mut bus, blk));
+}
+
+fn regmap_test_vals() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0x2A);
+    v.push(1);
+    return v;
+}
+
+fn bool_str(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}

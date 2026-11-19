@@ -1,0 +1,100 @@
+// Track MI (docs/roadmap/llvm-roadmap.md MI19, MI20), the machine layer
+// (compiler/nat_ir.fd): nat_ctx_swap and the task trampoline are written
+// once over the architecture layer (ng_prim_ctx_swap, ng_prim_task_tramp)
+// for Linux x86-64 / AArch64 / RISC-V, `--nat` Windows and macOS, and
+// every target's primitives are checked against one interface
+// (nat_prim_interface, under FID_VERIFY=1). A task switch must keep every
+// callee-saved register, the frame pointer and the return address: the
+// workers below keep many values live across task_yield (more than the
+// argument registers, so the allocator puts them in callee-saved
+// registers), recurse across a yield (frame records), and the first
+// switch to each task goes through the trampoline. Run:
+//   NATIVE=1 FID_VERIFY=1 bash scripts/cross-test.sh x86_64-linux (and
+//   aarch64-linux, riscv64-linux, x86_64-windows), and
+//   bash tests/nattools/machine_frame_check.sh.
+// Expected output:
+// 2820
+// 2795
+// 610
+// true
+use task;
+
+fn juggle(n: i64) -> i64 {
+    var a: i64 = n;
+    var b: i64 = n * 2;
+    var c: i64 = n * 3;
+    var d: i64 = n * 5;
+    var e: i64 = n * 7;
+    var f: i64 = n * 11;
+    var i: i64 = 0;
+    while i < 4 {
+        task_yield();
+        a = a + 1;
+        b = b + a;
+        c = c + b - a;
+        d = d + 1;
+        e = e + d - c + b;
+        f = f + e - b;
+        i = i + 1;
+    }
+    return a + b + c + d + e + f - n * 50;
+}
+
+// Recursion with a yield at every level: return addresses and frame
+// records survive the switches
+fn deep(k: i64) -> i64 {
+    if k == 0 {
+        task_yield();
+        return 1;
+    }
+    task_yield();
+    return k + deep(k - 1);
+}
+
+fn fib_yield(n: i64) -> i64 {
+    var x: i64 = 0;
+    var y: i64 = 1;
+    var i: i64 = 0;
+    while i < n {
+        val t: i64 = x + y;
+        x = y;
+        y = t;
+        task_yield();
+        i = i + 1;
+    }
+    return x;
+}
+
+fn main() -> i64 {
+    var ids: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= 20 {
+        ids.push(task_go("juggle", i));
+        i = i + 1;
+    }
+    var deeps: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 12 {
+        deeps.push(task_go("deep", i));
+        i = i + 1;
+    }
+    val fy: i64 = task_go("fib_yield", 15);
+    task_run();
+    var sum: i64 = 0;
+    i = 0;
+    while i < ids.len() {
+        sum = sum + task_result(ids.get(i));
+        i = i + 1;
+    }
+    println(sum);
+    var dsum: i64 = 0;
+    i = 0;
+    while i < deeps.len() {
+        dsum = dsum + task_result(deeps.get(i)) * (i + 1);
+        i = i + 1;
+    }
+    println(dsum);
+    println(task_result(fy));
+    println(task_done(fy));
+    return 0;
+}

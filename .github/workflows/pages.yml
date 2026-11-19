@@ -1,0 +1,87 @@
+# The website on GitHub Pages (roadmap AD2; competitive roadmap BM10: the
+# benchmark results page, kept current).
+#
+# tools/site.fd renders the repository's Markdown (docs/website.md);
+# `site --build _site --base /<repo>/` writes the static pages. Before that,
+# bench/page-merge.sh puts the weekly Linux runs (the newest
+# `bench-weekly-history` artifact of verify-weekly.yml, one section per run,
+# newest first) into docs/benchmarks.md, so the published results page shows
+# the latest run without anyone copying tables by hand. It runs on a push
+# to main that changes a page, when the weekly verification ends, and by
+# hand. Needs Settings > Pages > Source: GitHub Actions.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "docs/**"
+      - "tools/site.fd"
+      - "bench/page-merge.sh"
+      - ".github/workflows/pages.yml"
+  workflow_run:
+    workflows: ["Verify (weekly)"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CC: zig cc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: BM10 weekly benchmark runs into the results page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build/pages
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=bench-weekly-history&per_page=1" \
+               -q '.artifacts[0].id' 2>/dev/null || true)
+          if [ -n "$id" ] && [ "$id" != "null" ] &&
+             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > build/pages/h.zip &&
+             unzip -o -q build/pages/h.zip -d build/pages && [ -f build/pages/weekly-history.md ]; then
+            bash bench/page-merge.sh build/pages/weekly-history.md
+          else
+            echo "no bench-weekly-history artifact yet: the page as committed"
+          fi
+      - name: Build the site
+        run: |
+          release/fid-dev ccompile tools/site.fd -o build/pages/site
+          build/pages/site --build _site --base "/${{ github.event.repository.name }}/"
+          test -f _site/docs/benchmarks.html
+          ls _site | head -50
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,937 @@
+// Fides RSA (RFC 8017, PKCS #1 v2.2) on stdlib/bigint: key parsing
+// (RSAPublicKey, RSAPrivateKey, SubjectPublicKeyInfo, PKCS#8), the
+// primitives RSAEP/RSADP (the private one through the Chinese remainder
+// theorem), signatures RSASSA-PKCS1-v1_5 and RSASSA-PSS (sign and
+// verify), encryption RSAES-OAEP (encrypt and decrypt), MGF1, and key
+// generation with Miller-Rabin primality tests.
+//
+// Pure computation. The seam is randomness: PSS salts, OAEP seeds and key
+// generation take their random bytes as arguments (or, for keygen, from a
+// function `rand: fn(i64) -> Vec<i64>` returning n random bytes), so the
+// caller chooses the generator (crypto_random_bytes in real use, a fixed
+// source in tests). Hashes are kdf.fd's (KDF_SHA1, KDF_SHA256,
+// KDF_SHA512) for the message digest and for MGF1 alike.
+//
+// Keys are stored as bigint values; the modular exponentiations run on a
+// Montgomery engine over 28-bit limbs written here (RsaMont, rsa_mont_*,
+// also used by ecdsa.fd), because bigint divides on every product.
+//
+// Limits: none of this is constant time (window lookups, conditional
+// subtractions, bigint conversions), so the private-key operations leak
+// timing; acceptable for verification-heavy uses (X.509, JWT checks) and
+// for tests, not for a signing service facing attackers. OAEP decryption
+// returns one failure for every malformed case.
+//
+// Checked against an OpenSSL-generated key in tests/bootstrap/test_std_rsa.fd:
+// the PKCS#1 v1.5 signature byte-exact, OpenSSL's PSS signature and OAEP
+// ciphertext accepted and decrypted, and round trips of our own.
+//
+// Usage:
+//   use rsa;
+//   val pk = rsa_public_from_spki(der);
+//   val good = rsa_pkcs1_verify(pk, KDF_SHA256, msg, sig);
+//   val sk = rsa_private_from_pkcs8(der2);
+//   val sig2 = rsa_pss_sign(sk, KDF_SHA256, msg, salt32);
+//   val ct = rsa_oaep_encrypt(pk, KDF_SHA256, msg, label, seed32);
+
+module rsa;
+use vec;
+use bigint;
+use asn1;
+use pem;
+use kdf;
+
+pub struct RsaPublicKey {
+    pub ok: bool,
+    pub n: BigInt,
+    pub e: BigInt,
+    pub k: i64,
+    pub bits: i64,
+}
+
+pub struct RsaPrivateKey {
+    pub ok: bool,
+    pub n: BigInt,
+    pub e: BigInt,
+    pub d: BigInt,
+    pub p: BigInt,
+    pub q: BigInt,
+    pub dp: BigInt,
+    pub dq: BigInt,
+    pub qinv: BigInt,
+    pub k: i64,
+    pub bits: i64,
+}
+
+/// A decryption result: ok false on any failure.
+pub struct RsaPlain {
+    pub ok: bool,
+    pub data: Vec<i64>,
+}
+
+// ─── Integers and octet strings (RFC 8017 §4) ──────────────────────────
+
+/// OS2IP: big-endian bytes to a non-negative integer.
+pub fn rsa_os2ip(b: Vec<i64>) -> BigInt {
+    var acc: BigInt = bigint_zero();
+    var i: i64 = 0;
+    val n: i64 = b.len();
+    // Three bytes at a time: 2^24 stays below bigint's 10^9 limb base.
+    val lead: i64 = n % 3;
+    var chunk: i64 = 0;
+    while i < lead {
+        chunk = (chunk << 8) | (b.get(i) & 255);
+        i = i + 1;
+    }
+    acc = bigint_from_i64(chunk);
+    while i < n {
+        val c: i64 = ((b.get(i) & 255) << 16) | ((b.get(i + 1) & 255) << 8) | (b.get(i + 2) & 255);
+        acc = bigint_add_i64(bigint_mul_i64(acc, 16777216), c);
+        i = i + 3;
+    }
+    return acc;
+}
+
+/// The minimal big-endian bytes of a non-negative integer (empty for 0).
+pub fn rsa_int_bytes(x: BigInt) -> Vec<i64> {
+    var rev: Vec<i64> = Vec::new();
+    var v: BigInt = x;
+    val base: BigInt = bigint_from_i64(16777216);
+    while !bigint_is_zero(v) {
+        val dm: BigDiv = bigint_divmod(v, base);
+        val r: i64 = bigint_to_i64(dm.r);
+        rev.push(r & 255);
+        rev.push((r >> 8) & 255);
+        rev.push((r >> 16) & 255);
+        v = dm.q;
+    }
+    while rev.len() > 0 && rev.get(rev.len() - 1) == 0 { rev.pop(); }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = rev.len() - 1;
+    while i >= 0 { out.push(rev.get(i)); i = i - 1; }
+    return out;
+}
+
+/// I2OSP: a non-negative integer as exactly `len` big-endian bytes. An
+/// integer too large for `len` bytes gives an empty vector.
+pub fn rsa_i2osp(x: BigInt, len: i64) -> Vec<i64> {
+    val b: Vec<i64> = rsa_int_bytes(x);
+    var out: Vec<i64> = Vec::new();
+    if b.len() > len { return out; }
+    var i: i64 = 0;
+    while i < len - b.len() { out.push(0); i = i + 1; }
+    i = 0;
+    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    return out;
+}
+
+/// The number of bits of a non-negative integer.
+pub fn rsa_bit_len(x: BigInt) -> i64 {
+    val b: Vec<i64> = rsa_int_bytes(x);
+    if b.len() == 0 { return 0; }
+    var top: i64 = b.get(0);
+    var bits: i64 = 0;
+    while top > 0 { bits = bits + 1; top = top >> 1; }
+    return (b.len() - 1) * 8 + bits;
+}
+
+/// a mod m in 0..m-1 (bigint_mod keeps the sign of a).
+pub fn rsa_mod(a: BigInt, m: BigInt) -> BigInt {
+    var r: BigInt = bigint_mod(a, m);
+    if r.neg { r = bigint_add(r, m); }
+    return r;
+}
+
+/// The inverse of a modulo m (extended Euclid); zero when none exists.
+pub fn rsa_modinv(a: BigInt, m: BigInt) -> BigInt {
+    var r0: BigInt = rsa_mod(a, m);
+    var r1: BigInt = m;
+    var s0: BigInt = bigint_one();
+    var s1: BigInt = bigint_zero();
+    while !bigint_is_zero(r1) {
+        val dm: BigDiv = bigint_divmod(r0, r1);
+        val r2: BigInt = dm.r;
+        val s2: BigInt = bigint_sub(s0, bigint_mul(dm.q, s1));
+        r0 = r1;
+        r1 = r2;
+        s0 = s1;
+        s1 = s2;
+    }
+    if !bigint_eq(r0, bigint_one()) { return bigint_zero(); }
+    return rsa_mod(s0, m);
+}
+
+/// Greatest common divisor of non-negative integers.
+pub fn rsa_gcd(a: BigInt, b: BigInt) -> BigInt {
+    var x: BigInt = a;
+    var y: BigInt = b;
+    while !bigint_is_zero(y) {
+        val r: BigInt = bigint_mod(x, y);
+        x = y;
+        y = r;
+    }
+    return x;
+}
+
+// ─── Montgomery arithmetic (used by rsa and ecdsa) ─────────────────────
+//
+// Odd moduli as s limbs of 28 bits, little-endian, in a Vec<i64>.
+// Products of two limbs fit in 56 bits, so a CIOS Montgomery product
+// never overflows an i64. One context per modulus holds n, -n^-1 mod
+// 2^28, R mod n and R^2 mod n (R = 2^(28 s)). Values in Montgomery form
+// are x R mod n. This replaces bigint for the hot loops: bigint divides
+// on every product, and allocates more.
+
+pub const RSA_LIMB_BITS: i64 = 28;
+pub const RSA_LIMB_MASK: i64 = 0xfffffff;
+
+pub struct RsaMont {
+    pub s: i64,
+    pub n: Vec<i64>,
+    pub n0: i64,
+    pub one: Vec<i64>,
+    pub r2: Vec<i64>,
+}
+
+/// Big-endian bytes to s limbs (the high bytes beyond s limbs are dropped).
+pub fn rsa_limbs_from_bytes(b: Vec<i64>, s: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < s { out.push(0); i = i + 1; }
+    var bit: i64 = 0;
+    var k: i64 = b.len() - 1;
+    while k >= 0 {
+        val limb: i64 = bit / 28;
+        val sh: i64 = bit % 28;
+        val v: i64 = b.get(k) & 255;
+        if limb < s { out.set(limb, out.get(limb) | ((v << sh) & RSA_LIMB_MASK)); }
+        if sh > 20 && limb + 1 < s { out.set(limb + 1, out.get(limb + 1) | (v >> (28 - sh))); }
+        bit = bit + 8;
+        k = k - 1;
+    }
+    return out;
+}
+
+/// Limbs to exactly `len` big-endian bytes.
+pub fn rsa_limbs_to_bytes(x: & Vec<i64>, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < len { out.push(0); i = i + 1; }
+    var bit: i64 = 0;
+    var k: i64 = len - 1;
+    while k >= 0 {
+        val limb: i64 = bit / 28;
+        val sh: i64 = bit % 28;
+        var v: i64 = 0;
+        if limb < x.len() { v = x.get(limb) >> sh; }
+        if sh > 20 && limb + 1 < x.len() { v = v | (x.get(limb + 1) << (28 - sh)); }
+        out.set(k, v & 255);
+        bit = bit + 8;
+        k = k - 1;
+    }
+    return out;
+}
+
+/// Compare s-limb numbers: -1, 0 or 1.
+pub fn rsa_limbs_cmp(a: & Vec<i64>, b: & Vec<i64>, s: i64) -> i64 {
+    var i: i64 = s - 1;
+    while i >= 0 {
+        if a.get(i) != b.get(i) {
+            if a.get(i) < b.get(i) { return -1; }
+            return 1;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// a - b over s limbs (a >= b, or a with a carry out of its top), in place.
+fn rsa_limbs_sub_in(a: & mut Vec<i64>, b: & Vec<i64>, s: i64) {
+    var borrow: i64 = 0;
+    var i: i64 = 0;
+    while i < s {
+        var d: i64 = a.get(i) - b.get(i) - borrow;
+        if d < 0 { d = d + (1 << 28); borrow = 1; } else { borrow = 0; }
+        a.set(i, d);
+        i = i + 1;
+    }
+}
+
+/// A context for an odd modulus given as big-endian bytes.
+pub fn rsa_mont_new(modulus: Vec<i64>) -> RsaMont {
+    var bits: i64 = modulus.len() * 8;
+    var lead: i64 = 0;
+    while lead < modulus.len() && (modulus.get(lead) & 255) == 0 { lead = lead + 1; bits = bits - 8; }
+    val s: i64 = (bits + 27) / 28 + 1;
+    val n: Vec<i64> = rsa_limbs_from_bytes(modulus, s);
+    // -n^-1 mod 2^28 by Newton's iteration on the low limb.
+    val n_lo: i64 = n.get(0);
+    var x: i64 = 1;
+    var it: i64 = 0;
+    while it < 6 {
+        val nx: i64 = (n_lo * x) & RSA_LIMB_MASK;
+        x = (x * ((2 - nx) & RSA_LIMB_MASK)) & RSA_LIMB_MASK;
+        it = it + 1;
+    }
+    val n0: i64 = ((1 << 28) - x) & RSA_LIMB_MASK;
+    // R mod n and R^2 mod n by doubling 1 modulo n.
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < s { r.push(0); i = i + 1; }
+    r.set(0, 1);
+    var step: i64 = 0;
+    var one: Vec<i64> = Vec::new();
+    while step < 2 * 28 * s {
+        var carry: i64 = 0;
+        i = 0;
+        while i < s {
+            val v: i64 = (r.get(i) << 1) | carry;
+            r.set(i, v & RSA_LIMB_MASK);
+            carry = v >> 28;
+            i = i + 1;
+        }
+        if carry != 0 || rsa_limbs_cmp(& r, & n, s) >= 0 {
+            rsa_limbs_sub_in(& mut r, & n, s);
+        }
+        step = step + 1;
+        if step == 28 * s {
+            var copy: Vec<i64> = Vec::new();
+            i = 0;
+            while i < s { copy.push(r.get(i)); i = i + 1; }
+            one = copy;
+        }
+    }
+    return RsaMont { s: s, n: n, n0: n0, one: one, r2: r };
+}
+
+/// Montgomery product a b R^-1 mod n of values below n.
+pub fn rsa_mont_mul(c: & RsaMont, a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    val s: i64 = c.s;
+    var t: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < s + 2 { t.push(0); i = i + 1; }
+    i = 0;
+    while i < s {
+        val bi: i64 = b.get(i);
+        var carry: i64 = 0;
+        var j: i64 = 0;
+        while j < s {
+            val sum: i64 = t.get(j) + a.get(j) * bi + carry;
+            t.set(j, sum & RSA_LIMB_MASK);
+            carry = sum >> 28;
+            j = j + 1;
+        }
+        var sum2: i64 = t.get(s) + carry;
+        t.set(s, sum2 & RSA_LIMB_MASK);
+        t.set(s + 1, sum2 >> 28);
+        val m: i64 = (t.get(0) * c.n0) & RSA_LIMB_MASK;
+        carry = (t.get(0) + m * c.n.get(0)) >> 28;
+        j = 1;
+        while j < s {
+            val sum3: i64 = t.get(j) + m * c.n.get(j) + carry;
+            t.set(j - 1, sum3 & RSA_LIMB_MASK);
+            carry = sum3 >> 28;
+            j = j + 1;
+        }
+        sum2 = t.get(s) + carry;
+        t.set(s - 1, sum2 & RSA_LIMB_MASK);
+        t.set(s, t.get(s + 1) + (sum2 >> 28));
+        t.set(s + 1, 0);
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < s { out.push(t.get(i)); i = i + 1; }
+    if t.get(s) != 0 || rsa_limbs_cmp(& out, & c.n, s) >= 0 {
+        rsa_limbs_sub_in(& mut out, & c.n, s);
+    }
+    return out;
+}
+
+/// (a + b) mod n for values below n.
+pub fn rsa_mont_add(c: & RsaMont, a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var carry: i64 = 0;
+    var i: i64 = 0;
+    while i < c.s {
+        val v: i64 = a.get(i) + b.get(i) + carry;
+        out.push(v & RSA_LIMB_MASK);
+        carry = v >> 28;
+        i = i + 1;
+    }
+    if carry != 0 || rsa_limbs_cmp(& out, & c.n, c.s) >= 0 {
+        rsa_limbs_sub_in(& mut out, & c.n, c.s);
+    }
+    return out;
+}
+
+/// (a - b) mod n for values below n.
+pub fn rsa_mont_sub(c: & RsaMont, a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var borrow: i64 = 0;
+    var i: i64 = 0;
+    while i < c.s {
+        var v: i64 = a.get(i) - b.get(i) - borrow;
+        if v < 0 { v = v + (1 << 28); borrow = 1; } else { borrow = 0; }
+        out.push(v);
+        i = i + 1;
+    }
+    if borrow != 0 {
+        var carry: i64 = 0;
+        i = 0;
+        while i < c.s {
+            val v2: i64 = out.get(i) + c.n.get(i) + carry;
+            out.set(i, v2 & RSA_LIMB_MASK);
+            carry = v2 >> 28;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// x (below n, plain) into Montgomery form.
+pub fn rsa_mont_to(c: & RsaMont, x: & Vec<i64>) -> Vec<i64> {
+    return rsa_mont_mul(c, x, & c.r2);
+}
+
+/// A Montgomery-form value back to plain form.
+pub fn rsa_mont_from(c: & RsaMont, x: & Vec<i64>) -> Vec<i64> {
+    var unit: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < c.s { unit.push(0); i = i + 1; }
+    unit.set(0, 1);
+    return rsa_mont_mul(c, x, & unit);
+}
+
+/// a^e in Montgomery form (a in Montgomery form, e big-endian bytes),
+/// with a fixed 4-bit window.
+pub fn rsa_mont_pow(c: & RsaMont, a: & Vec<i64>, e: Vec<i64>) -> Vec<i64> {
+    var table: Vec<Vec<i64>> = Vec::new();
+    table.push(c.one);
+    var k: i64 = 1;
+    while k < 16 {
+        val prev: Vec<i64> = table.get(k - 1);
+        table.push(rsa_mont_mul(c, & prev, a));
+        k = k + 1;
+    }
+    var x: Vec<i64> = c.one;
+    var started: bool = false;
+    var i: i64 = 0;
+    while i < e.len() {
+        val byte: i64 = e.get(i) & 255;
+        var half: i64 = 0;
+        while half < 2 {
+            var nib: i64 = byte >> 4;
+            if half == 1 { nib = byte & 15; }
+            if started {
+                x = rsa_mont_mul(c, & x, & x);
+                x = rsa_mont_mul(c, & x, & x);
+                x = rsa_mont_mul(c, & x, & x);
+                x = rsa_mont_mul(c, & x, & x);
+            }
+            if nib != 0 {
+                val tv: Vec<i64> = table.get(nib);
+                if started { x = rsa_mont_mul(c, & x, & tv); } else { x = tv; }
+                started = true;
+            }
+            half = half + 1;
+        }
+        i = i + 1;
+    }
+    return x;
+}
+
+/// base^e mod m for an odd modulus m, through Montgomery arithmetic.
+pub fn rsa_modexp(base: BigInt, e: BigInt, m: BigInt) -> BigInt {
+    val mb: Vec<i64> = rsa_i2osp(m, (rsa_bit_len(m) + 7) / 8);
+    val c: RsaMont = rsa_mont_new(mb);
+    val b: Vec<i64> = rsa_limbs_from_bytes(rsa_i2osp(rsa_mod(base, m), mb.len()), c.s);
+    val bm: Vec<i64> = rsa_mont_to(& c, & b);
+    val eb: Vec<i64> = rsa_i2osp(e, (rsa_bit_len(e) + 7) / 8);
+    val p: Vec<i64> = rsa_mont_pow(& c, & bm, eb);
+    val r: Vec<i64> = rsa_mont_from(& c, & p);
+    return rsa_os2ip(rsa_limbs_to_bytes(& r, mb.len()));
+}
+
+// ─── Keys ──────────────────────────────────────────────────────────────
+
+fn rsa_bad_public() -> RsaPublicKey {
+    return RsaPublicKey { ok: false, n: bigint_zero(), e: bigint_zero(), k: 0, bits: 0 };
+}
+
+fn rsa_bad_private() -> RsaPrivateKey {
+    val z: BigInt = bigint_zero();
+    return RsaPrivateKey { ok: false, n: z, e: z, d: z, p: z, q: z, dp: z, dq: z, qinv: z, k: 0, bits: 0 };
+}
+
+/// A public key from n and e.
+pub fn rsa_public(n: BigInt, e: BigInt) -> RsaPublicKey {
+    val bits: i64 = rsa_bit_len(n);
+    return RsaPublicKey { ok: bits >= 64, n: n, e: e, k: (bits + 7) / 8, bits: bits };
+}
+
+fn rsa_uint(buf: & Vec<i64>, t: Asn1Tlv) -> BigInt {
+    return rsa_os2ip(asn1_get_uint_bytes(buf, t));
+}
+
+/// RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }.
+pub fn rsa_public_from_der(der: Vec<i64>) -> RsaPublicKey {
+    val t: Asn1Tlv = asn1_read_der(& der, 0, der.len());
+    if !asn1_is(t, ASN1_SEQUENCE) || t.end != der.len() { return rsa_bad_public(); }
+    val kids: Vec<Asn1Tlv> = asn1_children(& der, t);
+    if kids.len() != 2 || !asn1_is(kids.get(0), ASN1_INTEGER) || !asn1_is(kids.get(1), ASN1_INTEGER) {
+        return rsa_bad_public();
+    }
+    if asn1_int_negative(& der, kids.get(0)) || asn1_int_negative(& der, kids.get(1)) { return rsa_bad_public(); }
+    return rsa_public(rsa_uint(& der, kids.get(0)), rsa_uint(& der, kids.get(1)));
+}
+
+/// A public key from a SubjectPublicKeyInfo ("PUBLIC KEY" PEM block).
+pub fn rsa_public_from_spki(der: Vec<i64>) -> RsaPublicKey {
+    val s: Spki = spki_parse(der);
+    if !s.ok || !str_equal(s.alg, PEM_OID_RSA) { return rsa_bad_public(); }
+    return rsa_public_from_der(s.key);
+}
+
+/// The public half of a private key.
+pub fn rsa_public_of(sk: RsaPrivateKey) -> RsaPublicKey {
+    return rsa_public(sk.n, sk.e);
+}
+
+/// RSAPrivateKey (RFC 8017 A.1.2): version 0 with n, e, d, p, q, dP, dQ,
+/// qInv ("RSA PRIVATE KEY" PEM block). Multi-prime keys are refused.
+pub fn rsa_private_from_der(der: Vec<i64>) -> RsaPrivateKey {
+    val t: Asn1Tlv = asn1_read_der(& der, 0, der.len());
+    if !asn1_is(t, ASN1_SEQUENCE) || t.end != der.len() { return rsa_bad_private(); }
+    val kids: Vec<Asn1Tlv> = asn1_children(& der, t);
+    if kids.len() != 9 { return rsa_bad_private(); }
+    var i: i64 = 0;
+    while i < 9 {
+        if !asn1_is(kids.get(i), ASN1_INTEGER) { return rsa_bad_private(); }
+        i = i + 1;
+    }
+    if asn1_get_int(& der, kids.get(0)) != 0 { return rsa_bad_private(); }
+    val n: BigInt = rsa_uint(& der, kids.get(1));
+    val bits: i64 = rsa_bit_len(n);
+    return RsaPrivateKey {
+        ok: true, n: n, e: rsa_uint(& der, kids.get(2)), d: rsa_uint(& der, kids.get(3)),
+        p: rsa_uint(& der, kids.get(4)), q: rsa_uint(& der, kids.get(5)),
+        dp: rsa_uint(& der, kids.get(6)), dq: rsa_uint(& der, kids.get(7)),
+        qinv: rsa_uint(& der, kids.get(8)), k: (bits + 7) / 8, bits: bits
+    };
+}
+
+/// A private key from PKCS#8 ("PRIVATE KEY" PEM block).
+pub fn rsa_private_from_pkcs8(der: Vec<i64>) -> RsaPrivateKey {
+    val k: Pkcs8Key = pkcs8_parse(der);
+    if !k.ok || !str_equal(k.alg, PEM_OID_RSA) { return rsa_bad_private(); }
+    return rsa_private_from_der(k.key);
+}
+
+fn rsa_enc_big(x: BigInt) -> Vec<i64> {
+    return asn1_enc_uint(rsa_i2osp(x, (rsa_bit_len(x) + 8) / 8));
+}
+
+/// RSAPublicKey DER.
+pub fn rsa_public_to_der(pk: RsaPublicKey) -> Vec<i64> {
+    return asn1_enc_seq(asn1_cat(rsa_enc_big(pk.n), rsa_enc_big(pk.e)));
+}
+
+/// RSAPrivateKey DER.
+pub fn rsa_private_to_der(sk: RsaPrivateKey) -> Vec<i64> {
+    var c: Vec<i64> = asn1_enc_int(0);
+    c = asn1_cat(c, rsa_enc_big(sk.n));
+    c = asn1_cat(c, rsa_enc_big(sk.e));
+    c = asn1_cat(c, rsa_enc_big(sk.d));
+    c = asn1_cat(c, rsa_enc_big(sk.p));
+    c = asn1_cat(c, rsa_enc_big(sk.q));
+    c = asn1_cat(c, rsa_enc_big(sk.dp));
+    c = asn1_cat(c, rsa_enc_big(sk.dq));
+    c = asn1_cat(c, rsa_enc_big(sk.qinv));
+    return asn1_enc_seq(c);
+}
+
+/// A private key from its primes and public exponent: d, dP, dQ and qInv
+/// are computed (d modulo lcm(p-1, q-1), as FIPS 186-5 asks).
+pub fn rsa_private_from_primes(p_in: BigInt, q_in: BigInt, e: BigInt) -> RsaPrivateKey {
+    var p: BigInt = p_in;
+    var q: BigInt = q_in;
+    if bigint_lt(p, q) {
+        p = q_in;
+        q = p_in;
+    }
+    val one: BigInt = bigint_one();
+    val p1: BigInt = bigint_sub(p, one);
+    val q1: BigInt = bigint_sub(q, one);
+    val lcm: BigInt = bigint_div(bigint_mul(p1, q1), rsa_gcd(p1, q1));
+    val d: BigInt = rsa_modinv(e, lcm);
+    if bigint_is_zero(d) { return rsa_bad_private(); }
+    val n: BigInt = bigint_mul(p, q);
+    val bits: i64 = rsa_bit_len(n);
+    return RsaPrivateKey {
+        ok: true, n: n, e: e, d: d, p: p, q: q, dp: bigint_mod(d, p1), dq: bigint_mod(d, q1),
+        qinv: rsa_modinv(q, p), k: (bits + 7) / 8, bits: bits
+    };
+}
+
+// ─── Primitives (RFC 8017 §5) ──────────────────────────────────────────
+
+/// RSAEP / RSAVP1: m^e mod n.
+pub fn rsa_ep(pk: RsaPublicKey, m: BigInt) -> BigInt {
+    return rsa_modexp(m, pk.e, pk.n);
+}
+
+/// RSADP / RSASP1 with the CRT: m1 = c^dP mod p, m2 = c^dQ mod q,
+/// h = qInv (m1 - m2) mod p, m = m2 + q h.
+pub fn rsa_dp(sk: RsaPrivateKey, c: BigInt) -> BigInt {
+    val m1: BigInt = rsa_modexp(c, sk.dp, sk.p);
+    val m2: BigInt = rsa_modexp(c, sk.dq, sk.q);
+    val h: BigInt = rsa_mod(bigint_mul(sk.qinv, bigint_sub(m1, m2)), sk.p);
+    return bigint_add(m2, bigint_mul(sk.q, h));
+}
+
+/// Whether the private key's parts agree: n = p q, and a test value comes
+/// back through the CRT private operation and the public one.
+pub fn rsa_private_check(sk: RsaPrivateKey) -> bool {
+    if !sk.ok || !bigint_eq(sk.n, bigint_mul(sk.p, sk.q)) { return false; }
+    val x: BigInt = bigint_from_i64(0x1234567);
+    val y: BigInt = rsa_dp(sk, x);
+    return bigint_eq(rsa_modexp(y, sk.e, sk.n), x);
+}
+
+// ─── Byte helpers ──────────────────────────────────────────────────────
+
+fn rsa_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() { out.push(a.get(i) & 255); i = i + 1; }
+    i = 0;
+    while i < b.len() { out.push(b.get(i) & 255); i = i + 1; }
+    return out;
+}
+
+fn rsa_sub(a: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { out.push(a.get(i)); i = i + 1; }
+    return out;
+}
+
+/// Equality of byte vectors without an early exit.
+pub fn rsa_ct_eq(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() { d = d | (a.get(i) ^ b.get(i)); i = i + 1; }
+    return d == 0;
+}
+
+/// MGF1 (RFC 8017 B.2.1) with hash `h`.
+pub fn rsa_mgf1(h: i64, seed: Vec<i64>, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var counter: i64 = 0;
+    while out.len() < len {
+        var m: Vec<i64> = rsa_cat(seed, Vec::new());
+        m.push((counter >> 24) & 255);
+        m.push((counter >> 16) & 255);
+        m.push((counter >> 8) & 255);
+        m.push(counter & 255);
+        val d: Vec<i64> = kdf_hash(h, m);
+        var i: i64 = 0;
+        while i < d.len() && out.len() < len { out.push(d.get(i)); i = i + 1; }
+        counter = counter + 1;
+    }
+    return out;
+}
+
+/// The DER DigestInfo prefix of EMSA-PKCS1-v1_5 for a hash.
+pub fn rsa_digest_info_prefix(h: i64) -> Vec<i64> {
+    var oid: str = "2.16.840.1.101.3.4.2.1";
+    if h == KDF_SHA1 { oid = "1.3.14.3.2.26"; }
+    if h == KDF_SHA512 { oid = "2.16.840.1.101.3.4.2.3"; }
+    val alg: Vec<i64> = asn1_enc_seq(asn1_cat(asn1_enc_oid(oid), asn1_enc_null()));
+    val hl: i64 = kdf_hash_len(h);
+    // SEQUENCE { alg, OCTET STRING (hl bytes) } without the digest itself.
+    var prefix: Vec<i64> = Vec::new();
+    prefix.push(0x30);
+    prefix.push(alg.len() + 2 + hl);
+    prefix = rsa_cat(prefix, alg);
+    prefix.push(0x04);
+    prefix.push(hl);
+    return prefix;
+}
+
+// ─── RSASSA-PKCS1-v1_5 (RFC 8017 §8.2, §9.2) ───────────────────────────
+
+/// EMSA-PKCS1-v1_5: 00 01 ff..ff 00 DigestInfo; empty when k is too small.
+pub fn rsa_emsa_pkcs1(h: i64, msg: Vec<i64>, k: i64) -> Vec<i64> {
+    val t: Vec<i64> = rsa_cat(rsa_digest_info_prefix(h), kdf_hash(h, msg));
+    var em: Vec<i64> = Vec::new();
+    if k < t.len() + 11 { return em; }
+    em.push(0);
+    em.push(1);
+    var i: i64 = 0;
+    while i < k - t.len() - 3 { em.push(255); i = i + 1; }
+    em.push(0);
+    return rsa_cat(em, t);
+}
+
+/// Sign `msg` with RSASSA-PKCS1-v1_5: k bytes (empty on a bad key).
+pub fn rsa_pkcs1_sign(sk: RsaPrivateKey, h: i64, msg: Vec<i64>) -> Vec<i64> {
+    val em: Vec<i64> = rsa_emsa_pkcs1(h, msg, sk.k);
+    if em.len() == 0 || !sk.ok { return Vec::new(); }
+    return rsa_i2osp(rsa_dp(sk, rsa_os2ip(em)), sk.k);
+}
+
+/// Verify an RSASSA-PKCS1-v1_5 signature.
+pub fn rsa_pkcs1_verify(pk: RsaPublicKey, h: i64, msg: Vec<i64>, sig: Vec<i64>) -> bool {
+    if !pk.ok || sig.len() != pk.k { return false; }
+    val s: BigInt = rsa_os2ip(sig);
+    if !bigint_lt(s, pk.n) { return false; }
+    val em: Vec<i64> = rsa_i2osp(rsa_ep(pk, s), pk.k);
+    val want: Vec<i64> = rsa_emsa_pkcs1(h, msg, pk.k);
+    return want.len() > 0 && rsa_ct_eq(em, want);
+}
+
+// ─── RSASSA-PSS (RFC 8017 §8.1, §9.1) ──────────────────────────────────
+
+/// EMSA-PSS-ENCODE of a message digest with the given salt; emBits is
+/// modBits - 1. Empty when the encoding does not fit.
+pub fn rsa_emsa_pss_encode(h: i64, mhash: Vec<i64>, salt: Vec<i64>, em_bits: i64) -> Vec<i64> {
+    val hl: i64 = kdf_hash_len(h);
+    val em_len: i64 = (em_bits + 7) / 8;
+    val sl: i64 = salt.len();
+    if em_len < hl + sl + 2 { return Vec::new(); }
+    var mp: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 { mp.push(0); i = i + 1; }
+    val hh: Vec<i64> = kdf_hash(h, rsa_cat(rsa_cat(mp, mhash), salt));
+    var db: Vec<i64> = Vec::new();
+    i = 0;
+    while i < em_len - sl - hl - 2 { db.push(0); i = i + 1; }
+    db.push(1);
+    db = rsa_cat(db, salt);
+    val mask: Vec<i64> = rsa_mgf1(h, hh, em_len - hl - 1);
+    i = 0;
+    while i < db.len() { db.set(i, db.get(i) ^ mask.get(i)); i = i + 1; }
+    val clear: i64 = 8 * em_len - em_bits;
+    db.set(0, db.get(0) & (255 >> clear));
+    var em: Vec<i64> = rsa_cat(db, hh);
+    em.push(0xbc);
+    return em;
+}
+
+/// EMSA-PSS-VERIFY. `salt_len` -1 accepts any salt length (it is read
+/// back from the padding).
+pub fn rsa_emsa_pss_verify(h: i64, mhash: Vec<i64>, em: Vec<i64>, em_bits: i64, salt_len: i64) -> bool {
+    val hl: i64 = kdf_hash_len(h);
+    val em_len: i64 = (em_bits + 7) / 8;
+    if em.len() != em_len || em_len < hl + 2 { return false; }
+    if salt_len >= 0 && em_len < hl + salt_len + 2 { return false; }
+    if em.get(em_len - 1) != 0xbc { return false; }
+    var db: Vec<i64> = rsa_sub(& em, 0, em_len - hl - 1);
+    val hh: Vec<i64> = rsa_sub(& em, em_len - hl - 1, em_len - 1);
+    val clear: i64 = 8 * em_len - em_bits;
+    if (db.get(0) & (255 - (255 >> clear))) != 0 { return false; }
+    val mask: Vec<i64> = rsa_mgf1(h, hh, em_len - hl - 1);
+    var i: i64 = 0;
+    while i < db.len() { db.set(i, db.get(i) ^ mask.get(i)); i = i + 1; }
+    db.set(0, db.get(0) & (255 >> clear));
+    // DB = PS (zeros) || 01 || salt.
+    var j: i64 = 0;
+    while j < db.len() && db.get(j) == 0 { j = j + 1; }
+    if j == db.len() || db.get(j) != 1 { return false; }
+    val sl: i64 = db.len() - j - 1;
+    if salt_len >= 0 && sl != salt_len { return false; }
+    val salt: Vec<i64> = rsa_sub(& db, j + 1, db.len());
+    var mp: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 { mp.push(0); i = i + 1; }
+    val h2: Vec<i64> = kdf_hash(h, rsa_cat(rsa_cat(mp, mhash), salt));
+    return rsa_ct_eq(hh, h2);
+}
+
+/// Sign with RSASSA-PSS (MGF1 with the same hash). The salt is the
+/// caller's random bytes, usually as long as the hash.
+pub fn rsa_pss_sign(sk: RsaPrivateKey, h: i64, msg: Vec<i64>, salt: Vec<i64>) -> Vec<i64> {
+    if !sk.ok { return Vec::new(); }
+    val em: Vec<i64> = rsa_emsa_pss_encode(h, kdf_hash(h, msg), salt, sk.bits - 1);
+    if em.len() == 0 { return Vec::new(); }
+    return rsa_i2osp(rsa_dp(sk, rsa_os2ip(em)), sk.k);
+}
+
+/// Verify an RSASSA-PSS signature; salt_len -1 accepts any length.
+pub fn rsa_pss_verify(pk: RsaPublicKey, h: i64, msg: Vec<i64>, sig: Vec<i64>, salt_len: i64) -> bool {
+    if !pk.ok || sig.len() != pk.k { return false; }
+    val s: BigInt = rsa_os2ip(sig);
+    if !bigint_lt(s, pk.n) { return false; }
+    val em_bits: i64 = pk.bits - 1;
+    val em_len: i64 = (em_bits + 7) / 8;
+    val m: BigInt = rsa_ep(pk, s);
+    val em: Vec<i64> = rsa_i2osp(m, em_len);
+    if em.len() == 0 { return false; }
+    return rsa_emsa_pss_verify(h, kdf_hash(h, msg), em, em_bits, salt_len);
+}
+
+// ─── RSAES-OAEP (RFC 8017 §7.1) ────────────────────────────────────────
+
+/// Encrypt with RSAES-OAEP. `seed` is hLen random bytes from the caller.
+/// Empty when the message is too long (k - 2 hLen - 2 bytes at most).
+pub fn rsa_oaep_encrypt(pk: RsaPublicKey, h: i64, msg: Vec<i64>, label: Vec<i64>, seed: Vec<i64>) -> Vec<i64> {
+    val hl: i64 = kdf_hash_len(h);
+    val k: i64 = pk.k;
+    if !pk.ok || msg.len() > k - 2 * hl - 2 || seed.len() != hl { return Vec::new(); }
+    var db: Vec<i64> = kdf_hash(h, label);
+    var i: i64 = 0;
+    while i < k - msg.len() - 2 * hl - 2 { db.push(0); i = i + 1; }
+    db.push(1);
+    db = rsa_cat(db, msg);
+    val dmask: Vec<i64> = rsa_mgf1(h, seed, k - hl - 1);
+    i = 0;
+    while i < db.len() { db.set(i, db.get(i) ^ dmask.get(i)); i = i + 1; }
+    val smask: Vec<i64> = rsa_mgf1(h, db, hl);
+    var ms: Vec<i64> = Vec::new();
+    i = 0;
+    while i < hl { ms.push((seed.get(i) & 255) ^ smask.get(i)); i = i + 1; }
+    var em: Vec<i64> = Vec::new();
+    em.push(0);
+    em = rsa_cat(rsa_cat(em, ms), db);
+    return rsa_i2osp(rsa_ep(pk, rsa_os2ip(em)), k);
+}
+
+/// Decrypt RSAES-OAEP. Every failure looks the same (ok false, no data).
+pub fn rsa_oaep_decrypt(sk: RsaPrivateKey, h: i64, ct: Vec<i64>, label: Vec<i64>) -> RsaPlain {
+    val hl: i64 = kdf_hash_len(h);
+    val k: i64 = sk.k;
+    val fail: RsaPlain = RsaPlain { ok: false, data: Vec::new() };
+    if !sk.ok || ct.len() != k || k < 2 * hl + 2 { return fail; }
+    val c: BigInt = rsa_os2ip(ct);
+    if !bigint_lt(c, sk.n) { return fail; }
+    val em: Vec<i64> = rsa_i2osp(rsa_dp(sk, c), k);
+    if em.len() != k { return fail; }
+    var seed: Vec<i64> = rsa_sub(& em, 1, 1 + hl);
+    var db: Vec<i64> = rsa_sub(& em, 1 + hl, k);
+    val smask: Vec<i64> = rsa_mgf1(h, db, hl);
+    var i: i64 = 0;
+    while i < hl { seed.set(i, seed.get(i) ^ smask.get(i)); i = i + 1; }
+    val dmask: Vec<i64> = rsa_mgf1(h, seed, k - hl - 1);
+    i = 0;
+    while i < db.len() { db.set(i, db.get(i) ^ dmask.get(i)); i = i + 1; }
+    // Collect every check into one flag before deciding.
+    var bad: i64 = em.get(0);
+    val lh: Vec<i64> = kdf_hash(h, label);
+    i = 0;
+    while i < hl { bad = bad | (db.get(i) ^ lh.get(i)); i = i + 1; }
+    var sep: i64 = -1;
+    var j: i64 = hl;
+    while j < db.len() {
+        if sep < 0 && db.get(j) == 1 { sep = j; }
+        if sep < 0 && db.get(j) != 0 { bad = bad | 1; }
+        j = j + 1;
+    }
+    if sep < 0 { bad = bad | 1; }
+    if bad != 0 { return fail; }
+    return RsaPlain { ok: true, data: rsa_sub(& db, sep + 1, db.len()) };
+}
+
+// ─── Key generation ────────────────────────────────────────────────────
+
+fn rsa_small_primes() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var c: i64 = 3;
+    while c < 600 {
+        var prime: bool = true;
+        var d: i64 = 3;
+        while d * d <= c {
+            if c % d == 0 { prime = false; break; }
+            d = d + 2;
+        }
+        if prime { out.push(c); }
+        c = c + 2;
+    }
+    return out;
+}
+
+/// Miller-Rabin with `rounds` bases drawn from rand (n odd and > 3),
+/// after trial division by the primes below 600.
+pub fn rsa_is_probable_prime(n: BigInt, rounds: i64, rand: fn(i64) -> Vec<i64>) -> bool {
+    val two: BigInt = bigint_from_i64(2);
+    if bigint_lt(n, bigint_from_i64(600)) {
+        val v: i64 = bigint_to_i64(n);
+        if v < 2 { return false; }
+        if v == 2 { return true; }
+        if v % 2 == 0 { return false; }
+        var d: i64 = 3;
+        while d * d <= v {
+            if v % d == 0 { return false; }
+            d = d + 2;
+        }
+        return true;
+    }
+    if bigint_is_zero(bigint_mod(n, two)) { return false; }
+    val small: Vec<i64> = rsa_small_primes();
+    var i: i64 = 0;
+    while i < small.len() {
+        if bigint_is_zero(bigint_mod(n, bigint_from_i64(small.get(i)))) { return false; }
+        i = i + 1;
+    }
+    val one: BigInt = bigint_one();
+    val nm1: BigInt = bigint_sub(n, one);
+    var d2: BigInt = nm1;
+    var s: i64 = 0;
+    while bigint_is_zero(bigint_mod(d2, two)) {
+        d2 = bigint_div(d2, two);
+        s = s + 1;
+    }
+    val nbytes: i64 = (rsa_bit_len(n) + 7) / 8;
+    var r: i64 = 0;
+    while r < rounds {
+        // A base in 2..n-2.
+        val a: BigInt = bigint_add(rsa_mod(rsa_os2ip(rand(nbytes + 8)), bigint_sub(n, bigint_from_i64(3))), two);
+        var x: BigInt = rsa_modexp(a, d2, n);
+        if !bigint_eq(x, one) && !bigint_eq(x, nm1) {
+            var composite: bool = true;
+            var k: i64 = 1;
+            while k < s && composite {
+                x = bigint_mod(bigint_mul(x, x), n);
+                if bigint_eq(x, nm1) { composite = false; }
+                k = k + 1;
+            }
+            if composite { return false; }
+        }
+        r = r + 1;
+    }
+    return true;
+}
+
+/// A random prime of exactly `bits` bits (top two bits set, so a product
+/// of two has 2*bits bits) with p mod e != 1.
+pub fn rsa_random_prime(bits: i64, e: BigInt, rand: fn(i64) -> Vec<i64>) -> BigInt {
+    val nbytes: i64 = (bits + 7) / 8;
+    val extra: i64 = nbytes * 8 - bits;
+    while true {
+        var b: Vec<i64> = rand(nbytes);
+        b.set(0, (b.get(0) & (255 >> extra)) | (0xc0 >> extra));
+        b.set(nbytes - 1, b.get(nbytes - 1) | 1);
+        val cand: BigInt = rsa_os2ip(b);
+        if !bigint_eq(rsa_mod(cand, e), bigint_one()) && rsa_is_probable_prime(cand, 24, rand) {
+            return cand;
+        }
+    }
+    return bigint_zero();
+}
+
+/// A new key of `bits` bits (even, at least 128) with exponent e
+/// (65537 in practice).
+pub fn rsa_generate(bits: i64, e: i64, rand: fn(i64) -> Vec<i64>) -> RsaPrivateKey {
+    val eb: BigInt = bigint_from_i64(e);
+    while true {
+        val p: BigInt = rsa_random_prime(bits / 2, eb, rand);
+        val q: BigInt = rsa_random_prime(bits - bits / 2, eb, rand);
+        if !bigint_eq(p, q) {
+            val sk: RsaPrivateKey = rsa_private_from_primes(p, q, eb);
+            if sk.ok && sk.bits == bits { return sk; }
+        }
+    }
+    return rsa_bad_private();
+}

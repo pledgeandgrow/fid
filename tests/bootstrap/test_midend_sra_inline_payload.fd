@@ -1,0 +1,116 @@
+// SP16 (llvm-roadmap): the compiler's own parser, built by `fid emit`
+// (pe_ir and nat_ir alike), crashed in __own_dup_N/Vec_share on its first
+// expression. The cause was the mid-end's scalar replacement of aggregates
+// (compiler/iropt_me.fd ime_sra, ME26): `return Res::Ok(Ex::Pair(..))`
+// builds the Res in a stack struct, stores the Ex *by value* into the
+// payload words (Store with an explicit struct type: a copy of every word
+// of the Ex, lower.fd enum literal "Struct/enum-typed field") and then
+// copies the Res word by word into the caller's result. ime_sra took the
+// payload's first word for an i64 field, so the stored Ex became its
+// address in one local and the other payload words were never written.
+// Every result below is built that way; each one is read back field by
+// field, through a match and through a copy kept in a Vec.
+//
+// Expected output:
+// lit 7
+// pair 10 11 12 p10
+// name n3 3
+// err bad 4
+// pair 20 21 22 p20
+// sum 150
+// kept 4
+
+enum Ex {
+    Lit(i64),
+    Pair(i64, i64, i64, str),
+    Name(str, i64),
+}
+
+enum Res {
+    Ok(Ex),
+    Err(str, i64),
+}
+
+struct Wide {
+    a: i64,
+    b: i64,
+    c: str,
+    d: i64,
+}
+
+enum WRes {
+    Ok(Wide),
+    Err(str),
+}
+
+fn mk(n: i64) -> Res {
+    if n == 0 {
+        return Res::Ok(Ex::Lit(7));
+    }
+    if n == 3 {
+        return Res::Ok(Ex::Name("n" + int_to_str(n), n));
+    }
+    if n == 4 {
+        return Res::Err("bad", n);
+    }
+    return Res::Ok(Ex::Pair(n, n + 1, n + 2, "p" + int_to_str(n)));
+}
+
+fn mkw(n: i64) -> WRes {
+    if n < 0 {
+        return WRes::Err("neg");
+    }
+    return WRes::Ok(Wide { a: n, b: n * 2, c: "w" + int_to_str(n), d: n * 3 });
+}
+
+fn show(r: Res) -> i64 {
+    match r {
+        Res::Ok(e) => {
+            match e {
+                Ex::Lit(v) => {
+                    println("lit " + int_to_str(v));
+                    return v;
+                }
+                Ex::Pair(a, b, c, s) => {
+                    println("pair " + int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c) + " " + s);
+                    return a + b + c + str_len(s);
+                }
+                Ex::Name(s, k) => {
+                    println("name " + s + " " + int_to_str(k));
+                    return str_len(s) + k;
+                }
+            }
+        }
+        Res::Err(m, k) => {
+            println("err " + m + " " + int_to_str(k));
+            return k;
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    var total: i64 = 0;
+    total = total + show(mk(0));
+    total = total + show(mk(10));
+    total = total + show(mk(3));
+    total = total + show(mk(4));
+    total = total + show(mk(20));
+    var kept: Vec<Res> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        kept.push(mk(i + 1));
+        i = i + 1;
+    }
+    match mkw(5) {
+        WRes::Ok(w) => {
+            total = total + w.a + w.b + str_len(w.c) + w.d;
+        }
+        WRes::Err(m) => {
+            println(m);
+        }
+    }
+    println("sum " + int_to_str(total));
+    println("kept " + int_to_str(kept.len()));
+    return 0;
+}

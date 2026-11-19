@@ -1,0 +1,182 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA18: float values that live
+// across a call keep a callee-saved float register (AArch64 d8..d15,
+// RISC-V fs0..fs11) instead of a stack slot (compiler/nat_ir.fd
+// ng_float_assign, ng_float_callee_pool; the function saves the ones it
+// uses: ng_save_subset). Each function below keeps floats live across
+// calls; the callees use the same registers for their own floats, so a
+// register that is not saved and restored shows up as a wrong number.
+//   across   four floats live across a call in a loop
+//   nest     a recursive float function: every level keeps floats in the
+//            same registers across the call to the next level
+//   many     twelve floats across one call (more than the eight d8..d15:
+//            some spill, the rest stay in registers)
+//   single   f32 values across calls
+//   early    an early return that touches no float (shrink wrapping saves
+//            the registers on the other way only)
+//   tailf    a float function ending in a tail call to itself
+//   passing  floats passed to and returned from calls while others live
+// tests/nattools/machine_fcallee_check.sh builds it for aarch64-linux and
+// riscv64-linux (FID_VERIFY=1) with `--stats`: "[fcallee]" lines, the same
+// output with FID_NAT_OFF=fcallee, a different one with
+// FID_NAT_MUTATE=fcallee (the registers used but not saved).
+// Expected output:
+// across 194722 184
+// nest 1583 4
+// many 755507
+// single 9250 162
+// early 2 0 7250
+// tailf 33140
+// passing 1374721 44
+
+// an integer function that is not inlined (recursive) and clobbers what
+// a caller may keep in caller-saved registers
+fn mix(k: i64) -> i64 {
+    if k <= 0 {
+        return 1;
+    }
+    return (k & 3) + mix(k >> 2);
+}
+
+// a float function the callers call: it uses floats of its own
+fn fpoly(x: f64, k: i64) -> f64 {
+    var a: f64 = x * 0.5;
+    var b: f64 = a + 1.25;
+    var c: f64 = b * b - a;
+    var t: i64 = mix(k);
+    return c + (t as f64) * 0.125 + a * b;
+}
+
+fn across(n: i64) -> i64 {
+    var a: f64 = 1.5;
+    var b: f64 = 0.25;
+    var c: f64 = 2.0;
+    var d: f64 = 0.75;
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var t: i64 = mix(i);
+        a = a + b * 0.5;
+        b = b + 0.125;
+        c = c * 0.5 + d;
+        d = d + (t as f64) * 0.25;
+        acc = acc + t;
+        i = i + 1;
+    }
+    val fa: i64 = ((a + b + c + d) * 1000.0) as i64;
+    return fa + acc;
+}
+
+fn across_acc(n: i64) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        acc = acc + mix(i);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn nest(depth: i64, x: f64) -> f64 {
+    if depth <= 0 {
+        return x;
+    }
+    var keep1: f64 = x * 1.5;
+    var keep2: f64 = x + 0.25;
+    var below: f64 = nest(depth - 1, x * 0.5 + 0.125);
+    return keep1 - keep2 + below * 0.5;
+}
+
+fn many(n: i64) -> i64 {
+    var f0: f64 = 0.5;
+    var f1: f64 = 1.5;
+    var f2: f64 = 2.5;
+    var f3: f64 = 3.5;
+    var f4: f64 = 4.5;
+    var f5: f64 = 5.5;
+    var f6: f64 = 6.5;
+    var f7: f64 = 7.5;
+    var f8: f64 = 8.5;
+    var f9: f64 = 9.5;
+    var f10: f64 = 10.5;
+    var f11: f64 = 11.5;
+    var t: i64 = mix(n);
+    var s: f64 = f0 + f1 * 2.0 + f2 * 3.0 + f3 * 4.0 + f4 * 5.0 + f5 * 6.0;
+    s = s + f6 * 7.0 + f7 * 8.0 + f8 * 9.0 + f9 * 10.0 + f10 * 11.0 + f11 * 12.0;
+    var u: i64 = mix(n + 1);
+    s = s + f0 * f11 + f1 * f10 + f2 * f9 + f3 * f8 + f4 * f7 + f5 * f6;
+    return (s * 1000.0) as i64 + t + u;
+}
+
+fn single(n: i64) -> i64 {
+    var a: f32 = 1.5 as f32;
+    var b: f32 = 0.25 as f32;
+    var cnt: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        cnt = cnt + mix(i * 3);
+        a = a + b;
+        b = b * (0.5 as f32) + (0.125 as f32);
+        i = i + 1;
+    }
+    return ((a + b) * (1000.0 as f32)) as i64;
+}
+
+fn single_cnt(n: i64) -> i64 {
+    var cnt: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        cnt = cnt + mix(i * 3);
+        i = i + 1;
+    }
+    return cnt;
+}
+
+fn early(n: i64, x: f64) -> f64 {
+    if n < 2 {
+        return 0.0;
+    }
+    var a: f64 = x * 2.0;
+    var b: f64 = x + 1.0;
+    var t: i64 = mix(n);
+    return a * b + (t as f64);
+}
+
+fn tailf(x: f64, acc: f64, n: i64) -> f64 {
+    if n <= 0 {
+        return acc;
+    }
+    var y: f64 = x * 0.5 + 1.0;
+    var z: f64 = fpoly(y, n);
+    return tailf(y, acc + z * 0.25 + y, n - 1);
+}
+
+fn passing(n: i64) -> i64 {
+    var keep: f64 = 3.25;
+    var other: f64 = 0.5;
+    var total: f64 = 0.0;
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var r: f64 = fpoly(keep + (i as f64), i);
+        total = total + r * other;
+        keep = keep * 0.5 + 1.0;
+        other = other + 0.25;
+        k = k + mix(i);
+        i = i + 1;
+    }
+    val ft: i64 = (total * 1000.0) as i64;
+    val fk: i64 = (keep * 1000.0) as i64;
+    return ft + fk + k;
+}
+
+fn main() {
+    println("across " + int_to_str(across(40)) + " " + int_to_str(across_acc(40)));
+    println("nest " + int_to_str((nest(12, 3.0) * 1000.0) as i64) + " " + int_to_str(mix(9)));
+    println("many " + int_to_str(many(5)));
+    println("single " + int_to_str(single(30)) + " " + int_to_str(single_cnt(30)));
+    val e0: f64 = early(1, 3.0);
+    val e1: f64 = early(7, 3.0);
+    println("early " + int_to_str(mix(1)) + " " + int_to_str(e0 as i64) + " " + int_to_str((e1 * 250.0) as i64));
+    println("tailf " + int_to_str((tailf(2.0, 0.0, 9) * 1000.0) as i64));
+    println("passing " + int_to_str(passing(12)) + " " + int_to_str(mix(12) * 11));
+}

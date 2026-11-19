@@ -1,0 +1,94 @@
+// VF5 finding O1 (docs/verification/miscompile-log.md M26). A local
+// variable that has the name of a module-level global hides it (reference
+// §5: the innermost binding of a name is the one used), also when it is
+// assigned. The lowerer looked the target of an assignment up among the
+// globals first (compiler/lower.fd, Stmt::Assign), so `x = e` and `x += e`
+// on a local `x` wrote the global `x` and left the local alone, on every
+// backend. Core's own functions have locals too: a HashMap insert ran
+// `base = ...` in core's hm_set_hashed and overwrote a user's global
+// `base` (it printed 262144). It is also why gconst (compiler/iropt.fd
+// iro_const_globals, WP18) folded nothing: the stray stores made every
+// such global look written.
+//
+// Each line prints a value the bug changes: a local assigned inside an
+// `if`, one assigned at the top of a function and with `+=`, a loop
+// counter named like a global, a global assigned where no local hides it
+// (that must still reach the global), and globals named like core's
+// locals after a HashMap and a Vec were used.
+//
+// Expected output:
+// 6
+// 100
+// 23
+// 0
+// 604
+// 7
+// 2
+// 3
+// 30
+// 100 7 2
+
+var base: i64 = 100;
+var tally: i64 = 7;
+var total: i64 = 0;
+
+fn shadow_if(c: bool) -> i64 {
+    var base: i64 = 1;
+    if c {
+        base = base + 5;
+    }
+    return base;
+}
+
+fn shadow_top() -> i64 {
+    var total: i64 = 2;
+    total = total * 10;
+    total += 3;
+    return total;
+}
+
+fn count_to(n: i64) -> i64 {
+    var tally: i64 = 0;
+    var s: i64 = 0;
+    // the guard ends the loop when `tally = tally + 1` misses the local
+    // (the bug). A global named like one of core's loop counters (`i`)
+    // hung the program inside core's HashMap insert
+    var guard: i64 = 0;
+    while tally < n && guard < 100 {
+        s = s + tally;
+        tally = tally + 1;
+        guard = guard + 1;
+    }
+    return s * 100 + tally;
+}
+
+fn bump_global() {
+    total = total + 1;
+}
+
+fn main() -> i64 {
+    println(shadow_if(true));
+    println(base);
+    println(shadow_top());
+    println(total);
+    println(count_to(4));
+    println(tally);
+    bump_global();
+    bump_global();
+    println(total);
+    var m: HashMap<str, i64> = HashMap::new();
+    m.insert("a", 1);
+    m.insert("b", 2);
+    println(m.get("a") + m.get("b"));
+    var v: Vec<i64> = Vec::new();
+    for k in 0..5 {
+        v.push(k * k);
+    }
+    var s: i64 = 0;
+    for k in 0..v.len() {
+        s = s + v[k];
+    }
+    println(s);
+    println(int_to_str(base) + " " + int_to_str(tally) + " " + int_to_str(total));
+    return 0;
+}

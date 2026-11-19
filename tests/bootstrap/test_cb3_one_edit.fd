@@ -1,0 +1,82 @@
+// CB3 (complaint-roadmap): "incremental builds are not incremental". A
+// one-line change to one function must send only that function through
+// the native back end again; the rest of the program is replayed from the
+// per-function caches (pe_ir's B5 cache for a Windows `fid emit`, nat_ir's
+// FID_FNCACHE for `--nat` and the Linux targets), and the mid-end's memo
+// (compiler/iropt.fd iro_imc_key, compiler/ir_ser.fd imc_*) runs its
+// passes only on the changed function and the functions that call it.
+// tests/tooling/cb3-incremental-check.sh builds this program, then a copy
+// with the line marked CB3-EDIT changed (`n * 3` -> `n * 5`), on the same
+// caches, and checks what each build reports and prints.
+//
+// `tri` is recursive (not inlined into `main`) and its argument is not a
+// constant the optimizer can specialize on (`n` depends on the clock), so
+// the edit leaves every other function's IR as it was.
+//
+// Expected output:
+// 165
+// 55
+// 12
+// 3
+// 5
+
+fn tri(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return n * 3 + tri(n - 1); // CB3-EDIT
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return a;
+    }
+    return gcd(b, a % b);
+}
+
+fn count_words(s: str) -> i64 {
+    var words: i64 = 0;
+    var inside: bool = false;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 32 {
+            inside = false;
+        } else if !inside {
+            inside = true;
+            words = words + 1;
+        }
+        i = i + 1;
+    }
+    return words;
+}
+
+fn digits(x: i64) -> i64 {
+    var d: i64 = 1;
+    var v: i64 = x;
+    while v >= 10 {
+        v = v / 10;
+        d = d + 1;
+    }
+    return d;
+}
+
+fn main() -> i64 {
+    var n: i64 = 10;
+    if p_clock_now_ms() < 0 {
+        n = 11;
+    }
+    println(int_to_str(tri(n)));
+    println(int_to_str(fib(n)));
+    println(int_to_str(gcd(n * 6, 84)));
+    println(int_to_str(count_words("one  two three")));
+    println(int_to_str(digits(n * 1000)));
+    return 0;
+}

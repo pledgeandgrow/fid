@@ -1,0 +1,171 @@
+// Test (competitive roadmap OP28): comptime runs whole parsers. A comptime
+// fn parses constant text with core's string functions (str_len,
+// str_byte_at, str_split, str_trim, str_parse_int) and a plain helper of
+// its own (`is_digit`, `field_value`); the program gets only the parsed
+// values (tests/tooling/op28-comptime-parser.sh checks that main calls no
+// parser). Each line is printed twice: from the comptime value and from
+// the same parser run when the program does, which must agree.
+//
+// Expected output:
+// 4 364
+// 4 364
+// 3 width=640 height=480 depth=24
+// 3 width=640 height=480 depth=24
+// 7372800
+// 7372800
+
+fn is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+comptime fn parse_nums(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var have: bool = false;
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if is_digit(c) {
+            cur = cur * 10 + (c - 48);
+            have = true;
+        } else {
+            if have {
+                out.push(cur);
+            }
+            cur = 0;
+            have = false;
+        }
+        i = i + 1;
+    }
+    if have {
+        out.push(cur);
+    }
+    return out;
+}
+
+fn parse_nums_rt(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var have: bool = false;
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if is_digit(c) {
+            cur = cur * 10 + (c - 48);
+            have = true;
+        } else {
+            if have {
+                out.push(cur);
+            }
+            cur = 0;
+            have = false;
+        }
+        i = i + 1;
+    }
+    if have {
+        out.push(cur);
+    }
+    return out;
+}
+
+// `key = value` lines: the keys, in order.
+comptime fn config_keys(text: str) -> Vec<str> {
+    var keys: Vec<str> = Vec::new();
+    val lines: Vec<str> = str_split(text, ";");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val line: str = str_trim(lines.get(i));
+        val eq: i64 = str_find(line, "=");
+        if eq > 0 {
+            keys.push(str_trim(str_slice(line, 0, eq)));
+        }
+        i = i + 1;
+    }
+    return keys;
+}
+
+fn field_value(text: str, key: str) -> i64 {
+    val lines: Vec<str> = str_split(text, ";");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val line: str = str_trim(lines.get(i));
+        val eq: i64 = str_find(line, "=");
+        if eq > 0 && str_trim(str_slice(line, 0, eq)) == key {
+            return str_parse_int(str_trim(str_slice(line, eq + 1, str_len(line))));
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+comptime fn config_values(text: str) -> Vec<i64> {
+    var vals: Vec<i64> = Vec::new();
+    val keys: Vec<str> = config_keys(text);
+    var i: i64 = 0;
+    while i < keys.len() {
+        vals.push(field_value(text, keys.get(i)));
+        i = i + 1;
+    }
+    return vals;
+}
+
+fn config_keys_rt(text: str) -> Vec<str> {
+    var keys: Vec<str> = Vec::new();
+    val lines: Vec<str> = str_split(text, ";");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val line: str = str_trim(lines.get(i));
+        val eq: i64 = str_find(line, "=");
+        if eq > 0 {
+            keys.push(str_trim(str_slice(line, 0, eq)));
+        }
+        i = i + 1;
+    }
+    return keys;
+}
+
+fn show(keys: Vec<str>, vals: Vec<i64>) {
+    var line: str = int_to_str(keys.len());
+    var i: i64 = 0;
+    while i < keys.len() {
+        line = line + " " + keys.get(i) + "=" + int_to_str(vals.get(i));
+        i = i + 1;
+    }
+    println(line);
+}
+
+fn sum(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    val nums: Vec<i64> = comptime parse_nums("12, 7,300 ,45");
+    println(int_to_str(nums.len()) + " " + int_to_str(sum(nums)));
+    val nums2: Vec<i64> = parse_nums_rt("12, 7,300 ,45");
+    println(int_to_str(nums2.len()) + " " + int_to_str(sum(nums2)));
+
+    val keys: Vec<str> = comptime config_keys(" width = 640; height=480 ;depth= 24 ; ");
+    val vals: Vec<i64> = comptime config_values(" width = 640; height=480 ;depth= 24 ; ");
+    show(keys, vals);
+    val text: str = " width = 640; height=480 ;depth= 24 ; ";
+    val keys2: Vec<str> = config_keys_rt(text);
+    var vals2: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < keys2.len() {
+        vals2.push(field_value(text, keys2.get(i)));
+        i = i + 1;
+    }
+    show(keys2, vals2);
+
+    println(vals.get(0) * vals.get(1) * vals.get(2));
+    println(vals2.get(0) * vals2.get(1) * vals2.get(2));
+    return 0;
+}

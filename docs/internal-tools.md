@@ -9,7 +9,25 @@ ones that are not in Fides, whether they could be and what stands in the way.
 `veil`, `ark`); `tools/ark.fd`, `tools/scribe.fd`, `tools/veil.fd` (entries for
 `compiler/{ark,scribe,veil}.fd`); `tools/cas.fd` (the build-cache server);
 and, new on Nov 15, `tools/site.fd` (the website, [website.md](website.md)),
-`tools/release_notes.fd` and `tools/release_checksums.fd` (ports, below).
+`tools/release_notes.fd` and `tools/release_checksums.fd`, on Nov 16
+`tools/macho_check.fd` and `tools/fuzz_triage.fd`, and on Nov 17, after the
+process API below, `tools/doctest.fd` and `tools/check_stdlib.fd` (ports,
+below).
+
+**The process API (Nov 17).** `stdlib/process.fd` now has
+`process_spawn(argv, env, dir) -> handle` (no shell: each argument reaches
+the program as written), `process_spawn_to` / `process_spawn_files` (stdout,
+and stderr apart or with it, to files), `process_wait(handle, timeout_ms)
+-> Option<code>`, `process_kill(handle)`, `process_child_pid`,
+`process_release`, and `process_run_argv(argv, env, dir, timeout_ms)` (run
+with a time limit, stdout and stderr captured). Each runtime implements it
+(`fid_proc_*`): the C runtime (`compiler/codegen_c.fd`, fork/execvp and
+CreateProcessA), native Windows (`stdlib/pe_runtime/base.fd`), the machine
+layer's Linux, macOS and `--nat` Windows (`stdlib/linux_runtime/sys.fd`,
+`win.fd`), and the interpreter (`compiler/interp.fd`, through the shell,
+since fid's first stage is built by a compiler without these functions).
+Test: `tests/bootstrap/test_process_spawn.fd`. The section below is what
+stood in the way before it.
 
 ## What blocks the rest
 
@@ -47,11 +65,11 @@ above), **no** (the tool is someone else's, or must not depend on `fid`).
 |---|---|---|---|---|
 | `scripts/release-notes.py` | Python, 39 lines | **ported**: `tools/release_notes.fd` | — | Same output on the real changelog (below). |
 | `scripts/release-checksums.sh` | Bash, 48 | **ported**: `tools/release_checksums.fd` | — | Uses `stdlib/crypto.fd`'s SHA-256; needs no `sha256sum`. |
-| `scripts/doctest.py` | Python, 125 | no | after P | Extracts `/// Example:` blocks, runs each with `fid run`, 60 s timeout. The extraction is plain text work; the timeout needs P. |
+| `scripts/doctest.py` | Python, 125 | **yes** (`tools/doctest.fd`, Nov 17) | — | Extracts `/// Example:` blocks, runs each with `fid run`, 60 s timeout (native-only ones built and run with `--emit`). Same arguments and output; `tests/tools/doctest/check.sh` compares the two. |
 | `scripts/gen-brotli-dict.py` | Python, 88 | no | yes | Base64 of a binary file into Fides literals, checked by SHA-256: `encoding` and `crypto` have both. Run once; low value. |
 | `installer/build-installer.sh` | Bash, 157 | no | no | Drives NSIS. |
 | `.github/workflows/*.yml`, `scripts/ci/cross.yml` | YAML | no | no | GitHub Actions. |
-| `scribe` (Rust `src/scribe.rs`) | Rust, 882 | Fides version in `compiler/scribe.fd` | — | Shipped binary is still the Rust one (AD1). |
+| `scribe` (Rust `src/scribe.rs`) | Rust, 882 | **ported**: `compiler/scribe.fd` through `tools/scribe.fd` | — | Takes the Rust tool's command line (`-o`/`-f`, `--help`, `--version`, errors on stderr with exit 1); the installer builds it through C, and `tests/tooling/tools-selfbuild-check.sh` compares it with the Rust tool. |
 | website | — | **`tools/site.fd`** | — | New (AD2). |
 
 ### Building and checking the compiler
@@ -63,14 +81,14 @@ above), **no** (the tool is someone else's, or must not depend on `fid`).
 | `scripts/verify/clean-bootstrap.sh`, `build-variant.sh`, `repro.sh` | Bash, 63/94/85 | no | after P | `git archive`, copies of the tree, rebuilds, byte comparison. `repro.sh`'s comparison could be Fides today. |
 | `verify.sh`, `verify-selfhost.sh` | Bash, 170/322 | no | after P | Drive Cargo and `fidesc test` (the Rust harness). |
 | `tests/harness.rs` (`fidesc test`) | Rust, 841 | no | after P | The suite runner of the frozen Rust compiler. A Fides runner would also free the suite from `fidesc` (needs timeouts and parallel children). |
-| `scripts/check-stdlib.sh` | Bash, 25 | no | after P | Builds one tiny program per stdlib module. Without timeouts it is portable as it is (no program is run), but slow without parallel builds. |
+| `scripts/check-stdlib.sh` | Bash, 25 | **yes** (`tools/check_stdlib.fd`, Nov 17) | — | Builds one tiny program per stdlib module. The port has the same output and builds `JOBS=n` at once. |
 | `scripts/compile-gate.sh`, `bench/compile-check.sh` | Bash, 89/87 | no | after P | Parse `fid emit --time` lines, best of N, compare with a baseline file. The comparison is easy Fides; the runs need P only for a timeout. |
 | `scripts/stale-cache-test.sh` | Bash, 49 | no | after P | Edits inputs, rebuilds, checks the cache was not reused. |
 | `scripts/leak-check.sh` | Bash, 50 | no | after P | Runs `fid run --leaks`, compares with `.expected`. |
 | `scripts/nat-gate.sh`, `pass-matrix.sh`, `me-measure.sh` | Bash, 72/33/65 | no | after P | Native builds with checkers on, then results compared. |
 | `scripts/rules-smt.sh` | Bash, 36 | no | after P | Runs z3 on files `fid test-rules --smt` writes; z3 stays. |
 | `scripts/enc-oracle.py` | Python, 359 | no | after P | Our encoders against clang's assembler; clang stays, the driver could move. |
-| `scripts/macho-check.py` | Python, 297 | no | **yes** | Reads a Mach-O file and checks its structure: bytes in, verdict out, no other program. The best next port. |
+| `scripts/macho-check.py` | Python, 297 | **ported**: `tools/macho_check.fd` | — | Same output and exit status on the aarch64-macos and x86_64-macos hello builds and on 124 of 126 damaged copies; the other 2 crash the script (UnicodeEncodeError on a name byte >= 0x80 on a cp1252 console). Native `emit` is blocked by `use crypto`'s @secret errors (known-bugs 2g.71): build it through C. |
 
 ### Testing on other targets
 
@@ -90,7 +108,7 @@ above), **no** (the tool is someone else's, or must not depend on `fid`).
 | `scripts/fuzz/gen_programs.py`, `gen_vs_c.py` | Python, 178/657 | no | after P | Random program generators (`stdlib/random.fd` exists); running each candidate needs timeouts. A generator written in Fides would also test Fides. |
 | `scripts/fuzz/fuzz_frontend.py`, `fuzz_parsers.py` | Python, 210/141 | no | after P | Mutate inputs, run `fid check` / parsers, classify crashes. |
 | `scripts/fuzz/reduce.py` | Python, 128 | no | after P | Delta debugging over a failing program. |
-| `scripts/fuzz/triage.py` | Python, 75 | no | **yes** | Groups kept failures by message: files and regexes only (`stdlib/regex.fd`). |
+| `scripts/fuzz/triage.py` | Python, 75 | **ported**: `tools/fuzz_triage.fd` | — | Same output on a keep directory written as gen_vs_c.py writes them and on 6 random ones (decoding, newline translation, repr, grouping). Native `emit` is blocked by `memchr` missing from the msvcrt imports (2g.58): build it through C. |
 | `scripts/fuzz/nightly.sh` | Bash, 57 | no | after P | Runs the above. |
 | `scripts/verify/expect.py` | Python, 176 | no | after P | Every backend on a test file, checks what it must do. |
 | `scripts/verify/variants.py` | Python, 288 | no | after P | Builds with passes off / broken on purpose. |
@@ -108,11 +126,11 @@ above), **no** (the tool is someone else's, or must not depend on `fid`).
 
 | Tool | Rust | Fides | State |
 |---|---|---|---|
-| `ark` | `src/ark.rs`, 881 lines | `compiler/ark.fd` 761, `tools/ark.fd`, `fid ark` | Fides version builds and runs (`version`, `list`); the installer still ships the Rust one (AD1). |
-| `scribe` | `src/scribe.rs`, 882 | `compiler/scribe.fd` 1,023, `tools/scribe.fd`, `fid doc` | Same. |
-| `veil` | `src/veil.rs`, 367 | `compiler/veil.fd` 655, `tools/veil.fd`, `fid veil` | Same; the Windows native build ran out of memory (AD1). |
+| `ark` | `src/ark.rs`, 881 lines | `compiler/ark.fd` 761, `tools/ark.fd`, `fid ark` | Fides version builds and runs (`version`, `list`); since Nov 16 the installer builds it from `tools/ark.fd` with the shipped fid.exe through C (release N8). |
+| `scribe` | `src/scribe.rs`, 882 | `compiler/scribe.fd` 1,023, `tools/scribe.fd`, `fid doc` | `tools/scribe.fd` takes the Rust tool's command line (`-o`/`-f`, `--help`, `--version`, errors on stderr with exit 1); the installer builds it with the shipped fid.exe through C; `tests/tooling/tools-selfbuild-check.sh` compares it with the Rust scribe. |
+| `veil` | `src/veil.rs`, 367 | `compiler/veil.fd` 655, `tools/veil.fd`, `fid veil` | As scribe: the Rust tool's command line, built by the installer through C, compared with the Rust veil by `tests/tooling/tools-selfbuild-check.sh`. Only `fid emit tools/veil.fd` (pe_ir) runs out of memory, since veil imports the whole compiler (AD1). |
 
-## The two ports, checked
+## The ports, checked
 
 Both originals are kept; the ports were built with
 `CC="zig cc" fid ccompile tools/<name>.fd` (Nov 15 compiler) and run from the
@@ -138,3 +156,37 @@ Git Bash's `sha256sum` marks binary mode with `" *name"`, Linux's writes
 on both (checked in Git Bash). The port adds `--out FILE` (the script always
 writes `SHA256SUMS.txt` at the repository root), so it can be checked without
 touching the tree.
+
+**`tools/macho_check.fd`** (Nov 16) against `python3 scripts/macho-check.py`
+on `fid emit tests/bootstrap/hello.fd --target aarch64-macos` and
+`--target x86_64-macos`, and on 126 damaged copies (truncated at every load
+command, flipped bytes, bad protections, overlaps, bad rebase and bind
+opcodes, signature damage, unknown commands; about 75 different FAIL
+messages): identical text and exit status except 2, where the script itself
+crashes. Values are 64-bit where Python's are unbounded; a missing file is
+an error message, not a traceback.
+
+**`tools/fuzz_triage.fd`** (Nov 16) against `python3 scripts/fuzz/triage.py`
+on 7 keep directories: identical. Python's repr, isspace and `\d` are
+matched for Latin-1 and the common Unicode ranges, not all of Unicode.
+
+**`tools/doctest.fd`** (Nov 17) against `python scripts/doctest.py` with the
+same arguments and the same compiler for the examples (the Nov 16 fid; the
+port built through C with the new runtime's `fid_proc_*` linked in, as the
+rebuilt compiler will have them): on `tests/tools/doctest/sample` (an
+example that passes, a failing assertion, a panic, its own `main` and a
+`use` line, one that does not compile, a native-only one, an early return)
+with `-v`, with `--emit` (the native one built with `fid emit` and run) and
+with `--emit --native-only`, and on a folder of four stdlib modules with a
+subfolder (45 examples): identical output and exit status, in about the
+same time. Differences, none of which the sources reach: lines split at
+`\n` only, ASCII whitespace and word characters, a program a signal killed
+is `exit 128+n` (Python: `exit -n`), a `--fid` that cannot start fails
+each example instead of a traceback.
+
+**`tools/check_stdlib.fd`** (Nov 17) against `bash scripts/check-stdlib.sh`
+on a small stdlib (five modules and one that does not type-check): identical
+output and exit status; with `JOBS=3` 19 s against the script's 54 s. The
+port sorts the modules in byte order (the script's glob in the C locale).
+
+All six ports write `\n` where Python on Windows writes `\r\n`.

@@ -1,0 +1,535 @@
+// Fides trajectory generation (robotics / motion control)
+//
+// One-dimensional motion profiles; use one per joint or axis (or scale a
+// path parameter s in [0, 1]):
+//   traj_cubic          cubic polynomial with position and velocity given
+//                       at both ends over a duration T
+//   traj_quintic        quintic polynomial with position, velocity and
+//                       acceleration given at both ends
+//   traj_spline_*       cubic spline through waypoints (t_i, y_i), natural
+//                       (zero second derivative at the ends) or clamped
+//                       (end velocities given), solved with the Thomas
+//                       algorithm on the tridiagonal system of the second
+//                       derivatives
+//   traj_trapezoid      rest-to-rest trapezoidal velocity profile (a
+//                       triangle when the distance is too short to reach
+//                       vmax)
+//   traj_scurve         rest-to-rest jerk-limited (S-curve) profile of
+//                       seven segments (jerk +j, 0, -j, 0, -j, 0, +j), with
+//                       the peak velocity lowered, and the constant-
+//                       acceleration segments dropped, for short moves
+//   traj_sample_*       position / velocity / acceleration at a fixed
+//                       time step, end point included
+// Every profile evaluates `TrajState { p, v, a }` at any time; before the
+// start it holds the start, after the end the end.
+// Everything here is pure computation; the seam to hardware is the caller,
+// who sends the sampled set points to its motor controller.
+//
+// Usage:
+//   use trajectory;
+//   val prof = traj_scurve(0.0, 10.0, 2.0, 1.0, 2.0);
+//   val pts = traj_sample_scurve(&prof, 0.01);
+//   val st = traj_scurve_eval(&prof, 1.25);
+
+module trajectory;
+use math;
+
+/// Position, velocity and acceleration at a time.
+pub struct TrajState {
+    pub t: f64,
+    pub p: f64,
+    pub v: f64,
+    pub a: f64,
+}
+
+// ─── Polynomials ───
+
+/// p(t) = sum c[k] (t - t0)^k for t in [0, duration] (t measured from the
+/// start of the segment).
+pub struct TrajPoly {
+    pub c: Vec<f64>,
+    pub duration: f64,
+}
+
+/// The cubic with p(0) = p0, p'(0) = v0, p(T) = p1, p'(T) = v1.
+pub fn traj_cubic(p0: f64, v0: f64, p1: f64, v1: f64, t: f64) -> TrajPoly {
+    var c: Vec<f64> = Vec::new();
+    c.push(p0);
+    c.push(v0);
+    c.push((3.0 * (p1 - p0) - (2.0 * v0 + v1) * t) / (t * t));
+    c.push((2.0 * (p0 - p1) + (v0 + v1) * t) / (t * t * t));
+    return TrajPoly {
+        c: c, duration: t
+    };
+}
+
+/// The quintic with position, velocity and acceleration (p0, v0, a0) at
+/// t = 0 and (p1, v1, a1) at t = T.
+pub fn traj_quintic(p0: f64, v0: f64, a0: f64, p1: f64, v1: f64, a1: f64, t: f64) -> TrajPoly {
+    val t2: f64 = t * t;
+    val t3: f64 = t2 * t;
+    val t4: f64 = t3 * t;
+    val t5: f64 = t4 * t;
+    val h: f64 = p1 - p0;
+    var c: Vec<f64> = Vec::new();
+    c.push(p0);
+    c.push(v0);
+    c.push(0.5 * a0);
+    c.push((20.0 * h - (8.0 * v1 + 12.0 * v0) * t - (3.0 * a0 - a1) * t2) / (2.0 * t3));
+    c.push((0.0 - 30.0 * h + (14.0 * v1 + 16.0 * v0) * t + (3.0 * a0 - 2.0 * a1) * t2) / (2.0 * t4));
+    c.push((12.0 * h - 6.0 * (v1 + v0) * t + (a1 - a0) * t2) / (2.0 * t5));
+    return TrajPoly {
+        c: c, duration: t
+    };
+}
+
+/// The state of a polynomial at time t (clamped to [0, duration]; outside
+/// it the velocity and acceleration are those of the nearest end).
+pub fn traj_poly_eval(p: & TrajPoly, tin: f64) -> TrajState {
+    var t: f64 = tin;
+    if t < 0.0 {
+        t = 0.0;
+    }
+    if t > p.duration {
+        t = p.duration;
+    }
+    var pos: f64 = 0.0;
+    var vel: f64 = 0.0;
+    var acc: f64 = 0.0;
+    var k: i64 = p.c.len() - 1;
+    // Horner for p, p' and p''
+    while k >= 0 {
+        acc = acc * t + 2.0 * vel;
+        vel = vel * t + pos;
+        pos = pos * t + p.c.get(k);
+        k = k - 1;
+    }
+    return TrajState {
+        t: tin, p: pos, v: vel, a: acc
+    };
+}
+
+/// The jerk (third derivative) of a polynomial at time t.
+pub fn traj_poly_jerk(p: & TrajPoly, t: f64) -> f64 {
+    var j: f64 = 0.0;
+    var k: i64 = 3;
+    var tp: f64 = 1.0;
+    while k < p.c.len() {
+        val kf: f64 = k as f64;
+        j = j + kf * (kf - 1.0) * (kf - 2.0) * p.c.get(k) * tp;
+        tp = tp * t;
+        k = k + 1;
+    }
+    return j;
+}
+
+// ─── Cubic splines ───
+
+/// A cubic spline: knots t (increasing), values y, second derivatives m.
+pub struct TrajSpline {
+    pub t: Vec<f64>,
+    pub y: Vec<f64>,
+    pub m: Vec<f64>,
+}
+
+/// Solve the tridiagonal system sub[i] x[i-1] + diag[i] x[i] + sup[i]
+/// x[i+1] = rhs[i] (Thomas algorithm).
+pub fn traj_tridiag(sub: & Vec<f64>, diag: & Vec<f64>, sup: & Vec<f64>, rhs: & Vec<f64>) -> Vec<f64> {
+    val n: i64 = diag.len();
+    var c: Vec<f64> = Vec::new();
+    var d: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        if i == 0 {
+            c.push(sup.get(0) / diag.get(0));
+            d.push(rhs.get(0) / diag.get(0));
+        } else {
+            val den: f64 = diag.get(i) - sub.get(i) * c.get(i - 1);
+            c.push(sup.get(i) / den);
+            d.push((rhs.get(i) - sub.get(i) * d.get(i - 1)) / den);
+        }
+        i = i + 1;
+    }
+    var x: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        x.push(0.0);
+        i = i + 1;
+    }
+    x.set(n - 1, d.get(n - 1));
+    i = n - 2;
+    while i >= 0 {
+        x.set(i, d.get(i) - c.get(i) * x.get(i + 1));
+        i = i - 1;
+    }
+    return x;
+}
+
+/// The spline through (t[i], y[i]); natural ends unless `clamped`, in
+/// which case the end velocities are v0 and vn. Needs at least 2 knots
+/// with increasing times.
+fn traj_spline_build(t: & Vec<f64>, y: & Vec<f64>, clamped: bool, v0: f64, vn: f64) -> TrajSpline {
+    val n: i64 = t.len();
+    var sub: Vec<f64> = Vec::new();
+    var diag: Vec<f64> = Vec::new();
+    var sup: Vec<f64> = Vec::new();
+    var rhs: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        if i == 0 {
+            sub.push(0.0);
+            if clamped {
+                val h: f64 = t.get(1) - t.get(0);
+                diag.push(2.0 * h);
+                sup.push(h);
+                rhs.push(6.0 * ((y.get(1) - y.get(0)) / h - v0));
+            } else {
+                diag.push(1.0);
+                sup.push(0.0);
+                rhs.push(0.0);
+            }
+        } else if i == n - 1 {
+            sup.push(0.0);
+            if clamped {
+                val h: f64 = t.get(n - 1) - t.get(n - 2);
+                sub.push(h);
+                diag.push(2.0 * h);
+                rhs.push(6.0 * (vn - (y.get(n - 1) - y.get(n - 2)) / h));
+            } else {
+                sub.push(0.0);
+                diag.push(1.0);
+                rhs.push(0.0);
+            }
+        } else {
+            val h0: f64 = t.get(i) - t.get(i - 1);
+            val h1: f64 = t.get(i + 1) - t.get(i);
+            sub.push(h0);
+            diag.push(2.0 * (h0 + h1));
+            sup.push(h1);
+            rhs.push(6.0 * ((y.get(i + 1) - y.get(i)) / h1 - (y.get(i) - y.get(i - 1)) / h0));
+        }
+        i = i + 1;
+    }
+    val m: Vec<f64> = traj_tridiag(&sub, &diag, &sup, &rhs);
+    var tc: Vec<f64> = Vec::new();
+    var yc: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        tc.push(t.get(i));
+        yc.push(y.get(i));
+        i = i + 1;
+    }
+    return TrajSpline {
+        t: tc, y: yc, m: m
+    };
+}
+
+/// The natural cubic spline through (t[i], y[i]).
+pub fn traj_spline_natural(t: & Vec<f64>, y: & Vec<f64>) -> TrajSpline {
+    return traj_spline_build(t, y, false, 0.0, 0.0);
+}
+
+/// The cubic spline through (t[i], y[i]) with velocity v0 at the first
+/// knot and vn at the last.
+pub fn traj_spline_clamped(t: & Vec<f64>, y: & Vec<f64>, v0: f64, vn: f64) -> TrajSpline {
+    return traj_spline_build(t, y, true, v0, vn);
+}
+
+/// The spline's state at time t (clamped to the knot range).
+pub fn traj_spline_eval(s: & TrajSpline, tin: f64) -> TrajState {
+    val n: i64 = s.t.len();
+    var t: f64 = tin;
+    if t < s.t.get(0) {
+        t = s.t.get(0);
+    }
+    if t > s.t.get(n - 1) {
+        t = s.t.get(n - 1);
+    }
+    // the interval [t_k, t_k+1] holding t (binary search)
+    var lo: i64 = 0;
+    var hi: i64 = n - 1;
+    while hi - lo > 1 {
+        val mid: i64 = (lo + hi) / 2;
+        if s.t.get(mid) <= t {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    val h: f64 = s.t.get(hi) - s.t.get(lo);
+    val a: f64 = (s.t.get(hi) - t) / h;
+    val b: f64 = (t - s.t.get(lo)) / h;
+    val m0: f64 = s.m.get(lo);
+    val m1: f64 = s.m.get(hi);
+    val y0: f64 = s.y.get(lo);
+    val y1: f64 = s.y.get(hi);
+    val p: f64 = a * y0 + b * y1 + ((a * a * a - a) * m0 + (b * b * b - b) * m1) * h * h / 6.0;
+    val v: f64 = (y1 - y0) / h - (3.0 * a * a - 1.0) * h * m0 / 6.0 + (3.0 * b * b - 1.0) * h * m1 / 6.0;
+    val acc: f64 = a * m0 + b * m1;
+    return TrajState {
+        t: tin, p: p, v: v, a: acc
+    };
+}
+
+// ─── Trapezoidal profile ───
+
+/// A rest-to-rest move of `dist` (signed) from p0 with peak speed vpeak:
+/// accelerate for ta, cruise for tv, decelerate for ta.
+pub struct TrajTrapezoid {
+    pub p0: f64,
+    pub dist: f64,
+    pub vpeak: f64,
+    pub amax: f64,
+    pub ta: f64,
+    pub tv: f64,
+    pub total: f64,
+}
+
+/// The fastest move from p0 to p1 with |v| <= vmax and |a| <= amax.
+pub fn traj_trapezoid(p0: f64, p1: f64, vmax: f64, amax: f64) -> TrajTrapezoid {
+    val d: f64 = math_fabs(p1 - p0);
+    var vp: f64 = vmax;
+    var ta: f64 = vmax / amax;
+    var tv: f64 = 0.0;
+    if vmax * vmax / amax > d {
+        // triangle: vmax is never reached
+        vp = math_sqrt(d * amax);
+        ta = vp / amax;
+    } else {
+        tv = (d - vmax * vmax / amax) / vmax;
+    }
+    return TrajTrapezoid {
+        p0: p0, dist: p1 - p0, vpeak: vp, amax: amax, ta: ta, tv: tv, total: 2.0 * ta + tv
+    };
+}
+
+/// The state of a trapezoidal move at time t.
+pub fn traj_trapezoid_eval(tr: & TrajTrapezoid, t: f64) -> TrajState {
+    var sign: f64 = 1.0;
+    if tr.dist < 0.0 {
+        sign = - 1.0;
+    }
+    val d: f64 = math_fabs(tr.dist);
+    var p: f64 = 0.0;
+    var v: f64 = 0.0;
+    var a: f64 = 0.0;
+    if t <= 0.0 {
+        p = 0.0;
+    } else if t < tr.ta {
+        a = tr.amax;
+        v = tr.amax * t;
+        p = 0.5 * tr.amax * t * t;
+    } else if t < tr.ta + tr.tv {
+        v = tr.vpeak;
+        p = 0.5 * tr.vpeak * tr.ta + tr.vpeak * (t - tr.ta);
+    } else if t < tr.total {
+        val r: f64 = tr.total - t;
+        a = 0.0 - tr.amax;
+        v = tr.amax * r;
+        p = d - 0.5 * tr.amax * r * r;
+    } else {
+        p = d;
+    }
+    return TrajState {
+        t: t, p: tr.p0 + sign * p, v: sign * v, a: sign * a
+    };
+}
+
+// ─── S-curve (jerk-limited) profile ───
+
+/// A rest-to-rest jerk-limited move: seven segments of constant jerk.
+pub struct TrajSCurve {
+    pub p0: f64,
+    pub dist: f64,
+    pub jmax: f64,
+    // jerk-up time, acceleration phase time, cruise time
+    pub tj: f64,
+    pub ta: f64,
+    pub tv: f64,
+    pub vpeak: f64,
+    pub apeak: f64,
+    pub total: f64,
+    // segment durations and jerks
+    pub durs: Vec<f64>,
+    pub jerks: Vec<f64>,
+}
+
+/// The acceleration phase from rest to speed v: (tj, ta) with jerk jmax and
+/// |a| <= amax.
+fn traj_sc_accel(v: f64, amax: f64, jmax: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    if v * jmax >= amax * amax {
+        out.push(amax / jmax);
+        out.push(v / amax + amax / jmax);
+    } else {
+        val tj: f64 = math_sqrt(v / jmax);
+        out.push(tj);
+        out.push(2.0 * tj);
+    }
+    return out;
+}
+
+/// The fastest move from p0 to p1 with |v| <= vmax, |a| <= amax and
+/// |jerk| <= jmax, starting and ending at rest.
+pub fn traj_scurve(p0: f64, p1: f64, vmax: f64, amax: f64, jmax: f64) -> TrajSCurve {
+    val d: f64 = math_fabs(p1 - p0);
+    var v: f64 = vmax;
+    var acc: Vec<f64> = traj_sc_accel(v, amax, jmax);
+    var tv: f64 = 0.0;
+    if v * acc.get(1) <= d {
+        tv = (d - v * acc.get(1)) / v;
+    } else {
+        // vmax is not reached: the peak speed v with v * ta(v) = d
+        val r: f64 = amax / jmax;
+        v = amax * (0.0 - r + math_sqrt(r * r + 4.0 * d / amax)) / 2.0;
+        if v * jmax < amax * amax {
+            // no constant-acceleration segment: d = 2 v^1.5 / sqrt(jmax)
+            v = math_pow(d * math_sqrt(jmax) / 2.0, 2.0 / 3.0);
+        }
+        acc = traj_sc_accel(v, amax, jmax);
+    }
+    val tj: f64 = acc.get(0);
+    val ta: f64 = acc.get(1);
+    var tc: f64 = ta - 2.0 * tj;
+    if tc < 0.0 {
+        tc = 0.0;
+    }
+    var durs: Vec<f64> = Vec::new();
+    var jerks: Vec<f64> = Vec::new();
+    durs.push(tj);
+    jerks.push(jmax);
+    durs.push(tc);
+    jerks.push(0.0);
+    durs.push(tj);
+    jerks.push(0.0 - jmax);
+    durs.push(tv);
+    jerks.push(0.0);
+    durs.push(tj);
+    jerks.push(0.0 - jmax);
+    durs.push(tc);
+    jerks.push(0.0);
+    durs.push(tj);
+    jerks.push(jmax);
+    if d == 0.0 {
+        var i: i64 = 0;
+        while i < 7 {
+            durs.set(i, 0.0);
+            i = i + 1;
+        }
+        v = 0.0;
+    }
+    var total: f64 = 0.0;
+    var i: i64 = 0;
+    while i < 7 {
+        total = total + durs.get(i);
+        i = i + 1;
+    }
+    return TrajSCurve {
+        p0: p0, dist: p1 - p0, jmax: jmax, tj: tj, ta: ta, tv: tv, vpeak: v, apeak: jmax * tj, total: total, durs: durs, jerks: jerks
+    };
+}
+
+/// The state of an S-curve move at time t (the segments integrated in
+/// closed form).
+pub fn traj_scurve_eval(s: & TrajSCurve, tin: f64) -> TrajState {
+    var sign: f64 = 1.0;
+    if s.dist < 0.0 {
+        sign = - 1.0;
+    }
+    var t: f64 = tin;
+    if t > s.total {
+        t = s.total;
+    }
+    var p: f64 = 0.0;
+    var v: f64 = 0.0;
+    var a: f64 = 0.0;
+    var i: i64 = 0;
+    while i < 7 && t > 0.0 {
+        var dt: f64 = s.durs.get(i);
+        if dt > t {
+            dt = t;
+        }
+        val j: f64 = s.jerks.get(i);
+        p = p + v * dt + a * dt * dt / 2.0 + j * dt * dt * dt / 6.0;
+        v = v + a * dt + j * dt * dt / 2.0;
+        a = a + j * dt;
+        t = t - dt;
+        i = i + 1;
+    }
+    if tin >= s.total {
+        // land exactly on the target (no rounding left over)
+        p = math_fabs(s.dist);
+        v = 0.0;
+        a = 0.0;
+    }
+    return TrajState {
+        t: tin, p: s.p0 + sign * p, v: sign * v, a: sign * a
+    };
+}
+
+// ─── Sampling ───
+
+/// The times 0, dt, 2 dt, ... and the end time `total`.
+pub fn traj_times(total: f64, dt: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    loop {
+        val t: f64 = (k as f64) * dt;
+        if t >= total - dt * 0.000001 {
+            break;
+        }
+        out.push(t);
+        k = k + 1;
+    }
+    out.push(total);
+    return out;
+}
+
+/// A polynomial sampled every dt seconds.
+pub fn traj_sample_poly(p: & TrajPoly, dt: f64) -> Vec<TrajState> {
+    val ts: Vec<f64> = traj_times(p.duration, dt);
+    var out: Vec<TrajState> = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        out.push(traj_poly_eval(p, ts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A spline sampled every dt seconds from its first knot to its last.
+pub fn traj_sample_spline(s: & TrajSpline, dt: f64) -> Vec<TrajState> {
+    val t0: f64 = s.t.get(0);
+    val ts: Vec<f64> = traj_times(s.t.get(s.t.len() - 1) - t0, dt);
+    var out: Vec<TrajState> = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        out.push(traj_spline_eval(s, t0 + ts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A trapezoidal move sampled every dt seconds.
+pub fn traj_sample_trapezoid(tr: & TrajTrapezoid, dt: f64) -> Vec<TrajState> {
+    val ts: Vec<f64> = traj_times(tr.total, dt);
+    var out: Vec<TrajState> = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        out.push(traj_trapezoid_eval(tr, ts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// An S-curve move sampled every dt seconds.
+pub fn traj_sample_scurve(s: & TrajSCurve, dt: f64) -> Vec<TrajState> {
+    val ts: Vec<f64> = traj_times(s.total, dt);
+    var out: Vec<TrajState> = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        out.push(traj_scurve_eval(s, ts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}

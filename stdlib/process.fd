@@ -82,3 +82,750 @@ pub fn process_capture(cmd: str) -> Vec<str> {
     process_close(h);
     return out;
 }
+
+// ─── Command builder (roadmap L4H) ──────────────────────────────────────
+// Build a child process step by step: program, arguments, environment
+// variables set or removed, working directory, data for its standard
+// input, stderr merged into stdout, and further programs its stdout is
+// piped into. The command runs through the platform shell (sh / cmd), so
+// every argument is quoted for it: spaces, quotes and shell characters
+// (& | < > ; $ ...) reach the program as written.
+//
+//   var c = Command::new("sort");
+//   c.env("LC_ALL", "C");
+//   c.cwd("/data");
+//   c.stdin("pear\napple\n");
+//   var g = Command::new("grep");
+//   g.arg("p");
+//   c.pipe(& g);
+//   val h = c.output();        // a process result: process_stdout(h) ...
+//   process_close(h);
+//
+// Environment and directory apply to the whole pipeline. Limits of
+// output() / status(): on Windows, `%NAME%` in an argument is still
+// expanded by cmd, and a variable's value cannot hold a double quote; they
+// wait for the child to finish. spawn() has neither limit: it starts the
+// program without a shell and returns a Child at once, with pipes to the
+// streams asked for (pipe_stdin / pipe_stdout / pipe_stderr).
+
+/// A child process to run. Build with Command::new and the methods below.
+pub struct Command {
+    pub program: str,
+    pub args: Vec<str>,
+    pub env_keys: Vec<str>,
+    pub env_vals: Vec<str>,
+    pub env_unset: Vec<str>,
+    pub dir: str,
+    pub stdin_data: str,
+    pub has_stdin: bool,
+    pub merge_stderr: bool,
+    pub stages: Vec<str>,     // programs piped after this one, rendered
+    pub io: i64,              // spawn(): the PROC_PIPE_* streams asked for
+}
+
+var proc_cmd_ctr: i64 = 0;
+
+/// True on Windows (cmd.exe quoting); sh quoting otherwise.
+pub fn process_is_windows() -> bool {
+    match env_var("OS") {
+        Option::Some(s) => {
+            return str_contains(str_to_lower(s), "windows");
+        }
+        Option::None => {
+        }
+    }
+    return false;
+}
+
+fn proc_safe_char(c: i64) -> bool {
+    if c >= 48 && c <= 57 { return true; }
+    if c >= 65 && c <= 90 { return true; }
+    if c >= 97 && c <= 122 { return true; }
+    // _ - . / : , + @ =
+    return c == 95 || c == 45 || c == 46 || c == 47 || c == 58 || c == 44 || c == 43 || c == 64 || c == 61;
+}
+
+fn proc_needs_quote(s: str) -> bool {
+    if str_len(s) == 0 { return true; }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if !proc_safe_char(str_byte_at(s, i)) {
+            // a backslash is a plain path character for cmd
+            if !(str_byte_at(s, i) == 92 && process_is_windows()) { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `s` quoted as one word for the platform shell (unchanged when it
+/// needs no quotes). sh: single quotes; cmd: double quotes, a quote
+/// inside doubled, trailing backslashes doubled before the closing quote.
+///
+/// Example:
+///   assert_eq(process_quote("plain"), "plain");
+///   if process_is_windows() {
+///       assert_eq(process_quote("a b"), "\"a b\"");
+///   } else {
+///       assert_eq(process_quote("a b"), "'a b'");
+///   }
+///   assert(process_pid() > 0);
+pub fn process_quote(s: str) -> str {
+    if !proc_needs_quote(s) { return s; }
+    if !process_is_windows() {
+        return "'" + str_replace(s, "'", "'\\''") + "'";
+    }
+    var body: str = str_replace(s, "\"", "\"\"");
+    var tail: i64 = 0;
+    var k: i64 = str_len(body) - 1;
+    while k >= 0 && str_byte_at(body, k) == 92 {
+        tail = tail + 1;
+        k = k - 1;
+    }
+    if tail > 0 { body = body + str_repeat("\\", tail); }
+    return "\"" + body + "\"";
+}
+
+fn proc_temp_dir() -> str {
+    match env_var("TEMP") {
+        Option::Some(s) => { if str_len(s) > 0 { return s; } }
+        Option::None => { }
+    }
+    match env_var("TMP") {
+        Option::Some(s) => { if str_len(s) > 0 { return s; } }
+        Option::None => { }
+    }
+    match env_var("TMPDIR") {
+        Option::Some(s) => { if str_len(s) > 0 { return s; } }
+        Option::None => { }
+    }
+    return "/tmp";
+}
+
+impl Command {
+    /// A command that runs `program` (looked up on PATH like the shell does).
+    pub fn new(program: str) -> Command {
+        return Command {
+            program: program, args: Vec::new(), env_keys: Vec::new(), env_vals: Vec::new(),
+            env_unset: Vec::new(), dir: "", stdin_data: "", has_stdin: false,
+            merge_stderr: false, stages: Vec::new(), io: 0
+        };
+    }
+
+    /// Add one argument (passed as one word, whatever it contains).
+    pub fn arg(self: & mut Command, a: str) -> void {
+        self.args.push(a);
+    }
+
+    /// Add several arguments.
+    pub fn args_all(self: & mut Command, list: Vec<str>) -> void {
+        var i: i64 = 0;
+        while i < list.len() {
+            self.args.push(list.get(i));
+            i = i + 1;
+        }
+    }
+
+    /// Set environment variable `key` to `value` for the child.
+    pub fn env(self: & mut Command, key: str, value: str) -> void {
+        self.env_keys.push(key);
+        self.env_vals.push(value);
+    }
+
+    /// Remove environment variable `key` for the child.
+    pub fn env_remove(self: & mut Command, key: str) -> void {
+        self.env_unset.push(key);
+    }
+
+    /// Run the child in directory `path`. If it cannot change there, the
+    /// program does not run and the exit code is non-zero.
+    pub fn cwd(self: & mut Command, path: str) -> void {
+        self.dir = path;
+    }
+
+    /// Give the child `data` as its standard input (otherwise it gets the
+    /// parent's).
+    pub fn stdin(self: & mut Command, data: str) -> void {
+        self.stdin_data = data;
+        self.has_stdin = true;
+    }
+
+    /// Send the child's standard error to its standard output.
+    pub fn stderr_to_stdout(self: & mut Command) -> void {
+        self.merge_stderr = true;
+    }
+
+    /// Pipe this command's standard output into `next` (its program and
+    /// arguments; its environment and directory are not used). Piping
+    /// again adds a further stage.
+    pub fn pipe(self: & mut Command, next: & Command) -> void {
+        var st: str = next.render_stage();
+        if self.merge_stderr { st = st + " 2>&1"; }
+        self.stages.push(st);
+        var i: i64 = 0;
+        while i < next.stages.len() {
+            self.stages.push(next.stages.get(i));
+            i = i + 1;
+        }
+    }
+
+    // program and arguments, quoted
+    fn render_stage(self: & Command) -> str {
+        var s: str = process_quote(self.program);
+        var i: i64 = 0;
+        while i < self.args.len() {
+            s = s + " " + process_quote(self.args.get(i));
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// The shell command line this runs, with `stdin_path` as the file
+    /// its input is read from ("" for none).
+    pub fn command_line(self: & Command, stdin_path: str) -> str {
+        val win: bool = process_is_windows();
+        var pre: str = "";
+        var i: i64 = 0;
+        while i < self.env_unset.len() {
+            if win {
+                pre = pre + "set \"" + self.env_unset.get(i) + "=\" & ";
+            } else {
+                pre = pre + "unset " + self.env_unset.get(i) + "; ";
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < self.env_keys.len() {
+            if win {
+                pre = pre + "set \"" + self.env_keys.get(i) + "=" + self.env_vals.get(i) + "\" & ";
+            } else {
+                pre = pre + self.env_keys.get(i) + "=" + process_quote(self.env_vals.get(i))
+                    + "; export " + self.env_keys.get(i) + "; ";
+            }
+            i = i + 1;
+        }
+        var line: str = self.render_stage();
+        if str_len(stdin_path) > 0 { line = line + " < " + process_quote(stdin_path); }
+        if self.merge_stderr { line = line + " 2>&1"; }
+        i = 0;
+        while i < self.stages.len() {
+            line = line + " | " + self.stages.get(i);
+            i = i + 1;
+        }
+        if str_len(self.dir) > 0 {
+            if win {
+                line = "cd /d " + process_quote(self.dir) + " && " + line;
+            } else {
+                line = "cd " + process_quote(self.dir) + " && " + line;
+            }
+        }
+        return pre + line;
+    }
+
+    /// Run the command to completion; returns a process result handle
+    /// (process_stdout / process_stderr / process_code / process_close),
+    /// or 0 when it could not start.
+    pub fn output(self: & Command) -> i64 {
+        var path: str = "";
+        if self.has_stdin {
+            proc_cmd_ctr = proc_cmd_ctr + 1;
+            var dir: str = proc_temp_dir();
+            var sep: str = "/";
+            if str_ends_with(dir, "/") || str_ends_with(dir, "\\") { sep = ""; }
+            path = dir + sep + ".fides_cmd_" + int_to_str(p_getpid()) + "_"
+                + int_to_str(p_clock_now_us()) + "_" + int_to_str(proc_cmd_ctr) + ".in";
+            if p_file_write(path, self.stdin_data) != 0 { return 0; }
+        }
+        val h: i64 = p_process_run(self.command_line(path));
+        if str_len(path) > 0 { p_file_delete(path); }
+        return h;
+    }
+
+    /// Run the command to completion and return its exit code (-1 when it
+    /// could not start). Output is captured and dropped.
+    pub fn status(self: & Command) -> i64 {
+        val h: i64 = self.output();
+        if h == 0 { return -1; }
+        val code: i64 = p_process_code(h);
+        p_process_close(h);
+        return code;
+    }
+
+    /// spawn(): give the child a pipe as its standard input
+    /// (Child::write, Child::close_stdin).
+    pub fn pipe_stdin(self: & mut Command) -> void {
+        self.io = self.io | PROC_PIPE_STDIN;
+    }
+
+    /// spawn(): give the child a pipe as its standard output
+    /// (Child::read_stdout, Child::read_all_stdout).
+    pub fn pipe_stdout(self: & mut Command) -> void {
+        self.io = self.io | PROC_PIPE_STDOUT;
+    }
+
+    /// spawn(): give the child a pipe as its standard error
+    /// (Child::read_stderr, Child::read_all_stderr).
+    pub fn pipe_stderr(self: & mut Command) -> void {
+        self.io = self.io | PROC_PIPE_STDERR;
+    }
+
+    /// Start the program directly, without a shell, and return at once
+    /// (roadmap L4H): each argument reaches it as one word whatever it
+    /// holds (no cmd.exe or sh quoting, no `%NAME%` expansion), the
+    /// environment changes and the directory apply, and the streams asked
+    /// for with pipe_stdin / pipe_stdout / pipe_stderr are pipes to this
+    /// process; the others are ours (stderr_to_stdout: stderr goes where
+    /// stdout goes). Data given with stdin(data) is written to the child
+    /// at once, then its input is closed unless pipe_stdin was asked for.
+    /// None when the program could not start (on POSIX one that is not
+    /// found starts and exits with 127) or the command has pipe() stages
+    /// (a pipeline runs through the shell: output()).
+    ///
+    /// Example:
+    ///   var c: Command = Command::new("sort");
+    ///   c.stdin("pear\napple\n");
+    ///   c.pipe_stdout();
+    ///   match c.spawn() {
+    ///       Option::Some(ch) => {
+    ///           var child: Child = ch;
+    ///           val text: str = child.read_all_stdout();   // "apple\npear\n"
+    ///           val code: i64 = child.wait();              // 0
+    ///           child.release();
+    ///       }
+    ///       Option::None => { }
+    ///   }
+    pub fn spawn(self: & Command) -> Option<Child> {
+        if self.stages.len() > 0 { return Option::None; }
+        var argv: Vec<str> = Vec::new();
+        argv.push(self.program);
+        var i: i64 = 0;
+        while i < self.args.len() {
+            argv.push(self.args.get(i));
+            i = i + 1;
+        }
+        var env: Vec<str> = Vec::new();
+        i = 0;
+        while i < self.env_unset.len() {
+            env.push(self.env_unset.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < self.env_keys.len() {
+            env.push(self.env_keys.get(i) + "=" + self.env_vals.get(i));
+            i = i + 1;
+        }
+        var io: i64 = self.io;
+        if self.has_stdin { io = io | PROC_PIPE_STDIN; }
+        if self.merge_stderr { io = io | PROC_STDERR_TO_STDOUT; }
+        val h: i64 = process_spawn_io(argv, env, self.dir, io);
+        if h == 0 { return Option::None; }
+        // (a function below: Child is declared after this impl)
+        var child: Child = proc_child(h, (io & PROC_PIPE_STDIN) != 0);
+        if self.has_stdin {
+            child.write(self.stdin_data);
+            if (self.io & PROC_PIPE_STDIN) == 0 { child.close_stdin(); }
+        }
+        return Option::Some(child);
+    }
+}
+
+// ─── Child processes with a time limit (roadmap AD4) ────────────────────
+// process_spawn starts a program directly, without a shell (each element of
+// argv reaches it as one argument, whatever it holds), and returns at once
+// with a handle. process_wait waits for it up to a time limit,
+// process_kill stops it, process_release forgets the handle; many children
+// can run at once. A handle is 0 when the program could not start (on
+// POSIX a program that is not found starts and exits with 127).
+//
+//   val h = process_spawn_to(argv, env, "", "/tmp/t.out");
+//   match process_wait(h, 60000) {
+//       Option::Some(code) => { ... }                   // it ended
+//       Option::None => { process_kill(h); process_wait(h, -1); }
+//   }
+//   process_release(h);
+//
+// env: "KEY=VALUE" items set KEY for the child on top of this process's
+// environment, a bare "KEY" removes it. dir: the child's working directory
+// ("" keeps ours). Each runtime implements fid_proc_*: the C runtime
+// (compiler/codegen_c.fd), native Windows (pe_runtime/base.fd), the machine
+// layer's Linux, macOS and --nat Windows (linux_runtime/sys.fd, win.fd),
+// and the interpreter (compiler/interp.fd, through the shell; limits there:
+// see Interpreter_proc_spawn). Items cannot hold byte 31 (it separates
+// them on the way to the runtime) or NUL. Spawn, wait and release from one
+// thread.
+
+// SAFETY: the runtimes' own functions, with the prototypes above in every
+// runtime (word arguments and results); a list or path goes as the address
+// of a str that lives until the call returns, and the runtime copies what
+// it keeps.
+extern "C" {
+    fn fid_proc_spawn(argv: i64, env: i64, dir: i64, out: i64) -> i64;
+    fn fid_proc_wait(h: i64, timeout_ms: i64) -> i64;
+    fn fid_proc_code(h: i64) -> i64;
+    fn fid_proc_kill(h: i64) -> i64;
+    fn fid_proc_pid(h: i64) -> i64;
+    fn fid_proc_free(h: i64) -> i64;
+    // roadmap L4H (Command::spawn): a child with pipes; io bits 1 / 2 / 4:
+    // its stdin / stdout / stderr is a pipe to this process, 8: its stderr
+    // goes where its stdout goes. write: all n bytes at data, n or -1;
+    // read: up to max bytes into buf (which 1 stdout, 2 stderr), 0 at the
+    // end, -1 without that pipe; close_in: the child reads end of input.
+    fn fid_proc_spawn_io(argv: i64, env: i64, dir: i64, out: i64, io: i64) -> i64;
+    fn fid_proc_write(h: i64, data: i64, n: i64) -> i64;
+    fn fid_proc_read(h: i64, which: i64, buf: i64, max: i64) -> i64;
+    fn fid_proc_close_in(h: i64) -> i64;
+}
+
+/// The items of `list` joined by byte 31, as fid_proc_spawn takes a list;
+/// None when an item holds that byte.
+fn proc_join_list(list: Vec<str>) -> Option<str> {
+    val sep: str = char_to_str(31);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < list.len() {
+        val item: str = list.get(i);
+        if str_contains(item, sep) { return Option::None; }
+        if i > 0 { s = s + sep; }
+        s = s + item;
+        i = i + 1;
+    }
+    return Option::Some(s);
+}
+
+/// Start `argv` (program, then its arguments; the program is looked up on
+/// PATH) with `env` added to the environment, in directory `dir` ("" for
+/// ours), its stdout and stderr going where ours go. Returns at once: a
+/// handle for process_wait / process_kill / process_release, 0 when it
+/// could not start.
+pub fn process_spawn(argv: Vec<str>, env: Vec<str>, dir: str) -> i64 {
+    return process_spawn_to(argv, env, dir, "");
+}
+
+/// process_spawn with the child's stdout and stderr both written to the
+/// file `out_path` (created or emptied; "" for ours).
+pub fn process_spawn_to(argv: Vec<str>, env: Vec<str>, dir: str, out_path: str) -> i64 {
+    return process_spawn_files(argv, env, dir, out_path, "");
+}
+
+/// process_spawn with the child's stdout written to the file `out_path`
+/// and its stderr to `err_path` (each created or emptied; err_path "":
+/// with stdout; out_path "": ours).
+pub fn process_spawn_files(argv: Vec<str>, env: Vec<str>, dir: str, out_path: str, err_path: str) -> i64 {
+    if argv.len() == 0 { return 0; }
+    if str_len(argv.get(0)) == 0 { return 0; }
+    var a: str = "";
+    match proc_join_list(argv) {
+        Option::Some(s) => { a = s; }
+        Option::None => { return 0; }
+    }
+    var e: str = "";
+    match proc_join_list(env) {
+        Option::Some(s) => { e = s; }
+        Option::None => { return 0; }
+    }
+    // the files are a list too: stdout's, then stderr's when it has one
+    var files: Vec<str> = Vec::new();
+    files.push(out_path);
+    if str_len(err_path) > 0 { files.push(err_path); }
+    var f: str = "";
+    match proc_join_list(files) {
+        Option::Some(s) => { f = s; }
+        Option::None => { return 0; }
+    }
+    return fid_proc_spawn(a as i64, e as i64, dir as i64, f as i64);
+}
+
+/// Wait for child `h` at most `timeout_ms` milliseconds (negative: as long
+/// as it takes; 0: only look). Some(exit code) once it has ended (a child
+/// killed by signal n: 128 + n; one process_kill stopped on Windows: 137),
+/// None while it is still running (or for handle 0). Asking again after it
+/// ended gives the same code.
+pub fn process_wait(h: i64, timeout_ms: i64) -> Option<i64> {
+    if h == 0 { return Option::None; }
+    if fid_proc_wait(h, timeout_ms) == 1 {
+        return Option::Some(fid_proc_code(h));
+    }
+    return Option::None;
+}
+
+/// Stop child `h` (SIGKILL; TerminateProcess on Windows). True when it was
+/// running and was told to stop; process_wait then gives its code.
+pub fn process_kill(h: i64) -> bool {
+    if h == 0 { return false; }
+    return fid_proc_kill(h) == 1;
+}
+
+/// The operating system's process id of child `h` (-1 for a bad handle).
+pub fn process_child_pid(h: i64) -> i64 {
+    if h == 0 { return -1; }
+    return fid_proc_pid(h);
+}
+
+/// Forget child `h` (wait for it first: one still running keeps running).
+pub fn process_release(h: i64) -> void {
+    if h != 0 { fid_proc_free(h); }
+}
+
+/// What process_run_argv found: the exit code (-1 when the program did not
+/// start or did not end), whether it was stopped at the time limit, its
+/// stdout (output) and its stderr (errors).
+pub struct ChildResult {
+    pub started: bool,
+    pub timed_out: bool,
+    pub code: i64,
+    pub output: str,
+    pub errors: str,
+}
+
+/// The text of file `path` ("" when there is none), then the file removed.
+fn proc_take_file(path: str) -> str {
+    var text: str = "";
+    match read_file(path) {
+        Option::Some(t) => { text = t; }
+        Option::None => { }
+    }
+    p_file_delete(path);
+    return text;
+}
+
+/// Run `argv` (no shell) with `env` added, in `dir`, for at most
+/// `timeout_ms` milliseconds (negative: no limit); one still running then
+/// is killed. Its stdout and stderr are captured through two files in the
+/// temp directory.
+///
+/// Example:
+///   var argv: Vec<str> = Vec::new();
+///   if process_is_windows() {
+///       argv.push("cmd");
+///       argv.push("/c");
+///       argv.push("echo hi& echo oops 1>&2& exit 3");
+///   } else {
+///       argv.push("sh");
+///       argv.push("-c");
+///       argv.push("echo hi; echo oops >&2; exit 3");
+///   }
+///   val r: ChildResult = process_run_argv(argv, Vec::new(), "", 30000);
+///   assert(r.started);
+///   assert(!r.timed_out);
+///   assert_eq(r.code, 3);
+///   assert_eq(str_trim(r.output), "hi");
+///   assert_eq(str_trim(r.errors), "oops");
+pub fn process_run_argv(argv: Vec<str>, env: Vec<str>, dir: str, timeout_ms: i64) -> ChildResult {
+    proc_cmd_ctr = proc_cmd_ctr + 1;
+    val tmp: str = proc_temp_dir();
+    var sep: str = "/";
+    if str_ends_with(tmp, "/") || str_ends_with(tmp, "\\") { sep = ""; }
+    val base: str = tmp + sep + ".fides_child_" + int_to_str(p_getpid()) + "_"
+        + int_to_str(p_clock_now_us()) + "_" + int_to_str(proc_cmd_ctr);
+    val path: str = base + ".out";
+    val epath: str = base + ".err";
+    val h: i64 = process_spawn_files(argv, env, dir, path, epath);
+    if h == 0 {
+        p_file_delete(path);
+        p_file_delete(epath);
+        return ChildResult { started: false, timed_out: false, code: -1, output: "", errors: "" };
+    }
+    var timed_out: bool = false;
+    var code: i64 = -1;
+    match process_wait(h, timeout_ms) {
+        Option::Some(c) => { code = c; }
+        Option::None => {
+            timed_out = true;
+            process_kill(h);
+            match process_wait(h, 10000) {
+                Option::Some(c2) => { code = c2; }
+                Option::None => { }
+            }
+        }
+    }
+    process_release(h);
+    val text: str = proc_take_file(path);
+    val etext: str = proc_take_file(epath);
+    return ChildResult { started: true, timed_out: timed_out, code: code, output: text, errors: etext };
+}
+
+// ─── Children with pipes (roadmap L4H: Command::spawn) ──────────────────
+// process_spawn_io starts a program as process_spawn does (no shell) with
+// pipes to the streams `io` names; process_write feeds its stdin,
+// process_close_stdin ends that input, process_read takes what it wrote
+// next. Command::spawn returns the same as a Child. Every runtime has the
+// pipes (the C runtime, native Windows, the machine layer's Linux and
+// macOS) except --nat Windows (a request for a pipe fails there) and the
+// interpreter, which starts the child only when it is first read from or
+// waited for, with what was written before as its input, and hands its
+// output over once it has ended (see compiler/interp.fd "Pipes").
+//
+// Reading one pipe to its end while the child fills the other can stop
+// both: read stdout and stderr in turn, or use stderr_to_stdout.
+
+/// process_spawn_io: the child's standard input is a pipe (process_write).
+pub const PROC_PIPE_STDIN: i64 = 1;
+/// The child's standard output is a pipe (process_read(h, PROC_STDOUT)).
+pub const PROC_PIPE_STDOUT: i64 = 2;
+/// The child's standard error is a pipe (process_read(h, PROC_STDERR)).
+pub const PROC_PIPE_STDERR: i64 = 4;
+/// The child's standard error goes where its standard output goes.
+pub const PROC_STDERR_TO_STDOUT: i64 = 8;
+/// process_read: which stream.
+pub const PROC_STDOUT: i64 = 1;
+pub const PROC_STDERR: i64 = 2;
+
+/// The most one process_read gives.
+const PROC_READ_CHUNK: i64 = 65536;
+
+/// Start `argv` (no shell; the program looked up on PATH) with `env`
+/// added and in `dir` as process_spawn does, with pipes to the streams
+/// `io` names (PROC_PIPE_STDIN | PROC_PIPE_STDOUT | PROC_PIPE_STDERR, and
+/// PROC_STDERR_TO_STDOUT); the others are ours. Returns at once: a handle
+/// (0 when it could not start) for process_write / process_read /
+/// process_close_stdin and process_wait / process_kill / process_release
+/// (which closes the pipes still open).
+pub fn process_spawn_io(argv: Vec<str>, env: Vec<str>, dir: str, io: i64) -> i64 {
+    if argv.len() == 0 { return 0; }
+    if str_len(argv.get(0)) == 0 { return 0; }
+    var a: str = "";
+    match proc_join_list(argv) {
+        Option::Some(s) => { a = s; }
+        Option::None => { return 0; }
+    }
+    var e: str = "";
+    match proc_join_list(env) {
+        Option::Some(s) => { e = s; }
+        Option::None => { return 0; }
+    }
+    val none: str = "";
+    return fid_proc_spawn_io(a as i64, e as i64, dir as i64, none as i64, io & 15);
+}
+
+/// Write all of `data` to child `h`'s standard input pipe: false when it
+/// has none, it was closed, or the child has closed its end.
+pub fn process_write(h: i64, data: str) -> bool {
+    if h == 0 { return false; }
+    val n: i64 = str_len(data);
+    if n == 0 { return true; }
+    return fid_proc_write(h, data as i64, n) == n;
+}
+
+/// Close child `h`'s standard input pipe: it reads the end of its input.
+pub fn process_close_stdin(h: i64) -> void {
+    if h != 0 { fid_proc_close_in(h); }
+}
+
+/// What child `h` wrote next to its stdout (which PROC_STDOUT) or stderr
+/// (PROC_STDERR) pipe: at most 64 KB, waiting for at least one byte. None
+/// once the pipe is empty and closed (the child ended or closed it) or
+/// when there is no such pipe.
+pub fn process_read(h: i64, which: i64) -> Option<str> {
+    if h == 0 { return Option::None; }
+    val buf: i64 = p_malloc(PROC_READ_CHUNK);
+    if buf == 0 { return Option::None; }
+    val n: i64 = fid_proc_read(h, which, buf, PROC_READ_CHUNK);
+    if n <= 0 {
+        p_free(buf);
+        return Option::None;
+    }
+    val r: i64 = p_str_buf(n);
+    p_str_copy_n(r, buf, n);
+    p_free(buf);
+    return Option::Some(p_str_adopt(r));
+}
+
+/// Everything child `h` writes to the stream until it closes it.
+pub fn process_read_all(h: i64, which: i64) -> str {
+    var text: str = "";
+    var more: bool = true;
+    while more {
+        match process_read(h, which) {
+            Option::Some(chunk) => { text = text + chunk; }
+            Option::None => { more = false; }
+        }
+    }
+    return text;
+}
+
+/// A running child process with pipes (Command::spawn).
+pub struct Child {
+    pub handle: i64,        // 0 once released
+    pub stdin_open: bool,
+}
+
+/// The Child of handle h (Command::spawn).
+fn proc_child(h: i64, stdin_open: bool) -> Child {
+    return Child { handle: h, stdin_open: stdin_open };
+}
+
+impl Child {
+    /// The operating system's process id (-1 once released).
+    pub fn id(self: & Child) -> i64 {
+        return process_child_pid(self.handle);
+    }
+
+    /// Write `data` to the child's standard input (pipe_stdin): false when
+    /// it has no pipe or the child has stopped reading.
+    pub fn write(self: & mut Child, data: str) -> bool {
+        if !self.stdin_open { return false; }
+        return process_write(self.handle, data);
+    }
+
+    /// Close the child's standard input: it reads the end of its input.
+    pub fn close_stdin(self: & mut Child) -> void {
+        if self.stdin_open {
+            process_close_stdin(self.handle);
+            self.stdin_open = false;
+        }
+    }
+
+    /// What the child wrote next to its standard output (pipe_stdout),
+    /// waiting for it; None at the end.
+    pub fn read_stdout(self: & mut Child) -> Option<str> {
+        return process_read(self.handle, PROC_STDOUT);
+    }
+
+    /// What the child wrote next to its standard error (pipe_stderr).
+    pub fn read_stderr(self: & mut Child) -> Option<str> {
+        return process_read(self.handle, PROC_STDERR);
+    }
+
+    /// All the child's standard output, to its end.
+    pub fn read_all_stdout(self: & mut Child) -> str {
+        return process_read_all(self.handle, PROC_STDOUT);
+    }
+
+    /// All the child's standard error, to its end.
+    pub fn read_all_stderr(self: & mut Child) -> str {
+        return process_read_all(self.handle, PROC_STDERR);
+    }
+
+    /// Wait for the child to end (its input is closed first) and give its
+    /// exit code (killed by signal n: 128 + n; Windows kill: 137), -1 for
+    /// a released child.
+    pub fn wait(self: & mut Child) -> i64 {
+        self.close_stdin();
+        match process_wait(self.handle, -1) {
+            Option::Some(code) => { return code; }
+            Option::None => { }
+        }
+        return -1;
+    }
+
+    /// Wait at most `timeout_ms` milliseconds: Some(exit code) once it has
+    /// ended, None while it is still running.
+    pub fn wait_timeout(self: & mut Child, timeout_ms: i64) -> Option<i64> {
+        return process_wait(self.handle, timeout_ms);
+    }
+
+    /// Stop the child; true when it was running and was told to stop.
+    pub fn kill(self: & mut Child) -> bool {
+        return process_kill(self.handle);
+    }
+
+    /// Forget the child and close its pipes (wait for it first: one still
+    /// running keeps running).
+    pub fn release(self: & mut Child) -> void {
+        if self.handle != 0 {
+            process_release(self.handle);
+            self.handle = 0;
+            self.stdin_open = false;
+        }
+    }
+}

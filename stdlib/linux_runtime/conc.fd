@@ -27,6 +27,28 @@ const PE_SYS_SCHED_GETAFFINITY: i64 = 123;
 const PE_THREAD_STACK: i64 = 8388608;
 const PE_TASK_STACK: i64 = 262144;
 const PE_MAX_WORKERS: i64 = 8;
+// RT11: madvise (generic number; x86-64 needs nat_ir's map entry 233 -> 28,
+// unmapped numbers return ENOSYS there, as on --nat Windows and macOS)
+const PE_SYS_MADVISE: i64 = 233;
+const PE_MADV_GUARD_INSTALL: i64 = 102;
+var pe_guard_madv: i64 = 1;    // 0 once the kernel refused MADV_GUARD_INSTALL
+
+/// A task's stack, PE_GUARD bytes of guard region at its bottom. Linux
+/// 6.13+ installs the guard without a mapping of its own: one mapping per
+/// stack instead of two, so vm.max_map_count (65530 stock, 1048576 on some
+/// distributions) no longer caps the tasks at half of it (competitive
+/// RT11, 1M idle connections). Elsewhere the guard is mprotect'ed.
+fn pe_task_stack_new() -> i64 {
+    var stack: i64 = pe_mmap(PE_TASK_STACK + PE_GUARD);
+    if pe_guard_madv != 0 {
+        if pe_sys(PE_SYS_MADVISE, stack, PE_GUARD, PE_MADV_GUARD_INSTALL) == 0 {
+            return stack;
+        }
+        pe_guard_madv = 0;
+    }
+    pe_sys(PE_SYS_MPROTECT, stack, PE_GUARD, 0);
+    return stack;
+}
 
 /// What a non-blocking poll returns for a task still running, and a
 /// receive on a channel closed and empty (C: 0x8000000000000001).
@@ -65,8 +87,88 @@ fn pe_sleep_ms(ms: i64) {
     var ts: i64 = pert_malloc(16);
     pe_st(ts, ms / 1000);
     pe_st(ts + 8, (ms % 1000) * 1000000);
-    pe_sys(PE_SYS_NANOSLEEP, ts, 0, 0);
+    // The profiler's SIGPROF (sys.fd, DB9) cuts a sleep short with EINTR
+    // even under SA_RESTART: then the rest, which the kernel left in ts.
+    // Without the profiler a signal still ends the sleep, as before.
+    var r: i64 = pe_sys(PE_SYS_NANOSLEEP, ts, ts, 0);
+    while r == 0 - 4 && pe_prof_m != 0 {
+        r = pe_sys(PE_SYS_NANOSLEEP, ts, ts, 0);
+    }
     pert_free(ts);
+}
+
+// ─── Random-choice scheduling (competitive RL17) ────────────────────────
+// FIDES_SCHED_RANDOM=<seed> (a decimal number, not 0) turns it on, for
+// interleaving tests, as in pe_runtime/conc.fd: one worker thread; the
+// queue is turned a random number of places before each take, so the next
+// task is a random runnable one; a loop safepoint yields one time in two
+// while tasks are queued; threads, mutexes, atomics and channels sleep 0 or
+// 1 ms one time in four. The scheduler's choices follow from the seed.
+// Off, each hook costs one load.
+var pe_rnd: i64 = 0;           // *i64: the xorshift state
+var pe_rnd_on: i64 = 0;        // 0 not read yet, 1 random mode, 2 off
+
+fn pe_rnd_enabled() -> bool {
+    if pe_rnd_on == 0 {
+        pe_rnd_init();
+    }
+    return pe_rnd_on == 1;
+}
+
+@wrapping
+fn pe_rnd_init() {
+    var s: i64 = pe_env_raw("FIDES_SCHED_RANDOM" as i64);
+    var seed: i64 = 0;
+    if s != 0 {
+        var i: i64 = 0;
+        while pe_ldb(s + i) >= 48 && pe_ldb(s + i) <= 57 && i < 18 {
+            seed = seed * 10 + (pe_ldb(s + i) - 48);
+            i = i + 1;
+        }
+    }
+    if seed == 0 {
+        pe_rnd_on = 2;
+        return;
+    }
+    var st: i64 = pe_zeroed(1);
+    var x: i64 = seed * 2654435761 + 88172645463325252;
+    if x == 0 { x = 1; }
+    pe_st(st, x);
+    pe_rnd = st;
+    pe_rnd_on = 1;
+}
+
+/// The next number of the shared xorshift64 sequence, >= 0.
+@wrapping
+fn pe_rnd_next() -> i64 {
+    while true {
+        var x: i64 = nat_atomic_load(pe_rnd);
+        var y: i64 = x ^ (x << 13);
+        y = y ^ ((y >> 7) & 0x01FFFFFFFFFFFFFF);
+        y = y ^ (y << 17);
+        if nat_atomic_cas(pe_rnd, x, y) != 0 {
+            return y & 0x7FFFFFFFFFFFFFFF;
+        }
+    }
+    return 0;
+}
+
+/// A random number in [0, n) (0 when n <= 1).
+fn pe_rnd_below(n: i64) -> i64 {
+    if n <= 1 { return 0; }
+    return pe_rnd_next() % n;
+}
+
+/// An OS-thread interleaving point (random mode only).
+fn pe_rnd_jitter() {
+    if pe_rnd_enabled() {
+        var r: i64 = pe_rnd_below(8);
+        if r == 0 {
+            pe_sleep_ms(1);
+        } else if r == 1 {
+            pe_sleep_ms(0);
+        }
+    }
 }
 
 /// Atomically: *addr = v; the old value.
@@ -177,6 +279,10 @@ fn pe_thread_count() -> i64 {
 
 /// Start the program function `name` with argv[0..nargs) on a new thread.
 pub fn pert_thread_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
+    // LG11: p_co_stack by name (the C runtime's handshake): -2 here
+    if name == "__p_co_stack" {
+        return pert_c_p_co_stack(0);
+    }
     var fn_addr: i64 = pe_fn_lookup(name);
     if fn_addr == 0 {
         return 0 - 1;
@@ -220,6 +326,7 @@ pub fn pe_thread_main(block: i64) -> i64 {
     var t: i64 = nat_tls_get();
     pe_st(block + 104, t);
     pe_altstack_on(t);
+    pe_rnd_jitter();
     var result: i64 = pe_thread_body(block);
     pe_altstack_off(t);
     return result;
@@ -261,7 +368,7 @@ fn pe_join(idx: i64) -> i64 {
         var block: i64 = pe_thread_block(idx);
         var w: i64 = nat_atomic_load(block + 96) & 4294967295;
         while w != 0 {
-            if pe_co_self() != 0 || pe_q_n > 0 {
+            if pe_co_self() != 0 || pe_q_any() {
                 pe_relax();
             } else {
                 pe_futex_wait(block + 96, w, 0 - 1, false);
@@ -288,10 +395,19 @@ fn pe_join(idx: i64) -> i64 {
 // entered it last (where it goes back to); a socket wait (epoll, below):
 // [17] its fd + 1 while the task asks to wait, [18] 1 to wait for writing
 // (+ 2 when it has a deadline), [22] the wait's token while it is armed,
-// [23] the token's generation, [24] how the wait ended.
+// [23] the token's generation, [24] how the wait ended; (CA9) [25] its
+// function's name, [26] the task awaiting it (set while it waits), [27] the
+// name of the task that started it (1: started off a task on a thread, 0:
+// by main); (CA7/CA8) [28] its token slot ("Token slot" below); (CA9) [29]
+// the task that entered it, while it runs inside that task's turn.
 // A future of a task is its block with the tag 0x7FA5 in the top 16 bits.
-// The run queue is one list under pe_q_lock; pe_q_seq is the futex idle
-// workers sleep on, pe_done_seq the one waiters for a finished task do.
+// Run queues (competitive RT10, as pe_runtime/conc.fd): each worker owns a
+// lock-free ring (below, "Worker rings") of tasks ready to run; the global
+// queue is one list under pe_q_lock and holds what threads that are not
+// workers queue, every sleeper (a deadline in [19]: the scan below skips it
+// until it is due) and everything in random mode (RL17). pe_q_seq is the
+// futex idle workers sleep on, pe_done_seq the one waiters for a finished
+// task do.
 
 var pe_q_lock: i64 = 0;        // *i64
 var pe_q_seq: i64 = 0;         // *i64
@@ -303,6 +419,7 @@ var pe_q_idle: i64 = 0;        // *i64: workers asleep
 var pe_co_live: i64 = 0;       // *i64: unfinished tasks
 var pe_co_total: i64 = 0;      // *i64: tasks there have been
 var pe_workers: i64 = 0;       // *i64: 0 none, 1 starting or started
+var pe_lq: i64 = 0;            // the worker rings: [0] how many, then PE_LQ_REC bytes each
 
 /// The scheduler's words, once (the first task comes from one thread at
 /// a time: pe_co_new_block's caller has none running yet).
@@ -337,8 +454,30 @@ fn pe_q_push(t: i64) {
 
 /// Queue t; wake an idle worker when `wake` (a task that just yielded is
 /// queued again by the thread that will take the next one at once: no
-/// wake, or two threads fight over the queue on every yield).
-fn pe_q_push2(t: i64, wake: bool) {
+/// wake, or two threads fight over the queue on every yield). On a worker,
+/// a task ready to run goes on the worker's own ring (RT10); a full ring
+/// moves half of itself to the global queue first, and t follows it there.
+fn pe_q_push2(t: i64, wake0: bool) {
+    var wake: bool = wake0;
+    var wid: i64 = pe_my_wid();
+    if wid >= 0 && pe_rnd_on != 1 && pe_ld(t + 152) == 0 {
+        var backlog: bool = pe_lq_size(wid) > 0 || pe_q_n > 0;
+        if pe_lq_push(t, wid) {
+            // the slot is published (a barrier) before pe_q_idle is read:
+            // a worker counts itself idle before its last look (no lost
+            // wake-up)
+            if (wake || backlog) && nat_atomic_load(pe_q_idle) > 0 {
+                nat_atomic_add(pe_q_seq, 1);
+                pe_futex_wake(pe_q_seq, 1);
+            }
+            if wake {
+                pe_ep_poke();
+            }
+            return;
+        }
+        pe_lq_spill(wid);
+        wake = true;
+    }
     pe_lock(pe_q_lock);
     pe_st(t + 128, 0);
     if pe_q_tail == 0 {
@@ -357,9 +496,241 @@ fn pe_q_push2(t: i64, wake: bool) {
     pe_ep_poke();
 }
 
-/// A queued task that is not sleeping, taken off the queue; 0 if none.
-/// *wake = when the first sleeper wakes (0: none sleeps).
+// ─── Worker rings (competitive RT10) ────────────────────────────────────
+// As pe_runtime/conc.fd's: each worker owns a bounded Chase-Lev deque taken
+// FIFO. Only its worker pushes, at `bottom`, with plain stores and a
+// sequentially consistent store that publishes the slot; its worker and the
+// thieves take at `top` by compare-and-swap, so a slot is claimed once and
+// no lock is taken. A worker whose ring is dry takes from the global queue,
+// then steals half of a sibling's ring in one CAS (the slots are copied to
+// its own ring's unpublished end first: if the claim fails they are copied
+// again). A thread that is not a worker (main waiting for a task) takes one
+// task from a ring. A full ring moves its older half to the global queue in
+// one lock hold. Indexes only grow; a slot is `index & (PE_LQ_CAP - 1)`.
+// pe_lq: [0] the number of workers, then for worker w at 64 + w * PE_LQ_REC:
+// [0] top, [64] bottom (another cache line), [128] the ring, [136] where
+// its next steal starts. A worker's thread block holds w + 1 at [72].
+
+const PE_LQ_CAP: i64 = 256;
+const PE_LQ_REC: i64 = 192;
+
+/// This thread's worker index, -1 when it is not a worker.
+fn pe_my_wid() -> i64 {
+    var t: i64 = nat_tls_get();
+    if t == 0 || pe_lq == 0 {
+        return 0 - 1;
+    }
+    return pe_ld(t + 72) - 1;
+}
+
+fn pe_lq_rec(wid: i64) -> i64 {
+    return pe_lq + 64 + wid * PE_LQ_REC;
+}
+
+fn pe_lq_count() -> i64 {
+    var q: i64 = pe_lq;
+    if q == 0 {
+        return 0;
+    }
+    return pe_ld(q);
+}
+
+/// Tasks on worker wid's ring, a snapshot.
+fn pe_lq_size(wid: i64) -> i64 {
+    var q: i64 = pe_lq_rec(wid);
+    var t: i64 = nat_atomic_load(q);
+    var b: i64 = nat_atomic_load(q + 64);
+    if b > t {
+        return b - t;
+    }
+    return 0;
+}
+
+/// Tasks on every ring.
+fn pe_lq_total() -> i64 {
+    var n: i64 = pe_lq_count();
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + pe_lq_size(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Anything queued, on the global queue or a ring.
+fn pe_q_any() -> bool {
+    if pe_q_n > 0 {
+        return true;
+    }
+    return pe_lq_total() > 0;
+}
+
+/// Worker wid's thread only: t on its ring. False when the ring is full.
+fn pe_lq_push(t: i64, wid: i64) -> bool {
+    var q: i64 = pe_lq_rec(wid);
+    var b: i64 = pe_ld(q + 64);
+    if b - nat_atomic_load(q) >= PE_LQ_CAP {
+        return false;
+    }
+    pe_st(pe_ld(q + 128) + (b & (PE_LQ_CAP - 1)) * 8, t);
+    nat_atomic_store(q + 64, b + 1);
+    return true;
+}
+
+/// The oldest task of worker wid's ring (any thread). 0 if it is empty.
+fn pe_lq_pop(wid: i64) -> i64 {
+    var q: i64 = pe_lq_rec(wid);
+    var buf: i64 = pe_ld(q + 128);
+    while true {
+        var t: i64 = nat_atomic_load(q);
+        var b: i64 = nat_atomic_load(q + 64);
+        if b - t <= 0 {
+            return 0;
+        }
+        // read the slot, then claim it: if its owner reused it meanwhile,
+        // top moved and the claim fails
+        var task: i64 = pe_ld(buf + (t & (PE_LQ_CAP - 1)) * 8);
+        if nat_atomic_cas(q, t, t + 1) != 0 {
+            return task;
+        }
+    }
+    return 0;
+}
+
+/// Thief wid (its ring empty) takes half of worker v's ring, rounded up:
+/// the last one to run, the others published on its own ring. 0 if v's
+/// ring is empty.
+fn pe_lq_steal_half(wid: i64, v: i64) -> i64 {
+    var q: i64 = pe_lq_rec(v);
+    var vbuf: i64 = pe_ld(q + 128);
+    var mine: i64 = pe_lq_rec(wid);
+    var mbuf: i64 = pe_ld(mine + 128);
+    var mb: i64 = pe_ld(mine + 64);
+    var mask: i64 = PE_LQ_CAP - 1;
+    while true {
+        var t: i64 = nat_atomic_load(q);
+        var b: i64 = nat_atomic_load(q + 64);
+        var n: i64 = b - t;
+        if n <= 0 {
+            return 0;
+        }
+        n = n - n / 2;
+        if n > PE_LQ_CAP / 2 {
+            n = PE_LQ_CAP / 2;
+        }
+        var i: i64 = 0;
+        while i < n {
+            pe_st(mbuf + ((mb + i) & mask) * 8, pe_ld(vbuf + ((t + i) & mask) * 8));
+            i = i + 1;
+        }
+        if nat_atomic_cas(q, t, t + n) != 0 {
+            if n > 1 {
+                nat_atomic_store(mine + 64, mb + n - 1);
+            }
+            return pe_ld(mbuf + ((mb + n - 1) & mask) * 8);
+        }
+    }
+    return 0;
+}
+
+/// A task from another ring: half of the first sibling's that has work
+/// (worker wid, its ring dry), or one task (wid < 0: not a worker).
+fn pe_lq_steal(wid: i64) -> i64 {
+    var n: i64 = pe_lq_count();
+    if n == 0 {
+        return 0;
+    }
+    var start: i64 = 0;
+    if wid >= 0 {
+        if n < 2 {
+            return 0;
+        }
+        var mine: i64 = pe_lq_rec(wid);
+        start = pe_ld(mine + 136);
+        pe_st(mine + 136, start + 1);
+    }
+    var i: i64 = 0;
+    while i < n {
+        var v: i64 = (wid + 1 + n + (start + i) % n) % n;
+        var t: i64 = 0;
+        if wid < 0 {
+            t = pe_lq_pop(v);
+        } else if v != wid {
+            t = pe_lq_steal_half(wid, v);
+        }
+        if t != 0 {
+            return t;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Worker wid's thread, its ring full: its older half to the global queue.
+/// The half is claimed before it is read (only this thread writes its
+/// slots).
+fn pe_lq_spill(wid: i64) {
+    var q: i64 = pe_lq_rec(wid);
+    var buf: i64 = pe_ld(q + 128);
+    var b: i64 = pe_ld(q + 64);
+    var top: i64 = nat_atomic_load(q);
+    var half: i64 = (b - top) / 2;
+    var claimed: bool = half <= 0;
+    while !claimed {
+        if nat_atomic_cas(q, top, top + half) != 0 {
+            claimed = true;
+        } else {
+            top = nat_atomic_load(q);
+            half = (b - top) / 2;
+            if half <= 0 {
+                half = 0;
+                claimed = true;
+            }
+        }
+    }
+    if half == 0 {
+        return;
+    }
+    pe_lock(pe_q_lock);
+    var i: i64 = 0;
+    while i < half {
+        var t: i64 = pe_ld(buf + ((top + i) & (PE_LQ_CAP - 1)) * 8);
+        pe_st(t + 128, 0);
+        if pe_q_tail == 0 {
+            pe_q_head = t;
+        } else {
+            pe_st(pe_q_tail + 128, t);
+        }
+        pe_q_tail = t;
+        pe_q_n = pe_q_n + 1;
+        i = i + 1;
+    }
+    pe_unlock(pe_q_lock);
+}
+
+/// A task to run, 0 if none: this worker's ring, the global queue (which
+/// skips sleepers), then another ring. *wake = when the first sleeper of
+/// the global queue wakes (0: none sleeps).
 fn pe_q_take(wake: i64) -> i64 {
+    var wid: i64 = pe_my_wid();
+    if wid >= 0 {
+        var r: i64 = pe_lq_pop(wid);
+        if r != 0 {
+            pe_st(wake, 0);
+            return r;
+        }
+    }
+    var t: i64 = pe_gq_take(wake);
+    if t != 0 {
+        return t;
+    }
+    return pe_lq_steal(wid);
+}
+
+/// A queued task that is not sleeping, taken off the global queue; 0 if
+/// none. *wake = when the first sleeper wakes (0: none sleeps).
+fn pe_gq_take(wake: i64) -> i64 {
     pe_st(wake, 0);
     if pe_q_n == 0 {
         return 0;
@@ -370,6 +741,20 @@ fn pe_q_take(wake: i64) -> i64 {
     var n: i64 = pe_q_n;
     var found: i64 = 0;
     var first: i64 = 0;
+    if pe_rnd_on == 1 {
+        // RL17: turn the queue a random number of places
+        var r: i64 = pe_rnd_below(n);
+        while r > 0 {
+            var h: i64 = pe_q_head;
+            if pe_ld(h + 128) != 0 {
+                pe_q_head = pe_ld(h + 128);
+                pe_st(h + 128, 0);
+                pe_st(pe_q_tail + 128, h);
+                pe_q_tail = h;
+            }
+            r = r - 1;
+        }
+    }
     while n > 0 && found == 0 {
         var t: i64 = pe_q_head;
         pe_q_head = pe_ld(t + 128);
@@ -404,7 +789,31 @@ fn pe_co_workers() {
     }
     var n: i64 = pe_cpu_count() - 1;
     if n < 1 { n = 1; }
+    // CP5: FIDES_WORKERS=<n> (1-16), as pe_runtime's: that many workers
+    // instead of one per CPU but one (benchmarks of the switch itself,
+    // programs that want fewer threads)
+    var wenv: i64 = pe_env_raw("FIDES_WORKERS" as i64);
+    if wenv != 0 {
+        var wn: i64 = 0;
+        var wi: i64 = 0;
+        while wi < 3 && pe_ldb(wenv + wi) >= 48 && pe_ldb(wenv + wi) <= 57 {
+            wn = wn * 10 + (pe_ldb(wenv + wi) - 48);
+            wi = wi + 1;
+        }
+        if wn >= 1 && wn <= 16 { n = wn; }
+    }
     if n > PE_MAX_WORKERS { n = PE_MAX_WORKERS; }
+    if pe_rnd_enabled() { n = 1; }          // RL17
+    // The rings (RT10), written before pe_lq is: the count's store is a
+    // barrier, and readers reach the rest through pe_lq
+    var lq: i64 = pe_zeroed(8 + n * (PE_LQ_REC / 8));
+    var ri: i64 = 0;
+    while ri < n {
+        pe_st(lq + 64 + ri * PE_LQ_REC + 128, pe_zeroed(PE_LQ_CAP));
+        ri = ri + 1;
+    }
+    nat_atomic_store(lq, n);
+    pe_lq = lq;
     var entry: i64 = pe_fn_lookup("pe_worker_main");
     var i: i64 = 0;
     while i < n {
@@ -417,6 +826,7 @@ fn pe_co_workers() {
 /// A worker: run queued tasks for good, asleep while there are none.
 pub fn pe_worker_main(id: i64) -> i64 {
     pe_altstack_on(nat_tls_get());
+    pe_st(nat_tls_get() + 72, id + 1);      // its ring (RT10)
     var wake: i64 = pe_tls() + 56;
     while true {
         var seen: i64 = nat_atomic_load(pe_q_seq);
@@ -438,7 +848,13 @@ pub fn pe_worker_main(id: i64) -> i64 {
                 nat_atomic_store(pe_ep_polling, 0);
             } else {
                 nat_atomic_add(pe_q_idle, 1);
-                pe_futex_wait(pe_q_seq, seen & 4294967295, ms, true);
+                // A last look at the rings once counted idle: a push to a
+                // ring publishes its slot before it reads pe_q_idle, so
+                // either it wakes this worker or this worker sees its task
+                // (a push to the global queue bumps pe_q_seq: `seen`)
+                if pe_lq_total() == 0 {
+                    pe_futex_wait(pe_q_seq, seen & 4294967295, ms, true);
+                }
                 nat_atomic_add(pe_q_idle, 0 - 1);
             }
         }
@@ -452,17 +868,24 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
         pert_panic("task: no such function" as i64);
     }
     pe_co_init();
-    var block: i64 = pe_zeroed(28);
+    var block: i64 = pe_zeroed(30);
     pe_st(block, fn_addr);
     pe_st(block + 8, nargs);
+    // CA9: its name and who started it, for a panic's task chain
+    pe_st(block + 200, name as i64);
+    var starter: i64 = pe_co_self();
+    if starter != 0 {
+        pe_st(block + 216, pe_ld(starter + 200));
+    } else if pe_ld(pe_tls() + 16) != 0 {
+        pe_st(block + 216, 1);
+    }
     var a: i64 = 0;
     while a < nargs && a < 8 {
         pe_st(block + 16 + a * 8, pe_ld(argv + a * 8));
         a = a + 1;
     }
     pe_st(block + 96, 1);
-    var stack: i64 = pe_mmap(PE_TASK_STACK + PE_GUARD);
-    pe_sys(PE_SYS_MPROTECT, stack, PE_GUARD, 0);
+    var stack: i64 = pe_task_stack_new();
     pe_st(block + 120, stack);
     // The first switch restores the record at s (nat_ctx_swap): registers
     // 0, fp 0, lr the trampoline, which calls [s + 112](env 0, [s + 120])
@@ -499,8 +922,11 @@ fn pe_co_enter(block: i64) {
     var t: i64 = pe_tls();
     var prev: i64 = pe_ld(t);
     pe_st(t, block);
+    // CA9: the task whose turn this runs in, while it runs
+    pe_st(block + 232, prev);
     nat_ctx_swap(block + 168, pe_ld(block + 104));
     pe_st(pe_tls(), prev);
+    pe_st(block + 232, 0);
 }
 
 /// Give control back to whoever entered the running task.
@@ -537,7 +963,7 @@ fn pe_co_after(t: i64) {
 /// Run one queued task that is not sleeping; when all of them sleep, wait
 /// for the first to wake, at most `limit` ms. False with nothing queued.
 fn pe_co_step(limit: i64) -> bool {
-    if pe_q_n == 0 {
+    if !pe_q_any() {
         return false;
     }
     var t: i64 = pe_q_take(pe_tls() + 56);
@@ -567,6 +993,19 @@ fn pe_co_drain() {
             pe_futex_wait(pe_done_seq, seen & 4294967295, 10, true);
         }
     }
+}
+
+/// LG11: the C runtime's `extern "C" fn p_co_stack(bytes) -> i64` (the
+/// stack of the tasks started from now on; also asked as
+/// p_thread_spawn("__p_co_stack", 1, bytes)). Here every task stack is
+/// PE_TASK_STACK and tasks run on several workers at once: -2, nothing
+/// changes (fid run's interpreter then runs each task to its end when it
+/// starts).
+pub fn pert_c_p_co_stack(bytes: i64) -> i64 {
+    if bytes < 0 {
+        return - 2;
+    }
+    return - 2;
 }
 
 pub fn pert_co_go(name: str, arg: i64) -> i64 {
@@ -600,10 +1039,20 @@ pub fn pert_co_yield() {
     }
 }
 
-/// Loop-backedge safepoint: yield only when other tasks are queued.
+/// Loop-backedge safepoint: yield only when other tasks are queued (on the
+/// global queue or this worker's ring: the other rings have their own
+/// workers, and thieves).
 pub fn pert_co_tick() {
-    if pe_q_n > 0 && pe_co_self() != 0 {
-        pe_co_leave();
+    var queued: bool = pe_q_n > 0;
+    if !queued && pe_lq != 0 {
+        var wid: i64 = pe_my_wid();
+        queued = wid >= 0 && pe_lq_size(wid) > 0;
+    }
+    if queued && pe_co_self() != 0 {
+        // RL17: in random mode, a preemption point one time in two
+        if pe_rnd_on != 1 || pe_rnd_below(2) == 0 {
+            pe_co_leave();
+        }
     }
 }
 
@@ -623,15 +1072,55 @@ fn pe_is_co_future(f: i64) -> bool {
 
 fn pe_co_await(f: i64) -> i64 {
     var c: i64 = f & 0xFFFFFFFFFFFF;
+    // CA9: the task awaiting it, for a panic's task chain
+    var me: i64 = pe_co_self();
+    if me != 0 && nat_atomic_load(c + 80) == 0 {
+        pe_st(c + 208, me);
+    }
+    // CA7: with a token in the slot, give up (0) once it is cancelled
+    var tok: i64 = pert_task_token();
     while nat_atomic_load(c + 80) == 0 {
+        if tok != 0 && pe_tok_cancelled(tok) {
+            if me != 0 && pe_ld(c + 208) == me {
+                pe_st(c + 208, 0);
+            }
+            return 0;
+        }
         var seen: i64 = nat_atomic_load(pe_done_seq);
         if nat_atomic_load(c + 80) != 0 { break; }
-        pe_wait_word(pe_done_seq, seen, 10);
+        var wms: i64 = 10;
+        if tok != 0 { wms = pe_tok_slice(tok, 10); }
+        pe_wait_word(pe_done_seq, seen, wms);
     }
     return pe_ld(c + 88);
 }
 
+/// CA7: sleep, in slices when the slot holds a token: 1 when the token
+/// stopped it, 0 when the whole time passed.
 pub fn pert_co_sleep(ms: i64) -> i64 {
+    var tok: i64 = pert_task_token();
+    if tok == 0 {
+        return pe_co_sleep_plain(ms);
+    }
+    var d: i64 = ms;
+    if d < 0 {
+        d = 0;
+    }
+    var end: i64 = pert_clock_mono_ms() + d;
+    while true {
+        if pe_tok_cancelled(tok) {
+            return 1;
+        }
+        var left: i64 = end - pert_clock_mono_ms();
+        if left <= 0 {
+            return 0;
+        }
+        pe_co_sleep_plain(pe_tok_slice(tok, left));
+    }
+    return 0;
+}
+
+fn pe_co_sleep_plain(ms: i64) -> i64 {
     var d: i64 = ms;
     if d < 0 {
         d = 0;
@@ -960,8 +1449,33 @@ fn pe_ep_forget(fd: i64) {
 }
 
 /// Wait until fd is readable (or writable): 1, or 0 when `timeout_ms`
-/// (>= 0) passes first. A task gives control back meanwhile.
+/// (>= 0) passes first. A task gives control back meanwhile. CA7: with a
+/// token in the slot, it waits in slices and gives 0 once it is cancelled.
 pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
+    var tok: i64 = pert_task_token();
+    if tok == 0 {
+        return pe_co_wait_fd_plain(fd, write, timeout_ms);
+    }
+    var start: i64 = pert_clock_mono_ms();
+    while true {
+        if pe_tok_cancelled(tok) {
+            return 0;
+        }
+        var left: i64 = 0 - 1;
+        if timeout_ms >= 0 {
+            left = timeout_ms - (pert_clock_mono_ms() - start);
+            if left <= 0 {
+                return 0;
+            }
+        }
+        if pe_co_wait_fd_plain(fd, write, pe_tok_slice(tok, left)) != 0 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn pe_co_wait_fd_plain(fd: i64, write: i64, timeout_ms: i64) -> i64 {
     var cur: i64 = pe_co_self();
     if cur == 0 {
         return pe_poll_fd(fd, write, timeout_ms);
@@ -991,12 +1505,165 @@ pub fn pert_co_wait_fd(fd: i64, write: i64, timeout_ms: i64) -> i64 {
     while true {
         // Nothing else to run: wait in the kernel a moment
         var ms: i64 = 0;
-        if pe_q_n == 0 { ms = 1; }
+        if !pe_q_any() { ms = 1; }
         if pe_poll_fd(fd, write, ms) > 0 { return 1; }
         if dl != 0 && pert_clock_now_ms() >= dl { return 0; }
         pe_co_leave();
     }
     return 0;
+}
+
+// ─── Token slot (complaint CA7, CA8) ────────────────────────────────────
+// A timeout block's token (compiler/lower.fd Lowerer_to_enter) is three
+// words: [cancelled][deadline on pert_clock_mono_ms's clock, 0 none][the
+// token the slot held before]. The slot is word [28] of the running task's
+// block, else word [10] of the thread's block (base.fd pe_tls): a new task
+// starts with an empty one. The builtin waits (sleep, await, channel send
+// and receive, socket waits) look at the slot's token, and at the ones it
+// replaced, at least every 10 ms (a channel's or an await's wait, every
+// turn), and give up once one is cancelled or past its deadline, as the C
+// runtime's do. With an empty slot they wait as before.
+
+/// The token in the running task's slot (p_task_token), 0 if none.
+pub fn pert_task_token() -> i64 {
+    var t: i64 = nat_tls_get();
+    if t == 0 {
+        return 0;
+    }
+    var c: i64 = pe_ld(t);
+    if c != 0 {
+        return pe_ld(c + 224);
+    }
+    return pe_ld(t + 80);
+}
+
+/// Put `tok` in the slot (p_task_set_token); the token it held.
+pub fn pert_task_set_token(tok: i64) -> i64 {
+    var t: i64 = pe_tls();
+    var c: i64 = pe_ld(t);
+    var at: i64 = t + 80;
+    if c != 0 {
+        at = c + 224;
+    }
+    var old: i64 = pe_ld(at);
+    pe_st(at, tok);
+    return old;
+}
+
+/// Whether `tok`, or a token it replaced, is cancelled or past its
+/// deadline (a token past its deadline is marked cancelled).
+fn pe_tok_cancelled(tok: i64) -> bool {
+    var t: i64 = tok;
+    var depth: i64 = 0;
+    var now: i64 = 0;
+    while t != 0 && depth < 64 {
+        if nat_atomic_load(t) != 0 {
+            return true;
+        }
+        var dl: i64 = nat_atomic_load(t + 8);
+        if dl != 0 {
+            if now == 0 {
+                now = pert_clock_mono_ms();
+            }
+            if now >= dl {
+                nat_atomic_store(t, 1);
+                return true;
+            }
+        }
+        t = nat_atomic_load(t + 16);
+        depth = depth + 1;
+    }
+    return false;
+}
+
+/// The next slice of a wait of `left` ms (-1: no limit) under `tok`: 10
+/// ms at most, and no later than the first deadline of its chain.
+fn pe_tok_slice(tok: i64, left: i64) -> i64 {
+    var s: i64 = 10;
+    if left >= 0 && left < s {
+        s = left;
+    }
+    var now: i64 = pert_clock_mono_ms();
+    var t: i64 = tok;
+    var depth: i64 = 0;
+    while t != 0 && depth < 64 {
+        var dl: i64 = nat_atomic_load(t + 8);
+        if dl != 0 {
+            var r: i64 = 0;
+            if dl > now {
+                r = dl - now;
+            }
+            if r < s {
+                s = r;
+            }
+        }
+        t = nat_atomic_load(t + 16);
+        depth = depth + 1;
+    }
+    return s;
+}
+
+// ─── Task chain of a panic (complaint CA9) ──────────────────────────────
+// A panic's trace shows only the running task's own stack. pe_co_print_chain
+// (called by base.fd pert_panic and pe_on_signal after the trace) prints the
+// tasks it runs for, as the C runtime's __p_co_print_chain: the one
+// awaiting it ([26]), else the one whose turn it runs in ([29]; both are
+// alive while they wait), up to the code outside tasks (`main`, or
+// `(thread)` off the main thread), or to the task that started it and has
+// not awaited it (`(started by f)`):
+//     task chain: b <- a <- main
+
+/// A task's name to fd, without the `__task` of an adapted task function.
+fn pe_co_put_name(fd: i64, name: i64) {
+    if name == 0 {
+        return;
+    }
+    var n: i64 = pe_len(name);
+    if n > 6 {
+        var e: i64 = name + n - 6;
+        if pe_ldb(e) == 95 && pe_ldb(e + 1) == 95 && pe_ldb(e + 2) == 116 && pe_ldb(e + 3) == 97 && pe_ldb(e + 4) == 115 && pe_ldb(e + 5) == 107 {
+            n = n - 6;
+        }
+    }
+    pe_write_all(fd, name, n);
+}
+
+/// `task chain: ...` on fd when a task is running; nothing otherwise.
+pub fn pe_co_print_chain(fd: i64) {
+    var c: i64 = pe_co_self();
+    if c == 0 {
+        return;
+    }
+    pe_write_all(fd, "task chain: " as i64, 12);
+    var depth: i64 = 0;
+    var more: bool = true;
+    while more {
+        pe_co_put_name(fd, pe_ld(c + 200));
+        var next: i64 = pe_ld(c + 208);
+        if next == 0 {
+            next = pe_ld(c + 232);
+        }
+        if next != 0 && depth < 64 {
+            pe_write_all(fd, " <- " as i64, 4);
+            c = next;
+            depth = depth + 1;
+        } else {
+            var starter: i64 = pe_ld(c + 216);
+            if next != 0 {
+                pe_write_all(fd, " <- ..." as i64, 7);
+            } else if starter > 1 {
+                pe_write_all(fd, " (started by " as i64, 13);
+                pe_co_put_name(fd, starter);
+                pe_write_all(fd, ")" as i64, 1);
+            } else if starter == 1 {
+                pe_write_all(fd, " <- (thread)" as i64, 12);
+            } else {
+                pe_write_all(fd, " <- main" as i64, 8);
+            }
+            more = false;
+        }
+    }
+    pe_write_all(fd, "\n" as i64, 1);
 }
 
 // ─── Futures and executors ──────────────────────────────────────────────
@@ -1135,15 +1802,18 @@ pub fn pert_shared_alloc(size: i64) -> i64 {
 }
 
 pub fn pert_atomic_load(addr: i64) -> i64 {
+    pe_rnd_jitter();
     return nat_atomic_load(addr);
 }
 
 pub fn pert_atomic_store(addr: i64, value: i64) {
+    pe_rnd_jitter();
     nat_atomic_store(addr, value);
 }
 
 /// The previous value.
 pub fn pert_atomic_add(addr: i64, value: i64) -> i64 {
+    pe_rnd_jitter();
     return nat_atomic_add(addr, value);
 }
 
@@ -1153,6 +1823,7 @@ pub fn pert_atomic_sub(addr: i64, value: i64) -> i64 {
 }
 
 pub fn pert_atomic_cas(addr: i64, expected: i64, new_value: i64) -> bool {
+    pe_rnd_jitter();
     return nat_atomic_cas(addr, expected, new_value) != 0;
 }
 
@@ -1166,11 +1837,12 @@ pub fn pert_mutex_init() -> i64 {
 }
 
 pub fn pert_mutex_lock(m: i64) {
+    pe_rnd_jitter();
     if nat_atomic_cas(m, 0, 1) != 0 {
         return;
     }
     while true {
-        if pe_co_self() != 0 || pe_q_n > 0 {
+        if pe_co_self() != 0 || pe_q_any() {
             pe_relax();
             if nat_atomic_cas(m, 0, 1) != 0 { return; }
         } else {
@@ -1185,6 +1857,7 @@ pub fn pert_mutex_unlock(m: i64) {
         nat_atomic_store(m, 0);
         pe_futex_wake(m, 1);
     }
+    pe_rnd_jitter();
 }
 
 // Thread-local storage keys: each thread's block holds its table of 64
@@ -1249,16 +1922,33 @@ fn pe_chan_wait(ch: i64, seen: i64) {
     nat_atomic_add(ch + 16, 0 - 1);
 }
 
-/// Wait until there is room or the channel is closed; false if closed.
+/// CA7: pe_chan_wait under token `tok` (0: none), at most a slice of it.
+fn pe_chan_wait_tok(ch: i64, seen: i64, tok: i64) {
+    if tok == 0 {
+        pe_chan_wait(ch, seen);
+        return;
+    }
+    nat_atomic_add(ch + 16, 1);
+    pe_wait_word(ch + 8, seen, pe_tok_slice(tok, 20));
+    nat_atomic_add(ch + 16, 0 - 1);
+}
+
+/// Wait until there is room or the channel is closed; false if closed, or
+/// (CA7) once the token in the slot is cancelled.
 pub fn pert_chan_send(ch: i64, value: i64) -> bool {
     if ch == 0 {
         return false;
     }
+    pe_rnd_jitter();
+    var tok: i64 = pert_task_token();
     var seen: i64 = nat_atomic_load(ch + 8);
     pe_lock(ch);
     while pe_ld(ch + 40) == pe_ld(ch + 48) && pe_ld(ch + 56) == 0 {
         pe_unlock(ch);
-        pe_chan_wait(ch, seen);
+        if tok != 0 && pe_tok_cancelled(tok) {
+            return false;
+        }
+        pe_chan_wait_tok(ch, seen, tok);
         seen = nat_atomic_load(ch + 8);
         pe_lock(ch);
     }
@@ -1285,16 +1975,21 @@ fn pe_chan_take(ch: i64) -> i64 {
 }
 
 /// Wait until there is a value or the channel is closed and empty (then
-/// the pending value).
+/// the pending value; CA7: also once the token in the slot is cancelled).
 pub fn pert_chan_recv(ch: i64) -> i64 {
     if ch == 0 {
         return 0;
     }
+    pe_rnd_jitter();
+    var tok: i64 = pert_task_token();
     var seen: i64 = nat_atomic_load(ch + 8);
     pe_lock(ch);
     while pe_ld(ch + 40) == 0 && pe_ld(ch + 56) == 0 {
         pe_unlock(ch);
-        pe_chan_wait(ch, seen);
+        if tok != 0 && pe_tok_cancelled(tok) {
+            return pe_pending();
+        }
+        pe_chan_wait_tok(ch, seen, tok);
         seen = nat_atomic_load(ch + 8);
         pe_lock(ch);
     }

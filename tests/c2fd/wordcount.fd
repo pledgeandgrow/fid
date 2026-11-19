@@ -1,0 +1,156 @@
+// Translated from wordcount.c by c2fd (C to Fid, best effort): review it before use.
+// C headers: <stdio.h>, <ctype.h> (their calls are mapped to Fid's).
+
+// Count the lines, words and bytes of a file, like wc.
+
+fn main() -> i64 {
+    // argv: the program's arguments (c_args)
+    val argv: Vec<str> = c_args();
+    val argc: i64 = argv.len();
+    val path: str = if argc > 1 { argv[1] } else { "words.txt" };
+    var f: CFile = c_fopen(path, "r");
+    if !f.ok {
+        p_eprint_str(f"cannot open {path}\n");
+        return 1;
+    }
+    var c: i64 = 0;
+    var in_word: i64 = 0;
+    var lines: i64 = 0;
+    var words: i64 = 0;
+    var bytes: i64 = 0;
+    var longest: i64 = 0;
+    var current: i64 = 0;
+    loop {
+        c = c_fgetc(&mut f);
+        if c == EOF {
+            break;
+        }
+        bytes += 1;
+        if c == '\n' {
+            lines += 1;
+        }
+        if c_isspace(c) {
+            if current > longest {
+                longest = current;
+            }
+            current = 0;
+            in_word = 0;
+        } else {
+            current += 1;
+            if in_word == 0 {
+                in_word = 1;
+                words += 1;
+            }
+        }
+    }
+    c_fclose(&mut f);
+    println(f"{c_rjust(int_to_str(lines), 7)} {c_rjust(int_to_str(words), 7)} {c_rjust(int_to_str(bytes), 7)} {path}");
+    println(f"longest word: {longest}");
+    return 0;
+}
+
+// --- c2fd helpers: the C library behaviour this translation relies on ---
+
+const EOF: i64 = -1;
+
+fn c_isspace(c: i64) -> bool {
+    return c == ' ' || (c >= 9 && c <= 13);
+}
+
+/// printf's width: s right-aligned in w columns.
+fn c_rjust(s: str, w: i64) -> str {
+    var out: str = s;
+    while str_len(out) < w {
+        out = " " + out;
+    }
+    return out;
+}
+
+/// A FILE* opened for reading: c_fopen reads the whole file.
+struct CFile {
+    data: str,
+    pos: i64,
+    ok: bool,
+}
+
+/// No file (a NULL FILE*).
+fn c_nofile() -> CFile {
+    return CFile { data: "", pos: 0, ok: false };
+}
+
+/// fopen: reading only ("r", "rb"); `ok` is false where C gives NULL.
+fn c_fopen(path: str, mode: str) -> CFile {
+    if !str_starts_with(mode, "r") {
+        return c_nofile();
+    }
+    match read_file(path) {
+        Option::Some(d) => {
+            return CFile { data: d, pos: 0, ok: true };
+        }
+        Option::None => {
+            return c_nofile();
+        }
+    }
+}
+
+fn c_fclose(f: &mut CFile) {
+    f.ok = false;
+}
+
+/// fgetc: the next byte, or EOF (-1).
+fn c_fgetc(f: &mut CFile) -> i64 {
+    if f.pos >= str_len(f.data) {
+        return -1;
+    }
+    val c: i64 = str_byte_at(f.data, f.pos);
+    f.pos += 1;
+    return c;
+}
+
+fn c_feof(f: &mut CFile) -> bool {
+    return f.pos >= str_len(f.data);
+}
+
+/// fgets: up to n - 1 bytes, through the next newline; a null str at the end.
+fn c_fgets(f: &mut CFile, n: i64) -> str {
+    if f.pos >= str_len(f.data) {
+        return 0 as str;
+    }
+    var end: i64 = f.pos;
+    while end < str_len(f.data) && end - f.pos < n - 1 {
+        end += 1;
+        if str_byte_at(f.data, end - 1) == '\n' {
+            break;
+        }
+    }
+    val line: str = str_slice(f.data, f.pos, end);
+    f.pos = end;
+    return line;
+}
+
+/// The program's arguments, argv[0] first. Under `fid run file.fd args`
+/// the arguments of fid itself come first: they are skipped.
+fn c_args() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    val a1: str = arg_at(1).unwrap_or("");
+    val a2: str = arg_at(2).unwrap_or("");
+    if a1 == "run" && str_ends_with(a2, ".fd") {
+        out.push(a2);
+        i = 3;
+    } else {
+        out.push(arg_at(0).unwrap_or("program"));
+    }
+    while true {
+        match arg_at(i) {
+            Option::Some(a) => {
+                out.push(a);
+            }
+            Option::None => {
+                break;
+            }
+        }
+        i += 1;
+    }
+    return out;
+}

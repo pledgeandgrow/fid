@@ -1,0 +1,87 @@
+// known-bugs 2g.56: `for x in v` with `v: &Vec<i64>` typed `x` as
+// `&Vec<i64>` (so `t + x` was rejected: "arithmetic requires numeric
+// types"), and the loop read the slot the reference points at as the Vec:
+// its header words and a runaway length. Now a borrowed Vec, `&mut Vec`,
+// `&v` of a local and a borrowed HashMap iterate over their elements, as
+// `for x in *v` does.
+//
+// Expected output:
+// sum 7
+// deref 7
+// a
+// bc
+// strs 3
+// local 7
+// bump 4 5
+// keys 2 30
+use core;
+
+fn sum(v: &Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    for x in v {
+        t = t + x;
+    }
+    return t;
+}
+
+fn sum_deref(v: &Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    for x in *v {
+        t = t + x;
+    }
+    return t;
+}
+
+fn total_len(v: &Vec<str>) -> i64 {
+    var n: i64 = 0;
+    for s in v {
+        println(s);
+        n = n + str_len(s);
+    }
+    return n;
+}
+
+fn bump(v: &mut Vec<i64>) -> i64 {
+    var m: i64 = 0;
+    for x in v {
+        if x > m {
+            m = x;
+        }
+    }
+    v.push(m + 1);
+    return m;
+}
+
+fn key_count(m: &HashMap<str, i64>) -> i64 {
+    var n: i64 = 0;
+    for k in m {
+        if str_len(k) > 0 {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    v.push(4);
+    println("sum " + int_to_str(sum(&v)));
+    println("deref " + int_to_str(sum_deref(&v)));
+    var w: Vec<str> = Vec::new();
+    w.push("a");
+    w.push("bc");
+    println("strs " + int_to_str(total_len(&w)));
+    var t: i64 = 0;
+    for x in &v {
+        t = t + x;
+    }
+    println("local " + int_to_str(t));
+    val m = bump(&mut v);
+    println("bump " + int_to_str(m) + " " + int_to_str(v.get(2)));
+    var h: HashMap<str, i64> = HashMap::new();
+    h.insert("x", 10);
+    h.insert("y", 20);
+    println("keys " + int_to_str(key_count(&h)) + " " + int_to_str(h.get("x") + h.get("y")));
+    return 0;
+}

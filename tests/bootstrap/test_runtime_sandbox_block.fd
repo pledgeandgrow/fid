@@ -1,0 +1,104 @@
+// Roadmap Phase 12 (run-time sandbox): lowering puts p_sandbox_enter() and
+// p_sandbox_exit() around `sandbox { }` (compiler/lower.fd
+// Lowerer_lower_sandbox). Under `fid run` every capability is revoked in
+// between, so each way out of the block must lift it again, or the
+// printing after it would stop the program: the normal end, `return`,
+// `?`, `break` and `continue`, and nested blocks. Compiled programs call
+// core's no-op p_sandbox_enter/exit and print the same.
+// Expected output:
+//   end 7
+//   early 10
+//   late 2
+//   loop 8
+//   try 21
+//   try none
+//   nested 9
+//   done
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn half(x: i64) -> Option<i64> {
+    if x % 2 == 0 {
+        return Option::Some(x / 2);
+    }
+    return Option::None;
+}
+
+fn early(n: i64) -> i64 {
+    sandbox {
+        if n > 3 {
+            return twice(n);
+        }
+    }
+    return n;
+}
+
+fn loop_exits() -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        i = i + 1;
+        sandbox {
+            if i == 2 {
+                continue;
+            }
+            if i == 5 {
+                break;
+            }
+            total = total + i;
+        }
+    }
+    return total;
+}
+
+fn try_exit(x: i64) -> Option<i64> {
+    var r: i64 = 0;
+    sandbox {
+        val h: i64 = half(x)?;
+        r = h + 1;
+    }
+    return Option::Some(r);
+}
+
+fn nested(n: i64) -> i64 {
+    var r: i64 = 0;
+    sandbox {
+        r = n + 1;
+        sandbox {
+            r = r * 3;
+        }
+        r = r + 3;
+    }
+    return r;
+}
+
+fn main() {
+    var a: i64 = 0;
+    sandbox {
+        a = twice(3) + 1;
+    }
+    println("end " + int_to_str(a));
+    println("early " + int_to_str(early(5)));
+    println("late " + int_to_str(early(2)));
+    println("loop " + int_to_str(loop_exits()));
+    match try_exit(40) {
+        Option::Some(v) => {
+            println("try " + int_to_str(v));
+        }
+        Option::None => {
+            println("try none");
+        }
+    }
+    match try_exit(7) {
+        Option::Some(v) => {
+            println("try " + int_to_str(v));
+        }
+        Option::None => {
+            println("try none");
+        }
+    }
+    println("nested " + int_to_str(nested(1)));
+    println("done");
+}

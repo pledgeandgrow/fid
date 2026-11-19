@@ -52,6 +52,17 @@ pub struct StreamManager {
 /// Create a new stream manager.
 /// chunk_size = pixel dimensions of each chunk (e.g., 32 or 64).
 /// view_radius = number of chunks to keep loaded in each direction from focus.
+///
+/// Example:
+///   var m = streaming_create(32, 1);
+///   val (cx, cy) = streaming_world_to_chunk(m, 70, 10);
+///   assert_eq(cx, 2);
+///   assert_eq(cy, 0);
+///   streaming_set_focus(&mut m, 0, 0);
+///   streaming_update(&mut m);
+///   assert(streaming_is_chunk_loaded(m, 0, 0));
+///   assert(!streaming_is_chunk_loaded(m, 5, 5));
+///   assert(streaming_loaded_count(m) > 0);
 pub fn streaming_create(chunk_size: i64, view_radius: i64) -> StreamManager {
     return StreamManager {
         chunk_size: chunk_size, view_radius: view_radius, focus_x: 0, focus_y: 0, chunks: Vec::new(), tick: 0, load_count: 0, unload_count: 0,
@@ -150,27 +161,31 @@ pub fn streaming_update(mgr: & mut StreamManager) -> i64 {
             mgr.load_count = mgr.load_count + 1;
             changes = changes + 1;
         } else {
-            // Update last_used for existing loaded chunk
+            // Re-entering the radius reloads an unloaded chunk; an already
+            // loaded one just gets its last_used touched.
             var c = mgr.chunks.get(idx);
-            if c.state == 2 {  // Can't mutate in-place due to Vec API — mark via rebuild
-            // For now, just update last_used conceptually
+            c.last_used = mgr.tick;
+            if c.state != 2 {
+                c.state = 2;
+                mgr.load_count = mgr.load_count + 1;
+                changes = changes + 1;
             }
+            mgr.chunks.set(idx, c);
         }
         i = i + 2;
     }
 
-    // Unload chunks that are outside view radius
+    // Unload chunks that are outside view radius: mark state = 0 (the
+    // entry stays in the list with its data — re-entering the radius
+    // reloads it from memory, which is the intended cache behavior).
     var j = 0;
     while j < mgr.chunks.len() {
         var c = mgr.chunks.get(j);
         var dcx = c.cx - fcx;
         var dcy = c.cy - fcy;
-        if dcx * dcx + dcy * dcy > mgr.view_radius * mgr.view_radius {
-            // Chunk is outside view radius — unload it
-            // In a real engine, this would save to disk and free memory.
-            // Here we just mark it as unloaded (state = 0).
-            // Can't mutate in-place, so we skip (the chunk stays in the list
-            // but would be cleaned up in a real implementation).
+        if c.state == 2 && dcx * dcx + dcy * dcy > mgr.view_radius * mgr.view_radius {
+            c.state = 0;
+            mgr.chunks.set(j, c);
             mgr.unload_count = mgr.unload_count + 1;
             changes = changes + 1;
         }
@@ -246,8 +261,12 @@ pub fn streaming_set_chunk_data(mgr: & mut StreamManager, cx: i64, cy: i64, loca
     if local_x < 0 || local_x >= mgr.chunk_size || local_y < 0 || local_y >= mgr.chunk_size {
         return;
     }
-    // Note: Can't mutate Vec element directly with current API.
-    // In a real implementation, this would use mutable indexing.
+    var c = mgr.chunks.get(idx);
+    if c.state != 2 {
+        return;
+    }
+    c.data.set(local_y * mgr.chunk_size + local_x, value);
+    mgr.chunks.set(idx, c);
 }
 
 // ─── Statistics ───────────────────────────────────────────────────────────

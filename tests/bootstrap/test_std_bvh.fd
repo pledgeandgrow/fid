@@ -1,0 +1,206 @@
+// stdlib/bvh: Moller-Trumbore cases, SAH build invariants and cost against a median build, closest-hit/any-hit/box queries agree with brute force on a random triangle soup, refit after moving every vertex
+// Expected output:
+// mt: hit true t 1.0000 u 0.2000 v 0.3000
+// mt: parallel ray misses true, behind the origin misses true, outside misses true
+// build: boxes nest true, every triangle once true, leaves hold <= 4: true
+// build: SAH cost below median-split cost: true
+// closest: 100/100 rays agree with brute force, some hit: true
+// any: 100/100 agree, shadow ray stops short of a hit: true
+// box query: 20/20 boxes agree with brute force
+// refit: boxes nest true, 100/100 rays agree
+use bvh;
+
+var seed: i64 = 2024;
+
+@wrapping
+fn rnd() -> f64 {
+    seed = (seed * 6364136223846793005 + 1442695040888963407) & 0x7FFFFFFFFFFFFFFF;
+    return ((seed >> 11) as f64) / 4503599627370496.0;
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn f4(x: f64) -> str {
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val v: i64 = (a * 10000.0 + 0.5) as i64;
+    var fr: str = int_to_str(v % 10000);
+    while str_len(fr) < 4 { fr = "0" + fr; }
+    var out: str = int_to_str(v / 10000) + "." + fr;
+    if neg && v != 0 { out = "-" + out; }
+    return out;
+}
+
+fn tri_box(pos: &Vec<f64>, t: i64, k: i64, lo: bool) -> f64 {
+    var v: f64 = pos.get(9 * t + k);
+    var j: i64 = 1;
+    while j < 3 {
+        val w: f64 = pos.get(9 * t + 3 * j + k);
+        if (lo && w < v) || (!lo && w > v) { v = w; }
+        j = j + 1;
+    }
+    return v;
+}
+
+fn rays_agree(m: &BvhMesh, n: i64) -> i64 {
+    var ok: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val ox: f64 = rnd() * 24.0 - 2.0;
+        val oy: f64 = rnd() * 24.0 - 2.0;
+        val oz: f64 = rnd() * 24.0 - 2.0;
+        val dx: f64 = rnd() * 2.0 - 1.0;
+        val dy: f64 = rnd() * 2.0 - 1.0;
+        val dz: f64 = rnd() * 2.0 - 1.0;
+        val a: BvhHit = bvh_mesh_closest(m, ox, oy, oz, dx, dy, dz, 1000.0);
+        val b: BvhHit = bvh_mesh_closest_brute(m, ox, oy, oz, dx, dy, dz, 1000.0);
+        if a.hit == b.hit && (!a.hit || (a.prim == b.prim && a.t == b.t)) { ok = ok + 1; }
+        i = i + 1;
+    }
+    return ok;
+}
+
+fn main() {
+    // ── Moller-Trumbore
+    val r: BvhRay = bvh_ray(0.2, 0.3, 0.0 - 1.0, 0.0, 0.0, 1.0);
+    val h: BvhHit = bvh_ray_triangle(&r, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 100.0);
+    println("mt: hit " + yes(h.hit) + " t " + f4(h.t) + " u " + f4(h.u) + " v " + f4(h.v));
+    val rp: BvhRay = bvh_ray(0.2, 0.3, 1.0, 1.0, 0.0, 0.0);
+    val rb: BvhRay = bvh_ray(0.2, 0.3, 1.0, 0.0, 0.0, 1.0);
+    val ro: BvhRay = bvh_ray(0.8, 0.8, 0.0 - 1.0, 0.0, 0.0, 1.0);
+    println("mt: parallel ray misses " + yes(!bvh_ray_triangle(&rp, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 100.0).hit) + ", behind the origin misses " + yes(!bvh_ray_triangle(&rb, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 100.0).hit) + ", outside misses " + yes(!bvh_ray_triangle(&ro, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 100.0).hit));
+
+    // ── a soup of 120 small triangles in a 20^3 box
+    var pos: Vec<f64> = Vec::new();
+    var idx: Vec<i64> = Vec::new();
+    var t: i64 = 0;
+    while t < 120 {
+        val cx: f64 = rnd() * 20.0;
+        val cy: f64 = rnd() * 20.0;
+        val cz: f64 = rnd() * 20.0;
+        var k: i64 = 0;
+        while k < 3 {
+            pos.push(cx + rnd() * 3.0 - 1.5);
+            pos.push(cy + rnd() * 3.0 - 1.5);
+            pos.push(cz + rnd() * 3.0 - 1.5);
+            idx.push(3 * t + k);
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+    var m: BvhMesh = bvh_mesh_new(pos, idx, 4);
+    var seen: Vec<i64> = Vec::filled(120, 0);
+    var i: i64 = 0;
+    while i < m.tree.order.len() {
+        seen.set(m.tree.order.get(i), seen.get(m.tree.order.get(i)) + 1);
+        i = i + 1;
+    }
+    var once: bool = m.tree.order.len() == 120;
+    i = 0;
+    while i < 120 {
+        if seen.get(i) != 1 { once = false; }
+        i = i + 1;
+    }
+    var small: bool = true;
+    i = 0;
+    while i < bvh_node_count(&m.tree) {
+        if bvh_is_leaf(&m.tree, i) && m.tree.count.get(i) > 4 { small = false; }
+        i = i + 1;
+    }
+    println("build: boxes nest " + yes(bvh_check(&m.tree)) + ", every triangle once " + yes(once) + ", leaves hold <= 4: " + yes(small));
+    var bmn: Vec<f64> = Vec::new();
+    var bmx: Vec<f64> = Vec::new();
+    t = 0;
+    while t < 120 {
+        var k: i64 = 0;
+        while k < 3 {
+            bmn.push(tri_box(&pos, t, k, true));
+            bmx.push(tri_box(&pos, t, k, false));
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+    val med: Bvh = bvh_build_median(bmn, bmx, 4);
+    println("build: SAH cost below median-split cost: " + yes(bvh_sah_cost(&m.tree) < bvh_sah_cost(&med)));
+
+    // ── rays
+    val saved: i64 = seed;
+    var hits: i64 = 0;
+    i = 0;
+    while i < 100 {
+        val ox: f64 = rnd() * 24.0 - 2.0;
+        val oy: f64 = rnd() * 24.0 - 2.0;
+        val oz: f64 = rnd() * 24.0 - 2.0;
+        val dx: f64 = rnd() * 2.0 - 1.0;
+        val dy: f64 = rnd() * 2.0 - 1.0;
+        val dz: f64 = rnd() * 2.0 - 1.0;
+        if bvh_mesh_closest_brute(&m, ox, oy, oz, dx, dy, dz, 1000.0).hit { hits = hits + 1; }
+        i = i + 1;
+    }
+    seed = saved;
+    println("closest: " + int_to_str(rays_agree(&m, 100)) + "/100 rays agree with brute force, some hit: " + yes(hits > 0));
+    var any_ok: i64 = 0;
+    var short_ok: bool = false;
+    i = 0;
+    while i < 100 {
+        val ox: f64 = rnd() * 24.0 - 2.0;
+        val oy: f64 = rnd() * 24.0 - 2.0;
+        val oz: f64 = rnd() * 24.0 - 2.0;
+        val dx: f64 = rnd() * 2.0 - 1.0;
+        val dy: f64 = rnd() * 2.0 - 1.0;
+        val dz: f64 = rnd() * 2.0 - 1.0;
+        val b: BvhHit = bvh_mesh_closest_brute(&m, ox, oy, oz, dx, dy, dz, 1000.0);
+        if bvh_mesh_any(&m, ox, oy, oz, dx, dy, dz, 1000.0) == b.hit { any_ok = any_ok + 1; }
+        if b.hit && !bvh_mesh_any(&m, ox, oy, oz, dx, dy, dz, b.t * 0.999) && !short_ok {
+            // only true when nothing else lies before the closest hit
+            short_ok = true;
+        }
+        i = i + 1;
+    }
+    println("any: " + int_to_str(any_ok) + "/100 agree, shadow ray stops short of a hit: " + yes(short_ok));
+
+    // ── box queries
+    var q_ok: i64 = 0;
+    i = 0;
+    while i < 20 {
+        val x0: f64 = rnd() * 20.0;
+        val y0: f64 = rnd() * 20.0;
+        val z0: f64 = rnd() * 20.0;
+        val s: f64 = rnd() * 6.0;
+        val got: Vec<i64> = bvh_query_aabb(&m.tree, x0, y0, z0, x0 + s, y0 + s, z0 + s);
+        var want: i64 = 0;
+        var good: bool = true;
+        t = 0;
+        while t < 120 {
+            val ov: bool = !(bmn.get(3 * t) > x0 + s || bmx.get(3 * t) < x0 || bmn.get(3 * t + 1) > y0 + s || bmx.get(3 * t + 1) < y0 || bmn.get(3 * t + 2) > z0 + s || bmx.get(3 * t + 2) < z0);
+            if ov {
+                want = want + 1;
+                var found: bool = false;
+                var j: i64 = 0;
+                while j < got.len() {
+                    if got.get(j) == t { found = true; }
+                    j = j + 1;
+                }
+                if !found { good = false; }
+            }
+            t = t + 1;
+        }
+        if good && want == got.len() { q_ok = q_ok + 1; }
+        i = i + 1;
+    }
+    println("box query: " + int_to_str(q_ok) + "/20 boxes agree with brute force");
+
+    // ── move every vertex, refit, test again
+    var moved: Vec<f64> = Vec::new();
+    i = 0;
+    while i < pos.len() {
+        moved.push(pos.get(i) * 0.9 + rnd() * 2.0);
+        i = i + 1;
+    }
+    bvh_mesh_refit(&mut m, moved);
+    println("refit: boxes nest " + yes(bvh_check(&m.tree)) + ", " + int_to_str(rays_agree(&m, 100)) + "/100 rays agree");
+}

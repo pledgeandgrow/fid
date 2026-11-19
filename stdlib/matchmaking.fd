@@ -1,0 +1,1161 @@
+// Fides matchmaking: game lobbies with host migration, Elo and Glicko-2
+// ratings, a skill-based matchmaking queue with a widening search window,
+// and NAT traversal helpers: a STUN message codec (RFC 5389: binding
+// requests and responses, XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY with
+// HMAC-SHA1, FINGERPRINT with CRC-32), NAT mapping classification
+// (RFC 4787 terms) and ICE candidate/pair priorities (RFC 8445).
+//
+// All of it is pure computation, real and complete; SHA-1, HMAC-SHA1 and
+// CRC-32 are implemented here (no dependency on other modules). The seam:
+// STUN messages are bytes (Vec<i64>, 0..255) that the caller sends to and
+// receives from a STUN server over UDP itself (stdlib net); the
+// transaction id (12 bytes) is supplied by the caller and should come from
+// a cryptographic random source.
+//
+// Glicko-2 follows Glickman, "Example of the Glicko-2 system" (2013),
+// including the Illinois iteration for the volatility; the paper's worked
+// example (r 1500, RD 200, sigma 0.06, tau 0.5, three games) gives
+// r' 1464.06, RD' 151.52, sigma' 0.05999 from rounded intermediates; unrounded
+// 1464.0507, 151.5165, 0.059996 (checked in the test). The STUN
+// codec is checked against the RFC 5769 test vectors.
+//
+// Usage:
+//   use matchmaking;
+//   var lob: MmLobbies = mm_lobbies_new();
+//   val id: i64 = mm_lobby_create(&mut lob, 7, "duel", 2);
+//   mm_lobby_join(&mut lob, id, 9);
+//   val g: Glicko2 = glicko2_update(me, opponents, scores, 0.5);
+//   val req: Vec<i64> = stun_binding_request(txid, Vec::new(), true);
+
+module matchmaking;
+use vec;
+use math;
+
+// ─── Lobbies ───────────────────────────────────────────────────────────────
+
+pub struct MmLobby {
+    pub id: i64,
+    pub name: str,
+    pub host: i64,
+    /// Players in join order; the host is one of them.
+    pub members: Vec<i64>,
+    pub max_players: i64,
+    pub open: bool,
+}
+
+pub struct MmLobbies {
+    pub lobbies: Vec<MmLobby>,
+    pub next_id: i64,
+}
+
+/// What a player leaving did to its lobby.
+pub struct MmLeave {
+    pub ok: bool,
+    pub closed: bool,
+    pub host_changed: bool,
+    pub new_host: i64,
+}
+
+pub fn mm_lobbies_new() -> MmLobbies {
+    return MmLobbies { lobbies: Vec::new(), next_id: 1 };
+}
+
+fn mm_lobby_index(l: &MmLobbies, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < l.lobbies.len() {
+        if l.lobbies.get(i).id == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The lobby a player is in, or -1.
+pub fn mm_lobby_of(l: &MmLobbies, player: i64) -> i64 {
+    var i: i64 = 0;
+    while i < l.lobbies.len() {
+        val lb: MmLobby = l.lobbies.get(i);
+        var k: i64 = 0;
+        while k < lb.members.len() {
+            if lb.members.get(k) == player {
+                return lb.id;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Create a lobby hosted by `host`; returns its id, or -1 when the host is
+/// already in a lobby or max_players < 1.
+pub fn mm_lobby_create(l: &mut MmLobbies, host: i64, name: str, max_players: i64) -> i64 {
+    if max_players < 1 || mm_lobby_of(l, host) >= 0 {
+        return - 1;
+    }
+    val id: i64 = l.next_id;
+    l.next_id = id + 1;
+    var members: Vec<i64> = Vec::new();
+    members.push(host);
+    l.lobbies.push(MmLobby { id: id, name: name, host: host, members: members, max_players: max_players, open: true });
+    return id;
+}
+
+pub fn mm_lobby_get(l: &MmLobbies, id: i64) -> Option<MmLobby> {
+    val i: i64 = mm_lobby_index(l, id);
+    if i < 0 {
+        return Option::None;
+    }
+    return Option::Some(l.lobbies.get(i));
+}
+
+/// Join a lobby. Err says why not.
+pub fn mm_lobby_join(l: &mut MmLobbies, id: i64, player: i64) -> Result<i64, str> {
+    val i: i64 = mm_lobby_index(l, id);
+    if i < 0 {
+        return Result::Err("no such lobby");
+    }
+    val in_lobby: i64 = mm_lobby_of(l, player);
+    if in_lobby == id {
+        return Result::Err("already in this lobby");
+    }
+    if in_lobby >= 0 {
+        return Result::Err("already in another lobby");
+    }
+    var lb: MmLobby = l.lobbies.get(i);
+    if !lb.open {
+        return Result::Err("lobby closed");
+    }
+    if lb.members.len() >= lb.max_players {
+        return Result::Err("lobby full");
+    }
+    lb.members.push(player);
+    l.lobbies.set(i, lb);
+    return Result::Ok(lb.members.len());
+}
+
+/// Leave a lobby. When the host leaves, the longest-present member becomes
+/// host; when the last member leaves, the lobby closes and is removed.
+pub fn mm_lobby_leave(l: &mut MmLobbies, id: i64, player: i64) -> MmLeave {
+    var r: MmLeave = MmLeave { ok: false, closed: false, host_changed: false, new_host: - 1 };
+    val i: i64 = mm_lobby_index(l, id);
+    if i < 0 {
+        return r;
+    }
+    var lb: MmLobby = l.lobbies.get(i);
+    var k: i64 = 0;
+    var at: i64 = - 1;
+    while k < lb.members.len() {
+        if lb.members.get(k) == player {
+            at = k;
+        }
+        k = k + 1;
+    }
+    if at < 0 {
+        return r;
+    }
+    r.ok = true;
+    lb.members.remove(at);
+    if lb.members.len() == 0 {
+        l.lobbies.remove(i);
+        r.closed = true;
+        return r;
+    }
+    if lb.host == player {
+        lb.host = lb.members.get(0);
+        r.host_changed = true;
+    }
+    r.new_host = lb.host;
+    l.lobbies.set(i, lb);
+    return r;
+}
+
+/// The host removes a member (not itself).
+pub fn mm_lobby_kick(l: &mut MmLobbies, id: i64, by: i64, player: i64) -> Result<i64, str> {
+    val i: i64 = mm_lobby_index(l, id);
+    if i < 0 {
+        return Result::Err("no such lobby");
+    }
+    if l.lobbies.get(i).host != by {
+        return Result::Err("only the host can kick");
+    }
+    if player == by {
+        return Result::Err("the host cannot kick itself");
+    }
+    val r: MmLeave = mm_lobby_leave(l, id, player);
+    if !r.ok {
+        return Result::Err("not a member");
+    }
+    return Result::Ok(player);
+}
+
+/// Open or close a lobby to new players (host only).
+pub fn mm_lobby_set_open(l: &mut MmLobbies, id: i64, by: i64, open: bool) -> bool {
+    val i: i64 = mm_lobby_index(l, id);
+    if i < 0 || l.lobbies.get(i).host != by {
+        return false;
+    }
+    var lb: MmLobby = l.lobbies.get(i);
+    lb.open = open;
+    l.lobbies.set(i, lb);
+    return true;
+}
+
+/// Ids of open lobbies with a free slot, in creation order.
+pub fn mm_lobby_list_joinable(l: &MmLobbies) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < l.lobbies.len() {
+        val lb: MmLobby = l.lobbies.get(i);
+        if lb.open && lb.members.len() < lb.max_players {
+            out.push(lb.id);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Elo ───────────────────────────────────────────────────────────────────
+
+/// Expected score of a player rated ra against rb.
+pub fn elo_expected(ra: f64, rb: f64) -> f64 {
+    return 1.0 / (1.0 + math_pow(10.0, (rb - ra) / 400.0));
+}
+
+/// New rating after scoring `score` (1 win, 0.5 draw, 0 loss) against rb.
+pub fn elo_update(ra: f64, rb: f64, score: f64, k: f64) -> f64 {
+    return ra + k * (score - elo_expected(ra, rb));
+}
+
+// ─── Glicko-2 ──────────────────────────────────────────────────────────────
+
+pub struct Glicko2 {
+    pub rating: f64,
+    pub rd: f64,
+    pub vol: f64,
+}
+
+pub const GLICKO2_SCALE: f64 = 173.7178;
+
+pub fn glicko2_new() -> Glicko2 {
+    return Glicko2 { rating: 1500.0, rd: 350.0, vol: 0.06 };
+}
+
+fn mm_g(phi: f64) -> f64 {
+    val pi: f64 = 3.141592653589793;
+    return 1.0 / math_sqrt(1.0 + 3.0 * phi * phi / (pi * pi));
+}
+
+fn mm_e(mu: f64, mu_j: f64, phi_j: f64) -> f64 {
+    return 1.0 / (1.0 + math_exp(0.0 - mm_g(phi_j) * (mu - mu_j)));
+}
+
+fn mm_vol_f(x: f64, delta: f64, phi: f64, v: f64, a: f64, tau: f64) -> f64 {
+    val ex: f64 = math_exp(x);
+    val d: f64 = phi * phi + v + ex;
+    return ex * (delta * delta - phi * phi - v - ex) / (2.0 * d * d) - (x - a) / (tau * tau);
+}
+
+/// One rating period: `opps` the opponents' ratings before the period,
+/// `scores` the results against each (1, 0.5, 0). With no games the RD
+/// grows by the volatility. `tau` constrains volatility change (0.3..1.2).
+pub fn glicko2_update(p: Glicko2, opps: &Vec<Glicko2>, scores: &Vec<f64>, tau: f64) -> Glicko2 {
+    val mu: f64 = (p.rating - 1500.0) / GLICKO2_SCALE;
+    val phi: f64 = p.rd / GLICKO2_SCALE;
+    if opps.len() == 0 {
+        val pstar: f64 = math_sqrt(phi * phi + p.vol * p.vol);
+        return Glicko2 { rating: p.rating, rd: pstar * GLICKO2_SCALE, vol: p.vol };
+    }
+    var vinv: f64 = 0.0;
+    var dsum: f64 = 0.0;
+    var j: i64 = 0;
+    while j < opps.len() {
+        val o: Glicko2 = opps.get(j);
+        val mu_j: f64 = (o.rating - 1500.0) / GLICKO2_SCALE;
+        val phi_j: f64 = o.rd / GLICKO2_SCALE;
+        val g: f64 = mm_g(phi_j);
+        val e: f64 = mm_e(mu, mu_j, phi_j);
+        vinv = vinv + g * g * e * (1.0 - e);
+        dsum = dsum + g * (scores.get(j) - e);
+        j = j + 1;
+    }
+    val v: f64 = 1.0 / vinv;
+    val delta: f64 = v * dsum;
+    // volatility by the Illinois algorithm
+    val a: f64 = math_log(p.vol * p.vol);
+    val eps: f64 = 0.000001;
+    var big_a: f64 = a;
+    var big_b: f64 = 0.0;
+    if delta * delta > phi * phi + v {
+        big_b = math_log(delta * delta - phi * phi - v);
+    } else {
+        var k: f64 = 1.0;
+        while mm_vol_f(a - k * tau, delta, phi, v, a, tau) < 0.0 {
+            k = k + 1.0;
+        }
+        big_b = a - k * tau;
+    }
+    var fa: f64 = mm_vol_f(big_a, delta, phi, v, a, tau);
+    var fb: f64 = mm_vol_f(big_b, delta, phi, v, a, tau);
+    var iter: i64 = 0;
+    while math_fabs(big_b - big_a) > eps && iter < 200 {
+        val c: f64 = big_a + (big_a - big_b) * fa / (fb - fa);
+        val fc: f64 = mm_vol_f(c, delta, phi, v, a, tau);
+        if fc * fb <= 0.0 {
+            big_a = big_b;
+            fa = fb;
+        } else {
+            fa = fa / 2.0;
+        }
+        big_b = c;
+        fb = fc;
+        iter = iter + 1;
+    }
+    val vol2: f64 = math_exp(big_a / 2.0);
+    val pstar: f64 = math_sqrt(phi * phi + vol2 * vol2);
+    val phi2: f64 = 1.0 / math_sqrt(1.0 / (pstar * pstar) + 1.0 / v);
+    val mu2: f64 = mu + phi2 * phi2 * dsum;
+    return Glicko2 { rating: mu2 * GLICKO2_SCALE + 1500.0, rd: phi2 * GLICKO2_SCALE, vol: vol2 };
+}
+
+/// Glicko-2 expected score of a against b (both uncertainties).
+pub fn glicko2_expected(a: Glicko2, b: Glicko2) -> f64 {
+    val mu: f64 = (a.rating - 1500.0) / GLICKO2_SCALE;
+    val mu_b: f64 = (b.rating - 1500.0) / GLICKO2_SCALE;
+    val pa: f64 = a.rd / GLICKO2_SCALE;
+    val pb: f64 = b.rd / GLICKO2_SCALE;
+    return mm_e(mu, mu_b, math_sqrt(pa * pa + pb * pb));
+}
+
+// ─── Matchmaking queue ─────────────────────────────────────────────────────
+
+pub struct MmEntry {
+    pub player: i64,
+    pub rating: f64,
+    pub since: i64,
+}
+
+pub struct MmMatch {
+    pub players: Vec<i64>,
+    pub team_a: Vec<i64>,
+    pub team_b: Vec<i64>,
+    /// Highest minus lowest rating in the match.
+    pub spread: f64,
+    /// Team rating sums, a minus b.
+    pub balance: f64,
+}
+
+/// Players wait until a group of `match_size` fits inside every member's
+/// window: `base + widen * waited`, at most `max_window` rating points.
+pub struct MmQueue {
+    pub entries: Vec<MmEntry>,
+    pub match_size: i64,
+    pub base: f64,
+    pub widen: f64,
+    pub max_window: f64,
+}
+
+pub fn mm_queue_new(match_size: i64, base: f64, widen: f64, max_window: f64) -> MmQueue {
+    return MmQueue { entries: Vec::new(), match_size: match_size, base: base, widen: widen, max_window: max_window };
+}
+
+/// Enqueue; false when the player is already waiting.
+pub fn mm_queue_add(q: &mut MmQueue, player: i64, rating: f64, now: i64) -> bool {
+    var i: i64 = 0;
+    while i < q.entries.len() {
+        if q.entries.get(i).player == player {
+            return false;
+        }
+        i = i + 1;
+    }
+    q.entries.push(MmEntry { player: player, rating: rating, since: now });
+    return true;
+}
+
+pub fn mm_queue_remove(q: &mut MmQueue, player: i64) -> bool {
+    var i: i64 = 0;
+    while i < q.entries.len() {
+        if q.entries.get(i).player == player {
+            q.entries.remove(i);
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A waiting player's current window.
+pub fn mm_queue_window(q: &MmQueue, e: MmEntry, now: i64) -> f64 {
+    var w: f64 = q.base + q.widen * ((now - e.since) as f64);
+    if w > q.max_window {
+        w = q.max_window;
+    }
+    return w;
+}
+
+/// Form every match possible now. Players are taken in rating order; the
+/// group with the longest waiter goes first among overlapping candidates.
+/// Teams are a snake draft (best to A, next two to B, ...).
+pub fn mm_queue_tick(q: &mut MmQueue, now: i64) -> Vec<MmMatch> {
+    var out: Vec<MmMatch> = Vec::new();
+    val n: i64 = q.match_size;
+    if n < 1 {
+        return out;
+    }
+    while true {
+        // sort by rating (then by join time) — insertion sort, queues are small
+        var es: Vec<MmEntry> = q.entries;
+        var i: i64 = 1;
+        while i < es.len() {
+            val x: MmEntry = es.get(i);
+            var j: i64 = i - 1;
+            while j >= 0 && (es.get(j).rating > x.rating || (es.get(j).rating == x.rating && es.get(j).since > x.since)) {
+                es.set(j + 1, es.get(j));
+                j = j - 1;
+            }
+            es.set(j + 1, x);
+            i = i + 1;
+        }
+        var best: i64 = - 1;
+        var best_wait: i64 = - 1;
+        var s: i64 = 0;
+        while s + n <= es.len() {
+            val spread: f64 = es.get(s + n - 1).rating - es.get(s).rating;
+            var ok: bool = true;
+            var oldest: i64 = now;
+            var k: i64 = s;
+            while k < s + n {
+                val e: MmEntry = es.get(k);
+                if spread > mm_queue_window(q, e, now) {
+                    ok = false;
+                }
+                if e.since < oldest {
+                    oldest = e.since;
+                }
+                k = k + 1;
+            }
+            if ok && now - oldest > best_wait {
+                best = s;
+                best_wait = now - oldest;
+            }
+            s = s + 1;
+        }
+        if best < 0 {
+            break;
+        }
+        var m: MmMatch = MmMatch { players: Vec::new(), team_a: Vec::new(), team_b: Vec::new(), spread: es.get(best + n - 1).rating - es.get(best).rating, balance: 0.0 };
+        var k: i64 = best + n - 1;
+        var pick: i64 = 0;
+        while k >= best {
+            val e: MmEntry = es.get(k);
+            m.players.push(e.player);
+            // snake: A B B A A B B A ...
+            if n == 1 || pick % 4 == 0 || pick % 4 == 3 {
+                m.team_a.push(e.player);
+                m.balance = m.balance + e.rating;
+            } else {
+                m.team_b.push(e.player);
+                m.balance = m.balance - e.rating;
+            }
+            mm_queue_remove(q, e.player);
+            pick = pick + 1;
+            k = k - 1;
+        }
+        out.push(m);
+    }
+    return out;
+}
+
+// ─── SHA-1, HMAC-SHA1, CRC-32 (local, for STUN) ────────────────────────────
+
+fn mm_rol(x: i64, n: i64) -> i64 {
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF;
+}
+
+/// SHA-1 (FIPS 180-4) of bytes.
+@wrapping
+pub fn mm_sha1(msg: &Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < msg.len() {
+        m.push(msg.get(i) & 255);
+        i = i + 1;
+    }
+    val bits: i64 = msg.len() * 8;
+    m.push(0x80);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    var k: i64 = 7;
+    while k >= 0 {
+        m.push((bits >> (8 * k)) & 255);
+        k = k - 1;
+    }
+    var h0: i64 = 0x67452301;
+    var h1: i64 = 0xEFCDAB89;
+    var h2: i64 = 0x98BADCFE;
+    var h3: i64 = 0x10325476;
+    var h4: i64 = 0xC3D2E1F0;
+    var w: Vec<i64> = Vec::filled(80, 0);
+    var blk: i64 = 0;
+    while blk < m.len() {
+        var t: i64 = 0;
+        while t < 16 {
+            val o: i64 = blk + 4 * t;
+            w.set(t, (m.get(o) << 24) | (m.get(o + 1) << 16) | (m.get(o + 2) << 8) | m.get(o + 3));
+            t = t + 1;
+        }
+        while t < 80 {
+            w.set(t, mm_rol(w.get(t - 3) ^ w.get(t - 8) ^ w.get(t - 14) ^ w.get(t - 16), 1));
+            t = t + 1;
+        }
+        var a: i64 = h0;
+        var b: i64 = h1;
+        var c: i64 = h2;
+        var d: i64 = h3;
+        var e: i64 = h4;
+        t = 0;
+        while t < 80 {
+            var f: i64 = 0;
+            var kk: i64 = 0;
+            if t < 20 {
+                f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+                kk = 0x5A827999;
+            } else if t < 40 {
+                f = b ^ c ^ d;
+                kk = 0x6ED9EBA1;
+            } else if t < 60 {
+                f = (b & c) | (b & d) | (c & d);
+                kk = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                kk = 0xCA62C1D6;
+            }
+            val tmp: i64 = (mm_rol(a, 5) + f + e + kk + w.get(t)) & 0xFFFFFFFF;
+            e = d;
+            d = c;
+            c = mm_rol(b, 30);
+            b = a;
+            a = tmp;
+            t = t + 1;
+        }
+        h0 = (h0 + a) & 0xFFFFFFFF;
+        h1 = (h1 + b) & 0xFFFFFFFF;
+        h2 = (h2 + c) & 0xFFFFFFFF;
+        h3 = (h3 + d) & 0xFFFFFFFF;
+        h4 = (h4 + e) & 0xFFFFFFFF;
+        blk = blk + 64;
+    }
+    var out: Vec<i64> = Vec::new();
+    var hs: Vec<i64> = Vec::new();
+    hs.push(h0); hs.push(h1); hs.push(h2); hs.push(h3); hs.push(h4);
+    i = 0;
+    while i < 5 {
+        val h: i64 = hs.get(i);
+        out.push((h >> 24) & 255);
+        out.push((h >> 16) & 255);
+        out.push((h >> 8) & 255);
+        out.push(h & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// HMAC-SHA1 (RFC 2104).
+pub fn mm_hmac_sha1(key: &Vec<i64>, msg: &Vec<i64>) -> Vec<i64> {
+    var k: Vec<i64> = Vec::new();
+    if key.len() > 64 {
+        k = mm_sha1(key);
+    } else {
+        var i: i64 = 0;
+        while i < key.len() {
+            k.push(key.get(i));
+            i = i + 1;
+        }
+    }
+    while k.len() < 64 {
+        k.push(0);
+    }
+    var inner: Vec<i64> = Vec::new();
+    var outer: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        inner.push(k.get(i) ^ 0x36);
+        outer.push(k.get(i) ^ 0x5c);
+        i = i + 1;
+    }
+    i = 0;
+    while i < msg.len() {
+        inner.push(msg.get(i));
+        i = i + 1;
+    }
+    val ih: Vec<i64> = mm_sha1(&inner);
+    i = 0;
+    while i < ih.len() {
+        outer.push(ih.get(i));
+        i = i + 1;
+    }
+    return mm_sha1(&outer);
+}
+
+var mm_crc_table: Vec<i64> = Vec::new();
+
+/// CRC-32 (IEEE 802.3, reflected, as zlib) of bytes[0..n).
+pub fn mm_crc32(bytes: &Vec<i64>, n: i64) -> i64 {
+    if mm_crc_table.len() != 256 {
+        var t: i64 = 0;
+        while t < 256 {
+            var c: i64 = t;
+            var k: i64 = 0;
+            while k < 8 {
+                if (c & 1) == 1 {
+                    c = 0xEDB88320 ^ (c >> 1);
+                } else {
+                    c = c >> 1;
+                }
+                k = k + 1;
+            }
+            mm_crc_table.push(c);
+            t = t + 1;
+        }
+    }
+    var c: i64 = 0xFFFFFFFF;
+    var i: i64 = 0;
+    while i < n {
+        c = mm_crc_table.get((c ^ bytes.get(i)) & 255) ^ (c >> 8);
+        i = i + 1;
+    }
+    return c ^ 0xFFFFFFFF;
+}
+
+// ─── STUN (RFC 5389) ───────────────────────────────────────────────────────
+
+pub const STUN_MAGIC: i64 = 0x2112A442;
+pub const STUN_FINGERPRINT_XOR: i64 = 0x5354554E;
+pub const STUN_METHOD_BINDING: i64 = 1;
+pub const STUN_CLASS_REQUEST: i64 = 0;
+pub const STUN_CLASS_INDICATION: i64 = 1;
+pub const STUN_CLASS_SUCCESS: i64 = 2;
+pub const STUN_CLASS_ERROR: i64 = 3;
+
+pub const STUN_ATTR_MAPPED_ADDRESS: i64 = 0x0001;
+pub const STUN_ATTR_USERNAME: i64 = 0x0006;
+pub const STUN_ATTR_MESSAGE_INTEGRITY: i64 = 0x0008;
+pub const STUN_ATTR_ERROR_CODE: i64 = 0x0009;
+pub const STUN_ATTR_UNKNOWN_ATTRIBUTES: i64 = 0x000A;
+pub const STUN_ATTR_REALM: i64 = 0x0014;
+pub const STUN_ATTR_NONCE: i64 = 0x0015;
+pub const STUN_ATTR_XOR_MAPPED_ADDRESS: i64 = 0x0020;
+pub const STUN_ATTR_PRIORITY: i64 = 0x0024;
+pub const STUN_ATTR_USE_CANDIDATE: i64 = 0x0025;
+pub const STUN_ATTR_SOFTWARE: i64 = 0x8022;
+pub const STUN_ATTR_ALTERNATE_SERVER: i64 = 0x8023;
+pub const STUN_ATTR_FINGERPRINT: i64 = 0x8028;
+pub const STUN_ATTR_ICE_CONTROLLED: i64 = 0x8029;
+pub const STUN_ATTR_ICE_CONTROLLING: i64 = 0x802A;
+
+pub struct StunAttr {
+    pub kind: i64,
+    pub value: Vec<i64>,
+}
+
+pub struct StunMsg {
+    pub method: i64,
+    pub class: i64,
+    pub txid: Vec<i64>,
+    pub attrs: Vec<StunAttr>,
+}
+
+/// A transport address. family 1 = IPv4 (4 bytes), 2 = IPv6 (16 bytes).
+pub struct StunAddr {
+    pub family: i64,
+    pub port: i64,
+    pub ip: Vec<i64>,
+}
+
+/// The 14-bit message type of a method and class.
+pub fn stun_type(method: i64, class: i64) -> i64 {
+    return (method & 0xF) | ((method & 0x70) << 1) | ((method & 0xF80) << 2) | ((class & 1) << 4) | ((class & 2) << 7);
+}
+
+pub fn stun_type_method(t: i64) -> i64 {
+    return (t & 0xF) | ((t >> 1) & 0x70) | ((t >> 2) & 0xF80);
+}
+
+pub fn stun_type_class(t: i64) -> i64 {
+    return ((t >> 4) & 1) | ((t >> 7) & 2);
+}
+
+pub fn stun_msg_new(method: i64, class: i64, txid: Vec<i64>) -> StunMsg {
+    return StunMsg { method: method, class: class, txid: txid, attrs: Vec::new() };
+}
+
+pub fn stun_add_attr(m: &mut StunMsg, kind: i64, value: Vec<i64>) {
+    m.attrs.push(StunAttr { kind: kind, value: value });
+}
+
+/// The first attribute of a kind (empty value and false when absent).
+pub fn stun_find_attr(m: &StunMsg, kind: i64) -> Option<Vec<i64>> {
+    var i: i64 = 0;
+    while i < m.attrs.len() {
+        if m.attrs.get(i).kind == kind {
+            return Option::Some(m.attrs.get(i).value);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn mm_put16(out: &mut Vec<i64>, v: i64) {
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn mm_put32(out: &mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn mm_get16(b: &Vec<i64>, at: i64) -> i64 {
+    return (b.get(at) << 8) | b.get(at + 1);
+}
+
+fn mm_get32(b: &Vec<i64>, at: i64) -> i64 {
+    return (b.get(at) << 24) | (b.get(at + 1) << 16) | (b.get(at + 2) << 8) | b.get(at + 3);
+}
+
+fn stun_put_attr(out: &mut Vec<i64>, kind: i64, v: &Vec<i64>, pad: i64) {
+    mm_put16(out, kind);
+    mm_put16(out, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i) & 255);
+        i = i + 1;
+    }
+    while out.len() % 4 != 0 {
+        out.push(pad);
+    }
+}
+
+fn stun_set_length(out: &mut Vec<i64>, len: i64) {
+    out.set(2, (len >> 8) & 255);
+    out.set(3, len & 255);
+}
+
+/// Encode a message. With a non-empty `key` a MESSAGE-INTEGRITY attribute
+/// is appended (key = the short-term password, or MD5(user:realm:pass) for
+/// long-term credentials), then FINGERPRINT when asked. Padding is zeros.
+pub fn stun_encode(m: &StunMsg, key: &Vec<i64>, fingerprint: bool) -> Vec<i64> {
+    return stun_encode_padded(m, key, fingerprint, 0);
+}
+
+/// stun_encode with attribute padding bytes of value `pad` (receivers must
+/// ignore padding; RFC 5769's vectors pad with spaces).
+pub fn stun_encode_padded(m: &StunMsg, key: &Vec<i64>, fingerprint: bool, pad: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    mm_put16(&mut out, stun_type(m.method, m.class));
+    mm_put16(&mut out, 0);
+    mm_put32(&mut out, STUN_MAGIC);
+    var i: i64 = 0;
+    while i < 12 {
+        out.push(m.txid.get(i) & 255);
+        i = i + 1;
+    }
+    i = 0;
+    while i < m.attrs.len() {
+        val a: StunAttr = m.attrs.get(i);
+        stun_put_attr(&mut out, a.kind, &a.value, pad);
+        i = i + 1;
+    }
+    if key.len() > 0 {
+        stun_set_length(&mut out, out.len() - 20 + 24);
+        val mac: Vec<i64> = mm_hmac_sha1(key, &out);
+        stun_put_attr(&mut out, STUN_ATTR_MESSAGE_INTEGRITY, &mac, pad);
+    }
+    if fingerprint {
+        stun_set_length(&mut out, out.len() - 20 + 8);
+        val crc: i64 = mm_crc32(&out, out.len()) ^ STUN_FINGERPRINT_XOR;
+        var fv: Vec<i64> = Vec::new();
+        mm_put32(&mut fv, crc);
+        stun_put_attr(&mut out, STUN_ATTR_FINGERPRINT, &fv, pad);
+    }
+    stun_set_length(&mut out, out.len() - 20);
+    return out;
+}
+
+/// Is this datagram a STUN message (RFC 5389 section 7.3: top bits zero,
+/// magic cookie, length a multiple of 4 matching the datagram)?
+pub fn stun_is_message(b: &Vec<i64>) -> bool {
+    if b.len() < 20 || (b.get(0) & 0xC0) != 0 {
+        return false;
+    }
+    val len: i64 = mm_get16(b, 2);
+    return len % 4 == 0 && len + 20 == b.len() && mm_get32(b, 4) == STUN_MAGIC;
+}
+
+/// Decode a message; attribute values are unpadded.
+pub fn stun_decode(b: &Vec<i64>) -> Result<StunMsg, str> {
+    if !stun_is_message(b) {
+        return Result::Err("not a STUN message");
+    }
+    val t: i64 = mm_get16(b, 0);
+    var txid: Vec<i64> = Vec::new();
+    var i: i64 = 8;
+    while i < 20 {
+        txid.push(b.get(i));
+        i = i + 1;
+    }
+    var m: StunMsg = stun_msg_new(stun_type_method(t), stun_type_class(t), txid);
+    var at: i64 = 20;
+    while at < b.len() {
+        if at + 4 > b.len() {
+            return Result::Err("truncated attribute header");
+        }
+        val kind: i64 = mm_get16(b, at);
+        val len: i64 = mm_get16(b, at + 2);
+        if at + 4 + len > b.len() {
+            return Result::Err("attribute runs past the message");
+        }
+        var v: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < len {
+            v.push(b.get(at + 4 + k));
+            k = k + 1;
+        }
+        m.attrs.push(StunAttr { kind: kind, value: v });
+        at = at + 4 + ((len + 3) / 4) * 4;
+    }
+    return Result::Ok(m);
+}
+
+// Offset of the first attribute of a kind in raw bytes, or -1.
+fn stun_attr_offset(b: &Vec<i64>, kind: i64) -> i64 {
+    var at: i64 = 20;
+    while at + 4 <= b.len() {
+        if mm_get16(b, at) == kind {
+            return at;
+        }
+        at = at + 4 + ((mm_get16(b, at + 2) + 3) / 4) * 4;
+    }
+    return - 1;
+}
+
+/// Check MESSAGE-INTEGRITY with `key`. False when absent or wrong.
+pub fn stun_check_integrity(b: &Vec<i64>, key: &Vec<i64>) -> bool {
+    if !stun_is_message(b) {
+        return false;
+    }
+    val at: i64 = stun_attr_offset(b, STUN_ATTR_MESSAGE_INTEGRITY);
+    if at < 0 || mm_get16(b, at + 2) != 20 || at + 24 > b.len() {
+        return false;
+    }
+    var part: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < at {
+        part.push(b.get(i));
+        i = i + 1;
+    }
+    stun_set_length(&mut part, at + 24 - 20);
+    val mac: Vec<i64> = mm_hmac_sha1(key, &part);
+    i = 0;
+    var diff: i64 = 0;
+    while i < 20 {
+        diff = diff | (mac.get(i) ^ b.get(at + 4 + i));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+/// Check FINGERPRINT (must be the last attribute). False when absent.
+pub fn stun_check_fingerprint(b: &Vec<i64>) -> bool {
+    if !stun_is_message(b) || b.len() < 28 {
+        return false;
+    }
+    val at: i64 = b.len() - 8;
+    if mm_get16(b, at) != STUN_ATTR_FINGERPRINT || mm_get16(b, at + 2) != 4 {
+        return false;
+    }
+    val crc: i64 = mm_crc32(b, at) ^ STUN_FINGERPRINT_XOR;
+    return crc == mm_get32(b, at + 4);
+}
+
+/// XOR-MAPPED-ADDRESS value for an address (txid is the message's).
+pub fn stun_xor_address_encode(a: &StunAddr, txid: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0);
+    out.push(a.family);
+    mm_put16(&mut out, a.port ^ (STUN_MAGIC >> 16));
+    var mask: Vec<i64> = Vec::new();
+    mm_put32(&mut mask, STUN_MAGIC);
+    var i: i64 = 0;
+    while i < 12 {
+        mask.push(txid.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < a.ip.len() {
+        out.push(a.ip.get(i) ^ mask.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Decode XOR-MAPPED-ADDRESS (xored true) or MAPPED-ADDRESS (false).
+pub fn stun_address_decode(v: &Vec<i64>, txid: &Vec<i64>, xored: bool) -> Result<StunAddr, str> {
+    if v.len() < 4 {
+        return Result::Err("address too short");
+    }
+    val fam: i64 = v.get(1);
+    var n: i64 = 0;
+    if fam == 1 {
+        n = 4;
+    } else if fam == 2 {
+        n = 16;
+    } else {
+        return Result::Err("unknown address family");
+    }
+    if v.len() != 4 + n {
+        return Result::Err("address length does not match its family");
+    }
+    var mask: Vec<i64> = Vec::new();
+    mm_put32(&mut mask, STUN_MAGIC);
+    var i: i64 = 0;
+    while i < 12 {
+        mask.push(txid.get(i));
+        i = i + 1;
+    }
+    var port: i64 = mm_get16(v, 2);
+    if xored {
+        port = port ^ (STUN_MAGIC >> 16);
+    }
+    var ip: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        if xored {
+            ip.push(v.get(4 + i) ^ mask.get(i));
+        } else {
+            ip.push(v.get(4 + i));
+        }
+        i = i + 1;
+    }
+    return Result::Ok(StunAddr { family: fam, port: port, ip: ip });
+}
+
+fn mm_hex4(v: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    if v == 0 {
+        return "0";
+    }
+    var s: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        s = byte_to_str(str_byte_at(digits, x & 15)) + s;
+        x = x >> 4;
+    }
+    return s;
+}
+
+/// "a.b.c.d:port" or "[v6]:port" (RFC 5952: longest run of two or more
+/// zero groups becomes "::").
+pub fn stun_addr_str(a: &StunAddr) -> str {
+    if a.family == 1 {
+        return int_to_str(a.ip.get(0)) + "." + int_to_str(a.ip.get(1)) + "." + int_to_str(a.ip.get(2)) + "." + int_to_str(a.ip.get(3)) + ":" + int_to_str(a.port);
+    }
+    var g: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        g.push((a.ip.get(2 * i) << 8) | a.ip.get(2 * i + 1));
+        i = i + 1;
+    }
+    var best: i64 = - 1;
+    var best_len: i64 = 1;
+    i = 0;
+    while i < 8 {
+        if g.get(i) == 0 {
+            var j: i64 = i;
+            while j < 8 && g.get(j) == 0 {
+                j = j + 1;
+            }
+            if j - i > best_len {
+                best = i;
+                best_len = j - i;
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    var s: str = "";
+    i = 0;
+    while i < 8 {
+        if i == best {
+            s = s + "::";
+            i = i + best_len;
+            continue;
+        }
+        if str_len(s) > 0 && !str_ends_with(s, ":") {
+            s = s + ":";
+        }
+        s = s + mm_hex4(g.get(i));
+        i = i + 1;
+    }
+    return "[" + s + "]:" + int_to_str(a.port);
+}
+
+/// A Binding request; `key` empty for none.
+pub fn stun_binding_request(txid: Vec<i64>, key: Vec<i64>, fingerprint: bool) -> Vec<i64> {
+    val m: StunMsg = stun_msg_new(STUN_METHOD_BINDING, STUN_CLASS_REQUEST, txid);
+    return stun_encode(&m, &key, fingerprint);
+}
+
+/// A Binding success response telling the client its reflexive address.
+pub fn stun_binding_response(txid: Vec<i64>, mapped: &StunAddr, software: str, key: Vec<i64>, fingerprint: bool) -> Vec<i64> {
+    var m: StunMsg = stun_msg_new(STUN_METHOD_BINDING, STUN_CLASS_SUCCESS, txid);
+    if str_len(software) > 0 {
+        stun_add_attr(&mut m, STUN_ATTR_SOFTWARE, str_bytes(software));
+    }
+    stun_add_attr(&mut m, STUN_ATTR_XOR_MAPPED_ADDRESS, stun_xor_address_encode(mapped, &m.txid));
+    return stun_encode(&m, &key, fingerprint);
+}
+
+/// An ERROR-CODE value (code 300..699, reason text).
+pub fn stun_error_code_encode(code: i64, reason: str) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0);
+    v.push(0);
+    v.push((code / 100) & 7);
+    v.push(code % 100);
+    val rb: Vec<i64> = str_bytes(reason);
+    var i: i64 = 0;
+    while i < rb.len() {
+        v.push(rb.get(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn stun_error_code_decode(v: &Vec<i64>) -> i64 {
+    if v.len() < 4 {
+        return - 1;
+    }
+    return (v.get(2) & 7) * 100 + v.get(3);
+}
+
+/// The reflexive address in a Binding success response: XOR-MAPPED-ADDRESS,
+/// or MAPPED-ADDRESS from an old (RFC 3489) server.
+pub fn stun_response_address(b: &Vec<i64>) -> Result<StunAddr, str> {
+    match stun_decode(b) {
+        Result::Ok(m) => {
+            if m.class != STUN_CLASS_SUCCESS {
+                return Result::Err("not a success response");
+            }
+            match stun_find_attr(&m, STUN_ATTR_XOR_MAPPED_ADDRESS) {
+                Option::Some(v) => {
+                    return stun_address_decode(&v, &m.txid, true);
+                }
+                Option::None => {
+                }
+            }
+            match stun_find_attr(&m, STUN_ATTR_MAPPED_ADDRESS) {
+                Option::Some(v) => {
+                    return stun_address_decode(&v, &m.txid, false);
+                }
+                Option::None => {
+                }
+            }
+            return Result::Err("no mapped address");
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+pub fn stun_addr_eq(a: &StunAddr, b: &StunAddr) -> bool {
+    if a.family != b.family || a.port != b.port || a.ip.len() != b.ip.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.ip.len() {
+        if a.ip.get(i) != b.ip.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ─── NAT behaviour and ICE priorities ──────────────────────────────────────
+
+pub const NAT_NONE: i64 = 0;
+pub const NAT_ENDPOINT_INDEPENDENT: i64 = 1;
+pub const NAT_ADDRESS_DEPENDENT: i64 = 2;
+pub const NAT_ADDRESS_PORT_DEPENDENT: i64 = 3;
+
+/// Mapping behaviour (RFC 4787 / RFC 5780 section 4.3) from the reflexive
+/// addresses one local socket got from: server A, server B's address with
+/// A's port (`via_b_ip`), and server B's address and port (`via_b_ip_port`).
+pub fn nat_mapping_behaviour(local: &StunAddr, via_a: &StunAddr, via_b_ip: &StunAddr, via_b_ip_port: &StunAddr) -> i64 {
+    if stun_addr_eq(local, via_a) {
+        return NAT_NONE;
+    }
+    if stun_addr_eq(via_a, via_b_ip) {
+        return NAT_ENDPOINT_INDEPENDENT;
+    }
+    if stun_addr_eq(via_b_ip, via_b_ip_port) {
+        return NAT_ADDRESS_DEPENDENT;
+    }
+    return NAT_ADDRESS_PORT_DEPENDENT;
+}
+
+pub fn nat_behaviour_name(b: i64) -> str {
+    if b == NAT_NONE {
+        return "no NAT";
+    }
+    if b == NAT_ENDPOINT_INDEPENDENT {
+        return "endpoint-independent mapping";
+    }
+    if b == NAT_ADDRESS_DEPENDENT {
+        return "address-dependent mapping";
+    }
+    return "address and port-dependent mapping";
+}
+
+/// Can two peers expect UDP hole punching to work? Both sides need
+/// endpoint-independent mapping, or one side no NAT at all; otherwise use
+/// a relay (TURN).
+pub fn nat_hole_punch_likely(a: i64, b: i64) -> bool {
+    if a == NAT_NONE || b == NAT_NONE {
+        return true;
+    }
+    return a == NAT_ENDPOINT_INDEPENDENT && b == NAT_ENDPOINT_INDEPENDENT;
+}
+
+pub const ICE_TYPE_HOST: i64 = 126;
+pub const ICE_TYPE_PEER_REFLEXIVE: i64 = 110;
+pub const ICE_TYPE_SERVER_REFLEXIVE: i64 = 100;
+pub const ICE_TYPE_RELAYED: i64 = 0;
+
+/// Candidate priority (RFC 8445 section 5.1.2.1).
+pub fn ice_candidate_priority(type_pref: i64, local_pref: i64, component: i64) -> i64 {
+    return (type_pref << 24) + (local_pref << 8) + (256 - component);
+}
+
+/// Candidate pair priority (RFC 8445 section 6.1.2.3); g = controlling
+/// agent's candidate priority, d = controlled's.
+pub fn ice_pair_priority(g: i64, d: i64) -> i64 {
+    var lo: i64 = g;
+    var hi: i64 = d;
+    if d < g {
+        lo = d;
+        hi = g;
+    }
+    var bit: i64 = 0;
+    if g > d {
+        bit = 1;
+    }
+    return (lo << 32) + 2 * hi + bit;
+}

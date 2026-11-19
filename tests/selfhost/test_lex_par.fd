@@ -1,0 +1,217 @@
+// SP9: the pieces of the parallel import lexing (compiler/lexer.fd
+// "SP9: import files lexed in parallel"): lex_texts_par gives, in 1, 2 or
+// 4 threads, the tokens and messages Lexer::new(text).tokenize() gives;
+// lex_par_plan spreads the texts over the workers by size; token_use_paths
+// reads a module's imports from its tokens as parse_use names them; and
+// modgraph_levels / modgraph_summary give the levels of an import graph.
+// Run from the repository root (it also lexes three compiler files).
+//
+// Expected output:
+// plan 2: [0 1] [2 3 4]
+// plan 3: [1] [3] [0 2 4]
+// plan 9 of 2: [0] [1]
+// seq: same
+// par 2: same
+// par 4: same
+// errors: 0 0 1 0 0
+// files 4: same
+// uses: vec | core | compiler::token | compiler::ast | a::b | x::y | type::k
+// levels: 0 1 0 2 -1 -1 -1 0
+// graph: 8 modules, 3 levels, widest 3, 3 on a cycle
+// graph empty: 0 modules, 0 levels, widest 0
+
+use core;
+use vec;
+use string;
+use compiler::token;
+use compiler::lexer;
+
+fn tok_text(t: Token) -> str {
+    var s: str = int_to_str(token_kind_tag(t.kind));
+    match t.kind {
+        TokenKind::Ident(x: str) => {
+            s = s + "=" + x;
+        }
+        TokenKind::StringLit(x: str) => {
+            s = s + "\"" + x;
+        }
+        TokenKind::IntLit(v: i64) => {
+            s = s + "#" + int_to_str(v);
+        }
+        _ => {
+        }
+    }
+    return s + "@" + int_to_str(t.line) + ":" + int_to_str(t.col);
+}
+
+/// Whether two token lists are the same token for token.
+fn same_toks(a: Vec<Token>, b: Vec<Token>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if tok_text(a.get(i)) != tok_text(b.get(i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn same_strs(a: Vec<str>, b: Vec<str>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Every text's result equals a plain lexer's.
+fn check_all(label: str, texts: Vec<str>, got: Vec<LexedText>) {
+    var ok: bool = got.len() == texts.len();
+    var i: i64 = 0;
+    while ok && i < texts.len() {
+        var lx: Lexer = Lexer::new(texts.get(i));
+        var toks: Vec<Token> = lx.tokenize();
+        if !same_toks(toks, got.get(i).tokens) || !same_strs(lx.errors, got.get(i).errors) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    if ok {
+        println(label + ": same");
+    } else {
+        println(label + ": DIFFERENT");
+    }
+}
+
+fn show_plan(label: str, plan: Vec<Vec<i64>>) {
+    var s: str = label + ":";
+    var w: i64 = 0;
+    while w < plan.len() {
+        s = s + " [";
+        var k: i64 = 0;
+        while k < plan.get(w).len() {
+            if k > 0 {
+                s = s + " ";
+            }
+            s = s + int_to_str(plan.get(w).get(k));
+            k = k + 1;
+        }
+        s = s + "]";
+        w = w + 1;
+    }
+    println(s);
+}
+
+fn deps_of(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if a >= 0 {
+        v.push(a);
+    }
+    if b >= 0 {
+        v.push(b);
+    }
+    return v;
+}
+
+fn main() -> i64 {
+    var sizes: Vec<i64> = Vec::new();
+    sizes.push(5);
+    sizes.push(50);
+    sizes.push(10);
+    sizes.push(40);
+    sizes.push(0);
+    // largest first, each to the least loaded: 50->0, 40->1, 10->1, 5->0
+    // (a tie: the first), 0->1
+    show_plan("plan 2", lex_par_plan(sizes, 2));
+    show_plan("plan 3", lex_par_plan(sizes, 3));
+    var two: Vec<i64> = Vec::new();
+    two.push(7);
+    two.push(7);
+    show_plan("plan 9 of 2", lex_par_plan(two, 9));
+
+    var texts: Vec<str> = Vec::new();
+    texts.push("fn main() -> i64 {\n    var x: i64 = 42;\n    return x + 1;\n}\n");
+    texts.push("struct P { a: i64, b: str }\nfn f(p: P) -> str { return p.b + \"!\"; }\n");
+    texts.push("fn g() { var s: str = \"open\n");
+    texts.push("");
+    texts.push("use vec; use core;\n// match while loop for\nenum E { A, B(i64) }\nfn h(e: E) -> i64 { match e { E::A => { return 0x1F; } E::B(v) => { return v; } } }\n");
+    check_all("seq", texts, lex_texts_par(texts, 1));
+    check_all("par 2", texts, lex_texts_par(texts, 2));
+    var p4: Vec<LexedText> = lex_texts_par(texts, 4);
+    check_all("par 4", texts, p4);
+    var es: str = "errors:";
+    var i: i64 = 0;
+    while i < p4.len() {
+        es = es + " " + int_to_str(p4.get(i).errors.len());
+        i = i + 1;
+    }
+    println(es);
+
+    // real files: the same tokens in four threads
+    var files: Vec<str> = Vec::new();
+    var paths: Vec<str> = Vec::new();
+    paths.push("compiler/lexer.fd");
+    paths.push("compiler/token.fd");
+    paths.push("stdlib/vec.fd");
+    paths.push("stdlib/string.fd");
+    i = 0;
+    while i < paths.len() {
+        match read_file(paths.get(i)) {
+            Option::Some(t) => {
+                files.push(t);
+            }
+            Option::None => {
+                files.push("");
+            }
+        }
+        i = i + 1;
+    }
+    check_all("files 4", files, lex_texts_par(files, 4));
+
+    var src: str = "module m::n; use vec;\npub use core;\nuse compiler::token;\nuse compiler::ast as A;\nuse vec;\n" + "use a::b::{c, d};\nuse x::y::*;\nfn f() { use z::w; }\nimpl S { }\nuse type::k;\n";
+    var lx: Lexer = Lexer::new(src);
+    var ups: Vec<str> = token_use_paths(lx.tokenize());
+    var us: str = "uses:";
+    i = 0;
+    while i < ups.len() {
+        if i > 0 {
+            us = us + " |";
+        }
+        us = us + " " + ups.get(i);
+        i = i + 1;
+    }
+    println(us);
+
+    // 0: none; 1 imports 0; 2: none; 3 imports 1 and 2; 4 <-> 5 a cycle;
+    // 6 imports 4 (behind the cycle); 7 imports itself and an index out of range
+    var deps: Vec<Vec<i64>> = Vec::new();
+    deps.push(deps_of(- 1, - 1));
+    deps.push(deps_of(0, - 1));
+    deps.push(deps_of(- 1, - 1));
+    deps.push(deps_of(1, 2));
+    deps.push(deps_of(5, - 1));
+    deps.push(deps_of(4, - 1));
+    deps.push(deps_of(4, 0));
+    deps.push(deps_of(7, 99));
+    var lv: Vec<i64> = modgraph_levels(deps);
+    var ls: str = "levels:";
+    i = 0;
+    while i < lv.len() {
+        ls = ls + " " + int_to_str(lv.get(i));
+        i = i + 1;
+    }
+    println(ls);
+    println("graph: " + modgraph_summary(lv));
+    var none: Vec<i64> = Vec::new();
+    println("graph empty: " + modgraph_summary(none));
+    return 0;
+}

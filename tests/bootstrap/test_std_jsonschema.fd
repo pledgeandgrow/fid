@@ -1,0 +1,123 @@
+// stdlib/jsonschema: cases in the style of the JSON Schema Test Suite (draft 2020-12) for type, properties/required/additionalProperties, items/prefixItems, enum/const, numeric and string bounds, pattern, $ref into $defs, allOf/anyOf/oneOf/not, if/then/else, contains, uniqueItems; error paths are JSON Pointers.
+// Expected output:
+// integer 1: valid
+// integer 1.0: valid
+// integer 1.5: invalid (1) #: type is number, expected integer
+// type list null: valid
+// type list number: invalid (1) #: type is number, expected one of ["string","null"]
+// bool true schema: valid
+// bool false schema: invalid (1) #: schema is false: nothing is valid here
+// person ok: valid
+// person missing: invalid (1) #: missing required property "name"
+// person extra: invalid (1) #: additional property "email" is not allowed
+// person age: invalid (1) #/age: number -1 < minimum 0
+// person empty name: invalid (1) #/name: string length 0 < minLength 1
+// all errors: 3
+//   #/age: number 200 > maximum 150
+//   #/name: string length 0 < minLength 1
+//   #: additional property "zz" is not allowed
+// array ok: valid
+// array item: invalid (1) #/1: type is string, expected number
+// array empty: invalid (1) #: array length 0 < minItems
+// array long: invalid (1) #: array length 4 > maxItems
+// array dup: invalid (1) #: array items 0 and 2 are equal (uniqueItems)
+// prefixItems: invalid (1) #/2: schema is false: nothing is valid here
+// contains: valid
+// contains few: invalid (1) #: array has 1 matches of contains, need 2
+// enum ok: valid
+// enum bad: invalid (1) #: value not in enum ["red","green"]
+// const: valid
+// exclusiveMaximum: invalid (1) #: number 10 >= exclusiveMaximum
+// multipleOf: valid
+// multipleOf bad: invalid (1) #: number 10 is not a multiple of 3
+// pattern: valid
+// pattern bad: invalid (1) #: string does not match pattern "^[a-z]+-[0-9]+$"
+// maxLength code points: valid
+// maxLength utf-8 bytes: valid
+// minLength code points: invalid (1) #: string length 3 < minLength 4
+// ref ok: valid
+// ref bad: invalid (1) #/1/x: number 0 <= exclusiveMinimum
+// allOf: invalid (1) #: string length 4 > maxLength 3
+// anyOf: valid
+// anyOf none: invalid (1) #: value matches none of anyOf
+// oneOf both: invalid (1) #: value matches 2 of oneOf, need exactly 1
+// oneOf one: valid
+// not: invalid (1) #: value must not match the 'not' schema
+// if/then: invalid (1) #: missing required property "number"
+// if/else: valid
+// patternProperties: invalid (1) #/m: type is string, expected integer
+// bad json: invalid (1) #: the instance is not valid JSON
+// valid helper: true
+use jsonschema;
+use vec;
+use string;
+
+fn check(label: str, schema: str, inst: str) {
+    val r: JsResult = jsonschema_validate(schema, inst);
+    if r.valid {
+        println(label + ": valid");
+    } else {
+        println(label + ": invalid (" + int_to_str(r.errors.len()) + ") " + r.errors.get(0));
+    }
+}
+
+fn main() -> i64 {
+    check("integer 1", "{\"type\":\"integer\"}", "1");
+    check("integer 1.0", "{\"type\":\"integer\"}", "1.0");
+    check("integer 1.5", "{\"type\":\"integer\"}", "1.5");
+    check("type list null", "{\"type\":[\"string\",\"null\"]}", "null");
+    check("type list number", "{\"type\":[\"string\",\"null\"]}", "3");
+    check("bool true schema", "true", "{\"x\":1}");
+    check("bool false schema", "false", "1");
+
+    val person: str = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"minLength\":1},\"age\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":150}},\"required\":[\"name\"],\"additionalProperties\":false}";
+    check("person ok", person, "{\"name\":\"Ada\",\"age\":36}");
+    check("person missing", person, "{\"age\":3}");
+    check("person extra", person, "{\"name\":\"x\",\"email\":\"e\"}");
+    check("person age", person, "{\"name\":\"x\",\"age\":-1}");
+    check("person empty name", person, "{\"name\":\"\"}");
+    val r: JsResult = jsonschema_validate(person, "{\"age\":200,\"name\":\"\",\"zz\":1}");
+    println("all errors: " + int_to_str(r.errors.len()));
+    var i: i64 = 0;
+    while i < r.errors.len() { println("  " + r.errors.get(i)); i = i + 1; }
+
+    val arr: str = "{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"minItems\":1,\"maxItems\":3,\"uniqueItems\":true}";
+    check("array ok", arr, "[1,2.5]");
+    check("array item", arr, "[1,\"x\"]");
+    check("array empty", arr, "[]");
+    check("array long", arr, "[1,2,3,4]");
+    check("array dup", arr, "[1,2,1]");
+    check("prefixItems", "{\"prefixItems\":[{\"type\":\"string\"},{\"type\":\"integer\"}],\"items\":false}", "[\"a\",1,true]");
+    check("contains", "{\"contains\":{\"const\":5},\"minContains\":2}", "[5,1,5]");
+    check("contains few", "{\"contains\":{\"const\":5},\"minContains\":2}", "[5,1]");
+
+    check("enum ok", "{\"enum\":[\"red\",\"green\",{\"a\":[1,2]}]}", "{ \"a\" : [1, 2] }");
+    check("enum bad", "{\"enum\":[\"red\",\"green\"]}", "\"blue\"");
+    check("const", "{\"const\":{\"b\":1,\"a\":2}}", "{\"a\":2,\"b\":1}");
+    check("exclusiveMaximum", "{\"exclusiveMaximum\":10}", "10");
+    check("multipleOf", "{\"multipleOf\":0.5}", "4.5");
+    check("multipleOf bad", "{\"multipleOf\":3}", "10");
+    check("pattern", "{\"pattern\":\"^[a-z]+-[0-9]+$\"}", "\"abc-42\"");
+    check("pattern bad", "{\"pattern\":\"^[a-z]+-[0-9]+$\"}", "\"ABC-42\"");
+    check("maxLength code points", "{\"maxLength\":3}", "\"héé\"");
+    check("maxLength utf-8 bytes", "{\"maxLength\":3}", "\"héé\"");
+    check("minLength code points", "{\"minLength\":4}", "\"héé\"");
+
+    val refs: str = "{\"$defs\":{\"pos\":{\"type\":\"integer\",\"exclusiveMinimum\":0},\"pt\":{\"type\":\"object\",\"properties\":{\"x\":{\"$ref\":\"#/$defs/pos\"}}}},\"type\":\"array\",\"items\":{\"$ref\":\"#/$defs/pt\"}}";
+    check("ref ok", refs, "[{\"x\":1},{\"x\":7}]");
+    check("ref bad", refs, "[{\"x\":1},{\"x\":0}]");
+
+    check("allOf", "{\"allOf\":[{\"type\":\"string\"},{\"maxLength\":3}]}", "\"abcd\"");
+    check("anyOf", "{\"anyOf\":[{\"type\":\"string\"},{\"minimum\":10}]}", "12");
+    check("anyOf none", "{\"anyOf\":[{\"type\":\"string\"},{\"minimum\":10}]}", "2");
+    check("oneOf both", "{\"oneOf\":[{\"type\":\"integer\"},{\"minimum\":2}]}", "3");
+    check("oneOf one", "{\"oneOf\":[{\"type\":\"integer\"},{\"minimum\":2}]}", "1");
+    check("not", "{\"not\":{\"type\":\"null\"}}", "null");
+    val cond: str = "{\"if\":{\"properties\":{\"kind\":{\"const\":\"card\"}}},\"then\":{\"required\":[\"number\"]},\"else\":{\"required\":[\"iban\"]}}";
+    check("if/then", cond, "{\"kind\":\"card\"}");
+    check("if/else", cond, "{\"kind\":\"bank\",\"iban\":\"DE..\"}");
+    check("patternProperties", "{\"patternProperties\":{\"^x-\":{\"type\":\"string\"}},\"additionalProperties\":{\"type\":\"integer\"}}", "{\"x-a\":\"s\",\"n\":1,\"m\":\"bad\"}");
+    check("bad json", "{\"type\":\"string\"}", "{oops");
+    println("valid helper: " + bool_to_str(jsonschema_valid("{\"type\":\"string\"}", "\"x\"")));
+    return 0;
+}

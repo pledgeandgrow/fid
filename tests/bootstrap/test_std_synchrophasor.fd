@@ -1,0 +1,209 @@
+// stdlib/synchrophasor: IEEE C37.118.2 frames (CRC, command, header, CFG-2, data) and phasor estimation
+// CRC-CCITT check value: "123456789" -> 0x29B1 (CRC-16/CCITT-FALSE). Every
+// frame below was rebuilt byte for byte by an independent Python encoder
+// written from the C37.118.2-2011 field tables (struct.pack, big endian), and
+// the float patterns checked with struct.pack('>f'). Phasor estimation:
+// a balanced three-phase 230 V signal sampled 32 times per 50 Hz cycle; at
+// 50.5 Hz the positive-sequence phasor advances 2*pi*0.5/50 rad per cycle;
+// with a 1 Hz/s ramp the ROCOF estimate is 1 Hz/s.
+// Expected output:
+// crc 123456789 = 29B1
+// f32: 3F800000 C0200000 3DCCCCCD 00000001 7F7FFFFF 7F800000 back 0.1 -> 0.10000000149011612
+// cmd: AA4200121E36448527F000000000000203AF valid=true cmd=2
+// cmd with a flipped bit valid=false
+// hdr: valid=true text=Fides PMU, station A, 230 kV bus
+// cfg2 bytes=464 valid=true head=AA3201D01E364485 chk=7592
+// cfg2 decoded: 2 pmus, data rate 30
+// pmu STATION A id=7734 fmt=15 ph=3 an=1 dg=1 50 Hz names=VA,VB,VC,POWER,BRK1
+// pmu FEEDER 2 id=7735 fmt=0 ph=1 an=1 dg=0 60 Hz names=I1,TEMP scale=0.10000 A
+// data: AA0200441E36448536000007A120000048609C003F060A9248609C00BFC90FDB48609C0040278D364248199A3DF5C28F449A5000800120001FBBFC16FFF3FFFBFFEF0E00
+// data bytes=68 valid=true soc=1149580800 tq=0 frac=500000
+// pmu 1 stat=0 VA=230000.000 at 30.000 VB=230000.000 at -90.000 f=50.0250 df=0.1200 an=1234.5 dig=8001
+// pmu 2 stat=8192 I1=(812.30, -100.20) f=59.9870 df=-0.0500 an=-17
+// nominal 230 V at 30 deg: |V|=230.0000 ang=30.0000 tve=0.000000
+// 50.5 Hz: f estimates 50.5000 50.5000 50.5000
+// ramp 1 Hz/s: rocof 1.000 1.000
+use synchrophasor;
+use math;
+use complex;
+use string;
+use encoding;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn hex(v: i64, digits: i64) -> str {
+    val h: str = "0123456789ABCDEF";
+    var out: str = "";
+    var i: i64 = digits - 1;
+    while i >= 0 {
+        val d: i64 = (v >> (4 * i)) & 0xF;
+        out = out + str_slice(h, d, d + 1);
+        i = i - 1;
+    }
+    return out;
+}
+
+fn deg(z: Complex) -> f64 {
+    return complex_arg(z) * 180.0 / syn_pi();
+}
+
+fn three_phase(f: f64, rocof: f64, nsamp: i64) -> Vec<Vec<f64>> {
+    var out: Vec<Vec<f64>> = Vec::new();
+    var ph: i64 = 0;
+    while ph < 3 {
+        var x: Vec<f64> = Vec::new();
+        var k: i64 = 0;
+        while k < nsamp {
+            val t: f64 = (k as f64) / 1600.0;
+            val ang: f64 = 2.0 * syn_pi() * (f * t + 0.5 * rocof * t * t) + syn_pi() / 6.0 - 2.0 * syn_pi() * (ph as f64) / 3.0;
+            x.push(230.0 * math_sqrt(2.0) * math_cos(ang));
+            k = k + 1;
+        }
+        out.push(x);
+        ph = ph + 1;
+    }
+    return out;
+}
+
+fn pos_seq(s: &Vec<Vec<f64>>, start: i64) -> Complex {
+    val a = s.get(0);
+    val b = s.get(1);
+    val c = s.get(2);
+    return syn_positive_sequence(syn_phasor(&a, start, 32), syn_phasor(&b, start, 32), syn_phasor(&c, start, 32));
+}
+
+fn main() {
+    println("crc 123456789 = " + hex(c37_crc(&enc_str_to_bytes("123456789")), 4));
+    println("f32: " + hex(c37_f32_bits(1.0), 8) + " " + hex(c37_f32_bits(-2.5), 8) + " " + hex(c37_f32_bits(0.1), 8) + " " + hex(c37_f32_bits(1.0e-45), 8) + " " + hex(c37_f32_bits(3.4028234663852886e38), 8) + " " + hex(c37_f32_bits(1.0e39), 8) + " back 0.1 -> " + float_to_str(c37_f32_from_bits(0x3DCCCCCD)));
+
+    val cmd = c37_encode_command(7734, 1149577200, 0, C37_CMD_ON);
+    println("cmd: " + hex_encode_bytes_upper(cmd) + " valid=" + bool_to_str(c37_valid(&cmd)) + " cmd=" + int_to_str(c37_decode_command(&cmd)));
+    var bad = cmd;
+    bad.set(15, bad.get(15) ^ 0x04);
+    println("cmd with a flipped bit valid=" + bool_to_str(c37_valid(&bad)));
+    val hdr = c37_encode_header_frame(7734, 1149577200, 0, "Fides PMU, station A, 230 kV bus");
+    println("hdr: valid=" + bool_to_str(c37_valid(&hdr)) + " text=" + c37_decode_header_frame(&hdr));
+
+    var p1 = c37_pmu_config("STATION A", 7734, C37_FMT_POLAR | C37_FMT_PH_FLOAT | C37_FMT_AN_FLOAT | C37_FMT_FREQ_FLOAT, true);
+    c37_add_phasor(&mut p1, "VA", false, 915527);
+    c37_add_phasor(&mut p1, "VB", false, 915527);
+    c37_add_analog(&mut p1, "POWER", 1);
+    c37_add_phasor(&mut p1, "VC", false, 915527);
+    var bits: Vec<str> = Vec::new();
+    bits.push("BRK1");
+    c37_add_digital(&mut p1, bits, 0x0000, 0xFFFF);
+    var p2 = c37_pmu_config("FEEDER 2", 7735, 0, false);
+    c37_add_phasor(&mut p2, "I1", true, 10000);
+    c37_add_analog(&mut p2, "TEMP", 0);
+    var pmus: Vec<C37PmuConfig> = Vec::new();
+    pmus.push(p1);
+    pmus.push(p2);
+    val cfg = C37Config { frame_type: C37_TYPE_CFG2, idcode: 7734, soc: 1149577200, fracsec: 0, time_base: 1000000, pmus: pmus, data_rate: 30 };
+    val cb = c37_encode_config(&cfg);
+    val ch = hex_encode_bytes_upper(cb);
+    println("cfg2 bytes=" + int_to_str(cb.len()) + " valid=" + bool_to_str(c37_valid(&cb)) + " head=" + str_slice(ch, 0, 16) + " chk=" + str_slice(ch, str_len(ch) - 4, str_len(ch)));
+    val dc = c37_decode_config(&cb);
+    println("cfg2 decoded: " + int_to_str(dc.pmus.len()) + " pmus, data rate " + int_to_str(dc.data_rate));
+    var k: i64 = 0;
+    while k < dc.pmus.len() {
+        val p = dc.pmus.get(k);
+        var names: str = "";
+        var i: i64 = 0;
+        while i < p.chnam.len() {
+            val nm: str = p.chnam.get(i);
+            if str_len(nm) > 0 {
+                if str_len(names) > 0 {
+                    names = names + ",";
+                }
+                names = names + nm;
+            }
+            i = i + 1;
+        }
+        var line: str = "pmu " + p.stn + " id=" + int_to_str(p.idcode) + " fmt=" + int_to_str(p.format) + " ph=" + int_to_str(p.phnmr) + " an=" + int_to_str(p.annmr) + " dg=" + int_to_str(p.dgnmr) + " " + fx(c37_nominal_hz(&p), 0) + " Hz names=" + names;
+        if k == 1 {
+            line = line + " scale=" + fx(((p.phunit.get(0) & 0xFFFFFF) as f64) * 0.00001, 5) + " A";
+        }
+        println(line);
+        k = k + 1;
+    }
+
+    var m1 = c37_pmu_data(0, 50.025, 0.12);
+    val va = complex_from_polar(230000.0, syn_pi() / 6.0);
+    val vb = complex_from_polar(230000.0, 0.0 - syn_pi() / 2.0);
+    val vc = complex_from_polar(230000.0, 5.0 * syn_pi() / 6.0);
+    m1.ph_re.push(va.re);
+    m1.ph_im.push(va.im);
+    m1.ph_re.push(vb.re);
+    m1.ph_im.push(vb.im);
+    m1.ph_re.push(vc.re);
+    m1.ph_im.push(vc.im);
+    m1.analog.push(1234.5);
+    m1.digital.push(0x8001);
+    var m2 = c37_pmu_data(0x2000, 59.987, -0.05);
+    m2.ph_re.push(812.3);
+    m2.ph_im.push(-100.2);
+    m2.analog.push(-17.0);
+    var ms: Vec<C37PmuData> = Vec::new();
+    ms.push(m1);
+    ms.push(m2);
+    val d = C37Data { idcode: 7734, soc: 1149580800, time_quality: 0, fracsec: 500000, pmus: ms };
+    val db = c37_encode_data(&cfg, &d);
+    val dd = c37_decode_data(&dc, &db);
+    println("data: " + hex_encode_bytes_upper(db));
+    println("data bytes=" + int_to_str(db.len()) + " valid=" + bool_to_str(c37_valid(&db)) + " soc=" + int_to_str(dd.soc) + " tq=" + int_to_str(dd.time_quality) + " frac=" + int_to_str(dd.fracsec));
+    val r1 = dd.pmus.get(0);
+    val za = complex(r1.ph_re.get(0), r1.ph_im.get(0));
+    val zb = complex(r1.ph_re.get(1), r1.ph_im.get(1));
+    println("pmu 1 stat=" + int_to_str(r1.stat) + " VA=" + fx(complex_abs(za), 3) + " at " + fx(deg(za), 3) + " VB=" + fx(complex_abs(zb), 3) + " at " + fx(deg(zb), 3) + " f=" + fx(r1.freq, 4) + " df=" + fx(r1.dfreq, 4) + " an=" + fx(r1.analog.get(0), 1) + " dig=" + hex(r1.digital.get(0), 4));
+    val r2 = dd.pmus.get(1);
+    println("pmu 2 stat=" + int_to_str(r2.stat) + " I1=(" + fx(r2.ph_re.get(0), 2) + ", " + fx(r2.ph_im.get(0), 2) + ") f=" + fx(r2.freq, 4) + " df=" + fx(r2.dfreq, 4) + " an=" + fx(r2.analog.get(0), 0));
+
+    // phasor estimation
+    val s0 = three_phase(50.0, 0.0, 32 * 6);
+    val a0 = s0.get(0);
+    val pa = syn_phasor(&a0, 64, 32);
+    val truth = complex_from_polar(230.0, syn_pi() / 6.0);
+    println("nominal 230 V at 30 deg: |V|=" + fx(complex_abs(pa), 4) + " ang=" + fx(deg(pa), 4) + " tve=" + fx(syn_tve(pa, truth), 6));
+    val s1 = three_phase(50.5, 0.0, 32 * 6);
+    var fl: str = "";
+    k = 1;
+    while k <= 3 {
+        val f = syn_frequency(pos_seq(&s1, 32 * (k - 1)), pos_seq(&s1, 32 * k), 0.02, 50.0);
+        if k > 1 {
+            fl = fl + " ";
+        }
+        fl = fl + fx(f, 4);
+        k = k + 1;
+    }
+    println("50.5 Hz: f estimates " + fl);
+    val s2 = three_phase(50.0, 1.0, 32 * 8);
+    val fa = syn_frequency(pos_seq(&s2, 32), pos_seq(&s2, 64), 0.02, 50.0);
+    val fb = syn_frequency(pos_seq(&s2, 64), pos_seq(&s2, 96), 0.02, 50.0);
+    val fc = syn_frequency(pos_seq(&s2, 96), pos_seq(&s2, 128), 0.02, 50.0);
+    println("ramp 1 Hz/s: rocof " + fx(syn_rocof(fa, fb, 0.02), 3) + " " + fx(syn_rocof(fb, fc, 0.02), 3));
+}

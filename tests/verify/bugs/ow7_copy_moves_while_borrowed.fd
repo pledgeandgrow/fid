@@ -1,0 +1,48 @@
+// Log OW7 (docs/verification/miscompile-log.md; VF11,
+// scripts/verify/own_diff.py --ext struct: `let a = new; let r = &mut a;
+// { let u = Pr { f: a, g: *r }; read u }` faulted on the C path). A copy
+// `var b = a` keeps a (proposal 0004 rule 2: keeping a value that is not a
+// temporary takes a new owner). With stage 0 of Nov 16, `fid ccompile` of
+// this program stops with "Panic: Invalid memory access (null or dangling
+// pointer) at 0x8" in `shared`, at `r.kids.len()` (a null Vec handle read
+// at offset 8: by the look of it the copy was lowered as a move out of
+// `a`, a's last use by name, while the reference r to a is read after it). `fid run` prints the right lines. The borrow rules allow
+// the program (reading a borrowed variable is not a change, §8.4), and the
+// model reads 0 through r. A use after move on the C path: the "last use"
+// that allows a move must count the uses through references to the
+// variable.
+//> 0
+//> 0
+//> 1
+//> 0
+//> 0
+//> 2
+
+struct Bx {
+    n: i64,
+    kids: Vec<Bx>,
+}
+
+fn shared() {
+    var a: Bx = Bx { n: 0, kids: Vec::new() };
+    var r: &Bx = &a;
+    var b: Bx = a;
+    println(b.kids.len());
+    println(r.kids.len());
+}
+
+fn exclusive() {
+    var a: Bx = Bx { n: 0, kids: Vec::new() };
+    var r: &mut Bx = &mut a;
+    var b: Bx = a;
+    println(b.kids.len());
+    println(r.kids.len());
+}
+
+fn main() -> i64 {
+    shared();
+    println(1);
+    exclusive();
+    println(2);
+    return 0;
+}

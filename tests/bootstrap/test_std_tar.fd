@@ -1,0 +1,181 @@
+// stdlib/tar: archives written by Python's tarfile (ustar and pax) read and rewritten byte for byte.
+// Expected output:
+// ustar: 4 entries, err ""
+// -rw-r--r-- user/users 12 1700000000 hello.txt
+// drwxr-xr-x user/users 0 1700000000 dir/
+// lrwxrwxrwx user/users 0 1700000000 dir/link -> ../hello.txt
+// -rw-r--r-- user/users 5 1700000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.txt
+// hello.txt: Hello, tar!
+// rewrite ustar: same 10240 bytes
+// pax: 4 entries, long name 154 bytes, data "long name via pax"
+// rewrite pax: same 10240 bytes
+// pax record lengths: 99 102 101
+// bad checksum: bad header checksum at 0
+// base-256 size: 8589934592
+// GNU long name: gnu/very/long
+// written archive read back: 3 entries, dir/ x/y.bin 300 bytes, sum 33586
+use tar;
+use vec;
+use string;
+use encoding;
+
+fn TAR_U() -> str {
+    return "0:68656c6c6f2e747874;100:30303030363434003030303137353000303030313735300030303030303030303031340" +
+        "0313435323437373034303000303131363631002030;257:757374617200303075736572;297:7573657273;512:4865" +
+        "6c6c6f2c20746172210a;1024:6469722f;1124:30303030373535003030303137353000303030313735300030303030" +
+        "3030303030303000313435323437373034303000303130363030002035;1281:757374617200303075736572;1321:75" +
+        "73657273;1536:6469722f6c696e6b;1636:303030303737370030303031373530003030303137353000303030303030" +
+        "3030303030003134353234373730343030003031333533340020322e2e2f68656c6c6f2e747874;1793:757374617200" +
+        "303075736572;1833:7573657273;2048:62626262626262626262626262626262626262626262626262626262626262" +
+        "626262626262626262626262626262626262622e747874;2148:30303030363434003030303137353000303030313735" +
+        "3000303030303030303030303500313435323437373034303000303335353735002030;2305:75737461720030307573" +
+        "6572;2345:7573657273;2393:6161616161616161616161616161616161616161616161616161616161616161616161" +
+        "61616161616161616161616161616161616161616161616161;2560:73706c6974";
+}
+
+fn TAR_P() -> str {
+    return "0:68656c6c6f2e747874;100:30303030363434003030303137353000303030313735300030303030303030303031340" +
+        "0313435323437373034303000303131363631002030;257:757374617200303075736572;297:7573657273;512:4865" +
+        "6c6c6f2c20746172210a;1024:6469722f;1124:30303030373535003030303137353000303030313735300030303030" +
+        "3030303030303000313435323437373034303000303130363030002035;1281:757374617200303075736572;1321:75" +
+        "73657273;1536:6469722f6c696e6b;1636:303030303737370030303031373530003030303137353000303030303030" +
+        "3030303030003134353234373730343030003031333533340020322e2e2f68656c6c6f2e747874;1793:757374617200" +
+        "303075736572;1833:7573657273;2048:2e2f2e2f40506178486561646572;2148:3030303030303000303030303030" +
+        "30003030303030303000303030303030303032343400303030303030303030303000303130323135002078;2305:7573" +
+        "746172003030;2560:31363420706174683d636363636363636363636363636363636363636363636363636363636363" +
+        "636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363" +
+        "636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363" +
+        "6363636363636363636363636363636363636363636363632e6461740a;3072:63636363636363636363636363636363" +
+        "636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363" +
+        "636363636363636363636363636363636363636363636363636363636363636363636363303030303634340030303031" +
+        "373530003030303137353000303030303030303030323100313435323437373034303000303333323731002030;3329:" +
+        "757374617200303075736572;3369:7573657273;3584:6c6f6e67206e616d652076696120706178";
+}
+
+// "offset:hex;offset:hex..." -> bytes (zeros elsewhere)
+fn unsparse(s: str, total: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::filled(total, 0);
+    val parts: Vec<str> = str_split(s, ";");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val kv: Vec<str> = str_split(parts.get(i), ":");
+        val off: i64 = str_parse_int(kv.get(0));
+        val bs: Vec<i64> = hex_decode_bytes(kv.get(1));
+        var j: i64 = 0;
+        while j < bs.len() {
+            out.set(off + j, bs.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn show(e: TarEntry) {
+    var line: str = tar_mode_str(&e) + " " + e.uname + "/" + e.gname + " " + int_to_str(e.size) + " " + int_to_str(e.mtime) + " " + e.name;
+    if e.typeflag == TAR_SYM {
+        line = line + " -> " + e.linkname;
+    }
+    println(line);
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() {
+    val u: Vec<i64> = unsparse(TAR_U(), 10240);
+    val a: TarArchive = tar_parse(u);
+    println("ustar: " + int_to_str(a.entries.len()) + " entries, err \"" + a.err + "\"");
+    var i: i64 = 0;
+    while i < a.entries.len() {
+        show(a.entries.get(i));
+        i = i + 1;
+    }
+    println("hello.txt: " + str_trim(str_from_bytes(a.entries.get(tar_find(&a, "hello.txt")).data)));
+    val w: Vec<i64> = tar_write(a.entries);
+    if same(w, u) {
+        println("rewrite ustar: same " + int_to_str(w.len()) + " bytes");
+    } else {
+        println("rewrite ustar: DIFFERENT");
+    }
+
+    val p: Vec<i64> = unsparse(TAR_P(), 10240);
+    val b: TarArchive = tar_parse(p);
+    val last: TarEntry = b.entries.get(3);
+    println("pax: " + int_to_str(b.entries.len()) + " entries, long name " + int_to_str(str_len(last.name)) + " bytes, data \"" + str_from_bytes(last.data) + "\"");
+    val w2: Vec<i64> = tar_write(b.entries);
+    if same(w2, p) {
+        println("rewrite pax: same " + int_to_str(w2.len()) + " bytes");
+    } else {
+        println("rewrite pax: DIFFERENT");
+    }
+    println("pax record lengths: " + int_to_str(str_len(tar_pax_record("path", str_repeat("x", 90)))) + " " + int_to_str(str_len(tar_pax_record("path", str_repeat("x", 92)))) + " " + int_to_str(str_len(tar_pax_record("path", str_repeat("x", 91)))));
+
+    var bad: Vec<i64> = u;
+    bad.set(0, 72);
+    println("bad checksum: " + tar_parse(bad).err);
+
+    // GNU base-256 size field: 0x80 then big-endian 2^33
+    var g: Vec<i64> = Vec::filled(12, 0);
+    g.set(0, 128);
+    g.set(7, 2);
+    println("base-256 size: " + int_to_str(tar_field_num(&g, 0, 12)));
+
+    // a GNU ././@LongLink entry ('L') names the next entry
+    var es: Vec<TarEntry> = Vec::new();
+    var ln: TarEntry = tar_entry("././@LongLink", TAR_GNU_LONGNAME, 0, str_bytes("gnu/very/long"));
+    ln.typeflag = TAR_REG;
+    var raw: Vec<i64> = tar_header(&ln);
+    raw.set(156, TAR_GNU_LONGNAME);
+    tar_fix_checksum(&mut raw);
+    var k: i64 = 0;
+    var data: Vec<i64> = str_bytes("gnu/very/long");
+    while data.len() < 512 {
+        data.push(0);
+    }
+    var arc: Vec<i64> = raw;
+    k = 0;
+    while k < 512 {
+        arc.push(data.get(k));
+        k = k + 1;
+    }
+    es.push(tar_file("short", str_bytes("z"), 420));
+    val rest: Vec<i64> = tar_write(es);
+    k = 0;
+    while k < rest.len() {
+        arc.push(rest.get(k));
+        k = k + 1;
+    }
+    println("GNU long name: " + tar_parse(arc).entries.get(0).name);
+
+    var mine: Vec<TarEntry> = Vec::new();
+    mine.push(tar_dir("dir/", 493));
+    var big: Vec<i64> = Vec::new();
+    k = 0;
+    while k < 300 {
+        big.push(k % 256);
+        k = k + 1;
+    }
+    mine.push(tar_file("x/y.bin", big, 420));
+    mine.push(tar_symlink("l", "x/y.bin"));
+    val rb: TarArchive = tar_parse(tar_write(mine));
+    val yb: Vec<i64> = rb.entries.get(1).data;
+    var sum: i64 = 0;
+    k = 0;
+    while k < yb.len() {
+        sum = sum + yb.get(k);
+        k = k + 1;
+    }
+    println("written archive read back: " + int_to_str(rb.entries.len()) + " entries, " + rb.entries.get(0).name + " " + rb.entries.get(1).name + " " + int_to_str(yb.len()) + " bytes, sum " + int_to_str(sum));
+}

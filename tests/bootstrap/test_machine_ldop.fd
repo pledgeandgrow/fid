@@ -1,0 +1,132 @@
+// Track OP (docs/roadmap/competitive-roadmap.md OP18), the machine layer
+// (compiler/nat_ir.fd): memory operands. An 8-byte load whose only reader
+// is an ADD, SUB, MUL, AND, OR or XOR (ng_fuse_ldop, after ng_fuse_addr,
+// before allocation) becomes that operation's memory source on x86-64:
+//   LOAD t = [p + 16]; XOR d, a, t   ->   ALUM d = a ^ [p + 16]
+// (`xor r, [r + 16]`, one instruction instead of a load and the XOR). The
+// load may be the right operand of any of them or the left one of those
+// that commute (not of SUB). A load read twice (a checked i64 add reads
+// its operands again for the overflow test) stays a load. The emitter
+// handles a result register that is also the address register (formed in
+// r11, then moved). AArch64 and RISC-V never form it (load/store
+// machines). Every result is the same with FID_NAT_OFF=ldop, with
+// FID_VERIFY=1, and on run / ccompile. Run:
+//   NATIVE=1 bash scripts/cross-test.sh x86_64-linux (and x86_64-windows),
+//   bash tests/nattools/machine_batch9_check.sh (the `alum` operations in
+//   the MIR dump and the result with the pass off).
+// Expected output:
+// 6
+// 2
+// 31
+// 30
+// 7
+// 1302
+// 12
+// 1000000
+// 4
+// -5
+// 255
+// 1311768467463790320
+// 21
+// 99
+
+struct Pair { x: i64, y: i64, z: i64 }
+
+struct Node { val: i64, mask: i64, next_val: i64 }
+
+// the load on the right: d = a op [p + off]
+fn xor_y(a: i64, p: &Pair) -> i64 {
+    return a ^ p.y;
+}
+
+fn and_z(a: i64, p: &Pair) -> i64 {
+    return a & p.z;
+}
+
+fn or_x(a: i64, p: &Pair) -> i64 {
+    return a | p.x;
+}
+
+// the load on the left of a commuting operation: a ^ [p] the same
+fn xor_left(p: &Pair, a: i64) -> i64 {
+    return p.x ^ a;
+}
+
+// two loads: the first loaded, the second read from memory
+fn mix(p: &Pair) -> i64 {
+    return (p.x | p.y) & p.z;
+}
+
+// wrapping arithmetic: ADD, SUB and MUL take a memory operand too
+@wrapping fn wsum(p: &Pair) -> i64 {
+    return p.x * p.y + p.z;
+}
+
+@wrapping fn wsub(a: i64, p: &Pair) -> i64 {
+    return a - p.y;
+}
+
+@wrapping fn wmul(p: &Pair, k: i64) -> i64 {
+    return k * p.z;
+}
+
+// the result may take the address register (the pointer dies here)
+fn val_and_mask(n: &Node) -> i64 {
+    return n.val & n.mask;
+}
+
+// SUB with the load on the left is not formed (it does not commute)
+@wrapping fn wsub_left(p: &Pair, a: i64) -> i64 {
+    return p.x - a;
+}
+
+// checked add: the operands are read again by the overflow test
+fn checked_add(p: &Pair) -> i64 {
+    return p.y + p.z;
+}
+
+// in a loop over a fixed-size buffer of structs
+fn fold_xor(v: & Vec<Pair>) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        var p: Pair = v.get(i);
+        acc = acc ^ p.y;
+        i = i + 1;
+    }
+    return acc;
+}
+
+@wrapping fn hash_node(n: &Node) -> i64 {
+    var h: i64 = n.val;
+    h = h * 1000003;
+    h = h ^ n.mask;
+    h = h + n.next_val;
+    return h;
+}
+
+fn main() {
+    var p: Pair = Pair { x: 1, y: 7, z: 30 };
+    println(xor_y(1, &p));
+    println(and_z(3, &p));
+    println(or_x(30, &p));
+    println(xor_left(&p, 31));
+    println(mix(&p) & 7 | 1);
+    var q: Pair = Pair { x: 43, y: 30, z: 12 };
+    println(wsum(&q));
+    println(and_z(15, &q));
+    println(wmul(&q, 83333) + 4);
+    println(wsub(11, &p));
+    println(wsub_left(&q, 48));
+    var n: Node = Node { val: 1023, mask: 255, next_val: 0 };
+    println(val_and_mask(&n));
+    var n2: Node = Node { val: 1311768467463790320, mask: 0, next_val: 0 };
+    println(n2.val ^ n2.mask);
+    var v: Vec<Pair> = Vec::new();
+    v.push(Pair { x: 0, y: 5, z: 0 });
+    v.push(Pair { x: 0, y: 3, z: 0 });
+    v.push(Pair { x: 0, y: 19, z: 0 });
+    println(fold_xor(&v) + checked_add(&p) - 37);
+    var n3: Node = Node { val: 0, mask: 96, next_val: 3 };
+    println(hash_node(&n3));
+}

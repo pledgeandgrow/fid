@@ -1,0 +1,128 @@
+// stdlib/timeseries: ring storage (overwrite, order, range queries), downsampling into buckets, and Gorilla compression: exact bit counts on a regular series, bit-exact round trips of odd values and times, a day of minute readings, and truncated input.
+// Expected output:
+// ring: len 5, oldest 4, latest 8, dropped 3, out of order rejected true
+// range [5,7): 5 6; lower bound of 7 is index 3
+// buckets: 15/7/0/14 15/22/15/29 15/37/30/44 15/52/45/59 0
+// first/last of bucket 1: 15 29
+// constant series: 1001 points in 271 bytes (2136 bits)
+// odd values: 12 points, round trip bit-exact true
+// minute readings: 1440 points, round trip true, 7.4 bytes per point
+// truncated: ok false
+use timeseries;
+use vec;
+use string;
+
+fn bits_equal(a: & TsSeries, b: & TsSeries) -> bool {
+    if a.times.len() != b.times.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.times.len() {
+        if a.times.get(i) != b.times.get(i) || p_f64_to_bits(a.values.get(i)) != p_f64_to_bits(b.values.get(i)) {
+            println("differs at " + int_to_str(i));
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn f0(x: f64) -> str {
+    return int_to_str(x as i64);
+}
+
+fn main() {
+    var r: TsRing = ts_ring_new(5);
+    var t: i64 = 1;
+    while t <= 8 {
+        ts_ring_push(&mut r, t, (t * 10) as f64);
+        t = t + 1;
+    }
+    val rejected: bool = !ts_ring_push(&mut r, 7, 0.0);
+    println("ring: len " + int_to_str(ts_ring_len(&r)) + ", oldest " + int_to_str(ts_ring_time(&r, 0)) + ", latest " + int_to_str(ts_ring_time(&r, ts_ring_len(&r) - 1)) + ", dropped " + int_to_str(r.dropped) + ", out of order rejected " + bool_to_str(rejected));
+    val rg: TsSeries = ts_ring_range(&r, 5, 7);
+    println("range [5,7): " + int_to_str(rg.times.get(0)) + " " + int_to_str(rg.times.get(1)) + "; lower bound of 7 is index " + int_to_str(ts_ring_lower_bound(&r, 7)));
+
+    var s: TsSeries = ts_series_new();
+    var i: i64 = 0;
+    while i < 60 {
+        ts_series_push(&mut s, i, i as f64);
+        i = i + 1;
+    }
+    val b: TsBuckets = ts_downsample(&s, 0, 15, 5);
+    var line: str = "";
+    i = 0;
+    while i < 5 {
+        if i > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(b.counts.get(i));
+        if b.counts.get(i) > 0 {
+            line = line + "/" + f0(ts_bucket_avg(&b, i)) + "/" + f0(b.mins.get(i)) + "/" + f0(b.maxs.get(i));
+        }
+        i = i + 1;
+    }
+    println("buckets: " + line);
+    println("first/last of bucket 1: " + f0(b.firsts.get(1)) + " " + f0(b.lasts.get(1)));
+
+    var c: TsSeries = ts_series_new();
+    i = 0;
+    while i < 1001 {
+        ts_series_push(&mut c, 1000 + 60 * i, 42.0);
+        i = i + 1;
+    }
+    var g: TsGorilla = ts_gorilla_new();
+    i = 0;
+    while i < c.times.len() {
+        ts_gorilla_append(&mut g, c.times.get(i), c.values.get(i));
+        i = i + 1;
+    }
+    val cb: Vec<i64> = ts_gorilla_bytes(&g);
+    println("constant series: " + int_to_str(g.count) + " points in " + int_to_str(cb.len()) + " bytes (" + int_to_str(g.bits.nbits) + " bits)");
+
+    // odd values and times: every dod bucket, -0.0, NaN, infinities,
+    // subnormals, a huge jump and time going negative
+    var o: TsSeries = ts_series_new();
+    ts_series_push(&mut o, -5, 1.0);
+    ts_series_push(&mut o, 0, -0.0);
+    ts_series_push(&mut o, 100, 0.0 / 0.0);
+    ts_series_push(&mut o, 300, 1.0 / 0.0);
+    ts_series_push(&mut o, 2000, -1.0 / 0.0);
+    ts_series_push(&mut o, 2001, 4.9e-324);
+    ts_series_push(&mut o, 1000000002001, 1.7976931348623157e308);
+    ts_series_push(&mut o, 1000000002002, 1.7976931348623157e308);
+    ts_series_push(&mut o, -9000000000000000000, 3.14);
+    ts_series_push(&mut o, 9000000000000000000, 2.71);
+    ts_series_push(&mut o, 9000000000000000001, 2.72);
+    ts_series_push(&mut o, 9000000000000000001, 2.72);
+    val od: TsDecoded = ts_gorilla_decode(ts_gorilla_encode(&o));
+    println("odd values: " + int_to_str(od.series.times.len()) + " points, round trip bit-exact " + bool_to_str(od.ok && bits_equal(&o, &od.series)));
+
+    // a day of temperature readings once a minute, 0.1 degree resolution,
+    // with a few seconds of jitter
+    var m: TsSeries = ts_series_new();
+    var temp: i64 = 215;
+    var seed: i64 = 12345;
+    i = 0;
+    while i < 1440 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        val step: i64 = (seed >> 16) % 3 - 1;
+        temp = temp + step;
+        val jitter: i64 = (seed >> 8) % 3;
+        ts_series_push(&mut m, 1700000000000 + i * 60000 + jitter * 1000, (temp as f64) / 10.0);
+        i = i + 1;
+    }
+    val mb: Vec<i64> = ts_gorilla_encode(&m);
+    val md: TsDecoded = ts_gorilla_decode(mb);
+    val per: i64 = (mb.len() * 10 + 720) / 1440;
+    println("minute readings: 1440 points, round trip " + bool_to_str(md.ok && bits_equal(&m, &md.series)) + ", " + int_to_str(per / 10) + "." + int_to_str(per % 10) + " bytes per point");
+
+    var cut: Vec<i64> = Vec::new();
+    i = 0;
+    while i < mb.len() / 2 {
+        cut.push(mb.get(i));
+        i = i + 1;
+    }
+    val bad: TsDecoded = ts_gorilla_decode(cut);
+    println("truncated: ok " + bool_to_str(bad.ok));
+}

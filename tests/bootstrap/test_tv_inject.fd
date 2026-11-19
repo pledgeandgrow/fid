@@ -1,0 +1,131 @@
+// Translation validation's negative test (compiler/tv.fd, competitive
+// roadmap VF6). FID_TV_INJECT puts a fault (an addition made a subtraction,
+// a product or xor made an addition, a constant's low bit flipped) into
+// what each listed pass makes of the functions named main_*
+// (FID_TV_INJECT_IN), and the validator must reject every such result,
+// which undoes it: the function keeps its IR from before the pass (for a
+// module pass, the whole module does). A fault no check catches changes
+// what the program prints or returns, so the output below is the test:
+// it is what the program prints with no fault. The compiler reports each
+// fault on stderr ("tv: injected a fault into F after pass P: caught");
+// tests/tooling/tv-check.sh requires at least one and no "NOT caught".
+// The passes: per function fold, gvn, dce, licm and the SSA round trip
+// (witnesses), the others (iropt_me's sra, loops, unroll, loadhoist,
+// forward, matchfacts among them) by runs on random inputs; module passes
+// inline, inline2, ipcp, spec, gconst and icf (witnesses and runs in the
+// module).
+// Native `emit` only: `run` and the C path run no IR optimizer, and other
+// compilers ignore the variables.
+//@ env: FID_VALIDATE=1
+//@ env: FID_TV_INJECT=fold,simplify,branchfold,branchfacts,sccp,promote,dse,dce,gvn,iv,licm,ssa,sra,loops,unroll,loadhoist,forward,matchfacts,inline,inline2,ipcp,spec,gconst,icf
+//@ env: FID_TV_INJECT_IN=main_
+//
+// Expected output:
+// 43
+// 30
+// 210
+// 42
+// 6
+// 20
+// 30
+// 105
+// 21
+// 41
+// 1
+// 9
+
+var g_tvi_base: i64 = 100;
+
+fn main_fold() -> i64 {
+    // fold: 6 * 7 + 1 at compile time
+    var a: i64 = 6;
+    var b: i64 = a * 7;
+    return b + 1;
+}
+
+fn main_gvn(x: i64, y: i64) -> i64 {
+    // gvn: x * y + x once
+    var p: i64 = x * y + x;
+    var q: i64 = x * y + x;
+    return p - q + p * 2;
+}
+
+fn main_licm(n: i64, k: i64) -> i64 {
+    // licm: k * 3 out of the loop
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + k * 3;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main_dce(x: i64) -> i64 {
+    // dce: an unused product
+    var unused: i64 = x * 1000;
+    return x + 1;
+}
+
+fn main_add(a: i64, b: i64) -> i64 {
+    // inline: small enough to be copied into its callers
+    return a + b;
+}
+
+fn main_scale(x: i64, k: i64) -> i64 {
+    // ipcp: every call passes 5 for k
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < k {
+        r = r + x;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn main_glob(x: i64) -> i64 {
+    // gconst: a global nothing stores
+    return g_tvi_base + x;
+}
+
+fn main_twice_a(x: i64) -> i64 {
+    // icf: main_twice_b has the same body
+    var t: i64 = x * 2;
+    return t + 1;
+}
+
+fn main_twice_b(x: i64) -> i64 {
+    var t: i64 = x * 2;
+    return t + 1;
+}
+
+fn main_clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    var r: i64 = v;
+    if r < lo {
+        r = lo;
+    }
+    if r > hi {
+        r = hi;
+    }
+    return r;
+}
+
+fn main_run() {
+    println(main_fold());
+    println(main_gvn(3, 4));
+    println(main_licm(10, 7));
+    println(main_dce(41));
+    println(main_add(main_add(1, 2), 3));
+    println(main_scale(4, 5));
+    println(main_scale(6, 5));
+    println(main_glob(5));
+    println(main_twice_a(10));
+    println(main_twice_b(20));
+    println(main_clamp(-5, 1, 9));
+    println(main_clamp(50, 1, 9));
+}
+
+fn main() -> i64 {
+    main_run();
+    return 0;
+}

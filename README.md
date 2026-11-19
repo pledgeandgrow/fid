@@ -251,7 +251,8 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 | | |
 | --- | --- |
 | [The Fid Book](docs/book/01-intro.md) | First program to a network service |
-| [Coming from Rust](docs/guides/from-rust.md) · [Go](docs/guides/from-go.md) · [Zig](docs/guides/from-zig.md) · [C](docs/guides/from-c.md) | What you already know, mapped onto Fid |
+| [University course](docs/course/README.md) | 13 weeks of lecture notes: memory safety, effect systems, capability security, systems programming; a [lab per week](docs/course/labs/README.md) that opens in the playground |
+| [Coming from Rust](docs/guides/from-rust.md) · [Go](docs/guides/from-go.md) · [Zig](docs/guides/from-zig.md) · [C](docs/guides/from-c.md) · [Python](docs/guides/from-python.md) | What you already know, mapped onto Fid |
 | [Language reference](docs/reference/reference.md) | Every rule, with the compiler function that enforces it |
 | [Cookbook](docs/cookbook.md) | Files, JSON, HTTP, tasks |
 | [Examples](examples/) | A JSON parser, an HTTP server, a mini compiler, a neural network, a game loop |

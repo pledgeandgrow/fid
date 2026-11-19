@@ -1,0 +1,58 @@
+// llvm-roadmap DB9: the profiler driven by the program (stdlib/profiler.fd),
+// so that it runs on every backend without the entry point's FID_PROF
+// hook: prof_start, about 400 ms of fib on main (main_work) and on a
+// second OS thread (thread_work), prof_stop, prof_report. Under
+// FID_PROF=folded the report is the folded stacks (root first, one line
+// each), and both threads' stacks are in it; otherwise the table.
+// Checked by tests/prof/db9-check.sh. Output (stdout), on every backend:
+// start true
+// main 75025
+// thread 75025
+// samples ok
+use profiler;
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main_work(until: i64) -> i64 {
+    var s: i64 = 0;
+    while p_clock_now_ms() < until {
+        s = fib(25);
+    }
+    return s;
+}
+
+fn thread_work(until: i64) -> i64 {
+    var s: i64 = 0;
+    while p_clock_now_ms() < until {
+        s = fib(25);
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    val started = prof_start();
+    if started {
+        println("start true");
+    } else {
+        println("start false");
+    }
+    val until: i64 = p_clock_now_ms() + 400;
+    val t = spawn thread_work(until);
+    val a: i64 = main_work(until);
+    val b: i64 = await t;
+    println("main " + int_to_str(a));
+    println("thread " + int_to_str(b));
+    val n = prof_stop();
+    if n > 0 {
+        println("samples ok");
+    } else {
+        println("samples " + int_to_str(n));
+    }
+    prof_report();
+    return 0;
+}

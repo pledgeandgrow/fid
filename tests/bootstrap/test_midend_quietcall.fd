@@ -1,0 +1,111 @@
+// OP25 (compiler/iropt.fd iro_quiet_fns, iro_dead_calls, iro_licm_loop;
+// opt-in FID_IROPT_ON=quietcall): calls that end, never panic and change
+// nothing.
+// - unused: `mix(i, 3)` is called for nothing: mix has no loop, no
+//   recursion, nothing that can trap (bit operations and comparisons), and
+//   writes nothing, so the unused call goes.
+// - hoisted: `mix(a, b)` sits in the loop's body behind an `if`, not in its
+//   header; its arguments come from outside the loop and it touches no
+//   memory, so LICM computes it once before the loop.
+// - kept_print: an unused call to `loud`, which prints, stays (the output
+//   shows it).
+// - kept_loop: an unused call to `spin`, which loops, is not proved to end
+//   and stays (its count shows it ran).
+// - kept_rec: `down` calls itself: recursion is never proved to end.
+// - kept_div: `quot` divides integers (a division by zero panics): an
+//   unused call to it stays, so `quot(1, 0)` would still panic; it is only
+//   called with a divisor that is not zero here.
+// - wrapping: @wrapping arithmetic cannot overflow-panic, so `wmix` is
+//   quiet.
+// The program prints the same with the pass on and off.
+//
+// Expected output:
+// 100
+// 1500
+// loud 7
+// 7
+// 4
+// 3
+// 0
+// 2
+// 77
+
+var g_spins: i64 = 0;
+
+fn mix(a: i64, b: i64) -> i64 {
+    var r: i64 = (a ^ b) | (a & 12);
+    if r > 100 {
+        r = r & 255;
+    }
+    return r;
+}
+
+@wrapping
+fn wmix(a: i64, b: i64) -> i64 {
+    return a * 31 + b;
+}
+
+fn loud(x: i64) -> i64 {
+    print("loud ");
+    println(x);
+    return x;
+}
+
+fn spin(n: i64) -> i64 {
+    var k: i64 = 0;
+    while k < n {
+        k = k + 1;
+    }
+    g_spins = g_spins + k;
+    return k;
+}
+
+fn down(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    return down(n - 1);
+}
+
+fn quot(a: i64, b: i64) -> i64 {
+    return a / b;
+}
+
+fn unused(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        mix(i, 3);
+        wmix(i, 1);
+        s = s + 1;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn hoisted(n: i64, a: i64, b: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 2 == 0 {
+            s = s + mix(a, b);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println(unused(100));
+    // mix(20, 10) = (20 ^ 10) | (20 & 12) = 30 | 4 = 30; 50 even i's
+    println(hoisted(100, 20, 10));
+    loud(7);
+    spin(4);
+    println(7);
+    println(g_spins);
+    println(down(3) + 3);
+    quot(1, 1);
+    println(down(5));
+    println(quot(9, 4));
+    println(wmix(2, 15));
+}

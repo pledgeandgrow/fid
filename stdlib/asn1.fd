@@ -1,0 +1,796 @@
+// Fides ASN.1: a DER encoder and a DER/BER decoder (ITU-T X.690).
+//
+// Pure computation, no platform seam. The decoder does not build a tree:
+// asn1_read gives the header of one element (an Asn1Tlv: class, tag,
+// where its content starts, how long it is, where it ends), asn1_children
+// lists the elements inside a constructed one, and the asn1_get_*
+// functions decode a primitive's content. Callers walk a structure by
+// offsets into the one byte buffer, as x509 and pem do.
+//
+// Lengths: short form, long form (1..8 bytes) and BER's indefinite form
+// (0x80, content up to an end-of-contents 00 00, nested as deep as the
+// data goes). asn1_read accepts BER; asn1_read_der additionally rejects
+// what DER forbids (indefinite lengths, non-minimal length or tag
+// encodings). High tag numbers (the 0x1f form) are read and written.
+//
+// The encoder writes DER: minimal lengths, minimal two's-complement
+// INTEGERs, BOOLEAN true as 0xff, SET OF sorted by encoding, UTCTime for
+// years 1950..2049 and GeneralizedTime otherwise (both in Z form).
+//
+// Bytes are Vec<i64>, one byte 0..255 per element. Times are Unix seconds.
+// Checked against X.690's examples and known encodings in
+// tests/bootstrap/test_std_asn1.fd.
+//
+// Usage:
+//   use asn1;
+//   val der = asn1_enc_seq(asn1_cat(asn1_enc_int(5), asn1_enc_oid("1.2.840.113549")));
+//   val top = asn1_read_der(& der, 0, der.len());
+//   val kids = asn1_children(& der, top);
+//   val five = asn1_get_int(& der, kids.get(0));
+
+module asn1;
+use vec;
+
+pub const ASN1_BOOLEAN: i64 = 1;
+pub const ASN1_INTEGER: i64 = 2;
+pub const ASN1_BIT_STRING: i64 = 3;
+pub const ASN1_OCTET_STRING: i64 = 4;
+pub const ASN1_NULL: i64 = 5;
+pub const ASN1_OID: i64 = 6;
+pub const ASN1_ENUMERATED: i64 = 10;
+pub const ASN1_UTF8_STRING: i64 = 12;
+pub const ASN1_SEQUENCE: i64 = 16;
+pub const ASN1_SET: i64 = 17;
+pub const ASN1_PRINTABLE_STRING: i64 = 19;
+pub const ASN1_T61_STRING: i64 = 20;
+pub const ASN1_IA5_STRING: i64 = 22;
+pub const ASN1_UTC_TIME: i64 = 23;
+pub const ASN1_GENERALIZED_TIME: i64 = 24;
+pub const ASN1_BMP_STRING: i64 = 30;
+
+pub const ASN1_CLASS_UNIVERSAL: i64 = 0;
+pub const ASN1_CLASS_APPLICATION: i64 = 1;
+pub const ASN1_CLASS_CONTEXT: i64 = 2;
+pub const ASN1_CLASS_PRIVATE: i64 = 3;
+
+/// The header of one element. `off`..`off + len` is the content; `end` is
+/// the offset after the element (after the 00 00 of an indefinite length).
+/// `ok` is false when the bytes do not hold a well-formed element, `der`
+/// false when the element is valid BER but not DER.
+pub struct Asn1Tlv {
+    pub ok: bool,
+    pub cls: i64,
+    pub constructed: bool,
+    pub tag: i64,
+    pub start: i64,
+    pub off: i64,
+    pub len: i64,
+    pub end: i64,
+    pub indefinite: bool,
+    pub der: bool,
+}
+
+fn asn1_bad(at: i64) -> Asn1Tlv {
+    return Asn1Tlv {
+        ok: false, cls: 0, constructed: false, tag: 0, start: at, off: at,
+        len: 0, end: at, indefinite: false, der: false
+    };
+}
+
+fn asn1_read_depth(buf: & Vec<i64>, at: i64, limit: i64, depth: i64) -> Asn1Tlv {
+    if depth > 64 || at < 0 || at + 2 > limit || limit > buf.len() {
+        return asn1_bad(at);
+    }
+    var p: i64 = at;
+    val b0: i64 = buf.get(p) & 255;
+    p = p + 1;
+    val cls: i64 = b0 >> 6;
+    val constructed: bool = (b0 & 0x20) != 0;
+    var tag: i64 = b0 & 0x1f;
+    var der: bool = true;
+    if tag == 0x1f {
+        // High tag number: base-128, high bit = more bytes follow.
+        tag = 0;
+        var first: bool = true;
+        var more: bool = true;
+        while more {
+            if p >= limit { return asn1_bad(at); }
+            val b: i64 = buf.get(p) & 255;
+            p = p + 1;
+            if first && b == 0x80 { der = false; }
+            first = false;
+            if tag > (1 << 48) { return asn1_bad(at); }
+            tag = (tag << 7) | (b & 0x7f);
+            more = (b & 0x80) != 0;
+        }
+        if tag < 31 { der = false; }
+    }
+    if p >= limit { return asn1_bad(at); }
+    val lb: i64 = buf.get(p) & 255;
+    p = p + 1;
+    var len: i64 = 0;
+    var indefinite: bool = false;
+    if lb < 0x80 {
+        len = lb;
+    } else if lb == 0x80 {
+        indefinite = true;
+        der = false;
+        if !constructed { return asn1_bad(at); }
+    } else {
+        val nb: i64 = lb & 0x7f;
+        if nb > 8 || nb == 0x7f { return asn1_bad(at); }
+        if p + nb > limit { return asn1_bad(at); }
+        var i: i64 = 0;
+        while i < nb {
+            if len > (1 << 54) { return asn1_bad(at); }
+            len = (len << 8) | (buf.get(p + i) & 255);
+            i = i + 1;
+        }
+        if (buf.get(p) & 255) == 0 { der = false; }
+        if len < 128 { der = false; }
+        p = p + nb;
+    }
+    if indefinite {
+        // Content runs up to the end-of-contents octets 00 00.
+        var q: i64 = p;
+        var found: bool = false;
+        while !found {
+            if q + 2 > limit { return asn1_bad(at); }
+            if (buf.get(q) & 255) == 0 && (buf.get(q + 1) & 255) == 0 {
+                found = true;
+            } else {
+                val kid: Asn1Tlv = asn1_read_depth(buf, q, limit, depth + 1);
+                if !kid.ok { return asn1_bad(at); }
+                q = kid.end;
+            }
+        }
+        return Asn1Tlv {
+            ok: true, cls: cls, constructed: constructed, tag: tag, start: at,
+            off: p, len: q - p, end: q + 2, indefinite: true, der: false
+        };
+    }
+    if len < 0 || p + len > limit { return asn1_bad(at); }
+    return Asn1Tlv {
+        ok: true, cls: cls, constructed: constructed, tag: tag, start: at,
+        off: p, len: len, end: p + len, indefinite: false, der: der
+    };
+}
+
+/// The element at `at`, which must end by `limit` (BER: any length form).
+pub fn asn1_read(buf: & Vec<i64>, at: i64, limit: i64) -> Asn1Tlv {
+    return asn1_read_depth(buf, at, limit, 0);
+}
+
+/// The element at `at` under DER's rules: anything only BER allows makes
+/// the result not ok.
+pub fn asn1_read_der(buf: & Vec<i64>, at: i64, limit: i64) -> Asn1Tlv {
+    val t: Asn1Tlv = asn1_read_depth(buf, at, limit, 0);
+    if t.ok && !t.der { return asn1_bad(at); }
+    return t;
+}
+
+/// Whether t is the universal element with tag number `tag`.
+pub fn asn1_is(t: Asn1Tlv, tag: i64) -> bool {
+    return t.ok && t.cls == 0 && t.tag == tag;
+}
+
+/// Whether t is the context-specific element [n].
+pub fn asn1_is_ctx(t: Asn1Tlv, n: i64) -> bool {
+    return t.ok && t.cls == 2 && t.tag == n;
+}
+
+/// The elements directly inside a constructed element, in order. A
+/// malformed child ends the list with an element whose ok is false.
+pub fn asn1_children(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<Asn1Tlv> {
+    var out: Vec<Asn1Tlv> = Vec::new();
+    if !t.ok || !t.constructed { return out; }
+    var p: i64 = t.off;
+    val stop: i64 = t.off + t.len;
+    while p < stop {
+        val kid: Asn1Tlv = asn1_read(buf, p, stop);
+        out.push(kid);
+        if !kid.ok { return out; }
+        p = kid.end;
+    }
+    return out;
+}
+
+/// The number of children, or -1 when one of them is malformed.
+pub fn asn1_count(buf: & Vec<i64>, t: Asn1Tlv) -> i64 {
+    val kids: Vec<Asn1Tlv> = asn1_children(buf, t);
+    var i: i64 = 0;
+    while i < kids.len() {
+        if !kids.get(i).ok { return -1; }
+        i = i + 1;
+    }
+    return kids.len();
+}
+
+/// Bytes buf[from..to].
+pub fn asn1_slice(buf: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        out.push(buf.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The content bytes of an element.
+pub fn asn1_content(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<i64> {
+    return asn1_slice(buf, t.off, t.off + t.len);
+}
+
+/// The whole encoding of an element, header included.
+pub fn asn1_raw(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<i64> {
+    return asn1_slice(buf, t.start, t.end);
+}
+
+// ─── Decoding primitives ───────────────────────────────────────────────
+
+/// An INTEGER (or ENUMERATED) that fits in i64, two's complement.
+pub fn asn1_get_int(buf: & Vec<i64>, t: Asn1Tlv) -> i64 {
+    if t.len == 0 { return 0; }
+    var v: i64 = 0;
+    if (buf.get(t.off) & 0x80) != 0 { v = -1; }
+    var i: i64 = 0;
+    while i < t.len && i < 8 {
+        v = (v << 8) | (buf.get(t.off + i) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Whether an INTEGER's content is minimal (DER: no redundant leading
+/// 00 or ff byte) and not empty.
+pub fn asn1_int_minimal(buf: & Vec<i64>, t: Asn1Tlv) -> bool {
+    if t.len == 0 { return false; }
+    if t.len == 1 { return true; }
+    val a: i64 = buf.get(t.off) & 255;
+    val b: i64 = buf.get(t.off + 1) & 0x80;
+    if a == 0 && b == 0 { return false; }
+    if a == 0xff && b != 0 { return false; }
+    return true;
+}
+
+/// Whether an INTEGER is negative.
+pub fn asn1_int_negative(buf: & Vec<i64>, t: Asn1Tlv) -> bool {
+    return t.len > 0 && (buf.get(t.off) & 0x80) != 0;
+}
+
+/// The magnitude bytes of a non-negative INTEGER, big-endian, without
+/// leading zero bytes (at least one byte): RSA moduli, ECDSA r and s.
+pub fn asn1_get_uint_bytes(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<i64> {
+    var i: i64 = 0;
+    while i < t.len - 1 && (buf.get(t.off + i) & 255) == 0 {
+        i = i + 1;
+    }
+    return asn1_slice(buf, t.off + i, t.off + t.len);
+}
+
+/// A BOOLEAN: any non-zero byte is true (DER requires 0xff).
+pub fn asn1_get_bool(buf: & Vec<i64>, t: Asn1Tlv) -> bool {
+    return t.len == 1 && (buf.get(t.off) & 255) != 0;
+}
+
+/// An OBJECT IDENTIFIER in dotted form ("1.2.840.113549.1.1.11"); "" when
+/// malformed.
+pub fn asn1_get_oid(buf: & Vec<i64>, t: Asn1Tlv) -> str {
+    if t.len == 0 { return ""; }
+    var out: str = "";
+    var v: i64 = 0;
+    var first: bool = true;
+    var i: i64 = 0;
+    var fresh: bool = true;
+    while i < t.len {
+        val b: i64 = buf.get(t.off + i) & 255;
+        if fresh && b == 0x80 { return ""; }
+        if v > (1 << 55) { return ""; }
+        v = (v << 7) | (b & 0x7f);
+        fresh = false;
+        if (b & 0x80) == 0 {
+            if first {
+                var a: i64 = 2;
+                if v < 40 { a = 0; } else if v < 80 { a = 1; }
+                out = int_to_str(a) + "." + int_to_str(v - a * 40);
+                first = false;
+            } else {
+                out = out + "." + int_to_str(v);
+            }
+            v = 0;
+            fresh = true;
+        }
+        i = i + 1;
+    }
+    if !fresh { return ""; }
+    return out;
+}
+
+/// The number of unused bits in the last byte of a BIT STRING.
+pub fn asn1_bits_unused(buf: & Vec<i64>, t: Asn1Tlv) -> i64 {
+    if t.len == 0 { return 0; }
+    return buf.get(t.off) & 255;
+}
+
+/// The bytes of a BIT STRING (after the unused-bits count byte).
+pub fn asn1_get_bits(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<i64> {
+    if t.len == 0 { return Vec::new(); }
+    return asn1_slice(buf, t.off + 1, t.off + t.len);
+}
+
+/// A string type's bytes as a str (UTF8String, PrintableString,
+/// IA5String, T61String: bytes as they are; BMPString: UCS-2 to UTF-8).
+pub fn asn1_get_str(buf: & Vec<i64>, t: Asn1Tlv) -> str {
+    if t.tag == ASN1_BMP_STRING && t.cls == 0 {
+        var out: str = "";
+        var i: i64 = 0;
+        while i + 1 < t.len {
+            val cp: i64 = ((buf.get(t.off + i) & 255) << 8) | (buf.get(t.off + i + 1) & 255);
+            out = out + str_from_bytes(asn1_utf8_of(cp));
+            i = i + 2;
+        }
+        return out;
+    }
+    return str_from_bytes(asn1_content(buf, t));
+}
+
+fn asn1_utf8_of(cp: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    if cp < 0x80 {
+        o.push(cp);
+    } else if cp < 0x800 {
+        o.push(0xc0 | (cp >> 6));
+        o.push(0x80 | (cp & 0x3f));
+    } else {
+        o.push(0xe0 | (cp >> 12));
+        o.push(0x80 | ((cp >> 6) & 0x3f));
+        o.push(0x80 | (cp & 0x3f));
+    }
+    return o;
+}
+
+// ─── Calendar (proleptic Gregorian, UTC) ───────────────────────────────
+
+/// Days since 1970-01-01 of a civil date (H. Hinnant's algorithm).
+pub fn asn1_days_from_civil(y_in: i64, m: i64, d: i64) -> i64 {
+    var y: i64 = y_in;
+    if m <= 2 { y = y - 1; }
+    var era: i64 = y / 400;
+    if y < 0 && y % 400 != 0 { era = era - 1; }
+    val yoe: i64 = y - era * 400;
+    var mp: i64 = m - 3;
+    if m <= 2 { mp = m + 9; }
+    val doy: i64 = (153 * mp + 2) / 5 + d - 1;
+    val doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Unix seconds of a UTC date and time.
+pub fn asn1_unix_time(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+    return asn1_days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+}
+
+/// The civil date of a day count: year * 10000 + month * 100 + day.
+pub fn asn1_civil_from_days(z_in: i64) -> i64 {
+    val z: i64 = z_in + 719468;
+    var era: i64 = z / 146097;
+    if z < 0 && z % 146097 != 0 { era = era - 1; }
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    val d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = mp + 3;
+    if mp >= 10 { m = mp - 9; }
+    var y: i64 = yoe + era * 400;
+    if m <= 2 { y = y + 1; }
+    return y * 10000 + m * 100 + d;
+}
+
+fn asn1_digits(buf: & Vec<i64>, at: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = buf.get(at + i) & 255;
+        if c < 48 || c > 57 { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// A UTCTime (YYMMDDHHMM[SS]Z, years 50..99 are 19xx) or GeneralizedTime
+/// (YYYYMMDDHHMMSS[.fff]Z) as Unix seconds. Offsets other than Z and
+/// local times are refused (None), as RFC 5280 requires Z.
+pub fn asn1_get_time(buf: & Vec<i64>, t: Asn1Tlv) -> Option<i64> {
+    if !t.ok || t.cls != 0 { return Option::None; }
+    var p: i64 = t.off;
+    val end: i64 = t.off + t.len;
+    var y: i64 = 0;
+    if t.tag == ASN1_UTC_TIME {
+        if t.len < 11 { return Option::None; }
+        y = asn1_digits(buf, p, 2);
+        if y < 0 { return Option::None; }
+        if y < 50 { y = y + 2000; } else { y = y + 1900; }
+        p = p + 2;
+    } else if t.tag == ASN1_GENERALIZED_TIME {
+        if t.len < 13 { return Option::None; }
+        y = asn1_digits(buf, p, 4);
+        if y < 0 { return Option::None; }
+        p = p + 4;
+    } else {
+        return Option::None;
+    }
+    val mo: i64 = asn1_digits(buf, p, 2);
+    val d: i64 = asn1_digits(buf, p + 2, 2);
+    val h: i64 = asn1_digits(buf, p + 4, 2);
+    val mi: i64 = asn1_digits(buf, p + 6, 2);
+    p = p + 8;
+    var s: i64 = 0;
+    if p + 2 < end || (p + 2 == end && (buf.get(p) & 255) != 90) {
+        s = asn1_digits(buf, p, 2);
+        p = p + 2;
+    }
+    if t.tag == ASN1_GENERALIZED_TIME && p < end && (buf.get(p) & 255) == 46 {
+        p = p + 1;
+        while p < end && (buf.get(p) & 255) >= 48 && (buf.get(p) & 255) <= 57 { p = p + 1; }
+    }
+    if p != end - 1 || (buf.get(p) & 255) != 90 { return Option::None; }
+    if mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 60 {
+        return Option::None;
+    }
+    return Option::Some(asn1_unix_time(y, mo, d, h, mi, s));
+}
+
+// ─── Encoding ──────────────────────────────────────────────────────────
+
+/// a followed by b.
+pub fn asn1_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() { out.push(a.get(i)); i = i + 1; }
+    i = 0;
+    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    return out;
+}
+
+/// A DER length: short form below 128, else 0x80 + byte count, big-endian.
+pub fn asn1_enc_len(n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if n < 128 {
+        out.push(n);
+        return out;
+    }
+    var bytes: Vec<i64> = Vec::new();
+    var v: i64 = n;
+    while v > 0 {
+        bytes.push(v & 255);
+        v = v >> 8;
+    }
+    out.push(0x80 | bytes.len());
+    var i: i64 = bytes.len() - 1;
+    while i >= 0 { out.push(bytes.get(i)); i = i - 1; }
+    return out;
+}
+
+/// An element with class, constructed flag and any tag number.
+pub fn asn1_enc_tag(cls: i64, constructed: bool, tag: i64, content: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var b0: i64 = (cls & 3) << 6;
+    if constructed { b0 = b0 | 0x20; }
+    if tag < 31 {
+        out.push(b0 | tag);
+    } else {
+        out.push(b0 | 0x1f);
+        var groups: Vec<i64> = Vec::new();
+        var v: i64 = tag;
+        while v > 0 { groups.push(v & 0x7f); v = v >> 7; }
+        var i: i64 = groups.len() - 1;
+        while i >= 0 {
+            var g: i64 = groups.get(i);
+            if i > 0 { g = g | 0x80; }
+            out.push(g);
+            i = i - 1;
+        }
+    }
+    val l: Vec<i64> = asn1_enc_len(content.len());
+    var j: i64 = 0;
+    while j < l.len() { out.push(l.get(j)); j = j + 1; }
+    j = 0;
+    while j < content.len() { out.push(content.get(j) & 255); j = j + 1; }
+    return out;
+}
+
+/// A universal element: tag number below 31, constructed for SEQUENCE/SET.
+pub fn asn1_enc_tlv(tag: i64, content: Vec<i64>) -> Vec<i64> {
+    return asn1_enc_tag(0, tag == ASN1_SEQUENCE || tag == ASN1_SET, tag, content);
+}
+
+/// INTEGER of an i64, minimal two's complement.
+pub fn asn1_enc_int(x: i64) -> Vec<i64> {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 7;
+    while i >= 0 {
+        bytes.push((x >> (i * 8)) & 255);
+        i = i - 1;
+    }
+    var s: i64 = 0;
+    while s < 7 {
+        val a: i64 = bytes.get(s);
+        val b: i64 = bytes.get(s + 1) & 0x80;
+        if (a == 0 && b == 0) || (a == 255 && b != 0) {
+            s = s + 1;
+        } else {
+            break;
+        }
+    }
+    return asn1_enc_tlv(ASN1_INTEGER, asn1_slice(& bytes, s, 8));
+}
+
+/// INTEGER of a non-negative big-endian magnitude (leading zeros dropped,
+/// a 00 added when the top bit is set).
+pub fn asn1_enc_uint(mag: Vec<i64>) -> Vec<i64> {
+    var i: i64 = 0;
+    while i < mag.len() - 1 && (mag.get(i) & 255) == 0 { i = i + 1; }
+    var c: Vec<i64> = Vec::new();
+    if mag.len() == 0 {
+        c.push(0);
+        return asn1_enc_tlv(ASN1_INTEGER, c);
+    }
+    if (mag.get(i) & 0x80) != 0 { c.push(0); }
+    while i < mag.len() { c.push(mag.get(i) & 255); i = i + 1; }
+    return asn1_enc_tlv(ASN1_INTEGER, c);
+}
+
+/// BOOLEAN (DER: true is 0xff).
+pub fn asn1_enc_bool(b: bool) -> Vec<i64> {
+    var c: Vec<i64> = Vec::new();
+    if b { c.push(255); } else { c.push(0); }
+    return asn1_enc_tlv(ASN1_BOOLEAN, c);
+}
+
+/// NULL.
+pub fn asn1_enc_null() -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_NULL, Vec::new());
+}
+
+fn asn1_put_base128(out: & mut Vec<i64>, v: i64) {
+    var groups: Vec<i64> = Vec::new();
+    var x: i64 = v;
+    groups.push(x & 0x7f);
+    x = x >> 7;
+    while x > 0 { groups.push(x & 0x7f); x = x >> 7; }
+    var i: i64 = groups.len() - 1;
+    while i >= 0 {
+        var g: i64 = groups.get(i);
+        if i > 0 { g = g | 0x80; }
+        out.push(g);
+        i = i - 1;
+    }
+}
+
+/// The content bytes of a dotted OID; empty when the text is not an OID.
+pub fn asn1_oid_content(oid: str) -> Vec<i64> {
+    var arcs: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var digits: i64 = 0;
+    var i: i64 = 0;
+    val n: i64 = str_len(oid);
+    while i <= n {
+        var c: i64 = 46;
+        if i < n { c = str_byte_at(oid, i); }
+        if c == 46 {
+            if digits == 0 { return Vec::new(); }
+            arcs.push(cur);
+            cur = 0;
+            digits = 0;
+        } else if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48);
+            digits = digits + 1;
+        } else {
+            return Vec::new();
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    if arcs.len() < 2 || arcs.get(0) > 2 || (arcs.get(0) < 2 && arcs.get(1) >= 40) {
+        return out;
+    }
+    asn1_put_base128(& mut out, arcs.get(0) * 40 + arcs.get(1));
+    var k: i64 = 2;
+    while k < arcs.len() {
+        asn1_put_base128(& mut out, arcs.get(k));
+        k = k + 1;
+    }
+    return out;
+}
+
+/// OBJECT IDENTIFIER from dotted text.
+pub fn asn1_enc_oid(oid: str) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_OID, asn1_oid_content(oid));
+}
+
+/// OCTET STRING.
+pub fn asn1_enc_octets(b: Vec<i64>) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_OCTET_STRING, b);
+}
+
+/// BIT STRING of bytes whose last `unused` bits (0..7) are padding; DER
+/// requires those bits to be zero, so they are cleared.
+pub fn asn1_enc_bits(b: Vec<i64>, unused: i64) -> Vec<i64> {
+    var c: Vec<i64> = Vec::new();
+    c.push(unused & 7);
+    var i: i64 = 0;
+    while i < b.len() {
+        var x: i64 = b.get(i) & 255;
+        if i == b.len() - 1 && unused > 0 {
+            x = x & (255 - ((1 << unused) - 1));
+        }
+        c.push(x);
+        i = i + 1;
+    }
+    return asn1_enc_tlv(ASN1_BIT_STRING, c);
+}
+
+/// UTF8String.
+pub fn asn1_enc_utf8(s: str) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_UTF8_STRING, str_bytes(s));
+}
+
+/// Whether every byte is in PrintableString's alphabet (X.680 §41.4).
+pub fn asn1_is_printable(s: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        var good: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+        if c == 32 || c == 39 || c == 40 || c == 41 || c == 43 || c == 44 || c == 45 || c == 46 || c == 47 || c == 58 || c == 61 || c == 63 {
+            good = true;
+        }
+        if !good { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// PrintableString (the caller checks the alphabet with asn1_is_printable).
+pub fn asn1_enc_printable(s: str) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_PRINTABLE_STRING, str_bytes(s));
+}
+
+/// IA5String (ASCII: e-mail addresses, DNS names).
+pub fn asn1_enc_ia5(s: str) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_IA5_STRING, str_bytes(s));
+}
+
+fn asn1_push_num(out: & mut Vec<i64>, v: i64, width: i64) {
+    var d: Vec<i64> = Vec::new();
+    var x: i64 = v;
+    var i: i64 = 0;
+    while i < width {
+        d.push(48 + x % 10);
+        x = x / 10;
+        i = i + 1;
+    }
+    i = width - 1;
+    while i >= 0 { out.push(d.get(i)); i = i - 1; }
+}
+
+fn asn1_time_content(unix: i64, four: bool) -> Vec<i64> {
+    var days: i64 = unix / 86400;
+    var secs: i64 = unix % 86400;
+    if secs < 0 { secs = secs + 86400; days = days - 1; }
+    val ymd: i64 = asn1_civil_from_days(days);
+    val y: i64 = ymd / 10000;
+    var out: Vec<i64> = Vec::new();
+    if four { asn1_push_num(& mut out, y, 4); } else { asn1_push_num(& mut out, y % 100, 2); }
+    asn1_push_num(& mut out, (ymd / 100) % 100, 2);
+    asn1_push_num(& mut out, ymd % 100, 2);
+    asn1_push_num(& mut out, secs / 3600, 2);
+    asn1_push_num(& mut out, (secs / 60) % 60, 2);
+    asn1_push_num(& mut out, secs % 60, 2);
+    out.push(90);
+    return out;
+}
+
+/// UTCTime YYMMDDHHMMSSZ.
+pub fn asn1_enc_utctime(unix: i64) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_UTC_TIME, asn1_time_content(unix, false));
+}
+
+/// GeneralizedTime YYYYMMDDHHMMSSZ.
+pub fn asn1_enc_gentime(unix: i64) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_GENERALIZED_TIME, asn1_time_content(unix, true));
+}
+
+/// RFC 5280's Time: UTCTime through 2049, GeneralizedTime from 2050.
+pub fn asn1_enc_time(unix: i64) -> Vec<i64> {
+    val y: i64 = asn1_civil_from_days(unix / 86400) / 10000;
+    if y >= 1950 && y < 2050 { return asn1_enc_utctime(unix); }
+    return asn1_enc_gentime(unix);
+}
+
+/// SEQUENCE around already-encoded elements.
+pub fn asn1_enc_seq(content: Vec<i64>) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_SEQUENCE, content);
+}
+
+/// SET around already-encoded elements (kept in the given order).
+pub fn asn1_enc_set(content: Vec<i64>) -> Vec<i64> {
+    return asn1_enc_tlv(ASN1_SET, content);
+}
+
+/// Compare encodings as DER's SET OF does: byte by byte, the shorter one
+/// padded with zeros at its end. Negative, 0 or positive.
+pub fn asn1_bytes_cmp(a: & Vec<i64>, b: & Vec<i64>) -> i64 {
+    var n: i64 = a.len();
+    if b.len() > n { n = b.len(); }
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = 0;
+        var y: i64 = 0;
+        if i < a.len() { x = a.get(i) & 255; }
+        if i < b.len() { y = b.get(i) & 255; }
+        if x != y { return x - y; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// SET OF: the encoded elements sorted into DER order.
+pub fn asn1_enc_set_of(elems: Vec<Vec<i64>>) -> Vec<i64> {
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < elems.len() { order.push(i); i = i + 1; }
+    i = 1;
+    while i < order.len() {
+        var j: i64 = i;
+        while j > 0 {
+            val a: Vec<i64> = elems.get(order.get(j - 1));
+            val b: Vec<i64> = elems.get(order.get(j));
+            if asn1_bytes_cmp(& a, & b) <= 0 { break; }
+            val tmp: i64 = order.get(j);
+            order.set(j, order.get(j - 1));
+            order.set(j - 1, tmp);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    var content: Vec<i64> = Vec::new();
+    i = 0;
+    while i < order.len() {
+        val e: Vec<i64> = elems.get(order.get(i));
+        var k: i64 = 0;
+        while k < e.len() { content.push(e.get(k)); k = k + 1; }
+        i = i + 1;
+    }
+    return asn1_enc_set(content);
+}
+
+/// [n] EXPLICIT: a constructed context element around an encoded element.
+pub fn asn1_enc_explicit(n: i64, inner: Vec<i64>) -> Vec<i64> {
+    return asn1_enc_tag(2, true, n, inner);
+}
+
+/// [n] IMPLICIT: the content of an element under a context tag.
+pub fn asn1_enc_implicit(n: i64, constructed: bool, content: Vec<i64>) -> Vec<i64> {
+    return asn1_enc_tag(2, constructed, n, content);
+}
+
+// ─── Searching ─────────────────────────────────────────────────────────
+
+/// Follow a path of child indexes from the element at `at`: path [1, 0]
+/// is the first child of the second child. Not ok when a step is missing.
+pub fn asn1_path(buf: & Vec<i64>, at: i64, path: Vec<i64>) -> Asn1Tlv {
+    var t: Asn1Tlv = asn1_read(buf, at, buf.len());
+    var i: i64 = 0;
+    while i < path.len() {
+        if !t.ok { return t; }
+        val kids: Vec<Asn1Tlv> = asn1_children(buf, t);
+        val k: i64 = path.get(i);
+        if k < 0 || k >= kids.len() { return asn1_bad(t.start); }
+        t = kids.get(k);
+        i = i + 1;
+    }
+    return t;
+}

@@ -1,0 +1,102 @@
+// stdlib/oauth2: RFC 7636 Appendix B (S256 challenge), RFC 6749 §4.1.3's Basic header and form encoding, discovery parsing with an issuer mismatch, the authorization URL, redirect parsing (state, iss, error), token request bodies for the three grants and the client auth methods (an HS256 client assertion byte-exact against Node.js), token and error responses, and OIDC ID token validation of RS256 tokens signed by Node.js against a JWKS (good token, wrong nonce, at_hash, several audiences without azp, expired, max_age).
+// Expected output:
+// pkce E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM check true bad verifier false
+// basic Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW
+// basic encoded Basic bXkrY2xpZW50OnAlNDBzcyUyQncwcmQlMjE=
+// form a+b%26c%3Dd%2Fe~f.g_h-i%C3%A9 back a b&c=d/e~f.g_h-ié
+// discovery ok true token https://idp.example/token algs RS256,EdDSA s256 true
+// wrong issuer: issuer mismatch
+// discovery url https://idp.example/.well-known/openid-configuration
+// authorize https://idp.example/authorize?response_type=code&client_id=client-1&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&scope=openid+profile&state=af0ifjsldkj&nonce=n-0S6_WzA2Mj&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256
+// redirect ok true code SplxlOBeZQQYbYS6WxSbIA
+// redirect wrong state: state mismatch
+// redirect wrong iss: issuer mismatch
+// redirect error: access_denied: user said no
+// code grant grant_type=authorization_code&code=SplxlOBeZQQYbYS6WxSbIA&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&client_id=client-1
+// code grant headers Content-Type: application/x-www-form-urlencoded|Accept: application/json
+// refresh grant grant_type=refresh_token&refresh_token=tGzv3JOkF0XG5Qx2TlKWIA&scope=openid
+// refresh auth header true
+// client credentials grant_type=client_credentials&scope=api.read&client_id=svc&client_secret=s3cr3t
+// assertion same as node true
+// assertion body has type true
+// revoke token=45ghiukldjahdnhzdauz&token_type_hint=refresh_token
+// token ok true bearer usable true at 1700003600 refresh tGzv3JOkF0XG5Qx2TlKWIA
+// token error invalid_grant: code expired
+// id token ok true sub 248289761001 name Jane Doe
+// wrong nonce: wrong nonce
+// at_hash: at_hash mismatch
+// several audiences: several audiences and no azp
+// expired: token expired
+// max_age: authentication too old
+// userinfo GET https://idp.example/userinfo Authorization: Bearer ya29.access-token-value
+use oauth2;
+use jose;
+use vec;
+use string;
+use json;
+
+fn main() {
+    val v: str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    val pk: OAuthPkce = oauth2_pkce(v);
+    println("pkce " + pk.challenge + " check " + bool_to_str(oauth2_pkce_check(v, pk.challenge, "S256")) + " bad verifier " + bool_to_str(oauth2_pkce_check("short", pk.challenge, "S256")));
+    println("basic " + oauth2_basic_auth("s6BhdRkqt3", "gX1fBat3bV"));
+    println("basic encoded " + oauth2_basic_auth("my client", "p@ss+w0rd!"));
+    var eacute: Vec<i64> = Vec::new();
+    eacute.push(0xc3);
+    eacute.push(0xa9);
+    val f: str = oauth2_form_encode("a b&c=d/e~f.g_h-i" + str_from_bytes(eacute));
+    println("form " + f + " back " + oauth2_form_decode(f));
+
+    val doc: str = "{\"issuer\":\"https://idp.example\",\"authorization_endpoint\":\"https://idp.example/authorize\",\"token_endpoint\":\"https://idp.example/token\",\"userinfo_endpoint\":\"https://idp.example/userinfo\",\"jwks_uri\":\"https://idp.example/jwks\",\"revocation_endpoint\":\"https://idp.example/revoke\",\"response_types_supported\":[\"code\"],\"id_token_signing_alg_values_supported\":[\"RS256\",\"EdDSA\"],\"code_challenge_methods_supported\":[\"plain\",\"S256\"],\"authorization_response_iss_parameter_supported\":true}";
+    val p: OAuthProvider = oauth2_parse_discovery(doc, "https://idp.example");
+    println("discovery ok " + bool_to_str(p.ok) + " token " + p.token_endpoint + " algs " + p.id_token_algs + " s256 " + bool_to_str(p.supports_s256));
+    println("wrong issuer: " + oauth2_parse_discovery(doc, "https://evil.example").err);
+    println("discovery url " + oauth2_discovery_url("https://idp.example/"));
+
+    val c: OAuthClient = oauth2_client("client-1", "", "https://app.example/cb");
+    println("authorize " + oauth2_authorize_url(& p, & c, "openid profile", "af0ifjsldkj", "n-0S6_WzA2Mj", pk.challenge));
+    val cb: OAuthRedirect = oauth2_parse_redirect("https://app.example/cb?code=SplxlOBeZQQYbYS6WxSbIA&state=af0ifjsldkj&iss=https%3A%2F%2Fidp.example", "af0ifjsldkj", & p);
+    println("redirect ok " + bool_to_str(cb.ok) + " code " + cb.code);
+    println("redirect wrong state: " + oauth2_parse_redirect("https://app.example/cb?code=x&state=other&iss=https%3A%2F%2Fidp.example", "af0ifjsldkj", & p).err);
+    println("redirect wrong iss: " + oauth2_parse_redirect("https://app.example/cb?code=x&state=af0ifjsldkj&iss=https%3A%2F%2Fevil.example", "af0ifjsldkj", & p).err);
+    println("redirect error: " + oauth2_parse_redirect("https://app.example/cb?error=access_denied&error_description=user+said+no&state=af0ifjsldkj&iss=https%3A%2F%2Fidp.example", "af0ifjsldkj", & p).err);
+
+    val now: i64 = 1700000000;
+    val r1: OAuthHttpRequest = oauth2_code_request(& p, & c, cb.code, v, now);
+    println("code grant " + r1.body);
+    println("code grant headers " + str_replace(r1.headers, "\r\n", "|"));
+    val conf: OAuthClient = oauth2_client("s6BhdRkqt3", "gX1fBat3bV", "https://app.example/cb");
+    val r2: OAuthHttpRequest = oauth2_refresh_request(& p, & conf, "tGzv3JOkF0XG5Qx2TlKWIA", "openid", now);
+    println("refresh grant " + r2.body);
+    println("refresh auth header " + bool_to_str(str_contains(r2.headers, "Authorization: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW")));
+    var svc: OAuthClient = oauth2_client("svc", "s3cr3t", "");
+    svc.auth = "client_secret_post";
+    println("client credentials " + oauth2_client_credentials_request(& p, & svc, "api.read", now).body);
+    var jc: OAuthClient = oauth2_client("client-1", "client-secret-of-32-bytes-length", "");
+    jc.auth = "client_secret_jwt";
+    val node_assert: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJjbGllbnQtMSIsInN1YiI6ImNsaWVudC0xIiwiYXVkIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS90b2tlbiIsImp0aSI6Imp0aS0xIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDAzMDB9.U4XBaHPImuJas8JHcm17O3RX0H2Td-YsyHs4ADkcR9w";
+    println("assertion same as node " + bool_to_str(oauth2_client_assertion(& jc, "https://idp.example/token", "jti-1", now) == node_assert));
+    val r3: OAuthHttpRequest = oauth2_client_credentials_request(& p, & jc, "", now);
+    println("assertion body has type " + bool_to_str(oauth2_form_get(r3.body, "client_assertion_type") == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" && str_len(oauth2_form_get(r3.body, "client_assertion")) > 100));
+    println("revoke " + oauth2_revoke_request(& p, & conf, "45ghiukldjahdnhzdauz", "refresh_token", now).body);
+
+    val tr: OAuthToken = oauth2_parse_token_response(200, "{\"access_token\":\"ya29.access-token-value\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"refresh_token\":\"tGzv3JOkF0XG5Qx2TlKWIA\",\"id_token\":\"x\"}", now);
+    println("token ok " + bool_to_str(tr.ok) + " bearer usable " + bool_to_str(oauth2_token_usable(& tr, now + 10, 30)) + " at " + int_to_str(tr.expires_at) + " refresh " + tr.refresh_token);
+    val te: OAuthToken = oauth2_parse_token_response(400, "{\"error\":\"invalid_grant\",\"error_description\":\"code expired\"}", now);
+    println("token error " + te.err + ": " + te.err_description);
+
+    // ID tokens: RS256 by Node.js with the key published in the JWKS
+    var keys: Vec<Jwk> = jwks_parse("{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"idp-key-1\",\"use\":\"sig\",\"alg\":\"RS256\",\"n\":\"u1QPJpai6yCD3ve6ef_WsK2uDjXlQEWUtUS6K_JVtznJFaQ_MwHrFtv-Y9JDV0IrN1KeMXg_92YVVllcL5TTUFrpkdOvvT7OxhV1LP93Y-NLe5sQ5th1IyWnlFXK6WkO2Ka7cAlNavxLH9tEpYNB3BgYPo04UXraemMuOWWKJk0\",\"e\":\"AQAB\"}]}");
+    val t1: str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImlkcC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoiMjQ4Mjg5NzYxMDAxIiwiYXVkIjoiY2xpZW50LTEiLCJleHAiOjIwMDAwMDAwMDAsImlhdCI6MTcwMDAwMDAwMCwiYXV0aF90aW1lIjoxNjk5OTk5MDAwLCJub25jZSI6Im4tMFM2X1d6QTJNaiIsImF0X2hhc2giOiJwaVdZT3Bnd1A5Q2htanp6QnVBRmFRIiwibmFtZSI6IkphbmUgRG9lIn0.cR-DvdVAtFW7-5BAXg2-cS2F7-Py53iwxN51ne0OLYoP6YkGiLeopebkMtJcmKM4gobOh2V3QpvaMUPgMhBvbdxXF-fUeE53xUEg8YAMh1RSx_x8Y1157dPxRDYB8iG_pOM3tNYe7o2LfQjBSQIcW-LLAM7Hy65elhYIgaJILeY";
+    val t2: str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImlkcC1rZXktMSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoiMjQ4Mjg5NzYxMDAxIiwiYXVkIjpbImNsaWVudC0xIiwib3RoZXIiXSwiZXhwIjoyMDAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDAsIm5vbmNlIjoibi0wUzZfV3pBMk1qIn0.bHnxu5aWeB6ThLtO5naRcD2DVWjtLytYJbAdr9Vv20qcLM9m2G7Kp6cATb8elEMtG-ux3fR5YacJuypW_WT4fNZpXiFjtiVys6FMC4qndX7atoLk7mjIbGJ1zSiwktSfWHlgy3cAtIDWAwMiOJndTvj7X6SzSj-cexb9zofvFyQ";
+    val at: str = "ya29.access-token-value";
+    val ok1: OidcIdToken = oidc_validate_id_token(t1, & keys, & p, & c, "n-0S6_WzA2Mj", at, now + 60, -1);
+    println("id token ok " + bool_to_str(ok1.ok) + " sub " + ok1.sub + " name " + json_get_str(ok1.claims, "name"));
+    println("wrong nonce: " + oidc_validate_id_token(t1, & keys, & p, & c, "other-nonce", at, now + 60, -1).err);
+    println("at_hash: " + oidc_validate_id_token(t1, & keys, & p, & c, "n-0S6_WzA2Mj", "another-token", now + 60, -1).err);
+    println("several audiences: " + oidc_validate_id_token(t2, & keys, & p, & c, "n-0S6_WzA2Mj", "", now + 60, -1).err);
+    println("expired: " + oidc_validate_id_token(t1, & keys, & p, & c, "n-0S6_WzA2Mj", at, 2000000100, -1).err);
+    println("max_age: " + oidc_validate_id_token(t1, & keys, & p, & c, "n-0S6_WzA2Mj", at, now + 60, 300).err);
+    val ui: OAuthHttpRequest = oidc_userinfo_request(& p, at);
+    println("userinfo " + ui.method + " " + ui.url + " " + ui.headers);
+}

@@ -1,0 +1,615 @@
+// Fides static-allocation RTOS core, pure Fides.
+//
+// The scheduling and synchronisation logic of a small preemptive RTOS
+// (in the manner of FreeRTOS / Zephyr), with every object table sized at
+// creation (rtos_new): creating more tasks, semaphores, mutexes, queues or
+// timers than reserved fails instead of allocating.
+//   - tasks: base and effective priority (higher number = more urgent),
+//     states ready / running / blocked / delayed / suspended, an idle task
+//     at priority 0;
+//   - scheduler: the highest-priority ready task runs; a higher-priority
+//     task becoming ready preempts at once; tasks of equal priority share
+//     the CPU round robin with a time slice of `slice` ticks; a preempted
+//     or rotated task goes to the back of its priority level;
+//   - counting semaphores and mutexes with priority inheritance: a task
+//     blocking on a mutex lends its priority to the owner, transitively
+//     along a chain of owners blocked on other mutexes, and the lent
+//     priority is given back on unlock (recomputed from the mutexes still
+//     held); a mutex passes directly to its highest-priority waiter;
+//     recursive locking by the owner counts;
+//   - message queues of fixed capacity holding i64 messages: blocking
+//     send when full, blocking receive when empty, direct hand-over to a
+//     waiting receiver;
+//   - blocking with timeouts (in ticks; -1 forever, 0 poll) and delays;
+//   - software timers, one-shot or auto-reload, run from the tick.
+// Waiters are served highest priority first, first come first served
+// among equals.
+//
+// The seam: there is no context switch. The scheduler decides which task
+// runs (rtos_current); the program driving it (a port's PendSV handler on
+// hardware, a test script here) runs that task's code and calls the API
+// on its behalf, and calls rtos_tick from the timer interrupt. A call
+// that blocks returns RT_BLOCKED: the task's outcome (RT_OK or
+// RT_TIMEOUT, and a received message) is in its TCB when it runs again.
+
+module rtos;
+ use vec; use string;
+
+pub const RT_READY: i64 = 0;
+pub const RT_RUNNING: i64 = 1;
+pub const RT_BLOCKED: i64 = 2;
+pub const RT_DELAYED: i64 = 3;
+pub const RT_SUSPENDED: i64 = 4;
+
+// Results.
+pub const RT_OK: i64 = 0;
+pub const RT_WOULD_BLOCK: i64 = 1;
+pub const RT_TIMEOUT: i64 = 2;
+pub const RT_ERROR: i64 = 3;
+/// Returned by a call whose caller is now blocked.
+pub const RT_PENDING: i64 = 4;
+
+// What a blocked task waits for.
+pub const RTW_NONE: i64 = 0;
+pub const RTW_SEM: i64 = 1;
+pub const RTW_MUTEX: i64 = 2;
+pub const RTW_QRECV: i64 = 3;
+pub const RTW_QSEND: i64 = 4;
+
+pub struct RtTask {
+    pub name: str,
+    pub base_prio: i64,
+    pub prio: i64,
+    pub state: i64,
+    pub wake: i64,
+    pub wait_kind: i64,
+    pub wait_obj: i64,
+    pub result: i64,
+    pub msg: i64,
+    pub seq: i64,
+    pub slice: i64,
+    pub runs: i64,
+}
+
+pub struct RtSem {
+    pub count: i64,
+    pub max: i64,
+    pub waiters: Vec<i64>,
+}
+
+pub struct RtMutex {
+    pub owner: i64,
+    pub depth: i64,
+    pub waiters: Vec<i64>,
+}
+
+pub struct RtQueue {
+    pub cap: i64,
+    pub items: Vec<i64>,
+    pub recv_waiters: Vec<i64>,
+    pub send_waiters: Vec<i64>,
+}
+
+pub struct RtTimer {
+    pub period: i64,
+    pub expiry: i64,
+    pub reload: bool,
+    pub active: bool,
+    pub fired: i64,
+}
+
+pub struct Rtos {
+    pub tasks: Vec<RtTask>,
+    pub sems: Vec<RtSem>,
+    pub mutexes: Vec<RtMutex>,
+    pub queues: Vec<RtQueue>,
+    pub timers: Vec<RtTimer>,
+    pub max_tasks: i64,
+    pub max_sems: i64,
+    pub max_mutexes: i64,
+    pub max_queues: i64,
+    pub max_timers: i64,
+    pub tick: i64,
+    pub current: i64,
+    pub next_seq: i64,
+    pub slice_len: i64,
+    pub switches: i64,
+    pub log: Vec<str>,
+    pub timer_events: Vec<str>,
+}
+
+/// An RTOS with room for the given numbers of objects (the idle task is
+/// task 0 and counts towards max_tasks). `slice` ticks per round-robin turn.
+pub fn rtos_new(max_tasks: i64, max_sems: i64, max_mutexes: i64, max_queues: i64, max_timers: i64, slice: i64) -> Rtos {
+    var r: Rtos = Rtos {
+        tasks: Vec::new(), sems: Vec::new(), mutexes: Vec::new(), queues: Vec::new(), timers: Vec::new(),
+        max_tasks: max_tasks, max_sems: max_sems, max_mutexes: max_mutexes, max_queues: max_queues, max_timers: max_timers,
+        tick: 0, current: 0, next_seq: 0, slice_len: slice, switches: 0, log: Vec::new(), timer_events: Vec::new()
+    };
+    rtos_task_create(&mut r, "idle", 0);
+    var t: RtTask = r.tasks.get(0);
+    t.state = RT_RUNNING;
+    r.tasks.set(0, t);
+    return r;
+}
+
+fn rt_seq(r: &mut Rtos) -> i64 {
+    r.next_seq = r.next_seq + 1;
+    return r.next_seq;
+}
+
+fn rt_note(r: &mut Rtos, s: str) {
+    r.log.push("t" + int_to_str(r.tick) + " " + s);
+}
+
+pub fn rtos_name(r: &Rtos, id: i64) -> str {
+    return r.tasks.get(id).name;
+}
+
+/// Create a ready task; -1 when the task table is full. Does not switch:
+/// call rtos_schedule (or let the next API call or tick do it).
+pub fn rtos_task_create(r: &mut Rtos, name: str, prio: i64) -> i64 {
+    if r.tasks.len() >= r.max_tasks { return -1; }
+    val s: i64 = rt_seq(r);
+    r.tasks.push(RtTask {
+        name: name, base_prio: prio, prio: prio, state: RT_READY, wake: -1, wait_kind: RTW_NONE, wait_obj: -1,
+        result: RT_OK, msg: 0, seq: s, slice: r.slice_len, runs: 0
+    });
+    return r.tasks.len() - 1;
+}
+
+pub fn rtos_current(r: &Rtos) -> i64 {
+    return r.current;
+}
+
+// ─── Scheduler ──────────────────────────────────────────────────────────
+
+/// Pick the task to run and switch to it when it is not the current one.
+pub fn rtos_schedule(r: &mut Rtos) {
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i < r.tasks.len() {
+        val t: RtTask = r.tasks.get(i);
+        if t.state == RT_READY || t.state == RT_RUNNING {
+            if best < 0 {
+                best = i;
+            } else {
+                val b: RtTask = r.tasks.get(best);
+                if t.prio > b.prio {
+                    best = i;
+                } else if t.prio == b.prio {
+                    // The running task keeps the CPU against equals; else FIFO.
+                    if b.state != RT_RUNNING && (t.state == RT_RUNNING || t.seq < b.seq) { best = i; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if best < 0 || best == r.current { return; }
+    var old: RtTask = r.tasks.get(r.current);
+    if old.state == RT_RUNNING {
+        old.state = RT_READY;
+        old.seq = rt_seq(r);
+        r.tasks.set(r.current, old);
+    }
+    var nt: RtTask = r.tasks.get(best);
+    nt.state = RT_RUNNING;
+    nt.slice = r.slice_len;
+    nt.runs = nt.runs + 1;
+    r.tasks.set(best, nt);
+    rt_note(r, "switch " + old.name + " -> " + nt.name);
+    r.current = best;
+    r.switches = r.switches + 1;
+}
+
+fn rt_make_ready(r: &mut Rtos, id: i64, result: i64) {
+    var t: RtTask = r.tasks.get(id);
+    t.state = RT_READY;
+    t.result = result;
+    t.wake = -1;
+    t.wait_kind = RTW_NONE;
+    t.wait_obj = -1;
+    t.seq = rt_seq(r);
+    r.tasks.set(id, t);
+}
+
+fn rt_remove(v: &mut Vec<i64>, id: i64) {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == id {
+            v.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+/// Index in `waiters` of the highest-priority waiter (first among equals).
+fn rt_best_waiter(r: &Rtos, waiters: Vec<i64>) -> i64 {
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i < waiters.len() {
+        if best < 0 || r.tasks.get(waiters.get(i)).prio > r.tasks.get(waiters.get(best)).prio { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// Block the current task on (kind, obj) with a timeout.
+fn rt_block(r: &mut Rtos, kind: i64, obj: i64, timeout: i64) {
+    var t: RtTask = r.tasks.get(r.current);
+    t.state = RT_BLOCKED;
+    t.wait_kind = kind;
+    t.wait_obj = obj;
+    t.result = RT_PENDING;
+    if timeout >= 0 { t.wake = r.tick + timeout; } else { t.wake = -1; }
+    r.tasks.set(r.current, t);
+}
+
+/// Put the current task to sleep for `ticks` ticks.
+pub fn rtos_delay(r: &mut Rtos, ticks: i64) {
+    if r.current == 0 { return; }
+    var t: RtTask = r.tasks.get(r.current);
+    t.state = RT_DELAYED;
+    t.wake = r.tick + ticks;
+    r.tasks.set(r.current, t);
+    rtos_schedule(r);
+}
+
+pub fn rtos_suspend(r: &mut Rtos, id: i64) {
+    var t: RtTask = r.tasks.get(id);
+    if t.state == RT_BLOCKED { return; }
+    t.state = RT_SUSPENDED;
+    r.tasks.set(id, t);
+    rtos_schedule(r);
+}
+
+pub fn rtos_resume(r: &mut Rtos, id: i64) {
+    if r.tasks.get(id).state != RT_SUSPENDED { return; }
+    rt_make_ready(r, id, RT_OK);
+    rtos_schedule(r);
+}
+
+/// Yield to the next task of the same priority.
+pub fn rtos_yield(r: &mut Rtos) {
+    var t: RtTask = r.tasks.get(r.current);
+    t.state = RT_READY;
+    t.seq = rt_seq(r);
+    r.tasks.set(r.current, t);
+    val keep: i64 = r.current;
+    rtos_schedule(r);
+    if r.current == keep {
+        var k: RtTask = r.tasks.get(keep);
+        k.state = RT_RUNNING;
+        r.tasks.set(keep, k);
+    }
+}
+
+// ─── Semaphores ─────────────────────────────────────────────────────────
+
+pub fn rtos_sem_create(r: &mut Rtos, initial: i64, max: i64) -> i64 {
+    if r.sems.len() >= r.max_sems { return -1; }
+    r.sems.push(RtSem { count: initial, max: max, waiters: Vec::new() });
+    return r.sems.len() - 1;
+}
+
+/// Take: RT_OK, RT_WOULD_BLOCK (timeout 0) or RT_PENDING (blocked).
+pub fn rtos_sem_take(r: &mut Rtos, s: i64, timeout: i64) -> i64 {
+    var sem: RtSem = r.sems.get(s);
+    if sem.count > 0 {
+        sem.count = sem.count - 1;
+        r.sems.set(s, sem);
+        return RT_OK;
+    }
+    if timeout == 0 { return RT_WOULD_BLOCK; }
+    sem.waiters.push(r.current);
+    r.sems.set(s, sem);
+    rt_block(r, RTW_SEM, s, timeout);
+    rtos_schedule(r);
+    return RT_PENDING;
+}
+
+/// Give (also from an interrupt handler: it never blocks). RT_ERROR when
+/// the count is at its maximum.
+pub fn rtos_sem_give(r: &mut Rtos, s: i64) -> i64 {
+    var sem: RtSem = r.sems.get(s);
+    val w: i64 = rt_best_waiter(r, sem.waiters);
+    if w >= 0 {
+        val id: i64 = sem.waiters.get(w);
+        sem.waiters.remove(w);
+        r.sems.set(s, sem);
+        rt_make_ready(r, id, RT_OK);
+        rtos_schedule(r);
+        return RT_OK;
+    }
+    if sem.count >= sem.max { return RT_ERROR; }
+    sem.count = sem.count + 1;
+    r.sems.set(s, sem);
+    return RT_OK;
+}
+
+// ─── Mutexes with priority inheritance ──────────────────────────────────
+
+pub fn rtos_mutex_create(r: &mut Rtos) -> i64 {
+    if r.mutexes.len() >= r.max_mutexes { return -1; }
+    r.mutexes.push(RtMutex { owner: -1, depth: 0, waiters: Vec::new() });
+    return r.mutexes.len() - 1;
+}
+
+/// Effective priority of `id`: its base, raised to the priority of any
+/// task waiting on a mutex it holds. When it changes and the task is
+/// itself waiting on a mutex, the owner of that one is updated too.
+fn rt_update_prio(r: &mut Rtos, id: i64) {
+    var p: i64 = r.tasks.get(id).base_prio;
+    var m: i64 = 0;
+    while m < r.mutexes.len() {
+        val mx: RtMutex = r.mutexes.get(m);
+        if mx.owner == id {
+            var i: i64 = 0;
+            while i < mx.waiters.len() {
+                val wp: i64 = r.tasks.get(mx.waiters.get(i)).prio;
+                if wp > p { p = wp; }
+                i = i + 1;
+            }
+        }
+        m = m + 1;
+    }
+    var t: RtTask = r.tasks.get(id);
+    if t.prio == p { return; }
+    if p > t.prio {
+        rt_note(r, t.name + " inherits priority " + int_to_str(p));
+    } else {
+        rt_note(r, t.name + " back to priority " + int_to_str(p));
+    }
+    t.prio = p;
+    r.tasks.set(id, t);
+    if t.state == RT_BLOCKED && t.wait_kind == RTW_MUTEX {
+        val owner: i64 = r.mutexes.get(t.wait_obj).owner;
+        if owner >= 0 { rt_update_prio(r, owner); }
+    }
+}
+
+pub fn rtos_mutex_lock(r: &mut Rtos, m: i64, timeout: i64) -> i64 {
+    var mx: RtMutex = r.mutexes.get(m);
+    if mx.owner < 0 {
+        mx.owner = r.current;
+        mx.depth = 1;
+        r.mutexes.set(m, mx);
+        return RT_OK;
+    }
+    if mx.owner == r.current {
+        mx.depth = mx.depth + 1;
+        r.mutexes.set(m, mx);
+        return RT_OK;
+    }
+    if timeout == 0 { return RT_WOULD_BLOCK; }
+    mx.waiters.push(r.current);
+    r.mutexes.set(m, mx);
+    rt_note(r, rtos_name(r, r.current) + " blocks on mutex " + int_to_str(m) + " held by " + rtos_name(r, mx.owner));
+    rt_block(r, RTW_MUTEX, m, timeout);
+    rt_update_prio(r, mx.owner);
+    rtos_schedule(r);
+    return RT_PENDING;
+}
+
+/// Unlock (only by the owner): the mutex goes to the best waiter, the
+/// old owner's priority is recomputed.
+pub fn rtos_mutex_unlock(r: &mut Rtos, m: i64) -> i64 {
+    var mx: RtMutex = r.mutexes.get(m);
+    if mx.owner != r.current { return RT_ERROR; }
+    if mx.depth > 1 {
+        mx.depth = mx.depth - 1;
+        r.mutexes.set(m, mx);
+        return RT_OK;
+    }
+    val old: i64 = mx.owner;
+    val w: i64 = rt_best_waiter(r, mx.waiters);
+    if w >= 0 {
+        val id: i64 = mx.waiters.get(w);
+        mx.waiters.remove(w);
+        mx.owner = id;
+        mx.depth = 1;
+        r.mutexes.set(m, mx);
+        rt_make_ready(r, id, RT_OK);
+        rt_update_prio(r, id);
+    } else {
+        mx.owner = -1;
+        mx.depth = 0;
+        r.mutexes.set(m, mx);
+    }
+    rt_update_prio(r, old);
+    rtos_schedule(r);
+    return RT_OK;
+}
+
+// ─── Queues ─────────────────────────────────────────────────────────────
+
+pub fn rtos_queue_create(r: &mut Rtos, cap: i64) -> i64 {
+    if r.queues.len() >= r.max_queues { return -1; }
+    r.queues.push(RtQueue { cap: cap, items: Vec::new(), recv_waiters: Vec::new(), send_waiters: Vec::new() });
+    return r.queues.len() - 1;
+}
+
+/// Send `v`: to a waiting receiver directly, else into the queue, else
+/// block (the message waits with the sender).
+pub fn rtos_queue_send(r: &mut Rtos, q: i64, v: i64, timeout: i64) -> i64 {
+    var qu: RtQueue = r.queues.get(q);
+    val w: i64 = rt_best_waiter(r, qu.recv_waiters);
+    if w >= 0 {
+        val id: i64 = qu.recv_waiters.get(w);
+        qu.recv_waiters.remove(w);
+        r.queues.set(q, qu);
+        rt_make_ready(r, id, RT_OK);
+        var t: RtTask = r.tasks.get(id);
+        t.msg = v;
+        r.tasks.set(id, t);
+        rtos_schedule(r);
+        return RT_OK;
+    }
+    if qu.items.len() < qu.cap {
+        qu.items.push(v);
+        r.queues.set(q, qu);
+        return RT_OK;
+    }
+    if timeout == 0 { return RT_WOULD_BLOCK; }
+    qu.send_waiters.push(r.current);
+    r.queues.set(q, qu);
+    var me: RtTask = r.tasks.get(r.current);
+    me.msg = v;
+    r.tasks.set(r.current, me);
+    rt_block(r, RTW_QSEND, q, timeout);
+    rtos_schedule(r);
+    return RT_PENDING;
+}
+
+/// Receive: RT_OK with the message in the current task's `msg`, or block.
+pub fn rtos_queue_recv(r: &mut Rtos, q: i64, timeout: i64) -> i64 {
+    var qu: RtQueue = r.queues.get(q);
+    if qu.items.len() > 0 {
+        val v: i64 = qu.items.get(0);
+        qu.items.remove(0);
+        // A blocked sender's message moves into the freed place.
+        val w: i64 = rt_best_waiter(r, qu.send_waiters);
+        var woke: i64 = -1;
+        if w >= 0 {
+            woke = qu.send_waiters.get(w);
+            qu.send_waiters.remove(w);
+            qu.items.push(r.tasks.get(woke).msg);
+        }
+        r.queues.set(q, qu);
+        var me: RtTask = r.tasks.get(r.current);
+        me.msg = v;
+        r.tasks.set(r.current, me);
+        if woke >= 0 {
+            rt_make_ready(r, woke, RT_OK);
+            rtos_schedule(r);
+        }
+        return RT_OK;
+    }
+    if timeout == 0 { return RT_WOULD_BLOCK; }
+    qu.recv_waiters.push(r.current);
+    r.queues.set(q, qu);
+    rt_block(r, RTW_QRECV, q, timeout);
+    rtos_schedule(r);
+    return RT_PENDING;
+}
+
+/// The message the task received last (after RT_OK, or after waking).
+pub fn rtos_task_msg(r: &Rtos, id: i64) -> i64 {
+    return r.tasks.get(id).msg;
+}
+
+pub fn rtos_task_result(r: &Rtos, id: i64) -> i64 {
+    return r.tasks.get(id).result;
+}
+
+// ─── Timers ─────────────────────────────────────────────────────────────
+
+pub fn rtos_timer_create(r: &mut Rtos, period: i64, reload: bool) -> i64 {
+    if r.timers.len() >= r.max_timers { return -1; }
+    r.timers.push(RtTimer { period: period, expiry: 0, reload: reload, active: false, fired: 0 });
+    return r.timers.len() - 1;
+}
+
+pub fn rtos_timer_start(r: &mut Rtos, id: i64) {
+    var t: RtTimer = r.timers.get(id);
+    t.expiry = r.tick + t.period;
+    t.active = true;
+    r.timers.set(id, t);
+}
+
+pub fn rtos_timer_stop(r: &mut Rtos, id: i64) {
+    var t: RtTimer = r.timers.get(id);
+    t.active = false;
+    r.timers.set(id, t);
+}
+
+// ─── Tick ───────────────────────────────────────────────────────────────
+
+fn rt_timeout(r: &mut Rtos, id: i64) {
+    val t: RtTask = r.tasks.get(id);
+    val k: i64 = t.wait_kind;
+    val o: i64 = t.wait_obj;
+    if k == RTW_SEM {
+        var s: RtSem = r.sems.get(o);
+        rt_remove(&mut s.waiters, id);
+        r.sems.set(o, s);
+    }
+    if k == RTW_QRECV || k == RTW_QSEND {
+        var q: RtQueue = r.queues.get(o);
+        rt_remove(&mut q.recv_waiters, id);
+        rt_remove(&mut q.send_waiters, id);
+        r.queues.set(o, q);
+    }
+    if k == RTW_MUTEX {
+        var m: RtMutex = r.mutexes.get(o);
+        rt_remove(&mut m.waiters, id);
+        r.mutexes.set(o, m);
+    }
+    rt_make_ready(r, id, RT_TIMEOUT);
+    rt_note(r, t.name + " timed out");
+    if k == RTW_MUTEX && r.mutexes.get(o).owner >= 0 { rt_update_prio(r, r.mutexes.get(o).owner); }
+}
+
+/// The timer interrupt: advance time, wake sleepers and timeouts, run
+/// software timers, rotate equal-priority tasks, reschedule.
+pub fn rtos_tick(r: &mut Rtos) {
+    r.tick = r.tick + 1;
+    var i: i64 = 0;
+    while i < r.tasks.len() {
+        val t: RtTask = r.tasks.get(i);
+        if t.wake >= 0 && t.wake <= r.tick {
+            if t.state == RT_DELAYED { rt_make_ready(r, i, RT_OK); }
+            if t.state == RT_BLOCKED { rt_timeout(r, i); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < r.timers.len() {
+        var tm: RtTimer = r.timers.get(i);
+        if tm.active && tm.expiry <= r.tick {
+            tm.fired = tm.fired + 1;
+            r.timer_events.push("t" + int_to_str(r.tick) + " timer " + int_to_str(i));
+            if tm.reload { tm.expiry = tm.expiry + tm.period; } else { tm.active = false; }
+        }
+        r.timers.set(i, tm);
+        i = i + 1;
+    }
+    var cur: RtTask = r.tasks.get(r.current);
+    if cur.state == RT_RUNNING {
+        cur.slice = cur.slice - 1;
+        if cur.slice <= 0 {
+            cur.slice = r.slice_len;
+            var other: bool = false;
+            var k: i64 = 0;
+            while k < r.tasks.len() {
+                val o: RtTask = r.tasks.get(k);
+                if k != r.current && o.state == RT_READY && o.prio == cur.prio { other = true; }
+                k = k + 1;
+            }
+            if other {
+                cur.state = RT_READY;
+                cur.seq = rt_seq(r);
+            }
+        }
+        r.tasks.set(r.current, cur);
+    }
+    rtos_schedule(r);
+}
+
+pub fn rtos_state_name(s: i64) -> str {
+    val n: Vec<str> = str_split("ready,running,blocked,delayed,suspended", ",");
+    return n.get(s);
+}
+
+/// "name:prio/state" for every task.
+pub fn rtos_dump(r: &Rtos) -> str {
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < r.tasks.len() {
+        val t: RtTask = r.tasks.get(i);
+        parts.push(t.name + ":" + int_to_str(t.prio) + "/" + rtos_state_name(t.state));
+        i = i + 1;
+    }
+    return str_join(parts, " ");
+}

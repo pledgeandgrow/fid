@@ -1,0 +1,114 @@
+// stdlib/ringbuf: SPSC ring (full/empty, batches, counter wrap, shared copies), the Vyukov MPMC queue with interleaved producers and consumers, and the overwriting ring.
+// Expected output:
+// pow2 >= 100: 128
+// spsc push 1..5: true true true true false len 4
+// pop 1 2, then batch: 3 4 6 7, empty -> -1
+// 1000 values through a 4-slot ring in order: true
+// a copy is the same ring: 9
+// batch push of 6 into 4 slots: 4
+// mpmc: B published first, consumer sees: empty
+// mpmc after A publishes: 10 20
+// mpmc fill: true true true true false, drain: 1 2 3 4
+// 300 laps in order: true, len 0
+// overwrite: 3 4 5 6 dropped 2
+use ringbuf;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn ints(v: Vec<i64>) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        p.push(int_to_str(v.get(i)));
+        i = i + 1;
+    }
+    return str_join(p, " ");
+}
+
+fn main() {
+    println("pow2 >= 100: " + int_to_str(rb_pow2_at_least(100)));
+    val r: SpscRing = spsc_new(4);
+    var line: str = "spsc push 1..5:";
+    var i: i64 = 1;
+    while i <= 5 {
+        line = line + " " + bs(spsc_push(r, i));
+        i = i + 1;
+    }
+    println(line + " len " + int_to_str(spsc_len(r)));
+    val a: i64 = spsc_pop_or(r, -1);
+    val b: i64 = spsc_pop_or(r, -1);
+    spsc_push(r, 6);
+    spsc_push(r, 7);
+    println("pop " + int_to_str(a) + " " + int_to_str(b) + ", then batch: " + ints(spsc_pop_batch(r, 10)) + ", empty -> " + int_to_str(spsc_pop_or(r, -1)));
+    var ok: bool = true;
+    var next: i64 = 0;
+    i = 0;
+    while i < 1000 {
+        if !spsc_push(r, i) { ok = false; }
+        if i % 3 == 2 {
+            while !spsc_is_empty(r) {
+                if spsc_pop_or(r, -1) != next { ok = false; }
+                next = next + 1;
+            }
+        }
+        i = i + 1;
+    }
+    while !spsc_is_empty(r) {
+        if spsc_pop_or(r, -1) != next { ok = false; }
+        next = next + 1;
+    }
+    println("1000 values through a 4-slot ring in order: " + bs(ok && next == 1000));
+    val r2: SpscRing = r;
+    spsc_push(r2, 9);
+    println("a copy is the same ring: " + int_to_str(spsc_pop_or(r, -1)));
+    var six: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 6 {
+        six.push(i);
+        i = i + 1;
+    }
+    println("batch push of 6 into 4 slots: " + int_to_str(spsc_push_batch(r, six)));
+
+    val m: MpmcRing = mpmc_new(4);
+    val ka: MpmcTicket = mpmc_claim_push(m);
+    val kb: MpmcTicket = mpmc_claim_push(m);
+    mpmc_publish_push(m, kb, 20);
+    var seen: str = "value";
+    if !mpmc_claim_pop(m).ok { seen = "empty"; }
+    println("mpmc: B published first, consumer sees: " + seen);
+    mpmc_publish_push(m, ka, 10);
+    val x: i64 = mpmc_pop_or(m, -1);
+    val y: i64 = mpmc_pop_or(m, -1);
+    println("mpmc after A publishes: " + int_to_str(x) + " " + int_to_str(y));
+    line = "mpmc fill:";
+    i = 1;
+    while i <= 5 {
+        line = line + " " + bs(mpmc_push(m, i));
+        i = i + 1;
+    }
+    var drained: Vec<i64> = Vec::new();
+    while mpmc_len(m) > 0 { drained.push(mpmc_pop_or(m, -1)); }
+    println(line + ", drain: " + ints(drained));
+    ok = true;
+    i = 0;
+    while i < 300 {
+        mpmc_push(m, i);
+        mpmc_push(m, i + 1000);
+        if mpmc_pop_or(m, -1) != i || mpmc_pop_or(m, -1) != i + 1000 { ok = false; }
+        i = i + 1;
+    }
+    println("300 laps in order: " + bs(ok) + ", len " + int_to_str(mpmc_len(m)));
+
+    var o: OverwriteRing = owring_new(4);
+    i = 1;
+    while i <= 6 {
+        owring_push(&mut o, i);
+        i = i + 1;
+    }
+    println("overwrite: " + ints(owring_items(&o)) + " dropped " + int_to_str(o.dropped));
+}

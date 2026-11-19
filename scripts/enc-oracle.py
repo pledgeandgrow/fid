@@ -41,6 +41,7 @@ def a64_forms():
         for c, v in CC.items():
             f.append(('a64_cset(&mut e, %d, %d)' % (d, v), 'cset x%d, %s' % (d, c)))
         f.append(('a64_blr(&mut e, %d)' % n, 'blr x%d' % n))
+        f.append(('a64_br(&mut e, %d)' % n, 'br x%d' % n))  # MI27: a jump table's jump
         f.append(('a64_ldaxr(&mut e, %d, %d)' % (d, n), 'ldaxr x%d, [x%d]' % (d, n)))
         f.append(('a64_stlxr(&mut e, 11, %d, %d)' % (d, n), 'stlxr w11, x%d, [x%d]' % (d, n)))
         f.append(('a64_ldar(&mut e, %d, %d)' % (d, n), 'ldar x%d, [x%d]' % (d, n)))
@@ -139,7 +140,8 @@ def rv_forms():
         for rm, name in [(1, 'rtz'), (2, 'rdn'), (3, 'rup'), (4, 'rmm')]:
             f.append(('rv_fcvt_ld_rm(&mut e, 12, %d, %d)' % (d, rm), 'fcvt.l.d x12, f%d, %s' % (d, name)))
     f += [('rv_ret(&mut e)', 'ret'), ('rv_ecall(&mut e)', 'ecall'), ('rv_ebreak(&mut e)', 'ebreak'),
-          ('rv_fence(&mut e)', 'fence rw, rw')]
+          ('rv_fence(&mut e)', 'fence rw, rw'),
+          ('rv_jalr(&mut e, 0, 5, 0)', 'jalr x0, 0(x5)')]  # MI27: a jump table's jump (jr t0)
     return f
 
 
@@ -170,6 +172,7 @@ def x64_forms():
             f.append(('x64_shift_cl(&mut e, %d, %d)' % (ext, r), '%s %s, cl' % (name, R[r])))
         f.append(('x64_shift_imm(&mut e, 7, %d, 63)' % r, 'sar %s, 63' % R[r]))
         f.append(('x64_call_r(&mut e, %d)' % r, 'call %s' % R[r]))
+        f.append(('x64_jmp_r(&mut e, %d)' % r, 'jmp %s' % R[r]))  # MI27: a jump table's jump
         f.append(('x64_push(&mut e, %d)' % r, 'push %s' % R[r]))
         f.append(('x64_pop(&mut e, %d)' % r, 'pop %s' % R[r]))
         for cc, name in [(4, 'e'), (5, 'ne'), (12, 'l'), (13, 'ge'), (14, 'le'), (15, 'g'), (2, 'b'), (7, 'a')]:

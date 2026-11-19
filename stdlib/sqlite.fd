@@ -23,7 +23,7 @@
 // system.
 
 module sqlite;
- use json;
+ use json; use trace;
 // ─── FFI declarations: bind to the SQLite3 C library ───
 //
 // We declare the subset of the SQLite C API needed for basic database
@@ -33,6 +33,10 @@ module sqlite;
 // types and link against -lsqlite3. The linker resolves the symbols at
 // link time.
 
+// SAFETY: each declaration matches the sqlite3.h prototype it names (written
+// by hand: object pointers as i64, char * as str); the connection and
+// statement handles are the ones sqlite3_open and sqlite3_prepare_v2
+// returned.
 extern "C" link "sqlite3" {
     // Opening / closing a database connection
     // sqlite3_open(filename, &ppDb) -> int (SQLITE_OK=0 on success)
@@ -137,7 +141,12 @@ impl SQLite {
 
     /// As query, with values bound to the statement's `?` in order. A value is
     /// data, never SQL: this is the safe way to use anything from outside.
+    /// Run on `fid emit` (winsqlite3.dll) and ccompile (linked against
+    /// winsqlite3 through an import library) by test_sqlite_params.fd.
     pub fn query_params(self: SQLite, sql: str, params: Vec<str>) -> str {
+        // CO2: a "sqlite.query" span under FIDES_TRACE (the SQL, not the
+        // bound values)
+        val t0: i64 = trace_span_begin();
         var stmt: i64 = 0;
         // Out-parameters are word slots: `&s` of a str is the (borrowed)
         // string itself, so SQLite would write its pointer over the text
@@ -204,14 +213,18 @@ impl SQLite {
 
         result = result + "]";
         p_sqlite3_finalize(stmt);
+        trace_span_end(t0, "sqlite.query", sql, rc == SQLITE_DONE);
         return result;
     }
 
     /// Execute a non-query SQL statement (INSERT/UPDATE/DELETE/CREATE TABLE, etc.)
     /// Returns the number of rows affected.
     pub fn exec(self: SQLite, sql: str) -> i64 {
+        // CO2: a "sqlite.exec" span under FIDES_TRACE (the SQL)
+        val t0: i64 = trace_span_begin();
         var errmsg: i64 = 0;
         var rc = p_sqlite3_exec(self.handle, sql, 0, 0, & errmsg);
+        trace_span_end(t0, "sqlite.exec", sql, rc == SQLITE_OK);
         if rc != SQLITE_OK {
             var msg: str = "";
             if errmsg != 0 {

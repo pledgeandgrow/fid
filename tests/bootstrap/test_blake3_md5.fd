@@ -1,0 +1,89 @@
+// stdlib/blake3.fd against the official BLAKE3 test vectors
+// (test_vectors/test_vectors.json of the BLAKE3 repository: input byte i
+// is i % 251; keyed_hash key "whats the Elvish word for friend";
+// derive_key context "BLAKE3 2019-12-27 16:29:52 test vectors context"),
+// and stdlib/md5.fd against the RFC 1321 §A.5 test suite plus padding
+// edges (55, 56, 63, 64 bytes, values from Python's hashlib).
+// Each case is an extended output: the first 32 bytes must equal the
+// default-length output, which is checked too. A wrong answer panics.
+use blake3;
+use md5;
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn input(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(i % 251); i = i + 1; }
+    return v;
+}
+
+fn repeat_a(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(97); i = i + 1; }
+    return v;
+}
+
+/// The hash mode: the full 131-byte output when `want` has 262 digits,
+/// and always the default 32-byte hash against its first 64 digits.
+fn check_hash(n: i64, want: str) {
+    val label: str = "blake3 hash " + p_to_str(n);
+    if str_len(want) > 64 {
+        check(label + " xof", blake3_hex(blake3_xof(input(n), str_len(want) / 2)), want);
+    }
+    check(label, blake3_hex(blake3_bytes(input(n))), str_slice(want, 0, 64));
+}
+
+fn check_keyed(n: i64, want: str) {
+    val key: Vec<i64> = str_bytes("whats the Elvish word for friend");
+    val label: str = "blake3 keyed " + p_to_str(n);
+    check(label + " xof", blake3_hex(blake3_keyed_xof(key, input(n), str_len(want) / 2)), want);
+    check(label, blake3_hex(blake3_keyed(key, input(n))), str_slice(want, 0, 64));
+}
+
+fn check_derive(n: i64, want: str) {
+    val ctx: str = "BLAKE3 2019-12-27 16:29:52 test vectors context";
+    val label: str = "blake3 derive " + p_to_str(n);
+    check(label + " xof", blake3_hex(blake3_derive_key_xof(ctx, input(n), str_len(want) / 2)), want);
+    check(label, blake3_hex(blake3_derive_key(ctx, input(n))), str_slice(want, 0, 64));
+}
+
+fn main() -> i64 {
+    // ── MD5, RFC 1321 §A.5 ──
+    check("md5 empty", md5_hex(md5_str("")), "d41d8cd98f00b204e9800998ecf8427e");
+    check("md5 a", md5_hex(md5_str("a")), "0cc175b9c0f1b6a831c399e269772661");
+    check("md5 abc", md5_hex(md5_str("abc")), "900150983cd24fb0d6963f7d28e17f72");
+    check("md5 message digest", md5_hex(md5_str("message digest")), "f96b697d7cb7938d525a2f31aaf161d0");
+    check("md5 a-z", md5_hex(md5_str("abcdefghijklmnopqrstuvwxyz")), "c3fcd3d76192e4007dfb496cca67e13b");
+    check("md5 A-Za-z0-9", md5_hex(md5_str("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")),
+        "d174ab98d277d9f5a5611c2c9f419d9f");
+    check("md5 digits*8", md5_hex(md5_str(
+        "12345678901234567890123456789012345678901234567890123456789012345678901234567890")),
+        "57edf4a22be3c955ac49da2e2107b67a");
+    check("md5 a*55", md5_hex(md5_bytes(repeat_a(55))), "ef1772b6dff9a122358552954ad0df65");
+    check("md5 a*56", md5_hex(md5_bytes(repeat_a(56))), "3b0c8ac703f828b04c6c197006d17218");
+    check("md5 a*63", md5_hex(md5_bytes(repeat_a(63))), "b06521f39153d618550606be297466d5");
+    check("md5 a*64", md5_hex(md5_bytes(repeat_a(64))), "014842d480b571495a4a0363793f7367");
+
+    // ── BLAKE3 hash mode ──
+    check_hash(0, "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262e00f03e7b69af26b7faaf09fcd333050338ddfe085b8cc869ca98b206c08243a26f5487789e8f660afe6c99ef9e0c52b92e7393024a80459cf91f476f9ffdbda7001c22e159b402631f277ca96f2defdf1078282314e763699a31c5363165421cce14d");
+    check_hash(1, "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213");
+    check_hash(63, "e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b");
+    check_hash(64, "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98");
+    check_hash(65, "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee");
+    check_hash(1023, "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11");
+    check_hash(1024, "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af71cf8107265ecdaf8505b95d8fcec83a98a6a96ea5109d2c179c47a387ffbb404756f6eeae7883b446b70ebb144527c2075ab8ab204c0086bb22b7c93d465efc57f8d917f0b385c6df265e77003b85102967486ed57db5c5ca170ba441427ed9afa684e");
+    check_hash(1025, "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444f4c4a22b4b399155358a994e52bf255de60035742ec71bd08ac275a1b51cc6bfe332b0ef84b409108cda080e6269ed4b3e2c3f7d722aa4cdc98d16deb554e5627be8f955c98e1d5f9565a9194cad0c4285f93700062d9595adb992ae68ff12800ab67a");
+
+    // ── keyed_hash and derive_key ──
+    check_keyed(0, "92b2b75604ed3c761f9d6f62392c8a9227ad0ea3f09573e783f1498a4ed60d26b18171a2f22a4b94822c701f107153dba24918c4bae4d2945c20ece13387627d3b73cbf97b797d5e59948c7ef788f54372df45e45e4293c7dc18c1d41144a9758be58960856be1eabbe22c2653190de560ca3b2ac4aa692a9210694254c371e851bc8f");
+    check_derive(0, "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d905630c8be290dfcf3e6842f13bddd573c098c3f17361f1f206b8cad9d088aa4a3f746752c6b0ce6a83b0da81d59649257cdf8eb3e9f7d4998e41021fac119deefb896224ac99f860011f73609e6e0e4540f93b273e56547dfd3aa1a035ba6689d89a0");
+    println("blake3 and md5 vectors ok");
+    return 0;
+}

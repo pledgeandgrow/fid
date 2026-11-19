@@ -1,0 +1,101 @@
+// BM4 (competitive roadmap): the file-reading benchmark
+// (bench/work/fides/fileread.fd, the same code) on 200 lines: write the
+// file (3842 bytes), check its size, read it three times and sum the
+// numbers in it and the line count; then the scan of a text written by
+// hand, and a missing file. The expected value is a Python reference of
+// the same generator and scan.
+//
+// Expected output:
+// 3842
+// 277425888
+// 3842
+// 576
+// -1
+fn fr_generate(path: str, lines: i64) {
+    var sb: StringBuilder = StringBuilder::new();
+    var s: i64 = 1;
+    var k: i64 = 0;
+    while k < lines {
+        s = (s * 1103515245 + 12345) % 2147483648;
+        val r1: i64 = s >> 8;
+        s = (s * 1103515245 + 12345) % 2147483648;
+        val r2: i64 = s >> 8;
+        sb.append_str("rec");
+        sb.append_int(k);
+        sb.append_char(32);
+        sb.append_int(r1 % 1000000);
+        sb.append_str(" x");
+        sb.append_int(r2 % 10000);
+        sb.append_char(10);
+        k = k + 1;
+    }
+    val text: str = sb.to_str();
+    p_file_write(path, text);
+}
+
+fn fr_scan(d: str) -> i64 {
+    val n: i64 = str_len(d);
+    var tot: i64 = 0;
+    var cur: i64 = 0;
+    var ind: bool = false;
+    var lines: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = str_byte_at(d, i);
+        if b >= 48 && b <= 57 {
+            cur = cur * 10 + b - 48;
+            ind = true;
+        } else {
+            if ind {
+                tot = tot + cur;
+                cur = 0;
+                ind = false;
+            }
+            if b == 10 {
+                lines = lines + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if ind {
+        tot = tot + cur;
+    }
+    return tot + lines;
+}
+
+fn fileread(path: str, lines: i64, size: i64, reads: i64) -> i64 {
+    // the size from the file system (-1 when it is missing), not a read
+    if p_file_size(path) != size {
+        fr_generate(path, lines);
+    }
+    var total: i64 = 0;
+    var r: i64 = 0;
+    while r < reads {
+        match read_file(path) {
+            Option::Some(d) => {
+                total = total + fr_scan(d);
+            }
+            Option::None => {
+                println("cannot read " + path);
+                return -1;
+            }
+        }
+        r = r + 1;
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    val path: str = "_fides_bm_fileread.tmp";
+    p_file_delete(path);
+    fr_generate(path, 200);
+    println(p_file_size(path));
+    println(fileread(path, 200, 3842, 3));
+    // the file is there with the right size now: no second write
+    println(p_file_size(path));
+    p_file_delete(path);
+    // 12 + 345 + 7 + 0 + 200 + 9 (the last one without a newline) + 3 newlines
+    println(fr_scan("a12 b345\n7x0y\n200\n9"));
+    println(p_file_size("_fides_bm_fileread_missing.tmp"));
+    return 0;
+}

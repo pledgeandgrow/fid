@@ -1,0 +1,44 @@
+// Roadmap Phase 9 (aerospace, F47): @partitioned(P) marks the entry of an
+// ARINC 653 partition. The two partitions below keep their own globals,
+// share only library code that touches no global (`scale`), and pass data
+// through a sampling port (stdlib/arinc.fd) handed in by the scheduler
+// (`main`), so the spatial-partitioning check accepts them.
+// Expected output:
+//   nav wrote 0
+//   control read 42
+//   ticks 1 1
+
+use arinc;
+
+var NAV_TICKS: i64 = 0;
+var CTRL_TICKS: i64 = 0;
+
+fn scale(v: i64) -> i64 {
+    return v * 2;
+}
+
+@partitioned(navigation)
+fn nav_update(port: & mut SamplingPort, now: i64) -> i64 {
+    NAV_TICKS = NAV_TICKS + 1;
+    var msg: Vec<i64> = Vec::new();
+    msg.push(scale(21));
+    return arinc_sampling_port_write(port, msg, now);
+}
+
+@partitioned(flight_control)
+fn control_loop(port: SamplingPort) -> i64 {
+    CTRL_TICKS = CTRL_TICKS + 1;
+    val msg: Vec<i64> = arinc_sampling_port_read(port);
+    if msg.len() == 0 {
+        return 0;
+    }
+    return msg.get(0);
+}
+
+fn main() {
+    var port: SamplingPort = arinc_sampling_port_create("nav_to_ctrl", 8, 0, 100);
+    val w: i64 = nav_update(& mut port, 10);
+    println("nav wrote " + int_to_str(w));
+    println("control read " + int_to_str(control_loop(port)));
+    println("ticks " + int_to_str(NAV_TICKS) + " " + int_to_str(CTRL_TICKS));
+}

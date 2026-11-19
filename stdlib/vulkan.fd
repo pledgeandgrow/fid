@@ -1,0 +1,1238 @@
+// Fides Vulkan: Vulkan 1.3 core bindings plus helpers that need no GPU.
+//
+// Platform seam: the `extern "C"` block below declares the core entry
+// points exported by the Vulkan loader (libvulkan.so.1 on Linux,
+// vulkan-1.dll on Windows: link with -lvulkan, or rename vulkan-1.lib;
+// MoltenVK's libvulkan on macOS). Running them needs that loader and a
+// driver; nothing in the tests calls them. Every Vulkan handle is an i64
+// (dispatchable handles are pointers, the others 64-bit integers),
+// pointers are i64 addresses, uint32_t parameters are u32, and VkResult
+// is i32 (negative values are errors).
+//
+// Real, tested without a GPU:
+//   - the enums and flags of the core API (structure types, results,
+//     formats, layouts, access and stage masks, usage flags, ...);
+//   - C struct layout: vk_layout(name) computes field offsets, sizes and
+//     alignment of the main create-info structs from their field lists
+//     (x86-64 / AArch64 C rules: pointers and uint64_t 8 bytes, uint32_t
+//     and float 4), and VkBlob writes them, nested arrays and strings
+//     included, into one byte image whose internal pointers are
+//     relocations; vk_blob_to_mem copies it into C memory and patches the
+//     pointers (that is the only unsafe step, done right before a call);
+//   - a format table (texel block size and extent, depth/stencil aspects)
+//     and image/mip-chain size computation;
+//   - image layout transitions: the access masks and pipeline stages of a
+//     barrier from one layout to another, and VkImageMemoryBarrier images;
+//   - a descriptor set layout builder that checks bindings against the
+//     spec's minimum per-stage limits and emits the create-info image;
+//   - validation of VkImageCreateInfo / VkBufferCreateInfo parameters
+//     against the spec's valid-usage rules (a subset, listed per check).
+//
+// Usage:
+//   use vulkan;
+//   var b: VkBlob = vk_blob_new();
+//   val ci: i64 = vk_instance_create_info(&mut b, "demo", 1, "fides", 1, VK_API_VERSION_1_3, Vec::new(), exts);
+//   val mem: i64 = vk_blob_to_mem(&b);           // C memory, pointers fixed
+//   var out: i64 = vk_out_new();
+//   val r: i32 = vk_create_instance(mem + ci, 0, out);
+//   val instance: i64 = vk_out_read(out);
+
+module vulkan;
+use vec;
+
+// ─── Loader entry points (platform seam) ───────────────────────────────────
+
+// SAFETY: each declaration matches the vulkan_core.h prototype it names
+// (written by hand: handles and pointers as i64, uint32_t as u32, VkResult
+// as i32). Pointer arguments must be live C memory laid out as the API
+// requires (vk_blob_to_mem gives such memory).
+extern "C" link "vulkan" {
+    fn vkEnumerateInstanceVersion as vk_enumerate_instance_version(pApiVersion: i64) -> i32;
+    fn vkCreateInstance as vk_create_instance(pCreateInfo: i64, pAllocator: i64, pInstance: i64) -> i32;
+    fn vkDestroyInstance as vk_destroy_instance(instance: i64, pAllocator: i64) -> void;
+    fn vkGetInstanceProcAddr as vk_get_instance_proc_addr(instance: i64, pName: str) -> i64;
+    fn vkEnumeratePhysicalDevices as vk_enumerate_physical_devices(instance: i64, pCount: i64, pDevices: i64) -> i32;
+    fn vkGetPhysicalDeviceProperties as vk_get_physical_device_properties(pd: i64, pProperties: i64) -> void;
+    fn vkGetPhysicalDeviceQueueFamilyProperties as vk_get_physical_device_queue_family_properties(pd: i64, pCount: i64, pProperties: i64) -> void;
+    fn vkGetPhysicalDeviceMemoryProperties as vk_get_physical_device_memory_properties(pd: i64, pProperties: i64) -> void;
+    fn vkGetPhysicalDeviceFormatProperties as vk_get_physical_device_format_properties(pd: i64, format: u32, pProperties: i64) -> void;
+    fn vkCreateDevice as vk_create_device(pd: i64, pCreateInfo: i64, pAllocator: i64, pDevice: i64) -> i32;
+    fn vkDestroyDevice as vk_destroy_device(device: i64, pAllocator: i64) -> void;
+    fn vkDeviceWaitIdle as vk_device_wait_idle(device: i64) -> i32;
+    fn vkGetDeviceQueue as vk_get_device_queue(device: i64, family: u32, index: u32, pQueue: i64) -> void;
+    fn vkQueueSubmit as vk_queue_submit(queue: i64, count: u32, pSubmits: i64, fence: i64) -> i32;
+    fn vkQueueSubmit2 as vk_queue_submit2(queue: i64, count: u32, pSubmits: i64, fence: i64) -> i32;
+    fn vkQueueWaitIdle as vk_queue_wait_idle(queue: i64) -> i32;
+    fn vkAllocateMemory as vk_allocate_memory(device: i64, pInfo: i64, pAllocator: i64, pMemory: i64) -> i32;
+    fn vkFreeMemory as vk_free_memory(device: i64, memory: i64, pAllocator: i64) -> void;
+    fn vkMapMemory as vk_map_memory(device: i64, memory: i64, offset: i64, size: i64, flags: u32, ppData: i64) -> i32;
+    fn vkUnmapMemory as vk_unmap_memory(device: i64, memory: i64) -> void;
+    fn vkCreateBuffer as vk_create_buffer(device: i64, pInfo: i64, pAllocator: i64, pBuffer: i64) -> i32;
+    fn vkDestroyBuffer as vk_destroy_buffer(device: i64, buffer: i64, pAllocator: i64) -> void;
+    fn vkGetBufferMemoryRequirements as vk_get_buffer_memory_requirements(device: i64, buffer: i64, pReq: i64) -> void;
+    fn vkBindBufferMemory as vk_bind_buffer_memory(device: i64, buffer: i64, memory: i64, offset: i64) -> i32;
+    fn vkCreateImage as vk_create_image(device: i64, pInfo: i64, pAllocator: i64, pImage: i64) -> i32;
+    fn vkDestroyImage as vk_destroy_image(device: i64, image: i64, pAllocator: i64) -> void;
+    fn vkGetImageMemoryRequirements as vk_get_image_memory_requirements(device: i64, image: i64, pReq: i64) -> void;
+    fn vkBindImageMemory as vk_bind_image_memory(device: i64, image: i64, memory: i64, offset: i64) -> i32;
+    fn vkCreateImageView as vk_create_image_view(device: i64, pInfo: i64, pAllocator: i64, pView: i64) -> i32;
+    fn vkDestroyImageView as vk_destroy_image_view(device: i64, view: i64, pAllocator: i64) -> void;
+    fn vkCreateShaderModule as vk_create_shader_module(device: i64, pInfo: i64, pAllocator: i64, pModule: i64) -> i32;
+    fn vkDestroyShaderModule as vk_destroy_shader_module(device: i64, module: i64, pAllocator: i64) -> void;
+    fn vkCreateDescriptorSetLayout as vk_create_descriptor_set_layout(device: i64, pInfo: i64, pAllocator: i64, pLayout: i64) -> i32;
+    fn vkDestroyDescriptorSetLayout as vk_destroy_descriptor_set_layout(device: i64, layout: i64, pAllocator: i64) -> void;
+    fn vkCreateDescriptorPool as vk_create_descriptor_pool(device: i64, pInfo: i64, pAllocator: i64, pPool: i64) -> i32;
+    fn vkDestroyDescriptorPool as vk_destroy_descriptor_pool(device: i64, pool: i64, pAllocator: i64) -> void;
+    fn vkAllocateDescriptorSets as vk_allocate_descriptor_sets(device: i64, pInfo: i64, pSets: i64) -> i32;
+    fn vkUpdateDescriptorSets as vk_update_descriptor_sets(device: i64, writeCount: u32, pWrites: i64, copyCount: u32, pCopies: i64) -> void;
+    fn vkCreatePipelineLayout as vk_create_pipeline_layout(device: i64, pInfo: i64, pAllocator: i64, pLayout: i64) -> i32;
+    fn vkDestroyPipelineLayout as vk_destroy_pipeline_layout(device: i64, layout: i64, pAllocator: i64) -> void;
+    fn vkCreateGraphicsPipelines as vk_create_graphics_pipelines(device: i64, cache: i64, count: u32, pInfos: i64, pAllocator: i64, pPipelines: i64) -> i32;
+    fn vkCreateComputePipelines as vk_create_compute_pipelines(device: i64, cache: i64, count: u32, pInfos: i64, pAllocator: i64, pPipelines: i64) -> i32;
+    fn vkDestroyPipeline as vk_destroy_pipeline(device: i64, pipeline: i64, pAllocator: i64) -> void;
+    fn vkCreateCommandPool as vk_create_command_pool(device: i64, pInfo: i64, pAllocator: i64, pPool: i64) -> i32;
+    fn vkDestroyCommandPool as vk_destroy_command_pool(device: i64, pool: i64, pAllocator: i64) -> void;
+    fn vkAllocateCommandBuffers as vk_allocate_command_buffers(device: i64, pInfo: i64, pBuffers: i64) -> i32;
+    fn vkBeginCommandBuffer as vk_begin_command_buffer(cmd: i64, pInfo: i64) -> i32;
+    fn vkEndCommandBuffer as vk_end_command_buffer(cmd: i64) -> i32;
+    fn vkCmdPipelineBarrier as vk_cmd_pipeline_barrier(cmd: i64, srcStage: u32, dstStage: u32, depFlags: u32, memCount: u32, pMem: i64, bufCount: u32, pBuf: i64, imgCount: u32, pImg: i64) -> void;
+    fn vkCmdPipelineBarrier2 as vk_cmd_pipeline_barrier2(cmd: i64, pDependencyInfo: i64) -> void;
+    fn vkCmdBindPipeline as vk_cmd_bind_pipeline(cmd: i64, bindPoint: u32, pipeline: i64) -> void;
+    fn vkCmdBindDescriptorSets as vk_cmd_bind_descriptor_sets(cmd: i64, bindPoint: u32, layout: i64, firstSet: u32, count: u32, pSets: i64, dynCount: u32, pDynamic: i64) -> void;
+    fn vkCmdBindVertexBuffers as vk_cmd_bind_vertex_buffers(cmd: i64, first: u32, count: u32, pBuffers: i64, pOffsets: i64) -> void;
+    fn vkCmdDraw as vk_cmd_draw(cmd: i64, vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32) -> void;
+    fn vkCmdDispatch as vk_cmd_dispatch(cmd: i64, x: u32, y: u32, z: u32) -> void;
+    fn vkCmdCopyBuffer as vk_cmd_copy_buffer(cmd: i64, src: i64, dst: i64, count: u32, pRegions: i64) -> void;
+    fn vkCmdBeginRendering as vk_cmd_begin_rendering(cmd: i64, pRenderingInfo: i64) -> void;
+    fn vkCmdEndRendering as vk_cmd_end_rendering(cmd: i64) -> void;
+    fn vkCreateFence as vk_create_fence(device: i64, pInfo: i64, pAllocator: i64, pFence: i64) -> i32;
+    fn vkDestroyFence as vk_destroy_fence(device: i64, fence: i64, pAllocator: i64) -> void;
+    fn vkWaitForFences as vk_wait_for_fences(device: i64, count: u32, pFences: i64, waitAll: u32, timeout: i64) -> i32;
+    fn vkResetFences as vk_reset_fences(device: i64, count: u32, pFences: i64) -> i32;
+    fn vkCreateSemaphore as vk_create_semaphore(device: i64, pInfo: i64, pAllocator: i64, pSemaphore: i64) -> i32;
+    fn vkDestroySemaphore as vk_destroy_semaphore(device: i64, semaphore: i64, pAllocator: i64) -> void;
+}
+
+// ─── Versions, results, structure types ────────────────────────────────────
+
+pub fn vk_make_api_version(variant: i64, major: i64, minor: i64, patch: i64) -> i64 {
+    return (variant << 29) | (major << 22) | (minor << 12) | patch;
+}
+
+pub const VK_API_VERSION_1_0: i64 = 4194304;
+pub const VK_API_VERSION_1_1: i64 = 4198400;
+pub const VK_API_VERSION_1_2: i64 = 4202496;
+pub const VK_API_VERSION_1_3: i64 = 4206592;
+
+pub fn vk_version_str(v: i64) -> str {
+    return int_to_str((v >> 22) & 0x7F) + "." + int_to_str((v >> 12) & 0x3FF) + "." + int_to_str(v & 0xFFF);
+}
+
+pub const VK_SUCCESS: i64 = 0;
+pub const VK_NOT_READY: i64 = 1;
+pub const VK_TIMEOUT: i64 = 2;
+pub const VK_INCOMPLETE: i64 = 5;
+pub const VK_ERROR_OUT_OF_HOST_MEMORY: i64 = - 1;
+pub const VK_ERROR_OUT_OF_DEVICE_MEMORY: i64 = - 2;
+pub const VK_ERROR_INITIALIZATION_FAILED: i64 = - 3;
+pub const VK_ERROR_DEVICE_LOST: i64 = - 4;
+pub const VK_ERROR_MEMORY_MAP_FAILED: i64 = - 5;
+pub const VK_ERROR_LAYER_NOT_PRESENT: i64 = - 6;
+pub const VK_ERROR_EXTENSION_NOT_PRESENT: i64 = - 7;
+pub const VK_ERROR_FEATURE_NOT_PRESENT: i64 = - 8;
+pub const VK_ERROR_INCOMPATIBLE_DRIVER: i64 = - 9;
+pub const VK_ERROR_TOO_MANY_OBJECTS: i64 = - 10;
+pub const VK_ERROR_FORMAT_NOT_SUPPORTED: i64 = - 11;
+pub const VK_ERROR_OUT_OF_DATE_KHR: i64 = - 1000001004;
+pub const VK_SUBOPTIMAL_KHR: i64 = 1000001003;
+
+pub fn vk_result_name(r: i64) -> str {
+    if r == 0 { return "VK_SUCCESS"; }
+    if r == 1 { return "VK_NOT_READY"; }
+    if r == 2 { return "VK_TIMEOUT"; }
+    if r == 5 { return "VK_INCOMPLETE"; }
+    if r == - 1 { return "VK_ERROR_OUT_OF_HOST_MEMORY"; }
+    if r == - 2 { return "VK_ERROR_OUT_OF_DEVICE_MEMORY"; }
+    if r == - 3 { return "VK_ERROR_INITIALIZATION_FAILED"; }
+    if r == - 4 { return "VK_ERROR_DEVICE_LOST"; }
+    if r == - 5 { return "VK_ERROR_MEMORY_MAP_FAILED"; }
+    if r == - 6 { return "VK_ERROR_LAYER_NOT_PRESENT"; }
+    if r == - 7 { return "VK_ERROR_EXTENSION_NOT_PRESENT"; }
+    if r == - 8 { return "VK_ERROR_FEATURE_NOT_PRESENT"; }
+    if r == - 9 { return "VK_ERROR_INCOMPATIBLE_DRIVER"; }
+    if r == - 10 { return "VK_ERROR_TOO_MANY_OBJECTS"; }
+    if r == - 11 { return "VK_ERROR_FORMAT_NOT_SUPPORTED"; }
+    if r == - 1000001004 { return "VK_ERROR_OUT_OF_DATE_KHR"; }
+    if r == 1000001003 { return "VK_SUBOPTIMAL_KHR"; }
+    return "VkResult(" + int_to_str(r) + ")";
+}
+
+pub const VK_STRUCTURE_TYPE_APPLICATION_INFO: i64 = 0;
+pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: i64 = 1;
+pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: i64 = 2;
+pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: i64 = 3;
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: i64 = 4;
+pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: i64 = 5;
+pub const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: i64 = 8;
+pub const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: i64 = 9;
+pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: i64 = 12;
+pub const VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO: i64 = 14;
+pub const VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO: i64 = 15;
+pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: i64 = 16;
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: i64 = 18;
+pub const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: i64 = 29;
+pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: i64 = 30;
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: i64 = 32;
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: i64 = 33;
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: i64 = 34;
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: i64 = 35;
+pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: i64 = 39;
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: i64 = 40;
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: i64 = 42;
+pub const VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER: i64 = 44;
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: i64 = 45;
+pub const VK_STRUCTURE_TYPE_MEMORY_BARRIER: i64 = 46;
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: i64 = 53;
+pub const VK_STRUCTURE_TYPE_RENDERING_INFO: i64 = 1000044000;
+pub const VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO: i64 = 1000044001;
+pub const VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: i64 = 1000044002;
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2: i64 = 1000314002;
+pub const VK_STRUCTURE_TYPE_DEPENDENCY_INFO: i64 = 1000314003;
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO_2: i64 = 1000314004;
+
+// ─── Enums and flags ───────────────────────────────────────────────────────
+
+pub const VK_IMAGE_LAYOUT_UNDEFINED: i64 = 0;
+pub const VK_IMAGE_LAYOUT_GENERAL: i64 = 1;
+pub const VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: i64 = 2;
+pub const VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: i64 = 3;
+pub const VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: i64 = 4;
+pub const VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: i64 = 5;
+pub const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: i64 = 6;
+pub const VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: i64 = 7;
+pub const VK_IMAGE_LAYOUT_PREINITIALIZED: i64 = 8;
+pub const VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: i64 = 1000001002;
+
+pub const VK_ACCESS_INDIRECT_COMMAND_READ_BIT: i64 = 0x1;
+pub const VK_ACCESS_INDEX_READ_BIT: i64 = 0x2;
+pub const VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT: i64 = 0x4;
+pub const VK_ACCESS_UNIFORM_READ_BIT: i64 = 0x8;
+pub const VK_ACCESS_INPUT_ATTACHMENT_READ_BIT: i64 = 0x10;
+pub const VK_ACCESS_SHADER_READ_BIT: i64 = 0x20;
+pub const VK_ACCESS_SHADER_WRITE_BIT: i64 = 0x40;
+pub const VK_ACCESS_COLOR_ATTACHMENT_READ_BIT: i64 = 0x80;
+pub const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: i64 = 0x100;
+pub const VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT: i64 = 0x200;
+pub const VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT: i64 = 0x400;
+pub const VK_ACCESS_TRANSFER_READ_BIT: i64 = 0x800;
+pub const VK_ACCESS_TRANSFER_WRITE_BIT: i64 = 0x1000;
+pub const VK_ACCESS_HOST_READ_BIT: i64 = 0x2000;
+pub const VK_ACCESS_HOST_WRITE_BIT: i64 = 0x4000;
+pub const VK_ACCESS_MEMORY_READ_BIT: i64 = 0x8000;
+pub const VK_ACCESS_MEMORY_WRITE_BIT: i64 = 0x10000;
+
+pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: i64 = 0x1;
+pub const VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT: i64 = 0x2;
+pub const VK_PIPELINE_STAGE_VERTEX_INPUT_BIT: i64 = 0x4;
+pub const VK_PIPELINE_STAGE_VERTEX_SHADER_BIT: i64 = 0x8;
+pub const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: i64 = 0x80;
+pub const VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT: i64 = 0x100;
+pub const VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT: i64 = 0x200;
+pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: i64 = 0x400;
+pub const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: i64 = 0x800;
+pub const VK_PIPELINE_STAGE_TRANSFER_BIT: i64 = 0x1000;
+pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: i64 = 0x2000;
+pub const VK_PIPELINE_STAGE_HOST_BIT: i64 = 0x4000;
+pub const VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT: i64 = 0x8000;
+pub const VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: i64 = 0x10000;
+
+pub const VK_IMAGE_ASPECT_COLOR_BIT: i64 = 1;
+pub const VK_IMAGE_ASPECT_DEPTH_BIT: i64 = 2;
+pub const VK_IMAGE_ASPECT_STENCIL_BIT: i64 = 4;
+
+pub const VK_IMAGE_TYPE_1D: i64 = 0;
+pub const VK_IMAGE_TYPE_2D: i64 = 1;
+pub const VK_IMAGE_TYPE_3D: i64 = 2;
+pub const VK_IMAGE_TILING_OPTIMAL: i64 = 0;
+pub const VK_IMAGE_TILING_LINEAR: i64 = 1;
+pub const VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT: i64 = 0x10;
+
+pub const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: i64 = 0x1;
+pub const VK_IMAGE_USAGE_TRANSFER_DST_BIT: i64 = 0x2;
+pub const VK_IMAGE_USAGE_SAMPLED_BIT: i64 = 0x4;
+pub const VK_IMAGE_USAGE_STORAGE_BIT: i64 = 0x8;
+pub const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: i64 = 0x10;
+pub const VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT: i64 = 0x20;
+pub const VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT: i64 = 0x40;
+pub const VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT: i64 = 0x80;
+
+pub const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: i64 = 0x1;
+pub const VK_BUFFER_USAGE_TRANSFER_DST_BIT: i64 = 0x2;
+pub const VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT: i64 = 0x4;
+pub const VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT: i64 = 0x8;
+pub const VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT: i64 = 0x10;
+pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: i64 = 0x20;
+pub const VK_BUFFER_USAGE_INDEX_BUFFER_BIT: i64 = 0x40;
+pub const VK_BUFFER_USAGE_VERTEX_BUFFER_BIT: i64 = 0x80;
+pub const VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT: i64 = 0x100;
+
+pub const VK_SHARING_MODE_EXCLUSIVE: i64 = 0;
+pub const VK_SHARING_MODE_CONCURRENT: i64 = 1;
+pub const VK_QUEUE_FAMILY_IGNORED: i64 = 0xFFFFFFFF;
+pub const VK_WHOLE_SIZE: i64 = - 1;
+
+pub const VK_SHADER_STAGE_VERTEX_BIT: i64 = 0x1;
+pub const VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: i64 = 0x2;
+pub const VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: i64 = 0x4;
+pub const VK_SHADER_STAGE_GEOMETRY_BIT: i64 = 0x8;
+pub const VK_SHADER_STAGE_FRAGMENT_BIT: i64 = 0x10;
+pub const VK_SHADER_STAGE_COMPUTE_BIT: i64 = 0x20;
+pub const VK_SHADER_STAGE_ALL_GRAPHICS: i64 = 0x1F;
+
+pub const VK_DESCRIPTOR_TYPE_SAMPLER: i64 = 0;
+pub const VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: i64 = 1;
+pub const VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: i64 = 2;
+pub const VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: i64 = 3;
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: i64 = 4;
+pub const VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: i64 = 5;
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: i64 = 6;
+pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: i64 = 7;
+pub const VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: i64 = 8;
+pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: i64 = 9;
+pub const VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: i64 = 10;
+
+pub const VK_PIPELINE_BIND_POINT_GRAPHICS: i64 = 0;
+pub const VK_PIPELINE_BIND_POINT_COMPUTE: i64 = 1;
+pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: i64 = 0x1;
+pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: i64 = 0x2;
+pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: i64 = 0x4;
+pub const VK_QUEUE_GRAPHICS_BIT: i64 = 0x1;
+pub const VK_QUEUE_COMPUTE_BIT: i64 = 0x2;
+pub const VK_QUEUE_TRANSFER_BIT: i64 = 0x4;
+
+// Formats (VkFormat)
+pub const VK_FORMAT_UNDEFINED: i64 = 0;
+pub const VK_FORMAT_R8_UNORM: i64 = 9;
+pub const VK_FORMAT_R8G8_UNORM: i64 = 16;
+pub const VK_FORMAT_R8G8B8A8_UNORM: i64 = 37;
+pub const VK_FORMAT_R8G8B8A8_SRGB: i64 = 43;
+pub const VK_FORMAT_B8G8R8A8_UNORM: i64 = 44;
+pub const VK_FORMAT_B8G8R8A8_SRGB: i64 = 50;
+pub const VK_FORMAT_A2B10G10R10_UNORM_PACK32: i64 = 64;
+pub const VK_FORMAT_R16_SFLOAT: i64 = 76;
+pub const VK_FORMAT_R16G16_SFLOAT: i64 = 83;
+pub const VK_FORMAT_R16G16B16A16_SFLOAT: i64 = 97;
+pub const VK_FORMAT_R32_UINT: i64 = 98;
+pub const VK_FORMAT_R32_SFLOAT: i64 = 100;
+pub const VK_FORMAT_R32G32_SFLOAT: i64 = 103;
+pub const VK_FORMAT_R32G32B32_SFLOAT: i64 = 106;
+pub const VK_FORMAT_R32G32B32A32_SFLOAT: i64 = 109;
+pub const VK_FORMAT_B10G11R11_UFLOAT_PACK32: i64 = 122;
+pub const VK_FORMAT_D16_UNORM: i64 = 124;
+pub const VK_FORMAT_X8_D24_UNORM_PACK32: i64 = 125;
+pub const VK_FORMAT_D32_SFLOAT: i64 = 126;
+pub const VK_FORMAT_S8_UINT: i64 = 127;
+pub const VK_FORMAT_D16_UNORM_S8_UINT: i64 = 128;
+pub const VK_FORMAT_D24_UNORM_S8_UINT: i64 = 129;
+pub const VK_FORMAT_D32_SFLOAT_S8_UINT: i64 = 130;
+pub const VK_FORMAT_BC1_RGB_UNORM_BLOCK: i64 = 131;
+pub const VK_FORMAT_BC3_UNORM_BLOCK: i64 = 137;
+pub const VK_FORMAT_BC4_UNORM_BLOCK: i64 = 139;
+pub const VK_FORMAT_BC7_UNORM_BLOCK: i64 = 145;
+pub const VK_FORMAT_BC7_SRGB_BLOCK: i64 = 146;
+pub const VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK: i64 = 147;
+pub const VK_FORMAT_ASTC_4X4_UNORM_BLOCK: i64 = 157;
+pub const VK_FORMAT_ASTC_8X8_UNORM_BLOCK: i64 = 171;
+pub const VK_FORMAT_ASTC_12X12_SRGB_BLOCK: i64 = 184;
+
+// ─── Format table ──────────────────────────────────────────────────────────
+
+pub struct VkFormatInfo {
+    /// Bytes per texel block (0 for an unknown format).
+    pub block_bytes: i64,
+    pub block_w: i64,
+    pub block_h: i64,
+    /// Image aspects (VK_IMAGE_ASPECT_*).
+    pub aspects: i64,
+    pub compressed: bool,
+}
+
+fn vk_fi(bytes: i64, bw: i64, bh: i64, aspects: i64) -> VkFormatInfo {
+    return VkFormatInfo { block_bytes: bytes, block_w: bw, block_h: bh, aspects: aspects, compressed: bw > 1 || bh > 1 };
+}
+
+/// Texel block size and aspects of a core format (0..184).
+pub fn vk_format_info(f: i64) -> VkFormatInfo {
+    val c: i64 = VK_IMAGE_ASPECT_COLOR_BIT;
+    if f == 1 { return vk_fi(1, 1, 1, c); }
+    if f >= 2 && f <= 8 { return vk_fi(2, 1, 1, c); }
+    if f >= 9 && f <= 15 { return vk_fi(1, 1, 1, c); }
+    if f >= 16 && f <= 22 { return vk_fi(2, 1, 1, c); }
+    if f >= 23 && f <= 36 { return vk_fi(3, 1, 1, c); }
+    if f >= 37 && f <= 69 { return vk_fi(4, 1, 1, c); }
+    if f >= 70 && f <= 76 { return vk_fi(2, 1, 1, c); }
+    if f >= 77 && f <= 83 { return vk_fi(4, 1, 1, c); }
+    if f >= 84 && f <= 90 { return vk_fi(6, 1, 1, c); }
+    if f >= 91 && f <= 97 { return vk_fi(8, 1, 1, c); }
+    if f >= 98 && f <= 100 { return vk_fi(4, 1, 1, c); }
+    if f >= 101 && f <= 103 { return vk_fi(8, 1, 1, c); }
+    if f >= 104 && f <= 106 { return vk_fi(12, 1, 1, c); }
+    if f >= 107 && f <= 109 { return vk_fi(16, 1, 1, c); }
+    if f >= 110 && f <= 112 { return vk_fi(8, 1, 1, c); }
+    if f >= 113 && f <= 115 { return vk_fi(16, 1, 1, c); }
+    if f >= 116 && f <= 118 { return vk_fi(24, 1, 1, c); }
+    if f >= 119 && f <= 121 { return vk_fi(32, 1, 1, c); }
+    if f == 122 || f == 123 { return vk_fi(4, 1, 1, c); }
+    if f == 124 { return vk_fi(2, 1, 1, VK_IMAGE_ASPECT_DEPTH_BIT); }
+    if f == 125 || f == 126 { return vk_fi(4, 1, 1, VK_IMAGE_ASPECT_DEPTH_BIT); }
+    if f == 127 { return vk_fi(1, 1, 1, VK_IMAGE_ASPECT_STENCIL_BIT); }
+    if f == 128 { return vk_fi(3, 1, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT); }
+    if f == 129 { return vk_fi(4, 1, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT); }
+    if f == 130 { return vk_fi(5, 1, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT); }
+    // BC1 (131..134) and BC4 (139, 140): 8 bytes per 4x4; other BC 16
+    if (f >= 131 && f <= 134) || f == 139 || f == 140 { return vk_fi(8, 4, 4, c); }
+    if f >= 135 && f <= 146 { return vk_fi(16, 4, 4, c); }
+    // ETC2 RGB / RGB A1 and EAC R11: 8 bytes; ETC2 RGBA8 and EAC RG11: 16
+    if (f >= 147 && f <= 150) || f == 153 || f == 154 { return vk_fi(8, 4, 4, c); }
+    if f == 151 || f == 152 || f == 155 || f == 156 { return vk_fi(16, 4, 4, c); }
+    if f >= 157 && f <= 184 {
+        // ASTC: 16 bytes; block sizes in order, each UNORM then SRGB
+        val k: i64 = (f - 157) / 2;
+        val bw: Vec<i64> = vk_astc_dims(true);
+        val bh: Vec<i64> = vk_astc_dims(false);
+        return vk_fi(16, bw.get(k), bh.get(k), c);
+    }
+    return VkFormatInfo { block_bytes: 0, block_w: 1, block_h: 1, aspects: 0, compressed: false };
+}
+
+fn vk_astc_dims(width: bool) -> Vec<i64> {
+    // 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12
+    var w: Vec<i64> = Vec::new();
+    var h: Vec<i64> = Vec::new();
+    w.push(4); h.push(4);
+    w.push(5); h.push(4);
+    w.push(5); h.push(5);
+    w.push(6); h.push(5);
+    w.push(6); h.push(6);
+    w.push(8); h.push(5);
+    w.push(8); h.push(6);
+    w.push(8); h.push(8);
+    w.push(10); h.push(5);
+    w.push(10); h.push(6);
+    w.push(10); h.push(8);
+    w.push(10); h.push(10);
+    w.push(12); h.push(10);
+    w.push(12); h.push(12);
+    if width {
+        return w;
+    }
+    return h;
+}
+
+pub fn vk_format_is_depth_stencil(f: i64) -> bool {
+    return (vk_format_info(f).aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+}
+
+/// Full mip chain length of an extent: floor(log2(max)) + 1.
+pub fn vk_mip_levels(w: i64, h: i64, d: i64) -> i64 {
+    var m: i64 = w;
+    if h > m { m = h; }
+    if d > m { m = d; }
+    var n: i64 = 1;
+    while m > 1 {
+        m = m / 2;
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Bytes of one mip level (tightly packed blocks).
+pub fn vk_level_size(f: i64, w: i64, h: i64, d: i64) -> i64 {
+    val fi: VkFormatInfo = vk_format_info(f);
+    val bx: i64 = (w + fi.block_w - 1) / fi.block_w;
+    val by: i64 = (h + fi.block_h - 1) / fi.block_h;
+    return bx * by * d * fi.block_bytes;
+}
+
+/// Bytes of an image with `mips` levels and `layers` layers.
+pub fn vk_image_size(f: i64, w: i64, h: i64, d: i64, mips: i64, layers: i64) -> i64 {
+    var total: i64 = 0;
+    var lw: i64 = w;
+    var lh: i64 = h;
+    var ld: i64 = d;
+    var m: i64 = 0;
+    while m < mips {
+        total = total + vk_level_size(f, lw, lh, ld);
+        if lw > 1 { lw = lw / 2; }
+        if lh > 1 { lh = lh / 2; }
+        if ld > 1 { ld = ld / 2; }
+        m = m + 1;
+    }
+    return total * layers;
+}
+
+// ─── C struct layouts ──────────────────────────────────────────────────────
+
+pub struct VkLayout {
+    pub name: str,
+    pub fields: Vec<str>,
+    pub offsets: Vec<i64>,
+    pub sizes: Vec<i64>,
+    pub size: i64,
+    pub align: i64,
+}
+
+// Field lists: "name:type" with types u32 (also enums, flags, Bool32,
+// int32_t), f32, u64 (VkDeviceSize, non-dispatchable handles) and ptr.
+// Nested structs whose members are all 4 bytes are flattened.
+fn vk_layout_spec(name: str) -> str {
+    if name == "VkApplicationInfo" {
+        return "sType:u32 pNext:ptr pApplicationName:ptr applicationVersion:u32 pEngineName:ptr engineVersion:u32 apiVersion:u32";
+    }
+    if name == "VkInstanceCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 pApplicationInfo:ptr enabledLayerCount:u32 ppEnabledLayerNames:ptr enabledExtensionCount:u32 ppEnabledExtensionNames:ptr";
+    }
+    if name == "VkDeviceQueueCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 queueFamilyIndex:u32 queueCount:u32 pQueuePriorities:ptr";
+    }
+    if name == "VkDeviceCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 queueCreateInfoCount:u32 pQueueCreateInfos:ptr enabledLayerCount:u32 ppEnabledLayerNames:ptr enabledExtensionCount:u32 ppEnabledExtensionNames:ptr pEnabledFeatures:ptr";
+    }
+    if name == "VkBufferCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 size:u64 usage:u32 sharingMode:u32 queueFamilyIndexCount:u32 pQueueFamilyIndices:ptr";
+    }
+    if name == "VkImageCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 imageType:u32 format:u32 extent.width:u32 extent.height:u32 extent.depth:u32 mipLevels:u32 arrayLayers:u32 samples:u32 tiling:u32 usage:u32 sharingMode:u32 queueFamilyIndexCount:u32 pQueueFamilyIndices:ptr initialLayout:u32";
+    }
+    if name == "VkImageMemoryBarrier" {
+        return "sType:u32 pNext:ptr srcAccessMask:u32 dstAccessMask:u32 oldLayout:u32 newLayout:u32 srcQueueFamilyIndex:u32 dstQueueFamilyIndex:u32 image:u64 subresourceRange.aspectMask:u32 subresourceRange.baseMipLevel:u32 subresourceRange.levelCount:u32 subresourceRange.baseArrayLayer:u32 subresourceRange.layerCount:u32";
+    }
+    if name == "VkDescriptorSetLayoutBinding" {
+        return "binding:u32 descriptorType:u32 descriptorCount:u32 stageFlags:u32 pImmutableSamplers:ptr";
+    }
+    if name == "VkDescriptorSetLayoutCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 bindingCount:u32 pBindings:ptr";
+    }
+    if name == "VkCommandBufferBeginInfo" {
+        return "sType:u32 pNext:ptr flags:u32 pInheritanceInfo:ptr";
+    }
+    if name == "VkSubmitInfo" {
+        return "sType:u32 pNext:ptr waitSemaphoreCount:u32 pWaitSemaphores:ptr pWaitDstStageMask:ptr commandBufferCount:u32 pCommandBuffers:ptr signalSemaphoreCount:u32 pSignalSemaphores:ptr";
+    }
+    if name == "VkMemoryAllocateInfo" {
+        return "sType:u32 pNext:ptr allocationSize:u64 memoryTypeIndex:u32";
+    }
+    if name == "VkShaderModuleCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 codeSize:u64 pCode:ptr";
+    }
+    if name == "VkPipelineRasterizationStateCreateInfo" {
+        return "sType:u32 pNext:ptr flags:u32 depthClampEnable:u32 rasterizerDiscardEnable:u32 polygonMode:u32 cullMode:u32 frontFace:u32 depthBiasEnable:u32 depthBiasConstantFactor:f32 depthBiasClamp:f32 depthBiasSlopeFactor:f32 lineWidth:f32";
+    }
+    return "";
+}
+
+/// Offsets, sizes and alignment of a known struct (empty `fields` when the
+/// name is unknown).
+pub fn vk_layout(name: str) -> VkLayout {
+    var l: VkLayout = VkLayout { name: name, fields: Vec::new(), offsets: Vec::new(), sizes: Vec::new(), size: 0, align: 1 };
+    val spec: str = vk_layout_spec(name);
+    if str_len(spec) == 0 {
+        return l;
+    }
+    val parts: Vec<str> = str_split(spec, " ");
+    var off: i64 = 0;
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        val colon: i64 = str_find(p, ":");
+        val ty: str = str_slice(p, colon + 1, str_len(p));
+        var size: i64 = 4;
+        if ty == "u64" || ty == "ptr" {
+            size = 8;
+        }
+        off = ((off + size - 1) / size) * size;
+        l.fields.push(str_slice(p, 0, colon));
+        l.offsets.push(off);
+        l.sizes.push(size);
+        if size > l.align {
+            l.align = size;
+        }
+        off = off + size;
+        i = i + 1;
+    }
+    l.size = ((off + l.align - 1) / l.align) * l.align;
+    return l;
+}
+
+/// Offset of a field (-1 when absent).
+pub fn vk_offset(l: &VkLayout, field: str) -> i64 {
+    var i: i64 = 0;
+    while i < l.fields.len() {
+        if l.fields.get(i) == field {
+            return l.offsets.get(i);
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// ─── Blobs: C memory images with internal pointers ─────────────────────────
+
+pub struct VkBlob {
+    pub bytes: Vec<i64>,
+    /// Offsets of pointer fields and the blob offsets they point to.
+    pub reloc_at: Vec<i64>,
+    pub reloc_to: Vec<i64>,
+}
+
+pub fn vk_blob_new() -> VkBlob {
+    return VkBlob { bytes: Vec::new(), reloc_at: Vec::new(), reloc_to: Vec::new() };
+}
+
+/// Room for `size` zero bytes at `align`; returns its offset.
+pub fn vk_blob_alloc(b: &mut VkBlob, size: i64, align: i64) -> i64 {
+    while b.bytes.len() % align != 0 {
+        b.bytes.push(0);
+    }
+    val off: i64 = b.bytes.len();
+    var i: i64 = 0;
+    while i < size {
+        b.bytes.push(0);
+        i = i + 1;
+    }
+    return off;
+}
+
+/// Room for one struct of a layout.
+pub fn vk_blob_struct(b: &mut VkBlob, l: &VkLayout) -> i64 {
+    return vk_blob_alloc(b, l.size, l.align);
+}
+
+pub fn vk_put(b: &mut VkBlob, off: i64, size: i64, v: i64) {
+    var k: i64 = 0;
+    while k < size {
+        b.bytes.set(off + k, (v >> (8 * k)) & 255);
+        k = k + 1;
+    }
+}
+
+pub fn vk_get(b: &VkBlob, off: i64, size: i64) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = size - 1;
+    while k >= 0 {
+        v = (v << 8) | b.bytes.get(off + k);
+        k = k - 1;
+    }
+    return v;
+}
+
+/// IEEE single-precision bits of x (round to nearest even; normals,
+/// zeros, infinities; subnormal results flush to zero).
+pub fn vk_f32_bits(x: f64) -> i64 {
+    val d: i64 = p_f64_to_bits(x);
+    val sign: i64 = (d >> 63) & 1;
+    val exp: i64 = (d >> 52) & 0x7FF;
+    val man: i64 = d & 0xFFFFFFFFFFFFF;
+    if exp == 0x7FF {
+        if man != 0 {
+            return 0x7FC00000;
+        }
+        return (sign << 31) | 0x7F800000;
+    }
+    var e: i64 = exp - 1023 + 127;
+    if exp == 0 || e <= 0 {
+        return sign << 31;
+    }
+    var m: i64 = man >> 29;
+    val rest: i64 = man & 0x1FFFFFFF;
+    if rest > 0x10000000 || (rest == 0x10000000 && (m & 1) == 1) {
+        m = m + 1;
+        if m == 0x800000 {
+            m = 0;
+            e = e + 1;
+        }
+    }
+    if e >= 255 {
+        return (sign << 31) | 0x7F800000;
+    }
+    return (sign << 31) | (e << 23) | m;
+}
+
+/// Write a field of a struct at `base` by name; size from the layout.
+pub fn vk_set(b: &mut VkBlob, base: i64, l: &VkLayout, field: str, v: i64) {
+    var i: i64 = 0;
+    while i < l.fields.len() {
+        if l.fields.get(i) == field {
+            vk_put(b, base + l.offsets.get(i), l.sizes.get(i), v);
+            return;
+        }
+        i = i + 1;
+    }
+    panic("vulkan: " + l.name + " has no field " + field);
+}
+
+pub fn vk_set_f32(b: &mut VkBlob, base: i64, l: &VkLayout, field: str, x: f64) {
+    vk_set(b, base, l, field, vk_f32_bits(x));
+}
+
+/// Make a pointer field point at blob offset `target` (-1 leaves NULL).
+pub fn vk_set_ptr(b: &mut VkBlob, base: i64, l: &VkLayout, field: str, target: i64) {
+    if target < 0 {
+        vk_set(b, base, l, field, 0);
+        return;
+    }
+    b.reloc_at.push(base + vk_offset(l, field));
+    b.reloc_to.push(target);
+}
+
+pub fn vk_read(b: &VkBlob, base: i64, l: &VkLayout, field: str) -> i64 {
+    var i: i64 = 0;
+    while i < l.fields.len() {
+        if l.fields.get(i) == field {
+            return vk_get(b, base + l.offsets.get(i), l.sizes.get(i));
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Where a pointer field points inside the blob (-1: NULL).
+pub fn vk_read_ptr(b: &VkBlob, base: i64, l: &VkLayout, field: str) -> i64 {
+    val at: i64 = base + vk_offset(l, field);
+    var i: i64 = 0;
+    while i < b.reloc_at.len() {
+        if b.reloc_at.get(i) == at {
+            return b.reloc_to.get(i);
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// A NUL-terminated string in the blob; returns its offset.
+pub fn vk_blob_cstr(b: &mut VkBlob, s: str) -> i64 {
+    val bs: Vec<i64> = str_bytes(s);
+    val off: i64 = vk_blob_alloc(b, bs.len() + 1, 1);
+    var i: i64 = 0;
+    while i < bs.len() {
+        b.bytes.set(off + i, bs.get(i));
+        i = i + 1;
+    }
+    return off;
+}
+
+/// The string at a blob offset (up to its NUL).
+pub fn vk_blob_read_cstr(b: &VkBlob, off: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = off;
+    while i < b.bytes.len() && b.bytes.get(i) != 0 {
+        out.push(b.bytes.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// An array of pointers to strings (ppEnabledExtensionNames); -1 if empty.
+pub fn vk_blob_cstr_array(b: &mut VkBlob, names: &Vec<str>) -> i64 {
+    if names.len() == 0 {
+        return - 1;
+    }
+    val arr: i64 = vk_blob_alloc(b, 8 * names.len(), 8);
+    var i: i64 = 0;
+    while i < names.len() {
+        val s: i64 = vk_blob_cstr(b, names.get(i));
+        b.reloc_at.push(arr + 8 * i);
+        b.reloc_to.push(s);
+        i = i + 1;
+    }
+    return arr;
+}
+
+/// Copy the blob into fresh C memory with every internal pointer set to
+/// its real address. Returns the base address; free it with p_free.
+pub fn vk_blob_to_mem(b: &VkBlob) -> i64 {
+    var n: i64 = b.bytes.len();
+    if n == 0 {
+        n = 8;
+    }
+    // SAFETY: p_malloc returns n writable bytes; every write below stays
+    // inside them (offsets come from this blob, pointers are 8 bytes
+    // inside it).
+    unsafe {
+        val base: i64 = p_malloc(n);
+        var i: i64 = 0;
+        while i < b.bytes.len() {
+            var p: * mut u8 = base + i;
+            * p = b.bytes.get(i) as u8;
+            i = i + 1;
+        }
+        i = 0;
+        while i < b.reloc_at.len() {
+            var q: * mut i64 = base + b.reloc_at.get(i);
+            * q = base + b.reloc_to.get(i);
+            i = i + 1;
+        }
+        return base;
+    }
+}
+
+/// An 8-byte out-parameter slot (zeroed) for a handle a call writes.
+pub fn vk_out_new() -> i64 {
+    // SAFETY: an 8-byte block the caller owns, zeroed before use.
+    unsafe {
+        val p: i64 = p_malloc(8);
+        var q: * mut i64 = p;
+        * q = 0;
+        return p;
+    }
+}
+
+/// The handle a call wrote to an out slot from vk_out_new.
+pub fn vk_out_read(slot: i64) -> i64 {
+    // SAFETY: slot is an 8-byte block from vk_out_new.
+    unsafe {
+        var q: * mut i64 = slot;
+        return * q;
+    }
+}
+
+// ─── Create-info builders ──────────────────────────────────────────────────
+
+/// VkApplicationInfo + VkInstanceCreateInfo (+ layer and extension name
+/// arrays) in the blob; returns the create info's offset.
+pub fn vk_instance_create_info(b: &mut VkBlob, app: str, app_version: i64, engine: str, engine_version: i64, api: i64, layers: Vec<str>, exts: Vec<str>) -> i64 {
+    val la: VkLayout = vk_layout("VkApplicationInfo");
+    val li: VkLayout = vk_layout("VkInstanceCreateInfo");
+    val ci: i64 = vk_blob_struct(b, &li);
+    val ai: i64 = vk_blob_struct(b, &la);
+    vk_set(b, ai, &la, "sType", VK_STRUCTURE_TYPE_APPLICATION_INFO);
+    vk_set_ptr(b, ai, &la, "pApplicationName", vk_blob_cstr(b, app));
+    vk_set(b, ai, &la, "applicationVersion", app_version);
+    vk_set_ptr(b, ai, &la, "pEngineName", vk_blob_cstr(b, engine));
+    vk_set(b, ai, &la, "engineVersion", engine_version);
+    vk_set(b, ai, &la, "apiVersion", api);
+    vk_set(b, ci, &li, "sType", VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
+    vk_set_ptr(b, ci, &li, "pApplicationInfo", ai);
+    vk_set(b, ci, &li, "enabledLayerCount", layers.len());
+    vk_set_ptr(b, ci, &li, "ppEnabledLayerNames", vk_blob_cstr_array(b, &layers));
+    vk_set(b, ci, &li, "enabledExtensionCount", exts.len());
+    vk_set_ptr(b, ci, &li, "ppEnabledExtensionNames", vk_blob_cstr_array(b, &exts));
+    return ci;
+}
+
+/// VkDeviceCreateInfo with one queue family (priorities as floats).
+pub fn vk_device_create_info(b: &mut VkBlob, family: i64, priorities: Vec<f64>, exts: Vec<str>) -> i64 {
+    val ld: VkLayout = vk_layout("VkDeviceCreateInfo");
+    val lq: VkLayout = vk_layout("VkDeviceQueueCreateInfo");
+    val ci: i64 = vk_blob_struct(b, &ld);
+    val qi: i64 = vk_blob_struct(b, &lq);
+    val pr: i64 = vk_blob_alloc(b, 4 * priorities.len(), 4);
+    var i: i64 = 0;
+    while i < priorities.len() {
+        vk_put(b, pr + 4 * i, 4, vk_f32_bits(priorities.get(i)));
+        i = i + 1;
+    }
+    vk_set(b, qi, &lq, "sType", VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
+    vk_set(b, qi, &lq, "queueFamilyIndex", family);
+    vk_set(b, qi, &lq, "queueCount", priorities.len());
+    vk_set_ptr(b, qi, &lq, "pQueuePriorities", pr);
+    vk_set(b, ci, &ld, "sType", VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+    vk_set(b, ci, &ld, "queueCreateInfoCount", 1);
+    vk_set_ptr(b, ci, &ld, "pQueueCreateInfos", qi);
+    vk_set(b, ci, &ld, "enabledExtensionCount", exts.len());
+    vk_set_ptr(b, ci, &ld, "ppEnabledExtensionNames", vk_blob_cstr_array(b, &exts));
+    return ci;
+}
+
+/// VkBufferCreateInfo (exclusive sharing).
+pub fn vk_buffer_create_info(b: &mut VkBlob, size: i64, usage: i64) -> i64 {
+    val l: VkLayout = vk_layout("VkBufferCreateInfo");
+    val ci: i64 = vk_blob_struct(b, &l);
+    vk_set(b, ci, &l, "sType", VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    vk_set(b, ci, &l, "size", size);
+    vk_set(b, ci, &l, "usage", usage);
+    vk_set(b, ci, &l, "sharingMode", VK_SHARING_MODE_EXCLUSIVE);
+    return ci;
+}
+
+/// The parameters of a VkImageCreateInfo, for validation and writing.
+pub struct VkImageDesc {
+    pub flags: i64,
+    pub image_type: i64,
+    pub format: i64,
+    pub width: i64,
+    pub height: i64,
+    pub depth: i64,
+    pub mip_levels: i64,
+    pub array_layers: i64,
+    pub samples: i64,
+    pub tiling: i64,
+    pub usage: i64,
+}
+
+pub fn vk_image_desc_2d(format: i64, w: i64, h: i64, mips: i64, usage: i64) -> VkImageDesc {
+    return VkImageDesc { flags: 0, image_type: VK_IMAGE_TYPE_2D, format: format, width: w, height: h, depth: 1, mip_levels: mips, array_layers: 1, samples: 1, tiling: VK_IMAGE_TILING_OPTIMAL, usage: usage };
+}
+
+/// Valid-usage problems of an image description (empty when fine): extent
+/// and type (VUID-VkImageCreateInfo-extent-00944..00946, imageType-00956,
+/// 00957), mip levels (mipLevels-00947, 00958), layers (arrayLayers-00948,
+/// imageType-00961), samples (samples-parameter, samples-02257), usage
+/// (usage-requiredbitmask), format (format-00943), cube compatibility
+/// (flags-08865/08866: 2D, square, 6+ layers), depth formats as color.
+pub fn vk_validate_image(d: &VkImageDesc) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    if d.format == VK_FORMAT_UNDEFINED {
+        e.push("format must not be VK_FORMAT_UNDEFINED");
+    }
+    if d.width < 1 || d.height < 1 || d.depth < 1 {
+        e.push("extent must be at least 1 in every dimension");
+    }
+    if d.image_type == VK_IMAGE_TYPE_1D && (d.height != 1 || d.depth != 1) {
+        e.push("a 1D image has height and depth 1");
+    }
+    if d.image_type == VK_IMAGE_TYPE_2D && d.depth != 1 {
+        e.push("a 2D image has depth 1");
+    }
+    if d.mip_levels < 1 {
+        e.push("mipLevels must be at least 1");
+    } else if d.width >= 1 && d.height >= 1 && d.depth >= 1 && d.mip_levels > vk_mip_levels(d.width, d.height, d.depth) {
+        e.push("mipLevels " + int_to_str(d.mip_levels) + " exceeds the full chain of " + int_to_str(vk_mip_levels(d.width, d.height, d.depth)));
+    }
+    if d.array_layers < 1 {
+        e.push("arrayLayers must be at least 1");
+    }
+    if d.image_type == VK_IMAGE_TYPE_3D && d.array_layers != 1 {
+        e.push("a 3D image has arrayLayers 1");
+    }
+    val s: i64 = d.samples;
+    if s < 1 || s > 64 || (s & (s - 1)) != 0 {
+        e.push("samples must be a power of two from 1 to 64");
+    } else if s > 1 && (d.image_type != VK_IMAGE_TYPE_2D || d.mip_levels != 1 || d.tiling != VK_IMAGE_TILING_OPTIMAL || (d.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0) {
+        e.push("multisampled images are 2D, optimal tiling, one mip level, not cube compatible");
+    }
+    if d.usage == 0 {
+        e.push("usage must not be 0");
+    }
+    if (d.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0 && (d.image_type != VK_IMAGE_TYPE_2D || d.width != d.height || d.array_layers < 6) {
+        e.push("a cube-compatible image is 2D, square, with at least 6 layers");
+    }
+    if vk_format_is_depth_stencil(d.format) && (d.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) != 0 {
+        e.push("a depth/stencil format cannot be a color attachment or storage image");
+    }
+    if vk_format_info(d.format).compressed && (d.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0 {
+        e.push("a block-compressed format cannot be an attachment");
+    }
+    if d.tiling == VK_IMAGE_TILING_LINEAR && (d.mip_levels != 1 || d.array_layers != 1 || vk_format_is_depth_stencil(d.format)) {
+        e.push("linear tiling (portably) needs one mip level, one layer and a color format");
+    }
+    return e;
+}
+
+/// VkImageCreateInfo in the blob (exclusive sharing, UNDEFINED layout).
+pub fn vk_image_create_info(b: &mut VkBlob, d: &VkImageDesc) -> i64 {
+    val l: VkLayout = vk_layout("VkImageCreateInfo");
+    val ci: i64 = vk_blob_struct(b, &l);
+    vk_set(b, ci, &l, "sType", VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+    vk_set(b, ci, &l, "flags", d.flags);
+    vk_set(b, ci, &l, "imageType", d.image_type);
+    vk_set(b, ci, &l, "format", d.format);
+    vk_set(b, ci, &l, "extent.width", d.width);
+    vk_set(b, ci, &l, "extent.height", d.height);
+    vk_set(b, ci, &l, "extent.depth", d.depth);
+    vk_set(b, ci, &l, "mipLevels", d.mip_levels);
+    vk_set(b, ci, &l, "arrayLayers", d.array_layers);
+    vk_set(b, ci, &l, "samples", d.samples);
+    vk_set(b, ci, &l, "tiling", d.tiling);
+    vk_set(b, ci, &l, "usage", d.usage);
+    vk_set(b, ci, &l, "initialLayout", VK_IMAGE_LAYOUT_UNDEFINED);
+    return ci;
+}
+
+/// Problems of buffer parameters (VUID-VkBufferCreateInfo-size-00912,
+/// usage-requiredbitmask, sharingMode-00914).
+pub fn vk_validate_buffer(size: i64, usage: i64, sharing: i64, families: &Vec<i64>) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    if size <= 0 {
+        e.push("size must be greater than 0");
+    }
+    if usage == 0 {
+        e.push("usage must not be 0");
+    }
+    if sharing == VK_SHARING_MODE_CONCURRENT && families.len() < 2 {
+        e.push("concurrent sharing needs at least 2 queue family indices");
+    }
+    return e;
+}
+
+// ─── Layout transitions ────────────────────────────────────────────────────
+
+pub struct VkBarrierMasks {
+    pub src_access: i64,
+    pub dst_access: i64,
+    pub src_stage: i64,
+    pub dst_stage: i64,
+}
+
+fn vk_layout_access(layout: i64) -> i64 {
+    if layout == VK_IMAGE_LAYOUT_GENERAL {
+        return VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL {
+        return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL {
+        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL {
+        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL {
+        return VK_ACCESS_SHADER_READ_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL {
+        return VK_ACCESS_TRANSFER_READ_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL {
+        return VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_PREINITIALIZED {
+        return VK_ACCESS_HOST_WRITE_BIT;
+    }
+    return 0;
+}
+
+fn vk_layout_stage(layout: i64, shader_stage: i64, as_src: bool) -> i64 {
+    if layout == VK_IMAGE_LAYOUT_UNDEFINED {
+        return VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_PREINITIALIZED {
+        return VK_PIPELINE_STAGE_HOST_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_GENERAL {
+        return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL {
+        return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL {
+        return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL {
+        return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | shader_stage;
+    }
+    if layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL {
+        return shader_stage;
+    }
+    if layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL {
+        return VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    if layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR {
+        // acquiring waits at color output; presenting needs nothing after
+        if as_src {
+            return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        }
+        return VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    }
+    return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+}
+
+/// The masks of a layout transition barrier: the source side makes the old
+/// layout's writes available (reads need no access bits), the destination
+/// side covers every access the new layout allows. `shader_stage` is
+/// where shader reads happen (fragment or compute stage bit).
+pub fn vk_transition(old_layout: i64, new_layout: i64, shader_stage: i64) -> VkBarrierMasks {
+    val writes: i64 = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    return VkBarrierMasks {
+        src_access: vk_layout_access(old_layout) & writes,
+        dst_access: vk_layout_access(new_layout),
+        src_stage: vk_layout_stage(old_layout, shader_stage, true),
+        dst_stage: vk_layout_stage(new_layout, shader_stage, false),
+    };
+}
+
+/// A VkImageMemoryBarrier for a transition of all mips and layers.
+pub fn vk_image_barrier(b: &mut VkBlob, image: i64, format: i64, old_layout: i64, new_layout: i64, mips: i64, layers: i64, shader_stage: i64) -> i64 {
+    val l: VkLayout = vk_layout("VkImageMemoryBarrier");
+    val m: VkBarrierMasks = vk_transition(old_layout, new_layout, shader_stage);
+    val at: i64 = vk_blob_struct(b, &l);
+    vk_set(b, at, &l, "sType", VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+    vk_set(b, at, &l, "srcAccessMask", m.src_access);
+    vk_set(b, at, &l, "dstAccessMask", m.dst_access);
+    vk_set(b, at, &l, "oldLayout", old_layout);
+    vk_set(b, at, &l, "newLayout", new_layout);
+    vk_set(b, at, &l, "srcQueueFamilyIndex", VK_QUEUE_FAMILY_IGNORED);
+    vk_set(b, at, &l, "dstQueueFamilyIndex", VK_QUEUE_FAMILY_IGNORED);
+    vk_set(b, at, &l, "image", image);
+    vk_set(b, at, &l, "subresourceRange.aspectMask", vk_format_info(format).aspects);
+    vk_set(b, at, &l, "subresourceRange.levelCount", mips);
+    vk_set(b, at, &l, "subresourceRange.layerCount", layers);
+    return at;
+}
+
+// ─── Descriptor set layouts ────────────────────────────────────────────────
+
+pub struct VkDslBuilder {
+    pub binding: Vec<i64>,
+    pub dtype: Vec<i64>,
+    pub count: Vec<i64>,
+    pub stages: Vec<i64>,
+}
+
+pub fn vk_dsl_new() -> VkDslBuilder {
+    return VkDslBuilder { binding: Vec::new(), dtype: Vec::new(), count: Vec::new(), stages: Vec::new() };
+}
+
+pub fn vk_dsl_add(d: &mut VkDslBuilder, binding: i64, dtype: i64, count: i64, stages: i64) {
+    d.binding.push(binding);
+    d.dtype.push(dtype);
+    d.count.push(count);
+    d.stages.push(stages);
+}
+
+// minimum guaranteed per-stage limits (Vulkan spec, "Required Limits")
+fn vk_dsl_class(t: i64) -> i64 {
+    if t == VK_DESCRIPTOR_TYPE_SAMPLER { return 0; }
+    if t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER { return 5; }
+    if t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER { return 1; }
+    if t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER { return 2; }
+    if t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC { return 3; }
+    if t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC { return 4; }
+    return 6;
+}
+
+/// Problems with the bindings: duplicate numbers, unknown types, counts,
+/// stages, input attachments outside the fragment stage, dynamic buffer
+/// totals (8 uniform / 4 storage), and per-stage totals above the minimum
+/// limits every device supports (16 samplers, 16 sampled images, 4 storage
+/// images, 12 uniform buffers, 4 storage buffers, 4 input attachments; a
+/// combined image sampler counts as a sampler and a sampled image).
+pub fn vk_dsl_validate(d: &VkDslBuilder) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    var dyn_u: i64 = 0;
+    var dyn_s: i64 = 0;
+    while i < d.binding.len() {
+        var j: i64 = i + 1;
+        while j < d.binding.len() {
+            if d.binding.get(j) == d.binding.get(i) {
+                e.push("binding " + int_to_str(d.binding.get(i)) + " used twice");
+            }
+            j = j + 1;
+        }
+        val t: i64 = d.dtype.get(i);
+        if t < 0 || t > 10 {
+            e.push("binding " + int_to_str(d.binding.get(i)) + ": unknown descriptor type");
+        }
+        if d.count.get(i) > 0 && d.stages.get(i) == 0 {
+            e.push("binding " + int_to_str(d.binding.get(i)) + ": no shader stage");
+        }
+        if t == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT && (d.stages.get(i) & (0x7FFFFFFF ^ VK_SHADER_STAGE_FRAGMENT_BIT)) != 0 {
+            e.push("binding " + int_to_str(d.binding.get(i)) + ": input attachments are fragment-only");
+        }
+        if t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC {
+            dyn_u = dyn_u + d.count.get(i);
+        }
+        if t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC {
+            dyn_s = dyn_s + d.count.get(i);
+        }
+        i = i + 1;
+    }
+    if dyn_u > 8 {
+        e.push("more than 8 dynamic uniform buffers");
+    }
+    if dyn_s > 4 {
+        e.push("more than 4 dynamic storage buffers");
+    }
+    var limits: Vec<i64> = Vec::new();
+    limits.push(16); limits.push(16); limits.push(4); limits.push(12); limits.push(4); limits.push(0); limits.push(4);
+    var names: Vec<str> = Vec::new();
+    names.push("samplers"); names.push("sampled images"); names.push("storage images"); names.push("uniform buffers"); names.push("storage buffers"); names.push(""); names.push("input attachments");
+    var stage: i64 = 0;
+    while stage < 6 {
+        val bit: i64 = 1 << stage;
+        var used: Vec<i64> = Vec::filled(7, 0);
+        i = 0;
+        while i < d.binding.len() {
+            if (d.stages.get(i) & bit) != 0 {
+                val c: i64 = vk_dsl_class(d.dtype.get(i));
+                if c == 5 {
+                    used.set(0, used.get(0) + d.count.get(i));
+                    used.set(1, used.get(1) + d.count.get(i));
+                } else {
+                    used.set(c, used.get(c) + d.count.get(i));
+                }
+            }
+            i = i + 1;
+        }
+        var c: i64 = 0;
+        while c < 7 {
+            if c != 5 && used.get(c) > limits.get(c) {
+                e.push("stage bit " + int_to_str(bit) + ": " + int_to_str(used.get(c)) + " " + names.get(c) + " (limit " + int_to_str(limits.get(c)) + ")");
+            }
+            c = c + 1;
+        }
+        stage = stage + 1;
+    }
+    return e;
+}
+
+/// VkDescriptorSetLayoutCreateInfo and its bindings (sorted by binding
+/// number) in the blob; returns the create info's offset.
+pub fn vk_dsl_create_info(d: &VkDslBuilder, b: &mut VkBlob) -> i64 {
+    val lc: VkLayout = vk_layout("VkDescriptorSetLayoutCreateInfo");
+    val lb: VkLayout = vk_layout("VkDescriptorSetLayoutBinding");
+    val n: i64 = d.binding.len();
+    var idx: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        var at: i64 = idx.len();
+        while at > 0 && d.binding.get(idx.get(at - 1)) > d.binding.get(i) {
+            at = at - 1;
+        }
+        idx.insert(at, i);
+        i = i + 1;
+    }
+    val ci: i64 = vk_blob_struct(b, &lc);
+    var arr: i64 = - 1;
+    if n > 0 {
+        arr = vk_blob_alloc(b, lb.size * n, lb.align);
+    }
+    i = 0;
+    while i < n {
+        val k: i64 = idx.get(i);
+        val at: i64 = arr + i * lb.size;
+        vk_set(b, at, &lb, "binding", d.binding.get(k));
+        vk_set(b, at, &lb, "descriptorType", d.dtype.get(k));
+        vk_set(b, at, &lb, "descriptorCount", d.count.get(k));
+        vk_set(b, at, &lb, "stageFlags", d.stages.get(k));
+        i = i + 1;
+    }
+    vk_set(b, ci, &lc, "sType", VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
+    vk_set(b, ci, &lc, "bindingCount", n);
+    vk_set_ptr(b, ci, &lc, "pBindings", arr);
+    return ci;
+}
+
+/// Descriptor pool sizes for `sets` copies of a layout: (type, count)
+/// pairs, one per type used.
+pub fn vk_dsl_pool_sizes(d: &VkDslBuilder, sets: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var t: i64 = 0;
+    while t <= 10 {
+        var n: i64 = 0;
+        var i: i64 = 0;
+        while i < d.binding.len() {
+            if d.dtype.get(i) == t {
+                n = n + d.count.get(i);
+            }
+            i = i + 1;
+        }
+        if n > 0 {
+            out.push(t);
+            out.push(n * sets);
+        }
+        t = t + 1;
+    }
+    return out;
+}

@@ -1,0 +1,56 @@
+// LG14: async methods. An `async fn` in an impl block or a trait impl runs
+// as a task, as an async function does (lower.fd lw_split_async_methods: a
+// body function `<Type>__async__<method>` and a method returning its
+// future); a call through `dyn` gets a future from every implementation.
+// Expected output:
+// 11
+// 12
+// 15
+// 10
+// 7
+use task;
+
+cap Source {
+    async fn fetch(self, k: i64) -> Future<i64>;
+}
+
+struct Fixed { base: i64 }
+struct Slow { base: i64 }
+
+impl Source for Fixed {
+    async fn fetch(self, k: i64) -> Future<i64> {
+        return self.base + k;
+    }
+}
+
+impl Source for Slow {
+    async fn fetch(self, k: i64) -> Future<i64> {
+        task_yield();
+        return self.base * k;
+    }
+}
+
+struct Counter { n: i64 }
+
+impl Counter {
+    async fn add(self, k: i64) -> Future<i64> {
+        return self.n + k;
+    }
+    fn plain(self) -> i64 {
+        return self.n;
+    }
+}
+
+fn main() {
+    val a = Fixed { base: 10 };
+    val b = Slow { base: 3 };
+    val fa = a.fetch(1);
+    val fb = b.fetch(4);
+    println(await fa);
+    println(await fb);
+    val d = b as dyn Source;
+    println(await d.fetch(5));
+    val c = Counter { n: 7 };
+    println(await c.add(3));
+    println(c.plain());
+}

@@ -1,0 +1,105 @@
+// stdlib/world (complaint CT1), the clock: a test replaces the clock for
+// code it does not change. A rate limiter, a session that expires and a
+// wait-until-deadline loop read the time through time (clock_now_ms,
+// clock_elapsed_ms) and datetime (dt_now); the test fixes the clock,
+// moves it by hand or lets every reading move it, and the results are the
+// same on every run, with no sleeping.
+//
+// Expected output:
+// limiter = 1 1 1 0
+// after 999 ms = 0
+// after 1 s = 1
+// stamp = 2023-11-14T22:13:21Z
+// fresh = true
+// expired = false true
+// waited = 5 polls, 250 ms
+// elapsed = 250
+// reads = 19
+// frozen = 1700000006300 1700000006300
+// real = true
+use time;
+use datetime;
+use world;
+
+// ─── the code under test: no test hooks, no parameters for fakes ─────────
+
+// a limiter of 3 calls per second
+var lim_start: i64 = -1;
+var lim_used: i64 = 0;
+
+fn allow() -> i64 {
+    val now: i64 = clock_now_ms();
+    if lim_start < 0 || now - lim_start >= 1000 {
+        lim_start = now;
+        lim_used = 0;
+    }
+    if lim_used >= 3 { return 0; }
+    lim_used = lim_used + 1;
+    return 1;
+}
+
+// a session: its creation time (seconds) and its lifetime
+fn session_new() -> i64 {
+    return clock_now_ms() / 1000;
+}
+
+fn session_expired(created: i64, ttl_s: i64) -> bool {
+    return clock_now_ms() / 1000 - created >= ttl_s;
+}
+
+// poll until a deadline: how many polls it took
+fn wait_until(deadline_ms: i64) -> i64 {
+    var polls: i64 = 0;
+    while clock_now_ms() < deadline_ms {
+        polls = polls + 1;
+    }
+    return polls;
+}
+
+// ─── the test ────────────────────────────────────────────────────────────
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    world_fake_clock(1700000000000);
+
+    val a: i64 = allow();
+    val b: i64 = allow();
+    val c: i64 = allow();
+    val d: i64 = allow();
+    println("limiter = " + int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c) + " " + int_to_str(d));
+    world_clock_advance(999);
+    println("after 999 ms = " + int_to_str(allow()));
+    world_clock_advance(1);
+    println("after 1 s = " + int_to_str(allow()));
+
+    println("stamp = " + time_to_iso(dt_now()));
+
+    val s: i64 = session_new();
+    println("fresh = " + yes(!session_expired(s, 5)));
+    world_clock_advance(4000);
+    val e1: bool = session_expired(s, 5);
+    world_clock_advance(1000);
+    val e2: bool = session_expired(s, 5);
+    println("expired = " + yes(e1) + " " + yes(e2));
+
+    // every reading moves the clock by 50 ms: the loop ends after 250 ms
+    val start: i64 = clock_now_ms();
+    world_clock_auto_step(50);
+    val polls: i64 = wait_until(start + 250);
+    world_clock_auto_step(0);
+    println("waited = " + int_to_str(polls) + " polls, " + int_to_str(world_clock_peek() - start - 50) + " ms");
+    println("elapsed = " + int_to_str(clock_elapsed_ms(start) - 50));
+    println("reads = " + int_to_str(world_clock_read_count()));
+    // frozen again: two readings agree
+    val f1: i64 = clock_now_ms();
+    val f2: i64 = clock_now_ms();
+    println("frozen = " + int_to_str(f1) + " " + int_to_str(f2));
+
+    world_real_clock();
+    println("real = " + yes(clock_now_ms() > 1700000000000 && clock_now_ms() < 1700000000000 * 2));
+    return 0;
+}

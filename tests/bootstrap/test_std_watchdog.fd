@@ -1,0 +1,115 @@
+// stdlib/watchdog: IWDG timeout math and configuration, WWDG window timing and simulation, a windowed watchdog simulation, and the kick-discipline checker.
+// Expected output:
+// iwdg PR4 RL4095 @32kHz: 8192000 us
+// 1000 ms: ok true PR 1 RL 3999 -> 1000000 us
+// 30000 ms: ok true PR 6 RL 3749 -> 30000000 us
+// 40000 ms: ok false
+// range 680851..1882352 us
+// KR=0xCCCC KR=0x5555 PR=0x1 RLR=0xF9F wait SR==0 KR=0xAAAA
+// KR=0xCCCC KR=0x5555 PR=0x1 RLR=0xF9F wait SR==0 WINR=0x7D0
+// wwdg tick 910222 ns, timeout 58254208 ns, window 42780434..58254208 ns
+// early refresh: refresh at counter 0x6B above window 0x50
+// refresh at 0x50: reset false
+// ewi true at counter 0x40, then counter reached 0x3F after 64 ticks
+// early kick: 10 after the previous, window opens at 20 at 130
+// timeout: no kick for 100 at 150
+// kicks 3 no reset -1
+// good: ok true max 90 min 80 margin 10%
+// bad: ok false max 140 min 15 margin -40%
+//   early: kick at 95 only 15 after 80
+//   late: reset at 290 (gap 140)
+// kick period 55 -1 75
+use watchdog;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn showcfg(label: str, c: IwdgConfig) {
+    if c.ok {
+        println(label + ": ok true PR " + int_to_str(c.pr) + " RL " + int_to_str(c.rl) + " -> " + int_to_str(c.timeout_us) + " us");
+    } else {
+        println(label + ": ok false");
+    }
+}
+
+fn ints(xs: str) -> Vec<i64> {
+    val p: Vec<str> = str_split(xs, ",");
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < p.len() {
+        out.push(str_parse_int(p.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    println("iwdg PR4 RL4095 @32kHz: " + int_to_str(iwdg_timeout_us(4, 4095, 32000)) + " us");
+    val c1: IwdgConfig = iwdg_config_for(1000, 32000);
+    showcfg("1000 ms", c1);
+    showcfg("30000 ms", iwdg_config_for(30000, 32000));
+    showcfg("40000 ms", iwdg_config_for(40000, 32000));
+    val rg: Vec<i64> = iwdg_timeout_range(c1.pr, c1.rl, 17000, 47000);
+    println("range " + int_to_str(rg.get(0)) + ".." + int_to_str(rg.get(1)) + " us");
+    println(iwdg_seq_to_str(iwdg_write_sequence(c1, -1)));
+    println(iwdg_seq_to_str(iwdg_write_sequence(c1, 2000)));
+
+    val win: Vec<i64> = wwdg_window_ns(36000000, 3, 0x7F, 0x50);
+    println("wwdg tick " + int_to_str(wwdg_tick_ns(36000000, 3)) + " ns, timeout " + int_to_str(wwdg_timeout_ns(36000000, 3, 0x7F))
+        + " ns, window " + int_to_str(win.get(0)) + ".." + int_to_str(win.get(1)) + " ns");
+    var w1: WwdgSim = wwdgsim_new(0x7F, 0x50);
+    var i: i64 = 0;
+    while i < 20 {
+        wwdgsim_tick(&mut w1);
+        i = i + 1;
+    }
+    wwdgsim_refresh(&mut w1, 0x7F);
+    println("early refresh: " + w1.reason);
+    var w2: WwdgSim = wwdgsim_new(0x7F, 0x50);
+    i = 0;
+    while i < 47 {
+        wwdgsim_tick(&mut w2);
+        i = i + 1;
+    }
+    wwdgsim_refresh(&mut w2, 0x7F);
+    println("refresh at 0x50: reset " + bs(w2.reset));
+    i = 0;
+    while i < 63 {
+        wwdgsim_tick(&mut w2);
+        i = i + 1;
+    }
+    val ewi: bool = w2.ewi;
+    wwdgsim_tick(&mut w2);
+    println("ewi " + bs(ewi) + " at counter 0x40, then " + w2.reason);
+
+    var d1: WdtSim = wdtsim_new(100, 20);
+    wdtsim_kick(&mut d1, 50);
+    wdtsim_kick(&mut d1, 120);
+    wdtsim_kick(&mut d1, 130);
+    println(d1.reason + " at " + int_to_str(d1.reset_at));
+    var d2: WdtSim = wdtsim_new(100, 0);
+    wdtsim_kick(&mut d2, 50);
+    wdtsim_kick(&mut d2, 160);
+    println(d2.reason + " at " + int_to_str(d2.reset_at));
+    var d3: WdtSim = wdtsim_new(100, 20);
+    wdtsim_kick(&mut d3, 60);
+    wdtsim_kick(&mut d3, 150);
+    wdtsim_kick(&mut d3, 240);
+    wdtsim_advance(&mut d3, 300);
+    println("kicks " + int_to_str(d3.kicks) + " no reset " + int_to_str(d3.reset_at));
+
+    val g: KickReport = wdg_check_kicks(ints("80,170,250,330,420"), 0, 480, 100, 0);
+    println("good: ok " + bs(g.ok) + " max " + int_to_str(g.max_gap) + " min " + int_to_str(g.min_gap) + " margin " + int_to_str(g.margin_pct) + "%");
+    val b: KickReport = wdg_check_kicks(ints("80,95,190,330"), 0, 400, 100, 30);
+    println("bad: ok " + bs(b.ok) + " max " + int_to_str(b.max_gap) + " min " + int_to_str(b.min_gap) + " margin " + int_to_str(b.margin_pct) + "%");
+    i = 0;
+    while i < b.violations.len() {
+        println("  " + b.violations.get(i));
+        i = i + 1;
+    }
+    println("kick period " + int_to_str(wdg_kick_period(100, 30, 20)) + " " + int_to_str(wdg_kick_period(100, 90, 20)) + " " + int_to_str(wdg_kick_period(100, 0, 25)));
+}

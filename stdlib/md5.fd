@@ -1,0 +1,184 @@
+// Fides MD5 (RFC 1321), pure Fides. LEGACY: MD5 is broken for collision
+// resistance; use it only to read formats that require it (old checksums,
+// ETags, HTTP digest auth). For anything new, use sha256/sha512/blake3.
+//
+// 32-bit words are kept in i64 values in 0..2^32-1 and masked after every
+// addition, as crypto.fd's SHA-256 does, so no backend's overflow check
+// or shift semantics matter. Messages and digests are Vec<i64> of bytes.
+//
+// Usage:
+//   use md5;
+//   val d = md5_bytes(msg);              // 16-byte digest
+//   val h = md5_hex(md5_str("abc"));     // "900150983cd24fb0d6963f7d28e17f72"
+
+module md5;
+ use vec;
+
+fn m5_mask(x: i64) -> i64 {
+    return x & 0xffffffff;
+}
+
+fn m5_rotl(x: i64, n: i64) -> i64 {
+    return ((x << n) | (x >> (32 - n))) & 0xffffffff;
+}
+
+/// K[i] = floor(|sin(i + 1)| * 2^32), RFC 1321 §3.4.
+fn m5_k() -> Vec<i64> {
+    var k: Vec<i64> = Vec::new();
+    k.push(0xd76aa478); k.push(0xe8c7b756); k.push(0x242070db); k.push(0xc1bdceee);
+    k.push(0xf57c0faf); k.push(0x4787c62a); k.push(0xa8304613); k.push(0xfd469501);
+    k.push(0x698098d8); k.push(0x8b44f7af); k.push(0xffff5bb1); k.push(0x895cd7be);
+    k.push(0x6b901122); k.push(0xfd987193); k.push(0xa679438e); k.push(0x49b40821);
+    k.push(0xf61e2562); k.push(0xc040b340); k.push(0x265e5a51); k.push(0xe9b6c7aa);
+    k.push(0xd62f105d); k.push(0x02441453); k.push(0xd8a1e681); k.push(0xe7d3fbc8);
+    k.push(0x21e1cde6); k.push(0xc33707d6); k.push(0xf4d50d87); k.push(0x455a14ed);
+    k.push(0xa9e3e905); k.push(0xfcefa3f8); k.push(0x676f02d9); k.push(0x8d2a4c8a);
+    k.push(0xfffa3942); k.push(0x8771f681); k.push(0x6d9d6122); k.push(0xfde5380c);
+    k.push(0xa4beea44); k.push(0x4bdecfa9); k.push(0xf6bb4b60); k.push(0xbebfbc70);
+    k.push(0x289b7ec6); k.push(0xeaa127fa); k.push(0xd4ef3085); k.push(0x04881d05);
+    k.push(0xd9d4d039); k.push(0xe6db99e5); k.push(0x1fa27cf8); k.push(0xc4ac5665);
+    k.push(0xf4292244); k.push(0x432aff97); k.push(0xab9423a7); k.push(0xfc93a039);
+    k.push(0x655b59c3); k.push(0x8f0ccc92); k.push(0xffeff47d); k.push(0x85845dd1);
+    k.push(0x6fa87e4f); k.push(0xfe2ce6e0); k.push(0xa3014314); k.push(0x4e0811a1);
+    k.push(0xf7537e82); k.push(0xbd3af235); k.push(0x2ad7d2bb); k.push(0xeb86d391);
+    return k;
+}
+
+/// The per-round left rotation amounts (RFC 1321 §3.4: S11..S44).
+fn m5_shift(i: i64) -> i64 {
+    val r: i64 = i / 16;
+    val j: i64 = i % 4;
+    if r == 0 {
+        if j == 0 { return 7; }
+        if j == 1 { return 12; }
+        if j == 2 { return 17; }
+        return 22;
+    }
+    if r == 1 {
+        if j == 0 { return 5; }
+        if j == 1 { return 9; }
+        if j == 2 { return 14; }
+        return 20;
+    }
+    if r == 2 {
+        if j == 0 { return 4; }
+        if j == 1 { return 11; }
+        if j == 2 { return 16; }
+        return 23;
+    }
+    if j == 0 { return 6; }
+    if j == 1 { return 10; }
+    if j == 2 { return 15; }
+    return 21;
+}
+
+/// One 64-byte block of m at `off` into the state h (4 words).
+fn m5_block(h: & mut Vec<i64>, k: & Vec<i64>, w: & mut Vec<i64>, m: & Vec<i64>, off: i64) {
+    var i: i64 = 0;
+    while i < 16 {
+        val p: i64 = off + i * 4;
+        w.set(i, (m.get(p) & 255) | ((m.get(p + 1) & 255) << 8)
+            | ((m.get(p + 2) & 255) << 16) | ((m.get(p + 3) & 255) << 24));
+        i = i + 1;
+    }
+    var a: i64 = h.get(0);
+    var b: i64 = h.get(1);
+    var c: i64 = h.get(2);
+    var d: i64 = h.get(3);
+    i = 0;
+    while i < 64 {
+        var f: i64 = 0;
+        var g: i64 = 0;
+        if i < 16 {
+            f = (b & c) | ((b ^ 0xffffffff) & d);
+            g = i;
+        } else if i < 32 {
+            f = (d & b) | ((d ^ 0xffffffff) & c);
+            g = (5 * i + 1) % 16;
+        } else if i < 48 {
+            f = b ^ c ^ d;
+            g = (3 * i + 5) % 16;
+        } else {
+            f = c ^ (b | (d ^ 0xffffffff));
+            g = (7 * i) % 16;
+        }
+        f = m5_mask(f + a + k.get(i) + w.get(g));
+        a = d;
+        d = c;
+        c = b;
+        b = m5_mask(b + m5_rotl(f, m5_shift(i)));
+        i = i + 1;
+    }
+    h.set(0, m5_mask(h.get(0) + a));
+    h.set(1, m5_mask(h.get(1) + b));
+    h.set(2, m5_mask(h.get(2) + c));
+    h.set(3, m5_mask(h.get(3) + d));
+}
+
+/// MD5 of a byte vector (each element 0..255): the 16-byte digest.
+pub fn md5_bytes(msg: Vec<i64>) -> Vec<i64> {
+    val n: i64 = msg.len();
+    // Padding: 0x80, zeros to 56 mod 64, the bit length as 64-bit LE.
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        m.push(msg.get(i) & 255);
+        i = i + 1;
+    }
+    m.push(128);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    val bits: i64 = n * 8;
+    i = 0;
+    while i < 8 {
+        m.push((bits >> (i * 8)) & 255);
+        i = i + 1;
+    }
+    var h: Vec<i64> = Vec::new();
+    h.push(0x67452301);
+    h.push(0xefcdab89);
+    h.push(0x98badcfe);
+    h.push(0x10325476);
+    val k: Vec<i64> = m5_k();
+    var w: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 {
+        w.push(0);
+        i = i + 1;
+    }
+    var off: i64 = 0;
+    while off < m.len() {
+        m5_block(& mut h, & k, & mut w, & m, off);
+        off = off + 64;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 4 {
+        val x: i64 = h.get(i);
+        out.push(x & 255);
+        out.push((x >> 8) & 255);
+        out.push((x >> 16) & 255);
+        out.push((x >> 24) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// MD5 of the bytes of a string.
+pub fn md5_str(s: str) -> Vec<i64> {
+    return md5_bytes(str_bytes(s));
+}
+
+/// Lowercase hex of a byte vector.
+pub fn md5_hex(d: Vec<i64>) -> str {
+    val digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < d.len() {
+        val b: i64 = d.get(i) & 255;
+        out = out + str_slice(digits, b >> 4, (b >> 4) + 1) + str_slice(digits, b & 15, (b & 15) + 1);
+        i = i + 1;
+    }
+    return out;
+}

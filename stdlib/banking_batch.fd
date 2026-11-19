@@ -1,0 +1,389 @@
+// Fides banking batch processing (roadmap Phase 9: batch + COBOL interop).
+//
+// A nightly batch run as a mainframe does it, with the money moves proved
+// by the compiler: the step that moves money between two accounts is
+// @conserve (Money_take + Money_add), so a posting cannot create or lose
+// money. Around it, the batch keeps COBOL-style control totals: the
+// transaction file's trailer carries the record count and the sum of the
+// amounts, the run checks both, and the closing ledger total must equal
+// the opening total plus deposits minus withdrawals.
+//
+// Transactions come from a fixed-width COBOL file described by a
+// copybook (stdlib/cobol.fd; batch_txn_copybook is the default layout):
+//
+//   01 TXN-REC.
+//      05 TXN-TYPE   PIC X.            H header, D deposit, W withdrawal,
+//                                      T transfer, Z trailer
+//      05 TXN-FROM   PIC 9(8).         account (source of a transfer)
+//      05 TXN-TO     PIC 9(8).         target of a transfer
+//      05 TXN-AMT    PIC S9(11)V99 COMP-3.
+//      05 TXN-REF    PIC X(12).
+//
+// The trailer's TXN-FROM is the count of D/W/T records and TXN-AMT the
+// sum of their amounts.
+//
+// Usage:
+//   use banking_batch;
+//   var led = ledger_new();
+//   ledger_open(&mut led, 1001, 50000);
+//   val txns = batch_read_file(batch_txn_copybook(), fs_read_bytes("txns.dat"));
+//   val rep = batch_run(&mut led, txns);
+//   print(batch_report_text(rep));
+
+module banking_batch;
+use cobol;
+use money;
+
+pub const BATCH_DEPOSIT: i64 = 1;
+pub const BATCH_WITHDRAW: i64 = 2;
+pub const BATCH_TRANSFER: i64 = 3;
+
+/// One transaction of a batch.
+pub struct BatchTxn {
+    pub kind: i64,      // BATCH_DEPOSIT / WITHDRAW / TRANSFER
+    pub from: i64,      // the account (deposit/withdraw) or transfer source
+    pub to: i64,        // transfer target (0 otherwise)
+    pub cents: i64,
+    pub ref_id: str,
+}
+
+/// The accounts a batch posts to: id and balance in cents, in opening order.
+pub struct Ledger {
+    pub ids: Vec<i64>,
+    pub cents: Vec<i64>,
+}
+
+/// What a batch run did.
+pub struct BatchReport {
+    pub applied: i64,
+    pub rejected: i64,
+    pub deposits: i64,      // cents posted in
+    pub withdrawals: i64,   // cents paid out
+    pub transfers: i64,     // cents moved between accounts
+    pub opening: i64,       // ledger total before
+    pub closing: i64,       // ledger total after
+    pub balanced: bool,     // closing == opening + deposits - withdrawals
+    pub errors: Vec<str>,   // one line per rejected transaction / file error
+}
+
+/// The parsed transaction file: the transactions and file-level checks.
+pub struct BatchFile {
+    pub txns: Vec<BatchTxn>,
+    pub errors: Vec<str>,   // header/trailer/count/total/data errors
+}
+
+// ─── Ledger ─────────────────────────────────────────────────────────────
+
+pub fn ledger_new() -> Ledger {
+    return Ledger { ids: Vec::new(), cents: Vec::new() };
+}
+
+/// Open account `id` with `cents`; false when it is already open.
+pub fn ledger_open(led: & mut Ledger, id: i64, cents: i64) -> bool {
+    if ledger_index(led, id) >= 0 { return false; }
+    led.ids.push(id);
+    led.cents.push(cents);
+    return true;
+}
+
+/// Index of account `id`, or -1.
+pub fn ledger_index(led: & Ledger, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < led.ids.len() {
+        if led.ids.get(i) == id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Balance of account `id` in cents (0 when absent).
+pub fn ledger_balance(led: & Ledger, id: i64) -> i64 {
+    val i: i64 = ledger_index(led, id);
+    if i < 0 { return 0; }
+    return led.cents.get(i);
+}
+
+/// Sum of all balances.
+pub fn ledger_total(led: & Ledger) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < led.cents.len() {
+        t = t + led.cents.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+// ─── The proved step ────────────────────────────────────────────────────
+
+/// Move `cents` from `from` into `to`; returns the new `to`. @conserve:
+/// what leaves `from` arrives in the result, nothing is minted or lost.
+@conserve pub fn batch_move(from: & mut Money, to: Money, cents: i64) -> Money {
+    val moved = Money_take(from, cents);
+    return Money_add(to, moved);
+}
+
+/// Merge a deposit into a balance (@conserve: the deposit's Money is
+/// consumed into the balance).
+@conserve pub fn batch_credit(balance: Money, deposit: Money) -> Money {
+    return Money_add(balance, deposit);
+}
+
+/// Pay `cents` out of a balance; the result is the cash paid (@conserve).
+@conserve pub fn batch_debit(balance: & mut Money, cents: i64) -> Money {
+    return Money_take(balance, cents);
+}
+
+// ─── Running a batch ────────────────────────────────────────────────────
+
+// The ledger keeps cents; each posting lifts the balances into Money at
+// the boundary, runs the proved step and lowers the results again. A
+// linear value cannot be consumed inside a loop, so each posting is its
+// own function.
+
+// A deposit: the deposit is new money entering the bank, minted here and
+// merged by the proved step. Returns the new balance.
+fn batch_post_deposit(balance_cents: i64, cents: i64) -> i64 {
+    val bal = Money_from_cents(balance_cents);
+    val dep = Money_new(cents);
+    val after = batch_credit(bal, dep);
+    return Money_to_cents(after);
+}
+
+// A withdrawal: [new balance, cash paid].
+fn batch_post_withdraw(balance_cents: i64, cents: i64) -> Vec<i64> {
+    var bal = Money_from_cents(balance_cents);
+    val cash = batch_debit(& mut bal, cents);
+    var out: Vec<i64> = Vec::new();
+    val paid: i64 = Money_to_cents(cash);
+    out.push(Money_to_cents(bal));
+    out.push(paid);
+    return out;
+}
+
+// A transfer: [new source balance, new target balance].
+fn batch_post_transfer(from_cents: i64, to_cents: i64, cents: i64) -> Vec<i64> {
+    var src = Money_from_cents(from_cents);
+    val dst = Money_from_cents(to_cents);
+    val dst2 = batch_move(& mut src, dst, cents);
+    var out: Vec<i64> = Vec::new();
+    val b: i64 = Money_to_cents(dst2);
+    out.push(Money_to_cents(src));
+    out.push(b);
+    return out;
+}
+
+fn batch_reject(rep: & mut BatchReport, t: & BatchTxn, why: str) -> void {
+    rep.rejected = rep.rejected + 1;
+    rep.errors.push(t.ref_id + ": " + why);
+}
+
+/// Post every transaction in order. A transaction that names an unknown
+/// account, has a non-positive amount, or would overdraw is rejected and
+/// changes nothing; the rest are applied. The report's `balanced` checks
+/// the control totals afterwards.
+///
+/// Example:
+///   var led = ledger_new();
+///   assert(ledger_open(&mut led, 1, 1000));
+///   assert(ledger_open(&mut led, 2, 0));
+///   assert(!ledger_open(&mut led, 1, 5));
+///   var txns: Vec<BatchTxn> = Vec::new();
+///   txns.push(BatchTxn { kind: BATCH_TRANSFER, from: 1, to: 2, cents: 400, ref_id: "T1" });
+///   txns.push(BatchTxn { kind: BATCH_WITHDRAW, from: 2, to: 0, cents: 900, ref_id: "T2" });
+///   val rep = batch_run(&mut led, txns);
+///   assert_eq(rep.applied, 1);
+///   assert_eq(rep.rejected, 1);
+///   assert(rep.balanced);
+///   assert_eq(ledger_balance(&led, 2), 400);
+///   assert_eq(ledger_total(&led), 1000);
+pub fn batch_run(led: & mut Ledger, txns: Vec<BatchTxn>) -> BatchReport {
+    var rep = BatchReport {
+        applied: 0, rejected: 0, deposits: 0, withdrawals: 0, transfers: 0,
+        opening: ledger_total(led), closing: 0, balanced: false, errors: Vec::new()
+    };
+    var i: i64 = 0;
+    while i < txns.len() {
+        val t: BatchTxn = txns.get(i);
+        i = i + 1;
+        if t.cents <= 0 {
+            batch_reject(& mut rep, & t, "amount must be positive");
+            continue;
+        }
+        val a: i64 = ledger_index(led, t.from);
+        if a < 0 {
+            batch_reject(& mut rep, & t, "unknown account " + int_to_str(t.from));
+            continue;
+        }
+        if t.kind == BATCH_DEPOSIT {
+            // the deposit is new money entering the bank: minted here, at
+            // the boundary, then merged by the proved step
+            led.cents.set(a, batch_post_deposit(led.cents.get(a), t.cents));
+            rep.deposits = rep.deposits + t.cents;
+            rep.applied = rep.applied + 1;
+        } else if t.kind == BATCH_WITHDRAW {
+            if led.cents.get(a) < t.cents {
+                batch_reject(& mut rep, & t, "insufficient funds in " + int_to_str(t.from));
+                continue;
+            }
+            val left: Vec<i64> = batch_post_withdraw(led.cents.get(a), t.cents);
+            led.cents.set(a, left.get(0));
+            rep.withdrawals = rep.withdrawals + left.get(1);
+            rep.applied = rep.applied + 1;
+        } else if t.kind == BATCH_TRANSFER {
+            val b: i64 = ledger_index(led, t.to);
+            if b < 0 {
+                batch_reject(& mut rep, & t, "unknown account " + int_to_str(t.to));
+                continue;
+            }
+            if a == b {
+                batch_reject(& mut rep, & t, "transfer to the same account");
+                continue;
+            }
+            if led.cents.get(a) < t.cents {
+                batch_reject(& mut rep, & t, "insufficient funds in " + int_to_str(t.from));
+                continue;
+            }
+            val both: Vec<i64> = batch_post_transfer(led.cents.get(a), led.cents.get(b), t.cents);
+            led.cents.set(a, both.get(0));
+            led.cents.set(b, both.get(1));
+            rep.transfers = rep.transfers + t.cents;
+            rep.applied = rep.applied + 1;
+        } else {
+            batch_reject(& mut rep, & t, "unknown transaction type");
+        }
+    }
+    rep.closing = ledger_total(led);
+    rep.balanced = rep.closing == rep.opening + rep.deposits - rep.withdrawals;
+    return rep;
+}
+
+/// The report as text, one fact a line, then the errors.
+pub fn batch_report_text(rep: & BatchReport) -> str {
+    var s: str = "applied " + int_to_str(rep.applied) + "\n"
+        + "rejected " + int_to_str(rep.rejected) + "\n"
+        + "deposits " + cobol_format(rep.deposits, 2) + "\n"
+        + "withdrawals " + cobol_format(rep.withdrawals, 2) + "\n"
+        + "transfers " + cobol_format(rep.transfers, 2) + "\n"
+        + "opening " + cobol_format(rep.opening, 2) + "\n"
+        + "closing " + cobol_format(rep.closing, 2) + "\n";
+    if rep.balanced { s = s + "balanced yes\n"; } else { s = s + "balanced NO\n"; }
+    var i: i64 = 0;
+    while i < rep.errors.len() {
+        s = s + "error " + rep.errors.get(i) + "\n";
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── The COBOL transaction file ─────────────────────────────────────────
+
+/// The default transaction record layout (see the top of this file).
+pub fn batch_txn_copybook() -> Copybook {
+    return cobol_copybook(
+        "01 TXN-REC.\n"
+        + "   05 TXN-TYPE   PIC X.\n"
+        + "   05 TXN-FROM   PIC 9(8).\n"
+        + "   05 TXN-TO     PIC 9(8).\n"
+        + "   05 TXN-AMT    PIC S9(11)V99 COMP-3.\n"
+        + "   05 TXN-REF    PIC X(12).\n");
+}
+
+fn batch_record(cb: & Copybook, kind: str, from: i64, to: i64, cents: i64, ref_id: str) -> Vec<i64> {
+    var rec = cobol_record_new(cb);
+    cobol_set_str(cb, & mut rec, "TXN-TYPE", kind);
+    cobol_set_num(cb, & mut rec, "TXN-FROM", from);
+    cobol_set_num(cb, & mut rec, "TXN-TO", to);
+    cobol_set_num(cb, & mut rec, "TXN-AMT", cents);
+    cobol_set_str(cb, & mut rec, "TXN-REF", ref_id);
+    return rec;
+}
+
+/// The transactions as a COBOL file: a header record, one record each,
+/// and a trailer with the count and the amount total (no line ends:
+/// a plain fixed-length sequential file).
+pub fn batch_write_file(cb: & Copybook, txns: Vec<BatchTxn>) -> Vec<i64> {
+    var recs: Vec<Vec<i64>> = Vec::new();
+    recs.push(batch_record(cb, "H", 0, 0, 0, "HEADER"));
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < txns.len() {
+        val t: BatchTxn = txns.get(i);
+        var k: str = "?";
+        if t.kind == BATCH_DEPOSIT { k = "D"; }
+        if t.kind == BATCH_WITHDRAW { k = "W"; }
+        if t.kind == BATCH_TRANSFER { k = "T"; }
+        recs.push(batch_record(cb, k, t.from, t.to, t.cents, t.ref_id));
+        total = total + t.cents;
+        i = i + 1;
+    }
+    recs.push(batch_record(cb, "Z", txns.len(), 0, total, "TRAILER"));
+    return cobol_join_records(recs, false);
+}
+
+/// Read a transaction file written with the layout `cb`. Checks that it
+/// starts with a header, ends with a trailer whose count and total match,
+/// and that every amount is valid packed decimal; problems go to
+/// `.errors` (a bad record is left out).
+pub fn batch_read_file(cb: & Copybook, data: Vec<i64>) -> BatchFile {
+    var out = BatchFile { txns: Vec::new(), errors: Vec::new() };
+    if cb.size <= 0 {
+        out.errors.push("bad copybook: " + cb.error);
+        return out;
+    }
+    if data.len() % cb.size != 0 {
+        out.errors.push("file length " + int_to_str(data.len()) + " is not a multiple of "
+            + int_to_str(cb.size));
+    }
+    val recs: Vec<Vec<i64>> = cobol_split_records(data, cb.size, false);
+    var seen_header: bool = false;
+    var seen_trailer: bool = false;
+    var count: i64 = 0;
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < recs.len() {
+        val rec: Vec<i64> = recs.get(i);
+        i = i + 1;
+        val k: str = cobol_get_str(cb, rec, "TXN-TYPE");
+        if str_equal(k, "H") {
+            if i != 1 { out.errors.push("header not first (record " + int_to_str(i) + ")"); }
+            seen_header = true;
+            continue;
+        }
+        if seen_trailer {
+            out.errors.push("record " + int_to_str(i) + " after the trailer");
+            continue;
+        }
+        if !cobol_field_valid(cb, rec, "TXN-AMT") || !cobol_field_valid(cb, rec, "TXN-FROM")
+            || !cobol_field_valid(cb, rec, "TXN-TO") {
+            out.errors.push("record " + int_to_str(i) + ": invalid numeric data");
+            continue;
+        }
+        val amt: i64 = cobol_get_num(cb, rec, "TXN-AMT");
+        if str_equal(k, "Z") {
+            seen_trailer = true;
+            val want_n: i64 = cobol_get_num(cb, rec, "TXN-FROM");
+            if want_n != count {
+                out.errors.push("trailer count " + int_to_str(want_n) + ", file has " + int_to_str(count));
+            }
+            if amt != total {
+                out.errors.push("trailer total " + cobol_format(amt, 2) + ", records sum to "
+                    + cobol_format(total, 2));
+            }
+            continue;
+        }
+        var kind: i64 = 0;
+        if str_equal(k, "D") { kind = BATCH_DEPOSIT; }
+        if str_equal(k, "W") { kind = BATCH_WITHDRAW; }
+        if str_equal(k, "T") { kind = BATCH_TRANSFER; }
+        count = count + 1;
+        total = total + amt;
+        out.txns.push(BatchTxn {
+            kind: kind, from: cobol_get_num(cb, rec, "TXN-FROM"), to: cobol_get_num(cb, rec, "TXN-TO"),
+            cents: amt, ref_id: cobol_get_str(cb, rec, "TXN-REF")
+        });
+    }
+    if !seen_header { out.errors.push("no header record"); }
+    if !seen_trailer { out.errors.push("no trailer record"); }
+    return out;
+}

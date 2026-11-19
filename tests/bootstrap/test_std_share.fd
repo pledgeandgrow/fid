@@ -1,0 +1,87 @@
+// stdlib/share: FileProvider URIs and file_paths.xml, ACTION_SEND and
+// ACTION_SEND_MULTIPLE intents (type, extras, grant flag, ClipData), the
+// chooser, the am start command line, incoming shares, the common MIME
+// type, and the iOS activity items and iPad check.
+// Expected output:
+// uri content://com.example.app.fileprovider/docs/report%201.pdf
+// uri content://com.example.app.fileprovider/shared/img/a.png
+// outside "" climb ""
+// <?xml version="1.0" encoding="utf-8"?>
+// <paths>
+//     <files-path name="docs" path="docs" />
+//     <cache-path name="shared" path="." />
+// </paths>
+// am start -a android.intent.action.SEND -t 'text/plain' --es android.intent.extra.TEXT 'It'\''s here' --es android.intent.extra.SUBJECT 'Hi'
+// multiple android.intent.action.SEND_MULTIPLE image/* flags 1 clip 2
+// am start -a android.intent.action.SEND_MULTIPLE -t 'image/*' --eua android.intent.extra.STREAM 'content://com.example.app.fileprovider/shared/a.png,content://com.example.app.fileprovider/shared/b.jpg' -f 1
+// mixed */* single android.intent.action.SEND application/pdf
+// chooser android.intent.action.CHOOSER android.intent.extra.INTENT=android.intent.action.SEND_MULTIPLE android.intent.extra.TITLE=Send photos flags 1
+// error false not under a FileProvider root: /sdcard/x.png
+// received 2 url https://ex.com/a file content://x/y image/png
+// ios NSString:stringWithUTF8String: NSURL:URLWithString: NSURL:fileURLWithPath:
+// ios ipad iPad: popoverPresentationController needs a sourceView or barButtonItem
+// calls 8 getUriForFile initWithActivityItems:applicationActivities:
+use share;
+use vec;
+use string;
+
+fn main() {
+    var fp: FileProvider = share_file_provider("com.example.app.fileprovider");
+    share_provider_root(&mut fp, "files-path", "docs", "/data/user/0/com.example.app/files", "docs");
+    share_provider_root(&mut fp, "cache-path", "shared", "/data/user/0/com.example.app/cache", "");
+    println("uri " + share_content_uri(&fp, "/data/user/0/com.example.app/files/docs/report 1.pdf"));
+    println("uri " + share_content_uri(&fp, "/data/user/0/com.example.app/cache/img/a.png"));
+    println("outside \"" + share_content_uri(&fp, "/sdcard/x.png") + "\" climb \""
+        + share_content_uri(&fp, "/data/user/0/com.example.app/cache/../databases/app.db") + "\"");
+    print(share_file_paths_xml(&fp));
+
+    var r1: ShareRequest = share_request_new();
+    share_add(&mut r1, share_text("It's here"));
+    r1.subject = "Hi";
+    println(share_android_am_command(&share_android_intent(&r1, &fp)));
+
+    val cache: str = "/data/user/0/com.example.app/cache/";
+    var r2: ShareRequest = share_request_new();
+    share_add(&mut r2, share_file(cache + "a.png", ""));
+    share_add(&mut r2, share_file(cache + "b.jpg", ""));
+    val i2: ShareIntent = share_android_intent(&r2, &fp);
+    println("multiple " + i2.action + " " + i2.mime + " flags " + int_to_str(i2.flags) + " clip " + int_to_str(i2.clip_uris.len()));
+    println(share_android_am_command(&i2));
+    var r3: ShareRequest = share_request_new();
+    share_add(&mut r3, share_file(cache + "a.png", ""));
+    share_add(&mut r3, share_file(cache + "doc.pdf", ""));
+    var r4: ShareRequest = share_request_new();
+    share_add(&mut r4, share_file(cache + "doc.pdf", ""));
+    val i4: ShareIntent = share_android_intent(&r4, &fp);
+    println("mixed " + share_android_intent(&r3, &fp).mime + " single " + i4.action + " " + i4.mime);
+    val ch: ShareIntent = share_android_chooser(&i2, "Send photos");
+    println("chooser " + ch.action + " " + ch.extras.get(0).key + "=" + ch.extras.get(0).values.get(0) + " "
+        + ch.extras.get(1).key + "=" + ch.extras.get(1).values.get(0) + " flags " + int_to_str(ch.flags));
+    var r5: ShareRequest = share_request_new();
+    share_add(&mut r5, share_file("/sdcard/x.png", ""));
+    val i5: ShareIntent = share_android_intent(&r5, &fp);
+    println("error " + bool_to_str(i5.ok) + " " + i5.error);
+
+    var ex: Vec<ShareExtra> = Vec::new();
+    var t: Vec<str> = Vec::new();
+    t.push("https://ex.com/a");
+    ex.push(ShareExtra { key: ANDROID_EXTRA_TEXT, kind: "string", values: t });
+    var s: Vec<str> = Vec::new();
+    s.push("content://x/y");
+    ex.push(ShareExtra { key: ANDROID_EXTRA_STREAM, kind: "uri", values: s });
+    val got: Vec<ShareItem> = share_android_received(ANDROID_ACTION_SEND, "image/png", ex);
+    println("received " + int_to_str(got.len()) + " " + (if got.get(0).kind == SHARE_URL { "url" } else { "text" }) + " " + got.get(0).value
+        + " " + (if got.get(1).kind == SHARE_FILE { "file" } else { "?" }) + " " + got.get(1).value + " " + got.get(1).mime);
+
+    var r6: ShareRequest = share_request_new();
+    share_add(&mut r6, share_text("hello"));
+    share_add(&mut r6, share_url("https://ex.com"));
+    share_add(&mut r6, share_file("/tmp/a.txt", ""));
+    val items: Vec<ShareIosItem> = share_ios_items(&r6);
+    var line: str = "ios";
+    var i: i64 = 0;
+    while i < items.len() { line = line + " " + items.get(i).cls + ":" + items.get(i).ctor; i = i + 1; }
+    println(line);
+    println("ios ipad " + share_ios_check(&r6, true, false).get(0));
+    println("calls " + int_to_str(share_android_calls().len()) + " " + share_android_calls().get(5).method + " " + share_ios_calls().get(0).method);
+}

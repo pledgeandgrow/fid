@@ -1,0 +1,232 @@
+// stdlib/ps2: 8042 bring-up, keyboard and mouse commands against a modelled controller, set-1/set-2 decoding and mouse packets.
+// Expected output:
+// init ok true dual true port1 true port2 true config 0x7 flushed-stale true
+// keyboard present true id 0xab83, mouse present true id 0
+// leds caps true -> 4
+// scancode set 2 true, reads back 2
+// resend handled: 0xfa
+// typematic 300 20 109 byte 0x2b sent true stored 0x2b
+// mouse id 4 sample rates 200,100,80,200,200,80 enable true
+// set2 text: 'Hi' enter true
+// up arrow code 0x48 ext true pressed true, release pressed false
+// caps leds 4 changed true then 'A', ctrl-c 3
+// set1: a pressed true 'a', release false, ext up 0x48 true
+// pause events 1
+// pkt1 left true dx 5 dy 3
+// pkt2 dx -5 dy -2 overflow false
+// pkt3 right true dz -1
+// pkt4 dz -1 b4 true b5 false
+// assembler complete true dropped 1 dx 2
+use ps2;
+use scancode;
+use vec;
+use string;
+
+var g_q: Vec<i64> = Vec::new();
+var g_src: Vec<i64> = Vec::new();
+var g_st: Vec<i64> = Vec::new();
+var g_rates: Vec<i64> = Vec::new();
+
+// g_st: [0] config, [1] controller command waiting for data, [2] keyboard
+// command waiting for its argument, [3] mouse ditto, [4] scancode set,
+// [5] leds, [6] answer the next keyboard byte with RESEND, [7] typematic,
+// [8] mouse id mode
+fn push(b: i64, src: i64) {
+    g_q.push(b);
+    g_src.push(src);
+}
+
+fn inb(port: i64) -> i64 {
+    if port == PS2_CMD {
+        var s: i64 = 0;
+        if g_q.len() > 0 {
+            s = s | PS2_ST_OBF;
+            if g_src.get(0) == 1 { s = s | PS2_ST_AUX; }
+        }
+        return s;
+    }
+    if g_q.len() == 0 { return 0; }
+    val b: i64 = g_q.get(0);
+    g_q.remove(0);
+    g_src.remove(0);
+    return b;
+}
+
+fn last3(a: i64, b: i64, c: i64) -> bool {
+    val n: i64 = g_rates.len();
+    return n >= 3 && g_rates.get(n - 3) == a && g_rates.get(n - 2) == b && g_rates.get(n - 1) == c;
+}
+
+fn mouse(v: i64) {
+    if g_st.get(3) == MOUSE_SAMPLE_RATE {
+        g_rates.push(v);
+        g_st.set(3, 0);
+        push(PS2_ACK, 1);
+        return;
+    }
+    if v == DEV_RESET { push(PS2_ACK, 1); push(0xAA, 1); push(0, 1); g_st.set(8, 0); return; }
+    if v == MOUSE_SAMPLE_RATE { g_st.set(3, v); push(PS2_ACK, 1); return; }
+    if v == DEV_IDENTIFY {
+        if g_st.get(8) == 0 && last3(200, 100, 80) { g_st.set(8, 3); }
+        if g_st.get(8) == 3 && last3(200, 200, 80) { g_st.set(8, 4); }
+        push(PS2_ACK, 1);
+        push(g_st.get(8), 1);
+        return;
+    }
+    push(PS2_ACK, 1);
+}
+
+fn kbd(v: i64) {
+    val pend: i64 = g_st.get(2);
+    if pend != 0 {
+        g_st.set(2, 0);
+        if pend == KBD_SET_LEDS { g_st.set(5, v); }
+        if pend == KBD_TYPEMATIC { g_st.set(7, v); }
+        if pend == KBD_SCANCODE_SET {
+            push(PS2_ACK, 0);
+            if v == 0 { push(g_st.get(4), 0); } else { g_st.set(4, v); }
+            return;
+        }
+        push(PS2_ACK, 0);
+        return;
+    }
+    if g_st.get(6) == 1 {
+        g_st.set(6, 0);
+        push(PS2_RESEND, 0);
+        return;
+    }
+    if v == DEV_RESET { push(PS2_ACK, 0); push(0xAA, 0); return; }
+    if v == DEV_IDENTIFY { push(PS2_ACK, 0); push(0xAB, 0); push(0x83, 0); return; }
+    if v == KBD_SET_LEDS || v == KBD_SCANCODE_SET || v == KBD_TYPEMATIC { g_st.set(2, v); push(PS2_ACK, 0); return; }
+    if v == KBD_ECHO { push(0xEE, 0); return; }
+    push(PS2_ACK, 0);
+}
+
+fn outb(port: i64, v: i64) {
+    if port == PS2_CMD {
+        var cfg: i64 = g_st.get(0);
+        if v == PS2C_READ_CONFIG { push(cfg, 0); }
+        if v == PS2C_WRITE_CONFIG || v == PS2C_WRITE_P2 { g_st.set(1, v); }
+        if v == PS2C_DISABLE_P1 { g_st.set(0, cfg | PS2_CFG_CLK1_OFF); }
+        if v == PS2C_ENABLE_P1 { g_st.set(0, cfg & ~PS2_CFG_CLK1_OFF); }
+        if v == PS2C_DISABLE_P2 { g_st.set(0, cfg | PS2_CFG_CLK2_OFF); }
+        if v == PS2C_ENABLE_P2 { g_st.set(0, cfg & ~PS2_CFG_CLK2_OFF); }
+        if v == PS2C_SELF_TEST { push(PS2_CTRL_TEST_OK, 0); }
+        if v == PS2C_TEST_P1 || v == PS2C_TEST_P2 { push(0, 0); }
+        return;
+    }
+    val pc: i64 = g_st.get(1);
+    g_st.set(1, 0);
+    if pc == PS2C_WRITE_CONFIG { g_st.set(0, v); return; }
+    if pc == PS2C_WRITE_P2 { mouse(v); return; }
+    kbd(v);
+}
+
+fn h(v: i64) -> str {
+    return "0x" + int_to_hex(v);
+}
+
+fn feed_all(d: &mut KbdDecoder, bytes: Vec<i64>) -> Vec<KeyEvent> {
+    var out: Vec<KeyEvent> = Vec::new();
+    var i: i64 = 0;
+    while i < bytes.len() {
+        val e: KeyEvent = kbd_feed(d, bytes.get(i));
+        if e.valid { out.push(e); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn chs(c: i64) -> str {
+    var v: Vec<i64> = Vec::new();
+    v.push(c);
+    return str_from_bytes(v);
+}
+
+fn bytes4(a: i64, b: i64, c: i64, d: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    if d >= 0 { v.push(d); }
+    return v;
+}
+
+fn main() {
+    g_st = Vec::filled(9, 0);
+    g_st.set(0, 0x47);
+    g_st.set(4, 2);
+    push(0x1C, 0);
+    val io: Ps2Io = Ps2Io { inb: inb, outb: outb, spins: 100 };
+    val info: Ps2Info = ps2_init(&io, false);
+    println("init ok " + bool_to_str(info.ok) + " dual " + bool_to_str(info.dual) + " port1 " + bool_to_str(info.port1) + " port2 " + bool_to_str(info.port2) + " config " + h(info.config) + " flushed-stale " + bool_to_str(g_q.len() == 0));
+    println("keyboard present " + bool_to_str(info.kbd_present) + " id " + h(info.kbd_id) + ", mouse present " + bool_to_str(info.mouse_present) + " id " + int_to_str(info.mouse_id));
+    println("leds caps " + bool_to_str(ps2_kbd_set_leds(&io, LED_CAPS)) + " -> " + int_to_str(g_st.get(5)));
+    val ok2: bool = ps2_kbd_set_scancode_set(&io, 2);
+    println("scancode set 2 " + bool_to_str(ok2) + ", reads back " + int_to_str(ps2_kbd_get_scancode_set(&io)));
+    g_st.set(6, 1);
+    println("resend handled: " + h(ps2_dev_send(&io, false, DEV_ENABLE)));
+    val tb: i64 = ps2_typematic_byte(109, 500);
+    val sent: bool = ps2_dev_cmd_arg(&io, false, KBD_TYPEMATIC, tb);
+    println("typematic " + int_to_str(ps2_typematic_rate_x10(0)) + " " + int_to_str(ps2_typematic_rate_x10(0x1F)) + " " + int_to_str(ps2_typematic_rate_x10(0x0B)) + " byte " + h(tb) + " sent " + bool_to_str(sent) + " stored " + h(g_st.get(7)));
+    val mid: i64 = ps2_mouse_detect(&io);
+    println("mouse id " + int_to_str(mid) + " sample rates " + str_join_ints(g_rates, ",") + " enable " + bool_to_str(ps2_mouse_enable(&io)));
+
+    var d: KbdDecoder = kbd_decoder_new(2);
+    var seq: Vec<i64> = Vec::new();
+    seq.push(0x12); seq.push(0x33); seq.push(0xF0); seq.push(0x33); seq.push(0xF0); seq.push(0x12);
+    seq.push(0x43); seq.push(0xF0); seq.push(0x43); seq.push(0x5A); seq.push(0xF0); seq.push(0x5A);
+    val evs: Vec<KeyEvent> = feed_all(&mut d, seq);
+    var txt: Vec<i64> = Vec::new();
+    var enter: bool = false;
+    var i: i64 = 0;
+    while i < evs.len() {
+        val e: KeyEvent = evs.get(i);
+        if e.ascii == 10 { enter = true; } else { if e.ascii != 0 { txt.push(e.ascii); } }
+        i = i + 1;
+    }
+    println("set2 text: '" + str_from_bytes(txt) + "' enter " + bool_to_str(enter));
+    var arrow: Vec<i64> = Vec::new();
+    arrow.push(0xE0); arrow.push(0x75); arrow.push(0xE0); arrow.push(0xF0); arrow.push(0x75);
+    val ae: Vec<KeyEvent> = feed_all(&mut d, arrow);
+    println("up arrow code " + h(ae.get(0).code) + " ext " + bool_to_str(ae.get(0).extended) + " pressed " + bool_to_str(ae.get(0).pressed) + ", release pressed " + bool_to_str(ae.get(1).pressed));
+    val caps: KeyEvent = kbd_feed(&mut d, 0x58);
+    val changed: bool = d.leds_changed;
+    val la: KeyEvent = kbd_feed(&mut d, 0x1C);
+    kbd_feed(&mut d, 0x14);
+    val cc: KeyEvent = kbd_feed(&mut d, 0x21);
+    println("caps leds " + int_to_str(d.leds) + " changed " + bool_to_str(changed) + " then '" + chs(la.ascii) + "', ctrl-c " + int_to_str(cc.ascii));
+
+    var d1: KbdDecoder = kbd_decoder_new(1);
+    val a1: KeyEvent = kbd_feed(&mut d1, 0x1E);
+    val a2: KeyEvent = kbd_feed(&mut d1, 0x9E);
+    kbd_feed(&mut d1, 0xE0);
+    val up: KeyEvent = kbd_feed(&mut d1, 0x48);
+    println("set1: a pressed " + bool_to_str(a1.pressed) + " '" + chs(a1.ascii) + "', release " + bool_to_str(a2.pressed) + ", ext up " + h(up.code) + " " + bool_to_str(up.extended));
+    var pz: Vec<i64> = Vec::new();
+    pz.push(0xE1); pz.push(0x1D); pz.push(0x45); pz.push(0xE1); pz.push(0x9D); pz.push(0xC5);
+    val pe: Vec<KeyEvent> = feed_all(&mut d1, pz);
+    var np: i64 = 0;
+    i = 0;
+    while i < pe.len() {
+        if pe.get(i).pause { np = np + 1; }
+        i = i + 1;
+    }
+    println("pause events " + int_to_str(np));
+
+    val p1: MousePacket = ps2_mouse_decode(bytes4(0x09, 0x05, 0x03, -1), 0, 0);
+    println("pkt1 left " + bool_to_str(p1.left) + " dx " + int_to_str(p1.dx) + " dy " + int_to_str(p1.dy));
+    val p2: MousePacket = ps2_mouse_decode(bytes4(0x38, 0xFB, 0xFE, -1), 0, 0);
+    println("pkt2 dx " + int_to_str(p2.dx) + " dy " + int_to_str(p2.dy) + " overflow " + bool_to_str(p2.overflow));
+    val p3: MousePacket = ps2_mouse_decode(bytes4(0x0A, 0x01, 0x00, 0xFF), 0, 3);
+    println("pkt3 right " + bool_to_str(p3.right) + " dz " + int_to_str(p3.dz));
+    val p4: MousePacket = ps2_mouse_decode(bytes4(0x08, 0x00, 0x00, 0x1F), 0, 4);
+    println("pkt4 dz " + int_to_str(p4.dz) + " b4 " + bool_to_str(p4.button4) + " b5 " + bool_to_str(p4.button5));
+    var asm: MouseAssembler = mouse_assembler_new(3);
+    mouse_feed(&mut asm, 0x00);
+    mouse_feed(&mut asm, 0x08);
+    mouse_feed(&mut asm, 0x02);
+    mouse_feed(&mut asm, 0x00);
+    val done: bool = mouse_feed(&mut asm, 0x00);
+    println("assembler complete " + bool_to_str(done) + " dropped " + int_to_str(asm.dropped) + " dx " + int_to_str(mouse_packet(&asm).dx));
+}

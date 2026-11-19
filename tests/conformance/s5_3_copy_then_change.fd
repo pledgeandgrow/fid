@@ -1,0 +1,87 @@
+// Conformance: docs/reference/reference.md §5.3, proposal 0004 (release M5,
+// complaint CM3; decision: docs/proposals/0006-m5-ownership-replaces-cow.md).
+// `var b = a` gives b a value of its own: changing b afterwards leaves a as
+// it was, for Vec, str, HashMap, a struct (with a Vec field and a str
+// field), a Vec of Vecs, a Vec of structs and a struct field copied out.
+// The same on run, ccompile and emit.
+
+struct Acct {
+    id: i64,
+    name: str,
+    hist: Vec<i64>,
+}
+
+fn main() -> i64 {
+    // Vec: push, set and pop on the copy
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(2);
+    var b = a;
+    b.push(3);
+    b.set(0, 9);
+    println("vec a " + int_to_str(a.len()) + " " + int_to_str(a.get(0)) + " " + int_to_str(a.get(1)));
+    println("vec b " + int_to_str(b.len()) + " " + int_to_str(b.get(0)) + " " + int_to_str(b.get(2)));
+    var c = a;
+    c.pop();
+    println("vec a after pop " + int_to_str(a.len()) + ", c " + int_to_str(c.len()));
+
+    // str: appending to the copy
+    var s: str = "ab";
+    var t = s;
+    t = t + "c";
+    println("str " + s + " " + t);
+
+    // HashMap: insert a new key and overwrite an old one in the copy
+    var m0: HashMap<i64, i64> = HashMap::new();
+    m0.insert(1, 10);
+    var m1 = m0;
+    m1.insert(2, 20);
+    m1.insert(1, 11);
+    println("map " + int_to_str(m0.len()) + " " + int_to_str(m0.get(1)) + " " + int_to_str(m1.len()) + " " + int_to_str(m1.get(1)));
+
+    // struct: a scalar field, a str field and a Vec field of the copy
+    var x: Acct = Acct { id: 1, name: "ann", hist: Vec::new() };
+    x.hist.push(5);
+    var y = x;
+    y.id = 2;
+    y.name = "bob";
+    y.hist.push(6);
+    y.hist.set(0, 7);
+    println("struct x " + int_to_str(x.id) + " " + x.name + " " + int_to_str(x.hist.len()) + " " + int_to_str(x.hist.get(0)));
+    println("struct y " + int_to_str(y.id) + " " + y.name + " " + int_to_str(y.hist.len()) + " " + int_to_str(y.hist.get(0)));
+
+    // a Vec of Vecs: changing an inner Vec of the copy
+    var g: Vec<Vec<i64>> = Vec::new();
+    var row: Vec<i64> = Vec::new();
+    row.push(1);
+    g.push(row);
+    var h = g;
+    var inner: Vec<i64> = h.get(0);
+    inner.push(2);
+    h.set(0, inner);
+    println("nested g " + int_to_str(g.get(0).len()) + ", h " + int_to_str(h.get(0).len()));
+
+    // a Vec of structs: replacing an element of the copy
+    var ps: Vec<Acct> = Vec::new();
+    ps.push(Acct { id: 1, name: "p", hist: Vec::new() });
+    var qs = ps;
+    qs.set(0, Acct { id: 8, name: "q", hist: Vec::new() });
+    println("structs ps " + int_to_str(ps.get(0).id) + " " + ps.get(0).name + ", qs " + int_to_str(qs.get(0).id) + " " + qs.get(0).name);
+
+    // a Vec field copied out of a struct
+    var hs = x.hist;
+    hs.push(9);
+    println("field x " + int_to_str(x.hist.len()) + ", copy " + int_to_str(hs.len()));
+    return 0;
+}
+
+//> vec a 2 1 2
+//> vec b 3 9 3
+//> vec a after pop 2, c 1
+//> str ab abc
+//> map 1 10 2 11
+//> struct x 1 ann 1 5
+//> struct y 2 bob 2 7
+//> nested g 1, h 2
+//> structs ps 1 p, qs 8 q
+//> field x 1, copy 2

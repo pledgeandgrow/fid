@@ -16,6 +16,12 @@ on:
       - 'compiler/nat_enc.fd'
       - 'stdlib/linux_runtime/**'
       - 'scripts/macho-check.py'
+      - 'scripts/cross-test.sh'
+      - 'tests/nattools/machine_batch8_check.sh'
+      - 'compiler/main.fd'
+      - 'tests/nattools/universal_check.sh'
+      - 'tests/nattools/macos_udp_check.sh'
+      - 'tests/nattools/udp_peer.fd'
       - '.github/workflows/macos-native.yml'
   pull_request:
     paths:
@@ -32,7 +38,7 @@ jobs:
       matrix:
         os: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       RUST_MIN_STACK: "268435456"   # rustc overflowed its stack (SIGBUS) on macos-15-intel
     steps:
@@ -42,9 +48,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2.2.1
         with:
-          version: 0.13.0
+          version: 0.16.0
+
+      # GNU timeout for scripts/cross-test.sh (macOS has none of its own)
+      - name: coreutils
+        run: |
+          brew install coreutils || true
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # stage 1 is built by the frozen Rust compiler: fail first, with the
+      # file and line, when a source uses a word it reserves (Nov 15: every
+      # run stopped at "Parse error at 2183:31: unexpected token 'Eq'")
+      - name: The compiler's sources parse with stage 0
+        run: bash scripts/stage0-names-check.sh
 
       - name: Pick the macOS target for this host
         id: tgt
@@ -72,6 +90,9 @@ jobs:
           mkdir -p build/macos
           # a small, dependency-free set the machine layer already handles on Linux
           PROGRAMS="hello return_code arithmetic strings loops fileio"
+          # F7 runtime services (errno, directory listing, spawn): a suite
+          # test that prints its own expected lines; read from tests/bootstrap
+          PROGRAMS="$PROGRAMS test_machine_os_services"
           mkdir -p build/macos/src
           cat > build/macos/src/hello.fd <<'EOF'
           fn main() { print("hello from native macOS\n"); }
@@ -115,6 +136,7 @@ jobs:
           fail=0
           for p in $PROGRAMS; do
             src=build/macos/src/$p.fd
+            [ -f "$src" ] || src=tests/bootstrap/$p.fd
             out=build/macos/$p
             echo "=== $p ==="
             "$FID" run "$src" > build/macos/$p.ref 2>/dev/null; ref_rc=$?
@@ -132,3 +154,35 @@ jobs:
             fi
           done
           exit $fail
+
+      # F7 runtime services and DB9 (FID_PROF) on this Mac: both macOS
+      # targets pass macho-check.py and bind the libSystem imports, the
+      # host's target runs test_machine_os_services.fd and the profiler
+      - name: Machine batch 8 (macOS runtime services, FID_PROF)
+        run: bash tests/nattools/machine_batch8_check.sh release/fid
+
+      # MI16: recvfrom's peer address (darwin.fd pe_mac_recvfrom,
+      # pe_mac_sa_back) and sysinfo on this Mac, with net.fd's UDP functions
+      # (tests/nattools/udp_peer.fd)
+      - name: 'UDP peer address and sysinfo (MI16)'
+        run: bash tests/nattools/macos_udp_check.sh release/fid
+
+      # L2B: `fid emit --target universal` (main.fd build_universal_macho):
+      # lipo -info names both slices and each runs (Rosetta for x86_64)
+      - name: 'Universal binary (L2B): lipo -info and both slices'
+        run: FID=release/fid bash tests/nattools/universal_check.sh
+
+      # PL7: the whole suite through the machine layer on this Mac, each test
+      # against `fid run` (output, exit code, panic message)
+      - name: Suite through the native backend, compared with the interpreter
+        env:
+          TARGET: ${{ steps.tgt.outputs.target }}
+        run: NATIVE=1 FID=release/fid JOBS=3 bash scripts/cross-test.sh "$TARGET"
+
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-${{ steps.tgt.outputs.target }}
+          path: build/cross/${{ steps.tgt.outputs.target }}-native/results.txt
+          if-no-files-found: ignore

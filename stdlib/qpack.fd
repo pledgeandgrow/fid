@@ -1,0 +1,837 @@
+// Fides QPACK (RFC 9204): field compression for HTTP/3, static table only
+//
+// QPACK is HPACK (stdlib/hpack.fd) rearranged for QUIC's independent
+// streams. This module implements the part HTTP/3 needs when an endpoint
+// advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY 0, which stdlib/http3.fd
+// does: no dynamic table in either direction.
+//   - The static table of Appendix A (99 entries, indexes 0..98).
+//   - Field sections (§4.5): the prefix (Required Insert Count and Base,
+//     both 0 here), indexed field lines and literal field lines with a
+//     static name reference or a literal name, integers with an N-bit
+//     prefix, string literals raw or with the Huffman code of RFC 7541
+//     Appendix B (RFC 9204 §4.1 reuses HPACK's), rebuilt here from its
+//     code lengths (the code is canonical).
+//   - The decoder rejects what needs a dynamic table (a non-zero Required
+//     Insert Count, dynamic or post-base references) with
+//     QPACK_DECOMPRESSION_FAILED, and a section over the size limit
+//     (RFC 9114 §4.2.2: names, values and 32 bytes per line).
+//   - The encoder- and decoder-stream instructions a peer may send (§4.3,
+//     §4.4) are checked against a table of capacity 0: Set Dynamic Table
+//     Capacity 0 and Stream Cancellation are fine, every insertion, a
+//     duplicate, a larger capacity, a Section Acknowledgment and an Insert
+//     Count Increment are errors (QPACK_ENCODER_STREAM_ERROR,
+//     QPACK_DECODER_STREAM_ERROR).
+//
+// Bytes are Vec<i64>, one value 0..255 each. A field list is two parallel
+// Vec<str>, names and values.
+//
+//   val block: Vec<i64> = qpack_encode(names, values, true);
+//   val got: QpackFields = qpack_decode(block, 65536);
+//   if got.ok { println(got.names.get(0) + ": " + got.values.get(0)); }
+//
+// Checked by tests/bootstrap/test_stdlib_qpack.fd (RFC 9204 Appendix B.1,
+// every static entry, Huffman literals, the errors).
+
+module qpack;
+ use vec; use string;
+
+/// QPACK error codes (RFC 9204 §6), sent as HTTP/3 application errors.
+pub const QPACK_DECOMPRESSION_FAILED: i64 = 0x200;
+pub const QPACK_ENCODER_STREAM_ERROR: i64 = 0x201;
+pub const QPACK_DECODER_STREAM_ERROR: i64 = 0x202;
+
+/// The static table has 99 entries, 0..98 (Appendix A).
+pub const QPACK_STATIC_LEN: i64 = 99;
+
+/// Results of scanning an encoder or decoder stream.
+pub const QPACK_SCAN_OK: i64 = 0;
+pub const QPACK_SCAN_MORE: i64 = 1;
+pub const QPACK_SCAN_ERROR: i64 = 2;
+
+/// A decoded field section. `ok` false: `error` is the QPACK error code
+/// (QPACK_DECOMPRESSION_FAILED), or -1 with `too_large` when the section
+/// is over the size limit (an HTTP/3 message error, not a QPACK one);
+/// `why` says what was wrong. `size` is the section's size by RFC 9114
+/// §4.2.2.
+pub struct QpackFields {
+    pub ok: bool,
+    pub error: i64,
+    pub too_large: bool,
+    pub why: str,
+    pub names: Vec<str>,
+    pub values: Vec<str>,
+    pub size: i64,
+}
+
+/// What an encoder- or decoder-stream scan found: QPACK_SCAN_OK when
+/// every instruction from `from` was complete and allowed (`used` bytes),
+/// QPACK_SCAN_MORE when the last one is cut short (`used` covers the
+/// complete ones before it), QPACK_SCAN_ERROR with the code in `error`.
+pub struct QpackScan {
+    pub status: i64,
+    pub used: i64,
+    pub error: i64,
+    pub why: str,
+}
+
+// ─── Static table (Appendix A) ─────────────────────────────────────────
+
+var qp_st_names: Vec<str> = Vec::new(); var qp_st_vals: Vec<str> = Vec::new();
+fn qp_init() {
+    if qp_st_names.len() > 0 {
+        return;
+    }
+    qp_st_names.push(":authority");
+    qp_st_vals.push("");
+    qp_st_names.push(":path");
+    qp_st_vals.push("/");
+    qp_st_names.push("age");
+    qp_st_vals.push("0");
+    qp_st_names.push("content-disposition");
+    qp_st_vals.push("");
+    qp_st_names.push("content-length");
+    qp_st_vals.push("0");
+    qp_st_names.push("cookie");
+    qp_st_vals.push("");
+    qp_st_names.push("date");
+    qp_st_vals.push("");
+    qp_st_names.push("etag");
+    qp_st_vals.push("");
+    qp_st_names.push("if-modified-since");
+    qp_st_vals.push("");
+    qp_st_names.push("if-none-match");
+    qp_st_vals.push("");
+    // 10
+    qp_st_names.push("last-modified");
+    qp_st_vals.push("");
+    qp_st_names.push("link");
+    qp_st_vals.push("");
+    qp_st_names.push("location");
+    qp_st_vals.push("");
+    qp_st_names.push("referer");
+    qp_st_vals.push("");
+    qp_st_names.push("set-cookie");
+    qp_st_vals.push("");
+    qp_st_names.push(":method");
+    qp_st_vals.push("CONNECT");
+    qp_st_names.push(":method");
+    qp_st_vals.push("DELETE");
+    qp_st_names.push(":method");
+    qp_st_vals.push("GET");
+    qp_st_names.push(":method");
+    qp_st_vals.push("HEAD");
+    qp_st_names.push(":method");
+    qp_st_vals.push("OPTIONS");
+    // 20
+    qp_st_names.push(":method");
+    qp_st_vals.push("POST");
+    qp_st_names.push(":method");
+    qp_st_vals.push("PUT");
+    qp_st_names.push(":scheme");
+    qp_st_vals.push("http");
+    qp_st_names.push(":scheme");
+    qp_st_vals.push("https");
+    qp_st_names.push(":status");
+    qp_st_vals.push("103");
+    qp_st_names.push(":status");
+    qp_st_vals.push("200");
+    qp_st_names.push(":status");
+    qp_st_vals.push("304");
+    qp_st_names.push(":status");
+    qp_st_vals.push("404");
+    qp_st_names.push(":status");
+    qp_st_vals.push("503");
+    qp_st_names.push("accept");
+    qp_st_vals.push("*/*");
+    // 30
+    qp_st_names.push("accept");
+    qp_st_vals.push("application/dns-message");
+    qp_st_names.push("accept-encoding");
+    qp_st_vals.push("gzip, deflate, br");
+    qp_st_names.push("accept-ranges");
+    qp_st_vals.push("bytes");
+    qp_st_names.push("access-control-allow-headers");
+    qp_st_vals.push("cache-control");
+    qp_st_names.push("access-control-allow-headers");
+    qp_st_vals.push("content-type");
+    qp_st_names.push("access-control-allow-origin");
+    qp_st_vals.push("*");
+    qp_st_names.push("cache-control");
+    qp_st_vals.push("max-age=0");
+    qp_st_names.push("cache-control");
+    qp_st_vals.push("max-age=2592000");
+    qp_st_names.push("cache-control");
+    qp_st_vals.push("max-age=604800");
+    qp_st_names.push("cache-control");
+    qp_st_vals.push("no-cache");
+    // 40
+    qp_st_names.push("cache-control");
+    qp_st_vals.push("no-store");
+    qp_st_names.push("cache-control");
+    qp_st_vals.push("public, max-age=31536000");
+    qp_st_names.push("content-encoding");
+    qp_st_vals.push("br");
+    qp_st_names.push("content-encoding");
+    qp_st_vals.push("gzip");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("application/dns-message");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("application/javascript");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("application/json");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("application/x-www-form-urlencoded");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("image/gif");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("image/jpeg");
+    // 50
+    qp_st_names.push("content-type");
+    qp_st_vals.push("image/png");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("text/css");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("text/html; charset=utf-8");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("text/plain");
+    qp_st_names.push("content-type");
+    qp_st_vals.push("text/plain;charset=utf-8");
+    qp_st_names.push("range");
+    qp_st_vals.push("bytes=0-");
+    qp_st_names.push("strict-transport-security");
+    qp_st_vals.push("max-age=31536000");
+    qp_st_names.push("strict-transport-security");
+    qp_st_vals.push("max-age=31536000; includesubdomains");
+    qp_st_names.push("strict-transport-security");
+    qp_st_vals.push("max-age=31536000; includesubdomains; preload");
+    qp_st_names.push("vary");
+    qp_st_vals.push("accept-encoding");
+    // 60
+    qp_st_names.push("vary");
+    qp_st_vals.push("origin");
+    qp_st_names.push("x-content-type-options");
+    qp_st_vals.push("nosniff");
+    qp_st_names.push("x-xss-protection");
+    qp_st_vals.push("1; mode=block");
+    qp_st_names.push(":status");
+    qp_st_vals.push("100");
+    qp_st_names.push(":status");
+    qp_st_vals.push("204");
+    qp_st_names.push(":status");
+    qp_st_vals.push("206");
+    qp_st_names.push(":status");
+    qp_st_vals.push("302");
+    qp_st_names.push(":status");
+    qp_st_vals.push("400");
+    qp_st_names.push(":status");
+    qp_st_vals.push("403");
+    qp_st_names.push(":status");
+    qp_st_vals.push("421");
+    // 70
+    qp_st_names.push(":status");
+    qp_st_vals.push("425");
+    qp_st_names.push(":status");
+    qp_st_vals.push("500");
+    qp_st_names.push("accept-language");
+    qp_st_vals.push("");
+    qp_st_names.push("access-control-allow-credentials");
+    qp_st_vals.push("FALSE");
+    qp_st_names.push("access-control-allow-credentials");
+    qp_st_vals.push("TRUE");
+    qp_st_names.push("access-control-allow-headers");
+    qp_st_vals.push("*");
+    qp_st_names.push("access-control-allow-methods");
+    qp_st_vals.push("get");
+    qp_st_names.push("access-control-allow-methods");
+    qp_st_vals.push("get, post, options");
+    qp_st_names.push("access-control-allow-methods");
+    qp_st_vals.push("options");
+    qp_st_names.push("access-control-expose-headers");
+    qp_st_vals.push("content-length");
+    // 80
+    qp_st_names.push("access-control-request-headers");
+    qp_st_vals.push("content-type");
+    qp_st_names.push("access-control-request-method");
+    qp_st_vals.push("get");
+    qp_st_names.push("access-control-request-method");
+    qp_st_vals.push("post");
+    qp_st_names.push("alt-svc");
+    qp_st_vals.push("clear");
+    qp_st_names.push("authorization");
+    qp_st_vals.push("");
+    qp_st_names.push("content-security-policy");
+    qp_st_vals.push("script-src 'none'; object-src 'none'; base-uri 'none'");
+    qp_st_names.push("early-data");
+    qp_st_vals.push("1");
+    qp_st_names.push("expect-ct");
+    qp_st_vals.push("");
+    qp_st_names.push("forwarded");
+    qp_st_vals.push("");
+    qp_st_names.push("if-range");
+    qp_st_vals.push("");
+    // 90
+    qp_st_names.push("origin");
+    qp_st_vals.push("");
+    qp_st_names.push("purpose");
+    qp_st_vals.push("prefetch");
+    qp_st_names.push("server");
+    qp_st_vals.push("");
+    qp_st_names.push("timing-allow-origin");
+    qp_st_vals.push("*");
+    qp_st_names.push("upgrade-insecure-requests");
+    qp_st_vals.push("1");
+    qp_st_names.push("user-agent");
+    qp_st_vals.push("");
+    qp_st_names.push("x-forwarded-for");
+    qp_st_vals.push("");
+    qp_st_names.push("x-frame-options");
+    qp_st_vals.push("deny");
+    qp_st_names.push("x-frame-options");
+    qp_st_vals.push("sameorigin");
+}
+
+/// Name of static entry `i` (0..98); "" out of range.
+pub fn qpack_static_name(i: i64) -> str {
+    qp_init();
+    if i < 0 || i >= qp_st_names.len() {
+        return "";
+    }
+    return qp_st_names.get(i);
+}
+
+/// Value of static entry `i` (0..98); "" out of range.
+pub fn qpack_static_value(i: i64) -> str {
+    qp_init();
+    if i < 0 || i >= qp_st_vals.len() {
+        return "";
+    }
+    return qp_st_vals.get(i);
+}
+
+/// The static entry holding exactly `name` and `value`, -1 if none.
+pub fn qpack_static_find(name: str, value: str) -> i64 {
+    qp_init();
+    var i: i64 = 0;
+    while i < qp_st_names.len() {
+        if qp_st_names.get(i) == name && qp_st_vals.get(i) == value {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The first static entry named `name`, -1 if none.
+pub fn qpack_static_find_name(name: str) -> i64 {
+    qp_init();
+    var i: i64 = 0;
+    while i < qp_st_names.len() {
+        if qp_st_names.get(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The size of a field section by RFC 9114 §4.2.2 (and RFC 9204 §3.2.1):
+/// each line's name and value lengths plus 32.
+pub fn qpack_section_size(names: Vec<str>, values: Vec<str>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < names.len() {
+        n = n + str_len(names.get(i)) + str_len(values.get(i)) + 32;
+        i = i + 1;
+    }
+    return n;
+}
+
+// ─── Integers and Huffman-coded strings (RFC 7541 §5.1, §5.2) ────────────
+//
+// The same encodings as stdlib/hpack.fd, kept here so that qpack does not
+// import hpack: the whole-program @secret check (compiler/secrecy.fd)
+// matches a method call such as `.len()` against every function whose
+// name ends in `_len`, and hpack's `huffman_code_len` fills global tables
+// from its callees' arguments, which that check counts as output: every
+// program that also uses QUIC's cryptography would be rejected. The
+// tables here are filled from a literal only, in a function without
+// parameters.
+
+/// The largest integer a decoder accepts.
+const QP_INT_MAX: i64 = 2147483647;
+
+/// The code length of each symbol 0..256 (256 = EOS) of RFC 7541
+/// Appendix B, as 'A' + length - 5. The code is canonical: the codes of
+/// one length are consecutive in symbol order, after the shorter ones.
+const QP_HUFF_LENS: str = "ISXXXXXXXTZXXZXXXXXXXXZXXXXXXXXXBFFHIBDGFFDGDBBBAAABBBBBBBCDKBHFIBCCCCCCCCCCCCCCCCCCCCCCDCDIOIJBKABABABBBACCBBBABCBAABCCCCCKGJIXPRPPRRRSRSSSSSTSTTRSTSSSSQRSRSSTRQPRRSSQSRRTQRSSQQRQSRSSPRRRSRRSVVPORSRUVVVWWVTUOQVWWVWTQQVVXWWWPTPQRQQSRRUUTTVSVWVVWWWWWXWWWWWVZ";
+
+var qp_hlen: Vec<i64> = Vec::new(); var qp_hcode: Vec<i64> = Vec::new();
+var qp_hfirst: Vec<i64> = Vec::new(); var qp_hcount: Vec<i64> = Vec::new();
+var qp_hstart: Vec<i64> = Vec::new(); var qp_hsorted: Vec<i64> = Vec::new();
+fn qp_huff_init() {
+    if qp_hlen.len() > 0 {
+        return;
+    }
+    var l: i64 = 0;
+    while l <= 30 {
+        qp_hfirst.push(- 1);
+        qp_hcount.push(0);
+        qp_hstart.push(0);
+        l = l + 1;
+    }
+    var sym: i64 = 0;
+    while sym < 257 {
+        val len: i64 = str_byte_at(QP_HUFF_LENS, sym) - 65 + 5;
+        qp_hlen.push(len);
+        qp_hcode.push(0);
+        qp_hsorted.push(0);
+        qp_hcount.set(len, qp_hcount.get(len) + 1);
+        sym = sym + 1;
+    }
+    // Canonical codes: by length, then by symbol
+    var at: i64 = 0;
+    var code: i64 = 0;
+    l = 1;
+    while l <= 30 {
+        qp_hstart.set(l, at);
+        if qp_hcount.get(l) > 0 {
+            qp_hfirst.set(l, code);
+        }
+        var s: i64 = 0;
+        while s < 257 {
+            if qp_hlen.get(s) == l {
+                qp_hcode.set(s, code);
+                qp_hsorted.set(at, s);
+                code = code + 1;
+                at = at + 1;
+            }
+            s = s + 1;
+        }
+        code = code << 1;
+        l = l + 1;
+    }
+}
+
+/// The Huffman code of a symbol (0..255, 256 = EOS), right-aligned.
+pub fn qpack_huffman_code(sym: i64) -> i64 {
+    qp_huff_init();
+    return qp_hcode.get(sym);
+}
+
+/// Bytes the Huffman coding of `bytes` takes.
+fn qp_huff_size(bytes: Vec<i64>) -> i64 {
+    qp_huff_init();
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        bits = bits + qp_hlen.get(bytes.get(i) & 255);
+        i = i + 1;
+    }
+    return (bits + 7) / 8;
+}
+
+/// Huffman-code `bytes`; the last byte is padded with ones (the start of
+/// EOS).
+fn qp_huff_encode(bytes: Vec<i64>) -> Vec<i64> {
+    qp_huff_init();
+    var out: Vec<i64> = Vec::new();
+    var acc: i64 = 0;
+    var nbits: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        val b: i64 = bytes.get(i) & 255;
+        val len: i64 = qp_hlen.get(b);
+        acc = (acc << len) | qp_hcode.get(b);
+        nbits = nbits + len;
+        while nbits >= 8 {
+            out.push((acc >> (nbits - 8)) & 255);
+            nbits = nbits - 8;
+        }
+        acc = acc & ((1 << nbits) - 1);
+        i = i + 1;
+    }
+    if nbits > 0 {
+        val pad: i64 = 8 - nbits;
+        out.push(((acc << pad) | ((1 << pad) - 1)) & 255);
+    }
+    return out;
+}
+
+/// Decode `n` Huffman-coded bytes of `b` from `from` into `out`. False when
+/// the input holds EOS or is padded with more than 7 bits or with bits
+/// other than ones (RFC 7541 §5.2).
+fn qp_huff_decode_into(b: Vec<i64>, from: i64, n: i64, out: & mut Vec<i64>) -> bool {
+    qp_huff_init();
+    var code: i64 = 0;
+    var len: i64 = 0;
+    var i: i64 = from;
+    while i < from + n {
+        val byte: i64 = b.get(i) & 255;
+        var bit: i64 = 7;
+        while bit >= 0 {
+            code = (code << 1) | ((byte >> bit) & 1);
+            len = len + 1;
+            if len > 30 {
+                return false;
+            }
+            val cnt: i64 = qp_hcount.get(len);
+            if cnt > 0 {
+                val off: i64 = code - qp_hfirst.get(len);
+                if off >= 0 && off < cnt {
+                    val sym: i64 = qp_hsorted.get(qp_hstart.get(len) + off);
+                    if sym == 256 {
+                        return false;
+                    }
+                    out.push(sym);
+                    code = 0;
+                    len = 0;
+                }
+            }
+            bit = bit - 1;
+        }
+        i = i + 1;
+    }
+    return len <= 7 && code == (1 << len) - 1;
+}
+
+/// Append `value` as an integer with an N-bit prefix (`prefix` 1..8);
+/// `first` holds the bits above the prefix.
+fn qp_put_int(out: & mut Vec<i64>, first: i64, prefix: i64, value: i64) {
+    val max: i64 = (1 << prefix) - 1;
+    if value < max {
+        out.push(first | value);
+        return;
+    }
+    out.push(first | max);
+    var v: i64 = value - max;
+    while v >= 128 {
+        out.push((v % 128) + 128);
+        v = v / 128;
+    }
+    out.push(v);
+}
+
+/// Read an integer with an N-bit prefix at `*pos`, moving `*pos` past it.
+/// -1 (and `*pos` -1) when the input ends first or the value is too large.
+fn qp_get_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
+    val at: i64 = * pos;
+    if at < 0 || at >= b.len() {
+        * pos = - 1;
+        return - 1;
+    }
+    val max: i64 = (1 << prefix) - 1;
+    var v: i64 = b.get(at) & max;
+    var p: i64 = at + 1;
+    if v == max {
+        var shift: i64 = 0;
+        var more: bool = true;
+        while more {
+            if p >= b.len() || shift > 28 {
+                * pos = - 1;
+                return - 1;
+            }
+            val c: i64 = b.get(p);
+            p = p + 1;
+            v = v + ((c & 127) << shift);
+            shift = shift + 7;
+            more = (c & 128) != 0;
+        }
+        if v > QP_INT_MAX {
+            * pos = - 1;
+            return - 1;
+        }
+    }
+    * pos = p;
+    return v;
+}
+
+// ─── Encoding (§4.5) ───────────────────────────────────────────────────
+
+fn qp_put_bytes(out: & mut Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+/// A string literal whose length has a `prefix`-bit prefix; the H bit is
+/// the bit just above the prefix, `first` holds the bits above that.
+fn qp_put_str(out: & mut Vec<i64>, first: i64, prefix: i64, s: str, huffman: bool) {
+    val bytes: Vec<i64> = str_bytes(s);
+    if huffman && bytes.len() > 0 && qp_huff_size(bytes) < bytes.len() {
+        val coded: Vec<i64> = qp_huff_encode(bytes);
+        qp_put_int(out, first | (1 << prefix), prefix, coded.len());
+        qp_put_bytes(out, coded);
+        return;
+    }
+    qp_put_int(out, first, prefix, bytes.len());
+    qp_put_bytes(out, bytes);
+}
+
+/// Fields that intermediaries must not put in a dynamic table (the N bit).
+fn qp_sensitive(name: str) -> bool {
+    return name == "authorization" || name == "proxy-authorization";
+}
+
+/// Append one field line: an indexed line when the static table holds the
+/// whole field, a literal with a static name reference when it holds the
+/// name, a literal with a literal name otherwise. Strings are
+/// Huffman-coded when `huffman` and that is shorter.
+pub fn qpack_encode_line(out: & mut Vec<i64>, name: str, value: str, huffman: bool) {
+    var n_bit: i64 = 0;
+    if qp_sensitive(name) {
+        n_bit = 0x20;
+    }
+    // A static entry reveals nothing, sensitive or not
+    val full: i64 = qpack_static_find(name, value);
+    if full >= 0 {
+        // 1 T=1 index(6)
+        qp_put_int(out, 0xc0, 6, full);
+        return;
+    }
+    val ni: i64 = qpack_static_find_name(name);
+    if ni >= 0 {
+        // 01 N T=1 name index(4), then H value(7)
+        qp_put_int(out, 0x50 | n_bit, 4, ni);
+        qp_put_str(out, 0, 7, value, huffman);
+        return;
+    }
+    // 001 N H name length(3), then H value(7)
+    var nfirst: i64 = 0x20;
+    if n_bit != 0 {
+        nfirst = 0x30;
+    }
+    qp_put_str(out, nfirst, 3, name, huffman);
+    qp_put_str(out, 0, 7, value, huffman);
+}
+
+/// Encode a field section with the static table only: the prefix
+/// (Required Insert Count 0, Base 0), then one line per field.
+pub fn qpack_encode(names: Vec<str>, values: Vec<str>, huffman: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0);
+    out.push(0);
+    var i: i64 = 0;
+    while i < names.len() {
+        qpack_encode_line(& mut out, names.get(i), values.get(i), huffman);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Decoding (§4.5) ───────────────────────────────────────────────────
+
+fn qp_fail(r: QpackFields, why: str) -> QpackFields {
+    var f: QpackFields = r;
+    f.ok = false;
+    f.error = QPACK_DECOMPRESSION_FAILED;
+    f.why = why;
+    return f;
+}
+
+/// A string literal at `*pos` whose length has a `prefix`-bit prefix (the
+/// H bit just above it). `*pos` becomes -1 when it is cut short, too long
+/// or badly Huffman-coded.
+fn qp_get_str(b: Vec<i64>, pos: & mut i64, prefix: i64) -> str {
+    if * pos < 0 || * pos >= b.len() {
+        * pos = - 1;
+        return "";
+    }
+    val huff: bool = ((b.get(* pos) >> prefix) & 1) != 0;
+    val n: i64 = qp_get_int(b, pos, prefix);
+    if n < 0 {
+        return "";
+    }
+    val at: i64 = * pos;
+    if at + n > b.len() {
+        * pos = - 1;
+        return "";
+    }
+    var bytes: Vec<i64> = Vec::new();
+    if huff {
+        if !qp_huff_decode_into(b, at, n, & mut bytes) {
+            * pos = - 1;
+            return "";
+        }
+    } else {
+        var i: i64 = 0;
+        while i < n {
+            bytes.push(b.get(at + i) & 255);
+            i = i + 1;
+        }
+    }
+    * pos = at + n;
+    return str_from_bytes(bytes);
+}
+
+/// Decode a field section of a HEADERS frame, with no dynamic table (our
+/// SETTINGS_QPACK_MAX_TABLE_CAPACITY is 0). `max_size` is the largest
+/// section accepted (RFC 9114 §4.2.2), -1 for no limit.
+pub fn qpack_decode(block: Vec<i64>, max_size: i64) -> QpackFields {
+    var r: QpackFields = QpackFields {
+        ok: true, error: - 1, too_large: false, why: "", names: Vec::new(), values: Vec::new(), size: 0,
+    };
+    var pos: i64 = 0;
+    val ric: i64 = qp_get_int(block, & mut pos, 8);
+    if pos < 0 {
+        return qp_fail(r, "field section prefix cut short");
+    }
+    if ric != 0 {
+        // With MaxEntries 0 the only valid encoded Required Insert Count
+        // is 0 (§4.5.1.1).
+        return qp_fail(r, "Required Insert Count " + int_to_str(ric) + " without a dynamic table");
+    }
+    qp_get_int(block, & mut pos, 7);
+    if pos < 0 {
+        return qp_fail(r, "field section prefix cut short");
+    }
+    while pos < block.len() {
+        val first: i64 = block.get(pos) & 255;
+        var name: str = "";
+        var value: str = "";
+        if (first & 0x80) != 0 {
+            // Indexed field line
+            if (first & 0x40) == 0 {
+                return qp_fail(r, "dynamic table reference");
+            }
+            val idx: i64 = qp_get_int(block, & mut pos, 6);
+            if pos < 0 || idx >= QPACK_STATIC_LEN {
+                return qp_fail(r, "bad static index");
+            }
+            name = qpack_static_name(idx);
+            value = qpack_static_value(idx);
+        } else if (first & 0x40) != 0 {
+            // Literal field line with name reference
+            if (first & 0x10) == 0 {
+                return qp_fail(r, "dynamic table name reference");
+            }
+            val idx: i64 = qp_get_int(block, & mut pos, 4);
+            if pos < 0 || idx >= QPACK_STATIC_LEN {
+                return qp_fail(r, "bad static name index");
+            }
+            name = qpack_static_name(idx);
+            value = qp_get_str(block, & mut pos, 7);
+            if pos < 0 {
+                return qp_fail(r, "bad field value");
+            }
+        } else if (first & 0x20) != 0 {
+            // Literal field line with literal name
+            name = qp_get_str(block, & mut pos, 3);
+            if pos < 0 {
+                return qp_fail(r, "bad field name");
+            }
+            value = qp_get_str(block, & mut pos, 7);
+            if pos < 0 {
+                return qp_fail(r, "bad field value");
+            }
+        } else {
+            // Indexed field line with post-base index (0001) or literal
+            // with post-base name reference (0000): both dynamic
+            return qp_fail(r, "post-base reference");
+        }
+        r.size = r.size + str_len(name) + str_len(value) + 32;
+        if max_size >= 0 && r.size > max_size {
+            r.ok = false;
+            r.too_large = true;
+            r.why = "field section over " + int_to_str(max_size) + " bytes";
+            return r;
+        }
+        r.names.push(name);
+        r.values.push(value);
+    }
+    return r;
+}
+
+// ─── Encoder and decoder streams (§4.3, §4.4) ──────────────────────────
+
+fn qp_scan(status: i64, used: i64, error: i64, why: str) -> QpackScan {
+    return QpackScan { status: status, used: used, error: error, why: why };
+}
+
+/// An integer with a `prefix`-bit prefix at `*pos` that may be cut short
+/// by the end of what arrived: -2 when it is (more may come), -1 when it
+/// is too large, else the value (and `*pos` moves past it).
+fn qp_stream_int(b: Vec<i64>, pos: & mut i64, prefix: i64) -> i64 {
+    val at: i64 = * pos;
+    var p: i64 = at;
+    val v: i64 = qp_get_int(b, & mut p, prefix);
+    if p >= 0 {
+        * pos = p;
+        return v;
+    }
+    // Cut short when every continuation byte to the end has its high bit
+    // set (and there are few of them): otherwise too large.
+    var k: i64 = at + 1;
+    while k < b.len() {
+        if (b.get(k) & 128) == 0 {
+            return - 1;
+        }
+        k = k + 1;
+    }
+    if b.len() - at > 6 {
+        return - 1;
+    }
+    return - 2;
+}
+
+/// Scan what the peer sent on its QPACK encoder stream from `from`,
+/// against our table capacity `max_capacity` (0 for stdlib/http3.fd).
+/// With a capacity of 0 nothing can be inserted: only Set Dynamic Table
+/// Capacity 0 is allowed.
+pub fn qpack_encoder_stream_scan(b: Vec<i64>, from: i64, max_capacity: i64) -> QpackScan {
+    var pos: i64 = from;
+    while pos < b.len() {
+        val first: i64 = b.get(pos) & 255;
+        if (first & 0xe0) == 0x20 {
+            var p: i64 = pos;
+            val cap: i64 = qp_stream_int(b, & mut p, 5);
+            if cap == - 2 {
+                return qp_scan(QPACK_SCAN_MORE, pos - from, - 1, "");
+            }
+            if cap < 0 || cap > max_capacity {
+                return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR,
+                    "dynamic table capacity over our maximum");
+            }
+            pos = p;
+        } else if max_capacity == 0 {
+            // Insert with name reference (1...), with literal name (01..)
+            // or Duplicate (000): an entry never fits a table of size 0
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR,
+                "an insertion into a table of capacity 0");
+        } else {
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_ENCODER_STREAM_ERROR,
+                "dynamic table insertions are not supported");
+        }
+    }
+    return qp_scan(QPACK_SCAN_OK, pos - from, - 1, "");
+}
+
+/// Scan what the peer sent on its QPACK decoder stream from `from`. We
+/// never reference the dynamic table, so the peer has nothing to
+/// acknowledge: Section Acknowledgment and Insert Count Increment are
+/// errors; Stream Cancellation is fine.
+pub fn qpack_decoder_stream_scan(b: Vec<i64>, from: i64) -> QpackScan {
+    var pos: i64 = from;
+    while pos < b.len() {
+        val first: i64 = b.get(pos) & 255;
+        if (first & 0xc0) == 0x40 {
+            var p: i64 = pos;
+            val sid: i64 = qp_stream_int(b, & mut p, 6);
+            if sid == - 2 {
+                return qp_scan(QPACK_SCAN_MORE, pos - from, - 1, "");
+            }
+            if sid < 0 {
+                return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR, "stream id too large");
+            }
+            pos = p;
+        } else if (first & 0x80) != 0 {
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR,
+                "Section Acknowledgment of a section without dynamic references");
+        } else {
+            return qp_scan(QPACK_SCAN_ERROR, pos - from, QPACK_DECODER_STREAM_ERROR,
+                "Insert Count Increment without insertions");
+        }
+    }
+    return qp_scan(QPACK_SCAN_OK, pos - from, - 1, "");
+}

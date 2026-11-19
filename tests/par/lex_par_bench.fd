@@ -1,0 +1,98 @@
+// SP9: how long lexing the compiler's own modules takes in 1, 2, 4 and 8
+// threads (compiler/lexer.fd lex_texts_par, the lexing the import prefetch
+// does), and that every count gives the same tokens. Build with ccompile
+// and run from the repository root:
+//
+//   $FID ccompile tests/par/lex_par_bench.fd -o lexbench.exe && ./lexbench.exe
+//
+// Prints one line per thread count, `<n> threads: <ms> ms, <tokens> tokens`,
+// then `same tokens: true`. The times vary with the machine and its load.
+
+use core;
+use vec;
+use string;
+use fs;
+use compiler::token;
+use compiler::lexer;
+
+fn count_toks(v: Vec<LexedText>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        n = n + v.get(i).tokens.len();
+        i = i + 1;
+    }
+    return n;
+}
+
+/// A fingerprint of every token (kind, place and identifier text).
+@wrapping fn tok_hash(v: Vec<LexedText>) -> i64 {
+    var h: i64 = 1469598103934665603;
+    var i: i64 = 0;
+    while i < v.len() {
+        var t: i64 = 0;
+        while t < v.get(i).tokens.len() {
+            var tk: Token = v.get(i).tokens.get(t);
+            h = (h * 1099511628211) + token_kind_tag(tk.kind) * 31 + tk.line * 7 + tk.col;
+            match tk.kind {
+                TokenKind::Ident(x: str) => {
+                    h = h * 1099511628211 + str_len(x);
+                }
+                _ => {
+                }
+            }
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+    return h;
+}
+
+fn main() -> i64 {
+    var texts: Vec<str> = Vec::new();
+    var names: Vec<str> = fs_list_dir("compiler");
+    var ni: i64 = 0;
+    while ni < names.len() {
+        var nm: str = names.get(ni);
+        if str_ends_with(nm, ".fd") {
+            match read_file("compiler/" + nm) {
+                Option::Some(t) => {
+                    texts.push(t);
+                }
+                Option::None => {
+                }
+            }
+        }
+        ni = ni + 1;
+    }
+    var bytes: i64 = 0;
+    var i: i64 = 0;
+    while i < texts.len() {
+        bytes = bytes + str_len(texts.get(i));
+        i = i + 1;
+    }
+    println(int_to_str(texts.len()) + " files, " + int_to_str(bytes / 1024) + " KB");
+    var counts: Vec<i64> = Vec::new();
+    counts.push(1);
+    counts.push(2);
+    counts.push(4);
+    counts.push(8);
+    var first: i64 = 0;
+    var same: bool = true;
+    i = 0;
+    while i < counts.len() {
+        var t0: i64 = p_clock_now_ms();
+        var got: Vec<LexedText> = lex_texts_par(texts, counts.get(i));
+        var ms: i64 = p_clock_now_ms() - t0;
+        var h: i64 = tok_hash(got);
+        if i == 0 {
+            first = h;
+        } else if h != first {
+            same = false;
+        }
+        println(int_to_str(counts.get(i)) + " threads: " + int_to_str(ms) + " ms, " + int_to_str(count_toks(got)) + " tokens");
+        i = i + 1;
+    }
+    println("same tokens: " + bool_to_str(same));
+    return 0;
+}

@@ -1,0 +1,112 @@
+// alloc/threads (competitive roadmap RT8; mimalloc-bench's larson and
+// xmalloc-test shape): 4 threads at once, and blocks freed by a thread other
+// than the one that allocated them. Each thread has 10,000 slots. 6 rounds:
+// in phase A every thread replaces random slots of its own (500,000 times,
+// 16..527 bytes); in phase B each thread frees every block of the next
+// thread's slots (allocated by another thread) and refills them. Prints the
+// sum of the words read back.
+
+// 31-bit LCG: no product passes 2^62, so no overflow check fires
+fn next(x: i64) -> i64 {
+    return (x * 1103515245 + 12345) % 2147483648;
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: *mut i64 = a;
+    *p = v;
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: *mut i64 = a;
+    return *p;
+}
+
+/// Phase A: `steps` random replacements in the 10,000 slots at `tab`
+@unsafe
+fn churn(tab: i64, seed0: i64, steps: i64) -> i64 {
+    val slots: i64 = 10000;
+    var seed: i64 = seed0;
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < steps {
+        seed = next(seed);
+        val s: i64 = tab + ((seed >> 4) % slots) * 8;
+        val old: i64 = ld(s);
+        if old != 0 {
+            sum = sum + ld(old);
+            p_free(old);
+        }
+        seed = next(seed);
+        var b: i64 = p_malloc(16 + (seed >> 8) % 512);
+        st(b, i & 255);
+        st(s, b);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// Phase B: free every block at `tab` (another thread's) and refill them
+@unsafe
+fn swap(tab: i64, seed0: i64, tag: i64) -> i64 {
+    val slots: i64 = 10000;
+    var seed: i64 = seed0;
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < slots {
+        val s: i64 = tab + i * 8;
+        val old: i64 = ld(s);
+        if old != 0 {
+            sum = sum + ld(old);
+            p_free(old);
+        }
+        seed = next(seed);
+        var b: i64 = p_malloc(16 + (seed >> 8) % 512);
+        st(b, (i + tag) & 255);
+        st(s, b);
+        i = i + 1;
+    }
+    return sum;
+}
+
+@unsafe
+fn main() -> i64 {
+    val slots: i64 = 10000;
+    // p_malloc's blocks are zeroed: every slot starts empty
+    val tabs: i64 = p_malloc(4 * slots * 8);
+    val t1: i64 = tabs + slots * 8;
+    val t2: i64 = tabs + slots * 16;
+    val t3: i64 = tabs + slots * 24;
+    var total: i64 = 0;
+    var r: i64 = 0;
+    while r < 6 {
+        val a0 = spawn churn(tabs, r * 8 + 1, 500000);
+        val a1 = spawn churn(t1, r * 8 + 2, 500000);
+        val a2 = spawn churn(t2, r * 8 + 3, 500000);
+        val a3 = spawn churn(t3, r * 8 + 4, 500000);
+        total = total + await a0;
+        total = total + await a1;
+        total = total + await a2;
+        total = total + await a3;
+        val b0 = spawn swap(t1, r * 8 + 5, 0);
+        val b1 = spawn swap(t2, r * 8 + 6, 1);
+        val b2 = spawn swap(t3, r * 8 + 7, 2);
+        val b3 = spawn swap(tabs, r * 8 + 8, 3);
+        total = total + await b0;
+        total = total + await b1;
+        total = total + await b2;
+        total = total + await b3;
+        r = r + 1;
+    }
+    var i: i64 = 0;
+    while i < 4 * slots {
+        val old: i64 = ld(tabs + i * 8);
+        total = total + ld(old);
+        p_free(old);
+        i = i + 1;
+    }
+    p_free(tabs);
+    println(total);
+    return 0;
+}

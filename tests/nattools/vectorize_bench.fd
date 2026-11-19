@@ -1,0 +1,65 @@
+// competitive-roadmap OP22: a benchmark of loop vectorization. Three
+// kernels the vectorizer takes (compiler/nat_ir.fd ng_vz_*): saxpy over
+// Vec<f64>, an elementwise f64 add, and an i64 xor reduction, each over
+// 1 << 20 elements, repeated. tests/nattools/vectorize_bench.sh builds it
+// with and without FID_NAT_OFF=vectorize and prints the times; the output
+// (checksums) must be the same both ways.
+
+fn saxpy(y: & mut Vec<f64>, x: Vec<f64>, k: f64) {
+    for i in 0..x.len() {
+        y.set(i, k * x.get(i) + y.get(i));
+    }
+}
+
+fn add_f(c: & mut Vec<f64>, a: Vec<f64>, b: Vec<f64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) + b.get(i));
+        i = i + 1;
+    }
+}
+
+fn xor_all(a: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s ^ a.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+@wrapping fn fold(v: Vec<f64>) -> i64 {
+    var h: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = h * 31 + p_f64_to_bits(v.get(i));
+        i = i + 1;
+    }
+    return h;
+}
+
+fn main() {
+    var n: i64 = 1048576;
+    var x: Vec<f64> = Vec::new();
+    var y: Vec<f64> = Vec::new();
+    var c: Vec<f64> = Vec::new();
+    var a: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        x.push((i % 1000) as f64 * 0.5);
+        y.push((i % 7) as f64);
+        c.push(0.0);
+        a.push(i * 2654435761 % 1000003);
+        i = i + 1;
+    }
+    var r: i64 = 0;
+    var s: i64 = 0;
+    while r < 100 {
+        saxpy(& mut y, x, 0.25);
+        add_f(& mut c, x, y);
+        s = s + (xor_all(a) ^ r);
+        r = r + 1;
+    }
+    println(int_to_str(fold(y)) + " " + int_to_str(fold(c)) + " " + int_to_str(s));
+}

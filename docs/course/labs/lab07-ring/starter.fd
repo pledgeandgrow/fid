@@ -1,0 +1,57 @@
+// Lab 7 starter: take the unsafe code out of a ring buffer.
+//! lab: 7
+//! check: runs
+//
+// Tasks (see README.md):
+//   1. Replace the p_malloc block by a `Vec<i64>` of 8 elements, created
+//      full of zeros by `ring_new`. Remove every `unsafe` block: the
+//      program must print the same sum.
+//   2. Write `ring_items(r: &Ring) -> str`: the values from oldest to
+//      newest, separated by spaces, and print it after the sum.
+//   3. In `main`, push each of three frames' samples into a fresh ring
+//      inside `region frame { ... }`, and print the total of the three
+//      sums.
+
+struct Ring { base: i64, head: i64, count: i64 }
+
+fn ring_new() -> Ring {
+    var base: i64 = 0;
+    // SAFETY: the block is freed exactly once, by ring_free
+    unsafe { base = p_malloc(64); }
+    return Ring { base: base, head: 0, count: 0 };
+}
+
+fn ring_push(r: &mut Ring, x: i64) {
+    val slot: i64 = (r.head + r.count) % 8;
+    // SAFETY: slot is in 0..8 and the block holds 8 words
+    unsafe {
+        val p: *mut i64 = (r.base + slot * 8) as *mut i64;
+        *p = x;
+    }
+    if r.count < 8 { r.count = r.count + 1; } else { r.head = (r.head + 1) % 8; }
+}
+
+fn ring_sum(r: &Ring) -> i64 {
+    var s: i64 = 0;
+    for i in 0..r.count {
+        // SAFETY: (head + i) % 8 is a slot that ring_push wrote
+        unsafe {
+            val p: *mut i64 = (r.base + ((r.head + i) % 8) * 8) as *mut i64;
+            s = s + *p;
+        }
+    }
+    return s;
+}
+
+fn ring_free(r: Ring) {
+    // SAFETY: base came from p_malloc in ring_new
+    unsafe { p_free(r.base); }
+}
+
+fn main() -> i64 {
+    var r: Ring = ring_new();
+    for i in 1..11 { ring_push(&mut r, i); }
+    println("last 8 sum to " + int_to_str(ring_sum(&r)));
+    ring_free(r);
+    return 0;
+}

@@ -13,9 +13,7 @@
 //
 // Dependencies: compiler::token (TokenKind, Token, token_new)
 
-module compiler::lexer;
- use vec; use core; use compiler::token;
-// --- Lexer ----------------------------------------------------------------
+module compiler::lexer; use vec; use core; use compiler::token;  // --- Lexer ----------------------------------------------------------------
 
 pub struct Lexer {
     pub source: str,
@@ -26,12 +24,16 @@ pub struct Lexer {
     pub col: i64,
     /// Collected error messages (instead of printing directly).
     pub errors: Vec<str>,
+    /// SP9: the words found to be no keyword, in a map of this lexer's own
+    /// (a lexer on a worker thread, lex_text_alone); 0: the shared
+    /// g_lex_not_kw (one thread).
+    pub own_kw: i64,
 }
 
 impl Lexer {
     pub fn new(source: str) -> Lexer {
         return Lexer {
-            source: source, src_len: str_len(source), pos: 0, line: 1, col: 1, errors: Vec::new(),
+            source: source, src_len: str_len(source), pos: 0, line: 1, col: 1, errors: Vec::new(), own_kw: 0,
         };
     }
 
@@ -64,6 +66,9 @@ impl Lexer {
             } else if c == 34 {
                 // '"'
                 tokens.push(self.read_string());
+            } else if c == 39 && self.lifetime_ahead() {
+                // `'a` (LG3): a lifetime name, not the char literal `'a'`
+                tokens.push(self.read_lifetime());
             } else if c == 39 {
                 // '\''
                 tokens.push(self.read_char_lit());
@@ -197,7 +202,7 @@ impl Lexer {
                 break;
             }
             if !lex_is_hexdigit(d) {
-                self.errors.push(lex_error(line, col, "invalid hex digit in escape"));
+                self.errors.push(lex_error(line, col, "invalid hex digit in escape\n    Fix: use the hex digits 0-9 and a-f (or A-F), as in \"\\x41\" or \"\\u{e9}\""));
                 return 0;
             }
             if d <= 57 {
@@ -214,12 +219,39 @@ impl Lexer {
             if self.peek() == 125 {
                 self.advance();
             } else {
-                self.errors.push(lex_error(line, col, "expected '}' to close \\u{...}"));
+                self.errors.push(lex_error(line, col, "expected '}' to close \\u{...}\n    Fix: close the code point with `}` after at most 6 hex digits, as in \"\\u{1F600}\""));
             }
         } else if n != max_digits {
-            self.errors.push(lex_error(line, col, "\\x expects 2 hex digits"));
+            self.errors.push(lex_error(line, col, "\\x expects 2 hex digits\n    Fix: write two hex digits after \\x, as in \"\\x0a\" (a leading 0 for a small value)"));
         }
         return v;
+    }
+
+    /// At a `'`: whether a lifetime name follows -- a letter or `_`, then
+    /// letters, digits and `_` with no closing `'` after them (`'a'` is a
+    /// char literal, `'a` and `'static` are lifetimes).
+    fn lifetime_ahead(self: & Lexer) -> bool {
+        var c1: i64 = self.peek_at(1);
+        if !(lex_is_alpha(c1) || c1 == 95) {
+            return false;
+        }
+        var j: i64 = 2;
+        while lex_is_alphanumeric(self.peek_at(j)) || self.peek_at(j) == 95 {
+            j = j + 1;
+        }
+        return self.peek_at(j) != 39;
+    }
+
+    /// A lifetime name `'a`; the token's text keeps the quote.
+    fn read_lifetime(self: & mut Lexer) -> Token {
+        var line: i64 = self.line;
+        var col: i64 = self.col;
+        self.advance();
+        var name: str = "'";
+        while self.pos < self.src_len && (lex_is_alphanumeric(self.peek()) || self.peek() == 95) {
+            name = name + byte_to_str(self.advance());
+        }
+        return token_new(TokenKind::Lifetime(name), line, col);
     }
 
     /// R1.7: char literal 'c' -> IntLit holding the Unicode scalar value, so it
@@ -234,7 +266,7 @@ impl Lexer {
         var v: i64 = 0;
         var c: i64 = self.peek();
         if self.pos >= self.src_len || c == 39 || c == 10 {
-            self.errors.push(lex_error(line, col, "empty char literal"));
+            self.errors.push(lex_error(line, col, "empty char literal\n    Fix: a char literal holds one character, as in 'a' or '\\n'; for no text use the empty string \"\""));
         } else if c == 92 {
             self.advance();
             var esc: i64 = self.advance();
@@ -267,7 +299,7 @@ impl Lexer {
                 self.advance();
                 v = self.read_hex_value(line, col, 6, true);
             } else {
-                self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
+                self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes of a char literal are \\n \\t \\r \\0 \\\\ \\' \\\" \\xHH and \\u{...}; write '\\\\' for a backslash"));
                 v = esc;
             }
         } else {
@@ -278,7 +310,7 @@ impl Lexer {
             self.advance();
             // consume closing '\''
         } else {
-            self.errors.push(lex_error(line, col, "unterminated char literal"));
+            self.errors.push(lex_error(line, col, "unterminated char literal\n    Fix: a char literal holds one character: 'a', or use a string \"ab\""));
         }
 
         return token_new(TokenKind::IntLit(v), line, col);
@@ -323,7 +355,7 @@ impl Lexer {
         // Extract the identifier directly from the source string
         // instead of building it char-by-char with str_concat (O(n^2)).
         var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
-        var kind: TokenKind = keyword_or_ident(s);
+        var kind: TokenKind = keyword_or_ident_own(self.own_kw, s);
         return token_new(kind, line, col);
     }
 
@@ -375,8 +407,7 @@ impl Lexer {
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 8);
                 return token_new(TokenKind::IntLit(val), line, col);
             }
-        }
-        // Decimal integer part (with optional '_' separators)
+        }  // Decimal integer part (with optional '_' separators)
         while self.pos < self.src_len && (lex_is_digit(self.peek()) || self.peek() == 95) {
             self.advance();
         }
@@ -447,7 +478,6 @@ impl Lexer {
         // consume opening '"'
 
         var s: str = "";
-        var nul_at: i64 = - 1;
         while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
@@ -470,10 +500,8 @@ impl Lexer {
                     s = str_concat(s, "\"");
                 }  // '"'
                 else if esc == 48 {
-                    if nul_at < 0 {
-                        nul_at = str_len(s);
-                    }
-                }  // NUL: the C string ends here
+                    s = str_concat(s, char_to_str(0));
+                }  // NUL: a byte of the string (RT2; its length is stored)
                 else if esc == 120 || (esc == 117 && self.peek() == 123) {
                     // xHH, u{...}
                     var hv: i64 = 0;
@@ -484,15 +512,13 @@ impl Lexer {
                         hv = self.read_hex_value(line, col, 6, true);
                     }
                     if hv == 0 {
-                        if nul_at < 0 {
-                            nul_at = str_len(s);
-                        }
-                    }  // NUL: the C string ends here
+                        s = str_concat(s, char_to_str(0));
+                    }  // NUL: a byte of the string (RT2)
                     else {
                         s = str_concat(s, lex_utf8_encode(hv));
                     }
                 } else {
-                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
+                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes are \\n \\t \\r \\0 \\\\ \\' \\\" \\xHH and \\u{...}; write \\\\ for a backslash itself, or a raw string r\"...\""));
                     s = str_concat(s, byte_to_str(esc));
                 }
             } else if c == 123 {
@@ -529,10 +555,7 @@ impl Lexer {
             self.advance();
             // consume closing '"'
         } else {
-            self.errors.push(lex_error(line, col, "unterminated f-string"));
-        }
-        if nul_at >= 0 {
-            s = str_slice(s, 0, nul_at);
+            self.errors.push(lex_error(line, col, "unterminated f-string\n    Fix: end the f-string with `\"` on the same line (write \\n for a line break), and close each `{` with `}`"));
         }
 
         return token_new(TokenKind::FString(s), line, col);
@@ -545,7 +568,6 @@ impl Lexer {
         // consume opening '"'
 
         var s: str = "";
-        var nul_at: i64 = - 1;
         while self.pos < self.src_len && self.peek() != 34 {
             var c: i64 = self.peek();
             if c == 92 {
@@ -568,10 +590,8 @@ impl Lexer {
                     s = str_concat(s, "\"");
                 }  // '"'
                 else if esc == 48 {
-                    if nul_at < 0 {
-                        nul_at = str_len(s);
-                    }
-                }  // NUL: the C string ends here
+                    s = str_concat(s, char_to_str(0));
+                }  // NUL: a byte of the string (RT2; its length is stored)
                 else if esc == 120 || (esc == 117 && self.peek() == 123) {
                     // xHH, u{...}
                     var hv: i64 = 0;
@@ -582,15 +602,13 @@ impl Lexer {
                         hv = self.read_hex_value(line, col, 6, true);
                     }
                     if hv == 0 {
-                        if nul_at < 0 {
-                            nul_at = str_len(s);
-                        }
-                    }  // NUL: the C string ends here
+                        s = str_concat(s, char_to_str(0));
+                    }  // NUL: a byte of the string (RT2)
                     else {
                         s = str_concat(s, lex_utf8_encode(hv));
                     }
                 } else {
-                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc)));
+                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes are \\n \\t \\r \\0 \\\\ \\' \\\" \\xHH and \\u{...}; write \\\\ for a backslash itself, or a raw string r\"...\""));
                     s = str_concat(s, byte_to_str(esc));
                 }
             } else {
@@ -602,10 +620,7 @@ impl Lexer {
             self.advance();
             // consume closing '"'
         } else {
-            self.errors.push(lex_error(line, col, "unterminated string"));
-        }
-        if nul_at >= 0 {
-            s = str_slice(s, 0, nul_at);
+            self.errors.push(lex_error(line, col, "unterminated string\n    Fix: end the string with `\"`; write \\\" for a quote inside it and \\n for a line break"));
         }
 
         return token_new(TokenKind::StringLit(s), line, col);
@@ -629,7 +644,7 @@ impl Lexer {
 
         // Expect opening '"'
         if self.peek() != 34 {
-            self.errors.push(lex_error(line, col, "expected '\"' after r" + repeat_char(35, hash_count)));
+            self.errors.push(lex_error(line, col, "expected '\"' after r" + repeat_char(35, hash_count) + "\n    Fix: a raw string is r\"...\" or r#\"...\"# (the same number of # on both sides)"));
             return token_new(TokenKind::StringLit(""), line, col);
         }
         self.advance();
@@ -664,13 +679,14 @@ impl Lexer {
             s = str_concat(s, self.read_utf8());
         }
 
-        self.errors.push(lex_error(line, col, "unterminated raw string"));
+        self.errors.push(lex_error(line, col, "unterminated raw string\n    Fix: end it with `\"` followed by as many # as after the r that opened it, as in r#\"a \"b\" c\"#"));
         return token_new(TokenKind::StringLit(s), line, col);
     }
 
     fn read_operator(self: & mut Lexer) -> Token {
         var line: i64 = self.line;
         var col: i64 = self.col;
+        var op_start: i64 = self.pos;
         var c: i64 = self.advance();
 
         var kind: TokenKind = TokenKind::Eof;
@@ -900,8 +916,14 @@ impl Lexer {
             // ']'
             kind = TokenKind::RBracket;
         } else {
-            self.errors.push(lex_error(line, col, "unexpected character '" + byte_to_str(c) + "'"));
-            kind = TokenKind::Eof;
+            // 2g.18: an error token, not Eof. An Eof here ended the stream:
+            // compiler.fd does not look at an imported module's lex errors,
+            // so the rest of the module was dropped without a word. The
+            // parser rejects this token where it stands. The text is the
+            // whole character (advance took every byte of a UTF-8 one).
+            var bad: str = str_slice_len(self.source, self.src_len, op_start, self.pos);
+            self.errors.push(lex_error(line, col, "unexpected character '" + bad + "'\n    Fix: remove it, or put it in a string or a comment; outside them only letters, digits, `_` and the operators of the reference (§2) are allowed"));
+            kind = TokenKind::BadChar(bad);
         }
 
         return token_new(kind, line, col);
@@ -925,7 +947,16 @@ pub fn str_filter_underscores(s: str) -> str {
 // --- Keyword table --------------------------------------------------------
 // Maps an identifier string to its TokenKind, or TokenKind::Ident(s) if it
 // is not a reserved word. Mirrors the `match s.as_str()` block in lexer.rs.
-// Note: "q8" and "q4" are aliases for I8 (quantized 8/4-bit, stored in i8).
+// Note: "q8" and "q4" (quantized 8/4-bit, stored in i8) are not reserved:
+// they lex as identifiers, and parse_type reads them as i8, so `q4` can
+// also name a variable (stdlib-agent-bugs 13). Only an exact keyword
+// spelling is a keyword (`i8x`, `f64s` are identifiers).
+
+/// CS4: the words of at most 10 bytes keyword_or_ident found to be no
+/// keyword (a HashMap handle, made on first use; the lexer runs on one
+/// thread). keyword_or_ident_chain is a function of the word alone, so
+/// its answer for a word never changes.
+var g_lex_not_kw: i64 = 0;
 
 pub fn keyword_or_ident(s: str) -> TokenKind {
     // Fast path: all keywords are <= 10 chars. Skip keyword checks for
@@ -935,6 +966,51 @@ pub fn keyword_or_ident(s: str) -> TokenKind {
     if slen > 10 {
         return TokenKind::Ident(s);
     }
+    // CS4: a word already found to be no keyword is not compared with the
+    // ~90 keywords again (an identifier is met many times in a file)
+    if g_lex_not_kw == 0 {
+        g_lex_not_kw = HashMap_new();
+    }
+    if HashMap_contains(g_lex_not_kw, s) {
+        return TokenKind::Ident(s);
+    }
+    var kw: TokenKind = keyword_or_ident_chain(s);
+    match kw {
+        TokenKind::Ident(_) => {
+            HashMap_insert(g_lex_not_kw, s, 1);
+        }
+        _ => {
+        }
+    }
+    return kw;
+}
+
+/// SP9: keyword_or_ident with the not-a-keyword words kept in `own` (a map
+/// of one lexer, so lexers on several threads share nothing); `own` 0 is
+/// keyword_or_ident itself. The same answer for every word.
+pub fn keyword_or_ident_own(own: i64, s: str) -> TokenKind {
+    if own == 0 {
+        return keyword_or_ident(s);
+    }
+    if str_len(s) > 10 {
+        return TokenKind::Ident(s);
+    }
+    if HashMap_contains(own, s) {
+        return TokenKind::Ident(s);
+    }
+    var kw: TokenKind = keyword_or_ident_chain(s);
+    match kw {
+        TokenKind::Ident(_) => {
+            HashMap_insert(own, s, 1);
+        }
+        _ => {
+        }
+    }
+    return kw;
+}
+
+/// The keyword checks of keyword_or_ident, one group after another.
+fn keyword_or_ident_chain(s: str) -> TokenKind {
     // -- Keywords (split into small groups to keep generated C functions
     // small enough for TCC to compile without dropping statements) --
     var kind: TokenKind = keyword_or_ident_a(s);
@@ -1214,13 +1290,7 @@ fn keyword_or_ident_game(s: str) -> TokenKind {
 }
 
 fn keyword_or_ident_type(s: str) -> TokenKind {
-    // q8/q4 are aliases for I8 (quantized 8/4-bit, stored in i8)
-    if s == "q8" {
-        return TokenKind::I8;
-    }
-    if s == "q4" {
-        return TokenKind::I8;
-    }
+    // q8/q4 (aliases of i8) are identifiers: parse_type maps them to i8
     if s == "i8" {
         return TokenKind::I8;
     }
@@ -1374,4 +1444,362 @@ pub fn lex_error(line: i64, col: i64, msg: str) -> str {
         i = i + 1;
     }
     return v;
+}
+
+// --- SP9: import files lexed in parallel ----------------------------------
+// The import phase can read and lex every module of the import closure
+// before it parses them one at a time (compiler.fd imp_prefetch_lex). Lexing
+// a file depends on its text alone, so with FID_PAR=N the files of each
+// wave of the closure are lexed in up to N threads; the tokens are those
+// Lexer::new(text).tokenize() gives, and the parse order, the names the
+// parser is given and so every message stay as they were.
+//
+// A worker shares nothing it changes with another thread (owner counts are
+// not atomic: escape.fd "Parallel reporting pass"). It lexes a copy of each
+// of its texts (lex_own_str) with a keyword cache of its own (own_kw, not
+// g_lex_not_kw), and only reads the globals below, which are set before
+// the spawns and reset after the last await. Spawn arguments must be
+// @send: a worker gets its number and reads its list of texts from
+// g_lex_par_plan.
+
+/// The tokens of one text and the lexer's messages (none: it lexed clean).
+pub struct LexedText {
+    pub tokens: Vec<Token>,
+    pub errors: Vec<str>,
+}
+
+pub var g_lex_par_texts: Vec<str> = Vec::new();
+// for each worker, the indexes into g_lex_par_texts it lexes, in order
+pub var g_lex_par_plan: Vec<Vec<i64>> = Vec::new();
+
+/// `s` in a buffer of its own: it shares no owner count with `s`.
+fn lex_own_str(s: str) -> str {
+    return p_str_adopt(p_str_send_copy(s as i64));
+}
+
+/// What Lexer::new(text).tokenize() gives, and its messages, lexed with a
+/// keyword cache of this lexer's own (nothing shared with another thread).
+pub fn lex_text_alone(text: str) -> LexedText {
+    var lx: Lexer = Lexer::new(text);
+    lx.own_kw = HashMap_new();
+    var toks: Vec<Token> = lx.tokenize();
+    HashMap_drop(lx.own_kw);
+    lx.own_kw = 0;
+    var errs: Vec<str> = lx.errors;
+    return LexedText {
+        tokens: toks, errors: errs
+    };
+}
+
+/// A worker of lex_texts_par: the texts of its plan, each lexed alone, in
+/// the plan's order.
+pub fn lex_par_worker(w: i64) -> Vec<LexedText> {
+    var out: Vec<LexedText> = Vec::new();
+    var k: i64 = 0;
+    while k < g_lex_par_plan.get(w).len() {
+        var at: i64 = g_lex_par_plan.get(w).get(k);
+        out.push(lex_text_alone(lex_own_str(g_lex_par_texts.get(at))));
+        k = k + 1;
+    }
+    return out;
+}
+
+/// Which texts each of at most `nw` workers lexes: the texts by size,
+/// largest first (the first of equal ones first), each to the worker with
+/// the fewest bytes so far (the first of equal ones); a worker's list in
+/// text order. One list per worker, min(nw, number of texts) lists.
+pub fn lex_par_plan(sizes: Vec<i64>, nw: i64) -> Vec<Vec<i64>> {
+    var n: i64 = sizes.len();
+    var nb: i64 = nw;
+    if nb > n {
+        nb = n;
+    }
+    if nb < 1 {
+        nb = 1;
+    }
+    var taken: Vec<bool> = Vec::new();
+    var owner: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        taken.push(false);
+        owner.push(0);
+        i = i + 1;
+    }
+    var load: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < nb {
+        load.push(0);
+        b = b + 1;
+    }
+    var r: i64 = 0;
+    while r < n {
+        var best: i64 = - 1;
+        var j: i64 = 0;
+        while j < n {
+            if !taken.get(j) && (best < 0 || sizes.get(j) > sizes.get(best)) {
+                best = j;
+            }
+            j = j + 1;
+        }
+        taken.set(best, true);
+        var least: i64 = 0;
+        b = 1;
+        while b < nb {
+            if load.get(b) < load.get(least) {
+                least = b;
+            }
+            b = b + 1;
+        }
+        owner.set(best, least);
+        load.set(least, load.get(least) + sizes.get(best));
+        r = r + 1;
+    }
+    var plan: Vec<Vec<i64>> = Vec::new();
+    b = 0;
+    while b < nb {
+        var lst: Vec<i64> = Vec::new();
+        i = 0;
+        while i < n {
+            if owner.get(i) == b {
+                lst.push(i);
+            }
+            i = i + 1;
+        }
+        plan.push(lst);
+        b = b + 1;
+    }
+    return plan;
+}
+
+/// The tokens and messages of each of `texts`, in order, lexed in up to
+/// `nw` threads (FID_PAR); with fewer than two workers or texts, lexed
+/// here one after another. The same tokens either way.
+pub fn lex_texts_par(texts: Vec<str>, nw: i64) -> Vec<LexedText> {
+    var out: Vec<LexedText> = Vec::new();
+    var n: i64 = texts.len();
+    var i: i64 = 0;
+    if nw < 2 || n < 2 {
+        while i < n {
+            out.push(lex_text_alone(texts.get(i)));
+            i = i + 1;
+        }
+        return out;
+    }
+    var sizes: Vec<i64> = Vec::new();
+    while i < n {
+        sizes.push(str_len(texts.get(i)));
+        i = i + 1;
+    }
+    var plan: Vec<Vec<i64>> = lex_par_plan(sizes, nw);
+    // where each text's result is: its worker, and its place in that list
+    var res_w: Vec<i64> = Vec::new();
+    var res_k: Vec<i64> = Vec::new();
+    i = 0;
+    while i < n {
+        res_w.push(0);
+        res_k.push(0);
+        i = i + 1;
+    }
+    var w: i64 = 0;
+    while w < plan.len() {
+        var k: i64 = 0;
+        while k < plan.get(w).len() {
+            var t: i64 = plan.get(w).get(k);
+            res_w.set(t, w);
+            res_k.set(t, k);
+            k = k + 1;
+        }
+        w = w + 1;
+    }
+    g_lex_par_texts = texts;
+    g_lex_par_plan = plan;
+    var futs: Vec<Future<Vec<LexedText>> > = Vec::new();
+    w = 0;
+    while w < plan.len() {
+        futs.push(spawn lex_par_worker(w));
+        w = w + 1;
+    }
+    var got: Vec<Vec<LexedText>> = Vec::new();
+    w = 0;
+    while w < futs.len() {
+        var part: Vec<LexedText> = await futs.get(w);
+        got.push(part);
+        w = w + 1;
+    }
+    g_lex_par_texts = Vec::new();
+    g_lex_par_plan = Vec::new();
+    i = 0;
+    while i < n {
+        out.push(got.get(res_w.get(i)).get(res_k.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// SP9: the modules a file imports, read from its tokens without a parse:
+/// the path of each `use` outside braces, as parse_use puts it in
+/// ImportDef.path (`a::b` for `use a::b;`, `use a::b as c;`,
+/// `use a::b::{x, y};` and `use a::b::*;`), in order, each once. A `use` in
+/// a body or an impl is not an import of the module.
+pub fn token_use_paths(toks: Vec<Token>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var depth: i64 = 0;
+    var n: i64 = toks.len();
+    var i: i64 = 0;
+    while i < n {
+        var k: TokenKind = toks.get(i).kind;
+        if token_kind_eq(k, TokenKind::LBrace) {
+            depth = depth + 1;
+            i = i + 1;
+        } else if token_kind_eq(k, TokenKind::RBrace) {
+            if depth > 0 {
+                depth = depth - 1;
+            }
+            i = i + 1;
+        } else if depth == 0 && token_kind_eq(k, TokenKind::Use) {
+            var path: str = "";
+            var j: i64 = i + 1;
+            while j < n {
+                var kj: TokenKind = toks.get(j).kind;
+                var name: str = "";
+                match kj {
+                    TokenKind::Ident(s: str) => {
+                        name = s;
+                    }
+                    _ => {
+                        if is_word_keyword(kj) {
+                            name = token_kind_to_str(kj);
+                        }
+                    }
+                }
+                if str_len(name) == 0 {
+                    break;
+                }
+                path = path + name;
+                j = j + 1;
+                if j < n && token_kind_eq(toks.get(j).kind, TokenKind::DoubleColon) {
+                    path = path + "::";
+                    j = j + 1;
+                } else {
+                    break;
+                }
+            }
+            if str_ends_with(path, "::") {
+                path = str_slice(path, 0, str_len(path) - 2);
+            }
+            if str_len(path) > 0 && !HashMap_contains(seen, path) {
+                HashMap_insert(seen, path, 1);
+                out.push(path);
+            }
+            // the token after the path (`;`, `as`, `{`, `*`) is looked at next
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    HashMap_drop(seen);
+    return out;
+}
+
+/// SP9: the modules of an import closure, in the order they were found
+/// (breadth first from the program's own imports): each one's import path,
+/// its file ("" when none was found) and the modules it imports (indexes
+/// into names; "core" is left out, as the import loop skips it).
+pub struct ModGraph {
+    pub names: Vec<str>,
+    pub files: Vec<str>,
+    pub deps: Vec<Vec<i64>>,
+}
+
+pub fn ModGraph_new() -> ModGraph {
+    return ModGraph {
+        names: Vec::new(), files: Vec::new(), deps: Vec::new()
+    };
+}
+
+/// Each module's level: 0 when it imports none of the others, else one
+/// more than the highest level of those it imports. Modules of one level
+/// do not import each other, directly or through others, so they can be
+/// worked on at the same time once the levels below them are done. A
+/// module on an import cycle, or importing one, gets -1 (those stay in the
+/// import loop's order). An index out of range, or a module importing
+/// itself, is no dependency.
+pub fn modgraph_levels(deps: Vec<Vec<i64>>) -> Vec<i64> {
+    var n: i64 = deps.len();
+    var level: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        level.push(- 1);
+        i = i + 1;
+    }
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        i = 0;
+        while i < n {
+            if level.get(i) < 0 {
+                var ok: bool = true;
+                var lv: i64 = 0;
+                var j: i64 = 0;
+                while j < deps.get(i).len() {
+                    var t: i64 = deps.get(i).get(j);
+                    if t >= 0 && t < n && t != i {
+                        if level.get(t) < 0 {
+                            ok = false;
+                            break;
+                        }
+                        if level.get(t) + 1 > lv {
+                            lv = level.get(t) + 1;
+                        }
+                    }
+                    j = j + 1;
+                }
+                if ok {
+                    level.set(i, lv);
+                    changed = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return level;
+}
+
+/// `<n> modules, <l> levels, widest <w>` and, when some are, `, <c> on a
+/// cycle`: how many of the modules the levels of modgraph_levels let be
+/// worked on together.
+pub fn modgraph_summary(levels: Vec<i64>) -> str {
+    var top: i64 = - 1;
+    var cyc: i64 = 0;
+    var i: i64 = 0;
+    while i < levels.len() {
+        if levels.get(i) < 0 {
+            cyc = cyc + 1;
+        } else if levels.get(i) > top {
+            top = levels.get(i);
+        }
+        i = i + 1;
+    }
+    var widest: i64 = 0;
+    var lv: i64 = 0;
+    while lv <= top {
+        var w: i64 = 0;
+        i = 0;
+        while i < levels.len() {
+            if levels.get(i) == lv {
+                w = w + 1;
+            }
+            i = i + 1;
+        }
+        if w > widest {
+            widest = w;
+        }
+        lv = lv + 1;
+    }
+    var s: str = int_to_str(levels.len()) + " modules, " + int_to_str(top + 1) + " levels, widest " + int_to_str(widest);
+    if cyc > 0 {
+        s = s + ", " + int_to_str(cyc) + " on a cycle";
+    }
+    return s;
 }

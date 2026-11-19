@@ -1,8 +1,9 @@
 # 0001: Values, copy-on-write collections, equality by content
 
-- **Status:** accepted; partly implemented. `==` by content is done.
-  Copy-on-write is written and not on in the verified compiler: today
-  `var b = a` on a `Vec` still aliases (Nov 6, see below).
+- **Status:** superseded by proposal 0004 (one ownership rule) for the
+  memory model; decision recorded in 0006-m5-ownership-replaces-cow.md
+  (`LOWER_COW` removed Nov 17). What stands: values are values (`var b = a`
+  gives `b` a value of its own), and `==` by content is done.
 - **Decision:** accepted on 2026-11-02 (release M4, M5). `Vec`, `str` and
   `HashMap` are copy-on-write values; structs are values; `==` on a struct
   compares its fields.

@@ -1,0 +1,387 @@
+// Fides battery management: cell models, state of charge, health, balancing
+//
+// Pure computation; the seam is the caller, which supplies measured cell
+// voltages, currents and temperatures and acts on the balancing decisions
+// (switching bleed resistors is hardware). Sign convention: current > 0 is
+// discharge, < 0 is charge; SoC is a fraction 0..1, capacity in Ah.
+// - Open-circuit voltage as a function of SoC: a monotone table with linear
+//   interpolation, its slope, and its inverse (SoC from a rested voltage).
+// - Equivalent circuits (Plett, "Battery Management Systems", vol. 1, ch. 2):
+//   Rint (R0 only), Thevenin 1RC and 2RC. RC branches are advanced with the
+//   exact zero-order-hold solution v' = a v + R (1 - a) i, a = e^(-dt/RC),
+//   so any step length is stable. Terminal voltage
+//   v = OCV(SoC) - R0 i - v1 - v2.
+// - Coulomb counting with a coulombic efficiency on charge.
+// - An extended Kalman filter (Plett, vol. 2, ch. 3) on the state
+//   [SoC, v1] of the 1RC model, correcting coulomb counting with the
+//   measured terminal voltage through the OCV table's slope.
+// - State of health from capacity fade (measured / rated capacity) and from
+//   resistance growth (between new and end-of-life resistance), and a
+//   capacity estimate from two rested OCV points and the charge moved.
+// - Passive balancing: bleed every cell more than a threshold above the
+//   lowest one (above a minimum voltage), and the charge a bleed resistor
+//   removes in a given time.
+// - Pack aggregation of an s-series p-parallel pack: voltage, capacity (the
+//   weakest series group), available charge, SoC, energy and cell spread.
+
+module bms;
+use math;
+use vec;
+
+/// OCV against SoC; `soc` strictly increasing from 0 to 1.
+pub struct OcvTable {
+    pub soc: Vec<f64>,
+    pub ocv: Vec<f64>,
+}
+
+/// Equivalent-circuit parameters. r1 = 0 removes the first RC branch
+/// (Rint), r2 = 0 the second (1RC).
+pub struct CellModel {
+    pub capacity_ah: f64,
+    pub r0: f64,
+    pub r1: f64,
+    pub c1: f64,
+    pub r2: f64,
+    pub c2: f64,
+    pub eta_charge: f64,
+    pub ocv: OcvTable,
+}
+
+pub struct CellState {
+    pub soc: f64,
+    pub v1: f64,
+    pub v2: f64,
+}
+
+// ─── OCV table ───
+
+pub fn bms_ocv_table(soc: Vec<f64>, ocv: Vec<f64>) -> OcvTable {
+    if soc.len() != ocv.len() || soc.len() < 2 {
+        panic("bms_ocv_table: need two equal-length columns");
+    }
+    return OcvTable {
+        soc: soc, ocv: ocv
+    };
+}
+
+fn bms_seg(t: &OcvTable, s: f64) -> i64 {
+    val n: i64 = t.soc.len();
+    var i: i64 = 0;
+    while i < n - 2 && s > t.soc.get(i + 1) {
+        i = i + 1;
+    }
+    return i;
+}
+
+/// OCV at SoC s (clamped to the table).
+pub fn bms_ocv(t: &OcvTable, s: f64) -> f64 {
+    val n: i64 = t.soc.len();
+    if s <= t.soc.get(0) {
+        return t.ocv.get(0);
+    }
+    if s >= t.soc.get(n - 1) {
+        return t.ocv.get(n - 1);
+    }
+    val i: i64 = bms_seg(t, s);
+    val f: f64 = (s - t.soc.get(i)) / (t.soc.get(i + 1) - t.soc.get(i));
+    return t.ocv.get(i) + f * (t.ocv.get(i + 1) - t.ocv.get(i));
+}
+
+/// dOCV/dSoC at s (the slope of the segment holding s).
+pub fn bms_ocv_slope(t: &OcvTable, s: f64) -> f64 {
+    var x: f64 = math_clamp_f64(s, t.soc.get(0), t.soc.get(t.soc.len() - 1));
+    val i: i64 = bms_seg(t, x);
+    return (t.ocv.get(i + 1) - t.ocv.get(i)) / (t.soc.get(i + 1) - t.soc.get(i));
+}
+
+/// SoC of a rested cell at voltage v (inverse of the table, clamped).
+pub fn bms_soc_from_ocv(t: &OcvTable, v: f64) -> f64 {
+    val n: i64 = t.ocv.len();
+    if v <= t.ocv.get(0) {
+        return t.soc.get(0);
+    }
+    if v >= t.ocv.get(n - 1) {
+        return t.soc.get(n - 1);
+    }
+    var i: i64 = 0;
+    while i < n - 2 && v > t.ocv.get(i + 1) {
+        i = i + 1;
+    }
+    val f: f64 = (v - t.ocv.get(i)) / (t.ocv.get(i + 1) - t.ocv.get(i));
+    return t.soc.get(i) + f * (t.soc.get(i + 1) - t.soc.get(i));
+}
+
+// ─── Cell models ───
+
+pub fn bms_rint(capacity_ah: f64, r0: f64, ocv: OcvTable) -> CellModel {
+    return CellModel {
+        capacity_ah: capacity_ah, r0: r0, r1: 0.0, c1: 1.0, r2: 0.0, c2: 1.0, eta_charge: 1.0, ocv: ocv
+    };
+}
+
+pub fn bms_thevenin(capacity_ah: f64, r0: f64, r1: f64, c1: f64, ocv: OcvTable) -> CellModel {
+    return CellModel {
+        capacity_ah: capacity_ah, r0: r0, r1: r1, c1: c1, r2: 0.0, c2: 1.0, eta_charge: 1.0, ocv: ocv
+    };
+}
+
+pub fn bms_thevenin2(capacity_ah: f64, r0: f64, r1: f64, c1: f64, r2: f64, c2: f64, ocv: OcvTable) -> CellModel {
+    return CellModel {
+        capacity_ah: capacity_ah, r0: r0, r1: r1, c1: c1, r2: r2, c2: c2, eta_charge: 1.0, ocv: ocv
+    };
+}
+
+pub fn bms_cell_state(soc: f64) -> CellState {
+    return CellState {
+        soc: soc, v1: 0.0, v2: 0.0
+    };
+}
+
+/// Terminal voltage for the present state and current.
+pub fn bms_terminal_voltage(m: &CellModel, s: &CellState, current: f64) -> f64 {
+    return bms_ocv(&m.ocv, s.soc) - m.r0 * current - s.v1 - s.v2;
+}
+
+fn bms_soc_delta(m: &CellModel, current: f64, dt: f64) -> f64 {
+    var eta: f64 = 1.0;
+    if current < 0.0 {
+        eta = m.eta_charge;
+    }
+    return 0.0 - eta * current * dt / (3600.0 * m.capacity_ah);
+}
+
+/// Advance the cell by dt seconds at a constant current; returns the
+/// terminal voltage at the end of the step.
+pub fn bms_cell_step(m: &CellModel, s: &mut CellState, current: f64, dt: f64) -> f64 {
+    s.soc = s.soc + bms_soc_delta(m, current, dt);
+    if m.r1 > 0.0 {
+        val a1: f64 = math_exp(0.0 - dt / (m.r1 * m.c1));
+        s.v1 = a1 * s.v1 + m.r1 * (1.0 - a1) * current;
+    }
+    if m.r2 > 0.0 {
+        val a2: f64 = math_exp(0.0 - dt / (m.r2 * m.c2));
+        s.v2 = a2 * s.v2 + m.r2 * (1.0 - a2) * current;
+    }
+    return bms_terminal_voltage(m, s, current);
+}
+
+// ─── Coulomb counting ───
+
+pub struct CoulombCounter {
+    pub soc: f64,
+    pub capacity_ah: f64,
+    pub eta_charge: f64,
+    pub ah_out: f64,
+    pub ah_in: f64,
+}
+
+pub fn bms_coulomb_counter(soc: f64, capacity_ah: f64, eta_charge: f64) -> CoulombCounter {
+    return CoulombCounter {
+        soc: soc, capacity_ah: capacity_ah, eta_charge: eta_charge, ah_out: 0.0, ah_in: 0.0
+    };
+}
+
+pub fn CoulombCounter_step(c: &mut CoulombCounter, current: f64, dt: f64) -> f64 {
+    val ah: f64 = current * dt / 3600.0;
+    if current >= 0.0 {
+        c.ah_out = c.ah_out + ah;
+        c.soc = c.soc - ah / c.capacity_ah;
+    } else {
+        c.ah_in = c.ah_in - ah;
+        c.soc = c.soc - c.eta_charge * ah / c.capacity_ah;
+    }
+    return c.soc;
+}
+
+// ─── Extended Kalman filter (1RC) ───
+
+pub struct BmsEkf {
+    pub soc: f64,
+    pub v1: f64,
+    pub p00: f64,
+    pub p01: f64,
+    pub p11: f64,
+    pub q_soc: f64,
+    pub q_v1: f64,
+    pub r_v: f64,
+    pub model: CellModel,
+}
+
+/// An EKF starting at soc0 with variance p_soc; q_* process noise
+/// variances, r_v the voltage measurement variance (V^2).
+pub fn bms_ekf(model: CellModel, soc0: f64, p_soc: f64, q_soc: f64, q_v1: f64, r_v: f64) -> BmsEkf {
+    return BmsEkf {
+        soc: soc0, v1: 0.0, p00: p_soc, p01: 0.0, p11: 0.0001, q_soc: q_soc, q_v1: q_v1, r_v: r_v, model: model
+    };
+}
+
+/// One predict/correct cycle with the current over the last dt seconds and
+/// the terminal voltage measured at its end. Returns the SoC estimate.
+pub fn BmsEkf_step(e: &mut BmsEkf, current: f64, v_meas: f64, dt: f64) -> f64 {
+    // predict
+    var a: f64 = 0.0;
+    if e.model.r1 > 0.0 {
+        a = math_exp(0.0 - dt / (e.model.r1 * e.model.c1));
+    }
+    e.soc = e.soc + bms_soc_delta(&e.model, current, dt);
+    e.v1 = a * e.v1 + e.model.r1 * (1.0 - a) * current;
+    // P = A P A^T + Q, A = diag(1, a)
+    val p00: f64 = e.p00 + e.q_soc;
+    val p01: f64 = a * e.p01;
+    val p11: f64 = a * a * e.p11 + e.q_v1;
+    // correct: h = OCV(soc) - v1 - R0 i, H = [dOCV/dsoc, -1]
+    val h0: f64 = bms_ocv_slope(&e.model.ocv, e.soc);
+    val h1: f64 = -1.0;
+    val pred: f64 = bms_ocv(&e.model.ocv, e.soc) - e.v1 - e.model.r0 * current;
+    // P H^T
+    val ph0: f64 = p00 * h0 + p01 * h1;
+    val ph1: f64 = p01 * h0 + p11 * h1;
+    val s: f64 = h0 * ph0 + h1 * ph1 + e.r_v;
+    val k0: f64 = ph0 / s;
+    val k1: f64 = ph1 / s;
+    val innov: f64 = v_meas - pred;
+    e.soc = math_clamp_f64(e.soc + k0 * innov, 0.0, 1.0);
+    e.v1 = e.v1 + k1 * innov;
+    // P = (I - K H) P (symmetric form kept by recomputing from the parts)
+    e.p00 = p00 - k0 * ph0;
+    e.p01 = p01 - k0 * ph1;
+    e.p11 = p11 - k1 * ph1;
+    return e.soc;
+}
+
+// ─── State of health ───
+
+/// Capacity SoH: measured / rated capacity.
+pub fn bms_soh_capacity(measured_ah: f64, rated_ah: f64) -> f64 {
+    return measured_ah / rated_ah;
+}
+
+/// Resistance SoH: 1 when r == r_new, 0 when r reaches r_eol.
+pub fn bms_soh_resistance(r: f64, r_new: f64, r_eol: f64) -> f64 {
+    return math_clamp_f64((r_eol - r) / (r_eol - r_new), 0.0, 1.0);
+}
+
+/// Capacity from two rested voltages and the charge moved between them
+/// (Ah, positive when discharged).
+pub fn bms_capacity_from_ocv(t: &OcvTable, v_start: f64, v_end: f64, ah_moved: f64) -> f64 {
+    val ds: f64 = bms_soc_from_ocv(t, v_start) - bms_soc_from_ocv(t, v_end);
+    return math_fabs(ah_moved / ds);
+}
+
+/// Remaining equivalent full cycles to end of life, from a linear fade
+/// rate (fraction of rated capacity lost per cycle) and the EOL threshold.
+pub fn bms_cycles_to_eol(soh: f64, fade_per_cycle: f64, eol_soh: f64) -> f64 {
+    if fade_per_cycle <= 0.0 {
+        return 1.0e30;
+    }
+    return math_max_f64(0.0, (soh - eol_soh) / fade_per_cycle);
+}
+
+// ─── Passive balancing ───
+
+/// Which cells to bleed: those more than `threshold` volts above the
+/// lowest cell, when they are at least `min_voltage`.
+pub fn bms_balance_decisions(voltages: &Vec<f64>, threshold: f64, min_voltage: f64) -> Vec<bool> {
+    var vmin: f64 = 1.0e30;
+    var i: i64 = 0;
+    while i < voltages.len() {
+        vmin = math_min_f64(vmin, voltages.get(i));
+        i = i + 1;
+    }
+    var out: Vec<bool> = Vec::new();
+    i = 0;
+    while i < voltages.len() {
+        val v: f64 = voltages.get(i);
+        out.push(v - vmin > threshold && v >= min_voltage);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Charge (Ah) a bleed resistor of r_bleed ohms removes from a cell at
+/// voltage v in `seconds`.
+pub fn bms_bleed_ah(v: f64, r_bleed: f64, seconds: f64) -> f64 {
+    return v / r_bleed * seconds / 3600.0;
+}
+
+/// Seconds of bleeding needed to remove the charge between two SoCs.
+pub fn bms_bleed_time(soc_high: f64, soc_target: f64, capacity_ah: f64, v: f64, r_bleed: f64) -> f64 {
+    return (soc_high - soc_target) * capacity_ah * 3600.0 / (v / r_bleed);
+}
+
+// ─── Pack aggregation ───
+
+/// s series groups of p cells in parallel; cell k of group g is at
+/// index g * p + k of `cells` and `capacity_ah`.
+pub struct BmsPack {
+    pub series: i64,
+    pub parallel: i64,
+    pub capacity_ah: Vec<f64>,
+    pub cells: Vec<CellState>,
+}
+
+pub struct PackSummary {
+    pub voltage: f64,
+    pub capacity_ah: f64,
+    pub available_ah: f64,
+    pub soc: f64,
+    pub energy_wh: f64,
+    pub v_min: f64,
+    pub v_max: f64,
+    pub weakest_group: i64,
+}
+
+pub fn bms_pack(series: i64, parallel: i64) -> BmsPack {
+    return BmsPack {
+        series: series, parallel: parallel, capacity_ah: Vec::new(), cells: Vec::new()
+    };
+}
+
+pub fn BmsPack_add_cell(p: &mut BmsPack, capacity_ah: f64, soc: f64) {
+    p.capacity_ah.push(capacity_ah);
+    p.cells.push(bms_cell_state(soc));
+}
+
+/// Summary at rest (OCV of every cell from the table `t`). Each parallel
+/// group sits at the capacity-weighted mean OCV; the pack's capacity and
+/// available charge are those of its weakest group. `energy_wh` is the
+/// stored charge of every cell times its present OCV (an estimate).
+pub fn BmsPack_summary(p: &BmsPack, t: &OcvTable) -> PackSummary {
+    var volt: f64 = 0.0;
+    var cap: f64 = 1.0e30;
+    var avail: f64 = 1.0e30;
+    var energy: f64 = 0.0;
+    var vmin: f64 = 1.0e30;
+    var vmax: f64 = -1.0e30;
+    var weakest: i64 = 0;
+    var g: i64 = 0;
+    while g < p.series {
+        var gcap: f64 = 0.0;
+        var gav: f64 = 0.0;
+        var gv: f64 = 0.0;
+        var k: i64 = 0;
+        while k < p.parallel {
+            val idx: i64 = g * p.parallel + k;
+            val q: f64 = p.capacity_ah.get(idx);
+            val s: f64 = p.cells.get(idx).soc;
+            val v: f64 = bms_ocv(t, s);
+            gcap = gcap + q;
+            gav = gav + q * s;
+            gv = gv + q * v;
+            energy = energy + q * s * v;
+            vmin = math_min_f64(vmin, v);
+            vmax = math_max_f64(vmax, v);
+            k = k + 1;
+        }
+        volt = volt + gv / gcap;
+        cap = math_min_f64(cap, gcap);
+        if gav < avail {
+            avail = gav;
+            weakest = g;
+        }
+        g = g + 1;
+    }
+    return PackSummary {
+        voltage: volt, capacity_ah: cap, available_ah: avail, soc: avail / cap, energy_wh: energy, v_min: vmin, v_max: vmax, weakest_group: weakest
+    };
+}

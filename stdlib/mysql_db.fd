@@ -1,0 +1,244 @@
+// MySQL results as JSON rows, and a MySQL connection (module mysql) as a
+// `Database` (module db), as module sqlite and module postgres give them.
+//
+//   mysql_rows_json(&r)  -> the rows of a MysqlResult as a JSON array of
+//       objects, one key per column name: integer, float, double, decimal
+//       and year columns as JSON numbers, JSON columns as they are, NULL
+//       as null, everything else (strings, dates, times, blobs) as JSON
+//       strings. Text and binary (prepared statement) results alike.
+//   mysql_query_json(&mut c, sql), mysql_execute_json(&mut c, &stmt, args)
+//       -> the same for a query or an executed prepared statement ("[]"
+//       when it failed or returned no rows).
+//   Database for MysqlConn: query(sql) -> JSON rows, exec(sql) -> affected
+//       rows (-1 on an error), close() -> COM_QUIT.
+//
+// The Database methods take the connection by value, as the capability
+// does: a failure seen in one of them (a closed connection) is not
+// recorded in the caller's MysqlConn; check with mysql_query when that
+// matters.
+//
+// Usage:
+//   use mysql; use mysql_db; use db;
+//   var c: MysqlConn = mysql_connect(mysql_tcp_transport(sock), "app", "secret", "shop");
+//   println(mysql_query_json(& mut c, "SELECT id, name FROM users"));
+//   println(query_one(c, "SELECT COUNT(*) AS n FROM users"));     // {"n":3}
+
+module mysql_db;
+ use db; use json; use mysql;
+
+// Column types (protocol numbers; module mysql names most of them)
+const MJ_DECIMAL: i64 = 0;
+const MJ_TINY: i64 = 1;
+const MJ_SHORT: i64 = 2;
+const MJ_LONG: i64 = 3;
+const MJ_FLOAT: i64 = 4;
+const MJ_DOUBLE: i64 = 5;
+const MJ_LONGLONG: i64 = 8;
+const MJ_INT24: i64 = 9;
+const MJ_YEAR: i64 = 13;
+const MJ_JSON: i64 = 245;
+const MJ_NEWDECIMAL: i64 = 246;
+
+fn mj_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// True when `s` is a JSON number as it stands: -?digits(.digits)?
+/// ([eE][+-]?digits)?, leading zeros aside. MySQL writes its numbers so;
+/// anything else (an empty value, "inf", "nan") goes out as a string.
+pub fn mysql_json_is_number(s: str) -> bool {
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    if i < n && str_byte_at(s, i) == 45 {
+        i = i + 1;
+    }
+    val start: i64 = i;
+    while i < n && mj_digit(str_byte_at(s, i)) {
+        i = i + 1;
+    }
+    if i == start {
+        return false;
+    }
+    if i < n && str_byte_at(s, i) == 46 {
+        i = i + 1;
+        val frac: i64 = i;
+        while i < n && mj_digit(str_byte_at(s, i)) {
+            i = i + 1;
+        }
+        if i == frac {
+            return false;
+        }
+    }
+    if i < n && (str_byte_at(s, i) == 101 || str_byte_at(s, i) == 69) {
+        i = i + 1;
+        if i < n && (str_byte_at(s, i) == 43 || str_byte_at(s, i) == 45) {
+            i = i + 1;
+        }
+        val exp: i64 = i;
+        while i < n && mj_digit(str_byte_at(s, i)) {
+            i = i + 1;
+        }
+        if i == exp {
+            return false;
+        }
+    }
+    return i == n;
+}
+
+/// One value's JSON by its column type (`kind`, the protocol's number).
+pub fn mysql_json_value(kind: i64, text: str) -> str {
+    if kind == MJ_TINY || kind == MJ_SHORT || kind == MJ_LONG || kind == MJ_LONGLONG || kind == MJ_INT24 || kind == MJ_YEAR || kind == MJ_FLOAT || kind == MJ_DOUBLE || kind == MJ_DECIMAL || kind == MJ_NEWDECIMAL {
+        if mysql_json_is_number(text) {
+            return text;
+        }
+        return json_string(text);
+    }
+    if kind == MJ_JSON && json_is_valid(text) {
+        return text;
+    }
+    return json_string(text);
+}
+
+/// The rows of `r` as a JSON array of objects ("[]" without rows).
+pub fn mysql_rows_json(r: & MysqlResult) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    sb.append_str("[");
+    val ncols: i64 = r.columns.len();
+    var row: i64 = 0;
+    while row < r.nrows {
+        if row > 0 {
+            sb.append_str(",");
+        }
+        sb.append_str("{");
+        var col: i64 = 0;
+        while col < ncols {
+            if col > 0 {
+                sb.append_str(",");
+            }
+            val column: MysqlColumn = r.columns.get(col);
+            sb.append_str(json_string(column.name));
+            sb.append_str(":");
+            if mysql_is_null(r, row, col) {
+                sb.append_str("null");
+            } else {
+                sb.append_str(mysql_json_value(column.kind, mysql_cell(r, row, col)));
+            }
+            col = col + 1;
+        }
+        sb.append_str("}");
+        row = row + 1;
+    }
+    sb.append_str("]");
+    return sb.to_str();
+}
+
+/// COM_QUERY, the rows as JSON ("[]" on an error or without rows).
+pub fn mysql_query_json(c: & mut MysqlConn, sql: str) -> str {
+    val r: MysqlResult = mysql_query(c, sql);
+    if !r.ok {
+        return "[]";
+    }
+    return mysql_rows_json(& r);
+}
+
+/// COM_STMT_EXECUTE, the rows as JSON ("[]" on an error or without rows).
+pub fn mysql_execute_json(c: & mut MysqlConn, stmt: & MysqlStmt, params: Vec<MysqlParam>) -> str {
+    val r: MysqlResult = mysql_execute(c, stmt, params);
+    if !r.ok {
+        return "[]";
+    }
+    return mysql_rows_json(& r);
+}
+
+// ─── A TCP transport through the task runtime ─────────────────────────────
+
+/// How long a read waits for the server (ms).
+const MJ_TIMEOUT_MS: i64 = 30000;
+
+/// Send `bytes` on socket `sock` (p_co_send: other tasks run while it
+/// waits). The number sent, -1 on an error.
+pub fn mysql_co_send(sock: i64, bytes: Vec<i64>) -> i64 {
+    val n: i64 = bytes.len();
+    if n == 0 {
+        return 0;
+    }
+    var mem: i64 = p_malloc(n + 8);
+    var i: i64 = 0;
+    while i < n {
+        p_volatile_store8(mem + i, bytes.get(i));
+        i = i + 1;
+    }
+    val sent: i64 = p_co_send(sock, mem, n);
+    p_free(mem);
+    return sent;
+}
+
+/// Up to `max` bytes from socket `sock` ([] at the end, on an error or
+/// after 30 s without data).
+pub fn mysql_co_recv(sock: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if max <= 0 {
+        return out;
+    }
+    var mem: i64 = p_malloc(max + 8);
+    val n: i64 = p_co_recv(sock, mem, max, MJ_TIMEOUT_MS);
+    var k: i64 = 0;
+    while k < n {
+        out.push(p_volatile_load8(mem + k) & 255);
+        k = k + 1;
+    }
+    p_free(mem);
+    return out;
+}
+
+/// The transport over socket `sock` from p_co_connect.
+pub fn mysql_co_transport(sock: i64) -> MysqlTransport {
+    return MysqlTransport { conn: sock, send: mysql_co_send, recv: mysql_co_recv };
+}
+
+/// Connect to host:port and log in. `ok` false (`error` why) on failure;
+/// the socket is then closed.
+pub fn mysql_connect_tcp(host: str, port: i64, user: str, password: str, database: str) -> MysqlConn {
+    val sock: i64 = p_co_connect(host, port);
+    if sock < 0 {
+        // No socket: the handshake read fails at once, then say why
+        var none: MysqlConn = mysql_connect(mysql_co_transport(- 1), user, password, database);
+        none.ok = false;
+        none.error = "cannot connect to " + host + ":" + int_to_str(port);
+        return none;
+    }
+    val c: MysqlConn = mysql_connect(mysql_co_transport(sock), user, password, database);
+    if !c.ok {
+        p_socket_close(sock);
+    }
+    return c;
+}
+
+/// COM_QUIT and close the socket of a mysql_connect_tcp connection.
+pub fn mysql_close_tcp(c: & mut MysqlConn) {
+    mysql_close(c);
+    if c.tr.conn >= 0 {
+        p_socket_close(c.tr.conn);
+    }
+}
+
+impl Database for MysqlConn {
+    pub fn query (self: MysqlConn, sql: str) -> str {
+        var c: MysqlConn = self;
+        return mysql_query_json(& mut c, sql);
+    }
+
+    pub fn exec(self: MysqlConn, sql: str) -> i64 {
+        var c: MysqlConn = self;
+        val r: MysqlResult = mysql_query(& mut c, sql);
+        if !r.ok {
+            return - 1;
+        }
+        return r.affected_rows;
+    }
+
+    pub fn close(self: MysqlConn) {
+        var c: MysqlConn = self;
+        mysql_close(& mut c);
+    }
+}

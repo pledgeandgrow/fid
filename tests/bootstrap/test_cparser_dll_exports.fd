@@ -1,0 +1,69 @@
+// LG15 (fid, Windows): the DLL a native Windows program imports a header's
+// C function from when the declaration names no library. compiler/cparser.fd
+// cparse_dll_exports reads a DLL's export table; cparse_system_dll_of looks
+// in msvcrt.dll (the C library of the native backend) and then kernel32.dll
+// of the system folder. pe_ir uses it for `extern "C"` functions with no
+// `link` (or `link "c"`), so `@import("string.h")` and `@import("windows.h")`
+// functions link with no `link`. Needs Windows (the System32 DLLs).
+//
+// Expected output:
+// msvcrt exports ok
+// kernel32 exports ok
+// strspn from msvcrt.dll
+// lstrlenA from kernel32.dll
+// toupper from msvcrt.dll
+// unknown name: none
+// not a PE file: no exports
+
+use core;
+use vec;
+use string;
+use compiler::cparser;
+
+fn has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn main() -> i64 {
+    var root: str = "C:\\Windows";
+    match env_var("SystemRoot") {
+        Option::Some(r) => {
+            root = r;
+        }
+        Option::None => {
+        }
+    }
+    val crt: Vec<str> = cparse_dll_exports(root + "\\System32\\msvcrt.dll");
+    if crt.len() > 500 && has(crt, "strspn") && has(crt, "printf") {
+        println("msvcrt exports ok");
+    } else {
+        println("msvcrt exports FAILED: " + int_to_str(crt.len()));
+    }
+    val k32: Vec<str> = cparse_dll_exports(root + "\\System32\\kernel32.dll");
+    if k32.len() > 500 && has(k32, "lstrlenA") && has(k32, "ExitProcess") && !has(k32, "strspn") {
+        println("kernel32 exports ok");
+    } else {
+        println("kernel32 exports FAILED: " + int_to_str(k32.len()));
+    }
+    println("strspn from " + cparse_system_dll_of("strspn"));
+    println("lstrlenA from " + cparse_system_dll_of("lstrlenA"));
+    println("toupper from " + cparse_system_dll_of("toupper"));
+    if cparse_system_dll_of("fid_lg15_no_such_function") == "" {
+        println("unknown name: none");
+    } else {
+        println("unknown name: FAILED");
+    }
+    if cparse_dll_exports("tests/bootstrap/at_import/cinc.h").len() == 0 {
+        println("not a PE file: no exports");
+    } else {
+        println("not a PE file: FAILED");
+    }
+    return 0;
+}

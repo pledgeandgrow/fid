@@ -1,0 +1,67 @@
+// LF23 (compiler/iropt_me.fd ime_match_facts, FID_IROPT_ON=matchfacts):
+// in a match arm the scrutinee's tag is known, so a second test of the same
+// tag in the arm folds. It may not fold when the arm (or the code between
+// the tag's load and the branch) stores a new value into the scrutinee:
+// `retag` changes the variant inside the arm and tests it again. The
+// program prints the same with the pass on and off.
+//
+// Expected output:
+// 300
+// 16
+// 12
+// 1005
+// 49
+// 2
+// 1
+
+enum Shape {
+    Circle(i64),
+    Square(i64),
+    Rect(i64, i64),
+}
+
+fn area(s: Shape) -> i64 {
+    match s {
+        Shape::Circle(r) => { return 3 * r * r; }
+        Shape::Square(a) => { return a * a; }
+        Shape::Rect(w, h) => { return w * h; }
+    }
+}
+
+fn retag(s: Shape) -> i64 {
+    var t: Shape = s;
+    match t {
+        Shape::Circle(r) => {
+            // the variant changes inside the arm: the second test must see it
+            t = Shape::Square(r);
+            match t {
+                Shape::Square(a) => { return a + 1000; }
+                _ => { return 0; }
+            }
+        }
+        _ => { return area(t); }
+    }
+}
+
+fn kind_twice(s: Shape) -> i64 {
+    // the same tag tested twice with nothing changing it between
+    var k: i64 = 0;
+    match s {
+        Shape::Rect(_, _) => { k = 1; }
+        _ => { k = 2; }
+    }
+    match s {
+        Shape::Rect(_, _) => { return k * 1; }
+        _ => { return k; }
+    }
+}
+
+fn main() {
+    println(area(Shape::Circle(10)));
+    println(area(Shape::Square(4)));
+    println(area(Shape::Rect(3, 4)));
+    println(retag(Shape::Circle(5)));
+    println(retag(Shape::Square(7)));
+    println(kind_twice(Shape::Square(1)));
+    println(kind_twice(Shape::Rect(1, 2)));
+}

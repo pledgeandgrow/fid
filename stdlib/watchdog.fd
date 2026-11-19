@@ -1,0 +1,294 @@
+// Fides watchdog timer models, pure Fides.
+//
+//   - Independent watchdog (the STM32 IWDG layout: key register KR at
+//     0x00, prescaler PR at 0x04, reload RLR at 0x08, status SR at 0x0C,
+//     window WINR at 0x10; keys 0xCCCC start, 0x5555 unlock, 0xAAAA
+//     reload): prescaler divider 4 << PR (PR 0..6), 12-bit reload, the
+//     timeout (4 << PR) * (RL + 1) / f_LSI, the configuration for a wanted
+//     timeout (smallest prescaler, so the finest resolution), the timeout
+//     range over the LSI's tolerance, and the register write sequence;
+//   - window watchdog (the STM32 WWDG: 7-bit down-counter clocked by
+//     PCLK / 4096 / 2^WDGTB, reset when bit 6 clears (0x40 -> 0x3F) or
+//     when refreshed while the counter is above the window value W): tick
+//     length, timeout, the refresh window, and a tick-level simulation;
+//   - a generic down-counting watchdog simulation with an optional
+//     closed window, and a kick-discipline checker over a log of kick
+//     times that reports every reset a real watchdog would cause and the
+//     worst-case margin.
+//
+// The seam: writing KR/PR/RLR (or WWDG CR/CFR) is MMIO through the
+// caller's bus (regmap.fd's RegBus for instance); iwdg_write_sequence
+// returns the exact (offset, value) writes. Everything else is
+// computation and simulation.
+
+module watchdog;
+ use vec; use string;
+
+// ─── Independent watchdog ───────────────────────────────────────────────
+
+pub const IWDG_KR: i64 = 0x00;
+pub const IWDG_PR: i64 = 0x04;
+pub const IWDG_RLR: i64 = 0x08;
+pub const IWDG_SR: i64 = 0x0C;
+pub const IWDG_WINR: i64 = 0x10;
+pub const IWDG_KEY_START: i64 = 0xCCCC;
+pub const IWDG_KEY_UNLOCK: i64 = 0x5555;
+pub const IWDG_KEY_RELOAD: i64 = 0xAAAA;
+pub const IWDG_RL_MAX: i64 = 0xFFF;
+
+pub fn iwdg_divider(pr: i64) -> i64 {
+    if pr < 0 || pr > 6 { p_panic("watchdog: IWDG PR must be 0..6"); }
+    return 4 << pr;
+}
+
+/// Timeout in microseconds for PR, RL at an LSI of `lsi_hz`.
+pub fn iwdg_timeout_us(pr: i64, rl: i64, lsi_hz: i64) -> i64 {
+    return iwdg_divider(pr) * (rl + 1) * 1000000 / lsi_hz;
+}
+
+/// A configuration: prescaler code, reload, and the timeout it gives.
+pub struct IwdgConfig {
+    pub ok: bool,
+    pub pr: i64,
+    pub rl: i64,
+    pub timeout_us: i64,
+}
+
+/// The smallest prescaler that reaches `timeout_ms` (the finest reload
+/// step), reload rounded to the nearest count. ok = false when even PR 6
+/// with the full reload is too short or 1 count too long.
+pub fn iwdg_config_for(timeout_ms: i64, lsi_hz: i64) -> IwdgConfig {
+    var pr: i64 = 0;
+    while pr <= 6 {
+        val div: i64 = iwdg_divider(pr);
+        // counts = timeout * lsi / div, rounded
+        val counts: i64 = (timeout_ms * lsi_hz + div * 500) / (div * 1000);
+        if counts >= 1 && counts <= IWDG_RL_MAX + 1 {
+            return IwdgConfig { ok: true, pr: pr, rl: counts - 1, timeout_us: iwdg_timeout_us(pr, counts - 1, lsi_hz) };
+        }
+        pr = pr + 1;
+    }
+    return IwdgConfig { ok: false, pr: 6, rl: IWDG_RL_MAX, timeout_us: iwdg_timeout_us(6, IWDG_RL_MAX, lsi_hz) };
+}
+
+/// Timeout range in microseconds over an LSI tolerance [lo_hz, hi_hz]:
+/// [shortest (fastest clock), longest (slowest clock)].
+pub fn iwdg_timeout_range(pr: i64, rl: i64, lo_hz: i64, hi_hz: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(iwdg_timeout_us(pr, rl, hi_hz));
+    out.push(iwdg_timeout_us(pr, rl, lo_hz));
+    return out;
+}
+
+/// The register writes that start and configure the IWDG, as offset * 65536
+/// + value: start (the LSI starts too), unlock PR/RLR, PR, RLR, (WINR when
+/// windowed: writing it also reloads), wait for SR == 0 (marked offset
+/// 0x0C, value 0 = "poll until"), then the first reload.
+pub fn iwdg_write_sequence(c: IwdgConfig, window: i64) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    s.push(IWDG_KR * 65536 + IWDG_KEY_START);
+    s.push(IWDG_KR * 65536 + IWDG_KEY_UNLOCK);
+    s.push(IWDG_PR * 65536 + c.pr);
+    s.push(IWDG_RLR * 65536 + c.rl);
+    s.push(IWDG_SR * 65536 + 0);
+    if window >= 0 {
+        s.push(IWDG_WINR * 65536 + window);
+    } else {
+        s.push(IWDG_KR * 65536 + IWDG_KEY_RELOAD);
+    }
+    return s;
+}
+
+pub fn iwdg_seq_to_str(s: Vec<i64>) -> str {
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < s.len() {
+        val off: i64 = s.get(i) / 65536;
+        val v: i64 = s.get(i) % 65536;
+        var name: str = "KR";
+        if off == IWDG_PR { name = "PR"; }
+        if off == IWDG_RLR { name = "RLR"; }
+        if off == IWDG_SR { name = "SR"; }
+        if off == IWDG_WINR { name = "WINR"; }
+        if off == IWDG_SR {
+            parts.push("wait SR==0");
+        } else {
+            parts.push(name + "=" + wdg_hex(v));
+        }
+        i = i + 1;
+    }
+    return str_join(parts, " ");
+}
+
+fn wdg_hex(v: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    if v == 0 { return "0x0"; }
+    var out: str = "";
+    var x: i64 = v;
+    while x > 0 {
+        out = str_slice(d, x & 15, (x & 15) + 1) + out;
+        x = x >> 4;
+    }
+    return "0x" + out;
+}
+
+// ─── Window watchdog ────────────────────────────────────────────────────
+
+/// One WWDG counter tick in nanoseconds: 4096 * 2^WDGTB / PCLK.
+pub fn wwdg_tick_ns(pclk_hz: i64, wdgtb: i64) -> i64 {
+    return 4096 * (1 << wdgtb) * 1000000000 / pclk_hz;
+}
+
+/// Time from a refresh to T (0x40..0x7F) until the reset: T - 0x3F ticks.
+pub fn wwdg_timeout_ns(pclk_hz: i64, wdgtb: i64, t: i64) -> i64 {
+    return (t - 0x3F) * wwdg_tick_ns(pclk_hz, wdgtb);
+}
+
+/// The refresh window after reloading to T with window W: refreshing is
+/// allowed once the counter is <= W, i.e. from (T - W) ticks, and must
+/// happen before T - 0x3F ticks. [open_ns, close_ns].
+pub fn wwdg_window_ns(pclk_hz: i64, wdgtb: i64, t: i64, w: i64) -> Vec<i64> {
+    val tick: i64 = wwdg_tick_ns(pclk_hz, wdgtb);
+    var out: Vec<i64> = Vec::new();
+    var open: i64 = t - w;
+    if open < 0 { open = 0; }
+    out.push(open * tick);
+    out.push((t - 0x3F) * tick);
+    return out;
+}
+
+/// WWDG state, simulated tick by tick.
+pub struct WwdgSim {
+    pub counter: i64,
+    pub window: i64,
+    pub reset: bool,
+    pub reason: str,
+    pub ticks: i64,
+    pub ewi: bool,
+}
+
+pub fn wwdgsim_new(t: i64, w: i64) -> WwdgSim {
+    if t < 0x40 || t > 0x7F { p_panic("watchdog: WWDG T must be 0x40..0x7F"); }
+    return WwdgSim { counter: t, window: w & 0x7F, reset: false, reason: "", ticks: 0, ewi: false };
+}
+
+/// One counter tick. The early wakeup flag rises at 0x40; going below it
+/// resets.
+pub fn wwdgsim_tick(s: &mut WwdgSim) {
+    if s.reset { return; }
+    s.counter = s.counter - 1;
+    s.ticks = s.ticks + 1;
+    if s.counter == 0x40 { s.ewi = true; }
+    if s.counter < 0x40 {
+        s.reset = true;
+        s.reason = "counter reached 0x3F after " + int_to_str(s.ticks) + " ticks";
+    }
+}
+
+/// Refresh to `t`. Refreshing while the counter is above the window value
+/// resets.
+pub fn wwdgsim_refresh(s: &mut WwdgSim, t: i64) {
+    if s.reset { return; }
+    if s.counter > s.window {
+        s.reset = true;
+        s.reason = "refresh at counter " + wdg_hex(s.counter) + " above window " + wdg_hex(s.window);
+        return;
+    }
+    s.counter = t;
+    s.ticks = 0;
+    s.ewi = false;
+}
+
+// ─── Generic watchdog simulation ────────────────────────────────────────
+
+/// A down-counter reloaded by kicks. A kick sooner than `min_gap` ticks
+/// after the previous one is refused with a reset (closed window); no kick
+/// for `timeout` ticks resets.
+pub struct WdtSim {
+    pub timeout: i64,
+    pub min_gap: i64,
+    pub last_kick: i64,
+    pub now: i64,
+    pub reset_at: i64,
+    pub reason: str,
+    pub kicks: i64,
+}
+
+pub fn wdtsim_new(timeout: i64, min_gap: i64) -> WdtSim {
+    return WdtSim { timeout: timeout, min_gap: min_gap, last_kick: 0, now: 0, reset_at: -1, reason: "", kicks: 0 };
+}
+
+/// Advance time to `t` (no kick in between).
+pub fn wdtsim_advance(w: &mut WdtSim, t: i64) {
+    if w.reset_at >= 0 { return; }
+    if t - w.last_kick >= w.timeout {
+        w.reset_at = w.last_kick + w.timeout;
+        w.reason = "timeout: no kick for " + int_to_str(w.timeout);
+        w.now = w.reset_at;
+        return;
+    }
+    w.now = t;
+}
+
+/// A kick at time `t`.
+pub fn wdtsim_kick(w: &mut WdtSim, t: i64) {
+    wdtsim_advance(w, t);
+    if w.reset_at >= 0 { return; }
+    if w.min_gap > 0 && t - w.last_kick < w.min_gap {
+        w.reset_at = t;
+        w.reason = "early kick: " + int_to_str(t - w.last_kick) + " after the previous, window opens at " + int_to_str(w.min_gap);
+        return;
+    }
+    w.last_kick = t;
+    w.kicks = w.kicks + 1;
+}
+
+// ─── Kick discipline checker ────────────────────────────────────────────
+
+pub struct KickReport {
+    pub ok: bool,
+    pub violations: Vec<str>,
+    pub max_gap: i64,
+    pub min_gap: i64,
+    pub margin_pct: i64,
+}
+
+/// Check a log of kick times (sorted, the watchdog started at `start`)
+/// against `timeout` and an optional window `min_gap` (0: none), up to
+/// `end`. Each gap >= timeout is a reset ("late"), each gap < min_gap a
+/// reset ("early"). margin_pct: how much of the timeout the worst gap
+/// left unused (100 * (timeout - max_gap) / timeout).
+pub fn wdg_check_kicks(kicks: Vec<i64>, start: i64, end: i64, timeout: i64, min_gap: i64) -> KickReport {
+    var r: KickReport = KickReport { ok: true, violations: Vec::new(), max_gap: 0, min_gap: -1, margin_pct: 0 };
+    var prev: i64 = start;
+    var i: i64 = 0;
+    while i <= kicks.len() {
+        var t: i64 = end;
+        val is_kick: bool = i < kicks.len();
+        if is_kick { t = kicks.get(i); }
+        val gap: i64 = t - prev;
+        if gap > r.max_gap { r.max_gap = gap; }
+        if is_kick && (r.min_gap < 0 || gap < r.min_gap) { r.min_gap = gap; }
+        if gap >= timeout {
+            r.ok = false;
+            r.violations.push("late: reset at " + int_to_str(prev + timeout) + " (gap " + int_to_str(gap) + ")");
+        } else if is_kick && min_gap > 0 && gap < min_gap {
+            r.ok = false;
+            r.violations.push("early: kick at " + int_to_str(t) + " only " + int_to_str(gap) + " after " + int_to_str(prev));
+        }
+        prev = t;
+        i = i + 1;
+    }
+    r.margin_pct = 100 * (timeout - r.max_gap) / timeout;
+    return r;
+}
+
+/// Kick period that keeps `margin_pct` of the timeout in reserve and
+/// stays inside the window: midpoint of [min_gap, timeout * (100 -
+/// margin) / 100], or -1 when the window leaves no room.
+pub fn wdg_kick_period(timeout: i64, min_gap: i64, margin_pct: i64) -> i64 {
+    val hi: i64 = timeout * (100 - margin_pct) / 100;
+    if hi <= min_gap { return -1; }
+    if min_gap <= 0 { return hi; }
+    return (min_gap + hi) / 2;
+}

@@ -92,13 +92,10 @@ indented code blocks.
 
 ## Limits
 
-- Memory: the server uses `http_serve`, which keeps each request and its
-  response (about 130 KB per request of the largest page, measured on
-  Nov 15). `http_serve_scoped` frees them, but with the Nov 15 compiler a
-  scoped server dies with `Panic: Double free` in `http_conn_task` on the
-  end of the first connection (a five-line scoped server reproduces it). Switch to
-  `http_serve_scoped` when that is fixed (the handler then takes a
-  `ScopedRequest` and `str_clone`s the method and path).
+- Memory: the server uses `http_serve_scoped` (known-bugs 2g.35 is fixed):
+  each request's strings and its response are freed after the response,
+  so memory stays flat (tests/tooling/site-memory-check.sh; `http_serve`
+  kept about 130 KB per request of the largest page).
 - A page's sidebar reads the titles of its section's files on each request
   (about 30 ms for a reference page, through C); nothing is cached, so an
   edited page shows on the next request.

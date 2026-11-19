@@ -1,0 +1,115 @@
+// stdlib/sse: the four event-stream examples of the HTML standard (§9.2.5/9.2.6) parsed exactly, CRLF/CR/LF line ends, a BOM, retry and id handling, Last-Event-ID, encoding of multi-line data and comments, and a round trip fed in chunks of every size from 1 to 9 bytes (CRLF and UTF-8 split across chunks).
+// Expected output:
+// stock ticker: 1 event(s)
+//   type=message data="YHOO\n+2\n10" id=""
+// ids: 2 event(s)
+//   type=message data="first event" id="1"
+//   type=message data="second event" id=""
+// empty data: 2 event(s)
+//   type=message data="" id=""
+//   type=message data="\n" id=""
+// space after colon: 2 event(s)
+//   type=message data="test" id=""
+//   type=message data="test" id=""
+// crlf and cr: 2 event(s)
+//   type=add data="a" id=""
+//   type=remove data="b" id=""
+// bom + unknown field: 1 event(s)
+//   type=message data="x" id=""
+// retry 2500 last id 77 header [Last-Event-ID: 77]
+// next event keeps id: 77
+// dropped at end: true
+// encoded: id: 42\nevent: update\nretry: 3000\ndata: line 1\ndata: line 2\ndata: line 3\n\n
+// comment: : keep-alive\n retry: retry: 1000\n\n
+// bad id: []
+// plain message: data: hi\n\n
+// headers: Content-Type: text/event-stream; Cache-Control: no-cache; Connection: keep-alive
+// whole: greet|héllo wörld\n€ 5|1;tick|1|1;message|last|3;
+// chunk sizes 1..9 agree: true
+use sse;
+use vec;
+use string;
+
+fn esc(s: str) -> str {
+    return str_replace(str_replace(s, "\r", "\\r"), "\n", "\\n");
+}
+
+fn show(label: str, evs: Vec<SseEvent>) {
+    println(label + ": " + int_to_str(evs.len()) + " event(s)");
+    var i: i64 = 0;
+    while i < evs.len() {
+        val e: SseEvent = evs.get(i);
+        println("  type=" + e.event + " data=\"" + esc(e.data) + "\" id=\"" + e.id + "\"");
+        i = i + 1;
+    }
+}
+
+fn digest(evs: Vec<SseEvent>) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < evs.len() {
+        val e: SseEvent = evs.get(i);
+        o = o + e.event + "|" + e.data + "|" + e.id + ";";
+        i = i + 1;
+    }
+    return o;
+}
+
+fn main() -> i64 {
+    show("stock ticker", sse_parse("data: YHOO\ndata: +2\ndata: 10\n\n"));
+    show("ids", sse_parse(": test stream\n\ndata: first event\nid: 1\n\ndata:second event\nid\n\ndata:  third event\n"));
+    show("empty data", sse_parse("data\n\ndata\ndata\n\ndata:\n"));
+    show("space after colon", sse_parse("data:test\n\ndata: test\n\n"));
+    show("crlf and cr", sse_parse("event: add\r\ndata: a\r\n\r\nevent: remove\rdata: b\r\r"));
+    show("bom + unknown field", sse_parse("\u{FEFF}data: x\nfoo: bar\n\n"));
+
+    var p: SseParser = sse_parser_new();
+    sse_feed(& mut p, "retry: 2500\nretry: soon\nid: a\u{0000}b\nid: 77\n\n");
+    println("retry " + int_to_str(p.retry) + " last id " + p.last_id + " header [" + sse_last_event_id_header(& p) + "]");
+    val ev: Vec<SseEvent> = sse_feed(& mut p, "data: after\n\n");
+    println("next event keeps id: " + ev.get(0).id);
+    sse_feed(& mut p, "data: unfinished");
+    println("dropped at end: " + bool_to_str(sse_end(& mut p)));
+
+    // encoding
+    var e: SseEvent = sse_event("update", "line 1\nline 2\r\nline 3", "42");
+    e.retry = 3000;
+    val wire: str = sse_encode(e);
+    println("encoded: " + esc(wire));
+    println("comment: " + esc(sse_comment("keep-alive")) + " retry: " + esc(sse_retry(1000)));
+    println("bad id: [" + sse_encode(sse_event("", "x", "a\nb")) + "]");
+    println("plain message: " + esc(sse_encode(sse_event("", "hi", ""))));
+    println("headers: " + str_join(sse_response_headers(), "; "));
+
+    // a stream with CRLF, multi-byte UTF-8 and comments, fed in every chunk size
+    var stream: str = ": hello\r\n";
+    stream = stream + sse_encode(sse_event("greet", "héllo wörld\n€ 5", "1"));
+    stream = stream + "event: tick\r\ndata: 1\r\n\r\n";
+    stream = stream + sse_encode(sse_event("", "last", "3"));
+    val whole: str = digest(sse_parse(stream));
+    println("whole: " + esc(whole));
+    val bytes: Vec<i64> = str_bytes(stream);
+    var size: i64 = 1;
+    var all_same: bool = true;
+    while size <= 9 {
+        var q: SseParser = sse_parser_new();
+        var got: Vec<SseEvent> = Vec::new();
+        var off: i64 = 0;
+        while off < bytes.len() {
+            var chunk: Vec<i64> = Vec::new();
+            var k: i64 = 0;
+            while k < size && off + k < bytes.len() { chunk.push(bytes.get(off + k)); k = k + 1; }
+            off = off + size;
+            val evs: Vec<SseEvent> = sse_feed_bytes(& mut q, chunk);
+            var j: i64 = 0;
+            while j < evs.len() { got.push(evs.get(j)); j = j + 1; }
+        }
+        if digest(got) != whole {
+            all_same = false;
+            println("chunk size " + int_to_str(size) + " differs: " + esc(digest(got)));
+        }
+        size = size + 1;
+    }
+    println("chunk sizes 1..9 agree: " + bool_to_str(all_same));
+    return 0;
+}

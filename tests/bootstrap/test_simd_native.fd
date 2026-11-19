@@ -1,0 +1,176 @@
+// release-roadmap K10: `@simd` on the native paths. The machine layer's
+// loop vectorizer (compiler/nat_ir.fd, section "OP22: automatic loop
+// vectorization", ng_vz_*) takes more loops in a @simd function:
+// - a checked i64 `+` or `-` of element reads and invariants (outside
+//   @simd only a @wrapping one, or one checks.fd proved, is taken);
+// - a checked i64 `s = s + v[i]` reduction;
+// - its vector loop is unrolled twice (two vectors a trip, then one).
+// No overflow panic is lost: before the vector loop a vector pre-scan
+// checks that every element those operations read is in [-2^31, 2^31)
+// (and each invariant operand, the accumulator's start in [-2^61, 2^61)
+// and fewer than 2^30 iterations), so that no lane, and no order of the
+// sum, can overflow; when one is not, the vector loop is skipped and the
+// loop runs as written (and panics where it would have). The same
+// functions without @simd stay scalar, and an f64 sum stays scalar even
+// under @simd (its rounding depends on the order). `fid run` and the C
+// path run every loop as written: the output is the same on all paths.
+// tests/nattools/simd_native_check.sh checks the `[vectorize]` lines, the
+// images' output on every target, an overflow panic, and the speed.
+// Expected output:
+// n=0 sum=0 plain=0 add=17 sub=0 diff=17 fsum=0
+// n=1 sum=-835542111 plain=-835542111 add=-1079412611 sub=-835542118 diff=-591670557 fsum=-835542111
+// n=2 sum=-74680771 plain=-74680771 add=34043272099 sub=-74680785 diff=-18114212927 fsum=-74680771
+// n=3 sum=-337451516 plain=-337451516 add=-881768174733 sub=-337451537 diff=-562298709165 fsum=-337451516
+// n=4 sum=-1049223818 plain=-1049223818 add=36435169561061 sub=-1049223846 diff=-17431433370383 fsum=-1049223818
+// n=5 sum=228408291 plain=228408291 add=-732090194834663 sub=228408256 diff=-540308633582781 fsum=228408291
+// n=6 sum=-1334100757 plain=-1334100757 add=38590978563852247 sub=-1334100799 diff=-16751631963175007 fsum=-1334100757
+// n=7 sum=1585311486 plain=1585311486 add=-592720451558668689 sub=1585311437 diff=-519298526173079885 fsum=1585311486
+// n=8 sum=1731979484 plain=1731979484 add=3625823965320812153 sub=1731979428 diff=2348489763623587793 fsum=1731979484
+// n=9 sum=1941274133 plain=1941274133 add=-2000981028824158091 sub=1941274070 diff=-985712960677625437 fsum=1941274133
+// n=33 sum=-223212559 plain=-223212559 add=-2286575183360337315 sub=-223212790 diff=-4628904145237189149 fsum=-223212559
+// n=1001 sum=-9010881339 plain=-9010881339 add=6476459281085976213 sub=-9010888346 diff=3741540683362973347 fsum=-9010881339
+// big n=1001 sum=63683181880 add=6630051259745416435 sub=-1100630004051907 diff=-2791697387570492261
+// done
+
+/// a checked + reduction: vectorized under @simd
+@simd
+fn sum_i(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// the same without @simd: stays scalar
+fn sum_plain(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// a checked + of two element reads into a third Vec
+@simd
+fn add_into(c: & mut Vec<i64>, a: Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < a.len() {
+        c.set(i, a.get(i) + b.get(i));
+        i = i + 1;
+    }
+}
+
+/// a checked - of an invariant, the Vec written in place
+@simd
+fn sub_k(v: & mut Vec<i64>, k: i64) {
+    var i: i64 = 0;
+    while i < v.len() {
+        v.set(i, v.get(i) - k);
+        i = i + 1;
+    }
+}
+
+/// a checked - in a `for` loop
+@simd
+fn diff(c: & mut Vec<i64>, a: Vec<i64>, b: Vec<i64>) {
+    for i in 0..a.len() {
+        c[i] = a[i] - b[i];
+    }
+}
+
+/// an f64 sum stays scalar even under @simd
+@simd
+fn fsum(v: Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// values in [-2^30, 2^30) times `scale`
+fn data(n: i64, seed: i64, scale: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        v.push((x - 1073741824) * scale);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn zeros(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn floats(v: Vec<i64>) -> Vec<f64> {
+    var f: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        f.push(v.get(i) as f64);
+        i = i + 1;
+    }
+    return f;
+}
+
+/// a checksum of a Vec's elements and their order
+@wrapping
+fn hash(v: Vec<i64>) -> i64 {
+    var h: i64 = 17;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = h * 31 + v.get(i);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn line(n: i64) {
+    var a: Vec<i64> = data(n, 7 + n, 1);
+    var b: Vec<i64> = data(n, 99 + n, 1);
+    var c: Vec<i64> = zeros(n);
+    add_into(& mut c, a, b);
+    var d: Vec<i64> = zeros(n);
+    diff(& mut d, a, b);
+    var e: Vec<i64> = data(n, 7 + n, 1);
+    sub_k(& mut e, 7);
+    var fs: f64 = fsum(floats(a));
+    println("n=" + int_to_str(n) + " sum=" + int_to_str(sum_i(a)) + " plain=" + int_to_str(sum_plain(a)) + " add=" + int_to_str(hash(c)) + " sub=" + int_to_str(sum_i(e)) + " diff=" + int_to_str(hash(d)) + " fsum=" + int_to_str(fs as i64));
+}
+
+fn main() {
+    var n: i64 = 0;
+    while n <= 9 {
+        line(n);
+        n = n + 1;
+    }
+    line(33);
+    line(1001);
+    // elements past 2^31 and an invariant past 2^31: the pre-scan skips
+    // the vector loops, the results are those of the scalar loop
+    var a: Vec<i64> = data(1001, 5, 4);
+    var b: Vec<i64> = data(1001, 6, 4);
+    var c: Vec<i64> = zeros(1001);
+    add_into(& mut c, a, b);
+    var e: Vec<i64> = data(1001, 8, 1);
+    sub_k(& mut e, 1099511627776);
+    var d: Vec<i64> = zeros(1001);
+    diff(& mut d, data(1001, 3, 4), data(1001, 4, 4));
+    println("big n=1001 sum=" + int_to_str(sum_i(a)) + " add=" + int_to_str(hash(c)) + " sub=" + int_to_str(sum_i(e)) + " diff=" + int_to_str(hash(d)));
+    println("done");
+}

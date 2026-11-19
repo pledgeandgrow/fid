@@ -1,0 +1,115 @@
+// File handles (stdlib/fs.fd, roadmap L4B): create a file, write it in
+// pieces (text, a line, binary bytes with a NUL, a chunk past the handle's
+// buffer limit so write-outs happen while it is open), close it, then open
+// it and read it back in chunks, lines and bytes, with seek/tell, and
+// append. Expected output:
+//   create ok
+//   on disk before close: 12
+//   written 315
+//   size on disk 315
+//   line 1: alpha
+//   line 2: beta
+//   byte 0 1 255
+//   chunk sum ok
+//   eof true
+//   seek 7: beta
+//   read after close: 0
+//   append ok: 319
+//   tail: end
+//   missing: none
+use fs;
+
+fn main() -> i64 {
+    val path: str = "test_fs_handles.tmp";
+    match File::create(path) {
+        Option::Some(f) => {
+            var w: File = f;
+            println("create ok");
+            w.set_buffer_limit(10);
+            w.write_str("alpha\r\n");   // 7 pending
+            w.write_line("beta");       // 12 >= 10: written out
+            println("on disk before close: " + int_to_str(fs_file_size(path)));
+            var bin: Vec<i64> = Vec::new();
+            bin.push(0); bin.push(1); bin.push(255);
+            w.write(bin);
+            var big: Vec<i64> = Vec::new();
+            var i: i64 = 0;
+            while i < 300 { big.push(120); i = i + 1; }
+            w.write(big);
+            println("written " + int_to_str(w.tell()));
+            if !w.close() { println("close failed"); }
+        }
+        Option::None => { println("create failed"); return 1; }
+    }
+    println("size on disk " + int_to_str(fs_file_size(path)));
+    match File::open(path) {
+        Option::Some(f) => {
+            var r: File = f;
+            // bound first: `match r.read_line() { .. }` printed nothing on
+            // the interpreter (a match on a method call's Option<str>)
+            val l1: Option<str> = r.read_line();
+            match l1 {
+                Option::Some(l) => { println("line 1: " + l); }
+                Option::None => { println("line 1 missing"); }
+            }
+            val l2: Option<str> = r.read_line();
+            match l2 {
+                Option::Some(l) => { println("line 2: " + l); }
+                Option::None => { println("line 2 missing"); }
+            }
+            val b0: i64 = r.read_byte();
+            val b1: i64 = r.read_byte();
+            val b2: i64 = r.read_byte();
+            println("byte " + int_to_str(b0) + " " + int_to_str(b1) + " " + int_to_str(b2));
+            // the rest in 64-byte chunks
+            var total: i64 = 0;
+            var xs: i64 = 0;
+            var chunk: Vec<i64> = r.read(64);
+            while chunk.len() > 0 {
+                var j: i64 = 0;
+                while j < chunk.len() {
+                    if chunk.get(j) == 120 { xs = xs + 1; }
+                    j = j + 1;
+                }
+                total = total + chunk.len();
+                chunk = r.read(64);
+            }
+            if total == 300 && xs == 300 { println("chunk sum ok"); } else { println("chunk sum " + int_to_str(total) + " " + int_to_str(xs)); }
+            if r.at_eof() { println("eof true"); } else { println("eof false"); }
+            r.seek(7);
+            val t: i64 = r.tell();
+            println("seek " + int_to_str(t) + ": " + r.read_str(4));
+            r.close();
+            println("read after close: " + int_to_str(r.read(10).len()));
+        }
+        Option::None => { println("open failed"); return 1; }
+    }
+    match File::append(path) {
+        Option::Some(f) => {
+            var a: File = f;
+            a.write_str("end\n");
+            a.close();
+            println("append ok: " + int_to_str(fs_file_size(path)));
+        }
+        Option::None => { println("append failed"); }
+    }
+    match File::open(path) {
+        Option::Some(f) => {
+            var r: File = f;
+            r.seek(r.size() - 4);
+            val lt: Option<str> = r.read_line();
+            match lt {
+                Option::Some(l) => { println("tail: " + l); }
+                Option::None => { println("tail missing"); }
+            }
+            r.close();
+        }
+        Option::None => { println("reopen failed"); }
+    }
+    match File::open("test_fs_handles_missing.tmp") {
+        Option::Some(f) => { println("missing: opened"); }
+        Option::None => { println("missing: none"); }
+    }
+    fs_delete(path);
+    return 0;
+}

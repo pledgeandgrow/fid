@@ -1,7 +1,8 @@
 // Fides Zstandard standard library
 //
-// Pure-Fides Zstandard decoder (RFC 8878). Decoding only; there is no
-// compressor.
+// Pure-Fides Zstandard decoder (RFC 8878), and a compressor
+// (zstd_compress, zstd_compress_level, zstd_compress_str; see
+// "Compression" at the end of this file).
 //
 //   frames:     frame header (descriptor, window descriptor, frame content
 //               size, single-segment flag), raw / RLE / compressed blocks,
@@ -37,7 +38,7 @@
 //   val text = zstd_decompress_str(bytes);    // "" on error
 
 module zstd;
- use vec; use string;
+ use vec;
 // ─── Public result ──────────────────────────────────────────────────────
 
 /// The outcome of decoding a Zstandard stream. `ok` is false on malformed
@@ -1443,6 +1444,22 @@ pub fn zstd_decompress_limit(data: Vec<i64>, max_out: i64) -> Vec<i64> {
 
 /// Whether `data` is a valid Zstandard stream (it is decoded in full to
 /// find out; to keep the bytes as well, call zstd_decode once).
+///
+/// Example:
+///   // one frame: single segment, content size 2, one raw last block "hi"
+///   var f: Vec<i64> = Vec::new();
+///   f.push(0x28); f.push(0xB5); f.push(0x2F); f.push(0xFD);
+///   f.push(0x20); f.push(0x02);
+///   f.push(0x11); f.push(0x00); f.push(0x00);
+///   f.push(0x68); f.push(0x69);
+///   assert(zstd_ok(f));
+///   assert_eq(zstd_error(f), "");
+///   assert_eq(zstd_decompress_str(f), "hi");
+///   assert_eq(zstd_decompress(f).len(), 2);
+///   var bad: Vec<i64> = Vec::new();
+///   bad.push(1); bad.push(2);
+///   assert(!zstd_ok(bad));
+///   assert_eq(zstd_xxh64(Vec::new(), 0), -1205034819632174695);
 pub fn zstd_ok(data: Vec<i64>) -> bool {
     var r: ZstdResult = zstd_decode(data);
     return r.ok;
@@ -1465,4 +1482,1007 @@ pub fn zstd_decompress_str(data: Vec<i64>) -> str {
         i = i + 1;
     }
     return sb.to_str();
+}
+
+// ─── Compression ────────────────────────────────────────────────────────
+//
+// `zstd_compress_level(bytes, level)` writes one frame: single segment
+// (the window is the content size) up to 8 MB, an 8 MB window above; the
+// content size and the checksum are always written. The input is cut into
+// blocks of 128 KB, each written as the smallest of a raw block, an RLE
+// block (one repeated byte) and a compressed block:
+//   matches:   hash chains on 4-byte prefixes over the window (level 1: 4
+//              candidates, 3: 16, 6: 64 and one-step lazy matching, 9: 256,
+//              16 and up: 1024); the three repeat offsets are tried first
+//              and coded as repeat codes (RFC 8878 3.1.2.5)
+//   literals:  raw, RLE or Huffman-coded (code lengths at most 11 bits;
+//              weights direct or FSE-compressed, the shorter; one stream up
+//              to 1023 literals, four above)
+//   sequences: the predefined FSE tables (no table is transmitted)
+// Level 0 stores (raw and RLE blocks). No dictionaries, no custom sequence
+// tables, no treeless literals: the ratio is below zstd's at the same level.
+
+// Bit writer: bits go in least significant first. A backward stream (Huffman
+// literals, sequences, FSE weights) ends with a 1 marker bit and is read
+// from its end; an FSE table description is read forwards.
+struct ZcBits {
+    out: Vec<i64>,
+    acc: i64,
+    n: i64,
+}
+
+fn zc_bits_new() -> ZcBits {
+    return ZcBits {
+        out: Vec::new(), acc: 0, n: 0
+    };
+}
+
+fn zc_put(w: & mut ZcBits, v: i64, nbits: i64) {
+    if nbits <= 0 {
+        return;
+    }
+    w.acc = w.acc | ((v & ((1 << nbits) - 1)) << w.n);
+    w.n = w.n + nbits;
+    while w.n >= 8 {
+        w.out.push(w.acc & 255);
+        w.acc = w.acc >> 8;
+        w.n = w.n - 8;
+    }
+}
+
+// Pad the last byte with zero bits.
+fn zc_align(w: & mut ZcBits) {
+    if w.n > 0 {
+        w.out.push(w.acc & 255);
+        w.acc = 0;
+        w.n = 0;
+    }
+}
+
+// End a backward stream: the marker bit, then the last byte.
+fn zc_close(w: & mut ZcBits) {
+    zc_put(w, 1, 1);
+    zc_align(w);
+}
+
+fn zc_append(out: & mut Vec<i64>, src: Vec<i64>) {
+    var i: i64 = 0;
+    while i < src.len() {
+        out.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+// The encoder's view of an FSE decoding table (zs_fse_build):
+// enc[s * size + y] = x | nb << 16, the state x of symbol s from which the
+// decoder reaches state y by reading nb bits (whose value is y - base(x)).
+fn zc_encmap(t: ZsFse, nsym: i64) -> Vec<i64> {
+    var size: i64 = 1 << t.log;
+    var enc: Vec<i64> = Vec::filled(nsym * size, 0);
+    var x: i64 = 0;
+    while x < size {
+        var e: i64 = t.tab.get(x);
+        var nb: i64 = (e >> 8) & 255;
+        var base: i64 = e >> 16;
+        var row: i64 = (e & 255) * size;
+        var y: i64 = base;
+        var top: i64 = base + (1 << nb);
+        while y < top {
+            enc.set(row + y, x | (nb << 16));
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    return enc;
+}
+
+// Compression state of one frame: the input, hash chains (head per hash,
+// prev per position, positions below `ins` inserted), the search effort,
+// the repeat offsets as the decoder will hold them, the last match found
+// and the predefined sequence tables.
+struct ZcCtx {
+    data: Vec<i64>,
+    n: i64,
+    head: Vec<i64>,
+    prev: Vec<i64>,
+    hbits: i64,
+    ins: i64,
+    depth: i64,
+    lazy: bool,
+    win: i64,
+    r1: i64,
+    r2: i64,
+    r3: i64,
+    ml_len: i64,
+    ml_off: i64,
+    llt: ZsFse,
+    oft: ZsFse,
+    mlt: ZsFse,
+    llenc: Vec<i64>,
+    ofenc: Vec<i64>,
+    mlenc: Vec<i64>,
+    llcode: Vec<i64>,
+    mlcode: Vec<i64>,
+}
+
+fn zc_hash(d: Vec<i64>, p: i64, hbits: i64) -> i64 {
+    var v: i64 = d.get(p) | (d.get(p + 1) << 8) | (d.get(p + 2) << 16) | (d.get(p + 3) << 24);
+    return ((v * 739982445) >> 20) & ((1 << hbits) - 1);
+}
+
+fn zc_insert_upto(c: & mut ZcCtx, p: i64) {
+    while c.ins < p {
+        var q: i64 = c.ins;
+        if q + 4 <= c.n {
+            var h: i64 = zc_hash(c.data, q, c.hbits);
+            c.prev.set(q, c.head.get(h));
+            c.head.set(h, q);
+        }
+        c.ins = q + 1;
+    }
+}
+
+fn zc_mlen(d: Vec<i64>, a: i64, b: i64, max: i64) -> i64 {
+    var l: i64 = 0;
+    while l < max && d.get(a + l) == d.get(b + l) {
+        l = l + 1;
+    }
+    return l;
+}
+
+// The longest match at p that ends by `end` (c.ml_len, c.ml_off; ml_len is
+// 0 when there is none of 4 bytes or more): the repeat offsets first, then
+// the hash chain. Positions below p must be inserted.
+fn zc_find(c: & mut ZcCtx, p: i64, end: i64) {
+    c.ml_len = 0;
+    c.ml_off = 0;
+    var maxlen: i64 = end - p;
+    if maxlen < 4 || p + 4 > c.n {
+        return;
+    }
+    var best: i64 = 3;
+    var k: i64 = 0;
+    while k < 3 {
+        var r: i64 = c.r1;
+        if k == 1 {
+            r = c.r2;
+        } else if k == 2 {
+            r = c.r3;
+        }
+        if r >= 1 && r <= p && r <= c.win {
+            var l: i64 = zc_mlen(c.data, p - r, p, maxlen);
+            if l > best {
+                best = l;
+                c.ml_len = l;
+                c.ml_off = r;
+            }
+        }
+        k = k + 1;
+    }
+    if best >= maxlen {
+        return;
+    }
+    var cand: i64 = c.head.get(zc_hash(c.data, p, c.hbits));
+    var depth: i64 = c.depth;
+    while cand >= 0 && depth > 0 {
+        if p - cand > c.win {
+            break;
+        }
+        if c.data.get(cand + best) == c.data.get(p + best) {
+            var l2: i64 = zc_mlen(c.data, cand, p, maxlen);
+            if l2 > best {
+                best = l2;
+                c.ml_len = l2;
+                c.ml_off = p - cand;
+                if l2 >= maxlen {
+                    break;
+                }
+            }
+        }
+        cand = c.prev.get(cand);
+        depth = depth - 1;
+    }
+}
+
+// The offset value written for a match at distance `off` after `ll`
+// literals (1-3 name a repeat offset), and the repeat offsets updated as
+// the decoder updates them (zs_sequences).
+fn zc_offset_value(c: & mut ZcCtx, off: i64, ll: i64) -> i64 {
+    var v: i64 = off + 3;
+    if ll > 0 {
+        if off == c.r1 {
+            v = 1;
+        } else if off == c.r2 {
+            v = 2;
+        } else if off == c.r3 {
+            v = 3;
+        }
+    } else {
+        if off == c.r2 {
+            v = 1;
+        } else if off == c.r3 {
+            v = 2;
+        } else if off == c.r1 - 1 {
+            v = 3;
+        }
+    }
+    if v > 3 {
+        c.r3 = c.r2;
+        c.r2 = c.r1;
+        c.r1 = off;
+    } else {
+        var idx: i64 = v - 1;
+        if ll == 0 {
+            idx = idx + 1;
+        }
+        if idx > 0 {
+            if idx > 1 {
+                c.r3 = c.r2;
+            }
+            c.r2 = c.r1;
+            c.r1 = off;
+        }
+    }
+    return v;
+}
+
+// The code of a literal or match length: the largest code whose baseline
+// (tab: baseline | extra bits << 24) is <= v.
+fn zc_len_code(tab: Vec<i64>, v: i64) -> i64 {
+    var c: i64 = tab.len() - 1;
+    while c > 0 && (tab.get(c) & 0xFFFFFF) > v {
+        c = c - 1;
+    }
+    return c;
+}
+
+// The sequences section: the count, the compression modes (predefined
+// tables for all three codes) and the backward bitstream. Written last to
+// first: the decoder reads the initial states, then per sequence the offset,
+// match-length and literal-length extra bits and the state updates (literal
+// length, match length, offset) that lead to the next one.
+fn zc_sequences(c: & mut ZcCtx, out: & mut Vec<i64>, lls: Vec<i64>, mls: Vec<i64>, ofvs: Vec<i64>) {
+    var n: i64 = lls.len();
+    if n < 128 {
+        out.push(n);
+    } else if n < 0x7F00 {
+        out.push((n >> 8) + 128);
+        out.push(n & 255);
+    } else {
+        out.push(255);
+        out.push((n - 0x7F00) & 255);
+        out.push((n - 0x7F00) >> 8);
+    }
+    if n == 0 {
+        return;
+    }
+    out.push(0);
+    var lsz: i64 = 1 << c.llt.log;
+    var osz: i64 = 1 << c.oft.log;
+    var msz: i64 = 1 << c.mlt.log;
+    var w: ZcBits = zc_bits_new();
+    var xll: i64 = 0;
+    var xof: i64 = 0;
+    var xml: i64 = 0;
+    var i: i64 = n - 1;
+    while i >= 0 {
+        var ll: i64 = lls.get(i);
+        var ml: i64 = mls.get(i);
+        var ofv: i64 = ofvs.get(i);
+        var llc: i64 = ll;
+        if ll >= 16 {
+            llc = zc_len_code(c.llcode, ll);
+        }
+        var mlc: i64 = ml - 3;
+        if mlc >= 32 {
+            mlc = zc_len_code(c.mlcode, ml);
+        }
+        var ofc: i64 = zs_hibit(ofv);
+        if i == n - 1 {
+            xll = c.llenc.get(llc * lsz) & 0xFFFF;
+            xof = c.ofenc.get(ofc * osz) & 0xFFFF;
+            xml = c.mlenc.get(mlc * msz) & 0xFFFF;
+        } else {
+            var eo: i64 = c.ofenc.get(ofc * osz + xof);
+            var nxo: i64 = eo & 0xFFFF;
+            zc_put(& mut w, xof - (c.oft.tab.get(nxo) >> 16), eo >> 16);
+            var em: i64 = c.mlenc.get(mlc * msz + xml);
+            var nxm: i64 = em & 0xFFFF;
+            zc_put(& mut w, xml - (c.mlt.tab.get(nxm) >> 16), em >> 16);
+            var el: i64 = c.llenc.get(llc * lsz + xll);
+            var nxl: i64 = el & 0xFFFF;
+            zc_put(& mut w, xll - (c.llt.tab.get(nxl) >> 16), el >> 16);
+            xof = nxo;
+            xml = nxm;
+            xll = nxl;
+        }
+        var llx: i64 = c.llcode.get(llc);
+        zc_put(& mut w, ll - (llx & 0xFFFFFF), llx >> 24);
+        var mlx: i64 = c.mlcode.get(mlc);
+        zc_put(& mut w, ml - (mlx & 0xFFFFFF), mlx >> 24);
+        zc_put(& mut w, ofv - (1 << ofc), ofc);
+        i = i - 1;
+    }
+    zc_put(& mut w, xml, c.mlt.log);
+    zc_put(& mut w, xof, c.oft.log);
+    zc_put(& mut w, xll, c.llt.log);
+    zc_close(& mut w);
+    zc_append(out, w.out);
+}
+
+// Huffman code lengths of at most `limit` bits for the counts of symbols
+// 0..n-1 (two or more must be non-zero): a Huffman tree, rebuilt from
+// flattened counts while it is too deep.
+fn zc_huf_lengths(freq: Vec<i64>, n: i64, limit: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    var used: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        f.push(freq.get(i));
+        if freq.get(i) > 0 {
+            used = used + 1;
+        }
+        i = i + 1;
+    }
+    while true {
+        var w: Vec<i64> = Vec::new();
+        var parent: Vec<i64> = Vec::new();
+        var alive: Vec<i64> = Vec::new();
+        var node: Vec<i64> = Vec::filled(n, - 1);
+        i = 0;
+        while i < n {
+            if f.get(i) > 0 {
+                node.set(i, w.len());
+                w.push(f.get(i));
+                parent.push(- 1);
+                alive.push(1);
+            }
+            i = i + 1;
+        }
+        var left: i64 = used;
+        while left > 1 {
+            var a: i64 = - 1;
+            var b: i64 = - 1;
+            var j: i64 = 0;
+            while j < w.len() {
+                if alive.get(j) == 1 {
+                    if a < 0 || w.get(j) < w.get(a) {
+                        b = a;
+                        a = j;
+                    } else if b < 0 || w.get(j) < w.get(b) {
+                        b = j;
+                    }
+                }
+                j = j + 1;
+            }
+            alive.set(a, 0);
+            alive.set(b, 0);
+            parent.set(a, w.len());
+            parent.set(b, w.len());
+            w.push(w.get(a) + w.get(b));
+            parent.push(- 1);
+            alive.push(1);
+            left = left - 1;
+        }
+        var lens: Vec<i64> = Vec::filled(n, 0);
+        var maxl: i64 = 0;
+        i = 0;
+        while i < n {
+            var nd: i64 = node.get(i);
+            if nd >= 0 {
+                var d: i64 = 0;
+                while parent.get(nd) >= 0 {
+                    nd = parent.get(nd);
+                    d = d + 1;
+                }
+                lens.set(i, d);
+                if d > maxl {
+                    maxl = d;
+                }
+            }
+            i = i + 1;
+        }
+        if maxl <= limit {
+            return lens;
+        }
+        i = 0;
+        while i < n {
+            if f.get(i) > 0 {
+                f.set(i, (f.get(i) >> 1) | 1);
+            }
+            i = i + 1;
+        }
+    }
+    return Vec::new();
+}
+
+// Codes as the decoder lays them out (zs_huf_build): the longest codes take
+// the lowest table ranges, symbols in order within one length.
+fn zc_huf_codes(lens: Vec<i64>, mb: i64) -> Vec<i64> {
+    var n: i64 = lens.len();
+    var count: Vec<i64> = Vec::filled(mb + 2, 0);
+    var i: i64 = 0;
+    while i < n {
+        var b: i64 = lens.get(i);
+        if b > 0 {
+            count.set(b, count.get(b) + 1);
+        }
+        i = i + 1;
+    }
+    var start: Vec<i64> = Vec::filled(mb + 2, 0);
+    var idx: i64 = 0;
+    var k: i64 = mb;
+    while k >= 1 {
+        start.set(k, idx);
+        idx = idx + count.get(k) * (1 << (mb - k));
+        k = k - 1;
+    }
+    var codes: Vec<i64> = Vec::filled(n, 0);
+    i = 0;
+    while i < n {
+        var b2: i64 = lens.get(i);
+        if b2 > 0 {
+            var st: i64 = start.get(b2);
+            codes.set(i, st >> (mb - b2));
+            start.set(b2, st + (1 << (mb - b2)));
+        }
+        i = i + 1;
+    }
+    return codes;
+}
+
+// One Huffman stream of lits[from..to): last symbol first, so that the
+// decoder, reading from the end, meets them in order.
+fn zc_huf_stream(lits: Vec<i64>, from: i64, to: i64, codes: Vec<i64>, lens: Vec<i64>) -> Vec<i64> {
+    var w: ZcBits = zc_bits_new();
+    var j: i64 = to - 1;
+    while j >= from {
+        var s: i64 = lits.get(j);
+        zc_put(& mut w, codes.get(s), lens.get(s));
+        j = j - 1;
+    }
+    zc_close(& mut w);
+    return w.out;
+}
+
+// Huffman weights compressed with FSE (RFC 8878 4.2.1.2): the size byte,
+// the table description (log 6) and the two-state backward stream. Empty
+// when FSE cannot code them (one weight value only, or over 127 bytes).
+fn zc_fse_weights(w: Vec<i64>) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    var nw: i64 = w.len();
+    if nw < 2 {
+        return none;
+    }
+    var maxw: i64 = 0;
+    var i: i64 = 0;
+    while i < nw {
+        if w.get(i) > maxw {
+            maxw = w.get(i);
+        }
+        i = i + 1;
+    }
+    var hist: Vec<i64> = Vec::filled(maxw + 1, 0);
+    i = 0;
+    while i < nw {
+        hist.set(w.get(i), hist.get(w.get(i)) + 1);
+        i = i + 1;
+    }
+    // normalized counts: 64 in all, every used value at least 1
+    var log: i64 = 6;
+    var size: i64 = 64;
+    var norm: Vec<i64> = Vec::filled(maxw + 1, 0);
+    var total: i64 = 0;
+    var distinct: i64 = 0;
+    var big: i64 = 0;
+    var s: i64 = 0;
+    while s <= maxw {
+        var h: i64 = hist.get(s);
+        if h > 0 {
+            distinct = distinct + 1;
+            var q: i64 = h * size / nw;
+            if q < 1 {
+                q = 1;
+            }
+            norm.set(s, q);
+            total = total + q;
+            if q > norm.get(big) {
+                big = s;
+            }
+        }
+        s = s + 1;
+    }
+    if distinct < 2 {
+        return none;
+    }
+    while total > size {
+        var bj: i64 = - 1;
+        var j: i64 = 0;
+        while j <= maxw {
+            if norm.get(j) > 1 && (bj < 0 || norm.get(j) > norm.get(bj)) {
+                bj = j;
+            }
+            j = j + 1;
+        }
+        norm.set(bj, norm.get(bj) - 1);
+        total = total - 1;
+    }
+    if total < size {
+        norm.set(big, norm.get(big) + size - total);
+    }
+    // the table description, read forwards (zs_fse_read)
+    var hw: ZcBits = zc_bits_new();
+    zc_put(& mut hw, log - 5, 4);
+    var remaining: i64 = size;
+    s = 0;
+    while remaining > 0 {
+        var cnt: i64 = norm.get(s);
+        var x: i64 = cnt + 1;
+        var bits: i64 = zs_hibit(remaining + 1) + 1;
+        var lower: i64 = (1 << (bits - 1)) - 1;
+        var thr: i64 = (1 << bits) - 1 - (remaining + 1);
+        if x < thr {
+            zc_put(& mut hw, x, bits - 1);
+        } else if x <= lower {
+            zc_put(& mut hw, x, bits);
+        } else {
+            zc_put(& mut hw, x + thr, bits);
+        }
+        remaining = remaining - cnt;
+        s = s + 1;
+        if cnt == 0 {
+            var z: i64 = 0;
+            while s + z <= maxw && norm.get(s + z) == 0 {
+                z = z + 1;
+            }
+            s = s + z;
+            while z >= 3 {
+                zc_put(& mut hw, 3, 2);
+                z = z - 3;
+            }
+            zc_put(& mut hw, z, 2);
+        }
+    }
+    zc_align(& mut hw);
+    var t: ZsFse = zs_fse_build(norm, maxw + 1, log);
+    if !t.ok {
+        return none;
+    }
+    var enc: Vec<i64> = zc_encmap(t, maxw + 1);
+    // Two states take the weights in turn (even ones the first). Decoding
+    // stops when the update after the next-to-last weight reads past the
+    // start, so that weight's state is the one of its symbol whose update
+    // reads the most bits (at least 1); the last weight's state is free.
+    var hi: i64 = enc.get(w.get(nw - 1) * size) & 0xFFFF;
+    var lo: i64 = 0;
+    var target: i64 = w.get(nw - 2);
+    while lo < size && (t.tab.get(lo) & 255) != target {
+        lo = lo + 1;
+    }
+    var bw: ZcBits = zc_bits_new();
+    i = nw - 3;
+    while i >= 0 {
+        var e: i64 = enc.get(w.get(i) * size + hi);
+        var xs: i64 = e & 0xFFFF;
+        zc_put(& mut bw, hi - (t.tab.get(xs) >> 16), e >> 16);
+        hi = lo;
+        lo = xs;
+        i = i - 1;
+    }
+    zc_put(& mut bw, hi, log);
+    zc_put(& mut bw, lo, log);
+    zc_close(& mut bw);
+    var len: i64 = hw.out.len() + bw.out.len();
+    if len > 127 {
+        return none;
+    }
+    var res: Vec<i64> = Vec::new();
+    res.push(len);
+    zc_append(& mut res, hw.out);
+    zc_append(& mut res, bw.out);
+    return res;
+}
+
+// Huffman-coded literals with their section header; empty when they cannot
+// be coded that way (fewer than two byte values).
+fn zc_huf_literals(lits: Vec<i64>) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    var m: i64 = lits.len();
+    var freq: Vec<i64> = Vec::filled(256, 0);
+    var maxsym: i64 = 0;
+    var used: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        var b: i64 = lits.get(i);
+        if freq.get(b) == 0 {
+            used = used + 1;
+        }
+        freq.set(b, freq.get(b) + 1);
+        if b > maxsym {
+            maxsym = b;
+        }
+        i = i + 1;
+    }
+    if used < 2 {
+        return none;
+    }
+    var lens: Vec<i64> = zc_huf_lengths(freq, maxsym + 1, 11);
+    var mb: i64 = 0;
+    i = 0;
+    while i <= maxsym {
+        if lens.get(i) > mb {
+            mb = lens.get(i);
+        }
+        i = i + 1;
+    }
+    var codes: Vec<i64> = zc_huf_codes(lens, mb);
+    // weights of symbols 0..maxsym-1; maxsym's is implied
+    var wts: Vec<i64> = Vec::new();
+    i = 0;
+    while i < maxsym {
+        var ln: i64 = lens.get(i);
+        if ln > 0 {
+            wts.push(mb + 1 - ln);
+        } else {
+            wts.push(0);
+        }
+        i = i + 1;
+    }
+    var desc: Vec<i64> = Vec::new();
+    if maxsym <= 128 {
+        desc.push(127 + maxsym);
+        i = 0;
+        while i < maxsym {
+            var pair: i64 = wts.get(i) << 4;
+            if i + 1 < maxsym {
+                pair = pair | wts.get(i + 1);
+            }
+            desc.push(pair);
+            i = i + 2;
+        }
+    }
+    var fw: Vec<i64> = zc_fse_weights(wts);
+    if fw.len() > 0 && (desc.len() == 0 || fw.len() < desc.len()) {
+        desc = fw;
+    }
+    if desc.len() == 0 {
+        return none;
+    }
+    var body: Vec<i64> = Vec::new();
+    zc_append(& mut body, desc);
+    var single: bool = m <= 1023;
+    if single {
+        zc_append(& mut body, zc_huf_stream(lits, 0, m, codes, lens));
+        if body.len() > 1023 {
+            single = false;
+            body = Vec::new();
+            zc_append(& mut body, desc);
+        }
+    }
+    if !single {
+        if m < 16 {
+            return none;
+        }
+        var seg: i64 = (m + 3) / 4;
+        var s1: Vec<i64> = zc_huf_stream(lits, 0, seg, codes, lens);
+        var s2: Vec<i64> = zc_huf_stream(lits, seg, 2 * seg, codes, lens);
+        var s3: Vec<i64> = zc_huf_stream(lits, 2 * seg, 3 * seg, codes, lens);
+        var s4: Vec<i64> = zc_huf_stream(lits, 3 * seg, m, codes, lens);
+        if s1.len() > 65535 || s2.len() > 65535 || s3.len() > 65535 {
+            return none;
+        }
+        body.push(s1.len() & 255);
+        body.push(s1.len() >> 8);
+        body.push(s2.len() & 255);
+        body.push(s2.len() >> 8);
+        body.push(s3.len() & 255);
+        body.push(s3.len() >> 8);
+        zc_append(& mut body, s1);
+        zc_append(& mut body, s2);
+        zc_append(& mut body, s3);
+        zc_append(& mut body, s4);
+    }
+    var csize: i64 = body.len();
+    var sf: i64 = 0;
+    var nbits: i64 = 10;
+    var hl: i64 = 3;
+    if !single {
+        var top: i64 = m;
+        if csize > top {
+            top = csize;
+        }
+        if top < 1024 {
+            sf = 1;
+        } else if top < 16384 {
+            sf = 2;
+            nbits = 14;
+            hl = 4;
+        } else {
+            sf = 3;
+            nbits = 18;
+            hl = 5;
+        }
+    }
+    if csize >= (1 << nbits) {
+        return none;
+    }
+    var hv: i64 = 2 | (sf << 2) | (m << 4) | (csize << (4 + nbits));
+    var res: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < hl {
+        res.push((hv >> (8 * k)) & 255);
+        k = k + 1;
+    }
+    zc_append(& mut res, body);
+    return res;
+}
+
+// Header of a raw (ltype 0) or RLE (1) literals section of `m` bytes.
+fn zc_lit_header(out: & mut Vec<i64>, ltype: i64, m: i64) {
+    if m < 32 {
+        out.push((m << 3) | ltype);
+    } else if m < 4096 {
+        out.push(((m & 15) << 4) | 4 | ltype);
+        out.push(m >> 4);
+    } else {
+        out.push(((m & 15) << 4) | 12 | ltype);
+        out.push((m >> 4) & 255);
+        out.push(m >> 12);
+    }
+}
+
+// The literals section: RLE when one byte value repeats, else the shorter
+// of Huffman-coded and raw.
+fn zc_literals(lits: Vec<i64>, out: & mut Vec<i64>) {
+    var m: i64 = lits.len();
+    if m >= 2 {
+        var same: bool = true;
+        var i: i64 = 1;
+        while i < m && same {
+            if lits.get(i) != lits.get(0) {
+                same = false;
+            }
+            i = i + 1;
+        }
+        if same {
+            zc_lit_header(out, 1, m);
+            out.push(lits.get(0));
+            return;
+        }
+    }
+    var rawlen: i64 = m + 1;
+    if m >= 32 {
+        rawlen = m + 2;
+    }
+    if m >= 4096 {
+        rawlen = m + 3;
+    }
+    if m >= 32 {
+        var huf: Vec<i64> = zc_huf_literals(lits);
+        if huf.len() > 0 && huf.len() < rawlen {
+            zc_append(out, huf);
+            return;
+        }
+    }
+    zc_lit_header(out, 0, m);
+    zc_append(out, lits);
+}
+
+// A compressed block for data[bs..be), or an empty Vec when it would not
+// be shorter than the bytes themselves (the repeat offsets are then left
+// as they were).
+fn zc_block(c: & mut ZcCtx, bs: i64, be: i64) -> Vec<i64> {
+    var r1: i64 = c.r1;
+    var r2: i64 = c.r2;
+    var r3: i64 = c.r3;
+    var lits: Vec<i64> = Vec::new();
+    var lls: Vec<i64> = Vec::new();
+    var mls: Vec<i64> = Vec::new();
+    var ofvs: Vec<i64> = Vec::new();
+    var p: i64 = bs;
+    var anchor: i64 = bs;
+    while p + 4 <= be {
+        zc_insert_upto(c, p);
+        zc_find(c, p, be);
+        var len: i64 = c.ml_len;
+        var off: i64 = c.ml_off;
+        if len >= 4 && c.lazy && p + 5 <= be {
+            // one-step lazy: a longer match at the next byte wins
+            zc_insert_upto(c, p + 1);
+            zc_find(c, p + 1, be);
+            if c.ml_len > len {
+                p = p + 1;
+                len = c.ml_len;
+                off = c.ml_off;
+            }
+        }
+        if len >= 4 {
+            var k: i64 = anchor;
+            while k < p {
+                lits.push(c.data.get(k));
+                k = k + 1;
+            }
+            lls.push(p - anchor);
+            mls.push(len);
+            ofvs.push(zc_offset_value(c, off, p - anchor));
+            p = p + len;
+            anchor = p;
+        } else {
+            p = p + 1;
+        }
+    }
+    var t: i64 = anchor;
+    while t < be {
+        lits.push(c.data.get(t));
+        t = t + 1;
+    }
+    var body: Vec<i64> = Vec::new();
+    zc_literals(lits, & mut body);
+    zc_sequences(c, & mut body, lls, mls, ofvs);
+    if body.len() >= be - bs {
+        c.r1 = r1;
+        c.r2 = r2;
+        c.r3 = r3;
+        return Vec::new();
+    }
+    return body;
+}
+
+fn zc_le_bytes(out: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 255);
+        i = i + 1;
+    }
+}
+
+/// Compress `bytes` (values 0..255; higher bits are dropped) into one
+/// Zstandard frame with the content size and checksum. `level` 0 only
+/// stores (raw and RLE blocks); 1 to 22 search for matches, harder at
+/// higher levels (3 is zstd_compress's). Any Zstandard decoder reads the
+/// result; the ratio is below the zstd tool's at the same level.
+///
+/// Example:
+///   var b: Vec<i64> = Vec::new();
+///   var i: i64 = 0;
+///   while i < 200 { b.push(97 + i % 3); i = i + 1; }
+///   val z: Vec<i64> = zstd_compress_level(b, 3);
+///   assert(z.len() < 40);
+///   assert(zstd_ok(z));
+///   assert_eq(zstd_decompress(z).len(), 200);
+///   assert_eq(str_len(zstd_decompress_str(zstd_compress_level(b, 0))), 200);
+pub fn zstd_compress_level(bytes: Vec<i64>, level: i64) -> Vec<i64> {
+    var n: i64 = bytes.len();
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        data.push(bytes.get(i) & 255);
+        i = i + 1;
+    }
+    var ck: i64 = zstd_xxh64(data, 0) & 0xFFFFFFFF;
+    var out: Vec<i64> = Vec::new();
+    zc_le_bytes(& mut out, 0xFD2FB528, 4);
+    var win: i64 = n;
+    if n <= 8388608 {
+        // single segment: the window is the content size
+        if n < 256 {
+            out.push(32 | 4);
+            out.push(n);
+        } else if n < 65792 {
+            out.push(64 | 32 | 4);
+            zc_le_bytes(& mut out, n - 256, 2);
+        } else {
+            out.push(128 | 32 | 4);
+            zc_le_bytes(& mut out, n, 4);
+        }
+    } else {
+        win = 8388608;
+        if n < 4294967296 {
+            out.push(128 | 4);
+            out.push(13 << 3);
+            zc_le_bytes(& mut out, n, 4);
+        } else {
+            out.push(192 | 4);
+            out.push(13 << 3);
+            zc_le_bytes(& mut out, n, 8);
+        }
+    }
+    var depth: i64 = 0;
+    var lazy: bool = false;
+    if level >= 1 {
+        depth = 4;
+    }
+    if level >= 3 {
+        depth = 16;
+    }
+    if level >= 6 {
+        depth = 64;
+        lazy = true;
+    }
+    if level >= 9 {
+        depth = 256;
+    }
+    if level >= 16 {
+        depth = 1024;
+    }
+    var hb: i64 = 8;
+    var plen: i64 = 1;
+    if depth > 0 {
+        while hb < 16 && (1 << hb) < n {
+            hb = hb + 1;
+        }
+        plen = n + 1;
+    }
+    var llt: ZsFse = zs_fse_predefined(0);
+    var oft: ZsFse = zs_fse_predefined(1);
+    var mlt: ZsFse = zs_fse_predefined(2);
+    var st0: ZsState = zs_new_state(0);
+    var c: ZcCtx = ZcCtx {
+        data: data, n: n, head: Vec::filled(1 << hb, - 1), prev: Vec::filled(plen, - 1), hbits: hb, ins: 0, depth: depth, lazy: lazy, win: win, r1: 1, r2: 4, r3: 8, ml_len: 0, ml_off: 0, llt: llt, oft: oft, mlt: mlt, llenc: zc_encmap(llt, 36), ofenc: zc_encmap(oft, 29), mlenc: zc_encmap(mlt, 53), llcode: st0.llcode, mlcode: st0.mlcode
+    };
+    var bs: i64 = 0;
+    while true {
+        var be: i64 = bs + 131072;
+        if be > n {
+            be = n;
+        }
+        var last: i64 = 0;
+        if be == n {
+            last = 1;
+        }
+        var size: i64 = be - bs;
+        var rle: bool = size >= 2;
+        var j: i64 = bs + 1;
+        while j < be && rle {
+            if c.data.get(j) != c.data.get(bs) {
+                rle = false;
+            }
+            j = j + 1;
+        }
+        if rle {
+            zc_le_bytes(& mut out, last | 2 | (size << 3), 3);
+            out.push(c.data.get(bs));
+        } else {
+            var body: Vec<i64> = Vec::new();
+            if depth > 0 && size >= 8 {
+                body = zc_block(& mut c, bs, be);
+            }
+            if body.len() > 0 {
+                zc_le_bytes(& mut out, last | 4 | (body.len() << 3), 3);
+                zc_append(& mut out, body);
+            } else {
+                zc_le_bytes(& mut out, last | (size << 3), 3);
+                var k: i64 = bs;
+                while k < be {
+                    out.push(c.data.get(k));
+                    k = k + 1;
+                }
+            }
+        }
+        bs = be;
+        if last == 1 {
+            break;
+        }
+    }
+    zc_le_bytes(& mut out, ck, 4);
+    return out;
+}
+
+/// Compress `bytes` into one Zstandard frame at level 3 (see
+/// zstd_compress_level).
+pub fn zstd_compress(bytes: Vec<i64>) -> Vec<i64> {
+    return zstd_compress_level(bytes, 3);
+}
+
+/// Compress the bytes of a string at level 3; zstd_decompress_str gives
+/// the string back.
+pub fn zstd_compress_str(s: str) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        b.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return zstd_compress_level(b, 3);
 }

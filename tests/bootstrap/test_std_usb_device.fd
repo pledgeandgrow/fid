@@ -1,0 +1,115 @@
+// stdlib/usb_device: CDC-ACM descriptors (exact bytes), an enumeration sequence of SETUP packets through the chapter-9 state machine, CDC line coding / control line state, endpoint halt, stalls and EP0 packetisation.
+// Expected output:
+// device: 12 01 00 02 EF 02 01 40 83 04 40 57 00 01 01 02 03 01
+// config 75 bytes: 09 02 4B 00 02 01 00 80 32 | IAD 08 0B 00 02 02 02 01 00
+// endpoints: 0x82 0x1 0x81
+// GET_DESCRIPTOR device (64): 18 bytes, packets 18
+// set_configuration before address: STALL (SET_CONFIGURATION before an address)
+// SET_ADDRESS 5: ok, state before status Default, after Address addr 5
+// GET_DESCRIPTOR config (9): 09 02 4B 00 02 01 00 80 32
+// GET_DESCRIPTOR config (255): 75 bytes, packets 64 11
+// string 0: 04 03 09 04, string 2: 14 03 46 00 69 00 64 00 65 00 73 00 20 00 43 00 44 00 43 00
+// qualifier: STALL (full-speed only: no device qualifier)
+// line coding before configuration: STALL (class request before configuration)
+// SET_CONFIGURATION 1: Configured, GET_CONFIGURATION 01
+// SET_CONFIGURATION 2: STALL (no configuration value 2)
+// SET_LINE_CODING: ok -> 115200 8N1, GET_LINE_CODING 00 C2 01 00 00 00 08
+// 9600 7E2: 9600 7E2
+// control lines DTR true RTS true
+// halt 0x81: status 01 00, cleared 00 00, halt 0x05: STALL (cannot halt that endpoint)
+// device status 00 00, remote wakeup on 02 00
+// serial state: A1 20 00 00 00 00 02 00 03 00
+// zlp: 64 0 / 64 64 / 18
+// bus reset: Default addr 0 config 0
+use usb_device;
+use vec;
+use string;
+
+fn hx(b: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn hexs(v: Vec<i64>, from: i64, n: i64) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n && from + i < v.len() {
+        p.push(hx(v.get(from + i)));
+        i = i + 1;
+    }
+    return str_join(p, " ");
+}
+
+fn all(v: Vec<i64>) -> str { return hexs(v, 0, v.len()); }
+
+fn ints(v: Vec<i64>) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        p.push(int_to_str(v.get(i)));
+        i = i + 1;
+    }
+    return str_join(p, " ");
+}
+
+fn res(r: UsbResp) -> str {
+    if r.stall { return "STALL (" + r.why + ")"; }
+    return all(r.data);
+}
+
+fn main() {
+    val dev: Vec<i64> = usb_device_desc(0x0200, 0xEF, 0x02, 0x01, 64, 0x0483, 0x5740, 0x0100, 1, 2, 3, 1);
+    val cfg: Vec<i64> = usb_cdc_acm_config(0x82, 0x01, 0x81, 64);
+    println("device: " + all(dev));
+    println("config " + int_to_str(cfg.len()) + " bytes: " + hexs(cfg, 0, 9) + " | IAD " + hexs(cfg, 9, 8));
+    var strs: Vec<Vec<i64>> = Vec::new();
+    var langs: Vec<i64> = Vec::new();
+    langs.push(0x0409);
+    strs.push(usb_langid_desc(langs));
+    strs.push(usb_string_desc("Fides"));
+    strs.push(usb_string_desc("Fides CDC"));
+    strs.push(usb_string_desc("0001"));
+    var d: UsbDevice = usbdev_new(dev, cfg, strs);
+    println("endpoints: 0x" + int_to_hex(d.endpoints.get(0)) + " 0x" + int_to_hex(d.endpoints.get(1)) + " 0x" + int_to_hex(d.endpoints.get(2)));
+    var none: Vec<i64> = Vec::new();
+    usbdev_bus_reset(&mut d);
+    val r1: UsbResp = usbdev_setup(&mut d, usb_setup_bytes(0x80, 6, 0x0100, 0, 64), none);
+    println("GET_DESCRIPTOR device (64): " + int_to_str(r1.data.len()) + " bytes, packets " + ints(usb_ep0_packets(r1.data.len(), 64, 64)));
+    println("set_configuration before address: " + res(usbdev_setup(&mut d, usb_setup_bytes(0x00, 9, 1, 0, 0), none)));
+    val r2: UsbResp = usbdev_setup(&mut d, usb_setup_bytes(0x00, 5, 5, 0, 0), none);
+    val before: str = usb_state_name(d.state);
+    usbdev_status_done(&mut d);
+    var okr2: str = "ok";
+    if r2.stall { okr2 = "STALL"; }
+    println("SET_ADDRESS 5: " + okr2 + ", state before status " + before + ", after " + usb_state_name(d.state) + " addr " + int_to_str(d.address));
+    println("GET_DESCRIPTOR config (9): " + res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 6, 0x0200, 0, 9), none)));
+    val r3: UsbResp = usbdev_setup(&mut d, usb_setup_bytes(0x80, 6, 0x0200, 0, 255), none);
+    println("GET_DESCRIPTOR config (255): " + int_to_str(r3.data.len()) + " bytes, packets " + ints(usb_ep0_packets(r3.data.len(), 255, 64)));
+    println("string 0: " + res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 6, 0x0300, 0, 255), none))
+        + ", string 2: " + res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 6, 0x0302, 0x0409, 255), none)));
+    println("qualifier: " + res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 6, 0x0600, 0, 10), none)));
+    println("line coding before configuration: " + res(usbdev_setup(&mut d, usb_setup_bytes(0xA1, 0x21, 0, 0, 7), none)));
+    usbdev_setup(&mut d, usb_setup_bytes(0x00, 9, 1, 0, 0), none);
+    println("SET_CONFIGURATION 1: " + usb_state_name(d.state) + ", GET_CONFIGURATION " + res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 8, 0, 0, 1), none)));
+    println("SET_CONFIGURATION 2: " + res(usbdev_setup(&mut d, usb_setup_bytes(0x00, 9, 2, 0, 0), none)));
+    val lc: UsbResp = usbdev_setup(&mut d, usb_setup_bytes(0x21, 0x20, 0, 0, 7), usb_line_coding(115200, 0, 0, 8));
+    var lcs: str = "ok";
+    if lc.stall { lcs = "STALL"; }
+    println("SET_LINE_CODING: " + lcs + " -> " + usb_line_coding_str(&d) + ", GET_LINE_CODING " + res(usbdev_setup(&mut d, usb_setup_bytes(0xA1, 0x21, 0, 0, 7), none)));
+    usbdev_setup(&mut d, usb_setup_bytes(0x21, 0x20, 0, 0, 7), usb_line_coding(9600, 2, 2, 7));
+    println("9600 7E2: " + usb_line_coding_str(&d));
+    usbdev_setup(&mut d, usb_setup_bytes(0x21, 0x22, 3, 0, 0), none);
+    println("control lines DTR " + bool_to_str(d.dtr) + " RTS " + bool_to_str(d.rts));
+    usbdev_setup(&mut d, usb_setup_bytes(0x02, 3, 0, 0x81, 0), none);
+    val h1: str = res(usbdev_setup(&mut d, usb_setup_bytes(0x82, 0, 0, 0x81, 2), none));
+    usbdev_setup(&mut d, usb_setup_bytes(0x02, 1, 0, 0x81, 0), none);
+    val h2: str = res(usbdev_setup(&mut d, usb_setup_bytes(0x82, 0, 0, 0x81, 2), none));
+    println("halt 0x81: status " + h1 + ", cleared " + h2 + ", halt 0x05: " + res(usbdev_setup(&mut d, usb_setup_bytes(0x02, 3, 0, 0x05, 0), none)));
+    val ds: str = res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 0, 0, 0, 2), none));
+    usbdev_setup(&mut d, usb_setup_bytes(0x00, 3, 1, 0, 0), none);
+    println("device status " + ds + ", remote wakeup on " + res(usbdev_setup(&mut d, usb_setup_bytes(0x80, 0, 0, 0, 2), none)));
+    println("serial state: " + all(usb_cdc_serial_state(0, 3)));
+    println("zlp: " + ints(usb_ep0_packets(64, 255, 64)) + " / " + ints(usb_ep0_packets(128, 128, 64)) + " / " + ints(usb_ep0_packets(18, 18, 64)));
+    usbdev_bus_reset(&mut d);
+    println("bus reset: " + usb_state_name(d.state) + " addr " + int_to_str(d.address) + " config " + int_to_str(d.configuration));
+}

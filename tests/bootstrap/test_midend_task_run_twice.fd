@@ -1,0 +1,44 @@
+// The native mid-end (compiler/rules.fd, pure-call merging `purecse`;
+// compiler/iropt.fd effect masks) must never merge two calls that read
+// state another task or thread writes. task_run() waits for the tasks
+// started since the last call, and sync_atomic_load reads what a task's
+// sync_atomic_add wrote: two calls with the same arguments may return
+// different values. A runtime builtin's call carries a write effect
+// (compiler/lower.fd runtime_effects), so its wrappers (task_run,
+// sync_atomic_load) are never pure. Found Nov 17 with an `emit --nat`
+// build: the second task_run() returned the first one's count at once,
+// and the second task never ran (1 / 1 / false). Run on every backend:
+// fid run, ccompile, emit (pe_ir), emit --nat, and the Linux targets
+// (NATIVE=1 bash scripts/cross-test.sh x86_64-linux).
+// Expected output:
+// 0
+// 1
+// 1
+// 2
+// true
+// 3
+use string;
+use task;
+use sync;
+
+var g_counter: i64 = 0;
+
+fn leaf(n: i64) -> i64 {
+    sync_atomic_add(g_counter, n);
+    return n;
+}
+
+fn main() {
+    g_counter = sync_atomic_alloc(0);
+    val v0: i64 = sync_atomic_load(g_counter);
+    println(int_to_str(v0));
+    val a: i64 = task_go("leaf", 1);
+    println(int_to_str(task_run()));
+    val v1: i64 = sync_atomic_load(g_counter);
+    println(int_to_str(v1));
+    val b: i64 = task_go("leaf", 2);
+    println(int_to_str(task_run()));
+    println(bool_to_str(task_done(b)));
+    val v2: i64 = sync_atomic_load(g_counter);
+    println(int_to_str(v2 + task_result(a) - 1));
+}

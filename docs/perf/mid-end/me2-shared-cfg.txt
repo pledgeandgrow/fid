@@ -1,0 +1,64 @@
+# me2-shared-cfg: who builds a CFG, and who reads the shared one
+# (llvm-roadmap ME2: one dominator tree and one loop tree for every pass).
+#
+# The shared analyses are in compiler/checks.fd: IroCfg / iro_cfg (blocks,
+# successors, predecessors, reverse postorder, immediate dominators, O(1)
+# interval dominance, cached per function shape, OP3), iro_dominates, and
+# the loop tree IroLoops / iro_loops (headers innermost first, latches,
+# innermost header per block, parent, depth, and each loop's body:
+# iro_loop_body), cached with the CFG's `gen`.
+#
+# Readers of the shared CFG and loop tree (Nov 17):
+#   compiler/iropt.fd      every pass; iro_licm_loop and iro_iv_loop take
+#                          their loops and bodies from iro_loops /
+#                          iro_loop_body
+#   compiler/iropt_me.fd   every pass (its own ImeCfg is gone); ime_loop_body
+#                          reads iro_loop_body
+#   compiler/checks.fd     the counted-loop proof (peir_unchecked_ops,
+#                          peir_counted_loop, peir_counted_down) and the
+#                          range facts (peir_range_ops)
+#   compiler/ssa.fd        dominance frontiers and renaming over iro_cfg;
+#                          the exit values of counted loops (ssa_exit_values,
+#                          ME23) take the loop body from iro_loop_body
+#                          (ssa_loop_body, its own walk back from the latch,
+#                          is gone since Nov 17)
+#   compiler/egraph.fd, rules.fd, irverify.fd, tv.fd  dominators from iro_cfg
+#
+# Kept on purpose: checks.fd peir_dominators, a deliberately conservative
+# dominator set peir_guard_ops reads (exact dominators would widen what
+# peir_guard_len_fresh leaves out of its check).
+#
+# CFGs outside the mid-end:
+#
+# 1. compiler/nat_ir.fd, the machine layer: `mb.succs` and the predecessor
+#    lists built from it (register allocation, block layout, the MIR loop
+#    passes) are over MIR blocks, not IR blocks: a MIR block need not be an
+#    IR block (the MIR passes after lowering, such as coldpanic and brfuse,
+#    change the blocks and their edges), so the IR CFG does not describe
+#    them. This is a different level and stays its own.
+#
+# 2. compiler/nat_ir.fd ng_block_succs (the IR-level liveness of the values
+#    that live across blocks, before MIR): Jump, Branch, Switch, and a block
+#    without a terminator runs into the next one. iro_cfg gives such a block
+#    no successor. Lowering is meant to end every reachable block with a
+#    terminator, but the IR verifier (irverify.fd) does not check it (and
+#    the mid-end, reading iro_cfg, already assumes it), so the port to iro_cfg
+#    waits for that check: once ir_verify rejects a reachable block without
+#    a terminator, ng_block_succs can be `cfg.succs.get(bi)` of one iro_cfg
+#    per function (the same block indexes: iro_cfg's `index` is the block id
+#    -> position map nat_ir's `bindex` holds).
+#
+# 3. compiler/pe_ir.fd peir_global_ra (whole-function register allocation,
+#    D4): its liveness reads successors succ_a/succ_b from Jump and Branch
+#    only, so a Switch terminator has no successors there (the loop depth of
+#    peir_pick_reg_vars, peir_loop_back, likewise sees no Switch back edge).
+#    A value live into a Switch target laid out before the Switch block gets
+#    an interval that misses the blocks between. Ported to iro_cfg (the same
+#    block indexes as PeirRaFacts.index) it gets every Switch edge. The
+#    exact hunk is in the ME2 report (needsOther: pe_ir.fd is another
+#    group's file).
+#
+# Checks: tests/bootstrap/test_midend_loop_tree.fd,
+# test_midend_loop_body_shared.fd, test_ssa_exit_loop_tree.fd (emit,
+# default and FID_IROPT_OFF=ssa,ssaexit: the expected output both ways),
+# FID_IROPT_STATS=1 ("iropt: cfg built N, reused M").

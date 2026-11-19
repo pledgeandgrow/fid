@@ -1,0 +1,305 @@
+# Builds, installs and checks what a release ships, then publishes it with
+# checksums and provenance (docs/reference/releasing.md).
+#
+#   windows  release/fid.exe from the 3-stage release bootstrap (fixpoint
+#            checked, stamped: scripts/release-fresh.sh; release-roadmap A10),
+#            the NSIS installer around it, then on this clean runner: the
+#            previous release installed (when there is one), this installer
+#            over it (an update), the installed fid checked from a directory
+#            with no stdlib/ (run, ccompile, emit: scripts/
+#            install-layout-check.sh; A10, N12), then a silent uninstall.
+#   linux    the same bootstrap on Linux, packed as fid-x86_64-linux.tar.gz
+#            (bin/fid, stdlib/, runtime/, LICENSE), unpacked into a fresh
+#            directory and checked the same way; the stdlib docs generated
+#            by scribe (scripts/stdlib-docs.sh --zip, N10).
+#            The Windows installer's ark, scribe and veil are built from
+#            tools/*.fd by the fid.exe it ships (N8).
+#   crater   every known Fides project (scripts/crater/projects.txt) built
+#            with the new fid, against the last release's results
+#            (competitive-roadmap ST6).
+#   publish  the installer, the archive and fides-stdlib-docs.zip, with
+#            SHA256SUMS of every file and a Sigstore build-provenance
+#            attestation per file (ST10), attached to a draft GitHub release
+#            of the tag (a maintainer reviews and publishes it); a manual run
+#            keeps them as a workflow artifact.
+#
+# A tag v<version> runs it; so can a manual run (version input optional).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, e.g. 1.0.1 (default: the tag without its v, else 0.0.0-ci)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          v="${INPUT_VERSION:-}"
+          if [ -z "$v" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/v*) v="${GITHUB_REF_NAME#v}" ;;
+              *) v="0.0.0-ci" ;;
+            esac
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version $v"
+      - name: Build the Rust bootstrap compiler and the companion tools
+        run: cargo build --release
+      - name: Release bootstrap, 3 stages, fixpoint checked (A10)
+        env:
+          CC: zig cc
+          RELEASE: "1"
+          # N12: release/fid.exe names the release's version
+          # (scripts/build-info.sh reads it)
+          FIDES_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/bootstrap.sh
+      - name: release/fid.exe is this source's release build
+        run: |
+          bash scripts/release-fresh.sh release/fid.exe
+          ./release/fid.exe version
+      - name: Install NSIS
+        run: |
+          choco install nsis -y --no-progress
+          echo "C:\Program Files (x86)\NSIS" >> "$GITHUB_PATH"
+          echo "C:\Program Files (x86)\NSIS\Bin" >> "$GITHUB_PATH"
+      - name: Build the installer
+        # build-installer.sh checks release/fid.exe with release-fresh.sh
+        # again (A10; FIDES_NO_REBUILD: the step above built it, a stale one
+        # here is an error) and builds ark, scribe and veil from tools/*.fd
+        # with that fid.exe (N8)
+        env:
+          FIDES_VERSION: ${{ steps.version.outputs.version }}
+          FIDES_NO_REBUILD: "1"
+          CC: zig cc
+        run: ./installer/build-installer.sh
+      - name: The companion tools are the Fides builds (N8)
+        run: |
+          ./release/ark.exe version
+          ./release/scribe.exe tests/bootstrap/hello.fd --format markdown --output build/scribe-smoke
+          ls build/scribe-smoke
+      - name: Previous release's installer (for the update check)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p prev
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Fid*-Setup-*.exe' --dir prev \
+            || echo "no previous release installer: the update check installs over nothing"
+          ls prev
+      - name: Install the previous release, then this one over it (N12)
+        shell: pwsh
+        run: |
+          $dir = 'C:\fides-ci'
+          $prev = Get-ChildItem prev\Fid*-Setup-*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($prev) {
+            Write-Host "installing the previous release: $($prev.Name)"
+            $p = Start-Process -FilePath $prev.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "the previous installer exited with $($p.ExitCode)" }
+          }
+          $new = Get-ChildItem installer\Fid-Setup-*.exe | Select-Object -First 1
+          Write-Host "installing $($new.Name)"
+          $p = Start-Process -FilePath $new.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the installer exited with $($p.ExitCode)" }
+          if (-not (Test-Path "$dir\fid.exe")) { throw "no $dir\fid.exe" }
+          if (-not (Test-Path "$dir\stdlib\core.fd")) { throw "no $dir\stdlib\core.fd" }
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machine -notlike "*$dir*") { throw "the installer did not put $dir on the machine PATH" }
+          # the installed binary is the one this job built
+          $a = (Get-FileHash "$dir\fid.exe").Hash
+          $b = (Get-FileHash release\fid.exe).Hash
+          if ($a -ne $b) { throw "the installed fid.exe is not release\fid.exe" }
+          Write-Host "installed: $dir"
+      - name: The installed fid, from a directory with no stdlib (A10, N12)
+        env:
+          CC: zig cc
+        run: bash scripts/install-layout-check.sh --installed 'C:\fides-ci'
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          $dir = 'C:\fides-ci'
+          # _?= makes the uninstaller run in place and wait
+          $p = Start-Process -FilePath "$dir\uninstall.exe" -ArgumentList '/S', "_?=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the uninstaller exited with $($p.ExitCode)" }
+          if (Test-Path "$dir\fid.exe") { throw "fid.exe is still there after uninstall" }
+          if (Test-Path "$dir\stdlib") { throw "stdlib\ is still there after uninstall" }
+          Write-Host "uninstalled"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/Fid-Setup-*.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold (the Linux linker .cargo/config.toml asks for)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Release bootstrap, 3 stages, fixpoint checked (A10)
+        env:
+          CC: zig cc
+          RELEASE: "1"
+        run: ./scripts/bootstrap.sh
+      - name: release/fid is this source's release build
+        run: |
+          bash scripts/release-fresh.sh release/fid
+          ./release/fid version
+      - name: Pack fid-x86_64-linux.tar.gz
+        run: |
+          set -eu
+          rm -rf stage && mkdir -p stage/bin
+          cp release/fid stage/bin/fid
+          cp -r stdlib stage/stdlib
+          cp -r runtime stage/runtime
+          cp LICENSE stage/LICENSE
+          tar -czf fid-x86_64-linux.tar.gz -C stage .
+          ls -l fid-x86_64-linux.tar.gz
+      - name: Unpack into a fresh directory and check it (A10, N12)
+        env:
+          CC: zig cc
+        run: |
+          set -eu
+          home="$(mktemp -d)"
+          tar -xzf fid-x86_64-linux.tar.gz -C "$home"
+          bash scripts/install-layout-check.sh --installed "$home/bin"
+          # an update: the archive unpacked over an existing install
+          tar -xzf fid-x86_64-linux.tar.gz -C "$home"
+          bash scripts/install-layout-check.sh --installed "$home/bin"
+      - name: Standard library docs, generated by scribe (N10)
+        # `fid doc` over stdlib/*.fd: a Markdown page per module and
+        # index.md, packed as build/fides-stdlib-docs.zip for the release
+        env:
+          FID: release/fid
+        run: |
+          command -v zip > /dev/null || sudo apt-get install -y -qq zip
+          bash scripts/stdlib-docs.sh --zip
+          test -f build/fides-stdlib-docs.zip
+          unzip -l build/fides-stdlib-docs.zip | tail -n 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-archive
+          path: fid-x86_64-linux.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stdlib-docs
+          path: build/fides-stdlib-docs.zip
+          if-no-files-found: error
+
+  crater:
+    name: Known projects (crater)
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-archive
+      - name: Build every known project with the new fid (ST6)
+        env:
+          CC: zig cc
+        run: |
+          set -u
+          home="$RUNNER_TEMP/fid"
+          mkdir -p "$home"
+          tar -xzf fid-x86_64-linux.tar.gz -C "$home"
+          if [ -f scripts/crater/baseline.txt ]; then
+            bash scripts/crater.sh "$home/bin/fid"
+          else
+            # the first run has no last release to compare with: report
+            bash scripts/crater.sh "$home/bin/fid" \
+              || echo "::warning::crater: no baseline yet; record one with scripts/crater.sh --save"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crater-results
+          path: build/crater/results.txt
+          if-no-files-found: ignore
+
+  publish:
+    name: Checksums, provenance, release
+    needs: [windows, linux, crater]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-archive
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: stdlib-docs
+          path: dist
+      - name: SHA256SUMS (ST10)
+        run: |
+          cd dist
+          sha256sum Fid-Setup-*.exe fid-*.tar.gz fides-stdlib-docs.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: Build provenance, one Sigstore attestation per file (ST10)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/Fid-Setup-*.exe
+            dist/fid-*.tar.gz
+            dist/fides-stdlib-docs.zip
+      - name: Attach to a draft release of the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/Fid-Setup-*.exe
+            dist/fid-*.tar.gz
+            dist/fides-stdlib-docs.zip
+            dist/SHA256SUMS
+      - name: Keep the files (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: dist/*

@@ -1,0 +1,1017 @@
+// stdlib/ext4: ext2 and ext4 images made by mke2fs -d (e2fsprogs 1.47.4) read: inodes, extents, indirect blocks, holes, symlinks, checksums. Then written and read back: on the ext2 image, files through direct, single, double and triple indirect blocks, truncation, mkdir/rename/rmdir/link/unlink/symlinks, inodes running out; on the ext4 image (metadata_csum), extent trees growing a level and splitting a leaf, truncation, directory blocks with checksums, renames, the vfs, a full disk; on a third image with a journal (see JRN_IMG), recovery of four transactions (escaped block, revoke), an htree directory written to, an extent tree of depth 2, a damaged commit block, needs_recovery without a journal.
+// e2fsck -fn (e2fsprogs 1.47.4, WSL) on the three images as this test leaves them, and on the states holding the triple-indirect file, the split leaf and the depth-2 tree: clean, exit code 0, no messages (Nov 17). The writes run through C (fid ccompile): fid run passes the ext2 part, then runs out of memory (docs/stdlib-agent-bugs.md, bug 20).
+// Expected output:
+// ext2 "fides-e2": block 1024, 128 blocks, 24 inodes, 1 groups, inode size 256, metadata_csum false
+// ls /: lost+found big.txt docs hello.txt link longlink sparse.bin
+// /hello.txt: Hello from ext2!
+// /big.txt: 15360 bytes, block 0 "block 00", block 12 (single indirect) "block 12", block 14 "block 14"
+// /sparse.bin: 20480 bytes, hole byte 1000 = 0, byte 6144 = 99, non-zero bytes 960
+// /link -> hello.txt, read through it: Hello from ext2!
+// /longlink: 79 byte target (slow symlink), following it: ENOENT
+// /docs/../docs/readme: doc
+// ext4 "fides-e4": block 1024, 256 blocks, 48 inodes, 64-bit descriptors 64, metadata_csum true, superblock checksum ok
+// every inode checksum ok: true
+// /sparse.bin: 6 extents (tree depth 1), logical 0 3 6 9 12 15, same bytes as on ext2: true
+// /many: 19 entries, first file_with_a_fairly_long_name_number_1
+// vfs /mnt/docs/readme: doc, /mnt/link: Hello from ext2!, ls /mnt/docs: readme
+// corrupted inode 15: checksum ok false, vfs stat EIO
+// unknown feature: unsupported incompat features 8000
+// bad magic: bad magic
+// ext2 writable true, 77 free blocks, 6 free inodes
+// create /new.txt: ok, reads written on ext2
+// /grow.bin: 15 blocks through the single indirect block, i_blocks 32, same bytes true
+// /far.bin: size 67383310, 7 blocks (2 data, 2 for the double tree, 3 for the triple), read back "dind" "tind", hole byte 0
+//   truncated to 1000: 0 blocks left, i_blocks 0
+// mkdir /dir2: ok, links of / 5
+// rename /dir2/a -> /docs/a2: ok, /docs/a2 reads A
+// rename /dir2 -> /docs/dir2: ok, .. is /docs true, links / 4 /docs 3
+// rename /docs into itself: EINVAL, rmdir /docs: ENOTEMPTY, unlink /docs: EISDIR
+// hard link /hello2.txt: ok, links 2, reads Hello from ext2!
+// unlink /big.txt: 16 blocks freed (15 data + 1 indirect), lookup ENOENT
+// symlinks: /short -> docs/a2 reads A, /long (82 bytes, slow) reads A
+// rmdir /docs/dir2: ok, links /docs 2, 74 free blocks, 1 free inodes
+// created until ENOSPC: 1 files
+// reopened: lost+found short docs hello.txt link longlink sparse.bin new.txt grow.bin far.bin hello2.txt long; 74 free blocks, 1 free inodes; bad inode checksums 0, bitmap/count mismatches 0, groups say 74/1 free
+//   /docs: readme a2
+// ext4 writable true, 180 free blocks, 10 free inodes
+// /frag.bin: 9 extents, depth 1, i_blocks 20, block 16 reads x16
+// /split.bin: 90 extents, depth 1, root entries 2, tree blocks 2, i_blocks 184, byte at 178K+1 s
+//   truncated to 100 KiB: 50 extents, depth 1, i_blocks 102
+// /frag.bin overwritten and appended: xYZ / tail, 10 extents, size 18436
+// /many: 25 entries in 2 blocks, added_..._5 reads 5
+// rename /many/file_with_a_fairly_long_name_number_1 -> /renamed: ok, replace /hello.txt by /renamed: ok, /hello.txt reads 1
+// vfs: mkdir ok, write ok, rename ok, truncate ok, reads through, rmdir ok, unlink ok
+// fill: wrote 111 KiB of 400, free blocks 0, another write ENOSPC, extents 2, same bytes true
+// after unlinking them: -7 blocks from the start
+// reopened: superblock checksum true, 173 free blocks, 5 free inodes; bad inode checksums 0, bitmap/count mismatches 0, groups say 173/5 free
+//   /: lost+found big.txt docs hello.txt longlink many sparse.bin v.txt
+// journal image without recovery: writable false (the journal needs recovery (opened without replaying it)), write EROFS, /note.txt journal test
+// recovered: true, 4 transactions, 3 blocks replayed, 1 revoked, bad checksums 0, writable true
+//   /note.txt replayed by t, block 2000 c03b39986573 (escaped magic restored), block 2002 00000000 (revoked), block 2003 third transaction
+//   journal start 0, sequence 6, needs_recovery false, second open recovers again false
+// /big: indexed true, 70 entries
+//   after a create and an unlink: indexed false, 70 entries, entry_with_a_long_name_70 reads f70, added reads added to an htree directory
+// /deep.bin: 400 extents, depth 2, tree blocks 6, 406 blocks used, byte at 798K d
+//   truncated to 300 KiB: 150 extents, depth 1, 152 blocks used
+// reopened: recovered false, 1713 free blocks, 41 free inodes; bad inode checksums 0, bitmap/count mismatches 0, groups say 1713/41 free
+// bad commit checksum in transaction 4: 3 transactions, 2 blocks, block 2003 00000000, /note.txt replayed by t
+// needs_recovery without a journal: needs journal recovery: no journal
+use ext4;
+use vfs;
+use ramfs;
+use vec;
+use string;
+use encoding;
+
+fn EXT2_IMG() -> str {
+    return "1024:1800000080000000000000004d000000060000000100000000000000000000000020000000200000180000000000000" +
+        "000f153650000ffff53ef01000100000000f15365000000000000000001000000000000000b0000000001000008000000020" +
+        "00000030000001111111122223333444455555555555566696465732d6532;1260:111111112222333344445555555555550" +
+        "10000000c0000000000000000f15365;1372:2000200001;1608:0b;2048:0300000004000000050000004d00060003;3072" +
+        ":ffffffffffff03000000000000000080fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "fffffffffffffffffffffffffffffffffffffffffffffffff;4096:ffff03fffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "fff;5129:f1536500f1536500f15365;5376:ed4100000004000000f1536500f1536500f1536500000000000004000200000" +
+        "000000000000000000b;5504:20;5521:f15365;7680:c04100000030000000f1536500f1536500f15365000000000000020" +
+        "01800000000000000000000000c0000000d0000000e0000000f0000001000000011000000120000001300000014000000150" +
+        "000001600000017;7808:20;7825:f15365;7936:a481e803003c0000928cfb6a928cfb6a8c8bfb6a00000000e8030100200" +
+        "00000000000000000000018000000190000001a0000001b0000001c0000001d0000001e0000001f000000200000002100000" +
+        "0220000002300000024;8064:20;8081:f15365;8192:ed41e80300040000928cfb6a928cfb6a7f8bfb6a00000000e803020" +
+        "002000000000000000000000028;8320:20;8337:f15365;8448:a481e80304000000928cfb6a928cfb6a7f8bfb6a0000000" +
+        "0e803010002000000000000000000000029;8576:20;8593:f15365;8704:a481e80311000000928cfb6a928cfb6a7f8bfb6" +
+        "a00000000e80301000200000000000000000000002a;8832:20;8849:f15365;8960:ffa1e80309000000928cfb6a928cfb6" +
+        "a7f8bfb6a00000000e803010000000000000000000000000068656c6c6f2e747874;9088:20;9105:f15365;9216:ffa1e80" +
+        "34f000000928cfb6a928cfb6a7f8bfb6a00000000e80301000200000000000000000000002b;9344:20;9361:f15365;9472" +
+        ":a481e803005000009b8bfb6a928cfb6a7f8bfb6a00000000e80301000e00000000000000000000002c00000000000000000" +
+        "000002d00000000000000000000002e00000000000000000000002f000000000000000000000030;9600:20;9617:f15365;" +
+        "11264:020000000c0001022e000000020000000c0002022e2e00000b00000014000a026c6f73742b666f756e6400000c0000" +
+        "00100007016269672e747874000d0000000c000402646f63730f0000001400090168656c6c6f2e747874000000100000000c" +
+        "0004076c696e6b11000000100008076c6f6e676c696e6b1200000088030a017370617273652e62696e;12288:0b0000000c0" +
+        "001022e00000002000000f40302022e2e;13317:04;14341:04;15365:04;16389:04;17413:04;18437:04;19461:04;204" +
+        "85:04;21509:04;22533:04;23557:04;24576:626c6f636b2030300a;25600:626c6f636b2030310a;26624:626c6f636b2" +
+        "030320a;27648:626c6f636b2030330a;28672:626c6f636b2030340a;29696:626c6f636b2030350a;30720:626c6f636b2" +
+        "030360a;31744:626c6f636b2030370a;32768:626c6f636b2030380a;33792:626c6f636b2030390a;34816:626c6f636b2" +
+        "031300a;35840:626c6f636b2031310a;36864:250000002600000027;37888:626c6f636b2031320a;38912:626c6f636b2" +
+        "031330a;39936:626c6f636b2031340a;40960:0d0000000c0001022e000000020000000c0002022e2e00000e000000e8030" +
+        "601726561646d65;41984:646f630a;43008:48656c6c6f2066726f6d2065787432210a;44032:646f63732f616161616161" +
+        "6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161" +
+        "61616161616161616161616161612e747874;45056:6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6" +
+        "b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b203" +
+        "00a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6" +
+        "368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a;46080:6368756e6b20310a6368756e6b2031" +
+        "0a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a63" +
+        "68756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a636875" +
+        "6e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a;47104:636" +
+        "8756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756" +
+        "e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b2" +
+        "0320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320" +
+        "a6368756e6b20320a;48128:6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20" +
+        "330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a" +
+        "6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368" +
+        "756e6b20330a6368756e6b20330a6368756e6b20330a;49152:31000000000000000000000032;50176:6368756e6b20340a" +
+        "6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368" +
+        "756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e" +
+        "6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20" +
+        "340a;51200:6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6" +
+        "b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b203" +
+        "50a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6" +
+        "368756e6b20350a6368756e6b20350a";
+}
+
+fn EXT4_IMG() -> str {
+    return "1024:300000000001000000000000b40000000a0000000100000000000000000000000020000000200000300000000000000" +
+        "09e8cfb6a0000ffff53ef0100010000009e8cfb6a000000000000000001000000000000000b0000000001000028000000c22" +
+        "200006b0400001111111122223333444455555555555566696465732d6534;1260:111111112222333344445555555555550" +
+        "10040000c0000000000000000f15365;1372:2000200001;1396:0401000064;1608:11;1648:5bbf3d64;2044:66e6b2d8;" +
+        "2048:030000001300000023000000b4000a0004000000000000000e7ddaa50a00aed9;2104:0d6ff4d4;3072:fffffffffff" +
+        "fffffff07;3103:80fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "f;4096:020000000c0001022e000000020000000c0002022e2e00000b00000014000a026c6f73742b666f756e6400000c000" +
+        "000100007016269672e747874000d0000000c000402646f63730f0000001400090168656c6c6f2e747874000000100000000" +
+        "c0004076c696e6b11000000100008076c6f6e676c696e6b120000000c0004026d616e792600000070030a017370617273652" +
+        "e62696e;5112:0c0000de209988f4;5120:0b0000000c0001022e00000002000000e80302022e2e;6136:0c0000de68c7ebb" +
+        "0;6148:f403;7160:0c0000de16f63e44;7172:f403;8184:0c0000de16f63e44;8196:f403;9208:0c0000de16f63e44;92" +
+        "20:f403;10232:0c0000de16f63e44;10244:f403;11256:0c0000de16f63e44;11268:f403;12280:0c0000de16f63e44;1" +
+        "2292:f403;13304:0c0000de16f63e44;13316:f403;14328:0c0000de16f63e44;14340:f403;15352:0c0000de16f63e44" +
+        ";15364:f403;16376:0c0000de16f63e44;16388:f403;17400:0c0000de16f63e44;17408:626c6f636b2030300a;18432:" +
+        "626c6f636b2030310a;19456:ffffffff3f00fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;20480:626c6f636b2030320a;2" +
+        "1504:626c6f636b2030330a;22528:626c6f636b2030340a;23552:626c6f636b2030350a;24576:626c6f636b2030360a;2" +
+        "5600:626c6f636b2030370a;26624:626c6f636b2030380a;27648:626c6f636b2030390a;28672:626c6f636b2031300a;2" +
+        "9696:626c6f636b2031310a;30720:626c6f636b2031320a;31744:626c6f636b2031330a;32768:626c6f636b2031340a;3" +
+        "3792:0d0000000c0001022e000000020000000c0002022e2e00000e000000dc030601726561646d65;34808:0c0000de6dc6" +
+        "7f49;34816:646f630a;35849:f1536500f1536500f15365;35964:cefd;36096:ed4100000004000000f1536500f1536500" +
+        "f1536500000000000005000200000000000800000000000af301000400000000000000000000000100000004;36220:c1ed0" +
+        "0002000f2bf00000000000000000000000000f15365;36476:3dd6;36732:d771;36988:994b;37244:4b05;37500:053f;3" +
+        "7756:9f4a;38012:d170;38268:033e;38400:c04100000030000000f1536500f1536500f153650000000000000200180000" +
+        "0000000800000000000af301000400000000000000000000000c00000005;38524:97f100002000376b00000000000000000" +
+        "000000000f15365;38656:a481e803003c00008c8bfb6a8c8bfb6a8c8bfb6a00000000e80301001e00000000000800000000" +
+        "000af302000400000000000000000000000200000011000000020000000d00000014;38780:b1ec000020006788000000000" +
+        "00000000000000000f15365;38912:ed41e803000400008c8bfb6a7f8bfb6a7f8bfb6a00000000e803020002000000000008" +
+        "00000000000af301000400000000000000000000000100000021;39036:c2000000200043550000000000000000000000000" +
+        "0f15365;39168:a481e803040000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af301" +
+        "000400000000000000000000000100000022;39292:78c2000020005f8400000000000000000000000000f15365;39424:a4" +
+        "81e803110000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af3010004000000000000" +
+        "0000000000010000002f;39548:9e6100002000b6fd00000000000000000000000000f15365;39680:ffa1e803090000007f" +
+        "8bfb6a7f8bfb6a7f8bfb6a00000000e803010000000000000000000000000068656c6c6f2e747874;39804:30d1000020002" +
+        "30400000000000000000000000000f15365;39936:ffa1e8034f0000007f8bfb6a7f8bfb6a7f8bfb6a00000000e803010002" +
+        "00000000000800000000000af301000400000000000000000000000100000030;40060:ed3100002000c3290000000000000" +
+        "0000000000000f15365;40192:ed41e80300040000928cfb6a928cfb6a928cfb6a00000000e8030200020000000000080000" +
+        "0000000af301000400000000000000000000000100000031;40316:80ab00002000ece100000000000000000000000000f15" +
+        "365;40448:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af3010004" +
+        "00000000000000000000000100000032;40572:d9e600002000e42400000000000000000000000000f15365;40704:a481e8" +
+        "03020000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af30100040000000000000000" +
+        "0000000100000033;40828:fe02000020005d2f00000000000000000000000000f15365;40960:a481e803020000008c8bfb" +
+        "6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af301000400000000000000000000000100000034" +
+        ";41084:9f6d00002000704400000000000000000000000000f15365;41216:a481e803020000008c8bfb6a7f8bfb6a7f8bfb" +
+        "6a00000000e80301000200000000000800000000000af301000400000000000000000000000100000035;41340:bf9800002" +
+        "0006e1100000000000000000000000000f15365;41472:a481e803020000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301" +
+        "000200000000000800000000000af301000400000000000000000000000100000036;41596:e76e00002000818c000000000" +
+        "00000000000000000f15365;41728:a481e803020000008c8bfb6a7f8bfb6a7f8bfb6a00000000e803010002000000000008" +
+        "00000000000af301000400000000000000000000000100000037;41852:8fa000002000ca7e0000000000000000000000000" +
+        "0f15365;41984:a481e803020000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af301" +
+        "000400000000000000000000000100000038;42108:6d8b000020008efd00000000000000000000000000f15365;42240:a4" +
+        "81e803020000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af3010004000000000000" +
+        "00000000000100000039;42364:4d7e0000200090a800000000000000000000000000f15365;42496:a481e803020000008c" +
+        "8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af30100040000000000000000000000010000" +
+        "003a;42620:1588000020007f3500000000000000000000000000f15365;42752:a481e803020000008c8bfb6a7f8bfb6a7f" +
+        "8bfb6a00000000e80301000200000000000800000000000af30100040000000000000000000000010000003b;42876:0d940" +
+        "0002000ad0200000000000000000000000000f15365;43008:a481e803020000008c8bfb6a7f8bfb6a7f8bfb6a00000000e8" +
+        "0301000200000000000800000000000af30100040000000000000000000000010000003c;43132:6cfb00002000806900000" +
+        "000000000000000000000f15365;43264:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000" +
+        "000800000000000af30100040000000000000000000000010000003d;43388:73f600002000f500000000000000000000000" +
+        "00000f15365;43520:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000a" +
+        "f30100040000000000000000000000010000003e;43644:2b00000020001a9d00000000000000000000000000f15365;4377" +
+        "6:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af301000400000000" +
+        "00000000000000010000003f;43900:81ce00002000ddf900000000000000000000000000f15365;44032:a481e803010000" +
+        "008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000000af3010004000000000000000000000001" +
+        "00000040;44156:44f700002000f95a00000000000000000000000000f15365;44288:a481e803010000008c8bfb6a7f8bfb" +
+        "6a7f8bfb6a00000000e80301000200000000000800000000000af301000400000000000000000000000100000041;44412:6" +
+        "40200002000e70f00000000000000000000000000f15365;44544:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a000000" +
+        "00e80301000200000000000800000000000af301000400000000000000000000000100000042;44668:3cf40000200008920" +
+        "0000000000000000000000000f15365;44800:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a00000000e8030100020000" +
+        "0000000800000000000af301000400000000000000000000000100000043;44924:24e800002000daa500000000000000000" +
+        "000000000f15365;45056:a481e803010000008c8bfb6a7f8bfb6a7f8bfb6a00000000e80301000200000000000800000000" +
+        "000af301000400000000000000000000000100000044;45180:458700002000f7ce00000000000000000000000000f15365;" +
+        "45312:a481e803005000009b8bfb6a7f8bfb6a7f8bfb6a00000000e80301000e00000000000800000000000af30100040001" +
+        "0000000000000000004a00000000000000030000000100000046000000060000000100000047000000090000000100000048" +
+        ";45436:66d600002000c41300000000000000000000000000f15365;48128:48656c6c6f2066726f6d2065787432210a;491" +
+        "52:646f63732f616161616161616161616161616161616161616161616161616161616161616161616161616161616161616" +
+        "161616161616161616161616161616161616161616161616161612e747874;50176:120000000c0001022e00000002000000" +
+        "0c0002022e2e0000130000003000250166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265" +
+        "725f31000000140000003000260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f" +
+        "31300000150000003000260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f3131" +
+        "0000160000003000260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f31320000" +
+        "170000003000260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f313300001800" +
+        "00003000260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f3134000019000000" +
+        "3000260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f313500001a0000003000" +
+        "260166696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f313600001b00000030002601" +
+        "66696c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f313700001c000000300026016669" +
+        "6c655f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f313800001d0000003000260166696c65" +
+        "5f776974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f313900001e0000003000250166696c655f77" +
+        "6974685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f320000001f0000003000250166696c655f776974" +
+        "685f615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f33000000200000003000250166696c655f776974685f" +
+        "615f666169726c795f6c6f6e675f6e616d655f6e756d6265725f34000000210000003000250166696c655f776974685f615f" +
+        "666169726c795f6c6f6e675f6e616d655f6e756d6265725f35000000220000003000250166696c655f776974685f615f6661" +
+        "69726c795f6c6f6e675f6e616d655f6e756d6265725f36000000230000003000250166696c655f776974685f615f66616972" +
+        "6c795f6c6f6e675f6e616d655f6e756d6265725f37000000240000003000250166696c655f776974685f615f666169726c79" +
+        "5f6c6f6e675f6e616d655f6e756d6265725f38000000250000007c00250166696c655f776974685f615f666169726c795f6c" +
+        "6f6e675f6e616d655f6e756d6265725f39;51192:0c0000de7aa2fe6c;51200:31;52224:3130;53248:3131;54272:3132;" +
+        "55296:3133;56320:3134;57344:3135;58368:3136;59392:3137;60416:3138;61440:3139;62464:32;63488:33;64512" +
+        ":34;65536:35;66560:36;67584:37;68608:38;69632:39;70656:6368756e6b20300a6368756e6b20300a6368756e6b203" +
+        "00a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6" +
+        "368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a63687" +
+        "56e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a6368756e6b20300a;71680:6368756e6b20310a63" +
+        "68756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a636875" +
+        "6e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b" +
+        "20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b20310a6368756e6b2031" +
+        "0a;72704:6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b2" +
+        "0320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320" +
+        "a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a6368756e6b20320a636" +
+        "8756e6b20320a6368756e6b20320a;73728:6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a" +
+        "6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368" +
+        "756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a6368756e" +
+        "6b20330a6368756e6b20330a6368756e6b20330a6368756e6b20330a;74752:6368756e6b20340a6368756e6b20340a63687" +
+        "56e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6" +
+        "b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b203" +
+        "40a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a6368756e6b20340a;75776:0af3060054" +
+        "0000000000000000000000010000004500000003000000010000004600000006000000010000004700000009000000010000" +
+        "00480000000c00000001000000490000000f000000010000004b;76796:4b79120c;76800:6368756e6b20350a6368756e6b" +
+        "20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b2035" +
+        "0a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a63" +
+        "68756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a6368756e6b20350a";
+}
+
+// A RAM disk of 1 KiB blocks from "offset:hex;offset:hex..." (zeros elsewhere).
+fn disk_from_sparse(s: str, nblocks: i64) -> BlockDev {
+    val d: BlockDev = memdisk_new(1024, nblocks);
+    val parts: Vec<str> = str_split(s, ";");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val kv: Vec<str> = str_split(parts.get(i), ":");
+        val off: i64 = str_parse_int(kv.get(0));
+        val bs: Vec<i64> = hex_decode_bytes(kv.get(1));
+        var lba: i64 = off / 1024;
+        var blk: Vec<i64> = blk_read(&d, lba);
+        var j: i64 = 0;
+        while j < bs.len() {
+            val o: i64 = off + j;
+            if o / 1024 != lba {
+                blk_write(&d, lba, blk);
+                lba = o / 1024;
+                blk = blk_read(&d, lba);
+            }
+            blk.set(o % 1024, bs.get(j));
+            j = j + 1;
+        }
+        blk_write(&d, lba, blk);
+        i = i + 1;
+    }
+    return d;
+}
+
+fn poke(d: & BlockDev, off: i64, value: i64) {
+    var blk: Vec<i64> = blk_read(d, off / 1024);
+    blk.set(off % 1024, value);
+    blk_write(d, off / 1024, blk);
+}
+
+fn peek(d: & BlockDev, off: i64) -> i64 {
+    return blk_read(d, off / 1024).get(off % 1024);
+}
+
+fn line_at(b: Vec<i64>, off: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = off;
+    while i < b.len() && b.get(i) != 10 && b.get(i) != 0 {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn names(fs: & Ext4Fs, path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val n: Ext4Inode = ext4_inode(fs, ext4_lookup(fs, path, true));
+    val es: Vec<Ext4Dirent> = ext4_readdir(fs, &n);
+    var i: i64 = 0;
+    while i < es.len() {
+        val nm: str = es.get(i).name;
+        if nm != "." && nm != ".." {
+            out.push(nm);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn e4_depth(n: & Ext4Inode) -> i64 {
+    return n.iblock.get(6) + n.iblock.get(7) * 256;
+}
+
+fn main() {
+    var e2: Ext4Fs = ext4_open(disk_from_sparse(EXT2_IMG(), 128));
+    println("ext2 \"" + e2.label + "\": block " + int_to_str(e2.bs) + ", " + int_to_str(e2.blocks_count) + " blocks, " + int_to_str(e2.inodes_count) + " inodes, " + int_to_str(e2.ngroups) + " groups, inode size " + int_to_str(e2.inode_size) + ", metadata_csum " + bool_to_str(e2.csum));
+    println("ls /: " + str_join(names(&e2, "/"), " "));
+    println("/hello.txt: " + line_at(ext4_read_file(&mut e2, "/hello.txt"), 0));
+    val big: Vec<i64> = ext4_read_file(&mut e2, "/big.txt");
+    println("/big.txt: " + int_to_str(big.len()) + " bytes, block 0 \"" + line_at(big, 0) + "\", block 12 (single indirect) \"" + line_at(big, 12 * 1024) + "\", block 14 \"" + line_at(big, 14 * 1024) + "\"");
+    val sp: Vec<i64> = ext4_read_file(&mut e2, "/sparse.bin");
+    var nz: i64 = 0;
+    var i: i64 = 0;
+    while i < sp.len() {
+        if sp.get(i) != 0 {
+            nz = nz + 1;
+        }
+        i = i + 1;
+    }
+    println("/sparse.bin: " + int_to_str(sp.len()) + " bytes, hole byte 1000 = " + int_to_str(sp.get(1000)) + ", byte 6144 = " + int_to_str(sp.get(6144)) + ", non-zero bytes " + int_to_str(nz));
+    val ln: Ext4Inode = ext4_inode(&e2, ext4_lookup(&e2, "/link", false));
+    println("/link -> " + ext4_readlink(&e2, &ln) + ", read through it: " + line_at(ext4_read_file(&mut e2, "/link"), 0));
+    val ll: Ext4Inode = ext4_inode(&e2, ext4_lookup(&e2, "/longlink", false));
+    println("/longlink: " + int_to_str(str_len(ext4_readlink(&e2, &ll))) + " byte target (slow symlink), following it: " + vfs_errno_name(ext4_lookup(&e2, "/longlink", true)));
+    println("/docs/../docs/readme: " + line_at(ext4_read_file(&mut e2, "/docs/../docs/readme"), 0));
+
+    val d4: BlockDev = disk_from_sparse(EXT4_IMG(), 256);
+    val e4: Ext4Fs = ext4_open(d4);
+    println("ext4 \"" + e4.label + "\": block " + int_to_str(e4.bs) + ", " + int_to_str(e4.blocks_count) + " blocks, " + int_to_str(e4.inodes_count) + " inodes, 64-bit descriptors " + int_to_str(e4.desc_size) + ", metadata_csum " + bool_to_str(e4.csum) + ", superblock checksum " + str_replace(bool_to_str(e4.sb_csum_ok), "true", "ok"));
+    var all_ok: bool = true;
+    var ino: i64 = 1;
+    while ino <= e4.inodes_count {
+        val n: Ext4Inode = ext4_inode(&e4, ino);
+        if n.mode != 0 && !n.csum_ok {
+            all_ok = false;
+        }
+        ino = ino + 1;
+    }
+    println("every inode checksum ok: " + bool_to_str(all_ok));
+    val sn: Ext4Inode = ext4_inode(&e4, ext4_lookup(&e4, "/sparse.bin", true));
+    val ex: Vec<i64> = ext4_extents(&e4, &sn);
+    var starts: Vec<i64> = Vec::new();
+    i = 0;
+    while i < ex.len() {
+        starts.push(ex.get(i));
+        i = i + 4;
+    }
+    val sp4: Vec<i64> = ext4_read(&e4, &sn, 0, sn.size);
+    var same: bool = sp4.len() == sp.len();
+    i = 0;
+    while same && i < sp.len() {
+        if sp.get(i) != sp4.get(i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    println("/sparse.bin: " + int_to_str(starts.len()) + " extents (tree depth " + int_to_str(e4_depth(&sn)) + "), logical " + str_join_ints(starts, " ") + ", same bytes as on ext2: " + bool_to_str(same));
+    val many: Vec<str> = names(&e4, "/many");
+    println("/many: " + int_to_str(many.len()) + " entries, first " + many.get(0));
+
+    var v: Vfs = vfs_new();
+    vfs_mount(&mut v, "/", ramfs_ops(), ramfs_new());
+    vfs_mkdir(&mut v, "/mnt", 493);
+    ext4_mount(&mut v, "/mnt", e4);
+    println("vfs /mnt/docs/readme: " + line_at(vfs_read_file(&mut v, "/mnt/docs/readme"), 0) + ", /mnt/link: " + line_at(vfs_read_file(&mut v, "/mnt/link"), 0) + ", ls /mnt/docs: " + str_join(vfs_list(&mut v, "/mnt/docs"), " "));
+
+    // inode 15 (hello.txt) is in the inode table at block 35
+    val off15: i64 = 35 * 1024 + 14 * 256;
+    poke(&d4, off15 + 4, peek(&d4, off15 + 4) ^ 1);
+    val bad: Ext4Fs = ext4_open(d4);
+    val b15: Ext4Inode = ext4_inode(&bad, 15);
+    var v2: Vfs = vfs_new();
+    ext4_mount(&mut v2, "/", bad);
+    println("corrupted inode 15: checksum ok " + bool_to_str(b15.csum_ok) + ", vfs stat " + vfs_errno_name(vfs_stat(&mut v2, "/hello.txt").err));
+
+    val d2: BlockDev = disk_from_sparse(EXT2_IMG(), 128);
+    poke(&d2, 1024 + 97, 128);
+    println("unknown feature: " + ext4_open(d2).err);
+    poke(&d2, 1024 + 56, 0);
+    println("bad magic: " + ext4_open(d2).err);
+    write_ext2();
+    write_ext4();
+    journal_tests();
+}
+
+// ─── Writing ──────────────────────────────────────────────────────────────
+
+fn bytes_of(s: str) -> Vec<i64> {
+    return str_bytes(s);
+}
+
+fn pattern(n: i64, seed: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push((i * 7 + seed + i / 1024) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn same_bytes(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn stat_of(fs: & Ext4Fs, path: str) -> Ext4Inode {
+    return ext4_inode(fs, ext4_lookup(fs, path, false));
+}
+
+fn errno_of(r: i64) -> str {
+    if r >= 0 {
+        return "ok";
+    }
+    return vfs_errno_name(r);
+}
+
+fn counts(fs: & Ext4Fs) -> str {
+    return int_to_str(fs.free_blocks) + " free blocks, " + int_to_str(fs.free_inodes) + " free inodes";
+}
+
+// Every inode in use has a good checksum, and every group's counts agree
+// with its bitmaps.
+fn audit(fs: & Ext4Fs) -> str {
+    var bad: i64 = 0;
+    var ino: i64 = 1;
+    while ino <= fs.inodes_count {
+        val n: Ext4Inode = ext4_inode(fs, ino);
+        if n.mode != 0 && n.links > 0 && !n.csum_ok {
+            bad = bad + 1;
+        }
+        ino = ino + 1;
+    }
+    var fb: i64 = 0;
+    var fi: i64 = 0;
+    var mism: i64 = 0;
+    var g: i64 = 0;
+    while g < fs.ngroups {
+        val r: Ext4Group = ext4_group(fs, g);
+        val bm: Vec<i64> = ext4_block(fs, r.block_bitmap);
+        var free: i64 = 0;
+        var i: i64 = 0;
+        val nb: i64 = e4_min_t(fs.bpg, fs.blocks_count - fs.first_data_block - g * fs.bpg);
+        while i < nb {
+            if (bm.get(i / 8) & (1 << (i % 8))) == 0 {
+                free = free + 1;
+            }
+            i = i + 1;
+        }
+        if free != r.free_blocks {
+            mism = mism + 1;
+        }
+        val im: Vec<i64> = ext4_block(fs, r.inode_bitmap);
+        var ifree: i64 = 0;
+        i = 0;
+        while i < fs.ipg {
+            if (im.get(i / 8) & (1 << (i % 8))) == 0 {
+                ifree = ifree + 1;
+            }
+            i = i + 1;
+        }
+        if ifree != r.free_inodes {
+            mism = mism + 1;
+        }
+        fb = fb + r.free_blocks;
+        fi = fi + r.free_inodes;
+        g = g + 1;
+    }
+    return "bad inode checksums " + int_to_str(bad) + ", bitmap/count mismatches " + int_to_str(mism) + ", groups say " + int_to_str(fb) + "/" + int_to_str(fi) + " free";
+}
+
+fn e4_min_t(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn write_ext2() {
+    val d: BlockDev = disk_from_sparse(EXT2_IMG(), 128);
+    var fs: Ext4Fs = ext4_open(d);
+    println("ext2 writable " + bool_to_str(fs.writable) + ", " + counts(&fs));
+    println("create /new.txt: " + errno_of(ext4_write_file(&mut fs, "/new.txt", bytes_of("written on ext2\n"))) + ", reads " + line_at(ext4_read_file(&mut fs, "/new.txt"), 0));
+    val g14: Vec<i64> = pattern(14 * 1024 + 100, 3);
+    ext4_write_file(&mut fs, "/grow.bin", g14);
+    val gi: Ext4Inode = stat_of(&fs, "/grow.bin");
+    println("/grow.bin: 15 blocks through the single indirect block, i_blocks " + int_to_str(gi.blocks) + ", same bytes " + bool_to_str(same_bytes(&g14, &ext4_read_file(&mut fs, "/grow.bin"))));
+    // sparse writes reaching the double and triple indirect trees
+    val before: i64 = fs.free_blocks;
+    val far: i64 = ext4_create(&mut fs, EXT4_ROOT_INO, "far.bin", 420);
+    ext4_write(&mut fs, far, 300 * 1024, bytes_of("dind"));
+    ext4_write(&mut fs, far, 65804 * 1024 + 10, bytes_of("tind"));
+    val fi: Ext4Inode = ext4_inode(&fs, far);
+    println("/far.bin: size " + int_to_str(fi.size) + ", " + int_to_str(before - fs.free_blocks) + " blocks (2 data, 2 for the double tree, 3 for the triple), read back \"" + str_from_bytes(ext4_read(&fs, &fi, 300 * 1024, 4)) + "\" \"" + str_from_bytes(ext4_read(&fs, &fi, 65804 * 1024 + 10, 4)) + "\", hole byte " + int_to_str(ext4_read(&fs, &fi, 5000, 1).get(0)));
+    ext4_truncate(&mut fs, far, 1000);
+    println("  truncated to 1000: " + int_to_str(before - fs.free_blocks) + " blocks left, i_blocks " + int_to_str(ext4_inode(&fs, far).blocks));
+    // directories, rename, links
+    println("mkdir /dir2: " + errno_of(ext4_mkdir_path(&mut fs, "/dir2", 493)) + ", links of / " + int_to_str(ext4_inode(&fs, EXT4_ROOT_INO).links));
+    ext4_write_file(&mut fs, "/dir2/a", bytes_of("A\n"));
+    println("rename /dir2/a -> /docs/a2: " + errno_of(ext4_rename_path(&mut fs, "/dir2/a", "/docs/a2")) + ", /docs/a2 reads " + line_at(ext4_read_file(&mut fs, "/docs/a2"), 0));
+    println("rename /dir2 -> /docs/dir2: " + errno_of(ext4_rename_path(&mut fs, "/dir2", "/docs/dir2")) + ", .. is /docs " + bool_to_str(ext4_lookup(&fs, "/docs/dir2/..", true) == ext4_lookup(&fs, "/docs", true)) + ", links / " + int_to_str(ext4_inode(&fs, EXT4_ROOT_INO).links) + " /docs " + int_to_str(stat_of(&fs, "/docs").links));
+    println("rename /docs into itself: " + errno_of(ext4_rename_path(&mut fs, "/docs", "/docs/dir2/x")) + ", rmdir /docs: " + errno_of(ext4_rmdir_path(&mut fs, "/docs")) + ", unlink /docs: " + errno_of(ext4_unlink_path(&mut fs, "/docs")));
+    val hl: i64 = ext4_link(&mut fs, ext4_lookup(&fs, "/hello.txt", true), EXT4_ROOT_INO, "hello2.txt");
+    println("hard link /hello2.txt: " + errno_of(hl) + ", links " + int_to_str(stat_of(&fs, "/hello.txt").links) + ", reads " + line_at(ext4_read_file(&mut fs, "/hello2.txt"), 0));
+    val fb0: i64 = fs.free_blocks;
+    ext4_unlink_path(&mut fs, "/big.txt");
+    println("unlink /big.txt: " + int_to_str(fs.free_blocks - fb0) + " blocks freed (15 data + 1 indirect), lookup " + vfs_errno_name(ext4_lookup(&fs, "/big.txt", true)));
+    ext4_symlink_path(&mut fs, "docs/a2", "/short");
+    ext4_symlink_path(&mut fs, str_repeat("../docs/", 10) + "a2", "/long");
+    println("symlinks: /short -> " + ext4_readlink(&fs, &stat_of(&fs, "/short")) + " reads " + line_at(ext4_read_file(&mut fs, "/short"), 0) + ", /long (" + int_to_str(stat_of(&fs, "/long").size) + " bytes, slow) reads " + line_at(ext4_read_file(&mut fs, "/long"), 0));
+    println("rmdir /docs/dir2: " + errno_of(ext4_rmdir_path(&mut fs, "/docs/dir2")) + ", links /docs " + int_to_str(stat_of(&fs, "/docs").links) + ", " + counts(&fs));
+    // fill the inodes
+    var made: i64 = 0;
+    var r: i64 = 0;
+    while r >= 0 && made < 50 {
+        r = ext4_create(&mut fs, EXT4_ROOT_INO, "f" + int_to_str(made), 420);
+        if r >= 0 {
+            made = made + 1;
+        }
+    }
+    println("created until " + vfs_errno_name(r) + ": " + int_to_str(made) + " files");
+    var k: i64 = 0;
+    while k < made {
+        ext4_unlink(&mut fs, EXT4_ROOT_INO, "f" + int_to_str(k));
+        k = k + 1;
+    }
+    // e2fsck: ext2
+    val again: Ext4Fs = ext4_open(d);
+    println("reopened: " + str_join(names(&again, "/"), " ") + "; " + counts(&again) + "; " + audit(&again));
+    println("  /docs: " + str_join(names(&again, "/docs"), " "));
+}
+
+fn write_ext4() {
+    val d: BlockDev = disk_from_sparse(EXT4_IMG(), 256);
+    var fs: Ext4Fs = ext4_open(d);
+    val start_free: i64 = fs.free_blocks;
+    println("ext4 writable " + bool_to_str(fs.writable) + ", " + counts(&fs));
+    // fragmented: one block at every other logical block
+    val fr: i64 = ext4_create(&mut fs, EXT4_ROOT_INO, "frag.bin", 420);
+    var lb: i64 = 0;
+    while lb < 18 {
+        ext4_write(&mut fs, fr, lb * 1024, bytes_of("x" + int_to_str(lb)));
+        lb = lb + 2;
+    }
+    val fn1: Ext4Inode = ext4_inode(&fs, fr);
+    println("/frag.bin: " + int_to_str(ext4_extents(&fs, &fn1).len() / 4) + " extents, depth " + int_to_str(e4_depth(&fn1)) + ", i_blocks " + int_to_str(fn1.blocks) + ", block 16 reads " + line_at(ext4_read(&fs, &fn1, 16 * 1024, 4), 0));
+    // 90 extents: the leaf splits
+    val sp: i64 = ext4_create(&mut fs, EXT4_ROOT_INO, "split.bin", 420);
+    lb = 0;
+    while lb < 180 {
+        ext4_write(&mut fs, sp, lb * 1024 + 1, bytes_of("s"));
+        lb = lb + 2;
+    }
+    val sn: Ext4Inode = ext4_inode(&fs, sp);
+    println("/split.bin: " + int_to_str(ext4_extents(&fs, &sn).len() / 4) + " extents, depth " + int_to_str(e4_depth(&sn)) + ", root entries " + int_to_str(sn.iblock.get(2)) + ", tree blocks " + int_to_str(ext4_extent_tree_blocks(&fs, &sn).len()) + ", i_blocks " + int_to_str(sn.blocks) + ", byte at 178K+1 " + str_from_bytes(ext4_read(&fs, &sn, 178 * 1024 + 1, 1)));
+    ext4_truncate(&mut fs, sp, 100 * 1024);
+    val sn2: Ext4Inode = ext4_inode(&fs, sp);
+    println("  truncated to 100 KiB: " + int_to_str(ext4_extents(&fs, &sn2).len() / 4) + " extents, depth " + int_to_str(e4_depth(&sn2)) + ", i_blocks " + int_to_str(sn2.blocks));
+    // overwrite in place and append
+    ext4_write(&mut fs, fr, 1, bytes_of("YZ"));
+    ext4_write(&mut fs, fr, 18 * 1024, bytes_of("tail"));
+    val fn2: Ext4Inode = ext4_inode(&fs, fr);
+    println("/frag.bin overwritten and appended: " + line_at(ext4_read(&fs, &fn2, 0, 8), 0) + " / " + line_at(ext4_read(&fs, &fn2, 18 * 1024, 8), 0) + ", " + int_to_str(ext4_extents(&fs, &fn2).len() / 4) + " extents, size " + int_to_str(fn2.size));
+    // directories with checksums
+    var i: i64 = 0;
+    while i < 6 {
+        ext4_write_file(&mut fs, "/many/added_file_with_another_long_name_" + int_to_str(i), bytes_of(int_to_str(i)));
+        i = i + 1;
+    }
+    val mn: Ext4Inode = stat_of(&fs, "/many");
+    println("/many: " + int_to_str(names(&fs, "/many").len()) + " entries in " + int_to_str(mn.size / 1024) + " blocks, added_..._5 reads " + line_at(ext4_read_file(&mut fs, "/many/added_file_with_another_long_name_5"), 0));
+    println("rename /many/file_with_a_fairly_long_name_number_1 -> /renamed: " + errno_of(ext4_rename_path(&mut fs, "/many/file_with_a_fairly_long_name_number_1", "/renamed")) + ", replace /hello.txt by /renamed: " + errno_of(ext4_rename_path(&mut fs, "/renamed", "/hello.txt")) + ", /hello.txt reads " + line_at(ext4_read_file(&mut fs, "/hello.txt"), 0));
+    // through the vfs
+    var v: Vfs = vfs_new();
+    vfs_mount(&mut v, "/", ramfs_ops(), ramfs_new());
+    vfs_mkdir(&mut v, "/mnt", 493);
+    val h: i64 = ext4_mount(&mut v, "/mnt", fs);
+    println("vfs: mkdir " + errno_of(vfs_mkdir(&mut v, "/mnt/vdir", 493)) + ", write " + errno_of(vfs_write_file(&mut v, "/mnt/vdir/v.txt", bytes_of("through the vfs\n"))) + ", rename " + errno_of(vfs_rename(&mut v, "/mnt/vdir/v.txt", "/mnt/v.txt")) + ", truncate " + errno_of(vfs_truncate(&mut v, "/mnt/v.txt", 7)) + ", reads " + str_from_bytes(vfs_read_file(&mut v, "/mnt/v.txt")) + ", rmdir " + errno_of(vfs_rmdir(&mut v, "/mnt/vdir")) + ", unlink " + errno_of(vfs_unlink(&mut v, "/mnt/link")));
+    fs = ext4_mounted(h);
+    // fill the disk, then free it again
+    val big: i64 = ext4_create(&mut fs, EXT4_ROOT_INO, "fill.bin", 420);
+    val wrote: i64 = ext4_write(&mut fs, big, 0, pattern(400 * 1024, 1));
+    val bn: Ext4Inode = ext4_inode(&fs, big);
+    println("fill: wrote " + int_to_str(wrote / 1024) + " KiB of 400, free blocks " + int_to_str(fs.free_blocks) + ", another write " + errno_of(ext4_write(&mut fs, fr, 40 * 1024, bytes_of("z"))) + ", extents " + int_to_str(ext4_extents(&fs, &bn).len() / 4) + ", same bytes " + bool_to_str(same_bytes(&ext4_read(&fs, &bn, 0, wrote), &pattern(wrote, 1))));
+    ext4_unlink_path(&mut fs, "/fill.bin");
+    ext4_unlink_path(&mut fs, "/split.bin");
+    ext4_unlink_path(&mut fs, "/frag.bin");
+    println("after unlinking them: " + int_to_str(fs.free_blocks - start_free) + " blocks from the start");
+    // e2fsck: ext4
+    val again: Ext4Fs = ext4_open(d);
+    println("reopened: superblock checksum " + bool_to_str(again.sb_csum_ok) + ", " + counts(&again) + "; " + audit(&again));
+    println("  /: " + str_join(names(&again, "/"), " "));
+}
+
+fn journal_tests() {
+    val d: BlockDev = disk_from_sparse(JRN_IMG(), 3072);
+    val ro: Ext4Fs = ext4_open_opts(d, false);
+    var rof: Ext4Fs = ro;
+    println("journal image without recovery: writable " + bool_to_str(ro.writable) + " (" + ro.ro_reason + "), write " + errno_of(ext4_write_file(&mut rof, "/x", bytes_of("x"))) + ", /note.txt " + line_at(ext4_read_file(&mut rof, "/note.txt"), 0));
+    var fs: Ext4Fs = ext4_open(d);
+    println("recovered: " + bool_to_str(fs.recovered) + ", " + int_to_str(fs.replayed_transactions) + " transactions, " + int_to_str(fs.replayed_blocks) + " blocks replayed, " + int_to_str(fs.revoked_blocks) + " revoked, bad checksums " + int_to_str(fs.journal_bad_checksums) + ", writable " + bool_to_str(fs.writable));
+    println("  /note.txt " + line_at(ext4_read_file(&mut fs, "/note.txt"), 0) + ", block 2000 " + hex_encode_bytes(e4_first(ext4_block(&fs, 2000), 6)) + " (escaped magic restored), block 2002 " + hex_encode_bytes(e4_first(ext4_block(&fs, 2002), 4)) + " (revoked), block 2003 " + line_at(ext4_block(&fs, 2003), 0));
+    val jn: Ext4Inode = ext4_inode(&fs, 8);
+    val jsb: Vec<i64> = ext4_block(&fs, ext4_block_map(&fs, &jn).get(0));
+    println("  journal start " + int_to_str(be32(&jsb, 28)) + ", sequence " + int_to_str(be32(&jsb, 24)) + ", needs_recovery " + bool_to_str((fs.incompat & 4) != 0) + ", second open recovers again " + bool_to_str(ext4_open(d).recovered));
+    // an htree directory written to
+    val bi: Ext4Inode = stat_of(&fs, "/big");
+    println("/big: indexed " + bool_to_str((bi.flags & 4096) != 0) + ", " + int_to_str(names(&fs, "/big").len()) + " entries");
+    ext4_write_file(&mut fs, "/big/added", bytes_of("added to an htree directory\n"));
+    ext4_unlink_path(&mut fs, "/big/entry_with_a_long_name_5");
+    val bi2: Ext4Inode = stat_of(&fs, "/big");
+    println("  after a create and an unlink: indexed " + bool_to_str((bi2.flags & 4096) != 0) + ", " + int_to_str(names(&fs, "/big").len()) + " entries, entry_with_a_long_name_70 reads " + line_at(ext4_read_file(&mut fs, "/big/entry_with_a_long_name_70"), 0) + ", added reads " + line_at(ext4_read_file(&mut fs, "/big/added"), 0));
+    // a tree of depth 2
+    val dp: i64 = ext4_create(&mut fs, EXT4_ROOT_INO, "deep.bin", 420);
+    val free0: i64 = fs.free_blocks;
+    var lb: i64 = 0;
+    while lb < 800 {
+        ext4_write(&mut fs, dp, lb * 1024, bytes_of("d"));
+        lb = lb + 2;
+    }
+    val dn: Ext4Inode = ext4_inode(&fs, dp);
+    println("/deep.bin: " + int_to_str(ext4_extents(&fs, &dn).len() / 4) + " extents, depth " + int_to_str(e4_depth(&dn)) + ", tree blocks " + int_to_str(ext4_extent_tree_blocks(&fs, &dn).len()) + ", " + int_to_str(free0 - fs.free_blocks) + " blocks used, byte at 798K " + str_from_bytes(ext4_read(&fs, &dn, 798 * 1024, 1)));
+    ext4_truncate(&mut fs, dp, 300 * 1024);
+    val dn2: Ext4Inode = ext4_inode(&fs, dp);
+    println("  truncated to 300 KiB: " + int_to_str(ext4_extents(&fs, &dn2).len() / 4) + " extents, depth " + int_to_str(e4_depth(&dn2)) + ", " + int_to_str(free0 - fs.free_blocks) + " blocks used");
+    ext4_mkdir_path(&mut fs, "/newdir", 493);
+    ext4_write_file(&mut fs, "/newdir/inside", bytes_of("inside\n"));
+    // e2fsck: journal
+    val again: Ext4Fs = ext4_open(d);
+    println("reopened: recovered " + bool_to_str(again.recovered) + ", " + counts(&again) + "; " + audit(&again));
+    // a damaged commit block ends the log: transaction 4 is not replayed
+    val d2: BlockDev = disk_from_sparse(JRN_IMG(), 3072);
+    val j0: Ext4Fs = ext4_open_opts(d2, false);
+    val jn0: Ext4Inode = ext4_inode(&j0, 8);
+    val commit4: i64 = ext4_block_map(&j0, &jn0).get(12);
+    poke(&d2, commit4 * 1024 + 100, 1);
+    var f2: Ext4Fs = ext4_open(d2);
+    println("bad commit checksum in transaction 4: " + int_to_str(f2.replayed_transactions) + " transactions, " + int_to_str(f2.replayed_blocks) + " blocks, block 2003 " + hex_encode_bytes(e4_first(ext4_block(&f2, 2003), 4)) + ", /note.txt " + line_at(ext4_read_file(&mut f2, "/note.txt"), 0));
+    // no journal but needs_recovery
+    val d3: BlockDev = disk_from_sparse(EXT2_IMG(), 128);
+    poke(&d3, 1024 + 96, peek(&d3, 1024 + 96) | 4);
+    println("needs_recovery without a journal: " + ext4_open(d3).err);
+}
+
+fn e4_first(b: Vec<i64>, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n && i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn be32(b: & Vec<i64>, o: i64) -> i64 {
+    return ((b.get(o) * 256 + b.get(o + 1)) * 256 + b.get(o + 2)) * 256 + b.get(o + 3);
+}
+
+// A 3 MiB ext4 image with a journal, made in WSL with e2fsprogs 1.47.4:
+//   mkdir -p root/big; echo "journal test" > root/note.txt
+//   for i in $(seq 1 70); do echo "f$i" > root/big/entry_with_a_long_name_$i; done
+//   mke2fs -q -F -t ext4 -b 1024 -L fides-j -U 11111111-2222-3333-4444-555555555555 //     -E hash_seed=11111111-2222-3333-4444-555555555555,lazy_itable_init=0 -J size=1 -N 128 -d root j.img 3072
+//   e2fsck -fyD j.img            (indexes /big: an htree directory)
+//   debugfs -w -f cmds j.img     with cmds: jo -c / jw -b 1203,2000 t1.blk / jw -b 2002 x.blk /
+//                                jw -r 2002 /dev/null / jw -b 2003 y.blk / jc
+// (t1.blk: "replayed by the journal" for /note.txt's block 1203, then a block
+// starting with the jbd2 magic, logged escaped; x.blk "revoked: must not
+// appear"; y.blk "third transaction"). The image needs recovery; e2fsck -fy
+// replays it to the same blocks the test reads. "offset:hex" runs of
+// non-zero bytes.
+fn JRN_IMG() -> str {
+    return "1024:80000000000c0000990000004b0700002c00000001;1057:2000000020000080;1072:6755fc6a0000ffff53ef01000" +
+        "10000000d55fc6a;1100:01;1108:0b000000000100003c100000c62200006b0400001111111122223333444455555555555" +
+        "566696465732d6a;1230:17;1248:08;1260:11111111222233334444555555555555010140000c;1288:0d55fc6a0af3030" +
+        "004;1308:0200000028000000020000000f0000002b00000011000000ef0300005b;1358:10;1372:2000200001;1396:040" +
+        "10000d0;1608:3c04;1648:5bbf3d64;1664:0c;2044:e5a24a4c1a0000002a0000003a0000004b072c00030004000000000" +
+        "0a5f2f0e12c005d48;2104:f252202a;26624:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffff0f;27007:80fffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "fffffffffffffffffffffffffffff020000000c0001022e000000020000000c0002022e2e00000b00000014000a026c6f737" +
+        "42b666f756e6400000d0000000c0003026269670054000000bc0308016e6f74652e747874;28664:0c0000de4c9743370b00" +
+        "00000c0001022e00000002000000e80302022e2e;29688:0c0000de68c7ebb000000000f403;30712:0c0000de16f63e4400" +
+        "000000f403;31736:0c0000de16f63e4400000000f403;32760:0c0000de16f63e4400000000f403;33784:0c0000de16f63" +
+        "e4400000000f403;34808:0c0000de16f63e4400000000f403;35832:0c0000de16f63e4400000000f403;36856:0c0000de" +
+        "16f63e4400000000f403;37880:0c0000de16f63e4400000000f403;38904:0c0000de16f63e4400000000f403;39928:0c0" +
+        "000de16f63e4400000000f403;40952:0c0000de16f63e44c03b399800000004000000000000040000000400000000010000" +
+        "000100000001;41003:13000000001111111122223333444455555555555500000001;41040:04;41212:a47141af;41984:" +
+        "c03b39980000000100000001000004b3;42008:0f9a762f;42030:07d00000000b0000000063d3e857;42188:11111111222" +
+        "233334444555555555555;43004:840cd404ffffffffffffffffffff0f0000000000ffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7265706c61796564" +
+        "20627920746865206a6f75726e616c0a;45060:6573636170656420626c6f636b0a;46080:c03b3998000000020000000100" +
+        "000000de9cee84;46128:6afc5567000000001eeb8ae8;47104:c03b39980000000100000002000007d20000000800000000" +
+        "4d4bb29d;47308:11111111222233334444555555555555;48124:f15e0cd97265766f6b65643a206d757374206e6f742061" +
+        "70706561720a;49152:c03b399800000002000000020000000034532321;49200:6afc5567000000001eebec90;50176:c03" +
+        "b399800000005000000030000001800000000000007d2;51196:99d8418ac03b399800000002000000030000000013763d17" +
+        ";51248:6afc5567000000001eec0bd0;52224:c03b39980000000100000004000007d3000000080000000055f011bf;52428" +
+        ":11111111222233334444555555555555;53244:11e8f3827468697264207472616e73616374696f6e0a;54272:c03b39980" +
+        "000000200000004000000001416e859;54320:6afc5567000000001eecea78;59400:0d55fc6a0d55fc6a0d55fc6a;59516:" +
+        "f098;59648:ed410000000400000d55fc6a0d55fc6a0d55fc6a00000000000004000200000000000800000000000af301000" +
+        "4;59704:010000001b;59772:a649000020002895;59792:0d55fc6a;60028:3dd6;60284:d771;60540:994b;60796:4b05" +
+        ";60928:80810000003004040d55fc6a0d55fc6a0d55fc6a000000000000010030;61020:5a;61052:15010000200075e3;61" +
+        "072:0d55fc6a;61184:80810000000010000d55fc6a0d55fc6a0d55fc6a00000000000001000008000000000800000000000" +
+        "af3030004;61240:0200000028000000020000000f0000002b00000011000000ef0300005b;61308:527800002000dcb1;61" +
+        "328:0d55fc6a;61564:d170;61820:033e;61952:c0410000003000000d55fc6a0d55fc6a0d55fc6a0000000000000200180" +
+        "0000000000800000000000af3010004;62008:0c0000001c;62076:721500002000943e;62096:0d55fc6a;62208:8081000" +
+        "0008000000d55fc6a0d55fc6a0d55fc6a00000000000001004000000000000800000000000af3010004;62264:200000004a" +
+        "04;62332:7f65000020009c90;62352:0d55fc6a;62464:ed41e803001000000d55fc6a0d55fc6a0d55fc6a00000000e8030" +
+        "2000800000000100800000000000af3040004;62520:010000006a0400000100000001000000860400000200000001000000" +
+        "a30400000300000001000000b404;62588:a06f00002000e9d0;62608:0d55fc6a;62720:a481e803030000000d55fc6a0d5" +
+        "5fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;62776:010000006b04;62844:2a350000200" +
+        "0c82f;62864:0d55fc6a;62976:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010002000000000008000" +
+        "00000000af3010004;63032:010000006c04;63100:2002000020001428;63120:0d55fc6a;63232:a481e803040000000d5" +
+        "5fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;63288:010000006d04;63356:591" +
+        "e000020008054;63376:0d55fc6a;63488:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030100020000000" +
+        "0000800000000000af3010004;63544:010000006e04;63612:01e8000020006fc9;63632:0d55fc6a;63744:a481e803040" +
+        "000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;63800:010000006f04;6" +
+        "3868:211d00002000719c;63888:0d55fc6a;64000:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000" +
+        "200000000000800000000000af3010004;64056:010000007004;64124:34c9000020000bca;64144:0d55fc6a;64256:a48" +
+        "1e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;64312:010000" +
+        "007104;64380:2cd500002000d9fd;64400:0d55fc6a;64512:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e" +
+        "80301000200000000000800000000000af3010004;64568:010000007204;64636:7423000020003660;64656:0d55fc6a;6" +
+        "4768:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;6482" +
+        "4:010000007304;64892:54d6000020002835;64912:0d55fc6a;65024:a481e803040000000d55fc6a0d55fc6a0d55fc6a0" +
+        "0000000e80301000200000000000800000000000af3010004;65080:010000007404;65148:35b900002000055e;65168:0d" +
+        "55fc6a;65280:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010" +
+        "004;65336:010000007504;65404:5d77000020004eac;65424:0d55fc6a;65536:a481e803030000000d55fc6a0d55fc6a0" +
+        "d55fc6a00000000e80301000200000000000800000000000af3010004;65592:010000007604;65660:6ed900002000505d;" +
+        "65680:0d55fc6a;65792:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010002000000000008000000000" +
+        "00af3010004;65848:010000007704;65916:257400002000bf64;65936:0d55fc6a;66048:a481e803040000000d55fc6a0" +
+        "d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;66104:010000007804;66172:c75f00002" +
+        "000fbe7;66192:0d55fc6a;66304:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030100020000000000080" +
+        "0000000000af3010004;66360:010000007904;66428:df430000200029d0;66448:0d55fc6a;66560:a481e803040000000" +
+        "d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;66616:010000007a04;66684:8" +
+        "7b500002000c64d;66704:0d55fc6a;66816:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000" +
+        "000000800000000000af3010004;66872:010000007b04;66940:a74000002000d818;66960:0d55fc6a;67072:a481e8030" +
+        "40000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;67128:010000007c04" +
+        ";67196:c62f00002000f573;67216:0d55fc6a;67328:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010" +
+        "00200000000000800000000000af3010004;67384:010000007d04;67452:6ce1000020003217;67472:0d55fc6a;67584:a" +
+        "481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;67640:0100" +
+        "00007e04;67708:341700002000dd8a;67728:0d55fc6a;67840:a481e803040000000d55fc6a0d55fc6a0d55fc6a0000000" +
+        "0e80301000200000000000800000000000af3010004;67896:010000007f04;67964:14e200002000c3df;67984:0d55fc6a" +
+        ";68096:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;68" +
+        "152:010000008004;68220:4f120000200079c9;68240:0d55fc6a;68352:a481e803030000000d55fc6a0d55fc6a0d55fc6" +
+        "a00000000e80301000200000000000800000000000af3010004;68408:010000008104;68476:3c56000020005a92;68496:" +
+        "0d55fc6a;68608:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af30" +
+        "10004;68664:010000008204;68732:0ff8000020004463;68752:0d55fc6a;68864:a481e803040000000d55fc6a0d55fc6" +
+        "a0d55fc6a00000000e80301000200000000000800000000000af3010004;68920:010000008304;68988:2f0d000020005a3" +
+        "6;69008:0d55fc6a;69120:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030100020000000000080000000" +
+        "0000af3010004;69176:010000008404;69244:4e6200002000775d;69264:0d55fc6a;69376:a481e803040000000d55fc6" +
+        "a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;69432:010000008504;69500:26ac000" +
+        "020003caf;69520:0d55fc6a;69632:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000" +
+        "800000000000af3010004;69688:010000008704;69756:8ce100002000184e;69776:0d55fc6a;69888:a481e8030400000" +
+        "00d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;69944:010000008804;70012" +
+        ":f2be000020003afc;70032:0d55fc6a;70144:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010002000" +
+        "00000000800000000000af3010004;70200:010000008904;70268:4e3f000020004298;70288:0d55fc6a;70400:a481e80" +
+        "3040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;70456:010000008a" +
+        "04;70524:b254000020000756;70544:0d55fc6a;70656:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030" +
+        "1000200000000000800000000000af3010004;70712:010000008b04;70780:0ed5000020007f32;70800:0d55fc6a;70912" +
+        ":a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;70968:01" +
+        "0000008c04;71036:f3ce000020003468;71056:0d55fc6a;71168:a481e803030000000d55fc6a0d55fc6a0d55fc6a00000" +
+        "000e80301000200000000000800000000000af3010004;71224:010000008d04;71292:241700002000bd60;71312:0d55fc" +
+        "6a;71424:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;" +
+        "71480:010000008e04;71548:d224000020004f89;71568:0d55fc6a;71680:a481e803040000000d55fc6a0d55fc6a0d55f" +
+        "c6a00000000e80301000200000000000800000000000af3010004;71736:010000008f04;71804:6ea50000200037ed;7182" +
+        "4:0d55fc6a;71936:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af" +
+        "3010004;71992:010000009004;72060:e705000020002b8a;72080:0d55fc6a;72192:a481e803040000000d55fc6a0d55f" +
+        "c6a0d55fc6a00000000e80301000200000000000800000000000af3010004;72248:010000009104;72316:5b84000020005" +
+        "3ee;72336:0d55fc6a;72448:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000" +
+        "000000af3010004;72504:010000009204;72572:a7ef000020001620;72592:0d55fc6a;72704:a481e803040000000d55f" +
+        "c6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;72760:010000009304;72828:1b6e0" +
+        "00020006e44;72848:0d55fc6a;72960:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010002000000000" +
+        "00800000000000af3010004;73016:010000009404;73084:e67500002000251e;73104:0d55fc6a;73216:a481e80304000" +
+        "0000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;73272:010000009504;733" +
+        "40:5af4000020005d7a;73360:0d55fc6a;73472:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030100020" +
+        "0000000000800000000000af3010004;73528:010000009604;73596:d64d000020008171;73616:0d55fc6a;73728:a481e" +
+        "803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;73784:01000000" +
+        "9704;73852:6acc00002000f915;73872:0d55fc6a;73984:a481e803030000000d55fc6a0d55fc6a0d55fc6a00000000e80" +
+        "301000200000000000800000000000af3010004;74040:010000009804;74108:7fcb000020002acb;74128:0d55fc6a;742" +
+        "40:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;74296:" +
+        "010000009904;74364:a81200002000a3c3;74384:0d55fc6a;74496:a481e803040000000d55fc6a0d55fc6a0d55fc6a000" +
+        "00000e80301000200000000000800000000000af3010004;74552:010000009a04;74620:547900002000e60d;74640:0d55" +
+        "fc6a;74752:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af301000" +
+        "4;74808:010000009b04;74876:e8f8000020009e69;74896:0d55fc6a;75008:a481e803040000000d55fc6a0d55fc6a0d5" +
+        "5fc6a00000000e80301000200000000000800000000000af3010004;75064:010000009c04;75132:15e300002000d533;75" +
+        "152:0d55fc6a;75264:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000" +
+        "af3010004;75320:010000009d04;75388:a96200002000ad57;75408:0d55fc6a;75520:a481e803040000000d55fc6a0d5" +
+        "5fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;75576:010000009e04;75644:417e0000200" +
+        "05afa;75664:0d55fc6a;75776:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010002000000000008000" +
+        "00000000af3010004;75832:010000009f04;75900:fdff00002000229e;75920:0d55fc6a;76032:a481e803040000000d5" +
+        "5fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;76088:01000000a004;76156:6bd" +
+        "600002000af56;76176:0d55fc6a;76288:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030100020000000" +
+        "0000800000000000af3010004;76344:01000000a104;76412:d75700002000d732;76432:0d55fc6a;76544:a481e803040" +
+        "000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;76600:01000000a204;7" +
+        "6668:2b3c0000200092fc;76688:0d55fc6a;76800:a481e803030000000d55fc6a0d55fc6a0d55fc6a00000000e80301000" +
+        "200000000000800000000000af3010004;76856:01000000a404;76924:d3b0000020008587;76944:0d55fc6a;77056:a48" +
+        "1e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;77112:010000" +
+        "00a504;77180:981d000020006abe;77200:0d55fc6a;77312:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e" +
+        "80301000200000000000800000000000af3010004;77368:01000000a604;77436:c0eb000020008523;77456:0d55fc6a;7" +
+        "7568:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;7762" +
+        "4:01000000a704;77692:a82500002000ced1;77712:0d55fc6a;77824:a481e803040000000d55fc6a0d55fc6a0d55fc6a0" +
+        "0000000e80301000200000000000800000000000af3010004;77880:01000000a804;77948:4a0e000020008a52;77968:0d" +
+        "55fc6a;78080:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010" +
+        "004;78136:01000000a904;78204:6afb000020009407;78224:0d55fc6a;78336:a481e803040000000d55fc6a0d55fc6a0" +
+        "d55fc6a00000000e80301000200000000000800000000000af3010004;78392:01000000aa04;78460:320d000020007b9a;" +
+        "78480:0d55fc6a;78592:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e803010002000000000008000000000" +
+        "00af3010004;78648:01000000ab04;78716:2a1100002000a9ad;78736:0d55fc6a;78848:a481e803040000000d55fc6a0" +
+        "d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;78904:01000000ac04;78972:4b7e00002" +
+        "00084c6;78992:0d55fc6a;79104:a481e803040000000d55fc6a0d55fc6a0d55fc6a00000000e8030100020000000000080" +
+        "0000000000af3010004;79160:01000000ad04;79228:6b8b000020009a93;79248:0d55fc6a;79360:a481e803040000000" +
+        "d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;79416:01000000ae04;79484:3" +
+        "37d00002000750e;79504:0d55fc6a;79616:a481e803030000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000" +
+        "000000800000000000af3010004;79672:01000000af04;79740:213900002000101e;79760:0d55fc6a;79872:a481e8030" +
+        "40000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;79928:01000000b004" +
+        ";79996:5fb5000020009b24;80016:0d55fc6a;80128:a481e803030000000d55fc6a0d55fc6a0d55fc6a00000000e803010" +
+        "00200000000000800000000000af3010004;80184:01000000b104;80252:141800002000741d;80272:0d55fc6a;80384:a" +
+        "481e803030000000d55fc6a0d55fc6a0d55fc6a00000000e80301000200000000000800000000000af3010004;80440:0100" +
+        "0000b204;80508:4cee000020009b80;80528:0d55fc6a;80640:a481e8030d0000000d55fc6a0d55fc6a0d55fc6a0000000" +
+        "0e80301000200000000000800000000000af3010004;80696:01000000b304;80764:824200002000ab6e;80784:0d55fc6a" +
+        ";92164:030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e000" +
+        "0000f00000010000000110000001200000013000000140000001500000016000000170000001800000019;1125368:04ca10" +
+        "0b9b9562f0;1126392:04ca100bc3d7530e;1127416:04ca100ba9f51dff;1128440:04ca100bf1b72c01;1129464:04ca10" +
+        "0be8079306;1130488:04ca100bb045a2f8;1131512:04ca100b12e71134;1132536:04ca100b4aa520ca;1133560:04ca10" +
+        "0b53159fcd;1134584:04ca100b0b57ae33;1135608:04ca100b6175e0c2;1136632:04ca100b3937d13c;1137656:04ca10" +
+        "0b20876e3b;1138680:04ca100b78c55fc5;1139704:04ca100b05b51edc;1140728:04ca100b5df72f22;1141752:04ca10" +
+        "0b44479025;1142776:04ca100b1c05a1db;1143800:04ca100b7627ef2a;1144824:04ca100b2e65ded4;1145848:04ca10" +
+        "0b37d561d3;1146872:04ca100b6f97502d;1147896:04ca100b82e6ea4f;1148920:04ca100bdaa4dbb1;1149944:04ca10" +
+        "0bc31464b6;1150968:04ca100b9b565548;1151992:04ca100bf1741bb9;1153016:04ca100ba9362a47;1154040:04ca10" +
+        "0bb0869540;1155064:04ca100be8c4a4be;1156088:04ca100b95b4e5a7;1157112:04ca100bcdf6d4590d0000000c00010" +
+        "22e00000002000000f40302022e2e000000000000010800007b00030001000000d4f0765d0200000026a737ac03;1158140:" +
+        "42138c4f66310a;1159168:6631300a;1160192:6631310a;1161216:6631320a;1162240:6631330a;1163264:6631340a;" +
+        "1164288:6631350a;1165312:6631360a;1166336:6631370a;1167360:6631380a;1168384:6631390a;1169408:66320a;" +
+        "1170432:6632300a;1171456:6632310a;1172480:6632320a;1173504:6632330a;1174528:6632340a;1175552:6632350" +
+        "a;1176576:6632360a;1177600:6632370a;1178624:6632380a;1179648:6632390a;1180672:66330a;1181696:6633300" +
+        "a;1182720:6633310a;1183744:6633320a;1184768:6633330a;1185792:2c00000024001901656e7472795f776974685f6" +
+        "15f6c6f6e675f6e616d655f33370000003d00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f35320" +
+        "000004d00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f36370000004900000024001901656e747" +
+        "2795f776974685f615f6c6f6e675f6e616d655f36330000002500000024001901656e7472795f776974685f615f6c6f6e675" +
+        "f6e616d655f33300000004400000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f35390000002600000" +
+        "024001901656e7472795f776974685f615f6c6f6e675f6e616d655f33310000002000000024001901656e7472795f7769746" +
+        "85f615f6c6f6e675f6e616d655f32360000004b00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f3" +
+        "6350000003500000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f34350000002e00000024001901656" +
+        "e7472795f776974685f615f6c6f6e675f6e616d655f33390000003f00000024001901656e7472795f776974685f615f6c6f6" +
+        "e675f6e616d655f35340000004500000020001801656e7472795f776974685f615f6c6f6e675f6e616d655f363e000000240" +
+        "01901656e7472795f776974685f615f6c6f6e675f6e616d655f35330000002700000024001901656e7472795f776974685f6" +
+        "15f6c6f6e675f6e616d655f33320000001800000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f31390" +
+        "000003300000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f34330000003800000024001901656e747" +
+        "2795f776974685f615f6c6f6e675f6e616d655f34380000004300000024001901656e7472795f776974685f615f6c6f6e675" +
+        "f6e616d655f35380000001400000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f31350000002800000" +
+        "024001901656e7472795f776974685f615f6c6f6e675f6e616d655f33330000001a00000024001901656e7472795f7769746" +
+        "85f615f6c6f6e675f6e616d655f323000000052000000e0001801656e7472795f776974685f615f6c6f6e675f6e616d655f3" +
+        "8;1186808:0c0000de5e4fac3c6633340a;1187840:6633350a;1188864:6633360a;1189888:6633370a;1190912:663338" +
+        "0a;1191936:6633390a;1192960:66340a;1193984:6634300a;1195008:6634310a;1196032:6634320a;1197056:663433" +
+        "0a;1198080:6634340a;1199104:6634350a;1200128:6634360a;1201152:6634370a;1202176:6634380a;1203200:6634" +
+        "390a;1204224:66350a;1205248:6635300a;1206272:6635310a;1207296:6635320a;1208320:6635330a;1209344:6635" +
+        "340a;1210368:6635350a;1211392:6635360a;1212416:6635370a;1213440:6635380a;1214464:6635390a;1215488:46" +
+        "00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f36300000002d00000024001901656e7472795f77" +
+        "6974685f615f6c6f6e675f6e616d655f33380000001f00000024001901656e7472795f776974685f615f6c6f6e675f6e616d" +
+        "655f32350000002400000020001801656e7472795f776974685f615f6c6f6e675f6e616d655f334800000024001901656e74" +
+        "72795f776974685f615f6c6f6e675f6e616d655f36320000001c00000024001901656e7472795f776974685f615f6c6f6e67" +
+        "5f6e616d655f32320000004200000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f3537000000160000" +
+        "0024001901656e7472795f776974685f615f6c6f6e675f6e616d655f31370000004100000024001901656e7472795f776974" +
+        "685f615f6c6f6e675f6e616d655f35360000003700000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f" +
+        "34370000004a00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f36340000003b0000002400190165" +
+        "6e7472795f776974685f615f6c6f6e675f6e616d655f35300000004c00000024001901656e7472795f776974685f615f6c6f" +
+        "6e675f6e616d655f36360000003000000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f34300000002b" +
+        "00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f33360000003a00000020001801656e7472795f77" +
+        "6974685f615f6c6f6e675f6e616d655f351200000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f3133" +
+        "0000002100000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f32370000005100000024001901656e74" +
+        "72795f776974685f615f6c6f6e675f6e616d655f37300000003600000024001901656e7472795f776974685f615f6c6f6e67" +
+        "5f6e616d655f34360000002900000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f33340000004f0000" +
+        "0024001901656e7472795f776974685f615f6c6f6e675f6e616d655f363900000010000000e4001901656e7472795f776974" +
+        "685f615f6c6f6e675f6e616d655f3131;1216504:0c0000dec94a80a366360a;1217536:6636300a;1218560:6636310a;12" +
+        "19584:6636320a;1220608:6636330a;1221632:6636340a;1222656:6636350a;1223680:6636360a;1224704:6636370a;" +
+        "1225728:6636380a;1226752:6636390a;1227776:66370a;1228800:6637300a;1229824:66380a;1230848:66390a;1231" +
+        "872:6a6f75726e616c20746573740a;1232896:5000000020001801656e7472795f776974685f615f6c6f6e675f6e616d655" +
+        "f370e00000020001801656e7472795f776974685f615f6c6f6e675f6e616d655f314700000024001901656e7472795f77697" +
+        "4685f615f6c6f6e675f6e616d655f36310000003c00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655" +
+        "f35310000003200000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f343200000031000000240019016" +
+        "56e7472795f776974685f615f6c6f6e675f6e616d655f34310000001500000024001901656e7472795f776974685f615f6c6" +
+        "f6e675f6e616d655f31360000002200000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f32380000001" +
+        "d00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f32330000001700000024001901656e7472795f7" +
+        "76974685f615f6c6f6e675f6e616d655f31380000002a00000024001901656e7472795f776974685f615f6c6f6e675f6e616" +
+        "d655f33350000002f00000020001801656e7472795f776974685f615f6c6f6e675f6e616d655f345300000020001801656e7" +
+        "472795f776974685f615f6c6f6e675f6e616d655f393900000024001901656e7472795f776974685f615f6c6f6e675f6e616" +
+        "d655f34390000000f00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f31300000002300000024001" +
+        "901656e7472795f776974685f615f6c6f6e675f6e616d655f32390000004e00000024001901656e7472795f776974685f615" +
+        "f6c6f6e675f6e616d655f36380000001b00000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f3231000" +
+        "0003400000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f34340000001100000024001901656e74727" +
+        "95f776974685f615f6c6f6e675f6e616d655f31320000001900000020001801656e7472795f776974685f615f6c6f6e675f6" +
+        "e616d655f321300000024001901656e7472795f776974685f615f6c6f6e675f6e616d655f313400000040000000240019016" +
+        "56e7472795f776974685f615f6c6f6e675f6e616d655f35350000001e000000cc001901656e7472795f776974685f615f6c6" +
+        "f6e675f6e616d655f3234;1233912:0c0000de0b7d9694";
+}

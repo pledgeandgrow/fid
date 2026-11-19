@@ -1,0 +1,39 @@
+// OP30 (compiler/iropt.fd iro_inline_limit; FID_IROPT_OFF=inlinepgo
+// ignores the profile): the default inliner weighs a real run's profile
+// (`fid run --profile p`, then `fid emit --profile-use p`).
+// - hot: one block, larger than the default limit (16 instructions) but
+//   within twice it; the run calls it 5000 times, so with the profile it
+//   is inlined into its loop.
+// - cold: small enough for the default limit, larger than the cold limit
+//   (8); the run never calls it (its branch is never taken), so with the
+//   profile its call stays a call.
+// The program prints the same either way (tests/tooling/pgo-inline-check.sh
+// compares the mid-end's instruction counts).
+//
+// Expected output:
+// 36859824
+// 0
+
+fn hot(a: i64, b: i64) -> i64 {
+    var r: i64 = ((a * 3 + b) ^ (a & 1023)) + ((b | 5) & (a + 7));
+    return r + (a & 1) + (a & 2) + (a & 4) + (a & 8) + (a & 16);
+}
+
+fn cold(a: i64) -> i64 {
+    return a * 7 + 1 + (a & 15) + (a | 3);
+}
+
+fn main() {
+    var s: i64 = 0;
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < 5000 {
+        s = s + hot(i, 3);
+        if i < 0 {
+            c = c + cold(i);
+        }
+        i = i + 1;
+    }
+    println(s);
+    println(c);
+}

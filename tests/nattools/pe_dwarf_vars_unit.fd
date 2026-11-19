@@ -1,0 +1,159 @@
+// Release N9 / llvm-roadmap DB4 for pe_ir: the DWARF of a debug build of
+// the default Windows backend with variables, types and frames
+// (compiler/pe_ir_enc.fd pe_add_dwarf over compiler/nat_enc.fd
+// nat_dwarf_build; pe_add_debug_sections_n). A stand-in .text with two
+// functions (each starting `push rbp; mov rbp, rsp`, as pe_ir's do), their
+// line rows (a row at each function's first byte on its `fn` line: the
+// two functions below, whose lines nat_dbg_decl_line finds in this file),
+// their variables in g_nat_dbg_vars' format (a slot "f<off>", a constant
+// "c<v>", none "") and a struct type is written as a PE with its COFF
+// string table; the test reads the headers back and writes the image to
+// $PE_DWARF_OUT (when set) for tests/nattools/pe_dwarf_vars_check.py, which
+// decodes the DWARF (and objdump does, through pe_dbg_vars_check.sh).
+// Run (from the repository root):
+//   fid run tests/nattools/pe_dwarf_vars_unit.fd
+// Expected output:
+// sections 6
+// names .text .rdata /4 /18 /30 /42
+// debug sections ok true
+// ext restored true
+// fallback sections 5
+use core;
+use vec;
+use string;
+use file;
+use compiler::nat_enc;
+use compiler::pe_ir_enc;
+
+fn helper_one(base: i64) -> i64 {
+    return base + 7;
+}
+
+fn helper_two(n: i64) -> i64 {
+    return n * 2;
+}
+
+fn le16(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+/// A function of `n` bytes: push rbp; mov rbp, rsp; nops; pop rbp; ret.
+fn stand_in_fn(text: & mut Vec<i64>, n: i64) {
+    text.push(0x55);
+    text.push(0x48);
+    text.push(0x89);
+    text.push(0xE5);
+    var i: i64 = 4;
+    while i < n - 2 {
+        text.push(0x90);
+        i = i + 1;
+    }
+    text.push(0x5D);
+    text.push(0xC3);
+}
+
+fn section_names(img: & Vec<i64>) -> str {
+    var pe: i64 = le32(img, 0x3C);
+    var n: i64 = le16(img, pe + 6);
+    var at: i64 = pe + 24 + le16(img, pe + 20);
+    var out: str = "";
+    var k: i64 = 0;
+    while k < n {
+        var nm: str = "";
+        var j: i64 = 0;
+        while j < 8 && img.get(at + 40 * k + j) != 0 {
+            nm = nm + char_to_str(img.get(at + 40 * k + j));
+            j = j + 1;
+        }
+        if k > 0 {
+            out = out + " ";
+        }
+        out = out + nm;
+        k = k + 1;
+    }
+    return out;
+}
+
+fn main() {
+    var text: Vec<i64> = Vec::new();
+    stand_in_fn(& mut text, 64);
+    stand_in_fn(& mut text, 64);
+    var rdata: Vec<i64> = Vec::new();
+    var r: i64 = 0;
+    while r < 64 {
+        rdata.push(0);
+        r = r + 1;
+    }
+    var names: Vec<str> = Vec::new();
+    names.push("helper_one");
+    names.push("helper_two");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(64);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    ends.push(128);
+    // rows [offset, line, end?]: each function's first byte on its `fn`
+    // line (28 and 32 of this file), then its body
+    var rows: Vec<i64> = Vec::new();
+    var spec: Vec<i64> = Vec::new();
+    spec.push(0);
+    spec.push(28);
+    spec.push(0);
+    spec.push(8);
+    spec.push(29);
+    spec.push(0);
+    spec.push(64);
+    spec.push(0);
+    spec.push(1);
+    spec.push(64);
+    spec.push(32);
+    spec.push(0);
+    spec.push(72);
+    spec.push(33);
+    spec.push(0);
+    spec.push(128);
+    spec.push(0);
+    spec.push(1);
+    var si: i64 = 0;
+    while si < spec.len() {
+        rows.push(spec.get(si));
+        si = si + 1;
+    }
+    var vars: Vec<str> = Vec::new();
+    vars.push("P\tbase\ti64\t8\t5\tf-24\nV\tacc\ti64\t8\t5\tf-32\nV\tk\ti64\t8\t5\tc7\nV\tgone\ti64\t8\t5\t");
+    vars.push("P\tn\tPoint\t8\tP\tf-24\nV\tname\tstr\t8\tZ\tf-32\nV\tq\tPoint\t16\tS\tf-48\nV\tok\tbool\t1\t2\tf-56");
+    var types: Vec<str> = Vec::new();
+    types.push("Point\t16\tx\t0\ti64\t8\t5\ty\t8\ti64\t8\t5");
+    var file: str = "tests/nattools/pe_dwarf_vars_unit.fd";
+    var img0: Vec<i64> = pe_build_file(text, rdata, 0x1000, 0x2040, 0x2000, 24, 0x2000);
+    var img: Vec<i64> = pe_add_dwarf(img0, text, names, starts, ends, rows, file, vars, types);
+    pe_append_coff_symbols_pre(& mut img, pe_dwarf_section_names(), names, starts);
+    var pe: i64 = le32(& img, 0x3C);
+    println("sections " + int_to_str(le16(& img, pe + 6)));
+    println("names " + section_names(& img));
+    // SizeOfHeaders 1024, SizeOfImage past the last section
+    var opt: i64 = pe + 24;
+    var last: i64 = opt + le16(& img, pe + 20) + 40 * 5;
+    var ok: bool = le32(& img, opt + 60) == 1024 && le32(& img, opt + 56) >= le32(& img, last + 12) + le32(& img, last + 8);
+    println("debug sections ok " + bool_to_str(ok));
+    println("ext restored " + bool_to_str(!g_nat_dbg_ext && g_nat_dbg_vars.len() == 0));
+    // a variables list that does not match the functions: the three
+    // sections of before
+    var short: Vec<str> = Vec::new();
+    var img1: Vec<i64> = pe_add_dwarf(pe_build_file(text, rdata, 0x1000, 0x2040, 0x2000, 24, 0x2000), text, names, starts, ends, rows, file, short, types);
+    println("fallback sections " + int_to_str(le16(& img1, le32(& img1, 0x3C) + 6)));
+    match env_var("PE_DWARF_OUT") {
+        Option::Some(out) => {
+            if file_write_bytes(out, img) != 0 {
+                println("could not write " + out);
+            }
+        }
+        Option::None => {
+        }
+    }
+}

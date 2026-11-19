@@ -1,0 +1,47 @@
+// CA6: structured concurrency. A task started by `spawn` outside a
+// `spawn scope { }` must have its handle kept and read (awaited, joined,
+// passed on), or be let go by name: `spawn detached f(x)`. Detached here:
+// two threads and a green task (an async function with an f64 argument
+// runs as a task through its adapter; lowering detaches it with
+// p_co_detach, so its block is freed when it finishes). Nobody joins the
+// detached tasks, so main waits for their sums itself. `detached` is a
+// contextual word: `spawn detached(5)` still spawns a call of a function
+// named detached. test_spawn_unjoined_fail.fd is the rejected side.
+// Expected output:
+// 7
+// 10
+// 42
+// 6
+
+async fn add_scaled(total: i64, f: f64) -> Future<i64> {
+    p_atomic_add(total, (f * 2.0) as i64);
+    return 0;
+}
+
+fn bump(total: i64, n: i64) -> i64 {
+    p_atomic_add(total, n);
+    return n;
+}
+
+fn detached(n: i64) -> i64 {
+    return n + 1;
+}
+
+fn main() {
+    val total = p_shared_alloc(8);
+    p_atomic_store(total, 0);
+    spawn detached bump(total, 1);
+    spawn detached bump(total, 2);
+    spawn detached add_scaled(total, 2.0);
+    // the detached tasks are not joined: wait for what they add
+    while p_atomic_load(total) < 7 {
+        p_atomic_add(total, 0);
+    }
+    println(p_atomic_load(total));
+    // a kept handle is awaited
+    val t = spawn bump(total, 10);
+    println(await t);
+    println(detached(41));
+    val k = spawn detached(5);
+    println(await k);
+}

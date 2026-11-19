@@ -1,0 +1,890 @@
+// Fides QUIC frames and transport parameters (RFC 9000 §19, §18), pure Fides
+//
+// The payload of a QUIC packet is a sequence of frames; this module turns
+// a frame into bytes and a payload back into frames, with the checks of
+// RFC 9000 §19 (lengths inside the payload, offsets below 2^62, ACK ranges
+// that do not go below zero) and §12.4 (which frames each packet type may
+// carry). It also encodes and parses the quic_transport_parameters TLS
+// extension (§18), checking every value the RFC bounds.
+//
+//   var f: QuicFrame = quic_frame_blank(QF_STREAM);
+//   f.stream_id = 0; f.offset = 0; f.data = str_bytes("hi"); f.fin = true;
+//   val bytes: Vec<i64> = quic_frame_encode(f);
+//   val fs: QuicFrames = quic_frames_parse(payload);
+//   if fs.error < 0 { for each fs.frames ... }
+//
+// Bytes are Vec<i64> holding 0..255, as in quic.fd. The connection, the
+// handshake and the streams are stdlib/quic_conn.fd (competitive SL2).
+
+module quic_frame;
+ use vec; use quic;
+
+// ─── Frame types (RFC 9000 §19, Table 3) ────────────────────────────────
+
+pub const QF_PADDING: i64 = 0x00;
+pub const QF_PING: i64 = 0x01;
+pub const QF_ACK: i64 = 0x02;
+pub const QF_ACK_ECN: i64 = 0x03;
+pub const QF_RESET_STREAM: i64 = 0x04;
+pub const QF_STOP_SENDING: i64 = 0x05;
+pub const QF_CRYPTO: i64 = 0x06;
+pub const QF_NEW_TOKEN: i64 = 0x07;
+/// STREAM is 0x08..0x0f: OFF (0x04), LEN (0x02) and FIN (0x01) bits.
+pub const QF_STREAM: i64 = 0x08;
+pub const QF_MAX_DATA: i64 = 0x10;
+pub const QF_MAX_STREAM_DATA: i64 = 0x11;
+pub const QF_MAX_STREAMS_BIDI: i64 = 0x12;
+pub const QF_MAX_STREAMS_UNI: i64 = 0x13;
+pub const QF_DATA_BLOCKED: i64 = 0x14;
+pub const QF_STREAM_DATA_BLOCKED: i64 = 0x15;
+pub const QF_STREAMS_BLOCKED_BIDI: i64 = 0x16;
+pub const QF_STREAMS_BLOCKED_UNI: i64 = 0x17;
+pub const QF_NEW_CONNECTION_ID: i64 = 0x18;
+pub const QF_RETIRE_CONNECTION_ID: i64 = 0x19;
+pub const QF_PATH_CHALLENGE: i64 = 0x1a;
+pub const QF_PATH_RESPONSE: i64 = 0x1b;
+pub const QF_CONNECTION_CLOSE: i64 = 0x1c;
+pub const QF_CONNECTION_CLOSE_APP: i64 = 0x1d;
+pub const QF_HANDSHAKE_DONE: i64 = 0x1e;
+
+// ─── Transport error codes (RFC 9000 §20.1) ─────────────────────────────
+
+pub const QE_NO_ERROR: i64 = 0x0;
+pub const QE_INTERNAL_ERROR: i64 = 0x1;
+pub const QE_CONNECTION_REFUSED: i64 = 0x2;
+pub const QE_FLOW_CONTROL_ERROR: i64 = 0x3;
+pub const QE_STREAM_LIMIT_ERROR: i64 = 0x4;
+pub const QE_STREAM_STATE_ERROR: i64 = 0x5;
+pub const QE_FINAL_SIZE_ERROR: i64 = 0x6;
+pub const QE_FRAME_ENCODING_ERROR: i64 = 0x7;
+pub const QE_TRANSPORT_PARAMETER_ERROR: i64 = 0x8;
+pub const QE_CONNECTION_ID_LIMIT_ERROR: i64 = 0x9;
+pub const QE_PROTOCOL_VIOLATION: i64 = 0xa;
+pub const QE_INVALID_TOKEN: i64 = 0xb;
+pub const QE_APPLICATION_ERROR: i64 = 0xc;
+pub const QE_CRYPTO_BUFFER_EXCEEDED: i64 = 0xd;
+pub const QE_KEY_UPDATE_ERROR: i64 = 0xe;
+pub const QE_AEAD_LIMIT_REACHED: i64 = 0xf;
+pub const QE_NO_VIABLE_PATH: i64 = 0x10;
+/// CRYPTO_ERROR is 0x100 + the TLS alert (RFC 9001 §4.8).
+pub const QE_CRYPTO_ERROR: i64 = 0x100;
+
+/// Encryption levels, which are also the packet number spaces (RFC 9000
+/// §12.3) and where each frame may appear (§12.4): Initial, Handshake and
+/// 1-RTT ("application"). 0-RTT is not used by this implementation.
+pub const QL_INITIAL: i64 = 0;
+pub const QL_HANDSHAKE: i64 = 1;
+pub const QL_APP: i64 = 2;
+pub const QL_0RTT: i64 = 3;
+
+/// One frame. Which fields mean something depends on `ftype`:
+///   STREAM:            stream_id, offset, data, fin (ftype is QF_STREAM
+///                      whatever bits it was sent with)
+///   CRYPTO:            offset, data
+///   ACK / ACK_ECN:     ranges (pairs low, high, the highest first: the
+///                      packet numbers acknowledged), ack_delay (as sent,
+///                      before the exponent), ecn (three counts, ACK_ECN)
+///   RESET_STREAM:      stream_id, error_code, final_size
+///   STOP_SENDING:      stream_id, error_code
+///   NEW_TOKEN:         data (the token)
+///   MAX_DATA, DATA_BLOCKED, MAX_STREAMS_*, STREAMS_BLOCKED_*: limit
+///   MAX_STREAM_DATA, STREAM_DATA_BLOCKED: stream_id, limit
+///   NEW_CONNECTION_ID: seq, retire_prior_to, data (the connection ID),
+///                      reset_token (16 bytes)
+///   RETIRE_CONNECTION_ID: seq
+///   PATH_CHALLENGE / PATH_RESPONSE: data (8 bytes)
+///   CONNECTION_CLOSE:  error_code, frame_type (0x1c only), data (the
+///                      reason phrase)
+pub struct QuicFrame {
+    pub ftype: i64,
+    pub stream_id: i64,
+    pub offset: i64,
+    pub data: Vec<i64>,
+    pub fin: bool,
+    pub ranges: Vec<i64>,
+    pub ack_delay: i64,
+    pub ecn: Vec<i64>,
+    pub error_code: i64,
+    pub final_size: i64,
+    pub frame_type: i64,
+    pub limit: i64,
+    pub seq: i64,
+    pub retire_prior_to: i64,
+    pub reset_token: Vec<i64>,
+}
+
+/// The frames of a payload. `error` is -1 when every frame parsed, else
+/// the transport error to close the connection with (FRAME_ENCODING_ERROR,
+/// or PROTOCOL_VIOLATION for a frame the packet type may not carry, RFC
+/// 9000 §12.4) and `why` says what was wrong; `frames` then holds the
+/// frames before the bad one.
+pub struct QuicFrames {
+    pub frames: Vec<QuicFrame>,
+    pub error: i64,
+    pub why: str,
+    pub ack_eliciting: bool,
+}
+
+/// QUIC transport parameters (RFC 9000 §18.2). `has_*` tell whether an
+/// optional connection ID was present. Defaults are the RFC's.
+pub struct QuicParams {
+    pub has_original_dcid: bool,
+    pub original_dcid: Vec<i64>,
+    pub max_idle_timeout: i64,
+    pub stateless_reset_token: Vec<i64>,
+    pub max_udp_payload_size: i64,
+    pub initial_max_data: i64,
+    pub initial_max_stream_data_bidi_local: i64,
+    pub initial_max_stream_data_bidi_remote: i64,
+    pub initial_max_stream_data_uni: i64,
+    pub initial_max_streams_bidi: i64,
+    pub initial_max_streams_uni: i64,
+    pub ack_delay_exponent: i64,
+    pub max_ack_delay: i64,
+    pub disable_active_migration: bool,
+    pub active_connection_id_limit: i64,
+    pub has_initial_scid: bool,
+    pub initial_scid: Vec<i64>,
+    pub has_retry_scid: bool,
+    pub retry_scid: Vec<i64>,
+}
+
+/// Transport parameters parsed from the peer: `error` -1 when they are
+/// acceptable, else TRANSPORT_PARAMETER_ERROR with `why`.
+pub struct QuicParamsParsed {
+    pub params: QuicParams,
+    pub error: i64,
+    pub why: str,
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────
+
+fn qfr_put(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+fn qfr_put_varint(out: & mut Vec<i64>, v: i64) {
+    qfr_put(out, quic_varint_encode(v));
+}
+
+fn qfr_none() -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    return none;
+}
+
+/// A frame of type `ftype` with every field zero or empty.
+pub fn quic_frame_blank(ftype: i64) -> QuicFrame {
+    return QuicFrame {
+        ftype: ftype, stream_id: 0, offset: 0, data: qfr_none(), fin: false,
+        ranges: qfr_none(), ack_delay: 0, ecn: qfr_none(), error_code: 0,
+        final_size: 0, frame_type: 0, limit: 0, seq: 0, retire_prior_to: 0,
+        reset_token: qfr_none(),
+    };
+}
+
+/// Whether a frame type is a STREAM frame (0x08..0x0f).
+pub fn quic_frame_is_stream(ftype: i64) -> bool {
+    return ftype >= 0x08 && ftype <= 0x0f;
+}
+
+/// Whether receiving the frame calls for an acknowledgment (RFC 9002 §2):
+/// every frame but ACK, PADDING and CONNECTION_CLOSE.
+pub fn quic_frame_ack_eliciting(ftype: i64) -> bool {
+    return !(ftype == QF_PADDING || ftype == QF_ACK || ftype == QF_ACK_ECN
+        || ftype == QF_CONNECTION_CLOSE || ftype == QF_CONNECTION_CLOSE_APP);
+}
+
+/// Whether a frame type may appear in a packet of encryption level `level`
+/// (RFC 9000 §12.4, Table 3): Initial and Handshake packets carry only
+/// PADDING, PING, ACK, CRYPTO and CONNECTION_CLOSE of type 0x1c; 0-RTT no
+/// ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN, PATH_RESPONSE or
+/// RETIRE_CONNECTION_ID; 1-RTT every frame.
+pub fn quic_frame_allowed(ftype: i64, level: i64) -> bool {
+    if level == QL_INITIAL || level == QL_HANDSHAKE {
+        return ftype == QF_PADDING || ftype == QF_PING || ftype == QF_ACK
+            || ftype == QF_ACK_ECN || ftype == QF_CRYPTO || ftype == QF_CONNECTION_CLOSE;
+    }
+    if level == QL_0RTT {
+        return !(ftype == QF_ACK || ftype == QF_ACK_ECN || ftype == QF_CRYPTO
+            || ftype == QF_HANDSHAKE_DONE || ftype == QF_NEW_TOKEN
+            || ftype == QF_PATH_RESPONSE || ftype == QF_RETIRE_CONNECTION_ID);
+    }
+    return ftype >= 0 && ftype <= QF_HANDSHAKE_DONE;
+}
+
+// ─── Encoding ───────────────────────────────────────────────────────────
+
+/// Append the encoding of `f` to `out` (RFC 9000 §19). A STREAM frame is
+/// always sent with its Length field (type 0x0a/0x0b, 0x0e/0x0f when the
+/// offset is not zero); a frame type this module does not know adds
+/// nothing.
+pub fn quic_frame_put(out: & mut Vec<i64>, f: QuicFrame) {
+    val t: i64 = f.ftype;
+    if quic_frame_is_stream(t) {
+        var st: i64 = QF_STREAM | 0x02;
+        if f.offset > 0 {
+            st = st | 0x04;
+        }
+        if f.fin {
+            st = st | 0x01;
+        }
+        qfr_put_varint(out, st);
+        qfr_put_varint(out, f.stream_id);
+        if f.offset > 0 {
+            qfr_put_varint(out, f.offset);
+        }
+        qfr_put_varint(out, f.data.len());
+        qfr_put(out, f.data);
+        return;
+    }
+    if t == QF_PADDING || t == QF_PING || t == QF_HANDSHAKE_DONE {
+        out.push(t);
+        return;
+    }
+    if t == QF_ACK || t == QF_ACK_ECN {
+        // ranges: low0, high0, low1, high1, ... with high0 the largest
+        if f.ranges.len() < 2 {
+            return;
+        }
+        qfr_put_varint(out, t);
+        val largest: i64 = f.ranges.get(1);
+        qfr_put_varint(out, largest);
+        qfr_put_varint(out, f.ack_delay);
+        val n: i64 = f.ranges.len() / 2;
+        qfr_put_varint(out, n - 1);
+        qfr_put_varint(out, largest - f.ranges.get(0));
+        var prev_low: i64 = f.ranges.get(0);
+        var i: i64 = 1;
+        while i < n {
+            val lo: i64 = f.ranges.get(2 * i);
+            val hi: i64 = f.ranges.get(2 * i + 1);
+            qfr_put_varint(out, prev_low - hi - 2);
+            qfr_put_varint(out, hi - lo);
+            prev_low = lo;
+            i = i + 1;
+        }
+        if t == QF_ACK_ECN {
+            var k: i64 = 0;
+            while k < 3 {
+                var cnt: i64 = 0;
+                if k < f.ecn.len() {
+                    cnt = f.ecn.get(k);
+                }
+                qfr_put_varint(out, cnt);
+                k = k + 1;
+            }
+        }
+        return;
+    }
+    if t == QF_RESET_STREAM {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.stream_id);
+        qfr_put_varint(out, f.error_code);
+        qfr_put_varint(out, f.final_size);
+        return;
+    }
+    if t == QF_STOP_SENDING {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.stream_id);
+        qfr_put_varint(out, f.error_code);
+        return;
+    }
+    if t == QF_CRYPTO {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.offset);
+        qfr_put_varint(out, f.data.len());
+        qfr_put(out, f.data);
+        return;
+    }
+    if t == QF_NEW_TOKEN {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.data.len());
+        qfr_put(out, f.data);
+        return;
+    }
+    if t == QF_MAX_DATA || t == QF_MAX_STREAMS_BIDI || t == QF_MAX_STREAMS_UNI
+        || t == QF_DATA_BLOCKED || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.limit);
+        return;
+    }
+    if t == QF_MAX_STREAM_DATA || t == QF_STREAM_DATA_BLOCKED {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.stream_id);
+        qfr_put_varint(out, f.limit);
+        return;
+    }
+    if t == QF_NEW_CONNECTION_ID {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.seq);
+        qfr_put_varint(out, f.retire_prior_to);
+        out.push(f.data.len());
+        qfr_put(out, f.data);
+        qfr_put(out, f.reset_token);
+        return;
+    }
+    if t == QF_RETIRE_CONNECTION_ID {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.seq);
+        return;
+    }
+    if t == QF_PATH_CHALLENGE || t == QF_PATH_RESPONSE {
+        qfr_put_varint(out, t);
+        qfr_put(out, f.data);
+        return;
+    }
+    if t == QF_CONNECTION_CLOSE || t == QF_CONNECTION_CLOSE_APP {
+        qfr_put_varint(out, t);
+        qfr_put_varint(out, f.error_code);
+        if t == QF_CONNECTION_CLOSE {
+            qfr_put_varint(out, f.frame_type);
+        }
+        qfr_put_varint(out, f.data.len());
+        qfr_put(out, f.data);
+        return;
+    }
+}
+
+/// The encoding of one frame.
+pub fn quic_frame_encode(f: QuicFrame) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    quic_frame_put(& mut out, f);
+    return out;
+}
+
+/// How many bytes the encoding of a STREAM frame takes, `data_len` bytes
+/// of data at `offset` on `stream_id` (the connection uses it to fill a
+/// packet to its size).
+pub fn quic_stream_frame_overhead(stream_id: i64, offset: i64, data_len: i64) -> i64 {
+    var n: i64 = 1 + quic_varint_encode(stream_id).len() + quic_varint_encode(data_len).len();
+    if offset > 0 {
+        n = n + quic_varint_encode(offset).len();
+    }
+    return n;
+}
+
+/// The same for a CRYPTO frame.
+pub fn quic_crypto_frame_overhead(offset: i64, data_len: i64) -> i64 {
+    return 1 + quic_varint_encode(offset).len() + quic_varint_encode(data_len).len();
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────
+
+/// A reader over a payload: `pos` moves forward, `bad` is set (and stays
+/// set) when a field runs past the end.
+struct QfrReader {
+    b: Vec<i64>,
+    pos: i64,
+    bad: bool,
+}
+
+fn qfr_varint(r: & mut QfrReader) -> i64 {
+    if r.bad {
+        return 0;
+    }
+    val v: QuicVarint = quic_varint_decode(r.b, r.pos);
+    if !v.ok {
+        r.bad = true;
+        return 0;
+    }
+    r.pos = r.pos + v.len;
+    return v.value;
+}
+
+fn qfr_bytes(r: & mut QfrReader, n: i64) -> Vec<i64> {
+    if r.bad || n < 0 || r.pos + n > r.b.len() {
+        r.bad = true;
+        return qfr_none();
+    }
+    val out: Vec<i64> = quic_slice(r.b, r.pos, r.pos + n);
+    r.pos = r.pos + n;
+    return out;
+}
+
+fn qfr_fail(fs: & mut QuicFrames, code: i64, why: str) {
+    if fs.error < 0 {
+        fs.error = code;
+        fs.why = why;
+    }
+}
+
+/// Parse one frame at the reader's position (the type already read).
+/// False when it is malformed (the reason is set in `fs`).
+fn qfr_parse_one(r: & mut QfrReader, t: i64, fs: & mut QuicFrames) -> bool {
+    var f: QuicFrame = quic_frame_blank(t);
+    if quic_frame_is_stream(t) {
+        f.ftype = QF_STREAM;
+        f.stream_id = qfr_varint(r);
+        if (t & 0x04) != 0 {
+            f.offset = qfr_varint(r);
+        }
+        var len: i64 = 0;
+        if (t & 0x02) != 0 {
+            len = qfr_varint(r);
+        } else if !r.bad {
+            len = r.b.len() - r.pos;
+        }
+        f.data = qfr_bytes(r, len);
+        f.fin = (t & 0x01) != 0;
+        if r.bad {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "STREAM frame cut short");
+            return false;
+        }
+        if f.offset + f.data.len() > QUIC_VARINT_MAX {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "STREAM data past 2^62");
+            return false;
+        }
+        fs.frames.push(f);
+        return true;
+    }
+    if t == QF_PADDING || t == QF_PING || t == QF_HANDSHAKE_DONE {
+        fs.frames.push(f);
+        return true;
+    }
+    if t == QF_ACK || t == QF_ACK_ECN {
+        val largest: i64 = qfr_varint(r);
+        f.ack_delay = qfr_varint(r);
+        val count: i64 = qfr_varint(r);
+        val first: i64 = qfr_varint(r);
+        if r.bad || first > largest {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "bad ACK frame");
+            return false;
+        }
+        var lo: i64 = largest - first;
+        f.ranges.push(lo);
+        f.ranges.push(largest);
+        var i: i64 = 0;
+        while i < count {
+            val gap: i64 = qfr_varint(r);
+            val len: i64 = qfr_varint(r);
+            if r.bad || lo - gap - 2 < 0 || lo - gap - 2 - len < 0 {
+                qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "ACK range below zero");
+                return false;
+            }
+            val hi: i64 = lo - gap - 2;
+            lo = hi - len;
+            f.ranges.push(lo);
+            f.ranges.push(hi);
+            i = i + 1;
+            if i > 1024 {
+                qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "too many ACK ranges");
+                return false;
+            }
+        }
+        if t == QF_ACK_ECN {
+            f.ecn.push(qfr_varint(r));
+            f.ecn.push(qfr_varint(r));
+            f.ecn.push(qfr_varint(r));
+        }
+        if r.bad {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "ACK frame cut short");
+            return false;
+        }
+        fs.frames.push(f);
+        return true;
+    }
+    if t == QF_RESET_STREAM {
+        f.stream_id = qfr_varint(r);
+        f.error_code = qfr_varint(r);
+        f.final_size = qfr_varint(r);
+    } else if t == QF_STOP_SENDING {
+        f.stream_id = qfr_varint(r);
+        f.error_code = qfr_varint(r);
+    } else if t == QF_CRYPTO {
+        f.offset = qfr_varint(r);
+        val len: i64 = qfr_varint(r);
+        f.data = qfr_bytes(r, len);
+        if !r.bad && f.offset + f.data.len() > QUIC_VARINT_MAX {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "CRYPTO data past 2^62");
+            return false;
+        }
+    } else if t == QF_NEW_TOKEN {
+        val len: i64 = qfr_varint(r);
+        f.data = qfr_bytes(r, len);
+        if !r.bad && len == 0 {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "empty NEW_TOKEN");
+            return false;
+        }
+    } else if t == QF_MAX_DATA || t == QF_DATA_BLOCKED {
+        f.limit = qfr_varint(r);
+    } else if t == QF_MAX_STREAMS_BIDI || t == QF_MAX_STREAMS_UNI
+        || t == QF_STREAMS_BLOCKED_BIDI || t == QF_STREAMS_BLOCKED_UNI {
+        f.limit = qfr_varint(r);
+        if !r.bad && f.limit > 1152921504606846976 {
+            // 2^60 (RFC 9000 §19.11, §19.14)
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "stream count above 2^60");
+            return false;
+        }
+    } else if t == QF_MAX_STREAM_DATA || t == QF_STREAM_DATA_BLOCKED {
+        f.stream_id = qfr_varint(r);
+        f.limit = qfr_varint(r);
+    } else if t == QF_NEW_CONNECTION_ID {
+        f.seq = qfr_varint(r);
+        f.retire_prior_to = qfr_varint(r);
+        val cl: Vec<i64> = qfr_bytes(r, 1);
+        if !r.bad {
+            val n: i64 = cl.get(0);
+            if n < 1 || n > 20 {
+                qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "NEW_CONNECTION_ID length not 1..20");
+                return false;
+            }
+            f.data = qfr_bytes(r, n);
+            f.reset_token = qfr_bytes(r, 16);
+        }
+        if !r.bad && f.retire_prior_to > f.seq {
+            qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "retire_prior_to above the sequence number");
+            return false;
+        }
+    } else if t == QF_RETIRE_CONNECTION_ID {
+        f.seq = qfr_varint(r);
+    } else if t == QF_PATH_CHALLENGE || t == QF_PATH_RESPONSE {
+        f.data = qfr_bytes(r, 8);
+    } else if t == QF_CONNECTION_CLOSE || t == QF_CONNECTION_CLOSE_APP {
+        f.error_code = qfr_varint(r);
+        if t == QF_CONNECTION_CLOSE {
+            f.frame_type = qfr_varint(r);
+        }
+        val len: i64 = qfr_varint(r);
+        f.data = qfr_bytes(r, len);
+    } else {
+        qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "unknown frame type " + int_to_str(t));
+        return false;
+    }
+    if r.bad {
+        qfr_fail(fs, QE_FRAME_ENCODING_ERROR, "frame " + int_to_str(t) + " cut short");
+        return false;
+    }
+    fs.frames.push(f);
+    return true;
+}
+
+/// Parse the frames of a decrypted payload received at `level` (QL_*).
+/// An empty payload is a PROTOCOL_VIOLATION (RFC 9000 §12.4).
+pub fn quic_frames_parse(payload: Vec<i64>, level: i64) -> QuicFrames {
+    var fs: QuicFrames = QuicFrames { frames: Vec::new(), error: - 1, why: "", ack_eliciting: false };
+    if payload.len() == 0 {
+        qfr_fail(& mut fs, QE_PROTOCOL_VIOLATION, "a packet without frames");
+        return fs;
+    }
+    var r: QfrReader = QfrReader { b: payload, pos: 0, bad: false };
+    while r.pos < r.b.len() {
+        val t: i64 = qfr_varint(& mut r);
+        if r.bad {
+            qfr_fail(& mut fs, QE_FRAME_ENCODING_ERROR, "frame type cut short");
+            return fs;
+        }
+        if t == QF_PADDING {
+            // A run of PADDING is one frame for our purposes
+            while r.pos < r.b.len() && r.b.get(r.pos) == 0 {
+                r.pos = r.pos + 1;
+            }
+            continue;
+        }
+        if !quic_frame_allowed(t, level) && t <= QF_HANDSHAKE_DONE {
+            qfr_fail(& mut fs, QE_PROTOCOL_VIOLATION, "frame " + int_to_str(t) + " not allowed at this level");
+            return fs;
+        }
+        if !qfr_parse_one(& mut r, t, & mut fs) {
+            return fs;
+        }
+        if quic_frame_ack_eliciting(t) {
+            fs.ack_eliciting = true;
+        }
+    }
+    return fs;
+}
+
+// ─── ACK ranges ─────────────────────────────────────────────────────────
+
+/// Add packet number `pn` to a set of ranges kept as pairs (low, high),
+/// highest first, merging neighbours; at most `max_ranges` ranges are kept
+/// (the lowest are dropped). Returns the new set.
+pub fn quic_ranges_add(ranges: Vec<i64>, pn: i64, max_ranges: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var placed: bool = false;
+    var i: i64 = 0;
+    val n: i64 = ranges.len() / 2;
+    while i < n {
+        val lo: i64 = ranges.get(2 * i);
+        val hi: i64 = ranges.get(2 * i + 1);
+        if !placed && pn > hi + 1 {
+            out.push(pn);
+            out.push(pn);
+            placed = true;
+        }
+        if !placed && pn >= lo - 1 && pn <= hi + 1 {
+            var nlo: i64 = lo;
+            var nhi: i64 = hi;
+            if pn < nlo {
+                nlo = pn;
+            }
+            if pn > nhi {
+                nhi = pn;
+            }
+            out.push(nlo);
+            out.push(nhi);
+            placed = true;
+        } else {
+            out.push(lo);
+            out.push(hi);
+        }
+        i = i + 1;
+    }
+    if !placed {
+        out.push(pn);
+        out.push(pn);
+    }
+    // Merge ranges that now touch (pn filled the one gap between two)
+    var merged: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < out.len() / 2 {
+        val lo: i64 = out.get(2 * k);
+        val hi: i64 = out.get(2 * k + 1);
+        val m: i64 = merged.len();
+        if m >= 2 && merged.get(m - 2) <= hi + 1 {
+            if lo < merged.get(m - 2) {
+                merged.set(m - 2, lo);
+            }
+        } else {
+            merged.push(lo);
+            merged.push(hi);
+        }
+        k = k + 1;
+    }
+    while merged.len() / 2 > max_ranges {
+        merged.pop();
+        merged.pop();
+    }
+    return merged;
+}
+
+/// Whether `pn` is in a set of ranges.
+pub fn quic_ranges_contain(ranges: Vec<i64>, pn: i64) -> bool {
+    var i: i64 = 0;
+    while i + 1 < ranges.len() {
+        if pn >= ranges.get(i) && pn <= ranges.get(i + 1) {
+            return true;
+        }
+        i = i + 2;
+    }
+    return false;
+}
+
+// ─── Transport parameters (RFC 9000 §18) ────────────────────────────────
+
+pub const QTP_ORIGINAL_DCID: i64 = 0x00;
+pub const QTP_MAX_IDLE_TIMEOUT: i64 = 0x01;
+pub const QTP_STATELESS_RESET_TOKEN: i64 = 0x02;
+pub const QTP_MAX_UDP_PAYLOAD_SIZE: i64 = 0x03;
+pub const QTP_INITIAL_MAX_DATA: i64 = 0x04;
+pub const QTP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: i64 = 0x05;
+pub const QTP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: i64 = 0x06;
+pub const QTP_INITIAL_MAX_STREAM_DATA_UNI: i64 = 0x07;
+pub const QTP_INITIAL_MAX_STREAMS_BIDI: i64 = 0x08;
+pub const QTP_INITIAL_MAX_STREAMS_UNI: i64 = 0x09;
+pub const QTP_ACK_DELAY_EXPONENT: i64 = 0x0a;
+pub const QTP_MAX_ACK_DELAY: i64 = 0x0b;
+pub const QTP_DISABLE_ACTIVE_MIGRATION: i64 = 0x0c;
+pub const QTP_PREFERRED_ADDRESS: i64 = 0x0d;
+pub const QTP_ACTIVE_CONNECTION_ID_LIMIT: i64 = 0x0e;
+pub const QTP_INITIAL_SCID: i64 = 0x0f;
+pub const QTP_RETRY_SCID: i64 = 0x10;
+
+/// Transport parameters with the RFC's defaults (everything absent: no
+/// data or streams allowed until the peer says so).
+pub fn quic_params_default() -> QuicParams {
+    return QuicParams {
+        has_original_dcid: false, original_dcid: qfr_none(), max_idle_timeout: 0,
+        stateless_reset_token: qfr_none(), max_udp_payload_size: 65527,
+        initial_max_data: 0, initial_max_stream_data_bidi_local: 0,
+        initial_max_stream_data_bidi_remote: 0, initial_max_stream_data_uni: 0,
+        initial_max_streams_bidi: 0, initial_max_streams_uni: 0,
+        ack_delay_exponent: 3, max_ack_delay: 25, disable_active_migration: false,
+        active_connection_id_limit: 2, has_initial_scid: false, initial_scid: qfr_none(),
+        has_retry_scid: false, retry_scid: qfr_none(),
+    };
+}
+
+fn qfr_param_int(out: & mut Vec<i64>, id: i64, v: i64) {
+    val enc: Vec<i64> = quic_varint_encode(v);
+    qfr_put_varint(out, id);
+    qfr_put_varint(out, enc.len());
+    qfr_put(out, enc);
+}
+
+fn qfr_param_bytes(out: & mut Vec<i64>, id: i64, v: Vec<i64>) {
+    qfr_put_varint(out, id);
+    qfr_put_varint(out, v.len());
+    qfr_put(out, v);
+}
+
+/// The quic_transport_parameters extension body of `p`. Values equal to
+/// the default are still sent when the RFC's default is not "absent", so
+/// what is sent is always explicit.
+pub fn quic_params_encode(p: QuicParams) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if p.has_original_dcid {
+        qfr_param_bytes(& mut out, QTP_ORIGINAL_DCID, p.original_dcid);
+    }
+    if p.max_idle_timeout > 0 {
+        qfr_param_int(& mut out, QTP_MAX_IDLE_TIMEOUT, p.max_idle_timeout);
+    }
+    if p.stateless_reset_token.len() == 16 {
+        qfr_param_bytes(& mut out, QTP_STATELESS_RESET_TOKEN, p.stateless_reset_token);
+    }
+    qfr_param_int(& mut out, QTP_MAX_UDP_PAYLOAD_SIZE, p.max_udp_payload_size);
+    qfr_param_int(& mut out, QTP_INITIAL_MAX_DATA, p.initial_max_data);
+    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, p.initial_max_stream_data_bidi_local);
+    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, p.initial_max_stream_data_bidi_remote);
+    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAM_DATA_UNI, p.initial_max_stream_data_uni);
+    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAMS_BIDI, p.initial_max_streams_bidi);
+    qfr_param_int(& mut out, QTP_INITIAL_MAX_STREAMS_UNI, p.initial_max_streams_uni);
+    qfr_param_int(& mut out, QTP_ACK_DELAY_EXPONENT, p.ack_delay_exponent);
+    qfr_param_int(& mut out, QTP_MAX_ACK_DELAY, p.max_ack_delay);
+    if p.disable_active_migration {
+        qfr_put_varint(& mut out, QTP_DISABLE_ACTIVE_MIGRATION);
+        qfr_put_varint(& mut out, 0);
+    }
+    qfr_param_int(& mut out, QTP_ACTIVE_CONNECTION_ID_LIMIT, p.active_connection_id_limit);
+    if p.has_initial_scid {
+        qfr_param_bytes(& mut out, QTP_INITIAL_SCID, p.initial_scid);
+    }
+    if p.has_retry_scid {
+        qfr_param_bytes(& mut out, QTP_RETRY_SCID, p.retry_scid);
+    }
+    return out;
+}
+
+fn qfr_params_bad(p: QuicParams, why: str) -> QuicParamsParsed {
+    return QuicParamsParsed { params: p, error: QE_TRANSPORT_PARAMETER_ERROR, why: why };
+}
+
+/// Parse the peer's transport parameters. `from_server` tells who sent
+/// them: a client may not send the server-only ones (original and retry
+/// connection IDs, the stateless reset token, the preferred address). A
+/// parameter twice, a value out of its range or a length that does not
+/// match is a TRANSPORT_PARAMETER_ERROR; unknown parameters are skipped.
+pub fn quic_params_parse(b: Vec<i64>, from_server: bool) -> QuicParamsParsed {
+    var p: QuicParams = quic_params_default();
+    var seen: Vec<i64> = Vec::new();
+    var off: i64 = 0;
+    while off < b.len() {
+        val id: QuicVarint = quic_varint_decode(b, off);
+        if !id.ok {
+            return qfr_params_bad(p, "parameter id cut short");
+        }
+        off = off + id.len;
+        val ln: QuicVarint = quic_varint_decode(b, off);
+        if !ln.ok || off + ln.len + ln.value > b.len() {
+            return qfr_params_bad(p, "parameter value cut short");
+        }
+        off = off + ln.len;
+        val v: Vec<i64> = quic_slice(b, off, off + ln.value);
+        off = off + ln.value;
+        val pid: i64 = id.value;
+        if pid <= QTP_RETRY_SCID {
+            var k: i64 = 0;
+            while k < seen.len() {
+                if seen.get(k) == pid {
+                    return qfr_params_bad(p, "parameter " + int_to_str(pid) + " twice");
+                }
+                k = k + 1;
+            }
+            seen.push(pid);
+        }
+        if !from_server && (pid == QTP_ORIGINAL_DCID || pid == QTP_STATELESS_RESET_TOKEN
+            || pid == QTP_PREFERRED_ADDRESS || pid == QTP_RETRY_SCID) {
+            return qfr_params_bad(p, "a server-only parameter from the client");
+        }
+        var num: i64 = 0;
+        val is_int: bool = pid == QTP_MAX_IDLE_TIMEOUT || (pid >= QTP_MAX_UDP_PAYLOAD_SIZE && pid <= QTP_MAX_ACK_DELAY)
+            || pid == QTP_ACTIVE_CONNECTION_ID_LIMIT;
+        if is_int {
+            val x: QuicVarint = quic_varint_decode(v, 0);
+            if !x.ok || x.len != v.len() {
+                return qfr_params_bad(p, "parameter " + int_to_str(pid) + " is not one varint");
+            }
+            num = x.value;
+        }
+        if pid == QTP_ORIGINAL_DCID {
+            if v.len() > 20 {
+                return qfr_params_bad(p, "original_destination_connection_id over 20 bytes");
+            }
+            p.has_original_dcid = true;
+            p.original_dcid = v;
+        } else if pid == QTP_MAX_IDLE_TIMEOUT {
+            p.max_idle_timeout = num;
+        } else if pid == QTP_STATELESS_RESET_TOKEN {
+            if v.len() != 16 {
+                return qfr_params_bad(p, "stateless_reset_token not 16 bytes");
+            }
+            p.stateless_reset_token = v;
+        } else if pid == QTP_MAX_UDP_PAYLOAD_SIZE {
+            if num < 1200 {
+                return qfr_params_bad(p, "max_udp_payload_size below 1200");
+            }
+            p.max_udp_payload_size = num;
+        } else if pid == QTP_INITIAL_MAX_DATA {
+            p.initial_max_data = num;
+        } else if pid == QTP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL {
+            p.initial_max_stream_data_bidi_local = num;
+        } else if pid == QTP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE {
+            p.initial_max_stream_data_bidi_remote = num;
+        } else if pid == QTP_INITIAL_MAX_STREAM_DATA_UNI {
+            p.initial_max_stream_data_uni = num;
+        } else if pid == QTP_INITIAL_MAX_STREAMS_BIDI {
+            if num > 1152921504606846976 {
+                return qfr_params_bad(p, "initial_max_streams_bidi above 2^60");
+            }
+            p.initial_max_streams_bidi = num;
+        } else if pid == QTP_INITIAL_MAX_STREAMS_UNI {
+            if num > 1152921504606846976 {
+                return qfr_params_bad(p, "initial_max_streams_uni above 2^60");
+            }
+            p.initial_max_streams_uni = num;
+        } else if pid == QTP_ACK_DELAY_EXPONENT {
+            if num > 20 {
+                return qfr_params_bad(p, "ack_delay_exponent above 20");
+            }
+            p.ack_delay_exponent = num;
+        } else if pid == QTP_MAX_ACK_DELAY {
+            if num >= 16384 {
+                return qfr_params_bad(p, "max_ack_delay 2^14 or more");
+            }
+            p.max_ack_delay = num;
+        } else if pid == QTP_DISABLE_ACTIVE_MIGRATION {
+            if v.len() != 0 {
+                return qfr_params_bad(p, "disable_active_migration with a value");
+            }
+            p.disable_active_migration = true;
+        } else if pid == QTP_ACTIVE_CONNECTION_ID_LIMIT {
+            if num < 2 {
+                return qfr_params_bad(p, "active_connection_id_limit below 2");
+            }
+            p.active_connection_id_limit = num;
+        } else if pid == QTP_INITIAL_SCID {
+            if v.len() > 20 {
+                return qfr_params_bad(p, "initial_source_connection_id over 20 bytes");
+            }
+            p.has_initial_scid = true;
+            p.initial_scid = v;
+        } else if pid == QTP_RETRY_SCID {
+            if v.len() > 20 {
+                return qfr_params_bad(p, "retry_source_connection_id over 20 bytes");
+            }
+            p.has_retry_scid = true;
+            p.retry_scid = v;
+        }
+    }
+    if !p.has_initial_scid {
+        return qfr_params_bad(p, "initial_source_connection_id missing");
+    }
+    if from_server && !p.has_original_dcid {
+        return qfr_params_bad(p, "original_destination_connection_id missing");
+    }
+    return QuicParamsParsed { params: p, error: - 1, why: "" };
+}

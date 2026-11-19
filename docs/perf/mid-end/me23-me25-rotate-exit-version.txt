@@ -1,0 +1,84 @@
+ME23 / ME24 / ME25 (llvm-roadmap Track ME), Nov 17 — what was written, and
+how the final build checks it. Nothing here was built with today's
+compiler; the stage0 compiler of Nov 16 was used only where it already had
+the code (iro_version, the tests' outputs).
+
+ME23a  Exit values for bounds that are not constants (compiler/ssa.fd)
+-----------------------------------------------------------------------
+ssa_exit_values now takes a start c0 and a bound N that are values, not
+only constants. N must come from before the loop (ssa_outside_i64: a
+parameter, a value or phi of a block outside the body; an i64). Then:
+  i != N   i is N after the loop (the loop leaves only with i == N)
+  i < N    i is N, when a guard on the way in proves c0 <= N
+  i <= N   i is N + 1 (a new Add at the top of the exit block), same guard
+The guard (ssa_guard_le): up from the header's predecessor outside the
+loop through blocks of one predecessor (at most 6), each Branch whose edge
+leads down to the loop adds its condition, true on the true edge, false on
+the false one; `&&` is taken apart when true, `||` when false. A fact
+x < y / x <= y gives c0 <= N when x, y are c0, N themselves, or N is
+bounded below by a constant at least c0 (`if n > 0` with c0 = 0), or c0 is
+bounded above by a constant at most N. Signed i64 comparisons only. No
+select instruction exists in the IR, so without a guard `<` / `<=` loops
+keep their variable. Counters: `iropt: ssaexit C constant, B from a bound`
+(FID_IROPT_STATS=1).
+Test: tests/bootstrap/test_ssa_exit_bound.fd (interpreter and stage0's
+pe_ir print the expected block). Check: tests/tooling/ssaexit-check.sh
+(B > 0 on that test, outputs default / ssaexit off / ssa off the same;
+SUITE=1 NAT=1 runs midend-pass-suite-check.sh PASS=ssaexit, pe_ir and
+--nat).
+
+ME23b  Loop rotation in the mid-end (compiler/iropt_me.fd, checks.fd)
+--------------------------------------------------------------------
+ime_rotate (pass `rotate`, opt-in: FID_IROPT_ON=rotate), run by
+iropt_native last on each function (after licm, iv and version, which want
+the test in the header). A loop with one latch L and one way in P, both
+jumping to a header H of at most 12 instructions (loads, integer
+constants and operations, Vec_len calls, then Branch(c, T, X); pe_ir's
+peir_rotatable rule), T and X each entered only from H: L's Jump becomes a
+copy of H's instructions with new values, ending in Branch(c', T, X). A
+value of H that a later block reads must be a load through an address from
+before H; T and X load it again at their top (the test writes nothing, so
+memory there is what H or the copy read). Loops counting down
+(`i = i - 1` on a slot the test loads) are left alone (peir_counted_down
+reads the test in the header). Not in @constant_time code.
+checks.fd's counted-loop proof knows the shape (peir_rotated_test): a
+header that tests nothing, every predecessor of which ends in
+Branch(i < r, head, out) with out outside the loop, one operator, loads of
+one i64 slot in that predecessor with no store to it after them there,
+and every r the same bound as on the way in (peir_rot_same: the same
+value, loads of a plain local the loop never stores, Vec_len of the same
+Vec, or those minus the same constant). Then i < r whenever the header
+starts; the step may be in the header, and accesses in the header count.
+pe_ir's own PEIR_ROTATE stays: a rotated latch ends in a Branch, so it
+does not fire twice; loops the IR pass leaves (two latches, ...) are still
+rotated by pe_ir. nat_ir gets rotation only through this pass.
+Risk: nat_ir's vectorizer (ng_vz_try) looks for a Jump into a loop; a
+rotated loop is entered by H's Branch, so it may not vectorize. That is
+why `rotate` stays opt-in until BENCH=1 NAT=1 rotate-check.sh says no
+program is slower.
+Counters: `iropt: rotate N loops in M functions`. `fid explain` applies it
+with FID_IROPT_ON=rotate once main.fd calls iropt.fd iro_explain_loops.
+Test: tests/bootstrap/test_midend_rotate.fd (its expected block is stage0's
+pe_ir output). Check: tests/tooling/rotate-check.sh.
+
+ME24  Unrolling on by default
+-----------------------------
+Done by OP11 earlier today: `unroll` is in IME_DEFAULT_ON (full, partial
+by 4/2, peeled remainder, run-time trip counts: ime_unroll_one,
+ime_unroll_copy). Check: tests/tooling/unroll-check.sh NAT=1 SUITE=1 and
+BENCH=1, and tests/tooling/midend-optin-check.sh (IME names unroll; "off"
+names it in FID_IROPT_OFF).
+
+ME25  Loop versioning on by default
+-----------------------------------
+`version` is in IME_DEFAULT_ON (iropt.fd iro_version; FID_IROPT_OFF=version
+turns it off). Stage0 (Nov 16), with FID_IROPT_ON=version:
+test_irswitch_version 3 loops versioned, test_counted_loop_step 1,
+test_version_oob_fail 2, test_version_negstart_fail 1; outputs the same
+as with it off; both _fail tests panic with "Vec index out of bounds"
+after the same lines (n > v.len() and a start of -1 fail the guard and
+run the checked loop). A loop is versioned only when the proof covers an
+access of the copy, so `versioned loops N` > 0 already says the copy's
+checks are removed; `fid explain` shows it per check once main.fd calls
+iropt.fd iro_explain_loops before explain_checks.
+Check: tests/tooling/version-default-check.sh (NAT=1 SUITE=1, BENCH=1).

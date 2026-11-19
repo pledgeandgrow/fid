@@ -1,0 +1,102 @@
+// stdlib/webview: origins and the allow-list, JSON-RPC 2.0 dispatch
+// (results, handler errors, unknown methods, parse / invalid request /
+// invalid params errors, notifications, batches), calls into JavaScript
+// with responses and timeouts, events, the JS string escape and the
+// injected bridge script. Messages come in as text, as the platform view
+// would deliver them.
+// Expected output:
+// origin https://app.example.com http://x.com:8080 null file://
+// allowed true false true false true false false
+// {"jsonrpc":"2.0","id":1,"result":5}
+// {"jsonrpc":"2.0","id":"a","result":{"x":1}}
+// {"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"nope"}}
+// {"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"Method not found"}}
+// {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+// {"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"Invalid Request"}}
+// {"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Invalid params"}}
+// notification (none) logged 1
+// [{"jsonrpc":"2.0","id":10,"result":2},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}]
+// {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}
+// evil (none) refused 1
+// {"jsonrpc":"2.0","id":1,"method":"getTitle","params":null}
+// answer (none) resolved 1 "Home" true pending 1
+// expired 2 pending 0
+// {"jsonrpc":"2.0","method":"theme","params":{"dark":true}}
+// "a\"b\\c\n<\/script>\u2028\u0001"
+// window.FidesBridge&&window.FidesBridge._receive("{\"id\":1}");
+// android send function send(m){var t=JSON.stringify(m);window.FidesNative.postMessage(t);}
+// ios send function send(m){var t=JSON.stringify(m);window.webkit.messageHandlers.fides.postMessage(t);}
+// script lines 17
+// calls addJavascriptInterface addScriptMessageHandler:name:
+use webview;
+use vec;
+use string;
+use json;
+
+var logged: i64 = 0;
+
+fn h_add(params: str) -> str {
+    return int_to_str(str_parse_int(json_at_safe(params, 0)) + str_parse_int(json_at_safe(params, 1)));
+}
+fn h_echo(params: str) -> str { return params; }
+fn h_fail(params: str) -> str { return webview_error_result(-32001, "nope"); }
+fn h_log(params: str) -> str { logged = logged + 1; return "null"; }
+
+fn show(r: str) {
+    if str_len(r) == 0 { println("(none)"); } else { println(r); }
+}
+
+fn none(r: str) -> str { if str_len(r) == 0 { return "(none)"; } return r; }
+
+fn main() {
+    println("origin " + webview_origin("https://App.Example.com:443/path?x") + " " + webview_origin("http://x.com:8080/")
+        + " " + webview_origin("data:text/html,hi") + " " + webview_origin("file:///a/b.html"));
+    var allow: Vec<str> = Vec::new();
+    allow.push("https://app.example.com");
+    allow.push("https://*.cdn.example.com");
+    allow.push("app://local");
+    println("allowed " + bool_to_str(webview_origin_allowed(&allow, "https://app.example.com/page"))
+        + " " + bool_to_str(webview_origin_allowed(&allow, "https://evil.com"))
+        + " " + bool_to_str(webview_origin_allowed(&allow, "https://a.cdn.example.com"))
+        + " " + bool_to_str(webview_origin_allowed(&allow, "https://cdn.example.com"))
+        + " " + bool_to_str(webview_origin_allowed(&allow, "app://local/index.html"))
+        + " " + bool_to_str(webview_origin_allowed(&allow, "http://app.example.com"))
+        + " " + bool_to_str(webview_origin_allowed(&allow, "null")));
+
+    var b: WebviewBridge = webview_bridge_new(allow);
+    webview_register(&mut b, "add", h_add);
+    webview_register(&mut b, "echo", h_echo);
+    webview_register(&mut b, "fail", h_fail);
+    webview_register(&mut b, "log", h_log);
+    val o: str = "https://app.example.com";
+    show(webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"add\",\"params\":[2,3]}"));
+    show(webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"echo\",\"params\":{\"x\":1}}"));
+    show(webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"fail\"}"));
+    show(webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"nope\"}"));
+    show(webview_receive(&mut b, o, "{bad"));
+    show(webview_receive(&mut b, o, "{\"jsonrpc\":\"1.0\",\"id\":3,\"method\":\"add\"}"));
+    show(webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"add\",\"params\":5}"));
+    val nr: str = webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"params\":[\"hi\"]}");
+    println("notification " + none(nr) + " logged " + int_to_str(logged));
+    show(webview_receive(&mut b, o, "[{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"add\",\"params\":[1,1]},{\"jsonrpc\":\"2.0\",\"method\":\"log\"},{\"foo\":1}]"));
+    show(webview_receive(&mut b, o, "[]"));
+    val ev: str = webview_receive(&mut b, "https://evil.com", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"add\",\"params\":[1,2]}");
+    println("evil " + none(ev) + " refused " + int_to_str(b.refused));
+
+    println(webview_call_js(&mut b, "getTitle", "null", 1000));
+    webview_call_js(&mut b, "getScroll", "null", 2000);
+    val ans: str = webview_receive(&mut b, o, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"Home\"}");
+    println("answer " + none(ans) + " resolved " + int_to_str(b.resolved_ids.get(0)) + " " + b.resolved_vals.get(0) + " "
+        + bool_to_str(b.resolved_ok.get(0)) + " pending " + int_to_str(b.pending.len()));
+    val gone: Vec<i64> = webview_expire(&mut b, 7001, 5000);
+    println("expired " + int_to_str(gone.get(0)) + " pending " + int_to_str(b.pending.len()));
+    println(webview_emit("theme", "{\"dark\":true}"));
+    println(webview_js_string("a\"b\\c\n</script>\u{2028}\u{1}"));
+    println(webview_js_eval("{\"id\":1}"));
+    val sa: Vec<str> = str_lines(webview_bridge_script(WEBVIEW_ANDROID, "FidesNative"));
+    val si: Vec<str> = str_lines(webview_bridge_script(WEBVIEW_IOS, "fides"));
+    println("android send " + sa.get(3));
+    println("ios send " + si.get(3));
+    println("script lines " + int_to_str(sa.len()));
+    println("calls " + webview_android_calls().get(3).method + " " + webview_ios_calls().get(0).method);
+}

@@ -1,0 +1,137 @@
+// reverse-complement (the Benchmarks Game, roadmap BM3): the three sections
+// of fasta's output (ALU repeated for 2n characters, 3n drawn from the IUB
+// codes, 5n from the Homo sapiens frequencies, the generator seeded 42 and
+// carried from one section to the next), each reverse-complemented in place
+// the way the benchmark's programs do it (two indexes meet in the middle,
+// each byte through the IUPAC complement table, lower case to upper case).
+// The input is made in memory, n = 2500000 (25 MB), instead of read from
+// stdin; the output, 25M characters, is folded into a 32-bit hash,
+// h = h * 31 + c, which the program prints (bench/game/reference.py gives
+// the value). tests/bootstrap/test_verify_bm_revcomp.fd is this program
+// with n = 1000.
+fn alu_seq() -> str {
+    return "GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGAGGCGGGCGGATCACCTGAGGTCAGGAGTTCGAGACCAGCCTGGCCAACATGGTGAAACCCCGTCTCTACTAAAAATACAAAAATTAGCCGGGCGTGGTGGCGCGCGCCTGTAATCCCAGCTACTCGGGAGGCTGAGGCAGGAGAATCGCTTGAACCCGGGAGGCGGAGGTTGCAGTGAGCCGAGATCGCGCCACTGCACTCCAGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA";
+}
+
+fn repeat_section(m: i64) -> Vec<u8> {
+    val alu: Vec<i64> = str_bytes(alu_seq());
+    val len: i64 = alu.len();
+    var out: Vec<u8> = Vec::new();
+    var k: i64 = 0;
+    while k < m {
+        out.push(alu.get(k % len) as u8);
+        k = k + 1;
+    }
+    return out;
+}
+
+// random_section draws m characters; seed holds the generator's state
+// (seed.get(0)), carried from one section to the next
+fn random_section(seed: &mut Vec<i64>, chars: str, probs: Vec<f64>, m: i64) -> Vec<u8> {
+    val codes: Vec<i64> = str_bytes(chars);
+    var cum: Vec<f64> = Vec::new();
+    var p: f64 = 0.0;
+    var j: i64 = 0;
+    while j < probs.len() {
+        p = p + probs.get(j);
+        cum.push(p);
+        j = j + 1;
+    }
+    val last_i: i64 = cum.len() - 1;
+    var last: i64 = seed.get(0);
+    var out: Vec<u8> = Vec::new();
+    var k: i64 = 0;
+    while k < m {
+        last = (last * 3877 + 29573) % 139968;
+        val r: f64 = (last as f64) / 139968.0;
+        var i: i64 = 0;
+        while i < last_i && r >= cum.get(i) {
+            i = i + 1;
+        }
+        out.push(codes.get(i) as u8);
+        k = k + 1;
+    }
+    seed.set(0, last);
+    return out;
+}
+
+// the complement of every byte: the IUPAC codes, either case, to the upper
+// case complement; any other byte to itself
+fn comp_table() -> Vec<i64> {
+    val from: Vec<i64> = str_bytes("ACBDGHKMNSRUTWVYacbdghkmnsrutwvy");
+    val to: Vec<i64> = str_bytes("TGVHCDMKNSYAAWBRTGVHCDMKNSYAAWBR");
+    var t: Vec<i64> = Vec::new();
+    var c: i64 = 0;
+    while c < 256 {
+        t.push(c);
+        c = c + 1;
+    }
+    var j: i64 = 0;
+    while j < from.len() {
+        t.set(from.get(j), to.get(j));
+        j = j + 1;
+    }
+    return t;
+}
+
+fn reverse_complement(seq: &mut Vec<u8>, t: Vec<i64>) {
+    var i: i64 = 0;
+    var j: i64 = seq.len() - 1;
+    while i < j {
+        val a: i64 = seq.get(i) as i64;
+        val b: i64 = seq.get(j) as i64;
+        seq.set(i, t.get(b) as u8);
+        seq.set(j, t.get(a) as u8);
+        i = i + 1;
+        j = j - 1;
+    }
+    if i == j {
+        seq.set(i, t.get(seq.get(i) as i64) as u8);
+    }
+}
+
+fn hash_seq(h0: i64, seq: Vec<u8>) -> i64 {
+    var h: i64 = h0;
+    var k: i64 = 0;
+    while k < seq.len() {
+        h = (h * 31 + (seq.get(k) as i64)) & 4294967295;
+        k = k + 1;
+    }
+    return h;
+}
+
+fn revcomp(n: i64) -> i64 {
+    val t: Vec<i64> = comp_table();
+    var seed: Vec<i64> = Vec::new();
+    seed.push(42);
+    var iub: Vec<f64> = Vec::new();
+    iub.push(0.27);
+    iub.push(0.12);
+    iub.push(0.12);
+    iub.push(0.27);
+    var j: i64 = 0;
+    while j < 11 {
+        iub.push(0.02);
+        j = j + 1;
+    }
+    var homo: Vec<f64> = Vec::new();
+    homo.push(0.3029549426680);
+    homo.push(0.1979883004921);
+    homo.push(0.1975473066391);
+    homo.push(0.3015094502008);
+    var one: Vec<u8> = repeat_section(2 * n);
+    var two: Vec<u8> = random_section(&mut seed, "acgtBDHKMNRSVWY", iub, 3 * n);
+    var three: Vec<u8> = random_section(&mut seed, "acgt", homo, 5 * n);
+    reverse_complement(&mut one, t);
+    reverse_complement(&mut two, t);
+    reverse_complement(&mut three, t);
+    var h: i64 = hash_seq(0, one);
+    h = hash_seq(h, two);
+    h = hash_seq(h, three);
+    return h;
+}
+
+fn main() -> i64 {
+    println(revcomp(2500000));
+    return 0;
+}

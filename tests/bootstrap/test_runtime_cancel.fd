@@ -1,0 +1,56 @@
+// Waits that respect cancellation (competitive CA7; stdlib/task.fd
+// "Cancellation tokens"): a cancelled token stops a sleep at once, a token
+// with a deadline stops a long sleep and a channel receive when its time
+// is up (the library form of a timeout block, CA8), a live token lets a
+// short sleep run to its end, and a join returns once the task is done.
+//
+// Expected output:
+// cancelled sleep: false fast true
+// deadline sleep: false fast true
+// live sleep: true
+// remaining: -1 0
+// recv: 5
+// recv after deadline: none fast true
+// join: true 42
+use string;
+use task;
+use sync;
+
+fn answer(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn main() -> i64 {
+    val t0: i64 = p_clock_now_ms();
+    val tok: i64 = task_token_new();
+    task_token_cancel(tok);
+    val a: bool = task_sleep_cancellable(5000, tok);
+    println("cancelled sleep: " + bool_to_str(a) + " fast " + bool_to_str(p_clock_now_ms() - t0 < 2000));
+
+    val t1: i64 = p_clock_now_ms();
+    val dl: i64 = task_token_with_timeout(30);
+    val b: bool = task_sleep_cancellable(5000, dl);
+    println("deadline sleep: " + bool_to_str(b) + " fast " + bool_to_str(p_clock_now_ms() - t1 < 2000));
+
+    val live: i64 = task_token_new();
+    println("live sleep: " + bool_to_str(task_sleep_cancellable(20, live)));
+    println("remaining: " + int_to_str(task_token_remaining(live)) + " " + int_to_str(task_token_remaining(tok)));
+
+    val ch: i64 = sync_channel_create(4);
+    sync_channel_send(ch, 5);
+    match task_recv_cancellable(ch, live) {
+        Option::Some(v) => { println("recv: " + int_to_str(v)); }
+        Option::None => { println("recv: none"); }
+    }
+    val t2: i64 = p_clock_now_ms();
+    match task_recv_cancellable(ch, task_token_with_timeout(30)) {
+        Option::Some(v) => { println("recv after deadline: " + int_to_str(v)); }
+        Option::None => { println("recv after deadline: none fast " + bool_to_str(p_clock_now_ms() - t2 < 2000)); }
+    }
+
+    val t: i64 = task_go("answer", 21);
+    val done: bool = task_join_cancellable(t, live);
+    println("join: " + bool_to_str(done) + " " + int_to_str(task_result(t)));
+    task_run();
+    return 0;
+}

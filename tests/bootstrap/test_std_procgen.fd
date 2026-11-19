@@ -1,0 +1,185 @@
+// stdlib/procgen: PCG32 against the reference stream (pcg32_srandom_r(42, 54)), BSP dungeon / drunkard walk / cellular-automata cave invariants and determinism, L-systems (algae lengths, Koch curve geometry, bracketed plant), Poisson disk spacing
+// Expected output:
+// pcg32: 0xa15c02b7 0x7b47f409 0xba1d3330 0x83d2f293 0xbfa4784b 0xcbed606e
+// below(6) covers 0..5 evenly: true
+// f64 in [0,1): true
+// bsp: rooms >= 8: true, no rooms touch: true, rooms inside: true
+// bsp: border wall true, connected true, rooms carved true
+// bsp: same seed same map true, other seed differs true
+// drunkard: floor >= 40% true, connected true, border wall true
+// cave: one region true, border wall true, floor share 30..70%: true
+// cave: same seed same map true
+// algae lengths: 1 2 3 5 8 13 21 34
+// koch n=1: 4 segments, end (3.0000, 0.0000), height 0.8660
+// koch n=3: 64 segments, end (27.0000, 0.0000)
+// plant: 84 segments, bracket depth 6, balanced true
+// unbalanced: depth -1
+// poisson: many points true, min distance >= 3: true, inside: true, deterministic: true
+use procgen;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn hexn(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var x: i64 = v;
+    var n: i64 = 0;
+    while n < 8 {
+        s = byte_to_str(str_byte_at(d, x & 15)) + s;
+        x = x >> 4;
+        n = n + 1;
+    }
+    return "0x" + s;
+}
+
+fn f4(x: f64) -> str {
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val v: i64 = (a * 10000.0 + 0.5) as i64;
+    var fr: str = int_to_str(v % 10000);
+    while str_len(fr) < 4 { fr = "0" + fr; }
+    var out: str = int_to_str(v / 10000) + "." + fr;
+    if neg && v != 0 { out = "-" + out; }
+    return out;
+}
+
+fn main() {
+    var r: PgRng = pg_rng_seeded(42, 54);
+    var line: str = "pcg32:";
+    var i: i64 = 0;
+    while i < 6 {
+        line = line + " " + hexn(pg_rng_u32(&mut r));
+        i = i + 1;
+    }
+    println(line);
+    var counts: Vec<i64> = Vec::filled(6, 0);
+    i = 0;
+    while i < 6000 {
+        val k: i64 = pg_rng_below(&mut r, 6);
+        counts.set(k, counts.get(k) + 1);
+        i = i + 1;
+    }
+    var even: bool = true;
+    i = 0;
+    while i < 6 {
+        if counts.get(i) < 850 || counts.get(i) > 1150 { even = false; }
+        i = i + 1;
+    }
+    println("below(6) covers 0..5 evenly: " + yes(even));
+    var fok: bool = true;
+    i = 0;
+    while i < 1000 {
+        val f: f64 = pg_rng_f64(&mut r);
+        if f < 0.0 || f >= 1.0 { fok = false; }
+        i = i + 1;
+    }
+    println("f64 in [0,1): " + yes(fok));
+
+    // ── BSP
+    val d: PgDungeon = pg_bsp_dungeon(80, 50, 10, 1234);
+    var touch: bool = false;
+    var inside: bool = true;
+    var carved: bool = true;
+    i = 0;
+    while i < d.rooms.len() {
+        val a: PgRoom = d.rooms.get(i);
+        if a.x < 1 || a.y < 1 || a.x + a.w > 79 || a.y + a.h > 49 || a.w < 3 || a.h < 3 { inside = false; }
+        var y: i64 = a.y;
+        while y < a.y + a.h {
+            var x: i64 = a.x;
+            while x < a.x + a.w {
+                if pg_get(&d.grid, x, y) != PG_FLOOR { carved = false; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        var j: i64 = i + 1;
+        while j < d.rooms.len() {
+            if pg_rooms_touch(a, d.rooms.get(j)) { touch = true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    println("bsp: rooms >= 8: " + yes(d.rooms.len() >= 8) + ", no rooms touch: " + yes(!touch) + ", rooms inside: " + yes(inside));
+    println("bsp: border wall " + yes(pg_border_is_wall(&d.grid)) + ", connected " + yes(pg_grid_connected(&d.grid)) + ", rooms carved " + yes(carved));
+    val d2: PgDungeon = pg_bsp_dungeon(80, 50, 10, 1234);
+    val d3: PgDungeon = pg_bsp_dungeon(80, 50, 10, 1235);
+    println("bsp: same seed same map " + yes(pg_grid_hash(&d.grid) == pg_grid_hash(&d2.grid)) + ", other seed differs " + yes(pg_grid_hash(&d.grid) != pg_grid_hash(&d3.grid)));
+
+    // ── drunkard
+    val dw: PgGrid = pg_drunkard(40, 30, 40, 3);
+    println("drunkard: floor >= 40% " + yes(pg_count_walkable(&dw) >= 38 * 28 * 40 / 100) + ", connected " + yes(pg_grid_connected(&dw)) + ", border wall " + yes(pg_border_is_wall(&dw)));
+
+    // ── cave
+    val cv: PgGrid = pg_cave(60, 40, 45, 5, 11);
+    val share: i64 = pg_count_walkable(&cv) * 100 / (58 * 38);
+    println("cave: one region " + yes(pg_region_count(&cv) == 1) + ", border wall " + yes(pg_border_is_wall(&cv)) + ", floor share 30..70%: " + yes(share >= 30 && share <= 70));
+    val cv2: PgGrid = pg_cave(60, 40, 45, 5, 11);
+    println("cave: same seed same map " + yes(pg_grid_hash(&cv) == pg_grid_hash(&cv2)));
+
+    // ── L-systems
+    var algae: LSystem = ls_new("A");
+    ls_rule(&mut algae, "A", "AB");
+    ls_rule(&mut algae, "B", "A");
+    var lens: str = "algae lengths:";
+    i = 0;
+    while i < 8 {
+        lens = lens + " " + int_to_str(str_len(ls_expand(&algae, i)));
+        i = i + 1;
+    }
+    println(lens);
+    var koch: LSystem = ls_new("F");
+    ls_rule(&mut koch, "F", "F+F--F+F");
+    val k1: LsTurtle = ls_turtle(ls_expand(&koch, 1), 1.0, 60.0);
+    println("koch n=1: " + int_to_str(k1.segments.len() / 4) + " segments, end (" + f4(k1.x) + ", " + f4(k1.y) + "), height " + f4(k1.max_y));
+    val k3: LsTurtle = ls_turtle(ls_expand(&koch, 3), 1.0, 60.0);
+    println("koch n=3: " + int_to_str(k3.segments.len() / 4) + " segments, end (" + f4(k3.x) + ", " + f4(k3.y) + ")");
+    var plant: LSystem = ls_new("X");
+    ls_rule(&mut plant, "X", "F+[[X]-X]-F[-FX]+X");
+    ls_rule(&mut plant, "F", "FF");
+    val ps: str = ls_expand(&plant, 3);
+    val pt: LsTurtle = ls_turtle(ps, 1.0, 25.0);
+    var opens: i64 = 0;
+    var closes: i64 = 0;
+    i = 0;
+    while i < str_len(ps) {
+        if str_byte_at(ps, i) == 91 { opens = opens + 1; }
+        if str_byte_at(ps, i) == 93 { closes = closes + 1; }
+        i = i + 1;
+    }
+    println("plant: " + int_to_str(pt.segments.len() / 4) + " segments, bracket depth " + int_to_str(pt.max_depth) + ", balanced " + yes(opens == closes));
+    println("unbalanced: depth " + int_to_str(ls_turtle("F]F", 1.0, 90.0).max_depth));
+
+    // ── Poisson disk
+    val pts: Vec<f64> = pg_poisson_disk(30.0, 30.0, 3.0, 30, 7);
+    val n: i64 = pts.len() / 2;
+    var mind: f64 = 1000.0;
+    var inb: bool = true;
+    i = 0;
+    while i < n {
+        val x: f64 = pts.get(2 * i);
+        val y: f64 = pts.get(2 * i + 1);
+        if x < 0.0 || y < 0.0 || x >= 30.0 || y >= 30.0 { inb = false; }
+        var j: i64 = i + 1;
+        while j < n {
+            val dx: f64 = pts.get(2 * j) - x;
+            val dy: f64 = pts.get(2 * j + 1) - y;
+            val dd: f64 = math_sqrt(dx * dx + dy * dy);
+            if dd < mind { mind = dd; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    val pts2: Vec<f64> = pg_poisson_disk(30.0, 30.0, 3.0, 30, 7);
+    var det: bool = pts2.len() == pts.len();
+    i = 0;
+    while det && i < pts.len() {
+        if pts.get(i) != pts2.get(i) { det = false; }
+        i = i + 1;
+    }
+    println("poisson: many points " + yes(n >= 60) + ", min distance >= 3: " + yes(mind >= 3.0) + ", inside: " + yes(inb) + ", deterministic: " + yes(det));
+}

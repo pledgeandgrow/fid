@@ -1,0 +1,406 @@
+// VF9: the rules of docs/verification/semantics-2.md, one line per rule
+// (the rule's name, then what the rule says the program prints). Each line's
+// value comes from the rule, not from a run: a line that differs is either a
+// compiler bug or a rule that is wrong, and the doc's section 21 says which.
+// Lines I1 to O2 (Nov 17) are the rules of sections 11 to 20; the rules the
+// compiler breaks are not here but in tests/verify/bugs/ (m20, m21, m22,
+// d20 to d23), named in docs/verification/miscompile-log.md. E5 held on
+// Nov 16 and broke on emit since (m23, iropt dse): it stays as a
+// regression test.
+//
+// Expected output:
+// F1 false
+// F2 true true
+// F3 true false false false
+// F4 2 -2 0
+// F5 9007199254740992
+// F6 7 3
+// F7 true
+// S1 5 2
+// S2 true false
+// S3 bc 98
+// S4 -1 0 1
+// S5 x xy
+// S6 3-ab
+// E1 12 2
+// E2 big
+// E3 true false false
+// E4 7 -1 5
+// E5 1 2
+// G1 5 hi 2
+// G2 9
+// C1 2 11
+// C2 15
+// C3 6
+// R1 42 7
+// R2 2 1
+// M1 1 1 99 2
+// M2 1 2
+// M3 6 5
+// T1 49 64
+// I1 9000000000000000000 1285714285714285714 -2
+// U1 12 3 2
+// A1 10 7 15
+// D1 3 6 -1
+// D2 3 16
+// X1 crba 5
+// RG1 k7
+// L1 25
+// H1 a5c
+// H2 a6d
+// K1 1 2 3
+// K2 208 -1
+// K3 60 3
+// Y1 10 20
+// O1 102030 123
+// O2 t 1
+
+use channel;
+use task;
+
+enum Sh {
+    One(i64),
+    Two(i64, i32),
+    Zero,
+}
+
+struct Bag { v: Vec<i64>, n: i64 }
+
+fn sh_val(s: Sh) -> i64 {
+    match s {
+        Sh::One(a) => { return a; }
+        Sh::Two(a, b) => { return a + (b as i64); }
+        Sh::Zero => { return 0; }
+    }
+    return -100;
+}
+
+fn first_pos(v: Vec<i64>) -> Option<i64> {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) > 0 { return Option::Some(v.get(i)); }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn plus_one(v: Vec<i64>) -> Option<i64> {
+    val x = first_pos(v)?;
+    return Option::Some(x + 1);
+}
+
+fn id<T>(x: T) -> T { return x; }
+
+fn pick<T>(c: bool, a: T, b: T) -> T {
+    if c { return a; }
+    return b;
+}
+
+fn make_adder(n: i64) -> fn(i64) -> i64 {
+    return fn(x: i64) => x + n;
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { return f(x); }
+
+fn twice(x: i64) -> i64 { return x * 2; }
+
+fn set_through(r: &mut i64, v: i64) { *r = v; }
+
+fn swap(a: &mut i64, b: &mut i64) {
+    val t = *a;
+    *a = *b;
+    *b = t;
+}
+
+fn sq(x: i64) -> i64 { return x * x; }
+
+fn bs(b: bool) -> str { if b { return "true"; } return "false"; }
+
+// D: a trait method of the value's type; a default calls back into it
+cap Show {
+    fn show(self) -> i64;
+    fn twice_show(self) -> i64 { return self.show() * 2; }
+}
+
+struct Pt { x: i64 }
+struct Sq { s: i64 }
+
+impl Show for Pt {
+    pub fn show(self: Pt) -> i64 { return self.x; }
+}
+
+impl Show for Sq {
+    pub fn show(self: Sq) -> i64 { return self.s * self.s; }
+    pub fn twice_show(self: Sq) -> i64 { return 0 - 1; }
+}
+
+fn show_dyn(d: dyn Show) -> i64 { return d.show(); }
+
+// L: a linear value used exactly once
+@linear
+struct Coin { v: i64 }
+
+fn spend_coin(c: Coin) -> i64 { return c.v; }
+
+// U: a tuple returned and destructured
+fn qr(a: i64, b: i64) -> (i64, i64) { return (a / b, a % b); }
+
+// A: an array is read and written by index, and passed whole
+fn sum3a(a: [i64; 3]) -> i64 { return a[0] + a[1] + a[2]; }
+
+// X: the return value is evaluated, then the defers run, last first
+fn noisy(s: str, v: i64) -> i64 { print(s); return v; }
+
+fn x_order() -> i64 {
+    defer { print("a"); }
+    defer { print("b"); }
+    print("c");
+    return noisy("r", 5);
+}
+
+// K: a producer thread sends in order
+fn producer(ch: i64, n: i64) -> i64 {
+    var i: i64 = 1;
+    while i <= n {
+        channel_send(ch, i * 10);
+        i = i + 1;
+    }
+    return n;
+}
+
+// Y: a green task that waits once
+async fn y_val(id: i64) -> Future<i64> {
+    task_yield();
+    return id * 10;
+}
+
+// O2: what a thread prints before it returns
+fn printer(s: str) -> i64 { print(s); return 1; }
+
+fn main() -> i64 {
+    // F: f64 is IEEE binary64, round to nearest even
+    print("F1 " + bs(0.1 + 0.2 == 0.3) + "\n");
+    val z: f64 = 0.0;
+    val inf = 1.0 / z;
+    print("F2 " + bs(inf > 1.0e308) + " " + bs(-1.0 / z < -1.0e308) + "\n");
+    val nan = z / z;
+    print("F3 " + bs(nan != nan) + " " + bs(nan == nan) + " " + bs(nan < 1.0) + " " + bs(nan > 1.0) + "\n");
+    val a1: f64 = 2.7;
+    val a2: f64 = -2.7;
+    val a3: f64 = -0.5;
+    print("F4 " + int_to_str(a1 as i64) + " " + int_to_str(a2 as i64) + " " + int_to_str(a3 as i64) + "\n");
+    val big: i64 = 9007199254740993;
+    val bf = big as f64;
+    print("F5 " + int_to_str(bf as i64) + "\n");
+    val k: i64 = 3;
+    val m1 = (k as f64 + 0.5) * 2.0;
+    val m2 = 7.0 / 2.0;
+    print("F6 " + int_to_str(m1 as i64) + " " + int_to_str(m2 as i64) + "\n");
+    val nz: f64 = -0.0;
+    print("F7 " + bs(nz == z) + "\n");
+
+    // S: a str is a byte sequence with a length
+    print("S1 " + int_to_str(str_len("ab\0cd")) + " " + int_to_str(str_len("\u{e9}")) + "\n");
+    val sa = "ab" + "c";
+    print("S2 " + bs(sa == "abc") + " " + bs(sa == "abd") + "\n");
+    print("S3 " + str_slice("abcd", 1, 3) + " " + int_to_str(str_byte_at("abc", 1)) + "\n");
+    print("S4 " + int_to_str(str_compare("ab", "b")) + " " + int_to_str(str_compare("ab", "ab")) + " " + int_to_str(str_compare("b", "ab")) + "\n");
+    val s0 = "x";
+    var s1 = s0;
+    s1 = s1 + "y";
+    print("S5 " + s0 + " " + s1 + "\n");
+    val two = "ab";
+    print(f"S6 {1 + 2}-{two}" + "\n");
+
+    // E: an enum value is a tag and a payload
+    val e1 = Sh::Two(10, 2);
+    print("E1 " + int_to_str(sh_val(e1)) + " " + int_to_str(sh_val(Sh::One(2))) + "\n");
+    val n5: i64 = 50;
+    val word = match n5 {
+        0 => "zero",
+        1..=9 => "small",
+        _ => "big",
+    };
+    print("E2 " + word + "\n");
+    print("E3 " + bs(Sh::Two(1, 2) == Sh::Two(1, 2)) + " " + bs(Sh::Two(1, 2) == Sh::Two(1, 3)) + " " + bs(Sh::One(1) == Sh::Zero) + "\n");
+    var pv: Vec<i64> = Vec::new();
+    pv.push(-3);
+    pv.push(6);
+    val got = plus_one(pv);
+    var nv: Vec<i64> = Vec::new();
+    nv.push(-1);
+    val none = plus_one(nv);
+    print("E4 " + int_to_str(got.unwrap_or(-1)) + " " + int_to_str(none.unwrap_or(-1)) + " " + int_to_str(none ?? 5) + "\n");
+    var ea = Sh::One(1);
+    val eb = ea;
+    ea = Sh::One(2);
+    print("E5 " + int_to_str(sh_val(eb)) + " " + int_to_str(sh_val(ea)) + "\n");
+
+    // G: a generic function means its instance
+    print("G1 " + int_to_str(id(5)) + " " + id("hi") + " " + int_to_str(pick(false, 1, 2)) + "\n");
+    print("G2 " + int_to_str(id::<i64>(9)) + "\n");
+
+    // C: a closure copies what it names when it is made
+    var n: i64 = 1;
+    val f = fn(x: i64) => x + n;
+    n = 10;
+    print("C1 " + int_to_str(f(1)) + " " + int_to_str(f(1) + n - 1) + "\n");
+    val add5 = make_adder(5);
+    print("C2 " + int_to_str(add5(10)) + "\n");
+    print("C3 " + int_to_str(apply(twice, 3)) + "\n");
+
+    // R: a reference names a place
+    var x: i64 = 0;
+    set_through(&mut x, 42);
+    var y: i64 = 7;
+    val ry = &y;
+    print("R1 " + int_to_str(x) + " " + int_to_str(*ry) + "\n");
+    var p: i64 = 1;
+    var q: i64 = 2;
+    swap(&mut p, &mut q);
+    print("R2 " + int_to_str(p) + " " + int_to_str(q) + "\n");
+
+    // M: Vec, str, HashMap and structs behave as values (copy on write)
+    var va: Vec<i64> = Vec::new();
+    va.push(1);
+    var vb = va;
+    vb.set(0, 99);
+    vb.push(2);
+    print("M1 " + int_to_str(va.len()) + " " + int_to_str(va.get(0)) + " " + int_to_str(vb.get(0)) + " " + int_to_str(vb.len()) + "\n");
+    var d: Vec<i64> = Vec::new();
+    d.push(1);
+    val bag = Bag { v: d, n: 1 };
+    var bag2 = bag;
+    bag2.v.push(2);
+    print("M2 " + int_to_str(bag.v.len()) + " " + int_to_str(bag2.v.len()) + "\n");
+    val bx = Box::new(6);
+    var hm: HashMap<str, i64> = HashMap::new();
+    hm.insert("k", 5);
+    var hm2 = hm;
+    hm2.insert("k", 8);
+    print("M3 " + int_to_str(*bx) + " " + int_to_str(hm.get("k")) + "\n");
+
+    // T: spawn evaluates the arguments, then the call; await gives its value
+    val t1 = spawn sq(7);
+    val t2 = spawn sq(8);
+    print("T1 " + int_to_str(await t1) + " " + int_to_str(await t2) + "\n");
+
+    // I: i128 computes as the integer core while the values fit in i64
+    val ia: i128 = 3000000000;
+    val ib: i128 = ia * ia;
+    print("I1 " + int_to_str(ib as i64) + " " + int_to_str((ib / 7) as i64) + " " + int_to_str((0 - ib % 7) as i64) + "\n");
+
+    // U: tuples are built left to right and destructured by position
+    val (u1, u2) = (3, 4);
+    val (qq, rr) = qr(17, 5);
+    print("U1 " + int_to_str(u1 * u2) + " " + int_to_str(qq) + " " + int_to_str(rr) + "\n");
+
+    // A: an array literal is built left to right; a[i] reads, a[i] = e writes
+    val arr = [4, 5, 6];
+    var arw = [1, 2, 3];
+    arw[1] = 7;
+    print("A1 " + int_to_str(arr[0] + arr[2]) + " " + int_to_str(arw[1]) + " " + int_to_str(sum3a(arr)) + "\n");
+
+    // D: static calls, defaults, and dyn dispatch on the type made from
+    val pt0 = Pt { x: 3 };
+    val sq0 = Sq { s: 4 };
+    print("D1 " + int_to_str(pt0.show()) + " " + int_to_str(pt0.twice_show()) + " " + int_to_str(sq0.twice_show()) + "\n");
+    val dp = pt0 as dyn Show;
+    val ds = sq0 as dyn Show;
+    print("D2 " + int_to_str(show_dyn(dp)) + " " + int_to_str(show_dyn(ds)) + "\n");
+
+    // X: defer at function exit, after the return value, last first
+    print("X1 ");
+    val xr = x_order();
+    print(" " + int_to_str(xr) + "\n");
+
+    // RG: what a region makes and an outer value keeps is still there
+    var keep: Vec<str> = Vec::new();
+    region rr1 {
+        val kt = "k" + int_to_str(7);
+        keep.push(kt);
+    }
+    print("RG1 " + keep.get(0) + "\n");
+
+    // L: a linear struct is a struct value, passed once
+    val coin = Coin { v: 25 };
+    print("L1 " + int_to_str(spend_coin(coin)) + "\n");
+
+    // H: a handler runs at `do`; resume runs the rest, no resume drops it
+    print("H1 ");
+    handle {
+        print("a");
+        do Ask.get(5);
+        print("c");
+    } with {
+        Ask.get(hv) => {
+            print(int_to_str(hv));
+            resume(cont, 0);
+        }
+    }
+    print("\n");
+    print("H2 ");
+    handle {
+        print("a");
+        do Ask.get(6);
+        print("c");
+    } with {
+        Ask.get(hv) => {
+            print(int_to_str(hv));
+        }
+    }
+    print("d\n");
+
+    // K: channels are FIFO; select takes the first ready case, else default
+    val ch = channel_create(4);
+    channel_send(ch, 1);
+    channel_send(ch, 2);
+    channel_send(ch, 3);
+    val k1 = channel_recv(ch);
+    val k2 = channel_recv(ch);
+    val k3 = channel_recv(ch);
+    print("K1 " + int_to_str(k1) + " " + int_to_str(k2) + " " + int_to_str(k3) + "\n");
+    val ca = channel_create(1);
+    val cb = channel_create(1);
+    channel_send(cb, 8);
+    var kgot: i64 = 0;
+    select {
+        case ca => kv => { kgot = 100 + kv; }
+        case cb => kv => { kgot = 200 + kv; }
+        default => { kgot = 0 - 1; }
+    }
+    var kgot2: i64 = 0;
+    select {
+        case ca => kv => { kgot2 = 100 + kv; }
+        default => { kgot2 = 0 - 1; }
+    }
+    print("K2 " + int_to_str(kgot) + " " + int_to_str(kgot2) + "\n");
+    val pch = channel_create(8);
+    val kpt = spawn producer(pch, 3);
+    val kr1 = channel_recv(pch);
+    val kr2 = channel_recv(pch);
+    val kr3 = channel_recv(pch);
+    print("K3 " + int_to_str(kr1 + kr2 + kr3) + " " + int_to_str(await kpt) + "\n");
+
+    // Y: an async fn's future gives the task's result
+    val y1 = y_val(1);
+    val y2 = y_val(2);
+    print("Y1 " + int_to_str(await y1) + " " + int_to_str(await y2) + "\n");
+
+    // O1: integer keys come in ascending order, values in the same order
+    var hmi: HashMap<i64, i64> = HashMap::new();
+    hmi.insert(30, 3);
+    hmi.insert(10, 1);
+    hmi.insert(20, 2);
+    val hk: Vec<i64> = hmi.keys();
+    val hvs: Vec<i64> = hmi.values();
+    print("O1 " + int_to_str(hk.get(0)) + int_to_str(hk.get(1)) + int_to_str(hk.get(2)) + " " + int_to_str(hvs.get(0)) + int_to_str(hvs.get(1)) + int_to_str(hvs.get(2)) + "\n");
+
+    // O2: a thread's output before it returns comes before what follows
+    // the await of its future
+    print("O2 ");
+    val ot = spawn printer("t");
+    val oz = await ot;
+    print(" " + int_to_str(oz) + "\n");
+    return 0;
+}

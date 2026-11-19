@@ -1,0 +1,210 @@
+// Regions freed in one step (proposal 0005). Built with FID_REGION_ARENA=1
+// each region gets an arena; without it a region is a scope. The output is
+// the same either way, and the leak gate (scripts/leak-check.sh, and
+// scripts/region-check.sh with the arenas on) checks every block is freed.
+// Each case keeps something made inside a region outside it, or changes
+// something outside from inside: the value must survive the region's end.
+
+struct Rec {
+    name: str,
+    tags: Vec<str>,
+}
+
+enum Tree {
+    Leaf(str),
+    Node(Box<Tree>, Box<Tree>),
+}
+
+var LAST: str = "";
+
+fn note(s: str) {
+    LAST = s;
+}
+
+fn key_of(line: str) -> str {
+    val fields = str_split(line, ",");
+    return fields.get(0) + ":" + fields.get(1);
+}
+
+fn tree(d: i64) -> Tree {
+    if d == 0 {
+        return Tree::Leaf("leaf" + int_to_str(d));
+    }
+    return Tree::Node(Box::new(tree(d - 1)), Box::new(tree(d - 1)));
+}
+
+fn leaves(t: Tree) -> i64 {
+    match t {
+        Tree::Leaf(_) => { return 1; }
+        Tree::Node(l, r) => { return leaves(*l) + leaves(*r); }
+    }
+    return 0;
+}
+
+// A value made in a region, returned from inside it
+fn made_inside(n: i64) -> str {
+    region r {
+        val parts = str_split("a,b," + int_to_str(n), ",");
+        val res: str = parts.get(2) + "!";
+        return res;
+    }
+    return "";
+}
+
+// An error made inside a region kept outside it (`?` out of a region is
+// tests/bootstrap/regions/test_region_arena_try.fd)
+fn sum_lens(xs: Vec<str>) -> Result<i64, str> {
+    var total: i64 = 0;
+    var err: str = "";
+    region r {
+        for x in xs {
+            val t: str = x + "d";
+            if t == "bad" {
+                err = "not a number: " + t;
+            } else {
+                total = total + str_len(t);
+            }
+        }
+    }
+    if str_len(err) > 0 {
+        return Result::Err(err);
+    }
+    return Result::Ok(total);
+}
+
+fn main() {
+    // 1. A region in a loop: its temporaries go at each end; the keys are
+    // kept outside (copied out)
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < 50 {
+        region r {
+            val line = "k" + int_to_str(i) + ",v" + int_to_str(i * 2) + ",rest";
+            val fields = str_split(line, ",");
+            val key = fields.get(0) + ":" + fields.get(1);
+            if i % 10 == 0 {
+                names.push(key);
+            }
+        }
+        i = i + 1;
+    }
+    println(names.len());
+    println(names.get(0) + " " + names.get(4));
+
+    // 2. An outside Vec grown inside a region stays valid after it
+    var nums: Vec<i64> = Vec::new();
+    region r {
+        var j: i64 = 0;
+        while j < 1000 {
+            nums.push(j);
+            j = j + 1;
+        }
+    }
+    println(nums.len());
+    println(nums.get(999));
+
+    // 3. A value returned from inside a region
+    println(made_inside(7));
+
+    // 4. A struct built in a region, assigned to an outside variable
+    var keep: Rec = Rec { name: "none", tags: Vec::new() };
+    region r {
+        var tags: Vec<str> = Vec::new();
+        tags.push("t" + "1");
+        tags.push(key_of("x,y"));
+        val made = Rec { name: "rec" + int_to_str(5), tags: tags };
+        keep = made;
+    }
+    println(keep.name + " " + keep.tags.get(1) + " " + int_to_str(keep.tags.len()));
+
+    // 5. Nested regions: the inner one's value kept by the outer one's
+    // variable, then outside both
+    var outer_s: str = "";
+    region a {
+        var mid: str = "";
+        region b {
+            val t = "in" + "ner";
+            mid = t;
+        }
+        outer_s = mid + "/" + int_to_str(2);
+    }
+    println(outer_s);
+
+    // 6. A map built in a region, kept outside
+    var m: HashMap<str, str> = HashMap::new();
+    region r {
+        var local: HashMap<str, str> = HashMap::new();
+        local.insert("k" + "1", "v" + "1");
+        local.insert("k2", key_of("p,q"));
+        m = local;
+    }
+    println(m.get("k1") + " " + m.get("k2"));
+
+    // 7. A tree of Boxes built in a region, kept outside
+    var t: Tree = Tree::Leaf("start");
+    region r {
+        val tt: Tree = tree(4);
+        t = tt;
+    }
+    println(leaves(t));
+
+    // 8. A global changed from inside a region
+    region r {
+        note("logged " + int_to_str(3));
+    }
+    println(LAST);
+    LAST = "";
+
+    // 9. A break out of a region inside a loop, its value kept outside
+    var found: str = "";
+    var k: i64 = 0;
+    while k < 10 {
+        region r {
+            val cand = "c" + int_to_str(k);
+            if k == 4 {
+                found = cand;
+                break;
+            }
+        }
+        k = k + 1;
+    }
+    println(found);
+
+    // 10. `?` out of a region
+    var ok_in: Vec<str> = Vec::new();
+    ok_in.push("ab");
+    ok_in.push("cde");
+    val r_ok: Result<i64, str> = sum_lens(ok_in);
+    match r_ok {
+        Result::Ok(n) => { println(n); }
+        Result::Err(e) => { println(e); }
+    }
+    var bad_in: Vec<str> = Vec::new();
+    bad_in.push("xy");
+    bad_in.push("ba");
+    val r_bad: Result<i64, str> = sum_lens(bad_in);
+    match r_bad {
+        Result::Ok(n) => { println(n); }
+        Result::Err(e) => { println(e); }
+    }
+
+    // 11. An element taken from an outside Vec inside a region, and one put
+    // back
+    var stack: Vec<str> = Vec::new();
+    stack.push("s" + "1");
+    stack.push("s" + "2");
+    region r {
+        val top = stack.pop();
+        stack.push(top + "+" + "x");
+    }
+    println(stack.get(1));
+
+    // 12. A region that only reads outside values
+    var total: i64 = 0;
+    region r {
+        for n in names {
+            total = total + str_len(n);
+        }
+    }
+    println(total);
+}

@@ -1,0 +1,331 @@
+// stdlib/postgres (competitive SL12), the parts added after the first
+// driver: NULL parameters, SSLRequest and TLS through the transport seam
+// (PgIo), and PgConn as a db.fd `Database` (module postgres_db). No server
+// and no TLS library: a fake socket and a fake TLS session (functions of
+// this file) stand in for them, and every byte the driver writes is
+// compared with the same messages built in Python (struct, from
+// https://www.postgresql.org/docs/current/protocol-message-formats.html).
+//   - Bind with a NULL parameter (length -1, its text ignored);
+//   - SSLRequest (00000008 04d2162f) and what each answer means under
+//     each sslmode;
+//   - a whole connection with sslmode require: SSLRequest in clear, exactly
+//     one byte of answer read before the handshake (the byte after it is
+//     left unread, CVE-2021-23214), the handshake given the socket and the
+//     host, the startup and every later message inside the session;
+//   - Database.query / query_one / exec over that connection, a NULL bound
+//     through pg_query_params_nulls, Terminate and the session's end;
+//   - a server that answers 'N' under require, and one under prefer.
+// A wrong answer panics on every backend.
+//
+// Expected output:
+// null bind ok
+// sslrequest ok
+// tls startup ok
+// database ok
+// close ok
+// refused ok
+// prefer ok
+// postgres io ok
+use postgres;
+use postgres_db;
+use db;
+use encoding;
+
+const FAKE_FD: i64 = 900;
+const FAKE_SESSION: i64 = 4242;
+
+// What the fake server sends in clear, and what the client wrote in clear
+var plain_in: i64 = 0;
+var plain_in_len: i64 = 0;
+var plain_in_pos: i64 = 0;
+var plain_out: i64 = 0;
+var plain_out_len: i64 = 0;
+// What the fake server sends inside the session, cut into the reads it
+// arrives in (ends: byte offsets, 8 bytes each), and what the client wrote
+var tls_in: i64 = 0;
+var tls_in_len: i64 = 0;
+var tls_in_pos: i64 = 0;
+var tls_ends: i64 = 0;
+var tls_nends: i64 = 0;
+var tls_seg: i64 = 0;
+var tls_out: i64 = 0;
+var tls_out_len: i64 = 0;
+var tls_started: i64 = 0;
+var tls_closed: i64 = 0;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(label + ": got  " + got);
+        println(label + ": want " + want);
+        p_panic("postgres io: wrong " + label);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    if got != want {
+        p_panic("postgres io: wrong " + label + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("postgres io: wrong " + label);
+    }
+}
+
+// The bytes [0, n) at `mem`.
+fn bytes_at(mem: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(p_volatile_load8(mem + i) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Write the bytes of `hex` at mem + at; the offset after them.
+fn put_hex(mem: i64, at: i64, hex: str) -> i64 {
+    val b: Vec<i64> = hb(hex);
+    var i: i64 = 0;
+    while i < b.len() {
+        p_volatile_store8(mem + at + i, b.get(i));
+        i = i + 1;
+    }
+    return at + b.len();
+}
+
+// The server's next read inside the session ends after `hex`.
+fn tls_segment(hex: str) {
+    tls_in_len = put_hex(tls_in, tls_in_len, hex);
+    p_volatile_store(tls_ends + tls_nends * 8, tls_in_len);
+    tls_nends = tls_nends + 1;
+}
+
+fn fake_reset(plain_hex: str) {
+    plain_in_len = put_hex(plain_in, 0, plain_hex);
+    plain_in_pos = 0;
+    plain_out_len = 0;
+    tls_in_len = 0;
+    tls_in_pos = 0;
+    tls_nends = 0;
+    tls_seg = 0;
+    tls_out_len = 0;
+    tls_started = 0;
+    tls_closed = 0;
+}
+
+fn fake_plain_send(conn: i64, addr: i64, n: i64) -> i64 {
+    if conn != FAKE_FD {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        p_volatile_store8(plain_out + plain_out_len + i, p_volatile_load8(addr + i));
+        i = i + 1;
+    }
+    plain_out_len = plain_out_len + n;
+    return n;
+}
+
+fn fake_plain_recv(conn: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
+    if conn != FAKE_FD {
+        return - 1;
+    }
+    var k: i64 = 0;
+    while k < n && plain_in_pos < plain_in_len {
+        p_volatile_store8(addr + k, p_volatile_load8(plain_in + plain_in_pos));
+        plain_in_pos = plain_in_pos + 1;
+        k = k + 1;
+    }
+    return k;
+}
+
+fn fake_plain_close(conn: i64) -> i64 {
+    return 0;
+}
+
+fn fake_start(fd: i64, host: str) -> i64 {
+    if fd == FAKE_FD && str_equal(host, "db.example") {
+        tls_started = tls_started + 1;
+        return FAKE_SESSION;
+    }
+    return 0;
+}
+
+fn fake_tls_send(conn: i64, addr: i64, n: i64) -> i64 {
+    if conn != FAKE_SESSION {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        p_volatile_store8(tls_out + tls_out_len + i, p_volatile_load8(addr + i));
+        i = i + 1;
+    }
+    tls_out_len = tls_out_len + n;
+    return n;
+}
+
+fn fake_tls_recv(conn: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
+    if conn != FAKE_SESSION {
+        return - 1;
+    }
+    if tls_seg >= tls_nends {
+        return 0;
+    }
+    val end: i64 = p_volatile_load(tls_ends + tls_seg * 8);
+    var k: i64 = 0;
+    while k < n && tls_in_pos < end {
+        p_volatile_store8(addr + k, p_volatile_load8(tls_in + tls_in_pos));
+        tls_in_pos = tls_in_pos + 1;
+        k = k + 1;
+    }
+    if tls_in_pos >= end {
+        tls_seg = tls_seg + 1;
+    }
+    return k;
+}
+
+fn fake_tls_close(conn: i64) -> i64 {
+    if conn == FAKE_SESSION {
+        tls_closed = tls_closed + 1;
+    }
+    return 0;
+}
+
+fn fake_plain() -> PgIo {
+    return PgIo {
+        send: fake_plain_send, recv: fake_plain_recv, close: fake_plain_close, start: fake_start,
+    };
+}
+
+fn fake_tls() -> PgIo {
+    return PgIo {
+        send: fake_tls_send, recv: fake_tls_recv, close: fake_tls_close, start: fake_start,
+    };
+}
+
+// The startup answer: AuthenticationOk, ParameterStatus server_version
+// 18.4, BackendKeyData (77, 0x1234), ReadyForQuery idle.
+fn startup_answer() -> str {
+    return "52000000080000000053000000187365727665725f76657273696f6e0031382e34004b0000000c0000004d000012345a0000000549";
+}
+
+// RowDescription (n int4, s text), DataRow (42, NULL), SELECT 1, ready.
+fn select_answer() -> str {
+    return "540000002e00026e0000000000000000000017ffffffffffff0000730000000000000000000019ffffffffffff000044000000100002000000023432ffffffff430000000d53454c4543542031005a0000000549";
+}
+
+fn main() -> i64 {
+    // SAFETY: the fake buffers live as long as the program; every message
+    // of this test is far below 4096 bytes and there are 5 segments.
+    unsafe {
+        plain_in = p_malloc(4096);
+        plain_out = p_malloc(4096);
+        tls_in = p_malloc(4096);
+        tls_out = p_malloc(4096);
+        tls_ends = p_malloc(256);
+    }
+
+    // ── NULL parameters ──
+    var params: Vec<str> = Vec::new();
+    params.push("7");
+    params.push("ignored");
+    params.push("x");
+    var nulls: Vec<bool> = Vec::new();
+    nulls.push(false);
+    nulls.push(true);
+    nulls.push(false);
+    check("null bind", he(pg_extended_query_nulls("INSERT INTO t VALUES ($1, $2, $3)", params, nulls)), "500000002900494e5345525420494e544f20742056414c554553202824312c2024322c20243329000000420000001a0000000000030000000137ffffffff0000000178000044000000065000450000000900000000005300000004");
+    // No flags: the same bytes as pg_extended_query; fewer flags than
+    // parameters: the rest are not NULL
+    var one: Vec<bool> = Vec::new();
+    one.push(false);
+    check("no nulls", he(pg_extended_query_nulls("SELECT $1", params, one)), he(pg_extended_query("SELECT $1", params)));
+    println("null bind ok");
+
+    // ── SSLRequest ──
+    check("sslrequest", he(pg_ssl_request_message()), "0000000804d2162f");
+    check_i("S require", pg_ssl_answer(83, PG_SSL_REQUIRE), 1);
+    check_i("S prefer", pg_ssl_answer(83, PG_SSL_PREFER), 1);
+    check_i("N require", pg_ssl_answer(78, PG_SSL_REQUIRE), - 1);
+    check_i("N prefer", pg_ssl_answer(78, PG_SSL_PREFER), 0);
+    check_i("E", pg_ssl_answer(69, PG_SSL_PREFER), - 1);
+    check_i("nothing", pg_ssl_answer(- 1, PG_SSL_PREFER), - 1);
+    println("sslrequest ok");
+
+    // ── A connection with sslmode require ──
+    // 'S' then a byte a man in the middle slipped in: it must stay unread
+    fake_reset("5358");
+    tls_segment(startup_answer());
+    tls_segment(select_answer());
+    tls_segment(select_answer());
+    tls_segment("310000000432000000046e00000004430000000f494e5345525420302031005a0000000549");
+    tls_segment("430000000d5550444154452033005a0000000549");
+    var c: PgConn = pg_connect_io(FAKE_FD, "db.example", "app", "pw", "appdb", PG_SSL_REQUIRE, fake_plain(), fake_tls());
+    if !c.ok {
+        println(c.error);
+    }
+    check_b("connected", c.ok, true);
+    check_b("encrypted", c.tls, true);
+    check_i("handshakes", tls_started, 1);
+    check_i("session", c.conn, FAKE_SESSION);
+    check("in clear", he(bytes_at(plain_out, plain_out_len)), "0000000804d2162f");
+    check_i("answer bytes read", plain_in_pos, 1);
+    check("server_version", pg_parameter(& c, "server_version"), "18.4");
+    check_i("pid", c.pid, 77);
+    println("tls startup ok");
+
+    // ── Database over the session ──
+    check("query", c.query("SELECT 42 AS n, NULL::text AS s"), "[\x7b\"n\":42,\"s\":null\x7d]");
+    check("query_one", query_one(c, "SELECT 42 AS n, NULL::text AS s"), "\x7b\"n\":42,\"s\":null\x7d");
+    var p2: Vec<str> = Vec::new();
+    p2.push("");
+    p2.push("5");
+    var n2: Vec<bool> = Vec::new();
+    n2.push(true);
+    n2.push(false);
+    val upd: PgResult = pg_query_params_nulls(& c, "UPDATE t SET a = $1 WHERE b = $2", p2, n2);
+    check_b("params ok", upd.ok, true);
+    check_i("params affected", upd.affected, 1);
+    check_i("exec", c.exec("UPDATE t SET a = 1"), 3);
+    println("database ok");
+
+    // ── Close: Terminate inside the session, then the session ends ──
+    pg_close(& mut c);
+    check_b("closed", c.ok, false);
+    check_i("session ended", tls_closed, 1);
+    check_b("no longer encrypted", c.tls, false);
+    check("inside the session", he(bytes_at(tls_out, tls_out_len)), "0000003600030000757365720061707000646174616261736500617070646200636c69656e745f656e636f64696e6700555446380000510000002453454c454354203432204153206e2c204e554c4c3a3a74657874204153207300510000002453454c454354203432204153206e2c204e554c4c3a3a746578742041532073005000000028005550444154452074205345542061203d2024312057484552452062203d2024320000004200000015000000000002ffffffff000000013500004400000006500045000000090000000000530000000451000000175550444154452074205345542061203d2031005800000004");
+    check("nothing else in clear", he(bytes_at(plain_out, plain_out_len)), "0000000804d2162f");
+    println("close ok");
+
+    // ── 'N' under require: no connection, nothing sent after SSLRequest ──
+    fake_reset("4e");
+    val r: PgConn = pg_connect_io(FAKE_FD, "db.example", "app", "pw", "appdb", PG_SSL_REQUIRE, fake_plain(), fake_tls());
+    check_b("refused", r.ok, false);
+    check("refused error", r.error, "the server does not support TLS (sslmode require)");
+    check_i("no handshake", tls_started, 0);
+    check("only the request", he(bytes_at(plain_out, plain_out_len)), "0000000804d2162f");
+    // A failed handshake is an error too
+    fake_reset("53");
+    val h: PgConn = pg_connect_io(FAKE_FD, "other.example", "app", "pw", "appdb", PG_SSL_REQUIRE, fake_plain(), fake_tls());
+    check_b("handshake refused", h.ok, false);
+    check("handshake error", h.error, "TLS handshake with other.example failed (certificate or name not accepted)");
+    println("refused ok");
+
+    // ── 'N' under prefer: the startup goes on in clear ──
+    fake_reset("4e" + startup_answer());
+    var p: PgConn = pg_connect_io(FAKE_FD, "db.example", "app", "pw", "appdb", PG_SSL_PREFER, fake_plain(), fake_tls());
+    check_b("prefer connected", p.ok, true);
+    check_b("prefer in clear", p.tls, false);
+    check_i("prefer no handshake", tls_started, 0);
+    check("prefer bytes", he(bytes_at(plain_out, plain_out_len)), "0000000804d2162f0000003600030000757365720061707000646174616261736500617070646200636c69656e745f656e636f64696e6700555446380000");
+    println("prefer ok");
+    println("postgres io ok");
+    return 0;
+}

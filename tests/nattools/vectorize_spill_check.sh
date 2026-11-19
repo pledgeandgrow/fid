@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Checks of llvm-roadmap TG11's vector spill slots and vector liveness on the
+# machine layer (compiler/nat_ir.fd: ng_vz_pins, ng_vz_vslot, ng_vz_vget /
+# ng_vz_vput, ng_vz_frame_end; ng_vec_live_check, nat_vlive_unit_check),
+# run after the compiler is built:
+#   bash tests/nattools/vectorize_spill_check.sh [fid]   (default release/fid.exe)
+# - tests/bootstrap/test_vectorize_spill.fd through `fid run` and ccompile
+#   prints its expected lines.
+# - built with FID_VERIFY=1 (the MIR verifier with the vector liveness check,
+#   and nat_sel_check with nat_vlive_unit_check) and --stats for x86-64
+#   Linux (SSE2), x86-64 Linux --cpu x86-64-v3 (AVX2), AArch64 Linux (NEON),
+#   RISC-V Linux --cpu rv64gcv (RVV) and --nat Windows: every TAKEN loop has
+#   a `[vectorize] <fn>: ... vectorized ... spilled to N vector slots` line
+#   with N > 0; `deep` (18 values at once) has a `not vectorized` line
+#   naming the 16 homes; the TAKEN functions' MIR has vld, vst and vbin and,
+#   for wide/red6, a slotaddr (the slots' addresses).
+# - every image that can run here prints the expected lines (WSL for
+#   x86-64, qemu-user for AArch64 and RISC-V at VLEN 128 and 256, --nat
+#   natively on Windows); so do FID_NAT_OFF=vzspill (the TAKEN loops then
+#   stay scalar: no `vectorized` line for them) and FID_NAT_OFF=vectorize.
+# Lines marked "skip" (no runner here) are not failures. Exit 1 on a failure.
+set -u
+FID="${1:-release/fid.exe}"
+OUT="${TMPDIR:-/tmp}/fid-vectorize-spill-check"
+mkdir -p "$OUT"
+T=tests/bootstrap/test_vectorize_spill.fd
+TAKEN="wide splats red6 redk many"
+SLOTADDR="wide red6"
+RUN=""
+if command -v wsl.exe >/dev/null 2>&1; then RUN="wsl.exe -e"; fi
+WIN=0
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WIN=1 ;; esac
+fails=0
+ok() { echo "ok   $1"; }
+bad() { echo "FAIL $1"; fails=$((fails + 1)); }
+
+expected() { sed -n '/^\/\/ Expected output:/,/^[^/]/p' "$1" | sed -n 's|^// \(.*\)|\1|p' | sed '1d'; }
+WANT=$(expected "$T")
+strip() { grep -v '^\[[a-z0-9]*\] '; }
+
+# 0. the vector liveness check on small MIR sequences
+u=$("$FID" run tests/nattools/vlive_unit.fd 2>&1 | grep -v '^\[' | tr -d '\r')
+if [ "$u" = "vlive ok" ]; then ok "vlive_unit"; else bad "vlive_unit: $u"; fi
+
+# 1. the interpreter and the C path
+got=$("$FID" run "$T" 2>&1 | strip)
+if [ "$got" = "$WANT" ]; then ok "fid run"; else bad "fid run output"; diff <(echo "$WANT") <(echo "$got") | head -10; fi
+cexe="$OUT/c-spill"
+[ "$WIN" = 1 ] && cexe="$cexe.exe"
+if "$FID" ccompile "$T" -o "$cexe" >"$OUT/c.log" 2>&1; then
+    if [ "$("$cexe" 2>&1)" = "$WANT" ]; then ok "ccompile"; else bad "ccompile output"; fi
+else
+    bad "ccompile build"; tail -5 "$OUT/c.log"
+fi
+
+# name target cpu
+LANES="sse x86_64-linux - avx2 x86_64-linux x86-64-v3 neon aarch64-linux - rvv riscv64-linux rv64gcv nat nat -"
+
+build() {
+    # build <image> <target> <cpu> [env...]: FID_VERIFY=1 and --stats (the
+    # [vectorize] lines to <image>.log), then the MIR to <image>.mir
+    local img="$1" tgt="$2" cpu="$3"
+    shift 3
+    local args=()
+    if [ "$tgt" = nat ]; then args=(--nat); else args=(--target "$tgt"); fi
+    [ "$cpu" != - ] && args+=(--cpu "$cpu")
+    env FID_VERIFY=1 "$@" "$FID" emit "$T" "${args[@]}" --stats -o "$img" >"$img.log" 2>&1 || return 1
+    env FID_NAT_DUMP='*' "$@" "$FID" emit "$T" "${args[@]}" -o "$img.dump" >"$img.mir" 2>&1 || return 1
+    return 0
+}
+
+taken() { grep -q "^\[vectorize\] $2: bb[0-9]* vectorized" "$1"; }
+spilled() { grep -E -q "^\[vectorize\] $2: bb[0-9]* vectorized.*spilled to [1-9][0-9]* vector slots" "$1"; }
+fn_has_op() {
+    awk -v f="$2" -v op="$3" '
+        /^\[mir\] / {
+            if ($2 ~ /^[0-9]+:$/) { if (cur == f && $3 == op) found = 1 }
+            else { cur = $2; sub(":$", "", cur) }
+        }
+        END { exit found ? 0 : 1 }' "$1"
+}
+
+run_img() {
+    local img="$1" tgt="$2" extra="${3:-}"
+    case "$tgt" in
+        nat) "$img" 2>&1 ;;
+        x86_64-linux)
+            if [ -n "$RUN" ]; then $RUN "$img" 2>&1; else "$img" 2>&1; fi ;;
+        aarch64-linux) $RUN qemu-aarch64 "$img" 2>&1 ;;
+        riscv64-linux)
+            if [ -n "$extra" ]; then $RUN qemu-riscv64 -cpu "rv64,v=true,vlen=$extra" "$img" 2>&1
+            else $RUN qemu-riscv64 "$img" 2>&1; fi ;;
+    esac
+}
+
+can_run() {
+    local tgt="$1" cpu="$2"
+    case "$tgt" in
+        nat) [ "$WIN" = 1 ] ;;
+        x86_64-linux)
+            if [ -z "$RUN" ] && { [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; }; then return 1; fi
+            if [ "$cpu" = x86-64-v3 ]; then $RUN grep -q avx2 /proc/cpuinfo; else return 0; fi ;;
+        aarch64-linux) $RUN sh -c 'command -v qemu-aarch64' >/dev/null 2>&1 ;;
+        riscv64-linux) $RUN sh -c 'command -v qemu-riscv64' >/dev/null 2>&1 ;;
+    esac
+}
+
+check_run() {
+    # check_run <label> <image> <target> <cpu>
+    local label="$1" img="$2" tgt="$3" cpu="$4"
+    if can_run "$tgt" "$cpu"; then
+        if [ "$(run_img "$img" "$tgt" "$([ "$tgt" = riscv64-linux ] && echo 128)" | strip)" = "$WANT" ]; then ok "$label runs"; else bad "$label output differs"; run_img "$img" "$tgt" 128 | strip | diff <(echo "$WANT") - | head -10; fi
+        if [ "$tgt" = riscv64-linux ]; then
+            if [ "$(run_img "$img" "$tgt" 256 | strip)" = "$WANT" ]; then ok "$label runs at VLEN 256"; else bad "$label output differs at VLEN 256"; fi
+        fi
+    else
+        echo "skip $label run (no runner here)"
+    fi
+}
+
+set -- $LANES
+while [ $# -ge 3 ]; do
+    name="$1" tgt="$2" cpu="$3"
+    shift 3
+    img="$OUT/$name"
+    [ "$tgt" = nat ] && img="$img.exe"
+    if build "$img" "$tgt" "$cpu"; then ok "$name builds (FID_VERIFY=1)"; else bad "$name build"; tail -5 "$img.log"; continue; fi
+    grep "^\[vectorize\]" "$img.log" > "$OUT/$name.vz"
+    miss=""
+    for f in $TAKEN; do spilled "$img.log" "$f" || miss="$miss $f"; done
+    if [ -z "$miss" ]; then ok "$name: every TAKEN loop vectorized through spill slots"; else bad "$name: not vectorized with spill slots:$miss"; grep -E "\] ($(echo $miss | tr ' ' '|')):" "$img.log" | head -10; fi
+    if taken "$img.log" deep; then bad "$name: deep vectorized (it needs 18 homes)"; else
+        if grep -q "^\[vectorize\] deep: .*not vectorized.*16" "$img.log"; then ok "$name: deep stays scalar (more than 16 homes)"; else bad "$name: no 'not vectorized ... 16' line for deep"; fi
+    fi
+    nomir=""
+    for f in $TAKEN; do
+        fn_has_op "$img.mir" "$f" vld && fn_has_op "$img.mir" "$f" vst && fn_has_op "$img.mir" "$f" vbin || nomir="$nomir $f"
+    done
+    for f in $SLOTADDR; do fn_has_op "$img.mir" "$f" slotaddr || nomir="$nomir $f(slotaddr)"; done
+    if [ -z "$nomir" ]; then ok "$name: vld/vst/vbin (and slot addresses) in every TAKEN function"; else bad "$name: missing vector operations in:$nomir"; fi
+    if [ "$name" = avx2 ]; then
+        grep -q "^\[vectorize\] wide: .* 32-byte vectors" "$img.log" && ok "avx2: wide spills 32-byte vectors" || bad "avx2: wide not at 32 bytes"
+        grep -q "^\[vectorize\] red6: .* 16-byte vectors" "$img.log" && ok "avx2: red6 at 16 bytes (a reduction)" || bad "avx2: red6 not at 16 bytes"
+    fi
+    check_run "$name" "$img" "$tgt" "$cpu"
+    for sw in vzspill vectorize; do
+        off="$OUT/$name-$sw"
+        [ "$tgt" = nat ] && off="$off.exe"
+        if build "$off" "$tgt" "$cpu" FID_NAT_OFF=$sw; then
+            left=""
+            for f in $TAKEN; do taken "$off.log" "$f" && left="$left $f"; done
+            if [ -z "$left" ]; then ok "$name FID_NAT_OFF=$sw: the TAKEN loops stay scalar"; else bad "$name FID_NAT_OFF=$sw still vectorizes:$left"; fi
+            check_run "$name FID_NAT_OFF=$sw" "$off" "$tgt" "$cpu"
+        else
+            bad "$name FID_NAT_OFF=$sw build"; tail -5 "$off.log"
+        fi
+    done
+done
+
+echo
+echo "the [vectorize] lines of the x86-64 build: $OUT/sse.vz"
+if [ "$fails" = 0 ]; then echo "vectorize_spill_check: all passed"; else echo "vectorize_spill_check: $fails failed"; exit 1; fi

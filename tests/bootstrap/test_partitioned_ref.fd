@@ -1,0 +1,45 @@
+// Roadmap Phase 9 (aerospace, F47): the scheduler may hand each partition
+// its own state by reference (`nav_state` to navigation, `ctrl_state` to
+// flight control) and may give the same variable to two entries of one
+// partition; only memory reached from two partitions is rejected
+// (test_partitioned_ref_fail.fd, test_partitioned_ptr_fail.fd).
+// Expected output:
+//   nav 1200 1
+//   ctrl 120 2
+
+struct NavState {
+    alt: i64,
+    ticks: i64,
+}
+
+struct CtrlState {
+    cmd: i64,
+    ticks: i64,
+}
+
+@partitioned(navigation)
+fn nav_update(s: & mut NavState, alt: i64) {
+    s.alt = alt;
+    s.ticks = s.ticks + 1;
+}
+
+@partitioned(navigation)
+fn nav_altitude(s: & NavState) -> i64 {
+    return s.alt;
+}
+
+@partitioned(flight_control)
+fn ctrl_update(s: & mut CtrlState, alt: i64) {
+    s.cmd = alt / 10;
+    s.ticks = s.ticks + 2;
+}
+
+fn main() {
+    var nav_state: NavState = NavState { alt: 0, ticks: 0 };
+    var ctrl_state: CtrlState = CtrlState { cmd: 0, ticks: 0 };
+    nav_update(& mut nav_state, 1200);
+    val alt: i64 = nav_altitude(& nav_state);
+    ctrl_update(& mut ctrl_state, alt);
+    println("nav " + int_to_str(alt) + " " + int_to_str(nav_state.ticks));
+    println("ctrl " + int_to_str(ctrl_state.cmd) + " " + int_to_str(ctrl_state.ticks));
+}

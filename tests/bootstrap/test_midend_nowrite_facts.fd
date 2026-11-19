@@ -1,0 +1,146 @@
+// OP25 (LF5/LF6; compiler/iropt_me.fd ime_writes with iropt.fd's
+// g_ime_nowrite_calls, FID_IROPT_OFF=nowritecall; and readcse, compiler/
+// rules.fd, FID_NAT_OFF=readcse): a call to a function that, with
+// everything it calls, writes nothing keeps what is known about memory.
+// - fwd_global: `g_n` is loaded, `read_n()` only reads, the second load of
+//   `g_n` is the first's value (store forwarding across the call).
+// - fwd_global_write: `bump_n()` writes `g_n`: the second load reads again.
+// - hoist_read: `*x` in a loop whose only call (`peekv`) reads: the load
+//   moves out of the loop.
+// - hoist_write: the loop's call writes `*x`: the load stays in the loop.
+// - field_read: the same for a field behind a `&` parameter.
+// - read_twice: two calls of a read-only function with nothing between
+//   them merge (readcse).
+// - read_bump_read: a write between the two calls: they stay apart.
+// - loop_read_bump: a call before a loop and the same call in the loop,
+//   whose next pass follows a write: they stay apart.
+// The program prints the same with the passes on and off
+// (tests/tooling/op25-check.sh).
+//
+// Expected output:
+// 15
+// 56
+// 30
+// 6
+// 4
+// 32
+// 12
+// 67
+// 724
+// 10
+
+struct Acc { total: i64, count: i64 }
+
+var g_n: i64 = 5;
+
+fn read_n() -> i64 {
+    return g_n;
+}
+
+fn bump_n() {
+    g_n = g_n + 1;
+}
+
+fn peekv(x: &i64) -> i64 {
+    return *x;
+}
+
+fn bumpv(x: &mut i64) {
+    *x = *x + 1;
+}
+
+fn total_of(a: &Acc) -> i64 {
+    return a.total + a.count;
+}
+
+fn fwd_global() -> i64 {
+    var a: i64 = g_n;
+    var r: i64 = read_n();
+    var b: i64 = g_n;
+    return a + r + b;
+}
+
+fn fwd_global_write() -> i64 {
+    var a: i64 = g_n;
+    bump_n();
+    var b: i64 = g_n;
+    return a * 10 + b;
+}
+
+fn hoist_read(x: &i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        s = s + *x + peekv(x);
+        k = k + 1;
+    }
+    return s;
+}
+
+fn hoist_write(x: &mut i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        s = s + *x;
+        bumpv(x);
+        k = k + 1;
+    }
+    return s;
+}
+
+fn field_read(a: &Acc, n: i64) -> i64 {
+    var s: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        s = s + a.total + total_of(a);
+        k = k + 1;
+    }
+    return s;
+}
+
+fn read_twice() -> i64 {
+    return read_n() + read_n();
+}
+
+fn read_bump_read() -> i64 {
+    var a: i64 = read_n();
+    bump_n();
+    var b: i64 = read_n();
+    return a * 10 + b;
+}
+
+fn loop_read_bump() -> i64 {
+    var s: i64 = 0;
+    var k: i64 = 0;
+    var first: i64 = read_n();
+    while k < 3 {
+        s = s + read_n();
+        bump_n();
+        k = k + 1;
+    }
+    return first * 100 + s;
+}
+
+fn main() {
+    // 5 + 5 + 5
+    println(fwd_global());
+    // 5, then 6: g_n is 6 from here
+    println(fwd_global_write());
+    var v: i64 = 5;
+    // (5 + 5) * 3
+    println(hoist_read(&v, 3));
+    var w: i64 = 1;
+    // 1 + 2 + 3, and w ends at 4
+    println(hoist_write(&mut w, 3));
+    println(w);
+    var acc: Acc = Acc { total: 7, count: 2 };
+    // (7 + 9) * 2
+    println(field_read(&acc, 2));
+    // 6 + 6
+    println(read_twice());
+    // 6, then 7
+    println(read_bump_read());
+    // first 7; then 7 + 8 + 9; g_n ends at 10
+    println(loop_read_bump());
+    println(g_n);
+}

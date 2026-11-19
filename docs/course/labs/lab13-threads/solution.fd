@@ -1,0 +1,54 @@
+// Lab 13 solution: threads that share nothing, and one that shares a counter.
+//! lab: 13
+//! check: runs
+//! playground: no
+use sync;
+
+var served: i64 = 0;
+var served_lock: i64 = 0;
+
+// The only state two threads share is `served`, and every write to it
+// holds the one mutex. Arguments are copied into each thread (Vec and str
+// by value), so the rest needs no lock.
+fn handle(id: i64) -> i64 {
+    sync_mutex_lock(served_lock);
+    served = served + 1;
+    sync_mutex_unlock(served_lock);
+    return id * 10;
+}
+
+fn count_long(words: Vec<str>, min: i64) -> i64 {
+    var n: i64 = 0;
+    for w in words {
+        if str_len(w) >= min { n = n + 1; }
+    }
+    return n;
+}
+
+fn split_half(words: &Vec<str>, first: bool) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val mid: i64 = words.len() / 2;
+    for i in 0..words.len() {
+        if (i < mid) == first { out.push(words.get(i)); }
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    served_lock = sync_mutex_create();
+    val r1 = spawn handle(1);
+    val r2 = spawn handle(2);
+    println("responses " + int_to_str((await r1) + (await r2)));
+    println("served " + int_to_str(served));
+    val words: Vec<str> = str_split("ownership borrows regions effects capabilities sandbox layouts ffi", " ");
+    val left: Vec<str> = split_half(&words, true);
+    val right: Vec<str> = split_half(&words, false);
+    var a: i64 = 0;
+    var b: i64 = 0;
+    parallel {
+        | a = count_long(left, 7);
+        | b = count_long(right, 7);
+    }
+    println("long words: " + int_to_str(a + b) + " of " + int_to_str(words.len()));
+    return 0;
+}

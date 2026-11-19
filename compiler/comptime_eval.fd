@@ -6,9 +6,7 @@
 // Comptime functions (`comptime fn name(...) { ... }`) are evaluated by
 // directly interpreting their AST bodies when called from a comptime context.
 
-module compiler::comptime_eval;
- use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser;
-// --- Box helpers ---------------------------------------------------------
+module compiler::comptime_eval; use core; use vec; use string; use compiler::ast; use compiler::token; use compiler::lexer; use compiler::parser;  // --- Box helpers ---------------------------------------------------------
 // Each module defines its own box_expr_unbox because Fides has no trait-based
 // generic unbox. This mirrors the pattern in lower.fd, typechecker.fd, etc.
 
@@ -152,25 +150,44 @@ pub fn ComptimeEnv_new() -> ComptimeEnv {
     };
 }
 
+// Names are looked up from the last one declared: an inner block's `val x`
+// hides an outer `x` (ComptimeEnv_declare) and an assignment reaches the
+// innermost `x`.
 pub fn ComptimeEnv_get(env: & ComptimeEnv, name: str) -> OptExpr {
-    var i: i64 = 0;
-    while i < env.names.len() {
+    var i: i64 = env.names.len() - 1;
+    while i >= 0 {
         if env.names.get(i) == name {
             return OptExpr::Some(env.values.get(i));
         }
-        i = i + 1;
+        i = i - 1;
     }
     return OptExpr::None;
 }
 
 pub fn ComptimeEnv_set(env: & mut ComptimeEnv, name: str, v: Expr) {
-    var i: i64 = 0;
-    while i < env.names.len() {
+    var i: i64 = env.names.len() - 1;
+    while i >= 0 {
         if env.names.get(i) == name {
             env.values.set(i, v);
             return;
         }
-        i = i + 1;
+        i = i - 1;
+    }
+    env.names.push(name);
+    env.values.push(v);
+}
+
+/// `val name = v` in a block whose own names start at index `from`: a new
+/// variable, even when an enclosing block has one of the same name (it was
+/// overwritten, and the block's end wrote the inner value back to it).
+pub fn ComptimeEnv_declare(env: & mut ComptimeEnv, name: str, v: Expr, from: i64) {
+    var i: i64 = env.names.len() - 1;
+    while i >= from {
+        if env.names.get(i) == name {
+            env.values.set(i, v);
+            return;
+        }
+        i = i - 1;
     }
     env.names.push(name);
     env.values.push(v);
@@ -278,8 +295,7 @@ pub fn ct_materialize(v: Expr) -> Expr {
 
 // Explicit `comptime` that could not be evaluated: reported once each (it
 // then runs when the program does; it used to be silent).
-var g_ct_warn_on: bool = false; var g_ct_warned: i64 = 0;
- fn ct_warn(msg: str) {
+var g_ct_warn_on: bool = false; var g_ct_warned: i64 = 0; fn ct_warn(msg: str) {
     if !g_ct_warn_on {
         return;
     }
@@ -311,8 +327,7 @@ pub enum ResultExpr {
 
 // The errors of the last process_gen (they were dropped before: a failed
 // parse of generated code or an evaluation error was silent)
-var g_ct_gen_errors: Vec<str> = Vec::new();
- pub fn comptime_gen_errors() -> Vec<str> {
+var g_ct_gen_errors: Vec<str> = Vec::new(); pub fn comptime_gen_errors() -> Vec<str> {
     return g_ct_gen_errors;
 }
 
@@ -322,6 +337,12 @@ pub fn process_gen(program: Program) -> Program {
 
     // First, substitute comptime expressions inside comptime gen blocks
     var errs: Vec<str> = Vec::new();
+    // LG9: `comptime splice` expressions are expanded before anything else
+    // (the comptime fns a gen block calls have theirs in place), and before
+    // type checking, which sees only the generated expressions
+    if parser_saw_splice() {
+        prog = ct_expand_splices(prog, & mut errs);
+    }
     var fi: i64 = 0;
     while fi < prog.funcs.len() {
         substitute_comptime_gen_blocks(& mut prog.funcs, fi, & prog, & mut errs);
@@ -331,11 +352,33 @@ pub fn process_gen(program: Program) -> Program {
     // Now process the gen blocks
     var generated_funcs: Vec<Func> = Vec::new();
     var generated_structs: Vec<StructDef> = Vec::new();
+    // Generated enums, constants, impl blocks and trait impls (LG9)
+    var gen_rest: Program = program_new();
     var func_count: i64 = prog.funcs.len();
     var idx: i64 = 0;
     while idx < func_count {
-        process_comptime_gen_in_func(& mut prog.funcs, idx, & prog, & mut generated_funcs, & mut generated_structs, & mut errs);
+        process_comptime_gen_in_func(& mut prog.funcs, idx, & prog, & mut generated_funcs, & mut generated_structs, & mut gen_rest, & mut errs);
         idx = idx + 1;
+    }
+    var ei: i64 = 0;
+    while ei < gen_rest.enums.len() {
+        prog.enums.push(gen_rest.enums.get(ei));
+        ei = ei + 1;
+    }
+    var ci: i64 = 0;
+    while ci < gen_rest.consts.len() {
+        prog.consts.push(gen_rest.consts.get(ci));
+        ci = ci + 1;
+    }
+    var ii: i64 = 0;
+    while ii < gen_rest.impls.len() {
+        prog.impls.push(gen_rest.impls.get(ii));
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < gen_rest.trait_impls.len() {
+        prog.trait_impls.push(gen_rest.trait_impls.get(ti));
+        ti = ti + 1;
     }
 
     // Append generated funcs/structs
@@ -349,8 +392,237 @@ pub fn process_gen(program: Program) -> Program {
         prog.structs.push(generated_structs.get(si));
         si = si + 1;
     }
+    // CL6: `==` on the structs and enums gen created compares by content,
+    // as on declared ones (compiler.fd synthesizes those before this pass)
+    if generated_structs.len() > 0 || gen_rest.enums.len() > 0 {
+        ct_gen_synth_eq(& mut prog, generated_structs, gen_rest.enums);
+    }
     g_ct_gen_errors = errs;
     return prog;
+}
+
+// --- `==` for generated types (CL6) -------------------------------------------
+// compiler.fd synthesize_enum_eq / synthesize_struct_eq run before
+// process_gen, so a struct or enum `comptime gen` creates had no `__eq_<T>`
+// and `==` on it compared words (false for equal values). The same helpers
+// are made here for the generated types only, with the same shape:
+//
+//     fn __eq_S(__eq_a: S, __eq_b: S) -> bool { return __eq_a.f == __eq_b.f && ..; }
+//     fn __eq_E(__eq_a: E, __eq_b: E) -> bool {
+//         match __eq_a { E::V(__a0, ..) => { match __eq_b {
+//             E::V(__b0, ..) => { return __a0 == __b0 && ..; } _ => { return false; } } } .. }
+//         return false;
+//     }
+//
+// A type whose `__eq_` exists already (written by the program) is skipped,
+// and so are generic types and structs with a field of a generic struct or
+// enum (as there).
+
+/// The core function comparing two Vecs of type `t` by content, as
+/// lower.fd vec_eq_fn_for: "" for anything else (compared with `==`).
+fn ct_gen_vec_eq_fn(t: Type) -> str {
+    match t {
+        Type::Generic(gname, gargs) => {
+            if gname != "Vec" || gargs.len() != 1 {
+                return "";
+            }
+            match gargs.get(0) {
+                Type::Str => {
+                    return "Vec_eq_strs";
+                }
+                Type::I8 => {
+                    return "Vec_eq_words";
+                }
+                Type::I16 => {
+                    return "Vec_eq_words";
+                }
+                Type::I32 => {
+                    return "Vec_eq_words";
+                }
+                Type::I64 => {
+                    return "Vec_eq_words";
+                }
+                Type::U8 => {
+                    return "Vec_eq_words";
+                }
+                Type::U16 => {
+                    return "Vec_eq_words";
+                }
+                Type::U32 => {
+                    return "Vec_eq_words";
+                }
+                Type::U64 => {
+                    return "Vec_eq_words";
+                }
+                Type::F64 => {
+                    return "Vec_eq_words";
+                }
+                Type::Bool => {
+                    return "Vec_eq_words";
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// `E::V(<prefix>0, .., <prefix>n-1)` as a pattern.
+fn ct_gen_eq_pattern(enum_name: str, variant: str, prefix: str, n: i64) -> Pattern {
+    var binds: Vec<Binding> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        binds.push(Binding_new(prefix + int_to_str(i), ""));
+        i = i + 1;
+    }
+    return Pattern::EnumVariant(enum_name, variant, binds);
+}
+
+/// Whether `funcs` has a function `name`.
+fn ct_gen_has_func(funcs: Vec<Func>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < funcs.len() {
+        if funcs.get(i).name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `__eq_<T>` for each generated struct and enum (see above), added to
+/// `prog`.
+fn ct_gen_synth_eq(prog: & mut Program, gstructs: Vec<StructDef>, genums: Vec<EnumDef>) {
+    var generic_defs: Vec<str> = Vec::new();
+    var gd: i64 = 0;
+    while gd < prog.structs.len() {
+        if prog.structs.get(gd).type_params.len() > 0 {
+            generic_defs.push(prog.structs.get(gd).name);
+        }
+        gd = gd + 1;
+    }
+    gd = 0;
+    while gd < prog.enums.len() {
+        if prog.enums.get(gd).type_params.len() > 0 {
+            generic_defs.push(prog.enums.get(gd).name);
+        }
+        gd = gd + 1;
+    }
+    var made: Vec<Func> = Vec::new();
+    var si: i64 = 0;
+    while si < gstructs.len() {
+        var s: StructDef = gstructs.get(si);
+        si = si + 1;
+        if s.type_params.len() > 0 {
+            continue;
+        }
+        var sname: str = "__eq_" + s.name;
+        if ct_gen_has_func(prog.funcs, sname) {
+            continue;
+        }
+        var skip: bool = false;
+        var same: Expr = Expr::BoolLit(true);
+        var i: i64 = 0;
+        while i < s.fields.len() {
+            var f: Param = s.fields.get(i);
+            match f.ty {
+                Type::Generic(fgname, _) => {
+                    if str_vec_contains(generic_defs, fgname) {
+                        skip = true;
+                    }
+                }
+                _ => {
+                }
+            }
+            var fa: Expr = Expr::FieldAccess(Box::new(Expr::Ident("__eq_a")), f.name);
+            var fb: Expr = Expr::FieldAccess(Box::new(Expr::Ident("__eq_b")), f.name);
+            var cmp: Expr = Expr::Binary(BinOp::Eq, Box::new(fa), Box::new(fb));
+            var veq: str = ct_gen_vec_eq_fn(f.ty);
+            if veq != "" {
+                var vargs: Vec<Expr> = Vec::new();
+                vargs.push(Expr::FieldAccess(Box::new(Expr::Ident("__eq_a")), f.name));
+                vargs.push(Expr::FieldAccess(Box::new(Expr::Ident("__eq_b")), f.name));
+                cmp = Expr::Call(veq, vargs);
+            }
+            if i == 0 {
+                same = cmp;
+            } else {
+                same = Expr::Binary(BinOp::And, Box::new(same), Box::new(cmp));
+            }
+            i = i + 1;
+        }
+        if skip {
+            continue;
+        }
+        var sparams: Vec<Param> = Vec::new();
+        sparams.push(Param_new("__eq_a", Type::Named(s.name), false));
+        sparams.push(Param_new("__eq_b", Type::Named(s.name), false));
+        var sbody: Vec<Stmt> = Vec::new();
+        sbody.push(Stmt::Return(OptBoxExpr::Some(Box::new(same)), 0));
+        made.push(Func_new_full(sname, sparams, Type::Bool, sbody, true));
+    }
+    var ei: i64 = 0;
+    while ei < genums.len() {
+        var e: EnumDef = genums.get(ei);
+        ei = ei + 1;
+        if e.type_params.len() > 0 {
+            continue;
+        }
+        var ename: str = "__eq_" + e.name;
+        if ct_gen_has_func(prog.funcs, ename) {
+            continue;
+        }
+        var arms: Vec<MatchArm> = Vec::new();
+        var vi: i64 = 0;
+        while vi < e.variants.len() {
+            var v: EnumVariant = e.variants.get(vi);
+            vi = vi + 1;
+            var n: i64 = 0;
+            match v.data {
+                OptParams::Some(ps) => {
+                    n = ps.len();
+                }
+                OptParams::None => {
+                }
+            }
+            var vsame: Expr = Expr::BoolLit(true);
+            var k: i64 = 0;
+            while k < n {
+                var field_eq: Expr = Expr::Binary(BinOp::Eq, Box::new(Expr::Ident("__a" + int_to_str(k))), Box::new(Expr::Ident("__b" + int_to_str(k))));
+                if k == 0 {
+                    vsame = field_eq;
+                } else {
+                    vsame = Expr::Binary(BinOp::And, Box::new(vsame), Box::new(field_eq));
+                }
+                k = k + 1;
+            }
+            var same_body: Vec<Stmt> = Vec::new();
+            same_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(vsame)), 0));
+            var differ_body: Vec<Stmt> = Vec::new();
+            differ_body.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::BoolLit(false))), 0));
+            var inner_arms: Vec<MatchArm> = Vec::new();
+            inner_arms.push(MatchArm_new(ct_gen_eq_pattern(e.name, v.name, "__b", n), OptBoxExpr::None, same_body));
+            inner_arms.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, differ_body));
+            var outer_body: Vec<Stmt> = Vec::new();
+            outer_body.push(Stmt::Match(Expr::Ident("__eq_b"), inner_arms, 0));
+            arms.push(MatchArm_new(ct_gen_eq_pattern(e.name, v.name, "__a", n), OptBoxExpr::None, outer_body));
+        }
+        var eparams: Vec<Param> = Vec::new();
+        eparams.push(Param_new("__eq_a", Type::Named(e.name), false));
+        eparams.push(Param_new("__eq_b", Type::Named(e.name), false));
+        var ebody: Vec<Stmt> = Vec::new();
+        ebody.push(Stmt::Match(Expr::Ident("__eq_a"), arms, 0));
+        ebody.push(Stmt::Return(OptBoxExpr::Some(Box::new(Expr::BoolLit(false))), 0));
+        made.push(Func_new_full(ename, eparams, Type::Bool, ebody, true));
+    }
+    var mi: i64 = 0;
+    while mi < made.len() {
+        prog.funcs.push(made.get(mi));
+        mi = mi + 1;
+    }
 }
 
 fn substitute_comptime_gen_blocks(funcs: & mut Vec<Func>, idx: i64, original: & Program, errs: & mut Vec<str>) {
@@ -371,7 +643,7 @@ fn substitute_comptime_gen_blocks(funcs: & mut Vec<Func>, idx: i64, original: & 
     funcs.set(idx, func);
 }
 
-fn process_comptime_gen_in_func(funcs: & mut Vec<Func>, idx: i64, original: & Program, generated_funcs: & mut Vec<Func>, generated_structs: & mut Vec<StructDef>, errs: & mut Vec<str>) {
+fn process_comptime_gen_in_func(funcs: & mut Vec<Func>, idx: i64, original: & Program, generated_funcs: & mut Vec<Func>, generated_structs: & mut Vec<StructDef>, gen_rest: & mut Program, errs: & mut Vec<str>) {
     var func: Func = funcs.get(idx);
     var new_body: Vec<Stmt> = Vec::new();
     var si: i64 = 0;
@@ -402,13 +674,17 @@ fn process_comptime_gen_in_func(funcs: & mut Vec<Func>, idx: i64, original: & Pr
                                         var gsi: i64 = 0;
                                         while gsi < gen_prog.structs.len() {
                                             var gsname: str = gen_prog.structs.get(gsi).name;
-                                            if ct_gen_struct_taken(original, generated_structs, gsname) {
+                                            if ct_gen_struct_taken(original, generated_structs, gsname) || ct_gen_enum_in(gen_rest.enums, gsname) {
                                                 errs.push("comptime gen (line " + int_to_str(line) + "): generated struct '" + gsname + "' collides with a type already declared; give the generated one a unique name");
                                             } else {
                                                 generated_structs.push(gen_prog.structs.get(gsi));
                                             }
                                             gsi = gsi + 1;
                                         }
+                                        // Enums, constants, impl blocks and trait
+                                        // impls are added too (they were dropped
+                                        // without a word), under the same rule
+                                        ct_gen_merge_rest(gen_prog, original, generated_structs, gen_rest, line, errs);
                                     }
                                     OptProgram::None => {
                                         errs.push("comptime gen: failed to parse generated code");
@@ -482,6 +758,608 @@ fn ct_gen_struct_taken(original: & Program, generated: & Vec<StructDef>, name: s
     }
     return false;
 }
+
+fn ct_gen_enum_in(enums: Vec<EnumDef>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < enums.len() {
+        if enums.get(i).name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_gen_const_taken(original: & Program, rest: Vec<ConstDef>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < original.consts.len() {
+        if original.consts.get(i).name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < original.globals.len() {
+        if original.globals.get(i).name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < rest.len() {
+        if rest.get(i).name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether an `impl <sname>` block of `impls` already has a method `mname`.
+fn ct_gen_impl_has(impls: Vec<ImplDef>, sname: str, mname: str) -> bool {
+    var i: i64 = 0;
+    while i < impls.len() {
+        var im: ImplDef = impls.get(i);
+        if im.struct_name == sname {
+            var j: i64 = 0;
+            while j < im.methods.len() {
+                if im.methods.get(j).name == mname {
+                    return true;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ct_gen_trait_impl_in(tis: Vec<TraitImpl>, trait_name: str, type_name: str) -> bool {
+    var i: i64 = 0;
+    while i < tis.len() {
+        if tis.get(i).trait_name == trait_name && tis.get(i).type_name == type_name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// LG9: the declarations of generated code other than functions and
+/// structs. Enums, constants, impl blocks and trait impls are collected in
+/// `rest` (process_gen adds them to the program) unless a name is already
+/// taken; a kind `comptime gen` does not add (a trait, a global, a type
+/// alias, an extern block, a `use`) is an error rather than dropped.
+fn ct_gen_merge_rest(gp: Program, original: & Program, gstructs: & Vec<StructDef>, rest: & mut Program, line: i64, errs: & mut Vec<str>) {
+    var at: str = "comptime gen (line " + int_to_str(line) + "): ";
+    var i: i64 = 0;
+    while i < gp.enums.len() {
+        var ed: EnumDef = gp.enums.get(i);
+        if ct_gen_struct_taken(original, gstructs, ed.name) || ct_gen_enum_in(rest.enums, ed.name) {
+            errs.push(at + "generated enum '" + ed.name + "' collides with a type already declared; give the generated one a unique name");
+        } else {
+            rest.enums.push(ed);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < gp.consts.len() {
+        var cd: ConstDef = gp.consts.get(i);
+        if ct_gen_const_taken(original, rest.consts, cd.name) {
+            errs.push(at + "generated constant '" + cd.name + "' collides with a constant or global already declared; give the generated one a unique name");
+        } else {
+            rest.consts.push(cd);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < gp.impls.len() {
+        var im: ImplDef = gp.impls.get(i);
+        var kept: Vec<Func> = Vec::new();
+        var j: i64 = 0;
+        while j < im.methods.len() {
+            var mname: str = im.methods.get(j).name;
+            if ct_gen_impl_has(original.impls, im.struct_name, mname) || ct_gen_impl_has(rest.impls, im.struct_name, mname) {
+                errs.push(at + "generated method '" + im.struct_name + "." + mname + "' collides with a method already declared; give the generated one a unique name");
+            } else {
+                kept.push(im.methods.get(j));
+            }
+            j = j + 1;
+        }
+        if kept.len() > 0 {
+            im.methods = kept;
+            rest.impls.push(im);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < gp.trait_impls.len() {
+        var ti: TraitImpl = gp.trait_impls.get(i);
+        if ct_gen_trait_impl_in(original.trait_impls, ti.trait_name, ti.type_name) || ct_gen_trait_impl_in(rest.trait_impls, ti.trait_name, ti.type_name) {
+            errs.push(at + "generated `impl " + ti.trait_name + " for " + ti.type_name + "` collides with one already declared");
+        } else {
+            rest.trait_impls.push(ti);
+        }
+        i = i + 1;
+    }
+    if gp.traits.len() > 0 {
+        errs.push(at + "generated code declares the trait '" + gp.traits.get(0).name + "'; `comptime gen` adds functions, structs, enums, constants and impls only: declare it in the source");
+    }
+    if gp.globals.len() > 0 {
+        errs.push(at + "generated code declares the global '" + gp.globals.get(0).name + "'; `comptime gen` adds functions, structs, enums, constants and impls only: declare it in the source");
+    }
+    if gp.type_aliases.len() > 0 {
+        errs.push(at + "generated code declares a type alias; `comptime gen` adds functions, structs, enums, constants and impls only: declare it in the source");
+    }
+    if gp.extern_decls.len() > 0 || gp.imports.len() > 0 {
+        errs.push(at + "generated code has an extern block or a `use`; `comptime gen` adds functions, structs, enums, constants and impls only: write it in the source");
+    }
+}
+
+// --- gensym (LG9 hygiene) ----------------------------------------------------
+// `gensym("helper")` in a comptime context gives a name no declaration of
+// the program uses and no earlier gensym gave: `helper__gs1`, `helper__gs2`,
+// ... Generated code names its private helpers with it, so they can never
+// collide with (or capture) a name the program declares.
+
+var g_ct_gensym_n: i64 = 0; fn ct_gensym(prefix: str, original: & Program) -> str {
+    var empty_f: Vec<Func> = Vec::new();
+    var empty_s: Vec<StructDef> = Vec::new();
+    var empty_c: Vec<ConstDef> = Vec::new();
+    while true {
+        g_ct_gensym_n = g_ct_gensym_n + 1;
+        var name: str = prefix + "__gs" + int_to_str(g_ct_gensym_n);
+        if !ct_gen_func_taken(original, & empty_f, name) && !ct_gen_struct_taken(original, & empty_s, name) && !ct_gen_const_taken(original, empty_c, name) {
+            return name;
+        }
+    }
+    return prefix;
+}
+
+/// Whether the program declares a comptime function `name` (one of its own
+/// wins over a builtin of the evaluator).
+fn ct_has_comptime_fn(original: & Program, name: str) -> bool {
+    var i: i64 = 0;
+    while i < original.funcs.len() {
+        if original.funcs.get(i).name == name && original.funcs.get(i).is_comptime {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// CD8: builtins that reach outside the compiler. The evaluator never runs
+/// them; a comptime that calls one is reported as doing I/O (the
+/// typechecker rejects it in `comptime` expressions and `comptime fn`s).
+fn ct_io_builtin(name: str) -> bool {
+    if name == "print" || name == "println" || name == "eprint" || name == "eprintln" || name == "print_int" || name == "print_str" || name == "print_float" || name == "read_file" || name == "write_file" || name == "read_line" || name == "read_stdin" || name == "env_var" || name == "arg_at" || name == "http_get" || name == "http_post" || name == "spawn" || name == "exec" || name == "system" {
+        return true;
+    }
+    if str_starts_with(name, "p_print") || str_starts_with(name, "p_eprint") || str_starts_with(name, "p_file_") || str_starts_with(name, "p_dir_") || str_starts_with(name, "p_socket_") || str_starts_with(name, "p_net_") || str_starts_with(name, "p_http_") || str_starts_with(name, "p_dns_") || str_starts_with(name, "p_tls_") || str_starts_with(name, "p_process_") || str_starts_with(name, "p_clock_") || str_starts_with(name, "p_dl_") || str_starts_with(name, "p_co_") {
+        return true;
+    }
+    return name == "p_system" || name == "p_getenv" || name == "p_env_get" || name == "p_argv" || name == "p_argc" || name == "p_read_line" || name == "p_read_stdin" || name == "p_time_now" || name == "p_os_random_u64" || name == "p_thread_spawn" || name == "p_mkdir" || name == "p_rename" || name == "p_remove";
+}
+
+/// Whether an evaluation error is the I/O one ct_io_builtin leads to.
+fn ct_io_message(msg: str) -> bool {
+    var tail: str = "comptime code runs inside the compiler with no I/O";
+    var n: i64 = str_len(msg);
+    var m: i64 = str_len(tail);
+    var i: i64 = 0;
+    while i + m <= n {
+        if str_slice(msg, i, i + m) == tail {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `gensym(prefix)` with its argument already evaluated.
+fn ct_gensym_call(args: Vec<Expr>, original: & Program) -> ResultExpr {
+    if args.len() != 1 {
+        return ResultExpr::Err("gensym takes one string argument, the prefix of the name");
+    }
+    match args.get(0) {
+        Expr::StringLit(p) => {
+            return ResultExpr::Ok(Expr::StringLit(ct_gensym(p, original)));
+        }
+        _ => {
+        }
+    }
+    return ResultExpr::Err("gensym takes one string argument, the prefix of the name");
+}
+
+// --- Comptime parsers (OP28) -----------------------------------------------
+// A comptime fn that parses constant text calls core's string functions and
+// helper functions of its own. The pure string functions run here as the
+// compiler's own copy of core's (the same code the program links, so the
+// value is the one the program would compute), and a plain function whose
+// parameters and result are scalars, strings or Vecs of them is run by the
+// evaluator like a comptime fn. Anything else it reaches (I/O, a global,
+// a struct) is an evaluation error, and the comptime is left to run when the
+// program does, as before.
+
+/// Core's pure string functions the evaluator runs itself.
+fn ct_pure_builtin(name: str) -> bool {
+    if name == "str_len" || name == "str_byte_at" || name == "str_slice" || name == "str_is_empty" || name == "str_concat" || name == "str_equal" || name == "str_compare" || name == "int_to_str" || name == "char_to_str" || name == "byte_to_str" || name == "str_parse_int" || name == "str_parse_int_range" {
+        return true;
+    }
+    if name == "str_starts_with" || name == "str_ends_with" || name == "str_contains" || name == "str_find" || name == "str_rfind" || name == "str_trim" || name == "str_trim_start" || name == "str_trim_end" || name == "str_to_upper" || name == "str_to_lower" || name == "str_replace" || name == "str_repeat" || name == "str_clone" {
+        return true;
+    }
+    return name == "str_split" || name == "str_split_char" || name == "str_lines" || name == "str_bytes" || name == "str_from_bytes" || name == "char_is_digit" || name == "char_is_alpha";
+}
+
+fn ct_is_str(e: Expr) -> bool {
+    match e {
+        Expr::StringLit(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn ct_is_int(e: Expr) -> bool {
+    match e {
+        Expr::IntLit(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn ct_str(e: Expr) -> str {
+    match e {
+        Expr::StringLit(s) => {
+            return s;
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+fn ct_int(e: Expr) -> i64 {
+    match e {
+        Expr::IntLit(n) => {
+            return n;
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+/// Whether `a` are literals of the kinds `sig` spells: `s` a string, `i` an
+/// integer, `v` a comptime Vec of integers.
+fn ct_sig(a: Vec<Expr>, sig: str) -> bool {
+    var n: i64 = str_len(sig);
+    if a.len() != n {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val k: i64 = str_byte_at(sig, i);
+        val e: Expr = a.get(i);
+        if k == 115 && !ct_is_str(e) {
+            return false;
+        }
+        if k == 105 && !ct_is_int(e) {
+            return false;
+        }
+        if k == 118 {
+            var tmp: Vec<Expr> = Vec::new();
+            if !ct_vec_elems(e, & mut tmp) {
+                return false;
+            }
+            var j: i64 = 0;
+            while j < tmp.len() {
+                if !ct_is_int(tmp.get(j)) {
+                    return false;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ct_str_vec(items: Vec<str>) -> Expr {
+    var els: Vec<Expr> = Vec::new();
+    var i: i64 = 0;
+    while i < items.len() {
+        els.push(Expr::StringLit(items.get(i)));
+        i = i + 1;
+    }
+    return ct_vec_of(Type::Str, els);
+}
+
+/// Pure builtin `name` on evaluated arguments `a`.
+fn ct_pure_call(name: str, a: Vec<Expr>) -> ResultExpr {
+    val bad: ResultExpr = ResultExpr::Err("comptime: '" + name + "()' takes other arguments than these literals");
+    if name == "str_len" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::IntLit(str_len(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_is_empty" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::BoolLit(str_is_empty(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_byte_at" {
+        if ct_sig(a, "si") {
+            return ResultExpr::Ok(Expr::IntLit(str_byte_at(ct_str(a.get(0)), ct_int(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_slice" {
+        if ct_sig(a, "sii") {
+            return ResultExpr::Ok(Expr::StringLit(str_slice(ct_str(a.get(0)), ct_int(a.get(1)), ct_int(a.get(2)))));
+        }
+        return bad;
+    }
+    if name == "str_concat" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::StringLit(ct_str(a.get(0)) + ct_str(a.get(1))));
+        }
+        return bad;
+    }
+    if name == "str_equal" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::BoolLit(str_equal(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_compare" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::IntLit(str_compare(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "int_to_str" {
+        if ct_sig(a, "i") {
+            return ResultExpr::Ok(Expr::StringLit(int_to_str(ct_int(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "char_to_str" || name == "byte_to_str" {
+        if ct_sig(a, "i") {
+            return ResultExpr::Ok(Expr::StringLit(byte_to_str(ct_int(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "char_is_digit" {
+        if ct_sig(a, "i") {
+            return ResultExpr::Ok(Expr::BoolLit(char_is_digit(ct_int(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "char_is_alpha" {
+        if ct_sig(a, "i") {
+            return ResultExpr::Ok(Expr::BoolLit(char_is_alpha(ct_int(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_parse_int" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::IntLit(str_parse_int(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_parse_int_range" {
+        if ct_sig(a, "sii") {
+            return ResultExpr::Ok(Expr::IntLit(str_parse_int_range(ct_str(a.get(0)), ct_int(a.get(1)), ct_int(a.get(2)))));
+        }
+        return bad;
+    }
+    if name == "str_starts_with" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::BoolLit(str_starts_with(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_ends_with" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::BoolLit(str_ends_with(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_contains" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::BoolLit(str_contains(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_find" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::IntLit(str_find(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_rfind" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(Expr::IntLit(str_rfind(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_trim" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::StringLit(str_trim(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_trim_start" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::StringLit(str_trim_start(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_trim_end" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::StringLit(str_trim_end(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_to_upper" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::StringLit(str_to_upper(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_to_lower" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::StringLit(str_to_lower(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_clone" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(Expr::StringLit(ct_str(a.get(0))));
+        }
+        return bad;
+    }
+    if name == "str_replace" {
+        if ct_sig(a, "sss") {
+            return ResultExpr::Ok(Expr::StringLit(str_replace(ct_str(a.get(0)), ct_str(a.get(1)), ct_str(a.get(2)))));
+        }
+        return bad;
+    }
+    if name == "str_repeat" {
+        if ct_sig(a, "si") {
+            return ResultExpr::Ok(Expr::StringLit(str_repeat(ct_str(a.get(0)), ct_int(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_split" {
+        if ct_sig(a, "ss") {
+            return ResultExpr::Ok(ct_str_vec(str_split(ct_str(a.get(0)), ct_str(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_split_char" {
+        if ct_sig(a, "si") {
+            return ResultExpr::Ok(ct_str_vec(str_split_char(ct_str(a.get(0)), ct_int(a.get(1)))));
+        }
+        return bad;
+    }
+    if name == "str_lines" {
+        if ct_sig(a, "s") {
+            return ResultExpr::Ok(ct_str_vec(str_lines(ct_str(a.get(0)))));
+        }
+        return bad;
+    }
+    if name == "str_bytes" {
+        if ct_sig(a, "s") {
+            val bs: Vec<i64> = str_bytes(ct_str(a.get(0)));
+            var els: Vec<Expr> = Vec::new();
+            var bi: i64 = 0;
+            while bi < bs.len() {
+                els.push(Expr::IntLit(bs.get(bi)));
+                bi = bi + 1;
+            }
+            return ResultExpr::Ok(ct_vec_of(Type::I64, els));
+        }
+        return bad;
+    }
+    if name == "str_from_bytes" {
+        if ct_sig(a, "v") {
+            var bels: Vec<Expr> = Vec::new();
+            if !ct_vec_elems(a.get(0), & mut bels) {
+                return bad;
+            }
+            var bv: Vec<i64> = Vec::new();
+            var fi: i64 = 0;
+            while fi < bels.len() {
+                bv.push(ct_int(bels.get(fi)));
+                fi = fi + 1;
+            }
+            return ResultExpr::Ok(Expr::StringLit(str_from_bytes(bv)));
+        }
+        return bad;
+    }
+    return ResultExpr::Err("comptime: '" + name + "()' is not evaluated at compile time");
+}
+
+/// Whether values of type `t` are what the evaluator holds as literals.
+fn ct_plain_type(t: Type) -> bool {
+    match t {
+        Type::I64 => {
+            return true;
+        }
+        Type::Bool => {
+            return true;
+        }
+        Type::Str => {
+            return true;
+        }
+        Type::Void => {
+            return true;
+        }
+        Type::Generic(gn, gargs) => {
+            if gn == "Vec" && gargs.len() == 1 {
+                match gargs.get(0) {
+                    Type::I64 => {
+                        return true;
+                    }
+                    Type::Bool => {
+                        return true;
+                    }
+                    Type::Str => {
+                        return true;
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// Index in `original.funcs` of plain function `name` the evaluator may run
+/// at compile time (OP28): not generic, not async, with a body, scalar,
+/// string or Vec parameters and result. -1 when there is none.
+fn ct_plain_fn(original: & Program, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < original.funcs.len() {
+        val f: Func = original.funcs.get(i);
+        if f.name == name && !f.is_comptime {
+            if f.type_params.len() > 0 || f.const_params.len() > 0 || f.is_async || f.body.len() == 0 {
+                return - 1;
+            }
+            if !ct_plain_type(f.ret_ty) {
+                return - 1;
+            }
+            var pi: i64 = 0;
+            while pi < f.params.len() {
+                if !ct_plain_type(f.params.get(pi).ty) || f.params.get(pi).is_variadic {
+                    return - 1;
+                }
+                pi = pi + 1;
+            }
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// Nesting of comptime calls: a function that recurses without end is an
+// evaluation error, not a stack overflow of the compiler.
+var g_ct_call_depth: i64 = 0;
 
 fn parse_generated_code(source: str) -> OptProgram {
     var lex: Lexer = Lexer::new(source);
@@ -1112,7 +1990,12 @@ fn substitute_expr(expr: & mut Expr, original: & Program, errs: & mut Vec<str>) 
             substitute_expr(& mut e, original, errs);
             * expr = Expr::Unary(op, box_expr_new(e));
         }
-        Expr::Call(_, args) => {
+        Expr::Call(cname, args) => {
+            // LG9: `comptime splice { }` (parser.fd parse_comptime_expr)
+            if cname == "__comptime_splice" && args.len() == 2 {
+                * expr = ct_expand_splice(args, original, errs);
+                return;
+            }
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
@@ -1217,17 +2100,186 @@ fn substitute_expr(expr: & mut Expr, original: & Program, errs: & mut Vec<str>) 
             * expr = Expr::Cast(box_expr_new(e), ty);
         }
         Expr::Comptime(inner) => {
-            substitute_expr_comptime(expr, inner, original, errs);
+            // LG9: the splice-only walk of process_gen leaves the other
+            // comptime forms to substitute (after type checking)
+            if !g_ct_splice_only {
+                substitute_expr_comptime(expr, inner, original, errs);
+            }
         }
         Expr::ComptimeBlock(stmts) => {
-            substitute_expr_comptime_block(expr, & mut stmts, original, errs);
+            if !g_ct_splice_only {
+                substitute_expr_comptime_block(expr, & mut stmts, original, errs);
+            }
         }
         Expr::ComptimeReflect(op, ty) => {
-            substitute_expr_comptime_reflect(expr, op, ty, original, errs);
+            if !g_ct_splice_only {
+                substitute_expr_comptime_reflect(expr, op, ty, original, errs);
+            }
         }
         _ => {
         }
     }
+}
+
+// --- comptime splice (LG9) ---------------------------------------------------
+// `comptime splice { block }` is an expression written by compile-time code:
+// the block runs in the evaluator and returns source text, and that text,
+// parsed as one expression, takes the splice's place before type checking.
+// Names the generated expression introduces (a block's locals) come from
+// `gensym`, so they cannot capture or shadow the program's; a name the text
+// spells out (a variable of the caller) means that variable, as written.
+
+/// process_gen's walk: only splices are expanded (the other comptime forms
+/// are substitute's, after type checking).
+var g_ct_splice_only: bool = false;
+
+/// How many splices the one being expanded came out of.
+var g_ct_splice_depth: i64 = 0;
+
+/// The splice `__comptime_splice(ComptimeBlock(block), line)` (parser.fd
+/// parse_comptime_expr) replaced by the expression its block generates.
+/// What it gives is expanded too (generated text may hold a splice), to a
+/// depth of 16. A splice whose block cannot run at compile time, does not
+/// return a string, or returns text that is not one expression is an error:
+/// unlike `comptime <expr>`, it has nothing to run when the program does
+/// (the splice becomes 0, and process_gen's errors stop the build).
+/// The caller stores the result (`* expr = ct_expand_splice(..)`): the new
+/// expression is handed over whole, never stored through a reference while
+/// the old one's parts are still bound.
+fn ct_expand_splice(args: Vec<Expr>, original: & Program, errs: & mut Vec<str>) -> Expr {
+    var line: i64 = 0;
+    match args.get(1) {
+        Expr::IntLit(n) => {
+            line = n;
+        }
+        _ => {
+        }
+    }
+    var at: str = "comptime splice (line " + int_to_str(line) + "): ";
+    var block: Vec<Stmt> = Vec::new();
+    match args.get(0) {
+        Expr::ComptimeBlock(b) => {
+            block = b;
+        }
+        _ => {
+            errs.push(at + "a splice is `comptime splice { ... }`, a block that returns the expression's text");
+            return Expr::IntLit(0);
+        }
+    }
+    if g_ct_splice_depth >= 16 {
+        errs.push(at + "splices generate splices more than 16 deep");
+        return Expr::IntLit(0);
+    }
+    var src: str = "";
+    match evaluate_block(block, original) {
+        ResultExpr::Ok(v) => {
+            match v {
+                Expr::StringLit(s) => {
+                    src = s;
+                }
+                _ => {
+                    errs.push(at + "the block must return the source text of an expression, as a string");
+                    return Expr::IntLit(0);
+                }
+            }
+        }
+        ResultExpr::Err(msg) => {
+            errs.push(at + msg);
+            return Expr::IntLit(0);
+        }
+    }
+    var snames: Vec<str> = Vec::new();
+    var si: i64 = 0;
+    while si < original.structs.len() {
+        snames.push(original.structs.get(si).name);
+        si = si + 1;
+    }
+    var enames: Vec<str> = Vec::new();
+    var ei: i64 = 0;
+    while ei < original.enums.len() {
+        enames.push(original.enums.get(ei).name);
+        ei = ei + 1;
+    }
+    match parse_expression_source(src, line, snames, enames) {
+        ParseResultExpr::Ok(e) => {
+            var out: Expr = e;
+            if ct_scan_expr_sub(out) {
+                g_ct_splice_depth = g_ct_splice_depth + 1;
+                substitute_expr(& mut out, original, errs);
+                g_ct_splice_depth = g_ct_splice_depth - 1;
+            }
+            return out;
+        }
+        ParseResultExpr::Err(m) => {
+            errs.push(at + "the generated text `" + src + "` is not one expression: " + m);
+        }
+    }
+    return Expr::IntLit(0);
+}
+
+/// Expands the splices of `f`'s body (process_gen, splice-only walk).
+/// A body without comptime nodes (ct_scan_stmts_sub, which sees the splice's
+/// block) is left as it is.
+fn ct_splice_func(f: & mut Func, original: & Program, errs: & mut Vec<str>) {
+    if !ct_scan_stmts_sub(f.body) {
+        return;
+    }
+    var body: Vec<Stmt> = f.body;
+    substitute_stmts(& mut body, original, errs);
+    f.body = body;
+}
+
+/// LG9: every `comptime splice` of the program expanded in place: the
+/// functions, the methods of impl blocks and trait impls, and constants'
+/// initializers. Run by process_gen before type checking, and only when the
+/// parser saw a splice (parser_saw_splice).
+fn ct_expand_splices(program: Program, errs: & mut Vec<str>) -> Program {
+    var prog: Program = program;
+    g_ct_splice_only = true;
+    var fi: i64 = 0;
+    while fi < prog.funcs.len() {
+        var f: Func = prog.funcs.get(fi);
+        ct_splice_func(& mut f, & prog, errs);
+        prog.funcs.set(fi, f);
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < prog.impls.len() {
+        var im: ImplDef = prog.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < im.methods.len() {
+            var m: Func = im.methods.get(mi);
+            ct_splice_func(& mut m, & prog, errs);
+            im.methods.set(mi, m);
+            mi = mi + 1;
+        }
+        prog.impls.set(ii, im);
+        ii = ii + 1;
+    }
+    var ti: i64 = 0;
+    while ti < prog.trait_impls.len() {
+        var tim: TraitImpl = prog.trait_impls.get(ti);
+        var tmi: i64 = 0;
+        while tmi < tim.methods.len() {
+            var tm: Func = tim.methods.get(tmi);
+            ct_splice_func(& mut tm, & prog, errs);
+            tim.methods.set(tmi, tm);
+            tmi = tmi + 1;
+        }
+        prog.trait_impls.set(ti, tim);
+        ti = ti + 1;
+    }
+    var ci: i64 = 0;
+    while ci < prog.consts.len() {
+        var cd: ConstDef = prog.consts.get(ci);
+        if ct_scan_expr_sub(cd.expr) {
+            substitute_expr(& mut cd.expr, & prog, errs);
+            prog.consts.set(ci, cd);
+        }
+        ci = ci + 1;
+    }
+    g_ct_splice_only = false;
+    return prog;
 }
 
 fn substitute_expr_comptime(expr: & mut Expr, inner: Box<Expr>, original: & Program, errs: & mut Vec<str>) {
@@ -1241,7 +2293,11 @@ fn substitute_expr_comptime(expr: & mut Expr, inner: Box<Expr>, original: & Prog
         }
         ResultExpr::Err(msg) => {
             errs.push("comptime error: " + msg);
-            ct_warn(msg);
+            // CD8: I/O in comptime is a type error (typechecker.fd
+            // TypeChecker_check_comptime_call), not code moved to run time
+            if !ct_io_message(msg) {
+                ct_warn(msg);
+            }
         }
     }
 }
@@ -1255,7 +2311,11 @@ fn substitute_expr_comptime_block(expr: & mut Expr, stmts: & mut Vec<Stmt>, orig
         }
         ResultExpr::Err(msg) => {
             errs.push("comptime error: " + msg);
-            ct_warn(msg);
+            // CD8: I/O in comptime is a type error (typechecker.fd
+            // TypeChecker_check_comptime_call), not code moved to run time
+            if !ct_io_message(msg) {
+                ct_warn(msg);
+            }
         }
     }
 }
@@ -1277,8 +2337,7 @@ fn substitute_expr_comptime_reflect(expr: & mut Expr, op: ReflectOp, ty: Type, o
 // literals, without requiring an explicit `comptime` wrapper.
 
 // The names of this program's comptime fns
-var ct_comptime_fns: i64 = 0;
- fn aggressive_comptime_func(funcs: & mut Vec<Func>, idx: i64, original: & Program) {
+var ct_comptime_fns: i64 = 0; fn aggressive_comptime_func(funcs: & mut Vec<Func>, idx: i64, original: & Program) {
     var func: Func = funcs.get(idx);
     var si: i64 = 0;
     while si < func.body.len() {
@@ -1594,6 +2653,106 @@ fn stmt_has_break_or_continue(stmt: Stmt) -> bool {
                 i = i + 1;
             }
         }
+        // V1d (miscompile-log): a `break`/`continue` in a `match` arm (or
+        // another block, or an if/match/block expression) is the loop's
+        // too; unrolling such a body made `break` leave only the arm
+        Stmt::Match(scrut, arms, _) => {
+            if ct_expr_has_break_or_continue(scrut) {
+                return true;
+            }
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                if ct_stmts_have_break_or_continue(arms.get(ai).body) {
+                    return true;
+                }
+                ai = ai + 1;
+            }
+        }
+        Stmt::Loop(body, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::Defer(body, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::Sandbox(body, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::Txn(body, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::SpawnScope(body, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::Handle(body, _, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::RegionBlock(_, _, _, _, _, body, _) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Stmt::Expr(e, _) => {
+            return ct_expr_has_break_or_continue(e);
+        }
+        Stmt::Let(_, _, e, _, _, _, _) => {
+            return ct_expr_has_break_or_continue(e);
+        }
+        Stmt::Assign(_, _, e, _) => {
+            return ct_expr_has_break_or_continue(e);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn ct_stmts_have_break_or_continue(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        if stmt_has_break_or_continue(stmts.get(i)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// V1d: a `break`/`continue` inside an if, match or block expression
+/// (`val x = match k { _ => { break; } }`). Closures are left out: a
+/// `break` there is not the loop's.
+fn ct_expr_has_break_or_continue(e: Expr) -> bool {
+    match e {
+        Expr::If(c, then_block, else_block) => {
+            if ct_expr_has_break_or_continue(ct_box_expr_unbox(c)) {
+                return true;
+            }
+            if ct_stmts_have_break_or_continue(then_block) {
+                return true;
+            }
+            match else_block {
+                OptStmts::Some(eb) => {
+                    return ct_stmts_have_break_or_continue(eb);
+                }
+                OptStmts::None => {
+                }
+            }
+        }
+        Expr::Match(scrut, arms) => {
+            if ct_expr_has_break_or_continue(ct_box_expr_unbox(scrut)) {
+                return true;
+            }
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                if ct_stmts_have_break_or_continue(arms.get(ai).body) {
+                    return true;
+                }
+                ai = ai + 1;
+            }
+        }
+        Expr::Block(body) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
+        Expr::TryBlock(body) => {
+            return ct_stmts_have_break_or_continue(body);
+        }
         _ => {
         }
     }
@@ -1849,6 +3008,23 @@ fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
             }
         }
         Expr::Call(callee, args) => {
+            if callee == "gensym" && !ct_has_comptime_fn(original, callee) {
+                var gs_args: Vec<Expr> = Vec::new();
+                var gai: i64 = 0;
+                while gai < args.len() {
+                    var gae: Expr = args.get(gai);
+                    match evaluate(& gae, original) {
+                        ResultExpr::Err(gm) => {
+                            return ResultExpr::Err(gm);
+                        }
+                        ResultExpr::Ok(gv) => {
+                            gs_args.push(gv);
+                        }
+                    }
+                    gai = gai + 1;
+                }
+                return ct_gensym_call(gs_args, original);
+            }
             // Look up comptime function
             var func_idx: i64 = - 1;
             var fi: i64 = 0;
@@ -1858,6 +3034,29 @@ fn evaluate(expr: & Expr, original: & Program) -> ResultExpr {
                     func_idx = fi;
                 }
                 fi = fi + 1;
+            }
+            if func_idx < 0 {
+                if ct_io_builtin(callee) {
+                    return ResultExpr::Err("'" + callee + "()' does I/O, and comptime code runs inside the compiler with no I/O (files, network, processes, the console, the clock or the environment)");
+                }
+                if ct_pure_builtin(callee) {
+                    var pb_args: Vec<Expr> = Vec::new();
+                    var pbi: i64 = 0;
+                    while pbi < args.len() {
+                        var pbe: Expr = args.get(pbi);
+                        match evaluate(& pbe, original) {
+                            ResultExpr::Err(pm) => {
+                                return ResultExpr::Err(pm);
+                            }
+                            ResultExpr::Ok(pv) => {
+                                pb_args.push(pv);
+                            }
+                        }
+                        pbi = pbi + 1;
+                    }
+                    return ct_pure_call(callee, pb_args);
+                }
+                func_idx = ct_plain_fn(original, callee);
             }
             if func_idx < 0 {
                 return ResultExpr::Err("comptime function '" + callee + "' not found");
@@ -1961,7 +3160,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                         return ResultExpr::Err(msg);
                     }
                     ResultExpr::Ok(v) => {
-                        ComptimeEnv_set(& mut local_env, name, v);
+                        ComptimeEnv_declare(& mut local_env, name, v, n_outer);
                     }
                 }
             }
@@ -1972,50 +3171,23 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                         return ResultExpr::Err(msg);
                     }
                     ResultExpr::Ok(v) => {
-                        var current_opt: OptExpr = ComptimeEnv_get(& local_env, target);
-                        var current: Expr = Expr::IntLit(0);
-                        match current_opt {
-                            OptExpr::Some(c) => {
-                                current = c;
+                        // Every compound operator (`/=`, `%=`, `<<=`, ...: only
+                        // `+=`, `-=`, `*=` were known, the others stored `v`),
+                        // and one that fails (`x /= 0`) is an error
+                        match ce_assign(& local_env, target, op, v) {
+                            ResultExpr::Ok(nv) => {
+                                ComptimeEnv_set(& mut local_env, target, nv);
                             }
-                            OptExpr::None => {
-                            }
-                        }
-                        var new_v: Expr = v;
-                        match op {
-                            AssignOp::AddAssign => {
-                                var br: ResultExpr = eval_binop(BinOp::Add, current, v);
-                                match br {
-                                    ResultExpr::Ok(nv) => {
-                                        new_v = nv;
-                                    }, ResultExpr::Err(_) => {
-                                    }
-                                }
-                            }
-                            AssignOp::SubAssign => {
-                                var br: ResultExpr = eval_binop(BinOp::Sub, current, v);
-                                match br {
-                                    ResultExpr::Ok(nv) => {
-                                        new_v = nv;
-                                    }, ResultExpr::Err(_) => {
-                                    }
-                                }
-                            }
-                            AssignOp::MulAssign => {
-                                var br: ResultExpr = eval_binop(BinOp::Mul, current, v);
-                                match br {
-                                    ResultExpr::Ok(nv) => {
-                                        new_v = nv;
-                                    }, ResultExpr::Err(_) => {
-                                    }
-                                }
-                            }
-                            _ => {
+                            ResultExpr::Err(am) => {
+                                return ResultExpr::Err(am);
                             }
                         }
-                        ComptimeEnv_set(& mut local_env, target, new_v);
                     }
                 }
+            }
+            Stmt::LetUninit(uname, _, _, _) => {
+                // declared here, so an assignment in an inner block reaches it
+                ComptimeEnv_declare(& mut local_env, uname, Expr::IntLit(0), n_outer);
             }
             Stmt::Expr(e, _) => {
                 result = Expr::IntLit(0);
@@ -2096,7 +3268,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                 }
             }
             Stmt::Return(opt, _) => {
-                returned.push(1);
+                returned.push(CE_FLOW_RETURN);
                 match opt {
                     OptBoxExpr::Some(e) => {
                         var inner: Expr = ct_box_expr_unbox(e);
@@ -2119,6 +3291,10 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                                 if b {
                                     var br: ResultExpr = evaluate_block_rt(then_block, original, & mut local_env, returned);
                                     if returned.len() > 0 {
+                                        // return, or a break/continue for an
+                                        // enclosing loop: what was assigned
+                                        // so far is kept
+                                        ce_write_back(env, & local_env, n_outer);
                                         return br;
                                     }
                                     match br {
@@ -2134,6 +3310,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                                         OptStmts::Some(eb) => {
                                             var br: ResultExpr = evaluate_block_rt(eb, original, & mut local_env, returned);
                                             if returned.len() > 0 {
+                                                ce_write_back(env, & local_env, n_outer);
                                                 return br;
                                             }
                                             match br {
@@ -2160,7 +3337,7 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
             Stmt::While(wcond, wbody, _) => {
                 // at most 10 million iterations: a comptime loop that does
                 // not end is an error, not a hang
-                var guard: i64 = 0;
+                var hops: i64 = 0;
                 var going: bool = true;
                 while going {
                     var wc: ResultExpr = evaluate_with_env(wcond, & local_env, original);
@@ -2180,12 +3357,16 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                         }
                     }
                     if going {
-                        guard = guard + 1;
-                        if guard > 10000000 {
+                        hops = hops + 1;
+                        if hops > 10000000 {
                             return ResultExpr::Err("comptime while loop ran 10 million times");
                         }
                         var wr: ResultExpr = evaluate_block_rt(wbody, original, & mut local_env, returned);
-                        if returned.len() > 0 {
+                        var wflow: i64 = ce_loop_flow(returned);
+                        if wflow == CE_FLOW_BREAK {
+                            going = false;
+                        } else if wflow == CE_FLOW_RETURN {
+                            ce_write_back(env, & local_env, n_outer);
                             return wr;
                         }
                         match wr {
@@ -2227,9 +3408,13 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                                                             Expr::IntLit(b) => {
                                                                 var i: i64 = a;
                                                                 while i < b {
-                                                                    ComptimeEnv_set(& mut local_env, loop_var, Expr::IntLit(i));
+                                                                    ComptimeEnv_declare(& mut local_env, loop_var, Expr::IntLit(i), n_outer);
                                                                     var br: ResultExpr = evaluate_block_rt(body, original, & mut local_env, returned);
-                                                                    if returned.len() > 0 {
+                                                                    var fflow: i64 = ce_loop_flow(returned);
+                                                                    if fflow == CE_FLOW_BREAK {
+                                                                        break;
+                                                                    } else if fflow == CE_FLOW_RETURN {
+                                                                        ce_write_back(env, & local_env, n_outer);
                                                                         return br;
                                                                     }
                                                                     match br {
@@ -2264,7 +3449,51 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
                     }
                 }
             }
+            Stmt::Loop(lbody, _) => {
+                // `loop { ... }` ends by break or return; the same 10 million
+                // iteration guard as `while`
+                var lguard: i64 = 0;
+                var lgoing: bool = true;
+                while lgoing {
+                    lguard = lguard + 1;
+                    if lguard > 10000000 {
+                        return ResultExpr::Err("comptime loop ran 10 million times");
+                    }
+                    var lr: ResultExpr = evaluate_block_rt(lbody, original, & mut local_env, returned);
+                    var lflow: i64 = ce_loop_flow(returned);
+                    if lflow == CE_FLOW_BREAK {
+                        lgoing = false;
+                    } else if lflow == CE_FLOW_RETURN {
+                        ce_write_back(env, & local_env, n_outer);
+                        return lr;
+                    }
+                    match lr {
+                        ResultExpr::Ok(_) => {
+                        }
+                        ResultExpr::Err(lem) => {
+                            return ResultExpr::Err(lem);
+                        }
+                    }
+                }
+            }
+            Stmt::Break(_, _) => {
+                // the innermost loop stops (ce_loop_flow); this block and
+                // the ones up to the loop end here, keeping their assignments
+                returned.push(CE_FLOW_BREAK);
+                ce_write_back(env, & local_env, n_outer);
+                return ResultExpr::Ok(result);
+            }
+            Stmt::Continue(_) => {
+                returned.push(CE_FLOW_CONTINUE);
+                ce_write_back(env, & local_env, n_outer);
+                return ResultExpr::Ok(result);
+            }
             _ => {
+                // A statement the evaluator does not run (match, field or
+                // index assignment, defer, ...) was skipped, so the value
+                // came out wrong without a word. An error leaves the call
+                // to run with the program, which computes it right.
+                return ResultExpr::Err("this statement is not evaluated at compile time (comptime runs let, var, assignment, if, while, for, loop, break, continue, return and expression statements)");
             }
         }
         si = si + 1;
@@ -2272,13 +3501,47 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: & Program, env: & mut ComptimeE
     // The variables of the enclosing blocks get what this block assigned
     // them (the copy's buffers are not shared with `env` under copy-on-
     // write, so a `while` body's `i = i + 1` was lost: an endless loop)
-    var wk: i64 = 0;
-    while wk < n_outer {
-        env.values.set(wk, local_env.values.get(wk));
-        wk = wk + 1;
-    }
+    ce_write_back(env, & local_env, n_outer);
     return ResultExpr::Ok(result);
 }
+
+// How a comptime block ended, kept on the `returned` stack of
+// evaluate_block_rt: a `return` (the function's value is ready), or a
+// `break` / `continue` for the innermost loop.
+const CE_FLOW_RETURN: i64 = 1;
+const CE_FLOW_BREAK: i64 = 2;
+const CE_FLOW_CONTINUE: i64 = 3;
+
+/// After a loop body ran: 0 (go on), CE_FLOW_BREAK (stop the loop) or
+/// CE_FLOW_RETURN (leave the function). A break or continue is the loop's
+/// own and is taken off the stack; a return stays for the caller.
+fn ce_loop_flow(returned: & mut Vec<i64>) -> i64 {
+    if returned.len() == 0 {
+        return 0;
+    }
+    var code: i64 = returned.get(returned.len() - 1);
+    if code == CE_FLOW_BREAK {
+        returned.pop();
+        return CE_FLOW_BREAK;
+    }
+    if code == CE_FLOW_CONTINUE {
+        returned.pop();
+        return 0;
+    }
+    return CE_FLOW_RETURN;
+}
+
+/// The variables of the enclosing blocks (the first `n_outer` of `local`)
+/// get the values this block gave them.
+fn ce_write_back(env: & mut ComptimeEnv, local: & ComptimeEnv, n_outer: i64) {
+    var wk: i64 = 0;
+    while wk < n_outer {
+        env.values.set(wk, local.values.get(wk));
+        wk = wk + 1;
+    }
+}
+
+
 
 fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> ResultExpr {
     match expr {
@@ -2314,6 +3577,29 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
                     return ResultExpr::Err(msg);
                 }
                 ResultExpr::Ok(lv) => {
+                    // `&&` / `||` stop at the left side as the program does
+                    // (`i < v.len() && v.get(i) == x` reads no element past
+                    // the end).
+                    match lv {
+                        Expr::BoolLit(lb) => {
+                            match op {
+                                BinOp::And => {
+                                    if !lb {
+                                        return ResultExpr::Ok(Expr::BoolLit(false));
+                                    }
+                                }
+                                BinOp::Or => {
+                                    if lb {
+                                        return ResultExpr::Ok(Expr::BoolLit(true));
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
                     var rr: ResultExpr = evaluate_with_env(& r, env, original);
                     match rr {
                         ResultExpr::Err(msg) => {
@@ -2393,6 +3679,23 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
             if callee == "Vec_new" && args.len() == 0 {
                 return ResultExpr::Ok(ct_vec_of(Type::I64, Vec::new()));
             }
+            if callee == "gensym" && !ct_has_comptime_fn(original, callee) {
+                var gs_args: Vec<Expr> = Vec::new();
+                var gai: i64 = 0;
+                while gai < args.len() {
+                    var gae: Expr = args.get(gai);
+                    match evaluate_with_env(& gae, env, original) {
+                        ResultExpr::Err(gm) => {
+                            return ResultExpr::Err(gm);
+                        }
+                        ResultExpr::Ok(gv) => {
+                            gs_args.push(gv);
+                        }
+                    }
+                    gai = gai + 1;
+                }
+                return ct_gensym_call(gs_args, original);
+            }
             var func_idx: i64 = - 1;
             var fi: i64 = 0;
             while fi < original.funcs.len() {
@@ -2401,6 +3704,29 @@ fn evaluate_with_env(expr: & Expr, env: & ComptimeEnv, original: & Program) -> R
                     func_idx = fi;
                 }
                 fi = fi + 1;
+            }
+            if func_idx < 0 {
+                if ct_io_builtin(callee) {
+                    return ResultExpr::Err("'" + callee + "()' does I/O, and comptime code runs inside the compiler with no I/O (files, network, processes, the console, the clock or the environment)");
+                }
+                if ct_pure_builtin(callee) {
+                    var pb_args: Vec<Expr> = Vec::new();
+                    var pbi: i64 = 0;
+                    while pbi < args.len() {
+                        var pbe: Expr = args.get(pbi);
+                        match evaluate_with_env(& pbe, env, original) {
+                            ResultExpr::Err(pm) => {
+                                return ResultExpr::Err(pm);
+                            }
+                            ResultExpr::Ok(pv) => {
+                                pb_args.push(pv);
+                            }
+                        }
+                        pbi = pbi + 1;
+                    }
+                    return ct_pure_call(callee, pb_args);
+                }
+                func_idx = ct_plain_fn(original, callee);
             }
             if func_idx < 0 {
                 return ResultExpr::Err("comptime function '" + callee + "' not found");
@@ -2595,7 +3921,13 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: & Program) -> Resul
     // smaller interpreter of its own (no while, no `t.push`), so a table
     // built in a loop was left to run when the program did.
     var returned: Vec<i64> = Vec::new();
-    return evaluate_block_rt(func.body, original, & mut env, & mut returned);
+    if g_ct_call_depth >= 400 {
+        return ResultExpr::Err("comptime calls nest deeper than 400 (through '" + func.name + "')");
+    }
+    g_ct_call_depth = g_ct_call_depth + 1;
+    val cres: ResultExpr = evaluate_block_rt(func.body, original, & mut env, & mut returned);
+    g_ct_call_depth = g_ct_call_depth - 1;
+    return cres;
 }
 
 /// New value of `target` after `target op= v` (src/comptime.rs).
@@ -2609,6 +3941,9 @@ fn ce_assign(env: & ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultEx
         }
     }
     match op {
+        AssignOp::Assign => {
+            return ResultExpr::Ok(v);
+        }
         AssignOp::AddAssign => {
             return eval_binop(BinOp::Add, current, v);
         }
@@ -2618,7 +3953,26 @@ fn ce_assign(env: & ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultEx
         AssignOp::MulAssign => {
             return eval_binop(BinOp::Mul, current, v);
         }
-        _ => {
+        AssignOp::DivAssign => {
+            return eval_binop(BinOp::Div, current, v);
+        }
+        AssignOp::ModAssign => {
+            return eval_binop(BinOp::Mod, current, v);
+        }
+        AssignOp::BitAndAssign => {
+            return eval_binop(BinOp::BitAnd, current, v);
+        }
+        AssignOp::BitOrAssign => {
+            return eval_binop(BinOp::BitOr, current, v);
+        }
+        AssignOp::BitXorAssign => {
+            return eval_binop(BinOp::BitXor, current, v);
+        }
+        AssignOp::ShlAssign => {
+            return eval_binop(BinOp::Shl, current, v);
+        }
+        AssignOp::ShrAssign => {
+            return eval_binop(BinOp::Shr, current, v);
         }
     }
     return ResultExpr::Ok(v);

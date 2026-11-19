@@ -440,7 +440,11 @@ fn tp_basic(d: & mut TomlDoc, s: str, n: i64, i: i64, out: & mut Vec<str>) -> i6
             return tp_fail(d, i, "unterminated string");
         }
         if c == 34 {
-            out.push(acc + str_slice(s, run, j));
+            // appended in place, not `acc + ...`: natively a string that
+            // p_str_append grew lost what follows a zero byte when joined
+            // with `+` (known-bugs 2g.41, \u0000)
+            acc = acc + str_slice(s, run, j);
+            out.push(acc);
             return j + 1;
         }
         if c == 92 {
@@ -523,7 +527,10 @@ fn tp_multi(d: & mut TomlDoc, s: str, n: i64, i: i64, lit: bool, out: & mut Vec<
                 if q > 5 {
                     return tp_fail(d, j, "too many quotes at the end of a multi-line string");
                 }
-                out.push(acc + str_slice(s, run, j) + tp_quotes(q - 3, qs));
+                // appended in place (2g.41, see tp_basic)
+                acc = acc + str_slice(s, run, j);
+                acc = acc + tp_quotes(q - 3, qs);
+                out.push(acc);
                 return j + q;
             }
             j = j + q;
@@ -566,7 +573,8 @@ fn tp_multi(d: & mut TomlDoc, s: str, n: i64, i: i64, lit: bool, out: & mut Vec<
             if tp_at(s, n, j + 1) != 10 {
                 return tp_fail(d, j, "carriage return without a line feed");
             }
-            acc = acc + str_slice(s, run, j) + "\n";
+            acc = acc + str_slice(s, run, j);
+            acc = acc + "\n";
             j = j + 2;
             run = j;
             continue;
@@ -1582,6 +1590,17 @@ fn tf_kind(k: str) -> str {
 /// Parse TOML text into Vec<TomlEntry> (document order), leniently:
 /// see the module header. Tables become path prefixes; array elements
 /// are listed in their array's `items`.
+///
+/// Example:
+///   val doc = toml_parse("title = \"app\"\n[server]\nport = 8080\ndebug = true\n");
+///   assert_eq(toml_get_str(doc, "title"), "app");
+///   assert_eq(toml_get_int(doc, "server.port", 0), 8080);
+///   assert(toml_get_bool(doc, "server.debug", false));
+///   assert_eq(toml_get_int(doc, "server.missing", 7), 7);
+///   assert_eq(toml_kind(doc, "server.port"), "int");
+///   val d = toml_load("a = [1, 2, 3]\n");
+///   assert_eq(toml_node_len(d, toml_lookup(d, "a")), 3);
+///   assert_eq(toml_node_value(d, toml_lookup(d, "a.1")), "2");
 pub fn toml_parse(text: str) -> Vec<TomlEntry> {
     var d: TomlDoc = tp_run(text, true);
     var entries: Vec<TomlEntry> = Vec::new();

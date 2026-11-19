@@ -1,0 +1,54 @@
+// M23 (docs/verification/miscompile-log.md; repro
+// tests/verify/bugs/m23_enum_copy_dse.fd): `val eb = ea;` copies the enum,
+// so a later `ea = ...` leaves eb as it was. On emit the IR optimizer's
+// dead store elimination (compiler/iropt_me.fd ime_overwritten_stores)
+// dropped the store of `ea`'s first value: the struct store of the copy
+// was not counted as a read of `ea`.
+//
+// Expected output:
+// 1
+// 2
+// 5
+// 9
+// 30
+// 4
+
+enum Sh {
+    One(i64),
+    Two(i64, i32),
+    Zero,
+}
+
+struct P { a: i64, b: i64 }
+
+fn sh_val(s: Sh) -> i64 {
+    match s {
+        Sh::One(a) => { return a; }
+        Sh::Two(a, b) => { return a + (b as i64); }
+        Sh::Zero => { return 0; }
+    }
+    return -100;
+}
+
+fn main() -> i64 {
+    var ea = Sh::One(1);
+    val eb = ea;
+    ea = Sh::One(2);
+    println(sh_val(eb));
+    println(sh_val(ea));
+
+    var ec = Sh::Two(2, 3);
+    val ed = ec;
+    ec = Sh::Zero;
+    ec = Sh::Two(4, 5);
+    println(sh_val(ed));
+    println(sh_val(ec));
+
+    // the same with a struct
+    var p = P { a: 10, b: 20 };
+    val q = p;
+    p = P { a: 1, b: 3 };
+    println(q.a + q.b);
+    println(p.a + p.b);
+    return 0;
+}

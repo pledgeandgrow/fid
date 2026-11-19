@@ -1,0 +1,114 @@
+// VF15 (competitive roadmap): the stdlib parsers on the inputs the parser
+// fuzzer (scripts/fuzz/fuzz_parsers.py, driver tests/fuzz/parsers.fd)
+// found, and on malformed TLS records of the shapes it makes. None of these
+// entry points may panic, hang or run out of memory on untrusted input:
+//   P1  url_parse of a port longer than an i64 panicked (integer overflow
+//       in String_parse_int); an unparseable port is -1 (url.fd's doc)
+//   P2  a regex repetition count longer than an i64 panicked (integer
+//       overflow in rx_parse_brace); the pattern must not match "aaa"
+//   P3  xml_parse of a stray '<' allocated until out of memory, and
+//       "<a><b><<" ran for more than 20 s
+// The TLS cases are record streams the fuzzer's mutations make: a length
+// over 2^14 + 256, a handshake message whose 24-bit length runs past the
+// fragment, a protected record that cannot authenticate, a record cut in
+// its header, and an empty stream. docs/verification/miscompile-log.md
+// (P1-P3), docs/verification/vf15-parsers-2026-11-18.md (the runs).
+//
+// Expected output:
+// p1 port -1
+// p1 port -1
+// p1 port 8080
+// p2 false
+// p2 false
+// p2 true
+// p3 1
+// p3 2
+// p3 2
+// tls overflow: records 0 error 3
+// tls long handshake: messages 0 consumed 0 error 0
+// tls open: error 6
+// tls cut header: records 1 consumed 7 error 0
+// tls empty: records 0 consumed 0 error 0
+// done
+use string;
+use url;
+use regex;
+use xml;
+use tls_record;
+
+fn xml_count(n: XmlNode) -> i64 {
+    var total: i64 = 1;
+    for c in n.children {
+        total = total + xml_count(c);
+    }
+    return total;
+}
+
+fn hex_digit(c: i64) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    return c - 55;
+}
+
+// "16030300ff..." -> the bytes it spells
+fn hex_bytes(h: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        out.push(hex_digit(str_byte_at(h, i)) * 16 + hex_digit(str_byte_at(h, i + 1)));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    // P1
+    val u1 = url_parse("http://h:802142147483648748364875/");
+    println("p1 port " + int_to_str(u1.port));
+    val u2 = url_parse("http://[::1]:99999999999999999999999/");
+    println("p1 port " + int_to_str(u2.port));
+    val u3 = url_parse("http://h:8080/");
+    println("p1 port " + int_to_str(u3.port));
+
+    // P2
+    println("p2 " + bool_to_str(regex_match("aaa", "a{39999999999999999999999999}")));
+    // the upper bound overflows the same way (fuzz seed 4: x?y{2,3922…08})
+    println("p2 " + bool_to_str(regex_match("yyy", "y{2,39223372036854775808}")));
+    println("p2 " + bool_to_str(regex_match("aaa", "a{3}")));
+
+    // P3
+    println("p3 " + int_to_str(xml_count(xml_parse("<"))));
+    println("p3 " + int_to_str(xml_count(xml_parse("<a><b><<"))));
+    println("p3 " + int_to_str(xml_count(xml_parse("<r><<x/></r>"))));
+
+    // TLS: a record of 0x4101 bytes (more than 2^14 + 256)
+    val r1: TlsRecords = tls_records_parse(hex_bytes("1703034101000000"));
+    println("tls overflow: records " + int_to_str(r1.records.len()) + " error " + int_to_str(r1.error));
+    // a handshake message claiming 0xffffff bytes, with 4 of them there
+    val h1: TlsHandshakes = tls_handshake_parse(hex_bytes("01ffffff00010203"));
+    println("tls long handshake: messages " + int_to_str(h1.messages.len()) + " consumed " + int_to_str(h1.consumed) + " error " + int_to_str(h1.error));
+    // application_data of 17 zero bytes (type + tag) under a fixed key
+    val r2: TlsRecords = tls_records_parse(hex_bytes("1703030011" + "0000000000000000000000000000000000"));
+    var key: Vec<i64> = Vec::new();
+    var iv: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 32 {
+        key.push(k);
+        if k < 12 {
+            iv.push(k);
+        }
+        k = k + 1;
+    }
+    println("tls open: error " + int_to_str(tls_record_open(key, iv, 0, r2.records.get(0)).error));
+    // an alert record, then a record cut after 3 bytes of its header
+    val r3: TlsRecords = tls_records_parse(hex_bytes("15030300020228160303"));
+    println("tls cut header: records " + int_to_str(r3.records.len()) + " consumed " + int_to_str(r3.consumed) + " error " + int_to_str(r3.error));
+    val r4: TlsRecords = tls_records_parse(Vec::new());
+    println("tls empty: records " + int_to_str(r4.records.len()) + " consumed " + int_to_str(r4.consumed) + " error " + int_to_str(r4.error));
+    println("done");
+    return 0;
+}

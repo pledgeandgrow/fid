@@ -1,0 +1,790 @@
+// Fides I2C bus: messages, register helpers, 7/10-bit addressing, bus scan
+//
+// What is real (pure Fides, runs everywhere):
+//   - I2C messages (write / read, the Linux i2c_msg flags), combined
+//     write-then-read transactions with a repeated start
+//   - the address bytes on the wire for 7-bit and 10-bit addresses
+//   - register helpers: 8/16-bit register reads and writes, big- and
+//     little-endian 16-bit values, block reads, read-modify-write, devices
+//     with 16-bit register pointers (EEPROMs)
+//   - bus scan over the usable 7-bit range 0x08..0x77 (like i2cdetect)
+//   - SMBus PEC (CRC-8, polynomial x^8+x^2+x+1)
+//   - the memory image of a Linux I2C_RDWR request (struct
+//     i2c_rdwr_ioctl_data + struct i2c_msg[] + buffers, 64-bit layout)
+//   - a fake bus: register-pointer devices backed by Vecs, with a log of
+//     every transfer, for tests and simulation
+//
+// The seam (what touches hardware):
+//   - I2cBus.xfer: fn(handle, request) -> reply, where request is
+//     i2c_encode_request(msgs) and the reply is [status, read bytes...].
+//     A bare-metal driver supplies its own (i2c_bus_custom).
+//   - Linux: i2c_linux_open(n) opens /dev/i2c-N and its xfer issues
+//     ioctl(fd, I2C_RDWR, ...) through the extern "C" block below. Those
+//     functions are @cfg(linux): they exist only when fid runs on Linux.
+//     The interpreter cannot run them (no FFI); the C backend can.
+//
+//   var bus: I2cBus = i2c_bus_fake();
+//   i2c_fake_add(& mut bus, i2c_fake_dev(0x76, 256));
+//   val id: i64 = i2c_read_reg8(& mut bus, 0x76, 0xD0);
+module i2c;
+ use vec;
+ use string;
+
+// ─── Linux i2c-dev seam ─────────────────────────────────────────────────
+
+extern "C" include "<fcntl.h>" {
+    fn open as i2c_sys_open(path: str, flags: i64) -> i64;
+}
+extern "C" include "<unistd.h>" {
+    fn close as i2c_sys_close(fd: i64) -> i64;
+}
+// No header: <sys/ioctl.h> is missing on Windows. The calls are only in
+// @cfg(linux) functions, so other hosts never reference the symbol.
+extern "C" {
+    fn ioctl as i2c_sys_ioctl(fd: i64, req: i64, arg: i64) -> i64;
+}
+
+// <linux/i2c-dev.h> requests and <linux/i2c.h> message flags
+pub const I2C_RETRIES: i64 = 0x0701;
+pub const I2C_TIMEOUT: i64 = 0x0702;
+pub const I2C_SLAVE: i64 = 0x0703;
+pub const I2C_TENBIT: i64 = 0x0704;
+pub const I2C_FUNCS: i64 = 0x0705;
+pub const I2C_SLAVE_FORCE: i64 = 0x0706;
+pub const I2C_RDWR: i64 = 0x0707;
+pub const I2C_PEC: i64 = 0x0708;
+pub const I2C_SMBUS: i64 = 0x0720;
+pub const I2C_RDWR_MAX_MSGS: i64 = 42;
+
+pub const I2C_M_RD: i64 = 0x0001;
+pub const I2C_M_TEN: i64 = 0x0010;
+pub const I2C_M_DMA_SAFE: i64 = 0x0200;
+pub const I2C_M_RECV_LEN: i64 = 0x0400;
+pub const I2C_M_NO_RD_ACK: i64 = 0x0800;
+pub const I2C_M_IGNORE_NAK: i64 = 0x1000;
+pub const I2C_M_REV_DIR_ADDR: i64 = 0x2000;
+pub const I2C_M_NOSTART: i64 = 0x4000;
+pub const I2C_M_STOP: i64 = 0x8000;
+
+pub const I2C_O_RDWR: i64 = 2;
+
+// Bus kinds
+pub const I2C_BUS_FAKE: i64 = 0;
+pub const I2C_BUS_FN: i64 = 1;
+
+// ─── Messages ───────────────────────────────────────────────────────────
+
+/// One message of a transaction. For a write `data` holds the bytes and
+/// `len` is data.len(); for a read `len` bytes are read (data is empty).
+pub struct I2cMsg {
+    pub addr: i64,
+    pub flags: i64,
+    pub len: i64,
+    pub data: Vec<i64>,
+}
+
+pub fn i2c_msg_write(addr: i64, data: Vec<i64>) -> I2cMsg {
+    return I2cMsg { addr: addr, flags: 0, len: data.len(), data: data };
+}
+
+pub fn i2c_msg_read(addr: i64, n: i64) -> I2cMsg {
+    return I2cMsg { addr: addr, flags: I2C_M_RD, len: n, data: Vec::new() };
+}
+
+/// The same message addressed with a 10-bit address.
+pub fn i2c_msg_ten(m: I2cMsg) -> I2cMsg {
+    return I2cMsg { addr: m.addr, flags: m.flags | I2C_M_TEN, len: m.len, data: m.data };
+}
+
+pub fn i2c_msg_is_read(m: & I2cMsg) -> bool {
+    return (m.flags & I2C_M_RD) != 0;
+}
+
+/// A 7-bit address a device may have (0x08..0x77; the rest are reserved
+/// for general call, CBUS, HS-mode masters and 10-bit headers).
+pub fn i2c_addr7_valid(addr: i64) -> bool {
+    return addr >= 0x08 && addr <= 0x77;
+}
+
+pub fn i2c_addr10_valid(addr: i64) -> bool {
+    return addr >= 0 && addr <= 0x3FF;
+}
+
+/// The address bytes a master sends after START. 7-bit: one byte
+/// addr<<1 | R/W. 10-bit write: 11110 A9 A8 0, then A7..A0. 10-bit read:
+/// the full write header, then after a repeated start 11110 A9 A8 1.
+pub fn i2c_addr_wire(addr: i64, ten_bit: bool, read: bool) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var rw: i64 = 0;
+    if read {
+        rw = 1;
+    }
+    if !ten_bit {
+        out.push(((addr & 0x7F) << 1) | rw);
+        return out;
+    }
+    val hi: i64 = 0xF0 | (((addr >> 8) & 3) << 1);
+    out.push(hi);
+    out.push(addr & 0xFF);
+    if read {
+        out.push(hi | 1);
+    }
+    return out;
+}
+
+/// Decode the first address byte of a 7-bit transfer: [addr, read?1:0].
+pub fn i2c_addr_unwire7(b: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push((b >> 1) & 0x7F);
+    out.push(b & 1);
+    return out;
+}
+
+// ─── Seam encoding ──────────────────────────────────────────────────────
+
+/// The request a transport receives: [n, then per message addr, flags,
+/// len, and for writes the len data bytes].
+pub fn i2c_encode_request(msgs: & Vec<I2cMsg>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(msgs.len());
+    var i: i64 = 0;
+    while i < msgs.len() {
+        val m: I2cMsg = msgs.get(i);
+        out.push(m.addr);
+        out.push(m.flags);
+        out.push(m.len);
+        if (m.flags & I2C_M_RD) == 0 {
+            var j: i64 = 0;
+            while j < m.len {
+                out.push(m.data.get(j) & 0xFF);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Decode a request back into messages (a transport's view).
+pub fn i2c_decode_request(req: & Vec<i64>) -> Vec<I2cMsg> {
+    var msgs: Vec<I2cMsg> = Vec::new();
+    if req.len() == 0 {
+        return msgs;
+    }
+    val n: i64 = req.get(0);
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < n && p + 2 < req.len() {
+        val addr: i64 = req.get(p);
+        val flags: i64 = req.get(p + 1);
+        val len: i64 = req.get(p + 2);
+        p = p + 3;
+        var data: Vec<i64> = Vec::new();
+        if (flags & I2C_M_RD) == 0 {
+            var j: i64 = 0;
+            while j < len && p < req.len() {
+                data.push(req.get(p));
+                p = p + 1;
+                j = j + 1;
+            }
+        }
+        msgs.push(I2cMsg { addr: addr, flags: flags, len: len, data: data });
+        i = i + 1;
+    }
+    return msgs;
+}
+
+// ─── Fake devices ───────────────────────────────────────────────────────
+
+/// A register-pointer device: the first `reg_width` bytes of a write set
+/// the pointer (big-endian), further bytes are stored at the pointer and
+/// advance it; a read returns bytes from the pointer, advancing it. If
+/// `queue` is not empty a read takes its bytes from the queue first (a
+/// command device such as the SHT3x answers that way).
+pub struct I2cFakeDev {
+    pub addr: i64,
+    pub ten_bit: bool,
+    pub reg_width: i64,
+    pub regs: Vec<i64>,
+    pub ptr: i64,
+    pub queue: Vec<i64>,
+    pub written: Vec<i64>,
+}
+
+pub fn i2c_fake_dev(addr: i64, nregs: i64) -> I2cFakeDev {
+    return I2cFakeDev { addr: addr, ten_bit: false, reg_width: 1, regs: Vec::filled(nregs, 0), ptr: 0, queue: Vec::new(), written: Vec::new() };
+}
+
+/// A device with a 16-bit register pointer (24Cxx EEPROM style).
+pub fn i2c_fake_dev16(addr: i64, nregs: i64) -> I2cFakeDev {
+    return I2cFakeDev { addr: addr, ten_bit: false, reg_width: 2, regs: Vec::filled(nregs, 0), ptr: 0, queue: Vec::new(), written: Vec::new() };
+}
+
+pub fn i2c_fake_dev_ten(addr: i64, nregs: i64) -> I2cFakeDev {
+    return I2cFakeDev { addr: addr, ten_bit: true, reg_width: 1, regs: Vec::filled(nregs, 0), ptr: 0, queue: Vec::new(), written: Vec::new() };
+}
+
+pub fn i2c_fake_dev_set(d: & mut I2cFakeDev, reg: i64, bytes: Vec<i64>) {
+    var i: i64 = 0;
+    while i < bytes.len() {
+        val r: i64 = (reg + i) % d.regs.len();
+        d.regs.set(r, bytes.get(i) & 0xFF);
+        i = i + 1;
+    }
+}
+
+// ─── The bus ────────────────────────────────────────────────────────────
+
+pub struct I2cBus {
+    pub kind: i64,
+    pub handle: i64,
+    pub xfer: fn(i64, Vec<i64>) -> Vec<i64>,
+    pub devs: Vec<I2cFakeDev>,
+    pub log: Vec<str>,
+}
+
+fn i2c_no_xfer(h: i64, req: Vec<i64>) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    r.push(0 - 19);
+    // ENODEV
+    return r;
+}
+
+pub fn i2c_bus_fake() -> I2cBus {
+    return I2cBus { kind: I2C_BUS_FAKE, handle: 0, xfer: i2c_no_xfer, devs: Vec::new(), log: Vec::new() };
+}
+
+/// A bus driven by your own transport (a bare-metal controller driver):
+/// xfer(handle, i2c_encode_request(msgs)) returns [0, read bytes...] or
+/// [negative error].
+pub fn i2c_bus_custom(handle: i64, xfer: fn(i64, Vec<i64>) -> Vec<i64>) -> I2cBus {
+    return I2cBus { kind: I2C_BUS_FN, handle: handle, xfer: xfer, devs: Vec::new(), log: Vec::new() };
+}
+
+pub fn i2c_fake_add(bus: & mut I2cBus, d: I2cFakeDev) {
+    bus.devs.push(d);
+}
+
+fn i2c_fake_find(bus: & I2cBus, addr: i64, ten: bool) -> i64 {
+    var i: i64 = 0;
+    while i < bus.devs.len() {
+        val d: I2cFakeDev = bus.devs.get(i);
+        if d.addr == addr && d.ten_bit == ten {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// The fake device at an address (a copy), for checking what was written.
+pub fn i2c_fake_get(bus: & I2cBus, addr: i64) -> I2cFakeDev {
+    var i: i64 = i2c_fake_find(bus, addr, false);
+    if i < 0 {
+        i = i2c_fake_find(bus, addr, true);
+    }
+    if i < 0 {
+        return i2c_fake_dev(addr, 1);
+    }
+    return bus.devs.get(i);
+}
+
+pub fn i2c_fake_put(bus: & mut I2cBus, d: I2cFakeDev) {
+    val i: i64 = i2c_fake_find(bus, d.addr, d.ten_bit);
+    if i >= 0 {
+        bus.devs.set(i, d);
+    } else {
+        bus.devs.push(d);
+    }
+}
+
+fn i2c_hex2(b: i64) -> str {
+    val digits: str = "0123456789ABCDEF";
+    return char_to_str(str_byte_at(digits, (b >> 4) & 15)) + char_to_str(str_byte_at(digits, b & 15));
+}
+
+fn i2c_log_line(m: & I2cMsg, bytes: & Vec<i64>) -> str {
+    var s: str = "W";
+    if (m.flags & I2C_M_RD) != 0 {
+        s = "R";
+    }
+    s = s + " " + int_to_str(m.addr) + " [";
+    var i: i64 = 0;
+    while i < bytes.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + i2c_hex2(bytes.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+fn i2c_fake_transfer(bus: & mut I2cBus, msgs: & Vec<I2cMsg>) -> Result<Vec<i64>, str> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < msgs.len() {
+        val m: I2cMsg = msgs.get(i);
+        val ten: bool = (m.flags & I2C_M_TEN) != 0;
+        val di: i64 = i2c_fake_find(bus, m.addr, ten);
+        if di < 0 {
+            bus.log.push("NAK " + int_to_str(m.addr));
+            if (m.flags & I2C_M_IGNORE_NAK) == 0 {
+                return Result::Err("no ACK from address " + int_to_str(m.addr));
+            }
+        } else {
+            var d: I2cFakeDev = bus.devs.get(di);
+            if (m.flags & I2C_M_RD) != 0 {
+                var got: Vec<i64> = Vec::new();
+                var j: i64 = 0;
+                while j < m.len {
+                    if d.queue.len() > 0 {
+                        got.push(d.queue.get(0));
+                        d.queue.remove(0);
+                    } else {
+                        got.push(d.regs.get(d.ptr));
+                        d.ptr = (d.ptr + 1) % d.regs.len();
+                    }
+                    j = j + 1;
+                }
+                bus.log.push(i2c_log_line(& m, & got));
+                var k: i64 = 0;
+                while k < got.len() {
+                    out.push(got.get(k));
+                    k = k + 1;
+                }
+            } else {
+                var j: i64 = 0;
+                var p: i64 = 0;
+                while j < m.data.len() {
+                    val b: i64 = m.data.get(j) & 0xFF;
+                    d.written.push(b);
+                    if j < d.reg_width {
+                        p = (p << 8) | b;
+                        if j == d.reg_width - 1 {
+                            d.ptr = p % d.regs.len();
+                        }
+                    } else {
+                        d.regs.set(d.ptr, b);
+                        d.ptr = (d.ptr + 1) % d.regs.len();
+                    }
+                    j = j + 1;
+                }
+                bus.log.push(i2c_log_line(& m, & m.data));
+            }
+            bus.devs.set(di, d);
+        }
+        i = i + 1;
+    }
+    return Result::Ok(out);
+}
+
+/// Run one combined transaction (START, messages joined by repeated
+/// starts, STOP). The result holds the bytes of every read message, in
+/// order.
+pub fn i2c_transfer(bus: & mut I2cBus, msgs: Vec<I2cMsg>) -> Result<Vec<i64>, str> {
+    if msgs.len() == 0 {
+        return Result::Ok(Vec::new());
+    }
+    if msgs.len() > I2C_RDWR_MAX_MSGS {
+        return Result::Err("too many messages in one transfer");
+    }
+    if bus.kind == I2C_BUS_FAKE {
+        return i2c_fake_transfer(bus, & msgs);
+    }
+    val f = bus.xfer;
+    val reply: Vec<i64> = f(bus.handle, i2c_encode_request(& msgs));
+    if reply.len() == 0 {
+        return Result::Err("transport gave no status");
+    }
+    if reply.get(0) < 0 {
+        return Result::Err("transfer failed, error " + int_to_str(0 - reply.get(0)));
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i < reply.len() {
+        out.push(reply.get(i) & 0xFF);
+        i = i + 1;
+    }
+    return Result::Ok(out);
+}
+
+// ─── Transfers and register helpers ─────────────────────────────────────
+
+pub fn i2c_write(bus: & mut I2cBus, addr: i64, data: Vec<i64>) -> Result<Vec<i64>, str> {
+    var msgs: Vec<I2cMsg> = Vec::new();
+    msgs.push(i2c_msg_write(addr, data));
+    return i2c_transfer(bus, msgs);
+}
+
+pub fn i2c_read(bus: & mut I2cBus, addr: i64, n: i64) -> Result<Vec<i64>, str> {
+    var msgs: Vec<I2cMsg> = Vec::new();
+    msgs.push(i2c_msg_read(addr, n));
+    return i2c_transfer(bus, msgs);
+}
+
+/// Write `out`, repeated START, read n bytes: the usual register read.
+pub fn i2c_write_read(bus: & mut I2cBus, addr: i64, out: Vec<i64>, n: i64) -> Result<Vec<i64>, str> {
+    var msgs: Vec<I2cMsg> = Vec::new();
+    msgs.push(i2c_msg_write(addr, out));
+    msgs.push(i2c_msg_read(addr, n));
+    return i2c_transfer(bus, msgs);
+}
+
+/// The same with a 10-bit address.
+pub fn i2c_write_read10(bus: & mut I2cBus, addr: i64, out: Vec<i64>, n: i64) -> Result<Vec<i64>, str> {
+    var msgs: Vec<I2cMsg> = Vec::new();
+    msgs.push(i2c_msg_ten(i2c_msg_write(addr, out)));
+    msgs.push(i2c_msg_ten(i2c_msg_read(addr, n)));
+    return i2c_transfer(bus, msgs);
+}
+
+fn i2c_one(reg: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(reg & 0xFF);
+    return v;
+}
+
+/// Read n registers starting at reg (auto-increment).
+pub fn i2c_read_regs(bus: & mut I2cBus, addr: i64, reg: i64, n: i64) -> Result<Vec<i64>, str> {
+    return i2c_write_read(bus, addr, i2c_one(reg), n);
+}
+
+/// Read one 8-bit register; -1 when the device does not answer.
+pub fn i2c_read_reg8(bus: & mut I2cBus, addr: i64, reg: i64) -> i64 {
+    match i2c_read_regs(bus, addr, reg, 1) {
+        Result::Ok(b) => {
+            return b.get(0);
+        }
+        Result::Err(_) => {
+            return 0 - 1;
+        }
+    }
+}
+
+/// 16-bit register, most significant byte first; -1 on error.
+pub fn i2c_read_reg16_be(bus: & mut I2cBus, addr: i64, reg: i64) -> i64 {
+    match i2c_read_regs(bus, addr, reg, 2) {
+        Result::Ok(b) => {
+            return (b.get(0) << 8) | b.get(1);
+        }
+        Result::Err(_) => {
+            return 0 - 1;
+        }
+    }
+}
+
+/// 16-bit register, least significant byte first; -1 on error.
+pub fn i2c_read_reg16_le(bus: & mut I2cBus, addr: i64, reg: i64) -> i64 {
+    match i2c_read_regs(bus, addr, reg, 2) {
+        Result::Ok(b) => {
+            return b.get(0) | (b.get(1) << 8);
+        }
+        Result::Err(_) => {
+            return 0 - 1;
+        }
+    }
+}
+
+pub fn i2c_write_reg8(bus: & mut I2cBus, addr: i64, reg: i64, value: i64) -> bool {
+    var d: Vec<i64> = Vec::new();
+    d.push(reg & 0xFF);
+    d.push(value & 0xFF);
+    match i2c_write(bus, addr, d) {
+        Result::Ok(_) => {
+            return true;
+        }
+        Result::Err(_) => {
+            return false;
+        }
+    }
+}
+
+pub fn i2c_write_reg16_be(bus: & mut I2cBus, addr: i64, reg: i64, value: i64) -> bool {
+    var d: Vec<i64> = Vec::new();
+    d.push(reg & 0xFF);
+    d.push((value >> 8) & 0xFF);
+    d.push(value & 0xFF);
+    match i2c_write(bus, addr, d) {
+        Result::Ok(_) => {
+            return true;
+        }
+        Result::Err(_) => {
+            return false;
+        }
+    }
+}
+
+pub fn i2c_write_regs(bus: & mut I2cBus, addr: i64, reg: i64, values: Vec<i64>) -> bool {
+    var d: Vec<i64> = Vec::new();
+    d.push(reg & 0xFF);
+    var i: i64 = 0;
+    while i < values.len() {
+        d.push(values.get(i) & 0xFF);
+        i = i + 1;
+    }
+    match i2c_write(bus, addr, d) {
+        Result::Ok(_) => {
+            return true;
+        }
+        Result::Err(_) => {
+            return false;
+        }
+    }
+}
+
+/// Read-modify-write: the bits in mask take the bits of value.
+pub fn i2c_update_bits(bus: & mut I2cBus, addr: i64, reg: i64, mask: i64, value: i64) -> bool {
+    val old: i64 = i2c_read_reg8(bus, addr, reg);
+    if old < 0 {
+        return false;
+    }
+    val new: i64 = (old & (0xFF ^ (mask & 0xFF))) | (value & mask & 0xFF);
+    if new == old {
+        return true;
+    }
+    return i2c_write_reg8(bus, addr, reg, new);
+}
+
+/// Read n bytes from a device with a 16-bit register pointer.
+pub fn i2c_read_a16(bus: & mut I2cBus, addr: i64, reg: i64, n: i64) -> Result<Vec<i64>, str> {
+    var d: Vec<i64> = Vec::new();
+    d.push((reg >> 8) & 0xFF);
+    d.push(reg & 0xFF);
+    return i2c_write_read(bus, addr, d, n);
+}
+
+pub fn i2c_write_a16(bus: & mut I2cBus, addr: i64, reg: i64, values: Vec<i64>) -> bool {
+    var d: Vec<i64> = Vec::new();
+    d.push((reg >> 8) & 0xFF);
+    d.push(reg & 0xFF);
+    var i: i64 = 0;
+    while i < values.len() {
+        d.push(values.get(i) & 0xFF);
+        i = i + 1;
+    }
+    match i2c_write(bus, addr, d) {
+        Result::Ok(_) => {
+            return true;
+        }
+        Result::Err(_) => {
+            return false;
+        }
+    }
+}
+
+/// Probe every usable 7-bit address with a one-byte read, as i2cdetect -r
+/// does; the addresses that answer, in order.
+pub fn i2c_scan(bus: & mut I2cBus) -> Vec<i64> {
+    var found: Vec<i64> = Vec::new();
+    var a: i64 = 0x08;
+    while a <= 0x77 {
+        match i2c_read(bus, a, 1) {
+            Result::Ok(_) => {
+                found.push(a);
+            }
+            Result::Err(_) => {
+            }
+        }
+        a = a + 1;
+    }
+    return found;
+}
+
+// ─── SMBus PEC ──────────────────────────────────────────────────────────
+
+/// CRC-8 with polynomial 0x07, initial value 0 (SMBus packet error code).
+pub fn i2c_crc8_smbus(bytes: & Vec<i64>) -> i64 {
+    var crc: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        crc = crc ^ (bytes.get(i) & 0xFF);
+        var b: i64 = 0;
+        while b < 8 {
+            if (crc & 0x80) != 0 {
+                crc = ((crc << 1) ^ 0x07) & 0xFF;
+            } else {
+                crc = (crc << 1) & 0xFF;
+            }
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+/// PEC of an SMBus "read byte/word/block" transaction: the CRC covers the
+/// write address byte, the command, the read address byte and the data.
+pub fn i2c_smbus_pec_read(addr: i64, cmd: i64, data: & Vec<i64>) -> i64 {
+    var all: Vec<i64> = Vec::new();
+    all.push((addr << 1) & 0xFE);
+    all.push(cmd & 0xFF);
+    all.push(((addr << 1) | 1) & 0xFF);
+    var i: i64 = 0;
+    while i < data.len() {
+        all.push(data.get(i));
+        i = i + 1;
+    }
+    return i2c_crc8_smbus(& all);
+}
+
+/// PEC of an SMBus write: address byte, command, data.
+pub fn i2c_smbus_pec_write(addr: i64, cmd: i64, data: & Vec<i64>) -> i64 {
+    var all: Vec<i64> = Vec::new();
+    all.push((addr << 1) & 0xFE);
+    all.push(cmd & 0xFF);
+    var i: i64 = 0;
+    while i < data.len() {
+        all.push(data.get(i));
+        i = i + 1;
+    }
+    return i2c_crc8_smbus(& all);
+}
+
+// ─── Linux I2C_RDWR memory image ────────────────────────────────────────
+
+fn i2c_put_le(out: & mut Vec<i64>, off: i64, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.set(off + i, (v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+/// Bytes needed by i2c_rdwr_image for these messages.
+pub fn i2c_rdwr_size(msgs: & Vec<I2cMsg>) -> i64 {
+    var n: i64 = 16 + 16 * msgs.len();
+    var i: i64 = 0;
+    while i < msgs.len() {
+        n = n + msgs.get(i).len;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The bytes of an I2C_RDWR argument placed at address `base` (LP64):
+///   0: struct i2c_rdwr_ioctl_data { struct i2c_msg *msgs; __u32 nmsgs; }
+///  16: struct i2c_msg { __u16 addr; __u16 flags; __u16 len; __u8 *buf; }[n]
+///      (16 bytes each: addr@0 flags@2 len@4 buf@8)
+///   then each message's buffer (write data, or room for the read).
+pub fn i2c_rdwr_image(msgs: & Vec<I2cMsg>, base: i64) -> Vec<i64> {
+    var img: Vec<i64> = Vec::filled(i2c_rdwr_size(msgs), 0);
+    i2c_put_le(& mut img, 0, base + 16, 8);
+    i2c_put_le(& mut img, 8, msgs.len(), 4);
+    var buf_off: i64 = 16 + 16 * msgs.len();
+    var i: i64 = 0;
+    while i < msgs.len() {
+        val m: I2cMsg = msgs.get(i);
+        val mo: i64 = 16 + 16 * i;
+        i2c_put_le(& mut img, mo, m.addr, 2);
+        i2c_put_le(& mut img, mo + 2, m.flags, 2);
+        i2c_put_le(& mut img, mo + 4, m.len, 2);
+        i2c_put_le(& mut img, mo + 8, base + buf_off, 8);
+        if (m.flags & I2C_M_RD) == 0 {
+            var j: i64 = 0;
+            while j < m.len {
+                img.set(buf_off + j, m.data.get(j) & 0xFF);
+                j = j + 1;
+            }
+        }
+        buf_off = buf_off + m.len;
+        i = i + 1;
+    }
+    return img;
+}
+
+/// After the ioctl: the read messages' bytes, taken from the image.
+pub fn i2c_rdwr_reads(msgs: & Vec<I2cMsg>, img: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var buf_off: i64 = 16 + 16 * msgs.len();
+    var i: i64 = 0;
+    while i < msgs.len() {
+        val m: I2cMsg = msgs.get(i);
+        if (m.flags & I2C_M_RD) != 0 {
+            var j: i64 = 0;
+            while j < m.len {
+                out.push(img.get(buf_off + j));
+                j = j + 1;
+            }
+        }
+        buf_off = buf_off + m.len;
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A C int result widened to i64 (the declarations return 64 bits; the
+/// functions return int).
+pub fn i2c_c_int(r: i64) -> i64 {
+    val w: i64 = r & 0xFFFFFFFF;
+    if w >= 0x80000000 {
+        return w - 0x100000000;
+    }
+    return w;
+}
+
+/// The Linux transport: req is i2c_encode_request(msgs), handle the fd.
+@cfg(linux)
+pub fn i2c_linux_xfer(fd: i64, req: Vec<i64>) -> Vec<i64> {
+    val msgs: Vec<I2cMsg> = i2c_decode_request(& req);
+    var reply: Vec<i64> = Vec::new();
+    val n: i64 = i2c_rdwr_size(& msgs);
+    unsafe {
+        val base: i64 = p_malloc(n);
+        if base == 0 {
+            reply.push(0 - 12);
+            return reply;
+        }
+        val img: Vec<i64> = i2c_rdwr_image(& msgs, base);
+        var i: i64 = 0;
+        while i < n {
+            p_volatile_store8(base + i, img.get(i));
+            i = i + 1;
+        }
+        val r: i64 = i2c_c_int(i2c_sys_ioctl(fd, I2C_RDWR, base));
+        if r < 0 {
+            p_free(base);
+            reply.push(0 - 5);
+            return reply;
+        }
+        var back: Vec<i64> = Vec::new();
+        i = 0;
+        while i < n {
+            back.push(p_volatile_load8(base + i) & 0xFF);
+            i = i + 1;
+        }
+        p_free(base);
+        reply.push(0);
+        val reads: Vec<i64> = i2c_rdwr_reads(& msgs, & back);
+        var k: i64 = 0;
+        while k < reads.len() {
+            reply.push(reads.get(k));
+            k = k + 1;
+        }
+    }
+    return reply;
+}
+
+/// Open /dev/i2c-<n> as a bus.
+@cfg(linux)
+pub fn i2c_linux_open(n: i64) -> Result<I2cBus, str> {
+    val path: str = "/dev/i2c-" + int_to_str(n);
+    var fd: i64 = 0 - 1;
+    unsafe {
+        fd = i2c_c_int(i2c_sys_open(path, I2C_O_RDWR));
+    }
+    if fd < 0 {
+        return Result::Err("cannot open " + path);
+    }
+    return Result::Ok(I2cBus { kind: I2C_BUS_FN, handle: fd, xfer: i2c_linux_xfer, devs: Vec::new(), log: Vec::new() });
+}
+
+@cfg(linux)
+pub fn i2c_linux_close(bus: & mut I2cBus) {
+    if bus.kind == I2C_BUS_FN && bus.handle >= 0 {
+        unsafe {
+            i2c_sys_close(bus.handle);
+        }
+        bus.handle = 0 - 1;
+    }
+}

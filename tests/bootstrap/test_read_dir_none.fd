@@ -1,0 +1,54 @@
+// read_file of a directory is None on every backend (release F4): the
+// machine layer's Linux runtime (stdlib/linux_runtime/base.fd
+// pert_file_read) checks the mode first, as `fid run` and the C runtime
+// give no file. Before, a directory opened and its huge ext4 end offset
+// became the allocation size (a panic in p_str_alloc), or an empty
+// directory size read as Some(""). Both an empty directory and one with a
+// file in it; the directory lives in a fresh directory under the system
+// temp directory, removed at the end.
+//
+// Expected output:
+// empty dir: None
+// full dir: None
+// file: Some, length 2
+// still a dir: true
+// removed: true
+use fs;
+use env;
+use path;
+
+fn temp_base() -> str {
+    var t: str = env_get("TEMP");
+    if str_len(t) > 0 && fs_is_dir(t) { return t; }
+    t = env_get("TMPDIR");
+    if str_len(t) > 0 && fs_is_dir(t) { return t; }
+    if fs_is_dir("/tmp") { return "/tmp"; }
+    return ".";
+}
+
+fn show(label: str, path: str) {
+    match read_file(path) {
+        Option::Some(text) => {
+            println(label + ": Some, length " + int_to_str(str_len(text)));
+        }
+        Option::None => {
+            println(label + ": None");
+        }
+    }
+}
+
+fn main() -> i64 {
+    val root: str = fs_temp_dir(temp_base(), "read_dir");
+    val empty: str = path_join(root, "empty");
+    fs_mkdir(empty);
+    show("empty dir", empty);
+    val full: str = path_join(root, "full");
+    fs_mkdir(full);
+    val f: str = path_join(full, "f.txt");
+    fs_write_text(f, "hi");
+    show("full dir", full);
+    show("file", f);
+    println("still a dir: " + bool_to_str(fs_is_dir(full)));
+    println("removed: " + bool_to_str(fs_rmdir_all(root)));
+    return 0;
+}

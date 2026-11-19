@@ -1,0 +1,44 @@
+// MI17 (llvm roadmap): parity of `fid emit --nat` with `fid run`. A call
+// of a runtime builtin is not merged with an earlier identical one when a
+// write lies between them. The mid-end's pure-call merging (rules.fd
+// purecse) saw `p_tls_get` as a function the module does not define, with
+// no effects, so `sync_tls_get` looked pure and the second and third
+// lookups below reused the first one's 0 (test_new_features failed the
+// same way on the machine layer). The runtime's own body of the builtin
+// (pert_tls_get, merged into native builds) is what its calls do.
+// The same held for any builtin wrapped in a function of the program:
+// two random words through `rnd` were one.
+// Expected output:
+// 0
+// 42
+// 100
+// 7
+// random words differ
+use sync;
+
+fn rnd() -> i64 {
+    return p_os_random_u64();
+}
+
+fn twice(key: i64) -> i64 {
+    sync_tls_set(key, 7);
+    return sync_tls_get(key);
+}
+
+fn main() -> i64 {
+    val key = sync_tls_create();
+    println(sync_tls_get(key));
+    sync_tls_set(key, 42);
+    println(sync_tls_get(key));
+    sync_tls_set(key, 100);
+    println(sync_tls_get(key));
+    println(twice(key));
+    val a: i64 = rnd();
+    val b: i64 = rnd();
+    if a != b {
+        println("random words differ");
+    } else {
+        println("random words merged");
+    }
+    return 0;
+}

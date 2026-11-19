@@ -437,3 +437,315 @@ pub fn iter_chunk(v: Vec<i64>, size: i64) -> Vec<Vec<i64>> {
     }
     return result;
 }
+
+// ─── Zip / enumerate / windows ──────────────────────────────────────────
+
+/// Pair up two Vecs element-wise into a Vec of [a_i, b_i] pairs.
+/// Stops at the shorter input.
+///
+/// Example:
+///   var z = iter_zip(iter_range(0, 3), iter_range(10, 13));
+///   var p: Vec<i64> = z.get(1);
+///   assert_eq(p.get(0), 1);
+///   assert_eq(p.get(1), 11);
+pub fn iter_zip(a: Vec<i64>, b: Vec<i64>) -> Vec<Vec<i64>> {
+    var result = Vec::new();
+    var n = a.len();
+    if b.len() < n {
+        n = b.len();
+    }
+    var i = 0;
+    while i < n {
+        var pair = Vec::new();
+        pair.push(a.get(i));
+        pair.push(b.get(i));
+        result.push(pair);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Pair each element with its index: a Vec of [index, value] pairs.
+///
+/// Example:
+///   var e = iter_enumerate(iter_range(5, 8));
+///   var p: Vec<i64> = e.get(2);
+///   assert_eq(p.get(0), 2);
+///   assert_eq(p.get(1), 7);
+pub fn iter_enumerate(v: Vec<i64>) -> Vec<Vec<i64>> {
+    var result = Vec::new();
+    var i = 0;
+    while i < v.len() {
+        var pair = Vec::new();
+        pair.push(i);
+        pair.push(v.get(i));
+        result.push(pair);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Sliding windows of `size` elements as a Vec of Vecs.
+///
+/// Example:
+///   var w = iter_windows(iter_range(0, 4), 3);
+///   assert_eq(w.len(), 2);
+///   var w1: Vec<i64> = w.get(1);
+///   assert_eq(w1.get(0), 1);
+pub fn iter_windows(v: Vec<i64>, size: i64) -> Vec<Vec<i64>> {
+    var result = Vec::new();
+    if size <= 0 || size > v.len() {
+        return result;
+    }
+    var i = 0;
+    while i + size <= v.len() {
+        var win = Vec::new();
+        var j = 0;
+        while j < size {
+            win.push(v.get(i + j));
+            j = j + 1;
+        }
+        result.push(win);
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── flat_map / while adapters ──────────────────────────────────────────
+
+/// Map each element to a Vec and flatten the results.
+///
+/// Example:
+///   var r = iter_flat_map(iter_range(0, 3), fn(x: i64) -> Vec<i64> {
+///     var p: Vec<i64> = Vec::new();
+///     p.push(x); p.push(x * 10);
+///     return p;
+///   });
+///   assert_eq(r.len(), 6);
+///   assert_eq(r.get(3), 10);
+pub fn iter_flat_map(v: Vec<i64>, f: fn(i64) -> Vec<i64>) -> Vec<i64> {
+    var result = Vec::new();
+    var i = 0;
+    while i < v.len() {
+        var inner = f(v.get(i));
+        var j = 0;
+        while j < inner.len() {
+            result.push(inner.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Take elements while a predicate holds (stops at the first failure).
+///
+/// Example:
+///   var t = iter_take_while(iter_range(0, 10), fn(x: i64) -> bool { x < 3 });
+///   assert_eq(t.len(), 3);
+pub fn iter_take_while(v: Vec<i64>, pred: fn(i64) -> bool) -> Vec<i64> {
+    var result = Vec::new();
+    var i = 0;
+    var done = false;
+    while i < v.len() && !done {
+        if pred(v.get(i)) {
+            result.push(v.get(i));
+        } else {
+            done = true;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Skip elements while a predicate holds, return the rest.
+///
+/// Example:
+///   var s = iter_skip_while(iter_range(0, 10), fn(x: i64) -> bool { x < 3 });
+///   assert_eq(s.len(), 7);
+///   assert_eq(s.get(0), 3);
+pub fn iter_skip_while(v: Vec<i64>, pred: fn(i64) -> bool) -> Vec<i64> {
+    var result = Vec::new();
+    var i = 0;
+    while i < v.len() && pred(v.get(i)) {
+        i = i + 1;
+    }
+    while i < v.len() {
+        result.push(v.get(i));
+        i = i + 1;
+    }
+    return result;
+}
+
+// ─── Option-returning search / reduce ───────────────────────────────────
+
+/// The index of the first element matching a predicate, or Option::None.
+///
+/// Example:
+///   match iter_position(iter_range(0, 10), fn(x: i64) -> bool { x * x > 20 }) {
+///     Option::Some(i) => { assert_eq(i, 5); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_position(v: Vec<i64>, pred: fn(i64) -> bool) -> Option<i64> {
+    var i = 0;
+    while i < v.len() {
+        if pred(v.get(i)) {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// The index of the first element equal to `value`, or Option::None.
+///
+/// Example:
+///   match iter_find_opt(iter_range(10, 15), 12) {
+///     Option::Some(i) => { assert_eq(i, 2); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_find_opt(v: Vec<i64>, value: i64) -> Option<i64> {
+    var i = 0;
+    while i < v.len() {
+        if v.get(i) == value {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// The element at index `n`, or Option::None when out of range.
+///
+/// Example:
+///   match iter_nth(iter_range(5, 9), 2) {
+///     Option::Some(x) => { assert_eq(x, 7); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_nth(v: Vec<i64>, n: i64) -> Option<i64> {
+    if n < 0 || n >= v.len() {
+        return Option::None;
+    }
+    return Option::Some(v.get(n));
+}
+
+/// The last element, or Option::None if empty.
+///
+/// Example:
+///   match iter_last(iter_range(5, 9)) {
+///     Option::Some(x) => { assert_eq(x, 8); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_last(v: Vec<i64>) -> Option<i64> {
+    if v.is_empty() {
+        return Option::None;
+    }
+    return Option::Some(v.last());
+}
+
+/// The minimum element, or Option::None if empty.
+///
+/// Example:
+///   match iter_min_opt(iter_range(3, 9)) {
+///     Option::Some(m) => { assert_eq(m, 3); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_min_opt(v: Vec<i64>) -> Option<i64> {
+    if v.is_empty() {
+        return Option::None;
+    }
+    return Option::Some(iter_min(v));
+}
+
+/// The maximum element, or Option::None if empty.
+///
+/// Example:
+///   match iter_max_opt(iter_range(3, 9)) {
+///     Option::Some(m) => { assert_eq(m, 8); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_max_opt(v: Vec<i64>) -> Option<i64> {
+    if v.is_empty() {
+        return Option::None;
+    }
+    return Option::Some(iter_max(v));
+}
+
+/// The minimum element by a comparator (negative when a < b), or
+/// Option::None if empty.
+///
+/// Example:
+///   var v: Vec<i64> = Vec::new();
+///   v.push(30); v.push(12); v.push(21);
+///   match iter_min_by(v, fn(a: i64, b: i64) -> i64 { a - b }) {
+///     Option::Some(m) => { assert_eq(m, 12); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_min_by(v: Vec<i64>, cmp: fn(i64, i64) -> i64) -> Option<i64> {
+    if v.is_empty() {
+        return Option::None;
+    }
+    var m = v.get(0);
+    var i = 1;
+    while i < v.len() {
+        if cmp(v.get(i), m) < 0 {
+            m = v.get(i);
+        }
+        i = i + 1;
+    }
+    return Option::Some(m);
+}
+
+/// The maximum element by a comparator, or Option::None if empty.
+///
+/// Example:
+///   var v: Vec<i64> = Vec::new();
+///   v.push(30); v.push(12); v.push(21);
+///   match iter_max_by(v, fn(a: i64, b: i64) -> i64 { a - b }) {
+///     Option::Some(m) => { assert_eq(m, 30); }
+///     Option::None => { assert(false); }
+///   }
+pub fn iter_max_by(v: Vec<i64>, cmp: fn(i64, i64) -> i64) -> Option<i64> {
+    if v.is_empty() {
+        return Option::None;
+    }
+    var m = v.get(0);
+    var i = 1;
+    while i < v.len() {
+        if cmp(v.get(i), m) > 0 {
+            m = v.get(i);
+        }
+        i = i + 1;
+    }
+    return Option::Some(m);
+}
+
+// ─── Misc ───────────────────────────────────────────────────────────────
+
+/// A reversed copy of a Vec.
+///
+/// Example:
+///   var r = iter_rev(iter_range(0, 3));
+///   assert_eq(r.get(0), 2);
+///   assert_eq(r.get(2), 0);
+pub fn iter_rev(v: Vec<i64>) -> Vec<i64> {
+    var result = Vec::new();
+    var i = v.len();
+    while i > 0 {
+        i = i - 1;
+        result.push(v.get(i));
+    }
+    return result;
+}
+
+/// Apply a function to each element for its side effect.
+///
+/// Example:
+///   iter_for_each(iter_range(0, 3), fn(x: i64) -> void { println(x); });
+pub fn iter_for_each(v: Vec<i64>, f: fn(i64) -> void) -> void {
+    var i = 0;
+    while i < v.len() {
+        f(v.get(i));
+        i = i + 1;
+    }
+}

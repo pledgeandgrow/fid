@@ -1,0 +1,224 @@
+// roadmap L4H: Command::spawn -> Child, a child started without a shell
+// with pipes to its stdin / stdout / stderr (stdlib/process.fd
+// process_spawn_io and the runtimes' fid_proc_spawn_io / write / read /
+// close_in). What it checks: input written through the stdin pipe and
+// output read back (sort); Command::stdin data handed over at the start;
+// stdout and stderr read apart with the exit code; stderr_to_stdout; the
+// environment and working directory; a write to a child without a stdin
+// pipe; a program that does not exist; the low-level process_spawn_io.
+// Each child is a program the system has (sort, sh / cmd), so the commands
+// differ between Windows and POSIX but the output does not. `fid run` has
+// no live pipes: it starts the child at the first read or wait, with what
+// was written before as its input, which is all this test needs. (Each
+// input to sort has an odd number of bytes: Windows' sort.exe reads a
+// short even-length input as UTF-16 text.)
+//
+// Expected output:
+// sorted: apple,fig,pear
+// stdin data: 1,2,30
+// stdout: out
+// stderr: err
+// exit code: 4
+// merged: a,b
+// env and dir: true
+// write without a pipe: false
+// missing program: true
+// low level: x,yy 0
+// done
+
+use process;
+
+fn temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TEMP");
+    names.push("TMP");
+    names.push("TMPDIR");
+    var i: i64 = 0;
+    while i < names.len() {
+        match env_var(names.get(i)) {
+            Option::Some(s) => {
+                if str_len(s) > 0 { return s; }
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+fn sep() -> str {
+    if process_is_windows() { return "\\"; }
+    return "/";
+}
+
+/// A command running `posix` (sh -c) or `win` (cmd /c).
+fn shell_cmd(posix: str, win: str) -> Command {
+    if process_is_windows() {
+        var c: Command = Command::new("cmd");
+        c.arg("/d");
+        c.arg("/c");
+        c.arg(win);
+        return c;
+    }
+    var p: Command = Command::new("sh");
+    p.arg("-c");
+    p.arg(posix);
+    return p;
+}
+
+/// The non-empty lines of `text`, each trimmed (Windows' "\r" too), joined
+/// by commas.
+fn lines(text: str) -> str {
+    val parts: Vec<str> = str_split(text, "\n");
+    var out: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        val l: str = str_trim(parts.get(i));
+        if str_len(l) > 0 {
+            if str_len(out) > 0 { out = out + ","; }
+            out = out + l;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    val tag: str = int_to_str(p_getpid());
+
+    // input through the stdin pipe, output read back
+    var s1: Command = Command::new("sort");
+    s1.pipe_stdin();
+    s1.pipe_stdout();
+    match s1.spawn() {
+        Option::Some(ch) => {
+            var c1: Child = ch;
+            c1.write("pear\n");
+            c1.write("apple\nfig\n");
+            c1.close_stdin();
+            val text: str = c1.read_all_stdout();
+            c1.wait();
+            c1.release();
+            println("sorted: " + lines(text));
+        }
+        Option::None => { println("sorted: did not start"); }
+    }
+
+    // Command::stdin: written at the start, then the input closed
+    var s2: Command = Command::new("sort");
+    s2.stdin("30\n1\n2\n");
+    s2.pipe_stdout();
+    match s2.spawn() {
+        Option::Some(ch2) => {
+            var c2: Child = ch2;
+            val t2: str = c2.read_all_stdout();
+            c2.wait();
+            c2.release();
+            println("stdin data: " + lines(t2));
+        }
+        Option::None => { println("stdin data: did not start"); }
+    }
+
+    // stdout and stderr apart, and the exit code
+    var s3: Command = shell_cmd("echo out; echo err 1>&2; exit 4", "echo out& echo err 1>&2& exit 4");
+    s3.pipe_stdout();
+    s3.pipe_stderr();
+    match s3.spawn() {
+        Option::Some(ch3) => {
+            var c3: Child = ch3;
+            val o3: str = c3.read_all_stdout();
+            val e3: str = c3.read_all_stderr();
+            val code3: i64 = c3.wait();
+            c3.release();
+            println("stdout: " + lines(o3));
+            println("stderr: " + lines(e3));
+            println("exit code: " + int_to_str(code3));
+        }
+        Option::None => { println("stdout/stderr: did not start"); }
+    }
+
+    // stderr where stdout goes
+    var s4: Command = shell_cmd("echo a; echo b 1>&2", "echo a& echo b 1>&2");
+    s4.pipe_stdout();
+    s4.stderr_to_stdout();
+    match s4.spawn() {
+        Option::Some(ch4) => {
+            var c4: Child = ch4;
+            val t4: str = c4.read_all_stdout();
+            c4.wait();
+            c4.release();
+            println("merged: " + lines(t4));
+        }
+        Option::None => { println("merged: did not start"); }
+    }
+
+    // environment and working directory
+    val dir: str = temp_dir() + sep() + "fid_pipes_dir_" + tag;
+    p_mkdir(dir);
+    var s5: Command = shell_cmd("echo $FID_PIPE_X; pwd", "echo %FID_PIPE_X%& cd");
+    s5.env("FID_PIPE_X", "abc def");
+    s5.cwd(dir);
+    s5.pipe_stdout();
+    match s5.spawn() {
+        Option::Some(ch5) => {
+            var c5: Child = ch5;
+            val t5: str = c5.read_all_stdout();
+            c5.wait();
+            c5.release();
+            println("env and dir: " + yes(str_contains(t5, "abc def") && str_contains(t5, "fid_pipes_dir_" + tag)));
+        }
+        Option::None => { println("env and dir: did not start"); }
+    }
+    p_rmdir(dir);
+
+    // no stdin pipe: a write is refused
+    var s6: Command = shell_cmd("exit 0", "exit 0");
+    s6.pipe_stdout();
+    match s6.spawn() {
+        Option::Some(ch6) => {
+            var c6: Child = ch6;
+            println("write without a pipe: " + yes(c6.write("x")));
+            c6.wait();
+            c6.release();
+        }
+        Option::None => { println("write without a pipe: did not start"); }
+    }
+
+    // a program that does not exist: no child (Windows), or one that
+    // exits with 127 (POSIX: the exec fails in the child; 9009 from cmd
+    // under `fid run` on Windows)
+    var s7: Command = Command::new("fid_no_such_program_" + tag);
+    s7.pipe_stdout();
+    match s7.spawn() {
+        Option::Some(ch7) => {
+            var c7: Child = ch7;
+            c7.read_all_stdout();
+            val code7: i64 = c7.wait();
+            c7.release();
+            println("missing program: " + yes(code7 == 127 || code7 == 9009));
+        }
+        Option::None => { println("missing program: true"); }
+    }
+
+    // the functions under Command::spawn
+    var argv: Vec<str> = Vec::new();
+    argv.push("sort");
+    val h: i64 = process_spawn_io(argv, Vec::new(), "", PROC_PIPE_STDIN | PROC_PIPE_STDOUT);
+    process_write(h, "yy\nx\n");
+    process_close_stdin(h);
+    val t8: str = process_read_all(h, PROC_STDOUT);
+    var code8: i64 = -1;
+    match process_wait(h, 30000) {
+        Option::Some(c) => { code8 = c; }
+        Option::None => { }
+    }
+    process_release(h);
+    println("low level: " + lines(t8) + " " + int_to_str(code8));
+    println("done");
+    return 0;
+}

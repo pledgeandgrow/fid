@@ -1,0 +1,146 @@
+// stdlib/state_machine: nested states with entry/exit order, guards, internal and self transitions, transition actions, timed transitions and do actions on an injected clock, shallow and deep history, run-to-completion of events emitted by an entry action, dropped events
+// Expected output:
+// start: enter:Off | Off
+// power: Off -> On on power, exit:Off, enter:On, enter:Idle | On/Idle
+// go (battery 10): drop:go | On/Idle
+// ping: Idle internal on ping | pings=1
+// go (battery 50): Idle -> Moving on go, exit:Idle, enter:Moving, enter:Slow | On/Moving/Slow go actions=1
+// t=400: (nothing) | On/Moving/Slow
+// t=650: Slow -> Fast on after 500ms, exit:Slow, enter:Fast | On/Moving/Fast do=2
+// kick: Fast -> Fast on kick, exit:Fast, enter:Fast | On/Moving/Fast
+// power: On -> Off on power, exit:Fast, exit:Moving, exit:On, enter:Off | Off
+// power (shallow): Off -> On on power, exit:Off, enter:On, enter:Moving, enter:Slow | On/Moving/Slow
+// power x2 (deep): On/Moving/Fast
+// fault: On -> Error on fault, exit:Fast, exit:Moving, exit:On, enter:On, enter:Error, Error -> Idle on reset, exit:Error, enter:Idle | On/Idle
+// jump, stop: drop:jump, drop:stop | On/Idle in On=true in Moving=false
+// events processed=2
+use state_machine;
+
+var g_battery: i64 = 50;
+var g_pings: i64 = 0;
+var g_go: i64 = 0;
+var g_do: i64 = 0;
+
+// Named functions, not closures: a closure copies the globals it reads
+// when it is made (an interpreter bug), so it would not see g_battery change.
+fn battery_ok(c: i64) -> i64 {
+    if g_battery > 20 {
+        return 1;
+    }
+    return 0;
+}
+
+fn count_go(c: i64) -> i64 {
+    g_go = g_go + 1;
+    return 0;
+}
+
+fn count_ping(c: i64) -> i64 {
+    g_pings = g_pings + c - 6;
+    return 0;
+}
+
+fn count_do(c: i64) -> i64 {
+    g_do = g_do + 1;
+    return 0;
+}
+
+fn show(m: & mut Hsm, label: str) {
+    var l: str = hsm_take_log(m);
+    if str_len(l) == 0 {
+        l = "(nothing)";
+    }
+    println(label + ": " + l + " | " + hsm_path(m));
+}
+
+fn main() -> i64 {
+    var m: Hsm = hsm_new(7);
+    val off: i64 = hsm_add_state(&mut m, "Off", -1);
+    val on: i64 = hsm_add_state(&mut m, "On", -1);
+    hsm_set_history(&mut m, on, HSM_SHALLOW);
+    val idle: i64 = hsm_add_state(&mut m, "Idle", on);
+    val moving: i64 = hsm_add_state(&mut m, "Moving", on);
+    val slow: i64 = hsm_add_state(&mut m, "Slow", moving);
+    val fast: i64 = hsm_add_state(&mut m, "Fast", moving);
+    val err: i64 = hsm_add_state(&mut m, "Error", on);
+    hsm_add_transition(&mut m, off, on, "power");
+    hsm_add_transition(&mut m, on, off, "power");
+    val tgo: i64 = hsm_add_transition(&mut m, idle, moving, "go");
+    hsm_set_guard(&mut m, tgo, battery_ok);
+    hsm_set_action(&mut m, tgo, count_go);
+    hsm_add_transition(&mut m, slow, fast, "faster");
+    hsm_add_transition(&mut m, fast, slow, "slower");
+    hsm_add_transition(&mut m, moving, idle, "stop");
+    hsm_add_timed(&mut m, slow, fast, 500.0);
+    hsm_add_transition(&mut m, on, err, "fault");
+    hsm_add_transition(&mut m, err, idle, "reset");
+    val tp: i64 = hsm_add_transition(&mut m, idle, -1, "ping");
+    hsm_set_action(&mut m, tp, count_ping);
+    hsm_add_transition(&mut m, fast, fast, "kick");
+    hsm_on_entry(&mut m, err, fn(c: i64) -> i64 {
+        hsm_emit("reset");
+        return 0;
+    });
+    hsm_on_do(&mut m, moving, count_do);
+
+    hsm_start(&mut m, 0.0);
+    show(&mut m, "start");
+    hsm_post(&mut m, "power");
+    hsm_run(&mut m);
+    show(&mut m, "power");
+    g_battery = 10;
+    hsm_post(&mut m, "go");
+    hsm_run(&mut m);
+    show(&mut m, "go (battery 10)");
+    hsm_post(&mut m, "ping");
+    hsm_run(&mut m);
+    println("ping: " + hsm_take_log(&mut m) + " | pings=" + int_to_str(g_pings));
+    g_battery = 50;
+    hsm_post(&mut m, "go");
+    hsm_update(&mut m, 100.0);
+    println("go (battery 50): " + hsm_take_log(&mut m) + " | " + hsm_path(&m) + " go actions=" + int_to_str(g_go));
+    hsm_update(&mut m, 400.0);
+    val l400: str = hsm_take_log(&mut m);
+    println("t=400: " + str_or(l400, "(nothing)") + " | " + hsm_path(&m));
+    hsm_update(&mut m, 650.0);
+    println("t=650: " + hsm_take_log(&mut m) + " | " + hsm_path(&m) + " do=" + int_to_str(g_do));
+    hsm_post(&mut m, "kick");
+    hsm_run(&mut m);
+    show(&mut m, "kick");
+    hsm_post(&mut m, "power");
+    hsm_run(&mut m);
+    show(&mut m, "power");
+    hsm_post(&mut m, "power");
+    hsm_run(&mut m);
+    show(&mut m, "power (shallow)");
+    hsm_set_history(&mut m, on, HSM_DEEP);
+    hsm_post(&mut m, "faster");
+    hsm_post(&mut m, "power");
+    hsm_post(&mut m, "power");
+    hsm_run(&mut m);
+    hsm_take_log(&mut m);
+    println("power x2 (deep): " + hsm_path(&m));
+    hsm_post(&mut m, "fault");
+    hsm_run(&mut m);
+    show(&mut m, "fault");
+    hsm_post(&mut m, "jump");
+    hsm_post(&mut m, "stop");
+    val n: i64 = hsm_run(&mut m);
+    println("jump, stop: " + hsm_take_log(&mut m) + " | " + hsm_path(&m) + " in On=" + sm_b(hsm_in(&m, on)) + " in Moving=" + sm_b(hsm_in(&m, moving)));
+    println("events processed=" + int_to_str(n));
+    return 0;
+}
+
+fn str_or(s: str, d: str) -> str {
+    if str_len(s) == 0 {
+        return d;
+    }
+    return s;
+}
+
+fn sm_b(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

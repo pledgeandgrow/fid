@@ -1,0 +1,77 @@
+// A closure keeps its own owner of each string and Vec it captures (proposal
+// 0004; finding S4 of docs/verification/infra-runs-2026-11-16-b7.md: a
+// string captured by a returned closure was freed with its scope and read
+// afterwards). The closure may outlive the scope that made it, and the
+// variable it copied may get a new value. Each capture is read after blocks
+// of the same sizes were freed and filled with other text, so a capture
+// without an owner prints "zzzzz.." or a wrong number instead of its value.
+// Expected output:
+// name=alpha7 len=6
+// name=alpha7 len=6
+// old=first1 new=second2
+// sum=60 tag=vec3
+// done
+
+/// Allocate and fill strings and Vecs of the sizes the captures have.
+fn churn() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        val junk: str = "zzzzz" + int_to_str(i % 10);
+        val junk2: str = "zzzzzz" + int_to_str(i % 10);
+        var v: Vec<i64> = Vec::new();
+        v.push(-1);
+        v.push(-1);
+        v.push(-1);
+        t = t + str_len(junk) + str_len(junk2) + v.len();
+        i = i + 1;
+    }
+    return t;
+}
+
+/// A heap string captured by a closure that leaves the function.
+fn namer() -> fn() -> str {
+    val s: str = "alpha" + int_to_str(7);
+    return fn() -> str { "name=" + s + " len=" + int_to_str(str_len(s)) };
+}
+
+/// The variable gets a new value after the closure copied the old one.
+fn reassigned() -> str {
+    var s: str = "first" + int_to_str(1);
+    val f = fn() -> str { s };
+    s = "second" + int_to_str(2);
+    churn();
+    return "old=" + f() + " new=" + s;
+}
+
+/// A Vec and a string captured together, read after their scope ended.
+fn summer() -> fn() -> str {
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    val tag: str = "vec" + int_to_str(v.len());
+    return fn() -> str {
+        var t: i64 = 0;
+        var i: i64 = 0;
+        while i < v.len() {
+            t = t + v.get(i);
+            i = i + 1;
+        }
+        return "sum=" + int_to_str(t) + " tag=" + tag;
+    };
+}
+
+fn main() -> i64 {
+    val n = namer();
+    churn();
+    println(n());
+    churn();
+    println(n());
+    println(reassigned());
+    val s = summer();
+    churn();
+    println(s());
+    println("done");
+    return 0;
+}

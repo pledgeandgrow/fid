@@ -1,0 +1,156 @@
+// ME7 (compiler/egraph.fd eg_skeleton, native paths, opt-in
+// FID_IROPT_ON=egskel): the side-effect skeleton. Pure values leave their
+// blocks; each operand of a skeleton instruction (a call, store, checked
+// operation, branch, return) that was a pure value is made again from its
+// e-class where it is read: an equal value there if one is available, else
+// the cheapest form, in the block with the fewest loops between its operands
+// and the use. tests/tooling/egskel-check.sh emits this with the skeleton
+// off and on (FID_VERIFY=1) and checks the stats line.
+// - hoist: `(a ^ b) & m` and `a * 3 + b` in @wrapping code are invariant in
+//   the loop: made once before it.
+// - gvn_branches: `a + b` in one branch and `b + a` after the join: the join
+//   needs its own (the branch's does not dominate it), the second branch
+//   reuses the first value of its block.
+// - dead: pure values nothing reads are not made again.
+// - cmp_branch: a comparison feeding a branch is made right before it.
+// - casts_floats: casts and float arithmetic float like the rest.
+// - checked: in checked code `+` may panic and stays in the skeleton; only
+//   bit operations and comparisons float.
+// - near_max: @wrapping (x + c1) + c2 with c1 + c2 past the i64 maximum: the
+//   e-graph folds c1 + c2 wrapped (before Nov 17 the fold itself overflowed).
+// - narrow_sum: @wrapping i8 (x + 100) + 100: c1 + c2 = 200 is no i8, so it
+//   is not folded into one constant (the sum must wrap as the program's).
+// - nested: an invariant of the inner loop that varies in the outer one is
+//   made in the outer loop's body.
+// Every line must be what the program computes with the skeleton off.
+//
+// Expected output:
+// 910
+// 33
+// 17
+// 6
+// 3
+// 0
+// 0
+// 28.5
+// 122
+// 3
+// 12
+// -9223372036854775803
+// -55
+// 126
+
+@wrapping fn hoist(a: i64, b: i64, m: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        var k: i64 = (a ^ b) & m;
+        var j: i64 = a * 3 + b;
+        total = total + k * i + j;
+        i = i + 1;
+    }
+    return total;
+}
+
+@wrapping fn gvn_branches(a: i64, b: i64, c: bool) -> i64 {
+    var r: i64 = 0;
+    if c {
+        r = a + b;
+        var r2: i64 = b + a;
+        r = r + r2;
+    }
+    var s: i64 = b + a;
+    return r + s;
+}
+
+fn dead(a: i64, b: i64) -> i64 {
+    var unused1: i64 = a ^ b;
+    var unused2: bool = a < b;
+    var used: i64 = a & b;
+    if unused2 && unused1 > 1000000 {
+        return 0 - 1;
+    }
+    return used;
+}
+
+fn cmp_branch(a: i64, b: i64) -> i64 {
+    var lt: bool = a < b;
+    var eq: bool = a == b;
+    var n: i64 = 0;
+    if lt {
+        n = n + 1;
+    }
+    if eq {
+        n = n + 2;
+    }
+    if b > a {
+        n = n + 2;
+    }
+    return n;
+}
+
+fn casts_floats(x: i32, y: f64) -> f64 {
+    var wide: i64 = x as i64;
+    var f: f64 = wide as f64;
+    var acc: f64 = 0.0;
+    var i: i64 = 0;
+    while i < 3 {
+        acc = acc + f * 1.0 + y;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn checked(a: i64, b: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        var m: i64 = a | b;
+        if (m & 1) == 1 {
+            total = total + m + i;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+@wrapping fn near_max(x: i64) -> i64 {
+    return (x + 9223372036854775807) + 1;
+}
+
+@wrapping fn narrow_sum(x: i8) -> i64 {
+    var y: i8 = (x + 100) + 100;
+    return y as i64;
+}
+
+@wrapping fn nested(a: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        var j: i64 = 0;
+        while j < 4 {
+            var inv: i64 = (i * 7) ^ a;
+            total = total + inv + j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    println(hoist(13, 7, 15));
+    println(gvn_branches(5, 6, true));
+    println(gvn_branches(8, 9, false));
+    println(dead(6, 7));
+    println(cmp_branch(1, 2));
+    println(cmp_branch(2, 1));
+    println(cmp_branch(5, 5) - 2);
+    println(casts_floats(9, 0.5));
+    println(checked(5, 24) + checked(4, 8));
+    println(cmp_branch(3, 3) + 1);
+    println(dead(12, 13));
+    println(near_max(5));
+    println(narrow_sum(1));
+    println(nested(10));
+}

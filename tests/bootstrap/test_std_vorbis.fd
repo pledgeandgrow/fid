@@ -1,0 +1,532 @@
+// stdlib/vorbis: Ogg pages/CRC/packets of real libvorbis files, re-encoded pages, Vorbis headers, codebook and IMDCT checks, mono and coupled-stereo decode vs ffmpeg, floor 0 (bark map, LSP curve vs the spec formula, a generated floor-0 stream vs ffmpeg)
+// Expected output:
+// ogg crc of 123456789: 89a1897f
+// ilog 0 1 2 3 4 7 8 255: 0 1 2 2 3 3 4 8
+// lookup1_values 81,4 = 3 80,4 = 2 1000,3 = 10 6561,8 = 3
+// float32_unpack 1 -1.5
+// spec codebook decodes: 5 0 7 3 0 0 -1
+// over-specified lengths 1 1 1 rejected: yes
+// imdct 32 matches the direct sum within 1e-12: yes
+// mono page 0: type 2 granule 0 serial 00000000 segments 1 body 30 crc 64c1da11 ok
+// mono page 1: type 0 granule 0 serial 00000000 segments 11 body 2524 crc 193932d2 ok
+// mono page 2: type 4 granule 800 serial 00000000 segments 5 body 80 crc 5d9cab02 ok
+// mono pages re-encoded byte for byte: yes
+// mono packets: 30 48 2476 18 16 16 17 13 last granule 800
+// mono re-paginated into 8 pages, same packets: yes
+// stereo page 0: type 2 granule 0 serial 00000000 segments 1 body 30 crc 20007ee7 ok
+// stereo page 1: type 0 granule 0 serial 00000000 segments 12 body 2691 crc ca6459ca ok
+// stereo page 2: type 4 granule 1323 serial 00000000 segments 7 body 354 crc 0c4eb33f ok
+// stereo pages re-encoded byte for byte: yes
+// stereo packets: 30 48 2643 55 49 47 45 47 52 59 last granule 1323
+// stereo re-paginated into 10 pages, same packets: yes
+// damaged: bad CRC on page 1
+// junk header: not a Vorbis identification header
+// mono: 1 ch 8000 Hz, vendor ffmpeg [encoder=Lavc libvorbis], 5 audio packets, 800 samples per channel
+// mono first values: 0.0060 0.1134 0.0736 -0.0715 -0.1214 0.0011 0.1217 0.0721
+// mono matches ffmpeg at 20 points within 1e-6: yes
+// stereo: 2 ch 11025 Hz, vendor ffmpeg [encoder=Lavc libvorbis], 7 audio packets, 1323 samples per channel
+// stereo first values: -0.0009 0.0047 0.2494 -0.2290 -0.3824 0.1649 0.3616 -0.3910
+// stereo matches ffmpeg at 46 points within 1e-6: yes
+// floor 0 bark maps 128/8000/64: 0 1 5 21 48 63 sum 5422; 256/8000/64: 0 0 2 11 48 63 sum 10873; 1024/44100/256: 0 2 10 41 229 255 sum 214699
+// floor 0 curve; order 7: 256 values, spec formula within 1e-12 yes, uniform LSPs flat at 1 yes; order 8: 256 values, spec formula within 1e-12 yes, uniform LSPs flat at 1 yes
+// floor 0: 1 ch 8000 Hz, vendor fides floor0 test, 8 audio packets, 1344 samples per channel
+// floor 0 first values: -0.0277 -0.0653 -0.0873 0.2423 -0.0939 -0.1420 -0.1242 0.1745
+// floor 0 matches ffmpeg at 40 points within 1e-6: yes
+use vorbis;
+use encoding;
+use math;
+
+// x rounded to d decimals ("-" only when the rounded value is not zero)
+fn fx(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val n: i64 = (a * (scale as f64) + 0.5) as i64;
+    if n == 0 { neg = false; }
+    var s: str = int_to_str(n / scale);
+    if d > 0 {
+        var fr: str = int_to_str(n % scale);
+        while str_len(fr) < d { fr = "0" + fr; }
+        s = s + "." + fr;
+    }
+    if neg { return "-" + s; }
+    return s;
+}
+
+fn hex32(v: i64) -> str {
+    var s: str = "";
+    var k: i64 = 7;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at("0123456789abcdef", (v >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+fn same_bytes(a: &Vec<i64>, b: &Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Ogg layer: pages, CRCs, page re-encoding, packets, re-pagination
+fn ogg_checks(name: str, bytes: &Vec<i64>) {
+    var at: i64 = 0;
+    var all_same: bool = true;
+    while at < bytes.len() {
+        val p: OggPage = ogg_parse_page(bytes, at);
+        println(name + " page " + int_to_str(p.seq) + ": type " + int_to_str(p.header_type) + " granule " + int_to_str(p.granule) + " serial " + hex32(p.serial) + " segments " + int_to_str(p.lacing.len()) + " body " + int_to_str(p.body.len()) + " crc " + hex32(p.crc) + if p.crc_ok { " ok" } else { " BAD" });
+        val again: Vec<i64> = ogg_page_encode(&p);
+        var orig: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < p.size {
+            orig.push(bytes.get(at + k));
+            k = k + 1;
+        }
+        if !same_bytes(&again, &orig) { all_same = false; }
+        at = at + p.size;
+    }
+    println(name + " pages re-encoded byte for byte: " + if all_same { "yes" } else { "NO" });
+    val st: OggStream = ogg_read(bytes);
+    var sizes: str = "";
+    var i: i64 = 0;
+    while i < st.packets.len() {
+        sizes = sizes + " " + int_to_str(st.packets.get(i).len());
+        i = i + 1;
+    }
+    println(name + " packets:" + sizes + " last granule " + int_to_str(st.last_granule));
+    var gr: Vec<i64> = Vec::new();
+    i = 0;
+    while i < st.packets.len() {
+        gr.push(st.granules.get(i));
+        i = i + 1;
+    }
+    val repaged: Vec<i64> = ogg_paginate(&st.packets, &gr, st.serial);
+    val st2: OggStream = ogg_read(&repaged);
+    var same: bool = st2.ok && st2.packets.len() == st.packets.len();
+    i = 0;
+    while same && i < st.packets.len() {
+        if !same_bytes(&st.packets.get(i), &st2.packets.get(i)) { same = false; }
+        i = i + 1;
+    }
+    println(name + " re-paginated into " + int_to_str(st2.pages) + " pages, same packets: " + if same { "yes" } else { "NO" });
+}
+
+fn map_line(n: i64, rate: i64, bs: i64) -> str {
+    val m: Vec<i64> = vorbis_floor0_map(n, rate, bs);
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < m.len() {
+        sum = sum + m.get(i);
+        i = i + 1;
+    }
+    return int_to_str(n) + "/" + int_to_str(rate) + "/" + int_to_str(bs) + ": " + int_to_str(m.get(0)) + " " + int_to_str(m.get(1)) + " " + int_to_str(m.get(5)) + " " + int_to_str(m.get(20)) + " " + int_to_str(m.get(n / 2)) + " " + int_to_str(m.get(n - 1)) + " sum " + int_to_str(sum);
+}
+
+// The spec's floor 0 formula written out literally, one line at a time.
+fn spec_floor0(map: &Vec<i64>, i: i64, bark_size: i64, amp_bits: i64, amp_offset: i64, amplitude: i64, c: &Vec<f64>) -> f64 {
+    val order: i64 = c.len();
+    val omega: f64 = math_pi() * (map.get(i) as f64) / (bark_size as f64);
+    val w: f64 = math_cos(omega);
+    var p: f64 = 0.0;
+    var q: f64 = 0.0;
+    if (order & 1) == 1 {
+        p = 1.0 - w * w;
+        var j: i64 = 0;
+        while j <= (order - 3) / 2 {
+            p = p * 4.0 * (math_cos(c.get(2 * j + 1)) - w) * (math_cos(c.get(2 * j + 1)) - w);
+            j = j + 1;
+        }
+        q = 0.25;
+        j = 0;
+        while j <= (order - 1) / 2 {
+            q = q * 4.0 * (math_cos(c.get(2 * j)) - w) * (math_cos(c.get(2 * j)) - w);
+            j = j + 1;
+        }
+    } else {
+        p = (1.0 - w) / 2.0;
+        q = (1.0 + w) / 2.0;
+        var j: i64 = 0;
+        while j <= (order - 2) / 2 {
+            p = p * 4.0 * (math_cos(c.get(2 * j + 1)) - w) * (math_cos(c.get(2 * j + 1)) - w);
+            q = q * 4.0 * (math_cos(c.get(2 * j)) - w) * (math_cos(c.get(2 * j)) - w);
+            j = j + 1;
+        }
+    }
+    val maxamp: f64 = (math_pow(2.0, amp_bits as f64) - 1.0);
+    return math_exp(0.11512925 * ((amplitude as f64) * (amp_offset as f64) / (maxamp * math_sqrt(p + q)) - (amp_offset as f64)));
+}
+
+fn floor0_checks() {
+    println("floor 0 bark maps " + map_line(128, 8000, 64) + "; " + map_line(256, 8000, 64) + "; " + map_line(1024, 44100, 256));
+    val map: Vec<i64> = vorbis_floor0_map(256, 8000, 64);
+    var res: str = "";
+    var order: i64 = 7;
+    while order <= 8 {
+        // LSP angles, increasing, a little off the uniform spacing
+        var c: Vec<f64> = Vec::new();
+        var j: i64 = 0;
+        while j < order {
+            c.push(((j + 1) as f64) * math_pi() / ((order + 1) as f64) + 0.07 * math_sin((j * 5 + 1) as f64));
+            j = j + 1;
+        }
+        val curve: Vec<f64> = vorbis_floor0_curve(&map, 64, 6, 90, 50, &c);
+        var worst: f64 = 0.0;
+        var i: i64 = 0;
+        while i < map.len() {
+            val want: f64 = spec_floor0(&map, i, 64, 6, 90, 50, &c);
+            val d: f64 = math_fabs(curve.get(i) - want) / want;
+            if d > worst { worst = d; }
+            i = i + 1;
+        }
+        // uniform LSPs (j + 1) pi / (order + 1) are those of A(z) = 1, so
+        // p + q = |A|^2 = 1, and full amplitude gives exp(0) = 1
+        var u: Vec<f64> = Vec::new();
+        j = 0;
+        while j < order {
+            u.push(((j + 1) as f64) * math_pi() / ((order + 1) as f64));
+            j = j + 1;
+        }
+        val flat: Vec<f64> = vorbis_floor0_curve(&map, 64, 6, 90, 63, &u);
+        var fw: f64 = 0.0;
+        i = 0;
+        while i < flat.len() {
+            if math_fabs(flat.get(i) - 1.0) > fw { fw = math_fabs(flat.get(i) - 1.0); }
+            i = i + 1;
+        }
+        res = res + "; order " + int_to_str(order) + ": " + int_to_str(curve.len()) + " values, spec formula within 1e-12 " + if worst < 0.000000000001 { "yes" } else { "NO" } + ", uniform LSPs flat at 1 " + if fw < 0.000000001 { "yes" } else { "NO (" + float_to_str(fw) + ")" };
+        order = order + 1;
+    }
+    println("floor 0 curve" + res);
+}
+
+fn decode_check(name: str, bytes: &Vec<i64>, step: i64, want: Vec<f64>) {
+    val vf: VorbisFile = vorbis_decode_file(bytes);
+    if !vf.ok {
+        println(name + " decode ERROR " + vf.error);
+        return;
+    }
+    var cm: str = "";
+    var i: i64 = 0;
+    while i < vf.comments.len() {
+        cm = cm + " [" + vf.comments.get(i) + "]";
+        i = i + 1;
+    }
+    println(name + ": " + int_to_str(vf.channels) + " ch " + int_to_str(vf.rate) + " Hz, vendor " + vf.vendor + cm + ", " + int_to_str(vf.packets) + " audio packets, " + int_to_str(vf.pcm.get(0).len()) + " samples per channel");
+    var worst: f64 = 0.0;
+    var shown: str = "";
+    var k: i64 = 0;
+    i = 0;
+    while k < want.len() {
+        var c: i64 = 0;
+        while c < vf.channels {
+            val got: f64 = vf.pcm.get(c).get(i);
+            val d: f64 = math_fabs(got - want.get(k));
+            if d > worst { worst = d; }
+            if k < 8 { shown = shown + " " + fx(got, 4); }
+            k = k + 1;
+            c = c + 1;
+        }
+        i = i + step;
+    }
+    println(name + " first values:" + shown);
+    println(name + " matches ffmpeg at " + int_to_str(want.len()) + " points within 1e-6: " + if worst < 0.000001 { "yes" } else { "NO (" + float_to_str(worst) + ")" });
+}
+
+fn main() {
+    println("ogg crc of 123456789: " + hex32(ogg_crc(&str_bytes("123456789"))));
+    println("ilog 0 1 2 3 4 7 8 255: " + int_to_str(vorbis_ilog(0)) + " " + int_to_str(vorbis_ilog(1)) + " " + int_to_str(vorbis_ilog(2)) + " " + int_to_str(vorbis_ilog(3)) + " " + int_to_str(vorbis_ilog(4)) + " " + int_to_str(vorbis_ilog(7)) + " " + int_to_str(vorbis_ilog(8)) + " " + int_to_str(vorbis_ilog(255)));
+    println("lookup1_values 81,4 = " + int_to_str(vorbis_lookup1_values(81, 4)) + " 80,4 = " + int_to_str(vorbis_lookup1_values(80, 4)) + " 1000,3 = " + int_to_str(vorbis_lookup1_values(1000, 3)) + " 6561,8 = " + int_to_str(vorbis_lookup1_values(6561, 8)));
+    // float32_unpack: mantissa 1, exponent 788 -> 1.0; mantissa 3, sign, exponent 787 -> -1.5
+    println("float32_unpack " + float_to_str(vorbis_float32_unpack((788 << 21) | 1)) + " " + float_to_str(vorbis_float32_unpack(2147483648 | (787 << 21) | 3)));
+
+    // the codebook example of the spec (section 3.2.1): lengths 2 4 4 4 4 2 3 3
+    // give codewords 00 0100 0101 0110 0111 10 110 111
+    var lens: Vec<i64> = Vec::new();
+    lens.push(2); lens.push(4); lens.push(4); lens.push(4); lens.push(4); lens.push(2); lens.push(3); lens.push(3);
+    val bk: VbBook = vorbis_book_from_lengths(lens);
+    // bits 10 00 111 0110 then zeros, packed LSB first: 0x71 0x03
+    var pk: Vec<i64> = Vec::new();
+    pk.push(113);
+    pk.push(3);
+    var br: VbBits = vorbis_bits(pk);
+    var dec: str = "";
+    var t: i64 = 0;
+    while t < 7 {
+        dec = dec + " " + int_to_str(vorbis_book_decode(&bk, &mut br));
+        t = t + 1;
+    }
+    println("spec codebook decodes:" + dec);
+    var over: Vec<i64> = Vec::new();
+    over.push(1); over.push(1); over.push(1);
+    println("over-specified lengths 1 1 1 rejected: " + if vorbis_book_from_lengths(over).entries < 0 { "yes" } else { "no" });
+
+    // the fast IMDCT against the defining sum, n = 32
+    var x: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        x.push(math_sin((i as f64) * 1.7) * 0.5 + 0.1 * (i as f64));
+        i = i + 1;
+    }
+    val y: Vec<f64> = vorbis_imdct(&x);
+    var worst: f64 = 0.0;
+    var n: i64 = 0;
+    while n < 32 {
+        var s: f64 = 0.0;
+        var k: i64 = 0;
+        while k < 16 {
+            s = s + x.get(k) * math_cos(2.0 * math_pi() / 32.0 * ((n as f64) + 0.5 + 8.0) * ((k as f64) + 0.5));
+            k = k + 1;
+        }
+        val d: f64 = math_fabs(s - y.get(n));
+        if d > worst { worst = d; }
+        n = n + 1;
+    }
+    println("imdct 32 matches the direct sum within 1e-12: " + if worst < 0.000000000001 { "yes" } else { "NO" });
+
+    val mono: Vec<i64> = hex_decode_bytes("4f67675300020000000000000000000000000000000011dac164011e01766f726269730000000001401f000000000000b03600000000000099014f67" +
+        "6753000000000000000000000000000001000000d23239190b30ffffffffffffffffffb503766f726269730600000066666d70656701000000160000" +
+        "00656e636f6465723d4c617663206c6962766f726269730105766f726269731242435601000001000c5214212519534a630895525229051d63505b47" +
+        "1d63d4394621641053884919a57b4f2a95584ac811525829451d534c534995529629451d631453482153d63165a173144b864909256c4dae74164be8" +
+        "99639631461d63ce5a4a9d63d631451d63525249a173183a662564143a46c5e8627c303a95a24228bec7de52e92d858a5b8abdd71a53eb2d84184b69" +
+        "c1086173edb5d5dc4a6ac518638c31c6c5e2532882d09055000001000040040142435601000a0000c2500c455180d0905500400600800014457114c7" +
+        "711c479224cb024243560100400000020000288ee12892234992645996655996a67996a8b9aa2ffbae2eebaeedeaba0e8486ac0400c8000018862187" +
+        "de49cc90539049262955cc3908a1f50e39e51464d252c698628c51ce90530c31053186d0298510d44e39a50c220843489d64ce204b3de8e062e73810" +
+        "1ab22200880200008c418c21c690730c4a0621728e49c82044ce39299d944c4a28adb49649092d95d622e79c944e4a26a5b41652cba494d6422b0500" +
+        "00043800000458088586ac0800a20000108390524829c494624e318794528e29c79052cc39c598728c31e82054cc31c81c844829c518734e39e62064" +
+        "0c2ae61c840c32010000010e0000011642a1212b02803801008324699aa569a268699a287aa6a8aaa228aaaae579a6e999a6aa7aa2a9aaa6aabaaea9" +
+        "aaae6c799e697aa6a8aa9e29aaaaa9aaae6baaaaeb8aaa6acba6abdab6e9aab6eccab26ebbb2acdb9eaacab6a9bab26eaaae6dbbb26cebae2cdbbae4" +
+        "79aaea99a6eb7aa6e9baaaebdab2eabab2ed99a6eb8aaa2bdba6ebcab2ebcab6adcab2ae6ba6e9baa2abdaaea9bab2edcaae6dbbb2acfba6ebeab6ea" +
+        "cabaaecab2eedbb6aefbb2ad0bbbe8bab6aecaaeaeabb2acebb22debb66cdb42c9f354d5334dd7f54cd37555d7b56dd5756d5b334dd7355d579645d5" +
+        "7565d595755d75655bf74cd3754d579565d35565599565dd7665579745d7b56d55967d5d75655f976dddf76559d77dd375755b9565db576559f7655d" +
+        "f78559b77ddd53555b375d57d74dd7d57d5bd77d61b66ddf175d57d755d9d685559675dfd67d6598759d30baaeaeabb6ecebaa2cebbeaeebc630ebba" +
+        "30acba6dfcaead0bc3abebc6b1ebbeaedcbe8f6adbbef0eab631bcba6e1cbbb01bbfedfbc6b1a9aa6d9baeabeba62bebba6cebbe6febba718caeabeb" +
+        "aa2cfbbaeacabe6febbaf0ebbe2f0ca3ebeaba2acbbab0dab2afcbba2e0cbbae1bc36adbc2eedaba70ccb22e0cb7ef2bc7af0b43d5b685e1d575a3ab" +
+        "dbc66f0bc3d23776be000080010700800013ca40a1212b02803801000621081563102ac6208410520a21a454310621630e4ac61c94104a492194d22a" +
+        "c620648e49c81c93104a68a994d04a28a5a5504a4ba194d6526a2da6d45a0ca1b4144a69ad94d25a6a29b6d4526c15631032e7a4648e4928a5b4564a" +
+        "6929734c4ac6a0a40e422aa5a4d24a49ad65ce49c9a0a3d23948a9a4d25249a9b5504a6ba194d64a4ab1a5d24a6dadc51a4a692da4d25a49a9b5d452" +
+        "6dadb55a23c620648c41c99c93524a49a994d25ae69c940e3a2a9983924a29a9959252ac9893d2412825838c4a49a5b5924a2ba194d64a4ab185525a" +
+        "6badd598524b3594925a49a9c5504a6badb51a532b358550520ba5b4164a69adb5566b6a2db650426ba1a4164b2a31b516636dadc5184a69ada4125b" +
+        "29a9c5165b8dadb558534b359692626cadd5d84a2d39d65a6b4a2dd6d2528cadb5985b4cb9c5586b0d25b4164a69ad94d25a4aadc5d65aada194d64a" +
+        "2ab195925a6cadd5d85a8c3594d2622929b5904a6cadb5585b6c35a696626cb1d558528b31c658734bb5d5945a8badb5584b2b35c6186b6e35e55200" +
+        "00c080030040800965a0d090950040140000600c638c41681472cc39298d52ce392725730e42082965ce410821a5ce3908a5b4d43907a19494422929" +
+        "a5145b2825a5d65a2c0000a0c0010020c0064d89c5010a0d59090044010020c628c51884c620a51883d018a31463102aa518730e42a51463ce41c818" +
+        "73ce41291963ce41272584104229a584104228a5940200000a1c0000026cd094581ca0d090150140140000600c620c31862074523a2911844c4a27a5" +
+        "91125a0b2965964a8a25c6cc5a89adc4d84809ad85d6326b25c6d26246adc458622a0000ecc00100ecc04228346425009007004018a31463ce396710" +
+        "62cc390821340831e61c84102ac69c730e42081563ce39072184ce39e720841042e79c73104208a183104208a594d241082184524ae92084104229a5" +
+        "74104208a194520a00002a70000008b05164738291a0424356020079000080314a392725a54629c620a4145ba3146310526aad620c424aadc5583106" +
+        "21a5d662ec20a4d45a8cb57610526a2dc65a434aadc5586bce21a5d662ac35d7d45a8cb5e6dc7b6a2dc65a73ceb90000dc050700b0031b4536271809" +
+        "2a346425009007004020a414638c398794628c31e79c434a31c69873ce29c61873ce39e714638c39e79c738c31e79c73ce39c69873ce39e79c73ce39" +
+        "e7a0839039e79c73d041e89c73ce39082174ce39e71c84100a00002a70000008b05164738291a04243560200e10000803194524a29a594524aa8a394" +
+        "524a29a594520221a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594" +
+        "524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a2995524a29a59452" +
+        "4a29a594524a29a50020df0a0700ff071b6758493a2b1c0d2e34642500100e000018c318848c392725a5863108a5744e4a4925358c4128a57312524a" +
+        "2983d05a6aa5a4d2524a198494620b2195945a0aa5b4566b29a9b594522829c51a4b4aa9a5d632e724a4925a4badb6983907a5a4d65a6aadc510424a" +
+        "b1b5d6526bb175525249adb5d65a6d2da4945a6b2dc6d6626c25a5965a6ba9c5d65a4ca9b5165b4b2dc6d6624badc5d8628b31c61a0b00e06e700080" +
+        "48b0718695a4b3c2d1e0424356020021010004324a39e79c8310420821528a31e7a08310420821444a31e69c8310420821848c31e72084104208a194" +
+        "9031e61c841042082184523ae72084504a09a594524ae71c84104208a594524a092184104228a594524a292184104a29a594524a292584104228a594" +
+        "524a29a584104228a594524a29a594104228a594524a29a594124208a194524a29a594524208a594524a29a594524a282184524a29a594524a092594" +
+        "524a29a594524a292194524a29a594524a29a5000080030700800023e824a3ca226c34e1c203100000000200024c0081018282510802841108000000" +
+        "00000800f80000480a80888868e60c0e10121416181a1c1e202224000000000000000000000000044f67675300042003000000000000000000000200" +
+        "000002ab9c5d05121010110d9e989975e50dec2b000000a2a2d28c8dbf00a69999b3935700b00500000000887009a2999975e51500280000000080b0" +
+        "52009ed05078cd1bb8000000a05c342cff3f0386cc8dffaf16000090b75fe601");
+    val stereo: Vec<i64> = hex_decode_bytes("4f676753000200000000000000000000000000000000e77e0020011e01766f726269730000000002112b000000000000009600000000000099014f67" +
+        "6753000000000000000000000000000001000000ca5964ca0c30ffffffffffffffffffff5d03766f726269730600000066666d706567010000001600" +
+        "0000656e636f6465723d4c617663206c6962766f726269730105766f726269731142435601000001000c5214212519534a630895525229051d63505b" +
+        "471d63d4394621641053884919a57b4f2a95584ac811525829451d534c534995529629451d631453482153d63165a173144b864909256c4dae74164b" +
+        "e899639631461d63ce5a4a9d63d631451d63525249a173183a662564143a46c5e8627c303a95a24228bec7de52e92d858a5b8abdd71a53eb2d84184b" +
+        "69c1086173edb5d5dc4a6ac518638c31c6c5e2532882d09055000001000040040142435601000a0000c2500c455180d0905500400600800014457114" +
+        "c7711c479224cb024243560100400000020000288ee12892234992645996655996a67996a8b9aa2ffbae2eebaeedeaba0e8486ac0400c8000018251e" +
+        "750e42698c481029e6a41863841042080d81451573d05a08ae73504acc1058ce20e5a44260396410838c81071542ca390722754a290625b85642c61c" +
+        "101ab2420008cd0030481220691a20691a00000000000000489e06689e08689e080000000000000092e6019ae8019ae8010000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020791ee0" +
+        "8922e089220000000000000068a208789e0988a609000000000000009a28029e2902a269020000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020791ee08922e0892200000000000000" +
+        "68a20888a60978a209000000000000009a2802a269029ee9010000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" +
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000800000870000008b0100a0d591100c40900381c47" +
+        "920000c0711ccb020000c7712c0b00002ccbd2340000b02c4bd300000000000000000000000000000000000000000000000000000000000000000000" +
+        "000000000000000000000000000000000000000000000000000000000000000400000c380000049850060a0d590900440100180c45d3009605b02c80" +
+        "a601340de07900d10398260010000050e00000106083a6c4e2008586ac0400a200000c8ae24896e579f03c4d1345789ea6892244d3f34411a6e979a2" +
+        "08d5f43cd384aa7a9e69c27545d13481289aa600008002070080001b34251607283464250010120060501449f23ccf1345d354555585e7799e288aa2" +
+        "69aaaaebc2f33c4f1445d13455d575218a9e679aa6a9aaaeebba1045cf334dd35455d7755d98a6289aa669aaaaebca324c53144dd33455d5756519aa" +
+        "2a8aa6699aaaeabab20c44d1344d53555d579681289aa6aabaaeebca321045d3545557755d5906a6a9aaaaeabab22bcb00d55455d795655906a8aaeb" +
+        "baae2ccb3640555dd77565d99601aeebbab22ccbb60dc0756559966d5b0000c08103004080117492516511369a70e10128346445001005000018a394" +
+        "624a19c624841242c498845042a8a4945252291584124a2aa582504248a16452524aa9940a42292585504128a594100a00003b7000003bb0100a0d59" +
+        "0900e40100108420c418638c49091963cc39e720848c31e69c73524ac61873ce392925638c39e79c94d239e79c734e4ae99c73ce3927a574ce39e79c" +
+        "93524ae99c73ce4929a574ce39e7a494523ae79c730200800a1c0000026c14d99c6024a8d0909500402a0080c1712ccbf33c4f144d5393244df33ccf" +
+        "134d55d52449d33c4f144d5355799ee789a2288aa6aaf23ccf134551344d55e5baa2288aa668aaaa4a76454f144d53555d15a2288aa6a9aaae0bd314" +
+        "45d35455d7852c9ba6aabaaaecc2b64d533555d57581ebaaaaebca32705dd57455d91500009ee000005460c3ea08274563818586ac04003200000842" +
+        "10524a21a4944248298590520a21010000030e0000012694814243560200a900000021524a29a5945222a5a494524a29a554cc4929a594524a29a594" +
+        "524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594524a29a594" +
+        "524a29a594524a29a594524a29a594524208a10040ec0a07809d081b564738291a0b2c34642500100e00001883106310526a2dc60a21a52094d25a8b" +
+        "b956083106a194d65aac3168cc392929b518638c4163ce494929c6186b0d2a8590526b2dc69a63702d84945a8b31c6da8310aab51663acb9e61c8470" +
+        "2da5186bcd35e72084ce31d69a6bce3d0721748e31d69a73ce3d08217ccdb5e65a73ce4108216ced35e79c730e4208217ccf41e71a74f04108e173cd" +
+        "39e79c0b0030797000804ab0718695a4b3c2d1e04243560200b9010084314a31e69c73d04108218410526a1963cc39082194524a29a5a49432c69873" +
+        "d041082184524a49a975ce39e72084504a29a5949252ca9873ce4108a194524a2925a5d439e72084104229a594524a4aa973ce41082184524a29a594" +
+        "d452081d84104229a594524a2929a5943a072184524a29a59452524b2d85104228a594524a29a5a494520a2184524a29a594524a69a9a5144228a594" +
+        "524a29a594d2524a29a5524a29a594524a2929a596524ba594524a29a594924a4a29a5944a29a594524a29a594945a6a2995524a29a594524a2929b5" +
+        "d4524aa994524a29a59452526a29b5945a29a994524a29a5a494524a29a5524a29a594524a692db5945a6b2995524a29a594d45a6a2db594522aa594" +
+        "524a29a50000a00307008000232a2dc44e33ae3c024714324c40010000200020c0041018202818852040180101000000000001800f0080a400088888" +
+        "66cee00021416181a1c1e101220200001040000000000000000000014f67675300042b0500000000000000000000020000003fb34e0c0737312f2d2f" +
+        "343b8e9406a499bda12d42410000c200807efa6e0300009cebcf7f0e302700008276038068d47ed1af3fde27fa6e24c59deaa93d3a042b44009a951e" +
+        "10e5dec0578122ac01401800d0da67000000fbe7ffe6e706e61c000040db664429a4de5077f44000eaee1ffd40049695bee1c9bd812d401100803000" +
+        "a03f79170000c0ffe20fff14e0160000f8bd8f5861c581d76f3e410136e75c020096951213e5dec0578122ac02003000c0bb4f0000008effd601c69c" +
+        "000010020f2b033a4258d81c80ba07f6b81f9a959e48947b035f058a00008401007ed5000000fcff3fff13c09c030000a249817357ecd8f3c5090230" +
+        "f043fe8f009295c2d2d4ded056a0400000c20080fe4bbd030000fce17f01600000c0b05f130160fabbee81a5f38d16ddb34da42f5f3c3a350f72cf49" +
+        "b40e226f9c2e4181000084129c47220060679f9f7f02000020f3dffdbf580660daf7d37eadb41d575c698f4e620cac1e50973a81882a2a06");
+    ogg_checks("mono", &mono);
+    ogg_checks("stereo", &stereo);
+
+    // a damaged page and a non-Vorbis stream
+    var bad: Vec<i64> = mono;
+    bad.set(100, bad.get(100) ^ 4);
+    println("damaged: " + ogg_read(&bad).error);
+    var d0: VorbisDecoder = vorbis_decoder();
+    var junk: Vec<i64> = Vec::new();
+    junk.push(1); junk.push(118); junk.push(111);
+    vorbis_header(&mut d0, junk);
+    println("junk header: " + d0.error);
+
+    var mw: Vec<f64> = Vec::new();
+    mw.push(0.006049429);
+    mw.push(0.113381580);
+    mw.push(0.073641449);
+    mw.push(-0.071512364);
+    mw.push(-0.121380068);
+    mw.push(0.001094852);
+    mw.push(0.121676527);
+    mw.push(0.072138831);
+    mw.push(-0.067245260);
+    mw.push(-0.114472240);
+    mw.push(-0.003291812);
+    mw.push(0.113166869);
+    mw.push(0.075159617);
+    mw.push(-0.075021803);
+    mw.push(-0.118754588);
+    mw.push(0.002393171);
+    mw.push(0.116516195);
+    mw.push(0.068757266);
+    mw.push(-0.072536543);
+    mw.push(-0.114459574);
+    decode_check("mono", &mono, 40, mw);
+    var sw: Vec<f64> = Vec::new();
+    sw.push(-0.000896945);
+    sw.push(0.004703591);
+    sw.push(0.249433786);
+    sw.push(-0.229000539);
+    sw.push(-0.382350504);
+    sw.push(0.164907470);
+    sw.push(0.361550808);
+    sw.push(-0.391048074);
+    sw.push(-0.194765016);
+    sw.push(0.204736829);
+    sw.push(-0.067651689);
+    sw.push(-0.017181475);
+    sw.push(0.303981394);
+    sw.push(0.009355672);
+    sw.push(-0.393072426);
+    sw.push(0.327495068);
+    sw.push(0.337083071);
+    sw.push(-0.255286634);
+    sw.push(-0.128552720);
+    sw.push(0.240765885);
+    sw.push(-0.138162598);
+    sw.push(-0.220249042);
+    sw.push(0.338195562);
+    sw.push(-0.114189699);
+    sw.push(-0.396474421);
+    sw.push(0.107783183);
+    sw.push(0.289634556);
+    sw.push(-0.289282709);
+    sw.push(-0.057763103);
+    sw.push(0.337949753);
+    sw.push(-0.199721366);
+    sw.push(-0.104246736);
+    sw.push(0.366050661);
+    sw.push(0.144161999);
+    sw.push(-0.383224875);
+    sw.push(0.145638347);
+    sw.push(0.247191623);
+    sw.push(-0.283768296);
+    sw.push(0.008461021);
+    sw.push(0.209779978);
+    sw.push(-0.253401548);
+    sw.push(-0.346151620);
+    sw.push(0.396646529);
+    sw.push(0.082596868);
+    sw.push(-0.351249695);
+    sw.push(0.062667601);
+    decode_check("stereo", &stereo, 60, sw);
+    floor0_checks();
+    val f0: Vec<i64> = hex_decode_bytes("4f6767530002000000000000000000000000000000003f8e47b6011e01766f726269730000000001401f000000000000000000000000000098014f67" +
+        "675300000000000000000000000000000100000062b8aeff02218f03766f7262697311000000666964657320666c6f6f723020746573740000000001" +
+        "05766f7262697303424356010004000084104250000087050000870572a121ab00000100000000a1212b0100080000c618638c31c618638c31020300" +
+        "401c0200402c900b0d59090040000030c618638c31c618638c111400c0610100c061911c000000000010803e80000cb200180002000000000001003e" +
+        "00008080100000000000002000000000001000000000204f676753000440050000000000000000000002000000f29a98d808242402242424242470d8" +
+        "70fa1f711920c584f83927cd286fb1b9d3ab20b4d82299fea9a940ee32e2543826100a8297b465e686633d37b260c108d675c70342c72c6dad8e1c06" +
+        "490fa5cb5ce5a75476e10600546016d98cebcd5d5c31f88597e594ec88b6084fd361914be2b1dd987a08fc60782c7e016808302c2dea99ecb05a1648" +
+        "8a7d838bfdb57bc082d657a03af87838c38b0f128f423130e2944988194bc9d56fa2a7d7f8eabe8c28ff9f4a93f2dcb084f8316df5b26f074f83e74e" +
+        "78a429c1d225628ac4be02583b4ff623c541cb97bb2f838bbf3155f4314b6dea7d2ab10e82c51143f0c3bbe6a89f2518abed888ca95a74c29dcacf07" +
+        "03f6d73386c7297284d04e0f");
+    var f0w: Vec<f64> = Vec::new();
+    f0w.push(-0.027721813);
+    f0w.push(-0.065317065);
+    f0w.push(-0.087325312);
+    f0w.push(0.242261276);
+    f0w.push(-0.093949467);
+    f0w.push(-0.141987428);
+    f0w.push(-0.124235623);
+    f0w.push(0.174538806);
+    f0w.push(-0.025393799);
+    f0w.push(-0.017079152);
+    f0w.push(-0.056865189);
+    f0w.push(-0.032263491);
+    f0w.push(-0.089581527);
+    f0w.push(-0.028833268);
+    f0w.push(-0.001609209);
+    f0w.push(0.000000000);
+    f0w.push(0.000000000);
+    f0w.push(-0.000449500);
+    f0w.push(-0.006434217);
+    f0w.push(0.006605781);
+    f0w.push(-0.003254950);
+    f0w.push(0.009593043);
+    f0w.push(-0.034690909);
+    f0w.push(-0.050895147);
+    f0w.push(-0.212491035);
+    f0w.push(-0.053322431);
+    f0w.push(0.087901331);
+    f0w.push(0.001622242);
+    f0w.push(0.000702995);
+    f0w.push(-0.001790649);
+    f0w.push(0.000160936);
+    f0w.push(-0.001428310);
+    f0w.push(-0.001089785);
+    f0w.push(-0.000867904);
+    f0w.push(-0.005507935);
+    f0w.push(0.018859318);
+    f0w.push(-0.029711336);
+    f0w.push(-0.082128003);
+    f0w.push(-0.001154492);
+    f0w.push(0.006635441);
+    decode_check("floor 0", &f0, 31, f0w);
+}

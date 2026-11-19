@@ -17,7 +17,7 @@
 > [reference.md](reference.md). Much of this document states goals: where it
 > says something is a compile-time error, check reference.md for what the
 > compiler checks today (there is, for example, no region use-after-free
-> check, and copy-on-write value semantics are written but switched off).
+> check; copy-on-write value semantics are on since proposal 0004).
 > The status below is from September and kept as history.
 >
 > **Status (Sep 6, 2026 — session 16):** Bootstrap fixpoint achieved. The

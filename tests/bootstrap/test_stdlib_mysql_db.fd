@@ -1,0 +1,222 @@
+// stdlib/mysql_db (competitive SL12): MySQL result sets as JSON rows and
+// MysqlConn as a db.fd `Database`, over a replayed session (the packets of
+// the MySQL internals manual's 5.5 handshake, as test_std_mysql.fd): a text
+// resultset (BIGINT, VARCHAR with a quote, DECIMAL, JSON, DATETIME, NULLs),
+// a binary one from a prepared statement (LONGLONG, DOUBLE, TINY,
+// DATETIME), query_one and exec through the capability, an error. The
+// JSON is checked byte for byte; a wrong answer panics.
+//
+// Expected output:
+// numbers ok
+// text rows ok
+// binary rows ok
+// database ok
+// mysql db ok
+use mysql;
+use mysql_db;
+use db;
+use encoding;
+
+var INQ: Vec<i64> = Vec::new();
+var SENT: Vec<i64> = Vec::new();
+
+fn mock_send(conn: i64, b: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < b.len() {
+        SENT.push(b.get(i));
+        i = i + 1;
+    }
+    return b.len();
+}
+
+fn mock_recv(conn: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while INQ.len() > 0 && out.len() < 64 && out.len() < max {
+        out.push(INQ.remove(0));
+    }
+    return out;
+}
+
+fn hb(h: str) -> Vec<i64> {
+    return hex_decode_bytes(h);
+}
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+// A packet: header with `seq`, then the payload given in hex.
+fn feed(seq: i64, payload_hex: str) {
+    val b: Vec<i64> = mysql_packets(hb(payload_hex), seq);
+    var i: i64 = 0;
+    while i < b.len() {
+        INQ.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn reset() {
+    INQ = Vec::new();
+    SENT = Vec::new();
+}
+
+fn lenenc_text(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    out.push(str_len(s));
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return hx(out);
+}
+
+// A ColumnDefinition41 payload (hex) for table shop.users.
+fn coldef(name: str, kind: i64, flags: i64) -> str {
+    var tail: Vec<i64> = Vec::new();
+    tail.push(12);
+    tail.push(63);
+    tail.push(0);
+    tail.push(20);
+    tail.push(0);
+    tail.push(0);
+    tail.push(0);
+    tail.push(kind);
+    tail.push(flags & 255);
+    tail.push(flags >> 8);
+    tail.push(0);
+    tail.push(0);
+    tail.push(0);
+    return lenenc_text("def") + lenenc_text("shop") + lenenc_text("users") + lenenc_text("users") + lenenc_text(name) + lenenc_text(name) + hx(tail);
+}
+
+fn transport() -> MysqlTransport {
+    val t: MysqlTransport = MysqlTransport { conn: 9, send: mock_send, recv: mock_recv };
+    return t;
+}
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(label + ": got  " + got);
+        println(label + ": want " + want);
+        p_panic("mysql db: wrong " + label);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    if got != want {
+        p_panic("mysql db: wrong " + label + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("mysql db: wrong " + label);
+    }
+}
+
+fn main() -> i64 {
+    // ── What counts as a JSON number ──
+    check_b("int", mysql_json_is_number("42"), true);
+    check_b("negative decimal", mysql_json_is_number("-0.50"), true);
+    check_b("exponent", mysql_json_is_number("1.5e-07"), true);
+    check_b("empty", mysql_json_is_number(""), false);
+    check_b("inf", mysql_json_is_number("inf"), false);
+    check_b("dot only", mysql_json_is_number("1."), false);
+    check_b("trailing", mysql_json_is_number("12abc"), false);
+    check("decimal value", mysql_json_value(246, "12.50"), "12.50");
+    check("nan double", mysql_json_value(5, "nan"), "\"nan\"");
+    check("json value", mysql_json_value(245, "[1, 2]"), "[1, 2]");
+    check("bad json value", mysql_json_value(245, "[1,"), "\"[1,\"");
+    check("date value", mysql_json_value(12, "2024-11-17 10:07:00"), "\"2024-11-17 10:07:00\"");
+    println("numbers ok");
+
+    // ── Login (the manual's 5.5 handshake, no CLIENT_DEPRECATE_EOF) ──
+    val hs_hex: str = "0a352e352e322d6d32000b00000064764840492d434a00fff7080200" + "0f801500000000000000000000" + "2a34647c635a776b345e5d3a00";
+    reset();
+    feed(0, hs_hex);
+    feed(2, "00000002000000");
+    var c: MysqlConn = mysql_connect(transport(), "app", "secret", "shop");
+    check_b("connected", c.ok, true);
+
+    // ── A text resultset ──
+    reset();
+    feed(1, "05");
+    feed(2, coldef("id", 8, 0));
+    feed(3, coldef("name", 253, 0));
+    feed(4, coldef("score", 246, 0));
+    feed(5, coldef("doc", 245, 0));
+    feed(6, coldef("born", 12, 0));
+    feed(7, "fe00000200");
+    feed(8, lenenc_text("1") + lenenc_text("Ada \"q\"") + lenenc_text("12.50") + lenenc_text("\x7b\"a\": [1, 2]\x7d") + lenenc_text("2024-11-17 10:07:00"));
+    feed(9, lenenc_text("2") + "fb" + lenenc_text("-0.5") + "fb" + lenenc_text("2025-01-01 00:00:00"));
+    feed(10, "fe00000200");
+    check("text rows", mysql_query_json(& mut c, "SELECT id, name, score, doc, born FROM users"), "[\x7b\"id\":1,\"name\":\"Ada \\\"q\\\"\",\"score\":12.50,\"doc\":\x7b\"a\": [1, 2]\x7d,\"born\":\"2024-11-17 10:07:00\"\x7d,\x7b\"id\":2,\"name\":null,\"score\":-0.5,\"doc\":null,\"born\":\"2025-01-01 00:00:00\"\x7d]");
+    check("sent query", hx(SENT), "2d0000000353454c4543542069642c206e616d652c2073636f72652c20646f632c20626f726e2046524f4d207573657273");
+    // No rows: an empty array
+    reset();
+    feed(1, "01");
+    feed(2, coldef("id", 8, 0));
+    feed(3, "fe00000200");
+    feed(4, "fe00000200");
+    check("no rows", mysql_query_json(& mut c, "SELECT id FROM users WHERE 0"), "[]");
+    println("text rows ok");
+
+    // ── A binary resultset (prepared statement) ──
+    reset();
+    feed(1, "000500000004000100000000");
+    feed(2, coldef("?", 253, 0));
+    feed(3, "fe00000200");
+    feed(4, coldef("id", 8, 0));
+    feed(5, coldef("score", 5, 0));
+    feed(6, coldef("small", 1, 0));
+    feed(7, coldef("born", 12, 0));
+    feed(8, "fe00000200");
+    val stmt: MysqlStmt = mysql_prepare(& mut c, "SELECT id, score, small, born FROM users WHERE name = ?");
+    check_b("prepared", stmt.ok, true);
+    reset();
+    feed(1, "04");
+    feed(2, coldef("id", 8, 0));
+    feed(3, coldef("score", 5, 0));
+    feed(4, coldef("small", 1, 0));
+    feed(5, coldef("born", 12, 0));
+    feed(6, "fe00000200");
+    feed(7, "0000" + "2a00000000000000" + "000000000000f43f" + "fe" + "0bea070b110a070040e20100");
+    feed(8, "0020" + "0700000000000000" + "000000000000f0bf" + "05");
+    feed(9, "fe00000200");
+    var args: Vec<MysqlParam> = Vec::new();
+    args.push(mysql_param_text("Ada"));
+    val bin: str = mysql_execute_json(& mut c, & stmt, args);
+    // 42, 1.25 (DOUBLE 0x3ff4...), TINY 0xfe signed, DATETIME with
+    // microseconds; then 7, -1.0, 5 and a NULL (bitmap bit 2+3)
+    check("binary rows", bin, "[\x7b\"id\":42,\"score\":1.25,\"small\":-2,\"born\":\"2026-11-17 10:07:00.123456\"\x7d,\x7b\"id\":7,\"score\":-1,\"small\":5,\"born\":null\x7d]");
+    check_b("binary rows valid", json_is_valid(bin), true);
+    println("binary rows ok");
+
+    // ── The Database capability ──
+    reset();
+    feed(1, "01");
+    feed(2, coldef("n", 8, 0));
+    feed(3, "fe00000200");
+    feed(4, lenenc_text("3"));
+    feed(5, "fe00000200");
+    check("query_one", query_one(c, "SELECT COUNT(*) AS n FROM users"), "\x7b\"n\":3\x7d");
+    reset();
+    feed(1, "0003000200" + "0000");
+    check_i("exec", c.exec("UPDATE users SET seen = 1"), 3);
+    check("sent update", hx(SENT), "1a0000000355504441544520757365727320534554207365656e203d2031");
+    reset();
+    feed(1, "ff7a042334325330325461626c65202773686f702e6e6f70652720646f65736e2774206578697374");
+    check("error rows", c.query("SELECT * FROM nope"), "[]");
+    reset();
+    feed(1, "ff7a042334325330325461626c65202773686f702e6e6f70652720646f65736e2774206578697374");
+    check_i("error exec", c.exec("DELETE FROM nope"), - 1);
+    // Nothing listens on port 1: a clean failure
+    val none: MysqlConn = mysql_connect_tcp("127.0.0.1", 1, "app", "pw", "");
+    check_b("no server", none.ok, false);
+    check("no server error", none.error, "cannot connect to 127.0.0.1:1");
+    println("database ok");
+    println("mysql db ok");
+    return 0;
+}

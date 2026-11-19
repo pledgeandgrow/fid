@@ -1,0 +1,81 @@
+// fasta (the Benchmarks Game, roadmap BM3): the ALU sequence repeated for
+// 2n characters, then 3n characters drawn from the IUB codes and 5n from
+// the Homo sapiens frequencies with the benchmark's linear congruential
+// generator (seed 42, IM 139968, IA 3877, IC 29573), n = 2500000. Instead of
+// writing the 25 MB of FASTA, the program folds every character into a
+// 32-bit hash, h = h * 31 + c, and prints it (887466333 for n = 2500000).
+// tests/bootstrap/test_verify_bm_fasta.fd is this program with n = 1000.
+fn alu_seq() -> str {
+    return "GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGAGGCGGGCGGATCACCTGAGGTCAGGAGTTCGAGACCAGCCTGGCCAACATGGTGAAACCCCGTCTCTACTAAAAATACAAAAATTAGCCGGGCGTGGTGGCGCGCGCCTGTAATCCCAGCTACTCGGGAGGCTGAGGCAGGAGAATCGCTTGAACCCGGGAGGCGGAGGTTGCAGTGAGCCGAGATCGCGCCACTGCACTCCAGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA";
+}
+
+fn repeat_hash(h0: i64, n: i64) -> i64 {
+    val alu: Vec<i64> = str_bytes(alu_seq());
+    val len: i64 = alu.len();
+    var h: i64 = h0;
+    var k: i64 = 0;
+    while k < n {
+        h = (h * 31 + alu.get(k % len)) & 4294967295;
+        k = k + 1;
+    }
+    return h;
+}
+
+// random_hash draws m characters; seed holds the generator's state
+// (seed.get(0)) and h the hash, both carried from one call to the next
+fn random_hash(h0: i64, seed: &mut Vec<i64>, chars: str, probs: Vec<f64>, m: i64) -> i64 {
+    val codes: Vec<i64> = str_bytes(chars);
+    var cum: Vec<f64> = Vec::new();
+    var p: f64 = 0.0;
+    var j: i64 = 0;
+    while j < probs.len() {
+        p = p + probs.get(j);
+        cum.push(p);
+        j = j + 1;
+    }
+    val last_i: i64 = cum.len() - 1;
+    var last: i64 = seed.get(0);
+    var h: i64 = h0;
+    var k: i64 = 0;
+    while k < m {
+        last = (last * 3877 + 29573) % 139968;
+        val r: f64 = (last as f64) / 139968.0;
+        var i: i64 = 0;
+        while i < last_i && r >= cum.get(i) {
+            i = i + 1;
+        }
+        h = (h * 31 + codes.get(i)) & 4294967295;
+        k = k + 1;
+    }
+    seed.set(0, last);
+    return h;
+}
+
+fn fasta(n: i64) -> i64 {
+    var h: i64 = repeat_hash(0, 2 * n);
+    var seed: Vec<i64> = Vec::new();
+    seed.push(42);
+    var iub: Vec<f64> = Vec::new();
+    iub.push(0.27);
+    iub.push(0.12);
+    iub.push(0.12);
+    iub.push(0.27);
+    var j: i64 = 0;
+    while j < 11 {
+        iub.push(0.02);
+        j = j + 1;
+    }
+    h = random_hash(h, &mut seed, "acgtBDHKMNRSVWY", iub, 3 * n);
+    var homo: Vec<f64> = Vec::new();
+    homo.push(0.3029549426680);
+    homo.push(0.1979883004921);
+    homo.push(0.1975473066391);
+    homo.push(0.3015094502008);
+    h = random_hash(h, &mut seed, "acgt", homo, 5 * n);
+    return h;
+}
+
+fn main() -> i64 {
+    println(fasta(2500000));
+    return 0;
+}

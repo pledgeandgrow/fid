@@ -1,0 +1,661 @@
+// Fides HTML building and parsing, pure Fides
+//
+// Two halves:
+//   - a builder with automatic escaping: elements, attributes and text are
+//     escaped for their context (text: & < >; attribute values also " ');
+//     void elements self-close, nothing else does
+//   - an HTML5-ish tokenizer and tree builder good enough for real pages:
+//     tags, attributes (quoted, unquoted, empty), comments, doctype, void
+//     elements, raw-text elements (script, style) read to their close tag,
+//     character references (named: the common ones, plus &#NN; and &#xHH;),
+//     and the implied end tags HTML needs most (a <p> closed by a block
+//     start or </div>; <li>, <dd>, <dt>, <td>, <th>, <tr>, <option>,
+//     <thead>/<tbody> closed by a sibling or their parent's close). The
+//     tree is a flat node arena; query it by tag, id or class.
+//
+// Everything here is real; there is no platform seam.
+//
+// Usage:
+//   val page: str = h_el("a", h_attrs1("href", "/x"), h_text("A & B"));
+//   // <a href="/x">A &amp; B</a>
+//   val doc: HtmlDoc = html_parse("<ul><li>a<li>b</ul>");
+//   val lis: Vec<i64> = html_by_tag(& doc, "li");
+
+module html;
+ use vec;
+
+// ─── escaping ───────────────────────────────────────────────────────────
+
+/// Escape text content (& < >).
+pub fn h_escape(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 38 { o = o + "&amp;"; }
+        else if c == 60 { o = o + "&lt;"; }
+        else if c == 62 { o = o + "&gt;"; }
+        else { o = o + char_to_str(c); }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Escape an attribute value (& < > " ').
+pub fn h_escape_attr(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 38 { o = o + "&amp;"; }
+        else if c == 60 { o = o + "&lt;"; }
+        else if c == 62 { o = o + "&gt;"; }
+        else if c == 34 { o = o + "&quot;"; }
+        else if c == 39 { o = o + "&#39;"; }
+        else { o = o + char_to_str(c); }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Is `tag` a void element (no end tag, no content)?
+pub fn h_is_void(tag: str) -> bool {
+    return tag == "area" || tag == "base" || tag == "br" || tag == "col" || tag == "embed" || tag == "hr" || tag == "img" || tag == "input" || tag == "link" || tag == "meta" || tag == "param" || tag == "source" || tag == "track" || tag == "wbr";
+}
+
+fn h_is_rawtext(tag: str) -> bool {
+    return tag == "script" || tag == "style" || tag == "textarea" || tag == "title";
+}
+
+// script/style keep their text verbatim; title/textarea decode references.
+fn h_is_rcdata(tag: str) -> bool {
+    return tag == "title" || tag == "textarea";
+}
+
+// ─── building ───────────────────────────────────────────────────────────
+
+/// An attribute list: parallel names and values. A value of "" with the
+/// name marked boolean prints the bare name (checked, disabled...).
+pub struct HAttrs {
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub bare: Vec<bool>,
+}
+
+pub fn h_attrs() -> HAttrs {
+    return HAttrs { names: Vec::new(), vals: Vec::new(), bare: Vec::new() };
+}
+
+/// Add a name=value attribute.
+pub fn h_attr(a: & mut HAttrs, name: str, value: str) {
+    a.names.push(name);
+    a.vals.push(value);
+    a.bare.push(false);
+}
+
+/// Add a boolean attribute (printed as the bare name).
+pub fn h_attr_bool(a: & mut HAttrs, name: str) {
+    a.names.push(name);
+    a.vals.push("");
+    a.bare.push(true);
+}
+
+/// A one-attribute list (a common case).
+pub fn h_attrs1(name: str, value: str) -> HAttrs {
+    var a: HAttrs = h_attrs();
+    h_attr(& mut a, name, value);
+    return a;
+}
+
+/// Render an attribute list (with a leading space when non-empty).
+pub fn h_render_attrs(a: & HAttrs) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < a.names.len() {
+        o = o + " " + a.names.get(i);
+        if !a.bare.get(i) {
+            o = o + "=\"" + h_escape_attr(a.vals.get(i)) + "\"";
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// An element with attributes and already-rendered inner HTML.
+pub fn h_el(tag: str, attrs: HAttrs, inner: str) -> str {
+    if h_is_void(tag) {
+        return "<" + tag + h_render_attrs(& attrs) + ">";
+    }
+    return "<" + tag + h_render_attrs(& attrs) + ">" + inner + "</" + tag + ">";
+}
+
+/// An element with no attributes.
+pub fn h_tag(tag: str, inner: str) -> str {
+    return h_el(tag, h_attrs(), inner);
+}
+
+/// A text node (escaped).
+pub fn h_text(s: str) -> str {
+    return h_escape(s);
+}
+
+/// Join rendered children.
+pub fn h_seq(parts: Vec<str>) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        o = o + parts.get(i);
+        i = i + 1;
+    }
+    return o;
+}
+
+/// A complete document with a doctype.
+pub fn h_document(head: str, body: str) -> str {
+    return "<!DOCTYPE html>\n<html>" + h_tag("head", head) + h_tag("body", body) + "</html>";
+}
+
+// ─── character references ───────────────────────────────────────────────
+
+fn h_named_ref(name: str) -> i64 {
+    if name == "amp" { return 38; }
+    if name == "lt" { return 60; }
+    if name == "gt" { return 62; }
+    if name == "quot" { return 34; }
+    if name == "apos" { return 39; }
+    if name == "nbsp" { return 160; }
+    if name == "copy" { return 169; }
+    if name == "reg" { return 174; }
+    if name == "trade" { return 8482; }
+    if name == "mdash" { return 8212; }
+    if name == "ndash" { return 8211; }
+    if name == "hellip" { return 8230; }
+    if name == "lsquo" { return 8216; }
+    if name == "rsquo" { return 8217; }
+    if name == "ldquo" { return 8220; }
+    if name == "rdquo" { return 8221; }
+    if name == "euro" { return 8364; }
+    if name == "times" { return 215; }
+    if name == "middot" { return 183; }
+    return - 1;
+}
+
+fn h_utf8(cp: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    if cp < 0x80 {
+        b.push(cp);
+    } else if cp < 0x800 {
+        b.push(0xC0 | (cp >> 6));
+        b.push(0x80 | (cp & 0x3F));
+    } else if cp < 0x10000 {
+        b.push(0xE0 | (cp >> 12));
+        b.push(0x80 | ((cp >> 6) & 0x3F));
+        b.push(0x80 | (cp & 0x3F));
+    } else {
+        b.push(0xF0 | (cp >> 18));
+        b.push(0x80 | ((cp >> 12) & 0x3F));
+        b.push(0x80 | ((cp >> 6) & 0x3F));
+        b.push(0x80 | (cp & 0x3F));
+    }
+    return str_from_bytes(b);
+}
+
+fn h_hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return - 1;
+}
+
+/// Decode HTML character references in `s` (named, decimal, hex).
+pub fn h_unescape(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c != 38 {
+            o = o + char_to_str(c);
+            i = i + 1;
+        } else {
+            // find the ';' within 32 chars
+            var j: i64 = i + 1;
+            var semi: i64 = - 1;
+            while j < n && j < i + 33 {
+                if str_byte_at(s, j) == 59 {
+                    semi = j;
+                    j = n;
+                } else {
+                    j = j + 1;
+                }
+            }
+            if semi < 0 {
+                o = o + "&";
+                i = i + 1;
+            } else {
+                val body: str = str_slice(s, i + 1, semi);
+                var cp: i64 = - 1;
+                if str_len(body) >= 2 && str_byte_at(body, 0) == 35 {
+                    if str_byte_at(body, 1) == 120 || str_byte_at(body, 1) == 88 {
+                        cp = 0;
+                        var k: i64 = 2;
+                        var okh: bool = str_len(body) > 2;
+                        while k < str_len(body) {
+                            val d: i64 = h_hexv(str_byte_at(body, k));
+                            if d < 0 { okh = false; }
+                            cp = cp * 16 + d;
+                            k = k + 1;
+                        }
+                        if !okh { cp = - 1; }
+                    } else {
+                        cp = 0;
+                        var k: i64 = 1;
+                        var okd: bool = str_len(body) > 1;
+                        while k < str_len(body) {
+                            val d: i64 = str_byte_at(body, k);
+                            if d < 48 || d > 57 { okd = false; }
+                            cp = cp * 10 + (d - 48);
+                            k = k + 1;
+                        }
+                        if !okd { cp = - 1; }
+                    }
+                } else {
+                    cp = h_named_ref(body);
+                }
+                if cp >= 0 {
+                    o = o + h_utf8(cp);
+                    i = semi + 1;
+                } else {
+                    o = o + "&";
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    return o;
+}
+
+// ─── tree model ─────────────────────────────────────────────────────────
+
+pub const H_ELEMENT: i64 = 0;
+pub const H_TEXT: i64 = 1;
+pub const H_COMMENT: i64 = 2;
+
+/// A node of the parse tree (flat arena, children by index).
+pub struct HtmlNode {
+    pub kind: i64,
+    pub tag: str,
+    pub text: str,
+    pub attrs: HAttrs,
+    pub parent: i64,
+    pub children: Vec<i64>,
+}
+
+pub struct HtmlDoc {
+    pub nodes: Vec<HtmlNode>,
+    pub root: i64,
+}
+
+fn h_new_node(d: & mut HtmlDoc, kind: i64, tag: str, text: str, parent: i64) -> i64 {
+    d.nodes.push(HtmlNode { kind: kind, tag: tag, text: text, attrs: h_attrs(), parent: parent, children: Vec::new() });
+    val id: i64 = d.nodes.len() - 1;
+    if parent >= 0 {
+        var p: HtmlNode = d.nodes.get(parent);
+        p.children.push(id);
+        d.nodes.set(parent, p);
+    }
+    return id;
+}
+
+// ─── tokenizer + tree builder ───────────────────────────────────────────
+
+struct HP {
+    s: str,
+    i: i64,
+}
+
+fn hp_name(c: i64) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 58;
+}
+
+fn h_lower(s: str) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c >= 65 && c <= 90 { c = c + 32; }
+        o = o + char_to_str(c);
+        i = i + 1;
+    }
+    return o;
+}
+
+fn hp_ws(p: & mut HP) {
+    while p.i < str_len(p.s) {
+        val c: i64 = str_byte_at(p.s, p.i);
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            p.i = p.i + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+// pops the open stack until a tag matching `tag` is removed; no-op if none
+fn h_close_to(stack: & mut Vec<i64>, d: & HtmlDoc, tag: str) {
+    var k: i64 = stack.len() - 1;
+    while k >= 0 {
+        if d.nodes.get(stack.get(k)).tag == tag {
+            while stack.len() > k {
+                stack.pop();
+            }
+            return;
+        }
+        k = k - 1;
+    }
+}
+
+fn h_top_tag(stack: & Vec<i64>, d: & HtmlDoc) -> str {
+    if stack.len() == 0 {
+        return "";
+    }
+    return d.nodes.get(stack.get(stack.len() - 1)).tag;
+}
+
+// HTML's implied-end-tag rules for the common inline/list/table cases:
+// before opening `tag`, close siblings that cannot contain it.
+fn h_imply(stack: & mut Vec<i64>, d: & HtmlDoc, tag: str) {
+    var top: str = h_top_tag(stack, d);
+    if tag == "li" && top == "li" { stack.pop(); }
+    else if (tag == "dd" || tag == "dt") && (top == "dd" || top == "dt") { stack.pop(); }
+    else if tag == "option" && top == "option" { stack.pop(); }
+    else if tag == "tr" {
+        if top == "td" || top == "th" { stack.pop(); top = h_top_tag(stack, d); }
+        if top == "tr" { stack.pop(); }
+    }
+    else if (tag == "td" || tag == "th") && (top == "td" || top == "th") { stack.pop(); }
+    else if (tag == "thead" || tag == "tbody" || tag == "tfoot") {
+        if top == "td" || top == "th" { stack.pop(); top = h_top_tag(stack, d); }
+        if top == "tr" { stack.pop(); top = h_top_tag(stack, d); }
+        if top == "thead" || top == "tbody" || top == "tfoot" { stack.pop(); }
+    }
+    else if h_closes_p(tag) && top == "p" { stack.pop(); }
+}
+
+fn h_closes_p(tag: str) -> bool {
+    return tag == "p" || tag == "div" || tag == "ul" || tag == "ol" || tag == "li" || tag == "table" || tag == "h1" || tag == "h2" || tag == "h3" || tag == "h4" || tag == "h5" || tag == "h6" || tag == "blockquote" || tag == "pre" || tag == "section" || tag == "article" || tag == "header" || tag == "footer" || tag == "form" || tag == "hr";
+}
+
+fn h_cur_parent(stack: & Vec<i64>, root: i64) -> i64 {
+    if stack.len() == 0 {
+        return root;
+    }
+    return stack.get(stack.len() - 1);
+}
+
+/// Parse HTML into a tree. The root is an element node named "#document".
+pub fn html_parse(src: str) -> HtmlDoc {
+    var d: HtmlDoc = HtmlDoc { nodes: Vec::new(), root: 0 };
+    val root: i64 = h_new_node(& mut d, H_ELEMENT, "#document", "", - 1);
+    d.root = root;
+    var stack: Vec<i64> = Vec::new();
+    var p: HP = HP { s: src, i: 0 };
+    val n: i64 = str_len(src);
+    while p.i < n {
+        val c: i64 = str_byte_at(p.s, p.i);
+        if c == 60 {
+            if p.i + 3 < n && str_byte_at(p.s, p.i + 1) == 33 && str_byte_at(p.s, p.i + 2) == 45 && str_byte_at(p.s, p.i + 3) == 45 {
+                // comment
+                val e: i64 = str_find(str_slice(p.s, p.i + 4, n), "-->");
+                var end: i64 = n;
+                if e >= 0 { end = p.i + 4 + e; }
+                h_new_node(& mut d, H_COMMENT, "", str_slice(p.s, p.i + 4, end), h_cur_parent(& stack, root));
+                p.i = end + 3;
+            } else if p.i + 1 < n && str_byte_at(p.s, p.i + 1) == 33 {
+                // doctype or other declaration: skip to '>'
+                val e: i64 = str_find(str_slice(p.s, p.i, n), ">");
+                if e < 0 { p.i = n; } else { p.i = p.i + e + 1; }
+            } else if p.i + 1 < n && str_byte_at(p.s, p.i + 1) == 47 {
+                // end tag
+                p.i = p.i + 2;
+                val st: i64 = p.i;
+                while p.i < n && hp_name(str_byte_at(p.s, p.i)) {
+                    p.i = p.i + 1;
+                }
+                val tag: str = h_lower(str_slice(p.s, st, p.i));
+                while p.i < n && str_byte_at(p.s, p.i) != 62 {
+                    p.i = p.i + 1;
+                }
+                p.i = p.i + 1;
+                h_close_to(& mut stack, & d, tag);
+            } else if p.i + 1 < n && hp_name(str_byte_at(p.s, p.i + 1)) {
+                // start tag
+                p.i = p.i + 1;
+                val st: i64 = p.i;
+                while p.i < n && hp_name(str_byte_at(p.s, p.i)) {
+                    p.i = p.i + 1;
+                }
+                val tag: str = h_lower(str_slice(p.s, st, p.i));
+                var attrs: HAttrs = h_attrs();
+                hp_ws(& mut p);
+                var selfclose: bool = false;
+                while p.i < n && str_byte_at(p.s, p.i) != 62 {
+                    if str_byte_at(p.s, p.i) == 47 {
+                        selfclose = true;
+                        p.i = p.i + 1;
+                        hp_ws(& mut p);
+                    } else {
+                        val ns: i64 = p.i;
+                        while p.i < n && hp_name(str_byte_at(p.s, p.i)) {
+                            p.i = p.i + 1;
+                        }
+                        val aname: str = h_lower(str_slice(p.s, ns, p.i));
+                        if str_len(aname) == 0 {
+                            p.i = p.i + 1;
+                        } else {
+                            hp_ws(& mut p);
+                            if p.i < n && str_byte_at(p.s, p.i) == 61 {
+                                p.i = p.i + 1;
+                                hp_ws(& mut p);
+                                var aval: str = "";
+                                val q: i64 = str_byte_at(p.s, p.i);
+                                if q == 34 || q == 39 {
+                                    p.i = p.i + 1;
+                                    val vs: i64 = p.i;
+                                    while p.i < n && str_byte_at(p.s, p.i) != q {
+                                        p.i = p.i + 1;
+                                    }
+                                    aval = h_unescape(str_slice(p.s, vs, p.i));
+                                    p.i = p.i + 1;
+                                } else {
+                                    val vs: i64 = p.i;
+                                    while p.i < n && str_byte_at(p.s, p.i) != 62 && str_byte_at(p.s, p.i) != 32 && str_byte_at(p.s, p.i) != 9 && str_byte_at(p.s, p.i) != 10 && str_byte_at(p.s, p.i) != 13 {
+                                        p.i = p.i + 1;
+                                    }
+                                    aval = h_unescape(str_slice(p.s, vs, p.i));
+                                }
+                                h_attr(& mut attrs, aname, aval);
+                            } else {
+                                h_attr_bool(& mut attrs, aname);
+                            }
+                            hp_ws(& mut p);
+                        }
+                    }
+                }
+                p.i = p.i + 1;  // past '>'
+                h_imply(& mut stack, & d, tag);
+                val id: i64 = h_new_node(& mut d, H_ELEMENT, tag, "", h_cur_parent(& stack, root));
+                var node: HtmlNode = d.nodes.get(id);
+                node.attrs = attrs;
+                d.nodes.set(id, node);
+                if !h_is_void(tag) && !selfclose {
+                    if h_is_rawtext(tag) {
+                        val close: str = "</" + tag;
+                        val rest: str = str_slice(p.s, p.i, n);
+                        val e: i64 = str_find(h_lower(rest), close);
+                        var end: i64 = n;
+                        if e >= 0 { end = p.i + e; }
+                        if end > p.i {
+                            var raw: str = str_slice(p.s, p.i, end);
+                            if h_is_rcdata(tag) {
+                                raw = h_unescape(raw);
+                            }
+                            h_new_node(& mut d, H_TEXT, "", raw, id);
+                        }
+                        p.i = end;
+                        // skip the close tag
+                        while p.i < n && str_byte_at(p.s, p.i) != 62 {
+                            p.i = p.i + 1;
+                        }
+                        p.i = p.i + 1;
+                    } else {
+                        stack.push(id);
+                    }
+                }
+            } else {
+                // a lone '<'
+                h_new_node(& mut d, H_TEXT, "", "<", h_cur_parent(& stack, root));
+                p.i = p.i + 1;
+            }
+        } else {
+            // text up to the next '<'
+            val st: i64 = p.i;
+            while p.i < n && str_byte_at(p.s, p.i) != 60 {
+                p.i = p.i + 1;
+            }
+            val raw: str = str_slice(p.s, st, p.i);
+            h_new_node(& mut d, H_TEXT, "", h_unescape(raw), h_cur_parent(& stack, root));
+        }
+    }
+    return d;
+}
+
+// ─── queries ────────────────────────────────────────────────────────────
+
+/// An attribute's value, "" when absent.
+pub fn html_attr(node: & HtmlNode, name: str) -> str {
+    var i: i64 = 0;
+    while i < node.attrs.names.len() {
+        if node.attrs.names.get(i) == name {
+            return node.attrs.vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn html_has_attr(node: & HtmlNode, name: str) -> bool {
+    var i: i64 = 0;
+    while i < node.attrs.names.len() {
+        if node.attrs.names.get(i) == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn h_has_class(node: & HtmlNode, cls: str) -> bool {
+    val classes: Vec<str> = str_split(html_attr(node, "class"), " ");
+    var i: i64 = 0;
+    while i < classes.len() {
+        if classes.get(i) == cls {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The indexes of every element with tag name `tag`.
+pub fn html_by_tag(d: & HtmlDoc, tag: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < d.nodes.len() {
+        val nd: HtmlNode = d.nodes.get(i);
+        if nd.kind == H_ELEMENT && nd.tag == tag {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The first element whose id attribute is `id`, or -1.
+pub fn html_by_id(d: & HtmlDoc, id: str) -> i64 {
+    var i: i64 = 0;
+    while i < d.nodes.len() {
+        val nd: HtmlNode = d.nodes.get(i);
+        if nd.kind == H_ELEMENT && html_attr(& nd, "id") == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Every element carrying class `cls`.
+pub fn html_by_class(d: & HtmlDoc, cls: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < d.nodes.len() {
+        val nd: HtmlNode = d.nodes.get(i);
+        if nd.kind == H_ELEMENT && h_has_class(& nd, cls) {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The concatenated text of a node and its descendants.
+pub fn html_text_of(d: & HtmlDoc, node: i64) -> str {
+    val nd: HtmlNode = d.nodes.get(node);
+    if nd.kind == H_TEXT {
+        return nd.text;
+    }
+    var o: str = "";
+    var i: i64 = 0;
+    while i < nd.children.len() {
+        o = o + html_text_of(d, nd.children.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+/// The number of element nodes in the tree.
+pub fn html_element_count(d: & HtmlDoc) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < d.nodes.len() {
+        if d.nodes.get(i).kind == H_ELEMENT && d.nodes.get(i).tag != "#document" {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Serialize a node back to HTML (re-escaping text and attributes).
+pub fn html_render(d: & HtmlDoc, node: i64) -> str {
+    val nd: HtmlNode = d.nodes.get(node);
+    if nd.kind == H_TEXT {
+        return h_escape(nd.text);
+    }
+    if nd.kind == H_COMMENT {
+        return "<!--" + nd.text + "-->";
+    }
+    var inner: str = "";
+    var i: i64 = 0;
+    while i < nd.children.len() {
+        inner = inner + html_render(d, nd.children.get(i));
+        i = i + 1;
+    }
+    if nd.tag == "#document" {
+        return inner;
+    }
+    if h_is_void(nd.tag) {
+        return "<" + nd.tag + h_render_attrs(& nd.attrs) + ">";
+    }
+    return "<" + nd.tag + h_render_attrs(& nd.attrs) + ">" + inner + "</" + nd.tag + ">";
+}

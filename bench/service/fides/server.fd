@@ -1,0 +1,142 @@
+// bench/service/fides/server.fd — the Fides server of the service
+// benchmarks (competitive roadmap BM5), the TechEmpower test types:
+//
+//   GET /plaintext          "Hello, World!"                      text/plain
+//   GET /json               {"message":"Hello, World!"}          application/json
+//   GET /db                 one random row of the World table:
+//                           {"id":N,"randomNumber":M}
+//   GET /queries?queries=Q  Q random rows (Q clamped to 1..500), a JSON array
+//   anything else           404
+//
+//   server [port]           serve on port (default 8080) until killed
+//   server --selftest       print the reply of each route once, no socket
+//
+// The World table is 10,000 rows held in the process (a Vec), not in a
+// database server: bench/service/README.md says what that leaves out of
+// the TechEmpower "db" and "queries" tests. Row i's randomNumber is
+// (i * 7919 + 13) % 10000 + 1 in every server of the benchmark, and rows
+// are picked by the same 31-bit LCG, so every server's replies have the same
+// form and the load client checks each one.
+
+use http;
+
+const WORLD_ROWS: i64 = 10000;
+
+var world: Vec<i64> = Vec::new();
+var rng_state: i64 = 42;
+
+fn world_init() {
+    var i: i64 = 0;
+    while i <= WORLD_ROWS {
+        world.push((i * 7919 + 13) % WORLD_ROWS + 1);
+        i = i + 1;
+    }
+}
+
+/// A row id in 1..10000 (a 31-bit LCG, the same in every server; the
+/// product stays under 2^62, so no language's overflow check fires).
+fn next_id() -> i64 {
+    rng_state = (rng_state * 1103515245 + 12345) % 2147483648;
+    return (rng_state >> 8) % WORLD_ROWS + 1;
+}
+
+fn row_json(sb: & mut StringBuilder, id: i64) {
+    sb.append_str("{\"id\":");
+    sb.append_int(id);
+    sb.append_str(",\"randomNumber\":");
+    sb.append_int(world.get(id));
+    sb.append_str("}");
+}
+
+fn one_row() -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    row_json(&mut sb, next_id());
+    return sb.to_str();
+}
+
+/// The `queries` parameter as TechEmpower reads it: missing or not a number
+/// is 1, then clamped to 1..500.
+fn query_count(query: str) -> i64 {
+    var q: i64 = 1;
+    if str_starts_with(query, "queries=") && str_len(query) > 8 {
+        q = str_parse_int(str_slice(query, 8, str_len(query)));
+    }
+    if q < 1 {
+        q = 1;
+    }
+    if q > 500 {
+        q = 500;
+    }
+    return q;
+}
+
+fn rows(q: i64) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    sb.append_str("[");
+    var i: i64 = 0;
+    while i < q {
+        if i > 0 {
+            sb.append_str(",");
+        }
+        row_json(&mut sb, next_id());
+        i = i + 1;
+    }
+    sb.append_str("]");
+    return sb.to_str();
+}
+
+fn reply(path: str, query: str) -> str {
+    if path == "/plaintext" {
+        return build_response(200, "text/plain", "Hello, World!");
+    }
+    if path == "/json" {
+        return build_response(200, "application/json", "{\"message\":\"Hello, World!\"}");
+    }
+    if path == "/db" {
+        return build_response(200, "application/json", one_row());
+    }
+    if path == "/queries" {
+        return build_response(200, "application/json", rows(query_count(query)));
+    }
+    return build_response(404, "text/plain", "not found\n");
+}
+
+fn route(req: ScopedRequest) -> str {
+    if req.method != "GET" {
+        return build_response(405, "text/plain", "method not allowed\n");
+    }
+    return reply(str_clone(req.path), str_clone(req.query));
+}
+
+fn selftest() -> i64 {
+    println(reply("/plaintext", ""));
+    println(reply("/json", ""));
+    println(reply("/db", ""));
+    println(reply("/queries", "queries=3"));
+    println(reply("/queries", "queries=0"));
+    println(reply("/queries", "queries=abc"));
+    println(int_to_str(query_count("queries=900")));
+    println(reply("/nope", ""));
+    return 0;
+}
+
+fn main() -> i64 {
+    world_init();
+    var port: i64 = 8080;
+    match arg_at(1) {
+        Option::Some(a) => {
+            if a == "--selftest" {
+                return selftest();
+            }
+            port = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    println("listening on " + int_to_str(port));
+    if !http_serve_scoped(port, route) {
+        println("cannot listen on " + int_to_str(port));
+        return 1;
+    }
+    return 0;
+}

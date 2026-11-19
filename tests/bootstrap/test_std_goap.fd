@@ -1,0 +1,98 @@
+// stdlib/goap: world-state facts, actions with preconditions/effects/costs, A* plans (get wood, build), no-plan and already-done cases
+// Expected output:
+// state gold=1; wood=0 missing=0
+// build a house: buy_axe -> chop_log -> chop_log -> build_house cost 9
+// simulated: ok final axe=1;house=1;
+// no gold: collect_branches -> collect_branches -> collect_branches -> collect_branches -> build_house cost 19
+// house and 2 wood: buy_axe -> chop_log -> chop_log -> chop_log -> build_house cost 11
+// already built: (nothing to do) cost 0
+// two gold: no plan (expanded 30)
+// budget 3: no plan (expanded 3)
+// first plan without gold: fails at step 0
+use goap;
+
+fn show(label: str, p: &GoapPlan) {
+    if !p.ok {
+        println(label + ": no plan (expanded " + int_to_str(p.expanded) + ")");
+        return;
+    }
+    var s: str = "";
+    var i: i64 = 0;
+    while i < p.actions.len() {
+        if i > 0 { s = s + " -> "; }
+        s = s + p.actions.get(i);
+        i = i + 1;
+    }
+    if p.actions.len() == 0 { s = "(nothing to do)"; }
+    println(label + ": " + s + " cost " + int_to_str(p.cost as i64));
+}
+
+fn main() {
+    // facts
+    var st: GoapState = goap_state();
+    goap_set(&mut st, "wood", 0);
+    goap_set(&mut st, "gold", 1);
+    goap_set(&mut st, "axe", 0);
+    println("state " + goap_state_key(&st) + " wood=" + int_to_str(goap_get(&st, "wood")) + " missing=" + int_to_str(goap_get(&st, "nothing")));
+
+    var acts: Vec<GoapAction> = Vec::new();
+    var buy: GoapAction = goap_action("buy_axe", 2.0);
+    goap_pre(&mut buy, "gold", GOAP_GE, 1);
+    goap_pre(&mut buy, "axe", GOAP_EQ, 0);
+    goap_effect_set(&mut buy, "axe", 1);
+    goap_add(&mut buy, "gold", -1);
+    acts.push(buy);
+    var branches: GoapAction = goap_action("collect_branches", 4.0);
+    goap_pre(&mut branches, "wood", GOAP_LT, 6);
+    goap_add(&mut branches, "wood", 1);
+    acts.push(branches);
+    var chop: GoapAction = goap_action("chop_log", 2.0);
+    goap_pre(&mut chop, "axe", GOAP_EQ, 1);
+    goap_pre(&mut chop, "wood", GOAP_LT, 6);
+    goap_add(&mut chop, "wood", 2);
+    acts.push(chop);
+    var build: GoapAction = goap_action("build_house", 3.0);
+    goap_pre(&mut build, "wood", GOAP_GE, 4);
+    goap_effect_set(&mut build, "house", 1);
+    goap_add(&mut build, "wood", -4);
+    acts.push(build);
+
+    var goal: GoapGoal = goap_goal();
+    goap_goal_add(&mut goal, "house", GOAP_EQ, 1);
+    val plan: GoapPlan = goap_plan(&st, &goal, &acts, 5000);
+    show("build a house", &plan);
+    val run: GoapRun = goap_simulate(&st, &plan, &acts);
+    println("simulated: " + if run.ok { "ok" } else { "FAILED" } + " final " + goap_state_key(&run.state));
+
+    // no gold: the axe cannot be bought, branches are the only way
+    var poor: GoapState = goap_state();
+    val p2: GoapPlan = goap_plan(&poor, &goal, &acts, 5000);
+    show("no gold", &p2);
+
+    // two goals at once
+    var g2: GoapGoal = goap_goal();
+    goap_goal_add(&mut g2, "house", GOAP_EQ, 1);
+    goap_goal_add(&mut g2, "wood", GOAP_GE, 2);
+    val p3: GoapPlan = goap_plan(&st, &g2, &acts, 5000);
+    show("house and 2 wood", &p3);
+
+    // already satisfied
+    var done: GoapState = goap_state();
+    goap_set(&mut done, "house", 1);
+    val p4: GoapPlan = goap_plan(&done, &goal, &acts, 5000);
+    show("already built", &p4);
+
+    // impossible: nothing makes gold; the finite state space is exhausted
+    var g3: GoapGoal = goap_goal();
+    goap_goal_add(&mut g3, "gold", GOAP_GE, 2);
+    val p5: GoapPlan = goap_plan(&st, &g3, &acts, 5000);
+    show("two gold", &p5);
+
+    // a budget too small
+    val p6: GoapPlan = goap_plan(&poor, &goal, &acts, 3);
+    show("budget 3", &p6);
+
+    // a plan that does not fit the state fails simulation
+    val bad: GoapRun = goap_simulate(&poor, &plan, &acts);
+    println("first plan without gold: " + if bad.ok { "ok" } else { "fails at step " + int_to_str(bad.failed_at) });
+}

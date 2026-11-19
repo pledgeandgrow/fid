@@ -17,17 +17,14 @@
 //   - Schema: 0
 //   - Instructions: (opcode << 16 | word_count) + operands
 //
-// Note: This module operates on PIR L3 modules. The self-hosted PIR
-// representation (compiler/pir.fd) uses opaque i64 handles for L3Module.
-// The public API functions accept the module as i64 and dispatch through
-// the available PIR accessors. Where direct PIR access is not available,
-// the port provides the structural emitter (header, type table, constant
-// table, instruction dispatch) and the caller wires the actual module
-// iteration.
+// Input: the IR module (compiler/ir.fd) from `fid gpu <file> --target
+// spirv|ptx` (main.fd cmd_gpu, no optimizer). Nov 16 (llvm-roadmap MI18):
+// read from the IR, no longer from PIR's L3, so `fid gpu` does not keep
+// pir.fd on a build path. Integer kernels only: see SpirVCodeGen and
+// PtxCodeGen below for what is translated. scripts/spirv-check.py checks
+// the structure of a written .spv.
 
-module compiler::gpu;
- use core; use vec; use string; use compiler::pir; use compiler::ast;
-// Wrapper structs for tuple-like data (Fides has no tuples)
+module compiler::gpu; use core; use vec; use string; use compiler::ir; use compiler::ast;  // Wrapper structs for tuple-like data (Fides has no tuples)
 pub struct GpuStrI64 {
     pub a: str,
     pub b: i64,
@@ -50,34 +47,281 @@ pub fn GpuI64I64_new(a: i64, b: i64) -> GpuI64I64 {
     };
 }
 
-// --- SPIR-V constants ---
+// --- SPIR-V constants (numbers of the SPIR-V 1.0 specification) ---
+//
+// Nov 15 (known-bugs 2g.21): the generator was rewritten. Before, every
+// instruction with a result had a word count one short, type instructions
+// had no result id, the opcode numbers of the arithmetic and comparisons
+// were wrong (OpIAdd is 128, not 126), Int64 was capability 33 (it is 11),
+// types and constants were written inside the function, branch targets
+// were ids no OpLabel defined, and `--text` named every instruction OpNop
+// (a `match` on const names binds the first arm).
 
-pub const SPIRV_MAGIC: i64 = 0x07230203; pub const SPIRV_VERSION_1_0: i64 = 0x00010000; pub const SPIRV_GENERATOR: i64 = 0;
-// SPIR-V opcodes
-pub const OP_NOP: i64 = 0; pub const OP_MEMORY_MODEL: i64 = 14; pub const OP_ENTRY_POINT: i64 = 15; pub const OP_EXECUTION_MODE: i64 = 16; pub const OP_TYPE_VOID: i64 = 19; pub const OP_TYPE_BOOL: i64 = 20; pub const OP_TYPE_INT: i64 = 21; pub const OP_TYPE_FLOAT: i64 = 22; pub const OP_TYPE_FUNCTION: i64 = 33; pub const OP_CONSTANT: i64 = 43; pub const OP_FUNCTION: i64 = 54; pub const OP_FUNCTION_END: i64 = 56; pub const OP_LOAD: i64 = 61; pub const OP_STORE: i64 = 62; pub const OP_IADD: i64 = 126; pub const OP_ISUB: i64 = 127; pub const OP_IMUL: i64 = 128; pub const OP_SDIV: i64 = 129; pub const OP_SMOD: i64 = 131; pub const OP_BITWISE_AND: i64 = 134; pub const OP_BITWISE_OR: i64 = 135; pub const OP_BITWISE_XOR: i64 = 136; pub const OP_SHIFT_LEFT: i64 = 137; pub const OP_SHIFT_RIGHT: i64 = 139; pub const OP_I_EQUAL: i64 = 161; pub const OP_I_NOT_EQUAL: i64 = 162; pub const OP_S_LESS_THAN: i64 = 163; pub const OP_S_GREATER_THAN: i64 = 164; pub const OP_S_LESS_THAN_EQUAL: i64 = 165; pub const OP_S_GREATER_THAN_EQUAL: i64 = 166; pub const OP_LABEL: i64 = 248; pub const OP_BRANCH: i64 = 249; pub const OP_BRANCH_CONDITIONAL: i64 = 250; pub const OP_RETURN: i64 = 253; pub const OP_RETURN_VALUE: i64 = 254;
-// SPIR-V capabilities
-pub const CAP_SHADER: i64 = 1; pub const CAP_INT64: i64 = 33;
-// SPIR-V execution models
-pub const EXEC_MODEL_GLCOMPUTE: i64 = 5;
-// SPIR-V addressing models
-pub const ADDRESSING_MODEL_LOGICAL: i64 = 0;
-// SPIR-V memory models
-pub const MEMORY_MODEL_GLSL450: i64 = 1;
+pub const SPIRV_MAGIC: i64 = 0x07230203;
+pub const SPIRV_VERSION_1_0: i64 = 0x00010000;
+pub const SPIRV_GENERATOR: i64 = 0;
+// Opcodes
+const SPV_MEMORY_MODEL: i64 = 14;
+const SPV_ENTRY_POINT: i64 = 15;
+const SPV_EXECUTION_MODE: i64 = 16;
+const SPV_CAPABILITY: i64 = 17;
+const SPV_TYPE_VOID: i64 = 19;
+const SPV_TYPE_BOOL: i64 = 20;
+const SPV_TYPE_INT: i64 = 21;
+const SPV_TYPE_POINTER: i64 = 32;
+const SPV_TYPE_FUNCTION: i64 = 33;
+const SPV_CONSTANT: i64 = 43;
+const SPV_FUNCTION: i64 = 54;
+const SPV_FUNCTION_END: i64 = 56;
+const SPV_VARIABLE: i64 = 59;
+const SPV_LOAD: i64 = 61;
+const SPV_STORE: i64 = 62;
+const SPV_S_NEGATE: i64 = 126;
+const SPV_IADD: i64 = 128;
+const SPV_ISUB: i64 = 130;
+const SPV_IMUL: i64 = 132;
+const SPV_SDIV: i64 = 135;
+const SPV_SREM: i64 = 138;
+const SPV_SELECT: i64 = 169;
+const SPV_IEQUAL: i64 = 170;
+const SPV_INOT_EQUAL: i64 = 171;
+const SPV_SGREATER: i64 = 173;
+const SPV_SGREATER_EQ: i64 = 175;
+const SPV_SLESS: i64 = 177;
+const SPV_SLESS_EQ: i64 = 179;
+const SPV_SHR_ARITH: i64 = 195;
+const SPV_SHL: i64 = 196;
+const SPV_BIT_OR: i64 = 197;
+const SPV_BIT_XOR: i64 = 198;
+const SPV_BIT_AND: i64 = 199;
+const SPV_NOT: i64 = 200;
+const SPV_LABEL: i64 = 248;
+const SPV_BRANCH: i64 = 249;
+const SPV_BRANCH_COND: i64 = 250;
+const SPV_RETURN: i64 = 253;
+const SPV_UNREACHABLE: i64 = 255;
+// Operand values
+const SPV_CAP_SHADER: i64 = 1;
+const SPV_CAP_INT64: i64 = 11;
+const SPV_EXEC_GLCOMPUTE: i64 = 5;
+const SPV_ADDR_LOGICAL: i64 = 0;
+const SPV_MEM_GLSL450: i64 = 1;
+const SPV_MODE_LOCAL_SIZE: i64 = 17;
+const SPV_SC_FUNCTION: i64 = 7;
+
+// --- Reading the IR (both generators) ---
+
+/// The kernel to write: the first @kernel function, else `main`, else -1.
+fn gpu_kernel_index(module: & IrModule) -> i64 {
+    var main_idx: i64 = - 1;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        var f: IrFunction = module.functions.get(i).func;
+        if f.is_kernel {
+            return i;
+        }
+        if module.functions.get(i).name == "main" && main_idx < 0 {
+            main_idx = i;
+        }
+        i = i + 1;
+    }
+    return main_idx;
+}
+
+/// The type of value `id` of `f`: a parameter's from f.params (it has no
+/// instruction), else the value's metadata, else i64.
+fn gpu_value_ty(f: & IrFunction, id: i64) -> IrType {
+    var i: i64 = 0;
+    while i < f.params.len() {
+        if f.params.get(i).id == id {
+            return f.params.get(i).ty;
+        }
+        i = i + 1;
+    }
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => {
+            return m.ty;
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return IrType::I64;
+}
+
+/// An integer or bool: a value the generators keep as an i64.
+fn gpu_is_scalar(t: IrType) -> bool {
+    match t {
+        IrType::I8 => {
+            return true;
+        }
+        IrType::I16 => {
+            return true;
+        }
+        IrType::I32 => {
+            return true;
+        }
+        IrType::I64 => {
+            return true;
+        }
+        IrType::U8 => {
+            return true;
+        }
+        IrType::U16 => {
+            return true;
+        }
+        IrType::U32 => {
+            return true;
+        }
+        IrType::U64 => {
+            return true;
+        }
+        IrType::Bool => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// An instruction that gives a value (not Void or Never).
+fn gpu_has_result(inst: Inst) -> bool {
+    match inst_result_type(inst) {
+        IrType::Void => {
+            return false;
+        }
+        IrType::Never => {
+            return false;
+        }
+        _ => {
+            return true;
+        }
+    }
+    return true;
+}
+
+/// The parameters a kernel takes: all but `__env` (and a struct-return
+/// pointer, which a kernel has no use for).
+fn gpu_kernel_params(f: & IrFunction) -> Vec<i64> {
+    var env: i64 = - 1;
+    match IrFunction_lookup_local(f, "__env") {
+        OptValueId::Some(e) => {
+            env = e;
+        }
+        OptValueId::None => {
+        }
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.params.len() {
+        var p: ValueIdType = f.params.get(i);
+        if p.id != env && gpu_is_scalar(p.ty) {
+            out.push(p.id);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The block order: the entry block first, then the others as they are.
+fn gpu_block_order(f: & IrFunction) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < f.blocks.len() {
+        if f.blocks.get(i).id == f.entry {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.blocks.len() {
+        if f.blocks.get(i).id != f.entry {
+            out.push(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Values of `f` that are scalar stack slots (an Alloca of an integer or
+/// bool): their loads and stores are translated, as a register each.
+fn gpu_slots(f: & IrFunction) -> Vec<bool> {
+    var out: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < f.next_value {
+        out.push(false);
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.insts.len() {
+        var vi: ValueIdInst = f.insts.get(i);
+        match vi.inst {
+            Inst::Alloca(ty, _) => {
+                if gpu_is_scalar(ty) && vi.id >= 0 && vi.id < out.len() {
+                    out.set(vi.id, true);
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn gpu_is_slot(slots: & Vec<bool>, id: i64) -> bool {
+    return id >= 0 && id < slots.len() && slots.get(id);
+}
+
 // --- SPIR-V Code Generator ---
+//
+// One entry point: the first @kernel function (else `main`), a GLCompute
+// shader `void()` with its @kernel workgroup size. Every IR value is a
+// Function-storage i64 variable (OpVariable), read with OpLoad and written
+// with OpStore, so a value used in other blocks needs no phi; a scalar
+// stack slot (Alloca of an integer) is a variable of its own, its Load and
+// Store an OpLoad/OpStore of it. A comparison's bool becomes 1 or 0
+// (OpSelect); a branch tests its condition != 0. The function's first
+// block is one of our own: the variables, then a branch to the IR entry
+// block (an entry block may not be a branch target).
+//
+// Not translated (counted in `skipped`, reported on stderr): calls,
+// memory other than scalar slots, floats, prints, dyn values. Their results
+// are 0. Parameters are not bound to buffers (they start at 0). Branches
+// are written as an unstructured CFG: a Vulkan validator (Shader
+// capability) requires OpSelectionMerge / OpLoopMerge, which this
+// generator does not write; straight-line kernels are valid.
 
 pub struct SpirVCodeGen {
+    // The finished module (generate_spirv's result)
     pub words: Vec<i64>,
+    // Types and constants, in definition order (before the function)
+    pub types: Vec<i64>,
+    // The OpVariables of the function (the start of its first block)
+    pub vars: Vec<i64>,
+    // Stores after the variables in the first block (parameters at 0)
+    pub pre: Vec<i64>,
+    // The function's code after its first block
+    pub code: Vec<i64>,
     pub next_id: i64,
+    // type key -> id
     pub type_ids: Vec<GpuStrI64>,
-    // (key, id)
-    pub const_ids: Vec<GpuI64I64>,
-    // (value, id)
-    pub vreg_ids: Vec<GpuI64I64>,  // (vreg_id, spirv_id)
+    // i64 value -> OpConstant id + 1 (an integer-key map)
+    pub const_ids: i64,
+    // value id -> its variable's id + 1
+    pub vreg_ids: Vec<i64>,
+    // scalar slot (Alloca value id) -> its contents' variable id + 1
+    pub slot_ids: Vec<i64>,
+    // IR block id -> OpLabel id + 1
+    pub label_ids: Vec<i64>,
+    // IR instructions with no translation
+    pub skipped: i64,
 }
 
 pub fn SpirVCodeGen_new() -> SpirVCodeGen {
     return SpirVCodeGen {
-        words: Vec::new(), next_id: 1, type_ids: Vec::new(), const_ids: Vec::new(), vreg_ids: Vec::new(),
+        words: Vec::new(), types: Vec::new(), vars: Vec::new(), pre: Vec::new(), code: Vec::new(), next_id: 1, type_ids: Vec::new(), const_ids: HashMap_new(), vreg_ids: Vec::new(), slot_ids: Vec::new(), label_ids: Vec::new(), skipped: 0,
     };
 }
 
@@ -87,319 +331,302 @@ pub fn SpirVCodeGen_alloc_id(self: & mut SpirVCodeGen) -> i64 {
     return id;
 }
 
-/// Emit an instruction with no result.
-pub fn SpirVCodeGen_emit(self: & mut SpirVCodeGen, opcode: i64, operands: Vec<i64>) -> void {
-    var word_count: i64 = 1 + operands.len();
-    self.words.push(opcode | (word_count << 16));
+/// One instruction into `buf`: (word count << 16 | opcode), then operands.
+/// The word count includes the first word.
+fn spv_inst(buf: & mut Vec<i64>, opcode: i64, operands: Vec<i64>) {
+    buf.push(opcode | ((1 + operands.len()) << 16));
     var i: i64 = 0;
     while i < operands.len() {
-        self.words.push(operands.get(i));
+        buf.push(operands.get(i));
         i = i + 1;
     }
 }
 
-/// Emit an instruction with a result type and result id.
-pub fn SpirVCodeGen_emit_with_result(self: & mut SpirVCodeGen, opcode: i64, result_type: i64, operands: Vec<i64>) -> i64 {
-    var result_id: i64 = SpirVCodeGen_alloc_id(self);
-    var word_count: i64 = 2 + operands.len();
-    self.words.push(opcode | (word_count << 16));
-    self.words.push(result_type);
-    self.words.push(result_id);
-    var i: i64 = 0;
-    while i < operands.len() {
-        self.words.push(operands.get(i));
-        i = i + 1;
-    }
-    return result_id;
+fn spv_v1(a: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    return v;
 }
 
-/// Emit an instruction with a result type and explicit result id.
-pub fn SpirVCodeGen_emit_with_result_id(self: & mut SpirVCodeGen, opcode: i64, result_type: i64, result_id: i64, operands: Vec<i64>) -> void {
-    var word_count: i64 = 2 + operands.len();
-    self.words.push(opcode | (word_count << 16));
-    self.words.push(result_type);
-    self.words.push(result_id);
-    var i: i64 = 0;
-    while i < operands.len() {
-        self.words.push(operands.get(i));
-        i = i + 1;
-    }
+fn spv_v2(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = spv_v1(a);
+    v.push(b);
+    return v;
 }
 
-/// Get or create an int type of the given bit width.
-pub fn SpirVCodeGen_get_int_type(self: & mut SpirVCodeGen, bits: i64) -> i64 {
-    var key: str = "int" + int_to_str(bits);
+fn spv_v3(a: i64, b: i64, c: i64) -> Vec<i64> {
+    var v: Vec<i64> = spv_v2(a, b);
+    v.push(c);
+    return v;
+}
+
+fn spv_v4(a: i64, b: i64, c: i64, d: i64) -> Vec<i64> {
+    var v: Vec<i64> = spv_v3(a, b, c);
+    v.push(d);
+    return v;
+}
+
+fn spv_v5(a: i64, b: i64, c: i64, d: i64, e: i64) -> Vec<i64> {
+    var v: Vec<i64> = spv_v4(a, b, c, d);
+    v.push(e);
+    return v;
+}
+
+/// A literal string's words: its bytes little-endian, NUL-terminated,
+/// padded to a whole word.
+fn spv_push_string(v: & mut Vec<i64>, s: str) {
+    var n: i64 = str_len(s);
+    var word: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        word = word | ((str_byte_at(s, i) & 0xFF) << ((i % 4) * 8));
+        if i % 4 == 3 {
+            v.push(word);
+            word = 0;
+        }
+        i = i + 1;
+    }
+    // The NUL: in the last partial word, or a word of its own
+    v.push(word);
+}
+
+/// A type, made once per key: `opcode` with its result id first, then
+/// `operands`, into the types section.
+fn spv_type(self: & mut SpirVCodeGen, key: str, opcode: i64, operands: Vec<i64>) -> i64 {
     var existing: i64 = lookup_str(self.type_ids, key);
     if existing >= 0 {
         return existing;
     }
     var id: i64 = SpirVCodeGen_alloc_id(self);
-    var ops: Vec<i64> = Vec::new();
-    ops.push(bits);
-    ops.push(1);
-    // signed=1
-    SpirVCodeGen_emit(self, OP_TYPE_INT, ops);
+    var ops: Vec<i64> = spv_v1(id);
+    var i: i64 = 0;
+    while i < operands.len() {
+        ops.push(operands.get(i));
+        i = i + 1;
+    }
+    spv_inst(& mut self.types, opcode, ops);
     self.type_ids.push(GpuStrI64 {
         a: key, b: id
     });
     return id;
 }
 
-/// Get or create the void type.
+/// The signed int type of `bits` bits.
+pub fn SpirVCodeGen_get_int_type(self: & mut SpirVCodeGen, bits: i64) -> i64 {
+    return spv_type(self, "int" + int_to_str(bits), SPV_TYPE_INT, spv_v2(bits, 1));
+}
+
 pub fn SpirVCodeGen_get_void_type(self: & mut SpirVCodeGen) -> i64 {
-    var existing: i64 = lookup_str(self.type_ids, "void");
-    if existing >= 0 {
-        return existing;
-    }
-    var id: i64 = SpirVCodeGen_alloc_id(self);
-    var ops: Vec<i64> = Vec::new();
-    SpirVCodeGen_emit(self, OP_TYPE_VOID, ops);
-    self.type_ids.push(GpuStrI64 {
-        a: "void", b: id
-    });
-    return id;
+    return spv_type(self, "void", SPV_TYPE_VOID, Vec::new());
 }
 
-/// Get or create the bool type.
 pub fn SpirVCodeGen_get_bool_type(self: & mut SpirVCodeGen) -> i64 {
-    var existing: i64 = lookup_str(self.type_ids, "bool");
-    if existing >= 0 {
-        return existing;
+    return spv_type(self, "bool", SPV_TYPE_BOOL, Vec::new());
+}
+
+/// `void()`, the entry point's type
+fn spv_fn_void_type(self: & mut SpirVCodeGen) -> i64 {
+    var void_t: i64 = SpirVCodeGen_get_void_type(self);
+    return spv_type(self, "fn_void", SPV_TYPE_FUNCTION, spv_v1(void_t));
+}
+
+/// Pointer to a Function-storage i64 (a value's variable)
+fn spv_ptr_type(self: & mut SpirVCodeGen) -> i64 {
+    var int_t: i64 = SpirVCodeGen_get_int_type(self, 64);
+    return spv_type(self, "ptr_fn_int64", SPV_TYPE_POINTER, spv_v2(SPV_SC_FUNCTION, int_t));
+}
+
+/// An i64 constant, made once per value (low word first).
+@wrapping pub fn SpirVCodeGen_get_constant(self: & mut SpirVCodeGen, value: i64) -> i64 {
+    var existing: i64 = HashMap_get_i(self.const_ids, value);
+    if existing != 0 {
+        return existing - 1;
     }
+    var int_t: i64 = SpirVCodeGen_get_int_type(self, 64);
     var id: i64 = SpirVCodeGen_alloc_id(self);
-    var ops: Vec<i64> = Vec::new();
-    SpirVCodeGen_emit(self, OP_TYPE_BOOL, ops);
-    self.type_ids.push(GpuStrI64 {
-        a: "bool", b: id
-    });
+    spv_inst(& mut self.types, SPV_CONSTANT, spv_v4(int_t, id, value & 0xFFFFFFFF, (value >> 32) & 0xFFFFFFFF));
+    HashMap_insert_i(self.const_ids, value, id + 1);
     return id;
 }
 
-/// Get or create a constant int64 value.
-pub fn SpirVCodeGen_get_constant(self: & mut SpirVCodeGen, value: i64) -> i64 {
-    var existing: i64 = lookup_i64(self.const_ids, value);
-    if existing >= 0 {
-        return existing;
+/// A new Function-storage i64 variable (an OpVariable in the first block).
+fn spv_new_var(self: & mut SpirVCodeGen) -> i64 {
+    var ptr_t: i64 = spv_ptr_type(self);
+    var id: i64 = SpirVCodeGen_alloc_id(self);
+    spv_inst(& mut self.vars, SPV_VARIABLE, spv_v3(ptr_t, id, SPV_SC_FUNCTION));
+    return id;
+}
+
+/// `map[key]` - 1, or -1 when not set (a dense map from ids).
+fn gpu_map_get(map: & Vec<i64>, key: i64) -> i64 {
+    if key >= 0 && key < map.len() {
+        return map.get(key) - 1;
     }
-    var type_id: i64 = SpirVCodeGen_get_int_type(self, 64);
-    var ops: Vec<i64> = Vec::new();
-    ops.push(value & 0xFFFFFFFF);
-    ops.push((value >> 32) & 0xFFFFFFFF);
-    var id: i64 = SpirVCodeGen_emit_with_result(self, OP_CONSTANT, type_id, ops);
-    self.const_ids.push(GpuI64I64 {
-        a: value, b: id
-    });
-    return id;
+    return - 1;
 }
 
-/// Get or create a vreg ID mapping.
+fn gpu_map_set(map: & mut Vec<i64>, key: i64, value: i64) {
+    while map.len() <= key {
+        map.push(0);
+    }
+    map.set(key, value + 1);
+}
+
+/// The variable of IR value `vreg`.
 pub fn SpirVCodeGen_get_vreg_id(self: & mut SpirVCodeGen, vreg: i64) -> i64 {
-    var existing: i64 = lookup_i64(self.vreg_ids, vreg);
+    var existing: i64 = gpu_map_get(& self.vreg_ids, vreg);
+    if existing >= 0 {
+        return existing;
+    }
+    var id: i64 = spv_new_var(self);
+    gpu_map_set(& mut self.vreg_ids, vreg, id);
+    return id;
+}
+
+/// The variable holding the contents of scalar slot `slot`.
+fn spv_slot_var(self: & mut SpirVCodeGen, slot: i64) -> i64 {
+    var existing: i64 = gpu_map_get(& self.slot_ids, slot);
+    if existing >= 0 {
+        return existing;
+    }
+    var id: i64 = spv_new_var(self);
+    gpu_map_set(& mut self.slot_ids, slot, id);
+    return id;
+}
+
+/// The OpLabel id of IR block `block_id`
+fn spv_label(self: & mut SpirVCodeGen, block_id: i64) -> i64 {
+    var existing: i64 = gpu_map_get(& self.label_ids, block_id);
     if existing >= 0 {
         return existing;
     }
     var id: i64 = SpirVCodeGen_alloc_id(self);
-    self.vreg_ids.push(GpuI64I64 {
-        a: vreg, b: id
-    });
+    gpu_map_set(& mut self.label_ids, block_id, id);
     return id;
 }
 
-// --- SPIR-V module header ---
-
-/// Emit the SPIR-V header (magic, version, generator, bound placeholder, schema).
-pub fn SpirVCodeGen_emit_header(self: & mut SpirVCodeGen) -> void {
-    self.words.push(SPIRV_MAGIC);
-    self.words.push(SPIRV_VERSION_1_0);
-    self.words.push(SPIRV_GENERATOR);
-    self.words.push(0);
-    // bound placeholder
-    self.words.push(0);
-    // schema
+/// The id of IR value `v`'s i64 (loaded from its variable).
+pub fn SpirVCodeGen_operand_to_id(self: & mut SpirVCodeGen, v: i64) -> i64 {
+    var var_id: i64 = SpirVCodeGen_get_vreg_id(self, v);
+    var int_t: i64 = SpirVCodeGen_get_int_type(self, 64);
+    var id: i64 = SpirVCodeGen_alloc_id(self);
+    spv_inst(& mut self.code, SPV_LOAD, spv_v3(int_t, id, var_id));
+    return id;
 }
 
-/// Emit capabilities (Shader, Int64).
-pub fn SpirVCodeGen_emit_capabilities(self: & mut SpirVCodeGen) -> void {
-    var ops1: Vec<i64> = Vec::new();
-    ops1.push(CAP_SHADER);
-    SpirVCodeGen_emit(self, 17, ops1);
-    // OpCapability
-    var ops2: Vec<i64> = Vec::new();
-    ops2.push(CAP_INT64);
-    SpirVCodeGen_emit(self, 17, ops2);
-    // OpCapability Int64
+/// Value `vreg` = value `value_id`
+fn spv_store(self: & mut SpirVCodeGen, vreg: i64, value_id: i64) {
+    var var_id: i64 = SpirVCodeGen_get_vreg_id(self, vreg);
+    spv_inst(& mut self.code, SPV_STORE, spv_v2(var_id, value_id));
 }
 
-/// Emit the memory model.
-pub fn SpirVCodeGen_emit_memory_model(self: & mut SpirVCodeGen) -> void {
-    var ops: Vec<i64> = Vec::new();
-    ops.push(ADDRESSING_MODEL_LOGICAL);
-    ops.push(MEMORY_MODEL_GLSL450);
-    SpirVCodeGen_emit(self, OP_MEMORY_MODEL, ops);
+/// A two-operand instruction with a result: returns the result's id
+fn spv_op2(self: & mut SpirVCodeGen, opcode: i64, result_type: i64, a: i64, b: i64) -> i64 {
+    var id: i64 = SpirVCodeGen_alloc_id(self);
+    spv_inst(& mut self.code, opcode, spv_v4(result_type, id, a, b));
+    return id;
 }
 
-/// Emit an entry point declaration.
-pub fn SpirVCodeGen_emit_entry_point(self: & mut SpirVCodeGen, entry_id: i64) -> void {
-    var ops: Vec<i64> = Vec::new();
-    ops.push(EXEC_MODEL_GLCOMPUTE);
-    ops.push(entry_id);
-    ops.push(0);
-    // name placeholder (no string literal support in this port)
-    ops.push(0);
-    SpirVCodeGen_emit(self, OP_ENTRY_POINT, ops);
+/// A bool as the i64 1 or 0
+fn spv_bool_to_int(self: & mut SpirVCodeGen, b: i64) -> i64 {
+    var int_t: i64 = SpirVCodeGen_get_int_type(self, 64);
+    var one: i64 = SpirVCodeGen_get_constant(self, 1);
+    var zero: i64 = SpirVCodeGen_get_constant(self, 0);
+    var id: i64 = SpirVCodeGen_alloc_id(self);
+    spv_inst(& mut self.code, SPV_SELECT, spv_v5(int_t, id, b, one, zero));
+    return id;
 }
 
-/// Emit the execution mode (LocalSize).
-pub fn SpirVCodeGen_emit_execution_mode(self: & mut SpirVCodeGen, entry_id: i64, wg_x: i64, wg_y: i64, wg_z: i64) -> void {
-    var ops: Vec<i64> = Vec::new();
-    ops.push(entry_id);
-    ops.push(17);
-    // LocalSize
-    ops.push(wg_x);
-    ops.push(wg_y);
-    ops.push(wg_z);
-    SpirVCodeGen_emit(self, OP_EXECUTION_MODE, ops);
-}
-
-/// Finalize the module: update the bound (word at index 3).
-pub fn SpirVCodeGen_finalize(self: & mut SpirVCodeGen) -> void {
-    self.words.set(3, self.next_id);
-}
-
-/// Update or create a vreg-to-SPIR-V ID mapping (replaces existing entry).
-pub fn SpirVCodeGen_set_vreg_id(self: & mut SpirVCodeGen, vreg: i64, id: i64) -> void {
-    var i: i64 = 0;
-    while i < self.vreg_ids.len() {
-        var entry: GpuI64I64 = self.vreg_ids.get(i);
-        if entry.a == vreg {
-            self.vreg_ids.set(i, GpuI64I64 {
-                a: vreg, b: id
-            });
-            return;
-        }
-        i = i + 1;
+/// An instruction that is not translated: its value (if any) is 0
+fn spv_skip(self: & mut SpirVCodeGen, id: i64, has_result: bool) {
+    self.skipped = self.skipped + 1;
+    if has_result {
+        spv_store(self, id, SpirVCodeGen_get_constant(self, 0));
     }
-    self.vreg_ids.push(GpuI64I64 {
-        a: vreg, b: id
-    });
 }
 
-// --- SPIR-V module / function / block / instruction generation ---
-
-/// Map a BinOp to its SPIR-V opcode. Returns OP_NOP for unsupported ops.
+/// The arithmetic opcode of a BinOp, 0 if it is not arithmetic. `&&` and
+/// `||` work on 0/1 values as `&` and `|`. `%` is C's remainder (OpSRem).
 pub fn binop_to_spirv_opcode(op: BinOp) -> i64 {
     if binop_eq(op, BinOp::Add) {
-        return OP_IADD;
+        return SPV_IADD;
     }
     if binop_eq(op, BinOp::Sub) {
-        return OP_ISUB;
+        return SPV_ISUB;
     }
     if binop_eq(op, BinOp::Mul) {
-        return OP_IMUL;
+        return SPV_IMUL;
     }
     if binop_eq(op, BinOp::Div) {
-        return OP_SDIV;
+        return SPV_SDIV;
     }
     if binop_eq(op, BinOp::Mod) {
-        return OP_SMOD;
+        return SPV_SREM;
     }
-    if binop_eq(op, BinOp::BitAnd) {
-        return OP_BITWISE_AND;
+    if binop_eq(op, BinOp::BitAnd) || binop_eq(op, BinOp::And) {
+        return SPV_BIT_AND;
     }
-    if binop_eq(op, BinOp::BitOr) {
-        return OP_BITWISE_OR;
+    if binop_eq(op, BinOp::BitOr) || binop_eq(op, BinOp::Or) {
+        return SPV_BIT_OR;
     }
     if binop_eq(op, BinOp::BitXor) {
-        return OP_BITWISE_XOR;
+        return SPV_BIT_XOR;
     }
     if binop_eq(op, BinOp::Shl) {
-        return OP_SHIFT_LEFT;
+        return SPV_SHL;
     }
     if binop_eq(op, BinOp::Shr) {
-        return OP_SHIFT_RIGHT;
+        return SPV_SHR_ARITH;
     }
+    return 0;
+}
+
+/// The comparison opcode of a BinOp (a bool result), 0 if none.
+fn spv_cmp_opcode(op: BinOp) -> i64 {
     if binop_eq(op, BinOp::Eq) {
-        return OP_I_EQUAL;
+        return SPV_IEQUAL;
     }
     if binop_eq(op, BinOp::Neq) {
-        return OP_I_NOT_EQUAL;
+        return SPV_INOT_EQUAL;
     }
     if binop_eq(op, BinOp::Lt) {
-        return OP_S_LESS_THAN;
+        return SPV_SLESS;
     }
     if binop_eq(op, BinOp::Gt) {
-        return OP_S_GREATER_THAN;
+        return SPV_SGREATER;
     }
     if binop_eq(op, BinOp::LtEq) {
-        return OP_S_LESS_THAN_EQUAL;
+        return SPV_SLESS_EQ;
     }
     if binop_eq(op, BinOp::GtEq) {
-        return OP_S_GREATER_THAN_EQUAL;
+        return SPV_SGREATER_EQ;
     }
-    return OP_NOP;
+    return 0;
 }
 
 /// Check if a BinOp is a comparison (result type is bool).
 pub fn binop_is_spirv_comparison(op: BinOp) -> bool {
-    if binop_eq(op, BinOp::Eq) {
-        return true;
-    }
-    if binop_eq(op, BinOp::Neq) {
-        return true;
-    }
-    if binop_eq(op, BinOp::Lt) {
-        return true;
-    }
-    if binop_eq(op, BinOp::Gt) {
-        return true;
-    }
-    if binop_eq(op, BinOp::LtEq) {
-        return true;
-    }
-    if binop_eq(op, BinOp::GtEq) {
-        return true;
-    }
-    return false;
+    return spv_cmp_opcode(op) != 0;
 }
 
-/// Generate SPIR-V for an entire L3 module.
-/// Emits header, capabilities, memory model, entry point, and function body.
-pub fn SpirVCodeGen_gen_module(self: & mut SpirVCodeGen, module: L3Module) -> void {
-    // Header
-    SpirVCodeGen_emit_header(self);
-
-    // Capabilities
-    SpirVCodeGen_emit_capabilities(self);
-
-    // Memory model
-    SpirVCodeGen_emit_memory_model(self);
-
-    // Entry point -- find @kernel annotated function, or use first function
-    var kernel_idx: i64 = - 1;
-    var i: i64 = 0;
-    while i < module.functions.len() {
-        var f: L3Function = module.functions.get(i);
-        if f.is_kernel {
-            if kernel_idx < 0 {
-                kernel_idx = i;
-            }
-        }
-        i = i + 1;
-    }
-    if kernel_idx < 0 {
-        if module.functions.len() > 0 {
-            kernel_idx = 0;
-        }
-    }
+/// Generate the module (into self.words): header, capabilities, memory
+/// model, entry point, execution mode, types and constants, the function.
+pub fn SpirVCodeGen_gen_module(self: & mut SpirVCodeGen, module: & IrModule) -> void {
+    var kernel_idx: i64 = gpu_kernel_index(module);
+    var w: Vec<i64> = Vec::new();
+    w.push(SPIRV_MAGIC);
+    w.push(SPIRV_VERSION_1_0);
+    w.push(SPIRV_GENERATOR);
+    // The bound (set at the end), then the schema
+    w.push(0);
+    w.push(0);
+    spv_inst(& mut w, SPV_CAPABILITY, spv_v1(SPV_CAP_SHADER));
+    spv_inst(& mut w, SPV_CAPABILITY, spv_v1(SPV_CAP_INT64));
+    spv_inst(& mut w, SPV_MEMORY_MODEL, spv_v2(SPV_ADDR_LOGICAL, SPV_MEM_GLSL450));
 
     if kernel_idx >= 0 {
-        var func: L3Function = module.functions.get(kernel_idx);
-        var entry_id: i64 = SpirVCodeGen_alloc_id(self);
-        var void_type: i64 = SpirVCodeGen_get_void_type(self);
-        var ft_ops: Vec<i64> = Vec::new();
-        var func_type: i64 = SpirVCodeGen_emit_with_result(self, OP_TYPE_FUNCTION, void_type, ft_ops);
-
-        // Workgroup size from @kernel annotation (default: 1, 1, 1)
+        var func: IrFunction = module.functions.get(kernel_idx).func;
+        var fname: str = module.functions.get(kernel_idx).name;
         var wg_x: i64 = 1;
         var wg_y: i64 = 1;
         var wg_z: i64 = 1;
@@ -408,159 +635,234 @@ pub fn SpirVCodeGen_gen_module(self: & mut SpirVCodeGen, module: L3Module) -> vo
             wg_y = func.workgroup_size.get(1);
             wg_z = func.workgroup_size.get(2);
         }
+        var void_t: i64 = SpirVCodeGen_get_void_type(self);
+        var fn_t: i64 = spv_fn_void_type(self);
+        var func_id: i64 = SpirVCodeGen_alloc_id(self);
+        var start_label: i64 = SpirVCodeGen_alloc_id(self);
+        SpirVCodeGen_gen_function(self, & func);
 
-        // Entry point
-        SpirVCodeGen_emit_entry_point(self, entry_id);
-        SpirVCodeGen_emit_execution_mode(self, entry_id, wg_x, wg_y, wg_z);
-
-        // Generate the function
-        SpirVCodeGen_gen_function(self, func, entry_id, func_type);
+        // OpEntryPoint GLCompute %func "name" (no interface variables)
+        var ep: Vec<i64> = spv_v2(SPV_EXEC_GLCOMPUTE, func_id);
+        spv_push_string(& mut ep, fname);
+        spv_inst(& mut w, SPV_ENTRY_POINT, ep);
+        spv_inst(& mut w, SPV_EXECUTION_MODE, spv_v5(func_id, SPV_MODE_LOCAL_SIZE, wg_x, wg_y, wg_z));
+        spv_append(& mut w, self.types);
+        // OpFunction %void %func None %fn_void
+        spv_inst(& mut w, SPV_FUNCTION, spv_v4(void_t, func_id, 0, fn_t));
+        spv_inst(& mut w, SPV_LABEL, spv_v1(start_label));
+        spv_append(& mut w, self.vars);
+        spv_append(& mut w, self.pre);
+        spv_inst(& mut w, SPV_BRANCH, spv_v1(spv_label(self, func.entry)));
+        spv_append(& mut w, self.code);
+        spv_inst(& mut w, SPV_FUNCTION_END, Vec::new());
+    } else {
+        spv_append(& mut w, self.types);
     }
-
-    // Update bound
-    SpirVCodeGen_finalize(self);
+    // The bound: every id is below it
+    w.set(3, self.next_id);
+    self.words = w;
 }
 
-/// Generate SPIR-V for one function: OpFunction, blocks, OpFunctionEnd.
-pub fn SpirVCodeGen_gen_function(self: & mut SpirVCodeGen, func: L3Function, func_id: i64, func_type: i64) -> void {
-    var void_type: i64 = SpirVCodeGen_get_void_type(self);
-
-    // OpFunction
-    var ops: Vec<i64> = Vec::new();
-    ops.push(0);
-    // Function control = 0 (normal)
-    ops.push(func_type);
-    SpirVCodeGen_emit_with_result_id(self, OP_FUNCTION, void_type, func_id, ops);
-
-    // Labels for blocks
+fn spv_append(dst: & mut Vec<i64>, src: Vec<i64>) {
     var i: i64 = 0;
-    while i < func.blocks.len() {
-        var block: L3Block = func.blocks.get(i);
-        var label_id: i64 = SpirVCodeGen_alloc_id(self);
-        var label_ops: Vec<i64> = Vec::new();
-        label_ops.push(label_id);
-        SpirVCodeGen_emit(self, OP_LABEL, label_ops);
-        SpirVCodeGen_gen_block(self, func, block);
-        i = i + 1;
-    }
-
-    // OpFunctionEnd
-    var end_ops: Vec<i64> = Vec::new();
-    SpirVCodeGen_emit(self, OP_FUNCTION_END, end_ops);
-}
-
-/// Generate SPIR-V for one block: iterate instructions.
-pub fn SpirVCodeGen_gen_block(self: & mut SpirVCodeGen, func: L3Function, block: L3Block) -> void {
-    var i: i64 = 0;
-    while i < block.instructions.len() {
-        SpirVCodeGen_gen_inst(self, block.instructions.get(i));
+    while i < src.len() {
+        dst.push(src.get(i));
         i = i + 1;
     }
 }
 
-/// Translate one L3 instruction to SPIR-V opcodes.
-pub fn SpirVCodeGen_gen_inst(self: & mut SpirVCodeGen, inst: L3Inst) -> void {
-    match inst {
-        L3Inst::AddrOfSlot(_, _) => {  // GPU: stack slots don't really apply, placeholder.
-        }
-        L3Inst::Mov(dst, src) => {
-            var dst_id: i64 = SpirVCodeGen_get_vreg_id(self, dst.id);
-            match src {
-                Operand::ImmI(imm) => {
-                    var const_id: i64 = SpirVCodeGen_get_constant(self, imm);
-                    var int_type: i64 = SpirVCodeGen_get_int_type(self, 64);
-                    // Copy constant to variable (simplified: IDs computed for side effects)
-                }
-                Operand::VReg(src_vreg) => {
-                    var src_id: i64 = SpirVCodeGen_get_vreg_id(self, src_vreg.id);
-                    // Copy between variables (simplified)
-                }
-                _ => {
-                }
+/// The function's blocks into self.code (each with its OpLabel, the IR
+/// entry block first), its variables into self.vars, the parameters'
+/// zero stores into self.pre.
+pub fn SpirVCodeGen_gen_function(self: & mut SpirVCodeGen, func: & IrFunction) -> void {
+    // Parameters are not bound to buffers: they start at 0
+    var params: Vec<i64> = gpu_kernel_params(func);
+    var pi: i64 = 0;
+    while pi < params.len() {
+        var p_var: i64 = SpirVCodeGen_get_vreg_id(self, params.get(pi));
+        var zero: i64 = SpirVCodeGen_get_constant(self, 0);
+        spv_inst(& mut self.pre, SPV_STORE, spv_v2(p_var, zero));
+        pi = pi + 1;
+    }
+    var slots: Vec<bool> = gpu_slots(func);
+    var order: Vec<i64> = gpu_block_order(func);
+    var bi: i64 = 0;
+    while bi < order.len() {
+        SpirVCodeGen_gen_block(self, func, func.blocks.get(order.get(bi)), & slots);
+        bi = bi + 1;
+    }
+}
+
+/// One block: its label, its instructions up to the first terminator, and
+/// OpReturn if it has none.
+pub fn SpirVCodeGen_gen_block(self: & mut SpirVCodeGen, func: & IrFunction, block: BasicBlock, slots: & Vec<bool>) -> void {
+    var label: i64 = spv_label(self, block.id);
+    spv_inst(& mut self.code, SPV_LABEL, spv_v1(label));
+    var i: i64 = 0;
+    var ended: bool = false;
+    while i < block.instructions.len() && !ended {
+        var id: i64 = block.instructions.get(i);
+        match IrFunction_get_inst(func, id) {
+            OptInst::Some(inst) => {
+                ended = SpirVCodeGen_gen_inst(self, func, id, inst, slots);
+            }
+            OptInst::None => {
             }
         }
-        L3Inst::Bin(op, dst, a, b, _) => {
+        i = i + 1;
+    }
+    if !ended {
+        spv_inst(& mut self.code, SPV_RETURN, Vec::new());
+    }
+}
+
+/// One IR instruction (value `id`); true when it ends the block.
+pub fn SpirVCodeGen_gen_inst(self: & mut SpirVCodeGen, func: & IrFunction, id: i64, inst: Inst, slots: & Vec<bool>) -> bool {
+    match inst {
+        Inst::ConstInt(v, _) => {
+            spv_store(self, id, SpirVCodeGen_get_constant(self, v));
+        }
+        Inst::ConstBool(b) => {
+            var bv: i64 = 0;
+            if b {
+                bv = 1;
+            }
+            spv_store(self, id, SpirVCodeGen_get_constant(self, bv));
+        }
+        Inst::ConstNull(_) => {
+            spv_store(self, id, SpirVCodeGen_get_constant(self, 0));
+        }
+        Inst::BinOp(op, a, b, ty) => {
+            if ir_type_is_float(ty) || ir_type_is_float(gpu_value_ty(func, a)) {
+                spv_skip(self, id, true);
+                return false;
+            }
             var a_id: i64 = SpirVCodeGen_operand_to_id(self, a);
             var b_id: i64 = SpirVCodeGen_operand_to_id(self, b);
-            var int_type: i64 = SpirVCodeGen_get_int_type(self, 64);
-
-            var opcode: i64 = binop_to_spirv_opcode(op);
-
-            if opcode != OP_NOP {
-                var result_type: i64 = int_type;
-                if binop_is_spirv_comparison(op) {
-                    result_type = SpirVCodeGen_get_bool_type(self);
-                }
-                var ops: Vec<i64> = Vec::new();
-                ops.push(a_id);
-                ops.push(b_id);
-                var result_id: i64 = SpirVCodeGen_emit_with_result(self, opcode, result_type, ops);
-                SpirVCodeGen_set_vreg_id(self, dst.id, result_id);
-            }
-        }
-        L3Inst::Ret(value) => {
-            match value {
-                OptOperand::Some(v) => {
-                    var val_id: i64 = SpirVCodeGen_operand_to_id(self, v);
-                    var ops: Vec<i64> = Vec::new();
-                    ops.push(val_id);
-                    SpirVCodeGen_emit(self, OP_RETURN_VALUE, ops);
-                }
-                OptOperand::None => {
-                    var ops: Vec<i64> = Vec::new();
-                    SpirVCodeGen_emit(self, OP_RETURN, ops);
+            var int_t: i64 = SpirVCodeGen_get_int_type(self, 64);
+            var cmp: i64 = spv_cmp_opcode(op);
+            if cmp != 0 {
+                var bool_t: i64 = SpirVCodeGen_get_bool_type(self);
+                var c: i64 = spv_op2(self, cmp, bool_t, a_id, b_id);
+                spv_store(self, id, spv_bool_to_int(self, c));
+            } else {
+                var arith: i64 = binop_to_spirv_opcode(op);
+                if arith != 0 {
+                    spv_store(self, id, spv_op2(self, arith, int_t, a_id, b_id));
+                } else {
+                    spv_skip(self, id, true);
                 }
             }
         }
-        L3Inst::Jmp(target) => {
-            var label_id: i64 = SpirVCodeGen_alloc_id(self);
-            // Simplified
-            var ops: Vec<i64> = Vec::new();
-            ops.push(label_id);
-            SpirVCodeGen_emit(self, OP_BRANCH, ops);
-        }
-        L3Inst::Br(cond, then_b, else_b) => {
-            var cond_id: i64 = SpirVCodeGen_operand_to_id(self, cond);
-            var then_label: i64 = SpirVCodeGen_alloc_id(self);
-            var else_label: i64 = SpirVCodeGen_alloc_id(self);
-            var ops: Vec<i64> = Vec::new();
-            ops.push(cond_id);
-            ops.push(then_label);
-            ops.push(else_label);
-            SpirVCodeGen_emit(self, OP_BRANCH_CONDITIONAL, ops);
-        }
-        L3Inst::Call(_, _, args, _) => {
-            // Simplified: compute arg IDs for side effects, skip actual call
-            var ai: i64 = 0;
-            while ai < args.len() {
-                var arg_id: i64 = SpirVCodeGen_operand_to_id(self, args.get(ai));
-                ai = ai + 1;
+        Inst::UnaryOp(op, a, ty) => {
+            if ir_type_is_float(ty) {
+                spv_skip(self, id, true);
+                return false;
             }
+            var u_id: i64 = SpirVCodeGen_operand_to_id(self, a);
+            var int_t2: i64 = SpirVCodeGen_get_int_type(self, 64);
+            if unaryop_eq(op, UnaryOp::Not) {
+                var bool_t2: i64 = SpirVCodeGen_get_bool_type(self);
+                var z: i64 = SpirVCodeGen_get_constant(self, 0);
+                var isz: i64 = spv_op2(self, SPV_IEQUAL, bool_t2, u_id, z);
+                spv_store(self, id, spv_bool_to_int(self, isz));
+            } else {
+                var uop: i64 = SPV_S_NEGATE;
+                if unaryop_eq(op, UnaryOp::BitNot) {
+                    uop = SPV_NOT;
+                }
+                var r: i64 = SpirVCodeGen_alloc_id(self);
+                spv_inst(& mut self.code, uop, spv_v3(int_t2, r, u_id));
+                spv_store(self, id, r);
+            }
+        }
+        Inst::IntExtend(v, _, _) => {
+            // Integers are kept as i64: the value as it is
+            spv_store(self, id, SpirVCodeGen_operand_to_id(self, v));
+        }
+        Inst::IntTrunc(v, _, _) => {
+            spv_store(self, id, SpirVCodeGen_operand_to_id(self, v));
+        }
+        Inst::BitCast(v, from, to) => {
+            if gpu_is_scalar(from) && gpu_is_scalar(to) {
+                spv_store(self, id, SpirVCodeGen_operand_to_id(self, v));
+            } else {
+                spv_skip(self, id, true);
+            }
+        }
+        Inst::Alloca(ty, _) => {
+            // A scalar slot is a variable of its own (spv_slot_var); the
+            // address itself is not translated
+            if !gpu_is_scalar(ty) {
+                spv_skip(self, id, true);
+            }
+        }
+        Inst::Load(p, _) => {
+            if gpu_is_slot(slots, p) {
+                var sv: i64 = spv_slot_var(self, p);
+                var int_t3: i64 = SpirVCodeGen_get_int_type(self, 64);
+                var lid: i64 = SpirVCodeGen_alloc_id(self);
+                spv_inst(& mut self.code, SPV_LOAD, spv_v3(int_t3, lid, sv));
+                spv_store(self, id, lid);
+            } else {
+                spv_skip(self, id, true);
+            }
+        }
+        Inst::Store(p, v, _) => {
+            if gpu_is_slot(slots, p) {
+                var sv2: i64 = spv_slot_var(self, p);
+                var vid: i64 = SpirVCodeGen_operand_to_id(self, v);
+                spv_inst(& mut self.code, SPV_STORE, spv_v2(sv2, vid));
+            } else {
+                self.skipped = self.skipped + 1;
+            }
+        }
+        Inst::Jump(target) => {
+            var jl: i64 = spv_label(self, target);
+            spv_inst(& mut self.code, SPV_BRANCH, spv_v1(jl));
+            return true;
+        }
+        Inst::Branch(cond, then_b, else_b) => {
+            var c_id: i64 = SpirVCodeGen_operand_to_id(self, cond);
+            var bool_t3: i64 = SpirVCodeGen_get_bool_type(self);
+            var zero: i64 = SpirVCodeGen_get_constant(self, 0);
+            var nz: i64 = spv_op2(self, SPV_INOT_EQUAL, bool_t3, c_id, zero);
+            var lt: i64 = spv_label(self, then_b);
+            var le: i64 = spv_label(self, else_b);
+            spv_inst(& mut self.code, SPV_BRANCH_COND, spv_v3(nz, lt, le));
+            return true;
+        }
+        Inst::Return(_) => {
+            // The entry point is void(): a returned value has nowhere to go
+            spv_inst(& mut self.code, SPV_RETURN, Vec::new());
+            return true;
+        }
+        Inst::Unreachable => {
+            spv_inst(& mut self.code, SPV_UNREACHABLE, Vec::new());
+            return true;
+        }
+        Inst::Panic(_) => {
+            // No way to report it on a GPU: the invocation ends
+            self.skipped = self.skipped + 1;
+            spv_inst(& mut self.code, SPV_RETURN, Vec::new());
+            return true;
+        }
+        Inst::TryUnwrap(_, _, _, _) => {
+            spv_skip(self, id, true);
+            spv_inst(& mut self.code, SPV_UNREACHABLE, Vec::new());
+            return true;
         }
         _ => {
+            // Calls, other memory, floats, prints, dyn values, regions
+            spv_skip(self, id, gpu_has_result(inst));
         }
     }
-}
-
-/// Map an L3 operand to a SPIR-V ID.
-pub fn SpirVCodeGen_operand_to_id(self: & mut SpirVCodeGen, op: Operand) -> i64 {
-    match op {
-        Operand::ImmI(v) => {
-            return SpirVCodeGen_get_constant(self, v);
-        }
-        Operand::VReg(v) => {
-            return SpirVCodeGen_get_vreg_id(self, v.id);
-        }
-        _ => {
-            return SpirVCodeGen_alloc_id(self);
-        }
-    }
-    return 0;
+    return false;
 }
 
 // --- SPIR-V disassembler ---
 
-/// Disassemble SPIR-V words to text (simplified structural dump).
+/// Disassemble SPIR-V words to text (one line per instruction).
 pub fn disassemble(words: Vec<i64>) -> str {
     var output: str = "; SPIR-V\n";
     output = output + "; Version: 1.0\n";
@@ -568,8 +870,6 @@ pub fn disassemble(words: Vec<i64>) -> str {
     var bound: i64 = 0;
     if words.len() > 3 {
         bound = words.get(3);
-    } else {
-        bound = 0;
     }
     output = output + "; Bound: " + int_to_str(bound) + "\n";
     output = output + "; Schema: 0\n";
@@ -578,138 +878,169 @@ pub fn disassemble(words: Vec<i64>) -> str {
     // Skip header
     while i < words.len() {
         var instr: i64 = words.get(i);
-        var word_count: i64 = instr >> 16;
+        var word_count: i64 = (instr >> 16) & 0xFFFF;
         var opcode: i64 = instr & 0xFFFF;
         output = output + "  " + opcode_name(opcode) + " (" + int_to_str(word_count) + " words)\n";
         if word_count < 1 {
-            word_count = 1;
+            output = output + "; invalid word count 0 at word " + int_to_str(i) + "\n";
+            return output;
         }
         i = i + word_count;
+    }
+    if i != words.len() {
+        output = output + "; the last instruction runs past the end of the module\n";
     }
     return output;
 }
 
-/// Get the human-readable name for a SPIR-V opcode.
+/// The name of a SPIR-V opcode. (An `if` chain: a `match` on const names
+/// binds the first arm to every value.)
 pub fn opcode_name(opcode: i64) -> str {
-    match opcode {
-        OP_NOP => {
-            return "OpNop";
-        }
-        OP_MEMORY_MODEL => {
-            return "OpMemoryModel";
-        }
-        OP_ENTRY_POINT => {
-            return "OpEntryPoint";
-        }
-        OP_EXECUTION_MODE => {
-            return "OpExecutionMode";
-        }
-        OP_TYPE_VOID => {
-            return "OpTypeVoid";
-        }
-        OP_TYPE_BOOL => {
-            return "OpTypeBool";
-        }
-        OP_TYPE_INT => {
-            return "OpTypeInt";
-        }
-        OP_TYPE_FLOAT => {
-            return "OpTypeFloat";
-        }
-        OP_TYPE_FUNCTION => {
-            return "OpTypeFunction";
-        }
-        OP_CONSTANT => {
-            return "OpConstant";
-        }
-        OP_FUNCTION => {
-            return "OpFunction";
-        }
-        OP_FUNCTION_END => {
-            return "OpFunctionEnd";
-        }
-        OP_LOAD => {
-            return "OpLoad";
-        }
-        OP_STORE => {
-            return "OpStore";
-        }
-        OP_LABEL => {
-            return "OpLabel";
-        }
-        OP_BRANCH => {
-            return "OpBranch";
-        }
-        OP_BRANCH_CONDITIONAL => {
-            return "OpBranchConditional";
-        }
-        OP_RETURN => {
-            return "OpReturn";
-        }
-        OP_RETURN_VALUE => {
-            return "OpReturnValue";
-        }
-        OP_IADD => {
-            return "OpIAdd";
-        }
-        OP_ISUB => {
-            return "OpISub";
-        }
-        OP_IMUL => {
-            return "OpIMul";
-        }
-        OP_SDIV => {
-            return "OpSDiv";
-        }
-        OP_SMOD => {
-            return "OpSMod";
-        }
-        OP_BITWISE_AND => {
-            return "OpBitwiseAnd";
-        }
-        OP_BITWISE_OR => {
-            return "OpBitwiseOr";
-        }
-        OP_BITWISE_XOR => {
-            return "OpBitwiseXor";
-        }
-        OP_SHIFT_LEFT => {
-            return "OpShiftLeftLogical";
-        }
-        OP_SHIFT_RIGHT => {
-            return "OpShiftRightArithmetic";
-        }
-        OP_I_EQUAL => {
-            return "OpIEqual";
-        }
-        OP_I_NOT_EQUAL => {
-            return "OpINotEqual";
-        }
-        OP_S_LESS_THAN => {
-            return "OpSLessThan";
-        }
-        OP_S_GREATER_THAN => {
-            return "OpSGreaterThan";
-        }
-        OP_S_LESS_THAN_EQUAL => {
-            return "OpSLessThanEqual";
-        }
-        OP_S_GREATER_THAN_EQUAL => {
-            return "OpSGreaterThanEqual";
-        }
+    if opcode == SPV_MEMORY_MODEL {
+        return "OpMemoryModel";
     }
-    return "OpUnknown";
+    if opcode == SPV_ENTRY_POINT {
+        return "OpEntryPoint";
+    }
+    if opcode == SPV_EXECUTION_MODE {
+        return "OpExecutionMode";
+    }
+    if opcode == SPV_CAPABILITY {
+        return "OpCapability";
+    }
+    if opcode == SPV_TYPE_VOID {
+        return "OpTypeVoid";
+    }
+    if opcode == SPV_TYPE_BOOL {
+        return "OpTypeBool";
+    }
+    if opcode == SPV_TYPE_INT {
+        return "OpTypeInt";
+    }
+    if opcode == SPV_TYPE_POINTER {
+        return "OpTypePointer";
+    }
+    if opcode == SPV_TYPE_FUNCTION {
+        return "OpTypeFunction";
+    }
+    if opcode == SPV_CONSTANT {
+        return "OpConstant";
+    }
+    if opcode == SPV_FUNCTION {
+        return "OpFunction";
+    }
+    if opcode == SPV_FUNCTION_END {
+        return "OpFunctionEnd";
+    }
+    if opcode == SPV_VARIABLE {
+        return "OpVariable";
+    }
+    if opcode == SPV_LOAD {
+        return "OpLoad";
+    }
+    if opcode == SPV_STORE {
+        return "OpStore";
+    }
+    if opcode == SPV_S_NEGATE {
+        return "OpSNegate";
+    }
+    if opcode == SPV_IADD {
+        return "OpIAdd";
+    }
+    if opcode == SPV_ISUB {
+        return "OpISub";
+    }
+    if opcode == SPV_IMUL {
+        return "OpIMul";
+    }
+    if opcode == SPV_SDIV {
+        return "OpSDiv";
+    }
+    if opcode == SPV_SREM {
+        return "OpSRem";
+    }
+    if opcode == SPV_SELECT {
+        return "OpSelect";
+    }
+    if opcode == SPV_IEQUAL {
+        return "OpIEqual";
+    }
+    if opcode == SPV_INOT_EQUAL {
+        return "OpINotEqual";
+    }
+    if opcode == SPV_SGREATER {
+        return "OpSGreaterThan";
+    }
+    if opcode == SPV_SGREATER_EQ {
+        return "OpSGreaterThanEqual";
+    }
+    if opcode == SPV_SLESS {
+        return "OpSLessThan";
+    }
+    if opcode == SPV_SLESS_EQ {
+        return "OpSLessThanEqual";
+    }
+    if opcode == SPV_SHR_ARITH {
+        return "OpShiftRightArithmetic";
+    }
+    if opcode == SPV_SHL {
+        return "OpShiftLeftLogical";
+    }
+    if opcode == SPV_BIT_OR {
+        return "OpBitwiseOr";
+    }
+    if opcode == SPV_BIT_XOR {
+        return "OpBitwiseXor";
+    }
+    if opcode == SPV_BIT_AND {
+        return "OpBitwiseAnd";
+    }
+    if opcode == SPV_NOT {
+        return "OpNot";
+    }
+    if opcode == SPV_LABEL {
+        return "OpLabel";
+    }
+    if opcode == SPV_BRANCH {
+        return "OpBranch";
+    }
+    if opcode == SPV_BRANCH_COND {
+        return "OpBranchConditional";
+    }
+    if opcode == SPV_RETURN {
+        return "OpReturn";
+    }
+    if opcode == SPV_UNREACHABLE {
+        return "OpUnreachable";
+    }
+    return "Op" + int_to_str(opcode);
 }
 
 // --- PTX Code Generator (NVIDIA) ---
+//
+// The @kernel functions (else `main`) as `.entry` kernels: parameters as
+// `.param .u64`, loaded into their registers; every IR value is a `.u64`
+// register r<id>, and a scalar stack slot (Alloca of an integer) is the
+// register of its Alloca value, which its Load and Store copy; immediates
+// go through t0/t1 where an instruction needs a register; a comparison is
+// setp + selp (1 or 0); a branch tests != 0. Labels are
+// <function>_b<block id>, the targets of bra too (2g.21: branches went to
+// `target_N`, which no label defined; `ret_val` and registers past r31 were
+// undeclared, `return;` is not PTX). Not translated (a comment, counted,
+// reported on stderr; the result register is 0): calls, other memory,
+// floats, prints, dyn values.
 
 pub struct PtxCodeGen {
     pub output: str,
+    // The function being written (its labels' prefix)
+    pub fname: str,
+    // IR instructions with no translation
+    pub skipped: i64,
 }
 
 pub fn PtxCodeGen_new() -> PtxCodeGen {
     return PtxCodeGen {
-        output: ""
+        output: "", fname: "", skipped: 0
     };
 }
 
@@ -720,211 +1051,322 @@ pub fn PtxCodeGen_emit_header(self: & mut PtxCodeGen) -> void {
     self.output = self.output + ".address_size 64\n\n";
 }
 
-/// Emit a function header.
-pub fn PtxCodeGen_emit_function_header(self: & mut PtxCodeGen, name: str, is_kernel: bool, wg_x: i64, wg_y: i64, wg_z: i64) -> void {
-    if is_kernel {
-        self.output = self.output + ".visible .entry " + name + "() .maxntid " + int_to_str(wg_x) + "," + int_to_str(wg_y) + "," + int_to_str(wg_z) + "\n{\n";
-    } else {
-        self.output = self.output + ".visible .entry " + name + "()\n{\n";
-    }
-    // Register declarations
-    self.output = self.output + "    .reg .u64 r<32>;\n";
-    self.output = self.output + "    .reg .pred p<8>;\n\n";
+fn ptx_line(self: & mut PtxCodeGen, s: str) {
+    self.output = self.output + "    " + s + "\n";
 }
 
-/// Emit a function footer.
-pub fn PtxCodeGen_emit_function_footer(self: & mut PtxCodeGen) -> void {
+fn ptx_label_name(self: & PtxCodeGen, block_id: i64) -> str {
+    return self.fname + "_b" + int_to_str(block_id);
+}
+
+/// The register of IR value `v`.
+fn ptx_reg(v: i64) -> str {
+    return "r" + int_to_str(v);
+}
+
+fn ptx_skip(self: & mut PtxCodeGen, what: str, id: i64, has_result: bool) {
+    self.skipped = self.skipped + 1;
+    ptx_line(self, "// not translated: " + what);
+    if has_result {
+        ptx_line(self, "mov.u64 " + ptx_reg(id) + ", 0;");
+    }
+}
+
+/// Generate PTX for an IR module: its kernels (else `main`).
+pub fn PtxCodeGen_gen_module(self: & mut PtxCodeGen, module: & IrModule) -> void {
+    PtxCodeGen_emit_header(self);
+    var any_kernel: bool = false;
+    var i: i64 = 0;
+    while i < module.functions.len() {
+        if module.functions.get(i).func.is_kernel {
+            any_kernel = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.functions.len() {
+        var f: IrFunction = module.functions.get(i).func;
+        if f.is_kernel || (!any_kernel && module.functions.get(i).name == "main") {
+            PtxCodeGen_gen_function(self, module.functions.get(i).name, & f);
+        }
+        i = i + 1;
+    }
+}
+
+/// One function as a `.entry` kernel.
+pub fn PtxCodeGen_gen_function(self: & mut PtxCodeGen, name: str, func: & IrFunction) -> void {
+    self.fname = name;
+    var params: Vec<i64> = gpu_kernel_params(func);
+    var head: str = ".visible .entry " + name + "(";
+    var pi: i64 = 0;
+    while pi < params.len() {
+        if pi > 0 {
+            head = head + ", ";
+        }
+        head = head + ".param .u64 " + name + "_param_" + int_to_str(pi);
+        pi = pi + 1;
+    }
+    head = head + ")";
+    if func.is_kernel && func.workgroup_size.len() > 2 {
+        head = head + " .maxntid " + int_to_str(func.workgroup_size.get(0)) + ", " + int_to_str(func.workgroup_size.get(1)) + ", " + int_to_str(func.workgroup_size.get(2));
+    }
+    self.output = self.output + head + "\n{\n";
+
+    // Registers: r0 .. r<n-1> for the IR values
+    var nregs: i64 = func.next_value;
+    if nregs < 1 {
+        nregs = 1;
+    }
+    ptx_line(self, ".reg .u64 r<" + int_to_str(nregs) + ">;");
+    ptx_line(self, ".reg .u64 t<2>;");
+    ptx_line(self, ".reg .u32 s<1>;");
+    ptx_line(self, ".reg .pred p<2>;");
+    pi = 0;
+    while pi < params.len() {
+        ptx_line(self, "ld.param.u64 " + ptx_reg(params.get(pi)) + ", [" + name + "_param_" + int_to_str(pi) + "];");
+        pi = pi + 1;
+    }
+
+    // The entry block first: execution starts at the top
+    var slots: Vec<bool> = gpu_slots(func);
+    var order: Vec<i64> = gpu_block_order(func);
+    var bi: i64 = 0;
+    while bi < order.len() {
+        PtxCodeGen_gen_block(self, func, func.blocks.get(order.get(bi)), & slots);
+        bi = bi + 1;
+    }
     self.output = self.output + "}\n\n";
 }
 
-/// Emit a block label.
-pub fn PtxCodeGen_emit_block_label(self: & mut PtxCodeGen, func_name: str, block_id: i64) -> void {
-    self.output = self.output + func_name + "_b" + int_to_str(block_id) + ":\n";
-}
-
-/// Emit a mov instruction.
-pub fn PtxCodeGen_emit_mov(self: & mut PtxCodeGen, dst: i64, src: str) -> void {
-    self.output = self.output + "    mov.u64 r" + int_to_str(dst) + ", " + src + ";\n";
-}
-
-/// Emit a binary operation.
-pub fn PtxCodeGen_emit_binop(self: & mut PtxCodeGen, op: str, dst: i64, a: str, b: str) -> void {
-    if op == "mul" {
-        self.output = self.output + "    mul.lo.u64 r" + int_to_str(dst) + ", " + a + ", " + b + ";\n";
-    } else {
-        self.output = self.output + "    " + op + ".u64 r" + int_to_str(dst) + ", " + a + ", " + b + ";\n";
-    }
-}
-
-/// Emit a return.
-pub fn PtxCodeGen_emit_ret(self: & mut PtxCodeGen, value: str) -> void {
-    if str_len(value) > 0 {
-        self.output = self.output + "    mov.u64 ret_val, " + value + ";\n";
-    }
-    self.output = self.output + "    return;\n";
-}
-
-/// Emit an unconditional branch.
-pub fn PtxCodeGen_emit_jmp(self: & mut PtxCodeGen, target: i64) -> void {
-    self.output = self.output + "    bra target_" + int_to_str(target) + ";\n";
-}
-
-/// Emit a conditional branch.
-pub fn PtxCodeGen_emit_br(self: & mut PtxCodeGen, cond: str, then_label: i64, else_label: i64) -> void {
-    self.output = self.output + "    setp.eq.u64 p0, " + cond + ", 0;\n";
-    self.output = self.output + "    @p0 bra target_" + int_to_str(else_label) + ";\n";
-    self.output = self.output + "    bra target_" + int_to_str(then_label) + ";\n";
-}
-
-/// Emit a comment (for unhandled instructions).
-pub fn PtxCodeGen_emit_comment(self: & mut PtxCodeGen, comment: str) -> void {
-    self.output = self.output + "    // " + comment + "\n";
-}
-
-// --- PTX module / function / block / instruction generation ---
-
-/// Map an L3 operand to a PTX register string.
-pub fn ptx_operand_to_str(op: Operand) -> str {
-    match op {
-        Operand::ImmI(v) => {
-            return int_to_str(v);
-        }
-        Operand::VReg(v) => {
-            return "r" + int_to_str(v.id);
-        }
-        _ => {
-            return "0";
-        }
-    }
-    return "0";
-}
-
-/// Generate PTX for an entire L3 module.
-/// Emits PTX header and iterates functions.
-pub fn PtxCodeGen_gen_module(self: & mut PtxCodeGen, module: L3Module) -> void {
-    PtxCodeGen_emit_header(self);
-
+/// One block: its label, its instructions up to the first terminator, and
+/// `ret` if it has none.
+pub fn PtxCodeGen_gen_block(self: & mut PtxCodeGen, func: & IrFunction, block: BasicBlock, slots: & Vec<bool>) -> void {
+    self.output = self.output + ptx_label_name(self, block.id) + ":\n";
     var i: i64 = 0;
-    while i < module.functions.len() {
-        PtxCodeGen_gen_function(self, module.functions.get(i));
+    var ended: bool = false;
+    while i < block.instructions.len() && !ended {
+        var id: i64 = block.instructions.get(i);
+        match IrFunction_get_inst(func, id) {
+            OptInst::Some(inst) => {
+                ended = PtxCodeGen_gen_inst(self, func, id, inst, slots);
+            }
+            OptInst::None => {
+            }
+        }
         i = i + 1;
     }
-}
-
-/// Generate PTX for one function.
-pub fn PtxCodeGen_gen_function(self: & mut PtxCodeGen, func: L3Function) -> void {
-    // Workgroup size (default: 1, 1, 1)
-    var wg_x: i64 = 1;
-    var wg_y: i64 = 1;
-    var wg_z: i64 = 1;
-    if func.workgroup_size.len() > 2 {
-        wg_x = func.workgroup_size.get(0);
-        wg_y = func.workgroup_size.get(1);
-        wg_z = func.workgroup_size.get(2);
-    }
-
-    PtxCodeGen_emit_function_header(self, func.name, func.is_kernel, wg_x, wg_y, wg_z);
-
-    var i: i64 = 0;
-    while i < func.blocks.len() {
-        var block: L3Block = func.blocks.get(i);
-        PtxCodeGen_emit_block_label(self, func.name, block.id);
-        PtxCodeGen_gen_block(self, block);
-        i = i + 1;
-    }
-
-    PtxCodeGen_emit_function_footer(self);
-}
-
-/// Generate PTX for one block: iterate instructions.
-pub fn PtxCodeGen_gen_block(self: & mut PtxCodeGen, block: L3Block) -> void {
-    var i: i64 = 0;
-    while i < block.instructions.len() {
-        PtxCodeGen_gen_inst(self, block.instructions.get(i));
-        i = i + 1;
+    if !ended {
+        ptx_line(self, "ret;");
     }
 }
 
-/// Translate one L3 instruction to PTX.
-pub fn PtxCodeGen_gen_inst(self: & mut PtxCodeGen, inst: L3Inst) -> void {
+/// The PTX comparison of a BinOp ("" if none)
+fn ptx_cmp(op: BinOp) -> str {
+    if binop_eq(op, BinOp::Eq) {
+        return "eq";
+    }
+    if binop_eq(op, BinOp::Neq) {
+        return "ne";
+    }
+    if binop_eq(op, BinOp::Lt) {
+        return "lt";
+    }
+    if binop_eq(op, BinOp::Gt) {
+        return "gt";
+    }
+    if binop_eq(op, BinOp::LtEq) {
+        return "le";
+    }
+    if binop_eq(op, BinOp::GtEq) {
+        return "ge";
+    }
+    return "";
+}
+
+/// The PTX arithmetic instruction of a BinOp ("" if none); shifts are
+/// written apart (their count is a .u32).
+fn ptx_arith(op: BinOp) -> str {
+    if binop_eq(op, BinOp::Add) {
+        return "add.s64";
+    }
+    if binop_eq(op, BinOp::Sub) {
+        return "sub.s64";
+    }
+    if binop_eq(op, BinOp::Mul) {
+        return "mul.lo.s64";
+    }
+    if binop_eq(op, BinOp::Div) {
+        return "div.s64";
+    }
+    if binop_eq(op, BinOp::Mod) {
+        return "rem.s64";
+    }
+    if binop_eq(op, BinOp::BitAnd) || binop_eq(op, BinOp::And) {
+        return "and.b64";
+    }
+    if binop_eq(op, BinOp::BitOr) || binop_eq(op, BinOp::Or) {
+        return "or.b64";
+    }
+    if binop_eq(op, BinOp::BitXor) {
+        return "xor.b64";
+    }
+    return "";
+}
+
+/// One IR instruction (value `id`); true when it ends the block.
+pub fn PtxCodeGen_gen_inst(self: & mut PtxCodeGen, func: & IrFunction, id: i64, inst: Inst, slots: & Vec<bool>) -> bool {
+    var d: str = ptx_reg(id);
     match inst {
-        L3Inst::AddrOfSlot(_, _) => {  // No-op on GPU
+        Inst::ConstInt(v, _) => {
+            ptx_line(self, "mov.u64 " + d + ", " + int_to_str(v) + ";");
         }
-        L3Inst::Mov(dst, src) => {
-            var d: i64 = dst.id;
-            match src {
-                Operand::ImmI(imm) => {
-                    PtxCodeGen_emit_mov(self, d, int_to_str(imm));
-                }
-                Operand::VReg(src_v) => {
-                    PtxCodeGen_emit_mov(self, d, "r" + int_to_str(src_v.id));
-                }
-                _ => {
-                }
-            }
-        }
-        L3Inst::Bin(op, dst, a, b, _) => {
-            var d: i64 = dst.id;
-            var a_reg: str = ptx_operand_to_str(a);
-            var b_reg: str = ptx_operand_to_str(b);
-
-            if binop_eq(op, BinOp::Add) {
-                PtxCodeGen_emit_binop(self, "add", d, a_reg, b_reg);
-            } else if binop_eq(op, BinOp::Sub) {
-                PtxCodeGen_emit_binop(self, "sub", d, a_reg, b_reg);
-            } else if binop_eq(op, BinOp::Mul) {
-                PtxCodeGen_emit_binop(self, "mul", d, a_reg, b_reg);
-            } else if binop_eq(op, BinOp::Div) {
-                PtxCodeGen_emit_binop(self, "div", d, a_reg, b_reg);
+        Inst::ConstBool(b) => {
+            if b {
+                ptx_line(self, "mov.u64 " + d + ", 1;");
             } else {
-                PtxCodeGen_emit_comment(self, "unhandled binop");
+                ptx_line(self, "mov.u64 " + d + ", 0;");
             }
         }
-        L3Inst::Ret(value) => {
-            match value {
-                OptOperand::Some(v) => {
-                    var v_reg: str = ptx_operand_to_str(v);
-                    PtxCodeGen_emit_ret(self, v_reg);
+        Inst::ConstNull(_) => {
+            ptx_line(self, "mov.u64 " + d + ", 0;");
+        }
+        Inst::BinOp(op, a, b, ty) => {
+            if ir_type_is_float(ty) || ir_type_is_float(gpu_value_ty(func, a)) {
+                ptx_skip(self, "float operation", id, true);
+                return false;
+            }
+            var ar: str = ptx_reg(a);
+            var br: str = ptx_reg(b);
+            var cmp: str = ptx_cmp(op);
+            var arith: str = ptx_arith(op);
+            if str_len(cmp) > 0 {
+                ptx_line(self, "setp." + cmp + ".s64 p1, " + ar + ", " + br + ";");
+                ptx_line(self, "selp.u64 " + d + ", 1, 0, p1;");
+            } else if str_len(arith) > 0 {
+                ptx_line(self, arith + " " + d + ", " + ar + ", " + br + ";");
+            } else if binop_eq(op, BinOp::Shl) || binop_eq(op, BinOp::Shr) {
+                ptx_line(self, "cvt.u32.u64 s0, " + br + ";");
+                if binop_eq(op, BinOp::Shl) {
+                    ptx_line(self, "shl.b64 " + d + ", " + ar + ", s0;");
+                } else {
+                    ptx_line(self, "shr.s64 " + d + ", " + ar + ", s0;");
                 }
-                OptOperand::None => {
-                    PtxCodeGen_emit_ret(self, "");
-                }
+            } else {
+                ptx_skip(self, "binary operator", id, true);
             }
         }
-        L3Inst::Jmp(target) => {
-            PtxCodeGen_emit_jmp(self, target);
+        Inst::UnaryOp(op, a, ty) => {
+            if ir_type_is_float(ty) {
+                ptx_skip(self, "float operation", id, true);
+                return false;
+            }
+            var ua: str = ptx_reg(a);
+            if unaryop_eq(op, UnaryOp::Not) {
+                ptx_line(self, "setp.eq.s64 p1, " + ua + ", 0;");
+                ptx_line(self, "selp.u64 " + d + ", 1, 0, p1;");
+            } else if unaryop_eq(op, UnaryOp::BitNot) {
+                ptx_line(self, "not.b64 " + d + ", " + ua + ";");
+            } else {
+                ptx_line(self, "neg.s64 " + d + ", " + ua + ";");
+            }
         }
-        L3Inst::Br(cond, then_b, else_b) => {
-            var c: str = ptx_operand_to_str(cond);
-            PtxCodeGen_emit_br(self, c, then_b, else_b);
+        Inst::IntExtend(v, _, _) => {
+            ptx_line(self, "mov.u64 " + d + ", " + ptx_reg(v) + ";");
+        }
+        Inst::IntTrunc(v, _, _) => {
+            ptx_line(self, "mov.u64 " + d + ", " + ptx_reg(v) + ";");
+        }
+        Inst::BitCast(v, from, to) => {
+            if gpu_is_scalar(from) && gpu_is_scalar(to) {
+                ptx_line(self, "mov.u64 " + d + ", " + ptx_reg(v) + ";");
+            } else {
+                ptx_skip(self, "bit cast", id, true);
+            }
+        }
+        Inst::Alloca(ty, _) => {
+            // A scalar slot is the register of its Alloca value
+            if !gpu_is_scalar(ty) {
+                ptx_skip(self, "stack allocation", id, true);
+            }
+        }
+        Inst::Load(p, _) => {
+            if gpu_is_slot(slots, p) {
+                ptx_line(self, "mov.u64 " + d + ", " + ptx_reg(p) + ";");
+            } else {
+                ptx_skip(self, "load", id, true);
+            }
+        }
+        Inst::Store(p, v, _) => {
+            if gpu_is_slot(slots, p) {
+                ptx_line(self, "mov.u64 " + ptx_reg(p) + ", " + ptx_reg(v) + ";");
+            } else {
+                ptx_skip(self, "store", id, false);
+            }
+        }
+        Inst::Jump(target) => {
+            ptx_line(self, "bra.uni " + ptx_label_name(self, target) + ";");
+            return true;
+        }
+        Inst::Branch(cond, then_b, else_b) => {
+            ptx_line(self, "setp.ne.s64 p0, " + ptx_reg(cond) + ", 0;");
+            ptx_line(self, "@p0 bra " + ptx_label_name(self, then_b) + ";");
+            ptx_line(self, "bra.uni " + ptx_label_name(self, else_b) + ";");
+            return true;
+        }
+        Inst::Return(_) => {
+            // A kernel returns no value
+            ptx_line(self, "ret;");
+            return true;
+        }
+        Inst::Unreachable => {
+            ptx_line(self, "trap;");
+            return true;
+        }
+        Inst::Panic(_) => {
+            ptx_line(self, "trap;");
+            return true;
+        }
+        Inst::TryUnwrap(_, _, _, _) => {
+            ptx_skip(self, "try-unwrap", id, true);
+            ptx_line(self, "trap;");
+            return true;
+        }
+        Inst::Call(name, _, _, _) => {
+            ptx_skip(self, "call " + name, id, gpu_has_result(inst));
         }
         _ => {
-            PtxCodeGen_emit_comment(self, "unhandled instruction");
+            ptx_skip(self, "memory, print or dyn value", id, gpu_has_result(inst));
         }
     }
+    return false;
 }
 
 // --- Public API ---
 
-/// Generate SPIR-V bytecode for an L3 module.
-/// Produces a Vulkan compute shader that can be executed on a GPU.
-pub fn generate_spirv(module: L3Module) -> Vec<i64> {
+/// SPIR-V words for an IR module (a Vulkan compute shader; see
+/// SpirVCodeGen for what is translated).
+pub fn generate_spirv(module: & IrModule) -> Vec<i64> {
     var gen: SpirVCodeGen = SpirVCodeGen_new();
-    SpirVCodeGen_gen_module(gen, module);
+    SpirVCodeGen_gen_module(& mut gen, module);
+    if gen.skipped > 0 {
+        p_eprint_str("warning: fid gpu: " + int_to_str(gen.skipped) + " instructions have no SPIR-V translation (calls, memory, floats); their results are 0\n");
+    }
     return gen.words;
 }
 
 /// Generate SPIR-V as a text disassembly (for debugging).
-pub fn generate_spirv_text(module: L3Module) -> str {
+pub fn generate_spirv_text(module: & IrModule) -> str {
     var words: Vec<i64> = generate_spirv(module);
     return disassemble(words);
 }
 
-/// Generate PTX (NVIDIA GPU assembly) for an L3 module.
-/// PTX is NVIDIA's parallel thread execution ISA.
-pub fn generate_ptx(module: L3Module) -> str {
+/// Generate PTX (NVIDIA GPU assembly) for an IR module.
+pub fn generate_ptx(module: & IrModule) -> str {
     var gen: PtxCodeGen = PtxCodeGen_new();
-    PtxCodeGen_gen_module(gen, module);
+    PtxCodeGen_gen_module(& mut gen, module);
+    if gen.skipped > 0 {
+        p_eprint_str("warning: fid gpu: " + int_to_str(gen.skipped) + " instructions have no PTX translation (calls, memory, floats); their results are 0\n");
+    }
     return gen.output;
 }
 
@@ -934,18 +1376,6 @@ fn lookup_str(v: Vec<GpuStrI64>, key: str) -> i64 {
     var i: i64 = 0;
     while i < v.len() {
         var entry: GpuStrI64 = v.get(i);
-        if entry.a == key {
-            return entry.b;
-        }
-        i = i + 1;
-    }
-    return - 1;
-}
-
-fn lookup_i64(v: Vec<GpuI64I64>, key: i64) -> i64 {
-    var i: i64 = 0;
-    while i < v.len() {
-        var entry: GpuI64I64 = v.get(i);
         if entry.a == key {
             return entry.b;
         }

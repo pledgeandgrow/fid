@@ -1,0 +1,103 @@
+// stdlib/lqr: dense matrix helpers (solve, inverse, det, Cholesky, expm), zero-order-hold discretization and discrete LQR on a double integrator; values checked against scipy (expm, solve_discrete_are)
+// Expected output:
+// solve = [2.000000; 3.000000; -1.000000]
+// inverse = [4.000000 3.000000 -1.000000; -2.000000 -2.000000 1.000000; 5.000000 4.000000 -1.000000]
+// det = -1.000000 det spd = 44.600000
+// cholesky = [2.000000 0.000000 0.000000; 1.000000 2.000000 0.000000; 0.300000 0.350000 1.669581]
+// L L' = A: true
+// singular: dm_solve: singular matrix
+// not spd: dm_cholesky: matrix is not positive definite
+// expm = [0.596261 0.498956; -0.997913 0.346783]
+// Ad = [1.000000 0.100000; 0.000000 1.000000]
+// Bd = [0.005000; 0.100000]
+// P = [11.171908 3.181981; 3.181981 3.645780]
+// K = [2.673385 2.986681]
+// closed loop trace = 1.687965 det = 0.714699
+// x after 50 steps = [-0.000058; -0.000301]
+// cost from x0 = 11.171908
+use lqr;
+
+fn main() -> i64 {
+    val d: DMat = dm_parse("2 1 -1; -3 -1 2; -2 1 2");
+    val rhs: DMat = dm_parse("8; -11; -3");
+    match dm_solve(&d, &rhs) {
+        Result::Ok(x) => {
+            println("solve = " + dm_to_str(&x, 6));
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    match dm_inverse(&d) {
+        Result::Ok(x) => {
+            println("inverse = " + dm_to_str(&x, 6));
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    val c: DMat = dm_parse("4 2 0.6; 2 5 1; 0.6 1 3");
+    println("det = " + rmath_fmt(dm_det(&d), 6) + " det spd = " + rmath_fmt(dm_det(&c), 6));
+    match dm_cholesky(&c) {
+        Result::Ok(l) => {
+            println("cholesky = " + dm_to_str(&l, 6));
+            val lt: DMat = dm_transpose(&l);
+            val llt: DMat = dm_mul(&l, &lt);
+            if dm_max_diff(&llt, &c) < 0.000000000001 {
+                println("L L' = A: true");
+            } else {
+                println("L L' = A: false");
+            }
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    val sing: DMat = dm_parse("1 2; 2 4");
+    match dm_inverse(&sing) {
+        Result::Ok(x) => {
+            println("singular: inverted?");
+        }
+        Result::Err(e) => {
+            println("singular: " + e);
+        }
+    }
+    val nspd: DMat = dm_parse("1 2; 2 1");
+    match dm_cholesky(&nspd) {
+        Result::Ok(x) => {
+            println("not spd: factored?");
+        }
+        Result::Err(e) => {
+            println("not spd: " + e);
+        }
+    }
+    val a2: DMat = dm_parse("0 0.7; -1.4 -0.35");
+    println("expm = " + dm_to_str(&dm_expm(&a2), 6));
+
+    // double integrator: x = (position, velocity), u = acceleration
+    val a: DMat = dm_parse("0 1; 0 0");
+    val b: DMat = dm_parse("0; 1");
+    val sys: DiscreteSys = lqr_c2d(&a, &b, 0.1);
+    println("Ad = " + dm_to_str(&sys.ad, 6));
+    println("Bd = " + dm_to_str(&sys.bd, 6));
+    val q: DMat = dm_parse("1 0; 0 0.5");
+    val r: DMat = dm_parse("0.1");
+    match lqr_dlqr(&sys.ad, &sys.bd, &q, &r) {
+        Result::Ok(res) => {
+            println("P = " + dm_to_str(&res.p, 6));
+            println("K = " + dm_to_str(&res.k, 6));
+            val acl: DMat = lqr_closed_loop(&sys.ad, &sys.bd, &res.k);
+            println("closed loop trace = " + rmath_fmt(dm_trace(&acl), 6) + " det = " + rmath_fmt(dm_det(&acl), 6));
+            val x0: DMat = dm_parse("1; 0");
+            val traj: Vec<DMat> = lqr_simulate(&sys.ad, &sys.bd, &res.k, &x0, 50);
+            println("x after 50 steps = " + dm_to_str(&traj.get(50), 6));
+            // the infinite-horizon cost from x0 is x0' P x0 = P[0][0]
+            val long: Vec<DMat> = lqr_simulate(&sys.ad, &sys.bd, &res.k, &x0, 400);
+            println("cost from x0 = " + rmath_fmt(lqr_cost(&long, &res.k, &q, &r), 6));
+        }
+        Result::Err(e) => {
+            println(e);
+        }
+    }
+    return 0;
+}

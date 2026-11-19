@@ -1,0 +1,158 @@
+// CS1: the real rules_run and egraph_run (compiler/rules.fd, egraph.fd)
+// with the mid-end memo (compiler/ir_ser.fd mec_*), on a module built by
+// hand: the first build misses and records, the second hits every function
+// and must leave each function exactly as the first did (same content
+// hash, same counts), and so must a build with FID_MECACHE=off. "rewrites
+// seen": the rules rewrote and merged calls, the e-graph forwarded a load
+// and rewrote (so both passes' recorded changes are replayed, not only
+// "nothing changed" entries).
+// tests/tooling/mecache-check.sh builds and runs it (C backend) with
+// FID_MECACHE_STATS=1 and reads the [mecache] lines on stderr.
+//
+// Expected output (stdout):
+// rules counts same
+// egraph counts same
+// functions same
+// off same
+// rewrites seen
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::ast_ser;
+use compiler::inc;
+use compiler::ir_ser;
+use compiler::rules;
+use compiler::egraph;
+
+fn tmp_dir() -> str {
+    var d: str = env_or_empty("TEMP");
+    if d == "" {
+        d = env_or_empty("TMPDIR");
+    }
+    if d == "" {
+        d = "/tmp";
+    }
+    return d;
+}
+
+/// (k + 0) * 1 and k - k, returned: work for the rules and the e-graph.
+fn make_arith(name: str, k: i64) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var a: i64 = IrFunction_emit(& mut f, Inst::ConstInt(k, IrType::I64));
+    var z: i64 = IrFunction_emit(& mut f, Inst::ConstInt(0, IrType::I64));
+    var one: i64 = IrFunction_emit(& mut f, Inst::ConstInt(1, IrType::I64));
+    var s: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Add, a, z, IrType::I64));
+    var p: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Mul, s, one, IrType::I64));
+    var d: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Sub, p, p, IrType::I64));
+    var t: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Add, p, d, IrType::I64));
+    var _r: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(t)));
+    return f;
+}
+
+/// k, returned: nothing to do.
+fn make_plain(name: str, k: i64) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var a: i64 = IrFunction_emit(& mut f, Inst::ConstInt(k, IrType::I64));
+    var _r: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(a)));
+    return f;
+}
+
+/// Two calls of the pure `plain0` with the same (no) arguments: the rules
+/// merge the second into a move.
+fn make_calls(name: str) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var c1: i64 = IrFunction_emit(& mut f, Inst::Call("plain0", Vec::new(), IrType::I64, EffectSet_new()));
+    var c2: i64 = IrFunction_emit(& mut f, Inst::Call("plain0", Vec::new(), IrType::I64, EffectSet_new()));
+    var s: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Add, c1, c2, IrType::I64));
+    var _r: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(s)));
+    return f;
+}
+
+/// 3 + 4 and 4 + 3, a local stored once and loaded: the e-graph folds the
+/// first, makes the second a move of it, and forwarding replaces the load.
+fn make_fold(name: str) -> IrFunction {
+    var f: IrFunction = IrFunction_new(name, IrType::I64);
+    var a: i64 = IrFunction_emit(& mut f, Inst::ConstInt(3, IrType::I64));
+    var b: i64 = IrFunction_emit(& mut f, Inst::ConstInt(4, IrType::I64));
+    var s: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Add, a, b, IrType::I64));
+    var t: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Add, b, a, IrType::I64));
+    var p: i64 = IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var _st: i64 = IrFunction_emit(& mut f, Inst::Store(p, t, OptIrType::Some(IrType::I64)));
+    var l: i64 = IrFunction_emit(& mut f, Inst::Load(p, IrType::I64));
+    var u: i64 = IrFunction_emit(& mut f, Inst::BinOp(BinOp::Mul, s, l, IrType::I64));
+    var _r: i64 = IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(u)));
+    return f;
+}
+
+fn make_module() -> IrModule {
+    var m: IrModule = IrModule_new();
+    IrModule_add_function(& mut m, make_plain("plain0", 3));
+    IrModule_add_function(& mut m, make_arith("arith5", 5));
+    IrModule_add_function(& mut m, make_arith("arith9", 9));
+    IrModule_add_function(& mut m, make_calls("calls"));
+    IrModule_add_function(& mut m, make_fold("fold"));
+    return m;
+}
+
+fn same_vec(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hashes(m: & IrModule) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < m.functions.len() {
+        out.push(mec_fn_hash(m.functions.get(i).func));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    var path: str = tmp_dir() + "/fid-mec-passes-" + int_to_str(p_getpid()) + ".bin";
+    p_file_delete(path);
+    env_override_set("FID_MECACHE", path);
+    // the first build: every function misses
+    var m1: IrModule = make_module();
+    var r1: Vec<i64> = rules_run(& mut m1);
+    var e1: Vec<i64> = egraph_run(& mut m1);
+    // the second: every function hits
+    var m2: IrModule = make_module();
+    var r2: Vec<i64> = rules_run(& mut m2);
+    var e2: Vec<i64> = egraph_run(& mut m2);
+    if same_vec(r1, r2) {
+        println("rules counts same");
+    }
+    if same_vec(e1, e2) {
+        println("egraph counts same");
+    }
+    var h1: Vec<i64> = hashes(& m1);
+    if same_vec(h1, hashes(& m2)) {
+        println("functions same");
+    }
+    // without the memo
+    env_override_set("FID_MECACHE", "off");
+    var m3: IrModule = make_module();
+    var r3: Vec<i64> = rules_run(& mut m3);
+    var e3: Vec<i64> = egraph_run(& mut m3);
+    if same_vec(r1, r3) && same_vec(e1, e3) && same_vec(h1, hashes(& m3)) {
+        println("off same");
+    }
+    if r1.get(0) > 0 && r1.get(1) > 0 && e1.get(0) > 0 && e1.get(1) > 0 {
+        println("rewrites seen");
+    }
+    p_eprint_str("[probe] rules " + int_to_str(r1.get(0)) + " " + int_to_str(r1.get(1)) + ", egraph " + int_to_str(e1.get(0)) + " " + int_to_str(e1.get(1)) + " " + int_to_str(e1.get(2)) + "\n");
+    p_file_delete(path);
+}

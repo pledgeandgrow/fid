@@ -1,0 +1,119 @@
+// stdlib/tlsf: size-class mapping, first allocations, a 2000-operation random alloc/free workload with data and integrity checks, coalescing after fragmentation, realloc in place.
+// Expected output:
+// fls 0 31 ffs 4
+// map 100 -> 0/12, 1000 -> 3/15, search 1000 -> 4/0
+// fresh: free 65504 in 1 block, check ok
+// malloc 10 -> 16 (usable 16), malloc 100 -> 48 (usable 104)
+// workload: 2000 ops, integrity ok true, data intact true
+// all freed: free 65504 in 1 block, used 0, check ok
+// too big: -1
+// four 16000-byte blocks: true, fifth: -1
+// free 2nd and 4th: free blocks 2, largest 17456, 20000 fits: false
+// free 3rd: largest 49488, 20000 fits: true, check ok
+// realloc in place: true, usable 224
+// realloc moved: true, data kept: true
+use tlsf;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn okc(s: str) -> str {
+    if str_len(s) == 0 { return "ok"; }
+    return s;
+}
+
+fn mp(m: i64) -> str {
+    return int_to_str(m / 16) + "/" + int_to_str(m % 16);
+}
+
+fn main() {
+    println("fls " + int_to_str(tlsf_fls(1)) + " " + int_to_str(tlsf_fls(0x80000000)) + " ffs " + int_to_str(tlsf_ffs(0x50)));
+    println("map 100 -> " + mp(tlsf_mapping_insert(100)) + ", 1000 -> " + mp(tlsf_mapping_insert(1000)) + ", search 1000 -> " + mp(tlsf_mapping_search(1000)));
+    var t: Tlsf = tlsf_new(65536);
+    val s0: TlsfStats = tlsf_stats(&t);
+    println("fresh: free " + int_to_str(s0.free_bytes) + " in " + int_to_str(s0.free_blocks) + " block, check " + okc(tlsf_check(&t)));
+    val a: i64 = tlsf_malloc(&mut t, 10);
+    val b: i64 = tlsf_malloc(&mut t, 100);
+    println("malloc 10 -> " + int_to_str(a) + " (usable " + int_to_str(tlsf_usable(&t, a)) + "), malloc 100 -> " + int_to_str(b) + " (usable " + int_to_str(tlsf_usable(&t, b)) + ")");
+    tlsf_free(&mut t, a);
+    tlsf_free(&mut t, b);
+
+    var slots: Vec<i64> = Vec::filled(64, -1);
+    var sizes: Vec<i64> = Vec::filled(64, 0);
+    var seed: i64 = 12345;
+    var integrity: bool = true;
+    var intact: bool = true;
+    var op: i64 = 0;
+    while op < 2000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        val k: i64 = (seed >> 8) % 64;
+        if slots.get(k) < 0 {
+            seed = (seed * 1103515245 + 12345) % 2147483648;
+            var n: i64 = 1 + (seed >> 4) % 1500;
+            if (seed & 7) == 0 { n = 1 + (seed >> 4) % 24; }
+            val p: i64 = tlsf_malloc(&mut t, n);
+            if p >= 0 {
+                if p % 8 != 0 { integrity = false; }
+                slots.set(k, p);
+                sizes.set(k, n);
+                tlsf_wr(&mut t, p, k * 1000 + n);
+                tlsf_wr(&mut t, p + (n - 1) / 8 * 8, 0 - k - 1);
+            }
+        } else {
+            val p: i64 = slots.get(k);
+            val n: i64 = sizes.get(k);
+            if tlsf_rd(&t, p) != k * 1000 + n || tlsf_rd(&t, p + (n - 1) / 8 * 8) != 0 - k - 1 {
+                // The last word holds the tag only when the block has two words.
+                if n > 8 || tlsf_rd(&t, p) != 0 - k - 1 { intact = false; }
+            }
+            tlsf_free(&mut t, p);
+            slots.set(k, -1);
+        }
+        if op % 250 == 249 && str_len(tlsf_check(&t)) > 0 {
+            integrity = false;
+            println(tlsf_check(&t));
+        }
+        op = op + 1;
+    }
+    println("workload: 2000 ops, integrity ok " + bs(integrity) + ", data intact " + bs(intact));
+    var k2: i64 = 0;
+    while k2 < 64 {
+        if slots.get(k2) >= 0 { tlsf_free(&mut t, slots.get(k2)); }
+        k2 = k2 + 1;
+    }
+    val s1: TlsfStats = tlsf_stats(&t);
+    println("all freed: free " + int_to_str(s1.free_bytes) + " in " + int_to_str(s1.free_blocks) + " block, used " + int_to_str(s1.used_bytes) + ", check " + okc(tlsf_check(&t)));
+    println("too big: " + int_to_str(tlsf_malloc(&mut t, 70000)));
+
+    val blk1: i64 = tlsf_malloc(&mut t, 16000);
+    val blk2: i64 = tlsf_malloc(&mut t, 16000);
+    val blk3: i64 = tlsf_malloc(&mut t, 16000);
+    val blk4: i64 = tlsf_malloc(&mut t, 16000);
+    println("four 16000-byte blocks: " + bs(blk1 >= 0 && blk2 >= 0 && blk3 >= 0 && blk4 >= 0) + ", fifth: " + int_to_str(tlsf_malloc(&mut t, 16000)));
+    tlsf_free(&mut t, blk2);
+    tlsf_free(&mut t, blk4);
+    val s2: TlsfStats = tlsf_stats(&t);
+    val f1: i64 = tlsf_malloc(&mut t, 20000);
+    println("free 2nd and 4th: free blocks " + int_to_str(s2.free_blocks) + ", largest " + int_to_str(s2.largest_free) + ", 20000 fits: " + bs(f1 >= 0));
+    tlsf_free(&mut t, blk3);
+    val s3: TlsfStats = tlsf_stats(&t);
+    val f2: i64 = tlsf_malloc(&mut t, 20000);
+    println("free 3rd: largest " + int_to_str(s3.largest_free) + ", 20000 fits: " + bs(f2 >= 0) + ", check " + okc(tlsf_check(&t)));
+    tlsf_free(&mut t, f2);
+    tlsf_free(&mut t, blk1);
+
+    val p: i64 = tlsf_malloc(&mut t, 100);
+    val q: i64 = tlsf_malloc(&mut t, 100);
+    val guard: i64 = tlsf_malloc(&mut t, 100);
+    tlsf_free(&mut t, q);
+    val r: i64 = tlsf_realloc(&mut t, p, 200);
+    println("realloc in place: " + bs(r == p) + ", usable " + int_to_str(tlsf_usable(&t, r)));
+    tlsf_wr(&mut t, r, 777);
+    val r2: i64 = tlsf_realloc(&mut t, r, 5000);
+    println("realloc moved: " + bs(r2 != r) + ", data kept: " + bs(tlsf_rd(&t, r2) == 777 && str_len(tlsf_check(&t)) == 0));
+    tlsf_free(&mut t, guard);
+}

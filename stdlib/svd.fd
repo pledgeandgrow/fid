@@ -1,0 +1,360 @@
+// Fides CMSIS-SVD reader, pure Fides.
+//
+// Reads a CMSIS-SVD (System View Description, CMSIS 5 SVD schema 1.3)
+// document, the XML file chip vendors publish for every Cortex-M part,
+// into regmap.fd descriptions: one RegBlock per <peripheral>, one RegDesc
+// per <register>, one RegField per <field> with its <enumeratedValues>.
+// Everything is real parsing; there is no platform seam (the result can
+// be used with regbus_mmio() or regbus_fake() from regmap.fd).
+//
+// Supported:
+//   - device-, peripheral- and register-level defaults of <size>,
+//     <access> and <resetValue> (the registerPropertiesGroup inheritance)
+//   - field positions as <bitOffset>/<bitWidth>, <lsb>/<msb> or
+//     <bitRange>[msb:lsb]</bitRange>
+//   - <access> read-only / write-only / read-write / writeOnce /
+//     read-writeOnce, and modifiedWriteValues="oneToClear" (-> REG_W1C)
+//   - numbers in decimal, 0x hex, 0b or # binary ("#01"; enumerated
+//     values with 'x' don't-care bits are skipped, they are patterns)
+//   - register arrays: <dim>, <dimIncrement>, <dimIndex> ("0-3" or
+//     "A,B,C"), the name's %s replaced by each index
+//   - <peripheral derivedFrom="X">: a copy of X's registers at the new base
+//   - <cluster>: its registers flattened with the cluster's
+//     <addressOffset> added and its name as a prefix ("CH0_CTRL")
+// Not supported: <dimArrayIndex>, derivedFrom on registers or fields,
+// <writeConstraint>, <interrupt> (ignored).
+//
+//   val dev: SvdDevice = svd_parse(text);
+//   if !dev.ok { println(dev.error); }
+//   val gpio: RegBlock = svd_peripheral(dev, "GPIOA");
+
+module svd;
+ use vec; use string; use xml; use regmap;
+
+pub struct SvdDevice {
+    pub ok: bool,
+    pub error: str,
+    pub name: str,
+    pub width: i64,
+    pub peripherals: Vec<RegBlock>,
+    pub descs: Vec<str>,
+}
+
+/// Defaults inherited from the enclosing element.
+struct SvdProps {
+    size: i64,
+    access: i64,
+    reset: i64,
+}
+
+fn svd_trim(s: str) -> str {
+    return str_trim(s);
+}
+
+/// Parse an SVD scaled non-negative integer: decimal, 0x/0X hex, 0b or #
+/// binary. -1 when the text is not a number.
+pub fn svd_parse_int(s0: str) -> i64 {
+    val s: str = svd_trim(s0);
+    val n: i64 = str_len(s);
+    if n == 0 { return -1; }
+    var base: i64 = 10;
+    var i: i64 = 0;
+    if n > 2 && str_byte_at(s, 0) == 48 && (str_byte_at(s, 1) == 120 || str_byte_at(s, 1) == 88) {
+        base = 16;
+        i = 2;
+    } else if n > 2 && str_byte_at(s, 0) == 48 && (str_byte_at(s, 1) == 98 || str_byte_at(s, 1) == 66) {
+        base = 2;
+        i = 2;
+    } else if str_byte_at(s, 0) == 35 {
+        base = 2;
+        i = 1;
+    }
+    if i >= n { return -1; }
+    var v: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        var d: i64 = -1;
+        if c >= 48 && c <= 57 { d = c - 48; }
+        if c >= 97 && c <= 102 { d = c - 87; }
+        if c >= 65 && c <= 70 { d = c - 55; }
+        if d < 0 || d >= base { return -1; }
+        v = v * base + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn svd_child_text(node: XmlNode, tag: str) -> str {
+    if !xml_has(node, tag) { return ""; }
+    return svd_trim(xml_text(xml_child(node, tag)));
+}
+
+fn svd_child_int(node: XmlNode, tag: str, dflt: i64) -> i64 {
+    val t: str = svd_child_text(node, tag);
+    if str_len(t) == 0 { return dflt; }
+    val v: i64 = svd_parse_int(t);
+    if v < 0 { return dflt; }
+    return v;
+}
+
+/// SVD <access> text to a regmap access kind (-1 when unknown).
+pub fn svd_access(s: str) -> i64 {
+    if str_equal(s, "read-only") { return REG_RO; }
+    if str_equal(s, "write-only") || str_equal(s, "writeOnce") { return REG_WO; }
+    if str_equal(s, "read-write") || str_equal(s, "read-writeOnce") { return REG_RW; }
+    return -1;
+}
+
+fn svd_props(node: XmlNode, up: SvdProps) -> SvdProps {
+    var p: SvdProps = SvdProps { size: up.size, access: up.access, reset: up.reset };
+    p.size = svd_child_int(node, "size", up.size);
+    p.reset = svd_child_int(node, "resetValue", up.reset);
+    val a: i64 = svd_access(svd_child_text(node, "access"));
+    if a >= 0 { p.access = a; }
+    return p;
+}
+
+/// The indices of a dim array: <dimIndex> "0-3" or "A,B,C", else 0..dim-1.
+pub fn svd_dim_indices(dim: i64, dim_index: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val di: str = svd_trim(dim_index);
+    if str_len(di) == 0 {
+        var i: i64 = 0;
+        while i < dim {
+            out.push(int_to_str(i));
+            i = i + 1;
+        }
+        return out;
+    }
+    val dash: i64 = str_find(di, "-");
+    if dash > 0 && str_find(di, ",") < 0 {
+        val a: i64 = svd_parse_int(str_slice(di, 0, dash));
+        val b: i64 = svd_parse_int(str_slice(di, dash + 1, str_len(di)));
+        if a >= 0 && b >= a {
+            var k: i64 = a;
+            while k <= b {
+                out.push(int_to_str(k));
+                k = k + 1;
+            }
+            return out;
+        }
+    }
+    val parts: Vec<str> = str_split(di, ",");
+    var j: i64 = 0;
+    while j < parts.len() {
+        out.push(svd_trim(parts.get(j)));
+        j = j + 1;
+    }
+    return out;
+}
+
+fn svd_field(fnode: XmlNode, reg_access: i64) -> RegField {
+    var lsb: i64 = -1;
+    var width: i64 = -1;
+    if xml_has(fnode, "bitOffset") {
+        lsb = svd_child_int(fnode, "bitOffset", -1);
+        width = svd_child_int(fnode, "bitWidth", 1);
+    } else if xml_has(fnode, "lsb") {
+        lsb = svd_child_int(fnode, "lsb", -1);
+        val msb: i64 = svd_child_int(fnode, "msb", -1);
+        width = msb - lsb + 1;
+    } else if xml_has(fnode, "bitRange") {
+        val br: str = svd_child_text(fnode, "bitRange");
+        val colon: i64 = str_find(br, ":");
+        if str_len(br) > 4 && colon > 0 {
+            val msb2: i64 = svd_parse_int(str_slice(br, 1, colon));
+            lsb = svd_parse_int(str_slice(br, colon + 1, str_len(br) - 1));
+            width = msb2 - lsb + 1;
+        }
+    }
+    var acc: i64 = svd_access(svd_child_text(fnode, "access"));
+    if acc < 0 { acc = reg_access; }
+    if str_equal(svd_child_text(fnode, "modifiedWriteValues"), "oneToClear") { acc = REG_W1C; }
+    var f: RegField = regfield_new(svd_child_text(fnode, "name"), lsb, width, acc);
+    f.desc = svd_child_text(fnode, "description");
+    val evs: Vec<XmlNode> = xml_children(fnode, "enumeratedValues");
+    var e: i64 = 0;
+    while e < evs.len() {
+        val items: Vec<XmlNode> = xml_children(evs.get(e), "enumeratedValue");
+        var k: i64 = 0;
+        while k < items.len() {
+            val it: XmlNode = items.get(k);
+            val vt: str = svd_child_text(it, "value");
+            val v: i64 = svd_parse_int(vt);
+            if v >= 0 {
+                regfield_add_enum(&mut f, svd_child_text(it, "name"), v);
+            }
+            k = k + 1;
+        }
+        e = e + 1;
+    }
+    return f;
+}
+
+fn svd_register(rnode: XmlNode, props: SvdProps, prefix: str, extra_off: i64, out: &mut Vec<RegDesc>) {
+    val p: SvdProps = svd_props(rnode, props);
+    val name: str = svd_child_text(rnode, "name");
+    val off: i64 = svd_child_int(rnode, "addressOffset", 0) + extra_off;
+    var base: RegDesc = regdesc_new(prefix + name, off, p.size, p.access, p.reset);
+    if str_equal(svd_child_text(rnode, "modifiedWriteValues"), "oneToClear") { base.access = REG_W1C; }
+    base.desc = svd_child_text(rnode, "description");
+    if xml_has(rnode, "fields") {
+        val fs: Vec<XmlNode> = xml_children(xml_child(rnode, "fields"), "field");
+        var i: i64 = 0;
+        while i < fs.len() {
+            regdesc_add_field(&mut base, svd_field(fs.get(i), base.access));
+            i = i + 1;
+        }
+    }
+    val dim: i64 = svd_child_int(rnode, "dim", 0);
+    if dim <= 0 {
+        out.push(base);
+        return;
+    }
+    val inc: i64 = svd_child_int(rnode, "dimIncrement", p.size / 8);
+    val idx: Vec<str> = svd_dim_indices(dim, svd_child_text(rnode, "dimIndex"));
+    var k: i64 = 0;
+    while k < idx.len() {
+        var r: RegDesc = base;
+        r.name = str_replace(base.name, "%s", idx.get(k));
+        r.offset = off + k * inc;
+        out.push(r);
+        k = k + 1;
+    }
+}
+
+fn svd_cluster(cnode: XmlNode, props: SvdProps, prefix: str, extra_off: i64, out: &mut Vec<RegDesc>) {
+    val p: SvdProps = svd_props(cnode, props);
+    val cname: str = svd_child_text(cnode, "name");
+    val off: i64 = svd_child_int(cnode, "addressOffset", 0) + extra_off;
+    val dim: i64 = svd_child_int(cnode, "dim", 0);
+    var names: Vec<str> = Vec::new();
+    var offs: Vec<i64> = Vec::new();
+    if dim <= 0 {
+        names.push(cname);
+        offs.push(off);
+    } else {
+        val inc: i64 = svd_child_int(cnode, "dimIncrement", 0);
+        val idx: Vec<str> = svd_dim_indices(dim, svd_child_text(cnode, "dimIndex"));
+        var k: i64 = 0;
+        while k < idx.len() {
+            names.push(str_replace(cname, "%s", idx.get(k)));
+            offs.push(off + k * inc);
+            k = k + 1;
+        }
+    }
+    var n: i64 = 0;
+    while n < names.len() {
+        svd_register_list(cnode, p, prefix + str_replace(str_replace(names.get(n), "[", ""), "]", "") + "_", offs.get(n), out);
+        n = n + 1;
+    }
+}
+
+fn svd_register_list(container: XmlNode, props: SvdProps, prefix: str, extra_off: i64, out: &mut Vec<RegDesc>) {
+    var i: i64 = 0;
+    while i < container.children.len() {
+        val c: XmlNode = container.children.get(i);
+        if str_equal(c.tag, "register") {
+            svd_register(c, props, prefix, extra_off, out);
+        } else if str_equal(c.tag, "cluster") {
+            svd_cluster(c, props, prefix, extra_off, out);
+        }
+        i = i + 1;
+    }
+}
+
+fn svd_find_block(blocks: &Vec<RegBlock>, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < blocks.len() {
+        if str_equal(blocks.get(i).name, name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn svd_fail(msg: str) -> SvdDevice {
+    return SvdDevice { ok: false, error: msg, name: "", width: 0, peripherals: Vec::new(), descs: Vec::new() };
+}
+
+/// Parse an SVD document.
+pub fn svd_parse(text: str) -> SvdDevice {
+    val doc: XmlDoc = xml_load(text);
+    if !doc.ok { return svd_fail("svd: XML: " + doc.error); }
+    val root: XmlNode = doc.root;
+    if !str_equal(root.tag, "device") { return svd_fail("svd: root element is <" + root.tag + ">, not <device>"); }
+    val top: SvdProps = svd_props(root, SvdProps { size: 32, access: REG_RW, reset: 0 });
+    var dev: SvdDevice = SvdDevice {
+        ok: true, error: "", name: svd_child_text(root, "name"),
+        width: svd_child_int(root, "width", 32), peripherals: Vec::new(), descs: Vec::new()
+    };
+    if !xml_has(root, "peripherals") { return dev; }
+    val ps: Vec<XmlNode> = xml_children(xml_child(root, "peripherals"), "peripheral");
+    var i: i64 = 0;
+    while i < ps.len() {
+        val pn: XmlNode = ps.get(i);
+        val name: str = svd_child_text(pn, "name");
+        val base: i64 = svd_child_int(pn, "baseAddress", -1);
+        if base < 0 { return svd_fail("svd: peripheral " + name + " has no baseAddress"); }
+        var blk: RegBlock = regblock_new(name, base);
+        val from: str = xml_attr(pn, "derivedFrom");
+        if str_len(from) > 0 {
+            val j: i64 = svd_find_block(&dev.peripherals, from);
+            if j < 0 { return svd_fail("svd: " + name + " derives from unknown " + from); }
+            blk.regs = dev.peripherals.get(j).regs;
+        }
+        val pp: SvdProps = svd_props(pn, top);
+        if xml_has(pn, "registers") {
+            var regs: Vec<RegDesc> = Vec::new();
+            svd_register_list(xml_child(pn, "registers"), pp, "", 0, &mut regs);
+            var k: i64 = 0;
+            while k < regs.len() {
+                blk.regs.push(regs.get(k));
+                k = k + 1;
+            }
+        }
+        val errs: Vec<str> = regblock_check(&blk);
+        if errs.len() > 0 { return svd_fail("svd: " + name + ": " + errs.get(0)); }
+        dev.peripherals.push(blk);
+        dev.descs.push(svd_child_text(pn, "description"));
+        i = i + 1;
+    }
+    return dev;
+}
+
+/// The peripheral named `name` (panics when absent).
+pub fn svd_peripheral(dev: SvdDevice, name: str) -> RegBlock {
+    val i: i64 = svd_find_block(&dev.peripherals, name);
+    if i < 0 { p_panic("svd: no peripheral " + name); }
+    return dev.peripherals.get(i);
+}
+
+/// One line per peripheral, register and field: a listing to compare with
+/// the vendor's reference manual.
+pub fn svd_listing(dev: SvdDevice) -> str {
+    var out: str = dev.name + " (" + int_to_str(dev.peripherals.len()) + " peripherals)\n";
+    var i: i64 = 0;
+    while i < dev.peripherals.len() {
+        val b: RegBlock = dev.peripherals.get(i);
+        out = out + b.name + " " + regmap_hex(b.base, 8) + "\n";
+        var j: i64 = 0;
+        while j < b.regs.len() {
+            val r: RegDesc = b.regs.get(j);
+            out = out + "  " + r.name + " +" + regmap_hex(r.offset, 3) + " " + int_to_str(r.width) + "b " + regmap_access_name(r.access) + " reset " + regmap_hex(r.reset, r.width / 4) + "\n";
+            var k: i64 = 0;
+            while k < r.fields.len() {
+                val f: RegField = r.fields.get(k);
+                var line: str = "    " + f.name + " [" + int_to_str(f.lsb + f.width - 1) + ":" + int_to_str(f.lsb) + "] " + regmap_access_name(f.access);
+                var e: i64 = 0;
+                while e < f.enum_names.len() {
+                    line = line + " " + f.enum_names.get(e) + "=" + int_to_str(f.enum_vals.get(e));
+                    e = e + 1;
+                }
+                out = out + line + "\n";
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}

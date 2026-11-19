@@ -1,0 +1,247 @@
+// test_stack_lower.fd — compiler/lower.fd LF13 on hand-built IR: which
+// local strings (lw_rc_stack_strs_fn) and which Vec::filled buffers
+// (lw_rc_stack_vecs_fn with vbuf_ok, lw_rc_vbuf_fits) go on the stack, and
+// what the rewrite makes of their creation and drops. A string or buffer
+// that is returned, copied, grown, too big, of unknown size or holding
+// owned elements must stay as it was.
+//
+// Expected output:
+// str read: changed creation Str_concat_into area Alloca drop Str_drop
+// str returned: unchanged
+// str copied: unchanged
+// str two creations: unchanged
+// str chain: changed Str_concat_into Str_concat_into
+// str passed: unchanged
+// vbuf read: changed creation Vec_init_filled_at drop Vec_drop_stackbuf
+// vbuf pushed, no filled: unchanged
+// vbuf pushed, filled: changed creation Vec_init_filled drop Vec_drop_inplace
+// vbuf big: changed creation Vec_init_filled drop Vec_drop_inplace
+// vbuf unknown n: unchanged
+// vbuf owned elements: unchanged
+// vbuf bytes: changed creation Vec_init_filled_at drop Vec_drop_stackbuf
+// All tests passed!
+
+use core;
+use compiler::ir;
+use compiler::lower;
+
+fn call_name(f: & IrFunction, id: i64) -> str {
+    match IrFunction_get_inst(f, id) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Call(cn, _, _, _) => {
+                    return cn;
+                }
+                Inst::Alloca(_, _) => {
+                    return "Alloca";
+                }
+                _ => {
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    return "?";
+}
+
+fn cs(f: & mut IrFunction, s: str) -> i64 {
+    return IrFunction_emit(f, Inst::ConstStr(s));
+}
+
+fn ci(f: & mut IrFunction, n: i64) -> i64 {
+    return IrFunction_emit(f, Inst::ConstInt(n, IrType::I64));
+}
+
+fn pu8() -> IrType {
+    return IrType::Ptr(Box::new(IrType::U8));
+}
+
+fn call(f: & mut IrFunction, name: str, args: Vec<i64>, ty: IrType) -> i64 {
+    return IrFunction_emit(f, Inst::Call(name, args, ty, EffectSet_new()));
+}
+
+fn args2(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+/// A string slot S = "a" + "b", then `use` decides how its value is used.
+/// Returns the function; `h` gets the creation's id.
+fn str_fn(use_kind: i64, h: & mut i64, drop_id: & mut i64) -> IrFunction {
+    var f: IrFunction = IrFunction_new("t", IrType::I64);
+    var s: i64 = IrFunction_emit(& mut f, Inst::Alloca(pu8(), Region::Stack));
+    var z: i64 = IrFunction_emit(& mut f, Inst::ConstNull(pu8()));
+    IrFunction_emit(& mut f, Inst::Store(s, z, OptIrType::None));
+    var a: i64 = cs(& mut f, "hello ");
+    var b: i64 = cs(& mut f, "bob");
+    var c: i64 = call(& mut f, "p_str_concat", args2(a, b), pu8());
+    * h = c;
+    IrFunction_emit(& mut f, Inst::Store(s, c, OptIrType::None));
+    var l1: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+    IrFunction_emit(& mut f, Inst::Print(l1, pu8()));
+    var l2: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+    var env: i64 = ci(& mut f, 0);
+    var lenv: Vec<i64> = Vec::new();
+    lenv.push(env);
+    lenv.push(l2);
+    call(& mut f, "str_len", lenv, IrType::I64);
+    if use_kind == 1 {
+        // returned
+        var lr: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+        IrFunction_emit(& mut f, Inst::Return(OptValueId::Some(lr)));
+        return f;
+    }
+    if use_kind == 2 {
+        // copied: one more owner
+        var ld: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+        var cd: i64 = IrFunction_emit(& mut f, Inst::BitCast(ld, pu8(), IrType::I64));
+        call(& mut f, "Str_dup", args2(env, cd), IrType::I64);
+    }
+    if use_kind == 3 {
+        // a second creation stored in the same slot
+        var c2: i64 = call(& mut f, "p_str_concat", args2(a, b), pu8());
+        IrFunction_emit(& mut f, Inst::Store(s, c2, OptIrType::None));
+    }
+    if use_kind == 5 {
+        // passed to the program's own function
+        var lp: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+        call(& mut f, "shout", args2(env, lp), IrType::Void);
+    }
+    var l3: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+    var c3: i64 = IrFunction_emit(& mut f, Inst::BitCast(l3, pu8(), IrType::I64));
+    * drop_id = call(& mut f, "Str_drop", args2(env, c3), IrType::Void);
+    var z2: i64 = IrFunction_emit(& mut f, Inst::ConstNull(pu8()));
+    IrFunction_emit(& mut f, Inst::Store(s, z2, OptIrType::None));
+    IrFunction_emit(& mut f, Inst::Return(OptValueId::None));
+    return f;
+}
+
+fn check_str(label: str, use_kind: i64) {
+    var h: i64 = - 1;
+    var d: i64 = - 1;
+    var f: IrFunction = str_fn(use_kind, & mut h, & mut d);
+    if !lw_rc_stack_strs_fn(& mut f) {
+        println(label + ": unchanged");
+        if call_name(& f, h) != "p_str_concat" {
+            p_panic("creation changed although nothing was");
+        }
+        return;
+    }
+    var first: i64 = f.blocks.get(0).instructions.get(0);
+    println(label + ": changed creation " + call_name(& f, h) + " area " + call_name(& f, first) + " drop " + call_name(& f, d));
+}
+
+/// t = "<" + s and u = t + "!" where s and t are both read only.
+fn check_chain() {
+    var f: IrFunction = IrFunction_new("t", IrType::Void);
+    var s: i64 = IrFunction_emit(& mut f, Inst::Alloca(pu8(), Region::Stack));
+    var t: i64 = IrFunction_emit(& mut f, Inst::Alloca(pu8(), Region::Stack));
+    var a: i64 = cs(& mut f, "a");
+    var b: i64 = cs(& mut f, "b");
+    var c1: i64 = call(& mut f, "p_str_concat", args2(a, b), pu8());
+    IrFunction_emit(& mut f, Inst::Store(s, c1, OptIrType::None));
+    var l1: i64 = IrFunction_emit(& mut f, Inst::Load(s, pu8()));
+    var x: i64 = cs(& mut f, "!");
+    var c2: i64 = call(& mut f, "p_str_concat", args2(l1, x), pu8());
+    IrFunction_emit(& mut f, Inst::Store(t, c2, OptIrType::None));
+    var l2: i64 = IrFunction_emit(& mut f, Inst::Load(t, pu8()));
+    IrFunction_emit(& mut f, Inst::Print(l2, pu8()));
+    IrFunction_emit(& mut f, Inst::Return(OptValueId::None));
+    var ch: bool = lw_rc_stack_strs_fn(& mut f);
+    if !ch {
+        println("str chain: unchanged");
+        return;
+    }
+    println("str chain: changed " + call_name(& f, c1) + " " + call_name(& f, c2));
+}
+
+/// A Vec slot S = Vec::filled(n, 0) of element code `code` and type `tid`;
+/// `push`: a push grows it. `n_const`: n a constant (else loaded).
+fn vec_fn(n: i64, n_const: bool, code: i64, tid: i64, push: bool, h: & mut i64, drop_id: & mut i64) -> IrFunction {
+    var f: IrFunction = IrFunction_new("t", IrType::I64);
+    var nslot: i64 = IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var s: i64 = IrFunction_emit(& mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    var z: i64 = ci(& mut f, 0);
+    IrFunction_emit(& mut f, Inst::Store(s, z, OptIrType::None));
+    var nv: i64 = ci(& mut f, n);
+    if !n_const {
+        IrFunction_emit(& mut f, Inst::Store(nslot, nv, OptIrType::None));
+        nv = IrFunction_emit(& mut f, Inst::Load(nslot, IrType::I64));
+    }
+    var env: i64 = ci(& mut f, 0);
+    var a: Vec<i64> = Vec::new();
+    a.push(env);
+    a.push(nv);
+    a.push(ci(& mut f, 0));
+    a.push(ci(& mut f, code));
+    a.push(ci(& mut f, tid));
+    var c: i64 = call(& mut f, "Vec_filled_typed", a, IrType::I64);
+    * h = c;
+    IrFunction_emit(& mut f, Inst::Store(s, c, OptIrType::None));
+    var l1: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
+    var sa: Vec<i64> = Vec::new();
+    sa.push(env);
+    sa.push(l1);
+    sa.push(ci(& mut f, 1));
+    sa.push(ci(& mut f, 5));
+    call(& mut f, "Vec_set", sa, IrType::Void);
+    var l2: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
+    var ga: Vec<i64> = Vec::new();
+    ga.push(env);
+    ga.push(l2);
+    ga.push(ci(& mut f, 1));
+    call(& mut f, "Vec_get", ga, IrType::I64);
+    var l4: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
+    var pl: Vec<i64> = Vec::new();
+    pl.push(l4);
+    call(& mut f, "p_vec_len", pl, IrType::I64);
+    if push {
+        var l5: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
+        var pa: Vec<i64> = Vec::new();
+        pa.push(env);
+        pa.push(l5);
+        pa.push(ci(& mut f, 9));
+        call(& mut f, "Vec_push", pa, IrType::Void);
+    }
+    var l3: i64 = IrFunction_emit(& mut f, Inst::Load(s, IrType::I64));
+    * drop_id = call(& mut f, "Vec_drop", args2(env, l3), IrType::Void);
+    var z2: i64 = ci(& mut f, 0);
+    IrFunction_emit(& mut f, Inst::Store(s, z2, OptIrType::None));
+    IrFunction_emit(& mut f, Inst::Return(OptValueId::None));
+    return f;
+}
+
+fn check_vec(label: str, n: i64, n_const: bool, code: i64, tid: i64, push: bool, filled_ok: bool) {
+    var h: i64 = - 1;
+    var d: i64 = - 1;
+    var f: IrFunction = vec_fn(n, n_const, code, tid, push, & mut h, & mut d);
+    if !lw_rc_stack_vecs_fn(& mut f, 0, filled_ok, true) {
+        println(label + ": unchanged");
+        if call_name(& f, h) != "Vec_filled_typed" || call_name(& f, d) != "Vec_drop" {
+            p_panic("creation or drop changed although nothing was");
+        }
+        return;
+    }
+    println(label + ": changed creation " + call_name(& f, h) + " drop " + call_name(& f, d));
+}
+
+fn main() -> i64 {
+    check_str("str read", 0);
+    check_str("str returned", 1);
+    check_str("str copied", 2);
+    check_str("str two creations", 3);
+    check_chain();
+    check_str("str passed", 5);
+    check_vec("vbuf read", 26, true, 0, 0, false, false);
+    check_vec("vbuf pushed, no filled", 8, true, 0, 0, true, false);
+    check_vec("vbuf pushed, filled", 8, true, 0, 0, true, true);
+    check_vec("vbuf big", 1000, true, 0, 0, false, true);
+    check_vec("vbuf unknown n", 4, false, 0, 0, false, false);
+    check_vec("vbuf owned elements", 4, true, 0, 3, false, false);
+    check_vec("vbuf bytes", 300, true, 1, 0, false, false);
+    println("All tests passed!");
+    return 0;
+}

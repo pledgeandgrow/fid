@@ -1,0 +1,74 @@
+// alloc/small (competitive roadmap RT8; mimalloc-bench's alloc-test and
+// cfrac shape): one thread, small blocks. 40 rounds; each allocates
+// 100,000 blocks of 16..271 bytes, writes a word in each, frees every
+// other one, allocates 50,000 more into the holes, then frees all of them
+// newest first. Prints the sum of the words read back (deterministic).
+// bench/alloc/run.sh builds it with fid's allocator, the C library's and
+// mimalloc's (the same program, only the allocator differs).
+
+// 31-bit LCG: no product passes 2^62, so no overflow check fires
+fn next(x: i64) -> i64 {
+    return (x * 1103515245 + 12345) % 2147483648;
+}
+
+@unsafe
+fn st(a: i64, v: i64) {
+    var p: *mut i64 = a;
+    *p = v;
+}
+
+@unsafe
+fn ld(a: i64) -> i64 {
+    var p: *mut i64 = a;
+    return *p;
+}
+
+@unsafe
+fn round(slots: i64, n: i64, seed0: i64) -> i64 {
+    var seed: i64 = seed0;
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        seed = next(seed);
+        var b: i64 = p_malloc(16 + (seed >> 8) % 256);
+        st(b, i);
+        st(slots + i * 8, b);
+        i = i + 1;
+    }
+    // every other block back, then new ones in the holes
+    i = 0;
+    while i < n {
+        var b: i64 = ld(slots + i * 8);
+        sum = sum + ld(b);
+        p_free(b);
+        seed = next(seed);
+        var c: i64 = p_malloc(16 + (seed >> 8) % 256);
+        st(c, i + 1);
+        st(slots + i * 8, c);
+        i = i + 2;
+    }
+    // all of them, newest first
+    i = n - 1;
+    while i >= 0 {
+        var b: i64 = ld(slots + i * 8);
+        sum = sum + ld(b);
+        p_free(b);
+        i = i - 1;
+    }
+    return sum;
+}
+
+@unsafe
+fn main() -> i64 {
+    val n: i64 = 100000;
+    val slots: i64 = p_malloc(n * 8);
+    var total: i64 = 0;
+    var r: i64 = 0;
+    while r < 40 {
+        total = total + round(slots, n, r + 1);
+        r = r + 1;
+    }
+    p_free(slots);
+    println(total);
+    return 0;
+}

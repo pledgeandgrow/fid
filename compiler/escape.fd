@@ -13,9 +13,7 @@
 //
 // Dependencies: compiler::ast
 
-module compiler::escape;
- use core; use vec; use string; use compiler::ast;
-/// What a reference-holding value points into: a local variable (or
+module compiler::escape; use core; use vec; use string; use compiler::ast;  /// What a reference-holding value points into: a local variable (or
 /// by-value parameter) declared at block depth `depth`, or the function's
 /// `index`-th parameter, a reference the caller supplied.
 pub struct EscRoot {
@@ -32,6 +30,11 @@ pub struct EscVar {
     // The value is itself a reference (rather than an Option, Result or
     // tuple holding one): what it points to holds no reference (rule 2).
     pub is_ref: bool,
+    // The value is a function whose declared result holds no reference
+    // (`fn(&S) -> i64`, or a named function returning i64/bool/str/a
+    // struct): calling it gives no reference back, whatever it was passed
+    // or captured (bugs 15/33/39/48).
+    pub fn_noref: bool,
 }
 
 pub enum OptEscVar {
@@ -77,6 +80,25 @@ pub struct EscapeChecker {
     pub ret_is_ref: Vec<bool>,
     // esc_is_ref_type(ret_ty)
     pub param_has_ref: Vec<Vec<bool>>,  // esc_contains_ref(params[j].ty)
+    // LG3: a function whose result names lifetimes (`-> &'a T`): its result
+    // borrows from exactly the parameters carrying one of them. Declared
+    // flows replace the inferred summary, and a body returning a borrow of
+    // another parameter is an error.
+    pub has_decl_flows: Vec<bool>,
+    pub decl_flows: Vec<Vec<i64>>,
+    // CS5: what a call needs of its callee's parameters, so no analysis
+    // copies another function's Func (a parallel worker must not touch
+    // what another worker's function owns): each parameter's name, and
+    // whether the lowering reads a value through it (esc_read_through).
+    pub param_names: Vec<Vec<str>>,
+    pub param_rt: Vec<Vec<bool>>,
+    // CS5: a worker of the parallel reporting pass (esc_par_worker): `all`
+    // is empty, and the type of a callee's parameter an error names comes
+    // from param_tys (filled only in a worker's copy)
+    pub par: bool,
+    pub param_tys: Vec<Vec<str>>,
+    // esc_ret_noref(ret_ty) per function: a call of it returns no reference
+    pub ret_noref: Vec<bool>,
 }
 
 // --- Root sets ------------------------------------------------------------
@@ -178,6 +200,84 @@ fn esc_is_transparent(name: str) -> bool {
     return name == "Option" || name == "Result";
 }
 
+// LG3: structs with lifetime parameters (`struct View<'a> { r: &'a i64 }`)
+// hold references the way Option and tuples do: a value of one is rooted
+// where its references point (its literal's fields), may be held in a
+// local, passed and returned like a reference, and is never stored.
+// Struct name -> 1, and the name of each of their fields that holds a
+// reference -> 1 (`v.r` reads one). Built by EscapeChecker_new; the
+// parallel workers only read them.
+var g_esc_lt_structs: i64 = 0; var g_esc_lt_fields: i64 = 0;
+
+fn esc_is_lt_struct(name: str) -> bool {
+    return g_esc_lt_structs != 0 && HashMap_get(g_esc_lt_structs, name) != 0;
+}
+
+fn esc_lt_struct_type(t: Type) -> bool {
+    match t {
+        Type::Named(n) => {
+            return esc_is_lt_struct(n);
+        }
+        Type::Generic(gn, _) => {
+            return esc_is_lt_struct(gn);
+        }
+        _ => {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// The variable `e` names, or "".
+fn esc_ident_of(e: Expr) -> str {
+    match e {
+        Expr::Ident(n) => {
+            return n;
+        }
+        _ => {
+            return "";
+        }
+    }
+    return "";
+}
+
+fn esc_is_lt_field(name: str) -> bool {
+    return g_esc_lt_fields != 0 && HashMap_get(g_esc_lt_fields, name) != 0;
+}
+
+fn esc_collect_lt_structs(program: Program) {
+    if g_esc_lt_structs == 0 {
+        g_esc_lt_structs = HashMap_new();
+        g_esc_lt_fields = HashMap_new();
+    } else {
+        HashMap_clear(g_esc_lt_structs);
+        HashMap_clear(g_esc_lt_fields);
+    }
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        var s: StructDef = program.structs.get(si);
+        if ann_lifetimes(s.annotations).len() > 0 {
+            HashMap_insert(g_esc_lt_structs, s.name, 1);
+        }
+        si = si + 1;
+    }
+    // fields after every struct is known: a field may be another such struct
+    var sj: i64 = 0;
+    while sj < program.structs.len() {
+        var s2: StructDef = program.structs.get(sj);
+        if esc_is_lt_struct(s2.name) {
+            var fi: i64 = 0;
+            while fi < s2.fields.len() {
+                if esc_contains_ref(s2.fields.get(fi).ty) {
+                    HashMap_insert(g_esc_lt_fields, s2.fields.get(fi).name, 1);
+                }
+                fi = fi + 1;
+            }
+        }
+        sj = sj + 1;
+    }
+}
+
 /// Whether `t` holds a reference anywhere (function types do not hold their
 /// parameters' or result's references).
 pub fn esc_contains_ref(t: Type) -> bool {
@@ -185,7 +285,14 @@ pub fn esc_contains_ref(t: Type) -> bool {
         Type::Ref(_, _) => {
             return true;
         }
-        Type::Generic(_, args) => {
+        Type::Named(sn) => {
+            // LG3: a struct with lifetime parameters holds references
+            return esc_is_lt_struct(sn);
+        }
+        Type::Generic(gn, args) => {
+            if esc_is_lt_struct(gn) {
+                return true;
+            }
             return esc_any_ref(args);
         }
         Type::Tuple(args) => {
@@ -236,12 +343,16 @@ fn esc_read_only_call(name: str) -> bool {
 }
 
 fn esc_read_only_method(name: str) -> bool {
-    return name == "contains" || name == "starts_with" || name == "ends_with" || name == "find" || name == "index_of" || name == "eq" || name == "equals" || name == "cmp" || name == "compare" || name == "len" || name == "get";
+    // extend copies its argument's elements (a reference cannot be one):
+    // it keeps nothing of it (stdlib-agent-bugs 8)
+    return name == "extend" || name == "contains_key" || name == "contains" || name == "starts_with" || name == "ends_with" || name == "find" || name == "index_of" || name == "eq" || name == "equals" || name == "cmp" || name == "compare" || name == "len" || name == "get";
 }
 
 // --- Setup ----------------------------------------------------------------
 
 pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
+    // LG3: first, so the facts below see which types hold references
+    esc_collect_lt_structs(program);
     var all: Vec<EscFunc> = Vec::new();
     var i: i64 = 0;
     while i < program.funcs.len() {
@@ -331,23 +442,43 @@ pub fn EscapeChecker_new(program: Program) -> EscapeChecker {
     var ret_has_ref: Vec<bool> = Vec::new();
     var ret_is_ref: Vec<bool> = Vec::new();
     var param_has_ref: Vec<Vec<bool>> = Vec::new();
+    var has_decl_flows: Vec<bool> = Vec::new();
+    var decl_flows: Vec<Vec<i64>> = Vec::new();
+    var param_names: Vec<Vec<str>> = Vec::new();
+    var param_rt: Vec<Vec<bool>> = Vec::new();
     var fk: i64 = 0;
     while fk < all.len() {
         var ff: Func = all.get(fk).func;
         ret_has_ref.push(esc_contains_ref(ff.ret_ty));
         ret_is_ref.push(esc_is_ref_type(ff.ret_ty));
+        has_decl_flows.push(func_has_lifetimes(ff));
+        decl_flows.push(func_lifetime_ties(ff));
         var pr: Vec<bool> = Vec::new();
+        var pn: Vec<str> = Vec::new();
+        var prt: Vec<bool> = Vec::new();
         var pj: i64 = 0;
         while pj < ff.params.len() {
-            pr.push(esc_contains_ref(ff.params.get(pj).ty));
+            var pp: Param = ff.params.get(pj);
+            pr.push(esc_contains_ref(pp.ty));
+            pn.push(pp.name);
+            prt.push(esc_reads_through_type(pp.ty));
             pj = pj + 1;
         }
         param_has_ref.push(pr);
+        param_names.push(pn);
+        param_rt.push(prt);
         fk = fk + 1;
     }
-    return EscapeChecker {
-        ret_has_ref: ret_has_ref, ret_is_ref: ret_is_ref, param_has_ref: param_has_ref, all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), scopes: Vec::new(), func_name: "", flows: Vec::new(), loop_depths: Vec::new(), closure_base: 0, unsafe_depth: 0, line: 0, report: false, errors: Vec::new(), type_names: type_names,
+    var c: EscapeChecker = EscapeChecker {
+        ret_noref: Vec::new(), param_names: param_names, param_rt: param_rt, par: false, param_tys: Vec::new(), ret_has_ref: ret_has_ref, ret_is_ref: ret_is_ref, param_has_ref: param_has_ref, has_decl_flows: has_decl_flows, decl_flows: decl_flows, all: all, func_index: func_index, method_index: method_index, method_keys: method_keys, globals: globals, summary_index: HashMap_new(), summaries: Vec::new(), scopes: Vec::new(), func_name: "", flows: Vec::new(), loop_depths: Vec::new(), closure_base: 0, unsafe_depth: 0, line: 0, report: false, errors: Vec::new(), type_names: type_names,
     };
+    var rk: i64 = 0;
+    while rk < c.all.len() {
+        var rn: bool = esc_ret_noref(& c, c.all.get(rk).func.ret_ty);
+        c.ret_noref.push(rn);
+        rk = rk + 1;
+    }
+    return c;
 }
 
 /// A result type no reference can be in: a scalar, str, void, or a
@@ -404,7 +535,59 @@ fn esc_ret_noref(self: & EscapeChecker, t: Type) -> bool {
             return true;
         }
         Type::Named(n) => {
-            return HashMap_get(self.type_names, n) != 0;
+            // LG3: a struct with lifetime parameters holds references
+            return HashMap_get(self.type_names, n) != 0 && !esc_is_lt_struct(n);
+        }
+        _ => {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// A function type whose declared result holds no reference
+/// (`fn(&S) -> i64`): calling a value of it gives no reference back.
+fn esc_fn_ret_noref(self: & EscapeChecker, t: Type) -> bool {
+    match t {
+        Type::Func(_, ret) => {
+            return esc_ret_noref(self, box_type_unbox(ret));
+        }
+        _ => {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// For a local declared without a type: whether its initializer is a
+/// function value whose result holds no reference (a named function
+/// returning one of esc_ret_noref's types, a closure declaring such a
+/// result, or another such local).
+fn esc_expr_fn_noref(self: & EscapeChecker, e: Expr) -> bool {
+    match e {
+        Expr::Ident(name) => {
+            match esc_lookup(self, name) {
+                OptEscVar::Some(v) => {
+                    return v.fn_noref;
+                }
+                OptEscVar::None => {
+                }
+            }
+            var slot: i64 = HashMap_get(self.func_index, name);
+            if slot == 0 {
+                return false;
+            }
+            return self.ret_noref.get(slot - 1);
+        }
+        Expr::Closure(_, _, rt) => {
+            match rt {
+                OptType::Some(t) => {
+                    return esc_ret_noref(self, t);
+                }
+                OptType::None => {
+                    return false;
+                }
+            }
         }
         _ => {
             return false;
@@ -430,33 +613,42 @@ fn esc_read_through(self: & EscapeChecker, arg: Expr) -> bool {
     if slot == 0 {
         return false;
     }
-    var f: Func = self.all.get(slot - 1).func;
+    // CS5: from the tables EscapeChecker_new made (the first parameter so
+    // named decides), not from a copy of the Func
+    var names: Vec<str> = self.param_names.get(slot - 1);
     var i: i64 = 0;
-    while i < f.params.len() {
-        if f.params.get(i).name == n {
-            match f.params.get(i).ty {
-                Type::Ref(inner, _) => {
-                    match box_type_unbox(inner) {
-                        Type::Generic(gn, _) => {
-                            return gn == "Vec" || gn == "HashMap";
-                        }
-                        Type::Named(nn) => {
-                            return nn == "Vec" || nn == "HashMap";
-                        }
-                        Type::Str => {
-                            return true;
-                        }
-                        _ => {
-                            return false;
-                        }
-                    }
+    while i < names.len() {
+        if names.get(i) == n {
+            return self.param_rt.get(slot - 1).get(i);
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A parameter of this type is read through by the lowering when given to
+/// a value parameter: `&Vec`, `&HashMap` or `&str` (esc_read_through).
+fn esc_reads_through_type(t: Type) -> bool {
+    match t {
+        Type::Ref(inner, _) => {
+            match box_type_unbox(inner) {
+                Type::Generic(gn, _) => {
+                    return gn == "Vec" || gn == "HashMap";
+                }
+                Type::Named(nn) => {
+                    return nn == "Vec" || nn == "HashMap";
+                }
+                Type::Str => {
+                    return true;
                 }
                 _ => {
                     return false;
                 }
             }
         }
-        i = i + 1;
+        _ => {
+            return false;
+        }
     }
     return false;
 }
@@ -508,19 +700,33 @@ fn esc_summary_total(self: & EscapeChecker) -> i64 {
 /// inside Option/Result/tuples, never inside storage.
 fn esc_check_value_type(self: & mut EscapeChecker, t: Type, what: str) {
     match t {
-        Type::Ref(inner, _) => {
-            if esc_contains_ref(box_type_unbox(inner)) {
+        Type::Ref(inner, ref_mut) => {
+            var pointee: Type = box_type_unbox(inner);
+            // LG3: `&View` reads a struct holding references (a value of
+            // it is rooted where they point); `&mut View` could store a
+            // shorter-lived reference into the caller's struct
+            if !ref_mut && esc_lt_struct_type(pointee) {
+                return;
+            }
+            if esc_contains_ref(pointee) {
                 esc_error(self, what + " has type '" + type_to_str(t) + "': a reference cannot point to another reference");
             }
         }
         Type::Generic(name, args) => {
-            if esc_is_transparent(name) {
+            // LG3: a struct with lifetime parameters is held like a
+            // reference; its type arguments are checked as its fields are
+            if esc_is_transparent(name) || esc_is_lt_struct(name) {
                 var i: i64 = 0;
                 while i < args.len() {
                     esc_check_value_type(self, args.get(i), what);
                     i = i + 1;
                 }
             } else {
+                esc_check_storage_type(self, t, what);
+            }
+        }
+        Type::Named(sn) => {
+            if !esc_is_lt_struct(sn) {
                 esc_check_storage_type(self, t, what);
             }
         }
@@ -553,7 +759,14 @@ fn esc_check_decls(self: & mut EscapeChecker, program: Program) {
         var fi: i64 = 0;
         while fi < s.fields.len() {
             var fld: Param = s.fields.get(fi);
-            esc_check_storage_type(self, fld.ty, "field '" + s.name + "." + fld.name + "'");
+            if esc_is_lt_struct(s.name) {
+                // LG3: a struct with lifetime parameters may hold a
+                // reference (or another such struct) where a local could;
+                // never a Vec of them or a reference to a reference
+                esc_check_value_type(self, fld.ty, "field '" + s.name + "." + fld.name + "'");
+            } else if esc_contains_ref(fld.ty) {
+                esc_error(self, "field '" + s.name + "." + fld.name + "' has type '" + type_to_str(fld.ty) + "', which stores a reference; references can only be passed to calls, held in locals and returned; to hold one, give the struct a lifetime parameter: `struct " + s.name + "<'a> { " + fld.name + ": &'a T }`");
+            }
             fi = fi + 1;
         }
         si = si + 1;
@@ -607,21 +820,29 @@ fn esc_pop_scope(self: & mut EscapeChecker) {
 }
 
 fn esc_declare(self: & mut EscapeChecker, name: str, roots: Vec<EscRoot>, is_ref: bool) {
+    esc_declare_fn(self, name, roots, is_ref, false);
+}
+
+/// esc_declare, saying whether the variable is a function value whose
+/// result holds no reference (EscVar.fn_noref).
+fn esc_declare_fn(self: & mut EscapeChecker, name: str, roots: Vec<EscRoot>, is_ref: bool, fn_noref: bool) {
     var last: i64 = self.scopes.len() - 1;
-    var top: Vec<EscVar> = self.scopes.get(last);
     // A redeclaration in the same block shadows the earlier one.
+    // SP12: the block's list is read in place. A copy of it held here made
+    // the push below copy the whole list (two owners), once per variable:
+    // quadratic in a block's variables.
     var i: i64 = 0;
-    while i < top.len() {
-        if top.get(i).name == name {
+    while i < self.scopes.get(last).len() {
+        if self.scopes.get(last).get(i).name == name {
             self.scopes.get(last).set(i, EscVar {
-                name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref
+                name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref, fn_noref: fn_noref
             });
             return;
         }
         i = i + 1;
     }
     self.scopes.get(last).push(EscVar {
-        name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref
+        name: name, depth: self.scopes.len(), roots: roots, is_ref: is_ref, fn_noref: fn_noref
     });
 }
 
@@ -659,7 +880,7 @@ fn esc_is_reference(self: & EscapeChecker, e: Expr) -> bool {
             if slot == 0 {
                 return false;
             }
-            return esc_is_ref_type(self.all.get(slot - 1).func.ret_ty);
+            return self.ret_is_ref.get(slot - 1);
         }
         Expr::MethodCall(_, method, _) => {
             var mslot: i64 = HashMap_get(self.method_index, method);
@@ -699,13 +920,18 @@ fn esc_lookup(self: & EscapeChecker, name: str) -> OptEscVar {
     var s: i64 = self.scopes.len() - 1;
     while s >= 0 {
         var scope: Vec<EscVar> = self.scopes.get(s);
-        var i: i64 = 0;
-        while i < scope.len() {
-            var v: EscVar = scope.get(i);
-            if v.name == name {
-                return OptEscVar::Some(v);
+        // SP12: names compared in place, only the one found copied (the
+        // first match from the start, as before)
+        var at: i64 = - 1;
+        var k: i64 = 0;
+        while k < scope.len() && at < 0 {
+            if scope.get(k).name == name {
+                at = k;
             }
-            i = i + 1;
+            k = k + 1;
+        }
+        if at >= 0 {
+            return OptEscVar::Some(scope.get(at));
         }
         s = s - 1;
     }
@@ -728,13 +954,14 @@ fn esc_var_roots(self: & EscapeChecker, name: str) -> Vec<EscRoot> {
 fn esc_add_roots(self: & mut EscapeChecker, name: str, extra: Vec<EscRoot>) {
     var s: i64 = self.scopes.len() - 1;
     while s >= 0 {
-        var scope: Vec<EscVar> = self.scopes.get(s);
         var i: i64 = 0;
-        while i < scope.len() {
-            var v: EscVar = scope.get(i);
-            if v.name == name {
+        // SP12: no copy of the block's list is held (the set below would
+        // copy the whole list) and only the variable found is copied
+        while i < self.scopes.get(s).len() {
+            if self.scopes.get(s).get(i).name == name {
+                var v: EscVar = self.scopes.get(s).get(i);
                 self.scopes.get(s).set(i, EscVar {
-                    name: v.name, depth: v.depth, roots: esc_union(v.roots, extra), is_ref: v.is_ref
+                    name: v.name, depth: v.depth, roots: esc_union(v.roots, extra), is_ref: v.is_ref, fn_noref: v.fn_noref
                 });
                 return;
             }
@@ -765,7 +992,9 @@ fn esc_leave_blocks(self: & mut EscapeChecker, roots: Vec<EscRoot>, depth: i64, 
 
 fn esc_analyze_func(self: & mut EscapeChecker, key: str, f: Func) {
     self.func_name = f.name;
-    self.line = 0;
+    // TL2: what is reported before its first statement (a parameter's
+    // type) is placed at its `fn`, not at "line 0"
+    self.line = f.line;
     var no_flows: Vec<i64> = Vec::new();
     var no_scopes: Vec<Vec<EscVar>> = Vec::new();
     var no_loops: Vec<i64> = Vec::new();
@@ -782,7 +1011,7 @@ fn esc_analyze_func(self: & mut EscapeChecker, key: str, f: Func) {
         if esc_contains_ref(p.ty) {
             esc_declare(self, p.name, esc_one(esc_param(i)), esc_is_ref_type(p.ty));
         } else {
-            esc_declare(self, p.name, esc_none(), false);
+            esc_declare_fn(self, p.name, esc_none(), false, esc_fn_ret_noref(self, p.ty));
         }
         i = i + 1;
     }
@@ -805,7 +1034,42 @@ fn esc_analyze_func(self: & mut EscapeChecker, key: str, f: Func) {
         var tail: Vec<EscRoot> = esc_stmts_value(self, f.body);
         esc_check_return(self, tail);
     }
-    esc_set_summary(self, key, self.flows);
+    // LG3: a signature naming the result's lifetimes is the summary callers
+    // see; the body may return borrows of those parameters only
+    var fslot: i64 = HashMap_get(self.func_index, key);
+    if fslot > 0 && self.has_decl_flows.get(fslot - 1) {
+        var declared: Vec<i64> = self.decl_flows.get(fslot - 1);
+        var ret_lts: Vec<str> = ann_lifetimes(f.annotations);
+        var lt_list: str = "";
+        var li: i64 = 0;
+        while li < ret_lts.len() {
+            if li > 0 {
+                lt_list = lt_list + ", ";
+            }
+            lt_list = lt_list + ret_lts.get(li);
+            li = li + 1;
+        }
+        var di: i64 = 0;
+        while di < self.flows.len() {
+            var pidx: i64 = self.flows.get(di);
+            if !vec_contains_i64(declared, pidx) && pidx < f.params.len() {
+                esc_error(self, "'" + f.name + "' returns a borrow of parameter '" + f.params.get(pidx).name + "', but its signature ties the result to " + lt_list + "; give '" + f.params.get(pidx).name + "' that lifetime or return a borrow of a parameter that has it");
+            }
+            di = di + 1;
+        }
+        if !self.report {
+            esc_set_summary(self, key, declared);
+        }
+        return;
+    }
+    // CS5: the reporting pass reads the summaries the fixpoint found and
+    // changes none. A function the fixpoint did not analyze (its result
+    // holds no reference) keeps the empty summary it had there, whatever
+    // order the reporting pass takes: the order of the functions, or a
+    // chunk per parallel worker, cannot change what a call sees.
+    if !self.report {
+        esc_set_summary(self, key, self.flows);
+    }
 }
 
 fn esc_check_return(self: & mut EscapeChecker, roots: Vec<EscRoot>) {
@@ -997,15 +1261,24 @@ fn esc_stmt(self: & mut EscapeChecker, s: Stmt) {
             }
             var r: Vec<EscRoot> = esc_expr(self, expr);
             var is_ref: bool = false;
+            var fn_noref: bool = false;
             match ty {
                 OptType::Some(t2) => {
                     is_ref = esc_is_ref_type(t2);
+                    fn_noref = esc_fn_ret_noref(self, t2);
+                    // A local of a type no reference can be in (i64, bool,
+                    // str, a struct) holds none, whatever its initializer
+                    // was given (bugs 15/33/39/48)
+                    if esc_ret_noref(self, t2) {
+                        r = esc_none();
+                    }
                 }
                 OptType::None => {
                     is_ref = esc_is_reference(self, expr);
+                    fn_noref = esc_expr_fn_noref(self, expr);
                 }
             }
-            esc_declare(self, name, r, is_ref);
+            esc_declare_fn(self, name, r, is_ref, fn_noref);
         }
         Stmt::LetTuple(names, expr, _) => {
             var tr: Vec<EscRoot> = esc_expr(self, expr);
@@ -1042,6 +1315,11 @@ fn esc_stmt(self: & mut EscapeChecker, s: Stmt) {
                         _ => {
                         }
                     }
+                } else if esc_is_lt_field(field) && esc_ident_of(object) != "" {
+                    // LG3: `v.r = &b` in a struct with lifetime
+                    // parameters: v is rooted at b too (and must not
+                    // outlive it)
+                    esc_assign_to(self, esc_ident_of(object), fr);
                 } else {
                     esc_error(self, "a reference cannot be stored in field '" + field + "'");
                 }
@@ -1265,6 +1543,11 @@ fn esc_expr(self: & mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             if esc_all_digits(field) {
                 return fr;
             }
+            // LG3: a field of a struct with lifetime parameters holding a
+            // reference points where that struct's references do
+            if esc_is_lt_field(field) {
+                return fr;
+            }
             return esc_none();
         }
         Expr::OptionalFieldAccess(inner, _) => {
@@ -1359,23 +1642,34 @@ fn esc_expr(self: & mut EscapeChecker, e: Expr) -> Vec<EscRoot> {
             return esc_union(pr, esc_expr(self, box_expr_deref(right)));
         }
         Expr::StructLit(name, fields, spread) => {
+            // LG3: a struct with lifetime parameters holds the references
+            // its fields are given: the literal is rooted where they point
+            var lt_held: bool = esc_is_lt_struct(name);
+            var held: Vec<EscRoot> = esc_none();
             var fi: i64 = 0;
             while fi < fields.len() {
                 var init: FieldInit = fields.get(fi);
                 var vr: Vec<EscRoot> = esc_expr(self, init.value);
                 if vr.len() > 0 {
-                    esc_error(self, "a reference cannot be stored in field '" + name + "." + init.name + "'");
+                    if lt_held {
+                        held = esc_union(held, vr);
+                    } else {
+                        esc_error(self, "a reference cannot be stored in field '" + name + "." + init.name + "'");
+                    }
                 }
                 fi = fi + 1;
             }
             match spread {
                 OptBoxExpr::Some(sp) => {
-                    esc_expr(self, box_expr_deref(sp));
+                    var spr: Vec<EscRoot> = esc_expr(self, box_expr_deref(sp));
+                    if lt_held {
+                        held = esc_union(held, spr);
+                    }
                 }
                 OptBoxExpr::None => {
                 }
             }
-            return esc_none();
+            return held;
         }
         Expr::EnumLit(enum_name, variant, args) => {
             var rs: Vec<Vec<EscRoot>> = esc_exprs(self, args);
@@ -1515,8 +1809,13 @@ fn esc_call(self: & mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscR
     }
     // Calling a closure held in a local: its result may be any reference it
     // captured or was given.
+    // A function value whose declared result holds no reference (`f:
+    // fn(&S) -> i64`) gives none back (bugs 15/33/39/48).
     match esc_lookup(self, callee) {
         OptEscVar::Some(v) => {
+            if v.fn_noref {
+                return esc_none();
+            }
             return esc_union(v.roots, esc_union_all(rs));
         }
         OptEscVar::None => {
@@ -1526,20 +1825,26 @@ fn esc_call(self: & mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscR
     if slot == 0 {
         return esc_none();
     }
-    var f: Func = self.all.get(slot - 1).func;
+    // CS5: the callee's parameters from the tables, not a copy of its Func
+    var phr: Vec<bool> = self.param_has_ref.get(slot - 1);
     var i: i64 = 0;
     while i < rs.len() {
-        if rs.get(i).len() > 0 && !esc_read_only_call(callee) && i < f.params.len() && !esc_read_through(self, args.get(i)) {
-            var p: Param = f.params.get(i);
-            if !esc_contains_ref(p.ty) {
+        if rs.get(i).len() > 0 && !esc_read_only_call(callee) && i < phr.len() && !esc_read_through(self, args.get(i)) {
+            if !phr.get(i) {
                 var what: str = "a reference";
                 if esc_is_closure(args.get(i)) {
                     what = "a closure that captures a reference";
                 }
-                esc_error(self, what + " cannot be passed to parameter '" + p.name + "' of '" + callee + "' (type '" + type_to_str(p.ty) + "'), which may keep it; only reference parameters can borrow");
+                var pname: str = self.param_names.get(slot - 1).get(i);
+                esc_error(self, what + " cannot be passed to parameter '" + pname + "' of '" + callee + "' (type '" + esc_param_ty_str(self, slot, i) + "'), which may keep it; only reference parameters can borrow");
             }
         }
         i = i + 1;
+    }
+    // Nor does a function whose declared result holds no reference, whatever
+    // its summary says
+    if self.ret_noref.get(slot - 1) {
+        return esc_none();
     }
     var flows: Vec<i64> = esc_summary(self, callee);
     var out: Vec<EscRoot> = Vec::new();
@@ -1552,6 +1857,16 @@ fn esc_call(self: & mut EscapeChecker, callee: str, args: Vec<Expr>) -> Vec<EscR
         fi = fi + 1;
     }
     return out;
+}
+
+/// The type of parameter `i` of the function at `slot` (index + 1 into
+/// `all`), as an error names it. A parallel worker has no `all`: its copy
+/// of the checker carries the names (esc_par_copy).
+fn esc_param_ty_str(self: & EscapeChecker, slot: i64, i: i64) -> str {
+    if self.par {
+        return self.param_tys.get(slot - 1).get(i);
+    }
+    return type_to_str(self.all.get(slot - 1).func.params.get(i).ty);
 }
 
 fn esc_method_call(self: & mut EscapeChecker, receiver: Expr, method: str, args: Vec<Expr>) -> Vec<EscRoot> {
@@ -1635,7 +1950,7 @@ fn esc_closure(self: & mut EscapeChecker, params: Vec<Param>, body: Vec<Stmt>) -
     while qi < params.len() {
         var p: Param = params.get(qi);
         esc_check_value_type(self, p.ty, "closure parameter '" + p.name + "'");
-        esc_declare(self, p.name, esc_none(), esc_is_ref_type(p.ty));
+        esc_declare_fn(self, p.name, esc_none(), esc_is_ref_type(p.ty), esc_fn_ret_noref(self, p.ty));
         qi = qi + 1;
     }
     var tail: Vec<EscRoot> = esc_stmts_value(self, body);
@@ -1925,6 +2240,261 @@ fn esc_idents_expr(e: Expr, out: & mut Vec<str>) {
     }
 }
 
+// --- Parallel reporting pass (CS5) ----------------------------------------
+// FID_PAR=N (opt-in, as for the borrow check: borrowck.fd bc_par_workers)
+// runs the reporting pass in up to N threads. The summaries are final
+// before it starts (the fixpoint) and the pass changes none
+// (esc_analyze_func), so a function's messages depend on that function
+// alone; all one function's check does to another's is drop a message
+// already given (esc_error). Each worker checks a contiguous chunk of the
+// functions with a checker of its own; the chunks' messages, merged in
+// order by the same rule, are the sequential output byte for byte.
+//
+// Owner counts are not atomic (core.fd "Copies for another thread"), so no
+// two threads may copy or drop the same string, Vec or Box at once. Only
+// keeping a value (let, field, element, return) copies it; reading one, or
+// passing it as an argument, does not. So:
+//  - each worker makes its own checker (esc_par_copy) from the master's,
+//    which it only reads: its tables are copies in buffers of its own
+//    (par_own_*), and the HashMaps (raw handles) are only looked up;
+//  - no analysis keeps another function's Func: a call reads its callee's
+//    parameters from param_names/param_rt/param_has_ref/param_tys, and a
+//    worker passes its units to esc_analyze_func without keeping them;
+//  - a function's AST is touched by the one worker that checks it. Before
+//    this pass, AST pieces are shared only inside one impl block (its type
+//    name) and among trait impls (compiler.fd gives every impl that lacks
+//    it the same default body of a trait method), so a chunk never splits
+//    an impl block, and the trait impls' methods stay in one chunk.
+// Spawn arguments must be @send: a worker gets its chunk bounds and reads
+// the master checker and the functions from the module globals below, set
+// before the spawns and reset after the last await.
+pub var g_esc_par_units: Vec<EscFunc> = Vec::new();
+pub var g_esc_par_master: Vec<EscapeChecker> = Vec::new();
+pub var g_esc_par_tys: Vec<Vec<str>> = Vec::new();
+
+/// The worker count FID_PAR asks for: 1 (sequential) unless it is a number
+/// of 2 or more (16 at most).
+pub fn esc_par_workers() -> i64 {
+    var r: i64 = p_getenv("FID_PAR");
+    if r == 0 {
+        return 1;
+    }
+    var s: str = p_str_adopt(r);
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var ch: i64 = str_byte_at(s, i);
+        if ch < 48 || ch > 57 {
+            return 1;
+        }
+        n = n * 10 + (ch - 48);
+        i = i + 1;
+    }
+    if n < 1 {
+        return 1;
+    }
+    if n > 16 {
+        return 16;
+    }
+    return n;
+}
+
+/// `s` in a buffer of its own: it shares no owner count with `s`.
+pub fn par_own_str(s: str) -> str {
+    return p_str_adopt(p_str_send_copy(s as i64));
+}
+
+pub fn par_own_strs(v: Vec<str>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(par_own_str(v.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn par_own_strss(v: Vec<Vec<str>>) -> Vec<Vec<str>> {
+    var out: Vec<Vec<str>> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(par_own_strs(v.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn par_own_i64s(v: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn par_own_i64ss(v: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+    var out: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(par_own_i64s(v.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn par_own_bools(v: Vec<bool>) -> Vec<bool> {
+    var out: Vec<bool> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn par_own_boolss(v: Vec<Vec<bool>>) -> Vec<Vec<bool>> {
+    var out: Vec<Vec<bool>> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(par_own_bools(v.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The group a reporting unit (by its skip-set key) must share a chunk
+/// with: "" for a free function (any chunk), "impl:S" for a method of an
+/// impl block of S, "trait:" for every trait impl's method.
+pub fn par_unit_group(skey: str) -> str {
+    if str_starts_with(skey, "impl:") {
+        var p: i64 = 5;
+        while p < str_len(skey) && str_byte_at(skey, p) != 58 {
+            p = p + 1;
+        }
+        return str_slice(skey, 0, p);
+    }
+    if str_starts_with(skey, "trait:") {
+        return "trait:";
+    }
+    return "";
+}
+
+/// Chunks of `skeys` (in order, about n / nw each, none splitting a group
+/// of par_unit_group) as [start0, end0, start1, end1, ...]; nw at most.
+pub fn par_chunk_bounds(skeys: Vec<str>, nw: i64) -> Vec<i64> {
+    var n: i64 = skeys.len();
+    var target: i64 = (n + nw - 1) / nw;
+    var out: Vec<i64> = Vec::new();
+    var s: i64 = 0;
+    var prev: str = "";
+    var i: i64 = 0;
+    while i < n {
+        var g: str = par_unit_group(skeys.get(i));
+        if i - s >= target && (g == "" || g != prev) {
+            out.push(s);
+            out.push(i);
+            s = i;
+        }
+        prev = g;
+        i = i + 1;
+    }
+    if s < n {
+        out.push(s);
+        out.push(n);
+    }
+    return out;
+}
+
+/// A worker's checker: the tables of `c` (the master, only read), copied so
+/// they share no buffer and no string with it, and `par` set (no `all`;
+/// the callee parameter types of `tys`).
+fn esc_par_copy(c: EscapeChecker, tys: Vec<Vec<str>>) -> EscapeChecker {
+    var no_all: Vec<EscFunc> = Vec::new();
+    var no_scopes: Vec<Vec<EscVar>> = Vec::new();
+    var no_flows: Vec<i64> = Vec::new();
+    var no_loops: Vec<i64> = Vec::new();
+    var no_errors: Vec<str> = Vec::new();
+    return EscapeChecker {
+        all: no_all, func_index: c.func_index, method_index: c.method_index, method_keys: par_own_strss(c.method_keys), globals: c.globals, summary_index: c.summary_index, summaries: par_own_i64ss(c.summaries), scopes: no_scopes, func_name: "", flows: no_flows, loop_depths: no_loops, closure_base: 0, unsafe_depth: 0, line: 0, report: true, errors: no_errors, type_names: c.type_names, ret_has_ref: par_own_bools(c.ret_has_ref), ret_is_ref: par_own_bools(c.ret_is_ref), param_has_ref: par_own_boolss(c.param_has_ref), has_decl_flows: par_own_bools(c.has_decl_flows), decl_flows: par_own_i64ss(c.decl_flows), param_names: par_own_strss(c.param_names), param_rt: par_own_boolss(c.param_rt), par: true, param_tys: par_own_strss(tys), ret_noref: par_own_bools(c.ret_noref),
+    };
+}
+
+/// A worker of the parallel reporting pass: units s..e of g_esc_par_units,
+/// with a checker of its own; its messages in order. The units are passed
+/// to esc_analyze_func, never kept (that would copy what the master holds).
+pub fn esc_par_worker(s: i64, e: i64) -> Vec<str> {
+    var c: EscapeChecker = esc_par_copy(g_esc_par_master.get(0), g_esc_par_tys);
+    var i: i64 = s;
+    while i < e {
+        esc_analyze_func(& mut c, g_esc_par_units.get(i).key, g_esc_par_units.get(i).func);
+        i = i + 1;
+    }
+    var out: Vec<str> = c.errors;
+    return out;
+}
+
+/// The reporting pass over `units` in up to `nw` threads (CS5), with `c`
+/// (after the fixpoint) as the master: the workers' messages, each
+/// worker's in order, workers in order. The caller merges them into
+/// c.errors by esc_error's rule.
+fn esc_par_report(c: EscapeChecker, units: Vec<EscFunc>, nw: i64) -> Vec<str> {
+    var skeys: Vec<str> = Vec::new();
+    var ui: i64 = 0;
+    while ui < units.len() {
+        skeys.push(units.get(ui).skey);
+        ui = ui + 1;
+    }
+    var bounds: Vec<i64> = par_chunk_bounds(skeys, nw);
+    var nch: i64 = bounds.len() / 2;
+    // the parameter types an error may name, made once here
+    var tys: Vec<Vec<str>> = Vec::new();
+    var k: i64 = 0;
+    while k < c.all.len() {
+        var ff: Func = c.all.get(k).func;
+        var ts: Vec<str> = Vec::new();
+        var pj: i64 = 0;
+        while pj < ff.params.len() {
+            ts.push(type_to_str(ff.params.get(pj).ty));
+            pj = pj + 1;
+        }
+        tys.push(ts);
+        k = k + 1;
+    }
+    var master: Vec<EscapeChecker> = Vec::new();
+    master.push(c);
+    g_esc_par_master = master;
+    g_esc_par_tys = tys;
+    g_esc_par_units = units;
+    var futs: Vec<Future<Vec<str>> > = Vec::new();
+    var wi: i64 = 0;
+    while wi < nch {
+        var s: i64 = bounds.get(2 * wi);
+        var e: i64 = bounds.get(2 * wi + 1);
+        futs.push(spawn esc_par_worker(s, e));
+        wi = wi + 1;
+    }
+    var out: Vec<str> = Vec::new();
+    wi = 0;
+    while wi < futs.len() {
+        var errs: Vec<str> = await futs.get(wi);
+        var ei: i64 = 0;
+        while ei < errs.len() {
+            out.push(errs.get(ei));
+            ei = ei + 1;
+        }
+        wi = wi + 1;
+    }
+    var no_master: Vec<EscapeChecker> = Vec::new();
+    g_esc_par_master = no_master;
+    var no_tys: Vec<Vec<str>> = Vec::new();
+    g_esc_par_tys = no_tys;
+    var no_units: Vec<EscFunc> = Vec::new();
+    g_esc_par_units = no_units;
+    return out;
+}
+
 // --- Entry point ----------------------------------------------------------
 
 /// Run the escape check over every function of `program`.
@@ -1962,6 +2532,32 @@ pub fn escape_check_skipped(program: Program, skip: i64) -> Vec<str> {
         }
     }
     c.report = true;
+    // CS5: FID_PAR=N checks the bodies in N threads (the same messages in
+    // the same order), when there are enough to be worth the threads
+    var nw: i64 = esc_par_workers();
+    if nw > 1 {
+        var punits: Vec<EscFunc> = Vec::new();
+        var pj: i64 = 0;
+        while pj < c.all.len() {
+            var pef: EscFunc = c.all.get(pj);
+            if skip == 0 || !HashMap_contains(skip, pef.skey) {
+                punits.push(pef);
+            }
+            pj = pj + 1;
+        }
+        if punits.len() >= 64 {
+            var perrs: Vec<str> = esc_par_report(c, punits, nw);
+            var pe: i64 = 0;
+            while pe < perrs.len() {
+                var pm: str = perrs.get(pe);
+                if !str_vec_contains(c.errors, pm) {
+                    c.errors.push(pm);
+                }
+                pe = pe + 1;
+            }
+            return c.errors;
+        }
+    }
     var j: i64 = 0;
     while j < c.all.len() {
         var ef2: EscFunc = c.all.get(j);

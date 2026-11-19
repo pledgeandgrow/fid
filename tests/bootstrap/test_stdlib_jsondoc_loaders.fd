@@ -1,0 +1,226 @@
+// stdlib gltf and tiled on the indexed JSON DOM (competitive SL6). Both
+// loaders index their JSON once (GltfDoc.doc, TiledMap.doc) and every
+// lookup walks the index: a 32x32 map (two tile layers) loads into a
+// Tilemap in one pass over each data array, where the string API
+// rescanned the layer's data for every cell (at 128x128 the old loader
+// took over 3 minutes natively, the new one 0.4 s; the size is kept small
+// for the interpreter). Also checked: jd_children against jd_at, invalid
+// JSON giving ok=false, object properties of every value kind, and glTF
+// accessors found through the index. A wrong answer panics on every
+// backend.
+//
+// Expected output:
+// children ok
+// tiled ok 1024 cells, 768 set, 128 solid
+// gltf ok
+// loaders ok
+use json;
+use tiled;
+use tilemap;
+use gltf;
+use mesh;
+
+fn ck(name: str, got: i64, want: i64) {
+    if got != want {
+        println(name + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+        p_panic("jsondoc loaders: wrong " + name);
+    }
+}
+
+fn cks(name: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(name + ": got " + got + ", want " + want);
+        p_panic("jsondoc loaders: wrong " + name);
+    }
+}
+
+fn ckb(name: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("jsondoc loaders: wrong " + name);
+    }
+}
+
+// A W x H map: layer 0 has gid (x + y) % 4 (0 = empty; every 4th cell has
+// the H flip flag), layer 1 marks the cells with x even and y even solid;
+// layer 2 is an object group whose object has properties of each kind.
+fn build_map(w: i64, h: i64) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    sb.append_str("{\"width\": ");
+    sb.append_int(w);
+    sb.append_str(", \"height\": ");
+    sb.append_int(h);
+    sb.append_str(", \"tilewidth\": 8, \"tileheight\": 8, \"layers\": [\n");
+    sb.append_str("{\"type\": \"tilelayer\", \"name\": \"ground\", \"data\": [");
+    var i: i64 = 0;
+    while i < w * h {
+        if i > 0 {
+            sb.append_str(",");
+        }
+        val x: i64 = i % w;
+        val y: i64 = i / w;
+        var g: i64 = (x + y) % 4;
+        if g == 2 {
+            // flip flag H on: tiled_gid strips it
+            g = g + TILED_FLIP_H;
+        }
+        sb.append_int(g);
+        i = i + 1;
+    }
+    sb.append_str("]},\n{\"type\": \"tilelayer\", \"name\": \"walls\", \"visible\": false, \"data\": [");
+    i = 0;
+    while i < w * h {
+        if i > 0 {
+            sb.append_str(",");
+        }
+        val x: i64 = i % w;
+        val y: i64 = i / w;
+        if x % 2 == 0 && y % 2 == 0 {
+            sb.append_str("1");
+        } else {
+            sb.append_str("0");
+        }
+        i = i + 1;
+    }
+    sb.append_str("]},\n{\"type\": \"objectgroup\", \"name\": \"things\", \"objects\": [");
+    sb.append_str("{\"id\": 7, \"name\": \"door \\\"A\\\"\", \"type\": \"door\", \"x\": 4.5, \"y\": -2, \"width\": 8, \"height\": 16,");
+    sb.append_str(" \"properties\": [{\"name\": \"locked\", \"type\": \"bool\", \"value\": true},");
+    sb.append_str(" {\"name\": \"key\", \"type\": \"string\", \"value\": \"brass\\u0021\"},");
+    sb.append_str(" {\"name\": \"hp\", \"type\": \"int\", \"value\": 12}]}]}],\n");
+    sb.append_str(" \"properties\": [{\"name\": \"music\", \"type\": \"string\", \"value\": \"cave.ogg\"}]}");
+    return sb.to_str();
+}
+
+fn main() -> i64 {
+    // ── jd_children: the same nodes as jd_at / jd_member ──
+    val d: JsonDoc = json_index("{\"a\": [1, [2, 3], {\"x\": 4}, \"s\"], \"b\": {\"p\": 1, \"q\": [5]}}");
+    ckb("doc ok", d.ok, true);
+    val arr: i64 = jd_get(& d, jd_root(& d), "a");
+    val kids: Vec<i64> = jd_children(& d, arr);
+    ck("children of a", kids.len(), 4);
+    var k: i64 = 0;
+    while k < kids.len() {
+        ck("child " + int_to_str(k), kids.get(k), jd_at(& d, arr, k));
+        k = k + 1;
+    }
+    val obj: i64 = jd_get(& d, jd_root(& d), "b");
+    val members: Vec<i64> = jd_children(& d, obj);
+    ck("members of b", members.len(), 2);
+    ck("member 1", members.get(1), jd_member(& d, obj, 1));
+    cks("member 1 raw", jd_raw(& d, members.get(1)), "[5]");
+    ck("children of a number", jd_children(& d, kids.get(0)).len(), 0);
+    ck("children of no node", jd_children(& d, - 1).len(), 0);
+    println("children ok");
+
+    // ── tiled: a 32 x 32 map ──
+    val w: i64 = 32;
+    val h: i64 = 32;
+    val tm: TiledMap = tiled_open(build_map(w, h));
+    ckb("map ok", tm.ok, true);
+    ck("width", tm.width, w);
+    ck("tile_h", tm.tile_h, 8);
+    ck("layers", tiled_layer_count(tm), 3);
+    cks("layer 1 name", tiled_layer_name(tm, 1), "walls");
+    ckb("layer 1 hidden", tiled_layer_visible(tm, 1), false);
+    ckb("layer 0 visible", tiled_layer_visible(tm, 0), true);
+    cks("layer 2 type", tiled_layer_type(tm, 2), "objectgroup");
+    ck("tile (5, 3)", tiled_tile(tm, 0, 5, 3), 0);
+    ck("tile (1, 1)", tiled_tile(tm, 0, 1, 1), 2);
+    ckb("tile (1, 1) flipped", tiled_hflip(tiled_tile_raw(tm, 0, 1, 1)), true);
+    ck("last tile", tiled_tile(tm, 0, w - 1, h - 1), ((w - 1) + (h - 1)) % 4);
+    ck("outside", tiled_tile(tm, 0, w, 0), 0);
+    ck("object layer has no tiles", tiled_tile(tm, 2, 0, 0), 0);
+    val map: Tilemap = tiled_to_tilemap(tm, 0, 1);
+    var set: i64 = 0;
+    var solid: i64 = 0;
+    var y: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            val g: i64 = tilemap_get(map, x, y);
+            ck("cell gid", g, (x + y) % 4);
+            if g > 0 {
+                set = set + 1;
+                // solid only where a tile is set (tiled_to_tilemap sets set cells)
+                ckb("cell solid", tilemap_is_solid(map, x, y), x % 2 == 0 && y % 2 == 0);
+                if tilemap_is_solid(map, x, y) {
+                    solid = solid + 1;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ck("objects", tiled_object_count(tm, 2), 1);
+    ck("objects of a tile layer", tiled_object_count(tm, 0), 0);
+    val o: TiledObj = tiled_object(tm, 2, 0);
+    ck("object id", o.id, 7);
+    cks("object name", o.name, "door \"A\"");
+    cks("object kind", o.kind, "door");
+    ckb("object x", o.x == 4.5, true);
+    ckb("object y", o.y == - 2.0, true);
+    ckb("object h", o.h == 16.0, true);
+    ck("object gid", o.gid, - 1);
+    ck("no object", tiled_object(tm, 2, 1).id, 0);
+    cks("prop bool", tiled_obj_prop(tm, 2, 0, "locked"), "true");
+    cks("prop string", tiled_obj_prop(tm, 2, 0, "key"), "brass!");
+    cks("prop int", tiled_obj_prop(tm, 2, 0, "hp"), "12");
+    cks("prop missing", tiled_obj_prop(tm, 2, 0, "nope"), "");
+    cks("map prop", tiled_map_prop(tm, "music"), "cave.ogg");
+    ckb("bad map", tiled_open("{\"width\": 2, \"height\": 2, \"layers\": [}").ok, false);
+    ckb("no layers", tiled_open("{\"width\": 2, \"height\": 2}").ok, false);
+    println("tiled ok " + int_to_str(w * h) + " cells, " + int_to_str(set) + " set, " + int_to_str(solid) + " solid");
+
+    // ── gltf: lookups through the index (a .bin of 3 floats x 3 vertices) ──
+    var bin: Vec<i64> = Vec::new();
+    // 0.0 = 00 00 00 00, 1.0 = 00 00 80 3F; vertices (0,0,0) (1,0,0)
+    // (0,1,0): components 3 and 7 are 1.0
+    var v: i64 = 0;
+    while v < 9 {
+        if v == 3 || v == 7 {
+            bin.push(0);
+            bin.push(0);
+            bin.push(128);
+            bin.push(63);
+        } else {
+            bin.push(0);
+            bin.push(0);
+            bin.push(0);
+            bin.push(0);
+        }
+        v = v + 1;
+    }
+    val js: str = "{\"asset\": {\"version\": \"2.0\"}, \"buffers\": [{\"byteLength\": 36}],"
+        + " \"bufferViews\": [{\"buffer\": 0, \"byteOffset\": 0, \"byteLength\": 36}],"
+        + " \"accessors\": [{\"bufferView\": 0, \"componentType\": 5126, \"count\": 3, \"type\": \"VEC3\"}],"
+        + " \"materials\": [{\"pbrMetallicRoughness\": {\"baseColorFactor\": [0.5, 0.25, 1, 1]}}],"
+        + " \"meshes\": [{\"name\": \"tri\", \"primitives\": [{\"attributes\": {\"POSITION\": 0}, \"material\": 0}]}],"
+        + " \"nodes\": [{\"mesh\": 0}, {\"name\": \"empty\"}]}";
+    val gd: GltfDoc = gltf_open_json(js);
+    ckb("gltf ok", gd.ok, true);
+    ck("gltf meshes", gltf_mesh_count(gd), 1);
+    ck("gltf nodes", gltf_node_count(gd), 2);
+    val acc: GltfAcc = gltf_acc(gd, 0, 0);
+    ckb("accessor ok", acc.ok, true);
+    ck("accessor count", acc.count, 3);
+    ck("accessor stride", acc.stride, 12);
+    ckb("no accessor 1", gltf_acc(gd, 1, 0).ok, false);
+    val mesh: Mesh = gltf_mesh(bin, gd, 0, 0);
+    ckb("mesh valid", mesh.valid, true);
+    cks("mesh name", mesh.name, "tri");
+    ck("mesh vertices", mesh.vertices.len(), 3);
+    ckb("vertex 1 x", mesh.vertices.get(1).x == 1.0, true);
+    ckb("vertex 2 y", mesh.vertices.get(2).y == 1.0, true);
+    ck("mesh faces", mesh.faces.len(), 1);
+    ckb("no mesh 1", gltf_mesh(bin, gd, 1, 0).valid, false);
+    ckb("no primitive 1", gltf_mesh(bin, gd, 0, 1).valid, false);
+    val color: Vec<f64> = gltf_material_color(gd, 0);
+    ckb("color r", color.get(0) == 0.5, true);
+    ckb("color g", color.get(1) == 0.25, true);
+    ckb("color b", color.get(2) == 1.0, true);
+    val dflt: Vec<f64> = gltf_material_color(gd, 3);
+    ckb("default color", dflt.get(0) == 1.0 && dflt.get(3) == 1.0, true);
+    ckb("bad gltf", gltf_open_json("{\"meshes\": [").ok, false);
+    println("gltf ok");
+    println("loaders ok");
+    return 0;
+}

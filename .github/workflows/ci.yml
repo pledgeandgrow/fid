@@ -4,12 +4,31 @@
 #             tests pass, on Linux and Windows; it runs hello.fd.
 #   selfhost  the self-hosted compiler fid is built from compiler/*.fd in one
 #             stage (scripts/build-selfhost.sh) and runs and compiles a few
-#             programs, and the leak gate passes.
-#   natgate   the own-backend gate (scripts/nat-gate.sh) on x86_64-linux:
-#             the IR verifier and the allocation checker on every emit.
+#             programs, and the leak gate passes; `fid build` needs no C
+#             compiler and its `--target windows-x64` PE runs under wine
+#             (TL6); then what a new user
+#             meets (release-roadmap N1, N2, N4, N5, N11, A10): the ark
+#             workflow, the getting-started guide followed step by step, five
+#             example projects, fmt and lint on the tree, the installed layout.
+#   selfhost-windows  the same user-facing checks on Windows.
+#   natgate   the own-backend gate (scripts/nat-gate.sh), the whole suite on
+#             x86_64-linux, aarch64-linux and riscv64-linux (qemu-user): the
+#             IR verifier and the allocation checker on every emit; the
+#             rules proved by z3 (scripts/rules-smt.sh); the encoder oracles
+#             (scripts/enc-oracle.py).
+#   gates     checks of the tree alone: the miscompile log names a test for
+#             every fixed bug, every pass switch is documented, every gate a
+#             roadmap goal put into CI is still wired (ci-wiring-check.sh).
 #
 # The full suite, the 3-stage fixpoint and the cross targets take hours and
-# run before a release (docs/reference/releasing.md, scripts/ci/cross.yml).
+# run before a release (docs/reference/releasing.md, scripts/ci/cross.yml);
+# release.yml builds what a release ships with the 3-stage bootstrap, installs
+# it on clean Windows and Linux runners, builds the known projects (crater)
+# and publishes checksums and provenance.
+# The fuzzers and sanitizers run every night (verify-nightly.yml); the
+# clean-tree bootstrap, mutants, pass toggles, coverage and the Linux
+# benchmark tables every week (verify-weekly.yml); the 5% slowdown gate on
+# every push (bench.yml).
 
 name: CI
 
@@ -77,56 +96,248 @@ jobs:
         env:
           CC: zig cc
         run: bash scripts/leak-check.sh release/fid-dev
+      - name: Expected-fail tests print what they expect (CE4)
+        run: python3 scripts/diag-tests-check.py --fid ./release/fid-dev --jobs 4 tests/bootstrap/test_diag_*_fail.fd
+      - name: asm! register errors of emit --bare (CE4)
+        run: FID=./release/fid-dev bash tests/tooling/ce4-asm-register-check.sh
+      - name: wine (runs the Windows PE a Linux fid builds, TL6)
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends wine wine64
+          WINEDEBUG=-all timeout 300 "$(command -v wine || command -v wine64)" wineboot --init > /dev/null 2>&1 || true
+      - name: fid build with no C compiler, and --target windows-x64 run under wine (CB4, CB5, TL6)
+        # step 1: a host ELF from a PATH with no cc/zig/ld; step 2: a PE
+        # from this Linux fid (pe_ir), run under wine (REQUIRE_WINE=1: no
+        # wine is a failure); step 3: --via-c still takes the C route
+        env:
+          FID: release/fid-dev
+          REQUIRE_WINE: "1"
+          WINEDEBUG: "-all"
+        run: bash tests/tooling/build-no-toolchain-check.sh
+      - name: ASan + UBSan through C on a sample (M8; the whole suite runs nightly)
+        # clang is on the runner image (zig cc has no ASan runtime); each
+        # program must print what `fid run` prints with no sanitizer report
+        env:
+          CC: clang
+          FID: release/fid-dev
+          OUT: build/sanitize-sample
+        run: bash scripts/sanitize.sh hello test_vec_filled test_vec_builtins test_closure test_hashmap test_mem_owned_drop
       - name: Doc examples (CU7)
         run: python3 scripts/doctest.py stdlib --fid ./release/fid-dev
-      - name: Getting-started guide (N2)
+      - name: Doc examples marked native only, built with fid emit (CU7)
+        # `/// Example (native only):` blocks, built for x86_64-linux and run
+        env:
+          CC: zig cc
+        run: python3 scripts/doctest.py stdlib --fid ./release/fid-dev --emit --native-only
+      - name: Getting-started guide, step by step (N2)
+        # scripts/guide-check.py runs docs/reference/quickstart.md itself
         env:
           CC: zig cc
         run: bash scripts/quickstart-check.sh ./release/fid-dev
-      - name: Five example projects, lint-clean (N5/N11)
+      - name: Examples lint-clean and run
         run: bash scripts/examples-check.sh ./release/fid-dev
-      - name: fmt --check on compiler + stdlib (N4)
-        run: |
-          bad=0
-          for f in compiler/*.fd stdlib/*.fd; do
-            ./release/fid-dev fmt "$f" --check > /dev/null 2>&1 || { echo "fmt: $f"; bad=1; }
-          done
-          [ "$bad" = 0 ]
-      - name: stdlib docs via scribe (N10)
-        run: |
-          ./release/fid-dev scribe stdlib --format markdown --output /tmp/stdlib-docs
-          ls /tmp/stdlib-docs/*.md | wc -l | awk '$1 > 100'
-      - name: ark clean-machine flow (N1)
-        run: |
-          D="$(mktemp -d)"; cd "$D"
-          "$GITHUB_WORKSPACE/release/fid-dev" ark init ci-test
-          test -f ark.toml
-          "$GITHUB_WORKSPACE/release/fid-dev" ark install
-          "$GITHUB_WORKSPACE/release/fid-dev" ark list
+      - name: Five example projects built and run (N11)
+        # cli, library (through ark), service, game, C binding:
+        # tests/projects/, each against its expected.txt
+        env:
+          CC: zig cc
+        run: bash scripts/projects-check.sh ./release/fid-dev
+      - name: fmt on compiler + stdlib, comments and behaviour kept (N4)
+        env:
+          LIMIT: "20"
+        run: bash scripts/fmt-check.sh ./release/fid-dev
+      - name: lint on every stdlib module (N5)
+        # against scripts/lint-check.baseline when there is one
+        run: bash scripts/lint-check.sh ./release/fid-dev
+      - name: docs/stdlib/ matches the stdlib (N10)
+        # fails when a page is missing, stale or extra: run scripts/stdlib-docs.sh and commit
+        run: FID=./release/fid-dev bash scripts/stdlib-docs.sh --check
+      - name: the book's examples (AD6)
+        run: FID_HOME=$PWD python3 tests/book/check_book.py --fid ./release/fid-dev
+      - name: ark on a clean machine, init / add / install / build (N1)
+        env:
+          CC: zig cc
+        run: bash scripts/ark-check.sh ./release/fid-dev
+      - name: fid from an installed layout, run / ccompile / emit (A10, N12)
+        env:
+          CC: zig cc
+        run: bash scripts/install-layout-check.sh ./release/fid-dev
 
-  natgate:
-    # The own-backend gate (docs/roadmap/llvm-roadmap.md RL7): the IR
-    # verifier and the register-allocation checker on every emit, the rules
-    # tested and proved. x86_64-linux runs natively on ubuntu-latest; the
-    # qemu targets run with the release cross builds (scripts/ci/cross.yml).
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+  selfhost-windows:
+    # The user-facing checks of the selfhost job on a clean Windows machine
+    # (release-roadmap N1, N2, N11, A10): fid built in one stage, then the
+    # ark workflow, the getting-started guide, the example projects and the
+    # installed layout (where `fid emit` writes a native PE).
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
-      - name: mold
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
       - name: Build the Rust bootstrap compiler
         run: cargo build --release
       - name: Build fid (one stage)
         env:
           CC: zig cc
         run: ./scripts/build-selfhost.sh
-      - name: nat-gate on x86_64-linux
+      - name: fid run hello.fd
+        run: ./release/fid-dev.exe run tests/bootstrap/hello.fd
+      - name: ark on a clean machine (N1)
+        env:
+          CC: zig cc
+        run: bash scripts/ark-check.sh ./release/fid-dev.exe
+      - name: Getting-started guide, step by step (N2)
+        env:
+          CC: zig cc
+        run: bash scripts/quickstart-check.sh ./release/fid-dev.exe
+      - name: Five example projects built and run (N11)
+        env:
+          CC: zig cc
+        run: bash scripts/projects-check.sh ./release/fid-dev.exe
+      - name: fid from an installed layout, run / ccompile / emit (A10, N12)
+        env:
+          CC: zig cc
+        run: bash scripts/install-layout-check.sh ./release/fid-dev.exe
+
+  natgate:
+    # The own-backend gate (docs/roadmap/llvm-roadmap.md RL7, RA16): the IR
+    # verifier and the register-allocation checker on every emit of the
+    # whole suite (ALL=1), one job per Linux target: x86_64-linux runs
+    # natively on ubuntu-latest, AArch64 and RISC-V 64 under qemu-user.
+    # The rewrite rules are tested and proved by z3 (ME17; REQUIRE_Z3=1
+    # makes a missing solver a failure, not a skip); the encoder oracles run
+    # once, on the x86_64-linux job. (The compile-time gate, SP15, is in
+    # bench.yml, which builds the base commit's fid on the same runner.)
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, riscv64-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold, qemu-user
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold qemu-user
+      - name: The target's C library for qemu-user (CI4)
+        # A native Linux program that calls C functions is dynamic (CI2):
+        # qemu-user loads it with /usr/<arch>-linux-gnu's ld.so, which
+        # cross-test.sh's run-all.sh passes as QEMU_LD_PREFIX. Without it
+        # such tests are SKIP, and REQUIRE_LOADER=1 below fails the gate.
+        if: matrix.target != 'x86_64-linux'
+        run: sudo apt-get install -y -qq libc6-arm64-cross libc6-riscv64-cross
+      - name: z3 (the z3-solver wheel; rules-smt.sh uses its Python module)
+        run: python3 -m pip install --quiet z3-solver
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: Rules proved by z3, every obligation unsat (ME17)
+        if: matrix.target == 'x86_64-linux'
+        run: bash scripts/rules-smt.sh release/fid-dev
+      - name: nat-gate on ${{ matrix.target }}, the whole suite (RA16)
         env:
           CC: zig cc
           FID: release/fid-dev
-        run: bash scripts/nat-gate.sh x86_64-linux
+          ALL: "1"
+          JOBS: "4"
+          REQUIRE_Z3: "1"
+          REQUIRE_LOADER: "1"
+        run: bash scripts/nat-gate.sh ${{ matrix.target }}
+      - name: nat-gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-gate-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            build/nat-gate-*.log
+            build/nat-gate/*/results.txt
+            build/nat-gate/*-native/results.txt
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: The suite as Windows PEs built by this Linux fid, run under wine (TL6)
+        # pe_ir from a Linux host (`emit --target x86_64-windows`), each
+        # program compared with `fid run`. Reported, not yet a gate: wine
+        # is not Windows (scripts/cross-from-linux.sh is the gate, on a
+        # Windows host with WSL: the PEs built in WSL run on Windows itself)
+        if: matrix.target == 'x86_64-linux'
+        continue-on-error: true
+        env:
+          FID: release/fid-dev
+          NATIVE: "1"
+          JOBS: "4"
+          WINEDEBUG: "-all"
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends wine wine64
+          bash scripts/cross-test.sh x86_64-windows-pe
+      - name: Windows PEs from Linux, results
+        if: always() && matrix.target == 'x86_64-linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-windows-from-linux-${{ github.run_id }}
+          path: build/cross/x86_64-windows-pe-native/results.txt
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Encoder oracles, AArch64 / RV64 / x86-64 against clang (RL8, TG4)
+        # every instruction form nat_enc.fd emits, encoded by fid and by
+        # clang's assembler (zig cc -c); the exit status counts mismatches
+        if: matrix.target == 'x86_64-linux'
+        run: python3 scripts/enc-oracle.py --fid release/fid-dev --zig zig
+
+  gates:
+    # Checks that read the tree only (no compiler is built), so they are
+    # cheap on every push: a fixed miscompile names a test that exists
+    # (RL4, scripts/miscompile-gate.sh), and every pass switch the compiler
+    # reads is documented in docs/verification/kill-switches.md (RL19,
+    # scripts/switch-check.sh), which is also where the pass matrix (RL3)
+    # takes its list.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Miscompile log gate (RL4)
+        run: bash scripts/miscompile-gate.sh
+      - name: Miscompile gate checks itself (RL4)
+        run: FID=none bash tests/tooling/miscompile-gate-check.sh
+      - name: Kill switches documented (RL19)
+        run: bash scripts/switch-check.sh
+      - name: Roadmap gates still wired into CI (RA16, ME17, SP15, A10, N8, N10, A12)
+        run: bash scripts/ci-wiring-check.sh
+      - name: Sources parse with the stage-0 compiler (fidesc keywords as names)
+        # every job that builds fid starts from fidesc; a `guard = ...` in
+        # compiler/ stopped them all on Nov 15 (A4, F5, G4)
+        run: bash scripts/stage0-names-check.sh
+      - name: Error messages tested, with a Fix line and a code, no fewer than before (CE4, TL2)
+        # a ratchet over compiler/*.fd's messages: scripts/diag-coverage-baseline.txt
+        run: python3 scripts/diag-coverage.py
+      - name: The coverage script's message and test matching (CE4)
+        run: python3 scripts/diag-coverage.py --self-test
+      - name: RL13 repro.sh verdicts, stand-in compilers
+        # the WSL cases skip on Linux
+        run: bash tests/tooling/rl13-repro-check.sh
+      - name: Mutants and constant toggles still match the sources (VF7, VF4)
+        # each edit of scripts/verify/variants.py must match its file once,
+        # or the weekly mutation run reports BUILD FAILED instead of a verdict
+        run: python3 scripts/verify/variants.py check
+      - name: Coverage report's source mapping and line figures (VF8)
+        run: python3 scripts/verify/coverage.py --self-test
+      - name: Coverage counters' instrumenter, block and line counters (VF8)
+        run: python3 scripts/verify/cov_instrument.py --self-test
+      - name: Ownership calculus, every program up to 4 statements, and its mutants (VF11)
+        # scripts/verify/own_model.py: accepted programs never use a freed
+        # cell, free one twice or leak, and read what the value semantics
+        # reads; each mutant (a check or lowering step removed) is caught
+        run: python3 scripts/verify/own_model.py --size 4 --self-test
+      - name: native-fixpoint.sh's verdicts, with stand-in compilers (RL14)
+        run: bash scripts/native-fixpoint-check.sh

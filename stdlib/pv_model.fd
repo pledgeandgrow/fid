@@ -1,0 +1,391 @@
+// Fides photovoltaic modelling
+//
+// Pure computation (no platform seam):
+// - Solar position by Michalsky's algorithm (J. Michalsky, "The Astronomical
+//   Almanac's algorithm for approximate solar position (1950-2050)", Solar
+//   Energy 40(3), 1988), NOT the NREL SPA: mean longitude and anomaly,
+//   ecliptic longitude, obliquity, right ascension and declination, Greenwich
+//   mean sidereal time, hour angle; the azimuth from atan2 (which avoids the
+//   quadrant error of the paper's arcsine form, noted by Spencer 1989), and
+//   Michalsky's refraction formula scaled by (P/1010)(283/(273+T)). Quoted
+//   accuracy 0.01 deg for 1950-2050; on the NREL SPA report's example
+//   (17 Oct 2003 19:30:30 UT, Golden CO) it is within 0.003 deg of SPA.
+// - Extraterrestrial normal irradiance (Spencer's Fourier series for the
+//   Earth-Sun distance, solar constant 1361 W/m^2), relative air mass
+//   (Kasten & Young 1989).
+// - Plane-of-array irradiance: angle of incidence; beam + ground reflected
+//   + sky diffuse, with the isotropic (Liu-Jordan) or Hay-Davies sky model.
+// - Cell temperature: NOCT model and Faiman's (U0 + U1 * wind) model.
+// - Single-diode model I = IL - I0 (e^((V + I Rs)/(n Ns Vt)) - 1)
+//   - (V + I Rs)/Rsh: current at a voltage by Newton's method, Isc, Voc,
+//   and the maximum power point (golden-section search on P(V)); parameters
+//   at other irradiance and temperature by the De Soto (2006) relations.
+// - Inverters: the Sandia model (King et al. 2007), an efficiency curve
+//   interpolated against load, and CEC / European weighted efficiencies.
+//
+// Angles are degrees in the public API; azimuths are measured clockwise
+// from north (180 = south).
+
+module pv_model;
+use math;
+use complex;
+use vec;
+
+pub fn pv_pi() -> f64 {
+    return 3.14159265358979323846;
+}
+
+fn pv_rad(d: f64) -> f64 {
+    return d * pv_pi() / 180.0;
+}
+
+fn pv_deg(r: f64) -> f64 {
+    return r * 180.0 / pv_pi();
+}
+
+fn pv_atan2(y: f64, x: f64) -> f64 {
+    return complex_arg(complex(x, y));
+}
+
+fn pv_asin(x: f64) -> f64 {
+    val c: f64 = math_clamp_f64(x, -1.0, 1.0);
+    return pv_atan2(c, math_sqrt(1.0 - c * c));
+}
+
+fn pv_acos(x: f64) -> f64 {
+    val c: f64 = math_clamp_f64(x, -1.0, 1.0);
+    return pv_atan2(math_sqrt(1.0 - c * c), c);
+}
+
+fn pv_mod(x: f64, m: f64) -> f64 {
+    return x - m * math_floor(x / m);
+}
+
+// ─── Solar position ───
+
+/// Julian day of a Gregorian date at `hour_ut` hours (UT).
+pub fn pv_julian_day(year: i64, month: i64, day: i64, hour_ut: f64) -> f64 {
+    var y: i64 = year;
+    var m: i64 = month;
+    if m <= 2 {
+        y = y - 1;
+        m = m + 12;
+    }
+    val a: i64 = y / 100;
+    val b: i64 = 2 - a + a / 4;
+    val d1: f64 = math_floor(365.25 * ((y + 4716) as f64));
+    val d2: f64 = math_floor(30.6001 * ((m + 1) as f64));
+    return d1 + d2 + (day as f64) + (b as f64) - 1524.5 + hour_ut / 24.0;
+}
+
+/// Day of the year (1 = 1 January).
+pub fn pv_day_of_year(year: i64, month: i64, day: i64) -> i64 {
+    return (pv_julian_day(year, month, day, 12.0) - pv_julian_day(year, 1, 1, 12.0)) as i64 + 1;
+}
+
+pub struct SolarPosition {
+    pub zenith: f64,
+    pub true_zenith: f64,
+    pub azimuth: f64,
+    pub declination: f64,
+    pub hour_angle: f64,
+    pub elevation: f64,
+}
+
+/// Sun position for a UT instant at latitude/longitude (degrees, east
+/// positive), with refraction for pressure (hPa) and temperature (C).
+pub fn pv_solar_position(year: i64, month: i64, day: i64, hour_ut: f64, lat: f64, lon: f64, pressure: f64, temp: f64) -> SolarPosition {
+    val jd: f64 = pv_julian_day(year, month, day, hour_ut);
+    val n: f64 = jd - 2451545.0;
+    val l: f64 = pv_mod(280.460 + 0.9856474 * n, 360.0);
+    val g: f64 = pv_rad(pv_mod(357.528 + 0.9856003 * n, 360.0));
+    val lam: f64 = pv_rad(pv_mod(l + 1.915 * math_sin(g) + 0.020 * math_sin(2.0 * g), 360.0));
+    val ep: f64 = pv_rad(23.439 - 0.0000004 * n);
+    val ra: f64 = pv_atan2(math_cos(ep) * math_sin(lam), math_cos(lam));
+    val dec: f64 = pv_asin(math_sin(ep) * math_sin(lam));
+    val gmst: f64 = pv_mod(6.697375 + 0.0657098242 * n + hour_ut, 24.0);
+    val lmst: f64 = pv_mod(gmst + lon / 15.0, 24.0);
+    var ha: f64 = pv_rad(lmst * 15.0) - ra;
+    ha = pv_mod(ha + pv_pi(), 2.0 * pv_pi()) - pv_pi();
+    val la: f64 = pv_rad(lat);
+    val el: f64 = pv_asin(math_sin(dec) * math_sin(la) + math_cos(dec) * math_cos(la) * math_cos(ha));
+    val az: f64 = pv_atan2(0.0 - math_cos(dec) * math_sin(ha), math_sin(dec) * math_cos(la) - math_cos(dec) * math_sin(la) * math_cos(ha));
+    val eld: f64 = pv_deg(el);
+    var refr: f64 = 0.56;
+    if eld > -0.56 {
+        refr = 3.51561 * (0.1594 + 0.0196 * eld + 0.00002 * eld * eld) / (1.0 + 0.505 * eld + 0.0845 * eld * eld);
+    }
+    refr = refr * (pressure / 1010.0) * (283.0 / (273.0 + temp));
+    return SolarPosition {
+        zenith: 90.0 - eld - refr, true_zenith: 90.0 - eld, azimuth: pv_mod(pv_deg(az), 360.0), declination: pv_deg(dec), hour_angle: pv_deg(ha), elevation: eld + refr
+    };
+}
+
+/// Extraterrestrial normal irradiance on day-of-year `doy` (Spencer 1971).
+pub fn pv_extraterrestrial(doy: i64) -> f64 {
+    val b: f64 = 2.0 * pv_pi() * ((doy - 1) as f64) / 365.0;
+    val e: f64 = 1.00011 + 0.034221 * math_cos(b) + 0.00128 * math_sin(b) + 0.000719 * math_cos(2.0 * b) + 0.000077 * math_sin(2.0 * b);
+    return 1361.0 * e;
+}
+
+/// Relative (not pressure-corrected) air mass, Kasten & Young 1989.
+pub fn pv_airmass(zenith: f64) -> f64 {
+    if zenith >= 90.0 {
+        return 0.0;
+    }
+    return 1.0 / (math_cos(pv_rad(zenith)) + 0.50572 * math_pow(96.07995 - zenith, -1.6364));
+}
+
+// ─── Plane of array ───
+
+/// Angle of incidence (degrees) on a surface of `tilt` facing `surf_az`.
+pub fn pv_aoi(zenith: f64, azimuth: f64, tilt: f64, surf_az: f64) -> f64 {
+    val z: f64 = pv_rad(zenith);
+    val b: f64 = pv_rad(tilt);
+    val c: f64 = math_cos(z) * math_cos(b) + math_sin(z) * math_sin(b) * math_cos(pv_rad(azimuth - surf_az));
+    return pv_deg(pv_acos(c));
+}
+
+pub struct PoaIrradiance {
+    pub total: f64,
+    pub beam: f64,
+    pub sky_diffuse: f64,
+    pub ground: f64,
+    pub aoi: f64,
+}
+
+fn pv_poa_parts(zenith: f64, azimuth: f64, tilt: f64, surf_az: f64, dni: f64, ghi: f64, albedo: f64) -> PoaIrradiance {
+    val a: f64 = pv_aoi(zenith, azimuth, tilt, surf_az);
+    val beam: f64 = dni * math_max_f64(0.0, math_cos(pv_rad(a)));
+    val gnd: f64 = ghi * albedo * (1.0 - math_cos(pv_rad(tilt))) / 2.0;
+    return PoaIrradiance {
+        total: beam + gnd, beam: beam, sky_diffuse: 0.0, ground: gnd, aoi: a
+    };
+}
+
+/// Isotropic sky (Liu & Jordan): diffuse DHI (1 + cos tilt)/2.
+pub fn pv_poa_isotropic(zenith: f64, azimuth: f64, tilt: f64, surf_az: f64, dni: f64, ghi: f64, dhi: f64, albedo: f64) -> PoaIrradiance {
+    var p: PoaIrradiance = pv_poa_parts(zenith, azimuth, tilt, surf_az, dni, ghi, albedo);
+    p.sky_diffuse = dhi * (1.0 + math_cos(pv_rad(tilt))) / 2.0;
+    p.total = p.beam + p.sky_diffuse + p.ground;
+    return p;
+}
+
+/// Hay-Davies sky: anisotropy index Ai = DNI / DNI_extra; circumsolar part
+/// DHI Ai Rb with Rb = cos(aoi) / cos(zenith) (cos zenith floored at
+/// cos 89 deg), the rest isotropic.
+pub fn pv_poa_hay_davies(zenith: f64, azimuth: f64, tilt: f64, surf_az: f64, dni: f64, ghi: f64, dhi: f64, albedo: f64, dni_extra: f64) -> PoaIrradiance {
+    var p: PoaIrradiance = pv_poa_parts(zenith, azimuth, tilt, surf_az, dni, ghi, albedo);
+    val ai: f64 = dni / dni_extra;
+    val cz: f64 = math_max_f64(math_cos(pv_rad(zenith)), 0.01745);
+    val rb: f64 = math_max_f64(0.0, math_cos(pv_rad(p.aoi))) / cz;
+    p.sky_diffuse = dhi * ((1.0 - ai) * (1.0 + math_cos(pv_rad(tilt))) / 2.0 + ai * rb);
+    p.total = p.beam + p.sky_diffuse + p.ground;
+    return p;
+}
+
+// ─── Cell temperature ───
+
+/// NOCT model: Tc = Ta + (NOCT - 20) / 800 * G.
+pub fn pv_cell_temp_noct(t_air: f64, poa: f64, noct: f64) -> f64 {
+    return t_air + (noct - 20.0) / 800.0 * poa;
+}
+
+/// Faiman model: Tc = Ta + G / (U0 + U1 * wind); typical U0 = 25,
+/// U1 = 6.84 W/m^2/K per m/s.
+pub fn pv_cell_temp_faiman(t_air: f64, poa: f64, wind: f64, u0: f64, u1: f64) -> f64 {
+    return t_air + poa / (u0 + u1 * wind);
+}
+
+// ─── Single-diode model ───
+
+/// Parameters at one operating condition: photocurrent, saturation current,
+/// series and shunt resistance, and n * Ns * Vt (the modified ideality
+/// factor, volts).
+pub struct DiodeParams {
+    pub il: f64,
+    pub i0: f64,
+    pub rs: f64,
+    pub rsh: f64,
+    pub nnsvth: f64,
+}
+
+/// Thermal voltage k T / q at cell temperature tc (C).
+pub fn pv_thermal_voltage(tc: f64) -> f64 {
+    return 1.380649e-23 * (tc + 273.15) / 1.602176634e-19;
+}
+
+/// Parameters from a datasheet-style set: ideality n, Ns cells in series,
+/// cell temperature tc.
+pub fn pv_diode_params(il: f64, i0: f64, rs: f64, rsh: f64, n: f64, ns: i64, tc: f64) -> DiodeParams {
+    return DiodeParams {
+        il: il, i0: i0, rs: rs, rsh: rsh, nnsvth: n * (ns as f64) * pv_thermal_voltage(tc)
+    };
+}
+
+/// De Soto et al. (2006): parameters at irradiance g (W/m^2) and cell
+/// temperature tc from reference ones at 1000 W/m^2, 25 C; alpha_isc in
+/// A/K, band gap eg_ref (eV, 1.121 for silicon) with dEg/dT = -0.0002677.
+pub fn pv_desoto(reference: &DiodeParams, alpha_isc: f64, eg_ref: f64, g: f64, tc: f64) -> DiodeParams {
+    val tref: f64 = 298.15;
+    val t: f64 = tc + 273.15;
+    val k_ev: f64 = 0.00008617333262;
+    val eg: f64 = eg_ref * (1.0 - 0.0002677 * (t - tref));
+    val il: f64 = g / 1000.0 * (reference.il + alpha_isc * (t - tref));
+    val i0: f64 = reference.i0 * math_pow(t / tref, 3.0) * math_exp(eg_ref / (k_ev * tref) - eg / (k_ev * t));
+    return DiodeParams {
+        il: il, i0: i0, rs: reference.rs, rsh: reference.rsh * 1000.0 / g, nnsvth: reference.nnsvth * t / tref
+    };
+}
+
+/// Current at terminal voltage v (Newton on the implicit equation,
+/// started at the photocurrent).
+pub fn pv_current(p: &DiodeParams, v: f64) -> f64 {
+    var i: f64 = p.il;
+    var k: i64 = 0;
+    while k < 100 {
+        val e: f64 = math_exp((v + i * p.rs) / p.nnsvth);
+        val f: f64 = p.il - p.i0 * (e - 1.0) - (v + i * p.rs) / p.rsh - i;
+        val df: f64 = 0.0 - p.i0 * e * p.rs / p.nnsvth - p.rs / p.rsh - 1.0;
+        var step: f64 = f / df;
+        // damp large steps where the exponential is steep
+        if step > 1.0 {
+            step = 1.0;
+        }
+        if step < -1.0 {
+            step = -1.0;
+        }
+        i = i - step;
+        if math_fabs(step) < 1.0e-12 {
+            break;
+        }
+        k = k + 1;
+    }
+    return i;
+}
+
+pub fn pv_isc(p: &DiodeParams) -> f64 {
+    return pv_current(p, 0.0);
+}
+
+/// Open-circuit voltage: Newton on I(V) = 0 with I = 0.
+pub fn pv_voc(p: &DiodeParams) -> f64 {
+    // at I = 0: IL - I0 (e^(V/a) - 1) - V/Rsh = 0
+    var v: f64 = p.nnsvth * math_log(p.il / p.i0 + 1.0);
+    var k: i64 = 0;
+    while k < 100 {
+        val e: f64 = math_exp(v / p.nnsvth);
+        val f: f64 = p.il - p.i0 * (e - 1.0) - v / p.rsh;
+        val df: f64 = 0.0 - p.i0 * e / p.nnsvth - 1.0 / p.rsh;
+        val step: f64 = f / df;
+        v = v - step;
+        if math_fabs(step) < 1.0e-12 {
+            break;
+        }
+        k = k + 1;
+    }
+    return v;
+}
+
+pub struct MppPoint {
+    pub v: f64,
+    pub i: f64,
+    pub p: f64,
+}
+
+/// Maximum power point by golden-section search on P(V) over [0, Voc].
+pub fn pv_mpp(p: &DiodeParams) -> MppPoint {
+    var a: f64 = 0.0;
+    var b: f64 = pv_voc(p);
+    val g: f64 = (math_sqrt(5.0) - 1.0) / 2.0;
+    var c: f64 = b - g * (b - a);
+    var d: f64 = a + g * (b - a);
+    var fc: f64 = c * pv_current(p, c);
+    var fd: f64 = d * pv_current(p, d);
+    var k: i64 = 0;
+    while k < 80 && b - a > 1.0e-9 {
+        if fc > fd {
+            b = d;
+            d = c;
+            fd = fc;
+            c = b - g * (b - a);
+            fc = c * pv_current(p, c);
+        } else {
+            a = c;
+            c = d;
+            fc = fd;
+            d = a + g * (b - a);
+            fd = d * pv_current(p, d);
+        }
+        k = k + 1;
+    }
+    val v: f64 = (a + b) / 2.0;
+    val i: f64 = pv_current(p, v);
+    return MppPoint {
+        v: v, i: i, p: v * i
+    };
+}
+
+/// Fill factor Pmp / (Voc Isc).
+pub fn pv_fill_factor(p: &DiodeParams) -> f64 {
+    return pv_mpp(p).p / (pv_voc(p) * pv_isc(p));
+}
+
+// ─── Inverters ───
+
+/// Sandia inverter model parameters (King et al. 2007).
+pub struct SandiaInverter {
+    pub paco: f64,
+    pub pdco: f64,
+    pub vdco: f64,
+    pub pso: f64,
+    pub c0: f64,
+    pub c1: f64,
+    pub c2: f64,
+    pub c3: f64,
+    pub pnt: f64,
+}
+
+/// AC output for DC input power pdc at DC voltage vdc; clipped at paco,
+/// -pnt (night tare) below the start-up power pso.
+pub fn pv_sandia_inverter(inv: &SandiaInverter, pdc: f64, vdc: f64) -> f64 {
+    if pdc < inv.pso {
+        return 0.0 - inv.pnt;
+    }
+    val dv: f64 = vdc - inv.vdco;
+    val a: f64 = inv.pdco * (1.0 + inv.c1 * dv);
+    val b: f64 = inv.pso * (1.0 + inv.c2 * dv);
+    val c: f64 = inv.c0 * (1.0 + inv.c3 * dv);
+    val pac: f64 = (inv.paco / (a - b) - c * (a - b)) * (pdc - b) + c * (pdc - b) * (pdc - b);
+    return math_min_f64(pac, inv.paco);
+}
+
+/// Efficiency from a curve of (load fraction, efficiency) points, linear
+/// between them and flat beyond the ends.
+pub fn pv_efficiency_curve(load: &Vec<f64>, eff: &Vec<f64>, fraction: f64) -> f64 {
+    val n: i64 = load.len();
+    if fraction <= load.get(0) {
+        return eff.get(0);
+    }
+    if fraction >= load.get(n - 1) {
+        return eff.get(n - 1);
+    }
+    var i: i64 = 0;
+    while i < n - 2 && fraction > load.get(i + 1) {
+        i = i + 1;
+    }
+    val f: f64 = (fraction - load.get(i)) / (load.get(i + 1) - load.get(i));
+    return eff.get(i) + f * (eff.get(i + 1) - eff.get(i));
+}
+
+/// CEC weighted efficiency: weights 0.04 0.05 0.12 0.21 0.53 0.05 at 10,
+/// 20, 30, 50, 75 and 100 % load.
+pub fn pv_cec_efficiency(load: &Vec<f64>, eff: &Vec<f64>) -> f64 {
+    return 0.04 * pv_efficiency_curve(load, eff, 0.10) + 0.05 * pv_efficiency_curve(load, eff, 0.20) + 0.12 * pv_efficiency_curve(load, eff, 0.30) + 0.21 * pv_efficiency_curve(load, eff, 0.50) + 0.53 * pv_efficiency_curve(load, eff, 0.75) + 0.05 * pv_efficiency_curve(load, eff, 1.00);
+}
+
+/// European weighted efficiency: weights 0.03 0.06 0.13 0.10 0.48 0.20 at
+/// 5, 10, 20, 30, 50 and 100 % load.
+pub fn pv_euro_efficiency(load: &Vec<f64>, eff: &Vec<f64>) -> f64 {
+    return 0.03 * pv_efficiency_curve(load, eff, 0.05) + 0.06 * pv_efficiency_curve(load, eff, 0.10) + 0.13 * pv_efficiency_curve(load, eff, 0.20) + 0.10 * pv_efficiency_curve(load, eff, 0.30) + 0.48 * pv_efficiency_curve(load, eff, 0.50) + 0.20 * pv_efficiency_curve(load, eff, 1.00);
+}

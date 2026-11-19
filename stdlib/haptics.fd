@@ -1,0 +1,409 @@
+// Fides haptics: one pattern model, Android waveforms and iOS AHAP
+//
+// What is real (pure Fides, tested in the interpreter):
+//   - a pattern of transient taps and continuous vibrations with an
+//     intensity and a sharpness (0..1, the Core Haptics parameters) and
+//     optional intensity curves, built and validated (ranges, overlaps,
+//     Core Haptics' 30 s limit on one continuous event)
+//   - Android VibrationEffect.createWaveform(timings, amplitudes, repeat):
+//     segments in milliseconds with amplitudes 0..255 (0 = off), gaps
+//     filled, equal neighbours merged, transients rendered as short pulses
+//     whose length follows the sharpness; the on/off-only form for devices
+//     without amplitude control; the predefined effects and composition
+//     primitives
+//   - iOS Core Haptics AHAP JSON (Version, Pattern, Event / ParameterCurve
+//     entries) and parsing it back
+//   - the UIImpactFeedbackGenerator styles as patterns
+//
+// The platform seam: playing is a JNI call on Android
+// (VibrationEffect.createWaveform, Vibrator.vibrate) and an Objective-C
+// message on iOS (CHHapticEngine playPatternFromData:error: with the AHAP
+// bytes); both are given as data (`haptic_android_calls`,
+// `haptic_ios_calls`) for jni.fd and objc.fd to perform.
+
+module haptics;
+use vec;
+use string;
+use json;
+
+pub const HAPTIC_TRANSIENT: i64 = 0;
+pub const HAPTIC_CONTINUOUS: i64 = 1;
+pub const HAPTIC_MAX_CONTINUOUS_MS: i64 = 30000;
+
+// Android VibrationEffect constants
+pub const ANDROID_EFFECT_CLICK: i64 = 0;
+pub const ANDROID_EFFECT_DOUBLE_CLICK: i64 = 1;
+pub const ANDROID_EFFECT_TICK: i64 = 2;
+pub const ANDROID_EFFECT_HEAVY_CLICK: i64 = 5;
+pub const ANDROID_PRIMITIVE_CLICK: i64 = 1;
+pub const ANDROID_PRIMITIVE_THUD: i64 = 2;
+pub const ANDROID_PRIMITIVE_SPIN: i64 = 3;
+pub const ANDROID_PRIMITIVE_QUICK_RISE: i64 = 4;
+pub const ANDROID_PRIMITIVE_SLOW_RISE: i64 = 5;
+pub const ANDROID_PRIMITIVE_QUICK_FALL: i64 = 6;
+pub const ANDROID_PRIMITIVE_TICK: i64 = 7;
+pub const ANDROID_PRIMITIVE_LOW_TICK: i64 = 8;
+
+// UIImpactFeedbackStyle
+pub const IOS_IMPACT_LIGHT: i64 = 0;
+pub const IOS_IMPACT_MEDIUM: i64 = 1;
+pub const IOS_IMPACT_HEAVY: i64 = 2;
+pub const IOS_IMPACT_SOFT: i64 = 3;
+pub const IOS_IMPACT_RIGID: i64 = 4;
+
+pub struct HapticEvent {
+    pub kind: i64,
+    pub time_ms: i64,
+    pub duration_ms: i64,      // continuous only
+    pub intensity: f64,        // 0..1
+    pub sharpness: f64,        // 0..1
+}
+
+/// A control-point curve on the intensity of what plays (AHAP
+/// HapticIntensityControl): times relative to `time_ms`.
+pub struct HapticCurve {
+    pub time_ms: i64,
+    pub times: Vec<i64>,
+    pub values: Vec<f64>,
+}
+
+pub struct HapticPattern {
+    pub events: Vec<HapticEvent>,
+    pub curves: Vec<HapticCurve>,
+}
+
+pub fn haptic_pattern_new() -> HapticPattern {
+    return HapticPattern { events: Vec::new(), curves: Vec::new() };
+}
+
+pub fn haptic_add_transient(p: &mut HapticPattern, time_ms: i64, intensity: f64, sharpness: f64) {
+    p.events.push(HapticEvent { kind: HAPTIC_TRANSIENT, time_ms: time_ms, duration_ms: 0, intensity: intensity, sharpness: sharpness });
+}
+
+pub fn haptic_add_continuous(p: &mut HapticPattern, time_ms: i64, duration_ms: i64, intensity: f64, sharpness: f64) {
+    p.events.push(HapticEvent { kind: HAPTIC_CONTINUOUS, time_ms: time_ms, duration_ms: duration_ms, intensity: intensity, sharpness: sharpness });
+}
+
+pub fn haptic_add_curve(p: &mut HapticPattern, time_ms: i64, times: Vec<i64>, values: Vec<f64>) {
+    p.curves.push(HapticCurve { time_ms: time_ms, times: times, values: values });
+}
+
+/// Events sorted by start time (stable).
+pub fn haptic_sorted(p: &HapticPattern) -> Vec<HapticEvent> {
+    var out: Vec<HapticEvent> = Vec::new();
+    var i: i64 = 0;
+    while i < p.events.len() {
+        val e: HapticEvent = p.events.get(i);
+        var k: i64 = out.len();
+        while k > 0 && out.get(k - 1).time_ms > e.time_ms { k = k - 1; }
+        out.insert(k, e);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Problems that make the pattern unplayable; empty when it is fine.
+pub fn haptic_validate(p: &HapticPattern) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    val ev: Vec<HapticEvent> = haptic_sorted(p);
+    var i: i64 = 0;
+    var busy_until: i64 = -1;
+    while i < ev.len() {
+        val e: HapticEvent = ev.get(i);
+        val at: str = "event at " + int_to_str(e.time_ms) + " ms";
+        if e.time_ms < 0 { errs.push(at + ": negative time"); }
+        if e.intensity < 0.0 || e.intensity > 1.0 { errs.push(at + ": intensity outside 0..1"); }
+        if e.sharpness < 0.0 || e.sharpness > 1.0 { errs.push(at + ": sharpness outside 0..1"); }
+        if e.kind == HAPTIC_CONTINUOUS {
+            if e.duration_ms <= 0 { errs.push(at + ": continuous event needs a duration"); }
+            if e.duration_ms > HAPTIC_MAX_CONTINUOUS_MS { errs.push(at + ": continuous event longer than 30 s"); }
+        }
+        if e.time_ms < busy_until { errs.push(at + ": overlaps the previous event"); }
+        val end: i64 = e.time_ms + haptic_android_len(e);
+        if end > busy_until { busy_until = end; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.curves.len() {
+        val c: HapticCurve = p.curves.get(i);
+        if c.times.len() != c.values.len() || c.times.len() < 2 { errs.push("curve at " + int_to_str(c.time_ms) + " ms: needs matching points"); }
+        if c.times.len() > 16 { errs.push("curve at " + int_to_str(c.time_ms) + " ms: more than 16 control points"); }
+        i = i + 1;
+    }
+    return errs;
+}
+
+/// Total length in milliseconds (end of the last event).
+pub fn haptic_duration(p: &HapticPattern) -> i64 {
+    var end: i64 = 0;
+    var i: i64 = 0;
+    while i < p.events.len() {
+        val e: HapticEvent = p.events.get(i);
+        val t: i64 = e.time_ms + haptic_android_len(e);
+        if t > end { end = t; }
+        i = i + 1;
+    }
+    return end;
+}
+
+// ─── Android ───────────────────────────────────────────────────────────
+
+/// Amplitude 1..255 of an intensity (0 stays 0).
+pub fn haptic_amplitude(intensity: f64) -> i64 {
+    if intensity <= 0.0 { return 0; }
+    var a: i64 = (intensity * 255.0 + 0.5) as i64;
+    if a < 1 { a = 1; }
+    if a > 255 { a = 255; }
+    return a;
+}
+
+/// How long a transient pulse lasts on a vibration motor: 20 ms when
+/// dull, 5 ms when sharp.
+pub fn haptic_transient_ms(sharpness: f64) -> i64 {
+    return 20 - ((sharpness * 15.0 + 0.5) as i64);
+}
+
+fn haptic_android_len(e: HapticEvent) -> i64 {
+    if e.kind == HAPTIC_TRANSIENT { return haptic_transient_ms(e.sharpness); }
+    return e.duration_ms;
+}
+
+/// The arguments of VibrationEffect.createWaveform.
+pub struct Waveform {
+    pub timings: Vec<i64>,
+    pub amplitudes: Vec<i64>,
+    pub repeat: i64,           // -1: play once
+}
+
+fn haptic_seg(w: &mut Waveform, ms: i64, amp: i64) {
+    if ms <= 0 { return; }
+    val n: i64 = w.timings.len();
+    if n > 0 && w.amplitudes.get(n - 1) == amp {
+        w.timings.set(n - 1, w.timings.get(n - 1) + ms);
+        return;
+    }
+    w.timings.push(ms);
+    w.amplitudes.push(amp);
+}
+
+/// The waveform of a pattern. `repeat_from_ms` >= 0 makes it loop from
+/// the segment that starts at that time (-1: once).
+pub fn haptic_android_waveform(p: &HapticPattern, repeat_from_ms: i64) -> Waveform {
+    var w: Waveform = Waveform { timings: Vec::new(), amplitudes: Vec::new(), repeat: -1 };
+    val ev: Vec<HapticEvent> = haptic_sorted(p);
+    var now: i64 = 0;
+    var i: i64 = 0;
+    var starts: Vec<i64> = Vec::new();
+    while i < ev.len() {
+        val e: HapticEvent = ev.get(i);
+        if e.time_ms > now {
+            haptic_seg(&mut w, e.time_ms - now, 0);
+            now = e.time_ms;
+        }
+        var len: i64 = haptic_android_len(e);
+        // a later event cuts this one short
+        if i + 1 < ev.len() && ev.get(i + 1).time_ms < now + len { len = ev.get(i + 1).time_ms - now; }
+        haptic_seg(&mut w, len, haptic_amplitude(e.intensity));
+        now = now + len;
+        i = i + 1;
+    }
+    if repeat_from_ms >= 0 {
+        var t: i64 = 0;
+        var k: i64 = 0;
+        while k < w.timings.len() {
+            if t == repeat_from_ms { w.repeat = k; }
+            t = t + w.timings.get(k);
+            k = k + 1;
+        }
+    }
+    return w;
+}
+
+/// The legacy createWaveform(long[] timings, int repeat) form for
+/// vibrators without amplitude control: off, on, off, on... durations,
+/// starting with an "off" (possibly 0); an amplitude below `min_amp`
+/// counts as off.
+pub fn haptic_android_onoff(w: &Waveform, min_amp: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var on: bool = false;
+    out.push(0);
+    var i: i64 = 0;
+    while i < w.timings.len() {
+        val want: bool = w.amplitudes.get(i) >= min_amp && w.amplitudes.get(i) > 0;
+        if want == on {
+            out.set(out.len() - 1, out.get(out.len() - 1) + w.timings.get(i));
+        } else {
+            out.push(w.timings.get(i));
+            on = want;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The predefined Android effect closest to an iOS impact style.
+pub fn haptic_impact_android_effect(style: i64) -> i64 {
+    if style == IOS_IMPACT_LIGHT || style == IOS_IMPACT_SOFT { return ANDROID_EFFECT_TICK; }
+    if style == IOS_IMPACT_HEAVY { return ANDROID_EFFECT_HEAVY_CLICK; }
+    return ANDROID_EFFECT_CLICK;
+}
+
+/// An impact style as a one-tap pattern (the intensity and sharpness of
+/// the system generators).
+pub fn haptic_impact_pattern(style: i64) -> HapticPattern {
+    var p: HapticPattern = haptic_pattern_new();
+    if style == IOS_IMPACT_LIGHT { haptic_add_transient(&mut p, 0, 0.4, 0.6); }
+    else if style == IOS_IMPACT_MEDIUM { haptic_add_transient(&mut p, 0, 0.7, 0.5); }
+    else if style == IOS_IMPACT_HEAVY { haptic_add_transient(&mut p, 0, 1.0, 0.3); }
+    else if style == IOS_IMPACT_SOFT { haptic_add_transient(&mut p, 0, 0.6, 0.1); }
+    else { haptic_add_transient(&mut p, 0, 0.8, 1.0); }
+    return p;
+}
+
+// ─── iOS AHAP ──────────────────────────────────────────────────────────
+
+/// A number as AHAP writes it: up to 3 decimals, at least one.
+pub fn haptic_num(x: f64) -> str {
+    val neg: bool = x < 0.0;
+    val ax: f64 = if neg { 0.0 - x } else { x };
+    val n: i64 = (ax * 1000.0 + 0.5) as i64;
+    var frac: str = int_to_str(n % 1000);
+    while str_len(frac) < 3 { frac = "0" + frac; }
+    while str_len(frac) > 1 && str_ends_with(frac, "0") { frac = str_slice(frac, 0, str_len(frac) - 1); }
+    var s: str = int_to_str(n / 1000) + "." + frac;
+    if neg && n != 0 { s = "-" + s; }
+    return s;
+}
+
+fn haptic_secs(ms: i64) -> str { return haptic_num((ms as f64) / 1000.0); }
+
+fn haptic_param(id: str, v: f64) -> str {
+    return "{\"ParameterID\":\"" + id + "\",\"ParameterValue\":" + haptic_num(v) + "}";
+}
+
+/// The AHAP document of a pattern.
+pub fn haptic_ahap(p: &HapticPattern) -> str {
+    var items: Vec<str> = Vec::new();
+    val ev: Vec<HapticEvent> = haptic_sorted(p);
+    var i: i64 = 0;
+    while i < ev.len() {
+        val e: HapticEvent = ev.get(i);
+        var s: str = "{\"Event\":{\"Time\":" + haptic_secs(e.time_ms) + ",\"EventType\":";
+        if e.kind == HAPTIC_TRANSIENT { s = s + "\"HapticTransient\""; }
+        else { s = s + "\"HapticContinuous\",\"EventDuration\":" + haptic_secs(e.duration_ms); }
+        s = s + ",\"EventParameters\":[" + haptic_param("HapticIntensity", e.intensity) + "," + haptic_param("HapticSharpness", e.sharpness) + "]}}";
+        items.push(s);
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.curves.len() {
+        val c: HapticCurve = p.curves.get(i);
+        var s: str = "{\"ParameterCurve\":{\"ParameterID\":\"HapticIntensityControl\",\"Time\":" + haptic_secs(c.time_ms) + ",\"ParameterCurveControlPoints\":[";
+        var k: i64 = 0;
+        while k < c.times.len() {
+            if k > 0 { s = s + ","; }
+            s = s + "{\"Time\":" + haptic_secs(c.times.get(k)) + ",\"ParameterValue\":" + haptic_num(c.values.get(k)) + "}";
+            k = k + 1;
+        }
+        items.push(s + "]}}");
+        i = i + 1;
+    }
+    var out: str = "{\"Version\":1.0,\"Pattern\":[";
+    i = 0;
+    while i < items.len() {
+        if i > 0 { out = out + ","; }
+        out = out + items.get(i);
+        i = i + 1;
+    }
+    return out + "]}";
+}
+
+fn haptic_ms_of(raw: str) -> i64 {
+    val x: f64 = str_parse_float(raw);
+    return (x * 1000.0 + 0.5) as i64;
+}
+
+/// Parse the events and curves of an AHAP document (ok false when it is
+/// not one).
+pub struct AhapParsed {
+    pub ok: bool,
+    pub pattern: HapticPattern,
+}
+
+pub fn haptic_parse_ahap(text: str) -> AhapParsed {
+    var p: HapticPattern = haptic_pattern_new();
+    if json_type_safe(text) != "object" { return AhapParsed { ok: false, pattern: p }; }
+    val arr: str = json_get_safe(text, "Pattern");
+    if json_type_safe(arr) != "array" { return AhapParsed { ok: false, pattern: p }; }
+    val n: i64 = json_len_safe(arr);
+    var i: i64 = 0;
+    while i < n {
+        val item: str = json_at_safe(arr, i);
+        val ev: str = json_get_safe(item, "Event");
+        if json_type_safe(ev) == "object" {
+            val kind_raw: str = json_get_safe(ev, "EventType");
+            val t: i64 = haptic_ms_of(json_get_safe(ev, "Time"));
+            var inten: f64 = 1.0;
+            var sharp: f64 = 0.5;
+            val params: str = json_get_safe(ev, "EventParameters");
+            var k: i64 = 0;
+            while k < json_len_safe(params) {
+                val pr: str = json_at_safe(params, k);
+                val id: str = json_unescape(json_get_safe(pr, "ParameterID"));
+                val v: f64 = str_parse_float(json_get_safe(pr, "ParameterValue"));
+                if id == "HapticIntensity" { inten = v; }
+                if id == "HapticSharpness" { sharp = v; }
+                k = k + 1;
+            }
+            if kind_raw == "\"HapticTransient\"" { haptic_add_transient(&mut p, t, inten, sharp); }
+            else if kind_raw == "\"HapticContinuous\"" {
+                haptic_add_continuous(&mut p, t, haptic_ms_of(json_get_safe(ev, "EventDuration")), inten, sharp);
+            }
+        }
+        val cv: str = json_get_safe(item, "ParameterCurve");
+        if json_type_safe(cv) == "object" {
+            val pts: str = json_get_safe(cv, "ParameterCurveControlPoints");
+            var ts: Vec<i64> = Vec::new();
+            var vs: Vec<f64> = Vec::new();
+            var k: i64 = 0;
+            while k < json_len_safe(pts) {
+                val pt: str = json_at_safe(pts, k);
+                ts.push(haptic_ms_of(json_get_safe(pt, "Time")));
+                vs.push(str_parse_float(json_get_safe(pt, "ParameterValue")));
+                k = k + 1;
+            }
+            haptic_add_curve(&mut p, haptic_ms_of(json_get_safe(cv, "Time")), ts, vs);
+        }
+        i = i + 1;
+    }
+    return AhapParsed { ok: true, pattern: p };
+}
+
+// ─── Platform calls (as data) ──────────────────────────────────────────
+
+pub struct HapticCall {
+    pub cls: str,
+    pub method: str,
+    pub sig: str,
+}
+
+/// Android: build the effect, then vibrate (Vibrator from
+/// Context.getSystemService(VIBRATOR_SERVICE), or VibratorManager on 31+).
+pub fn haptic_android_calls() -> Vec<HapticCall> {
+    var v: Vec<HapticCall> = Vec::new();
+    v.push(HapticCall { cls: "android/os/VibrationEffect", method: "createWaveform", sig: "([J[II)Landroid/os/VibrationEffect;" });
+    v.push(HapticCall { cls: "android/os/VibrationEffect", method: "createPredefined", sig: "(I)Landroid/os/VibrationEffect;" });
+    v.push(HapticCall { cls: "android/os/Vibrator", method: "hasAmplitudeControl", sig: "()Z" });
+    v.push(HapticCall { cls: "android/os/Vibrator", method: "vibrate", sig: "(Landroid/os/VibrationEffect;)V" });
+    return v;
+}
+
+/// iOS: an engine, started, playing the AHAP bytes (NSData).
+pub fn haptic_ios_calls() -> Vec<HapticCall> {
+    var v: Vec<HapticCall> = Vec::new();
+    v.push(HapticCall { cls: "CHHapticEngine", method: "initAndReturnError:", sig: "@@:^@" });
+    v.push(HapticCall { cls: "CHHapticEngine", method: "startAndReturnError:", sig: "B@:^@" });
+    v.push(HapticCall { cls: "CHHapticEngine", method: "playPatternFromData:error:", sig: "B@:@^@" });
+    v.push(HapticCall { cls: "UIImpactFeedbackGenerator", method: "initWithStyle:", sig: "@@:q" });
+    return v;
+}

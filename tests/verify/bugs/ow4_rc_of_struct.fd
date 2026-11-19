@@ -1,0 +1,44 @@
+// Log OW4 (docs/verification/miscompile-log.md; VF11,
+// scripts/verify/own_diff.py --ext rc). Reference §13.3: `Rc::new` gives
+// `Rc<T>` with `clone`, `drop`, `get`, `count`; the conformance tests use
+// `Rc<i64>` only. `Rc<T>` of a struct holding a Vec does not work with
+// stage 0 of Nov 16: `fid check` accepts it, `fid run` stops with
+// "Panic: Unknown function 'Rc_clone'", and the C build fails
+// (`Vec_new` called with three arguments, `Rc_clone`/`Rc_count`/`Rc_get`
+// undeclared). The model's Rc (own_model.py --ext rc): a handle counts
+// one owner of a shared cell, `get` gives a counted copy of what it holds,
+// `count` is the number of live handles, the last handle drops the value.
+// Check also with `fid run --leaks` ("every block was freed").
+//> 2
+//> (3)
+//> 1
+//> (3)
+
+struct Bx {
+    n: i64,
+    kids: Vec<Bx>,
+}
+
+fn bx_show(b: &Bx) -> str {
+    var s: str = "(" + int_to_str(b.n);
+    var i: i64 = 0;
+    while i < b.kids.len() {
+        s = s + " " + bx_show(&b.kids.get(i));
+        i = i + 1;
+    }
+    return s + ")";
+}
+
+fn main() -> i64 {
+    var a: Bx = Bx { n: 3, kids: Vec::new() };
+    var h: Rc<Bx> = Rc::new(a);
+    {
+        var k: Rc<Bx> = h.clone();
+        println(int_to_str(h.count()));
+        println(bx_show(&k.get()));
+    }
+    println(int_to_str(h.count()));
+    var b: Bx = h.get();
+    println(bx_show(&b));
+    return 0;
+}

@@ -1,0 +1,50 @@
+// TG15: a C function whose last parameter is `...rest: T` (C's `...`)
+// takes any number of arguments after its fixed ones, each passed as it is
+// (no Vec packed: typechecker.fd tc_is_c_variadic, lower.fd's extern
+// registration). codegen_c declares it with `...`; the machine layer marks
+// the variadic arguments in the stub's signature (nat_ir.fd ng_ldyn_sig,
+// ng_ldyn_var_sig: Apple arm64 puts them on the stack, Windows x64 gives a
+// float its integer register too, System V counts the vector registers in
+// al). An integer, a string and an f64 among the variadic arguments.
+// Not in tests/bootstrap: `fid run` and the frozen fidesc cannot call
+// sprintf (FFI), so the suite's interpreter lane has no reference.
+// Check:
+//   fid ccompile tests/nattools/tg15_c_variadic.fd -o x && ./x
+//   fid emit tests/nattools/tg15_c_variadic.fd --target <t> -o x && ./x
+// Expected output:
+// 9
+// 0
+// 4
+// 0
+// 3
+// 0
+// 3
+// 0
+
+// sprintf, not snprintf: Windows' msvcrt.dll (the C library `fid emit
+// --nat` imports from) has no snprintf. The headers declare both for C.
+extern "C" include "<stdio.h>" {
+    fn sprintf(buf: *u8, fmt: str, ...rest: i64) -> i32;
+}
+
+extern "C" include "<string.h>" {
+    fn strcmp(a: *u8, b: str) -> i32;
+}
+
+@unsafe
+fn main() -> i64 {
+    val buf: *u8 = p_malloc(64);
+    println(sprintf(buf, "%d-%d-%s", 12, 345, "ab") as i64);
+    println(strcmp(buf, "12-345-ab") as i64);
+    println(sprintf(buf, "%.2f", 3.25) as i64);
+    println(strcmp(buf, "3.25") as i64);
+    // the fixed arguments alone
+    println(sprintf(buf, "abc") as i64);
+    println(strcmp(buf, "abc") as i64);
+    // three variadic integers: five integer arguments in all (System V
+    // takes six in registers; ng_ldyn_sig binds no more)
+    println(sprintf(buf, "%d%d%d", 1, 2, 3) as i64);
+    println(strcmp(buf, "123") as i64);
+    p_free(buf);
+    return 0;
+}

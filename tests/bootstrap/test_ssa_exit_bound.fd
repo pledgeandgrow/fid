@@ -1,0 +1,135 @@
+// ME23 (compiler/ssa.fd ssa_exit_values, Nov 17): exit values for bounds
+// that are not constants. After `while i != n { i = i + 1 }` i is n; after
+// `while i < n` (`<= n`) it is n (n + 1) when a guard on the loop's way in
+// says i starts at most n (`if n > 0`, `if start <= n`, `&&` of guards, the
+// false edge of `if n <= 0 { return }`). Without such a guard (`no_guard`)
+// i keeps its own value: the start may be past the bound. Every result
+// must be what the program computes, with ssa/ssaexit on (the default) and
+// off (FID_IROPT_OFF=ssa,ssaexit); tests/tooling/ssaexit-check.sh also
+// reads `iropt: ssaexit N constant, M from a bound` (M > 0 here).
+//
+// Expected output:
+// 7
+// 5 10
+// -1
+// 8 13
+// 4 0
+// 10
+// 6 15
+// -1
+// 12 12
+// 3 3
+// 0 0
+
+fn until_eq(n: i64) -> i64 {
+    // `!=`: the loop leaves only with i == n
+    var i: i64 = 0;
+    while i != n {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn guarded_lt(n: i64) {
+    if n > 0 {
+        var i: i64 = 0;
+        var s: i64 = 0;
+        while i < n {
+            s = s + i;
+            i = i + 1;
+        }
+        println(int_to_str(i) + " " + int_to_str(s));
+    } else {
+        println(-1);
+    }
+}
+
+fn guarded_le(start: i64, n: i64) {
+    if start <= n {
+        var i: i64 = start;
+        var s: i64 = 0;
+        while i <= n {
+            s = s + i;
+            i = i + 1;
+        }
+        println(int_to_str(i) + " " + int_to_str(s));
+    }
+}
+
+fn guarded_and(n: i64, m: i64) {
+    // `n >= 1 && m >= 0`: the first conjunct gives 0 <= n
+    if n >= 1 && m >= 0 {
+        var i: i64 = 0;
+        var c: i64 = 0;
+        while i < n {
+            c = c + m;
+            i = i + 1;
+        }
+        println(int_to_str(i) + " " + int_to_str(c));
+    }
+}
+
+fn no_guard(n: i64) -> i64 {
+    // no guard: i starts past n and the loop never runs
+    var i: i64 = 10;
+    while i < n {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn early_return(n: i64) -> i64 {
+    // the false edge of `n <= 0` leads on: 0 < n
+    if n <= 0 {
+        return -1;
+    }
+    var i: i64 = 0;
+    var s: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    println(int_to_str(i) + " " + int_to_str(s));
+    return 0;
+}
+
+fn from_param(a: i64, b: i64) {
+    // the start is a value too: `a < b` guards `while i < b` from i = a
+    if a < b {
+        var i: i64 = a;
+        var t: i64 = 0;
+        while i < b {
+            t = t + 1;
+            i = i + 1;
+        }
+        println(int_to_str(i) + " " + int_to_str(t + a));
+    }
+}
+
+fn twice(n: i64) {
+    // the exit value read twice after the loop
+    if n >= 0 {
+        var i: i64 = 0;
+        while i < n {
+            i = i + 1;
+        }
+        println(int_to_str(i) + " " + int_to_str(i));
+    }
+}
+
+fn main() {
+    // bounds from calls, so they are not constants even after inlining
+    var seven: i64 = str_len("1234567");
+    var five: i64 = str_len("12345");
+    println(until_eq(seven));
+    guarded_lt(five);
+    guarded_lt(five - 5);
+    guarded_le(seven - 1, seven);
+    guarded_and(five - 1, 0);
+    println(no_guard(five - 2));
+    var r: i64 = early_return(seven - 1);
+    println(early_return(r));
+    from_param(seven + 2, seven + 5);
+    twice(five - 2);
+    twice(five - 5);
+}

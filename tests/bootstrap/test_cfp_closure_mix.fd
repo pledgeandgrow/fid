@@ -1,0 +1,71 @@
+// Roadmap L6C: in a program that makes a C function pointer (an address
+// cast to a function type, lower.fd: an env whose word 0 is the marker
+// `__fid_c_fnptr`, which no function has, and word 1 the address), a call
+// through a function value has to tell a closure from a C pointer: pe_ir's
+// CallPtr tests word 0, and nat_ir sends every CallPtr of such a program
+// through a stub per C signature (ng_gen_cfp_stubs) that jumps to a
+// closure's function when word 0 is not 0. This program makes one (it is
+// never called: its address is 0) and calls closures and function values
+// of several signatures through it: integers, an f64 argument, six
+// arguments (past the registers of the internal convention), a captured
+// value, and a function value handed to a function. Every backend prints
+// the same. (An f64 result through a function value is left out: the C
+// path of the Nov 17 stage-0 compiler crashed on one, with or without a C
+// pointer in the program.)
+// Expected output:
+// add1 = 42
+// mix = 17
+// six = 21
+// captured = 105
+// apply = 9
+// apply closure = 12
+// pointer made = true
+
+fn add1(x: i64) -> i64 {
+    return x + 1;
+}
+
+fn mix(a: i64, b: f64, c: i64) -> i64 {
+    return a + (b as i64) + c;
+}
+
+fn six(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    return a + b + c + d + e + f;
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+// SAFETY: the pointer made from 0 is never dereferenced or called (the
+// call below is behind a test that it is not 0).
+@unsafe
+fn main() {
+    // the C function pointer: made, never called. Its address is 0 at run
+    // time but not known to the optimizer (an unset variable's length), so
+    // the pointer and the test below stay in the program.
+    val zero: i64 = str_len(env_var("FID_CFP_TEST_UNSET").unwrap_or(""));
+    val raw: *u8 = zero as *u8;
+    val cp: fn(i64) -> i64 = raw as fn(i64) -> i64;
+
+    val f1: fn(i64) -> i64 = add1;
+    println("add1 = " + int_to_str(f1(41)));
+    val f2: fn(i64, f64, i64) -> i64 = mix;
+    println("mix = " + int_to_str(f2(10, 4.5, 3)));
+    val f6: fn(i64, i64, i64, i64, i64, i64) -> i64 = six;
+    println("six = " + int_to_str(f6(1, 2, 3, 4, 5, 6)));
+    val k: i64 = 100;
+    val addk = fn(x: i64) -> i64 { x + k };
+    println("captured = " + int_to_str(addk(5)));
+    println("apply = " + int_to_str(apply(f1, 8)));
+    println("apply closure = " + int_to_str(apply(fn(y: i64) -> i64 { y * 2 }, 6)));
+    if (raw as i64) == 0 && apply(f1, 0) == 1 {
+        println("pointer made = true");
+    } else {
+        println("pointer made = false");
+    }
+    // keep cp alive without calling it
+    if (raw as i64) != 0 {
+        println(int_to_str(cp(1)));
+    }
+}

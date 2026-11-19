@@ -6,8 +6,12 @@
 //   regex_match(s, re)    — a regex engine in pure Fides, linear in the
 //     input (a Pike VM, no backtracking): literals, '.', classes [abc] [a-z]
 //     [^x], escapes \d \w \s \n \t \\ \. …, quantifiers * + ? {n} {n,} {n,m},
-//     anchors ^ $, alternation a|b (inside groups too), grouping ( ).
-// Plus find/replace/split helpers built on the engine.
+//     anchors ^ $, word boundaries \b \B, alternation a|b (inside groups
+//     too), grouping ( ), non-capturing (?: ), and a leading (?i) for
+//     ASCII case-blind matching.
+// Plus find/replace/split helpers built on the engine (regex_find_all,
+// regex_replace_groups with $1 / ${n}), and capture groups
+// (regex_captures, regex_group, regex_capture_spans[_from]).
 //
 // Usage:
 //   regex_match("hello123", "h[ae]l+o[0-9]+")     // true
@@ -30,8 +34,8 @@ pub fn regex_matches(s: str, pattern: str) -> bool {
 }
 
 // ─── Real regex engine ──────────────────────────────────────────────────
-// (The backtracking engine's token layout, kept for its helpers; the Pike
-// VM below shares the class, escape and {n,m} parsing.) Tokens, 5 slots:
+// (The backtracking engine's token layout; its accessors went with it, the
+// Pike VM below shares the class, escape and {n,m} parsing.) Tokens, 5 slots:
 //   [kind, arg, min, max, -]
 //   kind 0 = literal byte          arg = byte
 //   kind 1 = '.'                   arg = 0
@@ -52,38 +56,6 @@ pub struct Regex {
     cls: Vec<i64>,
     progs: Vec<i64>,
     ok: bool,
-}
-
-fn rx_tok_push(v: & mut Vec<i64>, kind: i64, arg: i64, mn: i64, mx: i64) -> void {
-    v.push(kind);
-    v.push(arg);
-    v.push(mn);
-    v.push(mx);
-    v.push(- 1);
-}
-
-fn rx_tok(v: Vec<i64>, i: i64) -> i64 {
-    return v.get(i * 5);
-}
-
-fn rx_arg(v: Vec<i64>, i: i64) -> i64 {
-    return v.get(i * 5 + 1);
-}
-
-fn rx_min(v: Vec<i64>, i: i64) -> i64 {
-    return v.get(i * 5 + 2);
-}
-
-fn rx_max(v: Vec<i64>, i: i64) -> i64 {
-    return v.get(i * 5 + 3);
-}
-
-fn rx_set_arg(v: & mut Vec<i64>, i: i64, a: i64) -> void {
-    v.set(i * 5 + 1, a);
-}
-
-fn rx_ntoks(v: Vec<i64>) -> i64 {
-    return v.len() / 5;
 }
 
 fn rx_is_digit(c: i64) -> bool {
@@ -255,8 +227,13 @@ fn rx_parse_brace(re: str, i: i64, out3: & mut Vec<i64>) -> bool {
     var mn: i64 = 0;
     var mx: i64 = - 1;
     var has: bool = false;
+    // VF15 P2: a count longer than an i64 overflowed; a saturated count
+    // stays above RV_MAX_REPEAT (1000), so rv_seq rejects the pattern and
+    // regex_match gives false. The digits are still consumed.
     while j < n && rx_is_digit(str_byte_at(re, j)) {
-        mn = mn * 10 + (str_byte_at(re, j) - 48);
+        if mn <= 100000000 {
+            mn = mn * 10 + (str_byte_at(re, j) - 48);
+        }
         j = j + 1;
         has = true;
     }
@@ -268,7 +245,9 @@ fn rx_parse_brace(re: str, i: i64, out3: & mut Vec<i64>) -> bool {
         if j < n && rx_is_digit(str_byte_at(re, j)) {
             mx = 0;
             while j < n && rx_is_digit(str_byte_at(re, j)) {
-                mx = mx * 10 + (str_byte_at(re, j) - 48);
+                if mx <= 100000000 {
+                    mx = mx * 10 + (str_byte_at(re, j) - 48);
+                }
                 j = j + 1;
             }
         }
@@ -301,6 +280,12 @@ const RV_CLASS: i64 = 2;  // x = class bitmap offset
 const RV_BOL: i64 = 3; const RV_EOL: i64 = 4; const RV_SPLIT: i64 = 5;  // try x, then y
 const RV_JMP: i64 = 6;  // x
 const RV_MATCH: i64 = 7;
+/// x = capture slot: group g's start is slot 2g, its end 2g + 1. Reads
+/// nothing; the plain matcher passes over it, rv_run_caps records `pos`.
+const RV_SAVE: i64 = 8;
+/// \b and \B: zero-width, hold where a word byte ([0-9A-Za-z_]) meets a
+/// non-word byte or an end (\b), or where they do not (\B)
+const RV_WORDB: i64 = 9; const RV_NWORDB: i64 = 10;
 /// Largest repeat count {n,m} expands to (each copy is code)
 const RV_MAX_REPEAT: i64 = 1000;
  fn rv_emit(p: & mut Vec<i64>, op: i64, x: i64, y: i64) -> i64 {
@@ -428,6 +413,169 @@ fn rv_bars(re: str, i: i64, end: i64) -> Vec<i64> {
     return out;
 }
 
+/// True when the '(' at j opens a non-capturing group "(?:", or the
+/// leading flag group "(?i)" (regex_compile takes it off before compiling;
+/// the group numbering of the pattern must not count it).
+fn rv_noncap_at(re: str, j: i64) -> bool {
+    if j + 2 < str_len(re) && str_byte_at(re, j + 1) == 63 && str_byte_at(re, j + 2) == 58 {
+        return true;
+    }
+    return j == 0 && rv_icase_prefix(re);
+}
+
+/// Does the pattern start with the flag group "(?i)" (ignore case)?
+fn rv_icase_prefix(re: str) -> bool {
+    return str_len(re) >= 4 && str_byte_at(re, 0) == 40 && str_byte_at(re, 1) == 63 && str_byte_at(re, 2) == 105 && str_byte_at(re, 3) == 41;
+}
+
+fn rv_swap_case(c: i64) -> i64 {
+    if c >= 97 && c <= 122 {
+        return c - 32;
+    }
+    if c >= 65 && c <= 90 {
+        return c + 32;
+    }
+    return c;
+}
+
+/// The other-case letters of the class body re[a..b) (after any '^'), as
+/// class text: each letter's other case, and for a range the other case of
+/// its letter part ("a-f" gives "A-F").
+fn rv_fold_class_extra(re: str, a: i64, b: i64) -> str {
+    var out: str = "";
+    var j: i64 = a;
+    if j < b && str_byte_at(re, j) == 94 {
+        j = j + 1;
+    }
+    while j < b {
+        var c: i64 = str_byte_at(re, j);
+        if c == 92 {
+            j = j + 2;
+            continue;
+        }
+        if j + 2 < b && str_byte_at(re, j + 1) == 45 && str_byte_at(re, j + 2) != 92 {
+            var lo: i64 = c;
+            var hi: i64 = str_byte_at(re, j + 2);
+            // lower-case part -> upper, upper-case part -> lower
+            var l1: i64 = lo;
+            if l1 < 97 {
+                l1 = 97;
+            }
+            var h1: i64 = hi;
+            if h1 > 122 {
+                h1 = 122;
+            }
+            if l1 <= h1 {
+                out = out + byte_to_str(l1 - 32) + "-" + byte_to_str(h1 - 32);
+            }
+            var l2: i64 = lo;
+            if l2 < 65 {
+                l2 = 65;
+            }
+            var h2: i64 = hi;
+            if h2 > 90 {
+                h2 = 90;
+            }
+            if l2 <= h2 {
+                out = out + byte_to_str(l2 + 32) + "-" + byte_to_str(h2 + 32);
+            }
+            j = j + 3;
+            continue;
+        }
+        if rv_swap_case(c) != c {
+            out = out + byte_to_str(rv_swap_case(c));
+        }
+        j = j + 1;
+    }
+    return out;
+}
+
+/// The pattern after "(?i)" made case-blind: a letter outside a class
+/// becomes [xX], a class gains the other case of its letters and ranges
+/// ([^a] becomes [^aA], so it excludes both). Escapes are kept as written.
+fn rv_fold_case(re: str) -> str {
+    var n: i64 = str_len(re);
+    var out: str = "";
+    var i: i64 = 4;
+    while i < n {
+        var c: i64 = str_byte_at(re, i);
+        if c == 92 {
+            var e2: i64 = i + 2;
+            if e2 > n {
+                e2 = n;
+            }
+            out = out + str_slice(re, i, e2);
+            i = e2;
+            continue;
+        }
+        if c == 91 {
+            var k: i64 = rv_class_end(re, i + 1, n);
+            if k < 0 {
+                return out + str_slice(re, i, n);
+            }
+            // body re[i+1 .. k-1); a trailing literal '-' stays last
+            var extra: str = rv_fold_class_extra(re, i + 1, k - 1);
+            var body_end: i64 = k - 1;
+            if body_end - 1 > i + 1 && str_byte_at(re, body_end - 1) == 45 && str_byte_at(re, body_end - 2) != 92 {
+                out = out + str_slice(re, i, body_end - 1) + extra + "-]";
+            } else {
+                out = out + str_slice(re, i, body_end) + extra + "]";
+            }
+            i = k;
+            continue;
+        }
+        if c == 123 {
+            // a {n,m} quantifier is copied whole (no letters in it)
+            var q: i64 = i;
+            while q < n && str_byte_at(re, q) != 125 {
+                q = q + 1;
+            }
+            if q < n {
+                q = q + 1;
+            }
+            out = out + str_slice(re, i, q);
+            i = q;
+            continue;
+        }
+        if rv_swap_case(c) != c {
+            out = out + "[" + byte_to_str(c) + byte_to_str(rv_swap_case(c)) + "]";
+        } else {
+            out = out + str_slice(re, i, i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The number of the capturing group whose '(' is at j: 1 + the capturing
+/// '(' before j (not escaped, not in a class, not "(?:"). With j = the
+/// pattern's length: 1 + the number of groups.
+fn rv_group_index(re: str, j: i64) -> i64 {
+    var n: i64 = str_len(re);
+    var count: i64 = 0;
+    var k: i64 = 0;
+    while k < j && k < n {
+        var c: i64 = str_byte_at(re, k);
+        if c == 92 {
+            k = k + 2;
+            continue;
+        }
+        if c == 91 {
+            var e: i64 = rv_class_end(re, k + 1, n);
+            if e < 0 {
+                return count + 1;
+            }
+            k = e;
+            continue;
+        }
+        if c == 40 && !rv_noncap_at(re, k) {
+            count = count + 1;
+        }
+        k = k + 1;
+    }
+    return count + 1;
+}
+
 /// Code for the single atom re[j..aj)
 fn rv_atom(re: str, j: i64, aj: i64, p: & mut Vec<i64>, cls: & mut Vec<i64>, depth: i64) -> bool {
     if depth > 200 {
@@ -435,7 +583,17 @@ fn rv_atom(re: str, j: i64, aj: i64, p: & mut Vec<i64>, cls: & mut Vec<i64>, dep
     }
     var c: i64 = str_byte_at(re, j);
     if c == 40 {
-        return rv_alt(re, j + 1, aj - 1, p, cls, depth + 1);
+        // (?:...) groups without capturing
+        if rv_noncap_at(re, j) {
+            return rv_alt(re, j + 3, aj - 1, p, cls, depth + 1);
+        }
+        var g: i64 = rv_group_index(re, j);
+        rv_emit(p, RV_SAVE, 2 * g, 0);
+        if !rv_alt(re, j + 1, aj - 1, p, cls, depth + 1) {
+            return false;
+        }
+        rv_emit(p, RV_SAVE, 2 * g + 1, 0);
+        return true;
     }
     if c == 91 {
         var off: i64 = rx_new_cls(cls);
@@ -459,6 +617,15 @@ fn rv_atom(re: str, j: i64, aj: i64, p: & mut Vec<i64>, cls: & mut Vec<i64>, dep
     }
     if c == 92 {
         var e: i64 = str_byte_at(re, j + 1);
+        // \b, \B: word boundary assertions (outside classes)
+        if e == 98 {
+            rv_emit(p, RV_WORDB, 0, 0);
+            return true;
+        }
+        if e == 66 {
+            rv_emit(p, RV_NWORDB, 0, 0);
+            return true;
+        }
         var named: i64 = rx_escape_cls(e);
         if named >= 0 {
             var off2: i64 = rx_new_cls(cls);
@@ -582,8 +749,13 @@ pub fn regex_compile(re: str) -> Regex {
     var r: Regex = Regex {
         toks: Vec::new(), cls: Vec::new(), progs: Vec::new(), ok: false
     };
-    var n: i64 = str_len(re);
-    var bars: Vec<i64> = rv_bars(re, 0, n);
+    // a leading "(?i)": the rest of the pattern, case-blind
+    var pat: str = re;
+    if rv_icase_prefix(re) {
+        pat = rv_fold_case(re);
+    }
+    var n: i64 = str_len(pat);
+    var bars: Vec<i64> = rv_bars(pat, 0, n);
     var s0: i64 = 0;
     var k: i64 = 0;
     while k <= bars.len() {
@@ -592,7 +764,7 @@ pub fn regex_compile(re: str) -> Regex {
             e = bars.get(k);
         }
         r.progs.push(rv_pc(& r.toks));
-        if !rv_seq(re, s0, e, & mut r.toks, & mut r.cls, 0) {
+        if !rv_seq(pat, s0, e, & mut r.toks, & mut r.cls, 0) {
             return r;
         }
         rv_emit(& mut r.toks, RV_MATCH, 0, 0);
@@ -603,9 +775,16 @@ pub fn regex_compile(re: str) -> Regex {
     return r;
 }
 
+/// Is `pos` of s (n bytes) a word boundary?
+fn rv_at_word_boundary(s: str, pos: i64, n: i64) -> bool {
+    var before: bool = pos > 0 && rx_is_word(str_byte_at(s, pos - 1));
+    var after: bool = pos < n && rx_is_word(str_byte_at(s, pos));
+    return before != after;
+}
+
 /// Add the thread (pc, st) and what it reaches without reading (jumps,
 /// splits, anchors that hold at `pos`) to the list, once per instruction.
-fn rv_add(r: & Regex, pcs: & mut Vec<i64>, sts: & mut Vec<i64>, mark: & mut Vec<i64>, gen: i64, pc0: i64, st: i64, pos: i64, n: i64, stack: & mut Vec<i64>) {
+fn rv_add(r: & Regex, pcs: & mut Vec<i64>, sts: & mut Vec<i64>, mark: & mut Vec<i64>, gen: i64, pc0: i64, st: i64, pos: i64, n: i64, stack: & mut Vec<i64>, s: str) {
     stack.clear();
     stack.push(pc0);
     while stack.len() > 0 {
@@ -629,11 +808,172 @@ fn rv_add(r: & Regex, pcs: & mut Vec<i64>, sts: & mut Vec<i64>, mark: & mut Vec<
             if pos == n {
                 stack.push(pc + 1);
             }
+        } else if op == RV_WORDB || op == RV_NWORDB {
+            if rv_at_word_boundary(s, pos, n) == (op == RV_WORDB) {
+                stack.push(pc + 1);
+            }
+        } else if op == RV_SAVE {
+            stack.push(pc + 1);
         } else {
             pcs.push(pc);
             sts.push(st);
         }
     }
+}
+
+/// rv_add for the capturing matcher: each thread carries `nslots` capture
+/// positions (appended to `caps`), starting from `cur`. The stack holds
+/// pairs: (pc, 0) visits pc; (-1 - slot, old) puts slot back to old once
+/// the path through a SAVE is done, so a lower-priority branch of a split
+/// sees the positions from before it.
+fn rv_add_caps(r: & Regex, pcs: & mut Vec<i64>, caps: & mut Vec<i64>, mark: & mut Vec<i64>, gen: i64, pc0: i64, cur: & mut Vec<i64>, pos: i64, n: i64, stack: & mut Vec<i64>, nslots: i64, s: str) {
+    stack.clear();
+    stack.push(pc0);
+    stack.push(0);
+    while stack.len() > 0 {
+        var b: i64 = stack.pop();
+        var a: i64 = stack.pop();
+        if a < 0 {
+            cur.set(0 - a - 1, b);
+            continue;
+        }
+        var pc: i64 = a;
+        if mark.get(pc) == gen {
+            continue;
+        }
+        mark.set(pc, gen);
+        var op: i64 = r.toks.get(pc * 3);
+        if op == RV_JMP {
+            stack.push(r.toks.get(pc * 3 + 1));
+            stack.push(0);
+        } else if op == RV_SPLIT {
+            stack.push(r.toks.get(pc * 3 + 2));
+            stack.push(0);
+            stack.push(r.toks.get(pc * 3 + 1));
+            stack.push(0);
+        } else if op == RV_BOL {
+            if pos == 0 {
+                stack.push(pc + 1);
+                stack.push(0);
+            }
+        } else if op == RV_EOL {
+            if pos == n {
+                stack.push(pc + 1);
+                stack.push(0);
+            }
+        } else if op == RV_WORDB || op == RV_NWORDB {
+            if rv_at_word_boundary(s, pos, n) == (op == RV_WORDB) {
+                stack.push(pc + 1);
+                stack.push(0);
+            }
+        } else if op == RV_SAVE {
+            var slot: i64 = r.toks.get(pc * 3 + 1);
+            if slot < nslots {
+                stack.push(0 - slot - 1);
+                stack.push(cur.get(slot));
+                cur.set(slot, pos);
+            }
+            stack.push(pc + 1);
+            stack.push(0);
+        } else {
+            pcs.push(pc);
+            var k: i64 = 0;
+            while k < nslots {
+                caps.push(cur.get(k));
+                k = k + 1;
+            }
+        }
+    }
+}
+
+/// The capture positions of the highest-priority way the program at
+/// `entry` matches exactly s[start..end): `nslots` positions (group g at
+/// 2g and 2g + 1, -1 for a group that took no part), slots 0 and 1 being
+/// start and end. Priority is the pattern's order: the first alternative,
+/// a greedy quantifier taking one more round first. The caller knows the
+/// match exists (rv_run found it); [] if not.
+fn rv_run_caps(r: & Regex, entry: i64, s: str, start: i64, end: i64, nslots: i64) -> Vec<i64> {
+    var n: i64 = str_len(s);
+    var ninst: i64 = r.toks.len() / 3;
+    var mark: Vec<i64> = Vec::new();
+    while mark.len() < ninst {
+        mark.push(- 1);
+    }
+    var cp: Vec<i64> = Vec::new();
+    var cc: Vec<i64> = Vec::new();
+    var np: Vec<i64> = Vec::new();
+    var nc: Vec<i64> = Vec::new();
+    var stack: Vec<i64> = Vec::new();
+    var cur: Vec<i64> = Vec::new();
+    while cur.len() < nslots {
+        cur.push(- 1);
+    }
+    var gen: i64 = 0;
+    rv_add_caps(r, & mut cp, & mut cc, & mut mark, gen, entry, & mut cur, start, n, & mut stack, nslots, s);
+    var i: i64 = start;
+    while true {
+        gen = gen + 1;
+        np.clear();
+        nc.clear();
+        var c: i64 = - 1;
+        if i < n {
+            c = str_byte_at(s, i);
+        }
+        var t: i64 = 0;
+        while t < cp.len() {
+            var pc: i64 = cp.get(t);
+            var op: i64 = r.toks.get(pc * 3);
+            if op == RV_MATCH {
+                if i == end {
+                    var out: Vec<i64> = Vec::new();
+                    var k: i64 = 0;
+                    while k < nslots {
+                        out.push(cc.get(t * nslots + k));
+                        k = k + 1;
+                    }
+                    out.set(0, start);
+                    out.set(1, end);
+                    return out;
+                }
+                t = t + 1;
+                continue;
+            }
+            if i < end && c >= 0 {
+                var ok: bool = false;
+                if op == RV_CHAR {
+                    ok = c == r.toks.get(pc * 3 + 1);
+                } else if op == RV_ANY {
+                    ok = c != 10;
+                } else if op == RV_CLASS {
+                    ok = rx_cls_get(r.cls, r.toks.get(pc * 3 + 1), c & 255);
+                }
+                if ok {
+                    var k2: i64 = 0;
+                    while k2 < nslots {
+                        cur.set(k2, cc.get(t * nslots + k2));
+                        k2 = k2 + 1;
+                    }
+                    rv_add_caps(r, & mut np, & mut nc, & mut mark, gen, pc + 1, & mut cur, i + 1, n, & mut stack, nslots, s);
+                }
+            }
+            t = t + 1;
+        }
+        if i >= end {
+            break;
+        }
+        i = i + 1;
+        if np.len() == 0 {
+            break;
+        }
+        var tp: Vec<i64> = cp;
+        cp = np;
+        np = tp;
+        var tc: Vec<i64> = cc;
+        cc = nc;
+        nc = tc;
+    }
+    var none: Vec<i64> = Vec::new();
+    return none;
 }
 
 /// The leftmost-longest match of the program at `entry` in s, starting at
@@ -654,7 +994,7 @@ fn rv_run(r: & Regex, entry: i64, s: str, from: i64, anchored: bool, whole: bool
     var gen: i64 = 0;
     var best_s: i64 = - 1;
     var best_e: i64 = - 1;
-    rv_add(r, & mut cp, & mut cs, & mut mark, gen, entry, from, from, n, & mut stack);
+    rv_add(r, & mut cp, & mut cs, & mut mark, gen, entry, from, from, n, & mut stack, s);
     var i: i64 = from;
     while true {
         gen = gen + 1;
@@ -695,7 +1035,7 @@ fn rv_run(r: & Regex, entry: i64, s: str, from: i64, anchored: bool, whole: bool
                 ok = rx_cls_get(r.cls, r.toks.get(pc * 3 + 1), c & 255);
             }
             if ok {
-                rv_add(r, & mut np, & mut ns, & mut mark, gen, pc + 1, st, i + 1, n, & mut stack);
+                rv_add(r, & mut np, & mut ns, & mut mark, gen, pc + 1, st, i + 1, n, & mut stack, s);
             }
         }
         if i >= n {
@@ -704,9 +1044,12 @@ fn rv_run(r: & Regex, entry: i64, s: str, from: i64, anchored: bool, whole: bool
         i = i + 1;
         // a new start here, last in priority, while nothing has matched
         if !anchored && best_s < 0 {
-            rv_add(r, & mut np, & mut ns, & mut mark, gen, entry, i, i, n, & mut stack);
+            rv_add(r, & mut np, & mut ns, & mut mark, gen, entry, i, i, n, & mut stack, s);
         }
-        if np.len() == 0 {
+        // No thread left: done, unless a later start can still match (a
+        // start whose assertion fails here, as \b inside a word, adds no
+        // thread, yet one further on may)
+        if np.len() == 0 && (anchored || best_s >= 0 || i >= n) {
             break;
         }
         var tp: Vec<i64> = cp;
@@ -804,6 +1147,116 @@ pub fn regex_find_span(s: str, re: str) -> Vec<i64> {
     return rv_find(& r, s, 0);
 }
 
+// ─── Capture groups ─────────────────────────────────────────────────────
+// Groups are numbered by their '(' from the left, from 1; group 0 is the
+// whole match; (?:...) groups without a number. The match is the one
+// regex_find_span finds; within it each group holds what the
+// highest-priority way of matching it gave (the first alternative, greedy
+// quantifiers taking as much as they can), the last round's text for a
+// repeated group, and nothing for a group that took no part.
+
+/// The number of capturing groups in `re`.
+///
+/// Example:
+///   assert_eq(regex_group_count("(a)(?:b)(c(d))"), 3);
+pub fn regex_group_count(re: str) -> i64 {
+    return rv_group_index(re, str_len(re)) - 1;
+}
+
+/// The first match at or after `from` and its groups as positions:
+/// [start0, end0, start1, end1, ...], group 0 the whole match and -1, -1
+/// for a group that took no part. [] when nothing matches (or `re` does
+/// not compile).
+///
+/// Example:
+///   var sp = regex_capture_spans_from("k=v; x=yz", "(\\w)=(\\w+)", 4);
+///   // [5, 9, 5, 6, 7, 9]
+pub fn regex_capture_spans_from(s: str, re: str, from: i64) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    var r: Regex = regex_compile(re);
+    if !r.ok {
+        return none;
+    }
+    return rv_caps_from(& r, 2 * rv_group_index(re, str_len(re)), s, from);
+}
+
+/// regex_capture_spans_from on a compiled pattern with `nslots` slots
+/// (2 per group, group 0 included).
+fn rv_caps_from(r: & Regex, nslots: i64, s: str, from: i64) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    // rv_find, keeping which alternative matched
+    var bs: i64 = - 1;
+    var be: i64 = - 1;
+    var ba: i64 = - 1;
+    var a: i64 = 0;
+    while a < r.progs.len() {
+        var m: Vec<i64> = rv_run(r, r.progs.get(a), s, from, false, false);
+        if m.get(0) >= 0 && (bs < 0 || m.get(0) < bs) {
+            bs = m.get(0);
+            be = m.get(1);
+            ba = a;
+        }
+        a = a + 1;
+    }
+    if bs < 0 {
+        return none;
+    }
+    return rv_run_caps(r, r.progs.get(ba), s, bs, be, nslots);
+}
+
+/// The first match and its groups as positions (see
+/// regex_capture_spans_from).
+///
+/// Example:
+///   var sp = regex_capture_spans("id=42", "(\\w+)=(\\d+)?");
+///   // [0, 5, 0, 2, 3, 5]
+pub fn regex_capture_spans(s: str, re: str) -> Vec<i64> {
+    return regex_capture_spans_from(s, re, 0);
+}
+
+/// The text of the first match and of each group: [whole, group 1, ...],
+/// "" for a group that took no part (regex_capture_spans tells it from an
+/// empty match). [] when nothing matches.
+///
+/// Example:
+///   var c = regex_captures("on 2026-11-16", "(\\d{4})-(\\d{2})-(\\d{2})");
+///   assert_eq(c.get(1), "2026");
+///   assert_eq(c.get(3), "16");
+pub fn regex_captures(s: str, re: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var sp: Vec<i64> = regex_capture_spans_from(s, re, 0);
+    var g: i64 = 0;
+    while g * 2 + 1 < sp.len() {
+        var a: i64 = sp.get(g * 2);
+        var b: i64 = sp.get(g * 2 + 1);
+        if a >= 0 && b >= a {
+            out.push(str_slice(s, a, b));
+        } else {
+            out.push("");
+        }
+        g = g + 1;
+    }
+    return out;
+}
+
+/// The text of group `g` of the first match (0 = the whole match), or
+/// None when nothing matches or the group took no part.
+///
+/// Example:
+///   assert_eq(regex_group("user=ann", "(\\w+)=(\\w+)", 2).unwrap(), "ann");
+pub fn regex_group(s: str, re: str, g: i64) -> Option<str> {
+    var sp: Vec<i64> = regex_capture_spans_from(s, re, 0);
+    if g < 0 || g * 2 + 1 >= sp.len() {
+        return Option::None;
+    }
+    var a: i64 = sp.get(g * 2);
+    var b: i64 = sp.get(g * 2 + 1);
+    if a < 0 || b < a {
+        return Option::None;
+    }
+    return Option::Some(str_slice(s, a, b));
+}
+
 /// Replace every match of `re` in `s` with `rep` (literal text).
 ///
 /// Example:
@@ -866,6 +1319,131 @@ pub fn regex_split(s: str, re: str) -> Vec<str> {
         }
         out.push(str_slice(s, i, found));
         if fend == found {
+            i = found + 1;
+        } else {
+            i = fend;
+        }
+    }
+    return out;
+}
+
+/// Every match of `re` in `s`, left to right, not overlapping (an empty
+/// match moves on one byte), as Python's re.findall without groups.
+///
+/// Example:
+///   var all = regex_find_all("a1 b22 c333", "\\d+");
+///   assert_eq(all.len(), 3);
+///   assert_eq(all.get(2), "333");
+pub fn regex_find_all(s: str, re: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var r: Regex = regex_compile(re);
+    if !r.ok {
+        return out;
+    }
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i <= n {
+        var m: Vec<i64> = rv_find(& r, s, i);
+        var found: i64 = m.get(0);
+        var fend: i64 = m.get(1);
+        if found < 0 {
+            return out;
+        }
+        out.push(str_slice(s, found, fend));
+        if fend == found {
+            i = found + 1;
+        } else {
+            i = fend;
+        }
+    }
+    return out;
+}
+
+/// `rep` with $0..$9 and ${n} replaced by the groups of a match (spans
+/// `sp` in `s`; a group that took no part gives ""), and $$ by '$'.
+fn rv_expand(rep: str, s: str, sp: Vec<i64>) -> str {
+    var out: str = "";
+    var n: i64 = str_len(rep);
+    var seg: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if str_byte_at(rep, i) != 36 || i + 1 >= n {
+            i = i + 1;
+            continue;
+        }
+        var c: i64 = str_byte_at(rep, i + 1);
+        var g: i64 = - 1;
+        var past: i64 = i + 2;
+        if c == 36 {
+            out = out + str_slice(rep, seg, i) + "$";
+            i = i + 2;
+            seg = i;
+            continue;
+        }
+        if c >= 48 && c <= 57 {
+            g = c - 48;
+        } else if c == 123 {
+            var k: i64 = i + 2;
+            var v: i64 = 0;
+            var digits: i64 = 0;
+            while k < n && str_byte_at(rep, k) >= 48 && str_byte_at(rep, k) <= 57 {
+                v = v * 10 + str_byte_at(rep, k) - 48;
+                digits = digits + 1;
+                k = k + 1;
+            }
+            if digits > 0 && k < n && str_byte_at(rep, k) == 125 {
+                g = v;
+                past = k + 1;
+            }
+        }
+        if g < 0 {
+            // not a group reference: the '$' stays as text
+            i = i + 1;
+            continue;
+        }
+        out = out + str_slice(rep, seg, i);
+        if g * 2 + 1 < sp.len() {
+            var a: i64 = sp.get(g * 2);
+            var b: i64 = sp.get(g * 2 + 1);
+            if a >= 0 && b >= a {
+                out = out + str_slice(s, a, b);
+            }
+        }
+        i = past;
+        seg = i;
+    }
+    return out + str_slice(rep, seg, n);
+}
+
+/// Replace every match of `re` in `s` with `rep`, where $0 (the whole
+/// match), $1..$9 and ${n} stand for groups and $$ for '$' (Go's
+/// Regexp.ReplaceAllString with numbered groups).
+///
+/// Example:
+///   assert_eq(regex_replace_groups("2026-11-17", "(\\d+)-(\\d+)-(\\d+)", "$3/$2/$1"), "17/11/2026");
+///   assert_eq(regex_replace_groups("a=1, b=2", "(\\w)=(\\d)", "${2}:$1"), "1:a, 2:b");
+///   assert_eq(regex_replace_groups("cost 5", "\\d", "$$$0"), "cost $5");
+pub fn regex_replace_groups(s: str, re: str, rep: str) -> str {
+    var r: Regex = regex_compile(re);
+    if !r.ok {
+        return s;
+    }
+    var nslots: i64 = 2 * rv_group_index(re, str_len(re));
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i <= n {
+        var sp: Vec<i64> = rv_caps_from(& r, nslots, s, i);
+        if sp.len() < 2 {
+            return out + str_slice(s, i, n);
+        }
+        var found: i64 = sp.get(0);
+        var fend: i64 = sp.get(1);
+        out = out + str_slice(s, i, found) + rv_expand(rep, s, sp);
+        if fend == found {
+            if found < n {
+                out = out + str_slice(s, found, found + 1);
+            }
             i = found + 1;
         } else {
             i = fend;

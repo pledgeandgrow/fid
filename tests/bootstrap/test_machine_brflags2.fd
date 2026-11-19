@@ -1,0 +1,186 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA19, more cases of a value used
+// only as a branch condition staying in the flags (compiler/nat_ir.fd
+// ng_fuse_branches, ng_fuse_xblock):
+//   xb_not   `val c: bool = a < b; if x > 0 { call } if !c`: the compare in
+//            another block, a `!` (XOR with 1, in place) at the branch
+//   xb_nval  `val c: bool = !(a < b)`: the `!` in the compare's block
+//   xb_nn    `!` twice
+//   ext_if   a bool kept in a `var` (normalized: EXT) and branched on in
+//            the same block
+//   xb_ext   the same across a block with a call
+// Every function is checked against a reference that computes the same
+// answer with arithmetic only; each line prints the number of
+// disagreements (0) and a checksum. tests/nattools/machine_ra19_more_check.sh
+// checks the MIR after branch fusion (no setcc left in xb_not, xb_nval,
+// xb_nn on every target), each switch off (brnot, brext, brxblock) and
+// FID_NAT_MUTATE=brnot,brxblock.
+// Expected output:
+// xb_not 0 146
+// xb_nval 0 158
+// xb_nn 0 152
+// ext_if 0 137
+// xb_ext 0 140
+
+var g_seed: i64 = 4242;
+
+fn rnd(m: i64) -> i64 {
+    g_seed = (g_seed * 1103515245 + 12345) % 2147483648;
+    return (g_seed / 65536) % m;
+}
+
+// 1 when a < b, else 0, without a compare (operands well inside i64)
+fn lt01(a: i64, b: i64) -> i64 {
+    return ((a - b) >> 63) & 1;
+}
+
+fn side(x: i64) -> i64 {
+    if x > 1000 {
+        return side(x - 1000) + 1;
+    }
+    return x * 3 + 1;
+}
+
+fn xb_not(a: i64, b: i64, x: i64) -> i64 {
+    val c: bool = a < b;
+    var r: i64 = 0;
+    if x > 0 {
+        r = r + side(x);
+    }
+    if !c {
+        r = r + 100;
+    }
+    return r;
+}
+
+fn xb_nval(a: i64, b: i64, x: i64) -> i64 {
+    val c: bool = !(a < b);
+    var r: i64 = 0;
+    if x > 0 {
+        r = r + side(x);
+    }
+    if c {
+        r = r + 100;
+    }
+    return r;
+}
+
+fn xb_nn(a: i64, b: i64, x: i64) -> i64 {
+    val c: bool = a < b;
+    var r: i64 = 0;
+    if x > 0 {
+        r = r + side(x);
+    }
+    if !(!c) {
+        r = r + 100;
+    }
+    return r;
+}
+
+fn ext_if(a: i64, b: i64) -> i64 {
+    var c: bool = a < b;
+    var r: i64 = a * 2;
+    if c {
+        r = r + 9;
+    }
+    return r;
+}
+
+fn xb_ext(a: i64, b: i64, x: i64) -> i64 {
+    var c: bool = a < b;
+    var r: i64 = 0;
+    if x > 0 {
+        r = r + side(x);
+    }
+    if c {
+        r = r + 9;
+    }
+    return r;
+}
+
+fn main() {
+    var bad: i64 = 0;
+    var sum: i64 = 0;
+    var t: i64 = 0;
+    while t < 300 {
+        var a: i64 = rnd(21) - 10;
+        var b: i64 = rnd(21) - 10;
+        var x: i64 = rnd(5) - 2;
+        var base: i64 = 0;
+        if x > 0 {
+            base = side(x);
+        }
+        if xb_not(a, b, x) != base + 100 * (1 - lt01(a, b)) {
+            bad = bad + 1;
+        }
+        sum = sum + lt01(a, b);
+        t = t + 1;
+    }
+    println("xb_not " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 300 {
+        var a2: i64 = rnd(21) - 10;
+        var b2: i64 = rnd(21) - 10;
+        var x2: i64 = rnd(5) - 2;
+        var base2: i64 = 0;
+        if x2 > 0 {
+            base2 = side(x2);
+        }
+        if xb_nval(a2, b2, x2) != base2 + 100 * (1 - lt01(a2, b2)) {
+            bad = bad + 1;
+        }
+        sum = sum + 1 - lt01(a2, b2);
+        t = t + 1;
+    }
+    println("xb_nval " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 300 {
+        var a3: i64 = rnd(21) - 10;
+        var b3: i64 = rnd(21) - 10;
+        var x3: i64 = rnd(5) - 2;
+        var base3: i64 = 0;
+        if x3 > 0 {
+            base3 = side(x3);
+        }
+        if xb_nn(a3, b3, x3) != base3 + 100 * lt01(a3, b3) {
+            bad = bad + 1;
+        }
+        sum = sum + lt01(a3, b3);
+        t = t + 1;
+    }
+    println("xb_nn " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 300 {
+        var a4: i64 = rnd(21) - 10;
+        var b4: i64 = rnd(21) - 10;
+        if ext_if(a4, b4) != a4 * 2 + 9 * lt01(a4, b4) {
+            bad = bad + 1;
+        }
+        sum = sum + lt01(a4, b4);
+        t = t + 1;
+    }
+    println("ext_if " + int_to_str(bad) + " " + int_to_str(sum));
+    bad = 0;
+    sum = 0;
+    t = 0;
+    while t < 300 {
+        var a5: i64 = rnd(21) - 10;
+        var b5: i64 = rnd(21) - 10;
+        var x5: i64 = rnd(5) - 2;
+        var base5: i64 = 0;
+        if x5 > 0 {
+            base5 = side(x5);
+        }
+        if xb_ext(a5, b5, x5) != base5 + 9 * lt01(a5, b5) {
+            bad = bad + 1;
+        }
+        sum = sum + lt01(a5, b5);
+        t = t + 1;
+    }
+    println("xb_ext " + int_to_str(bad) + " " + int_to_str(sum));
+}

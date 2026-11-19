@@ -1,0 +1,156 @@
+// stdlib/framing: COBS against the examples of the COBS paper/Wikipedia (incl. 254/255-byte blocks), SLIP per RFC 1055, round trips, and streaming decoders with resynchronisation after errors.
+// Expected output:
+// 00 -> 01 01 ok
+// 00 00 -> 01 01 01 ok
+// 00 11 00 -> 01 02 11 01 ok
+// 11 22 00 33 -> 03 11 22 02 33 ok
+// 11 22 33 44 -> 05 11 22 33 44 ok
+// 11 00 00 00 -> 02 11 01 01 01 ok
+// 01..FE (254) -> FF 01 .. FE (255 bytes) ok [FF 01 .. FD FE]
+// 00..FE (255) -> 01 FF 01 .. FE (256 bytes) ok [01 FF .. FD FE]
+// 01..FF (255) -> FF 01 .. 02 FF (257 bytes) ok [FF 01 .. 02 FF]
+// 02..FF 00 (255) -> FF 02 .. 01 01 (257 bytes) ok [FF 02 .. 01 01]
+// round trips 0..600 bytes: true
+// bad: zero byte inside a COBS frame / COBS code runs past the end
+// slip C0 DB 01 -> C0 DB DC DB DD 01 C0, decoded C0 DB 01
+// slip bad escape: bad SLIP escape
+// cobs stream: 3 frames, 2 errors (frame longer than 16), frames 11 22 | 00 | 41 42 43
+// slip stream: 2 frames, 1 errors (bad SLIP escape), frames C0 01 | DB
+use framing;
+use vec;
+use string;
+
+fn hx(b: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn hexs(v: Vec<i64>) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        p.push(hx(v.get(i)));
+        i = i + 1;
+    }
+    return str_join(p, " ");
+}
+
+fn bytes(h: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val parts: Vec<str> = str_split(h, " ");
+    var i: i64 = 0;
+    while i < parts.len() {
+        out.push(str_parse_hex(parts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn range(a: i64, b: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i <= b {
+        out.push(i);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn vec_check(inp: str, want: str) {
+    val d: Vec<i64> = bytes(inp);
+    val e: Vec<i64> = cobs_encode(d);
+    var st: str = "ok";
+    if !str_equal(hexs(e), want) || !same(cobs_decode(e).data, d) { st = "MISMATCH " + hexs(e); }
+    println(inp + " -> " + want + " " + st);
+}
+
+fn long_check(label: str, d: Vec<i64>, first: str, last: str) {
+    val e: Vec<i64> = cobs_encode(d);
+    var ok: bool = same(cobs_decode(e).data, d);
+    val shown: str = hx(e.get(0)) + " " + hx(e.get(1)) + " .. " + hx(e.get(e.len() - 2)) + " " + hx(e.get(e.len() - 1));
+    var st: str = "ok";
+    if !ok { st = "ROUND TRIP FAILED"; }
+    println(label + " -> " + first + " .. " + last + " (" + int_to_str(e.len()) + " bytes) " + st + " [" + shown + "]");
+}
+
+fn join_frames(fs: Vec<Vec<i64>>) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < fs.len() {
+        p.push(hexs(fs.get(i)));
+        i = i + 1;
+    }
+    return str_join(p, " | ");
+}
+
+fn main() {
+    vec_check("00", "01 01");
+    vec_check("00 00", "01 01 01");
+    vec_check("00 11 00", "01 02 11 01");
+    vec_check("11 22 00 33", "03 11 22 02 33");
+    vec_check("11 22 33 44", "05 11 22 33 44");
+    vec_check("11 00 00 00", "02 11 01 01 01");
+    long_check("01..FE (254)", range(1, 254), "FF 01", "FE");
+    long_check("00..FE (255)", range(0, 254), "01 FF 01", "FE");
+    long_check("01..FF (255)", range(1, 255), "FF 01", "02 FF");
+    var d4: Vec<i64> = range(2, 255);
+    d4.push(0);
+    long_check("02..FF 00 (255)", d4, "FF 02", "01 01");
+    var ok: bool = true;
+    var n: i64 = 0;
+    var seed: i64 = 7;
+    while n <= 600 {
+        var d: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < n {
+            seed = (seed * 1103515245 + 12345) % 2147483648;
+            var b: i64 = (seed >> 16) & 255;
+            if (seed & 3) == 0 { b = 0; }
+            d.push(b);
+            i = i + 1;
+        }
+        val e: Vec<i64> = cobs_encode(d);
+        if e.len() > cobs_max_encoded(n) || !same(cobs_decode(e).data, d) { ok = false; }
+        var j: i64 = 0;
+        while j < e.len() {
+            if e.get(j) == 0 { ok = false; }
+            j = j + 1;
+        }
+        if !same(slip_decode(slip_encode(d)).data, d) { ok = false; }
+        n = n + 37;
+    }
+    var oks: str = "false";
+    if ok { oks = "true"; }
+    println("round trips 0..600 bytes: " + oks);
+    println("bad: " + cobs_decode(bytes("03 11 00")).error + " / " + cobs_decode(bytes("05 11 22")).error);
+    val se: Vec<i64> = slip_encode(bytes("C0 DB 01"));
+    println("slip C0 DB 01 -> " + hexs(se) + ", decoded " + hexs(slip_decode(se).data));
+    println("slip bad escape: " + slip_decode(bytes("DB 01")).error);
+
+    var cs: CobsStream = cobs_stream_new(16);
+    var stream: Vec<i64> = Vec::new();
+    stream.push(0);
+    stream.extend(cobs_frame(bytes("11 22")));
+    stream.extend(bytes("05 11 00"));
+    stream.extend(cobs_frame(bytes("00")));
+    stream.extend(cobs_frame(range(1, 20)));
+    stream.extend(cobs_frame(bytes("41 42 43")));
+    val nf: i64 = cobs_stream_feed_all(&mut cs, stream);
+    println("cobs stream: " + int_to_str(nf) + " frames, " + int_to_str(cs.errors) + " errors (" + cs.last_error + "), frames " + join_frames(cs.frames));
+    var ss: SlipStream = slip_stream_new(16);
+    var sst: Vec<i64> = slip_encode(bytes("C0 01"));
+    sst.extend(bytes("C0 41 DB 41 42 C0"));
+    sst.extend(slip_encode(bytes("DB")));
+    val ns: i64 = slip_stream_feed_all(&mut ss, sst);
+    println("slip stream: " + int_to_str(ns) + " frames, " + int_to_str(ss.errors) + " errors (" + ss.last_error + "), frames " + join_frames(ss.frames));
+}

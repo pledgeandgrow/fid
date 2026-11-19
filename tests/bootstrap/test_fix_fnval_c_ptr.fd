@@ -1,0 +1,47 @@
+// Test (stdlib-agent bugs 45, 50): calling a C function through its
+// address. `addr as fn(..)` makes a function value of a C function's
+// address (lower.fd: an env holding the marker `__fid_c_fnptr` and the
+// address); a call through it calls the address with the call's own C
+// types (codegen_c.fd, CallPtr). The address here is the C adapter of a
+// Fides function handed to C, which memmove (n = 0) gives back.
+// Needs native FFI: `fid ccompile` only (the interpreter cannot call
+// machine code, and stops with a message saying so).
+// Expected output:
+// 7
+// 12
+// 5
+
+extern "C" include "<string.h>" {
+    fn memmove as c_give_back2(dst: fn(i64, i64) -> i64, src: *u8, n: i64) -> *u8;
+    fn memmove as c_give_back1(dst: fn(i64) -> i64, src: *u8, n: i64) -> *u8;
+}
+
+fn add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn mul(a: i64, b: i64) -> i64 {
+    return a * b;
+}
+
+fn half(a: i64) -> i64 {
+    return a / 2;
+}
+
+fn call2(f: fn(i64, i64) -> i64, a: i64, b: i64) -> i64 {
+    return f(a, b);
+}
+
+@unsafe
+fn main() {
+    val scratch: *u8 = p_malloc(8);
+    val a_add: *u8 = c_give_back2(add, scratch, 0);
+    val f = a_add as fn(i64, i64) -> i64;
+    println(f(3, 4));
+    val a_mul: *u8 = c_give_back2(mul, scratch, 0);
+    println(call2(a_mul as fn(i64, i64) -> i64, 3, 4));
+    val a_half: *u8 = c_give_back1(half, scratch, 0);
+    val h: fn(i64) -> i64 = a_half as fn(i64) -> i64;
+    println(h(10));
+    p_free(scratch);
+}

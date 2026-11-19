@@ -1,0 +1,40 @@
+OP24 (competitive roadmap): range facts per block, Nov 17
+==========================================================
+
+compiler/checks.fd, range analysis (peir_range_ops / peir_range_scan).
+
+Before: the scan carried one fact per block (r.ref_*); a fact on a plain
+local reached the blocks its block dominates (PeirDomFacts e_loc, rangedom);
+loop headers got one assumed fact over the back edge (LF8, PeirBackFacts).
+A fact on a value (a parameter, any computed value) held in its own block
+only, and a multiply was unchecked only with |operands| < 2^31.
+
+Now (FID_IROPT_OFF=rangedom turns the new facts off with the old ones):
+
+- A fact set per block. PeirDomFacts.fv_* chains facts on values per
+  block: the edge's fact on a value at the block's entry, and what a call
+  in it that returned implies. peir_dom_enter puts every fact of the
+  blocks that strictly dominate a block into r.cf_* when the scan enters
+  it (at most 32), and peir_rng_get_lo/hi intersect them with the value's
+  own range. Sound because a value never changes once computed and every
+  dominating block ran to its end before the block was entered (and a
+  redefinition of the value on the way back re-enters the fact's block).
+- A second fact on a local per block entry (e_loc2): a loop header's
+  assumed fact (LF8) when the edge's fact took the first slot.
+- Vec_filled_typed(n, ..) that returned: n <= 2^48 from there on (core
+  checks n * size and panics "out of memory"; the same bound lengths
+  already have).
+- peir_mul_fits: a multiply is unchecked when its four corner products fit
+  in i64 (3037000499 * 3037000499 does).
+
+Effect on the sieve (tests/bootstrap/test_opt_range_dom.fd, n a
+parameter): `Vec::filled(n, 1)` bounds n, `p * p < n` then bounds p by
+2^24 - 1 in the body, p by 2^24 at the header (loop-carried, through the
+self-step bound), m below 2^48 under `m < n`: both `p * p`, `m + p` and
+`p + 1` lose their overflow checks; the count's add keeps its check and
+the five bounds checks stay (p < n is a relation, not a range).
+
+Tests: tests/bootstrap/test_opt_range_facts.fd (+ _fail, and
+test_opt_range_filled_fail.fd), tests/tooling/range-dom-check.sh.
+Not built or validated when written; see the validation steps in the
+run's report.

@@ -85,6 +85,12 @@ impl SQLString {
 
 /// Create a SQLString from a literal query string.
 /// This is the safe constructor — only use with static query text.
+///
+/// Example:
+///   val q = sql_bind(sql_query("SELECT * FROM t WHERE name = '?'"), "O'Brien");
+///   assert_eq(q.raw(), "SELECT * FROM t WHERE name = 'O''Brien'");
+///   assert_eq(sql_bind_int(sql_query("LIMIT ?"), 10).raw(), "LIMIT 10");
+///   assert_eq(sql_escape("it's").raw(), "it''s");
 pub fn sql_query(sql: str) -> SQLString {
     return SQLString {
         value: sql
@@ -108,22 +114,62 @@ pub fn sql_escape(input: str) -> SQLString {
     };
 }
 
-/// Bind a parameter into a SQL query. Replaces the first `?` placeholder
-/// with the string-escaped value. Returns a new SQLString.
-/// This is the safe way to include user input in SQL queries.
+/// Is the byte before position `upto` inside a single-quoted SQL string
+/// literal? Scans the query tracking `'` state; a `''` pair inside a
+/// literal is an escaped quote, not a boundary.
+fn sql_in_quote(q: str, upto: i64) -> bool {
+    var inq: bool = false;
+    var i: i64 = 0;
+    while i < upto {
+        if str_byte_at(q, i) == 39 {
+            if inq && i + 1 < upto && str_byte_at(q, i + 1) == 39 {
+                i = i + 1;
+            } else {
+                inq = !inq;
+            }
+        }
+        i = i + 1;
+    }
+    return inq;
+}
+
+/// Bind a string parameter into a SQL query. Replaces the FIRST `?`
+/// placeholder (further `?`s stay for later binds — str_replace would
+/// have bound them all to this one value). The value is single-quote
+/// escaped; a `?` sitting inside a quoted literal (the recommended
+/// `WHERE x = '?'` form) gets the escaped text, a bare `?` gets the
+/// escaped text wrapped in quotes — either way the parameter can never
+/// break out into query syntax.
 pub fn sql_bind(query: SQLString, param: str) -> SQLString {
-    var escaped = str_replace(param, "'", "''");
-    var result = str_replace(query.value, "?", escaped);
+    var escaped: str = str_replace(param, "'", "''");
+    var q: str = query.value;
+    var idx: i64 = str_find(q, "?");
+    if idx < 0 {
+        return SQLString {
+            value: q
+        };
+    }
+    var ins: str = escaped;
+    if !sql_in_quote(q, idx) {
+        ins = "'" + escaped + "'";
+    }
     return SQLString {
-        value: result
+        value: str_slice(q, 0, idx) + ins + str_slice(q, idx + 1, str_len(q))
     };
 }
 
-/// Bind an integer parameter into a SQL query.
+/// Bind an integer parameter into a SQL query. Replaces the first `?`
+/// placeholder; integers need no quoting.
 pub fn sql_bind_int(query: SQLString, param: i64) -> SQLString {
-    var result = str_replace(query.value, "?", p_to_str(param));
+    var q: str = query.value;
+    var idx: i64 = str_find(q, "?");
+    if idx < 0 {
+        return SQLString {
+            value: q
+        };
+    }
     return SQLString {
-        value: result
+        value: str_slice(q, 0, idx) + p_to_str(param) + str_slice(q, idx + 1, str_len(q))
     };
 }
 

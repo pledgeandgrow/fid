@@ -1,0 +1,473 @@
+// Fides deep links: routing, universal links / app links files, intent filters
+//
+// All of this is real, portable logic. The platform hands the app the
+// URL it was opened with (Android: Intent.getData() through jni.fd; iOS:
+// application:openURL:options: or the NSUserActivity webpageURL through
+// objc.fd) and this module does the rest:
+//   - URL parsing (scheme, host, port, path segments, query, fragment)
+//     with percent-decoding
+//   - route patterns: custom schemes ("myapp://product/:id") and https
+//     links ("https://example.com/users/:user/posts/:post", "*.example.com"
+//     hosts, a trailing "*rest" segment); the most specific match wins
+//     (static segments beat parameters beat the tail wildcard); path and
+//     query parameters come back decoded; links are built back from a
+//     route and parameters
+//   - apple-app-site-association (applinks "components" of iOS 13+, with
+//     excludes, and webcredentials)
+//   - Digital Asset Links assetlinks.json with normalized SHA-256 signing
+//     certificate fingerprints
+//   - Android <intent-filter> XML for the routes (autoVerify for https,
+//     pathPrefix / pathPattern with escaped dots)
+
+module deep_link;
+use vec;
+use string;
+use encoding;
+
+// ─── URLs ──────────────────────────────────────────────────────────────
+
+pub struct DlUrl {
+    pub ok: bool,
+    pub scheme: str,       // lower case
+    pub host: str,         // lower case
+    pub port: i64,         // -1 when absent
+    pub segments: Vec<str>,  // decoded path segments
+    pub query_keys: Vec<str>,
+    pub query_vals: Vec<str>,
+    pub fragment: str,
+}
+
+fn dl_bad() -> DlUrl {
+    return DlUrl { ok: false, scheme: "", host: "", port: -1, segments: Vec::new(), query_keys: Vec::new(), query_vals: Vec::new(), fragment: "" };
+}
+
+/// Split a path into decoded, non-empty segments.
+pub fn dl_segments(path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val parts: Vec<str> = str_split(path, "/");
+    var i: i64 = 0;
+    while i < parts.len() {
+        if str_len(parts.get(i)) > 0 { out.push(url_decode(parts.get(i))); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse "scheme://host[:port]/path?query#fragment" (also "scheme:/path"
+/// and "scheme:path" with an empty host).
+pub fn dl_parse(url: str) -> DlUrl {
+    val colon: i64 = str_find(url, ":");
+    if colon <= 0 { return dl_bad(); }
+    val scheme: str = str_to_lower(str_slice(url, 0, colon));
+    var i: i64 = 0;
+    while i < str_len(scheme) {
+        val c: i64 = str_byte_at(scheme, i);
+        if !(char_is_alpha(c) || (i > 0 && (char_is_digit(c) || c == 43 || c == 45 || c == 46))) { return dl_bad(); }
+        i = i + 1;
+    }
+    var rest: str = str_slice(url, colon + 1, str_len(url));
+    var r: DlUrl = dl_bad();
+    r.ok = true;
+    r.scheme = scheme;
+    val hash: i64 = str_find(rest, "#");
+    if hash >= 0 {
+        r.fragment = url_decode(str_slice(rest, hash + 1, str_len(rest)));
+        rest = str_slice(rest, 0, hash);
+    }
+    val q: i64 = str_find(rest, "?");
+    if q >= 0 {
+        val qs: str = str_slice(rest, q + 1, str_len(rest));
+        rest = str_slice(rest, 0, q);
+        val pairs: Vec<str> = str_split(qs, "&");
+        var k: i64 = 0;
+        while k < pairs.len() {
+            val pr: str = pairs.get(k);
+            if str_len(pr) > 0 {
+                val eq: i64 = str_find(pr, "=");
+                if eq >= 0 {
+                    r.query_keys.push(url_decode_form(str_slice(pr, 0, eq)));
+                    r.query_vals.push(url_decode_form(str_slice(pr, eq + 1, str_len(pr))));
+                } else {
+                    r.query_keys.push(url_decode_form(pr));
+                    r.query_vals.push("");
+                }
+            }
+            k = k + 1;
+        }
+    }
+    var path: str = rest;
+    if str_starts_with(rest, "//") {
+        val after: str = str_slice(rest, 2, str_len(rest));
+        val slash: i64 = str_find(after, "/");
+        var auth: str = if slash >= 0 { str_slice(after, 0, slash) } else { after };
+        path = if slash >= 0 { str_slice(after, slash, str_len(after)) } else { "" };
+        val at: i64 = str_rfind(auth, "@");
+        if at >= 0 { auth = str_slice(auth, at + 1, str_len(auth)); }
+        val pc: i64 = str_rfind(auth, ":");
+        if pc >= 0 && !str_contains(auth, "]") || (pc >= 0 && str_rfind(auth, "]") < pc) {
+            val ps: str = str_slice(auth, pc + 1, str_len(auth));
+            if str_len(ps) > 0 {
+                if !str_is_numeric(ps) { return dl_bad(); }
+                r.port = str_parse_int(ps);
+            }
+            auth = str_slice(auth, 0, pc);
+        }
+        r.host = str_to_lower(auth);
+    }
+    r.segments = dl_segments(path);
+    return r;
+}
+
+/// The value of a query parameter ("" when absent).
+pub fn dl_query(u: &DlUrl, key: str) -> str {
+    var i: i64 = 0;
+    while i < u.query_keys.len() {
+        if u.query_keys.get(i) == key { return u.query_vals.get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Routes ────────────────────────────────────────────────────────────
+
+pub struct DlRoute {
+    pub name: str,
+    pub scheme: str,
+    pub host: str,           // "" any for custom schemes; "*.x.com" subdomains
+    pub parts: Vec<str>,     // literal, ":name" or "*name" (last only)
+    pub exclude: bool,       // a path the app must not open (AASA exclude)
+}
+
+pub struct DlRouter {
+    pub routes: Vec<DlRoute>,
+    pub errors: Vec<str>,
+}
+
+pub fn dl_router_new() -> DlRouter { return DlRouter { routes: Vec::new(), errors: Vec::new() }; }
+
+/// Add a route from a pattern URL; false (and an error recorded) when the
+/// pattern is malformed.
+pub fn dl_add(r: &mut DlRouter, name: str, pattern: str) -> bool {
+    return dl_add_ex(r, name, pattern, false);
+}
+
+/// Add a path the app must not handle (listed as excluded in the AASA).
+pub fn dl_exclude(r: &mut DlRouter, pattern: str) -> bool {
+    return dl_add_ex(r, "", pattern, true);
+}
+
+fn dl_add_ex(r: &mut DlRouter, name: str, pattern: str, exclude: bool) -> bool {
+    val u: DlUrl = dl_parse(pattern);
+    if !u.ok { r.errors.push("bad pattern " + pattern); return false; }
+    var i: i64 = 0;
+    while i < u.segments.len() {
+        val s: str = u.segments.get(i);
+        if str_starts_with(s, "*") && i != u.segments.len() - 1 {
+            r.errors.push(pattern + ": * only as the last segment");
+            return false;
+        }
+        if (str_starts_with(s, ":") || str_starts_with(s, "*")) && str_len(s) < 2 {
+            r.errors.push(pattern + ": parameter needs a name");
+            return false;
+        }
+        i = i + 1;
+    }
+    r.routes.push(DlRoute { name: name, scheme: u.scheme, host: u.host, parts: u.segments, exclude: exclude });
+    return true;
+}
+
+fn dl_host_matches(pattern: str, host: str) -> bool {
+    if str_len(pattern) == 0 { return true; }
+    if str_starts_with(pattern, "*.") {
+        val base: str = str_slice(pattern, 1, str_len(pattern));   // ".x.com"
+        return str_ends_with(host, base) && str_len(host) > str_len(base);
+    }
+    return pattern == host;
+}
+
+/// A match: the route's name and its parameters (path, then query).
+pub struct DlMatch {
+    pub ok: bool,
+    pub name: str,
+    pub keys: Vec<str>,
+    pub vals: Vec<str>,
+    pub score: i64,
+}
+
+fn dl_no_match() -> DlMatch { return DlMatch { ok: false, name: "", keys: Vec::new(), vals: Vec::new(), score: -1 }; }
+
+fn dl_try(rt: &DlRoute, u: &DlUrl) -> DlMatch {
+    if rt.scheme != u.scheme { return dl_no_match(); }
+    if !dl_host_matches(rt.host, u.host) { return dl_no_match(); }
+    var m: DlMatch = dl_no_match();
+    var score: i64 = 0;
+    if str_len(rt.host) > 0 && !str_starts_with(rt.host, "*.") { score = score + 1; }
+    var i: i64 = 0;
+    while i < rt.parts.len() {
+        val p: str = rt.parts.get(i);
+        if str_starts_with(p, "*") {
+            var tail: str = "";
+            var k: i64 = i;
+            while k < u.segments.len() {
+                if k > i { tail = tail + "/"; }
+                tail = tail + u.segments.get(k);
+                k = k + 1;
+            }
+            m.keys.push(str_slice(p, 1, str_len(p)));
+            m.vals.push(tail);
+            m.ok = true;
+            m.name = rt.name;
+            m.score = score;
+            return m;
+        }
+        if i >= u.segments.len() { return dl_no_match(); }
+        if str_starts_with(p, ":") {
+            m.keys.push(str_slice(p, 1, str_len(p)));
+            m.vals.push(u.segments.get(i));
+            score = score + 10;
+        } else {
+            if p != u.segments.get(i) { return dl_no_match(); }
+            score = score + 100;
+        }
+        i = i + 1;
+    }
+    if u.segments.len() != rt.parts.len() { return dl_no_match(); }
+    m.ok = true;
+    m.name = rt.name;
+    m.score = score + 1000;   // full matches beat any tail wildcard
+    return m;
+}
+
+/// Route a URL: the best match (excluded paths never match), with the
+/// query parameters appended after the path parameters.
+pub fn dl_route(r: &DlRouter, url: str) -> DlMatch {
+    val u: DlUrl = dl_parse(url);
+    if !u.ok { return dl_no_match(); }
+    var best: DlMatch = dl_no_match();
+    var best_excluded: bool = false;
+    var i: i64 = 0;
+    while i < r.routes.len() {
+        val rt: DlRoute = r.routes.get(i);
+        val m: DlMatch = dl_try(&rt, &u);
+        if m.ok && m.score > best.score {
+            best = m;
+            best_excluded = rt.exclude;
+        }
+        i = i + 1;
+    }
+    if !best.ok || best_excluded { return dl_no_match(); }
+    i = 0;
+    while i < u.query_keys.len() {
+        best.keys.push(u.query_keys.get(i));
+        best.vals.push(u.query_vals.get(i));
+        i = i + 1;
+    }
+    return best;
+}
+
+/// A parameter of a match ("" when absent).
+pub fn dl_param(m: &DlMatch, key: str) -> str {
+    var i: i64 = 0;
+    while i < m.keys.len() {
+        if m.keys.get(i) == key { return m.vals.get(i); }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Build the URL of a route from parameters (keys / vals); parameters the
+/// path does not use become the query. "" when the route is unknown or a
+/// path parameter is missing.
+pub fn dl_build(r: &DlRouter, name: str, keys: Vec<str>, vals: Vec<str>) -> str {
+    var i: i64 = 0;
+    while i < r.routes.len() {
+        val rt: DlRoute = r.routes.get(i);
+        if rt.name == name && !rt.exclude {
+            var used: Vec<bool> = Vec::new();
+            var k: i64 = 0;
+            while k < keys.len() { used.push(false); k = k + 1; }
+            var out: str = rt.scheme + "://" + rt.host;
+            var j: i64 = 0;
+            while j < rt.parts.len() {
+                val p: str = rt.parts.get(j);
+                if str_starts_with(p, ":") || str_starts_with(p, "*") {
+                    val pn: str = str_slice(p, 1, str_len(p));
+                    var found: i64 = -1;
+                    k = 0;
+                    while k < keys.len() { if keys.get(k) == pn { found = k; } k = k + 1; }
+                    if found < 0 { return ""; }
+                    used.set(found, true);
+                    if str_starts_with(p, "*") {
+                        val sub: Vec<str> = str_split(vals.get(found), "/");
+                        var t: i64 = 0;
+                        while t < sub.len() { out = out + "/" + url_encode_component(sub.get(t)); t = t + 1; }
+                    } else {
+                        out = out + "/" + url_encode_component(vals.get(found));
+                    }
+                } else {
+                    out = out + "/" + url_encode_component(p);
+                }
+                j = j + 1;
+            }
+            var q: str = "";
+            k = 0;
+            while k < keys.len() {
+                if !used.get(k) {
+                    q = q + (if str_len(q) == 0 { "?" } else { "&" }) + url_encode_component(keys.get(k)) + "=" + url_encode_component(vals.get(k));
+                }
+                k = k + 1;
+            }
+            return out + q;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── apple-app-site-association ────────────────────────────────────────
+
+fn dl_json_str(s: str) -> str {
+    return "\"" + str_replace(str_replace(s, "\\", "\\\\"), "\"", "\\\"") + "\"";
+}
+
+/// The AASA path pattern of a route: parameters become "*" (one
+/// segment: "?" patterns cannot say that, "*" is what Apple documents).
+pub fn dl_aasa_path(rt: &DlRoute) -> str {
+    var p: str = "";
+    var i: i64 = 0;
+    while i < rt.parts.len() {
+        val s: str = rt.parts.get(i);
+        if str_starts_with(s, ":") || str_starts_with(s, "*") { p = p + "/*"; }
+        else { p = p + "/" + s; }
+        i = i + 1;
+    }
+    if str_len(p) == 0 { p = "/"; }
+    return p;
+}
+
+/// The apple-app-site-association file for the https routes on `host`:
+/// excluded paths first (the first matching component wins).
+pub fn dl_aasa(r: &DlRouter, app_ids: Vec<str>, host: str) -> str {
+    var ids: str = "[";
+    var i: i64 = 0;
+    while i < app_ids.len() {
+        if i > 0 { ids = ids + ","; }
+        ids = ids + dl_json_str(app_ids.get(i));
+        i = i + 1;
+    }
+    ids = ids + "]";
+    var comps: Vec<str> = Vec::new();
+    var pass: i64 = 0;
+    while pass < 2 {
+        i = 0;
+        while i < r.routes.len() {
+            val rt: DlRoute = r.routes.get(i);
+            if rt.scheme == "https" && dl_host_matches(rt.host, host) && (rt.exclude == (pass == 0)) {
+                var c: str = "{\"/\":" + dl_json_str(dl_aasa_path(&rt));
+                if rt.exclude { c = c + ",\"exclude\":true"; }
+                else { c = c + ",\"comment\":" + dl_json_str(rt.name); }
+                comps.push(c + "}");
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    var cs: str = "";
+    i = 0;
+    while i < comps.len() {
+        if i > 0 { cs = cs + ","; }
+        cs = cs + comps.get(i);
+        i = i + 1;
+    }
+    return "{\"applinks\":{\"details\":[{\"appIDs\":" + ids + ",\"components\":[" + cs + "]}]},\"webcredentials\":{\"apps\":" + ids + "}}";
+}
+
+// ─── assetlinks.json ───────────────────────────────────────────────────
+
+/// A SHA-256 certificate fingerprint as assetlinks wants it: 32 bytes,
+/// upper-case hex, colon separated ("" when not 32 bytes of hex).
+pub fn dl_fingerprint(fp: str) -> str {
+    val clean: str = str_to_upper(str_replace(str_replace(str_trim(fp), ":", ""), " ", ""));
+    if str_len(clean) != 64 || !hex_valid(clean) { return ""; }
+    var out: str = "";
+    var i: i64 = 0;
+    while i < 64 {
+        if i > 0 { out = out + ":"; }
+        out = out + str_slice(clean, i, i + 2);
+        i = i + 2;
+    }
+    return out;
+}
+
+/// The assetlinks.json statement list for one package; "" when a
+/// fingerprint is malformed.
+pub fn dl_assetlinks(package: str, fingerprints: Vec<str>) -> str {
+    var fps: str = "";
+    var i: i64 = 0;
+    while i < fingerprints.len() {
+        val f: str = dl_fingerprint(fingerprints.get(i));
+        if str_len(f) == 0 { return ""; }
+        if i > 0 { fps = fps + ","; }
+        fps = fps + dl_json_str(f);
+        i = i + 1;
+    }
+    return "[{\"relation\":[\"delegate_permission/common.handle_all_urls\"],\"target\":{\"namespace\":\"android_app\",\"package_name\":"
+        + dl_json_str(package) + ",\"sha256_cert_fingerprints\":[" + fps + "]}}]";
+}
+
+// ─── Android intent filters ────────────────────────────────────────────
+
+fn dl_xml_attr(s: str) -> str {
+    return str_replace(str_replace(str_replace(str_replace(s, "&", "&amp;"), "\"", "&quot;"), "<", "&lt;"), ">", "&gt;");
+}
+
+/// The <data> path attribute of a route: pathPrefix when only the tail is
+/// open, pathPattern (".*" per parameter, literal dots escaped) when a
+/// parameter is in the middle, path when it is all literal.
+pub fn dl_android_path_attr(rt: &DlRoute) -> str {
+    var has_param: bool = false;
+    var only_tail: bool = true;
+    var lit: str = "";
+    var pat: str = "";
+    var i: i64 = 0;
+    while i < rt.parts.len() {
+        val s: str = rt.parts.get(i);
+        if str_starts_with(s, ":") {
+            has_param = true;
+            only_tail = false;
+            pat = pat + "/.*";
+        } else if str_starts_with(s, "*") {
+            has_param = true;
+            pat = pat + "/.*";
+        } else {
+            lit = lit + "/" + s;
+            pat = pat + "/" + str_replace(s, ".", "\\\\.");
+        }
+        i = i + 1;
+    }
+    if !has_param { return "android:path=\"" + dl_xml_attr(if str_len(lit) == 0 { "/" } else { lit }) + "\""; }
+    if only_tail { return "android:pathPrefix=\"" + dl_xml_attr(lit + "/") + "\""; }
+    return "android:pathPattern=\"" + dl_xml_attr(pat) + "\"";
+}
+
+/// One <intent-filter> per route (excluded routes are left out).
+pub fn dl_intent_filters(r: &DlRouter) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < r.routes.len() {
+        val rt: DlRoute = r.routes.get(i);
+        if !rt.exclude {
+            val web: bool = rt.scheme == "https" || rt.scheme == "http";
+            out = out + "<intent-filter" + (if web { " android:autoVerify=\"true\"" } else { "" }) + ">\n";
+            out = out + "    <action android:name=\"android.intent.action.VIEW\" />\n";
+            out = out + "    <category android:name=\"android.intent.category.DEFAULT\" />\n";
+            out = out + "    <category android:name=\"android.intent.category.BROWSABLE\" />\n";
+            out = out + "    <data android:scheme=\"" + dl_xml_attr(rt.scheme) + "\" />\n";
+            if str_len(rt.host) > 0 { out = out + "    <data android:host=\"" + dl_xml_attr(rt.host) + "\" />\n"; }
+            if rt.parts.len() > 0 { out = out + "    <data " + dl_android_path_attr(&rt) + " />\n"; }
+            out = out + "</intent-filter>\n";
+        }
+        i = i + 1;
+    }
+    return out;
+}

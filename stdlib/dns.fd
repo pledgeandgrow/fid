@@ -414,7 +414,7 @@ pub fn dns_resolve_v6(hostname: str) -> Vec<str> {
 // by shelling out to nslookup (Windows/Unix) or getent (glibc). Output
 // is parsed for the first IPv4 answer.
 
-use os; use fs; use io;
+use fs; use io; use os;
 // Parse dotted quads out of an nslookup/getent text block. Works across
 // locales: collects every IPv4-looking token except the resolver's own
 // address (the "Server:"/"Serveur :" header and its "Address:" line).
@@ -485,10 +485,44 @@ fn dns_looks_ipv4(s: str) -> bool {
     return true;
 }
 
+/// Is `hostname` safe to pass to a shell resolver command? Only the DNS
+/// alphabet is allowed: letters, digits, '.', '-', '_' and ':' (IPv6
+/// literals). Anything else (spaces, ';', '&', '$', quotes, ...) makes
+/// the name unsafe and the lookup returns "".
+pub fn dns_hostname_safe(hostname: str) -> bool {
+    var n: i64 = str_len(hostname);
+    if n == 0 || n > 253 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(hostname, i);
+        var ok: bool = false;
+        if c >= 97 && c <= 122 {
+            ok = true;
+        } else if c >= 65 && c <= 90 {
+            ok = true;
+        } else if c >= 48 && c <= 57 {
+            ok = true;
+        } else if c == 46 || c == 45 || c == 95 || c == 58 {
+            ok = true;
+        }
+        if !ok {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 /// Resolve via the OS resolver: nslookup on Windows, getent on Unix.
 /// Returns first IPv4 address or "" on failure. Slower than a wire query
-/// (process spawn) but needs no socket FFI.
+/// (process spawn) but needs no socket FFI. Names outside the DNS
+/// alphabet are rejected before the command is built (shell injection).
 pub fn dns_resolve_system(hostname: str) -> str {
+    if !dns_hostname_safe(hostname) {
+        return "";
+    }
     var tmp: str = "fides_dns_tmp.txt";
     var cmd: str = "";
     if str_equal(os_name(), "windows") {

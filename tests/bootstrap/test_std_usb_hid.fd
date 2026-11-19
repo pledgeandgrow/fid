@@ -1,0 +1,116 @@
+// stdlib/usb_hid: the HID 1.11 Appendix B boot keyboard and mouse report descriptors, a report-ID consumer descriptor, boot reports and class requests.
+// Expected output:
+// kbd: 63 bytes, 5 fields, error '', app 0x10006, input 8 bytes output 1 byte
+// kbd field 0: in page 7 usages 0xe0-0xe7 off 0 size 1 count 8 flags 0x2
+// kbd field 2: out page 8 usages 0x80001-0x80005 off 0 size 1 count 5
+// kbd field 4: in off 16 size 8 count 6 range 0-101 array true
+// mouse: 50 bytes, 3 fields, app 0x10002, input 3 bytes, xy collection 0x10001
+// mouse values button1 1 button2 0 x -5 y 10 wheel -999
+// consumer: ids true [2] report 3 bytes, volume-up 233 found 0
+// type 'AB' pressed 4,5
+// release 4 text ''
+// caps leds changed true leds 2
+// '1' pressed 30 released 57
+// caps 'A'
+// rollover changed false pressed 0
+// ctrl-c 3, led report 2
+// ascii '_' 95 enter 10 '?' 63 esc 27
+// boot mouse buttons 5 dx 16 dy -16 wheel -1
+// set_protocol 210b000000000000
+// set_idle 210a000001000000
+// get report descriptor 810600220000 3f00
+// set_report 2109000200000100
+// config: found true bcd 0x111 country 0 report 63 iface 0 boot 1 protocol 1
+use usb_hid;
+use vec;
+use string;
+use encoding;
+
+fn h(v: i64) -> str {
+    return "0x" + int_to_hex(v);
+}
+
+fn bytes(s: str) -> Vec<i64> {
+    return hex_decode_bytes(str_replace(s, " ", ""));
+}
+
+fn rep(a: i64, b: i64, c: i64, d: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    r.push(a);
+    r.push(0);
+    r.push(b);
+    r.push(c);
+    r.push(d);
+    r.push(0);
+    r.push(0);
+    r.push(0);
+    return r;
+}
+
+fn main() {
+    val kd: Vec<i64> = bytes("05 01 09 06 A1 01 05 07 19 E0 29 E7 15 00 25 01 75 01 95 08 81 02 95 01 75 08 81 01 95 05 75 01 05 08 19 01 29 05 91 02 95 01 75 03 91 01 95 06 75 08 15 00 25 65 05 07 19 00 29 65 81 00 C0");
+    val k: HidDescriptor = hid_parse(kd);
+    println("kbd: " + int_to_str(kd.len()) + " bytes, " + int_to_str(k.fields.len()) + " fields, error '" + k.error + "', app " + h(k.collections.get(0)) + ", input " + int_to_str(hid_report_bytes(&k, 0, HID_INPUT)) + " bytes output " + int_to_str(hid_report_bytes(&k, 0, HID_OUTPUT)) + " byte");
+    val f0: HidField = k.fields.get(0);
+    println("kbd field 0: in page " + int_to_str(f0.usage_page) + " usages " + h(f0.usage_min & 0xFFFF) + "-" + h(f0.usage_max & 0xFFFF) + " off " + int_to_str(f0.bit_offset) + " size " + int_to_str(f0.size) + " count " + int_to_str(f0.count) + " flags " + h(f0.flags));
+    val f2: HidField = k.fields.get(2);
+    println("kbd field 2: out page " + int_to_str(f2.usage_page) + " usages " + h(f2.usage_min) + "-" + h(f2.usage_max) + " off " + int_to_str(f2.bit_offset) + " size " + int_to_str(f2.size) + " count " + int_to_str(f2.count));
+    val f4: HidField = k.fields.get(4);
+    println("kbd field 4: in off " + int_to_str(f4.bit_offset) + " size " + int_to_str(f4.size) + " count " + int_to_str(f4.count) + " range " + int_to_str(f4.logical_min) + "-" + int_to_str(f4.logical_max) + " array " + bool_to_str((f4.flags & HID_VARIABLE) == 0));
+
+    val md: Vec<i64> = bytes("05 01 09 02 A1 01 09 01 A1 00 05 09 19 01 29 03 15 00 25 01 95 03 75 01 81 02 95 01 75 05 81 01 05 01 09 30 09 31 15 81 25 7F 75 08 95 02 81 06 C0 C0");
+    val m: HidDescriptor = hid_parse(md);
+    val fxy: HidField = m.fields.get(hid_find(&m, HID_INPUT, 0x10030));
+    println("mouse: " + int_to_str(md.len()) + " bytes, " + int_to_str(m.fields.len()) + " fields, app " + h(m.collections.get(0)) + ", input " + int_to_str(hid_report_bytes(&m, 0, HID_INPUT)) + " bytes, xy collection " + h(fxy.collection));
+    var mr: Vec<i64> = Vec::new();
+    mr.push(0x01);
+    mr.push(0xFB);
+    mr.push(0x0A);
+    println("mouse values button1 " + int_to_str(hid_usage_value(&m, mr, 0x90001, -999)) + " button2 " + int_to_str(hid_usage_value(&m, mr, 0x90002, -999)) + " x " + int_to_str(hid_usage_value(&m, mr, 0x10030, -999)) + " y " + int_to_str(hid_usage_value(&m, mr, 0x10031, -999)) + " wheel " + int_to_str(hid_usage_value(&m, mr, 0x10038, -999)));
+
+    val cd: Vec<i64> = bytes("05 0C 09 01 A1 01 85 02 15 00 26 FF 03 19 00 2A FF 03 75 10 95 01 81 00 C0");
+    val c: HidDescriptor = hid_parse(cd);
+    var cr: Vec<i64> = Vec::new();
+    cr.push(0x02);
+    cr.push(0xE9);
+    cr.push(0x00);
+    val cf: i64 = hid_find(&c, HID_INPUT, 0xC00E9);
+    val cfield: HidField = c.fields.get(cf);
+    println("consumer: ids " + bool_to_str(c.uses_ids) + " [" + str_join_ints(c.report_ids, ",") + "] report " + int_to_str(hid_report_bytes(&c, 2, HID_INPUT)) + " bytes, volume-up " + int_to_str(hid_field_value(&c, &cfield, cr, 0)) + " found " + int_to_str(cf));
+
+    var ks: KeyboardState = hid_kbd_state_new();
+    hid_kbd_update(&mut ks, rep(0x02, 0x04, 0x05, 0));
+    println("type '" + str_from_bytes(ks.text) + "' pressed " + str_join_ints(ks.pressed, ","));
+    hid_kbd_update(&mut ks, rep(0x00, 0x05, 0, 0));
+    println("release " + str_join_ints(ks.released, ",") + " text '" + str_from_bytes(ks.text) + "'");
+    val ch: bool = hid_kbd_update(&mut ks, rep(0x00, 0x39, 0x05, 0));
+    println("caps leds changed " + bool_to_str(ch) + " leds " + int_to_str(ks.leds));
+    hid_kbd_update(&mut ks, rep(0x00, 0x05, 0x1E, 0));
+    println("'" + str_from_bytes(ks.text) + "' pressed " + str_join_ints(ks.pressed, ",") + " released " + str_join_ints(ks.released, ","));
+    hid_kbd_update(&mut ks, rep(0x00, 0x04, 0, 0));
+    println("caps '" + str_from_bytes(ks.text) + "'");
+    var ro: Vec<i64> = rep(0x00, 1, 1, 1);
+    ro.set(5, 1);
+    ro.set(6, 1);
+    ro.set(7, 1);
+    val rc: bool = hid_kbd_update(&mut ks, ro);
+    println("rollover changed " + bool_to_str(rc) + " pressed " + int_to_str(ks.pressed.len()));
+    hid_kbd_update(&mut ks, rep(HID_MOD_LCTRL, 0x06, 0, 0));
+    println("ctrl-c " + int_to_str(ks.text.get(0)) + ", led report " + int_to_str(hid_led_report(ks.leds).get(0)));
+    println("ascii '_' " + int_to_str(hid_key_ascii(0x2D, true)) + " enter " + int_to_str(hid_key_ascii(0x28, false)) + " '?' " + int_to_str(hid_key_ascii(0x38, true)) + " esc " + int_to_str(hid_key_ascii(0x29, false)));
+    var bm: Vec<i64> = Vec::new();
+    bm.push(0x05);
+    bm.push(0x10);
+    bm.push(0xF0);
+    bm.push(0xFF);
+    val mo: MouseReport = hid_mouse_decode(bm);
+    println("boot mouse buttons " + int_to_str(mo.buttons) + " dx " + int_to_str(mo.dx) + " dy " + int_to_str(mo.dy) + " wheel " + int_to_str(mo.wheel));
+    println("set_protocol " + hex_encode_bytes(hid_req_set_protocol(0, 0)));
+    println("set_idle " + hex_encode_bytes(hid_req_set_idle(1, 0, 0)));
+    val gd: str = hex_encode_bytes(hid_req_report_descriptor(0, 63));
+    println("get report descriptor " + str_slice(gd, 0, 12) + " " + str_slice(gd, 12, 16));
+    println("set_report " + hex_encode_bytes(hid_req_set_report(0, 2, 0, 1)));
+    val cfg: Vec<i64> = bytes("09 02 22 00 01 01 00 a0 32 09 04 00 00 01 03 01 01 00 09 21 11 01 00 01 22 3f 00 07 05 81 03 08 00 0a");
+    val hi: HidInfo = hid_find_in_config(cfg);
+    println("config: found " + bool_to_str(hi.found) + " bcd " + h(hi.bcd_hid) + " country " + int_to_str(hi.country) + " report " + int_to_str(hi.report_len) + " iface " + int_to_str(hi.iface) + " boot " + int_to_str(hi.subclass) + " protocol " + int_to_str(hi.protocol));
+}

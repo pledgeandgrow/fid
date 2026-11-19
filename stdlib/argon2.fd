@@ -1,0 +1,517 @@
+// Fides Argon2 (RFC 9106): the memory-hard password hash in its three
+// variants, Argon2d, Argon2i and Argon2id (version 0x13), with secret key
+// and associated data inputs, any number of lanes (computed one after the
+// other; the result is the same as a parallel run), the variable-length
+// hash H', and PHC-format strings ("$argon2id$v=19$m=...,t=...,p=...$salt$hash")
+// for storing and checking passwords. BLAKE2b (RFC 7693), which Argon2 is
+// built on, is written here too, with keyed hashing and any output length
+// from 1 to 64 bytes.
+//
+// Pure computation, no platform seam (the salt is the caller's random
+// bytes). 64-bit words are u64 inside @wrapping functions, as in
+// sha512.fd; memory is one Vec<i64> of 128 words per 1 KiB block, so
+// m_kib KiB of memory is m_kib * 128 Vec elements. Argon2i/id's address
+// generation and the indexing rules follow the reference implementation.
+//
+// Checked against RFC 9106 §5.1-5.3 (Argon2d, Argon2i, Argon2id with
+// m = 32 KiB, t = 3, p = 4, secret and associated data) and RFC 7693
+// Appendix A / Python's hashlib (BLAKE2b) in tests/bootstrap/test_std_argon2.fd.
+//
+// Usage:
+//   use argon2;
+//   val tag = argon2id(str_bytes(pw), salt16, 3, 65536, 4, 32);
+//   val phc = argon2_phc_hash(ARGON2_ID, str_bytes(pw), salt16, 3, 65536, 4, 32);
+//   val good = argon2_phc_verify(phc, str_bytes(attempt));
+
+module argon2;
+use vec;
+use string;
+use encoding;
+
+pub const ARGON2_D: i64 = 0;
+pub const ARGON2_I: i64 = 1;
+pub const ARGON2_ID: i64 = 2;
+
+// ─── BLAKE2b (RFC 7693) ────────────────────────────────────────────────
+
+fn b2_iv() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    b2_put(& mut v, 0x6a09e667f3bcc908); b2_put(& mut v, 0xbb67ae8584caa73b);
+    b2_put(& mut v, 0x3c6ef372fe94f82b); b2_put(& mut v, 0xa54ff53a5f1d36f1);
+    b2_put(& mut v, 0x510e527fade682d1); b2_put(& mut v, 0x9b05688c2b3e6c1f);
+    b2_put(& mut v, 0x1f83d9abfb41bd6b); b2_put(& mut v, 0x5be0cd19137e2179);
+    return v;
+}
+
+fn b2_put(v: & mut Vec<i64>, x: u64) {
+    v.push(x as i64);
+}
+
+fn b2_sigma() -> Vec<i64> {
+    val s: str = "0123456789abcdefea489fd61c02b753b8c052fdae3671947931dcbe265a40f8905724afe1bc683d2c6a0b834d75fe19c51fed4a0763928bdb7ec13950f4862a6fe9b308c2d714a5a2847615fb9e3cd0";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c >= 97 { out.push(c - 87); } else { out.push(c - 48); }
+        i = i + 1;
+    }
+    return out;
+}
+
+@wrapping fn b2_rotr(x: u64, n: u64) -> u64 {
+    return (x >> n) | (x << (64 - n));
+}
+
+@wrapping fn b2_g(v: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64, x: i64, y: i64) {
+    var va: u64 = v.get(a) as u64;
+    var vb: u64 = v.get(b) as u64;
+    var vc: u64 = v.get(c) as u64;
+    var vd: u64 = v.get(d) as u64;
+    va = va + vb + (x as u64);
+    vd = b2_rotr(vd ^ va, 32);
+    vc = vc + vd;
+    vb = b2_rotr(vb ^ vc, 24);
+    va = va + vb + (y as u64);
+    vd = b2_rotr(vd ^ va, 16);
+    vc = vc + vd;
+    vb = b2_rotr(vb ^ vc, 63);
+    v.set(a, va as i64);
+    v.set(b, vb as i64);
+    v.set(c, vc as i64);
+    v.set(d, vd as i64);
+}
+
+@wrapping fn b2_compress(h: & mut Vec<i64>, blk: & Vec<i64>, off: i64, t: i64, last: bool, sigma: & Vec<i64>) {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        var w: u64 = 0;
+        var j: i64 = 7;
+        while j >= 0 {
+            w = (w << 8) | ((blk.get(off + i * 8 + j) & 255) as u64);
+            j = j - 1;
+        }
+        m.push(w as i64);
+        i = i + 1;
+    }
+    val iv: Vec<i64> = b2_iv();
+    var v: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 { v.push(h.get(i)); i = i + 1; }
+    i = 0;
+    while i < 8 { v.push(iv.get(i)); i = i + 1; }
+    v.set(12, ((v.get(12) as u64) ^ (t as u64)) as i64);
+    if last { v.set(14, ((v.get(14) as u64) ^ ~(0 as u64)) as i64); }
+    var r: i64 = 0;
+    while r < 12 {
+        val s: i64 = (r % 10) * 16;
+        b2_g(& mut v, 0, 4, 8, 12, m.get(sigma.get(s)), m.get(sigma.get(s + 1)));
+        b2_g(& mut v, 1, 5, 9, 13, m.get(sigma.get(s + 2)), m.get(sigma.get(s + 3)));
+        b2_g(& mut v, 2, 6, 10, 14, m.get(sigma.get(s + 4)), m.get(sigma.get(s + 5)));
+        b2_g(& mut v, 3, 7, 11, 15, m.get(sigma.get(s + 6)), m.get(sigma.get(s + 7)));
+        b2_g(& mut v, 0, 5, 10, 15, m.get(sigma.get(s + 8)), m.get(sigma.get(s + 9)));
+        b2_g(& mut v, 1, 6, 11, 12, m.get(sigma.get(s + 10)), m.get(sigma.get(s + 11)));
+        b2_g(& mut v, 2, 7, 8, 13, m.get(sigma.get(s + 12)), m.get(sigma.get(s + 13)));
+        b2_g(& mut v, 3, 4, 9, 14, m.get(sigma.get(s + 14)), m.get(sigma.get(s + 15)));
+        r = r + 1;
+    }
+    i = 0;
+    while i < 8 {
+        h.set(i, ((h.get(i) as u64) ^ (v.get(i) as u64) ^ (v.get(i + 8) as u64)) as i64);
+        i = i + 1;
+    }
+}
+
+/// BLAKE2b with an output of `out_len` bytes (1..64) and an optional key
+/// (0..64 bytes; empty for the plain hash).
+pub fn blake2b(out_len: i64, key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    var h: Vec<i64> = b2_iv();
+    h.set(0, h.get(0) ^ (0x01010000 | (key.len() << 8) | out_len));
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    if key.len() > 0 {
+        while i < key.len() { data.push(key.get(i) & 255); i = i + 1; }
+        while data.len() < 128 { data.push(0); }
+    }
+    i = 0;
+    while i < msg.len() { data.push(msg.get(i) & 255); i = i + 1; }
+    val total: i64 = data.len();
+    if total == 0 { data.push(0); }
+    while data.len() % 128 != 0 { data.push(0); }
+    val sigma: Vec<i64> = b2_sigma();
+    var off: i64 = 0;
+    while off < data.len() {
+        val last: bool = off + 128 >= data.len();
+        var t: i64 = off + 128;
+        if last { t = total; }
+        b2_compress(& mut h, & data, off, t, last, & sigma);
+        off = off + 128;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < out_len {
+        out.push((h.get(i / 8) >> ((i % 8) * 8)) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// BLAKE2b-512 of bytes.
+pub fn blake2b_512(msg: Vec<i64>) -> Vec<i64> {
+    return blake2b(64, Vec::new(), msg);
+}
+
+// ─── Argon2 building blocks ────────────────────────────────────────────
+
+fn a2_le32(v: & mut Vec<i64>, x: i64) {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+    v.push((x >> 16) & 255);
+    v.push((x >> 24) & 255);
+}
+
+fn a2_append(v: & mut Vec<i64>, b: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() { v.push(b.get(i) & 255); i = i + 1; }
+}
+
+/// H' (RFC 9106 §3.3): a hash of any length T built from BLAKE2b.
+pub fn argon2_hprime(t_len: i64, input: Vec<i64>) -> Vec<i64> {
+    var a: Vec<i64> = Vec::new();
+    a2_le32(& mut a, t_len);
+    a2_append(& mut a, & input);
+    if t_len <= 64 { return blake2b(t_len, Vec::new(), a); }
+    val r: i64 = (t_len + 31) / 32 - 2;
+    var out: Vec<i64> = Vec::new();
+    var v: Vec<i64> = blake2b(64, Vec::new(), a);
+    var i: i64 = 1;
+    while i <= r {
+        var k: i64 = 0;
+        while k < 32 { out.push(v.get(k)); k = k + 1; }
+        if i < r { v = blake2b(64, Vec::new(), v); }
+        i = i + 1;
+    }
+    val last: Vec<i64> = blake2b(t_len - 32 * r, Vec::new(), v);
+    a2_append(& mut out, & last);
+    return out;
+}
+
+@wrapping fn a2_gb(v: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64) {
+    val m32: u64 = 0xffffffff;
+    var va: u64 = v.get(a) as u64;
+    var vb: u64 = v.get(b) as u64;
+    var vc: u64 = v.get(c) as u64;
+    var vd: u64 = v.get(d) as u64;
+    va = va + vb + 2 * (va & m32) * (vb & m32);
+    vd = b2_rotr(vd ^ va, 32);
+    vc = vc + vd + 2 * (vc & m32) * (vd & m32);
+    vb = b2_rotr(vb ^ vc, 24);
+    va = va + vb + 2 * (va & m32) * (vb & m32);
+    vd = b2_rotr(vd ^ va, 16);
+    vc = vc + vd + 2 * (vc & m32) * (vd & m32);
+    vb = b2_rotr(vb ^ vc, 63);
+    v.set(a, va as i64);
+    v.set(b, vb as i64);
+    v.set(c, vc as i64);
+    v.set(d, vd as i64);
+}
+
+/// The permutation P on 16 words of q, taken at idx[0..16].
+fn a2_p(q: & mut Vec<i64>, idx: & Vec<i64>) {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 { v.push(q.get(idx.get(i))); i = i + 1; }
+    a2_gb(& mut v, 0, 4, 8, 12);
+    a2_gb(& mut v, 1, 5, 9, 13);
+    a2_gb(& mut v, 2, 6, 10, 14);
+    a2_gb(& mut v, 3, 7, 11, 15);
+    a2_gb(& mut v, 0, 5, 10, 15);
+    a2_gb(& mut v, 1, 6, 11, 12);
+    a2_gb(& mut v, 2, 7, 8, 13);
+    a2_gb(& mut v, 3, 4, 9, 14);
+    i = 0;
+    while i < 16 { q.set(idx.get(i), v.get(i)); i = i + 1; }
+}
+
+/// Row and column index lists of the compression function.
+fn a2_lists() -> Vec<Vec<i64>> {
+    var all: Vec<Vec<i64>> = Vec::new();
+    var r: i64 = 0;
+    while r < 8 {
+        var row: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < 16 { row.push(16 * r + k); k = k + 1; }
+        all.push(row);
+        r = r + 1;
+    }
+    var c: i64 = 0;
+    while c < 8 {
+        var col: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < 8 {
+            col.push(2 * c + 16 * j);
+            col.push(2 * c + 1 + 16 * j);
+            j = j + 1;
+        }
+        all.push(col);
+        c = c + 1;
+    }
+    return all;
+}
+
+/// The compression function G(X, Y) on 1 KiB blocks (128 words each).
+fn a2_compress(x: & Vec<i64>, xo: i64, y: & Vec<i64>, yo: i64, lists: & Vec<Vec<i64>>) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 128 { r.push(x.get(xo + i) ^ y.get(yo + i)); i = i + 1; }
+    var q: Vec<i64> = r;
+    var k: i64 = 0;
+    while k < 16 {
+        val l: Vec<i64> = lists.get(k);
+        a2_p(& mut q, & l);
+        k = k + 1;
+    }
+    i = 0;
+    while i < 128 { q.set(i, q.get(i) ^ r.get(i)); i = i + 1; }
+    return q;
+}
+
+fn a2_block_bytes(mem: & Vec<i64>, at: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 128 {
+        val w: i64 = mem.get(at + i);
+        var k: i64 = 0;
+        while k < 8 { out.push((w >> (k * 8)) & 255); k = k + 1; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn a2_store_bytes(mem: & mut Vec<i64>, at: i64, b: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < 128 {
+        var w: i64 = 0;
+        var k: i64 = 7;
+        while k >= 0 {
+            w = (w << 8) | (b.get(i * 8 + k) & 255);
+            k = k - 1;
+        }
+        mem.set(at + i, w);
+        i = i + 1;
+    }
+}
+
+/// The reference position (RFC 9106 §3.4.1.2) from the 32-bit J1.
+@wrapping fn a2_ref_pos(area: i64, j1: i64) -> i64 {
+    val x: u64 = ((j1 as u64) * (j1 as u64)) >> 32;
+    val y: u64 = ((area as u64) * x) >> 32;
+    return area - 1 - (y as i64);
+}
+
+// ─── Argon2 ────────────────────────────────────────────────────────────
+
+/// Argon2 (type ARGON2_D, ARGON2_I or ARGON2_ID): a `tag_len`-byte tag of
+/// the password with salt (at least 8 bytes), optional secret and
+/// associated data, `t_cost` passes over `m_kib` KiB in `lanes` lanes.
+/// Empty on invalid parameters.
+pub fn argon2_hash(kind: i64, password: Vec<i64>, salt: Vec<i64>, secret: Vec<i64>, ad: Vec<i64>, t_cost: i64, m_kib: i64, lanes: i64, tag_len: i64) -> Vec<i64> {
+    if lanes < 1 || t_cost < 1 || tag_len < 4 || m_kib < 8 * lanes || salt.len() < 8 { return Vec::new(); }
+    var h0in: Vec<i64> = Vec::new();
+    a2_le32(& mut h0in, lanes);
+    a2_le32(& mut h0in, tag_len);
+    a2_le32(& mut h0in, m_kib);
+    a2_le32(& mut h0in, t_cost);
+    a2_le32(& mut h0in, 0x13);
+    a2_le32(& mut h0in, kind);
+    a2_le32(& mut h0in, password.len());
+    a2_append(& mut h0in, & password);
+    a2_le32(& mut h0in, salt.len());
+    a2_append(& mut h0in, & salt);
+    a2_le32(& mut h0in, secret.len());
+    a2_append(& mut h0in, & secret);
+    a2_le32(& mut h0in, ad.len());
+    a2_append(& mut h0in, & ad);
+    val h0: Vec<i64> = blake2b(64, Vec::new(), h0in);
+
+    val mblocks: i64 = 4 * lanes * (m_kib / (4 * lanes));
+    val q: i64 = mblocks / lanes;
+    val seg: i64 = q / 4;
+    var mem: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < mblocks * 128 { mem.push(0); i = i + 1; }
+    val lists: Vec<Vec<i64>> = a2_lists();
+    var lane: i64 = 0;
+    while lane < lanes {
+        var k: i64 = 0;
+        while k < 2 {
+            var inp: Vec<i64> = h0;
+            a2_le32(& mut inp, k);
+            a2_le32(& mut inp, lane);
+            val b: Vec<i64> = argon2_hprime(1024, inp);
+            a2_store_bytes(& mut mem, (lane * q + k) * 128, & b);
+            k = k + 1;
+        }
+        lane = lane + 1;
+    }
+    var zero: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 128 { zero.push(0); i = i + 1; }
+    var pass: i64 = 0;
+    while pass < t_cost {
+        var slice: i64 = 0;
+        while slice < 4 {
+            lane = 0;
+            while lane < lanes {
+                val indep: bool = kind == ARGON2_I || (kind == ARGON2_ID && pass == 0 && slice < 2);
+                var input: Vec<i64> = zero;
+                var addr: Vec<i64> = zero;
+                if indep {
+                    input.set(0, pass);
+                    input.set(1, lane);
+                    input.set(2, slice);
+                    input.set(3, mblocks);
+                    input.set(4, t_cost);
+                    input.set(5, kind);
+                }
+                var start: i64 = 0;
+                if pass == 0 && slice == 0 {
+                    start = 2;
+                    if indep {
+                        input.set(6, input.get(6) + 1);
+                        val a1: Vec<i64> = a2_compress(& zero, 0, & input, 0, & lists);
+                        addr = a2_compress(& zero, 0, & a1, 0, & lists);
+                    }
+                }
+                var idx: i64 = start;
+                while idx < seg {
+                    if indep && idx % 128 == 0 {
+                        input.set(6, input.get(6) + 1);
+                        val a2: Vec<i64> = a2_compress(& zero, 0, & input, 0, & lists);
+                        addr = a2_compress(& zero, 0, & a2, 0, & lists);
+                    }
+                    val col: i64 = slice * seg + idx;
+                    var prev: i64 = col - 1;
+                    if col == 0 { prev = q - 1; }
+                    val prev_at: i64 = (lane * q + prev) * 128;
+                    var rnd: i64 = 0;
+                    if indep { rnd = addr.get(idx % 128); } else { rnd = mem.get(prev_at); }
+                    val j1: i64 = rnd & 0xffffffff;
+                    val j2: i64 = (rnd >> 32) & 0xffffffff;
+                    var ref_lane: i64 = j2 % lanes;
+                    if pass == 0 && slice == 0 { ref_lane = lane; }
+                    val same: bool = ref_lane == lane;
+                    var area: i64 = 0;
+                    if pass == 0 {
+                        if slice == 0 {
+                            area = idx - 1;
+                        } else if same {
+                            area = slice * seg + idx - 1;
+                        } else {
+                            area = slice * seg;
+                            if idx == 0 { area = area - 1; }
+                        }
+                    } else {
+                        if same {
+                            area = q - seg + idx - 1;
+                        } else {
+                            area = q - seg;
+                            if idx == 0 { area = area - 1; }
+                        }
+                    }
+                    val rel: i64 = a2_ref_pos(area, j1);
+                    var st: i64 = 0;
+                    if pass != 0 && slice != 3 { st = (slice + 1) * seg; }
+                    val ref_col: i64 = (st + rel) % q;
+                    val nb: Vec<i64> = a2_compress(& mem, prev_at, & mem, (ref_lane * q + ref_col) * 128, & lists);
+                    val cur_at: i64 = (lane * q + col) * 128;
+                    var w: i64 = 0;
+                    if pass == 0 {
+                        while w < 128 { mem.set(cur_at + w, nb.get(w)); w = w + 1; }
+                    } else {
+                        while w < 128 { mem.set(cur_at + w, mem.get(cur_at + w) ^ nb.get(w)); w = w + 1; }
+                    }
+                    idx = idx + 1;
+                }
+                lane = lane + 1;
+            }
+            slice = slice + 1;
+        }
+        pass = pass + 1;
+    }
+    var fin: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 128 { fin.push(mem.get((q - 1) * 128 + i)); i = i + 1; }
+    lane = 1;
+    while lane < lanes {
+        i = 0;
+        val at: i64 = (lane * q + q - 1) * 128;
+        while i < 128 { fin.set(i, fin.get(i) ^ mem.get(at + i)); i = i + 1; }
+        lane = lane + 1;
+    }
+    return argon2_hprime(tag_len, a2_block_bytes(& fin, 0));
+}
+
+/// Argon2id without secret or associated data.
+pub fn argon2id(password: Vec<i64>, salt: Vec<i64>, t_cost: i64, m_kib: i64, lanes: i64, tag_len: i64) -> Vec<i64> {
+    return argon2_hash(ARGON2_ID, password, salt, Vec::new(), Vec::new(), t_cost, m_kib, lanes, tag_len);
+}
+
+// ─── PHC strings ───────────────────────────────────────────────────────
+
+fn a2_b64_nopad(b: Vec<i64>) -> str {
+    val s: str = b64_encode_bytes(b);
+    var n: i64 = str_len(s);
+    while n > 0 && str_byte_at(s, n - 1) == 61 { n = n - 1; }
+    return str_slice(s, 0, n);
+}
+
+fn a2_kind_name(kind: i64) -> str {
+    if kind == ARGON2_D { return "argon2d"; }
+    if kind == ARGON2_I { return "argon2i"; }
+    return "argon2id";
+}
+
+/// The PHC string of a fresh hash: $argon2id$v=19$m=M,t=T,p=P$salt$tag
+/// (base64 without padding).
+pub fn argon2_phc_hash(kind: i64, password: Vec<i64>, salt: Vec<i64>, t_cost: i64, m_kib: i64, lanes: i64, tag_len: i64) -> str {
+    val tag: Vec<i64> = argon2_hash(kind, password, salt, Vec::new(), Vec::new(), t_cost, m_kib, lanes, tag_len);
+    return "$" + a2_kind_name(kind) + "$v=19$m=" + int_to_str(m_kib) + ",t=" + int_to_str(t_cost) + ",p=" + int_to_str(lanes) + "$" + a2_b64_nopad(salt) + "$" + a2_b64_nopad(tag);
+}
+
+fn a2_param(s: str, key: str) -> i64 {
+    val parts: Vec<str> = str_split(s, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        if str_starts_with(p, key + "=") { return str_parse_int(str_slice(p, str_len(key) + 1, str_len(p))); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Check a password against a PHC string (constant-time tag comparison).
+pub fn argon2_phc_verify(phc: str, password: Vec<i64>) -> bool {
+    val f: Vec<str> = str_split(phc, "$");
+    // "", kind, "v=19", params, salt, tag
+    if f.len() != 6 || !str_equal(f.get(2), "v=19") { return false; }
+    var kind: i64 = -1;
+    if str_equal(f.get(1), "argon2d") { kind = ARGON2_D; }
+    if str_equal(f.get(1), "argon2i") { kind = ARGON2_I; }
+    if str_equal(f.get(1), "argon2id") { kind = ARGON2_ID; }
+    if kind < 0 { return false; }
+    val m: i64 = a2_param(f.get(3), "m");
+    val t: i64 = a2_param(f.get(3), "t");
+    val p: i64 = a2_param(f.get(3), "p");
+    if m < 8 || t < 1 || p < 1 || p > 255 || m > 4194304 || t > 1000 { return false; }
+    val salt: Vec<i64> = b64_decode_bytes(f.get(4));
+    val want: Vec<i64> = b64_decode_bytes(f.get(5));
+    if want.len() < 4 { return false; }
+    val got: Vec<i64> = argon2_hash(kind, password, salt, Vec::new(), Vec::new(), t, m, p, want.len());
+    if got.len() != want.len() { return false; }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < got.len() { d = d | (got.get(i) ^ want.get(i)); i = i + 1; }
+    return d == 0;
+}

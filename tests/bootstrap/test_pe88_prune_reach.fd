@@ -1,0 +1,99 @@
+// pe-roadmap 88: before the mid-end, a pe_ir build (`fid emit`, the
+// Windows default) drops the functions no code can call
+// (compiler/main.fd pe88_prune). What only a trait object, a function
+// value, a closure or a scope exit reaches must stay: each is used below,
+// and `never_called` (with what only it calls) may go. Every backend
+// prints the same lines; tests/tooling/pe88-emit-time-check.sh also builds
+// it with FID_PE_PRUNE=0 and compares.
+//
+// Expected output:
+// 12
+// 20
+// 7
+// 30
+// 9
+// 4
+// dropped 5
+// done
+
+cap Measure {
+    fn size(self) -> i64;
+}
+
+struct Box2 { w: i64, h: i64 }
+
+impl Measure for Box2 {
+    pub fn size(self: Box2) -> i64 { return self.w * self.h; }
+}
+
+struct Line { n: i64 }
+
+impl Measure for Line {
+    pub fn size(self: Line) -> i64 { return self.n; }
+}
+
+struct Guard { id: i64 }
+
+impl Guard {
+    fn drop(self: &mut Guard) {
+        p_print_str("dropped " + int_to_str(self.id) + "\n");
+    }
+}
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn add3(x: i64) -> i64 {
+    return x + 3;
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn make_adder(n: i64) -> fn(i64) -> i64 {
+    return fn(x: i64) { x + n };
+}
+
+fn only_dead_calls_this(x: i64) -> i64 {
+    return x * 100;
+}
+
+fn never_called(x: i64) -> i64 {
+    return only_dead_calls_this(x) + 1;
+}
+
+fn measure_all(items: Vec<dyn Measure>) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < items.len() {
+        total = total + items.get(i).size();
+        i = i + 1;
+    }
+    return total;
+}
+
+fn guarded() {
+    val g: Guard = Guard { id: 5 };
+    println(g.id - 1);
+}
+
+fn main() -> i64 {
+    val b = Box2 { w: 3, h: 4 };
+    val l = Line { n: 8 };
+    val db = b as dyn Measure;
+    val dl = l as dyn Measure;
+    println(db.size());
+    var items: Vec<dyn Measure> = Vec::new();
+    items.push(db);
+    items.push(dl);
+    println(measure_all(items));
+    println(apply(add3, 4));
+    println(apply(twice, 15));
+    val plus_k = make_adder(6);
+    println(plus_k(3));
+    guarded();
+    println("done");
+    return 0;
+}

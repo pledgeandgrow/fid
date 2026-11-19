@@ -1,0 +1,191 @@
+// test_cow_names.fd -- SP12: cowcheck's cow_names_stmt (one walk that
+// gathers every name a statement uses) agrees with cow_uses_stmt (asked
+// one name at a time). The lowering's last-use check (lower.fd
+// Lowerer_last_use / Lowerer_used_after) answers from cow_names_stmt what
+// it used to ask cow_uses_stmt of every later statement, per variable.
+//
+// For every statement of every function of the fixture below (each
+// top-level statement, and every statement nested in it), and every
+// identifier of the fixture plus a name used nowhere, it checks
+//     cow_uses_stmt(s, name) != 0  <=>  name was put into the map, or the
+//                                       walk said "every name".
+// The fixture holds each statement and expression form cow_uses_* looks
+// into, and some it does not (f-strings, defer, spawn): those count for
+// every name.
+//
+// Expected output:
+//     statements <n> names <m>
+//     all-name statements <k>
+//     mismatches 0
+//     All tests passed!
+// (n, m, k > 0; the program exits 0)
+use core;
+use vec;
+use string;
+use compiler::lexer;
+use compiler::token;
+use compiler::ast;
+use compiler::parser;
+use compiler::cowcheck;
+
+fn fixture() -> str {
+    var s: str = "";
+    s = s + "struct P { x: i64, v: Vec<i64> }\n";
+    s = s + "fn helper(a: i64, b: i64) -> i64 { return a + b; }\n";
+    s = s + "fn shapes(n: i64, q: P, xs: Vec<i64>) -> i64 {\n";
+    s = s + "    var total: i64 = n;\n";
+    s = s + "    var (ta, tb) = (n, total);\n";
+    s = s + "    var later: i64;\n";
+    s = s + "    total = total + ta * tb;\n";
+    s = s + "    var arr: Vec<i64> = [1, 2, n];\n";
+    s = s + "    arr[0] = total;\n";
+    s = s + "    var p: P = P { x: total, v: xs };\n";
+    s = s + "    p.x = helper(n, total);\n";
+    s = s + "    var r: & mut i64 = & mut total;\n";
+    s = s + "    *r = *r + 1;\n";
+    s = s + "    if total > n { total = total - 1; } else { later = 3; }\n";
+    s = s + "    while total < 100 { total = total + n; if total == 50 { break; } }\n";
+    s = s + "    for i in 0..n { total = total + i; continue; }\n";
+    s = s + "    loop { total = total + 1; if total > 10 { break; } }\n";
+    s = s + "    match q.x { 0 => { total = 0; } _ => { total = total + q.x; } }\n";
+    s = s + "    val m: i64 = match n { 1 => total, _ => helper(total, n) };\n";
+    s = s + "    val f = fn(z: i64) -> i64 { return z + total; };\n";
+    s = s + "    val c: i64 = (n as i64) + xs.len() + arr.get(0);\n";
+    s = s + "    val t = (m, c);\n";
+    s = s + "    val g: i64 = if c > 0 { m } else { c };\n";
+    s = s + "    val fs: str = f\"{total} and {m}\";\n";
+    s = s + "    defer { total = 0; }\n";
+    s = s + "    unsafe { total = total + g; }\n";
+    s = s + "    return total + f(m);\n";
+    s = s + "}\n";
+    s = s + "fn strings(a: str, b: str) -> str {\n";
+    s = s + "    var x: str = a + b;\n";
+    s = s + "    var y: str = x;\n";
+    s = s + "    val z: str = a + \"lit\";\n";
+    s = s + "    return y + z;\n";
+    s = s + "}\n";
+    return s;
+}
+
+/// Every statement of `stmts`, nested ones too, into `out`.
+fn all_stmts(stmts: Vec<Stmt>, out: & mut Vec<Stmt>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        var s: Stmt = stmts.get(i);
+        out.push(s);
+        match s {
+            Stmt::If(_, tb, eb, _) => {
+                all_stmts(tb, out);
+                match eb {
+                    OptStmts::Some(b) => {
+                        all_stmts(b, out);
+                    }
+                    OptStmts::None => {
+                    }
+                }
+            }
+            Stmt::While(_, wb, _) => {
+                all_stmts(wb, out);
+            }
+            Stmt::For(_, _, fb, _) => {
+                all_stmts(fb, out);
+            }
+            Stmt::Loop(lb, _) => {
+                all_stmts(lb, out);
+            }
+            Stmt::Match(_, arms, _) => {
+                var a: i64 = 0;
+                while a < arms.len() {
+                    all_stmts(arms.get(a).body, out);
+                    a = a + 1;
+                }
+            }
+            Stmt::Unsafe(ub, _) => {
+                all_stmts(ub, out);
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn has_str(v: Vec<str>, x: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn main() -> i64 {
+    var src: str = fixture();
+    var lex: Lexer = Lexer::new(src);
+    var tokens: Vec<Token> = lex.tokenize();
+    // the names: every identifier of the fixture, and one used nowhere
+    var names: Vec<str> = Vec::new();
+    var ti: i64 = 0;
+    while ti < tokens.len() {
+        match tokens.get(ti).kind {
+            TokenKind::Ident(nm) => {
+                if !has_str(names, nm) {
+                    names.push(nm);
+                }
+            }
+            _ => {
+            }
+        }
+        ti = ti + 1;
+    }
+    names.push("zz_used_nowhere");
+    var p: Parser = Parser::new(tokens);
+    var stmts: Vec<Stmt> = Vec::new();
+    match p.parse() {
+        ParseResultProgram::Ok(program) => {
+            var fi: i64 = 0;
+            while fi < program.funcs.len() {
+                all_stmts(program.funcs.get(fi).body, & mut stmts);
+                fi = fi + 1;
+            }
+        }
+        ParseResultProgram::Err(e) => {
+            print("Parse error: " + e + "\n");
+            return 1;
+        }
+    }
+    var bad: i64 = 0;
+    var alls: i64 = 0;
+    var si: i64 = 0;
+    while si < stmts.len() {
+        var s: Stmt = stmts.get(si);
+        var m: i64 = HashMap_new();
+        var all: bool = cow_names_into(s, m, 7);
+        if all {
+            alls = alls + 1;
+        }
+        var ni: i64 = 0;
+        while ni < names.len() {
+            var nm2: str = names.get(ni);
+            var counted: bool = cow_uses_stmt(s, nm2) != 0;
+            var listed: bool = all || cow_names_get(m, nm2) == 7;
+            if counted != listed {
+                bad = bad + 1;
+                print("mismatch: statement " + int_to_str(si) + " name " + nm2 + " cow_uses " + int_to_str(cow_uses_stmt(s, nm2)) + "\n");
+            }
+            ni = ni + 1;
+        }
+        HashMap_drop(m);
+        si = si + 1;
+    }
+    print("statements " + int_to_str(stmts.len()) + " names " + int_to_str(names.len()) + "\n");
+    print("all-name statements " + int_to_str(alls) + "\n");
+    print("mismatches " + int_to_str(bad) + "\n");
+    if bad != 0 || stmts.len() == 0 || alls == 0 {
+        return 1;
+    }
+    print("All tests passed!\n");
+    return 0;
+}

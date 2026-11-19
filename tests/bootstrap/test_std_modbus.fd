@@ -1,0 +1,207 @@
+// stdlib/modbus: CRC-16/MODBUS check value and known RTU frames, every request/response example of the Modbus Application Protocol spec 1.1b3 (functions 1-6, 15, 16, 23 and the exception example) through the encoders, a server map and the client, then RTU stream framing, TCP transaction matching, broadcast and exceptions.
+// Expected output:
+// crc: 4b37, 01030000000ac5cd, 1103006b00037687
+// spec requests: 10 of 10 encode as in the spec
+// spec responses: 10 of 10 from the server as in the spec
+// client: coils 1,0,1,1,0,0,1,1 holding 555,0,100 rw 254,2765,1,3,13,255
+// rtu stream: 3 frames cut from 20 bytes, crc ok 3
+// tcp: answers matched out of order: tid 2 regs 10, tid 1 coil 172 on
+// broadcast: register 5 = 1234, answer bytes 0
+// bad crc: answer bytes 0; other unit: answer bytes 0
+// exceptions: ab01 8303 8302 8603
+// client checks: function mismatch rejected, short byte count rejected, exception 2 seen
+use modbus;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hb(s: str) -> Vec<i64> {
+    return hex_decode_bytes(s);
+}
+
+var rq_ok: i64 = 0;
+var rq_n: i64 = 0;
+var rs_ok: i64 = 0;
+var rs_n: i64 = 0;
+
+fn same_req(got: Vec<i64>, want: str) {
+    rq_n = rq_n + 1;
+    if hx(got) == want {
+        rq_ok = rq_ok + 1;
+    } else {
+        println("request " + hx(got) + " want " + want);
+    }
+}
+
+fn serve(m: &mut ModbusMap, req: str, want: str) {
+    rs_n = rs_n + 1;
+    val got: str = hx(modbus_server_handle(m, &hb(req)));
+    if got == want {
+        rs_ok = rs_ok + 1;
+    } else {
+        println("response to " + req + ": " + got + " want " + want);
+    }
+}
+
+fn ints(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + ",";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val nine: Vec<i64> = str_bytes("123456789");
+    println("crc: " + int_to_hex(modbus_crc16(&nine)) + ", " + hx(modbus_rtu_frame(1, &hb("030000000a"))) + ", " + hx(modbus_rtu_frame(0x11, &hb("03006b0003"))));
+
+    // Requests of the spec's examples
+    same_req(modbus_req_read(MODBUS_READ_COILS, 0x13, 0x13), "0100130013");
+    same_req(modbus_req_read(MODBUS_READ_DISCRETE, 0xc4, 0x16), "0200c40016");
+    same_req(modbus_req_read(MODBUS_READ_HOLDING, 0x6b, 3), "03006b0003");
+    same_req(modbus_req_read(MODBUS_READ_INPUT, 8, 1), "0400080001");
+    same_req(modbus_req_write_coil(0xac, true), "0500acff00");
+    same_req(modbus_req_write_register(1, 3), "0600010003");
+    var c15: Vec<i64> = Vec::new();
+    c15.push(1); c15.push(0); c15.push(1); c15.push(1); c15.push(0);
+    c15.push(0); c15.push(1); c15.push(1); c15.push(1); c15.push(0);
+    same_req(modbus_req_write_coils(0x13, &c15), "0f0013000a02cd01");
+    var r16: Vec<i64> = Vec::new();
+    r16.push(0x000a);
+    r16.push(0x0102);
+    same_req(modbus_req_write_registers(1, &r16), "100001000204000a0102");
+    var r23: Vec<i64> = Vec::new();
+    r23.push(0xff); r23.push(0xff); r23.push(0xff);
+    same_req(modbus_req_read_write(3, 6, 0x0e, &r23), "1700030006000e00030600ff00ff00ff");
+    same_req(modbus_req_read(MODBUS_READ_COILS, 0x04a1, 1), "0104a10001");
+    println("spec requests: " + int_to_str(rq_ok) + " of " + int_to_str(rq_n) + " encode as in the spec");
+
+    // A server whose tables hold the spec's example data
+    var m: ModbusMap = modbus_map_new(256, 256, 128, 16);
+    val cb: Vec<i64> = modbus_unpack_bits(&hb("cd6b05"), 0, 19);
+    var i: i64 = 0;
+    while i < 19 {
+        m.coils.set(0x13 + i, cb.get(i));
+        i = i + 1;
+    }
+    val db: Vec<i64> = modbus_unpack_bits(&hb("acdb35"), 0, 22);
+    i = 0;
+    while i < 22 {
+        m.discrete.set(0xc4 + i, db.get(i));
+        i = i + 1;
+    }
+    m.holding.set(0x6b, 0x022b);
+    m.holding.set(0x6c, 0);
+    m.holding.set(0x6d, 0x64);
+    m.input.set(8, 10);
+    m.holding.set(3, 0xfe);
+    m.holding.set(4, 0x0acd);
+    m.holding.set(5, 1);
+    m.holding.set(6, 3);
+    m.holding.set(7, 0x0d);
+    m.holding.set(8, 0xff);
+    serve(&mut m, "0100130013", "0103cd6b05");
+    serve(&mut m, "0200c40016", "0203acdb35");
+    serve(&mut m, "03006b0003", "0306022b00000064");
+    serve(&mut m, "0400080001", "0402000a");
+    serve(&mut m, "0500acff00", "0500acff00");
+    serve(&mut m, "0600010003", "0600010003");
+    serve(&mut m, "0f0013000a02cd01", "0f0013000a");
+    serve(&mut m, "100001000204000a0102", "1000010002");
+    serve(&mut m, "1700030006000e00030600ff00ff00ff", "170c00fe0acd00010003000d00ff");
+    serve(&mut m, "0104a10001", "8102");
+    println("spec responses: " + int_to_str(rs_ok) + " of " + int_to_str(rs_n) + " from the server as in the spec");
+
+    // The client decodes the spec's responses
+    var cl: ModbusClient = modbus_client_new(false);
+    modbus_client_request(&mut cl, 1, modbus_req_read(MODBUS_READ_COILS, 0x13, 0x13));
+    val p1: ModbusPdu = modbus_client_response(&mut cl, &modbus_rtu_frame(1, &hb("0103cd6b05")));
+    var first8: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 {
+        first8.push(p1.bits.get(i));
+        i = i + 1;
+    }
+    modbus_client_request(&mut cl, 1, modbus_req_read(MODBUS_READ_HOLDING, 0x6b, 3));
+    val p3: ModbusPdu = modbus_client_response(&mut cl, &modbus_rtu_frame(1, &hb("0306022b00000064")));
+    modbus_client_request(&mut cl, 1, modbus_req_read_write(3, 6, 0x0e, &r23));
+    val p23: ModbusPdu = modbus_client_response(&mut cl, &modbus_rtu_frame(1, &hb("170c00fe0acd00010003000d00ff")));
+    println("client: coils " + ints(first8) + " holding " + ints(p3.regs) + " rw " + ints(p23.regs));
+
+    // RTU stream: three responses back to back, cut by function code
+    var stream: Vec<i64> = Vec::new();
+    stream.extend(modbus_rtu_frame(1, &hb("0402000a")));
+    stream.extend(modbus_rtu_frame(1, &hb("0600010003")));
+    stream.extend(modbus_rtu_frame(1, &hb("8102")));
+    val total: i64 = stream.len();
+    var frames: i64 = 0;
+    var crc_ok: i64 = 0;
+    while stream.len() > 0 {
+        val n: i64 = modbus_rtu_frame_len(&stream, false);
+        if n <= 0 {
+            break;
+        }
+        var f: Vec<i64> = Vec::new();
+        var rest: Vec<i64> = Vec::new();
+        i = 0;
+        while i < stream.len() {
+            if i < n {
+                f.push(stream.get(i));
+            } else {
+                rest.push(stream.get(i));
+            }
+            i = i + 1;
+        }
+        stream = rest;
+        frames = frames + 1;
+        if modbus_rtu_parse(&f).ok {
+            crc_ok = crc_ok + 1;
+        }
+    }
+    println("rtu stream: " + int_to_str(frames) + " frames cut from " + int_to_str(total) + " bytes, crc ok " + int_to_str(crc_ok));
+
+    // TCP: two requests, answers in the other order
+    var tc: ModbusClient = modbus_client_new(true);
+    val f1: Vec<i64> = modbus_client_request(&mut tc, 1, modbus_req_read(MODBUS_READ_COILS, 0xac, 1));
+    val f2: Vec<i64> = modbus_client_request(&mut tc, 1, modbus_req_read(MODBUS_READ_INPUT, 8, 1));
+    val a2: Vec<i64> = modbus_server_tcp(&mut m, &f2);
+    val a1: Vec<i64> = modbus_server_tcp(&mut m, &f1);
+    val t2: ModbusPdu = modbus_client_response(&mut tc, &a2);
+    val t1: ModbusPdu = modbus_client_response(&mut tc, &a1);
+    var on: str = "off";
+    if t1.bits.get(0) == 1 {
+        on = "on";
+    }
+    println("tcp: answers matched out of order: tid 2 regs " + ints(t2.regs) + ", tid 1 coil 172 " + on);
+
+    val bc: Vec<i64> = modbus_server_rtu(&mut m, 7, &modbus_rtu_frame(0, &modbus_req_write_register(5, 1234)));
+    println("broadcast: register 5 = " + int_to_str(m.holding.get(5)) + ", answer bytes " + int_to_str(bc.len()));
+    var badf: Vec<i64> = modbus_rtu_frame(7, &modbus_req_read(MODBUS_READ_HOLDING, 0, 1));
+    badf.set(badf.len() - 1, badf.get(badf.len() - 1) ^ 1);
+    val other: Vec<i64> = modbus_server_rtu(&mut m, 7, &modbus_rtu_frame(8, &modbus_req_read(MODBUS_READ_HOLDING, 0, 1)));
+    println("bad crc: answer bytes " + int_to_str(modbus_server_rtu(&mut m, 7, &badf).len()) + "; other unit: answer bytes " + int_to_str(other.len()));
+
+    println("exceptions: " + hx(modbus_server_handle(&mut m, &hb("2b0e0100"))) + " " + hx(modbus_server_handle(&mut m, &hb("0300000000"))) + " " + hx(modbus_server_handle(&mut m, &hb("03007f0002"))) + " " + hx(modbus_server_handle(&mut m, &hb("060000"))));
+
+    var ck: ModbusClient = modbus_client_new(false);
+    modbus_client_request(&mut ck, 1, modbus_req_read(MODBUS_READ_HOLDING, 0, 2));
+    val e1: ModbusPdu = modbus_client_response(&mut ck, &modbus_rtu_frame(1, &hb("0402000a")));
+    modbus_client_request(&mut ck, 1, modbus_req_read(MODBUS_READ_HOLDING, 0, 2));
+    val e2: ModbusPdu = modbus_client_response(&mut ck, &modbus_rtu_frame(1, &hb("0302000a")));
+    modbus_client_request(&mut ck, 1, modbus_req_read(MODBUS_READ_HOLDING, 0, 2));
+    val e3: ModbusPdu = modbus_client_response(&mut ck, &modbus_rtu_frame(1, &hb("8302")));
+    var s1: str = "accepted";
+    if !e1.ok { s1 = "rejected"; }
+    var s2: str = "accepted";
+    if !e2.ok { s2 = "rejected"; }
+    println("client checks: function mismatch " + s1 + ", short byte count " + s2 + ", exception " + int_to_str(e3.exception) + " seen");
+}

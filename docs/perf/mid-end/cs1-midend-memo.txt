@@ -1,0 +1,117 @@
+CS1 — the rules and the e-graph memoized per function across builds (Nov 17)
+============================================================================
+
+Competitive roadmap CS1 asks for `fid emit hello.fd` under 0.1 s. The last
+measurement (hello `--nat`, -O2 fid, CS2 artifact and CS6 native fn-cache
+warm) was 631 ms: front end 138, lower 185, mid-end 256 (iropt 68, rules
+48, e-graph 140), native code 43. The rules (compiler/rules.fd rules_run)
+and the e-graph (compiler/egraph.fd egraph_run) work on each function
+alone, and on every build they ran again over the same core and runtime
+functions that hello's main reaches. This change makes them remember, per
+function, what they did; a later build that meets a function of the same
+IR replays that and skips the pass.
+
+What was added
+  compiler/ir_ser.fd, section "CS1: the mid-end's per-function memo"
+    the store: MecEntry, mec_begin / mec_lookup / mec_entry / mec_apply_at /
+    mec_note / mec_finish, the file (mec_path, mec_load, mec_write,
+    mec_rentry / mec_wentry, mec_check), the change log (mec_log_begin,
+    mec_log_end, mec_log_inst, mec_log_block, mec_delta, mec_apply), the
+    hand-over from the rules to the e-graph (mec_chain_*), the counts
+    (mec_pass_begin / mec_pass_end), and the content hash mec_fn_hash with
+    its helpers mh_* (one mixed word per field, in iw_irfunc's order).
+  compiler/rules.fd: rules_run uses the memo; ru_one (the two passes on
+    one function), ru_calls_salt (the callees' masks for the key);
+    ru_set_inst logs its write.
+  compiler/egraph.fd: egraph_run uses the memo and writes it at the end
+    (mec_finish); eg_one (forward, e-graph, place on one function);
+    eg_set_inst and eg_place log their writes.
+  tests/bootstrap/test_midend_memo.fd (the store alone),
+  tests/tooling/mecache_passes.fd (the real passes on a hand-built module),
+  tests/tooling/mecache-check.sh (both, and real builds).
+
+The key of a function for a pass (mec_key)
+  - mec_fn_hash of the function as the pass gets it: every field iw_irfunc
+    writes (name, parameters, blocks with their instruction lists,
+    predecessors and parameters, every value's meta, every instruction,
+    inst_at, effects, counters, locals, flags);
+  - the run's switches: for the rules FID_NAT_OFF=rules / purecse /
+    readcse (and FID_IROPT_OFF=readcse, --no-pass) as the booleans the pass
+    computed, FID_NAT_MUTATE; for the e-graph forward / egraph / egplace,
+    the FID_EGRAPH_OFF mask and the FID_NAT_MUTATE mask;
+  - for the rules' call merging: the effect mask of every call in the
+    function (iro_call_mask over iro_effect_masks), in order. That is all
+    ru_pure_cse and ru_read_reuse read of other functions;
+  - this compiler (inc_compiler_hash), also in the file's name.
+  The e-graph reads nothing outside the function (eg_function's `module`
+  parameter is unused).
+
+Exactness
+  A pass writes a function only through eg_set_inst, ru_set_inst and the
+  two block writes of eg_place; each logs the position it wrote. On a
+  miss, when the pass reported a change, the change is the final value of
+  each logged instruction and block. It is recorded only when replaying it
+  on the function as it was before the pass gives exactly the pass's
+  result (the same content hash, mec_note); a write the log missed would
+  fail that check and nothing is recorded. When the pass reported no
+  change the caller keeps the function as it was, so "no change" is exact
+  by construction. A replay (mec_apply) reads and checks every part
+  (positions, value ids) before it changes anything; one that does not fit
+  is refused and the pass runs. The counts the passes report ([prof]
+  native mid-end) come back from the entry, so the line is the same.
+  FID_RULE_STATS and FID_EGRAPH_STATS turn the memo off for their pass (they
+  count each rewrite as it happens).
+
+The file
+  <TEMP>/fid-mec-<hash of this compiler>.bin (FID_MECACHE=<file> names
+  another; FID_MECACHE=off|0|no|none|false, FIDES_NO_CACHE=1 or
+  `--no-cache` turn it off). Little-endian words: magic "MEC1", version 1,
+  the compiler's hash, a count, then per entry: key, name hash, hash after
+  the pass, three counts, the change's length and bytes (one byte each),
+  a check word over all of it. Loading stops at the first entry whose
+  check word does not match (a file another process was writing; the
+  writer writes a temporary file and renames it). A build writes the file
+  only when it made entries: those it used first, then the new ones, then
+  the older ones, up to 20000 entries. `fid serve` keeps them in memory
+  between builds. FID_MECACHE_STATS=1 prints, per pass,
+  "[mecache] <pass>: H hits, M misses, R recorded".
+
+Measured so far (the compiler of this run was not built: the numbers are
+from the probes, built by the stage-0 compiler of Nov 16 through C)
+  tests/bootstrap/test_midend_memo.fd (C backend): all 12 expected lines.
+  tests/tooling/mecache_passes.fd (C backend): 5 functions; cold 5 misses
+  and 5 recorded per pass, warm 5 hits and 0 misses per pass; counts,
+  content hashes and the memo-off results the same; the rules rewrote 8
+  operations and merged 1 call, the e-graph forwarded 1 load and rewrote 4.
+  A synthetic module (300 functions of 160 arithmetic instructions, built
+  with --cc-opt 2, a busy machine), rules + e-graph:
+    memo off  ~400-500 ms (rules 50-100, e-graph 290-440)
+    cold      ~430-480 ms (rules 60-85, e-graph 350-400)
+    warm       ~27-36 ms (rules 16-21, e-graph 9-18)
+  The first version hashed through an AwBuf (iw_irfunc, then the bytes):
+  warm rules cost 94-98 ms there, twice the pass itself; the word hash
+  (mh_*) costs a fifth of that.
+
+What is left of CS1 (0.1 s)
+  - Measure hello with this run's compiler (-O2) on a quiet machine:
+    TIME=1 tests/tooling/mecache-check.sh prints the --time rows cold, warm
+    and memo off. Expected: rules + e-graph 188 ms -> about 20-30 ms warm.
+  - That leaves about 470 ms: lowering 185 ms (every build lowers core's
+    and the runtime's functions again; the lowered-IR cache FID_IRCACHE was
+    measured slower than lowering, because ar_i64 builds a Vec per word and
+    the file nests bytes as words), iropt 68 ms (CS6's FID_IROCACHE, opt-in,
+    covers its per-function passes), the front end 138 ms (stdlib
+    deserialization 45) and native code 43 ms. 0.1 s needs a cache of the
+    lowered and optimized stdlib functions that loads faster than lowering
+    (a word-level reader instead of ar_i64, ast_ser.fd; lower.fd taking
+    whole functions from it for what reach.fd keeps).
+  - The rules still hash each function once per build; when iropt's memo
+    (CS6) knows a function's hash after iropt it could hand it over as the
+    rules hand theirs to the e-graph (mec_chain_*), once a module carries
+    an identity that keeps a stale hand-over from being read.
+
+Validate (with this run's compiler as FID)
+  FID=release/fid.exe bash tests/tooling/mecache-check.sh     # every line PASS
+  TIME=1 FID=release/fid.exe bash tests/tooling/mecache-check.sh
+  The suite twice with the memo on (cold, then warm) and once with
+  FID_MECACHE=off: the same results (scripts/cross-test.sh, NATIVE=1).

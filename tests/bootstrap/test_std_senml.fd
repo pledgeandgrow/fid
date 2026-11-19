@@ -1,0 +1,153 @@
+// stdlib/senml: the RFC 8428 examples (5.1.1-5.1.6) in JSON, the CBOR dump of section 6 byte for byte, resolution (sorted by time) against 5.1.4, and invalid packs.
+// Expected output:
+// 5.1.1 json round trip: same
+// 5.1.2 json round trip: same
+// 5.1.2 resolved: urn:dev:ow:10e2073a01080063:voltage V 120.1 | urn:dev:ow:10e2073a01080063:current A 1.2
+// section 6: json to cbor gives the RFC dump (195 bytes)
+// section 6: cbor decode and encode: same bytes
+// section 6: 7 records, first urn:dev:ow:10e2073a0108006:current t=1276020071.001 bver=5
+// section 6: record 2 urn:dev:ow:10e2073a0108006:current A t=1276020072.001 v=1.3
+// 5.1.3 resolved: 13 records, 13 equal to 5.1.4
+// 5.1.5 json round trip: same
+// 5.1.5 vd bytes: 6869200a, vs Machine Room, vb false
+// 5.1.5 cbor round trip: same
+// 5.1.6: 2001:db8::2/temperature 1320078429 | 2001:db8::2/humidity 1320078429 | 2001:db8::1/temperature 1320078429 | 2001:db8::1/humidity 1320078429
+// relative time: dev1 t=1699999990 v=3
+// sum: meter:energy s=105
+// errors: 6 of 6 rejected
+use senml;
+use cbor;
+use vec;
+use string;
+use encoding;
+
+fn rt(label: str, text: str) {
+    val p: SenmlPack = senml_json_decode(text);
+    if !p.ok {
+        println(label + " decode error: " + p.error);
+        return;
+    }
+    val again: str = senml_json_encode(p.records);
+    if again == text {
+        println(label + " json round trip: same");
+    } else {
+        println(label + " json round trip: DIFFERENT " + again);
+    }
+}
+
+fn names_times(p: SenmlPack) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < p.records.len() {
+        val r: SenmlRecord = p.records.get(i);
+        if i > 0 {
+            s = s + " | ";
+        }
+        s = s + r.n + " " + float_to_str(r.t);
+        i = i + 1;
+    }
+    return s;
+}
+
+var bad_ok: i64 = 0;
+var bad_n: i64 = 0;
+
+fn bad_json(text: str) {
+    bad_n = bad_n + 1;
+    var p: SenmlPack = senml_json_decode(text);
+    if p.ok {
+        p = senml_resolve(p.records, 0.0);
+    }
+    if !p.ok {
+        bad_ok = bad_ok + 1;
+    } else {
+        println("accepted " + text);
+    }
+}
+
+fn main() {
+    rt("5.1.1", "[{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"Cel\",\"v\":23.1}]");
+    val e512: str = "[{\"bn\":\"urn:dev:ow:10e2073a01080063:\",\"n\":\"voltage\",\"u\":\"V\",\"v\":120.1},{\"n\":\"current\",\"u\":\"A\",\"v\":1.2}]";
+    rt("5.1.2", e512);
+    val r512: SenmlPack = senml_resolve(senml_json_decode(e512).records, 1700000000.0);
+    val a: SenmlRecord = r512.records.get(0);
+    val b: SenmlRecord = r512.records.get(1);
+    println("5.1.2 resolved: " + a.n + " " + a.u + " " + float_to_str(a.v) + " | " + b.n + " " + b.u + " " + float_to_str(b.v));
+
+    // Section 6: the CBOR of the second example of 5.1.2. The dump carries
+    // "t":0 on the last record, so the JSON given here does too.
+    val dump: str = "87a721781b75726e3a6465763a6f773a3130653230373361303130383030363a22fb41d303a15b00106223614120050067766f6c7461676501615602fb405e066666666666a3006763757272656e74062402fb3ff3333333333333a3006763757272656e74062302fb3ff4cccccccccccda3006763757272656e74062202fb3ff6666666666666a3006763757272656e74062102f93e00a3006763757272656e74062002fb3ff999999999999aa3006763757272656e74060002fb3ffb333333333333";
+    val js: str = "[{\"bn\":\"urn:dev:ow:10e2073a0108006:\",\"bt\":1.276020076001e+09,\"bu\":\"A\",\"bver\":5,\"n\":\"voltage\",\"u\":\"V\",\"v\":120.1},{\"n\":\"current\",\"t\":-5,\"v\":1.2},{\"n\":\"current\",\"t\":-4,\"v\":1.3},{\"n\":\"current\",\"t\":-3,\"v\":1.4},{\"n\":\"current\",\"t\":-2,\"v\":1.5},{\"n\":\"current\",\"t\":-1,\"v\":1.6},{\"n\":\"current\",\"t\":0,\"v\":1.7}]";
+    val pj: SenmlPack = senml_json_decode(js);
+    val cb: Vec<i64> = senml_cbor_encode(pj.records);
+    if cbor_hex(cb) == dump {
+        println("section 6: json to cbor gives the RFC dump (" + int_to_str(cb.len()) + " bytes)");
+    } else {
+        println("section 6: json to cbor DIFFERENT " + cbor_hex(cb));
+    }
+    val pc: SenmlPack = senml_cbor_decode(hex_decode_bytes(dump));
+    if !pc.ok {
+        println("section 6 decode error: " + pc.error);
+    }
+    if cbor_hex(senml_cbor_encode(pc.records)) == dump {
+        println("section 6: cbor decode and encode: same bytes");
+    } else {
+        println("section 6: cbor decode and encode: DIFFERENT");
+    }
+    val rc: SenmlPack = senml_resolve(pc.records, 0.0);
+    val r0: SenmlRecord = rc.records.get(0);
+    println("section 6: " + int_to_str(rc.records.len()) + " records, first " + r0.n + " t=" + float_to_str(r0.t) + " bver=" + int_to_str(r0.bver));
+    val r1: SenmlRecord = rc.records.get(1);
+    println("section 6: record 2 " + r1.n + " " + r1.u + " t=" + float_to_str(r1.t) + " v=" + float_to_str(r1.v));
+
+    // 5.1.3 resolved must equal 5.1.4
+    val e513: str = "[{\"bn\":\"urn:dev:ow:10e2073a01080063\",\"bt\":1.320067464e+09,\"bu\":\"%RH\",\"v\":20},{\"u\":\"lon\",\"v\":24.30621},{\"u\":\"lat\",\"v\":60.07965},{\"t\":60,\"v\":20.3},{\"u\":\"lon\",\"t\":60,\"v\":24.30622},{\"u\":\"lat\",\"t\":60,\"v\":60.07965},{\"t\":120,\"v\":20.7},{\"u\":\"lon\",\"t\":120,\"v\":24.30623},{\"u\":\"lat\",\"t\":120,\"v\":60.07966},{\"u\":\"%EL\",\"t\":150,\"v\":98},{\"t\":180,\"v\":21.2},{\"u\":\"lon\",\"t\":180,\"v\":24.30628},{\"u\":\"lat\",\"t\":180,\"v\":60.07967}]";
+    val e514: str = "[{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"%RH\",\"t\":1.320067464e+09,\"v\":20},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lon\",\"t\":1.320067464e+09,\"v\":24.30621},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lat\",\"t\":1.320067464e+09,\"v\":60.07965},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"%RH\",\"t\":1.320067524e+09,\"v\":20.3},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lon\",\"t\":1.320067524e+09,\"v\":24.30622},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lat\",\"t\":1.320067524e+09,\"v\":60.07965},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"%RH\",\"t\":1.320067584e+09,\"v\":20.7},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lon\",\"t\":1.320067584e+09,\"v\":24.30623},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lat\",\"t\":1.320067584e+09,\"v\":60.07966},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"%EL\",\"t\":1.320067614e+09,\"v\":98},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"%RH\",\"t\":1.320067644e+09,\"v\":21.2},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lon\",\"t\":1.320067644e+09,\"v\":24.30628},{\"n\":\"urn:dev:ow:10e2073a01080063\",\"u\":\"lat\",\"t\":1.320067644e+09,\"v\":60.07967}]";
+    val res: SenmlPack = senml_resolve(senml_json_decode(e513).records, 0.0);
+    val want: SenmlPack = senml_json_decode(e514);
+    var same: i64 = 0;
+    var i: i64 = 0;
+    while i < res.records.len() && i < want.records.len() {
+        val x: SenmlRecord = res.records.get(i);
+        val y: SenmlRecord = want.records.get(i);
+        if x.n == y.n && x.u == y.u && x.t == y.t && x.v == y.v && x.fields == y.fields {
+            same = same + 1;
+        } else {
+            println("5.1.4 record " + int_to_str(i) + " differs: " + senml_json_record(&x));
+        }
+        i = i + 1;
+    }
+    println("5.1.3 resolved: " + int_to_str(res.records.len()) + " records, " + int_to_str(same) + " equal to 5.1.4");
+
+    val e515: str = "[{\"bn\":\"urn:dev:ow:10e2073a01080063:\",\"n\":\"temp\",\"u\":\"Cel\",\"v\":23.1},{\"n\":\"label\",\"vs\":\"Machine Room\"},{\"n\":\"open\",\"vb\":false},{\"n\":\"nfc-reader\",\"vd\":\"aGkgCg\"}]";
+    rt("5.1.5", e515);
+    val p515: SenmlPack = senml_json_decode(e515);
+    val rd: SenmlRecord = p515.records.get(3);
+    val rs: SenmlRecord = p515.records.get(1);
+    val rb: SenmlRecord = p515.records.get(2);
+    println("5.1.5 vd bytes: " + cbor_hex(rd.vd) + ", vs " + rs.vs + ", vb " + bool_to_str(rb.vb));
+    val c515: SenmlPack = senml_cbor_decode(senml_cbor_encode(p515.records));
+    if c515.ok && senml_json_encode(c515.records) == e515 {
+        println("5.1.5 cbor round trip: same");
+    } else {
+        println("5.1.5 cbor round trip: DIFFERENT " + c515.error);
+    }
+
+    val e516: str = "[{\"bn\":\"2001:db8::2/\",\"bt\":1.320078429e+09,\"n\":\"temperature\",\"u\":\"Cel\",\"v\":25.2},{\"n\":\"humidity\",\"u\":\"%RH\",\"v\":30},{\"bn\":\"2001:db8::1/\",\"n\":\"temperature\",\"u\":\"Cel\",\"v\":12.3},{\"n\":\"humidity\",\"u\":\"%RH\",\"v\":67}]";
+    println("5.1.6: " + names_times(senml_resolve(senml_json_decode(e516).records, 0.0)));
+
+    val rel: SenmlPack = senml_resolve(senml_json_decode("[{\"n\":\"dev1\",\"v\":3,\"t\":-10}]").records, 1700000000.0);
+    val rr: SenmlRecord = rel.records.get(0);
+    println("relative time: " + rr.n + " t=" + float_to_str(rr.t) + " v=" + float_to_str(rr.v));
+    val sum: SenmlPack = senml_resolve(senml_json_decode("[{\"bn\":\"meter:\",\"bs\":100,\"n\":\"energy\",\"s\":5}]").records, 0.0);
+    val rsum: SenmlRecord = sum.records.get(0);
+    println("sum: " + rsum.n + " s=" + float_to_str(rsum.s));
+
+    bad_json("{\"n\":\"x\",\"v\":1}");              // not an array
+    bad_json("[{\"n\":5,\"v\":1}]");                 // n is not a string
+    bad_json("[{\"n\":\"x\",\"v\":1,\"foo_\":2}]");  // must-understand label
+    bad_json("[{\"n\":\"-x\",\"v\":1}]");            // name starts with '-'
+    bad_json("[{\"n\":\"a b\",\"v\":1}]");           // space in a name
+    bad_json("[{\"n\":\"x\",\"vb\":1}]");            // vb is not a boolean
+    println("errors: " + int_to_str(bad_ok) + " of " + int_to_str(bad_n) + " rejected");
+}

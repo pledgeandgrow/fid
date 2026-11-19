@@ -1,0 +1,165 @@
+// `timeout(ms) { .. } else { .. }` (complaint-roadmap CA8): the body runs
+// with a token that cancels itself `ms` milliseconds after the block starts,
+// installed in the running task's token slot (p_task_token), so a wait
+// inside it that respects cancellation gives up at the deadline without
+// being handed the token, also in a function the body calls. `else` runs
+// when the deadline passed while the body ran. The slot gets its old token
+// back when the block ends, however it ends (end, return, break, continue,
+// `?`); nested blocks each have their own token; every task has a slot of
+// its own, empty when it starts.
+//
+// Expected output:
+// slot before: 0
+// in block: true
+// whole sleep: false
+// timed out
+// fast: true
+// slot after: 0
+// in time: true
+// nested inner differs: true
+// nested outer back: true
+// return: 20 slot 0
+// loop: 2 slot 0
+// try: err bad slot 0
+// late
+// child slot: 0
+// tasks: 11 1
+use string;
+use task;
+
+/// A wait in a function the block calls: it finds the block's token in the
+/// slot.
+fn slow_step(ms: i64) -> bool {
+    return task_sleep_cancellable(ms, p_task_token());
+}
+
+fn early(n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        timeout(1000) {
+            if i == 2 {
+                return i * 10;
+            }
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn may_fail(x: i64) -> Result<i64, str> {
+    if x > 0 {
+        return Result::Err("bad");
+    }
+    return Result::Ok(x);
+}
+
+fn try_in_block(x: i64) -> Result<i64, str> {
+    timeout(1000) {
+        val v: i64 = may_fail(x)?;
+        return Result::Ok(v + 1);
+    }
+    return Result::Ok(0);
+}
+
+fn peek(x: i64) -> i64 {
+    return p_task_token() + x;
+}
+
+/// Gives up at its deadline (1), runs its else (10), and its slot is empty
+/// afterwards (no 100).
+fn timed(x: i64) -> i64 {
+    var r: i64 = x;
+    timeout(30) {
+        if !task_sleep_cancellable(5000, p_task_token()) {
+            r = r + 1;
+        }
+    } else {
+        r = r + 10;
+    }
+    if p_task_token() != 0 {
+        r = r + 100;
+    }
+    return r;
+}
+
+/// Runs while the other task is inside its block: its own slot stays empty,
+/// so its wait runs to the end.
+fn plain(x: i64) -> i64 {
+    task_sleep(5);
+    val whole: bool = task_sleep_cancellable(40, p_task_token());
+    if whole && p_task_token() == 0 {
+        return 1 + x;
+    }
+    return x;
+}
+
+fn main() -> i64 {
+    println("slot before: " + int_to_str(p_task_token()));
+
+    val t0: i64 = p_clock_now_ms();
+    timeout(50) {
+        println("in block: " + bool_to_str(p_task_token() != 0));
+        val whole: bool = slow_step(5000);
+        println("whole sleep: " + bool_to_str(whole));
+    } else {
+        println("timed out");
+    }
+    println("fast: " + bool_to_str(p_clock_now_ms() - t0 < 2000));
+    println("slot after: " + int_to_str(p_task_token()));
+
+    timeout(5000) {
+        println("in time: " + bool_to_str(slow_step(10)));
+    } else {
+        println("not printed");
+    }
+
+    timeout(5000) {
+        val outer: i64 = p_task_token();
+        timeout(5000) {
+            println("nested inner differs: " + bool_to_str(p_task_token() != outer));
+        }
+        println("nested outer back: " + bool_to_str(p_task_token() == outer));
+    }
+
+    val e: i64 = early(5);
+    println("return: " + int_to_str(e) + " slot " + int_to_str(p_task_token()));
+
+    var k: i64 = 0;
+    while k < 3 {
+        timeout(1000) {
+            k = k + 1;
+            if k == 1 {
+                continue;
+            }
+            break;
+        }
+    }
+    println("loop: " + int_to_str(k) + " slot " + int_to_str(p_task_token()));
+
+    match try_in_block(1) {
+        Result::Ok(v) => {
+            println("try: ok " + int_to_str(v));
+        }
+        Result::Err(m) => {
+            println("try: err " + m + " slot " + int_to_str(p_task_token()));
+        }
+    }
+
+    timeout(0) {
+        task_sleep(5);
+    } else {
+        println("late");
+    }
+
+    timeout(5000) {
+        val c: i64 = task_go("peek", 0);
+        task_run();
+        println("child slot: " + int_to_str(task_result(c)));
+    }
+
+    val a: i64 = task_go("timed", 0);
+    val b: i64 = task_go("plain", 0);
+    task_run();
+    println("tasks: " + int_to_str(task_result(a)) + " " + int_to_str(task_result(b)));
+    return 0;
+}

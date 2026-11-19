@@ -1,0 +1,35 @@
+// expect-error: calling the @unsafe function Raw.load() needs an `unsafe` block
+// Release M10: an @unsafe method is called like an @unsafe function: from an
+// `unsafe` block or an @unsafe caller. Raw::at is called correctly here,
+// but its load method is called from safe code (test_unsafe_call_ok.fd:
+// both inside `unsafe` are accepted).
+
+struct Raw {
+    addr: i64,
+}
+
+impl Raw {
+    // SAFETY: the caller's promise: addr is a live, aligned word for as
+    // long as the Raw is used.
+    @unsafe
+    pub fn at(addr: i64) -> Raw {
+        return Raw { addr: addr };
+    }
+
+    // SAFETY: the promise Raw::at was given.
+    @unsafe
+    pub fn load(self: Raw) -> i64 {
+        var w: * mut i64 = self.addr;
+        return * w;
+    }
+}
+
+fn main() -> i64 {
+    var r: Raw = Raw { addr: 0 };
+    // SAFETY: not kept: the address is 0x1000, which nobody owns.
+    unsafe {
+        r = Raw::at(4096);
+    }
+    println(r.load());
+    return 0;
+}

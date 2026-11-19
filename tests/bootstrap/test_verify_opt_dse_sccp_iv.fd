@@ -1,0 +1,86 @@
+// VF5, three passes of compiler/iropt.fd without a test of their own:
+// dse (dead store elimination), sccp (sparse conditional constants) and iv
+// (induction variables). Each case prints a value that a wrong pass
+// changes: a store read by a call before it is overwritten (dse must keep
+// it), a variable constant on one path only (sccp must not fold the
+// branch), a derived induction variable used after a downward loop with a
+// stride of 2, and a loop that runs zero times (iv must not assume one
+// iteration).
+//
+// Expected output:
+// 1020
+// 56
+// 79
+// 95007
+// 0 5
+// 285
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn read_a(p: Pair) -> i64 {
+    return p.a;
+}
+
+fn branchy(n: i64) -> i64 {
+    var x: i64 = 3;
+    if n > 100 {
+        x = 4;
+    }
+    var y: i64 = 0;
+    if x == 3 {
+        y = 7;
+    } else {
+        y = 9;
+    }
+    return y;
+}
+
+fn squares(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i * i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    // dse: the store of 10 is read (through the copy passed to read_a)
+    // before the store of 20 replaces it
+    var bx: Pair = Pair { a: 1, b: 2 };
+    bx.a = 10;
+    val r1: i64 = read_a(bx);
+    bx.a = 20;
+    println(r1 * 100 + bx.a);
+
+    // dse on a Vec element: read between two stores
+    var v: Vec<i64> = Vec::new();
+    v.push(0);
+    v.set(0, 5);
+    val g: i64 = v.get(0);
+    v.set(0, 6);
+    println(g * 10 + v.get(0));
+
+    // sccp: x is 3 on one path and 4 on the other
+    println(branchy(5) * 10 + branchy(500));
+
+    // iv: i = 10, 8, 6, 4, 2; d = 3i + 1 is used after the loop
+    var i: i64 = 10;
+    var d: i64 = 0;
+    var acc: i64 = 0;
+    while i > 0 {
+        d = i * 3 + 1;
+        acc = acc + d;
+        i = i - 2;
+    }
+    println(acc * 1000 + i * 10 + d);
+
+    // iv: zero iterations, then two and one
+    println(int_to_str(squares(0)) + " " + int_to_str(squares(2) + squares(1) + 4));
+    println(squares(10));
+    return 0;
+}

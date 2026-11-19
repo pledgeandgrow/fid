@@ -1,0 +1,172 @@
+// stdlib/zstd: the Zstandard compressor (complaint CD2; competitive SL10,
+// "Left: compressing encoders for zstd and brotli"). zstd_compress_level,
+// zstd_compress and zstd_compress_str on inputs chosen to reach each part
+// of the writer: the empty frame (byte for byte libzstd's with a checksum),
+// one byte, an RLE block, a raw block when nothing compresses, level 0
+// (stored), raw literals (256 values once each), Huffman literals with
+// direct weights in one stream, with FSE-compressed weights (bytes over
+// 128) and in four streams (over 1023 literals), sequences with new and
+// repeat offsets, lazy matching (level 9). Every frame decodes back to its
+// input with zstd_decode and is pinned by its CRC-32. When written, each
+// frame printed here was decoded by Python 3.14's compression.zstd
+// (libzstd) to the same bytes, as were frames of 300 KB (three blocks);
+// sizes are within 20% of libzstd's at the same level.
+//
+// Expected output:
+// empty.3: 0 -> 13 ok crc 2953723833
+// one.3: 1 -> 14 ok crc 3210008734
+// run.3: 300 -> 15 ok crc 435418564
+// text.0: 1544 -> 1558 ok crc 2065100652
+// text.1: 1544 -> 189 ok crc 3715633658
+// text.3: 1544 -> 189 ok crc 3715633658
+// text.9: 1544 -> 189 ok crc 3715633658
+// skew.3: 600 -> 332 ok crc 974668246
+// four.3: 400 -> 191 ok crc 190463973
+// hiskew.3: 700 -> 385 ok crc 1288425295
+// letters.3: 2000 -> 1041 ok crc 1192331848
+// all256.3: 512 -> 280 ok crc 3580768620
+// noise.3: 500 -> 514 ok crc 1694685156
+// masked: 44 1
+// str: Hello, Zstandard! Hello, Zstandard!
+// default is level 3: true
+// compressed is valid: true
+
+use zstd;
+use compress;
+use vec;
+use string;
+
+// Set to true to print each frame and its input as hex (to check them with
+// another decoder).
+const DUMP: bool = false;
+
+fn hex(v: Vec<i64>) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    val digits: str = "0123456789abcdef";
+    var i: i64 = 0;
+    while i < v.len() {
+        val b: i64 = v.get(i) & 255;
+        sb.append_char(str_byte_at(digits, b >> 4));
+        sb.append_char(str_byte_at(digits, b & 15));
+        i = i + 1;
+    }
+    return sb.to_str();
+}
+
+// Pseudo-random bytes: kind 0 any byte, 1 skewed letters, 2 skewed bytes
+// near 255, 3 the 16 letters a..p evenly, 4 the bytes 1..4 skewed.
+fn gen(n: i64, seed: i64, kind: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var x: i64 = seed;
+    var i: i64 = 0;
+    while i < n {
+        x = (x * 1103515245 + 12345) & 2147483647;
+        var r: i64 = (x >> 8) & 255;
+        if kind == 1 || kind == 2 {
+            val k: i64 = r & 15;
+            if k < 6 {
+                r = 0;
+            } else if k < 10 {
+                r = 1;
+            } else if k < 12 {
+                r = 2;
+            } else {
+                r = (r >> 4) + 3;
+            }
+            if kind == 2 {
+                r = 255 - r;
+            } else {
+                r = 97 + r;
+            }
+        } else if kind == 3 {
+            r = 97 + (r & 15);
+        } else if kind == 4 {
+            val k4: i64 = r & 15;
+            if k4 < 8 {
+                r = 1;
+            } else if k4 < 12 {
+                r = 2;
+            } else if k4 < 14 {
+                r = 3;
+            } else {
+                r = 4;
+            }
+        }
+        out.push(r);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(name: str, data: Vec<i64>, level: i64) -> void {
+    val z: Vec<i64> = zstd_compress_level(data, level);
+    val r: ZstdResult = zstd_decode(z);
+    var same: bool = r.ok && r.bytes.len() == data.len();
+    var i: i64 = 0;
+    while same && i < data.len() {
+        if r.bytes.get(i) != data.get(i) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    var verdict: str = "ok";
+    if !same {
+        verdict = "MISMATCH " + r.error;
+    }
+    println(name + "." + int_to_str(level) + ": " + int_to_str(data.len()) + " -> " + int_to_str(z.len()) + " " + verdict + " crc " + int_to_str(crc32_bytes(z)));
+    if DUMP {
+        println("hex " + name + " " + int_to_str(level) + " " + hex(z) + " " + hex(data));
+    }
+}
+
+fn main() -> i64 {
+    val para: str = "It is a truth universally acknowledged, that a single program in possession of a good standard library, must be in want of a compressor. ";
+    var text: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        val s: str = para + "Section " + int_to_str(i) + ": the quick brown fox jumps over the lazy dog. ";
+        var k: i64 = 0;
+        while k < str_len(s) {
+            text.push(str_byte_at(s, k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var one: Vec<i64> = Vec::new();
+    one.push(65);
+    var run: Vec<i64> = Vec::new();
+    var all256: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 512 {
+        if i < 300 {
+            run.push(120);
+        }
+        all256.push(i & 255);
+        i = i + 1;
+    }
+    check("empty", Vec::new(), 3);
+    check("one", one, 3);
+    check("run", run, 3);
+    check("text", text, 0);
+    check("text", text, 1);
+    check("text", text, 3);
+    check("text", text, 9);
+    check("skew", gen(600, 7, 1), 3);
+    check("four", gen(400, 21, 4), 3);
+    check("hiskew", gen(700, 9, 2), 3);
+    check("letters", gen(2000, 13, 3), 3);
+    check("all256", all256, 3);
+    check("noise", gen(500, 3, 0), 3);
+    // bytes are taken modulo 256
+    var big: Vec<i64> = Vec::new();
+    big.push(300);
+    big.push(1);
+    val back: Vec<i64> = zstd_decompress(zstd_compress(big));
+    println("masked: " + int_to_str(back.get(0)) + " " + int_to_str(back.get(1)));
+    println("str: " + zstd_decompress_str(zstd_compress_str("Hello, Zstandard! Hello, Zstandard!")));
+    val a: Vec<i64> = zstd_compress(text);
+    val b: Vec<i64> = zstd_compress_level(text, 3);
+    println("default is level 3: " + bool_to_str(hex(a) == hex(b)));
+    println("compressed is valid: " + bool_to_str(zstd_ok(a)));
+    return 0;
+}

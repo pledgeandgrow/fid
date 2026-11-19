@@ -1,0 +1,177 @@
+// D4 (release-roadmap Track D): pe_ir (the default Windows `fid emit`)
+// keeps values in r8 and r9 as well as in the seven callee-saved
+// registers and r10/r11, for live ranges that hold no call and that do
+// not start or end at one (a call's arguments go to rcx, rdx, r8, r9, and
+// parameters arrive there). The functions below keep more integers live
+// at once than the other nine registers hold, through divisions (rax and
+// rdx), shifts by a variable count (rcx), compares, branches, narrow
+// types and conversions to f64, with calls before and after those ranges.
+// FID_PE_OFF=r89 builds without r8/r9 (tests/nattools/d4_pe_arg_regs_check.sh
+// compares the two builds); every backend prints the same lines.
+//
+// Expected output:
+// 3257
+// 1782
+// 127
+// -4
+// 7
+// 600
+// 77
+
+fn bump(x: i64) -> i64 {
+    return x + 1;
+}
+
+/// Twelve locals and a counter live through a call-free loop.
+fn mix12(n: i64) -> i64 {
+    var a: i64 = 1;
+    var b: i64 = 2;
+    var c: i64 = 3;
+    var d: i64 = 4;
+    var e: i64 = 5;
+    var f: i64 = 6;
+    var g: i64 = 7;
+    var h: i64 = 8;
+    var p: i64 = 9;
+    var q: i64 = 10;
+    var r: i64 = 11;
+    var s: i64 = 12;
+    var i: i64 = 0;
+    while i < n {
+        a = (a + b) & 4095;
+        b = (b ^ c) + 1;
+        c = (c + d) % 1000;
+        d = (d * 3) & 1023;
+        e = (e + f / 2) & 2047;
+        f = (f + g) % 999;
+        g = (g << (i & 3)) & 4095;
+        h = (h + p) & 511;
+        p = (p ^ q) & 255;
+        q = (q + r) % 77;
+        r = (r + s) & 127;
+        s = (s + a) % 300;
+        i = i + 1;
+    }
+    return a + b + c + d + e + f + g + h + p + q + r + s;
+}
+
+/// Values made after a call and used before the next one, with a compare
+/// on each and narrow types in between.
+fn between_calls(n: i64) -> i64 {
+    var t: i64 = bump(n);
+    var x1: i64 = t * 2;
+    var x2: i64 = t * 3;
+    var x3: i64 = t * 5;
+    var x4: i64 = t * 7;
+    var x5: i64 = t * 11;
+    var x6: i64 = t * 13;
+    var x7: i64 = t * 17;
+    var x8: i64 = t * 19;
+    var x9: i64 = t * 23;
+    var x10: i64 = t * 29;
+    var x11: i64 = t * 31;
+    var small: i32 = (x1 % 100) as i32;
+    var tiny: u8 = (x2 % 200) as u8;
+    var sum: i64 = 0;
+    if x1 < x2 {
+        sum = sum + x1;
+    }
+    if x3 > x2 {
+        sum = sum + x3;
+    }
+    if x4 != x5 {
+        sum = sum + x4 + x5;
+    }
+    if x6 >= x6 {
+        sum = sum + x6;
+    }
+    if x7 <= x8 {
+        sum = sum + x7 + x8;
+    }
+    sum = sum + x9 + x10 + x11 + (small as i64) + (tiny as i64);
+    return bump(sum) - 1;
+}
+
+/// Divisions and variable shifts with ten values live.
+fn div_shift(seed: i64) -> i64 {
+    var v0: i64 = seed + 1;
+    var v1: i64 = seed + 2;
+    var v2: i64 = seed + 3;
+    var v3: i64 = seed + 4;
+    var v4: i64 = seed + 5;
+    var v5: i64 = seed + 6;
+    var v6: i64 = seed + 7;
+    var v7: i64 = seed + 8;
+    var v8: i64 = seed + 9;
+    var v9: i64 = seed + 10;
+    var k: i64 = 0;
+    var acc: i64 = 0;
+    while k < 10 {
+        acc = acc | ((v0 / (k + 1)) << (k & 1));
+        acc = acc | (v1 % (k + 2));
+        acc = acc | (v2 >> (k & 3));
+        acc = acc | ((v3 + v4 + v5) / 3);
+        acc = acc | ((v6 * v7) % 64);
+        acc = acc | ((v8 ^ v9) << 2);
+        acc = acc & 1023;
+        k = k + 1;
+    }
+    return acc;
+}
+
+/// f64 conversions of values kept in registers.
+fn to_float(n: i64) -> i64 {
+    var a: i64 = n;
+    var b: i64 = n + 1;
+    var c: i64 = n + 2;
+    var d: i64 = n + 3;
+    var e: i64 = n + 4;
+    var f: i64 = n + 5;
+    var g: i64 = n + 6;
+    var h: i64 = n + 7;
+    var i: i64 = n + 8;
+    var j: i64 = n + 9;
+    var x: f64 = (a as f64) + (b as f64) + (c as f64);
+    var y: f64 = (d as f64) * 2.0 - (e as f64);
+    var z: i64 = (x / 3.0) as i64 + (y as i64) + f + g - h - i - j + 1;
+    return z;
+}
+
+/// A loop whose counter and bounds stay in registers; the call is outside.
+fn count_odd(limit: i64) -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = limit;
+    var step: i64 = 1;
+    var odd: i64 = 0;
+    var a: i64 = 3;
+    var b: i64 = 5;
+    var c: i64 = 7;
+    var d: i64 = 9;
+    var e: i64 = 11;
+    var f: i64 = 13;
+    var g: i64 = 15;
+    while lo < hi {
+        if (lo & 1) == 1 {
+            odd = odd + 1;
+        }
+        a = a ^ b;
+        b = b ^ c;
+        c = c ^ d;
+        d = d ^ e;
+        e = e ^ f;
+        f = f ^ g;
+        g = g ^ a;
+        lo = lo + step;
+    }
+    return odd + ((a + b + c + d + e + f + g) & 0) ;
+}
+
+fn main() {
+    println(int_to_str(mix12(1000)));
+    println(int_to_str(between_calls(10)));
+    println(int_to_str(div_shift(100)));
+    println(int_to_str(to_float(5)));
+    println(int_to_str(count_odd(15)));
+    println(int_to_str(count_odd(1200)));
+    println(int_to_str(bump(76)));
+}

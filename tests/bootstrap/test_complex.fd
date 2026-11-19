@@ -1,0 +1,108 @@
+// stdlib/complex: complex numbers. Arithmetic, Smith division on scaled
+// operands (no overflow when a component of the divisor is huge), hypot
+// without overflow, polar form, exp/ln/pow/sqrt/sin/cos on their principal
+// branches, and the identities they must keep.
+//
+// Expected output:
+// (1+2i)+(3-4i) = 4.000000-2.000000i
+// (1+2i)-(3-4i) = -2.000000+6.000000i
+// (1+2i)*(3-4i) = 11.000000+2.000000i
+// (1+2i)/(3-4i) = -0.200000+0.400000i
+// -(1+2i) = -1-2i, conj = 1-2i
+// |3+4i| = 5.000000, arg(-1-i) = -2.356194
+// polar(2, pi/3) = 1.000000+1.732051i
+// e^(i*pi) + 1 = 0.000000000000+0.000000000000i, near 0: true
+// sqrt(-1) = 0+1i, equals i: true
+// sqrt(-4) = 0+2i, sqrt(3-4i) = 2.000000-1.000000i
+// sqrt(i)^2 = 0.000000+1.000000i
+// exp(1+i) = 1.468694+2.287355i
+// ln(i) = 0.000000+1.570796i, ln(-1) = 0.000000+3.141593i
+// exp(ln(2-3i)) = 2.000000-3.000000i
+// i^i = 0.207880+0.000000i
+// (1+i)^2 = 0.000000+2.000000i
+// sin(1+i) = 1.298458+0.634964i
+// cos(1+i) = 0.833730-0.988898i
+// sin^2 + cos^2 at 2+3i = 1.000000+0.000000i
+// |3e300+4e300i| / 1e300 = 5.000000
+// (1+i)/(1e308+1e308i) * 1e308 = 1.000000+0.000000i, finite: true
+// (1e308+1e308i)/(1e308+1e308i) = 1.000000+0.000000i
+// (1e300+1e300i)/(1e308+1e308i) * 1e8 = 1.000000+0.000000i
+// naive (1+i)/(1e308+1e308i) * 1e308 = nan+0.000000i
+// 1/(1e-308i) / 1e308 = 0.000000-1.000000i
+// near: true false
+// 3-4i 0.5+2i
+use complex;
+use math;
+
+fn p(z: Complex) -> str {
+    return complex_to_str_prec(z, 6);
+}
+
+fn b(v: bool) -> str {
+    if v {
+        return "true";
+    }
+    return "false";
+}
+
+/// a / b by the textbook formula (a * conj(b) / |b|^2): overflows.
+fn naive_div(a: Complex, d: Complex) -> Complex {
+    val den: f64 = d.re * d.re + d.im * d.im;
+    return complex((a.re * d.re + a.im * d.im) / den, (a.im * d.re - a.re * d.im) / den);
+}
+
+fn main() -> i64 {
+    val a: Complex = complex(1.0, 2.0);
+    val c: Complex = complex(3.0, -4.0);
+    println("(1+2i)+(3-4i) = " + p(complex_add(a, c)));
+    println("(1+2i)-(3-4i) = " + p(complex_sub(a, c)));
+    println("(1+2i)*(3-4i) = " + p(complex_mul(a, c)));
+    println("(1+2i)/(3-4i) = " + p(complex_div(a, c)));
+    println("-(1+2i) = " + complex_to_str(complex_neg(a)) + ", conj = " + complex_to_str(complex_conj(a)));
+    println("|3+4i| = " + re_str(complex_abs(complex(3.0, 4.0))) + ", arg(-1-i) = " + re_str(complex_arg(complex(-1.0, -1.0))));
+    val pi: f64 = math_pi();
+    println("polar(2, pi/3) = " + p(complex_from_polar(2.0, pi / 3.0)));
+
+    // e^(i*pi) + 1 = 0
+    val e: Complex = complex_add(complex_exp(complex(0.0, pi)), complex_one());
+    println("e^(i*pi) + 1 = " + complex_to_str_prec(e, 12) + ", near 0: " + b(complex_approx_eq(e, complex_zero(), 0.000000000000001)));
+
+    // sqrt(-1) = i exactly, and the principal branch
+    val s: Complex = complex_sqrt(complex(-1.0, 0.0));
+    println("sqrt(-1) = " + complex_to_str(s) + ", equals i: " + b(complex_eq(s, complex_i())));
+    println("sqrt(-4) = " + complex_to_str(complex_sqrt(complex(-4.0, 0.0))) + ", sqrt(3-4i) = " + p(complex_sqrt(c)));
+    val si: Complex = complex_sqrt(complex_i());
+    println("sqrt(i)^2 = " + p(complex_mul(si, si)));
+
+    println("exp(1+i) = " + p(complex_exp(complex(1.0, 1.0))));
+    println("ln(i) = " + p(complex_ln(complex_i())) + ", ln(-1) = " + p(complex_ln(complex(-1.0, 0.0))));
+    println("exp(ln(2-3i)) = " + p(complex_exp(complex_ln(complex(2.0, -3.0)))));
+    println("i^i = " + p(complex_pow(complex_i(), complex_i())));
+    println("(1+i)^2 = " + p(complex_pow(complex(1.0, 1.0), complex(2.0, 0.0))));
+    println("sin(1+i) = " + p(complex_sin(complex(1.0, 1.0))));
+    println("cos(1+i) = " + p(complex_cos(complex(1.0, 1.0))));
+    val w: Complex = complex(2.0, 3.0);
+    val sw: Complex = complex_sin(w);
+    val cw: Complex = complex_cos(w);
+    println("sin^2 + cos^2 at 2+3i = " + p(complex_add(complex_mul(sw, sw), complex_mul(cw, cw))));
+
+    // huge components: no overflow where the result is representable
+    println("|3e300+4e300i| / 1e300 = " + re_str(complex_abs(complex(3.0e300, 4.0e300)) / 1.0e300));
+    val huge: Complex = complex(1.0e308, 1.0e308);
+    val q1: Complex = complex_div(complex(1.0, 1.0), huge);
+    println("(1+i)/(1e308+1e308i) * 1e308 = " + p(complex_scale(q1, 1.0e308)) + ", finite: " + b(complex_is_finite(q1)));
+    println("(1e308+1e308i)/(1e308+1e308i) = " + p(complex_div(huge, huge)));
+    println("(1e300+1e300i)/(1e308+1e308i) * 1e8 = " + p(complex_scale(complex_div(complex(1.0e300, 1.0e300), huge), 100000000.0)));
+    println("naive (1+i)/(1e308+1e308i) * 1e308 = " + p(complex_scale(naive_div(complex(1.0, 1.0), huge), 1.0e308)));
+    println("1/(1e-308i) / 1e308 = " + p(complex_scale(complex_recip(complex(0.0, 1.0e-308)), 1.0e-308)));
+
+    println("near: " + b(complex_approx_eq(complex(1.0, 1.0), complex(1.0, 1.0000000001), 0.000000001)) + " " + b(complex_approx_eq(complex(1.0, 1.0), complex(1.0, 1.001), 0.000000001)));
+    println(complex_to_str(c) + " " + complex_to_str(complex(0.5, 2.0)));
+    return 0;
+}
+
+/// x with 6 decimals
+fn re_str(x: f64) -> str {
+    val t: str = complex_to_str_prec(complex(x, 0.0), 6);
+    return str_slice(t, 0, str_len(t) - 10);
+}

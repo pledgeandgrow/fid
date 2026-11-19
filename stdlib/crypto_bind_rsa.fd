@@ -1,0 +1,290 @@
+// RSA keys for crypto_bind (BCrypt on Windows, libcrypto on Linux and
+// macOS): the key formats both bindings share, in plain Fides (no FFI).
+// Release J5 / SL18.
+//
+// A key moves as BCrypt's blob (BCRYPT_RSAKEY_BLOB), on every system, so a
+// key made on one is read on the other:
+//   u32 Magic, u32 BitLength, u32 cbPublicExp, u32 cbModulus,
+//   u32 cbPrime1, u32 cbPrime2 (little-endian), then big-endian numbers:
+//   public ("RSA1"):       e, n
+//   full private ("RSA3"): e, n, p, q, dp (cbPrime1), dq (cbPrime2),
+//                          qinv (cbPrime1), d (cbModulus)
+// (BCrypt's RSAPUBLICBLOB and RSAFULLPRIVATEBLOB.)
+//
+//   use crypto_bind; use crypto_bind_rsa;
+//   val pub_blob = cb_rsa_public_blob(& n, & e);
+//   val ok = cb_rsa_verify_pkcs1(& pub_blob, "SHA256", & hash, & sig);
+//
+// The functions over keys (generate, sign, verify, encrypt, decrypt) are in
+// crypto_bind.fd and crypto_bind_unix.fd. Hash names: "SHA1", "SHA256",
+// "SHA384", "SHA512" (BCrypt's names).
+
+module crypto_bind_rsa;
+ use vec;
+
+// BCRYPT_RSAPUBLIC_MAGIC "RSA1", BCRYPT_RSAPRIVATE_MAGIC "RSA2",
+// BCRYPT_RSAFULLPRIVATE_MAGIC "RSA3"
+pub const CBR_PUBLIC: i64 = 826364754;
+pub const CBR_PRIVATE: i64 = 843141970;
+pub const CBR_FULL: i64 = 859919186;
+const CBR_HEADER: i64 = 24;
+
+/// The bytes of a big-endian number without its leading zeros.
+pub fn cbr_strip(v: & Vec) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() && (v.get(i) & 255) == 0 {
+        i = i + 1;
+    }
+    while i < v.len() {
+        out.push(v.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A big-endian number as exactly `n` bytes (zeros in front); empty when it
+/// does not fit.
+pub fn cbr_pad(v: & Vec, n: i64) -> Vec<i64> {
+    val s: Vec<i64> = cbr_strip(v);
+    var out: Vec<i64> = Vec::new();
+    if s.len() > n {
+        return out;
+    }
+    var i: i64 = s.len();
+    while i < n {
+        out.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < s.len() {
+        out.push(s.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The digest length of a hash name ("SHA256": 32), 0 for an unknown one.
+pub fn cbr_hash_len(alg: str) -> i64 {
+    if alg == "SHA1" {
+        return 20;
+    }
+    if alg == "SHA256" {
+        return 32;
+    }
+    if alg == "SHA384" {
+        return 48;
+    }
+    if alg == "SHA512" {
+        return 64;
+    }
+    return 0;
+}
+
+fn cbr_push_u32(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 24) & 255);
+}
+
+/// The u32 at `at` (little-endian), or -1 past the end.
+pub fn cbr_u32(v: & Vec, at: i64) -> i64 {
+    if at < 0 || at + 4 > v.len() {
+        return - 1;
+    }
+    return (v.get(at) & 255) | ((v.get(at + 1) & 255) << 8) | ((v.get(at + 2) & 255) << 16) | ((v.get(at + 3) & 255) << 24);
+}
+
+fn cbr_append(out: & mut Vec<i64>, v: & Vec) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+// The number of bits of a big-endian number.
+fn cbr_bits(v: & Vec) -> i64 {
+    val s: Vec<i64> = cbr_strip(v);
+    if s.len() == 0 {
+        return 0;
+    }
+    var top: i64 = s.get(0);
+    var bits: i64 = (s.len() - 1) * 8;
+    while top > 0 {
+        bits = bits + 1;
+        top = top >> 1;
+    }
+    return bits;
+}
+
+/// The public blob ("RSA1") of the modulus `n` and exponent `e` (big-endian
+/// bytes; leading zeros are dropped). Empty when either is zero.
+pub fn cb_rsa_public_blob(n: & Vec, e: & Vec) -> Vec<i64> {
+    val ns: Vec<i64> = cbr_strip(n);
+    val es: Vec<i64> = cbr_strip(e);
+    var out: Vec<i64> = Vec::new();
+    if ns.len() == 0 || es.len() == 0 {
+        return out;
+    }
+    cbr_push_u32(& mut out, CBR_PUBLIC);
+    cbr_push_u32(& mut out, cbr_bits(& ns));
+    cbr_push_u32(& mut out, es.len());
+    cbr_push_u32(& mut out, ns.len());
+    cbr_push_u32(& mut out, 0);
+    cbr_push_u32(& mut out, 0);
+    cbr_append(& mut out, & es);
+    cbr_append(& mut out, & ns);
+    return out;
+}
+
+/// The full private blob ("RSA3") of a key given by its parts (big-endian
+/// bytes, as PKCS#1 RSAPrivateKey and JWK name them: n, e, d, p, q,
+/// dp = d mod (p-1), dq = d mod (q-1), qi = q^-1 mod p). Empty when a part
+/// is missing or too long. The result holds the private key: treat it as a
+/// secret.
+pub fn cb_rsa_private_blob(n: & Vec, e: & Vec, d: & Vec, p: & Vec, q: & Vec, dp: & Vec, dq: & Vec, qi: & Vec) -> Vec<i64> {
+    val ns: Vec<i64> = cbr_strip(n);
+    val es: Vec<i64> = cbr_strip(e);
+    val ps: Vec<i64> = cbr_strip(p);
+    val qs: Vec<i64> = cbr_strip(q);
+    var out: Vec<i64> = Vec::new();
+    if ns.len() == 0 || es.len() == 0 || ps.len() == 0 || qs.len() == 0 {
+        return out;
+    }
+    val dpp: Vec<i64> = cbr_pad(dp, ps.len());
+    val dqp: Vec<i64> = cbr_pad(dq, qs.len());
+    val qip: Vec<i64> = cbr_pad(qi, ps.len());
+    val dpad: Vec<i64> = cbr_pad(d, ns.len());
+    if dpp.len() == 0 || dqp.len() == 0 || qip.len() == 0 || dpad.len() == 0 {
+        return out;
+    }
+    cbr_push_u32(& mut out, CBR_FULL);
+    cbr_push_u32(& mut out, cbr_bits(& ns));
+    cbr_push_u32(& mut out, es.len());
+    cbr_push_u32(& mut out, ns.len());
+    cbr_push_u32(& mut out, ps.len());
+    cbr_push_u32(& mut out, qs.len());
+    cbr_append(& mut out, & es);
+    cbr_append(& mut out, & ns);
+    cbr_append(& mut out, & ps);
+    cbr_append(& mut out, & qs);
+    cbr_append(& mut out, & dpp);
+    cbr_append(& mut out, & dqp);
+    cbr_append(& mut out, & qip);
+    cbr_append(& mut out, & dpad);
+    return out;
+}
+
+/// The size a blob with this header must have, or -1 for a header that is
+/// not one of an RSA key.
+fn cbr_blob_size(blob: & Vec) -> i64 {
+    val magic: i64 = cbr_u32(blob, 0);
+    val ce: i64 = cbr_u32(blob, 8);
+    val cn: i64 = cbr_u32(blob, 12);
+    val cp: i64 = cbr_u32(blob, 16);
+    val cq: i64 = cbr_u32(blob, 20);
+    if magic < 0 || cq < 0 || ce <= 0 || cn <= 0 || ce > 4096 || cn > 4096 || cp > 4096 || cq > 4096 {
+        return - 1;
+    }
+    if magic == CBR_PUBLIC {
+        return CBR_HEADER + ce + cn;
+    }
+    if cp <= 0 || cq <= 0 {
+        return - 1;
+    }
+    if magic == CBR_PRIVATE {
+        return CBR_HEADER + ce + cn + cp + cq;
+    }
+    if magic == CBR_FULL {
+        return CBR_HEADER + ce + cn + cp + cq + cp + cq + cp + cn;
+    }
+    return - 1;
+}
+
+/// True when `blob` is a well-formed RSA blob: a public one ("RSA1") or a
+/// full private one ("RSA3") when `want_private` (a private one is also a
+/// public key).
+pub fn cbr_blob_ok(blob: & Vec, want_private: bool) -> bool {
+    val size: i64 = cbr_blob_size(blob);
+    if size < 0 || size != blob.len() {
+        return false;
+    }
+    val magic: i64 = cbr_u32(blob, 0);
+    if want_private {
+        return magic == CBR_FULL;
+    }
+    return magic == CBR_PUBLIC || magic == CBR_FULL;
+}
+
+/// The modulus length in bytes (the length of every signature and
+/// ciphertext of the key), 0 for a malformed blob.
+pub fn cb_rsa_modulus_len(blob: & Vec) -> i64 {
+    if cbr_blob_size(blob) != blob.len() {
+        return 0;
+    }
+    return cbr_u32(blob, 12);
+}
+
+/// The key size in bits (2048 ...), 0 for a malformed blob.
+pub fn cb_rsa_bits(blob: & Vec) -> i64 {
+    if cbr_blob_size(blob) != blob.len() {
+        return 0;
+    }
+    return cbr_u32(blob, 4);
+}
+
+/// Part `k` of a blob, big-endian: 0 e, 1 n, 2 p, 3 q, 4 dp, 5 dq, 6 qi,
+/// 7 d (a public blob has only e and n). Empty when the blob lacks it.
+pub fn cbr_blob_part(blob: & Vec, k: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val size: i64 = cbr_blob_size(blob);
+    if size < 0 || size != blob.len() || k < 0 || k > 7 {
+        return out;
+    }
+    val magic: i64 = cbr_u32(blob, 0);
+    if k >= 2 && magic == CBR_PUBLIC {
+        return out;
+    }
+    if k >= 4 && magic != CBR_FULL {
+        return out;
+    }
+    val ce: i64 = cbr_u32(blob, 8);
+    val cn: i64 = cbr_u32(blob, 12);
+    val cp: i64 = cbr_u32(blob, 16);
+    val cq: i64 = cbr_u32(blob, 20);
+    // the lengths of the parts, in order
+    var lens: Vec<i64> = Vec::new();
+    lens.push(ce);
+    lens.push(cn);
+    lens.push(cp);
+    lens.push(cq);
+    lens.push(cp);
+    lens.push(cq);
+    lens.push(cp);
+    lens.push(cn);
+    var at: i64 = CBR_HEADER;
+    var i: i64 = 0;
+    while i < k {
+        at = at + lens.get(i);
+        i = i + 1;
+    }
+    i = 0;
+    while i < lens.get(k) {
+        out.push(blob.get(at + i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The public blob of a key blob (public or private); empty for a
+/// malformed one.
+pub fn cb_rsa_public_of(blob: & Vec) -> Vec<i64> {
+    if !cbr_blob_ok(blob, false) {
+        return Vec::new();
+    }
+    val n: Vec<i64> = cbr_blob_part(blob, 1);
+    val e: Vec<i64> = cbr_blob_part(blob, 0);
+    return cb_rsa_public_blob(& n, & e);
+}

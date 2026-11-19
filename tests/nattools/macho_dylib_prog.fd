@@ -1,0 +1,41 @@
+// TG15 (docs/roadmap/llvm-roadmap.md): a macOS executable of the machine
+// layer calling C functions of three dylibs through its own tables:
+// libSystem (atoi, hypot through `link "m"`), /usr/lib/libsqlite3.dylib
+// and /usr/lib/libz.dylib (both in every macOS since 10.x). Each import is
+// a GOT slot in __DATA that dyld binds (bind opcodes with the dylib's
+// ordinal, one LC_LOAD_DYLIB per dylib), called through a stub that moves
+// the arguments to the C convention (compiler/nat_ir.fd ng_gen_ldyn_stubs;
+// compiler/nat_enc.fd nat_macho_img, nat_macho_import).
+// Not part of the suite (it needs those dylibs). Check, on any host:
+//   fid emit tests/nattools/macho_dylib_prog.fd --target aarch64-macos -o m
+//   python3 tests/nattools/macho_imports_check.py m atoi hypot sqlite3_libversion_number zlibCompileFlags /usr/lib/libsqlite3.dylib /usr/lib/libz.dylib
+// (the same with --target x86_64-macos and --target universal), and on a
+// Mac run ./m, which prints:
+// true
+// true
+// -5
+// 13
+
+extern "C" link "sqlite3" {
+    fn sqlite3_libversion_number() -> i32;
+}
+
+extern "C" link "z" {
+    fn zlibCompileFlags() -> i64;
+}
+
+extern "C" link "m" {
+    fn hypot(x: f64, y: f64) -> f64;
+}
+
+extern "C" {
+    fn atoi(s: str) -> i32;
+}
+
+@unsafe
+fn main() {
+    println(sqlite3_libversion_number() as i64 > 3000000);
+    println(zlibCompileFlags() >= 0);
+    println(atoi("-5") as i64);
+    println(hypot(5.0, 12.0) as i64);
+}

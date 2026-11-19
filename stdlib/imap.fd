@@ -1,0 +1,1266 @@
+// Fides IMAP4rev1 client (RFC 3501): commands, a response parser, FETCH
+// items, envelopes and body structures
+//
+// Real (pure computation):
+//   - command tagging (A001, A002, ...) and builders for CAPABILITY, LOGIN,
+//     SELECT, EXAMINE, LIST, SEARCH / UID SEARCH, FETCH / UID FETCH, STORE /
+//     UID STORE, COPY, EXPUNGE, NOOP, IDLE (RFC 2177) and DONE, LOGOUT;
+//     strings sent as atoms, quoted strings, or literals {n} (a command with
+//     a literal is split where the server's "+" continuation is awaited,
+//     or uses {n+} with LITERAL+, RFC 7888);
+//   - an incremental response reader: a response is complete only when
+//     every literal {n} in it has its n bytes, so pieces of any size work;
+//   - the response grammar into a flat value tree: atoms (\Seen,
+//     BODY[HEADER.FIELDS (SUBJECT)]<0>), numbers, quoted strings with
+//     escapes, literals, NIL, parenthesized lists; tagged, untagged and
+//     continuation responses with resp-text codes ([UIDVALIDITY 3857529045],
+//     [READ-WRITE], [PERMANENTFLAGS (...)]);
+//   - SELECT results (EXISTS, RECENT, FLAGS, UNSEEN, UIDVALIDITY, UIDNEXT,
+//     PERMANENTFLAGS, READ-WRITE/READ-ONLY), SEARCH results, FETCH items
+//     (UID, FLAGS, RFC822.SIZE, INTERNALDATE, BODY[...] sections, ENVELOPE
+//     with its address lists, BODY/BODYSTRUCTURE as a list of parts with
+//     their section numbers), RFC 2047 encoded-words in subjects and names
+//     (B and Q, UTF-8 and ISO-8859-1);
+//   - a client that sends a command and gathers the untagged responses up
+//     to its tagged completion, and IDLE start / read one event / DONE.
+//
+// The transport seam: ImapTransport (conn, send, recv) as in stdlib smtp;
+// imap_tcp_transport(sock) is plain TCP over stdlib net. IMAPS (port 993)
+// or STARTTLS needs a TLS transport from the caller; this module does not
+// encrypt.
+//
+// Usage:
+//   use imap;
+//   var c: ImapClient = imap_client_new(imap_tcp_transport(sock));
+//   imap_greeting(&mut c);
+//   imap_login(&mut c, "user", "pass");
+//   val box: ImapMailbox = imap_select(&mut c, "INBOX");
+//   val ids: Vec<i64> = imap_search(&mut c, "UNSEEN");
+//   val msgs: Vec<ImapFetch> = imap_fetch(&mut c, "1:5", "(UID FLAGS ENVELOPE)");
+
+module imap;
+ use vec; use string; use encoding; use net;
+
+pub const IMAP_ATOM: i64 = 1;
+pub const IMAP_NUM: i64 = 2;
+pub const IMAP_STR: i64 = 3;
+pub const IMAP_NIL: i64 = 4;
+pub const IMAP_LIST: i64 = 5;
+
+// ─── Values ───────────────────────────────────────────────────────────────
+
+/// Parsed values as a flat tree: node i has kind[i], text[i] (atom or
+/// string bytes), num[i], and for a list its children.
+pub struct ImapDoc {
+    pub kind: Vec<i64>,
+    pub text: Vec<str>,
+    pub num: Vec<i64>,
+    pub first: Vec<i64>,
+    pub nkids: Vec<i64>,
+    pub kids: Vec<i64>,
+}
+
+fn im_doc() -> ImapDoc {
+    return ImapDoc { kind: Vec::new(), text: Vec::new(), num: Vec::new(), first: Vec::new(), nkids: Vec::new(), kids: Vec::new() };
+}
+
+fn im_node(d: & mut ImapDoc, kind: i64, text: str, num: i64) -> i64 {
+    d.kind.push(kind);
+    d.text.push(text);
+    d.num.push(num);
+    d.first.push(0);
+    d.nkids.push(0);
+    return d.kind.len() - 1;
+}
+
+pub fn imap_kind(d: & ImapDoc, i: i64) -> i64 {
+    return d.kind.get(i);
+}
+
+pub fn imap_text(d: & ImapDoc, i: i64) -> str {
+    return d.text.get(i);
+}
+
+pub fn imap_num(d: & ImapDoc, i: i64) -> i64 {
+    return d.num.get(i);
+}
+
+pub fn imap_count(d: & ImapDoc, i: i64) -> i64 {
+    return d.nkids.get(i);
+}
+
+pub fn imap_child(d: & ImapDoc, i: i64, k: i64) -> i64 {
+    return d.kids.get(d.first.get(i) + k);
+}
+
+/// A string value (STR, ATOM or NUM as text), "" for NIL or a list.
+pub fn imap_string(d: & ImapDoc, i: i64) -> str {
+    val k: i64 = d.kind.get(i);
+    if k == IMAP_STR || k == IMAP_ATOM || k == IMAP_NUM {
+        return d.text.get(i);
+    }
+    return "";
+}
+
+/// IMAP syntax of node i (strings quoted), for logs and tests.
+pub fn imap_to_str(d: & ImapDoc, i: i64) -> str {
+    val k: i64 = d.kind.get(i);
+    if k == IMAP_NIL {
+        return "NIL";
+    }
+    if k == IMAP_STR {
+        return imap_quote(d.text.get(i));
+    }
+    if k == IMAP_LIST {
+        var out: str = "(";
+        var j: i64 = 0;
+        while j < d.nkids.get(i) {
+            if j > 0 {
+                out = out + " ";
+            }
+            out = out + imap_to_str(d, imap_child(d, i, j));
+            j = j + 1;
+        }
+        return out + ")";
+    }
+    return d.text.get(i);
+}
+
+// ─── Responses ────────────────────────────────────────────────────────────
+
+/// One server response. tag: "*" untagged, "+" continuation, or the
+/// command's tag. For "* 12 FETCH (...)": num 12, word "FETCH". For
+/// status responses (OK, NO, BAD, PREAUTH, BYE): word is it, code the
+/// bracketed resp-text code ("UIDVALIDITY 3857529045"), text the rest.
+/// values: the line's values after the word (a list node for FETCH).
+pub struct ImapResponse {
+    pub complete: bool,
+    pub ok: bool,
+    pub error: str,
+    pub used: i64,
+    pub tag: str,
+    pub num: i64,
+    pub word: str,
+    pub code: str,
+    pub text: str,
+    pub doc: ImapDoc,
+    pub values: Vec<i64>,
+}
+
+struct ImReader {
+    b: Vec<i64>,
+    pos: i64,
+    end: i64,
+    ok: bool,
+    more: bool,
+    error: str,
+}
+
+fn im_fail(r: & mut ImReader, msg: str) {
+    if r.ok {
+        r.ok = false;
+        r.error = msg + " at byte " + int_to_str(r.pos);
+    }
+}
+
+fn im_peek(r: & ImReader) -> i64 {
+    if r.pos >= r.end {
+        return 0 - 1;
+    }
+    return r.b.get(r.pos);
+}
+
+fn im_skip_spaces(r: & mut ImReader) {
+    while r.pos < r.end && r.b.get(r.pos) == 32 {
+        r.pos = r.pos + 1;
+    }
+}
+
+fn im_slice(r: & ImReader, a: i64, e: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < e {
+        out.push(r.b.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn im_is_atom_char(c: i64) -> bool {
+    // atom-char: not ( ) { SP CTL % * " \ ] ; we also stop at '[' handling
+    return c > 32 && c < 127 && c != 40 && c != 41 && c != 123 && c != 34 && c != 93;
+}
+
+// An atom; brackets inside (BODY[HEADER.FIELDS (A B)]<0.100>) are taken
+// whole, spaces and parentheses included.
+fn im_atom(r: & mut ImReader) -> str {
+    val start: i64 = r.pos;
+    var depth: i64 = 0;
+    while r.pos < r.end {
+        val c: i64 = r.b.get(r.pos);
+        if c == 91 {
+            depth = depth + 1;
+        } else if c == 93 {
+            if depth == 0 {
+                break;
+            }
+            depth = depth - 1;
+        } else if depth == 0 && !im_is_atom_char(c) {
+            break;
+        } else if c == 13 || c == 10 {
+            break;
+        }
+        r.pos = r.pos + 1;
+    }
+    return im_slice(r, start, r.pos);
+}
+
+fn im_set_kids(d: & mut ImapDoc, node: i64, ids: Vec<i64>) {
+    d.first.set(node, d.kids.len());
+    d.nkids.set(node, ids.len());
+    var i: i64 = 0;
+    while i < ids.len() {
+        d.kids.push(ids.get(i));
+        i = i + 1;
+    }
+}
+
+fn im_value(d: & mut ImapDoc, r: & mut ImReader, depth: i64) -> i64 {
+    im_skip_spaces(r);
+    val c: i64 = im_peek(r);
+    if c < 0 {
+        r.more = true;
+        im_fail(r, "need more bytes");
+        return 0 - 1;
+    }
+    if depth > 64 {
+        im_fail(r, "nested too deep");
+        return 0 - 1;
+    }
+    if c == 40 {
+        r.pos = r.pos + 1;
+        val node: i64 = im_node(d, IMAP_LIST, "", 0);
+        var ids: Vec<i64> = Vec::new();
+        while r.ok {
+            im_skip_spaces(r);
+            val p: i64 = im_peek(r);
+            if p == 41 {
+                r.pos = r.pos + 1;
+                im_set_kids(d, node, ids);
+                return node;
+            }
+            if p == 13 || p == 10 {
+                im_fail(r, "line ends inside a list");
+                return 0 - 1;
+            }
+            ids.push(im_value(d, r, depth + 1));
+        }
+        return 0 - 1;
+    }
+    if c == 34 {
+        r.pos = r.pos + 1;
+        var out: Vec<i64> = Vec::new();
+        while r.pos < r.end {
+            val q: i64 = r.b.get(r.pos);
+            if q == 34 {
+                r.pos = r.pos + 1;
+                return im_node(d, IMAP_STR, str_from_bytes(out), 0);
+            }
+            if q == 92 {
+                r.pos = r.pos + 1;
+                if r.pos >= r.end {
+                    break;
+                }
+            } else if q == 13 || q == 10 {
+                im_fail(r, "line ends inside a quoted string");
+                return 0 - 1;
+            }
+            out.push(r.b.get(r.pos));
+            r.pos = r.pos + 1;
+        }
+        r.more = true;
+        im_fail(r, "need more bytes");
+        return 0 - 1;
+    }
+    if c == 123 {
+        // {n}CRLF then n bytes ({n+} accepted too)
+        var p: i64 = r.pos + 1;
+        var n: i64 = 0;
+        var digits: i64 = 0;
+        while p < r.end && r.b.get(p) >= 48 && r.b.get(p) <= 57 {
+            n = n * 10 + (r.b.get(p) - 48);
+            digits = digits + 1;
+            p = p + 1;
+        }
+        if p < r.end && r.b.get(p) == 43 {
+            p = p + 1;
+        }
+        if p + 2 >= r.end {
+            r.more = true;
+            im_fail(r, "need more bytes");
+            return 0 - 1;
+        }
+        if digits == 0 || digits > 9 || r.b.get(p) != 125 || r.b.get(p + 1) != 13 || r.b.get(p + 2) != 10 {
+            im_fail(r, "bad literal");
+            return 0 - 1;
+        }
+        val start: i64 = p + 3;
+        if start + n > r.end {
+            r.more = true;
+            im_fail(r, "need more bytes");
+            return 0 - 1;
+        }
+        r.pos = start + n;
+        return im_node(d, IMAP_STR, im_slice(r, start, start + n), 0);
+    }
+    if c == 13 || c == 10 || c == 41 {
+        im_fail(r, "value expected");
+        return 0 - 1;
+    }
+    val a: str = im_atom(r);
+    if str_len(a) == 0 {
+        im_fail(r, "bad character " + int_to_str(c));
+        r.pos = r.pos + 1;
+        return 0 - 1;
+    }
+    if str_to_upper(a) == "NIL" {
+        return im_node(d, IMAP_NIL, "", 0);
+    }
+    var all_digits: bool = str_len(a) <= 18;
+    var i: i64 = 0;
+    while i < str_len(a) && all_digits {
+        val ch: i64 = str_byte_at(a, i);
+        if ch < 48 || ch > 57 {
+            all_digits = false;
+        }
+        i = i + 1;
+    }
+    if all_digits {
+        return im_node(d, IMAP_NUM, a, str_parse_int(a));
+    }
+    return im_node(d, IMAP_ATOM, a, 0);
+}
+
+// Read to the end of the line (CRLF), as text.
+fn im_rest_of_line(r: & mut ImReader) -> str {
+    im_skip_spaces(r);
+    val start: i64 = r.pos;
+    while r.pos < r.end && r.b.get(r.pos) != 13 && r.b.get(r.pos) != 10 {
+        r.pos = r.pos + 1;
+    }
+    return im_slice(r, start, r.pos);
+}
+
+fn im_eol(r: & mut ImReader) {
+    if r.pos + 1 < r.end && r.b.get(r.pos) == 13 && r.b.get(r.pos + 1) == 10 {
+        r.pos = r.pos + 2;
+        return;
+    }
+    if r.pos < r.end && r.b.get(r.pos) == 10 {
+        r.pos = r.pos + 1;
+        return;
+    }
+    if r.pos >= r.end || (r.b.get(r.pos) == 13 && r.pos + 1 >= r.end) {
+        r.more = true;
+        im_fail(r, "need more bytes");
+        return;
+    }
+    im_fail(r, "junk at the end of the line");
+}
+
+fn im_is_status(w: str) -> bool {
+    return w == "OK" || w == "NO" || w == "BAD" || w == "PREAUTH" || w == "BYE";
+}
+
+fn im_empty_response() -> ImapResponse {
+    return ImapResponse { complete: false, ok: true, error: "", used: 0, tag: "", num: 0 - 1, word: "", code: "", text: "", doc: im_doc(), values: Vec::new() };
+}
+
+/// Parse the response starting at byte `at`. complete false (and ok true)
+/// when more bytes are needed.
+pub fn imap_parse_response(bytes: Vec<i64>, at: i64) -> ImapResponse {
+    var res: ImapResponse = im_empty_response();
+    // a whole line must be there first (a literal's bytes are checked later)
+    var r: ImReader = ImReader { b: bytes, pos: at, end: bytes.len(), ok: true, more: false, error: "" };
+    if r.pos >= r.end {
+        return res;
+    }
+    var d: ImapDoc = im_doc();
+    if im_peek(& r) == 43 {
+        r.pos = r.pos + 1;
+        res.tag = "+";
+        val probe: i64 = r.pos;
+        res.text = im_rest_of_line(& mut r);
+        if r.pos >= r.end {
+            r.pos = probe;
+            return res;
+        }
+        im_eol(& mut r);
+    } else {
+        val tag: str = im_atom(& mut r);
+        if str_len(tag) == 0 || im_peek(& r) != 32 {
+            if r.pos >= r.end {
+                return res;
+            }
+            res.ok = false;
+            res.complete = true;
+            res.error = "bad tag";
+            return res;
+        }
+        res.tag = tag;
+        im_skip_spaces(& mut r);
+        var word: str = im_atom(& mut r);
+        if str_len(word) > 0 && char_is_digit(str_byte_at(word, 0)) && res.tag == "*" {
+            res.num = str_parse_int(word);
+            im_skip_spaces(& mut r);
+            word = im_atom(& mut r);
+        }
+        res.word = str_to_upper(word);
+        if im_is_status(res.word) {
+            im_skip_spaces(& mut r);
+            if im_peek(& r) == 91 {
+                // [CODE args]: up to the matching ']'
+                r.pos = r.pos + 1;
+                val cs: i64 = r.pos;
+                var depth: i64 = 0;
+                while r.pos < r.end && r.b.get(r.pos) != 13 && (r.b.get(r.pos) != 93 || depth > 0) {
+                    if r.b.get(r.pos) == 40 { depth = depth + 1; }
+                    if r.b.get(r.pos) == 41 { depth = depth - 1; }
+                    r.pos = r.pos + 1;
+                }
+                res.code = im_slice(& r, cs, r.pos);
+                if r.pos < r.end && r.b.get(r.pos) == 93 {
+                    r.pos = r.pos + 1;
+                }
+            }
+            res.text = im_rest_of_line(& mut r);
+            im_eol(& mut r);
+        } else {
+            // values up to the end of the line
+            while r.ok {
+                im_skip_spaces(& mut r);
+                val p: i64 = im_peek(& r);
+                if p == 13 || p == 10 || p < 0 {
+                    break;
+                }
+                res.values.push(im_value(& mut d, & mut r, 0));
+            }
+            if r.ok {
+                im_eol(& mut r);
+            }
+        }
+    }
+    if !r.ok {
+        if r.more {
+            return im_empty_response();
+        }
+        res.ok = false;
+        res.complete = true;
+        res.error = r.error;
+        res.used = r.pos - at;
+        return res;
+    }
+    res.doc = d;
+    res.complete = true;
+    res.used = r.pos - at;
+    return res;
+}
+
+// ─── Strings in commands ──────────────────────────────────────────────────
+
+/// A quoted string ("a \"b\"").
+pub fn imap_quote(s: str) -> str {
+    var out: str = "\"";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 34 || c == 92 {
+            out = out + "\\";
+        }
+        out = out + char_to_str(c);
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+/// How to send `s` as an astring: itself when it is a safe atom, quoted
+/// when it can be, else "" (a literal is needed).
+pub fn imap_astring(s: str) -> str {
+    val n: i64 = str_len(s);
+    if n == 0 {
+        return "\"\"";
+    }
+    var atom: bool = true;
+    var quotable: bool = true;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 13 || c == 10 || c == 0 || c > 127 {
+            quotable = false;
+        }
+        if !im_is_atom_char(c) || c == 37 || c == 42 || c == 92 || c == 91 {
+            atom = false;
+        }
+        i = i + 1;
+    }
+    if atom {
+        return s;
+    }
+    if quotable {
+        return imap_quote(s);
+    }
+    return "";
+}
+
+// ─── The client ───────────────────────────────────────────────────────────
+
+pub struct ImapTransport {
+    pub conn: i64,
+    pub send: fn(i64, Vec<i64>) -> i64,
+    pub recv: fn(i64, i64) -> Vec<i64>,
+}
+
+pub fn imap_tcp_transport(sock: i64) -> ImapTransport {
+    return ImapTransport { conn: sock, send: net_send_bytes, recv: net_recv_bytes };
+}
+
+pub struct ImapClient {
+    pub tr: ImapTransport,
+    pub inbuf: Vec<i64>,
+    pub next_tag: i64,
+    pub prefix: str,
+    pub ok: bool,
+    pub error: str,
+    pub caps: Vec<str>,
+    pub literal_plus: bool,
+    pub idle_tag: str,
+}
+
+pub fn imap_client_new(tr: ImapTransport) -> ImapClient {
+    return ImapClient { tr: tr, inbuf: Vec::new(), next_tag: 1, prefix: "A", ok: true, error: "", caps: Vec::new(), literal_plus: false, idle_tag: "" };
+}
+
+/// The next tag: A001, A002, ...
+pub fn imap_next_tag(c: & mut ImapClient) -> str {
+    var n: str = int_to_str(c.next_tag);
+    while str_len(n) < 3 {
+        n = "0" + n;
+    }
+    c.next_tag = c.next_tag + 1;
+    return c.prefix + n;
+}
+
+fn im_write(c: & mut ImapClient, s: str) {
+    if !c.ok {
+        return;
+    }
+    val send: fn(i64, Vec<i64>) -> i64 = c.tr.send;
+    val b: Vec<i64> = str_bytes(s);
+    if send(c.tr.conn, b) != b.len() {
+        c.ok = false;
+        c.error = "send failed";
+    }
+}
+
+/// Read one whole response from the connection.
+pub fn imap_read_response(c: & mut ImapClient) -> ImapResponse {
+    while c.ok {
+        val res: ImapResponse = imap_parse_response(c.inbuf, 0);
+        if res.complete {
+            var rest: Vec<i64> = Vec::new();
+            var i: i64 = res.used;
+            while i < c.inbuf.len() {
+                rest.push(c.inbuf.get(i));
+                i = i + 1;
+            }
+            c.inbuf = rest;
+            if !res.ok {
+                c.ok = false;
+                c.error = "bad response: " + res.error;
+            }
+            return res;
+        }
+        val recv: fn(i64, i64) -> Vec<i64> = c.tr.recv;
+        val got: Vec<i64> = recv(c.tr.conn, 16384);
+        if got.len() == 0 {
+            c.ok = false;
+            c.error = "connection closed";
+        } else {
+            var j: i64 = 0;
+            while j < got.len() {
+                c.inbuf.push(got.get(j));
+                j = j + 1;
+            }
+        }
+    }
+    var e: ImapResponse = im_empty_response();
+    e.ok = false;
+    e.error = c.error;
+    return e;
+}
+
+/// A command's outcome: the tagged status (OK/NO/BAD), its code and text,
+/// and every untagged response that came before it.
+pub struct ImapResult {
+    pub ok: bool,
+    pub status: str,
+    pub code: str,
+    pub text: str,
+    pub untagged: Vec<ImapResponse>,
+}
+
+/// Send a command (without tag) and read up to its tagged completion.
+/// `literals` are sent as {n} literals where the command has "{}" (each
+/// after the server's "+").
+pub fn imap_command_lit(c: & mut ImapClient, cmd: str, literals: Vec<str>) -> ImapResult {
+    var out: ImapResult = ImapResult { ok: false, status: "", code: "", text: "", untagged: Vec::new() };
+    val tag: str = imap_next_tag(c);
+    val parts: Vec<str> = str_split(cmd, "{}");
+    var line: str = tag + " " + parts.get(0);
+    var k: i64 = 0;
+    while k < literals.len() && k + 1 < parts.len() {
+        val lit: str = literals.get(k);
+        if c.literal_plus {
+            line = line + "{" + int_to_str(str_len(lit)) + "+}\r\n" + lit + parts.get(k + 1);
+        } else {
+            im_write(c, line + "{" + int_to_str(str_len(lit)) + "}\r\n");
+            // wait for the continuation
+            var cont: bool = false;
+            while c.ok && !cont {
+                val r: ImapResponse = imap_read_response(c);
+                if r.tag == "+" {
+                    cont = true;
+                } else if r.tag == tag {
+                    out.status = r.word;
+                    out.code = r.code;
+                    out.text = r.text;
+                    return out;
+                } else if c.ok {
+                    out.untagged.push(r);
+                }
+            }
+            line = lit + parts.get(k + 1);
+        }
+        k = k + 1;
+    }
+    im_write(c, line + "\r\n");
+    while c.ok {
+        val r: ImapResponse = imap_read_response(c);
+        if !c.ok {
+            break;
+        }
+        if r.tag == tag {
+            out.status = r.word;
+            out.code = r.code;
+            out.text = r.text;
+            out.ok = r.word == "OK";
+            return out;
+        }
+        if r.tag == "*" {
+            out.untagged.push(r);
+        }
+    }
+    out.status = "ERROR";
+    out.text = c.error;
+    return out;
+}
+
+pub fn imap_command(c: & mut ImapClient, cmd: str) -> ImapResult {
+    return imap_command_lit(c, cmd, Vec::new());
+}
+
+/// Read the server greeting (OK or PREAUTH; BYE refuses).
+pub fn imap_greeting(c: & mut ImapClient) -> bool {
+    val r: ImapResponse = imap_read_response(c);
+    if !c.ok {
+        return false;
+    }
+    im_note_caps(c, r.code);
+    return r.tag == "*" && (r.word == "OK" || r.word == "PREAUTH");
+}
+
+fn im_note_caps(c: & mut ImapClient, code: str) {
+    if str_starts_with(str_to_upper(code), "CAPABILITY ") {
+        im_set_caps(c, str_split(str_slice(code, 11, str_len(code)), " "));
+    }
+}
+
+fn im_set_caps(c: & mut ImapClient, words: Vec<str>) {
+    c.caps = Vec::new();
+    var i: i64 = 0;
+    while i < words.len() {
+        val w: str = str_to_upper(words.get(i));
+        if str_len(w) > 0 {
+            c.caps.push(w);
+            if w == "LITERAL+" {
+                c.literal_plus = true;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+pub fn imap_has_cap(c: & ImapClient, cap: str) -> bool {
+    var i: i64 = 0;
+    while i < c.caps.len() {
+        if c.caps.get(i) == str_to_upper(cap) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn imap_capability(c: & mut ImapClient) -> Vec<str> {
+    val r: ImapResult = imap_command(c, "CAPABILITY");
+    var i: i64 = 0;
+    while i < r.untagged.len() {
+        val u: ImapResponse = r.untagged.get(i);
+        if u.word == "CAPABILITY" {
+            var words: Vec<str> = Vec::new();
+            var k: i64 = 0;
+            while k < u.values.len() {
+                words.push(imap_to_str(& u.doc, u.values.get(k)));
+                k = k + 1;
+            }
+            im_set_caps(c, words);
+        }
+        i = i + 1;
+    }
+    return c.caps;
+}
+
+// An astring for a command, or "{}" with the string added to `lits`.
+fn im_arg(s: str, lits: & mut Vec<str>) -> str {
+    val a: str = imap_astring(s);
+    if str_len(a) > 0 {
+        return a;
+    }
+    lits.push(s);
+    return "{}";
+}
+
+pub fn imap_login(c: & mut ImapClient, user: str, pass: str) -> ImapResult {
+    var lits: Vec<str> = Vec::new();
+    val u: str = im_arg(user, & mut lits);
+    val p: str = im_arg(pass, & mut lits);
+    val r: ImapResult = imap_command_lit(c, "LOGIN " + u + " " + p, lits);
+    im_note_caps(c, r.code);
+    return r;
+}
+
+/// What SELECT / EXAMINE report.
+pub struct ImapMailbox {
+    pub ok: bool,
+    pub exists: i64,
+    pub recent: i64,
+    pub unseen: i64,
+    pub uidvalidity: i64,
+    pub uidnext: i64,
+    pub flags: Vec<str>,
+    pub permanent_flags: Vec<str>,
+    pub read_write: bool,
+    pub text: str,
+}
+
+fn im_code_num(code: str, name: str) -> i64 {
+    val u: str = str_to_upper(code);
+    if str_starts_with(u, name + " ") {
+        return str_parse_int(str_trim(str_slice(code, str_len(name) + 1, str_len(code))));
+    }
+    return 0 - 1;
+}
+
+fn im_paren_words(s: str) -> Vec<str> {
+    var t: str = str_trim(s);
+    if str_starts_with(t, "(") {
+        t = str_slice(t, 1, str_len(t));
+    }
+    if str_ends_with(t, ")") {
+        t = str_slice(t, 0, str_len(t) - 1);
+    }
+    var out: Vec<str> = Vec::new();
+    val ws: Vec<str> = str_split(t, " ");
+    var i: i64 = 0;
+    while i < ws.len() {
+        if str_len(ws.get(i)) > 0 {
+            out.push(ws.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The mailbox state from a SELECT/EXAMINE result.
+pub fn imap_mailbox_from(r: & ImapResult) -> ImapMailbox {
+    var m: ImapMailbox = ImapMailbox { ok: r.ok, exists: 0, recent: 0, unseen: 0 - 1, uidvalidity: 0 - 1, uidnext: 0 - 1, flags: Vec::new(), permanent_flags: Vec::new(), read_write: str_to_upper(r.code) == "READ-WRITE", text: r.text };
+    var i: i64 = 0;
+    while i < r.untagged.len() {
+        val u: ImapResponse = r.untagged.get(i);
+        if u.word == "EXISTS" {
+            m.exists = u.num;
+        } else if u.word == "RECENT" {
+            m.recent = u.num;
+        } else if u.word == "FLAGS" && u.values.len() == 1 {
+            var k: i64 = 0;
+            while k < imap_count(& u.doc, u.values.get(0)) {
+                m.flags.push(imap_text(& u.doc, imap_child(& u.doc, u.values.get(0), k)));
+                k = k + 1;
+            }
+        } else if u.word == "OK" {
+            if im_code_num(u.code, "UNSEEN") >= 0 {
+                m.unseen = im_code_num(u.code, "UNSEEN");
+            } else if im_code_num(u.code, "UIDVALIDITY") >= 0 {
+                m.uidvalidity = im_code_num(u.code, "UIDVALIDITY");
+            } else if im_code_num(u.code, "UIDNEXT") >= 0 {
+                m.uidnext = im_code_num(u.code, "UIDNEXT");
+            } else if str_starts_with(str_to_upper(u.code), "PERMANENTFLAGS ") {
+                m.permanent_flags = im_paren_words(str_slice(u.code, 15, str_len(u.code)));
+            }
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+pub fn imap_select(c: & mut ImapClient, mailbox: str) -> ImapMailbox {
+    var lits: Vec<str> = Vec::new();
+    val r: ImapResult = imap_command_lit(c, "SELECT " + im_arg(mailbox, & mut lits), lits);
+    return imap_mailbox_from(& r);
+}
+
+pub fn imap_examine(c: & mut ImapClient, mailbox: str) -> ImapMailbox {
+    var lits: Vec<str> = Vec::new();
+    val r: ImapResult = imap_command_lit(c, "EXAMINE " + im_arg(mailbox, & mut lits), lits);
+    return imap_mailbox_from(& r);
+}
+
+/// The numbers of "* SEARCH ..." responses in a result.
+pub fn imap_search_results(r: & ImapResult) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < r.untagged.len() {
+        val u: ImapResponse = r.untagged.get(i);
+        if u.word == "SEARCH" {
+            var k: i64 = 0;
+            while k < u.values.len() {
+                if imap_kind(& u.doc, u.values.get(k)) == IMAP_NUM {
+                    out.push(imap_num(& u.doc, u.values.get(k)));
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// SEARCH with criteria as IMAP text ("UNSEEN FROM \"ada\" SINCE 1-Feb-2026").
+pub fn imap_search(c: & mut ImapClient, criteria: str) -> Vec<i64> {
+    val r: ImapResult = imap_command(c, "SEARCH " + criteria);
+    return imap_search_results(& r);
+}
+
+pub fn imap_uid_search(c: & mut ImapClient, criteria: str) -> Vec<i64> {
+    val r: ImapResult = imap_command(c, "UID SEARCH " + criteria);
+    return imap_search_results(& r);
+}
+
+/// STORE: e.g. imap_store(c, "2:4", "+FLAGS.SILENT", "(\\Deleted)").
+pub fn imap_store(c: & mut ImapClient, set: str, op: str, flags: str) -> ImapResult {
+    return imap_command(c, "STORE " + set + " " + op + " " + flags);
+}
+
+pub fn imap_logout(c: & mut ImapClient) -> ImapResult {
+    return imap_command(c, "LOGOUT");
+}
+
+/// Start IDLE: true once the server's continuation came.
+pub fn imap_idle_start(c: & mut ImapClient) -> bool {
+    val tag: str = imap_next_tag(c);
+    im_write(c, tag + " IDLE\r\n");
+    while c.ok {
+        val r: ImapResponse = imap_read_response(c);
+        if r.tag == "+" {
+            c.idle_tag = tag;
+            return true;
+        }
+        if r.tag == tag {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// The next untagged response during IDLE ("* 23 EXISTS", "* 4 EXPUNGE").
+pub fn imap_idle_next(c: & mut ImapClient) -> ImapResponse {
+    return imap_read_response(c);
+}
+
+/// End IDLE (DONE) and read the tagged completion.
+pub fn imap_idle_done(c: & mut ImapClient) -> ImapResult {
+    var out: ImapResult = ImapResult { ok: false, status: "", code: "", text: "", untagged: Vec::new() };
+    im_write(c, "DONE\r\n");
+    while c.ok {
+        val r: ImapResponse = imap_read_response(c);
+        if r.tag == c.idle_tag {
+            out.ok = r.word == "OK";
+            out.status = r.word;
+            out.text = r.text;
+            c.idle_tag = "";
+            return out;
+        }
+        if r.tag == "*" {
+            out.untagged.push(r);
+        }
+    }
+    return out;
+}
+
+// ─── FETCH ────────────────────────────────────────────────────────────────
+
+/// An address of an envelope: "Name <mailbox@host>" in `full`.
+pub struct ImapAddress {
+    pub name: str,
+    pub mailbox: str,
+    pub host: str,
+    pub full: str,
+}
+
+pub struct ImapEnvelope {
+    pub date: str,
+    pub subject: str,
+    pub from: Vec<ImapAddress>,
+    pub sender: Vec<ImapAddress>,
+    pub reply_to: Vec<ImapAddress>,
+    pub to: Vec<ImapAddress>,
+    pub cc: Vec<ImapAddress>,
+    pub bcc: Vec<ImapAddress>,
+    pub in_reply_to: str,
+    pub message_id: str,
+}
+
+/// One part of a body structure: section "1", "2.1" (or "TEXT" for a
+/// single-part message: section "1"), type/subtype lowercase, parameters
+/// "name=value;..." and the transfer encoding, size in bytes, lines for text.
+pub struct ImapPart {
+    pub section: str,
+    pub mime: str,
+    pub params: str,
+    pub id: str,
+    pub description: str,
+    pub encoding: str,
+    pub size: i64,
+    pub lines: i64,
+    pub multipart: bool,
+}
+
+/// The items of one FETCH response (seq: its message number).
+pub struct ImapFetch {
+    pub seq: i64,
+    pub uid: i64,
+    pub flags: Vec<str>,
+    pub size: i64,
+    pub internal_date: str,
+    pub has_envelope: bool,
+    pub envelope: ImapEnvelope,
+    pub parts: Vec<ImapPart>,
+    pub section_names: Vec<str>,
+    pub section_data: Vec<str>,
+}
+
+fn im_hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return 0 - 1;
+}
+
+// Latin-1 bytes as UTF-8.
+fn im_latin1(b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c < 128 {
+            out.push(c);
+        } else {
+            out.push(192 | (c >> 6));
+            out.push(128 | (c & 63));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Decode RFC 2047 encoded-words (=?charset?B|Q?text?=) in a header value;
+/// UTF-8, US-ASCII and ISO-8859-1 charsets; whitespace between two
+/// encoded-words is dropped. Unknown charsets are left as they are.
+pub fn imap_decode_words(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    var last_word_end: i64 = 0 - 1;
+    while i < n {
+        if str_byte_at(s, i) == 61 && i + 1 < n && str_byte_at(s, i + 1) == 63 {
+            val q1: i64 = str_find(str_slice(s, i + 2, n), "?");
+            if q1 > 0 && i + 2 + q1 + 2 < n && str_byte_at(s, i + 2 + q1 + 2) == 63 {
+                val charset: str = str_to_upper(str_slice(s, i + 2, i + 2 + q1));
+                val enc: i64 = char_to_upper(str_byte_at(s, i + 2 + q1 + 1));
+                val tstart: i64 = i + 2 + q1 + 3;
+                val tend_rel: i64 = str_find(str_slice(s, tstart, n), "?=");
+                if tend_rel >= 0 && (enc == 66 || enc == 81) && (charset == "UTF-8" || charset == "US-ASCII" || charset == "ISO-8859-1") {
+                    val text: str = str_slice(s, tstart, tstart + tend_rel);
+                    var bytes: Vec<i64> = Vec::new();
+                    if enc == 66 {
+                        bytes = b64_decode_bytes(text);
+                    } else {
+                        var k: i64 = 0;
+                        while k < str_len(text) {
+                            val ch: i64 = str_byte_at(text, k);
+                            if ch == 95 {
+                                bytes.push(32);
+                                k = k + 1;
+                            } else if ch == 61 && k + 2 < str_len(text) && im_hexv(str_byte_at(text, k + 1)) >= 0 && im_hexv(str_byte_at(text, k + 2)) >= 0 {
+                                bytes.push(im_hexv(str_byte_at(text, k + 1)) * 16 + im_hexv(str_byte_at(text, k + 2)));
+                                k = k + 3;
+                            } else {
+                                bytes.push(ch);
+                                k = k + 1;
+                            }
+                        }
+                    }
+                    if charset == "ISO-8859-1" {
+                        bytes = im_latin1(bytes);
+                    }
+                    // drop the whitespace between adjacent encoded-words
+                    if last_word_end >= 0 {
+                        var only_ws: bool = true;
+                        var w: i64 = last_word_end;
+                        while w < i {
+                            val wc: i64 = str_byte_at(s, w);
+                            if wc != 32 && wc != 9 && wc != 13 && wc != 10 {
+                                only_ws = false;
+                            }
+                            w = w + 1;
+                        }
+                        if only_ws {
+                            var drop: i64 = i - last_word_end;
+                            while drop > 0 && out.len() > 0 {
+                                out.pop();
+                                drop = drop - 1;
+                            }
+                        }
+                    }
+                    var k2: i64 = 0;
+                    while k2 < bytes.len() {
+                        out.push(bytes.get(k2));
+                        k2 = k2 + 1;
+                    }
+                    i = tstart + tend_rel + 2;
+                    last_word_end = i;
+                    continue;
+                }
+            }
+        }
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+fn im_addresses(d: & ImapDoc, i: i64) -> Vec<ImapAddress> {
+    var out: Vec<ImapAddress> = Vec::new();
+    if i < 0 || imap_kind(d, i) != IMAP_LIST {
+        return out;
+    }
+    var k: i64 = 0;
+    while k < imap_count(d, i) {
+        val a: i64 = imap_child(d, i, k);
+        if imap_kind(d, a) == IMAP_LIST && imap_count(d, a) == 4 {
+            val name: str = imap_decode_words(imap_string(d, imap_child(d, a, 0)));
+            val mbox: str = imap_string(d, imap_child(d, a, 2));
+            val host: str = imap_string(d, imap_child(d, a, 3));
+            var full: str = mbox + "@" + host;
+            if str_len(name) > 0 {
+                full = name + " <" + full + ">";
+            }
+            out.push(ImapAddress { name: name, mailbox: mbox, host: host, full: full });
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+fn im_envelope_empty() -> ImapEnvelope {
+    return ImapEnvelope { date: "", subject: "", from: Vec::new(), sender: Vec::new(), reply_to: Vec::new(), to: Vec::new(), cc: Vec::new(), bcc: Vec::new(), in_reply_to: "", message_id: "" };
+}
+
+/// An ENVELOPE value (a list of 10 fields).
+pub fn imap_envelope(d: & ImapDoc, i: i64) -> ImapEnvelope {
+    var e: ImapEnvelope = im_envelope_empty();
+    if imap_kind(d, i) != IMAP_LIST || imap_count(d, i) < 10 {
+        return e;
+    }
+    e.date = imap_string(d, imap_child(d, i, 0));
+    e.subject = imap_decode_words(imap_string(d, imap_child(d, i, 1)));
+    e.from = im_addresses(d, imap_child(d, i, 2));
+    e.sender = im_addresses(d, imap_child(d, i, 3));
+    e.reply_to = im_addresses(d, imap_child(d, i, 4));
+    e.to = im_addresses(d, imap_child(d, i, 5));
+    e.cc = im_addresses(d, imap_child(d, i, 6));
+    e.bcc = im_addresses(d, imap_child(d, i, 7));
+    e.in_reply_to = imap_string(d, imap_child(d, i, 8));
+    e.message_id = imap_string(d, imap_child(d, i, 9));
+    return e;
+}
+
+fn im_params(d: & ImapDoc, i: i64) -> str {
+    if imap_kind(d, i) != IMAP_LIST {
+        return "";
+    }
+    var out: str = "";
+    var k: i64 = 0;
+    while k + 1 < imap_count(d, i) {
+        if k > 0 {
+            out = out + ";";
+        }
+        out = out + str_to_lower(imap_string(d, imap_child(d, i, k))) + "=" + imap_string(d, imap_child(d, i, k + 1));
+        k = k + 2;
+    }
+    return out;
+}
+
+fn im_body(d: & ImapDoc, i: i64, section: str, out: & mut Vec<ImapPart>) {
+    if imap_kind(d, i) != IMAP_LIST || imap_count(d, i) == 0 {
+        return;
+    }
+    if imap_kind(d, imap_child(d, i, 0)) == IMAP_LIST {
+        // multipart: body parts, then the subtype
+        var n: i64 = 0;
+        while n < imap_count(d, i) && imap_kind(d, imap_child(d, i, n)) == IMAP_LIST {
+            n = n + 1;
+        }
+        var sub: str = "mixed";
+        if n < imap_count(d, i) {
+            sub = str_to_lower(imap_string(d, imap_child(d, i, n)));
+        }
+        var params: str = "";
+        if n + 1 < imap_count(d, i) {
+            params = im_params(d, imap_child(d, i, n + 1));
+        }
+        var sec: str = section;
+        if str_len(sec) == 0 {
+            sec = "TEXT";
+        }
+        out.push(ImapPart { section: sec, mime: "multipart/" + sub, params: params, id: "", description: "", encoding: "", size: 0, lines: 0 - 1, multipart: true });
+        var k: i64 = 0;
+        while k < n {
+            var child: str = int_to_str(k + 1);
+            if str_len(section) > 0 {
+                child = section + "." + child;
+            }
+            im_body(d, imap_child(d, i, k), child, out);
+            k = k + 1;
+        }
+        return;
+    }
+    var sec: str = section;
+    if str_len(sec) == 0 {
+        sec = "1";
+    }
+    val cnt: i64 = imap_count(d, i);
+    var part: ImapPart = ImapPart { section: sec, mime: str_to_lower(imap_string(d, imap_child(d, i, 0)) + "/" + imap_string(d, imap_child(d, i, 1))), params: "", id: "", description: "", encoding: "", size: 0, lines: 0 - 1, multipart: false };
+    if cnt >= 7 {
+        part.params = im_params(d, imap_child(d, i, 2));
+        part.id = imap_string(d, imap_child(d, i, 3));
+        part.description = imap_string(d, imap_child(d, i, 4));
+        part.encoding = str_to_lower(imap_string(d, imap_child(d, i, 5)));
+        part.size = imap_num(d, imap_child(d, i, 6));
+        if str_starts_with(part.mime, "text/") && cnt >= 8 {
+            part.lines = imap_num(d, imap_child(d, i, 7));
+        }
+    }
+    out.push(part);
+}
+
+/// The parts of a BODY / BODYSTRUCTURE value, depth first.
+pub fn imap_body_parts(d: & ImapDoc, i: i64) -> Vec<ImapPart> {
+    var out: Vec<ImapPart> = Vec::new();
+    im_body(d, i, "", & mut out);
+    return out;
+}
+
+/// The items of a "* n FETCH (...)" response.
+pub fn imap_fetch_items(r: & ImapResponse) -> ImapFetch {
+    var f: ImapFetch = ImapFetch { seq: r.num, uid: 0 - 1, flags: Vec::new(), size: 0 - 1, internal_date: "", has_envelope: false, envelope: im_envelope_empty(), parts: Vec::new(), section_names: Vec::new(), section_data: Vec::new() };
+    if r.word != "FETCH" || r.values.len() != 1 {
+        return f;
+    }
+    val d: ImapDoc = r.doc;
+    val l: i64 = r.values.get(0);
+    var k: i64 = 0;
+    while k + 1 < imap_count(& d, l) {
+        val name: str = str_to_upper(imap_text(& d, imap_child(& d, l, k)));
+        val v: i64 = imap_child(& d, l, k + 1);
+        if name == "UID" {
+            f.uid = imap_num(& d, v);
+        } else if name == "FLAGS" {
+            var j: i64 = 0;
+            while j < imap_count(& d, v) {
+                f.flags.push(imap_text(& d, imap_child(& d, v, j)));
+                j = j + 1;
+            }
+        } else if name == "RFC822.SIZE" {
+            f.size = imap_num(& d, v);
+        } else if name == "INTERNALDATE" {
+            f.internal_date = imap_string(& d, v);
+        } else if name == "ENVELOPE" {
+            f.has_envelope = true;
+            f.envelope = imap_envelope(& d, v);
+        } else if name == "BODY" || name == "BODYSTRUCTURE" {
+            f.parts = imap_body_parts(& d, v);
+        } else if str_starts_with(name, "BODY[") || str_starts_with(name, "RFC822") || str_starts_with(name, "BINARY[") {
+            f.section_names.push(imap_text(& d, imap_child(& d, l, k)));
+            f.section_data.push(imap_string(& d, v));
+        }
+        k = k + 2;
+    }
+    return f;
+}
+
+fn im_fetches(r: & ImapResult) -> Vec<ImapFetch> {
+    var out: Vec<ImapFetch> = Vec::new();
+    var i: i64 = 0;
+    while i < r.untagged.len() {
+        val u: ImapResponse = r.untagged.get(i);
+        if u.word == "FETCH" {
+            out.push(imap_fetch_items(& u));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// FETCH set items: imap_fetch(c, "1:3", "(UID FLAGS ENVELOPE)").
+pub fn imap_fetch(c: & mut ImapClient, set: str, items: str) -> Vec<ImapFetch> {
+    val r: ImapResult = imap_command(c, "FETCH " + set + " " + items);
+    return im_fetches(& r);
+}
+
+pub fn imap_uid_fetch(c: & mut ImapClient, set: str, items: str) -> Vec<ImapFetch> {
+    val r: ImapResult = imap_command(c, "UID FETCH " + set + " " + items);
+    return im_fetches(& r);
+}
+
+/// The section data of a fetch by its name ("BODY[TEXT]"), or "".
+pub fn imap_fetch_section(f: & ImapFetch, name: str) -> str {
+    var i: i64 = 0;
+    while i < f.section_names.len() {
+        if str_to_upper(f.section_names.get(i)) == str_to_upper(name) {
+            return f.section_data.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}

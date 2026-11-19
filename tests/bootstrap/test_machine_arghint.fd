@@ -1,0 +1,117 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA7: register hints for
+// arguments, results and call operands in the machine layer
+// (compiler/nat_ir.fd ng_arg_hints, FID_NAT_ON=arghint). A value a move
+// ties to an argument register (a parameter, a call operand, a call's
+// result) may take that register where nothing else needs it; the
+// implicit uses are modelled (ng_implicit_regs): every call loses the
+// argument registers, x86-64 division and remainder use rdx, shifts rcx.
+// `divshift` keeps its third and fourth parameters (rdx, rcx on x86-64)
+// live across a division and a shift; `across` keeps a call operand live
+// across another call; `permute` sends its parameters back out in another
+// order; `relay` returns a call's result through an addition; `many`
+// passes more operands than there are argument registers. A value left in
+// an argument register that something clobbers changes what is printed.
+// tests/nattools/machine_ra7_check.sh builds it on every target with
+// FID_VERIFY=1 (the allocation checker, ng_mir_check_args) with and
+// without the switch, runs it where it can, compares the moves `--stats`
+// counts, and checks that FID_NAT_MUTATE=arghint (implicit uses ignored)
+// is rejected by the checker.
+// Expected output:
+// 1479684
+// 269240
+// 591539
+// 713558
+// -264978
+// 672
+// 55
+// 6765
+// 80381
+
+// (loop counts that depend on the operands: never unrolled or inlined)
+fn mix3(a: i64, b: i64, c: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = 3 + (c & 1);
+    while i < n {
+        s = (s * 31 + a * 7 + b * 3 + c + i) % 1000003;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn mix2(a: i64, b: i64) -> i64 {
+    var s: i64 = a;
+    var i: i64 = 0;
+    var n: i64 = 2 + (a & 1);
+    while i < n {
+        s = (s * 17 + b + i) % 1000003;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn permute(a: i64, b: i64, c: i64) -> i64 {
+    return mix3(c, b, a) + mix3(b, a, c);
+}
+
+fn divshift(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    var q: i64 = a / b;
+    var r: i64 = a % b;
+    var s: i64 = c << (d & 7);
+    var t: i64 = (c * 5) >> (d & 3);
+    var u: i64 = q * 1000 + r * 100 + s + t + c + d;
+    return mix3(u, c, d);
+}
+
+fn across(a: i64, b: i64) -> i64 {
+    var p: i64 = mix3(a, b, 1);
+    var t: i64 = a * 3 + p;
+    var u: i64 = mix2(b, t);
+    return mix3(p, u, t);
+}
+
+fn relay(x: i64, y: i64) -> i64 {
+    var r: i64 = mix2(x, y);
+    var s: i64 = r + 1;
+    return mix2(s, x);
+}
+
+fn many(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64) -> i64 {
+    return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10 + 34;
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn chain(n: i64) -> i64 {
+    var x: i64 = n;
+    var i: i64 = 0;
+    while i < 5 {
+        x = mix3(x, i, n);
+        i = i + 1;
+    }
+    return x;
+}
+
+fn main() {
+    // the operands come out of a Vec, so no call is folded away
+    var x: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k <= 20 {
+        x.push(k);
+        k = k + 1;
+    }
+    println(int_to_str(permute(x.get(1), x.get(2), x.get(3))));
+    println(int_to_str(divshift(x.get(10) * 100, x.get(7), x.get(13), x.get(5))));
+    println(int_to_str(across(x.get(4), x.get(9))));
+    println(int_to_str(relay(x.get(11), x.get(12))));
+    println(int_to_str(divshift(0 - 999 * x.get(1), x.get(13), 0 - x.get(3), x.get(6))));
+    println(int_to_str(many(x.get(1), x.get(2), x.get(3), x.get(4), x.get(5), x.get(6), x.get(7), x.get(8), x.get(9), x.get(10)) + many(x.get(10), x.get(9), x.get(8), x.get(7), x.get(6), x.get(5), x.get(4), x.get(3), x.get(2), x.get(1)) - 1));
+    println(int_to_str(fib(x.get(10))));
+    println(int_to_str(fib(x.get(20))));
+    println(int_to_str(chain(x.get(7))));
+}

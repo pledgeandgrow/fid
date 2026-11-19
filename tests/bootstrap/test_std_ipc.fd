@@ -1,0 +1,120 @@
+// stdlib/ipc: endpoints, call/reply, send queues, badges, rights, cap transfer, revoke, and the shared-memory ring.
+// Expected output:
+// server recv: 1 blocked-recv
+// call: 1 client blocked-reply server running
+// server got label 1 badge 11 words 5,7
+// reply: 0 client running reply 12
+// send queued: 1 1 blocked-send blocked-send
+// recv1 0 badge 22 label 2 c2 running
+// recv2 0 badge 11 label 3 c1 blocked-reply
+// reply_recv 1 c1 running 99 server blocked-recv
+// errors: -2 -1 -5 -3 -4
+// mint rights 1 badge 33
+// grant: server got cap 2 rights 7
+// via granted cap: 0 client got label 7 badge 0
+// revoke removed 3, c1 send -1, server still 0
+// ring push 4 full false count 4
+// ring pop 100 101 then 102 103 104 105 empty -1
+// ring wrap index 65535 -> 1 count 2
+// need_event true false true
+use ipc;
+use vec;
+use string;
+
+fn words(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    if b >= 0 { v.push(b); }
+    return v;
+}
+
+fn st(k: &IpcKernel, t: i64) -> str {
+    return ipc_state_name(ipc_state(k, t));
+}
+
+fn main() {
+    var k: IpcKernel = ipc_new();
+    val srv: i64 = ipc_thread_new(&mut k, "server");
+    val c1: i64 = ipc_thread_new(&mut k, "c1");
+    val c2: i64 = ipc_thread_new(&mut k, "c2");
+    val ep: i64 = ipc_endpoint_new(&mut k, srv);
+    val c1ep: i64 = ipc_cap_copy(&mut k, srv, ep, c1, CAP_SEND | CAP_GRANT, 11);
+    val c2ep: i64 = ipc_cap_copy(&mut k, srv, ep, c2, CAP_SEND, 22);
+
+    val r0: i64 = ipc_recv(&mut k, srv, ep);
+    println("server recv: " + int_to_str(r0) + " " + st(&k, srv));
+    val r1: i64 = ipc_call(&mut k, c1, c1ep, ipc_msg(1, words(5, 7)));
+    println("call: " + int_to_str(r1) + " client " + st(&k, c1) + " server " + st(&k, srv));
+    val m: IpcMsg = ipc_msg_of(&k, srv);
+    println("server got label " + int_to_str(m.label) + " badge " + int_to_str(m.badge) + " words " + str_join_ints(m.words, ","));
+    val r2: i64 = ipc_reply(&mut k, srv, ipc_msg(0, words(12, -1)));
+    println("reply: " + int_to_str(r2) + " client " + st(&k, c1) + " reply " + int_to_str(ipc_msg_of(&k, c1).words.get(0)));
+
+    val s1: i64 = ipc_send(&mut k, c2, c2ep, ipc_msg(2, words(1, -1)));
+    val s2: i64 = ipc_call(&mut k, c1, c1ep, ipc_msg(3, words(2, -1)));
+    println("send queued: " + int_to_str(s1) + " " + int_to_str(s2) + " " + st(&k, c2) + " " + st(&k, c1));
+    val q1: i64 = ipc_recv(&mut k, srv, ep);
+    val m1: IpcMsg = ipc_msg_of(&k, srv);
+    println("recv1 " + int_to_str(q1) + " badge " + int_to_str(m1.badge) + " label " + int_to_str(m1.label) + " c2 " + st(&k, c2));
+    val q2: i64 = ipc_recv(&mut k, srv, ep);
+    val m2: IpcMsg = ipc_msg_of(&k, srv);
+    println("recv2 " + int_to_str(q2) + " badge " + int_to_str(m2.badge) + " label " + int_to_str(m2.label) + " c1 " + st(&k, c1));
+    val q3: i64 = ipc_reply_recv(&mut k, srv, ep, ipc_msg(0, words(99, -1)));
+    println("reply_recv " + int_to_str(q3) + " c1 " + st(&k, c1) + " " + int_to_str(ipc_msg_of(&k, c1).words.get(0)) + " server " + st(&k, srv));
+
+    val e1: i64 = ipc_recv(&mut k, c2, c2ep);
+    val e2: i64 = ipc_send(&mut k, c2, 9, ipc_msg(0, words(0, -1)));
+    val e3: i64 = ipc_mint(&mut k, c2, c2ep, CAP_SEND, 44);
+    val e4: i64 = ipc_reply(&mut k, c2, ipc_msg(0, words(0, -1)));
+    // non-blocking send on an endpoint nobody receives on
+    val lone: i64 = ipc_endpoint_new(&mut k, c2);
+    val e5: i64 = ipc_nbsend(&mut k, c2, lone, ipc_msg(0, words(0, -1)));
+    println("errors: " + int_to_str(e1) + " " + int_to_str(e2) + " " + int_to_str(e3) + " " + int_to_str(e4) + " " + int_to_str(e5));
+    val mc: i64 = ipc_mint(&mut k, srv, ep, CAP_SEND, 33);
+    val mcap: Cap = ipc_cap(&k, srv, mc);
+    println("mint rights " + int_to_str(mcap.rights) + " badge " + int_to_str(mcap.badge));
+
+    // c1 creates its own endpoint and hands it to the server in a message
+    val back: i64 = ipc_endpoint_new(&mut k, c1);
+    // server is blocked in recv from reply_recv above
+    ipc_send(&mut k, c1, c1ep, ipc_msg_with_cap(5, words(0, -1), back));
+    val gm: IpcMsg = ipc_msg_of(&k, srv);
+    val gcap: Cap = ipc_cap(&k, srv, gm.cap);
+    println("grant: server got cap " + int_to_str(gm.cap) + " rights " + int_to_str(gcap.rights));
+    ipc_recv(&mut k, c1, back);
+    val v: i64 = ipc_send(&mut k, srv, gm.cap, ipc_msg(7, words(0, -1)));
+    println("via granted cap: " + int_to_str(v) + " client got label " + int_to_str(ipc_msg_of(&k, c1).label) + " badge " + int_to_str(ipc_msg_of(&k, c1).badge));
+
+    val rv: i64 = ipc_revoke(&mut k, srv, ep);
+    val after: i64 = ipc_send(&mut k, c1, c1ep, ipc_msg(0, words(0, -1)));
+    val still: i64 = ipc_nbsend(&mut k, srv, ep, ipc_msg(0, words(0, -1)));
+    println("revoke removed " + int_to_str(rv) + ", c1 send " + int_to_str(after) + ", server still " + int_to_str(still + 4));
+
+    var ring: Vec<i64> = shmring_new(4);
+    var i: i64 = 0;
+    var pushed: i64 = 0;
+    while i < 4 {
+        if shmring_push(&mut ring, RingDesc { offset: i * 256, len: 64, flags: 0, cookie: 100 + i }) { pushed = pushed + 1; }
+        i = i + 1;
+    }
+    val full: bool = shmring_push(&mut ring, RingDesc { offset: 0, len: 1, flags: 0, cookie: 999 });
+    println("ring push " + int_to_str(pushed) + " full " + bool_to_str(full) + " count " + int_to_str(shmring_count(&ring)));
+    val p0: RingDesc = shmring_pop(&mut ring);
+    val p1: RingDesc = shmring_pop(&mut ring);
+    shmring_push(&mut ring, RingDesc { offset: 0, len: 8, flags: 1, cookie: 104 });
+    shmring_push(&mut ring, RingDesc { offset: 0, len: 8, flags: 1, cookie: 105 });
+    var rest: str = "";
+    var d: RingDesc = shmring_pop(&mut ring);
+    while d.len >= 0 {
+        rest = rest + " " + int_to_str(d.cookie);
+        d = shmring_pop(&mut ring);
+    }
+    println("ring pop " + int_to_str(p0.cookie) + " " + int_to_str(p1.cookie) + " then" + rest + " empty " + int_to_str(d.len));
+    var w: Vec<i64> = shmring_new(4);
+    w.set(0, 65535);
+    w.set(1, 65535);
+    shmring_push(&mut w, RingDesc { offset: 0, len: 1, flags: 0, cookie: 1 });
+    shmring_push(&mut w, RingDesc { offset: 0, len: 1, flags: 0, cookie: 2 });
+    println("ring wrap index 65535 -> " + int_to_str(w.get(0)) + " count " + int_to_str(shmring_count(&w)));
+    println("need_event " + bool_to_str(shmring_need_event(5, 7, 4)) + " " + bool_to_str(shmring_need_event(2, 7, 4)) + " " + bool_to_str(shmring_need_event(65535, 1, 65534)));
+}

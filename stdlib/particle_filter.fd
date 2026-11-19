@@ -1,0 +1,364 @@
+// Fides particle filter (robotics / estimation)
+//
+// A sequential Monte Carlo filter over states of any dimension:
+//   - particles are `dim` floats each (one flat Vec<f64>) with weights;
+//   - initialization uniform in a box or Gaussian around a mean;
+//   - prediction through a motion model fn value f(state, u) plus Gaussian
+//     noise per dimension (or a plain shift `pf_predict_shift`);
+//   - weighting by a likelihood fn value p(z | state), then normalization
+//     (all weights zero resets them to uniform: the filter is lost);
+//   - effective sample size N_eff = 1 / sum w_i^2;
+//   - systematic resampling (one uniform draw u0 in [0, 1/N), positions
+//     u0 + k/N), optionally only when N_eff falls below a fraction of N;
+//   - weighted mean, variance and the best particle.
+// Randomness comes from `PfRng`, a SplitMix64 generator owned by the filter
+// and seeded explicitly, so a run repeats exactly (Gaussian draws by
+// Box-Muller). Everything here is pure computation; there is no platform
+// seam (sensor data and odometry come from the caller).
+//
+// Usage:
+//   use particle_filter;
+//   var pf = pf_new(500, 1, 42);
+//   pf_init_uniform(&mut pf, &lo, &hi);
+//   pf_predict_shift(&mut pf, &step, &noise_std);
+//   pf_weight(&mut pf, likelihood_fn, &z);
+//   pf_resample_if_needed(&mut pf, 0.5);
+//   val est = pf_mean(&pf);
+
+module particle_filter;
+use math;
+
+// ─── Deterministic random numbers ───
+
+/// SplitMix64 state.
+pub struct PfRng {
+    pub state: i64,
+}
+
+/// A generator seeded with `seed`.
+pub fn pfrng_new(seed: i64) -> PfRng {
+    return PfRng {
+        state: seed
+    };
+}
+
+/// The next 64 random bits (SplitMix64).
+@wrapping pub fn pfrng_next(r: & mut PfRng) -> i64 {
+    var z: u64 = (r.state as u64) + (0x9E3779B97F4A7C15 as u64);
+    r.state = z as i64;
+    z = (z ^ (z >> 30)) * (0xBF58476D1CE4E5B9 as u64);
+    z = (z ^ (z >> 27)) * (0x94D049BB133111EB as u64);
+    z = z ^ (z >> 31);
+    return z as i64;
+}
+
+/// A uniform float in [0, 1) (the top 53 bits).
+@wrapping pub fn pfrng_uniform(r: & mut PfRng) -> f64 {
+    val bits: u64 = (pfrng_next(r) as u64) >> 11;
+    return ((bits as i64) as f64) * 0.00000000000000011102230246251565;
+}
+
+/// A standard normal draw (Box-Muller, one of the pair).
+pub fn pfrng_gauss(r: & mut PfRng) -> f64 {
+    val u1: f64 = 1.0 - pfrng_uniform(r);
+    val u2: f64 = pfrng_uniform(r);
+    return math_sqrt(- 2.0 * math_log(u1)) * math_cos(6.283185307179586 * u2);
+}
+
+// ─── The filter ───
+
+/// n particles of dim floats each, their weights and the generator.
+pub struct ParticleFilter {
+    pub n: i64,
+    pub dim: i64,
+    pub states: Vec<f64>,
+    pub weights: Vec<f64>,
+    pub rng: PfRng,
+    pub resamples: i64,
+}
+
+/// n particles of dimension dim, all zero with equal weights.
+pub fn pf_new(n: i64, dim: i64, seed: i64) -> ParticleFilter {
+    var s: Vec<f64> = Vec::new();
+    var w: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n * dim {
+        s.push(0.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        w.push(1.0 / (n as f64));
+        i = i + 1;
+    }
+    return ParticleFilter {
+        n: n, dim: dim, states: s, weights: w, rng: pfrng_new(seed), resamples: 0
+    };
+}
+
+/// Component d of particle i.
+pub fn pf_get(pf: & ParticleFilter, i: i64, d: i64) -> f64 {
+    return pf.states.get(i * pf.dim + d);
+}
+
+/// Set component d of particle i.
+pub fn pf_set(pf: & mut ParticleFilter, i: i64, d: i64, v: f64) {
+    pf.states.set(i * pf.dim + d, v);
+}
+
+/// Particle i as a vector.
+pub fn pf_particle(pf: & ParticleFilter, i: i64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var d: i64 = 0;
+    while d < pf.dim {
+        out.push(pf.states.get(i * pf.dim + d));
+        d = d + 1;
+    }
+    return out;
+}
+
+/// Weight of particle i.
+pub fn pf_weight_of(pf: & ParticleFilter, i: i64) -> f64 {
+    return pf.weights.get(i);
+}
+
+/// Give every particle the weight 1/n.
+pub fn pf_reset_weights(pf: & mut ParticleFilter) {
+    var i: i64 = 0;
+    while i < pf.n {
+        pf.weights.set(i, 1.0 / (pf.n as f64));
+        i = i + 1;
+    }
+}
+
+/// Particles uniform in the box [lo, hi] (one bound per dimension), equal
+/// weights.
+pub fn pf_init_uniform(pf: & mut ParticleFilter, lo: & Vec<f64>, hi: & Vec<f64>) {
+    var i: i64 = 0;
+    while i < pf.n {
+        var d: i64 = 0;
+        while d < pf.dim {
+            val u: f64 = pfrng_uniform(&mut pf.rng);
+            pf.states.set(i * pf.dim + d, lo.get(d) + u * (hi.get(d) - lo.get(d)));
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    pf_reset_weights(pf);
+}
+
+/// Particles drawn from N(mean, diag(std^2)), equal weights.
+pub fn pf_init_gaussian(pf: & mut ParticleFilter, mean: & Vec<f64>, std: & Vec<f64>) {
+    var i: i64 = 0;
+    while i < pf.n {
+        var d: i64 = 0;
+        while d < pf.dim {
+            val g: f64 = pfrng_gauss(&mut pf.rng);
+            pf.states.set(i * pf.dim + d, mean.get(d) + std.get(d) * g);
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    pf_reset_weights(pf);
+}
+
+/// Move every particle by `delta` plus Gaussian noise of `std` per dimension.
+pub fn pf_predict_shift(pf: & mut ParticleFilter, delta: & Vec<f64>, std: & Vec<f64>) {
+    var i: i64 = 0;
+    while i < pf.n {
+        var d: i64 = 0;
+        while d < pf.dim {
+            val g: f64 = pfrng_gauss(&mut pf.rng);
+            val k: i64 = i * pf.dim + d;
+            pf.states.set(k, pf.states.get(k) + delta.get(d) + std.get(d) * g);
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// Replace every particle x by f(x, u) plus Gaussian noise of `std` per
+/// dimension.
+pub fn pf_predict(pf: & mut ParticleFilter, f: fn(Vec<f64>, Vec<f64>) -> Vec<f64>, u: & Vec<f64>, std: & Vec<f64>) {
+    var i: i64 = 0;
+    while i < pf.n {
+        var uc: Vec<f64> = Vec::new();
+        var j: i64 = 0;
+        while j < u.len() {
+            uc.push(u.get(j));
+            j = j + 1;
+        }
+        val nx: Vec<f64> = f(pf_particle(pf, i), uc);
+        var d: i64 = 0;
+        while d < pf.dim {
+            val g: f64 = pfrng_gauss(&mut pf.rng);
+            pf.states.set(i * pf.dim + d, nx.get(d) + std.get(d) * g);
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// Scale the weights to sum to 1; returns the sum before. A zero (or
+/// non-finite) sum resets them to uniform.
+pub fn pf_normalize(pf: & mut ParticleFilter) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < pf.n {
+        s = s + pf.weights.get(i);
+        i = i + 1;
+    }
+    if !(s > 0.0) || s > 1.0e300 {
+        pf_reset_weights(pf);
+        return s;
+    }
+    i = 0;
+    while i < pf.n {
+        pf.weights.set(i, pf.weights.get(i) / s);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Multiply each weight by likelihood(particle, z) and normalize. Returns
+/// the mean likelihood before normalization (0: every particle was ruled
+/// out and the weights were reset).
+pub fn pf_weight(pf: & mut ParticleFilter, likelihood: fn(Vec<f64>, Vec<f64>) -> f64, z: & Vec<f64>) -> f64 {
+    var i: i64 = 0;
+    while i < pf.n {
+        var zc: Vec<f64> = Vec::new();
+        var j: i64 = 0;
+        while j < z.len() {
+            zc.push(z.get(j));
+            j = j + 1;
+        }
+        val l: f64 = likelihood(pf_particle(pf, i), zc);
+        pf.weights.set(i, pf.weights.get(i) * l);
+        i = i + 1;
+    }
+    return pf_normalize(pf);
+}
+
+/// The effective sample size 1 / sum w^2 (weights normalized).
+pub fn pf_neff(pf: & ParticleFilter) -> f64 {
+    return pf_neff_of(&pf.weights);
+}
+
+/// 1 / sum w^2 of normalized weights.
+pub fn pf_neff_of(w: & Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < w.len() {
+        s = s + w.get(i) * w.get(i);
+        i = i + 1;
+    }
+    if s == 0.0 {
+        return 0.0;
+    }
+    return 1.0 / s;
+}
+
+/// The systematic resampling of normalized weights w with the draw u0 in
+/// [0, 1/N): for each k the index i where the cumulative weight first
+/// reaches u0 + k/N.
+pub fn pf_systematic_indices(w: & Vec<f64>, u0: f64) -> Vec<i64> {
+    val n: i64 = w.len();
+    var out: Vec<i64> = Vec::new();
+    var c: f64 = w.get(0);
+    var i: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        val u: f64 = u0 + (k as f64) / (n as f64);
+        while u > c && i < n - 1 {
+            i = i + 1;
+            c = c + w.get(i);
+        }
+        out.push(i);
+        k = k + 1;
+    }
+    return out;
+}
+
+/// Systematic resampling: draw u0, copy the chosen particles, equal weights.
+pub fn pf_resample(pf: & mut ParticleFilter) {
+    val u0: f64 = pfrng_uniform(&mut pf.rng) / (pf.n as f64);
+    val idx: Vec<i64> = pf_systematic_indices(&pf.weights, u0);
+    var ns: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    while k < pf.n {
+        val src: i64 = idx.get(k);
+        var d: i64 = 0;
+        while d < pf.dim {
+            ns.push(pf.states.get(src * pf.dim + d));
+            d = d + 1;
+        }
+        k = k + 1;
+    }
+    pf.states = ns;
+    pf_reset_weights(pf);
+    pf.resamples = pf.resamples + 1;
+}
+
+/// Resample when N_eff < ratio * N; returns whether it did.
+pub fn pf_resample_if_needed(pf: & mut ParticleFilter, ratio: f64) -> bool {
+    if pf_neff(pf) < ratio * (pf.n as f64) {
+        pf_resample(pf);
+        return true;
+    }
+    return false;
+}
+
+/// The weighted mean state.
+pub fn pf_mean(pf: & ParticleFilter) -> Vec<f64> {
+    var m: Vec<f64> = Vec::new();
+    var d: i64 = 0;
+    while d < pf.dim {
+        var s: f64 = 0.0;
+        var i: i64 = 0;
+        while i < pf.n {
+            s = s + pf.weights.get(i) * pf.states.get(i * pf.dim + d);
+            i = i + 1;
+        }
+        m.push(s);
+        d = d + 1;
+    }
+    return m;
+}
+
+/// The weighted variance of each component.
+pub fn pf_variance(pf: & ParticleFilter) -> Vec<f64> {
+    val m: Vec<f64> = pf_mean(pf);
+    var v: Vec<f64> = Vec::new();
+    var d: i64 = 0;
+    while d < pf.dim {
+        var s: f64 = 0.0;
+        var i: i64 = 0;
+        while i < pf.n {
+            val e: f64 = pf.states.get(i * pf.dim + d) - m.get(d);
+            s = s + pf.weights.get(i) * e * e;
+            i = i + 1;
+        }
+        v.push(s);
+        d = d + 1;
+    }
+    return v;
+}
+
+/// The index of the heaviest particle.
+pub fn pf_best(pf: & ParticleFilter) -> i64 {
+    var b: i64 = 0;
+    var i: i64 = 1;
+    while i < pf.n {
+        if pf.weights.get(i) > pf.weights.get(b) {
+            b = i;
+        }
+        i = i + 1;
+    }
+    return b;
+}
+
+/// exp(-(x - mu)^2 / (2 sigma^2)): an unnormalized Gaussian likelihood.
+pub fn pf_gauss_likelihood(x: f64, mu: f64, sigma: f64) -> f64 {
+    val e: f64 = (x - mu) / sigma;
+    return math_exp(- 0.5 * e * e);
+}

@@ -18,9 +18,7 @@
 // 6. Rust `emit(&[b0, b1, ...])` -> one PeirEnc_emit_u8 per byte,
 //    grouped through peir_emit2/peir_emit8
 
-module compiler::pe_ir;
- use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::pe_ir_enc; use compiler::pe_ir_stubs; use compiler::checks;
-// ===========================================================================
+module compiler::pe_ir; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::pe_ir_enc; use compiler::pe_ir_stubs; use compiler::checks; use compiler::inc; use compiler::ast_ser; use compiler::ir_ser; use compiler::token; use compiler::lexer; use compiler::parser; use compiler::pdb; use compiler::cparser; use compiler::pgo;  // ===========================================================================
 // Stack frame (src/pe.rs PeStackFrame — mirrors x86.rs StackFrame)
 // ===========================================================================
 
@@ -384,6 +382,30 @@ fn peir_emit8(e: & mut PeirEnc, a: i64, b: i64, c: i64, d: i64, f: i64, g: i64, 
     PeirEnc_emit_u8(e, i);
 }
 
+/// OP17 (known-bugs 2g.13): xmm0 converted in place between the float
+/// types: cvtss2sd xmm0, xmm0 (`to_f64`) or cvtsd2ss xmm0, xmm0.
+fn peir_cvt_float(e: & mut PeirEnc, to_f64: bool) -> void {
+    if to_f64 {
+        PeirEnc_emit_u8(e, 0xF3);
+    } else {
+        PeirEnc_emit_u8(e, 0xF2);
+    }
+    PeirEnc_emit_u8(e, 0x0F);
+    PeirEnc_emit_u8(e, 0x5A);
+    PeirEnc_emit_u8(e, 0xC0);
+}
+
+/// OP17: the f32 in xmm0 stored to `dst` as a whole word, its bits in the
+/// low half and zeros above (movd eax, xmm0; mov [dst], rax), as
+/// ConstFloat writes an f32 (an f32 never gets a register in pe_ir).
+fn peir_store_f32_xmm0(e: & mut PeirEnc, dst: i64) -> void {
+    PeirEnc_emit_u8(e, 0x66);
+    PeirEnc_emit_u8(e, 0x0F);
+    PeirEnc_emit_u8(e, 0x7E);
+    PeirEnc_emit_u8(e, 0xC0);
+    PeirEnc_mov_mem_rbp_reg(e, dst, PEIR_RAX);
+}
+
 /// The module's function names, sorted (Rust: keys of a sorted map).
 fn pe_module_fn_names(module: & IrModule) -> Vec<str> {
     var v: Vec<str> = Vec::new();
@@ -524,6 +546,47 @@ fn pe_runtime_stub_names() -> Vec<str> {
     return v;
 }
 
+/// The folder of the executable being written ("" when unknown or the
+/// current folder): the "is not on this machine" warning also looks there,
+/// where `ark build` copies a program's DLLs. Set by pe_set_output_path.
+pub var g_pe_out_dir: str = "";
+
+/// B5: the output file of the next PE build ("" when unknown): the
+/// per-function cache's default place is beside it (pe_fc_default_base).
+pub var g_pe_out_path: str = "";
+
+/// OP20: `fid emit --cpu <name>` for pe_ir (the driver checks the name
+/// with nat_cpu_check first): x86-64-v3 and x86-64-v4 turn on the BMI1 and
+/// BMI2 forms (peir_bmi); "" (the safe default), baseline and native
+/// leave them off.
+pub var g_pe_cpu: str = "";
+
+pub fn pe_set_cpu(cpu: str) {
+    g_pe_cpu = cpu;
+}
+
+/// OP20: may this build use BMI1/BMI2 (SHLX/SARX/SHRX, BLSR)?
+fn peir_bmi() -> bool {
+    return g_pe_cpu == "x86-64-v3" || g_pe_cpu == "x86-64-v4";
+}
+
+/// Record the output file of the next PE build (its folder: g_pe_out_dir).
+pub fn pe_set_output_path(path: str) {
+    g_pe_out_path = path;
+    var cut: i64 = str_rfind(path, "\\");
+    var cut2: i64 = str_rfind(path, "/");
+    if cut2 > cut {
+        cut = cut2;
+    }
+    if cut < 0 {
+        g_pe_out_dir = "";
+    } else if cut == 0 {
+        g_pe_out_dir = str_slice(path, 0, 1);
+    } else {
+        g_pe_out_dir = str_slice(path, 0, cut);
+    }
+}
+
 // ===========================================================================
 // PeirGen::generate (src/pe.rs)
 // ===========================================================================
@@ -532,6 +595,9 @@ fn pe_runtime_stub_names() -> Vec<str> {
 pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     // 1. Collect all string constants from IR (sorted for determinism)
     var all_strings: Vec<str> = Vec::new();
+    // PE88: membership through a table (a list scan per constant made this
+    // step quadratic in the module's strings); all_strings keeps the order
+    var all_seen: i64 = HashMap_new();
     var func_names: Vec<str> = pe_module_fn_names(module);
     var fi: i64 = 0;
     while fi < func_names.len() {
@@ -543,17 +609,20 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
                     var inst: Inst = insts.get(ii).inst;
                     match inst {
                         Inst::ConstStr(value) => {
-                            if !pe_ir_strs_contains(all_strings, value) {
+                            if !HashMap_contains(all_seen, value) {
+                                HashMap_insert(all_seen, value, 1);
                                 all_strings.push(value);
                             }
                         }
                         Inst::ConstFnRef(name) => {
-                            if !pe_ir_strs_contains(all_strings, name) {
+                            if !HashMap_contains(all_seen, name) {
+                                HashMap_insert(all_seen, name, 1);
                                 all_strings.push(name);
                             }
                         }
                         Inst::Panic(message) => {
-                            if !pe_ir_strs_contains(all_strings, message) {
+                            if !HashMap_contains(all_seen, message) {
+                                HashMap_insert(all_seen, message, 1);
                                 all_strings.push(message);
                             }
                         }
@@ -571,14 +640,23 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     // Add boolean strings
     all_strings.push("true");
     all_strings.push("false");
+    HashMap_insert(all_seen, "true", 1);
+    HashMap_insert(all_seen, "false", 1);
     // Panic messages of the runtime stubs
     var panic_strs: Vec<str> = peir_panic_strings();
     var psi: i64 = 0;
     while psi < panic_strs.len() {
-        if !pe_ir_strs_contains(all_strings, panic_strs.get(psi)) {
+        if !HashMap_contains(all_seen, panic_strs.get(psi)) {
+            HashMap_insert(all_seen, panic_strs.get(psi), 1);
             all_strings.push(panic_strs.get(psi));
         }
         psi = psi + 1;
+    }
+    HashMap_drop(all_seen);
+    // --checked-alloc: the fault report's formats (PeirGen_gen_checked_fault)
+    if g_pe_checked_alloc && !self.bare_mode {
+        all_strings.push(peir_checked_uaf_fmt());
+        all_strings.push(peir_checked_overrun_fmt());
     }
 
     // The C functions the program reaches, from the DLLs it links
@@ -587,14 +665,34 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     var xi: i64 = 0;
     while xi < module.extern_decls.len() {
         var xd: ExternDecl = module.extern_decls.get(xi);
+        var xlib: str = "";
         match xd.link_lib {
             OptStr::Some(lib) => {
-                var dll: str = pe_link_dll(lib);
-                if dll != "" && !self.bare_mode && pe_ir_strs_contains(reached, xd.pledge_name) && !pe_ir_strs_contains(self.module_fns, xd.pledge_name) && pe_import_slot(xd.c_name) < 0 && !pe_ir_strs_contains(pe_primitive_names(), xd.c_name) && pe_ir_c_override(module, xd.pledge_name) == "" {
-                    pe_add_extra_import(dll, xd.c_name);
+                xlib = lib;
+            }
+            OptStr::None => {
+            }
+        }
+        // LG15: the functions of a local header that does not exist stay stubs
+        var xmissing: bool = false;
+        match xd.include {
+            OptStr::Some(inc) => {
+                if !str_starts_with(inc, "<") && !c_file_exists(pe_str_trim_chars(inc, "\"<>")) {
+                    xmissing = true;
                 }
             }
             OptStr::None => {
+            }
+        }
+        if !xmissing && !self.bare_mode && pe_ir_strs_contains(reached, xd.pledge_name) && !pe_ir_strs_contains(self.module_fns, xd.pledge_name) && pe_import_slot(xd.c_name) < 0 && !pe_ir_strs_contains(pe_primitive_names(), xd.c_name) && pe_ir_c_override(module, xd.pledge_name) == "" {
+            var dll: str = pe_link_dll(xlib);
+            // LG15: no `link` or the C library's ("", c, m, msvcrt, kernel32):
+            // the system DLL that exports it (cparser.fd cparse_system_dll_of)
+            if dll == "" {
+                dll = cparse_system_dll_of(xd.c_name);
+            }
+            if dll != "" {
+                pe_add_extra_import(dll, xd.c_name);
             }
         }
         xi = xi + 1;
@@ -609,13 +707,13 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
         var xfound: bool = false;
         var xci: i64 = 0;
         while xci < xcands.len() {
-            if pe_dll_found(xcands.get(xci), "") {
+            if pe_dll_found(xcands.get(xci), g_pe_out_dir) {
                 xfound = true;
             }
             xci = xci + 1;
         }
         if !xfound {
-            p_eprint_str("warning: " + xdll + " is not on this machine (searched the current folder, the system folder and PATH): a call into it stops the program with a message\n");
+            p_eprint_str("warning: " + xdll + " is not on this machine (searched the output's folder, the current folder, the system folder and PATH): a call into it stops the program with a message\n");
         }
         xdi = xdi + 1;
     }
@@ -632,6 +730,11 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
             all_strings.push(", error ");
             all_strings.push(", rip ");
             all_strings.push(", address ");
+        }
+        if g_pe_uefi {
+            // the UEFI runtime's messages (pe_ir_stubs.fd, PeirGen_gen_uefi_*)
+            all_strings.push("out of memory");
+            all_strings.push("UEFI: not enough memory for the heap and the stack\n");
         }
         PeirRdata_build_strings(& mut rdata, all_strings);
     } else {
@@ -738,8 +841,7 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
             }
         }
         gi = gi + 1;
-    }
-    // Bump-allocator state for p_malloc: 32 zero bytes in writable .rdata —
+    }  // Bump-allocator state for p_malloc: 32 zero bytes in writable .rdata —
     // +0 chunk cursor, +8 chunk end, +16 cached process-heap handle, +24 lock.
     // Cache-line aligned: a locked operation on a value that crosses a line
     // stalls the whole memory bus (about 900 ns per allocation).
@@ -779,13 +881,32 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     }
     var pi: i64 = 0;
     while pi < prims.len() {
-        var plabel: i64 = PeirEnc_alloc_label(& mut self.enc);
-        HashMap_insert(self.func_labels, prims.get(pi), plabel);
+        var pname: str = prims.get(pi);
+        // MI20: a program function named like a nat_* primitive keeps its
+        // label (and is what its callers get)
+        var pnat: bool = str_starts_with(pname, "nat_");
+        if !(pnat && HashMap_contains(self.func_labels, pname)) {
+            var plabel: i64 = PeirEnc_alloc_label(& mut self.enc);
+            HashMap_insert(self.func_labels, pname, plabel);
+            if pnat {
+                HashMap_insert(self.nat_own, pname, 1);
+            }
+        }
         pi = pi + 1;
     }
     // (only those the program reaches: the runtime function they hand
     // over to is left out otherwise)
     var needed: Vec<str> = pe_ir_needed_functions(module);
+    // MI20: the nat_* primitives an extern declaration the program reaches
+    // names (by its C name: `fn nat_x as y(...)` too) are made
+    var nwi: i64 = 0;
+    while nwi < module.extern_decls.len() {
+        var nxd: ExternDecl = module.extern_decls.get(nwi);
+        if HashMap_contains(self.nat_own, nxd.c_name) && pe_ir_strs_contains(needed, nxd.pledge_name) {
+            HashMap_insert(self.nat_wanted, nxd.c_name, 1);
+        }
+        nwi = nwi + 1;
+    }
     var deps: Vec<PeirStrPair> = pe_stub_deps();
     var di: i64 = 0;
     while di < deps.len() {
@@ -881,6 +1002,17 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
         }
         ni = ni + 1;
     }
+    // A global's string initializer names a function too (`var g: str =
+    // "f"; task_go(g, 1)`): ir.fd ir_data_named_fns, as the mid-end keeps it
+    var gnamed: Vec<str> = ir_data_named_fns(module);
+    var gni: i64 = 0;
+    while gni < gnamed.len() {
+        var gns: str = gnamed.get(gni);
+        if !pe_ir_strs_contains(self.named_fns, gns) && pe_ir_strs_contains(self.module_fns, gns) && (!is_pe_runtime_fn(gns) || pe_ir_strs_contains(needed, gns)) {
+            self.named_fns.push(gns);
+        }
+        gni = gni + 1;
+    }
 
     var api: i64 = 0;
     while api < 9 {
@@ -895,6 +1027,15 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
         bare_entry = PeirEnc_alloc_label(& mut self.enc);
         PeirEnc_jmp_label(& mut self.enc, bare_entry);
     }
+
+    // OP15: the functions that only panic (calls to them are cold paths);
+    // DB3: the input file's functions get line rows; B5: the per-function
+    // cache, now that every label a function may refer to exists
+    PeirGen_find_cold_fns(self, module);
+    if !self.bare_mode {
+        PeirGen_lines_start(self);
+    }
+    PeirGen_fc_start(self, module, all_strings, global_names);
 
     // 4. Generate code for each function main reaches (competitive CS1:
     //    the rest of core and the stdlib is not compiled), sorted for a
@@ -928,7 +1069,7 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
         }
         match IrModule_get_function(module, fname) {
             OptIrFunction::Some(func) => {
-                PeirGen_gen_function(self, fname, & func, module);
+                PeirGen_gen_cached(self, fname, func, module);
             }
             OptIrFunction::None => {
             }
@@ -978,7 +1119,7 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
         // vector, and a void main exits with 0
         g_pe_bare_irqs = Vec::new();
         g_pe_bare_main_void = false;
-        if pe_bare_boot_on() {
+        if pe_bare_boot_on() || g_pe_uefi {
             var ivi: i64 = 0;
             while ivi < func_names.len() {
                 match IrModule_get_function(module, func_names.get(ivi)) {
@@ -1011,6 +1152,18 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     // The functions referred to that main's call graph missed
     PeirGen_gen_on_demand(self, module, func_names, & mut gen_done);
 
+    // MI20: the tables of nat_fn_names / nat_fn_table, after the last code;
+    // under FID_VERIFY=1, every primitive of the interface placed
+    if !self.bare_mode {
+        PeirGen_gen_nat_tables(self);
+        if pe_verify_on() {
+            self.nat_missing = PeirGen_nat_check(self);
+        }
+        // one nothing was made for (no reached declaration names it) traps
+        // if a call still lands on it, rather than jumping to offset -1
+        PeirGen_trap_unplaced(self, prim_interface_names());
+    }
+
     // 7. Resolve local labels (jumps/calls within .text)
     PeirEnc_resolve_labels(& mut self.enc);
 
@@ -1024,6 +1177,10 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
             code_base = g_pe_bare_load + PEIR_BOOT_PREFIX;
         }
         var flat_data: i64 = code_base + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
+        // where the data starts in the flat binary (a UEFI image's .data)
+        g_pe_uefi_code_size = Vec::new();
+        g_pe_uefi_code_size.push(flat_data - code_base);
+        var uefi_data_at: i64 = flat_data - g_pe_bare_load;
         PeirEnc_resolve_rip_refs(& mut self.enc, code_base, flat_data);
         var fpi: i64 = 0;
         while fpi < global_str_patches.len() {
@@ -1033,6 +1190,10 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
             while fb < 8 {
                 rdata.data.set(fslot + fb, (fva >> (8 * fb)) & 0xFF);
                 fb = fb + 1;
+            }
+            if g_pe_uefi {
+                // an absolute address: a DIR64 relocation of the EFI image
+                g_pe_uefi_abs.push(uefi_data_at + fslot);
             }
             fpi = fpi + 2;
         }
@@ -1054,6 +1215,9 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
         }
         return flat;
     }
+
+    // MI20: the absolute addresses in those tables
+    PeirGen_nat_patch_abs(self);
 
     // 8. Compute .rdata RVA dynamically from actual .text size
     var rdata_rva: i64 = PE_TEXT_RVA + pe_align_up(self.enc.code.len(), PE_SECTION_ALIGN);
@@ -1087,7 +1251,375 @@ pub fn PeirGen_generate(self: & mut PeirGen, module: & IrModule) -> Vec {
     var entry_rva: i64 = PE_TEXT_RVA + self.entry_offset;
 
     // 12. Build PE file
-    return pe_build_file(self.enc.code, rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
+    var image: Vec<i64> = pe_build_file(self.enc.code, rdata.data, entry_rva, import_dir_rva, iat_rva, iat_size, rdata_rva);
+    // 12b. DB3: a debug build's DWARF line tables (pe_lines_setup)
+    var dwarf: bool = self.dbg_names.len() > 0;
+    if dwarf {
+        // N9: with the variables, types and frames (pe_add_dwarf);
+        // FID_PE_OFF=dbgvars: the line tables and functions only
+        if peir_on("dbgvars") && g_pe_dbg_vars.len() == self.dbg_names.len() {
+            image = pe_add_dwarf(image, self.enc.code, self.dbg_names, self.dbg_starts, self.dbg_ends, self.lrows, g_pe_lines_file, g_pe_dbg_vars, peir_dbg_type_descs(module));
+        } else {
+            image = pe_add_debug_sections(image, pe_dwarf_abbrev(), pe_dwarf_info(g_pe_lines_file, self.dbg_names, self.dbg_starts, self.dbg_ends), pe_dwarf_line(g_pe_lines_file, self.lrows));
+        }
+    }
+    // 13. Function names for tools and debuggers (DB3, first step): a COFF
+    //     symbol table after the sections. FID_PE_SYMS=0 leaves it out
+    //     (not from a debug build: its string table names the DWARF sections).
+    if peir_syms_on() || dwarf {
+        PeirGen_append_symbols(self, & mut image, dwarf);
+    }
+    // 13b. DB3: the PDB for Visual Studio and WinDbg (compiler/pdb.fd) and
+    //      the debug directory naming it (pdb_setup gave the path). After the
+    //      COFF symbols: pdb_attach moves the symbol table behind its .buildid
+    //      section and reads the COFF function names as publics.
+    if dwarf {
+        var pdb_files: Vec<str> = Vec::new();
+        image = pdb_attach(image, self.dbg_names, self.dbg_starts, self.dbg_ends, self.lrows, pdb_files, g_pe_lines_file);
+    }
+    // B5: the cache file for the next build
+    PeirGen_fc_finish(self);
+    return image;
+}
+
+/// Is the COFF symbol table written (FID_PE_SYMS unset, or not "0")?
+fn peir_syms_on() -> bool {
+    var sw: str = p_getenv("FID_PE_SYMS");
+    if (sw as i64) == 0 {
+        return true;
+    }
+    return sw != "0";
+}
+
+/// Add `name` to the symbol lists when it labels code placed in .text.
+fn PeirGen_symbol_add(self: & mut PeirGen, name: str, seen: i64, names: & mut Vec<str>, offs: & mut Vec<i64>) {
+    if name == "" || HashMap_contains(seen, name) || !HashMap_contains(self.func_labels, name) {
+        return;
+    }
+    var label: i64 = HashMap_get(self.func_labels, name);
+    if label < 0 || label >= self.enc.labels.len() {
+        return;
+    }
+    var off: i64 = self.enc.labels.get(label);
+    if off < 0 {
+        return;
+    }
+    HashMap_insert(seen, name, 1);
+    names.push(name);
+    offs.push(off);
+}
+
+/// The COFF symbol table of the image (pe_append_coff_symbols): every
+/// function, runtime stub, primitive, C thunk and adapter placed in .text,
+/// under its Fides name, and the entry point as `__fid_entry`. In a fixed
+/// order (the sorted function names, then the stub lists), so the same
+/// input still gives the same bytes.
+fn PeirGen_append_symbols(self: & mut PeirGen, image: & mut Vec<i64>, dwarf: bool) {
+    var names: Vec<str> = Vec::new();
+    var offs: Vec<i64> = Vec::new();
+    var seen: i64 = HashMap_new();
+    names.push("__fid_entry");
+    offs.push(self.entry_offset);
+    HashMap_insert(seen, "__fid_entry", 1);
+    var mfns: Vec<str> = self.module_fns;
+    var i: i64 = 0;
+    while i < mfns.len() {
+        var mname: str = mfns.get(i);
+        PeirGen_symbol_add(self, mname, seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var stubs: Vec<str> = pe_runtime_stub_names();
+    i = 0;
+    while i < stubs.len() {
+        PeirGen_symbol_add(self, stubs.get(i), seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var prims: Vec<str> = pe_primitive_names();
+    i = 0;
+    while i < prims.len() {
+        PeirGen_symbol_add(self, prims.get(i), seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    i = 0;
+    var thunks: Vec<CThunk> = self.c_thunks;
+    while i < thunks.len() {
+        var th: CThunk = thunks.get(i);
+        PeirGen_symbol_add(self, th.name, seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    i = 0;
+    var adapters: Vec<CAdapter> = self.c_adapters;
+    while i < adapters.len() {
+        var ad: CAdapter = adapters.get(i);
+        PeirGen_symbol_add(self, ad.name, seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    i = 0;
+    var sexts: Vec<str> = self.stub_externs;
+    while i < sexts.len() {
+        var sname: str = sexts.get(i);
+        PeirGen_symbol_add(self, sname, seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    if dwarf {
+        pe_append_coff_symbols_pre(image, pe_dwarf_section_names(), names, offs);
+    } else {
+        pe_append_coff_symbols(image, names, offs);
+    }
+}
+
+// ===========================================================================
+// MI20: nat_fn_names / nat_fn_table, and the interface check
+// ===========================================================================
+
+/// MI20: the tables nat_fn_names and nat_fn_table return (each made when
+/// PeirGen_gen_nat_prims gave it a label), after the last code so that
+/// every function is placed. As the machine layer's (nat_ir.fd):
+/// nat_fn_names holds [address, name] for each named piece of .text
+/// (program and runtime functions, stubs, primitives, thunks, adapters) in
+/// address order, then [end of code, 0]; nat_fn_table [name, address] for
+/// each function named by a string (named_fns), then [0, 0]. A name is a
+/// static string in .text ([static magic][length] bytes NUL, as .rdata's
+/// strings); an address is absolute, an 8-byte slot PeirGen_nat_patch_abs
+/// fills once the labels are resolved (the image loads at PE_IMAGE_BASE
+/// and has no relocations).
+fn PeirGen_gen_nat_tables(self: & mut PeirGen) {
+    if self.nat_names_tab < 0 && self.nat_fntab_tab < 0 {
+        return;
+    }
+    var names: Vec<str> = Vec::new();
+    var offs: Vec<i64> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var mfns: Vec<str> = self.module_fns;
+    var i: i64 = 0;
+    while i < mfns.len() {
+        PeirGen_symbol_add(self, mfns.get(i), seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var stubs: Vec<str> = pe_runtime_stub_names();
+    i = 0;
+    while i < stubs.len() {
+        PeirGen_symbol_add(self, stubs.get(i), seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var prims: Vec<str> = pe_primitive_names();
+    i = 0;
+    while i < prims.len() {
+        PeirGen_symbol_add(self, prims.get(i), seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var thunks: Vec<CThunk> = self.c_thunks;
+    i = 0;
+    while i < thunks.len() {
+        var th: CThunk = thunks.get(i);
+        PeirGen_symbol_add(self, th.name, seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var adapters: Vec<CAdapter> = self.c_adapters;
+    i = 0;
+    while i < adapters.len() {
+        var ad: CAdapter = adapters.get(i);
+        PeirGen_symbol_add(self, ad.name, seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    var sexts: Vec<str> = self.stub_externs;
+    i = 0;
+    while i < sexts.len() {
+        PeirGen_symbol_add(self, sexts.get(i), seen, & mut names, & mut offs);
+        i = i + 1;
+    }
+    // By address (offset * 2^20 + index: ties keep the order collected)
+    var keys: Vec<i64> = Vec::new();
+    i = 0;
+    while i < offs.len() && offs.len() < 1048576 {
+        keys.push(offs.get(i) * 1048576 + i);
+        i = i + 1;
+    }
+    keys = pe_nat_sort_keys(keys);
+    var name_labels: i64 = HashMap_new();
+    var str_names: Vec<str> = Vec::new();
+    PeirEnc_align_to(& mut self.enc, 16);
+    if self.nat_names_tab >= 0 {
+        PeirEnc_place_label(& mut self.enc, self.nat_names_tab);
+        var last: i64 = 0 - 1;
+        i = 0;
+        while i < keys.len() {
+            var ix: i64 = keys.get(i) % 1048576;
+            var off: i64 = offs.get(ix);
+            // one entry per address (a nat_ alias shares its pe_ twin's)
+            if off != last {
+                var nm: str = names.get(ix);
+                var at_l: i64 = HashMap_get(self.func_labels, nm);
+                PeirGen_nat_abs(self, at_l);
+                var nm_l: i64 = PeirGen_nat_name_label(self, name_labels, & mut str_names, nm);
+                PeirGen_nat_abs(self, nm_l);
+                last = off;
+            }
+            i = i + 1;
+        }
+        // [end of code, 0]: the code ends where the table starts
+        var tab_l: i64 = self.nat_names_tab;
+        PeirGen_nat_abs(self, tab_l);
+        PeirEnc_emit_u64(& mut self.enc, 0);
+    }
+    if self.nat_fntab_tab >= 0 {
+        PeirEnc_place_label(& mut self.enc, self.nat_fntab_tab);
+        var nfs: Vec<str> = self.named_fns;
+        i = 0;
+        while i < nfs.len() {
+            var f: str = nfs.get(i);
+            if HashMap_contains(self.func_labels, f) {
+                var fl: i64 = HashMap_get(self.func_labels, f);
+                if self.enc.labels.get(fl) >= 0 {
+                    var f_l: i64 = PeirGen_nat_name_label(self, name_labels, & mut str_names, f);
+                    PeirGen_nat_abs(self, f_l);
+                    PeirGen_nat_abs(self, fl);
+                }
+            }
+            i = i + 1;
+        }
+        PeirEnc_emit_u64(& mut self.enc, 0);
+        PeirEnc_emit_u64(& mut self.enc, 0);
+    }
+    // The names
+    i = 0;
+    while i < str_names.len() {
+        var s: str = str_names.get(i);
+        var n: i64 = str_len(s);
+        PeirEnc_align_to(& mut self.enc, 8);
+        PeirEnc_emit_u64(& mut self.enc, 0x4649444553545202);
+        PeirEnc_emit_u64(& mut self.enc, n);
+        PeirEnc_place_label(& mut self.enc, HashMap_get(name_labels, s));
+        var b: i64 = 0;
+        while b < n {
+            PeirEnc_emit_u8(& mut self.enc, str_byte_at(s, b));
+            b = b + 1;
+        }
+        PeirEnc_emit_u8(& mut self.enc, 0);
+        i = i + 1;
+    }
+}
+
+/// MI20: the label of the name string `name` in the tables (one per name;
+/// `order` lists them as they are first asked for).
+fn PeirGen_nat_name_label(self: & mut PeirGen, map: i64, order: & mut Vec<str>, name: str) -> i64 {
+    if HashMap_contains(map, name) {
+        return HashMap_get(map, name);
+    }
+    var l: i64 = PeirEnc_alloc_label(& mut self.enc);
+    HashMap_insert(map, name, l);
+    order.push(name);
+    return l;
+}
+
+/// MI20: an 8-byte slot for the absolute address of `label`.
+fn PeirGen_nat_abs(self: & mut PeirGen, label: i64) {
+    var at: i64 = PeirEnc_offset(& self.enc);
+    self.nat_abs_fix.push(at);
+    self.nat_abs_fix.push(label);
+    PeirEnc_emit_u64(& mut self.enc, 0);
+}
+
+/// MI20: fill the slots PeirGen_nat_abs left (labels resolved; .text at
+/// PE_TEXT_RVA of an image at PE_IMAGE_BASE).
+fn PeirGen_nat_patch_abs(self: & mut PeirGen) {
+    var i: i64 = 0;
+    while i + 1 < self.nat_abs_fix.len() {
+        var pos: i64 = self.nat_abs_fix.get(i);
+        var off: i64 = self.enc.labels.get(self.nat_abs_fix.get(i + 1));
+        var va: i64 = 0;
+        if off >= 0 {
+            va = PE_IMAGE_BASE + PE_TEXT_RVA + off;
+        }
+        var b: i64 = 0;
+        while b < 8 {
+            self.enc.code.set(pos + b, (va >> (8 * b)) & 0xFF);
+            b = b + 1;
+        }
+        i = i + 2;
+    }
+}
+
+/// MI20 (FID_VERIFY=1, when every primitive is made): "" when pe_ir placed
+/// each name of prim_interface_names it owns, else the missing ones (as
+/// nat_ir.fd's ng_prim_check words it).
+fn PeirGen_nat_check(self: & PeirGen) -> str {
+    var names: Vec<str> = prim_interface_names();
+    var missing: str = "";
+    var i: i64 = 0;
+    while i < names.len() {
+        var n: str = names.get(i);
+        if HashMap_contains(self.nat_own, n) {
+            var l: i64 = HashMap_get(self.func_labels, n);
+            if self.enc.labels.get(l) < 0 {
+                if missing != "" {
+                    missing = missing + ", ";
+                }
+                missing = missing + n;
+            }
+        }
+        i = i + 1;
+    }
+    if missing == "" {
+        return "";
+    }
+    return "the runtime primitives of this target lack " + missing;
+}
+
+/// MI20: `v` in ascending order (a bottom-up merge sort).
+fn pe_nat_sort_keys(v: Vec<i64>) -> Vec<i64> {
+    var a: Vec<i64> = Vec::new();
+    var b: Vec<i64> = Vec::new();
+    var n: i64 = v.len();
+    var i: i64 = 0;
+    while i < n {
+        a.push(v.get(i));
+        b.push(0);
+        i = i + 1;
+    }
+    var w: i64 = 1;
+    while w < n {
+        var lo: i64 = 0;
+        while lo < n {
+            var mid: i64 = lo + w;
+            if mid > n {
+                mid = n;
+            }
+            var hi: i64 = lo + 2 * w;
+            if hi > n {
+                hi = n;
+            }
+            var x: i64 = lo;
+            var y: i64 = mid;
+            var k: i64 = lo;
+            while k < hi {
+                var take_x: bool = false;
+                if x < mid {
+                    if y >= hi {
+                        take_x = true;
+                    } else if a.get(x) <= a.get(y) {
+                        take_x = true;
+                    }
+                }
+                if take_x {
+                    b.set(k, a.get(x));
+                    x = x + 1;
+                } else {
+                    b.set(k, a.get(y));
+                    y = y + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        i = 0;
+        while i < n {
+            a.set(i, b.get(i));
+            i = i + 1;
+        }
+        w = w * 2;
+    }
+    return a;
 }
 
 // ===========================================================================
@@ -1100,9 +1632,50 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
     // The Fides runtime is machine-level code the interpreter never runs:
     // its arithmetic wraps, as a @wrapping function's does.
     self.cur_wrapping = func.is_wrapping || is_pe_runtime_fn(name);
+    // J7: a @constant_time function may not branch or divide on secrets in
+    // the code this backend emits (peir_ct_check)
+    if func.is_constant_time && !peir_ct_off() {
+        var ct_errs: Vec<str> = peir_ct_check(func, name);
+        var cti: i64 = 0;
+        while cti < ct_errs.len() {
+            g_pe_ct_errors.push(ct_errs.get(cti));
+            cti = cti + 1;
+        }
+    }
+    // B5: the cache key PeirGen_gen_cached worked out (0: not cached), and
+    // where this function's relocations and labels start
+    var fc_key: i64 = self.fc_key;
+    self.fc_key = 0;
+    var fc_pl0: i64 = self.enc.pending_labels.len();
+    var fc_rr0: i64 = self.enc.pending_rip_refs.len();
+    var fc_lab0: i64 = self.enc.next_label;
+    var fc_unres0: i64 = self.unres_adds;
     var label: i64 = HashMap_get(self.func_labels, name);
     PeirEnc_align_to(& mut self.enc, 16);
     PeirEnc_place_label(& mut self.enc, label);
+    var fc_start: i64 = self.enc.code.len();
+    // DB3: line rows for the functions of the input file
+    self.lines_cur_fn = HashMap_contains(self.line_fns, name) && !peir_is_interrupt(self, func);
+    self.cur_line = 0;
+    if self.lines_cur_fn {
+        // N9: one entry of variables per function named (a new generator
+        // starts the list again: PE88 may build the image twice)
+        if self.dbg_names.len() == 0 {
+            g_pe_dbg_vars = Vec::new();
+        }
+        self.dbg_names.push(name);
+        self.dbg_starts.push(fc_start);
+        g_pe_dbg_vars.push("");
+        // N9: a row at the function's first byte with its `fn` line, so a
+        // debugger's `break <function>` steps over the prologue to the
+        // body's first row (the next one: cur_line stays 0)
+        var dline: i64 = peir_dbg_decl_line(name);
+        if dline > 0 && peir_on("dbgvars") {
+            self.lrows.push(fc_start);
+            self.lrows.push(dline);
+            self.lrows.push(0);
+        }
+    }
     if str_len(p_getenv("PE_DUMP_FN")) > 0 {
         p_eprint_str("FN " + name + " @" + int_to_str(self.enc.code.len()) + "\n");
     }
@@ -1237,11 +1810,45 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
         }
         abi = abi + 1;
     }
+    // N9: in a debug build every value a source variable is bound to keeps
+    // its slot for the whole function (as an alloca does), so a debugger
+    // reads it there (PeirGen_dbg_vars_note) instead of a slot another
+    // value took over after its last use
+    if self.lines_cur_fn && peir_on("dbgvars") {
+        var dli: i64 = 0;
+        while dli < func.locals.len() {
+            var dlid: i64 = func.locals.get(dli).id;
+            if dlid >= 0 && dlid < nvals {
+                def_block.set(dlid, - 1);
+            }
+            dli = dli + 1;
+        }
+    }
 
     self.unchecked = peir_unchecked_ops(func, nvals);
     // Registers: the hottest locals keep one for the whole function, the
     // others serve temporaries, freed and reused as pool slots are.
-    var use_regs: bool = !self.bare_mode && !peir_is_interrupt(self, func);
+    // LG13: asm! templates run in a process; they may write any register,
+    // so such a function keeps every value in its slot (as a bare build
+    // does) and saves every callee-saved register (below)
+    self.has_asm = !self.bare_mode && peir_on("asm") && peir_has_asm(func);
+    // RA1: FID_PE_OFF=ra runs without pe_ir's own allocator (D4/OP16/OP17:
+    // peir_pick_reg_vars, peir_global_ra, coalescing, volatile ranges):
+    // every value in its slot, as a bare build and an asm! function do.
+    // It measures what the allocator's deletion costs, and that what keeps
+    // pe_ir after the Windows default moves to the machine layer (MI17)
+    // runs without it.
+    var use_regs: bool = !self.bare_mode && !peir_is_interrupt(self, func) && !self.has_asm && peir_on("ra");
+    // D13: repeated register moves left out (FID_PE_OFF=cprop: kept)
+    g_peir_cp = peir_on("cprop");
+    // LF20: a function holding secrets clears its frame and scratch
+    // registers before it returns (PeirGen_wipe_frame)
+    self.wipe_frame = peir_on("wipe") && !peir_is_interrupt(self, func) && (func.zeroize_locals.len() > 0 || func.is_constant_time);
+    // OP13: `return g(x)` jumps to g when nothing g gets points into this
+    // frame (it is gone once g runs)
+    self.tail_ok = use_regs && peir_on("tail") && !self.wipe_frame && !peir_frame_escapes(func, nvals);
+    self.tail_next = false;
+    self.tail_done = false;
     var no_reg: Vec<i64> = peir_zeros(nvals);
     var used_regs: Vec<i64> = Vec::new();
     var ra_facts: PeirRaFacts = PeirRaFacts_new();
@@ -1454,6 +2061,17 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
         }
         ii = ii + 1;
     }
+    if self.has_asm {
+        var ar: i64 = 0;
+        while ar < PEIR_VALUE_REGS {
+            if !peir_has_i64(used_regs, ar) {
+                used_regs.push(ar);
+            }
+            ar = ar + 1;
+        }
+        used_regs.push(0x100 + 6);
+        used_regs.push(0x100 + 7);
+    }
     self.saved_regs = Vec::new();
     var ri: i64 = 0;
     while ri < PEIR_VALUE_REGS {
@@ -1599,17 +2217,28 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
         bi = bi + 1;
     }
 
+    // OP15: the order blocks are laid out in: cold blocks (panic paths)
+    // after the others; lpos = a block's place in it
+    var order: Vec<i64> = PeirGen_block_order(self, func);
+    var lpos: Vec<i64> = peir_zeros(func.blocks.len());
+    var oi3: i64 = 0;
+    while oi3 < order.len() {
+        lpos.set(order.get(oi3), oi3);
+        oi3 = oi3 + 1;
+    }
+
     // Generate code for each basic block
-    bi = 0;
-    while bi < func.blocks.len() {
+    var lk: i64 = 0;
+    while lk < order.len() {
+        bi = order.get(lk);
         var block2: BasicBlock = func.blocks.get(bi);
         var blabel2: i64 = HashMap_get(self.block_labels, pe_block_key(name, block2.id));
         PeirEnc_place_label(& mut self.enc, blabel2);
 
         self.pending_cmp_cc = - 1;
         self.next_block = - 1;
-        if bi + 1 < func.blocks.len() {
-            self.next_block = HashMap_get(self.block_labels, pe_block_key(name, func.blocks.get(bi + 1).id));
+        if lk + 1 < order.len() {
+            self.next_block = HashMap_get(self.block_labels, pe_block_key(name, func.blocks.get(order.get(lk + 1)).id));
         }
         // Loop rotation (competitive OP11): a block that jumps back to a
         // loop header made only of the loop's test runs that test itself,
@@ -1622,7 +2251,7 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
                 OptInst::Some(lj) => {
                     match lj {
                         Inst::Jump(jt) => {
-                            if jt >= 0 && jt < bindex.len() && bindex.get(jt) >= 0 && bindex.get(jt) < bi && peir_rotatable(func, func.blocks.get(bindex.get(jt))) {
+                            if jt >= 0 && jt < bindex.len() && bindex.get(jt) >= 0 && bindex.get(jt) < bi && lpos.get(bindex.get(jt)) < lk && peir_rotatable(func, func.blocks.get(bindex.get(jt))) {
                                 rot = bindex.get(jt);
                             }
                         }
@@ -1643,21 +2272,39 @@ pub fn PeirGen_gen_function(self: & mut PeirGen, name: str, func: & IrFunction, 
             self.pending_cmp_cc = - 1;
             PeirGen_gen_insts(self, hb.instructions, hb.instructions.len(), & mut frame, func, module, name);
         }
-        bi = bi + 1;
+        lk = lk + 1;
     }
 
     // Epilogue (fallthrough safety)
     PeirGen_restore_regs(self);
+    if self.wipe_frame {
+        PeirGen_wipe_frame(self);
+    }
     PeirEnc_mov_rr(& mut self.enc, PEIR_RSP, PEIR_RBP);
     PeirEnc_pop(& mut self.enc, PEIR_RBP);
     PeirEnc_ret(& mut self.enc);
+    // DB3: the function's line rows end here (its cold paths have none)
+    if self.lines_cur_fn {
+        self.lrows.push(self.enc.code.len());
+        self.lrows.push(0);
+        self.lrows.push(1);
+    }
     // The inline Vec calls' cold paths, out of the hot code's way
     PeirGen_emit_cold(self, & mut frame);
+    if self.lines_cur_fn {
+        self.dbg_ends.push(self.enc.code.len());
+        // N9: its parameters and variables, now that the frame is laid out
+        PeirGen_dbg_vars_note(self, func, module, & frame);
+        self.lines_cur_fn = false;
+    }
+    // B5: keep the function's code for the next build
+    if fc_key != 0 {
+        PeirGen_fc_capture(self, name, fc_key, fc_start, fc_pl0, fc_rr0, fc_lab0, fc_unres0);
+    }
 }
 
 /// Only generate the functions main reaches, and those referred to (CS1)
-const PEIR_REACHABLE_ONLY: bool = true;
-/// Generate every function whose label some emitted code refers to but
+const PEIR_REACHABLE_ONLY: bool = true;  /// Generate every function whose label some emitted code refers to but
 /// that has no code yet, until there is none (each may refer to others).
 fn PeirGen_gen_on_demand(self: & mut PeirGen, module: & IrModule, func_names: Vec<str>, done: & mut Vec<i64>) {
     var changed: bool = true;
@@ -1681,7 +2328,7 @@ fn PeirGen_gen_on_demand(self: & mut PeirGen, module: & IrModule, func_names: Ve
                     if lab >= 0 && lab < refd.len() && refd.get(lab) == 1 && self.enc.labels.get(lab) < 0 {
                         match IrModule_get_function(module, fname) {
                             OptIrFunction::Some(func) => {
-                                PeirGen_gen_function(self, fname, & func, module);
+                                PeirGen_gen_cached(self, fname, func, module);
                                 changed = true;
                             }
                             OptIrFunction::None => {
@@ -1718,12 +2365,51 @@ fn PeirGen_gen_insts(self: & mut PeirGen, ids: Vec<i64>, n: i64, frame: & mut Pe
                 }
             }
         }
+        // DB3: a row where the source line changes
+        if self.lines_cur_fn {
+            var sl: i64 = peir_inst_line(func, inst_id);
+            if sl > 0 && sl != self.cur_line {
+                self.lrows.push(self.enc.code.len());
+                self.lrows.push(sl);
+                self.lrows.push(0);
+                self.cur_line = sl;
+            }
+        }
+        // OP13: a call whose result the next instruction returns
+        self.tail_next = false;
+        if self.tail_ok && ii2 + 1 < n {
+            match IrFunction_get_inst(func, ids.get(ii2 + 1)) {
+                OptInst::Some(rinst) => {
+                    match rinst {
+                        Inst::Return(rv) => {
+                            match rv {
+                                OptValueId::Some(rvid) => {
+                                    self.tail_next = rvid == inst_id;
+                                }
+                                OptValueId::None => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptInst::None => {
+                }
+            }
+        }
         match IrFunction_get_inst(func, inst_id) {
             OptInst::Some(inst) => {
                 PeirGen_gen_inst(self, inst_id, inst, next_cond, frame, func, module, name);
             }
             OptInst::None => {
             }
+        }
+        self.tail_next = false;
+        if self.tail_done {
+            // the Return is the jump just emitted
+            self.tail_done = false;
+            ii2 = ii2 + 1;
         }
         ii2 = ii2 + 1;
     }
@@ -1965,12 +2651,19 @@ fn peir_loop_back(index: Vec<i64>, depth: & mut Vec<i64>, target: i64, at: i64) 
 // emitting code is unchanged.
 // ===========================================================================
 
+/// r8 and r9 (value registers 9 and 10) for values whose live range holds
+/// no call, starts and ends at no call and is not a parameter's (D4). No
+/// instruction peir_ra_volatile_safe accepts uses r8 or r9: they appear
+/// only in calls' argument moves, the parameter moves of the prologue, the
+/// inline Vec calls and their cold paths (calls), an interrupt handler's
+/// saves (no registers there) and the frame wipe after the return value.
+const PEIR_ARG_RA: bool = true;
+
 const PEIR_GLOBAL_RA: bool = true;  /// Copy coalescing: a local's loads and stores share its register (OP16)
 const PEIR_COALESCE: bool = true;  /// r10 and r11, and xmm2-xmm5, for values no call crosses (OP16)
 const PEIR_VOLATILE_RA: bool = true;  /// f64 values and locals in xmm registers (OP17)
 const PEIR_XMM_RA: bool = true;  /// Loop rotation: a loop's test copied to the end of its body (OP11)
-const PEIR_ROTATE: bool = true;
-/// What pick_reg_vars works out, for the allocator: per alloca its weight
+const PEIR_ROTATE: bool = true;  /// What pick_reg_vars works out, for the allocator: per alloca its weight
 /// + 1 when it is a candidate and whether it must stay in memory; per block
 /// its loop depth; block id -> index.
 pub struct PeirRaFacts {
@@ -2107,12 +2800,27 @@ fn peir_ra_writes_last(inst: Inst) -> bool {
     }
 }
 
+/// Whether register `r` of the scan may hold candidate `c`: registers
+/// [0, nfixed) any candidate, [nfixed, nvol) (caller-saved) one with
+/// vok[c] >= 1, [nvol, nregs) (caller-saved argument registers, D4) one
+/// with vok[c] == 2.
+fn peir_ra_reg_ok(vok: & Vec<i64>, c: i64, r: i64, nfixed: i64, nvol: i64) -> bool {
+    if r < nfixed {
+        return true;
+    }
+    if r < nvol {
+        return vok.get(c) >= 1;
+    }
+    return vok.get(c) == 2;
+}
+
 /// Linear scan of the candidates with part[c] == 1 over `nregs` registers;
 /// registers [0, nfixed) any candidate may get, the others (caller-saved)
-/// only one with vok[c] == 1. A candidate prefers the register of hint[c]
-/// when that is free where it starts. Returns per candidate its register
-/// index or -1 (in memory).
-fn peir_ra_scan(nc: i64, lo: & Vec<i64>, hi: & Vec<i64>, wt: & Vec<i64>, part: & Vec<i64>, vok: & Vec<i64>, hint: & Vec<i64>, nregs: i64, nfixed: i64, npos: i64) -> Vec<i64> {
+/// only one with vok[c] >= 1, and those from `nvol` on only one with
+/// vok[c] == 2 (peir_ra_reg_ok). A candidate prefers the register of
+/// hint[c] when that is free where it starts. Returns per candidate its
+/// register index or -1 (in memory).
+fn peir_ra_scan(nc: i64, lo: & Vec<i64>, hi: & Vec<i64>, wt: & Vec<i64>, part: & Vec<i64>, vok: & Vec<i64>, hint: & Vec<i64>, nregs: i64, nfixed: i64, nvol: i64, npos: i64) -> Vec<i64> {
     var reg_of: Vec<i64> = Vec::new();
     while reg_of.len() < nc {
         reg_of.push(- 1);
@@ -2153,19 +2861,30 @@ fn peir_ra_scan(nc: i64, lo: & Vec<i64>, hi: & Vec<i64>, wt: & Vec<i64>, part: &
                 }
                 r = r + 1;
             }
-            var can_vol: bool = vok.get(cur) == 1;
+            var can_vol: bool = vok.get(cur) >= 1;
             var pick: i64 = - 1;
             var h: i64 = hint.get(cur);
             if h >= 0 && reg_of.get(h) >= 0 {
                 var hr: i64 = reg_of.get(h);
-                if active.get(hr) < 0 && (hr < nfixed || can_vol) {
+                if active.get(hr) < 0 && peir_ra_reg_ok(vok, cur, hr, nfixed, nvol) {
                     pick = hr;
+                }
+            }
+            if pick < 0 && vok.get(cur) == 2 {
+                // r8/r9 first (D4): r10/r11 stay for ranges that end or
+                // start at a call
+                r = nvol;
+                while r < nregs && pick < 0 {
+                    if active.get(r) < 0 {
+                        pick = r;
+                    }
+                    r = r + 1;
                 }
             }
             if pick < 0 && can_vol {
                 // a caller-saved register costs no save and restore
                 r = nfixed;
-                while r < nregs && pick < 0 {
+                while r < nvol && r < nregs && pick < 0 {
                     if active.get(r) < 0 {
                         pick = r;
                     }
@@ -2187,7 +2906,7 @@ fn peir_ra_scan(nc: i64, lo: & Vec<i64>, hi: & Vec<i64>, wt: & Vec<i64>, part: &
                 var worst: i64 = - 1;
                 r = 0;
                 while r < nregs {
-                    if r < nfixed || can_vol {
+                    if peir_ra_reg_ok(vok, cur, r, nfixed, nvol) {
                         var a2: i64 = active.get(r);
                         if worst < 0 || wt.get(a2) < wt.get(active.get(worst)) || (wt.get(a2) == wt.get(active.get(worst)) && hi.get(a2) > hi.get(active.get(worst))) {
                             worst = r;
@@ -2556,43 +3275,9 @@ fn peir_global_ra(func: & IrFunction, module: & IrModule, frame: & mut PeStackFr
         bend.set(b, pos - 1);
         b = b + 1;
     }
-    // Successors
-    var succ_a: Vec<i64> = Vec::new();
-    var succ_b: Vec<i64> = Vec::new();
-    b = 0;
-    while b < nb {
-        var sa: i64 = - 1;
-        var sb: i64 = - 1;
-        var ids2: Vec<i64> = func.blocks.get(b).instructions;
-        if ids2.len() > 0 {
-            match IrFunction_get_inst(func, ids2.get(ids2.len() - 1)) {
-                OptInst::Some(last) => {
-                    match last {
-                        Inst::Jump(t) => {
-                            if t >= 0 && t < facts.index.len() {
-                                sa = facts.index.get(t);
-                            }
-                        }
-                        Inst::Branch(_, t, e) => {
-                            if t >= 0 && t < facts.index.len() {
-                                sa = facts.index.get(t);
-                            }
-                            if e >= 0 && e < facts.index.len() {
-                                sb = facts.index.get(e);
-                            }
-                        }
-                        _ => {
-                        }
-                    }
-                }
-                OptInst::None => {
-                }
-            }
-        }
-        succ_a.push(sa);
-        succ_b.push(sb);
-        b = b + 1;
-    }
+    // Successors: the shared CFG (compiler/checks.fd iro_cfg, ME2); its block
+    // indexes are facts.index's, and it has every Switch edge
+    var ra_cfg: IroCfg = iro_cfg(func);
     // Liveness: in = use | (out & ~def), out = the ins of the successors
     var live_in: Vec<i64> = peir_zeros(nb * nw);
     var live_out: Vec<i64> = peir_zeros(nb * nw);
@@ -2602,16 +3287,14 @@ fn peir_global_ra(func: & IrFunction, module: & IrModule, frame: & mut PeStackFr
         b = nb - 1;
         while b >= 0 {
             var base2: i64 = b * nw;
-            var sa2: i64 = succ_a.get(b);
-            var sb2: i64 = succ_b.get(b);
+            var ss2: Vec<i64> = ra_cfg.succs.get(b);
             var w: i64 = 0;
             while w < nw {
                 var out: i64 = 0;
-                if sa2 >= 0 {
-                    out = out | live_in.get(sa2 * nw + w);
-                }
-                if sb2 >= 0 {
-                    out = out | live_in.get(sb2 * nw + w);
+                var lsi: i64 = 0;
+                while lsi < ss2.len() {
+                    out = out | live_in.get(ss2.get(lsi) * nw + w);
+                    lsi = lsi + 1;
                 }
                 live_out.set(base2 + w, out);
                 var inw: i64 = use_bs.get(base2 + w) | (out & ~def_bs.get(base2 + w));
@@ -2803,6 +3486,8 @@ fn peir_global_ra(func: & IrFunction, module: & IrModule, frame: & mut PeStackFr
     unsafe_before.push(cnt);
     var reg_gp: Vec<i64> = Vec::new();
     var reg_x: Vec<i64> = Vec::new();
+    // D4: r8 and r9 as value registers (FID_PE_OFF=r89: not)
+    var arg_ra: bool = PEIR_ARG_RA && peir_on("r89");
     var round: i64 = 0;
     while round < 3 {
         var vok: Vec<i64> = peir_zeros(nc);
@@ -2835,13 +3520,22 @@ fn peir_global_ra(func: & IrFunction, module: & IrModule, frame: & mut PeStackFr
                     }
                     if good {
                         vok.set(ci, 1);
+                        // D4: r8/r9 too when the range neither starts nor
+                        // ends at a call (a call's arguments are moved into
+                        // rcx, rdx, r8, r9 one after another, and its result
+                        // is written after code that may use them) and is
+                        // not a parameter's (they arrive in rcx-r9 and are
+                        // moved to their registers one after another)
+                        if arg_ra && l0 >= 0 && p_safe.get(l0) == 1 && p_safe.get(h0) == 1 {
+                            vok.set(ci, 2);
+                        }
                     }
                 }
             }
             ci = ci + 1;
         }
-        reg_gp = peir_ra_scan(nc, & lo, & hi, & wt, & part_gp, & vok, & hint, PEIR_ALL_REGS, PEIR_VALUE_REGS, npos);
-        reg_x = peir_ra_scan(nc, & lo, & hi, & wt, & part_x, & vok, & hint, 6, 2, npos);
+        reg_gp = peir_ra_scan(nc, & lo, & hi, & wt, & part_gp, & vok, & hint, PEIR_ALL_REGS, PEIR_VALUE_REGS, PEIR_ARG_VALUE_REGS, npos);
+        reg_x = peir_ra_scan(nc, & lo, & hi, & wt, & part_x, & vok, & hint, 6, 2, 6, npos);
         // A local left in memory: its members get registers of their own
         var again: bool = false;
         ci = 0;
@@ -2941,6 +3635,14 @@ fn peir_pick_reg_vars(func: & IrFunction, module: & IrModule, frame: & mut PeSta
                         Inst::Branch(_, t, e) => {
                             peir_loop_back(index, & mut depth, t, b);
                             peir_loop_back(index, & mut depth, e, b);
+                        }
+                        Inst::Switch(_, _, sw_t, sw_d) => {
+                            var swb: Vec<i64> = switch_succ_blocks(sw_t, sw_d);
+                            var swi: i64 = 0;
+                            while swi < swb.len() {
+                                peir_loop_back(index, & mut depth, swb.get(swi), b);
+                                swi = swi + 1;
+                            }
                         }
                         _ => {
                         }
@@ -3239,7 +3941,7 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
             }
             // straight into its register (competitive OP19)
             if dst >= PEIR_REG_SLOT && !peir_is_xmm_slot(dst) {
-                PeirEnc_mov_imm(& mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), value);
+                PeirEnc_mov_imm_cp(& mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), value);
             } else {
                 PeirEnc_mov_imm(& mut self.enc, PEIR_RAX, value);
                 PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
@@ -3253,7 +3955,7 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 v8 = 1;
             }
             if dst >= PEIR_REG_SLOT && !peir_is_xmm_slot(dst) {
-                PeirEnc_mov_imm(& mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), v8);
+                PeirEnc_mov_imm_cp(& mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), v8);
             } else {
                 PeirEnc_mov_imm64(& mut self.enc, PEIR_RAX, v8);
                 PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
@@ -3341,13 +4043,46 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 if pe_idmap_has(& frame.const_vals, right) {
                     rconst = OptU64::Some(pe_idmap_get(& frame.const_vals, right));
                 }
+                // D13: a constant left operand of a comparison or of a
+                // commutative operation goes right (`5 < x` is `x > 5`), so
+                // x is compared in its register or slot against an
+                // immediate. `cc` below comes from the mirrored operation,
+                // so the fused branch tests the swapped condition.
+                var bop: BinOp = op;
+                if PEIR_CONST_LEFT_SWAP && peir_op_commutes(op) && pe_idmap_has(& frame.const_vals, left) && !pe_idmap_has(& frame.const_vals, right) && peir_on("cswap") {
+                    bop = peir_mirror_op(op);
+                    var sw_off: i64 = loff;
+                    loff = roff;
+                    roff = sw_off;
+                    rconst = lconst;
+                    lconst = OptU64::None;
+                }
                 // cmp+branch fusion (item 82): a comparison feeding the next
                 // instruction's Branch keeps its flags live through
                 // setcc/movzx/mov — the branch jcc's on them directly. When
                 // that Branch is its only use, it is not stored at all.
-                var cc: i64 = peir_int_cmp_cc(op, unsigned_cmp);
+                var cc: i64 = peir_int_cmp_cc(bop, unsigned_cmp);
                 self.flags_only = cc >= 0 && next_cond == id && id < self.use_count.len() && self.use_count.get(id) == 1;
-                PeirGen_gen_int_binop(self, op, loff, roff, dst, lconst, rconst, ty, unsigned_cmp);
+                // OP20 (BMI1, --cpu x86-64-v3|v4): a 64-bit `x & (x - 1)`
+                // is BLSR (peir_blsr_src)
+                var blsr_x: i64 = - 1;
+                if peir_bmi() && (ir_type_eq(ty, IrType::I64) || ir_type_eq(ty, IrType::U64)) {
+                    match op {
+                        BinOp::BitAnd => {
+                            blsr_x = peir_blsr_src(func, frame, left, right);
+                            if blsr_x < 0 {
+                                blsr_x = peir_blsr_src(func, frame, right, left);
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                if blsr_x >= 0 {
+                    PeirGen_gen_blsr(self, PeStackFrame_offset(frame, blsr_x), dst);
+                } else {
+                    PeirGen_gen_int_binop(self, bop, loff, roff, dst, lconst, rconst, ty, unsigned_cmp);
+                }
                 self.flags_only = false;
                 if cc >= 0 && next_cond == id {
                     self.pending_cmp_cc = cc;
@@ -3468,7 +4203,8 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 }
                 var vreg: i64 = peir_value_reg(rvslot - PEIR_REG_SLOT);
                 if pe_idmap_has(& frame.const_vals, value) {
-                    PeirEnc_mov_imm(& mut self.enc, vreg, pe_idmap_get(& frame.const_vals, value));
+                    // (D13: not again when the constant was just put there)
+                    PeirEnc_mov_imm_cp(& mut self.enc, vreg, pe_idmap_get(& frame.const_vals, value));
                 } else {
                     PeirEnc_mov_reg_mem_rbp(& mut self.enc, vreg, PeStackFrame_offset(frame, value));
                 }
@@ -3634,6 +4370,31 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
             }
         }
 
+        Inst::Switch(sv, sw_keys, sw_targets, sw_dflt) => {
+            // ME28: a compare chain. pe_ir is given functions without
+            // switches (IrFunction_without_switches: its liveness knows two
+            // successors a block at most); this stays correct if one comes.
+            var swoff: i64 = PeStackFrame_offset(frame, sv);
+            if swoff >= PEIR_REG_SLOT && !peir_is_xmm_slot(swoff) {
+                PeirEnc_mov_rr(& mut self.enc, PEIR_RAX, peir_value_reg(swoff - PEIR_REG_SLOT));
+            } else {
+                PeirGen_load_operand(self, PEIR_RAX, sv, frame);
+            }
+            var swi: i64 = 0;
+            while swi < sw_keys.len() && swi < sw_targets.len() {
+                PeirEnc_mov_imm64(& mut self.enc, PEIR_RCX, sw_keys.get(swi));
+                PeirEnc_cmp_rr(& mut self.enc, PEIR_RAX, PEIR_RCX);
+                PeirEnc_jcc_label(& mut self.enc, 0x4, HashMap_get(self.block_labels, pe_block_key(func_name, sw_targets.get(swi))));
+                swi = swi + 1;
+            }
+            var sw_dl: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, sw_dflt));
+            if sw_dl != self.next_block {
+                PeirEnc_jmp_label(& mut self.enc, sw_dl);
+            }
+            self.pending_cmp_cc = - 1;
+            self.pending_cmp_vid = - 1;
+        }
+
         Inst::Branch(cond, then, else_) => {
             var then_label: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, then));
             var else_label: i64 = HashMap_get(self.block_labels, pe_block_key(func_name, else_));
@@ -3678,6 +4439,9 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 }
             }
             PeirGen_restore_regs(self);
+            if self.wipe_frame {
+                PeirGen_wipe_frame(self);
+            }
             PeirEnc_mov_rr(& mut self.enc, PEIR_RSP, PEIR_RBP);
             PeirEnc_pop(& mut self.enc, PEIR_RBP);
             if peir_is_interrupt(self, func) {
@@ -3874,6 +4638,20 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 ri = ri + 1;
             }
 
+            // OP13: a sibling tail call. The arguments are in their
+            // registers; the frame goes and the callee returns to our
+            // caller, with its result in rax as ours would be. Only to a
+            // Fides function (our convention, rax result) and with every
+            // argument in a register (stack arguments would be in our frame).
+            if self.tail_next && self.calls_reserved && call_args.len() <= 4 && pe_ir_strs_contains(self.module_fns, target_func) && HashMap_contains(self.func_labels, target_func) {
+                PeirGen_restore_regs(self);
+                PeirEnc_mov_rr(& mut self.enc, PEIR_RSP, PEIR_RBP);
+                PeirEnc_pop(& mut self.enc, PEIR_RBP);
+                PeirEnc_jmp_label(& mut self.enc, HashMap_get(self.func_labels, target_func));
+                self.tail_done = true;
+                return;
+            }
+
             if !self.calls_reserved {
                 PeirEnc_sub_rsp_i32(& mut self.enc, call_space);
             }
@@ -3908,12 +4686,22 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
             PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
         }
 
-        Inst::CallPtr(fn_ptr, args, _, _, _) => {
+        Inst::CallPtr(fn_ptr, args, cp_ret_ty, _, _) => {
             var fpoff: i64 = PeStackFrame_offset(frame, fn_ptr);
             // Load env struct pointer
             PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, fpoff);
             // Load fn addr from field 0
             PeirEnc_mov_reg_ptr(& mut self.enc, PEIR_RAX, PEIR_RAX);
+            // Roadmap L6C (@7737): word 0 == 0 is the C function pointer
+            // marker (lower.fd: an address cast to a function type, or a
+            // typed p_dl_find, is an env of ConstFnRef("__fid_c_fnptr"),
+            // which resolves to 0 as no function has that name, and the
+            // address in word 1). Such a call goes to c_fnptr_label below.
+            var c_fnptr_label: i64 = PeirEnc_alloc_label(& mut self.enc);
+            var c_fnptr_done: i64 = PeirEnc_alloc_label(& mut self.enc);
+            PeirEnc_test_rr(& mut self.enc, PEIR_RAX, PEIR_RAX);
+            PeirEnc_jcc_label(& mut self.enc, 0x4, c_fnptr_label);
+            // je
 
             var total_args: i64 = args.len() + 1;
             var arg_regs: Vec<i64> = Vec::new();
@@ -3950,6 +4738,53 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
             PeirEnc_call_reg(& mut self.enc, PEIR_R10);
             PeirEnc_add_rsp_i32(& mut self.enc, call_space);
             PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+            PeirEnc_jmp_label(& mut self.enc, c_fnptr_done);
+
+            // The C function pointer: call [env + 8] with the Win64 C
+            // convention and no env. Argument i goes in position i (RCX,
+            // RDX, R8, R9, then the stack at 32 + (i - 4) * 8); an f64/f32
+            // one of the first four in XMM<i> instead (positional rule).
+            // An f64/f32 result comes back in XMM0.
+            PeirEnc_place_label(& mut self.enc, c_fnptr_label);
+            var c_stack_args: i64 = 0;
+            if args.len() > 4 {
+                c_stack_args = args.len() - 4;
+            }
+            var c_space: i64 = (32 + c_stack_args * 8 + 15) & ~15;
+            PeirEnc_sub_rsp_i32(& mut self.enc, c_space);
+            var ci: i64 = 0;
+            while ci < args.len() {
+                var caoff: i64 = PeStackFrame_offset(frame, args.get(ci));
+                var caty: IrType = peir_operand_ty(func, args.get(ci));
+                var ca_f32: bool = ir_type_eq(caty, IrType::F32);
+                var ca_f64: bool = ir_type_eq(caty, IrType::F64);
+                if ci < 4 {
+                    if ca_f64 {
+                        PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, ci, caoff);
+                    } else if ca_f32 {
+                        PeirEnc_movss_xmm_mem_rbp(& mut self.enc, ci, caoff);
+                    } else {
+                        PeirEnc_mov_reg_mem_rbp(& mut self.enc, arg_regs.get(ci), caoff);
+                    }
+                } else {
+                    // a float's bits go on the stack as they are
+                    PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_R10, caoff);
+                    PeirEnc_mov_mem_disp_reg(& mut self.enc, PEIR_RSP, 32 + (ci - 4) * 8, PEIR_R10);
+                }
+                ci = ci + 1;
+            }
+            PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_R10, fpoff);
+            PeirEnc_mov_reg_mem_disp(& mut self.enc, PEIR_R10, PEIR_R10, 8);
+            PeirEnc_call_reg(& mut self.enc, PEIR_R10);
+            PeirEnc_add_rsp_i32(& mut self.enc, c_space);
+            if ir_type_eq(cp_ret_ty, IrType::F64) {
+                PeirEnc_movsd_mem_rbp_xmm(& mut self.enc, dst, 0);
+            } else if ir_type_eq(cp_ret_ty, IrType::F32) {
+                PeirEnc_movss_mem_rbp_xmm(& mut self.enc, dst, 0);
+            } else {
+                PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+            }
+            PeirEnc_place_label(& mut self.enc, c_fnptr_done);
         }
 
         // --- Conversions ---
@@ -3976,23 +4811,23 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
             var voff: i64 = PeStackFrame_offset(frame, value);
             PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, voff);
             match to {
+                // M7: a signed narrow value is kept sign-extended over the
+                // word (as loads and IntExtend do), an unsigned one
+                // zero-extended
                 IrType::I8 => {
-                    PeirEnc_movzx_r32_r8(& mut self.enc, PEIR_RAX, PEIR_RAX);
+                    PeirEnc_movsx_r64_r8(& mut self.enc, PEIR_RAX, PEIR_RAX);
                 }
                 IrType::U8 => {
                     PeirEnc_movzx_r32_r8(& mut self.enc, PEIR_RAX, PEIR_RAX);
                 }
                 IrType::I16 => {
-                    PeirEnc_movzx_r32_r16(& mut self.enc, PEIR_RAX, PEIR_RAX);
+                    PeirEnc_movsx_r64_r16(& mut self.enc, PEIR_RAX, PEIR_RAX);
                 }
                 IrType::U16 => {
                     PeirEnc_movzx_r32_r16(& mut self.enc, PEIR_RAX, PEIR_RAX);
                 }
                 IrType::I32 => {
-                    // mov eax, eax (zero-extends upper 32 bits)
-                    PeirEnc_rex(& mut self.enc, false, false, false, false);
-                    PeirEnc_emit_u8(& mut self.enc, 0x89);
-                    PeirEnc_modrm_rr(& mut self.enc, PEIR_RAX, PEIR_RAX);
+                    PeirEnc_movsxd_rr(& mut self.enc, PEIR_RAX, PEIR_RAX);
                 }
                 IrType::U32 => {
                     // mov eax, eax (zero-extends upper 32 bits)
@@ -4009,10 +4844,15 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
         Inst::IntToFloat(value, _, to) => {
             var voff: i64 = PeStackFrame_offset(frame, value);
             PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, voff);
-            PeirEnc_cvtsi2sd_r64(& mut self.enc, 0, PEIR_RAX);
             if ir_type_eq(to, IrType::F32) {
-                PeirEnc_movss_mem_rbp_xmm(& mut self.enc, dst, 0);
+                // OP17: cvtsi2ss xmm0, rax (it stored the low half of an
+                // f64's bits as the f32)
+                peir_emit2(& mut self.enc, 0xF3, 0x48);
+                peir_emit2(& mut self.enc, 0x0F, 0x2A);
+                PeirEnc_emit_u8(& mut self.enc, 0xC0);
+                peir_store_f32_xmm0(& mut self.enc, dst);
             } else {
+                PeirEnc_cvtsi2sd_r64(& mut self.enc, 0, PEIR_RAX);
                 PeirEnc_movsd_mem_rbp_xmm(& mut self.enc, dst, 0);
             }
         }
@@ -4020,7 +4860,10 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
         Inst::FloatToInt(value, from, _) => {
             var voff: i64 = PeStackFrame_offset(frame, value);
             if ir_type_eq(from, IrType::F32) {
+                // OP17: the f32 widened first (cvttsd2si read its bits as
+                // an f64's)
                 PeirEnc_movss_xmm_mem_rbp(& mut self.enc, 0, voff);
+                peir_cvt_float(& mut self.enc, true);
             } else {
                 PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 0, voff);
             }
@@ -4149,10 +4992,22 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
             PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
         }
 
-        Inst::BitCast(value, _, _) => {
+        Inst::BitCast(value, bc_from, bc_to) => {
             var voff: i64 = PeStackFrame_offset(frame, value);
-            PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, voff);
-            PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+            if ir_type_eq(bc_from, IrType::F32) && ir_type_eq(bc_to, IrType::F64) {
+                // OP17 / known-bugs 2g.13: `x as f64` of an f32 converts
+                // (as run, the C path and nat_ir do; it kept the bits)
+                PeirEnc_movss_xmm_mem_rbp(& mut self.enc, 0, voff);
+                peir_cvt_float(& mut self.enc, true);
+                PeirEnc_movsd_mem_rbp_xmm(& mut self.enc, dst, 0);
+            } else if ir_type_eq(bc_from, IrType::F64) && ir_type_eq(bc_to, IrType::F32) {
+                PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 0, voff);
+                peir_cvt_float(& mut self.enc, false);
+                peir_store_f32_xmm0(& mut self.enc, dst);
+            } else {
+                PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, voff);
+                PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+            }
         }
 
         // --- Fides-Specific ---
@@ -4255,8 +5110,10 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 var ii2: i64 = 0;
                 while ii2 < inputs.len() {
                     var inr: i64 = pe_asm_reg64(inputs.get(ii2).name);
-                    if inr < 0 {
-                        g_pe_asm_errors.push("asm! in " + func_name + ": in(\"" + inputs.get(ii2).name + "\") is not a 64-bit register");
+                    if inputs.get(ii2).id < 0 {
+                        // a clobber("reg"): nothing to load (2g.53)
+                    } else if inr < 0 {
+                        g_pe_asm_errors.push("asm! in " + func_name + ": in(\"" + inputs.get(ii2).name + "\") is not a 64-bit register\n    Fix: name a 64-bit general register: rax, rbx, rcx, rdx, rsi, rdi, rbp or r8 to r15");
                     } else {
                         PeirGen_load_operand(self, inr, inputs.get(ii2).id, frame);
                     }
@@ -4271,7 +5128,7 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                 if outputs.len() > 0 {
                     outr = pe_asm_reg64(outputs.get(0).name);
                     if outr < 0 {
-                        g_pe_asm_errors.push("asm! in " + func_name + ": out(\"" + outputs.get(0).name + "\") is not a 64-bit register");
+                        g_pe_asm_errors.push("asm! in " + func_name + ": out(\"" + outputs.get(0).name + "\") is not a 64-bit register\n    Fix: name a 64-bit general register: rax, rbx, rcx, rdx, rsi, rdi, rbp or r8 to r15");
                         outr = PEIR_RAX;
                     }
                 } else {
@@ -4284,8 +5141,13 @@ pub fn PeirGen_gen_inst(self: & mut PeirGen, id: i64, inst: Inst, next_cond: i64
                         PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, outr);
                     }
                 }
+            } else if self.has_asm && peir_asm_runs(template) {
+                // LG13: a Windows process runs the template too
+                PeirGen_gen_asm_process(self, template, inputs, outputs, asm_ty, dst, frame);
             } else {
-                // A Windows process runs no inline assembly (as on the C path)
+                // A template a process may not run (a privileged
+                // instruction, LG13) or one the encoder does not know
+                // gives 0, as before (and as the interpreter does)
                 PeirEnc_xor_self(& mut self.enc, PEIR_RAX);
                 PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
             }
@@ -4348,6 +5210,75 @@ pub fn peir_operand_ty(func: & IrFunction, id: i64) -> IrType {
     return IrType::I64;
 }
 
+/// D13: an integer BinOp whose constant left operand gen_inst moves to the
+/// right (a comparison, mirrored; add, mul, and, or, xor). Off: as before.
+const PEIR_CONST_LEFT_SWAP: bool = true;
+
+/// D13: whether `l op r` can be computed as `r op' l` (op' =
+/// peir_mirror_op(op)): the comparisons and the commutative operations.
+fn peir_op_commutes(op: BinOp) -> bool {
+    match op {
+        BinOp::Eq => {
+            return true;
+        }
+        BinOp::Neq => {
+            return true;
+        }
+        BinOp::Lt => {
+            return true;
+        }
+        BinOp::Gt => {
+            return true;
+        }
+        BinOp::LtEq => {
+            return true;
+        }
+        BinOp::GtEq => {
+            return true;
+        }
+        BinOp::Add => {
+            return true;
+        }
+        BinOp::Mul => {
+            return true;
+        }
+        BinOp::BitAnd => {
+            return true;
+        }
+        BinOp::BitOr => {
+            return true;
+        }
+        BinOp::BitXor => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// D13: the operation that gives the same result with the operands
+/// exchanged: `<` and `>`, `<=` and `>=`; any other one itself.
+fn peir_mirror_op(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => {
+            return BinOp::Gt;
+        }
+        BinOp::Gt => {
+            return BinOp::Lt;
+        }
+        BinOp::LtEq => {
+            return BinOp::GtEq;
+        }
+        BinOp::GtEq => {
+            return BinOp::LtEq;
+        }
+        _ => {
+            return op;
+        }
+    }
+}
+
 /// F=G; unsigned 2=B, 3=AE, 6=BE, 7=A), or -1 for a non-comparison.
 pub fn peir_int_cmp_cc(op: BinOp, unsigned: bool) -> i64 {
     match op {
@@ -4388,8 +5319,8 @@ pub fn peir_int_cmp_cc(op: BinOp, unsigned: bool) -> i64 {
 }
 
 // The arithmetic panics, one shared stub each (indices into arith_panics)
-const PEIR_PANIC_ADD: i64 = 0; const PEIR_PANIC_SUB: i64 = 1; const PEIR_PANIC_MUL: i64 = 2; const PEIR_PANIC_DIV_OVF: i64 = 3; const PEIR_PANIC_DIV_ZERO: i64 = 4; const PEIR_PANIC_MOD_ZERO: i64 = 5; const PEIR_PANIC_VEC_INDEX: i64 = 6; pub const PEIR_PANIC_DOUBLE_FREE: i64 = 7; pub const PEIR_PANIC_BAD_FREE: i64 = 8;
- fn peir_arith_panic_strings() -> Vec<str> {
+const PEIR_PANIC_ADD: i64 = 0; const PEIR_PANIC_SUB: i64 = 1; const PEIR_PANIC_MUL: i64 = 2; const PEIR_PANIC_DIV_OVF: i64 = 3; const PEIR_PANIC_DIV_ZERO: i64 = 4; const PEIR_PANIC_MOD_ZERO: i64 = 5; const PEIR_PANIC_VEC_INDEX: i64 = 6; // PEIR_PANIC_DOUBLE_FREE (7) and PEIR_PANIC_BAD_FREE (8) are in pe_ir_stubs.fd, whose p_free stub uses them
+fn peir_arith_panic_strings() -> Vec<str> {
     var v: Vec<str> = Vec::new();
     v.push("Integer overflow on addition");
     v.push("Integer overflow on subtraction");
@@ -4430,6 +5361,11 @@ pub fn PeirGen_gen_int_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: i6
     if PeirGen_int_binop_in_reg(self, op, loff, roff, dst, lconst, rconst, ty) {
         return;
     }
+    // OP20: under --cpu x86-64-v3|v4 a 64-bit shift by a variable count is
+    // SHLX/SARX/SHRX, its operands read from their registers (no CL)
+    if PeirGen_shift_bmi(self, op, loff, roff, dst, lconst, rconst, ty) {
+        return;
+    }
     // An i64 `x / c` or `x % c` by a constant c >= 2: x straight into rcx,
     // the result stored from where it ends up (no moves through rax)
     var dmc: i64 = 0;
@@ -4460,7 +5396,8 @@ pub fn PeirGen_gen_int_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: i6
                 PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RCX, loff);
             }
         }
-        PeirEnc_mov_rr(& mut self.enc, PEIR_RAX, PEIR_RCX);
+        // (D13: none when rcx was just copied from rax)
+        PeirEnc_mov_rr_cp(& mut self.enc, PEIR_RAX, PEIR_RCX);
         // (gen_inst passes `unsigned_cmp` = the dividend is >= 0 for these)
         PeirGen_gen_div_const_n(self, dm_mod == 1, dmc, unsigned_cmp);
         if dm_mod == 1 {
@@ -4507,6 +5444,68 @@ pub fn PeirGen_gen_int_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: i6
         PeirEnc_movzx_r32_r8(& mut self.enc, PEIR_RAX, PEIR_RAX);
         PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
         return;
+    }
+    // D13: the left operand in a stack slot, the right one in a register or
+    // a 32-bit immediate: `cmp [rbp+l], r` / `cmp qword [rbp+l], imm` (the
+    // same left - right, so the same condition), no load into rax first. A
+    // slot written from a register by the instruction just before: that
+    // register (what mov_reg_mem_rbp would forward).
+    var mcmp: bool = false;
+    match lconst {
+        OptU64::None => {
+            mcmp = loff < PEIR_REG_SLOT && peir_int_cmp_cc(op, unsigned_cmp) >= 0;
+        }
+        OptU64::Some(_) => {
+        }
+    }
+    if mcmp {
+        var fwd: i64 = - 1;
+        if self.enc.last_store_end == self.enc.code.len() && loff == self.enc.last_store_disp {
+            fwd = self.enc.last_store_reg;
+        }
+        var mdone: bool = false;
+        match rconst {
+            OptU64::Some(mv) => {
+                if mv > - 2147483648 && mv <= 2147483647 {
+                    if fwd >= 0 {
+                        PeirEnc_cmp_r_imm(& mut self.enc, fwd, mv);
+                    } else if mv >= - 128 && mv <= 127 {
+                        PeirEnc_rex(& mut self.enc, true, false, false, false);
+                        PeirEnc_emit_u8(& mut self.enc, 0x83);
+                        PeirEnc_emit_mem_rbp(& mut self.enc, 7, loff);
+                        PeirEnc_emit_u8(& mut self.enc, mv & 0xFF);
+                    } else {
+                        PeirEnc_rex(& mut self.enc, true, false, false, false);
+                        PeirEnc_emit_u8(& mut self.enc, 0x81);
+                        PeirEnc_emit_mem_rbp(& mut self.enc, 7, loff);
+                        PeirEnc_emit_i32(& mut self.enc, mv);
+                    }
+                    mdone = true;
+                }
+            }
+            OptU64::None => {
+                if roff >= PEIR_REG_SLOT && !peir_is_xmm_slot(roff) {
+                    var mr: i64 = peir_value_reg(roff - PEIR_REG_SLOT);
+                    if fwd >= 0 {
+                        PeirEnc_cmp_rr(& mut self.enc, fwd, mr);
+                    } else {
+                        PeirEnc_rex(& mut self.enc, true, reg_ext(mr), false, false);
+                        PeirEnc_emit_u8(& mut self.enc, 0x39);
+                        PeirEnc_emit_mem_rbp(& mut self.enc, peir_reg_code(mr), loff);
+                    }
+                    mdone = true;
+                }
+            }
+        }
+        if mdone {
+            if self.flags_only {
+                return;
+            }
+            PeirEnc_setcc_r(& mut self.enc, peir_int_cmp_cc(op, unsigned_cmp), PEIR_RAX);
+            PeirEnc_movzx_r32_r8(& mut self.enc, PEIR_RAX, PEIR_RAX);
+            PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+            return;
+        }
     }
     // A constant operand moves in as an immediate, not a slot load (item 81).
     match lconst {
@@ -4706,6 +5705,133 @@ pub fn PeirGen_gen_int_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: i6
     PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
 }
 
+/// OP20 (BMI2, --cpu x86-64-v3|v4): an i64/u64 `l << r` or `l >> r` by a
+/// variable count as `shlx|sarx|shrx d, l, r`: the count masked to 6 bits
+/// as `shl r, cl` masks it, so the result is the same. False when it does
+/// not apply (no BMI, a constant count, another type or operation).
+fn PeirGen_shift_bmi(self: & mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, lconst: OptU64, rconst: OptU64, ty: IrType) -> bool {
+    if !peir_bmi() {
+        return false;
+    }
+    var is_u64: bool = ir_type_eq(ty, IrType::U64);
+    if !is_u64 && !ir_type_eq(ty, IrType::I64) {
+        return false;
+    }
+    var pp: i64 = 0;
+    match op {
+        BinOp::Shl => {
+            pp = 1;
+        }
+        BinOp::Shr => {
+            if is_u64 {
+                pp = 3;
+            } else {
+                pp = 2;
+            }
+        }
+        _ => {
+        }
+    }
+    if pp == 0 {
+        return false;
+    }
+    match rconst {
+        OptU64::Some(_) => {
+            return false;
+        }
+        OptU64::None => {
+        }
+    }
+    if peir_is_xmm_slot(roff) || peir_is_xmm_slot(dst) {
+        return false;
+    }
+    var a: i64 = PEIR_RAX;
+    match lconst {
+        OptU64::Some(lv) => {
+            PeirEnc_mov_imm(& mut self.enc, PEIR_RAX, lv);
+        }
+        OptU64::None => {
+            if loff >= PEIR_REG_SLOT && !peir_is_xmm_slot(loff) {
+                a = peir_value_reg(loff - PEIR_REG_SLOT);
+            } else {
+                PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, loff);
+            }
+        }
+    }
+    var b: i64 = PEIR_RCX;
+    if roff >= PEIR_REG_SLOT {
+        b = peir_value_reg(roff - PEIR_REG_SLOT);
+    } else {
+        PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RCX, roff);
+    }
+    if dst >= PEIR_REG_SLOT {
+        PeirEnc_shiftx(& mut self.enc, pp, peir_value_reg(dst - PEIR_REG_SLOT), a, b);
+    } else {
+        PeirEnc_shiftx(& mut self.enc, pp, PEIR_RAX, a, b);
+        PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+    }
+    return true;
+}
+
+/// OP20 (BMI1, --cpu x86-64-v3|v4): the value `x & y` computes is
+/// `x & (x - 1)` when `y` is `x - 1` (a Sub of the constant 1, or an Add
+/// of -1) of a 64-bit type: then x, else -1. x is an operand of the And,
+/// so it is live there; the Sub is still generated (its overflow check
+/// with it), BLSR computes the And from x alone.
+fn peir_blsr_src(func: & IrFunction, frame: & PeStackFrame, x: i64, y: i64) -> i64 {
+    // (a constant has no slot to read: it is an immediate where used)
+    if pe_idmap_has(& frame.const_vals, x) {
+        return - 1;
+    }
+    match IrFunction_get_inst(func, y) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::BinOp(op2, a2, b2, _) => {
+                    if a2 != x || !pe_idmap_has(& frame.const_vals, b2) {
+                        return - 1;
+                    }
+                    var c: i64 = pe_idmap_get(& frame.const_vals, b2);
+                    match op2 {
+                        BinOp::Sub => {
+                            if c == 1 {
+                                return x;
+                            }
+                        }
+                        BinOp::Add => {
+                            if c == - 1 {
+                                return x;
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    return - 1;
+}
+
+/// OP20: `blsr d, x` for an And peir_blsr_src matched (x's slot `xoff`).
+fn PeirGen_gen_blsr(self: & mut PeirGen, xoff: i64, dst: i64) -> void {
+    var a: i64 = PEIR_RAX;
+    if xoff >= PEIR_REG_SLOT && !peir_is_xmm_slot(xoff) {
+        a = peir_value_reg(xoff - PEIR_REG_SLOT);
+    } else {
+        PeirEnc_mov_reg_mem_rbp(& mut self.enc, PEIR_RAX, xoff);
+    }
+    if dst >= PEIR_REG_SLOT && !peir_is_xmm_slot(dst) {
+        PeirEnc_blsr(& mut self.enc, peir_value_reg(dst - PEIR_REG_SLOT), a);
+    } else {
+        PeirEnc_blsr(& mut self.enc, PEIR_RAX, a);
+        PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+    }
+}
+
 /// An i64 add, sub, mul, and, or or xor whose result is in a register:
 /// computed there (`mov rd, l; op rd, r`), not through rax and rcx (D13).
 /// False when it does not apply.
@@ -4891,8 +6017,7 @@ fn PeirGen_load_operand(self: & mut PeirGen, reg: i64, value: i64, frame: & PeSt
 
 /// The element-code word of a Vec of bytes (u8 or bool): core's
 /// vec_code_word(1), P_VEC_TAG + 1 + 8 (release D14).
-const PEIR_VEC_BYTES: i64 = 0x4649445645430009;
-/// Is `v` typed as a Vec of u8 or bool (its code is most likely bytes)?
+const PEIR_VEC_BYTES: i64 = 0x4649445645430009;  /// Is `v` typed as a Vec of u8 or bool (its code is most likely bytes)?
 fn peir_vec_bytes_typed(func: & IrFunction, v: i64) -> bool {
     match IrFunction_get_meta(func, v) {
         OptValueMeta::Some(m) => {
@@ -5380,6 +6505,10 @@ pub fn PeirGen_gen_arith_panics(self: & mut PeirGen) -> void {
     PeirEnc_mov_r32_r32(& mut self.enc, PEIR_RAX, PEIR_RAX);
     var report: i64 = PeirEnc_alloc_label(& mut self.enc);
     PeirGen_crash_case(self, 0xC00000FD, "Stack overflow", report);
+    // --checked-alloc: a fault on a checked block's page names the block
+    if g_pe_checked_alloc && !self.bare_mode {
+        PeirGen_gen_checked_fault(self);
+    }
     PeirGen_crash_case(self, 0xC0000005, "Invalid memory access (null or dangling pointer)", report);
     PeirGen_crash_case(self, 0xC0000094, "Division by zero", report);
     PeirGen_crash_case(self, 0xC000001D, "Illegal instruction", report);
@@ -5395,9 +6524,58 @@ pub fn PeirGen_gen_arith_panics(self: & mut PeirGen) -> void {
 /// Generate float binary operation.
 pub fn PeirGen_gen_float_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: i64, dst: i64, ty: IrType) -> void {
     var is_f32: bool = ir_type_eq(ty, IrType::F32);
+    // OP17: an f64 operation reads an operand held in an xmm register
+    // (xmm2..xmm7, peir_ra_xmm: no REX) where it is, and computes into the
+    // result's register when it has one (movsd to or from an xmm slot is a
+    // register move or nothing). The result's register is used only when
+    // it is not the right operand's (or both operands are the same value).
+    if !is_f32 && pe_binop_is_arith(op) {
+        var rs: i64 = 1;
+        if peir_is_xmm_slot(roff) {
+            rs = roff - PEIR_XMM_SLOT;
+        } else {
+            PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 1, roff);
+        }
+        var xd: i64 = 0;
+        if peir_is_xmm_slot(dst) && (dst != roff || loff == roff) {
+            xd = dst - PEIR_XMM_SLOT;
+        }
+        PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, xd, loff);
+        match op {
+            BinOp::Add => {
+                PeirEnc_addsd(& mut self.enc, xd, rs);
+            }
+            BinOp::Sub => {
+                PeirEnc_subsd(& mut self.enc, xd, rs);
+            }
+            BinOp::Mul => {
+                PeirEnc_mulsd(& mut self.enc, xd, rs);
+            }
+            _ => {
+                PeirEnc_divsd(& mut self.enc, xd, rs);
+            }
+        }
+        PeirEnc_movsd_mem_rbp_xmm(& mut self.enc, dst, xd);
+        return;
+    }
+    // OP17: a comparison's f64 operands held in xmm registers are compared
+    // where they are (lx, rx); everything else goes through xmm0 / xmm1
+    var lx: i64 = 0;
+    var rx: i64 = 1;
     if is_f32 {
         PeirEnc_movss_xmm_mem_rbp(& mut self.enc, 0, loff);
         PeirEnc_movss_xmm_mem_rbp(& mut self.enc, 1, roff);
+    } else if pe_binop_is_cmp(op) {
+        if peir_is_xmm_slot(loff) {
+            lx = loff - PEIR_XMM_SLOT;
+        } else {
+            PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 0, loff);
+        }
+        if peir_is_xmm_slot(roff) {
+            rx = roff - PEIR_XMM_SLOT;
+        } else {
+            PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 1, roff);
+        }
     } else {
         PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 0, loff);
         PeirEnc_movsd_xmm_mem_rbp(& mut self.enc, 1, roff);
@@ -5443,20 +6621,20 @@ pub fn PeirGen_gen_float_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: 
         // unordered ucomis sets ZF, PF and CF, so: a < b is b > a
         // (seta: CF = ZF = 0), a <= b is b >= a (setae: CF = 0), and
         // == / != also look at PF.
-        var a: i64 = 0;
-        var b: i64 = 1;
+        var a: i64 = lx;
+        var b: i64 = rx;
         match op {
             BinOp::Lt => {
-                a = 1;
-                b = 0;
+                a = rx;
+                b = lx;
             }
             BinOp::LtEq => {
-                a = 1;
-                b = 0;
+                a = rx;
+                b = lx;
             }
             _ => {
-                a = 0;
-                b = 1;
+                a = lx;
+                b = rx;
             }
         }
         if is_f32 {
@@ -5496,7 +6674,1864 @@ pub fn PeirGen_gen_float_binop(self: & mut PeirGen, op: BinOp, loff: i64, roff: 
         }
         PeirEnc_movzx_r32_r8(& mut self.enc, PEIR_RAX, PEIR_RAX);
         PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, PEIR_RAX);
+    } else {
+        match op {
+            BinOp::Mod => {
+                PeirGen_gen_float_rem(self, dst, is_f32);
+            }
+            _ => {
+            }
+        }
     }
+}
+
+/// MI17: `%` on f32/f64 is C's fmod/fmodf, as `fid run`, the C path and
+/// the machine layer give (pe_ir stored nothing: the result was whatever
+/// the slot held, 7.5 % 3.0 printed 7.5). The operands are in xmm0 (a)
+/// and xmm1 (b). x87 FPREM gives the exact truncated remainder (the sign
+/// of a; NaN for b == 0 or an infinite a), repeated while C2 says it is
+/// partial; no call, so no register the allocator holds a value in is
+/// clobbered (only rax, as the comparisons above, and x87 state, left
+/// empty). 16 bytes below rsp move the values between SSE and x87.
+fn PeirGen_gen_float_rem(self: & mut PeirGen, dst: i64, is_f32: bool) -> void {
+    PeirEnc_sub_rsp_i32(& mut self.enc, 16);
+    var b: Vec<i64> = Vec::new();
+    // fld b, then fld a: st0 = a, st1 = b
+    if is_f32 {
+        // movss [rsp], xmm1 ; fld dword [rsp] ; movss [rsp], xmm0 ; fld dword [rsp]
+        b.push(0xF3); b.push(0x0F); b.push(0x11); b.push(0x0C); b.push(0x24);
+        b.push(0xD9); b.push(0x04); b.push(0x24);
+        b.push(0xF3); b.push(0x0F); b.push(0x11); b.push(0x04); b.push(0x24);
+        b.push(0xD9); b.push(0x04); b.push(0x24);
+    } else {
+        // movsd [rsp], xmm1 ; fld qword [rsp] ; movsd [rsp], xmm0 ; fld qword [rsp]
+        b.push(0xF2); b.push(0x0F); b.push(0x11); b.push(0x0C); b.push(0x24);
+        b.push(0xDD); b.push(0x04); b.push(0x24);
+        b.push(0xF2); b.push(0x0F); b.push(0x11); b.push(0x04); b.push(0x24);
+        b.push(0xDD); b.push(0x04); b.push(0x24);
+    }
+    // again: fprem ; fnstsw ax ; test ah, 4 (C2: partial) ; jnz again (-9)
+    b.push(0xD9); b.push(0xF8);
+    b.push(0xDF); b.push(0xE0);
+    b.push(0xF6); b.push(0xC4); b.push(0x04);
+    b.push(0x75); b.push(0xF7);
+    // fstp st(1): st0 = the remainder, b popped
+    b.push(0xDD); b.push(0xD9);
+    if is_f32 {
+        // fstp dword [rsp] ; movss xmm0, [rsp]
+        b.push(0xD9); b.push(0x1C); b.push(0x24);
+        b.push(0xF3); b.push(0x0F); b.push(0x10); b.push(0x04); b.push(0x24);
+    } else {
+        // fstp qword [rsp] ; movsd xmm0, [rsp]
+        b.push(0xDD); b.push(0x1C); b.push(0x24);
+        b.push(0xF2); b.push(0x0F); b.push(0x10); b.push(0x04); b.push(0x24);
+    }
+    PeirEnc_emit_bytes(& mut self.enc, b);
+    PeirEnc_add_rsp_i32(& mut self.enc, 16);
+    if is_f32 {
+        PeirEnc_movss_mem_rbp_xmm(& mut self.enc, dst, 0);
+    } else {
+        PeirEnc_movsd_mem_rbp_xmm(& mut self.enc, dst, 0);
+    }
+}
+
+// ===========================================================================
+// J7: @constant_time on the default Windows backend (and --bare / --elf)
+// ===========================================================================
+//
+// The source-level check (TypeChecker_verify_constant_time) works on names
+// in the AST. This one runs on the IR this backend turns into machine code,
+// after lowering and the mid-end, and follows values through memory and
+// calls, so it also sees what the source check cannot: a secret that
+// reaches a loop bound through an `&mut` out-parameter, a field of a local
+// struct, or a global. nat_ir.fd's ng_ct_check is its machine-layer
+// counterpart for `--nat` and the Linux targets.
+//
+// Secret: every parameter (the IR does not keep @public), and every value
+// computed from a secret: arithmetic, comparisons, conversions, addresses,
+// a load from memory a secret was stored into (per alloca or global, flow-
+// insensitive), and the result of a call one of whose arguments is secret,
+// except a length query (`len`, `*_len`, `*_length`: lengths are public,
+// as in the source check). A call that is given a secret also makes the memory behind
+// every pointer it is given secret (it may store the secret there).
+//
+// Rejected in a @constant_time function:
+//   a conditional branch on a secret value (a jcc in this backend's code)
+//   integer division or remainder of a secret (idiv/div: variable latency),
+//     except a signed division by a constant >= 2, which this backend turns
+//     into a multiplication (PeirGen_gen_div_const)
+//   float division of a secret (divsd: variable latency)
+//   an indirect call (closure, function value, dyn method)
+// Not rejected: overflow, bounds and narrowing checks. Their jump is taken
+// only on a run that ends in a panic, so a run that completes executes the
+// same instructions whatever the secret is. Memory addresses are not
+// checked here either (a pointer to a secret buffer is not secret itself);
+// the source check rejects indexing by a secret.
+// FID_PE_CT_OFF=1 turns this check off (to compare, or around a false
+// positive: please report one).
+
+/// The alloca or global that pointer `v` is derived from (through field and
+/// element addresses and bit casts): its instruction id, or -1.
+fn peir_ct_root(func: & IrFunction, v: i64) -> i64 {
+    var cur: i64 = v;
+    var steps: i64 = 0;
+    while steps < 64 {
+        match peir_inst_of(func, cur) {
+            Inst::Alloca(_, _) => {
+                return cur;
+            }
+            Inst::GlobalAddr(_, _) => {
+                return cur;
+            }
+            Inst::GetFieldPtr(p, _, _) => {
+                cur = p;
+            }
+            Inst::GetElemPtr(p, _, _) => {
+                cur = p;
+            }
+            Inst::BitCast(p, _, _) => {
+                cur = p;
+            }
+            _ => {
+                return - 1;
+            }
+        }
+        steps = steps + 1;
+    }
+    return - 1;
+}
+
+/// The key of the memory `p` points into ("a:<alloca id>", "g:<global>"),
+/// or "" when it is not a local or a global.
+fn peir_ct_mem_key(func: & IrFunction, p: i64) -> str {
+    var root: i64 = peir_ct_root(func, p);
+    if root < 0 {
+        return "";
+    }
+    match peir_inst_of(func, root) {
+        Inst::GlobalAddr(gname, _) => {
+            return "g:" + gname;
+        }
+        _ => {
+        }
+    }
+    return "a:" + int_to_str(root);
+}
+
+/// Does `p` point into memory a secret was stored into?
+fn peir_ct_mem_secret(func: & IrFunction, mem: i64, p: i64) -> bool {
+    var key: str = peir_ct_mem_key(func, p);
+    if key == "" {
+        return false;
+    }
+    return HashMap_contains(mem, key);
+}
+
+/// Mark the memory `p` points into as holding a secret; true when it was
+/// not marked before.
+fn peir_ct_mem_mark(func: & IrFunction, mem: i64, p: i64) -> bool {
+    var key: str = peir_ct_mem_key(func, p);
+    if key == "" || HashMap_contains(mem, key) {
+        return false;
+    }
+    HashMap_insert(mem, key, 1);
+    return true;
+}
+
+fn peir_ct_sec(secret: & Vec<i64>, v: i64) -> bool {
+    return v >= 0 && v < secret.len() && secret.get(v) != 0;
+}
+
+/// Is any of `args` secret, or a pointer to memory holding a secret?
+fn peir_ct_args_secret(func: & IrFunction, secret: & Vec<i64>, mem: i64, args: Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < args.len() {
+        var a: i64 = args.get(i);
+        if peir_ct_sec(secret, a) || peir_ct_mem_secret(func, mem, a) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A call given a secret may store it behind any pointer it is given.
+fn peir_ct_args_mark(func: & IrFunction, mem: i64, args: Vec<i64>) -> bool {
+    var changed: bool = false;
+    var i: i64 = 0;
+    while i < args.len() {
+        if peir_ct_mem_mark(func, mem, args.get(i)) {
+            changed = true;
+        }
+        i = i + 1;
+    }
+    return changed;
+}
+
+/// A length query: its result is public (TypeChecker's ct_secret rule;
+/// a str's `.len()` lowers to p_str_length).
+fn peir_ct_is_len(name: str) -> bool {
+    return name == "len" || str_ends_with(name, "_len") || str_ends_with(name, "_length");
+}
+
+fn peir_ct_unsigned(ty: IrType) -> bool {
+    return ir_type_eq(ty, IrType::U8) || ir_type_eq(ty, IrType::U16) || ir_type_eq(ty, IrType::U32) || ir_type_eq(ty, IrType::U64);
+}
+
+/// " (line N)" for value `id` when the lowering recorded its source line.
+fn peir_ct_line(func: & IrFunction, id: i64) -> str {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => {
+                    if v > 0 {
+                        return " (line " + int_to_str(v as i64) + ")";
+                    }
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return "";
+}
+
+/// Is the check turned off (FID_PE_CT_OFF set and not empty)?
+fn peir_ct_off() -> bool {
+    var sw: str = p_getenv("FID_PE_CT_OFF");
+    return (sw as i64) != 0 && str_len(sw) > 0 && sw != "0";
+}
+
+/// The violations of @constant_time function `func` (named `name`), one
+/// message each; empty when it is clean. See the section comment above.
+pub fn peir_ct_check(func: & IrFunction, name: str) -> Vec<str> {
+    var errs: Vec<str> = Vec::new();
+    var nvals: i64 = func.value_metas.len() + func.insts.len() + func.params.len() + 16;
+    if func.next_value + 1 > nvals {
+        nvals = func.next_value + 1;
+    }
+    var secret: Vec<i64> = peir_zeros(nvals);
+    var mem: i64 = HashMap_new();
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var pid: i64 = func.params.get(pi).id;
+        if pid >= 0 && pid < nvals {
+            secret.set(pid, 1);
+        }
+        pi = pi + 1;
+    }
+    // The instructions of the function's blocks, in layout order
+    var ids: Vec<i64> = Vec::new();
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        var blk: BasicBlock = func.blocks.get(bi);
+        var k: i64 = 0;
+        while k < blk.instructions.len() {
+            ids.push(blk.instructions.get(k));
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    // Propagate to a fixpoint: secrets only grow, so each round that
+    // changes something marks at least one more value or memory root.
+    var changed: bool = true;
+    var rounds: i64 = 0;
+    while changed && rounds < nvals + 2 {
+        changed = false;
+        rounds = rounds + 1;
+        var ii: i64 = 0;
+        while ii < ids.len() {
+            var id: i64 = ids.get(ii);
+            var t: bool = false;
+            match peir_inst_of(func, id) {
+                Inst::BinOp(_, l, r, _) => {
+                    t = peir_ct_sec(& secret, l) || peir_ct_sec(& secret, r);
+                }
+                Inst::UnaryOp(_, x, _) => {
+                    t = peir_ct_sec(& secret, x);
+                }
+                Inst::BitCast(x, _, _) => {
+                    t = peir_ct_sec(& secret, x);
+                }
+                Inst::IntExtend(x, _, _) => {
+                    t = peir_ct_sec(& secret, x);
+                }
+                Inst::IntTrunc(x, _, _) => {
+                    t = peir_ct_sec(& secret, x);
+                }
+                Inst::IntToFloat(x, _, _) => {
+                    t = peir_ct_sec(& secret, x);
+                }
+                Inst::FloatToInt(x, _, _) => {
+                    t = peir_ct_sec(& secret, x);
+                }
+                Inst::GetFieldPtr(p, _, _) => {
+                    t = peir_ct_sec(& secret, p);
+                }
+                Inst::GetElemPtr(p, ix, _) => {
+                    t = peir_ct_sec(& secret, p) || peir_ct_sec(& secret, ix);
+                }
+                Inst::Load(p, _) => {
+                    t = peir_ct_sec(& secret, p) || peir_ct_mem_secret(func, mem, p);
+                }
+                Inst::Store(sptr, sval, _) => {
+                    if peir_ct_sec(& secret, sval) || peir_ct_mem_secret(func, mem, sval) {
+                        if peir_ct_mem_mark(func, mem, sptr) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::StructCopy(cdst, csrc, _) => {
+                    if peir_ct_sec(& secret, csrc) || peir_ct_mem_secret(func, mem, csrc) {
+                        if peir_ct_mem_mark(func, mem, cdst) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::Call(callee, cargs, _, _) => {
+                    var any: bool = peir_ct_args_secret(func, & secret, mem, cargs);
+                    if any {
+                        if !peir_ct_is_len(callee) {
+                            t = true;
+                        }
+                        if peir_ct_args_mark(func, mem, cargs) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::CallPtr(fptr, pargs, _, _, _) => {
+                    var pany: bool = peir_ct_sec(& secret, fptr) || peir_ct_args_secret(func, & secret, mem, pargs);
+                    if pany {
+                        t = true;
+                        if peir_ct_args_mark(func, mem, pargs) {
+                            changed = true;
+                        }
+                    }
+                }
+                Inst::DynCall(_, _, dargs, _, _) => {
+                    if peir_ct_args_secret(func, & secret, mem, dargs) {
+                        t = true;
+                        if peir_ct_args_mark(func, mem, dargs) {
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            if t && id >= 0 && id < nvals && secret.get(id) == 0 {
+                secret.set(id, 1);
+                changed = true;
+            }
+            ii = ii + 1;
+        }
+    }
+    // What the code would do with the secrets
+    var ci: i64 = 0;
+    while ci < ids.len() {
+        var cid: i64 = ids.get(ci);
+        var what: str = "";
+        match peir_inst_of(func, cid) {
+            Inst::Branch(cond, _, _) => {
+                if peir_ct_sec(& secret, cond) {
+                    what = "conditional branch on secret data";
+                }
+            }
+            Inst::BinOp(op, l, r, ty) => {
+                var is_div: bool = false;
+                match op {
+                    BinOp::Div => {
+                        is_div = true;
+                    }
+                    BinOp::Mod => {
+                        is_div = true;
+                    }
+                    _ => {
+                    }
+                }
+                if is_div && (peir_ct_sec(& secret, l) || peir_ct_sec(& secret, r)) {
+                    if ir_type_is_float(ty) {
+                        what = "float division of secret data (variable latency)";
+                    } else {
+                        // A signed division by a constant >= 2 is a multiply
+                        var by_const: bool = false;
+                        match peir_inst_of(func, r) {
+                            Inst::ConstInt(d, _) => {
+                                by_const = d >= 2 && !peir_ct_unsigned(ty);
+                            }
+                            _ => {
+                            }
+                        }
+                        if !by_const {
+                            what = "integer division of secret data (variable latency)";
+                        }
+                    }
+                }
+            }
+            Inst::CallPtr(_, _, _, _, _) => {
+                what = "indirect call (closure or function value)";
+            }
+            Inst::DynCall(_, _, _, _, _) => {
+                what = "indirect call (dyn method)";
+            }
+            _ => {
+            }
+        }
+        if what != "" {
+            errs.push("@constant_time function '" + name + "': " + what + peir_ct_line(func, cid));
+        }
+        ci = ci + 1;
+    }
+    return errs;
+}
+
+/// The error lines of a build that @constant_time code fails: `what` names
+/// the build ("PE backend", "bare-metal build").
+fn peir_ct_report(errs: Vec<str>, what: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < errs.len() {
+        out.push(what + ": @constant_time violated: " + errs.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ===========================================================================
+// Nov 16: asm! in processes (LG13), cleared frames (LF20), sibling tail
+// calls (OP13), block layout (OP15), line tables (DB3) and the
+// per-function cache (B5). FID_PE_OFF=asm,wipe,tail,layout turns the
+// first four off.
+// ===========================================================================
+
+/// LG13: does the function hold an asm! template?
+fn peir_has_asm(func: & IrFunction) -> bool {
+    var i: i64 = 0;
+    while i < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(i);
+        match ve.inst {
+            Inst::Asm(_, _, _, _) => {
+                return true;
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// LG13: a template a Windows process runs: no privileged instruction
+/// (pe_asm_privileged), and the encoder knows every instruction.
+fn peir_asm_runs(template: str) -> bool {
+    if pe_asm_privileged(template) {
+        return false;
+    }
+    var r: PeAsmResult = pe_asm_encode(template);
+    return r.error == "";
+}
+
+/// LG13: asm! in a process. The function keeps every value in its slot and
+/// saves every callee-saved register (has_asm), so the template may write
+/// any register but rsp and rbp. An output register that is not an input
+/// starts at 0: a template that does not write it gives 0, as the
+/// interpreter and the old code did. The first output is the value.
+fn PeirGen_gen_asm_process(self: & mut PeirGen, template: str, inputs: Vec<StringValueId>, outputs: Vec<StringValueId>, asm_ty: IrType, dst: i64, frame: & PeStackFrame) {
+    var enc_res: PeAsmResult = pe_asm_encode(template);
+    var inregs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < inputs.len() {
+        inregs.push(pe_asm_reg64(inputs.get(i).name));
+        i = i + 1;
+    }
+    var o: i64 = 0;
+    while o < outputs.len() {
+        var r: i64 = pe_asm_reg64(outputs.get(o).name);
+        if r >= 0 && r != PEIR_RSP && r != PEIR_RBP && !peir_has_i64(inregs, r) {
+            PeirEnc_xor_rr(& mut self.enc, r, r);
+        }
+        o = o + 1;
+    }
+    i = 0;
+    while i < inputs.len() {
+        var inr: i64 = inregs.get(i);
+        if inr >= 0 && inr != PEIR_RSP && inr != PEIR_RBP && inputs.get(i).id >= 0 {
+            PeirGen_load_operand(self, inr, inputs.get(i).id, frame);
+        }
+        i = i + 1;
+    }
+    var bi: i64 = 0;
+    while bi < enc_res.bytes.len() {
+        PeirEnc_emit_u8(& mut self.enc, enc_res.bytes.get(bi));
+        bi = bi + 1;
+    }
+    var outr: i64 = PEIR_RAX;
+    var have: bool = false;
+    if outputs.len() > 0 {
+        var r0: i64 = pe_asm_reg64(outputs.get(0).name);
+        if r0 >= 0 {
+            outr = r0;
+            have = true;
+        }
+    }
+    if !have {
+        PeirEnc_xor_self(& mut self.enc, PEIR_RAX);
+    }
+    match asm_ty {
+        IrType::Void => {
+        }
+        _ => {
+            PeirEnc_mov_mem_rbp_reg(& mut self.enc, dst, outr);
+        }
+    }
+}
+
+/// LF20: before a function that holds secrets returns (its saved registers
+/// already restored, the result in rax): every word of the dead frame
+/// [rsp, rbp) becomes 0 — the slots its values, spills and temporaries
+/// lived in, the outgoing argument area — and so do the scratch
+/// registers (rcx, rdx, r8-r11, xmm0-xmm5). Callee-saved registers hold
+/// the caller's values again by then.
+fn PeirGen_wipe_frame(self: & mut PeirGen) {
+    var top: i64 = PeirEnc_alloc_label(& mut self.enc);
+    PeirEnc_xor_rr(& mut self.enc, PEIR_R10, PEIR_R10);
+    PeirEnc_mov_rr(& mut self.enc, PEIR_R11, PEIR_RSP);
+    PeirEnc_place_label(& mut self.enc, top);
+    PeirEnc_mov_mem_disp_reg(& mut self.enc, PEIR_R11, 0, PEIR_R10);
+    PeirEnc_add_r_i32(& mut self.enc, PEIR_R11, 8);
+    PeirEnc_cmp_rr(& mut self.enc, PEIR_R11, PEIR_RBP);
+    PeirEnc_jcc_label(& mut self.enc, 0x2, top);
+    // jb: below the frame pointer
+    PeirEnc_xor_rr(& mut self.enc, PEIR_RCX, PEIR_RCX);
+    PeirEnc_xor_rr(& mut self.enc, PEIR_RDX, PEIR_RDX);
+    PeirEnc_xor_rr(& mut self.enc, PEIR_R8, PEIR_R8);
+    PeirEnc_xor_rr(& mut self.enc, PEIR_R9, PEIR_R9);
+    PeirEnc_xor_rr(& mut self.enc, PEIR_R11, PEIR_R11);
+    var x: i64 = 0;
+    while x < 6 {
+        // xorps xmmx, xmmx
+        PeirEnc_emit_u8(& mut self.enc, 0x0F);
+        PeirEnc_emit_u8(& mut self.enc, 0x57);
+        PeirEnc_emit_u8(& mut self.enc, 0xC0 | (x << 3) | x);
+        x = x + 1;
+    }
+}
+
+fn peir_bit(v: & Vec<i64>, id: i64) -> bool {
+    return id >= 0 && id < v.len() && v.get(id) != 0;
+}
+
+/// OP13: may an address of this function's frame be kept beyond it? The
+/// values that are frame addresses are the allocas and what is computed
+/// from them (field and element addresses, casts, arithmetic). Loading
+/// through one, storing through one and struct copies keep it in the
+/// frame; anything else that reads one (a call argument, a stored value,
+/// a returned value) lets it out, and then no call may replace the frame.
+fn peir_frame_escapes(func: & IrFunction, nvals: i64) -> bool {
+    var addr: Vec<i64> = peir_zeros(nvals);
+    var any: bool = false;
+    var changed: bool = true;
+    var npass: i64 = 0;
+    while changed {
+        if npass >= 8 {
+            return true;
+        }
+        changed = false;
+        var i: i64 = 0;
+        while i < func.insts.len() {
+            var ve: ValueIdInst = func.insts.get(i);
+            var mark: bool = false;
+            match ve.inst {
+                Inst::Alloca(_, _) => {
+                    mark = true;
+                }
+                Inst::GetFieldPtr(p, _, _) => {
+                    mark = peir_bit(& addr, p);
+                }
+                Inst::GetElemPtr(p, x, _) => {
+                    mark = peir_bit(& addr, p) || peir_bit(& addr, x);
+                }
+                Inst::BitCast(p, _, _) => {
+                    mark = peir_bit(& addr, p);
+                }
+                Inst::IntExtend(p, _, _) => {
+                    mark = peir_bit(& addr, p);
+                }
+                Inst::IntTrunc(p, _, _) => {
+                    mark = peir_bit(& addr, p);
+                }
+                Inst::BinOp(_, l, r, _) => {
+                    mark = peir_bit(& addr, l) || peir_bit(& addr, r);
+                }
+                _ => {
+                }
+            }
+            if mark {
+                if ve.id < 0 || ve.id >= nvals {
+                    return true;
+                }
+                if addr.get(ve.id) == 0 {
+                    addr.set(ve.id, 1);
+                    changed = true;
+                    any = true;
+                }
+            }
+            i = i + 1;
+        }
+        npass = npass + 1;
+    }
+    if !any {
+        return false;
+    }
+    var ops: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < func.insts.len() {
+        var ue: ValueIdInst = func.insts.get(j);
+        var ok: bool = false;
+        match ue.inst {
+            Inst::Load(_, _) => {
+                ok = true;
+            }
+            Inst::Store(_, v, _) => {
+                if peir_bit(& addr, v) {
+                    return true;
+                }
+                ok = true;
+            }
+            Inst::StructCopy(_, _, _) => {
+                ok = true;
+            }
+            Inst::GetFieldPtr(_, _, _) => {
+                ok = true;
+            }
+            Inst::GetElemPtr(_, _, _) => {
+                ok = true;
+            }
+            Inst::BitCast(_, _, _) => {
+                ok = true;
+            }
+            Inst::IntExtend(_, _, _) => {
+                ok = true;
+            }
+            Inst::IntTrunc(_, _, _) => {
+                ok = true;
+            }
+            Inst::BinOp(_, _, _, _) => {
+                ok = true;
+            }
+            _ => {
+            }
+        }
+        if !ok {
+            peir_inst_operands(ue.inst, & mut ops);
+            var k: i64 = 0;
+            while k < ops.len() {
+                if peir_bit(& addr, ops.get(k)) {
+                    return true;
+                }
+                k = k + 1;
+            }
+            ops.clear();
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+/// OP15: the block's last instruction leaves it (it never falls into the
+/// block after it in the IR).
+fn peir_block_ends(func: & IrFunction, blk: BasicBlock) -> bool {
+    var n: i64 = blk.instructions.len();
+    if n == 0 {
+        return false;
+    }
+    match IrFunction_get_inst(func, blk.instructions.get(n - 1)) {
+        OptInst::Some(li) => {
+            match li {
+                Inst::Jump(_) => {
+                    return true;
+                }
+                Inst::Branch(_, _, _) => {
+                    return true;
+                }
+                Inst::Switch(_, _, _, _) => {
+                    return true;
+                }
+                Inst::Return(_) => {
+                    return true;
+                }
+                Inst::Unreachable => {
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptInst::None => {
+            return false;
+        }
+    }
+}
+
+/// OP15: is `name` a function that only panics?
+fn PeirGen_is_cold_fn(self: & PeirGen, name: str) -> bool {
+    // OP15: `@cold` functions and core's cold_path() (compiler/ast.fd)
+    return name == "p_panic" || name == "panic" || HashMap_contains(self.cold_fns, name) || is_cold_fn_hint(name);
+}
+
+/// OP15: a cold block: it panics (a panic instruction, a call to a
+/// function that only panics), calls a function the program marks
+/// unlikely (`@cold`, core's `cold_path()`: PeirGen_is_cold_fn), or
+/// cannot be reached (Unreachable). A panic path is the unlikely side of
+/// every check, as in nat_ir's ng_cold_last. OP30: with `--profile-use`,
+/// also a block the profiled run never or rarely entered (pgo_block_cold).
+fn PeirGen_block_cold(self: & PeirGen, func: & IrFunction, blk: BasicBlock) -> bool {
+    if g_pgo_use_path != "" && pgo_block_cold(func.name, blk.id) {
+        return true;
+    }
+    var i: i64 = 0;
+    while i < blk.instructions.len() {
+        match IrFunction_get_inst(func, blk.instructions.get(i)) {
+            OptInst::Some(inst) => {
+                match inst {
+                    Inst::Panic(_) => {
+                        return true;
+                    }
+                    Inst::Unreachable => {
+                        return true;
+                    }
+                    Inst::Call(cn, _, _, _) => {
+                        if PeirGen_is_cold_fn(self, cn) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            OptInst::None => {
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// OP15: the order the blocks are laid out in: the entry first, the other
+/// blocks in IR order, cold blocks last. A block moves only when it and
+/// the block before it in the IR both end in a jump, a branch, a return
+/// or Unreachable (nothing falls into it, and it falls into nothing);
+/// jumps to the block laid out next are still left out (next_block).
+fn PeirGen_block_order(self: & PeirGen, func: & IrFunction) -> Vec<i64> {
+    var hot: Vec<i64> = Vec::new();
+    var cold: Vec<i64> = Vec::new();
+    var on: bool = peir_on("layout");
+    var n: i64 = func.blocks.len();
+    var bi: i64 = 0;
+    while bi < n {
+        var moved: bool = false;
+        if on && bi > 0 {
+            var blk: BasicBlock = func.blocks.get(bi);
+            if peir_block_ends(func, blk) && peir_block_ends(func, func.blocks.get(bi - 1)) && PeirGen_block_cold(self, func, blk) {
+                moved = true;
+            }
+        }
+        if moved {
+            cold.push(bi);
+        } else {
+            hot.push(bi);
+        }
+        bi = bi + 1;
+    }
+    var ci: i64 = 0;
+    while ci < cold.len() {
+        hot.push(cold.get(ci));
+        ci = ci + 1;
+    }
+    return hot;
+}
+
+/// OP15: the functions that only panic: some block panics and every block
+/// that returns panics first (core's `panic`, a program's `fail(msg)`).
+/// Two rounds, so a function that only calls one of them counts too.
+fn PeirGen_find_cold_fns(self: & mut PeirGen, module: & IrModule) {
+    var round: i64 = 0;
+    while round < 2 {
+        var fi: i64 = 0;
+        while fi < module.functions.len() {
+            var fname: str = module.functions.get(fi).name;
+            if !HashMap_contains(self.cold_fns, fname) {
+                var f: IrFunction = module.functions.get(fi).func;
+                var panics: bool = false;
+                var ok: bool = f.blocks.len() > 0;
+                var b: i64 = 0;
+                while b < f.blocks.len() && ok {
+                    var blk: BasicBlock = f.blocks.get(b);
+                    var bp: bool = false;
+                    var ret: bool = false;
+                    var k: i64 = 0;
+                    while k < blk.instructions.len() {
+                        match IrFunction_get_inst(& f, blk.instructions.get(k)) {
+                            OptInst::Some(inst) => {
+                                match inst {
+                                    Inst::Panic(_) => {
+                                        bp = true;
+                                    }
+                                    Inst::Call(cn, _, _, _) => {
+                                        if PeirGen_is_cold_fn(self, cn) {
+                                            bp = true;
+                                        }
+                                    }
+                                    Inst::Return(_) => {
+                                        ret = true;
+                                    }
+                                    _ => {
+                                    }
+                                }
+                            }
+                            OptInst::None => {
+                            }
+                        }
+                        k = k + 1;
+                    }
+                    if bp {
+                        panics = true;
+                    }
+                    if ret && !bp {
+                        ok = false;
+                    }
+                    b = b + 1;
+                }
+                if panics && ok {
+                    HashMap_insert(self.cold_fns, fname, 1);
+                }
+            }
+            fi = fi + 1;
+        }
+        round = round + 1;
+    }
+}
+
+/// DB3: the source line of instruction `id` (0: none).
+fn peir_inst_line(func: & IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => {
+                    return v as i64;
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return 0;
+}
+
+/// DB3: a debug build (`fid emit --debug` / `-g`, or FID_PE_DEBUG=1)
+/// writes line tables for the functions of the input file. main.fd calls
+/// this with the input's source before pe_ir_generate_pe.
+pub fn pe_lines_setup(source: str, input: str) {
+    var lx: Lexer = Lexer::new(source);
+    var ps: Parser = Parser_new(lx.tokenize());
+    match ps.parse() {
+        ParseResultProgram::Ok(prog) => {
+            var names: Vec<str> = Vec::new();
+            // N9: each function's `fn` line (its first line row)
+            g_pe_lines_decl = HashMap_new();
+            var i: i64 = 0;
+            while i < prog.funcs.len() {
+                names.push(prog.funcs.get(i).name);
+                HashMap_insert(g_pe_lines_decl, prog.funcs.get(i).name, prog.funcs.get(i).line);
+                i = i + 1;
+            }
+            g_pe_lines_names = str_join(names, ",");
+            g_pe_lines_file = input;
+            // N9: a debug build keeps every value in its frame slot (pe_ir
+            // without its register allocator, as FID_PE_OFF=ra), so the
+            // debugger finds each variable in one place for the whole
+            // function; FID_PE_DEBUG_RA=1 keeps the allocator (variables
+            // held in registers then show as optimized out)
+            if peir_on("dbgvars") && str_len(env_or_empty("FID_PE_DEBUG_RA")) == 0 && peir_on("ra") {
+                g_peir_off = g_peir_off + "ra,";
+            }
+        }
+        ParseResultProgram::Err(_) => {
+        }
+    }
+}
+
+// --- N9: variables of a debug build (DB4 for pe_ir) ------------------------
+// pe_ir_enc.fd pe_add_dwarf writes them with nat_enc.fd's DWARF writer; the
+// formats are nat_enc.fd's g_nat_dbg_vars and g_nat_dbg_types. The type
+// descriptions follow compiler/nat_ir.fd's (ng_dbg_var_type,
+// ng_dbg_type_descs), which pe_ir cannot reach (nat_ir is not imported
+// here).
+
+/// N9: per function of a debug build (PeirGen.dbg_names' order), its
+/// parameters and variables in g_nat_dbg_vars' format
+/// (PeirGen_dbg_vars_note); "" until noted.
+pub var g_pe_dbg_vars: Vec<str> = Vec::new();
+/// N9: function name -> the line of its `fn` (pe_lines_setup); 0: none.
+pub var g_pe_lines_decl: i64 = 0;
+
+/// N9: the `fn` line of function `name` of the input file (0: unknown).
+fn peir_dbg_decl_line(name: str) -> i64 {
+    if g_pe_lines_decl == 0 || !HashMap_contains(g_pe_lines_decl, name) {
+        return 0;
+    }
+    return HashMap_get(g_pe_lines_decl, name);
+}
+
+fn peir_dbg_type_name(t: IrType) -> str {
+    var s: str = ir_type_to_str(t);
+    s = str_replace(s, "struct.", "");
+    s = str_replace(s, "opaque.", "");
+    return str_replace(s, "generic.", "");
+}
+
+/// The DWARF encoding of a scalar: 2 boolean, 4 float, 5 signed, 7
+/// unsigned (and anything held as a word: a handle, a pointer).
+fn peir_dbg_encoding(t: IrType) -> i64 {
+    if ir_type_eq(t, IrType::Bool) {
+        return 2;
+    }
+    if ir_type_is_float(t) {
+        return 4;
+    }
+    if ir_type_is_signed(t) {
+        return 5;
+    }
+    return 7;
+}
+
+/// A `str` (the IR's pointer to u8): described as text.
+fn peir_dbg_is_str(t: IrType) -> bool {
+    match t {
+        IrType::Ptr(inner) => {
+            return ir_type_eq(box_ir_type_unbox(inner), IrType::U8);
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// The struct of the module a word of type `t` holds the address of
+/// ("" when none).
+fn peir_dbg_held_struct(module: & IrModule, t: IrType) -> str {
+    match t {
+        IrType::Struct(sn) => {
+            if HashMap_contains(module.struct_index, sn) {
+                return sn;
+            }
+        }
+        IrType::Ptr(inner) => {
+            var it: IrType = box_ir_type_unbox(inner);
+            match it {
+                IrType::Struct(sn2) => {
+                    if HashMap_contains(module.struct_index, sn2) {
+                        return sn2;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// N9: a variable's type for g_nat_dbg_vars: name, byte size, encoding
+/// ("S" a struct held inline, "P" a pointer to a struct, "Z" a str, else
+/// the scalar's DWARF encoding), separated by tabs.
+fn peir_dbg_var_type(module: & IrModule, t: IrType) -> str {
+    match t {
+        IrType::Struct(sn) => {
+            return sn + "\t" + int_to_str(IrModule_type_size(module, t)) + "\tS";
+        }
+        IrType::Ptr(inner) => {
+            var it: IrType = box_ir_type_unbox(inner);
+            match it {
+                IrType::Struct(sn2) => {
+                    return sn2 + "\t8\tP";
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    if peir_dbg_is_str(t) {
+        return "str\t8\tZ";
+    }
+    var size: i64 = IrModule_type_size(module, t);
+    if size <= 0 || size > 8 {
+        size = 8;
+    }
+    return peir_dbg_type_name(t) + "\t" + int_to_str(size) + "\t" + int_to_str(peir_dbg_encoding(t));
+}
+
+/// N9: the module's struct types in g_nat_dbg_types' format (name, size,
+/// then per field its name, offset, type name, size and encoding): a
+/// field's size is the distance to the next field; a field that size of
+/// a struct of the module holds it inline ("S").
+pub fn peir_dbg_type_descs(module: & IrModule) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < module.struct_layouts.len() {
+        var lay: StructLayout = module.struct_layouts.get(i).layout;
+        var d: str = module.struct_layouts.get(i).name + "\t" + int_to_str(lay.size);
+        var f: i64 = 0;
+        while f < lay.fields.len() {
+            var fl: StringIrTypeOffset = lay.fields.get(f);
+            var end: i64 = lay.size;
+            if f + 1 < lay.fields.len() {
+                end = lay.fields.get(f + 1).offset;
+            }
+            var size: i64 = end - fl.offset;
+            var tname: str = peir_dbg_type_name(fl.ty);
+            var enc: str = int_to_str(peir_dbg_encoding(fl.ty));
+            var inline_struct: bool = false;
+            match fl.ty {
+                IrType::Struct(sn) => {
+                    if HashMap_contains(module.struct_index, sn) {
+                        var si: i64 = HashMap_get(module.struct_index, sn) - 1;
+                        if si >= 0 && si < module.struct_layouts.len() && module.struct_layouts.get(si).layout.size == size && size > 0 {
+                            inline_struct = true;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+            if inline_struct {
+                enc = "S";
+            } else {
+                if size > 8 || size <= 0 {
+                    size = 8;
+                }
+                var sc: i64 = ir_type_size(fl.ty);
+                if sc > 0 && sc < size {
+                    size = sc;
+                }
+                var held: str = peir_dbg_held_struct(module, fl.ty);
+                if peir_dbg_is_str(fl.ty) {
+                    tname = "str";
+                    enc = "Z";
+                    size = 8;
+                } else if str_len(held) > 0 && end - fl.offset == 8 {
+                    tname = held;
+                    enc = "P";
+                    size = 8;
+                }
+            }
+            d = d + "\t" + fl.name + "\t" + int_to_str(fl.offset) + "\t" + tname + "\t" + int_to_str(size) + "\t" + enc;
+            f = f + 1;
+        }
+        out.push(d);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// N9: the values of `func` whose memory something may write (by id):
+/// the pointer and value of a Store, and any value used other than as a
+/// Load's pointer (its address escapes). An alloca nothing writes never
+/// holds its variable (the slot is shown only when something does).
+fn peir_dbg_written(func: & IrFunction) -> i64 {
+    var w: i64 = HashMap_new();
+    var ops: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < func.insts.len() {
+        var inst: Inst = func.insts.get(i).inst;
+        match inst {
+            Inst::Load(_, _) => {
+            }
+            Inst::Store(p, v, _) => {
+                HashMap_insert(w, int_to_str(p), 1);
+                HashMap_insert(w, int_to_str(v), 1);
+            }
+            _ => {
+                ops.clear();
+                peir_inst_operands(inst, & mut ops);
+                var k: i64 = 0;
+                while k < ops.len() {
+                    HashMap_insert(w, int_to_str(ops.get(k)), 1);
+                    k = k + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return w;
+}
+
+/// N9: where value `id` (a parameter or a value a variable is bound to)
+/// is for the whole function: its constant ("c<v>"), its frame slot
+/// ("f<off>", CFA-relative: rbp + o is CFA + o - 16), or "" (in a
+/// register, or a parameter nothing reads, which the prologue does not
+/// store).
+fn PeirGen_dbg_value_loc(self: & PeirGen, frame: & PeStackFrame, id: i64, is_param: bool) -> str {
+    if pe_idmap_has(& frame.const_vals, id) {
+        return "c" + int_to_str(pe_idmap_get(& frame.const_vals, id));
+    }
+    if is_param && id >= 0 && id < self.use_count.len() && self.use_count.get(id) == 0 {
+        return "";
+    }
+    if !pe_idmap_has(& frame.offsets, id) {
+        return "";
+    }
+    var off: i64 = pe_idmap_get(& frame.offsets, id);
+    if off >= 0 {
+        return "";
+    }
+    return "f" + int_to_str(off - 16);
+}
+
+/// N9: the parameters and variables of the function just generated (the
+/// last of self.dbg_names), from IrFunction.locals (each name with the
+/// alloca or value it is bound to), into g_pe_dbg_vars: an alloca at its
+/// data slot when something writes it, a value at its slot or constant
+/// (PeirGen_dbg_value_loc), a value with no instruction (an alloca the IR
+/// optimizer promoted away: `-g` keeps the mid-end) with no location. A
+/// parameter the body copies is shown at the copy; hidden names (`__env`)
+/// are left out. A name bound twice (shadowing) is listed twice, without
+/// scopes. Called while `frame` is the function's laid-out frame.
+fn PeirGen_dbg_vars_note(self: & mut PeirGen, func: & IrFunction, module: & IrModule, frame: & PeStackFrame) {
+    var at: i64 = self.dbg_names.len() - 1;
+    if at < 0 || g_pe_dbg_vars.len() != self.dbg_names.len() || !peir_on("dbgvars") {
+        return;
+    }
+    var written: i64 = peir_dbg_written(func);
+    var params: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < func.params.len() {
+        HashMap_insert(params, int_to_str(func.params.get(i).id), i + 1);
+        i = i + 1;
+    }
+    var entries: Vec<str> = Vec::new();
+    var seen: i64 = HashMap_new();
+    var pnames: i64 = HashMap_new();
+    i = 0;
+    while i < func.locals.len() {
+        var lv: StringValueId = func.locals.get(i);
+        var nm: str = lv.name;
+        var id: i64 = lv.id;
+        var key: str = nm + "\t" + int_to_str(id);
+        if str_len(nm) > 0 && !str_starts_with(nm, "__") && !str_contains(nm, "\t") && !str_contains(nm, "\n") && !HashMap_contains(seen, key) {
+            HashMap_insert(seen, key, 1);
+            var tdesc: str = "";
+            var loc: str = "";
+            var is_alloca: bool = false;
+            var gone: bool = true;
+            match IrFunction_get_inst(func, id) {
+                OptInst::Some(inst) => {
+                    gone = false;
+                    match inst {
+                        Inst::Alloca(aty, _) => {
+                            is_alloca = true;
+                            tdesc = peir_dbg_var_type(module, aty);
+                            if !pe_idmap_has(& frame.reg_vars, id) && pe_idmap_has(& frame.alloca_slots, id) && HashMap_contains(written, int_to_str(id)) {
+                                loc = "f" + int_to_str(pe_idmap_get(& frame.alloca_slots, id) - 16);
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptInst::None => {
+                }
+            }
+            var pix: i64 = 0;
+            if HashMap_contains(params, int_to_str(id)) {
+                pix = HashMap_get(params, int_to_str(id));
+            }
+            if !is_alloca {
+                if pix > 0 {
+                    tdesc = peir_dbg_var_type(module, func.params.get(pix - 1).ty);
+                    loc = PeirGen_dbg_value_loc(self, frame, id, true);
+                } else if gone {
+                    // promoted away by the IR optimizer: no one place; its
+                    // type is what the alloca held
+                    var pty: IrType = peir_operand_ty(func, id);
+                    tdesc = peir_dbg_var_type(module, pty);
+                    match pty {
+                        IrType::Ptr(held) => {
+                            tdesc = peir_dbg_var_type(module, box_ir_type_unbox(held));
+                        }
+                        _ => {
+                        }
+                    }
+                } else {
+                    tdesc = peir_dbg_var_type(module, peir_operand_ty(func, id));
+                    loc = PeirGen_dbg_value_loc(self, frame, id, false);
+                }
+            }
+            if HashMap_contains(pnames, nm) {
+                // the body's copy of a parameter replaces it
+                entries.set(HashMap_get(pnames, nm) - 1, "P\t" + nm + "\t" + tdesc + "\t" + loc);
+            } else if pix > 0 {
+                entries.push("P\t" + nm + "\t" + tdesc + "\t" + loc);
+                HashMap_insert(pnames, nm, entries.len());
+            } else {
+                entries.push("V\t" + nm + "\t" + tdesc + "\t" + loc);
+            }
+        }
+        i = i + 1;
+    }
+    g_pe_dbg_vars.set(at, str_join(entries, "\n"));
+}
+
+/// DB3: the functions pe_lines_setup named get line rows.
+fn PeirGen_lines_start(self: & mut PeirGen) {
+    if g_pe_lines_names == "" {
+        return;
+    }
+    var names: Vec<str> = str_split(g_pe_lines_names, ",");
+    var i: i64 = 0;
+    while i < names.len() {
+        HashMap_insert(self.line_fns, names.get(i), 1);
+        i = i + 1;
+    }
+}
+
+// --- B5: the per-function cache ----------------------------------------
+// The late-link step of inc-roadmap B5 for the default Windows backend, as
+// nat_ir's CS6 (FID_FNCACHE) is for the machine layer. FID_FNCACHE=<path>
+// keeps, in <path>.pe, each generated function's code before its labels
+// and .rdata references are resolved, with those references by name: a
+// function, an arithmetic panic stub, a string (its text), a global, an
+// import slot, the allocator's state. The key is the function's IR
+// (iw_irfunc) and a salt of everything else its code depends on: struct
+// layouts, globals, externs, every name that has a label, the C
+// overrides, the named functions, the cold functions and FID_PE_OFF. A
+// hit copies the bytes to wherever the function lands now and registers
+// its references again; the image is laid out and linked afresh each
+// build. Left out: @interrupt and @constant_time functions, asm!, dyn
+// values (their type ids depend on the order functions are generated),
+// functions that call something nobody defines, and debug builds.
+
+/// B5: may `func`'s code come from the cache?
+fn peir_fc_cacheable(func: & IrFunction) -> bool {
+    if func.is_interrupt || func.is_constant_time || g_pe_lines_file != "" || env_or_empty("PE_DUMP_FN") != "" {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(i);
+        match ve.inst {
+            Inst::Asm(_, _, _, _) => {
+                return false;
+            }
+            Inst::MakeDyn(_, _, _) => {
+                return false;
+            }
+            Inst::DynCall(_, _, _, _, _) => {
+                return false;
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+@wrapping fn peir_fc_hash(v: Vec<i64>, seed: i64) -> i64 {
+    var h: i64 = seed * 1099511628211 + 1469598103934665603;
+    var i: i64 = 0;
+    while i < v.len() {
+        h = (h ^ v.get(i)) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// B5: the key of `func` under `salt` (never 0).
+fn peir_fc_key(func: IrFunction, salt: i64) -> i64 {
+    var b: AwBuf = awbuf_new();
+    iw_irfunc(& mut b, func);
+    var bytes: Vec<i64> = b.bytes;
+    var h: i64 = peir_fc_hash(bytes, salt);
+    if h == 0 {
+        h = 1;
+    }
+    return h;
+}
+
+/// B5: what besides its own IR a function's code depends on.
+fn PeirGen_fc_salt(self: & PeirGen, module: & IrModule) -> i64 {
+    var b: AwBuf = awbuf_new();
+    // the compiler itself (its executable's hash): another compiler may
+    // generate other code, or another runtime, for the same IR
+    aw_str(& mut b, "pefc1;" + int_to_str(inc_compiler_hash()) + ";" + env_or_empty("FID_PE_OFF") + ";" + env_or_empty("FID_PE_CT_OFF") + ";");
+    // code generation switches: --cpu (OP20: BMI forms), --checked-alloc
+    aw_str(& mut b, "cpu=" + g_pe_cpu + ";");
+    if g_pe_checked_alloc {
+        aw_i64(& mut b, 11);
+    }
+    // RL16: --leaks
+    if g_pe_leaks {
+        aw_i64(& mut b, 12);
+    }
+    var i: i64 = 0;
+    while i < module.struct_layouts.len() {
+        var sl: StructLayout = module.struct_layouts.get(i).layout;
+        aw_str(& mut b, sl.name);
+        aw_i64(& mut b, sl.size);
+        aw_i64(& mut b, sl.align);
+        if sl.repr_c {
+            aw_i64(& mut b, 1);
+        }
+        if sl.packed_layout {
+            aw_i64(& mut b, 2);
+        }
+        var f: i64 = 0;
+        while f < sl.fields.len() {
+            var fd: StringIrTypeOffset = sl.fields.get(f);
+            aw_str(& mut b, fd.name);
+            aw_i64(& mut b, fd.offset);
+            iw_irtype(& mut b, fd.ty);
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.globals.len() {
+        aw_str(& mut b, module.globals.get(i).name);
+        iw_irtype(& mut b, module.globals.get(i).ty);
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.extern_functions.len() {
+        var ef: StringVecIrType = module.extern_functions.get(i);
+        aw_str(& mut b, ef.name);
+        iw_irtype(& mut b, ef.ret);
+        var p: i64 = 0;
+        while p < ef.params.len() {
+            iw_irtype(& mut b, ef.params.get(p));
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.extern_decls.len() {
+        aw_str(& mut b, module.extern_decls.get(i).pledge_name);
+        aw_str(& mut b, module.extern_decls.get(i).c_name);
+        i = i + 1;
+    }
+    var rev: Vec<str> = self.fc_rev;
+    i = 0;
+    while i < rev.len() {
+        aw_str(& mut b, rev.get(i));
+        i = i + 1;
+    }
+    var ovs: Vec<COverride> = self.c_overrides;
+    i = 0;
+    while i < ovs.len() {
+        aw_str(& mut b, ovs.get(i).name);
+        aw_str(& mut b, ovs.get(i).over);
+        i = i + 1;
+    }
+    var nfs: Vec<str> = self.named_fns;
+    i = 0;
+    while i < nfs.len() {
+        aw_str(& mut b, nfs.get(i));
+        i = i + 1;
+    }
+    var mfs: Vec<str> = self.module_fns;
+    i = 0;
+    while i < mfs.len() {
+        if PeirGen_is_cold_fn(self, mfs.get(i)) {
+            aw_str(& mut b, mfs.get(i));
+        }
+        i = i + 1;
+    }
+    var bytes: Vec<i64> = b.bytes;
+    return peir_fc_hash(bytes, 7);
+}
+
+/// B5: what lives at .rdata offset `off`, for the cache's references.
+fn PeirGen_fc_rip_add(self: & mut PeirGen, off: i64, kind: i64, k: i64, s: str) {
+    var key: str = int_to_str(off);
+    if HashMap_contains(self.fc_rip, key) {
+        return;
+    }
+    self.fc_rip_kind.push(kind);
+    self.fc_rip_k.push(k);
+    self.fc_rip_s.push(s);
+    HashMap_insert(self.fc_rip, key, self.fc_rip_kind.len());
+}
+
+/// B5: the cache is on by default for a Windows `fid emit`/`fid build`:
+/// its file is `<output>.fides-fncache.pe`, beside the output as the
+/// build stamp `<output>.fides-stamp` is. FID_FNCACHE=<path> puts it at
+/// `<path>.pe` instead; FID_FNCACHE=0 (or off, no, none, false),
+/// FIDES_NO_CACHE=1, `--no-cache` or `--no-fncache` turn it off. "" when
+/// it is off or the output is unknown.
+fn pe_fc_base_path() -> str {
+    var v: str = env_or_empty("FID_FNCACHE");
+    if v == "0" || v == "off" || v == "no" || v == "none" || v == "false" {
+        return "";
+    }
+    var n: i64 = argv_count();
+    var i: i64 = 1;
+    while i < n {
+        var a: str = argv_at(i);
+        if a == "--no-fncache" {
+            return "";
+        }
+        i = i + 1;
+    }
+    if str_len(v) > 0 {
+        return v;
+    }
+    if str_len(env_or_empty("FIDES_NO_CACHE")) > 0 {
+        return "";
+    }
+    i = 1;
+    while i < n {
+        if argv_at(i) == "--no-cache" {
+            return "";
+        }
+        i = i + 1;
+    }
+    var out: str = pe_fc_output();
+    if str_len(out) == 0 {
+        return "";
+    }
+    return out + ".fides-fncache";
+}
+
+/// B5: the output of this build: what the driver recorded
+/// (pe_set_output_path), else the `-o` of an `emit`/`build` command line.
+fn pe_fc_output() -> str {
+    if str_len(g_pe_out_path) > 0 {
+        return g_pe_out_path;
+    }
+    var n: i64 = argv_count();
+    if n < 2 {
+        return "";
+    }
+    var cmd: str = argv_at(1);
+    if cmd != "emit" && cmd != "build" {
+        return "";
+    }
+    var i: i64 = 2;
+    while i + 1 < n {
+        if argv_at(i) == "-o" {
+            var o: str = argv_at(i + 1);
+            if !str_ends_with(o, ".exe") {
+                o = o + ".exe";
+            }
+            return o;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// B5: turn the cache on (by default, or FID_FNCACHE: pe_fc_base_path; a
+/// Windows image, not a debug build), once every label the functions may refer to exists: names for
+/// labels and .rdata offsets, the salt, the cache file.
+fn PeirGen_fc_start(self: & mut PeirGen, module: & IrModule, all_strings: Vec<str>, global_names: Vec<str>) {
+    var path: str = pe_fc_base_path();
+    if str_len(path) == 0 || self.bare_mode || g_pe_lines_file != "" {
+        return;
+    }
+    var rev: Vec<str> = Vec::new();
+    while rev.len() < self.enc.next_label {
+        rev.push("");
+    }
+    var cands: Vec<str> = Vec::new();
+    var mfs: Vec<str> = self.module_fns;
+    var i: i64 = 0;
+    while i < mfs.len() {
+        cands.push(mfs.get(i));
+        i = i + 1;
+    }
+    var stubs: Vec<str> = pe_runtime_stub_names();
+    i = 0;
+    while i < stubs.len() {
+        cands.push(stubs.get(i));
+        i = i + 1;
+    }
+    var prims: Vec<str> = pe_primitive_names();
+    i = 0;
+    while i < prims.len() {
+        cands.push(prims.get(i));
+        i = i + 1;
+    }
+    var deps: Vec<PeirStrPair> = pe_stub_deps();
+    i = 0;
+    while i < deps.len() {
+        cands.push(deps.get(i).a);
+        i = i + 1;
+    }
+    i = 0;
+    while i < module.extern_decls.len() {
+        cands.push(module.extern_decls.get(i).pledge_name);
+        i = i + 1;
+    }
+    var thunks: Vec<CThunk> = self.c_thunks;
+    i = 0;
+    while i < thunks.len() {
+        cands.push(thunks.get(i).name);
+        i = i + 1;
+    }
+    var adapters: Vec<CAdapter> = self.c_adapters;
+    i = 0;
+    while i < adapters.len() {
+        cands.push(adapters.get(i).name);
+        i = i + 1;
+    }
+    var sexts: Vec<str> = self.stub_externs;
+    i = 0;
+    while i < sexts.len() {
+        cands.push(sexts.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < cands.len() {
+        var nm: str = cands.get(i);
+        if HashMap_contains(self.func_labels, nm) {
+            var l: i64 = HashMap_get(self.func_labels, nm);
+            if l >= 0 && l < rev.len() && rev.get(l) == "" {
+                rev.set(l, nm);
+            }
+        }
+        i = i + 1;
+    }
+    self.fc_rev = rev;
+    i = 0;
+    while i < all_strings.len() {
+        var s: str = all_strings.get(i);
+        if HashMap_contains(self.string_rdata_offsets, s) {
+            PeirGen_fc_rip_add(self, HashMap_get(self.string_rdata_offsets, s), PEFC_STR, 0, s);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < global_names.len() {
+        var g: str = global_names.get(i);
+        if HashMap_contains(self.global_rdata_offsets, g) {
+            PeirGen_fc_rip_add(self, HashMap_get(self.global_rdata_offsets, g), PEFC_GLOBAL, 0, g);
+        }
+        i = i + 1;
+    }
+    var iats: Vec<i64> = self.iat_rdata_offsets;
+    i = 0;
+    while i < iats.len() {
+        PeirGen_fc_rip_add(self, iats.get(i), PEFC_IAT, i, "");
+        i = i + 1;
+    }
+    i = 0;
+    while i < PEIR_ALLOC_STATE_SIZE {
+        PeirGen_fc_rip_add(self, self.alloc_rdata_off + i, PEFC_ALLOC, i, "");
+        i = i + 1;
+    }
+    self.fc_salt = PeirGen_fc_salt(self, module);
+    self.fc_path = path + ".pe";
+    self.fc_on = true;
+    g_pe_fc_reemit = Vec::new();
+    // (p_file_exists is i64 to the type checker: tested alone in an `if`)
+    if p_file_exists(self.fc_path) {
+        PeirGen_fc_load(self);
+    }
+}
+
+fn pefc_fix(pos: i64, kind: i64, tkind: i64, toff: i64, tstr: str) -> PeFcFix {
+    return PeFcFix {
+        pos: pos, kind: kind, tkind: tkind, toff: toff, tstr: tstr
+    };
+}
+
+/// B5: keep the code just generated for `name` [start, end of code), when
+/// every reference it makes has a name.
+fn PeirGen_fc_capture(self: & mut PeirGen, name: str, key: i64, start: i64, pl0: i64, rr0: i64, lab0: i64, unres0: i64) {
+    if self.unres_adds != unres0 {
+        return;
+    }
+    var end: i64 = self.enc.code.len();
+    var fixes: Vec<PeFcFix> = Vec::new();
+    var i: i64 = pl0;
+    while i < self.enc.pending_labels.len() {
+        var r: PeirReloc = self.enc.pending_labels.get(i);
+        if r.code_offset < start || r.code_offset + 4 > end {
+            return;
+        }
+        var t: i64 = r.target_label;
+        if t >= lab0 {
+            if t >= self.enc.labels.len() {
+                return;
+            }
+            var tp: i64 = self.enc.labels.get(t);
+            if tp < start || tp > end {
+                return;
+            }
+            fixes.push(pefc_fix(r.code_offset - start, r.kind, PEFC_LOCAL, tp - start, ""));
+        } else if t >= 0 && t < self.fc_rev.len() && self.fc_rev.get(t) != "" {
+            fixes.push(pefc_fix(r.code_offset - start, r.kind, PEFC_NAME, 0, self.fc_rev.get(t)));
+        } else if t == self.crash_filter {
+            fixes.push(pefc_fix(r.code_offset - start, r.kind, PEFC_CRASH, 0, ""));
+        } else {
+            var ap: i64 = - 1;
+            var k: i64 = 0;
+            while k < self.arith_panics.len() {
+                if self.arith_panics.get(k) == t {
+                    ap = k;
+                }
+                k = k + 1;
+            }
+            if ap < 0 {
+                return;
+            }
+            fixes.push(pefc_fix(r.code_offset - start, r.kind, PEFC_PANIC, ap, ""));
+        }
+        i = i + 1;
+    }
+    i = rr0;
+    while i < self.enc.pending_rip_refs.len() {
+        var rr: PeirRipRef = self.enc.pending_rip_refs.get(i);
+        if rr.code_offset < start || rr.code_offset + 4 > end {
+            return;
+        }
+        var key2: str = int_to_str(rr.rdata_offset);
+        if !HashMap_contains(self.fc_rip, key2) {
+            return;
+        }
+        var ix: i64 = HashMap_get(self.fc_rip, key2) - 1;
+        fixes.push(pefc_fix(rr.code_offset - start, - 1, self.fc_rip_kind.get(ix), self.fc_rip_k.get(ix), self.fc_rip_s.get(ix)));
+        i = i + 1;
+    }
+    var bytes: Vec<i64> = Vec::new();
+    var c: i64 = start;
+    while c < end {
+        bytes.push(self.enc.code.get(c));
+        c = c + 1;
+    }
+    self.fc_new.push(PeFcEntry {
+        name: name, key: key, bytes: bytes, fixes: fixes
+    });
+}
+
+/// B5: the label (or .rdata offset) a cached reference names in this
+/// build: -1 for a label inside the function (made when replayed), -2
+/// when the name is gone (the entry cannot be used).
+fn PeirGen_fc_target(self: & PeirGen, fx: PeFcFix) -> i64 {
+    if fx.tkind == PEFC_LOCAL {
+        return - 1;
+    }
+    if fx.tkind == PEFC_NAME {
+        if HashMap_contains(self.func_labels, fx.tstr) {
+            return HashMap_get(self.func_labels, fx.tstr);
+        }
+        return - 2;
+    }
+    if fx.tkind == PEFC_PANIC {
+        if fx.toff >= 0 && fx.toff < self.arith_panics.len() {
+            return self.arith_panics.get(fx.toff);
+        }
+        return - 2;
+    }
+    if fx.tkind == PEFC_CRASH {
+        return self.crash_filter;
+    }
+    if fx.tkind == PEFC_STR {
+        if HashMap_contains(self.string_rdata_offsets, fx.tstr) {
+            return HashMap_get(self.string_rdata_offsets, fx.tstr);
+        }
+        return - 2;
+    }
+    if fx.tkind == PEFC_GLOBAL {
+        if HashMap_contains(self.global_rdata_offsets, fx.tstr) {
+            return HashMap_get(self.global_rdata_offsets, fx.tstr);
+        }
+        return - 2;
+    }
+    if fx.tkind == PEFC_IAT {
+        if fx.toff >= 0 && fx.toff < self.iat_rdata_offsets.len() {
+            return self.iat_rdata_offsets.get(fx.toff);
+        }
+        return - 2;
+    }
+    if fx.tkind == PEFC_ALLOC {
+        return self.alloc_rdata_off + fx.toff;
+    }
+    return - 2;
+}
+
+/// B5: place `name` from the cache when its entry has `key` and all it
+/// refers to exists; false: generate it.
+fn PeirGen_fc_replay(self: & mut PeirGen, name: str, key: i64) -> bool {
+    if !HashMap_contains(self.fc_ix, name) {
+        return false;
+    }
+    var e: PeFcEntry = self.fc_old.get(HashMap_get(self.fc_ix, name) - 1);
+    if e.key != key {
+        return false;
+    }
+    var tgt: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < e.fixes.len() {
+        var v: i64 = PeirGen_fc_target(self, e.fixes.get(i));
+        if v == - 2 {
+            return false;
+        }
+        tgt.push(v);
+        i = i + 1;
+    }
+    self.cur_func = name;
+    var label: i64 = HashMap_get(self.func_labels, name);
+    PeirEnc_align_to(& mut self.enc, 16);
+    PeirEnc_place_label(& mut self.enc, label);
+    var base: i64 = self.enc.code.len();
+    PeirEnc_emit_bytes(& mut self.enc, e.bytes);
+    i = 0;
+    while i < e.fixes.len() {
+        var fx: PeFcFix = e.fixes.get(i);
+        if fx.kind < 0 {
+            PeirEnc_add_rip_ref(& mut self.enc, base + fx.pos, tgt.get(i));
+        } else {
+            var lab: i64 = tgt.get(i);
+            if fx.tkind == PEFC_LOCAL {
+                lab = PeirEnc_alloc_label(& mut self.enc);
+                PeirEnc_set_label(& mut self.enc, lab, base + fx.toff);
+            }
+            PeirEnc_add_reloc(& mut self.enc, base + fx.pos, lab, fx.kind);
+        }
+        i = i + 1;
+    }
+    self.fc_new.push(e);
+    return true;
+}
+
+const PEFC_MAGIC: i64 = 0x4346455044494601; const PEFC_VERSION: i64 = 1;
+
+fn PeirGen_fc_load(self: & mut PeirGen) {
+    var vb: Vec<i64> = p_file_read_bytes(self.fc_path);
+    if vb.len() < 32 {
+        return;
+    }
+    var r: ArBuf = arbuf_new(vb);
+    if ar_i64(& mut r) != PEFC_MAGIC || ar_i64(& mut r) != PEFC_VERSION || ar_i64(& mut r) != self.fc_salt {
+        return;
+    }
+    var count: i64 = ar_i64(& mut r);
+    var i: i64 = 0;
+    while i < count && r.ok {
+        var name: str = ar_str(& mut r);
+        var key: i64 = ar_i64(& mut r);
+        var nb: i64 = ar_i64(& mut r);
+        if !r.ok || nb < 0 || nb > vb.len() {
+            return;
+        }
+        var bytes: Vec<i64> = Vec::new();
+        var b: i64 = 0;
+        while b < nb {
+            bytes.push(ar_u8(& mut r));
+            b = b + 1;
+        }
+        var nf: i64 = ar_i64(& mut r);
+        if !r.ok || nf < 0 || nf > vb.len() {
+            return;
+        }
+        var fixes: Vec<PeFcFix> = Vec::new();
+        var f: i64 = 0;
+        while f < nf {
+            var pos: i64 = ar_i64(& mut r);
+            var kind: i64 = ar_i64(& mut r);
+            var tkind: i64 = ar_i64(& mut r);
+            var toff: i64 = ar_i64(& mut r);
+            var tstr: str = ar_str(& mut r);
+            if pos < 0 || pos + 4 > nb {
+                return;
+            }
+            fixes.push(pefc_fix(pos, kind, tkind, toff, tstr));
+            f = f + 1;
+        }
+        if !r.ok {
+            return;
+        }
+        self.fc_old.push(PeFcEntry {
+            name: name, key: key, bytes: bytes, fixes: fixes
+        });
+        HashMap_insert(self.fc_ix, name, self.fc_old.len());
+        i = i + 1;
+    }
+}
+
+/// B5: write the entries this build used or made (others drop out).
+fn PeirGen_fc_finish(self: & mut PeirGen) {
+    if !self.fc_on {
+        return;
+    }
+    var b: AwBuf = awbuf_new();
+    aw_i64(& mut b, PEFC_MAGIC);
+    aw_i64(& mut b, PEFC_VERSION);
+    aw_i64(& mut b, self.fc_salt);
+    var ents: Vec<PeFcEntry> = self.fc_new;
+    aw_i64(& mut b, ents.len());
+    var i: i64 = 0;
+    while i < ents.len() {
+        var e: PeFcEntry = ents.get(i);
+        aw_str(& mut b, e.name);
+        aw_i64(& mut b, e.key);
+        aw_i64(& mut b, e.bytes.len());
+        var k: i64 = 0;
+        while k < e.bytes.len() {
+            aw_u8(& mut b, e.bytes.get(k));
+            k = k + 1;
+        }
+        aw_i64(& mut b, e.fixes.len());
+        var f: i64 = 0;
+        while f < e.fixes.len() {
+            var fx: PeFcFix = e.fixes.get(f);
+            aw_i64(& mut b, fx.pos);
+            aw_i64(& mut b, fx.kind);
+            aw_i64(& mut b, fx.tkind);
+            aw_i64(& mut b, fx.toff);
+            aw_str(& mut b, fx.tstr);
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    p_file_write_vec(self.fc_path, b.bytes);
+    if env_or_empty("FID_PE_FNCACHE_STATS") != "" {
+        p_eprint_str("[pe] fncache: " + int_to_str(self.fc_hits) + " hits, " + int_to_str(self.fc_misses) + " misses\n");
+        if g_pe_fc_reemit.len() > 0 {
+            p_eprint_str("[pe] fncache re-emitted: " + str_join(g_pe_fc_reemit, ", ") + "\n");
+        }
+    }
+}
+
+/// CB3: the functions this build generated again (cache misses), in order,
+/// for FID_PE_FNCACHE_STATS's log.
+var g_pe_fc_reemit: Vec<str> = Vec::new();
+
+/// B5: generate `func`, or place its code from the cache.
+fn PeirGen_gen_cached(self: & mut PeirGen, name: str, func: IrFunction, module: & IrModule) {
+    self.fc_key = 0;
+    if self.fc_on && peir_fc_cacheable(& func) {
+        var key: i64 = peir_fc_key(func, self.fc_salt);
+        if PeirGen_fc_replay(self, name, key) {
+            self.fc_hits = self.fc_hits + 1;
+            return;
+        }
+        self.fc_misses = self.fc_misses + 1;
+        g_pe_fc_reemit.push(name);
+        self.fc_key = key;
+    }
+    PeirGen_gen_function(self, name, & func, module);
 }
 
 // ===========================================================================
@@ -5513,6 +8548,7 @@ pub fn pe_ir_generate_flat(module: IrModule, panic_handler: str) -> ResultBytes 
     }
     g_pe_bare_panic_handler = panic_handler;
     g_pe_asm_errors = Vec::new();
+    g_pe_ct_errors = Vec::new();
     var gen: PeirGen = PeirGen_new();
     gen.bare_mode = true;
     // A bootable image is loaded at g_pe_bare_boot_load (release G1)
@@ -5530,6 +8566,9 @@ pub fn pe_ir_generate_flat(module: IrModule, panic_handler: str) -> ResultBytes 
     }
     if g_pe_asm_errors.len() > 0 {
         return ResultBytes::Err(g_pe_asm_errors);
+    }
+    if g_pe_ct_errors.len() > 0 {
+        return ResultBytes::Err(peir_ct_report(g_pe_ct_errors, "bare-metal build"));
     }
     var reachable: Vec<str> = pe_ir_reachable_functions(& module);
     var names: Vec<str> = Vec::new();
@@ -5653,13 +8692,51 @@ pub fn pe_ir_generate_elf(module: IrModule) -> ResultBytes {
     return ResultBytes::Err(c_vec1("unreachable"));
 }
 
+/// `fid emit --uefi` (roadmap Phase 16): a UEFI application, a PE32+ image
+/// of subsystem EFI_APPLICATION from the bare build's code and a runtime
+/// over the firmware's boot services (pe_ir_stubs.fd, "UEFI application").
+/// Like `--bare`, no stdlib. `panic_handler` is the @panic_handler, or "".
+/// Layout (pe_build_efi): headers, .text at RVA 0x1000 (the flat binary's
+/// code, entered at its first byte), .data after it, .reloc.
+pub fn pe_ir_generate_uefi(module: IrModule, panic_handler: str) -> ResultBytes {
+    g_pe_uefi = true;
+    g_pe_uefi_abs = Vec::new();
+    g_pe_uefi_code_size = Vec::new();
+    g_pe_uefi_exit = - 1;
+    var saved_load: i64 = g_pe_bare_load;
+    g_pe_bare_load = PE_EFI_IMAGE_BASE + PE_TEXT_RVA;
+    var flat_res: ResultBytes = pe_ir_generate_flat(module, panic_handler);
+    g_pe_uefi = false;
+    g_pe_bare_load = saved_load;
+    match flat_res {
+        ResultBytes::Err(e) => {
+            return ResultBytes::Err(e);
+        }
+        ResultBytes::Ok(flat) => {
+            if g_pe_uefi_code_size.len() != 1 || flat.len() < g_pe_uefi_code_size.get(0) {
+                return ResultBytes::Err(c_vec1("UEFI build: internal error: the code size of the flat binary is unknown"));
+            }
+            return ResultBytes::Ok(pe_build_efi(flat, g_pe_uefi_code_size.get(0), g_pe_uefi_abs));
+        }
+    }
+    return ResultBytes::Err(c_vec1("unreachable"));
+}
+
 pub fn pe_ir_generate_pe(module: IrModule) -> ResultBytes {
     // The entry point calls main (it used to panic when there was none).
     if !pe_module_has_fn(& module, "main") {
         return ResultBytes::Err(c_vec1("PE backend: the program has no `main` function"));
     }
+    g_pe_ct_errors = Vec::new();
     var gen: PeirGen = PeirGen_new();
     var bytes: Vec = PeirGen_generate(& mut gen, & module);
+    if g_pe_ct_errors.len() > 0 {
+        return ResultBytes::Err(peir_ct_report(g_pe_ct_errors, "PE backend"));
+    }
+    // MI20 (FID_VERIFY=1): pe_ir defines the whole nat_* interface
+    if gen.nat_missing != "" {
+        return ResultBytes::Err(c_vec1("PE backend: " + gen.nat_missing));
+    }
     var reachable: Vec<str> = pe_ir_reachable_functions(& module);
     var names: Vec<str> = Vec::new();
     var i: i64 = 0;

@@ -1,0 +1,89 @@
+// test_lexer_kw_cache.fd — compiler/lexer.fd keyword_or_ident (CS4): a word
+// found to be no keyword is remembered (g_lex_not_kw), so it is not compared
+// with every keyword again. The answer must not change: a word lexed after
+// it is remembered is still an identifier, a keyword is still a keyword, and
+// lexing the same source again gives the same tokens.
+//
+// Expected output:
+// round 1: fn Ident(x) val Ident(x) Ident(fnx) i64 Ident(i64x) Ident(Fn) while Ident(whilex) Ident(x) fn
+// round 2: fn Ident(x) val Ident(x) Ident(fnx) i64 Ident(i64x) Ident(Fn) while Ident(whilex) Ident(x) fn
+// long: Ident(a_very_long_identifier) Ident(a_very_long_identifier)
+// All tests passed!
+
+use core;
+use vec;
+use compiler::lexer;
+use compiler::token;
+
+fn kind_text(kind: TokenKind) -> str {
+    match kind {
+        TokenKind::Ident(s) => {
+            return "Ident(" + s + ")";
+        }
+        TokenKind::Fn => {
+            return "fn";
+        }
+        TokenKind::Val => {
+            return "val";
+        }
+        TokenKind::While => {
+            return "while";
+        }
+        TokenKind::I64 => {
+            return "i64";
+        }
+        TokenKind::Eof => {
+            return "";
+        }
+        _ => {
+            return "?";
+        }
+    }
+}
+
+fn lex_line(src: str) -> str {
+    var lex: Lexer = Lexer::new(src);
+    var tokens: Vec<Token> = lex.tokenize();
+    var out: str = "";
+    var i: i64 = 0;
+    while i < tokens.len() {
+        var t: str = kind_text(tokens.get(i).kind);
+        if str_len(t) > 0 {
+            if str_len(out) > 0 {
+                out = out + " ";
+            }
+            out = out + t;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val src: str = "fn x val x fnx i64 i64x Fn while whilex x fn";
+    val want: str = "fn Ident(x) val Ident(x) Ident(fnx) i64 Ident(i64x) Ident(Fn) while Ident(whilex) Ident(x) fn";
+    var failed: i64 = 0;
+    val r1: str = lex_line(src);
+    print("round 1: " + r1 + "\n");
+    if r1 != want {
+        failed = failed + 1;
+    }
+    // every word of src has been seen: the identifiers are remembered now
+    val r2: str = lex_line(src);
+    print("round 2: " + r2 + "\n");
+    if r2 != want {
+        failed = failed + 1;
+    }
+    // longer than 10 bytes: never a keyword, never remembered
+    val r3: str = lex_line("a_very_long_identifier a_very_long_identifier");
+    print("long: " + r3 + "\n");
+    if r3 != "Ident(a_very_long_identifier) Ident(a_very_long_identifier)" {
+        failed = failed + 1;
+    }
+    if failed > 0 {
+        print("FAILED: " + int_to_str(failed) + "\n");
+        return 1;
+    }
+    print("All tests passed!\n");
+    return 0;
+}

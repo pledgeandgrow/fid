@@ -2,9 +2,8 @@
 //
 // XML 1.0 (https://www.w3.org/TR/xml/) parsing and serialization:
 // elements, attributes (single or double quotes), text, comments, CDATA
-// sections, processing instructions, the XML declaration, a DOCTYPE
-// (skipped, but the general entities of its internal subset,
-// <!ENTITY name "value">, are replaced), the five predefined entities and
+// sections, processing instructions, the XML declaration, a DOCTYPE and
+// its internal subset (below), the five predefined entities and
 // character references (&#NN; &#xHH;), self-closing tags. Line ends are
 // read as XML says (CR LF and CR become LF) and in attribute values each
 // literal tab or line break becomes a space (3.3.3); other white space is
@@ -23,9 +22,28 @@
 //   xml_parse(text) -> XmlNode   lenient: malformed parts are skipped or
 //                                kept as text (unquoted attribute values
 //                                are read)
-// Not supported: validation against a DTD, external entities, parameter
-// entities, attribute defaults from a DTD, namespaces (a prefixed name is
-// kept whole, "a:b"), encodings other than UTF-8.
+//   xml_load_with(text, opts)    xml_load with XmlOptions (xml_options()
+//                                gives the defaults, all off): namespace
+//                                errors, validation, external entities
+//
+// The DTD: <!ENTITY> (general and parameter, internal and external, NDATA
+// unparsed ones), <!ELEMENT> (EMPTY, ANY, mixed, content models with
+// , | ? * +), <!ATTLIST> (every type, #REQUIRED #IMPLIED #FIXED and
+// defaults), <!NOTATION> (skipped), comments and PIs. Every parse adds
+// declared attribute defaults and normalizes the values of attributes not
+// declared CDATA (3.3). An entity's replacement text is read as content
+// where it is referenced, so it may hold elements (4.4); a reference to
+// itself and more than 8 MB of expansion (an entity bomb) are errors.
+// External entities and the external subset are read only with
+// opts.external, through opts.resolver (no file or network access of its
+// own); without it an external entity referenced in text is skipped.
+// Namespaces (XML Namespaces 1.0): every parse fills XmlNode.ns, .local
+// and .attr_ns from the xmlns declarations in scope; opts.namespaces makes
+// an unbound prefix and the other namespace constraints errors. The tag
+// stays the qualified name ("a:b").
+// Not supported: parameter-entity references inside a declaration (in an
+// external subset), encodings other than UTF-8, the standalone and
+// deterministic-content-model constraints.
 //
 // Attributes are parallel vecs (names/values) on each XmlNode.
 //
@@ -49,11 +67,19 @@ pub struct XmlNode {
     pub attr_vals: Vec<str>,
     pub text: str,
     pub children: Vec<XmlNode>,
+    // Namespaces (XML Namespaces 1.0), filled by every parse: `ns` is the
+    // namespace name (URI) of the element, "" for none or an unbound
+    // prefix; `local` its name without the prefix; `attr_ns` the namespace
+    // of each attribute, parallel to attr_names ("" for an unprefixed one,
+    // http://www.w3.org/2000/xmlns/ for xmlns declarations).
+    pub ns: str,
+    pub local: str,
+    pub attr_ns: Vec<str>,
 }
 
 fn x_node(tag: str) -> XmlNode {
     return XmlNode {
-        tag: tag, attr_names: Vec::new(), attr_vals: Vec::new(), text: "", children: Vec::new()
+        tag: tag, attr_names: Vec::new(), attr_vals: Vec::new(), text: "", children: Vec::new(), ns: "", local: tag, attr_ns: Vec::new()
     };
 }
 
@@ -167,6 +193,44 @@ pub struct XmlDoc {
     pub root: XmlNode,
 }
 
+/// Options of xml_load_with; xml_options() gives the defaults (all off).
+///   namespaces  XML Namespaces 1.0 errors: an unbound prefix, a name with
+///               two colons, xmlns:p="", the xml and xmlns prefixes and
+///               names misused, two attributes with one expanded name.
+///               (Prefixes are resolved into XmlNode.ns either way.)
+///   validate    validity against the DOCTYPE (XML 1.0 VCs): every element
+///               and attribute declared, content models (EMPTY, ANY, mixed,
+///               children with , | ? * +), #REQUIRED and #FIXED attributes,
+///               enumerations, ID (a name, unique), IDREF(S) (match an ID),
+///               NMTOKEN(S), ENTITY/ENTITIES (unparsed entities), the root
+///               element named by the DOCTYPE
+///   external    load external parsed entities (<!ENTITY e SYSTEM "uri">),
+///               external parameter entities and the external DTD subset
+///               (<!DOCTYPE r SYSTEM "uri">) through `resolver`. Off by
+///               default: nothing is fetched (no XXE), a reference to an
+///               external entity in text is skipped, as XML 1.0 4.4.3
+///               allows a processor that does not read them
+///   resolver    fn(system_id, public_id) -> the entity's text ("" when it
+///               cannot be had: an error)
+pub struct XmlOptions {
+    pub namespaces: bool,
+    pub validate: bool,
+    pub external: bool,
+    pub resolver: fn(str, str) -> str,
+}
+
+fn x_no_resolver(_system_id: str, _public_id: str) -> str {
+    return "";
+}
+
+/// Default options: no namespace errors, no validation, no external
+/// entities.
+pub fn xml_options() -> XmlOptions {
+    return XmlOptions {
+        namespaces: false, validate: false, external: false, resolver: x_no_resolver
+    };
+}
+
 // Parser state.
 struct XP {
     s: str,
@@ -176,8 +240,69 @@ struct XP {
     error: str,
     roots: i64,
     seen_doctype: bool,
+    // general entities: name, replacement text (internal), kind 0 internal,
+    // 1 external parsed (not loaded yet), 2 unparsed, 3 external loaded;
+    // system and public ids
     enames: Vec<str>,
     evals: Vec<str>,
+    ekind: Vec<i64>,
+    esys: Vec<str>,
+    epub: Vec<str>,
+    // parameter entities: kind 0 internal, 1 external
+    pnames: Vec<str>,
+    pvals: Vec<str>,
+    pkind: Vec<i64>,
+    psys: Vec<str>,
+    ppub: Vec<str>,
+    // entities being expanded (a parameter entity as "%name"), bytes
+    // expanded so far, what an error message adds ("in entity &e;")
+    active: Vec<str>,
+    expanded: i64,
+    ctx: str,
+    // an external parameter entity was not read: later ENTITY and ATTLIST
+    // declarations are not processed (XML 1.0 5.1)
+    dtd_skip: bool,
+    ns_check: bool,
+    validate: bool,
+    external: bool,
+    resolver: fn(str, str) -> str,
+    // in-scope namespace declarations, innermost last ("" = default)
+    ns_pre: Vec<str>,
+    ns_uri: Vec<str>,
+    dt_name: str,
+    dt_sys: str,
+    dt_pub: str,
+    // element declarations: kind 0 EMPTY, 1 ANY, 2 mixed (el_mixed holds
+    // "|a|b|"), 3 children (el_cm: the model's root particle)
+    el_names: Vec<str>,
+    el_kind: Vec<i64>,
+    el_cm: Vec<i64>,
+    el_mixed: Vec<str>,
+    el_model: Vec<str>,
+    // content-model particles: kind 0 name, 1 sequence, 2 choice; quant 0
+    // once, 1 ?, 2 *, 3 +; the children of particle k are cm_list[cm_first[k]
+    // .. + cm_count[k]]; cm_out: the particle x_cp just read
+    cm_kind: Vec<i64>,
+    cm_name: Vec<str>,
+    cm_quant: Vec<i64>,
+    cm_first: Vec<i64>,
+    cm_count: Vec<i64>,
+    cm_list: Vec<i64>,
+    cm_out: i64,
+    // attribute declarations: element, name, type (CDATA ID IDREF IDREFS
+    // ENTITY ENTITIES NMTOKEN NMTOKENS NOTATION ENUM), the allowed values
+    // ("|a|b|"), the default kind (#REQUIRED #IMPLIED #FIXED or "") and
+    // the default value
+    at_elem: Vec<str>,
+    at_name: Vec<str>,
+    at_type: Vec<str>,
+    at_enum: Vec<str>,
+    at_def: Vec<str>,
+    at_val: Vec<str>,
+    // validation: IDs seen, IDREFs to check at the end and where they were
+    ids: Vec<str>,
+    refs: Vec<str>,
+    ref_pos: Vec<i64>,
 }
 
 fn x_is_name_start(c: i64) -> bool {
@@ -242,9 +367,141 @@ fn xp_fail(p: & mut XP, pos: i64, msg: str) -> bool {
             k = k + 1;
         }
         p.ok = false;
-        p.error = "line " + int_to_str(line) + ", column " + int_to_str(col) + ": " + msg;
+        p.error = "line " + int_to_str(line) + ", column " + int_to_str(col) + p.ctx + ": " + msg;
     }
     return true;
+}
+
+fn x_index(v: Vec<str>, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < v.len() {
+        if str_equal(v.get(i), s) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn x_starts(s: str, j: i64, t: str) -> bool {
+    if j < 0 || j + str_len(t) > str_len(s) {
+        return false;
+    }
+    return str_equal(str_slice(s, j, j + str_len(t)), t);
+}
+
+fn x_is_ws(c: i64) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// Index of the quote closing the literal that starts at j, or -1 (also
+// when no quote is at j).
+fn x_quote_end(s: str, j: i64) -> i64 {
+    var q: i64 = x_at(s, j);
+    if q != 34 && q != 39 {
+        return - 1;
+    }
+    var k: i64 = j + 1;
+    while k < str_len(s) && str_byte_at(s, k) != q {
+        k = k + 1;
+    }
+    if k >= str_len(s) {
+        return - 1;
+    }
+    return k;
+}
+
+// Tabs and line breaks as spaces (attribute-value normalization, 3.3.3).
+fn x_ws_to_space(s: str) -> str {
+    if !str_contains(s, "\t") && !str_contains(s, "\n") && !str_contains(s, "\r") {
+        return s;
+    }
+    return str_replace(str_replace(str_replace(s, "\t", " "), "\n", " "), "\r", " ");
+}
+
+// The further normalization of a value whose declared type is not CDATA:
+// no leading or trailing spaces, one space between tokens.
+fn x_collapse(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    var pend: bool = false;
+    var run: i64 = - 1;
+    while i < n {
+        if str_byte_at(s, i) == 32 {
+            if run >= 0 {
+                if pend {
+                    out = out + " ";
+                }
+                out = out + str_slice(s, run, i);
+                pend = true;
+                run = - 1;
+            }
+        } else if run < 0 {
+            run = i;
+        }
+        i = i + 1;
+    }
+    if run >= 0 {
+        if pend {
+            out = out + " ";
+        }
+        out = out + str_slice(s, run, n);
+    }
+    return out;
+}
+
+fn x_is_name(s: str) -> bool {
+    return str_len(s) > 0 && x_name(s, 0) == str_len(s);
+}
+
+fn x_is_nmtoken(s: str) -> bool {
+    if str_len(s) == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if !x_is_name_char(str_byte_at(s, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The code point of a character reference's body ("#65", "#x41"), or -1
+// when it is malformed.
+fn x_charref(ent: str) -> i64 {
+    var hex: bool = str_len(ent) > 1 && str_byte_at(ent, 1) == 120;
+    var k: i64 = 1;
+    if hex {
+        k = 2;
+    }
+    if k >= str_len(ent) {
+        return - 1;
+    }
+    var cp: i64 = 0;
+    while k < str_len(ent) {
+        var d: i64 = str_byte_at(ent, k);
+        var v: i64 = - 1;
+        if d >= 48 && d <= 57 {
+            v = d - 48;
+        } else if hex && d >= 97 && d <= 102 {
+            v = d - 87;
+        } else if hex && d >= 65 && d <= 70 {
+            v = d - 55;
+        }
+        if v < 0 || cp > 1114111 {
+            return - 1;
+        }
+        if hex {
+            cp = cp * 16 + v;
+        } else {
+            cp = cp * 10 + v;
+        }
+        k = k + 1;
+    }
+    return cp;
 }
 
 // Is `cp` a character XML 1.0 allows?
@@ -261,10 +518,71 @@ fn x_char_ok(cp: i64) -> bool {
     return cp >= 65536 && cp <= 1114111;
 }
 
-// Decode character data or an attribute value (raw text from `pos` in the
-// source): references are replaced; in strict mode a bare '&', an unknown
-// entity or a reference to a character XML forbids is an error.
+// Part of the DTD was not read: an external subset or an external
+// parameter entity without opts.external.
+fn xp_dtd_unread(p: & mut XP) -> bool {
+    return p.dtd_skip || (str_len(p.dt_sys) > 0 && !p.external);
+}
+
+// The most text entity references may expand to in one document.
+const X_EXPAND_MAX: i64 = 8388608;
+
+// Character data decoded (see xp_decode_in).
 fn xp_decode(p: & mut XP, raw: str, pos: i64) -> str {
+    return xp_decode_in(p, raw, pos, false);
+}
+
+// The replacement text of the general entity enames[e], referred to at
+// `pos`, as decoded text: in an attribute value (`attr`) its literal tabs
+// and line breaks become spaces and it must not hold '<' or come from an
+// external or unparsed entity; references in it are expanded in turn (one
+// that refers back to itself is an error).
+fn xp_entity_text(p: & mut XP, e: i64, pos: i64, attr: bool) -> str {
+    var name: str = p.enames.get(e);
+    var kind: i64 = p.ekind.get(e);
+    if kind == 2 {
+        xp_fail(p, pos, "&" + name + "; is an unparsed entity: only an ENTITY attribute can name it");
+        return "";
+    }
+    if kind == 1 || kind == 3 {
+        if attr {
+            xp_fail(p, pos, "the external entity &" + name + "; cannot be used in an attribute value");
+        }
+        return "";
+    }
+    var v: str = p.evals.get(e);
+    if attr && str_contains(v, "<") {
+        xp_fail(p, pos, "'<' in the replacement text of &" + name + "; used in an attribute value");
+        return "";
+    }
+    if attr {
+        v = x_ws_to_space(v);
+    }
+    if str_contains(v, "&") {
+        if x_index(p.active, name) >= 0 {
+            xp_fail(p, pos, "entity &" + name + "; refers to itself");
+            return "";
+        }
+        if p.active.len() >= 64 {
+            xp_fail(p, pos, "entities nested too deeply");
+            return "";
+        }
+        p.active.push(name);
+        v = xp_decode_in(p, v, pos, attr);
+        p.active.pop();
+    }
+    p.expanded = p.expanded + str_len(v);
+    if p.expanded > X_EXPAND_MAX {
+        xp_fail(p, pos, "entity expansion passed 8 MB (an entity bomb?)");
+        return "";
+    }
+    return v;
+}
+
+// Decode character data or an attribute value (`attr`; raw text from `pos`
+// in the source): references are replaced; in strict mode a bare '&', an
+// unknown entity or a reference to a character XML forbids is an error.
+fn xp_decode_in(p: & mut XP, raw: str, pos: i64, attr: bool) -> str {
     if !p.strict && p.enames.len() == 0 {
         return xml_unescape(raw);
     }
@@ -345,12 +663,18 @@ fn xp_decode(p: & mut XP, raw: str, pos: i64) -> str {
                 rep = x_utf8(cp);
             }
         } else {
-            var e: i64 = p.enames.len() - 1;
-            while e >= 0 && !str_equal(p.enames.get(e), ent) {
-                e = e - 1;
-            }
+            // the first declaration of a name is the one that counts
+            var e: i64 = x_index(p.enames, ent);
             if e >= 0 {
-                rep = p.evals.get(e);
+                rep = xp_entity_text(p, e, pos + i, attr);
+                if !p.ok {
+                    return out;
+                }
+            } else if xp_dtd_unread(p) && !p.validate && x_is_name(ent) {
+                // it may be declared in the part of the DTD that was not
+                // read: not a well-formedness error (4.1 "Entity
+                // Declared"), the reference is skipped
+                rep = "";
             } else {
                 ok = false;
             }
@@ -434,7 +758,7 @@ fn x_attrs(p: & mut XP, i: i64, node: & mut XmlNode) -> i64 {
                     // attribute-value normalization (XML 1.0 3.3.3): each
                     // literal tab or line break becomes a space
                     raw = str_replace(str_replace(raw, "\t", " "), "\n", " ");
-                    aval = xp_decode(p, raw, j + 1);
+                    aval = xp_decode_in(p, raw, j + 1, true);
                     j = close + 1;
                 } else {
                     if xp_fail(p, j, "attribute values must be quoted") {
@@ -501,9 +825,11 @@ fn x_skip_until(s: str, i: i64, term: str) -> i64 {
     return k + str_len(term);
 }
 
-// A DOCTYPE declaration at i ("<!DOCTYPE"): its end, after reading the
-// internal subset's general entities (<!ENTITY name "value">).
-fn x_doctype(p: & mut XP, i: i64) -> i64 {
+// ─── DTD ────────────────────────────────────────────────────────────────
+
+// The end of the DOCTYPE at i, found by brackets and quotes alone (the
+// lenient parser's way past a DOCTYPE it could not read).
+fn x_doctype_end(p: & mut XP, i: i64) -> i64 {
     var s: str = p.s;
     var n: i64 = p.n;
     var j: i64 = i + 9;
@@ -521,35 +847,1395 @@ fn x_doctype(p: & mut XP, i: i64) -> i64 {
             depth = depth + 1;
         } else if c == 93 {
             depth = depth - 1;
-        } else if c == 60 && depth > 0 && str_equal(str_slice(s, j, j + 8), "<!ENTITY") {
-            // <!ENTITY name "value"> (a parameter entity, "%", is skipped)
-            var k: i64 = x_ws(s, j + 8);
-            var e: i64 = x_name(s, k);
-            if e > 0 {
-                var name: str = str_slice(s, k, e);
-                var v: i64 = x_ws(s, e);
-                var vq: i64 = x_at(s, v);
-                if vq == 34 || vq == 39 {
-                    var ve: i64 = v + 1;
-                    while ve < n && str_byte_at(s, ve) != vq {
-                        ve = ve + 1;
-                    }
-                    p.enames.push(name);
-                    p.evals.push(xp_decode(p, str_slice(s, v + 1, ve), v + 1));
-                    j = ve;
-                }
-            }
-        } else if c == 60 && depth > 0 && str_equal(str_slice(s, j, j + 4), "<!--") {
+        } else if c == 60 && depth > 0 && x_starts(s, j, "<!--") {
             j = x_skip_until(s, j + 4, "-->") - 1;
         } else if c == 62 && depth == 0 {
             return j + 1;
         }
         j = j + 1;
     }
-    if xp_fail(p, i, "unterminated DOCTYPE") {
-        return n;
+    xp_fail(p, i, "unterminated DOCTYPE");
+    return n;
+}
+
+// The '>' ending the declaration at j (outside quoted literals), or -1.
+fn x_decl_end(s: str, j: i64) -> i64 {
+    var k: i64 = j;
+    var q: i64 = 0;
+    while k < str_len(s) {
+        var c: i64 = str_byte_at(s, k);
+        if q != 0 {
+            if c == q {
+                q = 0;
+            }
+        } else if c == 34 || c == 39 {
+            q = c;
+        } else if c == 62 {
+            return k;
+        }
+        k = k + 1;
+    }
+    return - 1;
+}
+
+// Past a declaration that could not be read (lenient), or the end.
+fn x_decl_skip(p: & mut XP, j: i64) -> i64 {
+    var e: i64 = x_decl_end(p.s, j);
+    if e < 0 {
+        xp_fail(p, j, "unterminated declaration");
+        return p.n;
+    }
+    return e + 1;
+}
+
+// A DOCTYPE declaration at i ("<!DOCTYPE"): the root element's name, the
+// external id, the internal subset's declarations (x_subset), then with
+// opts.external the external subset (after: the internal subset's
+// declarations come first and win). Returns the position after it.
+fn x_doctype(p: & mut XP, i: i64) -> i64 {
+    var s: str = p.s;
+    var n: i64 = p.n;
+    var j: i64 = i + 9;
+    if !x_is_ws(x_at(s, j)) {
+        if xp_fail(p, j, "expected white space after <!DOCTYPE") {
+            return n;
+        }
+    }
+    j = x_ws(s, j);
+    var e: i64 = x_name(s, j);
+    if e == 0 {
+        if xp_fail(p, j, "the DOCTYPE needs the root element's name") {
+            return n;
+        }
+        return x_doctype_end(p, i);
+    }
+    p.dt_name = str_slice(s, j, e);
+    j = x_ws(s, e);
+    if x_starts(s, j, "SYSTEM") || x_starts(s, j, "PUBLIC") {
+        var ids: Vec<str> = Vec::new();
+        j = x_external_id(p, j, & mut ids);
+        if j < 0 {
+            if !p.ok {
+                return n;
+            }
+            return x_doctype_end(p, i);
+        }
+        p.dt_pub = ids.get(0);
+        p.dt_sys = ids.get(1);
+        j = x_ws(s, j);
+    }
+    if x_at(s, j) == 91 {
+        j = x_subset(p, j + 1, false);
+        if !p.ok {
+            return n;
+        }
+        j = x_ws(s, j);
+    }
+    if x_at(s, j) != 62 {
+        if xp_fail(p, j, "expected '>' to end the DOCTYPE") {
+            return n;
+        }
+        return x_doctype_end(p, i);
+    }
+    if p.external && str_len(p.dt_sys) > 0 && !p.dtd_skip {
+        var text: str = xp_fetch(p, p.dt_sys, p.dt_pub, i, "the external DTD subset");
+        if p.ok && str_len(text) > 0 {
+            var save_s: str = p.s;
+            var save_n: i64 = p.n;
+            var save_ctx: str = p.ctx;
+            p.s = text;
+            p.n = str_len(text);
+            p.ctx = save_ctx + " of the external DTD subset " + p.dt_sys;
+            x_subset(p, 0, true);
+            p.s = save_s;
+            p.n = save_n;
+            p.ctx = save_ctx;
+        }
+    }
+    return j + 1;
+}
+
+// SYSTEM "sys" or PUBLIC "pub" "sys" at j0: [pub, sys] into `out`; the
+// position after it, or -1.
+fn x_external_id(p: & mut XP, j0: i64, out: & mut Vec<str>) -> i64 {
+    var s: str = p.s;
+    var j: i64 = j0;
+    var is_pub: bool = x_starts(s, j, "PUBLIC");
+    if !is_pub && !x_starts(s, j, "SYSTEM") {
+        xp_fail(p, j, "expected a quoted value, SYSTEM or PUBLIC");
+        return - 1;
+    }
+    j = x_ws(s, j + 6);
+    var pubid: str = "";
+    if is_pub {
+        var pe: i64 = x_quote_end(s, j);
+        if pe < 0 {
+            xp_fail(p, j, "expected a quoted public identifier");
+            return - 1;
+        }
+        pubid = str_slice(s, j + 1, pe);
+        j = x_ws(s, pe + 1);
+    }
+    var se: i64 = x_quote_end(s, j);
+    if se < 0 {
+        xp_fail(p, j, "expected a quoted system identifier");
+        return - 1;
+    }
+    out.push(pubid);
+    out.push(str_slice(s, j + 1, se));
+    return se + 1;
+}
+
+// The text of an external entity (`what`, for messages) through the
+// resolver: line ends read as XML reads them, a byte order mark and a text
+// declaration (<?xml encoding=".."?>) taken off. "" and an error when the
+// resolver has nothing.
+fn xp_fetch(p: & mut XP, sys: str, pubid: str, pos: i64, what: str) -> str {
+    val resolve: fn(str, str) -> str = p.resolver;
+    var text: str = resolve(sys, pubid);
+    if str_len(text) == 0 {
+        xp_fail(p, pos, what + " (" + sys + ") could not be loaded: the resolver gave no text");
+        return "";
+    }
+    text = x_newlines(text);
+    if str_len(text) >= 3 && str_byte_at(text, 0) == 239 && str_byte_at(text, 1) == 187 && str_byte_at(text, 2) == 191 {
+        text = str_slice(text, 3, str_len(text));
+    }
+    if x_starts(text, 0, "<?xml") && x_is_ws(x_at(text, 5)) {
+        var e: i64 = x_find_from(text, 0, "?>");
+        if e < 0 {
+            xp_fail(p, pos, "unterminated text declaration in " + what);
+            return "";
+        }
+        text = str_slice(text, e + 2, str_len(text));
+    }
+    return text;
+}
+
+// Past the IGNORE section whose content starts at k (nested ones too).
+fn x_skip_ignore(s: str, k0: i64) -> i64 {
+    var k: i64 = k0;
+    var depth: i64 = 1;
+    while k < str_len(s) {
+        if x_starts(s, k, "<![") {
+            depth = depth + 1;
+            k = k + 3;
+        } else if x_starts(s, k, "]]>") {
+            depth = depth - 1;
+            k = k + 3;
+            if depth == 0 {
+                return k;
+            }
+        } else {
+            k = k + 1;
+        }
+    }
+    return str_len(s);
+}
+
+// The declarations of a DTD subset from j0 in p.s: the internal subset up
+// to its ']' (returns the position after it), or (`ext`) a whole external
+// subset or parameter entity text, with INCLUDE/IGNORE sections (returns
+// p.n). A parameter-entity reference between declarations is read in
+// place; inside a declaration one is not supported.
+fn x_subset(p: & mut XP, j0: i64, ext: bool) -> i64 {
+    var s: str = p.s;
+    var n: i64 = p.n;
+    var j: i64 = j0;
+    var incl: i64 = 0;
+    while p.ok {
+        j = x_ws(s, j);
+        if j >= n {
+            if ext && incl == 0 {
+                return n;
+            }
+            xp_fail(p, j, "unterminated DTD (internal subset or conditional section)");
+            return n;
+        }
+        var c: i64 = str_byte_at(s, j);
+        if c == 93 && !ext {
+            return j + 1;
+        }
+        if ext && incl > 0 && x_starts(s, j, "]]>") {
+            incl = incl - 1;
+            j = j + 3;
+            continue;
+        }
+        if x_starts(s, j, "<!--") {
+            var ce: i64 = x_find_from(s, j + 4, "-->");
+            if ce < 0 {
+                xp_fail(p, j, "unterminated comment");
+                return n;
+            }
+            j = ce + 3;
+            continue;
+        }
+        if x_starts(s, j, "<?") {
+            var pe: i64 = x_find_from(s, j + 2, "?>");
+            if pe < 0 {
+                xp_fail(p, j, "unterminated processing instruction");
+                return n;
+            }
+            j = pe + 2;
+            continue;
+        }
+        if x_starts(s, j, "<!ENTITY") {
+            j = x_decl_entity(p, j);
+            continue;
+        }
+        if x_starts(s, j, "<!ELEMENT") {
+            j = x_decl_element(p, j);
+            continue;
+        }
+        if x_starts(s, j, "<!ATTLIST") {
+            j = x_decl_attlist(p, j);
+            continue;
+        }
+        if x_starts(s, j, "<!NOTATION") {
+            j = x_decl_skip(p, j);
+            continue;
+        }
+        if ext && x_starts(s, j, "<![") {
+            var k: i64 = x_ws(s, j + 3);
+            if x_starts(s, k, "INCLUDE") && x_at(s, x_ws(s, k + 7)) == 91 {
+                incl = incl + 1;
+                j = x_ws(s, k + 7) + 1;
+                continue;
+            }
+            if x_starts(s, k, "IGNORE") && x_at(s, x_ws(s, k + 6)) == 91 {
+                j = x_skip_ignore(s, x_ws(s, k + 6) + 1);
+                continue;
+            }
+            xp_fail(p, j, "malformed conditional section");
+            return n;
+        }
+        if c == 37 {
+            j = x_pe_ref(p, j);
+            continue;
+        }
+        if xp_fail(p, j, "unknown markup in the DTD") {
+            return n;
+        }
+        var de: i64 = x_decl_end(s, j);
+        if de < 0 {
+            return n;
+        }
+        j = de + 1;
     }
     return n;
+}
+
+// A parameter-entity reference "%name;" at j between declarations: its
+// text read as declarations. An external one is read only with
+// opts.external; otherwise later ENTITY and ATTLIST declarations are not
+// processed (XML 1.0 5.1). Returns the position after the ';'.
+fn x_pe_ref(p: & mut XP, j: i64) -> i64 {
+    var s: str = p.s;
+    var e: i64 = x_name(s, j + 1);
+    if e == 0 || x_at(s, e) != 59 {
+        xp_fail(p, j, "a '%' in the DTD must start a parameter entity reference (%name;)");
+        return j + 1;
+    }
+    var name: str = str_slice(s, j + 1, e);
+    var pi: i64 = x_index(p.pnames, name);
+    if pi < 0 {
+        xp_fail(p, j, "unknown parameter entity %" + name + ";");
+        return e + 1;
+    }
+    if x_index(p.active, "%" + name) >= 0 {
+        xp_fail(p, j, "parameter entity %" + name + "; refers to itself");
+        return e + 1;
+    }
+    if p.active.len() >= 64 {
+        xp_fail(p, j, "entities nested too deeply");
+        return e + 1;
+    }
+    var text: str = "";
+    if p.pkind.get(pi) == 1 {
+        if !p.external {
+            p.dtd_skip = true;
+            return e + 1;
+        }
+        text = xp_fetch(p, p.psys.get(pi), p.ppub.get(pi), j, "parameter entity %" + name + ";");
+        if !p.ok {
+            return e + 1;
+        }
+    } else {
+        text = p.pvals.get(pi);
+    }
+    p.expanded = p.expanded + str_len(text);
+    if p.expanded > X_EXPAND_MAX {
+        xp_fail(p, j, "entity expansion passed 8 MB (an entity bomb?)");
+        return e + 1;
+    }
+    var save_s: str = p.s;
+    var save_n: i64 = p.n;
+    var save_ctx: str = p.ctx;
+    p.s = text;
+    p.n = str_len(text);
+    p.ctx = save_ctx + " in parameter entity %" + name + ";";
+    p.active.push("%" + name);
+    x_subset(p, 0, true);
+    p.active.pop();
+    p.s = save_s;
+    p.n = save_n;
+    p.ctx = save_ctx;
+    return e + 1;
+}
+
+// An entity value literal's text (from `pos`) as the replacement text:
+// character references replaced, general entity references kept (they
+// are expanded where the entity is used, 4.5); a '%' (a parameter entity
+// reference: not allowed in the internal subset, not supported in an
+// external one) and a bare '&' are errors.
+fn x_entity_value(p: & mut XP, raw: str, pos: i64) -> str {
+    var out: str = "";
+    var run: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = str_len(raw);
+    while i < n {
+        var c: i64 = str_byte_at(raw, i);
+        if c == 37 {
+            if xp_fail(p, pos + i, "a parameter entity reference (%) in an entity value is not supported") {
+                return out;
+            }
+        }
+        if c != 38 {
+            i = i + 1;
+            continue;
+        }
+        if x_at(raw, i + 1) == 35 {
+            var semi: i64 = i + 2;
+            while semi < n && str_byte_at(raw, semi) != 59 && semi - i < 12 {
+                semi = semi + 1;
+            }
+            var cp: i64 = - 1;
+            if x_at(raw, semi) == 59 {
+                cp = x_charref(str_slice(raw, i + 1, semi));
+            }
+            if cp < 0 || !x_char_ok(cp) {
+                if xp_fail(p, pos + i, "malformed character reference in an entity value") {
+                    return out;
+                }
+                i = i + 1;
+                continue;
+            }
+            out = out + str_slice(raw, run, i);
+            out = out + x_utf8(cp);
+            i = semi + 1;
+            run = i;
+            continue;
+        }
+        var e: i64 = x_name(raw, i + 1);
+        if e == 0 || x_at(raw, e) != 59 {
+            if xp_fail(p, pos + i, "a bare '&' in an entity value (write &amp;)") {
+                return out;
+            }
+            i = i + 1;
+            continue;
+        }
+        i = e + 1;
+    }
+    return out + str_slice(raw, run, n);
+}
+
+fn x_predefined(name: str) -> bool {
+    return str_equal(name, "amp") || str_equal(name, "lt") || str_equal(name, "gt") || str_equal(name, "quot") || str_equal(name, "apos");
+}
+
+// <!ENTITY [%] name ("value" | SYSTEM "sys" | PUBLIC "pub" "sys" [NDATA n])>
+// at j0: recorded unless the name is declared already (the first
+// declaration counts); returns the position after it.
+fn x_decl_entity(p: & mut XP, j0: i64) -> i64 {
+    var s: str = p.s;
+    var j: i64 = j0 + 8;
+    if !x_is_ws(x_at(s, j)) {
+        if xp_fail(p, j, "expected white space after <!ENTITY") {
+            return p.n;
+        }
+    }
+    j = x_ws(s, j);
+    var pe: bool = false;
+    if x_at(s, j) == 37 {
+        pe = true;
+        j = x_ws(s, j + 1);
+    }
+    var e: i64 = x_name(s, j);
+    if e == 0 {
+        if xp_fail(p, j, "an entity declaration needs a name") {
+            return p.n;
+        }
+        return x_decl_skip(p, j0);
+    }
+    var name: str = str_slice(s, j, e);
+    j = x_ws(s, e);
+    var value: str = "";
+    var kind: i64 = 0;
+    var sys: str = "";
+    var pubid: str = "";
+    var q: i64 = x_at(s, j);
+    if q == 34 || q == 39 {
+        var ve: i64 = x_quote_end(s, j);
+        if ve < 0 {
+            xp_fail(p, j, "unterminated entity value");
+            return p.n;
+        }
+        value = x_entity_value(p, str_slice(s, j + 1, ve), j + 1);
+        j = ve + 1;
+    } else {
+        var ids: Vec<str> = Vec::new();
+        var k: i64 = x_external_id(p, j, & mut ids);
+        if k < 0 {
+            if !p.ok {
+                return p.n;
+            }
+            return x_decl_skip(p, j0);
+        }
+        kind = 1;
+        pubid = ids.get(0);
+        sys = ids.get(1);
+        j = k;
+        var k2: i64 = x_ws(s, j);
+        if x_starts(s, k2, "NDATA") {
+            if pe {
+                if xp_fail(p, k2, "a parameter entity cannot be unparsed (NDATA)") {
+                    return p.n;
+                }
+            }
+            var k3: i64 = x_ws(s, k2 + 5);
+            var ne: i64 = x_name(s, k3);
+            if ne == 0 {
+                if xp_fail(p, k3, "NDATA needs a notation name") {
+                    return p.n;
+                }
+                return x_decl_skip(p, j0);
+            }
+            kind = 2;
+            j = ne;
+        }
+    }
+    j = x_ws(s, j);
+    if x_at(s, j) != 62 {
+        if xp_fail(p, j, "expected '>' to end the entity declaration") {
+            return p.n;
+        }
+        return x_decl_skip(p, j0);
+    }
+    if !p.dtd_skip {
+        if pe {
+            if x_index(p.pnames, name) < 0 {
+                p.pnames.push(name);
+                p.pvals.push(value);
+                p.pkind.push(kind);
+                p.psys.push(sys);
+                p.ppub.push(pubid);
+            }
+        } else if !x_predefined(name) && x_index(p.enames, name) < 0 {
+            p.enames.push(name);
+            p.evals.push(value);
+            p.ekind.push(kind);
+            p.esys.push(sys);
+            p.epub.push(pubid);
+        }
+    }
+    return j + 1;
+}
+
+// A content particle at j0: a name or a parenthesised sequence (a, b) or
+// choice (a | b), then ?, * or +. Its index goes to p.cm_out; returns the
+// position after it, or -1 when it is malformed.
+fn x_cp(p: & mut XP, j0: i64, depth: i64) -> i64 {
+    var s: str = p.s;
+    var j: i64 = x_ws(s, j0);
+    var kind: i64 = 0;
+    var name: str = "";
+    var kids: Vec<i64> = Vec::new();
+    if depth > 200 {
+        // a model nested this deep is malformed input, not a DTD
+        return - 1;
+    }
+    if x_at(s, j) == 40 {
+        j = j + 1;
+        var sep: i64 = 0;
+        while true {
+            j = x_cp(p, j, depth + 1);
+            if j < 0 {
+                return - 1;
+            }
+            kids.push(p.cm_out);
+            j = x_ws(s, j);
+            var c: i64 = x_at(s, j);
+            if c == 41 {
+                j = j + 1;
+                break;
+            }
+            if (c == 44 || c == 124) && (sep == 0 || sep == c) {
+                sep = c;
+                j = j + 1;
+                continue;
+            }
+            return - 1;
+        }
+        kind = 1;
+        if sep == 124 {
+            kind = 2;
+        }
+    } else {
+        var e: i64 = x_name(s, j);
+        if e == 0 {
+            return - 1;
+        }
+        name = str_slice(s, j, e);
+        j = e;
+    }
+    var quant: i64 = 0;
+    var qc: i64 = x_at(s, j);
+    if qc == 63 {
+        quant = 1;
+    } else if qc == 42 {
+        quant = 2;
+    } else if qc == 43 {
+        quant = 3;
+    }
+    if quant > 0 {
+        j = j + 1;
+    }
+    var idx: i64 = p.cm_kind.len();
+    p.cm_kind.push(kind);
+    p.cm_name.push(name);
+    p.cm_quant.push(quant);
+    p.cm_first.push(p.cm_list.len());
+    p.cm_count.push(kids.len());
+    var k: i64 = 0;
+    while k < kids.len() {
+        p.cm_list.push(kids.get(k));
+        k = k + 1;
+    }
+    p.cm_out = idx;
+    return j;
+}
+
+// <!ELEMENT name (EMPTY | ANY | (#PCDATA | a)* | children model)> at j0.
+fn x_decl_element(p: & mut XP, j0: i64) -> i64 {
+    var s: str = p.s;
+    var j: i64 = j0 + 9;
+    if !x_is_ws(x_at(s, j)) {
+        if xp_fail(p, j, "expected white space after <!ELEMENT") {
+            return p.n;
+        }
+    }
+    j = x_ws(s, j);
+    var e: i64 = x_name(s, j);
+    if e == 0 {
+        if xp_fail(p, j, "an element declaration needs a name") {
+            return p.n;
+        }
+        return x_decl_skip(p, j0);
+    }
+    var name: str = str_slice(s, j, e);
+    j = x_ws(s, e);
+    var mstart: i64 = j;
+    var kind: i64 = 0;
+    var cm: i64 = - 1;
+    var mixed: str = "";
+    if x_starts(s, j, "EMPTY") {
+        j = j + 5;
+    } else if x_starts(s, j, "ANY") {
+        kind = 1;
+        j = j + 3;
+    } else if x_at(s, j) == 40 && x_starts(s, x_ws(s, j + 1), "#PCDATA") {
+        kind = 2;
+        var k: i64 = x_ws(s, j + 1) + 7;
+        mixed = "|";
+        var cnt: i64 = 0;
+        while true {
+            k = x_ws(s, k);
+            var c: i64 = x_at(s, k);
+            if c == 41 {
+                k = k + 1;
+                if x_at(s, k) == 42 {
+                    k = k + 1;
+                } else if cnt > 0 {
+                    if xp_fail(p, k, "mixed content naming elements must end with ')*'") {
+                        return p.n;
+                    }
+                }
+                break;
+            }
+            if c == 124 {
+                k = x_ws(s, k + 1);
+                var ne: i64 = x_name(s, k);
+                if ne == 0 {
+                    if xp_fail(p, k, "expected an element name in mixed content") {
+                        return p.n;
+                    }
+                    return x_decl_skip(p, j0);
+                }
+                var nm: str = str_slice(s, k, ne);
+                if p.validate && str_contains(mixed, "|" + nm + "|") {
+                    if xp_fail(p, k, "<" + nm + "> appears twice in the mixed content of <" + name + ">") {
+                        return p.n;
+                    }
+                }
+                mixed = mixed + nm + "|";
+                cnt = cnt + 1;
+                k = ne;
+                continue;
+            }
+            if xp_fail(p, k, "malformed mixed content model") {
+                return p.n;
+            }
+            return x_decl_skip(p, j0);
+        }
+        j = k;
+    } else if x_at(s, j) == 40 {
+        kind = 3;
+        var r: i64 = x_cp(p, j, 0);
+        if r < 0 {
+            if xp_fail(p, j, "malformed content model of <" + name + ">") {
+                return p.n;
+            }
+            return x_decl_skip(p, j0);
+        }
+        cm = p.cm_out;
+        j = r;
+    } else {
+        if xp_fail(p, j, "expected EMPTY, ANY or a content model") {
+            return p.n;
+        }
+        return x_decl_skip(p, j0);
+    }
+    var model: str = str_slice(s, mstart, j);
+    j = x_ws(s, j);
+    if x_at(s, j) != 62 {
+        if xp_fail(p, j, "expected '>' to end the element declaration") {
+            return p.n;
+        }
+        return x_decl_skip(p, j0);
+    }
+    if x_index(p.el_names, name) >= 0 {
+        if p.validate {
+            xp_fail(p, j0, "element type <" + name + "> is declared twice");
+        }
+        return j + 1;
+    }
+    p.el_names.push(name);
+    p.el_kind.push(kind);
+    p.el_cm.push(cm);
+    p.el_mixed.push(mixed);
+    p.el_model.push(model);
+    return j + 1;
+}
+
+// <!ATTLIST element (name type default)*> at j0.
+fn x_decl_attlist(p: & mut XP, j0: i64) -> i64 {
+    var s: str = p.s;
+    var j: i64 = j0 + 9;
+    if !x_is_ws(x_at(s, j)) {
+        if xp_fail(p, j, "expected white space after <!ATTLIST") {
+            return p.n;
+        }
+    }
+    j = x_ws(s, j);
+    var e: i64 = x_name(s, j);
+    if e == 0 {
+        if xp_fail(p, j, "an attribute-list declaration needs an element name") {
+            return p.n;
+        }
+        return x_decl_skip(p, j0);
+    }
+    var elem: str = str_slice(s, j, e);
+    j = e;
+    while p.ok {
+        var j2: i64 = x_ws(s, j);
+        if x_at(s, j2) == 62 {
+            return j2 + 1;
+        }
+        var an_end: i64 = x_name(s, j2);
+        if j2 == j || an_end == 0 {
+            if xp_fail(p, j2, "expected an attribute definition or '>'") {
+                return p.n;
+            }
+            return x_decl_skip(p, j0);
+        }
+        var aname: str = str_slice(s, j2, an_end);
+        j = x_ws(s, an_end);
+        // the type
+        var ty: str = "";
+        var en: str = "";
+        if x_at(s, j) == 40 {
+            ty = "ENUM";
+        } else {
+            var te: i64 = x_name(s, j);
+            if te > 0 {
+                ty = str_slice(s, j, te);
+                j = te;
+            }
+            if str_equal(ty, "NOTATION") {
+                j = x_ws(s, j);
+            }
+        }
+        if str_equal(ty, "ENUM") || str_equal(ty, "NOTATION") {
+            if x_at(s, j) != 40 {
+                if xp_fail(p, j, "expected '(' and the allowed values") {
+                    return p.n;
+                }
+                return x_decl_skip(p, j0);
+            }
+            en = "|";
+            j = j + 1;
+            while true {
+                j = x_ws(s, j);
+                var t0: i64 = j;
+                while j < p.n && x_is_name_char(str_byte_at(s, j)) {
+                    j = j + 1;
+                }
+                if j == t0 {
+                    if xp_fail(p, j, "expected a value in the list") {
+                        return p.n;
+                    }
+                    return x_decl_skip(p, j0);
+                }
+                en = en + str_slice(s, t0, j) + "|";
+                j = x_ws(s, j);
+                if x_at(s, j) == 124 {
+                    j = j + 1;
+                    continue;
+                }
+                if x_at(s, j) == 41 {
+                    j = j + 1;
+                    break;
+                }
+                if xp_fail(p, j, "expected '|' or ')' in the list of values") {
+                    return p.n;
+                }
+                return x_decl_skip(p, j0);
+            }
+        } else if !(str_equal(ty, "CDATA") || str_equal(ty, "ID") || str_equal(ty, "IDREF") || str_equal(ty, "IDREFS") || str_equal(ty, "ENTITY") || str_equal(ty, "ENTITIES") || str_equal(ty, "NMTOKEN") || str_equal(ty, "NMTOKENS")) {
+            if xp_fail(p, j, "unknown attribute type '" + ty + "'") {
+                return p.n;
+            }
+            return x_decl_skip(p, j0);
+        }
+        // the default
+        j = x_ws(s, j);
+        var def: str = "";
+        var dval: str = "";
+        if x_starts(s, j, "#REQUIRED") {
+            def = "#REQUIRED";
+            j = j + 9;
+        } else if x_starts(s, j, "#IMPLIED") {
+            def = "#IMPLIED";
+            j = j + 8;
+        } else {
+            if x_starts(s, j, "#FIXED") {
+                def = "#FIXED";
+                j = x_ws(s, j + 6);
+            }
+            var ve: i64 = x_quote_end(s, j);
+            if ve < 0 {
+                if xp_fail(p, j, "expected #REQUIRED, #IMPLIED, #FIXED or a quoted default value") {
+                    return p.n;
+                }
+                return x_decl_skip(p, j0);
+            }
+            var raw: str = str_slice(s, j + 1, ve);
+            if str_contains(raw, "<") {
+                if xp_fail(p, j + 1, "'<' in an attribute default") {
+                    return p.n;
+                }
+            }
+            dval = xp_decode_in(p, x_ws_to_space(raw), j + 1, true);
+            if !str_equal(ty, "CDATA") {
+                dval = x_collapse(dval);
+            }
+            if p.validate && str_len(en) > 0 && !str_contains(en, "|" + dval + "|") {
+                if xp_fail(p, j, "the default '" + dval + "' of attribute '" + aname + "' is not one of its values") {
+                    return p.n;
+                }
+            }
+            j = ve + 1;
+        }
+        if !p.dtd_skip && x_attdecl(p, elem, aname) < 0 {
+            if p.validate && str_equal(ty, "ID") {
+                if str_len(def) == 0 || str_equal(def, "#FIXED") {
+                    if xp_fail(p, j0, "the ID attribute '" + aname + "' needs #IMPLIED or #REQUIRED") {
+                        return p.n;
+                    }
+                }
+                var o: i64 = 0;
+                while o < p.at_elem.len() {
+                    if str_equal(p.at_elem.get(o), elem) && str_equal(p.at_type.get(o), "ID") {
+                        if xp_fail(p, j0, "element <" + elem + "> has more than one ID attribute") {
+                            return p.n;
+                        }
+                    }
+                    o = o + 1;
+                }
+            }
+            p.at_elem.push(elem);
+            p.at_name.push(aname);
+            p.at_type.push(ty);
+            p.at_enum.push(en);
+            p.at_def.push(def);
+            p.at_val.push(dval);
+        }
+    }
+    return p.n;
+}
+
+// The attribute declaration of `name` on element `elem`, or -1.
+fn x_attdecl(p: & mut XP, elem: str, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < p.at_elem.len() {
+        if str_equal(p.at_name.get(i), name) && str_equal(p.at_elem.get(i), elem) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// After a start tag: values of attributes declared with a type other than
+// CDATA normalized further, declared defaults added for attributes the tag
+// left out (XML 1.0 3.3.2, which every processor applies).
+fn x_attr_defaults(p: & mut XP, node: & mut XmlNode) {
+    var i: i64 = 0;
+    while i < p.at_elem.len() {
+        if str_equal(p.at_elem.get(i), node.tag) {
+            var an: str = p.at_name.get(i);
+            var idx: i64 = x_index(node.attr_names, an);
+            if idx >= 0 {
+                if !str_equal(p.at_type.get(i), "CDATA") {
+                    node.attr_vals.set(idx, x_collapse(node.attr_vals.get(idx)));
+                }
+            } else {
+                var def: str = p.at_def.get(i);
+                if str_len(def) == 0 || str_equal(def, "#FIXED") {
+                    node.attr_names.push(an);
+                    node.attr_vals.push(p.at_val.get(i));
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// ─── Namespaces ─────────────────────────────────────────────────────────
+
+fn x_xml_ns() -> str {
+    return "http://www.w3.org/XML/1998/namespace";
+}
+
+fn x_xmlns_ns() -> str {
+    return "http://www.w3.org/2000/xmlns/";
+}
+
+// A qualified name: no ':' or one between a prefix and a local name that
+// starts as a name does.
+fn x_qname_ok(name: str) -> bool {
+    var c: i64 = str_find(name, ":");
+    if c < 0 {
+        return true;
+    }
+    if c == 0 || c == str_len(name) - 1 {
+        return false;
+    }
+    if str_find(str_slice(name, c + 1, str_len(name)), ":") >= 0 {
+        return false;
+    }
+    var l0: i64 = str_byte_at(name, c + 1);
+    return x_is_name_start(l0) && l0 != 58 && !(l0 >= 48 && l0 <= 57);
+}
+
+fn x_prefix(name: str) -> str {
+    var c: i64 = str_find(name, ":");
+    if c <= 0 {
+        return "";
+    }
+    return str_slice(name, 0, c);
+}
+
+fn x_local(name: str) -> str {
+    var c: i64 = str_find(name, ":");
+    if c < 0 {
+        return name;
+    }
+    return str_slice(name, c + 1, str_len(name));
+}
+
+// The namespace a prefix is bound to ("" the default one), "" when none.
+fn x_ns_lookup(p: & mut XP, pre: str) -> str {
+    var k: i64 = p.ns_pre.len() - 1;
+    while k >= 0 {
+        if str_equal(p.ns_pre.get(k), pre) {
+            return p.ns_uri.get(k);
+        }
+        k = k - 1;
+    }
+    if str_equal(pre, "xml") {
+        return x_xml_ns();
+    }
+    return "";
+}
+
+// A start tag's namespace declarations come into scope; its name and its
+// attributes' get their namespaces (node.ns, node.local, node.attr_ns).
+// With opts.namespaces the Namespaces 1.0 constraints are errors (at
+// `pos`, the tag). Returns the scope mark for x_ns_close.
+fn x_ns_open(p: & mut XP, node: & mut XmlNode, pos: i64) -> i64 {
+    var mark: i64 = p.ns_pre.len();
+    var na: i64 = node.attr_names.len();
+    var a: i64 = 0;
+    while a < na {
+        var an: str = node.attr_names.get(a);
+        var av: str = node.attr_vals.get(a);
+        if str_equal(an, "xmlns") {
+            if p.ns_check && (str_equal(av, x_xml_ns()) || str_equal(av, x_xmlns_ns())) {
+                xp_fail(p, pos, "the default namespace cannot be " + av);
+                return mark;
+            }
+            p.ns_pre.push("");
+            p.ns_uri.push(av);
+        } else if str_starts_with(an, "xmlns:") {
+            var pre: str = str_slice(an, 6, str_len(an));
+            if p.ns_check {
+                var bad: str = "";
+                if str_equal(pre, "xmlns") {
+                    bad = "the prefix xmlns cannot be declared";
+                } else if str_equal(pre, "xml") && !str_equal(av, x_xml_ns()) {
+                    bad = "the prefix xml can only be bound to " + x_xml_ns();
+                } else if !str_equal(pre, "xml") && str_equal(av, x_xml_ns()) {
+                    bad = "only the prefix xml can be bound to " + av;
+                } else if str_equal(av, x_xmlns_ns()) {
+                    bad = "no prefix can be bound to " + av;
+                } else if str_len(av) == 0 {
+                    bad = "xmlns:" + pre + "=\"\" cannot undeclare a prefix in XML Namespaces 1.0";
+                } else if !x_is_name(pre) || str_contains(pre, ":") {
+                    bad = "'" + pre + "' is not a valid prefix";
+                }
+                if str_len(bad) > 0 {
+                    xp_fail(p, pos, bad);
+                    return mark;
+                }
+            }
+            p.ns_pre.push(pre);
+            p.ns_uri.push(av);
+        }
+        a = a + 1;
+    }
+    var tag: str = node.tag;
+    if p.ns_check && !x_qname_ok(tag) {
+        xp_fail(p, pos, "'" + tag + "' is not a qualified name (prefix:local)");
+        return mark;
+    }
+    var tpre: str = x_prefix(tag);
+    node.local = x_local(tag);
+    if str_len(tpre) == 0 {
+        node.ns = x_ns_lookup(p, "");
+    } else {
+        node.ns = x_ns_lookup(p, tpre);
+        if p.ns_check && str_equal(tpre, "xmlns") {
+            xp_fail(p, pos, "an element cannot have the prefix xmlns");
+            return mark;
+        }
+        if p.ns_check && str_len(node.ns) == 0 {
+            xp_fail(p, pos, "the prefix '" + tpre + "' of <" + tag + "> is not bound (declare xmlns:" + tpre + ")");
+            return mark;
+        }
+    }
+    var ans: Vec<str> = Vec::new();
+    a = 0;
+    while a < na {
+        var an2: str = node.attr_names.get(a);
+        if str_equal(an2, "xmlns") || str_starts_with(an2, "xmlns:") {
+            ans.push(x_xmlns_ns());
+        } else {
+            if p.ns_check && !x_qname_ok(an2) {
+                xp_fail(p, pos, "attribute '" + an2 + "' is not a qualified name (prefix:local)");
+                return mark;
+            }
+            var apre: str = x_prefix(an2);
+            if str_len(apre) == 0 {
+                ans.push("");
+            } else {
+                var au: str = x_ns_lookup(p, apre);
+                if p.ns_check && str_len(au) == 0 {
+                    xp_fail(p, pos, "the prefix '" + apre + "' of attribute '" + an2 + "' is not bound (declare xmlns:" + apre + ")");
+                    return mark;
+                }
+                ans.push(au);
+            }
+        }
+        a = a + 1;
+    }
+    if p.ns_check {
+        var x: i64 = 0;
+        while x < na {
+            var y: i64 = x + 1;
+            while y < na {
+                if str_len(ans.get(x)) > 0 && str_equal(ans.get(x), ans.get(y)) && str_equal(x_local(node.attr_names.get(x)), x_local(node.attr_names.get(y))) {
+                    xp_fail(p, pos, "attributes '" + node.attr_names.get(x) + "' and '" + node.attr_names.get(y) + "' are one name in the namespace " + ans.get(x));
+                    return mark;
+                }
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+    }
+    node.attr_ns = ans;
+    return mark;
+}
+
+// The end of an element: its namespace declarations go out of scope.
+fn x_ns_close(p: & mut XP, mark: i64) {
+    while p.ns_pre.len() > mark {
+        p.ns_pre.pop();
+        p.ns_uri.pop();
+    }
+}
+
+// ─── Entities with markup ───────────────────────────────────────────────
+
+// The entity a reference at j in content names, when its text must be
+// read as content (it holds '<' or '&', or is external): its index, else
+// -1 (predefined, plain text, unknown or unparsed: xp_decode's).
+fn xp_markup_ref(p: & mut XP, j: i64) -> i64 {
+    if p.enames.len() == 0 {
+        return - 1;
+    }
+    var s: str = p.s;
+    var e: i64 = x_name(s, j + 1);
+    if e == 0 || x_at(s, e) != 59 {
+        return - 1;
+    }
+    var name: str = str_slice(s, j + 1, e);
+    var ei: i64 = x_index(p.enames, name);
+    if ei < 0 {
+        return - 1;
+    }
+    var kind: i64 = p.ekind.get(ei);
+    if kind == 1 || kind == 3 {
+        return ei;
+    }
+    if kind == 2 {
+        return - 1;
+    }
+    var v: str = p.evals.get(ei);
+    if str_contains(v, "<") || str_contains(v, "&") {
+        return ei;
+    }
+    return - 1;
+}
+
+// The entity enames[ei] referred to at `pos` in content: its replacement
+// text parsed as content of `parent` in place of the reference (elements,
+// text, references in it). An external entity is loaded the first time
+// (opts.external; without it the reference is skipped).
+fn xp_expand(p: & mut XP, ei: i64, pos: i64, parent: & mut XmlNode) {
+    var name: str = p.enames.get(ei);
+    if x_index(p.active, name) >= 0 {
+        xp_fail(p, pos, "entity &" + name + "; refers to itself");
+        return;
+    }
+    if p.active.len() >= 64 {
+        xp_fail(p, pos, "entities nested too deeply");
+        return;
+    }
+    var kind: i64 = p.ekind.get(ei);
+    var text: str = "";
+    if kind == 1 {
+        if !p.external {
+            return;
+        }
+        text = xp_fetch(p, p.esys.get(ei), p.epub.get(ei), pos, "external entity &" + name + ";");
+        if !p.ok {
+            return;
+        }
+        p.evals.set(ei, text);
+        p.ekind.set(ei, 3);
+    } else {
+        text = p.evals.get(ei);
+    }
+    p.expanded = p.expanded + str_len(text);
+    if p.expanded > X_EXPAND_MAX {
+        xp_fail(p, pos, "entity expansion passed 8 MB (an entity bomb?)");
+        return;
+    }
+    var save_s: str = p.s;
+    var save_n: i64 = p.n;
+    var save_ctx: str = p.ctx;
+    p.s = text;
+    p.n = str_len(text);
+    p.ctx = save_ctx + " in entity &" + name + ";";
+    p.active.push(name);
+    x_children(p, 0, parent, "#entity");
+    p.active.pop();
+    p.s = save_s;
+    p.n = save_n;
+    p.ctx = save_ctx;
+}
+
+// ─── Validation ─────────────────────────────────────────────────────────
+
+fn xm_has(v: Vec<i64>, x: i64) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Where particle `node` (without its ? * +) can end when it starts at any
+// of `starts` in the child names `names`.
+fn xm_base(p: & mut XP, node: i64, names: Vec<str>, starts: Vec<i64>) -> Vec<i64> {
+    var kind: i64 = p.cm_kind.get(node);
+    var res: Vec<i64> = Vec::new();
+    if kind == 0 {
+        var nm: str = p.cm_name.get(node);
+        var i: i64 = 0;
+        while i < starts.len() {
+            var st: i64 = starts.get(i);
+            if st < names.len() && str_equal(names.get(st), nm) && !xm_has(res, st + 1) {
+                res.push(st + 1);
+            }
+            i = i + 1;
+        }
+        return res;
+    }
+    var first: i64 = p.cm_first.get(node);
+    var cnt: i64 = p.cm_count.get(node);
+    if kind == 1 {
+        var cur: Vec<i64> = starts;
+        var c: i64 = 0;
+        while c < cnt && cur.len() > 0 {
+            cur = xm_match(p, p.cm_list.get(first + c), names, cur);
+            c = c + 1;
+        }
+        return cur;
+    }
+    var c2: i64 = 0;
+    while c2 < cnt {
+        var r: Vec<i64> = xm_match(p, p.cm_list.get(first + c2), names, starts);
+        var k: i64 = 0;
+        while k < r.len() {
+            if !xm_has(res, r.get(k)) {
+                res.push(r.get(k));
+            }
+            k = k + 1;
+        }
+        c2 = c2 + 1;
+    }
+    return res;
+}
+
+// Where particle `node` (with its ? * +) can end from any of `starts`.
+fn xm_match(p: & mut XP, node: i64, names: Vec<str>, starts: Vec<i64>) -> Vec<i64> {
+    var q: i64 = p.cm_quant.get(node);
+    if q == 0 {
+        return xm_base(p, node, names, starts);
+    }
+    var res: Vec<i64> = Vec::new();
+    var frontier: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    if q == 1 || q == 2 {
+        while i < starts.len() {
+            if !xm_has(res, starts.get(i)) {
+                res.push(starts.get(i));
+            }
+            i = i + 1;
+        }
+    }
+    if q == 1 {
+        var once: Vec<i64> = xm_base(p, node, names, starts);
+        var k: i64 = 0;
+        while k < once.len() {
+            if !xm_has(res, once.get(k)) {
+                res.push(once.get(k));
+            }
+            k = k + 1;
+        }
+        return res;
+    }
+    if q == 3 {
+        var first: Vec<i64> = xm_base(p, node, names, starts);
+        var k2: i64 = 0;
+        while k2 < first.len() {
+            if !xm_has(res, first.get(k2)) {
+                res.push(first.get(k2));
+                frontier.push(first.get(k2));
+            }
+            k2 = k2 + 1;
+        }
+    } else {
+        var k3: i64 = 0;
+        while k3 < res.len() {
+            frontier.push(res.get(k3));
+            k3 = k3 + 1;
+        }
+    }
+    // repeat while new end positions come up (at most names.len() + 1)
+    while frontier.len() > 0 {
+        var nx: Vec<i64> = xm_base(p, node, names, frontier);
+        var fresh: Vec<i64> = Vec::new();
+        var k4: i64 = 0;
+        while k4 < nx.len() {
+            if !xm_has(res, nx.get(k4)) {
+                res.push(nx.get(k4));
+                fresh.push(nx.get(k4));
+            }
+            k4 = k4 + 1;
+        }
+        frontier = fresh;
+    }
+    return res;
+}
+
+// "(a|b)" from "|a|b|".
+fn x_enum_text(en: str) -> str {
+    return "(" + str_slice(en, 1, str_len(en) - 1) + ")";
+}
+
+// The value `v` of the attribute declared at p.at_*[di] on <tag>, checked
+// against its type and #FIXED value.
+fn xv_attr(p: & mut XP, di: i64, v: str, pos: i64, tag: str) {
+    var an: str = p.at_name.get(di);
+    var ty: str = p.at_type.get(di);
+    var what: str = "attribute '" + an + "' of <" + tag + ">";
+    if str_equal(p.at_def.get(di), "#FIXED") && !str_equal(v, p.at_val.get(di)) {
+        xp_fail(p, pos, what + " must be \"" + p.at_val.get(di) + "\" (#FIXED)");
+        return;
+    }
+    if str_equal(ty, "CDATA") {
+        return;
+    }
+    if str_equal(ty, "ENUM") || str_equal(ty, "NOTATION") {
+        if !str_contains(p.at_enum.get(di), "|" + v + "|") {
+            xp_fail(p, pos, what + " is '" + v + "', not one of " + x_enum_text(p.at_enum.get(di)));
+        }
+        return;
+    }
+    var toks: Vec<str> = Vec::new();
+    if str_equal(ty, "IDREFS") || str_equal(ty, "ENTITIES") || str_equal(ty, "NMTOKENS") {
+        if str_len(v) > 0 {
+            toks = str_split(v, " ");
+        }
+    } else {
+        toks.push(v);
+    }
+    if toks.len() == 0 {
+        xp_fail(p, pos, what + " is empty: a " + ty + " needs at least one token");
+        return;
+    }
+    var k: i64 = 0;
+    while k < toks.len() {
+        var t: str = toks.get(k);
+        if str_equal(ty, "NMTOKEN") || str_equal(ty, "NMTOKENS") {
+            if !x_is_nmtoken(t) {
+                xp_fail(p, pos, what + ": '" + t + "' is not a name token");
+                return;
+            }
+        } else if !x_is_name(t) {
+            xp_fail(p, pos, what + ": '" + t + "' is not a name (" + ty + ")");
+            return;
+        } else if str_equal(ty, "ID") {
+            if x_index(p.ids, t) >= 0 {
+                xp_fail(p, pos, "ID '" + t + "' is used twice");
+                return;
+            }
+            p.ids.push(t);
+        } else if str_equal(ty, "IDREF") || str_equal(ty, "IDREFS") {
+            p.refs.push(t);
+            p.ref_pos.push(pos);
+        } else {
+            var ei: i64 = x_index(p.enames, t);
+            if ei < 0 || p.ekind.get(ei) != 2 {
+                xp_fail(p, pos, what + ": '" + t + "' is not an unparsed entity");
+                return;
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// The element `node` (its start tag at `pos`) against its declaration:
+// content model, declared attributes and their values, #REQUIRED ones.
+fn xv_element(p: & mut XP, node: XmlNode, pos: i64) {
+    var tag: str = node.tag;
+    var ei: i64 = x_index(p.el_names, tag);
+    if ei < 0 {
+        xp_fail(p, pos, "element <" + tag + "> is not declared in the DTD");
+        return;
+    }
+    var kind: i64 = p.el_kind.get(ei);
+    var model: str = p.el_model.get(ei);
+    if kind == 0 {
+        if node.children.len() > 0 || str_len(node.text) > 0 {
+            xp_fail(p, pos, "<" + tag + "> is declared EMPTY but has content");
+            return;
+        }
+    } else if kind == 2 {
+        var c: i64 = 0;
+        while c < node.children.len() {
+            var ct: str = node.children.get(c).tag;
+            if !str_contains(p.el_mixed.get(ei), "|" + ct + "|") {
+                xp_fail(p, pos, "<" + ct + "> is not allowed in <" + tag + ">, whose content is " + model);
+                return;
+            }
+            c = c + 1;
+        }
+    } else if kind == 3 {
+        if !str_is_blank(node.text) {
+            xp_fail(p, pos, "<" + tag + "> holds text, but its content model " + model + " allows elements only");
+            return;
+        }
+        var names: Vec<str> = Vec::new();
+        var seq: str = "";
+        var c2: i64 = 0;
+        while c2 < node.children.len() {
+            names.push(node.children.get(c2).tag);
+            if c2 > 0 {
+                seq = seq + ", ";
+            }
+            seq = seq + node.children.get(c2).tag;
+            c2 = c2 + 1;
+        }
+        var starts: Vec<i64> = Vec::new();
+        starts.push(0);
+        var ends: Vec<i64> = xm_match(p, p.el_cm.get(ei), names, starts);
+        if !xm_has(ends, names.len()) {
+            if names.len() == 0 {
+                seq = "nothing";
+            }
+            xp_fail(p, pos, "the content of <" + tag + "> (" + seq + ") does not match its model " + model);
+            return;
+        }
+    }
+    var a: i64 = 0;
+    while a < node.attr_names.len() {
+        var an: str = node.attr_names.get(a);
+        var di: i64 = x_attdecl(p, tag, an);
+        if di < 0 {
+            xp_fail(p, pos, "attribute '" + an + "' of <" + tag + "> is not declared");
+            return;
+        }
+        xv_attr(p, di, node.attr_vals.get(a), pos, tag);
+        if !p.ok {
+            return;
+        }
+        a = a + 1;
+    }
+    var d: i64 = 0;
+    while d < p.at_elem.len() {
+        if str_equal(p.at_elem.get(d), tag) && str_equal(p.at_def.get(d), "#REQUIRED") && x_index(node.attr_names, p.at_name.get(d)) < 0 {
+            xp_fail(p, pos, "<" + tag + "> needs the attribute '" + p.at_name.get(d) + "' (#REQUIRED)");
+            return;
+        }
+        d = d + 1;
+    }
 }
 
 // Recursive descent: parse content into `parent` until `close_tag`
@@ -595,7 +2281,12 @@ fn x_children(p: & mut XP, i: i64, parent: & mut XmlNode, close_tag: str) -> i64
                     return ce + 1;
                 }
                 // mismatched close — skip it
-                if xp_fail(p, j, "end tag </" + name + "> does not match <" + close_tag + ">") {
+                var mis: str = "end tag </" + name + "> does not match <" + close_tag + ">";
+                if str_equal(close_tag, "#entity") {
+                    // an entity's text must hold whole elements (4.3.2)
+                    mis = "end tag </" + name + "> has no start tag in the entity's text";
+                }
+                if xp_fail(p, j, mis) {
                     return n;
                 }
                 j = ce + 1;
@@ -719,6 +2410,14 @@ fn x_children(p: & mut XP, i: i64, parent: & mut XmlNode, close_tag: str) -> i64
                     }
                     k = n;
                 }
+                // declared defaults, then the namespaces in scope
+                if p.at_elem.len() > 0 {
+                    x_attr_defaults(p, & mut node);
+                }
+                var nsmark: i64 = x_ns_open(p, & mut node, j);
+                if !p.ok {
+                    return n;
+                }
                 // pending text belongs to the parent element
                 if str_len(text_acc) > 0 {
                     parent.text = parent.text + xp_decode(p, text_acc, text_pos);
@@ -726,6 +2425,13 @@ fn x_children(p: & mut XP, i: i64, parent: & mut XmlNode, close_tag: str) -> i64
                 }
                 if !self_close {
                     k = x_children(p, k, & mut node, tag);
+                }
+                x_ns_close(p, nsmark);
+                if p.validate && p.ok {
+                    xv_element(p, node, j);
+                    if !p.ok {
+                        return n;
+                    }
                 }
                 parent.children.push(node);
                 j = k;
@@ -742,9 +2448,32 @@ fn x_children(p: & mut XP, i: i64, parent: & mut XmlNode, close_tag: str) -> i64
             j = j + 1;
             continue;
         }
+        // a reference to an entity whose text holds markup (or is
+        // external): that text is read as content here
+        var markup: bool = !top && p.enames.len() > 0;
+        if c == 38 && markup {
+            var me: i64 = xp_markup_ref(p, j);
+            if me >= 0 {
+                if str_len(text_acc) > 0 {
+                    parent.text = parent.text + xp_decode(p, text_acc, text_pos);
+                    text_acc = "";
+                }
+                var semi: i64 = x_find_from(s, j, ";");
+                xp_expand(p, me, j, parent);
+                if !p.ok {
+                    return n;
+                }
+                j = semi + 1;
+                text_pos = j;
+                continue;
+            }
+        }
         // text run
         var t_end: i64 = j;
         while t_end < n && str_byte_at(s, t_end) != 60 {
+            if markup && t_end > j && str_byte_at(s, t_end) == 38 && xp_markup_ref(p, t_end) >= 0 {
+                break;
+            }
             t_end = t_end + 1;
         }
         var run: str = str_slice(s, j, t_end);
@@ -767,7 +2496,8 @@ fn x_children(p: & mut XP, i: i64, parent: & mut XmlNode, close_tag: str) -> i64
         text_acc = text_acc + run;
         j = t_end;
     }
-    if !top {
+    // an entity's text ends where it ends ("#entity", xp_expand)
+    if !top && !str_equal(close_tag, "#entity") {
         if xp_fail(p, n, "element <" + close_tag + "> is not closed") {
             return n;
         }
@@ -786,10 +2516,10 @@ fn x_newlines(text: str) -> str {
     return str_replace(str_replace(text, "\r\n", "\n"), "\r", "\n");
 }
 
-fn x_run(text: str, strict: bool, doc: & mut XmlNode) -> XP {
+fn x_run(text: str, strict: bool, opts: XmlOptions, doc: & mut XmlNode) -> XP {
     var s: str = x_newlines(text);
     var p: XP = XP {
-        s: s, n: str_len(s), strict: strict, ok: true, error: "", roots: 0, seen_doctype: false, enames: Vec::new(), evals: Vec::new()
+        s: s, n: str_len(s), strict: strict, ok: true, error: "", roots: 0, seen_doctype: false, enames: Vec::new(), evals: Vec::new(), ekind: Vec::new(), esys: Vec::new(), epub: Vec::new(), pnames: Vec::new(), pvals: Vec::new(), pkind: Vec::new(), psys: Vec::new(), ppub: Vec::new(), active: Vec::new(), expanded: 0, ctx: "", dtd_skip: false, ns_check: opts.namespaces && strict, validate: opts.validate && strict, external: opts.external, resolver: opts.resolver, ns_pre: Vec::new(), ns_uri: Vec::new(), dt_name: "", dt_sys: "", dt_pub: "", el_names: Vec::new(), el_kind: Vec::new(), el_cm: Vec::new(), el_mixed: Vec::new(), el_model: Vec::new(), cm_kind: Vec::new(), cm_name: Vec::new(), cm_quant: Vec::new(), cm_first: Vec::new(), cm_count: Vec::new(), cm_list: Vec::new(), cm_out: - 1, at_elem: Vec::new(), at_name: Vec::new(), at_type: Vec::new(), at_enum: Vec::new(), at_def: Vec::new(), at_val: Vec::new(), ids: Vec::new(), refs: Vec::new(), ref_pos: Vec::new()
     };
     var i: i64 = 0;
     if p.n >= 3 && str_byte_at(s, 0) == 239 && str_byte_at(s, 1) == 187 && str_byte_at(s, 2) == 191 {
@@ -812,6 +2542,25 @@ fn x_run(text: str, strict: bool, doc: & mut XmlNode) -> XP {
     x_children(& mut p, i, doc, "");
     if p.ok && strict && p.roots == 0 {
         xp_fail(& mut p, p.n, "no root element");
+    }
+    if p.ok && p.validate {
+        if str_len(p.dt_name) == 0 {
+            xp_fail(& mut p, 0, "no DOCTYPE to validate against");
+            return p;
+        }
+        var rt: str = doc.children.get(0).tag;
+        if !str_equal(rt, p.dt_name) {
+            xp_fail(& mut p, 0, "the root element <" + rt + "> is not <" + p.dt_name + ">, which the DOCTYPE names");
+            return p;
+        }
+        var r: i64 = 0;
+        while r < p.refs.len() {
+            if x_index(p.ids, p.refs.get(r)) < 0 {
+                xp_fail(& mut p, p.ref_pos.get(r), "IDREF '" + p.refs.get(r) + "' matches no ID");
+                return p;
+            }
+            r = r + 1;
+        }
     }
     return p;
 }
@@ -875,9 +2624,19 @@ fn x_check_decl(p: & mut XP, body: str, pos: i64) {
 /// Parse an XML document leniently (malformed parts are skipped or kept
 /// as text). Returns the root element; a node with tag "" when no element
 /// is found.
+///
+/// Example:
+///   val root = xml_parse("<cfg v=\"2\"><item>a &amp; b</item><item>c</item></cfg>");
+///   assert_eq(root.tag, "cfg");
+///   assert_eq(xml_attr(root, "v"), "2");
+///   assert_eq(xml_children(root, "item").len(), 2);
+///   assert_eq(xml_text(xml_child(root, "item")), "a & b");
+///   assert(!xml_has(root, "other"));
+///   assert_eq(xml_escape("<a&b>"), "&lt;a&amp;b&gt;");
+///   assert_eq(xml_unescape("&lt;x&gt;"), "<x>");
 pub fn xml_parse(text: str) -> XmlNode {
     var doc: XmlNode = x_node("#document");
-    x_run(text, false, & mut doc);
+    x_run(text, false, xml_options(), & mut doc);
     if doc.children.len() == 0 {
         return x_none();
     }
@@ -887,7 +2646,7 @@ pub fn xml_parse(text: str) -> XmlNode {
 /// Parse a fragment allowing multiple top-level elements.
 pub fn xml_parse_fragment(text: str) -> Vec<XmlNode> {
     var doc: XmlNode = x_node("#document");
-    x_run(text, false, & mut doc);
+    x_run(text, false, xml_options(), & mut doc);
     return doc.children;
 }
 
@@ -895,8 +2654,14 @@ pub fn xml_parse_fragment(text: str) -> Vec<XmlNode> {
 /// module header); otherwise ok = false and `error` gives the line and
 /// column of the first problem.
 pub fn xml_load(text: str) -> XmlDoc {
+    return xml_load_with(text, xml_options());
+}
+
+/// xml_load with options (XmlOptions: namespace errors, validation against
+/// the DTD, external entities through a resolver).
+pub fn xml_load_with(text: str, opts: XmlOptions) -> XmlDoc {
     var doc: XmlNode = x_node("#document");
-    var p: XP = x_run(text, true, & mut doc);
+    var p: XP = x_run(text, true, opts, & mut doc);
     if !p.ok {
         return XmlDoc {
             ok: false, error: p.error, root: x_none()
@@ -919,6 +2684,50 @@ pub fn xml_attr(node: XmlNode, name: str) -> str {
         i = i + 1;
     }
     return "";
+}
+
+/// Value of the attribute `local` in namespace `ns` ("" for an unprefixed
+/// attribute), or "" when absent.
+pub fn xml_attr_ns(node: XmlNode, ns: str, local: str) -> str {
+    var i: i64 = 0;
+    while i < node.attr_names.len() {
+        var ans: str = "";
+        if i < node.attr_ns.len() {
+            ans = node.attr_ns.get(i);
+        }
+        if str_equal(ans, ns) && str_equal(x_local(node.attr_names.get(i)), local) {
+            return node.attr_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// First direct child named `local` in namespace `ns`; tag "" when absent.
+pub fn xml_child_ns(node: XmlNode, ns: str, local: str) -> XmlNode {
+    var i: i64 = 0;
+    while i < node.children.len() {
+        var c: XmlNode = node.children.get(i);
+        if str_equal(c.ns, ns) && str_equal(c.local, local) {
+            return c;
+        }
+        i = i + 1;
+    }
+    return x_none();
+}
+
+/// All direct children named `local` in namespace `ns`.
+pub fn xml_children_ns(node: XmlNode, ns: str, local: str) -> Vec<XmlNode> {
+    var out: Vec<XmlNode> = Vec::new();
+    var i: i64 = 0;
+    while i < node.children.len() {
+        var c: XmlNode = node.children.get(i);
+        if str_equal(c.ns, ns) && str_equal(c.local, local) {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 /// First direct child with `tag`; tag "" sentinel when absent.
@@ -1019,6 +2828,7 @@ pub fn xml_with_attr(node: XmlNode, name: str, value: str) -> XmlNode {
     var node = node;
     node.attr_names.push(name);
     node.attr_vals.push(value);
+    node.attr_ns.push("");
     return node;
 }
 

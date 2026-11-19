@@ -1,0 +1,129 @@
+// stdlib/sql_builder: SELECT with joins, nested WHERE trees, GROUP BY/HAVING, ORDER/LIMIT/OFFSET; multi-row INSERT with ON CONFLICT and RETURNING; UPDATE and DELETE; PostgreSQL ($n) and SQLite (?) placeholders, identifier quoting, and refusals (no WHERE, bad operator, row width).
+// Expected output:
+// simple pg: SELECT "id", "name" FROM "users" WHERE "status" = $1 ORDER BY "name" ASC LIMIT 10
+// simple sqlite: SELECT "id", "name" FROM "users" WHERE "status" = ? ORDER BY "name" ASC LIMIT 10
+// simple params: ['active']
+// join pg: SELECT "o"."id", "u"."name", count(*) AS n FROM "orders" AS "o" LEFT JOIN "users" AS "u" ON "u"."id" = "o"."user_id" WHERE ("o"."total" > $1 OR "o"."state" IN ($2, $3) OR ("o"."deleted_at" IS NULL AND NOT ("u"."email" LIKE $4))) AND "o"."created" BETWEEN $5 AND $6 GROUP BY "o"."id", "u"."name" HAVING (count(*) > $7) ORDER BY "n" DESC LIMIT 20 OFFSET 40
+// join sqlite: SELECT "o"."id", "u"."name", count(*) AS n FROM "orders" AS "o" LEFT JOIN "users" AS "u" ON "u"."id" = "o"."user_id" WHERE ("o"."total" > ? OR "o"."state" IN (?, ?) OR ("o"."deleted_at" IS NULL AND NOT ("u"."email" LIKE ?))) AND "o"."created" BETWEEN ? AND ? GROUP BY "o"."id", "u"."name" HAVING (count(*) > ?) ORDER BY "n" DESC LIMIT 20 OFFSET 40
+// join params: [99.5, 'paid', 'shipped', '%@test.%', 1700000000, 1800000000, 2]
+// insert pg: INSERT INTO "users" ("name", "age", "admin") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT DO NOTHING RETURNING "id"
+// insert sqlite: INSERT INTO "users" ("name", "age", "admin") VALUES (?, ?, ?), (?, ?, ?) ON CONFLICT DO NOTHING RETURNING "id"
+// insert params: ['Ada', 36, true, 'O'Brien "Bob"', NULL, false]
+// update pg: UPDATE "users" SET "name" = $1, "age" = $2 WHERE "id" = $3 RETURNING "id", "name"
+// update sqlite: UPDATE "users" SET "name" = ?, "age" = ? WHERE "id" = ? RETURNING "id", "name"
+// update params: ['Ada L.', 37, 1]
+// delete pg: DELETE FROM "sessions" WHERE "expires" < $1
+// delete sqlite: DELETE FROM "sessions" WHERE "expires" < ?
+// delete params: [1700000000]
+// quoting pg: SELECT "select", "t".* FROM "weird""table" WHERE 1 = 1
+// quoting sqlite: SELECT "select", "t".* FROM "weird""table" WHERE 1 = 1
+// quoting params: []
+// update all: ERROR UPDATE needs at least one SET
+// update no where: ERROR UPDATE without WHERE (use sq_allow_all_rows)
+// update all allowed pg: UPDATE "users" SET "flag" = $1
+// update all allowed sqlite: UPDATE "users" SET "flag" = ?
+// update all allowed params: [false]
+// delete no where: ERROR DELETE without WHERE (use sq_allow_all_rows)
+// bad operator: ERROR operator not allowed: ; DROP
+// short row: ERROR row 0 has 1 values for 2 columns
+// offset only sqlite: SELECT * FROM "t" LIMIT -1 OFFSET 5
+use sql_builder;
+use vec;
+use string;
+
+fn show(label: str, q: & SqlQuery) {
+    val pg: SqlOut = sql_build(q, SQL_POSTGRES);
+    if !pg.ok {
+        println(label + ": ERROR " + pg.error);
+        return;
+    }
+    println(label + " pg: " + pg.sql);
+    val lite: SqlOut = sql_build(q, SQL_SQLITE);
+    println(label + " sqlite: " + lite.sql);
+    println(label + " params: " + sql_params_show(& pg));
+}
+
+fn vals2(a: SqlVal, b: SqlVal) -> Vec<SqlVal> {
+    var v: Vec<SqlVal> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn main() -> i64 {
+    var q: SqlQuery = sql_select("users");
+    q = sq_columns(q, "id, name");
+    q = sq_where(q, sc_eq("status", sv_text("active")));
+    q = sq_order(q, "name", false);
+    q = sq_limit(q, 10);
+    show("simple", & q);
+
+    var j: SqlQuery = sql_select("orders");
+    j = sq_alias(j, "o");
+    j = sq_columns(j, "o.id, u.name, count(*) AS n");
+    j = sq_join(j, "left", "users", "u", "u.id", "o.user_id");
+    var any: Vec<SqlCond> = Vec::new();
+    any.push(sc_gt("o.total", sv_real(99.5)));
+    any.push(sc_in("o.state", vals2(sv_text("paid"), sv_text("shipped"))));
+    any.push(sc_and2(sc_is_null("o.deleted_at"), sc_not(sc_like("u.email", "%@test.%"))));
+    j = sq_where(j, sc_or(any));
+    j = sq_where(j, sc_between("o.created", sv_int(1700000000), sv_int(1800000000)));
+    j = sq_group_by(j, "o.id, u.name");
+    var hv: Vec<SqlVal> = Vec::new();
+    hv.push(sv_int(2));
+    j = sq_having(j, sc_raw("count(*) > ?", hv));
+    j = sq_order(j, "n", true);
+    j = sq_limit(j, 20);
+    j = sq_offset(j, 40);
+    show("join", & j);
+
+    var ins: SqlQuery = sql_insert("users");
+    ins = sq_insert_columns(ins, "name, age, admin");
+    var r1: Vec<SqlVal> = Vec::new();
+    r1.push(sv_text("Ada")); r1.push(sv_int(36)); r1.push(sv_bool(true));
+    var r2: Vec<SqlVal> = Vec::new();
+    r2.push(sv_text("O'Brien \"Bob\"")); r2.push(sv_null()); r2.push(sv_bool(false));
+    ins = sq_row(ins, r1);
+    ins = sq_row(ins, r2);
+    ins = sq_on_conflict_do_nothing(ins);
+    ins = sq_returning(ins, "id");
+    show("insert", & ins);
+
+    var up: SqlQuery = sql_update("users");
+    up = sq_set(up, "name", sv_text("Ada L."));
+    up = sq_set(up, "age", sv_int(37));
+    up = sq_where(up, sc_eq("id", sv_int(1)));
+    up = sq_returning(up, "id, name");
+    show("update", & up);
+
+    var del: SqlQuery = sql_delete("sessions");
+    del = sq_where(del, sc_lt("expires", sv_int(1700000000)));
+    show("delete", & del);
+
+    // identifiers with quotes and odd characters stay identifiers
+    var odd: SqlQuery = sql_select("weird\"table");
+    odd = sq_columns(odd, "select, t.*");
+    odd = sq_where(odd, sc_not_in("x", Vec::new()));
+    show("quoting", & odd);
+
+    // refusals
+    show("update all", & sql_update("users"));
+    var up2: SqlQuery = sql_update("users");
+    up2 = sq_set(up2, "flag", sv_bool(false));
+    show("update no where", & up2);
+    show("update all allowed", & sq_allow_all_rows(up2));
+    show("delete no where", & sql_delete("logs"));
+    var badop: SqlQuery = sql_select("t");
+    badop = sq_where(badop, sc_cmp("a", "; DROP", sv_int(1)));
+    show("bad operator", & badop);
+    var badrow: SqlQuery = sql_insert("t");
+    badrow = sq_insert_columns(badrow, "a, b");
+    var one: Vec<SqlVal> = Vec::new();
+    one.push(sv_int(1));
+    badrow = sq_row(badrow, one);
+    show("short row", & badrow);
+    var off: SqlQuery = sql_select("t");
+    off = sq_offset(off, 5);
+    println("offset only sqlite: " + sql_build(& off, SQL_SQLITE).sql);
+    return 0;
+}

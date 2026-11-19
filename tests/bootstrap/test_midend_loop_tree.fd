@@ -1,0 +1,102 @@
+// ME2: iropt's LICM and induction-variable passes find loops through the
+// shared loop tree (compiler/checks.fd iro_loops: back edges to a header
+// that dominates them, innermost first), and iropt_me reads the shared
+// CFG and dominator tree (iro_cfg). Nested loops, a loop with two latches
+// (a `continue`), a loop invariant read and a loop that never runs must
+// compute what they compute without the passes (FID_IROPT_OFF=licm,iv).
+//
+// Expected output:
+// 41664
+// 435
+// 25
+// 0
+// 120
+
+fn nested(n: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var j: i64 = 0;
+        while j < i {
+            t = t + j;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+fn invariant(v: Vec<i64>, k: i64) -> i64 {
+    // v.len() and k * 3 do not change in the loop
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        t = t + v.get(i) + k * 3;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn two_latches(n: i64) -> i64 {
+    // odd i jump back early: two back edges to one header
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        i = i + 1;
+        if i % 2 == 0 {
+            continue;
+        }
+        t = t + i;
+    }
+    return t;
+}
+
+fn never(n: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = n;
+    while i < 0 {
+        t = t + 1;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn triple(n: i64) -> i64 {
+    var c: i64 = 0;
+    var a: i64 = 0;
+    while a < n {
+        var b: i64 = 0;
+        while b < n {
+            var d: i64 = 0;
+            while d < n {
+                if a < b && b < d {
+                    c = c + 1;
+                }
+                d = d + 1;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return c;
+}
+
+fn main() -> i64 {
+    print(nested(64));
+    print("\n");
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 10 {
+        v.push(i * 3);
+        i = i + 1;
+    }
+    print(invariant(v, 10));
+    print("\n");
+    print(two_latches(10));
+    print("\n");
+    print(never(5));
+    print("\n");
+    print(triple(10));
+    print("\n");
+    return 0;
+}

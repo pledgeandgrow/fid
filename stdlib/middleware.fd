@@ -1,0 +1,1013 @@
+// Fides HTTP middleware: CORS, compression, logging, request ids, rate
+// limiting, Basic/Bearer auth and timeouts, composed into a chain
+//
+// Real (pure computation over stdlib http's HttpRequest and response text):
+//   - MwResponse: a response string parsed into status, headers and body,
+//     and built back with a correct Content-Length;
+//   - CORS (Fetch standard): allowed origins (exact or "*"), preflight
+//     (OPTIONS with Access-Control-Request-Method) answered 204 with
+//     Allow-Methods/Allow-Headers/Max-Age, Allow-Origin + Vary: Origin on
+//     normal responses, credentials (never with a literal "*" origin);
+//   - compression: Accept-Encoding negotiation with q-values (gzip, deflate,
+//     identity, "*"), a real DEFLATE compressor here (LZ77 with hash chains
+//     over a 32 KB window, fixed Huffman codes, RFC 1951 3.2.6) in gzip
+//     (RFC 1952) or zlib (RFC 1950, what HTTP calls "deflate") framing, with
+//     the checksums from stdlib compress, whose inflate reads it back;
+//     only compressible types, bodies over a minimum size, not 204/304, not
+//     already encoded; Vary: Accept-Encoding;
+//   - request ids: an incoming X-Request-Id kept when well formed, else a
+//     new one from a seeded xorshift64*; given to the handler as a request
+//     header and returned as a response header;
+//   - rate limiting: a token bucket per key (a request header's value, or
+//     one bucket for all), refilled from the injected clock; 429 with
+//     Retry-After and RateLimit-Limit/Remaining headers;
+//   - auth: Basic (RFC 7617, base64 user:pass, checked by a function) and
+//     Bearer (RFC 6750), 401 with WWW-Authenticate (error="invalid_token"
+//     when a token was given but refused);
+//   - logging: one line per request (id, method, target, status, body
+//     bytes, milliseconds), kept in the chain and optionally printed;
+//   - custom layers: a before hook that may change the request or answer
+//     early, an after hook that may change the response.
+//
+// The seams: time is a function `clock: fn() -> i64` (milliseconds; the
+// default reads the system clock), so tests drive it. A handler runs to
+// its end on the calling task: the timeout layer cannot interrupt it. It
+// measures the handler with the clock and, past the limit, replaces the
+// late response with 503 (as Go's TimeoutHandler answers), so callers never
+// get an answer later than promised plus the handler's own run.
+//
+// Layers run in the order added (the first is outermost): on the way in
+// each may answer early (preflight, 401, 429), and then only the layers
+// outside it see the response on the way out, inner first.
+//
+// Usage:
+//   use middleware;
+//   var c: MwChain = mw_chain_new(my_handler);
+//   mw_use_log(&mut c, true);
+//   mw_use_request_id(&mut c, 42);
+//   mw_use_cors(&mut c, mw_cors_default());
+//   mw_use_rate_limit(&mut c, 10.0, 5.0, "x-api-key");
+//   mw_use_compress(&mut c, 256);
+//   http_serve(8080, mw_chain_serve_fn(c));
+
+module middleware;
+ use vec; use string; use http; use compress; use encoding;
+
+pub const MW_CORS: i64 = 1;
+pub const MW_COMPRESS: i64 = 2;
+pub const MW_LOG: i64 = 3;
+pub const MW_REQUEST_ID: i64 = 4;
+pub const MW_RATE_LIMIT: i64 = 5;
+pub const MW_BASIC_AUTH: i64 = 6;
+pub const MW_BEARER_AUTH: i64 = 7;
+pub const MW_TIMEOUT: i64 = 8;
+pub const MW_BEFORE: i64 = 9;
+pub const MW_AFTER: i64 = 10;
+
+// ─── Responses ────────────────────────────────────────────────────────────
+
+pub struct MwResponse {
+    pub status: i64,
+    pub reason: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub body: str,
+}
+
+pub fn mw_response_new(status: i64, content_type: str, body: str) -> MwResponse {
+    var r: MwResponse = MwResponse { status: status, reason: status_text(status), names: Vec::new(), vals: Vec::new(), body: body };
+    if str_len(content_type) > 0 {
+        r.names.push("Content-Type");
+        r.vals.push(content_type);
+    }
+    return r;
+}
+
+/// Parse a response as stdlib http builds it ("HTTP/1.1 200 OK\r\n...").
+pub fn mw_response_parse(raw: str) -> MwResponse {
+    val req: HttpRequest = http_parse_head(raw);
+    var r: MwResponse = MwResponse { status: str_parse_int(req.target), reason: "", names: Vec::new(), vals: Vec::new(), body: "" };
+    val le: i64 = str_find(raw, "\r\n");
+    val sp1: i64 = str_find(raw, " ");
+    if le > 0 && sp1 >= 0 && sp1 + 5 <= le {
+        r.reason = str_slice(raw, sp1 + 5, le);
+    }
+    var i: i64 = 0;
+    while i < req.names.len() {
+        if !mw_same(req.names.get(i), "content-length") {
+            r.names.push(req.names.get(i));
+            r.vals.push(req.vals.get(i));
+        }
+        i = i + 1;
+    }
+    val e: i64 = str_find(raw, "\r\n\r\n");
+    if e >= 0 {
+        r.body = str_slice(raw, e + 4, str_len(raw));
+    }
+    return r;
+}
+
+/// The response text, Content-Length from the body (none for 204/304).
+pub fn mw_response_build(r: & MwResponse) -> str {
+    var reason: str = r.reason;
+    if str_len(reason) == 0 {
+        reason = status_text(r.status);
+    }
+    var out: str = "HTTP/1.1 " + int_to_str(r.status) + " " + reason + "\r\n";
+    var i: i64 = 0;
+    while i < r.names.len() {
+        out = out + r.names.get(i) + ": " + r.vals.get(i) + "\r\n";
+        i = i + 1;
+    }
+    if r.status != 204 && r.status != 304 {
+        out = out + "Content-Length: " + int_to_str(str_len(r.body)) + "\r\n";
+    }
+    // joined as bytes: `+` on a body holding NUL bytes (gzip) stops at the
+    // first NUL in the interpreter
+    var all: Vec<i64> = str_bytes(out + "\r\n");
+    val body: Vec<i64> = str_bytes(r.body);
+    var i2: i64 = 0;
+    while i2 < body.len() {
+        all.push(body.get(i2));
+        i2 = i2 + 1;
+    }
+    return str_from_bytes(all);
+}
+
+fn mw_lower(b: i64) -> i64 {
+    if b >= 65 && b <= 90 {
+        return b + 32;
+    }
+    return b;
+}
+
+fn mw_same(a: str, b: str) -> bool {
+    if str_len(a) != str_len(b) {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < str_len(a) {
+        if mw_lower(str_byte_at(a, i)) != mw_lower(str_byte_at(b, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn mw_response_header(r: & MwResponse, name: str) -> str {
+    var i: i64 = 0;
+    while i < r.names.len() {
+        if mw_same(r.names.get(i), name) {
+            return r.vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Set a header, replacing one of the same name.
+pub fn mw_response_set_header(r: & mut MwResponse, name: str, value: str) {
+    var i: i64 = 0;
+    while i < r.names.len() {
+        if mw_same(r.names.get(i), name) {
+            r.vals.set(i, value);
+            return;
+        }
+        i = i + 1;
+    }
+    r.names.push(name);
+    r.vals.push(value);
+}
+
+// Add a token to a comma list header (Vary), once.
+fn mw_add_vary(r: & mut MwResponse, token: str) {
+    val cur: str = mw_response_header(r, "Vary");
+    if str_len(cur) == 0 {
+        mw_response_set_header(r, "Vary", token);
+        return;
+    }
+    val parts: Vec<str> = str_split(cur, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        if mw_same(str_trim(parts.get(i)), token) {
+            return;
+        }
+        i = i + 1;
+    }
+    mw_response_set_header(r, "Vary", cur + ", " + token);
+}
+
+fn mw_req_set_header(req: & mut HttpRequest, name: str, value: str) {
+    var i: i64 = 0;
+    while i < req.names.len() {
+        if mw_same(req.names.get(i), name) {
+            req.vals.set(i, value);
+            return;
+        }
+        i = i + 1;
+    }
+    req.names.push(name);
+    req.vals.push(value);
+}
+
+// ─── DEFLATE with fixed Huffman codes ─────────────────────────────────────
+
+struct MwBits {
+    out: Vec<i64>,
+    acc: i64,
+    n: i64,
+}
+
+fn mw_put_bits(w: & mut MwBits, v: i64, count: i64) {
+    var i: i64 = 0;
+    while i < count {
+        w.acc = w.acc | (((v >> i) & 1) << w.n);
+        w.n = w.n + 1;
+        if w.n == 8 {
+            w.out.push(w.acc);
+            w.acc = 0;
+            w.n = 0;
+        }
+        i = i + 1;
+    }
+}
+
+// A Huffman code: written most significant bit first.
+fn mw_put_code(w: & mut MwBits, code: i64, len: i64) {
+    var i: i64 = len - 1;
+    while i >= 0 {
+        mw_put_bits(w, (code >> i) & 1, 1);
+        i = i - 1;
+    }
+}
+
+fn mw_put_litlen(w: & mut MwBits, v: i64) {
+    if v < 144 {
+        mw_put_code(w, 48 + v, 8);
+    } else if v < 256 {
+        mw_put_code(w, 400 + v - 144, 9);
+    } else if v < 280 {
+        mw_put_code(w, v - 256, 7);
+    } else {
+        mw_put_code(w, 192 + v - 280, 8);
+    }
+}
+
+fn mw_len_base() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(3); v.push(4); v.push(5); v.push(6); v.push(7); v.push(8); v.push(9); v.push(10);
+    v.push(11); v.push(13); v.push(15); v.push(17); v.push(19); v.push(23); v.push(27); v.push(31);
+    v.push(35); v.push(43); v.push(51); v.push(59); v.push(67); v.push(83); v.push(99); v.push(115);
+    v.push(131); v.push(163); v.push(195); v.push(227); v.push(258);
+    return v;
+}
+
+fn mw_len_extra(i: i64) -> i64 {
+    if i < 8 || i == 28 {
+        return 0;
+    }
+    return (i - 4) / 4;
+}
+
+fn mw_dist_base() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(1); v.push(2); v.push(3); v.push(4); v.push(5); v.push(7); v.push(9); v.push(13);
+    v.push(17); v.push(25); v.push(33); v.push(49); v.push(65); v.push(97); v.push(129); v.push(193);
+    v.push(257); v.push(385); v.push(513); v.push(769); v.push(1025); v.push(1537); v.push(2049); v.push(3073);
+    v.push(4097); v.push(6145); v.push(8193); v.push(12289); v.push(16385); v.push(24577);
+    return v;
+}
+
+fn mw_dist_extra(i: i64) -> i64 {
+    if i < 4 {
+        return 0;
+    }
+    return (i - 2) / 2;
+}
+
+/// Raw DEFLATE (one fixed-Huffman block) of `data`.
+pub fn mw_deflate(data: Vec<i64>) -> Vec<i64> {
+    val lb: Vec<i64> = mw_len_base();
+    val db: Vec<i64> = mw_dist_base();
+    var w: MwBits = MwBits { out: Vec::new(), acc: 0, n: 0 };
+    mw_put_bits(& mut w, 1, 1);
+    mw_put_bits(& mut w, 1, 2);
+    val n: i64 = data.len();
+    val hsize: i64 = 4096;
+    var head: Vec<i64> = Vec::filled(hsize, 0 - 1);
+    var prev: Vec<i64> = Vec::filled(n + 1, 0 - 1);
+    var i: i64 = 0;
+    while i < n {
+        var best_len: i64 = 0;
+        var best_dist: i64 = 0;
+        if i + 2 < n {
+            val h: i64 = (((data.get(i) & 255) << 4) ^ ((data.get(i + 1) & 255) << 2) ^ (data.get(i + 2) & 255)) % hsize;
+            var cand: i64 = head.get(h);
+            var tries: i64 = 0;
+            while cand >= 0 && i - cand <= 32768 && tries < 32 {
+                var l: i64 = 0;
+                while l < 258 && i + l < n && data.get(cand + l) == data.get(i + l) {
+                    l = l + 1;
+                }
+                if l > best_len {
+                    best_len = l;
+                    best_dist = i - cand;
+                }
+                cand = prev.get(cand);
+                tries = tries + 1;
+            }
+            prev.set(i, head.get(h));
+            head.set(h, i);
+        }
+        if best_len >= 3 {
+            var li: i64 = 28;
+            while lb.get(li) > best_len {
+                li = li - 1;
+            }
+            mw_put_litlen(& mut w, 257 + li);
+            mw_put_bits(& mut w, best_len - lb.get(li), mw_len_extra(li));
+            var di: i64 = 29;
+            while db.get(di) > best_dist {
+                di = di - 1;
+            }
+            mw_put_code(& mut w, di, 5);
+            mw_put_bits(& mut w, best_dist - db.get(di), mw_dist_extra(di));
+            // index the positions the match covers
+            var k: i64 = 1;
+            while k < best_len {
+                val p: i64 = i + k;
+                if p + 2 < n {
+                    val h2: i64 = (((data.get(p) & 255) << 4) ^ ((data.get(p + 1) & 255) << 2) ^ (data.get(p + 2) & 255)) % hsize;
+                    prev.set(p, head.get(h2));
+                    head.set(h2, p);
+                }
+                k = k + 1;
+            }
+            i = i + best_len;
+        } else {
+            mw_put_litlen(& mut w, data.get(i) & 255);
+            i = i + 1;
+        }
+    }
+    mw_put_litlen(& mut w, 256);
+    if w.n > 0 {
+        w.out.push(w.acc);
+    }
+    return w.out;
+}
+
+/// gzip member (RFC 1952) holding mw_deflate(data).
+pub fn mw_gzip(data: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(31); out.push(139); out.push(8); out.push(0);
+    out.push(0); out.push(0); out.push(0); out.push(0);
+    out.push(0); out.push(255);
+    val body: Vec<i64> = mw_deflate(data);
+    var i: i64 = 0;
+    while i < body.len() {
+        out.push(body.get(i));
+        i = i + 1;
+    }
+    val crc: i64 = crc32_bytes(data);
+    val n: i64 = data.len();
+    i = 0;
+    while i < 4 {
+        out.push((crc >> (8 * i)) & 255);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 4 {
+        out.push((n >> (8 * i)) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// zlib stream (RFC 1950) holding mw_deflate(data): HTTP's "deflate".
+pub fn mw_zlib(data: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(120);
+    out.push(1);
+    val body: Vec<i64> = mw_deflate(data);
+    var i: i64 = 0;
+    while i < body.len() {
+        out.push(body.get(i));
+        i = i + 1;
+    }
+    val a: i64 = adler32_bytes(data);
+    out.push((a >> 24) & 255);
+    out.push((a >> 16) & 255);
+    out.push((a >> 8) & 255);
+    out.push(a & 255);
+    return out;
+}
+
+// ─── Content negotiation ──────────────────────────────────────────────────
+
+// A q-value ("0.5", "1", "0") in thousandths.
+fn mw_qvalue(s: str) -> i64 {
+    val t: str = str_trim(s);
+    if str_len(t) == 0 {
+        return 1000;
+    }
+    if str_byte_at(t, 0) == 49 {
+        return 1000;
+    }
+    if str_byte_at(t, 0) != 48 {
+        return 0;
+    }
+    var v: i64 = 0;
+    var scale: i64 = 100;
+    var i: i64 = 2;
+    while i < str_len(t) && scale > 0 {
+        val c: i64 = str_byte_at(t, i);
+        if c < 48 || c > 57 {
+            return v;
+        }
+        v = v + (c - 48) * scale;
+        scale = scale / 10;
+        i = i + 1;
+    }
+    return v;
+}
+
+// The q of `coding` in an Accept-Encoding value (-1: not listed).
+fn mw_coding_q(accept: str, coding: str) -> i64 {
+    val parts: Vec<str> = str_split(accept, ",");
+    var star: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = str_trim(parts.get(i));
+        var name: str = p;
+        var q: i64 = 1000;
+        val semi: i64 = str_find(p, ";");
+        if semi >= 0 {
+            name = str_trim(str_slice(p, 0, semi));
+            val params: str = str_trim(str_slice(p, semi + 1, str_len(p)));
+            if str_starts_with(params, "q=") || str_starts_with(params, "Q=") {
+                q = mw_qvalue(str_slice(params, 2, str_len(params)));
+            }
+        }
+        if mw_same(name, coding) {
+            return q;
+        }
+        if name == "*" {
+            star = q;
+        }
+        i = i + 1;
+    }
+    return star;
+}
+
+/// The coding to answer with: "gzip", "deflate" or "" (identity).
+/// gzip wins a tie.
+pub fn mw_negotiate_encoding(accept: str) -> str {
+    if str_len(str_trim(accept)) == 0 {
+        return "";
+    }
+    val g: i64 = mw_coding_q(accept, "gzip");
+    val d: i64 = mw_coding_q(accept, "deflate");
+    if g <= 0 && d <= 0 {
+        return "";
+    }
+    if g >= d {
+        return "gzip";
+    }
+    return "deflate";
+}
+
+fn mw_compressible(ctype: str) -> bool {
+    val t: str = str_to_lower(ctype);
+    return str_starts_with(t, "text/") || str_contains(t, "json") || str_contains(t, "xml") || str_contains(t, "javascript") || str_contains(t, "svg");
+}
+
+// ─── CORS ─────────────────────────────────────────────────────────────────
+
+pub struct MwCors {
+    pub origins: Vec<str>,
+    pub methods: str,
+    pub headers: str,
+    pub expose: str,
+    pub credentials: bool,
+    pub max_age: i64,
+}
+
+/// Any origin, the common methods, Content-Type and Authorization.
+pub fn mw_cors_default() -> MwCors {
+    var o: Vec<str> = Vec::new();
+    o.push("*");
+    return MwCors { origins: o, methods: "GET, HEAD, POST, PUT, PATCH, DELETE", headers: "Content-Type, Authorization", expose: "", credentials: false, max_age: 600 };
+}
+
+fn mw_origin_ok(c: & MwCors, origin: str) -> bool {
+    var i: i64 = 0;
+    while i < c.origins.len() {
+        if c.origins.get(i) == "*" || c.origins.get(i) == origin {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn mw_any_origin(c: & MwCors) -> bool {
+    var i: i64 = 0;
+    while i < c.origins.len() {
+        if c.origins.get(i) == "*" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn mw_cors_headers(c: & MwCors, origin: str, r: & mut MwResponse) {
+    if mw_any_origin(c) && !c.credentials {
+        mw_response_set_header(r, "Access-Control-Allow-Origin", "*");
+    } else {
+        mw_response_set_header(r, "Access-Control-Allow-Origin", origin);
+        mw_add_vary(r, "Origin");
+    }
+    if c.credentials {
+        mw_response_set_header(r, "Access-Control-Allow-Credentials", "true");
+    }
+}
+
+// ─── Rate limiting ────────────────────────────────────────────────────────
+
+/// Token buckets, one per key: `capacity` tokens, `per_second` refill.
+pub struct MwRateLimiter {
+    pub capacity: f64,
+    pub per_second: f64,
+    pub key_header: str,
+    keys: Vec<str>,
+    tokens: Vec<f64>,
+    last_ms: Vec<i64>,
+}
+
+pub fn mw_rate_limiter_new(capacity: f64, per_second: f64, key_header: str) -> MwRateLimiter {
+    return MwRateLimiter { capacity: capacity, per_second: per_second, key_header: key_header, keys: Vec::new(), tokens: Vec::new(), last_ms: Vec::new() };
+}
+
+fn mw_bucket(rl: & mut MwRateLimiter, key: str, now_ms: i64) -> i64 {
+    var i: i64 = 0;
+    while i < rl.keys.len() {
+        if rl.keys.get(i) == key {
+            val dt: i64 = now_ms - rl.last_ms.get(i);
+            if dt > 0 {
+                var t: f64 = rl.tokens.get(i) + (dt as f64) * rl.per_second / 1000.0;
+                if t > rl.capacity {
+                    t = rl.capacity;
+                }
+                rl.tokens.set(i, t);
+                rl.last_ms.set(i, now_ms);
+            }
+            return i;
+        }
+        i = i + 1;
+    }
+    rl.keys.push(key);
+    rl.tokens.push(rl.capacity);
+    rl.last_ms.push(now_ms);
+    return rl.keys.len() - 1;
+}
+
+/// Take a token for `key` at `now_ms`: true when allowed.
+pub fn mw_rate_take(rl: & mut MwRateLimiter, key: str, now_ms: i64) -> bool {
+    val i: i64 = mw_bucket(rl, key, now_ms);
+    val t: f64 = rl.tokens.get(i);
+    if t >= 1.0 {
+        rl.tokens.set(i, t - 1.0);
+        return true;
+    }
+    return false;
+}
+
+/// Whole tokens left for `key`.
+pub fn mw_rate_remaining(rl: & mut MwRateLimiter, key: str, now_ms: i64) -> i64 {
+    val i: i64 = mw_bucket(rl, key, now_ms);
+    return rl.tokens.get(i) as i64;
+}
+
+/// Milliseconds until `key` has a token again (0 when it has one).
+pub fn mw_rate_retry_ms(rl: & mut MwRateLimiter, key: str, now_ms: i64) -> i64 {
+    val i: i64 = mw_bucket(rl, key, now_ms);
+    val t: f64 = rl.tokens.get(i);
+    if t >= 1.0 || rl.per_second <= 0.0 {
+        return 0;
+    }
+    val ms: f64 = (1.0 - t) * 1000.0 / rl.per_second;
+    var whole: i64 = ms as i64;
+    if (whole as f64) < ms {
+        whole = whole + 1;
+    }
+    return whole;
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────
+
+/// Basic credentials from an Authorization value: [user, password], or an
+/// empty Vec when it is not well-formed Basic.
+pub fn mw_basic_credentials(auth: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val t: str = str_trim(auth);
+    if str_len(t) < 6 || !mw_same(str_slice(t, 0, 6), "basic ") {
+        return out;
+    }
+    val b64: str = str_trim(str_slice(t, 6, str_len(t)));
+    if !b64_valid(b64) {
+        return out;
+    }
+    val plain: str = b64_decode(b64);
+    val colon: i64 = str_find(plain, ":");
+    if colon < 0 {
+        return out;
+    }
+    out.push(str_slice(plain, 0, colon));
+    out.push(str_slice(plain, colon + 1, str_len(plain)));
+    return out;
+}
+
+/// The token of "Bearer <token>", or "".
+pub fn mw_bearer_token(auth: str) -> str {
+    val t: str = str_trim(auth);
+    if str_len(t) < 7 || !mw_same(str_slice(t, 0, 7), "bearer ") {
+        return "";
+    }
+    return str_trim(str_slice(t, 7, str_len(t)));
+}
+
+// ─── The chain ────────────────────────────────────────────────────────────
+
+// Hook functions are kept in structs: a Vec of bare fn values does not
+// call back in this compiler's interpreter. Hooks take the request by
+// reference and return a str/bool rather than a struct: a struct result
+// through a function value corrupts the arguments there.
+struct MwBasicFn {
+    f: fn(str, str) -> bool,
+}
+
+struct MwBearerFn {
+    f: fn(str) -> bool,
+}
+
+struct MwBeforeFn {
+    f: fn(& mut HttpRequest, & mut MwResponse) -> bool,
+}
+
+struct MwAfterFn {
+    f: fn(HttpRequest, & mut MwResponse) -> bool,
+}
+
+struct MwLayer {
+    kind: i64,
+    idx: i64,
+    num: i64,
+    flag: bool,
+    text: str,
+}
+
+pub struct MwChain {
+    layers: Vec<MwLayer>,
+    cors: Vec<MwCors>,
+    limiters: Vec<MwRateLimiter>,
+    basic: Vec<MwBasicFn>,
+    bearer: Vec<MwBearerFn>,
+    befores: Vec<MwBeforeFn>,
+    afters: Vec<MwAfterFn>,
+    handler: fn(HttpRequest) -> str,
+    clock: fn() -> i64,
+    rng: i64,
+    pub log: Vec<str>,
+    pub served: i64,
+}
+
+fn mw_wall_clock() -> i64 {
+    return p_clock_now_ms();
+}
+
+pub fn mw_chain_new(handler: fn(HttpRequest) -> str) -> MwChain {
+    return MwChain {
+        layers: Vec::new(), cors: Vec::new(), limiters: Vec::new(), basic: Vec::new(), bearer: Vec::new(), befores: Vec::new(), afters: Vec::new(), handler: handler, clock: mw_wall_clock, rng: 88172645463325252, log: Vec::new(), served: 0,
+    };
+}
+
+/// Use `clock` (milliseconds) instead of the system clock.
+pub fn mw_chain_set_clock(c: & mut MwChain, clock: fn() -> i64) {
+    c.clock = clock;
+}
+
+fn mw_add(c: & mut MwChain, kind: i64, idx: i64, num: i64, flag: bool, text: str) {
+    c.layers.push(MwLayer { kind: kind, idx: idx, num: num, flag: flag, text: text });
+}
+
+pub fn mw_use_cors(c: & mut MwChain, cfg: MwCors) {
+    mw_add(c, MW_CORS, c.cors.len(), 0, false, "");
+    c.cors.push(cfg);
+}
+
+/// Compress bodies of at least `min_bytes` when the client accepts it.
+pub fn mw_use_compress(c: & mut MwChain, min_bytes: i64) {
+    mw_add(c, MW_COMPRESS, 0, min_bytes, false, "");
+}
+
+/// One line per request into c.log (and printed when `print` is true).
+pub fn mw_use_log(c: & mut MwChain, print: bool) {
+    mw_add(c, MW_LOG, 0, 0, print, "");
+}
+
+/// X-Request-Id: kept or made (from a generator seeded with `seed`).
+pub fn mw_use_request_id(c: & mut MwChain, seed: i64) {
+    if seed != 0 {
+        c.rng = seed;
+    }
+    mw_add(c, MW_REQUEST_ID, 0, 0, false, "");
+}
+
+/// A token bucket per value of header `key_header` ("" = one bucket).
+pub fn mw_use_rate_limit(c: & mut MwChain, capacity: f64, per_second: f64, key_header: str) {
+    mw_add(c, MW_RATE_LIMIT, c.limiters.len(), 0, false, "");
+    c.limiters.push(mw_rate_limiter_new(capacity, per_second, key_header));
+}
+
+pub fn mw_use_basic_auth(c: & mut MwChain, realm: str, check: fn(str, str) -> bool) {
+    mw_add(c, MW_BASIC_AUTH, c.basic.len(), 0, false, realm);
+    c.basic.push(MwBasicFn { f: check });
+}
+
+pub fn mw_use_bearer_auth(c: & mut MwChain, realm: str, check: fn(str) -> bool) {
+    mw_add(c, MW_BEARER_AUTH, c.bearer.len(), 0, false, realm);
+    c.bearer.push(MwBearerFn { f: check });
+}
+
+/// Replace a response that took longer than `ms` with 503.
+pub fn mw_use_timeout(c: & mut MwChain, ms: i64) {
+    mw_add(c, MW_TIMEOUT, 0, ms, false, "");
+}
+
+/// A hook run on the way in: it may change the request and returns true
+/// to pass it on, or fills the response (a 500 with no body until it does)
+/// and returns false to answer at once.
+pub fn mw_use_before(c: & mut MwChain, hook: fn(& mut HttpRequest, & mut MwResponse) -> bool) {
+    mw_add(c, MW_BEFORE, c.befores.len(), 0, false, "");
+    c.befores.push(MwBeforeFn { f: hook });
+}
+
+/// A hook run on the way out: it may change the response (its result is
+/// not used).
+pub fn mw_use_after(c: & mut MwChain, hook: fn(HttpRequest, & mut MwResponse) -> bool) {
+    mw_add(c, MW_AFTER, c.afters.len(), 0, false, "");
+    c.afters.push(MwAfterFn { f: hook });
+}
+
+@wrapping fn mw_next_id(c: & mut MwChain) -> str {
+    var x: i64 = c.rng;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    c.rng = x;
+    val v: i64 = x * 2685821657736338717;
+    val hx: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 15;
+    while i >= 0 {
+        val d: i64 = (v >> (i * 4)) & 15;
+        out = out + str_slice(hx, d, d + 1);
+        i = i - 1;
+    }
+    return out;
+}
+
+fn mw_id_ok(s: str) -> bool {
+    val n: i64 = str_len(s);
+    if n == 0 || n > 200 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = str_byte_at(s, i);
+        if b < 33 || b > 126 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn mw_401(scheme: str, realm: str, error: str) -> MwResponse {
+    var r: MwResponse = mw_response_new(401, "text/plain", "Unauthorized\n");
+    var v: str = scheme + " realm=\"" + realm + "\"";
+    if str_len(error) > 0 {
+        v = v + ", error=\"" + error + "\"";
+    }
+    mw_response_set_header(& mut r, "WWW-Authenticate", v);
+    return r;
+}
+
+// A status-0 response: the request goes on.
+fn mw_go() -> MwResponse {
+    return mw_response_new(0, "", "");
+}
+
+// The inbound part of layer i: an answer, or mw_go() when the request
+// goes on.
+fn mw_in(c: & mut MwChain, i: i64, req: & mut HttpRequest, start_ms: i64) -> MwResponse {
+    val l: MwLayer = c.layers.get(i);
+    if l.kind == MW_REQUEST_ID {
+        val cur: str = http_header(*req, "x-request-id");
+        if !mw_id_ok(cur) {
+            mw_req_set_header(req, "X-Request-Id", mw_next_id(c));
+        }
+        return mw_go();
+    }
+    if l.kind == MW_CORS {
+        val cfg: MwCors = c.cors.get(l.idx);
+        val origin: str = http_header(*req, "origin");
+        val acrm: str = http_header(*req, "access-control-request-method");
+        if mw_same(req.method, "OPTIONS") && str_len(origin) > 0 && str_len(acrm) > 0 {
+            var r: MwResponse = mw_response_new(204, "", "");
+            if mw_origin_ok(& cfg, origin) {
+                mw_cors_headers(& cfg, origin, & mut r);
+                mw_response_set_header(& mut r, "Access-Control-Allow-Methods", cfg.methods);
+                val acrh: str = http_header(*req, "access-control-request-headers");
+                if str_len(acrh) > 0 {
+                    mw_response_set_header(& mut r, "Access-Control-Allow-Headers", cfg.headers);
+                }
+                mw_response_set_header(& mut r, "Access-Control-Max-Age", int_to_str(cfg.max_age));
+            }
+            mw_add_vary(& mut r, "Origin");
+            return r;
+        }
+        return mw_go();
+    }
+    if l.kind == MW_RATE_LIMIT {
+        var rl: MwRateLimiter = c.limiters.get(l.idx);
+        var key: str = "*";
+        if str_len(rl.key_header) > 0 {
+            key = http_header(*req, rl.key_header);
+        }
+        val ok: bool = mw_rate_take(& mut rl, key, start_ms);
+        var r: MwResponse = mw_response_new(429, "text/plain", "Too Many Requests\n");
+        if !ok {
+            val wait: i64 = mw_rate_retry_ms(& mut rl, key, start_ms);
+            mw_response_set_header(& mut r, "Retry-After", int_to_str((wait + 999) / 1000));
+        }
+        val left: i64 = mw_rate_remaining(& mut rl, key, start_ms);
+        c.limiters.set(l.idx, rl);
+        if !ok {
+            mw_response_set_header(& mut r, "RateLimit-Limit", int_to_str(rl.capacity as i64));
+            mw_response_set_header(& mut r, "RateLimit-Remaining", "0");
+            return r;
+        }
+        mw_req_set_header(req, "X-RateLimit-Remaining", int_to_str(left));
+        return mw_go();
+    }
+    if l.kind == MW_BASIC_AUTH {
+        val creds: Vec<str> = mw_basic_credentials(http_header(*req, "authorization"));
+        if creds.len() == 2 {
+            val bf: MwBasicFn = c.basic.get(l.idx);
+            val check: fn(str, str) -> bool = bf.f;
+            if check(creds.get(0), creds.get(1)) {
+                mw_req_set_header(req, "X-Auth-User", creds.get(0));
+                return mw_go();
+            }
+        }
+        return mw_401("Basic", l.text, "");
+    }
+    if l.kind == MW_BEARER_AUTH {
+        val tok: str = mw_bearer_token(http_header(*req, "authorization"));
+        if str_len(tok) > 0 {
+            val tf: MwBearerFn = c.bearer.get(l.idx);
+            val check: fn(str) -> bool = tf.f;
+            if check(tok) {
+                return mw_go();
+            }
+            return mw_401("Bearer", l.text, "invalid_token");
+        }
+        return mw_401("Bearer", l.text, "");
+    }
+    if l.kind == MW_BEFORE {
+        val hf: MwBeforeFn = c.befores.get(l.idx);
+        val hook: fn(& mut HttpRequest, & mut MwResponse) -> bool = hf.f;
+        var r: MwResponse = mw_response_new(500, "", "");
+        if hook(req, & mut r) {
+            return mw_go();
+        }
+        return r;
+    }
+    return mw_go();
+}
+
+// The outbound part of layer i.
+fn mw_out(c: & mut MwChain, i: i64, req: & HttpRequest, r: & mut MwResponse, start_ms: i64, end_ms: i64) {
+    val l: MwLayer = c.layers.get(i);
+    if l.kind == MW_REQUEST_ID {
+        mw_response_set_header(r, "X-Request-Id", http_header(*req, "x-request-id"));
+    } else if l.kind == MW_CORS {
+        val cfg: MwCors = c.cors.get(l.idx);
+        val origin: str = http_header(*req, "origin");
+        if str_len(origin) > 0 && mw_origin_ok(& cfg, origin) && str_len(mw_response_header(r, "Access-Control-Allow-Origin")) == 0 {
+            mw_cors_headers(& cfg, origin, r);
+            if str_len(cfg.expose) > 0 {
+                mw_response_set_header(r, "Access-Control-Expose-Headers", cfg.expose);
+            }
+        }
+    } else if l.kind == MW_RATE_LIMIT {
+        if r.status != 429 {
+            val rl: MwRateLimiter = c.limiters.get(l.idx);
+            mw_response_set_header(r, "RateLimit-Limit", int_to_str(rl.capacity as i64));
+            mw_response_set_header(r, "RateLimit-Remaining", http_header(*req, "x-ratelimit-remaining"));
+        }
+    } else if l.kind == MW_COMPRESS {
+        val coding: str = mw_negotiate_encoding(http_header(*req, "accept-encoding"));
+        mw_add_vary(r, "Accept-Encoding");
+        if str_len(coding) > 0 && str_len(r.body) >= l.num && r.status != 204 && r.status != 304 && str_len(mw_response_header(r, "Content-Encoding")) == 0 && mw_compressible(mw_response_header(r, "Content-Type")) && !mw_same(req.method, "HEAD") {
+            val raw: Vec<i64> = str_bytes(r.body);
+            if coding == "gzip" {
+                r.body = str_from_bytes(mw_gzip(raw));
+            } else {
+                r.body = str_from_bytes(mw_zlib(raw));
+            }
+            mw_response_set_header(r, "Content-Encoding", coding);
+        }
+    } else if l.kind == MW_TIMEOUT {
+        if end_ms - start_ms > l.num {
+            *r = mw_response_new(503, "text/plain", "Service Unavailable: the handler took " + int_to_str(end_ms - start_ms) + " ms, the limit is " + int_to_str(l.num) + " ms\n");
+        }
+    } else if l.kind == MW_AFTER {
+        val af: MwAfterFn = c.afters.get(l.idx);
+        val hook: fn(HttpRequest, & mut MwResponse) -> bool = af.f;
+        val cur: HttpRequest = *req;
+        hook(cur, r);
+    } else if l.kind == MW_LOG {
+        var id: str = http_header(*req, "x-request-id");
+        if str_len(id) == 0 {
+            id = "-";
+        }
+        val line: str = id + " " + req.method + " " + req.target + " " + int_to_str(r.status) + " " + int_to_str(str_len(r.body)) + " " + int_to_str(end_ms - start_ms) + "ms";
+        c.log.push(line);
+        if l.flag {
+            println(line);
+        }
+    }
+}
+
+/// Run one request through the layers and the handler.
+pub fn mw_chain_handle(c: & mut MwChain, request: HttpRequest) -> str {
+    var req: HttpRequest = request;
+    val clock: fn() -> i64 = c.clock;
+    val start: i64 = clock();
+    var resp: MwResponse = mw_go();
+    var reached: i64 = 0;
+    var answered: bool = false;
+    while reached < c.layers.len() && !answered {
+        resp = mw_in(c, reached, & mut req, start);
+        if resp.status != 0 {
+            answered = true;
+        } else {
+            reached = reached + 1;
+        }
+    }
+    var last: i64 = reached - 1;
+    if !answered {
+        val h: fn(HttpRequest) -> str = c.handler;
+        resp = mw_response_parse(h(req));
+    }
+    val end: i64 = clock();
+    // when layer `reached` answered, only the layers outside it see the
+    // response (a preflight is logged by an outer log layer)
+    var i: i64 = last;
+    while i >= 0 {
+        mw_out(c, i, & req, & mut resp, start, end);
+        i = i - 1;
+    }
+    c.served = c.served + 1;
+    return mw_response_build(& resp);
+}
+
+/// The log lines so far, and forget them.
+pub fn mw_chain_take_log(c: & mut MwChain) -> Vec<str> {
+    val out: Vec<str> = c.log;
+    c.log = Vec::new();
+    return out;
+}
+
+// Chains handed to mw_chain_serve_fn (a closure captures the index: this
+// compiler reads a captured struct's Vecs dangling).
+var MW_SERVED: Vec<MwChain> = Vec::new();
+
+fn mw_serve_one(id: i64, req: HttpRequest) -> str {
+    var c: MwChain = MW_SERVED.get(id);
+    val out: str = mw_chain_handle(& mut c, req);
+    MW_SERVED.set(id, c);
+    return out;
+}
+
+/// A handler for http_serve running the chain (its state kept between
+/// requests).
+pub fn mw_chain_serve_fn(c: MwChain) -> fn(HttpRequest) -> str {
+    val id: i64 = MW_SERVED.len();
+    MW_SERVED.push(c);
+    return fn(req: HttpRequest) -> str { return mw_serve_one(id, req); };
+}

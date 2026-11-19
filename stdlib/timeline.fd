@@ -1,0 +1,378 @@
+// Fides timeline standard library
+//
+// Cutscene / animation timelines, pure computation (no seam):
+//   - float tracks and vec3 tracks of keyframes kept sorted by time; the
+//     segment after each key is interpolated by that key's mode: step
+//     (hold), linear, or cubic (Hermite with Catmull-Rom tangents from the
+//     neighbouring keys, so curves pass through every key smoothly);
+//     before the first key a track holds the first value, after the last
+//     the last value;
+//   - event tracks: named events (with an integer payload) at times;
+//   - a timeline with a length, optional looping and a playback speed
+//     (negative plays backwards). `timeline_advance` moves time and returns
+//     the events crossed, each once per crossing: playing forward from t0
+//     to t1 fires events with t0 < t <= t1 (an event at 0 fires on the
+//     first advance from the start), backwards those with t1 <= t < t0;
+//     a loop wrap fires the rest of the lap, then the next one (several
+//     laps in one step fire each lap's events). `timeline_seek` scrubs
+//     without firing anything.
+//
+// Usage:
+//   use timeline;
+//   var tl: Timeline = timeline_new(4.0, true);
+//   val cam: i64 = timeline_add_float(&mut tl, "fov");
+//   timeline_key(&mut tl, cam, 0.0, 60.0, TL_CUBIC);
+//   timeline_key(&mut tl, cam, 2.0, 45.0, TL_LINEAR);
+//   val evs: i64 = timeline_add_events(&mut tl, "sfx");
+//   timeline_event(&mut tl, evs, 1.5, "boom", 0);
+//   val fired: Vec<TlFired> = timeline_advance(&mut tl, dt);
+//   val fov: f64 = timeline_float(&tl, cam);
+
+module timeline;
+use vec;
+use math;
+
+pub const TL_STEP: i64 = 0;
+pub const TL_LINEAR: i64 = 1;
+pub const TL_CUBIC: i64 = 2;
+
+pub struct TlFloatTrack {
+    pub name: str,
+    pub times: Vec<f64>,
+    pub vals: Vec<f64>,
+    pub modes: Vec<i64>,
+}
+
+pub struct TlVecTrack {
+    pub name: str,
+    pub times: Vec<f64>,
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+    pub zs: Vec<f64>,
+    pub modes: Vec<i64>,
+}
+
+pub struct TlEventTrack {
+    pub name: str,
+    pub times: Vec<f64>,
+    pub names: Vec<str>,
+    pub payloads: Vec<i64>,
+}
+
+/// An event crossed by `timeline_advance`.
+pub struct TlFired {
+    pub track: str,
+    pub name: str,
+    pub time: f64,
+    pub payload: i64,
+}
+
+pub struct Timeline {
+    pub length: f64,
+    pub looping: bool,
+    pub speed: f64,
+    pub time: f64,
+    pub started: bool,
+    // an advance has happened since the start or the last seek to 0
+    pub finished: bool,
+    // a non-looping timeline reached its end (or start, backwards)
+    pub floats: Vec<TlFloatTrack>,
+    pub vecs: Vec<TlVecTrack>,
+    pub events: Vec<TlEventTrack>,
+}
+
+pub fn timeline_new(length: f64, looping: bool) -> Timeline {
+    return Timeline {
+        length: length, looping: looping, speed: 1.0, time: 0.0, started: false, finished: false, floats: Vec::new(), vecs: Vec::new(), events: Vec::new(),
+    };
+}
+
+// ─── Interpolation ────────────────────────────────────────────────────────
+
+// index of the last key with time <= t (-1: before the first)
+fn tl_seg(times: &Vec<f64>, t: f64) -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = times.len();
+    while lo < hi {
+        val mid: i64 = (lo + hi) / 2;
+        if times.get(mid) <= t {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo - 1;
+}
+
+// Catmull-Rom tangent at key k (one-sided at the ends)
+fn tl_tangent(times: &Vec<f64>, vals: &Vec<f64>, k: i64) -> f64 {
+    val n: i64 = times.len();
+    var a: i64 = k - 1;
+    var b: i64 = k + 1;
+    if a < 0 { a = k; }
+    if b >= n { b = k; }
+    val dt: f64 = times.get(b) - times.get(a);
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    return (vals.get(b) - vals.get(a)) / dt;
+}
+
+/// Value of keys (`times`, `vals`, `modes`) at time `t`.
+pub fn timeline_interp(times: &Vec<f64>, vals: &Vec<f64>, modes: &Vec<i64>, t: f64) -> f64 {
+    val n: i64 = times.len();
+    if n == 0 {
+        return 0.0;
+    }
+    val k: i64 = tl_seg(times, t);
+    if k < 0 {
+        return vals.get(0);
+    }
+    if k >= n - 1 {
+        return vals.get(n - 1);
+    }
+    val mode: i64 = modes.get(k);
+    val t0: f64 = times.get(k);
+    val t1: f64 = times.get(k + 1);
+    val p0: f64 = vals.get(k);
+    val p1: f64 = vals.get(k + 1);
+    val h: f64 = t1 - t0;
+    if mode == TL_STEP || h <= 0.0 {
+        return p0;
+    }
+    val s: f64 = (t - t0) / h;
+    if mode == TL_LINEAR {
+        return p0 + (p1 - p0) * s;
+    }
+    val m0: f64 = tl_tangent(times, vals, k);
+    val m1: f64 = tl_tangent(times, vals, k + 1);
+    val s2: f64 = s * s;
+    val s3: f64 = s2 * s;
+    val h00: f64 = 2.0 * s3 - 3.0 * s2 + 1.0;
+    val h10: f64 = s3 - 2.0 * s2 + s;
+    val h01: f64 = - 2.0 * s3 + 3.0 * s2;
+    val h11: f64 = s3 - s2;
+    return h00 * p0 + h10 * h * m0 + h01 * p1 + h11 * h * m1;
+}
+
+// insertion point keeping times sorted (after equal times)
+fn tl_insert_at(times: &Vec<f64>, t: f64) -> i64 {
+    return tl_seg(times, t) + 1;
+}
+
+// ─── Tracks ───────────────────────────────────────────────────────────────
+
+/// Add a float track; returns its index.
+pub fn timeline_add_float(tl: &mut Timeline, name: str) -> i64 {
+    tl.floats.push(TlFloatTrack { name: name, times: Vec::new(), vals: Vec::new(), modes: Vec::new() });
+    return tl.floats.len() - 1;
+}
+
+/// Add a vec3 track; returns its index.
+pub fn timeline_add_vec(tl: &mut Timeline, name: str) -> i64 {
+    tl.vecs.push(TlVecTrack { name: name, times: Vec::new(), xs: Vec::new(), ys: Vec::new(), zs: Vec::new(), modes: Vec::new() });
+    return tl.vecs.len() - 1;
+}
+
+/// Add an event track; returns its index.
+pub fn timeline_add_events(tl: &mut Timeline, name: str) -> i64 {
+    tl.events.push(TlEventTrack { name: name, times: Vec::new(), names: Vec::new(), payloads: Vec::new() });
+    return tl.events.len() - 1;
+}
+
+/// Key float track `track` at time `t`; `mode` shapes the segment after it.
+pub fn timeline_key(tl: &mut Timeline, track: i64, t: f64, value: f64, mode: i64) {
+    var tr: TlFloatTrack = tl.floats.get(track);
+    val at: i64 = tl_insert_at(&tr.times, t);
+    tr.times.insert(at, t);
+    tr.vals.insert(at, value);
+    tr.modes.insert(at, mode);
+    tl.floats.set(track, tr);
+}
+
+/// Key vec3 track `track` at time `t`.
+pub fn timeline_key_vec(tl: &mut Timeline, track: i64, t: f64, v: vec3, mode: i64) {
+    var tr: TlVecTrack = tl.vecs.get(track);
+    val at: i64 = tl_insert_at(&tr.times, t);
+    tr.times.insert(at, t);
+    tr.xs.insert(at, v.x);
+    tr.ys.insert(at, v.y);
+    tr.zs.insert(at, v.z);
+    tr.modes.insert(at, mode);
+    tl.vecs.set(track, tr);
+}
+
+/// Put event `name` (with `payload`) on event track `track` at time `t`.
+pub fn timeline_event(tl: &mut Timeline, track: i64, t: f64, name: str, payload: i64) {
+    var tr: TlEventTrack = tl.events.get(track);
+    val at: i64 = tl_insert_at(&tr.times, t);
+    tr.times.insert(at, t);
+    tr.names.insert(at, name);
+    tr.payloads.insert(at, payload);
+    tl.events.set(track, tr);
+}
+
+/// Float track `track` at time `t`.
+pub fn timeline_sample_float(tl: &Timeline, track: i64, t: f64) -> f64 {
+    val tr: TlFloatTrack = tl.floats.get(track);
+    return timeline_interp(&tr.times, &tr.vals, &tr.modes, t);
+}
+
+/// Vec3 track `track` at time `t` (each component interpolated).
+pub fn timeline_sample_vec(tl: &Timeline, track: i64, t: f64) -> vec3 {
+    val tr: TlVecTrack = tl.vecs.get(track);
+    return vec3(timeline_interp(&tr.times, &tr.xs, &tr.modes, t), timeline_interp(&tr.times, &tr.ys, &tr.modes, t), timeline_interp(&tr.times, &tr.zs, &tr.modes, t));
+}
+
+/// Float track `track` at the current time.
+pub fn timeline_float(tl: &Timeline, track: i64) -> f64 {
+    return timeline_sample_float(tl, track, tl.time);
+}
+
+/// Vec3 track `track` at the current time.
+pub fn timeline_vec(tl: &Timeline, track: i64) -> vec3 {
+    return timeline_sample_vec(tl, track, tl.time);
+}
+
+/// Index of the track named `name` among float (kind 0), vec (1) or event
+/// (2) tracks, -1 when there is none.
+pub fn timeline_find(tl: &Timeline, kind: i64, name: str) -> i64 {
+    var i: i64 = 0;
+    if kind == 0 {
+        while i < tl.floats.len() {
+            if tl.floats.get(i).name == name { return i; }
+            i = i + 1;
+        }
+    } else if kind == 1 {
+        while i < tl.vecs.len() {
+            if tl.vecs.get(i).name == name { return i; }
+            i = i + 1;
+        }
+    } else {
+        while i < tl.events.len() {
+            if tl.events.get(i).name == name { return i; }
+            i = i + 1;
+        }
+    }
+    return - 1;
+}
+
+// ─── Playback ─────────────────────────────────────────────────────────────
+
+// Push the events in [a, b] (lo_incl / hi_incl say which ends count),
+// ascending when `fwd`, else descending.
+fn tl_collect(tl: &Timeline, out: &mut Vec<TlFired>, a: f64, b: f64, lo_incl: bool, hi_incl: bool, fwd: bool) {
+    var tri: i64 = 0;
+    var batch: Vec<TlFired> = Vec::new();
+    while tri < tl.events.len() {
+        val tr: TlEventTrack = tl.events.get(tri);
+        var i: i64 = 0;
+        while i < tr.times.len() {
+            val t: f64 = tr.times.get(i);
+            val above: bool = t > a || (lo_incl && t == a);
+            val below: bool = t < b || (hi_incl && t == b);
+            if above && below {
+                batch.push(TlFired { track: tr.name, name: tr.names.get(i), time: t, payload: tr.payloads.get(i) });
+            }
+            i = i + 1;
+        }
+        tri = tri + 1;
+    }
+    // order by time (stable: track order on ties), reversed backwards
+    var k: i64 = 1;
+    while k < batch.len() {
+        var j: i64 = k;
+        while j > 0 {
+            val x: TlFired = batch.get(j - 1);
+            val y: TlFired = batch.get(j);
+            val swap: bool = if fwd { x.time > y.time } else { x.time < y.time };
+            if !swap {
+                break;
+            }
+            batch.set(j - 1, y);
+            batch.set(j, x);
+            j = j - 1;
+        }
+        k = k + 1;
+    }
+    var m: i64 = 0;
+    while m < batch.len() {
+        out.push(batch.get(m));
+        m = m + 1;
+    }
+}
+
+/// Jump to time `t` (clamped to 0..length) without firing events.
+pub fn timeline_seek(tl: &mut Timeline, t: f64) {
+    var x: f64 = t;
+    if x < 0.0 { x = 0.0; }
+    if x > tl.length { x = tl.length; }
+    tl.time = x;
+    tl.started = x > 0.0;
+    tl.finished = false;
+}
+
+/// Advance by `dt` * speed seconds; the events crossed, in order.
+pub fn timeline_advance(tl: &mut Timeline, dt: f64) -> Vec<TlFired> {
+    var out: Vec<TlFired> = Vec::new();
+    val step: f64 = dt * tl.speed;
+    if tl.finished || step == 0.0 || tl.length <= 0.0 {
+        return out;
+    }
+    val from: f64 = tl.time;
+    var to: f64 = from + step;
+    val first: bool = !tl.started;
+    tl.started = true;
+    if step > 0.0 {
+        // an event exactly at the start fires on the first advance
+        val incl: bool = first && from == 0.0;
+        if to <= tl.length || !tl.looping {
+            if to >= tl.length && !tl.looping {
+                to = tl.length;
+                tl.finished = true;
+            }
+            tl_collect(tl, &mut out, from, to, incl, true, true);
+            tl.time = to;
+            return out;
+        }
+        // looping past the end: rest of this lap, whole laps, then the start
+        tl_collect(tl, &mut out, from, tl.length, incl, true, true);
+        var left: f64 = to - tl.length;
+        var laps: i64 = 0;
+        while left > tl.length && laps < 1000 {
+            tl_collect(tl, &mut out, 0.0, tl.length, true, true, true);
+            left = left - tl.length;
+            laps = laps + 1;
+        }
+        if laps >= 1000 {
+            left = left - math_floor(left / tl.length) * tl.length;
+        }
+        tl_collect(tl, &mut out, 0.0, left, true, true, true);
+        tl.time = left;
+        return out;
+    }
+    // backwards
+    if to >= 0.0 || !tl.looping {
+        if to <= 0.0 && !tl.looping {
+            to = 0.0;
+            tl.finished = true;
+        }
+        tl_collect(tl, &mut out, to, from, true, false, false);
+        tl.time = to;
+        return out;
+    }
+    tl_collect(tl, &mut out, 0.0, from, true, false, false);
+    var left: f64 = - to;
+    var laps: i64 = 0;
+    while left > tl.length && laps < 1000 {
+        tl_collect(tl, &mut out, 0.0, tl.length, true, true, false);
+        left = left - tl.length;
+        laps = laps + 1;
+    }
+    if laps >= 1000 {
+        left = left - math_floor(left / tl.length) * tl.length;
+    }
+    tl_collect(tl, &mut out, tl.length - left, tl.length, true, true, false);
+    tl.time = tl.length - left;
+    return out;
+}

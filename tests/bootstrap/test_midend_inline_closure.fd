@@ -1,0 +1,50 @@
+// WP16 (compiler/iropt_me.fd ime_inline_closures, FID_IROPT_ON=inlineclo;
+// also inline2): a closure whose environment is known where it is called
+// becomes a direct call to `__closure_N` (closure devirtualization, on by
+// default); one called at a single site is then copied into its caller even
+// when it has several blocks (a loop, a branch), up to the once-called
+// limit. A closure called at two sites, or one passed to a function that
+// calls it through a pointer, stays a call. The program prints the same
+// with the pass on and off.
+//
+// Expected output:
+// 55
+// 7
+// 12
+// 30
+// 21
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn main() {
+    val base: i64 = 0;
+    // called once, a loop inside: inlined
+    val sum_to = fn(n: i64) {
+        var s: i64 = base;
+        var i: i64 = 1;
+        while i <= n {
+            s = s + i;
+            i = i + 1;
+        }
+        s
+    };
+    println(sum_to(10));
+    // called once, a branch inside: inlined
+    val k: i64 = 3;
+    val pick = fn(x: i64) {
+        if x > k {
+            x
+        } else {
+            k + x
+        }
+    };
+    println(pick(7));
+    // called at two sites: stays a call
+    val twice = fn(x: i64) { x * 2 + base };
+    println(twice(6));
+    println(twice(15));
+    // through a function pointer: stays a call
+    println(apply(fn(x: i64) { x + k * 6 }, 3));
+}

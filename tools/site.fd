@@ -861,11 +861,14 @@ pub fn site_respond(method: str, path: str) -> str {
     return site_reply(404, html, "", site_render_missing("/"), head_only);
 }
 
-// http_serve, not http_serve_scoped: with the Nov 15 compiler the scoped
-// path frees a request twice after the first response ("Double free" in
-// http_conn_task; see docs/website.md).
-fn site_handler(req: HttpRequest) -> str {
-    val resp: str = site_respond(req.method, req.path);
+// Served through http_serve_scoped (known-bugs 2g.35 is fixed): the
+// request's strings and the response are freed after each response, so the
+// server's memory stays flat however many pages it serves (http_serve kept
+// about 130 KB a request). The fields read as borrowed &str: the method and
+// path are copied for site_respond (owned temporaries, dropped at the end of
+// the statement).
+fn site_handler(req: ScopedRequest) -> str {
+    val resp: str = site_respond(str_clone(req.method), str_clone(req.path));
     println(req.method + " " + req.path + " " + str_slice(resp, 9, 12));
     return resp;
 }
@@ -952,7 +955,7 @@ fn main() -> i64 {
     }
     val port: i64 = args_int_in(av, "-p", "--port", 8080);
     println("site: serving " + g_site_root + " on http://localhost:" + int_to_str(port) + "/");
-    if !http_serve(port, site_handler) {
+    if !http_serve_scoped(port, site_handler) {
         println("site: cannot listen on port " + int_to_str(port));
         return 1;
     }

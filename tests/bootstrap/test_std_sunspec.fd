@@ -1,0 +1,85 @@
+// stdlib/sunspec: populate a Modbus holding-register image with the "SunS"
+// marker, a common model (1) and a three-phase inverter model (103), then
+// scan it over a ModbusMap, walk the model list, read the common block, and
+// read the inverter with scale factors applied.
+// Expected output:
+// marker at 0
+// models: 1@4 103@72 (2 total)
+// common: mfr SunSpecTest model INV-3000 serial SN12345 addr 1
+// inverter: A 10.5 V 240 W 5000 Hz 60 PF 98 Wh 123456
+// scale: 1050 x 10^-2 = 10.5
+use sunspec;
+use modbus;
+use vec;
+use string;
+
+fn setregs(m: &mut ModbusMap, off: i64, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        m.holding.set(off + i, v.get(i));
+        i = i + 1;
+    }
+}
+
+fn main() {
+    var m: ModbusMap = modbus_map_new(0, 0, 130, 0);
+
+    // SunS marker at offset 0
+    m.holding.set(0, SUNSPEC_MARKER_HI);
+    m.holding.set(1, SUNSPEC_MARKER_LO);
+
+    // Common model (1), length 66, data at offset 4
+    m.holding.set(2, 1);
+    m.holding.set(3, 66);
+    setregs(& mut m, 4, sunspec_pack_string("SunSpecTest", 16));
+    setregs(& mut m, 20, sunspec_pack_string("INV-3000", 16));
+    setregs(& mut m, 36, sunspec_pack_string("OPT", 8));
+    setregs(& mut m, 44, sunspec_pack_string("1.2.3", 8));
+    setregs(& mut m, 52, sunspec_pack_string("SN12345", 16));
+    m.holding.set(68, 1);   // device modbus address
+
+    // Inverter model (103), length 50, data at offset 72
+    m.holding.set(70, 103);
+    m.holding.set(71, 50);
+    m.holding.set(72, 1050);     // A
+    m.holding.set(76, 65534);    // A_SF = -2
+    m.holding.set(80, 2400);     // PhVphA
+    m.holding.set(83, 65535);    // V_SF = -1
+    m.holding.set(84, 5000);     // W
+    m.holding.set(85, 0);        // W_SF = 0
+    m.holding.set(86, 6000);     // Hz
+    m.holding.set(87, 65534);    // Hz_SF = -2
+    m.holding.set(88, 5200);     // VA
+    m.holding.set(89, 0);        // VA_SF
+    m.holding.set(90, 100);      // VAr
+    m.holding.set(91, 0);        // VAr_SF
+    m.holding.set(92, 9800);     // PF
+    m.holding.set(93, 65534);    // PF_SF = -2
+    m.holding.set(94, 1);        // WH hi (123456 = 0x0001E240)
+    m.holding.set(95, 57920);    // WH lo (0xE240)
+    m.holding.set(96, 0);        // WH_SF
+
+    // End marker
+    m.holding.set(122, 65535);
+
+    val marker: i64 = sunspec_find_marker(& m.holding, 0);
+    println("marker at " + int_to_str(marker));
+
+    val models: Vec<SunSpecModel> = sunspec_scan(& m, 0);
+    var ms: str = "";
+    var i: i64 = 0;
+    while i < models.len() {
+        if i > 0 { ms = ms + " "; }
+        ms = ms + int_to_str(models.get(i).id) + "@" + int_to_str(models.get(i).data_off);
+        i = i + 1;
+    }
+    println("models: " + ms + " (" + int_to_str(models.len()) + " total)");
+
+    val c: SunSpecCommon = sunspec_read_common(& m, & models);
+    println("common: mfr " + c.manufacturer + " model " + c.model + " serial " + c.serial + " addr " + int_to_str(c.device_address));
+
+    val inv: SunSpecInverter = sunspec_read_inverter(& m, & models);
+    println("inverter: A " + float_to_str(inv.ac_current) + " V " + float_to_str(inv.ac_voltage) + " W " + float_to_str(inv.ac_power) + " Hz " + float_to_str(inv.frequency) + " PF " + float_to_str(inv.power_factor) + " Wh " + float_to_str(inv.energy_wh));
+
+    println("scale: 1050 x 10^-2 = " + float_to_str(sunspec_apply_sf(1050, -2)));
+}

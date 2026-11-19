@@ -1,0 +1,373 @@
+// SMP bring-up on x86: application processor startup (INIT-SIPI-SIPI),
+// the trampoline's parameter block, per-CPU data blocks and the mapping
+// between logical CPU numbers, APIC ids, ACPI processor UIDs and the
+// package / core / thread topology.
+//
+// What is real: the trampoline placement rules (4-KiB aligned, below
+// 1 MiB, outside the EBDA/VGA/BIOS area, SIPI vector = page number), the
+// parameter block the AP reads (CR3, stack, 64-bit entry, GDT pointer,
+// CPU number, APIC id, a callin flag) laid out as bytes, the startup
+// sequence with the Intel MP specification timings (INIT, 10 ms, SIPI,
+// 200 us, second SIPI only if the AP has not checked in, then polling
+// for callin with a timeout), per-AP states, per-CPU area layout and the
+// base each CPU loads into IA32_GS_BASE / TPIDR_EL1 / tp, logical CPU
+// numbering from the MADT (BSP first, present and hot-pluggable CPUs),
+// and APIC id topology decoding with the CPUID 0xB / 0x1F shift widths.
+// ICR values come from stdlib apic.
+//
+// The seam: SmpOps — send_ipi(apic_id, icr_low) -> bool (lapic_send_ipi
+// in a kernel), delay_us(us) (a calibrated busy wait, see stdlib hpet),
+// read_flag(cpu) -> i64 (the AP's callin word in the parameter block).
+// The real-mode trampoline code itself is assembler copied by the
+// platform to the trampoline page; per-CPU memory here is a Vec of words.
+module smp;
+ use vec; use apic;
+
+pub const SMP_OFFLINE: i64 = 0;
+pub const SMP_STARTING: i64 = 1;
+pub const SMP_ONLINE: i64 = 2;
+pub const SMP_FAILED: i64 = 3;
+
+// Startup timings (microseconds), Intel MP spec B.4.
+pub const SMP_INIT_DELAY_US: i64 = 10000;
+pub const SMP_SIPI_DELAY_US: i64 = 200;
+pub const SMP_CALLIN_TIMEOUT_US: i64 = 100000;
+pub const SMP_CALLIN_POLL_US: i64 = 100;
+
+// Value an AP writes to its callin word once it runs 64-bit code.
+pub const SMP_CALLIN_MAGIC: i64 = 0x41505550;
+
+// ─── Trampoline ─────────────────────────────────────────────────────────
+
+/// Whether a trampoline page can be started by a SIPI: 4 KiB aligned,
+/// below 1 MiB, not page 0 (real-mode IVT/BDA) and below the EBDA/VGA
+/// hole at 0x9F000.
+pub fn smp_trampoline_ok(addr: i64) -> bool {
+    return (addr & 0xFFF) == 0 && addr >= 0x1000 && addr + 0x1000 <= 0x9F000;
+}
+
+/// SIPI vector of a trampoline page (CS = vector << 8, IP = 0).
+pub fn smp_sipi_vector(addr: i64) -> i64 {
+    return (addr >> 12) & 255;
+}
+
+pub struct ApParams {
+    pub cr3: i64,
+    pub stack_top: i64,
+    pub entry: i64,
+    pub gdt_base: i64,
+    pub gdt_limit: i64,
+    pub cpu: i64,
+    pub apic_id: i64,
+    pub callin: i64,
+}
+
+// Parameter block layout, at offset SMP_PARAMS_OFF of the trampoline page
+// (the trampoline code occupies the bytes before it):
+//   +0 cr3 (8)  +8 stack top (8)  +16 entry (8)  +24 GDT limit (2)
+//   +26 GDT base (8)  +34 pad (6)  +40 cpu (4)  +44 APIC id (4)
+//   +48 callin (4)
+pub const SMP_PARAMS_OFF: i64 = 0xF00;
+pub const SMP_PARAMS_SIZE: i64 = 52;
+
+fn smp_put(b: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        b.push((v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn smp_get(b: Vec<i64>, o: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = n - 1;
+    while i >= 0 {
+        v = (v << 8) | b.get(o + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+/// Bytes of the parameter block.
+@wrapping pub fn smp_params_encode(p: ApParams) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    smp_put(&mut b, p.cr3, 8);
+    smp_put(&mut b, p.stack_top, 8);
+    smp_put(&mut b, p.entry, 8);
+    smp_put(&mut b, p.gdt_limit, 2);
+    smp_put(&mut b, p.gdt_base, 8);
+    smp_put(&mut b, 0, 6);
+    smp_put(&mut b, p.cpu, 4);
+    smp_put(&mut b, p.apic_id, 4);
+    smp_put(&mut b, p.callin, 4);
+    return b;
+}
+
+@wrapping pub fn smp_params_decode(b: Vec<i64>) -> ApParams {
+    return ApParams {
+        cr3: smp_get(b, 0, 8), stack_top: smp_get(b, 8, 8), entry: smp_get(b, 16, 8), gdt_limit: smp_get(b, 24, 2), gdt_base: smp_get(b, 26, 8), cpu: smp_get(b, 40, 4), apic_id: smp_get(b, 44, 4), callin: smp_get(b, 48, 4)
+    };
+}
+
+// ─── Startup sequence ───────────────────────────────────────────────────
+
+pub const SMP_STEP_IPI: i64 = 0;
+pub const SMP_STEP_DELAY: i64 = 1;
+pub const SMP_STEP_WAIT: i64 = 2;
+// poll callin up to `value` us
+pub const SMP_STEP_SIPI_IF_ABSENT: i64 = 3;  // second SIPI, skipped when callin is seen
+
+pub struct SmpStep {
+    pub kind: i64,
+    pub value: i64,
+}
+
+/// The INIT-SIPI-SIPI plan for one AP. icr values are for shorthand none
+/// (destination = the AP's APIC id).
+pub fn smp_boot_plan(trampoline: i64) -> Vec<SmpStep> {
+    var s: Vec<SmpStep> = Vec::new();
+    s.push(SmpStep { kind: SMP_STEP_IPI, value: apic_icr_init(APIC_DEST_NONE) });
+    s.push(SmpStep { kind: SMP_STEP_DELAY, value: SMP_INIT_DELAY_US });
+    s.push(SmpStep { kind: SMP_STEP_IPI, value: apic_icr_sipi(trampoline, APIC_DEST_NONE) });
+    s.push(SmpStep { kind: SMP_STEP_DELAY, value: SMP_SIPI_DELAY_US });
+    s.push(SmpStep { kind: SMP_STEP_SIPI_IF_ABSENT, value: apic_icr_sipi(trampoline, APIC_DEST_NONE) });
+    s.push(SmpStep { kind: SMP_STEP_DELAY, value: SMP_SIPI_DELAY_US });
+    s.push(SmpStep { kind: SMP_STEP_WAIT, value: SMP_CALLIN_TIMEOUT_US });
+    return s;
+}
+
+pub struct SmpOps {
+    pub send_ipi: fn(i64, i64) -> bool,
+    pub delay_us: fn(i64) -> void,
+    pub read_flag: fn(i64) -> i64,
+}
+
+pub struct ApResult {
+    pub state: i64,
+    pub ipis: i64,
+    pub waited_us: i64,
+    // total delay spent
+}
+
+/// Run the plan for CPU `cpu` at APIC id `apic_id`. ONLINE when the
+/// callin word holds SMP_CALLIN_MAGIC in time, FAILED otherwise (an IPI
+/// that was not delivered fails at once).
+pub fn smp_boot_ap(ops: & SmpOps, cpu: i64, apic_id: i64, trampoline: i64) -> ApResult {
+    var r: ApResult = ApResult { state: SMP_STARTING, ipis: 0, waited_us: 0 };
+    val send = ops.send_ipi;
+    val delay = ops.delay_us;
+    val flag = ops.read_flag;
+    var plan: Vec<SmpStep> = smp_boot_plan(trampoline);
+    var i: i64 = 0;
+    while i < plan.len() {
+        var st: SmpStep = plan.get(i);
+        if st.kind == SMP_STEP_IPI || (st.kind == SMP_STEP_SIPI_IF_ABSENT && flag(cpu) != SMP_CALLIN_MAGIC) {
+            if !send(apic_id, st.value) {
+                r.state = SMP_FAILED;
+                return r;
+            }
+            r.ipis = r.ipis + 1;
+        }
+        if st.kind == SMP_STEP_DELAY {
+            delay(st.value);
+            r.waited_us = r.waited_us + st.value;
+        }
+        if st.kind == SMP_STEP_WAIT {
+            var t: i64 = 0;
+            while flag(cpu) != SMP_CALLIN_MAGIC {
+                if t >= st.value {
+                    r.state = SMP_FAILED;
+                    return r;
+                }
+                delay(SMP_CALLIN_POLL_US);
+                t = t + SMP_CALLIN_POLL_US;
+                r.waited_us = r.waited_us + SMP_CALLIN_POLL_US;
+            }
+        }
+        i = i + 1;
+    }
+    r.state = SMP_ONLINE;
+    return r;
+}
+
+// ─── CPU numbering ──────────────────────────────────────────────────────
+
+pub struct CpuMap {
+    pub apic_ids: Vec<i64>,
+    // logical cpu -> APIC id
+    pub uids: Vec<i64>,
+    pub present: Vec<bool>,
+    // enabled at boot (others are hot-pluggable)
+    pub state: Vec<i64>,
+}
+
+/// Logical numbering from the MADT: the BSP (bsp_apic_id) is CPU 0, then
+/// every enabled CPU, then online-capable ones (possible, not present).
+pub fn smp_cpu_map(info: & MadtInfo, bsp_apic_id: i64) -> CpuMap {
+    var m: CpuMap = CpuMap { apic_ids: Vec::new(), uids: Vec::new(), present: Vec::new(), state: Vec::new() };
+    var pass: i64 = 0;
+    while pass < 3 {
+        var i: i64 = 0;
+        while i < info.cpus.len() {
+            var c: MadtCpu = info.cpus.get(i);
+            var take: bool = false;
+            if pass == 0 { take = c.apic_id == bsp_apic_id && c.enabled; }
+            if pass == 1 { take = c.apic_id != bsp_apic_id && c.enabled; }
+            if pass == 2 { take = !c.enabled && c.online_capable; }
+            if take && !m.apic_ids.contains(c.apic_id) {
+                m.apic_ids.push(c.apic_id);
+                m.uids.push(c.uid);
+                m.present.push(c.enabled);
+                if pass == 0 {
+                    m.state.push(SMP_ONLINE);
+                } else {
+                    m.state.push(SMP_OFFLINE);
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    return m;
+}
+
+/// Logical CPU of an APIC id, -1 when unknown.
+pub fn smp_cpu_of_apic(m: & CpuMap, apic_id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < m.apic_ids.len() {
+        if m.apic_ids.get(i) == apic_id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn smp_present_count(m: & CpuMap) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < m.present.len() {
+        if m.present.get(i) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn smp_set_state(m: & mut CpuMap, cpu: i64, st: i64) {
+    m.state.set(cpu, st);
+}
+
+pub fn smp_online_count(m: & CpuMap) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < m.state.len() {
+        if m.state.get(i) == SMP_ONLINE { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ─── Topology ───────────────────────────────────────────────────────────
+
+pub struct CpuTopo {
+    pub package: i64,
+    pub core: i64,
+    pub thread: i64,
+}
+
+/// Split an x2APIC id with the CPUID leaf 0xB / 0x1F shifts: smt_shift
+/// (EAX of the SMT level) and core_shift (EAX of the core level).
+pub fn smp_topology(apic_id: i64, smt_shift: i64, core_shift: i64) -> CpuTopo {
+    return CpuTopo {
+        package: apic_id >> core_shift, core: (apic_id >> smt_shift) & ((1 << (core_shift - smt_shift)) - 1), thread: apic_id & ((1 << smt_shift) - 1)
+    };
+}
+
+/// Bits needed for n items (the shift width CPUID reports for a level).
+pub fn smp_shift_for(n: i64) -> i64 {
+    var s: i64 = 0;
+    while (1 << s) < n {
+        s = s + 1;
+    }
+    return s;
+}
+
+// ─── Per-CPU data ───────────────────────────────────────────────────────
+// Each CPU owns a block of `stride` bytes (a multiple of 64 so blocks
+// never share a cache line). Fixed fields at the start of every block:
+pub const PCPU_SELF: i64 = 0;
+// the block's own address (read as gs:0)
+pub const PCPU_CPU: i64 = 8;
+pub const PCPU_APIC_ID: i64 = 16;
+pub const PCPU_CURRENT: i64 = 24;
+pub const PCPU_KSTACK: i64 = 32;
+pub const PCPU_TSS: i64 = 40;
+pub const PCPU_PREEMPT: i64 = 48;
+pub const PCPU_IRQ_DEPTH: i64 = 56;
+pub const PCPU_FIRST_FREE: i64 = 64;
+
+pub const MSR_GS_BASE: i64 = 0xC0000101;
+pub const MSR_KERNEL_GS_BASE: i64 = 0xC0000102;
+
+pub struct PerCpu {
+    pub base: i64,
+    pub stride: i64,
+    pub count: i64,
+    pub words: Vec<i64>,  // the area's memory, one element per 8 bytes
+}
+
+/// Area for `count` CPUs at virtual address base with `size` bytes of
+/// per-CPU data (rounded up to a multiple of 64).
+pub fn percpu_new(base: i64, count: i64, size: i64) -> PerCpu {
+    var stride: i64 = (size + 63) / 64 * 64;
+    if stride < PCPU_FIRST_FREE {
+        stride = PCPU_FIRST_FREE;
+    }
+    return PerCpu { base: base, stride: stride, count: count, words: Vec::filled(stride / 8 * count, 0) };
+}
+
+/// Address of `field` in cpu's block.
+pub fn percpu_addr(p: & PerCpu, cpu: i64, field: i64) -> i64 {
+    return p.base + cpu * p.stride + field;
+}
+
+/// The per-CPU base register value (IA32_GS_BASE, TPIDR_EL1, tp).
+pub fn percpu_base(p: & PerCpu, cpu: i64) -> i64 {
+    return p.base + cpu * p.stride;
+}
+
+pub fn percpu_get(p: & PerCpu, cpu: i64, field: i64) -> i64 {
+    return p.words.get((cpu * p.stride + field) / 8);
+}
+
+pub fn percpu_set(p: & mut PerCpu, cpu: i64, field: i64, v: i64) {
+    p.words.set((cpu * p.stride + field) / 8, v);
+}
+
+/// Fill the fixed fields of every block from a CPU map.
+pub fn percpu_init(p: & mut PerCpu, m: & CpuMap, kstacks_top: i64, kstack_size: i64) {
+    var c: i64 = 0;
+    while c < p.count && c < m.apic_ids.len() {
+        percpu_set(p, c, PCPU_SELF, percpu_base(p, c));
+        percpu_set(p, c, PCPU_CPU, c);
+        percpu_set(p, c, PCPU_APIC_ID, m.apic_ids.get(c));
+        percpu_set(p, c, PCPU_KSTACK, kstacks_top - c * kstack_size);
+        c = c + 1;
+    }
+}
+
+/// Which CPU owns a per-CPU address, -1 outside the area.
+pub fn percpu_owner(p: & PerCpu, addr: i64) -> i64 {
+    var off: i64 = addr - p.base;
+    if off < 0 || off >= p.stride * p.count {
+        return -1;
+    }
+    return off / p.stride;
+}
+
+/// Parameters for AP `cpu` (its stack from the per-CPU area).
+pub fn smp_ap_params(p: & PerCpu, cpu: i64, cr3: i64, entry: i64, gdt_base: i64, gdt_limit: i64) -> ApParams {
+    return ApParams {
+        cr3: cr3, stack_top: percpu_get(p, cpu, PCPU_KSTACK), entry: entry, gdt_base: gdt_base, gdt_limit: gdt_limit, cpu: cpu, apic_id: percpu_get(p, cpu, PCPU_APIC_ID), callin: 0
+    };
+}

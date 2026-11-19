@@ -1,0 +1,199 @@
+// Translated from cursors.c by c2fd (C to Fid, best effort): review it before use.
+// C headers: <stdio.h> (their calls are mapped to Fid's).
+
+// Pointers walking arrays: c2fd writes each as an index into its array.
+
+// A parameter moved along the array it points into.
+fn sum_until_zero(p: &Vec<i64>, p_at: i64) -> i64 {
+    var total: i64 = 0;
+    while p[p_at] != 0 {
+        val _t1: i64 = p_at;
+        p_at += 1;
+        total += p[_t1];
+    }
+    return total;
+}
+
+// Callers point into the middle: the offset becomes a parameter.
+fn sum_n(a: &Vec<i64>, a_at: i64, n: i64) -> i64 {
+    var s: i64 = 0;
+    for i in 0..n {
+        s += a[a_at + i];
+    }
+    return s;
+}
+
+// Recursion on the rest of the array.
+fn count_even(a: &Vec<i64>, a_at: i64, n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    return (if a[a_at] % 2 == 0 { 1 } else { 0 }) + count_even(a, a_at + 1, n - 1);
+}
+
+// A local pointer from start to end, compared with an end pointer.
+fn max_of(a: &Vec<i64>, a_at: i64, n: i64) -> i64 {
+    var p: i64 = a_at;
+    val end: i64 = a_at + n;
+    var best: i64 = a[p];
+    while p < end {
+        if a[p] > best {
+            best = a[p];
+        }
+        p += 1;
+    }
+    return best;
+}
+
+// Writing through a moving pointer.
+fn fill_squares(dst: &mut Vec<i64>, n: i64) {
+    var dst_at: i64 = 0;
+    for i in 0..n {
+        val _t1: i64 = dst_at;
+        dst_at += 1;
+        dst[_t1] = i * i;
+    }
+}
+
+// Two pointers from both ends, swapping.
+fn reverse(a: &mut Vec<i64>, a_at: i64, n: i64) {
+    var lo: i64 = a_at;
+    var hi: i64 = a_at + n - 1;
+    while lo < hi {
+        val t: i64 = a[lo];
+        a[lo] = a[hi];
+        a[hi] = t;
+        lo += 1;
+        hi -= 1;
+    }
+}
+
+// Indexing a pointer that was moved, and a pointer difference.
+fn find(a: &Vec<i64>, n: i64, x: i64) -> i64 {
+    var p: i64 = 1;
+    p -= 1;
+    while p < n {
+        if a[p] == x {
+            return p;
+        }
+        p += 1;
+    }
+    return -1;
+}
+
+// A char buffer written through a pointer.
+fn upcase(s: &mut Vec<i64>) {
+    var s_at: i64 = 0;
+    while s[s_at] != 0 {
+        if s[s_at] >= 'a' && s[s_at] <= 'z' {
+            s[s_at] = s[s_at] - 'a' + 'A';
+        }
+        s_at += 1;
+    }
+}
+
+fn print_array(a: &Vec<i64>, n: i64) {
+    for i in 0..n {
+        if i == 0 {
+            print(a[i]);
+        } else {
+            print(f" {a[i]}");
+        }
+    }
+    println("");
+}
+
+fn main() -> i64 {
+    var data: Vec<i64> = Vec::new();
+    for x in [3, 4, 5, 0, 9] {
+        data.push(x);
+    }
+    println(sum_until_zero(&data, 0));
+    println(sum_until_zero(&data, 1));
+
+    var v: Vec<i64> = Vec::new();
+    for x in [7, 2, 9, 4, 11, 6, 1, 8] {
+        v.push(x);
+    }
+    println(f"{sum_n(&v, 0, 8)} {sum_n(&v, 2, 3)}");
+    println(count_even(&v, 0, 8));
+    println(f"{max_of(&v, 0, 8)} {max_of(&v, 5, 3)}");
+
+    var sq: Vec<i64> = Vec::filled(6, 0);
+    fill_squares(&mut sq, 6);
+    print_array(&sq, 6);
+    reverse(&mut sq, 0, 6);
+    print_array(&sq, 6);
+    reverse(&mut sq, 1, 4);
+    print_array(&sq, 6);
+
+    println(f"{find(&v, 8, 11)} {find(&v, 8, 5)}");
+
+    var q: i64 = 0;
+    q += 3;
+    v[q] = 40;
+    v[q + 1] = 50;
+    v[q + 2] = 60;
+    print_array(&v, 8);
+
+    var word: Vec<i64> = c_bytes("hello, world");
+    upcase(&mut word);
+    println(c_cstr(&word));
+
+    // a local char pointer writing into a buffer
+    var buf: Vec<i64> = Vec::filled(16, 0);
+    var w: i64 = 0;
+    for i in 0..3 {
+        val _t1: i64 = w;
+        w += 1;
+        buf[_t1] = 'x' + i;
+    }
+    buf[w] = '\0';
+    println(f"{c_cstr(&buf)} {w}");
+
+    // a read-only string walk stays a str
+    var s: str = "abc";
+    var len: i64 = 0;
+    while c_char(s, 0) != 0 {
+        s = c_skip(s, 1);
+        len += 1;
+    }
+    println(len);
+    return 0;
+}
+
+// --- c2fd helpers: the C library behaviour this translation relies on ---
+
+/// s[i] of a C string: its NUL (0) at the end.
+fn c_char(s: str, i: i64) -> i64 {
+    if i < 0 || i >= str_len(s) {
+        return 0;
+    }
+    return str_byte_at(s, i);
+}
+
+/// s + n for a C string: what follows its first n bytes.
+fn c_skip(s: str, n: i64) -> str {
+    if n >= str_len(s) {
+        return "";
+    }
+    return str_slice(s, n, str_len(s));
+}
+
+/// A char array holding s and its NUL.
+fn c_bytes(s: str) -> Vec<i64> {
+    var b: Vec<i64> = str_bytes(s);
+    b.push(0);
+    return b;
+}
+
+/// The C string in a char array, as a str.
+fn c_cstr(b: &Vec<i64>) -> str {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() && b[i] != 0 {
+        v.push(b[i]);
+        i += 1;
+    }
+    return str_from_bytes(v);
+}

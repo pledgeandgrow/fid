@@ -1,0 +1,1438 @@
+// pdb.fd — program databases (PDB, MSF 7.00) for Windows images: what
+// Visual Studio, WinDbg and dbghelp read (own-backend roadmap DB3, release
+// N9). A debug build's image (`fid emit -g`: pe_ir, and `--nat`) already
+// carries COFF symbols and DWARF sections, which gdb, lldb and llvm tools
+// read; Microsoft's debuggers read neither, only a PDB that the image names
+// in its debug directory.
+//
+// pdb_attach is the one call a backend makes, after its image is complete
+// (sections, DWARF and COFF symbol table written):
+//   1. pdb_guid: the PDB's GUID, a hash of the image (the same input gives
+//      the same image and the same PDB);
+//   2. pdb_add_debug_directory: a `.buildid` section with an
+//      IMAGE_DEBUG_DIRECTORY entry of type CODEVIEW and its RSDS record
+//      (GUID, age, the PDB's path), data directory 6 pointing at it; the
+//      COFF symbol table moves after the new section;
+//   3. pdb_build: the PDB itself, written to g_pdb_out (pdb_setup: the
+//      output path with .exe -> .pdb) or $FID_PDB_OUT.
+// No path (pdb_setup not called, FID_PDB=0): the image comes back as it is.
+//
+// The PDB (streams of an MSF container, block size 4096):
+//   0  old directory (empty)
+//   1  PDB info: version VC70, signature, age, GUID, the named stream map
+//      ("/names" -> 5) and the feature VC140
+//   2  TPI, 4 IPI: headers only (no type records; functions have type 0,
+//      as assembly procedures do)
+//   3  DBI: one module (the input file) with its section contribution
+//      (.text), the section map, the file info (the module's source files),
+//      an empty EC name table and the optional debug header naming the
+//      section header stream
+//   5  /names: the source file names (string table, hash version 1)
+//   6  the module's symbols: S_OBJNAME, S_COMPILE3, then per function
+//      S_GPROC32 ... S_END; and its C13 lines: DEBUG_S_FILECHKSMS (one
+//      entry per file, no checksum) and a DEBUG_S_LINES subsection per
+//      function, one block per run of rows of the same file
+//   7  globals: S_PROCREF for each function (GSI hash)
+//   8  publics: S_PUB32 for each function and each other COFF function
+//      symbol of the image (runtime stubs, primitives, thunks), GSI hash
+//      and address map
+//   9  the symbol records of 7 and 8
+//   10 the image's section headers (dbghelp maps section:offset with them)
+// The formats are those LLVM documents (llvm/docs/PDB) and lld writes.
+//
+// Rows are those the backends already record for DWARF: [code offset,
+// line, 2 * file + end?] (nat_ir.fd; pe_ir.fd's rows are file 0), offsets
+// counted from the start of .text (section 1). Checks:
+// tests/nattools/pdb_unit.fd (the writer on a real image, run by
+// tests/nattools/pe_pdb_check.py, which reads the PDB with its own MSF
+// reader, with dbghelp on Windows and with llvm-pdbutil when present).
+
+module compiler::pdb; use core; use vec; use string;
+
+/// The PDB pdb_attach writes ("" = none): pdb_setup sets it.
+pub var g_pdb_out: str = "";
+
+pub const PDB_BLOCK: i64 = 4096;
+const PDB_S_END: i64 = 0x0006;
+const PDB_S_OBJNAME: i64 = 0x1101;
+const PDB_S_PUB32: i64 = 0x110E;
+const PDB_S_GPROC32: i64 = 0x1110;
+const PDB_S_PROCREF: i64 = 0x1125;
+const PDB_S_COMPILE3: i64 = 0x113C;
+const PDB_DEBUG_S_LINES: i64 = 0xF2;
+const PDB_DEBUG_S_FILECHKSMS: i64 = 0xF4;
+const PDB_IPHR_HASH: i64 = 4096;
+const PDB_STREAM_NAMES: i64 = 5;
+const PDB_STREAM_MODULE: i64 = 6;
+const PDB_STREAM_GLOBALS: i64 = 7;
+const PDB_STREAM_PUBLICS: i64 = 8;
+const PDB_STREAM_SYMRECS: i64 = 9;
+const PDB_STREAM_SECHDR: i64 = 10;
+
+// --- Bytes ------------------------------------------------------------------
+
+fn pdb_u8(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+}
+
+fn pdb_u16(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+}
+
+fn pdb_u32(out: & mut Vec<i64>, v: i64) {
+    pdb_u16(out, v & 0xFFFF);
+    pdb_u16(out, (v >> 16) & 0xFFFF);
+}
+
+fn pdb_set_u16(out: & mut Vec<i64>, at: i64, v: i64) {
+    out.set(at, v & 255);
+    out.set(at + 1, (v >> 8) & 255);
+}
+
+fn pdb_set_u32(out: & mut Vec<i64>, at: i64, v: i64) {
+    pdb_set_u16(out, at, v & 0xFFFF);
+    pdb_set_u16(out, at + 2, (v >> 16) & 0xFFFF);
+}
+
+pub fn pdb_get_u16(b: & Vec<i64>, at: i64) -> i64 {
+    return (b.get(at) & 255) | ((b.get(at + 1) & 255) << 8);
+}
+
+pub fn pdb_get_u32(b: & Vec<i64>, at: i64) -> i64 {
+    return pdb_get_u16(b, at) | (pdb_get_u16(b, at + 2) << 16);
+}
+
+fn pdb_cstr(out: & mut Vec<i64>, s: str) {
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    while i < n {
+        out.push(str_byte_at(s, i) & 255);
+        i = i + 1;
+    }
+    out.push(0);
+}
+
+fn pdb_pad4(out: & mut Vec<i64>) {
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
+fn pdb_append(out: & mut Vec<i64>, src: & Vec<i64>) {
+    var i: i64 = 0;
+    var n: i64 = src.len();
+    while i < n {
+        out.push(src.get(i));
+        i = i + 1;
+    }
+}
+
+fn pdb_align(v: i64, a: i64) -> i64 {
+    return ((v + a - 1) / a) * a;
+}
+
+/// A CodeView symbol record: u16 length (after itself), u16 kind; the
+/// caller writes the fields, then pdb_rec_end pads it to 4 bytes with zeros
+/// and sets the length. Returns where the record starts.
+fn pdb_rec_begin(out: & mut Vec<i64>, kind: i64) -> i64 {
+    var at: i64 = out.len();
+    pdb_u16(out, 0);
+    pdb_u16(out, kind);
+    return at;
+}
+
+fn pdb_rec_end(out: & mut Vec<i64>, at: i64) {
+    pdb_pad4(out);
+    pdb_set_u16(out, at, out.len() - at - 2);
+}
+
+// --- Hashes -----------------------------------------------------------------
+
+/// hashStringV1 of the PDB reference implementation (LHashPbCb): the names
+/// map of the info stream, the string tables and the GSI buckets use it.
+pub fn pdb_hash_v1(s: str) -> i64 {
+    var n: i64 = str_len(s);
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i + 4 <= n {
+        r = r ^ ((str_byte_at(s, i) & 255) | ((str_byte_at(s, i + 1) & 255) << 8) | ((str_byte_at(s, i + 2) & 255) << 16) | ((str_byte_at(s, i + 3) & 255) << 24));
+        i = i + 4;
+    }
+    if n - i >= 2 {
+        r = r ^ ((str_byte_at(s, i) & 255) | ((str_byte_at(s, i + 1) & 255) << 8));
+        i = i + 2;
+    }
+    if n - i == 1 {
+        r = r ^ (str_byte_at(s, i) & 255);
+    }
+    r = r | 0x20202020;
+    r = r ^ (r >> 11);
+    return (r ^ (r >> 16)) & 0xFFFFFFFF;
+}
+
+/// The PDB's GUID (16 bytes, a version-4 layout): four FNV-1a lanes over
+/// the image, so the same image always names the same PDB.
+pub fn pdb_guid(pe: & Vec<i64>) -> Vec<i64> {
+    var h0: i64 = 0x811C9DC5;
+    var h1: i64 = 0x050C5D1F;
+    var h2: i64 = 0x2E5BE3A1;
+    var h3: i64 = 0x1B873593;
+    var i: i64 = 0;
+    var n: i64 = pe.len();
+    while i < n {
+        var b: i64 = pe.get(i) & 255;
+        h0 = ((h0 ^ b) * 16777619) & 0xFFFFFFFF;
+        h1 = ((h1 ^ ((b + 0x5B) & 255)) * 16777619) & 0xFFFFFFFF;
+        h2 = ((h2 ^ ((b + 0xA7) & 255)) * 16777619) & 0xFFFFFFFF;
+        h3 = ((h3 ^ ((b + 0x3D) & 255)) * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    h3 = ((h3 ^ (n & 0xFFFFFFFF)) * 16777619) & 0xFFFFFFFF;
+    var g: Vec<i64> = Vec::new();
+    pdb_u32(& mut g, h0);
+    pdb_u32(& mut g, h1);
+    pdb_u32(& mut g, h2);
+    pdb_u32(& mut g, h3);
+    g.set(7, (g.get(7) & 0x0F) | 0x40);
+    g.set(8, (g.get(8) & 0x3F) | 0x80);
+    return g;
+}
+
+/// The GUID as Windows prints it ({XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
+/// without braces, upper case): what symbol servers and dumpbin show.
+pub fn pdb_guid_text(g: & Vec<i64>) -> str {
+    var out: str = "";
+    out = out + pdb_hex(pdb_get_u32(g, 0), 8) + "-" + pdb_hex(pdb_get_u16(g, 4), 4) + "-" + pdb_hex(pdb_get_u16(g, 6), 4) + "-";
+    var i: i64 = 8;
+    while i < 16 {
+        if i == 10 {
+            out = out + "-";
+        }
+        out = out + pdb_hex(g.get(i), 2);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pdb_hex(v: i64, digits: i64) -> str {
+    var out: str = "";
+    var d: i64 = digits - 1;
+    while d >= 0 {
+        var x: i64 = (v >> (4 * d)) & 15;
+        if x < 10 {
+            out = out + char_to_str(48 + x);
+        } else {
+            out = out + char_to_str(55 + x);
+        }
+        d = d - 1;
+    }
+    return out;
+}
+
+// --- Setup and the backends' call --------------------------------------------
+
+/// The PDB beside `exe`: its name with ".exe" replaced by ".pdb" (or
+/// ".pdb" added).
+pub fn pdb_path_for(exe: str) -> str {
+    var n: i64 = str_len(exe);
+    if n > 4 && str_to_lower(str_slice(exe, n - 4, n)) == ".exe" {
+        return str_slice(exe, 0, n - 4) + ".pdb";
+    }
+    return exe + ".pdb";
+}
+
+/// A debug build's driver (main.fd) calls this with the output path before
+/// the backend runs: pdb_attach then writes the PDB beside it. FID_PDB=0
+/// writes none.
+pub fn pdb_setup(output: str) {
+    match env_var("FID_PDB") {
+        Option::Some(v) => {
+            if v == "0" {
+                g_pdb_out = "";
+                return;
+            }
+        }
+        Option::None => {
+        }
+    }
+    g_pdb_out = pdb_path_for(output);
+}
+
+/// Where pdb_attach writes: g_pdb_out, else $FID_PDB_OUT, else "".
+pub fn pdb_out_path() -> str {
+    if g_pdb_out != "" {
+        return g_pdb_out;
+    }
+    match env_var("FID_PDB_OUT") {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+        }
+    }
+    return "";
+}
+
+/// The backends' call (pe_ir.fd after the COFF symbols, nat_enc.fd
+/// nat_pe_debug): `pe` is the finished image; the functions `names` span
+/// [starts, ends) of .text; `rows` are their line rows (see the top of the
+/// file) against `files` (empty: just `file`). Writes the PDB to
+/// pdb_out_path() and returns the image with its debug directory; with no
+/// path, no functions, or an image pdb_add_debug_directory cannot extend,
+/// returns `pe` as it is (and writes nothing).
+pub fn pdb_attach(pe: Vec<i64>, names: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, rows: Vec<i64>, files: Vec<str>, file: str) -> Vec<i64> {
+    var path: str = pdb_out_path();
+    if path == "" || names.len() == 0 || names.len() != starts.len() || names.len() != ends.len() {
+        return pe;
+    }
+    var guid: Vec<i64> = pdb_guid(& pe);
+    var out: Vec<i64> = pdb_add_debug_directory(& pe, & guid, 1, path);
+    if out.len() == 0 {
+        return pe;
+    }
+    var bytes: Vec<i64> = pdb_build(& out, & names, & starts, & ends, & rows, & files, file, & guid, 1);
+    p_file_write_vec(path, bytes);
+    return out;
+}
+
+// --- The image's debug directory ---------------------------------------------
+
+/// Where the PE headers of `pe` are: [e_lfanew, NumberOfSections, the
+/// optional header, the section table], or an empty Vec when `pe` is not a
+/// PE32+ image.
+fn pdb_pe_layout(pe: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if pe.len() < 0x200 || pe.get(0) != 0x4D || pe.get(1) != 0x5A {
+        return out;
+    }
+    var e: i64 = pdb_get_u32(pe, 0x3C);
+    if e <= 0 || e + 24 + 240 > pe.len() || pe.get(e) != 0x50 || pe.get(e + 1) != 0x45 || pe.get(e + 2) != 0 || pe.get(e + 3) != 0 {
+        return out;
+    }
+    var opt: i64 = e + 24;
+    if pdb_get_u16(pe, opt) != 0x20B {
+        return out;
+    }
+    out.push(e);
+    out.push(pdb_get_u16(pe, e + 6));
+    out.push(opt);
+    out.push(opt + pdb_get_u16(pe, e + 20));
+    return out;
+}
+
+/// `pe` (a PE32+ image) with a `.buildid` section after its last one that
+/// holds an IMAGE_DEBUG_DIRECTORY entry (type 2, CODEVIEW) and the RSDS
+/// record it points at: "RSDS", `guid`, `age`, `path` NUL-ended. Data
+/// directory 6 (Debug) points at the entry. The section gets the next
+/// aligned address and file space (INITIALIZED_DATA | MEM_READ);
+/// NumberOfSections, SizeOfImage and SizeOfInitializedData cover it. A COFF
+/// symbol table after the sections moves after the new one (its pointer
+/// follows). Empty when `pe` is not a PE32+ image, has fewer than 7 data
+/// directories, or has no room for another section header.
+pub fn pdb_add_debug_directory(pe: & Vec<i64>, guid: & Vec<i64>, age: i64, path: str) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    var lay: Vec<i64> = pdb_pe_layout(pe);
+    if lay.len() == 0 || guid.len() != 16 {
+        return none;
+    }
+    var e: i64 = lay.get(0);
+    var nsec: i64 = lay.get(1);
+    var opt: i64 = lay.get(2);
+    var sect: i64 = lay.get(3);
+    var hdr_size: i64 = pdb_get_u32(pe, opt + 60);
+    var file_align: i64 = pdb_get_u32(pe, opt + 36);
+    var sect_align: i64 = pdb_get_u32(pe, opt + 32);
+    if pdb_get_u32(pe, opt + 108) < 7 || sect + 40 * (nsec + 1) > hdr_size || file_align <= 0 || sect_align <= 0 {
+        return none;
+    }
+    // the first free address, right after the last section (the loader
+    // wants the sections contiguous in memory)
+    var next_rva: i64 = 0;
+    var s: i64 = 0;
+    while s < nsec {
+        var h: i64 = sect + 40 * s;
+        var vs: i64 = pdb_get_u32(pe, h + 8);
+        if vs == 0 {
+            vs = pdb_get_u32(pe, h + 16);
+        }
+        var top: i64 = pdb_align(pdb_get_u32(pe, h + 12) + vs, sect_align);
+        if top > next_rva {
+            next_rva = top;
+        }
+        s = s + 1;
+    }
+    var symptr: i64 = pdb_get_u32(pe, e + 12);
+    var body_end: i64 = pe.len();
+    if symptr > 0 && symptr <= pe.len() {
+        body_end = symptr;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < body_end {
+        out.push(pe.get(i));
+        i = i + 1;
+    }
+    while out.len() % file_align != 0 {
+        out.push(0);
+    }
+    var raw_off: i64 = out.len();
+    // the section: the directory entry, then the RSDS record
+    var data: Vec<i64> = Vec::new();
+    pdb_u32(& mut data, 0);
+    // Characteristics
+    pdb_u32(& mut data, 0);
+    // TimeDateStamp (none: reproducible)
+    pdb_u16(& mut data, 0);
+    pdb_u16(& mut data, 0);
+    // version
+    pdb_u32(& mut data, 2);
+    // IMAGE_DEBUG_TYPE_CODEVIEW
+    var rsds: Vec<i64> = Vec::new();
+    rsds.push(0x52);
+    rsds.push(0x53);
+    rsds.push(0x44);
+    rsds.push(0x53);
+    pdb_append(& mut rsds, guid);
+    pdb_u32(& mut rsds, age);
+    pdb_cstr(& mut rsds, path);
+    pdb_u32(& mut data, rsds.len());
+    // SizeOfData
+    pdb_u32(& mut data, next_rva + 28);
+    // AddressOfRawData
+    pdb_u32(& mut data, raw_off + 28);
+    // PointerToRawData
+    pdb_append(& mut data, & rsds);
+    var raw: i64 = pdb_align(data.len(), file_align);
+    pdb_append(& mut out, & data);
+    while out.len() < raw_off + raw {
+        out.push(0);
+    }
+    // the section header
+    var sh: i64 = sect + 40 * nsec;
+    var name: str = ".buildid";
+    var k: i64 = 0;
+    while k < 8 {
+        out.set(sh + k, str_byte_at(name, k) & 255);
+        k = k + 1;
+    }
+    pdb_set_u32(& mut out, sh + 8, data.len());
+    pdb_set_u32(& mut out, sh + 12, next_rva);
+    pdb_set_u32(& mut out, sh + 16, raw);
+    pdb_set_u32(& mut out, sh + 20, raw_off);
+    pdb_set_u32(& mut out, sh + 24, 0);
+    pdb_set_u32(& mut out, sh + 28, 0);
+    pdb_set_u32(& mut out, sh + 32, 0);
+    pdb_set_u32(& mut out, sh + 36, 0x40000040);
+    pdb_set_u16(& mut out, e + 6, nsec + 1);
+    // SizeOfImage, SizeOfInitializedData, data directory 6 (Debug)
+    pdb_set_u32(& mut out, opt + 56, next_rva + pdb_align(data.len(), sect_align));
+    pdb_set_u32(& mut out, opt + 8, pdb_get_u32(& out, opt + 8) + raw);
+    pdb_set_u32(& mut out, opt + 112 + 6 * 8, next_rva);
+    pdb_set_u32(& mut out, opt + 112 + 6 * 8 + 4, 28);
+    // the COFF symbol table (and its string table) after the new section
+    if body_end < pe.len() {
+        pdb_set_u32(& mut out, e + 12, out.len());
+        i = body_end;
+        while i < pe.len() {
+            out.push(pe.get(i));
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// The function symbols of `pe`'s COFF symbol table (section 1, .text):
+/// their names in `names`, their offsets in .text in `offs`.
+pub fn pdb_coff_functions(pe: & Vec<i64>, names: & mut Vec<str>, offs: & mut Vec<i64>) {
+    var lay: Vec<i64> = pdb_pe_layout(pe);
+    if lay.len() == 0 {
+        return;
+    }
+    var e: i64 = lay.get(0);
+    var symptr: i64 = pdb_get_u32(pe, e + 12);
+    var nsyms: i64 = pdb_get_u32(pe, e + 16);
+    if symptr <= 0 || symptr + 18 * nsyms > pe.len() {
+        return;
+    }
+    var strtab: i64 = symptr + 18 * nsyms;
+    var i: i64 = 0;
+    while i < nsyms {
+        var at: i64 = symptr + 18 * i;
+        var sec: i64 = pdb_get_u16(pe, at + 12);
+        var naux: i64 = pe.get(at + 17) & 255;
+        if sec == 1 {
+            var bytes: Vec<i64> = Vec::new();
+            if pdb_get_u32(pe, at) == 0 {
+                var p: i64 = strtab + pdb_get_u32(pe, at + 4);
+                while p < pe.len() && pe.get(p) != 0 {
+                    bytes.push(pe.get(p) & 255);
+                    p = p + 1;
+                }
+            } else {
+                var k: i64 = 0;
+                while k < 8 && pe.get(at + k) != 0 {
+                    bytes.push(pe.get(at + k) & 255);
+                    k = k + 1;
+                }
+            }
+            if bytes.len() > 0 {
+                names.push(str_from_bytes(bytes));
+                offs.push(pdb_get_u32(pe, at + 8));
+            }
+        }
+        i = i + 1 + naux;
+    }
+}
+
+// --- String tables and hash tables ---------------------------------------------
+
+/// The bucket count of a PDB string table of `n` names (LLVM's table, so
+/// the tables match what lld writes).
+fn pdb_strtab_buckets(n: i64) -> i64 {
+    if n <= 1 {
+        return 2;
+    }
+    if n <= 2 {
+        return 4;
+    }
+    if n <= 4 {
+        return 7;
+    }
+    if n <= 6 {
+        return 11;
+    }
+    if n <= 9 {
+        return 17;
+    }
+    if n <= 13 {
+        return 26;
+    }
+    if n <= 20 {
+        return 40;
+    }
+    if n <= 31 {
+        return 61;
+    }
+    if n <= 46 {
+        return 92;
+    }
+    if n <= 70 {
+        return 139;
+    }
+    return n * 2 + 1;
+}
+
+/// A PDB string table (the /names stream, the DBI's EC names): header
+/// (0xEFFEEFFE, hash version 1, size of the strings), the strings `buf`
+/// (starting with the empty string), the buckets (hashStringV1, linear
+/// probing; 0 = empty) and the number of names. `offs` are the names'
+/// offsets in `buf`.
+fn pdb_string_table(buf: & Vec<i64>, offs: & Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    pdb_u32(& mut out, 0xEFFEEFFE);
+    pdb_u32(& mut out, 1);
+    pdb_u32(& mut out, buf.len());
+    pdb_append(& mut out, buf);
+    var nb: i64 = pdb_strtab_buckets(offs.len());
+    var buckets: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nb {
+        buckets.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < offs.len() {
+        var off: i64 = offs.get(i);
+        var h: i64 = pdb_hash_v1(pdb_cstr_at(buf, off));
+        var t: i64 = 0;
+        while t < nb {
+            var slot: i64 = (h + t) % nb;
+            if buckets.get(slot) == 0 {
+                buckets.set(slot, off);
+                t = nb;
+            }
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+    pdb_u32(& mut out, nb);
+    i = 0;
+    while i < nb {
+        pdb_u32(& mut out, buckets.get(i));
+        i = i + 1;
+    }
+    pdb_u32(& mut out, offs.len());
+    return out;
+}
+
+fn pdb_cstr_at(buf: & Vec<i64>, at: i64) -> str {
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = at;
+    while i < buf.len() && buf.get(i) != 0 {
+        bytes.push(buf.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(bytes);
+}
+
+/// Add `s` to the string buffer `buf` (once) and return its offset.
+fn pdb_intern(buf: & mut Vec<i64>, offs: & mut Vec<i64>, strs: & mut Vec<str>, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < strs.len() {
+        if strs.get(i) == s {
+            return offs.get(i);
+        }
+        i = i + 1;
+    }
+    var at: i64 = buf.len();
+    pdb_cstr(buf, s);
+    offs.push(at);
+    strs.push(s);
+    return at;
+}
+
+/// The order of names within a GSI bucket (the reference implementation's
+/// caseInsensitiveComparePchPchCchCch): shorter first; ASCII names case
+/// insensitively, others byte by byte.
+fn pdb_gsi_cmp(a: str, b: str) -> i64 {
+    var la: i64 = str_len(a);
+    var lb: i64 = str_len(b);
+    if la != lb {
+        if la < lb {
+            return 0 - 1;
+        }
+        return 1;
+    }
+    var ascii: bool = true;
+    var i: i64 = 0;
+    while i < la {
+        if (str_byte_at(a, i) & 255) >= 128 || (str_byte_at(b, i) & 255) >= 128 {
+            ascii = false;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < la {
+        var x: i64 = str_byte_at(a, i) & 255;
+        var y: i64 = str_byte_at(b, i) & 255;
+        if ascii {
+            if x >= 65 && x <= 90 {
+                x = x + 32;
+            }
+            if y >= 65 && y <= 90 {
+                y = y + 32;
+            }
+        }
+        if x != y {
+            if x < y {
+                return 0 - 1;
+            }
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// A GSI hash table (globals and publics streams): header (0xFFFFFFFF,
+/// GSIHashV70, size of the hash records, size of bitmap and buckets), one
+/// record {offset + 1, 1} per name in bucket order (hashStringV1 % 4096;
+/// within a bucket by pdb_gsi_cmp, then offset), the bitmap of non-empty
+/// buckets (4096 + 32 bits) and, per non-empty bucket, where its chain
+/// starts (record index * 12, the reference implementation's in-memory
+/// record size). `offs` are the records' offsets in the symbol record
+/// stream.
+fn pdb_gsi_hash(names: & Vec<str>, offs: & Vec<i64>) -> Vec<i64> {
+    var n: i64 = names.len();
+    var bucket: Vec<i64> = Vec::new();
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        bucket.push(pdb_hash_v1(names.get(i)) % PDB_IPHR_HASH);
+        order.push(i);
+        i = i + 1;
+    }
+    // insertion sort by (bucket, name, offset)
+    i = 1;
+    while i < n {
+        var cur: i64 = order.get(i);
+        var j: i64 = i - 1;
+        var moving: bool = true;
+        while j >= 0 && moving {
+            var o: i64 = order.get(j);
+            var before: bool = false;
+            if bucket.get(cur) != bucket.get(o) {
+                before = bucket.get(cur) < bucket.get(o);
+            } else {
+                var c: i64 = pdb_gsi_cmp(names.get(cur), names.get(o));
+                if c != 0 {
+                    before = c < 0;
+                } else {
+                    before = offs.get(cur) < offs.get(o);
+                }
+            }
+            if before {
+                order.set(j + 1, o);
+                j = j - 1;
+            } else {
+                moving = false;
+            }
+        }
+        order.set(j + 1, cur);
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    var nwords: i64 = (PDB_IPHR_HASH + 32) / 32;
+    var bitmap: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nwords {
+        bitmap.push(0);
+        i = i + 1;
+    }
+    var chains: Vec<i64> = Vec::new();
+    var prev: i64 = 0 - 1;
+    i = 0;
+    while i < n {
+        var b: i64 = bucket.get(order.get(i));
+        if b != prev {
+            bitmap.set(b / 32, bitmap.get(b / 32) | (1 << (b % 32)));
+            chains.push(i * 12);
+            prev = b;
+        }
+        i = i + 1;
+    }
+    pdb_u32(& mut out, 0xFFFFFFFF);
+    pdb_u32(& mut out, 0xEFFE0000 + 19990810);
+    pdb_u32(& mut out, n * 8);
+    pdb_u32(& mut out, nwords * 4 + chains.len() * 4);
+    i = 0;
+    while i < n {
+        pdb_u32(& mut out, offs.get(order.get(i)) + 1);
+        pdb_u32(& mut out, 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nwords {
+        pdb_u32(& mut out, bitmap.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < chains.len() {
+        pdb_u32(& mut out, chains.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- Line rows ---------------------------------------------------------------
+
+/// The rows of the function at [start, end): triples [offset from start,
+/// line, file index], by offset, one per offset (the last row given for
+/// it), lines > 0 only, and a first row at offset 0 (the function's first
+/// line) when the first recorded row is later (the prologue).
+fn pdb_fn_rows(rows: & Vec<i64>, start: i64, end: i64, nfiles: i64) -> Vec<i64> {
+    var offs: Vec<i64> = Vec::new();
+    var lines: Vec<i64> = Vec::new();
+    var fls: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 2 < rows.len() {
+        var at: i64 = rows.get(i);
+        var line: i64 = rows.get(i + 1);
+        var flag: i64 = rows.get(i + 2);
+        if at >= start && at < end && (flag & 1) == 0 && line > 0 {
+            var f: i64 = flag >> 1;
+            if f < 0 || f >= nfiles {
+                f = 0;
+            }
+            if line > 0xFFFFFF {
+                line = 0xFFFFFF;
+            }
+            // keep them by offset: insert after the last row at or before
+            var k: i64 = offs.len();
+            while k > 0 && offs.get(k - 1) > at - start {
+                k = k - 1;
+            }
+            if k > 0 && offs.get(k - 1) == at - start {
+                lines.set(k - 1, line);
+                fls.set(k - 1, f);
+            } else {
+                offs.push(0);
+                lines.push(0);
+                fls.push(0);
+                var m: i64 = offs.len() - 1;
+                while m > k {
+                    offs.set(m, offs.get(m - 1));
+                    lines.set(m, lines.get(m - 1));
+                    fls.set(m, fls.get(m - 1));
+                    m = m - 1;
+                }
+                offs.set(k, at - start);
+                lines.set(k, line);
+                fls.set(k, f);
+            }
+        }
+        i = i + 3;
+    }
+    var out: Vec<i64> = Vec::new();
+    if offs.len() > 0 && offs.get(0) > 0 {
+        out.push(0);
+        out.push(lines.get(0));
+        out.push(fls.get(0));
+    }
+    i = 0;
+    while i < offs.len() {
+        out.push(offs.get(i));
+        out.push(lines.get(i));
+        out.push(fls.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- The PDB ------------------------------------------------------------------
+
+/// The PDB of the image `pe` (with its debug directory: pdb_add_debug_
+/// directory): the functions `names` at [starts, ends) of .text, their
+/// line rows `rows` against `files` (empty: `file`), `guid` and `age` as
+/// in the image's RSDS record. See the top of the file for the streams.
+pub fn pdb_build(pe: & Vec<i64>, names: & Vec<str>, starts: & Vec<i64>, ends: & Vec<i64>, rows: & Vec<i64>, files: & Vec<str>, file: str, guid: & Vec<i64>, age: i64) -> Vec<i64> {
+    var lay: Vec<i64> = pdb_pe_layout(pe);
+    var nsec: i64 = 0;
+    var sect: i64 = 0;
+    if lay.len() > 0 {
+        nsec = lay.get(1);
+        sect = lay.get(3);
+    }
+    var text_size: i64 = 0;
+    var text_chars: i64 = 0x60000020;
+    if nsec > 0 {
+        text_size = pdb_get_u32(pe, sect + 8);
+        text_chars = pdb_get_u32(pe, sect + 36);
+    }
+    var main_file: str = file;
+    if main_file == "" {
+        main_file = "fides";
+    }
+    // the source files: `files` (the first one "" means `file`), else `file`
+    var fl: Vec<str> = Vec::new();
+    var fi: i64 = 0;
+    while fi < files.len() {
+        var fname: str = files.get(fi);
+        if fname == "" {
+            fname = main_file;
+        }
+        fl.push(fname);
+        fi = fi + 1;
+    }
+    if fl.len() == 0 {
+        fl.push(main_file);
+    }
+    // /names: the file names
+    var nbuf: Vec<i64> = Vec::new();
+    nbuf.push(0);
+    var noffs: Vec<i64> = Vec::new();
+    var nstrs: Vec<str> = Vec::new();
+    var file_name_off: Vec<i64> = Vec::new();
+    fi = 0;
+    while fi < fl.len() {
+        file_name_off.push(pdb_intern(& mut nbuf, & mut noffs, & mut nstrs, fl.get(fi)));
+        fi = fi + 1;
+    }
+    var names_stream: Vec<i64> = pdb_string_table(& nbuf, & noffs);
+
+    // the module's symbols
+    var msyms: Vec<i64> = Vec::new();
+    pdb_u32(& mut msyms, 4);
+    // CV_SIGNATURE_C13
+    var r: i64 = pdb_rec_begin(& mut msyms, PDB_S_OBJNAME);
+    pdb_u32(& mut msyms, 0);
+    pdb_cstr(& mut msyms, main_file);
+    pdb_rec_end(& mut msyms, r);
+    r = pdb_rec_begin(& mut msyms, PDB_S_COMPILE3);
+    pdb_u32(& mut msyms, 0);
+    // flags: language C (the expression evaluators' plainest)
+    pdb_u16(& mut msyms, 0xD0);
+    // CV_CFL_X64
+    var vi: i64 = 0;
+    while vi < 8 {
+        if vi == 0 || vi == 4 {
+            pdb_u16(& mut msyms, 1);
+        } else {
+            pdb_u16(& mut msyms, 0);
+        }
+        vi = vi + 1;
+    }
+    pdb_cstr(& mut msyms, "fid");
+    pdb_rec_end(& mut msyms, r);
+    var proc_off: Vec<i64> = Vec::new();
+    var proc_name: Vec<str> = Vec::new();
+    var proc_start: Vec<i64> = Vec::new();
+    var proc_end: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() {
+        var st: i64 = starts.get(i);
+        var en: i64 = ends.get(i);
+        var nm: str = names.get(i);
+        if en > st && st >= 0 && nm != "" {
+            var at: i64 = pdb_rec_begin(& mut msyms, PDB_S_GPROC32);
+            pdb_u32(& mut msyms, 0);
+            // parent
+            pdb_u32(& mut msyms, 0);
+            // end (set below)
+            pdb_u32(& mut msyms, 0);
+            // next
+            pdb_u32(& mut msyms, en - st);
+            pdb_u32(& mut msyms, 0);
+            // debug start
+            pdb_u32(& mut msyms, en - st);
+            // debug end
+            pdb_u32(& mut msyms, 0);
+            // type: none
+            pdb_u32(& mut msyms, st);
+            pdb_u16(& mut msyms, 1);
+            // section 1, .text
+            pdb_u8(& mut msyms, 0);
+            // flags
+            pdb_cstr(& mut msyms, nm);
+            pdb_rec_end(& mut msyms, at);
+            var end_at: i64 = pdb_rec_begin(& mut msyms, PDB_S_END);
+            pdb_rec_end(& mut msyms, end_at);
+            pdb_set_u32(& mut msyms, at + 8, end_at);
+            proc_off.push(at);
+            proc_name.push(nm);
+            proc_start.push(st);
+            proc_end.push(en);
+        }
+        i = i + 1;
+    }
+    var sym_bytes: i64 = msyms.len();
+    // C13: the file checksums (none), then the lines of each function
+    var c13: Vec<i64> = Vec::new();
+    var chk: Vec<i64> = Vec::new();
+    var chk_off: Vec<i64> = Vec::new();
+    fi = 0;
+    while fi < fl.len() {
+        chk_off.push(chk.len());
+        pdb_u32(& mut chk, file_name_off.get(fi));
+        pdb_u8(& mut chk, 0);
+        // checksum size
+        pdb_u8(& mut chk, 0);
+        // checksum kind: none
+        pdb_pad4(& mut chk);
+        fi = fi + 1;
+    }
+    pdb_u32(& mut c13, PDB_DEBUG_S_FILECHKSMS);
+    pdb_u32(& mut c13, chk.len());
+    pdb_append(& mut c13, & chk);
+    i = 0;
+    while i < proc_off.len() {
+        var lst: i64 = proc_start.get(i);
+        var len_fn: i64 = proc_end.get(i) - lst;
+        var fr: Vec<i64> = pdb_fn_rows(rows, lst, lst + len_fn, fl.len());
+        if fr.len() > 0 {
+            var sub: Vec<i64> = Vec::new();
+            pdb_u32(& mut sub, lst);
+            pdb_u16(& mut sub, 1);
+            pdb_u16(& mut sub, 0);
+            // no columns
+            pdb_u32(& mut sub, len_fn);
+            var k: i64 = 0;
+            while k < fr.len() {
+                var bfile: i64 = fr.get(k + 2);
+                var bend: i64 = k;
+                while bend < fr.len() && fr.get(bend + 2) == bfile {
+                    bend = bend + 3;
+                }
+                var cnt: i64 = (bend - k) / 3;
+                pdb_u32(& mut sub, chk_off.get(bfile));
+                pdb_u32(& mut sub, cnt);
+                pdb_u32(& mut sub, 12 + 8 * cnt);
+                var q: i64 = k;
+                while q < bend {
+                    pdb_u32(& mut sub, fr.get(q));
+                    pdb_u32(& mut sub, fr.get(q + 1) | 0x80000000);
+                    // is a statement
+                    q = q + 3;
+                }
+                k = bend;
+            }
+            pdb_u32(& mut c13, PDB_DEBUG_S_LINES);
+            pdb_u32(& mut c13, sub.len());
+            pdb_append(& mut c13, & sub);
+            pdb_pad4(& mut c13);
+        }
+        i = i + 1;
+    }
+    var mod_stream: Vec<i64> = Vec::new();
+    pdb_append(& mut mod_stream, & msyms);
+    pdb_append(& mut mod_stream, & c13);
+    pdb_u32(& mut mod_stream, 0);
+    // no global refs
+
+    // the symbol records: publics (the functions, then the image's other
+    // COFF function symbols), then the globals' S_PROCREFs
+    var recs: Vec<i64> = Vec::new();
+    var pub_names: Vec<str> = Vec::new();
+    var pub_offs: Vec<i64> = Vec::new();
+    var pub_addr: Vec<i64> = Vec::new();
+    var seen: i64 = HashMap_new();
+    i = 0;
+    while i < proc_off.len() {
+        var pn: str = proc_name.get(i);
+        if !HashMap_contains(seen, pn) {
+            HashMap_insert(seen, pn, 1);
+            pub_offs.push(recs.len());
+            pub_names.push(pn);
+            pub_addr.push(proc_start.get(i));
+            var pr: i64 = pdb_rec_begin(& mut recs, PDB_S_PUB32);
+            pdb_u32(& mut recs, 2);
+            // a function
+            pdb_u32(& mut recs, proc_start.get(i));
+            pdb_u16(& mut recs, 1);
+            pdb_cstr(& mut recs, pn);
+            pdb_rec_end(& mut recs, pr);
+        }
+        i = i + 1;
+    }
+    var cnames: Vec<str> = Vec::new();
+    var coffs: Vec<i64> = Vec::new();
+    pdb_coff_functions(pe, & mut cnames, & mut coffs);
+    i = 0;
+    while i < cnames.len() {
+        var cn: str = cnames.get(i);
+        if !HashMap_contains(seen, cn) && coffs.get(i) >= 0 && (text_size == 0 || coffs.get(i) < text_size) {
+            HashMap_insert(seen, cn, 1);
+            pub_offs.push(recs.len());
+            pub_names.push(cn);
+            pub_addr.push(coffs.get(i));
+            var cr: i64 = pdb_rec_begin(& mut recs, PDB_S_PUB32);
+            pdb_u32(& mut recs, 2);
+            pdb_u32(& mut recs, coffs.get(i));
+            pdb_u16(& mut recs, 1);
+            pdb_cstr(& mut recs, cn);
+            pdb_rec_end(& mut recs, cr);
+        }
+        i = i + 1;
+    }
+    var glob_names: Vec<str> = Vec::new();
+    var glob_offs: Vec<i64> = Vec::new();
+    i = 0;
+    while i < proc_off.len() {
+        glob_offs.push(recs.len());
+        glob_names.push(proc_name.get(i));
+        var gr: i64 = pdb_rec_begin(& mut recs, PDB_S_PROCREF);
+        pdb_u32(& mut recs, 0);
+        // SumName
+        pdb_u32(& mut recs, proc_off.get(i));
+        // the S_GPROC32 in the module stream
+        pdb_u16(& mut recs, 1);
+        // module 1 (counted from 1)
+        pdb_cstr(& mut recs, proc_name.get(i));
+        pdb_rec_end(& mut recs, gr);
+        i = i + 1;
+    }
+    var globals: Vec<i64> = pdb_gsi_hash(& glob_names, & glob_offs);
+    // publics: header, hash, the address map (by section, offset, name)
+    var pub_hash: Vec<i64> = pdb_gsi_hash(& pub_names, & pub_offs);
+    var amap: Vec<i64> = Vec::new();
+    i = 0;
+    while i < pub_names.len() {
+        amap.push(i);
+        i = i + 1;
+    }
+    i = 1;
+    while i < amap.len() {
+        var cur: i64 = amap.get(i);
+        var j: i64 = i - 1;
+        var moving: bool = true;
+        while j >= 0 && moving {
+            var o: i64 = amap.get(j);
+            var before: bool = false;
+            if pub_addr.get(cur) != pub_addr.get(o) {
+                before = pub_addr.get(cur) < pub_addr.get(o);
+            } else {
+                before = str_compare(pub_names.get(cur), pub_names.get(o)) < 0;
+            }
+            if before {
+                amap.set(j + 1, o);
+                j = j - 1;
+            } else {
+                moving = false;
+            }
+        }
+        amap.set(j + 1, cur);
+        i = i + 1;
+    }
+    var publics: Vec<i64> = Vec::new();
+    pdb_u32(& mut publics, pub_hash.len());
+    // SymHash
+    pdb_u32(& mut publics, amap.len() * 4);
+    // AddrMap
+    pdb_u32(& mut publics, 0);
+    // NumThunks
+    pdb_u32(& mut publics, 0);
+    // SizeOfThunk
+    pdb_u16(& mut publics, 0);
+    // ISectThunkTable
+    pdb_u16(& mut publics, 0);
+    pdb_u32(& mut publics, 0);
+    // OffThunkTable
+    pdb_u32(& mut publics, 0);
+    // NumSections
+    pdb_append(& mut publics, & pub_hash);
+    i = 0;
+    while i < amap.len() {
+        pdb_u32(& mut publics, pub_offs.get(amap.get(i)));
+        i = i + 1;
+    }
+
+    // DBI
+    var modi: Vec<i64> = Vec::new();
+    pdb_u32(& mut modi, 0);
+    pdb_section_contrib(& mut modi, text_size, text_chars);
+    pdb_u16(& mut modi, 0);
+    // flags
+    pdb_u16(& mut modi, PDB_STREAM_MODULE);
+    pdb_u32(& mut modi, sym_bytes);
+    pdb_u32(& mut modi, 0);
+    // C11 lines
+    pdb_u32(& mut modi, c13.len());
+    pdb_u16(& mut modi, fl.len());
+    pdb_u16(& mut modi, 0);
+    pdb_u32(& mut modi, 0);
+    pdb_u32(& mut modi, 0);
+    // source file name index
+    pdb_u32(& mut modi, 0);
+    // PDB file path name index
+    pdb_cstr(& mut modi, main_file);
+    pdb_cstr(& mut modi, main_file);
+    pdb_pad4(& mut modi);
+    var contribs: Vec<i64> = Vec::new();
+    pdb_u32(& mut contribs, 0xEFFE0000 + 19970605);
+    pdb_section_contrib(& mut contribs, text_size, text_chars);
+    var secmap: Vec<i64> = Vec::new();
+    pdb_u16(& mut secmap, nsec + 1);
+    pdb_u16(& mut secmap, nsec + 1);
+    var s: i64 = 0;
+    while s < nsec {
+        var ch: i64 = pdb_get_u32(pe, sect + 40 * s + 36);
+        var fl16: i64 = 0x100;
+        // IsSelector
+        if (ch & 0x40000000) != 0 {
+            fl16 = fl16 | 1;
+        }
+        if (ch & 0x80000000) != 0 {
+            fl16 = fl16 | 2;
+        }
+        if (ch & 0x20000000) != 0 {
+            fl16 = fl16 | 4;
+        }
+        if (ch & 0x00020000) == 0 {
+            fl16 = fl16 | 8;
+        }
+        pdb_u16(& mut secmap, fl16);
+        pdb_u16(& mut secmap, 0);
+        pdb_u16(& mut secmap, 0);
+        pdb_u16(& mut secmap, s + 1);
+        pdb_u16(& mut secmap, 0xFFFF);
+        pdb_u16(& mut secmap, 0xFFFF);
+        pdb_u32(& mut secmap, 0);
+        pdb_u32(& mut secmap, pdb_get_u32(pe, sect + 40 * s + 8));
+        s = s + 1;
+    }
+    pdb_u16(& mut secmap, 8 | 0x200);
+    // the absolute pseudo-section
+    pdb_u16(& mut secmap, 0);
+    pdb_u16(& mut secmap, 0);
+    pdb_u16(& mut secmap, nsec + 1);
+    pdb_u16(& mut secmap, 0xFFFF);
+    pdb_u16(& mut secmap, 0xFFFF);
+    pdb_u32(& mut secmap, 0);
+    pdb_u32(& mut secmap, 0xFFFFFFFF);
+    var finfo: Vec<i64> = Vec::new();
+    pdb_u16(& mut finfo, 1);
+    pdb_u16(& mut finfo, fl.len());
+    pdb_u16(& mut finfo, 0);
+    pdb_u16(& mut finfo, fl.len());
+    var fnames: Vec<i64> = Vec::new();
+    fi = 0;
+    while fi < fl.len() {
+        pdb_u32(& mut finfo, fnames.len());
+        pdb_cstr(& mut fnames, fl.get(fi));
+        fi = fi + 1;
+    }
+    pdb_append(& mut finfo, & fnames);
+    pdb_pad4(& mut finfo);
+    var ec_buf: Vec<i64> = Vec::new();
+    ec_buf.push(0);
+    var ec_offs: Vec<i64> = Vec::new();
+    var ec: Vec<i64> = pdb_string_table(& ec_buf, & ec_offs);
+    var dbghdr: Vec<i64> = Vec::new();
+    var di: i64 = 0;
+    while di < 11 {
+        if di == 5 {
+            pdb_u16(& mut dbghdr, PDB_STREAM_SECHDR);
+        } else {
+            pdb_u16(& mut dbghdr, 0xFFFF);
+        }
+        di = di + 1;
+    }
+    var dbi: Vec<i64> = Vec::new();
+    pdb_u32(& mut dbi, 0xFFFFFFFF);
+    pdb_u32(& mut dbi, 19990903);
+    // V70
+    pdb_u32(& mut dbi, age);
+    pdb_u16(& mut dbi, PDB_STREAM_GLOBALS);
+    pdb_u16(& mut dbi, 0x8E0B);
+    // new format, 14.11 (what Microsoft's tools expect, as lld writes)
+    pdb_u16(& mut dbi, PDB_STREAM_PUBLICS);
+    pdb_u16(& mut dbi, 0);
+    pdb_u16(& mut dbi, PDB_STREAM_SYMRECS);
+    pdb_u16(& mut dbi, 0);
+    pdb_u32(& mut dbi, modi.len());
+    pdb_u32(& mut dbi, contribs.len());
+    pdb_u32(& mut dbi, secmap.len());
+    pdb_u32(& mut dbi, finfo.len());
+    pdb_u32(& mut dbi, 0);
+    // type server map
+    pdb_u32(& mut dbi, 0);
+    // MFC type server
+    pdb_u32(& mut dbi, dbghdr.len());
+    pdb_u32(& mut dbi, ec.len());
+    pdb_u16(& mut dbi, 0);
+    // flags
+    pdb_u16(& mut dbi, 0x8664);
+    pdb_u32(& mut dbi, 0);
+    pdb_append(& mut dbi, & modi);
+    pdb_append(& mut dbi, & contribs);
+    pdb_append(& mut dbi, & secmap);
+    pdb_append(& mut dbi, & finfo);
+    pdb_append(& mut dbi, & ec);
+    pdb_append(& mut dbi, & dbghdr);
+
+    // PDB info
+    var info: Vec<i64> = Vec::new();
+    pdb_u32(& mut info, 20000404);
+    // VC70
+    pdb_u32(& mut info, pdb_get_u32(guid, 0));
+    // signature
+    pdb_u32(& mut info, age);
+    pdb_append(& mut info, guid);
+    var nm_names: str = "/names";
+    pdb_u32(& mut info, str_len(nm_names) + 1);
+    pdb_cstr(& mut info, nm_names);
+    pdb_u32(& mut info, 1);
+    // entries
+    pdb_u32(& mut info, 8);
+    // capacity
+    pdb_u32(& mut info, 1);
+    // present bit vector: one word
+    pdb_u32(& mut info, 1 << ((pdb_hash_v1(nm_names) & 0xFFFF) % 8));
+    pdb_u32(& mut info, 0);
+    // deleted bit vector: none
+    pdb_u32(& mut info, 0);
+    // key: "/names" at 0 in the buffer
+    pdb_u32(& mut info, PDB_STREAM_NAMES);
+    pdb_u32(& mut info, 20140508);
+    // feature VC140
+
+    var sechdr: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 40 * nsec {
+        sechdr.push(pe.get(sect + i) & 255);
+        i = i + 1;
+    }
+
+    var streams: Vec<Vec<i64>> = Vec::new();
+    streams.push(Vec::new());
+    streams.push(info);
+    streams.push(pdb_tpi_header());
+    streams.push(dbi);
+    streams.push(pdb_tpi_header());
+    streams.push(names_stream);
+    streams.push(mod_stream);
+    streams.push(globals);
+    streams.push(publics);
+    streams.push(recs);
+    streams.push(sechdr);
+    return pdb_msf(& streams);
+}
+
+/// A section contribution (28 bytes): .text (section 1) from offset 0 for
+/// `size` bytes, module 0.
+fn pdb_section_contrib(out: & mut Vec<i64>, size: i64, chars: i64) {
+    pdb_u16(out, 1);
+    pdb_u16(out, 0);
+    pdb_u32(out, 0);
+    pdb_u32(out, size);
+    pdb_u32(out, chars);
+    pdb_u16(out, 0);
+    pdb_u16(out, 0);
+    pdb_u32(out, 0);
+    pdb_u32(out, 0);
+}
+
+/// A TPI or IPI stream with no records: the 56-byte header (V80, type
+/// indices 0x1000..0x1000, no hash stream).
+fn pdb_tpi_header() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    pdb_u32(& mut out, 20040203);
+    pdb_u32(& mut out, 56);
+    pdb_u32(& mut out, 0x1000);
+    pdb_u32(& mut out, 0x1000);
+    pdb_u32(& mut out, 0);
+    // record bytes
+    pdb_u16(& mut out, 0xFFFF);
+    pdb_u16(& mut out, 0xFFFF);
+    // hash streams: none
+    pdb_u32(& mut out, 4);
+    // hash key size
+    pdb_u32(& mut out, 0x3FFFF);
+    // buckets
+    var k: i64 = 0;
+    while k < 6 {
+        pdb_u32(& mut out, 0);
+        k = k + 1;
+    }
+    return out;
+}
+
+// --- MSF ----------------------------------------------------------------------
+
+/// The next block at or after `b` that is not a free block map block
+/// (blocks 1 and 2 of every 4096).
+fn pdb_msf_next(b: i64) -> i64 {
+    var x: i64 = b;
+    while x % PDB_BLOCK == 1 || x % PDB_BLOCK == 2 {
+        x = x + 1;
+    }
+    return x;
+}
+
+/// The MSF 7.00 container ("big MSF", blocks of 4096 bytes) of `streams`:
+/// block 0 the superblock, 1 and 2 (and 1, 2 of every 4096) the free block
+/// maps, then each stream's blocks, the stream directory (number of
+/// streams, their sizes, their blocks) and the block that lists the
+/// directory's blocks. Every block is used: the free block map has a 0 bit
+/// for each block of the file, 1 after.
+pub fn pdb_msf(streams: & Vec<Vec<i64>>) -> Vec<i64> {
+    var bs: i64 = PDB_BLOCK;
+    var next: i64 = 3;
+    var blocks: Vec<i64> = Vec::new();
+    var counts: Vec<i64> = Vec::new();
+    var s: i64 = 0;
+    while s < streams.len() {
+        var st: Vec<i64> = streams.get(s);
+        var nb: i64 = (st.len() + bs - 1) / bs;
+        counts.push(nb);
+        var k: i64 = 0;
+        while k < nb {
+            next = pdb_msf_next(next);
+            blocks.push(next);
+            next = next + 1;
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    var dir: Vec<i64> = Vec::new();
+    pdb_u32(& mut dir, streams.len());
+    s = 0;
+    while s < streams.len() {
+        var st2: Vec<i64> = streams.get(s);
+        pdb_u32(& mut dir, st2.len());
+        s = s + 1;
+    }
+    var bi: i64 = 0;
+    while bi < blocks.len() {
+        pdb_u32(& mut dir, blocks.get(bi));
+        bi = bi + 1;
+    }
+    var ndir: i64 = (dir.len() + bs - 1) / bs;
+    var dir_blocks: Vec<i64> = Vec::new();
+    var d: i64 = 0;
+    while d < ndir {
+        next = pdb_msf_next(next);
+        dir_blocks.push(next);
+        next = next + 1;
+        d = d + 1;
+    }
+    next = pdb_msf_next(next);
+    var map_block: i64 = next;
+    next = next + 1;
+    var num_blocks: i64 = next;
+    var out: Vec<i64> = Vec::new();
+    var t: i64 = 0;
+    while t < num_blocks * bs {
+        out.push(0);
+        t = t + 1;
+    }
+    // the superblock
+    var magic: str = "Microsoft C/C++ MSF 7.00\r\n";
+    var m: i64 = 0;
+    while m < str_len(magic) {
+        out.set(m, str_byte_at(magic, m) & 255);
+        m = m + 1;
+    }
+    out.set(26, 0x1A);
+    out.set(27, 0x44);
+    out.set(28, 0x53);
+    pdb_set_u32(& mut out, 32, bs);
+    pdb_set_u32(& mut out, 36, 1);
+    // the free block map in use: blocks 1, 4097, ...
+    pdb_set_u32(& mut out, 40, num_blocks);
+    pdb_set_u32(& mut out, 44, dir.len());
+    pdb_set_u32(& mut out, 48, 0);
+    pdb_set_u32(& mut out, 52, map_block);
+    // the free block maps: byte j of the map (spread over blocks 1, 4097,
+    // ... ; block 2's copy alike) holds the bits of blocks 8j .. 8j + 7
+    var fb: i64 = 1;
+    while fb < num_blocks {
+        var interval: i64 = fb / bs;
+        var q: i64 = 0;
+        while q < bs {
+            var j: i64 = interval * bs + q;
+            var byte: i64 = 0;
+            var bit: i64 = 0;
+            while bit < 8 {
+                if 8 * j + bit >= num_blocks {
+                    byte = byte | (1 << bit);
+                }
+                bit = bit + 1;
+            }
+            out.set(fb * bs + q, byte);
+            if fb + 1 < num_blocks {
+                out.set((fb + 1) * bs + q, byte);
+            }
+            q = q + 1;
+        }
+        fb = fb + bs;
+    }
+    // the streams
+    var bpos: i64 = 0;
+    s = 0;
+    while s < streams.len() {
+        var st3: Vec<i64> = streams.get(s);
+        var n: i64 = st3.len();
+        var c: i64 = 0;
+        while c < n {
+            var blk: i64 = blocks.get(bpos + c / bs);
+            out.set(blk * bs + c % bs, st3.get(c) & 255);
+            c = c + 1;
+        }
+        bpos = bpos + counts.get(s);
+        s = s + 1;
+    }
+    // the directory and its block list
+    var dc: i64 = 0;
+    while dc < dir.len() {
+        out.set(dir_blocks.get(dc / bs) * bs + dc % bs, dir.get(dc));
+        dc = dc + 1;
+    }
+    d = 0;
+    while d < dir_blocks.len() {
+        pdb_set_u32(& mut out, map_block * bs + 4 * d, dir_blocks.get(d));
+        d = d + 1;
+    }
+    return out;
+}

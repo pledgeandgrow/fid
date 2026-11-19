@@ -1,0 +1,160 @@
+# RL5: dead code elimination and value numbering (iropt.fd iro_dce,
+# iro_gvn), checked by tv.fd's witness (value ids kept: what has an effect
+# stays in its order on equal operands; what may panic stays, or an equal
+# one before it stands for it) and by runs on random inputs.
+
+pair dce_bitand
+pass dce
+expect accept
+before
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = band i64 %0 %1
+  %3 = const i64 4
+  %4 = ret %0
+after
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %4 = ret %0
+
+# x / y panics for y = 0: an unused division must stay
+pair dce_division
+pass dce
+expect reject
+why may panic
+before
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = div i64 %0 %1
+  %3 = ret %0
+after
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %3 = ret %0
+
+pair dce_print
+pass dce
+expect reject
+why effect
+before
+fn f(%0: i64) -> i64
+b0:
+  %1 = print i64 %0
+  %2 = ret %0
+after
+fn f(%0: i64) -> i64
+b0:
+  %2 = ret %0
+
+# a call marked pure still stays: the witness keeps every call (a pure
+# callee may panic), so a pass may not drop one
+pair dce_pure_call
+pass dce
+expect reject
+why effect
+before
+fn f(%0: i64) -> i64
+b0:
+  %1 = call i64 g(%0)
+  %2 = ret %0
+after
+fn f(%0: i64) -> i64
+b0:
+  %2 = ret %0
+
+pair gvn_add
+pass gvn
+expect accept
+before
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = add i64 %0 %1
+  %3 = add i64 %0 %1
+  %4 = bxor i64 %2 %3
+  %5 = ret %4
+after
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = add i64 %0 %1
+  %4 = bxor i64 %2 %2
+  %5 = ret %4
+
+# the second division is the first one's value, and the first comes before it
+pair gvn_division
+pass gvn
+expect accept
+before
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = div i64 %0 %1
+  %3 = div i64 %0 %1
+  %4 = sub i64 %2 %3
+  %5 = ret %4
+after
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = div i64 %0 %1
+  %4 = sub i64 %2 %2
+  %5 = ret %4
+
+pair gvn_loads
+pass gvn
+expect accept
+before
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = alloca i64
+  %3 = store %2 %0
+  %4 = load i64 %2
+  %5 = load i64 %2
+  %6 = add i64 %4 %5
+  %7 = ret %6
+after
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = alloca i64
+  %3 = store %2 %0
+  %4 = load i64 %2
+  %6 = add i64 %4 %4
+  %7 = ret %6
+
+pair gvn_load_across_store
+pass gvn
+expect reject
+before
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = alloca i64
+  %3 = store %2 %0
+  %4 = load i64 %2
+  %5 = store %2 %1
+  %6 = load i64 %2
+  %7 = bxor i64 %4 %6
+  %8 = ret %7
+after
+fn f(%0: i64, %1: i64) -> i64
+b0:
+  %2 = alloca i64
+  %3 = store %2 %0
+  %4 = load i64 %2
+  %5 = store %2 %1
+  %7 = bxor i64 %4 %4
+  %8 = ret %7
+
+# two calls with an effect are two calls, even with the same arguments
+pair gvn_io_calls
+pass gvn
+expect reject
+before
+fn f(%0: i64) -> i64
+b0:
+  %1 = call i64 next(%0) !io
+  %2 = call i64 next(%0) !io
+  %3 = add i64 %1 %2
+  %4 = ret %3
+after
+fn f(%0: i64) -> i64
+b0:
+  %1 = call i64 next(%0) !io
+  %3 = add i64 %1 %1
+  %4 = ret %3

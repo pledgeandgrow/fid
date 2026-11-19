@@ -1,0 +1,135 @@
+// stdlib/riscv_csr: CSR numbers and Zicsr encodings, mstatus/mcause/misa/satp/PMP fields, a CSR file through trap and MRET, PLIC and CLINT register sequences on a fake bus, PLIC arbitration.
+// Expected output:
+// mhartid ro=true priv=3 sstatus priv=1 0x7C0: csr0x7C0
+// csrr a0, mhartid: 0xF1402573 = csrrs a0, mhartid, zero
+// csrw mtvec, t0: 0x30529073 = csrrw zero, mtvec, t0
+// csrsi mstatus, 8: 0x30046073 = csrrsi zero, mstatus, 8
+// SIE=0 MIE=1 SPIE=0 MPIE=0 SPP=U MPP=M FS=Dirty SD=1
+// Machine timer interrupt / Illegal instruction / Machine external interrupt
+// vectored MTI -> 0x8000011C, exception -> 0x80000100
+// misa 0x800000000014112D RV64IMAFDCSU
+// satp 0x8000100000080200 Sv39 ASID=1 root=0x80200000
+// pmpaddr 0x20001FFF base 0x80000000 size 65536
+// NAPOT RWX / TOR R-- L
+// irq select: 11 7 -1
+// setup traps: 0, mtvec 0x80000101, mie MTI
+// write mhartid: -1, read mhartid: 0
+// mret -> 0x80400000 priv U mstatus SIE=0 MIE=0 SPIE=0 MPIE=1 SPP=U MPP=U FS=Off
+// U-mode write of mstatus: -1
+// irq 7 taken, pc 0x8000011C, Machine timer interrupt, mepc 0x80400000
+// SIE=0 MIE=0 SPIE=0 MPIE=0 SPP=U MPP=U FS=Off
+// mret -> 0x80400000 priv U
+// W 0x0C000028 <- 0x00000003
+// W 0x0C002084 <- 0x00000002
+// W 0x0C201000 <- 0x00000001
+// W 0x0C201004 <- 0x0000000A
+// claim order: 7 9 5 0 eip=false
+// held while claimed: 0, after complete: 7
+// W 0x02004008 <- 0xFFFFFFFF
+// W 0x0200400C <- 0x00000001
+// W 0x02004008 <- 0x00000010
+// W 0x02000008 <- 0x00000001
+// mtime 0x0123456789ABCDEF deadline 101000
+use riscv_csr;
+use regmap;
+use vec;
+use string;
+
+fn flush(bus: &mut RegBus) {
+    var i: i64 = 0;
+    while i < bus.log.len() {
+        if str_starts_with(bus.log.get(i), "W") { println(bus.log.get(i)); }
+        i = i + 1;
+    }
+    bus.log.clear();
+}
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() {
+    println("mhartid ro=" + bs(rv_csr_readonly(CSR_MHARTID)) + " priv=" + int_to_str(rv_csr_priv(CSR_MHARTID))
+        + " sstatus priv=" + int_to_str(rv_csr_priv(CSR_SSTATUS)) + " 0x7C0: " + rv_csr_name(0x7C0));
+    val i1: i64 = rv_csrr(10, CSR_MHARTID);
+    println("csrr a0, mhartid: " + regmap_hex(i1, 8) + " = " + rv_csr_disasm(i1));
+    val i2: i64 = rv_csrw(CSR_MTVEC, 5);
+    println("csrw mtvec, t0: " + regmap_hex(i2, 8) + " = " + rv_csr_disasm(i2));
+    val i3: i64 = rv_csr_insn(CSR_OP_SET, 0, CSR_MSTATUS, 8, true);
+    println("csrsi mstatus, 8: " + regmap_hex(i3, 8) + " = " + rv_csr_disasm(i3));
+    println(rv_mstatus_decode(MSTATUS_MIE | 0x6000 | MSTATUS_MPP | (1 << 63)));
+    println(rv_cause_name(rv_mcause_interrupt(7, 64), 64) + " / " + rv_cause_name(2, 64) + " / " + rv_cause_name(0x8000000B, 32));
+    val tv: i64 = rv_mtvec(0x80000100, MTVEC_VECTORED);
+    println("vectored MTI -> " + regmap_hex(rv_mtvec_target(tv, rv_mcause_interrupt(7, 64), 64), 8)
+        + ", exception -> " + regmap_hex(rv_mtvec_target(tv, 13, 64), 8));
+    val misa: i64 = rv_misa(2, "IMAFDCSU", 64);
+    println("misa " + regmap_hex(misa, 16) + " " + rv_misa_decode(misa, 64));
+    val satp: i64 = rv_satp(SATP_SV39, 1, 0x80200000);
+    println("satp " + regmap_hex(satp, 16) + " " + rv_satp_decode(satp));
+    val pa: i64 = rv_pmp_napot(0x80000000, 0x10000);
+    println("pmpaddr " + regmap_hex(pa, 8) + " " + rv_pmp_napot_decode(pa));
+    println(rv_pmpcfg_decode(rv_pmpcfg(PMP_R | PMP_W | PMP_X, PMP_NAPOT, false)) + " / " + rv_pmpcfg_decode(rv_pmpcfg(PMP_R, PMP_TOR, true)));
+    println("irq select: " + int_to_str(rv_irq_select(0x880, 0x888)) + " " + int_to_str(rv_irq_select(0xA0, 0xAAA)) + " " + int_to_str(rv_irq_select(0x80, 0x8)));
+
+    var f: CsrFile = csrfile_new(64, misa, 0);
+    val bad: i64 = csrfile_run(&mut f, rv_trap_setup_ops(0x80000100, true, 0x80010000, 1 << RV_IRQ_MTI));
+    println("setup traps: " + int_to_str(bad) + ", mtvec " + regmap_hex(csrfile_get(&f, CSR_MTVEC), 8) + ", mie " + rv_ip_decode(csrfile_get(&f, CSR_MIE)));
+    println("write mhartid: " + int_to_str(csrfile_apply(&mut f, csr_op(CSR_OP_WRITE, CSR_MHARTID, 5)))
+        + ", read mhartid: " + int_to_str(csrfile_apply(&mut f, csr_op(CSR_OP_SET, CSR_MHARTID, 0))));
+    csrfile_apply(&mut f, csr_op(CSR_OP_WRITE, CSR_MEPC, 0x80400000));
+    csrfile_apply(&mut f, csr_op(CSR_OP_CLEAR, CSR_MSTATUS, MSTATUS_MPP));
+    val pc1: i64 = csrfile_mret(&mut f);
+    println("mret -> " + regmap_hex(pc1, 8) + " priv " + rv_priv_name(f.priv_) + " mstatus " + rv_mstatus_decode(csrfile_get(&f, CSR_MSTATUS)));
+    println("U-mode write of mstatus: " + int_to_str(csrfile_apply(&mut f, csr_op(CSR_OP_WRITE, CSR_MSTATUS, 0))));
+    csrfile_poke(&mut f, CSR_MIP, 1 << RV_IRQ_MTI);
+    val code: i64 = csrfile_check_irq(&mut f);
+    println("irq " + int_to_str(code) + " taken, pc " + regmap_hex(f.pc, 8) + ", " + rv_cause_name(csrfile_get(&f, CSR_MCAUSE), 64)
+        + ", mepc " + regmap_hex(csrfile_get(&f, CSR_MEPC), 8));
+    println(rv_mstatus_decode(csrfile_get(&f, CSR_MSTATUS)));
+    val pc2: i64 = csrfile_mret(&mut f);
+    println("mret -> " + regmap_hex(pc2, 8) + " priv " + rv_priv_name(f.priv_));
+
+    var bus: RegBus = regbus_fake();
+    val plic: i64 = 0x0C000000;
+    plic_set_priority(&mut bus, plic, 10, 3);
+    plic_enable(&mut bus, plic, 1, 33);
+    plic_set_threshold(&mut bus, plic, 1, 1);
+    regbus_poke(&mut bus, plic_claim_addr(plic, 1), 10);
+    val got: i64 = plic_claim(&mut bus, plic, 1);
+    plic_complete(&mut bus, plic, 1, got);
+    flush(&mut bus);
+
+    var ps: PlicSim = plicsim_new(40, 2);
+    plicsim_set_priority(&mut ps, 5, 2);
+    plicsim_set_priority(&mut ps, 7, 5);
+    plicsim_set_priority(&mut ps, 9, 5);
+    plicsim_set_priority(&mut ps, 12, 1);
+    plicsim_enable(&mut ps, 0, 5, true);
+    plicsim_enable(&mut ps, 0, 7, true);
+    plicsim_enable(&mut ps, 0, 9, true);
+    plicsim_enable(&mut ps, 0, 12, true);
+    plicsim_set_threshold(&mut ps, 0, 1);
+    plicsim_raise(&mut ps, 12);
+    plicsim_raise(&mut ps, 9);
+    plicsim_raise(&mut ps, 5);
+    plicsim_raise(&mut ps, 7);
+    val c1: i64 = plicsim_claim(&mut ps, 0);
+    val c2: i64 = plicsim_claim(&mut ps, 0);
+    val c3: i64 = plicsim_claim(&mut ps, 0);
+    val c4: i64 = plicsim_claim(&mut ps, 0);
+    println("claim order: " + int_to_str(c1) + " " + int_to_str(c2) + " " + int_to_str(c3) + " " + int_to_str(c4) + " eip=" + bs(plicsim_eip(&ps, 0)));
+    plicsim_raise(&mut ps, 7);
+    val held: i64 = plicsim_claim(&mut ps, 0);
+    plicsim_complete(&mut ps, 7);
+    plicsim_raise(&mut ps, 7);
+    println("held while claimed: " + int_to_str(held) + ", after complete: " + int_to_str(plicsim_claim(&mut ps, 0)));
+
+    val clint: i64 = 0x02000000;
+    clint_set_timer32(&mut bus, clint, 1, 0x100000010);
+    clint_send_ipi(&mut bus, clint, 2);
+    flush(&mut bus);
+    regbus_poke(&mut bus, clint_mtime_addr(clint), 0x89ABCDEF);
+    regbus_poke(&mut bus, clint_mtime_addr(clint) + 4, 0x01234567);
+    println("mtime " + regmap_hex(clint_read_mtime32(&mut bus, clint), 16) + " deadline " + int_to_str(clint_deadline(1000, 10, 10000000)));
+}

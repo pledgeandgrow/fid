@@ -1,0 +1,2316 @@
+// Fides MP3 standard library
+//
+// An MPEG audio decoder for Layers I, II and III (ISO/IEC 11172-3 for
+// MPEG-1, ISO/IEC 13818-3 for the MPEG-2 "LSF" rates, and the MPEG-2.5
+// extension), all in Fides, no seam (bytes in, f64 PCM out):
+//   - frame headers (all versions, layers, bitrates, sample rates, padding,
+//     CRC flag, channel modes) and frame sync, skipping an ID3v2 tag and the
+//     Xing/Info frame (whose LAME tag gives the encoder delay and padding
+//     used for gapless trimming); free-format streams (bitrate index 0):
+//     the frame size is found from the next frame header and kept;
+//   - Layers I and II: bit allocation (shared above the joint-stereo
+//     bound), Layer II scale factor selection and the allocation tables
+//     3-B.2a..d (and ISO 13818-3 B.1), grouped samples, requantization;
+//   - Layer III: side information, the bit reservoir (main_data_begin),
+//     scale factors (MPEG-1 with scfsi; MPEG-2 scalefac_compress
+//     partitions), Huffman decoding of big values (the 15 code tables of
+//     ISO 11172-3 Table 3-B.7, with linbits for tables 16-31) and count1
+//     quadruples (tables A and B), requantization (long, short and mixed
+//     blocks, pretab, subblock gain), mid/side stereo, intensity stereo
+//     (MPEG-1, and MPEG-2/2.5 with both intensity scales and the illegal
+//     position), short-block reordering, alias reduction, IMDCT (36 and
+//     3 x 12 point, the four window shapes), overlap-add, frequency
+//     inversion;
+//   - the polyphase synthesis filterbank with the window D[] of ISO
+//     11172-3 Table 3-B.3, shared by the three layers.
+// Data tables come from the standard (ISO 11172-3 Annex B) and are
+// checked: the Huffman tables are complete prefix codes (mp3_huff_check),
+// the window D[] reconstructs through the analysis filterbank, and decoded
+// output matches ffmpeg.
+//
+// Verified against ffmpeg's float decoders (mp1float, mp2float, mp3float;
+// max difference 1.5e-6 at full scale, the float precision of ffmpeg's
+// output). Layer III on real LAME files with gapless trimming matching
+// ffmpeg's sample counts exactly: in tests/bootstrap/test_std_mp3.fd an
+// MPEG-1 44.1 kHz mono file (long, start, short and stop blocks) and an
+// MPEG-2 22.05 kHz joint-stereo file (M/S frames); built through C (too
+// slow for the interpreter test): MPEG-1 128 kbit/s joint stereo, MPEG-2.5
+// 8 kHz, and a file of clicks that is mostly short blocks. Layer II on
+// files from ffmpeg's and twolame's encoders covering all five allocation
+// tables, mono, stereo and joint stereo (bounds 4 and 8) and CRC; Layer I
+// and MPEG-2 intensity stereo on generated streams of random valid
+// content (no encoder at hand writes them); free format on a Layer II
+// stream with its bitrate index set to 0, against ffmpeg's decode of the
+// original. tests/bootstrap/test_std_mp3.fd decodes one Layer I and one
+// Layer II joint-stereo frame (with CRC) and one MPEG-2 intensity-stereo
+// frame and checks free-format framing; the longer decodes above (all
+// allocation tables, MPEG-2 Layer II, free-format PCM, intensity stereo
+// with long/start/short/stop blocks and both intensity scales) were run
+// through C, since `fid run` uses about 7 MB per 32 synthesized samples.
+// Not verified: MPEG-1 intensity stereo (no encoder writes it)
+// and mixed blocks. ffmpeg differs on purpose in two places: it drops
+// the overlap of slots 12..17 when a short block follows a normal long
+// block directly (no start block; not allowed by the standard, which this
+// decoder follows), and it treats every MPEG-2 intensity position as
+// legal, where the standard makes 2^slen - 1 illegal.
+//
+// Usage:
+//   use mp3;
+//   val f: Mp3File = mp3_decode(&bytes);
+//   if f.ok { println(int_to_str(f.rate) + " Hz, " + int_to_str(f.pcm.get(0).len()) + " samples"); }
+
+module mp3;
+use vec;
+use math;
+
+// ─── Frame header ─────────────────────────────────────────────────────────
+
+pub struct Mp3Header {
+    pub ok: bool,
+    pub version: i64,
+    // 1, 2 or 25 (MPEG-2.5)
+    pub layer: i64,
+    pub has_crc: bool,
+    pub bitrate: i64,
+    // kbit/s
+    pub rate: i64,
+    pub padding: i64,
+    pub mode: i64,
+    // 0 stereo, 1 joint stereo, 2 dual channel, 3 mono
+    pub mode_ext: i64,
+    pub channels: i64,
+    pub frame_len: i64,
+    // bytes, header included
+    pub samples: i64,
+    // per channel
+    pub side_len: i64,
+    // Layer III side information bytes
+    pub free: bool,  // free format (bitrate index 0): bitrate and frame_len are 0
+    // until mp3_free_frame_len / the decoder finds the next header
+}
+
+fn mp_bad_header() -> Mp3Header {
+    return Mp3Header { ok: false, version: 0, layer: 0, has_crc: false, bitrate: 0, rate: 0, padding: 0, mode: 0, mode_ext: 0, channels: 0, frame_len: 0, samples: 0, side_len: 0, free: false };
+}
+
+fn mp_tbl(s: str, i: i64) -> i64 {
+    var k: i64 = 0;
+    var p: i64 = 0;
+    val n: i64 = str_len(s);
+    while p < n {
+        var v: i64 = 0;
+        var neg: bool = false;
+        if str_byte_at(s, p) == 45 {
+            neg = true;
+            p = p + 1;
+        }
+        while p < n && str_byte_at(s, p) != 32 {
+            v = v * 10 + (str_byte_at(s, p) - 48);
+            p = p + 1;
+        }
+        if k == i {
+            if neg { return - v; }
+            return v;
+        }
+        k = k + 1;
+        p = p + 1;
+    }
+    return 0;
+}
+
+/// Parse the 4-byte header at `at`.
+pub fn mp3_parse_header(b: &Vec<i64>, at: i64) -> Mp3Header {
+    if at + 4 > b.len() {
+        return mp_bad_header();
+    }
+    val h: i64 = b.get(at) * 16777216 + b.get(at + 1) * 65536 + b.get(at + 2) * 256 + b.get(at + 3);
+    if ((h >> 21) & 2047) != 2047 {
+        return mp_bad_header();
+    }
+    val vbits: i64 = (h >> 19) & 3;
+    val lbits: i64 = (h >> 17) & 3;
+    val bri: i64 = (h >> 12) & 15;
+    val sri: i64 = (h >> 10) & 3;
+    if vbits == 1 || lbits == 0 || bri == 15 || sri == 3 {
+        return mp_bad_header();
+    }
+    var hd: Mp3Header = mp_bad_header();
+    hd.ok = true;
+    if vbits == 3 { hd.version = 1; }
+    if vbits == 2 { hd.version = 2; }
+    if vbits == 0 { hd.version = 25; }
+    hd.layer = 4 - lbits;
+    hd.has_crc = ((h >> 16) & 1) == 0;
+    if hd.version == 1 {
+        if hd.layer == 1 {
+            hd.bitrate = mp_tbl("0 32 64 96 128 160 192 224 256 288 320 352 384 416 448", bri);
+        } else if hd.layer == 2 {
+            hd.bitrate = mp_tbl("0 32 48 56 64 80 96 112 128 160 192 224 256 320 384", bri);
+        } else {
+            hd.bitrate = mp_tbl("0 32 40 48 56 64 80 96 112 128 160 192 224 256 320", bri);
+        }
+        hd.rate = mp_tbl("44100 48000 32000", sri);
+    } else {
+        if hd.layer == 1 {
+            hd.bitrate = mp_tbl("0 32 48 56 64 80 96 112 128 144 160 176 192 224 256", bri);
+        } else {
+            hd.bitrate = mp_tbl("0 8 16 24 32 40 48 56 64 80 96 112 128 144 160", bri);
+        }
+        if hd.version == 2 {
+            hd.rate = mp_tbl("22050 24000 16000", sri);
+        } else {
+            hd.rate = mp_tbl("11025 12000 8000", sri);
+        }
+    }
+    hd.padding = (h >> 9) & 1;
+    hd.mode = (h >> 6) & 3;
+    hd.mode_ext = (h >> 4) & 3;
+    hd.channels = 2;
+    if hd.mode == 3 {
+        hd.channels = 1;
+    }
+    if hd.layer == 1 {
+        hd.samples = 384;
+        hd.frame_len = (12000 * hd.bitrate / hd.rate + hd.padding) * 4;
+    } else if hd.layer == 2 || hd.version == 1 {
+        hd.samples = 1152;
+        hd.frame_len = 144000 * hd.bitrate / hd.rate + hd.padding;
+    } else {
+        hd.samples = 576;
+        hd.frame_len = 72000 * hd.bitrate / hd.rate + hd.padding;
+    }
+    if bri == 0 {
+        hd.free = true;
+        hd.frame_len = 0;
+    }
+    if hd.layer == 3 {
+        if hd.version == 1 {
+            hd.side_len = if hd.channels == 1 { 17 } else { 32 };
+        } else {
+            hd.side_len = if hd.channels == 1 { 9 } else { 17 };
+        }
+    }
+    return hd;
+}
+
+// ─── Bit reader (MSB first) ───────────────────────────────────────────────
+
+pub struct Mp3Bits {
+    pub data: Vec<i64>,
+    pub pos: i64,
+}
+
+pub fn mp3_bits(data: Vec<i64>) -> Mp3Bits {
+    return Mp3Bits { data: data, pos: 0 };
+}
+
+/// Read `n` (0..32) bits, most significant first; zeros past the end.
+pub fn mp3_read(r: &mut Mp3Bits, n: i64) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = 0;
+    while k < n {
+        val byte_i: i64 = r.pos >> 3;
+        var bit: i64 = 0;
+        if byte_i < r.data.len() {
+            bit = (r.data.get(byte_i) >> (7 - (r.pos & 7))) & 1;
+        }
+        v = (v << 1) | bit;
+        r.pos = r.pos + 1;
+        k = k + 1;
+    }
+    return v;
+}
+
+// ─── Tables ───────────────────────────────────────────────────────────────
+
+// Huffman trees: per table id (0..31 as in table_select, 32 = count1
+// table A), child arrays; a leaf is -(value + 1), value = x * 16 + y.
+var mp_left: Vec<Vec<i64>> = Vec::new();
+var mp_right: Vec<Vec<i64>> = Vec::new();
+var mp_dwin: Vec<f64> = Vec::new();
+var mp_ncos: Vec<f64> = Vec::new();
+var mp_cos36: Vec<f64> = Vec::new();
+var mp_cos12: Vec<f64> = Vec::new();
+var mp_win: Vec<f64> = Vec::new();
+// [block_type * 36 + i]
+var mp_pow43_tab: Vec<f64> = Vec::new();
+var mp_linb: Vec<i64> = Vec::new();
+var mp_pretab: Vec<i64> = Vec::new();
+var mp_aa_cs: Vec<f64> = Vec::new();
+var mp_aa_ca: Vec<f64> = Vec::new();
+
+// Space-separated decimal integers (an optional '-').
+fn mp_ilist(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var p: i64 = 0;
+    while p < n {
+        var v: i64 = 0;
+        var neg: bool = false;
+        if str_byte_at(s, p) == 45 {
+            neg = true;
+            p = p + 1;
+        }
+        while p < n && str_byte_at(s, p) != 32 {
+            v = v * 10 + (str_byte_at(s, p) - 48);
+            p = p + 1;
+        }
+        out.push(if neg { - v } else { v });
+        p = p + 1;
+    }
+    return out;
+}
+
+fn mp_hex_list(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var p: i64 = 0;
+    while p < n {
+        var v: i64 = 0;
+        while p < n && str_byte_at(s, p) != 32 {
+            val c: i64 = str_byte_at(s, p);
+            if c >= 97 {
+                v = v * 16 + (c - 87);
+            } else {
+                v = v * 16 + (c - 48);
+            }
+            p = p + 1;
+        }
+        out.push(v);
+        p = p + 1;
+    }
+    return out;
+}
+
+fn mp_tab(id: i64, wrap: i64, codes: str, lens: str) {
+    val cs: Vec<i64> = mp_hex_list(codes);
+    val ls: Vec<i64> = mp_hex_list(lens);
+    var left: Vec<i64> = Vec::new();
+    var right: Vec<i64> = Vec::new();
+    left.push(0);
+    right.push(0);
+    var i: i64 = 0;
+    while i < cs.len() {
+        val value: i64 = (i / wrap) * 16 + (i % wrap);
+        val code: i64 = cs.get(i);
+        val len: i64 = ls.get(i);
+        var node: i64 = 0;
+        var b: i64 = len - 1;
+        while b >= 0 {
+            val bit: i64 = (code >> b) & 1;
+            if b == 0 {
+                if bit == 1 {
+                    right.set(node, - (value + 1));
+                } else {
+                    left.set(node, - (value + 1));
+                }
+            } else {
+                var child: i64 = if bit == 1 { right.get(node) } else { left.get(node) };
+                if child == 0 {
+                    left.push(0);
+                    right.push(0);
+                    child = left.len() - 1;
+                    if bit == 1 {
+                        right.set(node, child);
+                    } else {
+                        left.set(node, child);
+                    }
+                }
+                node = child;
+            }
+            b = b - 1;
+        }
+        i = i + 1;
+    }
+    mp_left.set(id, left);
+    mp_right.set(id, right);
+}
+
+fn mp_init() {
+    if mp_left.len() > 0 {
+        return;
+    }
+    var i: i64 = 0;
+    while i < 33 {
+        mp_left.push(Vec::new());
+        mp_right.push(Vec::new());
+        i = i + 1;
+    }
+    // Synthesis window D[i]: ISO/IEC 11172-3 Annex B, Table 3-B.3
+    // ("Coefficients Di of the synthesis window"), the normative source.
+    // It is a designed prototype low-pass filter with no closed form, so
+    // it is a table; every D[i] in the standard is an exact multiple of
+    // 2^-16 (printed to 9 decimals), and these are D[0..256] times 65536.
+    // D[257..511] follow from D[512 - i] (negated except at multiples of
+    // 64), as in the standard. Cross-checked: decoded output matches
+    // ffmpeg's to under 1e-6 (changing one coefficient by one unit of
+    // 2^-16 raises that to 6e-6 on a 1.5 s file), and with the analysis
+    // window C[i] = D[i] / 32 (Table
+    // 3-C.1) the analysis + synthesis filterbank pair reconstructs its
+    // input, delayed by 481 samples, to 5e-5 (tests/bootstrap/test_std_mp3.fd).
+    val half: str ="0 -1 -1 -1 -1 -1 -1 -2 -2 -2 -2 -3 -3 -4 -4 -5 -5 -6 -7 -7 -8 -9 -10 -11 -13 -14 -16 -17 -19 -21 -24 -26 -29 -31 -35 -38 -41 -45 -49 -53 -58 -63 -68 -73 -79 -85 -91 -97 -104 -111 -117 -125 -132 -139 -147 -154 -161 -169 -176 -183 -190 -196 -202 -208 213 218 222 225 227 228 228 227 224 221 215 208 200 189 177 163 146 127 106 83 57 29 -2 -36 -72 -111 -153 -197 -244 -294 -347 -401 -459 -519 -581 -645 -711 -779 -848 -919 -991 -1064 -1137 -1210 -1283 -1356 -1428 -1498 -1567 -1634 -1698 -1759 -1817 -1870 -1919 -1962 -2001 -2032 -2057 -2075 -2085 -2087 -2080 -2063 2037 2000 1952 1893 1822 1739 1644 1535 1414 1280 1131 970 794 605 402 185 -45 -288 -545 -814 -1095 -1388 -1692 -2006 -2330 -2663 -3004 -3351 -3705 -4063 -4425 -4788 -5153 -5517 -5879 -6237 -6589 -6935 -7271 -7597 -7910 -8209 -8491 -8755 -8998 -9219 -9416 -9585 -9727 -9838 -9916 -9959 -9966 -9935 -9863 -9750 -9592 -9389 -9139 -8840 -8492 -8092 -7640 -7134 6574 5959 5288 4561 3776 2935 2037 1082 70 -998 -2122 -3300 -4533 -5818 -7154 -8540 -9975 -11455 -12980 -14548 -16155 -17799 -19478 -21189 -22929 -24694 -26482 -28289 -30112 -31947 -33791 -35640 -37489 -39336 -41176 -43006 -44821 -46617 -48390 -50137 -51853 -53534 -55178 -56778 -58333 -59838 -61289 -62684 -64019 -65290 -66494 -67629 -68692 -69679 -70590 -71420 -72169 -72835 -73415 -73908 -74313 -74630 -74856 -74992 75038";
+    var d: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 512 {
+        d.push(0.0);
+        i = i + 1;
+    }
+    val dh: Vec<i64> = mp_ilist(half);
+    i = 0;
+    while i <= 256 {
+        d.set(i, (dh.get(i) as f64) / 65536.0);
+        i = i + 1;
+    }
+    i = 257;
+    while i < 512 {
+        val m: f64 = d.get(512 - i);
+        if (i % 64) == 0 {
+            d.set(i, m);
+        } else {
+            d.set(i, - m);
+        }
+        i = i + 1;
+    }
+    mp_dwin = d;
+    val pi: f64 = math_pi();
+    // matrixing goes through a 32-point DCT: c[j][k] = cos(j (2k + 1) pi / 64)
+    i = 0;
+    while i < 32 {
+        var k: i64 = 0;
+        while k < 32 {
+            mp_ncos.push(math_cos((i * (2 * k + 1)) as f64 * pi / 64.0));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    mp_linb = mp_ilist("0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 2 3 4 6 8 10 13 4 5 6 7 8 9 11 13");
+    mp_pretab = mp_ilist("0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 2 2 3 3 3 2 0");
+    val cs: Vec<i64> = mp_ilist("-6000 -5350 -3300 -1850 -950 -410 -142 -37");
+    i = 0;
+    while i < 8 {
+        val c: f64 = (cs.get(i) as f64) / 10000.0;
+        val sq: f64 = math_sqrt(1.0 + c * c);
+        mp_aa_cs.push(1.0 / sq);
+        mp_aa_ca.push(c / sq);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 256 {
+        mp_pow43_tab.push(math_pow(i as f64, 4.0 / 3.0));
+        i = i + 1;
+    }
+    // IMDCT kernels
+    i = 0;
+    while i < 36 {
+        var k: i64 = 0;
+        while k < 18 {
+            mp_cos36.push(math_cos(pi / 72.0 * ((2 * i + 1 + 18) * (2 * k + 1)) as f64));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < 12 {
+        var k: i64 = 0;
+        while k < 6 {
+            mp_cos12.push(math_cos(pi / 24.0 * ((2 * i + 1 + 6) * (2 * k + 1)) as f64));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // windows of block types 0, 1, 2 (short, 12 points), 3
+    var bt: i64 = 0;
+    while bt < 4 {
+        i = 0;
+        while i < 36 {
+            var w: f64 = 0.0;
+            val fi: f64 = i as f64;
+            if bt == 0 {
+                w = math_sin(pi / 36.0 * (fi + 0.5));
+            } else if bt == 1 {
+                if i < 18 {
+                    w = math_sin(pi / 36.0 * (fi + 0.5));
+                } else if i < 24 {
+                    w = 1.0;
+                } else if i < 30 {
+                    w = math_sin(pi / 12.0 * (fi - 18.0 + 0.5));
+                }
+            } else if bt == 2 {
+                if i < 12 {
+                    w = math_sin(pi / 12.0 * (fi + 0.5));
+                }
+            } else {
+                if i >= 6 && i < 12 {
+                    w = math_sin(pi / 12.0 * (fi - 6.0 + 0.5));
+                } else if i >= 12 && i < 18 {
+                    w = 1.0;
+                } else if i >= 18 {
+                    w = math_sin(pi / 36.0 * (fi + 0.5));
+                }
+            }
+            mp_win.push(w);
+            i = i + 1;
+        }
+        bt = bt + 1;
+    }
+}
+
+// The Huffman code tables of ISO/IEC 11172-3 Annex B, Table 3-B.7
+// ("Huffman code tables for Layer III", the same tables in ISO 13818-3):
+// for each table the codeword (hcod, in hex) and its length (hlen, in hex)
+// of every value pair x * wrap + y, x and y in 0..wrap-1, in the table's
+// order (x outer, y inner); table 32 is count1 table A (quadruples
+// v w x y as the bits of one 4-bit value). Tables 16..23 share table 16's
+// codes and 24..31 table 24's (they differ in linbits); tables 0, 4 and 14
+// are not used. mp3_huff_check tests that every table is a prefix code
+// and complete (Kraft sum exactly 1), as the standard's tables are.
+fn mp_huff_wrap(id: i64) -> i64 {
+    if id == 1 { return 2; }
+    if id == 2 { return 3; }
+    if id == 3 { return 3; }
+    if id == 5 { return 4; }
+    if id == 6 { return 4; }
+    if id == 7 { return 6; }
+    if id == 8 { return 6; }
+    if id == 9 { return 6; }
+    if id == 10 { return 8; }
+    if id == 11 { return 8; }
+    if id == 12 { return 8; }
+    if id == 13 { return 16; }
+    if id == 15 { return 16; }
+    if id == 16 { return 16; }
+    if id == 24 { return 16; }
+    if id == 32 { return 16; }
+    return 0;
+}
+
+fn mp_huff_codes(id: i64) -> str {
+    if id == 1 {
+        return "1 1 1 0";
+    }
+    if id == 2 {
+        return "1 2 1 3 1 1 3 2 0";
+    }
+    if id == 3 {
+        return "3 2 1 1 1 1 3 2 0";
+    }
+    if id == 5 {
+        return "1 2 6 5 3 1 4 4 7 5 7 1 6 1 1 0";
+    }
+    if id == 6 {
+        return "7 3 5 1 6 2 3 2 5 4 4 1 3 3 2 0";
+    }
+    if id == 7 {
+        return "1 2 a 13 10 a 3 3 7 a 5 3 b 4 d 11 8 4 c b 12 f b 2 7 6 9 e 3 1 6 4 5 3 2 0";
+    }
+    if id == 8 {
+        return "3 4 6 12 c 5 5 1 2 10 9 3 7 3 5 e 7 3 13 11 f d a 4 d 5 8 b 5 1 c 4 4 1 1 0";
+    }
+    if id == 9 {
+        return "7 5 9 e f 7 6 4 5 5 6 7 7 6 8 8 8 5 f 6 9 a 5 1 b 7 9 6 4 1 e 4 6 2 6 0";
+    }
+    if id == 10 {
+        return "1 2 a 17 23 1e c 11 3 3 8 c 12 15 c 7 b 9 f 15 20 28 13 6 e d 16 22 2e 17 12 7 14 13 21 2f 1b 16 9 3 1f 16 29 1a 15 14 5 3 e d a b 10 6 5 1 9 8 7 8 4 4 2 0";
+    }
+    if id == 11 {
+        return "3 4 a 18 22 21 15 f 5 3 4 a 20 11 b a b 7 d 12 1e 1f 14 5 19 b 13 3b 1b 12 c 5 23 21 1f 3a 1e 10 7 5 1c 1a 20 13 11 f 8 e e c 9 d e 9 4 1 b 4 6 6 6 3 2 0";
+    }
+    if id == 12 {
+        return "9 6 10 21 29 27 26 1a 7 5 6 9 17 10 1a b 11 7 b e 15 1e a 7 11 a f c 12 1c e 5 20 d 16 13 12 10 9 5 28 11 1f 1d 11 d 4 2 1b c b f a 7 4 1 1b c 8 c 6 3 1 0";
+    }
+    if id == 13 {
+        return "1 5 e 15 22 33 2e 47 2a 34 44 34 43 2c 2b 13 3 4 c 13 1f 1a 2c 21 1f 18 20 18 1f 23 16 e f d 17 24 3b 31 4d 41 1d 28 1e 28 1b 21 2a 10 16 14 25 3d 38 4f 49 40 2b 4c 38 25 1a 1f 19 e 23 10 3c 39 61 4b 72 5b 36 49 37 29 30 35 17 18 3a 1b 32 60 4c 46 5d 54 4d 3a 4f 1d 4a 31 29 11 2f 2d 4e 4a 73 5e 5a 4f 45 53 47 32 3b 26 24 f 48 22 38 5f 5c 55 5b 5a 56 49 4d 41 33 2c 2b 2a 2b 14 1e 2c 37 4e 48 57 4e 3d 2e 36 25 1e 14 10 35 19 29 25 2c 3b 36 51 42 4c 39 36 25 12 27 b 23 21 1f 39 2a 52 48 50 2f 3a 37 15 16 1a 26 16 35 19 17 26 46 3c 33 24 37 1a 22 17 1b e 9 7 22 20 1c 27 31 4b 1e 34 30 28 34 1c 12 11 9 5 2d 15 22 40 38 32 31 2d 1f 13 c f a 7 6 3 30 17 14 27 24 23 35 15 10 17 d a 6 1 4 2 10 f 11 1b 19 14 1d b 11 c 10 8 1 1 0 1";
+    }
+    if id == 15 {
+        return "7 c 12 35 2f 4c 7c 6c 59 7b 6c 77 6b 51 7a 3f d 5 10 1b 2e 24 3d 33 2a 46 34 53 41 29 3b 24 13 11 f 18 29 22 3b 30 28 40 32 4e 3e 50 38 21 1d 1c 19 2b 27 3f 37 5d 4c 3b 5d 48 36 4b 32 1d 34 16 2a 28 43 39 5f 4f 48 39 59 45 31 42 2e 1b 4d 25 23 42 3a 34 5b 4a 3e 30 4f 3f 5a 3e 28 26 7d 20 3c 38 32 5c 4e 41 37 57 47 33 49 33 46 1e 6d 35 31 5e 58 4b 42 7a 5b 49 38 2a 40 2c 15 19 5a 2b 29 4d 49 3f 38 5c 4d 42 2f 43 30 35 24 14 47 22 43 3c 3a 31 58 4c 43 6a 47 36 26 27 17 f 6d 35 33 2f 5a 52 3a 39 30 48 39 29 17 1b 3e 9 56 2a 28 25 46 40 34 2b 46 37 2a 19 1d 12 b b 76 44 1e 37 32 2e 4a 41 31 27 18 10 16 d e 7 5b 2c 27 26 22 3f 34 2d 1f 34 1c 13 e 8 9 3 7b 3c 3a 35 2f 2b 20 16 25 18 11 c f a 2 1 47 25 22 1e 1c 14 11 1a 15 10 a 6 8 6 2 0";
+    }
+    if id == 16 {
+        return "1 5 e 2c 4a 3f 6e 5d ac 95 8a f2 e1 c3 178 11 3 4 c 14 23 3e 35 2f 53 4b 44 77 c9 6b cf 9 f d 17 26 43 3a 67 5a a1 48 7f 75 6e d1 ce 10 2d 15 27 45 40 72 63 57 9e 8c fc d4 c7 183 16d 1a 4b 24 44 41 73 65 b3 a4 9b 108 f6 e2 18b 17e 16a 9 42 1e 3b 38 66 b9 ad 109 8e fd e8 190 184 17a 1bd 10 6f 36 34 64 b8 b2 a0 85 101 f4 e4 d9 181 16e 2cb a 62 30 5b 58 a5 9d 94 105 f8 197 18d 174 17c 379 374 8 55 54 51 9f 9c 8f 104 f9 1ab 191 188 17f 2d7 2c9 2c4 7 9a 4c 49 8d 83 100 f5 1aa 196 18a 180 2df 167 2c6 160 b 8b 81 43 7d f7 e9 e5 db 189 2e7 2e1 2d0 375 372 1b7 4 f3 78 76 73 e3 df 18c 2ea 2e6 2e0 2d1 2c8 2c2 df 1b4 6 ca e0 de da d8 185 182 17d 16c 378 1bb 2c3 1b8 1b5 6c0 4 2eb d3 d2 d0 172 17b 2de 2d3 2ca 6c7 373 36d 36c d83 361 2 179 171 66 bb 2d6 2d2 166 2c7 2c5 362 6c6 367 d82 366 1b2 0 c a 7 b a 11 b 9 d c a 7 5 3 1 3";
+    }
+    if id == 24 {
+        return "f d 2e 50 92 106 f8 1b2 1aa 29d 28d 289 26d 205 408 58 e c 15 26 47 82 7a d8 d1 c6 147 159 13f 129 117 2a 2f 16 29 4a 44 80 78 dd cf c2 b6 154 13b 127 21d 12 51 27 4b 46 86 7d 74 dc cc be b2 145 137 125 10f 10 93 48 45 87 7f 76 70 d2 c8 bc 160 143 132 11d 21c e 107 42 81 7e 77 72 d6 ca c0 b4 155 13d 12d 119 106 c f9 7b 79 75 71 d7 ce c3 b9 15b 14a 134 123 110 208 a 1b3 73 6f 6d d3 cb c4 bb 161 14c 139 12a 11b 213 17d 11 1ab d4 d0 cd c9 c1 ba b1 a9 140 12f 11e 10c 202 179 10 14f c7 c5 bf bd b5 ae 14d 141 131 121 113 209 17b 173 b 29c b8 b7 b3 af 158 14b 13a 130 122 115 212 17f 175 16e a 28c 15a ab a8 a4 13e 135 12b 11f 114 107 201 177 170 16a 6 288 142 13c 138 133 12e 124 11c 10d 105 200 178 172 16c 167 4 26c 12c 128 126 120 11a 111 10a 203 17c 176 171 16d 169 165 2 409 118 116 112 10b 108 103 17e 17a 174 16f 16b 168 166 164 0 2b 14 13 11 f d b 9 7 6 4 7 5 3 1 3";
+    }
+    if id == 32 {
+        return "1 5 4 5 6 5 4 4 7 3 6 0 7 2 3 1";
+    }
+    return "";
+}
+
+fn mp_huff_lens(id: i64) -> str {
+    if id == 1 {
+        return "1 3 2 3";
+    }
+    if id == 2 {
+        return "1 3 6 3 3 5 5 5 6";
+    }
+    if id == 3 {
+        return "2 2 6 3 2 5 5 5 6";
+    }
+    if id == 5 {
+        return "1 3 6 7 3 3 6 7 6 6 7 8 7 6 7 8";
+    }
+    if id == 6 {
+        return "3 3 5 7 3 2 4 5 4 4 5 6 6 5 6 7";
+    }
+    if id == 7 {
+        return "1 3 6 8 8 9 3 4 6 7 7 8 6 5 7 8 8 9 7 7 8 9 9 9 7 7 8 9 9 a 8 8 9 a a a";
+    }
+    if id == 8 {
+        return "2 3 6 8 8 9 3 2 4 8 8 8 6 4 6 8 8 9 8 8 8 9 9 a 8 7 8 9 a a 9 8 9 9 b b";
+    }
+    if id == 9 {
+        return "3 3 5 6 8 9 3 3 4 5 6 8 4 4 5 6 7 8 6 5 6 7 7 8 7 6 7 7 8 9 8 7 8 8 9 9";
+    }
+    if id == 10 {
+        return "1 3 6 8 9 9 9 a 3 4 6 7 8 9 8 8 6 6 7 8 9 a 9 9 7 7 8 9 a a 9 a 8 8 9 a a a a a 9 9 a a b b a b 8 8 9 a a a b b 9 8 9 a a b b b";
+    }
+    if id == 11 {
+        return "2 3 5 7 8 9 8 9 3 3 4 6 8 8 7 8 5 5 6 7 8 9 8 8 7 6 7 9 8 a 8 9 8 8 8 9 9 a 9 a 8 8 9 a a b a b 8 7 7 8 9 a a a 8 7 8 9 a a a a";
+    }
+    if id == 12 {
+        return "4 3 5 7 8 9 9 9 3 3 4 5 7 7 8 8 5 4 5 6 7 8 7 8 6 5 6 6 7 8 8 8 7 6 7 7 8 8 8 9 8 7 8 8 8 9 8 9 8 7 7 8 8 9 9 a 9 8 8 9 9 9 9 a";
+    }
+    if id == 13 {
+        return "1 4 6 7 8 9 9 a 9 a b b c c d d 3 4 6 7 8 8 9 9 9 9 a a b c c c 6 6 7 8 9 9 a a 9 a a b b c d d 7 7 8 9 9 a a a a b b b b c d d 8 7 9 9 a a b b a b b c c d d e 9 8 9 a a a b b b b c b d d e e 9 9 a a b b b b b c c c d d e e a 9 a b b b c c c c d d d e 10 10 9 8 9 a a b b c c c c d d e f f a 9 a a b b b d c d d e e e 10 f a a a b b c c d c d e d e f 10 11 b a a b c c c c d d d e f f f 10 b b b c c d c d e e f f f 10 10 10 c b c d d d e e e e e f 10 f 10 10 d c c d d d f e e 11 f f f 11 10 10 c c d e e e f e f f 10 10 13 12 13 10";
+    }
+    if id == 15 {
+        return "3 4 5 7 7 8 9 9 9 a a b b b c d 4 3 5 6 7 7 8 8 8 9 9 a a a b b 5 5 5 6 7 7 8 8 8 9 9 a a b b b 6 6 6 7 7 8 8 9 9 9 a a a b b b 7 6 7 7 8 8 9 9 9 9 a a a b b b 8 7 7 8 8 8 9 9 9 9 a a b b b c 9 7 8 8 8 9 9 9 9 a a a b b c c 9 8 8 9 9 9 9 a a a a a b b b c 9 8 8 9 9 9 9 a a a a b b c c c 9 8 9 9 9 9 a a a b b b b c c c a 9 9 9 a a a a a b b b b c d c a 9 9 9 a a a a b b b b c c c d b a 9 a a a b b b b b b c c d d b a a a a b b b b c c c c c d d c b b b b b b b c c c c d d c d c b b b b b b c c c c c d d d d";
+    }
+    if id == 16 {
+        return "1 4 6 8 9 9 a a b b b c c c d 9 3 4 6 7 8 9 9 9 a a a b c b c 8 6 6 7 8 9 9 a a b a b b b c c 9 8 7 8 9 9 a a a b b c c c d d a 9 8 9 9 a a b b b c c c d d d 9 9 8 9 9 a b b c b c c d d d e a a 9 9 a b b b b c c c c d d e a a 9 a a b b b c c d d d d f f a a a a b b b c c d d d d e e e a b a a b b c c d d d d e d e d b b b a b c c c c d e e e f f e a c b b b c c d e e e e e e d e b c c c c c d d d d f e e e e 10 b e c c c d d e e e 10 f f f 11 f b d d b c e e d e e f 10 f 11 f e b 9 8 8 9 9 a a a b b b b b b b 8";
+    }
+    if id == 24 {
+        return "4 4 6 7 8 9 9 a a b b b b b c 9 4 4 5 6 7 8 8 9 9 9 a a a a a 8 6 5 6 7 7 8 8 9 9 9 9 a a a b 7 7 6 7 7 8 8 8 9 9 9 9 a a a a 7 8 7 7 8 8 8 8 9 9 9 a a a a b 7 9 7 8 8 8 8 9 9 9 9 a a a a a 7 9 8 8 8 8 9 9 9 9 a a a a a b 7 a 8 8 8 9 9 9 9 a a a a a b b 8 a 9 9 9 9 9 9 9 9 a a a a b b 8 a 9 9 9 9 9 9 a a a a a b b b 8 b 9 9 9 9 a a a a a a b b b b 8 b a 9 9 9 a a a a a a b b b b 8 b a a a a a a a a a b b b b b 8 b a a a a a a a b b b b b b b 8 c a a a a a a b b b b b b b b 8 8 7 7 7 7 7 7 7 7 7 7 8 8 8 8 4";
+    }
+    if id == 32 {
+        return "1 4 4 5 4 6 5 6 4 5 5 6 5 6 6 6";
+    }
+    return "";
+}
+
+// Build the tree of table `id` the first time it is used.
+fn mp_build_table(id: i64) {
+    if mp_left.get(id).len() > 0 {
+        return;
+    }
+    if id > 16 && id < 24 {
+        mp_build_table(16);
+        mp_left.set(id, mp_left.get(16));
+        mp_right.set(id, mp_right.get(16));
+        return;
+    }
+    if id > 24 && id < 32 {
+        mp_build_table(24);
+        mp_left.set(id, mp_left.get(24));
+        mp_right.set(id, mp_right.get(24));
+        return;
+    }
+    val wrap: i64 = mp_huff_wrap(id);
+    if wrap > 0 {
+        mp_tab(id, wrap, mp_huff_codes(id), mp_huff_lens(id));
+    }
+}
+
+pub struct Mp3HuffCheck {
+    pub codes: i64,
+    pub max_len: i64,
+    pub prefix_free: bool,
+    // no codeword is a prefix of another (nor equal to one)
+    pub complete: bool,  // sum of 2^-len over the codewords is exactly 1
+}
+
+/// Check Huffman table `t` (1..32) as a code: count, longest codeword,
+/// prefix-freeness and completeness.
+pub fn mp3_huff_check(t: i64) -> Mp3HuffCheck {
+    var res = Mp3HuffCheck { codes: 0, max_len: 0, prefix_free: false, complete: false };
+    val wrap: i64 = mp_huff_wrap(t);
+    if wrap == 0 {
+        return res;
+    }
+    val cs: Vec<i64> = mp_hex_list(mp_huff_codes(t));
+    val ls: Vec<i64> = mp_hex_list(mp_huff_lens(t));
+    val want: i64 = if t == 32 { 16 } else { wrap * wrap };
+    if cs.len() != ls.len() || cs.len() != want {
+        return res;
+    }
+    return mp3_prefix_code_check(&cs, &ls);
+}
+
+/// Check a code given as codewords (MSB first) and their lengths.
+pub fn mp3_prefix_code_check(cs: &Vec<i64>, ls: &Vec<i64>) -> Mp3HuffCheck {
+    var res = Mp3HuffCheck { codes: 0, max_len: 0, prefix_free: false, complete: false };
+    if cs.len() != ls.len() || cs.len() == 0 {
+        return res;
+    }
+    res.codes = cs.len();
+    var i: i64 = 0;
+    while i < ls.len() {
+        if ls.get(i) > res.max_len { res.max_len = ls.get(i); }
+        i = i + 1;
+    }
+    if res.max_len > 32 {
+        return res;
+    }
+    // tree insertion: a codeword must end on a fresh node and pass no leaf
+    // (node 0 is the root; child 0: empty, -1: leaf, > 0: inner node)
+    var left: Vec<i64> = Vec::new();
+    var right: Vec<i64> = Vec::new();
+    left.push(0);
+    right.push(0);
+    var ok: bool = true;
+    var kraft: i64 = 0;
+    i = 0;
+    while i < cs.len() && ok {
+        val code: i64 = cs.get(i);
+        val len: i64 = ls.get(i);
+        if len < 1 || len > 32 || (code >> len) != 0 {
+            ok = false;
+        }
+        kraft = kraft + (1 << (res.max_len - len));
+        var node: i64 = 0;
+        var b: i64 = len - 1;
+        while b >= 0 && ok {
+            val bit: i64 = (code >> b) & 1;
+            val child: i64 = if bit == 1 { right.get(node) } else { left.get(node) };
+            if b == 0 {
+                if child != 0 {
+                    ok = false;
+                } else if bit == 1 {
+                    right.set(node, - 1);
+                } else {
+                    left.set(node, - 1);
+                }
+            } else if child < 0 {
+                ok = false;
+            } else if child == 0 {
+                left.push(0);
+                right.push(0);
+                val nn: i64 = left.len() - 1;
+                if bit == 1 { right.set(node, nn); } else { left.set(node, nn); }
+                node = nn;
+            } else {
+                node = child;
+            }
+            b = b - 1;
+        }
+        i = i + 1;
+    }
+    res.prefix_free = ok;
+    res.complete = ok && kraft == (1 << res.max_len);
+    return res;
+}
+
+/// Decode one big-values pair with table `t` (1..31); x * 16 + y, or -1
+/// (count1 table A is t = 32: its value is v w x y as 4 bits).
+pub fn mp3_huff_pair(t: i64, r: &mut Mp3Bits) -> i64 {
+    mp_init();
+    if t <= 0 || t > 32 {
+        return - 1;
+    }
+    mp_build_table(t);
+    val left: Vec<i64> = mp_left.get(t);
+    val right: Vec<i64> = mp_right.get(t);
+    if left.len() == 0 {
+        return - 1;
+    }
+    var node: i64 = 0;
+    var guard: i64 = 0;
+    while guard < 32 {
+        val bit: i64 = mp3_read(r, 1);
+        val next: i64 = if bit == 1 { right.get(node) } else { left.get(node) };
+        if next < 0 {
+            return - next - 1;
+        }
+        if next == 0 {
+            return - 1;
+        }
+        node = next;
+        guard = guard + 1;
+    }
+    return - 1;
+}
+
+/// The linbits of table `t`.
+pub fn mp3_linbits(t: i64) -> i64 {
+    mp_init();
+    return mp_linb.get(t);
+}
+
+fn mp_pow43(v: i64) -> f64 {
+    if v < 256 {
+        return mp_pow43_tab.get(v);
+    }
+    return math_pow(v as f64, 4.0 / 3.0);
+}
+
+// Scale factor band boundaries (long: 23 values, short: 14) of rate `rate`.
+fn mp_sfb_long(rate: i64) -> str {
+    if rate == 44100 { return "0 4 8 12 16 20 24 30 36 44 52 62 74 90 110 134 162 196 238 288 342 418 576"; }
+    if rate == 48000 { return "0 4 8 12 16 20 24 30 36 42 50 60 72 88 106 128 156 190 230 276 330 384 576"; }
+    if rate == 32000 { return "0 4 8 12 16 20 24 30 36 44 54 66 82 102 126 156 194 240 296 364 448 550 576"; }
+    if rate == 24000 { return "0 6 12 18 24 30 36 44 54 66 80 96 114 136 162 194 232 278 332 394 464 540 576"; }
+    if rate == 8000 { return "0 12 24 36 48 60 72 88 108 132 160 192 232 280 336 400 476 566 568 570 572 574 576"; }
+    // 22050, 16000, 11025, 12000
+    return "0 6 12 18 24 30 36 44 54 66 80 96 116 140 168 200 238 284 336 396 464 522 576";
+}
+
+fn mp_sfb_short(rate: i64) -> str {
+    if rate == 44100 { return "0 4 8 12 16 22 30 40 52 66 84 106 136 192"; }
+    if rate == 48000 { return "0 4 8 12 16 22 28 38 50 64 80 100 126 192"; }
+    if rate == 32000 { return "0 4 8 12 16 22 30 42 58 78 104 138 180 192"; }
+    if rate == 22050 { return "0 4 8 12 18 24 32 42 56 74 100 132 174 192"; }
+    if rate == 24000 { return "0 4 8 12 18 26 36 48 62 80 104 136 180 192"; }
+    if rate == 8000 { return "0 8 16 24 36 52 72 96 124 160 162 164 166 192"; }
+    // 16000, 11025, 12000
+    return "0 4 8 12 18 26 36 48 62 80 104 134 174 192";
+}
+
+fn mp_list(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = str_len(s);
+    var p: i64 = 0;
+    while p < n {
+        var v: i64 = 0;
+        while p < n && str_byte_at(s, p) != 32 {
+            v = v * 10 + (str_byte_at(s, p) - 48);
+            p = p + 1;
+        }
+        out.push(v);
+        p = p + 1;
+    }
+    return out;
+}
+
+// ─── Side information ─────────────────────────────────────────────────────
+
+pub struct Mp3Granule {
+    pub part2_3_length: i64,
+    pub big_values: i64,
+    pub global_gain: i64,
+    pub scalefac_compress: i64,
+    pub window_switching: bool,
+    pub block_type: i64,
+    pub mixed: bool,
+    pub table_select: Vec<i64>,
+    pub subblock_gain: Vec<i64>,
+    pub region0_count: i64,
+    pub region1_count: i64,
+    pub preflag: i64,
+    pub scalefac_scale: i64,
+    pub count1_table: i64,
+}
+
+pub struct Mp3Side {
+    pub main_data_begin: i64,
+    pub scfsi: Vec<i64>,
+    // [ch * 4 + band group]
+    pub granules: Vec<Mp3Granule>,  // [gr * channels + ch]
+}
+
+/// Parse Layer III side information (the bytes after the header and CRC).
+pub fn mp3_parse_side(hd: &Mp3Header, side: Vec<i64>) -> Mp3Side {
+    var r: Mp3Bits = mp3_bits(side);
+    val nch: i64 = hd.channels;
+    var s = Mp3Side { main_data_begin: 0, scfsi: Vec::new(), granules: Vec::new() };
+    val ngr: i64 = if hd.version == 1 { 2 } else { 1 };
+    if hd.version == 1 {
+        s.main_data_begin = mp3_read(&mut r, 9);
+        mp3_read(&mut r, if nch == 1 { 5 } else { 3 });
+        var c: i64 = 0;
+        while c < nch * 4 {
+            s.scfsi.push(mp3_read(&mut r, 1));
+            c = c + 1;
+        }
+    } else {
+        s.main_data_begin = mp3_read(&mut r, 8);
+        mp3_read(&mut r, if nch == 1 { 1 } else { 2 });
+        var c: i64 = 0;
+        while c < nch * 4 {
+            s.scfsi.push(0);
+            c = c + 1;
+        }
+    }
+    var gr: i64 = 0;
+    while gr < ngr {
+        var ch: i64 = 0;
+        while ch < nch {
+            var g = Mp3Granule { part2_3_length: 0, big_values: 0, global_gain: 0, scalefac_compress: 0, window_switching: false, block_type: 0, mixed: false, table_select: Vec::new(), subblock_gain: Vec::new(), region0_count: 0, region1_count: 0, preflag: 0, scalefac_scale: 0, count1_table: 0 };
+            g.part2_3_length = mp3_read(&mut r, 12);
+            g.big_values = mp3_read(&mut r, 9);
+            g.global_gain = mp3_read(&mut r, 8);
+            g.scalefac_compress = mp3_read(&mut r, if hd.version == 1 { 4 } else { 9 });
+            g.window_switching = mp3_read(&mut r, 1) == 1;
+            if g.window_switching {
+                g.block_type = mp3_read(&mut r, 2);
+                g.mixed = mp3_read(&mut r, 1) == 1;
+                g.table_select.push(mp3_read(&mut r, 5));
+                g.table_select.push(mp3_read(&mut r, 5));
+                g.table_select.push(0);
+                g.subblock_gain.push(mp3_read(&mut r, 3));
+                g.subblock_gain.push(mp3_read(&mut r, 3));
+                g.subblock_gain.push(mp3_read(&mut r, 3));
+                g.region0_count = if g.block_type == 2 && !g.mixed { 8 } else { 7 };
+                g.region1_count = 20 - g.region0_count;
+            } else {
+                g.table_select.push(mp3_read(&mut r, 5));
+                g.table_select.push(mp3_read(&mut r, 5));
+                g.table_select.push(mp3_read(&mut r, 5));
+                g.subblock_gain.push(0);
+                g.subblock_gain.push(0);
+                g.subblock_gain.push(0);
+                g.region0_count = mp3_read(&mut r, 4);
+                g.region1_count = mp3_read(&mut r, 3);
+            }
+            if hd.version == 1 {
+                g.preflag = mp3_read(&mut r, 1);
+            }
+            g.scalefac_scale = mp3_read(&mut r, 1);
+            g.count1_table = mp3_read(&mut r, 1);
+            s.granules.push(g);
+            ch = ch + 1;
+        }
+        gr = gr + 1;
+    }
+    return s;
+}
+
+// ─── Decoder ──────────────────────────────────────────────────────────────
+
+pub struct Mp3Decoder {
+    pub reservoir: Vec<i64>,
+    // main data bytes of past frames
+    pub overlap: Vec<Vec<f64>>,
+    // per channel, 576 values for the next granule
+    pub vbuf: Vec<Vec<f64>>,
+    // synthesis V, 1024 per channel
+    pub voff: Vec<i64>,
+    pub scf_prev: Vec<Vec<i64>>,
+    // MPEG-1 granule 0 long scale factors per channel (scfsi)
+    pub frames: i64,
+    pub error: str,
+    pub free_len: i64,  // free format: frame bytes without the padding slot, 0 until known
+}
+
+pub fn mp3_decoder() -> Mp3Decoder {
+    mp_init();
+    var d = Mp3Decoder { reservoir: Vec::new(), overlap: Vec::new(), vbuf: Vec::new(), voff: Vec::new(), scf_prev: Vec::new(), frames: 0, error: "", free_len: 0 };
+    var c: i64 = 0;
+    while c < 2 {
+        var o: Vec<f64> = Vec::new();
+        var i: i64 = 0;
+        while i < 576 {
+            o.push(0.0);
+            i = i + 1;
+        }
+        d.overlap.push(o);
+        var v: Vec<f64> = Vec::new();
+        i = 0;
+        while i < 1024 {
+            v.push(0.0);
+            i = i + 1;
+        }
+        d.vbuf.push(v);
+        d.voff.push(0);
+        var s: Vec<i64> = Vec::new();
+        i = 0;
+        while i < 22 {
+            s.push(0);
+            i = i + 1;
+        }
+        d.scf_prev.push(s);
+        c = c + 1;
+    }
+    return d;
+}
+
+// Scale factors of one granule/channel: 22 long then 13 * 3 short
+// ([22 + sfb * 3 + w]), the preflag at [61], then (MPEG-2/2.5) at
+// [62 + k] the largest value scale factor k could hold, 2^slen - 1: as the
+// right channel's intensity position that value is illegal (ISO 13818-3
+// 2.4.3.2); -1 where nothing was read.
+fn mp_scalefactors(d: &mut Mp3Decoder, hd: &Mp3Header, side: &Mp3Side, g: &Mp3Granule, gr: i64, ch: i64, r: &mut Mp3Bits) -> Vec<i64> {
+    var sf: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 22 + 39 + 1 {
+        sf.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 61 {
+        sf.push(- 1);
+        i = i + 1;
+    }
+    val short_blk: bool = g.window_switching && g.block_type == 2;
+    if hd.version == 1 {
+        val slen1: i64 = mp_tbl("0 0 0 0 3 1 1 1 2 2 2 3 3 3 4 4", g.scalefac_compress);
+        val slen2: i64 = mp_tbl("0 1 2 3 0 1 2 3 1 2 3 1 2 3 2 3", g.scalefac_compress);
+        if short_blk {
+            var sfb: i64 = 0;
+            if g.mixed {
+                while sfb < 8 {
+                    sf.set(sfb, mp3_read(r, slen1));
+                    sfb = sfb + 1;
+                }
+                sfb = 3;
+            }
+            while sfb < 12 {
+                val n: i64 = if sfb < 6 { slen1 } else { slen2 };
+                var w: i64 = 0;
+                while w < 3 {
+                    sf.set(22 + sfb * 3 + w, mp3_read(r, n));
+                    w = w + 1;
+                }
+                sfb = sfb + 1;
+            }
+        } else {
+            var prev: Vec<i64> = d.scf_prev.get(ch);
+            var grp: i64 = 0;
+            while grp < 4 {
+                val lo: i64 = mp_tbl("0 6 11 16", grp);
+                val hi: i64 = mp_tbl("6 11 16 21", grp);
+                val reuse: bool = gr == 1 && side.scfsi.get(ch * 4 + grp) == 1;
+                var sfb: i64 = lo;
+                while sfb < hi {
+                    if reuse {
+                        sf.set(sfb, prev.get(sfb));
+                    } else {
+                        sf.set(sfb, mp3_read(r, if grp < 2 { slen1 } else { slen2 }));
+                    }
+                    sfb = sfb + 1;
+                }
+                grp = grp + 1;
+            }
+            i = 0;
+            while i < 22 {
+                prev.set(i, sf.get(i));
+                i = i + 1;
+            }
+            d.scf_prev.set(ch, prev);
+        }
+        sf.set(61, g.preflag);
+        return sf;
+    }
+    // MPEG-2 / 2.5 (ISO 13818-3 2.4.3.2)
+    var sfc: i64 = g.scalefac_compress;
+    var slen: Vec<i64> = Vec::new();
+    var tbl: i64 = 0;
+    var preflag: i64 = 0;
+    val is_right: bool = ch == 1 && (hd.mode_ext & 1) == 1 && hd.mode == 1;
+    if !is_right {
+        if sfc < 400 {
+            slen.push((sfc >> 4) / 5);
+            slen.push((sfc >> 4) % 5);
+            slen.push((sfc & 15) >> 2);
+            slen.push(sfc & 3);
+            tbl = 0;
+        } else if sfc < 500 {
+            sfc = sfc - 400;
+            slen.push((sfc >> 2) / 5);
+            slen.push((sfc >> 2) % 5);
+            slen.push(sfc & 3);
+            slen.push(0);
+            tbl = 1;
+        } else {
+            sfc = sfc - 500;
+            slen.push(sfc / 3);
+            slen.push(sfc % 3);
+            slen.push(0);
+            slen.push(0);
+            tbl = 2;
+            preflag = 1;
+        }
+    } else {
+        var isfc: i64 = sfc >> 1;
+        if isfc < 180 {
+            slen.push(isfc / 36);
+            slen.push((isfc % 36) / 6);
+            slen.push((isfc % 36) % 6);
+            slen.push(0);
+            tbl = 3;
+        } else if isfc < 244 {
+            isfc = isfc - 180;
+            slen.push((isfc % 64) >> 4);
+            slen.push((isfc % 16) >> 2);
+            slen.push(isfc % 4);
+            slen.push(0);
+            tbl = 4;
+        } else {
+            isfc = isfc - 244;
+            slen.push(isfc / 3);
+            slen.push(isfc % 3);
+            slen.push(0);
+            slen.push(0);
+            tbl = 5;
+        }
+    }
+    var kind: i64 = 0;
+    if short_blk {
+        kind = if g.mixed { 2 } else { 1 };
+    }
+    val counts: str = "6 5 5 5 9 9 9 9 6 9 9 9 6 5 7 3 9 9 12 6 6 9 12 6 11 10 0 0 18 18 0 0 15 18 0 0 7 7 7 0 12 12 12 0 6 15 12 0 6 6 6 3 12 9 9 6 6 12 9 6 8 8 5 0 15 12 9 0 6 18 9 0";
+    var n: i64 = 0;
+    var part: i64 = 0;
+    while part < 4 {
+        val cnt: i64 = mp_tbl(counts, tbl * 12 + kind * 4 + part);
+        var k: i64 = 0;
+        while k < cnt {
+            val v: i64 = mp3_read(r, slen.get(part));
+            var at: i64 = - 1;
+            if kind == 0 {
+                if n < 22 { at = n; }
+            } else if kind == 1 {
+                val sfb: i64 = n / 3;
+                if sfb < 13 { at = 22 + sfb * 3 + (n % 3); }
+            } else {
+                if n < 6 {
+                    at = n;
+                } else {
+                    val m: i64 = n - 6;
+                    val sfb: i64 = 3 + m / 3;
+                    if sfb < 13 { at = 22 + sfb * 3 + (m % 3); }
+                }
+            }
+            if at >= 0 {
+                sf.set(at, v);
+                sf.set(62 + at, (1 << slen.get(part)) - 1);
+            }
+            n = n + 1;
+            k = k + 1;
+        }
+        part = part + 1;
+    }
+    sf.set(61, preflag);
+    return sf;
+}
+
+// Huffman-decode one granule/channel's 576 values; `end` is the bit
+// position where its part 2/3 data ends.
+fn mp_huffman(hd: &Mp3Header, g: &Mp3Granule, r: &mut Mp3Bits, end: i64) -> Vec<i64> {
+    var is: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 576 {
+        is.push(0);
+        i = i + 1;
+    }
+    val sfl: Vec<i64> = mp_list(mp_sfb_long(hd.rate));
+    var r1: i64 = 0;
+    var r2: i64 = 576;
+    if g.window_switching && g.block_type == 2 && !g.mixed {
+        // 36 lines (three short bands of 4 at most rates), 72 at 8 kHz
+        r1 = if hd.rate == 8000 { 72 } else { 36 };
+    } else {
+        var a: i64 = g.region0_count + 1;
+        if a > 22 { a = 22; }
+        r1 = sfl.get(a);
+        if !g.window_switching {
+            var b: i64 = g.region0_count + g.region1_count + 2;
+            if b > 22 { b = 22; }
+            r2 = sfl.get(b);
+        }
+    }
+    var bv: i64 = g.big_values * 2;
+    if bv > 576 { bv = 576; }
+    i = 0;
+    while i < bv {
+        var t: i64 = g.table_select.get(0);
+        if i >= r1 { t = g.table_select.get(1); }
+        if i >= r2 { t = g.table_select.get(2); }
+        if t != 0 && t != 4 && t != 14 {
+            val v: i64 = mp3_huff_pair(t, r);
+            if v < 0 {
+                return is;
+            }
+            var x: i64 = v / 16;
+            var y: i64 = v % 16;
+            val lb: i64 = mp3_linbits(t);
+            if lb > 0 && x == 15 {
+                x = x + mp3_read(r, lb);
+            }
+            if x != 0 && mp3_read(r, 1) == 1 {
+                x = - x;
+            }
+            if lb > 0 && y == 15 {
+                y = y + mp3_read(r, lb);
+            }
+            if y != 0 && mp3_read(r, 1) == 1 {
+                y = - y;
+            }
+            is.set(i, x);
+            is.set(i + 1, y);
+        }
+        i = i + 2;
+    }
+    // count1 region
+    while r.pos < end && i + 4 <= 576 {
+        var v: i64 = 0;
+        if g.count1_table == 1 {
+            v = 15 - mp3_read(r, 4);
+        } else {
+            v = mp3_huff_pair(32, r);
+            if v < 0 {
+                break;
+            }
+        }
+        var q: Vec<i64> = Vec::new();
+        var k: i64 = 3;
+        while k >= 0 {
+            var val_: i64 = (v >> k) & 1;
+            if val_ != 0 && mp3_read(r, 1) == 1 {
+                val_ = - 1;
+            }
+            q.push(val_);
+            k = k - 1;
+        }
+        if r.pos > end {
+            break;
+        }
+        k = 0;
+        while k < 4 {
+            is.set(i + k, q.get(k));
+            k = k + 1;
+        }
+        i = i + 4;
+    }
+    return is;
+}
+
+// Requantize into xr (576 values, in decode order: short blocks are still
+// grouped by scale factor band and window).
+fn mp_requantize(hd: &Mp3Header, g: &Mp3Granule, sf: &Vec<i64>, is: &Vec<i64>) -> Vec<f64> {
+    var xr: Vec<f64> = Vec::new();
+    val sfl: Vec<i64> = mp_list(mp_sfb_long(hd.rate));
+    val sfs: Vec<i64> = mp_list(mp_sfb_short(hd.rate));
+    val mult: f64 = 0.5 * ((1 + g.scalefac_scale) as f64);
+    val gain: f64 = (g.global_gain - 210) as f64;
+    val preflag: i64 = sf.get(61);
+    var i: i64 = 0;
+    while i < 576 {
+        xr.push(0.0);
+        i = i + 1;
+    }
+    val short_blk: bool = g.window_switching && g.block_type == 2;
+    // long part: everything, or the first 36 lines of a mixed block
+    var long_end: i64 = 576;
+    if short_blk {
+        long_end = if g.mixed { 36 } else { 0 };
+    }
+    var sfb: i64 = 0;
+    i = 0;
+    while i < long_end {
+        while sfb < 21 && i >= sfl.get(sfb + 1) {
+            sfb = sfb + 1;
+        }
+        val q: i64 = is.get(i);
+        if q != 0 {
+            var s: i64 = 0;
+            if sfb < 21 {
+                s = sf.get(sfb) + preflag * mp_pretab.get(sfb);
+            }
+            val mag: f64 = mp_pow43(if q < 0 { - q } else { q }) * math_pow(2.0, 0.25 * gain - mult * (s as f64));
+            xr.set(i, if q < 0 { - mag } else { mag });
+        }
+        i = i + 1;
+    }
+    if !short_blk {
+        return xr;
+    }
+    // short part, band by band, window by window
+    var sb: i64 = if g.mixed { 3 } else { 0 };
+    while sb < 13 {
+        val start: i64 = sfs.get(sb) * 3;
+        val width: i64 = sfs.get(sb + 1) - sfs.get(sb);
+        var w: i64 = 0;
+        while w < 3 {
+            var s: i64 = 0;
+            if sb < 12 {
+                s = sf.get(22 + sb * 3 + w);
+            }
+            val e: f64 = 0.25 * (gain - 8.0 * (g.subblock_gain.get(w) as f64)) - mult * (s as f64);
+            var f: i64 = 0;
+            while f < width {
+                val idx: i64 = start + w * width + f;
+                val q: i64 = is.get(idx);
+                if q != 0 {
+                    val mag: f64 = mp_pow43(if q < 0 { - q } else { q }) * math_pow(2.0, e);
+                    xr.set(idx, if q < 0 { - mag } else { mag });
+                }
+                f = f + 1;
+            }
+            w = w + 1;
+        }
+        sb = sb + 1;
+    }
+    return xr;
+}
+
+// Short blocks: from band/window/frequency order to the order the IMDCT
+// reads (each subband's 18 values interleaved by window).
+fn mp_reorder(hd: &Mp3Header, g: &Mp3Granule, xr: &Vec<f64>) -> Vec<f64> {
+    if !(g.window_switching && g.block_type == 2) {
+        return xr.clone();
+    }
+    val sfs: Vec<i64> = mp_list(mp_sfb_short(hd.rate));
+    var out: Vec<f64> = xr.clone();
+    var sb: i64 = if g.mixed { 3 } else { 0 };
+    while sb < 13 {
+        val start: i64 = sfs.get(sb) * 3;
+        val width: i64 = sfs.get(sb + 1) - sfs.get(sb);
+        var w: i64 = 0;
+        while w < 3 {
+            var f: i64 = 0;
+            while f < width {
+                out.set(start + f * 3 + w, xr.get(start + w * width + f));
+                f = f + 1;
+            }
+            w = w + 1;
+        }
+        sb = sb + 1;
+    }
+    return out;
+}
+
+// Joint stereo of one granule. Intensity stereo codes the lines above the
+// last nonzero line of the right channel (per window for short blocks);
+// the right channel's scale factors there are intensity positions. MPEG-1
+// (ISO 11172-3 2.4.3.4.9.3): is_pos 0..6, ratio tan(is_pos pi / 12), 7 is
+// illegal. MPEG-2/2.5 (ISO 13818-3 2.4.3.2): with io = 2^-1/4
+// (intensity_scale, the low bit of the right channel's scalefac_compress,
+// 0) or 2^-1/2 (1), is_pos 0 keeps L = R = the coded value, an odd is_pos
+// scales the left channel by io^((is_pos + 1) / 2), an even one the right
+// by io^(is_pos / 2); is_pos = 2^slen - 1 is illegal. A band with an
+// illegal position, and every line below the intensity region, gets M/S
+// when it is on. The last band (long 21, short 12) has no scale factor
+// and uses the band below's position.
+fn mp_stereo(hd: &Mp3Header, g: &Mp3Granule, sf_r: &Vec<i64>, l: &mut Vec<f64>, r: &mut Vec<f64>) {
+    val ms: bool = hd.mode == 1 && (hd.mode_ext & 2) == 2;
+    val intensity: bool = hd.mode == 1 && (hd.mode_ext & 1) == 1;
+    val lsf: bool = hd.version != 1;
+    var is_on: Vec<bool> = Vec::new();
+    var is_pos: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 576 {
+        is_on.push(false);
+        is_pos.push(0);
+        i = i + 1;
+    }
+    if intensity {
+        val short_blk: bool = g.window_switching && g.block_type == 2;
+        if !short_blk {
+            val sfl: Vec<i64> = mp_list(mp_sfb_long(hd.rate));
+            var last: i64 = - 1;
+            i = 575;
+            while i >= 0 && last < 0 {
+                if r.get(i) != 0.0 { last = i; }
+                i = i - 1;
+            }
+            var sfb: i64 = 0;
+            while sfb < 22 {
+                val lo: i64 = sfl.get(sfb);
+                val hi: i64 = sfl.get(sfb + 1);
+                if lo > last {
+                    val k: i64 = if sfb < 21 { sfb } else { 20 };
+                    val p: i64 = sf_r.get(k);
+                    val lim: i64 = if lsf { sf_r.get(62 + k) } else { 7 };
+                    var j: i64 = lo;
+                    while j < hi {
+                        is_on.set(j, p != lim);
+                        is_pos.set(j, p);
+                        j = j + 1;
+                    }
+                }
+                sfb = sfb + 1;
+            }
+        } else {
+            // per window, in decode order (before reordering)
+            val sfs: Vec<i64> = mp_list(mp_sfb_short(hd.rate));
+            var w: i64 = 0;
+            while w < 3 {
+                var last_sfb: i64 = - 1;
+                var sb: i64 = 0;
+                while sb < 13 {
+                    val start: i64 = sfs.get(sb) * 3;
+                    val width: i64 = sfs.get(sb + 1) - sfs.get(sb);
+                    var f: i64 = 0;
+                    while f < width {
+                        if r.get(start + w * width + f) != 0.0 { last_sfb = sb; }
+                        f = f + 1;
+                    }
+                    sb = sb + 1;
+                }
+                sb = last_sfb + 1;
+                if g.mixed && sb < 3 { sb = 3; }
+                while sb < 13 {
+                    val start: i64 = sfs.get(sb) * 3;
+                    val width: i64 = sfs.get(sb + 1) - sfs.get(sb);
+                    val k: i64 = 22 + (if sb < 12 { sb } else { 11 }) * 3 + w;
+                    val p: i64 = sf_r.get(k);
+                    val lim: i64 = if lsf { sf_r.get(62 + k) } else { 7 };
+                    var f: i64 = 0;
+                    while f < width {
+                        is_on.set(start + w * width + f, p != lim);
+                        is_pos.set(start + w * width + f, p);
+                        f = f + 1;
+                    }
+                    sb = sb + 1;
+                }
+                w = w + 1;
+            }
+        }
+    }
+    val s2: f64 = 1.0 / math_sqrt(2.0);
+    // MPEG-2: io per step of is_pos
+    val io_exp: f64 = if (g.scalefac_compress & 1) == 1 { - 0.5 } else { - 0.25 };
+    i = 0;
+    while i < 576 {
+        if is_on.get(i) {
+            val x: f64 = l.get(i);
+            val p: i64 = is_pos.get(i);
+            if lsf {
+                var kl: f64 = 1.0;
+                var kr: f64 = 1.0;
+                if p > 0 {
+                    if (p & 1) == 1 {
+                        kl = math_pow(2.0, io_exp * (((p + 1) / 2) as f64));
+                    } else {
+                        kr = math_pow(2.0, io_exp * ((p / 2) as f64));
+                    }
+                }
+                l.set(i, x * kl);
+                r.set(i, x * kr);
+            } else {
+                val ang: f64 = (p as f64) * math_pi() / 12.0;
+                val c: f64 = math_cos(ang);
+                val s: f64 = math_sin(ang);
+                // tan / (1 + tan) and 1 / (1 + tan), written with sin and cos
+                val den: f64 = c + s;
+                if math_fabs(den) < 0.000000000001 {
+                    l.set(i, 0.0);
+                    r.set(i, 0.0);
+                } else {
+                    l.set(i, x * s / den);
+                    r.set(i, x * c / den);
+                }
+            }
+        } else if ms {
+            val m: f64 = l.get(i);
+            val sd: f64 = r.get(i);
+            l.set(i, (m + sd) * s2);
+            r.set(i, (m - sd) * s2);
+        }
+        i = i + 1;
+    }
+}
+
+fn mp_antialias(g: &Mp3Granule, xr: &mut Vec<f64>) {
+    if g.window_switching && g.block_type == 2 && !g.mixed {
+        return;
+    }
+    val sblim: i64 = if g.window_switching && g.block_type == 2 { 2 } else { 32 };
+    var sb: i64 = 1;
+    while sb < sblim {
+        var i: i64 = 0;
+        while i < 8 {
+            val csv: f64 = mp_aa_cs.get(i);
+            val cav: f64 = mp_aa_ca.get(i);
+            val lo: i64 = 18 * sb - 1 - i;
+            val hi: i64 = 18 * sb + i;
+            val a: f64 = xr.get(lo);
+            val b: f64 = xr.get(hi);
+            xr.set(lo, a * csv - b * cav);
+            xr.set(hi, b * csv + a * cav);
+            i = i + 1;
+        }
+        sb = sb + 1;
+    }
+}
+
+/// The 36-point IMDCT of 18 values: x_i = sum_k X_k cos(pi/72 (2i + 19)(2k + 1)).
+pub fn mp3_imdct36(x: &Vec<f64>) -> Vec<f64> {
+    mp_init();
+    var y: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 36 {
+        var s: f64 = 0.0;
+        var k: i64 = 0;
+        while k < 18 {
+            s = s + x.get(k) * mp_cos36.get(i * 18 + k);
+            k = k + 1;
+        }
+        y.push(s);
+        i = i + 1;
+    }
+    return y;
+}
+
+// IMDCT + window + overlap of one channel's granule; frequency inversion.
+fn mp_hybrid(d: &mut Mp3Decoder, g: &Mp3Granule, ch: i64, xr: &Vec<f64>) -> Vec<f64> {
+    var ov: Vec<f64> = d.overlap.get(ch);
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 576 {
+        out.push(0.0);
+        i = i + 1;
+    }
+    var sb: i64 = 0;
+    while sb < 32 {
+        var bt: i64 = 0;
+        if g.window_switching {
+            bt = g.block_type;
+            if g.mixed && sb < 2 {
+                bt = 0;
+            }
+        }
+        var z: Vec<f64> = Vec::new();
+        i = 0;
+        while i < 36 {
+            z.push(0.0);
+            i = i + 1;
+        }
+        val base: i64 = sb * 18;
+        var zero: bool = true;
+        i = 0;
+        while i < 18 && zero {
+            if xr.get(base + i) != 0.0 { zero = false; }
+            i = i + 1;
+        }
+        if zero {
+            // nothing to transform: z stays zero
+        } else if bt == 2 {
+            // 12-point IMDCT per window; only outputs 3..8 are computed:
+            // y[5 - i] = -y[i] (i = 3..5) and y[17 - i] = y[i] (i = 6..8)
+            var y: Vec<f64> = Vec::new();
+            i = 0;
+            while i < 12 {
+                y.push(0.0);
+                i = i + 1;
+            }
+            var w: i64 = 0;
+            while w < 3 {
+                i = 3;
+                while i < 9 {
+                    var s: f64 = 0.0;
+                    var k: i64 = 0;
+                    while k < 6 {
+                        s = s + xr.get(base + k * 3 + w) * mp_cos12.get(i * 6 + k);
+                        k = k + 1;
+                    }
+                    y.set(i, s);
+                    if i < 6 {
+                        y.set(5 - i, - s);
+                    } else {
+                        y.set(17 - i, s);
+                    }
+                    i = i + 1;
+                }
+                i = 0;
+                while i < 12 {
+                    val at: i64 = 6 + 6 * w + i;
+                    z.set(at, z.get(at) + y.get(i) * mp_win.get(72 + i));
+                    i = i + 1;
+                }
+                w = w + 1;
+            }
+        } else {
+            // 36-point IMDCT; only outputs 9..26 are computed:
+            // x[17 - i] = -x[i] (i = 9..17) and x[53 - i] = x[i] (i = 18..26)
+            i = 9;
+            while i < 27 {
+                var s: f64 = 0.0;
+                var k: i64 = 0;
+                val row: i64 = i * 18;
+                while k < 18 {
+                    s = s + xr.get(base + k) * mp_cos36.get(row + k);
+                    k = k + 1;
+                }
+                z.set(i, s * mp_win.get(bt * 36 + i));
+                if i < 18 {
+                    z.set(17 - i, - s * mp_win.get(bt * 36 + 17 - i));
+                } else {
+                    z.set(53 - i, s * mp_win.get(bt * 36 + 53 - i));
+                }
+                i = i + 1;
+            }
+        }
+        i = 0;
+        while i < 18 {
+            var v: f64 = z.get(i) + ov.get(base + i);
+            if (sb & 1) == 1 && (i & 1) == 1 {
+                v = - v;
+            }
+            out.set(base + i, v);
+            ov.set(base + i, z.get(18 + i));
+            i = i + 1;
+        }
+        sb = sb + 1;
+    }
+    d.overlap.set(ch, ov);
+    return out;
+}
+
+/// D[i] of the synthesis window, i in 0..511.
+pub fn mp3_synth_window(i: i64) -> f64 {
+    mp_init();
+    return mp_dwin.get(i);
+}
+
+/// Run `n` time samples of the 32 subbands (sub[k * n + t]) through
+/// channel `ch`'s synthesis filterbank of `d`: 32 * n PCM samples.
+pub fn mp3_synthesize(d: &mut Mp3Decoder, ch: i64, sub: &Vec<f64>, n: i64) -> Vec<f64> {
+    var pcm: Vec<f64> = Vec::new();
+    mp_synth(d, ch, sub, 0, n, &mut pcm);
+    return pcm;
+}
+
+// Polyphase synthesis (ISO 11172-3 Figure A.2) of `n` time samples of the
+// 32 subbands, sub[base + k * n + t]; appends 32 * n PCM samples.
+fn mp_synth(d: &mut Mp3Decoder, ch: i64, sub: &Vec<f64>, base: i64, n: i64, pcm: &mut Vec<f64>) {
+    var v: Vec<f64> = d.vbuf.get(ch);
+    var off: i64 = d.voff.get(ch);
+    var t: i64 = 0;
+    while t < n {
+        off = (off + 1024 - 64) % 1024;
+        // d[j] = sum_k s[k] cos(j (2k + 1) pi / 64); then
+        // V[i] = cos-matrix row 16 + i, folded onto d (see the standard's
+        // N[i][k] = cos((16 + i)(2k + 1) pi / 64))
+        // s[k] and s[31 - k] share |cos|: sums for even j, differences for odd
+        var sa: Vec<f64> = Vec::new();
+        var sd: Vec<f64> = Vec::new();
+        var k0: i64 = 0;
+        while k0 < 16 {
+            val x0: f64 = sub.get(base + k0 * n + t);
+            val x1: f64 = sub.get(base + (31 - k0) * n + t);
+            sa.push(x0 + x1);
+            sd.push(x0 - x1);
+            k0 = k0 + 1;
+        }
+        var dv: Vec<f64> = Vec::new();
+        var j0: i64 = 0;
+        while j0 < 32 {
+            var s: f64 = 0.0;
+            var k: i64 = 0;
+            val row: i64 = j0 * 32;
+            if (j0 & 1) == 0 {
+                while k < 16 {
+                    s = s + mp_ncos.get(row + k) * sa.get(k);
+                    k = k + 1;
+                }
+            } else {
+                while k < 16 {
+                    s = s + mp_ncos.get(row + k) * sd.get(k);
+                    k = k + 1;
+                }
+            }
+            dv.push(s);
+            j0 = j0 + 1;
+        }
+        var i: i64 = 0;
+        while i < 64 {
+            val m: i64 = 16 + i;
+            var x: f64 = 0.0;
+            if m < 32 {
+                x = dv.get(m);
+            } else if m > 32 && m < 64 {
+                x = - dv.get(64 - m);
+            } else if m >= 64 {
+                x = - dv.get(m - 64);
+            }
+            v.set((off + i) % 1024, x);
+            i = i + 1;
+        }
+        var j: i64 = 0;
+        while j < 32 {
+            var acc: f64 = 0.0;
+            var m: i64 = 0;
+            var a: i64 = off + j;
+            var b: i64 = off + 96 + j;
+            var dw: i64 = j;
+            while m < 8 {
+                if a >= 1024 { a = a - 1024; }
+                if b >= 1024 { b = b - 1024; }
+                acc = acc + v.get(a) * mp_dwin.get(dw) + v.get(b) * mp_dwin.get(dw + 32);
+                a = a + 128;
+                b = b + 128;
+                dw = dw + 64;
+                m = m + 1;
+            }
+            pcm.push(acc);
+            j = j + 1;
+        }
+        t = t + 1;
+    }
+    d.vbuf.set(ch, v);
+    d.voff.set(ch, off);
+}
+
+pub struct Mp3Frame {
+    pub ok: bool,
+    pub error: str,
+    pub header: Mp3Header,
+    pub pcm: Vec<Vec<f64>>,  // per channel; empty while the reservoir fills
+}
+
+/// Decode the frame (Layer I, II or III) at `at`.
+pub fn mp3_decode_frame(d: &mut Mp3Decoder, b: &Vec<i64>, at: i64) -> Mp3Frame {
+    var hd: Mp3Header = mp3_parse_header(b, at);
+    var fr = Mp3Frame { ok: false, error: "", header: hd, pcm: Vec::new() };
+    if !hd.ok {
+        fr.error = "no frame header";
+        return fr;
+    }
+    if hd.free {
+        if !mp_free_fill(d, b, at, &mut hd) {
+            fr.error = "free-format frame: no next frame header to size it";
+            return fr;
+        }
+        fr.header = hd;
+    }
+    if at + hd.frame_len > b.len() {
+        fr.error = "truncated frame";
+        return fr;
+    }
+    if hd.layer != 3 {
+        d.frames = d.frames + 1;
+        mp_decode_l12(d, &hd, b, at, &mut fr);
+        return fr;
+    }
+    var p: i64 = at + 4;
+    if hd.has_crc {
+        p = p + 2;
+    }
+    var side_bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < hd.side_len {
+        side_bytes.push(b.get(p + i));
+        i = i + 1;
+    }
+    p = p + hd.side_len;
+    val side: Mp3Side = mp3_parse_side(&hd, side_bytes);
+    // main data: main_data_begin bytes from the reservoir, then this frame
+    var main: Vec<i64> = Vec::new();
+    val have: i64 = d.reservoir.len();
+    val missing: bool = side.main_data_begin > have;
+    if !missing {
+        i = have - side.main_data_begin;
+        while i < have {
+            main.push(d.reservoir.get(i));
+            i = i + 1;
+        }
+    }
+    var frame_main: Vec<i64> = Vec::new();
+    i = p;
+    while i < at + hd.frame_len {
+        frame_main.push(b.get(i));
+        main.push(b.get(i));
+        i = i + 1;
+    }
+    // keep the last 511 bytes for the next frames
+    var res: Vec<i64> = d.reservoir;
+    i = 0;
+    while i < frame_main.len() {
+        res.push(frame_main.get(i));
+        i = i + 1;
+    }
+    if res.len() > 511 {
+        var trimmed: Vec<i64> = Vec::new();
+        i = res.len() - 511;
+        while i < res.len() {
+            trimmed.push(res.get(i));
+            i = i + 1;
+        }
+        res = trimmed;
+    }
+    d.reservoir = res;
+    d.frames = d.frames + 1;
+    fr.ok = true;
+    if missing {
+        // the stream started mid-reservoir: nothing to decode yet
+        return fr;
+    }
+    val nch: i64 = hd.channels;
+    val ngr: i64 = if hd.version == 1 { 2 } else { 1 };
+    var c: i64 = 0;
+    while c < nch {
+        fr.pcm.push(Vec::new());
+        c = c + 1;
+    }
+    var r: Mp3Bits = mp3_bits(main);
+    var gr: i64 = 0;
+    while gr < ngr {
+        var xrs: Vec<Vec<f64>> = Vec::new();
+        var sfs: Vec<Vec<i64>> = Vec::new();
+        c = 0;
+        while c < nch {
+            val g: Mp3Granule = side.granules.get(gr * nch + c);
+            val start: i64 = r.pos;
+            val sf: Vec<i64> = mp_scalefactors(d, &hd, &side, &g, gr, c, &mut r);
+            val is: Vec<i64> = mp_huffman(&hd, &g, &mut r, start + g.part2_3_length);
+            r.pos = start + g.part2_3_length;
+            xrs.push(mp_requantize(&hd, &g, &sf, &is));
+            sfs.push(sf);
+            c = c + 1;
+        }
+        if nch == 2 && hd.mode == 1 {
+            var l: Vec<f64> = xrs.get(0);
+            var rr: Vec<f64> = xrs.get(1);
+            val g1: Mp3Granule = side.granules.get(gr * nch + 1);
+            mp_stereo(&hd, &g1, &sfs.get(1), &mut l, &mut rr);
+            xrs.set(0, l);
+            xrs.set(1, rr);
+        }
+        c = 0;
+        while c < nch {
+            val g: Mp3Granule = side.granules.get(gr * nch + c);
+            var xr: Vec<f64> = mp_reorder(&hd, &g, &xrs.get(c));
+            mp_antialias(&g, &mut xr);
+            val sub: Vec<f64> = mp_hybrid(d, &g, c, &xr);
+            var pcm: Vec<f64> = fr.pcm.get(c);
+            mp_synth(d, c, &sub, 0, 18, &mut pcm);
+            fr.pcm.set(c, pcm);
+            c = c + 1;
+        }
+        gr = gr + 1;
+    }
+    return fr;
+}
+
+// ─── Layers I and II ──────────────────────────────────────────────────────
+//
+// ISO 11172-3 2.4.1.5-2.4.1.6 and 2.4.3.2-2.4.3.3 (ISO 13818-3 2.4.2.3 for
+// the MPEG-2 Layer II table): bit allocation (shared above the joint
+// stereo bound), Layer II scale factor selection, scale factors and
+// samples (Layer II: grouped codes for 3, 5 and 9 levels). A sample v of
+// L levels is requantized to (2v - (L - 1)) / L, which is the standard's
+// C * (s''' + D) of Table 3-B.4 written out (for Layer I, L = 2^nb - 1),
+// times the scale factor 2^(1 - i/3) (Table 3-B.1). The 32 subband
+// signals go through the same synthesis filterbank as Layer III.
+
+var mp_scf_tab: Vec<f64> = Vec::new();
+var mp_l2_cache: Vec<Vec<i64>> = Vec::new();
+
+fn mp_l12_scf(i: i64) -> f64 {
+    if mp_scf_tab.len() == 0 {
+        var k: i64 = 0;
+        while k < 64 {
+            mp_scf_tab.push(math_pow(2.0, 1.0 - (k as f64) / 3.0));
+            k = k + 1;
+        }
+    }
+    return mp_scf_tab.get(i);
+}
+
+fn mp_l12_requant(v: i64, levels: i64) -> f64 {
+    return ((2 * v - (levels - 1)) as f64) / (levels as f64);
+}
+
+/// The Layer II allocation table of a frame: 0..3 are ISO 11172-3 Tables
+/// 3-B.2a..d (chosen by sample rate and bitrate per channel; a
+/// free-format stream uses B.2a at 48 kHz, B.2b otherwise), 4 is ISO
+/// 13818-3 Table B.1 (the MPEG-2 rates).
+pub fn mp3_l2_table(hd: &Mp3Header) -> i64 {
+    if hd.version != 1 {
+        return 4;
+    }
+    if hd.free {
+        if hd.rate == 48000 { return 0; }
+        return 1;
+    }
+    val per: i64 = if hd.channels == 1 { hd.bitrate } else { hd.bitrate / 2 };
+    if per >= 56 && per <= 80 {
+        return 0;
+    }
+    if per >= 96 {
+        if hd.rate == 48000 { return 0; }
+        return 1;
+    }
+    if hd.rate == 32000 {
+        return 3;
+    }
+    return 2;
+}
+
+/// Subbands with an allocation (sblimit) in Layer II table `tbl`.
+pub fn mp3_l2_sblimit(tbl: i64) -> i64 {
+    if tbl == 0 { return 27; }
+    if tbl == 2 { return 8; }
+    if tbl == 3 { return 12; }
+    return 30;
+}
+
+// Table `tbl` as [sb * 16] = nbal (bits of the allocation of subband sb),
+// [sb * 16 + a] = quantization levels of allocation a (0: none).
+fn mp_l2_alloc(tbl: i64) -> Vec<i64> {
+    if mp_l2_cache.len() == 0 {
+        var k: i64 = 0;
+        while k < 5 {
+            mp_l2_cache.push(Vec::new());
+            k = k + 1;
+        }
+    }
+    if mp_l2_cache.get(tbl).len() > 0 {
+        return mp_l2_cache.get(tbl);
+    }
+    var t: Vec<i64> = Vec::new();
+    var sb: i64 = 0;
+    while sb < 32 {
+        var nbal: i64 = 0;
+        var lv: str = "";
+        if tbl <= 1 {
+            if sb < 3 {
+                nbal = 4;
+                lv = "3 7 15 31 63 127 255 511 1023 2047 4095 8191 16383 32767 65535";
+            } else if sb < 11 {
+                nbal = 4;
+                lv = "3 5 7 9 15 31 63 127 255 511 1023 2047 4095 8191 65535";
+            } else if sb < 23 {
+                nbal = 3;
+                lv = "3 5 7 9 15 31 65535";
+            } else {
+                nbal = 2;
+                lv = "3 5 65535";
+            }
+        } else if tbl <= 3 {
+            if sb < 2 {
+                nbal = 4;
+                lv = "3 5 9 15 31 63 127 255 511 1023 2047 4095 8191 16383 32767";
+            } else {
+                nbal = 3;
+                lv = "3 5 9 15 31 63 127";
+            }
+        } else {
+            if sb < 4 {
+                nbal = 4;
+                lv = "3 5 7 9 15 31 63 127 255 511 1023 2047 4095 8191 16383";
+            } else if sb < 11 {
+                nbal = 3;
+                lv = "3 5 9 15 31 63 127";
+            } else {
+                nbal = 2;
+                lv = "3 5 9";
+            }
+        }
+        val l: Vec<i64> = mp_list(lv);
+        t.push(nbal);
+        var a: i64 = 0;
+        while a < 15 {
+            t.push(if a < l.len() { l.get(a) } else { 0 });
+            a = a + 1;
+        }
+        sb = sb + 1;
+    }
+    mp_l2_cache.set(tbl, t);
+    return t;
+}
+
+// Bits of one ungrouped Layer II sample of `levels` levels (7 -> 3 ... 65535 -> 16).
+fn mp_l2_bits(levels: i64) -> i64 {
+    var n: i64 = 0;
+    var v: i64 = levels;
+    while v > 0 {
+        n = n + 1;
+        v = v >> 1;
+    }
+    return n;
+}
+
+// Decode a Layer I or II frame into fr.pcm (384 or 1152 samples per channel).
+fn mp_decode_l12(d: &mut Mp3Decoder, hd: &Mp3Header, b: &Vec<i64>, at: i64, fr: &mut Mp3Frame) {
+    var p: i64 = at + 4;
+    if hd.has_crc {
+        p = p + 2;
+    }
+    var data: Vec<i64> = Vec::new();
+    while p < at + hd.frame_len {
+        data.push(b.get(p));
+        p = p + 1;
+    }
+    var r: Mp3Bits = mp3_bits(data);
+    val nch: i64 = hd.channels;
+    val l1: bool = hd.layer == 1;
+    val ns: i64 = if l1 { 12 } else { 36 };
+    var tbl: Vec<i64> = Vec::new();
+    var sblimit: i64 = 32;
+    if !l1 {
+        val ti: i64 = mp3_l2_table(hd);
+        tbl = mp_l2_alloc(ti);
+        sblimit = mp3_l2_sblimit(ti);
+    }
+    var bound: i64 = sblimit;
+    if hd.mode == 1 {
+        bound = (hd.mode_ext + 1) * 4;
+        if bound > sblimit { bound = sblimit; }
+    }
+    // bit allocation [ch * 32 + sb]
+    var alloc: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        alloc.push(0);
+        i = i + 1;
+    }
+    var sb: i64 = 0;
+    while sb < sblimit {
+        val nb: i64 = if l1 { 4 } else { tbl.get(sb * 16) };
+        if sb < bound {
+            var c: i64 = 0;
+            while c < nch {
+                alloc.set(c * 32 + sb, mp3_read(&mut r, nb));
+                c = c + 1;
+            }
+        } else {
+            val a: i64 = mp3_read(&mut r, nb);
+            var c: i64 = 0;
+            while c < nch {
+                alloc.set(c * 32 + sb, a);
+                c = c + 1;
+            }
+        }
+        sb = sb + 1;
+    }
+    if l1 {
+        i = 0;
+        while i < 64 {
+            if alloc.get(i) == 15 {
+                fr.error = "bad Layer I bit allocation";
+                return;
+            }
+            i = i + 1;
+        }
+    }
+    // Layer II scale factor selection
+    var scfsi: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 64 {
+        scfsi.push(0);
+        i = i + 1;
+    }
+    if !l1 {
+        sb = 0;
+        while sb < sblimit {
+            var c: i64 = 0;
+            while c < nch {
+                if alloc.get(c * 32 + sb) != 0 {
+                    scfsi.set(c * 32 + sb, mp3_read(&mut r, 2));
+                }
+                c = c + 1;
+            }
+            sb = sb + 1;
+        }
+    }
+    // scale factors [(ch * 32 + sb) * 3 + part], part = third of the frame
+    var scf: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 192 {
+        scf.push(0.0);
+        i = i + 1;
+    }
+    sb = 0;
+    while sb < sblimit {
+        var c: i64 = 0;
+        while c < nch {
+            if alloc.get(c * 32 + sb) != 0 {
+                val o: i64 = (c * 32 + sb) * 3;
+                var s0: i64 = mp3_read(&mut r, 6);
+                var s1: i64 = s0;
+                var s2: i64 = s0;
+                if !l1 {
+                    val sel: i64 = scfsi.get(c * 32 + sb);
+                    if sel == 0 {
+                        s1 = mp3_read(&mut r, 6);
+                        s2 = mp3_read(&mut r, 6);
+                    } else if sel == 1 {
+                        s2 = mp3_read(&mut r, 6);
+                    } else if sel == 3 {
+                        s1 = mp3_read(&mut r, 6);
+                        s2 = s1;
+                    }
+                }
+                scf.set(o, mp_l12_scf(s0));
+                scf.set(o + 1, mp_l12_scf(s1));
+                scf.set(o + 2, mp_l12_scf(s2));
+            }
+            c = c + 1;
+        }
+        sb = sb + 1;
+    }
+    // samples [ch * 32 * ns + sb * ns + t]
+    var sub: Vec<f64> = Vec::new();
+    i = 0;
+    while i < nch * 32 * ns {
+        sub.push(0.0);
+        i = i + 1;
+    }
+    var gr: i64 = 0;
+    while gr < 12 {
+        sb = 0;
+        while sb < sblimit {
+            val nread: i64 = if sb < bound { nch } else { 1 };
+            var c: i64 = 0;
+            while c < nread {
+                val a: i64 = alloc.get(c * 32 + sb);
+                if a != 0 {
+                    var levels: i64 = 0;
+                    var v0: i64 = 0;
+                    var v1: i64 = 0;
+                    var v2: i64 = 0;
+                    if l1 {
+                        levels = (1 << (a + 1)) - 1;
+                        v0 = mp3_read(&mut r, a + 1);
+                    } else {
+                        levels = tbl.get(sb * 16 + a);
+                        if levels == 3 || levels == 5 || levels == 9 {
+                            val gb: i64 = if levels == 3 { 5 } else if levels == 5 { 7 } else { 10 };
+                            var cw: i64 = mp3_read(&mut r, gb);
+                            v0 = cw % levels;
+                            cw = cw / levels;
+                            v1 = cw % levels;
+                            v2 = (cw / levels) % levels;
+                        } else {
+                            val nb: i64 = mp_l2_bits(levels);
+                            v0 = mp3_read(&mut r, nb);
+                            v1 = mp3_read(&mut r, nb);
+                            v2 = mp3_read(&mut r, nb);
+                        }
+                    }
+                    val part: i64 = if l1 { 0 } else { gr / 4 };
+                    // below the bound one channel; above it the samples
+                    // are shared, each channel with its own scale factor
+                    var c2: i64 = c;
+                    val c_end: i64 = if sb < bound { c + 1 } else { nch };
+                    while c2 < c_end {
+                        val f: f64 = scf.get((c2 * 32 + sb) * 3 + part);
+                        val o: i64 = c2 * 32 * ns + sb * ns;
+                        if l1 {
+                            sub.set(o + gr, mp_l12_requant(v0, levels) * f);
+                        } else {
+                            sub.set(o + gr * 3, mp_l12_requant(v0, levels) * f);
+                            sub.set(o + gr * 3 + 1, mp_l12_requant(v1, levels) * f);
+                            sub.set(o + gr * 3 + 2, mp_l12_requant(v2, levels) * f);
+                        }
+                        c2 = c2 + 1;
+                    }
+                }
+                c = c + 1;
+            }
+            sb = sb + 1;
+        }
+        gr = gr + 1;
+    }
+    var c: i64 = 0;
+    while c < nch {
+        var pcm: Vec<f64> = Vec::new();
+        mp_synth(d, c, &sub, c * 32 * ns, ns, &mut pcm);
+        fr.pcm.push(pcm);
+        c = c + 1;
+    }
+    fr.ok = true;
+}
+
+// ─── Free format ──────────────────────────────────────────────────────────
+
+/// Bytes of the free-format frame at `at` (header included): the distance
+/// to the next header of the same stream (same version, layer, sample
+/// rate, CRC flag and channel count, bitrate index 0) whose own frame ends
+/// at a further such header or at the end of `b`. 0 when there is none.
+pub fn mp3_free_frame_len(b: &Vec<i64>, at: i64) -> i64 {
+    val hd: Mp3Header = mp3_parse_header(b, at);
+    if !hd.ok || !hd.free {
+        return 0;
+    }
+    val slot: i64 = if hd.layer == 1 { 4 } else { 1 };
+    var p: i64 = at + 4 + hd.side_len + 1;
+    while p + 4 <= b.len() && p < at + 8192 {
+        if b.get(p) == 255 && (b.get(p + 1) & 224) == 224 {
+            val h2: Mp3Header = mp3_parse_header(b, p);
+            if mp_free_same(&hd, &h2) {
+                val base: i64 = p - at - hd.padding * slot;
+                val next: i64 = p + base + h2.padding * slot;
+                if next == b.len() {
+                    return p - at;
+                }
+                if next < b.len() {
+                    val h3: Mp3Header = mp3_parse_header(b, next);
+                    if mp_free_same(&hd, &h3) {
+                        return p - at;
+                    }
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+fn mp_free_same(a: &Mp3Header, h: &Mp3Header) -> bool {
+    return h.ok && h.free && h.version == a.version && h.layer == a.layer && h.rate == a.rate && h.has_crc == a.has_crc && h.channels == a.channels;
+}
+
+// Fill in frame_len and bitrate of a free-format header (the frame size
+// without padding is found once, from the first frame, and kept in `d`).
+fn mp_free_fill(d: &mut Mp3Decoder, b: &Vec<i64>, at: i64, hd: &mut Mp3Header) -> bool {
+    val slot: i64 = if hd.layer == 1 { 4 } else { 1 };
+    if d.free_len <= 0 {
+        val n: i64 = mp3_free_frame_len(b, at);
+        if n == 0 {
+            return false;
+        }
+        d.free_len = n - hd.padding * slot;
+    }
+    hd.frame_len = d.free_len + hd.padding * slot;
+    // bitrate (kbit/s, rounded) from frame_len = k * bitrate / rate
+    var k: i64 = 144000;
+    if hd.layer == 1 {
+        k = 48000;
+    } else if hd.layer == 3 && hd.version != 1 {
+        k = 72000;
+    }
+    hd.bitrate = (d.free_len * hd.rate + k / 2) / k;
+    return true;
+}
+
+// ─── Streams ──────────────────────────────────────────────────────────────
+
+/// Bytes of an ID3v2 tag at the start (0 when there is none).
+pub fn mp3_id3_size(b: &Vec<i64>) -> i64 {
+    if b.len() < 10 || b.get(0) != 73 || b.get(1) != 68 || b.get(2) != 51 {
+        return 0;
+    }
+    var n: i64 = ((b.get(6) & 127) << 21) | ((b.get(7) & 127) << 14) | ((b.get(8) & 127) << 7) | (b.get(9) & 127);
+    n = n + 10;
+    if (b.get(5) & 16) != 0 {
+        n = n + 10;
+    }
+    return n;
+}
+
+pub struct Mp3File {
+    pub ok: bool,
+    pub error: str,
+    pub version: i64,
+    pub layer: i64,
+    pub rate: i64,
+    pub channels: i64,
+    pub free_format: bool,
+    pub frames: i64,
+    // audio frames decoded (the Xing/Info frame is not counted)
+    pub info_frame: bool,
+    pub delay: i64,
+    pub padding: i64,
+    // from the LAME tag, -1 when absent
+    pub pcm: Vec<Vec<f64>>,
+}
+
+fn mp_is_letter(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+// Is the frame at `at` a Xing/Info header? Returns the offset of the tag.
+fn mp_xing(b: &Vec<i64>, at: i64, hd: &Mp3Header) -> i64 {
+    var o: i64 = at + 4 + hd.side_len;
+    if hd.has_crc { o = o + 2; }
+    if o + 4 > b.len() {
+        return - 1;
+    }
+    val x: bool = b.get(o) == 88 && b.get(o + 1) == 105 && b.get(o + 2) == 110 && b.get(o + 3) == 103;
+    val inf: bool = b.get(o) == 73 && b.get(o + 1) == 110 && b.get(o + 2) == 102 && b.get(o + 3) == 111;
+    if x || inf {
+        return o;
+    }
+    return - 1;
+}
+
+/// Decode every frame. With `gapless`, the LAME tag's encoder delay (+ the
+/// 529 samples of decoder delay) is cut from the start and its padding from
+/// the end, as ffmpeg and LAME's own decoder do.
+pub fn mp3_decode_stream(b: &Vec<i64>, gapless: bool) -> Mp3File {
+    var f = Mp3File { ok: false, error: "", version: 0, layer: 0, rate: 0, channels: 0, free_format: false, frames: 0, info_frame: false, delay: - 1, padding: - 1, pcm: Vec::new() };
+    var d: Mp3Decoder = mp3_decoder();
+    var at: i64 = mp3_id3_size(b);
+    var first: bool = true;
+    while at + 4 <= b.len() {
+        var hd: Mp3Header = mp3_parse_header(b, at);
+        if hd.ok && hd.free {
+            if !mp_free_fill(&mut d, b, at, &mut hd) {
+                hd.ok = false;
+            }
+        }
+        if !hd.ok || at + hd.frame_len > b.len() {
+            at = at + 1;
+            continue;
+        }
+        if first {
+            first = false;
+            f.version = hd.version;
+            f.layer = hd.layer;
+            f.rate = hd.rate;
+            f.channels = hd.channels;
+            f.free_format = hd.free;
+            var c: i64 = 0;
+            while c < hd.channels {
+                f.pcm.push(Vec::new());
+                c = c + 1;
+            }
+            val xo: i64 = if hd.layer == 3 { mp_xing(b, at, &hd) } else { - 1 };
+            if xo >= 0 {
+                f.info_frame = true;
+                // LAME tag, 120 bytes after the Xing tag: a 9-byte encoder
+                // name ("LAME3.100", or "Lavc..." from ffmpeg), then the
+                // 12-bit delay and padding at bytes 21..23
+                val lo: i64 = xo + 120;
+                if lo + 24 <= b.len() && mp_is_letter(b.get(lo)) && mp_is_letter(b.get(lo + 1)) && mp_is_letter(b.get(lo + 2)) && mp_is_letter(b.get(lo + 3)) {
+                    f.delay = (b.get(lo + 21) << 4) | (b.get(lo + 22) >> 4);
+                    f.padding = ((b.get(lo + 22) & 15) << 8) | b.get(lo + 23);
+                }
+                at = at + hd.frame_len;
+                continue;
+            }
+        }
+        if hd.channels != f.channels || hd.rate != f.rate || hd.layer != f.layer {
+            at = at + hd.frame_len;
+            continue;
+        }
+        val fr: Mp3Frame = mp3_decode_frame(&mut d, b, at);
+        if fr.ok {
+            f.frames = f.frames + 1;
+            var c: i64 = 0;
+            while c < fr.pcm.len() {
+                var all: Vec<f64> = f.pcm.get(c);
+                val part: Vec<f64> = fr.pcm.get(c);
+                var k: i64 = 0;
+                while k < part.len() {
+                    all.push(part.get(k));
+                    k = k + 1;
+                }
+                f.pcm.set(c, all);
+                c = c + 1;
+            }
+        }
+        at = at + hd.frame_len;
+    }
+    if f.channels == 0 {
+        f.error = "no MPEG audio frame found";
+        return f;
+    }
+    if gapless && f.delay >= 0 {
+        val skip: i64 = f.delay + 529;
+        var c: i64 = 0;
+        while c < f.pcm.len() {
+            val all: Vec<f64> = f.pcm.get(c);
+            var cut: Vec<f64> = Vec::new();
+            var end: i64 = all.len() - f.padding + 529;
+            if end > all.len() { end = all.len(); }
+            var k: i64 = skip;
+            while k < end {
+                cut.push(all.get(k));
+                k = k + 1;
+            }
+            f.pcm.set(c, cut);
+            c = c + 1;
+        }
+    }
+    f.ok = true;
+    return f;
+}
+
+/// Decode a whole MP3 file without gapless trimming.
+pub fn mp3_decode(b: &Vec<i64>) -> Mp3File {
+    return mp3_decode_stream(b, false);
+}

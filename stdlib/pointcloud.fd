@@ -1,0 +1,649 @@
+// Fides point clouds (robotics / 3D perception)
+//
+// A cloud is a `Vec<vec3>` (math's vec3). This module gives:
+//   pcl_voxel_downsample  one point per occupied voxel (the centroid of its
+//                         points), voxels in order of first appearance
+//   KdTree                a balanced 3-d tree (median split on the axis of
+//                         largest spread) with nearest neighbour, k nearest
+//                         neighbours and radius search
+//   pcl_eigen_sym         eigenvalues and eigenvectors of a small symmetric
+//                         matrix by cyclic Jacobi rotations (used for 3x3
+//                         covariances and Horn's 4x4 matrix)
+//   pcl_normals           a normal per point: the eigenvector of the smallest
+//                         eigenvalue of its k neighbours' covariance (PCA),
+//                         turned toward a viewpoint
+//   pcl_icp               point-to-point ICP: nearest neighbours in the
+//                         target's k-d tree, pairs farther than a cut-off
+//                         dropped, the best rigid motion of the pairs in
+//                         closed form (Horn's quaternion method), repeated
+//                         until the motion stops changing; like any
+//                         point-to-point ICP it needs an initial guess
+//                         within the basin of the right answer (regular
+//                         sampling has local minima about a sample apart)
+// Transforms are transform3d `Transform3` values.
+// Everything here is pure computation; there is no platform seam (clouds
+// come from the caller's depth camera or lidar driver).
+//
+// Usage:
+//   use math; use quat; use transform3d; use pointcloud;
+//   val small = pcl_voxel_downsample(&cloud, 0.05);
+//   val tree = kdtree_build(&target);
+//   val nn = kdtree_knn(&tree, vec3(0.0, 0.0, 0.0), 8);
+//   val r = pcl_icp(&source, &target, tf3_identity(), 50, 0.5, 0.000001);
+//   println(tf3_to_str(r.transform, 4));
+
+module pointcloud;
+use math;
+use quat;
+use transform3d;
+
+// ─── Basics ───
+
+/// The centroid of a cloud ((0, 0, 0) for an empty one).
+pub fn pcl_centroid(pts: & Vec<vec3>) -> vec3 {
+    var s: vec3 = vec3(0.0, 0.0, 0.0);
+    var i: i64 = 0;
+    while i < pts.len() {
+        s = s.add(pts.get(i));
+        i = i + 1;
+    }
+    if pts.len() == 0 {
+        return s;
+    }
+    return s.scale(1.0 / (pts.len() as f64));
+}
+
+/// Componentwise minimum and maximum (two points).
+pub fn pcl_bounds(pts: & Vec<vec3>) -> Vec<vec3> {
+    var lo: vec3 = pts.get(0);
+    var hi: vec3 = pts.get(0);
+    var i: i64 = 1;
+    while i < pts.len() {
+        val p: vec3 = pts.get(i);
+        lo = vec3(rmath_min(lo.x, p.x), rmath_min(lo.y, p.y), rmath_min(lo.z, p.z));
+        hi = vec3(rmath_max(hi.x, p.x), rmath_max(hi.y, p.y), rmath_max(hi.z, p.z));
+        i = i + 1;
+    }
+    var out: Vec<vec3> = Vec::new();
+    out.push(lo);
+    out.push(hi);
+    return out;
+}
+
+/// Squared distance.
+pub fn pcl_dist2(a: vec3, b: vec3) -> f64 {
+    val dx: f64 = a.x - b.x;
+    val dy: f64 = a.y - b.y;
+    val dz: f64 = a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+fn pcl_coord(p: vec3, axis: i64) -> f64 {
+    if axis == 0 {
+        return p.x;
+    }
+    if axis == 1 {
+        return p.y;
+    }
+    return p.z;
+}
+
+// ─── Voxel grid ───
+
+/// One point per voxel of edge `size`: the centroid of the points in it.
+/// Voxel indices must stay within +-2^20 (size * 1e6 around the origin).
+pub fn pcl_voxel_downsample(pts: & Vec<vec3>, size: f64) -> Vec<vec3> {
+    var slot: HashMap<i64, i64> = HashMap::new();
+    var sums: Vec<vec3> = Vec::new();
+    var counts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < pts.len() {
+        val p: vec3 = pts.get(i);
+        val ix: i64 = (math_floor(p.x / size) as i64) + 1048576;
+        val iy: i64 = (math_floor(p.y / size) as i64) + 1048576;
+        val iz: i64 = (math_floor(p.z / size) as i64) + 1048576;
+        val key: i64 = ix * 4398046511104 + iy * 2097152 + iz;
+        if slot.contains(key) {
+            val k: i64 = slot.get(key);
+            sums.set(k, sums.get(k).add(p));
+            counts.set(k, counts.get(k) + 1);
+        } else {
+            slot.insert(key, sums.len());
+            sums.push(p);
+            counts.push(1);
+        }
+        i = i + 1;
+    }
+    var out: Vec<vec3> = Vec::new();
+    i = 0;
+    while i < sums.len() {
+        out.push(sums.get(i).scale(1.0 / (counts.get(i) as f64)));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── k-d tree ───
+
+/// A 3-d tree over a copy of the points; node n splits on axis[n] at
+/// point idx[n].
+pub struct KdTree {
+    pub pts: Vec<vec3>,
+    pub idx: Vec<i64>,
+    pub axis: Vec<i64>,
+    pub left: Vec<i64>,
+    pub right: Vec<i64>,
+    pub root: i64,
+}
+
+/// Swap order[a] and order[b].
+fn kd_swap(order: & mut Vec<i64>, a: i64, b: i64) {
+    val t: i64 = order.get(a);
+    order.set(a, order.get(b));
+    order.set(b, t);
+}
+
+/// Rearrange order[lo..hi) so order[k] is the point with the k-th smallest
+/// coordinate on `axis`, smaller ones before it and larger after
+/// (quickselect, middle pivot).
+fn kd_select(pts: & Vec<vec3>, order: & mut Vec<i64>, lo0: i64, hi0: i64, k: i64, axis: i64) {
+    var lo: i64 = lo0;
+    var hi: i64 = hi0 - 1;
+    while lo < hi {
+        val pv: f64 = pcl_coord(pts.get(order.get((lo + hi) / 2)), axis);
+        var i: i64 = lo;
+        var j: i64 = hi;
+        while i <= j {
+            while pcl_coord(pts.get(order.get(i)), axis) < pv {
+                i = i + 1;
+            }
+            while pcl_coord(pts.get(order.get(j)), axis) > pv {
+                j = j - 1;
+            }
+            if i <= j {
+                kd_swap(order, i, j);
+                i = i + 1;
+                j = j - 1;
+            }
+        }
+        if k <= j {
+            hi = j;
+        } else if k >= i {
+            lo = i;
+        } else {
+            return;
+        }
+    }
+}
+
+/// Build the subtree of order[lo..hi); returns its node id or -1.
+fn kd_build(t: & mut KdTree, order: & mut Vec<i64>, lo: i64, hi: i64) -> i64 {
+    if lo >= hi {
+        return - 1;
+    }
+    // the axis of largest spread
+    var mn: vec3 = t.pts.get(order.get(lo));
+    var mx: vec3 = mn;
+    var i: i64 = lo + 1;
+    while i < hi {
+        val p: vec3 = t.pts.get(order.get(i));
+        mn = vec3(rmath_min(mn.x, p.x), rmath_min(mn.y, p.y), rmath_min(mn.z, p.z));
+        mx = vec3(rmath_max(mx.x, p.x), rmath_max(mx.y, p.y), rmath_max(mx.z, p.z));
+        i = i + 1;
+    }
+    var axis: i64 = 0;
+    var spread: f64 = mx.x - mn.x;
+    if mx.y - mn.y > spread {
+        axis = 1;
+        spread = mx.y - mn.y;
+    }
+    if mx.z - mn.z > spread {
+        axis = 2;
+    }
+    val mid: i64 = (lo + hi) / 2;
+    kd_select(&t.pts, order, lo, hi, mid, axis);
+    val node: i64 = t.idx.len();
+    t.idx.push(order.get(mid));
+    t.axis.push(axis);
+    t.left.push(- 1);
+    t.right.push(- 1);
+    val l: i64 = kd_build(t, order, lo, mid);
+    val r: i64 = kd_build(t, order, mid + 1, hi);
+    t.left.set(node, l);
+    t.right.set(node, r);
+    return node;
+}
+
+/// A k-d tree over (a copy of) pts.
+pub fn kdtree_build(pts: & Vec<vec3>) -> KdTree {
+    var t = KdTree {
+        pts: Vec::new(), idx: Vec::new(), axis: Vec::new(), left: Vec::new(), right: Vec::new(), root: - 1
+    };
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < pts.len() {
+        t.pts.push(pts.get(i));
+        order.push(i);
+        i = i + 1;
+    }
+    t.root = kd_build(&mut t, &mut order, 0, pts.len());
+    return t;
+}
+
+/// The number of points in the tree.
+pub fn kdtree_len(t: & KdTree) -> i64 {
+    return t.pts.len();
+}
+
+/// Insert (i, d2) into the k best (sorted by distance, then index).
+fn kd_offer(best_i: & mut Vec<i64>, best_d: & mut Vec<f64>, k: i64, i: i64, d2: f64) {
+    if best_i.len() == k {
+        val last: i64 = k - 1;
+        if d2 > best_d.get(last) || (d2 == best_d.get(last) && i > best_i.get(last)) {
+            return;
+        }
+        best_i.pop();
+        best_d.pop();
+    }
+    var pos: i64 = best_i.len();
+    while pos > 0 && (best_d.get(pos - 1) > d2 || (best_d.get(pos - 1) == d2 && best_i.get(pos - 1) > i)) {
+        pos = pos - 1;
+    }
+    best_i.insert(pos, i);
+    best_d.insert(pos, d2);
+}
+
+fn kd_knn(t: & KdTree, node: i64, q: vec3, k: i64, best_i: & mut Vec<i64>, best_d: & mut Vec<f64>) {
+    if node < 0 {
+        return;
+    }
+    val pi: i64 = t.idx.get(node);
+    val p: vec3 = t.pts.get(pi);
+    kd_offer(best_i, best_d, k, pi, pcl_dist2(p, q));
+    val ax: i64 = t.axis.get(node);
+    val diff: f64 = pcl_coord(q, ax) - pcl_coord(p, ax);
+    var near: i64 = t.left.get(node);
+    var far: i64 = t.right.get(node);
+    if diff > 0.0 {
+        near = t.right.get(node);
+        far = t.left.get(node);
+    }
+    kd_knn(t, near, q, k, best_i, best_d);
+    if best_i.len() < k || diff * diff <= best_d.get(best_i.len() - 1) {
+        kd_knn(t, far, q, k, best_i, best_d);
+    }
+}
+
+/// The indices (into the original points) of the k nearest neighbours of
+/// q, nearest first (ties by index).
+pub fn kdtree_knn(t: & KdTree, q: vec3, k: i64) -> Vec<i64> {
+    var bi: Vec<i64> = Vec::new();
+    var bd: Vec<f64> = Vec::new();
+    if k <= 0 {
+        return bi;
+    }
+    kd_knn(t, t.root, q, k, &mut bi, &mut bd);
+    return bi;
+}
+
+/// The index of the point nearest q (-1 for an empty tree).
+pub fn kdtree_nearest(t: & KdTree, q: vec3) -> i64 {
+    val r: Vec<i64> = kdtree_knn(t, q, 1);
+    if r.len() == 0 {
+        return - 1;
+    }
+    return r.get(0);
+}
+
+fn kd_radius(t: & KdTree, node: i64, q: vec3, r2: f64, out: & mut Vec<i64>) {
+    if node < 0 {
+        return;
+    }
+    val pi: i64 = t.idx.get(node);
+    val p: vec3 = t.pts.get(pi);
+    if pcl_dist2(p, q) <= r2 {
+        out.push(pi);
+    }
+    val ax: i64 = t.axis.get(node);
+    val diff: f64 = pcl_coord(q, ax) - pcl_coord(p, ax);
+    if diff <= 0.0 || diff * diff <= r2 {
+        kd_radius(t, t.left.get(node), q, r2, out);
+    }
+    if diff >= 0.0 || diff * diff <= r2 {
+        kd_radius(t, t.right.get(node), q, r2, out);
+    }
+}
+
+/// The indices of all points within distance r of q, in increasing index
+/// order.
+pub fn kdtree_radius(t: & KdTree, q: vec3, r: f64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    kd_radius(t, t.root, q, r * r, &mut out);
+    out.sort();
+    return out;
+}
+
+// ─── Symmetric eigenproblem ───
+
+/// Eigenvalues (ascending) and unit eigenvectors (vectors[i * n + c] is
+/// component i of eigenvector c).
+pub struct EigenSym {
+    pub n: i64,
+    pub values: Vec<f64>,
+    pub vectors: Vec<f64>,
+}
+
+/// The eigen decomposition of the symmetric n x n matrix `a` (row-major),
+/// by cyclic Jacobi rotations until the off-diagonal part is negligible.
+pub fn pcl_eigen_sym(a0: & Vec<f64>, n: i64) -> EigenSym {
+    var a: Vec<f64> = Vec::new();
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n * n {
+        a.push(a0.get(i));
+        if i / n == i % n {
+            v.push(1.0);
+        } else {
+            v.push(0.0);
+        }
+        i = i + 1;
+    }
+    var sweep: i64 = 0;
+    while sweep < 100 {
+        var off: f64 = 0.0;
+        var tot: f64 = 0.0;
+        var p: i64 = 0;
+        while p < n {
+            var q: i64 = 0;
+            while q < n {
+                tot = tot + a.get(p * n + q) * a.get(p * n + q);
+                if p != q {
+                    off = off + a.get(p * n + q) * a.get(p * n + q);
+                }
+                q = q + 1;
+            }
+            p = p + 1;
+        }
+        if off <= 1.0e-30 * tot || off == 0.0 {
+            break;
+        }
+        p = 0;
+        while p < n - 1 {
+            var q: i64 = p + 1;
+            while q < n {
+                val apq: f64 = a.get(p * n + q);
+                if apq != 0.0 {
+                    val app: f64 = a.get(p * n + p);
+                    val aqq: f64 = a.get(q * n + q);
+                    val theta: f64 = (aqq - app) / (2.0 * apq);
+                    var t: f64 = 1.0 / (math_fabs(theta) + math_sqrt(theta * theta + 1.0));
+                    if theta < 0.0 {
+                        t = 0.0 - t;
+                    }
+                    val c: f64 = 1.0 / math_sqrt(t * t + 1.0);
+                    val s: f64 = t * c;
+                    // rotate rows/columns p and q
+                    var k: i64 = 0;
+                    while k < n {
+                        val akp: f64 = a.get(k * n + p);
+                        val akq: f64 = a.get(k * n + q);
+                        a.set(k * n + p, c * akp - s * akq);
+                        a.set(k * n + q, s * akp + c * akq);
+                        k = k + 1;
+                    }
+                    k = 0;
+                    while k < n {
+                        val apk: f64 = a.get(p * n + k);
+                        val aqk: f64 = a.get(q * n + k);
+                        a.set(p * n + k, c * apk - s * aqk);
+                        a.set(q * n + k, s * apk + c * aqk);
+                        k = k + 1;
+                    }
+                    k = 0;
+                    while k < n {
+                        val vkp: f64 = v.get(k * n + p);
+                        val vkq: f64 = v.get(k * n + q);
+                        v.set(k * n + p, c * vkp - s * vkq);
+                        v.set(k * n + q, s * vkp + c * vkq);
+                        k = k + 1;
+                    }
+                }
+                q = q + 1;
+            }
+            p = p + 1;
+        }
+        sweep = sweep + 1;
+    }
+    // sort ascending (selection sort of columns)
+    var vals: Vec<f64> = Vec::new();
+    i = 0;
+    while i < n {
+        vals.push(a.get(i * n + i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        var m: i64 = i;
+        var j: i64 = i + 1;
+        while j < n {
+            if vals.get(j) < vals.get(m) {
+                m = j;
+            }
+            j = j + 1;
+        }
+        if m != i {
+            val tv: f64 = vals.get(i);
+            vals.set(i, vals.get(m));
+            vals.set(m, tv);
+            var r: i64 = 0;
+            while r < n {
+                val tc: f64 = v.get(r * n + i);
+                v.set(r * n + i, v.get(r * n + m));
+                v.set(r * n + m, tc);
+                r = r + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return EigenSym {
+        n: n, values: vals, vectors: v
+    };
+}
+
+/// Eigenvector c of e as a vec3 (n = 3).
+pub fn pcl_eigvec3(e: & EigenSym, c: i64) -> vec3 {
+    return vec3(e.vectors.get(c), e.vectors.get(3 + c), e.vectors.get(6 + c));
+}
+
+/// The 3x3 covariance (row-major) of the points pts[ids].
+pub fn pcl_covariance(pts: & Vec<vec3>, ids: & Vec<i64>) -> Vec<f64> {
+    var c: vec3 = vec3(0.0, 0.0, 0.0);
+    var i: i64 = 0;
+    while i < ids.len() {
+        c = c.add(pts.get(ids.get(i)));
+        i = i + 1;
+    }
+    val n: f64 = ids.len() as f64;
+    c = c.scale(1.0 / n);
+    var m: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 9 {
+        m.push(0.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < ids.len() {
+        val d: vec3 = pts.get(ids.get(i)).sub(c);
+        m.set(0, m.get(0) + d.x * d.x);
+        m.set(1, m.get(1) + d.x * d.y);
+        m.set(2, m.get(2) + d.x * d.z);
+        m.set(4, m.get(4) + d.y * d.y);
+        m.set(5, m.get(5) + d.y * d.z);
+        m.set(8, m.get(8) + d.z * d.z);
+        i = i + 1;
+    }
+    m.set(3, m.get(1));
+    m.set(6, m.get(2));
+    m.set(7, m.get(5));
+    i = 0;
+    while i < 9 {
+        m.set(i, m.get(i) / n);
+        i = i + 1;
+    }
+    return m;
+}
+
+/// A unit normal per point from its k nearest neighbours (PCA), pointing to
+/// the side of `viewpoint`.
+pub fn pcl_normals(pts: & Vec<vec3>, k: i64, viewpoint: vec3) -> Vec<vec3> {
+    val t: KdTree = kdtree_build(pts);
+    var out: Vec<vec3> = Vec::new();
+    var i: i64 = 0;
+    while i < pts.len() {
+        val p: vec3 = pts.get(i);
+        val nb: Vec<i64> = kdtree_knn(&t, p, k);
+        val cov: Vec<f64> = pcl_covariance(pts, &nb);
+        val e: EigenSym = pcl_eigen_sym(&cov, 3);
+        var nrm: vec3 = pcl_eigvec3(&e, 0).normalize();
+        if nrm.dot(viewpoint.sub(p)) < 0.0 {
+            nrm = nrm.scale(- 1.0);
+        }
+        out.push(nrm);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── ICP ───
+
+/// The best rigid motion (least squares) taking src[k] onto dst[k], by
+/// Horn's quaternion method: the eigenvector of the largest eigenvalue of
+/// his 4x4 matrix built from the cross-covariance.
+pub fn pcl_fit_rigid(src: & Vec<vec3>, dst: & Vec<vec3>) -> Transform3 {
+    val cs: vec3 = pcl_centroid(src);
+    val cd: vec3 = pcl_centroid(dst);
+    var sxx: f64 = 0.0;
+    var sxy: f64 = 0.0;
+    var sxz: f64 = 0.0;
+    var syx: f64 = 0.0;
+    var syy: f64 = 0.0;
+    var syz: f64 = 0.0;
+    var szx: f64 = 0.0;
+    var szy: f64 = 0.0;
+    var szz: f64 = 0.0;
+    var i: i64 = 0;
+    while i < src.len() {
+        val a: vec3 = src.get(i).sub(cs);
+        val b: vec3 = dst.get(i).sub(cd);
+        sxx = sxx + a.x * b.x;
+        sxy = sxy + a.x * b.y;
+        sxz = sxz + a.x * b.z;
+        syx = syx + a.y * b.x;
+        syy = syy + a.y * b.y;
+        syz = syz + a.y * b.z;
+        szx = szx + a.z * b.x;
+        szy = szy + a.z * b.y;
+        szz = szz + a.z * b.z;
+        i = i + 1;
+    }
+    var n: Vec<f64> = Vec::new();
+    n.push(sxx + syy + szz);
+    n.push(syz - szy);
+    n.push(szx - sxz);
+    n.push(sxy - syx);
+    n.push(syz - szy);
+    n.push(sxx - syy - szz);
+    n.push(sxy + syx);
+    n.push(szx + sxz);
+    n.push(szx - sxz);
+    n.push(sxy + syx);
+    n.push(0.0 - sxx + syy - szz);
+    n.push(syz + szy);
+    n.push(sxy - syx);
+    n.push(szx + sxz);
+    n.push(syz + szy);
+    n.push(0.0 - sxx - syy + szz);
+    val e: EigenSym = pcl_eigen_sym(&n, 4);
+    val q: quat = qt_normalize(quat(e.vectors.get(3), e.vectors.get(7), e.vectors.get(11), e.vectors.get(15)));
+    val t: vec3 = cd.sub(qt_rotate(q, cs));
+    return Transform3 {
+        rot: qt_canonical(q), trans: t
+    };
+}
+
+/// The result of `pcl_icp`.
+pub struct IcpResult {
+    // target_T_source: apply to the source to align it with the target
+    pub transform: Transform3,
+    // root mean square distance of the matched pairs at the end
+    pub rmse: f64,
+    pub pairs: i64,
+    pub iterations: i64,
+    pub converged: bool,
+}
+
+/// Point-to-point ICP aligning `source` to `target` from the guess
+/// `initial`: pairs farther apart than max_dist are ignored; stops when an
+/// iteration moves the source by less than `tol` (translation and rotation
+/// angle) or after max_iter iterations.
+pub fn pcl_icp(source: & Vec<vec3>, target: & Vec<vec3>, initial: Transform3, max_iter: i64, max_dist: f64, tol: f64) -> IcpResult {
+    val tree: KdTree = kdtree_build(target);
+    var cur: Transform3 = initial;
+    var it: i64 = 0;
+    var rmse: f64 = 0.0;
+    var pairs: i64 = 0;
+    val md2: f64 = max_dist * max_dist;
+    while it < max_iter {
+        var src: Vec<vec3> = Vec::new();
+        var dst: Vec<vec3> = Vec::new();
+        var se: f64 = 0.0;
+        var i: i64 = 0;
+        while i < source.len() {
+            val p: vec3 = tf3_apply(cur, source.get(i));
+            val j: i64 = kdtree_nearest(&tree, p);
+            if j >= 0 {
+                val d2: f64 = pcl_dist2(p, target.get(j));
+                if d2 <= md2 {
+                    src.push(p);
+                    dst.push(target.get(j));
+                    se = se + d2;
+                }
+            }
+            i = i + 1;
+        }
+        pairs = src.len();
+        if pairs < 3 {
+            return IcpResult {
+                transform: cur, rmse: 0.0, pairs: pairs, iterations: it, converged: false
+            };
+        }
+        rmse = math_sqrt(se / (pairs as f64));
+        val step: Transform3 = pcl_fit_rigid(&src, &dst);
+        cur = tf3_compose(step, cur);
+        it = it + 1;
+        if step.trans.length() < tol && qt_angle_between(step.rot, qt_identity()) < tol {
+            // the pairs of the final pose
+            var se2: f64 = 0.0;
+            var n2: i64 = 0;
+            var k: i64 = 0;
+            while k < source.len() {
+                val p: vec3 = tf3_apply(cur, source.get(k));
+                val d2: f64 = pcl_dist2(p, target.get(kdtree_nearest(&tree, p)));
+                if d2 <= md2 {
+                    se2 = se2 + d2;
+                    n2 = n2 + 1;
+                }
+                k = k + 1;
+            }
+            if n2 > 0 {
+                rmse = math_sqrt(se2 / (n2 as f64));
+            }
+            return IcpResult {
+                transform: cur, rmse: rmse, pairs: n2, iterations: it, converged: true
+            };
+        }
+    }
+    return IcpResult {
+        transform: cur, rmse: rmse, pairs: pairs, iterations: it, converged: false
+    };
+}

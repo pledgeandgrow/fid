@@ -1,0 +1,55 @@
+// One-byte strings are static on every backend (competitive RT3): the C
+// runtime's __p_chr1 table and, natively, pert_char_to_str's table in
+// pe_runtime/base.fd and linux_runtime/base.fd. They must still behave as
+// strings: compare, concatenate, be kept in a Vec and a HashMap, survive
+// their owners being dropped (a drop of a static string does nothing), and
+// a high byte is its own byte, not a code point.
+//
+// Expected output:
+// A B z
+// slices: h e o
+// joined: hello
+// equal: true true
+// map: x=1 y=2
+// bytes: 255 1
+// loop: 26000
+use string;
+use vec;
+
+fn main() -> i64 {
+    println(char_to_str(65) + " " + char_to_str(66) + " " + char_to_str(122));
+    val s: str = "hello";
+    println("slices: " + str_slice(s, 0, 1) + " " + str_slice(s, 1, 2) + " " + str_slice(s, 4, 5));
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(s) {
+        parts.push(str_slice(s, i, i + 1));
+        i = i + 1;
+    }
+    var joined: str = "";
+    for p in parts {
+        joined = joined + p;
+    }
+    println("joined: " + joined);
+    println("equal: " + bool_to_str(char_to_str(104) == parts.get(0)) + " " + bool_to_str(str_slice(s, 2, 3) == str_slice(s, 3, 4)));
+    var m: HashMap<str, i64> = HashMap::new();
+    m.insert(char_to_str(120), 1);
+    m.insert(str_slice("xy", 1, 2), 2);
+    println("map: x=" + int_to_str(m.get_or("x", 0)) + " y=" + int_to_str(m.get_or("y", 0)));
+    println("bytes: " + int_to_str(str_byte_at(char_to_str(255), 0)) + " " + int_to_str(str_len(char_to_str(200))));
+    // many short-lived one-byte strings: each is dropped at the end of its
+    // statement, which must not free the shared static one
+    var total: i64 = 0;
+    var k: i64 = 0;
+    while k < 1000 {
+        var c: i64 = 0;
+        while c < 26 {
+            val t: str = char_to_str(97 + c) + "";
+            total = total + str_len(t);
+            c = c + 1;
+        }
+        k = k + 1;
+    }
+    println("loop: " + int_to_str(total));
+    return 0;
+}

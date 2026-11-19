@@ -1,0 +1,57 @@
+// stdlib/argon2: BLAKE2b (RFC 7693 Appendix A "abc", an empty 32-byte
+// hash, a keyed 20-byte hash and a multi-block message, checked against
+// Python's hashlib), H' over 1024 bytes, the three RFC 9106 test vectors
+// (§5.1 Argon2d, §5.2 Argon2i, §5.3 Argon2id: m = 32 KiB, t = 3, p = 4,
+// secret and associated data), two cases checked against OpenSSL 3.5's
+// ARGON2ID/ARGON2I KDF (one lane; and two lanes with an 80-byte tag, which
+// exercises H' beyond 64 bytes), and a PHC string round trip.
+// Expected output:
+// blake2b abc ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923
+// blake2b-256 empty 0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8
+// blake2b keyed 6aa89fd2fbdca604c633d5aaecb9108fc30d2bd9
+// blake2b 512 bytes c59ab1095ca4579525338b6b74689ff2
+// argon2d 512b391b6f1162975371d30919734294f868e3be3984f3c1a13a4db9fabe4acb
+// argon2i c814d9d1dc7f37aa13f0d77f2494bda1c8de6b016dd388d29952a4c4672b6ce8
+// argon2id 0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659
+// openssl argon2id 616bd3fa39aa4928b769b1d51c2a43d041bd7a5ed500d8bb
+// openssl argon2i 5f01dbbb13d3817f54755bead093bbf224774a5fd5b87f690a001b98c8b47dd48da83d64384d3cc7c10be43b67b6c8c51109d0381146202e84a4b989d8f04bba852c88c825803450150e8f9f7ce048fa
+// phc $argon2id$v=19$m=16,t=2,p=1$c29tZXNhbHQ$YWvT+jmqSSi3abHVHCpD0EG9el7VANi7
+// phc verify true wrong false
+use argon2;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn rep(b: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(b); i = i + 1; }
+    return v;
+}
+
+fn main() {
+    println("blake2b abc " + hx(blake2b_512(str_bytes("abc"))));
+    println("blake2b-256 empty " + hx(blake2b(32, Vec::new(), Vec::new())));
+    println("blake2b keyed " + hx(blake2b(20, rep(107, 64), str_bytes("hello"))));
+    var big: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 512 { big.push(i & 255); i = i + 1; }
+    val bd: Vec<i64> = blake2b_512(big);
+    var first: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 { first.push(bd.get(i)); i = i + 1; }
+    println("blake2b 512 bytes " + hx(first));
+    val pw: Vec<i64> = rep(1, 32);
+    val salt: Vec<i64> = rep(2, 16);
+    val secret: Vec<i64> = rep(3, 8);
+    val ad: Vec<i64> = rep(4, 12);
+    println("argon2d " + hx(argon2_hash(ARGON2_D, pw, salt, secret, ad, 3, 32, 4, 32)));
+    println("argon2i " + hx(argon2_hash(ARGON2_I, pw, salt, secret, ad, 3, 32, 4, 32)));
+    println("argon2id " + hx(argon2_hash(ARGON2_ID, pw, salt, secret, ad, 3, 32, 4, 32)));
+    println("openssl argon2id " + hx(argon2id(str_bytes("password"), str_bytes("somesalt"), 2, 16, 1, 24)));
+    println("openssl argon2i " + hx(argon2_hash(ARGON2_I, str_bytes("password"), str_bytes("somesalt"), Vec::new(), Vec::new(), 1, 24, 2, 80)));
+    val phc: str = argon2_phc_hash(ARGON2_ID, str_bytes("password"), str_bytes("somesalt"), 2, 16, 1, 24);
+    println("phc " + phc);
+    println("phc verify " + bool_to_str(argon2_phc_verify(phc, str_bytes("password"))) + " wrong " + bool_to_str(argon2_phc_verify(phc, str_bytes("passw0rd"))));
+}

@@ -1,0 +1,73 @@
+// test_natabi_memcheck.fd — llvm RL16: the machine layer's runtime under
+// `--checked-alloc` (every block on pages of its own before an
+// inaccessible page, freed pages never reused) and `--leaks` (the
+// program's blocks on a list, reported at exit): stdlib/linux_runtime/
+// base.fd pe_dbg_malloc / pe_dbg_free / pe_leak_report, the mode set by
+// compiler/nat_ir.fd ng_mem_mode. This program frees everything it
+// allocates, so its output is the same under every flag and backend, and
+// natively
+//     fid emit tests/bootstrap/test_natabi_memcheck.fd --target x86_64-linux --leaks -o m
+// also prints "fid --leaks: every block was freed" on stderr
+// (NATIVE=<target> scripts/leak-check.sh runs that check).
+//
+// Expected output:
+// 4950
+// abcabcabc
+// 3 1 2
+// 300
+
+struct Node {
+    v: i64,
+    name: str,
+}
+
+fn build(n: i64) -> Vec<i64> {
+    var xs: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        xs.push(i);
+        i = i + 1;
+    }
+    return xs;
+}
+
+fn total(xs: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < xs.len() {
+        s = s + xs.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn repeat(s: str, n: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < n {
+        out = out + s;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    println(total(build(100)));
+    println(repeat("abc", 3));
+    var nodes: Vec<Node> = Vec::new();
+    nodes.push(Node { v: 3, name: "c" });
+    nodes.push(Node { v: 1, name: "a" });
+    nodes.push(Node { v: 2, name: "b" });
+    var line: str = "";
+    var i: i64 = 0;
+    while i < nodes.len() {
+        if i > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(nodes.get(i).v);
+        i = i + 1;
+    }
+    println(line);
+    var big: Vec<i64> = build(25);
+    println(total(big));
+}

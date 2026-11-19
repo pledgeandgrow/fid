@@ -1,0 +1,189 @@
+// Tasks interleave on every backend, `fid run` included (competitive
+// roadmap LG11): a task runs until it waits -- a sleep, a channel receive,
+// an await, a yield -- and then another runs. So a task sleeping in one
+// part of the program lets the others print in between, a task can wait
+// for a value that main sends later, a cancellation or a deadline reaches
+// a task while it waits, and a cancelled task stops at that checkpoint and
+// returns along its normal path: its `defer` runs (nothing is killed
+// mid-way, nothing unwinds).
+//
+// Before LG11 the interpreter ran a task to its end when it started: it
+// printed "a1 a2 b1", the echo task waited out its deadline before main
+// had sent anything ("ping-pong: none"), the sleeper slept its full 5 s
+// ("cancelled: 1 fast false") and the spawned consumer read an empty
+// channel.
+//
+//   $FID run tests/bootstrap/test_task_interleave.fd
+//   $FID ccompile tests/bootstrap/test_task_interleave.fd -o t.exe && ./t.exe
+//   $FID emit tests/bootstrap/test_task_interleave.fd -o t.exe && ./t.exe
+//
+// Expected output:
+// a1
+// b1
+// a2
+// ping-pong: 11 21
+// cancelled: 2 fast true
+// deadline: -1
+// cleanup ran: true result 7 fast true
+// before await
+// async done
+// await: 42
+// spawned consumer: 42
+use string;
+use task;
+use sync;
+
+fn ticker_a(x: i64) -> i64 {
+    println("a1");
+    task_sleep(300);
+    println("a2");
+    return x;
+}
+
+fn ticker_b(x: i64) -> i64 {
+    task_sleep(100);
+    println("b1");
+    return x;
+}
+
+/// Answers each value on the inbox, twice: value + 1 into the reply word.
+/// `blk` is a shared block [inbox][reply][replies so far].
+fn echo(blk: i64) -> i64 {
+    val inbox: i64 = p_atomic_load(blk);
+    // a deadline, so a runtime that cannot switch still ends
+    val tok: i64 = task_token_with_timeout(3000);
+    var n: i64 = 0;
+    while n < 2 {
+        match task_recv_cancellable(inbox, tok) {
+            Option::Some(v) => {
+                p_atomic_store(blk + 8, v + 1);
+                p_atomic_store(blk + 16, n + 1);
+            }
+            Option::None => {
+                return n;
+            }
+        }
+        n = n + 1;
+    }
+    return n;
+}
+
+/// The echo's reply number `count`, or "none" once `tok` is cancelled.
+fn wait_reply(blk: i64, count: i64, tok: i64) -> str {
+    while p_atomic_load(blk + 16) < count {
+        if task_token_cancelled(tok) {
+            return "none";
+        }
+        task_sleep(1);
+    }
+    return int_to_str(p_atomic_load(blk + 8));
+}
+
+fn sleeper(tok: i64) -> i64 {
+    if task_sleep_cancellable(5000, tok) {
+        return 1;
+    }
+    return 2;
+}
+
+fn waiter(ch: i64) -> i64 {
+    match task_recv_cancellable(ch, task_token_with_timeout(50)) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+            return - 1;
+        }
+    }
+    return - 1;
+}
+
+/// Sleeps until its token is cancelled; `cell` is [cleaned up][token].
+fn worker_with_cleanup(cell: i64) -> i64 {
+    defer {
+        p_atomic_store(cell, 1);
+    }
+    val tok: i64 = p_atomic_load(cell + 8);
+    var going: bool = true;
+    while going {
+        going = task_sleep_cancellable(1000, tok);
+    }
+    return 7;
+}
+
+async fn slow_double(x: i64) -> Future<i64> {
+    task_sleep(100);
+    println("async done");
+    return x * 2;
+}
+
+fn consumer(ch: i64) -> i64 {
+    val v: i64 = sync_channel_recv(ch);
+    return v + 1;
+}
+
+fn main() -> i64 {
+    // 1. a sleeping task lets the other run in between
+    task_go("ticker_a", 1);
+    task_go("ticker_b", 2);
+    task_run();
+
+    // 2. a task waits for values main sends after starting it
+    val inbox: i64 = sync_channel_create(4);
+    val blk: i64 = p_shared_alloc(24);
+    p_atomic_store(blk, inbox);
+    p_atomic_store(blk + 8, 0);
+    p_atomic_store(blk + 16, 0);
+    val e: i64 = task_go("echo", blk);
+    val tok_pp: i64 = task_token_with_timeout(3000);
+    sync_channel_send(inbox, 10);
+    val r1: str = wait_reply(blk, 1, tok_pp);
+    sync_channel_send(inbox, 20);
+    val r2: str = wait_reply(blk, 2, tok_pp);
+    task_run();
+    println("ping-pong: " + r1 + " " + r2);
+    if task_result(e) != 2 {
+        println("echo answered " + int_to_str(task_result(e)));
+    }
+
+    // 3. cancelling a token reaches a task asleep on it
+    val t0: i64 = p_clock_now_ms();
+    val tok: i64 = task_token_new();
+    val s: i64 = task_go("sleeper", tok);
+    task_sleep(50);
+    task_token_cancel(tok);
+    task_run();
+    println("cancelled: " + int_to_str(task_result(s)) + " fast " + bool_to_str(p_clock_now_ms() - t0 < 2000));
+
+    // 4. a deadline ends a receive nobody answers
+    val quiet: i64 = sync_channel_create(1);
+    val w: i64 = task_go("waiter", quiet);
+    task_run();
+    println("deadline: " + int_to_str(task_result(w)));
+
+    // 5. a cancelled task stops at its checkpoint and its defer runs
+    val t1: i64 = p_clock_now_ms();
+    val cell: i64 = p_shared_alloc(16);
+    p_atomic_store(cell, 0);
+    // the deadline only bounds a runtime that cannot switch
+    p_atomic_store(cell + 8, task_token_with_timeout(4000));
+    val c: i64 = task_go("worker_with_cleanup", cell);
+    task_sleep(30);
+    task_token_cancel(p_atomic_load(cell + 8));
+    task_run();
+    println("cleanup ran: " + bool_to_str(p_atomic_load(cell) == 1) + " result " + int_to_str(task_result(c)) + " fast " + bool_to_str(p_clock_now_ms() - t1 < 2000));
+
+    // 6. an async call runs until it first waits, then its caller goes on
+    val f = slow_double(21);
+    println("before await");
+    val r = await f;
+    println("await: " + int_to_str(r));
+
+    // 7. a spawned function waits on a channel main fills afterwards
+    val ch: i64 = sync_channel_create(1);
+    val h = spawn consumer(ch);
+    sync_channel_send(ch, 41);
+    val got = await h;
+    println("spawned consumer: " + int_to_str(got));
+    return 0;
+}

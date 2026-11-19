@@ -1,0 +1,661 @@
+// Fides HTTP router: path patterns, parameters, wildcards, groups, 404/405
+//
+// Real (pure computation, no I/O): a route table over stdlib http's
+// HttpRequest. A pattern is a path of segments:
+//   /users            a static segment matches itself (case-sensitive)
+//   /users/:id        `:name` matches one non-empty segment, kept as a param
+//   /files/*path      `*name` (or a bare `*`) matches the rest of the path,
+//                     zero or more segments, and must be last
+// The path is split on '/' first and each segment percent-decoded after, so
+// "/files/a%2Fb" gives the parameter "a/b" and never matches two segments.
+// A bad escape (%zz, %4) gives 400. One trailing slash is ignored
+// ("/users/" is "/users") unless http_router_strict_slash is set.
+//
+// When several routes match, the most specific wins, segment by segment
+// from the left: static before :param before *wildcard (so /users/new beats
+// /users/:id whatever order they were added in); on a tie the first added.
+// A path that some route matches but not with the request's method gives
+// 405 with an Allow header (HEAD is allowed wherever GET is; OPTIONS always).
+// HEAD falls back to the GET route and the body is cut from the response
+// (headers, Content-Length included, kept). OPTIONS without its own route
+// answers 204 with Allow. Method "*" in a route matches any method.
+//
+// Route groups: route_group("/api") and route_group_sub(g, "/v1") give a
+// prefix that route_group_add puts in front of each pattern.
+//
+// Handlers are fn(HttpRequest, RouteParams) -> str and return a whole HTTP
+// response, as stdlib http's handlers do (build_response). To serve:
+//   http_serve(8080, http_router_serve_fn(r));
+//
+// Usage:
+//   use router;
+//   fn show_user(req: HttpRequest, p: RouteParams) -> str {
+//       return build_response(200, "text/plain", "user " + route_param(&p, "id"));
+//   }
+//   var r: HttpRouter = http_router_new();
+//   http_router_add(&mut r, "GET", "/users/:id", show_user);
+//   val api: RouteGroup = route_group("/api/v1");
+//   route_group_add(&mut r, api, "POST", "/items", create_item);
+//   val resp: str = http_router_handle(&r, req);
+
+module router;
+ use vec; use string; use http;
+
+// Segment kinds
+pub const RT_STATIC: i64 = 3;
+pub const RT_PARAM: i64 = 2;
+pub const RT_WILD: i64 = 1;
+
+/// The parameters a match captured: names[i] = vals[i]; a wildcard's
+/// value is also in `wildcard` (segments joined by '/', decoded).
+pub struct RouteParams {
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub wildcard: str,
+}
+
+pub fn route_params_new() -> RouteParams {
+    return RouteParams { names: Vec::new(), vals: Vec::new(), wildcard: "" };
+}
+
+/// The value of parameter `name`, or "".
+pub fn route_param(p: & RouteParams, name: str) -> str {
+    var i: i64 = 0;
+    while i < p.names.len() {
+        if p.names.get(i) == name {
+            return p.vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn route_has_param(p: & RouteParams, name: str) -> bool {
+    var i: i64 = 0;
+    while i < p.names.len() {
+        if p.names.get(i) == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+struct RouteEntry {
+    method: str,
+    pattern: str,
+    kinds: Vec<i64>,
+    texts: Vec<str>,
+    handler: fn(HttpRequest, RouteParams) -> str,
+}
+
+pub struct HttpRouter {
+    routes: Vec<RouteEntry>,
+    not_found: fn(HttpRequest, RouteParams) -> str,
+    not_allowed: fn(HttpRequest, RouteParams) -> str,
+    pub strict_slash: bool,
+    pub auto_options: bool,
+    pub error: str,
+}
+
+/// The outcome of matching: status 200 (index = the route), 404, 405
+/// (allow = the methods the path takes, "GET, HEAD, OPTIONS"), 400 (bad
+/// escape), or 204 for an automatic OPTIONS answer.
+pub struct RouteMatch {
+    pub status: i64,
+    pub index: i64,
+    pub params: RouteParams,
+    pub allow: str,
+    pub pattern: str,
+}
+
+fn rt_default_not_found(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(404, "text/plain", "Not Found\n");
+}
+
+fn rt_default_not_allowed(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(405, "text/plain", "Method Not Allowed\n");
+}
+
+pub fn http_router_new() -> HttpRouter {
+    return HttpRouter {
+        routes: Vec::new(), not_found: rt_default_not_found, not_allowed: rt_default_not_allowed, strict_slash: false, auto_options: true, error: "",
+    };
+}
+
+/// The handler for paths no route matches (default: plain 404).
+pub fn http_router_set_not_found(r: & mut HttpRouter, h: fn(HttpRequest, RouteParams) -> str) {
+    r.not_found = h;
+}
+
+/// The handler for a known path with the wrong method (default: plain
+/// 405). The router adds the Allow header to whatever it returns.
+pub fn http_router_set_not_allowed(r: & mut HttpRouter, h: fn(HttpRequest, RouteParams) -> str) {
+    r.not_allowed = h;
+}
+
+/// Treat "/a/" and "/a" as different paths.
+pub fn http_router_strict_slash(r: & mut HttpRouter, on: bool) {
+    r.strict_slash = on;
+}
+
+// ─── Paths ────────────────────────────────────────────────────────────────
+
+fn rt_hex(c: i64) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return 0 - 1;
+}
+
+/// Percent-decode one path segment; ok false on a bad escape. '+' stays
+/// '+' (it means a space only in a query).
+pub fn route_pct_decode(s: str, ok: & mut bool) -> str {
+    val n: i64 = str_len(s);
+    if str_find(s, "%") < 0 {
+        return s;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c == 37 {
+            if i + 2 >= n {
+                *ok = false;
+                return "";
+            }
+            val h: i64 = rt_hex(str_byte_at(s, i + 1));
+            val l: i64 = rt_hex(str_byte_at(s, i + 2));
+            if h < 0 || l < 0 {
+                *ok = false;
+                return "";
+            }
+            out.push(h * 16 + l);
+            i = i + 3;
+        } else {
+            out.push(c);
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+// The raw segments of a path: "/a/b" -> [a, b]; "/" -> []; empty
+// segments in the middle ("/a//b") are kept.
+fn rt_split(path: str, strict: bool) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var p: str = path;
+    if str_len(p) == 0 || str_byte_at(p, 0) != 47 {
+        p = "/" + p;
+    }
+    var n: i64 = str_len(p);
+    if !strict && n > 1 && str_byte_at(p, n - 1) == 47 {
+        n = n - 1;
+    }
+    if n == 1 {
+        return out;
+    }
+    var start: i64 = 1;
+    var i: i64 = 1;
+    while i <= n {
+        if i == n || str_byte_at(p, i) == 47 {
+            out.push(str_slice(p, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn rt_join(a: str, b: str) -> str {
+    var x: str = a;
+    while str_len(x) > 0 && str_byte_at(x, str_len(x) - 1) == 47 {
+        x = str_slice(x, 0, str_len(x) - 1);
+    }
+    var y: str = b;
+    if str_len(y) == 0 {
+        if str_len(x) == 0 {
+            return "/";
+        }
+        return x;
+    }
+    if str_byte_at(y, 0) != 47 {
+        y = "/" + y;
+    }
+    if y == "/" && str_len(x) > 0 {
+        return x;
+    }
+    return x + y;
+}
+
+// ─── Adding routes ────────────────────────────────────────────────────────
+
+/// Add a route. false (and r.error set) when the pattern is bad: a
+/// wildcard not last, an empty parameter name, a parameter name used
+/// twice, or the same method and pattern added before.
+pub fn http_router_add(r: & mut HttpRouter, method: str, pattern: str, handler: fn(HttpRequest, RouteParams) -> str) -> bool {
+    val segs: Vec<str> = rt_split(pattern, true);
+    var kinds: Vec<i64> = Vec::new();
+    var texts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < segs.len() {
+        val s: str = segs.get(i);
+        if str_len(s) > 0 && str_byte_at(s, 0) == 58 {
+            val name: str = str_slice(s, 1, str_len(s));
+            if str_len(name) == 0 {
+                r.error = "empty parameter name in " + pattern;
+                return false;
+            }
+            var k: i64 = 0;
+            while k < texts.len() {
+                if kinds.get(k) != RT_STATIC && texts.get(k) == name {
+                    r.error = "parameter " + name + " used twice in " + pattern;
+                    return false;
+                }
+                k = k + 1;
+            }
+            kinds.push(RT_PARAM);
+            texts.push(name);
+        } else if str_len(s) > 0 && str_byte_at(s, 0) == 42 {
+            if i != segs.len() - 1 {
+                r.error = "wildcard not last in " + pattern;
+                return false;
+            }
+            kinds.push(RT_WILD);
+            texts.push(str_slice(s, 1, str_len(s)));
+        } else {
+            var good: bool = true;
+            val dec: str = route_pct_decode(s, & mut good);
+            if !good {
+                r.error = "bad escape in " + pattern;
+                return false;
+            }
+            kinds.push(RT_STATIC);
+            texts.push(dec);
+        }
+        i = i + 1;
+    }
+    val m: str = str_to_upper(method);
+    var j: i64 = 0;
+    while j < r.routes.len() {
+        val e: RouteEntry = r.routes.get(j);
+        if e.method == m && rt_same_shape(e.kinds, e.texts, kinds, texts) {
+            r.error = "route " + m + " " + pattern + " added twice";
+            return false;
+        }
+        j = j + 1;
+    }
+    r.routes.push(RouteEntry { method: m, pattern: pattern, kinds: kinds, texts: texts, handler: handler });
+    return true;
+}
+
+// Two patterns that match the same paths (parameter names aside).
+fn rt_same_shape(ka: Vec<i64>, ta: Vec<str>, kb: Vec<i64>, tb: Vec<str>) -> bool {
+    if ka.len() != kb.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < ka.len() {
+        if ka.get(i) != kb.get(i) {
+            return false;
+        }
+        if ka.get(i) == RT_STATIC && ta.get(i) != tb.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn http_router_get(r: & mut HttpRouter, pattern: str, h: fn(HttpRequest, RouteParams) -> str) -> bool {
+    return http_router_add(r, "GET", pattern, h);
+}
+
+pub fn http_router_post(r: & mut HttpRouter, pattern: str, h: fn(HttpRequest, RouteParams) -> str) -> bool {
+    return http_router_add(r, "POST", pattern, h);
+}
+
+pub fn http_router_put(r: & mut HttpRouter, pattern: str, h: fn(HttpRequest, RouteParams) -> str) -> bool {
+    return http_router_add(r, "PUT", pattern, h);
+}
+
+pub fn http_router_delete(r: & mut HttpRouter, pattern: str, h: fn(HttpRequest, RouteParams) -> str) -> bool {
+    return http_router_add(r, "DELETE", pattern, h);
+}
+
+pub fn http_router_patch(r: & mut HttpRouter, pattern: str, h: fn(HttpRequest, RouteParams) -> str) -> bool {
+    return http_router_add(r, "PATCH", pattern, h);
+}
+
+pub fn http_router_len(r: & HttpRouter) -> i64 {
+    return r.routes.len();
+}
+
+// ─── Groups ───────────────────────────────────────────────────────────────
+
+/// A prefix shared by several routes.
+pub struct RouteGroup {
+    pub prefix: str,
+}
+
+fn rt_trim_slash(p: str) -> str {
+    var x: str = p;
+    while str_len(x) > 1 && str_byte_at(x, str_len(x) - 1) == 47 {
+        x = str_slice(x, 0, str_len(x) - 1);
+    }
+    return x;
+}
+
+pub fn route_group(prefix: str) -> RouteGroup {
+    return RouteGroup { prefix: rt_trim_slash(rt_join("", prefix)) };
+}
+
+/// A group nested in another: route_group_sub(route_group("/api"), "/v1")
+/// has the prefix "/api/v1".
+pub fn route_group_sub(g: RouteGroup, prefix: str) -> RouteGroup {
+    return RouteGroup { prefix: rt_trim_slash(rt_join(g.prefix, prefix)) };
+}
+
+pub fn route_group_add(r: & mut HttpRouter, g: RouteGroup, method: str, pattern: str, h: fn(HttpRequest, RouteParams) -> str) -> bool {
+    return http_router_add(r, method, rt_join(g.prefix, pattern), h);
+}
+
+// ─── Matching ─────────────────────────────────────────────────────────────
+
+// Does route e match the decoded segments? Captures go into p.
+fn rt_match_route(e: & RouteEntry, segs: Vec<str>, p: & mut RouteParams) -> bool {
+    val n: i64 = e.kinds.len();
+    var i: i64 = 0;
+    while i < n {
+        val k: i64 = e.kinds.get(i);
+        if k == RT_WILD {
+            var rest: str = "";
+            var j: i64 = i;
+            while j < segs.len() {
+                if j > i {
+                    rest = rest + "/";
+                }
+                rest = rest + segs.get(j);
+                j = j + 1;
+            }
+            p.wildcard = rest;
+            if str_len(e.texts.get(i)) > 0 {
+                p.names.push(e.texts.get(i));
+                p.vals.push(rest);
+            }
+            return true;
+        }
+        if i >= segs.len() {
+            return false;
+        }
+        if k == RT_STATIC {
+            if e.texts.get(i) != segs.get(i) {
+                return false;
+            }
+        } else {
+            if str_len(segs.get(i)) == 0 {
+                return false;
+            }
+            p.names.push(e.texts.get(i));
+            p.vals.push(segs.get(i));
+        }
+        i = i + 1;
+    }
+    return segs.len() == n;
+}
+
+// Is route a more specific than route b? (left to right: static > param
+// > wildcard; a longer pattern beats a wildcard that stops earlier)
+fn rt_better(a: & RouteEntry, b: & RouteEntry) -> bool {
+    var i: i64 = 0;
+    while i < a.kinds.len() && i < b.kinds.len() {
+        val ka: i64 = a.kinds.get(i);
+        val kb: i64 = b.kinds.get(i);
+        if ka != kb {
+            return ka > kb;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn rt_method_ok(route_method: str, method: str) -> bool {
+    return route_method == "*" || route_method == method;
+}
+
+fn rt_add_allow(list: & mut Vec<str>, m: str) {
+    var i: i64 = 0;
+    while i < list.len() {
+        if list.get(i) == m {
+            return;
+        }
+        i = i + 1;
+    }
+    list.push(m);
+}
+
+/// Match a method and path (path without the query).
+pub fn http_router_match(r: & HttpRouter, method: str, path: str) -> RouteMatch {
+    var res: RouteMatch = RouteMatch { status: 404, index: 0 - 1, params: route_params_new(), allow: "", pattern: "" };
+    val raw: Vec<str> = rt_split(path, r.strict_slash);
+    var segs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < raw.len() {
+        var good: bool = true;
+        segs.push(route_pct_decode(raw.get(i), & mut good));
+        if !good {
+            res.status = 400;
+            return res;
+        }
+        i = i + 1;
+    }
+    val m: str = str_to_upper(method);
+    var best: i64 = 0 - 1;
+    var best_get: i64 = 0 - 1;
+    var methods: Vec<str> = Vec::new();
+    var any_path: bool = false;
+    var j: i64 = 0;
+    while j < r.routes.len() {
+        val e: RouteEntry = r.routes.get(j);
+        var p: RouteParams = route_params_new();
+        if rt_match_route(& e, segs, & mut p) {
+            any_path = true;
+            if e.method == "*" {
+                rt_add_allow(& mut methods, "*");
+            } else {
+                rt_add_allow(& mut methods, e.method);
+            }
+            if rt_method_ok(e.method, m) {
+                if best < 0 || rt_better(& e, & r.routes.get(best)) {
+                    best = j;
+                }
+            } else if m == "HEAD" && e.method == "GET" {
+                if best_get < 0 || rt_better(& e, & r.routes.get(best_get)) {
+                    best_get = j;
+                }
+            }
+        }
+        j = j + 1;
+    }
+    if best < 0 && best_get >= 0 {
+        best = best_get;
+    }
+    if best >= 0 {
+        val e: RouteEntry = r.routes.get(best);
+        var p: RouteParams = route_params_new();
+        rt_match_route(& e, segs, & mut p);
+        res.status = 200;
+        res.index = best;
+        res.params = p;
+        res.pattern = e.pattern;
+        return res;
+    }
+    if !any_path {
+        return res;
+    }
+    // Allow: the path's methods in a fixed order, then any others
+    var order: Vec<str> = Vec::new();
+    order.push("GET");
+    order.push("HEAD");
+    order.push("POST");
+    order.push("PUT");
+    order.push("PATCH");
+    order.push("DELETE");
+    order.push("OPTIONS");
+    var has_get: bool = false;
+    var k: i64 = 0;
+    while k < methods.len() {
+        if methods.get(k) == "GET" {
+            has_get = true;
+        }
+        k = k + 1;
+    }
+    var allow: Vec<str> = Vec::new();
+    k = 0;
+    while k < order.len() {
+        val o: str = order.get(k);
+        var present: bool = o == "OPTIONS" || (o == "HEAD" && has_get);
+        var q: i64 = 0;
+        while q < methods.len() {
+            if methods.get(q) == o {
+                present = true;
+            }
+            q = q + 1;
+        }
+        if present {
+            allow.push(o);
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while k < methods.len() {
+        val o: str = methods.get(k);
+        var known: bool = false;
+        var q: i64 = 0;
+        while q < order.len() {
+            if order.get(q) == o {
+                known = true;
+            }
+            q = q + 1;
+        }
+        if !known {
+            allow.push(o);
+        }
+        k = k + 1;
+    }
+    res.allow = str_join(allow, ", ");
+    if m == "OPTIONS" && r.auto_options {
+        res.status = 204;
+    } else {
+        res.status = 405;
+    }
+    return res;
+}
+
+// Insert a header line after the status line of a response.
+fn rt_add_header(resp: str, line: str) -> str {
+    val e: i64 = str_find(resp, "\r\n");
+    if e < 0 {
+        return resp;
+    }
+    return str_slice(resp, 0, e + 2) + line + "\r\n" + str_slice(resp, e + 2, str_len(resp));
+}
+
+// The head of a response, body cut (for HEAD).
+fn rt_head_only(resp: str) -> str {
+    val e: i64 = str_find(resp, "\r\n\r\n");
+    if e < 0 {
+        return resp;
+    }
+    return str_slice(resp, 0, e + 4);
+}
+
+/// Route one request and return the response.
+pub fn http_router_handle(r: & HttpRouter, req: HttpRequest) -> str {
+    val m: RouteMatch = http_router_match(r, req.method, req.path);
+    if m.status == 400 {
+        return build_response(400, "text/plain", "Bad Request\n");
+    }
+    if m.status == 404 {
+        val nf: fn(HttpRequest, RouteParams) -> str = r.not_found;
+        return nf(req, m.params);
+    }
+    if m.status == 204 {
+        return "HTTP/1.1 204 No Content\r\nAllow: " + m.allow + "\r\n\r\n";
+    }
+    if m.status == 405 {
+        val na: fn(HttpRequest, RouteParams) -> str = r.not_allowed;
+        val out: str = na(req, m.params);
+        return rt_add_header(out, "Allow: " + m.allow);
+    }
+    val e: RouteEntry = r.routes.get(m.index);
+    val h: fn(HttpRequest, RouteParams) -> str = e.handler;
+    val out: str = h(req, m.params);
+    if str_to_upper(req.method) == "HEAD" {
+        return rt_head_only(out);
+    }
+    return out;
+}
+
+// Routers handed to http_router_serve_fn. A closure that captures a struct
+// holding Vecs reads them dangling in this compiler (see the module's
+// report), so the closure captures an index into this list instead.
+var RT_SERVED: Vec<HttpRouter> = Vec::new();
+
+fn rt_serve_one(id: i64, req: HttpRequest) -> str {
+    val r: HttpRouter = RT_SERVED.get(id);
+    return http_router_handle(& r, req);
+}
+
+/// A handler for http_serve that routes with (a copy of) `r`.
+pub fn http_router_serve_fn(r: HttpRouter) -> fn(HttpRequest) -> str {
+    val id: i64 = RT_SERVED.len();
+    RT_SERVED.push(r);
+    return fn(req: HttpRequest) -> str { return rt_serve_one(id, req); };
+}
+
+/// The value of `name` in a query string (form-decoded: '+' is a space),
+/// or "" when absent. route_query(req.query, "page").
+pub fn route_query(query: str, name: str) -> str {
+    val parts: Vec<str> = str_split(query, "&");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val kv: str = parts.get(i);
+        val eq: i64 = str_find(kv, "=");
+        var k: str = kv;
+        var v: str = "";
+        if eq >= 0 {
+            k = str_slice(kv, 0, eq);
+            v = str_slice(kv, eq + 1, str_len(kv));
+        }
+        var good: bool = true;
+        val dk: str = route_pct_decode(str_replace(k, "+", " "), & mut good);
+        if good && dk == name {
+            val dv: str = route_pct_decode(str_replace(v, "+", " "), & mut good);
+            if good {
+                return dv;
+            }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The route table, one "METHOD pattern" per line (for logs).
+pub fn http_router_describe(r: & HttpRouter) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < r.routes.len() {
+        val e: RouteEntry = r.routes.get(i);
+        out = out + e.method + " " + e.pattern + "\n";
+        i = i + 1;
+    }
+    return out;
+}

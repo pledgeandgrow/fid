@@ -1,0 +1,33 @@
+// SP16 (llvm-roadmap): the main thread's stack is deep enough for the
+// compiler built by our own backend. A recursion 400000 calls deep (tens
+// of MB of stack, past the 8 MB of `ulimit -s` and of the old PE header)
+// must finish: the Linux runtime raises RLIMIT_STACK at start
+// (stdlib/linux_runtime/sys.fd pe_main_stack_raise), `--nat` Windows
+// reserves 256 MB (compiler/nat_enc.fd). tests/nattools/main_stack_check.sh
+// builds and runs it. Not a tests/bootstrap test: a C build has the
+// system's default main stack.
+// Expected output:
+// depth 400000
+// sum 80000200000
+use core;
+
+fn deep(n: i64, acc: i64) -> i64 {
+    if n == 0 {
+        return acc;
+    }
+    // not a tail call: the addition happens after the call returns
+    val r: i64 = deep(n - 1, acc + 1);
+    return r + n;
+}
+
+fn main() -> i64 {
+    var n: i64 = 400000;
+    match arg_at(1) {
+        Option::Some(a) => { n = str_parse_int(a); }
+        Option::None => {}
+    }
+    val s: i64 = deep(n, 0);
+    println("depth " + int_to_str(n));
+    println("sum " + int_to_str(s - n));
+    return 0;
+}

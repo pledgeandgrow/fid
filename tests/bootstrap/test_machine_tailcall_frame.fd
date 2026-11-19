@@ -1,0 +1,90 @@
+// Track MI (docs/roadmap/llvm-roadmap.md MI28), the machine layer
+// (compiler/nat_ir.fd): tail calls as jumps in a function that takes its
+// own frame's address (a struct local handed to a callee by address, an
+// MO_SLOTADDR). ng_tail_taint follows where frame addresses go: a call
+// whose arguments may carry one stays a call (after a jump the frame is
+// the callee's), every other call in tail position may be a jump. Before
+// MI28 such a function had no jumps at all, so its self-recursion was a
+// loop only through the IR optimizer (iropt's tailcall) and its mutual
+// recursion never.
+//   walk      self-recursion; its struct goes to a helper by address,
+//             its tail call passes only numbers: a jump, also with
+//             FID_IROPT_OFF=tailcall
+//   even_s /  mutual recursion, a struct local in each: jumps
+//   odd_s
+//   peek      `return acc_sum(&t, 2)`: the tail call passes the frame
+//             address itself, so it must stay a call (a jump would let
+//             acc_sum's frames overwrite t before it is read)
+//   relay     the address goes through a local first (a move), then to
+//             the tail call: a call too
+// tests/nattools/tailcall_frame_deep.fd runs the first two millions of
+// levels deep (tests/nattools/machine_tailcall_frame_check.sh). The
+// results are the same with FID_NAT_OFF=tailframe (no jumps in these
+// functions, as before) and FID_NAT_OFF=tailcall.
+// Expected output:
+// 4398
+// 2257
+// 2720
+// 34
+// 64
+// 19
+// -25
+
+struct Acc { a: i64, b: i64, c: i64 }
+
+// recursive, so never inlined: reads the struct through its address after
+// d frames of its own
+fn acc_sum(t: &Acc, d: i64) -> i64 {
+    if d <= 0 {
+        return t.a + t.b * 2 + t.c * 3;
+    }
+    return acc_sum(t, d - 1) + 1;
+}
+
+fn walk(n: i64, total: i64) -> i64 {
+    if n == 0 {
+        return total;
+    }
+    var t: Acc = Acc { a: n % 7, b: n % 5, c: 1 };
+    return walk(n - 1, total + acc_sum(&t, 1));
+}
+
+fn even_s(n: i64, k: i64) -> i64 {
+    if n == 0 {
+        return k;
+    }
+    var t: Acc = Acc { a: n % 3, b: 1, c: 0 };
+    return odd_s(n - 1, k + acc_sum(&t, 0));
+}
+
+fn odd_s(n: i64, k: i64) -> i64 {
+    if n == 0 {
+        return k * 2;
+    }
+    var t: Acc = Acc { a: 0, b: n % 2, c: 1 };
+    return even_s(n - 1, k + acc_sum(&t, 0) - 3);
+}
+
+fn peek(n: i64) -> i64 {
+    var t: Acc = Acc { a: n, b: n + 1, c: n + 2 };
+    return acc_sum(&t, 2);
+}
+
+fn relay_use(t: &Acc) -> i64 {
+    return acc_sum(t, 3) * 2 - t.a;
+}
+
+fn relay(n: i64) -> i64 {
+    var t: Acc = Acc { a: n, b: 1, c: 1 };
+    return relay_use(&t);
+}
+
+fn main() {
+    println(walk(400, 0));
+    println(even_s(900, 7));
+    println(even_s(901, 7));
+    println(peek(4));
+    println(peek(9));
+    println(relay(3));
+    println(relay(29) - 70);
+}

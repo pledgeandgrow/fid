@@ -1,0 +1,44 @@
+// Lab 12 solution: a safe wrapper around C functions.
+//! lab: 12
+//! check: runs
+//! playground: no
+//! run: ccompile
+//! env: FID_LAB_PORT=8080
+//! env: FID_LAB_BAD=eighty
+
+extern "C" include "<stdlib.h>" {
+    fn getenv as c_getenv(name: str) -> str;
+    fn atoi as c_atoi(s: str) -> i32;
+}
+
+fn all_digits(s: str) -> bool {
+    if str_len(s) == 0 { return false; }
+    for i in 0..str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < '0' || c > '9' { return false; }
+    }
+    return true;
+}
+
+// The wrapper's contract: any name, any environment, no crash. getenv
+// returns NULL for a missing name; the pointer is tested before it is
+// read. The C string is not ours: it is read, never kept or freed.
+fn env_int(name: str, default: i64) -> i64 {
+    var raw: str = "";
+    // SAFETY: getenv reads a NUL-terminated name and returns NULL or a
+    // pointer into the environment, valid until the environment changes
+    unsafe { raw = c_getenv(name); }
+    if (raw as i64) == 0 { return default; }
+    if !all_digits(raw) { return default; }
+    var n: i32 = 0;
+    // SAFETY: raw is non-null and NUL-terminated, and all digits
+    unsafe { n = c_atoi(raw); }
+    return n as i64;
+}
+
+fn main() -> i64 {
+    println("port " + int_to_str(env_int("FID_LAB_PORT", 80)));
+    println("unset " + int_to_str(env_int("FID_LAB_UNSET", 80)));
+    println("bad " + int_to_str(env_int("FID_LAB_BAD", 80)));
+    return 0;
+}

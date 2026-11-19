@@ -139,6 +139,20 @@ impl Vec {
         return - 1;
     }
 
+    // The first element satisfying the predicate, or Option::None
+    pub fn find_opt(self: Vec<i64>, pred: fn(i64) -> bool) -> Option<i64> {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if pred(x) {
+                return Option::Some(x);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
     // Index of first element satisfying predicate, or -1
     pub fn position(self: Vec<i64>, pred: fn(i64) -> bool) -> i64 {
         var i: i64 = 0;
@@ -151,6 +165,20 @@ impl Vec {
             i = i + 1;
         }
         return - 1;
+    }
+
+    // Index of first element satisfying predicate, or Option::None
+    pub fn position_opt(self: Vec<i64>, pred: fn(i64) -> bool) -> Option<i64> {
+        var i: i64 = 0;
+        var n: i64 = self.len();
+        while i < n {
+            var x: i64 = self.get(i);
+            if pred(x) {
+                return Option::Some(i);
+            }
+            i = i + 1;
+        }
+        return Option::None;
     }
 
     // ─── Iterator Adapters (Phase 2.3) ──────────────────────────────
@@ -318,6 +346,7 @@ pub fn vec_flat_map(self: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
 }
 
 /// The start index of each chunk of `size` elements.
+/// A size <= 0 gives an empty Vec (never an infinite loop).
 ///
 /// Example:
 ///   var v: Vec<i64> = Vec::new();
@@ -328,6 +357,9 @@ pub fn vec_flat_map(self: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
 pub fn vec_chunk(self: Vec<i64>, size: i64) -> Vec<i64> {
     var result: Vec<i64> = Vec_new();
     var n: i64 = Vec_len(self);
+    if size <= 0 {
+        return result;
+    }
     var i: i64 = 0;
     while i < n {
         Vec_push(result, i);
@@ -384,7 +416,7 @@ pub fn vec_dedup(self: & mut Vec<i64>) -> void {
 }
 
 /// Sort in place with a comparison function (negative, zero or positive,
-/// like `a - b`). Stable insertion sort.
+/// like `a - b`). Heapsort: O(n log n) worst case, in place, no recursion.
 ///
 /// Example:
 ///   var v: Vec<i64> = Vec::new();
@@ -394,19 +426,47 @@ pub fn vec_dedup(self: & mut Vec<i64>) -> void {
 ///   assert_eq(v.get(2), 1);
 pub fn vec_sort_by(self: & mut Vec<i64>, cmp: fn(i64, i64) -> i64) -> void {
     var n: i64 = Vec_len(self);
-    var i: i64 = 1;
-    while i < n {
-        var key: i64 = Vec_get(self, i);
-        var j: i64 = i - 1;
-        while j >= 0 {
-            if cmp(Vec_get(self, j), key) <= 0 {
-                break;
+    var i: i64 = n / 2;
+    while i > 0 {
+        i = i - 1;
+        vec_sift_down(self, i, n, cmp);
+    }
+    var end: i64 = n - 1;
+    while end > 0 {
+        var tmp: i64 = Vec_get(self, 0);
+        Vec_set(self, 0, Vec_get(self, end));
+        Vec_set(self, end, tmp);
+        vec_sift_down(self, 0, end, cmp);
+        end = end - 1;
+    }
+}
+
+// Restore the max-heap (by cmp) rooted at `root` within the first `n`
+// elements of `self`.
+fn vec_sift_down(self: & mut Vec<i64>, root: i64, n: i64, cmp: fn(i64, i64) -> i64) -> void {
+    var r: i64 = root;
+    var running = true;
+    while running {
+        var child: i64 = 2 * r + 1;
+        if child >= n {
+            running = false;
+        } else {
+            var swap_idx: i64 = r;
+            if cmp(Vec_get(self, swap_idx), Vec_get(self, child)) < 0 {
+                swap_idx = child;
             }
-            Vec_set(self, j + 1, Vec_get(self, j));
-            j = j - 1;
+            if child + 1 < n && cmp(Vec_get(self, swap_idx), Vec_get(self, child + 1)) < 0 {
+                swap_idx = child + 1;
+            }
+            if swap_idx == r {
+                running = false;
+            } else {
+                var tmp: i64 = Vec_get(self, r);
+                Vec_set(self, r, Vec_get(self, swap_idx));
+                Vec_set(self, swap_idx, tmp);
+                r = swap_idx;
+            }
         }
-        Vec_set(self, j + 1, key);
-        i = i + 1;
     }
 }
 
@@ -427,4 +487,88 @@ pub fn vec_contains_val(self: Vec<i64>, value: i64) -> bool {
         i = i + 1;
     }
     return false;
+}
+
+/// The first element satisfying `pred`, or Option::None.
+///
+/// Example:
+///   var v: Vec<i64> = Vec::new();
+///   v.push(4); v.push(5);
+///   match vec_find_opt(v, fn(x: i64) -> bool { x == 5 }) {
+///     Option::Some(x) => { assert_eq(x, 5); }
+///     Option::None => { assert(false); }
+///   }
+pub fn vec_find_opt(self: Vec<i64>, pred: fn(i64) -> bool) -> Option<i64> {
+    var n: i64 = Vec_len(self);
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = Vec_get(self, i);
+        if pred(x) {
+            return Option::Some(x);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// The index of the first element satisfying `pred`, or Option::None.
+///
+/// Example:
+///   var v: Vec<i64> = Vec::new();
+///   v.push(4); v.push(5);
+///   match vec_position_opt(v, fn(x: i64) -> bool { x == 5 }) {
+///     Option::Some(i) => { assert_eq(i, 1); }
+///     Option::None => { assert(false); }
+///   }
+pub fn vec_position_opt(self: Vec<i64>, pred: fn(i64) -> bool) -> Option<i64> {
+    var n: i64 = Vec_len(self);
+    var i: i64 = 0;
+    while i < n {
+        if pred(Vec_get(self, i)) {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// The element at `idx`, or Option::None when out of bounds — the safe
+/// version of v.get (which panics).
+///
+/// Example:
+///   var v: Vec<i64> = Vec::new();
+///   v.push(7);
+///   match vec_get_opt(v, 5) {
+///     Option::Some(x) => { assert(false); }
+///     Option::None => { assert(true); }
+///   }
+pub fn vec_get_opt(v: Vec<i64>, idx: i64) -> Option<i64> {
+    if idx < 0 || idx >= Vec_len(v) {
+        return Option::None;
+    }
+    return Option::Some(Vec_get(v, idx));
+}
+
+/// The first element, or Option::None when empty.
+///
+/// Example:
+///   var v: Vec<i64> = Vec::new();
+///   match vec_first_opt(v) {
+///     Option::Some(x) => { assert(false); }
+///     Option::None => { assert(true); }
+///   }
+pub fn vec_first_opt(v: Vec<i64>) -> Option<i64> {
+    if Vec_len(v) == 0 {
+        return Option::None;
+    }
+    return Option::Some(Vec_get(v, 0));
+}
+
+/// The last element, or Option::None when empty.
+pub fn vec_last_opt(v: Vec<i64>) -> Option<i64> {
+    var n: i64 = Vec_len(v);
+    if n == 0 {
+        return Option::None;
+    }
+    return Option::Some(Vec_get(v, n - 1));
 }

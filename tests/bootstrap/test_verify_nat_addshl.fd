@@ -1,0 +1,150 @@
+// VF5, element addresses in the machine layer (compiler/nat_ir.fd,
+// `FID_NAT_OFF=addshl`: data + index << shift in one add-shifted or
+// scaled-index operation; also the inlined Vec operations of
+// `FID_NAT_OFF=vecinline`, which compute those addresses, and the address
+// modes `ng_fuse_addr` folds them into). Each element size the language
+// has is read and written at computed indexes (i, i + 1, 2 * i + 1, the
+// last one), so a wrong shift or a wrong base reads another element:
+// Vec<i64>, Vec<f64>, Vec<u8>, Vec<i32>, Vec<bool>, a Vec of two-word
+// structs and a Vec read at a stride. scripts/verify/variants.py's mutant
+// addshl-shift-off-by-one breaks it.
+//
+// Expected output:
+// 285 81 9
+// 22.5
+// 765 255
+// 2470 -95
+// 5
+// 30 125
+// 120 45
+
+struct Pt {
+    x: i64,
+    y: i64,
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 10 {
+        v.push(i * i);
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    i = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    // v[2i+1] for i = 4 is v[9] = 81; v[i - 1] after the loop is v[9]
+    println(int_to_str(s) + " " + int_to_str(v[2 * 4 + 1]) + " " + int_to_str(v[v.len() - 7]));
+
+    var f: Vec<f64> = Vec::new();
+    i = 0;
+    while i < 6 {
+        f.push((i as f64) * 1.5);
+        i = i + 1;
+    }
+    var fs: f64 = 0.0;
+    i = 0;
+    while i < 6 {
+        fs = fs + f.get(i);
+        i = i + 1;
+    }
+    println(fs);
+
+    var b: Vec<u8> = Vec::new();
+    i = 0;
+    while i < 6 {
+        b.push(250);
+        i = i + 1;
+    }
+    var bs: i64 = 0;
+    i = 0;
+    while i < 3 {
+        b.set(i * 2 + 1, 255);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 3 {
+        bs = bs + (b.get(i * 2 + 1) as i64);
+        i = i + 1;
+    }
+    println(int_to_str(bs) + " " + int_to_str(b.get(5) as i64));
+
+    var w: Vec<i32> = Vec::new();
+    i = 0;
+    while i < 20 {
+        w.push((i * 13) as i32);
+        i = i + 1;
+    }
+    var ws: i64 = 0;
+    i = 0;
+    while i < 20 {
+        ws = ws + (w.get(i) as i64);
+        i = i + 1;
+    }
+    w.set(19, 0 - 95);
+    println(int_to_str(ws) + " " + int_to_str(w.get(19) as i64));
+
+    var flags: Vec<bool> = Vec::new();
+    i = 0;
+    while i < 10 {
+        flags.push(i % 2 == 0);
+        i = i + 1;
+    }
+    var nf: i64 = 0;
+    i = 0;
+    while i < 10 {
+        if flags.get(i) {
+            nf = nf + 1;
+        }
+        i = i + 1;
+    }
+    println(nf);
+
+    var pts: Vec<Pt> = Vec::new();
+    i = 0;
+    while i < 5 {
+        pts.push(Pt { x: i, y: i * 10 + 5 });
+        i = i + 1;
+    }
+    var px: i64 = 0;
+    var py: i64 = 0;
+    i = 0;
+    while i < 5 {
+        val p: Pt = pts.get(i);
+        px = px + p.x * 3;
+        py = py + p.y;
+        i = i + 1;
+    }
+    println(int_to_str(px) + " " + int_to_str(py));
+
+    // a Vec grown past its first buffer, read at stride 3 (3 * 8 bytes
+    // between reads)
+    var big: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 {
+        big.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 16 {
+        big.set(i, i);
+        i = i + 1;
+    }
+    var as1: i64 = 0;
+    i = 0;
+    while i < 16 {
+        as1 = as1 + big[i];
+        i = i + 1;
+    }
+    var as2: i64 = 0;
+    i = 0;
+    while i < 5 {
+        as2 = as2 + big[i * 3];
+        i = i + 1;
+    }
+    println(int_to_str(as1) + " " + int_to_str(as2 + 15));
+    return 0;
+}

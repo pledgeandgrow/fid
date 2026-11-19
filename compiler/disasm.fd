@@ -1,0 +1,2563 @@
+// disasm.fd -- a disassembler for the machine layer's own output
+// (llvm-roadmap TG5, `fid disasm`).
+//
+// It reads what compiler/nat_enc.fd (and the few raw words of nat_ir.fd)
+// write on x86-64, AArch64 and RISC-V 64: the same encodings, read back.
+// Every form is a row of one table ("The encoding forms: one table"
+// below: fixed bits, operand template), which the decoders match and the
+// encoders' words come from (the EFW_* constants, ef_word, ef_x64_rr), so
+// the two cannot drift; tests/nattools/enc_table_unit.fd checks each
+// encoder of nat_enc.fd against its row. Bytes no row has are shown as
+// `.word` / `.byte`, never guessed at. scripts/enc-oracle.py checks the
+// encoders against clang's assembler; scripts/disasm-check.sh checks a
+// disassembly of the suite's images against llvm-objdump (where each
+// instruction starts) and back through clang's assembler (that each line
+// gives its own bytes again).
+//
+//   disasm_image(bytes, name)   an ELF executable (its .symtab) or a PE
+//                               (its COFF symbols): every function, or the
+//                               one named `name`
+//   disasm_bytes(bytes, from, to, arch, addr)   bare code at address addr
+//
+// Syntax: Intel for x86-64 (`mov rax, qword [rbp - 8]`), the ARM and
+// RISC-V assembler syntax for the others, with the usual aliases (mov,
+// cmp, cset, li, mv, j, ret). Branch targets are absolute addresses.
+
+module compiler::disasm; use core; use vec; use string; use compiler::nat_enc;
+
+pub const DSM_A64: i64 = 1;
+pub const DSM_RV64: i64 = 2;
+pub const DSM_X64: i64 = 3;
+
+/// An instruction: its length in bytes and its text.
+pub struct DsmInsn {
+    pub len: i64,
+    pub text: str,
+}
+
+fn dsm_insn(len: i64, text: str) -> DsmInsn {
+    return DsmInsn {
+        len: len, text: text
+    };
+}
+
+/// The architecture of a --arch name, 0 when it is not one.
+pub fn disasm_arch_of(name: str) -> i64 {
+    if name == "x86_64" || name == "x86-64" || name == "x64" || name == "amd64" {
+        return DSM_X64;
+    }
+    if name == "aarch64" || name == "arm64" {
+        return DSM_A64;
+    }
+    if name == "riscv64" || name == "riscv" || name == "rv64" {
+        return DSM_RV64;
+    }
+    return 0;
+}
+
+// --- Numbers -----------------------------------------------------------------
+
+/// `v` as `digits` lowercase hex digits (more when it needs them).
+@wrapping fn dsm_hex(v: i64, digits: i64) -> str {
+    var hexd: str = "0123456789abcdef";
+    var out: str = "";
+    var x: i64 = v;
+    var n: i64 = 0;
+    while n < 16 && (n < digits || x != 0) {
+        var nib: i64 = x & 15;
+        out = str_slice(hexd, nib, nib + 1) + out;
+        x = (x >> 4) & 0x0FFFFFFFFFFFFFFF;
+        n = n + 1;
+    }
+    return out;
+}
+
+/// A signed number in hex: 0x10, -0x10.
+@wrapping fn dsm_shex(v: i64) -> str {
+    if v < 0 {
+        return "-0x" + dsm_hex(0 - v, 1);
+    }
+    return "0x" + dsm_hex(v, 1);
+}
+
+/// The low `bits` bits of `v` as a signed number.
+@wrapping fn dsm_sext(v: i64, bits: i64) -> i64 {
+    var m: i64 = 1 << (bits - 1);
+    var x: i64 = v & ((1 << bits) - 1);
+    return (x ^ m) - m;
+}
+
+fn dsm_u8(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at >= b.len() {
+        return 0;
+    }
+    return b.get(at) & 255;
+}
+
+@wrapping fn dsm_u(b: & Vec<i64>, at: i64, size: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = size - 1;
+    while i >= 0 {
+        v = (v << 8) | dsm_u8(b, at + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+/// The little-endian 32-bit word at `at`.
+fn dsm_word(b: & Vec<i64>, at: i64) -> i64 {
+    return dsm_u(b, at, 4) & 0xFFFFFFFF;
+}
+
+// --- AArch64 -------------------------------------------------------------------
+
+/// x<n> / w<n>; register 31 is `sp` or `xzr`/`wzr` as `sp31` says.
+fn a64r(n: i64, wide: bool, sp31: bool) -> str {
+    if n == 31 {
+        if sp31 {
+            if wide {
+                return "sp";
+            }
+            return "wsp";
+        }
+        if wide {
+            return "xzr";
+        }
+        return "wzr";
+    }
+    if wide {
+        return "x" + int_to_str(n);
+    }
+    return "w" + int_to_str(n);
+}
+
+fn a64x(n: i64) -> str {
+    return a64r(n, true, false);
+}
+
+fn a64xs(n: i64) -> str {
+    return a64r(n, true, true);
+}
+
+fn a64cond(c: i64) -> str {
+    var names: Vec<str> = str_split("eq,ne,hs,lo,mi,pl,vs,vc,hi,ls,ge,lt,gt,le,al,nv", ",");
+    return names.get(c & 15);
+}
+
+fn a64shift(w: i64) -> str {
+    var amt: i64 = (w >> 10) & 63;
+    if amt == 0 {
+        return "";
+    }
+    var kinds: Vec<str> = str_split("lsl,lsr,asr,ror", ",");
+    return ", " + kinds.get((w >> 22) & 3) + " #" + int_to_str(amt);
+}
+
+// --- RISC-V 64 -------------------------------------------------------------------
+
+fn rvr(n: i64) -> str {
+    var names: Vec<str> = str_split("zero,ra,sp,gp,tp,t0,t1,t2,s0,s1,a0,a1,a2,a3,a4,a5,a6,a7,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,t3,t4,t5,t6", ",");
+    return names.get(n & 31);
+}
+
+fn rvf(n: i64) -> str {
+    return "f" + int_to_str(n & 31);
+}
+
+// --- x86-64 -----------------------------------------------------------------------
+
+/// A general register of `size` bytes (8, 4, 2, 1); `rex`: a REX prefix
+/// was there (byte registers 4..7 are spl..dil, else ah..bh).
+fn x64r(n: i64, size: i64, rex: bool) -> str {
+    if size == 8 {
+        var q: Vec<str> = str_split("rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8,r9,r10,r11,r12,r13,r14,r15", ",");
+        return q.get(n & 15);
+    }
+    if size == 4 {
+        var d: Vec<str> = str_split("eax,ecx,edx,ebx,esp,ebp,esi,edi,r8d,r9d,r10d,r11d,r12d,r13d,r14d,r15d", ",");
+        return d.get(n & 15);
+    }
+    if size == 2 {
+        var w: Vec<str> = str_split("ax,cx,dx,bx,sp,bp,si,di,r8w,r9w,r10w,r11w,r12w,r13w,r14w,r15w", ",");
+        return w.get(n & 15);
+    }
+    if !rex && n >= 4 && n <= 7 {
+        var h: Vec<str> = str_split("ah,ch,dh,bh", ",");
+        return h.get(n - 4);
+    }
+    var b: Vec<str> = str_split("al,cl,dl,bl,spl,bpl,sil,dil,r8b,r9b,r10b,r11b,r12b,r13b,r14b,r15b", ",");
+    return b.get(n & 15);
+}
+
+fn x64cc(c: i64) -> str {
+    var names: Vec<str> = str_split("o,no,b,ae,e,ne,be,a,s,ns,p,np,l,ge,le,g", ",");
+    return names.get(c & 15);
+}
+
+fn x64size_word(size: i64) -> str {
+    if size == 8 {
+        return "qword ";
+    }
+    if size == 4 {
+        return "dword ";
+    }
+    if size == 2 {
+        return "word ";
+    }
+    return "byte ";
+}
+
+/// A ModRM operand: `len` bytes (ModRM, SIB, displacement), the register
+/// field, the r/m register when mod is 3 (else -1) and the memory text
+/// ([base + index*scale + disp]); `rip`: rip-relative with `disp`.
+pub struct DsmModrm {
+    pub len: i64,
+    pub reg: i64,
+    pub rm_reg: i64,
+    pub mem: str,
+    pub rip: bool,
+    pub disp: i64,
+}
+
+@wrapping fn x64_modrm(b: & Vec<i64>, at: i64, rex: i64) -> DsmModrm {
+    var modrm: i64 = dsm_u8(b, at);
+    var md: i64 = (modrm >> 6) & 3;
+    var reg: i64 = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+    var rm: i64 = modrm & 7;
+    if md == 3 {
+        return DsmModrm {
+            len: 1, reg: reg, rm_reg: rm | ((rex & 1) << 3), mem: "", rip: false, disp: 0
+        };
+    }
+    var len: i64 = 1;
+    var base: str = "";
+    var index: str = "";
+    var rip: bool = false;
+    var no_base: bool = false;
+    if rm == 4 {
+        var sib: i64 = dsm_u8(b, at + 1);
+        len = 2;
+        var scale: i64 = 1 << ((sib >> 6) & 3);
+        var ix: i64 = ((sib >> 3) & 7) | ((rex & 2) << 2);
+        var bs: i64 = (sib & 7) | ((rex & 1) << 3);
+        if ix != 4 {
+            index = x64r(ix, 8, true);
+            if scale > 1 {
+                index = index + "*" + int_to_str(scale);
+            }
+        }
+        if (sib & 7) == 5 && md == 0 {
+            no_base = true;
+        } else {
+            base = x64r(bs, 8, true);
+        }
+    } else if rm == 5 && md == 0 {
+        rip = true;
+    } else {
+        base = x64r(rm | ((rex & 1) << 3), 8, true);
+    }
+    var disp: i64 = 0;
+    if md == 1 {
+        disp = dsm_sext(dsm_u8(b, at + len), 8);
+        len = len + 1;
+    } else if md == 2 || rip || no_base {
+        disp = dsm_sext(dsm_u(b, at + len, 4), 32);
+        len = len + 4;
+    }
+    var text: str = "";
+    if rip {
+        text = "rip";
+    } else {
+        text = base;
+        if str_len(index) > 0 {
+            if str_len(text) > 0 {
+                text = text + " + ";
+            }
+            text = text + index;
+        }
+    }
+    if disp != 0 || str_len(text) == 0 {
+        if str_len(text) == 0 {
+            text = "0x" + dsm_hex(disp, 1);
+        } else if disp < 0 {
+            text = text + " - 0x" + dsm_hex(0 - disp, 1);
+        } else {
+            text = text + " + 0x" + dsm_hex(disp, 1);
+        }
+    }
+    return DsmModrm {
+        len: len, reg: reg, rm_reg: - 1, mem: "[" + text + "]", rip: rip, disp: disp
+    };
+}
+
+/// The r/m operand as text: a register of `size` bytes, or memory (with
+/// its size word when `sized`).
+fn x64rm(m: DsmModrm, size: i64, rex: bool, sized: bool) -> str {
+    if m.rm_reg >= 0 {
+        return x64r(m.rm_reg, size, rex);
+    }
+    if sized {
+        return x64size_word(size) + m.mem;
+    }
+    return m.mem;
+}
+
+fn x64xmm(n: i64) -> str {
+    return "xmm" + int_to_str(n & 15);
+}
+
+/// A rip-relative operand's target, once the instruction's end is known.
+@wrapping fn x64_rip_note(m: DsmModrm, end_addr: i64) -> str {
+    if !m.rip {
+        return "";
+    }
+    return "  ; 0x" + dsm_hex(end_addr + m.disp, 1);
+}
+
+// --- The encoding forms: one table --------------------------------------------
+//
+// TG5: every instruction form the decoders below name, in one table that
+// the encoders read too (compiler/nat_enc.fd), so the two cannot drift.
+// A row is the form's fixed bits and a template of its operands:
+//
+//   AArch64 / RISC-V   base, mask: a word w is the form when
+//                      (w & mask) == base; the template's fields are the
+//                      operand bits base leaves free.
+//   x86-64             mandatory prefix, opcode map, opcode, ModRM.reg
+//                      digit (or /r), REX.W rule; the template's fields
+//                      are the ModRM operands and immediates.
+//
+// The template is the assembler text with each operand as {field}
+// (ef_field_code lists them): `add {xd}, {xn}, {xm}{shift}`. Decoding
+// renders it from the word's bits (ef_render_word, x64_render);
+// encoding puts operands into those bits in template order (ef_word,
+// ef_x64_rr). Rows are matched in table order within their priority:
+// the aliases (priority 0: mov, cmp, neg, li, ...) before the general
+// forms they are a case of. The EFW_* constants are the base words the
+// encoders use, each row built from its constant; ef_check() verifies the
+// table (fields inside the free bits, no row shadowed by an earlier one)
+// and tests/nattools/enc_table_unit.fd checks every encoder of nat_enc.fd
+// against its row, word for word, and every row decoded back.
+
+// AArch64 base words (64-bit forms; register fields 0)
+pub const EFW_A64_ADD: i64 = 0x8B000000;
+pub const EFW_A64_ADDS: i64 = 0xAB000000;
+pub const EFW_A64_SUB: i64 = 0xCB000000;
+pub const EFW_A64_SUBS: i64 = 0xEB000000;
+pub const EFW_A64_AND: i64 = 0x8A000000;
+pub const EFW_A64_ORR: i64 = 0xAA000000;
+pub const EFW_A64_EOR: i64 = 0xCA000000;
+pub const EFW_A64_ANDS: i64 = 0xEA000000;
+pub const EFW_A64_BIC: i64 = 0x8A200000;
+pub const EFW_A64_ORN: i64 = 0xAA200000;
+pub const EFW_A64_EON: i64 = 0xCA200000;
+pub const EFW_A64_BICS: i64 = 0xEA200000;
+pub const EFW_A64_ADD_IMM: i64 = 0x91000000;
+pub const EFW_A64_ADDS_IMM: i64 = 0xB1000000;
+pub const EFW_A64_SUB_IMM: i64 = 0xD1000000;
+pub const EFW_A64_SUBS_IMM: i64 = 0xF1000000;
+pub const EFW_A64_ADD_EXT: i64 = 0x8B206000;
+pub const EFW_A64_SUB_EXT: i64 = 0xCB206000;
+pub const EFW_A64_MADD: i64 = 0x9B000000;
+pub const EFW_A64_MSUB: i64 = 0x9B008000;
+pub const EFW_A64_SMULH: i64 = 0x9B407C00;
+pub const EFW_A64_UMULH: i64 = 0x9BC07C00;
+pub const EFW_A64_UDIV: i64 = 0x9AC00800;
+pub const EFW_A64_SDIV: i64 = 0x9AC00C00;
+pub const EFW_A64_LSLV: i64 = 0x9AC02000;
+pub const EFW_A64_LSRV: i64 = 0x9AC02400;
+pub const EFW_A64_ASRV: i64 = 0x9AC02800;
+pub const EFW_A64_RORV: i64 = 0x9AC02C00;
+pub const EFW_A64_CSEL: i64 = 0x9A800000;
+pub const EFW_A64_CSINC: i64 = 0x9A800400;
+pub const EFW_A64_SBFM: i64 = 0x93400000;
+pub const EFW_A64_UBFM: i64 = 0xD3400000;
+pub const EFW_A64_MOVN: i64 = 0x92800000;
+pub const EFW_A64_MOVZ: i64 = 0xD2800000;
+pub const EFW_A64_MOVK: i64 = 0xF2800000;
+pub const EFW_A64_B: i64 = 0x14000000;
+pub const EFW_A64_BL: i64 = 0x94000000;
+pub const EFW_A64_BCOND: i64 = 0x54000000;
+pub const EFW_A64_CBZ_W: i64 = 0x34000000;
+pub const EFW_A64_CBNZ_W: i64 = 0x35000000;
+pub const EFW_A64_CBZ: i64 = 0xB4000000;
+pub const EFW_A64_CBNZ: i64 = 0xB5000000;
+pub const EFW_A64_TBZ: i64 = 0x36000000;
+pub const EFW_A64_TBNZ: i64 = 0x37000000;
+pub const EFW_A64_ADRP: i64 = 0x90000000;
+pub const EFW_A64_ADR: i64 = 0x10000000;
+pub const EFW_A64_BLR: i64 = 0xD63F0000;
+pub const EFW_A64_BR: i64 = 0xD61F0000;
+pub const EFW_A64_RET: i64 = 0xD65F03C0;
+pub const EFW_A64_NOP: i64 = 0xD503201F;
+pub const EFW_A64_SVC0: i64 = 0xD4000001;
+pub const EFW_A64_BRK: i64 = 0xD4200000;
+pub const EFW_A64_DMB_ISH: i64 = 0xD5033BBF;
+pub const EFW_A64_CLREX: i64 = 0xD5033F5F;
+pub const EFW_A64_MRS_TPIDR: i64 = 0xD53BD040;
+pub const EFW_A64_MSR_TPIDR: i64 = 0xD51BD040;
+pub const EFW_A64_STRB: i64 = 0x39000000;
+pub const EFW_A64_LDRB: i64 = 0x39400000;
+pub const EFW_A64_LDRSB: i64 = 0x39800000;
+pub const EFW_A64_STRH: i64 = 0x79000000;
+pub const EFW_A64_LDRH: i64 = 0x79400000;
+pub const EFW_A64_LDRSH: i64 = 0x79800000;
+pub const EFW_A64_STR_W: i64 = 0xB9000000;
+pub const EFW_A64_LDR_W: i64 = 0xB9400000;
+pub const EFW_A64_LDRSW: i64 = 0xB9800000;
+pub const EFW_A64_STR: i64 = 0xF9000000;
+pub const EFW_A64_LDR: i64 = 0xF9400000;
+pub const EFW_A64_STR_Q: i64 = 0x3D800000;
+pub const EFW_A64_LDR_Q: i64 = 0x3DC00000;
+pub const EFW_A64_STP_POST: i64 = 0xA8800000;
+pub const EFW_A64_LDP_POST: i64 = 0xA8C00000;
+pub const EFW_A64_STP: i64 = 0xA9000000;
+pub const EFW_A64_LDP: i64 = 0xA9400000;
+pub const EFW_A64_STP_PRE: i64 = 0xA9800000;
+pub const EFW_A64_LDP_PRE: i64 = 0xA9C00000;
+pub const EFW_A64_LDAXR: i64 = 0xC85FFC00;
+pub const EFW_A64_STLXR: i64 = 0xC800FC00;
+pub const EFW_A64_LDAR: i64 = 0xC8DFFC00;
+pub const EFW_A64_STLR: i64 = 0xC89FFC00;
+pub const EFW_A64_FMOV_DX: i64 = 0x9E670000;
+pub const EFW_A64_FMOV_XD: i64 = 0x9E660000;
+pub const EFW_A64_FMOV_SW: i64 = 0x1E270000;
+pub const EFW_A64_FMOV_WS: i64 = 0x1E260000;
+pub const EFW_A64_FCVT_DS: i64 = 0x1E22C000;
+pub const EFW_A64_FCVT_SD: i64 = 0x1E624000;
+pub const EFW_A64_SCVTF: i64 = 0x9E620000;
+pub const EFW_A64_FCVTZS: i64 = 0x9E780000;
+pub const EFW_A64_FSQRT: i64 = 0x1E61C000;
+pub const EFW_A64_FABS: i64 = 0x1E60C000;
+pub const EFW_A64_FRINTM: i64 = 0x1E654000;
+pub const EFW_A64_FRINTP: i64 = 0x1E64C000;
+pub const EFW_A64_FRINTZ: i64 = 0x1E65C000;
+pub const EFW_A64_FRINTA: i64 = 0x1E664000;
+pub const EFW_A64_FMOV_DD: i64 = 0x1E604000;
+pub const EFW_A64_FADD: i64 = 0x1E602800;
+pub const EFW_A64_FSUB: i64 = 0x1E603800;
+pub const EFW_A64_FMUL: i64 = 0x1E600800;
+pub const EFW_A64_FDIV: i64 = 0x1E601800;
+pub const EFW_A64_FCMP: i64 = 0x1E602000;
+pub const EFW_A64_FMADD: i64 = 0x1F400000;
+
+// RISC-V base words (register fields 0)
+pub const EFW_RV_ADD: i64 = 0x00000033;
+pub const EFW_RV_SUB: i64 = 0x40000033;
+pub const EFW_RV_SLL: i64 = 0x00001033;
+pub const EFW_RV_SLT: i64 = 0x00002033;
+pub const EFW_RV_SLTU: i64 = 0x00003033;
+pub const EFW_RV_XOR: i64 = 0x00004033;
+pub const EFW_RV_SRL: i64 = 0x00005033;
+pub const EFW_RV_SRA: i64 = 0x40005033;
+pub const EFW_RV_OR: i64 = 0x00006033;
+pub const EFW_RV_AND: i64 = 0x00007033;
+pub const EFW_RV_MUL: i64 = 0x02000033;
+pub const EFW_RV_MULH: i64 = 0x02001033;
+pub const EFW_RV_MULHU: i64 = 0x02003033;
+pub const EFW_RV_DIV: i64 = 0x02004033;
+pub const EFW_RV_DIVU: i64 = 0x02005033;
+pub const EFW_RV_REM: i64 = 0x02006033;
+pub const EFW_RV_REMU: i64 = 0x02007033;
+pub const EFW_RV_ADDI: i64 = 0x00000013;
+pub const EFW_RV_SLTIU: i64 = 0x00003013;
+pub const EFW_RV_XORI: i64 = 0x00004013;
+pub const EFW_RV_ANDI: i64 = 0x00007013;
+pub const EFW_RV_SLLI: i64 = 0x00001013;
+pub const EFW_RV_SRLI: i64 = 0x00005013;
+pub const EFW_RV_SRAI: i64 = 0x40005013;
+pub const EFW_RV_ADDIW: i64 = 0x0000001B;
+pub const EFW_RV_ADDW: i64 = 0x0000003B;
+pub const EFW_RV_SUBW: i64 = 0x4000003B;
+pub const EFW_RV_MULW: i64 = 0x0200003B;
+pub const EFW_RV_SH1ADD: i64 = 0x20002033;
+pub const EFW_RV_ZEXT_W: i64 = 0x0800003B;
+pub const EFW_RV_ZEXT_H: i64 = 0x0800403B;
+pub const EFW_RV_SEXT_B: i64 = 0x60401013;
+pub const EFW_RV_SEXT_H: i64 = 0x60501013;
+pub const EFW_RV_ANDN: i64 = 0x40007033;
+pub const EFW_RV_CZERO_EQZ: i64 = 0x0E005033;
+pub const EFW_RV_CZERO_NEZ: i64 = 0x0E007033;
+pub const EFW_RV_LUI: i64 = 0x00000037;
+pub const EFW_RV_AUIPC: i64 = 0x00000017;
+pub const EFW_RV_JAL: i64 = 0x0000006F;
+pub const EFW_RV_JALR: i64 = 0x00000067;
+pub const EFW_RV_ECALL: i64 = 0x00000073;
+pub const EFW_RV_EBREAK: i64 = 0x00100073;
+pub const EFW_RV_FENCE_RW: i64 = 0x0330000F;
+pub const EFW_RV_LD: i64 = 0x00003003;
+pub const EFW_RV_SD: i64 = 0x00003023;
+pub const EFW_RV_FLD: i64 = 0x00003007;
+pub const EFW_RV_FSD: i64 = 0x00003027;
+pub const EFW_RV_BEQ: i64 = 0x00000063;
+pub const EFW_RV_FMV_DX: i64 = 0xF2000053;
+pub const EFW_RV_FMV_XD: i64 = 0xE2000053;
+pub const EFW_RV_FMV_WX: i64 = 0xF0000053;
+pub const EFW_RV_FMV_XW: i64 = 0xE0000053;
+pub const EFW_RV_FADD_D: i64 = 0x02000053;
+pub const EFW_RV_FSUB_D: i64 = 0x0A000053;
+pub const EFW_RV_FMUL_D: i64 = 0x12000053;
+pub const EFW_RV_FDIV_D: i64 = 0x1A000053;
+pub const EFW_RV_FSQRT_D: i64 = 0x5A000053;
+pub const EFW_RV_FSGNJ_D: i64 = 0x22000053;
+pub const EFW_RV_FSGNJN_D: i64 = 0x22001053;
+pub const EFW_RV_FSGNJX_D: i64 = 0x22002053;
+pub const EFW_RV_FLE_D: i64 = 0xA2000053;
+pub const EFW_RV_FLT_D: i64 = 0xA2001053;
+pub const EFW_RV_FEQ_D: i64 = 0xA2002053;
+pub const EFW_RV_FCVT_D_L: i64 = 0xD2200053;
+pub const EFW_RV_FCVT_D_W: i64 = 0xD2000053;
+pub const EFW_RV_FCVT_L_D: i64 = 0xC2200053;
+pub const EFW_RV_FCVT_W_D: i64 = 0xC2000053;
+pub const EFW_RV_FCVT_D_S: i64 = 0x42000053;
+pub const EFW_RV_FCVT_S_D: i64 = 0x40100053;
+pub const EFW_RV_FMADD_D: i64 = 0x02000043;
+pub const EFW_RV_LR_D: i64 = 0x1000302F;
+pub const EFW_RV_SC_D: i64 = 0x1800302F;
+pub const EFW_RV_AMOADD_D: i64 = 0x0000302F;
+pub const EFW_RV_AMOSWAP_D: i64 = 0x0800302F;
+
+// Field codes of the templates. AArch64:
+const EFF_XD: i64 = 1; const EFF_XDS: i64 = 2; const EFF_WD: i64 = 3; const EFF_XN: i64 = 4;
+const EFF_XNS: i64 = 5; const EFF_WN: i64 = 6; const EFF_XM: i64 = 7; const EFF_WM: i64 = 8;
+const EFF_XA: i64 = 9; const EFF_DD: i64 = 10; const EFF_DN: i64 = 11; const EFF_DM: i64 = 12;
+const EFF_DA: i64 = 13; const EFF_SD: i64 = 14; const EFF_SN: i64 = 15; const EFF_IMM12: i64 = 16;
+const EFF_SH12: i64 = 17; const EFF_SHIFT: i64 = 18; const EFF_COND: i64 = 19; const EFF_NCOND: i64 = 20;
+const EFF_IMMR: i64 = 21; const EFF_IMMS: i64 = 22; const EFF_LSL6: i64 = 23; const EFF_IMM16: i64 = 24;
+const EFF_HW: i64 = 25; const EFF_B26: i64 = 26; const EFF_B19: i64 = 27; const EFF_B14: i64 = 28;
+const EFF_TBIT: i64 = 29; const EFF_ADRP: i64 = 30; const EFF_ADR: i64 = 31; const EFF_UOFF: i64 = 32;
+const EFF_SIMM7: i64 = 33; const EFF_XT2: i64 = 34; const EFF_QD: i64 = 35; const EFF_VD: i64 = 36;
+const EFF_VN: i64 = 37; const EFF_VM: i64 = 38; const EFF_IDX1: i64 = 39; const EFF_COND0: i64 = 40;
+const EFF_TBR: i64 = 41; const EFF_IMM16D: i64 = 42; const EFF_RSC: i64 = 43;
+// RISC-V:
+const EFF_RD: i64 = 50; const EFF_RS1: i64 = 51; const EFF_RS2: i64 = 52; const EFF_FD: i64 = 53;
+const EFF_FS1: i64 = 54; const EFF_FS2: i64 = 55; const EFF_FS3: i64 = 56; const EFF_IMMI: i64 = 57;
+const EFF_IMMST: i64 = 58; const EFF_SHAMT6: i64 = 59; const EFF_SHAMT5: i64 = 60; const EFF_BOFF: i64 = 61;
+const EFF_JOFF: i64 = 62; const EFF_UIMM20: i64 = 63; const EFF_RM: i64 = 64; const EFF_RVD: i64 = 65;
+const EFF_RVS1: i64 = 66; const EFF_RVS2: i64 = 67; const EFF_VTYPE: i64 = 68; const EFF_AQRL: i64 = 69;
+const EFF_FSAME: i64 = 70; const EFF_RMD: i64 = 71;
+// x86-64 (ModRM operands, immediates):
+const EFF_R: i64 = 80; const EFF_R8: i64 = 81; const EFF_R32: i64 = 82; const EFF_R64: i64 = 83;
+const EFF_RW: i64 = 84; const EFF_RM: i64 = 85; const EFF_RMS: i64 = 86; const EFF_RM8: i64 = 87;
+const EFF_RM8S: i64 = 88; const EFF_RM16S: i64 = 89; const EFF_RM32: i64 = 90; const EFF_RM32S: i64 = 91;
+const EFF_RM64: i64 = 92; const EFF_RM64S: i64 = 93; const EFF_RMW: i64 = 94; const EFF_RMWS: i64 = 95;
+const EFF_X: i64 = 96; const EFF_XRM: i64 = 97; const EFF_V: i64 = 98; const EFF_VV: i64 = 99;
+const EFF_VRM: i64 = 100; const EFF_GV: i64 = 101; const EFF_ACC: i64 = 102; const EFF_OREG: i64 = 103;
+const EFF_IB: i64 = 104; const EFF_IBX: i64 = 105; const EFF_SB: i64 = 106; const EFF_SZ: i64 = 107;
+const EFF_UZ: i64 = 108; const EFF_IQ: i64 = 109; const EFF_DQ: i64 = 110; const EFF_XV: i64 = 111;
+
+/// A template field's code, 0 when `name` is not a field.
+fn ef_field_code(name: str) -> i64 {
+    var names: Vec<str> = str_split("xd,xds,wd,xn,xns,wn,xm,wm,xa,dd,dn,dm,da,sd,sn,imm12,sh12,shift,cond,ncond,immr,imms,lsl6,imm16,hw,b26,b19,b14,tbit,adrp,adr,uoff,simm7,xt2,qd,vd,vn,vm,idx1,cond0,tbr,imm16d,rsc", ",");
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    var rnames: Vec<str> = str_split("rd,rs1,rs2,fd,fs1,fs2,fs3,immi,immst,shamt6,shamt5,boff,joff,uimm20,rm,rvd,rvs1,rvs2,vtype,aqrl,fsame,rmd", ",");
+    i = 0;
+    while i < rnames.len() {
+        if rnames.get(i) == name {
+            return i + 50;
+        }
+        i = i + 1;
+    }
+    var xnames: Vec<str> = str_split("r,r8,r32,r64,rw,rm,rms,rm8,rm8s,rm16s,rm32,rm32s,rm64,rm64s,rmw,rmws,x,xrm,v,vv,vrm,gv,acc,oreg,ib,ibx,sb,sz,uz,iq,dq,xv", ",");
+    i = 0;
+    while i < xnames.len() {
+        if xnames.get(i) == name {
+            return i + 80;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The table, built once (ef_init). One entry per row in each Vec.
+var g_ef_ready: bool = false;
+var g_ef_arch: Vec<i64> = Vec::new();
+var g_ef_base: Vec<i64> = Vec::new();   // A64/RV: fixed bits; x64: opcode byte
+var g_ef_mask: Vec<i64> = Vec::new();   // A64/RV: the bits base fixes
+var g_ef_prio: Vec<i64> = Vec::new();   // 0: an alias, matched first
+var g_ef_tmpl: Vec<str> = Vec::new();
+var g_ef_fields: Vec<i64> = Vec::new(); // EF_MAXF field codes per row, 0 = none
+var g_ef_pre: Vec<i64> = Vec::new();    // x64: -1 any, 0 none, 0x66 / 0xF2 / 0xF3
+var g_ef_map: Vec<i64> = Vec::new();    // x64: 0 one byte, 1 0F, 2 0F 38, 3 0F 3A
+var g_ef_dig: Vec<i64> = Vec::new();    // x64: ModRM.reg digit, -1 /r, -2 no ModRM, -3 +r
+var g_ef_w: Vec<i64> = Vec::new();      // x64: REX/VEX.W -1 any, 0, 1
+var g_ef_vex: Vec<i64> = Vec::new();    // x64: 1 a VEX form
+var g_ef_order: Vec<i64> = Vec::new();  // rows in match order (by arch, priority)
+var g_ef_errors: Vec<str> = Vec::new();
+
+const EF_MAXF: i64 = 6;
+
+/// Add a row; returns its id.
+fn ef_add(arch: i64, base: i64, mask: i64, prio: i64, tmpl: str, pre: i64, map: i64, dig: i64, w: i64, vex: i64) -> i64 {
+    var id: i64 = g_ef_arch.len();
+    g_ef_arch.push(arch);
+    g_ef_base.push(base);
+    g_ef_mask.push(mask);
+    g_ef_prio.push(prio);
+    g_ef_tmpl.push(tmpl);
+    g_ef_pre.push(pre);
+    g_ef_map.push(map);
+    g_ef_dig.push(dig);
+    g_ef_w.push(w);
+    g_ef_vex.push(vex);
+    var nf: i64 = 0;
+    var i: i64 = 0;
+    var n: i64 = str_len(tmpl);
+    while i < n {
+        if str_byte_at(tmpl, i) == 123 {
+            var j: i64 = i + 1;
+            while j < n && str_byte_at(tmpl, j) != 125 {
+                j = j + 1;
+            }
+            var code: i64 = ef_field_code(str_slice(tmpl, i + 1, j));
+            if code == 0 {
+                g_ef_errors.push("row " + int_to_str(id) + " `" + tmpl + "`: no field {" + str_slice(tmpl, i + 1, j) + "}");
+            }
+            if nf < EF_MAXF {
+                g_ef_fields.push(code);
+            }
+            nf = nf + 1;
+            i = j;
+        }
+        i = i + 1;
+    }
+    while nf < EF_MAXF {
+        g_ef_fields.push(0);
+        nf = nf + 1;
+    }
+    return id;
+}
+
+/// An AArch64 / RISC-V row: a general form (prio 1) or an alias (0).
+fn ef_w(arch: i64, base: i64, mask: i64, tmpl: str) -> i64 {
+    return ef_add(arch, base & 0xFFFFFFFF, mask & 0xFFFFFFFF, 1, tmpl, 0, 0, 0, 0, 0);
+}
+
+fn ef_alias(arch: i64, base: i64, mask: i64, tmpl: str) -> i64 {
+    return ef_add(arch, base & 0xFFFFFFFF, mask & 0xFFFFFFFF, 0, tmpl, 0, 0, 0, 0, 0);
+}
+
+/// An x86-64 row: mandatory prefix `pre`, opcode map, opcode, ModRM digit
+/// (-1 /r, -2 none, -3 +r), REX.W rule.
+fn ef_x(pre: i64, map: i64, op: i64, dig: i64, w: i64, tmpl: str) -> i64 {
+    return ef_add(DSM_X64, op, 0, 1, tmpl, pre, map, dig, w, 0);
+}
+
+/// A VEX row: pp as the prefix it stands for, map 1 0F / 2 0F38 / 3 0F3A.
+fn ef_vx(pre: i64, map: i64, op: i64, dig: i64, w: i64, tmpl: str) -> i64 {
+    return ef_add(DSM_X64, op, 0, 1, tmpl, pre, map, dig, w, 1);
+}
+
+/// The field code `k` (0-based) of row `id`.
+fn ef_field(id: i64, k: i64) -> i64 {
+    return g_ef_fields.get(id * EF_MAXF + k);
+}
+
+/// Build the table once.
+pub fn ef_init() {
+    if g_ef_ready {
+        return;
+    }
+    g_ef_ready = true;
+    ef_init_a64();
+    ef_init_rv();
+    ef_init_x64();
+    // match order: per arch, aliases first, then table order
+    var arch: i64 = 1;
+    while arch <= 3 {
+        var prio: i64 = 0;
+        while prio <= 1 {
+            var i: i64 = 0;
+            while i < g_ef_arch.len() {
+                if g_ef_arch.get(i) == arch && g_ef_prio.get(i) == prio {
+                    g_ef_order.push(i);
+                }
+                i = i + 1;
+            }
+            prio = prio + 1;
+        }
+        arch = arch + 1;
+    }
+}
+
+fn ef_init_a64() {
+    var a: i64 = DSM_A64;
+    // Aliases of the forms below (matched first)
+    ef_alias(a, EFW_A64_ORR | 0x3E0, 0xFFE0FFE0, "mov {xd}, {xm}");
+    ef_alias(a, EFW_A64_ORN | 0x3E0, 0xFFE0FFE0, "mvn {xd}, {xm}");
+    ef_alias(a, EFW_A64_SUBS | 0x1F, 0xFF20001F, "cmp {xn}, {xm}{shift}");
+    ef_alias(a, EFW_A64_SUB | 0x3E0, 0xFF2003E0, "neg {xd}, {xm}{shift}");
+    ef_alias(a, EFW_A64_SUBS | 0x3E0, 0xFF2003E0, "negs {xd}, {xm}{shift}");
+    ef_alias(a, EFW_A64_ANDS | 0x1F, 0xFF20001F, "tst {xn}, {xm}{shift}");
+    ef_alias(a, EFW_A64_ADD_IMM | 0x3E0, 0xFFFFFFE0, "mov {xds}, {xns}");
+    ef_alias(a, EFW_A64_ADD_IMM | 0x1F, 0xFFFFFC1F, "mov {xds}, {xns}");
+    ef_alias(a, EFW_A64_SUBS_IMM | 0x1F, 0xFF80001F, "cmp {xns}, #{imm12}{sh12}");
+    ef_alias(a, EFW_A64_ADDS_IMM | 0x1F, 0xFF80001F, "cmn {xns}, #{imm12}{sh12}");
+    ef_alias(a, EFW_A64_MADD | 0x7C00, 0xFFE0FC00, "mul {xd}, {xn}, {xm}");
+    ef_alias(a, EFW_A64_MSUB | 0x7C00, 0xFFE0FC00, "mneg {xd}, {xn}, {xm}");
+    ef_alias(a, EFW_A64_CSINC | 0x1F03E0, 0xFFFF0FE0, "cset {xd}, {ncond}");
+    ef_alias(a, EFW_A64_SBFM | 0x1C00, 0xFFFFFC00, "sxtb {xd}, {wn}");
+    ef_alias(a, EFW_A64_SBFM | 0x3C00, 0xFFFFFC00, "sxth {xd}, {wn}");
+    ef_alias(a, EFW_A64_SBFM | 0x7C00, 0xFFFFFC00, "sxtw {xd}, {wn}");
+    ef_alias(a, EFW_A64_SBFM | 0xFC00, 0xFFC0FC00, "asr {xd}, {xn}, #{immr}");
+    // (uxtb / uxth are 32-bit aliases only: the 64-bit UBFM is ubfx)
+    ef_alias(a, EFW_A64_UBFM | 0x1C00, 0xFFFFFC00, "ubfx {xd}, {xn}, #0, #8");
+    ef_alias(a, EFW_A64_UBFM | 0x3C00, 0xFFFFFC00, "ubfx {xd}, {xn}, #0, #16");
+    ef_alias(a, EFW_A64_UBFM | 0x7C00, 0xFFFFFC00, "ubfx {xd}, {xn}, #0, #32");
+    ef_alias(a, EFW_A64_UBFM | 0xFC00, 0xFFC0FC00, "lsr {xd}, {xn}, #{immr}");
+    ef_alias(a, EFW_A64_UBFM, 0xFFC00000, "lsl {xd}, {xn}, #{lsl6}");
+    // System, branches
+    ef_w(a, EFW_A64_RET, 0xFFFFFFFF, "ret");
+    ef_w(a, EFW_A64_NOP, 0xFFFFFFFF, "nop");
+    ef_w(a, EFW_A64_SVC0, 0xFFFFFFFF, "svc #0");
+    ef_w(a, EFW_A64_BRK, 0xFFE0001F, "brk #{imm16d}");
+    ef_w(a, EFW_A64_DMB_ISH, 0xFFFFFFFF, "dmb ish");
+    ef_w(a, EFW_A64_CLREX, 0xFFFFFFFF, "clrex");
+    ef_w(a, EFW_A64_MRS_TPIDR, 0xFFFFFFE0, "mrs {xd}, tpidr_el0");
+    ef_w(a, EFW_A64_MSR_TPIDR, 0xFFFFFFE0, "msr tpidr_el0, {xd}");
+    ef_w(a, EFW_A64_BLR, 0xFFFFFC1F, "blr {xn}");
+    ef_w(a, EFW_A64_BR, 0xFFFFFC1F, "br {xn}");
+    ef_w(a, EFW_A64_B, 0xFC000000, "b {b26}");
+    ef_w(a, EFW_A64_BL, 0xFC000000, "bl {b26}");
+    ef_w(a, EFW_A64_BCOND, 0xFF000010, "b.{cond0} {b19}");
+    ef_w(a, EFW_A64_CBZ_W, 0xFF000000, "cbz {wd}, {b19}");
+    ef_w(a, EFW_A64_CBNZ_W, 0xFF000000, "cbnz {wd}, {b19}");
+    ef_w(a, EFW_A64_CBZ, 0xFF000000, "cbz {xd}, {b19}");
+    ef_w(a, EFW_A64_CBNZ, 0xFF000000, "cbnz {xd}, {b19}");
+    ef_w(a, EFW_A64_TBZ, 0x7F000000, "tbz {tbr}, #{tbit}, {b14}");
+    ef_w(a, EFW_A64_TBNZ, 0x7F000000, "tbnz {tbr}, #{tbit}, {b14}");
+    ef_w(a, EFW_A64_ADRP, 0x9F000000, "adrp {xd}, {adrp}");
+    ef_w(a, EFW_A64_ADR, 0x9F000000, "adr {xd}, {adr}");
+    // Data processing, immediate and register
+    ef_w(a, EFW_A64_ADD_IMM, 0xFF800000, "add {xds}, {xns}, #{imm12}{sh12}");
+    ef_w(a, EFW_A64_ADDS_IMM, 0xFF800000, "adds {xd}, {xns}, #{imm12}{sh12}");
+    ef_w(a, EFW_A64_SUB_IMM, 0xFF800000, "sub {xds}, {xns}, #{imm12}{sh12}");
+    ef_w(a, EFW_A64_SUBS_IMM, 0xFF800000, "subs {xd}, {xns}, #{imm12}{sh12}");
+    ef_w(a, EFW_A64_ADD_EXT, 0xFFE0FC00, "add {xds}, {xns}, {xm}");
+    ef_w(a, EFW_A64_SUB_EXT, 0xFFE0FC00, "sub {xds}, {xns}, {xm}");
+    ef_w(a, EFW_A64_ADD, 0xFF200000, "add {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_ADDS, 0xFF200000, "adds {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_SUB, 0xFF200000, "sub {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_SUBS, 0xFF200000, "subs {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_AND, 0xFF200000, "and {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_ORR, 0xFF200000, "orr {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_EOR, 0xFF200000, "eor {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_ANDS, 0xFF200000, "ands {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_BIC, 0xFF200000, "bic {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_ORN, 0xFF200000, "orn {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_EON, 0xFF200000, "eon {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_BICS, 0xFF200000, "bics {xd}, {xn}, {xm}{shift}");
+    ef_w(a, EFW_A64_MADD, 0xFFE08000, "madd {xd}, {xn}, {xm}, {xa}");
+    ef_w(a, EFW_A64_MSUB, 0xFFE08000, "msub {xd}, {xn}, {xm}, {xa}");
+    ef_w(a, EFW_A64_SMULH, 0xFFE0FC00, "smulh {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_UMULH, 0xFFE0FC00, "umulh {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_UDIV, 0xFFE0FC00, "udiv {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_SDIV, 0xFFE0FC00, "sdiv {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_LSLV, 0xFFE0FC00, "lsl {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_LSRV, 0xFFE0FC00, "lsr {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_ASRV, 0xFFE0FC00, "asr {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_RORV, 0xFFE0FC00, "ror {xd}, {xn}, {xm}");
+    ef_w(a, EFW_A64_CSINC, 0xFFE00C00, "csinc {xd}, {xn}, {xm}, {cond}");
+    ef_w(a, EFW_A64_CSEL, 0xFFE00C00, "csel {xd}, {xn}, {xm}, {cond}");
+    ef_w(a, EFW_A64_SBFM, 0xFFC00000, "sbfm {xd}, {xn}, #{immr}, #{imms}");
+    ef_w(a, EFW_A64_UBFM, 0xFFC00000, "ubfm {xd}, {xn}, #{immr}, #{imms}");
+    ef_w(a, EFW_A64_MOVZ, 0xFF800000, "movz {xd}, #{imm16}{hw}");
+    ef_w(a, EFW_A64_MOVN, 0xFF800000, "movn {xd}, #{imm16}{hw}");
+    ef_w(a, EFW_A64_MOVK, 0xFF800000, "movk {xd}, #{imm16}{hw}");
+    // Loads and stores: unsigned scaled offset, register offset, pairs
+    ef_w(a, EFW_A64_STRB, 0xFFC00000, "strb {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRB, 0xFFC00000, "ldrb {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRSB, 0xFFC00000, "ldrsb {xd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRSB | 0x00400000, 0xFFC00000, "ldrsb {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_STRH, 0xFFC00000, "strh {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRH, 0xFFC00000, "ldrh {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRSH, 0xFFC00000, "ldrsh {xd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRSH | 0x00400000, 0xFFC00000, "ldrsh {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_STR_W, 0xFFC00000, "str {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDR_W, 0xFFC00000, "ldr {wd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDRSW, 0xFFC00000, "ldrsw {xd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_STR, 0xFFC00000, "str {xd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDR, 0xFFC00000, "ldr {xd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_STR_Q, 0xFFC00000, "str {qd}, [{xns}{uoff}]");
+    ef_w(a, EFW_A64_LDR_Q, 0xFFC00000, "ldr {qd}, [{xns}{uoff}]");
+    // register offset: the imm form & ~(1 << 24) | 1 << 21 | option LSL
+    // (011) << 13 | 1 << 11; S (bit 12) scales the index by the size
+    ef_w(a, (EFW_A64_STRB & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "strb {wd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDRB & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldrb {wd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDRSB & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldrsb {xd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_STRH & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "strh {wd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDRH & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldrh {wd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDRSH & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldrsh {xd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_STR_W & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "str {wd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDR_W & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldr {wd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDRSW & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldrsw {xd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_STR & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "str {xd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, (EFW_A64_LDR & 0xFEFFFFFF) | 0x206800, 0xFFE0EC00, "ldr {xd}, [{xns}, {xm}{rsc}]");
+    ef_w(a, EFW_A64_STP_POST, 0xFFC00000, "stp {xd}, {xt2}, [{xns}], #{simm7}");
+    ef_w(a, EFW_A64_LDP_POST, 0xFFC00000, "ldp {xd}, {xt2}, [{xns}], #{simm7}");
+    ef_w(a, EFW_A64_STP, 0xFFC00000, "stp {xd}, {xt2}, [{xns}, #{simm7}]");
+    ef_w(a, EFW_A64_LDP, 0xFFC00000, "ldp {xd}, {xt2}, [{xns}, #{simm7}]");
+    ef_w(a, EFW_A64_STP_PRE, 0xFFC00000, "stp {xd}, {xt2}, [{xns}, #{simm7}]!");
+    ef_w(a, EFW_A64_LDP_PRE, 0xFFC00000, "ldp {xd}, {xt2}, [{xns}, #{simm7}]!");
+    // Exclusive and acquire/release
+    ef_w(a, EFW_A64_LDAXR, 0xFFFFFC00, "ldaxr {xd}, [{xns}]");
+    ef_w(a, EFW_A64_STLXR, 0xFFE0FC00, "stlxr {wm}, {xd}, [{xns}]");
+    ef_w(a, EFW_A64_LDAR, 0xFFFFFC00, "ldar {xd}, [{xns}]");
+    ef_w(a, EFW_A64_STLR, 0xFFFFFC00, "stlr {xd}, [{xns}]");
+    // Floating point (d for double, s for single)
+    ef_w(a, EFW_A64_FMOV_DX, 0xFFFFFC00, "fmov {dd}, {xn}");
+    ef_w(a, EFW_A64_FMOV_XD, 0xFFFFFC00, "fmov {xd}, {dn}");
+    ef_w(a, EFW_A64_FMOV_SW, 0xFFFFFC00, "fmov {sd}, {wn}");
+    ef_w(a, EFW_A64_FMOV_WS, 0xFFFFFC00, "fmov {wd}, {sn}");
+    ef_w(a, EFW_A64_FCVT_DS, 0xFFFFFC00, "fcvt {dd}, {sn}");
+    ef_w(a, EFW_A64_FCVT_SD, 0xFFFFFC00, "fcvt {sd}, {dn}");
+    ef_w(a, EFW_A64_SCVTF, 0xFFFFFC00, "scvtf {dd}, {xn}");
+    ef_w(a, EFW_A64_FCVTZS, 0xFFFFFC00, "fcvtzs {xd}, {dn}");
+    ef_w(a, EFW_A64_FSQRT, 0xFFFFFC00, "fsqrt {dd}, {dn}");
+    ef_w(a, EFW_A64_FABS, 0xFFFFFC00, "fabs {dd}, {dn}");
+    ef_w(a, EFW_A64_FRINTM, 0xFFFFFC00, "frintm {dd}, {dn}");
+    ef_w(a, EFW_A64_FRINTP, 0xFFFFFC00, "frintp {dd}, {dn}");
+    ef_w(a, EFW_A64_FRINTZ, 0xFFFFFC00, "frintz {dd}, {dn}");
+    ef_w(a, EFW_A64_FRINTA, 0xFFFFFC00, "frinta {dd}, {dn}");
+    ef_w(a, EFW_A64_FMOV_DD, 0xFFFFFC00, "fmov {dd}, {dn}");
+    ef_w(a, EFW_A64_FADD, 0xFFE0FC00, "fadd {dd}, {dn}, {dm}");
+    ef_w(a, EFW_A64_FSUB, 0xFFE0FC00, "fsub {dd}, {dn}, {dm}");
+    ef_w(a, EFW_A64_FMUL, 0xFFE0FC00, "fmul {dd}, {dn}, {dm}");
+    ef_w(a, EFW_A64_FDIV, 0xFFE0FC00, "fdiv {dd}, {dn}, {dm}");
+    ef_w(a, EFW_A64_FCMP, 0xFFE0FC1F, "fcmp {dn}, {dm}");
+    ef_w(a, EFW_A64_FMADD, 0xFFE08000, "fmadd {dd}, {dn}, {dm}, {da}");
+    // NEON (OP21 / TG11 vector forms)
+    ef_w(a, 0x4EE08400, 0xFFE0FC00, "add {vd}.2d, {vn}.2d, {vm}.2d");
+    ef_w(a, 0x6EE08400, 0xFFE0FC00, "sub {vd}.2d, {vn}.2d, {vm}.2d");
+    ef_w(a, 0x4EA08400, 0xFFE0FC00, "add {vd}.4s, {vn}.4s, {vm}.4s");
+    ef_w(a, 0x6EA08400, 0xFFE0FC00, "sub {vd}.4s, {vn}.4s, {vm}.4s");
+    ef_w(a, 0x4EA09C00, 0xFFE0FC00, "mul {vd}.4s, {vn}.4s, {vm}.4s");
+    ef_w(a, 0x4E201C00, 0xFFE0FC00, "and {vd}.16b, {vn}.16b, {vm}.16b");
+    ef_w(a, 0x4EA01C00, 0xFFE0FC00, "orr {vd}.16b, {vn}.16b, {vm}.16b");
+    ef_w(a, 0x6E201C00, 0xFFE0FC00, "eor {vd}.16b, {vn}.16b, {vm}.16b");
+    ef_w(a, 0x4E60D400, 0xFFE0FC00, "fadd {vd}.2d, {vn}.2d, {vm}.2d");
+    ef_w(a, 0x4EE0D400, 0xFFE0FC00, "fsub {vd}.2d, {vn}.2d, {vm}.2d");
+    ef_w(a, 0x6E60DC00, 0xFFE0FC00, "fmul {vd}.2d, {vn}.2d, {vm}.2d");
+    ef_w(a, 0x6E60FC00, 0xFFE0FC00, "fdiv {vd}.2d, {vn}.2d, {vm}.2d");
+    ef_w(a, 0x4E080C00, 0xFFFFFC00, "dup {vd}.2d, {xn}");
+    ef_w(a, 0x5EF1B800, 0xFFFFFC00, "addp {dd}, {vn}.2d");
+    ef_w(a, 0x4E083C00, 0xFFEFFC00, "mov {xd}, {vn}.d[{idx1}]");
+    ef_w(a, 0x4E081C00, 0xFFEFFC00, "mov {vd}.d[{idx1}], {xn}");
+    ef_w(a, 0x4EE0D800, 0xFFFFFC00, "fcmeq {vd}.2d, {vn}.2d, #0.0");
+}
+
+fn ef_init_rv() {
+    var r: i64 = DSM_RV64;
+    // Aliases
+    ef_alias(r, 0x00000013, 0xFFFFFFFF, "nop");
+    ef_alias(r, EFW_RV_ADDI, 0x000F807F, "li {rd}, {immi}");
+    ef_alias(r, EFW_RV_ADDI, 0xFFF0707F, "mv {rd}, {rs1}");
+    ef_alias(r, EFW_RV_SUB, 0xFE0FF07F, "neg {rd}, {rs2}");
+    ef_alias(r, EFW_RV_SLTIU | 0x00100000, 0xFFF0707F, "seqz {rd}, {rs1}");
+    ef_alias(r, EFW_RV_XORI | 0xFFF00000, 0xFFF0707F, "not {rd}, {rs1}");
+    ef_alias(r, EFW_RV_ADDIW, 0xFFF0707F, "sext.w {rd}, {rs1}");
+    ef_alias(r, EFW_RV_BEQ, 0x01F0707F, "beqz {rs1}, {boff}");
+    ef_alias(r, EFW_RV_BEQ | 0x1000, 0x01F0707F, "bnez {rs1}, {boff}");
+    ef_alias(r, EFW_RV_JAL, 0x00000FFF, "j {joff}");
+    ef_alias(r, EFW_RV_JAL | 0x80, 0x00000FFF, "jal {joff}");
+    ef_alias(r, EFW_RV_JALR | 0x8000, 0xFFFFFFFF, "ret");
+    ef_alias(r, EFW_RV_JALR, 0xFFF07FFF, "jr {rs1}");
+    ef_alias(r, EFW_RV_JALR | 0x80, 0xFFF07FFF, "jalr {rs1}");
+    ef_alias(r, EFW_RV_FSGNJ_D, 0xFE00707F, "fmv.d {fd}, {fsame}");
+    // R-type
+    ef_w(r, EFW_RV_ADD, 0xFE00707F, "add {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SLL, 0xFE00707F, "sll {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SLT, 0xFE00707F, "slt {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SLTU, 0xFE00707F, "sltu {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_XOR, 0xFE00707F, "xor {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SRL, 0xFE00707F, "srl {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_OR, 0xFE00707F, "or {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_AND, 0xFE00707F, "and {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SUB, 0xFE00707F, "sub {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SRA, 0xFE00707F, "sra {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MUL, 0xFE00707F, "mul {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULH, 0xFE00707F, "mulh {rd}, {rs1}, {rs2}");
+    ef_w(r, 0x02002033, 0xFE00707F, "mulhsu {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULHU, 0xFE00707F, "mulhu {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_DIV, 0xFE00707F, "div {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_DIVU, 0xFE00707F, "divu {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_REM, 0xFE00707F, "rem {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_REMU, 0xFE00707F, "remu {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SH1ADD, 0xFE00707F, "sh1add {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SH1ADD + 0x2000, 0xFE00707F, "sh2add {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SH1ADD + 0x4000, 0xFE00707F, "sh3add {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_ANDN, 0xFE00707F, "andn {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_CZERO_EQZ, 0xFE00707F, "czero.eqz {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_CZERO_NEZ, 0xFE00707F, "czero.nez {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_ZEXT_W, 0xFFF0707F, "zext.w {rd}, {rs1}");
+    ef_w(r, EFW_RV_ZEXT_H, 0xFFF0707F, "zext.h {rd}, {rs1}");
+    ef_w(r, EFW_RV_ADDW, 0xFE00707F, "addw {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_SUBW, 0xFE00707F, "subw {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULW, 0xFE00707F, "mulw {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULW | 0x4000, 0xFE00707F, "divw {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULW | 0x5000, 0xFE00707F, "divuw {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULW | 0x6000, 0xFE00707F, "remw {rd}, {rs1}, {rs2}");
+    ef_w(r, EFW_RV_MULW | 0x7000, 0xFE00707F, "remuw {rd}, {rs1}, {rs2}");
+    // I-type
+    ef_w(r, EFW_RV_ADDI, 0x0000707F, "addi {rd}, {rs1}, {immi}");
+    ef_w(r, EFW_RV_SEXT_B, 0xFFF0707F, "sext.b {rd}, {rs1}");
+    ef_w(r, EFW_RV_SEXT_H, 0xFFF0707F, "sext.h {rd}, {rs1}");
+    ef_w(r, EFW_RV_SLLI, 0xFC00707F, "slli {rd}, {rs1}, {shamt6}");
+    ef_w(r, EFW_RV_SRLI, 0xFC00707F, "srli {rd}, {rs1}, {shamt6}");
+    ef_w(r, EFW_RV_SRAI, 0xFC00707F, "srai {rd}, {rs1}, {shamt6}");
+    ef_w(r, 0x00002013, 0x0000707F, "slti {rd}, {rs1}, {immi}");
+    ef_w(r, EFW_RV_SLTIU, 0x0000707F, "sltiu {rd}, {rs1}, {immi}");
+    ef_w(r, EFW_RV_XORI, 0x0000707F, "xori {rd}, {rs1}, {immi}");
+    ef_w(r, 0x00006013, 0x0000707F, "ori {rd}, {rs1}, {immi}");
+    ef_w(r, EFW_RV_ANDI, 0x0000707F, "andi {rd}, {rs1}, {immi}");
+    ef_w(r, EFW_RV_ADDIW, 0x0000707F, "addiw {rd}, {rs1}, {immi}");
+    ef_w(r, 0x0000101B, 0xFE00707F, "slliw {rd}, {rs1}, {shamt5}");
+    ef_w(r, 0x0000501B, 0xFE00707F, "srliw {rd}, {rs1}, {shamt5}");
+    ef_w(r, 0x4000501B, 0xFE00707F, "sraiw {rd}, {rs1}, {shamt5}");
+    // Loads and stores
+    ef_w(r, 0x00000003, 0x0000707F, "lb {rd}, {immi}({rs1})");
+    ef_w(r, 0x00001003, 0x0000707F, "lh {rd}, {immi}({rs1})");
+    ef_w(r, 0x00002003, 0x0000707F, "lw {rd}, {immi}({rs1})");
+    ef_w(r, EFW_RV_LD, 0x0000707F, "ld {rd}, {immi}({rs1})");
+    ef_w(r, 0x00004003, 0x0000707F, "lbu {rd}, {immi}({rs1})");
+    ef_w(r, 0x00005003, 0x0000707F, "lhu {rd}, {immi}({rs1})");
+    ef_w(r, 0x00006003, 0x0000707F, "lwu {rd}, {immi}({rs1})");
+    ef_w(r, 0x00000023, 0x0000707F, "sb {rs2}, {immst}({rs1})");
+    ef_w(r, 0x00001023, 0x0000707F, "sh {rs2}, {immst}({rs1})");
+    ef_w(r, 0x00002023, 0x0000707F, "sw {rs2}, {immst}({rs1})");
+    ef_w(r, EFW_RV_SD, 0x0000707F, "sd {rs2}, {immst}({rs1})");
+    ef_w(r, 0x00002007, 0x0000707F, "flw {fd}, {immi}({rs1})");
+    ef_w(r, EFW_RV_FLD, 0x0000707F, "fld {fd}, {immi}({rs1})");
+    ef_w(r, 0x00002027, 0x0000707F, "fsw {fs2}, {immst}({rs1})");
+    ef_w(r, EFW_RV_FSD, 0x0000707F, "fsd {fs2}, {immst}({rs1})");
+    // Branches and jumps
+    ef_w(r, EFW_RV_BEQ, 0x0000707F, "beq {rs1}, {rs2}, {boff}");
+    ef_w(r, EFW_RV_BEQ | 0x1000, 0x0000707F, "bne {rs1}, {rs2}, {boff}");
+    ef_w(r, EFW_RV_BEQ | 0x4000, 0x0000707F, "blt {rs1}, {rs2}, {boff}");
+    ef_w(r, EFW_RV_BEQ | 0x5000, 0x0000707F, "bge {rs1}, {rs2}, {boff}");
+    ef_w(r, EFW_RV_BEQ | 0x6000, 0x0000707F, "bltu {rs1}, {rs2}, {boff}");
+    ef_w(r, EFW_RV_BEQ | 0x7000, 0x0000707F, "bgeu {rs1}, {rs2}, {boff}");
+    ef_w(r, EFW_RV_JAL, 0x0000007F, "jal {rd}, {joff}");
+    ef_w(r, EFW_RV_JALR, 0x0000707F, "jalr {rd}, {immi}({rs1})");
+    ef_w(r, EFW_RV_LUI, 0x0000007F, "lui {rd}, {uimm20}");
+    ef_w(r, EFW_RV_AUIPC, 0x0000007F, "auipc {rd}, {uimm20}");
+    ef_w(r, EFW_RV_ECALL, 0xFFFFFFFF, "ecall");
+    ef_w(r, EFW_RV_EBREAK, 0xFFFFFFFF, "ebreak");
+    ef_w(r, EFW_RV_FENCE_RW, 0xFFFFFFFF, "fence rw, rw");
+    ef_w(r, 0x0000000F, 0x0000007F, "fence");
+    // Atomics (A)
+    ef_w(r, EFW_RV_LR_D, 0xF9F0707F, "lr.d{aqrl} {rd}, ({rs1})");
+    ef_w(r, EFW_RV_SC_D, 0xF800707F, "sc.d{aqrl} {rd}, {rs2}, ({rs1})");
+    ef_w(r, EFW_RV_AMOADD_D, 0xF800707F, "amoadd.d{aqrl} {rd}, {rs2}, ({rs1})");
+    ef_w(r, EFW_RV_AMOSWAP_D, 0xF800707F, "amoswap.d{aqrl} {rd}, {rs2}, ({rs1})");
+    // Floating point (D, and the conversions to and from S)
+    ef_w(r, EFW_RV_FADD_D, 0xFE00007F, "fadd.d {fd}, {fs1}, {fs2}{rmd}");
+    ef_w(r, EFW_RV_FSUB_D, 0xFE00007F, "fsub.d {fd}, {fs1}, {fs2}{rmd}");
+    ef_w(r, EFW_RV_FMUL_D, 0xFE00007F, "fmul.d {fd}, {fs1}, {fs2}{rmd}");
+    ef_w(r, EFW_RV_FDIV_D, 0xFE00007F, "fdiv.d {fd}, {fs1}, {fs2}{rmd}");
+    ef_w(r, EFW_RV_FSQRT_D, 0xFE00007F, "fsqrt.d {fd}, {fs1}{rmd}");
+    ef_w(r, EFW_RV_FSGNJ_D, 0xFE00707F, "fsgnj.d {fd}, {fs1}, {fs2}");
+    ef_w(r, EFW_RV_FSGNJN_D, 0xFE00707F, "fsgnjn.d {fd}, {fs1}, {fs2}");
+    ef_w(r, EFW_RV_FSGNJX_D, 0xFE00707F, "fsgnjx.d {fd}, {fs1}, {fs2}");
+    ef_w(r, EFW_RV_FLE_D, 0xFE00707F, "fle.d {rd}, {fs1}, {fs2}");
+    ef_w(r, EFW_RV_FLT_D, 0xFE00707F, "flt.d {rd}, {fs1}, {fs2}");
+    ef_w(r, EFW_RV_FEQ_D, 0xFE00707F, "feq.d {rd}, {fs1}, {fs2}");
+    ef_w(r, EFW_RV_FCVT_D_L, 0xFFF0007F, "fcvt.d.l {fd}, {rs1}{rmd}");
+    ef_w(r, EFW_RV_FCVT_D_W, 0xFE00007F, "fcvt.d.w {fd}, {rs1}");
+    ef_w(r, EFW_RV_FCVT_L_D, 0xFFF0007F, "fcvt.l.d {rd}, {fs1}, {rm}");
+    ef_w(r, EFW_RV_FCVT_W_D, 0xFE00007F, "fcvt.w.d {rd}, {fs1}, {rm}");
+    ef_w(r, EFW_RV_FCVT_D_S, 0xFFF0007F, "fcvt.d.s {fd}, {fs1}");
+    ef_w(r, EFW_RV_FCVT_S_D, 0xFFF0007F, "fcvt.s.d {fd}, {fs1}{rmd}");
+    ef_w(r, EFW_RV_FMV_DX, 0xFE00007F, "fmv.d.x {fd}, {rs1}");
+    ef_w(r, EFW_RV_FMV_XD, 0xFE00007F, "fmv.x.d {rd}, {fs1}");
+    ef_w(r, EFW_RV_FMV_WX, 0xFE00007F, "fmv.w.x {fd}, {rs1}");
+    ef_w(r, EFW_RV_FMV_XW, 0xFE00007F, "fmv.x.w {rd}, {fs1}");
+    ef_w(r, EFW_RV_FMADD_D, 0x0600007F, "fmadd.d {fd}, {fs1}, {fs2}, {fs3}");
+    // Vector (V 1.0; OP21 / TG11)
+    ef_w(r, 0x00007057, 0x8000707F, "vsetvli {rd}, {rs1}, {vtype}");
+    ef_w(r, 0x02000007, 0xFFF0707F, "vle8.v {rvd}, ({rs1})");
+    ef_w(r, 0x02005007, 0xFFF0707F, "vle16.v {rvd}, ({rs1})");
+    ef_w(r, 0x02006007, 0xFFF0707F, "vle32.v {rvd}, ({rs1})");
+    ef_w(r, 0x02007007, 0xFFF0707F, "vle64.v {rvd}, ({rs1})");
+    ef_w(r, 0x02000027, 0xFFF0707F, "vse8.v {rvd}, ({rs1})");
+    ef_w(r, 0x02005027, 0xFFF0707F, "vse16.v {rvd}, ({rs1})");
+    ef_w(r, 0x02006027, 0xFFF0707F, "vse32.v {rvd}, ({rs1})");
+    ef_w(r, 0x02007027, 0xFFF0707F, "vse64.v {rvd}, ({rs1})");
+    ef_w(r, 0x02000057, 0xFE00707F, "vadd.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x0A000057, 0xFE00707F, "vsub.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x96002057, 0xFE00707F, "vmul.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x26000057, 0xFE00707F, "vand.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x2A000057, 0xFE00707F, "vor.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x2E000057, 0xFE00707F, "vxor.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x02001057, 0xFE00707F, "vfadd.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x0A001057, 0xFE00707F, "vfsub.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x92001057, 0xFE00707F, "vfmul.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x82001057, 0xFE00707F, "vfdiv.vv {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x02002057, 0xFE00707F, "vredsum.vs {rvd}, {rvs2}, {rvs1}");
+    ef_w(r, 0x42002057, 0xFE0FF07F, "vmv.x.s {rd}, {rvs2}");
+    ef_w(r, 0x5E004057, 0xFFF0707F, "vmv.v.x {rvd}, {rs1}");
+}
+
+fn ef_init_x64() {
+    // ALU: add or adc sbb and sub xor cmp, the four r/m forms and the
+    // accumulator forms (op = n << 3 | form)
+    var alu: Vec<str> = str_split("add,or,adc,sbb,and,sub,xor,cmp", ",");
+    var n: i64 = 0;
+    while n < 8 {
+        var nm: str = alu.get(n);
+        ef_x(-1, 0, (n << 3) | 0, -1, -1, nm + " {rm8}, {r8}");
+        ef_x(-1, 0, (n << 3) | 1, -1, -1, nm + " {rm}, {r}");
+        ef_x(-1, 0, (n << 3) | 2, -1, -1, nm + " {r8}, {rm8}");
+        ef_x(-1, 0, (n << 3) | 3, -1, -1, nm + " {r}, {rm}");
+        ef_x(-1, 0, (n << 3) | 4, -2, -1, nm + " al, {ibx}");
+        ef_x(-1, 0, (n << 3) | 5, -2, -1, nm + " {acc}, {sz}");
+        // group 1: 80 /n ib, 81 /n iz, 83 /n ib (sign-extended)
+        ef_x(-1, 0, 0x80, n, -1, nm + " {rm8s}, {ibx}");
+        ef_x(-1, 0, 0x81, n, -1, nm + " {rms}, {sz}");
+        ef_x(-1, 0, 0x83, n, -1, nm + " {rms}, {sb}");
+        n = n + 1;
+    }
+    ef_x(-1, 0, 0x63, -1, -1, "movsxd {r64}, {rm32s}");
+    ef_x(-1, 0, 0x69, -1, -1, "imul {r}, {rm}, {sz}");
+    ef_x(-1, 0, 0x6B, -1, -1, "imul {r}, {rm}, {sb}");
+    ef_x(-1, 0, 0x84, -1, -1, "test {rm8}, {r8}");
+    ef_x(-1, 0, 0x85, -1, -1, "test {rm}, {r}");
+    ef_x(-1, 0, 0x86, -1, -1, "xchg {rm8}, {r8}");
+    ef_x(-1, 0, 0x87, -1, -1, "xchg {rm}, {r}");
+    ef_x(-1, 0, 0x88, -1, -1, "mov {rm8}, {r8}");
+    ef_x(-1, 0, 0x89, -1, -1, "mov {rm}, {r}");
+    ef_x(-1, 0, 0x8A, -1, -1, "mov {r8}, {rm8}");
+    ef_x(-1, 0, 0x8B, -1, -1, "mov {r}, {rm}");
+    ef_x(-1, 0, 0x8D, -1, -1, "lea {r}, {rm}");
+    ef_x(-1, 0, 0xA8, -2, -1, "test al, {ibx}");
+    ef_x(-1, 0, 0xA9, -2, -1, "test {acc}, {sz}");
+    ef_x(-1, 0, 0xB8, -3, 1, "mov {oreg}, {iq}");
+    ef_x(-1, 0, 0xB8, -3, 0, "mov {oreg}, {uz}");
+    // shifts: C0/C1 /n ib, D0/D1 /n by 1, D2/D3 /n by cl
+    var shn: Vec<str> = str_split("rol,ror,rcl,rcr,shl,shr,sal,sar", ",");
+    n = 0;
+    while n < 8 {
+        var sn: str = shn.get(n);
+        ef_x(-1, 0, 0xC0, n, -1, sn + " {rm8s}, {ib}");
+        ef_x(-1, 0, 0xC1, n, -1, sn + " {rms}, {ib}");
+        ef_x(-1, 0, 0xD0, n, -1, sn + " {rm8s}, 1");
+        ef_x(-1, 0, 0xD1, n, -1, sn + " {rms}, 1");
+        ef_x(-1, 0, 0xD2, n, -1, sn + " {rm8s}, cl");
+        ef_x(-1, 0, 0xD3, n, -1, sn + " {rms}, cl");
+        n = n + 1;
+    }
+    ef_x(-1, 0, 0xC6, 0, -1, "mov {rm8s}, {ibx}");
+    ef_x(-1, 0, 0xC7, 0, -1, "mov {rms}, {sz}");
+    // group 3: F6 / F7
+    ef_x(-1, 0, 0xF6, 0, -1, "test {rm8s}, {ibx}");
+    ef_x(-1, 0, 0xF6, 1, -1, "test {rm8s}, {ibx}");
+    ef_x(-1, 0, 0xF7, 0, -1, "test {rms}, {sz}");
+    ef_x(-1, 0, 0xF7, 1, -1, "test {rms}, {sz}");
+    var g3: Vec<str> = str_split("test,test,not,neg,mul,imul,div,idiv", ",");
+    n = 2;
+    while n < 8 {
+        ef_x(-1, 0, 0xF6, n, -1, g3.get(n) + " {rm8s}");
+        ef_x(-1, 0, 0xF7, n, -1, g3.get(n) + " {rms}");
+        n = n + 1;
+    }
+    // group 5: FF
+    ef_x(-1, 0, 0xFF, 0, -1, "inc {rms}");
+    ef_x(-1, 0, 0xFF, 1, -1, "dec {rms}");
+    ef_x(-1, 0, 0xFF, 2, -1, "call {rm64}");
+    ef_x(-1, 0, 0xFF, 4, -1, "jmp {rm64}");
+    ef_x(-1, 0, 0xFF, 6, -1, "push {rm64}");
+    // Two-byte (0F) integer forms
+    var cc: Vec<str> = str_split("o,no,b,ae,e,ne,be,a,s,ns,p,np,l,ge,le,g", ",");
+    n = 0;
+    while n < 16 {
+        ef_x(-1, 1, 0x40 + n, -1, -1, "cmov" + cc.get(n) + " {r}, {rm}");
+        ef_x(-1, 1, 0x90 + n, -1, -1, "set" + cc.get(n) + " {rm8s}");
+        n = n + 1;
+    }
+    ef_x(-1, 1, 0x1F, -1, -1, "nop {rms}");
+    ef_x(-1, 1, 0xAF, -1, -1, "imul {r}, {rm}");
+    ef_x(-1, 1, 0xB6, -1, -1, "movzx {r}, {rm8s}");
+    ef_x(-1, 1, 0xB7, -1, -1, "movzx {r}, {rm16s}");
+    ef_x(-1, 1, 0xBE, -1, -1, "movsx {r}, {rm8s}");
+    ef_x(-1, 1, 0xBF, -1, -1, "movsx {r}, {rm16s}");
+    ef_x(-1, 1, 0xBA, 4, -1, "bt {rm}, {ib}");
+    ef_x(-1, 1, 0xC1, -1, -1, "xadd {rm}, {r}");
+    ef_x(-1, 1, 0xB1, -1, -1, "cmpxchg {rm}, {r}");
+    // SSE2 / SSE4.1 scalar and packed forms
+    ef_x(0x66, 1, 0x6E, -1, -1, "mov{dq} {x}, {rmw}");
+    ef_x(0x66, 1, 0x7E, -1, -1, "mov{dq} {rmw}, {x}");
+    ef_x(0xF2, 1, 0x2A, -1, -1, "cvtsi2sd {x}, {rmws}");
+    ef_x(0xF2, 1, 0x2C, -1, -1, "cvttsd2si {rw}, {xrm}");
+    ef_x(0x66, 3, 0x0B, -1, -1, "roundsd {x}, {xrm}, {ib}");
+    ef_x(0xF2, 1, 0x58, -1, -1, "addsd {x}, {xrm}");
+    ef_x(0xF2, 1, 0x5C, -1, -1, "subsd {x}, {xrm}");
+    ef_x(0xF2, 1, 0x59, -1, -1, "mulsd {x}, {xrm}");
+    ef_x(0xF2, 1, 0x5E, -1, -1, "divsd {x}, {xrm}");
+    ef_x(0xF2, 1, 0x51, -1, -1, "sqrtsd {x}, {xrm}");
+    ef_x(0xF2, 1, 0x5A, -1, -1, "cvtsd2ss {x}, {xrm}");
+    ef_x(0xF2, 1, 0x10, -1, -1, "movsd {x}, {xrm}");
+    ef_x(0xF2, 1, 0x11, -1, -1, "movsd {xrm}, {x}");
+    ef_x(0xF3, 1, 0x5A, -1, -1, "cvtss2sd {x}, {xrm}");
+    ef_x(0xF3, 1, 0x10, -1, -1, "movss {x}, {xrm}");
+    ef_x(0xF3, 1, 0x11, -1, -1, "movss {xrm}, {x}");
+    ef_x(0xF3, 1, 0x7E, -1, -1, "movq {x}, {xrm}");
+    ef_x(0xF3, 1, 0x6F, -1, -1, "movdqu {x}, {xrm}");
+    ef_x(0xF3, 1, 0x7F, -1, -1, "movdqu {xrm}, {x}");
+    ef_x(0x66, 1, 0x2E, -1, -1, "ucomisd {x}, {xrm}");
+    ef_x(0x66, 1, 0x2F, -1, -1, "comisd {x}, {xrm}");
+    ef_x(0x66, 1, 0x57, -1, -1, "xorpd {x}, {xrm}");
+    ef_x(0x66, 1, 0x54, -1, -1, "andpd {x}, {xrm}");
+    ef_x(0x66, 1, 0xEF, -1, -1, "pxor {x}, {xrm}");
+    ef_x(0x66, 1, 0xD6, -1, -1, "movq {xrm}, {x}");
+    ef_x(0x66, 1, 0xD4, -1, -1, "paddq {x}, {xrm}");
+    ef_x(0x66, 1, 0xFB, -1, -1, "psubq {x}, {xrm}");
+    ef_x(0x66, 1, 0xFE, -1, -1, "paddd {x}, {xrm}");
+    ef_x(0x66, 1, 0xFA, -1, -1, "psubd {x}, {xrm}");
+    ef_x(0x66, 2, 0x40, -1, -1, "pmulld {x}, {xrm}");
+    ef_x(0x66, 1, 0xDB, -1, -1, "pand {x}, {xrm}");
+    ef_x(0x66, 1, 0xEB, -1, -1, "por {x}, {xrm}");
+    ef_x(0x66, 1, 0x58, -1, -1, "addpd {x}, {xrm}");
+    ef_x(0x66, 1, 0x5C, -1, -1, "subpd {x}, {xrm}");
+    ef_x(0x66, 1, 0x59, -1, -1, "mulpd {x}, {xrm}");
+    ef_x(0x66, 1, 0x5E, -1, -1, "divpd {x}, {xrm}");
+    ef_x(0x66, 1, 0x70, -1, -1, "pshufd {x}, {xrm}, {ib}");
+    ef_x(0x66, 1, 0x6C, -1, -1, "punpcklqdq {x}, {xrm}");
+    ef_x(0x66, 1, 0xC2, -1, -1, "cmppd {x}, {xrm}, {ib}");
+    ef_x(0, 1, 0x28, -1, -1, "movaps {x}, {xrm}");
+    ef_x(0, 1, 0x29, -1, -1, "movaps {xrm}, {x}");
+    ef_x(0, 1, 0x57, -1, -1, "xorps {x}, {xrm}");
+    // VEX: BMI1/BMI2, FMA, AVX/AVX2 (the vector forms of x64_vvec)
+    ef_vx(0x66, 2, 0xF7, -1, -1, "shlx {r64}, {rm64}, {gv}");
+    ef_vx(0xF3, 2, 0xF7, -1, -1, "sarx {r64}, {rm64}, {gv}");
+    ef_vx(0xF2, 2, 0xF7, -1, -1, "shrx {r64}, {rm64}, {gv}");
+    ef_vx(0, 2, 0xF7, -1, -1, "bextr {r64}, {rm64}, {gv}");
+    ef_vx(0, 2, 0xF2, -1, -1, "andn {r64}, {gv}, {rm64}");
+    ef_vx(0, 2, 0xF3, 1, -1, "blsr {gv}, {rm64}");
+    ef_vx(0x66, 2, 0xA9, -1, 1, "vfmadd213sd {x}, {xv}, {xrm}");
+    ef_vx(0x66, 2, 0x59, -1, 0, "vpbroadcastq {v}, {xrm}");
+    ef_vx(0xF3, 1, 0x6F, -1, -1, "vmovdqu {v}, {vrm}");
+    ef_vx(0xF3, 1, 0x7F, -1, -1, "vmovdqu {vrm}, {v}");
+    ef_vx(0x66, 1, 0xC2, -1, -1, "vcmppd {v}, {vv}, {vrm}, {ib}");
+    ef_vx(0x66, 1, 0xD4, -1, -1, "vpaddq {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0xFB, -1, -1, "vpsubq {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0xFE, -1, -1, "vpaddd {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0xFA, -1, -1, "vpsubd {v}, {vv}, {vrm}");
+    ef_vx(0x66, 2, 0x40, -1, -1, "vpmulld {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0xDB, -1, -1, "vpand {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0xEB, -1, -1, "vpor {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0xEF, -1, -1, "vpxor {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0x58, -1, -1, "vaddpd {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0x5C, -1, -1, "vsubpd {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0x59, -1, -1, "vmulpd {v}, {vv}, {vrm}");
+    ef_vx(0x66, 1, 0x5E, -1, -1, "vdivpd {v}, {vv}, {vrm}");
+}
+
+// --- Using the table ---------------------------------------------------------
+
+/// The id of the row whose template is `tmpl` (first in table order), -1
+/// when none. For tools and tests; the encoders use the EFW_* words.
+pub fn ef_id(arch: i64, tmpl: str) -> i64 {
+    ef_init();
+    var i: i64 = 0;
+    while i < g_ef_arch.len() {
+        if g_ef_arch.get(i) == arch && g_ef_tmpl.get(i) == tmpl {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+pub fn ef_count() -> i64 {
+    ef_init();
+    return g_ef_arch.len();
+}
+
+pub fn ef_arch(id: i64) -> i64 {
+    ef_init();
+    return g_ef_arch.get(id);
+}
+
+pub fn ef_template(id: i64) -> str {
+    ef_init();
+    return g_ef_tmpl.get(id);
+}
+
+pub fn ef_base(id: i64) -> i64 {
+    ef_init();
+    return g_ef_base.get(id);
+}
+
+pub fn ef_mask(id: i64) -> i64 {
+    ef_init();
+    return g_ef_mask.get(id);
+}
+
+/// The bits of an AArch64 / RISC-V field holding `v` (the encoder side).
+@wrapping fn ef_put(code: i64, v: i64) -> i64 {
+    if code == EFF_XD || code == EFF_XDS || code == EFF_WD || code == EFF_DD || code == EFF_SD || code == EFF_QD || code == EFF_VD {
+        return v & 31;
+    }
+    if code == EFF_XN || code == EFF_XNS || code == EFF_WN || code == EFF_DN || code == EFF_SN || code == EFF_VN {
+        return (v & 31) << 5;
+    }
+    if code == EFF_XM || code == EFF_WM || code == EFF_DM || code == EFF_VM {
+        return (v & 31) << 16;
+    }
+    if code == EFF_XA || code == EFF_DA || code == EFF_XT2 {
+        return (v & 31) << 10;
+    }
+    if code == EFF_IMM12 {
+        return (v & 0xFFF) << 10;
+    }
+    if code == EFF_SH12 {
+        return (v & 1) << 22;
+    }
+    if code == EFF_SHIFT {
+        // amount | kind << 6 (kind 0 lsl, 1 lsr, 2 asr, 3 ror)
+        return ((v & 63) << 10) | (((v >> 6) & 3) << 22);
+    }
+    if code == EFF_COND {
+        return (v & 15) << 12;
+    }
+    if code == EFF_NCOND {
+        return ((v ^ 1) & 15) << 12;
+    }
+    if code == EFF_COND0 {
+        return v & 15;
+    }
+    if code == EFF_IMMR {
+        return (v & 63) << 16;
+    }
+    if code == EFF_IMMS {
+        return (v & 63) << 10;
+    }
+    if code == EFF_LSL6 {
+        return (((64 - v) & 63) << 16) | (((63 - v) & 63) << 10);
+    }
+    if code == EFF_IMM16 || code == EFF_IMM16D {
+        return (v & 0xFFFF) << 5;
+    }
+    if code == EFF_HW {
+        // the shift in bits: 0, 16, 32, 48
+        return ((v >> 4) & 3) << 21;
+    }
+    if code == EFF_B26 {
+        return v & 0x3FFFFFF;
+    }
+    if code == EFF_B19 {
+        return (v & 0x7FFFF) << 5;
+    }
+    if code == EFF_B14 {
+        return (v & 0x3FFF) << 5;
+    }
+    if code == EFF_TBIT {
+        return (((v >> 5) & 1) << 31) | ((v & 31) << 19);
+    }
+    if code == EFF_TBR {
+        return v & 31;
+    }
+    if code == EFF_ADRP || code == EFF_ADR {
+        // pages (adrp) or bytes (adr)
+        return ((v & 3) << 29) | (((v >> 2) & 0x7FFFF) << 5);
+    }
+    if code == EFF_UOFF {
+        // the 12-bit field (ef_word scales a byte offset into it)
+        return (v & 0xFFF) << 10;
+    }
+    if code == EFF_RSC {
+        return (v & 1) << 12;
+    }
+    if code == EFF_SIMM7 {
+        // a byte offset, a multiple of 8
+        return ((v >> 3) & 0x7F) << 15;
+    }
+    if code == EFF_IDX1 {
+        return (v & 1) << 20;
+    }
+    if code == EFF_RD || code == EFF_FD || code == EFF_RVD {
+        return (v & 31) << 7;
+    }
+    if code == EFF_RS1 || code == EFF_FS1 || code == EFF_RVS1 {
+        return (v & 31) << 15;
+    }
+    if code == EFF_RS2 || code == EFF_FS2 || code == EFF_RVS2 {
+        return (v & 31) << 20;
+    }
+    if code == EFF_FS3 {
+        return (v & 31) << 27;
+    }
+    if code == EFF_FSAME {
+        return ((v & 31) << 15) | ((v & 31) << 20);
+    }
+    if code == EFF_IMMI {
+        return (v & 0xFFF) << 20;
+    }
+    if code == EFF_IMMST {
+        return (((v >> 5) & 0x7F) << 25) | ((v & 0x1F) << 7);
+    }
+    if code == EFF_SHAMT6 {
+        return (v & 63) << 20;
+    }
+    if code == EFF_SHAMT5 {
+        return (v & 31) << 20;
+    }
+    if code == EFF_BOFF {
+        return (((v >> 12) & 1) << 31) | (((v >> 5) & 0x3F) << 25) | (((v >> 1) & 0xF) << 8) | (((v >> 11) & 1) << 7);
+    }
+    if code == EFF_JOFF {
+        return (((v >> 20) & 1) << 31) | (((v >> 1) & 0x3FF) << 21) | (((v >> 11) & 1) << 20) | (((v >> 12) & 0xFF) << 12);
+    }
+    if code == EFF_UIMM20 {
+        return (v & 0xFFFFF) << 12;
+    }
+    if code == EFF_RM || code == EFF_RMD {
+        return (v & 7) << 12;
+    }
+    if code == EFF_VTYPE {
+        return (v & 0x7FF) << 20;
+    }
+    if code == EFF_AQRL {
+        // 1 rl, 2 aq, 3 both
+        return (v & 3) << 25;
+    }
+    return 0;
+}
+
+/// The bits a field occupies (for ef_check).
+@wrapping fn ef_field_bits(code: i64) -> i64 {
+    if code == EFF_SHIFT {
+        return (63 << 10) | (3 << 22);
+    }
+    if code == EFF_LSL6 {
+        return (63 << 16) | (63 << 10);
+    }
+    if code == EFF_HW {
+        return 3 << 21;
+    }
+    if code == EFF_TBIT {
+        return (1 << 31) | (31 << 19);
+    }
+    if code == EFF_ADRP || code == EFF_ADR {
+        return (3 << 29) | (0x7FFFF << 5);
+    }
+    if code == EFF_SIMM7 {
+        return 0x7F << 15;
+    }
+    if code == EFF_BOFF {
+        return (1 << 31) | (0x3F << 25) | (0xF << 8) | (1 << 7);
+    }
+    if code == EFF_JOFF {
+        return 0xFFFFF << 12;
+    }
+    if code == EFF_IMMST {
+        return (0x7F << 25) | (0x1F << 7);
+    }
+    if code == EFF_B26 {
+        return 0x3FFFFFF;
+    }
+    if code == EFF_B19 {
+        return 0x7FFFF << 5;
+    }
+    if code == EFF_B14 {
+        return 0x3FFF << 5;
+    }
+    if code == EFF_NCOND {
+        return 15 << 12;
+    }
+    if code == EFF_HW {
+        return 3 << 21;
+    }
+    // a field whose ef_put of all ones is its bits
+    return ef_put(code, 0 - 1) & 0xFFFFFFFF;
+}
+
+/// AArch64 / RISC-V: the word of row `id` with operands a, b, c, d in the
+/// order its template names them (unused ones 0). `ef_word(ef_id(DSM_A64,
+/// "add {xd}, {xn}, {xm}{shift}"), 0, 1, 2, 0)` is `add x0, x1, x2`.
+@wrapping pub fn ef_word(id: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    ef_init();
+    var w: i64 = g_ef_base.get(id);
+    var ops: Vec<i64> = Vec::new();
+    ops.push(a);
+    ops.push(b);
+    ops.push(c);
+    ops.push(d);
+    var k: i64 = 0;
+    while k < 4 {
+        var code: i64 = ef_field(id, k);
+        if code == EFF_UOFF {
+            // a byte offset: scaled by the access size, as decoded
+            var size: i64 = (w >> 30) & 3;
+            if (w & 0x04800000) == 0x04800000 && size == 0 {
+                size = 4;
+            }
+            w = w | ef_put(code, ops.get(k) >> size);
+        } else if code != 0 {
+            w = w | ef_put(code, ops.get(k));
+        }
+        k = k + 1;
+    }
+    return w & 0xFFFFFFFF;
+}
+
+/// The row of a 32-bit word (match order: aliases first), -1 when none.
+fn ef_match_word(arch: i64, w: i64) -> i64 {
+    ef_init();
+    var i: i64 = 0;
+    while i < g_ef_order.len() {
+        var id: i64 = g_ef_order.get(i);
+        if g_ef_arch.get(id) == arch && (w & g_ef_mask.get(id)) == g_ef_base.get(id) && ef_word_ok(id, w) {
+            return id;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// The relations between fields a mask cannot say: `lsl` is UBFM with
+/// imms + 1 == immr, `fmv.d` is FSGNJ with rs1 == rs2.
+fn ef_word_ok(id: i64, w: i64) -> bool {
+    var k: i64 = 0;
+    while k < EF_MAXF {
+        var code: i64 = ef_field(id, k);
+        if code == EFF_LSL6 && ((w >> 10) & 63) + 1 != ((w >> 16) & 63) {
+            return false;
+        }
+        if code == EFF_FSAME && ((w >> 15) & 31) != ((w >> 20) & 31) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// One AArch64 / RISC-V field of word `w` (at address `pc`) as text.
+@wrapping fn ef_field_text(code: i64, w: i64, pc: i64) -> str {
+    var d: i64 = w & 31;
+    var n: i64 = (w >> 5) & 31;
+    var m: i64 = (w >> 16) & 31;
+    if code == EFF_XD {
+        return a64x(d);
+    }
+    if code == EFF_XDS {
+        return a64xs(d);
+    }
+    if code == EFF_WD {
+        return a64r(d, false, false);
+    }
+    if code == EFF_XN {
+        return a64x(n);
+    }
+    if code == EFF_XNS {
+        return a64xs(n);
+    }
+    if code == EFF_WN {
+        return a64r(n, false, false);
+    }
+    if code == EFF_XM {
+        return a64x(m);
+    }
+    if code == EFF_WM {
+        return a64r(m, false, false);
+    }
+    if code == EFF_XA {
+        return a64x((w >> 10) & 31);
+    }
+    if code == EFF_XT2 {
+        return a64x((w >> 10) & 31);
+    }
+    if code == EFF_DD {
+        return "d" + int_to_str(d);
+    }
+    if code == EFF_DN {
+        return "d" + int_to_str(n);
+    }
+    if code == EFF_DM {
+        return "d" + int_to_str(m);
+    }
+    if code == EFF_DA {
+        return "d" + int_to_str((w >> 10) & 31);
+    }
+    if code == EFF_SD {
+        return "s" + int_to_str(d);
+    }
+    if code == EFF_SN {
+        return "s" + int_to_str(n);
+    }
+    if code == EFF_QD {
+        return "q" + int_to_str(d);
+    }
+    if code == EFF_VD {
+        return "v" + int_to_str(d);
+    }
+    if code == EFF_VN {
+        return "v" + int_to_str(n);
+    }
+    if code == EFF_VM {
+        return "v" + int_to_str(m);
+    }
+    if code == EFF_IDX1 {
+        return int_to_str((w >> 20) & 1);
+    }
+    if code == EFF_IMM12 {
+        return int_to_str((w >> 10) & 0xFFF);
+    }
+    if code == EFF_SH12 {
+        if (w & 0x00400000) != 0 {
+            return ", lsl #12";
+        }
+        return "";
+    }
+    if code == EFF_SHIFT {
+        return a64shift(w);
+    }
+    if code == EFF_COND {
+        return a64cond((w >> 12) & 15);
+    }
+    if code == EFF_NCOND {
+        return a64cond(((w >> 12) & 15) ^ 1);
+    }
+    if code == EFF_COND0 {
+        return a64cond(w & 15);
+    }
+    if code == EFF_IMMR {
+        return int_to_str((w >> 16) & 63);
+    }
+    if code == EFF_IMMS {
+        return int_to_str((w >> 10) & 63);
+    }
+    if code == EFF_LSL6 {
+        return int_to_str(63 - ((w >> 10) & 63));
+    }
+    if code == EFF_IMM16 {
+        return "0x" + dsm_hex((w >> 5) & 0xFFFF, 1);
+    }
+    if code == EFF_IMM16D {
+        return int_to_str((w >> 5) & 0xFFFF);
+    }
+    if code == EFF_HW {
+        var hw: i64 = (w >> 21) & 3;
+        if hw == 0 {
+            return "";
+        }
+        return ", lsl #" + int_to_str(hw * 16);
+    }
+    if code == EFF_B26 {
+        return "0x" + dsm_hex(pc + dsm_sext(w & 0x3FFFFFF, 26) * 4, 1);
+    }
+    if code == EFF_B19 {
+        return "0x" + dsm_hex(pc + dsm_sext((w >> 5) & 0x7FFFF, 19) * 4, 1);
+    }
+    if code == EFF_B14 {
+        return "0x" + dsm_hex(pc + dsm_sext((w >> 5) & 0x3FFF, 14) * 4, 1);
+    }
+    if code == EFF_TBIT {
+        return int_to_str((((w >> 31) & 1) << 5) | ((w >> 19) & 31));
+    }
+    if code == EFF_TBR {
+        return a64r(d, ((w >> 31) & 1) != 0, false);
+    }
+    if code == EFF_ADRP {
+        var page: i64 = dsm_sext(((((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)), 21) * 4096;
+        return "0x" + dsm_hex((pc & (0 - 4096)) + page, 1);
+    }
+    if code == EFF_ADR {
+        return "0x" + dsm_hex(pc + dsm_sext(((((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)), 21), 1);
+    }
+    if code == EFF_UOFF {
+        // scaled by the access size (bits 30-31; a q register: 16 bytes)
+        var size: i64 = (w >> 30) & 3;
+        if (w & 0x04800000) == 0x04800000 && size == 0 {
+            size = 4;
+        }
+        var off: i64 = ((w >> 10) & 0xFFF) << size;
+        if off == 0 {
+            return "";
+        }
+        return ", #" + int_to_str(off);
+    }
+    if code == EFF_RSC {
+        if (w & 0x1000) == 0 {
+            return "";
+        }
+        return ", lsl #" + int_to_str((w >> 30) & 3);
+    }
+    if code == EFF_SIMM7 {
+        return int_to_str(dsm_sext((w >> 15) & 0x7F, 7) * 8);
+    }
+    // RISC-V
+    var rd: i64 = (w >> 7) & 31;
+    var rs1: i64 = (w >> 15) & 31;
+    var rs2: i64 = (w >> 20) & 31;
+    if code == EFF_RD {
+        return rvr(rd);
+    }
+    if code == EFF_RS1 {
+        return rvr(rs1);
+    }
+    if code == EFF_RS2 {
+        return rvr(rs2);
+    }
+    if code == EFF_FD {
+        return rvf(rd);
+    }
+    if code == EFF_FS1 || code == EFF_FSAME {
+        return rvf(rs1);
+    }
+    if code == EFF_FS2 {
+        return rvf(rs2);
+    }
+    if code == EFF_FS3 {
+        return rvf((w >> 27) & 31);
+    }
+    if code == EFF_RVD {
+        return "v" + int_to_str(rd);
+    }
+    if code == EFF_RVS1 {
+        return "v" + int_to_str(rs1);
+    }
+    if code == EFF_RVS2 {
+        return "v" + int_to_str(rs2);
+    }
+    if code == EFF_IMMI {
+        return int_to_str(dsm_sext(w >> 20, 12));
+    }
+    if code == EFF_IMMST {
+        return int_to_str(dsm_sext((((w >> 25) & 0x7F) << 5) | rd, 12));
+    }
+    if code == EFF_SHAMT6 {
+        return int_to_str((w >> 20) & 63);
+    }
+    if code == EFF_SHAMT5 {
+        return int_to_str((w >> 20) & 31);
+    }
+    if code == EFF_BOFF {
+        var bimm: i64 = dsm_sext((((w >> 31) & 1) << 12) | (((w >> 7) & 1) << 11) | (((w >> 25) & 0x3F) << 5) | (((w >> 8) & 0xF) << 1), 13);
+        return "0x" + dsm_hex(pc + bimm, 1);
+    }
+    if code == EFF_JOFF {
+        var jimm: i64 = dsm_sext((((w >> 31) & 1) << 20) | (((w >> 12) & 0xFF) << 12) | (((w >> 20) & 1) << 11) | (((w >> 21) & 0x3FF) << 1), 21);
+        return "0x" + dsm_hex(pc + jimm, 1);
+    }
+    if code == EFF_UIMM20 {
+        return "0x" + dsm_hex((w >> 12) & 0xFFFFF, 1);
+    }
+    if code == EFF_RM {
+        var rms: Vec<str> = str_split("rne,rtz,rdn,rup,rmm,?,?,dyn", ",");
+        return rms.get((w >> 12) & 7);
+    }
+    if code == EFF_RMD {
+        // the rounding mode, shown when it is not dyn (the default)
+        var rmn: Vec<str> = str_split("rne,rtz,rdn,rup,rmm,?,?,dyn", ",");
+        if ((w >> 12) & 7) == 7 {
+            return "";
+        }
+        return ", " + rmn.get((w >> 12) & 7);
+    }
+    if code == EFF_AQRL {
+        var aq: str = "";
+        if (w & 0x04000000) != 0 {
+            aq = ".aq";
+        }
+        if (w & 0x02000000) != 0 {
+            if aq == "" {
+                aq = ".rl";
+            } else {
+                aq = aq + "rl";
+            }
+        }
+        return aq;
+    }
+    if code == EFF_VTYPE {
+        var vt: i64 = (w >> 20) & 0x7FF;
+        var sews: Vec<str> = str_split("e8,e16,e32,e64,?,?,?,?", ",");
+        var lmuls: Vec<str> = str_split("m1,m2,m4,m8,?,mf8,mf4,mf2", ",");
+        var ta: str = "tu";
+        if (vt & 0x40) != 0 {
+            ta = "ta";
+        }
+        var ma: str = "mu";
+        if (vt & 0x80) != 0 {
+            ma = "ma";
+        }
+        return sews.get((vt >> 3) & 7) + ", " + lmuls.get(vt & 7) + ", " + ta + ", " + ma;
+    }
+    return "?";
+}
+
+/// Row `id`'s template with the fields of word `w` (at `pc`) filled in.
+fn ef_render_word(id: i64, w: i64, pc: i64) -> str {
+    var t: str = g_ef_tmpl.get(id);
+    var out: str = "";
+    var n: i64 = str_len(t);
+    var i: i64 = 0;
+    var from: i64 = 0;
+    var k: i64 = 0;
+    while i < n {
+        if str_byte_at(t, i) == 123 {
+            out = out + str_slice(t, from, i);
+            var j: i64 = i + 1;
+            while j < n && str_byte_at(t, j) != 125 {
+                j = j + 1;
+            }
+            out = out + ef_field_text(ef_field(id, k), w, pc);
+            k = k + 1;
+            i = j;
+            from = j + 1;
+        }
+        i = i + 1;
+    }
+    return out + str_slice(t, from, n);
+}
+
+/// A 32-bit word through the table: its text, "" when no row has it.
+pub fn ef_decode_word(arch: i64, w: i64, pc: i64) -> str {
+    var id: i64 = ef_match_word(arch, w);
+    if id < 0 {
+        return "";
+    }
+    return ef_render_word(id, w, pc);
+}
+
+/// x86-64: the bytes of row `id` between registers (ModRM mod 3): reg in
+/// ModRM.reg (the row's digit when it has one), rm in ModRM.rm (for a
+/// VEX row, vvvv = v and `l256` VEX.L); `w` sets REX.W / VEX.W. A +r row
+/// takes the register in rm. Immediates are not included. The encoder
+/// side of the x86-64 rows; the two-byte VEX (C5) when it can say it, as
+/// assemblers (and nat_enc.fd x64_vex) pick.
+pub fn ef_x64_rr(id: i64, reg: i64, rm: i64, v: i64, w: bool, l256: bool) -> Vec<i64> {
+    ef_init();
+    var out: Vec<i64> = Vec::new();
+    var pre: i64 = g_ef_pre.get(id);
+    var map: i64 = g_ef_map.get(id);
+    var dig: i64 = g_ef_dig.get(id);
+    var r: i64 = reg;
+    if dig >= 0 {
+        r = dig;
+    }
+    if g_ef_vex.get(id) == 1 {
+        var pp: i64 = 0;
+        if pre == 0x66 {
+            pp = 1;
+        } else if pre == 0xF3 {
+            pp = 2;
+        } else if pre == 0xF2 {
+            pp = 3;
+        }
+        var wbit: i64 = 0;
+        if w {
+            wbit = 0x80;
+        }
+        var rbar: i64 = 0x80;
+        if r >= 8 {
+            rbar = 0;
+        }
+        var vv: i64 = ((15 - (v & 15)) & 15) << 3;
+        if l256 {
+            vv = vv | 4;
+        }
+        if map == 1 && rm < 8 && !w {
+            out.push(0xC5);
+            out.push(rbar | vv | pp);
+        } else {
+            var bbar: i64 = 0x20;
+            if rm >= 8 {
+                bbar = 0;
+            }
+            out.push(0xC4);
+            out.push(rbar | 0x40 | bbar | map);
+            out.push(wbit | vv | pp);
+        }
+        out.push(g_ef_base.get(id));
+        out.push(0xC0 | ((r & 7) << 3) | (rm & 7));
+        return out;
+    }
+    if pre > 0 {
+        out.push(pre);
+    }
+    var rex: i64 = 0x40;
+    if w {
+        rex = rex | 8;
+    }
+    if r >= 8 && dig < 0 {
+        rex = rex | 4;
+    }
+    if rm >= 8 {
+        rex = rex | 1;
+    }
+    if rex != 0x40 {
+        out.push(rex);
+    }
+    if map >= 1 {
+        out.push(0x0F);
+    }
+    if map == 2 {
+        out.push(0x38);
+    }
+    if map == 3 {
+        out.push(0x3A);
+    }
+    if dig == 0 - 3 {
+        out.push(g_ef_base.get(id) + (rm & 7));
+        return out;
+    }
+    out.push(g_ef_base.get(id));
+    if dig != 0 - 2 {
+        out.push(0xC0 | ((r & 7) << 3) | (rm & 7));
+    }
+    return out;
+}
+
+/// The x86-64 row of an instruction: VEX or not, opcode map, opcode, the
+/// mandatory prefix in force (0, 0x66, 0xF2, 0xF3), ModRM.reg, W.
+fn ef_match_x64(vex: i64, map: i64, op: i64, mand: i64, reg: i64, w: bool) -> i64 {
+    ef_init();
+    var any: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < g_ef_order.len() {
+        var id: i64 = g_ef_order.get(i);
+        if g_ef_arch.get(id) == DSM_X64 && g_ef_vex.get(id) == vex && g_ef_map.get(id) == map {
+            var dig: i64 = g_ef_dig.get(id);
+            var opok: bool = g_ef_base.get(id) == op;
+            if dig == 0 - 3 {
+                opok = g_ef_base.get(id) == (op & 0xF8);
+            }
+            var wr: i64 = g_ef_w.get(id);
+            var wok: bool = wr < 0 || (wr == 1) == w;
+            if opok && wok && (dig < 0 || dig == (reg & 7)) {
+                var pre: i64 = g_ef_pre.get(id);
+                if pre == mand {
+                    return id;
+                }
+                if pre < 0 && any < 0 {
+                    any = id;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return any;
+}
+
+/// Problems with the table: a field outside the bits a row leaves free, two
+/// fields on the same bits, base bits outside the mask, a row no word can
+/// reach (an earlier row in match order takes every word it has). Empty
+/// when the table is sound.
+@wrapping pub fn ef_check() -> Vec<str> {
+    ef_init();
+    var out: Vec<str> = Vec::new();
+    var e: i64 = 0;
+    while e < g_ef_errors.len() {
+        out.push(g_ef_errors.get(e));
+        e = e + 1;
+    }
+    var i: i64 = 0;
+    while i < g_ef_arch.len() {
+        var arch: i64 = g_ef_arch.get(i);
+        if arch != DSM_X64 {
+            var base: i64 = g_ef_base.get(i);
+            var mask: i64 = g_ef_mask.get(i);
+            var t: str = g_ef_tmpl.get(i);
+            if (base & mask) != base {
+                out.push("`" + t + "`: base 0x" + dsm_hex(base, 8) + " has bits outside its mask 0x" + dsm_hex(mask, 8));
+            }
+            var used: i64 = 0;
+            var k: i64 = 0;
+            while k < EF_MAXF {
+                var code: i64 = ef_field(i, k);
+                if code != 0 {
+                    var bits: i64 = ef_field_bits(code);
+                    // a field on fixed bits (an alias may fix one: `mov sp,
+                    // xn` is ADD with n = 31) is an error in a general form
+                    if (bits & mask) != 0 && g_ef_prio.get(i) == 1 && code != EFF_FSAME && code != EFF_LSL6 && code != EFF_TBIT {
+                        out.push("`" + t + "`: field " + int_to_str(code) + " overlaps the fixed bits");
+                    }
+                    if (bits & used) != 0 && code != EFF_FSAME {
+                        out.push("`" + t + "`: two fields share bits");
+                    }
+                    used = used | bits;
+                }
+                k = k + 1;
+            }
+            // shadowed: no word of this row's (its base with the free bits
+            // all 0, all 1 or two mixed patterns) reaches it
+            var free: i64 = 0xFFFFFFFF & ~mask;
+            var probes: Vec<i64> = Vec::new();
+            probes.push(base);
+            probes.push(base | free);
+            probes.push(base | (free & 0x12345678));
+            probes.push(base | (free & 0x9ABCDEF0));
+            var reached: bool = false;
+            var tried: bool = false;
+            var first_other: i64 = 0 - 1;
+            var pi: i64 = 0;
+            while pi < probes.len() {
+                var pw: i64 = probes.get(pi);
+                if ef_word_ok(i, pw) {
+                    tried = true;
+                    var mm: i64 = ef_match_word(arch, pw);
+                    if mm == i {
+                        reached = true;
+                    } else if first_other < 0 {
+                        first_other = mm;
+                    }
+                }
+                pi = pi + 1;
+            }
+            if tried && !reached && first_other >= 0 {
+                out.push("`" + t + "`: shadowed by `" + g_ef_tmpl.get(first_other) + "`");
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// One AArch64 instruction at address `pc`: its row in the table of
+/// encoding forms (ef_init_a64), else `.word`.
+@wrapping pub fn dsm_a64(w: i64, pc: i64) -> str {
+    var t: str = ef_decode_word(DSM_A64, w, pc);
+    if t != "" {
+        return t;
+    }
+    return ".word 0x" + dsm_hex(w, 8);
+}
+
+/// One RISC-V instruction at address `pc`: its row in the table
+/// (ef_init_rv), else `.word`.
+@wrapping pub fn dsm_rv(w: i64, pc: i64) -> str {
+    var t: str = ef_decode_word(DSM_RV64, w, pc);
+    if t != "" {
+        return t;
+    }
+    return ".word 0x" + dsm_hex(w, 8);
+}
+
+/// The text of x86-64 field `code`: an operand of ModRM `m`, or an
+/// immediate at b[imm] (its length in .len). `size` is the operand size,
+/// `vl` VEX.L, `vvvv` the VEX register, `op` the opcode byte.
+@wrapping fn x64_field_text(code: i64, b: & Vec<i64>, imm: i64, m: DsmModrm, size: i64, rex: i64, has_rex: bool, wide: bool, vl: bool, vvvv: i64, op: i64, seg: str) -> DsmInsn {
+    var mseg: str = "";
+    if m.rm_reg < 0 {
+        mseg = seg;
+    }
+    if code == EFF_R {
+        return dsm_insn(0, x64r(m.reg, size, has_rex));
+    }
+    if code == EFF_R8 {
+        return dsm_insn(0, x64r(m.reg, 1, has_rex));
+    }
+    if code == EFF_R32 {
+        return dsm_insn(0, x64r(m.reg, 4, has_rex));
+    }
+    if code == EFF_R64 {
+        return dsm_insn(0, x64r(m.reg, 8, true));
+    }
+    if code == EFF_RW {
+        if wide {
+            return dsm_insn(0, x64r(m.reg, 8, true));
+        }
+        return dsm_insn(0, x64r(m.reg, 4, has_rex));
+    }
+    if code == EFF_RM {
+        return dsm_insn(0, mseg + x64rm(m, size, has_rex, false));
+    }
+    if code == EFF_RMS {
+        return dsm_insn(0, mseg + x64rm(m, size, has_rex, true));
+    }
+    if code == EFF_RM8 {
+        return dsm_insn(0, mseg + x64rm(m, 1, has_rex, false));
+    }
+    if code == EFF_RM8S {
+        return dsm_insn(0, mseg + x64rm(m, 1, has_rex, true));
+    }
+    if code == EFF_RM16S {
+        return dsm_insn(0, mseg + x64rm(m, 2, has_rex, true));
+    }
+    if code == EFF_RM32 {
+        return dsm_insn(0, mseg + x64rm(m, 4, has_rex, false));
+    }
+    if code == EFF_RM32S {
+        return dsm_insn(0, mseg + x64rm(m, 4, has_rex, true));
+    }
+    if code == EFF_RM64 {
+        return dsm_insn(0, mseg + x64rm(m, 8, true, false));
+    }
+    if code == EFF_RM64S {
+        return dsm_insn(0, mseg + x64rm(m, 8, true, true));
+    }
+    if code == EFF_RMW || code == EFF_RMWS {
+        var ws: i64 = 4;
+        if wide {
+            ws = 8;
+        }
+        return dsm_insn(0, mseg + x64rm(m, ws, has_rex, code == EFF_RMWS));
+    }
+    if code == EFF_X {
+        return dsm_insn(0, x64xmm(m.reg));
+    }
+    if code == EFF_XRM {
+        if m.rm_reg >= 0 {
+            return dsm_insn(0, x64xmm(m.rm_reg));
+        }
+        return dsm_insn(0, mseg + m.mem);
+    }
+    var vk: str = "xmm";
+    if vl {
+        vk = "ymm";
+    }
+    if code == EFF_V {
+        return dsm_insn(0, vk + int_to_str(m.reg & 15));
+    }
+    if code == EFF_VV {
+        return dsm_insn(0, vk + int_to_str(vvvv & 15));
+    }
+    if code == EFF_VRM {
+        if m.rm_reg >= 0 {
+            return dsm_insn(0, vk + int_to_str(m.rm_reg & 15));
+        }
+        return dsm_insn(0, mseg + m.mem);
+    }
+    if code == EFF_XV {
+        return dsm_insn(0, x64xmm(vvvv));
+    }
+    if code == EFF_GV {
+        return dsm_insn(0, x64r(vvvv, 8, true));
+    }
+    if code == EFF_ACC {
+        return dsm_insn(0, x64r(0, size, has_rex));
+    }
+    if code == EFF_OREG {
+        var r: i64 = (op & 7) | ((rex & 1) << 3);
+        if wide {
+            return dsm_insn(0, x64r(r, 8, true));
+        }
+        return dsm_insn(0, x64r(r, 4, has_rex));
+    }
+    if code == EFF_IB {
+        return dsm_insn(1, int_to_str(dsm_u8(b, imm)));
+    }
+    if code == EFF_IBX {
+        return dsm_insn(1, "0x" + dsm_hex(dsm_u8(b, imm), 1));
+    }
+    if code == EFF_SB {
+        return dsm_insn(1, dsm_shex(dsm_sext(dsm_u8(b, imm), 8)));
+    }
+    if code == EFF_SZ {
+        if size == 2 {
+            return dsm_insn(2, dsm_shex(dsm_sext(dsm_u(b, imm, 2), 16)));
+        }
+        return dsm_insn(4, dsm_shex(dsm_sext(dsm_u(b, imm, 4), 32)));
+    }
+    if code == EFF_UZ {
+        return dsm_insn(4, "0x" + dsm_hex(dsm_u(b, imm, 4) & 0xFFFFFFFF, 1));
+    }
+    if code == EFF_IQ {
+        return dsm_insn(8, "0x" + dsm_hex(dsm_u(b, imm, 8), 1));
+    }
+    if code == EFF_DQ {
+        if wide {
+            return dsm_insn(0, "q");
+        }
+        return dsm_insn(0, "d");
+    }
+    return dsm_insn(0, "?");
+}
+
+/// An x86-64 row rendered: `head` bytes before the ModRM (prefixes, REX or
+/// VEX, opcode), the ModRM at b[at + head] unless the row has none.
+@wrapping fn x64_render(id: i64, b: & Vec<i64>, at: i64, head: i64, addr: i64, rex: i64, has_rex: bool, size: i64, vl: bool, vvvv: i64, op: i64, seg: str, lock: str) -> DsmInsn {
+    var dig: i64 = g_ef_dig.get(id);
+    var m: DsmModrm = DsmModrm {
+        len: 0, reg: 0, rm_reg: 0, mem: "", rip: false, disp: 0
+    };
+    if dig != 0 - 2 && dig != 0 - 3 {
+        m = x64_modrm(b, at + head, rex);
+    }
+    var wide: bool = (rex & 8) != 0;
+    var imm: i64 = at + head + m.len;
+    var t: str = g_ef_tmpl.get(id);
+    var out: str = "";
+    var n: i64 = str_len(t);
+    var i: i64 = 0;
+    var from: i64 = 0;
+    var k: i64 = 0;
+    while i < n {
+        if str_byte_at(t, i) == 123 {
+            out = out + str_slice(t, from, i);
+            var j: i64 = i + 1;
+            while j < n && str_byte_at(t, j) != 125 {
+                j = j + 1;
+            }
+            var f: DsmInsn = x64_field_text(ef_field(id, k), b, imm, m, size, rex, has_rex, wide, vl, vvvv, op, seg);
+            out = out + f.text;
+            imm = imm + f.len;
+            k = k + 1;
+            i = j;
+            from = j + 1;
+        }
+        i = i + 1;
+    }
+    out = lock + out + str_slice(t, from, n);
+    var len: i64 = imm - at;
+    // xor r, r: the idiom for zero
+    if g_ef_vex.get(id) == 0 && g_ef_map.get(id) == 0 && (op == 0x30 || op == 0x31) && m.rm_reg >= 0 && m.rm_reg == m.reg {
+        out = out + "  ; = 0";
+    }
+    return dsm_insn(len, out + x64_rip_note(m, addr + len));
+}
+
+/// One x86-64 instruction at `at` (address `addr`): the prefixes, REX or
+/// VEX and the opcode, then its row in the table of encoding forms
+/// (ef_init_x64); branches, the one-byte forms without operands and the
+/// system instructions are named here.
+@wrapping pub fn dsm_x64(b: & Vec<i64>, at: i64, addr: i64) -> DsmInsn {
+    var p: i64 = at;
+    var opsize16: bool = false;
+    var rep: i64 = 0;
+    var lock: str = "";
+    var seg: str = "";
+    var going: bool = true;
+    while going && p < at + 4 {
+        var pre: i64 = dsm_u8(b, p);
+        if pre == 0x66 {
+            opsize16 = true;
+            p = p + 1;
+        } else if pre == 0xF2 || pre == 0xF3 {
+            rep = pre;
+            p = p + 1;
+        } else if pre == 0xF0 {
+            lock = "lock ";
+            p = p + 1;
+        } else if pre == 0x64 {
+            seg = "fs:";
+            p = p + 1;
+        } else if pre == 0x65 {
+            seg = "gs:";
+            p = p + 1;
+        } else {
+            going = false;
+        }
+    }
+    var rex: i64 = 0;
+    var has_rex: bool = false;
+    var r0: i64 = dsm_u8(b, p);
+    if r0 >= 0x40 && r0 <= 0x4F {
+        rex = r0 & 15;
+        has_rex = true;
+        p = p + 1;
+    }
+    var wide: bool = (rex & 8) != 0;
+    var size: i64 = 4;
+    if wide {
+        size = 8;
+    } else if opsize16 {
+        size = 2;
+    }
+    var op: i64 = dsm_u8(b, p);
+    p = p + 1;
+    var start_len: i64 = p - at;
+    var mand: i64 = rep;
+    if mand == 0 && opsize16 {
+        mand = 0x66;
+    }
+
+    // VEX (C4 three bytes, C5 two): BMI1/BMI2, FMA, AVX/AVX2
+    if (op == 0xC4 || op == 0xC5) && !has_rex {
+        var v1: i64 = dsm_u8(b, p);
+        var vrex: i64 = 0;
+        if (v1 & 0x80) == 0 {
+            vrex = vrex | 4;
+        }
+        var vmap: i64 = 1;
+        var vw: bool = false;
+        var v2: i64 = v1;
+        var q: i64 = p + 1;
+        if op == 0xC4 {
+            if (v1 & 0x40) == 0 {
+                vrex = vrex | 2;
+            }
+            if (v1 & 0x20) == 0 {
+                vrex = vrex | 1;
+            }
+            vmap = v1 & 31;
+            v2 = dsm_u8(b, p + 1);
+            vw = (v2 & 0x80) != 0;
+            q = p + 2;
+        }
+        if vw {
+            vrex = vrex | 8;
+        }
+        var vvvv: i64 = ((v2 >> 3) & 15) ^ 15;
+        var vl: bool = (v2 & 4) != 0;
+        var pp: i64 = v2 & 3;
+        var vpre: i64 = 0;
+        if pp == 1 {
+            vpre = 0x66;
+        } else if pp == 2 {
+            vpre = 0xF3;
+        } else if pp == 3 {
+            vpre = 0xF2;
+        }
+        var vop: i64 = dsm_u8(b, q);
+        var vm: DsmModrm = x64_modrm(b, q + 1, vrex);
+        var vid: i64 = ef_match_x64(1, vmap, vop, vpre, vm.reg, vw);
+        if vid >= 0 {
+            return x64_render(vid, b, at, q + 1 - at, addr, vrex, true, 8, vl, vvvv, vop, seg, lock);
+        }
+        return dsm_insn((q + 1 - at) + vm.len, ".byte 0x" + dsm_hex(op, 2) + " (vex)");
+    }
+
+    // One-byte opcodes without operands, and the branches
+    if op == 0xC3 {
+        return dsm_insn(start_len, "ret");
+    }
+    if op == 0x90 {
+        return dsm_insn(start_len, "nop");
+    }
+    if op == 0xCC {
+        return dsm_insn(start_len, "int3");
+    }
+    if op == 0x99 {
+        if wide {
+            return dsm_insn(start_len, "cqo");
+        }
+        return dsm_insn(start_len, "cdq");
+    }
+    if op >= 0x50 && op <= 0x57 {
+        return dsm_insn(start_len, "push " + x64r((op & 7) | ((rex & 1) << 3), 8, true));
+    }
+    if op >= 0x58 && op <= 0x5F {
+        return dsm_insn(start_len, "pop " + x64r((op & 7) | ((rex & 1) << 3), 8, true));
+    }
+    if op == 0xE8 || op == 0xE9 {
+        var rel: i64 = dsm_sext(dsm_u(b, p, 4), 32);
+        var cname: str = "call";
+        if op == 0xE9 {
+            cname = "jmp";
+        }
+        return dsm_insn(start_len + 4, cname + " 0x" + dsm_hex(addr + start_len + 4 + rel, 1));
+    }
+    if op == 0xEB {
+        var rel8: i64 = dsm_sext(dsm_u8(b, p), 8);
+        return dsm_insn(start_len + 1, "jmp 0x" + dsm_hex(addr + start_len + 1 + rel8, 1));
+    }
+    if op >= 0x70 && op <= 0x7F {
+        var relc: i64 = dsm_sext(dsm_u8(b, p), 8);
+        return dsm_insn(start_len + 1, "j" + x64cc(op & 15) + " 0x" + dsm_hex(addr + start_len + 1 + relc, 1));
+    }
+    if op != 0x0F {
+        var id: i64 = ef_match_x64(0, 0, op, mand, (dsm_u8(b, p) >> 3) & 7, wide);
+        if id >= 0 {
+            return x64_render(id, b, at, start_len, addr, rex, has_rex, size, false, 0, op, seg, lock);
+        }
+        return dsm_insn(start_len, ".byte 0x" + dsm_hex(op, 2));
+    }
+
+    // Two-byte opcodes (0F xx), and 0F 38 xx / 0F 3A xx
+    var op2: i64 = dsm_u8(b, p);
+    var two: i64 = p + 1 - at;
+    if op2 == 0x05 {
+        return dsm_insn(two, "syscall");
+    }
+    if op2 == 0x0B {
+        return dsm_insn(two, "ud2");
+    }
+    if op2 == 0xA2 {
+        return dsm_insn(two, "cpuid");
+    }
+    if op2 == 0x31 {
+        return dsm_insn(two, "rdtsc");
+    }
+    if op2 == 0xAE && dsm_u8(b, p + 1) == 0xF0 {
+        return dsm_insn(two + 1, "mfence");
+    }
+    if op2 >= 0x80 && op2 <= 0x8F {
+        var jrel: i64 = dsm_sext(dsm_u(b, p + 1, 4), 32);
+        return dsm_insn(two + 4, "j" + x64cc(op2 & 15) + " 0x" + dsm_hex(addr + two + 4 + jrel, 1));
+    }
+    var map: i64 = 1;
+    var opx: i64 = op2;
+    var head: i64 = two;
+    if op2 == 0x38 || op2 == 0x3A {
+        map = 2;
+        if op2 == 0x3A {
+            map = 3;
+        }
+        opx = dsm_u8(b, p + 1);
+        head = two + 1;
+    }
+    var id2: i64 = ef_match_x64(0, map, opx, mand, (dsm_u8(b, at + head) >> 3) & 7, wide);
+    if id2 >= 0 {
+        return x64_render(id2, b, at, head, addr, rex, has_rex, size, false, 0, opx, seg, lock);
+    }
+    if map != 1 {
+        return dsm_insn(head, ".byte 0x0f, 0x" + dsm_hex(op2, 2) + ", 0x" + dsm_hex(opx, 2));
+    }
+    return dsm_insn(two, ".byte 0x0f, 0x" + dsm_hex(op2, 2));
+}
+
+// --- Listing --------------------------------------------------------------------
+
+/// An instruction after which nothing runs into the next byte: x86-64
+/// alignment padding (MI30: zeros up to a 16-byte loop head) follows only
+/// these.
+fn dsm_x64_ends_flow(text: str) -> bool {
+    return str_starts_with(text, "jmp ") || text == "ret" || text == "ud2" || text == "int3";
+}
+
+/// The code of b[from..to), at address `addr` for its first byte, one
+/// instruction a line: address, bytes, instruction. The zero bytes at the
+/// end (the padding between functions) and, on x86-64, the zeros after a
+/// jump up to an aligned loop head are each shown as one line
+/// `(N zero bytes of padding)`, not decoded as instructions.
+@wrapping pub fn disasm_bytes(b: & Vec<i64>, from: i64, to: i64, arch: i64, addr: i64) -> str {
+    ef_init();
+    var out: str = "";
+    var end: i64 = to;
+    if end > b.len() {
+        end = b.len();
+    }
+    // where the trailing run of zeros starts; padding only from an
+    // instruction boundary at or after it (an instruction's own zero bytes
+    // before it are kept)
+    var zero_from: i64 = end;
+    while zero_from > from && dsm_u8(b, zero_from - 1) == 0 {
+        zero_from = zero_from - 1;
+    }
+    var p: i64 = from;
+    while p < end {
+        if p >= zero_from {
+            out = out + "  " + dsm_hex(addr + (p - from), 8) + ":  (" + int_to_str(end - p) + " zero bytes of padding)\n";
+            return out;
+        }
+        var len: i64 = 4;
+        var text: str = "";
+        if arch == DSM_X64 {
+            var ins: DsmInsn = dsm_x64(b, p, addr + (p - from));
+            len = ins.len;
+            text = ins.text;
+            if len < 1 {
+                len = 1;
+            }
+        } else if arch == DSM_RV64 && p + 2 <= end && (dsm_u8(b, p) & 3) != 3 {
+            // TG9: a 2-byte RVC instruction, listed as the 32-bit
+            // instruction it stands for (nat_enc.fd nat_rvc_expand)
+            len = 2;
+            var cx: i64 = nat_rvc_expand(dsm_u(b, p, 2));
+            if cx < 0 {
+                text = ".half 0x" + dsm_hex(dsm_u(b, p, 2), 4);
+            } else {
+                text = dsm_rv(cx, addr + (p - from));
+            }
+        } else if p + 4 > end {
+            len = end - p;
+            text = ".byte";
+        } else if arch == DSM_A64 {
+            text = dsm_a64(dsm_word(b, p), addr + (p - from));
+        } else {
+            text = dsm_rv(dsm_word(b, p), addr + (p - from));
+        }
+        var hexb: str = "";
+        var k: i64 = 0;
+        while k < len && k < 10 {
+            if k > 0 {
+                hexb = hexb + " ";
+            }
+            hexb = hexb + dsm_hex(dsm_u8(b, p + k), 2);
+            k = k + 1;
+        }
+        if len > 10 {
+            hexb = hexb + " ..";
+        }
+        while str_len(hexb) < 30 {
+            hexb = hexb + " ";
+        }
+        out = out + "  " + dsm_hex(addr + (p - from), 8) + ":  " + hexb + " " + text + "\n";
+        p = p + len;
+        // x86-64: zeros after a jump up to the next 16-byte boundary (a
+        // loop head's alignment) or 4-byte boundary (the next function's,
+        // when one symbol covers several), with code after them
+        if arch == DSM_X64 && p < zero_from && dsm_x64_ends_flow(text) {
+            var a: i64 = addr + (p - from);
+            var z: i64 = 0;
+            while z < 16 && p + z < zero_from && dsm_u8(b, p + z) == 0 {
+                z = z + 1;
+            }
+            var gap: i64 = ((a + 15) & (0 - 16)) - a;
+            if z < gap || gap == 0 {
+                gap = ((a + 3) & (0 - 4)) - a;
+            }
+            if gap > 0 && z >= gap && p + gap < zero_from {
+                out = out + "  " + dsm_hex(a, 8) + ":  (" + int_to_str(gap) + " zero bytes of padding)\n";
+                p = p + gap;
+            }
+        }
+    }
+    return out;
+}
+
+/// The NUL-ended name at `off` of an image.
+fn dsm_cstr(b: & Vec<i64>, off: i64) -> str {
+    var out: str = "";
+    var i: i64 = off;
+    while i >= 0 && i < b.len() && dsm_u8(b, i) != 0 && i - off < 512 {
+        out = out + char_to_str(dsm_u8(b, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// An ELF executable's functions (its .symtab), or the one named `name`.
+fn disasm_elf(b: & Vec<i64>, name: str) -> str {
+    var machine: i64 = dsm_u(b, 0x12, 2);
+    var arch: i64 = 0;
+    if machine == 62 {
+        arch = DSM_X64;
+    } else if machine == 183 {
+        arch = DSM_A64;
+    } else if machine == 243 {
+        arch = DSM_RV64;
+    }
+    if arch == 0 {
+        return "fid disasm: ELF machine " + int_to_str(machine) + " is not x86-64, AArch64 or RISC-V 64\n";
+    }
+    var shoff: i64 = dsm_u(b, 0x28, 8);
+    var shentsize: i64 = dsm_u(b, 0x3A, 2);
+    var shnum: i64 = dsm_u(b, 0x3C, 2);
+    var out: str = "";
+    var found: i64 = 0;
+    var si: i64 = 0;
+    while si < shnum && shentsize >= 64 {
+        var sh: i64 = shoff + si * shentsize;
+        if dsm_u(b, sh + 4, 4) == 2 {
+            var sym_off: i64 = dsm_u(b, sh + 24, 8);
+            var sym_size: i64 = dsm_u(b, sh + 32, 8);
+            var link: i64 = dsm_u(b, sh + 40, 4);
+            var str_off: i64 = dsm_u(b, shoff + link * shentsize + 24, 8);
+            var k: i64 = 24;
+            while k + 24 <= sym_size {
+                var ent: i64 = sym_off + k;
+                var fsize: i64 = dsm_u(b, ent + 16, 8);
+                var shndx: i64 = dsm_u(b, ent + 6, 2);
+                if fsize > 0 && shndx > 0 && shndx < shnum {
+                    var nm: str = dsm_cstr(b, str_off + dsm_u(b, ent, 4));
+                    if str_len(name) == 0 || nm == name {
+                        var value: i64 = dsm_u(b, ent + 8, 8);
+                        var tsh: i64 = shoff + shndx * shentsize;
+                        var file_off: i64 = value - dsm_u(b, tsh + 16, 8) + dsm_u(b, tsh + 24, 8);
+                        out = out + "\n" + dsm_hex(value, 8) + " <" + nm + ">:\n" + disasm_bytes(b, file_off, file_off + fsize, arch, value);
+                        found = found + 1;
+                    }
+                }
+                k = k + 24;
+            }
+        }
+        si = si + 1;
+    }
+    if found == 0 {
+        if str_len(name) > 0 {
+            return "fid disasm: no function " + name + " in the symbol table (not reached from main, folded into an identical function, or built with FID_NAT_OFF=debug)\n";
+        }
+        // No symbol table: from the entry point
+        var entry: i64 = dsm_u(b, 0x18, 8);
+        var phoff: i64 = dsm_u(b, 0x20, 8);
+        var vaddr: i64 = dsm_u(b, phoff + 16, 8);
+        var foff: i64 = dsm_u(b, phoff + 8, 8);
+        var at: i64 = entry - vaddr + foff;
+        return "(no symbol table: 256 bytes from the entry point)\n" + disasm_bytes(b, at, at + 256, arch, entry);
+    }
+    return out;
+}
+
+/// A PE executable's functions (the COFF symbols nat_pe_symbols writes),
+/// or the one named `name`. x86-64 only.
+fn disasm_pe(b: & Vec<i64>, name: str) -> str {
+    var pe: i64 = dsm_u(b, 0x3C, 4);
+    var coff: i64 = pe + 4;
+    var nsec: i64 = dsm_u(b, coff + 2, 2);
+    var symtab: i64 = dsm_u(b, coff + 8, 4);
+    var nsym: i64 = dsm_u(b, coff + 12, 4);
+    var opt_size: i64 = dsm_u(b, coff + 16, 2);
+    var image_base: i64 = dsm_u(b, coff + 20 + 24, 8);
+    var sec: i64 = coff + 20 + opt_size;
+    if nsec < 1 {
+        return "fid disasm: the PE has no sections\n";
+    }
+    var text_rva: i64 = dsm_u(b, sec + 12, 4);
+    var text_size: i64 = dsm_u(b, sec + 8, 4);
+    var text_raw: i64 = dsm_u(b, sec + 20, 4);
+    if symtab == 0 || nsym == 0 {
+        return "(no symbol table: the first 256 bytes of the code)\n" + disasm_bytes(b, text_raw, text_raw + 256, DSM_X64, image_base + text_rva);
+    }
+    var strtab: i64 = symtab + nsym * 18;
+    var names: Vec<str> = Vec::new();
+    var starts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nsym {
+        var ent: i64 = symtab + i * 18;
+        var nm: str = "";
+        if dsm_u(b, ent, 4) == 0 {
+            nm = dsm_cstr(b, strtab + dsm_u(b, ent + 4, 4));
+        } else {
+            var k: i64 = 0;
+            while k < 8 && dsm_u8(b, ent + k) != 0 {
+                nm = nm + char_to_str(dsm_u8(b, ent + k));
+                k = k + 1;
+            }
+        }
+        names.push(nm);
+        starts.push(dsm_u(b, ent + 8, 4));
+        i = i + 1;
+    }
+    var out: str = "";
+    var found: i64 = 0;
+    i = 0;
+    while i < names.len() {
+        if str_len(name) == 0 || names.get(i) == name {
+            // a function ends where the next one (by address) starts
+            var fend: i64 = text_size;
+            var j: i64 = 0;
+            while j < starts.len() {
+                if starts.get(j) > starts.get(i) && starts.get(j) < fend {
+                    fend = starts.get(j);
+                }
+                j = j + 1;
+            }
+            var va: i64 = image_base + text_rva + starts.get(i);
+            out = out + "\n" + dsm_hex(va, 8) + " <" + names.get(i) + ">:\n" + disasm_bytes(b, text_raw + starts.get(i), text_raw + fend, DSM_X64, va);
+            found = found + 1;
+        }
+        i = i + 1;
+    }
+    if found == 0 {
+        return "fid disasm: no function " + name + " in the symbol table\n";
+    }
+    return out;
+}
+
+/// An executable's code by function: an ELF (x86-64, AArch64, RISC-V 64)
+/// or a PE from the machine layer; `name` "" for every function.
+pub fn disasm_image(bytes: Vec<i64>, name: str) -> str {
+    var b: Vec<i64> = bytes;
+    if b.len() >= 64 && dsm_u8(& b, 0) == 0x7F && dsm_u8(& b, 1) == 0x45 && dsm_u8(& b, 2) == 0x4C && dsm_u8(& b, 3) == 0x46 {
+        return disasm_elf(& b, name);
+    }
+    if b.len() >= 256 && dsm_u8(& b, 0) == 0x4D && dsm_u8(& b, 1) == 0x5A {
+        return disasm_pe(& b, name);
+    }
+    if b.len() >= 4 && (dsm_u(& b, 0, 4) & 0xFFFFFFFE) == 0xFEEDFACE {
+        return "fid disasm: a Mach-O: use a Linux --target (the code is the same) or llvm-objdump -d\n";
+    }
+    if b.len() >= 4 && dsm_u(& b, 0, 4) == 0xFEEDFACF {
+        return "fid disasm: a Mach-O: use a Linux --target (the code is the same) or llvm-objdump -d\n";
+    }
+    return "fid disasm: not an ELF or PE executable (for bare code: --raw --arch <a>)\n";
+}

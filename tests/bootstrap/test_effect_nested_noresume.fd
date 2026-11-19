@@ -1,0 +1,71 @@
+// Reference section 9.4: in a handler, `cont` is the rest of the handle
+// block after the `do`. A `do` nested in an `if` or a loop of the block,
+// whose handler does not resume, ends the whole handle block, not only the
+// inner block: "valid", the loop's later values, "all checked" and "not
+// printed" are never printed. A handler that resumes still runs the rest
+// (compiler/lower.fd Lowerer_hx_abort; the top-level case is
+// test_effect_noresume.fd).
+// Expected output:
+// rejected
+// 0
+// 1
+// rejected at 2
+// note 7
+// after note
+// note 1
+// rejected 2
+// done
+fn main() {
+    handle {
+        if true {
+            do Check.reject(1);
+        }
+        println("valid");
+    } with {
+        Check.reject(b) => {
+            println("rejected");
+        }
+    }
+    handle {
+        var i: i64 = 0;
+        while i < 5 {
+            if i == 2 {
+                do Check.reject(i);
+            }
+            println(i);
+            i = i + 1;
+        }
+        println("all checked");
+    } with {
+        Check.reject(b) => {
+            println("rejected at " + int_to_str(b));
+        }
+    }
+    handle {
+        if true {
+            do Log.note(7);
+        }
+        println("after note");
+    } with {
+        Log.note(v) => {
+            println("note " + int_to_str(v));
+            resume(cont, 0);
+        }
+    }
+    handle {
+        do Log.note(1);
+        if true {
+            do Check.reject(2);
+        }
+        println("not printed");
+    } with {
+        Log.note(v) => {
+            println("note " + int_to_str(v));
+            resume(cont, 0);
+        },
+        Check.reject(b) => {
+            println("rejected " + int_to_str(b));
+        }
+    }
+    println("done");
+}

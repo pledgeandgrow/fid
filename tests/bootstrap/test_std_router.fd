@@ -1,0 +1,203 @@
+// stdlib/router: static, :param and *wildcard routes, specificity order, percent-decoded params, groups, 404/405/400, HEAD and OPTIONS, bad patterns, query values and the http_serve adapter, on requests parsed by stdlib http.
+// Expected output:
+// group prefix: /api/v1
+// routes: 9
+// GET / -> 200 home
+// GET /users -> 200 list users
+// GET /users/ -> 200 list users
+// POST /users -> 201 created
+// GET /users/42 -> 200 user 42
+// GET /users/new -> 200 new user form
+// GET /users/caf%C3%A9%20au%20lait -> 200 user café au lait
+// GET /users/a%2Fb -> 200 user a/b
+// GET /users/7/posts/99 -> 200 user 7 post 99
+// GET /users/7/posts -> 404 Not Found
+// GET /files/docs/2026/report.pdf -> 200 file [docs/2026/report.pdf]
+// GET /files/ -> 200 file []
+// PATCH /echo -> 200 any PATCH
+// GET /api/v1/items?page=2&q=red+shoes%21 -> 200 v1 items page 2 q=red shoes!
+// DELETE /users -> 405 allow=[GET, HEAD, POST, OPTIONS] Method Not Allowed
+// DELETE /users/42 -> 405 allow=[GET, HEAD, OPTIONS] Method Not Allowed
+// GET /nowhere -> 404 Not Found
+// GET /users/%zz -> 400 Bad Request
+// OPTIONS /users -> 204 allow=[GET, HEAD, POST, OPTIONS]
+// HEAD /users/5 -> 200 length 6 body bytes 0
+// GET /users/ -> 404 Not Found
+// GET /missing -> 404 no such page: /missing
+// rejected: wildcard not last in /a/*rest/b
+// rejected: empty parameter name in /a/:
+// rejected: parameter x used twice in /a/:x/:x
+// rejected: route GET /a/:y added twice
+// match: 200 /users/:uid/posts/:pid uid=9 pid=3
+// wildcard: a/b c
+// serve fn: user 77
+// GET /
+// GET /users/:id
+// GET /users
+// POST /users
+// GET /users/new
+// GET /users/:uid/posts/:pid
+// GET /files/*path
+// * /echo
+// GET /api/v1/items
+use router;
+use http;
+use vec;
+use string;
+
+fn status_of(resp: str) -> str {
+    return str_slice(resp, 9, 12);
+}
+
+fn body_of(resp: str) -> str {
+    val e: i64 = str_find(resp, "\r\n\r\n");
+    return str_slice(resp, e + 4, str_len(resp));
+}
+
+fn header_of(resp: str, name: str) -> str {
+    val req: HttpRequest = http_parse_head(resp);
+    return http_header(req, name);
+}
+
+fn h_users(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "list users");
+}
+
+fn h_user(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "user " + route_param(& p, "id"));
+}
+
+fn h_user_new(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "new user form");
+}
+
+fn h_create(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(201, "text/plain", "created");
+}
+
+fn h_post(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "user " + route_param(& p, "uid") + " post " + route_param(& p, "pid"));
+}
+
+fn h_files(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "file [" + route_param(& p, "path") + "]");
+}
+
+fn h_any(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "any " + req.method);
+}
+
+fn h_items(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "v1 items page " + route_query(req.query, "page") + " q=" + route_query(req.query, "q"));
+}
+
+fn h_home(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(200, "text/plain", "home");
+}
+
+fn h_nf(req: HttpRequest, p: RouteParams) -> str {
+    return build_response(404, "text/plain", "no such page: " + req.path);
+}
+
+fn get(r: & HttpRouter, method: str, target: str) -> str {
+    val req: HttpRequest = http_parse_head(method + " " + target + " HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    return http_router_handle(r, req);
+}
+
+fn show(r: & HttpRouter, method: str, target: str) {
+    val resp: str = get(r, method, target);
+    var line: str = method + " " + target + " -> " + status_of(resp);
+    val allow: str = header_of(resp, "allow");
+    if str_len(allow) > 0 {
+        line = line + " allow=[" + allow + "]";
+    }
+    val b: str = body_of(resp);
+    if str_len(b) > 0 {
+        line = line + " " + str_trim(b);
+    }
+    println(line);
+}
+
+fn main() -> i64 {
+    var r: HttpRouter = http_router_new();
+    http_router_get(& mut r, "/", h_home);
+    http_router_get(& mut r, "/users/:id", h_user);
+    http_router_get(& mut r, "/users", h_users);
+    http_router_post(& mut r, "/users", h_create);
+    http_router_get(& mut r, "/users/new", h_user_new);
+    http_router_get(& mut r, "/users/:uid/posts/:pid", h_post);
+    http_router_get(& mut r, "/files/*path", h_files);
+    http_router_add(& mut r, "*", "/echo", h_any);
+    val api: RouteGroup = route_group("/api");
+    val v1: RouteGroup = route_group_sub(api, "v1/");
+    println("group prefix: " + v1.prefix);
+    route_group_add(& mut r, v1, "GET", "/items", h_items);
+    println("routes: " + int_to_str(http_router_len(& r)));
+
+    show(& r, "GET", "/");
+    show(& r, "GET", "/users");
+    show(& r, "GET", "/users/");
+    show(& r, "POST", "/users");
+    show(& r, "GET", "/users/42");
+    show(& r, "GET", "/users/new");
+    show(& r, "GET", "/users/caf%C3%A9%20au%20lait");
+    show(& r, "GET", "/users/a%2Fb");
+    show(& r, "GET", "/users/7/posts/99");
+    show(& r, "GET", "/users/7/posts");
+    show(& r, "GET", "/files/docs/2026/report.pdf");
+    show(& r, "GET", "/files/");
+    show(& r, "PATCH", "/echo");
+    show(& r, "GET", "/api/v1/items?page=2&q=red+shoes%21");
+    show(& r, "DELETE", "/users");
+    show(& r, "DELETE", "/users/42");
+    show(& r, "GET", "/nowhere");
+    show(& r, "GET", "/users/%zz");
+    show(& r, "OPTIONS", "/users");
+
+    val head: str = get(& r, "HEAD", "/users/5");
+    println("HEAD /users/5 -> " + status_of(head) + " length " + header_of(head, "content-length") + " body bytes " + int_to_str(str_len(body_of(head))));
+
+    // Strict trailing slash
+    http_router_strict_slash(& mut r, true);
+    show(& r, "GET", "/users/");
+    http_router_strict_slash(& mut r, false);
+
+    // Custom 404
+    http_router_set_not_found(& mut r, h_nf);
+    show(& r, "GET", "/missing");
+
+    // Bad patterns
+    var bad: HttpRouter = http_router_new();
+    var rejected: Vec<str> = Vec::new();
+    if !http_router_get(& mut bad, "/a/*rest/b", h_home) {
+        rejected.push(bad.error);
+    }
+    if !http_router_get(& mut bad, "/a/:", h_home) {
+        rejected.push(bad.error);
+    }
+    if !http_router_get(& mut bad, "/a/:x/:x", h_home) {
+        rejected.push(bad.error);
+    }
+    http_router_get(& mut bad, "/a/:x", h_home);
+    if !http_router_get(& mut bad, "/a/:y", h_home) {
+        rejected.push(bad.error);
+    }
+    var i: i64 = 0;
+    while i < rejected.len() {
+        println("rejected: " + rejected.get(i));
+        i = i + 1;
+    }
+
+    // Matching on its own
+    val m: RouteMatch = http_router_match(& r, "get", "/users/9/posts/3");
+    println("match: " + int_to_str(m.status) + " " + m.pattern + " uid=" + route_param(& m.params, "uid") + " pid=" + route_param(& m.params, "pid"));
+    val w: RouteMatch = http_router_match(& r, "GET", "/files/a/b%20c");
+    println("wildcard: " + w.params.wildcard);
+
+    // The adapter for http_serve
+    val serve: fn(HttpRequest) -> str = http_router_serve_fn(r);
+    val req: HttpRequest = http_parse_head("GET /users/77 HTTP/1.1\r\n\r\n");
+    println("serve fn: " + body_of(serve(req)));
+    print(http_router_describe(& r));
+    return 0;
+}

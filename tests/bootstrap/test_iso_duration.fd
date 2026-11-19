@@ -1,0 +1,105 @@
+// stdlib/datetime: ISO 8601 durations (complaint CD2, SL8 depth).
+// dur_iso_parse reads every component, the sign, weeks, a decimal comma
+// and fractions of a second, and rejects malformed text (no component, a
+// time unit before T, units out of order or repeated, a fraction not on
+// the seconds); dur_iso_format writes the canonical form; dur_to_iso
+// writes an exact Duration; dt_add_iso moves a time by calendar months
+// and years (end of month clamped, as java.time and Temporal do), then
+// days and time. The dates agree with Python's dateutil.relativedelta.
+//
+// Expected output:
+// P3Y6M4DT12H30M5S -> P3Y6M4DT12H30M5S
+// PT1.5S -> PT1.5S
+// PT0,25S -> PT0.25S
+// P2W -> P14D
+// -P1D -> -P1D
+// +PT36H -> PT36H
+// P0D -> PT0S
+// P1W2D -> P9D
+// PT0.000000001S -> PT0.000000001S
+// P -> invalid
+// PT -> invalid
+// 1D -> invalid
+// P1H -> invalid
+// PT1D -> invalid
+// P1D2Y -> invalid
+// P1Y1Y -> invalid
+// P1.5D -> invalid
+// PT1S2M -> invalid
+// P-1D -> invalid
+// PT1.S -> invalid
+// P1DT -> invalid
+// PT1.0000000001S -> invalid
+// parts = 1 2 10 9000 0
+// iso.93784 = P1DT2H3M4S
+// iso.-90 = -PT1M30S
+// iso.0 = PT0S
+// iso.2d = P2D
+// 2024-01-31T10:00:00Z + P1M = 2024-02-29T10:00:00Z
+// 2024-01-31T10:00:00Z + P1Y1M = 2025-02-28T10:00:00Z
+// 2023-03-31T00:00:00Z + -P1M = 2023-02-28T00:00:00Z
+// 2024-02-29T00:00:00Z + P1Y = 2025-02-28T00:00:00Z
+// 2024-12-31T23:00:00Z + PT2H = 2025-01-01T01:00:00Z
+// 2024-01-01T00:00:00Z + P1Y2M10DT2H30M = 2025-03-11T02:30:00Z
+// 2024-03-01T00:30:00Z + -P1DT1H = 2024-02-28T23:30:00Z
+// 2024-01-15T00:00:00Z + -P13M = 2022-12-15T00:00:00Z
+// iso duration ok
+
+use datetime;
+use time;
+
+fn rt(s: str) {
+    var d: IsoDuration = dur_iso_parse(s);
+    if d.ok {
+        println(s + " -> " + dur_iso_format(d));
+    } else {
+        println(s + " -> invalid");
+    }
+}
+
+fn add(t: LogicalTime, s: str) {
+    println(time_to_iso(t) + " + " + s + " = " + time_to_iso(dt_add_iso(t, dur_iso_parse(s))));
+}
+
+fn main() -> i64 {
+    rt("P3Y6M4DT12H30M5S");
+    rt("PT1.5S");
+    rt("PT0,25S");
+    rt("P2W");
+    rt("-P1D");
+    rt("+PT36H");
+    rt("P0D");
+    rt("P1W2D");
+    rt("PT0.000000001S");
+    rt("P");
+    rt("PT");
+    rt("1D");
+    rt("P1H");
+    rt("PT1D");
+    rt("P1D2Y");
+    rt("P1Y1Y");
+    rt("P1.5D");
+    rt("PT1S2M");
+    rt("P-1D");
+    rt("PT1.S");
+    rt("P1DT");
+    rt("PT1.0000000001S");
+    var d: IsoDuration = dur_iso_parse("P1Y2M10DT2H30M");
+    println("parts = " + int_to_str(d.years) + " " + int_to_str(d.months) + " " + int_to_str(d.days) + " " + int_to_str(d.seconds) + " " + int_to_str(d.nanos));
+
+    println("iso.93784 = " + dur_to_iso(dur_seconds(93784)));
+    println("iso.-90 = " + dur_to_iso(dur_seconds(- 90)));
+    println("iso.0 = " + dur_to_iso(dur_seconds(0)));
+    println("iso.2d = " + dur_to_iso(dur_days(2)));
+
+    add(time_new(2024, 1, 31, 10, 0, 0), "P1M");
+    add(time_new(2024, 1, 31, 10, 0, 0), "P1Y1M");
+    add(time_new(2023, 3, 31, 0, 0, 0), "-P1M");
+    add(time_new(2024, 2, 29, 0, 0, 0), "P1Y");
+    add(time_new(2024, 12, 31, 23, 0, 0), "PT2H");
+    add(time_new(2024, 1, 1, 0, 0, 0), "P1Y2M10DT2H30M");
+    add(time_new(2024, 3, 1, 0, 30, 0), "-P1DT1H");
+    add(time_new(2024, 1, 15, 0, 0, 0), "-P13M");
+    println("iso duration ok");
+    return 0;
+}

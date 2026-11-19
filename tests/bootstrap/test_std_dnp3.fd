@@ -1,0 +1,114 @@
+// stdlib/dnp3: CRC-16/DNP check value, a link frame round trip with every
+// CRC verified, transport segmentation/reassembly, a READ request, and a
+// CROB select/operate against an outstation with a Class-0 response.
+// Expected output:
+// crc 123456789: ea82
+// link frame bytes: 05640ac4010002008e2b + data
+// link parse: ok func 4 dest 1 src 2 payload 5
+// transport: 3 segments, reassembled 500 bytes ok
+// read req: c1 1 1e 1 0 0 9
+// crob decode: idx 2 code 3 on 1000 status 0
+// select: 0, operate: 0, relay2 now 1
+// operate without select: 2
+// class0: func 129 iin 0x0 bins 3 analog0 12345
+use dnp3;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn main() {
+    // CRC check value
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 9 {
+        m.push(49 + i);   // '1'..'9'
+        i = i + 1;
+    }
+    println("crc 123456789: " + int_to_hex(dnp3_crc_all(& m)));
+
+    // Link frame: unconfirmed user data, dest 1, src 2, 5-byte payload
+    var payload: Vec<i64> = Vec::new();
+    payload.push(0xC0); payload.push(0x01); payload.push(0x3C); payload.push(0x02); payload.push(0x06);
+    val frame: Vec<i64> = dnp3_link_frame(1, 1, 0, 0, DNP3_LINK_UNCONFIRMED, 1, 2, & payload);
+    println("link frame bytes: " + hx_first(frame, 10) + " + data");
+
+    val lp: Dnp3LinkFrame = dnp3_link_parse(& frame);
+    println("link parse: " + ok_str(lp.ok) + " func " + int_to_str(lp.func) + " dest " + int_to_str(lp.dest) + " src " + int_to_str(lp.src) + " payload " + int_to_str(lp.payload.len()));
+
+    // Transport: 500-byte fragment -> segments -> back
+    var frag: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 500 {
+        frag.push(k & 255);
+        k = k + 1;
+    }
+    val segs: Vec<Vec<i64>> = dnp3_transport_segment(& frag, 0);
+    val asm: Dnp3Assembly = dnp3_transport_assemble(& segs);
+    var same: bool = asm.ok && asm.fragment.len() == 500;
+    var c: i64 = 0;
+    while c < asm.fragment.len() {
+        if asm.fragment.get(c) != frag.get(c) { same = false; }
+        c = c + 1;
+    }
+    println("transport: " + int_to_str(segs.len()) + " segments, reassembled " + int_to_str(asm.fragment.len()) + " bytes " + ok_str(same));
+
+    // READ request: analog inputs g30v1, points 0..9
+    val rq: Vec<i64> = dnp3_build_read(1, 30, 1, 0, 9);
+    println("read req: " + hx_space(rq));
+
+    // CROB select/operate
+    val crob_bytes: Vec<i64> = dnp3_crob_encode(2, DNP3_CROB_LATCH_ON, 1, 1000, 0, 0);
+    val crob: Dnp3Crob = dnp3_crob_decode(& crob_bytes, 0);
+    println("crob decode: idx " + int_to_str(crob.index) + " code " + int_to_str(crob.control_code) + " on " + int_to_str(crob.on_time) + " status " + int_to_str(crob.status));
+
+    var os: Dnp3Outstation = dnp3_outstation_new(3, 4, 2, 0);
+    os.analog_in.set(0, 12345);
+    val s1: i64 = dnp3_outstation_select(& mut os, & crob);
+    val o1: i64 = dnp3_outstation_operate(& mut os, & crob);
+    println("select: " + int_to_str(s1) + ", operate: " + int_to_str(o1) + ", relay2 now " + int_to_str(os.relays.get(2)));
+
+    // operate without a fresh select -> NO_SELECT (2)
+    val o2: i64 = dnp3_outstation_operate(& mut os, & crob);
+    println("operate without select: " + int_to_str(o2));
+
+    // Class-0 response
+    val resp: Vec<i64> = dnp3_outstation_class0(& os, 1, 0);
+    val rh: Dnp3AppResponse = dnp3_app_response_header(& resp);
+    // first object header at body_start: g1v2 range; count = stop-start+1
+    val oh: Dnp3ObjHeaderAt = dnp3_objhdr_decode(& resp, rh.body_start);
+    val nbins: i64 = oh.hdr.count;
+    // analog header follows the 3 binary flag bytes
+    val oh2: Dnp3ObjHeaderAt = dnp3_objhdr_decode(& resp, oh.next + nbins);
+    val a0: i64 = dnp3_analog32_value(& resp, oh2.next);
+    println("class0: func " + int_to_str(rh.func) + " iin 0x" + int_to_hex(rh.iin) + " bins " + int_to_str(nbins) + " analog0 " + int_to_str(a0));
+}
+
+fn ok_str(b: bool) -> str {
+    if b { return "ok"; }
+    return "FAIL";
+}
+
+fn hx_first(v: Vec<i64>, n: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n && i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return hex_encode_bytes(out);
+}
+
+fn hx_space(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + " "; }
+        s = s + int_to_hex(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}

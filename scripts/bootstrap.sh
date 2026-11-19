@@ -64,7 +64,9 @@ elif command -v gcc >/dev/null; then CC_CMD=(gcc)
 elif command -v clang >/dev/null; then CC_CMD=(clang)
 elif command -v zig >/dev/null; then CC_CMD=(zig cc)
 else echo "error: no C compiler found (set CC)"; exit 1; fi
-CFLAGS=(-O0 -w)
+# -DP_NO_ENV_LIMITS: FID_MEM_LIMIT / FID_CPU_LIMIT in the environment limit
+# the programs fid builds, not fid itself while it compiles
+CFLAGS=(-O0 -w -DP_NO_ENV_LIMITS)
 case "${CC_CMD[*]}" in
   *tcc*) ;;
   *) CFLAGS+=(-fno-sanitize=all -Wno-error -Wno-int-conversion -Wno-incompatible-pointer-types
@@ -78,7 +80,7 @@ SPLIT_CFLAGS=(-O2 -fno-strict-aliasing -fwrapv)
 for f in "${CFLAGS[@]}"; do [ "$f" != "-O0" ] && SPLIT_CFLAGS+=("$f"); done
 LIBS=()
 EXE=""
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; Darwin) LIBS=(-lm -lpthread); CFLAGS+=(-D_XOPEN_SOURCE=600 -D_DARWIN_C_SOURCE) ;; *) LIBS=(-lm -lpthread); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LIBS=(-lws2_32); EXE=".exe" ;; Darwin) LIBS=(-lm -lpthread); CFLAGS+=(-D_XOPEN_SOURCE=600 -D_DARWIN_C_SOURCE) ;; *) LIBS=(-lm -lpthread -ldl); case "${CC_CMD[*]}${CC:-}" in *zig*) LIBS+=(-lunwind) ;; esac ;; esac
 
 # Rename main and run it on a thread with a 256MB stack.
 wrap() {
@@ -141,6 +143,17 @@ compile_c() {
   esac
   "${CC_CMD[@]}" "${CFLAGS[@]}" "$c" -o "$exe" "${LIBS[@]}" >> "$log" 2>&1
 }
+
+# N12: a release build names its commit and date in `fid version`
+# (compiler/build_info.fd, written for the stages and put back on exit)
+if [ -n "${RELEASE:-}" ]; then
+  bash scripts/build-info.sh
+  trap 'bash scripts/build-info.sh --reset' EXIT
+  # D9: the stages share one source hash and differ only in size; keyed by
+  # their bytes (inc.fd inc_compiler_identity "exe") they never share a
+  # build cache. The installed fid keeps the cheap source key.
+  export FIDES_SELF_HASH=exe
+fi
 
 prev="$STAGE0"
 if [ -n "${NATIVE:-}" ]; then
@@ -220,4 +233,7 @@ if [ -n "${RELEASE:-}" ]; then
     exit 1
   fi
   echo "RELEASE OK: release/fid$EXE ($(wc -c < "release/fid$EXE") bytes)"
+  # release-roadmap A10: stamp it (binary and source hashes, commit), so a
+  # stale release/fid is told apart from this build (scripts/release-fresh.sh)
+  bash scripts/release-fresh.sh --write "release/fid$EXE"
 fi

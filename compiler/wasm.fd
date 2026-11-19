@@ -21,9 +21,12 @@
 // wasi_snapshot_preview1 here. The other nat_* primitives are written here
 // in WASM.
 //
-// Control flow: one loop around one block per IR block (the "switch loop"):
-// a jump sets the block index and branches to the loop, whose br_table
-// enters the block; a jump to the next block falls through.
+// Control flow (TG16): WASM's block / loop / if made from the CFG over its
+// dominator tree ("Structured control flow"). The functions that may give
+// control away (see "Tasks") and an irreducible CFG keep the "switch
+// loop": one loop around one block per IR block; a jump sets the block
+// index and branches to the loop, whose br_table enters the block; a jump
+// to the next block falls through.
 //
 // Linear memory: [0, 1024) unused, [1024, WG_STACK_TOP) the stack of
 // allocas (global 0 is its pointer; it grows down, a frame below 1024 is
@@ -33,6 +36,23 @@
 //
 // Functions are compiled from `_start` on, as they are called (a
 // worklist): unused code is never emitted.
+//
+// Tasks (PL4): WASM cannot switch stacks, so a task switch unwinds the
+// WASM stack and rewinds the other context's, as Binaryen's asyncify
+// does. The functions that may reach nat_ctx_swap (wg_as_analyze: the
+// call graph, closures and dyn calls included) save their locals and
+// their resume point (a "segment" of the switch loop that starts with the
+// call) when a call returns with the state "unwinding", and restore them
+// on entry when it is "rewinding". A context is a record: the running
+// program's in the data (main_rec), a task's the record pe_co_new_block
+// puts at the top of its stack; [0] where its saved frames start, [8]
+// where they end, [16] its stack pointer (global 0). nat_ctx_swap(save,
+// sp) stores the running context's record at save and unwinds; _start's
+// loop (wg_gen_start) then enters the context `sp` names: a new task by
+// calling its body [sp + 112](env 0, [sp + 120]) on its own stack, a
+// suspended one by calling its bottom function again while rewinding.
+// Threads still run to their end when they start (nat_clone_thread),
+// within the context that starts them.
 
 module compiler::wasm;
  use core; use vec; use string; use compiler::ir; use compiler::ast; use compiler::checks;
@@ -44,6 +64,10 @@ const SEC_TYPE: i64 = 1; const SEC_IMPORT: i64 = 2; const SEC_FUNCTION: i64 = 3;
 const WG_STACK_LO: i64 = 1024; const WG_STACK_TOP: i64 = 8389632;  // 1024 + 8 MB
 const WG_DATA_BASE: i64 = 8389632;  // What nat_ctx_tramp returns: marks a task's first context record
 const WG_TRAMP: i64 = 0x7A5E7A5E;
+// The globals of stack switching (see "Tasks"): the state (0 running, 1
+// unwinding, 2 rewinding), the end of the saved frames, the running
+// context's record, the context to switch to
+const WG_G_ST: i64 = 4; const WG_G_PTR: i64 = 5; const WG_G_CUR: i64 = 6; const WG_G_NEXT: i64 = 7;
 // The arithmetic panics (nat_ir's NP_*)
 const WP_ADD: i64 = 0; const WP_SUB: i64 = 1; const WP_MUL: i64 = 2; const WP_DIV_OVF: i64 = 3; const WP_DIV_ZERO: i64 = 4; const WP_MOD_ZERO: i64 = 5;
 // Integer compare kinds
@@ -120,11 +144,29 @@ pub struct WasmGen {
     pub k: i64,
     pub extra: i64,
     pub cur_inst_line: i64,
+    // Stack switching (PL4, see "Tasks"): the functions that may give
+    // control away (name -> 1), whether a closure call may, whether the
+    // function being compiled saves and restores its frame, whether the
+    // instruction being compiled is a call that may; the main context's
+    // record
+    pub as_set: i64,
+    pub as_ind: bool,
+    pub as_fn: bool,
+    pub as_here: bool,
+    pub main_rec: i64,
+    // Control flow (TG16): every function gets the switch loop
+    // (FID_WASM_SWITCH=1); functions written structured, with the switch
+    // loop for tasks, for an irreducible CFG, because of FID_WASM_SWITCH
+    pub cf_switch_only: bool,
+    pub cf_struct: i64,
+    pub cf_task: i64,
+    pub cf_irred: i64,
+    pub cf_forced: i64,
 }
 
 fn WasmGen_new() -> WasmGen {
     return WasmGen {
-        all_fns: HashMap_new(), fn_index: HashMap_new(), queue: Vec::new(), def_types: Vec::new(), n_imports: 0, imp_names: Vec::new(), imp_sigs: Vec::new(), imp_index: HashMap_new(), type_keys: Vec::new(), type_index: HashMap_new(), table: Vec::new(), table_index: HashMap_new(), data: Vec::new(), str_addr: HashMap_new(), glob_addr: HashMap_new(), globs: Vec::new(), named_fns: Vec::new(), named_seen: HashMap_new(), dyn_types: Vec::new(), c_names: HashMap_new(), c_list: Vec::new(), unresolved: Vec::new(), unresolved_seen: HashMap_new(), b: Vec::new(), cur_name: "", cur_wrapping: false, unchecked: Vec::new(), local_of: Vec::new(), alloca_off: Vec::new(), frame: 0, va_off: 0 - 1, t0: 0, t1: 0, t2: 0, t3: 0, fp: 0, cur: 0, block_index: HashMap_new(), nblocks: 0, k: 0, extra: 0, cur_inst_line: 0,
+        all_fns: HashMap_new(), fn_index: HashMap_new(), queue: Vec::new(), def_types: Vec::new(), n_imports: 0, imp_names: Vec::new(), imp_sigs: Vec::new(), imp_index: HashMap_new(), type_keys: Vec::new(), type_index: HashMap_new(), table: Vec::new(), table_index: HashMap_new(), data: Vec::new(), str_addr: HashMap_new(), glob_addr: HashMap_new(), globs: Vec::new(), named_fns: Vec::new(), named_seen: HashMap_new(), dyn_types: Vec::new(), c_names: HashMap_new(), c_list: Vec::new(), unresolved: Vec::new(), unresolved_seen: HashMap_new(), b: Vec::new(), cur_name: "", cur_wrapping: false, unchecked: Vec::new(), local_of: Vec::new(), alloca_off: Vec::new(), frame: 0, va_off: 0 - 1, t0: 0, t1: 0, t2: 0, t3: 0, fp: 0, cur: 0, block_index: HashMap_new(), nblocks: 0, k: 0, extra: 0, cur_inst_line: 0, as_set: HashMap_new(), as_ind: false, as_fn: false, as_here: false, main_rec: 0, cf_switch_only: false, cf_struct: 0, cf_task: 0, cf_irred: 0, cf_forced: 0,
     };
 }
 
@@ -443,6 +485,17 @@ fn wg_is_narrow(ty: IrType) -> bool {
 /// Push value `id` as an f64 (its bits reinterpreted), or an f32
 fn wget_f(g: & mut WasmGen, id: i64, is32: bool) {
     wget(g, id);
+    if is32 {
+        wwrap(g);
+        w(g, 0xBE);
+    } else {
+        w(g, 0xBF);
+    }
+}
+
+/// Local `local` (a float's bits) pushed as an f32 or f64
+fn wlget_f(g: & mut WasmGen, local: i64, is32: bool) {
+    wlget(g, local);
     if is32 {
         wwrap(g);
         w(g, 0xBE);
@@ -785,6 +838,69 @@ fn wg_meta_ty(func: & IrFunction, id: i64) -> IrType {
     return IrType::I64;
 }
 
+/// CI5: the element count of the fixed-size array `ptr` points at (its
+/// type is `*[T; N]` and the access steps by T's size), or -1. A function
+/// parameter has no type here (-1: unchecked, as before). A value typed
+/// `[T; N]` itself is the array's address here (the Load from a slot of a
+/// `var a: [T; N] = ...`, which holds the pointer: an i64 load), so it is
+/// checked against N the same way.
+fn wg_array_bound(func: & IrFunction, module: & IrModule, ptr: i64, esize: i64) -> i64 {
+    match wg_meta_ty(func, ptr) {
+        IrType::Array(velem, vn) => {
+            var vsize: i64 = IrModule_type_size(module, box_ir_type_unbox(velem));
+            if vsize < 1 {
+                vsize = 1;
+            }
+            if vsize == esize && vn >= 0 {
+                return vn;
+            }
+        }
+        IrType::Ptr(inner) => {
+            match box_ir_type_unbox(inner) {
+                IrType::Array(aelem, n) => {
+                    var asize: i64 = IrModule_type_size(module, box_ir_type_unbox(aelem));
+                    if asize < 1 {
+                        asize = 1;
+                    }
+                    if asize == esize && n >= 0 {
+                        return n;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return 0 - 1;
+}
+
+/// CI5: whether instruction `id` lies inside an `unsafe` block (between an
+/// UnsafeBegin and its UnsafeEnd: ids grow in the order lowering emits)
+fn wg_in_unsafe(func: & IrFunction, id: i64) -> bool {
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while i < func.insts.len() {
+        if func.insts.get(i).id < id {
+            match func.insts.get(i).inst {
+                Inst::UnsafeBegin => {
+                    depth = depth + 1;
+                }
+                Inst::UnsafeEnd => {
+                    if depth > 0 {
+                        depth = depth - 1;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return depth > 0;
+}
+
 fn wg_meta_line(func: & IrFunction, id: i64) -> i64 {
     match IrFunction_get_meta(func, id) {
         OptValueMeta::Some(m) => {
@@ -849,6 +965,186 @@ fn wg_call_named(g: & mut WasmGen, name: str, pushed: i64) {
         k = k + 1;
     }
     wcall(g, f);
+    if g.as_here && HashMap_contains(g.as_set, name) {
+        wg_as_check(g);
+    }
+}
+
+/// After a call that may give control away: when it returned unwinding,
+/// leave the switch loop for the function's save code with this segment
+/// (the call's) as the resume point
+fn wg_as_check(g: & mut WasmGen) {
+    wgget(g, WG_G_ST);
+    wwrap(g);
+    wif(g);
+    wi32(g, g.k);
+    wlset(g, g.cur);
+    // the if, the segments' blocks still open, the loop, then $unwind
+    wbr(g, g.nblocks - g.k + g.extra);
+    wendif(g);
+}
+
+/// The functions a call instruction may run, as wg_gen_call resolves it
+/// ("<ind>": a closure, any function a function reference names)
+fn wg_as_callees(g: & WasmGen, inst: Inst) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    match inst {
+        Inst::Call(call_name, _, _, _) => {
+            out.push(call_name);
+            var r: str = wg_resolve(g, call_name);
+            if r != call_name {
+                out.push(r);
+            }
+            if call_name == "p_thread_spawn" {
+                out.push("pert_thread_spawn_v");
+            }
+            if call_name == "p_co_async" {
+                out.push("pert_co_async_v");
+            }
+            if call_name == "p_executor_spawn" {
+                out.push("pert_executor_spawn_v");
+            }
+            if HashMap_contains(g.c_names, call_name) {
+                var cname: str = g.c_list.get(HashMap_get(g.c_names, call_name) - 1);
+                out.push("pert_c_" + cname);
+                out.push(cname);
+            }
+        }
+        Inst::CallPtr(_, _, _, _, _) => {
+            out.push("<ind>");
+        }
+        Inst::DynCall(_, method, _, _, _) => {
+            var ti: i64 = 0;
+            while ti < g.dyn_types.len() {
+                out.push(g.dyn_types.get(ti) + "_" + method);
+                ti = ti + 1;
+            }
+        }
+        _ => {
+        }
+    }
+    return out;
+}
+
+/// Whether instruction `inst` is a call that may give control away
+fn wg_as_inst(g: & WasmGen, inst: Inst) -> bool {
+    var cs: Vec<str> = wg_as_callees(g, inst);
+    var i: i64 = 0;
+    while i < cs.len() {
+        var c: str = cs.get(i);
+        if c == "<ind>" {
+            if g.as_ind {
+                return true;
+            }
+        } else if HashMap_contains(g.as_set, c) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The functions that may give control away (g.as_set): those that reach
+/// nat_ctx_swap, nat_call_fn (a task's body, any function) or
+/// nat_clone_thread (a thread's) through calls, closures (when a function
+/// a function reference names may) and dyn calls
+fn wg_as_analyze(g: & mut WasmGen, module: & IrModule) {
+    var nf: i64 = module.functions.len();
+    var idx: i64 = HashMap_new();
+    var fi: i64 = 0;
+    while fi < nf {
+        HashMap_insert(idx, module.functions.get(fi).name, fi + 1);
+        fi = fi + 1;
+    }
+    // Node nf: a closure call; node nf + 1: the primitives
+    var ind: i64 = nf;
+    var seed: i64 = nf + 1;
+    var starts: Vec<i64> = Vec::new();
+    var edges: Vec<i64> = Vec::new();
+    var refs: Vec<i64> = Vec::new();
+    fi = 0;
+    while fi < nf {
+        starts.push(edges.len());
+        var f: IrFunction = module.functions.get(fi).func;
+        var k: i64 = 0;
+        while k < f.insts.len() {
+            match f.insts.get(k).inst {
+                Inst::ConstFnRef(rname) => {
+                    var rt: str = c_fn_target(rname);
+                    if HashMap_contains(idx, rt) {
+                        refs.push(HashMap_get(idx, rt) - 1);
+                    }
+                }
+                _ => {
+                }
+            }
+            var cs: Vec<str> = wg_as_callees(g, f.insts.get(k).inst);
+            var ci: i64 = 0;
+            while ci < cs.len() {
+                var c: str = cs.get(ci);
+                if c == "<ind>" {
+                    edges.push(ind);
+                } else if c == "nat_ctx_swap" || c == "nat_call_fn" || c == "nat_clone_thread" {
+                    edges.push(seed);
+                } else if HashMap_contains(idx, c) {
+                    edges.push(HashMap_get(idx, c) - 1);
+                }
+                ci = ci + 1;
+            }
+            k = k + 1;
+        }
+        fi = fi + 1;
+    }
+    starts.push(edges.len());
+    var sw: Vec<i64> = Vec::new();
+    var n: i64 = 0;
+    while n < nf + 2 {
+        sw.push(0);
+        n = n + 1;
+    }
+    sw.set(seed, 1);
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        fi = 0;
+        while fi < nf {
+            if sw.get(fi) == 0 {
+                var e: i64 = starts.get(fi);
+                var e_end: i64 = starts.get(fi + 1);
+                while e < e_end {
+                    if sw.get(edges.get(e)) != 0 {
+                        sw.set(fi, 1);
+                        changed = true;
+                        break;
+                    }
+                    e = e + 1;
+                }
+            }
+            fi = fi + 1;
+        }
+        if sw.get(ind) == 0 {
+            var r: i64 = 0;
+            while r < refs.len() {
+                if sw.get(refs.get(r)) != 0 {
+                    sw.set(ind, 1);
+                    changed = true;
+                    break;
+                }
+                r = r + 1;
+            }
+        }
+    }
+    g.as_ind = sw.get(ind) != 0;
+    fi = 0;
+    while fi < nf {
+        if sw.get(fi) != 0 {
+            HashMap_insert(g.as_set, module.functions.get(fi).name, 1);
+        }
+        fi = fi + 1;
+    }
+    HashMap_insert(g.as_set, "nat_ctx_swap", 1);
+    HashMap_insert(g.as_set, "nat_call_fn", 1);
+    HashMap_insert(g.as_set, "nat_clone_thread", 1);
 }
 
 /// Push values `srcs` (-1: a null `__env`)
@@ -944,6 +1240,46 @@ fn wg_call_import(g: & mut WasmGen, ix: i64, args: & Vec<i64>) {
     }
 }
 
+/// The value of bare-metal builtin `name` in a WASI program (the
+/// interpreter's), -1 when it is not one (or the program or its runtime
+/// defines it)
+fn wg_bare_value(g: & WasmGen, name: str) -> i64 {
+    if wg_has_fn(g, name) || wg_has_fn(g, wg_resolve(g, name)) {
+        return 0 - 1;
+    }
+    if name == "p_cli" || name == "p_sti" || name == "p_lidt" || name == "p_idt_set_entry" || name == "p_hlt" || name == "p_outb" || name == "p_cr3_write" || name == "p_cr0_write" || name == "p_cr4_write" || name == "p_invlpg" || name == "p_page_map" || name == "p_page_unmap" || name == "p_phys_write64" || name == "p_lgdt" || name == "p_gdt_set_entry" || name == "p_serial_init" || name == "p_serial_write" {
+        return 0;
+    }
+    if name == "p_inb" || name == "p_phys_read64" || name == "p_serial_read" || name == "p_serial_ready" {
+        return 0;
+    }
+    if name == "p_cr3_read" {
+        return 0x10000;
+    }
+    if name == "p_cr0_read" {
+        return 0x80000011;
+    }
+    if name == "p_cr4_read" {
+        return 0x20;
+    }
+    return 0 - 1;
+}
+
+/// A builtin or C function that starts a process (WASI has no processes)
+fn wg_is_process_call(g: & WasmGen, name: str) -> bool {
+    if wg_has_fn(g, name) {
+        return false;
+    }
+    if name == "p_system" || name == "p_process_run" || name == "p_spawn_process" || name == "p_exec" {
+        return true;
+    }
+    if HashMap_contains(g.c_names, name) {
+        var cname: str = g.c_list.get(HashMap_get(g.c_names, name) - 1);
+        return cname == "system" || cname == "popen" || cname == "fork" || cname == "execv" || cname == "execvp" || cname == "execve" || cname == "posix_spawn" || cname == "posix_spawnp";
+    }
+    return false;
+}
+
 fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: & IrFunction) {
     // An f64 lives in its local as its bits: these copy the word
     if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
@@ -969,6 +1305,23 @@ fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: 
         wget_f(g, args.get(0), false);
         w(g, 0xB6);
         wf_bits(g, true);
+        wset(g, id);
+        return;
+    }
+    // Bare-metal builtins (PL4): a WASI program has no ports, control
+    // registers or serial line; they do nothing, as in the interpreter
+    // (compiler/interp.fd "Bare-metal stubs")
+    var bare: i64 = wg_bare_value(g, call_name);
+    if bare != 0 - 1 {
+        wi64(g, bare);
+        wset(g, id);
+        return;
+    }
+    // Processes (PL4): WASI has none, so a command is a clear run-time
+    // error where the runtime would fail to fork ("could not start")
+    if wg_is_process_call(g, call_name) {
+        wg_panic_msg(g, "not available in WebAssembly: processes (" + call_name + ")");
+        wi64(g, 0);
         wset(g, id);
         return;
     }
@@ -1034,6 +1387,20 @@ fn wg_gen_call(g: & mut WasmGen, id: i64, call_name: str, args: Vec<i64>, func: 
         if wg_prim_params(cname) >= 0 {
             wg_push_srcs(g, & args);
             wg_call_named(g, cname, args.len());
+            wset(g, id);
+            return;
+        }
+        // A C function with no WebAssembly version (a C library's, or the
+        // C runtime's own, as pledge_asset_*): a clear error when it is
+        // called, not a module that cannot be built (PL4), as the
+        // interpreter does with FFI it cannot run
+        if !wg_has_fn(g, wg_resolve(g, call_name)) {
+            if !HashMap_contains(g.unresolved_seen, "C " + cname) {
+                HashMap_insert(g.unresolved_seen, "C " + cname, 1);
+                p_eprint_str("[wasm] warning: C function " + cname + " (from " + g.cur_name + ") has no WebAssembly version: calling it panics\n");
+            }
+            wg_panic_msg(g, "not available in WebAssembly: C function " + cname + " (build with `fid ccompile --target wasm32-wasi`)");
+            wi64(g, 0);
             wset(g, id);
             return;
         }
@@ -1325,6 +1692,43 @@ fn wg_gen_binop(g: & mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty:
             }
             BinOp::GtEq => {
                 cc = WCC_GE;
+            }
+            _ => {
+            }
+        }
+        match op {
+            BinOp::Mod => {
+                // WASM has no fmod: a - trunc(a / b) * b, which is C's fmod
+                // while a / b's integer part is exact (2g.13; it gave 0).
+                // A zero b or an infinite a gives NaN, as fmod does; an
+                // infinite b gives NaN where fmod gives a.
+                wget(g, left);
+                wlset(g, g.t0);
+                wget(g, right);
+                wlset(g, g.t1);
+                wlget_f(g, g.t0, is32);
+                wlget_f(g, g.t0, is32);
+                wlget_f(g, g.t1, is32);
+                if is32 {
+                    w(g, 0x95);
+                    w(g, 0x8F);
+                } else {
+                    w(g, 0xA3);
+                    w(g, 0x9D);
+                }
+                // f.div, f.trunc
+                wlget_f(g, g.t1, is32);
+                if is32 {
+                    w(g, 0x94);
+                    w(g, 0x93);
+                } else {
+                    w(g, 0xA2);
+                    w(g, 0xA1);
+                }
+                // f.mul, f.sub
+                wf_bits(g, is32);
+                wset(g, id);
+                return;
             }
             _ => {
             }
@@ -1744,6 +2148,17 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
             if esize < 1 {
                 esize = 1;
             }
+            // CI5: an index into a fixed-size array is checked, as the
+            // interpreter checks it (outside unsafe blocks)
+            var abound: i64 = wg_array_bound(func, module, array_ptr, esize);
+            if abound >= 0 && !wg_in_unsafe(func, id) {
+                wget(g, index);
+                wi64(g, abound);
+                w(g, 0x5A);
+                wif(g);
+                wg_panic_msg(g, "Array index out of bounds");
+                wendif(g);
+            }
             wget(g, array_ptr);
             wget(g, index);
             if esize != 1 {
@@ -1758,6 +2173,11 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
             if !(last && t == g.k + 1) {
                 wg_jump(g, t);
             }
+        }
+        Inst::Switch(_, _, _, _) => {
+            // ME28: formed only for codegen_c and nat_ir (ir.fd), never on
+            // this path; trap rather than guess a target
+            w(g, 0x00);
         }
         Inst::Branch(cond, then, else_) => {
             var tb: i64 = wg_block(g, then);
@@ -1820,6 +2240,9 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
             w(g, 0x11);
             wu(g, wg_type_n(g, srcs.len()));
             wu(g, 0);
+            if g.as_here && g.as_ind {
+                wg_as_check(g);
+            }
             wset(g, id);
         }
         Inst::DynCall(_, method, args, _, _) => {
@@ -1878,8 +2301,25 @@ fn wg_gen_inst(g: & mut WasmGen, id: i64, inst: Inst, last: bool, func: & IrFunc
             wlget(g, g.t0);
             wset(g, id);
         }
-        Inst::BitCast(value, _, _) => {
-            wget(g, value);
+        Inst::BitCast(value, from, to) => {
+            // f32 <-> f64 (lower.fd's float-to-float cast) converts the
+            // value: an f32 is held as its 32 bits, an f64 as its 64
+            // (2g.13). Any other bit cast keeps the bits.
+            var from32: bool = ir_type_eq(from, IrType::F32);
+            var to32: bool = ir_type_eq(to, IrType::F32);
+            if from32 && ir_type_eq(to, IrType::F64) {
+                wget_f(g, value, true);
+                w(g, 0xBB);
+                // f64.promote_f32
+                wf_bits(g, false);
+            } else if to32 && ir_type_eq(from, IrType::F64) {
+                wget_f(g, value, false);
+                w(g, 0xB6);
+                // f32.demote_f64
+                wf_bits(g, true);
+            } else {
+                wget(g, value);
+            }
             wset(g, id);
         }
         Inst::IntExtend(value, from, _) => {
@@ -2066,6 +2506,530 @@ fn wg_note_id(maxid: i64, id: i64) -> i64 {
     return maxid;
 }
 
+// ─── Structured control flow (TG16) ────────────────────────────────────
+//
+// A function's IR blocks become WASM's block / loop / if (a "stackifier"),
+// by Ramsey's translation over the dominator tree ("Beyond Relooper",
+// ICFP 2022). Block x is written as
+//   [loop]                       when a back edge enters x
+//     block .. block             one per merge child of x (a child in the
+//                                dominator tree with two or more forward
+//                                edges in), the latest in reverse
+//                                postorder outermost
+//       <x's code> <x's terminator>
+//     end <the earliest merge child's tree> .. end <the latest's>
+//   [end]
+// The edge x -> y is a `br` to y's loop (a back edge), a `br` to the end
+// of the block that y follows (y a merge node), or else y's tree written
+// in place (the edge is y's only forward edge in, so x is y's immediate
+// dominator). A two-way branch is a `br_if` when one side is a `br`, else
+// if / else. Every path ends in a return, a `br` or a trap, so nothing
+// falls out of the structure.
+//
+// The switch loop stays for an irreducible CFG (a back edge to a block
+// that does not dominate its source) and for the functions that may give
+// control away (see "Tasks": a rewind enters the code at a call, which is
+// the switch loop's dispatch). FID_WASM_SWITCH=1 gives every function the
+// switch loop (to compare).
+
+// A block's terminator: none (falls into the next block), Jump, Branch,
+// Return / Unreachable / Switch, none in the last block (returns 0)
+const WK_FALL: i64 = 0; const WK_JUMP: i64 = 1; const WK_BRANCH: i64 = 2; const WK_END: i64 = 3; const WK_RET0: i64 = 4;
+// The enclosing constructs while writing: an if, block x's loop, the
+// block that merge node x follows
+const WS_IF: i64 = 0; const WS_LOOP: i64 = 1; const WS_BLOCK: i64 = 2;
+
+/// The CFG of one function, by block index (func.blocks order; 0 is the
+/// entry), and the state of writing it
+pub struct WgCfg {
+    pub nb: i64,
+    // successors (-1: none): Jump's or the fall-through's in s0, Branch's
+    // then in s0 and else in s1
+    pub s0: Vec<i64>,
+    pub s1: Vec<i64>,
+    // the terminator: its kind (WK_*), its position in the block's
+    // instructions (the count when there is none), Branch's condition
+    pub tkind: Vec<i64>,
+    pub tpos: Vec<i64>,
+    pub tcond: Vec<i64>,
+    // reverse-postorder number (-1: not reachable), immediate dominator
+    pub rnum: Vec<i64>,
+    pub idom: Vec<i64>,
+    // 1: a back edge enters it; 1: two or more forward edges enter it
+    pub loop_head: Vec<i64>,
+    pub merge: Vec<i64>,
+    // the merge children of a block in the dominator tree, as a list
+    // (first, next), the latest in reverse postorder first
+    pub kid_first: Vec<i64>,
+    pub kid_next: Vec<i64>,
+    // written already
+    pub done: Vec<i64>,
+    // the enclosing constructs, innermost last
+    pub ctx_kind: Vec<i64>,
+    pub ctx_blk: Vec<i64>,
+    // false: irreducible, a jump to no block, or (not expected) an edge
+    // with no label to take it: the function keeps the switch loop
+    pub ok: bool,
+}
+
+fn wg_cfg_index(bidx: i64, block_id: i64) -> i64 {
+    if HashMap_contains(bidx, int_to_str(block_id)) {
+        return HashMap_get(bidx, int_to_str(block_id));
+    }
+    return 0 - 1;
+}
+
+/// The CFG of `func`: terminators and successors, reverse postorder from
+/// the entry, immediate dominators (Cooper, Harvey and Kennedy's iteration),
+/// loop headers and merge nodes, and the dominator tree's merge children.
+fn wg_cfg_build(func: & IrFunction) -> WgCfg {
+    var nb: i64 = func.blocks.len();
+    var bidx: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < nb {
+        HashMap_insert(bidx, int_to_str(func.blocks.get(i).id), i);
+        i = i + 1;
+    }
+    var c: WgCfg = WgCfg {
+        nb: nb, s0: Vec::new(), s1: Vec::new(), tkind: Vec::new(), tpos: Vec::new(), tcond: Vec::new(), rnum: Vec::new(), idom: Vec::new(), loop_head: Vec::new(), merge: Vec::new(), kid_first: Vec::new(), kid_next: Vec::new(), done: Vec::new(), ctx_kind: Vec::new(), ctx_blk: Vec::new(), ok: true,
+    };
+    // Terminators: the first Jump / Branch / Return / Unreachable / Switch
+    // of a block (what follows it never runs)
+    i = 0;
+    while i < nb {
+        var block: BasicBlock = func.blocks.get(i);
+        var kind: i64 = WK_FALL;
+        var pos: i64 = block.instructions.len();
+        var sa: i64 = 0 - 1;
+        var sb: i64 = 0 - 1;
+        var cond: i64 = 0;
+        var ii: i64 = 0;
+        while ii < block.instructions.len() && kind == WK_FALL {
+            match IrFunction_get_inst(func, block.instructions.get(ii)) {
+                OptInst::Some(inst) => {
+                    match inst {
+                        Inst::Jump(t) => {
+                            kind = WK_JUMP;
+                            pos = ii;
+                            sa = wg_cfg_index(bidx, t);
+                            if sa < 0 {
+                                c.ok = false;
+                            }
+                        }
+                        Inst::Branch(cv, t, e) => {
+                            kind = WK_BRANCH;
+                            pos = ii;
+                            cond = cv;
+                            sa = wg_cfg_index(bidx, t);
+                            sb = wg_cfg_index(bidx, e);
+                            if sa < 0 || sb < 0 {
+                                c.ok = false;
+                            }
+                        }
+                        Inst::Return(_) => {
+                            kind = WK_END;
+                            pos = ii;
+                        }
+                        Inst::Unreachable => {
+                            kind = WK_END;
+                            pos = ii;
+                        }
+                        Inst::Switch(_, _, _, _) => {
+                            kind = WK_END;
+                            pos = ii;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                OptInst::None => {
+                }
+            }
+            ii = ii + 1;
+        }
+        if kind == WK_FALL {
+            if i + 1 < nb {
+                sa = i + 1;
+            } else {
+                kind = WK_RET0;
+            }
+        }
+        c.s0.push(sa);
+        c.s1.push(sb);
+        c.tkind.push(kind);
+        c.tpos.push(pos);
+        c.tcond.push(cond);
+        c.rnum.push(0 - 1);
+        c.idom.push(0 - 1);
+        c.loop_head.push(0);
+        c.merge.push(0);
+        c.kid_first.push(0 - 1);
+        c.kid_next.push(0 - 1);
+        c.done.push(0);
+        i = i + 1;
+    }
+    if !c.ok || nb == 0 {
+        c.ok = false;
+        return c;
+    }
+    // Postorder from the entry, by an explicit stack (block, next successor)
+    var state: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nb {
+        state.push(0);
+        i = i + 1;
+    }
+    var order: Vec<i64> = Vec::new();
+    var stk: Vec<i64> = Vec::new();
+    var nxt: Vec<i64> = Vec::new();
+    stk.push(0);
+    nxt.push(0);
+    state.set(0, 1);
+    while stk.len() > 0 {
+        var top: i64 = stk.get(stk.len() - 1);
+        var e: i64 = nxt.get(nxt.len() - 1);
+        if e < 2 {
+            nxt.set(nxt.len() - 1, e + 1);
+            var y: i64 = c.s0.get(top);
+            if e == 1 {
+                y = c.s1.get(top);
+            }
+            if y >= 0 && state.get(y) == 0 {
+                state.set(y, 1);
+                stk.push(y);
+                nxt.push(0);
+            }
+        } else {
+            order.push(top);
+            stk.truncate(stk.len() - 1);
+            nxt.truncate(nxt.len() - 1);
+        }
+    }
+    var nr: i64 = order.len();
+    i = 0;
+    while i < nr {
+        c.rnum.set(order.get(i), nr - 1 - i);
+        i = i + 1;
+    }
+    // Predecessors of the reachable blocks, as offsets into one list
+    var poff: Vec<i64> = Vec::new();
+    i = 0;
+    while i <= nb {
+        poff.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        if c.rnum.get(i) >= 0 {
+            if c.s0.get(i) >= 0 {
+                poff.set(c.s0.get(i) + 1, poff.get(c.s0.get(i) + 1) + 1);
+            }
+            if c.s1.get(i) >= 0 {
+                poff.set(c.s1.get(i) + 1, poff.get(c.s1.get(i) + 1) + 1);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        poff.set(i + 1, poff.get(i + 1) + poff.get(i));
+        i = i + 1;
+    }
+    var plist: Vec<i64> = Vec::new();
+    var fill: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nb {
+        fill.push(poff.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < poff.get(nb) {
+        plist.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        if c.rnum.get(i) >= 0 {
+            var wsi: i64 = 0;
+            while wsi < 2 {
+                var to: i64 = c.s0.get(i);
+                if wsi == 1 {
+                    to = c.s1.get(i);
+                }
+                if to >= 0 {
+                    plist.set(fill.get(to), i);
+                    fill.set(to, fill.get(to) + 1);
+                }
+                wsi = wsi + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // Immediate dominators, over reverse postorder after the entry
+    c.idom.set(0, 0);
+    var changed: bool = true;
+    while changed {
+        changed = false;
+        var oi: i64 = nr - 2;
+        while oi >= 0 {
+            var bb: i64 = order.get(oi);
+            var nd: i64 = 0 - 1;
+            var pi: i64 = poff.get(bb);
+            while pi < poff.get(bb + 1) {
+                var p: i64 = plist.get(pi);
+                if c.idom.get(p) >= 0 {
+                    if nd < 0 {
+                        nd = p;
+                    } else {
+                        nd = wg_cfg_isect(& c, p, nd);
+                    }
+                }
+                pi = pi + 1;
+            }
+            if nd != c.idom.get(bb) {
+                c.idom.set(bb, nd);
+                changed = true;
+            }
+            oi = oi - 1;
+        }
+    }
+    // Back edges (to a block not later in reverse postorder) make loop
+    // headers and must go to a dominator of their source (or the CFG is
+    // irreducible); forward edges count towards merge nodes. An edge is
+    // counted once per successor slot: a Branch with both sides the same
+    // block gives it two.
+    var fwd: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nb {
+        fwd.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < nb {
+        if c.rnum.get(i) >= 0 {
+            var wk: i64 = 0;
+            while wk < 2 {
+                var t: i64 = c.s0.get(i);
+                if wk == 1 {
+                    t = c.s1.get(i);
+                }
+                if t >= 0 {
+                    if c.rnum.get(t) <= c.rnum.get(i) {
+                        c.loop_head.set(t, 1);
+                        var x: i64 = i;
+                        while x != t && x != 0 {
+                            x = c.idom.get(x);
+                        }
+                        if x != t {
+                            c.ok = false;
+                        }
+                    } else {
+                        fwd.set(t, fwd.get(t) + 1);
+                    }
+                }
+                wk = wk + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // Merge children: pushed to the front in increasing reverse postorder,
+    // so each list starts with its latest
+    var ri: i64 = nr - 2;
+    while ri >= 0 {
+        var yb: i64 = order.get(ri);
+        if fwd.get(yb) >= 2 {
+            c.merge.set(yb, 1);
+            var xb: i64 = c.idom.get(yb);
+            c.kid_next.set(yb, c.kid_first.get(xb));
+            c.kid_first.set(xb, yb);
+        }
+        ri = ri - 1;
+    }
+    return c;
+}
+
+/// The nearest common dominator of reachable blocks a and b.
+fn wg_cfg_isect(c: & WgCfg, a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    var y: i64 = b;
+    while x != y {
+        while c.rnum.get(x) > c.rnum.get(y) {
+            x = c.idom.get(x);
+        }
+        while c.rnum.get(y) > c.rnum.get(x) {
+            y = c.idom.get(y);
+        }
+    }
+    return x;
+}
+
+fn wg_st_push(c: & mut WgCfg, kind: i64, blk: i64) {
+    c.ctx_kind.push(kind);
+    c.ctx_blk.push(blk);
+}
+
+fn wg_st_pop(c: & mut WgCfg) {
+    c.ctx_kind.truncate(c.ctx_kind.len() - 1);
+    c.ctx_blk.truncate(c.ctx_blk.len() - 1);
+}
+
+/// The depth of the innermost enclosing construct `kind` of block t, -2
+/// when none encloses
+fn wg_st_find(c: & WgCfg, kind: i64, t: i64) -> i64 {
+    var n: i64 = c.ctx_kind.len();
+    var i: i64 = n - 1;
+    while i >= 0 {
+        if c.ctx_kind.get(i) == kind && c.ctx_blk.get(i) == t {
+            return n - 1 - i;
+        }
+        i = i - 1;
+    }
+    return 0 - 2;
+}
+
+/// How the edge s -> t is taken here: the depth of its `br` (to t's loop
+/// for a back edge, to the block merge node t follows), -1 when t's tree is
+/// written in place, -2 when neither applies (the function then keeps the
+/// switch loop)
+fn wg_st_depth(c: & WgCfg, s: i64, t: i64) -> i64 {
+    if c.rnum.get(t) <= c.rnum.get(s) {
+        return wg_st_find(c, WS_LOOP, t);
+    }
+    if c.merge.get(t) == 1 {
+        return wg_st_find(c, WS_BLOCK, t);
+    }
+    if c.idom.get(t) != s || c.done.get(t) == 1 {
+        return 0 - 2;
+    }
+    return 0 - 1;
+}
+
+/// Take the edge s -> t
+fn wg_st_goto(g: & mut WasmGen, c: & mut WgCfg, s: i64, t: i64, func: & IrFunction, module: & IrModule) {
+    var d: i64 = wg_st_depth(c, s, t);
+    if d >= 0 {
+        wbr(g, d);
+    } else if d == 0 - 1 {
+        wg_st_tree(g, c, t, func, module);
+    } else {
+        c.ok = false;
+        w(g, 0x00);
+    }
+}
+
+/// Block x and what it dominates: [loop] x's merge children's blocks
+/// around x's code, each child's tree after its block [end]
+fn wg_st_tree(g: & mut WasmGen, c: & mut WgCfg, x: i64, func: & IrFunction, module: & IrModule) {
+    if !c.ok || c.done.get(x) == 1 {
+        c.ok = false;
+        w(g, 0x00);
+        return;
+    }
+    c.done.set(x, 1);
+    if c.loop_head.get(x) == 1 {
+        w(g, 0x03);
+        w(g, WT_VOID);
+        wg_st_push(c, WS_LOOP, x);
+        wg_st_within(g, c, x, c.kid_first.get(x), func, module);
+        wend(g);
+        wg_st_pop(c);
+    } else {
+        wg_st_within(g, c, x, c.kid_first.get(x), func, module);
+    }
+}
+
+/// Merge child y of x (and the later ones in the list) around x's code
+fn wg_st_within(g: & mut WasmGen, c: & mut WgCfg, x: i64, y: i64, func: & IrFunction, module: & IrModule) {
+    if !c.ok {
+        return;
+    }
+    if y >= 0 {
+        w(g, 0x02);
+        w(g, WT_VOID);
+        wg_st_push(c, WS_BLOCK, y);
+        wg_st_within(g, c, x, c.kid_next.get(y), func, module);
+        wend(g);
+        wg_st_pop(c);
+        wg_st_tree(g, c, y, func, module);
+        return;
+    }
+    wg_st_code(g, c, x, func, module);
+}
+
+/// Block x's instructions up to its terminator, then the terminator
+fn wg_st_code(g: & mut WasmGen, c: & mut WgCfg, x: i64, func: & IrFunction, module: & IrModule) {
+    var block: BasicBlock = func.blocks.get(x);
+    var pos: i64 = c.tpos.get(x);
+    var ii: i64 = 0;
+    while ii < pos {
+        var iid: i64 = block.instructions.get(ii);
+        match IrFunction_get_inst(func, iid) {
+            OptInst::Some(inst) => {
+                g.extra = 0;
+                wg_gen_inst(g, iid, inst, false, func, module);
+            }
+            OptInst::None => {
+            }
+        }
+        ii = ii + 1;
+    }
+    g.extra = 0;
+    var kind: i64 = c.tkind.get(x);
+    if kind == WK_FALL || kind == WK_JUMP {
+        wg_st_goto(g, c, x, c.s0.get(x), func, module);
+    } else if kind == WK_BRANCH {
+        var tb: i64 = c.s0.get(x);
+        var eb: i64 = c.s1.get(x);
+        var dt: i64 = wg_st_depth(c, x, tb);
+        var de: i64 = wg_st_depth(c, x, eb);
+        if dt >= 0 {
+            // br_if to then's label, else on
+            wget(g, c.tcond.get(x));
+            wi64(g, 0);
+            w(g, 0x52);
+            w(g, 0x0D);
+            wu(g, dt);
+            wg_st_goto(g, c, x, eb, func, module);
+        } else if de >= 0 {
+            // br_if (cond == 0) to else's label, then on
+            wget(g, c.tcond.get(x));
+            w(g, 0x50);
+            w(g, 0x0D);
+            wu(g, de);
+            wg_st_goto(g, c, x, tb, func, module);
+        } else {
+            wget(g, c.tcond.get(x));
+            wi64(g, 0);
+            w(g, 0x52);
+            w(g, 0x04);
+            w(g, WT_VOID);
+            wg_st_push(c, WS_IF, 0 - 1);
+            wg_st_goto(g, c, x, tb, func, module);
+            welse(g);
+            wg_st_goto(g, c, x, eb, func, module);
+            wend(g);
+            wg_st_pop(c);
+        }
+    } else if kind == WK_RET0 {
+        // falling off the last block returns 0
+        wi64(g, 0);
+        wg_epilogue(g);
+        w(g, 0x0F);
+    } else {
+        // Return, Unreachable, Switch: as the switch loop writes them
+        var tid: i64 = block.instructions.get(pos);
+        match IrFunction_get_inst(func, tid) {
+            OptInst::Some(tinst) => {
+                g.extra = 0;
+                wg_gen_inst(g, tid, tinst, true, func, module);
+            }
+            OptInst::None => {
+                w(g, 0x00);
+            }
+        }
+    }
+}
+
 /// The body of IR function `func`: its locals, the frame, the blocks.
 fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & IrModule) {
     g.cur_name = name;
@@ -2152,8 +3116,39 @@ fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & Ir
     w(g, WT_I64);
     wu(g, 1);
     w(g, WT_I32);
-    // The frame: sp -= frame; below the stack: "Stack overflow" (with the
-    // stack given back first, so the panic can run)
+    // A function that may give control away (see "Tasks"): entered while
+    // rewinding, its locals and resume point come back from the saved
+    // frames (its frame is still there: the prologue does not run)
+    g.as_here = false;
+    g.as_fn = HashMap_contains(g.as_set, name) && func.blocks.len() > 0;
+    var as_nl: i64 = nloc + 5;
+    var as_size: i64 = as_nl * 8 + 8;
+    if g.as_fn {
+        wgget(g, WG_G_ST);
+        wi64(g, 2);
+        w(g, 0x51);
+        wif(g);
+        wgget(g, WG_G_PTR);
+        wi64(g, as_size);
+        w(g, 0x7D);
+        wgset(g, WG_G_PTR);
+        var rj: i64 = 0;
+        while rj < as_nl {
+            wgget(g, WG_G_PTR);
+            wload(g, 8, false, rj * 8);
+            wlset(g, rj);
+            rj = rj + 1;
+        }
+        wgget(g, WG_G_PTR);
+        wload(g, 8, false, as_nl * 8);
+        wwrap(g);
+        wlset(g, g.cur);
+        welse(g);
+    }
+    // The frame: sp -= frame; below the running context's stack area (the
+    // program's from WG_STACK_LO, a task's from the start of its stack):
+    // "Stack overflow" (with the stack given back first, so the panic can
+    // run)
     if g.frame > 0 {
         wgget(g, 0);
         wi64(g, g.frame);
@@ -2161,12 +3156,16 @@ fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & Ir
         wltee(g, g.fp);
         wgset(g, 0);
         wlget(g, g.fp);
-        wi64(g, WG_STACK_LO);
+        wgget(g, WG_G_CUR);
+        wload(g, 8, false, 0);
         w(g, 0x53);
         wif(g);
         wi64(g, WG_STACK_TOP);
         wgset(g, 0);
         wg_panic_msg(g, "Stack overflow");
+        wendif(g);
+    }
+    if g.as_fn {
         wendif(g);
     }
     g.extra = 0;
@@ -2177,44 +3176,121 @@ fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & Ir
         wend(g);
         return;
     }
-    g.block_index = HashMap_new();
+    // Structured control flow (TG16, "Structured control flow"); the
+    // switch loop below when the CFG is irreducible, for a function that
+    // may give control away, or with FID_WASM_SWITCH=1
+    if g.as_fn {
+        g.cf_task = g.cf_task + 1;
+    } else if g.cf_switch_only {
+        g.cf_forced = g.cf_forced + 1;
+    } else {
+        var st_mark: i64 = g.b.len();
+        var cfg: WgCfg = wg_cfg_build(func);
+        if cfg.ok {
+            wg_st_tree(g, & mut cfg, 0, func, module);
+        }
+        if cfg.ok {
+            // every path ended in a return, a br or a trap
+            w(g, 0x00);
+            wend(g);
+            g.extra = 0;
+            g.cf_struct = g.cf_struct + 1;
+            return;
+        }
+        g.b.truncate(st_mark);
+        g.extra = 0;
+        g.cf_irred = g.cf_irred + 1;
+    }
+    // Segments of the switch loop: one per block, and in a function that
+    // may give control away one more before each call that may (so that
+    // a rewind can enter the code at that call). splits: per instruction
+    // of the blocks in order, 0 for most, 1 for such a call that starts
+    // its block, 2 for one that starts a segment of its own.
+    var seg_first: Vec<i64> = Vec::new();
+    var splits: Vec<i64> = Vec::new();
+    var nseg: i64 = 0;
     var bi: i64 = 0;
     while bi < nb {
-        HashMap_insert(g.block_index, int_to_str(func.blocks.get(bi).id), bi);
+        seg_first.push(nseg);
+        nseg = nseg + 1;
+        var sblock: BasicBlock = func.blocks.get(bi);
+        var si: i64 = 0;
+        while si < sblock.instructions.len() {
+            var sw: i64 = 0;
+            if g.as_fn {
+                match IrFunction_get_inst(func, sblock.instructions.get(si)) {
+                    OptInst::Some(sinst) => {
+                        if wg_as_inst(g, sinst) {
+                            sw = 1;
+                            if si > 0 {
+                                sw = 2;
+                                nseg = nseg + 1;
+                            }
+                        }
+                    }
+                    OptInst::None => {
+                    }
+                }
+            }
+            splits.push(sw);
+            si = si + 1;
+        }
         bi = bi + 1;
     }
-    g.nblocks = nb;
-    // loop { block_{N-1} { ... block_0 { br_table } code_0 } ... code_{N-1} }
+    g.block_index = HashMap_new();
+    bi = 0;
+    while bi < nb {
+        HashMap_insert(g.block_index, int_to_str(func.blocks.get(bi).id), seg_first.get(bi));
+        bi = bi + 1;
+    }
+    g.nblocks = nseg;
+    // [block $unwind] loop { seg_{N-1} { ... seg_0 { br_table } code_0 }
+    // ... code_{N-1} }
+    if g.as_fn {
+        w(g, 0x02);
+        w(g, WT_VOID);
+    }
     w(g, 0x03);
     w(g, WT_VOID);
     bi = 0;
-    while bi < nb {
+    while bi < nseg {
         w(g, 0x02);
         w(g, WT_VOID);
         bi = bi + 1;
     }
     wlget(g, g.cur);
     w(g, 0x0E);
-    wu(g, nb);
+    wu(g, nseg);
     bi = 0;
-    while bi < nb {
+    while bi < nseg {
         wu(g, bi);
         bi = bi + 1;
     }
     wu(g, 0);
     wend(g);
+    var at: i64 = 0;
     bi = 0;
     while bi < nb {
         var block: BasicBlock = func.blocks.get(bi);
-        g.k = bi;
+        g.k = seg_first.get(bi);
         g.extra = 0;
         var ii: i64 = 0;
         var ninst: i64 = block.instructions.len();
         while ii < ninst {
+            var split: i64 = splits.get(at);
+            at = at + 1;
+            if split == 2 {
+                // the next segment: code_k falls through into it
+                wend(g);
+                g.k = g.k + 1;
+                g.extra = 0;
+            }
             var iid: i64 = block.instructions.get(ii);
             match IrFunction_get_inst(func, iid) {
                 OptInst::Some(inst) => {
+                    g.as_here = split != 0;
                     wg_gen_inst(g, iid, inst, ii == ninst - 1, func, module);
+                    g.as_here = false;
                 }
                 OptInst::None => {
                 }
@@ -2227,6 +3303,42 @@ fn wg_gen_function(g: & mut WasmGen, name: str, func: & IrFunction, module: & Ir
     // Falling off the end returns 0
     wi64(g, 0);
     wg_epilogue(g);
+    if g.as_fn {
+        w(g, 0x0F);
+        wend(g);
+        // Unwinding ($unwind): the locals and the resume point (cur) onto
+        // the saved frames; a context's frames reaching its stack is a
+        // stack overflow
+        wgget(g, WG_G_PTR);
+        wi64(g, as_size);
+        w(g, 0x7C);
+        wgget(g, 0);
+        w(g, 0x56);
+        wif(g);
+        wi64(g, 0);
+        wgset(g, WG_G_ST);
+        wg_panic_msg(g, "Stack overflow");
+        wendif(g);
+        var sj: i64 = 0;
+        while sj < as_nl {
+            wgget(g, WG_G_PTR);
+            wwrap(g);
+            wlget(g, sj);
+            wstore(g, 8, sj * 8);
+            sj = sj + 1;
+        }
+        wgget(g, WG_G_PTR);
+        wwrap(g);
+        wlget(g, g.cur);
+        wextu(g);
+        wstore(g, 8, as_nl * 8);
+        wgget(g, WG_G_PTR);
+        wi64(g, as_size);
+        w(g, 0x7C);
+        wgset(g, WG_G_PTR);
+        wi64(g, 0);
+        g.as_fn = false;
+    }
     wend(g);
 }
 
@@ -2300,55 +3412,37 @@ fn wg_gen_primitive(g: & mut WasmGen, name: str) {
         wi64(g, 0);
         wendif(g);
     } else if name == "nat_ctx_swap" {
-        // nat_ctx_swap(save, sp) without a stack switch (WASM has none):
-        // tasks run to their end when first entered, nested on this stack.
-        // Entering a new task (its record at sp names the trampoline): its
-        // body [sp + 112](env 0, [sp + 120]) now. Leaving an unfinished task
-        // (save = its block + 104, sp = [block + 168]; done at block + 80):
-        // run another queued
-        // task meanwhile (pe_co_step), then go on. Anything else: nothing.
-        wlget(g, 1);
-        wload(g, 8, false, 104);
-        wi64(g, WG_TRAMP);
+        // nat_ctx_swap(save, sp) (see "Tasks"): reached while rewinding,
+        // the context it left is back: it returns. Else the running
+        // context's record goes to [save], its stack pointer to the record,
+        // and the WASM stack unwinds to _start, which enters `sp` (a new
+        // task's record, nat_ctx_tramp at sp + 104, or a record stored
+        // here before).
+        wgget(g, WG_G_ST);
+        wi64(g, 2);
         w(g, 0x51);
         wif(g);
-        wlget(g, 1);
-        wwrap(g);
         wi64(g, 0);
-        wstore(g, 8, 104);
-        wi64(g, 0);
-        wlget(g, 1);
-        wload(g, 8, false, 120);
-        wlget(g, 1);
-        wload(g, 8, false, 112);
-        wwrap(g);
-        w(g, 0x11);
-        wu(g, wg_type_n(g, 2));
-        wu(g, 0);
-        w(g, 0x1A);
+        wgset(g, WG_G_ST);
         wi64(g, 0);
         w(g, 0x0F);
         wendif(g);
-        if wg_has_fn(g, "pe_co_step") {
-            // a leave: sp is the enterer's record, kept at block + 168
-            wlget(g, 0);
-            wload(g, 8, false, 64);
-            wlget(g, 1);
-            w(g, 0x51);
-            wif(g);
-            wlget(g, 0);
-            wi64(g, 24);
-            w(g, 0x7D);
-            wload(g, 8, false, 0);
-            w(g, 0x50);
-            wif(g);
-            wi64(g, 0);
-            wi64(g, 1);
-            wg_call_named(g, "pe_co_step", 2);
-            w(g, 0x1A);
-            wendif(g);
-            wendif(g);
-        }
+        wlget(g, 0);
+        wwrap(g);
+        wgget(g, WG_G_CUR);
+        wstore(g, 8, 0);
+        wgget(g, WG_G_CUR);
+        wwrap(g);
+        wgget(g, 0);
+        wstore(g, 8, 16);
+        wlget(g, 1);
+        wgset(g, WG_G_NEXT);
+        // its frames are saved from the start of its area
+        wgget(g, WG_G_CUR);
+        wload(g, 8, false, 0);
+        wgset(g, WG_G_PTR);
+        wi64(g, 1);
+        wgset(g, WG_G_ST);
         wi64(g, 0);
     } else if name == "nat_ctx_tramp" {
         wi64(g, WG_TRAMP);
@@ -2358,7 +3452,10 @@ fn wg_gen_primitive(g: & mut WasmGen, name: str) {
         // thread's block as its thread pointer; then the 32-bit word at
         // ctid is zeroed, as the kernel does when a thread is gone. The
         // scheduler's workers (pe_worker_main, which never return) do not
-        // start: tasks run on the thread that waits for them.
+        // start: tasks run on the thread that waits for them. A task switch
+        // within the thread (see "Tasks") unwinds through here with the
+        // starter's thread pointer (local 9) saved, and rewinds through
+        // here.
         if wg_has_fn(g, "pe_worker_main") {
             wlget(g, 0);
             wi64(g, wg_table_ref(g, "pe_worker_main"));
@@ -2368,8 +3465,21 @@ fn wg_gen_primitive(g: & mut WasmGen, name: str) {
             w(g, 0x0F);
             wendif(g);
         }
+        wgget(g, WG_G_ST);
+        wi64(g, 2);
+        w(g, 0x51);
+        wif(g);
+        wgget(g, WG_G_PTR);
+        wi64(g, 8);
+        w(g, 0x7D);
+        wgset(g, WG_G_PTR);
+        wgget(g, WG_G_PTR);
+        wload(g, 8, false, 0);
+        wlset(g, 9);
+        welse(g);
         wgget(g, 1);
         wlset(g, 9);
+        wendif(g);
         wlget(g, 4);
         wgset(g, 1);
         wi64(g, 0);
@@ -2380,6 +3490,20 @@ fn wg_gen_primitive(g: & mut WasmGen, name: str) {
         wu(g, wg_type_n(g, 2));
         wu(g, 0);
         w(g, 0x1A);
+        wgget(g, WG_G_ST);
+        wwrap(g);
+        wif(g);
+        wgget(g, WG_G_PTR);
+        wwrap(g);
+        wlget(g, 9);
+        wstore(g, 8, 0);
+        wgget(g, WG_G_PTR);
+        wi64(g, 8);
+        w(g, 0x7C);
+        wgset(g, WG_G_PTR);
+        wi64(g, 0);
+        w(g, 0x0F);
+        wendif(g);
         wlget(g, 9);
         wgset(g, 1);
         wlget(g, 3);
@@ -2530,14 +3654,95 @@ fn wg_gen_start(g: & mut WasmGen, exit_ix: i64) {
     g.cur_name = "_start";
     g.b = Vec::new();
     g.extra = 0;
-    wu(g, 0);
+    g.as_here = false;
+    // Locals: 0 main's result, 1 the context to enter
+    wu(g, 1);
+    wu(g, 2);
+    w(g, WT_I64);
     if wg_has_fn(g, "pe_rt_init") {
         wi64(g, 0);
         wg_call_named(g, "pe_rt_init", 1);
         w(g, 0x1A);
     }
+    // The contexts' loop (see "Tasks"): run the running context's bottom
+    // function, main(env 0) or a task's body [rec + 112](env 0, [rec +
+    // 120]); when it comes back unwinding, enter the context nat_ctx_swap
+    // named: a new task on its stack (below its record; its frames are
+    // saved from the start of its stack area, [rec + 56]), a suspended
+    // one by rewinding its frames
+    w(g, 0x03);
+    w(g, WT_VOID);
+    wgget(g, WG_G_CUR);
+    wi64(g, g.main_rec);
+    w(g, 0x51);
+    wif_t(g, WT_I64);
     wi64(g, 0);
     wg_call_named(g, "main", 1);
+    welse(g);
+    wi64(g, 0);
+    wgget(g, WG_G_CUR);
+    wload(g, 8, false, 120);
+    wgget(g, WG_G_CUR);
+    wload(g, 8, false, 112);
+    wwrap(g);
+    w(g, 0x11);
+    wu(g, wg_type_n(g, 2));
+    wu(g, 0);
+    wendif(g);
+    wlset(g, 0);
+    wgget(g, WG_G_ST);
+    wi64(g, 1);
+    w(g, 0x51);
+    wif(g);
+    // where the context's saved frames end
+    wgget(g, WG_G_CUR);
+    wwrap(g);
+    wgget(g, WG_G_PTR);
+    wstore(g, 8, 8);
+    wgget(g, WG_G_NEXT);
+    wlset(g, 1);
+    wlget(g, 1);
+    wload(g, 8, false, 104);
+    wi64(g, WG_TRAMP);
+    w(g, 0x51);
+    wif(g);
+    wlget(g, 1);
+    wwrap(g);
+    wi64(g, 0);
+    wstore(g, 8, 104);
+    wlget(g, 1);
+    wwrap(g);
+    wlget(g, 1);
+    wload(g, 8, false, 56);
+    wstore(g, 8, 0);
+    wlget(g, 1);
+    wgset(g, 0);
+    wi64(g, 0);
+    wgset(g, WG_G_ST);
+    welse(g);
+    wlget(g, 1);
+    wload(g, 8, false, 16);
+    wgset(g, 0);
+    wlget(g, 1);
+    wload(g, 8, false, 8);
+    wgset(g, WG_G_PTR);
+    wi64(g, 2);
+    wgset(g, WG_G_ST);
+    wendif(g);
+    wlget(g, 1);
+    wgset(g, WG_G_CUR);
+    // to the loop (the if is open)
+    wbr(g, 1);
+    wendif(g);
+    wend(g);
+    // A task's body never returns (pe_co_main leaves for good)
+    wgget(g, WG_G_CUR);
+    wi64(g, g.main_rec);
+    w(g, 0x52);
+    wif(g);
+    w(g, 0x00);
+    wendif(g);
+    wlget(g, 0);
     if exit_ix >= 0 {
         wwrap(g);
         wcall(g, exit_ix);
@@ -2695,6 +3900,45 @@ fn wb_global_i64(out: & mut Vec<i64>, mutable: bool, v: i64) {
     out.push(0x0B);
 }
 
+/// FID_NAT_OFF lists "debug": no symbol names in the module (as nat_ir's
+/// `ng_on("debug")`)
+fn wg_debug_on() -> bool {
+    var off: str = p_getenv("FID_NAT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 {
+        return true;
+    }
+    return !str_contains("," + off + ",", "," + "debug" + ",");
+}
+
+/// FID_WASM_SWITCH=1: every function keeps the switch loop (TG16: to
+/// compare with the structured control flow)
+fn wg_switch_only() -> bool {
+    var v: str = p_getenv("FID_WASM_SWITCH");
+    if (v as i64) == 0 || str_len(v) == 0 {
+        return false;
+    }
+    return v == "1";
+}
+
+/// The "name" custom section (id 0) with its function-names subsection
+/// (id 1): function index i is named names[i] (imports first, as indexed)
+fn wb_name_section(out: & mut Vec<i64>, names: & Vec<str>) {
+    var sub: Vec<i64> = Vec::new();
+    wb_uleb(& mut sub, names.len());
+    var i: i64 = 0;
+    while i < names.len() {
+        wb_uleb(& mut sub, i);
+        wb_name(& mut sub, names.get(i));
+        i = i + 1;
+    }
+    var contents: Vec<i64> = Vec::new();
+    wb_name(& mut contents, "name");
+    contents.push(1);
+    wb_uleb(& mut contents, sub.len());
+    wb_append(& mut contents, & sub);
+    wb_section(out, 0, & contents);
+}
+
 // ─── Public entry points ───────────────────────────────────────────────
 
 /// A WASI module from an IR module that has the Linux runtime and its
@@ -2704,6 +3948,7 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         return ResultBytes::Err(c_vec1("wasm backend: the program has no `main` function"));
     }
     var g: WasmGen = WasmGen_new();
+    g.cf_switch_only = wg_switch_only();
     var fi: i64 = 0;
     while fi < module.functions.len() {
         var fe: IrFunctionEntry = module.functions.get(fi);
@@ -2739,6 +3984,18 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         HashMap_insert(g.imp_index, "wasi_proc_exit", g.imp_names.len());
     }
     g.n_imports = g.imp_names.len();
+    // Stack switching (see "Tasks"): the functions that may give control
+    // away, and the running program's context record (its frames are
+    // saved from the bottom of the stack up)
+    wg_as_analyze(& mut g, & module);
+    wg_data_align(& mut g);
+    g.main_rec = WG_DATA_BASE + g.data.len();
+    var mr: i64 = 0;
+    while mr < 128 {
+        g.data.push(0);
+        mr = mr + 1;
+    }
+    wg_data_word(& mut g, g.main_rec, WG_STACK_LO);
     var imp_types: Vec<i64> = Vec::new();
     var ii: i64 = 0;
     while ii < g.imp_names.len() {
@@ -2844,13 +4101,19 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     wb_uleb(& mut sec, pages);
     wb_section(& mut m, SEC_MEMORY, & sec);
     // Globals: 0 the stack pointer, 1 the thread block, 2 the named
-    // functions' table, 3 the panic-trace table
+    // functions' table, 3 the panic-trace table; stack switching's 4 the
+    // state, 5 the end of the saved frames, 6 the running context, 7 the
+    // context to enter
     sec = Vec::new();
-    wb_uleb(& mut sec, 4);
+    wb_uleb(& mut sec, 8);
     wb_global_i64(& mut sec, true, WG_STACK_TOP);
     wb_global_i64(& mut sec, true, 0);
     wb_global_i64(& mut sec, false, tabs.get(1));
     wb_global_i64(& mut sec, false, tabs.get(0));
+    wb_global_i64(& mut sec, true, 0);
+    wb_global_i64(& mut sec, true, 0);
+    wb_global_i64(& mut sec, true, g.main_rec);
+    wb_global_i64(& mut sec, true, 0);
     wb_section(& mut m, SEC_GLOBAL, & sec);
     // Exports
     sec = Vec::new();
@@ -2893,7 +4156,25 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     wb_uleb(& mut sec, g.data.len());
     wb_append(& mut sec, & g.data);
     wb_section(& mut m, SEC_DATA, & sec);
+    // The "name" custom section (DB10): every function's name, for
+    // wasm-objdump, wasm-tools, Node's traces; FID_NAT_OFF=debug leaves it out
+    if wg_debug_on() {
+        var fnames: Vec<str> = Vec::new();
+        ii = 0;
+        while ii < g.n_imports {
+            fnames.push(g.imp_names.get(ii));
+            ii = ii + 1;
+        }
+        fnames.push("_start");
+        qi = 0;
+        while qi < g.queue.len() {
+            fnames.push(g.queue.get(qi));
+            qi = qi + 1;
+        }
+        wb_name_section(& mut m, & fnames);
+    }
     p_eprint_str("[wasm] " + int_to_str(nbodies) + " functions, " + int_to_str(g.data.len()) + " bytes of data, " + int_to_str(m.len()) + " bytes\n");
+    p_eprint_str("[wasm] control flow: " + int_to_str(g.cf_struct) + " structured, " + int_to_str(g.cf_task + g.cf_irred + g.cf_forced) + " switch loops (" + int_to_str(g.cf_task) + " tasks, " + int_to_str(g.cf_irred) + " irreducible, " + int_to_str(g.cf_forced) + " FID_WASM_SWITCH)\n");
     return ResultBytes::Ok(m);
 }
 

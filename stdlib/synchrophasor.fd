@@ -1,0 +1,785 @@
+// Fides synchrophasors: IEEE C37.118.2 frames and phasor estimation
+//
+// All of it is real computation on bytes and samples; there is no platform
+// seam (the caller moves the bytes over TCP/UDP and supplies the samples).
+// - Frames of IEEE C37.118.2-2011 (version 2; version 1 frames of
+//   C37.118-2005 parse the same way): the common header (SYNC, FRAMESIZE,
+//   IDCODE, SOC, FRACSEC with its time-quality byte), the CHK word
+//   (CRC-CCITT: polynomial 0x1021, initial value 0xFFFF, no reflection, no
+//   final xor; "123456789" gives 0x29B1), and
+//     data frames   - STAT, phasors (16-bit integer or 32-bit IEEE float,
+//                     rectangular or polar as FORMAT says), FREQ, DFREQ,
+//                     analogs, digital words, for every PMU of the stream;
+//     CFG-2 frames  - TIME_BASE, NUM_PMU, and per PMU: STN, IDCODE, FORMAT,
+//                     PHNMR/ANNMR/DGNMR, channel names, PHUNIT, ANUNIT,
+//                     DIGUNIT, FNOM, CFGCNT; then DATA_RATE (CFG-1 has the
+//                     same layout and is accepted too);
+//     header frames - free ASCII text;
+//     command frames- the CMD word (1 off, 2 on, 3 send HDR, 4 send CFG-1,
+//                     5 send CFG-2, 6 send CFG-3, 8 extended frame).
+//   Integer phasors are scaled by PHUNIT (10^-5 V or A per bit); integer
+//   FREQ is the deviation from nominal in mHz and DFREQ is ROCOF x 100.
+//   Integer analog values are passed through unscaled (ANUNIT's scaling is
+//   user-defined in the standard). 32-bit floats are encoded and decoded
+//   here bit by bit (round to nearest even, subnormals, infinities).
+// - Phasor estimation from samples: a one-cycle DFT referenced to the
+//   absolute sample clock (angle relative to a nominal-frequency cosine at
+//   sample 0, as C37.118.1 defines it), positive sequence from three
+//   phases, frequency from the phase advance between successive estimates
+//   and ROCOF from successive frequencies, and the TVE of C37.118.1.
+//
+// Usage:
+//   use synchrophasor;
+//   val bytes = c37_encode_command(7734, 1149577200, 0, C37_CMD_ON);
+//   val h = c37_parse_header(&bytes);       // h.frame_type == C37_TYPE_CMD
+//   val ok = c37_check_crc(&bytes);
+
+module synchrophasor;
+use math;
+use complex;
+use vec;
+use string;
+use encoding;
+
+pub const C37_TYPE_DATA: i64 = 0;
+pub const C37_TYPE_HEADER: i64 = 1;
+pub const C37_TYPE_CFG1: i64 = 2;
+pub const C37_TYPE_CFG2: i64 = 3;
+pub const C37_TYPE_CMD: i64 = 4;
+pub const C37_TYPE_CFG3: i64 = 5;
+
+pub const C37_CMD_OFF: i64 = 1;
+pub const C37_CMD_ON: i64 = 2;
+pub const C37_CMD_SEND_HDR: i64 = 3;
+pub const C37_CMD_SEND_CFG1: i64 = 4;
+pub const C37_CMD_SEND_CFG2: i64 = 5;
+pub const C37_CMD_SEND_CFG3: i64 = 6;
+
+// FORMAT bits
+pub const C37_FMT_POLAR: i64 = 1;
+pub const C37_FMT_PH_FLOAT: i64 = 2;
+pub const C37_FMT_AN_FLOAT: i64 = 4;
+pub const C37_FMT_FREQ_FLOAT: i64 = 8;
+
+/// The common frame header.
+pub struct C37Header {
+    pub frame_type: i64,
+    pub version: i64,
+    pub framesize: i64,
+    pub idcode: i64,
+    pub soc: i64,
+    pub time_quality: i64,
+    pub fracsec: i64,
+}
+
+/// One PMU of a configuration frame.
+pub struct C37PmuConfig {
+    pub stn: str,
+    pub idcode: i64,
+    pub format: i64,
+    pub phnmr: i64,
+    pub annmr: i64,
+    pub dgnmr: i64,
+    pub chnam: Vec<str>,
+    pub phunit: Vec<i64>,
+    pub anunit: Vec<i64>,
+    pub digunit: Vec<i64>,
+    pub fnom: i64,
+    pub cfgcnt: i64,
+}
+
+pub struct C37Config {
+    pub frame_type: i64,
+    pub idcode: i64,
+    pub soc: i64,
+    pub fracsec: i64,
+    pub time_base: i64,
+    pub pmus: Vec<C37PmuConfig>,
+    pub data_rate: i64,
+}
+
+/// Measurements of one PMU in a data frame. Phasors are rectangular
+/// (re, im) in volts or amperes whatever the wire format.
+pub struct C37PmuData {
+    pub stat: i64,
+    pub ph_re: Vec<f64>,
+    pub ph_im: Vec<f64>,
+    pub freq: f64,
+    pub dfreq: f64,
+    pub analog: Vec<f64>,
+    pub digital: Vec<i64>,
+}
+
+pub struct C37Data {
+    pub idcode: i64,
+    pub soc: i64,
+    pub time_quality: i64,
+    pub fracsec: i64,
+    pub pmus: Vec<C37PmuData>,
+}
+
+// ─── CRC and byte helpers ───
+
+/// CRC-CCITT (0x1021, init 0xFFFF) of bytes[start..end).
+pub fn c37_crc_range(b: &Vec<i64>, start: i64, end: i64) -> i64 {
+    var crc: i64 = 0xFFFF;
+    var i: i64 = start;
+    while i < end {
+        crc = crc ^ ((b.get(i) & 0xFF) << 8);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 0x8000) != 0 {
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+            } else {
+                crc = (crc << 1) & 0xFFFF;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+pub fn c37_crc(b: &Vec<i64>) -> i64 {
+    return c37_crc_range(b, 0, b.len());
+}
+
+/// True when the last two bytes are the CRC of the rest and FRAMESIZE
+/// matches the length.
+pub fn c37_check_crc(b: &Vec<i64>) -> bool {
+    val n: i64 = b.len();
+    if n < 16 {
+        return false;
+    }
+    if c37_u16(b, 2) != n {
+        return false;
+    }
+    return c37_crc_range(b, 0, n - 2) == c37_u16(b, n - 2);
+}
+
+fn c37_put16(b: &mut Vec<i64>, v: i64) {
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+}
+
+fn c37_put32(b: &mut Vec<i64>, v: i64) {
+    b.push((v >> 24) & 0xFF);
+    b.push((v >> 16) & 0xFF);
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+}
+
+pub fn c37_u16(b: &Vec<i64>, at: i64) -> i64 {
+    return ((b.get(at) & 0xFF) << 8) | (b.get(at + 1) & 0xFF);
+}
+
+pub fn c37_s16(b: &Vec<i64>, at: i64) -> i64 {
+    val v: i64 = c37_u16(b, at);
+    if v >= 0x8000 {
+        return v - 0x10000;
+    }
+    return v;
+}
+
+pub fn c37_u32(b: &Vec<i64>, at: i64) -> i64 {
+    return (c37_u16(b, at) << 16) | c37_u16(b, at + 2);
+}
+
+fn c37_round(x: f64) -> i64 {
+    if x < 0.0 {
+        return 0 - (math_floor(0.0 - x + 0.5) as i64);
+    }
+    return math_floor(x + 0.5) as i64;
+}
+
+// ─── IEEE 754 single precision ───
+
+fn c37_pow2(e: i64) -> f64 {
+    var r: f64 = 1.0;
+    var k: i64 = e;
+    while k > 0 {
+        r = r * 2.0;
+        k = k - 1;
+    }
+    while k < 0 {
+        r = r * 0.5;
+        k = k + 1;
+    }
+    return r;
+}
+
+/// Round m (>= 0) to the nearest integer, ties to even.
+fn c37_rne(m: f64) -> i64 {
+    var mf: f64 = math_floor(m);
+    val r: f64 = m - mf;
+    var v: i64 = mf as i64;
+    if r > 0.5 || (r == 0.5 && (v & 1) == 1) {
+        v = v + 1;
+    }
+    return v;
+}
+
+/// The 32-bit pattern of x as an IEEE 754 single.
+pub fn c37_f32_bits(x: f64) -> i64 {
+    if x != x {
+        return 0x7FC00000;
+    }
+    var sign: i64 = 0;
+    var a: f64 = x;
+    if a < 0.0 {
+        sign = 0x80000000;
+        a = 0.0 - a;
+    }
+    if a == 0.0 {
+        return sign;
+    }
+    if a > 3.4028235677973366e38 {
+        return sign | 0x7F800000;
+    }
+    var e: i64 = 0;
+    var m: f64 = a;
+    while m >= 2.0 {
+        m = m * 0.5;
+        e = e + 1;
+    }
+    while m < 1.0 {
+        m = m * 2.0;
+        e = e - 1;
+    }
+    if e < -126 {
+        // subnormal: a / 2^-149
+        val sub: i64 = c37_rne(a * c37_pow2(149));
+        return sign | sub;
+    }
+    var frac: i64 = c37_rne((m - 1.0) * 8388608.0);
+    if frac == 8388608 {
+        frac = 0;
+        e = e + 1;
+    }
+    if e > 127 {
+        return sign | 0x7F800000;
+    }
+    return sign | ((e + 127) << 23) | frac;
+}
+
+/// The value of a 32-bit IEEE 754 single pattern.
+pub fn c37_f32_from_bits(bits: i64) -> f64 {
+    val sign: i64 = (bits >> 31) & 1;
+    val e: i64 = (bits >> 23) & 0xFF;
+    val frac: i64 = bits & 0x7FFFFF;
+    var v: f64 = 0.0;
+    if e == 255 {
+        if frac != 0 {
+            return 0.0 / 0.0;
+        }
+        v = 1.0e308 * 10.0;
+    } else if e == 0 {
+        v = (frac as f64) * c37_pow2(-149);
+    } else {
+        v = (1.0 + (frac as f64) / 8388608.0) * c37_pow2(e - 127);
+    }
+    if sign == 1 {
+        return 0.0 - v;
+    }
+    return v;
+}
+
+fn c37_putf(b: &mut Vec<i64>, x: f64) {
+    c37_put32(b, c37_f32_bits(x));
+}
+
+fn c37_getf(b: &Vec<i64>, at: i64) -> f64 {
+    return c37_f32_from_bits(c37_u32(b, at));
+}
+
+// ─── Header and framing ───
+
+fn c37_start(frame_type: i64, idcode: i64, soc: i64, fracsec: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0xAA);
+    b.push((frame_type << 4) | 2);
+    c37_put16(&mut b, 0);
+    c37_put16(&mut b, idcode);
+    c37_put32(&mut b, soc);
+    c37_put32(&mut b, fracsec);
+    return b;
+}
+
+/// Fill FRAMESIZE and append CHK.
+fn c37_finish(b: &mut Vec<i64>) {
+    val size: i64 = b.len() + 2;
+    b.set(2, (size >> 8) & 0xFF);
+    b.set(3, size & 0xFF);
+    val crc: i64 = c37_crc(b);
+    c37_put16(b, crc);
+}
+
+/// FRACSEC word from the time-quality byte and the 24-bit fraction count.
+pub fn c37_fracsec(time_quality: i64, fraction: i64) -> i64 {
+    return ((time_quality & 0xFF) << 24) | (fraction & 0xFFFFFF);
+}
+
+pub fn c37_parse_header(b: &Vec<i64>) -> C37Header {
+    return C37Header {
+        frame_type: (b.get(1) >> 4) & 0x7, version: b.get(1) & 0xF, framesize: c37_u16(b, 2), idcode: c37_u16(b, 4), soc: c37_u32(b, 6), time_quality: b.get(10), fracsec: c37_u32(b, 10) & 0xFFFFFF
+    };
+}
+
+/// A frame is well formed: SYNC byte, FRAMESIZE and CRC.
+pub fn c37_valid(b: &Vec<i64>) -> bool {
+    if b.len() < 16 || b.get(0) != 0xAA {
+        return false;
+    }
+    return c37_check_crc(b);
+}
+
+// ─── Command and header frames ───
+
+pub fn c37_encode_command(idcode: i64, soc: i64, fracsec: i64, cmd: i64) -> Vec<i64> {
+    var b: Vec<i64> = c37_start(C37_TYPE_CMD, idcode, soc, fracsec);
+    c37_put16(&mut b, cmd);
+    c37_finish(&mut b);
+    return b;
+}
+
+/// The CMD word of a command frame (-1 when the frame is not one).
+pub fn c37_decode_command(b: &Vec<i64>) -> i64 {
+    if !c37_valid(b) || c37_parse_header(b).frame_type != C37_TYPE_CMD {
+        return -1;
+    }
+    return c37_u16(b, 14);
+}
+
+pub fn c37_encode_header_frame(idcode: i64, soc: i64, fracsec: i64, text: str) -> Vec<i64> {
+    var b: Vec<i64> = c37_start(C37_TYPE_HEADER, idcode, soc, fracsec);
+    val t: Vec<i64> = enc_str_to_bytes(text);
+    var i: i64 = 0;
+    while i < t.len() {
+        b.push(t.get(i));
+        i = i + 1;
+    }
+    c37_finish(&mut b);
+    return b;
+}
+
+pub fn c37_decode_header_frame(b: &Vec<i64>) -> str {
+    var t: Vec<i64> = Vec::new();
+    var i: i64 = 14;
+    while i < b.len() - 2 {
+        t.push(b.get(i));
+        i = i + 1;
+    }
+    return enc_bytes_to_str(t);
+}
+
+// ─── Configuration frames ───
+
+/// A PMU configuration with no channels yet.
+pub fn c37_pmu_config(stn: str, idcode: i64, format: i64, nominal_50hz: bool) -> C37PmuConfig {
+    var fnom: i64 = 0;
+    if nominal_50hz {
+        fnom = 1;
+    }
+    return C37PmuConfig {
+        stn: stn, idcode: idcode, format: format, phnmr: 0, annmr: 0, dgnmr: 0, chnam: Vec::new(), phunit: Vec::new(), anunit: Vec::new(), digunit: Vec::new(), fnom: fnom, cfgcnt: 0
+    };
+}
+
+/// Add a phasor channel; `is_current` selects amperes, `scale` is the
+/// integer-format scale in 10^-5 V (or A) per bit.
+pub fn c37_add_phasor(p: &mut C37PmuConfig, name: str, is_current: bool, scale: i64) {
+    var kind: i64 = 0;
+    if is_current {
+        kind = 1;
+    }
+    // names are kept in order: phasors, analogs, then 16 per digital word
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < p.phnmr {
+        names.push(p.chnam.get(i));
+        i = i + 1;
+    }
+    names.push(name);
+    while i < p.chnam.len() {
+        names.push(p.chnam.get(i));
+        i = i + 1;
+    }
+    p.chnam = names;
+    p.phunit.push((kind << 24) | (scale & 0xFFFFFF));
+    p.phnmr = p.phnmr + 1;
+}
+
+pub fn c37_add_analog(p: &mut C37PmuConfig, name: str, anunit: i64) {
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val upto: i64 = p.phnmr + p.annmr;
+    while i < upto {
+        names.push(p.chnam.get(i));
+        i = i + 1;
+    }
+    names.push(name);
+    while i < p.chnam.len() {
+        names.push(p.chnam.get(i));
+        i = i + 1;
+    }
+    p.chnam = names;
+    p.anunit.push(anunit);
+    p.annmr = p.annmr + 1;
+}
+
+/// A digital status word: 16 bit names and its DIGUNIT (normal mask << 16 |
+/// valid mask).
+pub fn c37_add_digital(p: &mut C37PmuConfig, bit_names: Vec<str>, normal_mask: i64, valid_mask: i64) {
+    var i: i64 = 0;
+    while i < 16 {
+        if i < bit_names.len() {
+            p.chnam.push(bit_names.get(i));
+        } else {
+            p.chnam.push("");
+        }
+        i = i + 1;
+    }
+    p.digunit.push(((normal_mask & 0xFFFF) << 16) | (valid_mask & 0xFFFF));
+    p.dgnmr = p.dgnmr + 1;
+}
+
+fn c37_put_name(b: &mut Vec<i64>, name: str) {
+    val t: Vec<i64> = enc_str_to_bytes(name);
+    var i: i64 = 0;
+    while i < 16 {
+        if i < t.len() {
+            b.push(t.get(i));
+        } else {
+            b.push(0x20);
+        }
+        i = i + 1;
+    }
+}
+
+fn c37_get_name(b: &Vec<i64>, at: i64) -> str {
+    var t: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        t.push(b.get(at + i));
+        i = i + 1;
+    }
+    // trailing blanks and NULs are padding
+    while t.len() > 0 && (t.get(t.len() - 1) == 0x20 || t.get(t.len() - 1) == 0) {
+        t.pop();
+    }
+    return enc_bytes_to_str(t);
+}
+
+pub fn c37_encode_config(cfg: &C37Config) -> Vec<i64> {
+    var b: Vec<i64> = c37_start(cfg.frame_type, cfg.idcode, cfg.soc, cfg.fracsec);
+    c37_put32(&mut b, cfg.time_base);
+    c37_put16(&mut b, cfg.pmus.len());
+    var k: i64 = 0;
+    while k < cfg.pmus.len() {
+        val p: C37PmuConfig = cfg.pmus.get(k);
+        c37_put_name(&mut b, p.stn);
+        c37_put16(&mut b, p.idcode);
+        c37_put16(&mut b, p.format);
+        c37_put16(&mut b, p.phnmr);
+        c37_put16(&mut b, p.annmr);
+        c37_put16(&mut b, p.dgnmr);
+        var i: i64 = 0;
+        while i < p.chnam.len() {
+            c37_put_name(&mut b, p.chnam.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.phnmr {
+            c37_put32(&mut b, p.phunit.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.annmr {
+            c37_put32(&mut b, p.anunit.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.dgnmr {
+            c37_put32(&mut b, p.digunit.get(i));
+            i = i + 1;
+        }
+        c37_put16(&mut b, p.fnom);
+        c37_put16(&mut b, p.cfgcnt);
+        k = k + 1;
+    }
+    c37_put16(&mut b, cfg.data_rate & 0xFFFF);
+    c37_finish(&mut b);
+    return b;
+}
+
+/// Decode a CFG-1 or CFG-2 frame. Check `c37_valid` first.
+pub fn c37_decode_config(b: &Vec<i64>) -> C37Config {
+    val h: C37Header = c37_parse_header(b);
+    var at: i64 = 14;
+    val time_base: i64 = c37_u32(b, at);
+    at = at + 4;
+    val num: i64 = c37_u16(b, at);
+    at = at + 2;
+    var pmus: Vec<C37PmuConfig> = Vec::new();
+    var k: i64 = 0;
+    while k < num {
+        val stn: str = c37_get_name(b, at);
+        at = at + 16;
+        var p: C37PmuConfig = c37_pmu_config(stn, c37_u16(b, at), c37_u16(b, at + 2), false);
+        p.phnmr = c37_u16(b, at + 4);
+        p.annmr = c37_u16(b, at + 6);
+        p.dgnmr = c37_u16(b, at + 8);
+        at = at + 10;
+        val nnames: i64 = p.phnmr + p.annmr + 16 * p.dgnmr;
+        var i: i64 = 0;
+        while i < nnames {
+            p.chnam.push(c37_get_name(b, at));
+            at = at + 16;
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.phnmr {
+            p.phunit.push(c37_u32(b, at));
+            at = at + 4;
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.annmr {
+            p.anunit.push(c37_u32(b, at));
+            at = at + 4;
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.dgnmr {
+            p.digunit.push(c37_u32(b, at));
+            at = at + 4;
+            i = i + 1;
+        }
+        p.fnom = c37_u16(b, at);
+        p.cfgcnt = c37_u16(b, at + 2);
+        at = at + 4;
+        pmus.push(p);
+        k = k + 1;
+    }
+    return C37Config {
+        frame_type: h.frame_type, idcode: h.idcode, soc: h.soc, fracsec: c37_u32(b, 10), time_base: time_base, pmus: pmus, data_rate: c37_s16(b, at)
+    };
+}
+
+/// Nominal frequency of a PMU configuration in Hz.
+pub fn c37_nominal_hz(p: &C37PmuConfig) -> f64 {
+    if (p.fnom & 1) == 1 {
+        return 50.0;
+    }
+    return 60.0;
+}
+
+// ─── Data frames ───
+
+pub fn c37_pmu_data(stat: i64, freq: f64, dfreq: f64) -> C37PmuData {
+    return C37PmuData {
+        stat: stat, ph_re: Vec::new(), ph_im: Vec::new(), freq: freq, dfreq: dfreq, analog: Vec::new(), digital: Vec::new()
+    };
+}
+
+fn c37_scale(p: &C37PmuConfig, i: i64) -> f64 {
+    return ((p.phunit.get(i) & 0xFFFFFF) as f64) * 0.00001;
+}
+
+/// Encode a data frame for the configuration `cfg` (one C37PmuData per
+/// PMU, in order).
+pub fn c37_encode_data(cfg: &C37Config, d: &C37Data) -> Vec<i64> {
+    var b: Vec<i64> = c37_start(C37_TYPE_DATA, cfg.idcode, d.soc, c37_fracsec(d.time_quality, d.fracsec));
+    var k: i64 = 0;
+    while k < cfg.pmus.len() {
+        val p: C37PmuConfig = cfg.pmus.get(k);
+        val m: C37PmuData = d.pmus.get(k);
+        val nom: f64 = c37_nominal_hz(&p);
+        c37_put16(&mut b, m.stat);
+        var i: i64 = 0;
+        while i < p.phnmr {
+            val re: f64 = m.ph_re.get(i);
+            val im: f64 = m.ph_im.get(i);
+            val polar: bool = (p.format & C37_FMT_POLAR) != 0;
+            if (p.format & C37_FMT_PH_FLOAT) != 0 {
+                if polar {
+                    c37_putf(&mut b, math_sqrt(re * re + im * im));
+                    c37_putf(&mut b, complex_arg(complex(re, im)));
+                } else {
+                    c37_putf(&mut b, re);
+                    c37_putf(&mut b, im);
+                }
+            } else {
+                val sc: f64 = c37_scale(&p, i);
+                if polar {
+                    c37_put16(&mut b, c37_round(math_sqrt(re * re + im * im) / sc));
+                    c37_put16(&mut b, c37_round(complex_arg(complex(re, im)) * 10000.0) & 0xFFFF);
+                } else {
+                    c37_put16(&mut b, c37_round(re / sc) & 0xFFFF);
+                    c37_put16(&mut b, c37_round(im / sc) & 0xFFFF);
+                }
+            }
+            i = i + 1;
+        }
+        if (p.format & C37_FMT_FREQ_FLOAT) != 0 {
+            c37_putf(&mut b, m.freq);
+            c37_putf(&mut b, m.dfreq);
+        } else {
+            c37_put16(&mut b, c37_round((m.freq - nom) * 1000.0) & 0xFFFF);
+            c37_put16(&mut b, c37_round(m.dfreq * 100.0) & 0xFFFF);
+        }
+        i = 0;
+        while i < p.annmr {
+            if (p.format & C37_FMT_AN_FLOAT) != 0 {
+                c37_putf(&mut b, m.analog.get(i));
+            } else {
+                c37_put16(&mut b, c37_round(m.analog.get(i)) & 0xFFFF);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.dgnmr {
+            c37_put16(&mut b, m.digital.get(i));
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    c37_finish(&mut b);
+    return b;
+}
+
+/// Decode a data frame with the stream's configuration.
+pub fn c37_decode_data(cfg: &C37Config, b: &Vec<i64>) -> C37Data {
+    val h: C37Header = c37_parse_header(b);
+    var at: i64 = 14;
+    var pmus: Vec<C37PmuData> = Vec::new();
+    var k: i64 = 0;
+    while k < cfg.pmus.len() {
+        val p: C37PmuConfig = cfg.pmus.get(k);
+        val nom: f64 = c37_nominal_hz(&p);
+        var m: C37PmuData = c37_pmu_data(c37_u16(b, at), 0.0, 0.0);
+        at = at + 2;
+        val polar: bool = (p.format & C37_FMT_POLAR) != 0;
+        var i: i64 = 0;
+        while i < p.phnmr {
+            var x: f64 = 0.0;
+            var y: f64 = 0.0;
+            if (p.format & C37_FMT_PH_FLOAT) != 0 {
+                x = c37_getf(b, at);
+                y = c37_getf(b, at + 4);
+                at = at + 8;
+            } else {
+                val sc: f64 = c37_scale(&p, i);
+                if polar {
+                    x = (c37_u16(b, at) as f64) * sc;
+                    y = (c37_s16(b, at + 2) as f64) / 10000.0;
+                } else {
+                    x = (c37_s16(b, at) as f64) * sc;
+                    y = (c37_s16(b, at + 2) as f64) * sc;
+                }
+                at = at + 4;
+            }
+            if polar {
+                m.ph_re.push(x * math_cos(y));
+                m.ph_im.push(x * math_sin(y));
+            } else {
+                m.ph_re.push(x);
+                m.ph_im.push(y);
+            }
+            i = i + 1;
+        }
+        if (p.format & C37_FMT_FREQ_FLOAT) != 0 {
+            m.freq = c37_getf(b, at);
+            m.dfreq = c37_getf(b, at + 4);
+            at = at + 8;
+        } else {
+            m.freq = nom + (c37_s16(b, at) as f64) / 1000.0;
+            m.dfreq = (c37_s16(b, at + 2) as f64) / 100.0;
+            at = at + 4;
+        }
+        i = 0;
+        while i < p.annmr {
+            if (p.format & C37_FMT_AN_FLOAT) != 0 {
+                m.analog.push(c37_getf(b, at));
+                at = at + 4;
+            } else {
+                m.analog.push(c37_s16(b, at) as f64);
+                at = at + 2;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < p.dgnmr {
+            m.digital.push(c37_u16(b, at));
+            at = at + 2;
+            i = i + 1;
+        }
+        pmus.push(m);
+        k = k + 1;
+    }
+    return C37Data {
+        idcode: h.idcode, soc: h.soc, time_quality: h.time_quality, fracsec: h.fracsec, pmus: pmus
+    };
+}
+
+// ─── Phasor estimation ───
+
+pub fn syn_pi() -> f64 {
+    return 3.14159265358979323846;
+}
+
+/// One-cycle DFT phasor (RMS magnitude) of x[start .. start + n), with n
+/// samples per nominal cycle. The angle is referenced to a nominal-frequency
+/// cosine at sample 0 of `x` (absolute time), so a steady signal at
+/// nominal frequency gives the same phasor in every window.
+pub fn syn_phasor(x: &Vec<f64>, start: i64, n: i64) -> Complex {
+    var re: f64 = 0.0;
+    var im: f64 = 0.0;
+    var k: i64 = 0;
+    while k < n {
+        val ang: f64 = 2.0 * syn_pi() * (((start + k) % n) as f64) / (n as f64);
+        val v: f64 = x.get(start + k);
+        re = re + v * math_cos(ang);
+        im = im - v * math_sin(ang);
+        k = k + 1;
+    }
+    val s: f64 = math_sqrt(2.0) / (n as f64);
+    return complex(re * s, im * s);
+}
+
+/// Positive-sequence phasor (Va + a Vb + a^2 Vc) / 3, a = 1 at 120 deg.
+pub fn syn_positive_sequence(va: Complex, vb: Complex, vc: Complex) -> Complex {
+    val a: Complex = complex_from_polar(1.0, 2.0 * syn_pi() / 3.0);
+    val a2: Complex = complex_from_polar(1.0, -2.0 * syn_pi() / 3.0);
+    val s: Complex = complex_add(va, complex_add(complex_mul(a, vb), complex_mul(a2, vc)));
+    return complex_scale(s, 1.0 / 3.0);
+}
+
+/// Wrap an angle to (-pi, pi].
+pub fn syn_wrap(a: f64) -> f64 {
+    var x: f64 = a;
+    while x > syn_pi() {
+        x = x - 2.0 * syn_pi();
+    }
+    while x <= 0.0 - syn_pi() {
+        x = x + 2.0 * syn_pi();
+    }
+    return x;
+}
+
+/// Frequency from two phasors `dt` seconds apart: the phasor of a signal
+/// at f0 + df turns at 2 pi df rad/s.
+pub fn syn_frequency(prev: Complex, cur: Complex, dt: f64, f0: f64) -> f64 {
+    val d: f64 = syn_wrap(complex_arg(cur) - complex_arg(prev));
+    return f0 + d / (2.0 * syn_pi() * dt);
+}
+
+/// ROCOF from two frequency estimates `dt` seconds apart (Hz/s).
+pub fn syn_rocof(f_prev: f64, f_cur: f64, dt: f64) -> f64 {
+    return (f_cur - f_prev) / dt;
+}
+
+/// Total vector error |est - ref| / |ref| (C37.118.1).
+pub fn syn_tve(est: Complex, reference: Complex) -> f64 {
+    return complex_abs(complex_sub(est, reference)) / complex_abs(reference);
+}

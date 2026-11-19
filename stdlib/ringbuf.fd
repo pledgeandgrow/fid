@@ -1,0 +1,261 @@
+// Fides lock-free ring buffers, pure Fides on stdlib/atomic.fd.
+//
+//   - SpscRing: single producer, single consumer, power-of-two capacity,
+//     free-running head/tail counters (no slot is wasted: full when
+//     head - tail == capacity). The producer writes the slot then
+//     publishes head with a Release store; the consumer reads head with
+//     Acquire, takes the slot, publishes tail with Release. Batch push and
+//     pop for drivers (a UART interrupt handler filling the ring, a task
+//     draining it).
+//   - MpmcRing: multi-producer multi-consumer bounded queue (Dmitry
+//     Vyukov's algorithm): each cell carries a sequence number; a producer
+//     claims a position with compare-and-swap on the enqueue counter when
+//     the cell's sequence says it is free for that lap, writes the value,
+//     then releases the cell with sequence pos + 1; a consumer claims with
+//     CAS on the dequeue counter when the sequence is pos + 1 and frees the
+//     cell for the next lap with pos + capacity. Also serves as MPSC.
+//   - OverwriteRing: single-threaded ring that drops the oldest entry when
+//     full (trace and log buffers), with a count of what was lost.
+//
+// Every counter and slot is an Atomic word (atomic_new), and copies of an
+// Atomic refer to the same word, so a copy of a ring value handed to
+// another thread works on the same ring. The atomics are SeqCst on every
+// backend today (atomic.fd), stronger than the orders named here. The
+// interpreter is single-threaded: the tests run the protocols in an
+// interleaved sequential order.
+
+module ringbuf;
+ use vec; use atomic;
+
+fn rb_check_cap(cap: i64) {
+    if cap < 2 || (cap & (cap - 1)) != 0 { p_panic("ringbuf: capacity must be a power of two >= 2"); }
+}
+
+/// Smallest power of two >= n (n >= 1).
+pub fn rb_pow2_at_least(n: i64) -> i64 {
+    var p: i64 = 2;
+    while p < n { p = p * 2; }
+    return p;
+}
+
+// ─── SPSC ───────────────────────────────────────────────────────────────
+
+pub struct SpscRing {
+    pub cap: i64,
+    pub mask: i64,
+    pub slots: Vec<Atomic>,
+    pub head: Atomic,
+    pub tail: Atomic,
+}
+
+pub fn spsc_new(cap: i64) -> SpscRing {
+    rb_check_cap(cap);
+    var s: Vec<Atomic> = Vec::new();
+    var i: i64 = 0;
+    while i < cap {
+        s.push(atomic_new(0));
+        i = i + 1;
+    }
+    return SpscRing { cap: cap, mask: cap - 1, slots: s, head: atomic_new(0), tail: atomic_new(0) };
+}
+
+/// Producer: false when full.
+pub fn spsc_push(r: SpscRing, v: i64) -> bool {
+    val h: i64 = r.head.load(Order::Relaxed);
+    val t: i64 = r.tail.load(Order::Acquire);
+    if h - t == r.cap { return false; }
+    r.slots.get(h & r.mask).store(v, Order::Relaxed);
+    r.head.store(h + 1, Order::Release);
+    return true;
+}
+
+/// Number of values in the ring (exact from the producer's or the
+/// consumer's side; a snapshot from anywhere else).
+pub fn spsc_len(r: SpscRing) -> i64 {
+    return r.head.load(Order::Acquire) - r.tail.load(Order::Acquire);
+}
+
+pub fn spsc_is_empty(r: SpscRing) -> bool {
+    return spsc_len(r) == 0;
+}
+
+/// Consumer: the oldest value without taking it (call when not empty).
+pub fn spsc_peek(r: SpscRing) -> i64 {
+    val t: i64 = r.tail.load(Order::Relaxed);
+    return r.slots.get(t & r.mask).load(Order::Relaxed);
+}
+
+/// Consumer: take the oldest value; `none` when empty.
+pub fn spsc_pop_or(r: SpscRing, none: i64) -> i64 {
+    val t: i64 = r.tail.load(Order::Relaxed);
+    val h: i64 = r.head.load(Order::Acquire);
+    if h == t { return none; }
+    val v: i64 = r.slots.get(t & r.mask).load(Order::Relaxed);
+    r.tail.store(t + 1, Order::Release);
+    return v;
+}
+
+/// Producer: push as many of `vals` as fit (one head publication); count.
+pub fn spsc_push_batch(r: SpscRing, vals: Vec<i64>) -> i64 {
+    val h: i64 = r.head.load(Order::Relaxed);
+    val t: i64 = r.tail.load(Order::Acquire);
+    var n: i64 = r.cap - (h - t);
+    if n > vals.len() { n = vals.len(); }
+    var i: i64 = 0;
+    while i < n {
+        r.slots.get((h + i) & r.mask).store(vals.get(i), Order::Relaxed);
+        i = i + 1;
+    }
+    r.head.store(h + n, Order::Release);
+    return n;
+}
+
+/// Consumer: take up to `max` values (one tail publication).
+pub fn spsc_pop_batch(r: SpscRing, max: i64) -> Vec<i64> {
+    val t: i64 = r.tail.load(Order::Relaxed);
+    val h: i64 = r.head.load(Order::Acquire);
+    var n: i64 = h - t;
+    if n > max { n = max; }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(r.slots.get((t + i) & r.mask).load(Order::Relaxed));
+        i = i + 1;
+    }
+    r.tail.store(t + n, Order::Release);
+    return out;
+}
+
+// ─── MPMC (Vyukov) ──────────────────────────────────────────────────────
+
+pub struct MpmcRing {
+    pub cap: i64,
+    pub mask: i64,
+    pub seq: Vec<Atomic>,
+    pub data: Vec<Atomic>,
+    pub enq: Atomic,
+    pub deq: Atomic,
+}
+
+pub fn mpmc_new(cap: i64) -> MpmcRing {
+    rb_check_cap(cap);
+    var sq: Vec<Atomic> = Vec::new();
+    var dt: Vec<Atomic> = Vec::new();
+    var i: i64 = 0;
+    while i < cap {
+        sq.push(atomic_new(i));
+        dt.push(atomic_new(0));
+        i = i + 1;
+    }
+    return MpmcRing { cap: cap, mask: cap - 1, seq: sq, data: dt, enq: atomic_new(0), deq: atomic_new(0) };
+}
+
+/// A claimed position, so a producer or consumer can be stepped through
+/// the two halves of its protocol (claim, then publish) in tests that
+/// interleave several of them.
+pub struct MpmcTicket {
+    pub ok: bool,
+    pub pos: i64,
+}
+
+/// Producer, first half: claim a cell. ok = false when full.
+pub fn mpmc_claim_push(r: MpmcRing) -> MpmcTicket {
+    var pos: i64 = r.enq.load(Order::Relaxed);
+    while true {
+        val s: i64 = r.seq.get(pos & r.mask).load(Order::Acquire);
+        val dif: i64 = s - pos;
+        if dif == 0 {
+            if r.enq.compare_swap(pos, pos + 1, Order::Relaxed) { return MpmcTicket { ok: true, pos: pos }; }
+            pos = r.enq.load(Order::Relaxed);
+        } else if dif < 0 {
+            return MpmcTicket { ok: false, pos: pos };
+        } else {
+            pos = r.enq.load(Order::Relaxed);
+        }
+    }
+    return MpmcTicket { ok: false, pos: pos };
+}
+
+/// Producer, second half: write the value and release the cell.
+pub fn mpmc_publish_push(r: MpmcRing, k: MpmcTicket, v: i64) {
+    r.data.get(k.pos & r.mask).store(v, Order::Relaxed);
+    r.seq.get(k.pos & r.mask).store(k.pos + 1, Order::Release);
+}
+
+pub fn mpmc_push(r: MpmcRing, v: i64) -> bool {
+    val k: MpmcTicket = mpmc_claim_push(r);
+    if !k.ok { return false; }
+    mpmc_publish_push(r, k, v);
+    return true;
+}
+
+/// Consumer, first half: claim the next published cell. ok = false when
+/// empty (or the next cell's producer has not published yet).
+pub fn mpmc_claim_pop(r: MpmcRing) -> MpmcTicket {
+    var pos: i64 = r.deq.load(Order::Relaxed);
+    while true {
+        val s: i64 = r.seq.get(pos & r.mask).load(Order::Acquire);
+        val dif: i64 = s - (pos + 1);
+        if dif == 0 {
+            if r.deq.compare_swap(pos, pos + 1, Order::Relaxed) { return MpmcTicket { ok: true, pos: pos }; }
+            pos = r.deq.load(Order::Relaxed);
+        } else if dif < 0 {
+            return MpmcTicket { ok: false, pos: pos };
+        } else {
+            pos = r.deq.load(Order::Relaxed);
+        }
+    }
+    return MpmcTicket { ok: false, pos: pos };
+}
+
+/// Consumer, second half: read the value and free the cell for the next lap.
+pub fn mpmc_finish_pop(r: MpmcRing, k: MpmcTicket) -> i64 {
+    val v: i64 = r.data.get(k.pos & r.mask).load(Order::Relaxed);
+    r.seq.get(k.pos & r.mask).store(k.pos + r.cap, Order::Release);
+    return v;
+}
+
+pub fn mpmc_pop_or(r: MpmcRing, none: i64) -> i64 {
+    val k: MpmcTicket = mpmc_claim_pop(r);
+    if !k.ok { return none; }
+    return mpmc_finish_pop(r, k);
+}
+
+/// Approximate number of queued values (exact when no one is mid-operation).
+pub fn mpmc_len(r: MpmcRing) -> i64 {
+    return r.enq.load(Order::Acquire) - r.deq.load(Order::Acquire);
+}
+
+// ─── Overwriting ring (single thread) ───────────────────────────────────
+
+pub struct OverwriteRing {
+    pub cap: i64,
+    pub buf: Vec<i64>,
+    pub head: i64,
+    pub count: i64,
+    pub dropped: i64,
+}
+
+pub fn owring_new(cap: i64) -> OverwriteRing {
+    rb_check_cap(cap);
+    return OverwriteRing { cap: cap, buf: Vec::filled(cap, 0), head: 0, count: 0, dropped: 0 };
+}
+
+/// Append; when full the oldest entry is overwritten (and counted).
+pub fn owring_push(r: &mut OverwriteRing, v: i64) {
+    r.buf.set(r.head, v);
+    r.head = (r.head + 1) & (r.cap - 1);
+    if r.count == r.cap { r.dropped = r.dropped + 1; } else { r.count = r.count + 1; }
+}
+
+/// The entries, oldest first.
+pub fn owring_items(r: &OverwriteRing) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    val start: i64 = (r.head - r.count + r.cap) & (r.cap - 1);
+    while i < r.count {
+        out.push(r.buf.get((start + i) & (r.cap - 1)));
+        i = i + 1;
+    }
+    return out;
+}

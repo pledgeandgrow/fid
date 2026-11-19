@@ -4,9 +4,17 @@
 // (i64 Unix seconds, always UTC — no timezones, no clock skew).
 //
 //   - dt_parse(s):            ISO 8601 -> unix seconds ("YYYY-MM-DD[ T]HH[:MM[:SS]][.frac][Z|±HH[:MM]]")
-//   - dt_format(t, fmt):      strftime-style formatting (%Y %m %d %H %M %S %F %T %R %j %A %a %B %b %e %p %y %z %Z %%)
+//   - dt_format(t, fmt):      strftime-style formatting (%Y %m %d %H %M %S %F %T %R %j %A %a %B %b %h %e %p %y %z %Z
+//                             %G %g %V %u %w %s %n %t %%)
+//   - dt_parse_format(s, fmt): the reverse, strptime-style: the same codes read back (ISO week dates and
+//                             ordinal dates included), checked strictly (calendar module for week math)
+//   - dt_format_lang / dt_parse_format_lang: the same with month and weekday names of fr de es it pt ar
+//                             (CLDR's), dt_month_name_in / dt_weekday_name_in and their short forms
 //   - dt_to_iso / dt_to_rfc2822 / dt_to_date
 //   - Duration:               relative timespans with parse/format and arithmetic
+//   - IsoDuration:            ISO 8601 durations ("P1Y2M10DT2H30M", "PT1.5S"):
+//                             dur_iso_parse / dur_iso_format / dur_to_iso, and
+//                             dt_add_iso (months on the calendar, end-of-month clamped)
 //
 // Usage:
 //   use datetime;
@@ -16,7 +24,7 @@
 //   value later = dt_add(t, dur_hours(2));
 
 module datetime;
- use time; use vec; use string;
+ use vec; use calendar; use time; use world;
 // ─── Digit parsing helpers ──────────────────────────────────────────────
 
 fn dt_is_digit(b: i64) -> bool {
@@ -349,6 +357,188 @@ pub fn dt_month_short(m: i64) -> str {
     return str_slice(dt_month_name(m), 0, 3);
 }
 
+// ─── Localized names ────────────────────────────────────────────────────
+//
+// Month and weekday names of a few languages as CLDR 47 writes them inside
+// a date (the "format" forms: what Python babel's format_date gives for
+// MMMM, MMM, EEEE and EEE): "en" English, "fr" French, "de" German, "es"
+// Spanish, "it" Italian, "pt" Portuguese, "ar" Arabic. A tag with a region
+// ("fr-CA", "de_AT") takes its language's names; any other language is
+// English. Names are UTF-8; the abbreviations keep CLDR's dots ("janv.",
+// "Okt.").
+
+// Whether the tag `lang` is the language `code` ("fr", "fr-FR", "FR_ca").
+fn dt_lang_is(lang: str, code: str) -> bool {
+    if !dt_word_at(lang, 0, code) {
+        return false;
+    }
+    if str_len(lang) == 2 {
+        return true;
+    }
+    val b: i64 = str_byte_at(lang, 2);
+    return b == 45 || b == 95;
+}
+
+// The names of `lang`, "|"-separated: kind 0 the months, 1 their
+// abbreviations, 2 the weekdays from Sunday, 3 their abbreviations; ""
+// for English.
+fn dt_names(lang: str, kind: i64) -> str {
+    if dt_lang_is(lang, "fr") {
+        if kind == 0 {
+            return "janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre";
+        }
+        if kind == 1 {
+            return "janv.|févr.|mars|avr.|mai|juin|juil.|août|sept.|oct.|nov.|déc.";
+        }
+        if kind == 2 {
+            return "dimanche|lundi|mardi|mercredi|jeudi|vendredi|samedi";
+        }
+        return "dim.|lun.|mar.|mer.|jeu.|ven.|sam.";
+    }
+    if dt_lang_is(lang, "de") {
+        if kind == 0 {
+            return "Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember";
+        }
+        if kind == 1 {
+            return "Jan.|Feb.|März|Apr.|Mai|Juni|Juli|Aug.|Sept.|Okt.|Nov.|Dez.";
+        }
+        if kind == 2 {
+            return "Sonntag|Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag";
+        }
+        return "So.|Mo.|Di.|Mi.|Do.|Fr.|Sa.";
+    }
+    if dt_lang_is(lang, "es") {
+        if kind == 0 {
+            return "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre";
+        }
+        if kind == 1 {
+            return "ene|feb|mar|abr|may|jun|jul|ago|sept|oct|nov|dic";
+        }
+        if kind == 2 {
+            return "domingo|lunes|martes|miércoles|jueves|viernes|sábado";
+        }
+        return "dom|lun|mar|mié|jue|vie|sáb";
+    }
+    if dt_lang_is(lang, "it") {
+        if kind == 0 {
+            return "gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre";
+        }
+        if kind == 1 {
+            return "gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov|dic";
+        }
+        if kind == 2 {
+            return "domenica|lunedì|martedì|mercoledì|giovedì|venerdì|sabato";
+        }
+        return "dom|lun|mar|mer|gio|ven|sab";
+    }
+    if dt_lang_is(lang, "pt") {
+        if kind == 0 {
+            return "janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro";
+        }
+        if kind == 1 {
+            return "jan.|fev.|mar.|abr.|mai.|jun.|jul.|ago.|set.|out.|nov.|dez.";
+        }
+        if kind == 2 {
+            return "domingo|segunda-feira|terça-feira|quarta-feira|quinta-feira|sexta-feira|sábado";
+        }
+        return "dom.|seg.|ter.|qua.|qui.|sex.|sáb.";
+    }
+    if dt_lang_is(lang, "ar") {
+        // CLDR's Arabic abbreviations are the full names
+        if kind == 0 || kind == 1 {
+            return "يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر";
+        }
+        return "الأحد|الاثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت";
+    }
+    return "";
+}
+
+// Field `idx` (0 the first) of a "|"-separated list; "?" past its end.
+fn dt_field(list: str, idx: i64) -> str {
+    val n: i64 = str_len(list);
+    var start: i64 = 0;
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        if i == n || str_byte_at(list, i) == 124 {
+            if k == idx {
+                return str_slice(list, start, i);
+            }
+            k = k + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "?";
+}
+
+/// The name of month 1..12 in language `lang` ("?" for another number).
+///
+/// Example:
+///   assert_eq(dt_month_name_in("fr", 8), "août");
+///   assert_eq(dt_month_name_in("de-AT", 3), "März");
+pub fn dt_month_name_in(lang: str, m: i64) -> str {
+    val names: str = dt_names(lang, 0);
+    if str_len(names) == 0 {
+        return dt_month_name(m);
+    }
+    if m < 1 || m > 12 {
+        return "?";
+    }
+    return dt_field(names, m - 1);
+}
+
+/// The abbreviated name of month 1..12 in language `lang`.
+///
+/// Example:
+///   assert_eq(dt_month_short_in("fr", 2), "févr.");
+pub fn dt_month_short_in(lang: str, m: i64) -> str {
+    val names: str = dt_names(lang, 1);
+    if str_len(names) == 0 {
+        return dt_month_short(m);
+    }
+    if m < 1 || m > 12 {
+        return "?";
+    }
+    return dt_field(names, m - 1);
+}
+
+/// The name of weekday 0 (Sunday) .. 6 in language `lang`.
+///
+/// Example:
+///   assert_eq(dt_weekday_name_in("es", 3), "miércoles");
+pub fn dt_weekday_name_in(lang: str, wd: i64) -> str {
+    val names: str = dt_names(lang, 2);
+    if str_len(names) == 0 {
+        return dt_weekday_name(wd);
+    }
+    if wd < 0 || wd > 6 {
+        return "?";
+    }
+    return dt_field(names, wd);
+}
+
+/// The abbreviated name of weekday 0 (Sunday) .. 6 in language `lang`.
+///
+/// Example:
+///   assert_eq(dt_weekday_short_in("de", 1), "Mo.");
+pub fn dt_weekday_short_in(lang: str, wd: i64) -> str {
+    val names: str = dt_names(lang, 3);
+    if str_len(names) == 0 {
+        return dt_weekday_short(wd);
+    }
+    if wd < 0 || wd > 6 {
+        return "?";
+    }
+    return dt_field(names, wd);
+}
+
+/// Whether `lang` has its own names here (English included); any other
+/// language formats and parses with the English ones.
+pub fn dt_lang_supported(lang: str) -> bool {
+    return dt_lang_is(lang, "en") || str_len(dt_names(lang, 0)) > 0;
+}
+
 // ─── Formatting ─────────────────────────────────────────────────────────
 
 fn dt_pad2(n: i64) -> str {
@@ -379,7 +569,10 @@ fn dt_pad4(n: i64) -> str {
 
 /// Format a LogicalTime with strftime-style codes.
 ///
-/// Supported: %Y %y %m %d %e %H %I %M %S %p %A %a %B %b %j %F %T %R %D %z %Z %%
+/// Supported: %Y %y %m %d %e %H %I %M %S %p %A %a %B %b %h %j %F %T %R %D %z %Z %%,
+/// the ISO 8601 week date %G (ISO year), %g (its last two digits), %V (ISO
+/// week 01..53), %u (weekday 1 Monday .. 7), and %w (weekday 0 Sunday .. 6),
+/// %s (Unix seconds), %n (newline), %t (tab).
 /// Unknown codes are emitted literally (the '%' is kept).
 ///
 /// Example:
@@ -389,6 +582,18 @@ fn dt_pad4(n: i64) -> str {
 ///   assert_eq(s, "Tuesday 27 October 2026, 14:30:05");
 ///   assert_eq(dt_format(t, "%F %I%p"), "2026-10-27 02PM");
 pub fn dt_format(t: LogicalTime, fmt: str) -> str {
+    return dt_format_lang(t, fmt, "en");
+}
+
+/// dt_format with the month and weekday names (%B %b %h %A %a) of
+/// language `lang` (see "Localized names": en fr de es it pt ar). The
+/// other codes are the same in every language (%p stays AM/PM).
+///
+/// Example:
+///   var t = time_new(2026, 8, 15, 9, 0, 0);
+///   assert_eq(dt_format_lang(t, "%A %e %B %Y", "fr"), "samedi 15 août 2026");
+///   assert_eq(dt_format_lang(t, "%a, %d. %b %Y", "de"), "Sa., 15. Aug. 2026");
+pub fn dt_format_lang(t: LogicalTime, fmt: str, lang: str) -> str {
     var out = "";
     var i = 0;
     var n = str_len(fmt);
@@ -453,17 +658,17 @@ pub fn dt_format(t: LogicalTime, fmt: str) -> str {
                     out = out + "PM";
                 }
             } else if code == 65 {
-                out = out + dt_weekday_name(wd);
+                out = out + dt_weekday_name_in(lang, wd);
             }  // %A
             else if code == 97 {
-                out = out + dt_weekday_short(wd);
+                out = out + dt_weekday_short_in(lang, wd);
             }  // %a
             else if code == 66 {
-                out = out + dt_month_name(month);
+                out = out + dt_month_name_in(lang, month);
             }  // %B
-            else if code == 98 {
-                out = out + dt_month_short(month);
-            }  // %b
+            else if code == 98 || code == 104 {
+                out = out + dt_month_short_in(lang, month);
+            }  // %b %h
             else if code == 106 {
                 // %j day of year
                 var doy = time_get_day_of_year(t);
@@ -495,6 +700,35 @@ pub fn dt_format(t: LogicalTime, fmt: str) -> str {
             else if code == 37 {
                 out = out + "%";
             }  // %%
+            else if code == 71 || code == 103 || code == 86 {
+                // %G %g %V: the ISO 8601 week date
+                val iw: CalIsoWeek = cal_iso_week(year, month, day);
+                if code == 71 {
+                    out = out + dt_pad4(iw.year);
+                } else if code == 103 {
+                    out = out + dt_pad2(((iw.year % 100) + 100) % 100);
+                } else {
+                    out = out + dt_pad2(iw.week);
+                }
+            } else if code == 117 {
+                // %u ISO weekday, Monday 1 .. Sunday 7
+                if wd == 0 {
+                    out = out + "7";
+                } else {
+                    out = out + p_to_str(wd);
+                }
+            } else if code == 119 {
+                out = out + p_to_str(wd);
+            }  // %w Sunday 0 .. Saturday 6
+            else if code == 115 {
+                out = out + p_to_str(t.seconds);
+            }  // %s
+            else if code == 110 {
+                out = out + "\n";
+            }  // %n
+            else if code == 116 {
+                out = out + "\t";
+            }  // %t
             else {
                 out = out + "%" + char_to_str(code);
                 // unknown: literal
@@ -503,6 +737,458 @@ pub fn dt_format(t: LogicalTime, fmt: str) -> str {
         }
     }
     return out;
+}
+
+// ─── Format-driven parsing (strptime) ───────────────────────────────────
+
+fn dt_is_space(b: i64) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+/// Read 1..`maxd` digits at `i`: (ok, value, digits read).
+fn dt_read_num(s: str, i: i64, maxd: i64) -> (bool, i64, i64) {
+    var n = str_len(s);
+    var v = 0;
+    var used = 0;
+    while used < maxd && i + used < n && dt_is_digit(str_byte_at(s, i + used)) {
+        v = v * 10 + (str_byte_at(s, i + used) - 48);
+        used = used + 1;
+    }
+    if used == 0 {
+        return (false, 0, 0);
+    }
+    return (true, v, used);
+}
+
+fn dt_lower(b: i64) -> i64 {
+    if b >= 65 && b <= 90 {
+        return b + 32;
+    }
+    return b;
+}
+
+/// Whether `word` is at `i` of `s`, letters compared without case.
+fn dt_word_at(s: str, i: i64, word: str) -> bool {
+    var k = 0;
+    var w = str_len(word);
+    if i + w > str_len(s) {
+        return false;
+    }
+    while k < w {
+        if dt_lower(str_byte_at(s, i + k)) != dt_lower(str_byte_at(word, k)) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// How much of `s` at `i` the name `word` takes: its length, or that of
+/// the name without a final "." ("janv" for "janv."), or 0.
+fn dt_name_len_at(s: str, i: i64, word: str) -> i64 {
+    val w: i64 = str_len(word);
+    if w == 0 {
+        return 0;
+    }
+    if dt_word_at(s, i, word) {
+        return w;
+    }
+    if w > 1 && str_byte_at(word, w - 1) == 46 {
+        val bare: str = str_slice(word, 0, w - 1);
+        if dt_word_at(s, i, bare) {
+            return w - 1;
+        }
+    }
+    return 0;
+}
+
+/// Month name of `lang` at `i`, full or abbreviated (the longest that
+/// matches): (month, length), month 0 when there is none.
+fn dt_read_month(s: str, i: i64, lang: str) -> (i64, i64) {
+    var best = 0;
+    var best_len = 0;
+    var m = 1;
+    while m <= 12 {
+        val lf: i64 = dt_name_len_at(s, i, dt_month_name_in(lang, m));
+        if lf > best_len {
+            best = m;
+            best_len = lf;
+        }
+        val ls: i64 = dt_name_len_at(s, i, dt_month_short_in(lang, m));
+        if ls > best_len {
+            best = m;
+            best_len = ls;
+        }
+        m = m + 1;
+    }
+    return (best, best_len);
+}
+
+/// Weekday name of `lang` at `i`, full or abbreviated (the longest that
+/// matches): (weekday 0 Sunday .. 6, length), -1 when none.
+fn dt_read_weekday(s: str, i: i64, lang: str) -> (i64, i64) {
+    var best = - 1;
+    var best_len = 0;
+    var d = 0;
+    while d <= 6 {
+        val lf: i64 = dt_name_len_at(s, i, dt_weekday_name_in(lang, d));
+        if lf > best_len {
+            best = d;
+            best_len = lf;
+        }
+        val ls: i64 = dt_name_len_at(s, i, dt_weekday_short_in(lang, d));
+        if ls > best_len {
+            best = d;
+            best_len = ls;
+        }
+        d = d + 1;
+    }
+    return (best, best_len);
+}
+
+/// The composite codes spelled out: %F %T %R %D.
+fn dt_expand_format(fmt: str) -> str {
+    var out = "";
+    var i = 0;
+    var n = str_len(fmt);
+    while i < n {
+        var c = str_byte_at(fmt, i);
+        if c == 37 && i + 1 < n {
+            var code = str_byte_at(fmt, i + 1);
+            if code == 70 {
+                out = out + "%Y-%m-%d";
+            } else if code == 84 {
+                out = out + "%H:%M:%S";
+            } else if code == 82 {
+                out = out + "%H:%M";
+            } else if code == 68 {
+                out = out + "%m/%d/%y";
+            } else {
+                out = out + str_slice(fmt, i, i + 2);
+            }
+            i = i + 2;
+        } else {
+            out = out + str_slice(fmt, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// Parse `s` by a strptime-style format to (ok, Unix seconds, UTC).
+///
+/// Codes: %Y (1..4 digits) %y (69..99 -> 19xx, 00..68 -> 20xx) %m %d %e
+/// %H %I %M %S (0..60) %p (AM/PM, any case) %j (day of year) %b %h %B
+/// (month names, full or short, any case) %a %A (weekday names: checked
+/// against the date) %z (Z, +HH, +HHMM, +HH:MM) %Z (UTC, GMT or Z) %s
+/// (Unix seconds: the rest of the date is not used) %G %V %u (ISO 8601
+/// week date) %w (weekday 0 Sunday .. 6, checked) %F %T %R %D %n %t %%.
+/// A space in the format matches any run of white space, none included;
+/// anything else must match exactly. The whole of `s` must be used, and
+/// the date must exist (no February 30, no week 53 in a 52-week year).
+/// Fields the format leaves out default to 1970-01-01 00:00:00 UTC.
+///
+/// Example:
+///   var (ok, ts) = dt_parse_format("Tue, 27 Oct 2026 14:30:00 +0200", "%a, %d %b %Y %T %z");
+///   assert(ok);
+///   assert_eq(dt_to_iso(dt_from_seconds(ts)), "2026-10-27T12:30:00Z");
+///   var (ok2, ts2) = dt_parse_format("2026-W44-2", "%G-W%V-%u");
+///   assert_eq(dt_to_date(dt_from_seconds(ts2)), "2026-10-27");
+pub fn dt_parse_format(s: str, fmt_in: str) -> (bool, i64) {
+    return dt_parse_format_lang(s, fmt_in, "en");
+}
+
+/// dt_parse_format with the month and weekday names of language `lang`
+/// (see "Localized names"): %b %h %B take the language's month names, full
+/// or abbreviated, the final "." of an abbreviation optional; %a %A its
+/// weekday names. ASCII letters match in any case; other letters as
+/// written ("août", not "AOÛT").
+///
+/// Example:
+///   var (ok, ts) = dt_parse_format_lang("mercredi 4 févr. 2026", "%A %e %b %Y", "fr");
+///   assert_eq(dt_to_date(dt_from_seconds(ts)), "2026-02-04");
+pub fn dt_parse_format_lang(s: str, fmt_in: str, lang: str) -> (bool, i64) {
+    var fmt = dt_expand_format(fmt_in);
+    var n = str_len(s);
+    var nf = str_len(fmt);
+    var year = 1970;
+    var month = 1;
+    var day = 1;
+    var hour = 0;
+    var min = 0;
+    var sec = 0;
+    var off = 0;
+    var pm = - 1;
+    var h12 = false;
+    var doy = - 1;
+    var has_epoch = false;
+    var epoch = 0;
+    var iso_year = 0;
+    var has_iso_year = false;
+    var iso_week = - 1;
+    var iso_wd = - 1;
+    var wday = - 1;
+    var i = 0;
+    var k = 0;
+    while k < nf {
+        var c = str_byte_at(fmt, k);
+        if dt_is_space(c) {
+            while i < n && dt_is_space(str_byte_at(s, i)) {
+                i = i + 1;
+            }
+            k = k + 1;
+        } else if c != 37 || k + 1 >= nf {
+            if i >= n || str_byte_at(s, i) != c {
+                return (false, 0);
+            }
+            i = i + 1;
+            k = k + 1;
+        } else {
+            var code = str_byte_at(fmt, k + 1);
+            k = k + 2;
+            if code == 89 || code == 71 {
+                // %Y %G
+                var(ok_yr, v_yr, used_yr) = dt_read_num(s, i, 4);
+                if !ok_yr {
+                    return (false, 0);
+                }
+                i = i + used_yr;
+                if code == 89 {
+                    year = v_yr;
+                } else {
+                    iso_year = v_yr;
+                    has_iso_year = true;
+                }
+            } else if code == 121 {
+                // %y
+                var(ok_yy, v_yy, used_yy) = dt_read_num(s, i, 2);
+                if !ok_yy {
+                    return (false, 0);
+                }
+                i = i + used_yy;
+                if v_yy >= 69 {
+                    year = 1900 + v_yy;
+                } else {
+                    year = 2000 + v_yy;
+                }
+            } else if code == 109 || code == 100 || code == 101 || code == 72 || code == 73 || code == 77 || code == 83 || code == 86 {
+                // %m %d %e %H %I %M %S %V: one or two digits
+                if code == 101 && i < n && str_byte_at(s, i) == 32 {
+                    i = i + 1;
+                }
+                var(ok_two, v_two, used_two) = dt_read_num(s, i, 2);
+                if !ok_two {
+                    return (false, 0);
+                }
+                i = i + used_two;
+                if code == 109 {
+                    month = v_two;
+                } else if code == 100 || code == 101 {
+                    day = v_two;
+                } else if code == 72 {
+                    hour = v_two;
+                } else if code == 73 {
+                    hour = v_two;
+                    h12 = true;
+                } else if code == 77 {
+                    min = v_two;
+                } else if code == 83 {
+                    sec = v_two;
+                } else {
+                    iso_week = v_two;
+                }
+            } else if code == 106 {
+                // %j
+                var(ok_doy, v_doy, used_doy) = dt_read_num(s, i, 3);
+                if !ok_doy {
+                    return (false, 0);
+                }
+                i = i + used_doy;
+                doy = v_doy;
+            } else if code == 117 || code == 119 {
+                // %u %w: one digit
+                var(ok_one, v_one, used_one) = dt_read_num(s, i, 1);
+                if !ok_one {
+                    return (false, 0);
+                }
+                i = i + used_one;
+                if code == 117 {
+                    if v_one < 1 || v_one > 7 {
+                        return (false, 0);
+                    }
+                    iso_wd = v_one;
+                } else {
+                    if v_one > 6 {
+                        return (false, 0);
+                    }
+                    wday = v_one;
+                }
+            } else if code == 112 {
+                // %p
+                if dt_word_at(s, i, "AM") {
+                    pm = 0;
+                } else if dt_word_at(s, i, "PM") {
+                    pm = 1;
+                } else {
+                    return (false, 0);
+                }
+                i = i + 2;
+            } else if code == 98 || code == 104 || code == 66 {
+                // %b %h %B
+                var(mon, mlen) = dt_read_month(s, i, lang);
+                if mon == 0 {
+                    return (false, 0);
+                }
+                month = mon;
+                i = i + mlen;
+            } else if code == 97 || code == 65 {
+                // %a %A
+                var(wdn, wlen) = dt_read_weekday(s, i, lang);
+                if wdn < 0 {
+                    return (false, 0);
+                }
+                wday = wdn;
+                i = i + wlen;
+            } else if code == 122 {
+                // %z: Z, or a sign, HH, then [:]MM or nothing
+                if i < n && (str_byte_at(s, i) == 90 || str_byte_at(s, i) == 122) {
+                    off = 0;
+                    i = i + 1;
+                } else {
+                    if i >= n {
+                        return (false, 0);
+                    }
+                    var sign = 1;
+                    var sb = str_byte_at(s, i);
+                    if sb == 45 {
+                        sign = - 1;
+                    } else if sb != 43 {
+                        return (false, 0);
+                    }
+                    i = i + 1;
+                    var(okh, zh) = dt_digits(s, i, 2);
+                    if !okh {
+                        return (false, 0);
+                    }
+                    i = i + 2;
+                    var zm = 0;
+                    if i < n && str_byte_at(s, i) == 58 {
+                        i = i + 1;
+                        var(okm, zmv) = dt_digits(s, i, 2);
+                        if !okm {
+                            return (false, 0);
+                        }
+                        zm = zmv;
+                        i = i + 2;
+                    } else if i + 1 < n && dt_is_digit(str_byte_at(s, i)) && dt_is_digit(str_byte_at(s, i + 1)) {
+                        var(okm2, zmv2) = dt_digits(s, i, 2);
+                        if !okm2 {
+                            return (false, 0);
+                        }
+                        zm = zmv2;
+                        i = i + 2;
+                    }
+                    if zh > 23 || zm > 59 {
+                        return (false, 0);
+                    }
+                    off = sign * (zh * 3600 + zm * 60);
+                }
+            } else if code == 90 {
+                // %Z: only the names of UTC
+                if dt_word_at(s, i, "UTC") || dt_word_at(s, i, "GMT") {
+                    i = i + 3;
+                } else if i < n && str_byte_at(s, i) == 90 {
+                    i = i + 1;
+                } else {
+                    return (false, 0);
+                }
+                off = 0;
+            } else if code == 115 {
+                // %s
+                var neg = false;
+                if i < n && str_byte_at(s, i) == 45 {
+                    neg = true;
+                    i = i + 1;
+                }
+                var(ok_ep, v_ep, used_ep) = dt_read_num(s, i, 18);
+                if !ok_ep {
+                    return (false, 0);
+                }
+                i = i + used_ep;
+                epoch = v_ep;
+                if neg {
+                    epoch = - v_ep;
+                }
+                has_epoch = true;
+            } else if code == 110 || code == 116 {
+                // %n %t: any white space
+                while i < n && dt_is_space(str_byte_at(s, i)) {
+                    i = i + 1;
+                }
+            } else if code == 37 {
+                if i >= n || str_byte_at(s, i) != 37 {
+                    return (false, 0);
+                }
+                i = i + 1;
+            } else {
+                // an unknown code
+                return (false, 0);
+            }
+        }
+    }
+    if i != n {
+        return (false, 0);
+    }
+    if has_epoch {
+        return (true, epoch);
+    }
+    if h12 {
+        if hour < 1 || hour > 12 {
+            return (false, 0);
+        }
+        hour = hour % 12;
+        if pm == 1 {
+            hour = hour + 12;
+        }
+    } else if pm == 1 && hour < 12 {
+        hour = hour + 12;
+    }
+    if hour > 23 || min > 59 || sec > 60 {
+        return (false, 0);
+    }
+    var days = 0;
+    if has_iso_year || iso_week >= 0 || iso_wd >= 0 {
+        // an ISO week date: %G, %V and %u (a missing weekday is Monday)
+        if !has_iso_year || iso_week < 0 {
+            return (false, 0);
+        }
+        if iso_wd < 0 {
+            iso_wd = 1;
+        }
+        if !cal_iso_week_is_valid(iso_year, iso_week, iso_wd) {
+            return (false, 0);
+        }
+        days = cal_days_from_iso_week(iso_year, iso_week, iso_wd);
+    } else if doy >= 0 {
+        var ylen = 365;
+        if is_leap_year(year) {
+            ylen = 366;
+        }
+        if doy < 1 || doy > ylen {
+            return (false, 0);
+        }
+        days = cal_days_from_ordinal(year, doy);
+    } else {
+        if !cal_is_valid(year, month, day) {
+            return (false, 0);
+        }
+        days = cal_days_from_civil(year, month, day);
+    }
+    // a weekday that was given must be the date's
+    if wday >= 0 && cal_iso_weekday(days) % 7 != wday {
+        return (false, 0);
+    }
+    return (true, days * 86400 + hour * 3600 + min * 60 + sec - off);
 }
 
 /// ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" (same as time_to_iso).
@@ -546,11 +1232,22 @@ pub fn dt_to_seconds(t: LogicalTime) -> i64 {
 }
 
 /// The current wall-clock time as a LogicalTime (NOT deterministic —
-/// reads CLOCK_REALTIME).
+/// reads CLOCK_REALTIME). With FIDES_TEST_NOW set to unix seconds (a test
+/// run, complaint CT3), it is that time instead, so a test that reads the
+/// date repeats exactly.
 ///
 /// Example:
 ///   assert(time_get_year(dt_now()) >= 2024);
 pub fn dt_now() -> LogicalTime {
+    // a test's fake clock (stdlib/world.fd, CT1) comes first
+    if world_clock_faked() { return time_from_timestamp(clock_now_ms() / 1000); }
+    match env_var("FIDES_TEST_NOW") {
+        Option::Some(s) => {
+            return time_from_timestamp(str_parse_int(s));
+        }
+        Option::None => {
+        }
+    }
     return time_from_timestamp(p_clock_now_ms() / 1000);
 }
 
@@ -853,4 +1550,255 @@ pub fn dur_format_hms(d: Duration) -> str {
     var m = (secs % 3600) / 60;
     var s = secs % 60;
     return sign + dt_pad2(h) + ":" + dt_pad2(m) + ":" + dt_pad2(s);
+}
+
+// ─── ISO 8601 durations ─────────────────────────────────────────────────
+//
+// "P3Y6M4DT12H30M5S", "PT1.5S", "P2W", "-P1D" (ISO 8601-1 §5.5.2, with the
+// sign of ISO 8601-2 / RFC 3339 appendix A and JavaScript's Temporal).
+// Years and months have no fixed length, so they stay apart from the exact
+// part; dt_add_iso applies them on the calendar (Jan 31 + P1M = the last
+// day of February), then the days, then the exact time.
+
+/// A parsed ISO 8601 duration. `ok` is false when the text was not one.
+/// Weeks are folded into `days`; hours, minutes and seconds into
+/// `seconds`; `nanos` is the fraction of a second (0..999999999).
+pub struct IsoDuration {
+    pub ok: bool,
+    pub neg: bool,
+    pub years: i64,
+    pub months: i64,
+    pub days: i64,
+    pub seconds: i64,
+    pub nanos: i64,
+}
+
+fn dt_iso_bad() -> IsoDuration {
+    return IsoDuration {
+        ok: false, neg: false, years: 0, months: 0, days: 0, seconds: 0, nanos: 0,
+    };
+}
+
+/// Parse an ISO 8601 duration: an optional sign, `P`, then any of `nY`
+/// `nM` `nW` `nD` in that order, then `T` and any of `nH` `nM` `nS` (at
+/// least one component, at least one after `T`); only the seconds may have
+/// a fraction (`.` or `,`, up to 9 digits).
+///
+/// Example:
+///   var d = dur_iso_parse("P1Y2M10DT2H30M");
+///   assert(d.ok);
+///   assert_eq(d.months, 2);
+///   assert_eq(d.seconds, 9000);
+///   assert(!dur_iso_parse("P1H").ok);
+pub fn dur_iso_parse(s: str) -> IsoDuration {
+    var d: IsoDuration = dt_iso_bad();
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    if i < n && str_byte_at(s, i) == 45 {
+        d.neg = true;
+        i = i + 1;
+    } else if i < n && str_byte_at(s, i) == 43 {
+        i = i + 1;
+    }
+    if i >= n || str_byte_at(s, i) != 80 {
+        return dt_iso_bad();
+    }
+    i = i + 1;
+    var in_time: bool = false;
+    var any: bool = false;
+    var time_any: bool = false;
+    var last: i64 = 0;
+    while i < n {
+        if str_byte_at(s, i) == 84 {
+            if in_time {
+                return dt_iso_bad();
+            }
+            in_time = true;
+            i = i + 1;
+            continue;
+        }
+        var num: i64 = 0;
+        var digits: i64 = 0;
+        while i < n && dt_is_digit(str_byte_at(s, i)) {
+            num = num * 10 + (str_byte_at(s, i) - 48);
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if digits == 0 || digits > 15 {
+            return dt_iso_bad();
+        }
+        var frac: i64 = 0;
+        var has_frac: bool = false;
+        if i < n && (str_byte_at(s, i) == 46 || str_byte_at(s, i) == 44) {
+            has_frac = true;
+            i = i + 1;
+            var fd: i64 = 0;
+            while i < n && dt_is_digit(str_byte_at(s, i)) {
+                if fd < 9 {
+                    frac = frac * 10 + (str_byte_at(s, i) - 48);
+                    fd = fd + 1;
+                } else {
+                    return dt_iso_bad();
+                }
+                i = i + 1;
+            }
+            if fd == 0 {
+                return dt_iso_bad();
+            }
+            while fd < 9 {
+                frac = frac * 10;
+                fd = fd + 1;
+            }
+        }
+        if i >= n {
+            return dt_iso_bad();
+        }
+        var u: i64 = str_byte_at(s, i);
+        i = i + 1;
+        var order: i64 = 0;
+        if !in_time {
+            if u == 89 {
+                order = 1;
+                d.years = num;
+            } else if u == 77 {
+                order = 2;
+                d.months = num;
+            } else if u == 87 {
+                order = 3;
+                d.days = d.days + num * 7;
+            } else if u == 68 {
+                order = 4;
+                d.days = d.days + num;
+            }
+        } else {
+            if u == 72 {
+                order = 5;
+                d.seconds = d.seconds + num * 3600;
+            } else if u == 77 {
+                order = 6;
+                d.seconds = d.seconds + num * 60;
+            } else if u == 83 {
+                order = 7;
+                d.seconds = d.seconds + num;
+                d.nanos = frac;
+            }
+            time_any = true;
+        }
+        if order == 0 || order <= last {
+            return dt_iso_bad();
+        }
+        if has_frac && order != 7 {
+            return dt_iso_bad();
+        }
+        last = order;
+        any = true;
+    }
+    if !any || (in_time && !time_any) {
+        return dt_iso_bad();
+    }
+    d.ok = true;
+    return d;
+}
+
+/// The canonical text of `d`: units that are zero left out, hours,
+/// minutes and seconds from `seconds` (not carried into days), the
+/// fraction without trailing zeros, "PT0S" for zero.
+///
+/// Example:
+///   assert_eq(dur_iso_format(dur_iso_parse("P2W")), "P14D");
+///   assert_eq(dur_iso_format(dur_iso_parse("PT0,250S")), "PT0.25S");
+pub fn dur_iso_format(d: IsoDuration) -> str {
+    var out: str = "P";
+    if d.years != 0 {
+        out = out + p_to_str(d.years) + "Y";
+    }
+    if d.months != 0 {
+        out = out + p_to_str(d.months) + "M";
+    }
+    if d.days != 0 {
+        out = out + p_to_str(d.days) + "D";
+    }
+    var h: i64 = d.seconds / 3600;
+    var m: i64 = (d.seconds % 3600) / 60;
+    var s: i64 = d.seconds % 60;
+    if h != 0 || m != 0 || s != 0 || d.nanos != 0 {
+        out = out + "T";
+        if h != 0 {
+            out = out + p_to_str(h) + "H";
+        }
+        if m != 0 {
+            out = out + p_to_str(m) + "M";
+        }
+        if s != 0 || d.nanos != 0 {
+            out = out + p_to_str(s);
+            if d.nanos != 0 {
+                var f: str = p_to_str(d.nanos);
+                while str_len(f) < 9 {
+                    f = "0" + f;
+                }
+                var e: i64 = 9;
+                while e > 1 && str_byte_at(f, e - 1) == 48 {
+                    e = e - 1;
+                }
+                out = out + "." + str_slice(f, 0, e);
+            }
+            out = out + "S";
+        }
+    }
+    if str_len(out) == 1 {
+        out = "PT0S";
+    }
+    if d.neg && !str_equal(out, "PT0S") {
+        return "-" + out;
+    }
+    return out;
+}
+
+/// An exact Duration as ISO 8601: whole days (86400 s) and the rest as
+/// hours, minutes and seconds.
+///
+/// Example:
+///   assert_eq(dur_to_iso(dur_seconds(93784)), "P1DT2H3M4S");
+///   assert_eq(dur_to_iso(dur_seconds(-90)), "-PT1M30S");
+pub fn dur_to_iso(d: Duration) -> str {
+    var secs: i64 = d.seconds;
+    var neg: bool = secs < 0;
+    if neg {
+        secs = 0 - secs;
+    }
+    var iso: IsoDuration = IsoDuration {
+        ok: true, neg: neg, years: 0, months: 0, days: secs / 86400, seconds: secs % 86400, nanos: 0,
+    };
+    return dur_iso_format(iso);
+}
+
+/// `t` moved by `d`: years and months on the calendar (a day past the
+/// end of the new month becomes its last day), then the days, then the
+/// hours, minutes and seconds; a negative duration moves back the same way.
+/// The fraction of a second is dropped (LogicalTime counts whole seconds).
+///
+/// Example:
+///   var t = time_new(2024, 1, 31, 10, 0, 0);
+///   assert_eq(time_to_iso(dt_add_iso(t, dur_iso_parse("P1M"))), "2024-02-29T10:00:00Z");
+///   assert_eq(time_to_iso(dt_add_iso(t, dur_iso_parse("-P1DT1H"))), "2024-01-30T09:00:00Z");
+pub fn dt_add_iso(t: LogicalTime, d: IsoDuration) -> LogicalTime {
+    var sign: i64 = 1;
+    if d.neg {
+        sign = - 1;
+    }
+    var y: i64 = time_get_year(t);
+    var mo: i64 = time_get_month(t);
+    var day: i64 = time_get_day(t);
+    var total: i64 = y * 12 + (mo - 1) + sign * (d.years * 12 + d.months);
+    var ny: i64 = total / 12;
+    if total % 12 < 0 {
+        ny = ny - 1;
+    }
+    var nm: i64 = total - ny * 12 + 1;
+    var last: i64 = days_in_month(ny, nm);
+    if day > last {
+        day = last;
+    }
+    var moved: LogicalTime = time_new(ny, nm, day, time_get_hour(t), time_get_minute(t), time_get_second(t));
+    return time_from_timestamp(moved.seconds + sign * (d.days * 86400 + d.seconds));
 }

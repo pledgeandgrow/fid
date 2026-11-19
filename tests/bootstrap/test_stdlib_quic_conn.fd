@@ -1,0 +1,587 @@
+// stdlib/quic_conn (competitive SL2, part 2): a QUIC client and server in
+// one process, their datagrams carried by a simulated network that delays
+// each by one 5 ms step and drops some on purpose.
+//   - the TLS 1.3 handshake in CRYPTO frames (X25519, a self-signed
+//     Ed25519 certificate pinned by the client, ALPN "h3", transport
+//     parameters), the client's Initial padded to 1200 bytes;
+//   - a 100000-byte request echoed back on a bidirectional stream with one
+//     datagram in 7 dropped both ways: ACKs, loss detection and
+//     retransmission, stream and connection flow control (16 KB stream
+//     windows, 32 KB connection window, raised as the data is read);
+//   - a unidirectional stream from the server, MAX_STREAMS (the server
+//     allows 2 streams at once, the client opens 6), STOP_SENDING answered
+//     by RESET_STREAM, a key update started by the client, CONNECTION_CLOSE
+//     with an application error, then the draining and closing periods;
+//   - a lost server flight recovered by the probe timeout, and the idle
+//     timeout;
+//   - a wrong pinned key (bad_certificate) and no common ALPN
+//     (no_application_protocol) fail the handshake with CRYPTO_ERROR.
+// Too slow for the interpreter (pure-Fides X25519, Ed25519 and AES-GCM):
+// run it through C (`fid ccompile`). A wrong answer panics.
+//
+// Expected output:
+// certificate ok
+// client initial 1200 bytes
+// handshake ok: h3
+// echo 100000 bytes ok
+// losses recovered
+// uni stream: control
+// six streams with a limit of two ok
+// stop_sending answered by reset_stream 66
+// key update ok
+// close seen by the server: 256 bye
+// both ends closed
+// lost server flight recovered
+// idle timeout ok
+// pinned key mismatch: 298
+// no common alpn: 376
+// garbage ignored
+// flow control violation: 3
+// stream limit violation: 4
+// retry handled
+// quic connection ok
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use ed25519;
+use encoding;
+
+/// The simulated network: datagrams sent during a step arrive at the next.
+struct Net {
+    to_server: Vec<Vec<i64>>,
+    to_client: Vec<Vec<i64>>,
+    now: i64,
+    drop_every: i64,
+    sent_cs: i64,
+    sent_sc: i64,
+    drop_server_first: i64,
+    jump: bool,
+}
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+/// The client's Initial keys are @secret (complaint CO1): the Retry check
+/// opens the client's packet as the server would, through this release.
+@declassify fn client_initial_keys(dcid: Vec<i64>) -> QuicKeys {
+    return quic_initial_keys(dcid, false);
+}
+
+fn alpn1(p: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(p);
+    return v;
+}
+
+fn server_seed() -> Vec<i64> {
+    return hb("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+}
+
+fn client_cfg(pin: Vec<i64>, alpn: str) -> QuicConfig {
+    var cfg: QuicConfig = quic_config_client(alpn1(alpn), "localhost");
+    cfg.peer_key = pin;
+    cfg.seed = str_bytes("client seed");
+    cfg.max_data = 32768;
+    cfg.max_stream_data_bidi_local = 16384;
+    cfg.max_stream_data_bidi_remote = 16384;
+    cfg.max_stream_data_uni = 16384;
+    return cfg;
+}
+
+fn server_cfg(cert: Vec<i64>) -> QuicConfig {
+    var cfg: QuicConfig = quic_config_server(alpn1("h3"), cert, server_seed());
+    cfg.seed = str_bytes("server seed");
+    cfg.max_data = 32768;
+    cfg.max_stream_data_bidi_local = 16384;
+    cfg.max_stream_data_bidi_remote = 16384;
+    cfg.max_stream_data_uni = 16384;
+    cfg.max_streams_bidi = 2;
+    return cfg;
+}
+
+fn net_new() -> Net {
+    return Net { to_server: Vec::new(), to_client: Vec::new(), now: 0, drop_every: 0,
+        sent_cs: 0, sent_sc: 0, drop_server_first: 0, jump: false };
+}
+
+fn min_time(a: i64, b: i64) -> i64 {
+    if a < 0 { return b; }
+    if b < 0 { return a; }
+    if a < b { return a; }
+    return b;
+}
+
+/// One step: deliver what was sent last step, run due timers, send.
+fn step(c: & mut QuicConn, s: & mut QuicConn, n: & mut Net) {
+    n.now = n.now + 5;
+    val now: i64 = n.now;
+    val ts: Vec<Vec<i64>> = n.to_server;
+    n.to_server = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        quic_conn_recv(s, ts.get(i), now);
+        i = i + 1;
+    }
+    val tc: Vec<Vec<i64>> = n.to_client;
+    n.to_client = Vec::new();
+    i = 0;
+    while i < tc.len() {
+        quic_conn_recv(c, tc.get(i), now);
+        i = i + 1;
+    }
+    val tcl: i64 = quic_conn_timeout(c);
+    if tcl >= 0 && tcl <= now { quic_conn_on_timeout(c, now); }
+    val tsv: i64 = quic_conn_timeout(s);
+    if tsv >= 0 && tsv <= now { quic_conn_on_timeout(s, now); }
+    var guard: i64 = 0;
+    while guard < 100 {
+        val d: Vec<i64> = quic_conn_send(c, now);
+        if d.len() == 0 { guard = 100; } else {
+            if d.len() > 1200 { p_panic("client datagram over 1200 bytes"); }
+            n.sent_cs = n.sent_cs + 1;
+            if n.drop_every == 0 || n.sent_cs % n.drop_every != 0 {
+                n.to_server.push(d);
+            }
+        }
+        guard = guard + 1;
+    }
+    guard = 0;
+    while guard < 100 {
+        val d: Vec<i64> = quic_conn_send(s, now);
+        if d.len() == 0 { guard = 100; } else {
+            if d.len() > 1200 { p_panic("server datagram over 1200 bytes"); }
+            n.sent_sc = n.sent_sc + 1;
+            if n.drop_server_first > 0 {
+                n.drop_server_first = n.drop_server_first - 1;
+            } else if n.drop_every == 0 || n.sent_sc % n.drop_every != 0 {
+                n.to_client.push(d);
+            }
+        }
+        guard = guard + 1;
+    }
+    if n.jump && n.to_server.len() == 0 && n.to_client.len() == 0 {
+        val t: i64 = min_time(quic_conn_timeout(c), quic_conn_timeout(s));
+        if t > n.now + 5 {
+            n.now = t - 5;
+        }
+    }
+}
+
+/// A connected pair: the client's first datagram makes the server.
+struct Pair {
+    c: QuicConn,
+    s: QuicConn,
+}
+
+fn connect(ccfg: QuicConfig, scfg: QuicConfig, n: & mut Net, check_size: bool) -> Pair {
+    var c: QuicConn = quic_connect(ccfg, n.now);
+    val first: Vec<i64> = quic_conn_send(& mut c, n.now);
+    if check_size {
+        if first.len() != 1200 { p_panic("client Initial is " + int_to_str(first.len()) + " bytes"); }
+        println("client initial 1200 bytes");
+    }
+    if !quic_is_new_initial(first) { p_panic("not a new Initial"); }
+    n.now = n.now + 5;
+    var s: QuicConn = quic_accept(scfg, first, n.now);
+    if quic_conn_closed(& s) { p_panic("server refused the Initial: " + s.why); }
+    return Pair { c: c, s: s };
+}
+
+fn run_handshake(c: & mut QuicConn, s: & mut QuicConn, n: & mut Net) {
+    var rounds: i64 = 0;
+    while rounds < 400 && !(quic_conn_established(c) && quic_conn_established(s)) {
+        step(c, s, n);
+        if quic_conn_done(c) || quic_conn_done(s) { return; }
+        rounds = rounds + 1;
+    }
+}
+
+fn pattern(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((i * 7 + i / 251) % 256);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn append(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// The server's application: every stream a client opens is echoed back
+/// once the client finished it.
+struct Echo {
+    ids: Vec<i64>,
+    bufs: Vec<Vec<i64>>,
+    done: Vec<bool>,
+}
+
+fn echo_run(s: & mut QuicConn, e: & mut Echo) {
+    val fresh: Vec<i64> = quic_accept_streams(s);
+    var i: i64 = 0;
+    while i < fresh.len() {
+        if (fresh.get(i) & 2) == 0 {
+            e.ids.push(fresh.get(i));
+            var none: Vec<i64> = Vec::new();
+            e.bufs.push(none);
+            e.done.push(false);
+        }
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < e.ids.len() {
+        if !e.done.get(k) {
+            val id: i64 = e.ids.get(k);
+            var b: Vec<i64> = e.bufs.get(k);
+            append(& mut b, quic_stream_read(s, id));
+            if quic_stream_reset_code(s, id) < 0 && quic_stream_finished(s, id) {
+                quic_stream_write(s, id, b, true);
+                e.done.set(k, true);
+            }
+            e.bufs.set(k, b);
+        }
+        k = k + 1;
+    }
+}
+
+fn main() -> i64 {
+    val seed: Vec<i64> = server_seed();
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    val pk: Vec<i64> = ed25519_public_key(seed);
+    if !same(quic_cert_ed25519_key(cert), pk) { p_panic("certificate key"); }
+    if !quic_cert_self_signed_ok(cert) { p_panic("certificate self-signature"); }
+    var bad_cert: Vec<i64> = cert;
+    bad_cert.set(bad_cert.len() - 3, bad_cert.get(bad_cert.len() - 3) ^ 1);
+    if quic_cert_self_signed_ok(bad_cert) { p_panic("a bad certificate signature verified"); }
+    println("certificate ok");
+
+    // ── The main connection ──
+    var n: Net = net_new();
+    var p: Pair = connect(client_cfg(pk, "h3"), server_cfg(cert), & mut n, true);
+    var c1: QuicConn = p.c;
+    var s1: QuicConn = p.s;
+    run_handshake(& mut c1, & mut s1, & mut n);
+    if !quic_conn_established(& c1) || !quic_conn_established(& s1) {
+        p_panic("handshake failed: client " + c1.why + " / server " + s1.why);
+    }
+    if !str_equal(c1.alpn, "h3") || !str_equal(s1.alpn, "h3") { p_panic("alpn"); }
+    println("handshake ok: " + c1.alpn);
+
+    // 100000 bytes echoed, one datagram in 7 dropped
+    n.drop_every = 7;
+    var echo: Echo = Echo { ids: Vec::new(), bufs: Vec::new(), done: Vec::new() };
+    val req: Vec<i64> = pattern(100000);
+    val sid: i64 = quic_open_bidi(& mut c1);
+    if sid != 0 { p_panic("first client stream is " + int_to_str(sid)); }
+    quic_stream_write(& mut c1, sid, req, true);
+    var got: Vec<i64> = Vec::new();
+    var rounds: i64 = 0;
+    while rounds < 20000 && !(quic_stream_finished(& c1, sid) && got.len() == 100000) {
+        step(& mut c1, & mut s1, & mut n);
+        echo_run(& mut s1, & mut echo);
+        append(& mut got, quic_stream_read(& mut c1, sid));
+        if quic_conn_done(& c1) || quic_conn_done(& s1) {
+            p_panic("connection failed during the echo: " + c1.why + " / " + s1.why);
+        }
+        rounds = rounds + 1;
+    }
+    if !same(got, req) { p_panic("echo differs: got " + int_to_str(got.len()) + " bytes"); }
+    println("echo 100000 bytes ok");
+    if c1.packets_lost + s1.packets_lost == 0 { p_panic("no loss was detected"); }
+    println("losses recovered");
+    n.drop_every = 0;
+
+    // A unidirectional stream from the server
+    val uid: i64 = quic_open_uni(& mut s1);
+    if uid != 3 { p_panic("first server uni stream is " + int_to_str(uid)); }
+    quic_stream_write(& mut s1, uid, str_bytes("control"), true);
+    var ugot: Vec<i64> = Vec::new();
+    var seen_uni: bool = false;
+    rounds = 0;
+    while rounds < 200 && !(seen_uni && quic_stream_finished(& c1, uid)) {
+        step(& mut c1, & mut s1, & mut n);
+        echo_run(& mut s1, & mut echo);
+        val fresh: Vec<i64> = quic_accept_streams(& mut c1);
+        var f: i64 = 0;
+        while f < fresh.len() {
+            if fresh.get(f) == uid { seen_uni = true; }
+            f = f + 1;
+        }
+        append(& mut ugot, quic_stream_read(& mut c1, uid));
+        rounds = rounds + 1;
+    }
+    if !seen_uni { p_panic("the uni stream was not announced"); }
+    println("uni stream: " + str_from_bytes(ugot));
+
+    // Six streams, the server allows two at once: MAX_STREAMS lets the rest in
+    var opened: Vec<i64> = Vec::new();
+    var answers: Vec<Vec<i64>> = Vec::new();
+    rounds = 0;
+    var complete: i64 = 0;
+    while rounds < 2000 && complete < 6 {
+        if opened.len() < 6 {
+            val id: i64 = quic_open_bidi(& mut c1);
+            if id >= 0 {
+                quic_stream_write(& mut c1, id, str_bytes("msg" + int_to_str(opened.len())), true);
+                opened.push(id);
+                var none: Vec<i64> = Vec::new();
+                answers.push(none);
+            }
+        }
+        step(& mut c1, & mut s1, & mut n);
+        echo_run(& mut s1, & mut echo);
+        complete = 0;
+        var k: i64 = 0;
+        while k < opened.len() {
+            var a: Vec<i64> = answers.get(k);
+            append(& mut a, quic_stream_read(& mut c1, opened.get(k)));
+            answers.set(k, a);
+            if quic_stream_finished(& c1, opened.get(k)) && a.len() > 0 { complete = complete + 1; }
+            k = k + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if complete != 6 { p_panic("only " + int_to_str(complete) + " of six streams finished"); }
+    var k2: i64 = 0;
+    while k2 < 6 {
+        if !str_equal(str_from_bytes(answers.get(k2)), "msg" + int_to_str(k2)) { p_panic("stream answer " + int_to_str(k2)); }
+        k2 = k2 + 1;
+    }
+    println("six streams with a limit of two ok");
+
+    // STOP_SENDING from the server is answered with RESET_STREAM
+    rounds = 0;
+    var stop_id: i64 = - 1;
+    while rounds < 400 && stop_id < 0 {
+        stop_id = quic_open_bidi(& mut c1);
+        step(& mut c1, & mut s1, & mut n);
+        echo_run(& mut s1, & mut echo);
+        rounds = rounds + 1;
+    }
+    quic_stream_write(& mut c1, stop_id, str_bytes("partial"), false);
+    rounds = 0;
+    var stopped: bool = false;
+    while rounds < 400 && quic_stream_reset_code(& s1, stop_id) < 0 {
+        step(& mut c1, & mut s1, & mut n);
+        if !stopped && quic_stream_index(& s1, stop_id) >= 0 {
+            quic_stream_stop(& mut s1, stop_id, 66);
+            stopped = true;
+        }
+        rounds = rounds + 1;
+    }
+    if quic_stream_reset_code(& s1, stop_id) != 66 { p_panic("no RESET_STREAM after STOP_SENDING"); }
+    if quic_stream_write(& mut c1, stop_id, str_bytes("more"), false) { p_panic("wrote after STOP_SENDING"); }
+    println("stop_sending answered by reset_stream " + int_to_str(quic_stream_reset_code(& s1, stop_id)));
+
+    // Key update started by the client, then data both ways
+    if !quic_conn_update_keys(& mut c1) { p_panic("key update refused"); }
+    if quic_conn_update_keys(& mut c1) { p_panic("a second key update before the first was acknowledged"); }
+    var kid: i64 = - 1;
+    rounds = 0;
+    while rounds < 400 && kid < 0 {
+        kid = quic_open_bidi(& mut c1);
+        if kid < 0 {
+            step(& mut c1, & mut s1, & mut n);
+            echo_run(& mut s1, & mut echo);
+        }
+        rounds = rounds + 1;
+    }
+    quic_stream_write(& mut c1, kid, str_bytes("after update"), true);
+    var kgot: Vec<i64> = Vec::new();
+    rounds = 0;
+    while rounds < 400 && !(quic_stream_finished(& c1, kid) && kgot.len() > 0) {
+        step(& mut c1, & mut s1, & mut n);
+        echo_run(& mut s1, & mut echo);
+        append(& mut kgot, quic_stream_read(& mut c1, kid));
+        rounds = rounds + 1;
+    }
+    if !str_equal(str_from_bytes(kgot), "after update") || !s1.key_phase || !c1.key_phase {
+        p_panic("key update: echo or phase");
+    }
+    println("key update ok");
+
+    // Application close
+    quic_conn_close(& mut c1, 256, "bye", n.now);
+    rounds = 0;
+    while rounds < 50 && !s1.peer_closed {
+        step(& mut c1, & mut s1, & mut n);
+        rounds = rounds + 1;
+    }
+    if !s1.peer_closed || !s1.app_error { p_panic("the server did not see the close"); }
+    println("close seen by the server: " + int_to_str(s1.error) + " " + s1.why);
+    n.jump = true;
+    rounds = 0;
+    while rounds < 100 && !(quic_conn_closed(& c1) && quic_conn_closed(& s1)) {
+        step(& mut c1, & mut s1, & mut n);
+        rounds = rounds + 1;
+    }
+    if !quic_conn_closed(& c1) || !quic_conn_closed(& s1) { p_panic("closing period did not end"); }
+    println("both ends closed");
+
+    // ── The server's first flight is lost: probes bring it back ──
+    var n2: Net = net_new();
+    n2.jump = true;
+    n2.drop_server_first = 2;
+    var ccfg2: QuicConfig = client_cfg(pk, "h3");
+    ccfg2.idle_timeout_ms = 3000;
+    var p2: Pair = connect(ccfg2, server_cfg(cert), & mut n2, false);
+    var c2: QuicConn = p2.c;
+    var s2: QuicConn = p2.s;
+    run_handshake(& mut c2, & mut s2, & mut n2);
+    if !quic_conn_established(& c2) || !quic_conn_established(& s2) {
+        p_panic("handshake after loss failed: " + c2.why + " / " + s2.why);
+    }
+    println("lost server flight recovered");
+    // Nothing more is sent: the idle timeout closes both ends
+    rounds = 0;
+    while rounds < 100 && !(quic_conn_closed(& c2) && quic_conn_closed(& s2)) {
+        step(& mut c2, & mut s2, & mut n2);
+        rounds = rounds + 1;
+    }
+    if !quic_conn_closed(& c2) || !str_equal(c2.why, "idle timeout") { p_panic("no idle timeout: " + c2.why); }
+    println("idle timeout ok");
+
+    // ── A wrong pinned key ──
+    var n3: Net = net_new();
+    var p3: Pair = connect(client_cfg(hb("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"), "h3"),
+        server_cfg(cert), & mut n3, false);
+    var c3: QuicConn = p3.c;
+    var s3: QuicConn = p3.s;
+    run_handshake(& mut c3, & mut s3, & mut n3);
+    if quic_conn_established(& c3) || c3.error != 0x100 + 42 { p_panic("pinned key mismatch accepted: " + int_to_str(c3.error)); }
+    println("pinned key mismatch: " + int_to_str(c3.error));
+
+    // ── No common application protocol ──
+    var n4: Net = net_new();
+    var p4: Pair = connect(client_cfg(pk, "h2"), server_cfg(cert), & mut n4, false);
+    var c4: QuicConn = p4.c;
+    var s4: QuicConn = p4.s;
+    rounds = 0;
+    while rounds < 20 && !c4.peer_closed {
+        step(& mut c4, & mut s4, & mut n4);
+        rounds = rounds + 1;
+    }
+    if s4.error != 0x100 + 120 || !c4.peer_closed || c4.error != 0x100 + 120 {
+        p_panic("alpn mismatch: server " + int_to_str(s4.error) + " client " + int_to_str(c4.error));
+    }
+    println("no common alpn: " + int_to_str(c4.error));
+
+    // ── Garbage: not a new Initial, and ignored by a live connection ──
+    var junk: Vec<i64> = pattern(1200);
+    junk.set(0, 0xc3);
+    if quic_is_new_initial(junk) { p_panic("junk taken for an Initial"); }
+    var n5: Net = net_new();
+    var p5: Pair = connect(client_cfg(pk, "h3"), server_cfg(cert), & mut n5, false);
+    var c5: QuicConn = p5.c;
+    var s5: QuicConn = p5.s;
+    quic_conn_recv(& mut s5, junk, n5.now);
+    quic_conn_recv(& mut s5, pattern(40), n5.now);
+    // An Initial for the server's connection ID that does not decrypt
+    var forged: Vec<i64> = quic_long_header(QUIC_INITIAL, QUIC_V1, s5.scid, c5.scid, pattern(0), 7, 2, 100);
+    append(& mut forged, pattern(116));
+    quic_conn_recv(& mut s5, forged, n5.now);
+    // A short header for the client's connection ID
+    var forged2: Vec<i64> = Vec::new();
+    forged2.push(0x41);
+    append(& mut forged2, c5.scid);
+    append(& mut forged2, pattern(60));
+    quic_conn_recv(& mut c5, forged2, n5.now);
+    quic_conn_recv(& mut c5, junk, n5.now);
+    run_handshake(& mut c5, & mut s5, & mut n5);
+    if !quic_conn_established(& c5) || !quic_conn_established(& s5) { p_panic("garbage broke the handshake"); }
+    println("garbage ignored");
+
+    // ── A client that ignores the server's windows: FLOW_CONTROL_ERROR ──
+    val fid1: i64 = quic_open_bidi(& mut c5);
+    c5.max_data_peer = 10000000;
+    val fk: i64 = quic_stream_index(& c5, fid1);
+    var fst: QStream = c5.streams.get(fk);
+    fst.send_max = 10000000;
+    c5.streams.set(fk, fst);
+    quic_stream_write(& mut c5, fid1, pattern(20000), true);
+    rounds = 0;
+    while rounds < 200 && !c5.peer_closed {
+        step(& mut c5, & mut s5, & mut n5);
+        rounds = rounds + 1;
+    }
+    if !c5.peer_closed || c5.error != QE_FLOW_CONTROL_ERROR { p_panic("flow control violation: " + int_to_str(c5.error)); }
+    println("flow control violation: " + int_to_str(c5.error));
+
+    // ── A client that opens more streams than allowed: STREAM_LIMIT_ERROR ──
+    var n6: Net = net_new();
+    var p6: Pair = connect(client_cfg(pk, "h3"), server_cfg(cert), & mut n6, false);
+    var c6: QuicConn = p6.c;
+    var s6: QuicConn = p6.s;
+    run_handshake(& mut c6, & mut s6, & mut n6);
+    c6.max_streams_bidi_peer = 10;
+    var q: i64 = 0;
+    while q < 4 {
+        val qid: i64 = quic_open_bidi(& mut c6);
+        quic_stream_write(& mut c6, qid, str_bytes("x"), true);
+        q = q + 1;
+    }
+    rounds = 0;
+    while rounds < 200 && !c6.peer_closed {
+        step(& mut c6, & mut s6, & mut n6);
+        rounds = rounds + 1;
+    }
+    if !c6.peer_closed || c6.error != QE_STREAM_LIMIT_ERROR { p_panic("stream limit violation: " + int_to_str(c6.error)); }
+    println("stream limit violation: " + int_to_str(c6.error));
+
+    // ── Retry: the client starts over with the server's connection ID and
+    // token; a Retry with a bad integrity tag is ignored ──
+    var c7: QuicConn = quic_connect(client_cfg(pk, "h3"), 0);
+    quic_conn_send(& mut c7, 0);
+    var retry: Vec<i64> = Vec::new();
+    retry.push(0xf5);
+    retry.push(0);
+    retry.push(0);
+    retry.push(0);
+    retry.push(1);
+    retry.push(c7.scid.len());
+    append(& mut retry, c7.scid);
+    val new_cid: Vec<i64> = hb("0102030405060708");
+    retry.push(8);
+    append(& mut retry, new_cid);
+    append(& mut retry, str_bytes("token-1"));
+    var bad_retry: Vec<i64> = Vec::new();
+    append(& mut bad_retry, retry);
+    append(& mut bad_retry, pattern(16));
+    append(& mut retry, quic_retry_tag(c7.odcid, retry));
+    quic_conn_recv(& mut c7, bad_retry, 5);
+    if c7.retried { p_panic("a Retry with a bad tag was taken"); }
+    quic_conn_recv(& mut c7, retry, 5);
+    if !c7.retried || !same(c7.dcid, new_cid) { p_panic("the Retry was not taken"); }
+    val again: Vec<i64> = quic_conn_send(& mut c7, 10);
+    val rh: QuicLongHeader = quic_parse_long(again);
+    if !rh.ok || rh.ptype != QUIC_INITIAL || !same(rh.dcid, new_cid)
+        || !str_equal(str_from_bytes(rh.token), "token-1") || again.len() != 1200 {
+        p_panic("the Initial after Retry");
+    }
+    val ro: QuicOpened = quic_unprotect_long(client_initial_keys(new_cid), again, - 1);
+    if !ro.ok { p_panic("the Initial after Retry does not open with the new keys"); }
+    val rfs: QuicFrames = quic_frames_parse(ro.payload, QL_INITIAL);
+    if rfs.error >= 0 || rfs.frames.len() < 1 || rfs.frames.get(0).ftype != QF_CRYPTO
+        || rfs.frames.get(0).offset != 0 || rfs.frames.get(0).data.len() < 100 {
+        p_panic("the ClientHello was not sent again after Retry");
+    }
+    println("retry handled");
+    println("quic connection ok");
+    return 0;
+}

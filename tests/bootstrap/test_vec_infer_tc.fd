@@ -1,0 +1,124 @@
+// RT6: `var v = Vec::new()` written without a type takes its element type
+// from the first value pushed onto it, also when that value is not a literal
+// and its type is known only to the type checker: a call's result, or a
+// variable declared from one (typechecker.fd TypeChecker_rt6_note_push,
+// lower.fd Lowerer_rt6_let_type). The Vec is made with that element type,
+// so its strings, bools and structs are owned and printed as what they are;
+// before, it was a Vec<i64>: a string printed as an address, a bool as 1,
+// and a string pushed from a variable that went out of scope was freed
+// while the Vec still held it.
+// Expected output:
+// item0
+// item2
+// 3
+// tag10
+// tag11
+// 2
+// true
+// false
+// 2
+// 20
+// 1
+// tag7
+// 7
+// 2.5
+// done
+
+struct Pt {
+    x: i64,
+    y: i64,
+}
+
+struct Tag {
+    name: str,
+    n: i64,
+}
+
+fn name_of(i: i64) -> str {
+    return "item" + int_to_str(i);
+}
+
+fn tag_name(i: i64) -> str {
+    return "tag" + int_to_str(i);
+}
+
+fn make_pt(i: i64) -> Pt {
+    return Pt { x: i, y: i * 10 };
+}
+
+fn make_tag(i: i64) -> Tag {
+    return Tag { name: tag_name(i), n: i };
+}
+
+fn is_even(i: i64) -> bool {
+    return i % 2 == 0;
+}
+
+fn half(x: f64) -> f64 {
+    return x / 2.0;
+}
+
+fn collect_names(n: i64) -> Vec<str> {
+    var out = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(name_of(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    // strings from calls, in a Vec returned as a Vec<str>
+    val names = collect_names(3);
+    println(names.get(0));
+    println(names.get(2));
+    println(names.len());
+
+    // a string from a variable whose scope ends before the Vec is read
+    var kept = Vec::new();
+    var k: i64 = 0;
+    while k < 2 {
+        val s = tag_name(k + 10);
+        kept.push(s);
+        k = k + 1;
+    }
+    println(kept.get(0));
+    println(kept.get(1));
+    println(kept.len());
+
+    // bools from calls
+    var flags = Vec::new();
+    flags.push(is_even(2));
+    flags.push(is_even(3));
+    println(flags.get(0));
+    println(flags.get(1));
+
+    // structs from a call and from a variable
+    var pts = Vec::new();
+    pts.push(make_pt(1));
+    val p = make_pt(2);
+    pts.push(p);
+    val q: Pt = pts.get(1);
+    println(q.x);
+    println(q.y);
+    val r: Pt = pts.get(0);
+    println(r.x);
+
+    // a struct holding a string, made in a block that ends first
+    var tags = Vec::new();
+    if true {
+        val t = make_tag(7);
+        tags.push(t);
+    }
+    val t0: Tag = tags.get(0);
+    println(t0.name);
+    println(t0.n);
+
+    // a float from a call
+    var fs = Vec::new();
+    fs.push(half(5.0));
+    println(fs.get(0));
+
+    println("done");
+}

@@ -1,0 +1,479 @@
+// Fides spatial audio standard library
+//
+// 3D audio for games, pure computation on samples (no platform seam):
+//   - listener and emitter structs (position, velocity, orientation, gain);
+//   - the three distance models of OpenAL 1.1, clamped variants: inverse
+//     ref / (ref + rolloff (d - ref)), linear 1 - rolloff (d - ref) /
+//     (max - ref) and exponential (d / ref)^-rolloff, with d clamped to
+//     ref..max;
+//   - azimuth / elevation of an emitter in the listener's frame and stereo
+//     equal-power panning (L = cos, R = sin of (pan + 1) pi / 4);
+//   - Doppler pitch shift as OpenAL 1.1 specifies it (speed of sound 343.3
+//     m/s, doppler factor, velocities clamped to the speed of sound);
+//   - a binaural approximation: Woodworth's interaural time difference
+//     (a / c)(theta + sin theta) for a spherical head of radius 8.75 cm,
+//     and the Brown-Duda one-pole head-shadow filter per ear (high
+//     frequencies boosted up to 6 dB at the near ear, cut to -20 dB at the
+//     far one, DC unchanged), discretized with the bilinear transform;
+//   - a voice renderer that plays a mono clip (Vec<f64>, -1..1) at an
+//     emitter into an interleaved stereo buffer (Vec<f64>, added to what is
+//     there, like a mixer bus): it resamples for Doppler, reads each ear at
+//     its own delay, filters, and ramps gains across the block (no clicks).
+//
+// Mixing into stdlib audio_mixer is not possible sample by sample: that
+// module only drives SDL_mixer channels by handle. For it (or stdlib
+// audio's audio_set_volume / audio_set_pan) `spatial_channel_params` gives
+// the volume (0..1) and pan (-1..1) of an emitter instead.
+//
+// Coordinates: right-handed, metres; the listener looks along `forward`
+// with `up` up, so its right is forward x up.
+//
+// Usage:
+//   use spatial_audio;
+//   var lis: SpatialListener = spatial_listener(vec3(0.0, 0.0, 0.0));
+//   var em: SpatialEmitter = spatial_emitter(vec3(3.0, 0.0, -2.0));
+//   var voice: SpatialVoice = spatial_voice(SPATIAL_BINAURAL);
+//   spatial_render(&mut voice, &lis, &em, &clip, &mut bus, 512, 48000.0);
+
+module spatial_audio;
+use vec;
+use math;
+
+pub const SPATIAL_INVERSE: i64 = 0;
+pub const SPATIAL_LINEAR: i64 = 1;
+pub const SPATIAL_EXPONENTIAL: i64 = 2;
+pub const SPATIAL_NONE: i64 = 3;
+
+pub const SPATIAL_STEREO: i64 = 0;
+pub const SPATIAL_BINAURAL: i64 = 1;
+
+/// Speed of sound in air (m/s) used by OpenAL.
+pub const SPATIAL_SPEED_OF_SOUND: f64 = 343.3;
+/// Head radius (m) of the binaural model.
+pub const SPATIAL_HEAD_RADIUS: f64 = 0.0875;
+
+pub struct SpatialListener {
+    pub pos: vec3,
+    pub vel: vec3,
+    pub forward: vec3,
+    pub up: vec3,
+    pub gain: f64,
+}
+
+pub struct SpatialEmitter {
+    pub pos: vec3,
+    pub vel: vec3,
+    pub gain: f64,
+    pub ref_dist: f64,
+    pub max_dist: f64,
+    pub rolloff: f64,
+    pub model: i64,
+    pub pitch: f64,
+    pub looping: bool,
+}
+
+/// A listener at `pos` looking along -z with +y up.
+pub fn spatial_listener(pos: vec3) -> SpatialListener {
+    return SpatialListener { pos: pos, vel: vec3(0.0, 0.0, 0.0), forward: vec3(0.0, 0.0, - 1.0), up: vec3(0.0, 1.0, 0.0), gain: 1.0 };
+}
+
+/// An emitter at `pos`: inverse model, ref 1 m, max 100 m, rolloff 1.
+pub fn spatial_emitter(pos: vec3) -> SpatialEmitter {
+    return SpatialEmitter { pos: pos, vel: vec3(0.0, 0.0, 0.0), gain: 1.0, ref_dist: 1.0, max_dist: 100.0, rolloff: 1.0, model: SPATIAL_INVERSE, pitch: 1.0, looping: false };
+}
+
+// ─── Distance attenuation ─────────────────────────────────────────────────
+
+/// Gain of `model` at distance `d` (OpenAL 1.1 "clamped" models).
+pub fn spatial_attenuation(model: i64, d0: f64, ref_dist: f64, max_dist: f64, rolloff: f64) -> f64 {
+    if model == SPATIAL_NONE {
+        return 1.0;
+    }
+    var d: f64 = d0;
+    if d < ref_dist { d = ref_dist; }
+    if d > max_dist { d = max_dist; }
+    if model == SPATIAL_LINEAR {
+        if max_dist <= ref_dist {
+            return 1.0;
+        }
+        var g: f64 = 1.0 - rolloff * (d - ref_dist) / (max_dist - ref_dist);
+        if g < 0.0 { g = 0.0; }
+        return g;
+    }
+    if ref_dist <= 0.0 {
+        return 1.0;
+    }
+    if model == SPATIAL_EXPONENTIAL {
+        return math_pow(d / ref_dist, - rolloff);
+    }
+    val den: f64 = ref_dist + rolloff * (d - ref_dist);
+    if den <= 0.0 {
+        return 1.0;
+    }
+    return ref_dist / den;
+}
+
+/// Distance from the listener to the emitter.
+pub fn spatial_distance(l: &SpatialListener, e: &SpatialEmitter) -> f64 {
+    return e.pos.sub(l.pos).length();
+}
+
+/// The emitter's distance gain times both gains.
+pub fn spatial_gain(l: &SpatialListener, e: &SpatialEmitter) -> f64 {
+    return l.gain * e.gain * spatial_attenuation(e.model, spatial_distance(l, e), e.ref_dist, e.max_dist, e.rolloff);
+}
+
+// ─── Direction ────────────────────────────────────────────────────────────
+
+/// atan(x) to double precision (argument reduction + series).
+pub fn spatial_atan(x: f64) -> f64 {
+    if x < 0.0 {
+        return - spatial_atan(- x);
+    }
+    val pi: f64 = math_pi();
+    if x > 1.0 {
+        return pi / 2.0 - spatial_atan(1.0 / x);
+    }
+    if x > 0.4142135623730950 {
+        return pi / 4.0 + spatial_atan((x - 1.0) / (x + 1.0));
+    }
+    // |x| <= tan(pi/8): the series converges fast
+    val x2: f64 = x * x;
+    var term: f64 = x;
+    var sum: f64 = 0.0;
+    var k: i64 = 0;
+    while k < 30 {
+        sum = sum + term / ((2 * k + 1) as f64);
+        term = - term * x2;
+        k = k + 1;
+    }
+    return sum;
+}
+
+/// atan2(y, x) in -pi..pi.
+pub fn spatial_atan2(y: f64, x: f64) -> f64 {
+    val pi: f64 = math_pi();
+    if x > 0.0 {
+        return spatial_atan(y / x);
+    }
+    if x < 0.0 {
+        if y >= 0.0 {
+            return spatial_atan(y / x) + pi;
+        }
+        return spatial_atan(y / x) - pi;
+    }
+    if y > 0.0 { return pi / 2.0; }
+    if y < 0.0 { return - pi / 2.0; }
+    return 0.0;
+}
+
+/// asin(x) for -1..1.
+pub fn spatial_asin(x: f64) -> f64 {
+    var c: f64 = 1.0 - x * x;
+    if c < 0.0 { c = 0.0; }
+    return spatial_atan2(x, math_sqrt(c));
+}
+
+/// The listener's right vector (forward x up, normalized).
+pub fn spatial_right(l: &SpatialListener) -> vec3 {
+    return l.forward.cross(l.up).normalize();
+}
+
+/// The emitter's direction in the listener's frame: x right, y up, z ahead
+/// (unit length; straight ahead when the emitter is on the listener).
+pub fn spatial_local_dir(l: &SpatialListener, e: &SpatialEmitter) -> vec3 {
+    val rel: vec3 = e.pos.sub(l.pos);
+    if rel.length() < 0.000000001 {
+        return vec3(0.0, 0.0, 1.0);
+    }
+    val d: vec3 = rel.normalize();
+    val f: vec3 = l.forward.normalize();
+    val r: vec3 = spatial_right(l);
+    val u: vec3 = r.cross(f);
+    return vec3(d.dot(r), d.dot(u), d.dot(f));
+}
+
+/// Azimuth in radians: 0 ahead, +pi/2 right, -pi/2 left, +-pi behind.
+pub fn spatial_azimuth(l: &SpatialListener, e: &SpatialEmitter) -> f64 {
+    val d: vec3 = spatial_local_dir(l, e);
+    return spatial_atan2(d.x, d.z);
+}
+
+/// Elevation in radians: +pi/2 straight up.
+pub fn spatial_elevation(l: &SpatialListener, e: &SpatialEmitter) -> f64 {
+    val d: vec3 = spatial_local_dir(l, e);
+    return spatial_asin(d.y);
+}
+
+/// Pan -1 (left) .. 1 (right): the lateral component of the direction.
+pub fn spatial_pan(l: &SpatialListener, e: &SpatialEmitter) -> f64 {
+    return spatial_local_dir(l, e).x;
+}
+
+/// A pair of channel gains.
+pub struct SpatialGains {
+    pub left: f64,
+    pub right: f64,
+}
+
+/// Equal-power gains for `pan` -1..1: left^2 + right^2 = 1.
+pub fn spatial_equal_power(pan0: f64) -> SpatialGains {
+    var pan: f64 = pan0;
+    if pan < - 1.0 { pan = - 1.0; }
+    if pan > 1.0 { pan = 1.0; }
+    val a: f64 = (pan + 1.0) * math_pi() / 4.0;
+    return SpatialGains { left: math_cos(a), right: math_sin(a) };
+}
+
+// ─── Doppler ──────────────────────────────────────────────────────────────
+
+/// Pitch factor of the Doppler effect (OpenAL 1.1, section 3.5.2):
+/// (SS - DF vls) / (SS - DF vss), the velocities projected on the
+/// source-to-listener axis and clamped below SS / DF (> 1 approaching).
+pub fn spatial_doppler(l: &SpatialListener, e: &SpatialEmitter, doppler_factor: f64, speed_of_sound: f64) -> f64 {
+    if doppler_factor <= 0.0 {
+        return 1.0;
+    }
+    // SL points from the source to the listener
+    val sl: vec3 = l.pos.sub(e.pos);
+    val mag: f64 = sl.length();
+    if mag < 0.000000001 {
+        return 1.0;
+    }
+    val ss: f64 = speed_of_sound;
+    val lim: f64 = ss / doppler_factor;
+    var vls: f64 = sl.dot(l.vel) / mag;
+    var vss: f64 = sl.dot(e.vel) / mag;
+    if vls > lim { vls = lim; }
+    if vss > lim { vss = lim; }
+    val den: f64 = ss - doppler_factor * vss;
+    if den <= 0.0 {
+        return 1.0;
+    }
+    var f: f64 = (ss - doppler_factor * vls) / den;
+    if f < 0.0 { f = 0.0; }
+    return f;
+}
+
+// ─── Binaural ─────────────────────────────────────────────────────────────
+
+/// Woodworth's interaural time difference in seconds for lateral angle
+/// `theta` (-pi/2 left .. pi/2 right); positive: the left ear hears later.
+pub fn spatial_itd(theta0: f64) -> f64 {
+    val half: f64 = math_pi() / 2.0;
+    var theta: f64 = theta0;
+    if theta > half { theta = half; }
+    if theta < - half { theta = - half; }
+    return SPATIAL_HEAD_RADIUS / SPATIAL_SPEED_OF_SOUND * (theta + math_sin(theta));
+}
+
+/// Lateral angle of the emitter (asin of its rightward component): the
+/// angle the ITD depends on (a source behind mirrors one in front).
+pub fn spatial_lateral(l: &SpatialListener, e: &SpatialEmitter) -> f64 {
+    return spatial_asin(spatial_local_dir(l, e).x);
+}
+
+/// Brown-Duda alpha (high-frequency gain) for incidence angle `theta`
+/// between the source and an ear's axis: (1 + amin/2) + (1 - amin/2)
+/// cos(theta / 150 deg * 180 deg) with amin = 0.1, so 2 at 0 and 0.1 at
+/// 150 degrees (rising a little again behind: the "bright spot").
+pub fn spatial_shadow_alpha(theta: f64) -> f64 {
+    val theta_min: f64 = 150.0 * math_pi() / 180.0;
+    var t: f64 = theta;
+    if t < 0.0 { t = - t; }
+    if t > math_pi() { t = 2.0 * math_pi() - t; }
+    return 1.05 + 0.95 * math_cos(t / theta_min * math_pi());
+}
+
+/// One head-shadow filter: y = b0 x + b1 x' - a1 y'.
+pub struct SpatialShadow {
+    pub b0: f64,
+    pub b1: f64,
+    pub a1: f64,
+    pub x1: f64,
+    pub y1: f64,
+}
+
+pub fn spatial_shadow() -> SpatialShadow {
+    return SpatialShadow { b0: 1.0, b1: 0.0, a1: 0.0, x1: 0.0, y1: 0.0 };
+}
+
+/// Set the filter for `alpha` at `sample_rate` (bilinear transform of
+/// H(s) = (alpha s + beta) / (s + beta), beta = 2 c / a).
+pub fn spatial_shadow_set(f: &mut SpatialShadow, alpha: f64, sample_rate: f64) {
+    val beta: f64 = 2.0 * SPATIAL_SPEED_OF_SOUND / SPATIAL_HEAD_RADIUS;
+    val k: f64 = 2.0 * sample_rate;
+    val a0: f64 = beta + k;
+    f.b0 = (beta + k * alpha) / a0;
+    f.b1 = (beta - k * alpha) / a0;
+    f.a1 = (beta - k) / a0;
+}
+
+pub fn spatial_shadow_run(f: &mut SpatialShadow, x: f64) -> f64 {
+    val y: f64 = f.b0 * x + f.b1 * f.x1 - f.a1 * f.y1;
+    f.x1 = x;
+    f.y1 = y;
+    return y;
+}
+
+/// Magnitude of the filter's response at `freq` Hz.
+pub fn spatial_shadow_gain(f: &SpatialShadow, freq: f64, sample_rate: f64) -> f64 {
+    val w: f64 = 2.0 * math_pi() * freq / sample_rate;
+    val c: f64 = math_cos(w);
+    val s: f64 = math_sin(w);
+    // (b0 + b1 e^-jw) / (1 + a1 e^-jw)
+    val nr: f64 = f.b0 + f.b1 * c;
+    val ni: f64 = - f.b1 * s;
+    val dr: f64 = 1.0 + f.a1 * c;
+    val di: f64 = - f.a1 * s;
+    return math_sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+}
+
+// ─── Mixer parameters ─────────────────────────────────────────────────────
+
+/// What a channel-based mixer needs for one emitter.
+pub struct SpatialChannel {
+    pub volume: f64,
+    // 0..1 (stdlib audio's audio_set_volume)
+    pub pan: f64,  // -1..1 (audio_set_pan)
+}
+
+/// Volume and pan of an emitter for a channel-based mixer.
+pub fn spatial_channel_params(l: &SpatialListener, e: &SpatialEmitter) -> SpatialChannel {
+    var g: f64 = spatial_gain(l, e);
+    if g > 1.0 { g = 1.0; }
+    return SpatialChannel { volume: g, pan: spatial_pan(l, e) };
+}
+
+// ─── Voice renderer ───────────────────────────────────────────────────────
+
+/// Playback state of one emitter's clip.
+pub struct SpatialVoice {
+    pub mode: i64,
+    pub cursor: f64,
+    // read position in the clip, in clip samples
+    pub gain_l: f64,
+    pub gain_r: f64,
+    // gains at the end of the last block
+    pub delay_l: f64,
+    pub delay_r: f64,
+    // ear delays at the end of the last block, in clip samples
+    pub fresh: bool,
+    // no block rendered yet: start ramps at their targets
+    pub done: bool,
+    pub doppler_factor: f64,
+    pub shadow_l: SpatialShadow,
+    pub shadow_r: SpatialShadow,
+}
+
+pub fn spatial_voice(mode: i64) -> SpatialVoice {
+    return SpatialVoice {
+        mode: mode, cursor: 0.0, gain_l: 0.0, gain_r: 0.0, delay_l: 0.0, delay_r: 0.0, fresh: true, done: false, doppler_factor: 1.0, shadow_l: spatial_shadow(), shadow_r: spatial_shadow(),
+    };
+}
+
+// clip sample at fractional position p (linear interpolation)
+fn sp_read(clip: &Vec<f64>, p0: f64, looping: bool) -> f64 {
+    val n: i64 = clip.len();
+    if n == 0 {
+        return 0.0;
+    }
+    var p: f64 = p0;
+    if looping {
+        val nf: f64 = n as f64;
+        p = p - math_floor(p / nf) * nf;
+    } else if p < 0.0 || p > ((n - 1) as f64) {
+        return 0.0;
+    }
+    val i: i64 = math_floor(p) as i64;
+    val fr: f64 = p - (i as f64);
+    var j: i64 = i + 1;
+    if j >= n {
+        if looping {
+            j = 0;
+        } else {
+            return clip.get(i);
+        }
+    }
+    return clip.get(i) * (1.0 - fr) + clip.get(j) * fr;
+}
+
+/// Render `frames` stereo frames of `clip` (mono, at `sample_rate`) played
+/// by `e`, adding them into `out` (interleaved L R; grown when too short).
+/// Returns false once a non-looping clip has played to its end.
+pub fn spatial_render(v: &mut SpatialVoice, l: &SpatialListener, e: &SpatialEmitter, clip: &Vec<f64>, out: &mut Vec<f64>, frames: i64, sample_rate: f64) -> bool {
+    while out.len() < frames * 2 {
+        out.push(0.0);
+    }
+    if v.done {
+        return false;
+    }
+    val gain: f64 = spatial_gain(l, e);
+    var tl: f64 = 0.0;
+    var tr: f64 = 0.0;
+    var dl: f64 = 0.0;
+    var dr: f64 = 0.0;
+    if v.mode == SPATIAL_BINAURAL {
+        val lat: f64 = spatial_lateral(l, e);
+        val itd: f64 = spatial_itd(lat) * sample_rate;
+        if itd > 0.0 {
+            dl = itd;
+        } else {
+            dr = - itd;
+        }
+        // incidence angles at the ears (axis +x for the right ear)
+        val dir: vec3 = spatial_local_dir(l, e);
+        var cr: f64 = dir.x;
+        if cr > 1.0 { cr = 1.0; }
+        if cr < - 1.0 { cr = - 1.0; }
+        val ang_r: f64 = math_pi() / 2.0 - spatial_asin(cr);
+        val ang_l: f64 = math_pi() / 2.0 + spatial_asin(cr);
+        spatial_shadow_set(&mut v.shadow_l, spatial_shadow_alpha(ang_l), sample_rate);
+        spatial_shadow_set(&mut v.shadow_r, spatial_shadow_alpha(ang_r), sample_rate);
+        tl = gain;
+        tr = gain;
+    } else {
+        val pr: SpatialGains = spatial_equal_power(spatial_pan(l, e));
+        tl = gain * pr.left;
+        tr = gain * pr.right;
+    }
+    if v.fresh {
+        v.gain_l = tl;
+        v.gain_r = tr;
+        v.delay_l = dl;
+        v.delay_r = dr;
+        v.fresh = false;
+    }
+    val step: f64 = e.pitch * spatial_doppler(l, e, v.doppler_factor, SPATIAL_SPEED_OF_SOUND);
+    val n: i64 = clip.len();
+    var i: i64 = 0;
+    while i < frames {
+        val f: f64 = ((i + 1) as f64) / (frames as f64);
+        val gl: f64 = v.gain_l + (tl - v.gain_l) * f;
+        val gr: f64 = v.gain_r + (tr - v.gain_r) * f;
+        val ddl: f64 = v.delay_l + (dl - v.delay_l) * f;
+        val ddr: f64 = v.delay_r + (dr - v.delay_r) * f;
+        var sl: f64 = sp_read(clip, v.cursor - ddl, e.looping);
+        var sr: f64 = sp_read(clip, v.cursor - ddr, e.looping);
+        if v.mode == SPATIAL_BINAURAL {
+            sl = spatial_shadow_run(&mut v.shadow_l, sl);
+            sr = spatial_shadow_run(&mut v.shadow_r, sr);
+        }
+        out.set(2 * i, out.get(2 * i) + sl * gl);
+        out.set(2 * i + 1, out.get(2 * i + 1) + sr * gr);
+        v.cursor = v.cursor + step;
+        i = i + 1;
+    }
+    v.gain_l = tl;
+    v.gain_r = tr;
+    v.delay_l = dl;
+    v.delay_r = dr;
+    if !e.looping && v.cursor - dl - dr > ((n - 1) as f64) {
+        v.done = true;
+        return false;
+    }
+    if e.looping && n > 0 {
+        v.cursor = v.cursor - math_floor(v.cursor / (n as f64)) * (n as f64);
+    }
+    return true;
+}

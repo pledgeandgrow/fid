@@ -1,0 +1,479 @@
+// Fides PWM: period and duty in nanoseconds, polarity, servos, timers
+//
+// What is real (pure Fides, runs everywhere):
+//   - PWM state (period, duty, polarity, enable) with checks (duty never
+//     above period), frequency <-> period, duty in percent and per-mille
+//   - the output level at any time t (software PWM, simulation)
+//   - the Linux sysfs order of writes: export, then period/duty in the
+//     order the kernel accepts (duty must not exceed period at any
+//     moment), polarity only while disabled, then enable
+//   - servo helper: angle -> pulse width (and back) for a servo with given
+//     minimum/maximum pulse and travel, continuous-rotation speed -> pulse
+//   - prescaler / auto-reload / compare values of a 16-bit hardware timer
+//     (STM32 TIMx style) for a frequency and duty, with the achieved values
+//   - a fake PWM chip that applies the same rules as the kernel
+//
+// The seam: the sysfs root (normally /sys/class/pwm) is a parameter and the
+// writes go through stdlib file, so on Linux this drives real PWM channels
+// without FFI; on bare metal pwm_timer_setup gives the register values to
+// write (PSC, ARR, CCR) with stdlib volatile.
+module pwm;
+ use vec;
+ use string;
+ use file;
+
+pub const PWM_POLARITY_NORMAL: i64 = 0;
+pub const PWM_POLARITY_INVERSED: i64 = 1;
+pub const PWM_NS_PER_S: i64 = 1000000000;
+
+pub struct PwmState {
+    pub period_ns: i64,
+    pub duty_ns: i64,
+    pub polarity: i64,
+    pub enabled: bool,
+}
+
+pub fn pwm_state(period_ns: i64, duty_ns: i64) -> PwmState {
+    return PwmState { period_ns: period_ns, duty_ns: duty_ns, polarity: PWM_POLARITY_NORMAL, enabled: true };
+}
+
+pub fn pwm_off() -> PwmState {
+    return PwmState { period_ns: 0, duty_ns: 0, polarity: PWM_POLARITY_NORMAL, enabled: false };
+}
+
+/// Period for a frequency (rounded to the nearest ns).
+pub fn pwm_period_for_hz(hz: i64) -> i64 {
+    if hz <= 0 {
+        return 0;
+    }
+    return (PWM_NS_PER_S + hz / 2) / hz;
+}
+
+pub fn pwm_hz_for_period(period_ns: i64) -> f64 {
+    if period_ns <= 0 {
+        return 0.0;
+    }
+    return (PWM_NS_PER_S as f64) / (period_ns as f64);
+}
+
+/// Duty for a fraction in per-mille (0..1000) of the period.
+pub fn pwm_duty_permille(period_ns: i64, permille: i64) -> i64 {
+    var p: i64 = permille;
+    if p < 0 {
+        p = 0;
+    }
+    if p > 1000 {
+        p = 1000;
+    }
+    return (period_ns * p + 500) / 1000;
+}
+
+pub fn pwm_duty_percent(period_ns: i64, percent: f64) -> i64 {
+    var p: f64 = percent;
+    if p < 0.0 {
+        p = 0.0;
+    }
+    if p > 100.0 {
+        p = 100.0;
+    }
+    return ((period_ns as f64) * p / 100.0 + 0.5) as i64;
+}
+
+/// The duty cycle as a percentage of the period.
+pub fn pwm_percent(s: & PwmState) -> f64 {
+    if s.period_ns <= 0 {
+        return 0.0;
+    }
+    return 100.0 * (s.duty_ns as f64) / (s.period_ns as f64);
+}
+
+/// Why a state cannot be applied, or "" when it can.
+pub fn pwm_check(s: & PwmState) -> str {
+    if s.period_ns < 0 || s.duty_ns < 0 {
+        return "negative period or duty";
+    }
+    if s.enabled && s.period_ns == 0 {
+        return "period is 0";
+    }
+    if s.duty_ns > s.period_ns {
+        return "duty cycle above period";
+    }
+    if s.polarity != PWM_POLARITY_NORMAL && s.polarity != PWM_POLARITY_INVERSED {
+        return "bad polarity";
+    }
+    return "";
+}
+
+/// The output level at time t (0 = start of a period): high for the
+/// first duty_ns of each period (low for inversed polarity); a disabled
+/// output sits at its inactive level.
+pub fn pwm_level_at(s: & PwmState, t_ns: i64) -> i64 {
+    var active: i64 = 1;
+    if s.polarity == PWM_POLARITY_INVERSED {
+        active = 0;
+    }
+    if !s.enabled || s.period_ns <= 0 {
+        return 1 - active;
+    }
+    val phase: i64 = t_ns % s.period_ns;
+    if phase < s.duty_ns {
+        return active;
+    }
+    return 1 - active;
+}
+
+/// Average output (0..1) over n samples of one period: checks a state or
+/// a software PWM against its intended duty.
+pub fn pwm_measured_duty(s: & PwmState, samples: i64) -> f64 {
+    if samples <= 0 || s.period_ns <= 0 {
+        return 0.0;
+    }
+    var high: i64 = 0;
+    var i: i64 = 0;
+    while i < samples {
+        high = high + pwm_level_at(s, (s.period_ns * i) / samples);
+        i = i + 1;
+    }
+    return (high as f64) / (samples as f64);
+}
+
+// ─── sysfs ──────────────────────────────────────────────────────────────
+
+pub struct PwmWrite {
+    pub path: str,
+    pub value: str,
+}
+
+pub fn pwm_sysfs_channel(root: str, chip: i64, ch: i64) -> str {
+    return root + "/pwmchip" + int_to_str(chip) + "/pwm" + int_to_str(ch);
+}
+
+/// The writes that take a channel from `old` to `new`. Export when the
+/// channel is new (old = pwm_off() and exported=false). Polarity changes
+/// with the output disabled. Period and duty are ordered so that duty <=
+/// period holds after each write.
+pub fn pwm_sysfs_plan(root: str, chip: i64, ch: i64, exported: bool, old: & PwmState, new: & PwmState) -> Vec<PwmWrite> {
+    var w: Vec<PwmWrite> = Vec::new();
+    val dir: str = pwm_sysfs_channel(root, chip, ch);
+    if !exported {
+        w.push(PwmWrite { path: root + "/pwmchip" + int_to_str(chip) + "/export", value: int_to_str(ch) });
+    }
+    var enabled: bool = old.enabled;
+    if new.polarity != old.polarity {
+        if enabled {
+            w.push(PwmWrite { path: dir + "/enable", value: "0" });
+            enabled = false;
+        }
+        if new.polarity == PWM_POLARITY_INVERSED {
+            w.push(PwmWrite { path: dir + "/polarity", value: "inversed" });
+        } else {
+            w.push(PwmWrite { path: dir + "/polarity", value: "normal" });
+        }
+    }
+    if !new.enabled && enabled {
+        w.push(PwmWrite { path: dir + "/enable", value: "0" });
+        enabled = false;
+    }
+    val period_changes: bool = new.period_ns != old.period_ns;
+    val duty_changes: bool = new.duty_ns != old.duty_ns;
+    if period_changes && new.period_ns < old.duty_ns {
+        // shrinking below the current duty: lower the duty first
+        w.push(PwmWrite { path: dir + "/duty_cycle", value: int_to_str(new.duty_ns) });
+        w.push(PwmWrite { path: dir + "/period", value: int_to_str(new.period_ns) });
+    } else {
+        if period_changes {
+            w.push(PwmWrite { path: dir + "/period", value: int_to_str(new.period_ns) });
+        }
+        if duty_changes {
+            w.push(PwmWrite { path: dir + "/duty_cycle", value: int_to_str(new.duty_ns) });
+        }
+    }
+    if new.enabled && !enabled {
+        w.push(PwmWrite { path: dir + "/enable", value: "1" });
+    }
+    return w;
+}
+
+pub fn pwm_sysfs_apply(writes: & Vec<PwmWrite>) -> i64 {
+    var failed: i64 = 0;
+    var i: i64 = 0;
+    while i < writes.len() {
+        val x: PwmWrite = writes.get(i);
+        if file_write(x.path, x.value) != 0 {
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    return failed;
+}
+
+fn pwm_parse_num(t: str) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    var any: bool = false;
+    while i < str_len(t) {
+        val c: i64 = str_byte_at(t, i);
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48);
+            any = true;
+        } else if any {
+            return v;
+        }
+        i = i + 1;
+    }
+    if !any {
+        return 0 - 1;
+    }
+    return v;
+}
+
+/// Read a channel's state back from its sysfs files.
+pub fn pwm_sysfs_read(root: str, chip: i64, ch: i64) -> Result<PwmState, str> {
+    val dir: str = pwm_sysfs_channel(root, chip, ch);
+    var s: PwmState = pwm_off();
+    match file_read_result(dir + "/period") {
+        Result::Ok(t) => {
+            s.period_ns = pwm_parse_num(t);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    match file_read_result(dir + "/duty_cycle") {
+        Result::Ok(t) => {
+            s.duty_ns = pwm_parse_num(t);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    match file_read_result(dir + "/polarity") {
+        Result::Ok(t) => {
+            if str_starts_with(t, "inversed") {
+                s.polarity = PWM_POLARITY_INVERSED;
+            }
+        }
+        Result::Err(_) => {
+        }
+    }
+    match file_read_result(dir + "/enable") {
+        Result::Ok(t) => {
+            s.enabled = pwm_parse_num(t) == 1;
+        }
+        Result::Err(_) => {
+        }
+    }
+    return Result::Ok(s);
+}
+
+// ─── Fake chip (the kernel's rules) ─────────────────────────────────────
+
+pub struct PwmFakeChip {
+    pub exported: Vec<bool>,
+    pub states: Vec<PwmState>,
+    pub writes: i64,
+}
+
+pub fn pwm_fake_chip(nch: i64) -> PwmFakeChip {
+    var ex: Vec<bool> = Vec::new();
+    var st: Vec<PwmState> = Vec::new();
+    var i: i64 = 0;
+    while i < nch {
+        ex.push(false);
+        st.push(pwm_off());
+        i = i + 1;
+    }
+    return PwmFakeChip { exported: ex, states: st, writes: 0 };
+}
+
+/// Apply one sysfs write to the fake chip ("<file>" is the last path
+/// part, ch the channel). Returns "" or the errno-like reason the kernel
+/// would refuse it with.
+pub fn pwm_fake_write(c: & mut PwmFakeChip, ch: i64, file: str, value: str) -> str {
+    c.writes = c.writes + 1;
+    if ch < 0 || ch >= c.states.len() {
+        return "ENODEV";
+    }
+    if file == "export" {
+        if c.exported.get(ch) {
+            return "EBUSY";
+        }
+        c.exported.set(ch, true);
+        return "";
+    }
+    if !c.exported.get(ch) {
+        return "ENOENT";
+    }
+    var s: PwmState = c.states.get(ch);
+    if file == "period" {
+        val p: i64 = pwm_parse_num(value);
+        if p < s.duty_ns {
+            return "EINVAL";
+        }
+        s.period_ns = p;
+    } else if file == "duty_cycle" {
+        val d: i64 = pwm_parse_num(value);
+        if d > s.period_ns {
+            return "EINVAL";
+        }
+        s.duty_ns = d;
+    } else if file == "polarity" {
+        if s.enabled {
+            return "EBUSY";
+        }
+        if value == "inversed" {
+            s.polarity = PWM_POLARITY_INVERSED;
+        } else if value == "normal" {
+            s.polarity = PWM_POLARITY_NORMAL;
+        } else {
+            return "EINVAL";
+        }
+    } else if file == "enable" {
+        val e: i64 = pwm_parse_num(value);
+        if e == 1 && s.period_ns == 0 {
+            return "EINVAL";
+        }
+        s.enabled = e == 1;
+    } else {
+        return "ENOENT";
+    }
+    c.states.set(ch, s);
+    return "";
+}
+
+/// Run a plan against the fake chip; the first refusal or "".
+pub fn pwm_fake_apply(c: & mut PwmFakeChip, ch: i64, writes: & Vec<PwmWrite>) -> str {
+    var i: i64 = 0;
+    while i < writes.len() {
+        val x: PwmWrite = writes.get(i);
+        val parts: Vec<str> = str_split_char(x.path, 47);
+        val file: str = parts.get(parts.len() - 1);
+        val r: str = pwm_fake_write(c, ch, file, x.value);
+        if r != "" {
+            return file + ": " + r;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ─── Servo ──────────────────────────────────────────────────────────────
+
+pub struct Servo {
+    pub min_ns: i64,
+    pub max_ns: i64,
+    pub travel_deg: f64,
+    pub period_ns: i64,
+}
+
+/// A hobby servo: 1.0-2.0 ms over 180 degrees at 50 Hz.
+pub fn servo_standard() -> Servo {
+    return Servo { min_ns: 1000000, max_ns: 2000000, travel_deg: 180.0, period_ns: 20000000 };
+}
+
+pub fn servo_new(min_us: i64, max_us: i64, travel_deg: f64, hz: i64) -> Servo {
+    return Servo { min_ns: min_us * 1000, max_ns: max_us * 1000, travel_deg: travel_deg, period_ns: pwm_period_for_hz(hz) };
+}
+
+/// Pulse width for an angle (clamped to the travel), rounded to the ns.
+pub fn servo_pulse_ns(s: & Servo, angle_deg: f64) -> i64 {
+    var a: f64 = angle_deg;
+    if a < 0.0 {
+        a = 0.0;
+    }
+    if a > s.travel_deg {
+        a = s.travel_deg;
+    }
+    val span: f64 = (s.max_ns - s.min_ns) as f64;
+    return s.min_ns + (span * a / s.travel_deg + 0.5) as i64;
+}
+
+pub fn servo_angle(s: & Servo, pulse_ns: i64) -> f64 {
+    val span: f64 = (s.max_ns - s.min_ns) as f64;
+    if span <= 0.0 {
+        return 0.0;
+    }
+    var p: i64 = pulse_ns;
+    if p < s.min_ns {
+        p = s.min_ns;
+    }
+    if p > s.max_ns {
+        p = s.max_ns;
+    }
+    return ((p - s.min_ns) as f64) * s.travel_deg / span;
+}
+
+pub fn servo_state(s: & Servo, angle_deg: f64) -> PwmState {
+    return pwm_state(s.period_ns, servo_pulse_ns(s, angle_deg));
+}
+
+/// Continuous-rotation servo: speed -1.0 (full reverse) .. 1.0 (full
+/// forward) around the middle pulse (stop).
+pub fn servo_speed_pulse_ns(s: & Servo, speed: f64) -> i64 {
+    var v: f64 = speed;
+    if v < -1.0 {
+        v = -1.0;
+    }
+    if v > 1.0 {
+        v = 1.0;
+    }
+    val mid: f64 = ((s.min_ns + s.max_ns) as f64) / 2.0;
+    val half: f64 = ((s.max_ns - s.min_ns) as f64) / 2.0;
+    val x: f64 = mid + v * half;
+    if x >= 0.0 {
+        return (x + 0.5) as i64;
+    }
+    return (x - 0.5) as i64;
+}
+
+// ─── Hardware timer ─────────────────────────────────────────────────────
+
+/// Register values of a timer: f = clk / ((psc + 1) * (arr + 1)),
+/// duty = ccr / (arr + 1).
+pub struct PwmTimer {
+    pub psc: i64,
+    pub arr: i64,
+    pub ccr: i64,
+    pub actual_hz: f64,
+    pub resolution_bits: i64,
+}
+
+/// The smallest prescaler that lets ARR fit in max_count (65535 for a
+/// 16-bit timer): the most duty resolution. psc is limited to 0..65535;
+/// psc = -1 when the frequency cannot be reached.
+pub fn pwm_timer_setup(clk_hz: i64, hz: i64, duty_permille: i64, max_count: i64) -> PwmTimer {
+    if hz <= 0 || clk_hz <= 0 || hz > clk_hz {
+        return PwmTimer { psc: 0 - 1, arr: 0, ccr: 0, actual_hz: 0.0, resolution_bits: 0 };
+    }
+    val per_cycle: i64 = (max_count + 1) * hz;
+    var div: i64 = (clk_hz + per_cycle - 1) / per_cycle;
+    if div < 1 {
+        div = 1;
+    }
+    if div > 65536 {
+        return PwmTimer { psc: 0 - 1, arr: 0, ccr: 0, actual_hz: 0.0, resolution_bits: 0 };
+    }
+    val psc: i64 = div - 1;
+    val ticks: i64 = (clk_hz + (hz * div) / 2) / (hz * div);
+    var arr: i64 = ticks - 1;
+    if arr > max_count {
+        arr = max_count;
+    }
+    if arr < 1 {
+        arr = 1;
+    }
+    var pm: i64 = duty_permille;
+    if pm < 0 {
+        pm = 0;
+    }
+    if pm > 1000 {
+        pm = 1000;
+    }
+    val ccr: i64 = ((arr + 1) * pm + 500) / 1000;
+    var bits: i64 = 0;
+    while (1 << (bits + 1)) <= arr + 1 {
+        bits = bits + 1;
+    }
+    val actual: f64 = (clk_hz as f64) / (((psc + 1) * (arr + 1)) as f64);
+    return PwmTimer { psc: psc, arr: arr, ccr: ccr, actual_hz: actual, resolution_bits: bits };
+}

@@ -1,0 +1,51 @@
+// Track MI (docs/roadmap/llvm-roadmap.md), MI6: on the machine layer
+// (compiler/nat_ir.fd ng_mir_emit) every overflow, division and narrowing
+// check is one branch to a cold block at the end of its function, one per
+// panic kind and line, which calls the shared stub (so a trace still names
+// the function). Here no check fires: many checks share a line (mix3) or
+// each have their own (spread), in a loop, with i64 and i32 arithmetic.
+// FID_NAT_OFF=coldpanic: each check calls its stub inline, as before. The
+// panics themselves: test_panic_*_fail.fd, test_machine_coldpanic_fail.fd.
+// Native check: NATIVE=1 bash scripts/cross-test.sh aarch64-linux (and
+// riscv64-linux, x86_64-linux), also with FID_VERIFY=1.
+// Expected output:
+// 131856
+// 28562
+// 14949
+
+fn mix3(a: i64, b: i64, c: i64) -> i64 {
+    return a * b + c - a / b + c % b;
+}
+
+fn spread(a: i64, b: i64) -> i64 {
+    val p: i64 = a * b;
+    val q: i64 = p + a;
+    val r: i64 = q / b;
+    val s: i64 = q % b;
+    return r - s;
+}
+
+fn narrow(a: i32, b: i32) -> i32 {
+    return a * b + 1;
+}
+
+fn main() -> i64 {
+    var acc: i64 = 0;
+    var acc2: i64 = 0;
+    var i: i64 = 1;
+    while i < 200 {
+        acc = acc + mix3(i, i % 7 + 1, i * 3);
+        acc2 = acc2 + spread(i, i % 5 + 1);
+        i = i + 1;
+    }
+    println(acc);
+    println(acc2);
+    var n: i64 = 0;
+    var k: i32 = 1;
+    while k < 100 {
+        n = n + (narrow(k, 3) as i64);
+        k = k + 1;
+    }
+    println(n);
+    return 0;
+}

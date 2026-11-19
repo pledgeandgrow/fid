@@ -1,0 +1,102 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA3: the caller-saved argument
+// registers for ranges no call crosses (compiler/nat_ir.fd ng_arg_free).
+// On x86-64 the pools have callee-saved registers only (rbx, r12..r15);
+// RA3 gives rdi, rsi, rdx and rcx to a range wherever no operation uses
+// them (RA7's table, ng_implicit_regs): first to the ranges the allocator
+// spilled ("fill"), then to every range of a callee-saved register whose
+// ranges all fit ("trade": the register's save goes away).
+// `press` keeps eight values live through a loop with a division, a
+// remainder and shifts by a register (the operations that use rdx and rcx
+// without naming them), more than x86-64's five callee-saved registers;
+// `leafy` is a small leaf; `between` keeps one value across calls and
+// computes others between them; `pair` returns two words (rdi and rsi on
+// x86-64, which must hold the result up to the epilogue). A value left in
+// an argument register that something clobbers changes what is printed.
+// tests/nattools/machine_ra3_check.sh builds it on every target with
+// FID_VERIFY=1 (the allocation checker, ng_mir_check_args) with and
+// without FID_NAT_OFF=argfree, runs it where it can, compares the spills
+// and reloads `--stats` counts, and checks that FID_NAT_MUTATE=argfree
+// (implicit uses ignored) is rejected by the checker.
+// Expected output:
+// 989939
+// 1226120
+// 672341
+// 225047
+// 52 90
+// -65 -125
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn press(a: i64, b: i64, c: i64, d: i64, n: i64) -> i64 {
+    var s0: i64 = a * 3 + b;
+    var s1: i64 = b * 5 + c;
+    var s2: i64 = c * 7 + d;
+    var s3: i64 = d * 11 + a;
+    var s4: i64 = a ^ c;
+    var s5: i64 = b ^ d;
+    var s6: i64 = a + d * 13;
+    var s7: i64 = b + c * 17;
+    var i: i64 = 0;
+    while i < n {
+        s0 = (s0 + s1 * 3) & 65535;
+        s1 = (s1 ^ (s2 >> (i & 7))) & 65535;
+        s2 = (s2 + s3 / 3 + 1) & 65535;
+        s3 = (s3 * 5 + s4) & 65535;
+        s4 = (s4 + s5 % 7) & 65535;
+        s5 = (s5 ^ (s6 << (i & 3))) & 65535;
+        s6 = (s6 + s7 / (5 + (i & 1))) & 65535;
+        s7 = (s7 + s0 + i) & 65535;
+        i = i + 1;
+    }
+    return s0 + s1 * 2 + s2 * 3 + s3 * 4 + s4 * 5 + s5 * 6 + s6 * 7 + s7 * 8;
+}
+
+fn leafy(x: i64, y: i64) -> i64 {
+    var t: i64 = x * y + 1;
+    var u: i64 = t ^ (x << (y & 7));
+    return u - t / 3;
+}
+
+fn between(n: i64) -> i64 {
+    var keep: i64 = n * 2 + 1;
+    var r: i64 = leafy(n, 3);
+    var p: i64 = r % 97;
+    var q: i64 = (r / 5) & 1023;
+    var w: i64 = (p << (keep & 3)) + q;
+    var r2: i64 = leafy(w & 1023, keep & 15);
+    return keep + r + r2 + p - q;
+}
+
+fn pair(x: i64) -> Pair {
+    var a: i64 = x * 3 + 1;
+    var b: i64 = x * 5 + x / 3;
+    var c: i64 = (a ^ b) % 11;
+    return Pair { a: a + c, b: b - c };
+}
+
+fn main() {
+    // the operands come out of a Vec, so no call is folded away
+    var x: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k <= 40 {
+        x.push(k);
+        k = k + 1;
+    }
+    println(int_to_str(press(x.get(1), x.get(2), x.get(3), x.get(4), x.get(40))));
+    println(int_to_str(press(x.get(9), x.get(8), x.get(7), x.get(6), x.get(25))));
+    println(int_to_str(leafy(x.get(12) * 1000 + x.get(5), x.get(6))));
+    var total: i64 = 0;
+    k = 0;
+    while k < 20 {
+        total = total + between(x.get(k));
+        k = k + 1;
+    }
+    println(int_to_str(total));
+    var pr: Pair = pair(x.get(17));
+    println(int_to_str(pr.a) + " " + int_to_str(pr.b));
+    var pq: Pair = pair(0 - x.get(23));
+    println(int_to_str(pq.a) + " " + int_to_str(pq.b));
+}

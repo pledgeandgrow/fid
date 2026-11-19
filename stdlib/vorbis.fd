@@ -1,0 +1,2145 @@
+// Fides Ogg + Vorbis standard library
+//
+// Ogg container (RFC 3533) and a Vorbis I audio decoder (the Xiph.Org
+// "Vorbis I specification"), all in Fides, no seam (bytes in, f64 PCM out):
+//
+// Ogg: page parsing with the Ogg CRC-32 (polynomial 0x04C11DB7, MSB first,
+// init 0, computed with the CRC field zeroed), lacing values, packets that
+// span pages, page writing (`ogg_page_encode`) and packing packets into
+// pages (`ogg_paginate`).
+//
+// Vorbis: identification, comment and setup headers (codebooks with both
+// codeword-length encodings, sparse books, VQ lookup types 1 and 2;
+// floors 0 and 1; residue types 0, 1 and 2; mappings with channel
+// coupling and submaps; modes); audio packets: floor 1 decode and curve
+// synthesis (integer line rendering of the spec, the inverse-dB table),
+// floor 0 decode (amplitude, book number, LSP coefficients from VQ books
+// with the running "last" offset) and its curve (the bark map and the
+// LSP-to-curve formula of spec 6.2.3, evaluated once per run of equal map
+// values), residue
+// decode, inverse channel coupling, the inverse MDCT (a DCT-IV through an
+// N/4-point complex FFT), the Vorbis power-sine window with long/short
+// transitions, overlap-add, and end trimming from the last granule
+// position.
+//
+// Verified (tests/bootstrap/test_std_vorbis.fd): Ogg pages of real files
+// made by ffmpeg/libvorbis parse with good CRCs and re-encode byte for
+// byte; the headers parse; the decoded PCM of a mono and a stereo
+// (coupled) libvorbis file matches ffmpeg's decoder to 1e-6. Checked
+// outside the test (built through C, too slow for the interpreter): a
+// 44.1 kHz stereo file with clicks, whose blocks switch between 256 and
+// 2048 samples, matches ffmpeg to 2e-7 on all 7056 frames. Floor 0: no
+// encoder in use writes it (libvorbis has not since 1.0), so the test
+// decodes a stream generated from the spec (mono, 256/512-sample blocks,
+// an order-8 floor 0 with two books, dims 1 and dims 2 with sequence_p,
+// random packet contents), which matches ffmpeg's decoder to 3e-7 on the
+// 1216 samples ffmpeg returns (ffmpeg stops 128 samples before the last
+// granule position, which this decoder honours); the bark map is checked
+// against values computed outside Fides, and the curve against the spec's
+// formula written out literally and against A(z) = 1 (uniform LSPs give a
+// flat curve).
+//
+// Usage:
+//   use vorbis;
+//   val dec: VorbisFile = vorbis_decode_file(&bytes);
+//   if dec.ok { println(int_to_str(dec.channels) + " ch " + int_to_str(dec.rate) + " Hz"); }
+//   // dec.pcm.get(ch) is channel ch, -1..1
+
+module vorbis;
+use vec;
+use math;
+
+// ─── Ogg ──────────────────────────────────────────────────────────────────
+
+var og_crc_table: Vec<i64> = Vec::new();
+
+fn og_crc_init() {
+    if og_crc_table.len() == 256 {
+        return;
+    }
+    var i: i64 = 0;
+    while i < 256 {
+        var r: i64 = i << 24;
+        var k: i64 = 0;
+        while k < 8 {
+            if (r & 2147483648) != 0 {
+                r = ((r << 1) & 4294967295) ^ 79764919;
+            } else {
+                r = (r << 1) & 4294967295;
+            }
+            k = k + 1;
+        }
+        og_crc_table.push(r);
+        i = i + 1;
+    }
+}
+
+/// Ogg CRC-32 of bytes[from..to) (continue from `crc`; start at 0).
+pub fn ogg_crc_update(crc: i64, b: &Vec<i64>, from: i64, to: i64) -> i64 {
+    og_crc_init();
+    var c: i64 = crc;
+    var i: i64 = from;
+    while i < to {
+        c = ((c << 8) & 4294967295) ^ og_crc_table.get(((c >> 24) & 255) ^ b.get(i));
+        i = i + 1;
+    }
+    return c;
+}
+
+pub fn ogg_crc(b: &Vec<i64>) -> i64 {
+    return ogg_crc_update(0, b, 0, b.len());
+}
+
+pub const OGG_CONTINUED: i64 = 1;
+pub const OGG_BOS: i64 = 2;
+pub const OGG_EOS: i64 = 4;
+
+/// One Ogg page.
+pub struct OggPage {
+    pub ok: bool,
+    pub error: str,
+    pub header_type: i64,
+    // OGG_CONTINUED | OGG_BOS | OGG_EOS
+    pub granule: i64,
+    // -1: no packet ends on this page
+    pub serial: i64,
+    pub seq: i64,
+    pub crc: i64,
+    // as stored
+    pub crc_ok: bool,
+    pub lacing: Vec<i64>,
+    pub body: Vec<i64>,
+    pub size: i64,  // bytes of the whole page
+}
+
+fn og_u32(b: &Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256 + b.get(o + 2) * 65536 + b.get(o + 3) * 16777216;
+}
+
+fn og_bad_page(msg: str) -> OggPage {
+    return OggPage { ok: false, error: msg, header_type: 0, granule: 0, serial: 0, seq: 0, crc: 0, crc_ok: false, lacing: Vec::new(), body: Vec::new(), size: 0 };
+}
+
+/// Parse the page that starts at byte `at`.
+@wrapping
+pub fn ogg_parse_page(b: &Vec<i64>, at: i64) -> OggPage {
+    if at + 27 > b.len() {
+        return og_bad_page("truncated page header");
+    }
+    if b.get(at) != 79 || b.get(at + 1) != 103 || b.get(at + 2) != 103 || b.get(at + 3) != 83 {
+        return og_bad_page("no OggS capture pattern");
+    }
+    if b.get(at + 4) != 0 {
+        return og_bad_page("unknown Ogg version " + int_to_str(b.get(at + 4)));
+    }
+    var g: i64 = 0;
+    var k: i64 = 7;
+    while k >= 0 {
+        g = (g << 8) | b.get(at + 6 + k);
+        k = k - 1;
+    }
+    val nseg: i64 = b.get(at + 26);
+    if at + 27 + nseg > b.len() {
+        return og_bad_page("truncated segment table");
+    }
+    var lacing: Vec<i64> = Vec::new();
+    var body_len: i64 = 0;
+    var i: i64 = 0;
+    while i < nseg {
+        val l: i64 = b.get(at + 27 + i);
+        lacing.push(l);
+        body_len = body_len + l;
+        i = i + 1;
+    }
+    val body_at: i64 = at + 27 + nseg;
+    if body_at + body_len > b.len() {
+        return og_bad_page("truncated page body");
+    }
+    var body: Vec<i64> = Vec::new();
+    i = 0;
+    while i < body_len {
+        body.push(b.get(body_at + i));
+        i = i + 1;
+    }
+    val stored: i64 = og_u32(b, at + 22);
+    // CRC over the page with the CRC field read as zero
+    var c: i64 = ogg_crc_update(0, b, at, at + 22);
+    var zeros: Vec<i64> = Vec::new();
+    zeros.push(0);
+    zeros.push(0);
+    zeros.push(0);
+    zeros.push(0);
+    c = ogg_crc_update(c, &zeros, 0, 4);
+    c = ogg_crc_update(c, b, at + 26, body_at + body_len);
+    return OggPage {
+        ok: true, error: "", header_type: b.get(at + 5), granule: g, serial: og_u32(b, at + 14), seq: og_u32(b, at + 18), crc: stored, crc_ok: c == stored, lacing: lacing, body: body, size: body_at + body_len - at,
+    };
+}
+
+/// The bytes of a page (the CRC is computed; `p.crc` is ignored).
+@wrapping
+pub fn ogg_page_encode(p: &OggPage) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(79);
+    out.push(103);
+    out.push(103);
+    out.push(83);
+    out.push(0);
+    out.push(p.header_type);
+    var k: i64 = 0;
+    while k < 8 {
+        out.push((p.granule >> (8 * k)) & 255);
+        k = k + 1;
+    }
+    k = 0;
+    while k < 4 {
+        out.push((p.serial >> (8 * k)) & 255);
+        k = k + 1;
+    }
+    k = 0;
+    while k < 4 {
+        out.push((p.seq >> (8 * k)) & 255);
+        k = k + 1;
+    }
+    k = 0;
+    while k < 4 {
+        out.push(0);
+        k = k + 1;
+    }
+    out.push(p.lacing.len());
+    var i: i64 = 0;
+    while i < p.lacing.len() {
+        out.push(p.lacing.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.body.len() {
+        out.push(p.body.get(i));
+        i = i + 1;
+    }
+    val c: i64 = ogg_crc(&out);
+    out.set(22, c & 255);
+    out.set(23, (c >> 8) & 255);
+    out.set(24, (c >> 16) & 255);
+    out.set(25, (c >> 24) & 255);
+    return out;
+}
+
+/// A logical stream split into packets.
+pub struct OggStream {
+    pub ok: bool,
+    pub error: str,
+    pub serial: i64,
+    pub pages: i64,
+    pub crc_errors: i64,
+    pub packets: Vec<Vec<i64>>,
+    pub granules: Vec<i64>,
+    // per packet: granule of the page it ends on, -1 if not the last there
+    pub last_granule: i64,
+}
+
+/// Read every page of the first logical stream in `b` and assemble its
+/// packets. Pages with a bad CRC are an error.
+pub fn ogg_read(b: &Vec<i64>) -> OggStream {
+    var st = OggStream { ok: true, error: "", serial: - 1, pages: 0, crc_errors: 0, packets: Vec::new(), granules: Vec::new(), last_granule: - 1 };
+    var at: i64 = 0;
+    var cur: Vec<i64> = Vec::new();
+    var have_cur: bool = false;
+    var expect_seq: i64 = - 1;
+    while at < b.len() {
+        val p: OggPage = ogg_parse_page(b, at);
+        if !p.ok {
+            st.ok = false;
+            st.error = "page at byte " + int_to_str(at) + ": " + p.error;
+            return st;
+        }
+        at = at + p.size;
+        if st.serial < 0 {
+            st.serial = p.serial;
+        }
+        if p.serial != st.serial {
+            continue;
+        }
+        st.pages = st.pages + 1;
+        if !p.crc_ok {
+            st.crc_errors = st.crc_errors + 1;
+            st.ok = false;
+            st.error = "bad CRC on page " + int_to_str(p.seq);
+            return st;
+        }
+        if expect_seq >= 0 && p.seq != expect_seq {
+            // a lost page: drop the partial packet
+            cur = Vec::new();
+            have_cur = false;
+        }
+        expect_seq = p.seq + 1;
+        if (p.header_type & OGG_CONTINUED) == 0 && have_cur {
+            cur = Vec::new();
+            have_cur = false;
+        }
+        var off: i64 = 0;
+        var last_end: i64 = - 1;
+        var i: i64 = 0;
+        while i < p.lacing.len() {
+            val l: i64 = p.lacing.get(i);
+            var k: i64 = 0;
+            while k < l {
+                cur.push(p.body.get(off + k));
+                k = k + 1;
+            }
+            off = off + l;
+            have_cur = true;
+            if l < 255 {
+                st.packets.push(cur);
+                st.granules.push(- 1);
+                last_end = st.packets.len() - 1;
+                cur = Vec::new();
+                have_cur = false;
+            }
+            i = i + 1;
+        }
+        if last_end >= 0 {
+            st.granules.set(last_end, p.granule);
+        }
+        if p.granule != - 1 {
+            st.last_granule = p.granule;
+        }
+    }
+    return st;
+}
+
+/// Pack `packets` into pages of stream `serial` (pages of at most 255
+/// lacing values; one page per packet unless a packet needs more).
+/// `granules[i]` is the granule position after packet i. The first page is
+/// marked BOS, the last EOS.
+pub fn ogg_paginate(packets: &Vec<Vec<i64>>, granules: &Vec<i64>, serial: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var seq: i64 = 0;
+    var pi: i64 = 0;
+    while pi < packets.len() {
+        val pk: Vec<i64> = packets.get(pi);
+        // lacing of this packet
+        var lac: Vec<i64> = Vec::new();
+        var left: i64 = pk.len();
+        while left >= 255 {
+            lac.push(255);
+            left = left - 255;
+        }
+        lac.push(left);
+        var li: i64 = 0;
+        var bi: i64 = 0;
+        var first: bool = true;
+        while li < lac.len() {
+            var page = OggPage { ok: true, error: "", header_type: 0, granule: - 1, serial: serial, seq: seq, crc: 0, crc_ok: true, lacing: Vec::new(), body: Vec::new(), size: 0 };
+            if !first {
+                page.header_type = OGG_CONTINUED;
+            }
+            if seq == 0 {
+                page.header_type = page.header_type | OGG_BOS;
+            }
+            while li < lac.len() && page.lacing.len() < 255 {
+                val l: i64 = lac.get(li);
+                page.lacing.push(l);
+                var k: i64 = 0;
+                while k < l {
+                    page.body.push(pk.get(bi));
+                    bi = bi + 1;
+                    k = k + 1;
+                }
+                li = li + 1;
+            }
+            if li >= lac.len() {
+                page.granule = granules.get(pi);
+                if pi == packets.len() - 1 {
+                    page.header_type = page.header_type | OGG_EOS;
+                }
+            }
+            val bytes: Vec<i64> = ogg_page_encode(&page);
+            var k: i64 = 0;
+            while k < bytes.len() {
+                out.push(bytes.get(k));
+                k = k + 1;
+            }
+            seq = seq + 1;
+            first = false;
+        }
+        pi = pi + 1;
+    }
+    return out;
+}
+
+// ─── Bit reader (LSB first, as Vorbis packs) ──────────────────────────────
+
+pub struct VbBits {
+    pub data: Vec<i64>,
+    pub pos: i64,
+    // in bits
+    pub nbits: i64,
+    pub eop: bool,  // a read went past the end of the packet
+}
+
+pub fn vorbis_bits(data: Vec<i64>) -> VbBits {
+    val n: i64 = data.len() * 8;
+    return VbBits { data: data, pos: 0, nbits: n, eop: false };
+}
+
+/// Read `n` (0..32) bits as an unsigned integer; past the end: 0 and eop.
+pub fn vorbis_read(r: &mut VbBits, n: i64) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    if r.pos + n > r.nbits {
+        r.pos = r.nbits;
+        r.eop = true;
+        return 0;
+    }
+    var v: i64 = 0;
+    var got: i64 = 0;
+    while got < n {
+        val byte: i64 = r.data.get(r.pos >> 3);
+        val bit: i64 = r.pos & 7;
+        var take: i64 = 8 - bit;
+        if take > n - got {
+            take = n - got;
+        }
+        v = v | (((byte >> bit) & ((1 << take) - 1)) << got);
+        got = got + take;
+        r.pos = r.pos + take;
+    }
+    return v;
+}
+
+fn vb_bit(r: &mut VbBits) -> i64 {
+    if r.pos >= r.nbits {
+        r.eop = true;
+        return 0;
+    }
+    val v: i64 = (r.data.get(r.pos >> 3) >> (r.pos & 7)) & 1;
+    r.pos = r.pos + 1;
+    return v;
+}
+
+/// ilog: the position of the highest set bit (ilog(0) = 0, ilog(7) = 3).
+pub fn vorbis_ilog(x: i64) -> i64 {
+    var n: i64 = 0;
+    var v: i64 = x;
+    while v > 0 {
+        n = n + 1;
+        v = v >> 1;
+    }
+    return n;
+}
+
+/// float32_unpack of the spec: 21-bit mantissa, sign, 10-bit exponent
+/// biased by 788.
+pub fn vorbis_float32_unpack(x: i64) -> f64 {
+    var mant: f64 = (x & 2097151) as f64;
+    val exp: i64 = (x & 2145386496) >> 21;
+    if (x & 2147483648) != 0 {
+        mant = - mant;
+    }
+    return mant * math_pow(2.0, (exp - 788) as f64);
+}
+
+/// lookup1_values: the largest r with r^dims <= entries.
+pub fn vorbis_lookup1_values(entries: i64, dims: i64) -> i64 {
+    var r: i64 = math_floor(math_pow(entries as f64, 1.0 / (dims as f64))) as i64;
+    if r < 0 { r = 0; }
+    // correct float error either way
+    while vb_powi(r + 1, dims) <= entries {
+        r = r + 1;
+    }
+    while r > 0 && vb_powi(r, dims) > entries {
+        r = r - 1;
+    }
+    return r;
+}
+
+fn vb_powi(b: i64, e: i64) -> i64 {
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while i < e {
+        r = r * b;
+        if r > 4294967296 {
+            return 4294967297;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+// ─── Codebooks ────────────────────────────────────────────────────────────
+
+pub struct VbBook {
+    pub dims: i64,
+    pub entries: i64,
+    pub lengths: Vec<i64>,
+    // 0: unused entry
+    pub left: Vec<i64>,
+    pub right: Vec<i64>,
+    // decode tree: child 0 = none, > 0 node, < 0 leaf -(entry + 1)
+    pub lookup: i64,
+    pub vq: Vec<f64>,
+    // entries * dims values (lookup types 1 and 2)
+    pub single: i64,  // the entry of a book with one used entry, else -1
+}
+
+fn vb_new_book() -> VbBook {
+    return VbBook { dims: 0, entries: 0, lengths: Vec::new(), left: Vec::new(), right: Vec::new(), lookup: 0, vq: Vec::new(), single: - 1 };
+}
+
+// Insert codeword `code` (MSB first, `len` bits) for `entry`.
+fn vb_tree_add(bk: &mut VbBook, code: i64, len: i64, entry: i64) -> bool {
+    var node: i64 = 0;
+    var b: i64 = len - 1;
+    while b >= 0 {
+        val bit: i64 = (code >> b) & 1;
+        var child: i64 = 0;
+        if bit == 1 {
+            child = bk.right.get(node);
+        } else {
+            child = bk.left.get(node);
+        }
+        if b == 0 {
+            if child != 0 {
+                return false;
+            }
+            if bit == 1 {
+                bk.right.set(node, - (entry + 1));
+            } else {
+                bk.left.set(node, - (entry + 1));
+            }
+            return true;
+        }
+        if child < 0 {
+            return false;
+        }
+        if child == 0 {
+            bk.left.push(0);
+            bk.right.push(0);
+            child = bk.left.len() - 1;
+            if bit == 1 {
+                bk.right.set(node, child);
+            } else {
+                bk.left.set(node, child);
+            }
+        }
+        node = child;
+        b = b - 1;
+    }
+    return true;
+}
+
+// Assign codewords to lengths as the spec does (each entry takes the
+// lowest free codeword of its length, in entry order) and build the tree.
+fn vb_build_tree(bk: &mut VbBook) -> bool {
+    bk.left.push(0);
+    bk.right.push(0);
+    var used: i64 = 0;
+    var last: i64 = - 1;
+    var i: i64 = 0;
+    while i < bk.entries {
+        if bk.lengths.get(i) > 0 {
+            used = used + 1;
+            last = i;
+        }
+        i = i + 1;
+    }
+    if used == 0 {
+        return true;
+    }
+    if used == 1 {
+        bk.single = last;
+        return true;
+    }
+    // available[len] = next free codeword of that length, as a 32-bit
+    // left-aligned value; 0: none
+    var avail: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 33 {
+        avail.push(0);
+        i = i + 1;
+    }
+    var first: bool = true;
+    i = 0;
+    while i < bk.entries {
+        val len: i64 = bk.lengths.get(i);
+        if len > 0 {
+            if first {
+                first = false;
+                if !vb_tree_add(bk, 0, len, i) {
+                    return false;
+                }
+                var y: i64 = 1;
+                while y <= len {
+                    avail.set(y, 1 << (32 - y));
+                    y = y + 1;
+                }
+            } else {
+                var z: i64 = len;
+                while z > 0 && avail.get(z) == 0 {
+                    z = z - 1;
+                }
+                if z == 0 {
+                    return false;
+                }
+                val res: i64 = avail.get(z);
+                avail.set(z, 0);
+                if !vb_tree_add(bk, res >> (32 - len), len, i) {
+                    return false;
+                }
+                if z != len {
+                    var y: i64 = len;
+                    while y > z {
+                        avail.set(y, res + (1 << (32 - y)));
+                        y = y - 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A scalar codebook (no VQ) with these codeword lengths (0: unused
+/// entry), codewords assigned as the spec does. `entries` is -1 when the
+/// lengths are over-specified.
+pub fn vorbis_book_from_lengths(lengths: Vec<i64>) -> VbBook {
+    var bk: VbBook = vb_new_book();
+    bk.dims = 1;
+    bk.entries = lengths.len();
+    bk.lengths = lengths;
+    if !vb_build_tree(&mut bk) {
+        bk.entries = - 1;
+    }
+    return bk;
+}
+
+/// Decode one entry number with `bk` (-1 at the end of the packet or on a
+/// codeword the book does not have).
+pub fn vorbis_book_decode(bk: &VbBook, r: &mut VbBits) -> i64 {
+    if bk.single >= 0 {
+        vb_bit(r);
+        if r.eop {
+            return - 1;
+        }
+        return bk.single;
+    }
+    var node: i64 = 0;
+    loop {
+        val bit: i64 = vb_bit(r);
+        if r.eop {
+            return - 1;
+        }
+        var next: i64 = 0;
+        if bit == 1 {
+            next = bk.right.get(node);
+        } else {
+            next = bk.left.get(node);
+        }
+        if next < 0 {
+            return - next - 1;
+        }
+        if next == 0 {
+            return - 1;
+        }
+        node = next;
+    }
+    return - 1;
+}
+
+fn vb_read_book(r: &mut VbBits) -> VbBook {
+    var bk: VbBook = vb_new_book();
+    if vorbis_read(r, 24) != 5653314 {
+        bk.entries = - 1;
+        return bk;
+    }
+    bk.dims = vorbis_read(r, 16);
+    bk.entries = vorbis_read(r, 24);
+    val ordered: i64 = vorbis_read(r, 1);
+    if ordered == 0 {
+        val sparse: i64 = vorbis_read(r, 1);
+        var i: i64 = 0;
+        while i < bk.entries {
+            if sparse == 1 {
+                if vorbis_read(r, 1) == 1 {
+                    bk.lengths.push(vorbis_read(r, 5) + 1);
+                } else {
+                    bk.lengths.push(0);
+                }
+            } else {
+                bk.lengths.push(vorbis_read(r, 5) + 1);
+            }
+            i = i + 1;
+        }
+    } else {
+        var cur_entry: i64 = 0;
+        var cur_len: i64 = vorbis_read(r, 5) + 1;
+        while cur_entry < bk.entries {
+            val num: i64 = vorbis_read(r, vorbis_ilog(bk.entries - cur_entry));
+            if cur_entry + num > bk.entries || cur_len > 32 {
+                bk.entries = - 1;
+                return bk;
+            }
+            var k: i64 = 0;
+            while k < num {
+                bk.lengths.push(cur_len);
+                k = k + 1;
+            }
+            cur_entry = cur_entry + num;
+            cur_len = cur_len + 1;
+            if r.eop {
+                bk.entries = - 1;
+                return bk;
+            }
+        }
+    }
+    bk.lookup = vorbis_read(r, 4);
+    if bk.lookup == 1 || bk.lookup == 2 {
+        val minv: f64 = vorbis_float32_unpack(vorbis_read(r, 32));
+        val delta: f64 = vorbis_float32_unpack(vorbis_read(r, 32));
+        val vbits: i64 = vorbis_read(r, 4) + 1;
+        val seq: i64 = vorbis_read(r, 1);
+        var nvals: i64 = 0;
+        if bk.lookup == 1 {
+            nvals = vorbis_lookup1_values(bk.entries, bk.dims);
+        } else {
+            nvals = bk.entries * bk.dims;
+        }
+        var mult: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < nvals {
+            mult.push(vorbis_read(r, vbits));
+            i = i + 1;
+        }
+        // the VQ vector of every entry
+        var e: i64 = 0;
+        while e < bk.entries {
+            var last: f64 = 0.0;
+            var divisor: i64 = 1;
+            var d: i64 = 0;
+            while d < bk.dims {
+                var off: i64 = 0;
+                if bk.lookup == 1 {
+                    off = (e / divisor) % nvals;
+                    divisor = divisor * nvals;
+                } else {
+                    off = e * bk.dims + d;
+                }
+                val v: f64 = (mult.get(off) as f64) * delta + minv + last;
+                bk.vq.push(v);
+                if seq == 1 {
+                    last = v;
+                }
+                d = d + 1;
+            }
+            e = e + 1;
+        }
+    } else if bk.lookup != 0 {
+        bk.entries = - 1;
+        return bk;
+    }
+    if r.eop || !vb_build_tree(&mut bk) {
+        bk.entries = - 1;
+    }
+    return bk;
+}
+
+// ─── Setup structures ─────────────────────────────────────────────────────
+
+pub struct VbFloor {
+    pub partitions: i64,
+    pub part_class: Vec<i64>,
+    pub class_dims: Vec<i64>,
+    pub class_subs: Vec<i64>,
+    pub class_master: Vec<i64>,
+    pub sub_books: Vec<i64>,
+    // [class * 8 + j], -1: none
+    pub multiplier: i64,
+    pub xlist: Vec<i64>,
+    pub sorted: Vec<i64>,
+    // indexes of xlist in increasing x
+    pub low_n: Vec<i64>,
+    pub high_n: Vec<i64>,
+    pub ftype: i64,
+    // 1, or 0 (LSP; the fields below)
+    pub order: i64,
+    pub f0_rate: i64,
+    pub bark_size: i64,
+    pub amp_bits: i64,
+    pub amp_offset: i64,
+    pub f0_books: Vec<i64>,
+    pub map0: Vec<i64>,
+    // bark map of the short blocks (bs0 / 2 entries)
+    pub map1: Vec<i64>,  // and of the long blocks
+}
+
+pub struct VbResidue {
+    pub rtype: i64,
+    pub begin: i64,
+    pub end: i64,
+    pub psize: i64,
+    pub nclass: i64,
+    pub classbook: i64,
+    pub books: Vec<i64>,  // [class * 8 + pass], -1: none
+}
+
+pub struct VbMapping {
+    pub submaps: i64,
+    pub mag: Vec<i64>,
+    pub ang: Vec<i64>,
+    pub mux: Vec<i64>,
+    pub sub_floor: Vec<i64>,
+    pub sub_residue: Vec<i64>,
+}
+
+pub struct VbMode {
+    pub blockflag: i64,
+    pub mapping: i64,
+}
+
+/// Decoder state: the three headers, then the overlap of the last block.
+pub struct VorbisDecoder {
+    pub ok: bool,
+    pub error: str,
+    pub channels: i64,
+    pub rate: i64,
+    pub bitrate_max: i64,
+    pub bitrate_nominal: i64,
+    pub bitrate_min: i64,
+    pub bs0: i64,
+    pub bs1: i64,
+    pub vendor: str,
+    pub comments: Vec<str>,
+    pub books: Vec<VbBook>,
+    pub floors: Vec<VbFloor>,
+    pub residues: Vec<VbResidue>,
+    pub mappings: Vec<VbMapping>,
+    pub modes: Vec<VbMode>,
+    pub headers: i64,
+    // headers read so far (0..3)
+    pub prev: Vec<Vec<f64>>,
+    // windowed IMDCT output of the last block, per channel
+    pub prev_n: i64,
+    // its size, 0 before the first audio packet
+    pub prev_long: bool,
+}
+
+pub fn vorbis_decoder() -> VorbisDecoder {
+    return VorbisDecoder {
+        ok: true, error: "", channels: 0, rate: 0, bitrate_max: 0, bitrate_nominal: 0, bitrate_min: 0, bs0: 0, bs1: 0, vendor: "", comments: Vec::new(), books: Vec::new(), floors: Vec::new(), residues: Vec::new(), mappings: Vec::new(), modes: Vec::new(), headers: 0, prev: Vec::new(), prev_n: 0, prev_long: false,
+    };
+}
+
+fn vb_fail(d: &mut VorbisDecoder, msg: str) -> bool {
+    d.ok = false;
+    d.error = msg;
+    return false;
+}
+
+fn vb_signed32(v: i64) -> i64 {
+    if v >= 2147483648 {
+        return v - 4294967296;
+    }
+    return v;
+}
+
+// packet type byte + "vorbis"
+fn vb_check_tag(r: &mut VbBits, want: i64) -> bool {
+    if vorbis_read(r, 8) != want {
+        return false;
+    }
+    val tag: Vec<i64> = str_bytes("vorbis");
+    var i: i64 = 0;
+    while i < 6 {
+        if vorbis_read(r, 8) != tag.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn vb_read_string(r: &mut VbBits, n: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n && !r.eop {
+        b.push(vorbis_read(r, 8));
+        i = i + 1;
+    }
+    return str_from_bytes(b);
+}
+
+/// Feed one of the three header packets (in order). False on an error
+/// (d.error says why).
+pub fn vorbis_header(d: &mut VorbisDecoder, packet: Vec<i64>) -> bool {
+    var r: VbBits = vorbis_bits(packet);
+    if d.headers == 0 {
+        if !vb_check_tag(&mut r, 1) {
+            return vb_fail(d, "not a Vorbis identification header");
+        }
+        if vorbis_read(&mut r, 32) != 0 {
+            return vb_fail(d, "unknown Vorbis version");
+        }
+        d.channels = vorbis_read(&mut r, 8);
+        d.rate = vorbis_read(&mut r, 32);
+        d.bitrate_max = vb_signed32(vorbis_read(&mut r, 32));
+        d.bitrate_nominal = vb_signed32(vorbis_read(&mut r, 32));
+        d.bitrate_min = vb_signed32(vorbis_read(&mut r, 32));
+        val e0: i64 = vorbis_read(&mut r, 4);
+        val e1: i64 = vorbis_read(&mut r, 4);
+        d.bs0 = 1 << e0;
+        d.bs1 = 1 << e1;
+        if vorbis_read(&mut r, 1) != 1 || r.eop {
+            return vb_fail(d, "identification header framing bit not set");
+        }
+        if d.channels == 0 || d.rate == 0 || e0 < 6 || e0 > 13 || e1 < 6 || e1 > 13 || e0 > e1 {
+            return vb_fail(d, "bad identification header values");
+        }
+        d.headers = 1;
+        return true;
+    }
+    if d.headers == 1 {
+        if !vb_check_tag(&mut r, 3) {
+            return vb_fail(d, "not a Vorbis comment header");
+        }
+        val vlen: i64 = vorbis_read(&mut r, 32);
+        d.vendor = vb_read_string(&mut r, vlen);
+        val count: i64 = vorbis_read(&mut r, 32);
+        var i: i64 = 0;
+        while i < count && !r.eop {
+            val clen: i64 = vorbis_read(&mut r, 32);
+            d.comments.push(vb_read_string(&mut r, clen));
+            i = i + 1;
+        }
+        if vorbis_read(&mut r, 1) != 1 || r.eop {
+            return vb_fail(d, "comment header framing bit not set");
+        }
+        d.headers = 2;
+        return true;
+    }
+    if d.headers == 2 {
+        if !vb_check_tag(&mut r, 5) {
+            return vb_fail(d, "not a Vorbis setup header");
+        }
+        if !vb_setup(d, &mut r) {
+            return false;
+        }
+        d.headers = 3;
+        var c: i64 = 0;
+        while c < d.channels {
+            d.prev.push(Vec::new());
+            c = c + 1;
+        }
+        return true;
+    }
+    return vb_fail(d, "all three headers have been read");
+}
+
+fn vb_setup(d: &mut VorbisDecoder, r: &mut VbBits) -> bool {
+    // codebooks
+    val nbooks: i64 = vorbis_read(r, 8) + 1;
+    var i: i64 = 0;
+    while i < nbooks {
+        val bk: VbBook = vb_read_book(r);
+        if bk.entries < 0 {
+            return vb_fail(d, "bad codebook " + int_to_str(i));
+        }
+        d.books.push(bk);
+        i = i + 1;
+    }
+    // time domain transforms: placeholders in Vorbis I, must be zero
+    val ntimes: i64 = vorbis_read(r, 6) + 1;
+    i = 0;
+    while i < ntimes {
+        if vorbis_read(r, 16) != 0 {
+            return vb_fail(d, "nonzero time domain transform type");
+        }
+        i = i + 1;
+    }
+    // floors
+    val nfloors: i64 = vorbis_read(r, 6) + 1;
+    i = 0;
+    while i < nfloors {
+        val ftype: i64 = vorbis_read(r, 16);
+        if ftype != 0 && ftype != 1 {
+            return vb_fail(d, "floor type " + int_to_str(ftype) + " is not supported");
+        }
+        var f = VbFloor { partitions: 0, part_class: Vec::new(), class_dims: Vec::new(), class_subs: Vec::new(), class_master: Vec::new(), sub_books: Vec::new(), multiplier: 0, xlist: Vec::new(), sorted: Vec::new(), low_n: Vec::new(), high_n: Vec::new(), ftype: ftype, order: 0, f0_rate: 0, bark_size: 0, amp_bits: 0, amp_offset: 0, f0_books: Vec::new(), map0: Vec::new(), map1: Vec::new() };
+        if ftype == 0 {
+            // Vorbis I spec 6.2.1
+            f.order = vorbis_read(r, 8);
+            f.f0_rate = vorbis_read(r, 16);
+            f.bark_size = vorbis_read(r, 16);
+            f.amp_bits = vorbis_read(r, 6);
+            f.amp_offset = vorbis_read(r, 8);
+            val nb: i64 = vorbis_read(r, 4) + 1;
+            var k: i64 = 0;
+            while k < nb {
+                val bn: i64 = vorbis_read(r, 8);
+                if bn >= nbooks {
+                    return vb_fail(d, "floor 0 book out of range");
+                }
+                f.f0_books.push(bn);
+                k = k + 1;
+            }
+            if f.order < 1 || f.f0_rate < 1 || f.bark_size < 1 || r.eop {
+                return vb_fail(d, "bad floor 0 header");
+            }
+            f.map0 = vorbis_floor0_map(d.bs0 / 2, f.f0_rate, f.bark_size);
+            f.map1 = vorbis_floor0_map(d.bs1 / 2, f.f0_rate, f.bark_size);
+            d.floors.push(f);
+            i = i + 1;
+            continue;
+        }
+        f.partitions = vorbis_read(r, 5);
+        var maxc: i64 = - 1;
+        var p: i64 = 0;
+        while p < f.partitions {
+            val c: i64 = vorbis_read(r, 4);
+            f.part_class.push(c);
+            if c > maxc { maxc = c; }
+            p = p + 1;
+        }
+        var c: i64 = 0;
+        while c <= maxc {
+            f.class_dims.push(vorbis_read(r, 3) + 1);
+            val subs: i64 = vorbis_read(r, 2);
+            f.class_subs.push(subs);
+            if subs > 0 {
+                val mb: i64 = vorbis_read(r, 8);
+                if mb >= nbooks {
+                    return vb_fail(d, "floor master book out of range");
+                }
+                f.class_master.push(mb);
+            } else {
+                f.class_master.push(- 1);
+            }
+            var j: i64 = 0;
+            while j < 8 {
+                if j < (1 << subs) {
+                    val sb: i64 = vorbis_read(r, 8) - 1;
+                    if sb >= nbooks {
+                        return vb_fail(d, "floor subclass book out of range");
+                    }
+                    f.sub_books.push(sb);
+                } else {
+                    f.sub_books.push(- 1);
+                }
+                j = j + 1;
+            }
+            c = c + 1;
+        }
+        f.multiplier = vorbis_read(r, 2) + 1;
+        val rangebits: i64 = vorbis_read(r, 4);
+        f.xlist.push(0);
+        f.xlist.push(1 << rangebits);
+        p = 0;
+        while p < f.partitions {
+            val cls: i64 = f.part_class.get(p);
+            var j: i64 = 0;
+            while j < f.class_dims.get(cls) {
+                f.xlist.push(vorbis_read(r, rangebits));
+                j = j + 1;
+            }
+            p = p + 1;
+        }
+        if f.xlist.len() > 65 {
+            return vb_fail(d, "floor has more than 65 points");
+        }
+        vb_floor_prepare(&mut f);
+        d.floors.push(f);
+        i = i + 1;
+    }
+    // residues
+    val nres: i64 = vorbis_read(r, 6) + 1;
+    i = 0;
+    while i < nres {
+        var rs = VbResidue { rtype: vorbis_read(r, 16), begin: 0, end: 0, psize: 0, nclass: 0, classbook: 0, books: Vec::new() };
+        if rs.rtype > 2 {
+            return vb_fail(d, "bad residue type " + int_to_str(rs.rtype));
+        }
+        rs.begin = vorbis_read(r, 24);
+        rs.end = vorbis_read(r, 24);
+        rs.psize = vorbis_read(r, 24) + 1;
+        rs.nclass = vorbis_read(r, 6) + 1;
+        rs.classbook = vorbis_read(r, 8);
+        if rs.classbook >= nbooks {
+            return vb_fail(d, "residue classbook out of range");
+        }
+        var cascade: Vec<i64> = Vec::new();
+        var c: i64 = 0;
+        while c < rs.nclass {
+            val low: i64 = vorbis_read(r, 3);
+            var high: i64 = 0;
+            if vorbis_read(r, 1) == 1 {
+                high = vorbis_read(r, 5);
+            }
+            cascade.push(high * 8 + low);
+            c = c + 1;
+        }
+        c = 0;
+        while c < rs.nclass {
+            var pass: i64 = 0;
+            while pass < 8 {
+                if (cascade.get(c) & (1 << pass)) != 0 {
+                    val bk: i64 = vorbis_read(r, 8);
+                    if bk >= nbooks {
+                        return vb_fail(d, "residue book out of range");
+                    }
+                    rs.books.push(bk);
+                } else {
+                    rs.books.push(- 1);
+                }
+                pass = pass + 1;
+            }
+            c = c + 1;
+        }
+        d.residues.push(rs);
+        i = i + 1;
+    }
+    // mappings
+    val nmaps: i64 = vorbis_read(r, 6) + 1;
+    i = 0;
+    while i < nmaps {
+        if vorbis_read(r, 16) != 0 {
+            return vb_fail(d, "bad mapping type");
+        }
+        var m = VbMapping { submaps: 1, mag: Vec::new(), ang: Vec::new(), mux: Vec::new(), sub_floor: Vec::new(), sub_residue: Vec::new() };
+        if vorbis_read(r, 1) == 1 {
+            m.submaps = vorbis_read(r, 4) + 1;
+        }
+        if vorbis_read(r, 1) == 1 {
+            val steps: i64 = vorbis_read(r, 8) + 1;
+            val bits: i64 = vorbis_ilog(d.channels - 1);
+            var s: i64 = 0;
+            while s < steps {
+                val mg: i64 = vorbis_read(r, bits);
+                val an: i64 = vorbis_read(r, bits);
+                if mg == an || mg >= d.channels || an >= d.channels {
+                    return vb_fail(d, "bad channel coupling");
+                }
+                m.mag.push(mg);
+                m.ang.push(an);
+                s = s + 1;
+            }
+        }
+        if vorbis_read(r, 2) != 0 {
+            return vb_fail(d, "mapping reserved bits set");
+        }
+        var c: i64 = 0;
+        while c < d.channels {
+            if m.submaps > 1 {
+                val mx: i64 = vorbis_read(r, 4);
+                if mx >= m.submaps {
+                    return vb_fail(d, "bad mapping mux");
+                }
+                m.mux.push(mx);
+            } else {
+                m.mux.push(0);
+            }
+            c = c + 1;
+        }
+        var s: i64 = 0;
+        while s < m.submaps {
+            vorbis_read(r, 8);
+            val fl: i64 = vorbis_read(r, 8);
+            val rs: i64 = vorbis_read(r, 8);
+            if fl >= d.floors.len() || rs >= d.residues.len() {
+                return vb_fail(d, "mapping submap out of range");
+            }
+            m.sub_floor.push(fl);
+            m.sub_residue.push(rs);
+            s = s + 1;
+        }
+        d.mappings.push(m);
+        i = i + 1;
+    }
+    // modes
+    val nmodes: i64 = vorbis_read(r, 6) + 1;
+    i = 0;
+    while i < nmodes {
+        val bf: i64 = vorbis_read(r, 1);
+        val wt: i64 = vorbis_read(r, 16);
+        val tt: i64 = vorbis_read(r, 16);
+        val mp: i64 = vorbis_read(r, 8);
+        if wt != 0 || tt != 0 || mp >= d.mappings.len() {
+            return vb_fail(d, "bad mode");
+        }
+        d.modes.push(VbMode { blockflag: bf, mapping: mp });
+        i = i + 1;
+    }
+    if vorbis_read(r, 1) != 1 || r.eop {
+        return vb_fail(d, "setup header framing bit not set");
+    }
+    return true;
+}
+
+// Sort order and neighbours of a floor's x list.
+fn vb_floor_prepare(f: &mut VbFloor) {
+    val n: i64 = f.xlist.len();
+    var i: i64 = 0;
+    while i < n {
+        f.sorted.push(i);
+        i = i + 1;
+    }
+    // insertion sort by x (x values are distinct in a valid stream)
+    i = 1;
+    while i < n {
+        var j: i64 = i;
+        while j > 0 && f.xlist.get(f.sorted.get(j - 1)) > f.xlist.get(f.sorted.get(j)) {
+            val t: i64 = f.sorted.get(j - 1);
+            f.sorted.set(j - 1, f.sorted.get(j));
+            f.sorted.set(j, t);
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        var lo: i64 = 0;
+        var hi: i64 = 1;
+        var lx: i64 = - 1;
+        var hx: i64 = 1000000;
+        val x: i64 = f.xlist.get(i);
+        var j: i64 = 0;
+        while j < i {
+            val xj: i64 = f.xlist.get(j);
+            if xj < x && xj > lx {
+                lx = xj;
+                lo = j;
+            }
+            if xj > x && xj < hx {
+                hx = xj;
+                hi = j;
+            }
+            j = j + 1;
+        }
+        f.low_n.push(lo);
+        f.high_n.push(hi);
+        i = i + 1;
+    }
+}
+
+// ─── Audio packets ────────────────────────────────────────────────────────
+
+var vb_db_table: Vec<f64> = Vec::new();
+
+// floor1_inverse_dB_table: 256 values from 1.0649863e-07 to 1.0 in equal
+// ratios, e^((k - 255) * ln(1 / 1.0649863e-07) / 255); the spec lists the
+// same values rounded to float precision (1.1341951e-07, 1.2079015e-07,
+// ..., 0.9389798, 1.0)
+fn vb_db(i: i64) -> f64 {
+    if vb_db_table.len() == 0 {
+        var k: i64 = 0;
+        while k < 256 {
+            vb_db_table.push(math_exp(((k - 255) as f64) * 0.06296130868913505));
+            k = k + 1;
+        }
+    }
+    return vb_db_table.get(i);
+}
+
+fn vb_render_point(x0: i64, y0: i64, x1: i64, y1: i64, x: i64) -> i64 {
+    val dy: i64 = y1 - y0;
+    val adx: i64 = x1 - x0;
+    var ady: i64 = dy;
+    if ady < 0 { ady = - ady; }
+    val err: i64 = ady * (x - x0);
+    val off: i64 = err / adx;
+    if dy < 0 {
+        return y0 - off;
+    }
+    return y0 + off;
+}
+
+fn vb_render_line(x0: i64, y0: i64, x1: i64, y1: i64, v: &mut Vec<i64>, n: i64) {
+    val dy: i64 = y1 - y0;
+    val adx: i64 = x1 - x0;
+    var ady: i64 = dy;
+    if ady < 0 { ady = - ady; }
+    val base: i64 = dy / adx;
+    var sy: i64 = base + 1;
+    if dy < 0 {
+        sy = base - 1;
+    }
+    var abase: i64 = base;
+    if abase < 0 { abase = - abase; }
+    ady = ady - abase * adx;
+    var y: i64 = y0;
+    var err: i64 = 0;
+    if x0 < n {
+        v.set(x0, y);
+    }
+    var x: i64 = x0 + 1;
+    while x < x1 {
+        err = err + ady;
+        if err >= adx {
+            err = err - adx;
+            y = y + sy;
+        } else {
+            y = y + base;
+        }
+        if x < n {
+            v.set(x, y);
+        }
+        x = x + 1;
+    }
+}
+
+// ─── Floor 0 (LSP) ────────────────────────────────────────────────────────
+
+// arctan to double precision: atan(x) = pi/2 - atan(1/x) for x > 1, then
+// atan(x) = pi/6 + atan((x sqrt 3 - 1) / (x + sqrt 3)) above tan(pi/12),
+// then the odd power series (|t| <= 0.268: terms below 1e-16 by t^25).
+fn vb_atan(x: f64) -> f64 {
+    var neg: bool = x < 0.0;
+    var a: f64 = if neg { 0.0 - x } else { x };
+    var add: f64 = 0.0;
+    var flip: bool = false;
+    if a > 1.0 {
+        a = 1.0 / a;
+        flip = true;
+    }
+    if a > 0.2679491924311227 {
+        val r3: f64 = math_sqrt(3.0);
+        a = (a * r3 - 1.0) / (a + r3);
+        add = math_pi() / 6.0;
+    }
+    val t2: f64 = a * a;
+    var term: f64 = a;
+    var s: f64 = 0.0;
+    var k: i64 = 0;
+    while k < 13 {
+        val d: f64 = (2 * k + 1) as f64;
+        if (k & 1) == 0 { s = s + term / d; } else { s = s - term / d; }
+        term = term * t2;
+        k = k + 1;
+    }
+    var v: f64 = s + add;
+    if flip { v = math_pi() / 2.0 - v; }
+    if neg { return 0.0 - v; }
+    return v;
+}
+
+fn vb_bark(x: f64) -> f64 {
+    return 13.1 * vb_atan(0.00074 * x) + 2.24 * vb_atan(0.0000000185 * x * x) + 0.0001 * x;
+}
+
+/// The floor 0 bark map of a block of `n` (half the blocksize) values
+/// (Vorbis I spec 6.2.3): map[i] = min(bark_size - 1, floor(bark(rate i /
+/// 2n) * bark_size / bark(rate / 2))).
+pub fn vorbis_floor0_map(n: i64, rate: i64, bark_size: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    val scale: f64 = (bark_size as f64) / vb_bark(0.5 * (rate as f64));
+    var i: i64 = 0;
+    while i < n {
+        var v: i64 = math_floor(vb_bark((rate as f64) * (i as f64) / (2.0 * (n as f64))) * scale) as i64;
+        if v > bark_size - 1 { v = bark_size - 1; }
+        m.push(v);
+        i = i + 1;
+    }
+    return m;
+}
+
+/// The floor 0 curve (spec 6.2.3) over a bark map: for each run of equal
+/// map values, omega = pi map[i] / bark_size, w = cos(omega), and with the
+/// LSP coefficients c (angles),
+///   odd order:  p = (1 - w^2) prod_j 4 (cos c[2j+1] - w)^2,  q = 1/4 prod_j 4 (cos c[2j] - w)^2
+///   even order: p = (1 - w)/2 prod_j 4 (cos c[2j+1] - w)^2,  q = (1 + w)/2 prod_j 4 (cos c[2j] - w)^2
+/// and the value exp(0.11512925 (amplitude amp_offset / ((2^amp_bits - 1)
+/// sqrt(p + q)) - amp_offset)).
+pub fn vorbis_floor0_curve(map: &Vec<i64>, bark_size: i64, amp_bits: i64, amp_offset: i64, amplitude: i64, coefs: &Vec<f64>) -> Vec<f64> {
+    val order: i64 = coefs.len();
+    var cs: Vec<f64> = Vec::new();
+    var j: i64 = 0;
+    while j < order {
+        cs.push(math_cos(coefs.get(j)));
+        j = j + 1;
+    }
+    val amax: f64 = ((1 << amp_bits) - 1) as f64;
+    var out: Vec<f64> = Vec::new();
+    val n: i64 = map.len();
+    var i: i64 = 0;
+    while i < n {
+        val mi: i64 = map.get(i);
+        val w: f64 = math_cos(math_pi() * (mi as f64) / (bark_size as f64));
+        var p: f64 = 1.0;
+        var q: f64 = 1.0;
+        j = 0;
+        while j + 1 < order {
+            val dq: f64 = cs.get(j) - w;
+            val dp: f64 = cs.get(j + 1) - w;
+            q = q * 4.0 * dq * dq;
+            p = p * 4.0 * dp * dp;
+            j = j + 2;
+        }
+        if (order & 1) == 1 {
+            val dq: f64 = cs.get(order - 1) - w;
+            q = q * 4.0 * dq * dq * 0.25;
+            p = p * (1.0 - w * w);
+        } else {
+            q = q * (1.0 + w) * 0.5;
+            p = p * (1.0 - w) * 0.5;
+        }
+        val v: f64 = math_exp(0.11512925 * ((amplitude * amp_offset) as f64 / (amax * math_sqrt(p + q)) - (amp_offset as f64)));
+        // the same value for every line with this map entry
+        while i < n && map.get(i) == mi {
+            out.push(v);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// Decode a floor 0 packet part (spec 6.2.2) and compute its curve for a
+// block of `half` values; empty result: the channel is unused (amplitude
+// 0, a bad book number, or the packet ended).
+fn vb_floor0_decode(d: &VorbisDecoder, f: &VbFloor, r: &mut VbBits, half: i64) -> Vec<f64> {
+    val amplitude: i64 = vorbis_read(r, f.amp_bits);
+    if amplitude == 0 || r.eop {
+        return Vec::new();
+    }
+    val bn: i64 = vorbis_read(r, vorbis_ilog(f.f0_books.len()));
+    if bn >= f.f0_books.len() || r.eop {
+        return Vec::new();
+    }
+    val bk: VbBook = d.books.get(f.f0_books.get(bn));
+    if bk.vq.len() == 0 || bk.dims < 1 {
+        return Vec::new();
+    }
+    var coefs: Vec<f64> = Vec::new();
+    var last: f64 = 0.0;
+    while coefs.len() < f.order {
+        val e: i64 = vorbis_book_decode(&bk, r);
+        if e < 0 {
+            return Vec::new();
+        }
+        var k: i64 = 0;
+        while k < bk.dims {
+            coefs.push(bk.vq.get(e * bk.dims + k) + last);
+            k = k + 1;
+        }
+        last = coefs.get(coefs.len() - 1);
+    }
+    while coefs.len() > f.order {
+        coefs.pop();
+    }
+    val map: Vec<i64> = if half == d.bs0 / 2 { f.map0 } else { f.map1 };
+    return vorbis_floor0_curve(&map, f.bark_size, f.amp_bits, f.amp_offset, amplitude, &coefs);
+}
+
+// Decode a floor 1 packet part; empty result: the channel is unused.
+fn vb_floor_decode(d: &VorbisDecoder, f: &VbFloor, r: &mut VbBits) -> Vec<i64> {
+    var ys: Vec<i64> = Vec::new();
+    if vorbis_read(r, 1) == 0 {
+        return ys;
+    }
+    var range: i64 = 256;
+    if f.multiplier == 2 { range = 128; }
+    if f.multiplier == 3 { range = 86; }
+    if f.multiplier == 4 { range = 64; }
+    val rb: i64 = vorbis_ilog(range - 1);
+    ys.push(vorbis_read(r, rb));
+    ys.push(vorbis_read(r, rb));
+    var p: i64 = 0;
+    while p < f.partitions {
+        val cls: i64 = f.part_class.get(p);
+        val cdim: i64 = f.class_dims.get(cls);
+        val cbits: i64 = f.class_subs.get(cls);
+        val csub: i64 = (1 << cbits) - 1;
+        var cval: i64 = 0;
+        if cbits > 0 {
+            cval = vorbis_book_decode(&d.books.get(f.class_master.get(cls)), r);
+            if cval < 0 {
+                return Vec::new();
+            }
+        }
+        var j: i64 = 0;
+        while j < cdim {
+            val book: i64 = f.sub_books.get(cls * 8 + (cval & csub));
+            cval = cval >> cbits;
+            if book >= 0 {
+                val v: i64 = vorbis_book_decode(&d.books.get(book), r);
+                if v < 0 {
+                    return Vec::new();
+                }
+                ys.push(v);
+            } else {
+                ys.push(0);
+            }
+            j = j + 1;
+        }
+        p = p + 1;
+    }
+    return ys;
+}
+
+// The floor curve (n/2 values, already through the inverse-dB table).
+fn vb_floor_curve(f: &VbFloor, ys: &Vec<i64>, half: i64) -> Vec<f64> {
+    val nv: i64 = f.xlist.len();
+    var range: i64 = 256;
+    if f.multiplier == 2 { range = 128; }
+    if f.multiplier == 3 { range = 86; }
+    if f.multiplier == 4 { range = 64; }
+    var fy: Vec<i64> = Vec::new();
+    var step2: Vec<bool> = Vec::new();
+    fy.push(ys.get(0));
+    fy.push(ys.get(1));
+    step2.push(true);
+    step2.push(true);
+    var i: i64 = 2;
+    while i < nv {
+        val lo: i64 = f.low_n.get(i);
+        val hi: i64 = f.high_n.get(i);
+        val predicted: i64 = vb_render_point(f.xlist.get(lo), fy.get(lo), f.xlist.get(hi), fy.get(hi), f.xlist.get(i));
+        val val_: i64 = ys.get(i);
+        val highroom: i64 = range - predicted;
+        val lowroom: i64 = predicted;
+        var room: i64 = highroom;
+        if lowroom < room { room = lowroom; }
+        room = room * 2;
+        if val_ != 0 {
+            step2.set(lo, true);
+            step2.set(hi, true);
+            step2.push(true);
+            if val_ >= room {
+                if highroom > lowroom {
+                    fy.push(val_ - lowroom + predicted);
+                } else {
+                    fy.push(predicted - val_ + highroom - 1);
+                }
+            } else {
+                if (val_ & 1) == 1 {
+                    fy.push(predicted - (val_ + 1) / 2);
+                } else {
+                    fy.push(predicted + val_ / 2);
+                }
+            }
+        } else {
+            step2.push(false);
+            fy.push(predicted);
+        }
+        i = i + 1;
+    }
+    var line: Vec<i64> = Vec::new();
+    i = 0;
+    while i < half {
+        line.push(0);
+        i = i + 1;
+    }
+    var hx: i64 = 0;
+    var hy: i64 = 0;
+    var lx: i64 = 0;
+    var ly: i64 = fy.get(f.sorted.get(0)) * f.multiplier;
+    i = 1;
+    while i < nv {
+        val idx: i64 = f.sorted.get(i);
+        if step2.get(idx) {
+            hy = fy.get(idx) * f.multiplier;
+            hx = f.xlist.get(idx);
+            vb_render_line(lx, ly, hx, hy, &mut line, half);
+            lx = hx;
+            ly = hy;
+        }
+        i = i + 1;
+    }
+    if hx < half {
+        vb_render_line(hx, hy, half, hy, &mut line, half);
+    }
+    var out: Vec<f64> = Vec::new();
+    i = 0;
+    while i < half {
+        var y: i64 = line.get(i);
+        if y < 0 { y = 0; }
+        if y > 255 { y = 255; }
+        out.push(vb_db(y));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Add one VQ vector decoded with book `bk` into v at the given positions.
+fn vb_residue_partition(bk: &VbBook, r: &mut VbBits, v: &mut Vec<f64>, off: i64, psize: i64, rtype: i64) -> bool {
+    val dims: i64 = bk.dims;
+    if dims <= 0 || bk.vq.len() == 0 {
+        return false;
+    }
+    if rtype == 0 {
+        val step: i64 = psize / dims;
+        var i: i64 = 0;
+        while i < step {
+            val e: i64 = vorbis_book_decode(bk, r);
+            if e < 0 {
+                return false;
+            }
+            var j: i64 = 0;
+            while j < dims {
+                val at: i64 = off + i + j * step;
+                v.set(at, v.get(at) + bk.vq.get(e * dims + j));
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    var i: i64 = 0;
+    while i < psize {
+        val e: i64 = vorbis_book_decode(bk, r);
+        if e < 0 {
+            return false;
+        }
+        var j: i64 = 0;
+        while j < dims && i < psize {
+            v.set(off + i, v.get(off + i) + bk.vq.get(e * dims + j));
+            i = i + 1;
+            j = j + 1;
+        }
+    }
+    return true;
+}
+
+// Decode residue `rs` into `vecs` (one per channel of the submap, each
+// `size` long); `skip[j]`: channel j is not decoded.
+fn vb_residue_decode(d: &VorbisDecoder, rs: &VbResidue, r: &mut VbBits, vecs: &mut Vec<Vec<f64>>, skip: &Vec<bool>, size: i64) {
+    val nch: i64 = vecs.len();
+    if rs.rtype == 2 {
+        var any: bool = false;
+        var j: i64 = 0;
+        while j < nch {
+            if !skip.get(j) { any = true; }
+            j = j + 1;
+        }
+        if !any {
+            return;
+        }
+        var one: Vec<Vec<f64>> = Vec::new();
+        var flat: Vec<f64> = Vec::new();
+        var i: i64 = 0;
+        while i < size * nch {
+            flat.push(0.0);
+            i = i + 1;
+        }
+        one.push(flat);
+        var no_skip: Vec<bool> = Vec::new();
+        no_skip.push(false);
+        vb_residue_core(d, rs, r, &mut one, &no_skip, size * nch, 1);
+        val got: Vec<f64> = one.get(0);
+        j = 0;
+        while j < nch {
+            var ch: Vec<f64> = vecs.get(j);
+            i = 0;
+            while i < size {
+                ch.set(i, got.get(i * nch + j));
+                i = i + 1;
+            }
+            vecs.set(j, ch);
+            j = j + 1;
+        }
+        return;
+    }
+    vb_residue_core(d, rs, r, vecs, skip, size, rs.rtype);
+}
+
+fn vb_residue_core(d: &VorbisDecoder, rs: &VbResidue, r: &mut VbBits, vecs: &mut Vec<Vec<f64>>, skip: &Vec<bool>, size: i64, fmt: i64) {
+    val nch: i64 = vecs.len();
+    var begin: i64 = rs.begin;
+    var end: i64 = rs.end;
+    if begin > size { begin = size; }
+    if end > size { end = size; }
+    val nread: i64 = end - begin;
+    if nread <= 0 {
+        return;
+    }
+    val classbook: VbBook = d.books.get(rs.classbook);
+    val cpw: i64 = classbook.dims;
+    val nparts: i64 = nread / rs.psize;
+    // classifications[j][p]
+    var cls: Vec<Vec<i64>> = Vec::new();
+    var j: i64 = 0;
+    while j < nch {
+        var row: Vec<i64> = Vec::new();
+        var p: i64 = 0;
+        while p < nparts + cpw {
+            row.push(0);
+            p = p + 1;
+        }
+        cls.push(row);
+        j = j + 1;
+    }
+    var pass: i64 = 0;
+    while pass < 8 {
+        var pc: i64 = 0;
+        while pc < nparts {
+            if pass == 0 {
+                j = 0;
+                while j < nch {
+                    if !skip.get(j) {
+                        var temp: i64 = vorbis_book_decode(&classbook, r);
+                        if temp < 0 {
+                            return;
+                        }
+                        var row: Vec<i64> = cls.get(j);
+                        var i: i64 = cpw - 1;
+                        while i >= 0 {
+                            row.set(i + pc, temp % rs.nclass);
+                            temp = temp / rs.nclass;
+                            i = i - 1;
+                        }
+                        cls.set(j, row);
+                    }
+                    j = j + 1;
+                }
+            }
+            var i: i64 = 0;
+            while i < cpw && pc < nparts {
+                j = 0;
+                while j < nch {
+                    if !skip.get(j) {
+                        val vqclass: i64 = cls.get(j).get(pc);
+                        val book: i64 = rs.books.get(vqclass * 8 + pass);
+                        if book >= 0 {
+                            var v: Vec<f64> = vecs.get(j);
+                            val ok: bool = vb_residue_partition(&d.books.get(book), r, &mut v, begin + pc * rs.psize, rs.psize, fmt);
+                            vecs.set(j, v);
+                            if !ok {
+                                return;
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+                pc = pc + 1;
+                i = i + 1;
+            }
+        }
+        pass = pass + 1;
+    }
+}
+
+// ─── IMDCT ────────────────────────────────────────────────────────────────
+
+// In-place radix-2 complex FFT (forward, e^{-2 pi i jk / n}).
+fn vb_fft(re: &mut Vec<f64>, im: &mut Vec<f64>) {
+    val n: i64 = re.len();
+    var j: i64 = 0;
+    var i: i64 = 1;
+    while i < n {
+        var bit: i64 = n >> 1;
+        while (j & bit) != 0 {
+            j = j ^ bit;
+            bit = bit >> 1;
+        }
+        j = j | bit;
+        if i < j {
+            val tr: f64 = re.get(i);
+            re.set(i, re.get(j));
+            re.set(j, tr);
+            val ti: f64 = im.get(i);
+            im.set(i, im.get(j));
+            im.set(j, ti);
+        }
+        i = i + 1;
+    }
+    var len: i64 = 2;
+    while len <= n {
+        val ang: f64 = - 2.0 * math_pi() / (len as f64);
+        val wr: f64 = math_cos(ang);
+        val wi: f64 = math_sin(ang);
+        var s: i64 = 0;
+        while s < n {
+            var cr: f64 = 1.0;
+            var ci: f64 = 0.0;
+            var k: i64 = 0;
+            val h: i64 = len / 2;
+            while k < h {
+                val a: i64 = s + k;
+                val b: i64 = a + h;
+                val xr: f64 = re.get(b) * cr - im.get(b) * ci;
+                val xi: f64 = re.get(b) * ci + im.get(b) * cr;
+                re.set(b, re.get(a) - xr);
+                im.set(b, im.get(a) - xi);
+                re.set(a, re.get(a) + xr);
+                im.set(a, im.get(a) + xi);
+                val ncr: f64 = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+                k = k + 1;
+            }
+            s = s + len;
+        }
+        len = len * 2;
+    }
+}
+
+/// The inverse MDCT of the spec: n/2 coefficients `x` to n samples
+/// y[i] = sum_k x[k] cos(2 pi / n (i + 1/2 + n/4)(k + 1/2)).
+pub fn vorbis_imdct(x: &Vec<f64>) -> Vec<f64> {
+    val m: i64 = x.len();
+    val h: i64 = m / 2;
+    var re: Vec<f64> = Vec::new();
+    var im: Vec<f64> = Vec::new();
+    val pi: f64 = math_pi();
+    var k: i64 = 0;
+    while k < h {
+        val a: f64 = x.get(2 * k);
+        val b: f64 = x.get(m - 1 - 2 * k);
+        val ang: f64 = - pi * ((8 * k + 1) as f64) / ((8 * m) as f64);
+        val c: f64 = math_cos(ang);
+        val s: f64 = math_sin(ang);
+        re.push(a * c - b * s);
+        im.push(a * s + b * c);
+        k = k + 1;
+    }
+    vb_fft(&mut re, &mut im);
+    // DCT-IV u[0..m)
+    var u: Vec<f64> = Vec::new();
+    k = 0;
+    while k < m {
+        u.push(0.0);
+        k = k + 1;
+    }
+    var j: i64 = 0;
+    while j < h {
+        val ang: f64 = - pi * ((8 * j + 1) as f64) / ((8 * m) as f64);
+        val c: f64 = math_cos(ang);
+        val s: f64 = math_sin(ang);
+        val cr: f64 = re.get(j) * c - im.get(j) * s;
+        val ci: f64 = re.get(j) * s + im.get(j) * c;
+        u.set(2 * j, cr);
+        u.set(m - 1 - 2 * j, - ci);
+        j = j + 1;
+    }
+    var y: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 2 * m {
+        val q: i64 = i + h;
+        if q < m {
+            y.push(u.get(q));
+        } else if q < 2 * m {
+            y.push(- u.get(2 * m - 1 - q));
+        } else {
+            y.push(- u.get(q - 2 * m));
+        }
+        i = i + 1;
+    }
+    return y;
+}
+
+// The Vorbis window of a block of size n.
+fn vb_window(n: i64, long: bool, prev_long: bool, next_long: bool, bs0: i64) -> Vec<f64> {
+    var ls: i64 = 0;
+    var le: i64 = n / 2;
+    var ln: i64 = n / 2;
+    if long && !prev_long {
+        ls = n / 4 - bs0 / 4;
+        le = n / 4 + bs0 / 4;
+        ln = bs0 / 2;
+    }
+    var rs: i64 = n / 2;
+    var re: i64 = n;
+    var rn: i64 = n / 2;
+    if long && !next_long {
+        rs = n * 3 / 4 - bs0 / 4;
+        re = n * 3 / 4 + bs0 / 4;
+        rn = bs0 / 2;
+    }
+    val hp: f64 = math_pi() / 2.0;
+    var w: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        if i < ls {
+            w.push(0.0);
+        } else if i < le {
+            val s: f64 = math_sin(((i - ls) as f64 + 0.5) / (ln as f64) * hp);
+            w.push(math_sin(hp * s * s));
+        } else if i < rs {
+            w.push(1.0);
+        } else if i < re {
+            val s: f64 = math_sin(((i - rs) as f64 + 0.5) / (rn as f64) * hp + hp);
+            w.push(math_sin(hp * s * s));
+        } else {
+            w.push(0.0);
+        }
+        i = i + 1;
+    }
+    return w;
+}
+
+/// Decode one audio packet; the PCM it completes, one Vec per channel
+/// (empty for the first packet, which only fills the overlap). On an
+/// invalid packet the result is empty and nothing changes.
+pub fn vorbis_decode_packet(d: &mut VorbisDecoder, packet: Vec<i64>) -> Vec<Vec<f64>> {
+    var out: Vec<Vec<f64>> = Vec::new();
+    if d.headers < 3 || packet.len() == 0 {
+        return out;
+    }
+    var r: VbBits = vorbis_bits(packet);
+    if vorbis_read(&mut r, 1) != 0 {
+        return out;
+    }
+    val mode_n: i64 = vorbis_read(&mut r, vorbis_ilog(d.modes.len() - 1));
+    if mode_n >= d.modes.len() || r.eop {
+        return out;
+    }
+    val mode: VbMode = d.modes.get(mode_n);
+    val long: bool = mode.blockflag == 1;
+    var n: i64 = d.bs0;
+    var prev_long: bool = false;
+    var next_long: bool = false;
+    if long {
+        n = d.bs1;
+        prev_long = vorbis_read(&mut r, 1) == 1;
+        next_long = vorbis_read(&mut r, 1) == 1;
+    }
+    val half: i64 = n / 2;
+    val map: VbMapping = d.mappings.get(mode.mapping);
+    val nch: i64 = d.channels;
+    // floors
+    var floor_ys: Vec<Vec<i64>> = Vec::new();
+    var floor0_curves: Vec<Vec<f64>> = Vec::new();
+    var unused: Vec<bool> = Vec::new();
+    var c: i64 = 0;
+    while c < nch {
+        val sm: i64 = map.mux.get(c);
+        val fl: VbFloor = d.floors.get(map.sub_floor.get(sm));
+        if fl.ftype == 0 {
+            val cv: Vec<f64> = vb_floor0_decode(d, &fl, &mut r, half);
+            unused.push(cv.len() == 0);
+            floor0_curves.push(cv);
+            floor_ys.push(Vec::new());
+        } else {
+            val ys: Vec<i64> = vb_floor_decode(d, &fl, &mut r);
+            unused.push(ys.len() == 0);
+            floor_ys.push(ys);
+            floor0_curves.push(Vec::new());
+        }
+        c = c + 1;
+    }
+    // coupled channels are decoded when either one is used
+    var no_residue: Vec<bool> = Vec::new();
+    c = 0;
+    while c < nch {
+        no_residue.push(unused.get(c));
+        c = c + 1;
+    }
+    var s: i64 = 0;
+    while s < map.mag.len() {
+        val mg: i64 = map.mag.get(s);
+        val an: i64 = map.ang.get(s);
+        if !no_residue.get(mg) || !no_residue.get(an) {
+            no_residue.set(mg, false);
+            no_residue.set(an, false);
+        }
+        s = s + 1;
+    }
+    // residues, per submap
+    var spec: Vec<Vec<f64>> = Vec::new();
+    c = 0;
+    while c < nch {
+        var z: Vec<f64> = Vec::new();
+        var i: i64 = 0;
+        while i < half {
+            z.push(0.0);
+            i = i + 1;
+        }
+        spec.push(z);
+        c = c + 1;
+    }
+    var sm: i64 = 0;
+    while sm < map.submaps {
+        var vecs: Vec<Vec<f64>> = Vec::new();
+        var skip: Vec<bool> = Vec::new();
+        var chans: Vec<i64> = Vec::new();
+        c = 0;
+        while c < nch {
+            if map.mux.get(c) == sm {
+                vecs.push(spec.get(c));
+                skip.push(no_residue.get(c));
+                chans.push(c);
+            }
+            c = c + 1;
+        }
+        val rs: VbResidue = d.residues.get(map.sub_residue.get(sm));
+        vb_residue_decode(d, &rs, &mut r, &mut vecs, &skip, half);
+        var k: i64 = 0;
+        while k < chans.len() {
+            spec.set(chans.get(k), vecs.get(k));
+            k = k + 1;
+        }
+        sm = sm + 1;
+    }
+    // inverse coupling, last step first
+    s = map.mag.len() - 1;
+    while s >= 0 {
+        val mi: i64 = map.mag.get(s);
+        val ai: i64 = map.ang.get(s);
+        var mv: Vec<f64> = spec.get(mi);
+        var av: Vec<f64> = spec.get(ai);
+        var i: i64 = 0;
+        while i < half {
+            val m: f64 = mv.get(i);
+            val a: f64 = av.get(i);
+            if m > 0.0 {
+                if a > 0.0 {
+                    av.set(i, m - a);
+                } else {
+                    av.set(i, m);
+                    mv.set(i, m + a);
+                }
+            } else {
+                if a > 0.0 {
+                    av.set(i, m + a);
+                } else {
+                    av.set(i, m);
+                    mv.set(i, m - a);
+                }
+            }
+            i = i + 1;
+        }
+        spec.set(mi, mv);
+        spec.set(ai, av);
+        s = s - 1;
+    }
+    // floor curves, IMDCT, window
+    val win: Vec<f64> = vb_window(n, long, prev_long, next_long, d.bs0);
+    var cur: Vec<Vec<f64>> = Vec::new();
+    c = 0;
+    while c < nch {
+        var block: Vec<f64> = Vec::new();
+        if unused.get(c) {
+            var i: i64 = 0;
+            while i < n {
+                block.push(0.0);
+                i = i + 1;
+            }
+        } else {
+            val fl: VbFloor = d.floors.get(map.sub_floor.get(map.mux.get(c)));
+            val curve: Vec<f64> = if fl.ftype == 0 { floor0_curves.get(c) } else { vb_floor_curve(&fl, &floor_ys.get(c), half) };
+            var x: Vec<f64> = spec.get(c);
+            var i: i64 = 0;
+            while i < half {
+                x.set(i, x.get(i) * curve.get(i));
+                i = i + 1;
+            }
+            block = vorbis_imdct(&x);
+            i = 0;
+            while i < n {
+                block.set(i, block.get(i) * win.get(i));
+                i = i + 1;
+            }
+        }
+        cur.push(block);
+        c = c + 1;
+    }
+    // overlap-add with the previous block: from its centre to ours
+    if d.prev_n > 0 {
+        val pn: i64 = d.prev_n;
+        val count: i64 = pn / 4 + n / 4;
+        c = 0;
+        while c < nch {
+            val pv: Vec<f64> = d.prev.get(c);
+            val cv: Vec<f64> = cur.get(c);
+            var o: Vec<f64> = Vec::new();
+            var i: i64 = 0;
+            while i < count {
+                var v: f64 = 0.0;
+                val pi_: i64 = pn / 2 + i;
+                if pi_ < pn {
+                    v = v + pv.get(pi_);
+                }
+                val ci: i64 = i - pn / 4 + n / 4;
+                if ci >= 0 && ci < n {
+                    v = v + cv.get(ci);
+                }
+                o.push(v);
+                i = i + 1;
+            }
+            out.push(o);
+            c = c + 1;
+        }
+    }
+    d.prev = cur;
+    d.prev_n = n;
+    d.prev_long = long;
+    return out;
+}
+
+// ─── Whole files ──────────────────────────────────────────────────────────
+
+pub struct VorbisFile {
+    pub ok: bool,
+    pub error: str,
+    pub channels: i64,
+    pub rate: i64,
+    pub vendor: str,
+    pub comments: Vec<str>,
+    pub packets: i64,
+    // audio packets decoded
+    pub pcm: Vec<Vec<f64>>,  // per channel
+}
+
+/// Decode an Ogg Vorbis file. PCM is trimmed to the last page's granule
+/// position (the stream's length in samples) when that is shorter.
+pub fn vorbis_decode_file(b: &Vec<i64>) -> VorbisFile {
+    var vf = VorbisFile { ok: false, error: "", channels: 0, rate: 0, vendor: "", comments: Vec::new(), packets: 0, pcm: Vec::new() };
+    val st: OggStream = ogg_read(b);
+    if !st.ok {
+        vf.error = st.error;
+        return vf;
+    }
+    if st.packets.len() < 3 {
+        vf.error = "fewer than three Vorbis headers";
+        return vf;
+    }
+    var d: VorbisDecoder = vorbis_decoder();
+    var i: i64 = 0;
+    while i < 3 {
+        if !vorbis_header(&mut d, st.packets.get(i)) {
+            vf.error = d.error;
+            return vf;
+        }
+        i = i + 1;
+    }
+    vf.channels = d.channels;
+    vf.rate = d.rate;
+    vf.vendor = d.vendor;
+    vf.comments = d.comments;
+    var c: i64 = 0;
+    while c < d.channels {
+        vf.pcm.push(Vec::new());
+        c = c + 1;
+    }
+    i = 3;
+    while i < st.packets.len() {
+        val got: Vec<Vec<f64>> = vorbis_decode_packet(&mut d, st.packets.get(i));
+        vf.packets = vf.packets + 1;
+        c = 0;
+        while c < got.len() {
+            var all: Vec<f64> = vf.pcm.get(c);
+            val part: Vec<f64> = got.get(c);
+            var k: i64 = 0;
+            while k < part.len() {
+                all.push(part.get(k));
+                k = k + 1;
+            }
+            vf.pcm.set(c, all);
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    if st.last_granule >= 0 {
+        c = 0;
+        while c < vf.pcm.len() {
+            var all: Vec<f64> = vf.pcm.get(c);
+            while all.len() > st.last_granule {
+                all.pop();
+            }
+            vf.pcm.set(c, all);
+            c = c + 1;
+        }
+    }
+    vf.ok = true;
+    return vf;
+}

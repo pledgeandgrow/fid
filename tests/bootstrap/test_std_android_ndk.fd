@@ -1,0 +1,211 @@
+// stdlib/android_ndk: header constants and struct offsets, motion action
+// decoding, the multi-touch tracker, the glue state machine and the event
+// loop driven by a scripted seam (the NDK calls themselves need a device),
+// logcat lines and chunking, and window-buffer pixel packing.
+// Expected output:
+// callbacks 16 onResume@8 onInputQueueCreated@88 onLowMemory@120
+// callback cmds 6 7 1 0 12
+// action 5 index 2 raw 517
+// source touch true mouse-is-touch false
+// pixel rgba ff336699 rgbx ff336699 565 34d3
+// fill 4 of 12 row1 0 7 7 0
+// pointers after down 1 [0]
+// pointers after pointer-down 2 [0 5]
+// pointers after move 2 x5=310
+// pointers after pointer-up 1 [5]
+// pointers after up 0 downs 2 ups 2
+// loop polls 14 frames 5 destroyed true
+// timeouts -1 -1 -1 -1 0 0 0 -1 0 0 -1 -1 -1 -1
+// cmds START RESUME INIT_WINDOW GAINED_FOCUS PAUSE RESUME LOST_FOCUS TERM_WINDOW SAVE_STATE STOP DESTROY
+// size 1080x1920 back 1 saves 1
+// draw 1 1080x1920 draw 5 1080x1920
+// log I/game: started
+// chunks 3 4061 4061 80
+// chunk at newline 2 3000
+use android_ndk;
+use vec;
+use string;
+
+fn hex(x: i64) -> str { return int_to_hex(x); }
+
+// ─── A scripted looper ─────────────────────────────────────────────────
+
+var sc_ident: Vec<i64> = Vec::new();
+var sc_cmd: Vec<i64> = Vec::new();
+var sc_pos: i64 = 0;
+var sc_timeouts: Vec<i64> = Vec::new();
+var sc_inputs: Vec<NdkInput> = Vec::new();
+var sc_in_pos: i64 = 0;
+var sc_draws: Vec<str> = Vec::new();
+var sc_trace: Vec<str> = Vec::new();
+var sc_tracker: NdkPointers = ndk_pointers_new();
+
+fn step(ident: i64, cmd: i64) { sc_ident.push(ident); sc_cmd.push(cmd); }
+
+fn s_poll(timeout: i64) -> i64 {
+    sc_timeouts.push(timeout);
+    if sc_pos >= sc_ident.len() { return ALOOPER_POLL_TIMEOUT; }
+    val id: i64 = sc_ident.get(sc_pos);
+    return id;
+}
+
+fn s_cmd() -> i64 {
+    val c: i64 = sc_cmd.get(sc_pos);
+    sc_pos = sc_pos + 1;
+    return c;
+}
+
+fn s_w() -> i64 { return 1080; }
+fn s_h() -> i64 { return 1920; }
+
+fn s_input(out: &mut NdkInput) {
+    // one batch per INPUT poll: events up to the next kind-0 separator
+    if sc_in_pos >= sc_inputs.len() { return; }
+    val e: NdkInput = sc_inputs.get(sc_in_pos);
+    sc_in_pos = sc_in_pos + 1;
+    if e.kind == 0 { sc_pos = sc_pos + 1; }
+    out.kind = e.kind;
+    out.source = e.source;
+    out.action = e.action;
+    out.key_code = e.key_code;
+    out.meta = e.meta;
+    var i: i64 = 0;
+    while i < e.ids.len() {
+        out.ids.push(e.ids.get(i));
+        out.xs.push(e.xs.get(i));
+        out.ys.push(e.ys.get(i));
+        i = i + 1;
+    }
+}
+
+fn s_draw(frame: i64, w: i64, h: i64) {
+    sc_draws.push("draw " + int_to_str(frame) + " " + int_to_str(w) + "x" + int_to_str(h));
+}
+
+fn motion(action: i64, ids: Vec<i64>, xs: Vec<f64>) -> NdkInput {
+    var e: NdkInput = ndk_no_input();
+    e.kind = AINPUT_EVENT_TYPE_MOTION;
+    e.source = AINPUT_SOURCE_TOUCHSCREEN;
+    e.action = action;
+    e.ids = ids;
+    e.xs = xs;
+    var ys: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < xs.len() { ys.push(xs.get(i) * 2.0); i = i + 1; }
+    e.ys = ys;
+    return e;
+}
+
+fn ids_str(p: &NdkPointers) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < p.ids.len() {
+        if i > 0 { s = s + " "; }
+        s = s + int_to_str(p.ids.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+fn v1(a: i64) -> Vec<i64> { var v: Vec<i64> = Vec::new(); v.push(a); return v; }
+fn v2(a: i64, b: i64) -> Vec<i64> { var v: Vec<i64> = v1(a); v.push(b); return v; }
+fn f1(a: f64) -> Vec<f64> { var v: Vec<f64> = Vec::new(); v.push(a); return v; }
+fn f2(a: f64, b: f64) -> Vec<f64> { var v: Vec<f64> = f1(a); v.push(b); return v; }
+
+fn feed(e: NdkInput, label: str) {
+    ndk_pointers_update(&mut sc_tracker, &e);
+    var extra: str = ids_str(&sc_tracker);
+    if label == "move" {
+        extra = "x5=" + int_to_str(sc_tracker.xs.get(1) as i64);
+    }
+    if label == "up" {
+        extra = "downs " + int_to_str(sc_tracker.downs) + " ups " + int_to_str(sc_tracker.ups);
+    }
+    println("pointers after " + label + " " + int_to_str(sc_tracker.ids.len()) + " " + extra);
+    sc_inputs.push(e);
+}
+
+fn main() {
+    val cb: Vec<str> = ndk_callback_names();
+    println("callbacks " + int_to_str(cb.len()) + " onResume@" + int_to_str(ndk_callback_offset("onResume"))
+        + " onInputQueueCreated@" + int_to_str(ndk_callback_offset("onInputQueueCreated"))
+        + " onLowMemory@" + int_to_str(ndk_callback_offset("onLowMemory")));
+    println("callback cmds " + int_to_str(ndk_callback_cmd("onWindowFocusChanged", 1)) + " "
+        + int_to_str(ndk_callback_cmd("onWindowFocusChanged", 0)) + " "
+        + int_to_str(ndk_callback_cmd("onNativeWindowCreated", 0)) + " "
+        + int_to_str(ndk_callback_cmd("onInputQueueDestroyed", 0)) + " "
+        + int_to_str(ndk_callback_cmd("onSaveInstanceState", 0)));
+    val raw: i64 = ndk_motion_make_action(AMOTION_EVENT_ACTION_POINTER_DOWN, 2);
+    println("action " + int_to_str(ndk_motion_action(raw)) + " index " + int_to_str(ndk_motion_pointer_index(raw)) + " raw " + int_to_str(raw));
+    println("source touch " + bool_to_str(ndk_source_is(AINPUT_SOURCE_TOUCHSCREEN, AINPUT_SOURCE_TOUCHSCREEN))
+        + " mouse-is-touch " + bool_to_str(ndk_source_is(AINPUT_SOURCE_MOUSE, AINPUT_SOURCE_TOUCHSCREEN)));
+    println("pixel rgba " + hex(ndk_pack_pixel(WINDOW_FORMAT_RGBA_8888, 0x99, 0x66, 0x33, 255))
+        + " rgbx " + hex(ndk_pack_pixel(WINDOW_FORMAT_RGBX_8888, 0x99, 0x66, 0x33, 0))
+        + " 565 " + hex(ndk_pack_pixel(WINDOW_FORMAT_RGB_565, 0x33, 0x99, 0x99, 0)));
+    var px: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 12 { px.push(0); i = i + 1; }
+    // 3x3 visible inside a stride-4 buffer of 3 rows; the rect overhangs
+    ndk_fill_rect(&mut px, 3, 3, 4, 1, 1, 5, 5, 7);
+    var filled: i64 = 0;
+    i = 0;
+    while i < 12 { if px.get(i) == 7 { filled = filled + 1; } i = i + 1; }
+    println("fill " + int_to_str(filled) + " of 12 row1 " + int_to_str(px.get(4)) + " " + int_to_str(px.get(5)) + " "
+        + int_to_str(px.get(6)) + " " + int_to_str(px.get(7)));
+
+    // the input batch (checked through a tracker as it is scripted)
+    feed(motion(AMOTION_EVENT_ACTION_DOWN, v1(0), f1(10.0)), "down");
+    feed(motion(ndk_motion_make_action(AMOTION_EVENT_ACTION_POINTER_DOWN, 1), v2(0, 5), f2(10.0, 300.0)), "pointer-down");
+    feed(motion(AMOTION_EVENT_ACTION_MOVE, v2(0, 5), f2(12.0, 310.0)), "move");
+    feed(motion(ndk_motion_make_action(AMOTION_EVENT_ACTION_POINTER_UP, 0), v2(0, 5), f2(12.0, 310.0)), "pointer-up");
+    feed(motion(AMOTION_EVENT_ACTION_UP, v1(5), f1(311.0)), "up");
+    sc_inputs.push(ndk_key_input(AKEY_EVENT_ACTION_DOWN, AKEYCODE_BACK, 0));
+    sc_inputs.push(ndk_key_input(AKEY_EVENT_ACTION_UP, AKEYCODE_BACK, 0));
+    sc_inputs.push(ndk_no_input());
+
+    step(LOOPER_ID_MAIN, APP_CMD_START);
+    step(LOOPER_ID_MAIN, APP_CMD_RESUME);
+    step(LOOPER_ID_MAIN, APP_CMD_INIT_WINDOW);
+    step(LOOPER_ID_MAIN, APP_CMD_GAINED_FOCUS);   // animating from here
+    step(ALOOPER_POLL_TIMEOUT, 0);
+    step(LOOPER_ID_INPUT, 0);
+    step(LOOPER_ID_MAIN, APP_CMD_PAUSE);
+    step(LOOPER_ID_MAIN, APP_CMD_RESUME);
+    step(ALOOPER_POLL_TIMEOUT, 0);
+    step(LOOPER_ID_MAIN, APP_CMD_LOST_FOCUS);
+    step(LOOPER_ID_MAIN, APP_CMD_TERM_WINDOW);
+    step(LOOPER_ID_MAIN, APP_CMD_SAVE_STATE);
+    step(LOOPER_ID_MAIN, APP_CMD_STOP);
+    step(LOOPER_ID_MAIN, APP_CMD_DESTROY);
+    // a TIMEOUT step does not read a command: skip it in s_poll's index
+    var app: NdkApp = ndk_app_new();
+    val seam: NdkLoopSeam = NdkLoopSeam { poll: s_poll2, read_cmd: s_cmd, window_w: s_w, window_h: s_h, read_input: s_input, draw: s_draw };
+    val polls: i64 = ndk_run_loop(&mut app, seam, 100);
+    println("loop polls " + int_to_str(polls) + " frames " + int_to_str(app.frames) + " destroyed " + bool_to_str(app.destroy_requested));
+    var t: str = "timeouts";
+    i = 0;
+    while i < sc_timeouts.len() { t = t + " " + int_to_str(sc_timeouts.get(i)); i = i + 1; }
+    println(t);
+    var c: str = "cmds";
+    i = 0;
+    while i < app.log.len() { c = c + " " + app.log.get(i); i = i + 1; }
+    println(c);
+    println("size " + int_to_str(app.width) + "x" + int_to_str(app.height) + " back " + int_to_str(app.back_pressed)
+        + " saves " + int_to_str(app.state_saves));
+    println(sc_draws.get(0) + " " + sc_draws.get(sc_draws.len() - 1));
+    println("log " + ndk_log_line(ANDROID_LOG_INFO, "game", "started"));
+    val big: str = str_repeat("x", 4061 * 2 + 80);
+    val ch: Vec<str> = ndk_log_chunks("abcd", big);
+    println("chunks " + int_to_str(ch.len()) + " " + int_to_str(str_len(ch.get(0))) + " " + int_to_str(str_len(ch.get(1)))
+        + " " + int_to_str(str_len(ch.get(2))));
+    val nl: str = str_repeat("y", 2999) + "\n" + str_repeat("z", 3000);
+    val ch2: Vec<str> = ndk_log_chunks("abcd", nl);
+    println("chunk at newline " + int_to_str(ch2.len()) + " " + int_to_str(str_len(ch2.get(0))));
+}
+
+// Poll: a TIMEOUT step is consumed here (no command or input follows it).
+fn s_poll2(timeout: i64) -> i64 {
+    val id: i64 = s_poll(timeout);
+    if id == ALOOPER_POLL_TIMEOUT && sc_pos < sc_ident.len() { sc_pos = sc_pos + 1; }
+    return id;
+}

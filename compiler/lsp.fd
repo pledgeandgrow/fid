@@ -8,14 +8,21 @@
 //   - textDocument/hover
 //   - textDocument/definition
 //   - textDocument/rename
+//   - textDocument/references, formatting, signatureHelp
+//   - textDocument/inlayHint (parameter names, also of methods and imported
+//     functions; the type of a local declared without one), codeAction
+//     (quick fixes)
+//   - rename/references: a local in its scope only; a top-level name also
+//     in the other files that declare or import it (TL4)
+//
+// The suggested-fix engine (fix_suggestions, fix_apply) is shared with
+// `fid fix` (compiler/main.fd cmd_fix).
 //
 // Ported from src/lsp.rs (996 lines Rust -> ~700 lines Fides).
 // Uses compiler/json.fd for JSON parsing/serialization.
 // Uses compiler/compiler.fd for diagnostics and program building.
 
-module compiler::lsp;
- use core; use vec; use string; use compiler::ast; use compiler::json; use compiler::compiler; use compiler::comptime_eval; use compiler::fmt;
-// --- Document tracking --------------------------------------------------
+module compiler::lsp; use core; use vec; use string; use compiler::ast; use compiler::json; use compiler::compiler; use compiler::comptime_eval; use compiler::fmt; use compiler::build_info;  // --- Document tracking --------------------------------------------------
 
 pub struct DocEntry {
     pub uri: str,
@@ -33,6 +40,9 @@ pub fn DocEntry_new(uri: str, text: str) -> DocEntry {
 /// Run the LSP server over stdio. Returns exit code.
 pub fn lsp_run() -> i64 {
     var documents: Vec<DocEntry> = Vec::new();
+    // CB2: imported modules unchanged since the last check are not lexed
+    // or parsed again (compiler.fd modcache_get)
+    modcache_enable();
 
     // Main message loop
     loop {
@@ -148,7 +158,7 @@ pub fn lsp_run() -> i64 {
                     var character: i64 = json_get_int(json_get(params, "position"), "character");
                     var new_name: str = json_get_str(params, "newName");
                     var text: str = doc_get(documents, uri);
-                    var result: Json = handle_rename(text, uri, line, character, new_name);
+                    var result: Json = handle_rename(text, uri, line, character, new_name, documents);
                     send_response(id, result);
                 } else if method == "textDocument/references" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
@@ -156,7 +166,7 @@ pub fn lsp_run() -> i64 {
                     var character: i64 = json_get_int(json_get(params, "position"), "character");
                     var include_decl: bool = json_get_bool(json_get(params, "context"), "includeDeclaration", true);
                     var text: str = doc_get(documents, uri);
-                    var result: Json = handle_references(text, uri, line, character, include_decl);
+                    var result: Json = handle_references(text, uri, line, character, include_decl, documents);
                     send_response(id, result);
                 } else if method == "textDocument/formatting" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
@@ -170,6 +180,22 @@ pub fn lsp_run() -> i64 {
                     var text: str = doc_get(documents, uri);
                     var result: Json = handle_signature_help(text, line, character);
                     send_response(id, result);
+                } else if method == "textDocument/inlayHint" {
+                    // TL4: parameter names at the arguments of calls
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var range: Json = json_get(params, "range");
+                    var first_line: i64 = json_get_int(json_get(range, "start"), "line");
+                    var last_line: i64 = json_get_int(json_get(range, "end"), "line");
+                    var text: str = doc_get(documents, uri);
+                    send_response(id, handle_inlay_hints(text, uri, first_line, last_line));
+                } else if method == "textDocument/codeAction" {
+                    // TL4: the suggested fixes of the diagnostics in range
+                    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+                    var range: Json = json_get(params, "range");
+                    var first_line: i64 = json_get_int(json_get(range, "start"), "line");
+                    var last_line: i64 = json_get_int(json_get(range, "end"), "line");
+                    var text: str = doc_get(documents, uri);
+                    send_response(id, handle_code_action(text, uri, first_line, last_line));
                 } else {
                     // Unknown method -- if it has an id, return error
                     match id {
@@ -324,10 +350,17 @@ fn handle_initialize(id: Json) -> void {
     sig_triggers.push(Json::Str(","));
     sig_provider.insert("triggerCharacters", Json::Arr(sig_triggers));
     caps.insert("signatureHelpProvider", Json::Obj(sig_provider));
+    // TL4: inlay hints (parameter names) and quick fixes
+    caps.insert("inlayHintProvider", Json::Bool(true));
+    var ca_provider: JsonObject = JsonObject::new();
+    var ca_kinds: Vec<Json> = Vec::new();
+    ca_kinds.push(Json::Str("quickfix"));
+    ca_provider.insert("codeActionKinds", Json::Arr(ca_kinds));
+    caps.insert("codeActionProvider", Json::Obj(ca_provider));
 
     var server_info: JsonObject = JsonObject::new();
     server_info.insert("name", Json::Str("fides-lsp"));
-    server_info.insert("version", Json::Str("0.1.0"));
+    server_info.insert("version", Json::Str(fid_version()));
 
     var result: JsonObject = JsonObject::new();
     result.insert("capabilities", Json::Obj(caps));
@@ -970,10 +1003,25 @@ fn handle_definition(text: str, uri: str, line: i64, character: i64) -> Json {
 }
 
 /// Handle textDocument/rename.
-fn handle_rename(text: str, uri: str, line: i64, character: i64, new_name: str) -> Json {
+fn handle_rename(text: str, uri: str, line: i64, character: i64, new_name: str, documents: Vec<DocEntry>) -> Json {
     var word: str = word_at_position(text, line, character);
     if str_len(word) == 0 {
         return Json::Null;
+    }
+    // TL4: a local is renamed in its scope only
+    if lsp_is_local_at(text, word, line, character) {
+        var locc: Vec<I64Triple> = lsp_local_occ(text, word, line, character, true);
+        var ledits: Vec<Json> = Vec::new();
+        var li: i64 = 0;
+        while li < locc.len() {
+            ledits.push(lsp_occ_edit(locc.get(li), new_name));
+            li = li + 1;
+        }
+        var lchanges: JsonObject = JsonObject::new();
+        lchanges.insert(uri, Json::Arr(ledits));
+        var lres: JsonObject = JsonObject::new();
+        lres.insert("changes", Json::Obj(lchanges));
+        return Json::Obj(lres);
     }
 
     var result: ResultProgram = build_program_with_path(text, OptStr::None);
@@ -1052,13 +1100,27 @@ fn handle_rename(text: str, uri: str, line: i64, character: i64, new_name: str) 
         i = i + 1;
     }
 
-    if !is_known {
+    // TL4: the files where the symbol is the same one (its declaring file,
+    // and those that `use` it)
+    var related: Vec<DocEntry> = lsp_related_files(documents, uri, text, word);
+    if !is_known && related.len() == 0 {
         return Json::Null;
     }
+    // a method (`fn m` in an impl) is called as `.m(`; anything else is
+    // not the symbol after a `.`
+    var skip_dot: bool = lsp_declares(text, word) != 2;
+    var ri: i64 = 0;
+    while ri < related.len() {
+        if lsp_declares(related.get(ri).text, word) == 2 {
+            skip_dot = false;
+        }
+        ri = ri + 1;
+    }
 
-    // Find all occurrences
-    var edits: Vec<I64Triple> = find_all_occurrences(text, word);
-    if edits.len() == 0 {
+    // Find all occurrences in code (not in strings or comments)
+    var tlines: Vec<str> = split_lines(text);
+    var edits: Vec<I64Triple> = lsp_drop_locals(text, word, lsp_code_occ(tlines, word, 0, tlines.len() - 1, - 1, tlines.len(), skip_dot, false));
+    if edits.len() == 0 && related.len() == 0 {
         return Json::Null;
     }
 
@@ -1085,6 +1147,23 @@ fn handle_rename(text: str, uri: str, line: i64, character: i64, new_name: str) 
 
     var changes: JsonObject = JsonObject::new();
     changes.insert(uri, Json::Arr(edit_objects));
+    // the same symbol in the other files
+    ri = 0;
+    while ri < related.len() {
+        var rd: DocEntry = related.get(ri);
+        var rlines: Vec<str> = split_lines(rd.text);
+        var rocc: Vec<I64Triple> = lsp_drop_locals(rd.text, word, lsp_code_occ(rlines, word, 0, rlines.len() - 1, - 1, rlines.len(), skip_dot, false));
+        if rocc.len() > 0 {
+            var redits: Vec<Json> = Vec::new();
+            var rj: i64 = 0;
+            while rj < rocc.len() {
+                redits.push(lsp_occ_edit(rocc.get(rj), new_name));
+                rj = rj + 1;
+            }
+            changes.insert(rd.uri, Json::Arr(redits));
+        }
+        ri = ri + 1;
+    }
     var result_obj: JsonObject = JsonObject::new();
     result_obj.insert("changes", Json::Obj(changes));
     return Json::Obj(result_obj);
@@ -1286,13 +1365,50 @@ fn params_to_str(params: Vec<Param>) -> str {
 
 /// Handle textDocument/references — every whole-word occurrence of the
 /// symbol at position as an LSP Location (same document).
-fn handle_references(text: str, uri: str, line: i64, character: i64, include_decl: bool) -> Json {
+fn handle_references(text: str, uri: str, line: i64, character: i64, include_decl: bool, documents: Vec<DocEntry>) -> Json {
     var word: str = word_at_position(text, line, character);
     var locs: Vec<Json> = Vec::new();
     if str_len(word) == 0 {
         return Json::Arr(locs);
     }
-    var occ: Vec<I64Triple> = find_all_occurrences(text, word);
+    // TL4: a local: its scope only
+    if lsp_is_local_at(text, word, line, character) {
+        var locc: Vec<I64Triple> = lsp_local_occ(text, word, line, character, include_decl);
+        var li: i64 = 0;
+        while li < locc.len() {
+            locs.push(location_json(uri, locc.get(li).a, locc.get(li).b, word));
+            li = li + 1;
+        }
+        return Json::Arr(locs);
+    }
+    // TL4: a top-level symbol: also in the files that declare or import it
+    var related: Vec<DocEntry> = lsp_related_files(documents, uri, text, word);
+    var skip_dot: bool = lsp_declares(text, word) != 2;
+    var ri: i64 = 0;
+    while ri < related.len() {
+        if lsp_declares(related.get(ri).text, word) == 2 {
+            skip_dot = false;
+        }
+        ri = ri + 1;
+    }
+    ri = 0;
+    while ri < related.len() {
+        var rd: DocEntry = related.get(ri);
+        var rlines: Vec<str> = split_lines(rd.text);
+        var rocc: Vec<I64Triple> = lsp_drop_locals(rd.text, word, lsp_code_occ(rlines, word, 0, rlines.len() - 1, - 1, rlines.len(), skip_dot, false));
+        var rj: i64 = 0;
+        while rj < rocc.len() {
+            var rt: I64Triple = rocc.get(rj);
+            var before_r: str = str_trim_end(str_slice(rlines.get(rt.a), 0, rt.b));
+            var is_decl: bool = str_ends_with(before_r, "fn") || str_ends_with(before_r, "struct") || str_ends_with(before_r, "enum") || str_ends_with(before_r, "const") || str_ends_with(before_r, "type") || str_ends_with(before_r, "trait");
+            if include_decl || !is_decl {
+                locs.push(location_json(rd.uri, rt.a, rt.b, word));
+            }
+            rj = rj + 1;
+        }
+        ri = ri + 1;
+    }
+    var occ: Vec<I64Triple> = lsp_drop_locals(text, word, find_all_occurrences(text, word));
     var lines: Vec<str> = split_lines(text);
     var i: i64 = 0;
     while i < occ.len() {
@@ -1486,4 +1602,2975 @@ fn handle_signature_help(text: str, line: i64, character: i64) -> Json {
     sh.insert("activeSignature", Json::Num(0.0));
     sh.insert("activeParameter", Json::Num(active as f64));
     return Json::Obj(sh);
+}
+
+// --- TL3 / TL4: suggested fixes ------------------------------------------
+// A diagnostic whose fix is mechanical gets a SrcFix: replace `size` bytes at
+// byte offset `off` of the source with `text`. `fid fix` (main.fd cmd_fix)
+// applies them one at a time and keeps a fix only when it helps (fewer
+// errors, or none left on the fixed line); the editor offers them as quick
+// fixes (codeAction).
+//   cannot assign to 'x': it is declared with `val`   val x -> var x
+//   a T may not fit in U (Fix: convert it with `as U`) rhs -> (rhs) as U
+//   undefined variable/function 'x' (Fix: did you mean 'y'?)  x -> y
+//   unused import: 'm' (fid lint)                      `use m;` removed
+//   'old' is deprecated: use `new` instead (fid lint)  old(...) -> new(...)
+
+pub struct SrcFix {
+    pub off: i64,
+    pub size: i64,
+    pub text: str,
+    pub title: str,
+    pub line: i64,
+}
+
+pub fn SrcFix_new(off: i64, size: i64, text: str, title: str, line: i64) -> SrcFix {
+    return SrcFix {
+        off: off, size: size, text: text, title: title, line: line
+    };
+}
+
+/// The byte offset where each line of `lines` (split on "\n") starts.
+fn fix_line_starts(lines: Vec<str>) -> Vec<i64> {
+    var starts: Vec<i64> = Vec::new();
+    var off: i64 = 0;
+    var i: i64 = 0;
+    while i < lines.len() {
+        starts.push(off);
+        off = off + str_len(lines.get(i)) + 1;
+        i = i + 1;
+    }
+    return starts;
+}
+
+/// The 1-based line a diagnostic names: "(line N)" or "line N: ", else 0.
+fn fix_line_of(err: str) -> i64 {
+    var at: i64 = str_find(err, "(line ");
+    var skip: i64 = 6;
+    if at < 0 {
+        at = str_find(err, "line ");
+        skip = 5;
+    }
+    if at < 0 {
+        return 0;
+    }
+    var k: i64 = at + skip;
+    var v: i64 = 0;
+    var digits: i64 = 0;
+    while k < str_len(err) && str_byte_at(err, k) >= 48 && str_byte_at(err, k) <= 57 {
+        v = v * 10 + (str_byte_at(err, k) - 48);
+        digits = digits + 1;
+        k = k + 1;
+    }
+    if digits == 0 {
+        return 0;
+    }
+    return v;
+}
+
+/// The text after `marker` up to the next `close`, or "".
+fn fix_between(err: str, marker: str, close: str) -> str {
+    var at: i64 = str_find(err, marker);
+    if at < 0 {
+        return "";
+    }
+    var rest: str = str_slice(err, at + str_len(marker), str_len(err));
+    var end: i64 = str_find(rest, close);
+    if end <= 0 {
+        return "";
+    }
+    return str_slice(rest, 0, end);
+}
+
+/// The column of the first whole-word `name` in `line` that is not a field
+/// or method (no `.` before it), or -1.
+fn fix_word_col(line: str, name: str) -> i64 {
+    var nlen: i64 = str_len(name);
+    var llen: i64 = str_len(line);
+    var i: i64 = 0;
+    while i + nlen <= llen {
+        if str_slice(line, i, i + nlen) == name {
+            var ok: bool = true;
+            if i > 0 {
+                var b: i64 = str_byte_at(line, i - 1);
+                if is_ident_char(b) || b == 46 {
+                    ok = false;
+                }
+            }
+            if i + nlen < llen && is_ident_char(str_byte_at(line, i + nlen)) {
+                ok = false;
+            }
+            if ok {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Is `s` one name or a field path (`a`, `a.b`): no parentheses needed
+/// before `as`?
+fn fix_is_simple(s: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if !is_ident_char(b) && b != 46 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return str_len(s) > 0;
+}
+
+/// The column of the first method call `.name(` (or `.name (`) in `line`,
+/// at the name, or -1.
+fn fix_method_call_col(line: str, name: str) -> i64 {
+    var nlen: i64 = str_len(name);
+    var llen: i64 = str_len(line);
+    var i: i64 = 1;
+    while i + nlen <= llen {
+        if str_byte_at(line, i - 1) == 46 && str_slice(line, i, i + nlen) == name {
+            var after: i64 = i + nlen;
+            if after >= llen || !is_ident_char(str_byte_at(line, after)) {
+                while after < llen && str_byte_at(line, after) == 32 {
+                    after = after + 1;
+                }
+                if after < llen && str_byte_at(line, after) == 40 {
+                    return i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// --- TL3: `fid fix --edition N` -------------------------------------------
+// main.fd cmd_fix upgrades a file to edition N: it states the edition with
+// fix_set_edition, applies the fixes the checker then asks for (under 2027
+// the @deprecated calls with a replacement, now errors, fix_for above), and
+// keeps `#[edition(N)]` only when the file then checks clean; otherwise the
+// file's own edition line comes back (fix_restore_edition) with the fixes
+// that hold in both editions.
+
+/// The 0-based index of the line of `lines` that states the edition
+/// (`#[edition(...)]` at the start of the line), or -1.
+pub fn fix_edition_line(lines: Vec<str>) -> i64 {
+    var i: i64 = 0;
+    while i < lines.len() {
+        if str_starts_with(str_trim(lines.get(i)), "#[edition(") {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// `source` stating edition `e`: its `#[edition(...)]` changed to
+/// `#[edition(e)]`, or, when it states none, the line `#[edition(e)]`
+/// put before its first line of code (after the header comments and the
+/// `module` line).
+pub fn fix_set_edition(source: str, e: i64) -> str {
+    var lines: Vec<str> = split_lines(source);
+    var attr: str = "#[edition(" + int_to_str(e) + ")]";
+    var at: i64 = fix_edition_line(lines);
+    var starts: Vec<i64> = fix_line_starts(lines);
+    if at >= 0 {
+        var l: str = lines.get(at);
+        var open: i64 = str_find(l, "#[edition(");
+        var rest: str = str_slice(l, open, str_len(l));
+        var close: i64 = str_find(rest, ")]");
+        if close < 0 {
+            return str_clone(source);
+        }
+        var f: SrcFix = SrcFix_new(starts.get(at) + open, close + 2, attr, "state edition " + int_to_str(e), at + 1);
+        return fix_apply(source, f);
+    }
+    // the first line of code: not blank, not a comment
+    var k: i64 = 0;
+    while k < lines.len() {
+        var t: str = str_trim(lines.get(k));
+        if str_len(t) > 0 && !str_starts_with(t, "//") {
+            break;
+        }
+        k = k + 1;
+    }
+    // after a `module a::b;` line
+    if k < lines.len() && str_starts_with(str_trim(lines.get(k)), "module ") {
+        k = k + 1;
+    }
+    var nl: str = "\n";
+    if str_contains(source, "\r\n") {
+        nl = "\r\n";
+    }
+    if k >= lines.len() {
+        // nothing but comments: at the end
+        var tail: str = str_clone(source);
+        if str_len(tail) > 0 && !str_ends_with(tail, "\n") {
+            tail = tail + nl;
+        }
+        return tail + attr + nl;
+    }
+    var ins: SrcFix = SrcFix_new(starts.get(k), 0, attr + nl, "state edition " + int_to_str(e), k + 1);
+    return fix_apply(source, ins);
+}
+
+/// `fixed` (which fix_set_edition gave an edition line) with the edition
+/// line `orig` had put back, or taken out when `orig` stated none.
+pub fn fix_restore_edition(orig: str, fixed: str) -> str {
+    var olines: Vec<str> = split_lines(orig);
+    var flines: Vec<str> = split_lines(fixed);
+    var fat: i64 = fix_edition_line(flines);
+    if fat < 0 {
+        return str_clone(fixed);
+    }
+    var fstarts: Vec<i64> = fix_line_starts(flines);
+    var oat: i64 = fix_edition_line(olines);
+    if oat >= 0 {
+        // the original line, as it was (its newline stays)
+        var ol: str = olines.get(oat);
+        var fl: str = flines.get(fat);
+        if str_ends_with(fl, "\r") && !str_ends_with(ol, "\r") {
+            ol = ol + "\r";
+        }
+        if str_ends_with(ol, "\r") && !str_ends_with(fl, "\r") {
+            ol = str_slice(ol, 0, str_len(ol) - 1);
+        }
+        return fix_apply(fixed, SrcFix_new(fstarts.get(fat), str_len(fl), ol, "restore the edition", fat + 1));
+    }
+    // the inserted line and its newline
+    var whole: i64 = str_len(flines.get(fat));
+    if fat + 1 < flines.len() {
+        whole = whole + 1;
+    }
+    return fix_apply(fixed, SrcFix_new(fstarts.get(fat), whole, "", "restore the edition", fat + 1));
+}
+
+/// The fix of one diagnostic, appended to `out` (none when it has no
+/// mechanical fix).
+fn fix_for(lines: Vec<str>, starts: Vec<i64>, err: str, out: & mut Vec<SrcFix>) {
+    var ln: i64 = fix_line_of(err);
+    // val -> var: the innermost `val name` at or above the assignment
+    var vname: str = fix_between(err, "cannot assign to '", "'");
+    if str_len(vname) > 0 && str_contains(err, "declared with `val`") {
+        var li: i64 = ln - 1;
+        if li < 0 || li >= lines.len() {
+            li = lines.len() - 1;
+        } while li >= 0 {
+            var l: str = lines.get(li);
+            var pos: i64 = find_word_after(l, "val ", vname);
+            if pos >= 0 {
+                var k: i64 = pos;
+                while k > 0 && (str_byte_at(l, k - 1) == 32 || str_byte_at(l, k - 1) == 9) {
+                    k = k - 1;
+                }
+                if k >= 3 && str_slice(l, k - 3, k) == "val" {
+                    out.push(SrcFix_new(starts.get(li) + k - 3, 3, "var", "declare '" + vname + "' with var", ln));
+                    return;
+                }
+            }
+            li = li - 1;
+        }
+        return;
+    }
+    // A narrowing conversion: the right side of `x = e;`, `var x: T = e;`
+    // or `return e;`, when the statement is all the line holds
+    var ty: str = fix_between(err, "convert it with `as ", "`");
+    if str_len(ty) > 0 && ln > 0 && ln <= lines.len() {
+        var l2: str = lines.get(ln - 1);
+        var te: str = str_trim_end(l2);
+        if str_ends_with(te, ";") {
+            var semi: i64 = str_len(te) - 1;
+            var rs: i64 = - 1;
+            var eq: i64 = str_find(l2, " = ");
+            if eq >= 0 && eq + 3 <= semi && str_find(str_slice(l2, eq + 3, semi), " = ") < 0 {
+                rs = eq + 3;
+            } else {
+                var lead: i64 = 0;
+                while lead < semi && (str_byte_at(l2, lead) == 32 || str_byte_at(l2, lead) == 9) {
+                    lead = lead + 1;
+                }
+                if str_starts_with(str_slice(l2, lead, semi), "return ") {
+                    rs = lead + 7;
+                }
+            }
+            if rs >= 0 && rs < semi {
+                var rhs: str = str_trim(str_slice(l2, rs, semi));
+                if str_len(rhs) > 0 && !str_ends_with(rhs, "as " + ty) {
+                    var newt: str = "(" + rhs + ") as " + ty;
+                    if fix_is_simple(rhs) {
+                        newt = rhs + " as " + ty;
+                    }
+                    out.push(SrcFix_new(starts.get(ln - 1) + rs, semi - rs, newt, "convert with `as " + ty + "`", ln));
+                }
+            }
+        }
+        return;
+    }
+    // did you mean: the misspelled name on the line
+    var sug: str = fix_between(err, "did you mean '", "'");
+    if str_len(sug) > 0 && ln > 0 && ln <= lines.len() {
+        var uname: str = fix_between(err, "undefined variable '", "'");
+        if str_len(uname) == 0 {
+            uname = fix_between(err, "undefined function '", "'");
+        }
+        if str_len(uname) > 0 {
+            var col: i64 = fix_word_col(lines.get(ln - 1), uname);
+            if col >= 0 {
+                out.push(SrcFix_new(starts.get(ln - 1) + col, str_len(uname), sug, "change '" + uname + "' to '" + sug + "'", ln));
+            }
+        }
+        return;
+    }
+    // CU3: a call of a @deprecated function with a replacement
+    // (`@deprecated(use = "new_fn")`): the warning reads "Warning (line N,
+    // in 'f'): 'old' is deprecated: use `new_fn` instead." -- the first
+    // call of `old` on line N (a whole word followed by `(`, not a method
+    // or field) becomes `new_fn`
+    var dold: str = fix_between(err, "): '", "' is deprecated: use `");
+    var dnew: str = fix_between(err, "' is deprecated: use `", "` instead");
+    // TL3: from edition 2027 the same call is an error: "Type error (line
+    // N, in 'f'): 'old' is deprecated, and edition 2027 does not call
+    // deprecated functions: use `new_fn` instead." (`fid fix --edition`)
+    if str_len(dold) == 0 && str_contains(err, "' is deprecated, and edition ") {
+        dold = fix_between(err, "): '", "' is deprecated, and edition ");
+        dnew = fix_between(err, "deprecated functions: use `", "` instead");
+    }
+    // a deprecated method (`Type.old`): its calls `.old(` become `.new(`
+    if str_len(dold) > 0 && str_len(dnew) > 0 && str_contains(dold, ".") && ln > 0 && ln <= lines.len() {
+        var dmeth: str = dold;
+        while str_find(dmeth, ".") >= 0 {
+            dmeth = str_slice(dmeth, str_find(dmeth, ".") + 1, str_len(dmeth));
+        }
+        var dml: str = lines.get(ln - 1);
+        var dmcol: i64 = fix_method_call_col(dml, dmeth);
+        if dmcol >= 0 && str_len(dmeth) > 0 {
+            out.push(SrcFix_new(starts.get(ln - 1) + dmcol, str_len(dmeth), dnew, "call '" + dnew + "' instead of the deprecated '" + dold + "'", ln));
+        }
+        return;
+    }
+    if str_len(dold) > 0 && str_len(dnew) > 0 && ln > 0 && ln <= lines.len() {
+        var dl: str = lines.get(ln - 1);
+        var dcol: i64 = fix_word_col(dl, dold);
+        if dcol >= 0 {
+            // the name must be called here: `old(` or `old (`
+            var after: i64 = dcol + str_len(dold);
+            while after < str_len(dl) && str_byte_at(dl, after) == 32 {
+                after = after + 1;
+            }
+            if after < str_len(dl) && str_byte_at(dl, after) == 40 {
+                out.push(SrcFix_new(starts.get(ln - 1) + dcol, str_len(dold), dnew, "call '" + dnew + "' instead of the deprecated '" + dold + "'", ln));
+            }
+        }
+        return;
+    }
+    // CE5: the fixes of the other mechanical `Fix:` lines
+    if fix_for_more(lines, starts, err, ln, out) {
+        return;
+    }
+    // An unused import: `use m;` taken out (the whole line when it holds
+    // nothing else)
+    var mname: str = fix_between(err, "unused import: '", "'");
+    if str_len(mname) > 0 {
+        var pat: str = "use " + mname + ";";
+        var li2: i64 = 0;
+        while li2 < lines.len() {
+            var l3: str = lines.get(li2);
+            var p: i64 = str_find(l3, pat);
+            if p >= 0 && (p == 0 || !is_ident_char(str_byte_at(l3, p - 1))) {
+                var dlen: i64 = str_len(pat);
+                if str_trim(l3) == pat {
+                    // the line and its newline
+                    var whole: i64 = str_len(l3);
+                    if li2 + 1 < lines.len() {
+                        whole = whole + 1;
+                    }
+                    out.push(SrcFix_new(starts.get(li2), whole, "", "remove the unused import " + mname, li2 + 1));
+                } else {
+                    while p + dlen < str_len(l3) && str_byte_at(l3, p + dlen) == 32 {
+                        dlen = dlen + 1;
+                    }
+                    out.push(SrcFix_new(starts.get(li2) + p, dlen, "", "remove the unused import " + mname, li2 + 1));
+                }
+                return;
+            }
+            li2 = li2 + 1;
+        }
+    }
+}
+
+// --- CE5 (complaint-roadmap): more `Fix:` lines applied --------------------
+//   unused variable/parameter 'x' (fid lint)          x -> _x at its declaration
+//   imports are not sorted: 'use b' ... 'use a' (lint) the two use lines swapped
+//   returns a borrowed string (&str) as an owned str  return e; -> return str_clone(e);
+//   'f' parameter K takes an owned str ... (&str)      K-th argument -> str_clone(arg)
+//   Fix: add @A [annotation] to 'f'                    `@A` on the line before `fn f`
+
+/// The whitespace that starts `l`.
+fn fix_indent(l: str) -> str {
+    var k: i64 = 0;
+    while k < str_len(l) && (str_byte_at(l, k) == 32 || str_byte_at(l, k) == 9) {
+        k = k + 1;
+    }
+    return str_slice(l, 0, k);
+}
+
+/// Is `l` the line `use <path>;` (or `pub use`, or `use <path>::{..}` for
+/// exactly that path)?
+fn fix_is_use_of(l: str, path: str) -> bool {
+    var t: str = str_trim(l);
+    if str_starts_with(t, "pub ") {
+        t = str_trim(str_slice(t, 4, str_len(t)));
+    }
+    var pre: str = "use " + path;
+    if !str_starts_with(t, pre) {
+        return false;
+    }
+    if str_len(t) == str_len(pre) {
+        return true;
+    }
+    var b: i64 = str_byte_at(t, str_len(pre));
+    return !is_ident_char(b) && b != 58;
+}
+
+/// The 1-based number after `marker` in `err`, or 0.
+fn fix_num_after(err: str, marker: str) -> i64 {
+    var at: i64 = str_find(err, marker);
+    if at < 0 {
+        return 0;
+    }
+    var k: i64 = at + str_len(marker);
+    var v: i64 = 0;
+    while k < str_len(err) && str_byte_at(err, k) >= 48 && str_byte_at(err, k) <= 57 {
+        v = v * 10 + (str_byte_at(err, k) - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+/// The columns [start, end) of argument `k` (1-based) of the call whose `(`
+/// is at column `open` of `l`, trimmed of spaces; [-1, -1] when the call
+/// has no such argument or does not close on this line.
+fn fix_call_arg(l: str, open: i64, k: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var depth: i64 = 0;
+    var idx: i64 = 1;
+    var a0: i64 = open + 1;
+    var a1: i64 = - 1;
+    var i: i64 = open + 1;
+    var n: i64 = str_len(l);
+    while i < n && a1 < 0 {
+        var b: i64 = str_byte_at(l, i);
+        if b == 34 {
+            // a string literal: to its closing quote
+            i = i + 1;
+            while i < n && str_byte_at(l, i) != 34 {
+                if str_byte_at(l, i) == 92 {
+                    i = i + 1;
+                }
+                i = i + 1;
+            }
+        } else if b == 40 || b == 91 || b == 123 {
+            depth = depth + 1;
+        } else if b == 41 || b == 93 || b == 125 {
+            if depth == 0 {
+                if idx == k {
+                    a1 = i;
+                } else {
+                    i = n;
+                }
+            } else {
+                depth = depth - 1;
+            }
+        } else if b == 44 && depth == 0 {
+            if idx == k {
+                a1 = i;
+            } else {
+                idx = idx + 1;
+                a0 = i + 1;
+            }
+        }
+        if a1 < 0 {
+            i = i + 1;
+        }
+    }
+    if a1 < 0 {
+        r.push(- 1);
+        r.push(- 1);
+        return r;
+    }
+    while a0 < a1 && str_byte_at(l, a0) == 32 {
+        a0 = a0 + 1;
+    }
+    while a1 > a0 && str_byte_at(l, a1 - 1) == 32 {
+        a1 = a1 - 1;
+    }
+    if a1 <= a0 {
+        r.push(- 1);
+        r.push(- 1);
+        return r;
+    }
+    r.push(a0);
+    r.push(a1);
+    return r;
+}
+
+/// The CE5 fixes; true when `err` is one of their diagnostics (fixed or not).
+fn fix_for_more(lines: Vec<str>, starts: Vec<i64>, err: str, ln: i64, out: & mut Vec<SrcFix>) -> bool {
+    // An unused variable or parameter: named _x at its declaration
+    var uvar: str = fix_between(err, "unused variable '", "'");
+    var upar: str = fix_between(err, "unused parameter '", "'");
+    if str_len(uvar) > 0 || str_len(upar) > 0 {
+        if ln > 0 && ln <= lines.len() {
+            var ul: str = lines.get(ln - 1);
+            var ucol: i64 = - 1;
+            var uname: str = uvar;
+            if str_len(uvar) > 0 {
+                ucol = find_word_after(ul, "var ", uvar);
+                if ucol < 0 {
+                    ucol = find_word_after(ul, "val ", uvar);
+                }
+                if ucol < 0 {
+                    ucol = find_word_after(ul, "let ", uvar);
+                }
+                if ucol < 0 {
+                    ucol = find_word_after(ul, "mut ", uvar);
+                }
+                if ucol < 0 {
+                    ucol = find_word_after(ul, "for ", uvar);
+                }
+            } else {
+                uname = upar;
+                // after the `(` of the parameter list (not the function's name)
+                var paren: i64 = str_find(ul, "(");
+                var pfrom: i64 = 0;
+                if paren >= 0 {
+                    pfrom = paren + 1;
+                }
+                var pc: i64 = fix_word_col(str_slice(ul, pfrom, str_len(ul)), upar);
+                if pc >= 0 {
+                    var pend: i64 = pfrom + pc + str_len(upar);
+                    while pend < str_len(ul) && str_byte_at(ul, pend) == 32 {
+                        pend = pend + 1;
+                    }
+                    // a parameter is followed by its `:`
+                    if pend < str_len(ul) && str_byte_at(ul, pend) == 58 {
+                        ucol = pfrom + pc;
+                    }
+                }
+            }
+            if ucol >= 0 {
+                out.push(SrcFix_new(starts.get(ln - 1) + ucol, str_len(uname), "_" + uname, "name the unused '" + uname + "' _" + uname, ln));
+            }
+        }
+        return true;
+    }
+    // Import order: `use later;` moved above `use earlier;`
+    var later: str = fix_between(err, "imports are not sorted: 'use ", "'");
+    var earlier: str = fix_between(err, "' should come before 'use ", "'");
+    if str_len(later) > 0 && str_len(earlier) > 0 {
+        var at: i64 = ln - 1;
+        if at >= 1 && at < lines.len() && fix_is_use_of(lines.get(at), later) {
+            var bi: i64 = at - 1;
+            while bi >= 0 && !fix_is_use_of(lines.get(bi), earlier) {
+                bi = bi - 1;
+            }
+            if bi >= 0 {
+                var text: str = lines.get(at);
+                var mi: i64 = bi + 1;
+                while mi < at {
+                    text = text + "\n" + lines.get(mi);
+                    mi = mi + 1;
+                }
+                text = text + "\n" + lines.get(bi);
+                var size: i64 = starts.get(at) + str_len(lines.get(at)) - starts.get(bi);
+                out.push(SrcFix_new(starts.get(bi), size, text, "put 'use " + later + "' before 'use " + earlier + "'", ln));
+            }
+        }
+        return true;
+    }
+    // A borrowed string returned as an owned one: return an owned copy
+    if str_contains(err, "returns a borrowed string (&str) as an owned str") {
+        if ln > 0 && ln <= lines.len() {
+            var rl: str = lines.get(ln - 1);
+            var rte: str = str_trim_end(rl);
+            var lead: i64 = str_len(fix_indent(rl));
+            if str_ends_with(rte, ";") && str_starts_with(str_slice(rl, lead, str_len(rl)), "return ") {
+                var semi: i64 = str_len(rte) - 1;
+                var e0: i64 = lead + 7;
+                var rexpr: str = str_trim(str_slice(rl, e0, semi));
+                if str_len(rexpr) > 0 && !str_starts_with(rexpr, "str_clone(") {
+                    out.push(SrcFix_new(starts.get(ln - 1) + e0, semi - e0, "str_clone(" + rexpr + ")", "return an owned copy (str_clone)", ln));
+                }
+            }
+        }
+        return true;
+    }
+    // A borrowed string passed to an owned str parameter: pass a copy
+    if str_contains(err, "takes an owned str, and it is given a borrowed string") {
+        var callee: str = fix_between(err, "): '", "' parameter ");
+        var k: i64 = fix_num_after(err, "' parameter ");
+        if str_len(callee) > 0 && k > 0 && ln > 0 && ln <= lines.len() {
+            var cl: str = lines.get(ln - 1);
+            var ccol: i64 = fix_word_col(cl, callee);
+            if ccol >= 0 {
+                var open: i64 = ccol + str_len(callee);
+                while open < str_len(cl) && str_byte_at(cl, open) == 32 {
+                    open = open + 1;
+                }
+                if open < str_len(cl) && str_byte_at(cl, open) == 40 {
+                    var span: Vec<i64> = fix_call_arg(cl, open, k);
+                    var s0: i64 = span.get(0);
+                    var s1: i64 = span.get(1);
+                    if s0 >= 0 {
+                        var arg: str = str_slice(cl, s0, s1);
+                        if !str_starts_with(arg, "str_clone(") {
+                            out.push(SrcFix_new(starts.get(ln - 1) + s0, s1 - s0, "str_clone(" + arg + ")", "pass an owned copy of '" + arg + "' (str_clone)", ln));
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    // TL3: a by-value parameter changed: the body changes a copy
+    // (`var p = p;` as its first line), which is what the caller saw
+    // before (it never sees the change)
+    if str_contains(err, "' is a by-value parameter") && str_contains(err, "cannot be changed") {
+        var bpar: str = fix_between(err, "): '", "' is a by-value parameter");
+        var bfn: str = fix_between(err, "' is a by-value parameter of '", "'");
+        if str_len(bpar) > 0 && fix_is_simple(bpar) && ln > 0 {
+            fix_param_copy(lines, starts, bpar, bfn, ln, out);
+        }
+        return true;
+    }
+    // TL3 (a borrow conflict): a Vec changed while a `for` loop iterates
+    // over it: the loop iterates over a copy (`for x in v.clone()`), so it
+    // sees the elements it started with and the changes stay in `v`
+    var itv: str = fix_between(err, "cannot change ", " while a `for` loop iterates over it");
+    if str_len(itv) == 0 {
+        itv = fix_between(err, "cannot create &mut ", " while a `for` loop iterates over it");
+    }
+    if str_len(itv) > 0 {
+        var dot: i64 = str_find(itv, ".");
+        if dot > 0 {
+            itv = str_slice(itv, 0, dot);
+        }
+        if ln > 0 {
+            fix_for_clone(lines, starts, itv, ln, out);
+        } else {
+            // CE5: "borrow error in f (line 0): cannot create &mut v ...":
+            // no line, so the loop is looked for from the end of f up
+            var bfn2: str = fix_between(err, "borrow error in ", " (line");
+            if str_len(bfn2) > 0 {
+                var bspan: Vec<i64> = fix_fn_span(lines, bfn2, lines.len());
+                if bspan.get(0) >= 0 {
+                    fix_for_clone(lines, starts, itv, bspan.get(1) + 1, out);
+                }
+            }
+        }
+        return true;
+    }
+    // CE5: a name that is not snake_case, renamed with every use of it
+    if str_contains(err, "' should be snake_case: ") {
+        fix_snake_rename(lines, starts, err, ln, out);
+        return true;
+    }
+    // CE5: a field a `S { .., .. }` literal leaves out, with no default:
+    // given the zero value of its type before the `..`
+    if str_contains(err, "' leaves out field '") && str_contains(err, "which has no default") {
+        fix_missing_field(lines, starts, err, ln, out);
+        return true;
+    }
+    // A missing annotation: `@A` on its own line before `fn f`
+    var ann_at: i64 = str_find(err, "Fix: add @");
+    if ann_at >= 0 {
+        var k2: i64 = ann_at + 10;
+        var a0: i64 = k2;
+        while k2 < str_len(err) && (is_ident_char(str_byte_at(err, k2)) || str_byte_at(err, k2) == 45) {
+            k2 = k2 + 1;
+        }
+        var ann: str = str_slice(err, a0, k2);
+        var target: str = fix_between(str_slice(err, k2, str_len(err)), " to '", "'");
+        if str_len(ann) > 0 && str_len(target) > 0 {
+            var li: i64 = 0;
+            while li < lines.len() {
+                var fl: str = lines.get(li);
+                if find_word_after(fl, "fn ", target) >= 0 {
+                    // not when the annotation is already above it
+                    var has: bool = false;
+                    var pi: i64 = li - 1;
+                    while pi >= 0 && str_starts_with(str_trim(lines.get(pi)), "@") {
+                        if str_trim(lines.get(pi)) == "@" + ann {
+                            has = true;
+                        }
+                        pi = pi - 1;
+                    }
+                    if !has {
+                        var nl: str = "\n";
+                        if str_ends_with(fl, "\r") {
+                            nl = "\r\n";
+                        }
+                        out.push(SrcFix_new(starts.get(li), 0, fix_indent(fl) + "@" + ann + nl, "add @" + ann + " to '" + target + "'", li + 1));
+                    }
+                    return true;
+                }
+                li = li + 1;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// --- TL3: more diagnostics fixed ------------------------------------------
+//   'p' is a by-value parameter of 'f' and cannot be changed
+//                                  `var p = p;` as the first line of f's body
+//   cannot change v while a `for` loop iterates over it (borrow error)
+//                                  `for x in v {` -> `for x in v.clone() {`
+
+/// The name `fn` declares on `l` (`fn name(`, `pub fn name<T>(`), or "".
+fn fix_fn_name(l: str) -> str {
+    var n: i64 = str_len(l);
+    if str_starts_with(str_trim(l), "//") {
+        return "";
+    }
+    var from: i64 = 0;
+    while from < n {
+        var p: i64 = str_find(str_slice(l, from, n), "fn ");
+        if p < 0 {
+            return "";
+        }
+        var at: i64 = from + p;
+        if at == 0 || !is_ident_char(str_byte_at(l, at - 1)) {
+            var k: i64 = at + 3;
+            while k < n && str_byte_at(l, k) == 32 {
+                k = k + 1;
+            }
+            var k0: i64 = k;
+            while k < n && is_ident_char(str_byte_at(l, k)) {
+                k = k + 1;
+            }
+            if k > k0 {
+                return str_slice(l, k0, k);
+            }
+            return "";
+        }
+        from = at + 1;
+    }
+    return "";
+}
+
+/// The column of the parameter `p` on `l` (the whole word followed by `:`,
+/// not `::`; after the first `(` when the line has one), or -1.
+fn fix_param_col(l: str, p: str) -> i64 {
+    var n: i64 = str_len(l);
+    var plen: i64 = str_len(p);
+    var i: i64 = 0;
+    var open: i64 = str_find(l, "(");
+    if open >= 0 {
+        i = open + 1;
+    }
+    while i + plen <= n {
+        if str_slice(l, i, i + plen) == p {
+            var ok: bool = true;
+            if i > 0 && (is_ident_char(str_byte_at(l, i - 1)) || str_byte_at(l, i - 1) == 46) {
+                ok = false;
+            }
+            if i + plen < n && is_ident_char(str_byte_at(l, i + plen)) {
+                ok = false;
+            }
+            if ok {
+                var k: i64 = i + plen;
+                while k < n && str_byte_at(l, k) == 32 {
+                    k = k + 1;
+                }
+                if k < n && str_byte_at(l, k) == 58 && (k + 1 >= n || str_byte_at(l, k + 1) != 58) {
+                    return i;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// `var p = p;` as the first line of the body of the function `fname` (the
+/// nearest `fn` of that name at or above line `ln`; a method `T_m` is
+/// written `fn m` in `impl T`) when it has a parameter `p`.
+fn fix_param_copy(lines: Vec<str>, starts: Vec<i64>, p: str, fname: str, ln: i64, out: & mut Vec<SrcFix>) {
+    var li: i64 = ln - 1;
+    if li >= lines.len() {
+        li = lines.len() - 1;
+    }
+    var at: i64 = - 1;
+    while li >= 0 && at < 0 {
+        var nm: str = fix_fn_name(lines.get(li));
+        if str_len(nm) > 0 && (str_len(fname) == 0 || nm == fname || str_ends_with(fname, "_" + nm)) {
+            at = li;
+        } else {
+            li = li - 1;
+        }
+    }
+    if at < 0 {
+        return;
+    }
+    // the parameter, and the line whose `{` opens the body
+    var has: bool = false;
+    var body: i64 = - 1;
+    var bi: i64 = at;
+    while bi < lines.len() && bi < at + 12 && body < 0 {
+        var bl: str = lines.get(bi);
+        if fix_param_col(bl, p) >= 0 {
+            has = true;
+        }
+        if str_ends_with(str_trim_end(bl), "{") {
+            body = bi;
+        }
+        bi = bi + 1;
+    }
+    if !has || body < 0 || body + 1 >= lines.len() {
+        return;
+    }
+    var next: str = lines.get(body + 1);
+    var nt: str = str_trim(next);
+    var copy: str = "var " + p + " = " + p + ";";
+    if nt == copy {
+        return;
+    }
+    var ind: str = fix_indent(next);
+    if str_len(nt) == 0 || str_starts_with(nt, "}") {
+        ind = fix_indent(lines.get(at)) + "    ";
+    }
+    var nl: str = "\n";
+    if str_ends_with(next, "\r") {
+        nl = "\r\n";
+    }
+    out.push(SrcFix_new(starts.get(body + 1), 0, ind + copy + nl, "change a copy of the by-value parameter '" + p + "'", ln));
+}
+
+/// The `for x in v {` (or `for x in v.iter() {`) at or above line `ln`
+/// iterates over `v.clone()` instead.
+fn fix_for_clone(lines: Vec<str>, starts: Vec<i64>, v: str, ln: i64, out: & mut Vec<SrcFix>) {
+    var li: i64 = ln - 1;
+    if li >= lines.len() {
+        li = lines.len() - 1;
+    }
+    var vlen: i64 = str_len(v);
+    while li >= 0 {
+        var l: str = lines.get(li);
+        var n: i64 = str_len(l);
+        var f: i64 = str_find(l, "for ");
+        if f >= 0 && (f == 0 || !is_ident_char(str_byte_at(l, f - 1))) && !str_starts_with(str_trim(l), "//") {
+            var inp: i64 = str_find(str_slice(l, f, n), " in ");
+            if inp >= 0 {
+                var k: i64 = f + inp + 4;
+                while k < n && str_byte_at(l, k) == 32 {
+                    k = k + 1;
+                }
+                var e: i64 = k + vlen;
+                if e <= n && str_slice(l, k, e) == v && (e == n || !is_ident_char(str_byte_at(l, e))) {
+                    var rest: str = str_slice(l, e, n);
+                    if str_starts_with(rest, ".iter()") {
+                        out.push(SrcFix_new(starts.get(li) + e, 7, ".clone()", "iterate over a copy of '" + v + "'", ln));
+                    } else if str_starts_with(str_trim(rest), "{") {
+                        out.push(SrcFix_new(starts.get(li) + e, 0, ".clone()", "iterate over a copy of '" + v + "'", ln));
+                    }
+                    return;
+                }
+            }
+        }
+        li = li - 1;
+    }
+}
+
+// --- CE5: renames to snake_case, fields left out of a literal --------------
+//   variable 'x' in 'f' should be snake_case: y (lint)
+//                         x -> y from its declaration to the end of f
+//   parameter 'x' of 'f' should be snake_case: y (lint)
+//                         x -> y in f's parameter list and body
+//   function 'f' should be snake_case: g (lint)
+//                         f -> g at its `fn` and every call in the file
+//                         (not a `pub` function, which other files call, and
+//                         not a method, which `.f(` calls of other types share)
+//   the literal of struct 'S' leaves out field 'f', which has no default
+//                         `f: <zero of its type>, ` before the literal's `..`
+// A rename is not made when the new name is already used where the old one
+// is renamed (it would then mean another binding). Uses are whole words in
+// code: not in a string or a `//` comment, not a field or method (`.x`, but
+// a range `..x` is a use), not a path's tail (`m::x`), and not the field
+// name of a struct literal (`S { x: .. }`).
+
+/// The previous byte of `l` before column `at` that is not a space or tab,
+/// and its column (-1, -1 when there is none).
+fn fix_prev_byte(l: str, at: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var k: i64 = at - 1;
+    while k >= 0 && (str_byte_at(l, k) == 32 || str_byte_at(l, k) == 9) {
+        k = k - 1;
+    }
+    if k < 0 {
+        r.push(- 1);
+        r.push(- 1);
+        return r;
+    }
+    r.push(str_byte_at(l, k));
+    r.push(k);
+    return r;
+}
+
+/// Is the word at columns [s0, e) of `l` a use of a name (see above)?
+/// `keys`: a word followed by `:` after `{`, `,` or the line's start is a
+/// use too (a parameter list), not a struct literal's field name.
+fn fix_rename_here(l: str, s0: i64, e: i64, keys: bool) -> bool {
+    var pv: Vec<i64> = fix_prev_byte(l, s0);
+    var pb: i64 = pv.get(0);
+    var pk: i64 = pv.get(1);
+    // a field or method `.x` (a range `..x` is a use)
+    if pb == 46 && !(pk > 0 && str_byte_at(l, pk - 1) == 46) {
+        return false;
+    }
+    // a path's tail `m::x`
+    if pb == 58 && pk > 0 && str_byte_at(l, pk - 1) == 58 {
+        return false;
+    }
+    if !keys {
+        var n: i64 = str_len(l);
+        var k: i64 = e;
+        while k < n && (str_byte_at(l, k) == 32 || str_byte_at(l, k) == 9) {
+            k = k + 1;
+        }
+        var colon: bool = k < n && str_byte_at(l, k) == 58 && !(k + 1 < n && str_byte_at(l, k + 1) == 58);
+        if colon && (pb == 123 || pb == 44 || pb == - 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// `l` with every use (fix_rename_here) of the name `old` written `new`.
+fn fix_rename_line(l: str, old: str, new: str, keys: bool) -> str {
+    var n: i64 = str_len(l);
+    var olen: i64 = str_len(old);
+    var out: str = "";
+    var last: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var b: i64 = str_byte_at(l, i);
+        if b == 34 {
+            // a string literal, to its closing quote
+            i = i + 1;
+            while i < n && str_byte_at(l, i) != 34 {
+                if str_byte_at(l, i) == 92 {
+                    i = i + 1;
+                }
+                i = i + 1;
+            }
+            i = i + 1;
+        } else if b == 39 && i + 2 < n && str_byte_at(l, i + 2) == 39 {
+            // a character literal 'c'
+            i = i + 3;
+        } else if b == 39 && i + 3 < n && str_byte_at(l, i + 1) == 92 && str_byte_at(l, i + 3) == 39 {
+            // a character literal '\c'
+            i = i + 4;
+        } else if b == 47 && i + 1 < n && str_byte_at(l, i + 1) == 47 {
+            // a comment, to the end of the line
+            i = n;
+        } else if is_ident_char(b) {
+            var s0: i64 = i;
+            while i < n && is_ident_char(str_byte_at(l, i)) {
+                i = i + 1;
+            }
+            if i - s0 == olen && str_slice(l, s0, i) == old && fix_rename_here(l, s0, i, keys) {
+                out = out + str_slice(l, last, s0) + new;
+                last = i;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    if last == 0 {
+        return str_clone(l);
+    }
+    return out + str_slice(l, last, n);
+}
+
+/// Is the name `w` used (fix_rename_here, field names included) on `l`?
+fn fix_uses_word(l: str, w: str) -> bool {
+    return fix_rename_line(l, w, w + "_", true) != l;
+}
+
+/// The lines [first, last] (0-based) of the function `fname` (the nearest
+/// `fn` of that name at or above line `ln`, 1-based; a method `T_m` is
+/// written `fn m`): from its `fn` line to the line of the `}` that closes
+/// its body. [-1, -1] when there is none.
+fn fix_fn_span(lines: Vec<str>, fname: str, ln: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var li: i64 = ln - 1;
+    if li >= lines.len() {
+        li = lines.len() - 1;
+    }
+    var at: i64 = - 1;
+    while li >= 0 && at < 0 {
+        var nm: str = fix_fn_name(lines.get(li));
+        if str_len(nm) > 0 && (nm == fname || str_ends_with(fname, "_" + nm)) {
+            at = li;
+        } else {
+            li = li - 1;
+        }
+    }
+    var end: i64 = - 1;
+    if at >= 0 {
+        var depth: i64 = 0;
+        var opened: bool = false;
+        var k: i64 = at;
+        while k < lines.len() && end < 0 {
+            var l: str = lines.get(k);
+            var n: i64 = str_len(l);
+            var i: i64 = 0;
+            while i < n && end < 0 {
+                var b: i64 = str_byte_at(l, i);
+                if b == 34 {
+                    i = i + 1;
+                    while i < n && str_byte_at(l, i) != 34 {
+                        if str_byte_at(l, i) == 92 {
+                            i = i + 1;
+                        }
+                        i = i + 1;
+                    }
+                } else if b == 39 && i + 2 < n && str_byte_at(l, i + 2) == 39 {
+                    i = i + 2;
+                } else if b == 47 && i + 1 < n && str_byte_at(l, i + 1) == 47 {
+                    i = n;
+                } else if b == 123 {
+                    depth = depth + 1;
+                    opened = true;
+                } else if b == 125 {
+                    depth = depth - 1;
+                    if opened && depth == 0 {
+                        end = k;
+                    }
+                }
+                i = i + 1;
+            }
+            k = k + 1;
+        }
+    }
+    if at < 0 || end < 0 {
+        r.push(- 1);
+        r.push(- 1);
+        return r;
+    }
+    r.push(at);
+    r.push(end);
+    return r;
+}
+
+/// The fix that renames `old` to `new` on lines [first, last]; `keys_to`:
+/// the last line on which a word before `:` is a use (a parameter list),
+/// -1 for none. Nothing when `new` is used there already or nothing changes.
+fn fix_rename_lines(lines: Vec<str>, starts: Vec<i64>, old: str, new: str, first: i64, last: i64, keys_to: i64, title: str, ln: i64, out: & mut Vec<SrcFix>) {
+    if first < 0 || last < first || last >= lines.len() {
+        return;
+    }
+    var i: i64 = first;
+    while i <= last {
+        if fix_uses_word(lines.get(i), new) {
+            return;
+        }
+        i = i + 1;
+    }
+    var text: str = "";
+    var changed: bool = false;
+    i = first;
+    while i <= last {
+        var l: str = lines.get(i);
+        var nl: str = fix_rename_line(l, old, new, i <= keys_to);
+        if nl != l {
+            changed = true;
+        }
+        if i > first {
+            text = text + "\n";
+        }
+        text = text + nl;
+        i = i + 1;
+    }
+    if !changed {
+        return;
+    }
+    var size: i64 = starts.get(last) + str_len(lines.get(last)) - starts.get(first);
+    out.push(SrcFix_new(starts.get(first), size, text, title, ln));
+}
+
+/// The rename a "... should be snake_case: y" lint warning asks for.
+fn fix_snake_rename(lines: Vec<str>, starts: Vec<i64>, err: str, ln: i64, out: & mut Vec<SrcFix>) {
+    var at: i64 = str_find(err, "' should be snake_case: ");
+    var new: str = str_trim(str_slice(err, at + 24, str_len(err)));
+    var ni: i64 = 0;
+    while ni < str_len(new) {
+        if !is_ident_char(str_byte_at(new, ni)) {
+            return;
+        }
+        ni = ni + 1;
+    }
+    if str_len(new) == 0 || ln <= 0 || ln > lines.len() {
+        return;
+    }
+    // a local variable: from its declaration to the end of its function
+    var vold: str = fix_between(err, "variable '", "' in '");
+    if str_len(vold) > 0 {
+        var vfn: str = fix_between(err, "' in '", "' should be");
+        var vspan: Vec<i64> = fix_fn_span(lines, vfn, ln);
+        if vspan.get(0) >= 0 && ln - 1 <= vspan.get(1) {
+            fix_rename_lines(lines, starts, vold, new, ln - 1, vspan.get(1), - 1, "rename '" + vold + "' to '" + new + "'", ln, out);
+        }
+        return;
+    }
+    // a parameter: in the parameter list (up to the line that opens the
+    // body) and the body
+    var pold: str = fix_between(err, "parameter '", "' of '");
+    if str_len(pold) > 0 {
+        var pfn: str = fix_between(err, "' of '", "' should be");
+        var pspan: Vec<i64> = fix_fn_span(lines, pfn, ln);
+        if pspan.get(0) >= 0 {
+            var open: i64 = pspan.get(0);
+            while open < pspan.get(1) && str_find(lines.get(open), "{") < 0 {
+                open = open + 1;
+            }
+            fix_rename_lines(lines, starts, pold, new, pspan.get(0), pspan.get(1), open, "rename the parameter '" + pold + "' to '" + new + "'", ln, out);
+        }
+        return;
+    }
+    // a function: its `fn` and every call in the file
+    var fold: str = fix_between(err, "function '", "' should be");
+    if str_len(fold) > 0 {
+        var dl: str = lines.get(ln - 1);
+        var dt: str = str_trim(dl);
+        if fix_fn_name(dl) != fold || str_starts_with(dt, "pub ") || str_len(fix_indent(dl)) > 0 {
+            return;
+        }
+        fix_rename_lines(lines, starts, fold, new, 0, lines.len() - 1, - 1, "rename the function '" + fold + "' to '" + new + "'", ln, out);
+    }
+}
+
+/// The zero value of the type `ty` as written in a diagnostic, or "".
+fn fix_zero_of(ty: str) -> str {
+    var t: str = str_trim(ty);
+    if t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32" || t == "u64" || t == "isize" || t == "usize" {
+        return "0";
+    }
+    if t == "f32" || t == "f64" {
+        return "0.0";
+    }
+    if t == "bool" {
+        return "false";
+    }
+    if t == "str" || t == "String" {
+        return "\"\"";
+    }
+    if str_starts_with(t, "Vec<") {
+        return "Vec::new()";
+    }
+    if str_starts_with(t, "HashMap<") {
+        return "HashMap::new()";
+    }
+    if str_starts_with(t, "Option<") {
+        return "Option::None";
+    }
+    return "";
+}
+
+/// `f: <zero>, ` put before the `..` of the first literal `S { .. }` at or
+/// after line `ln`: "the literal of struct 'S' leaves out field 'f', which
+/// has no default ... (`f: T = ...`)".
+fn fix_missing_field(lines: Vec<str>, starts: Vec<i64>, err: str, ln: i64, out: & mut Vec<SrcFix>) {
+    var sname: str = fix_between(err, "the literal of struct '", "'");
+    var fname: str = fix_between(err, "' leaves out field '", "'");
+    var zero: str = fix_zero_of(fix_between(err, "a default in the struct (`" + fname + ": ", " = ...`)"));
+    if str_len(sname) == 0 || str_len(fname) == 0 || str_len(zero) == 0 || ln <= 0 || ln > lines.len() {
+        return;
+    }
+    // the statement's lines, from line ln (offsets as in the source)
+    var last: i64 = ln - 1 + 60;
+    if last >= lines.len() {
+        last = lines.len() - 1;
+    }
+    var seg: str = str_clone(lines.get(ln - 1));
+    var si: i64 = ln;
+    while si <= last {
+        seg = seg + "\n" + lines.get(si);
+        si = si + 1;
+    }
+    var base: i64 = starts.get(ln - 1);
+    var n: i64 = str_len(seg);
+    // `S {` or `S<..> {`
+    var open: i64 = - 1;
+    var from: i64 = 0;
+    while open < 0 && from < n {
+        var p: i64 = str_find(str_slice(seg, from, n), sname);
+        if p < 0 {
+            return;
+        }
+        var s0: i64 = from + p;
+        var e: i64 = s0 + str_len(sname);
+        var word: bool = (s0 == 0 || (!is_ident_char(str_byte_at(seg, s0 - 1)) && str_byte_at(seg, s0 - 1) != 46)) && (e >= n || !is_ident_char(str_byte_at(seg, e)));
+        if word {
+            var k: i64 = e;
+            if k < n && str_byte_at(seg, k) == 60 {
+                var gd: i64 = 0;
+                var gdone: bool = false;
+                while k < n && !gdone {
+                    if str_byte_at(seg, k) == 60 {
+                        gd = gd + 1;
+                    } else if str_byte_at(seg, k) == 62 {
+                        gd = gd - 1;
+                        if gd == 0 {
+                            gdone = true;
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+            while k < n && (str_byte_at(seg, k) == 32 || str_byte_at(seg, k) == 9) {
+                k = k + 1;
+            }
+            if k < n && str_byte_at(seg, k) == 123 {
+                open = k;
+            }
+        }
+        from = s0 + 1;
+    }
+    if open < 0 {
+        return;
+    }
+    // its `..` (at the literal's own depth, just before its `}`)
+    var depth: i64 = 0;
+    var dots: i64 = - 1;
+    var i: i64 = open + 1;
+    var closed: bool = false;
+    while i < n && !closed {
+        var b: i64 = str_byte_at(seg, i);
+        if b == 34 {
+            i = i + 1;
+            while i < n && str_byte_at(seg, i) != 34 {
+                if str_byte_at(seg, i) == 92 {
+                    i = i + 1;
+                }
+                i = i + 1;
+            }
+        } else if b == 40 || b == 91 || b == 123 {
+            depth = depth + 1;
+        } else if b == 41 || b == 93 || b == 125 {
+            if depth == 0 {
+                closed = true;
+            } else {
+                depth = depth - 1;
+            }
+        } else if b == 46 && depth == 0 && i + 1 < n && str_byte_at(seg, i + 1) == 46 {
+            var k2: i64 = i + 2;
+            while k2 < n && (str_byte_at(seg, k2) == 32 || str_byte_at(seg, k2) == 9 || str_byte_at(seg, k2) == 10 || str_byte_at(seg, k2) == 13) {
+                k2 = k2 + 1;
+            }
+            if k2 < n && str_byte_at(seg, k2) == 125 {
+                dots = i;
+            }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    if dots < 0 {
+        return;
+    }
+    // `..` alone on its line: the field goes on a line of its own before it
+    var ls: i64 = dots;
+    while ls > 0 && (str_byte_at(seg, ls - 1) == 32 || str_byte_at(seg, ls - 1) == 9) {
+        ls = ls - 1;
+    }
+    var text: str = fname + ": " + zero + ", ";
+    if ls == 0 || str_byte_at(seg, ls - 1) == 10 {
+        var nl: str = "\n";
+        if ls >= 2 && str_byte_at(seg, ls - 2) == 13 {
+            nl = "\r\n";
+        }
+        text = fname + ": " + zero + "," + nl + str_slice(seg, ls, dots);
+    }
+    out.push(SrcFix_new(base + dots, 0, text, "give the field '" + fname + "' of the '" + sname + "' literal a value (" + zero + ")", ln));
+}
+
+/// The mechanical fixes of the diagnostics `errs` (as the checker or the
+/// linter gives them) of `source`, in the order of the diagnostics.
+pub fn fix_suggestions(source: str, errs: Vec<str>) -> Vec<SrcFix> {
+    var lines: Vec<str> = split_lines(source);
+    var starts: Vec<i64> = fix_line_starts(lines);
+    var out: Vec<SrcFix> = Vec::new();
+    var i: i64 = 0;
+    while i < errs.len() {
+        fix_for(lines, starts, errs.get(i), & mut out);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// `source` with the fix `f` applied.
+pub fn fix_apply(source: str, f: SrcFix) -> str {
+    var n: i64 = str_len(source);
+    var end: i64 = f.off + f.size;
+    if f.off < 0 || f.off > n || end > n {
+        return str_clone(source);
+    }
+    return str_slice(source, 0, f.off) + f.text + str_slice(source, end, n);
+}
+
+/// The LSP position {line, character} of byte offset `off`.
+fn fix_pos_json(starts: Vec<i64>, off: i64) -> Json {
+    // the last line starting at or before `off` (binary search)
+    var lo: i64 = 0;
+    var hi: i64 = starts.len() - 1;
+    while lo < hi {
+        var mid: i64 = (lo + hi + 1) / 2;
+        if starts.get(mid) <= off {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    var pos: JsonObject = JsonObject::new();
+    pos.insert("line", Json::Num(lo as f64));
+    var col: i64 = 0;
+    if starts.len() > 0 {
+        col = off - starts.get(lo);
+    }
+    pos.insert("character", Json::Num(col as f64));
+    return Json::Obj(pos);
+}
+
+/// Handle textDocument/codeAction: a quick fix for each diagnostic with a
+/// mechanical fix on the lines `first_line`..`last_line` (0-based).
+fn handle_code_action(text: str, uri: str, first_line: i64, last_line: i64) -> Json {
+    var actions: Vec<Json> = Vec::new();
+    var errs: Vec<str> = Vec::new();
+    var source_path: OptStr = OptStr::None;
+    if str_starts_with(uri, "file://") {
+        source_path = OptStr::Some(str_slice(uri, 7, str_len(uri)));
+    }
+    // SP19: from `fid serve --port` when FID_SERVE names it (as diagnostics)
+    errs = check_text_errors(text, source_path);
+    var fixes: Vec<SrcFix> = fix_suggestions(text, errs);
+    var starts: Vec<i64> = fix_line_starts(split_lines(text));
+    var i: i64 = 0;
+    while i < fixes.len() {
+        var f: SrcFix = fixes.get(i);
+        var dl: i64 = f.line - 1;
+        if dl >= first_line && dl <= last_line {
+            var range: JsonObject = JsonObject::new();
+            range.insert("start", fix_pos_json(starts, f.off));
+            range.insert("end", fix_pos_json(starts, f.off + f.size));
+            var edit: JsonObject = JsonObject::new();
+            edit.insert("range", Json::Obj(range));
+            edit.insert("newText", Json::Str(f.text));
+            var edits: Vec<Json> = Vec::new();
+            edits.push(Json::Obj(edit));
+            var changes: JsonObject = JsonObject::new();
+            changes.insert(uri, Json::Arr(edits));
+            var wedit: JsonObject = JsonObject::new();
+            wedit.insert("changes", Json::Obj(changes));
+            var action: JsonObject = JsonObject::new();
+            action.insert("title", Json::Str(f.title));
+            action.insert("kind", Json::Str("quickfix"));
+            action.insert("isPreferred", Json::Bool(true));
+            action.insert("edit", Json::Obj(wedit));
+            actions.push(Json::Obj(action));
+        }
+        i = i + 1;
+    }
+    return Json::Arr(actions);
+}
+
+// --- TL4: scope-aware rename and references; other files --------------------
+// A name declared in a function (a parameter, `var`/`val`/`let`, a `for`
+// variable, a match-arm or closure binding) is renamed and found only in
+// its scope: the rest of the block of a `var`, the body of a `for` or an
+// arm, the whole function for a parameter. Strings, comments, fields
+// (`.x`), paths (`T::x`) and struct-literal fields (`{ x: .. }`) are not
+// the local. A name a file declares at top level is also found in the
+// other open documents and the .fd files of the document's directory that
+// declare it or `use` the module that does.
+
+/// The file path of a `file://` URI ("" for another scheme): `%XX` for
+/// `:` and space decoded, and `/C:/..` taken as `C:/..`.
+fn lsp_uri_path(uri: str) -> str {
+    if !str_starts_with(uri, "file://") {
+        return "";
+    }
+    var p: str = str_slice(uri, 7, str_len(uri));
+    p = str_replace(str_replace(str_replace(p, "%3A", ":"), "%3a", ":"), "%20", " ");
+    if str_len(p) >= 3 && str_byte_at(p, 0) == 47 && str_byte_at(p, 2) == 58 {
+        p = str_slice(p, 1, str_len(p));
+    }
+    return p;
+}
+
+/// The lines [first, last] (0-based) of the function around `line`, from
+/// its `fn` line to the line of the `}` closing its body; [-1, -1] outside
+/// any function.
+fn lsp_fn_span(lines: Vec<str>, line: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var depth: i64 = 0;
+    var in_str: bool = false;
+    var start: i64 = - 1;
+    var start_depth: i64 = 0;
+    var opened: bool = false;
+    var li: i64 = 0;
+    while li < lines.len() {
+        var l: str = lines.get(li);
+        var n: i64 = str_len(l);
+        if start < 0 && !in_str && str_len(fix_fn_name(l)) > 0 {
+            start = li;
+            start_depth = depth;
+            opened = false;
+        }
+        var k: i64 = 0;
+        while k < n {
+            var c: i64 = str_byte_at(l, k);
+            if in_str {
+                if c == 92 {
+                    k = k + 1;
+                } else if c == 34 {
+                    in_str = false;
+                }
+                k = k + 1;
+            } else if c == 34 {
+                in_str = true;
+                k = k + 1;
+            } else if c == 47 && k + 1 < n && str_byte_at(l, k + 1) == 47 {
+                k = n;
+            } else if c == 39 {
+                k = ih_skip_literal(l, k);
+            } else {
+                if c == 123 {
+                    depth = depth + 1;
+                    if start >= 0 {
+                        opened = true;
+                    }
+                } else if c == 125 {
+                    depth = depth - 1;
+                    if start >= 0 && opened && depth == start_depth {
+                        if line >= start && line <= li {
+                            r.push(start);
+                            r.push(li);
+                            return r;
+                        }
+                        start = - 1;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        // a declaration without a body (`fn f(x: i64) -> i64;`)
+        if start >= 0 && !opened && str_ends_with(str_trim_end(l), ";") {
+            start = - 1;
+        }
+        li = li + 1;
+    }
+    r.push(- 1);
+    r.push(- 1);
+    return r;
+}
+
+/// The byte before column `k` of `l` that is not a space, or 0.
+fn lsp_prev_byte(l: str, k: i64) -> i64 {
+    var b: i64 = k - 1;
+    while b >= 0 && (str_byte_at(l, b) == 32 || str_byte_at(l, b) == 9) {
+        b = b - 1;
+    }
+    if b < 0 {
+        return 0;
+    }
+    return str_byte_at(l, b);
+}
+
+/// The byte at or after column `e` of `l` that is not a space, or 0.
+fn lsp_next_byte(l: str, e: i64) -> i64 {
+    var a: i64 = e;
+    while a < str_len(l) && (str_byte_at(l, a) == 32 || str_byte_at(l, a) == 9) {
+        a = a + 1;
+    }
+    if a >= str_len(l) {
+        return 0;
+    }
+    return str_byte_at(l, a);
+}
+
+/// Is the name at [k, e) of `l` the symbol searched for? Not a field or
+/// method (`.x`, when `skip_dot`); for a local also not a path (`T::x`,
+/// `x::y`) and, in a body, not a struct-literal field (`{ x: ..`, `, x: ..`).
+fn lsp_occ_ok(l: str, k: i64, e: i64, in_body: bool, skip_dot: bool, is_local: bool) -> bool {
+    var b: i64 = k - 1;
+    while b >= 0 && str_byte_at(l, b) == 32 {
+        b = b - 1;
+    }
+    if b >= 0 && str_byte_at(l, b) == 46 && skip_dot && !(b > 0 && str_byte_at(l, b - 1) == 46) {
+        return false;
+    }
+    if !is_local {
+        return true;
+    }
+    if b > 0 && str_byte_at(l, b) == 58 && str_byte_at(l, b - 1) == 58 {
+        return false;
+    }
+    var a: i64 = e;
+    while a < str_len(l) && str_byte_at(l, a) == 32 {
+        a = a + 1;
+    }
+    var colon: bool = a < str_len(l) && str_byte_at(l, a) == 58;
+    var dcolon: bool = colon && a + 1 < str_len(l) && str_byte_at(l, a + 1) == 58;
+    if dcolon {
+        return false;
+    }
+    if colon && in_body {
+        var pc: i64 = lsp_prev_byte(l, k);
+        if pc == 0 || pc == 123 || pc == 44 {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The occurrences of `name` in code (not in strings or comments) on the
+/// lines [l0, l1], as (line, column, length); on line l0 only those at or
+/// before column `first_max` (when it is 0 or more). Lines after
+/// `body_from` are a function body (struct-literal fields there are not a
+/// local).
+fn lsp_code_occ(lines: Vec<str>, name: str, l0: i64, l1: i64, first_max: i64, body_from: i64, skip_dot: bool, is_local: bool) -> Vec<I64Triple> {
+    var r: Vec<I64Triple> = Vec::new();
+    var nlen: i64 = str_len(name);
+    if nlen == 0 {
+        return r;
+    }
+    var in_str: bool = false;
+    var li: i64 = l0;
+    if li < 0 {
+        li = 0;
+    }
+    while li <= l1 && li < lines.len() {
+        var l: str = lines.get(li);
+        var n: i64 = str_len(l);
+        var k: i64 = 0;
+        while k < n {
+            var c: i64 = str_byte_at(l, k);
+            if in_str {
+                if c == 92 {
+                    k = k + 1;
+                } else if c == 34 {
+                    in_str = false;
+                }
+                k = k + 1;
+            } else if c == 34 {
+                in_str = true;
+                k = k + 1;
+            } else if c == 47 && k + 1 < n && str_byte_at(l, k + 1) == 47 {
+                k = n;
+            } else if c == 39 {
+                k = ih_skip_literal(l, k);
+            } else if is_ident_char(c) {
+                var e: i64 = k;
+                while e < n && is_ident_char(str_byte_at(l, e)) {
+                    e = e + 1;
+                }
+                var in_range: bool = li != l0 || first_max < 0 || k <= first_max;
+                if in_range && e - k == nlen && str_slice(l, k, e) == name && lsp_occ_ok(l, k, e, li > body_from, skip_dot, is_local) {
+                    r.push(I64Triple_new(li, k, nlen));
+                }
+                k = e;
+            } else {
+                k = k + 1;
+            }
+        }
+        li = li + 1;
+    }
+    return r;
+}
+
+/// How line `l` declares the local `name`: [mode, column], mode 1 for
+/// `var`/`val`/`let`/`mut` (to the end of the block), 2 for a `for`
+/// variable or a match-arm or closure binding (its own braces, or the
+/// line); [0, -1] when it does not.
+fn lsp_decl_col(l: str, name: str) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var kws: Vec<str> = Vec::new();
+    kws.push("var ");
+    kws.push("val ");
+    kws.push("let ");
+    kws.push("mut ");
+    var ki: i64 = 0;
+    while ki < kws.len() {
+        var c: i64 = find_word_after(l, kws.get(ki), name);
+        if c >= 0 {
+            r.push(1);
+            r.push(c);
+            return r;
+        }
+        ki = ki + 1;
+    }
+    var fc: i64 = find_word_after(l, "for ", name);
+    if fc >= 0 {
+        r.push(2);
+        r.push(fc);
+        return r;
+    }
+    // a binding of a match arm (`V(a, name) =>`) or a closure (`|a, name|`)
+    var n: i64 = str_len(l);
+    var nlen: i64 = str_len(name);
+    var arrow: i64 = str_find(l, "=>");
+    var i: i64 = 0;
+    while i + nlen <= n {
+        if str_slice(l, i, i + nlen) == name && (i == 0 || !is_ident_char(str_byte_at(l, i - 1))) && (i + nlen == n || !is_ident_char(str_byte_at(l, i + nlen))) {
+            var pc: i64 = lsp_prev_byte(l, i);
+            var nc: i64 = lsp_next_byte(l, i + nlen);
+            if arrow > i && (pc == 40 || pc == 44) && (nc == 41 || nc == 44) {
+                r.push(2);
+                r.push(i);
+                return r;
+            }
+            // inside |...|: an odd number of `|` before it
+            var bars: i64 = 0;
+            var j: i64 = 0;
+            while j < i {
+                if str_byte_at(l, j) == 124 {
+                    bars = bars + 1;
+                }
+                j = j + 1;
+            }
+            if bars % 2 == 1 && (pc == 124 || pc == 44) && (nc == 124 || nc == 44 || nc == 58) {
+                r.push(2);
+                r.push(i);
+                return r;
+            }
+        }
+        i = i + 1;
+    }
+    r.push(0);
+    r.push(- 1);
+    return r;
+}
+
+/// The last line of the scope of a local declared on line `li` (mode as
+/// lsp_decl_col), at most `last`.
+fn lsp_scope_end(lines: Vec<str>, li: i64, last: i64, mode: i64) -> i64 {
+    var depth: i64 = 0;
+    var opened: bool = false;
+    var in_str: bool = false;
+    var x: i64 = li;
+    while x <= last && x < lines.len() {
+        var l: str = lines.get(x);
+        var n: i64 = str_len(l);
+        var k: i64 = 0;
+        while k < n {
+            var c: i64 = str_byte_at(l, k);
+            if in_str {
+                if c == 92 {
+                    k = k + 1;
+                } else if c == 34 {
+                    in_str = false;
+                }
+                k = k + 1;
+            } else if c == 34 {
+                in_str = true;
+                k = k + 1;
+            } else if c == 47 && k + 1 < n && str_byte_at(l, k + 1) == 47 {
+                k = n;
+            } else if c == 39 {
+                k = ih_skip_literal(l, k);
+            } else {
+                if c == 123 {
+                    depth = depth + 1;
+                    opened = true;
+                } else if c == 125 {
+                    depth = depth - 1;
+                    if mode == 1 && depth < 0 {
+                        return x;
+                    }
+                    if mode == 2 && opened && depth == 0 {
+                        return x;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        if mode == 2 && !opened {
+            return x;
+        }
+        x = x + 1;
+    }
+    return last;
+}
+
+/// The scope of the local `name` the cursor (0-based `line`, `character`)
+/// is on: [first line, last line, body-open line, declaration line,
+/// declaration column, column limit on the first line]; [-1, ...] when the
+/// name there is not a local of the function around it.
+fn lsp_local_scope(lines: Vec<str>, name: str, line: i64, character: i64) -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    none.push(- 1);
+    none.push(- 1);
+    none.push(- 1);
+    none.push(- 1);
+    none.push(- 1);
+    none.push(- 1);
+    if line < 0 || line >= lines.len() || str_len(name) == 0 {
+        return none;
+    }
+    var span: Vec<i64> = lsp_fn_span(lines, line);
+    var s: i64 = span.get(0);
+    var e: i64 = span.get(1);
+    if s < 0 {
+        return none;
+    }
+    // the cursor's word: a plain name, not a field, method or path
+    var cl: str = lines.get(line);
+    var k: i64 = character;
+    if k > str_len(cl) {
+        k = str_len(cl);
+    }
+    while k > 0 && is_ident_char(str_byte_at(cl, k - 1)) {
+        k = k - 1;
+    }
+    if !lsp_occ_ok(cl, k, k + str_len(name), false, true, true) {
+        return none;
+    }
+    // the line whose `{` opens the body
+    var body: i64 = s;
+    while body < e && str_find(lines.get(body), "{") < 0 {
+        body = body + 1;
+    }
+    // the nearest declaration at or above the cursor whose scope reaches it
+    var li: i64 = line;
+    while li > body || (li == body && li >= s) {
+        var dc: Vec<i64> = lsp_decl_col(lines.get(li), name);
+        var mode: i64 = dc.get(0);
+        // TL4: on the declaration's own line the name is the new local
+        // only at the declaration and after it where it is seen: not in
+        // the initializer or type of `var x = x + 1;` (that `x` is the
+        // one declared before: shadowing in one scope), not in the
+        // iterable of `for x in x {`, not before it on the line
+        if mode > 0 && li == line && k != dc.get(1) {
+            var seen: bool = false;
+            if k > dc.get(1) && mode == 2 {
+                seen = true;
+                var dl: str = lines.get(li);
+                if find_word_after(dl, "for ", name) == dc.get(1) {
+                    var brace: i64 = str_find(str_slice(dl, dc.get(1), str_len(dl)), "{");
+                    seen = brace >= 0 && k > dc.get(1) + brace;
+                }
+            }
+            if !seen {
+                mode = 0;
+            }
+        }
+        if mode > 0 && !(li <= body && fix_param_col(lines.get(li), name) >= 0) {
+            var end: i64 = lsp_scope_end(lines, li, e, mode);
+            if end >= line {
+                var r: Vec<i64> = Vec::new();
+                r.push(li);
+                r.push(end);
+                r.push(body);
+                r.push(li);
+                r.push(dc.get(1));
+                if mode == 1 {
+                    r.push(dc.get(1));
+                } else {
+                    r.push(- 1);
+                }
+                return r;
+            }
+        }
+        if li == body {
+            li = - 1;
+        } else {
+            li = li - 1;
+        }
+    }
+    // a parameter: the whole function
+    var pi: i64 = s;
+    while pi <= body {
+        var pc: i64 = fix_param_col(lines.get(pi), name);
+        if pc >= 0 && (pi > s || pc > str_find(lines.get(pi), "(")) {
+            var r2: Vec<i64> = Vec::new();
+            r2.push(s);
+            r2.push(e);
+            r2.push(body);
+            r2.push(pi);
+            r2.push(pc);
+            r2.push(- 1);
+            return r2;
+        }
+        pi = pi + 1;
+    }
+    return none;
+}
+
+/// The name a top-level (or impl) declaration on `l` declares: `fn`,
+/// `struct`, `enum`, `const`, `trait`, `type`, `cap` (after `pub`), or "".
+fn lsp_decl_name(l: str) -> str {
+    var t: str = str_trim(l);
+    if str_starts_with(t, "pub ") {
+        t = str_trim(str_slice(t, 4, str_len(t)));
+    }
+    var kws: Vec<str> = Vec::new();
+    kws.push("fn ");
+    kws.push("struct ");
+    kws.push("enum ");
+    kws.push("const ");
+    kws.push("trait ");
+    kws.push("type ");
+    kws.push("cap ");
+    var ki: i64 = 0;
+    while ki < kws.len() {
+        var kw: str = kws.get(ki);
+        if str_starts_with(t, kw) {
+            var k: i64 = str_len(kw);
+            while k < str_len(t) && str_byte_at(t, k) == 32 {
+                k = k + 1;
+            }
+            var k0: i64 = k;
+            while k < str_len(t) && is_ident_char(str_byte_at(t, k)) {
+                k = k + 1;
+            }
+            return str_slice(t, k0, k);
+        }
+        ki = ki + 1;
+    }
+    return "";
+}
+
+/// 1 when `text` declares `name` at top level, 2 when only indented (a
+/// method of an `impl`), 0 when not at all.
+fn lsp_declares(text: str, name: str) -> i64 {
+    var lines: Vec<str> = split_lines(text);
+    var found: i64 = 0;
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        if lsp_decl_name(l) == name {
+            if str_len(fix_indent(l)) == 0 {
+                return 1;
+            }
+            found = 2;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+/// The module name of a document: its file name without `.fd`.
+fn lsp_module_name(uri: str) -> str {
+    var slash: i64 = c_str_find_last(uri, "/");
+    var base: str = str_slice(uri, slash + 1, str_len(uri));
+    if str_ends_with(base, ".fd") {
+        base = str_slice(base, 0, str_len(base) - 3);
+    }
+    return base;
+}
+
+/// Does `text` have a `use` line naming the module `m` (`use m;`,
+/// `use a::m;`, `use m::{..}`)?
+fn lsp_uses(text: str, m: str) -> bool {
+    var lines: Vec<str> = split_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() {
+        var t: str = str_trim(lines.get(i));
+        if str_starts_with(t, "pub ") {
+            t = str_trim(str_slice(t, 4, str_len(t)));
+        }
+        if str_starts_with(t, "use ") && fix_word_col(t, m) >= 0 {
+            return true;
+        }
+        // a module line that names several imports: `module x; use m;`
+        if str_starts_with(t, "module ") && str_contains(t, "use ") && fix_word_col(str_slice(t, str_find(t, "use "), str_len(t)), m) >= 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The other files of the workspace: the open documents but `uri`, then
+/// the .fd files of `uri`'s directory that are not open (read from disk).
+fn lsp_workspace_files(documents: Vec<DocEntry>, uri: str) -> Vec<DocEntry> {
+    var out: Vec<DocEntry> = Vec::new();
+    var i: i64 = 0;
+    while i < documents.len() {
+        var d: DocEntry = documents.get(i);
+        if d.uri != uri {
+            out.push(DocEntry_new(d.uri, d.text));
+        }
+        i = i + 1;
+    }
+    var path: str = lsp_uri_path(uri);
+    var slash: i64 = c_str_find_last(uri, "/");
+    if str_len(path) == 0 || slash < 0 {
+        return out;
+    }
+    var dir: str = c_path_dirname(path);
+    var dir_uri: str = str_slice(uri, 0, slash);
+    var me: str = str_slice(uri, slash + 1, str_len(uri));
+    var listing: str = p_dir_list(dir);
+    if str_len(listing) == 0 {
+        return out;
+    }
+    var names: Vec<str> = str_split(listing, "\n");
+    var k: i64 = 0;
+    while k < names.len() && k < 500 {
+        var nm: str = str_trim(names.get(k));
+        if str_ends_with(nm, ".fd") && nm != me {
+            var open: bool = false;
+            var j: i64 = 0;
+            while j < documents.len() {
+                if lsp_module_name(documents.get(j).uri) + ".fd" == nm && c_path_dirname(lsp_uri_path(documents.get(j).uri)) == dir {
+                    open = true;
+                }
+                j = j + 1;
+            }
+            if !open {
+                var src: str = c_file_read(dir + "/" + nm);
+                if str_len(src) > 0 {
+                    out.push(DocEntry_new(dir_uri + "/" + nm, src));
+                }
+            }
+        }
+        k = k + 1;
+    }
+    // TL4: the modules the document imports from below its directory
+    // (`use a::b;` is a/b.fd), as ih_imported_funcs finds them
+    var mytext: str = "";
+    var di: i64 = 0;
+    while di < documents.len() {
+        if documents.get(di).uri == uri {
+            mytext = documents.get(di).text;
+        }
+        di = di + 1;
+    }
+    var ulines: Vec<str> = split_lines(mytext);
+    var ui: i64 = 0;
+    while ui < ulines.len() && ui < 2000 {
+        var ut: str = str_trim(ulines.get(ui));
+        var at: i64 = str_find(ut, "use ");
+        while at >= 0 && (at == 0 || !is_ident_char(str_byte_at(ut, at - 1))) {
+            var rest: str = str_slice(ut, at + 4, str_len(ut));
+            var e: i64 = 0;
+            while e < str_len(rest) && (is_ident_char(str_byte_at(rest, e)) || str_byte_at(rest, e) == 58) {
+                e = e + 1;
+            }
+            var mpath: str = str_slice(rest, 0, e);
+            if str_ends_with(mpath, "::") {
+                mpath = str_slice(mpath, 0, str_len(mpath) - 2);
+            }
+            if str_contains(mpath, "::") {
+                var rel: str = str_replace(mpath, "::", "/") + ".fd";
+                var muri: str = dir_uri + "/" + rel;
+                var have: bool = muri == uri;
+                var oi: i64 = 0;
+                while oi < out.len() {
+                    if out.get(oi).uri == muri {
+                        have = true;
+                    }
+                    oi = oi + 1;
+                }
+                if !have {
+                    var msrc: str = c_file_read(dir + "/" + rel);
+                    if str_len(msrc) > 0 {
+                        out.push(DocEntry_new(muri, msrc));
+                    }
+                }
+            }
+            // the next `use` on the line (`module x; use a::b; use c::d;`)
+            var nx: i64 = str_find(rest, "use ");
+            if nx < 0 {
+                at = - 1;
+            } else {
+                at = at + 4 + nx;
+            }
+        }
+        ui = ui + 1;
+    }
+    return out;
+}
+
+/// The other files where the top-level `name` of `text` (the document
+/// `uri`) is the same symbol: the file that declares it and those that
+/// `use` its module. Empty when no file declares it, or when another
+/// file does and this one does not import it.
+fn lsp_related_files(documents: Vec<DocEntry>, uri: str, text: str, name: str) -> Vec<DocEntry> {
+    var out: Vec<DocEntry> = Vec::new();
+    var all: Vec<DocEntry> = lsp_workspace_files(documents, uri);
+    var def_mod: str = "";
+    if lsp_declares(text, name) > 0 {
+        def_mod = lsp_module_name(uri);
+    } else {
+        var i: i64 = 0;
+        while i < all.len() && str_len(def_mod) == 0 {
+            if lsp_declares(all.get(i).text, name) > 0 {
+                def_mod = lsp_module_name(all.get(i).uri);
+            }
+            i = i + 1;
+        }
+        if str_len(def_mod) == 0 || !lsp_uses(text, def_mod) {
+            return out;
+        }
+    }
+    var j: i64 = 0;
+    while j < all.len() {
+        var d: DocEntry = all.get(j);
+        if lsp_module_name(d.uri) == def_mod || lsp_uses(d.text, def_mod) {
+            out.push(DocEntry_new(d.uri, d.text));
+        }
+        j = j + 1;
+    }
+    return out;
+}
+
+/// One LSP TextEdit replacing the occurrence `t` with `new_name`.
+fn lsp_occ_edit(t: I64Triple, new_name: str) -> Json {
+    var range: JsonObject = JsonObject::new();
+    var start: JsonObject = JsonObject::new();
+    start.insert("line", Json::Num(t.a as f64));
+    start.insert("character", Json::Num(t.b as f64));
+    var end: JsonObject = JsonObject::new();
+    end.insert("line", Json::Num(t.a as f64));
+    end.insert("character", Json::Num((t.b + t.c) as f64));
+    range.insert("start", Json::Obj(start));
+    range.insert("end", Json::Obj(end));
+    var edit_obj: JsonObject = JsonObject::new();
+    edit_obj.insert("range", Json::Obj(range));
+    edit_obj.insert("newText", Json::Str(new_name));
+    return Json::Obj(edit_obj);
+}
+
+/// The occurrences of the local at the cursor (none when the name there
+/// is not a local: see lsp_is_local_at); the declaration only when
+/// `include_decl`.
+fn lsp_local_occ(text: str, name: str, line: i64, character: i64, include_decl: bool) -> Vec<I64Triple> {
+    var out: Vec<I64Triple> = Vec::new();
+    var lines: Vec<str> = split_lines(text);
+    var sc: Vec<i64> = lsp_local_scope(lines, name, line, character);
+    if sc.get(0) < 0 {
+        return out;
+    }
+    var occ: Vec<I64Triple> = lsp_code_occ(lines, name, sc.get(0), sc.get(1), sc.get(5), sc.get(2), true, true);
+    var i: i64 = 0;
+    while i < occ.len() {
+        var t: I64Triple = occ.get(i);
+        // TL4: an occurrence another declaration of the name shadows (a
+        // `var x = x + 1;` later in the same block, or a block inside) is
+        // that one's: each occurrence is resolved by declaration position
+        var own: Vec<i64> = lsp_local_scope(lines, name, t.a, t.b);
+        var same: bool = own.get(3) == sc.get(3) && own.get(4) == sc.get(4);
+        if same && (include_decl || t.a != sc.get(3) || t.b != sc.get(4)) {
+            out.push(t);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// TL4: `occ` (occurrences of the top-level `name` in `text`) without
+/// those that are a local of the same name (a parameter or `var` that
+/// shadows the function, const or global there).
+fn lsp_drop_locals(text: str, name: str, occ: Vec<I64Triple>) -> Vec<I64Triple> {
+    var out: Vec<I64Triple> = Vec::new();
+    var lines: Vec<str> = split_lines(text);
+    var i: i64 = 0;
+    while i < occ.len() {
+        var t: I64Triple = occ.get(i);
+        var sc: Vec<i64> = lsp_local_scope(lines, name, t.a, t.b);
+        if sc.get(0) < 0 {
+            out.push(t);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Is the name at the cursor a local of the function around it?
+fn lsp_is_local_at(text: str, name: str, line: i64, character: i64) -> bool {
+    var sc: Vec<i64> = lsp_local_scope(split_lines(text), name, line, character);
+    return sc.get(0) >= 0;
+}
+
+// --- TL4: inlay hints ------------------------------------------------------
+
+/// The offset just past a string or char literal starting at `i` (a `"`
+/// or `'`), or `i + 1` when the byte at `i` does not open one.
+fn ih_skip_literal(text: str, i: i64) -> i64 {
+    var n: i64 = str_len(text);
+    var c: i64 = str_byte_at(text, i);
+    if c == 34 {
+        var k: i64 = i + 1;
+        while k < n && str_byte_at(text, k) != 34 {
+            if str_byte_at(text, k) == 92 {
+                k = k + 1;
+            }
+            k = k + 1;
+        }
+        return k + 1;
+    }
+    if c == 39 {
+        // 'a' or '\n'; anything else is not a char literal
+        if i + 2 < n && str_byte_at(text, i + 1) != 92 && str_byte_at(text, i + 2) == 39 {
+            return i + 3;
+        }
+        if i + 3 < n && str_byte_at(text, i + 1) == 92 && str_byte_at(text, i + 3) == 39 {
+            return i + 4;
+        }
+    }
+    return i + 1;
+}
+
+/// The offset of the next byte at or after `i` that is not white space.
+fn ih_skip_space(text: str, i: i64) -> i64 {
+    var k: i64 = i;
+    while k < str_len(text) {
+        var b: i64 = str_byte_at(text, k);
+        if b != 32 && b != 9 && b != 10 && b != 13 {
+            return k;
+        }
+        k = k + 1;
+    }
+    return k;
+}
+
+/// Handle textDocument/inlayHint: at each argument of a call of a function
+/// of this file, the name of its parameter (`p:`), on the lines
+/// `first_line`..`last_line` (0-based). An argument written as the
+/// parameter's own name gets none.
+fn handle_inlay_hints(text: str, uri: str, first_line: i64, last_line: i64) -> Json {
+    var hints: Vec<Json> = Vec::new();
+    var program: Program;
+    match parse_program_only(text) {
+        OptProgram::Some(p) => {
+            program = p;
+        }
+        OptProgram::None => {
+            return Json::Arr(hints);
+        }
+    }
+    // the functions a call can name: this file's, then the `pub` ones of
+    // the modules it imports (TL4) found beside it
+    var table: Vec<Func> = Vec::new();
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        table.push(program.funcs.get(fi));
+        fi = fi + 1;
+    }
+    ih_imported_funcs(program, uri, & mut table);
+    // function name -> index + 1 into table
+    var fn_ix: i64 = HashMap_new();
+    fi = 0;
+    while fi < table.len() {
+        var fname: str = table.get(fi).name;
+        if HashMap_get(fn_ix, fname) == 0 {
+            HashMap_insert(fn_ix, fname, fi + 1);
+        }
+        fi = fi + 1;
+    }
+    // TL4: methods (`fn m(self, ..)` in an impl, or `fn T_m(self, ..)`):
+    // name -> index + 1 into meths, -1 when two types have one of that name
+    var meths: Vec<Func> = Vec::new();
+    var owners: Vec<str> = Vec::new();
+    var meth_ix: i64 = HashMap_new();
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var mj: i64 = 0;
+        var owner: str = program.impls.get(ii).struct_name;
+        while mj < program.impls.get(ii).methods.len() {
+            var mf: Func = program.impls.get(ii).methods.get(mj);
+            var mname: str = mf.name;
+            // a method's name may carry its type (`T_m`)
+            if str_starts_with(mname, owner + "_") {
+                mname = str_slice(mname, str_len(owner) + 1, str_len(mname));
+            }
+            ih_add_method(mname, owner, mf, & mut meths, & mut owners, meth_ix);
+            mj = mj + 1;
+        }
+        ii = ii + 1;
+    }
+    fi = 0;
+    while fi < table.len() {
+        var tf: Func = table.get(fi);
+        // `fn T_m(self: ..)`: T's method m
+        var us: i64 = str_find(tf.name, "_");
+        if us > 0 && tf.params.len() > 0 && tf.params.get(0).name == "self" {
+            ih_add_method(str_slice(tf.name, us + 1, str_len(tf.name)), str_slice(tf.name, 0, us), tf, & mut meths, & mut owners, meth_ix);
+        }
+        fi = fi + 1;
+    }
+    var starts: Vec<i64> = fix_line_starts(split_lines(text));
+    var n: i64 = str_len(text);
+    var prev_word: str = "";
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(text, i);
+        if c == 47 && i + 1 < n && str_byte_at(text, i + 1) == 47 {
+            while i < n && str_byte_at(text, i) != 10 {
+                i = i + 1;
+            }
+        } else if c == 34 || c == 39 {
+            i = ih_skip_literal(text, i);
+        } else if is_ident_char(c) {
+            var j: i64 = i;
+            while j < n && is_ident_char(str_byte_at(text, j)) {
+                j = j + 1;
+            }
+            var w: str = str_slice(text, i, j);
+            var before: i64 = 0;
+            if i > 0 {
+                before = str_byte_at(text, i - 1);
+            }
+            var paren: i64 = ih_skip_space(text, j);
+            var idx: i64 = 0;
+            // a call `w(`: not a declaration (`fn w(`), a method (`.w(`)
+            // or a path (`T::w(`)
+            if paren < n && str_byte_at(text, paren) == 40 && prev_word != "fn" && before != 46 && before != 58 {
+                idx = HashMap_get(fn_ix, w);
+            }
+            if idx > 0 {
+                var f: Func = table.get(idx - 1);
+                ih_call_hints(text, starts, paren, f, 0, first_line, last_line, & mut hints);
+            }
+            // TL4: a method call `.w(`: the parameters after `self`, when
+            // one type has a method of that name
+            if paren < n && str_byte_at(text, paren) == 40 && before == 46 {
+                var mi: i64 = HashMap_get(meth_ix, w);
+                if mi > 0 {
+                    var mf2: Func = meths.get(mi - 1);
+                    var first: i64 = 0;
+                    if mf2.params.len() > 0 && mf2.params.get(0).name == "self" {
+                        first = 1;
+                    }
+                    ih_call_hints(text, starts, paren, mf2, first, first_line, last_line, & mut hints);
+                }
+            }
+            prev_word = w;
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    // TL4: the type of a local declared without one (`var x = f(..);`)
+    var lines: Vec<str> = split_lines(text);
+    var enum_names: Vec<str> = Vec::new();
+    var ei: i64 = 0;
+    while ei < program.enums.len() {
+        enum_names.push(program.enums.get(ei).name);
+        ei = ei + 1;
+    }
+    // TL4: methods by "Type.m" for the type of a method-call initializer
+    // (`var r = p.scale(3);`, `var q = Pt::origin();`)
+    var ctx: IhCtx = IhCtx_new(table, fn_ix, enum_names);
+    var si: i64 = 0;
+    while si < program.structs.len() {
+        ctx.struct_names.push(program.structs.get(si).name);
+        si = si + 1;
+    }
+    ii = 0;
+    while ii < program.impls.len() {
+        var iowner: str = program.impls.get(ii).struct_name;
+        var itps: str = str_join(program.impls.get(ii).type_params, ",");
+        var mj2: i64 = 0;
+        while mj2 < program.impls.get(ii).methods.len() {
+            var imf: Func = program.impls.get(ii).methods.get(mj2);
+            var imname: str = imf.name;
+            if str_starts_with(imname, iowner + "_") {
+                imname = str_slice(imname, str_len(iowner) + 1, str_len(imname));
+            }
+            ih_add_mkey(& mut ctx, iowner + "." + imname, imf, itps);
+            mj2 = mj2 + 1;
+        }
+        ii = ii + 1;
+    }
+    fi = 0;
+    while fi < table.len() {
+        // `fn T_m(..)`: T's method (or static function) m
+        var tf2: Func = table.get(fi);
+        var us2: i64 = str_find(tf2.name, "_");
+        if us2 > 0 && str_byte_at(tf2.name, 0) >= 65 && str_byte_at(tf2.name, 0) <= 90 {
+            ih_add_mkey(& mut ctx, str_slice(tf2.name, 0, us2) + "." + str_slice(tf2.name, us2 + 1, str_len(tf2.name)), tf2, "");
+        }
+        fi = fi + 1;
+    }
+    fi = 0;
+    while fi < program.funcs.len() {
+        var pf: Func = program.funcs.get(fi);
+        ih_type_hints(pf.body, lines, ctx, ih_param_names(pf), ih_param_types(pf, ""), first_line, last_line, & mut hints);
+        fi = fi + 1;
+    }
+    ii = 0;
+    while ii < program.impls.len() {
+        var mk: i64 = 0;
+        while mk < program.impls.get(ii).methods.len() {
+            var pm: Func = program.impls.get(ii).methods.get(mk);
+            ih_type_hints(pm.body, lines, ctx, ih_param_names(pm), ih_param_types(pm, program.impls.get(ii).struct_name), first_line, last_line, & mut hints);
+            mk = mk + 1;
+        }
+        ii = ii + 1;
+    }
+    return Json::Arr(hints);
+}
+
+/// TL4: what a type hint can look up: the functions (`table`, `fn_ix`:
+/// name -> index + 1), the methods by "Type.m" (`mkey_ix` -> index + 1
+/// into `mfuncs`, -1 when two impls have one of that key) with their
+/// impl's type parameters (`mtps`, joined by ","), the enums and structs
+/// of the file.
+pub struct IhCtx {
+    pub table: Vec<Func>,
+    pub fn_ix: i64,
+    pub enum_names: Vec<str>,
+    pub struct_names: Vec<str>,
+    pub mfuncs: Vec<Func>,
+    pub mtps: Vec<str>,
+    pub mkey_ix: i64,
+}
+
+pub fn IhCtx_new(table: Vec<Func>, fn_ix: i64, enum_names: Vec<str>) -> IhCtx {
+    return IhCtx {
+        table: table, fn_ix: fn_ix, enum_names: enum_names, struct_names: Vec::new(), mfuncs: Vec::new(), mtps: Vec::new(), mkey_ix: HashMap_new()
+    };
+}
+
+/// Record the method `f` under `key` ("Type.m"), with its impl's type
+/// parameters `tps`; a second one under the same key makes it ambiguous.
+fn ih_add_mkey(ctx: & mut IhCtx, key: str, f: Func, tps: str) {
+    var at: i64 = HashMap_get(ctx.mkey_ix, key);
+    if at == 0 {
+        ctx.mfuncs.push(f);
+        ctx.mtps.push(tps);
+        HashMap_insert(ctx.mkey_ix, key, ctx.mfuncs.len());
+    } else if at > 0 {
+        HashMap_insert(ctx.mkey_ix, key, - 1);
+    }
+}
+
+/// The names of `f`'s parameters.
+fn ih_param_names(f: Func) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < f.params.len() {
+        out.push(f.params.get(i).name);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The types of `f`'s parameters, as text; `self` without a type of its
+/// own is `owner`.
+fn ih_param_types(f: Func, owner: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < f.params.len() {
+        var t: str = type_to_str(f.params.get(i).ty);
+        if f.params.get(i).name == "self" && str_len(owner) > 0 && (t == "Self" || t == "_" || t == "&Self" || t == "&mut Self" || str_len(t) == 0) {
+            t = owner;
+        }
+        out.push(t);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The type of the local `name` in the environment (the last entry of
+/// that name), or "".
+fn ih_env_get(env_n: Vec<str>, env_t: Vec<str>, name: str) -> str {
+    var i: i64 = env_n.len() - 1;
+    while i >= 0 {
+        if env_n.get(i) == name {
+            return env_t.get(i);
+        }
+        i = i - 1;
+    }
+    return "";
+}
+
+/// `t` without a leading `&` / `&mut `.
+fn ih_deref(t: str) -> str {
+    var s: str = str_trim(t);
+    if str_starts_with(s, "&mut ") {
+        return str_trim(str_slice(s, 5, str_len(s)));
+    }
+    if str_starts_with(s, "& mut ") {
+        return str_trim(str_slice(s, 6, str_len(s)));
+    }
+    if str_starts_with(s, "&") {
+        return str_trim(str_slice(s, 1, str_len(s)));
+    }
+    return s;
+}
+
+/// The type arguments of `t` (`Pair<i64, Vec<str>>` -> [i64, Vec<str>]),
+/// split at its top-level commas; none when it has no `<..>`.
+fn ih_type_args(t: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var lt: i64 = str_find(t, "<");
+    if lt < 0 || !str_ends_with(t, ">") {
+        return out;
+    }
+    var depth: i64 = 0;
+    var from: i64 = lt + 1;
+    var k: i64 = lt + 1;
+    var end: i64 = str_len(t) - 1;
+    while k < end {
+        var c: i64 = str_byte_at(t, k);
+        if c == 60 || c == 40 || c == 91 {
+            depth = depth + 1;
+        } else if c == 62 || c == 41 || c == 93 {
+            depth = depth - 1;
+        } else if c == 44 && depth == 0 {
+            out.push(str_trim(str_slice(t, from, k)));
+            from = k + 1;
+        }
+        k = k + 1;
+    }
+    if end > from {
+        out.push(str_trim(str_slice(t, from, end)));
+    }
+    return out;
+}
+
+/// The name of `t` before its type arguments (`Vec<i64>` -> `Vec`).
+fn ih_type_head(t: str) -> str {
+    var lt: i64 = str_find(t, "<");
+    if lt < 0 {
+        return t;
+    }
+    return str_trim(str_slice(t, 0, lt));
+}
+
+/// Bind the type parameters `tps` that the parameter type `p` holds to
+/// what the argument type `a` has there (`Vec<T>` against `Vec<i64>`:
+/// T = i64); a parameter bound already keeps its first binding.
+fn ih_unify(p: str, a: str, tps: Vec<str>, names: & mut Vec<str>, vals: & mut Vec<str>) {
+    var pt: str = ih_deref(p);
+    var at: str = ih_deref(a);
+    if str_len(at) == 0 {
+        return;
+    }
+    if ih_str_vec_has(tps, pt) {
+        var bound: bool = false;
+        var j: i64 = 0;
+        while j < names.len() {
+            if names.get(j) == pt {
+                bound = true;
+            }
+            j = j + 1;
+        }
+        if !bound {
+            names.push(pt);
+            vals.push(at);
+        }
+        return;
+    }
+    if ih_type_head(pt) != ih_type_head(at) {
+        return;
+    }
+    var pa: Vec<str> = ih_type_args(pt);
+    var aa: Vec<str> = ih_type_args(at);
+    if pa.len() != aa.len() {
+        return;
+    }
+    var i: i64 = 0;
+    while i < pa.len() {
+        ih_unify(pa.get(i), aa.get(i), tps, names, vals);
+        i = i + 1;
+    }
+}
+
+/// `t` with each whole-word name of `names` replaced by its `vals` entry.
+fn ih_subst(t: str, names: Vec<str>, vals: Vec<str>) -> str {
+    var out: str = "";
+    var n: i64 = str_len(t);
+    var k: i64 = 0;
+    while k < n {
+        var c: i64 = str_byte_at(t, k);
+        if is_ident_char(c) {
+            var e: i64 = k;
+            while e < n && is_ident_char(str_byte_at(t, e)) {
+                e = e + 1;
+            }
+            var w: str = str_slice(t, k, e);
+            var rep: str = w;
+            var j: i64 = 0;
+            while j < names.len() {
+                if names.get(j) == w {
+                    rep = vals.get(j);
+                }
+                j = j + 1;
+            }
+            out = out + rep;
+            k = e;
+        } else {
+            out = out + str_slice(t, k, k + 1);
+            k = k + 1;
+        }
+    }
+    return out;
+}
+
+/// Does `t` still name one of the type parameters `tps`?
+fn ih_has_tp(t: str, tps: Vec<str>) -> bool {
+    var n: i64 = str_len(t);
+    var k: i64 = 0;
+    while k < n {
+        if is_ident_char(str_byte_at(t, k)) {
+            var e: i64 = k;
+            while e < n && is_ident_char(str_byte_at(t, e)) {
+                e = e + 1;
+            }
+            if ih_str_vec_has(tps, str_slice(t, k, e)) {
+                return true;
+            }
+            k = e;
+        } else {
+            k = k + 1;
+        }
+    }
+    return false;
+}
+
+/// The return type of a call of `f` with `args` (types of the locals in
+/// `env_n`/`env_t`): a generic one with its type parameters inferred from
+/// the arguments (`first_of(nums)` with `nums: Vec<i64>`, `fn
+/// first_of<T>(v: Vec<T>) -> T`: i64). `skip` parameters come before the
+/// arguments (1 for `self`), `bound_n`/`bound_v` are bound already (an
+/// impl's), `all_tps` every type parameter in play; "" when the type
+/// cannot be told.
+fn ih_ret_type(f: Func, args: Vec<Expr>, skip: i64, bound_n: Vec<str>, bound_v: Vec<str>, all_tps: Vec<str>, ctx: IhCtx, env_n: Vec<str>, env_t: Vec<str>) -> str {
+    var ret: str = type_to_str(f.ret_ty);
+    if ret == "void" || str_len(ret) == 0 {
+        return "";
+    }
+    var names: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    var b: i64 = 0;
+    while b < bound_n.len() {
+        names.push(bound_n.get(b));
+        vals.push(bound_v.get(b));
+        b = b + 1;
+    }
+    var tps: Vec<str> = Vec::new();
+    var t: i64 = 0;
+    while t < all_tps.len() {
+        tps.push(all_tps.get(t));
+        t = t + 1;
+    }
+    t = 0;
+    while t < f.type_params.len() {
+        tps.push(f.type_params.get(t));
+        t = t + 1;
+    }
+    if tps.len() > 0 {
+        var i: i64 = 0;
+        while i < args.len() && i + skip < f.params.len() {
+            var at: str = ih_expr_type(args.get(i), ctx, env_n, env_t);
+            ih_unify(type_to_str(f.params.get(i + skip).ty), at, tps, & mut names, & mut vals);
+            i = i + 1;
+        }
+    }
+    if names.len() > 0 {
+        ret = ih_subst(ret, names, vals);
+    }
+    if tps.len() > 0 && ih_has_tp(ret, tps) {
+        return "";
+    }
+    if ret == "Self" {
+        return "";
+    }
+    return ret;
+}
+
+/// Record the method `m` of the type `owner` (the Func `f`) in
+/// `meths`/`owners`/`meth_ix`; a method of that name of another type makes
+/// it ambiguous (-1).
+fn ih_add_method(m: str, owner: str, f: Func, meths: & mut Vec<Func>, owners: & mut Vec<str>, meth_ix: i64) {
+    var at: i64 = HashMap_get(meth_ix, m);
+    if at == 0 {
+        meths.push(f);
+        owners.push(owner);
+        HashMap_insert(meth_ix, m, meths.len());
+    } else if at > 0 {
+        if owners.get(at - 1) != owner {
+            HashMap_insert(meth_ix, m, - 1);
+        }
+    }
+}
+
+/// The `pub` functions of the modules `program` imports, appended to
+/// `table`: `use a::b;` is `a/b.fd` (or `b.fd`) beside the document `uri`.
+fn ih_imported_funcs(program: Program, uri: str, table: & mut Vec<Func>) {
+    var path: str = lsp_uri_path(uri);
+    if str_len(path) == 0 {
+        return;
+    }
+    var dir: str = c_path_dirname(path);
+    var i: i64 = 0;
+    while i < program.imports.len() && i < 64 {
+        var ip: str = program.imports.get(i).path;
+        var rel: str = str_replace(ip, "::", "/");
+        var src: str = c_file_read(dir + "/" + rel + ".fd");
+        if str_len(src) == 0 {
+            var last: i64 = c_str_find_last(rel, "/");
+            if last >= 0 {
+                src = c_file_read(dir + "/" + str_slice(rel, last + 1, str_len(rel)) + ".fd");
+            }
+        }
+        if str_len(src) > 0 {
+            match parse_program_only(src) {
+                OptProgram::Some(mp) => {
+                    var k: i64 = 0;
+                    while k < mp.funcs.len() {
+                        if mp.funcs.get(k).is_pub {
+                            table.push(mp.funcs.get(k));
+                        }
+                        k = k + 1;
+                    }
+                }
+                OptProgram::None => {
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// The type of `e` when it can be read off the expression: a literal, a
+/// struct literal, a cast, a variant of an enum of the file, a local of
+/// the environment (`env_n`/`env_t`), a call of a function of the table
+/// (its return type, a generic one's inferred from the arguments), or a
+/// method call (`p.m(..)`, `T::m(..)`: the method's return type, `Self`
+/// and an impl's type parameters filled in from the receiver's type);
+/// "" otherwise.
+fn ih_expr_type(e: Expr, ctx: IhCtx, env_n: Vec<str>, env_t: Vec<str>) -> str {
+    match e {
+        Expr::Ident(iname) => {
+            return ih_env_get(env_n, env_t, iname);
+        }
+        Expr::MethodCall(recv, mname, margs) => {
+            return ih_method_type(box_expr_unbox(recv), mname, margs, ctx, env_n, env_t);
+        }
+        _ => {
+        }
+    }
+    return ih_expr_type_plain(e, ctx.table, ctx.fn_ix, ctx.enum_names, ctx, env_n, env_t);
+}
+
+/// The return type of the method call `recv.m(args)` (or `T::m(args)`
+/// when `recv` names a type), or "".
+fn ih_method_type(recv: Expr, m: str, args: Vec<Expr>, ctx: IhCtx, env_n: Vec<str>, env_t: Vec<str>) -> str {
+    var rt: str = "";
+    var is_static: bool = false;
+    match recv {
+        Expr::Ident(rn) => {
+            var lt: str = ih_env_get(env_n, env_t, rn);
+            if str_len(lt) == 0 && (ih_str_vec_has(ctx.struct_names, rn) || HashMap_get(ctx.mkey_ix, rn + "." + m) != 0) {
+                rt = rn;
+                is_static = true;
+            } else {
+                rt = lt;
+            }
+        }
+        _ => {
+            rt = ih_expr_type(recv, ctx, env_n, env_t);
+        }
+    }
+    rt = ih_deref(rt);
+    if str_len(rt) == 0 {
+        return "";
+    }
+    var head: str = ih_type_head(rt);
+    var rargs: Vec<str> = ih_type_args(rt);
+    // the core Vec's methods whose result type the receiver tells
+    if head == "Vec" && rargs.len() == 1 && !is_static {
+        if m == "len" {
+            return "i64";
+        }
+        if m == "is_empty" || m == "contains" {
+            return "bool";
+        }
+        if m == "get" {
+            return rargs.get(0);
+        }
+        if m == "clone" {
+            return rt;
+        }
+    }
+    var at: i64 = HashMap_get(ctx.mkey_ix, head + "." + m);
+    if at <= 0 {
+        return "";
+    }
+    var f: Func = ctx.mfuncs.get(at - 1);
+    var itps: Vec<str> = Vec::new();
+    if str_len(ctx.mtps.get(at - 1)) > 0 {
+        itps = str_split(ctx.mtps.get(at - 1), ",");
+    }
+    var bn: Vec<str> = Vec::new();
+    var bv: Vec<str> = Vec::new();
+    bn.push("Self");
+    bv.push(rt);
+    // impl<A, B> Pair<A, B>: A and B are the receiver's type arguments
+    if itps.len() > 0 && itps.len() == rargs.len() {
+        var i: i64 = 0;
+        while i < itps.len() {
+            bn.push(str_trim(itps.get(i)));
+            bv.push(rargs.get(i));
+            i = i + 1;
+        }
+    }
+    var tps: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < itps.len() {
+        tps.push(str_trim(itps.get(k)));
+        k = k + 1;
+    }
+    var skip: i64 = 0;
+    if !is_static && f.params.len() > 0 && f.params.get(0).name == "self" {
+        skip = 1;
+    }
+    return ih_ret_type(f, args, skip, bn, bv, tps, ctx, env_n, env_t);
+}
+
+/// ih_expr_type's cases that need no environment of their own.
+fn ih_expr_type_plain(e: Expr, table: Vec<Func>, fn_ix: i64, enum_names: Vec<str>, ctx: IhCtx, env_n: Vec<str>, env_t: Vec<str>) -> str {
+    match e {
+        Expr::IntLit(_) => {
+            return "i64";
+        }
+        Expr::FloatLit(_) => {
+            return "f64";
+        }
+        Expr::StringLit(_) => {
+            return "str";
+        }
+        Expr::FString(_) => {
+            return "str";
+        }
+        Expr::StrConcat(_, _) => {
+            return "str";
+        }
+        Expr::BoolLit(_) => {
+            return "bool";
+        }
+        Expr::StructLit(sn, _, _) => {
+            return sn;
+        }
+        Expr::Cast(_, ct) => {
+            return type_to_str(ct);
+        }
+        Expr::EnumLit(en, _, _) => {
+            if ih_str_vec_has(enum_names, en) {
+                return en;
+            }
+            return "";
+        }
+        Expr::Call(cn, cargs) => {
+            var at: i64 = HashMap_get(fn_ix, cn);
+            if at > 0 {
+                var f: Func = table.get(at - 1);
+                match f.ret_ty {
+                    Type::Void => {
+                        return "";
+                    }
+                    _ => {
+                    }
+                }
+                // TL4: a generic function's return type, its type
+                // parameters inferred from the arguments
+                var no_n: Vec<str> = Vec::new();
+                var no_v: Vec<str> = Vec::new();
+                var no_tps: Vec<str> = Vec::new();
+                return ih_ret_type(f, cargs, 0, no_n, no_v, no_tps, ctx, env_n, env_t);
+            }
+            return "";
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// Is `s` one of `v`?
+fn ih_str_vec_has(v: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == s {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The type hints (`: T` after the name) of the locals declared without a
+/// type in `stmts` and the blocks they hold, on lines first_line..last_line.
+/// `env_n`/`env_t`: the locals in scope and their types (the parameters,
+/// then each local as it is declared: its type, or the one inferred).
+fn ih_type_hints(stmts: Vec<Stmt>, lines: Vec<str>, ctx: IhCtx, env_n: Vec<str>, env_t: Vec<str>, first_line: i64, last_line: i64, hints: & mut Vec<Json>) {
+    // this block's locals: after the block they are out of scope
+    var en: Vec<str> = env_n.clone();
+    var et: Vec<str> = env_t.clone();
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Let(name, ty, expr, _, _, _, line) => {
+                var untyped: bool = false;
+                var declared: str = "";
+                match ty {
+                    OptType::None => {
+                        untyped = true;
+                    }
+                    OptType::Some(dt) => {
+                        declared = type_to_str(dt);
+                    }
+                }
+                var t: str = declared;
+                if untyped {
+                    t = ih_expr_type(expr, ctx, en, et);
+                }
+                // known to the statements after it (an unknown type too,
+                // so it hides an outer local of that name)
+                en.push(name);
+                et.push(t);
+                var l0: i64 = line - 1;
+                if untyped && l0 >= first_line && l0 <= last_line && l0 < lines.len() {
+                    var l: str = lines.get(l0);
+                    var col: i64 = find_word_after(l, "var ", name);
+                    if col < 0 {
+                        col = find_word_after(l, "val ", name);
+                    }
+                    if col < 0 {
+                        col = find_word_after(l, "let ", name);
+                    }
+                    if col < 0 {
+                        col = find_word_after(l, "mut ", name);
+                    }
+                    if str_len(t) > 0 && col >= 0 {
+                        var pos: JsonObject = JsonObject::new();
+                        pos.insert("line", Json::Num(l0 as f64));
+                        pos.insert("character", Json::Num((col + str_len(name)) as f64));
+                        var hint: JsonObject = JsonObject::new();
+                        hint.insert("position", Json::Obj(pos));
+                        hint.insert("label", Json::Str(": " + t));
+                        hint.insert("kind", Json::Num(1.0));
+                        hints.push(Json::Obj(hint));
+                    }
+                }
+            }
+            Stmt::If(_, tb, eb, _) => {
+                ih_type_hints(tb, lines, ctx, en, et, first_line, last_line, hints);
+                match eb {
+                    OptStmts::Some(es) => {
+                        ih_type_hints(es, lines, ctx, en, et, first_line, last_line, hints);
+                    }
+                    OptStmts::None => {
+                    }
+                }
+            }
+            Stmt::While(_, wb, _) => {
+                ih_type_hints(wb, lines, ctx, en, et, first_line, last_line, hints);
+            }
+            Stmt::For(fvar, fiter, fb, _) => {
+                // the loop variable: an element of a Vec, a number of a range
+                var fen: Vec<str> = en.clone();
+                var fet: Vec<str> = et.clone();
+                var ft: str = "";
+                match fiter {
+                    Expr::Range(_, _, _) => {
+                        ft = "i64";
+                    }
+                    _ => {
+                        var it: str = ih_deref(ih_expr_type(fiter, ctx, en, et));
+                        var ita: Vec<str> = ih_type_args(it);
+                        if ih_type_head(it) == "Vec" && ita.len() == 1 {
+                            ft = ita.get(0);
+                        }
+                    }
+                }
+                fen.push(fvar);
+                fet.push(ft);
+                ih_type_hints(fb, lines, ctx, fen, fet, first_line, last_line, hints);
+            }
+            Stmt::Loop(lb, _) => {
+                ih_type_hints(lb, lines, ctx, en, et, first_line, last_line, hints);
+            }
+            Stmt::Unsafe(ub, _) => {
+                ih_type_hints(ub, lines, ctx, en, et, first_line, last_line, hints);
+            }
+            Stmt::Match(_, arms, _) => {
+                var a: i64 = 0;
+                while a < arms.len() {
+                    ih_type_hints(arms.get(a).body, lines, ctx, en, et, first_line, last_line, hints);
+                    a = a + 1;
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// The hints of one call whose `(` is at `paren`, for the function `f`
+/// (its arguments match the parameters from index `first`: 1 for a
+/// method called as `x.m(..)`).
+fn ih_call_hints(text: str, starts: Vec<i64>, paren: i64, f: Func, first: i64, first_line: i64, last_line: i64, hints: & mut Vec<Json>) {
+    var n: i64 = str_len(text);
+    var k: i64 = ih_skip_space(text, paren + 1);
+    var argi: i64 = first;
+    while k < n && str_byte_at(text, k) != 41 && argi < f.params.len() {
+        var pname: str = f.params.get(argi).name;
+        // the argument's leading name, to skip `f(x)` for a parameter x
+        var e: i64 = k;
+        while e < n && is_ident_char(str_byte_at(text, e)) {
+            e = e + 1;
+        }
+        var lead: str = str_slice(text, k, e);
+        var after: i64 = ih_skip_space(text, e);
+        var same: bool = lead == pname && after < n && (str_byte_at(text, after) == 44 || str_byte_at(text, after) == 41);
+        if !same && pname != "self" && str_len(pname) > 0 {
+            var pos: Json = fix_pos_json(starts, k);
+            var pl: i64 = json_get_int(pos, "line");
+            if pl >= first_line && pl <= last_line {
+                var hint: JsonObject = JsonObject::new();
+                hint.insert("position", pos);
+                hint.insert("label", Json::Str(pname + ":"));
+                hint.insert("kind", Json::Num(2.0));
+                hint.insert("paddingRight", Json::Bool(true));
+                hints.push(Json::Obj(hint));
+            }
+        }
+        // to the next top-level `,` or the closing `)`
+        var depth: i64 = 0;
+        var done: bool = false;
+        while k < n && !done {
+            var b: i64 = str_byte_at(text, k);
+            if b == 34 || b == 39 {
+                k = ih_skip_literal(text, k);
+            } else if b == 40 || b == 91 || b == 123 {
+                depth = depth + 1;
+                k = k + 1;
+            } else if b == 41 || b == 93 || b == 125 {
+                if depth == 0 {
+                    done = true;
+                } else {
+                    depth = depth - 1;
+                    k = k + 1;
+                }
+            } else if b == 44 && depth == 0 {
+                k = ih_skip_space(text, k + 1);
+                done = true;
+            } else {
+                k = k + 1;
+            }
+        }
+        argi = argi + 1;
+    }
 }

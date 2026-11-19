@@ -1,0 +1,45 @@
+// llvm-roadmap MI5/MI17: a difference between `fid emit --nat` (the
+// machine layer) and the default Windows `fid emit` (pe_ir), found while
+// measuring whether the machine layer can become the Windows default.
+//
+// The native mid-end merges calls to functions it believes pure
+// (compiler/rules.fd ru_pure_cse). A Fides function that only calls a
+// runtime builtin with no listed effect (p_tls_create, p_tls_get: lower.fd
+// runtime_effects has no entry for them) got an empty effect mask
+// (iropt.fd iro_absent_call_mask treats a `p_` call with read-only call-site
+// effects as writing nothing), so the wrappers in stdlib/sync.fd counted as
+// pure: two sync_tls_create() calls gave the same key, and sync_tls_get
+// after sync_tls_set reused the value read before the set (0). pe_ir, the C
+// path and the interpreter print the lines below; --nat printed
+// "keys differ: false" and "after set: 0".
+//
+// Expected output:
+// keys differ: true
+// initial: 0
+// after set: 42
+// after overwrite: 100
+// second key: 7
+// first key kept: 100
+
+use sync;
+
+fn bool_str(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() {
+    val k1 = sync_tls_create();
+    val k2 = sync_tls_create();
+    println("keys differ: " + bool_str(k1 != k2));
+    println("initial: " + int_to_str(sync_tls_get(k1)));
+    sync_tls_set(k1, 42);
+    println("after set: " + int_to_str(sync_tls_get(k1)));
+    sync_tls_set(k1, 100);
+    println("after overwrite: " + int_to_str(sync_tls_get(k1)));
+    sync_tls_set(k2, 7);
+    println("second key: " + int_to_str(sync_tls_get(k2)));
+    println("first key kept: " + int_to_str(sync_tls_get(k1)));
+}

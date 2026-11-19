@@ -1,0 +1,157 @@
+// llvm-roadmap TG11 / competitive-roadmap OP21: the simd module's f64
+// intrinsics (stdlib/simd.fd) on the machine layer's vector operations
+// (compiler/nat_ir.fd MO_VLD .. MO_VEND, ng_simd_call). `fid emit` turns
+// add, sub, mul, div, scale and dot into vector loops: SSE2 (AVX2 under
+// --cpu x86-64-v3) on x86-64, NEON on AArch64, RVV under --cpu rv64gcv on
+// RISC-V, two f64 lanes a step (four under AVX2), then a scalar loop for
+// the rest. Lengths 0..9, 33 and 1001 cover an empty input, a tail only,
+// whole vectors only and both; the divisors hold 0.0 and -0.0 in lanes of
+// either position (div keeps `x / 0 is 0` through MO_VZMASK); a float
+// value is kept live across the vector code (FID_NAT_ON=fregs keeps it in
+// a float register beside the vector class); the results are pushed to
+// (a Vec the vector path built must grow like any other). Every value is
+// exact in f64, so the output is the same on `fid run`, ccompile and emit
+// whatever the order of the additions. tests/nattools/simd_check.sh
+// builds it for every target, checks that the vector operations were
+// selected (FID_NAT_DUMP, the disassembly) and compares the output.
+// Expected output:
+// n=0 add=0 sub=0 mul=0 div=0 scale=0 dot=0 len=1
+// n=1 add=0 sub=-2 mul=1 div=1 scale=-2 dot=-1 len=2
+// n=2 add=0 sub=-2 mul=1 div=1 scale=-2 dot=-1 len=3
+// n=3 add=4 sub=0 mul=4 div=4 scale=5 dot=2 len=4
+// n=4 add=16 sub=4 mul=20 div=8 scale=25 dot=10 len=5
+// n=5 add=7 sub=3 mul=0 div=6 scale=12 dot=30 len=6
+// n=6 add=7 sub=3 mul=0 div=6 scale=12 dot=30 len=7
+// n=7 add=13 sub=11 mul=-7 div=0 scale=30 dot=23 len=8
+// n=8 add=29 sub=27 mul=-7 div=0 scale=70 dot=23 len=9
+// n=9 add=19 sub=19 mul=-16 div=-9 scale=47 dot=32 len=10
+// n=33 add=279 sub=263 mul=88 div=7 scale=677 dot=512 len=34
+// n=1001 add=250833 sub=250165 mul=167660 div=43042 scale=626247 dot=504006 len=1002
+// [0, 2, 4, 6, 9]
+// [2, 2, 2, 2, 1]
+// [-1, 0, 3, 8, 20]
+// [-1, 0, 3, 2, 1.25]
+// [1.25, 2.5, 3.75, 5, 6.25]
+// longer b: [0, 4, 3]
+// shared: [2, 4, 6, 8] [2, 4, 6, 8]
+// kept 1.5 5.5
+// done
+
+use simd;
+
+/// The divisor pattern: -1, 0, 1, 2, 4, -0.0, ... (exact quotients)
+fn divisor(i: i64) -> f64 {
+    var k: i64 = i % 6;
+    if k == 0 {
+        return 0.0 - 1.0;
+    }
+    if k == 1 {
+        return 0.0;
+    }
+    if k == 2 {
+        return 1.0;
+    }
+    if k == 3 {
+        return 2.0;
+    }
+    if k == 4 {
+        return 4.0;
+    }
+    return 0.0 * (0.0 - 1.0);
+}
+
+/// sum of v[i] * w(i) for weights 1, -1, 2, -2, ... times 4, as an integer
+/// (every element is a multiple of 0.25)
+fn checksum(v: Vec<f64>) -> i64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        var w: f64 = ((i % 4) as f64) - 1.0;
+        s = s + v.get(i) * w * 4.0;
+        i = i + 1;
+    }
+    return (s / 4.0) as i64;
+}
+
+fn case_n(n: i64) {
+    var a: Vec<f64> = Vec::new();
+    var b: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        a.push((i + 1) as f64);
+        b.push(divisor(i));
+        i = i + 1;
+    }
+    var r_add: Vec<f64> = add(a, b);
+    var r_sub: Vec<f64> = sub(a, b);
+    var r_mul: Vec<f64> = mul(a, b);
+    var r_div: Vec<f64> = div(a, b);
+    var r_scale: Vec<f64> = scale(a, 2.5);
+    var d: f64 = dot(a, b);
+    var cs_add: i64 = checksum(r_add);
+    r_add.push(7.0);
+    print("n=" + int_to_str(n) + " add=" + int_to_str(cs_add) + " sub=" + int_to_str(checksum(r_sub)) + " mul=" + int_to_str(checksum(r_mul)) + " div=" + int_to_str(checksum(r_div)) + " scale=" + int_to_str(checksum(r_scale)) + " dot=" + int_to_str(d as i64) + " len=" + int_to_str(r_add.len()) + "\n");
+}
+
+fn main() {
+    case_n(0);
+    case_n(1);
+    case_n(2);
+    case_n(3);
+    case_n(4);
+    case_n(5);
+    case_n(6);
+    case_n(7);
+    case_n(8);
+    case_n(9);
+    case_n(33);
+    case_n(1001);
+
+    var a: Vec<f64> = Vec::new();
+    var b: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < 5 {
+        a.push((i + 1) as f64);
+        b.push(divisor(i));
+        i = i + 1;
+    }
+    print(to_str(add(a, b)) + "\n");
+    print(to_str(sub(a, b)) + "\n");
+    print(to_str(mul(a, b)) + "\n");
+    print(to_str(div(a, b)) + "\n");
+    print(to_str(scale(a, 1.25)) + "\n");
+
+    // b longer than a: a's length
+    var c: Vec<f64> = Vec::new();
+    c.push(0.0);
+    c.push(2.0);
+    c.push(1.0);
+    var e: Vec<f64> = Vec::new();
+    e.push(5.0);
+    e.push(1.0);
+    e.push(2.0);
+    e.push(9.0);
+    print("longer b: " + to_str(add(mul(c, e), c)) + "\n");
+
+    // a Vec sharing its buffer with another
+    var f: Vec<f64> = Vec::new();
+    f.push(1.0);
+    f.push(2.0);
+    f.push(3.0);
+    f.push(4.0);
+    var g: Vec<f64> = f;
+    print("shared: " + to_str(add(g, f)) + " " + to_str(scale(f, 2.0)) + "\n");
+
+    // a float live across the vector code
+    var k: f64 = 1.5;
+    var h: Vec<f64> = add(f, f);
+    var k2: f64 = k + h.get(1) * 0.5 + 2.0;
+    print("kept " + to_str_f(k) + " " + to_str_f(k2) + "\n");
+    print("done\n");
+}
+
+fn to_str_f(x: f64) -> str {
+    var whole: i64 = x as i64;
+    var frac: i64 = ((x - (whole as f64)) * 10.0) as i64;
+    return int_to_str(whole) + "." + int_to_str(frac);
+}

@@ -1,0 +1,198 @@
+// stdlib/forecast: exponential smoothing (SES, Holt, Holt-Winters), ARIMA by least squares, metrics, backtesting
+// SES: the example of the NIST/SEMATECH e-Handbook of Statistical Methods,
+// section 6.4.3.1 (data 71 70 69 68 64 65 72 78 75 75 75 70; S2 = y1); the
+// handbook's table lists S3..S12 for alpha 0.1 as 70.9, 70.71, 70.44, 69.80,
+// 69.32, 69.58, 70.43, 70.88, 71.29, 71.67 (printed below from S2, with the
+// forecast S13 last). A series that is exactly
+// linear plus an additive season must be forecast exactly by Holt-Winters
+// additive; an exactly linear one by Holt. AR(2) and MA(1) series driven by a
+// fixed pseudo-random sequence must give coefficients near the true ones;
+// the OLS / Hannan-Rissanen estimates were reproduced with numpy.linalg.lstsq.
+// Metrics on (100, 200, 300) vs (110, 190, 330): MAE 50/3, RMSE sqrt(1100/3),
+// MAPE (10 + 5 + 10)/3 %.
+// Expected output:
+// ses 0.1: 71.00 70.90 70.71 70.44 69.80 69.32 69.58 70.43 70.88 71.29 71.67 71.50
+// ses 0.5: 71.00 70.50 69.75 68.88 66.44 65.72 68.86 73.43 74.21 74.61 74.80 72.40
+// ses forecast 0.5: 72.40
+// fitted ses alpha 1.000 sse 139.00
+// holt on 3 + 2t: 43.0000 45.0000 47.0000
+// hw additive exact: 22.0000 19.5000 24.0000 17.5000
+// hw multiplicative fitted mape on the next season 0.00 %
+// ar(2) phi=0.57 -0.27 c=1.01 within 0.05: true
+// ma(1) theta=0.50 within 0.08: true
+// arima(1,1,0) forecasts: 30.0000 32.0000 34.0000
+// mae 16.6667 rmse 19.1485 mape 8.3333 smape 8.0586
+// backtest ses 0.5 one step from t=3: n=9 mae 3.4485 rmse 4.4499
+use forecast;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn row(v: &Vec<f64>, from: i64, d: i64) -> str {
+    var out: str = "";
+    var i: i64 = from;
+    while i < v.len() {
+        if i > from {
+            out = out + " ";
+        }
+        out = out + fx(v.get(i), d);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn nist() -> Vec<f64> {
+    var y: Vec<f64> = Vec::new();
+    y.push(71.0);
+    y.push(70.0);
+    y.push(69.0);
+    y.push(68.0);
+    y.push(64.0);
+    y.push(65.0);
+    y.push(72.0);
+    y.push(78.0);
+    y.push(75.0);
+    y.push(75.0);
+    y.push(75.0);
+    y.push(70.0);
+    return y;
+}
+
+// uniform in [-0.5, 0.5) from a fixed LCG
+fn shock(seed: &mut i64) -> f64 {
+    *seed = (*seed * 1103515245 + 12345) % 2147483648;
+    return ((*seed) as f64) / 2147483648.0 - 0.5;
+}
+
+fn main() {
+    val y = nist();
+    // S_t for t = 1..11 of the 0-based series (S_2..S_12 of the handbook)
+    val s1 = fc_ses_smooth(&y, 0.1);
+    println("ses 0.1: " + row(&s1, 1, 2));
+    val s5 = fc_ses_smooth(&y, 0.5);
+    println("ses 0.5: " + row(&s5, 1, 2));
+    println("ses forecast 0.5: " + fx(fc_ses(&y, 0.5, 3).get(2), 2));
+    val fit = fc_fit(&y, FC_SES, 0);
+    println("fitted ses alpha " + fx(fit.alpha, 3) + " sse " + fx(fc_sse(&y, &fit, 1), 2));
+
+    var lin: Vec<f64> = Vec::new();
+    var t: i64 = 0;
+    while t < 20 {
+        lin.push(3.0 + 2.0 * (t as f64));
+        t = t + 1;
+    }
+    println("holt on 3 + 2t: " + row(&fc_holt(&lin, 0.3, 0.2, 3), 0, 4));
+
+    var sea: Vec<f64> = Vec::new();
+    var sm: Vec<f64> = Vec::new();
+    sm.push(2.0);
+    sm.push(-1.0);
+    sm.push(3.0);
+    sm.push(-4.0);
+    t = 0;
+    while t < 20 {
+        sea.push(10.0 + 0.5 * (t as f64) + sm.get(t % 4));
+        t = t + 1;
+    }
+    println("hw additive exact: " + row(&fc_holt_winters(&sea, 4, 0.4, 0.2, 0.3, false, 4), 0, 4));
+
+    var mul: Vec<f64> = Vec::new();
+    var fac: Vec<f64> = Vec::new();
+    fac.push(1.2);
+    fac.push(0.8);
+    fac.push(1.1);
+    fac.push(0.9);
+    t = 0;
+    while t < 28 {
+        mul.push((50.0 + 2.0 * (t as f64)) * fac.get(t % 4));
+        t = t + 1;
+    }
+    var train: Vec<f64> = Vec::new();
+    var test: Vec<f64> = Vec::new();
+    t = 0;
+    while t < 28 {
+        if t < 24 {
+            train.push(mul.get(t));
+        } else {
+            test.push(mul.get(t));
+        }
+        t = t + 1;
+    }
+    val mfit = fc_fit(&train, FC_HW_MUL, 4);
+    val mf = fc_forecast(&train, &mfit, 4);
+    println("hw multiplicative fitted mape on the next season " + fx(fc_mape(&test, &mf), 2) + " %");
+
+    var seed: i64 = 7;
+    var ar: Vec<f64> = Vec::new();
+    ar.push(0.0);
+    ar.push(0.0);
+    t = 2;
+    while t < 600 {
+        ar.push(1.0 + 0.6 * ar.get(t - 1) - 0.3 * ar.get(t - 2) + shock(&mut seed));
+        t = t + 1;
+    }
+    val af = fc_arima_fit(&ar, 2, 0, 0);
+    val ok_ar: bool = math_fabs(af.ar.get(0) - 0.6) < 0.05 && math_fabs(af.ar.get(1) + 0.3) < 0.05 && math_fabs(af.c - 1.0) < 0.05;
+    println("ar(2) phi=" + fx(af.ar.get(0), 2) + " " + fx(af.ar.get(1), 2) + " c=" + fx(af.c, 2) + " within 0.05: " + bool_to_str(ok_ar));
+
+    var ma: Vec<f64> = Vec::new();
+    var prev: f64 = 0.0;
+    t = 0;
+    while t < 800 {
+        val e: f64 = shock(&mut seed);
+        ma.push(e + 0.5 * prev);
+        prev = e;
+        t = t + 1;
+    }
+    val mf1 = fc_arima_fit(&ma, 0, 0, 1);
+    println("ma(1) theta=" + fx(mf1.ma.get(0), 2) + " within 0.08: " + bool_to_str(math_fabs(mf1.ma.get(0) - 0.5) < 0.08));
+
+    // a random walk with drift 2 has constant differences: AR on the
+    // differences predicts the drift
+    var rw: Vec<f64> = Vec::new();
+    t = 0;
+    while t < 15 {
+        rw.push(2.0 * (t as f64));
+        t = t + 1;
+    }
+    val rf = fc_arima_fit(&rw, 1, 1, 0);
+    println("arima(1,1,0) forecasts: " + row(&fc_arima_forecast(&rf, 3), 0, 4));
+
+    var a: Vec<f64> = Vec::new();
+    a.push(100.0);
+    a.push(200.0);
+    a.push(300.0);
+    var f: Vec<f64> = Vec::new();
+    f.push(110.0);
+    f.push(190.0);
+    f.push(330.0);
+    println("mae " + fx(fc_mae(&a, &f), 4) + " rmse " + fx(fc_rmse(&a, &f), 4) + " mape " + fx(fc_mape(&a, &f), 4) + " smape " + fx(fc_smape(&a, &f), 4));
+    val bt = fc_backtest(&y, &fc_model(FC_SES, 0.5, 0.0, 0.0, 0), 3, 1);
+    println("backtest ses 0.5 one step from t=3: n=" + int_to_str(bt.actual.len()) + " mae " + fx(bt.mae, 4) + " rmse " + fx(bt.rmse, 4));
+}

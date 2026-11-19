@@ -1,6 +1,64 @@
 // Test @cfg conditional compilation
 // On Linux, @cfg(linux) items are included, @cfg(windows) items are excluded.
 // On Windows, @cfg(windows) items are included, @cfg(linux) items are excluded.
+// PL3: every tier-1 and tier-2 target has exactly one variant of each
+// platform function (Windows x64/ARM64, Linux x64/ARM64/RISC-V, macOS,
+// FreeBSD, WASI), so the test builds and passes on each. `freebsd`, `unix`
+// and `wasi` are known conditions (compiler.fd cfg_os_cond): before, an
+// unknown condition held everywhere, so `os_tag`'s FreeBSD variant (first)
+// and `is_unix` held on Windows too.
+// Expected output:
+// All @cfg tests passed!
+
+@cfg(freebsd)
+fn os_tag() -> str {
+    return "freebsd";
+}
+
+@cfg(linux)
+fn os_tag() -> str {
+    return "linux";
+}
+
+@cfg(windows)
+fn os_tag() -> str {
+    return "windows";
+}
+
+@cfg(macos)
+fn os_tag() -> str {
+    return "macos";
+}
+
+@cfg(wasi)
+fn os_tag() -> str {
+    return "wasi";
+}
+
+@cfg(unix)
+fn is_unix() -> bool {
+    return true;
+}
+
+@cfg(windows)
+fn is_unix() -> bool {
+    return false;
+}
+
+@cfg(wasi)
+fn is_unix() -> bool {
+    return false;
+}
+
+@cfg(os = "freebsd")
+fn freebsd_os_fn() -> i64 {
+    return 500;
+}
+
+@cfg(target_os = "unix")
+fn unix_os_fn() -> i64 {
+    return 600;
+}
 
 @cfg(linux)
 fn linux_only_fn() -> i64 {
@@ -53,6 +111,9 @@ fn test_platform_specific() -> i64 {
     assert(linux_only_fn() == 42);
     assert(linux_platform_fn() == 100);
     assert(linux_os_fn() == 200);
+    assert(os_tag() == "linux");
+    assert(is_unix());
+    assert(unix_os_fn() == 600);
     return 0;
 }
 
@@ -61,6 +122,55 @@ fn test_platform_specific() -> i64 {
     assert(windows_only_fn() == 999);
     assert(windows_platform_fn() == 300);
     assert(windows_os_fn() == 400);
+    assert(os_tag() == "windows");
+    assert(!is_unix());
+    return 0;
+}
+
+@cfg(macos)
+fn test_platform_specific() -> i64 {
+    assert(os_tag() == "macos");
+    assert(is_unix());
+    assert(unix_os_fn() == 600);
+    return 0;
+}
+
+@cfg(freebsd)
+fn test_platform_specific() -> i64 {
+    assert(os_tag() == "freebsd");
+    assert(is_unix());
+    assert(freebsd_os_fn() == 500);
+    assert(unix_os_fn() == 600);
+    return 0;
+}
+
+@cfg(wasi)
+fn test_platform_specific() -> i64 {
+    assert(os_tag() == "wasi");
+    assert(!is_unix());
+    return 0;
+}
+
+// The architecture: one variant on each target
+@cfg(x86_64)
+fn test_arch_specific() -> i64 {
+    assert(x86_64_fn() == 64);
+    assert(x86_64_arch_fn() == 128);
+    return 0;
+}
+
+@cfg(aarch64)
+fn test_arch_specific() -> i64 {
+    return 0;
+}
+
+@cfg(riscv64)
+fn test_arch_specific() -> i64 {
+    return 0;
+}
+
+@cfg(arch = "wasm32")
+fn test_arch_specific() -> i64 {
     return 0;
 }
 
@@ -70,9 +180,8 @@ fn main() {
     // Platform-specific tests (one of the above is included)
     test_platform_specific();
 
-    // On x86_64, these should be present
-    assert(x86_64_fn() == 64);
-    assert(x86_64_arch_fn() == 128);
+    // The architecture's checks (x86_64_fn and x86_64_arch_fn on x86-64)
+    test_arch_specific();
 
     println("All @cfg tests passed!");
 }

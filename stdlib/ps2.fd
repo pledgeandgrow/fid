@@ -1,0 +1,538 @@
+// PS/2: the 8042 controller, keyboard command set and scancode sets 1
+// and 2, and mouse packets (standard 3-byte and IntelliMouse 4-byte).
+//
+// What is real: status and configuration bits of the 8042, its command
+// bytes, the initialisation sequence (disable both ports, flush, config
+// without IRQs or translation, controller self test 0x55, dual-channel
+// detection, port tests, enable, device resets); keyboard commands (LEDs,
+// echo, scancode set get/set, identify, typematic rate/delay with the
+// rate formula, enable/disable scanning, reset) with ACK / RESEND
+// handling; mouse commands sent through 0xD4, the IntelliMouse
+// (200/100/80) and 5-button (200/200/80) sample-rate knocks, the 3- and
+// 4-byte packet formats with 9-bit signed deltas, overflow bits and
+// resynchronisation on bit 3; scancode set 1 and set 2 decoders (E0/E1
+// prefixes, F0 breaks, the 8042 set-2 -> set-1 translation table), and
+// modifier / lock state with the LED byte. ASCII comes from stdlib
+// scancode (US layout).
+//
+// The seam: Ps2Io with inb(port) -> byte and outb(port, byte) (port 0x60
+// data, 0x64 status/command); the kernel supplies real port I/O, the test
+// a model of an 8042 with a keyboard and a mouse behind it.
+module ps2;
+ use vec; use scancode;
+
+pub const PS2_DATA: i64 = 0x60;
+pub const PS2_CMD: i64 = 0x64;
+
+// Status register.
+pub const PS2_ST_OBF: i64 = 0x01;
+pub const PS2_ST_IBF: i64 = 0x02;
+pub const PS2_ST_SYS: i64 = 0x04;
+pub const PS2_ST_CMD: i64 = 0x08;
+pub const PS2_ST_AUX: i64 = 0x20;
+pub const PS2_ST_TIMEOUT: i64 = 0x40;
+pub const PS2_ST_PARITY: i64 = 0x80;
+
+// Controller commands.
+pub const PS2C_READ_CONFIG: i64 = 0x20;
+pub const PS2C_WRITE_CONFIG: i64 = 0x60;
+pub const PS2C_DISABLE_P2: i64 = 0xA7;
+pub const PS2C_ENABLE_P2: i64 = 0xA8;
+pub const PS2C_TEST_P2: i64 = 0xA9;
+pub const PS2C_SELF_TEST: i64 = 0xAA;
+pub const PS2C_TEST_P1: i64 = 0xAB;
+pub const PS2C_DISABLE_P1: i64 = 0xAD;
+pub const PS2C_ENABLE_P1: i64 = 0xAE;
+pub const PS2C_WRITE_P2: i64 = 0xD4;
+pub const PS2C_RESET_CPU: i64 = 0xFE;
+
+// Configuration byte.
+pub const PS2_CFG_IRQ1: i64 = 0x01;
+pub const PS2_CFG_IRQ12: i64 = 0x02;
+pub const PS2_CFG_SYS: i64 = 0x04;
+pub const PS2_CFG_CLK1_OFF: i64 = 0x10;
+pub const PS2_CFG_CLK2_OFF: i64 = 0x20;
+pub const PS2_CFG_TRANSLATE: i64 = 0x40;
+
+// Device commands and replies.
+pub const KBD_SET_LEDS: i64 = 0xED;
+pub const KBD_ECHO: i64 = 0xEE;
+pub const KBD_SCANCODE_SET: i64 = 0xF0;
+pub const DEV_IDENTIFY: i64 = 0xF2;
+pub const KBD_TYPEMATIC: i64 = 0xF3;
+pub const MOUSE_SAMPLE_RATE: i64 = 0xF3;
+pub const DEV_ENABLE: i64 = 0xF4;
+pub const DEV_DISABLE: i64 = 0xF5;
+pub const DEV_DEFAULTS: i64 = 0xF6;
+pub const DEV_RESET: i64 = 0xFF;
+pub const MOUSE_RESOLUTION: i64 = 0xE8;
+
+pub const PS2_ACK: i64 = 0xFA;
+pub const PS2_RESEND: i64 = 0xFE;
+pub const PS2_SELF_TEST_OK: i64 = 0xAA;
+pub const PS2_CTRL_TEST_OK: i64 = 0x55;
+
+pub const LED_SCROLL: i64 = 1;
+pub const LED_NUM: i64 = 2;
+pub const LED_CAPS: i64 = 4;
+
+// ─── Port access ────────────────────────────────────────────────────────
+
+pub struct Ps2Io {
+    pub inb: fn(i64) -> i64,
+    pub outb: fn(i64, i64) -> void,
+    pub spins: i64,  // polls before a timeout
+}
+
+pub fn ps2_status(io: & Ps2Io) -> i64 {
+    val f = io.inb;
+    return f(PS2_CMD);
+}
+
+fn ps2_wait_write(io: & Ps2Io) -> bool {
+    var i: i64 = 0;
+    while i < io.spins {
+        if (ps2_status(io) & PS2_ST_IBF) == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Next byte from the output buffer, -1 on a timeout.
+pub fn ps2_read(io: & Ps2Io) -> i64 {
+    val f = io.inb;
+    var i: i64 = 0;
+    while i < io.spins {
+        if (ps2_status(io) & PS2_ST_OBF) != 0 {
+            return f(PS2_DATA);
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Drop whatever is in the output buffer; returns how many bytes.
+pub fn ps2_flush(io: & Ps2Io) -> i64 {
+    val f = io.inb;
+    var n: i64 = 0;
+    while (ps2_status(io) & PS2_ST_OBF) != 0 && n < 64 {
+        f(PS2_DATA);
+        n = n + 1;
+    }
+    return n;
+}
+
+pub fn ps2_cmd(io: & Ps2Io, c: i64) -> bool {
+    val f = io.outb;
+    if !ps2_wait_write(io) {
+        return false;
+    }
+    f(PS2_CMD, c);
+    return true;
+}
+
+pub fn ps2_write_data(io: & Ps2Io, b: i64) -> bool {
+    val f = io.outb;
+    if !ps2_wait_write(io) {
+        return false;
+    }
+    f(PS2_DATA, b);
+    return true;
+}
+
+pub fn ps2_read_config(io: & Ps2Io) -> i64 {
+    ps2_cmd(io, PS2C_READ_CONFIG);
+    return ps2_read(io);
+}
+
+pub fn ps2_write_config(io: & Ps2Io, v: i64) {
+    ps2_cmd(io, PS2C_WRITE_CONFIG);
+    ps2_write_data(io, v);
+}
+
+/// Send a byte to a device (port 2 through 0xD4) and wait for its reply,
+/// resending up to 3 times on 0xFE. Returns the reply or -1.
+pub fn ps2_dev_send(io: & Ps2Io, port2: bool, b: i64) -> i64 {
+    var tries: i64 = 0;
+    while tries < 3 {
+        if port2 {
+            ps2_cmd(io, PS2C_WRITE_P2);
+        }
+        ps2_write_data(io, b);
+        var r: i64 = ps2_read(io);
+        if r != PS2_RESEND {
+            return r;
+        }
+        tries = tries + 1;
+    }
+    return -1;
+}
+
+/// Command plus argument byte, both acknowledged.
+pub fn ps2_dev_cmd_arg(io: & Ps2Io, port2: bool, c: i64, arg: i64) -> bool {
+    if ps2_dev_send(io, port2, c) != PS2_ACK {
+        return false;
+    }
+    return ps2_dev_send(io, port2, arg) == PS2_ACK;
+}
+
+// ─── Controller bring-up ────────────────────────────────────────────────
+
+pub struct Ps2Info {
+    pub ok: bool,
+    pub dual: bool,
+    pub port1: bool,
+    pub port2: bool,
+    pub kbd_present: bool,
+    pub mouse_present: bool,
+    pub config: i64,
+    pub kbd_id: i64,
+    // identify bytes packed (0xAB83 for an MF2 keyboard)
+    pub mouse_id: i64,
+}
+
+/// The standard 8042 initialisation; leaves IRQs 1 and 12 enabled for
+/// the ports that work, translation off (set 2 arrives raw) unless
+/// `translate`.
+pub fn ps2_init(io: & Ps2Io, translate: bool) -> Ps2Info {
+    var info: Ps2Info = Ps2Info { ok: false, dual: false, port1: false, port2: false, kbd_present: false, mouse_present: false, config: 0, kbd_id: -1, mouse_id: -1 };
+    ps2_cmd(io, PS2C_DISABLE_P1);
+    ps2_cmd(io, PS2C_DISABLE_P2);
+    ps2_flush(io);
+    var cfg: i64 = ps2_read_config(io);
+    if cfg < 0 {
+        return info;
+    }
+    cfg = cfg & ~(PS2_CFG_IRQ1 | PS2_CFG_IRQ12 | PS2_CFG_TRANSLATE);
+    ps2_write_config(io, cfg);
+    ps2_cmd(io, PS2C_SELF_TEST);
+    if ps2_read(io) != PS2_CTRL_TEST_OK {
+        return info;
+    }
+    // the self test can reset the configuration byte
+    ps2_write_config(io, cfg);
+    // a second port exists when enabling it clears its clock-disable bit
+    ps2_cmd(io, PS2C_ENABLE_P2);
+    var cfg2: i64 = ps2_read_config(io);
+    info.dual = (cfg2 & PS2_CFG_CLK2_OFF) == 0;
+    if info.dual {
+        ps2_cmd(io, PS2C_DISABLE_P2);
+    }
+    ps2_cmd(io, PS2C_TEST_P1);
+    info.port1 = ps2_read(io) == 0;
+    if info.dual {
+        ps2_cmd(io, PS2C_TEST_P2);
+        info.port2 = ps2_read(io) == 0;
+    }
+    if info.port1 {
+        ps2_cmd(io, PS2C_ENABLE_P1);
+        cfg = cfg | PS2_CFG_IRQ1;
+        cfg = cfg & ~PS2_CFG_CLK1_OFF;
+    }
+    if info.port2 {
+        ps2_cmd(io, PS2C_ENABLE_P2);
+        cfg = cfg | PS2_CFG_IRQ12;
+        cfg = cfg & ~PS2_CFG_CLK2_OFF;
+    }
+    if translate {
+        cfg = cfg | PS2_CFG_TRANSLATE;
+    }
+    if info.port1 && ps2_dev_send(io, false, DEV_RESET) == PS2_ACK {
+        info.kbd_present = ps2_read(io) == PS2_SELF_TEST_OK;
+        if info.kbd_present && ps2_dev_send(io, false, DEV_IDENTIFY) == PS2_ACK {
+            var a: i64 = ps2_read(io);
+            var b: i64 = ps2_read(io);
+            info.kbd_id = a * 256 + b;
+        }
+    }
+    if info.port2 && ps2_dev_send(io, true, DEV_RESET) == PS2_ACK {
+        info.mouse_present = ps2_read(io) == PS2_SELF_TEST_OK;
+        info.mouse_id = ps2_read(io);
+    }
+    ps2_write_config(io, cfg);
+    info.config = cfg;
+    info.ok = true;
+    return info;
+}
+
+// ─── Keyboard ───────────────────────────────────────────────────────────
+
+pub fn ps2_kbd_set_leds(io: & Ps2Io, leds: i64) -> bool {
+    return ps2_dev_cmd_arg(io, false, KBD_SET_LEDS, leds & 7);
+}
+
+/// Select scancode set 1, 2 or 3.
+pub fn ps2_kbd_set_scancode_set(io: & Ps2Io, set: i64) -> bool {
+    return ps2_dev_cmd_arg(io, false, KBD_SCANCODE_SET, set);
+}
+
+/// The current scancode set (as the keyboard reports it), -1 on error.
+pub fn ps2_kbd_get_scancode_set(io: & Ps2Io) -> i64 {
+    if !ps2_dev_cmd_arg(io, false, KBD_SCANCODE_SET, 0) {
+        return -1;
+    }
+    var r: i64 = ps2_read(io);
+    // with translation on, sets read back as their translated codes
+    if r == 0x43 { return 1; }
+    if r == 0x41 { return 2; }
+    if r == 0x3F { return 3; }
+    return r;
+}
+
+/// Typematic rate in tenths of characters per second for a 5-bit rate
+/// code: 1 / ((8 + A) * 2^B * 4.17 ms), A = bits 2:0, B = bits 4:3.
+pub fn ps2_typematic_rate_x10(code: i64) -> i64 {
+    var a: i64 = code & 7;
+    var b: i64 = (code >> 3) & 3;
+    // period in microseconds: (8 + A) * 2^B * 4170
+    var period_us: i64 = (8 + a) * (1 << b) * 4170;
+    return (10000000 + period_us / 2) / period_us;
+}
+
+/// Typematic byte for a repeat rate (tenths of cps, nearest code) and a
+/// delay in ms (250, 500, 750, 1000).
+pub fn ps2_typematic_byte(rate_x10: i64, delay_ms: i64) -> i64 {
+    var best: i64 = 0;
+    var bestd: i64 = -1;
+    var c: i64 = 0;
+    while c < 32 {
+        var d: i64 = ps2_typematic_rate_x10(c) - rate_x10;
+        if d < 0 { d = 0 - d; }
+        if bestd < 0 || d < bestd {
+            best = c;
+            bestd = d;
+        }
+        c = c + 1;
+    }
+    var dl: i64 = (delay_ms + 125) / 250 - 1;
+    if dl < 0 { dl = 0; }
+    if dl > 3 { dl = 3; }
+    return best | (dl << 5);
+}
+
+/// The 8042 translation table: scancode set 2 -> set 1, indexed by the
+/// set-2 code (0x00..0x83); 0 = no key.
+pub const PS2_SET2_TO_SET1: [i64; 132] = [
+    0x00, 0x43, 0x00, 0x3F, 0x3D, 0x3B, 0x3C, 0x58, 0x00, 0x44, 0x42, 0x40,
+    0x3E, 0x0F, 0x29, 0x00, 0x00, 0x38, 0x2A, 0x00, 0x1D, 0x10, 0x02, 0x00,
+    0x00, 0x00, 0x2C, 0x1F, 0x1E, 0x11, 0x03, 0x00, 0x00, 0x2E, 0x2D, 0x20,
+    0x12, 0x05, 0x04, 0x00, 0x00, 0x39, 0x2F, 0x21, 0x14, 0x13, 0x06, 0x00,
+    0x00, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x00, 0x00, 0x00, 0x32, 0x24,
+    0x16, 0x08, 0x09, 0x00, 0x00, 0x33, 0x25, 0x17, 0x18, 0x0B, 0x0A, 0x00,
+    0x00, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0C, 0x00, 0x00, 0x00, 0x28, 0x00,
+    0x1A, 0x0D, 0x00, 0x00, 0x3A, 0x36, 0x1C, 0x1B, 0x00, 0x2B, 0x00, 0x00,
+    0x00, 0x56, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x4F, 0x00, 0x4B,
+    0x47, 0x00, 0x00, 0x00, 0x52, 0x53, 0x50, 0x4C, 0x4D, 0x48, 0x01, 0x45,
+    0x57, 0x4E, 0x51, 0x4A, 0x37, 0x49, 0x46, 0x00, 0x00, 0x00, 0x00, 0x41
+];
+
+/// Set-1 code of a set-2 code, 0 when none.
+pub fn ps2_set2_to_set1(c: i64) -> i64 {
+    if c < 0 || c >= 132 {
+        return 0;
+    }
+    return PS2_SET2_TO_SET1[c];
+}
+
+pub struct KeyEvent {
+    pub valid: bool,
+    // false while a multi-byte sequence is incomplete
+    pub code: i64,
+    // set-1 base code (0x01..0x7F)
+    pub extended: bool,
+    // E0-prefixed (arrows, right ctrl/alt, keypad enter, ...)
+    pub pressed: bool,
+    pub ascii: i64,
+    // 0 for non-printing keys and releases
+    pub pause: bool,
+}
+
+pub struct KbdDecoder {
+    pub set: i64,
+    pub ext: bool,
+    pub brk: bool,
+    pub skip: i64,
+    // remaining bytes of a Pause (E1) sequence
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub leds: i64,
+    pub leds_changed: bool,
+}
+
+pub fn kbd_decoder_new(set: i64) -> KbdDecoder {
+    return KbdDecoder { set: set, ext: false, brk: false, skip: 0, shift: false, ctrl: false, alt: false, leds: 0, leds_changed: false };
+}
+
+fn kbd_none() -> KeyEvent {
+    return KeyEvent { valid: false, code: 0, extended: false, pressed: false, ascii: 0, pause: false };
+}
+
+fn kbd_event(d: & mut KbdDecoder, code: i64, pressed: bool) -> KeyEvent {
+    var e: KeyEvent = KeyEvent { valid: true, code: code, extended: d.ext, pressed: pressed, ascii: 0, pause: false };
+    d.ext = false;
+    d.brk = false;
+    d.leds_changed = false;
+    if code == SC_LSHIFT() || (code == SC_RSHIFT() && !e.extended) {
+        d.shift = pressed;
+    }
+    if code == SC_LCTRL() {
+        d.ctrl = pressed;
+    }
+    if code == 0x38 {
+        d.alt = pressed;
+    }
+    if pressed && !e.extended {
+        if code == SC_CAPS() { d.leds = d.leds ^ LED_CAPS; d.leds_changed = true; }
+        if code == 0x45 { d.leds = d.leds ^ LED_NUM; d.leds_changed = true; }
+        if code == 0x46 { d.leds = d.leds ^ LED_SCROLL; d.leds_changed = true; }
+    }
+    if pressed && !e.extended {
+        var st: i64 = 0;
+        if d.shift { st = st | 1; }
+        if (d.leds & LED_CAPS) != 0 { st = st | 2; }
+        e.ascii = sc_key_char(code, st);
+        if d.ctrl && e.ascii >= 64 && e.ascii < 128 {
+            e.ascii = e.ascii & 0x1F;
+            // Ctrl-letter control codes
+        }
+    }
+    return e;
+}
+
+/// Feed one byte from the keyboard; returns an event once a key's
+/// sequence is complete.
+pub fn kbd_feed(d: & mut KbdDecoder, b: i64) -> KeyEvent {
+    if d.skip > 0 {
+        d.skip = d.skip - 1;
+        if d.skip == 0 {
+            var p: KeyEvent = kbd_none();
+            p.valid = true;
+            p.pause = true;
+            p.pressed = true;
+            return p;
+        }
+        return kbd_none();
+    }
+    if b == 0xE1 {
+        // Pause: E1 1D 45 E1 9D C5 (set 1) / E1 14 77 E1 F0 14 F0 77 (set 2)
+        if d.set == 1 { d.skip = 5; } else { d.skip = 7; }
+        return kbd_none();
+    }
+    if b == 0xE0 {
+        d.ext = true;
+        return kbd_none();
+    }
+    if d.set == 1 {
+        return kbd_event(d, b & 0x7F, (b & 0x80) == 0);
+    }
+    if b == 0xF0 {
+        d.brk = true;
+        return kbd_none();
+    }
+    var code: i64 = ps2_set2_to_set1(b);
+    if code == 0 {
+        d.ext = false;
+        d.brk = false;
+        return kbd_none();
+    }
+    return kbd_event(d, code, !d.brk);
+}
+
+// ─── Mouse ──────────────────────────────────────────────────────────────
+
+/// Sample-rate knock and identify: 3 = IntelliMouse (wheel), 4 = 5-button.
+pub fn ps2_mouse_detect(io: & Ps2Io) -> i64 {
+    ps2_dev_cmd_arg(io, true, MOUSE_SAMPLE_RATE, 200);
+    ps2_dev_cmd_arg(io, true, MOUSE_SAMPLE_RATE, 100);
+    ps2_dev_cmd_arg(io, true, MOUSE_SAMPLE_RATE, 80);
+    var id: i64 = -1;
+    if ps2_dev_send(io, true, DEV_IDENTIFY) == PS2_ACK {
+        id = ps2_read(io);
+    }
+    if id == 3 {
+        ps2_dev_cmd_arg(io, true, MOUSE_SAMPLE_RATE, 200);
+        ps2_dev_cmd_arg(io, true, MOUSE_SAMPLE_RATE, 200);
+        ps2_dev_cmd_arg(io, true, MOUSE_SAMPLE_RATE, 80);
+        if ps2_dev_send(io, true, DEV_IDENTIFY) == PS2_ACK {
+            id = ps2_read(io);
+        }
+    }
+    return id;
+}
+
+pub fn ps2_mouse_enable(io: & Ps2Io) -> bool {
+    return ps2_dev_send(io, true, DEV_ENABLE) == PS2_ACK;
+}
+
+pub struct MousePacket {
+    pub left: bool,
+    pub right: bool,
+    pub middle: bool,
+    pub button4: bool,
+    pub button5: bool,
+    pub dx: i64,
+    pub dy: i64,
+    // positive = up (PS/2 convention)
+    pub dz: i64,
+    // wheel, positive = towards the user
+    pub overflow: bool,
+}
+
+/// Decode a 3- or 4-byte packet starting at b[o] for device id `id`.
+pub fn ps2_mouse_decode(b: Vec<i64>, o: i64, id: i64) -> MousePacket {
+    var b0: i64 = b.get(o);
+    var p: MousePacket = MousePacket {
+        left: (b0 & 1) != 0, right: (b0 & 2) != 0, middle: (b0 & 4) != 0, button4: false, button5: false, dx: b.get(o + 1) - ((b0 << 4) & 0x100), dy: b.get(o + 2) - ((b0 << 3) & 0x100), dz: 0, overflow: (b0 & 0xC0) != 0
+    };
+    if id == 3 {
+        var z: i64 = b.get(o + 3);
+        if z >= 128 { z = z - 256; }
+        p.dz = z;
+    }
+    if id == 4 {
+        var z4: i64 = b.get(o + 3) & 15;
+        if z4 >= 8 { z4 = z4 - 16; }
+        p.dz = z4;
+        p.button4 = (b.get(o + 3) & 0x10) != 0;
+        p.button5 = (b.get(o + 3) & 0x20) != 0;
+    }
+    return p;
+}
+
+pub struct MouseAssembler {
+    pub id: i64,
+    pub buf: Vec<i64>,
+    pub dropped: i64,
+}
+
+pub fn mouse_assembler_new(id: i64) -> MouseAssembler {
+    return MouseAssembler { id: id, buf: Vec::new(), dropped: 0 };
+}
+
+pub fn ps2_packet_size(id: i64) -> i64 {
+    if id == 3 || id == 4 {
+        return 4;
+    }
+    return 3;
+}
+
+/// Feed one byte (from IRQ 12); true when a whole packet is in a.buf.
+/// A first byte without bit 3 set is out of sync and dropped.
+pub fn mouse_feed(a: & mut MouseAssembler, byte: i64) -> bool {
+    if a.buf.len() >= ps2_packet_size(a.id) {
+        a.buf = Vec::new();
+    }
+    if a.buf.len() == 0 && (byte & 0x08) == 0 {
+        a.dropped = a.dropped + 1;
+        return false;
+    }
+    a.buf.push(byte);
+    return a.buf.len() == ps2_packet_size(a.id);
+}
+
+pub fn mouse_packet(a: & MouseAssembler) -> MousePacket {
+    return ps2_mouse_decode(a.buf, 0, a.id);
+}

@@ -1,0 +1,635 @@
+// Fides pcap / pcapng capture files, pure Fides
+//
+// Reads and writes the two capture formats tcpdump and Wireshark use:
+//   - classic pcap (the libpcap format): the 24-byte global header with
+//     either byte order, microsecond (0xA1B2C3D4) or nanosecond
+//     (0xA1B23C4D) timestamps, and the 16-byte record header per packet
+//   - pcapng (draft-ietf-opsawg-pcapng): Section Header Blocks (both byte
+//     orders, several sections in one file), Interface Description Blocks
+//     with their options (if_name, if_description, if_tsresol), Enhanced
+//     Packet Blocks (with opt_comment and epb_flags), Simple Packet Blocks,
+//     and the generic option list; unknown block types are skipped
+//
+// Everything here is real; there is no platform seam. Files are byte
+// vectors (Vec<i64>, one byte 0..255 each): read them with the file module
+// or a socket and hand the bytes over; write the bytes this module returns.
+//
+// Timestamps are kept as seconds plus nanoseconds for both formats. A
+// pcapng interface's if_tsresol decides the unit of its 64-bit timestamps
+// (10^-n when the top bit is clear, 2^-n when set; 10^-6 when absent).
+//
+// Usage:
+//   val f: PcapFile = pcap_read(bytes);
+//   if f.ok { println(int_to_str(f.packets.len())); }
+//   var out: PcapFile = pcap_new(PCAP_LINKTYPE_ETHERNET, 65535);
+//   pcap_add(& mut out, sec, nsec, frame);
+//   val raw: Vec<i64> = pcap_write(& out);
+
+module pcap;
+ use vec;
+
+/// Link-layer header types (www.tcpdump.org/linktypes.html).
+pub const PCAP_LINKTYPE_NULL: i64 = 0;
+pub const PCAP_LINKTYPE_ETHERNET: i64 = 1;
+pub const PCAP_LINKTYPE_RAW: i64 = 101;
+pub const PCAP_LINKTYPE_LINUX_SLL: i64 = 113;
+pub const PCAP_LINKTYPE_IEEE802_11: i64 = 105;
+
+/// pcapng block types.
+pub const PCAPNG_SHB: i64 = 0x0A0D0D0A;
+pub const PCAPNG_IDB: i64 = 1;
+pub const PCAPNG_SPB: i64 = 3;
+pub const PCAPNG_EPB: i64 = 6;
+
+/// One captured packet. `incl_len` is data.len(); `orig_len` the length on
+/// the wire. `iface` is the pcapng interface index (0 for classic pcap).
+pub struct PcapPacket {
+    pub ts_sec: i64,
+    pub ts_nsec: i64,
+    pub orig_len: i64,
+    pub data: Vec<i64>,
+    pub iface: i64,
+    pub comment: str,
+    pub flags: i64,  // epb_flags, -1 when absent
+}
+
+/// A classic pcap file. `nanos`: timestamps are written/read in ns.
+pub struct PcapFile {
+    pub ok: bool,
+    pub error: str,
+    pub big_endian: bool,
+    pub nanos: bool,
+    pub major: i64,
+    pub minor: i64,
+    pub thiszone: i64,
+    pub sigfigs: i64,
+    pub snaplen: i64,
+    pub linktype: i64,
+    pub packets: Vec<PcapPacket>,
+}
+
+/// A pcapng interface (IDB). `tsresol` is the raw if_tsresol byte.
+pub struct PcapngIface {
+    pub linktype: i64,
+    pub snaplen: i64,
+    pub name: str,
+    pub description: str,
+    pub tsresol: i64,
+}
+
+/// A pcapng file: every section's interfaces in order (a packet's `iface`
+/// indexes this list, already offset by the section it came from).
+pub struct PcapngFile {
+    pub ok: bool,
+    pub error: str,
+    pub big_endian: bool,
+    pub major: i64,
+    pub minor: i64,
+    pub sections: i64,
+    pub hardware: str,
+    pub os: str,
+    pub app: str,
+    pub interfaces: Vec<PcapngIface>,
+    pub packets: Vec<PcapPacket>,
+}
+
+// ─── byte helpers ───────────────────────────────────────────────────────
+
+fn pc_u16(b: & Vec<i64>, off: i64, be: bool) -> i64 {
+    if be {
+        return ((b.get(off) & 255) << 8) | (b.get(off + 1) & 255);
+    }
+    return ((b.get(off + 1) & 255) << 8) | (b.get(off) & 255);
+}
+
+fn pc_u32(b: & Vec<i64>, off: i64, be: bool) -> i64 {
+    if be {
+        return (pc_u16(b, off, true) << 16) | pc_u16(b, off + 2, true);
+    }
+    return (pc_u16(b, off + 2, false) << 16) | pc_u16(b, off, false);
+}
+
+fn pc_put16(o: & mut Vec<i64>, v: i64, be: bool) {
+    if be {
+        o.push((v >> 8) & 255);
+        o.push(v & 255);
+    } else {
+        o.push(v & 255);
+        o.push((v >> 8) & 255);
+    }
+}
+
+fn pc_put32(o: & mut Vec<i64>, v: i64, be: bool) {
+    if be {
+        pc_put16(o, (v >> 16) & 65535, true);
+        pc_put16(o, v & 65535, true);
+    } else {
+        pc_put16(o, v & 65535, false);
+        pc_put16(o, (v >> 16) & 65535, false);
+    }
+}
+
+fn pc_pad4(o: & mut Vec<i64>) {
+    while o.len() % 4 != 0 {
+        o.push(0);
+    }
+}
+
+fn pc_slice(b: & Vec<i64>, off: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(b.get(off + i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pc_text(b: & Vec<i64>, off: i64, n: i64) -> str {
+    // option strings are UTF-8, sometimes NUL-terminated
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = b.get(off + i) & 255;
+        if c == 0 {
+            return str_from_bytes(bytes);
+        }
+        bytes.push(c);
+        i = i + 1;
+    }
+    return str_from_bytes(bytes);
+}
+
+fn pc_packet(sec: i64, nsec: i64, orig: i64, data: Vec<i64>, iface: i64) -> PcapPacket {
+    return PcapPacket { ts_sec: sec, ts_nsec: nsec, orig_len: orig, data: data, iface: iface, comment: "", flags: - 1 };
+}
+
+// ─── classic pcap ───────────────────────────────────────────────────────
+
+/// An empty little-endian, microsecond pcap file (version 2.4).
+pub fn pcap_new(linktype: i64, snaplen: i64) -> PcapFile {
+    return PcapFile { ok: true, error: "", big_endian: false, nanos: false, major: 2, minor: 4, thiszone: 0, sigfigs: 0, snaplen: snaplen, linktype: linktype, packets: Vec::new() };
+}
+
+fn pcap_fail(msg: str) -> PcapFile {
+    var f: PcapFile = pcap_new(0, 0);
+    f.ok = false;
+    f.error = msg;
+    return f;
+}
+
+/// Append a packet (its whole length captured).
+pub fn pcap_add(f: & mut PcapFile, sec: i64, nsec: i64, data: Vec<i64>) {
+    f.packets.push(pc_packet(sec, nsec, data.len(), data, 0));
+}
+
+/// Append a packet cut to `snaplen` bytes; `orig_len` keeps the full size.
+pub fn pcap_add_truncated(f: & mut PcapFile, sec: i64, nsec: i64, data: Vec<i64>) {
+    var cut: Vec<i64> = data;
+    if f.snaplen > 0 && cut.len() > f.snaplen {
+        cut.truncate(f.snaplen);
+    }
+    f.packets.push(pc_packet(sec, nsec, data.len(), cut, 0));
+}
+
+/// Parse a classic pcap file.
+pub fn pcap_read(b: Vec<i64>) -> PcapFile {
+    if b.len() < 24 {
+        return pcap_fail("pcap: shorter than the 24-byte global header");
+    }
+    val m: i64 = pc_u32(& b, 0, false);
+    var be: bool = false;
+    var nanos: bool = false;
+    if m == 0xA1B2C3D4 {
+        be = false;
+    } else if m == 0xD4C3B2A1 {
+        be = true;
+    } else if m == 0xA1B23C4D {
+        nanos = true;
+    } else if m == 0x4D3CB2A1 {
+        be = true;
+        nanos = true;
+    } else {
+        return pcap_fail("pcap: bad magic number");
+    }
+    var f: PcapFile = pcap_new(0, 0);
+    f.big_endian = be;
+    f.nanos = nanos;
+    f.major = pc_u16(& b, 4, be);
+    f.minor = pc_u16(& b, 6, be);
+    var zone: i64 = pc_u32(& b, 8, be);
+    if zone >= 0x80000000 {
+        zone = zone - 0x100000000;
+    }
+    f.thiszone = zone;
+    f.sigfigs = pc_u32(& b, 12, be);
+    f.snaplen = pc_u32(& b, 16, be);
+    // the top bits of the link type field carry the FCS length (rarely set)
+    f.linktype = pc_u32(& b, 20, be) & 0x0FFFFFFF;
+    var off: i64 = 24;
+    while off < b.len() {
+        if off + 16 > b.len() {
+            return pcap_fail("pcap: truncated record header at " + int_to_str(off));
+        }
+        val sec: i64 = pc_u32(& b, off, be);
+        val frac: i64 = pc_u32(& b, off + 4, be);
+        val incl: i64 = pc_u32(& b, off + 8, be);
+        val orig: i64 = pc_u32(& b, off + 12, be);
+        if off + 16 + incl > b.len() {
+            return pcap_fail("pcap: truncated packet data at " + int_to_str(off));
+        }
+        var ns: i64 = frac;
+        if !nanos {
+            ns = frac * 1000;
+        }
+        f.packets.push(pc_packet(sec, ns, orig, pc_slice(& b, off + 16, incl), 0));
+        off = off + 16 + incl;
+    }
+    return f;
+}
+
+/// Serialize a classic pcap file in its byte order and timestamp unit.
+pub fn pcap_write(f: & PcapFile) -> Vec<i64> {
+    val be: bool = f.big_endian;
+    var o: Vec<i64> = Vec::new();
+    if f.nanos {
+        pc_put32(& mut o, 0xA1B23C4D, be);
+    } else {
+        pc_put32(& mut o, 0xA1B2C3D4, be);
+    }
+    pc_put16(& mut o, f.major, be);
+    pc_put16(& mut o, f.minor, be);
+    pc_put32(& mut o, f.thiszone & 0xFFFFFFFF, be);
+    pc_put32(& mut o, f.sigfigs, be);
+    pc_put32(& mut o, f.snaplen, be);
+    pc_put32(& mut o, f.linktype, be);
+    var i: i64 = 0;
+    while i < f.packets.len() {
+        val p: PcapPacket = f.packets.get(i);
+        pc_put32(& mut o, p.ts_sec, be);
+        if f.nanos {
+            pc_put32(& mut o, p.ts_nsec, be);
+        } else {
+            pc_put32(& mut o, p.ts_nsec / 1000, be);
+        }
+        pc_put32(& mut o, p.data.len(), be);
+        pc_put32(& mut o, p.orig_len, be);
+        var j: i64 = 0;
+        while j < p.data.len() {
+            o.push(p.data.get(j) & 255);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+// ─── pcapng timestamps ──────────────────────────────────────────────────
+
+/// Units per second of an if_tsresol byte (10^n or 2^n).
+pub fn pcapng_units_per_sec(tsresol: i64) -> i64 {
+    var n: i64 = tsresol & 127;
+    var u: i64 = 1;
+    if (tsresol & 128) != 0 {
+        if n > 62 {
+            n = 62;
+        }
+        return 1 << n;
+    }
+    if n > 18 {
+        n = 18;
+    }
+    var i: i64 = 0;
+    while i < n {
+        u = u * 10;
+        i = i + 1;
+    }
+    return u;
+}
+
+/// Split a timestamp in interface units into [seconds, nanoseconds].
+pub fn pcapng_ts_split(ts: u64, tsresol: i64) -> Vec<i64> {
+    val ups: u64 = pcapng_units_per_sec(tsresol) as u64;
+    val sec: u64 = ts / ups;
+    val rem: u64 = ts % ups;
+    var ns: u64 = 0;
+    if ups == 1000000000 {
+        ns = rem;
+    } else if ups > 1000000000 {
+        ns = rem / (ups / 1000000000);
+    } else if ups <= 4294967296 {
+        ns = rem * 1000000000 / ups;
+    } else {
+        ns = (rem >> 32) * 1000000000 / (ups >> 32);
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(sec as i64);
+    out.push(ns as i64);
+    return out;
+}
+
+/// A timestamp of [seconds, nanoseconds] in interface units.
+pub fn pcapng_ts_join(sec: i64, nsec: i64, tsresol: i64) -> u64 {
+    val ups: u64 = pcapng_units_per_sec(tsresol) as u64;
+    var frac: u64 = 0;
+    if ups == 1000000000 {
+        frac = nsec as u64;
+    } else if ups > 1000000000 {
+        frac = (nsec as u64) * (ups / 1000000000);
+    } else {
+        frac = (nsec as u64) * ups / 1000000000;
+    }
+    return (sec as u64) * ups + frac;
+}
+
+// ─── pcapng reading ─────────────────────────────────────────────────────
+
+fn png_fail(msg: str) -> PcapngFile {
+    var f: PcapngFile = pcapng_new();
+    f.ok = false;
+    f.error = msg;
+    return f;
+}
+
+/// An empty pcapng file (little-endian, version 1.0, no interfaces).
+pub fn pcapng_new() -> PcapngFile {
+    return PcapngFile { ok: true, error: "", big_endian: false, major: 1, minor: 0, sections: 0, hardware: "", os: "", app: "", interfaces: Vec::new(), packets: Vec::new() };
+}
+
+/// An interface with microsecond timestamps.
+pub fn pcapng_iface(linktype: i64, snaplen: i64, name: str) -> PcapngIface {
+    return PcapngIface { linktype: linktype, snaplen: snaplen, name: name, description: "", tsresol: 6 };
+}
+
+/// Add an interface; returns its index.
+pub fn pcapng_add_iface(f: & mut PcapngFile, i: PcapngIface) -> i64 {
+    f.interfaces.push(i);
+    return f.interfaces.len() - 1;
+}
+
+/// Add a packet seen on interface `iface`.
+pub fn pcapng_add(f: & mut PcapngFile, iface: i64, sec: i64, nsec: i64, data: Vec<i64>) {
+    f.packets.push(pc_packet(sec, nsec, data.len(), data, iface));
+}
+
+/// Parse a pcapng file (every section).
+pub fn pcapng_read(b: Vec<i64>) -> PcapngFile {
+    var f: PcapngFile = pcapng_new();
+    var off: i64 = 0;
+    var be: bool = false;
+    var base: i64 = 0;  // first interface index of the current section
+    while off < b.len() {
+        if off + 12 > b.len() {
+            return png_fail("pcapng: truncated block at " + int_to_str(off));
+        }
+        // the SHB type reads the same in both byte orders
+        val raw_type: i64 = pc_u32(& b, off, false);
+        if raw_type == PCAPNG_SHB {
+            val bom: i64 = pc_u32(& b, off + 8, false);
+            if bom == 0x1A2B3C4D {
+                be = false;
+            } else if bom == 0x4D3C2B1A {
+                be = true;
+            } else {
+                return png_fail("pcapng: bad byte-order magic");
+            }
+            if f.sections == 0 {
+                f.big_endian = be;
+            }
+            base = f.interfaces.len();
+        } else if f.sections == 0 {
+            return png_fail("pcapng: the file does not start with a section header");
+        }
+        val btype: i64 = pc_u32(& b, off, be);
+        val blen: i64 = pc_u32(& b, off + 4, be);
+        if blen < 12 || blen % 4 != 0 || off + blen > b.len() {
+            return png_fail("pcapng: bad block length at " + int_to_str(off));
+        }
+        if pc_u32(& b, off + blen - 4, be) != blen {
+            return png_fail("pcapng: trailing block length differs at " + int_to_str(off));
+        }
+        val body: i64 = off + 8;
+        val end: i64 = off + blen - 4;
+        if btype == PCAPNG_SHB {
+            if blen < 28 {
+                return png_fail("pcapng: short section header");
+            }
+            f.sections = f.sections + 1;
+            f.major = pc_u16(& b, body + 4, be);
+            f.minor = pc_u16(& b, body + 6, be);
+            if f.major != 1 {
+                return png_fail("pcapng: unsupported major version " + int_to_str(f.major));
+            }
+            var o: i64 = body + 16;
+            while o + 4 <= end {
+                val code: i64 = pc_u16(& b, o, be);
+                val n: i64 = pc_u16(& b, o + 2, be);
+                if code == 0 || o + 4 + n > end {
+                    o = end;
+                } else {
+                    if code == 2 { f.hardware = pc_text(& b, o + 4, n); }
+                    if code == 3 { f.os = pc_text(& b, o + 4, n); }
+                    if code == 4 { f.app = pc_text(& b, o + 4, n); }
+                    o = o + 4 + ((n + 3) / 4) * 4;
+                }
+            }
+        } else if btype == PCAPNG_IDB {
+            if blen < 20 {
+                return png_fail("pcapng: short interface block");
+            }
+            var it: PcapngIface = pcapng_iface(pc_u16(& b, body, be), pc_u32(& b, body + 4, be), "");
+            var o: i64 = body + 8;
+            while o + 4 <= end {
+                val code: i64 = pc_u16(& b, o, be);
+                val n: i64 = pc_u16(& b, o + 2, be);
+                if code == 0 || o + 4 + n > end {
+                    o = end;
+                } else {
+                    if code == 2 { it.name = pc_text(& b, o + 4, n); }
+                    if code == 3 { it.description = pc_text(& b, o + 4, n); }
+                    if code == 9 && n >= 1 { it.tsresol = b.get(o + 4) & 255; }
+                    o = o + 4 + ((n + 3) / 4) * 4;
+                }
+            }
+            f.interfaces.push(it);
+        } else if btype == PCAPNG_EPB {
+            if blen < 32 {
+                return png_fail("pcapng: short packet block");
+            }
+            val ifn: i64 = pc_u32(& b, body, be);
+            if base + ifn >= f.interfaces.len() {
+                return png_fail("pcapng: packet on an undeclared interface");
+            }
+            val hi: u64 = pc_u32(& b, body + 4, be) as u64;
+            val lo: u64 = pc_u32(& b, body + 8, be) as u64;
+            val cap: i64 = pc_u32(& b, body + 12, be);
+            val orig: i64 = pc_u32(& b, body + 16, be);
+            if body + 20 + cap > end {
+                return png_fail("pcapng: packet data past the block");
+            }
+            val tsr: i64 = f.interfaces.get(base + ifn).tsresol;
+            val ts: Vec<i64> = pcapng_ts_split((hi << 32) | lo, tsr);
+            var p: PcapPacket = pc_packet(ts.get(0), ts.get(1), orig, pc_slice(& b, body + 20, cap), base + ifn);
+            var o: i64 = body + 20 + ((cap + 3) / 4) * 4;
+            while o + 4 <= end {
+                val code: i64 = pc_u16(& b, o, be);
+                val n: i64 = pc_u16(& b, o + 2, be);
+                if code == 0 || o + 4 + n > end {
+                    o = end;
+                } else {
+                    if code == 1 { p.comment = pc_text(& b, o + 4, n); }
+                    if code == 2 && n == 4 { p.flags = pc_u32(& b, o + 4, be); }
+                    o = o + 4 + ((n + 3) / 4) * 4;
+                }
+            }
+            f.packets.push(p);
+        } else if btype == PCAPNG_SPB {
+            if base >= f.interfaces.len() {
+                return png_fail("pcapng: simple packet without an interface");
+            }
+            val orig: i64 = pc_u32(& b, body, be);
+            var cap: i64 = orig;
+            val snap: i64 = f.interfaces.get(base).snaplen;
+            if snap > 0 && cap > snap {
+                cap = snap;
+            }
+            if cap > end - body - 4 {
+                cap = end - body - 4;
+            }
+            f.packets.push(pc_packet(0, 0, orig, pc_slice(& b, body + 4, cap), base));
+        }
+        off = off + blen;
+    }
+    if f.sections == 0 {
+        return png_fail("pcapng: empty file");
+    }
+    return f;
+}
+
+// ─── pcapng writing ─────────────────────────────────────────────────────
+
+fn png_opt_str(o: & mut Vec<i64>, code: i64, s: str, be: bool) {
+    if str_len(s) == 0 {
+        return;
+    }
+    val bytes: Vec<i64> = str_bytes(s);
+    pc_put16(o, code, be);
+    pc_put16(o, bytes.len(), be);
+    var i: i64 = 0;
+    while i < bytes.len() {
+        o.push(bytes.get(i) & 255);
+        i = i + 1;
+    }
+    pc_pad4(o);
+}
+
+fn png_block(o: & mut Vec<i64>, btype: i64, body: Vec<i64>, be: bool) {
+    val total: i64 = body.len() + 12;
+    pc_put32(o, btype, be);
+    pc_put32(o, total, be);
+    var i: i64 = 0;
+    while i < body.len() {
+        o.push(body.get(i));
+        i = i + 1;
+    }
+    pc_put32(o, total, be);
+}
+
+/// Serialize as one section: SHB, one IDB per interface, one EPB per packet.
+/// Options are written only when set; an option list ends with opt_endofopt.
+pub fn pcapng_write(f: & PcapngFile) -> Vec<i64> {
+    val be: bool = f.big_endian;
+    var o: Vec<i64> = Vec::new();
+    var shb: Vec<i64> = Vec::new();
+    pc_put32(& mut shb, 0x1A2B3C4D, be);
+    pc_put16(& mut shb, 1, be);
+    pc_put16(& mut shb, 0, be);
+    pc_put32(& mut shb, 0xFFFFFFFF, be);  // section length -1: not given
+    pc_put32(& mut shb, 0xFFFFFFFF, be);
+    val n0: i64 = shb.len();
+    png_opt_str(& mut shb, 2, f.hardware, be);
+    png_opt_str(& mut shb, 3, f.os, be);
+    png_opt_str(& mut shb, 4, f.app, be);
+    if shb.len() > n0 {
+        pc_put32(& mut shb, 0, be);
+    }
+    png_block(& mut o, PCAPNG_SHB, shb, be);
+    var i: i64 = 0;
+    while i < f.interfaces.len() {
+        val it: PcapngIface = f.interfaces.get(i);
+        var idb: Vec<i64> = Vec::new();
+        pc_put16(& mut idb, it.linktype, be);
+        pc_put16(& mut idb, 0, be);
+        pc_put32(& mut idb, it.snaplen, be);
+        val m0: i64 = idb.len();
+        png_opt_str(& mut idb, 2, it.name, be);
+        png_opt_str(& mut idb, 3, it.description, be);
+        if it.tsresol != 6 {
+            pc_put16(& mut idb, 9, be);
+            pc_put16(& mut idb, 1, be);
+            idb.push(it.tsresol & 255);
+            pc_pad4(& mut idb);
+        }
+        if idb.len() > m0 {
+            pc_put32(& mut idb, 0, be);
+        }
+        png_block(& mut o, PCAPNG_IDB, idb, be);
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.packets.len() {
+        val p: PcapPacket = f.packets.get(i);
+        var tsr: i64 = 6;
+        if p.iface < f.interfaces.len() {
+            tsr = f.interfaces.get(p.iface).tsresol;
+        }
+        val ts: u64 = pcapng_ts_join(p.ts_sec, p.ts_nsec, tsr);
+        var epb: Vec<i64> = Vec::new();
+        pc_put32(& mut epb, p.iface, be);
+        pc_put32(& mut epb, (ts >> 32) as i64, be);
+        pc_put32(& mut epb, (ts & 0xFFFFFFFF) as i64, be);
+        pc_put32(& mut epb, p.data.len(), be);
+        pc_put32(& mut epb, p.orig_len, be);
+        var j: i64 = 0;
+        while j < p.data.len() {
+            epb.push(p.data.get(j) & 255);
+            j = j + 1;
+        }
+        pc_pad4(& mut epb);
+        val k0: i64 = epb.len();
+        png_opt_str(& mut epb, 1, p.comment, be);
+        if p.flags >= 0 {
+            pc_put16(& mut epb, 2, be);
+            pc_put16(& mut epb, 4, be);
+            pc_put32(& mut epb, p.flags, be);
+        }
+        if epb.len() > k0 {
+            pc_put32(& mut epb, 0, be);
+        }
+        png_block(& mut o, PCAPNG_EPB, epb, be);
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Convert a classic pcap file into a one-interface pcapng file (keeps the
+/// nanosecond resolution when the pcap file had it).
+pub fn pcap_to_pcapng(f: & PcapFile) -> PcapngFile {
+    var g: PcapngFile = pcapng_new();
+    var it: PcapngIface = pcapng_iface(f.linktype, f.snaplen, "");
+    if f.nanos {
+        it.tsresol = 9;
+    }
+    g.interfaces.push(it);
+    var i: i64 = 0;
+    while i < f.packets.len() {
+        g.packets.push(f.packets.get(i));
+        i = i + 1;
+    }
+    return g;
+}
+
+/// True when the bytes start like a pcapng file, false for anything else.
+pub fn pcap_is_pcapng(b: & Vec<i64>) -> bool {
+    return b.len() >= 4 && pc_u32(b, 0, false) == PCAPNG_SHB;
+}

@@ -1,0 +1,97 @@
+// stdlib/os_sandbox: compile an allow-list policy to seccomp-BPF sock_filter bytes (matched against a Python reference), run it over records to check each verdict, encode a Landlock ruleset and a Windows job-object limit block, and check the call-number tables. Defensive policy generation; no kernel is called.
+// Expected output:
+// instructions: 11
+// bpf bytes: match the reference
+// read -> ALLOW
+// write -> ALLOW
+// open -> ERRNO 1
+// ptrace -> ERRNO 1
+// foreign arch -> ERRNO 1
+// x32 read -> ERRNO 1
+// mmap(prot=1) -> ALLOW
+// mmap(prot=3) -> TRAP
+// clone -> KILL_PROCESS
+// getpid -> TRAP
+// decode: 11 insns, first code 20
+// read nr: x64 0 a64 63
+// abi1 drops: 4000 abi3 drops: 0
+// ruleset attr (abi3): 0f400000000000000000000000000000
+// path beneath /usr: 0c00000000000000ffffffff
+// port attr: 0100000000000000901f000000000000
+// job limit flags: 2008 bytes 64
+// job block: true
+// appcontainer sandbox.worker cap sid S-1-15-3-3
+use os_sandbox;
+use encoding;
+use vec;
+use string;
+
+fn verdict(prog: & Vec<i64>, nr: i64) -> str {
+    return sb_verdict_name(bpf_run(prog, SB_ARCH_X86_64, nr, sb_args0()));
+}
+
+fn main() -> i64 {
+    var p: BpfPolicy = bpf_policy_new(SB_VERDICT_ERRNO + 1);  // default EPERM
+    bpf_allow(& mut p, sb_call_x64("read"));
+    bpf_allow(& mut p, sb_call_x64("write"));
+    val prog: Vec<i64> = bpf_compile(& p, SB_ARCH_X86_64);
+    println("instructions: " + int_to_str(bpf_len(& p, SB_ARCH_X86_64)));
+    val ref: str = "2000000004000000150001003e0000c006000000010005002000000000000000350000010000004006000000010005001500000100000000060000000000ff7f1500000101000000060000000000ff7f0600000001000500";
+    if hex_encode_bytes(prog) == ref {
+        println("bpf bytes: match the reference");
+    } else {
+        println("bpf bytes: DIFFER " + hex_encode_bytes(prog));
+    }
+    println("read -> " + verdict(& prog, 0));
+    println("write -> " + verdict(& prog, 1));
+    println("open -> " + verdict(& prog, sb_call_x64("open")));
+    println("ptrace -> " + verdict(& prog, sb_call_x64("ptrace")));
+
+    // wrong architecture is rejected
+    println("foreign arch -> " + sb_verdict_name(bpf_run(& prog, SB_ARCH_AARCH64, 0, sb_args0())));
+    // an x32 number (high bit) is rejected
+    println("x32 read -> " + sb_verdict_name(bpf_run(& prog, SB_ARCH_X86_64, 0x40000000, sb_args0())));
+
+    // a richer policy: allow mmap only with PROT_READ (arg2 == 1), kill clone
+    var q: BpfPolicy = bpf_policy_new(SB_VERDICT_TRAP);
+    bpf_allow_name(& mut q, "read", SB_ARCH_X86_64);
+    bpf_allow_arg(& mut q, sb_call_x64("mmap"), 2, 1);
+    bpf_rule(& mut q, sb_call_x64("clone"), SB_VERDICT_KILL);
+    val prog2: Vec<i64> = bpf_compile(& q, SB_ARCH_X86_64);
+    println("mmap(prot=1) -> " + sb_verdict_name(bpf_run(& prog2, SB_ARCH_X86_64, sb_call_x64("mmap"), sb_args(0, 0, 1, 0, 0, 0))));
+    println("mmap(prot=3) -> " + sb_verdict_name(bpf_run(& prog2, SB_ARCH_X86_64, sb_call_x64("mmap"), sb_args(0, 0, 3, 0, 0, 0))));
+    println("clone -> " + sb_verdict_name(bpf_run(& prog2, SB_ARCH_X86_64, sb_call_x64("clone"), sb_args0())));
+    println("getpid -> " + sb_verdict_name(bpf_run(& prog2, SB_ARCH_X86_64, sb_call_x64("getpid"), sb_args0())));
+
+    // decode round-trips
+    val back: Vec<BpfInsn> = bpf_decode(& prog);
+    println("decode: " + int_to_str(back.len()) + " insns, first code " + int_to_hex(back.get(0).code));
+
+    // aarch64 numbers differ from x86-64
+    println("read nr: x64 " + int_to_str(sb_call_x64("read")) + " a64 " + int_to_str(sb_call_a64("read")));
+
+    // Landlock ruleset
+    var r: LlRuleset = ll_new(LL_FS_EXECUTE | LL_FS_READ_FILE | LL_FS_WRITE_FILE | LL_FS_READ_DIR | LL_FS_TRUNCATE, LL_NET_BIND_TCP);
+    ll_allow_path(& mut r, "/usr", LL_FS_READ_FILE | LL_FS_READ_DIR);
+    ll_allow_port(& mut r, 8080, LL_NET_BIND_TCP);
+    // ABI 1 cannot do TRUNCATE
+    println("abi1 drops: " + int_to_hex(ll_unsupported_fs(& r, 1)) + " abi3 drops: " + int_to_hex(ll_unsupported_fs(& r, 3)));
+    println("ruleset attr (abi3): " + hex_encode_bytes(ll_ruleset_attr(& r, 3)));
+    println("path beneath /usr: " + hex_encode_bytes(ll_path_beneath_attr(& r.paths.get(0), 3)));
+    println("port attr: " + hex_encode_bytes(ll_net_port_attr(& r.ports.get(0))));
+
+    // Windows job object
+    var j: JobLimits = job_new();
+    j.active_process_limit = 4;
+    val jb: Vec<i64> = job_basic_limit_bytes(& j);
+    println("job limit flags: " + int_to_hex(job_limit_flags(& j)) + " bytes " + int_to_str(jb.len()));
+    val jref: str = "00000000000000000000000000000000082000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000";
+    println("job block: " + bool_to_str(hex_encode_bytes(jb) == jref));
+
+    // AppContainer
+    var ac: AppContainer = appcontainer_new("sandbox.worker");
+    appcontainer_add(& mut ac, APPCAP_INTERNET_CLIENT);
+    val sid: Vec<i64> = appcap_sid_parts(APPCAP_INTERNET_CLIENT);
+    println("appcontainer " + ac.name + " cap sid S-1-" + int_to_str(sid.get(0)) + "-" + int_to_str(sid.get(1)) + "-" + int_to_str(sid.get(2)));
+    return 0;
+}

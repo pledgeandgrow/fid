@@ -1,0 +1,112 @@
+WP7 (envtrim), WP14 (spec), WP15 (deadf) on by default; WP10 (readcse)
+=====================================================================
+llvm-roadmap Track WP. Nov 17. Code in compiler/iropt.fd, compiler/ir.fd,
+compiler/checks.fd; check: tests/tooling/wp-defaults-check.sh.
+
+What changed
+------------
+envtrim (WP7), iropt.fd iropt_native: `on_envtrim = iro_pass_on("envtrim")`
+  (was also `ime_on`, opt-in). FID_IROPT_OFF=envtrim turns it off.
+  - The exclusions are one table shared with WP6 (iro_conv_pinned,
+    iro_conv_free; iro_conv_mark and iro_env_trim both use them). Before,
+    each was a list scan per function (envtrim cost 795 ms of a 5.4 s
+    iropt on test_brotli with the -O0 compiler of Nov 16).
+  - Two callers the pass could miss are excluded now:
+    * core's vec_buf_alloc: nat_ir's vector loops (ng_simd_call, OP21:
+      p_simd_* and the simd module's simd_lanes_*_i64) call it by name
+      with a null env in the first register. Trimmed, its `bytes` would
+      read that 0 (a 24-byte block written n words long). ir.fd
+      ir_dfe_root names it, so envtrim, WP6 and deadf all keep it.
+    * functions the module's data names (ir.fd ir_data_named_fns: a string
+      constant or a global's string initializer equal to a function name):
+      `var g_entry: str = "triple"; task_go(g_entry, 7)` starts `triple`
+      by name with the env slot first. Also excluded from LF10's
+      parameter ranges (checks.fd peir_prm_internal).
+  - FID_IROPT_STATS=1 prints "iropt: envtrim N calls".
+
+spec (WP14), iropt.fd iro_specialize: `on_spec = iro_pass_on("spec")`.
+  - Only call sites in functions main reaches count, and each clone is
+    added to `reach`. Before, the clones were made after `reach` was
+    computed, so the per-function passes skipped them as unreached: spec
+    cloned and redirected but folded nothing (the Nov 16 measurement:
+    "same instructions, +2.6 s of iropt" on test_counted_loop).
+  - Linear: each candidate's call sites are recorded once (function,
+    instruction, the constants passed), linked per candidate; weighing
+    (iro_spec_site_weights, one loop tree per function) and redirecting
+    visit only those sites. Before, every mixed parameter and every clone
+    rescanned every instruction of the module. The clones and their order
+    are what the old code chose, given the same sites.
+
+deadf (WP15), iropt.fd: `if has_main && iro_pass_on("deadf")`.
+  - ir.fd pe_ir_reachable_from: a table for the seen set and one scan per
+    dyn method (was pe_strs_contains on a list, and a module scan per
+    DynCall); pe_sort_strs is a merge sort (was insertion sort; same order);
+    IrModule_dead_function_elimination keeps the reachable set in a table.
+    deadf cost 1.4 s on hello at -O0 (driver-2-6's profile, Nov 17).
+    pe_ir_reachable_from is also what iropt's `reach`, pe_ir and nat_ir
+    use, so every emit gains from it.
+  - Roots: also ir_data_named_fns (as pe88 in main.fd roots them).
+  - Dead globals: a global an inline-assembly template names stays.
+  - FID_IROPT_STATS=1 always prints "iropt: dead functions N, dead
+    globals M" (was only when N or M > 0).
+
+readcse (WP10): on by default since OP25 (compiler/rules.fd g_ru_readcse,
+  rules_run; FID_NAT_OFF=readcse or FID_IROPT_OFF=readcse turns it off);
+  tests/tooling/op25-check.sh checks it does something and runs the suite.
+
+Evidence so far (stage0 = the compiler of Nov 16, which has the old
+envtrim/spec/deadf; none of the Nov 17 code was built)
+----------------------------------------------------------------------
+test_brotli (the program envtrim miscompiled on Nov 9), emitted with
+FID_IROPT_ON=envtrim and without, pe_ir and --nat: same output, exit 0.
+test_simd, test_simd_i64 --nat, envtrim on/off: same output.
+tests/tooling/midend-optin-check.sh, IME=envtrim,spec,deadf RULES=readcse,
+14 programs, pe_ir and --nat rounds: see the table below.
+
+  program                    pe_ir  --nat
+  test_brotli                SAME   SAME
+  test_irswitch_envtrim      SAME   SAME
+  test_midend_spec_hot       SAME   SAME
+  test_midend_effects_deep   SAME   SAME
+  test_collections           SAME   SAME
+  test_closure_capture       SAME   SAME
+  test_lang_features         SAME   DIFF (not these passes: line 2 is
+                                    "len = <garbage>" that changes from run
+                                    to run of the same "off" executable:
+                                    1080898355, 1080046387, 1080767283)
+  test_generics_full         SAME   SAME
+  test_hashmap               SAME   SAME
+  test_struct_eq             SAME   SAME
+  test_matrix_mul            SAME   SAME
+  test_simd                  SAME   SAME
+  test_lib_bigint            SAME   SAME
+  test_xml_spec              SAME   SAME
+
+test_midend_wp_named (new): `fid run`, and stage0 emit pe_ir (default and
+FID_IROPT_ON=envtrim,deadf,spec) and --nat: the four expected lines.
+
+What the old code cost (stage0, an -O0 compiler, test_collections emitted
+with FID_IROPT_ON=spec,deadf,envtrim FID_IROPT_STATS=1): iropt 6442 ms in
+all, of which deadf 1860 ms (133 dead functions, 1 dead global), spec
+878 ms (0 clones), envtrim 529 ms. The Nov 17 code removes the list scans
+behind these; TIME=1 wp-defaults-check.sh prints the new times.
+
+Found while doing this, not fixed (other groups' files)
+------------------------------------------------------
+A task entry named only by a global's string initializer
+(`var g: str = "f"; task_go(g, 1)`) panics "task: no such function"
+natively with every pass off (pe_ir named_fns comes from the strings the
+code uses, nat_ir's named_seen from ConstStr instructions). The mid-end
+now keeps such a function and its convention, so the backends can add
+those names to their tables.
+
+Validation (with the final compiler $FID)
+-----------------------------------------
+  FID=$FID bash tests/tooling/wp-defaults-check.sh            # exit 0
+  FID=$FID SUITE=1 NAT=1 JOBS=4 bash tests/tooling/wp-defaults-check.sh
+  FID=$FID TIME=1 bash tests/tooling/wp-defaults-check.sh      # INFO lines
+  FID=$FID SUITE=1 NAT=1 bash tests/tooling/op25-check.sh      # readcse
+If a suite DIFF/BUILD/VERIFY line is caused by one of the three (rerun
+that program with FID_IROPT_OFF=<one pass>), put that pass back to opt-in:
+`&& ime_on("<pass>")` on its line in iropt_native (on_envtrim, on_spec,
+the deadf `if`).

@@ -10,6 +10,9 @@
 #             natively and compares it with the interpreter.
 #   cross     Linux on AArch64 and RISC-V: every test is cross-compiled with
 #             zig cc (static musl) and run under qemu-user.
+#   native    our backend (nat_ir) on Linux x86-64, AArch64 and RISC-V, the
+#             whole suite with FID_VERIFY=1, and the C path on the same
+#             target; the two must agree test by test (scripts/suite-all.sh).
 #   wasm      WebAssembly (WASI preview 1): every test is compiled to .wasm
 #             with zig cc and run under Node's WASI.
 #
@@ -80,6 +83,39 @@ jobs:
         env:
           CC: zig cc
         run: FID=release/fid JOBS=4 bash scripts/cross-test.sh ${{ matrix.target }}
+
+  native:
+    # Our own backend (compiler/nat_ir.fd) on the three Linux targets, the
+    # whole suite, with the IR verifier and the allocation checker on, and
+    # the C path on the same target compared test by test (RL2, RL22:
+    # scripts/suite-all.sh).
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux, aarch64-linux, riscv64-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: qemu-user and mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user mold
+      - name: Build fid
+        run: |
+          cargo build --release
+          CC=gcc ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: Suite, our backend and the C path, on ${{ matrix.target }}
+        env:
+          CC: zig cc
+          FID: release/fid
+          FID_VERIFY: 1
+          JOBS: 4
+          AGREE: 1
+        run: bash scripts/suite-all.sh native:${{ matrix.target }} c:${{ matrix.target }}
 
   wasm:
     runs-on: ubuntu-latest

@@ -1,0 +1,52 @@
+// Test (stdlib-agent bugs 2, 46): calling a function value whose result
+// is a struct, through a parameter, a variable and a closure that
+// captures. The callee writes the struct to the caller's memory, a pointer
+// it takes before the env, as for a direct call; the arguments were
+// shifted by one ("Invalid memory access", or zeros). Also run it through
+// `fid ccompile` (codegen_c's CallPtr; the C build failed too).
+// Expected output:
+// 1 2
+// 7 0
+// 30 4
+// 12 5
+// 9 9
+struct P {
+    a: i64,
+    b: i64,
+}
+
+fn first(x: i64, y: i64) -> P {
+    return P { a: x, b: y };
+}
+
+fn seven() -> P {
+    return P { a: 7, b: 0 };
+}
+
+fn call(f: fn(i64, i64) -> P) -> P {
+    return f(1, 2);
+}
+
+fn show(p: P) {
+    println(int_to_str(p.a) + " " + int_to_str(p.b));
+}
+
+fn main() {
+    val p: P = call(first);
+    show(p);
+    val g: fn() -> P = seven;
+    val q: P = g();
+    show(q);
+    val k: i64 = 4;
+    val h = fn(x: i64) -> P {
+        return P { a: x * 10, b: k };
+    };
+    val r: P = h(3);
+    show(r);
+    val s: P = call(fn(x: i64, y: i64) -> P {
+        return P { a: x + 11, b: y + 3 };
+    });
+    show(s);
+    // struct results used in place
+    println(int_to_str(g().a + 2) + " " + int_to_str(call(first).b + 7));
+}

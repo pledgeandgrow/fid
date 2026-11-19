@@ -1,0 +1,351 @@
+// Competitive roadmap OP23: the runtime's 16-byte block routines
+// (stdlib/linux_runtime/base.fd pert_vblk_copy, pert_vblk_diff,
+// pert_vblk_cmpz, pert_vblk_find, which compiler/nat_ir.fd may lower to
+// vector code) under
+// core's p_mem_find_byte, p_bytes_eq, p_mem_copy, str_compare and
+// p_str_hash. Every case is checked against a byte loop written here, at
+// address offsets 0, 1, 3, 7 and 8 (the runtime aligns to words: the
+// same word alignment, and misaligned ones), lengths around the block
+// sizes (15, 16, 17, 32, 33, 50) and the byte that matters (the needle,
+// the difference) at every position, so the head bytes, the blocks, the
+// word after them and the tail each decide some case. Each "bad" count
+// must be 0; the other numbers are sums of the results, the same on every
+// backend (C: the C library; pe_ir: msvcrt; the machine layer: the block
+// routines; the interpreter: core's byte loops).
+// Expected output:
+// find bad 0 sum 13145 none 0
+// eq bad 0 same 90 differ 1720
+// copy bad 0 bytes 1720
+// cmp bad 0 sum 704 zero 362
+// nul 0 0 1 -1
+// hash bad 0
+// done
+
+const LENS: i64 = 9;
+const OFFS: i64 = 5;
+
+fn len_at(i: i64) -> i64 {
+    if i == 0 { return 0; }
+    if i == 1 { return 1; }
+    if i == 2 { return 8; }
+    if i == 3 { return 15; }
+    if i == 4 { return 16; }
+    if i == 5 { return 17; }
+    if i == 6 { return 32; }
+    if i == 7 { return 33; }
+    return 50;
+}
+
+fn off_at(i: i64) -> i64 {
+    if i == 0 { return 0; }
+    if i == 1 { return 1; }
+    if i == 2 { return 3; }
+    if i == 3 { return 7; }
+    return 8;
+}
+
+@unsafe
+fn ldb(a: i64) -> i64 {
+    var p: *mut u8 = a;
+    return *p;
+}
+
+@unsafe
+fn stb(a: i64, v: i64) {
+    var p: *mut u8 = a;
+    *p = v;
+}
+
+// SAFETY: (release M10: ldb is @unsafe) p..p+n are bytes the caller owns.
+@unsafe
+fn ref_find(p: i64, n: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        if ldb(p + i) == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// SAFETY: (release M10: ldb is @unsafe) a..a+n and b..b+n are bytes the
+// caller owns.
+@unsafe
+fn ref_eq(a: i64, b: i64, n: i64) -> bool {
+    var i: i64 = 0;
+    while i < n {
+        if ldb(a + i) != ldb(b + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// the bytes of two strings up to the first NUL of either; the first
+// difference as a - b
+fn ref_cmp(a: str, b: str) -> i64 {
+    val la: i64 = str_len(a);
+    val lb: i64 = str_len(b);
+    var i: i64 = 0;
+    while true {
+        var x: i64 = 0;
+        var y: i64 = 0;
+        if i < la {
+            x = str_byte_at(a, i);
+        }
+        if i < lb {
+            y = str_byte_at(b, i);
+        }
+        if x != y {
+            return x - y;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn sign(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - 1;
+    }
+    if x > 0 {
+        return 1;
+    }
+    return 0;
+}
+
+// n letters, a..z repeating, starting at letter k
+fn letters(n: i64, k: i64) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < n {
+        s = s + char_to_str(97 + (i + k) % 26);
+        i = i + 1;
+    }
+    return s;
+}
+
+// fill n bytes at p with 97 + (i % 23): never 0, never '#'
+// SAFETY: (release M10: stb is @unsafe) p..p+n are writable bytes the
+// caller owns.
+@unsafe
+fn fill(p: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        stb(p + i, 97 + i % 23);
+        i = i + 1;
+    }
+}
+
+@unsafe
+fn main() -> i64 {
+    val a: i64 = p_malloc(256);
+    val b: i64 = p_malloc(256);
+    val c: i64 = p_malloc(256);
+
+    // p_mem_find_byte: '#' (35) at every position of every length at every
+    // offset, and a byte that is not there (and one outside 0..255)
+    var bad: i64 = 0;
+    var sum: i64 = 0;
+    var nomatch: i64 = 0;
+    var oi: i64 = 0;
+    while oi < OFFS {
+        val off: i64 = off_at(oi);
+        var li: i64 = 0;
+        while li < LENS {
+            val n: i64 = len_at(li);
+            fill(a, 128);
+            var pos: i64 = 0;
+            while pos <= n {
+                if pos < n {
+                    stb(a + off + pos, 35);
+                }
+                val got: i64 = p_mem_find_byte(a + off, n, 35);
+                if got != ref_find(a + off, n, 35) {
+                    bad = bad + 1;
+                }
+                sum = sum + got;
+                if pos < n {
+                    stb(a + off + pos, 97 + (off + pos) % 23);
+                }
+                pos = pos + 1;
+            }
+            if p_mem_find_byte(a + off, n, 33) != 0 - 1 || p_mem_find_byte(a + off, n, 256 + 97) != 0 - 1 {
+                nomatch = nomatch + 1;
+            }
+            li = li + 1;
+        }
+        oi = oi + 1;
+    }
+    println("find bad " + int_to_str(bad) + " sum " + int_to_str(sum) + " none " + int_to_str(nomatch));
+
+    // p_bytes_eq: a and b at the same offset (the block path) and one
+    // apart (the byte path), equal, then differing at each position
+    bad = 0;
+    var same: i64 = 0;
+    var differ: i64 = 0;
+    oi = 0;
+    while oi < OFFS {
+        val off: i64 = off_at(oi);
+        var skew: i64 = 0;
+        while skew < 2 {
+            var li: i64 = 0;
+            while li < LENS {
+                val n: i64 = len_at(li);
+                fill(a, 128);
+                var i: i64 = 0;
+                while i < n {
+                    stb(b + off + skew + i, ldb(a + off + i));
+                    i = i + 1;
+                }
+                if p_bytes_eq(a + off, b + off + skew, n) {
+                    same = same + 1;
+                } else {
+                    bad = bad + 1;
+                }
+                var pos: i64 = 0;
+                while pos < n {
+                    stb(b + off + skew + pos, 35);
+                    val got: bool = p_bytes_eq(a + off, b + off + skew, n);
+                    if got != ref_eq(a + off, b + off + skew, n) {
+                        bad = bad + 1;
+                    }
+                    if !got {
+                        differ = differ + 1;
+                    }
+                    stb(b + off + skew + pos, ldb(a + off + pos));
+                    pos = pos + 1;
+                }
+                li = li + 1;
+            }
+            skew = skew + 1;
+        }
+        oi = oi + 1;
+    }
+    println("eq bad " + int_to_str(bad) + " same " + int_to_str(same) + " differ " + int_to_str(differ));
+
+    // p_mem_copy: every source offset 0..8, to the same offset (the block
+    // path) and to one 3 bytes on (the byte path); the guard bytes either
+    // side left alone
+    bad = 0;
+    var bytes: i64 = 0;
+    fill(a, 128);
+    var si: i64 = 0;
+    while si < OFFS {
+        val so: i64 = off_at(si);
+        var dk: i64 = 0;
+        while dk < 2 {
+            var dof: i64 = so;
+            if dk == 1 {
+                dof = (so + 3) % 9;
+            }
+            var li: i64 = 0;
+            while li < LENS {
+                val n: i64 = len_at(li);
+                var k: i64 = 7 + dof;
+                while k <= 8 + dof + n {
+                    stb(c + k, 0);
+                    k = k + 1;
+                }
+                p_mem_copy(c + 8 + dof, a + so, n);
+                if !ref_eq(c + 8 + dof, a + so, n) {
+                    bad = bad + 1;
+                }
+                if ldb(c + 7 + dof) != 0 || ldb(c + 8 + dof + n) != 0 {
+                    bad = bad + 1;
+                }
+                bytes = bytes + n;
+                li = li + 1;
+            }
+            dk = dk + 1;
+        }
+        si = si + 1;
+    }
+    println("copy bad " + int_to_str(bad) + " bytes " + int_to_str(bytes));
+
+    // str_compare: equal strings, then each byte of one changed; a
+    // shorter string against a longer one
+    bad = 0;
+    var csum: i64 = 0;
+    var zero: i64 = 0;
+    var li2: i64 = 0;
+    while li2 < LENS {
+        val n: i64 = len_at(li2);
+        var k: i64 = 0;
+        while k < 2 {
+            val s1: str = letters(n, k);
+            val s2: str = letters(n, k);
+            var r: i64 = str_compare(s1, s2);
+            if r != 0 {
+                bad = bad + 1;
+            }
+            if r == 0 {
+                zero = zero + 1;
+            }
+            var pos: i64 = 0;
+            while pos < n {
+                val lo: str = str_slice(s1, 0, pos) + "#" + str_slice(s1, pos + 1, n);
+                val hi: str = str_slice(s1, 0, pos) + "~" + str_slice(s1, pos + 1, n);
+                val r1: i64 = str_compare(s1, lo);
+                val r2: i64 = str_compare(s1, hi);
+                val r3: i64 = str_compare(lo, lo);
+                if r1 != ref_cmp(s1, lo) || r2 != ref_cmp(s1, hi) || r3 != 0 {
+                    bad = bad + 1;
+                }
+                if r3 == 0 {
+                    zero = zero + 1;
+                }
+                csum = csum + sign(r1) - sign(r2);
+                pos = pos + 1;
+            }
+            if n > 0 {
+                val sh: str = str_slice(s1, 0, n - 1);
+                if str_compare(sh, s1) != ref_cmp(sh, s1) || str_compare(s1, sh) != ref_cmp(s1, sh) {
+                    bad = bad + 1;
+                }
+                csum = csum + sign(str_compare(s1, sh));
+            }
+            k = k + 1;
+        }
+        li2 = li2 + 1;
+    }
+    println("cmp bad " + int_to_str(bad) + " sum " + int_to_str(csum) + " zero " + int_to_str(zero));
+
+    // a zero byte inside both strings ends the compare there, past a
+    // block boundary too
+    val z: str = char_to_str(0);
+    val n1: str = letters(20, 0) + z + "abc";
+    val n2: str = letters(20, 0) + z + "xyz";
+    val n3: str = letters(40, 0) + z + "q";
+    val n4: str = letters(41, 0);
+    println("nul " + int_to_str(str_compare(n1, n2)) + " " + int_to_str(sign(ref_cmp(n1, n2))) + " " + int_to_str(sign(str_compare(n4, n3))) + " " + int_to_str(sign(str_compare(n3, n4))));
+
+    // p_str_hash: a counted string and a plain copy of its bytes (no
+    // header: the runtime's other path) hash the same, every length
+    bad = 0;
+    var hn: i64 = 0;
+    while hn < 41 {
+        val hs: str = letters(hn, hn);
+        var i: i64 = 0;
+        while i < hn {
+            stb(c + i, str_byte_at(hs, i));
+            i = i + 1;
+        }
+        stb(c + hn, 0);
+        if p_str_hash(hs as i64) != p_str_hash(c) {
+            bad = bad + 1;
+        }
+        hn = hn + 1;
+    }
+    println("hash bad " + int_to_str(bad));
+    p_free(a);
+    p_free(b);
+    p_free(c);
+    println("done");
+    return 0;
+}

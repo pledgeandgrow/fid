@@ -1,0 +1,126 @@
+// Test: the lowering's name lookups (CS4, compiler/lower.fd). Struct,
+// impl method, extern, return type and "is this a function" lookups go
+// through indexes now (struct_index, impl_index, extern_index,
+// own_ret_index, lw_fn_at) instead of scans that copied what they passed;
+// the post-lowering passes read instructions in place (lw_inst_pos). Each
+// must find what the scan found: the first entry of a name, nothing for a
+// name that is not there. Two types with a method of the same name, a
+// free function and a method of one name, a struct used before it is
+// declared, an extern called and its result used, a function used as a
+// value, an enum laid out, strings counted and dropped in one block.
+// Expected output:
+//   area 12
+//   area 28
+//   describe rect
+//   describe circle
+//   describe free
+//   len 11
+//   twice 42
+//   late 7 8
+//   shape 3
+//   shape 0
+//   s hello world
+//   v 3
+//   lookups ok
+
+extern "C" include "<string.h>" {
+    fn strlen as lk_strlen(s: str) -> u64;
+}
+
+struct Rect {
+    w: i64,
+    h: i64,
+}
+
+struct Circle {
+    r: i64,
+}
+
+impl Rect {
+    fn area(self: & Rect) -> i64 {
+        return self.w * self.h;
+    }
+    fn describe(self: & Rect) -> str {
+        return "rect";
+    }
+}
+
+impl Circle {
+    fn area(self: & Circle) -> i64 {
+        return self.r * self.r * 7;
+    }
+    fn describe(self: & Circle) -> str {
+        return "circle";
+    }
+}
+
+fn describe() -> str {
+    return "free";
+}
+
+enum Shape {
+    Square(i64),
+    Dot,
+}
+
+fn shape_size(s: Shape) -> i64 {
+    match s {
+        Shape::Square(n) => {
+            return n;
+        }
+        Shape::Dot => {
+            return 0;
+        }
+    }
+    return 0 - 1;
+}
+
+fn make_late(a: i64) -> Late {
+    return Late { a: a, b: a + 1 };
+}
+
+struct Late {
+    a: i64,
+    b: i64,
+}
+
+fn double(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn greet(name: str) -> str {
+    var s: str = "hello";
+    var t: str = s;
+    return t + " " + name;
+}
+
+@unsafe
+fn main() -> i64 {
+    val r: Rect = Rect { w: 3, h: 4 };
+    val c: Circle = Circle { r: 2 };
+    print("area " + int_to_str(r.area()) + "\n");
+    print("area " + int_to_str(c.area()) + "\n");
+    print("describe " + r.describe() + "\n");
+    print("describe " + c.describe() + "\n");
+    print("describe " + describe() + "\n");
+    val n: u64 = lk_strlen("hello world");
+    print("len " + int_to_str(n as i64) + "\n");
+    print("twice " + int_to_str(apply(double, 21)) + "\n");
+    val l: Late = make_late(7);
+    print("late " + int_to_str(l.a) + " " + int_to_str(l.b) + "\n");
+    print("shape " + int_to_str(shape_size(Shape::Square(3))) + "\n");
+    print("shape " + int_to_str(shape_size(Shape::Dot)) + "\n");
+    print("s " + greet("world") + "\n");
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    var w: Vec<i64> = v;
+    print("v " + int_to_str(w.len()) + "\n");
+    print("lookups ok" + "\n");
+    return 0;
+}

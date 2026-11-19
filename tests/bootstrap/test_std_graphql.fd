@@ -1,0 +1,143 @@
+// stdlib/graphql: lex and parse queries (aliases, arguments, variables with defaults, fragments, inline fragments, directives, block strings), parse a schema SDL, execute against a Star Wars-style resolver (interfaces, lists, non-null, @skip/@include, mutations), report field and syntax errors with paths, and introspect field names.
+// Expected output:
+// tokens: 31 kinds 1100101020010103104001010100105
+// block string: "Hello,\n  World!\n\nYours"
+// parsed: ok=true query HeroQ, mutation M, fragment F on Character nodes 23
+// syntax error: line 1: expected '}', found end of input
+// syntax error: line 1: expected a value, found ')'
+// lex error: line 1: unterminated string
+// schema: ok=true  types=7 query=Query mutation=Mutation
+// Human fields: id,name,friends,height
+// Human implements: Character; SearchResult = Human|Droid
+// hero: {"data":{"hero":{"name":"R2-D2"}}}
+// hero empire: {"data":{"hero":{"id":"1000","name":"Luke Skywalker","height":1.72}}}
+// aliases: {"data":{"a":"hello world","b":"hello Ada hello Ada"}}
+// variables: {"data":{"greet":"hello Eve"}}
+// var default: {"data":{"greet":"hello Bob"}}
+// var missing: {"errors":[{"message":"Variable \"$id\" of required type \"ID!\" was not provided."}]}
+// fragments: {"data":{"hero":{"id":"2001","name":"R2-D2","friends":[{"name":"Luke Skywalker","__typename":"Human"},{"name":"Han Solo","__typename":"Human"}]}}}
+// directives: {"data":{"hero":{"name":"R2-D2"}}}
+// union: {"data":{"search":[{"__typename":"Human","name":"Luke Skywalker","height":1.72},{"__typename":"Droid","name":"R2-D2","primaryFunction":"Astromech"}]}}
+// null human: {"data":{"human":null}}
+// unknown field: {"errors":[{"message":"Cannot query field \"mass\" on type \"Droid\"","path":["hero","mass"]}],"data":{"hero":{"name":"R2-D2","mass":null}}}
+// needs subfields: {"errors":[{"message":"Field \"hero\" of type \"Character\" must have a selection of subfields","path":["hero"]}],"data":{"hero":null}}
+// mutation: {"data":{"rename":{"id":"1000","name":"Luke"}}}
+// two ops: {"errors":[{"message":"Must provide operation name if query contains multiple operations"}]}
+// pick op: {"data":{"b":"hello world hello world"}}
+// typename: {"data":{"__typename":"Query","hero":{"__typename":"Droid"}}}
+// __type: {"data":{"__type":{"name":"Droid","kind":"OBJECT","fields":[{"name":"id"},{"name":"name"},{"name":"friends"},{"name":"primaryFunction"}]}}}
+// __type enum: {"data":{"__type":{"kind":"ENUM","enumValues":[{"name":"NEWHOPE"},{"name":"EMPIRE"},{"name":"JEDI"}]}}}
+// __type field type: {"data":{"__type":{"fields":[{"name":"hero","type":{"kind":"INTERFACE","ofType":null}},{"name":"human","type":{"kind":"OBJECT","ofType":null}},{"name":"greet","type":{"kind":"NON_NULL","ofType":{"name":"String"}}},{"name":"search","type":{"kind":"NON_NULL","ofType":{"name":null}}}]}}}
+// __schema type count: 12 query "Query"
+use graphql;
+use json;
+use vec;
+use string;
+
+fn sdl() -> str {
+    return "
+\"\"\"The query root\"\"\"
+type Query {
+  hero(episode: Episode = NEWHOPE): Character
+  human(id: ID!): Human
+  greet(name: String = \"world\", times: Int = 1): String!
+  search(text: String!): [SearchResult!]!
+}
+type Mutation { rename(id: ID!, name: String!): Human }
+enum Episode { NEWHOPE EMPIRE JEDI }
+interface Character { id: ID! name: String! friends: [Character] }
+type Human implements Character { id: ID! name: String! friends: [Character] height: Float }
+type Droid implements Character { id: ID! name: String! friends: [Character] primaryFunction: String }
+union SearchResult = Human | Droid
+";
+}
+
+fn luke() -> str { return "{\"__typename\":\"Human\",\"id\":\"1000\",\"name\":\"Luke Skywalker\",\"height\":1.72}"; }
+fn r2() -> str { return "{\"__typename\":\"Droid\",\"id\":\"2001\",\"name\":\"R2-D2\",\"primaryFunction\":\"Astromech\"}"; }
+fn han() -> str { return "{\"__typename\":\"Human\",\"id\":\"1002\",\"name\":\"Han Solo\",\"height\":1.8}"; }
+
+// the application's resolver: "Type.field", parent JSON, args JSON -> JSON
+// ("" means: read the parent's member)
+fn resolve(field: str, parent: str, args: str) -> str {
+    if field == "Query.hero" {
+        if json_get_str(args, "episode") == "EMPIRE" { return luke(); }
+        return r2();
+    }
+    if field == "Query.human" {
+        if json_get_str(args, "id") == "1000" { return luke(); }
+        return "null";
+    }
+    if field == "Query.greet" {
+        var s: str = "";
+        var i: i64 = 0;
+        while i < json_get_int(args, "times", 1) {
+            if i > 0 { s = s + " "; }
+            s = s + "hello " + json_get_str(args, "name");
+            i = i + 1;
+        }
+        return json_string(s);
+    }
+    if field == "Query.search" { return "[" + luke() + "," + r2() + "]"; }
+    if field == "Human.friends" || field == "Droid.friends" {
+        if json_get_str(parent, "id") == "2001" { return "[" + luke() + "," + han() + "]"; }
+        return "[" + r2() + "]";
+    }
+    if field == "Mutation.rename" {
+        return "{\"__typename\":\"Human\",\"id\":" + json_string(json_get_str(args, "id")) + ",\"name\":" + json_string(json_get_str(args, "name")) + "}";
+    }
+    return "";
+}
+
+fn run(label: str, s: & GqlSchema, q: str, vars: str) {
+    println(label + ": " + gql_execute(s, q, vars, "", resolve));
+}
+
+fn main() -> i64 {
+    // lexer
+    val toks: Vec<GqlTok> = gql_lex("query Q($n: Int = 3) { a(x: -1.5e3, s: \"\\u0041\\n\") @skip(if: false) ...F } # c");
+    var kinds: str = "";
+    var i: i64 = 0;
+    while i < toks.len() { kinds = kinds + int_to_str(toks.get(i).kind); i = i + 1; }
+    println("tokens: " + int_to_str(toks.len()) + " kinds " + kinds);
+    val bs: Vec<GqlTok> = gql_lex("\"\"\"\n    Hello,\n      World!\n\n    Yours\n  \"\"\"");
+    println("block string: " + json_string(bs.get(0).text));
+
+    // parser
+    val d: GqlDoc = gql_parse("query HeroQ($ep: Episode = JEDI) { hero(episode: $ep) { name ...F } } mutation M { rename(id: \"1\", name: \"x\") { id } } fragment F on Character { id }");
+    println("parsed: ok=" + bool_to_str(d.ok) + " " + str_join(gql_operations(& d), ", ") + " nodes " + int_to_str(d.nodes.len()));
+    println("syntax error: " + gql_parse("{ hero { name } ").error);
+    println("syntax error: " + gql_parse("query { a(x: ) }").error);
+    println("lex error: " + gql_parse("{ a(x: \"abc) }").error);
+
+    // schema
+    val s: GqlSchema = gql_parse_schema(sdl());
+    println("schema: ok=" + bool_to_str(s.ok) + " " + s.error + " types=" + int_to_str(s.types.len()) + " query=" + s.query + " mutation=" + s.mutation);
+    println("Human fields: " + str_join(gql_field_names(& s, "Human"), ","));
+    println("Human implements: " + s.types.get(gql_type_index(& s, "Human")).interfaces.get(0) + "; SearchResult = " + str_join(s.types.get(gql_type_index(& s, "SearchResult")).members, "|"));
+
+    // execution
+    run("hero", & s, "{ hero { name } }", "{}");
+    run("hero empire", & s, "query { hero(episode: EMPIRE) { id name ... on Human { height } } }", "{}");
+    run("aliases", & s, "{ a: greet b: greet(name: \"Ada\", times: 2) }", "{}");
+    run("variables", & s, "query G($who: String = \"Bob\") { greet(name: $who) }", "{\"who\":\"Eve\"}");
+    run("var default", & s, "query G($who: String = \"Bob\") { greet(name: $who) }", "{}");
+    run("var missing", & s, "query H($id: ID!) { human(id: $id) { name } }", "{}");
+    run("fragments", & s, "{ hero { ...Who friends { name __typename } } } fragment Who on Character { id name }", "{}");
+    run("directives", & s, "query D($yes: Boolean = true) { hero { name id @skip(if: $yes) friends @include(if: false) { name } } }", "{}");
+    run("union", & s, "{ search(text: \"x\") { __typename ... on Human { name height } ... on Droid { name primaryFunction } } }", "{}");
+    run("null human", & s, "{ human(id: \"9\") { name } }", "{}");
+    run("unknown field", & s, "{ hero { name mass } }", "{}");
+    run("needs subfields", & s, "{ hero }", "{}");
+    run("mutation", & s, "mutation { rename(id: \"1000\", name: \"Luke\") { id name } }", "{}");
+    run("two ops", & s, "query A { greet } query B { greet }", "{}");
+    println("pick op: " + gql_execute(& s, "query A { a: greet } query B { b: greet(times: 2) }", "{}", "B", resolve));
+
+    // introspection
+    run("typename", & s, "{ __typename hero { __typename } }", "{}");
+    run("__type", & s, "{ __type(name: \"Droid\") { name kind fields { name } } }", "{}");
+    run("__type enum", & s, "{ __type(name: \"Episode\") { kind enumValues { name } } }", "{}");
+    run("__type field type", & s, "{ __type(name: \"Query\") { fields { name type { kind ofType { name } } } } }", "{}");
+    val sch: str = gql_execute(& s, "{ __schema { queryType { name } mutationType { name } types { name } } }", "{}", "", resolve);
+    println("__schema type count: " + int_to_str(json_len(json_path(sch, "data.__schema.types"))) + " query " + json_path(sch, "data.__schema.queryType.name"));
+    return 0;
+}

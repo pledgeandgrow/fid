@@ -1,0 +1,46 @@
+// VF1 finding (Nov 16): a parameter assigned to itself (`n = n;`) reads as
+// 0 or garbage afterwards on the native paths. Found by
+// scripts/fuzz/gen_programs.py --seed 20261133 (plain and --rich: the
+// generator writes `n = n;` in helper bodies); run and ccompile print the
+// right values, `emit` (pe_ir) and `emit --nat` print garbage for every
+// line but the third (a local `x = x;` breaks the same way: 1, not 41).
+// FID_IROPT_OFF=promote makes emit right: compiler/iropt.fd iro_promote
+// forwards the store `Store(slot, Load(slot))` to the later load, so the
+// load's value is the load itself, which was never given a value. The
+// parameter's entry copy (proposal 0004: a parameter the body changes is
+// copied at entry) is the slot.
+//
+// Expected output:
+// 5
+// 77
+// 9
+// 41
+fn self_assign(n: i64) -> i64 {
+    n = n;
+    return n;
+}
+
+fn self_assign_used(n: i64) -> i64 {
+    var acc: i64 = n;
+    n = n;
+    return acc * 10 + n;
+}
+
+fn plus_zero(n: i64) -> i64 {
+    n = n + 0;
+    return n;
+}
+
+fn local_self_assign(k: i64) -> i64 {
+    var x: i64 = k * 2;
+    x = x;
+    return x + 1;
+}
+
+fn main() -> i64 {
+    println(self_assign(5));
+    println(self_assign_used(7));
+    println(plus_zero(9));
+    println(local_self_assign(20));
+    return 0;
+}

@@ -11,9 +11,9 @@
 //     The threshold ensures the interpreter always takes the sequential path.
 //   - In C codegen, Vec pointers are real heap addresses shared across
 //     pthreads, so the parallel path works correctly.
-//   - par_map/par_fill/par_range remain sequential (parallel write to a
-//     shared result Vec requires finer-grained synchronization than we
-//     have today).
+//   - par_map/par_for_each write through raw data pointers (not Vec_set)
+//     because a typed Vec param arriving through spawn is shared: the
+//     first owning write would copy-on-write into a private buffer.
 
 module parallel;
 /// Threshold: inputs smaller than this run sequentially.
@@ -51,19 +51,165 @@ fn __par_dot_worker(a: Vec<i64>, b: Vec<i64>, start: i64, end: i64) -> i64 {
     return sum;
 }
 
-// ─── Public parallel operations ────────────────────────────────────────
-
-/// Parallel map: apply a function to each element of a Vec.
-/// Currently sequential — parallel write to a shared result Vec requires
-/// finer-grained synchronization. Each element is independent.
-pub fn par_map(n: i64) -> Vec<i64> {
-    var result = Vec::new();
-    var i = 0;
-    while i < n {
-        result.push(i * i);
+/// Worker: write f(v[i]) into out[i] for i in [lo, hi). Each worker owns a
+/// disjoint index range of the preallocated result Vec, so the writes need
+/// no synchronization. `v`/`out` arrive as raw Vec-header words (i64), not
+/// typed Vecs: a typed Vec param is shared on the way in, and the first
+/// Vec_set would then copy-on-write into a private buffer the caller never
+/// sees. The raw word keeps the same data pointer; the caller remains the
+/// sole owner, so no ownership bookkeeping runs in the worker.
+fn __par_map_worker(vw: i64, outw: i64, lo: i64, hi: i64, f: fn(i64) -> i64) -> i64 {
+    var vd: * mut i64 = vw;
+    var od: * mut i64 = outw;
+    var vdata: i64 = 0;
+    var odata: i64 = 0;
+    // SAFETY: vw/outw are live Vec headers for the duration of the task
+    // (the caller awaits before either Vec dies); header word 0 is the data
+    // pointer, and the elements are i64 words.
+    unsafe {
+        vdata = * vd;
+        odata = * od;
+    }
+    var i = lo;
+    while i < hi {
+        var p: * mut i64 = vdata + i * 8;
+        var x: i64 = 0;
+        // SAFETY: lo <= i < hi <= v's length (caller's contract).
+        unsafe {
+            x = * p;
+        }
+        var q: * mut i64 = odata + i * 8;
+        // SAFETY: i < out's length; only this worker writes [lo, hi).
+        unsafe {
+            * q = f(x);
+        }
         i = i + 1;
     }
-    return result;
+    return 0;
+}
+
+/// Worker: fold v[lo, hi) into an accumulator with f(acc, x).
+fn __par_reduce_worker(v: Vec<i64>, lo: i64, hi: i64, init: i64, f: fn(i64, i64) -> i64) -> i64 {
+    var acc = init;
+    var i = lo;
+    while i < hi {
+        acc = f(acc, Vec_get(v, i));
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// Worker: sum f(v[i]) for i in [lo, hi).
+fn __par_sum_by_worker(v: Vec<i64>, lo: i64, hi: i64, f: fn(i64) -> i64) -> i64 {
+    var sum = 0;
+    var i = lo;
+    while i < hi {
+        sum = sum + f(Vec_get(v, i));
+        i = i + 1;
+    }
+    return sum;
+}
+
+// ─── Public parallel operations ────────────────────────────────────────
+
+/// Parallel map: `out[i] = f(v[i])` for every element.
+/// For large inputs (>= PAR_THRESHOLD) two OS threads each write a
+/// disjoint half of a preallocated result Vec — truly parallel, since no
+/// element is written twice. Small inputs run sequentially.
+///
+/// Example:
+///   var v = par_range(1, 5);
+///   var sq = par_map(v, fn(x: i64) -> i64 { x * x });
+///   assert_eq(sq.get(3), 16);
+pub fn par_map(v: Vec<i64>, f: fn(i64) -> i64) -> Vec<i64> {
+    var n = v.len();
+    var out: Vec<i64> = Vec::filled(n, 0);
+    if n < PAR_THRESHOLD() {
+        var i = 0;
+        while i < n {
+            Vec_set(out, i, f(v.get(i)));
+            i = i + 1;
+        }
+        return out;
+    }
+    var mid = n / 2;
+    var vw: i64 = v as i64;
+    var ow: i64 = out as i64;
+    var t1 = spawn __par_map_worker(vw, ow, 0, mid, f);
+    var t2 = spawn __par_map_worker(vw, ow, mid, n, f);
+    await t1;
+    await t2;
+    return out;
+}
+
+/// Parallel for-each: apply f to every element, discarding results.
+/// Same threshold and disjoint-range split as par_map.
+pub fn par_for_each(v: Vec<i64>, f: fn(i64) -> i64) -> void {
+    var n = v.len();
+    if n < PAR_THRESHOLD() {
+        var i = 0;
+        while i < n {
+            f(v.get(i));
+            i = i + 1;
+        }
+        return;
+    }
+    var mid = n / 2;
+    var sink: Vec<i64> = Vec::filled(n, 0);
+    var vw: i64 = v as i64;
+    var sw: i64 = sink as i64;
+    var t1 = spawn __par_map_worker(vw, sw, 0, mid, f);
+    var t2 = spawn __par_map_worker(vw, sw, mid, n, f);
+    await t1;
+    await t2;
+}
+
+/// Parallel reduce: fold all elements with `f`, seeded with `init`.
+/// Each half is folded independently and the partial results are combined
+/// with f — correct for associative f (sum, product, min, max).
+///
+/// Example:
+///   var v = par_range(1, 101);
+///   assert_eq(par_reduce(v, 0, fn(a: i64, x: i64) -> i64 { a + x }), 5050);
+pub fn par_reduce(v: Vec<i64>, init: i64, f: fn(i64, i64) -> i64) -> i64 {
+    var n = v.len();
+    if n < PAR_THRESHOLD() {
+        var acc = init;
+        var i = 0;
+        while i < n {
+            acc = f(acc, v.get(i));
+            i = i + 1;
+        }
+        return acc;
+    }
+    var mid = n / 2;
+    var t1 = spawn __par_reduce_worker(v, 0, mid, init, f);
+    var t2 = spawn __par_reduce_worker(v, mid, n, init, f);
+    var a1 = await t1;
+    var a2 = await t2;
+    return f(a1, a2);
+}
+
+/// Parallel sum with a per-element projection: sum of f(v[i]).
+///
+/// Example:
+///   var v = par_range(1, 4);
+///   assert_eq(par_sum_by(v, fn(x: i64) -> i64 { x * x }), 14);
+pub fn par_sum_by(v: Vec<i64>, f: fn(i64) -> i64) -> i64 {
+    var n = v.len();
+    if n < PAR_THRESHOLD() {
+        var total = 0;
+        var i = 0;
+        while i < n {
+            total = total + f(v.get(i));
+            i = i + 1;
+        }
+        return total;
+    }
+    var mid = n / 2;
+    var t1 = spawn __par_sum_by_worker(v, 0, mid, f);
+    var t2 = spawn __par_sum_by_worker(v, mid, n, f);
+    return await t1 + await t2;
 }
 
 /// Parallel sum: compute the sum of a Vec.
@@ -116,6 +262,16 @@ pub fn par_dot(a: Vec<i64>, b: Vec<i64>) -> i64 {
 /// Currently sequential — each element is independent (embarrassingly
 /// parallel) but parallel write to a shared result Vec requires
 /// finer-grained synchronization.
+///
+/// Example:
+///   val f = par_fill(4, 7);
+///   assert_eq(f.len(), 4);
+///   assert_eq(par_sum(f), 28);
+///   val r = par_range(1, 5);
+///   assert_eq(par_sum(r), 10);
+///   assert_eq(par_dot(r, r), 30);
+///   var sq = par_map(r, fn(x: i64) -> i64 { x * x });
+///   assert_eq(sq.get(3), 16);
 pub fn par_fill(n: i64, value: i64) -> Vec<i64> {
     var result = Vec::new();
     var i = 0;

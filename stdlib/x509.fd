@@ -1,0 +1,1115 @@
+// Fides X.509: certificate parsing (RFC 5280 §4.1) and path validation
+// basics (§6.1): TBSCertificate fields, distinguished names, validity,
+// SubjectPublicKeyInfo, and the extensions basicConstraints, keyUsage,
+// subjectAltName (DNS, IP, e-mail), subject/authority key identifiers and
+// nameConstraints; then chain checks: issuer/subject name chaining,
+// validity at a given time, CA flag, keyCertSign, path length
+// constraints, unknown critical extensions, the signature of each
+// certificate by its issuer, and name constraints (§4.2.1.10, §6.1.3 b/c:
+// permitted and excluded DNS, e-mail, IP and directoryName subtrees of
+// every CA, the anchor included, applied to the certificates below it;
+// self-issued intermediates are skipped). CRLs (§5): parsing of the
+// TBSCertList (issuer, thisUpdate/nextUpdate, revoked serials with their
+// dates and reason codes, cRLNumber, authority key identifier), the CRL's
+// signature by the certificate's issuer (with cRLSign when keyUsage is
+// present), and revocation checks of a chain against a set of CRLs.
+//
+// Pure computation. Signatures are checked through x509_verify_sig, which
+// dispatches on the signature algorithm to the stdlib verifiers: Ed25519
+// (ed25519.fd), ECDSA with SHA-256/SHA-384/SHA-512 on P-256/P-384/P-521
+// (ecdsa.fd), RSASSA-PKCS1-v1_5 with SHA-1/SHA-256/SHA-384/SHA-512 and
+// RSASSA-PSS (any of SHA-1/256/384/512, MGF1 with the same hash, the
+// salt length the parameters give; written here over rsa.fd's RSAVP1 so
+// SHA-384 works). Ed448 and other algorithms are reported as unsupported
+// and fail verification. Not done: OCSP, delta CRLs and CRLs with an
+// issuingDistributionPoint (refused: they are critical extensions this
+// module does not process), indirect CRLs, policy processing, and name
+// constraints on URIs or other name forms (a CA carrying one fails the
+// chain rather than being ignored); the subject CN is not checked against
+// DNS constraints. The caller must not treat a passing chain as a full
+// RFC 5280 validation.
+//
+// Checked against a four-certificate chain made by OpenSSL 3.5 (Ed25519
+// root, P-256 intermediate, RSA-1024 intermediate, Ed25519 leaf with SANs)
+// and against an OpenSSL chain with a P-384 root (ecdsa-with-SHA384), a
+// name-constrained RSA intermediate, RSA-PSS (SHA-256 and SHA-384) leaves
+// and OpenSSL CRLs, in tests/bootstrap/test_std_x509.fd.
+//
+// Usage:
+//   use x509;
+//   val leaf = x509_parse(pem_decode(text, "CERTIFICATE").der);
+//   var chain: Vec<X509Cert> = Vec::new(); chain.push(leaf); chain.push(inter);
+//   var roots: Vec<X509Cert> = Vec::new(); roots.push(root);
+//   val r = x509_verify_chain(chain, roots, now);  // r.ok, r.err
+//   val good = x509_matches_host(leaf, "www.example.test");
+
+module x509;
+use vec;
+use string;
+use encoding;
+use asn1;
+use pem;
+use kdf;
+use rsa;
+use ecdsa;
+use ed25519;
+use bigint;
+
+pub const X509_KU_DIGITAL_SIGNATURE: i64 = 1;
+pub const X509_KU_NON_REPUDIATION: i64 = 2;
+pub const X509_KU_KEY_ENCIPHERMENT: i64 = 4;
+pub const X509_KU_DATA_ENCIPHERMENT: i64 = 8;
+pub const X509_KU_KEY_AGREEMENT: i64 = 16;
+pub const X509_KU_KEY_CERT_SIGN: i64 = 32;
+pub const X509_KU_CRL_SIGN: i64 = 64;
+
+pub const X509_OID_ED25519: str = "1.3.101.112";
+pub const X509_OID_ECDSA_SHA256: str = "1.2.840.10045.4.3.2";
+pub const X509_OID_ECDSA_SHA384: str = "1.2.840.10045.4.3.3";
+pub const X509_OID_ECDSA_SHA512: str = "1.2.840.10045.4.3.4";
+pub const X509_OID_RSA_SHA1: str = "1.2.840.113549.1.1.5";
+pub const X509_OID_RSA_SHA256: str = "1.2.840.113549.1.1.11";
+pub const X509_OID_RSA_SHA512: str = "1.2.840.113549.1.1.13";
+pub const X509_OID_RSA_SHA384: str = "1.2.840.113549.1.1.12";
+pub const X509_OID_RSA_PSS: str = "1.2.840.113549.1.1.10";
+
+pub const X509_REASON_UNSPECIFIED: i64 = 0;
+pub const X509_REASON_KEY_COMPROMISE: i64 = 1;
+pub const X509_REASON_CA_COMPROMISE: i64 = 2;
+pub const X509_REASON_SUPERSEDED: i64 = 4;
+pub const X509_REASON_CESSATION: i64 = 5;
+
+/// A parsed certificate. `key_usage` is -1 when the extension is absent,
+/// else bit i is KeyUsage bit i (X509_KU_*); `path_len` is -1 when there
+/// is no pathLenConstraint.
+pub struct X509Cert {
+    pub ok: bool,
+    pub err: str,
+    pub raw: Vec<i64>,
+    pub tbs: Vec<i64>,
+    pub version: i64,
+    pub serial: Vec<i64>,
+    pub sig_alg: str,
+    pub sig_params: Vec<i64>,
+    pub sig: Vec<i64>,
+    pub issuer_raw: Vec<i64>,
+    pub subject_raw: Vec<i64>,
+    pub issuer: str,
+    pub subject: str,
+    pub common_name: str,
+    pub subject_email: Vec<str>,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub spki: Spki,
+    pub has_basic: bool,
+    pub is_ca: bool,
+    pub path_len: i64,
+    pub key_usage: i64,
+    pub san_dns: Vec<str>,
+    pub san_ip: Vec<str>,
+    pub san_email: Vec<str>,
+    pub san_ip_raw: Vec<str>,
+    pub ski: Vec<i64>,
+    pub aki: Vec<i64>,
+    pub unknown_critical: bool,
+    pub has_nc: bool,
+    pub nc_permitted: Vec<str>,
+    pub nc_excluded: Vec<str>,
+    pub nc_unsupported: bool,
+}
+
+/// The result of a chain check: ok, or the reason and the position
+/// (0 = the leaf) of the certificate that failed.
+pub struct X509ChainResult {
+    pub ok: bool,
+    pub err: str,
+    pub at: i64,
+}
+
+fn x509_empty(err: str) -> X509Cert {
+    return X509Cert {
+        ok: false, err: err, raw: Vec::new(), tbs: Vec::new(), version: 0, serial: Vec::new(),
+        sig_alg: "", sig_params: Vec::new(), sig: Vec::new(), issuer_raw: Vec::new(), subject_raw: Vec::new(),
+        issuer: "", subject: "", common_name: "", subject_email: Vec::new(), not_before: 0, not_after: 0,
+        spki: Spki { ok: false, alg: "", params: "", key: Vec::new() },
+        has_basic: false, is_ca: false, path_len: -1, key_usage: -1,
+        san_dns: Vec::new(), san_ip: Vec::new(), san_email: Vec::new(), san_ip_raw: Vec::new(),
+        ski: Vec::new(), aki: Vec::new(), unknown_critical: false,
+        has_nc: false, nc_permitted: Vec::new(), nc_excluded: Vec::new(), nc_unsupported: false
+    };
+}
+
+/// The short name of an attribute type ("CN", "O", ...) or the dotted OID.
+pub fn x509_attr_name(oid: str) -> str {
+    if str_equal(oid, "2.5.4.3") { return "CN"; }
+    if str_equal(oid, "2.5.4.6") { return "C"; }
+    if str_equal(oid, "2.5.4.7") { return "L"; }
+    if str_equal(oid, "2.5.4.8") { return "ST"; }
+    if str_equal(oid, "2.5.4.10") { return "O"; }
+    if str_equal(oid, "2.5.4.11") { return "OU"; }
+    if str_equal(oid, "2.5.4.5") { return "serialNumber"; }
+    if str_equal(oid, "0.9.2342.19200300.100.1.25") { return "DC"; }
+    if str_equal(oid, "1.2.840.113549.1.9.1") { return "emailAddress"; }
+    return oid;
+}
+
+/// A Name (SEQUENCE OF RDN) as text, RDNs in encoded order joined by ", "
+/// ("C=FR, O=Fides Test, CN=example.test"). Also returns the last CN
+/// through `cn`.
+fn x509_name_text(buf: & Vec<i64>, t: Asn1Tlv, cn: & mut str) -> str {
+    var out: str = "";
+    val rdns: Vec<Asn1Tlv> = asn1_children(buf, t);
+    var i: i64 = 0;
+    while i < rdns.len() {
+        val atvs: Vec<Asn1Tlv> = asn1_children(buf, rdns.get(i));
+        var j: i64 = 0;
+        while j < atvs.len() {
+            val parts: Vec<Asn1Tlv> = asn1_children(buf, atvs.get(j));
+            if parts.len() == 2 && asn1_is(parts.get(0), ASN1_OID) {
+                val oid: str = asn1_get_oid(buf, parts.get(0));
+                val value: str = asn1_get_str(buf, parts.get(1));
+                if str_len(out) > 0 { out = out + ", "; }
+                out = out + x509_attr_name(oid) + "=" + value;
+                if str_equal(oid, "2.5.4.3") { *cn = value; }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn x509_ip_text(b: Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    if b.len() == 4 {
+        while i < 4 {
+            if i > 0 { out = out + "."; }
+            out = out + int_to_str(b.get(i));
+            i = i + 1;
+        }
+        return out;
+    }
+    while i + 1 < b.len() {
+        if i > 0 { out = out + ":"; }
+        val g: i64 = (b.get(i) << 8) | b.get(i + 1);
+        out = out + str_to_lower(int_to_hex(g));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn x509_extension(c: & mut X509Cert, buf: & Vec<i64>, ext: Asn1Tlv) -> bool {
+    val parts: Vec<Asn1Tlv> = asn1_children(buf, ext);
+    if parts.len() < 2 || !asn1_is(parts.get(0), ASN1_OID) { return false; }
+    val oid: str = asn1_get_oid(buf, parts.get(0));
+    var critical: bool = false;
+    var vi: i64 = 1;
+    if asn1_is(parts.get(1), ASN1_BOOLEAN) {
+        critical = asn1_get_bool(buf, parts.get(1));
+        vi = 2;
+    }
+    if vi >= parts.len() || !asn1_is(parts.get(vi), ASN1_OCTET_STRING) { return false; }
+    val ov: Asn1Tlv = parts.get(vi);
+    val v: Asn1Tlv = asn1_read(buf, ov.off, ov.off + ov.len);
+    if !v.ok || v.end != ov.off + ov.len { return false; }
+    if str_equal(oid, "2.5.29.19") {
+        // basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLen INTEGER OPTIONAL }
+        if !asn1_is(v, ASN1_SEQUENCE) { return false; }
+        c.has_basic = true;
+        val kids: Vec<Asn1Tlv> = asn1_children(buf, v);
+        var k: i64 = 0;
+        if k < kids.len() && asn1_is(kids.get(k), ASN1_BOOLEAN) {
+            c.is_ca = asn1_get_bool(buf, kids.get(k));
+            k = k + 1;
+        }
+        if k < kids.len() && asn1_is(kids.get(k), ASN1_INTEGER) {
+            c.path_len = asn1_get_int(buf, kids.get(k));
+        }
+    } else if str_equal(oid, "2.5.29.15") {
+        if !asn1_is(v, ASN1_BIT_STRING) { return false; }
+        val bits: Vec<i64> = asn1_get_bits(buf, v);
+        var ku: i64 = 0;
+        var b: i64 = 0;
+        while b < bits.len() * 8 && b < 16 {
+            if (bits.get(b / 8) & (0x80 >> (b % 8))) != 0 { ku = ku | (1 << b); }
+            b = b + 1;
+        }
+        c.key_usage = ku;
+    } else if str_equal(oid, "2.5.29.17") {
+        if !asn1_is(v, ASN1_SEQUENCE) { return false; }
+        val names: Vec<Asn1Tlv> = asn1_children(buf, v);
+        var k: i64 = 0;
+        while k < names.len() {
+            val g: Asn1Tlv = names.get(k);
+            if asn1_is_ctx(g, 2) { c.san_dns.push(str_from_bytes(asn1_content(buf, g))); }
+            if asn1_is_ctx(g, 1) { c.san_email.push(str_from_bytes(asn1_content(buf, g))); }
+            if asn1_is_ctx(g, 7) {
+                c.san_ip.push(x509_ip_text(asn1_content(buf, g)));
+                c.san_ip_raw.push(hex_encode_bytes(asn1_content(buf, g)));
+            }
+            k = k + 1;
+        }
+    } else if str_equal(oid, "2.5.29.14") {
+        if !asn1_is(v, ASN1_OCTET_STRING) { return false; }
+        c.ski = asn1_content(buf, v);
+    } else if str_equal(oid, "2.5.29.35") {
+        val kids: Vec<Asn1Tlv> = asn1_children(buf, v);
+        if kids.len() > 0 && asn1_is_ctx(kids.get(0), 0) { c.aki = asn1_content(buf, kids.get(0)); }
+    } else if str_equal(oid, "2.5.29.30") {
+        // NameConstraints ::= SEQUENCE { permittedSubtrees [0], excludedSubtrees [1] }
+        if !asn1_is(v, ASN1_SEQUENCE) { return false; }
+        c.has_nc = true;
+        val trees: Vec<Asn1Tlv> = asn1_children(buf, v);
+        var k: i64 = 0;
+        while k < trees.len() {
+            val tr: Asn1Tlv = trees.get(k);
+            if !asn1_is_ctx(tr, 0) && !asn1_is_ctx(tr, 1) { return false; }
+            val subs: Vec<Asn1Tlv> = asn1_children(buf, tr);
+            var j: i64 = 0;
+            while j < subs.len() {
+                if !asn1_is(subs.get(j), ASN1_SEQUENCE) { return false; }
+                val parts2: Vec<Asn1Tlv> = asn1_children(buf, subs.get(j));
+                if parts2.len() < 1 { return false; }
+                val base: str = x509_nc_base(buf, parts2.get(0));
+                if str_len(base) == 0 {
+                    c.nc_unsupported = true;
+                } else if asn1_is_ctx(tr, 0) {
+                    c.nc_permitted.push(base);
+                } else {
+                    c.nc_excluded.push(base);
+                }
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+    } else if critical {
+        c.unknown_critical = true;
+    }
+    return true;
+}
+
+/// A GeneralSubtree's base as "dns:<name>", "email:<mailbox or domain>",
+/// "ip:<address hex><mask hex>" or "dn:<hex of the RDNs>"; "" for a name
+/// form this module does not check.
+fn x509_nc_base(buf: & Vec<i64>, g: Asn1Tlv) -> str {
+    if asn1_is_ctx(g, 2) { return "dns:" + str_to_lower(str_from_bytes(asn1_content(buf, g))); }
+    if asn1_is_ctx(g, 1) { return "email:" + str_from_bytes(asn1_content(buf, g)); }
+    if asn1_is_ctx(g, 7) {
+        val ip: Vec<i64> = asn1_content(buf, g);
+        if ip.len() != 8 && ip.len() != 32 { return ""; }
+        return "ip:" + hex_encode_bytes(ip);
+    }
+    if asn1_is_ctx(g, 4) && g.constructed {
+        val name: Asn1Tlv = asn1_read(buf, g.off, g.off + g.len);
+        if !asn1_is(name, ASN1_SEQUENCE) { return ""; }
+        return "dn:" + hex_encode_bytes(asn1_content(buf, name));
+    }
+    return "";
+}
+
+/// The emailAddress attributes of a Name.
+fn x509_name_emails(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val rdns: Vec<Asn1Tlv> = asn1_children(buf, t);
+    var i: i64 = 0;
+    while i < rdns.len() {
+        val atvs: Vec<Asn1Tlv> = asn1_children(buf, rdns.get(i));
+        var j: i64 = 0;
+        while j < atvs.len() {
+            val parts: Vec<Asn1Tlv> = asn1_children(buf, atvs.get(j));
+            if parts.len() == 2 && asn1_is(parts.get(0), ASN1_OID) && str_equal(asn1_get_oid(buf, parts.get(0)), "1.2.840.113549.1.9.1") {
+                out.push(asn1_get_str(buf, parts.get(1)));
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The parameters of an AlgorithmIdentifier as raw DER when they are a
+/// SEQUENCE (RSASSA-PSS), else empty.
+fn x509_alg_params(buf: & Vec<i64>, t: Asn1Tlv) -> Vec<i64> {
+    val kids: Vec<Asn1Tlv> = asn1_children(buf, t);
+    if kids.len() >= 2 && asn1_is(kids.get(1), ASN1_SEQUENCE) { return asn1_raw(buf, kids.get(1)); }
+    return Vec::new();
+}
+
+fn x509_time_of(buf: & Vec<i64>, t: Asn1Tlv) -> i64 {
+    match asn1_get_time(buf, t) {
+        Option::Some(x) => { return x; }
+        Option::None => { return -1; }
+    }
+}
+
+/// Parse a DER certificate. On failure ok is false and err says why.
+pub fn x509_parse(der: Vec<i64>) -> X509Cert {
+    val top: Asn1Tlv = asn1_read_der(& der, 0, der.len());
+    if !asn1_is(top, ASN1_SEQUENCE) || top.end != der.len() { return x509_empty("not a DER SEQUENCE"); }
+    val outer: Vec<Asn1Tlv> = asn1_children(& der, top);
+    if outer.len() != 3 || !asn1_is(outer.get(0), ASN1_SEQUENCE) || !asn1_is(outer.get(2), ASN1_BIT_STRING) {
+        return x509_empty("not a Certificate");
+    }
+    var c: X509Cert = x509_empty("");
+    c.raw = der;
+    c.tbs = asn1_raw(& der, outer.get(0));
+    c.sig_alg = str_split(pem_alg_id(& der, outer.get(1)), " ").get(0);
+    c.sig_params = x509_alg_params(& der, outer.get(1));
+    c.sig = asn1_get_bits(& der, outer.get(2));
+    val f: Vec<Asn1Tlv> = asn1_children(& der, outer.get(0));
+    var i: i64 = 0;
+    c.version = 1;
+    if i < f.len() && asn1_is_ctx(f.get(i), 0) {
+        val vt: Asn1Tlv = asn1_read(& der, f.get(i).off, f.get(i).off + f.get(i).len);
+        if !asn1_is(vt, ASN1_INTEGER) { return x509_empty("bad version"); }
+        c.version = asn1_get_int(& der, vt) + 1;
+        i = i + 1;
+    }
+    if f.len() < i + 6 { return x509_empty("short TBSCertificate"); }
+    if !asn1_is(f.get(i), ASN1_INTEGER) { return x509_empty("bad serial"); }
+    c.serial = asn1_get_uint_bytes(& der, f.get(i));
+    val inner_alg: str = str_split(pem_alg_id(& der, f.get(i + 1)), " ").get(0);
+    if !str_equal(inner_alg, c.sig_alg) { return x509_empty("signature algorithms differ"); }
+    if !rsa_ct_eq(x509_alg_params(& der, f.get(i + 1)), c.sig_params) { return x509_empty("signature algorithms differ"); }
+    if !asn1_is(f.get(i + 2), ASN1_SEQUENCE) || !asn1_is(f.get(i + 4), ASN1_SEQUENCE) { return x509_empty("bad name"); }
+    c.issuer_raw = asn1_raw(& der, f.get(i + 2));
+    c.subject_raw = asn1_raw(& der, f.get(i + 4));
+    var cn_unused: str = "";
+    c.issuer = x509_name_text(& der, f.get(i + 2), & mut cn_unused);
+    var cn: str = "";
+    c.subject = x509_name_text(& der, f.get(i + 4), & mut cn);
+    c.common_name = cn;
+    c.subject_email = x509_name_emails(& der, f.get(i + 4));
+    val val_kids: Vec<Asn1Tlv> = asn1_children(& der, f.get(i + 3));
+    if val_kids.len() != 2 { return x509_empty("bad validity"); }
+    c.not_before = x509_time_of(& der, val_kids.get(0));
+    c.not_after = x509_time_of(& der, val_kids.get(1));
+    if c.not_before < 0 || c.not_after < 0 { return x509_empty("bad time"); }
+    c.spki = spki_parse_at(& der, f.get(i + 5));
+    if !c.spki.ok { return x509_empty("bad SubjectPublicKeyInfo"); }
+    var k: i64 = i + 6;
+    while k < f.len() {
+        val e: Asn1Tlv = f.get(k);
+        if asn1_is_ctx(e, 3) {
+            val seq: Asn1Tlv = asn1_read(& der, e.off, e.off + e.len);
+            if !asn1_is(seq, ASN1_SEQUENCE) { return x509_empty("bad extensions"); }
+            val exts: Vec<Asn1Tlv> = asn1_children(& der, seq);
+            var j: i64 = 0;
+            while j < exts.len() {
+                if !x509_extension(& mut c, & der, exts.get(j)) { return x509_empty("bad extension"); }
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    c.ok = true;
+    return c;
+}
+
+/// Parse the first CERTIFICATE block of PEM text.
+pub fn x509_parse_pem(text: str) -> X509Cert {
+    val b: PemBlock = pem_decode(text, "CERTIFICATE");
+    if !b.ok { return x509_empty("no CERTIFICATE block"); }
+    return x509_parse(b.der);
+}
+
+/// Whether the certificate is within its validity period at Unix time t.
+pub fn x509_valid_at(c: X509Cert, t: i64) -> bool {
+    return c.ok && t >= c.not_before && t <= c.not_after;
+}
+
+/// Whether issuer's subject is child's issuer (byte-exact names, the
+/// usual case; RFC 5280's case-folding comparison is not done).
+pub fn x509_names_chain(child: X509Cert, issuer: X509Cert) -> bool {
+    return rsa_ct_eq(child.issuer_raw, issuer.subject_raw);
+}
+
+/// Whether a certificate is self-issued (issuer name = subject name).
+pub fn x509_self_issued(c: X509Cert) -> bool {
+    return rsa_ct_eq(c.issuer_raw, c.subject_raw);
+}
+
+/// A readable name of a signature algorithm OID ("" when unsupported).
+pub fn x509_sig_alg_name(oid: str) -> str {
+    if str_equal(oid, X509_OID_ED25519) { return "Ed25519"; }
+    if str_equal(oid, X509_OID_ECDSA_SHA256) { return "ecdsa-with-SHA256"; }
+    if str_equal(oid, X509_OID_ECDSA_SHA384) { return "ecdsa-with-SHA384"; }
+    if str_equal(oid, X509_OID_ECDSA_SHA512) { return "ecdsa-with-SHA512"; }
+    if str_equal(oid, X509_OID_RSA_SHA1) { return "sha1WithRSAEncryption"; }
+    if str_equal(oid, X509_OID_RSA_SHA256) { return "sha256WithRSAEncryption"; }
+    if str_equal(oid, X509_OID_RSA_SHA384) { return "sha384WithRSAEncryption"; }
+    if str_equal(oid, X509_OID_RSA_SHA512) { return "sha512WithRSAEncryption"; }
+    if str_equal(oid, X509_OID_RSA_PSS) { return "RSASSA-PSS"; }
+    return "";
+}
+
+// ─── Signatures ────────────────────────────────────────────────────────
+
+/// The hash id (kdf.fd / ecdsa.fd) of a hash algorithm OID, 0 if unknown.
+fn x509_hash_of_oid(oid: str) -> i64 {
+    if str_equal(oid, "1.3.14.3.2.26") { return KDF_SHA1; }
+    if str_equal(oid, "2.16.840.1.101.3.4.2.1") { return KDF_SHA256; }
+    if str_equal(oid, "2.16.840.1.101.3.4.2.2") { return EC_SHA384; }
+    if str_equal(oid, "2.16.840.1.101.3.4.2.3") { return KDF_SHA512; }
+    return 0;
+}
+
+fn x509_hash_oid(h: i64) -> str {
+    if h == KDF_SHA1 { return "1.3.14.3.2.26"; }
+    if h == EC_SHA384 { return "2.16.840.1.101.3.4.2.2"; }
+    if h == KDF_SHA512 { return "2.16.840.1.101.3.4.2.3"; }
+    return "2.16.840.1.101.3.4.2.1";
+}
+
+/// RSASSA-PSS-params (RFC 4055 §3.1): the hash and salt length, with the
+/// defaults SHA-1 and 20. False when the parameters are malformed, use an
+/// unknown hash, a mask generation function other than MGF1 with the
+/// same hash, or a trailer field other than 1.
+fn x509_pss_params(p: Vec<i64>, hash: & mut i64, salt: & mut i64) -> bool {
+    *hash = KDF_SHA1;
+    *salt = 20;
+    var mgf_hash: i64 = KDF_SHA1;
+    val t: Asn1Tlv = asn1_read_der(& p, 0, p.len());
+    if !asn1_is(t, ASN1_SEQUENCE) || t.end != p.len() { return false; }
+    val kids: Vec<Asn1Tlv> = asn1_children(& p, t);
+    var i: i64 = 0;
+    while i < kids.len() {
+        val k: Asn1Tlv = kids.get(i);
+        if !k.ok || k.cls != 2 { return false; }
+        val inner: Asn1Tlv = asn1_read(& p, k.off, k.off + k.len);
+        if !inner.ok { return false; }
+        if k.tag == 0 {
+            *hash = x509_hash_of_oid(str_split(pem_alg_id(& p, inner), " ").get(0));
+        } else if k.tag == 1 {
+            val mk: Vec<Asn1Tlv> = asn1_children(& p, inner);
+            if mk.len() != 2 || !asn1_is(mk.get(0), ASN1_OID) { return false; }
+            if !str_equal(asn1_get_oid(& p, mk.get(0)), "1.2.840.113549.1.1.8") { return false; }
+            mgf_hash = x509_hash_of_oid(str_split(pem_alg_id(& p, mk.get(1)), " ").get(0));
+        } else if k.tag == 2 {
+            if !asn1_is(inner, ASN1_INTEGER) { return false; }
+            *salt = asn1_get_int(& p, inner);
+        } else if k.tag == 3 {
+            if !asn1_is(inner, ASN1_INTEGER) || asn1_get_int(& p, inner) != 1 { return false; }
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return *hash != 0 && mgf_hash == *hash && *salt >= 0;
+}
+
+/// MGF1 (RFC 8017 B.2.1) with any hash ec_hash knows.
+fn x509_mgf1(h: i64, seed: & Vec<i64>, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var counter: i64 = 0;
+    while out.len() < len {
+        var m: Vec<i64> = *seed;
+        m.push((counter >> 24) & 255);
+        m.push((counter >> 16) & 255);
+        m.push((counter >> 8) & 255);
+        m.push(counter & 255);
+        val d: Vec<i64> = ec_hash(h, m);
+        var i: i64 = 0;
+        while i < d.len() && out.len() < len { out.push(d.get(i)); i = i + 1; }
+        counter = counter + 1;
+    }
+    return out;
+}
+
+/// RSAVP1: the k-byte (or em_len-byte) encoded message of a signature,
+/// empty when the signature is out of range.
+fn x509_rsa_open(pk: & RsaPublicKey, sig: & Vec<i64>, len: i64) -> Vec<i64> {
+    if !pk.ok || sig.len() != pk.k { return Vec::new(); }
+    val s: BigInt = rsa_os2ip(*sig);
+    if !bigint_lt(s, pk.n) { return Vec::new(); }
+    return rsa_i2osp(rsa_ep(*pk, s), len);
+}
+
+/// RSASSA-PSS verification (RFC 8017 §8.1.2, EMSA-PSS-VERIFY §9.1.2).
+pub fn x509_rsa_pss_verify(pk: RsaPublicKey, h: i64, msg: Vec<i64>, sig: Vec<i64>, salt_len: i64) -> bool {
+    val em_bits: i64 = pk.bits - 1;
+    val em_len: i64 = (em_bits + 7) / 8;
+    val em: Vec<i64> = x509_rsa_open(& pk, & sig, em_len);
+    val hl: i64 = ec_hash_len(h);
+    if em.len() != em_len || em_len < hl + salt_len + 2 { return false; }
+    if em.get(em_len - 1) != 0xbc { return false; }
+    var db: Vec<i64> = asn1_slice(& em, 0, em_len - hl - 1);
+    val hh: Vec<i64> = asn1_slice(& em, em_len - hl - 1, em_len - 1);
+    val clear: i64 = 8 * em_len - em_bits;
+    if (db.get(0) & (255 - (255 >> clear))) != 0 { return false; }
+    val mask: Vec<i64> = x509_mgf1(h, & hh, em_len - hl - 1);
+    var i: i64 = 0;
+    while i < db.len() { db.set(i, db.get(i) ^ mask.get(i)); i = i + 1; }
+    db.set(0, db.get(0) & (255 >> clear));
+    // DB = zeros || 01 || salt, with exactly salt_len salt bytes.
+    val ps: i64 = em_len - hl - salt_len - 2;
+    var bad: i64 = db.get(ps) ^ 1;
+    i = 0;
+    while i < ps { bad = bad | db.get(i); i = i + 1; }
+    if bad != 0 { return false; }
+    var mp: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 { mp.push(0); i = i + 1; }
+    mp = asn1_cat(asn1_cat(mp, ec_hash(h, msg)), asn1_slice(& db, ps + 1, db.len()));
+    return rsa_ct_eq(hh, ec_hash(h, mp));
+}
+
+/// RSASSA-PKCS1-v1_5 verification with any hash ec_hash knows (rsa.fd's
+/// has no SHA-384).
+pub fn x509_rsa_pkcs1_verify(pk: RsaPublicKey, h: i64, msg: Vec<i64>, sig: Vec<i64>) -> bool {
+    val em: Vec<i64> = x509_rsa_open(& pk, & sig, pk.k);
+    if em.len() != pk.k { return false; }
+    val alg: Vec<i64> = asn1_enc_seq(asn1_cat(asn1_enc_oid(x509_hash_oid(h)), asn1_enc_null()));
+    val t: Vec<i64> = asn1_enc_seq(asn1_cat(alg, asn1_enc_octets(ec_hash(h, msg))));
+    if pk.k < t.len() + 11 { return false; }
+    var want: Vec<i64> = Vec::new();
+    want.push(0);
+    want.push(1);
+    var i: i64 = 0;
+    while i < pk.k - t.len() - 3 { want.push(255); i = i + 1; }
+    want.push(0);
+    return rsa_ct_eq(em, asn1_cat(want, t));
+}
+
+/// Whether `sig` over `tbs` verifies under `key` with the signature
+/// algorithm `alg` (an OID) and its parameters (RSASSA-PSS only).
+pub fn x509_verify_sig(alg: str, params: Vec<i64>, tbs: Vec<i64>, sig: Vec<i64>, key: Spki) -> bool {
+    if str_equal(alg, X509_OID_ED25519) {
+        if !str_equal(key.alg, PEM_OID_ED25519) || key.key.len() != 32 { return false; }
+        return ed25519_verify(key.key, tbs, sig);
+    }
+    if str_equal(alg, X509_OID_ECDSA_SHA256) || str_equal(alg, X509_OID_ECDSA_SHA384) || str_equal(alg, X509_OID_ECDSA_SHA512) {
+        if !str_equal(key.alg, PEM_OID_EC) { return false; }
+        val curve: EcCurve = ec_curve_by_oid(key.params);
+        if curve.len == 0 { return false; }
+        var h: i64 = KDF_SHA256;
+        if str_equal(alg, X509_OID_ECDSA_SHA384) { h = EC_SHA384; }
+        if str_equal(alg, X509_OID_ECDSA_SHA512) { h = KDF_SHA512; }
+        return ecdsa_verify_der(& curve, key.key, h, tbs, sig);
+    }
+    val rsa_key: bool = str_equal(key.alg, PEM_OID_RSA) || str_equal(key.alg, PEM_OID_RSA_PSS);
+    if str_equal(alg, X509_OID_RSA_PSS) {
+        if !rsa_key { return false; }
+        var h3: i64 = 0;
+        var salt: i64 = 0;
+        if !x509_pss_params(params, & mut h3, & mut salt) { return false; }
+        return x509_rsa_pss_verify(rsa_public_from_der(key.key), h3, tbs, sig, salt);
+    }
+    if str_equal(alg, X509_OID_RSA_SHA256) || str_equal(alg, X509_OID_RSA_SHA384) || str_equal(alg, X509_OID_RSA_SHA512) || str_equal(alg, X509_OID_RSA_SHA1) {
+        // A key restricted to PSS (id-RSASSA-PSS) must not verify PKCS#1 v1.5.
+        if !str_equal(key.alg, PEM_OID_RSA) { return false; }
+        val pk: RsaPublicKey = rsa_public_from_der(key.key);
+        var h2: i64 = KDF_SHA256;
+        if str_equal(alg, X509_OID_RSA_SHA384) { h2 = EC_SHA384; }
+        if str_equal(alg, X509_OID_RSA_SHA512) { h2 = KDF_SHA512; }
+        if str_equal(alg, X509_OID_RSA_SHA1) { h2 = KDF_SHA1; }
+        return x509_rsa_pkcs1_verify(pk, h2, tbs, sig);
+    }
+    return false;
+}
+
+/// Whether `child`'s signature verifies under `issuer`'s public key.
+pub fn x509_verify_signed_by(child: X509Cert, issuer: X509Cert) -> bool {
+    if !child.ok || !issuer.ok { return false; }
+    return x509_verify_sig(child.sig_alg, child.sig_params, child.tbs, child.sig, issuer.spki);
+}
+
+fn x509_fail(err: str, at: i64) -> X509ChainResult {
+    return X509ChainResult { ok: false, err: err, at: at };
+}
+
+/// Check one issuer as a CA for a child `below` CA certificates beneath it.
+fn x509_check_ca(issuer: X509Cert, below: i64) -> str {
+    if !issuer.has_basic || !issuer.is_ca { return "issuer is not a CA"; }
+    if issuer.key_usage >= 0 && (issuer.key_usage & X509_KU_KEY_CERT_SIGN) == 0 { return "issuer lacks keyCertSign"; }
+    if issuer.path_len >= 0 && below > issuer.path_len { return "path length exceeded"; }
+    return "";
+}
+
+/// Validate a chain at Unix time `now`. chain[0] is the leaf, each next
+/// certificate its issuer; the last one must be issued by one of the
+/// trust anchors (a root may also be the chain's last element itself, if
+/// it is among the anchors). Every certificate must be valid at `now`,
+/// chain by name to its issuer, be signed by it, have no unknown critical
+/// extension, and every issuer must be a CA allowed to sign certificates
+/// within its path length.
+pub fn x509_verify_chain(chain: Vec<X509Cert>, anchors: Vec<X509Cert>, now: i64) -> X509ChainResult {
+    if chain.len() == 0 { return x509_fail("empty chain", 0); }
+    var i: i64 = 0;
+    while i < chain.len() {
+        val c: X509Cert = chain.get(i);
+        if !c.ok { return x509_fail("unparsable certificate: " + c.err, i); }
+        if !x509_valid_at(c, now) { return x509_fail("outside its validity period", i); }
+        if c.unknown_critical { return x509_fail("unknown critical extension", i); }
+        // A CA count below the issuer: intermediates between it and the leaf.
+        val below: i64 = i;
+        if i + 1 < chain.len() {
+            val iss: X509Cert = chain.get(i + 1);
+            if !x509_names_chain(c, iss) { return x509_fail("issuer name does not match", i); }
+            val why: str = x509_check_ca(iss, below);
+            if str_len(why) > 0 { return x509_fail(why, i + 1); }
+            if !x509_verify_signed_by(c, iss) { return x509_fail("bad signature", i); }
+        } else {
+            // The last certificate: an anchor itself, or issued by one.
+            var k: i64 = 0;
+            while k < anchors.len() {
+                val a: X509Cert = anchors.get(k);
+                if rsa_ct_eq(a.raw, c.raw) { return x509_nc_chain(& chain, & a, i); }
+                k = k + 1;
+            }
+            k = 0;
+            while k < anchors.len() {
+                val a2: X509Cert = anchors.get(k);
+                if x509_names_chain(c, a2) {
+                    if !x509_valid_at(a2, now) { return x509_fail("trust anchor expired", i + 1); }
+                    val why2: str = x509_check_ca(a2, below);
+                    if str_len(why2) > 0 { return x509_fail(why2, i + 1); }
+                    if x509_verify_signed_by(c, a2) { return x509_nc_chain(& chain, & a2, i + 1); }
+                    return x509_fail("bad signature", i);
+                }
+                k = k + 1;
+            }
+            return x509_fail("no trust anchor", i);
+        }
+        i = i + 1;
+    }
+    return x509_fail("no trust anchor", chain.len());
+}
+
+// ─── Name constraints (RFC 5280 §4.2.1.10) ─────────────────────────────
+
+/// Whether a DNS name lies in a dNSName subtree: the name itself or a
+/// subdomain of it ("example.test" covers "a.example.test"); a base with a
+/// leading dot covers subdomains only; an empty base covers every name.
+pub fn x509_nc_dns_in(name: str, base: str) -> bool {
+    val n: str = str_to_lower(name);
+    val b: str = str_to_lower(base);
+    if str_len(b) == 0 { return true; }
+    if str_starts_with(b, ".") { return str_ends_with(n, b); }
+    return str_equal(n, b) || str_ends_with(n, "." + b);
+}
+
+/// Whether a wildcard DNS name "*.X" could name a host inside the subtree
+/// `base` (used for excluded subtrees: "*.example.test" can be
+/// "bad.example.test").
+fn x509_nc_wild_hits(name: str, base: str) -> bool {
+    if !str_starts_with(name, "*.") { return false; }
+    val rest: str = str_to_lower(str_slice(name, 2, str_len(name)));
+    var b: str = str_to_lower(base);
+    if str_starts_with(b, ".") { b = str_slice(b, 1, str_len(b)); }
+    if !str_ends_with(b, "." + rest) { return false; }
+    val head: str = str_slice(b, 0, str_len(b) - str_len(rest) - 1);
+    return str_len(head) > 0 && str_find(head, ".") < 0;
+}
+
+/// Whether a mailbox lies in an rfc822Name subtree: a whole mailbox
+/// (exact), a host (the mailbox's domain), or ".domain" (any subdomain).
+pub fn x509_nc_email_in(mail: str, base: str) -> bool {
+    val at: i64 = str_rfind(mail, "@");
+    if at < 0 { return false; }
+    val host: str = str_to_lower(str_slice(mail, at + 1, str_len(mail)));
+    if str_find(base, "@") >= 0 {
+        val bat: i64 = str_rfind(base, "@");
+        return str_equal(str_slice(mail, 0, at), str_slice(base, 0, bat))
+            && str_equal(host, str_to_lower(str_slice(base, bat + 1, str_len(base))));
+    }
+    val b: str = str_to_lower(base);
+    if str_starts_with(b, ".") { return str_ends_with(host, b); }
+    return str_equal(host, b);
+}
+
+/// Whether an address (hex of 4 or 16 bytes) lies in an iPAddress subtree
+/// (hex of address || mask).
+pub fn x509_nc_ip_in(ip_hex: str, base_hex: str) -> bool {
+    val ip: Vec<i64> = hex_decode_bytes(ip_hex);
+    val b: Vec<i64> = hex_decode_bytes(base_hex);
+    if b.len() != 2 * ip.len() { return false; }
+    var i: i64 = 0;
+    while i < ip.len() {
+        val m: i64 = b.get(ip.len() + i);
+        if (ip.get(i) & m) != (b.get(i) & m) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Whether one name ("dns:..", "email:..", "ip:..", "dn:..") lies in one
+/// constraint of the same form.
+fn x509_nc_match(name: str, base: str, excluded: bool) -> bool {
+    if str_starts_with(name, "dns:") && str_starts_with(base, "dns:") {
+        val n: str = str_slice(name, 4, str_len(name));
+        val b: str = str_slice(base, 4, str_len(base));
+        if x509_nc_dns_in(n, b) { return true; }
+        return excluded && x509_nc_wild_hits(n, b);
+    }
+    if str_starts_with(name, "email:") && str_starts_with(base, "email:") {
+        return x509_nc_email_in(str_slice(name, 6, str_len(name)), str_slice(base, 6, str_len(base)));
+    }
+    if str_starts_with(name, "ip:") && str_starts_with(base, "ip:") {
+        return x509_nc_ip_in(str_slice(name, 3, str_len(name)), str_slice(base, 3, str_len(base)));
+    }
+    if str_starts_with(name, "dn:") && str_starts_with(base, "dn:") {
+        return str_starts_with(name, base);
+    }
+    return false;
+}
+
+fn x509_nc_form(s: str) -> str {
+    return str_slice(s, 0, str_find(s, ":") + 1);
+}
+
+/// The names of a certificate that name constraints apply to.
+fn x509_nc_names(c: & X509Cert) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < c.san_dns.len() { out.push("dns:" + c.san_dns.get(i)); i = i + 1; }
+    i = 0;
+    while i < c.san_email.len() { out.push("email:" + c.san_email.get(i)); i = i + 1; }
+    i = 0;
+    while i < c.subject_email.len() { out.push("email:" + c.subject_email.get(i)); i = i + 1; }
+    i = 0;
+    while i < c.san_ip_raw.len() { out.push("ip:" + c.san_ip_raw.get(i)); i = i + 1; }
+    val t: Asn1Tlv = asn1_read_der(& c.subject_raw, 0, c.subject_raw.len());
+    if t.ok && t.len > 0 { out.push("dn:" + hex_encode_bytes(asn1_content(& c.subject_raw, t))); }
+    return out;
+}
+
+/// Check certificate c against the name constraints of a CA above it:
+/// "" when it passes, else the reason.
+pub fn x509_nc_check(ca: & X509Cert, c: & X509Cert) -> str {
+    if !ca.has_nc { return ""; }
+    if ca.nc_unsupported { return "unsupported name constraint"; }
+    val names: Vec<str> = x509_nc_names(c);
+    var i: i64 = 0;
+    while i < names.len() {
+        val n: str = names.get(i);
+        val form: str = x509_nc_form(n);
+        var any_form: bool = false;
+        var hit: bool = false;
+        var j: i64 = 0;
+        while j < ca.nc_permitted.len() {
+            val b: str = ca.nc_permitted.get(j);
+            if str_equal(x509_nc_form(b), form) {
+                any_form = true;
+                if x509_nc_match(n, b, false) { hit = true; }
+            }
+            j = j + 1;
+        }
+        if any_form && !hit { return "name not permitted: " + n; }
+        j = 0;
+        while j < ca.nc_excluded.len() {
+            if x509_nc_match(n, ca.nc_excluded.get(j), true) { return "name excluded: " + n; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Apply the name constraints of every CA of a validated chain (and of
+/// its trust anchor) to the certificates below it; `at` is the position
+/// the chain check ended at.
+fn x509_nc_chain(chain: & Vec<X509Cert>, anchor: & X509Cert, at: i64) -> X509ChainResult {
+    var k: i64 = 1;
+    while k <= chain.len() {
+        var ca: X509Cert = *anchor;
+        if k < chain.len() { ca = chain.get(k); }
+        if k < chain.len() || at == chain.len() {
+            var j: i64 = 0;
+            while j < k {
+                val c: X509Cert = chain.get(j);
+                // Self-issued intermediates are not checked (§6.1.3 b).
+                if j == 0 || !x509_self_issued(c) {
+                    val why: str = x509_nc_check(& ca, & c);
+                    if str_len(why) > 0 { return x509_fail(why, j); }
+                }
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return X509ChainResult { ok: true, err: "", at: at };
+}
+
+// ─── CRLs (RFC 5280 §5) ────────────────────────────────────────────────
+
+/// One revoked certificate: its serial (big-endian magnitude), the
+/// revocation date, and the reason code (-1 when absent).
+pub struct X509Revoked {
+    pub serial: Vec<i64>,
+    pub date: i64,
+    pub reason: i64,
+}
+
+/// A parsed CRL. `next_update` is -1 when absent; `unknown_critical` is
+/// true when the CRL or an entry carries a critical extension this module
+/// does not process (delta CRL indicator, issuing distribution point,
+/// certificate issuer, ...): such a CRL is refused by x509_crl_check.
+pub struct X509Crl {
+    pub ok: bool,
+    pub err: str,
+    pub raw: Vec<i64>,
+    pub tbs: Vec<i64>,
+    pub version: i64,
+    pub sig_alg: str,
+    pub sig_params: Vec<i64>,
+    pub sig: Vec<i64>,
+    pub issuer_raw: Vec<i64>,
+    pub issuer: str,
+    pub this_update: i64,
+    pub next_update: i64,
+    pub revoked: Vec<X509Revoked>,
+    pub crl_number: Vec<i64>,
+    pub aki: Vec<i64>,
+    pub unknown_critical: bool,
+}
+
+fn x509_crl_empty(err: str) -> X509Crl {
+    return X509Crl {
+        ok: false, err: err, raw: Vec::new(), tbs: Vec::new(), version: 0, sig_alg: "",
+        sig_params: Vec::new(), sig: Vec::new(), issuer_raw: Vec::new(), issuer: "",
+        this_update: 0, next_update: -1, revoked: Vec::new(), crl_number: Vec::new(),
+        aki: Vec::new(), unknown_critical: false
+    };
+}
+
+/// The OID, criticality and inner value of one Extension; the value's ok
+/// is false when the extension is malformed.
+fn x509_ext_split(buf: & Vec<i64>, ext: Asn1Tlv, oid: & mut str, critical: & mut bool) -> Asn1Tlv {
+    val bad: Asn1Tlv = asn1_read(buf, 0, 0);
+    val parts: Vec<Asn1Tlv> = asn1_children(buf, ext);
+    if parts.len() < 2 || !asn1_is(parts.get(0), ASN1_OID) { return bad; }
+    *oid = asn1_get_oid(buf, parts.get(0));
+    *critical = false;
+    var vi: i64 = 1;
+    if asn1_is(parts.get(1), ASN1_BOOLEAN) {
+        *critical = asn1_get_bool(buf, parts.get(1));
+        vi = 2;
+    }
+    if vi >= parts.len() || !asn1_is(parts.get(vi), ASN1_OCTET_STRING) { return bad; }
+    val ov: Asn1Tlv = parts.get(vi);
+    val v: Asn1Tlv = asn1_read(buf, ov.off, ov.off + ov.len);
+    if !v.ok || v.end != ov.off + ov.len { return bad; }
+    return v;
+}
+
+fn x509_is_time(t: Asn1Tlv) -> bool {
+    return asn1_is(t, ASN1_UTC_TIME) || asn1_is(t, ASN1_GENERALIZED_TIME);
+}
+
+/// Parse a DER CRL (CertificateList). On failure ok is false and err says why.
+pub fn x509_crl_parse(der: Vec<i64>) -> X509Crl {
+    val top: Asn1Tlv = asn1_read_der(& der, 0, der.len());
+    if !asn1_is(top, ASN1_SEQUENCE) || top.end != der.len() { return x509_crl_empty("not a DER SEQUENCE"); }
+    val outer: Vec<Asn1Tlv> = asn1_children(& der, top);
+    if outer.len() != 3 || !asn1_is(outer.get(0), ASN1_SEQUENCE) || !asn1_is(outer.get(2), ASN1_BIT_STRING) {
+        return x509_crl_empty("not a CertificateList");
+    }
+    var c: X509Crl = x509_crl_empty("");
+    c.raw = der;
+    c.tbs = asn1_raw(& der, outer.get(0));
+    c.sig_alg = str_split(pem_alg_id(& der, outer.get(1)), " ").get(0);
+    c.sig_params = x509_alg_params(& der, outer.get(1));
+    c.sig = asn1_get_bits(& der, outer.get(2));
+    val f: Vec<Asn1Tlv> = asn1_children(& der, outer.get(0));
+    var i: i64 = 0;
+    c.version = 1;
+    if i < f.len() && asn1_is(f.get(i), ASN1_INTEGER) {
+        c.version = asn1_get_int(& der, f.get(i)) + 1;
+        i = i + 1;
+    }
+    if f.len() < i + 3 { return x509_crl_empty("short TBSCertList"); }
+    if !str_equal(str_split(pem_alg_id(& der, f.get(i)), " ").get(0), c.sig_alg)
+        || !rsa_ct_eq(x509_alg_params(& der, f.get(i)), c.sig_params) {
+        return x509_crl_empty("signature algorithms differ");
+    }
+    if !asn1_is(f.get(i + 1), ASN1_SEQUENCE) { return x509_crl_empty("bad issuer"); }
+    c.issuer_raw = asn1_raw(& der, f.get(i + 1));
+    var cn: str = "";
+    c.issuer = x509_name_text(& der, f.get(i + 1), & mut cn);
+    if !x509_is_time(f.get(i + 2)) { return x509_crl_empty("bad thisUpdate"); }
+    c.this_update = x509_time_of(& der, f.get(i + 2));
+    if c.this_update < 0 { return x509_crl_empty("bad thisUpdate"); }
+    var k: i64 = i + 3;
+    if k < f.len() && x509_is_time(f.get(k)) {
+        c.next_update = x509_time_of(& der, f.get(k));
+        if c.next_update < 0 { return x509_crl_empty("bad nextUpdate"); }
+        k = k + 1;
+    }
+    if k < f.len() && asn1_is(f.get(k), ASN1_SEQUENCE) {
+        val entries: Vec<Asn1Tlv> = asn1_children(& der, f.get(k));
+        var e: i64 = 0;
+        while e < entries.len() {
+            val ent: Vec<Asn1Tlv> = asn1_children(& der, entries.get(e));
+            if ent.len() < 2 || !asn1_is(ent.get(0), ASN1_INTEGER) || !x509_is_time(ent.get(1)) {
+                return x509_crl_empty("bad revoked entry");
+            }
+            var r: X509Revoked = X509Revoked { serial: asn1_get_uint_bytes(& der, ent.get(0)), date: x509_time_of(& der, ent.get(1)), reason: -1 };
+            if ent.len() > 2 {
+                if !asn1_is(ent.get(2), ASN1_SEQUENCE) { return x509_crl_empty("bad entry extensions"); }
+                val exts: Vec<Asn1Tlv> = asn1_children(& der, ent.get(2));
+                var x: i64 = 0;
+                while x < exts.len() {
+                    var oid: str = "";
+                    var crit: bool = false;
+                    val v: Asn1Tlv = x509_ext_split(& der, exts.get(x), & mut oid, & mut crit);
+                    if !v.ok { return x509_crl_empty("bad entry extension"); }
+                    if str_equal(oid, "2.5.29.21") {
+                        if !asn1_is(v, ASN1_ENUMERATED) { return x509_crl_empty("bad reason code"); }
+                        r.reason = asn1_get_int(& der, v);
+                    } else if crit {
+                        c.unknown_critical = true;
+                    }
+                    x = x + 1;
+                }
+            }
+            c.revoked.push(r);
+            e = e + 1;
+        }
+        k = k + 1;
+    }
+    if k < f.len() && asn1_is_ctx(f.get(k), 0) {
+        val seq: Asn1Tlv = asn1_read(& der, f.get(k).off, f.get(k).off + f.get(k).len);
+        if !asn1_is(seq, ASN1_SEQUENCE) { return x509_crl_empty("bad CRL extensions"); }
+        val exts2: Vec<Asn1Tlv> = asn1_children(& der, seq);
+        var x2: i64 = 0;
+        while x2 < exts2.len() {
+            var oid2: str = "";
+            var crit2: bool = false;
+            val v2: Asn1Tlv = x509_ext_split(& der, exts2.get(x2), & mut oid2, & mut crit2);
+            if !v2.ok { return x509_crl_empty("bad CRL extension"); }
+            if str_equal(oid2, "2.5.29.20") {
+                if !asn1_is(v2, ASN1_INTEGER) { return x509_crl_empty("bad CRL number"); }
+                c.crl_number = asn1_get_uint_bytes(& der, v2);
+            } else if str_equal(oid2, "2.5.29.35") {
+                val kids: Vec<Asn1Tlv> = asn1_children(& der, v2);
+                if kids.len() > 0 && asn1_is_ctx(kids.get(0), 0) { c.aki = asn1_content(& der, kids.get(0)); }
+            } else if crit2 {
+                c.unknown_critical = true;
+            }
+            x2 = x2 + 1;
+        }
+        k = k + 1;
+    }
+    if k != f.len() { return x509_crl_empty("trailing TBSCertList fields"); }
+    c.ok = true;
+    return c;
+}
+
+/// Parse the first X509 CRL block of PEM text.
+pub fn x509_crl_parse_pem(text: str) -> X509Crl {
+    val b: PemBlock = pem_decode(text, "X509 CRL");
+    if !b.ok { return x509_crl_empty("no X509 CRL block"); }
+    return x509_crl_parse(b.der);
+}
+
+/// Whether the CRL is issued and signed by `issuer` (same name, cRLSign
+/// when the issuer has keyUsage, a good signature).
+pub fn x509_crl_verify_signed_by(crl: X509Crl, issuer: X509Cert) -> bool {
+    if !crl.ok || !issuer.ok { return false; }
+    if !rsa_ct_eq(crl.issuer_raw, issuer.subject_raw) { return false; }
+    if issuer.key_usage >= 0 && (issuer.key_usage & X509_KU_CRL_SIGN) == 0 { return false; }
+    return x509_verify_sig(crl.sig_alg, crl.sig_params, crl.tbs, crl.sig, issuer.spki);
+}
+
+/// The index of a serial number in the CRL's revoked list, -1 if absent.
+pub fn x509_crl_find(crl: & X509Crl, serial: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < crl.revoked.len() {
+        val r: X509Revoked = crl.revoked.get(i);
+        if rsa_ct_eq(r.serial, serial) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Check one certificate against a CRL of its issuer at time `now`: ""
+/// when the CRL is good and does not list it, else the reason
+/// ("certificate revoked", or why the CRL cannot be used).
+pub fn x509_crl_check(c: X509Cert, issuer: X509Cert, crl: X509Crl, now: i64) -> str {
+    if !crl.ok { return "unparsable CRL: " + crl.err; }
+    if !rsa_ct_eq(crl.issuer_raw, c.issuer_raw) { return "CRL of another issuer"; }
+    if crl.unknown_critical { return "unsupported critical CRL extension"; }
+    if !x509_crl_verify_signed_by(crl, issuer) { return "bad CRL signature"; }
+    if now < crl.this_update { return "CRL not yet valid"; }
+    if crl.next_update >= 0 && now > crl.next_update { return "CRL expired"; }
+    if x509_crl_find(& crl, c.serial) >= 0 { return "certificate revoked"; }
+    return "";
+}
+
+/// Validate a chain (x509_verify_chain), then check each certificate
+/// below the trust anchor against the CRL of its issuer found in `crls`
+/// (matched by issuer name). With `require` true a certificate whose
+/// issuer has no CRL in the list fails; otherwise it is not checked.
+pub fn x509_verify_chain_crl(chain: Vec<X509Cert>, anchors: Vec<X509Cert>, now: i64, crls: Vec<X509Crl>, require: bool) -> X509ChainResult {
+    val r: X509ChainResult = x509_verify_chain(chain, anchors, now);
+    if !r.ok { return r; }
+    var i: i64 = 0;
+    while i < r.at && i < chain.len() {
+        val c: X509Cert = chain.get(i);
+        var issuer: X509Cert = x509_empty("no issuer");
+        if i + 1 < chain.len() {
+            issuer = chain.get(i + 1);
+        } else {
+            var a: i64 = 0;
+            while a < anchors.len() {
+                val an: X509Cert = anchors.get(a);
+                if x509_names_chain(c, an) && !issuer.ok { issuer = an; }
+                a = a + 1;
+            }
+        }
+        var found: bool = false;
+        var k: i64 = 0;
+        while k < crls.len() && !found {
+            val crl: X509Crl = crls.get(k);
+            if crl.ok && rsa_ct_eq(crl.issuer_raw, c.issuer_raw) {
+                found = true;
+                val why: str = x509_crl_check(c, issuer, crl, now);
+                if str_len(why) > 0 { return x509_fail(why, i); }
+            }
+            k = k + 1;
+        }
+        if !found && require { return x509_fail("no CRL for the issuer", i); }
+        i = i + 1;
+    }
+    return r;
+}
+
+fn x509_label_match(pattern: str, host: str) -> bool {
+    val p: str = str_to_lower(pattern);
+    val h: str = str_to_lower(host);
+    if str_equal(p, h) { return true; }
+    // "*.example.test" matches exactly one leftmost label.
+    if str_starts_with(p, "*.") {
+        val dot: i64 = str_find(h, ".");
+        if dot <= 0 { return false; }
+        return str_equal(str_slice(p, 1, str_len(p)), str_slice(h, dot, str_len(h)));
+    }
+    return false;
+}
+
+/// Whether the certificate names `host` (RFC 6125): a DNS SAN (one
+/// leftmost wildcard label allowed) or an IP SAN for an address; the
+/// subject CN is used only when there is no SAN at all.
+pub fn x509_matches_host(c: X509Cert, host: str) -> bool {
+    var i: i64 = 0;
+    while i < c.san_ip.len() {
+        if str_equal(c.san_ip.get(i), host) { return true; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < c.san_dns.len() {
+        if x509_label_match(c.san_dns.get(i), host) { return true; }
+        i = i + 1;
+    }
+    if c.san_dns.len() == 0 && c.san_ip.len() == 0 {
+        return str_len(c.common_name) > 0 && x509_label_match(c.common_name, host);
+    }
+    return false;
+}
+
+/// The serial number as lowercase hex.
+pub fn x509_serial_hex(c: X509Cert) -> str {
+    return hex_encode_bytes(c.serial);
+}

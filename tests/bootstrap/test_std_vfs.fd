@@ -1,0 +1,186 @@
+// stdlib/vfs: mounts, path walks with .. and symlinks, the open file table, dentry cache, memdisk.
+// Expected output:
+// mount / 0, mount /mnt 1
+// write 11, lseek 6, read world
+// append: hello world!!
+// stat size 13 kind 1 nlink 1
+// open missing: ENOENT
+// open excl: EEXIST
+// open dir for write: EISDIR
+// read on O_WRONLY: EBADF
+// fds 0 1 0 after close
+// ls /: mnt etc hello.txt
+// /mnt/../hello.txt size 13
+// cross mount root: /mnt is dev 1, /mnt/.. is dev 0
+// symlink rel: abc
+// symlink abs: abc
+// lstat kind 3 size 11, readlink /mnt/data/f
+// dir symlink then ..: hello.txt found
+// loop: ELOOP
+// chdir: /mnt/data
+// relative read: abc
+// rename across mounts: EXDEV
+// rmdir mountpoint: EBUSY
+// umount busy: EBUSY
+// umount: 0, /mnt/data now ENOENT
+// dcache hits > 0: true
+// readdir fd: a b
+// readonly fs: EROFS
+// lseek past end, write: size 8, hole 0 0 0
+// truncate 3: hel
+// memdisk: block 2 = 7 8, used 1, zero -> used 0
+// blk bytes across blocks: 1 2 3 4 5
+use vfs;
+use ramfs;
+use vec;
+use string;
+
+fn bytes_of(s: str) -> Vec<i64> {
+    return str_bytes(s);
+}
+
+fn txt(b: Vec<i64>) -> str {
+    return str_from_bytes(b);
+}
+
+fn ro_root(fs: i64) -> i64 {
+    return ramfs_root(fs);
+}
+
+fn main() {
+    var v: Vfs = vfs_new();
+    val rootfs: i64 = ramfs_new();
+    val m0: i64 = vfs_mount(&mut v, "/", ramfs_ops(), rootfs);
+    vfs_mkdir(&mut v, "/mnt", 493);
+    vfs_mkdir(&mut v, "/etc", 493);
+    val fs2: i64 = ramfs_new();
+    val m1: i64 = vfs_mount(&mut v, "/mnt", ramfs_ops(), fs2);
+    println("mount / " + int_to_str(m0) + ", mount /mnt " + int_to_str(m1));
+
+    // files and offsets
+    val fd: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_RDWR | VFS_O_CREAT);
+    val n: i64 = vfs_write(&mut v, fd, bytes_of("hello world"));
+    val p: i64 = vfs_lseek(&mut v, fd, 6, VFS_SEEK_SET);
+    val got: Vec<i64> = vfs_read(&mut v, fd, 100);
+    println("write " + int_to_str(n) + ", lseek " + int_to_str(p) + ", read " + txt(got));
+    vfs_close(&mut v, fd);
+    val fa: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_WRONLY | VFS_O_APPEND);
+    vfs_write(&mut v, fa, bytes_of("!!"));
+    vfs_close(&mut v, fa);
+    println("append: " + txt(vfs_read_file(&mut v, "/hello.txt")));
+    val st: VStat = vfs_stat(&mut v, "/hello.txt");
+    println("stat size " + int_to_str(st.size) + " kind " + int_to_str(st.kind) + " nlink " + int_to_str(st.nlink));
+
+    // errors
+    println("open missing: " + vfs_errno_name(vfs_open(&mut v, "/nope", VFS_O_RDONLY)));
+    println("open excl: " + vfs_errno_name(vfs_open(&mut v, "/hello.txt", VFS_O_CREAT | VFS_O_EXCL | VFS_O_WRONLY)));
+    println("open dir for write: " + vfs_errno_name(vfs_open(&mut v, "/etc", VFS_O_WRONLY)));
+    val wo: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_WRONLY);
+    vfs_read(&mut v, wo, 4);
+    println("read on O_WRONLY: " + vfs_errno_name(v.err));
+
+    // lowest free descriptor
+    val a: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_RDONLY);
+    vfs_close(&mut v, wo);
+    vfs_close(&mut v, a);
+    val b: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_RDONLY);
+    val c: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_RDONLY);
+    vfs_close(&mut v, b);
+    vfs_close(&mut v, c);
+    val d: i64 = vfs_open(&mut v, "/hello.txt", VFS_O_RDONLY);
+    vfs_close(&mut v, d);
+    println("fds " + int_to_str(b) + " " + int_to_str(c) + " " + int_to_str(d) + " after close");
+
+    // directories and mounts
+    println("ls /: " + str_join(vfs_list(&mut v, "/"), " "));
+    println("/mnt/../hello.txt size " + int_to_str(vfs_stat(&mut v, "/mnt/../hello.txt").size));
+    println("cross mount root: /mnt is dev " + int_to_str(vfs_stat(&mut v, "/mnt").dev) + ", /mnt/.. is dev " + int_to_str(vfs_stat(&mut v, "/mnt/..").dev));
+
+    // symlinks
+    vfs_mkdir(&mut v, "/mnt/data", 493);
+    vfs_write_file(&mut v, "/mnt/data/f", bytes_of("abc"));
+    vfs_symlink(&mut v, "data/f", "/mnt/rel");
+    vfs_symlink(&mut v, "/mnt/data/f", "/etc/abs");
+    println("symlink rel: " + txt(vfs_read_file(&mut v, "/mnt/rel")));
+    println("symlink abs: " + txt(vfs_read_file(&mut v, "/etc/abs")));
+    val ls: VStat = vfs_lstat(&mut v, "/etc/abs");
+    println("lstat kind " + int_to_str(ls.kind) + " size " + int_to_str(ls.size) + ", readlink " + vfs_readlink(&mut v, "/etc/abs"));
+    // /etc/d -> /mnt/data ; /etc/d/.. is /mnt (the target's parent)
+    vfs_symlink(&mut v, "/mnt/data", "/etc/d");
+    vfs_write_file(&mut v, "/mnt/hello.txt", bytes_of("x"));
+    if vfs_stat(&mut v, "/etc/d/../hello.txt").dev == m1 {
+        println("dir symlink then ..: hello.txt found");
+    }
+    vfs_symlink(&mut v, "/etc/loop2", "/etc/loop1");
+    vfs_symlink(&mut v, "/etc/loop1", "/etc/loop2");
+    println("loop: " + vfs_errno_name(vfs_open(&mut v, "/etc/loop1", VFS_O_RDONLY)));
+
+    // cwd
+    vfs_chdir(&mut v, "/etc/d");
+    println("chdir: " + vfs_getcwd(&v));
+    println("relative read: " + txt(vfs_read_file(&mut v, "f")));
+    vfs_chdir(&mut v, "/");
+
+    println("rename across mounts: " + vfs_errno_name(vfs_rename(&mut v, "/hello.txt", "/mnt/h")));
+    println("rmdir mountpoint: " + vfs_errno_name(vfs_rmdir(&mut v, "/mnt")));
+    val hold: i64 = vfs_open(&mut v, "/mnt/data/f", VFS_O_RDONLY);
+    println("umount busy: " + vfs_errno_name(vfs_umount(&mut v, "/mnt")));
+    vfs_close(&mut v, hold);
+    val um: i64 = vfs_umount(&mut v, "/mnt");
+    println("umount: " + int_to_str(um) + ", /mnt/data now " + vfs_errno_name(vfs_stat(&mut v, "/mnt/data").err));
+    println("dcache hits > 0: " + bool_to_str(v.dc_hits > 0));
+
+    // readdir through a descriptor
+    vfs_mkdir(&mut v, "/dd", 493);
+    vfs_write_file(&mut v, "/dd/a", bytes_of("1"));
+    vfs_write_file(&mut v, "/dd/b", bytes_of("2"));
+    val dfd: i64 = vfs_open(&mut v, "/dd", VFS_O_RDONLY | VFS_O_DIRECTORY);
+    val e1: VDirent = vfs_readdir_fd(&mut v, dfd);
+    val e2: VDirent = vfs_readdir_fd(&mut v, dfd);
+    val e3: VDirent = vfs_readdir_fd(&mut v, dfd);
+    vfs_close(&mut v, dfd);
+    if e3.ino < 0 {
+        println("readdir fd: " + e1.name + " " + e2.name);
+    }
+
+    // a read-only file system built from ramfs's read side
+    val rofs: i64 = ramfs_new();
+    ramfs_create(rofs, rofs, "file", 420);
+    val ro: FsOps = vfs_ops_readonly("ro", ro_root, ramfs_lookup, ramfs_getattr, ramfs_read, ramfs_readdir, ramfs_readlink);
+    vfs_mount(&mut v, "/mnt", ro, rofs);
+    println("readonly fs: " + vfs_errno_name(vfs_write_file(&mut v, "/mnt/file", bytes_of("z"))));
+
+    // holes and truncate
+    val hf: i64 = vfs_open(&mut v, "/hole", VFS_O_RDWR | VFS_O_CREAT);
+    vfs_write(&mut v, hf, bytes_of("ab"));
+    vfs_lseek(&mut v, hf, 3, VFS_SEEK_CUR);
+    vfs_write(&mut v, hf, bytes_of("xyz"));
+    val hs: VStat = vfs_fstat(&mut v, hf);
+    val hb: Vec<i64> = vfs_pread(&mut v, hf, 2, 3);
+    vfs_close(&mut v, hf);
+    println("lseek past end, write: size " + int_to_str(hs.size) + ", hole " + int_to_str(hb.get(0)) + " " + int_to_str(hb.get(1)) + " " + int_to_str(hb.get(2)));
+    vfs_truncate(&mut v, "/hello.txt", 3);
+    println("truncate 3: " + txt(vfs_read_file(&mut v, "/hello.txt")));
+
+    // block device seam: sparse RAM disk
+    val disk: BlockDev = memdisk_new(4, 16);
+    var blk: Vec<i64> = Vec::new();
+    blk.push(7);
+    blk.push(8);
+    blk.push(0);
+    blk.push(0);
+    blk_write(&disk, 2, blk);
+    val rb: Vec<i64> = blk_read(&disk, 2);
+    val used: i64 = memdisk_used_blocks(disk.handle);
+    blk_zero(&disk, 0, 16);
+    println("memdisk: block 2 = " + int_to_str(rb.get(0)) + " " + int_to_str(rb.get(1)) + ", used " + int_to_str(used) + ", zero -> used " + int_to_str(memdisk_used_blocks(disk.handle)));
+    var five: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= 5 {
+        five.push(i);
+        i = i + 1;
+    }
+    blk_write_bytes(&disk, 3, five);
+    val back: Vec<i64> = blk_read_bytes(&disk, 3, 5);
+    println("blk bytes across blocks: " + str_join_ints(back, " "));
+}

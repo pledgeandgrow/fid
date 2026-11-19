@@ -1,0 +1,94 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA12 with DB6: unwinding through
+// a function whose callee-saved registers shrink wrapping saves late
+// (compiler/nat_ir.fd ng_sw_plan) must still give each caller its own
+// values. `mid` calls `probe` before its rare region (nothing deferred is
+// saved yet: the registers still hold the caller's values), inside it
+// (saved on entering it: the caller's values are in the save slots, the
+// registers hold mid's), and after it (given back on leaving it,
+// ng_sw_rest). `rare2` saves on its rare path only, after a loop, and its
+// exit there restores them. The CFI rows for the deferred saves
+// (ng_dbg_sw_states / ng_dbg_sw_to, nat_enc.fd nat_dwarf_build) must say
+// so at each of those points. tests/nattools/sw_unwind_check.sh builds
+// this for the Linux targets, runs it under qemu-user's gdb stub and, at
+// every stop in `probe`, unwinds two frames from .debug_frame: the
+// registers it finds for mid's or rare2's caller must be the ones that
+// caller had when it made the call (read at the callee's entry). `probe`
+// writes a global, so no pass folds, merges or moves its calls; `driver`
+// keeps values in callee-saved registers across the calls.
+// Expected output:
+// 811
+// 20
+// 33298
+// 7
+// 103137
+// 409018
+// 194
+
+var g_probe_calls: i64 = 0;
+
+fn probe(x: i64) -> i64 {
+    g_probe_calls = g_probe_calls + 1;
+    if x > 1000000000 {
+        return probe(x - 1);
+    }
+    return x * 3 + 1;
+}
+
+// before, inside and after a rare region whose values live across calls
+fn mid(n: i64) -> i64 {
+    var r: i64 = probe(n);
+    if n == 77 {
+        var a: i64 = probe(n - 62);
+        var b: i64 = probe(n - 61);
+        var c: i64 = probe(n - 60);
+        var d: i64 = probe(n - 59);
+        r = r + a + b * 2 + c * 3 + d * 5;
+    }
+    return r + probe(1);
+}
+
+// a loop first, then a rare path that keeps values across calls and
+// returns from inside it
+fn rare2(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    if s == 45 {
+        var a: i64 = probe(s);
+        var b: i64 = probe(a);
+        var c: i64 = probe(b);
+        var d: i64 = probe(c);
+        return a + b * 3 + c * 5 + d * 7;
+    }
+    return s + 1;
+}
+
+// values held across every call in the caller's own callee-saved
+// registers: unwinding must find them again
+fn driver(m: i64) -> i64 {
+    var u: i64 = m * 7;
+    var v: i64 = m * 11;
+    var w: i64 = m * 13;
+    var y: i64 = m * 17;
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        t = t + mid(76 + i % 2) + rare2(9 + i % 2);
+        t = t + u - v + w - y;
+        i = i + 1;
+    }
+    return t + u + v + w + y;
+}
+
+fn main() {
+    println(mid(77));
+    println(mid(5));
+    println(rare2(10));
+    println(rare2(4));
+    println(driver(6));
+    println(driver(25));
+    println(g_probe_calls);
+}

@@ -1,0 +1,1098 @@
+// Fides RTPS / DDS wire protocol (robotics middleware)
+//
+// The DDS Interoperability Wire Protocol (OMG RTPS 2.3/2.5), the transport
+// under ROS 2:
+//   - the message header ("RTPS", protocol version, vendor id, 12-byte GUID
+//     prefix) and submessages: DATA (0x15, with inline QoS skipped on
+//     reading), HEARTBEAT (0x07), ACKNACK (0x06), GAP (0x08), INFO_TS
+//     (0x09), INFO_DST (0x0e), INFO_SRC (0x0c) and PAD (0x01); each
+//     submessage carries its own byte order (flag E), and
+//     octetsToNextHeader 0 means "to the end of the message";
+//   - GUIDs (prefix + entity id), the well-known entity ids of the builtin
+//     endpoints, sequence numbers (high int32, low uint32) and sequence
+//     number sets (bitmapBase, numBits, bitmap words with bit 31 of the
+//     first word = bitmapBase);
+//   - SPDP participant announcements: the PL_CDR_LE parameter list
+//     (protocol version, vendor id, participant GUID, locators, lease
+//     duration, builtin endpoint set, domain id, entity name, sentinel);
+//   - the well-known UDP ports (PB 7400, DG 250, PG 2, d0..d3 = 0, 10, 1,
+//     11);
+//   - the receiver rules for INFO_DST/INFO_TS/INFO_SRC (they set the
+//     destination, timestamp and source of the submessages after them);
+//   - reliable delivery: a stateful writer (history cache, one proxy per
+//     matched reader, HEARTBEAT, answering ACKNACK by resending DATA or by
+//     GAP for changes no longer in its history) and a stateful reader
+//     (out-of-order buffer, in-order delivery, ACKNACK of missing changes
+//     after a HEARTBEAT, GAP handling).
+// The seam is UDP: writers and readers put whole RTPS messages (Vec<i64>,
+// bytes 0..255) in their `outbox`, and the caller sends them with
+// stdlib/net and passes received datagrams to *_receive. The tests run the
+// exchange in memory, dropping packets on purpose.
+//
+// Usage:
+//   use dds;
+//   var w: RtpsWriter = rtps_writer_new(prefix_a, rtps_entity(1, RTPS_KIND_WRITER_NO_KEY));
+//   var r: RtpsReader = rtps_reader_new(prefix_b, rtps_entity(1, RTPS_KIND_READER_NO_KEY));
+//   rtps_writer_add_reader(&mut w, prefix_b, r.reader_id);
+//   rtps_reader_add_writer(&mut r, prefix_a, w.writer_id);
+//   rtps_writer_write(&mut w, payload);
+//   rtps_writer_flush(&mut w);       // DATA + HEARTBEAT into w.outbox
+
+module dds;
+
+// ─── Constants ───
+
+pub const RTPS_PAD: i64 = 1;
+pub const RTPS_ACKNACK: i64 = 6;
+pub const RTPS_HEARTBEAT: i64 = 7;
+pub const RTPS_GAP: i64 = 8;
+pub const RTPS_INFO_TS: i64 = 9;
+pub const RTPS_INFO_SRC: i64 = 12;
+pub const RTPS_INFO_DST: i64 = 14;
+pub const RTPS_DATA: i64 = 21;
+
+pub const RTPS_KIND_WRITER_KEY: i64 = 2;
+pub const RTPS_KIND_WRITER_NO_KEY: i64 = 3;
+pub const RTPS_KIND_READER_NO_KEY: i64 = 4;
+pub const RTPS_KIND_READER_KEY: i64 = 7;
+
+/// Entity ids as 32-bit values (the four octets, first one highest).
+pub const RTPS_ENTITYID_UNKNOWN: i64 = 0;
+pub const RTPS_ENTITYID_PARTICIPANT: i64 = 0x000001c1;
+pub const RTPS_ENTITYID_SPDP_WRITER: i64 = 0x000100c2;
+pub const RTPS_ENTITYID_SPDP_READER: i64 = 0x000100c7;
+pub const RTPS_ENTITYID_SEDP_PUB_WRITER: i64 = 0x000003c2;
+pub const RTPS_ENTITYID_SEDP_PUB_READER: i64 = 0x000003c7;
+pub const RTPS_ENTITYID_SEDP_SUB_WRITER: i64 = 0x000004c2;
+pub const RTPS_ENTITYID_SEDP_SUB_READER: i64 = 0x000004c7;
+
+/// Parameter ids of SPDP data.
+pub const PID_PAD: i64 = 0;
+pub const PID_SENTINEL: i64 = 1;
+pub const PID_PARTICIPANT_LEASE_DURATION: i64 = 2;
+pub const PID_DOMAIN_ID: i64 = 15;
+pub const PID_PROTOCOL_VERSION: i64 = 21;
+pub const PID_VENDORID: i64 = 22;
+pub const PID_DEFAULT_UNICAST_LOCATOR: i64 = 49;
+pub const PID_METATRAFFIC_UNICAST_LOCATOR: i64 = 50;
+pub const PID_METATRAFFIC_MULTICAST_LOCATOR: i64 = 51;
+pub const PID_DEFAULT_MULTICAST_LOCATOR: i64 = 72;
+pub const PID_PARTICIPANT_GUID: i64 = 80;
+pub const PID_BUILTIN_ENDPOINT_SET: i64 = 88;
+pub const PID_ENTITY_NAME: i64 = 98;
+
+pub const RTPS_LOCATOR_UDPV4: i64 = 1;
+
+/// A user entity id from a 24-bit key and a kind.
+pub fn rtps_entity(key: i64, kind: i64) -> i64 {
+    return ((key & 16777215) << 8) | (kind & 255);
+}
+
+// ─── Byte helpers ───
+
+@wrapping
+fn rtps_put_le(b: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        b.push((v >> (8 * i)) & 255);
+        i = i + 1;
+    }
+}
+
+fn rtps_put_entity(b: & mut Vec<i64>, e: i64) {
+    b.push((e >> 24) & 255);
+    b.push((e >> 16) & 255);
+    b.push((e >> 8) & 255);
+    b.push(e & 255);
+}
+
+fn rtps_put_sn(b: & mut Vec<i64>, sn: i64) {
+    rtps_put_le(b, sn >> 32, 4);
+    rtps_put_le(b, sn & 4294967295, 4);
+}
+
+fn rtps_get(b: & Vec<i64>, off: i64, n: i64, little: bool) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = 0;
+        if off + i < b.len() {
+            x = b.get(off + i);
+        }
+        if little {
+            v = v | (x << (8 * i));
+        } else {
+            v = v | (x << (8 * (n - 1 - i)));
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn rtps_get_entity(b: & Vec<i64>, off: i64) -> i64 {
+    return rtps_get(b, off, 4, false);
+}
+
+fn rtps_get_sn(b: & Vec<i64>, off: i64, little: bool) -> i64 {
+    var hi: i64 = rtps_get(b, off, 4, little);
+    if hi >= 2147483648 {
+        hi = hi - 4294967296;
+    }
+    return (hi << 32) | rtps_get(b, off + 4, 4, little);
+}
+
+fn rtps_sub(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to && i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn rtps_append(a: & mut Vec<i64>, b: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        a.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn rtps_same(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Hex dump of bytes ("52 54 50 53 ...").
+pub fn rtps_hex(b: & Vec<i64>) -> str {
+    val d: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        val v: i64 = b.get(i);
+        s = s + str_slice(d, (v >> 4) & 15, ((v >> 4) & 15) + 1) + str_slice(d, v & 15, (v & 15) + 1);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// A GUID prefix from a host id, app id and instance id (the layout most
+/// vendors use: 4 bytes each, big-endian).
+pub fn rtps_prefix(host: i64, app: i64, instance: i64) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    rtps_put_entity(&mut p, host);
+    rtps_put_entity(&mut p, app);
+    rtps_put_entity(&mut p, instance);
+    return p;
+}
+
+// ─── Ports ───
+
+/// SPDP multicast port of a domain.
+pub fn rtps_port_spdp_multicast(domain: i64) -> i64 {
+    return 7400 + 250 * domain;
+}
+
+/// SPDP unicast port of participant `pid` in a domain.
+pub fn rtps_port_spdp_unicast(domain: i64, pid: i64) -> i64 {
+    return 7400 + 250 * domain + 10 + 2 * pid;
+}
+
+/// User traffic multicast port.
+pub fn rtps_port_user_multicast(domain: i64) -> i64 {
+    return 7400 + 250 * domain + 1;
+}
+
+/// User traffic unicast port.
+pub fn rtps_port_user_unicast(domain: i64, pid: i64) -> i64 {
+    return 7400 + 250 * domain + 11 + 2 * pid;
+}
+
+// ─── Building messages ───
+
+/// The 20-byte header: "RTPS", version 2.3, vendor id, GUID prefix.
+pub fn rtps_header(prefix: & Vec<i64>, vendor: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(82);
+    b.push(84);
+    b.push(80);
+    b.push(83);
+    b.push(2);
+    b.push(3);
+    b.push((vendor >> 8) & 255);
+    b.push(vendor & 255);
+    rtps_append(&mut b, prefix);
+    return b;
+}
+
+// A submessage: id, flags (E set: little-endian), length, body.
+fn rtps_wrap(id: i64, flags: i64, body: & Vec<i64>) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(id);
+    b.push(flags | 1);
+    rtps_put_le(&mut b, body.len(), 2);
+    rtps_append(&mut b, body);
+    return b;
+}
+
+/// A SequenceNumberSet holding the sequence numbers in `set` (each in
+/// base .. base + 255; others are ignored); numBits reaches the last one.
+pub fn rtps_snset(base: i64, set: & Vec<i64>) -> Vec<i64> {
+    var nbits: i64 = 0;
+    var i: i64 = 0;
+    while i < set.len() {
+        val d: i64 = set.get(i) - base;
+        if d >= 0 && d < 256 && d + 1 > nbits {
+            nbits = d + 1;
+        }
+        i = i + 1;
+    }
+    val words: i64 = (nbits + 31) / 32;
+    var bm: Vec<i64> = Vec::new();
+    i = 0;
+    while i < words {
+        bm.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < set.len() {
+        val d: i64 = set.get(i) - base;
+        if d >= 0 && d < 256 {
+            val w: i64 = d / 32;
+            bm.set(w, bm.get(w) | (1 << (31 - d % 32)));
+        }
+        i = i + 1;
+    }
+    var b: Vec<i64> = Vec::new();
+    rtps_put_sn(&mut b, base);
+    rtps_put_le(&mut b, nbits, 4);
+    i = 0;
+    while i < words {
+        rtps_put_le(&mut b, bm.get(i), 4);
+        i = i + 1;
+    }
+    return b;
+}
+
+/// DATA: a serialized payload (with its encapsulation header) from writer
+/// to reader. The payload is padded with zeros to a multiple of 4.
+pub fn rtps_sub_data(reader: i64, writer: i64, sn: i64, payload: & Vec<i64>) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    rtps_put_le(&mut body, 0, 2);
+    rtps_put_le(&mut body, 16, 2);
+    rtps_put_entity(&mut body, reader);
+    rtps_put_entity(&mut body, writer);
+    rtps_put_sn(&mut body, sn);
+    rtps_append(&mut body, payload);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    // flags: D (data present)
+    return rtps_wrap(RTPS_DATA, 4, &body);
+}
+
+/// HEARTBEAT: the writer has first..last (F: no answer needed when all is
+/// received; L: liveliness).
+pub fn rtps_sub_heartbeat(reader: i64, writer: i64, first: i64, last: i64, count: i64, final_flag: bool, liveliness: bool) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    rtps_put_entity(&mut body, reader);
+    rtps_put_entity(&mut body, writer);
+    rtps_put_sn(&mut body, first);
+    rtps_put_sn(&mut body, last);
+    rtps_put_le(&mut body, count, 4);
+    var f: i64 = 0;
+    if final_flag {
+        f = f | 2;
+    }
+    if liveliness {
+        f = f | 4;
+    }
+    return rtps_wrap(RTPS_HEARTBEAT, f, &body);
+}
+
+/// ACKNACK: everything before `base` received; `missing` requested again.
+pub fn rtps_sub_acknack(reader: i64, writer: i64, base: i64, missing: & Vec<i64>, count: i64, final_flag: bool) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    rtps_put_entity(&mut body, reader);
+    rtps_put_entity(&mut body, writer);
+    rtps_append(&mut body, &rtps_snset(base, missing));
+    rtps_put_le(&mut body, count, 4);
+    var f: i64 = 0;
+    if final_flag {
+        f = 2;
+    }
+    return rtps_wrap(RTPS_ACKNACK, f, &body);
+}
+
+/// GAP: gap_start .. list_base - 1 and the members of `list` are
+/// irrelevant to the reader.
+pub fn rtps_sub_gap(reader: i64, writer: i64, gap_start: i64, list_base: i64, list: & Vec<i64>) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    rtps_put_entity(&mut body, reader);
+    rtps_put_entity(&mut body, writer);
+    rtps_put_sn(&mut body, gap_start);
+    rtps_append(&mut body, &rtps_snset(list_base, list));
+    return rtps_wrap(RTPS_GAP, 0, &body);
+}
+
+/// INFO_TS with a timestamp (seconds, 1/2^32 fractions).
+pub fn rtps_sub_info_ts(sec: i64, frac: i64) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    rtps_put_le(&mut body, sec, 4);
+    rtps_put_le(&mut body, frac, 4);
+    return rtps_wrap(RTPS_INFO_TS, 0, &body);
+}
+
+/// INFO_DST: the following submessages are for this participant.
+pub fn rtps_sub_info_dst(prefix: & Vec<i64>) -> Vec<i64> {
+    return rtps_wrap(RTPS_INFO_DST, 0, prefix);
+}
+
+// ─── Parsing ───
+
+/// One parsed submessage with the receiver context in force for it.
+pub struct RtpsSub {
+    pub id: i64,
+    pub flags: i64,
+    pub reader: i64,
+    pub writer: i64,
+    // DATA: its sequence number; GAP: gapStart
+    pub sn: i64,
+    pub first: i64,
+    pub last: i64,
+    pub count: i64,
+    // ACKNACK readerSNState / GAP gapList
+    pub set_base: i64,
+    pub set: Vec<i64>,
+    pub payload: Vec<i64>,
+    pub src_prefix: Vec<i64>,
+    pub dst_prefix: Vec<i64>,
+    pub has_ts: bool,
+    pub ts_sec: i64,
+    pub ts_frac: i64,
+}
+
+pub struct RtpsMsg {
+    pub ok: bool,
+    pub error: str,
+    pub major: i64,
+    pub minor: i64,
+    pub vendor: i64,
+    pub prefix: Vec<i64>,
+    pub subs: Vec<RtpsSub>,
+}
+
+fn rtps_bad(msg: str) -> RtpsMsg {
+    return RtpsMsg { ok: false, error: msg, major: 0, minor: 0, vendor: 0, prefix: Vec::new(), subs: Vec::new() };
+}
+
+// A SequenceNumberSet at off; the set's members; returns the bytes used
+// (-1 when malformed).
+fn rtps_read_snset(b: & Vec<i64>, off: i64, end: i64, little: bool, s: & mut RtpsSub) -> i64 {
+    if off + 12 > end {
+        return - 1;
+    }
+    s.set_base = rtps_get_sn(b, off, little);
+    val nbits: i64 = rtps_get(b, off + 8, 4, little);
+    if nbits > 256 {
+        return - 1;
+    }
+    val words: i64 = (nbits + 31) / 32;
+    if off + 12 + 4 * words > end {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < nbits {
+        val w: i64 = rtps_get(b, off + 12 + 4 * (i / 32), 4, little);
+        if ((w >> (31 - i % 32)) & 1) == 1 {
+            s.set.push(s.set_base + i);
+        }
+        i = i + 1;
+    }
+    return 12 + 4 * words;
+}
+
+/// Parse an RTPS message.
+pub fn rtps_parse(b: & Vec<i64>) -> RtpsMsg {
+    if b.len() < 20 || b.get(0) != 82 || b.get(1) != 84 || b.get(2) != 80 || b.get(3) != 83 {
+        return rtps_bad("not an RTPS message");
+    }
+    var m: RtpsMsg = RtpsMsg { ok: true, error: "", major: b.get(4), minor: b.get(5), vendor: (b.get(6) << 8) | b.get(7), prefix: rtps_sub(b, 8, 20), subs: Vec::new() };
+    if m.major != 2 {
+        return rtps_bad("unsupported protocol version " + int_to_str(m.major));
+    }
+    var src: Vec<i64> = m.prefix;
+    var dst: Vec<i64> = Vec::new();
+    var has_ts: bool = false;
+    var ts_sec: i64 = 0;
+    var ts_frac: i64 = 0;
+    var pos: i64 = 20;
+    while pos + 4 <= b.len() {
+        val id: i64 = b.get(pos);
+        val flags: i64 = b.get(pos + 1);
+        val little: bool = (flags & 1) == 1;
+        var len: i64 = rtps_get(b, pos + 2, 2, little);
+        val start: i64 = pos + 4;
+        if len == 0 && id != RTPS_PAD && id != RTPS_INFO_TS {
+            len = b.len() - start;
+        }
+        val end: i64 = start + len;
+        if end > b.len() {
+            return rtps_bad("submessage runs past the end");
+        }
+        var s: RtpsSub = RtpsSub { id: id, flags: flags, reader: 0, writer: 0, sn: 0, first: 0, last: 0, count: 0, set_base: 0, set: Vec::new(), payload: Vec::new(), src_prefix: src, dst_prefix: dst, has_ts: has_ts, ts_sec: ts_sec, ts_frac: ts_frac };
+        var keep: bool = true;
+        if id == RTPS_INFO_TS {
+            keep = false;
+            if (flags & 2) != 0 {
+                has_ts = false;
+            } else {
+                if len < 8 {
+                    return rtps_bad("short INFO_TS");
+                }
+                has_ts = true;
+                ts_sec = rtps_get(b, start, 4, little);
+                ts_frac = rtps_get(b, start + 4, 4, little);
+            }
+        } else if id == RTPS_INFO_DST {
+            keep = false;
+            if len < 12 {
+                return rtps_bad("short INFO_DST");
+            }
+            dst = rtps_sub(b, start, start + 12);
+            var zero: bool = true;
+            var k: i64 = 0;
+            while k < 12 {
+                if dst.get(k) != 0 {
+                    zero = false;
+                }
+                k = k + 1;
+            }
+            if zero {
+                dst = Vec::new();
+            }
+        } else if id == RTPS_INFO_SRC {
+            keep = false;
+            if len < 20 {
+                return rtps_bad("short INFO_SRC");
+            }
+            src = rtps_sub(b, start + 8, start + 20);
+        } else if id == RTPS_PAD {
+            keep = false;
+        } else if id == RTPS_DATA {
+            if len < 20 {
+                return rtps_bad("short DATA");
+            }
+            val to_qos: i64 = rtps_get(b, start + 2, 2, little);
+            s.reader = rtps_get_entity(b, start + 4);
+            s.writer = rtps_get_entity(b, start + 8);
+            s.sn = rtps_get_sn(b, start + 12, little);
+            var p: i64 = start + 4 + to_qos;
+            if (flags & 2) != 0 {
+                // inline QoS: a parameter list up to its sentinel
+                var going: bool = true;
+                while going {
+                    if p + 4 > end {
+                        return rtps_bad("inline QoS runs past the end");
+                    }
+                    val pid: i64 = rtps_get(b, p, 2, little);
+                    val plen: i64 = rtps_get(b, p + 2, 2, little);
+                    p = p + 4 + plen;
+                    if pid == PID_SENTINEL {
+                        going = false;
+                    }
+                }
+            }
+            if (flags & 12) != 0 {
+                s.payload = rtps_sub(b, p, end);
+            }
+        } else if id == RTPS_HEARTBEAT {
+            if len < 28 {
+                return rtps_bad("short HEARTBEAT");
+            }
+            s.reader = rtps_get_entity(b, start);
+            s.writer = rtps_get_entity(b, start + 4);
+            s.first = rtps_get_sn(b, start + 8, little);
+            s.last = rtps_get_sn(b, start + 16, little);
+            s.count = rtps_get(b, start + 24, 4, little);
+        } else if id == RTPS_ACKNACK {
+            s.reader = rtps_get_entity(b, start);
+            s.writer = rtps_get_entity(b, start + 4);
+            val used: i64 = rtps_read_snset(b, start + 8, end, little, &mut s);
+            if used < 0 || start + 8 + used + 4 > end {
+                return rtps_bad("bad ACKNACK");
+            }
+            s.count = rtps_get(b, start + 8 + used, 4, little);
+        } else if id == RTPS_GAP {
+            s.reader = rtps_get_entity(b, start);
+            s.writer = rtps_get_entity(b, start + 4);
+            if start + 16 > end {
+                return rtps_bad("bad GAP");
+            }
+            s.sn = rtps_get_sn(b, start + 8, little);
+            if rtps_read_snset(b, start + 16, end, little, &mut s) < 0 {
+                return rtps_bad("bad GAP");
+            }
+        }
+        if keep {
+            m.subs.push(s);
+        }
+        pos = end;
+    }
+    return m;
+}
+
+pub fn rtps_sub_name(id: i64) -> str {
+    if id == RTPS_DATA { return "DATA"; }
+    if id == RTPS_HEARTBEAT { return "HEARTBEAT"; }
+    if id == RTPS_ACKNACK { return "ACKNACK"; }
+    if id == RTPS_GAP { return "GAP"; }
+    if id == RTPS_INFO_TS { return "INFO_TS"; }
+    if id == RTPS_INFO_DST { return "INFO_DST"; }
+    if id == RTPS_INFO_SRC { return "INFO_SRC"; }
+    if id == RTPS_PAD { return "PAD"; }
+    return "UNKNOWN";
+}
+
+// ─── SPDP participant data ───
+
+pub struct RtpsLocator {
+    pub kind: i64,
+    pub port: i64,
+    // 16 address bytes (IPv4: the last 4)
+    pub addr: Vec<i64>,
+}
+
+/// A UDPv4 locator for a.b.c.d:port.
+pub fn rtps_locator_v4(a: i64, b: i64, c: i64, d: i64, port: i64) -> RtpsLocator {
+    var ad: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 12 {
+        ad.push(0);
+        i = i + 1;
+    }
+    ad.push(a);
+    ad.push(b);
+    ad.push(c);
+    ad.push(d);
+    return RtpsLocator { kind: RTPS_LOCATOR_UDPV4, port: port, addr: ad };
+}
+
+pub fn rtps_locator_str(l: & RtpsLocator) -> str {
+    return int_to_str(l.addr.get(12)) + "." + int_to_str(l.addr.get(13)) + "." + int_to_str(l.addr.get(14)) + "." + int_to_str(l.addr.get(15)) + ":" + int_to_str(l.port);
+}
+
+pub struct SpdpData {
+    pub prefix: Vec<i64>,
+    pub vendor: i64,
+    pub major: i64,
+    pub minor: i64,
+    pub domain: i64,
+    pub lease_sec: i64,
+    pub builtin_endpoints: i64,
+    pub name: str,
+    pub meta_unicast: Vec<RtpsLocator>,
+    pub meta_multicast: Vec<RtpsLocator>,
+    pub default_unicast: Vec<RtpsLocator>,
+    pub ok: bool,
+}
+
+pub fn spdp_new(prefix: Vec<i64>, vendor: i64, domain: i64, name: str) -> SpdpData {
+    // participant announcer/detector, publications and subscriptions
+    // announcer/detector (bits 0..5)
+    return SpdpData { prefix: prefix, vendor: vendor, major: 2, minor: 3, domain: domain, lease_sec: 20, builtin_endpoints: 63, name: name, meta_unicast: Vec::new(), meta_multicast: Vec::new(), default_unicast: Vec::new(), ok: true };
+}
+
+fn spdp_param(b: & mut Vec<i64>, pid: i64, value: & Vec<i64>) {
+    rtps_put_le(b, pid, 2);
+    var v: Vec<i64> = Vec::new();
+    rtps_append(&mut v, value);
+    while v.len() % 4 != 0 {
+        v.push(0);
+    }
+    rtps_put_le(b, v.len(), 2);
+    rtps_append(b, &v);
+}
+
+fn spdp_locator_bytes(l: & RtpsLocator) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    rtps_put_le(&mut v, l.kind, 4);
+    rtps_put_le(&mut v, l.port, 4);
+    rtps_append(&mut v, &l.addr);
+    return v;
+}
+
+/// The serialized payload (PL_CDR_LE) of a participant announcement.
+pub fn spdp_encode(d: & SpdpData) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    b.push(3);
+    b.push(0);
+    b.push(0);
+    var v: Vec<i64> = Vec::new();
+    v.push(d.major);
+    v.push(d.minor);
+    spdp_param(&mut b, PID_PROTOCOL_VERSION, &v);
+    v = Vec::new();
+    v.push((d.vendor >> 8) & 255);
+    v.push(d.vendor & 255);
+    spdp_param(&mut b, PID_VENDORID, &v);
+    v = Vec::new();
+    rtps_append(&mut v, &d.prefix);
+    rtps_put_entity(&mut v, RTPS_ENTITYID_PARTICIPANT);
+    spdp_param(&mut b, PID_PARTICIPANT_GUID, &v);
+    v = Vec::new();
+    rtps_put_le(&mut v, d.domain, 4);
+    spdp_param(&mut b, PID_DOMAIN_ID, &v);
+    var i: i64 = 0;
+    while i < d.meta_unicast.len() {
+        spdp_param(&mut b, PID_METATRAFFIC_UNICAST_LOCATOR, &spdp_locator_bytes(&d.meta_unicast.get(i)));
+        i = i + 1;
+    }
+    i = 0;
+    while i < d.meta_multicast.len() {
+        spdp_param(&mut b, PID_METATRAFFIC_MULTICAST_LOCATOR, &spdp_locator_bytes(&d.meta_multicast.get(i)));
+        i = i + 1;
+    }
+    i = 0;
+    while i < d.default_unicast.len() {
+        spdp_param(&mut b, PID_DEFAULT_UNICAST_LOCATOR, &spdp_locator_bytes(&d.default_unicast.get(i)));
+        i = i + 1;
+    }
+    v = Vec::new();
+    rtps_put_le(&mut v, d.lease_sec, 4);
+    rtps_put_le(&mut v, 0, 4);
+    spdp_param(&mut b, PID_PARTICIPANT_LEASE_DURATION, &v);
+    v = Vec::new();
+    rtps_put_le(&mut v, d.builtin_endpoints, 4);
+    spdp_param(&mut b, PID_BUILTIN_ENDPOINT_SET, &v);
+    if str_len(d.name) > 0 {
+        v = Vec::new();
+        rtps_put_le(&mut v, str_len(d.name) + 1, 4);
+        var k: i64 = 0;
+        while k < str_len(d.name) {
+            v.push(str_byte_at(d.name, k));
+            k = k + 1;
+        }
+        v.push(0);
+        spdp_param(&mut b, PID_ENTITY_NAME, &v);
+    }
+    rtps_put_le(&mut b, PID_SENTINEL, 2);
+    rtps_put_le(&mut b, 0, 2);
+    return b;
+}
+
+fn spdp_locator_at(b: & Vec<i64>, off: i64, little: bool) -> RtpsLocator {
+    return RtpsLocator { kind: rtps_get(b, off, 4, little), port: rtps_get(b, off + 4, 4, little), addr: rtps_sub(b, off + 8, off + 24) };
+}
+
+/// Parse a participant announcement payload (PL_CDR_LE or PL_CDR_BE);
+/// unknown parameters are skipped.
+pub fn spdp_decode(b: & Vec<i64>) -> SpdpData {
+    var d: SpdpData = spdp_new(Vec::new(), 0, 0, "");
+    d.ok = false;
+    if b.len() < 4 || b.get(0) != 0 || (b.get(1) != 2 && b.get(1) != 3) {
+        return d;
+    }
+    val little: bool = b.get(1) == 3;
+    var p: i64 = 4;
+    while p + 4 <= b.len() {
+        val pid: i64 = rtps_get(b, p, 2, little) & 16383;
+        val len: i64 = rtps_get(b, p + 2, 2, little);
+        val v: i64 = p + 4;
+        if v + len > b.len() {
+            return d;
+        }
+        if pid == PID_SENTINEL {
+            d.ok = true;
+            return d;
+        }
+        if pid == PID_PROTOCOL_VERSION {
+            d.major = b.get(v);
+            d.minor = b.get(v + 1);
+        } else if pid == PID_VENDORID {
+            d.vendor = (b.get(v) << 8) | b.get(v + 1);
+        } else if pid == PID_PARTICIPANT_GUID {
+            d.prefix = rtps_sub(b, v, v + 12);
+        } else if pid == PID_DOMAIN_ID {
+            d.domain = rtps_get(b, v, 4, little);
+        } else if pid == PID_PARTICIPANT_LEASE_DURATION {
+            d.lease_sec = rtps_get(b, v, 4, little);
+        } else if pid == PID_BUILTIN_ENDPOINT_SET {
+            d.builtin_endpoints = rtps_get(b, v, 4, little);
+        } else if pid == PID_METATRAFFIC_UNICAST_LOCATOR {
+            d.meta_unicast.push(spdp_locator_at(b, v, little));
+        } else if pid == PID_METATRAFFIC_MULTICAST_LOCATOR {
+            d.meta_multicast.push(spdp_locator_at(b, v, little));
+        } else if pid == PID_DEFAULT_UNICAST_LOCATOR {
+            d.default_unicast.push(spdp_locator_at(b, v, little));
+        } else if pid == PID_ENTITY_NAME {
+            val n: i64 = rtps_get(b, v, 4, little);
+            var bytes: Vec<i64> = Vec::new();
+            var k: i64 = 0;
+            while k < n - 1 && v + 4 + k < b.len() {
+                bytes.push(b.get(v + 4 + k));
+                k = k + 1;
+            }
+            d.name = str_from_bytes(bytes);
+        }
+        p = v + len;
+    }
+    return d;
+}
+
+/// A complete SPDP announcement message (to the SPDP multicast group).
+pub fn spdp_message(d: & SpdpData, sn: i64, ts_sec: i64) -> Vec<i64> {
+    var m: Vec<i64> = rtps_header(&d.prefix, d.vendor);
+    rtps_append(&mut m, &rtps_sub_info_ts(ts_sec, 0));
+    rtps_append(&mut m, &rtps_sub_data(RTPS_ENTITYID_SPDP_READER, RTPS_ENTITYID_SPDP_WRITER, sn, &spdp_encode(d)));
+    return m;
+}
+
+// ─── Reliable writer ───
+
+pub struct RtpsChange {
+    pub sn: i64,
+    pub payload: Vec<i64>,
+}
+
+pub struct RtpsReaderProxy {
+    pub prefix: Vec<i64>,
+    pub reader_id: i64,
+    // every change <= acked is acknowledged
+    pub acked: i64,
+    // changes <= sent were sent once
+    pub sent: i64,
+}
+
+pub struct RtpsWriter {
+    pub prefix: Vec<i64>,
+    pub writer_id: i64,
+    pub vendor: i64,
+    pub history: Vec<RtpsChange>,
+    pub next_sn: i64,
+    pub hb_count: i64,
+    pub readers: Vec<RtpsReaderProxy>,
+    pub outbox: Vec<Vec<i64>>,
+    pub resent: i64,
+    pub gaps_sent: i64,
+}
+
+pub fn rtps_writer_new(prefix: Vec<i64>, writer_id: i64) -> RtpsWriter {
+    return RtpsWriter { prefix: prefix, writer_id: writer_id, vendor: 0x01ff, history: Vec::new(), next_sn: 1, hb_count: 0, readers: Vec::new(), outbox: Vec::new(), resent: 0, gaps_sent: 0 };
+}
+
+/// Match a reader (by its GUID).
+pub fn rtps_writer_add_reader(w: & mut RtpsWriter, prefix: Vec<i64>, reader_id: i64) {
+    w.readers.push(RtpsReaderProxy { prefix: prefix, reader_id: reader_id, acked: 0, sent: 0 });
+}
+
+/// Add a change to the history; its sequence number.
+pub fn rtps_writer_write(w: & mut RtpsWriter, payload: Vec<i64>) -> i64 {
+    val sn: i64 = w.next_sn;
+    w.history.push(RtpsChange { sn: sn, payload: payload });
+    w.next_sn = sn + 1;
+    return sn;
+}
+
+/// Drop a change from the history (readers that ask for it get a GAP).
+pub fn rtps_writer_remove(w: & mut RtpsWriter, sn: i64) {
+    var i: i64 = 0;
+    while i < w.history.len() {
+        if w.history.get(i).sn == sn {
+            w.history.remove(i);
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn rtps_writer_find(w: & RtpsWriter, sn: i64) -> i64 {
+    var i: i64 = 0;
+    while i < w.history.len() {
+        if w.history.get(i).sn == sn {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn rtps_writer_first(w: & RtpsWriter) -> i64 {
+    if w.history.len() == 0 {
+        return w.next_sn;
+    }
+    return w.history.get(0).sn;
+}
+
+fn rtps_writer_msg(w: & RtpsWriter, dst: & Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = rtps_header(&w.prefix, w.vendor);
+    rtps_append(&mut m, &rtps_sub_info_dst(dst));
+    return m;
+}
+
+/// A HEARTBEAT to every matched reader (one message each) in the outbox.
+pub fn rtps_writer_heartbeat(w: & mut RtpsWriter) {
+    w.hb_count = w.hb_count + 1;
+    var i: i64 = 0;
+    while i < w.readers.len() {
+        val rp: RtpsReaderProxy = w.readers.get(i);
+        var m: Vec<i64> = rtps_writer_msg(w, &rp.prefix);
+        rtps_append(&mut m, &rtps_sub_heartbeat(rp.reader_id, w.writer_id, rtps_writer_first(w), w.next_sn - 1, w.hb_count, false, false));
+        w.outbox.push(m);
+        i = i + 1;
+    }
+}
+
+/// Send every change a reader has not been sent yet (one DATA message per
+/// change), then a HEARTBEAT.
+pub fn rtps_writer_flush(w: & mut RtpsWriter) {
+    var i: i64 = 0;
+    while i < w.readers.len() {
+        var rp: RtpsReaderProxy = w.readers.get(i);
+        var k: i64 = 0;
+        while k < w.history.len() {
+            val ch: RtpsChange = w.history.get(k);
+            if ch.sn > rp.sent {
+                var m: Vec<i64> = rtps_writer_msg(w, &rp.prefix);
+                rtps_append(&mut m, &rtps_sub_data(rp.reader_id, w.writer_id, ch.sn, &ch.payload));
+                w.outbox.push(m);
+                rp.sent = ch.sn;
+            }
+            k = k + 1;
+        }
+        w.readers.set(i, rp);
+        i = i + 1;
+    }
+    rtps_writer_heartbeat(w);
+}
+
+/// Handle a datagram for this writer (ACKNACKs): acknowledged changes are
+/// recorded, requested ones are sent again, or as a GAP when gone.
+pub fn rtps_writer_receive(w: & mut RtpsWriter, bytes: & Vec<i64>) {
+    val m: RtpsMsg = rtps_parse(bytes);
+    if !m.ok {
+        return;
+    }
+    var s: i64 = 0;
+    while s < m.subs.len() {
+        val sub: RtpsSub = m.subs.get(s);
+        if sub.id == RTPS_ACKNACK && sub.writer == w.writer_id {
+            var i: i64 = 0;
+            while i < w.readers.len() {
+                var rp: RtpsReaderProxy = w.readers.get(i);
+                if rp.reader_id == sub.reader && rtps_same(&rp.prefix, &sub.src_prefix) {
+                    if sub.set_base - 1 > rp.acked {
+                        rp.acked = sub.set_base - 1;
+                    }
+                    w.readers.set(i, rp);
+                    var k: i64 = 0;
+                    while k < sub.set.len() {
+                        val sn: i64 = sub.set.get(k);
+                        var msg: Vec<i64> = rtps_writer_msg(w, &rp.prefix);
+                        val hi: i64 = rtps_writer_find(w, sn);
+                        if hi >= 0 {
+                            val ch: RtpsChange = w.history.get(hi);
+                            rtps_append(&mut msg, &rtps_sub_data(rp.reader_id, w.writer_id, sn, &ch.payload));
+                            w.resent = w.resent + 1;
+                        } else {
+                            val none: Vec<i64> = Vec::new();
+                            rtps_append(&mut msg, &rtps_sub_gap(rp.reader_id, w.writer_id, sn, sn + 1, &none));
+                            w.gaps_sent = w.gaps_sent + 1;
+                        }
+                        w.outbox.push(msg);
+                        k = k + 1;
+                    }
+                    if sub.set.len() > 0 {
+                        rtps_writer_heartbeat(w);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+}
+
+/// Whether every matched reader acknowledged everything written.
+pub fn rtps_writer_all_acked(w: & RtpsWriter) -> bool {
+    var i: i64 = 0;
+    while i < w.readers.len() {
+        if w.readers.get(i).acked < w.next_sn - 1 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Take the outgoing datagrams.
+pub fn rtps_writer_take_outbox(w: & mut RtpsWriter) -> Vec<Vec<i64>> {
+    val out: Vec<Vec<i64>> = w.outbox;
+    w.outbox = Vec::new();
+    return out;
+}
+
+// ─── Reliable reader ───
+
+pub struct RtpsReader {
+    pub prefix: Vec<i64>,
+    pub reader_id: i64,
+    pub vendor: i64,
+    pub writer_prefix: Vec<i64>,
+    pub writer_id: i64,
+    // the next sequence number to deliver
+    pub next: i64,
+    // received out of order (or irrelevant: empty payload, flagged)
+    pub pend_sn: Vec<i64>,
+    pub pend_data: Vec<Vec<i64>>,
+    pub pend_gap: Vec<bool>,
+    pub delivered: Vec<Vec<i64>>,
+    pub delivered_sn: Vec<i64>,
+    pub ack_count: i64,
+    pub outbox: Vec<Vec<i64>>,
+    pub duplicates: i64,
+}
+
+pub fn rtps_reader_new(prefix: Vec<i64>, reader_id: i64) -> RtpsReader {
+    return RtpsReader { prefix: prefix, reader_id: reader_id, vendor: 0x01ff, writer_prefix: Vec::new(), writer_id: 0, next: 1, pend_sn: Vec::new(), pend_data: Vec::new(), pend_gap: Vec::new(), delivered: Vec::new(), delivered_sn: Vec::new(), ack_count: 0, outbox: Vec::new(), duplicates: 0 };
+}
+
+/// Match the (one) remote writer.
+pub fn rtps_reader_add_writer(r: & mut RtpsReader, prefix: Vec<i64>, writer_id: i64) {
+    r.writer_prefix = prefix;
+    r.writer_id = writer_id;
+}
+
+fn rtps_reader_has(r: & RtpsReader, sn: i64) -> bool {
+    var i: i64 = 0;
+    while i < r.pend_sn.len() {
+        if r.pend_sn.get(i) == sn {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn rtps_reader_store(r: & mut RtpsReader, sn: i64, data: Vec<i64>, gap: bool) {
+    if sn < r.next {
+        if !gap {
+            r.duplicates = r.duplicates + 1;
+        }
+        return;
+    }
+    if rtps_reader_has(r, sn) {
+        if !gap {
+            r.duplicates = r.duplicates + 1;
+        }
+        return;
+    }
+    r.pend_sn.push(sn);
+    r.pend_data.push(data);
+    r.pend_gap.push(gap);
+}
+
+// Deliver in order what is pending.
+fn rtps_reader_advance(r: & mut RtpsReader) {
+    var moved: bool = true;
+    while moved {
+        moved = false;
+        var i: i64 = 0;
+        while i < r.pend_sn.len() {
+            if r.pend_sn.get(i) == r.next {
+                if !r.pend_gap.get(i) {
+                    r.delivered.push(r.pend_data.get(i));
+                    r.delivered_sn.push(r.next);
+                }
+                r.pend_sn.remove(i);
+                r.pend_data.remove(i);
+                r.pend_gap.remove(i);
+                r.next = r.next + 1;
+                moved = true;
+                i = r.pend_sn.len();
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn rtps_reader_ack(r: & mut RtpsReader, last: i64, final_flag: bool) {
+    var missing: Vec<i64> = Vec::new();
+    var sn: i64 = r.next;
+    while sn <= last && sn < r.next + 256 {
+        if !rtps_reader_has(r, sn) {
+            missing.push(sn);
+        }
+        sn = sn + 1;
+    }
+    if missing.len() == 0 && final_flag {
+        return;
+    }
+    r.ack_count = r.ack_count + 1;
+    var m: Vec<i64> = rtps_header(&r.prefix, r.vendor);
+    rtps_append(&mut m, &rtps_sub_info_dst(&r.writer_prefix));
+    rtps_append(&mut m, &rtps_sub_acknack(r.reader_id, r.writer_id, r.next, &missing, r.ack_count, true));
+    r.outbox.push(m);
+}
+
+/// Handle a datagram for this reader: DATA, GAP and HEARTBEAT from the
+/// matched writer (an ACKNACK answering a HEARTBEAT goes to the outbox).
+pub fn rtps_reader_receive(r: & mut RtpsReader, bytes: & Vec<i64>) {
+    val m: RtpsMsg = rtps_parse(bytes);
+    if !m.ok {
+        return;
+    }
+    var s: i64 = 0;
+    while s < m.subs.len() {
+        val sub: RtpsSub = m.subs.get(s);
+        val mine: bool = sub.writer == r.writer_id && rtps_same(&sub.src_prefix, &r.writer_prefix) && (sub.dst_prefix.len() == 0 || rtps_same(&sub.dst_prefix, &r.prefix));
+        if mine {
+            if sub.id == RTPS_DATA {
+                rtps_reader_store(r, sub.sn, sub.payload, false);
+                rtps_reader_advance(r);
+            } else if sub.id == RTPS_GAP {
+                var sn: i64 = sub.sn;
+                while sn < sub.set_base {
+                    rtps_reader_store(r, sn, Vec::new(), true);
+                    sn = sn + 1;
+                }
+                var k: i64 = 0;
+                while k < sub.set.len() {
+                    rtps_reader_store(r, sub.set.get(k), Vec::new(), true);
+                    k = k + 1;
+                }
+                rtps_reader_advance(r);
+            } else if sub.id == RTPS_HEARTBEAT {
+                // changes before `first` are no longer available
+                while r.next < sub.first {
+                    rtps_reader_store(r, r.next, Vec::new(), true);
+                    rtps_reader_advance(r);
+                }
+                rtps_reader_ack(r, sub.last, (sub.flags & 2) != 0);
+            }
+        }
+        s = s + 1;
+    }
+}
+
+/// Take the outgoing datagrams.
+pub fn rtps_reader_take_outbox(r: & mut RtpsReader) -> Vec<Vec<i64>> {
+    val out: Vec<Vec<i64>> = r.outbox;
+    r.outbox = Vec::new();
+    return out;
+}

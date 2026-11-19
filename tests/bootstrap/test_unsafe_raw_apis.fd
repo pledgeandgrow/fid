@@ -1,0 +1,105 @@
+// Release M10 (complaint CM10): the standard library's raw-address APIs
+// are @unsafe, and each has a safe typed alternative. stdlib/volatile's
+// ptr_read/ptr_write (and the volatile forms) and Volatile::new, and
+// stdlib/arena's mem_copy/mem_zero/mem_set take addresses only the caller
+// can vouch for, so a program calls them from an `unsafe` block or an
+// @unsafe function (test_unsafe_raw_apis_fail.fd: a call outside is an
+// error). stdlib/sync's SyncMutex, SyncRwLock, SyncCounter, SyncTlsKey and
+// SyncChannel keep their handle private, so no forged integer reaches the
+// runtime, and need no `unsafe`.
+//
+// Expected output:
+// copy = 1234 99
+// cleared = 0 99
+// volatile = 7
+// mmio = 5 5
+// locked = 42
+// counter = 3 3
+// rw = 10
+// tls = 77
+// channel = 1 2 true
+use volatile;
+use arena;
+use sync;
+
+// SAFETY: addr is a live, aligned word the caller owns (an MMIO register in
+// real code; a heap word here).
+@unsafe
+fn mmio_roundtrip(addr: i64) -> i64 {
+    val reg: Volatile = Volatile::new(addr);
+    reg.store(5);
+    return reg.load();
+}
+
+var guarded: i64 = 41;
+
+fn bump() -> i64 {
+    guarded = guarded + 1;
+    return guarded;
+}
+
+fn read_guarded() -> i64 {
+    return guarded;
+}
+
+fn main() -> i64 {
+    var buf: i64 = 0;
+    var dst: i64 = 0;
+    var vol: i64 = 0;
+    var mm: i64 = 0;
+    // SAFETY: two fresh 16-byte blocks; every access below stays inside
+    // them; both are freed at the end.
+    unsafe {
+        buf = p_malloc(16);
+        dst = p_malloc(16);
+        mem_zero(buf, 16);
+        ptr_write(buf, 1234);
+        ptr_write(ptr_add(buf, 8), 99);
+        mem_copy(dst, buf, 16);
+        println("copy = " + int_to_str(ptr_read(dst)) + " " + int_to_str(ptr_read(ptr_offset(dst, 8))));
+        mem_set(dst, 0, 8);
+        println("cleared = " + int_to_str(ptr_read(dst)) + " " + int_to_str(ptr_read(ptr_add(dst, 8))));
+        ptr_write_volatile(buf, 7);
+        vol = ptr_read_volatile(buf);
+        mm = mmio_roundtrip(dst);
+    }
+    println("volatile = " + int_to_str(vol));
+    var after: i64 = 0;
+    // SAFETY: dst is still the 16-byte block above.
+    unsafe {
+        after = ptr_read(dst);
+        p_free(buf);
+        p_free(dst);
+    }
+    println("mmio = " + int_to_str(mm) + " " + int_to_str(after));
+
+    // typed handles: no unsafe needed
+    val m: SyncMutex = SyncMutex::new();
+    m.lock();
+    m.unlock();
+    println("locked = " + int_to_str(m.locked(bump)));
+
+    val c: SyncCounter = SyncCounter::new(1);
+    c.add(1);
+    val swapped: bool = c.cas(2, 3);
+    println("counter = " + int_to_str(c.load()) + " " + (if swapped { "3" } else { "?" }));
+
+    val rw: SyncRwLock = SyncRwLock::new();
+    rw.write_lock();
+    guarded = 10;
+    rw.write_unlock();
+    println("rw = " + int_to_str(rw.with_read(read_guarded)));
+
+    val key: SyncTlsKey = SyncTlsKey::new();
+    key.set(77);
+    println("tls = " + int_to_str(key.get()));
+
+    val ch: SyncChannel = SyncChannel::new(4);
+    ch.send(1);
+    ch.send(2);
+    val a: i64 = ch.recv();
+    val b: i64 = ch.recv();
+    ch.close();
+    println("channel = " + int_to_str(a) + " " + int_to_str(b) + " " + (if ch.is_closed() { "true" } else { "false" }));
+    return 0;
+}

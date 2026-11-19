@@ -1,0 +1,88 @@
+// LF2 (compiler/iropt_me.fd ime_note_ref_params, `lendref`, on by default
+// since Nov 17): the other side of test_midend_lend_ref.fd. A callee that
+// lets go of its reference parameter (unsafe code keeps the address as an
+// integer in a global) is not in the table, nor is a function that only
+// hands the reference on to it, so a local passed to either stays escaped
+// for every later call. `poke` is given nothing, yet writes the local
+// through the kept address: a load of the local after it must see the
+// write. If lendref took `keep` or `keep_via` for a lending callee,
+// forwarding would reuse the value stored before `poke` and print 5, 6 and
+// 2 instead of 9, 8 and 4.
+//
+// Expected output:
+// 9
+// 8
+// 4
+// 3
+
+var g_ptr: i64 = 0;
+
+// SAFETY: keeps x's address past the call; main's locals it is given live
+// until main returns, after the last poke.
+@unsafe
+fn keep(x: &mut i64) {
+    unsafe {
+        g_ptr = x as *mut i64 as i64;
+    }
+}
+
+// hands the reference on to keep: lets go of it too
+@unsafe
+fn keep_via(x: &mut i64) {
+    unsafe {
+        keep(x);
+    }
+}
+
+// SAFETY: g_ptr is the address keep stored, of a live local of main.
+@unsafe
+fn poke(v: i64) {
+    unsafe {
+        val p: *mut i64 = g_ptr as *mut i64;
+        *p = v;
+    }
+}
+
+// lends its reference (only loads and stores): the control case
+fn bump(x: &mut i64) {
+    *x = *x + 1;
+}
+
+fn main() {
+    var x: i64 = 1;
+    unsafe {
+        keep(&mut x);
+    }
+    x = 5;
+    unsafe {
+        poke(9);
+    }
+    println(x);
+    var y: i64 = 2;
+    unsafe {
+        keep_via(&mut y);
+    }
+    y = 6;
+    unsafe {
+        poke(8);
+    }
+    println(y);
+    // lent to bump, then given away to keep: escaped from then on
+    var z: i64 = 1;
+    bump(&mut z);
+    unsafe {
+        keep(&mut z);
+    }
+    z = z * 1;
+    unsafe {
+        poke(4);
+    }
+    println(z);
+    // a lent local beside them: bump alone reaches it
+    var w: i64 = 2;
+    bump(&mut w);
+    unsafe {
+        poke(7);
+    }
+    println(w);
+}

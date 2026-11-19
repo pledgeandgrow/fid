@@ -1,0 +1,39 @@
+// expect-error: Deadlock error: locks are taken in an inconsistent order
+// Complaint roadmap CA4: lock order is checked across the call graph at
+// compile time. `transfer` takes ACCOUNTS then LEDGER; `audit` takes
+// LEDGER and then, through `count_accounts`, ACCOUNTS. Two threads running
+// them can each hold one lock and wait for the other: the cycle
+// ACCOUNTS -> LEDGER -> ACCOUNTS is a compile error naming both paths.
+
+var ACCOUNTS: i64 = 0;
+var LEDGER: i64 = 0;
+
+fn transfer(amount: i64) -> i64 {
+    p_mutex_lock(ACCOUNTS);
+    p_mutex_lock(LEDGER);
+    val r: i64 = amount * 2;
+    p_mutex_unlock(LEDGER);
+    p_mutex_unlock(ACCOUNTS);
+    return r;
+}
+
+fn count_accounts() -> i64 {
+    p_mutex_lock(ACCOUNTS);
+    val n: i64 = 3;
+    p_mutex_unlock(ACCOUNTS);
+    return n;
+}
+
+fn audit() -> i64 {
+    p_mutex_lock(LEDGER);
+    val n: i64 = count_accounts();
+    p_mutex_unlock(LEDGER);
+    return n;
+}
+
+fn main() {
+    ACCOUNTS = p_mutex_init();
+    LEDGER = p_mutex_init();
+    println(int_to_str(transfer(5)));
+    println(int_to_str(audit()));
+}

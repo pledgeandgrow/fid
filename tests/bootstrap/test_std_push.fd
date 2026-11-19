@@ -1,0 +1,168 @@
+// stdlib/push: APNs payload JSON and the size limit (UTF-8-safe fit),
+// request headers and the background-push rules, FCM v1 message JSON and
+// data key rules, device tokens, the ES256 provider token (header and
+// claims checked against Python's base64url; the signature comes from a
+// fake signer behind the seam, as DER, converted to r||s), categories,
+// and parsing received payloads.
+// Expected output:
+// {"aps":{"alert":{"title":"Order shipped","body":"Arrives \"Tuesday\""},"badge":3,"sound":"default","category":"ORDER","thread-id":"orders"},"order_id":42}
+// {"aps":{"alert":"Hi","interruption-level":"time-sensitive","relevance-score":0.05}}
+// check bad interruption-level urgent
+// fit true 4095 utf8 true tail ...
+// request true /3/device/00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff apns-push-type=background apns-priority=5 apns-topic=com.example.app
+// background with alert: background push must carry content-available only
+// voip topic com.example.app.voip
+// token ok true short false fcm false true
+// {"message":{"topic":"news","notification":{"title":"Hello","body":"World"},"data":{"story_id":"42"},"android":{"priority":"high","ttl":"3600s","notification":{"channel_id":"news"}},"apns":{"headers":{"apns-priority":"10"},"payload":{"aps":{"badge":1}}}}}
+// data keys google.x false from false ok true; two targets ""
+// url https://fcm.googleapis.com/v1/projects/my-app/messages:send
+// input eyJhbGciOiJFUzI1NiIsImtpZCI6IkFCQzEyM0RFRkcifQ.eyJpc3MiOiJERUYxMjNHSElKIiwiaWF0IjoxNzAwMDAwMDAwfQ
+// sig AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QA
+// jwt parts 3 same true
+// der padded 64 r0 128 s0 0 s1 7; bad 0
+// refresh 2999 false 3000 true
+// b64url -__- back fbfffe
+// categories 3: duplicate category ORDER | ORDER: reserved action com.apple.x | MSG: action needs identifier and title
+// options 7 response open dismiss reply
+// apns T/B badge 2 cat C data order_id=42
+// fcm N/ data k="v" n="1"
+// silent true data sync="inbox"
+use push;
+use vec;
+use string;
+use encoding;
+
+fn fake_sign(input: Vec<i64>) -> Vec<i64> {
+    // DER SEQUENCE { INTEGER 1..32, INTEGER 33..64 }
+    var d: Vec<i64> = Vec::new();
+    d.push(0x30); d.push(0x44); d.push(0x02); d.push(0x20);
+    var i: i64 = 1;
+    while i <= 32 { d.push(i); i = i + 1; }
+    d.push(0x02); d.push(0x20);
+    while i <= 64 { d.push(i); i = i + 1; }
+    return d;
+}
+
+fn act(id: str, title: str, opts: i64) -> PushAction { return PushAction { id: id, title: title, options: opts, text_input: false }; }
+
+fn hdr(r: &ApnsRequest, name: str) -> str {
+    var i: i64 = 0;
+    while i < r.header_names.len() {
+        if r.header_names.get(i) == name { return name + "=" + r.header_vals.get(i); }
+        i = i + 1;
+    }
+    return name + "=?";
+}
+
+fn show_data(r: &PushReceived) -> str {
+    var s: str = "data";
+    var i: i64 = 0;
+    while i < r.data_keys.len() { s = s + " " + r.data_keys.get(i) + "=" + r.data_vals.get(i); i = i + 1; }
+    return s;
+}
+
+fn main() {
+    var p: ApnsPayload = apns_payload_new();
+    p.title = "Order shipped";
+    p.body = "Arrives \"Tuesday\"";
+    p.badge = 3;
+    p.sound = "default";
+    p.category = "ORDER";
+    p.thread_id = "orders";
+    apns_payload_custom(&mut p, "order_id", "42");
+    println(apns_payload_json(&p));
+    var q: ApnsPayload = apns_payload_new();
+    q.body = "Hi";
+    q.interruption_level = "time-sensitive";
+    q.relevance = 5;
+    println(apns_payload_json(&q));
+    q.interruption_level = "urgent";
+    println("check " + apns_payload_check(&q, false));
+
+    var big: ApnsPayload = apns_payload_new();
+    big.body = str_repeat("\u{e9}", 5000);
+    val fits: bool = apns_payload_fit(&mut big, APNS_MAX_PAYLOAD);
+    val js: str = apns_payload_json(&big);
+    println("fit " + bool_to_str(fits) + " " + int_to_str(str_len(js)) + " utf8 " + bool_to_str(utf8_valid(js))
+        + " tail " + str_slice(big.body, str_len(big.body) - 3, str_len(big.body)));
+
+    val tok: str = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF";
+    var bg: ApnsPayload = apns_payload_new();
+    bg.content_available = true;
+    apns_payload_custom(&mut bg, "sync", "\"inbox\"");
+    val r: ApnsRequest = apns_request(tok, "com.example.app", "background", &bg, 0, "", "");
+    println("request " + bool_to_str(r.ok) + " " + r.path + " " + hdr(&r, "apns-push-type") + " " + hdr(&r, "apns-priority") + " " + hdr(&r, "apns-topic"));
+    bg.body = "x";
+    val r2: ApnsRequest = apns_request(tok, "com.example.app", "background", &bg, 0, "", "");
+    println("background with alert: " + r2.error);
+    val r3: ApnsRequest = apns_request(tok, "com.example.app", "voip", &q, 0, "", "jwt");
+    q.interruption_level = "";
+    val r4: ApnsRequest = apns_request(tok, "com.example.app", "voip", &q, 0, "", "jwt");
+    println("voip topic " + str_slice(hdr(&r4, "apns-topic"), 11, 100));
+    println("token ok " + bool_to_str(apns_token_valid(tok)) + " short " + bool_to_str(apns_token_valid("abcd"))
+        + " fcm " + bool_to_str(fcm_token_valid("abc")) + " " + bool_to_str(fcm_token_valid(str_repeat("aZ0_:-", 25))));
+
+    var m: FcmMessage = fcm_message_new();
+    m.topic = "news";
+    m.title = "Hello";
+    m.body = "World";
+    fcm_add_data(&mut m, "story_id", "42");
+    m.android_priority = "high";
+    m.ttl_secs = 3600;
+    m.channel_id = "news";
+    m.apns.badge = 1;
+    m.apns_priority = "10";
+    println(fcm_message_json(&m));
+    val g: bool = fcm_add_data(&mut m, "google.x", "1");
+    val f: bool = fcm_add_data(&mut m, "from", "1");
+    val o: bool = fcm_add_data(&mut m, "k", "1");
+    m.token = "t";
+    println("data keys google.x " + bool_to_str(g) + " from " + bool_to_str(f) + " ok " + bool_to_str(o) + "; two targets \"" + fcm_message_json(&m) + "\"");
+    println("url " + fcm_send_url("my-app"));
+
+    val input: str = apns_jwt_signing_input("ABC123DEFG", "DEF123GHIJ", 1700000000);
+    println("input " + input);
+    val jwt: str = apns_provider_token("ABC123DEFG", "DEF123GHIJ", 1700000000, fake_sign);
+    val parts: Vec<str> = str_split(jwt, ".");
+    println("sig " + parts.get(2));
+    println("jwt parts " + int_to_str(parts.len()) + " same " + bool_to_str(str_starts_with(jwt, input + ".")));
+    var der: Vec<i64> = Vec::new();
+    der.push(0x30); der.push(0x45); der.push(0x02); der.push(0x21); der.push(0x00); der.push(0x80);
+    var i: i64 = 0;
+    while i < 31 { der.push(1); i = i + 1; }
+    der.push(0x02); der.push(0x20 - 0x01);   // s of 31 bytes: padded with one 0
+    der.push(7);
+    i = 0;
+    while i < 30 { der.push(2); i = i + 1; }
+    val raw: Vec<i64> = push_der_to_raw(der);
+    var bad: Vec<i64> = Vec::new();
+    bad.push(0x31); bad.push(0); bad.push(0); bad.push(0); bad.push(0); bad.push(0); bad.push(0); bad.push(0);
+    println("der padded " + int_to_str(raw.len()) + " r0 " + int_to_str(raw.get(0)) + " s0 " + int_to_str(raw.get(32))
+        + " s1 " + int_to_str(raw.get(33)) + "; bad " + int_to_str(push_der_to_raw(bad).len()));
+    println("refresh 2999 " + bool_to_str(apns_jwt_should_refresh(0, 2999)) + " 3000 " + bool_to_str(apns_jwt_should_refresh(0, 3000)));
+    var tb: Vec<i64> = Vec::new();
+    tb.push(0xfb); tb.push(0xff); tb.push(0xfe);
+    println("b64url " + push_b64url(tb) + " back " + hex_encode_bytes(push_b64url_decode(push_b64url(tb))));
+
+    var cats: Vec<PushCategory> = Vec::new();
+    var a1: Vec<PushAction> = Vec::new();
+    a1.push(act("TRACK", "Track", PUSH_ACTION_FOREGROUND));
+    a1.push(act("com.apple.x", "X", 0));
+    cats.push(PushCategory { id: "ORDER", actions: a1 });
+    var a2: Vec<PushAction> = Vec::new();
+    a2.push(act("", "Reply", 0));
+    cats.push(PushCategory { id: "MSG", actions: a2 });
+    cats.push(PushCategory { id: "ORDER", actions: Vec::new() });
+    val errs: Vec<str> = push_categories_check(cats);
+    println("categories " + int_to_str(errs.len()) + ": " + errs.get(2) + " | " + errs.get(0) + " | " + errs.get(1));
+    println("options " + int_to_str(push_action_un_options(PUSH_ACTION_FOREGROUND | PUSH_ACTION_DESTRUCTIVE | PUSH_ACTION_AUTH))
+        + " response " + push_response_action("com.apple.UNNotificationDefaultActionIdentifier") + " "
+        + push_response_action("com.apple.UNNotificationDismissActionIdentifier") + " " + push_response_action("reply"));
+
+    val rx: PushReceived = push_parse_received("{\"aps\":{\"alert\":{\"title\":\"T\",\"body\":\"B\"},\"badge\":2,\"category\":\"C\"},\"order_id\":42}");
+    println("apns " + rx.title + "/" + rx.body + " badge " + int_to_str(rx.badge) + " cat " + rx.category + " " + show_data(&rx));
+    val fx: PushReceived = push_parse_received("{\"notification\":{\"title\":\"N\"},\"data\":{\"k\":\"v\",\"n\":\"1\"}}");
+    println("fcm " + fx.title + "/" + fx.body + " " + show_data(&fx));
+    val sx: PushReceived = push_parse_received("{\"aps\":{\"content-available\":1},\"sync\":\"inbox\"}");
+    println("silent " + bool_to_str(sx.silent) + " " + show_data(&sx));
+}

@@ -1,0 +1,299 @@
+// stdlib/xml beyond well-formedness (competitive SL11): XML Namespaces 1.0
+// (prefixes resolved into XmlNode.ns/.local/.attr_ns, xmlns scoping, the
+// namespace errors with xml_options().namespaces), the DTD every parse
+// reads (attribute defaults and normalization, entities whose text holds
+// markup, entity loops and bombs), validation against the DTD
+// (xml_options().validate: content models, attribute types, IDs, #REQUIRED,
+// #FIXED) and external entities (off by default: nothing is fetched; on,
+// through a resolver: external parsed entities, parameter entities, the
+// external subset with INCLUDE/IGNORE). Each case prints its tree, or the
+// error a rejected document gets; a wrong result panics. A tree prints as
+// tag[name=value,...]{text}(children...); nstree prints names as
+// {namespace}local.
+use xml;
+
+var resolver_calls: i64 = 0;
+
+fn resolve(system_id: str, public_id: str) -> str {
+    resolver_calls = resolver_calls + 1;
+    if str_equal(system_id, "chap1.xml") {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<p>One &amp; <b>bold</b></p>";
+    }
+    if str_equal(system_id, "ext.dtd") {
+        return "<!ELEMENT doc (p+)>\n<!ELEMENT p (#PCDATA|b)*>\n<!ELEMENT b (#PCDATA)>\n<!ATTLIST p n CDATA \"1\">\n";
+    }
+    if str_equal(system_id, "decls.ent") {
+        return "<!ENTITY who \"World\">";
+    }
+    if str_equal(system_id, "cond.dtd") {
+        return "<![IGNORE[ <!ENTITY x \"ignored\"> <![INCLUDE[ nested ]]> ]]>\n<![INCLUDE[ <!ENTITY x \"included\"> ]]>\n<!ELEMENT r (#PCDATA)>";
+    }
+    return "";
+}
+
+fn esc(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if c == 10 { out = out + "\\n"; }
+        else if c == 9 { out = out + "\\t"; }
+        else { out = out + str_slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tree(n: XmlNode) -> str {
+    var out: str = n.tag;
+    if n.attr_names.len() > 0 {
+        out = out + "[";
+        var a: i64 = 0;
+        while a < n.attr_names.len() {
+            if a > 0 { out = out + ","; }
+            out = out + n.attr_names.get(a) + "=" + esc(n.attr_vals.get(a));
+            a = a + 1;
+        }
+        out = out + "]";
+    }
+    if str_len(n.text) > 0 { out = out + "\x7b" + esc(n.text) + "\x7d"; }
+    if n.children.len() > 0 {
+        out = out + "(";
+        var c: i64 = 0;
+        while c < n.children.len() {
+            if c > 0 { out = out + " "; }
+            out = out + tree(n.children.get(c));
+            c = c + 1;
+        }
+        out = out + ")";
+    }
+    return out;
+}
+
+fn qn(ns: str, local: str) -> str {
+    if str_len(ns) == 0 { return local; }
+    return "\x7b" + ns + "\x7d" + local;
+}
+
+// names with their namespaces; xmlns declarations left out
+fn nstree(n: XmlNode) -> str {
+    var out: str = qn(n.ns, n.local);
+    var shown: i64 = 0;
+    var a: i64 = 0;
+    while a < n.attr_names.len() {
+        val ans: str = n.attr_ns.get(a);
+        if !str_equal(ans, "http://www.w3.org/2000/xmlns/") {
+            if shown == 0 { out = out + "["; } else { out = out + ","; }
+            var an: str = n.attr_names.get(a);
+            if str_contains(an, ":") { an = str_slice(an, str_find(an, ":") + 1, str_len(an)); }
+            out = out + qn(ans, an) + "=" + n.attr_vals.get(a);
+            shown = shown + 1;
+        }
+        a = a + 1;
+    }
+    if shown > 0 { out = out + "]"; }
+    if n.children.len() > 0 {
+        out = out + "(";
+        var c: i64 = 0;
+        while c < n.children.len() {
+            if c > 0 { out = out + " "; }
+            out = out + nstree(n.children.get(c));
+            c = c + 1;
+        }
+        out = out + ")";
+    }
+    return out;
+}
+
+fn same(name: str, got: str, want: str) {
+    println(name + ": " + got);
+    if !str_equal(got, want) {
+        println(name + ": want " + want);
+        p_panic("xml dtd/ns: " + name + " gave the wrong result");
+    }
+}
+
+fn load(name: str, text: str, o: XmlOptions) -> XmlNode {
+    val d: XmlDoc = xml_load_with(text, o);
+    if !d.ok {
+        println(name + ": rejected: " + d.error);
+        p_panic("xml dtd/ns: " + name + " should be accepted");
+    }
+    return d.root;
+}
+
+fn ok(name: str, text: str, o: XmlOptions, want: str) {
+    same(name, tree(load(name, text, o)), want);
+}
+
+fn bad(name: str, text: str, o: XmlOptions) {
+    val d: XmlDoc = xml_load_with(text, o);
+    if d.ok {
+        println(name + ": accepted: " + tree(d.root));
+        p_panic("xml dtd/ns: " + name + " should be rejected");
+    }
+    println(name + ": rejected (" + d.error + ")");
+}
+
+fn opts_ns() -> XmlOptions {
+    var o: XmlOptions = xml_options();
+    o.namespaces = true;
+    return o;
+}
+
+fn opts_valid() -> XmlOptions {
+    var o: XmlOptions = xml_options();
+    o.validate = true;
+    return o;
+}
+
+fn opts_ext(validate: bool) -> XmlOptions {
+    var o: XmlOptions = xml_options();
+    o.external = true;
+    o.validate = validate;
+    o.resolver = resolve;
+    return o;
+}
+
+fn namespaces() {
+    println("-- Namespaces");
+    val o: XmlOptions = opts_ns();
+    val doc: str = "<r xmlns=\"urn:a\" xmlns:b=\"urn:b\"><x/><b:y b:k=\"1\" k=\"2\"/><z xmlns=\"\"><w/></z><b:v xmlns:b=\"urn:c\"/><b:u/></r>";
+    val r: XmlNode = load("scoping", doc, o);
+    same("scoping", nstree(r), "\x7burn:a\x7dr(\x7burn:a\x7dx \x7burn:b\x7dy[\x7burn:b\x7dk=1,k=2] z(w) \x7burn:c\x7dv \x7burn:b\x7du)");
+    val y: XmlNode = xml_child_ns(r, "urn:b", "y");
+    same("child by namespace", y.tag, "b:y");
+    same("attribute by namespace", xml_attr_ns(y, "urn:b", "k") + " " + xml_attr_ns(y, "", "k"), "1 2");
+    same("children by namespace", int_to_str(xml_children_ns(r, "urn:b", "u").len()) + " " + int_to_str(xml_children_ns(r, "urn:a", "x").len()), "1 1");
+    val l: XmlNode = load("xml prefix", "<a xml:lang=\"en\"/>", o);
+    same("xml prefix", xml_attr_ns(l, "http://www.w3.org/XML/1998/namespace", "lang"), "en");
+    // without the option a prefix may be unbound: ns "" and the local name
+    val u: XmlNode = load("unbound, option off", "<p:a q:x=\"1\"/>", xml_options());
+    same("unbound, option off", "[" + u.ns + "] " + u.local + " " + u.tag, "[] a p:a");
+    same("prefixes resolved by xml_parse too", nstree(xml_parse("<a xmlns:n=\"urn:n\"><n:b/></a>")), "a(\x7burn:n\x7db)");
+    bad("unbound element prefix", "<p:a/>", o);
+    bad("unbound attribute prefix", "<a p:x=\"1\"/>", o);
+    bad("prefix out of scope", "<a><b xmlns:p=\"urn:p\"/><p:c/></a>", o);
+    bad("two colons", "<a:b:c xmlns:a=\"urn:a\"/>", o);
+    bad("empty local name", "<a: xmlns:a=\"urn:a\"/>", o);
+    bad("undeclaring a prefix", "<a xmlns:p=\"\"/>", o);
+    bad("declaring xmlns", "<a xmlns:xmlns=\"urn:x\"/>", o);
+    bad("xml bound elsewhere", "<a xmlns:xml=\"urn:x\"/>", o);
+    bad("another prefix for the xml namespace", "<a xmlns:q=\"http://www.w3.org/XML/1998/namespace\"/>", o);
+    bad("default namespace to xmlns", "<a xmlns=\"http://www.w3.org/2000/xmlns/\"/>", o);
+    bad("element prefixed xmlns", "<xmlns:a/>", o);
+    bad("one expanded attribute name twice", "<a xmlns:p=\"urn:u\" xmlns:q=\"urn:u\" p:x=\"1\" q:x=\"2\"/>", o);
+    ok("same attribute name, option off", "<a xmlns:p=\"urn:u\" xmlns:q=\"urn:u\" p:x=\"1\" q:x=\"2\"/>", xml_options(), "a[xmlns:p=urn:u,xmlns:q=urn:u,p:x=1,q:x=2]");
+}
+
+fn dtd_every_parse() {
+    println("-- DTD read by every parse");
+    val o: XmlOptions = xml_options();
+    ok("attribute defaults and normalization", "<!DOCTYPE a [<!ATTLIST a x CDATA \"dx\" y NMTOKENS \"  p   q \" z (on|off) #IMPLIED f CDATA #FIXED \"fx\" w CDATA #REQUIRED>]><a z=\"  on  \" w=\" s  t \"/>", o,
+       "a[z=on,w= s  t ,x=dx,y=p q,f=fx]");
+    ok("first attribute declaration wins", "<!DOCTYPE a [<!ATTLIST a x CDATA \"1\"><!ATTLIST a x CDATA \"2\" y CDATA \"3\">]><a/>", o,
+       "a[x=1,y=3]");
+    ok("first entity declaration wins", "<!DOCTYPE a [<!ENTITY e \"one\"><!ENTITY e \"two\">]><a>&e;</a>", o, "a\x7bone\x7d");
+    ok("entity text with elements", "<!DOCTYPE a [<!ENTITY e \"<b>x</b> &amp; y\"><!ENTITY f \"[&e;]\">]><a>1&f;2</a>", o,
+       "a\x7b1[ & y]2\x7d(b\x7bx\x7d)");
+    ok("XML 1.0 4.6 example", "<!DOCTYPE r [<!ENTITY example \"<p>An ampersand (&#38;#38;) may be escaped numerically (&#38;#38;#38;) or with a general entity (&amp;amp;).</p>\">]><r>&example;</r>", o,
+       "r(p\x7bAn ampersand (&) may be escaped numerically (&#38;) or with a general entity (&amp;).\x7d)");
+    ok("entity in an attribute", "<!DOCTYPE r [<!ENTITY a \"x&#9;y\"><!ENTITY b \"[&a;]\">]><r v=\"&b;\"/>", o, "r[v=[x y]]");
+    ok("internal parameter entity", "<!DOCTYPE r [<!ENTITY % d \"<!ENTITY g 'from pe'>\"> %d;]><r>&g;</r>", o, "r\x7bfrom pe\x7d");
+    bad("entity loop", "<!DOCTYPE r [<!ENTITY a \"&b;\"><!ENTITY b \"x&a;\">]><r>&a;</r>", o);
+    bad("entity loop in an attribute", "<!DOCTYPE r [<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">]><r v=\"&a;\"/>", o);
+    bad("< from an entity in an attribute", "<!DOCTYPE r [<!ENTITY e \"<b/>\">]><r x=\"&e;\"/>", o);
+    bad("entity text not balanced", "<!DOCTYPE r [<!ENTITY e \"<b>\">]><r>&e;</b></r>", o);
+    bad("bare & in an entity value", "<!DOCTYPE r [<!ENTITY e \"a & b\">]><r/>", o);
+    bad("parameter entity in an internal entity value", "<!DOCTYPE r [<!ENTITY % p \"x\"><!ENTITY e \"%p;\">]><r/>", o);
+    bad("unknown parameter entity", "<!DOCTYPE r [%nope;]><r/>", o);
+    bad("malformed ELEMENT", "<!DOCTYPE r [<!ELEMENT r (a,|b)>]><r/>", o);
+    bad("malformed ATTLIST", "<!DOCTYPE r [<!ATTLIST r x BOGUS #IMPLIED>]><r/>", o);
+    bad("unterminated internal subset", "<!DOCTYPE r [<!ELEMENT r ANY>", o);
+    var deep: str = "";
+    var dk: i64 = 0;
+    while dk < 300 { deep = "(" + deep + ")"; dk = dk + 1; }
+    bad("content model nested 300 deep", "<!DOCTYPE r [<!ELEMENT r " + str_slice(deep, 0, 300) + "a" + str_slice(deep, 300, 600) + ">]><r/>", o);
+    same("lenient past a broken DTD", tree(xml_parse("<!DOCTYPE r [<!ELEMENT r (((>  <!ATTLIST <!ENTITY % ]><r>t</r>")), "r\x7bt\x7d");
+    // an entity bomb: 4 KB text, then each level ten references to the last
+    var big: str = "";
+    var k: i64 = 0;
+    while k < 4096 { big = big + "x"; k = k + 1; }
+    var bomb: str = "<!DOCTYPE r [<!ENTITY l0 \"" + big + "\">";
+    var lv: i64 = 1;
+    while lv <= 6 {
+        bomb = bomb + "<!ENTITY l" + int_to_str(lv) + " \"";
+        var t: i64 = 0;
+        while t < 10 { bomb = bomb + "&l" + int_to_str(lv - 1) + ";"; t = t + 1; }
+        bomb = bomb + "\">";
+        lv = lv + 1;
+    }
+    bomb = bomb + "]><r>&l6;</r>";
+    bad("entity bomb", bomb, o);
+}
+
+fn validation() {
+    println("-- Validation");
+    val v: XmlOptions = opts_valid();
+    val dtd: str = "<!DOCTYPE lib [\n<!ELEMENT lib (book+, note?)>\n<!ELEMENT book (title, (author | editor)*)>\n<!ELEMENT title (#PCDATA)>\n<!ELEMENT author (#PCDATA)>\n<!ELEMENT editor EMPTY>\n<!ELEMENT note ANY>\n<!ATTLIST book id ID #REQUIRED ref IDREFS #IMPLIED kind (paper|cloth) \"paper\" lang NMTOKEN #IMPLIED>\n<!ATTLIST editor name CDATA #REQUIRED>\n<!NOTATION gif SYSTEM \"image/gif\">\n]>\n";
+    ok("valid document", dtd + "<lib>\n<book id=\"b1\" lang=\"en\"><title>One</title><author>A</author><editor name=\"E\"/></book><book id=\"b2\" ref=\" b1  b2 \" kind=\"cloth\"><title>Two</title></book><note>any <title>t</title></note>\n</lib>", v,
+       "lib\x7b\\n\\n\x7d(book[id=b1,lang=en,kind=paper](title\x7bOne\x7d author\x7bA\x7d editor[name=E]) book[id=b2,ref=b1 b2,kind=cloth](title\x7bTwo\x7d) note\x7bany \x7d(title\x7bt\x7d))");
+    bad("element not declared", dtd + "<lib><book id=\"b1\"><title>x</title><chapter/></book></lib>", v);
+    bad("children out of order", dtd + "<lib><book id=\"b1\"><author>A</author><title>x</title></book></lib>", v);
+    bad("required child missing", dtd + "<lib><note/></lib>", v);
+    bad("too many of a ? child", dtd + "<lib><book id=\"b1\"><title>x</title></book><note/><note/></lib>", v);
+    bad("text in element content", dtd + "<lib>text<book id=\"b1\"><title>x</title></book></lib>", v);
+    bad("EMPTY with content", dtd + "<lib><book id=\"b1\"><title>x</title><editor name=\"E\">e</editor></book></lib>", v);
+    bad("element in #PCDATA", dtd + "<lib><book id=\"b1\"><title>x<author>a</author></title></book></lib>", v);
+    bad("attribute not declared", dtd + "<lib><book id=\"b1\" year=\"1\"><title>x</title></book></lib>", v);
+    bad("required attribute missing", dtd + "<lib><book><title>x</title></book></lib>", v);
+    bad("value not in the list", dtd + "<lib><book id=\"b1\" kind=\"wood\"><title>x</title></book></lib>", v);
+    bad("ID used twice", dtd + "<lib><book id=\"b1\"><title>x</title></book><book id=\"b1\"><title>y</title></book></lib>", v);
+    bad("ID not a name", dtd + "<lib><book id=\"1b\"><title>x</title></book></lib>", v);
+    bad("IDREF to no ID", dtd + "<lib><book id=\"b1\" ref=\"b1 b9\"><title>x</title></book></lib>", v);
+    bad("NMTOKEN with a space", dtd + "<lib><book id=\"b1\" lang=\"e n\"><title>x</title></book></lib>", v);
+    bad("root not the DOCTYPE's", "<!DOCTYPE b [<!ELEMENT a EMPTY>]><a/>", v);
+    bad("no DOCTYPE", "<a/>", v);
+    bad("#FIXED value differs", "<!DOCTYPE a [<!ELEMENT a EMPTY><!ATTLIST a v CDATA #FIXED \"1\">]><a v=\"2\"/>", v);
+    bad("element declared twice", "<!DOCTYPE a [<!ELEMENT a EMPTY><!ELEMENT a ANY>]><a/>", v);
+    bad("two ID attributes", "<!DOCTYPE a [<!ELEMENT a EMPTY><!ATTLIST a i ID #IMPLIED j ID #IMPLIED>]><a/>", v);
+    bad("ID with a default", "<!DOCTYPE a [<!ELEMENT a EMPTY><!ATTLIST a i ID \"x\">]><a/>", v);
+    val ent: str = "<!DOCTYPE a [<!ELEMENT a EMPTY><!NOTATION gif SYSTEM \"g\"><!ENTITY pic SYSTEM \"p.gif\" NDATA gif><!ATTLIST a src ENTITY #REQUIRED>]>";
+    ok("ENTITY attribute", ent + "<a src=\"pic\"/>", v, "a[src=pic]");
+    bad("ENTITY attribute, no such entity", ent + "<a src=\"nope\"/>", v);
+    bad("unparsed entity in text", "<!DOCTYPE a [<!ENTITY pic SYSTEM \"p.gif\" NDATA gif>]><a>&pic;</a>", xml_options());
+    val m: str = "<!DOCTYPE r [<!ELEMENT r ((a, b)+ | c)><!ELEMENT a EMPTY><!ELEMENT b EMPTY><!ELEMENT c EMPTY>]>";
+    ok("repeated sequence", m + "<r><a/><b/><a/><b/></r>", v, "r(a b a b)");
+    ok("other branch", m + "<r><c/></r>", v, "r(c)");
+    bad("half a repetition", m + "<r><a/><b/><a/></r>", v);
+    bad("both branches", m + "<r><a/><b/><c/></r>", v);
+    // the same invalid document is well-formed: xml_load takes it
+    ok("not validated by default", dtd + "<lib><chapter/></lib>", xml_options(), "lib(chapter)");
+}
+
+fn external() {
+    println("-- External entities");
+    val doc: str = "<!DOCTYPE d [<!ENTITY c1 SYSTEM \"chap1.xml\">]><d>[&c1;]</d>";
+    resolver_calls = 0;
+    ok("off by default: skipped, nothing fetched", doc, xml_options(), "d\x7b[]\x7d");
+    same("resolver calls with external off", int_to_str(resolver_calls), "0");
+    ok("loaded through the resolver", doc, opts_ext(false), "d\x7b[\\n]\x7d(p\x7bOne & \x7d(b\x7bbold\x7d))");
+    same("resolver calls", int_to_str(resolver_calls), "1");
+    ok("external subset, validated", "<!DOCTYPE doc SYSTEM \"ext.dtd\"><doc><p>t<b>x</b></p></doc>", opts_ext(true), "doc(p[n=1]\x7bt\x7d(b\x7bx\x7d))");
+    bad("external subset, invalid", "<!DOCTYPE doc SYSTEM \"ext.dtd\"><doc><b/></doc>", opts_ext(true));
+    ok("external parameter entity", "<!DOCTYPE r [<!ENTITY % decls SYSTEM \"decls.ent\"> %decls;]><r>&who;</r>", opts_ext(false), "r\x7bWorld\x7d");
+    ok("parameter entity not read: its entities skipped", "<!DOCTYPE r [<!ENTITY % decls SYSTEM \"decls.ent\"> %decls;]><r>[&who;]</r>", xml_options(), "r\x7b[]\x7d");
+    ok("INCLUDE and IGNORE", "<!DOCTYPE r SYSTEM \"cond.dtd\"><r>&x;</r>", opts_ext(true), "r\x7bincluded\x7d");
+    bad("resolver has nothing", "<!DOCTYPE r [<!ENTITY m SYSTEM \"missing.xml\">]><r>&m;</r>", opts_ext(false));
+    bad("external entity in an attribute", "<!DOCTYPE r [<!ENTITY c1 SYSTEM \"chap1.xml\">]><r a=\"&c1;\"/>", xml_options());
+    bad("unknown entity without an external DTD", "<!DOCTYPE r [<!ELEMENT r ANY>]><r>&nope;</r>", xml_options());
+}
+
+fn main() -> i64 {
+    namespaces();
+    dtd_every_parse();
+    validation();
+    external();
+    println("xml dtd ns ok");
+    return 0;
+}

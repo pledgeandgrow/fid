@@ -1,0 +1,70 @@
+// MI16 (docs/roadmap/llvm-roadmap.md): the sender's address of a UDP
+// datagram (recvfrom's peer, which stdlib/linux_runtime/darwin.fd
+// pe_mac_recvfrom translates from the BSD sockaddr layout on macOS) and
+// sysinfo (darwin.fd pe_mac_sysinfo; sysconf's memory pages go through it).
+// The machine layer's net.fd functions are stdlib/linux_runtime/sys.fd
+// pert_c_pledge_net_*. Built and run by tests/nattools/macos_udp_check.sh
+// (macOS host) and by `fid emit --target <arch>-linux` (Linux, qemu-user).
+// Without the translation the port and address print 0 or garbage on
+// macOS; without sysinfo the page counts are -1 / 0.
+use net;
+
+extern "C" {
+    fn sysconf(name: i64) -> i64;
+}
+
+fn main() -> i64 {
+    val a: i64 = net_socket_create();
+    val b: i64 = net_socket_create();
+    if a < 0 || b < 0 {
+        println("socket failed");
+        return 1;
+    }
+    // ports chosen high and apart; bind sets SO_REUSEADDR
+    val pa: i64 = 47311;
+    val pb: i64 = 47312;
+    println(net_bind(a, pa));
+    println(net_bind(b, pb));
+    net_set_recv_timeout(b, 3000);
+    val to: NetAddr = net_addr_create("127.0.0.1", pb);
+    var msg: Vec<i64> = Vec::new();
+    msg.push(104);
+    msg.push(105);
+    msg.push(33);
+    println(net_send_bytes_to(a, msg, &to));
+    var from: NetAddr = net_addr_create("0.0.0.0", 0);
+    val got: Vec<i64> = net_recv_bytes_from(b, 64, &mut from);
+    println(got.len());
+    if got.len() == 3 {
+        println(got.get(0));
+        println(got.get(2));
+    }
+    // the sender: socket a, at 127.0.0.1:pa
+    println(from.port == pa);
+    println(from.ip == net_addr_create("127.0.0.1", 0).ip);
+    net_close(a);
+    net_close(b);
+    // sysinfo: total memory pages (_SC_PHYS_PAGES, Linux 85) and available
+    // ones (_SC_AVPHYS_PAGES, 86), available no more than total
+    var total: i64 = 0;
+    var avail: i64 = 0;
+    unsafe {
+        total = sysconf(85);
+        avail = sysconf(86);
+    }
+    println(total > 0);
+    println(avail > 0 && avail <= total);
+    return 0;
+}
+
+// Expected output:
+// 0
+// 0
+// 3
+// 3
+// 104
+// 33
+// true
+// true
+// true
+// true

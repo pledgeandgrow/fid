@@ -1,0 +1,208 @@
+// stdlib/imap: the RFC 3501 examples (SELECT responses, the FETCH with ENVELOPE and BODY of 7.4.2, the multipart BODYSTRUCTURE), literals split across reads, astring quoting, encoded-words, and a scripted session: greeting with capabilities, LOGIN with a literal password, SELECT, SEARCH, FETCH with a body section, STORE, IDLE and LOGOUT.
+// Expected output:
+// status: tag * word OK code [UIDVALIDITY 3857529045] text UIDs valid
+// exists: 172 EXISTS
+// list: (\HasNoChildren \Marked) | / | Sent "old"
+// continuation: + idling
+// partial literal: complete false ok true
+// unclosed list: ok false (line ends inside a list at byte 16)
+// fetch 12: flags \Seen, size 4286, internal 17-Jul-1996 02:44:25 -0700
+//   date: Wed, 17 Jul 1996 02:23:25 -0700 (PDT)
+//   subject: IMAP4rev1 WG mtg summary and minutes
+//   from: Terry Gray <gray@cac.washington.edu>
+//   to: imap@cac.washington.edu
+//   cc: minutes@CNRI.Reston.VA.US, John Klensin <KLENSIN@MIT.EDU>
+//   bcc: 0, message-id: <B27397-0100000@cac.washington.edu>
+//   part 1 text/plain [charset=US-ASCII] 7bit 3028 bytes 92 lines
+// bodystructure uid 4827313:
+//   part TEXT multipart/mixed
+//   part 1 text/plain [charset=US-ASCII] 7bit 1152 bytes 23 lines
+//   part 2 text/plain [charset=US-ASCII;name=cc.diff] base64 4554 bytes 73 lines "Compiler diff"
+// nested:
+//   part TEXT multipart/mixed [boundary=b0]
+//   part 1 multipart/alternative [boundary=b1]
+//   part 1.1 text/plain [charset=utf-8] quoted-printable 120 bytes 4 lines
+//   part 1.2 text/html [charset=utf-8] base64 900 bytes 12 lines
+//   part 2 image/png [name=a.png] base64 2048 bytes
+// astring: INBOX "Sent Items" "a\"b\\c" [] ""
+// words: Café ☕café crème plain =?X-UNKNOWN?B?eA==?=
+// greeting: true idle true literal+ true
+// login: OK sent A001 LOGIN fred {10+}\r\npäss word\r\n caps now IMAP4REV1 IDLE UIDPLUS
+// select: exists 172 recent 1 unseen 12 uidvalidity 3857529045 uidnext 4392 rw true
+//   flags \Answered \Flagged \Deleted \Seen \Draft | permanent \Deleted \Seen \*
+//   sent A002 SELECT INBOX\r\n
+// examine (literal without LITERAL+): rw false sent A003 EXAMINE {5}\r\nCafé\r\n
+// search: 3 ids 2 84 882, sent A004 SEARCH FLAGGED SINCE 1-Feb-1994 NOT FROM "Smith"\r\n
+// uid fetch: seq 2 uid 302 flags [\Seen] header Subject: Lunch on Friday?\r\n\r\n
+// uid fetch: seq 84 uid 381 flags [] header \r\n
+//   sent A005 UID FETCH 302,381 (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])\r\n
+// store: OK untagged 1 sent A006 STORE 2 +FLAGS (\Deleted)\r\n
+// idle: true
+//   events 173 EXISTS, 3 EXPUNGE; done OK sent A007 IDLE\r\nDONE\r\n
+// copy: ok false NO [TRYCREATE] no such mailbox, alerts 1
+// logout: OK BYE
+use imap;
+use vec;
+use string;
+
+var INQ: Vec<i64> = Vec::new();
+var SENT: str = "";
+
+fn mock_send(conn: i64, b: Vec<i64>) -> i64 {
+    SENT = SENT + str_from_bytes(b);
+    return b.len();
+}
+
+// Small reads (11 bytes), so literals and lines arrive in pieces.
+fn mock_recv(conn: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while INQ.len() > 0 && out.len() < 11 {
+        out.push(INQ.remove(0));
+    }
+    return out;
+}
+
+fn feed(s: str) {
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        INQ.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn visible(s: str) -> str {
+    return str_replace(str_replace(s, "\r", "\\r"), "\n", "\\n");
+}
+
+fn addrs(v: Vec<ImapAddress>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            out = out + ", ";
+        }
+        out = out + v.get(i).full;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn show_parts(parts: Vec<ImapPart>) {
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: ImapPart = parts.get(i);
+        var line: str = "  part " + p.section + " " + p.mime;
+        if str_len(p.params) > 0 {
+            line = line + " [" + p.params + "]";
+        }
+        if !p.multipart {
+            line = line + " " + p.encoding + " " + int_to_str(p.size) + " bytes";
+            if p.lines >= 0 {
+                line = line + " " + int_to_str(p.lines) + " lines";
+            }
+            if str_len(p.description) > 0 {
+                line = line + " \"" + p.description + "\"";
+            }
+        }
+        println(line);
+        i = i + 1;
+    }
+}
+
+fn parse(s: str) -> ImapResponse {
+    return imap_parse_response(str_bytes(s), 0);
+}
+
+fn main() -> i64 {
+    // Single responses
+    val a: ImapResponse = parse("* OK [UIDVALIDITY 3857529045] UIDs valid\r\n");
+    println("status: tag " + a.tag + " word " + a.word + " code [" + a.code + "] text " + a.text);
+    val b: ImapResponse = parse("* 172 EXISTS\r\n");
+    println("exists: " + int_to_str(b.num) + " " + b.word);
+    val l: ImapResponse = parse("* LIST (\\HasNoChildren \\Marked) \"/\" \"Sent \\\"old\\\"\"\r\n");
+    println("list: " + imap_to_str(& l.doc, l.values.get(0)) + " | " + imap_string(& l.doc, l.values.get(1)) + " | " + imap_string(& l.doc, l.values.get(2)));
+    val cont: ImapResponse = parse("+ idling\r\n");
+    println("continuation: " + cont.tag + " " + cont.text);
+    val part: ImapResponse = parse("* 1 FETCH (BODY[TEXT] {10}\r\nhello");
+    println("partial literal: complete " + bool_to_str(part.complete) + " ok " + bool_to_str(part.ok));
+    val bad: ImapResponse = parse("* 1 FETCH (UID 5\r\n");
+    println("unclosed list: ok " + bool_to_str(bad.ok) + " (" + bad.error + ")");
+
+    // RFC 3501 7.4.2: a FETCH response with ENVELOPE and BODY
+    val f: ImapResponse = parse("* 12 FETCH (FLAGS (\\Seen) INTERNALDATE \"17-Jul-1996 02:44:25 -0700\" RFC822.SIZE 4286 ENVELOPE (\"Wed, 17 Jul 1996 02:23:25 -0700 (PDT)\" \"IMAP4rev1 WG mtg summary and minutes\" ((\"Terry Gray\" NIL \"gray\" \"cac.washington.edu\")) ((\"Terry Gray\" NIL \"gray\" \"cac.washington.edu\")) ((\"Terry Gray\" NIL \"gray\" \"cac.washington.edu\")) ((NIL NIL \"imap\" \"cac.washington.edu\")) ((NIL NIL \"minutes\" \"CNRI.Reston.VA.US\")(\"John Klensin\" NIL \"KLENSIN\" \"MIT.EDU\")) NIL NIL \"<B27397-0100000@cac.washington.edu>\") BODY (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"US-ASCII\") NIL NIL \"7BIT\" 3028 92))\r\n");
+    val fi: ImapFetch = imap_fetch_items(& f);
+    println("fetch " + int_to_str(fi.seq) + ": flags " + str_join(fi.flags, " ") + ", size " + int_to_str(fi.size) + ", internal " + fi.internal_date);
+    println("  date: " + fi.envelope.date);
+    println("  subject: " + fi.envelope.subject);
+    println("  from: " + addrs(fi.envelope.from));
+    println("  to: " + addrs(fi.envelope.to));
+    println("  cc: " + addrs(fi.envelope.cc));
+    println("  bcc: " + int_to_str(fi.envelope.bcc.len()) + ", message-id: " + fi.envelope.message_id);
+    show_parts(fi.parts);
+
+    // RFC 3501 7.4.2: a multipart BODYSTRUCTURE
+    val m: ImapResponse = parse("* 13 FETCH (UID 4827313 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"US-ASCII\") NIL NIL \"7BIT\" 1152 23)(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"US-ASCII\" \"NAME\" \"cc.diff\") \"<960723163407.20117h@cac.washington.edu>\" \"Compiler diff\" \"BASE64\" 4554 73) \"MIXED\"))\r\n");
+    val mi: ImapFetch = imap_fetch_items(& m);
+    println("bodystructure uid " + int_to_str(mi.uid) + ":");
+    show_parts(mi.parts);
+    val nested: ImapResponse = parse("* 14 FETCH (BODYSTRUCTURE (((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"quoted-printable\" 120 4 NIL NIL NIL)(\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"base64\" 900 12 NIL NIL NIL) \"alternative\" (\"boundary\" \"b1\") NIL NIL)(\"image\" \"png\" (\"name\" \"a.png\") NIL NIL \"base64\" 2048 NIL (\"attachment\" (\"filename\" \"a.png\")) NIL) \"mixed\" (\"boundary\" \"b0\") NIL NIL))\r\n");
+    println("nested:");
+    show_parts(imap_fetch_items(& nested).parts);
+
+    // Strings
+    println("astring: " + imap_astring("INBOX") + " " + imap_astring("Sent Items") + " " + imap_astring("a\"b\\c") + " [" + imap_astring("line\nbreak") + "] " + imap_astring(""));
+    println("words: " + imap_decode_words("=?UTF-8?B?Q2Fmw6kg4piV?= =?ISO-8859-1?Q?caf=E9_cr=E8me?= plain =?X-UNKNOWN?B?eA==?="));
+
+    // A session
+    feed("* OK [CAPABILITY IMAP4rev1 LITERAL+ IDLE] IMAP4rev1 Service Ready\r\n");
+    var c: ImapClient = imap_client_new(ImapTransport { conn: 1, send: mock_send, recv: mock_recv });
+    println("greeting: " + bool_to_str(imap_greeting(& mut c)) + " idle " + bool_to_str(imap_has_cap(& c, "idle")) + " literal+ " + bool_to_str(c.literal_plus));
+    feed("A001 OK [CAPABILITY IMAP4rev1 IDLE UIDPLUS] LOGIN completed\r\n");
+    val lg: ImapResult = imap_login(& mut c, "fred", "p\u{e4}ss word");
+    println("login: " + lg.status + " sent " + visible(SENT) + " caps now " + str_join(c.caps, " "));
+    SENT = "";
+    c.literal_plus = false;
+    feed("* 172 EXISTS\r\n* 1 RECENT\r\n* OK [UNSEEN 12] Message 12 is first unseen\r\n* OK [UIDVALIDITY 3857529045] UIDs valid\r\n* OK [UIDNEXT 4392] Predicted next UID\r\n* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\nA002 OK [READ-WRITE] SELECT completed\r\n");
+    val box: ImapMailbox = imap_select(& mut c, "INBOX");
+    println("select: exists " + int_to_str(box.exists) + " recent " + int_to_str(box.recent) + " unseen " + int_to_str(box.unseen) + " uidvalidity " + int_to_str(box.uidvalidity) + " uidnext " + int_to_str(box.uidnext) + " rw " + bool_to_str(box.read_write));
+    println("  flags " + str_join(box.flags, " ") + " | permanent " + str_join(box.permanent_flags, " "));
+    println("  sent " + visible(SENT));
+    SENT = "";
+    feed("+ Ready for literal data\r\nA003 OK [READ-ONLY] EXAMINE completed\r\n");
+    val ex: ImapMailbox = imap_examine(& mut c, "Caf\u{e9}");
+    println("examine (literal without LITERAL+): rw " + bool_to_str(ex.read_write) + " sent " + visible(SENT));
+    SENT = "";
+    feed("* SEARCH 2 84 882\r\nA004 OK SEARCH completed\r\n");
+    val ids: Vec<i64> = imap_search(& mut c, "FLAGGED SINCE 1-Feb-1994 NOT FROM \"Smith\"");
+    println("search: " + int_to_str(ids.len()) + " ids " + int_to_str(ids.get(0)) + " " + int_to_str(ids.get(1)) + " " + int_to_str(ids.get(2)) + ", sent " + visible(SENT));
+    SENT = "";
+    feed("* 2 FETCH (UID 302 FLAGS (\\Seen) BODY[HEADER.FIELDS (SUBJECT)] {29}\r\nSubject: Lunch on Friday?\r\n\r\n)\r\n* 84 FETCH (UID 381 FLAGS () BODY[HEADER.FIELDS (SUBJECT)] {2}\r\n\r\n)\r\nA005 OK FETCH completed\r\n");
+    val fs: Vec<ImapFetch> = imap_uid_fetch(& mut c, "302,381", "(FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])");
+    var i: i64 = 0;
+    while i < fs.len() {
+        val x: ImapFetch = fs.get(i);
+        println("uid fetch: seq " + int_to_str(x.seq) + " uid " + int_to_str(x.uid) + " flags [" + str_join(x.flags, " ") + "] header " + visible(imap_fetch_section(& x, "BODY[HEADER.FIELDS (SUBJECT)]")));
+        i = i + 1;
+    }
+    println("  sent " + visible(SENT));
+    SENT = "";
+    feed("* 2 FETCH (FLAGS (\\Deleted \\Seen))\r\nA006 OK STORE completed\r\n");
+    val st: ImapResult = imap_store(& mut c, "2", "+FLAGS", "(\\Deleted)");
+    println("store: " + st.status + " untagged " + int_to_str(st.untagged.len()) + " sent " + visible(SENT));
+    SENT = "";
+    feed("+ idling\r\n* 173 EXISTS\r\n* 3 EXPUNGE\r\nA007 OK IDLE terminated\r\n");
+    println("idle: " + bool_to_str(imap_idle_start(& mut c)));
+    val e1: ImapResponse = imap_idle_next(& mut c);
+    val e2: ImapResponse = imap_idle_next(& mut c);
+    val done: ImapResult = imap_idle_done(& mut c);
+    println("  events " + int_to_str(e1.num) + " " + e1.word + ", " + int_to_str(e2.num) + " " + e2.word + "; done " + done.status + " sent " + visible(SENT));
+    SENT = "";
+    feed("* NO [ALERT] disk is full\r\nA008 NO [TRYCREATE] no such mailbox\r\n");
+    val no: ImapResult = imap_command(& mut c, "COPY 1:2 Archive");
+    println("copy: ok " + bool_to_str(no.ok) + " " + no.status + " [" + no.code + "] " + no.text + ", alerts " + int_to_str(no.untagged.len()));
+    feed("* BYE IMAP4rev1 Server logging out\r\nA009 OK LOGOUT completed\r\n");
+    val bye: ImapResult = imap_logout(& mut c);
+    println("logout: " + bye.status + " " + bye.untagged.get(0).word);
+    return 0;
+}

@@ -1,0 +1,53 @@
+# op3-shared-analyses: the mid-end's analyses kept between passes
+# (competitive-roadmap OP3), caches on (default) vs FID_IROPT_OFF=cfgcache.
+#
+# What is cached:
+#   - the CFG with its dominator tree and intervals, per function shape
+#     (compiler/checks.fd iro_cfg; key iro_cfg_key: block ids and
+#     terminator targets; a new CFG gets a new `gen`)
+#   - the loop tree found on it (checks.fd iro_loops: reused while the CFG
+#     handed in has the `gen` it was found for)
+#   - the use lists between the passes of one function (compiler/iropt.fd
+#     iro_uses_entry, armed by iropt_native per function; forgotten by
+#     iro_uses_forget after every pass that reports a change, and checked
+#     against a key of next_value and every block's instruction ids)
+# FID_IROPT_OFF=cfgcache turns all three off; FID_IROPT_STATS=1 prints
+#   iropt: cfg built N, reused M
+#   iropt: loops built N, reused M
+#   iropt: uses built N, reused M
+#
+# Run 1 (Nov 16 23:5x): tests/tooling/cfgcache-check.sh with the compiler of
+# the morning of Nov 16 (scratchpad ws/stage0.exe), which has the CFG cache
+# but not yet the loop-tree and use-list caches (so their lines read 0/0 and
+# the script's "a cache was never hit" line is expected for that compiler).
+# pe_ir `emit`, executables compared byte for byte:
+SAME  pe    test_midend_shared_analyses        cfg 82/870 (built/reused)
+SAME  pe    test_midend_loop_tree              cfg 84/861
+SAME  pe    test_midend_unroll_partial         cfg 79/885
+SAME  pe    test_unroll                        cfg 21/211
+SAME  pe    test_counted_loop_step             cfg 84/903
+SAME  pe    test_midend_iv_bounded             cfg 24/282
+SAME  pe    test_midend_licm_guard             cfg 22/231
+SAME  pe    test_matrix_mul                    cfg 82/839
+SAME  pe    test_collections                   cfg 152/1506
+SAME  pe    test_match_range                   cfg 23/199
+SAME  pe    test_struct_copy_vec               cfg 82/845
+SAME  pe    test_generic_struct                cfg 23/280
+SAME  pe    test_vec_loop                      cfg 75/784
+SAME  pe    test_vec_math                      cfg 35/465
+SAME  pe    test_hashmap                       cfg 98/939
+SAME  pe    test_closure_capture               cfg 21/215
+SAME  pe    test_lang_features                 cfg 100/1145
+SAME  pe    test_opt_dce                       cfg 78/808
+SAME  pe    test_verify_opt_dse_sccp_iv        cfg 82/853
+SAME  pe    test_lib_bigint                    cfg 129/1423
+SAME  pe    test_ssa_merge                     cfg 29/301
+SAME  pe    test_mem2reg_promote               cfg 81/834
+# cache on:  cfg built 1486, reused 15679
+# cache off: cfg built 17165, reused 0
+# 22 tests, 0 differ: the CFG cache saves 91% of the CFG builds and changes
+# no executable.
+#
+# Still to record (with the compiler built from this tree): the same run
+# with the loop-tree and use-list counts, and NAT=1 (emit --nat):
+#   FID=$FID NAT=1 bash tests/tooling/cfgcache-check.sh

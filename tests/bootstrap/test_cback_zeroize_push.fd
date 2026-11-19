@@ -1,0 +1,37 @@
+// J8 (C runtime part): a @zeroize Vec grown by the C runtime's own
+// p_vec_push keeps its wipes: each new buffer is registered as the old one
+// is wiped (it was not, so the old buffers p_vec_push replaced were never
+// wiped). Growth 8 -> 16 -> 32 -> 64 frees three buffers. The interpreter
+// manages Vecs itself (no registry): there the count is not checked.
+//
+// Expected output:
+// 40
+// ok
+
+extern fn p_sensitive_wipes() -> i64;
+extern fn p_sensitive_check(v: i64) -> i64;
+
+fn main() -> i64 {
+    var tracked: bool = true;
+    var before: i64 = p_sensitive_wipes();
+    {
+        @zeroize
+        var v: Vec<i64> = Vec::new();
+        if p_sensitive_check(v as i64) != 1 {
+            tracked = false;
+        }
+        var i: i64 = 0;
+        while i < 40 {
+            p_vec_push(v, i);
+            i = i + 1;
+        }
+        println(p_vec_len(v));
+    }
+    var n: i64 = p_sensitive_wipes() - before;
+    if tracked && n < 3 {
+        println("J8: buffers p_vec_push replaced were not wiped");
+        return 1;
+    }
+    println("ok");
+    return 0;
+}

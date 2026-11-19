@@ -1,0 +1,118 @@
+// stdlib/wind_model: power curves, Weibull and AEP, shear, Jensen wakes
+// Checks: G(1.5) = sqrt(pi)/2 = 0.886227, G(5) = 24; Weibull k=2 c=8 mean
+// 8 G(1.5) = 7.0898 and cdf(6) = 1 - e^-0.5625; for a curve that is rated
+// between 12 and 25 m/s the AEP has the closed form
+// P 8760 (e^-(12/c)^k - e^-(25/c)^k) (Manwell, McGowan & Rogers, Wind Energy
+// Explained, ch. 6); the Jensen deficit for Ct 0.88, k 0.075, D 40 m at
+// 400 m is (1 - sqrt(0.12)) / 2.5^2 = 0.104574 (Jensen 1983 geometry). The
+// tabulated-curve AEP, partial wake and three-turbine farm were checked with
+// numpy (trapezoid integration on 400001 points).
+// Expected output:
+// gamma(1.5)=0.886227 gamma(5)=24.000000 gamma(0.3)=2.991569
+// weibull k=2 c=8: mean 7.0898 pdf(6) 0.106834 cdf(6) 0.430217
+// rayleigh scale for mean 7: 7.8987
+// curve: P(2.5)=0 P(7.5)=578.0 P(12.5)=1933.0 P(20)=2000.0 P(26)=0 cubic P(8)=447.0
+// aep 2 MW, rayleigh 7 m/s: 5687.4 MWh, capacity factor 0.3246
+// step curve aep 1740.8 MWh vs closed form 1741.6 MWh, within 0.5%: true
+// shear: power law 6.7295 log law 6.7898 alpha 0.1337
+// density 1.2250 kg/m3, normalised 8 m/s at 1.1 kg/m3: 7.7181, available power 3078.8 kW
+// justus fit mean 6 sigma 2: k=3.2973 c=6.6891
+// jensen deficit 0.104574 speed 7.1634, partial wake (45 m off) 0.064379
+// farm speeds: 9.0000 7.8162 7.7079
+use wind_model;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn curve() -> PowerCurve {
+    var s: Vec<f64> = Vec::new();
+    var p: Vec<f64> = Vec::new();
+    s.push(3.0);
+    p.push(0.0);
+    s.push(4.0);
+    p.push(66.0);
+    s.push(5.0);
+    p.push(154.0);
+    s.push(6.0);
+    p.push(282.0);
+    s.push(7.0);
+    p.push(460.0);
+    s.push(8.0);
+    p.push(696.0);
+    s.push(9.0);
+    p.push(996.0);
+    s.push(10.0);
+    p.push(1341.0);
+    s.push(11.0);
+    p.push(1661.0);
+    s.push(12.0);
+    p.push(1866.0);
+    s.push(13.0);
+    p.push(2000.0);
+    s.push(25.0);
+    p.push(2000.0);
+    return wind_power_curve(s, p, 3.0, 25.0);
+}
+
+fn main() {
+    println("gamma(1.5)=" + fx(wind_gamma(1.5), 6) + " gamma(5)=" + fx(wind_gamma(5.0), 6) + " gamma(0.3)=" + fx(wind_gamma(0.3), 6));
+    println("weibull k=2 c=8: mean " + fx(wind_weibull_mean(2.0, 8.0), 4) + " pdf(6) " + fx(wind_weibull_pdf(6.0, 2.0, 8.0), 6) + " cdf(6) " + fx(wind_weibull_cdf(6.0, 2.0, 8.0), 6));
+    val c = wind_rayleigh_scale(7.0);
+    println("rayleigh scale for mean 7: " + fx(c, 4));
+    val pc = curve();
+    println("curve: P(2.5)=" + fx(wind_power(&pc, 2.5), 0) + " P(7.5)=" + fx(wind_power(&pc, 7.5), 1) + " P(12.5)=" + fx(wind_power(&pc, 12.5), 1) + " P(20)=" + fx(wind_power(&pc, 20.0), 1) + " P(26)=" + fx(wind_power(&pc, 26.0), 0) + " cubic P(8)=" + fx(wind_power_cubic(8.0, 3.0, 13.0, 2000.0, 25.0), 1));
+    val aep = wind_aep(&pc, 2.0, c, 1.0);
+    println("aep 2 MW, rayleigh 7 m/s: " + fx(aep / 1000.0, 1) + " MWh, capacity factor " + fx(wind_capacity_factor(aep, 2000.0), 4));
+    var ss: Vec<f64> = Vec::new();
+    var sp: Vec<f64> = Vec::new();
+    ss.push(12.0);
+    sp.push(2000.0);
+    ss.push(25.0);
+    sp.push(2000.0);
+    val step = wind_power_curve(ss, sp, 12.0, 25.0);
+    val a1 = wind_aep(&step, 2.0, c, 1.0);
+    val closed = 2000.0 * 8760.0 * (math_exp(0.0 - (12.0 / c) * (12.0 / c)) - math_exp(0.0 - (25.0 / c) * (25.0 / c)));
+    println("step curve aep " + fx(a1 / 1000.0, 1) + " MWh vs closed form " + fx(closed / 1000.0, 1) + " MWh, within 0.5%: " + bool_to_str(math_fabs(a1 - closed) / closed < 0.005));
+    println("shear: power law " + fx(wind_shear_power(5.0, 10.0, 80.0, 1.0 / 7.0), 4) + " log law " + fx(wind_shear_log(5.0, 10.0, 80.0, 0.03), 4) + " alpha " + fx(wind_shear_alpha(5.0, 10.0, 6.2, 50.0), 4));
+    println("density " + fx(wind_air_density(101325.0, 15.0), 4) + " kg/m3, normalised 8 m/s at 1.1 kg/m3: " + fx(wind_density_normalise(8.0, 1.1, 1.225), 4) + ", available power " + fx(wind_power_available(1.225, 80.0, 10.0) / 1000.0, 1) + " kW");
+    val fit = wind_weibull_fit(6.0, 2.0);
+    println("justus fit mean 6 sigma 2: k=" + fx(fit.get(0), 4) + " c=" + fx(fit.get(1), 4));
+    val d = wind_jensen_deficit(0.88, 0.075, 40.0, 400.0);
+    println("jensen deficit " + fx(d, 6) + " speed " + fx(8.0 * (1.0 - d), 4) + ", partial wake (45 m off) " + fx(wind_jensen_rotor_deficit(0.88, 0.075, 40.0, 400.0, 45.0), 6));
+    var xs: Vec<f64> = Vec::new();
+    var ys: Vec<f64> = Vec::new();
+    xs.push(0.0);
+    ys.push(0.0);
+    xs.push(560.0);
+    ys.push(0.0);
+    xs.push(1120.0);
+    ys.push(40.0);
+    val u = wind_farm_speeds(&xs, &ys, 9.0, 0.8, 0.075, 80.0);
+    println("farm speeds: " + fx(u.get(0), 4) + " " + fx(u.get(1), 4) + " " + fx(u.get(2), 4));
+}

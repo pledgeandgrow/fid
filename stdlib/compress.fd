@@ -4,10 +4,11 @@
 //
 //   decompress: full inflate — stored blocks, fixed Huffman, and
 //               dynamic Huffman (puff-style canonical decode)
-//   compress:   valid DEFLATE using *stored* blocks only — output is
-//               slightly larger than input but every inflater (zlib,
-//               gzip, .zip) accepts it. A real Huffman compressor is a
-//               future TODO.
+//   compress:   deflate_compress / zlib_compress_level /
+//               gzip_compress_level: LZ77 + dynamic or fixed Huffman
+//               blocks, levels 0-9. zlib_compress / gzip_compress /
+//               deflate_stored keep writing stored blocks only (byte-exact
+//               output other code relies on).
 //   checksums:  crc32, adler32
 //
 // Usage:
@@ -17,7 +18,7 @@
 //   println(zlib_decompress(zlib_compress("abc")));
 
 module compress;
- use vec; use string;
+ use vec;
 // ─── Checksums ──────────────────────────────────────────────────────────
 
 fn z_crc_table() -> Vec {
@@ -163,6 +164,12 @@ fn st_push_u32_msb(out: & mut Vec, v: i64) -> void {
 }
 
 /// zlib-compress a string's bytes.
+///
+/// Example:
+///   assert_eq(crc32("hello"), 907060870);
+///   assert_eq(adler32("abc"), 38600999);
+///   assert_eq(zlib_decompress_str(zlib_compress("hello, zlib")), "hello, zlib");
+///   assert_eq(gzip_decompress_str(gzip_compress("hello, gzip")), "hello, gzip");
 pub fn zlib_compress(s: str) -> Vec {
     var b: Vec = Vec::new();
     var i: i64 = 0;
@@ -801,4 +808,728 @@ pub fn zlib_decompress_str(data: Vec) -> str {
 
 pub fn gzip_decompress_str(data: Vec) -> str {
     return str_from_bytes(gzip_decompress(data));
+}
+
+// ─── Compressing DEFLATE writer (LZ77 + Huffman) ────────────────────────
+//
+// `deflate_compress(bytes, level)`: LZ77 over a 32 KiB window (hash chains
+// on 3-byte prefixes; level 1-3 greedy, 4-9 lazy as zlib's deflate_slow),
+// then per block of up to 16384 tokens the smallest of a dynamic-Huffman
+// block (code lengths limited to 15 bits, code-length code to 7, the
+// lengths run-length coded with 16/17/18), a fixed-Huffman block and
+// stored blocks. Level 0 is `deflate_stored`. Every inflater (zlib, gzip,
+// .zip, `inflate` above) reads the output; the stored-only writers above
+// keep their byte-exact output.
+
+struct ZBitW {
+    out: Vec,
+    acc: i64,
+    nbits: i64,
+}
+
+fn zw_new() -> ZBitW {
+    return ZBitW { out: Vec::new(), acc: 0, nbits: 0 };
+}
+
+// Put the low `n` bits of `v`, least significant first.
+fn zw_put(w: & mut ZBitW, v: i64, n: i64) -> void {
+    if n <= 0 {
+        return;
+    }
+    w.acc = w.acc | ((v & ((1 << n) - 1)) << w.nbits);
+    w.nbits = w.nbits + n;
+    while w.nbits >= 8 {
+        w.out.push(w.acc & 255);
+        w.acc = w.acc >> 8;
+        w.nbits = w.nbits - 8;
+    }
+}
+
+// Pad to a byte boundary with zero bits.
+fn zw_align(w: & mut ZBitW) -> void {
+    if w.nbits > 0 {
+        w.out.push(w.acc & 255);
+        w.acc = 0;
+        w.nbits = 0;
+    }
+}
+
+// Put a Huffman code (`len` bits, most significant bit first on the wire).
+fn zw_code(w: & mut ZBitW, code: i64, len: i64) -> void {
+    var rev: i64 = 0;
+    var i: i64 = 0;
+    while i < len {
+        rev = (rev << 1) | ((code >> i) & 1);
+        i = i + 1;
+    }
+    zw_put(w, rev, len);
+}
+
+// LZ77 state: the input, the hash chains and the last match found.
+struct ZLz {
+    data: Vec,
+    n: i64,
+    head: Vec,
+    prev: Vec,
+    chain: i64,
+    nice: i64,
+    ml: i64,
+    md: i64,
+}
+
+fn zl_hash(d: Vec, p: i64) -> i64 {
+    return ((d.get(p) << 10) ^ (d.get(p + 1) << 5) ^ d.get(p + 2)) & 32767;
+}
+
+fn zl_insert(s: & mut ZLz, p: i64) -> void {
+    if p + 3 > s.n {
+        return;
+    }
+    var h: i64 = zl_hash(s.data, p);
+    s.prev.set(p & 32767, s.head.get(h));
+    s.head.set(h, p);
+}
+
+// Longest match for position p among earlier positions (s.ml, s.md;
+// s.ml < 3 when there is none). Does not insert p.
+fn zl_find(s: & mut ZLz, p: i64) -> void {
+    s.ml = 0;
+    s.md = 0;
+    if p + 3 > s.n {
+        return;
+    }
+    var maxlen: i64 = s.n - p;
+    if maxlen > 258 {
+        maxlen = 258;
+    }
+    var best: i64 = 2;
+    var cand: i64 = s.head.get(zl_hash(s.data, p));
+    var chain: i64 = s.chain;
+    while cand >= 0 && chain > 0 {
+        if p - cand > 32768 || cand >= p {
+            break;
+        }
+        if s.data.get(cand + best) == s.data.get(p + best) && s.data.get(cand) == s.data.get(p) {
+            var l: i64 = 0;
+            while l < maxlen && s.data.get(cand + l) == s.data.get(p + l) {
+                l = l + 1;
+            }
+            if l > best {
+                best = l;
+                s.ml = l;
+                s.md = p - cand;
+                if l >= s.nice || l >= maxlen {
+                    break;
+                }
+            }
+        }
+        var next: i64 = s.prev.get(cand & 32767);
+        if next >= cand {
+            break;
+        }
+        cand = next;
+        chain = chain - 1;
+    }
+    if s.ml < 3 {
+        s.ml = 0;
+        s.md = 0;
+    }
+}
+
+// A token: a literal byte (0..255) or a match `(len << 16) | dist`.
+fn zl_tokens(bytes: Vec, level: i64) -> Vec {
+    var n: i64 = bytes.len();
+    var chains: Vec = Vec::new();
+    chains.push(4);
+    chains.push(8);
+    chains.push(16);
+    chains.push(16);
+    chains.push(32);
+    chains.push(128);
+    chains.push(256);
+    chains.push(1024);
+    chains.push(4096);
+    var lv: i64 = level;
+    if lv < 1 {
+        lv = 1;
+    }
+    if lv > 9 {
+        lv = 9;
+    }
+    var nice: i64 = 258;
+    if lv <= 3 {
+        nice = 32;
+    } else if lv <= 6 {
+        nice = 128;
+    }
+    var data: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        data.push(bytes.get(i) & 255);
+        i = i + 1;
+    }
+    var s: ZLz = ZLz {
+        data: data, n: n, head: Vec::filled(32768, - 1), prev: Vec::filled(32768, - 1), chain: chains.get(lv - 1), nice: nice, ml: 0, md: 0,
+    };
+    var toks: Vec = Vec::new();
+    var pos: i64 = 0;
+    if lv <= 3 {
+        while pos < n {
+            zl_find(& mut s, pos);
+            if s.ml >= 3 {
+                toks.push((s.ml << 16) | s.md);
+                var end: i64 = pos + s.ml;
+                while pos < end {
+                    zl_insert(& mut s, pos);
+                    pos = pos + 1;
+                }
+            } else {
+                toks.push(s.data.get(pos));
+                zl_insert(& mut s, pos);
+                pos = pos + 1;
+            }
+        }
+        return toks;
+    }
+    // lazy: a match is taken only when the next position has no longer one
+    var prev_len: i64 = 0;
+    var prev_dist: i64 = 0;
+    var prev_avail: bool = false;
+    while pos < n {
+        zl_find(& mut s, pos);
+        var ml: i64 = s.ml;
+        var md: i64 = s.md;
+        zl_insert(& mut s, pos);
+        if prev_len >= 3 && ml <= prev_len {
+            toks.push((prev_len << 16) | prev_dist);
+            var end2: i64 = pos - 1 + prev_len;
+            var k: i64 = pos + 1;
+            while k < end2 {
+                zl_insert(& mut s, k);
+                k = k + 1;
+            }
+            pos = end2;
+            prev_len = 0;
+            prev_dist = 0;
+            prev_avail = false;
+        } else {
+            if prev_avail {
+                toks.push(s.data.get(pos - 1));
+            }
+            prev_len = ml;
+            prev_dist = md;
+            prev_avail = true;
+            pos = pos + 1;
+        }
+    }
+    if prev_avail {
+        toks.push(s.data.get(n - 1));
+    }
+    return toks;
+}
+
+// Length 3..258 -> length code index 0..28 (symbol 257 + index).
+fn zh_len_index(len: i64, lb: Vec) -> i64 {
+    if len >= 258 {
+        return 28;
+    }
+    var i: i64 = 27;
+    while i > 0 && lb.get(i) > len {
+        i = i - 1;
+    }
+    return i;
+}
+
+// Distance 1..32768 -> distance code 0..29.
+fn zh_dist_index(dist: i64, db: Vec) -> i64 {
+    var i: i64 = 29;
+    while i > 0 && db.get(i) > dist {
+        i = i - 1;
+    }
+    return i;
+}
+
+// Huffman code lengths for `freq` (n symbols), none longer than `limit`.
+// Unused symbols get 0; at least two symbols get a length (a lone symbol
+// is paired with another so the code is complete).
+fn zh_lengths(freq: Vec, n: i64, limit: i64) -> Vec {
+    var f: Vec = Vec::new();
+    var used: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        f.push(freq.get(i));
+        if freq.get(i) > 0 {
+            used = used + 1;
+        }
+        i = i + 1;
+    }
+    if used < 2 {
+        // one or no symbol: lengths 1 for it and a neighbour
+        var lens0: Vec = Vec::filled(n, 0);
+        var first: i64 = - 1;
+        i = 0;
+        while i < n {
+            if f.get(i) > 0 && first < 0 {
+                first = i;
+            }
+            i = i + 1;
+        }
+        if first < 0 {
+            first = 0;
+        }
+        lens0.set(first, 1);
+        if first == 0 {
+            lens0.set(1, 1);
+        } else {
+            lens0.set(0, 1);
+        }
+        return lens0;
+    }
+    while true {
+        // nodes: leaves for used symbols, then internal ones
+        var w: Vec = Vec::new();
+        var parent: Vec = Vec::new();
+        var alive: Vec = Vec::new();
+        var sym_node: Vec = Vec::filled(n, - 1);
+        i = 0;
+        while i < n {
+            if f.get(i) > 0 {
+                sym_node.set(i, w.len());
+                w.push(f.get(i));
+                parent.push(- 1);
+                alive.push(1);
+            }
+            i = i + 1;
+        }
+        var left: i64 = used;
+        while left > 1 {
+            var a: i64 = - 1;
+            var b: i64 = - 1;
+            var j: i64 = 0;
+            while j < w.len() {
+                if alive.get(j) == 1 {
+                    if a < 0 || w.get(j) < w.get(a) {
+                        b = a;
+                        a = j;
+                    } else if b < 0 || w.get(j) < w.get(b) {
+                        b = j;
+                    }
+                }
+                j = j + 1;
+            }
+            alive.set(a, 0);
+            alive.set(b, 0);
+            parent.set(a, w.len());
+            parent.set(b, w.len());
+            w.push(w.get(a) + w.get(b));
+            parent.push(- 1);
+            alive.push(1);
+            left = left - 1;
+        }
+        var lens: Vec = Vec::filled(n, 0);
+        var maxl: i64 = 0;
+        i = 0;
+        while i < n {
+            var nd: i64 = sym_node.get(i);
+            if nd >= 0 {
+                var d: i64 = 0;
+                while parent.get(nd) >= 0 {
+                    nd = parent.get(nd);
+                    d = d + 1;
+                }
+                lens.set(i, d);
+                if d > maxl {
+                    maxl = d;
+                }
+            }
+            i = i + 1;
+        }
+        if maxl <= limit {
+            return lens;
+        }
+        // too deep: flatten the frequencies and build again
+        i = 0;
+        while i < n {
+            if f.get(i) > 0 {
+                f.set(i, (f.get(i) >> 1) | 1);
+            }
+            i = i + 1;
+        }
+    }
+    return Vec::new();
+}
+
+// Canonical codes (RFC 1951 3.2.2) for code lengths `lens`.
+fn zh_codes(lens: Vec) -> Vec {
+    var bl_count: Vec = Vec::filled(16, 0);
+    var i: i64 = 0;
+    while i < lens.len() {
+        var l: i64 = lens.get(i);
+        if l > 0 {
+            bl_count.set(l, bl_count.get(l) + 1);
+        }
+        i = i + 1;
+    }
+    var next: Vec = Vec::filled(16, 0);
+    var code: i64 = 0;
+    var bits: i64 = 1;
+    while bits < 16 {
+        code = (code + bl_count.get(bits - 1)) << 1;
+        next.set(bits, code);
+        bits = bits + 1;
+    }
+    var codes: Vec = Vec::filled(lens.len(), 0);
+    i = 0;
+    while i < lens.len() {
+        var l2: i64 = lens.get(i);
+        if l2 > 0 {
+            codes.set(i, next.get(l2));
+            next.set(l2, next.get(l2) + 1);
+        }
+        i = i + 1;
+    }
+    return codes;
+}
+
+// The code-length sequence of a dynamic header, run-length coded: each
+// entry is `sym | (extra << 8)` (16: 3-6 repeats, 17: 3-10 zeros, 18:
+// 11-138 zeros).
+fn zh_rle(seq: Vec) -> Vec {
+    var out: Vec = Vec::new();
+    var n: i64 = seq.len();
+    var i: i64 = 0;
+    while i < n {
+        var l: i64 = seq.get(i);
+        var run: i64 = 1;
+        while i + run < n && seq.get(i + run) == l {
+            run = run + 1;
+        }
+        if l == 0 {
+            var left: i64 = run;
+            while left >= 11 {
+                var r: i64 = left;
+                if r > 138 {
+                    r = 138;
+                }
+                out.push(18 | ((r - 11) << 8));
+                left = left - r;
+            }
+            if left >= 3 {
+                out.push(17 | ((left - 3) << 8));
+                left = 0;
+            }
+            while left > 0 {
+                out.push(0);
+                left = left - 1;
+            }
+        } else {
+            out.push(l);
+            var left2: i64 = run - 1;
+            while left2 >= 3 {
+                var r2: i64 = left2;
+                if r2 > 6 {
+                    r2 = 6;
+                }
+                out.push(16 | ((r2 - 3) << 8));
+                left2 = left2 - r2;
+            }
+            while left2 > 0 {
+                out.push(l);
+                left2 = left2 - 1;
+            }
+        }
+        i = i + run;
+    }
+    return out;
+}
+
+fn zh_cl_extra_bits(sym: i64) -> i64 {
+    if sym == 16 {
+        return 2;
+    }
+    if sym == 17 {
+        return 3;
+    }
+    if sym == 18 {
+        return 7;
+    }
+    return 0;
+}
+
+// Bits of the token body (no header) with the given code lengths.
+fn zh_body_bits(toks: Vec, a: i64, b: i64, llen: Vec, dlen: Vec, lb: Vec, le: Vec, db: Vec, de: Vec) -> i64 {
+    var bits: i64 = llen.get(256);
+    var i: i64 = a;
+    while i < b {
+        var t: i64 = toks.get(i);
+        if t < 256 {
+            bits = bits + llen.get(t);
+        } else {
+            var li: i64 = zh_len_index(t >> 16, lb);
+            var di: i64 = zh_dist_index(t & 65535, db);
+            bits = bits + llen.get(257 + li) + le.get(li) + dlen.get(di) + de.get(di);
+        }
+        i = i + 1;
+    }
+    return bits;
+}
+
+fn zh_write_body(w: & mut ZBitW, toks: Vec, a: i64, b: i64, llen: Vec, lcode: Vec, dlen: Vec, dcode: Vec, lb: Vec, le: Vec, db: Vec, de: Vec) -> void {
+    var i: i64 = a;
+    while i < b {
+        var t: i64 = toks.get(i);
+        if t < 256 {
+            zw_code(w, lcode.get(t), llen.get(t));
+        } else {
+            var len: i64 = t >> 16;
+            var dist: i64 = t & 65535;
+            var li: i64 = zh_len_index(len, lb);
+            zw_code(w, lcode.get(257 + li), llen.get(257 + li));
+            zw_put(w, len - lb.get(li), le.get(li));
+            var di: i64 = zh_dist_index(dist, db);
+            zw_code(w, dcode.get(di), dlen.get(di));
+            zw_put(w, dist - db.get(di), de.get(di));
+        }
+        i = i + 1;
+    }
+    zw_code(w, lcode.get(256), llen.get(256));
+}
+
+// Write tokens a..b (covering input bytes ba..bb) as one block, or as
+// stored blocks when that is smaller.
+fn zh_block(w: & mut ZBitW, data: Vec, toks: Vec, a: i64, b: i64, ba: i64, bb: i64, last: bool, lb: Vec, le: Vec, db: Vec, de: Vec) -> void {
+    var lfreq: Vec = Vec::filled(286, 0);
+    var dfreq: Vec = Vec::filled(30, 0);
+    lfreq.set(256, 1);
+    var i: i64 = a;
+    while i < b {
+        var t: i64 = toks.get(i);
+        if t < 256 {
+            lfreq.set(t, lfreq.get(t) + 1);
+        } else {
+            var li: i64 = 257 + zh_len_index(t >> 16, lb);
+            lfreq.set(li, lfreq.get(li) + 1);
+            var di: i64 = zh_dist_index(t & 65535, db);
+            dfreq.set(di, dfreq.get(di) + 1);
+        }
+        i = i + 1;
+    }
+    // dynamic code
+    var dl: Vec = zh_lengths(lfreq, 286, 15);
+    var dd: Vec = zh_lengths(dfreq, 30, 15);
+    var hlit: i64 = 286;
+    while hlit > 257 && dl.get(hlit - 1) == 0 {
+        hlit = hlit - 1;
+    }
+    var hdist: i64 = 30;
+    while hdist > 1 && dd.get(hdist - 1) == 0 {
+        hdist = hdist - 1;
+    }
+    var seq: Vec = Vec::new();
+    i = 0;
+    while i < hlit {
+        seq.push(dl.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < hdist {
+        seq.push(dd.get(i));
+        i = i + 1;
+    }
+    var rle: Vec = zh_rle(seq);
+    var cfreq: Vec = Vec::filled(19, 0);
+    i = 0;
+    while i < rle.len() {
+        var cs: i64 = rle.get(i) & 255;
+        cfreq.set(cs, cfreq.get(cs) + 1);
+        i = i + 1;
+    }
+    var cl: Vec = zh_lengths(cfreq, 19, 7);
+    var order: Vec = z_cl_order();
+    var hclen: i64 = 19;
+    while hclen > 4 && cl.get(order.get(hclen - 1)) == 0 {
+        hclen = hclen - 1;
+    }
+    var dyn_bits: i64 = 3 + 14 + 3 * hclen + zh_body_bits(toks, a, b, dl, dd, lb, le, db, de);
+    i = 0;
+    while i < rle.len() {
+        var rs: i64 = rle.get(i) & 255;
+        dyn_bits = dyn_bits + cl.get(rs) + zh_cl_extra_bits(rs);
+        i = i + 1;
+    }
+    // fixed code
+    var fx: TwoLens = z_fixed();
+    var fix_bits: i64 = 3 + zh_body_bits(toks, a, b, fx.lit, fx.dist, lb, le, db, de);
+    // stored: 5 header bytes per 65535-byte chunk plus the bytes
+    var nraw: i64 = bb - ba;
+    var chunks: i64 = (nraw + 65534) / 65535;
+    if chunks == 0 {
+        chunks = 1;
+    }
+    var stored_bits: i64 = (nraw + 5 * chunks) * 8 + 7;
+    if stored_bits < dyn_bits && stored_bits < fix_bits {
+        var pos: i64 = ba;
+        var first: bool = true;
+        while first || pos < bb {
+            first = false;
+            var chunk: i64 = bb - pos;
+            if chunk > 65535 {
+                chunk = 65535;
+            }
+            var fin: i64 = 0;
+            if last && pos + chunk >= bb {
+                fin = 1;
+            }
+            zw_put(w, fin, 1);
+            zw_put(w, 0, 2);
+            zw_align(w);
+            w.out.push(chunk & 255);
+            w.out.push((chunk >> 8) & 255);
+            w.out.push((65535 - chunk) & 255);
+            w.out.push(((65535 - chunk) >> 8) & 255);
+            var k: i64 = 0;
+            while k < chunk {
+                w.out.push(data.get(pos + k) & 255);
+                k = k + 1;
+            }
+            pos = pos + chunk;
+        }
+        return;
+    }
+    var finbit: i64 = 0;
+    if last {
+        finbit = 1;
+    }
+    zw_put(w, finbit, 1);
+    if fix_bits <= dyn_bits {
+        zw_put(w, 1, 2);
+        zh_write_body(w, toks, a, b, fx.lit, zh_codes(fx.lit), fx.dist, zh_codes(fx.dist), lb, le, db, de);
+        return;
+    }
+    zw_put(w, 2, 2);
+    zw_put(w, hlit - 257, 5);
+    zw_put(w, hdist - 1, 5);
+    zw_put(w, hclen - 4, 4);
+    i = 0;
+    while i < hclen {
+        zw_put(w, cl.get(order.get(i)), 3);
+        i = i + 1;
+    }
+    var ccode: Vec = zh_codes(cl);
+    i = 0;
+    while i < rle.len() {
+        var e: i64 = rle.get(i);
+        var sym: i64 = e & 255;
+        zw_code(w, ccode.get(sym), cl.get(sym));
+        zw_put(w, e >> 8, zh_cl_extra_bits(sym));
+        i = i + 1;
+    }
+    zh_write_body(w, toks, a, b, dl, zh_codes(dl), dd, zh_codes(dd), lb, le, db, de);
+}
+
+/// Compress `bytes` into a raw DEFLATE stream (RFC 1951). `level` 0 is
+/// stored blocks only (`deflate_stored`); 1-9 trade speed for size as in
+/// zlib (1-3 greedy matching, 4-9 lazy, longer hash chains as the level
+/// rises). Each block is written as dynamic Huffman, fixed Huffman or
+/// stored, whichever is smallest.
+///
+/// Example:
+///   var text: Vec = Vec::new();
+///   var i: i64 = 0;
+///   while i < 600 { text.push(97 + (i % 3)); i = i + 1; }
+///   var z: Vec = deflate_compress(text, 6);
+///   assert(z.len() < 30);
+///   assert_eq(inflate(z).len(), 600);
+pub fn deflate_compress(bytes: Vec, level: i64) -> Vec {
+    if level <= 0 {
+        return deflate_stored(bytes);
+    }
+    var lb: Vec = z_len_base();
+    var le: Vec = z_len_extra();
+    var db: Vec = z_dist_base();
+    var de: Vec = z_dist_extra();
+    var toks: Vec = zl_tokens(bytes, level);
+    var w: ZBitW = zw_new();
+    var nt: i64 = toks.len();
+    var a: i64 = 0;
+    var ba: i64 = 0;
+    while true {
+        var b: i64 = a + 16384;
+        if b > nt {
+            b = nt;
+        }
+        // input bytes the tokens a..b cover
+        var bb: i64 = ba;
+        var i: i64 = a;
+        while i < b {
+            var t: i64 = toks.get(i);
+            if t < 256 {
+                bb = bb + 1;
+            } else {
+                bb = bb + (t >> 16);
+            }
+            i = i + 1;
+        }
+        var last: bool = b >= nt;
+        zh_block(& mut w, bytes, toks, a, b, ba, bb, last, lb, le, db, de);
+        if last {
+            break;
+        }
+        a = b;
+        ba = bb;
+    }
+    zw_align(& mut w);
+    return w.out;
+}
+
+/// zlib stream (RFC 1950) of `bytes` compressed at `level` (0-9).
+pub fn zlib_compress_level(bytes: Vec, level: i64) -> Vec {
+    var out: Vec = Vec::new();
+    out.push(0x78);
+    // FLEVEL as zlib writes it; each header is a multiple of 31
+    if level <= 1 {
+        out.push(0x01);
+    } else if level <= 5 {
+        out.push(0x5E);
+    } else if level == 6 {
+        out.push(0x9C);
+    } else {
+        out.push(0xDA);
+    }
+    var body: Vec = deflate_compress(bytes, level);
+    var i: i64 = 0;
+    while i < body.len() {
+        out.push(body.get(i));
+        i = i + 1;
+    }
+    st_push_u32_msb(& mut out, adler32_bytes(bytes));
+    return out;
+}
+
+/// gzip member (RFC 1952) of `bytes` compressed at `level` (0-9).
+pub fn gzip_compress_level(bytes: Vec, level: i64) -> Vec {
+    var out: Vec = Vec::new();
+    out.push(0x1F);
+    out.push(0x8B);
+    out.push(8);
+    out.push(0);
+    st_push_u32(& mut out, 0);
+    // XFL: 2 = slowest, 4 = fastest
+    if level >= 9 {
+        out.push(2);
+    } else if level == 1 {
+        out.push(4);
+    } else {
+        out.push(0);
+    }
+    out.push(255);
+    var body: Vec = deflate_compress(bytes, level);
+    var i: i64 = 0;
+    while i < body.len() {
+        out.push(body.get(i));
+        i = i + 1;
+    }
+    st_push_u32(& mut out, crc32_bytes(bytes));
+    st_push_u32(& mut out, bytes.len() % 4294967296);
+    return out;
 }

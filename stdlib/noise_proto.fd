@@ -1,0 +1,781 @@
+// Fides Noise Protocol Framework (revision 34): CipherState,
+// SymmetricState and HandshakeState (§5), the twelve fundamental
+// interactive patterns NN NK NX XN XK XX KN KK KX IN IK IX (§7.4) with
+// the psk0..psk3 modifiers (§9), transport messages after Split, and
+// Rekey (§11.3). Also BLAKE2s (RFC 7693, keyed and unkeyed, any output
+// length 1..32), which Noise's BLAKE2s hash and WireGuard use.
+//
+// Protocol names: Noise_<pattern>_25519_<cipher>_<hash>, with cipher
+// ChaChaPoly (chacha20poly1305.fd, nonce = 4 zero bytes || 64-bit
+// little-endian counter) or AESGCM (aes_gcm.fd, 4 zero bytes || 64-bit
+// big-endian counter), and hash SHA256 (crypto.fd), SHA512 (sha512.fd)
+// or BLAKE2s (here). DH is X25519 (x25519.fd); a DH result of all zeros
+// (a low-order public key) fails the handshake. 448 and BLAKE2b are not
+// supported.
+//
+// Pure computation over bytes: messages go in and out as Vec<i64>, the
+// transport (TCP, UDP, a pipe) is the caller's. The seam is randomness:
+// ephemeral keys come from crypto_random_bytes(32) unless the caller sets
+// the next one with noise_set_ephemeral (tests, and test vectors).
+//
+// Checked in tests/bootstrap/test_std_noise_proto.fd against RFC 7693
+// (BLAKE2s "abc") and Python's hashlib (keyed BLAKE2s), and against an
+// independent Node.js (OpenSSL) implementation of the framework for
+// NN, NK, XX and IK with fixed keys: every handshake message, the
+// handshake hash and the first transport messages byte-exact.
+//
+// Usage:
+//   use noise_proto;
+//   var i = noise_handshake_new("Noise_XX_25519_ChaChaPoly_SHA256", true, prologue, s_i, Vec::new(), Vec::new());
+//   var r = noise_handshake_new("Noise_XX_25519_ChaChaPoly_SHA256", false, prologue, s_r, Vec::new(), Vec::new());
+//   val m1 = noise_write_message(& mut i, Vec::new());
+//   val p1 = noise_read_message(& mut r, m1);          // p1.ok, p1.data
+//   ... until noise_handshake_done(& i)
+//   val t = noise_split(& i);                          // t.send, t.recv, t.hash
+//   var send = t.send;
+//   val ct = noise_encrypt(& mut send, Vec::new(), plain);
+
+module noise_proto;
+use vec;
+use crypto;
+use sha512;
+use x25519;
+use chacha20poly1305;
+use aes_gcm;
+
+pub const NOISE_SHA256: i64 = 1;
+pub const NOISE_SHA512: i64 = 2;
+pub const NOISE_BLAKE2S: i64 = 3;
+pub const NOISE_CHACHAPOLY: i64 = 1;
+pub const NOISE_AESGCM: i64 = 2;
+/// Largest Noise message (§3).
+pub const NOISE_MAX_MSG: i64 = 65535;
+
+/// Bytes with a success flag.
+pub struct NoiseBytes {
+    pub ok: bool,
+    pub data: Vec<i64>,
+}
+
+/// A CipherState (§5.1): key k (empty = none) and nonce n.
+pub struct NoiseCipher {
+    pub k: Vec<i64>,
+    pub n: i64,
+    pub cipher: i64,
+}
+
+/// The two transport ciphers after Split, oriented for one side, and the
+/// handshake hash (for channel binding).
+pub struct NoiseTransport {
+    pub ok: bool,
+    pub send: NoiseCipher,
+    pub recv: NoiseCipher,
+    pub hash: Vec<i64>,
+}
+
+/// A HandshakeState (§5.3) with its SymmetricState (§5.2) folded in.
+pub struct NoiseHandshake {
+    pub ok: bool,
+    pub err: str,
+    pub initiator: bool,
+    pub hash: i64,
+    pub cipher: i64,
+    pub ck: Vec<i64>,
+    pub h: Vec<i64>,
+    pub k: Vec<i64>,
+    pub n: i64,
+    pub s: Vec<i64>,
+    pub s_pub: Vec<i64>,
+    pub e: Vec<i64>,
+    pub e_pub: Vec<i64>,
+    pub rs: Vec<i64>,
+    pub re: Vec<i64>,
+    pub psk: Vec<i64>,
+    pub has_psk: bool,
+    pub msgs: Vec<str>,
+    pub idx: i64,
+    pub e_next: Vec<i64>,
+}
+
+fn noise_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    return out;
+}
+
+fn noise_slice(v: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { o.push(v.get(i)); i = i + 1; }
+    return o;
+}
+
+fn noise_zeros(n: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { o.push(0); i = i + 1; }
+    return o;
+}
+
+// ─── BLAKE2s (RFC 7693) ────────────────────────────────────────────────
+
+fn b2s_iv(i: i64) -> i64 {
+    if i == 0 { return 0x6a09e667; }
+    if i == 1 { return 0xbb67ae85; }
+    if i == 2 { return 0x3c6ef372; }
+    if i == 3 { return 0xa54ff53a; }
+    if i == 4 { return 0x510e527f; }
+    if i == 5 { return 0x9b05688c; }
+    if i == 6 { return 0x1f83d9ab; }
+    return 0x5be0cd19;
+}
+
+fn b2s_sigma() -> Vec<i64> {
+    var t: str = "";
+    t = t + "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 ";
+    t = t + "14 10 4 8 9 15 13 6 1 12 0 2 11 7 5 3 ";
+    t = t + "11 8 12 0 5 2 15 13 10 14 3 6 7 1 9 4 ";
+    t = t + "7 9 3 1 13 12 11 14 2 6 5 10 4 0 15 8 ";
+    t = t + "9 0 5 7 2 4 10 15 14 1 11 12 6 8 3 13 ";
+    t = t + "2 12 6 10 0 11 8 3 4 13 7 5 15 14 1 9 ";
+    t = t + "12 5 1 15 14 13 4 10 0 7 6 3 9 2 8 11 ";
+    t = t + "13 11 7 14 12 1 3 9 5 0 15 4 8 6 2 10 ";
+    t = t + "6 15 14 9 11 3 0 8 12 2 13 7 1 4 10 5 ";
+    t = t + "10 2 8 4 7 6 1 5 15 11 9 14 3 12 13 0 ";
+    val parts: Vec<str> = str_split(str_trim(t), " ");
+    var out: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < parts.len() { out.push(str_parse_int(parts.get(j))); j = j + 1; }
+    return out;
+}
+
+fn b2s_rotr(x: i64, n: i64) -> i64 {
+    return ((x >> n) | (x << (32 - n))) & 0xffffffff;
+}
+
+fn b2s_g(v: & mut Vec<i64>, a: i64, b: i64, c: i64, d: i64, x: i64, y: i64) {
+    v.set(a, (v.get(a) + v.get(b) + x) & 0xffffffff);
+    v.set(d, b2s_rotr(v.get(d) ^ v.get(a), 16));
+    v.set(c, (v.get(c) + v.get(d)) & 0xffffffff);
+    v.set(b, b2s_rotr(v.get(b) ^ v.get(c), 12));
+    v.set(a, (v.get(a) + v.get(b) + y) & 0xffffffff);
+    v.set(d, b2s_rotr(v.get(d) ^ v.get(a), 8));
+    v.set(c, (v.get(c) + v.get(d)) & 0xffffffff);
+    v.set(b, b2s_rotr(v.get(b) ^ v.get(c), 7));
+}
+
+fn b2s_compress(h: & mut Vec<i64>, sigma: & Vec<i64>, block: & Vec<i64>, off: i64, t: i64, last: bool) {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        val p: i64 = off + i * 4;
+        m.push(block.get(p) | (block.get(p + 1) << 8) | (block.get(p + 2) << 16) | (block.get(p + 3) << 24));
+        i = i + 1;
+    }
+    var v: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 { v.push(h.get(i)); i = i + 1; }
+    i = 0;
+    while i < 8 { v.push(b2s_iv(i)); i = i + 1; }
+    v.set(12, v.get(12) ^ (t & 0xffffffff));
+    v.set(13, v.get(13) ^ ((t >> 32) & 0xffffffff));
+    if last { v.set(14, v.get(14) ^ 0xffffffff); }
+    var r: i64 = 0;
+    while r < 10 {
+        val s: i64 = r * 16;
+        b2s_g(& mut v, 0, 4, 8, 12, m.get(sigma.get(s)), m.get(sigma.get(s + 1)));
+        b2s_g(& mut v, 1, 5, 9, 13, m.get(sigma.get(s + 2)), m.get(sigma.get(s + 3)));
+        b2s_g(& mut v, 2, 6, 10, 14, m.get(sigma.get(s + 4)), m.get(sigma.get(s + 5)));
+        b2s_g(& mut v, 3, 7, 11, 15, m.get(sigma.get(s + 6)), m.get(sigma.get(s + 7)));
+        b2s_g(& mut v, 0, 5, 10, 15, m.get(sigma.get(s + 8)), m.get(sigma.get(s + 9)));
+        b2s_g(& mut v, 1, 6, 11, 12, m.get(sigma.get(s + 10)), m.get(sigma.get(s + 11)));
+        b2s_g(& mut v, 2, 7, 8, 13, m.get(sigma.get(s + 12)), m.get(sigma.get(s + 13)));
+        b2s_g(& mut v, 3, 4, 9, 14, m.get(sigma.get(s + 14)), m.get(sigma.get(s + 15)));
+        r = r + 1;
+    }
+    i = 0;
+    while i < 8 {
+        h.set(i, h.get(i) ^ v.get(i) ^ v.get(i + 8));
+        i = i + 1;
+    }
+}
+
+/// BLAKE2s with an optional key (0..32 bytes) and `outlen` (1..32)
+/// output bytes; empty on bad parameters.
+pub fn noise_blake2s(key: Vec<i64>, msg: Vec<i64>, outlen: i64) -> Vec<i64> {
+    if outlen < 1 || outlen > 32 || key.len() > 32 { return Vec::new(); }
+    var h: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 { h.push(b2s_iv(i)); i = i + 1; }
+    h.set(0, h.get(0) ^ 0x01010000 ^ (key.len() << 8) ^ outlen);
+    var data: Vec<i64> = Vec::new();
+    if key.len() > 0 {
+        data = noise_cat(key, noise_zeros(64 - key.len()));
+    }
+    i = 0;
+    while i < msg.len() { data.push(msg.get(i) & 255); i = i + 1; }
+    val total: i64 = data.len();
+    var blocks: i64 = (total + 63) / 64;
+    if blocks == 0 { blocks = 1; }
+    while data.len() < blocks * 64 { data.push(0); }
+    val sigma: Vec<i64> = b2s_sigma();
+    var b: i64 = 0;
+    while b < blocks {
+        val last: bool = b == blocks - 1;
+        var t: i64 = (b + 1) * 64;
+        if last { t = total; }
+        b2s_compress(& mut h, & sigma, & data, b * 64, t, last);
+        b = b + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < outlen {
+        out.push((h.get(i / 4) >> ((i % 4) * 8)) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Hash functions, HMAC and HKDF (§4.3) ──────────────────────────────
+
+/// HASH(data) for a hash id.
+pub fn noise_hash(hash: i64, data: Vec<i64>) -> Vec<i64> {
+    if hash == NOISE_SHA512 { return sha512_bytes(data); }
+    if hash == NOISE_BLAKE2S { return noise_blake2s(Vec::new(), data, 32); }
+    return crypto_sha256_bytes(data);
+}
+
+/// HASHLEN.
+pub fn noise_hash_len(hash: i64) -> i64 {
+    if hash == NOISE_SHA512 { return 64; }
+    return 32;
+}
+
+/// HMAC-HASH (RFC 2104) with the hash's block length.
+pub fn noise_hmac(hash: i64, key: Vec<i64>, data: Vec<i64>) -> Vec<i64> {
+    var bl: i64 = 64;
+    if hash == NOISE_SHA512 { bl = 128; }
+    var kb: Vec<i64> = key;
+    if kb.len() > bl { kb = noise_hash(hash, kb); }
+    while kb.len() < bl { kb.push(0); }
+    var inner: Vec<i64> = Vec::new();
+    var outer: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < bl {
+        inner.push(kb.get(i) ^ 0x36);
+        outer.push(kb.get(i) ^ 0x5c);
+        i = i + 1;
+    }
+    return noise_hash(hash, noise_cat(outer, noise_hash(hash, noise_cat(inner, data))));
+}
+
+/// HKDF(chaining_key, input_key_material, num_outputs): the outputs
+/// concatenated (2 or 3 times HASHLEN bytes).
+pub fn noise_hkdf(hash: i64, ck: Vec<i64>, ikm: Vec<i64>, num: i64) -> Vec<i64> {
+    val temp: Vec<i64> = noise_hmac(hash, ck, ikm);
+    var one: Vec<i64> = Vec::new();
+    one.push(1);
+    val o1: Vec<i64> = noise_hmac(hash, temp, one);
+    var two: Vec<i64> = o1;
+    two.push(2);
+    val o2: Vec<i64> = noise_hmac(hash, temp, two);
+    var out: Vec<i64> = noise_cat(o1, o2);
+    if num == 3 {
+        var three: Vec<i64> = o2;
+        three.push(3);
+        out = noise_cat(out, noise_hmac(hash, temp, three));
+    }
+    return out;
+}
+
+// ─── CipherState (§5.1) ────────────────────────────────────────────────
+
+/// A cipher state holding key `k` (32 bytes) with nonce 0.
+pub fn noise_cipher_new(cipher: i64, k: Vec<i64>) -> NoiseCipher {
+    return NoiseCipher { k: k, n: 0, cipher: cipher };
+}
+
+fn noise_nonce(cipher: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = noise_zeros(4);
+    var i: i64 = 0;
+    while i < 8 {
+        if cipher == NOISE_AESGCM {
+            out.push((n >> ((7 - i) * 8)) & 255);
+        } else {
+            out.push((n >> (i * 8)) & 255);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The all-ones nonce 2^64 - 1 that Rekey uses.
+fn noise_max_nonce() -> Vec<i64> {
+    var out: Vec<i64> = noise_zeros(4);
+    var i: i64 = 0;
+    while i < 8 { out.push(255); i = i + 1; }
+    return out;
+}
+
+fn noise_aead_seal(cipher: i64, k: Vec<i64>, nonce: Vec<i64>, ad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    if cipher == NOISE_AESGCM { return aes_gcm_seal(k, nonce, ad, plain); }
+    return aead_chacha20poly1305_seal(k, nonce, ad, plain);
+}
+
+fn noise_aead_open(cipher: i64, k: Vec<i64>, nonce: Vec<i64>, ad: Vec<i64>, ct: Vec<i64>) -> NoiseBytes {
+    if cipher == NOISE_AESGCM {
+        val g: GcmOpened = aes_gcm_open(k, nonce, ad, ct);
+        return NoiseBytes { ok: g.ok, data: g.plain };
+    }
+    val o: AeadOpened = aead_chacha20poly1305_open(k, nonce, ad, ct);
+    return NoiseBytes { ok: o.ok, data: o.data };
+}
+
+/// ENCRYPT(k, n, ad, plaintext) with an explicit 64-bit nonce (WireGuard
+/// and other protocols that carry the counter in the packet).
+pub fn noise_encrypt_with_nonce(cipher: i64, k: Vec<i64>, n: i64, ad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    return noise_aead_seal(cipher, k, noise_nonce(cipher, n), ad, plain);
+}
+
+/// DECRYPT(k, n, ad, ciphertext) with an explicit nonce.
+pub fn noise_decrypt_with_nonce(cipher: i64, k: Vec<i64>, n: i64, ad: Vec<i64>, ct: Vec<i64>) -> NoiseBytes {
+    return noise_aead_open(cipher, k, noise_nonce(cipher, n), ad, ct);
+}
+
+/// EncryptWithAd: the plaintext unchanged when there is no key yet.
+pub fn noise_encrypt(c: & mut NoiseCipher, ad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    if c.k.len() == 0 { return plain; }
+    val ct: Vec<i64> = noise_encrypt_with_nonce(c.cipher, c.k, c.n, ad, plain);
+    c.n = c.n + 1;
+    return ct;
+}
+
+/// DecryptWithAd: the nonce advances only on success.
+pub fn noise_decrypt(c: & mut NoiseCipher, ad: Vec<i64>, ct: Vec<i64>) -> NoiseBytes {
+    if c.k.len() == 0 { return NoiseBytes { ok: true, data: ct }; }
+    val o: NoiseBytes = noise_decrypt_with_nonce(c.cipher, c.k, c.n, ad, ct);
+    if o.ok { c.n = c.n + 1; }
+    return o;
+}
+
+/// REKEY(k): the first 32 bytes of ENCRYPT(k, 2^64 - 1, "", 32 zeros) (§4.2).
+pub fn noise_rekey_key(cipher: i64, k: Vec<i64>) -> Vec<i64> {
+    val ct: Vec<i64> = noise_aead_seal(cipher, k, noise_max_nonce(), Vec::new(), noise_zeros(32));
+    return noise_slice(& ct, 0, 32);
+}
+
+/// Rekey() of a cipher state; the nonce is kept (§11.3).
+pub fn noise_rekey(c: & mut NoiseCipher) {
+    if c.k.len() == 0 { return; }
+    c.k = noise_rekey_key(c.cipher, c.k);
+}
+
+// ─── Patterns (§7) ─────────────────────────────────────────────────────
+
+/// The message token lists of a fundamental pattern, each message as a
+/// comma-separated list; empty when the name is unknown. The first
+/// element is the pre-message line: "i:s", "r:s", "i:s r:s" or "".
+pub fn noise_pattern(name: str) -> Vec<str> {
+    var p: Vec<str> = Vec::new();
+    if str_equal(name, "NN") {
+        p.push("");
+        p.push("e");
+        p.push("e,ee");
+        return p;
+    }
+    if str_equal(name, "NK") {
+        p.push("r:s");
+        p.push("e,es");
+        p.push("e,ee");
+        return p;
+    }
+    if str_equal(name, "NX") {
+        p.push("");
+        p.push("e");
+        p.push("e,ee,s,es");
+        return p;
+    }
+    if str_equal(name, "XN") {
+        p.push("");
+        p.push("e");
+        p.push("e,ee");
+        p.push("s,se");
+        return p;
+    }
+    if str_equal(name, "XK") {
+        p.push("r:s");
+        p.push("e,es");
+        p.push("e,ee");
+        p.push("s,se");
+        return p;
+    }
+    if str_equal(name, "XX") {
+        p.push("");
+        p.push("e");
+        p.push("e,ee,s,es");
+        p.push("s,se");
+        return p;
+    }
+    if str_equal(name, "KN") {
+        p.push("i:s");
+        p.push("e");
+        p.push("e,ee,se");
+        return p;
+    }
+    if str_equal(name, "KK") {
+        p.push("i:s r:s");
+        p.push("e,es,ss");
+        p.push("e,ee,se");
+        return p;
+    }
+    if str_equal(name, "KX") {
+        p.push("i:s");
+        p.push("e");
+        p.push("e,ee,se,s,es");
+        return p;
+    }
+    if str_equal(name, "IN") {
+        p.push("");
+        p.push("e,s");
+        p.push("e,ee,se");
+        return p;
+    }
+    if str_equal(name, "IK") {
+        p.push("r:s");
+        p.push("e,es,s,ss");
+        p.push("e,ee,se");
+        return p;
+    }
+    if str_equal(name, "IX") {
+        p.push("");
+        p.push("e,s");
+        p.push("e,ee,se,s,es");
+        return p;
+    }
+    return p;
+}
+
+/// The pattern with "pskN" modifiers applied (e.g. "IKpsk2", "NNpsk0+psk2").
+pub fn noise_pattern_with_mods(full: str) -> Vec<str> {
+    var base: str = full;
+    var mods: str = "";
+    val at: i64 = str_find(full, "psk");
+    if at > 0 {
+        base = str_slice(full, 0, at);
+        mods = str_slice(full, at, str_len(full));
+    }
+    var p: Vec<str> = noise_pattern(base);
+    if p.len() == 0 || str_len(mods) == 0 { return p; }
+    val ms: Vec<str> = str_split(mods, "+");
+    var i: i64 = 0;
+    while i < ms.len() {
+        val m: str = ms.get(i);
+        if !str_starts_with(m, "psk") || str_len(m) != 4 { return Vec::new(); }
+        val num: i64 = str_byte_at(m, 3) - 48;
+        if num < 0 || num >= p.len() { return Vec::new(); }
+        if num == 0 {
+            p.set(1, "psk," + p.get(1));
+        } else {
+            p.set(num, p.get(num) + ",psk");
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+// ─── HandshakeState (§5.2, §5.3) ───────────────────────────────────────
+
+fn noise_mix_hash(hs: & mut NoiseHandshake, data: Vec<i64>) {
+    val h: Vec<i64> = noise_hash(hs.hash, noise_cat(hs.h, data));
+    hs.h = h;
+}
+
+fn noise_trunc32(k: Vec<i64>) -> Vec<i64> {
+    return noise_slice(& k, 0, 32);
+}
+
+fn noise_mix_key(hs: & mut NoiseHandshake, ikm: Vec<i64>) {
+    val hl: i64 = noise_hash_len(hs.hash);
+    val ck: Vec<i64> = hs.ck;
+    val out: Vec<i64> = noise_hkdf(hs.hash, ck, ikm, 2);
+    hs.ck = noise_slice(& out, 0, hl);
+    hs.k = noise_trunc32(noise_slice(& out, hl, 2 * hl));
+    hs.n = 0;
+}
+
+fn noise_mix_key_and_hash(hs: & mut NoiseHandshake, ikm: Vec<i64>) {
+    val hl: i64 = noise_hash_len(hs.hash);
+    val ck: Vec<i64> = hs.ck;
+    val out: Vec<i64> = noise_hkdf(hs.hash, ck, ikm, 3);
+    hs.ck = noise_slice(& out, 0, hl);
+    val th: Vec<i64> = noise_slice(& out, hl, 2 * hl);
+    noise_mix_hash(hs, th);
+    hs.k = noise_trunc32(noise_slice(& out, 2 * hl, 3 * hl));
+    hs.n = 0;
+}
+
+fn noise_encrypt_and_hash(hs: & mut NoiseHandshake, plain: Vec<i64>) -> Vec<i64> {
+    var ct: Vec<i64> = plain;
+    if hs.k.len() > 0 {
+        ct = noise_encrypt_with_nonce(hs.cipher, hs.k, hs.n, hs.h, plain);
+        hs.n = hs.n + 1;
+    }
+    noise_mix_hash(hs, ct);
+    return ct;
+}
+
+fn noise_decrypt_and_hash(hs: & mut NoiseHandshake, ct: Vec<i64>) -> NoiseBytes {
+    var r: NoiseBytes = NoiseBytes { ok: true, data: ct };
+    if hs.k.len() > 0 {
+        r = noise_decrypt_with_nonce(hs.cipher, hs.k, hs.n, hs.h, ct);
+        if !r.ok { return r; }
+        hs.n = hs.n + 1;
+    }
+    noise_mix_hash(hs, ct);
+    return r;
+}
+
+fn noise_fail_hs(err: str) -> NoiseHandshake {
+    return NoiseHandshake {
+        ok: false, err: err, initiator: false, hash: 0, cipher: 0,
+        ck: Vec::new(), h: Vec::new(), k: Vec::new(), n: 0,
+        s: Vec::new(), s_pub: Vec::new(), e: Vec::new(), e_pub: Vec::new(),
+        rs: Vec::new(), re: Vec::new(), psk: Vec::new(), has_psk: false,
+        msgs: Vec::new(), idx: 0, e_next: Vec::new()
+    };
+}
+
+/// Initialize(handshake_pattern, initiator, prologue, s, e, rs, re) for a
+/// protocol name. `s` is our 32-byte static private key (empty if the
+/// pattern sends none), `rs` the peer's static public key when the
+/// pattern has it as a pre-message (empty otherwise), `psk` 32 bytes when
+/// the name has psk modifiers. ok is false on an unsupported name or a
+/// missing key.
+pub fn noise_handshake_new(protocol: str, initiator: bool, prologue: Vec<i64>, s: Vec<i64>, rs: Vec<i64>, psk: Vec<i64>) -> NoiseHandshake {
+    val parts: Vec<str> = str_split(protocol, "_");
+    if parts.len() != 5 || !str_equal(parts.get(0), "Noise") || !str_equal(parts.get(2), "25519") {
+        return noise_fail_hs("unsupported protocol name");
+    }
+    var cipher: i64 = 0;
+    if str_equal(parts.get(3), "ChaChaPoly") { cipher = NOISE_CHACHAPOLY; }
+    if str_equal(parts.get(3), "AESGCM") { cipher = NOISE_AESGCM; }
+    var hash: i64 = 0;
+    if str_equal(parts.get(4), "SHA256") { hash = NOISE_SHA256; }
+    if str_equal(parts.get(4), "SHA512") { hash = NOISE_SHA512; }
+    if str_equal(parts.get(4), "BLAKE2s") { hash = NOISE_BLAKE2S; }
+    if cipher == 0 || hash == 0 { return noise_fail_hs("unsupported cipher or hash"); }
+    val pat: Vec<str> = noise_pattern_with_mods(parts.get(1));
+    if pat.len() == 0 { return noise_fail_hs("unsupported pattern"); }
+    val has_psk: bool = str_contains(parts.get(1), "psk");
+    if has_psk && psk.len() != 32 { return noise_fail_hs("psk must be 32 bytes"); }
+    var hs: NoiseHandshake = noise_fail_hs("");
+    hs.ok = true;
+    hs.initiator = initiator;
+    hs.hash = hash;
+    hs.cipher = cipher;
+    hs.s = s;
+    if s.len() == 32 { hs.s_pub = x25519_public_key(s); }
+    hs.rs = rs;
+    hs.psk = psk;
+    hs.has_psk = has_psk;
+    var msgs: Vec<str> = Vec::new();
+    var i: i64 = 1;
+    while i < pat.len() { msgs.push(pat.get(i)); i = i + 1; }
+    hs.msgs = msgs;
+    // InitializeSymmetric(protocol_name)
+    val name: Vec<i64> = str_bytes(protocol);
+    if name.len() <= noise_hash_len(hash) {
+        hs.h = noise_cat(name, noise_zeros(noise_hash_len(hash) - name.len()));
+    } else {
+        hs.h = noise_hash(hash, name);
+    }
+    hs.ck = hs.h;
+    noise_mix_hash(& mut hs, prologue);
+    // pre-messages: the initiator's first, then the responder's
+    val pre: str = pat.get(0);
+    if str_contains(pre, "i:s") {
+        val k1: Vec<i64> = hs.s_pub;
+        if initiator { noise_mix_hash(& mut hs, k1); } else { noise_mix_hash(& mut hs, rs); }
+        if (initiator && s.len() != 32) || (!initiator && rs.len() != 32) { return noise_fail_hs("pattern needs the initiator's static key"); }
+    }
+    if str_contains(pre, "r:s") {
+        val k2: Vec<i64> = hs.s_pub;
+        if initiator { noise_mix_hash(& mut hs, rs); } else { noise_mix_hash(& mut hs, k2); }
+        if (initiator && rs.len() != 32) || (!initiator && s.len() != 32) { return noise_fail_hs("pattern needs the responder's static key"); }
+    }
+    return hs;
+}
+
+/// Seam: the private key of the next ephemeral key this side generates
+/// (32 bytes). Without it, ephemeral keys come from crypto_random_bytes.
+pub fn noise_set_ephemeral(hs: & mut NoiseHandshake, e: Vec<i64>) {
+    hs.e_next = e;
+}
+
+/// True when every handshake message has been written or read.
+pub fn noise_handshake_done(hs: & NoiseHandshake) -> bool {
+    return hs.ok && hs.idx >= hs.msgs.len();
+}
+
+/// True when it is this side's turn to write.
+pub fn noise_my_turn(hs: & NoiseHandshake) -> bool {
+    return (hs.idx % 2 == 0) == hs.initiator;
+}
+
+/// The handshake hash h so far (channel binding once done).
+pub fn noise_handshake_hash(hs: & NoiseHandshake) -> Vec<i64> {
+    return hs.h;
+}
+
+fn noise_dh(hs: & mut NoiseHandshake, sk: Vec<i64>, pk: Vec<i64>) -> bool {
+    if sk.len() != 32 || pk.len() != 32 {
+        hs.ok = false;
+        hs.err = "missing key for DH";
+        return false;
+    }
+    val z: Vec<i64> = x25519_scalarmult(sk, pk);
+    if x25519_is_all_zero(z) {
+        hs.ok = false;
+        hs.err = "DH result is zero";
+        return false;
+    }
+    noise_mix_key(hs, z);
+    return true;
+}
+
+/// The DH a token means for this side: ee, es, se, ss.
+fn noise_token_dh(hs: & mut NoiseHandshake, tok: str) -> bool {
+    val e: Vec<i64> = hs.e;
+    val s: Vec<i64> = hs.s;
+    val re: Vec<i64> = hs.re;
+    val rs: Vec<i64> = hs.rs;
+    if str_equal(tok, "ee") { return noise_dh(hs, e, re); }
+    if str_equal(tok, "ss") { return noise_dh(hs, s, rs); }
+    if str_equal(tok, "es") {
+        if hs.initiator { return noise_dh(hs, e, rs); }
+        return noise_dh(hs, s, re);
+    }
+    if hs.initiator { return noise_dh(hs, s, re); }
+    return noise_dh(hs, e, rs);
+}
+
+/// WriteMessage(payload, message_buffer): the next handshake message, or
+/// empty with ok false (hs.err says why).
+pub fn noise_write_message(hs: & mut NoiseHandshake, payload: Vec<i64>) -> Vec<i64> {
+    if !hs.ok || hs.idx >= hs.msgs.len() || !noise_my_turn(hs) {
+        hs.ok = false;
+        if str_len(hs.err) == 0 { hs.err = "not this side's turn to write"; }
+        return Vec::new();
+    }
+    val toks: Vec<str> = str_split(hs.msgs.get(hs.idx), ",");
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < toks.len() {
+        val t: str = toks.get(i);
+        if str_equal(t, "e") {
+            var ek: Vec<i64> = hs.e_next;
+            if ek.len() != 32 { ek = crypto_random_bytes(32); }
+            hs.e_next = Vec::new();
+            val epub: Vec<i64> = x25519_public_key(ek);
+            hs.e = ek;
+            hs.e_pub = epub;
+            out = noise_cat(out, epub);
+            noise_mix_hash(hs, epub);
+            if hs.has_psk { noise_mix_key(hs, epub); }
+        } else if str_equal(t, "s") {
+            if hs.s_pub.len() != 32 {
+                hs.ok = false;
+                hs.err = "no static key to send";
+                return Vec::new();
+            }
+            val spub: Vec<i64> = hs.s_pub;
+            out = noise_cat(out, noise_encrypt_and_hash(hs, spub));
+        } else if str_equal(t, "psk") {
+            val psk: Vec<i64> = hs.psk;
+            noise_mix_key_and_hash(hs, psk);
+        } else {
+            if !noise_token_dh(hs, t) { return Vec::new(); }
+        }
+        i = i + 1;
+    }
+    out = noise_cat(out, noise_encrypt_and_hash(hs, payload));
+    if out.len() > NOISE_MAX_MSG {
+        hs.ok = false;
+        hs.err = "message too long";
+        return Vec::new();
+    }
+    hs.idx = hs.idx + 1;
+    return out;
+}
+
+/// ReadMessage(message, payload_buffer): the decrypted payload. On any
+/// failure ok is false and the handshake is dead (hs.ok false).
+pub fn noise_read_message(hs: & mut NoiseHandshake, msg: Vec<i64>) -> NoiseBytes {
+    if !hs.ok || hs.idx >= hs.msgs.len() || noise_my_turn(hs) || msg.len() > NOISE_MAX_MSG {
+        hs.ok = false;
+        if str_len(hs.err) == 0 { hs.err = "not this side's turn to read"; }
+        return NoiseBytes { ok: false, data: Vec::new() };
+    }
+    val toks: Vec<str> = str_split(hs.msgs.get(hs.idx), ",");
+    var at: i64 = 0;
+    var i: i64 = 0;
+    while i < toks.len() {
+        val t: str = toks.get(i);
+        if str_equal(t, "e") {
+            if msg.len() - at < 32 {
+                hs.ok = false;
+                hs.err = "message too short";
+                return NoiseBytes { ok: false, data: Vec::new() };
+            }
+            val re: Vec<i64> = noise_slice(& msg, at, at + 32);
+            hs.re = re;
+            at = at + 32;
+            noise_mix_hash(hs, re);
+            if hs.has_psk { noise_mix_key(hs, re); }
+        } else if str_equal(t, "s") {
+            var len: i64 = 32;
+            if hs.k.len() > 0 { len = 48; }
+            if msg.len() - at < len {
+                hs.ok = false;
+                hs.err = "message too short";
+                return NoiseBytes { ok: false, data: Vec::new() };
+            }
+            val r: NoiseBytes = noise_decrypt_and_hash(hs, noise_slice(& msg, at, at + len));
+            if !r.ok {
+                hs.ok = false;
+                hs.err = "static key decryption failed";
+                return r;
+            }
+            hs.rs = r.data;
+            at = at + len;
+        } else if str_equal(t, "psk") {
+            val psk: Vec<i64> = hs.psk;
+            noise_mix_key_and_hash(hs, psk);
+        } else {
+            if !noise_token_dh(hs, t) { return NoiseBytes { ok: false, data: Vec::new() }; }
+        }
+        i = i + 1;
+    }
+    val p: NoiseBytes = noise_decrypt_and_hash(hs, noise_slice(& msg, at, msg.len()));
+    if !p.ok {
+        hs.ok = false;
+        hs.err = "payload decryption failed";
+        return p;
+    }
+    hs.idx = hs.idx + 1;
+    return p;
+}
+
+/// Split() (§5.2) oriented for this side: the initiator sends with the
+/// first key, the responder with the second.
+pub fn noise_split(hs: & NoiseHandshake) -> NoiseTransport {
+    val hl: i64 = noise_hash_len(hs.hash);
+    val out: Vec<i64> = noise_hkdf(hs.hash, hs.ck, Vec::new(), 2);
+    val c1: NoiseCipher = noise_cipher_new(hs.cipher, noise_trunc32(noise_slice(& out, 0, hl)));
+    val c2: NoiseCipher = noise_cipher_new(hs.cipher, noise_trunc32(noise_slice(& out, hl, 2 * hl)));
+    if hs.initiator {
+        return NoiseTransport { ok: noise_handshake_done(hs), send: c1, recv: c2, hash: hs.h };
+    }
+    return NoiseTransport { ok: noise_handshake_done(hs), send: c2, recv: c1, hash: hs.h };
+}

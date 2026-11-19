@@ -1,0 +1,2089 @@
+// fat32: the FAT file system (FAT12, FAT16 and FAT32), after Microsoft's
+// "FAT: General Overview of On-Disk Format" (fatgen103).
+//
+// Real: BPB parsing and the FAT type decision by cluster count; FAT
+// entries of all three widths (12-bit entries straddling sectors, the top
+// four bits of FAT32 entries kept on write, every FAT copy written);
+// cluster chains; directories in the fixed FAT12/16 root region or in a
+// cluster chain (growing by a cluster when full); 8.3 entries with the
+// NT lower-case bits; VFAT long file names (UTF-16 pieces, ordinal and
+// checksum checked on read, written in reverse order with 0x40 on the
+// last piece, basis-name generation with "~N" numeric tails); file read,
+// create/replace, delete, mkdir (with "." and ".."), rmdir (empty only),
+// rename; timestamps; FSInfo (free count, next free hint) on FAT32; and
+// formatting (cluster size tables of fatgen103, FAT sizes computed to a
+// fixpoint, boot sector and backup, FSInfo, media entries, volume label).
+// Names are matched without regard to ASCII case, as Windows does.
+//
+// The seam: the disk is a vfs BlockDev (stdlib/vfs.fd) whose block size is
+// the sector size; tests use a memdisk. The clock is not read: entries get
+// the time set with fat_set_clock (by default 2026-01-01 00:00:00).
+// fat_ops/fat_mount expose a volume as a vfs file system (no symlinks:
+// EPERM; inode numbers are handed out per directory entry and do not
+// survive a rename of that entry).
+module fat32;
+use vec;
+use string;
+use vfs;
+
+pub const FAT_ATTR_READ_ONLY: i64 = 1;
+pub const FAT_ATTR_HIDDEN: i64 = 2;
+pub const FAT_ATTR_SYSTEM: i64 = 4;
+pub const FAT_ATTR_VOLUME_ID: i64 = 8;
+pub const FAT_ATTR_DIRECTORY: i64 = 16;
+pub const FAT_ATTR_ARCHIVE: i64 = 32;
+pub const FAT_ATTR_LFN: i64 = 15;
+
+pub struct FatVol {
+    pub err: str,
+    pub dev: BlockDev,
+    pub fat_type: i64,
+    pub bps: i64,
+    pub spc: i64,
+    pub rsvd: i64,
+    pub nfats: i64,
+    pub root_ent: i64,
+    pub tot_sec: i64,
+    pub fatsz: i64,
+    pub root_clus: i64,
+    pub fsinfo: i64,
+    pub root_start: i64,
+    pub root_secs: i64,
+    pub data_start: i64,
+    pub nclusters: i64,
+    pub media: i64,
+    pub volid: i64,
+    pub label: str,
+    pub spt: i64,
+    pub heads: i64,
+    pub free_count: i64,
+    pub next_free: i64,
+    pub date: i64,
+    pub time: i64,
+}
+
+pub struct FatDirEnt {
+    pub found: bool,
+    pub name: str,
+    pub short: str,
+    pub attr: i64,
+    pub clus: i64,
+    pub size: i64,
+    pub wdate: i64,
+    pub wtime: i64,
+    pub cdate: i64,
+    pub ctime: i64,
+    pub dir: i64,
+    pub slot: i64,
+    pub first: i64,
+}
+
+// --- little-endian helpers ----------------------------------------------------------
+
+fn fat_u16(b: & Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256;
+}
+
+fn fat_u32(b: & Vec<i64>, o: i64) -> i64 {
+    return fat_u16(b, o) + fat_u16(b, o + 2) * 65536;
+}
+
+fn fat_put16(b: &mut Vec<i64>, o: i64, v: i64) {
+    b.set(o, v & 255);
+    b.set(o + 1, (v >> 8) & 255);
+}
+
+fn fat_put32(b: &mut Vec<i64>, o: i64, v: i64) {
+    fat_put16(b, o, v & 65535);
+    fat_put16(b, o + 2, (v >> 16) & 65535);
+}
+
+fn fat_put_ascii(b: &mut Vec<i64>, o: i64, len: i64, s: str) {
+    val bs: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < len {
+        if i < bs.len() {
+            b.set(o + i, bs.get(i));
+        } else {
+            b.set(o + i, 32);
+        }
+        i = i + 1;
+    }
+}
+
+fn fat_ascii(b: & Vec<i64>, o: i64, len: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < len {
+        out.push(b.get(o + i));
+        i = i + 1;
+    }
+    return str_trim_end(str_from_bytes(out));
+}
+
+// --- dates ----------------------------------------------------------------------------
+
+pub fn fat_date(year: i64, month: i64, day: i64) -> i64 {
+    return ((year - 1980) << 9) | (month << 5) | day;
+}
+
+pub fn fat_time(hour: i64, minute: i64, second: i64) -> i64 {
+    return (hour << 11) | (minute << 5) | (second / 2);
+}
+
+/// "YYYY-MM-DD hh:mm:ss" of a FAT date and time.
+pub fn fat_datetime_str(d: i64, t: i64) -> str {
+    val y: i64 = 1980 + (d >> 9);
+    return int_to_str(y) + "-" + str_pad_left(int_to_str((d >> 5) & 15), 2, 48) + "-" + str_pad_left(int_to_str(d & 31), 2, 48) + " " + str_pad_left(int_to_str(t >> 11), 2, 48) + ":" + str_pad_left(int_to_str((t >> 5) & 63), 2, 48) + ":" + str_pad_left(int_to_str((t & 31) * 2), 2, 48);
+}
+
+pub fn fat_set_clock(vol: &mut FatVol, year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) {
+    vol.date = fat_date(year, month, day);
+    vol.time = fat_time(hour, minute, second);
+}
+
+// --- opening a volume ----------------------------------------------------------------
+
+fn fat_empty_vol(dev: BlockDev, err: str) -> FatVol {
+    return FatVol {
+        err: err, dev: dev, fat_type: 0, bps: 0, spc: 0, rsvd: 0, nfats: 0, root_ent: 0, tot_sec: 0, fatsz: 0, root_clus: 0, fsinfo: 0, root_start: 0, root_secs: 0, data_start: 0, nclusters: 0, media: 0, volid: 0, label: "", spt: 0, heads: 0, free_count: -1, next_free: 2, date: 23585, time: 0
+    };
+}
+
+/// Read the boot sector of `dev` and work out the layout. `err` is "" on
+/// success.
+pub fn fat_open(dev: BlockDev) -> FatVol {
+    val b: Vec<i64> = blk_read(&dev, 0);
+    if b.len() < 512 {
+        return fat_empty_vol(dev, "cannot read sector 0");
+    }
+    if b.get(510) != 85 || b.get(511) != 170 {
+        return fat_empty_vol(dev, "no boot signature");
+    }
+    var v: FatVol = fat_empty_vol(dev, "");
+    v.bps = fat_u16(&b, 11);
+    v.spc = b.get(13);
+    v.rsvd = fat_u16(&b, 14);
+    v.nfats = b.get(16);
+    v.root_ent = fat_u16(&b, 17);
+    v.tot_sec = fat_u16(&b, 19);
+    v.media = b.get(21);
+    v.fatsz = fat_u16(&b, 22);
+    v.spt = fat_u16(&b, 24);
+    v.heads = fat_u16(&b, 26);
+    if v.tot_sec == 0 {
+        v.tot_sec = fat_u32(&b, 32);
+    }
+    if v.fatsz == 0 {
+        v.fatsz = fat_u32(&b, 36);
+    }
+    if v.bps != dev.block_size || (v.bps != 512 && v.bps != 1024 && v.bps != 2048 && v.bps != 4096) {
+        return fat_empty_vol(dev, "sector size " + int_to_str(v.bps) + " does not match the device");
+    }
+    if v.spc == 0 || (v.spc & (v.spc - 1)) != 0 || v.nfats == 0 || v.rsvd == 0 || v.fatsz == 0 {
+        return fat_empty_vol(dev, "bad BPB");
+    }
+    v.root_secs = (v.root_ent * 32 + v.bps - 1) / v.bps;
+    v.root_start = v.rsvd + v.nfats * v.fatsz;
+    v.data_start = v.root_start + v.root_secs;
+    if v.data_start >= v.tot_sec {
+        return fat_empty_vol(dev, "bad BPB");
+    }
+    v.nclusters = (v.tot_sec - v.data_start) / v.spc;
+    // the type follows from the cluster count alone (fatgen103 p. 14)
+    if v.nclusters < 4085 {
+        v.fat_type = 12;
+    } else if v.nclusters < 65525 {
+        v.fat_type = 16;
+    } else {
+        v.fat_type = 32;
+    }
+    if v.fat_type == 32 {
+        v.root_clus = fat_u32(&b, 44);
+        v.fsinfo = fat_u16(&b, 48);
+        v.volid = fat_u32(&b, 67);
+        v.label = fat_ascii(&b, 71, 11);
+        val fi: Vec<i64> = blk_read(&dev, v.fsinfo);
+        if fi.len() >= 512 && fat_u32(&fi, 0) == 1096897106 && fat_u32(&fi, 484) == 1631679090 {
+            val fc: i64 = fat_u32(&fi, 488);
+            val nf: i64 = fat_u32(&fi, 492);
+            if fc <= v.nclusters {
+                v.free_count = fc;
+            }
+            if nf >= 2 && nf < v.nclusters + 2 {
+                v.next_free = nf;
+            }
+        }
+    } else {
+        v.volid = fat_u32(&b, 39);
+        v.label = fat_ascii(&b, 43, 11);
+    }
+    return v;
+}
+
+pub fn fat_type_name(vol: & FatVol) -> str {
+    return "FAT" + int_to_str(vol.fat_type);
+}
+
+// --- the FAT --------------------------------------------------------------------------
+
+pub fn fat_eoc(vol: & FatVol) -> i64 {
+    if vol.fat_type == 12 {
+        return 4095;
+    }
+    if vol.fat_type == 16 {
+        return 65535;
+    }
+    return 268435455;
+}
+
+pub fn fat_is_eoc(vol: & FatVol, v: i64) -> bool {
+    if vol.fat_type == 12 {
+        return v >= 4088;
+    }
+    if vol.fat_type == 16 {
+        return v >= 65528;
+    }
+    return v >= 268435448;
+}
+
+fn fat_valid_clus(vol: & FatVol, c: i64) -> bool {
+    return c >= 2 && c < vol.nclusters + 2;
+}
+
+fn fat_byte_at(vol: & FatVol, copy: i64, off: i64) -> i64 {
+    val lba: i64 = vol.rsvd + copy * vol.fatsz + off / vol.bps;
+    val s: Vec<i64> = blk_read(&vol.dev, lba);
+    return s.get(off % vol.bps);
+}
+
+/// FAT entry `n` (copy 0).
+pub fn fat_get(vol: & FatVol, n: i64) -> i64 {
+    if vol.fat_type == 12 {
+        val off: i64 = n + n / 2;
+        val w: i64 = fat_byte_at(vol, 0, off) | (fat_byte_at(vol, 0, off + 1) << 8);
+        if (n & 1) != 0 {
+            return w >> 4;
+        }
+        return w & 4095;
+    }
+    if vol.fat_type == 16 {
+        val off: i64 = 2 * n;
+        val s: Vec<i64> = blk_read(&vol.dev, vol.rsvd + off / vol.bps);
+        return fat_u16(&s, off % vol.bps);
+    }
+    val off: i64 = 4 * n;
+    val s: Vec<i64> = blk_read(&vol.dev, vol.rsvd + off / vol.bps);
+    return fat_u32(&s, off % vol.bps) & 268435455;
+}
+
+fn fat_set_byte(vol: & FatVol, copy: i64, off: i64, val_: i64) {
+    val lba: i64 = vol.rsvd + copy * vol.fatsz + off / vol.bps;
+    var s: Vec<i64> = blk_read(&vol.dev, lba);
+    s.set(off % vol.bps, val_ & 255);
+    blk_write(&vol.dev, lba, s);
+}
+
+/// Set FAT entry `n` in every FAT copy.
+pub fn fat_set(vol: & FatVol, n: i64, value: i64) {
+    var copy: i64 = 0;
+    while copy < vol.nfats {
+        if vol.fat_type == 12 {
+            val off: i64 = n + n / 2;
+            val w: i64 = fat_byte_at(vol, copy, off) | (fat_byte_at(vol, copy, off + 1) << 8);
+            var nw: i64 = 0;
+            if (n & 1) != 0 {
+                nw = (w & 15) | ((value & 4095) << 4);
+            } else {
+                nw = (w & 61440) | (value & 4095);
+            }
+            fat_set_byte(vol, copy, off, nw & 255);
+            fat_set_byte(vol, copy, off + 1, (nw >> 8) & 255);
+        } else {
+            var width: i64 = 2;
+            if vol.fat_type == 32 {
+                width = 4;
+            }
+            val off: i64 = width * n;
+            val lba: i64 = vol.rsvd + copy * vol.fatsz + off / vol.bps;
+            var s: Vec<i64> = blk_read(&vol.dev, lba);
+            val o: i64 = off % vol.bps;
+            if width == 2 {
+                fat_put16(&mut s, o, value);
+            } else {
+                val keep: i64 = fat_u32(&s, o) & 4026531840;
+                fat_put32(&mut s, o, keep | (value & 268435455));
+            }
+            blk_write(&vol.dev, lba, s);
+        }
+        copy = copy + 1;
+    }
+}
+
+/// The clusters of the chain starting at `c` (stops at a loop or a bad
+/// entry).
+pub fn fat_chain(vol: & FatVol, start: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var c: i64 = start;
+    while fat_valid_clus(vol, c) && out.len() <= vol.nclusters {
+        out.push(c);
+        val nx: i64 = fat_get(vol, c);
+        if fat_is_eoc(vol, nx) || nx < 2 {
+            break;
+        }
+        c = nx;
+    }
+    return out;
+}
+
+/// Allocate a free cluster, mark it end of chain and link it after `prev`
+/// (0: a new chain). Returns the cluster or -ENOSPC.
+pub fn fat_alloc(vol: &mut FatVol, prev: i64) -> i64 {
+    var c: i64 = vol.next_free;
+    if !fat_valid_clus(vol, c) {
+        c = 2;
+    }
+    var tries: i64 = 0;
+    while tries < vol.nclusters {
+        if fat_get(vol, c) == 0 {
+            fat_set(vol, c, fat_eoc(vol));
+            if prev > 0 {
+                fat_set(vol, prev, c);
+            }
+            if vol.free_count > 0 {
+                vol.free_count = vol.free_count - 1;
+            }
+            vol.next_free = c + 1;
+            if !fat_valid_clus(vol, vol.next_free) {
+                vol.next_free = 2;
+            }
+            return c;
+        }
+        c = c + 1;
+        if !fat_valid_clus(vol, c) {
+            c = 2;
+        }
+        tries = tries + 1;
+    }
+    return 0 - VFS_ENOSPC;
+}
+
+/// Free the chain starting at `c`.
+pub fn fat_free_chain(vol: &mut FatVol, start: i64) {
+    val ch: Vec<i64> = fat_chain(vol, start);
+    var i: i64 = 0;
+    while i < ch.len() {
+        fat_set(vol, ch.get(i), 0);
+        if vol.free_count >= 0 {
+            vol.free_count = vol.free_count + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// Count free clusters by reading the whole FAT, each sector once.
+pub fn fat_count_free(vol: & FatVol) -> i64 {
+    var secs: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < vol.fatsz {
+        secs.push(blk_read(&vol.dev, vol.rsvd + i));
+        i = i + 1;
+    }
+    var n: i64 = 0;
+    var c: i64 = 2;
+    while c < vol.nclusters + 2 {
+        var e: i64 = 0;
+        if vol.fat_type == 12 {
+            val off: i64 = c + c / 2;
+            val lo: i64 = secs.get(off / vol.bps).get(off % vol.bps);
+            val hi: i64 = secs.get((off + 1) / vol.bps).get((off + 1) % vol.bps);
+            val w: i64 = lo | (hi << 8);
+            if (c & 1) != 0 {
+                e = w >> 4;
+            } else {
+                e = w & 4095;
+            }
+        } else if vol.fat_type == 16 {
+            val off: i64 = 2 * c;
+            val s: Vec<i64> = secs.get(off / vol.bps);
+            e = fat_u16(&s, off % vol.bps);
+        } else {
+            val off: i64 = 4 * c;
+            val s: Vec<i64> = secs.get(off / vol.bps);
+            e = fat_u32(&s, off % vol.bps) & 268435455;
+        }
+        if e == 0 {
+            n = n + 1;
+        }
+        c = c + 1;
+    }
+    return n;
+}
+
+fn fat_clus_lba(vol: & FatVol, c: i64) -> i64 {
+    return vol.data_start + (c - 2) * vol.spc;
+}
+
+fn fat_zero_cluster(vol: & FatVol, c: i64) {
+    blk_zero(&vol.dev, fat_clus_lba(vol, c), vol.spc);
+}
+
+/// Write the FSInfo sector (FAT32) with the current free count and hint.
+pub fn fat_sync(vol: & FatVol) {
+    if vol.fat_type != 32 || vol.fsinfo == 0 {
+        return;
+    }
+    var s: Vec<i64> = blk_read(&vol.dev, vol.fsinfo);
+    var fc: i64 = vol.free_count;
+    if fc < 0 {
+        fc = 4294967295;
+    }
+    fat_put32(&mut s, 488, fc);
+    fat_put32(&mut s, 492, vol.next_free);
+    blk_write(&vol.dev, vol.fsinfo, s);
+}
+
+// --- directories -----------------------------------------------------------------------
+
+/// The root directory's cluster: 0 for the fixed FAT12/16 root region.
+pub fn fat_root(vol: & FatVol) -> i64 {
+    if vol.fat_type == 32 {
+        return vol.root_clus;
+    }
+    return 0;
+}
+
+/// The sectors of directory `dclus`, in order.
+fn fat_dir_lbas(vol: & FatVol, dclus: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if dclus == 0 && vol.fat_type != 32 {
+        var i: i64 = 0;
+        while i < vol.root_secs {
+            out.push(vol.root_start + i);
+            i = i + 1;
+        }
+        return out;
+    }
+    var c: i64 = dclus;
+    if c == 0 {
+        c = vol.root_clus;
+    }
+    val ch: Vec<i64> = fat_chain(vol, c);
+    var i: i64 = 0;
+    while i < ch.len() {
+        var s: i64 = 0;
+        while s < vol.spc {
+            out.push(fat_clus_lba(vol, ch.get(i)) + s);
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The 8.3 checksum the long-name pieces carry.
+pub fn fat_lfn_checksum(short11: & Vec<i64>) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < 11 {
+        var hi: i64 = 0;
+        if (sum & 1) != 0 {
+            hi = 128;
+        }
+        sum = (hi + (sum >> 1) + short11.get(i)) & 255;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn fat_utf16_to_str(units: & Vec<i64>) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < units.len() {
+        var u: i64 = units.get(i);
+        if u == 0 || u == 65535 {
+            break;
+        }
+        if u >= 55296 && u < 56320 && i + 1 < units.len() {
+            val lo: i64 = units.get(i + 1);
+            if lo >= 56320 && lo < 57344 {
+                u = 65536 + ((u - 55296) << 10) + (lo - 56320);
+                i = i + 1;
+            }
+        }
+        if u < 128 {
+            out.push(u);
+        } else if u < 2048 {
+            out.push(192 | (u >> 6));
+            out.push(128 | (u & 63));
+        } else if u < 65536 {
+            out.push(224 | (u >> 12));
+            out.push(128 | ((u >> 6) & 63));
+            out.push(128 | (u & 63));
+        } else {
+            out.push(240 | (u >> 18));
+            out.push(128 | ((u >> 12) & 63));
+            out.push(128 | ((u >> 6) & 63));
+            out.push(128 | (u & 63));
+        }
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// UTF-8 -> UTF-16 code units (invalid bytes become U+FFFD).
+pub fn fat_str_to_utf16(s: str) -> Vec<i64> {
+    val b: Vec<i64> = str_bytes(s);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        var cp: i64 = 65533;
+        var n: i64 = 1;
+        if c < 128 {
+            cp = c;
+        } else if c >= 192 && c < 224 && i + 1 < b.len() {
+            cp = ((c & 31) << 6) | (b.get(i + 1) & 63);
+            n = 2;
+        } else if c >= 224 && c < 240 && i + 2 < b.len() {
+            cp = ((c & 15) << 12) | ((b.get(i + 1) & 63) << 6) | (b.get(i + 2) & 63);
+            n = 3;
+        } else if c >= 240 && i + 3 < b.len() {
+            cp = ((c & 7) << 18) | ((b.get(i + 1) & 63) << 12) | ((b.get(i + 2) & 63) << 6) | (b.get(i + 3) & 63);
+            n = 4;
+        }
+        if cp >= 65536 {
+            val x: i64 = cp - 65536;
+            out.push(55296 + (x >> 10));
+            out.push(56320 + (x & 1023));
+        } else {
+            out.push(cp);
+        }
+        i = i + n;
+    }
+    return out;
+}
+
+fn fat_short_display(b: & Vec<i64>, o: i64, use_case: bool) -> str {
+    var nt: i64 = b.get(o + 12);
+    if !use_case {
+        nt = 0;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        var c: i64 = b.get(o + i);
+        if i == 0 && c == 5 {
+            c = 229;
+        }
+        if c != 32 {
+            if (nt & 8) != 0 && c >= 65 && c <= 90 {
+                c = c + 32;
+            }
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    var ext: Vec<i64> = Vec::new();
+    i = 8;
+    while i < 11 {
+        var c: i64 = b.get(o + i);
+        if c != 32 {
+            if (nt & 16) != 0 && c >= 65 && c <= 90 {
+                c = c + 32;
+            }
+            ext.push(c);
+        }
+        i = i + 1;
+    }
+    if ext.len() > 0 {
+        out.push(46);
+        i = 0;
+        while i < ext.len() {
+            out.push(ext.get(i));
+            i = i + 1;
+        }
+    }
+    return str_from_bytes(out);
+}
+
+fn fat_raw11(b: & Vec<i64>, o: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 11 {
+        r.push(b.get(o + i));
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Every live entry of directory `dclus` ("." and ".." included, the
+/// volume label left out), with long names put together.
+pub fn fat_dir_entries(vol: & FatVol, dclus: i64) -> Vec<FatDirEnt> {
+    var out: Vec<FatDirEnt> = Vec::new();
+    val lbas: Vec<i64> = fat_dir_lbas(vol, dclus);
+    val per: i64 = vol.bps / 32;
+    var units: Vec<i64> = Vec::new();
+    var lfn_n: i64 = 0;
+    var expect: i64 = 0;
+    var lfn_sum: i64 = 0;
+    var lfn_first: i64 = 0;
+    var si: i64 = 0;
+    while si < lbas.len() {
+        val s: Vec<i64> = blk_read(&vol.dev, lbas.get(si));
+        var k: i64 = 0;
+        while k < per {
+            val o: i64 = 32 * k;
+            val slot: i64 = si * per + k;
+            val b0: i64 = s.get(o);
+            if b0 == 0 {
+                return out;
+            }
+            val attr: i64 = s.get(o + 11);
+            if b0 == 229 {
+                lfn_n = 0;
+            } else if (attr & 63) == FAT_ATTR_LFN {
+                val seq: i64 = b0 & 31;
+                if (b0 & 64) != 0 {
+                    lfn_n = seq;
+                    expect = seq;
+                    lfn_sum = s.get(o + 13);
+                    lfn_first = slot;
+                    units = Vec::filled(seq * 13, 65535);
+                }
+                if lfn_n > 0 && seq == expect && seq >= 1 && s.get(o + 13) == lfn_sum {
+                    val base: i64 = (seq - 1) * 13;
+                    var j: i64 = 0;
+                    while j < 5 {
+                        units.set(base + j, fat_u16(&s, o + 1 + 2 * j));
+                        j = j + 1;
+                    }
+                    j = 0;
+                    while j < 6 {
+                        units.set(base + 5 + j, fat_u16(&s, o + 14 + 2 * j));
+                        j = j + 1;
+                    }
+                    j = 0;
+                    while j < 2 {
+                        units.set(base + 11 + j, fat_u16(&s, o + 28 + 2 * j));
+                        j = j + 1;
+                    }
+                    expect = seq - 1;
+                } else {
+                    lfn_n = 0;
+                }
+            } else if (attr & FAT_ATTR_VOLUME_ID) != 0 {
+                lfn_n = 0;
+            } else {
+                val r11: Vec<i64> = fat_raw11(&s, o);
+                val short: str = fat_short_display(&s, o, false);
+                var name: str = fat_short_display(&s, o, true);
+                var first: i64 = slot;
+                if lfn_n > 0 && expect == 0 && fat_lfn_checksum(&r11) == lfn_sum {
+                    name = fat_utf16_to_str(&units);
+                    first = lfn_first;
+                }
+                lfn_n = 0;
+                out.push(FatDirEnt {
+                    found: true, name: name, short: short, attr: attr, clus: fat_u16(&s, o + 26) + fat_u16(&s, o + 20) * 65536, size: fat_u32(&s, o + 28), wdate: fat_u16(&s, o + 24), wtime: fat_u16(&s, o + 22), cdate: fat_u16(&s, o + 16), ctime: fat_u16(&s, o + 14), dir: dclus, slot: slot, first: first
+                });
+            }
+            k = k + 1;
+        }
+        si = si + 1;
+    }
+    return out;
+}
+
+fn fat_upper(s: str) -> str {
+    return str_to_upper(s);
+}
+
+fn fat_not_found() -> FatDirEnt {
+    return FatDirEnt { found: false, name: "", short: "", attr: 0, clus: 0, size: 0, wdate: 0, wtime: 0, cdate: 0, ctime: 0, dir: -1, slot: -1, first: -1 };
+}
+
+/// The entry called `name` (long or short name, any ASCII case) in `dclus`.
+pub fn fat_find(vol: & FatVol, dclus: i64, name: str) -> FatDirEnt {
+    val es: Vec<FatDirEnt> = fat_dir_entries(vol, dclus);
+    val want: str = fat_upper(name);
+    var i: i64 = 0;
+    while i < es.len() {
+        val e: FatDirEnt = es.get(i);
+        if fat_upper(e.name) == want || fat_upper(e.short) == want {
+            return e;
+        }
+        i = i + 1;
+    }
+    return fat_not_found();
+}
+
+fn fat_root_ent(vol: & FatVol) -> FatDirEnt {
+    var e: FatDirEnt = fat_not_found();
+    e.found = true;
+    e.name = "/";
+    e.attr = FAT_ATTR_DIRECTORY;
+    e.clus = fat_root(vol);
+    return e;
+}
+
+/// Look `path` up from the root ("/" separated, "." and ".." allowed).
+pub fn fat_lookup(vol: & FatVol, path: str) -> FatDirEnt {
+    val parts: Vec<str> = str_split(path, "/");
+    var stack: Vec<FatDirEnt> = Vec::new();
+    stack.push(fat_root_ent(vol));
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        if str_len(p) == 0 || p == "." {
+            i = i + 1;
+            continue;
+        }
+        if p == ".." {
+            if stack.len() > 1 {
+                stack.pop();
+            }
+            i = i + 1;
+            continue;
+        }
+        val top: FatDirEnt = stack.get(stack.len() - 1);
+        if (top.attr & FAT_ATTR_DIRECTORY) == 0 {
+            return fat_not_found();
+        }
+        val e: FatDirEnt = fat_find(vol, top.clus, p);
+        if !e.found {
+            return e;
+        }
+        stack.push(e);
+        i = i + 1;
+    }
+    return stack.get(stack.len() - 1);
+}
+
+/// The directory part and the last name of a path.
+fn fat_split_parent(path: str) -> Vec<str> {
+    var parts: Vec<str> = Vec::new();
+    val all: Vec<str> = str_split(path, "/");
+    var i: i64 = 0;
+    while i < all.len() {
+        if str_len(all.get(i)) > 0 {
+            parts.push(all.get(i));
+        }
+        i = i + 1;
+    }
+    var out: Vec<str> = Vec::new();
+    if parts.len() == 0 {
+        out.push("/");
+        out.push("");
+        return out;
+    }
+    var dir: str = "";
+    i = 0;
+    while i < parts.len() - 1 {
+        dir = dir + "/" + parts.get(i);
+        i = i + 1;
+    }
+    if str_len(dir) == 0 {
+        dir = "/";
+    }
+    out.push(dir);
+    out.push(parts.get(parts.len() - 1));
+    return out;
+}
+
+/// List a directory (no "." and "..").
+pub fn fat_list(vol: & FatVol, path: str) -> Vec<FatDirEnt> {
+    var out: Vec<FatDirEnt> = Vec::new();
+    val d: FatDirEnt = fat_lookup(vol, path);
+    if !d.found || (d.attr & FAT_ATTR_DIRECTORY) == 0 {
+        return out;
+    }
+    val es: Vec<FatDirEnt> = fat_dir_entries(vol, d.clus);
+    var i: i64 = 0;
+    while i < es.len() {
+        val e: FatDirEnt = es.get(i);
+        if e.short != "." && e.short != ".." {
+            out.push(e);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// --- short names -----------------------------------------------------------------------
+
+fn fat_valid_long_name(name: str) -> bool {
+    val n: i64 = str_len(name);
+    if n == 0 || n > 255 || name == "." || name == ".." {
+        return false;
+    }
+    val last: i64 = str_byte_at(name, n - 1);
+    if last == 46 || last == 32 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(name, i);
+        if c < 32 || c == 34 || c == 42 || c == 47 || c == 58 || c == 60 || c == 62 || c == 63 || c == 92 || c == 124 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fat_short_ok(c: i64) -> bool {
+    if c >= 65 && c <= 90 {
+        return true;
+    }
+    if c >= 48 && c <= 57 {
+        return true;
+    }
+    // ! # $ % & ' ( ) - @ ^ _ ` { } ~
+    return c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 40 || c == 41 || c == 45 || c == 64 || c == 94 || c == 95 || c == 96 || c == 123 || c == 125 || c == 126;
+}
+
+/// The case of the letters of a part: 0 none, 1 all lower, 2 all upper,
+/// 3 mixed.
+fn fat_case_of(b: & Vec<i64>) -> i64 {
+    var lo: bool = false;
+    var up: bool = false;
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c >= 97 && c <= 122 {
+            lo = true;
+        }
+        if c >= 65 && c <= 90 {
+            up = true;
+        }
+        i = i + 1;
+    }
+    if lo && up {
+        return 3;
+    }
+    if lo {
+        return 1;
+    }
+    if up {
+        return 2;
+    }
+    return 0;
+}
+
+/// The 8.3 form of `name` in directory entries `es`: 11 bytes, then the
+/// NT case byte, then 1 when a long name must be written as well.
+pub fn fat_short_name(name: str, es: & Vec<FatDirEnt>) -> Vec<i64> {
+    val b: Vec<i64> = str_bytes(name);
+    var lastdot: i64 = -1;
+    var dots: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) == 46 {
+            lastdot = i;
+            dots = dots + 1;
+        }
+        i = i + 1;
+    }
+    var base_raw: Vec<i64> = Vec::new();
+    var ext_raw: Vec<i64> = Vec::new();
+    i = 0;
+    while i < b.len() {
+        if lastdot >= 0 && i > lastdot {
+            ext_raw.push(b.get(i));
+        } else if i != lastdot {
+            base_raw.push(b.get(i));
+        }
+        i = i + 1;
+    }
+    // Does the name fit 8.3 as it is?
+    var fits: bool = dots <= 1 && base_raw.len() >= 1 && base_raw.len() <= 8 && ext_raw.len() <= 3 && lastdot != 0;
+    var lossy: bool = false;
+    var base: Vec<i64> = Vec::new();
+    var ext: Vec<i64> = Vec::new();
+    i = 0;
+    while i < base_raw.len() {
+        var c: i64 = base_raw.get(i);
+        if c == 32 || c == 46 {
+            lossy = true;
+        } else {
+            if c >= 97 && c <= 122 {
+                c = c - 32;
+            }
+            if !fat_short_ok(c) {
+                c = 95;
+                lossy = true;
+            }
+            if base.len() < 8 {
+                base.push(c);
+            } else {
+                lossy = true;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < ext_raw.len() {
+        var c: i64 = ext_raw.get(i);
+        if c == 32 {
+            lossy = true;
+        } else {
+            if c >= 97 && c <= 122 {
+                c = c - 32;
+            }
+            if !fat_short_ok(c) {
+                c = 95;
+                lossy = true;
+            }
+            if ext.len() < 3 {
+                ext.push(c);
+            } else {
+                lossy = true;
+            }
+        }
+        i = i + 1;
+    }
+    if base.len() == 0 {
+        base.push(95);
+        lossy = true;
+    }
+    if lossy {
+        fits = false;
+    }
+    val bc: i64 = fat_case_of(&base_raw);
+    val ec: i64 = fat_case_of(&ext_raw);
+    var nt: i64 = 0;
+    var need_lfn: bool = !fits;
+    if fits {
+        if bc == 3 || ec == 3 {
+            need_lfn = true;
+        } else {
+            if bc == 1 {
+                nt = nt | 8;
+            }
+            if ec == 1 {
+                nt = nt | 16;
+            }
+        }
+    }
+    // existing short names
+    var taken: HashMap<str, i64> = HashMap::new();
+    i = 0;
+    while i < es.len() {
+        taken.insert(fat_upper(es.get(i).short), 1);
+        i = i + 1;
+    }
+    var cand: Vec<i64> = Vec::new();
+    var n: i64 = 0;
+    if !fits {
+        n = 1;
+    }
+    loop {
+        var bb: Vec<i64> = base;
+        if n > 0 {
+            val tail: Vec<i64> = str_bytes("~" + int_to_str(n));
+            var keep: i64 = 8 - tail.len();
+            if keep > base.len() {
+                keep = base.len();
+            }
+            bb = Vec::new();
+            var j: i64 = 0;
+            while j < keep {
+                bb.push(base.get(j));
+                j = j + 1;
+            }
+            j = 0;
+            while j < tail.len() {
+                bb.push(tail.get(j));
+                j = j + 1;
+            }
+        }
+        cand = Vec::filled(11, 32);
+        var j: i64 = 0;
+        while j < bb.len() {
+            cand.set(j, bb.get(j));
+            j = j + 1;
+        }
+        j = 0;
+        while j < ext.len() {
+            cand.set(8 + j, ext.get(j));
+            j = j + 1;
+        }
+        var disp: str = str_from_bytes(bb);
+        if ext.len() > 0 {
+            disp = disp + "." + str_from_bytes(ext);
+        }
+        if !taken.contains(disp) || n > 999999 {
+            break;
+        }
+        if n == 0 {
+            // the plain 8.3 name is another entry's alias: tail and long name
+            need_lfn = true;
+            nt = 0;
+        }
+        n = n + 1;
+    }
+    if cand.get(0) == 229 {
+        cand.set(0, 5);
+    }
+    cand.push(nt);
+    if need_lfn {
+        cand.push(1);
+    } else {
+        cand.push(0);
+    }
+    return cand;
+}
+
+// --- writing entries ---------------------------------------------------------------------
+
+fn fat_slot_write(vol: & FatVol, lbas: & Vec<i64>, slot: i64, ent: & Vec<i64>) {
+    val per: i64 = vol.bps / 32;
+    val lba: i64 = lbas.get(slot / per);
+    var s: Vec<i64> = blk_read(&vol.dev, lba);
+    val o: i64 = (slot % per) * 32;
+    var i: i64 = 0;
+    while i < 32 {
+        s.set(o + i, ent.get(i));
+        i = i + 1;
+    }
+    blk_write(&vol.dev, lba, s);
+}
+
+fn fat_slot_read(vol: & FatVol, lbas: & Vec<i64>, slot: i64) -> Vec<i64> {
+    val per: i64 = vol.bps / 32;
+    val s: Vec<i64> = blk_read(&vol.dev, lbas.get(slot / per));
+    val o: i64 = (slot % per) * 32;
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 32 {
+        out.push(s.get(o + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A first run of `need` free slots of the directory, or -1.
+fn fat_free_run(vol: & FatVol, lbas: & Vec<i64>, need: i64) -> i64 {
+    val per: i64 = vol.bps / 32;
+    val total: i64 = lbas.len() * per;
+    var run: i64 = 0;
+    var start: i64 = 0;
+    var si: i64 = 0;
+    while si < lbas.len() {
+        val s: Vec<i64> = blk_read(&vol.dev, lbas.get(si));
+        var k: i64 = 0;
+        while k < per {
+            val slot: i64 = si * per + k;
+            val b0: i64 = s.get(32 * k);
+            if b0 == 0 {
+                // everything from here on is free
+                if run == 0 {
+                    start = slot;
+                }
+                if total - start >= need {
+                    return start;
+                }
+                return -1;
+            }
+            if b0 == 229 {
+                if run == 0 {
+                    start = slot;
+                }
+                run = run + 1;
+                if run >= need {
+                    return start;
+                }
+            } else {
+                run = 0;
+            }
+            k = k + 1;
+        }
+        si = si + 1;
+    }
+    return -1;
+}
+
+fn fat_short_entry(short11: & Vec<i64>, nt: i64, attr: i64, clus: i64, size: i64, date: i64, time: i64) -> Vec<i64> {
+    var e: Vec<i64> = Vec::filled(32, 0);
+    var i: i64 = 0;
+    while i < 11 {
+        e.set(i, short11.get(i));
+        i = i + 1;
+    }
+    e.set(11, attr);
+    e.set(12, nt);
+    fat_put16(&mut e, 14, time);
+    fat_put16(&mut e, 16, date);
+    fat_put16(&mut e, 18, date);
+    fat_put16(&mut e, 20, (clus >> 16) & 65535);
+    fat_put16(&mut e, 22, time);
+    fat_put16(&mut e, 24, date);
+    fat_put16(&mut e, 26, clus & 65535);
+    fat_put32(&mut e, 28, size);
+    return e;
+}
+
+/// Add an entry `name` to directory `dclus`. Returns its slot or -errno.
+fn fat_add_entry(vol: &mut FatVol, dclus: i64, name: str, attr: i64, clus: i64, size: i64) -> i64 {
+    if !fat_valid_long_name(name) {
+        return 0 - VFS_EINVAL;
+    }
+    val es: Vec<FatDirEnt> = fat_dir_entries(vol, dclus);
+    val want: str = fat_upper(name);
+    var i: i64 = 0;
+    while i < es.len() {
+        if fat_upper(es.get(i).name) == want || fat_upper(es.get(i).short) == want {
+            return 0 - VFS_EEXIST;
+        }
+        i = i + 1;
+    }
+    val sn: Vec<i64> = fat_short_name(name, &es);
+    var short11: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 11 {
+        short11.push(sn.get(i));
+        i = i + 1;
+    }
+    val nt: i64 = sn.get(11);
+    val units: Vec<i64> = fat_str_to_utf16(name);
+    var nl: i64 = 0;
+    if sn.get(12) == 1 {
+        nl = (units.len() + 12) / 13;
+    }
+    if nl > 20 {
+        return 0 - VFS_ENAMETOOLONG;
+    }
+    var lbas: Vec<i64> = fat_dir_lbas(vol, dclus);
+    var start: i64 = fat_free_run(vol, &lbas, nl + 1);
+    while start < 0 {
+        if dclus == 0 && vol.fat_type != 32 {
+            return 0 - VFS_ENOSPC;
+        }
+        var c0: i64 = dclus;
+        if c0 == 0 {
+            c0 = vol.root_clus;
+        }
+        val ch: Vec<i64> = fat_chain(vol, c0);
+        val nc: i64 = fat_alloc(vol, ch.get(ch.len() - 1));
+        if nc < 0 {
+            return nc;
+        }
+        fat_zero_cluster(vol, nc);
+        lbas = fat_dir_lbas(vol, dclus);
+        start = fat_free_run(vol, &lbas, nl + 1);
+    }
+    val sum: i64 = fat_lfn_checksum(&short11);
+    var k: i64 = 0;
+    while k < nl {
+        val seq: i64 = nl - k;
+        var e: Vec<i64> = Vec::filled(32, 0);
+        if k == 0 {
+            e.set(0, seq | 64);
+        } else {
+            e.set(0, seq);
+        }
+        e.set(11, FAT_ATTR_LFN);
+        e.set(13, sum);
+        var j: i64 = 0;
+        while j < 13 {
+            val idx: i64 = (seq - 1) * 13 + j;
+            var u: i64 = 65535;
+            if idx < units.len() {
+                u = units.get(idx);
+            } else if idx == units.len() {
+                u = 0;
+            }
+            var o: i64 = 0;
+            if j < 5 {
+                o = 1 + 2 * j;
+            } else if j < 11 {
+                o = 14 + 2 * (j - 5);
+            } else {
+                o = 28 + 2 * (j - 11);
+            }
+            fat_put16(&mut e, o, u);
+            j = j + 1;
+        }
+        fat_slot_write(vol, &lbas, start + k, &e);
+        k = k + 1;
+    }
+    val se: Vec<i64> = fat_short_entry(&short11, nt, attr, clus, size, vol.date, vol.time);
+    fat_slot_write(vol, &lbas, start + nl, &se);
+    return start + nl;
+}
+
+/// Mark the slots of entry `e` deleted.
+fn fat_remove_slots(vol: & FatVol, e: & FatDirEnt) {
+    val lbas: Vec<i64> = fat_dir_lbas(vol, e.dir);
+    var s: i64 = e.first;
+    while s <= e.slot {
+        var r: Vec<i64> = fat_slot_read(vol, &lbas, s);
+        r.set(0, 229);
+        fat_slot_write(vol, &lbas, s, &r);
+        s = s + 1;
+    }
+}
+
+fn fat_update_short(vol: & FatVol, e: & FatDirEnt, clus: i64, size: i64) {
+    val lbas: Vec<i64> = fat_dir_lbas(vol, e.dir);
+    var r: Vec<i64> = fat_slot_read(vol, &lbas, e.slot);
+    fat_put16(&mut r, 20, (clus >> 16) & 65535);
+    fat_put16(&mut r, 26, clus & 65535);
+    fat_put32(&mut r, 28, size);
+    fat_put16(&mut r, 22, vol.time);
+    fat_put16(&mut r, 24, vol.date);
+    fat_put16(&mut r, 18, vol.date);
+    fat_slot_write(vol, &lbas, e.slot, &r);
+}
+
+// --- files ----------------------------------------------------------------------------------
+
+/// The contents of a file. Sets vol.err ("" when ok).
+pub fn fat_read_file(vol: &mut FatVol, path: str) -> Vec<i64> {
+    vol.err = "";
+    val e: FatDirEnt = fat_lookup(vol, path);
+    if !e.found {
+        vol.err = "not found";
+        return Vec::new();
+    }
+    if (e.attr & FAT_ATTR_DIRECTORY) != 0 {
+        vol.err = "is a directory";
+        return Vec::new();
+    }
+    return fat_read_ent(vol, &e, 0, e.size);
+}
+
+/// `len` bytes from `off` of the file of entry `e`.
+pub fn fat_read_ent(vol: & FatVol, e: & FatDirEnt, off: i64, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var end: i64 = off + len;
+    if end > e.size {
+        end = e.size;
+    }
+    if off >= end {
+        return out;
+    }
+    val cb: i64 = vol.bps * vol.spc;
+    val ch: Vec<i64> = fat_chain(vol, e.clus);
+    var pos: i64 = off;
+    while pos < end {
+        val ci: i64 = pos / cb;
+        if ci >= ch.len() {
+            break;
+        }
+        val within: i64 = pos - ci * cb;
+        val lba: i64 = fat_clus_lba(vol, ch.get(ci)) + within / vol.bps;
+        val s: Vec<i64> = blk_read(&vol.dev, lba);
+        var k: i64 = within % vol.bps;
+        while k < vol.bps && pos < end {
+            out.push(s.get(k));
+            k = k + 1;
+            pos = pos + 1;
+        }
+    }
+    return out;
+}
+
+/// Write `data` into a newly allocated chain; returns its first cluster
+/// (0 for no data) or -errno.
+fn fat_store(vol: &mut FatVol, data: & Vec<i64>) -> i64 {
+    if data.len() == 0 {
+        return 0;
+    }
+    val cb: i64 = vol.bps * vol.spc;
+    val need: i64 = (data.len() + cb - 1) / cb;
+    if vol.free_count >= 0 && vol.free_count < need {
+        return 0 - VFS_ENOSPC;
+    }
+    var first: i64 = 0;
+    var prev: i64 = 0;
+    var n: i64 = 0;
+    val zero: Vec<i64> = Vec::filled(vol.bps, 0);
+    while n < need {
+        val c: i64 = fat_alloc(vol, prev);
+        if c < 0 {
+            if first > 0 {
+                fat_free_chain(vol, first);
+            }
+            return c;
+        }
+        if first == 0 {
+            first = c;
+        }
+        var s: i64 = 0;
+        while s < vol.spc {
+            val base: i64 = n * cb + s * vol.bps;
+            if base < data.len() {
+                var sec: Vec<i64> = zero;
+                var k: i64 = 0;
+                while k < vol.bps && base + k < data.len() {
+                    sec.set(k, data.get(base + k));
+                    k = k + 1;
+                }
+                blk_write(&vol.dev, fat_clus_lba(vol, c) + s, sec);
+            } else {
+                blk_zero(&vol.dev, fat_clus_lba(vol, c) + s, 1);
+            }
+            s = s + 1;
+        }
+        prev = c;
+        n = n + 1;
+    }
+    return first;
+}
+
+/// Create or replace the file at `path` with `data`. Returns 0 or -errno.
+pub fn fat_write_file(vol: &mut FatVol, path: str, data: Vec<i64>) -> i64 {
+    if data.len() > 4294967295 {
+        return 0 - VFS_EFBIG;
+    }
+    val pp: Vec<str> = fat_split_parent(path);
+    val d: FatDirEnt = fat_lookup(vol, pp.get(0));
+    if !d.found {
+        return 0 - VFS_ENOENT;
+    }
+    if (d.attr & FAT_ATTR_DIRECTORY) == 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    val e: FatDirEnt = fat_find(vol, d.clus, pp.get(1));
+    if e.found {
+        if (e.attr & FAT_ATTR_DIRECTORY) != 0 {
+            return 0 - VFS_EISDIR;
+        }
+        if (e.attr & FAT_ATTR_READ_ONLY) != 0 {
+            return 0 - VFS_EACCES;
+        }
+        if e.clus != 0 {
+            fat_free_chain(vol, e.clus);
+        }
+        val c: i64 = fat_store(vol, &data);
+        if c < 0 {
+            fat_update_short(vol, &e, 0, 0);
+            fat_sync(vol);
+            return c;
+        }
+        fat_update_short(vol, &e, c, data.len());
+        fat_sync(vol);
+        return 0;
+    }
+    val c: i64 = fat_store(vol, &data);
+    if c < 0 {
+        return c;
+    }
+    val r: i64 = fat_add_entry(vol, d.clus, pp.get(1), FAT_ATTR_ARCHIVE, c, data.len());
+    if r < 0 && c > 0 {
+        fat_free_chain(vol, c);
+    }
+    fat_sync(vol);
+    if r < 0 {
+        return r;
+    }
+    return 0;
+}
+
+/// Point the ".." entry of directory `dclus` at `parent` (0 for the root).
+fn fat_set_dotdot(vol: & FatVol, dclus: i64, parent: i64) {
+    var p: i64 = parent;
+    if vol.fat_type == 32 && p == vol.root_clus {
+        p = 0;
+    }
+    val lbas: Vec<i64> = fat_dir_lbas(vol, dclus);
+    var dd: Vec<i64> = fat_slot_read(vol, &lbas, 1);
+    fat_put16(&mut dd, 20, (p >> 16) & 65535);
+    fat_put16(&mut dd, 26, p & 65535);
+    fat_slot_write(vol, &lbas, 1, &dd);
+}
+
+/// Make directory `name` in directory `dclus`: a zeroed cluster with "."
+/// and "..". Returns the new entry's slot or -errno.
+fn fat_mkdir_in(vol: &mut FatVol, dclus: i64, name: str) -> i64 {
+    if fat_find(vol, dclus, name).found {
+        return 0 - VFS_EEXIST;
+    }
+    val c: i64 = fat_alloc(vol, 0);
+    if c < 0 {
+        return c;
+    }
+    fat_zero_cluster(vol, c);
+    var parent: i64 = dclus;
+    if parent == vol.root_clus && vol.fat_type == 32 {
+        parent = 0;
+    }
+    val dname: Vec<i64> = str_bytes(".          ");
+    val ddname: Vec<i64> = str_bytes("..         ");
+    val dot: Vec<i64> = fat_short_entry(&dname, 0, FAT_ATTR_DIRECTORY, c, 0, vol.date, vol.time);
+    val dotdot: Vec<i64> = fat_short_entry(&ddname, 0, FAT_ATTR_DIRECTORY, parent, 0, vol.date, vol.time);
+    var sec: Vec<i64> = Vec::filled(vol.bps, 0);
+    var i: i64 = 0;
+    while i < 32 {
+        sec.set(i, dot.get(i));
+        sec.set(32 + i, dotdot.get(i));
+        i = i + 1;
+    }
+    blk_write(&vol.dev, fat_clus_lba(vol, c), sec);
+    val r: i64 = fat_add_entry(vol, dclus, name, FAT_ATTR_DIRECTORY, c, 0);
+    if r < 0 {
+        fat_free_chain(vol, c);
+    }
+    fat_sync(vol);
+    return r;
+}
+
+/// Create a directory. Returns 0 or -errno.
+pub fn fat_mkdir(vol: &mut FatVol, path: str) -> i64 {
+    val pp: Vec<str> = fat_split_parent(path);
+    val d: FatDirEnt = fat_lookup(vol, pp.get(0));
+    if !d.found {
+        return 0 - VFS_ENOENT;
+    }
+    if (d.attr & FAT_ATTR_DIRECTORY) == 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    val r: i64 = fat_mkdir_in(vol, d.clus, pp.get(1));
+    if r < 0 {
+        return r;
+    }
+    return 0;
+}
+
+fn fat_dir_is_empty(vol: & FatVol, clus: i64) -> bool {
+    val es: Vec<FatDirEnt> = fat_dir_entries(vol, clus);
+    var i: i64 = 0;
+    while i < es.len() {
+        val s: str = es.get(i).short;
+        if s != "." && s != ".." {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Delete a file or an empty directory. Returns 0 or -errno.
+pub fn fat_delete(vol: &mut FatVol, path: str) -> i64 {
+    val e: FatDirEnt = fat_lookup(vol, path);
+    if !e.found || e.dir < 0 {
+        if e.found {
+            return 0 - VFS_EBUSY;
+        }
+        return 0 - VFS_ENOENT;
+    }
+    if (e.attr & FAT_ATTR_DIRECTORY) != 0 && !fat_dir_is_empty(vol, e.clus) {
+        return 0 - VFS_ENOTEMPTY;
+    }
+    fat_remove_slots(vol, &e);
+    if e.clus != 0 {
+        fat_free_chain(vol, e.clus);
+    }
+    fat_sync(vol);
+    return 0;
+}
+
+/// Rename or move an entry (the target must not exist). A moved
+/// directory's ".." is updated.
+pub fn fat_rename(vol: &mut FatVol, from: str, to: str) -> i64 {
+    val e: FatDirEnt = fat_lookup(vol, from);
+    if !e.found {
+        return 0 - VFS_ENOENT;
+    }
+    if e.dir < 0 {
+        return 0 - VFS_EBUSY;
+    }
+    val pp: Vec<str> = fat_split_parent(to);
+    val d: FatDirEnt = fat_lookup(vol, pp.get(0));
+    if !d.found {
+        return 0 - VFS_ENOENT;
+    }
+    if (d.attr & FAT_ATTR_DIRECTORY) == 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    if (e.attr & FAT_ATTR_DIRECTORY) != 0 {
+        // not into itself: walk up from the target directory via ".."
+        var c: i64 = d.clus;
+        var steps: i64 = 0;
+        while c != 0 && c != fat_root(vol) && steps < 4096 {
+            if c == e.clus {
+                return 0 - VFS_EINVAL;
+            }
+            val up: FatDirEnt = fat_find(vol, c, "..");
+            if !up.found {
+                break;
+            }
+            c = up.clus;
+            steps = steps + 1;
+        }
+    }
+    val r: i64 = fat_add_entry(vol, d.clus, pp.get(1), e.attr, e.clus, e.size);
+    if r < 0 {
+        return r;
+    }
+    fat_remove_slots(vol, &e);
+    if (e.attr & FAT_ATTR_DIRECTORY) != 0 && d.clus != e.dir {
+        fat_set_dotdot(vol, e.clus, d.clus);
+    }
+    fat_sync(vol);
+    return 0;
+}
+
+// --- formatting ---------------------------------------------------------------------------
+
+fn fat_spc_fat16(tot: i64) -> i64 {
+    if tot <= 8400 { return 0; }
+    if tot <= 32680 { return 2; }
+    if tot <= 262144 { return 4; }
+    if tot <= 524288 { return 8; }
+    if tot <= 1048576 { return 16; }
+    if tot <= 2097152 { return 32; }
+    if tot <= 4194304 { return 64; }
+    return 0;
+}
+
+fn fat_spc_fat32(tot: i64) -> i64 {
+    if tot <= 66600 { return 0; }
+    if tot <= 532480 { return 1; }
+    if tot <= 16777216 { return 8; }
+    if tot <= 33554432 { return 16; }
+    if tot <= 67108864 { return 32; }
+    return 64;
+}
+
+/// Format `dev` as FAT12, FAT16 or FAT32 (`kind` 12/16/32, 0 to choose by
+/// size). `volid` is the volume serial number. The result is the opened
+/// volume (err "" on success).
+pub fn fat_format(dev: BlockDev, kind: i64, label: str, volid: i64) -> FatVol {
+    val bps: i64 = dev.block_size;
+    val tot: i64 = dev.nblocks;
+    if bps != 512 && bps != 1024 && bps != 2048 && bps != 4096 {
+        return fat_empty_vol(dev, "unsupported sector size");
+    }
+    var t: i64 = kind;
+    if t == 0 {
+        if tot <= 8400 {
+            t = 12;
+        } else if tot <= 1048576 {
+            t = 16;
+        } else {
+            t = 32;
+        }
+    }
+    var spc: i64 = 1;
+    var rsvd: i64 = 1;
+    var root_ent: i64 = 512;
+    var media: i64 = 248;
+    var spt: i64 = 63;
+    var heads: i64 = 255;
+    if t == 12 {
+        if tot == 2880 {
+            // the 3.5" 1.44 MB floppy
+            root_ent = 224;
+            media = 240;
+            spt = 18;
+            heads = 2;
+        } else if tot <= 1440 {
+            root_ent = 112;
+            spc = 2;
+        }
+    } else if t == 16 {
+        spc = fat_spc_fat16(tot);
+    } else {
+        spc = fat_spc_fat32(tot);
+        rsvd = 32;
+        root_ent = 0;
+    }
+    if spc == 0 {
+        return fat_empty_vol(dev, "volume size does not suit FAT" + int_to_str(t));
+    }
+    val nfats: i64 = 2;
+    val root_secs: i64 = (root_ent * 32 + bps - 1) / bps;
+    // FAT size: the smallest that covers every cluster it leaves room for
+    var fatsz: i64 = 1;
+    var clusters: i64 = 0;
+    loop {
+        if tot <= rsvd + nfats * fatsz + root_secs {
+            return fat_empty_vol(dev, "volume too small");
+        }
+        clusters = (tot - rsvd - nfats * fatsz - root_secs) / spc;
+        if t == 12 && clusters >= 4085 && spc < 128 {
+            spc = spc * 2;
+            continue;
+        }
+        var bytes: i64 = 0;
+        if t == 12 {
+            bytes = ((clusters + 2) * 3 + 1) / 2;
+        } else if t == 16 {
+            bytes = (clusters + 2) * 2;
+        } else {
+            bytes = (clusters + 2) * 4;
+        }
+        val need: i64 = (bytes + bps - 1) / bps;
+        if need <= fatsz {
+            break;
+        }
+        fatsz = need;
+    }
+    // the climb can overshoot: take the smallest size that still covers
+    while fatsz > 1 {
+        val f: i64 = fatsz - 1;
+        val cl: i64 = (tot - rsvd - nfats * f - root_secs) / spc;
+        var bytes: i64 = 0;
+        if t == 12 {
+            bytes = ((cl + 2) * 3 + 1) / 2;
+        } else if t == 16 {
+            bytes = (cl + 2) * 2;
+        } else {
+            bytes = (cl + 2) * 4;
+        }
+        if (bytes + bps - 1) / bps > f {
+            break;
+        }
+        fatsz = f;
+        clusters = cl;
+    }
+    if (t == 12 && clusters >= 4085) || (t == 16 && (clusters < 4085 || clusters >= 65525)) || (t == 32 && clusters < 65525) {
+        return fat_empty_vol(dev, "volume size does not suit FAT" + int_to_str(t));
+    }
+    var b: Vec<i64> = Vec::filled(bps, 0);
+    b.set(0, 235);
+    if t == 32 {
+        b.set(1, 88);
+    } else {
+        b.set(1, 60);
+    }
+    b.set(2, 144);
+    fat_put_ascii(&mut b, 3, 8, "MSWIN4.1");
+    fat_put16(&mut b, 11, bps);
+    b.set(13, spc);
+    fat_put16(&mut b, 14, rsvd);
+    b.set(16, nfats);
+    fat_put16(&mut b, 17, root_ent);
+    if tot < 65536 && t != 32 {
+        fat_put16(&mut b, 19, tot);
+    } else {
+        fat_put32(&mut b, 32, tot);
+    }
+    b.set(21, media);
+    fat_put16(&mut b, 24, spt);
+    fat_put16(&mut b, 26, heads);
+    var lab: str = fat_upper(label);
+    if str_len(lab) == 0 {
+        lab = "NO NAME";
+    }
+    if t == 32 {
+        fat_put32(&mut b, 36, fatsz);
+        fat_put32(&mut b, 44, 2);
+        fat_put16(&mut b, 48, 1);
+        fat_put16(&mut b, 50, 6);
+        b.set(64, 128);
+        b.set(66, 41);
+        fat_put32(&mut b, 67, volid);
+        fat_put_ascii(&mut b, 71, 11, lab);
+        fat_put_ascii(&mut b, 82, 8, "FAT32");
+    } else {
+        fat_put16(&mut b, 22, fatsz);
+        b.set(36, 128);
+        b.set(38, 41);
+        fat_put32(&mut b, 39, volid);
+        fat_put_ascii(&mut b, 43, 11, lab);
+        fat_put_ascii(&mut b, 54, 8, "FAT" + int_to_str(t));
+    }
+    b.set(510, 85);
+    b.set(511, 170);
+    // reserved area, FATs and the root region start out zeroed
+    blk_zero(&dev, 0, rsvd + nfats * fatsz + root_secs);
+    blk_write(&dev, 0, b);
+    if t == 32 {
+        blk_write(&dev, 6, b);
+        var fi: Vec<i64> = Vec::filled(bps, 0);
+        fat_put32(&mut fi, 0, 1096897106);
+        fat_put32(&mut fi, 484, 1631679090);
+        fat_put32(&mut fi, 488, clusters - 1);
+        fat_put32(&mut fi, 492, 3);
+        fat_put32(&mut fi, 508, 2857697280);
+        blk_write(&dev, 1, fi);
+        blk_write(&dev, 7, fi);
+    }
+    // FAT[0] = media, FAT[1] = end of chain (and FAT[2] for the FAT32 root)
+    var f0: Vec<i64> = Vec::filled(bps, 0);
+    if t == 12 {
+        f0.set(0, media);
+        f0.set(1, 255);
+        f0.set(2, 255);
+    } else if t == 16 {
+        fat_put16(&mut f0, 0, 65280 | media);
+        fat_put16(&mut f0, 2, 65535);
+    } else {
+        fat_put32(&mut f0, 0, 268435200 | media);
+        fat_put32(&mut f0, 4, 268435455);
+        fat_put32(&mut f0, 8, 268435455);
+    }
+    var copy: i64 = 0;
+    while copy < nfats {
+        blk_write(&dev, rsvd + copy * fatsz, f0);
+        copy = copy + 1;
+    }
+    var vol: FatVol = fat_open(dev);
+    if str_len(vol.err) > 0 {
+        return vol;
+    }
+    if t == 32 {
+        fat_zero_cluster(&vol, 2);
+    }
+    if lab != "NO NAME" {
+        var l11: Vec<i64> = Vec::filled(11, 32);
+        val lb: Vec<i64> = str_bytes(lab);
+        var i: i64 = 0;
+        while i < 11 && i < lb.len() {
+            l11.set(i, lb.get(i));
+            i = i + 1;
+        }
+        val le: Vec<i64> = fat_short_entry(&l11, 0, FAT_ATTR_VOLUME_ID, 0, 0, vol.date, vol.time);
+        val lbas: Vec<i64> = fat_dir_lbas(&vol, fat_root(&vol));
+        fat_slot_write(&vol, &lbas, 0, &le);
+    }
+    return vol;
+}
+
+// --- vfs file system -------------------------------------------------------------------------
+
+var fv_vols: Vec<FatVol> = Vec::new();
+var fv_ino_fs: Vec<i64> = Vec::new();
+var fv_ino_dir: Vec<i64> = Vec::new();
+var fv_ino_slot: Vec<i64> = Vec::new();
+var fv_ino_map: HashMap<str, i64> = HashMap::new();
+
+fn fv_ino(fs: i64, dir: i64, slot: i64) -> i64 {
+    val key: str = int_to_str(fs) + ":" + int_to_str(dir) + ":" + int_to_str(slot);
+    if fv_ino_map.contains(key) {
+        return fv_ino_map.get(key);
+    }
+    if fv_ino_fs.len() == 0 {
+        fv_ino_fs.push(-1);
+        fv_ino_dir.push(-1);
+        fv_ino_slot.push(-1);
+    }
+    val ino: i64 = fv_ino_fs.len();
+    fv_ino_fs.push(fs);
+    fv_ino_dir.push(dir);
+    fv_ino_slot.push(slot);
+    fv_ino_map.insert(key, ino);
+    return ino;
+}
+
+/// The directory entry an inode stands for (the root for the fs's root).
+fn fv_ent(fs: i64, ino: i64) -> FatDirEnt {
+    val vol: FatVol = fv_vols.get(fs);
+    if ino == fv_ino(fs, -1, -1) {
+        return fat_root_ent(&vol);
+    }
+    if ino <= 0 || ino >= fv_ino_fs.len() || fv_ino_fs.get(ino) != fs {
+        return fat_not_found();
+    }
+    val es: Vec<FatDirEnt> = fat_dir_entries(&vol, fv_ino_dir.get(ino));
+    var i: i64 = 0;
+    while i < es.len() {
+        if es.get(i).slot == fv_ino_slot.get(ino) {
+            return es.get(i);
+        }
+        i = i + 1;
+    }
+    return fat_not_found();
+}
+
+/// The path of an inode's entry is not kept, so operations are done on
+/// the directory cluster directly.
+fn fv_dir_clus(fs: i64, dir: i64) -> i64 {
+    val e: FatDirEnt = fv_ent(fs, dir);
+    if !e.found || (e.attr & FAT_ATTR_DIRECTORY) == 0 {
+        return -1;
+    }
+    return e.clus;
+}
+
+pub fn fat_fs_root(fs: i64) -> i64 {
+    if fs < 0 || fs >= fv_vols.len() {
+        return 0 - VFS_EINVAL;
+    }
+    return fv_ino(fs, -1, -1);
+}
+
+pub fn fat_fs_lookup(fs: i64, dir: i64, name: str) -> i64 {
+    val dc: i64 = fv_dir_clus(fs, dir);
+    if dc < 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    val vol: FatVol = fv_vols.get(fs);
+    val e: FatDirEnt = fat_find(&vol, dc, name);
+    if !e.found {
+        return 0 - VFS_ENOENT;
+    }
+    if e.short == ".." && (e.clus == 0 || e.clus == fat_root(&vol)) {
+        return fv_ino(fs, -1, -1);
+    }
+    return fv_ino(fs, dc, e.slot);
+}
+
+pub fn fat_fs_getattr(fs: i64, ino: i64) -> Vec<i64> {
+    val e: FatDirEnt = fv_ent(fs, ino);
+    var w: Vec<i64> = Vec::new();
+    if !e.found {
+        w.push(0 - VFS_ENOENT);
+        w.push(0);
+        w.push(0);
+        w.push(0);
+        w.push(0);
+        w.push(0);
+        return w;
+    }
+    var perm: i64 = 438;
+    if (e.attr & FAT_ATTR_READ_ONLY) != 0 {
+        perm = 292;
+    }
+    w.push(0);
+    if (e.attr & FAT_ATTR_DIRECTORY) != 0 {
+        w.push(VFS_DIR);
+        w.push(0);
+        w.push(2);
+        w.push(VFS_S_IFDIR | 511);
+    } else {
+        w.push(VFS_REG);
+        w.push(e.size);
+        w.push(1);
+        w.push(VFS_S_IFREG | perm);
+    }
+    w.push(e.wdate * 65536 + e.wtime);
+    return w;
+}
+
+pub fn fat_fs_read(fs: i64, ino: i64, off: i64, len: i64) -> Vec<i64> {
+    val e: FatDirEnt = fv_ent(fs, ino);
+    if !e.found || (e.attr & FAT_ATTR_DIRECTORY) != 0 {
+        return Vec::new();
+    }
+    val vol: FatVol = fv_vols.get(fs);
+    return fat_read_ent(&vol, &e, off, len);
+}
+
+/// Replace the data of the file entry `e` (by rewriting its chain).
+fn fv_replace(fs: i64, e: & FatDirEnt, data: & Vec<i64>) -> i64 {
+    var vol: FatVol = fv_vols.get(fs);
+    if e.clus != 0 {
+        fat_free_chain(&mut vol, e.clus);
+    }
+    val c: i64 = fat_store(&mut vol, data);
+    if c < 0 {
+        fat_update_short(&vol, e, 0, 0);
+        fat_sync(&vol);
+        fv_vols.set(fs, vol);
+        return c;
+    }
+    fat_update_short(&vol, e, c, data.len());
+    fat_sync(&vol);
+    fv_vols.set(fs, vol);
+    return 0;
+}
+
+pub fn fat_fs_write(fs: i64, ino: i64, off: i64, data: Vec<i64>) -> i64 {
+    val e: FatDirEnt = fv_ent(fs, ino);
+    if !e.found {
+        return 0 - VFS_ENOENT;
+    }
+    if (e.attr & FAT_ATTR_DIRECTORY) != 0 {
+        return 0 - VFS_EISDIR;
+    }
+    val vol: FatVol = fv_vols.get(fs);
+    var cur: Vec<i64> = fat_read_ent(&vol, &e, 0, e.size);
+    while cur.len() < off {
+        cur.push(0);
+    }
+    var i: i64 = 0;
+    while i < data.len() {
+        if off + i < cur.len() {
+            cur.set(off + i, data.get(i) & 255);
+        } else {
+            cur.push(data.get(i) & 255);
+        }
+        i = i + 1;
+    }
+    val r: i64 = fv_replace(fs, &e, &cur);
+    if r < 0 {
+        return r;
+    }
+    return data.len();
+}
+
+pub fn fat_fs_truncate(fs: i64, ino: i64, size: i64) -> i64 {
+    val e: FatDirEnt = fv_ent(fs, ino);
+    if !e.found {
+        return 0 - VFS_ENOENT;
+    }
+    val vol: FatVol = fv_vols.get(fs);
+    var cur: Vec<i64> = fat_read_ent(&vol, &e, 0, size);
+    while cur.len() < size {
+        cur.push(0);
+    }
+    return fv_replace(fs, &e, &cur);
+}
+
+fn fv_make(fs: i64, dir: i64, name: str, attr: i64) -> i64 {
+    val dc: i64 = fv_dir_clus(fs, dir);
+    if dc < 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    var vol: FatVol = fv_vols.get(fs);
+    var slot: i64 = 0;
+    if attr == FAT_ATTR_DIRECTORY {
+        slot = fat_mkdir_in(&mut vol, dc, name);
+    } else {
+        slot = fat_add_entry(&mut vol, dc, name, attr, 0, 0);
+    }
+    fat_sync(&vol);
+    fv_vols.set(fs, vol);
+    if slot < 0 {
+        return slot;
+    }
+    return fv_ino(fs, dc, slot);
+}
+
+pub fn fat_fs_create(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+    var attr: i64 = FAT_ATTR_ARCHIVE;
+    if (mode & 146) == 0 {
+        attr = attr | FAT_ATTR_READ_ONLY;
+    }
+    return fv_make(fs, dir, name, attr);
+}
+
+pub fn fat_fs_mkdir(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+    return fv_make(fs, dir, name, FAT_ATTR_DIRECTORY);
+}
+
+fn fv_remove(fs: i64, dir: i64, name: str, want_dir: bool) -> i64 {
+    val dc: i64 = fv_dir_clus(fs, dir);
+    if dc < 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    var vol: FatVol = fv_vols.get(fs);
+    val e: FatDirEnt = fat_find(&vol, dc, name);
+    if !e.found {
+        return 0 - VFS_ENOENT;
+    }
+    val is_dir: bool = (e.attr & FAT_ATTR_DIRECTORY) != 0;
+    if want_dir && !is_dir {
+        return 0 - VFS_ENOTDIR;
+    }
+    if !want_dir && is_dir {
+        return 0 - VFS_EISDIR;
+    }
+    if is_dir && !fat_dir_is_empty(&vol, e.clus) {
+        return 0 - VFS_ENOTEMPTY;
+    }
+    fat_remove_slots(&vol, &e);
+    if e.clus != 0 {
+        fat_free_chain(&mut vol, e.clus);
+    }
+    fat_sync(&vol);
+    fv_vols.set(fs, vol);
+    return 0;
+}
+
+pub fn fat_fs_unlink(fs: i64, dir: i64, name: str) -> i64 {
+    return fv_remove(fs, dir, name, false);
+}
+
+pub fn fat_fs_rmdir(fs: i64, dir: i64, name: str) -> i64 {
+    return fv_remove(fs, dir, name, true);
+}
+
+pub fn fat_fs_rename(fs: i64, odir: i64, oname: str, ndir: i64, nname: str) -> i64 {
+    val oc: i64 = fv_dir_clus(fs, odir);
+    val nc: i64 = fv_dir_clus(fs, ndir);
+    if oc < 0 || nc < 0 {
+        return 0 - VFS_ENOTDIR;
+    }
+    var vol: FatVol = fv_vols.get(fs);
+    val e: FatDirEnt = fat_find(&vol, oc, oname);
+    if !e.found {
+        return 0 - VFS_ENOENT;
+    }
+    val t: FatDirEnt = fat_find(&vol, nc, nname);
+    if t.found {
+        if t.slot == e.slot && t.dir == e.dir {
+            return 0;
+        }
+        val r: i64 = fv_remove(fs, ndir, nname, (t.attr & FAT_ATTR_DIRECTORY) != 0);
+        if r < 0 {
+            return r;
+        }
+        vol = fv_vols.get(fs);
+    }
+    val e2: FatDirEnt = fat_find(&vol, oc, oname);
+    val slot: i64 = fat_add_entry(&mut vol, nc, nname, e2.attr, e2.clus, e2.size);
+    if slot < 0 {
+        fv_vols.set(fs, vol);
+        return slot;
+    }
+    fat_remove_slots(&vol, &e2);
+    if (e2.attr & FAT_ATTR_DIRECTORY) != 0 && nc != oc {
+        fat_set_dotdot(&vol, e2.clus, nc);
+    }
+    fat_sync(&vol);
+    fv_vols.set(fs, vol);
+    return 0;
+}
+
+pub fn fat_fs_readdir(fs: i64, dir: i64, index: i64) -> str {
+    val dc: i64 = fv_dir_clus(fs, dir);
+    if dc < 0 {
+        return "";
+    }
+    val vol: FatVol = fv_vols.get(fs);
+    val es: Vec<FatDirEnt> = fat_dir_entries(&vol, dc);
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i < es.len() {
+        val e: FatDirEnt = es.get(i);
+        if e.short != "." && e.short != ".." {
+            if k == index {
+                return e.name;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn fat_fs_symlink(fs: i64, dir: i64, name: str, target: str) -> i64 {
+    return 0 - VFS_EPERM;
+}
+
+fn fat_fs_readlink(fs: i64, ino: i64) -> str {
+    return "";
+}
+
+pub fn fat_ops() -> FsOps {
+    return FsOps {
+        name: "vfat", root: fat_fs_root, lookup: fat_fs_lookup, getattr: fat_fs_getattr, read: fat_fs_read, write: fat_fs_write, truncate: fat_fs_truncate, create: fat_fs_create, mkdir: fat_fs_mkdir, unlink: fat_fs_unlink, rmdir: fat_fs_rmdir, rename: fat_fs_rename, readdir: fat_fs_readdir, symlink: fat_fs_symlink, readlink: fat_fs_readlink
+    };
+}
+
+/// Register an opened volume as a vfs file system and mount it on `path`.
+/// Returns the file system handle or -errno.
+pub fn fat_mount(v: &mut Vfs, path: str, vol: FatVol) -> i64 {
+    if str_len(vol.err) > 0 {
+        return 0 - VFS_EINVAL;
+    }
+    val fs: i64 = fv_vols.len();
+    fv_vols.push(vol);
+    val r: i64 = vfs_mount(v, path, fat_ops(), fs);
+    if r < 0 {
+        return r;
+    }
+    return fs;
+}
+
+/// The volume behind a mounted handle (its free count and hint are kept
+/// up to date by the vfs operations).
+pub fn fat_fs_volume(fs: i64) -> FatVol {
+    return fv_vols.get(fs);
+}

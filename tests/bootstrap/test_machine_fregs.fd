@@ -1,0 +1,245 @@
+// Track MI/RA (docs/roadmap/llvm-roadmap.md), the machine layer
+// (compiler/nat_ir.fd):
+//   MI25  floats in float registers on every target (x86-64 xmm2..xmm11,
+//         --nat Windows xmm2..xmm5, AArch64 v16..v27, RISC-V f2..f7 /
+//         f28..f31), f32 kept as f32 (single-precision operations, never
+//         widened), a move between the classes only where a float meets an
+//         operation on general registers: loads and stores of 8 / 4 bytes
+//         and the lane moves take the float register itself
+//         (FID_NAT_ON=fregs; FID_NAT_OFF=fregs: every float in a general
+//         register, as before). `x as f32` / `x as f64` between the float
+//         types convert on every nat_ir target (they kept the bits: the f32
+//         lines below printed NaN, 0 and wrong comparisons)
+//   RA10  the register classes: integer, f64 and f32 (ng_mir_classes_c);
+//         FID_VERIFY=1 checks each value's register is in its class's pool
+//         and that no call clobbers a float register holding a live value
+// The program keeps f64 and f32 accumulators in loops, more live floats
+// than the float pool has registers (some must give theirs up), floats
+// live across calls (they cannot stay in a caller-saved float register),
+// every comparison (NaN included), the conversions, floats stored in a Vec
+// and a struct (f32 and f64 fields side by side) and passed to and
+// returned from functions.
+// Native check: tests/nattools/machine_fregs_check.sh (x86-64, AArch64,
+// RISC-V and --nat Windows, with and without the switch, FID_VERIFY=1).
+// pe_ir (the default Windows `emit`) still keeps the bits on an f32 <->
+// f64 cast (known-bugs 2g.13), so this file names its backends.
+//@ backends: run,ccompile
+// Expected output:
+// 249750
+// 1.0000001192092896
+// 0.5
+// 27.890625
+// 3.3333332538604736
+// 385
+// 3.23046875
+// 1237
+// 3628800
+// 1 0 0 1 0 1
+// 0 1 0 0 0 0
+// 1 0 0 1 0 1
+// 0 1 1 1 0 0
+// 0 1 0 0 0 0
+// -7 7 -3 2
+// 2.5 3.25 1000000000000000
+// 0.3333333432674408
+// 45.5625
+// 41
+// 6
+// 87
+// 10.890625 9 21.13720703125 0.25
+// 28.5
+
+struct Pt {
+    x: f64,
+    y: f64,
+}
+
+struct Mix {
+    a: f32,
+    n: i64,
+    b: f64,
+    c: f32,
+}
+
+fn scale(p: Pt, k: f64) -> Pt {
+    return Pt { x: p.x * k, y: p.y * k };
+}
+
+fn half(x: f64) -> f64 {
+    return x * 0.5;
+}
+
+fn third32(x: f32) -> f32 {
+    val three: f32 = 3.0 as f32;
+    val r: f32 = x / three;
+    return r;
+}
+
+fn b2i(b: bool) -> i64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn cmp_line(a: f64, b: f64) -> str {
+    return int_to_str(b2i(a == b)) + " " + int_to_str(b2i(a != b)) + " " + int_to_str(b2i(a < b)) + " " + int_to_str(b2i(a <= b)) + " " + int_to_str(b2i(a > b)) + " " + int_to_str(b2i(a >= b));
+}
+
+fn cmp_line32(a: f32, b: f32) -> str {
+    return int_to_str(b2i(a == b)) + " " + int_to_str(b2i(a != b)) + " " + int_to_str(b2i(a < b)) + " " + int_to_str(b2i(a <= b)) + " " + int_to_str(b2i(a > b)) + " " + int_to_str(b2i(a >= b));
+}
+
+// sum of i * 0.5 for i < n: an f64 accumulator in a loop with no call
+fn acc64(n: i64) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < n {
+        val x: f64 = i as f64;
+        s = s + x * 0.5;
+        i = i + 1;
+    }
+    return s;
+}
+
+// ten additions of 0.1 in f32 (each rounded to single precision)
+fn acc32() -> f32 {
+    var s: f32 = 0.0 as f32;
+    val step: f32 = 0.1 as f32;
+    var i: i64 = 0;
+    while i < 10 {
+        s = s + step;
+        i = i + 1;
+    }
+    return s;
+}
+
+// fourteen floats live at once, then combined: more than the pool holds
+fn many(a: f64) -> f64 {
+    val x1: f64 = a + 1.0;
+    val x2: f64 = a + 2.0;
+    val x3: f64 = a + 3.0;
+    val x4: f64 = a + 4.0;
+    val x5: f64 = a + 5.0;
+    val x6: f64 = a + 6.0;
+    val x7: f64 = a + 7.0;
+    val x8: f64 = a + 8.0;
+    val x9: f64 = a + 9.0;
+    val x10: f64 = a + 10.0;
+    val x11: f64 = a + 11.0;
+    val x12: f64 = a + 12.0;
+    val x13: f64 = a + 13.0;
+    val x14: f64 = a + 14.0;
+    val s1: f64 = x1 * x14 + x2 * x13 + x3 * x12 + x4 * x11;
+    val s2: f64 = x5 * x10 + x6 * x9 + x7 * x8;
+    return s1 + s2 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14;
+}
+
+// floats live across calls
+fn across(n: i64) -> f64 {
+    var t: f64 = 1.5;
+    var u: f64 = 0.25;
+    var i: i64 = 0;
+    while i < n {
+        val h: f64 = half(t + u);
+        t = t + h;
+        u = u + 0.5;
+        i = i + 1;
+    }
+    return t + u;
+}
+
+// f32 and f64 fields loaded, combined and stored back in a loop (loads
+// and stores straight between memory and float registers)
+fn mix_steps(m: Mix, n: i64) -> Mix {
+    var r: Mix = Mix { a: m.a, n: m.n, b: m.b, c: m.c };
+    var i: i64 = 0;
+    while i < n {
+        r.a = r.a * (1.5 as f32) + r.c;
+        r.b = r.b * 0.75 + (r.a as f64);
+        r.n = r.n + 1;
+        i = i + 1;
+    }
+    return r;
+}
+
+// an f32 through calls, widened and narrowed
+fn f32_chain(x: f32) -> f64 {
+    val y: f32 = third32(x) + third32(x * (2.0 as f32));
+    val w: f64 = (y as f64) * 4.0;
+    val back: f32 = w as f32;
+    return (back as f64) + 0.5;
+}
+
+fn main() -> i64 {
+    println(int_to_str(acc64(1000) as i64));
+    println(float_to_str(acc32() as f64));
+    println(float_to_str(half(1.0)));
+    println(float_to_str(many(0.5) / 16.0));
+    println(float_to_str(third32(10.0 as f32) as f64));
+    println(int_to_str(many(0.0) as i64));
+    println(float_to_str(across(4) / 4.0));
+    // f64 products in a loop, then truncated
+    var p: f64 = 1.0;
+    var q: f64 = 0.0;
+    var k: i64 = 1;
+    while k <= 10 {
+        p = p * (k as f64);
+        q = q + (k as f64) * 22.5;
+        k = k + 1;
+    }
+    println(int_to_str(q as i64));
+    println(int_to_str(p as i64));
+    // every comparison, NaN included, f64 and f32
+    val zero: f64 = 0.0;
+    val nan: f64 = zero / zero;
+    println(cmp_line(2.5, 2.5));
+    println(cmp_line(nan, 1.0));
+    println(cmp_line32(1.5 as f32, 1.5 as f32));
+    println(cmp_line32(0.25 as f32, 0.75 as f32));
+    println(cmp_line32(nan as f32, 0.75 as f32));
+    // conversions: truncation toward zero, both widths
+    val m1: f64 = 0.0 - 7.9;
+    val m2: f32 = 7.75 as f32;
+    val m3: f32 = (0.0 - 3.5) as f32;
+    println(int_to_str(m1 as i64) + " " + int_to_str(m2 as i64) + " " + int_to_str(m3 as i64) + " " + int_to_str((2.99 as f32) as i64));
+    // f32 to f64 and back, a large integer to f64
+    val w1: f32 = 2.5 as f32;
+    val w2: f64 = (w1 as f64) + 0.75;
+    val big: i64 = 1000000000000000;
+    println(float_to_str(w1 as f64) + " " + float_to_str(w2) + " " + float_to_str(big as f64));
+    var acc: f32 = 1.0 as f32;
+    acc = acc / (3.0 as f32);
+    println(float_to_str(acc as f64));
+    // floats in a struct and a Vec
+    val pt: Pt = scale(Pt { x: 1.5, y: 3.0 }, 4.5);
+    println(float_to_str(pt.x * pt.y / 2.0));
+    var v: Vec<f64> = Vec::new();
+    var j: i64 = 0;
+    while j < 5 {
+        v.push((j as f64) * 1.25 + 3.2);
+        j = j + 1;
+    }
+    var tot: f64 = 0.0;
+    j = 0;
+    while j < v.len() {
+        tot = tot + v.get(j);
+        j = j + 1;
+    }
+    println(int_to_str(tot as i64 + 13));
+    var cnt: i64 = 0;
+    j = 0;
+    while j < v.len() {
+        if v.get(j) > 5.0 {
+            cnt = cnt + 1;
+        }
+        j = j + 1;
+    }
+    println(int_to_str(cnt * 2));
+    println(float_to_str(tot + pt.y * 3.0 + 18.0));
+    // f32 and f64 fields of one struct
+    val mx: Mix = mix_steps(Mix { a: 0.5 as f32, n: 3, b: 2.0, c: 0.25 as f32 }, 6);
+    println(float_to_str(mx.a as f64) + " " + int_to_str(mx.n) + " " + float_to_str(mx.b) + " " + float_to_str(mx.c as f64));
+    println(float_to_str(f32_chain(7.0 as f32)));
+    return 0;
+}

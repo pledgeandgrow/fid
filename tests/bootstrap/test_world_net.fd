@@ -1,0 +1,130 @@
+// stdlib/world (complaint CT1), the network: a test replaces the network
+// for code it does not change. `UserClient` below is ordinary code over
+// http_client (GET, POST with a JSON body, a retry on 503); the test
+// answers its requests from an in-process handler that keeps state,
+// reads the raw requests it sent, and shows what the code does when
+// there is no network at all. No DNS lookup, no socket.
+//
+// Expected output:
+// create = 201 id=1
+// create = 201 id=2
+// get 1 = 200 ada
+// get 2 = 200 linus
+// get 9 = 404
+// flaky = 200 after 3 tries
+// requests = 8
+// host 0 = api.example:8080
+// req 0 = POST /users
+// type 0 = application/json
+// body 0 = {"name":"ada"}
+// req 2 = GET /users/1
+// agent 2 = fides-http/1.0
+// hosts = api.example:8080 x8
+// offline = 0 after 3 tries
+// offline requests = 3
+// no calls = 0
+use http_client;
+use world;
+
+// ─── the code under test: no test hooks, no parameters for fakes ─────────
+
+const API: str = "api.example";
+const PORT: i64 = 8080;
+var last_tries: i64 = 0;
+
+fn create_user(name: str) -> str {
+    val r = http_post(API, PORT, "/users", "application/json", "{\"name\":\"" + name + "\"}");
+    return int_to_str(r.status) + " " + str_trim(r.body);
+}
+
+fn get_user(id: i64) -> str {
+    val r = http_get(API, PORT, "/users/" + int_to_str(id));
+    if r.status != 200 { return int_to_str(r.status); }
+    return "200 " + str_trim(r.body);
+}
+
+// GET with up to 3 tries while the server is unavailable (503) or
+// unreachable (status 0)
+fn get_with_retry(path: str) -> i64 {
+    var tries: i64 = 0;
+    var status: i64 = 0;
+    while tries < 3 {
+        tries = tries + 1;
+        status = http_get(API, PORT, path).status;
+        if status != 503 && status != 0 { break; }
+    }
+    last_tries = tries;
+    return status;
+}
+
+// ─── the test's fake server ──────────────────────────────────────────────
+
+var users: Vec<str> = Vec::new();
+var flaky_left: i64 = 2;
+
+fn api_server(host: str, port: i64, req: str) -> str {
+    val method: str = world_req_method(req);
+    val path: str = world_req_path(req);
+    if str_equal(method, "POST") && str_equal(path, "/users") {
+        // {"name":"X"} -> X
+        val body: str = world_req_body(req);
+        val q: Vec<str> = str_split(body, "\"");
+        users.push(q.get(3));
+        return world_http_response(201, "id=" + int_to_str(users.len()));
+    }
+    if str_equal(method, "GET") && str_equal(path, "/flaky") {
+        if flaky_left > 0 {
+            flaky_left = flaky_left - 1;
+            return world_http_response(503, "");
+        }
+        return world_http_response(200, "ok");
+    }
+    if str_equal(method, "GET") && str_starts_with(path, "/users/") {
+        val id: i64 = str_parse_int(str_slice(path, 7, str_len(path)));
+        if id >= 1 && id <= users.len() {
+            return world_http_response(200, users.get(id - 1));
+        }
+        return world_http_response(404, "");
+    }
+    return world_http_response(400, "");
+}
+
+fn main() -> i64 {
+    world_fake_network(api_server);
+
+    println("create = " + create_user("ada"));
+    println("create = " + create_user("linus"));
+    println("get 1 = " + get_user(1));
+    println("get 2 = " + get_user(2));
+    println("get 9 = " + get_user(9));
+    val fs: i64 = get_with_retry("/flaky");
+    println("flaky = " + int_to_str(fs) + " after " + int_to_str(last_tries) + " tries");
+
+    println("requests = " + int_to_str(world_net_count()));
+    println("host 0 = " + world_net_host(0));
+    val r0: str = world_net_request(0);
+    println("req 0 = " + world_req_method(r0) + " " + world_req_path(r0));
+    println("type 0 = " + world_req_header(r0, "content-type"));
+    println("body 0 = " + world_req_body(r0));
+    val r2: str = world_net_request(2);
+    println("req 2 = " + world_req_method(r2) + " " + world_req_path(r2));
+    println("agent 2 = " + world_req_header(r2, "User-Agent"));
+    var same: i64 = 0;
+    var i: i64 = 0;
+    while i < world_net_count() {
+        if str_equal(world_net_host(i), "api.example:8080") { same = same + 1; }
+        i = i + 1;
+    }
+    println("hosts = api.example:8080 x" + int_to_str(same));
+
+    // no network: every request fails (status 0) and is still recorded
+    world_no_network();
+    val off: i64 = get_with_retry("/flaky");
+    println("offline = " + int_to_str(off) + " after " + int_to_str(last_tries) + " tries");
+    println("offline requests = " + int_to_str(world_net_count()));
+
+    // a new fake starts with an empty request log
+    world_no_network();
+    println("no calls = " + int_to_str(world_net_count()));
+    return 0;
+}

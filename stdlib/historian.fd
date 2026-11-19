@@ -1,0 +1,339 @@
+// Fides process historian: tags, exception reporting, swinging-door
+// compression and retrieval
+//
+// Pure computation over in-memory archives; the seam is the caller, which
+// feeds (time, value) samples from its data source (OPC UA, Modbus, ...) and
+// may persist `HistTag.times` / `HistTag.values` wherever it likes.
+// - Tag registry: name -> tag, with units, description, exception and
+//   compression settings.
+// - Exception reporting (the first stage of a PI-style historian): a sample
+//   passes when it differs from the last passed value by more than the
+//   exception deviation, or when the exception maximum time has elapsed;
+//   the sample held just before an exception passes too, so a step keeps
+//   its shape.
+// - Swinging-door trending compression (E.H. Bristol, "Swinging door
+//   trending: adaptive trend recording?", ISA 1990): from the last archived
+//   point two "doors" pivot at +/- the compression deviation; every new
+//   point narrows them, and when the line from the pivot to a new point
+//   leaves the doors, the previous point is archived and becomes the new
+//   pivot. Every discarded point therefore lies within the deviation of the
+//   straight line between its archived neighbours. A compression maximum
+//   time forces an archive. With exception reporting in front, a raw
+//   sample is within 2 x exception deviation + compression deviation of
+//   the archived trend.
+// - Retrieval: recorded values in a window, the value at any time
+//   (linear interpolation between archived points), evenly spaced
+//   interpolated samples, and aggregates over a window: time-weighted
+//   average (the integral of the interpolated trend over the window
+//   length), minimum, maximum, sample average and count.
+//
+// Times are f64 seconds; values f64.
+
+module historian;
+use math;
+use vec;
+
+pub struct HistTag {
+    pub name: str,
+    pub units: str,
+    pub description: str,
+    pub exc_dev: f64,
+    pub exc_max: f64,
+    pub comp_dev: f64,
+    pub comp_max: f64,
+    // archive
+    pub times: Vec<f64>,
+    pub values: Vec<f64>,
+    // exception state
+    pub exc_has: bool,
+    pub exc_t: f64,
+    pub exc_v: f64,
+    pub held_has: bool,
+    pub held_t: f64,
+    pub held_v: f64,
+    // compression state: pivot is the last archived point; snapshot the
+    // newest point not archived yet
+    pub snap_has: bool,
+    pub snap_t: f64,
+    pub snap_v: f64,
+    pub slope_hi: f64,
+    pub slope_lo: f64,
+    pub received: i64,
+    pub passed: i64,
+}
+
+pub struct Historian {
+    pub tags: Vec<HistTag>,
+    pub index: HashMap<str, i64>,
+}
+
+pub fn historian_new() -> Historian {
+    return Historian {
+        tags: Vec::new(), index: HashMap::new()
+    };
+}
+
+/// Register a tag; returns its id (the existing id if the name is known).
+/// A deviation of 0 passes every change; a max time of 0 means none.
+pub fn historian_add_tag(h: &mut Historian, name: str, units: str, exc_dev: f64, exc_max: f64, comp_dev: f64, comp_max: f64) -> i64 {
+    if h.index.contains(name) {
+        return h.index.get(name);
+    }
+    h.tags.push(HistTag {
+        name: name, units: units, description: "", exc_dev: exc_dev, exc_max: exc_max, comp_dev: comp_dev, comp_max: comp_max, times: Vec::new(), values: Vec::new(), exc_has: false, exc_t: 0.0, exc_v: 0.0, held_has: false, held_t: 0.0, held_v: 0.0, snap_has: false, snap_t: 0.0, snap_v: 0.0, slope_hi: 0.0, slope_lo: 0.0, received: 0, passed: 0
+    });
+    val id: i64 = h.tags.len() - 1;
+    h.index.insert(name, id);
+    return id;
+}
+
+/// Tag id by name, -1 when unknown.
+pub fn historian_tag_id(h: &Historian, name: str) -> i64 {
+    if h.index.contains(name) {
+        return h.index.get(name);
+    }
+    return -1;
+}
+
+// ─── Swinging door ───
+
+fn hist_archive(tag: &mut HistTag, t: f64, v: f64) {
+    tag.times.push(t);
+    tag.values.push(v);
+}
+
+/// Feed one exception-passed point to the compressor.
+pub fn HistTag_compress(tag: &mut HistTag, t: f64, v: f64) {
+    tag.passed = tag.passed + 1;
+    val n: i64 = tag.times.len();
+    if n == 0 {
+        hist_archive(tag, t, v);
+        tag.snap_has = false;
+        return;
+    }
+    val pt: f64 = tag.times.get(n - 1);
+    val pv: f64 = tag.values.get(n - 1);
+    if t <= pt {
+        return;
+    }
+    if !tag.snap_has {
+        tag.snap_has = true;
+        tag.snap_t = t;
+        tag.snap_v = v;
+        tag.slope_hi = (v + tag.comp_dev - pv) / (t - pt);
+        tag.slope_lo = (v - tag.comp_dev - pv) / (t - pt);
+        return;
+    }
+    // the line from the pivot to the new point must pass through the doors
+    // of every point since the pivot; if it does not, archive the snapshot
+    // and pivot there (the new point becomes the snapshot)
+    val s: f64 = (v - pv) / (t - pt);
+    val too_old: bool = tag.comp_max > 0.0 && t - pt > tag.comp_max;
+    if s > tag.slope_hi || s < tag.slope_lo || too_old {
+        val st: f64 = tag.snap_t;
+        val sv: f64 = tag.snap_v;
+        hist_archive(tag, st, sv);
+        tag.snap_t = t;
+        tag.snap_v = v;
+        tag.slope_hi = (v + tag.comp_dev - sv) / (t - st);
+        tag.slope_lo = (v - tag.comp_dev - sv) / (t - st);
+        return;
+    }
+    tag.slope_hi = math_min_f64(tag.slope_hi, (v + tag.comp_dev - pv) / (t - pt));
+    tag.slope_lo = math_max_f64(tag.slope_lo, (v - tag.comp_dev - pv) / (t - pt));
+    tag.snap_t = t;
+    tag.snap_v = v;
+}
+
+// ─── Exception reporting ───
+
+/// Feed one raw sample: exception test, then compression.
+pub fn HistTag_add(tag: &mut HistTag, t: f64, v: f64) {
+    tag.received = tag.received + 1;
+    if !tag.exc_has {
+        tag.exc_has = true;
+        tag.exc_t = t;
+        tag.exc_v = v;
+        tag.held_has = false;
+        HistTag_compress(tag, t, v);
+        return;
+    }
+    val dev: bool = math_fabs(v - tag.exc_v) > tag.exc_dev;
+    val old: bool = tag.exc_max > 0.0 && t - tag.exc_t >= tag.exc_max;
+    if dev || old {
+        if tag.held_has && dev {
+            val ht: f64 = tag.held_t;
+            val hv: f64 = tag.held_v;
+            HistTag_compress(tag, ht, hv);
+        }
+        tag.exc_t = t;
+        tag.exc_v = v;
+        tag.held_has = false;
+        HistTag_compress(tag, t, v);
+    } else {
+        tag.held_has = true;
+        tag.held_t = t;
+        tag.held_v = v;
+    }
+}
+
+/// Archive what is pending (the held sample and the snapshot), e.g. at
+/// shutdown or before reading the newest data.
+pub fn HistTag_flush(tag: &mut HistTag) {
+    if tag.held_has {
+        val ht: f64 = tag.held_t;
+        val hv: f64 = tag.held_v;
+        tag.held_has = false;
+        tag.exc_t = ht;
+        tag.exc_v = hv;
+        HistTag_compress(tag, ht, hv);
+    }
+    if tag.snap_has {
+        val st: f64 = tag.snap_t;
+        val sv: f64 = tag.snap_v;
+        hist_archive(tag, st, sv);
+        tag.snap_has = false;
+    }
+}
+
+pub fn historian_add(h: &mut Historian, id: i64, t: f64, v: f64) {
+    var tag: HistTag = h.tags.get(id);
+    HistTag_add(&mut tag, t, v);
+    h.tags.set(id, tag);
+}
+
+pub fn historian_flush(h: &mut Historian, id: i64) {
+    var tag: HistTag = h.tags.get(id);
+    HistTag_flush(&mut tag);
+    h.tags.set(id, tag);
+}
+
+/// Raw samples per archived value.
+pub fn HistTag_compression_ratio(tag: &HistTag) -> f64 {
+    if tag.times.len() == 0 {
+        return 0.0;
+    }
+    return (tag.received as f64) / (tag.times.len() as f64);
+}
+
+// ─── Retrieval ───
+
+/// Index of the last archived point at or before t (-1 if none).
+fn hist_find(tag: &HistTag, t: f64) -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = tag.times.len() - 1;
+    if hi < 0 || t < tag.times.get(0) {
+        return -1;
+    }
+    while lo < hi {
+        val mid: i64 = (lo + hi + 1) / 2;
+        if tag.times.get(mid) <= t {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+/// The trend's value at t: linear between archived points, the first or
+/// last value outside them.
+pub fn HistTag_value_at(tag: &HistTag, t: f64) -> f64 {
+    val n: i64 = tag.times.len();
+    if n == 0 {
+        return 0.0;
+    }
+    val i: i64 = hist_find(tag, t);
+    if i < 0 {
+        return tag.values.get(0);
+    }
+    if i >= n - 1 {
+        return tag.values.get(n - 1);
+    }
+    val t0: f64 = tag.times.get(i);
+    val t1: f64 = tag.times.get(i + 1);
+    val f: f64 = (t - t0) / (t1 - t0);
+    return tag.values.get(i) + f * (tag.values.get(i + 1) - tag.values.get(i));
+}
+
+/// `count` evenly spaced interpolated values from t0 to t1 inclusive.
+pub fn HistTag_interpolated(tag: &HistTag, t0: f64, t1: f64, count: i64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var k: i64 = 0;
+    while k < count {
+        var t: f64 = t0;
+        if count > 1 {
+            t = t0 + (t1 - t0) * (k as f64) / ((count - 1) as f64);
+        }
+        out.push(HistTag_value_at(tag, t));
+        k = k + 1;
+    }
+    return out;
+}
+
+/// Archived points with t0 <= t <= t1 as [t, v, t, v, ...].
+pub fn HistTag_recorded(tag: &HistTag, t0: f64, t1: f64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < tag.times.len() {
+        val t: f64 = tag.times.get(i);
+        if t >= t0 && t <= t1 {
+            out.push(t);
+            out.push(tag.values.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub struct HistAggregate {
+    pub time_avg: f64,
+    pub min: f64,
+    pub max: f64,
+    pub sample_avg: f64,
+    pub count: i64,
+}
+
+/// Aggregates of the interpolated trend over [t0, t1] (t1 > t0). Min and
+/// max cover the window's end values and every archived point inside;
+/// count and sample average the archived points inside.
+pub fn HistTag_aggregate(tag: &HistTag, t0: f64, t1: f64) -> HistAggregate {
+    var pts_t: Vec<f64> = Vec::new();
+    var pts_v: Vec<f64> = Vec::new();
+    pts_t.push(t0);
+    pts_v.push(HistTag_value_at(tag, t0));
+    var sum: f64 = 0.0;
+    var cnt: i64 = 0;
+    var i: i64 = 0;
+    while i < tag.times.len() {
+        val t: f64 = tag.times.get(i);
+        if t >= t0 && t <= t1 {
+            sum = sum + tag.values.get(i);
+            cnt = cnt + 1;
+            if t > t0 && t < t1 {
+                pts_t.push(t);
+                pts_v.push(tag.values.get(i));
+            }
+        }
+        i = i + 1;
+    }
+    pts_t.push(t1);
+    pts_v.push(HistTag_value_at(tag, t1));
+    var area: f64 = 0.0;
+    var mn: f64 = pts_v.get(0);
+    var mx: f64 = pts_v.get(0);
+    i = 1;
+    while i < pts_t.len() {
+        area = area + (pts_t.get(i) - pts_t.get(i - 1)) * (pts_v.get(i) + pts_v.get(i - 1)) / 2.0;
+        mn = math_min_f64(mn, pts_v.get(i));
+        mx = math_max_f64(mx, pts_v.get(i));
+        i = i + 1;
+    }
+    var avg: f64 = 0.0;
+    if cnt > 0 {
+        avg = sum / (cnt as f64);
+    }
+    return HistAggregate {
+        time_avg: area / (t1 - t0), min: mn, max: mx, sample_avg: avg, count: cnt
+    };
+}

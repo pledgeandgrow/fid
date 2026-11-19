@@ -1,0 +1,108 @@
+// Track RA, RA14 (docs/roadmap/llvm-roadmap.md): the fast allocator of
+// debug builds (compiler/nat_ir.fd ng_mir_alloc, FID_NAT_FAST=1 or
+// g_nat_fast): no liveness fixed point; a value that lives in more than
+// one block stays in its frame slot, the values local to a block share the
+// registers. The program must give the same output either way: values
+// carried around loops and across branches, swapped in a loop, live
+// across calls, and nested loops.
+// Native check in the fast mode:
+//   FID_NAT_FAST=1 FID_VERIFY=1 NATIVE=1 bash scripts/cross-test.sh \
+//     x86_64-linux tests/bootstrap/test_machine_fast.fd
+// Expected output:
+// 4950
+// 55
+// 348
+// 21
+// 1 0
+// 2870
+// 3628800
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn fact(n: i64) -> i64 {
+    if n <= 1 {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+fn main() -> i64 {
+    // a sum carried around a loop
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        s = s + i;
+        i = i + 1;
+    }
+    println(s);
+
+    // fibonacci: two values defined from each other in a loop
+    var a: i64 = 0;
+    var b: i64 = 1;
+    i = 0;
+    while i < 10 {
+        val t: i64 = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    println(a);
+
+    // values across branches and calls
+    var evens: i64 = 0;
+    var odds: i64 = 0;
+    i = 0;
+    while i < 12 {
+        if i % 2 == 0 {
+            evens = evens + twice(i);
+        } else {
+            odds = odds + i * i;
+        }
+        i = i + 1;
+    }
+    println(evens + odds + 2);
+
+    // a break and a continue
+    var bc: i64 = 0;
+    i = 0;
+    while i < 100 {
+        i = i + 1;
+        if i % 2 == 0 {
+            continue;
+        }
+        if i > 9 {
+            break;
+        }
+        bc = bc + i;
+    }
+    println(bc - 4);
+
+    // a swap in a loop that runs an odd number of times
+    var p: i64 = 0;
+    var q: i64 = 1;
+    i = 0;
+    while i < 3 {
+        val t2: i64 = p;
+        p = q;
+        q = t2;
+        i = i + 1;
+    }
+    println(int_to_str(p) + " " + int_to_str(q));
+
+    // nested loops
+    var sq: i64 = 0;
+    var x: i64 = 1;
+    while x <= 20 {
+        var y: i64 = 0;
+        while y < x {
+            sq = sq + x;
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    println(sq);
+    println(fact(10));
+    return 0;
+}

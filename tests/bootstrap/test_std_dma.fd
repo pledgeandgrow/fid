@@ -1,0 +1,140 @@
+// stdlib/dma: cache-line plans, scatter-gather split/coalesce, a descriptor ring with OWN handoff driven by a simulated engine, and the channel state machine.
+// Expected output:
+// align 1024 960, lines 2, bounce true/false
+// before: clean+invalidate 4096+2 lines (shared lines) | after: invalidate 4096+2 lines
+// before: clean 8192+2 lines
+// [65520:16 65536:32768 98304:32768 131072:32768 163840:1680] total 100000
+// [4096:300 5000:20] / [8000:96 8096:200]
+// submit A 0 B 2 C -1 free 1 doorbells 2
+// slot0 bytes 00 10 00 00 00 00 00 00 05 00 00 82 07 00 00 00 round trip true
+// reap early: 0
+// device 1, reap: 0
+// device 2, irqs 1
+// done first 0 count 2 bytes 11 status 0 tag 7
+// done first 2 count 1 bytes 3 status 0 tag 8
+// done first 3 count 0 bytes 0 status 0 tag 0
+// dst: HELLOWORLD!abc
+// submit D 3 E 1, device 3
+// done first 3 count 2 bytes 4 status 0 tag 9
+// done first 1 count 1 bytes 4 status 1 tag 10
+// dst: HELLOWORLD!abcxyzw
+// configure->configured start->running pause->paused start! resume->running complete->done start! configure->configured start->running fault->error resume! reset->idle
+// rejected 3, state idle
+use dma;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn sg(a: i64, n: i64) -> SgEntry {
+    return SgEntry { addr: a, len: n };
+}
+
+fn put(m: &mut DmaMem, addr: i64, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        m.bytes.set(addr - m.base + i, str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn get(m: &DmaMem, addr: i64, n: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < n {
+        out = out + byte_to_str(m.bytes.get(addr - m.base + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hx(b: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    return str_slice(d, b >> 4, (b >> 4) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn show(d: DmaDone) {
+    println("done first " + int_to_str(d.first) + " count " + int_to_str(d.count) + " bytes " + int_to_str(d.bytes)
+        + " status " + int_to_str(d.status) + " tag " + int_to_str(d.tag));
+}
+
+fn main() {
+    println("align " + int_to_str(dma_align_up(1000, 64)) + " " + int_to_str(dma_align_down(1000, 64)) + ", lines " + int_to_str(dma_line_count(0x1010, 100, 64))
+        + ", bounce " + bs(dma_needs_bounce(0x1010, 100, 64)) + "/" + bs(dma_needs_bounce(0x2000, 128, 64)));
+    println(str_join(dma_cache_plan(0x1010, 100, 64, DMA_FROM_DEVICE), " | "));
+    println(str_join(dma_cache_plan(0x2000, 128, 64, DMA_TO_DEVICE), " | "));
+    val parts: Vec<SgEntry> = dma_sg_split(65520, 100000, 32768, 65536);
+    println(dma_sg_to_str(parts) + " total " + int_to_str(dma_sg_total(parts)));
+    var l1: Vec<SgEntry> = Vec::new();
+    l1.push(sg(4096, 100)); l1.push(sg(4196, 200)); l1.push(sg(5000, 10)); l1.push(sg(5010, 10));
+    var l2: Vec<SgEntry> = Vec::new();
+    l2.push(sg(8000, 96)); l2.push(sg(8096, 200));
+    println(dma_sg_to_str(dma_sg_coalesce(l1, 1000, 0)) + " / " + dma_sg_to_str(dma_sg_coalesce(l2, 1000, 4096)));
+
+    var m: DmaMem = dmamem_new(0x1000, 512);
+    put(&mut m, 0x1000, "HELLO");
+    put(&mut m, 0x1010, "WORLD!");
+    put(&mut m, 0x1020, "abc");
+    put(&mut m, 0x1030, "xy");
+    put(&mut m, 0x1040, "zw");
+    var r: DmaRing = dmaring_new(4);
+    var ta: Vec<SgEntry> = Vec::new();
+    ta.push(sg(0x1000, 5)); ta.push(sg(0x1010, 6));
+    var tb: Vec<SgEntry> = Vec::new();
+    tb.push(sg(0x1020, 3));
+    val a: i64 = dmaring_submit(&mut r, ta, true, 7);
+    val b: i64 = dmaring_submit(&mut r, tb, false, 8);
+    val c: i64 = dmaring_submit(&mut r, ta, true, 9);
+    println("submit A " + int_to_str(a) + " B " + int_to_str(b) + " C " + int_to_str(c) + " free " + int_to_str(dmaring_free(&r)) + " doorbells " + int_to_str(r.doorbells));
+    val bytes: Vec<i64> = dmadesc_bytes(r.descs.get(0));
+    var hs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < bytes.len() {
+        hs.push(hx(bytes.get(i)));
+        i = i + 1;
+    }
+    val back: DmaDesc = dmadesc_from_bytes(bytes, 0);
+    val same: bool = back.addr == r.descs.get(0).addr && back.ctrl == r.descs.get(0).ctrl && back.aux == r.descs.get(0).aux;
+    println("slot0 bytes " + str_join(hs, " ") + " round trip " + bs(same));
+    println("reap early: " + int_to_str(dmaring_reap(&mut r).count));
+    var dev: DmaSimDevice = dmasim_new(0x1100);
+    val n1: i64 = dmasim_run(&mut dev, &mut r, &mut m, 1);
+    println("device " + int_to_str(n1) + ", reap: " + int_to_str(dmaring_reap(&mut r).count));
+    val n2: i64 = dmasim_run(&mut dev, &mut r, &mut m, 10);
+    println("device " + int_to_str(n2) + ", irqs " + int_to_str(dev.irqs));
+    show(dmaring_reap(&mut r));
+    show(dmaring_reap(&mut r));
+    show(dmaring_reap(&mut r));
+    println("dst: " + get(&m, 0x1100, 14));
+
+    var td: Vec<SgEntry> = Vec::new();
+    td.push(sg(0x1030, 2)); td.push(sg(0x1040, 2));
+    var te: Vec<SgEntry> = Vec::new();
+    te.push(sg(0x9000, 4));
+    val d: i64 = dmaring_submit(&mut r, td, true, 9);
+    val e: i64 = dmaring_submit(&mut r, te, true, 10);
+    val n3: i64 = dmasim_run(&mut dev, &mut r, &mut m, 10);
+    println("submit D " + int_to_str(d) + " E " + int_to_str(e) + ", device " + int_to_str(n3));
+    show(dmaring_reap(&mut r));
+    show(dmaring_reap(&mut r));
+    println("dst: " + get(&m, 0x1100, 18));
+
+    var ch: DmaChannel = dmach_new();
+    dmach_event(&mut ch, DMAEV_CONFIGURE);
+    dmach_event(&mut ch, DMAEV_START);
+    dmach_event(&mut ch, DMAEV_PAUSE);
+    dmach_event(&mut ch, DMAEV_START);
+    dmach_event(&mut ch, DMAEV_RESUME);
+    dmach_event(&mut ch, DMAEV_COMPLETE);
+    dmach_event(&mut ch, DMAEV_START);
+    dmach_event(&mut ch, DMAEV_CONFIGURE);
+    dmach_event(&mut ch, DMAEV_START);
+    dmach_event(&mut ch, DMAEV_FAULT);
+    dmach_event(&mut ch, DMAEV_RESUME);
+    dmach_event(&mut ch, DMAEV_RESET);
+    println(str_join(ch.history, " "));
+    println("rejected " + int_to_str(ch.rejected) + ", state " + dmach_state_name(ch.state));
+}

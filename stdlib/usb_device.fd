@@ -1,0 +1,532 @@
+// Fides USB device stack core: descriptors, chapter-9 requests and CDC-ACM, pure Fides.
+//
+//   - Descriptor builders (USB 2.0 spec chapter 9.6): device (18 bytes),
+//     configuration (9, with wTotalLength filled in over everything that
+//     follows), interface association (8), interface (9), endpoint (7),
+//     string (UTF-16LE; index 0 the language list), and the CDC 1.2
+//     functional descriptors (header, call management, ACM, union);
+//     usb_cdc_acm_config() builds the standard two-interface virtual COM
+//     port configuration (67 bytes).
+//   - SETUP packet parsing (bmRequestType, bRequest, wValue, wIndex,
+//     wLength) and the device state machine of 9.1: Default (after bus
+//     reset) -> Address (SET_ADDRESS, applied only after the status stage,
+//     9.4.6) -> Configured (SET_CONFIGURATION non-zero); SET_CONFIGURATION
+//     0 goes back to Address. Standard requests: GET_DESCRIPTOR (device,
+//     configuration, string; device qualifier STALLs on a full-speed-only
+//     device, as 9.6.2 says), GET/SET_CONFIGURATION, GET/SET_INTERFACE,
+//     GET_STATUS, SET/CLEAR_FEATURE (ENDPOINT_HALT, DEVICE_REMOTE_WAKEUP);
+//     a request not valid in the current state, or unknown, STALLs.
+//     Data stages are cut to wLength and split into EP0 packets, with a
+//     zero-length packet when the reply is shorter than asked and ends on
+//     a packet boundary (5.5.3).
+//   - CDC-ACM class requests (PSTN 1.2, 6.3): SET/GET_LINE_CODING (7 bytes:
+//     baud, stop bits, parity, data bits), SET_CONTROL_LINE_STATE (DTR,
+//     RTS), SEND_BREAK, and the SERIAL_STATE notification.
+//
+// The seam: the USB controller (PHY, endpoint buffers, interrupts) is
+// the port's: its driver passes each SETUP packet (and OUT data stage) to
+// usbdev_setup and sends the returned bytes or a STALL handshake.
+
+module usb_device;
+ use vec; use string;
+
+// ─── Constants ──────────────────────────────────────────────────────────
+
+pub const USB_DESC_DEVICE: i64 = 1;
+pub const USB_DESC_CONFIG: i64 = 2;
+pub const USB_DESC_STRING: i64 = 3;
+pub const USB_DESC_INTERFACE: i64 = 4;
+pub const USB_DESC_ENDPOINT: i64 = 5;
+pub const USB_DESC_QUALIFIER: i64 = 6;
+pub const USB_DESC_IAD: i64 = 11;
+pub const USB_DESC_CS_INTERFACE: i64 = 0x24;
+
+pub const USB_REQ_GET_STATUS: i64 = 0;
+pub const USB_REQ_CLEAR_FEATURE: i64 = 1;
+pub const USB_REQ_SET_FEATURE: i64 = 3;
+pub const USB_REQ_SET_ADDRESS: i64 = 5;
+pub const USB_REQ_GET_DESCRIPTOR: i64 = 6;
+pub const USB_REQ_SET_DESCRIPTOR: i64 = 7;
+pub const USB_REQ_GET_CONFIGURATION: i64 = 8;
+pub const USB_REQ_SET_CONFIGURATION: i64 = 9;
+pub const USB_REQ_GET_INTERFACE: i64 = 10;
+pub const USB_REQ_SET_INTERFACE: i64 = 11;
+
+pub const USB_FEAT_ENDPOINT_HALT: i64 = 0;
+pub const USB_FEAT_REMOTE_WAKEUP: i64 = 1;
+
+pub const CDC_SET_LINE_CODING: i64 = 0x20;
+pub const CDC_GET_LINE_CODING: i64 = 0x21;
+pub const CDC_SET_CONTROL_LINE_STATE: i64 = 0x22;
+pub const CDC_SEND_BREAK: i64 = 0x23;
+pub const CDC_SERIAL_STATE: i64 = 0x20;
+
+pub const USB_STATE_DEFAULT: i64 = 0;
+pub const USB_STATE_ADDRESS: i64 = 1;
+pub const USB_STATE_CONFIGURED: i64 = 2;
+
+pub const USB_EP_CONTROL: i64 = 0;
+pub const USB_EP_ISO: i64 = 1;
+pub const USB_EP_BULK: i64 = 2;
+pub const USB_EP_INTERRUPT: i64 = 3;
+
+pub fn usb_state_name(s: i64) -> str {
+    if s == 0 { return "Default"; }
+    if s == 1 { return "Address"; }
+    return "Configured";
+}
+
+fn usb_le16(out: &mut Vec<i64>, v: i64) {
+    out.push(v & 0xFF);
+    out.push((v >> 8) & 0xFF);
+}
+
+// ─── Descriptors ────────────────────────────────────────────────────────
+
+pub fn usb_device_desc(bcd_usb: i64, cls: i64, sub: i64, proto: i64, mps0: i64, vid: i64, pid: i64, bcd_dev: i64,
+                       i_manuf: i64, i_product: i64, i_serial: i64, n_configs: i64) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(18);
+    d.push(USB_DESC_DEVICE);
+    usb_le16(&mut d, bcd_usb);
+    d.push(cls);
+    d.push(sub);
+    d.push(proto);
+    d.push(mps0);
+    usb_le16(&mut d, vid);
+    usb_le16(&mut d, pid);
+    usb_le16(&mut d, bcd_dev);
+    d.push(i_manuf);
+    d.push(i_product);
+    d.push(i_serial);
+    d.push(n_configs);
+    return d;
+}
+
+/// The 9-byte configuration header; usb_config_finish sets wTotalLength
+/// and bNumInterfaces.
+pub fn usb_config_desc(value: i64, i_config: i64, attributes: i64, max_power_ma: i64) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(9);
+    d.push(USB_DESC_CONFIG);
+    usb_le16(&mut d, 0);
+    d.push(0);
+    d.push(value);
+    d.push(i_config);
+    d.push(attributes | 0x80);
+    d.push(max_power_ma / 2);
+    return d;
+}
+
+pub fn usb_interface_desc(num: i64, alt: i64, n_eps: i64, cls: i64, sub: i64, proto: i64, i_str: i64) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(9);
+    d.push(USB_DESC_INTERFACE);
+    d.push(num);
+    d.push(alt);
+    d.push(n_eps);
+    d.push(cls);
+    d.push(sub);
+    d.push(proto);
+    d.push(i_str);
+    return d;
+}
+
+pub fn usb_endpoint_desc(addr: i64, ep_type: i64, mps: i64, interval: i64) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(7);
+    d.push(USB_DESC_ENDPOINT);
+    d.push(addr);
+    d.push(ep_type);
+    usb_le16(&mut d, mps);
+    d.push(interval);
+    return d;
+}
+
+pub fn usb_iad_desc(first: i64, count: i64, cls: i64, sub: i64, proto: i64, i_str: i64) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(8);
+    d.push(USB_DESC_IAD);
+    d.push(first);
+    d.push(count);
+    d.push(cls);
+    d.push(sub);
+    d.push(proto);
+    d.push(i_str);
+    return d;
+}
+
+/// Append descriptors to a configuration and fill in its header.
+pub fn usb_config_finish(cfg: Vec<i64>, parts: Vec<Vec<i64>>) -> Vec<i64> {
+    var out: Vec<i64> = cfg;
+    var nif: i64 = 0;
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: Vec<i64> = parts.get(i);
+        if p.len() >= 4 && p.get(1) == USB_DESC_INTERFACE && p.get(3) == 0 { nif = nif + 1; }
+        out.extend(p);
+        i = i + 1;
+    }
+    out.set(2, out.len() & 0xFF);
+    out.set(3, (out.len() >> 8) & 0xFF);
+    out.set(4, nif);
+    return out;
+}
+
+/// String descriptor of `s` (ASCII/Latin-1 as UTF-16LE).
+pub fn usb_string_desc(s: str) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(2 + 2 * str_len(s));
+    d.push(USB_DESC_STRING);
+    var i: i64 = 0;
+    while i < str_len(s) {
+        d.push(str_byte_at(s, i));
+        d.push(0);
+        i = i + 1;
+    }
+    return d;
+}
+
+/// String descriptor 0: the supported language IDs.
+pub fn usb_langid_desc(langs: Vec<i64>) -> Vec<i64> {
+    var d: Vec<i64> = Vec::new();
+    d.push(2 + 2 * langs.len());
+    d.push(USB_DESC_STRING);
+    var i: i64 = 0;
+    while i < langs.len() {
+        usb_le16(&mut d, langs.get(i));
+        i = i + 1;
+    }
+    return d;
+}
+
+/// The CDC-ACM virtual COM port: IAD, communication interface 0 with
+/// header/call-management/ACM/union functional descriptors and an
+/// interrupt IN notification endpoint, data interface 1 with bulk OUT and
+/// bulk IN endpoints.
+pub fn usb_cdc_acm_config(notif_ep: i64, out_ep: i64, in_ep: i64, bulk_mps: i64) -> Vec<i64> {
+    var parts: Vec<Vec<i64>> = Vec::new();
+    parts.push(usb_iad_desc(0, 2, 2, 2, 1, 0));
+    parts.push(usb_interface_desc(0, 0, 1, 2, 2, 1, 0));
+    var hdr: Vec<i64> = Vec::new();
+    hdr.push(5); hdr.push(USB_DESC_CS_INTERFACE); hdr.push(0x00); usb_le16(&mut hdr, 0x0110);
+    parts.push(hdr);
+    var cm: Vec<i64> = Vec::new();
+    cm.push(5); cm.push(USB_DESC_CS_INTERFACE); cm.push(0x01); cm.push(0x00); cm.push(1);
+    parts.push(cm);
+    var acm: Vec<i64> = Vec::new();
+    acm.push(4); acm.push(USB_DESC_CS_INTERFACE); acm.push(0x02); acm.push(0x02);
+    parts.push(acm);
+    var un: Vec<i64> = Vec::new();
+    un.push(5); un.push(USB_DESC_CS_INTERFACE); un.push(0x06); un.push(0); un.push(1);
+    parts.push(un);
+    parts.push(usb_endpoint_desc(notif_ep, USB_EP_INTERRUPT, 8, 16));
+    parts.push(usb_interface_desc(1, 0, 2, 0x0A, 0, 0, 0));
+    parts.push(usb_endpoint_desc(out_ep, USB_EP_BULK, bulk_mps, 0));
+    parts.push(usb_endpoint_desc(in_ep, USB_EP_BULK, bulk_mps, 0));
+    return usb_config_finish(usb_config_desc(1, 0, 0x00, 100), parts);
+}
+
+// ─── SETUP packets ──────────────────────────────────────────────────────
+
+pub struct UsbSetup {
+    pub request_type: i64,
+    pub request: i64,
+    pub value: i64,
+    pub index: i64,
+    pub length: i64,
+}
+
+pub fn usb_setup_parse(b: Vec<i64>) -> UsbSetup {
+    return UsbSetup {
+        request_type: b.get(0), request: b.get(1), value: b.get(2) | (b.get(3) << 8),
+        index: b.get(4) | (b.get(5) << 8), length: b.get(6) | (b.get(7) << 8)
+    };
+}
+
+pub fn usb_setup_bytes(rt: i64, req: i64, value: i64, index: i64, length: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(rt);
+    b.push(req);
+    usb_le16(&mut b, value);
+    usb_le16(&mut b, index);
+    usb_le16(&mut b, length);
+    return b;
+}
+
+/// 0 standard, 1 class, 2 vendor.
+pub fn usb_setup_kind(s: UsbSetup) -> i64 { return (s.request_type >> 5) & 3; }
+/// 0 device, 1 interface, 2 endpoint, 3 other.
+pub fn usb_setup_recipient(s: UsbSetup) -> i64 { return s.request_type & 0x1F; }
+pub fn usb_setup_in(s: UsbSetup) -> bool { return (s.request_type & 0x80) != 0; }
+
+// ─── Device ─────────────────────────────────────────────────────────────
+
+pub struct UsbResp {
+    pub stall: bool,
+    pub data: Vec<i64>,
+    pub why: str,
+}
+
+pub struct UsbDevice {
+    pub device_desc: Vec<i64>,
+    pub config_desc: Vec<i64>,
+    pub strings: Vec<Vec<i64>>,
+    pub state: i64,
+    pub address: i64,
+    pub pending_address: i64,
+    pub configuration: i64,
+    pub self_powered: bool,
+    pub remote_wakeup: bool,
+    pub halted: HashMap<i64, i64>,
+    pub endpoints: Vec<i64>,
+    pub baud: i64,
+    pub stop_bits: i64,
+    pub parity: i64,
+    pub data_bits: i64,
+    pub dtr: bool,
+    pub rts: bool,
+    pub break_ms: i64,
+}
+
+/// A device; `strings` are descriptors for indexes 0, 1, 2 ...
+pub fn usbdev_new(device_desc: Vec<i64>, config_desc: Vec<i64>, strings: Vec<Vec<i64>>) -> UsbDevice {
+    var d: UsbDevice = UsbDevice {
+        device_desc: device_desc, config_desc: config_desc, strings: strings, state: USB_STATE_DEFAULT,
+        address: 0, pending_address: -1, configuration: 0, self_powered: false, remote_wakeup: false,
+        halted: HashMap::new(), endpoints: Vec::new(), baud: 9600, stop_bits: 0, parity: 0, data_bits: 8,
+        dtr: false, rts: false, break_ms: 0
+    };
+    // Endpoint addresses declared in the configuration.
+    var i: i64 = 0;
+    while i + 1 < config_desc.len() {
+        val len: i64 = config_desc.get(i);
+        if len == 0 { break; }
+        if config_desc.get(i + 1) == USB_DESC_ENDPOINT { d.endpoints.push(config_desc.get(i + 2)); }
+        i = i + len;
+    }
+    return d;
+}
+
+pub fn usbdev_bus_reset(d: &mut UsbDevice) {
+    d.state = USB_STATE_DEFAULT;
+    d.address = 0;
+    d.pending_address = -1;
+    d.configuration = 0;
+    d.halted.clear();
+}
+
+fn usb_ok(data: Vec<i64>) -> UsbResp {
+    return UsbResp { stall: false, data: data, why: "" };
+}
+
+fn usb_stall(why: str) -> UsbResp {
+    return UsbResp { stall: true, data: Vec::new(), why: why };
+}
+
+fn usb_cut(data: Vec<i64>, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < data.len() && i < n {
+        out.push(data.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn usb_has_ep(d: &UsbDevice, ep: i64) -> bool {
+    if (ep & 0x7F) == 0 { return true; }
+    var i: i64 = 0;
+    while i < d.endpoints.len() {
+        if d.endpoints.get(i) == ep { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn usb_le_word(v: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    usb_le16(&mut o, v);
+    return o;
+}
+
+/// Handle a SETUP packet; `out_data` is the OUT data stage (empty for IN
+/// or no-data requests). The reply's data is already cut to wLength.
+pub fn usbdev_setup(d: &mut UsbDevice, setup: Vec<i64>, out_data: Vec<i64>) -> UsbResp {
+    val s: UsbSetup = usb_setup_parse(setup);
+    val kind: i64 = usb_setup_kind(s);
+    if kind == 1 { return usbdev_class(d, s, out_data); }
+    if kind != 0 { return usb_stall("vendor request"); }
+    val rcp: i64 = usb_setup_recipient(s);
+    val req: i64 = s.request;
+    var empty: Vec<i64> = Vec::new();
+    if req == USB_REQ_GET_DESCRIPTOR {
+        val dt: i64 = s.value >> 8;
+        val di: i64 = s.value & 0xFF;
+        if dt == USB_DESC_DEVICE { return usb_ok(usb_cut(d.device_desc, s.length)); }
+        if dt == USB_DESC_CONFIG {
+            if di != 0 { return usb_stall("no configuration " + int_to_str(di)); }
+            return usb_ok(usb_cut(d.config_desc, s.length));
+        }
+        if dt == USB_DESC_STRING {
+            if di >= d.strings.len() { return usb_stall("no string " + int_to_str(di)); }
+            return usb_ok(usb_cut(d.strings.get(di), s.length));
+        }
+        if dt == USB_DESC_QUALIFIER { return usb_stall("full-speed only: no device qualifier"); }
+        return usb_stall("unknown descriptor type " + int_to_str(dt));
+    }
+    if req == USB_REQ_SET_ADDRESS {
+        if rcp != 0 || s.value > 127 || s.index != 0 || s.length != 0 { return usb_stall("bad SET_ADDRESS"); }
+        if d.state == USB_STATE_CONFIGURED { return usb_stall("SET_ADDRESS while configured"); }
+        d.pending_address = s.value;
+        return usb_ok(empty);
+    }
+    if req == USB_REQ_SET_CONFIGURATION {
+        if d.state == USB_STATE_DEFAULT { return usb_stall("SET_CONFIGURATION before an address"); }
+        if s.value == 0 {
+            d.configuration = 0;
+            d.state = USB_STATE_ADDRESS;
+            return usb_ok(empty);
+        }
+        if s.value != d.config_desc.get(5) { return usb_stall("no configuration value " + int_to_str(s.value)); }
+        d.configuration = s.value;
+        d.state = USB_STATE_CONFIGURED;
+        d.halted.clear();
+        return usb_ok(empty);
+    }
+    if req == USB_REQ_GET_CONFIGURATION {
+        if d.state == USB_STATE_DEFAULT { return usb_stall("GET_CONFIGURATION in Default state"); }
+        var b: Vec<i64> = Vec::new();
+        b.push(d.configuration);
+        return usb_ok(usb_cut(b, s.length));
+    }
+    if req == USB_REQ_GET_INTERFACE || req == USB_REQ_SET_INTERFACE {
+        if d.state != USB_STATE_CONFIGURED { return usb_stall("interface request before configuration"); }
+        if s.index > 1 { return usb_stall("no interface " + int_to_str(s.index)); }
+        if req == USB_REQ_SET_INTERFACE {
+            if s.value != 0 { return usb_stall("no alternate setting " + int_to_str(s.value)); }
+            return usb_ok(empty);
+        }
+        var b: Vec<i64> = Vec::new();
+        b.push(0);
+        return usb_ok(usb_cut(b, s.length));
+    }
+    if req == USB_REQ_GET_STATUS {
+        if rcp == 0 {
+            var st: i64 = 0;
+            if d.self_powered { st = st | 1; }
+            if d.remote_wakeup { st = st | 2; }
+            return usb_ok(usb_cut(usb_le_word(st), s.length));
+        }
+        if rcp == 1 {
+            if d.state != USB_STATE_CONFIGURED { return usb_stall("interface status before configuration"); }
+            return usb_ok(usb_cut(usb_le_word(0), s.length));
+        }
+        if rcp == 2 {
+            if !usb_has_ep(d, s.index) || (d.state != USB_STATE_CONFIGURED && (s.index & 0x7F) != 0) { return usb_stall("no endpoint"); }
+            var h: i64 = 0;
+            if d.halted.contains(s.index) { h = 1; }
+            return usb_ok(usb_cut(usb_le_word(h), s.length));
+        }
+        return usb_stall("bad recipient");
+    }
+    if req == USB_REQ_SET_FEATURE || req == USB_REQ_CLEAR_FEATURE {
+        val set: bool = req == USB_REQ_SET_FEATURE;
+        if rcp == 0 && s.value == USB_FEAT_REMOTE_WAKEUP {
+            d.remote_wakeup = set;
+            return usb_ok(empty);
+        }
+        if rcp == 2 && s.value == USB_FEAT_ENDPOINT_HALT {
+            if !usb_has_ep(d, s.index) || (s.index & 0x7F) == 0 || d.state != USB_STATE_CONFIGURED { return usb_stall("cannot halt that endpoint"); }
+            if set { d.halted.insert(s.index, 1); } else { if d.halted.contains(s.index) { d.halted.remove(s.index); } }
+            return usb_ok(empty);
+        }
+        return usb_stall("unsupported feature");
+    }
+    return usb_stall("unknown request " + int_to_str(req));
+}
+
+/// The status stage completed: a pending SET_ADDRESS takes effect now.
+pub fn usbdev_status_done(d: &mut UsbDevice) {
+    if d.pending_address >= 0 {
+        d.address = d.pending_address;
+        d.pending_address = -1;
+        if d.address == 0 { d.state = USB_STATE_DEFAULT; } else { d.state = USB_STATE_ADDRESS; }
+    }
+}
+
+/// CDC-ACM class requests to the communication interface (index 0).
+fn usbdev_class(d: &mut UsbDevice, s: UsbSetup, out_data: Vec<i64>) -> UsbResp {
+    var empty: Vec<i64> = Vec::new();
+    if d.state != USB_STATE_CONFIGURED { return usb_stall("class request before configuration"); }
+    if usb_setup_recipient(s) != 1 || s.index != 0 { return usb_stall("class request not for the CDC interface"); }
+    if s.request == CDC_SET_LINE_CODING {
+        if s.length != 7 || out_data.len() != 7 { return usb_stall("line coding needs 7 bytes"); }
+        val db: i64 = out_data.get(6);
+        if db != 5 && db != 6 && db != 7 && db != 8 && db != 16 { return usb_stall("bad data bits"); }
+        d.baud = out_data.get(0) | (out_data.get(1) << 8) | (out_data.get(2) << 16) | (out_data.get(3) << 24);
+        d.stop_bits = out_data.get(4);
+        d.parity = out_data.get(5);
+        d.data_bits = db;
+        return usb_ok(empty);
+    }
+    if s.request == CDC_GET_LINE_CODING { return usb_ok(usb_cut(usb_line_coding(d.baud, d.stop_bits, d.parity, d.data_bits), s.length)); }
+    if s.request == CDC_SET_CONTROL_LINE_STATE {
+        d.dtr = (s.value & 1) != 0;
+        d.rts = (s.value & 2) != 0;
+        return usb_ok(empty);
+    }
+    if s.request == CDC_SEND_BREAK {
+        d.break_ms = s.value;
+        return usb_ok(empty);
+    }
+    return usb_stall("unknown CDC request " + int_to_str(s.request));
+}
+
+/// The 7-byte line coding structure.
+pub fn usb_line_coding(baud: i64, stop_bits: i64, parity: i64, data_bits: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(baud & 0xFF);
+    b.push((baud >> 8) & 0xFF);
+    b.push((baud >> 16) & 0xFF);
+    b.push((baud >> 24) & 0xFF);
+    b.push(stop_bits);
+    b.push(parity);
+    b.push(data_bits);
+    return b;
+}
+
+/// "115200 8N1" from the device's line coding.
+pub fn usb_line_coding_str(d: &UsbDevice) -> str {
+    val par: Vec<str> = str_split("N,O,E,M,S", ",");
+    val stops: Vec<str> = str_split("1,1.5,2", ",");
+    return int_to_str(d.baud) + " " + int_to_str(d.data_bits) + par.get(d.parity) + stops.get(d.stop_bits);
+}
+
+/// SERIAL_STATE notification (PSTN 6.5.4): 8-byte header + UART state bits
+/// (DCD bit 0, DSR bit 1, break 2, ring 3, framing 4, parity 5, overrun 6).
+pub fn usb_cdc_serial_state(interface: i64, state: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0xA1);
+    b.push(CDC_SERIAL_STATE);
+    usb_le16(&mut b, 0);
+    usb_le16(&mut b, interface);
+    usb_le16(&mut b, 2);
+    usb_le16(&mut b, state);
+    return b;
+}
+
+/// Split an IN data stage into EP0 packet sizes; a zero-length packet ends
+/// it when the data is shorter than wLength and a multiple of mps.
+pub fn usb_ep0_packets(len: i64, wlength: i64, mps: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var left: i64 = len;
+    while left > 0 {
+        var n: i64 = left;
+        if n > mps { n = mps; }
+        out.push(n);
+        left = left - n;
+    }
+    if len < wlength && len % mps == 0 { out.push(0); }
+    return out;
+}

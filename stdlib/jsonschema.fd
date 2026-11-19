@@ -1,0 +1,555 @@
+// Fides JSON Schema validation (draft 2020-12 core subset), pure Fides
+//
+// Validates a JSON instance against a JSON Schema. Both are JSON text; this
+// module uses stdlib json to read them and stdlib regex for `pattern`.
+//
+// Keywords supported (JSON Schema 2020-12, core + validation):
+//   type (a name or an array of names: null boolean object array number
+//     integer string), enum, const,
+//   properties, required, additionalProperties (bool or schema),
+//   patternProperties, propertyNames, minProperties, maxProperties,
+//   items (a schema; also the array form for prefixItems), prefixItems,
+//   additionalItems/items-after-prefix, minItems, maxItems, uniqueItems,
+//   contains with minContains/maxContains,
+//   minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf,
+//   minLength, maxLength, pattern,
+//   allOf, anyOf, oneOf, not, if/then/else,
+//   $ref to a JSON Pointer within the same document (#/$defs/... etc.),
+//   boolean schemas (true accepts everything, false rejects everything).
+//
+// Errors are collected with the instance location (a JSON Pointer) and a
+// message, so a caller can show exactly what failed and where.
+//
+// Not covered (documented so callers know): remote $ref (other documents),
+// $dynamicRef/$dynamicAnchor, format assertion, content*, unevaluated*,
+// $anchor by name (only pointer refs). These are out of the "core subset".
+//
+// Everything here is real; there is no platform seam.
+//
+// Usage:
+//   val r: JsResult = jsonschema_validate(schema, instance);
+//   if !r.valid { println(r.errors.get(0)); }
+
+module jsonschema;
+ use vec; use json; use regex;
+
+pub struct JsResult {
+    pub valid: bool,
+    pub errors: Vec<str>,
+}
+
+struct JsCtx {
+    root: str,          // the root schema (for $ref resolution)
+    errors: Vec<str>,
+}
+
+fn js_err(ctx: & mut JsCtx, path: str, msg: str) {
+    var p: str = path;
+    if str_len(p) == 0 {
+        p = "#";
+    }
+    ctx.errors.push(p + ": " + msg);
+}
+
+// canonical form of a value (for enum/const/uniqueItems comparison)
+fn js_canon(v: str) -> str {
+    return json_parse_safe(v);
+}
+
+fn js_is_int_number(v: str) -> bool {
+    // a JSON number with zero fractional part
+    if str_find(v, ".") >= 0 || str_find(v, "e") >= 0 || str_find(v, "E") >= 0 {
+        val f: f64 = str_parse_float(v);
+        val t: f64 = f - (f as i64 as f64);
+        return t == 0.0;
+    }
+    return true;
+}
+
+// resolve a "#/a/b/0" JSON Pointer against the root schema
+fn js_resolve_ref(ctx: & JsCtx, ref: str) -> str {
+    if ref == "#" || str_len(ref) == 0 {
+        return ctx.root;
+    }
+    if str_byte_at(ref, 0) != 35 {
+        return "false";  // only same-document refs; unknown -> reject
+    }
+    var cur: str = ctx.root;
+    val body: str = str_slice(ref, 1, str_len(ref));
+    val parts: Vec<str> = str_split(body, "/");
+    var i: i64 = 1;  // parts[0] is "" before the first '/'
+    while i < parts.len() {
+        var seg: str = parts.get(i);
+        seg = js_unescape_pointer(seg);
+        val t: str = json_type_safe(cur);
+        if t == "object" {
+            if !json_has(cur, seg) {
+                return "false";
+            }
+            cur = json_get_safe(cur, seg);
+        } else if t == "array" {
+            cur = json_at_safe(cur, str_parse_int(seg));
+        } else {
+            return "false";
+        }
+        if str_len(cur) == 0 {
+            return "false";
+        }
+        i = i + 1;
+    }
+    return cur;
+}
+
+fn js_unescape_pointer(s: str) -> str {
+    // ~1 -> /, ~0 -> ~
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if str_byte_at(s, i) == 126 && i + 1 < str_len(s) {
+            val n: i64 = str_byte_at(s, i + 1);
+            if n == 49 { o = o + "/"; i = i + 2; }
+            else if n == 48 { o = o + "~"; i = i + 2; }
+            else { o = o + "~"; i = i + 1; }
+        } else {
+            o = o + char_to_str(str_byte_at(s, i));
+            i = i + 1;
+        }
+    }
+    return o;
+}
+
+fn js_type_name(v: str) -> str {
+    val t: str = json_type_safe(v);
+    if t == "number" {
+        return "number";
+    }
+    return t;
+}
+
+fn js_type_matches(wanted: str, v: str) -> bool {
+    val t: str = json_type_safe(v);
+    if wanted == "integer" {
+        return t == "number" && js_is_int_number(v);
+    }
+    if wanted == "number" {
+        return t == "number";
+    }
+    if wanted == "boolean" {
+        return t == "boolean";
+    }
+    return wanted == t;
+}
+
+fn js_count_valid(ctx: & mut JsCtx, schemas: Vec<str>, v: str, path: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < schemas.len() {
+        var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
+        js_check(& mut sub, schemas.get(i), v, path);
+        if sub.errors.len() == 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn js_check(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+    val st: str = json_type_safe(schema);
+    // boolean schema
+    if st == "boolean" {
+        if schema == "false" || json_parse_safe(schema) == "false" {
+            js_err(ctx, path, "schema is false: nothing is valid here");
+        }
+        return;
+    }
+    if st != "object" {
+        return;  // not a usable schema
+    }
+    // $ref
+    if json_has(schema, "$ref") {
+        val refv: str = json_get_str(schema, "$ref");
+        js_check(ctx, js_resolve_ref(ctx, refv), v, path);
+        // 2020-12 lets $ref sit beside other keywords; we continue below
+    }
+    // type
+    if json_has(schema, "type") {
+        val tv: str = json_get_safe(schema, "type");
+        if json_type_safe(tv) == "array" {
+            var ok: bool = false;
+            val arr: Vec<str> = json_items(tv);
+            var i: i64 = 0;
+            while i < arr.len() {
+                if js_type_matches(json_unescape(arr.get(i)), v) {
+                    ok = true;
+                }
+                i = i + 1;
+            }
+            if !ok {
+                js_err(ctx, path, "type is " + js_type_name(v) + ", expected one of " + tv);
+            }
+        } else {
+            val want: str = json_get_str(schema, "type");
+            if !js_type_matches(want, v) {
+                js_err(ctx, path, "type is " + js_type_name(v) + ", expected " + want);
+            }
+        }
+    }
+    // const
+    if json_has(schema, "const") {
+        val cv: str = json_get_safe(schema, "const");
+        if js_canon(cv) != js_canon(v) {
+            js_err(ctx, path, "value must equal const " + cv);
+        }
+    }
+    // enum
+    if json_has(schema, "enum") {
+        val ev: str = json_get_safe(schema, "enum");
+        val arr: Vec<str> = json_items(ev);
+        var ok: bool = false;
+        var i: i64 = 0;
+        while i < arr.len() {
+            if js_canon(arr.get(i)) == js_canon(v) {
+                ok = true;
+            }
+            i = i + 1;
+        }
+        if !ok {
+            js_err(ctx, path, "value not in enum " + ev);
+        }
+    }
+    val vt: str = json_type_safe(v);
+    // numbers
+    if vt == "number" {
+        js_check_number(ctx, schema, v, path);
+    }
+    // strings
+    if vt == "string" {
+        js_check_string(ctx, schema, v, path);
+    }
+    // arrays
+    if vt == "array" {
+        js_check_array(ctx, schema, v, path);
+    }
+    // objects
+    if vt == "object" {
+        js_check_object(ctx, schema, v, path);
+    }
+    // combinators
+    js_check_logic(ctx, schema, v, path);
+}
+
+fn js_num(v: str) -> f64 {
+    return str_parse_float(v);
+}
+
+fn js_check_number(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+    val x: f64 = js_num(v);
+    if json_has(schema, "minimum") {
+        val m: f64 = js_num(json_get_safe(schema, "minimum"));
+        if x < m {
+            js_err(ctx, path, "number " + v + " < minimum " + json_get_safe(schema, "minimum"));
+        }
+    }
+    if json_has(schema, "maximum") {
+        val m: f64 = js_num(json_get_safe(schema, "maximum"));
+        if x > m {
+            js_err(ctx, path, "number " + v + " > maximum " + json_get_safe(schema, "maximum"));
+        }
+    }
+    if json_has(schema, "exclusiveMinimum") {
+        val m: f64 = js_num(json_get_safe(schema, "exclusiveMinimum"));
+        if x <= m {
+            js_err(ctx, path, "number " + v + " <= exclusiveMinimum");
+        }
+    }
+    if json_has(schema, "exclusiveMaximum") {
+        val m: f64 = js_num(json_get_safe(schema, "exclusiveMaximum"));
+        if x >= m {
+            js_err(ctx, path, "number " + v + " >= exclusiveMaximum");
+        }
+    }
+    if json_has(schema, "multipleOf") {
+        val d: f64 = js_num(json_get_safe(schema, "multipleOf"));
+        if d > 0.0 {
+            val q: f64 = x / d;
+            val r: f64 = q - (q as i64 as f64);
+            if r > 0.000000001 && r < 0.999999999 {
+                js_err(ctx, path, "number " + v + " is not a multiple of " + json_get_safe(schema, "multipleOf"));
+            }
+        }
+    }
+}
+
+// the code point count of decoded UTF-8 text (continuation bytes skipped)
+fn js_cp_len(s: str) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        if (str_byte_at(s, i) & 0xC0) != 0x80 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn js_check_string(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+    val s: str = json_unescape(v);
+    val n: i64 = js_cp_len(s);
+    if json_has(schema, "minLength") {
+        if n < json_get_int(schema, "minLength", 0) {
+            js_err(ctx, path, "string length " + int_to_str(n) + " < minLength " + int_to_str(json_get_int(schema, "minLength", 0)));
+        }
+    }
+    if json_has(schema, "maxLength") {
+        if n > json_get_int(schema, "maxLength", 0) {
+            js_err(ctx, path, "string length " + int_to_str(n) + " > maxLength " + int_to_str(json_get_int(schema, "maxLength", 0)));
+        }
+    }
+    if json_has(schema, "pattern") {
+        val pat: str = json_get_str(schema, "pattern");
+        if !regex_search(s, pat) {
+            js_err(ctx, path, "string does not match pattern " + json_get_safe(schema, "pattern"));
+        }
+    }
+}
+
+fn js_check_array(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+    val items: Vec<str> = json_items(v);
+    val n: i64 = items.len();
+    if json_has(schema, "minItems") {
+        if n < json_get_int(schema, "minItems", 0) {
+            js_err(ctx, path, "array length " + int_to_str(n) + " < minItems");
+        }
+    }
+    if json_has(schema, "maxItems") {
+        if n > json_get_int(schema, "maxItems", 0) {
+            js_err(ctx, path, "array length " + int_to_str(n) + " > maxItems");
+        }
+    }
+    if json_has(schema, "uniqueItems") && json_get_bool(schema, "uniqueItems", false) {
+        var i: i64 = 0;
+        while i < n {
+            var j: i64 = i + 1;
+            while j < n {
+                if js_canon(items.get(i)) == js_canon(items.get(j)) {
+                    js_err(ctx, path, "array items " + int_to_str(i) + " and " + int_to_str(j) + " are equal (uniqueItems)");
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    // prefixItems (2020-12): positional schemas
+    var prefix: i64 = 0;
+    if json_has(schema, "prefixItems") {
+        val pre: Vec<str> = json_items(json_get_safe(schema, "prefixItems"));
+        prefix = pre.len();
+        var i: i64 = 0;
+        while i < pre.len() && i < n {
+            js_check(ctx, pre.get(i), items.get(i), path + "/" + int_to_str(i));
+            i = i + 1;
+        }
+    }
+    // items: a schema applied to every element after the prefix
+    if json_has(schema, "items") {
+        val iv: str = json_get_safe(schema, "items");
+        if json_type_safe(iv) == "array" {
+            // draft-07 tuple form: positional
+            val tup: Vec<str> = json_items(iv);
+            var i: i64 = 0;
+            while i < tup.len() && i < n {
+                js_check(ctx, tup.get(i), items.get(i), path + "/" + int_to_str(i));
+                i = i + 1;
+            }
+        } else {
+            var i: i64 = prefix;
+            while i < n {
+                js_check(ctx, iv, items.get(i), path + "/" + int_to_str(i));
+                i = i + 1;
+            }
+        }
+    }
+    // contains / minContains / maxContains
+    if json_has(schema, "contains") {
+        val cs: str = json_get_safe(schema, "contains");
+        var matched: i64 = 0;
+        var i: i64 = 0;
+        while i < n {
+            var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
+            js_check(& mut sub, cs, items.get(i), path);
+            if sub.errors.len() == 0 {
+                matched = matched + 1;
+            }
+            i = i + 1;
+        }
+        var minc: i64 = 1;
+        if json_has(schema, "minContains") {
+            minc = json_get_int(schema, "minContains", 1);
+        }
+        if matched < minc {
+            js_err(ctx, path, "array has " + int_to_str(matched) + " matches of contains, need " + int_to_str(minc));
+        }
+        if json_has(schema, "maxContains") {
+            val maxc: i64 = json_get_int(schema, "maxContains", 0);
+            if matched > maxc {
+                js_err(ctx, path, "array has " + int_to_str(matched) + " matches of contains, max " + int_to_str(maxc));
+            }
+        }
+    }
+}
+
+fn js_check_object(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+    val keys: Vec<str> = json_keys(v);
+    if json_has(schema, "minProperties") {
+        if keys.len() < json_get_int(schema, "minProperties", 0) {
+            js_err(ctx, path, "object has " + int_to_str(keys.len()) + " properties < minProperties");
+        }
+    }
+    if json_has(schema, "maxProperties") {
+        if keys.len() > json_get_int(schema, "maxProperties", 0) {
+            js_err(ctx, path, "object has " + int_to_str(keys.len()) + " properties > maxProperties");
+        }
+    }
+    // required
+    if json_has(schema, "required") {
+        val req: Vec<str> = json_items(json_get_safe(schema, "required"));
+        var i: i64 = 0;
+        while i < req.len() {
+            val name: str = json_unescape(req.get(i));
+            if !json_has(v, name) {
+                js_err(ctx, path, "missing required property \"" + name + "\"");
+            }
+            i = i + 1;
+        }
+    }
+    val props: str = json_get_safe(schema, "properties");
+    val has_props: bool = json_has(schema, "properties");
+    val has_pp: bool = json_has(schema, "patternProperties");
+    val pp: str = json_get_safe(schema, "patternProperties");
+    var ppkeys: Vec<str> = Vec::new();
+    if has_pp {
+        ppkeys = json_keys(pp);
+    }
+    val has_ap: bool = json_has(schema, "additionalProperties");
+    val ap: str = json_get_safe(schema, "additionalProperties");
+    // propertyNames
+    val has_pn: bool = json_has(schema, "propertyNames");
+    val pn: str = json_get_safe(schema, "propertyNames");
+    var ki: i64 = 0;
+    while ki < keys.len() {
+        val k: str = keys.get(ki);
+        val cv: str = json_get_safe(v, k);
+        var covered: bool = false;
+        if has_pn {
+            js_check(ctx, pn, "\"" + json_escape_min(k) + "\"", path + "/" + k);
+        }
+        if has_props && json_has(props, k) {
+            covered = true;
+            js_check(ctx, json_get_safe(props, k), cv, path + "/" + k);
+        }
+        if has_pp {
+            var pj: i64 = 0;
+            while pj < ppkeys.len() {
+                if regex_search(k, ppkeys.get(pj)) {
+                    covered = true;
+                    js_check(ctx, json_get_safe(pp, ppkeys.get(pj)), cv, path + "/" + k);
+                }
+                pj = pj + 1;
+            }
+        }
+        if !covered && has_ap {
+            if json_type_safe(ap) == "boolean" {
+                if ap == "false" || json_parse_safe(ap) == "false" {
+                    js_err(ctx, path, "additional property \"" + k + "\" is not allowed");
+                }
+            } else {
+                js_check(ctx, ap, cv, path + "/" + k);
+            }
+        }
+        ki = ki + 1;
+    }
+}
+
+fn json_escape_min(s: str) -> str {
+    // escape a key for embedding as a JSON string value (quotes/backslash)
+    var o: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 34 { o = o + "\\\""; }
+        else if c == 92 { o = o + "\\\\"; }
+        else { o = o + char_to_str(c); }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn js_check_logic(ctx: & mut JsCtx, schema: str, v: str, path: str) {
+    if json_has(schema, "allOf") {
+        val arr: Vec<str> = json_items(json_get_safe(schema, "allOf"));
+        var i: i64 = 0;
+        while i < arr.len() {
+            js_check(ctx, arr.get(i), v, path);
+            i = i + 1;
+        }
+    }
+    if json_has(schema, "anyOf") {
+        val arr: Vec<str> = json_items(json_get_safe(schema, "anyOf"));
+        if js_count_valid(ctx, arr, v, path) == 0 {
+            js_err(ctx, path, "value matches none of anyOf");
+        }
+    }
+    if json_has(schema, "oneOf") {
+        val arr: Vec<str> = json_items(json_get_safe(schema, "oneOf"));
+        val n: i64 = js_count_valid(ctx, arr, v, path);
+        if n != 1 {
+            js_err(ctx, path, "value matches " + int_to_str(n) + " of oneOf, need exactly 1");
+        }
+    }
+    if json_has(schema, "not") {
+        var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
+        js_check(& mut sub, json_get_safe(schema, "not"), v, path);
+        if sub.errors.len() == 0 {
+            js_err(ctx, path, "value must not match the 'not' schema");
+        }
+    }
+    // if / then / else
+    if json_has(schema, "if") {
+        var sub: JsCtx = JsCtx { root: ctx.root, errors: Vec::new() };
+        js_check(& mut sub, json_get_safe(schema, "if"), v, path);
+        if sub.errors.len() == 0 {
+            if json_has(schema, "then") {
+                js_check(ctx, json_get_safe(schema, "then"), v, path);
+            }
+        } else {
+            if json_has(schema, "else") {
+                js_check(ctx, json_get_safe(schema, "else"), v, path);
+            }
+        }
+    }
+}
+
+/// Validate `instance` against `schema` (both JSON text). The result holds
+/// every error with its location.
+pub fn jsonschema_validate(schema: str, instance: str) -> JsResult {
+    if !json_is_valid(schema) {
+        var e: Vec<str> = Vec::new();
+        e.push("#: the schema is not valid JSON");
+        return JsResult { valid: false, errors: e };
+    }
+    if !json_is_valid(instance) {
+        var e: Vec<str> = Vec::new();
+        e.push("#: the instance is not valid JSON");
+        return JsResult { valid: false, errors: e };
+    }
+    var ctx: JsCtx = JsCtx { root: schema, errors: Vec::new() };
+    js_check(& mut ctx, schema, instance, "#");
+    return JsResult { valid: ctx.errors.len() == 0, errors: ctx.errors };
+}
+
+/// Just the boolean: does `instance` satisfy `schema`?
+pub fn jsonschema_valid(schema: str, instance: str) -> bool {
+    return jsonschema_validate(schema, instance).valid;
+}

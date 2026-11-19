@@ -297,7 +297,8 @@ Fides's stdlib lives in `stdlib/` and is imported explicitly via `use` (except `
 |--------|------|----------|
 | `core` | `stdlib/core.fd` | Auto-included: `Option<T>`, `Result<T, E>`, `println`, `print`, `assert`, `assert_eq`, `max`, `min`, `abs`, `clamp` |
 | `math` | `stdlib/math.fd` | `math_sqrt`, `math_pow`, `math_floor`, `math_ceil`, `math_sin`, `math_cos`, `math_fabs`, `math_pi`, `math_e`. Vec2/3/4, mat4, quat types with operator overloading + swizzle access |
-| `env` | `stdlib/env.fd` | `env_get`, `env_exists` |
+| `env` | `stdlib/env.fd` | `env_get`, `env_exists`, `env_secret` (a `@secret` credential) |
+| `trace` | `stdlib/trace.fd` | spans as JSON lines on stderr under `FIDES_TRACE=1`: `trace_span_begin`, `trace_span_end` (the stdlib's HTTP client, postgres queries and file writes are traced) |
 | `args` | `stdlib/args.fd` | `args_len`, `args_get`, `args_program_name` |
 | `process` | `stdlib/process.fd` | `process_exit`, `process_system` |
 | `regex` | `stdlib/regex.fd` | `regex_matches` (?/* wildcards), `regex_find`, `regex_contains`, `regex_starts_with`, `regex_ends_with` |
@@ -530,10 +531,10 @@ var COUNTER: i64 = 0;
 val a = 5;
 val b = a;      // a is still valid
 
-// Vec, HashMap, str: handles. Assignment gives a second name for the same data
+// Vec, HashMap, str: values. Assignment gives an independent value
 val v: Vec<i64> = Vec::new();
 var w = v;
-w.push(1);      // v.len() is now 1 as well
+w.push(1);      // v.len() is still 0: the first write copied the data
 ```
 
 There is no move check for `str` or `Vec`: only `@linear` struct types move
@@ -2030,7 +2031,9 @@ async fn fetch_data(url: &str) -> String {
 }
 
 fn main() -> i64 {
-    spawn fetch_data("https://example.com");
+    // a dropped handle is an error (CA6): detach the task by name, or keep
+    // the handle and await it
+    spawn detached fetch_data("https://example.com");
     return 0;
 }
 ```

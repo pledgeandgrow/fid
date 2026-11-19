@@ -1,0 +1,102 @@
+// Release M10: calling an @unsafe function needs an `unsafe` block or an
+// @unsafe caller, and both are accepted: a free function of the program, a
+// method and an associated function of its own struct, the stdlib's
+// ptr_read/ptr_write (stdlib/volatile.fd) by plain and by module-qualified
+// name, and Volatile::new. The calls outside `unsafe` are rejected
+// (test_unsafe_call_user_fail.fd, test_unsafe_call_method_fail.fd,
+// test_unsafe_call_static_fail.fd, test_unsafe_call_qualified_fail.fd,
+// test_unsafe_raw_apis_fail.fd).
+// Expected output:
+// poke 11
+// raw 12
+// at 13
+// volatile 14
+// qualified 15
+// wrapper 16
+use volatile;
+
+// SAFETY: the caller's promise: p is a live, aligned, writable word.
+@unsafe
+fn poke(p: i64, v: i64) {
+    var w: * mut i64 = p;
+    * w = v;
+}
+
+// SAFETY: the caller's promise: p is a live, aligned word.
+@unsafe
+fn peek(p: i64) -> i64 {
+    var w: * mut i64 = p;
+    return * w;
+}
+
+struct Raw {
+    addr: i64,
+}
+
+impl Raw {
+    // SAFETY: the caller's promise: addr is a live, aligned word for as
+    // long as the Raw is used.
+    @unsafe
+    pub fn at(addr: i64) -> Raw {
+        return Raw { addr: addr };
+    }
+
+    // SAFETY: the promise Raw::at was given.
+    @unsafe
+    pub fn load(self: Raw) -> i64 {
+        return peek(self.addr);
+    }
+}
+
+// An @unsafe function may call @unsafe functions without a block.
+// SAFETY: the caller's promise: p is a live, aligned, writable word.
+@unsafe
+fn store_and_load(p: i64, v: i64) -> i64 {
+    poke(p, v);
+    return peek(p);
+}
+
+// A safe wrapper: it owns the word it hands to the @unsafe functions.
+fn roundtrip(v: i64) -> i64 {
+    var got: i64 = 0;
+    // SAFETY: an 8-byte block of our own, freed before returning.
+    unsafe {
+        val p: i64 = p_malloc(8);
+        got = store_and_load(p, v);
+        p_free(p);
+    }
+    return got;
+}
+
+fn main() -> i64 {
+    var p: i64 = 0;
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var c: i64 = 0;
+    var d: i64 = 0;
+    var e: i64 = 0;
+    // SAFETY: one 8-byte block of our own; every access below stays in it.
+    unsafe {
+        p = p_malloc(8);
+        poke(p, 11);
+        a = peek(p);
+        poke(p, 12);
+        val r: Raw = Raw::at(p);
+        b = r.load();
+        poke(p, 13);
+        c = Raw::at(p).load();
+        ptr_write(p, 14);
+        val v: Volatile = Volatile::new(p);
+        d = v.load();
+        volatile::ptr_write(p, 15);
+        e = volatile::ptr_read(p);
+        p_free(p);
+    }
+    println("poke " + int_to_str(a));
+    println("raw " + int_to_str(b));
+    println("at " + int_to_str(c));
+    println("volatile " + int_to_str(d));
+    println("qualified " + int_to_str(e));
+    println("wrapper " + int_to_str(roundtrip(16)));
+    return 0;
+}

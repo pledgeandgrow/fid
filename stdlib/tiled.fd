@@ -11,12 +11,15 @@
 // (0x80000000 H, 0x40000000 V, 0x20000000 D) — tiled_gid strips them,
 // tiled_hflip/vflip/dflip read them.
 
-use vec; use string; use json; use tilemap;
+use vec; use json; use tilemap;
  pub const TILED_FLIP_H: i64 = 0x80000000; pub const TILED_FLIP_V: i64 = 0x40000000; pub const TILED_FLIP_D: i64 = 0x20000000; const FLIP_MASK: i64 = 0x1FFFFFFF;
-/// A parsed TMJ document (canonicalized JSON kept for property access).
+/// A parsed TMJ document: `json` is its text and `doc` its index (json.fd
+/// json_index: scanned once; every lookup below walks the index instead of
+/// rescanning the text, and tiled_to_tilemap reads each data array once).
 pub struct TiledMap {
     pub ok: bool,
     pub json: str,
+    pub doc: JsonDoc,
     pub width: i64,
     // tiles
     pub height: i64,
@@ -48,22 +51,21 @@ pub struct TiledObj {
 ///   println(int_to_str(tiled_tile(m, 0, 1, 0)));   // 2
 
 pub fn tiled_open(j: str) -> TiledMap {
+    val doc: JsonDoc = json_index(j);
+    val root: i64 = jd_root(& doc);
+    if !jd_has(& doc, root, "width") || !jd_has(& doc, root, "height") || !jd_has(& doc, root, "layers") {
+        var bad: TiledMap = TiledMap {
+            ok: false, json: "", doc: json_index(""), width: 0, height: 0, tile_w: 0, tile_h: 0
+        };
+        return bad;
+    }
+    val w: i64 = jd_int(& doc, jd_get(& doc, root, "width"), 0);
+    val h: i64 = jd_int(& doc, jd_get(& doc, root, "height"), 0);
+    val tw: i64 = jd_int(& doc, jd_get(& doc, root, "tilewidth"), 0);
+    val th: i64 = jd_int(& doc, jd_get(& doc, root, "tileheight"), 0);
     var m: TiledMap = TiledMap {
-        ok: false, json: "", width: 0, height: 0, tile_w: 0, tile_h: 0
+        ok: w > 0 && h > 0, json: j, doc: doc, width: w, height: h, tile_w: tw, tile_h: th
     };
-    var c: str = json_parse_safe(j);
-    if !json_has(c, "width") || !json_has(c, "height") {
-        return m;
-    }
-    if !json_has(c, "layers") {
-        return m;
-    }
-    m.json = c;
-    m.width = json_get_int(c, "width", 0);
-    m.height = json_get_int(c, "height", 0);
-    m.tile_w = json_get_int(c, "tilewidth", 0);
-    m.tile_h = json_get_int(c, "tileheight", 0);
-    m.ok = m.width > 0 && m.height > 0;
     return m;
 }
 
@@ -81,51 +83,47 @@ pub fn tiled_dflip(raw: i64) -> bool {
     return (raw & TILED_FLIP_D) != 0;
 }
 
-fn tiled_layer(m: TiledMap, li: i64) -> str {
-    var l: str = json_get_safe(m.json, "layers");
-    if str_len(l) == 0 || li < 0 || li >= json_len_safe(l) {
-        return "";
-    }
-    return json_at_safe(l, li);
+// The node of layer `li`, -1 when out of range.
+fn tiled_layer(m: TiledMap, li: i64) -> i64 {
+    return jd_at(& m.doc, jd_get(& m.doc, jd_root(& m.doc), "layers"), li);
 }
 
 pub fn tiled_layer_count(m: TiledMap) -> i64 {
-    var l: str = json_get_safe(m.json, "layers");
-    if str_len(l) == 0 {
-        return 0;
-    }
-    return json_len_safe(l);
+    return jd_len(& m.doc, jd_get(& m.doc, jd_root(& m.doc), "layers"));
+}
+
+// String field `key` of node `o` decoded, "" when absent.
+fn tiled_str(m: TiledMap, o: i64, key: str) -> str {
+    return jd_str(& m.doc, jd_get(& m.doc, o, key));
 }
 
 /// Layer name/type/visibility/opacity for UI decisions.
 pub fn tiled_layer_name(m: TiledMap, li: i64) -> str {
-    return json_get_str(tiled_layer(m, li), "name");
+    return tiled_str(m, tiled_layer(m, li), "name");
 }
 pub fn tiled_layer_type(m: TiledMap, li: i64) -> str {
-    return json_get_str(tiled_layer(m, li), "type");
+    return tiled_str(m, tiled_layer(m, li), "type");
 }
 pub fn tiled_layer_visible(m: TiledMap, li: i64) -> bool {
-    return json_get_bool(tiled_layer(m, li), "visible", true);
+    return jd_bool(& m.doc, jd_get(& m.doc, tiled_layer(m, li), "visible"), true);
 }
 
 /// Raw gid at (x,y) of tile layer `li` — flip bits included, 0 outside
-/// bounds or for non-tile layers. Tiled stores data row-major.
+/// bounds or for non-tile layers. Tiled stores data row-major. One call
+/// walks the layer's data array up to the cell (no text is scanned); to
+/// read every cell, tiled_to_tilemap reads each array once.
 pub fn tiled_tile_raw(m: TiledMap, li: i64, x: i64, y: i64) -> i64 {
-    var l: str = tiled_layer(m, li);
-    if str_len(l) == 0 {
+    val l: i64 = tiled_layer(m, li);
+    if l < 0 {
         return 0;
     }
-    if !str_equal(json_get_str(l, "type"), "tilelayer") {
+    if !str_equal(tiled_str(m, l, "type"), "tilelayer") {
         return 0;
     }
     if x < 0 || y < 0 || x >= m.width || y >= m.height {
         return 0;
     }
-    var data: str = json_get_safe(l, "data");
-    if str_len(data) == 0 {
-        return 0;
-    }
-    return json_at_int(data, y * m.width + x, 0);
+    return jd_int(& m.doc, jd_at(& m.doc, jd_get(& m.doc, l, "data"), y * m.width + x), 0);
 }
 
 /// gid with flip flags stripped.
@@ -139,28 +137,26 @@ pub fn tiled_tile(m: TiledMap, li: i64, x: i64, y: i64) -> i64 {
 /// per-cell work is a single array index.
 pub fn tiled_to_tilemap(m: TiledMap, li: i64, solid_layer: i64) -> Tilemap {
     var tm: Tilemap = tilemap_create(m.width, m.height, m.tile_w);
-    var data: str = "";
-    var l: str = tiled_layer(m, li);
-    if str_len(l) != 0 {
-        data = json_get_safe(l, "data");
-    }
-    var sdata: str = "";
+    // the cells' nodes, each array walked once (empty for a missing layer
+    // or base64 data)
+    val data: Vec<i64> = jd_children(& m.doc, jd_get(& m.doc, tiled_layer(m, li), "data"));
+    var sdata: Vec<i64> = Vec::new();
     if solid_layer >= 0 {
-        var sl: str = tiled_layer(m, solid_layer);
-        if str_len(sl) != 0 {
-            sdata = json_get_safe(sl, "data");
-        }
+        sdata = jd_children(& m.doc, jd_get(& m.doc, tiled_layer(m, solid_layer), "data"));
     }
     var n: i64 = m.width * m.height;
     var i: i64 = 0;
     while i < n {
-        var g: i64 = tiled_gid(json_at_int(data, i, 0));
+        var g: i64 = 0;
+        if i < data.len() {
+            g = tiled_gid(jd_int(& m.doc, data.get(i), 0));
+        }
         if g > 0 {
             var x: i64 = i - (i / m.width) * m.width;
             var y: i64 = i / m.width;
             var solid: bool = false;
-            if str_len(sdata) != 0 {
-                solid = tiled_gid(json_at_int(sdata, i, 0)) > 0;
+            if i < sdata.len() {
+                solid = tiled_gid(jd_int(& m.doc, sdata.get(i), 0)) > 0;
             }
             tilemap_set_with_solid(& mut tm, x, y, g, solid);
         }
@@ -172,18 +168,19 @@ pub fn tiled_to_tilemap(m: TiledMap, li: i64, solid_layer: i64) -> Tilemap {
 // --- object layers ------------------------------------------------------------
 
 pub fn tiled_object_count(m: TiledMap, li: i64) -> i64 {
-    var l: str = tiled_layer(m, li);
-    if str_len(l) == 0 {
+    val l: i64 = tiled_layer(m, li);
+    if l < 0 {
         return 0;
     }
-    if !str_equal(json_get_str(l, "type"), "objectgroup") {
+    if !str_equal(tiled_str(m, l, "type"), "objectgroup") {
         return 0;
     }
-    var objs: str = json_get_safe(l, "objects");
-    if str_len(objs) == 0 {
-        return 0;
-    }
-    return json_len_safe(objs);
+    return jd_len(& m.doc, jd_get(& m.doc, l, "objects"));
+}
+
+// The node of object `oi` of layer `li`, -1 when out of range.
+fn tiled_obj_node(m: TiledMap, li: i64, oi: i64) -> i64 {
+    return jd_at(& m.doc, jd_get(& m.doc, tiled_layer(m, li), "objects"), oi);
 }
 
 /// Object `oi` of objectgroup layer `li`; id=0 when out of range.
@@ -191,84 +188,51 @@ pub fn tiled_object(m: TiledMap, li: i64, oi: i64) -> TiledObj {
     var o: TiledObj = TiledObj {
         id: 0, name: "", kind: "", x: 0.0, y: 0.0, w: 0.0, h: 0.0, gid: - 1, point: false
     };
-    var l: str = tiled_layer(m, li);
-    if str_len(l) == 0 {
+    val e: i64 = tiled_obj_node(m, li, oi);
+    if e < 0 {
         return o;
     }
-    var objs: str = json_get_safe(l, "objects");
-    if str_len(objs) == 0 || oi < 0 || oi >= json_len_safe(objs) {
-        return o;
+    o.id = jd_int(& m.doc, jd_get(& m.doc, e, "id"), 0);
+    o.name = tiled_str(m, e, "name");
+    o.kind = tiled_str(m, e, "type");
+    o.x = jd_num(& m.doc, jd_get(& m.doc, e, "x"), 0.0);
+    o.y = jd_num(& m.doc, jd_get(& m.doc, e, "y"), 0.0);
+    o.w = jd_num(& m.doc, jd_get(& m.doc, e, "width"), 0.0);
+    o.h = jd_num(& m.doc, jd_get(& m.doc, e, "height"), 0.0);
+    val gn: i64 = jd_get(& m.doc, e, "gid");
+    if gn >= 0 {
+        o.gid = tiled_gid(jd_int(& m.doc, gn, - 1));
     }
-    var e: str = json_at_safe(objs, oi);
-    o.id = json_get_int(e, "id", 0);
-    o.name = json_get_str(e, "name");
-    o.kind = json_get_str(e, "type");
-    o.x = json_get_num(e, "x", 0.0);
-    o.y = json_get_num(e, "y", 0.0);
-    o.w = json_get_num(e, "width", 0.0);
-    o.h = json_get_num(e, "height", 0.0);
-    o.gid = tiled_gid(json_get_int(e, "gid", - 1));
-    if !json_has(e, "gid") {
-        o.gid = - 1;
-    }
-    o.point = json_get_bool(e, "point", false);
+    o.point = jd_bool(& m.doc, jd_get(& m.doc, e, "point"), false);
     return o;
+}
+
+// Custom property `name` in the {name, type, value} array `props`, as
+// text: a string value decoded, any other value's raw text; "" when absent.
+fn tiled_prop_in(m: TiledMap, props: i64, name: str) -> str {
+    val kids: Vec<i64> = jd_children(& m.doc, props);
+    var i: i64 = 0;
+    while i < kids.len() {
+        val p: i64 = kids.get(i);
+        if str_equal(tiled_str(m, p, "name"), name) {
+            val v: i64 = jd_get(& m.doc, p, "value");
+            if jd_kind(& m.doc, v) == JSON_STRING {
+                return jd_str(& m.doc, v);
+            }
+            return jd_raw(& m.doc, v);
+        }
+        i = i + 1;
+    }
+    return "";
 }
 
 /// First custom property `name` on an object as str ("" when absent).
 /// Properties are an array of {name, type, value} objects.
 pub fn tiled_obj_prop(m: TiledMap, li: i64, oi: i64, name: str) -> str {
-    var l: str = tiled_layer(m, li);
-    if str_len(l) == 0 {
-        return "";
-    }
-    var objs: str = json_get_safe(l, "objects");
-    if str_len(objs) == 0 || oi >= json_len_safe(objs) {
-        return "";
-    }
-    var props: str = json_get_safe(json_at_safe(objs, oi), "properties");
-    if str_len(props) == 0 {
-        return "";
-    }
-    var i: i64 = 0;
-    while i < json_len_safe(props) {
-        var p: str = json_at_safe(props, i);
-        if str_equal(json_get_str(p, "name"), name) {
-            var v: str = json_get_safe(p, "value");
-            if str_len(v) == 0 {
-                return "";
-            }
-            // value may be a raw string/number/bool — normalize to text
-            if str_equal(json_type_safe(v), "string") {
-                return json_unescape(v);
-            }
-            return v;
-        }
-        i = i + 1;
-    }
-    return "";
+    return tiled_prop_in(m, jd_get(& m.doc, tiled_obj_node(m, li, oi), "properties"), name);
 }
 
 /// Map-level custom property (same {name,type,value} array).
 pub fn tiled_map_prop(m: TiledMap, name: str) -> str {
-    var props: str = json_get_safe(m.json, "properties");
-    if str_len(props) == 0 {
-        return "";
-    }
-    var i: i64 = 0;
-    while i < json_len_safe(props) {
-        var p: str = json_at_safe(props, i);
-        if str_equal(json_get_str(p, "name"), name) {
-            var v: str = json_get_safe(p, "value");
-            if str_len(v) == 0 {
-                return "";
-            }
-            if str_equal(json_type_safe(v), "string") {
-                return json_unescape(v);
-            }
-            return v;
-        }
-        i = i + 1;
-    }
-    return "";
+    return tiled_prop_in(m, jd_get(& m.doc, jd_root(& m.doc), "properties"), name);
 }

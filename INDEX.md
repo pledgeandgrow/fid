@@ -184,7 +184,7 @@ and `AGENTS.md` first when working on the compiler.
 | [veil.fd](../compiler/veil.fd) | 516 | `fid veil`: coverage (crashes with a double free: 2g.2) |
 | [ark.fd](../compiler/ark.fd) | 761 | `fid ark`: package manager |
 | **Old PIR path and experimental back ends (no default command)** | | |
-| [pir.fd](../compiler/pir.fd) | 2,704 | IR → PIR L1/L2/L3 (`pir`, `codegen`, `gpu`, `emit --boot`, `build --native`) |
+| [pir.fd](../compiler/pir.fd) | 2,704 | IR → PIR L1/L2/L3; no command reaches it any more (MI18: `pir`/`dump-pir` say where their views went, `codegen` is the machine layer); only elf64.fd's unused import keeps it in the build |
 | [opt.fd](../compiler/opt.fd) | 7,764 | PIR L2 optimizer, 19 passes; panics on hello world (2g.17) |
 | [regalloc.fd](../compiler/regalloc.fd) | 1,354 | Linear scan for PIR L3 |
 | [peephole.fd](../compiler/peephole.fd) | 1,151 | 9-pass x86-64 asm peephole (`codegen --peephole`) |
@@ -465,5 +465,5 @@ All are gitignored (see `.gitignore`).
 - **New to the codebase?** Read [README.md](../README.md) → [reference/architecture.md](reference/architecture.md) → [AGENTS.md](../AGENTS.md).
 - **Looking for a specific feature?** Check [reference/features.md](reference/features.md) and [reference/syntax.md](reference/syntax.md).
 - **About to edit the compiler?** Read [AGENTS.md](../AGENTS.md) — especially the high-risk file table. Run `./verify.sh` before and after.
-- **A test broke?** Bisect manually with `dump-ir` / `dump-pir` / `codegen --peephole` (no bisect script exists).
+- **A test broke?** Bisect manually with `dump-ir` / `opt` / `dump-mir` / `disasm` (no bisect script exists).
 - **Adding a new file?** Add a row to the relevant table above so this index stays current.

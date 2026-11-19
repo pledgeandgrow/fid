@@ -1,0 +1,122 @@
+// ME24 remainder (compiler/iropt_me.fd ime_unroll_one, `peel`): a loop of
+// one header and one body block whose constant trip count is over 8 and no
+// multiple of 4 or 2 runs `trips % factor` copies of its body before the
+// header, then groups of `factor` copies per test. Every result, the order
+// of the side effects included (the trace of `seen`), must be what the
+// loop computes without unrolling (FID_IROPT_OFF=unroll).
+//
+// Expected output:
+// 78
+// 3
+// 110
+// 286
+// 2
+// 7233
+// 0 1 2 3 4 5 6 7 8 9 10
+// 11
+// 5
+
+fn sum13() -> i64 {
+    // 13 trips: 1 peeled, then 3 groups of 4
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 13 {
+        t = t + i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn odd_steps() -> i64 {
+    // step 3 from 1 while i < 31: 10 trips: by 2, nothing peeled
+    // (the 4-way test fails first), ends at 31
+    var i: i64 = 1;
+    var n: i64 = 0;
+    while i < 31 {
+        n = n + 1;
+        i = i + 3;
+    }
+    return i - n * 3 + 2;
+}
+
+fn tri15() -> i64 {
+    // `<=` from 5 to 15: 11 trips, 3 peeled
+    var t: i64 = 0;
+    var i: i64 = 5;
+    while i <= 15 {
+        t = t + i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn ne13() -> i64 {
+    // `!=` from 0 to 13: 13 trips, 1 peeled
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i != 13 {
+        t = t + i * 2 + 10;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn first_then_rest() -> i64 {
+    // the peeled copy is the first iteration: a value set only on i == 0
+    // by arithmetic (no branch) survives
+    var a: i64 = 0;
+    var i: i64 = 0;
+    while i < 9 {
+        a = a * 0 + (i + 1) * 0 + 2;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn product11() -> i64 {
+    var p: i64 = 1;
+    var i: i64 = 1;
+    while i < 12 {
+        p = (p * (i + 1)) % 100003;
+        i = i + 1;
+    }
+    return p % 10000;
+}
+
+fn trace11(seen: & mut Vec<i64>) {
+    // the order of the calls survives the peel
+    var i: i64 = 0;
+    while i < 11 {
+        seen.push(i);
+        i = i + 1;
+    }
+}
+
+fn main() {
+    println(sum13());
+    println(odd_steps());
+    println(tri15());
+    println(ne13());
+    println(first_then_rest());
+    println(product11());
+    var seen: Vec<i64> = Vec::new();
+    trace11(& mut seen);
+    var line: str = "";
+    var k: i64 = 0;
+    while k < seen.len() {
+        if k > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(seen.get(k));
+        k = k + 1;
+    }
+    println(line);
+    println(seen.len());
+    var tail: i64 = 0;
+    var j: i64 = 0;
+    while j < 5 {
+        tail = tail + 1;
+        j = j + 1;
+    }
+    println(tail);
+}

@@ -1,0 +1,216 @@
+// stdlib/quic_udp over real UDP sockets (competitive SL2): IPv6, the
+// server's Retry, client migration to a new socket, Version Negotiation,
+// a stateless reset from a restarted server, and resumption with 0-RTT, all
+// on the loopback interface, client and server in one process. It uses
+// real sockets (ports the system picks), so it is not in the suite; build
+// it any way (stdlib/udp.fd needs nothing linked by hand):
+//   $FID ccompile tests/net/quic_udp_more.fd -o qm.exe && ./qm.exe
+//   $FID emit tests/net/quic_udp_more.fd -o qm.exe && ./qm.exe            (Windows, native)
+//   CC="zig cc" $FID ccompile tests/net/quic_udp_more.fd --target x86_64-linux -o qm  (./qm in WSL)
+// A host without IPv6 on its loopback runs it on 127.0.0.1 and prints
+// "ipv4 only" first.
+//
+// Expected output:
+// retry and handshake over udp: h3
+// echo ok
+// migrated to a new socket: echo ok
+// version negotiation over udp: v1, echo ok
+// ticket received
+// resumed with 0-rtt over udp: echo ok
+// stateless reset after a server restart
+// quic udp more ok
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use quic_udp;
+use udp;
+use crypto;
+use encoding;
+
+fn append(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// Echo every client stream once it is finished (ids/bufs per stream of
+/// every connection, keyed by connection index * 1000000 + stream id).
+fn serve(sv: & mut QuicUdpServer, keys: & mut Vec<i64>, bufs: & mut Vec<Vec<i64>>) {
+    var k: i64 = 0;
+    while k < sv.conns.len() {
+        var c: QuicConn = sv.conns.get(k);
+        val fresh: Vec<i64> = quic_accept_streams(& mut c);
+        var f: i64 = 0;
+        while f < fresh.len() {
+            keys.push(k * 1000000 + fresh.get(f));
+            var none: Vec<i64> = Vec::new();
+            bufs.push(none);
+            f = f + 1;
+        }
+        var j: i64 = 0;
+        while j < keys.len() {
+            val key: i64 = keys.get(j);
+            if key >= 0 && key / 1000000 == k {
+                val id: i64 = key % 1000000;
+                var b: Vec<i64> = bufs.get(j);
+                append(& mut b, quic_stream_read(& mut c, id));
+                if quic_stream_finished(& c, id) {
+                    quic_stream_write(& mut c, id, b, true);
+                    keys.set(j, - 1);
+                }
+                bufs.set(j, b);
+            }
+            j = j + 1;
+        }
+        sv.conns.set(k, c);
+        k = k + 1;
+    }
+}
+
+struct Echoer {
+    keys: Vec<i64>,
+    bufs: Vec<Vec<i64>>,
+}
+
+fn poll_both(cl: & mut QuicUdpClient, sv: & mut QuicUdpServer, e: & mut Echoer) {
+    quic_udp_client_poll(cl, 2);
+    quic_udp_server_poll(sv, 2);
+    serve(sv, & mut e.keys, & mut e.bufs);
+}
+
+fn handshake(cl: & mut QuicUdpClient, sv: & mut QuicUdpServer, e: & mut Echoer, what: str) {
+    var rounds: i64 = 0;
+    while rounds < 3000 && !(quic_conn_established(& cl.conn) && cl.conn.hs_confirmed) {
+        poll_both(cl, sv, e);
+        if quic_conn_done(& cl.conn) { p_panic(what + ": handshake failed: " + cl.conn.why); }
+        rounds = rounds + 1;
+    }
+    if !quic_conn_established(& cl.conn) { p_panic(what + ": no handshake"); }
+}
+
+fn echo(cl: & mut QuicUdpClient, sv: & mut QuicUdpServer, e: & mut Echoer, msg: str, what: str) {
+    val id: i64 = quic_open_bidi(& mut cl.conn);
+    if id < 0 { p_panic(what + ": no stream"); }
+    quic_stream_write(& mut cl.conn, id, str_bytes(msg), true);
+    var got: Vec<i64> = Vec::new();
+    var rounds: i64 = 0;
+    while rounds < 3000 && !(quic_stream_finished(& cl.conn, id) && got.len() > 0) {
+        poll_both(cl, sv, e);
+        append(& mut got, quic_stream_read(& mut cl.conn, id));
+        if quic_conn_done(& cl.conn) { p_panic(what + ": closed: " + cl.conn.why); }
+        rounds = rounds + 1;
+    }
+    if !str_equal(str_from_bytes(got), msg) { p_panic(what + ": echo '" + str_from_bytes(got) + "'"); }
+}
+
+fn main() -> i64 {
+    val seed: Vec<i64> = hex_decode_bytes("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    var scfg: QuicConfig = quic_config_server(alpn, cert, seed);
+    scfg.retry = true;
+    scfg.ticket_key = crypto_random_bytes(16);
+    scfg.early_data = true;
+    var host: str = "::1";
+    var sv: QuicUdpServer = quic_udp_listen_on(host, 0, scfg);
+    if sv.sock < 0 {
+        println("ipv4 only");
+        host = "127.0.0.1";
+        sv = quic_udp_listen_on(host, 0, scfg);
+    }
+    val port: i64 = quic_udp_server_port(& sv);
+    if port <= 0 { p_panic("no server port"); }
+    var ccfg: QuicConfig = quic_config_client(alpn, "localhost");
+    ccfg.peer_key = quic_cert_ed25519_key(cert);
+    var e: Echoer = Echoer { keys: Vec::new(), bufs: Vec::new() };
+
+    // Retry, handshake, echo
+    var cl: QuicUdpClient = quic_udp_connect(host, port, ccfg);
+    handshake(& mut cl, & mut sv, & mut e, "retry");
+    if !cl.conn.retried { p_panic("no Retry seen"); }
+    println("retry and handshake over udp: " + cl.conn.alpn);
+    echo(& mut cl, & mut sv, & mut e, "hello over udp", "echo");
+    println("echo ok");
+
+    // Migration: a new socket (a new local port)
+    var rounds: i64 = 0;
+    while rounds < 50 && cl.conn.spare_cids.len() == 0 {
+        poll_both(& mut cl, & mut sv, & mut e);
+        rounds = rounds + 1;
+    }
+    if !quic_udp_client_migrate(& mut cl) { p_panic("migration refused"); }
+    echo(& mut cl, & mut sv, & mut e, "from a new port", "migration");
+    rounds = 0;
+    var s0: QuicConn = sv.conns.get(0);
+    while rounds < 200 && !quic_conn_path_validated(& s0) {
+        poll_both(& mut cl, & mut sv, & mut e);
+        s0 = sv.conns.get(0);
+        rounds = rounds + 1;
+    }
+    if s0.migrations != 1 || !quic_conn_path_validated(& s0) { p_panic("server did not follow"); }
+    println("migrated to a new socket: echo ok");
+    // A ticket for later
+    rounds = 0;
+    while rounds < 200 && !quic_conn_has_ticket(& cl.conn) {
+        poll_both(& mut cl, & mut sv, & mut e);
+        rounds = rounds + 1;
+    }
+    val ticket: QuicTicket = quic_conn_ticket(& cl.conn);
+
+    // Version negotiation: a client starting with an unknown version
+    var vcfg: QuicConfig = ccfg;
+    vcfg.version = 0x5a6a7a8a;
+    var vc: QuicUdpClient = quic_udp_connect(host, port, vcfg);
+    handshake(& mut vc, & mut sv, & mut e, "version negotiation");
+    if !quic_conn_version_negotiated(& vc.conn) { p_panic("no Version Negotiation seen"); }
+    echo(& mut vc, & mut sv, & mut e, "after vn", "vn echo");
+    println("version negotiation over udp: v1, echo ok");
+
+    // Resumption with 0-RTT
+    if !quic_conn_has_ticket(& cl.conn) { p_panic("no ticket"); }
+    println("ticket received");
+    var rcfg: QuicConfig = ccfg;
+    rcfg.ticket = ticket;
+    rcfg.early_data = true;
+    var rc: QuicUdpClient = quic_udp_connect(host, port, rcfg);
+    // (the Retry costs the 0-RTT packet of the first flight: it goes again)
+    val eid: i64 = quic_open_bidi(& mut rc.conn);
+    quic_stream_write(& mut rc.conn, eid, str_bytes("early over udp"), true);
+    var got: Vec<i64> = Vec::new();
+    rounds = 0;
+    while rounds < 3000 && !(quic_stream_finished(& rc.conn, eid) && got.len() > 0) {
+        poll_both(& mut rc, & mut sv, & mut e);
+        append(& mut got, quic_stream_read(& mut rc.conn, eid));
+        if quic_conn_done(& rc.conn) { p_panic("resumption: closed: " + rc.conn.why); }
+        rounds = rounds + 1;
+    }
+    if !quic_conn_resumed(& rc.conn) || !str_equal(str_from_bytes(got), "early over udp") { p_panic("resumption"); }
+    println("resumed with 0-rtt over udp: echo ok");
+
+    // The server restarts on the same port (same reset key): the client's
+    // next packet gets a stateless reset
+    val keep_cfg: QuicConfig = sv.cfg;
+    quic_udp_server_free(& mut sv);
+    var sv2: QuicUdpServer = quic_udp_listen_on(host, port, keep_cfg);
+    if sv2.sock < 0 { p_panic("could not listen again on the port"); }
+    val rid: i64 = quic_open_bidi(& mut cl.conn);
+    quic_stream_write(& mut cl.conn, rid, str_bytes("still there?"), true);
+    rounds = 0;
+    while rounds < 3000 && !quic_conn_done(& cl.conn) {
+        quic_udp_client_poll(& mut cl, 2);
+        quic_udp_server_poll(& mut sv2, 2);
+        rounds = rounds + 1;
+    }
+    if !quic_conn_was_reset(& cl.conn) { p_panic("no stateless reset: " + cl.conn.why); }
+    println("stateless reset after a server restart");
+    quic_udp_client_free(& mut cl);
+    quic_udp_client_free(& mut vc);
+    quic_udp_client_free(& mut rc);
+    quic_udp_server_free(& mut sv2);
+    println("quic udp more ok");
+    return 0;
+}

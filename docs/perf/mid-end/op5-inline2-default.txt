@@ -1,0 +1,75 @@
+# op5-inline2-default: inline2 (compiler/iropt_me.fd ime_inline) on by default
+# (competitive-roadmap OP5). Measured Nov 17 with the compiler of Nov 16
+# (ws/stage0.exe: inline2 opt-in there, so the "on" builds name it with
+# FID_IROPT_ON=inline2; it has neither the growth budget nor
+# ime_backend_named). FID_HOME = the working tree.
+
+## Correctness: tests/tooling/midend-optin-check.sh, IME=inline2 RULES=
+## (pe_ir, FID_VERIFY=1 on the "on" build), the 33 default programs
+SAME 29 (test_unroll, test_midend_unroll_partial, test_midend_unroll_runtime,
+     test_midend_unroll_remainder, test_irswitch_version,
+     test_counted_loop_step, test_midend_effects_deep,
+     test_midend_loop_body_shared, test_midend_iv_bounded,
+     test_midend_licm_guard, test_matrix_mul, test_match_range,
+     test_struct_copy_vec, test_struct_eq, test_struct_reassign,
+     test_generic_struct, test_generics_full, test_vec_loop, test_vec_math,
+     test_vec_builtins, test_vec_filled, test_vec_f64, test_hashmap,
+     test_hashmap_int_keys, test_closure_capture, test_lang_features,
+     test_opt_dce, test_verify_opt_dse_sccp_iv, test_lib_bigint), and
+     test_counted_loop by hand (iropt instructions 5201 -> 4472 off,
+     11965 -> 10146 on; same output)
+SKIP 4 (build only with inline2 on: test_collections, test_str_reclaim,
+     test_xml_spec; builds with neither: test_grid_safe)
+DIFF 0, BUILD 0
+
+## Speed: tests/tooling/inline2-bench-check.sh, ONENV=FID_IROPT_ON=inline2,
+## best of several runs (ms), executable sizes (bytes); an earlier run of
+## Nov 17 (bench/fides, then SUITE=game)
+program        result     off-ms      on-ms  off-bytes   on-bytes
+fib            SLOW         1310       1781      41479      42170
+hashmap        OK           1819       1806      80717     101991
+loop           OK           4952       4784      41461      42152
+sieve          SLOW          478        984      68197     104363
+binarytrees    OK           1630       1453      52548      81284
+fannkuch       SLOW         8397      36296      73584     109757
+fasta          SLOW          771       1131      74231     110327
+knucleotide    SLOW         5854       7219      89562     111575
+mandelbrot     OK           2558       2535      42514      43176
+nbody          SLOW         3557      13494      84648     133081
+pidigits       SLOW        49993      91318      94784     162628
+regexredux     SLOW         2653      12366      88820     140813
+revcomp        SLOW         1115       2338      78417     120687
+spectral       SLOW         2209       2495      71773     111000
+
+## Why: inline2 copied core's Vec_get/Vec_set/Vec_push/Vec_len (and other
+## runtime functions) into the loops that call them
+bench/fides/sieve.fd, FID_IROPT_STATS=1:
+  inline2 off: iropt instructions 4647 -> 3987, run 482-681 ms
+  inline2 on:  iropt instructions 10422 -> 8893, run 1133-1269 ms
+emit --nat, FID_NAT_DUMP=main: main after selection 324 operations (off),
+  796 (on); calls 54 (off), 161 (on).
+test_midend_inline2_vecfast.fd (main calls only Vec_* and println), --nat:
+  main 745 operations (off), 1706 (on); run 382 ms vs 518 ms.
+pe_ir and nat_ir lower those calls themselves (a load or store with a fast
+path), checks.fd proves their bounds checks away in counted loops, and a
+Vec_* call goes to pe_runtime (pe_runtime_alias_target); core's body in
+their place is a generic element-code dispatch with its own checks.
+
+## Fix (Nov 17): ime_backend_named in compiler/iropt_me.fd, called by
+## ime_callee_ok: no function the backends or the check proofs know by name
+## is copied (p_, pe_, pet_, ped_, pert_, nat_, __ but __closure_/__eq_,
+## Vec_, HashMap_, vec_, Str_, Box_, *_len, *_length, print, println, len,
+## int_to_str, str_concat, String_from, main_entry, and every
+## pe_runtime_alias_target name). Check: tests/tooling/inline2-vecfast-check.sh.
+## fib is not explained by it (fib calls itself, which inline2 never copies;
+## only println was copied into main, +691 bytes): with println now kept
+## as a call, main is the same as with inline2 off; recheck fib's time.
+
+## To measure with the final compiler (inline2 on by default there):
+##   FID=$FID bash tests/tooling/inline2-vecfast-check.sh
+##   FID=$FID bash tests/tooling/inline2-check.sh
+##   FID=$FID bash tests/tooling/inline2-suite-check.sh
+##   FID=$FID bash tests/tooling/inline2-bench-check.sh
+##   FID=$FID SUITE=game bash tests/tooling/inline2-bench-check.sh
+## If any program is still SLOW (over 10% slower with inline2 on) or WRONG,
+## take inline2 out of IME_DEFAULT_ON in compiler/iropt_me.fd.

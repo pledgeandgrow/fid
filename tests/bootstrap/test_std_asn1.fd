@@ -1,0 +1,106 @@
+// stdlib/asn1: DER encodings of INTEGER, BOOLEAN, NULL, OID (X.690's
+// {2 999 3} example), BIT STRING (X.690 8.6.4.2), long lengths, high tag
+// numbers, times and SET OF ordering; decoding them back; BER indefinite
+// lengths and the DER checks that reject BER-only forms.
+// Expected output:
+// int 0 020100
+// int 127 02017f
+// int 128 02020080
+// int 256 02020100
+// int -128 020180
+// int -129 0202ff7f
+// uint 020200ff 020200ff
+// bool null 0101ff 0500
+// oid rsadsi 06062a864886f70d
+// oid 2.999.3 0603883703
+// bits 0307040a3b5f291cd0 unused 4
+// len 200 0481c8 300 0482012c
+// high tag 5f640101 tag 100 class 1
+// utc 491231235959Z gen 20500101000000Z
+// set of 31080101ff0201050400
+// decode 5 1.2.840.113549 hello 0a3b5f291cd0
+// time 673573540 2524608000 500159187 -310478400
+// bmp AB
+// ber indefinite ok true der false kids 2 end 11
+// der rejects true true true
+// int minimal true false false
+// path 1.2.840.113549
+use asn1;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn tm(s: str, tag: i64) -> i64 {
+    val c: Vec<i64> = asn1_enc_tlv(tag, str_bytes(s));
+    val t: Asn1Tlv = asn1_read_der(& c, 0, c.len());
+    match asn1_get_time(& c, t) {
+        Some(x) => { return x; }
+        None => { return -1; }
+    }
+}
+
+fn main() {
+    println("int 0 " + hx(asn1_enc_int(0)));
+    println("int 127 " + hx(asn1_enc_int(127)));
+    println("int 128 " + hx(asn1_enc_int(128)));
+    println("int 256 " + hx(asn1_enc_int(256)));
+    println("int -128 " + hx(asn1_enc_int(-128)));
+    println("int -129 " + hx(asn1_enc_int(-129)));
+    println("uint " + hx(asn1_enc_uint(hex_decode_bytes("0000ff"))) + " " + hx(asn1_enc_uint(hex_decode_bytes("00ff"))) );
+    println("bool null " + hx(asn1_enc_bool(true)) + " " + hx(asn1_enc_null()));
+    println("oid rsadsi " + hx(asn1_enc_oid("1.2.840.113549")));
+    println("oid 2.999.3 " + hx(asn1_enc_oid("2.999.3")));
+    val bits: Vec<i64> = asn1_enc_bits(hex_decode_bytes("0a3b5f291cdf"), 4);
+    val bt: Asn1Tlv = asn1_read_der(& bits, 0, bits.len());
+    println("bits " + hx(bits) + " unused " + int_to_str(asn1_bits_unused(& bits, bt)));
+    var big: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 { big.push(i & 255); i = i + 1; }
+    val o300: Vec<i64> = asn1_enc_octets(big);
+    var b200: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 200 { b200.push(7); i = i + 1; }
+    val o200: Vec<i64> = asn1_enc_octets(b200);
+    println("len 200 " + hx(asn1_slice(& o200, 0, 3)) + " 300 " + hx(asn1_slice(& o300, 0, 4)));
+    var one: Vec<i64> = Vec::new();
+    one.push(1);
+    val ht: Vec<i64> = asn1_enc_tag(1, false, 100, one);
+    val htt: Asn1Tlv = asn1_read_der(& ht, 0, ht.len());
+    println("high tag " + hx(ht) + " tag " + int_to_str(htt.tag) + " class " + int_to_str(htt.cls));
+    val u: Vec<i64> = asn1_enc_time(2524607999);
+    val g: Vec<i64> = asn1_enc_time(2524608000);
+    println("utc " + str_from_bytes(asn1_slice(& u, 2, u.len())) + " gen " + str_from_bytes(asn1_slice(& g, 2, g.len())));
+    var elems: Vec<Vec<i64>> = Vec::new();
+    elems.push(asn1_enc_int(5));
+    elems.push(asn1_enc_bool(true));
+    elems.push(asn1_enc_octets(Vec::new()));
+    println("set of " + hx(asn1_enc_set_of(elems)));
+
+    // A SEQUENCE built and walked back.
+    val seq: Vec<i64> = asn1_enc_seq(asn1_cat(asn1_cat(asn1_enc_int(5), asn1_enc_oid("1.2.840.113549")), asn1_cat(asn1_enc_utf8("hello"), bits)));
+    val top: Asn1Tlv = asn1_read_der(& seq, 0, seq.len());
+    val kids: Vec<Asn1Tlv> = asn1_children(& seq, top);
+    println("decode " + int_to_str(asn1_get_int(& seq, kids.get(0))) + " " + asn1_get_oid(& seq, kids.get(1)) + " " + asn1_get_str(& seq, kids.get(2)) + " " + hx(asn1_get_bits(& seq, kids.get(3))));
+    println("time " + int_to_str(tm("910506234540Z", ASN1_UTC_TIME)) + " " + int_to_str(tm("20500101000000Z", ASN1_GENERALIZED_TIME)) + " " + int_to_str(tm("19851106210627.3Z", ASN1_GENERALIZED_TIME)) + " " + int_to_str(tm("600229120000Z", ASN1_UTC_TIME)));
+    val bmp: Vec<i64> = hex_decode_bytes("1e0400410042");
+    println("bmp " + asn1_get_str(& bmp, asn1_read(& bmp, 0, bmp.len())));
+
+    val ber2: Vec<i64> = hex_decode_bytes("3080020105" + "0402aabb" + "0000");
+    val bt2: Asn1Tlv = asn1_read(& ber2, 0, ber2.len());
+    println("ber indefinite ok " + bool_to_str(bt2.ok) + " der " + bool_to_str(bt2.der) + " kids " + int_to_str(asn1_count(& ber2, bt2)) + " end " + int_to_str(bt2.end));
+    val nonmin: Vec<i64> = hex_decode_bytes("0481050102030405");
+    val hightag: Vec<i64> = hex_decode_bytes("1f050100");
+    val r1: Asn1Tlv = asn1_read_der(& nonmin, 0, nonmin.len());
+    val r2: Asn1Tlv = asn1_read_der(& ber2, 0, ber2.len());
+    val r3: Asn1Tlv = asn1_read_der(& hightag, 0, hightag.len());
+    println("der rejects " + bool_to_str(!r1.ok) + " " + bool_to_str(!r2.ok) + " " + bool_to_str(!r3.ok));
+    val im: Vec<i64> = hex_decode_bytes("020200ff" + "02020001" + "0202ff80");
+    val m1: Asn1Tlv = asn1_read(& im, 0, im.len());
+    val m2: Asn1Tlv = asn1_read(& im, 4, im.len());
+    val m3: Asn1Tlv = asn1_read(& im, 8, im.len());
+    println("int minimal " + bool_to_str(asn1_int_minimal(& im, m1)) + " " + bool_to_str(asn1_int_minimal(& im, m2)) + " " + bool_to_str(asn1_int_minimal(& im, m3)));
+    var path: Vec<i64> = Vec::new();
+    path.push(1);
+    println("path " + asn1_get_oid(& seq, asn1_path(& seq, 0, path)));
+}

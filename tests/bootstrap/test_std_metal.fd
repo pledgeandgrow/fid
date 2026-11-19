@@ -1,0 +1,94 @@
+// stdlib/metal: MTLPixelFormat and MTLVertexFormat tables, vertex descriptor packing with its MSL struct, render pipeline checks, dispatch sizing, resource options, C string round trip. No Objective-C runtime call is made (needs macOS and a Metal device).
+// Expected output:
+// RGBA8Unorm 4B renderable true; BGRA8Unorm_sRGB srgb true; Depth32Float depth true; Depth32Float_Stencil8 8B depth true stencil true
+// BC1_RGBA 8B 4x4; BC7_RGBAUnorm_sRGB 16B srgb true; ASTC_8x8_LDR 16B 8x8; RGB9E5Float renderable false; 136 unknown true
+// bytesPerRow: RGBA8Unorm x100 400, BC1_RGBA x100 200
+// vertex: Float3 12 float3, UChar4Normalized 4 float4, Short2 4 short2, Half4 8 half4, UChar4Normalized_BGRA 4 float4, Half 2 half, UChar4 4 uchar4, 43 unknown true
+// layout: offsets 0 12 16 20, stride 24, errors 0
+// struct VertexIn {
+//     float3 position [[attribute(0)]];
+//     float4 color [[attribute(1)]];
+//     half2 uv [[attribute(2)]];
+//     uchar flags [[attribute(3)]];
+// };
+// bad layout: buffer index 31 out of range 0..30
+// bad layout: attribute 2 used twice
+// pipeline ok: 0 problems
+// pipeline bad: color attachment 0: Depth32Float is not color-renderable
+// pipeline bad: color attachment 1: RGB9E5Float is not color-renderable
+// pipeline bad: depth attachment format is not a depth format
+// pipeline bad: sample count must be 1, 2, 4 or 8
+// dispatch 1920x1080: threadgroup 32x32, groups 60x34
+// options private+write-combined+untracked: 289, storage 2
+// C string round trip: hello metal
+use metal;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn vf(v: i64) -> str {
+    val f: MtlVertexFormat = mtl_vertex_format(v);
+    if f.name == "" { return int_to_str(v) + " unknown true"; }
+    return f.name + " " + int_to_str(f.size) + " " + f.msl;
+}
+
+fn main() {
+    val a: MtlPixelFormat = mtl_pixel_format(MTL_PIXEL_FORMAT_RGBA8_UNORM);
+    val b: MtlPixelFormat = mtl_pixel_format(MTL_PIXEL_FORMAT_BGRA8_UNORM_SRGB);
+    val c: MtlPixelFormat = mtl_pixel_format(MTL_PIXEL_FORMAT_DEPTH32_FLOAT);
+    val d: MtlPixelFormat = mtl_pixel_format(MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8);
+    println(a.name + " " + int_to_str(a.bytes) + "B renderable " + yes(a.color_renderable) + "; " + b.name + " srgb " + yes(b.srgb) + "; " + c.name + " depth " + yes(c.depth) + "; " + d.name + " " + int_to_str(d.bytes) + "B depth " + yes(d.depth) + " stencil " + yes(d.stencil));
+    val e: MtlPixelFormat = mtl_pixel_format(MTL_PIXEL_FORMAT_BC1_RGBA);
+    val f: MtlPixelFormat = mtl_pixel_format(153);
+    val g: MtlPixelFormat = mtl_pixel_format(212);
+    println(e.name + " " + int_to_str(e.bytes) + "B " + int_to_str(e.block_w) + "x" + int_to_str(e.block_h) + "; " + f.name + " " + int_to_str(f.bytes) + "B srgb " + yes(f.srgb) + "; " + g.name + " " + int_to_str(g.bytes) + "B " + int_to_str(g.block_w) + "x" + int_to_str(g.block_h) + "; RGB9E5Float renderable " + yes(mtl_pixel_format(MTL_PIXEL_FORMAT_RGB9E5_FLOAT).color_renderable) + "; 136 unknown " + yes(mtl_pixel_format(136).name == ""));
+    println("bytesPerRow: RGBA8Unorm x100 " + int_to_str(mtl_bytes_per_row(70, 100)) + ", BC1_RGBA x100 " + int_to_str(mtl_bytes_per_row(130, 100)));
+    println("vertex: " + vf(30) + ", " + vf(9) + ", " + vf(16) + ", " + vf(27) + ", " + vf(42) + ", " + vf(53) + ", " + vf(3) + ", " + vf(43));
+
+    var l: MtlVertexLayout = mtl_vertex_layout_new(0);
+    mtl_vertex_add(&mut l, 0, MTL_VERTEX_FORMAT_FLOAT3, "position");
+    mtl_vertex_add(&mut l, 1, MTL_VERTEX_FORMAT_UCHAR4_NORMALIZED, "color");
+    mtl_vertex_add(&mut l, 2, MTL_VERTEX_FORMAT_HALF2, "uv");
+    mtl_vertex_add(&mut l, 3, MTL_VERTEX_FORMAT_UCHAR, "flags");
+    var offs: str = "";
+    var i: i64 = 0;
+    while i < l.offsets.len() {
+        offs = offs + " " + int_to_str(l.offsets.get(i));
+        i = i + 1;
+    }
+    println("layout: offsets" + offs + ", stride " + int_to_str(l.stride) + ", errors " + int_to_str(l.errors.len()));
+    val msl: Vec<str> = str_lines(mtl_vertex_msl(&l, "VertexIn"));
+    i = 0;
+    while i < msl.len() {
+        if str_len(msl.get(i)) > 0 { println(msl.get(i)); }
+        i = i + 1;
+    }
+    var bad: MtlVertexLayout = mtl_vertex_layout_new(31);
+    mtl_vertex_add(&mut bad, 2, MTL_VERTEX_FORMAT_FLOAT, "a");
+    mtl_vertex_add(&mut bad, 2, MTL_VERTEX_FORMAT_FLOAT, "b");
+    i = 0;
+    while i < bad.errors.len() {
+        println("bad layout: " + bad.errors.get(i));
+        i = i + 1;
+    }
+
+    var ok_fmts: Vec<i64> = Vec::new();
+    ok_fmts.push(MTL_PIXEL_FORMAT_BGRA8_UNORM);
+    println("pipeline ok: " + int_to_str(mtl_validate_render_pipeline(&ok_fmts, MTL_PIXEL_FORMAT_DEPTH32_FLOAT, 4).len()) + " problems");
+    var bad_fmts: Vec<i64> = Vec::new();
+    bad_fmts.push(MTL_PIXEL_FORMAT_DEPTH32_FLOAT);
+    bad_fmts.push(MTL_PIXEL_FORMAT_RGB9E5_FLOAT);
+    val pe: Vec<str> = mtl_validate_render_pipeline(&bad_fmts, MTL_PIXEL_FORMAT_RGBA8_UNORM, 3);
+    i = 0;
+    while i < pe.len() {
+        println("pipeline bad: " + pe.get(i));
+        i = i + 1;
+    }
+    val dp: MtlDispatch = mtl_dispatch_2d(1920, 1080, 32, 1024);
+    println("dispatch 1920x1080: threadgroup " + int_to_str(dp.tg_w) + "x" + int_to_str(dp.tg_h) + ", groups " + int_to_str(dp.groups_w) + "x" + int_to_str(dp.groups_h));
+    val o: i64 = mtl_resource_options(2, 1, 1);
+    println("options private+write-combined+untracked: " + int_to_str(o) + ", storage " + int_to_str(mtl_options_storage(o)));
+    println("C string round trip: " + mtl_read_cstr(mtl_cstr("hello metal")));
+}

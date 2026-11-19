@@ -1,0 +1,136 @@
+// DB3 (docs/roadmap/llvm-roadmap.md): the PDB writer of compiler/pdb.fd
+// on a real image. Reads the Windows image $PDB_IN (any `fid emit` image:
+// pe_ir writes a COFF symbol table by default), takes its COFF function
+// symbols (pdb_coff_functions) sorted by address, makes every other one a
+// procedure (S_GPROC32 over [its address, the next symbol's)) and leaves
+// the rest as publics only, gives the first eight procedures line rows
+// (100 * (k + 1) at the start, + 5 half way; the second procedure's second
+// row in a second file, lib_extra.fd), then calls pdb_attach as a backend
+// does: $PDB_OUT_EXE gets the image with its .buildid section and debug
+// directory, $PDB_OUT the PDB. It prints what a reader must find:
+//   guid <GUID as Windows prints it>
+//   proc <name> <start> <size>      (offsets in .text)
+//   public <name> <offset>
+//   row <name> <offset> <line> <file>
+// tests/nattools/pe_pdb_check.py --unit runs it and checks the PDB with
+// its own MSF reader, dbghelp (Windows) and llvm-pdbutil (when present).
+// Run by hand (from the repository root):
+//   PDB_IN=hello.exe PDB_OUT_EXE=hello2.exe PDB_OUT=hello2.pdb fid run tests/nattools/pdb_unit.fd
+use core;
+use vec;
+use string;
+use compiler::pdb;
+
+fn env_or(name: str, dflt: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+        }
+    }
+    return dflt;
+}
+
+fn main() {
+    var inp: str = env_or("PDB_IN", "");
+    var out_exe: str = env_or("PDB_OUT_EXE", "");
+    var out_pdb: str = env_or("PDB_OUT", "");
+    if inp == "" || out_exe == "" || out_pdb == "" {
+        println("usage: PDB_IN=<image> PDB_OUT_EXE=<image> PDB_OUT=<pdb> fid run tests/nattools/pdb_unit.fd");
+        return;
+    }
+    var pe: Vec<i64> = p_file_read_bytes(inp);
+    var cn: Vec<str> = Vec::new();
+    var co: Vec<i64> = Vec::new();
+    pdb_coff_functions(& pe, & mut cn, & mut co);
+    var e: i64 = pdb_get_u32(& pe, 0x3C);
+    var sect: i64 = e + 24 + pdb_get_u16(& pe, e + 20);
+    var text_size: i64 = pdb_get_u32(& pe, sect + 8);
+    // by address (insertion sort of indices)
+    var order: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < cn.len() {
+        order.push(i);
+        i = i + 1;
+    }
+    i = 1;
+    while i < order.len() {
+        var cur: i64 = order.get(i);
+        var j: i64 = i - 1;
+        var moving: bool = true;
+        while j >= 0 && moving {
+            var o: i64 = order.get(j);
+            if co.get(cur) < co.get(o) {
+                order.set(j + 1, o);
+                j = j - 1;
+            } else {
+                moving = false;
+            }
+        }
+        order.set(j + 1, cur);
+        i = i + 1;
+    }
+    var names: Vec<str> = Vec::new();
+    var starts: Vec<i64> = Vec::new();
+    var ends: Vec<i64> = Vec::new();
+    var rows: Vec<i64> = Vec::new();
+    var nproc: i64 = 0;
+    i = 0;
+    while i < order.len() {
+        var ix: i64 = order.get(i);
+        var st: i64 = co.get(ix);
+        var en: i64 = text_size;
+        var k: i64 = i + 1;
+        while k < order.len() && co.get(order.get(k)) <= st {
+            k = k + 1;
+        }
+        if k < order.len() {
+            en = co.get(order.get(k));
+        }
+        if i % 2 == 0 && en > st {
+            names.push(cn.get(ix));
+            starts.push(st);
+            ends.push(en);
+            println("proc " + cn.get(ix) + " " + int_to_str(st) + " " + int_to_str(en - st));
+            if nproc < 8 {
+                var base: i64 = 100 * (nproc + 1);
+                rows.push(st);
+                rows.push(base);
+                rows.push(0);
+                println("row " + cn.get(ix) + " 0 " + int_to_str(base) + " 0");
+                var half: i64 = (en - st) / 2;
+                if half > 0 {
+                    var f2: i64 = 0;
+                    if nproc == 1 {
+                        f2 = 1;
+                    }
+                    rows.push(st + half);
+                    rows.push(base + 5);
+                    rows.push(2 * f2);
+                    println("row " + cn.get(ix) + " " + int_to_str(half) + " " + int_to_str(base + 5) + " " + int_to_str(f2));
+                }
+                rows.push(en);
+                rows.push(0);
+                rows.push(1);
+            }
+            nproc = nproc + 1;
+        } else {
+            println("public " + cn.get(ix) + " " + int_to_str(st));
+        }
+        i = i + 1;
+    }
+    var files: Vec<str> = Vec::new();
+    files.push("");
+    files.push("lib_extra.fd");
+    g_pdb_out = out_pdb;
+    var out: Vec<i64> = pdb_attach(pe, names, starts, ends, rows, files, "pdb_unit_main.fd");
+    if out.len() == pe.len() {
+        println("no debug directory added");
+        return;
+    }
+    p_file_write_vec(out_exe, out);
+    var guid: Vec<i64> = pdb_guid(& pe);
+    println("guid " + pdb_guid_text(& guid));
+    println("done");
+}

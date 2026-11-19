@@ -1,0 +1,136 @@
+// stdlib/sigmatch: compile a YARA-like rule file and scan buffers (hex patterns with wildcards, nibbles, jumps and alternatives; text with nocase/wide/fullword; stdlib regex; all/any/N of, at, in, counts, offsets, filesize); compile errors name the line.
+// Expected output:
+// compiled: ok=true rules=6 
+// rule 0: MZ_header tags pe,exe meta author=fides score=7
+// pe header: MZ_header NotEmpty
+// mz not at 0: NotEmpty
+// jump too long: NotEmpty
+// packer alt 2: Packer NotEmpty
+// packer alt 1, empty jump: Packer NotEmpty
+// nibble mismatch: NotEmpty
+// text: Words NotEmpty
+// one text only: NotEmpty
+// wide+ascii: Words NotEmpty
+// not fullword: NotEmpty
+// regex: Codes NotEmpty
+//   $re at 0+5, 15+6
+// regex early: NotEmpty InRange
+// in range: NotEmpty InRange
+// out of range: NotEmpty
+// empty buffer: (none)
+// all of them: Q / (none)
+// error: line 3: bad hex token
+// error: line 3: unknown string $nope
+// error: line 1: unexpected '}' in condition
+// error: line 43: expected '}' after the condition
+use sigmatch;
+use encoding;
+use vec;
+use string;
+
+fn names(h: Vec<SigHit>) -> str {
+    val n: Vec<str> = sig_hit_names(& h);
+    if n.len() == 0 { return "(none)"; }
+    return str_join(n, " ");
+}
+
+fn main() -> i64 {
+    val rules: str = "
+// demo rules
+rule MZ_header : pe exe {
+    meta:
+        author = \"fides\"
+        score = 7
+    strings:
+        $mz = { 4D 5A ?? 00 [2-4] 50 45 }
+    condition:
+        $mz at 0
+}
+
+rule Packer {
+    strings:
+        $a = { 6A ( 40 | 41 42 ) 6? }
+        $b = { E8 [-] C3 }
+    condition:
+        $a and $b
+}
+
+rule Words {
+    strings:
+        $t1 = \"this program\" nocase
+        $t2 = \"cannot run\"
+        $w = \"kernel\" wide ascii fullword
+    condition:
+        2 of ($t*) or #w >= 2
+}
+
+rule Codes {
+    strings:
+        $re = /[A-Z]{3}-[0-9]+/
+    condition:
+        #re >= 2 and @re[2] > 10 and filesize < 1KB
+}
+
+rule NotEmpty { condition: filesize > 0 and not any of them }
+
+rule InRange {
+    strings:
+        $x = \"XY\"
+    condition:
+        $x in (4..6) and none of ($x) == false
+}
+";
+    // the full text has trailing junk after InRange's condition (an error,
+    // checked last); without it the file compiles
+    val good: str = str_replace(rules, " and none of ($x) == false", "");
+    val rs: SigRules = sig_compile(good);
+    println("compiled: ok=" + bool_to_str(rs.ok) + " rules=" + int_to_str(rs.rules.len()) + " " + rs.error);
+    val r0: SigRule = rs.rules.get(0);
+    println("rule 0: " + r0.name + " tags " + str_join(r0.tags, ",") + " meta " + r0.meta_keys.get(0) + "=" + r0.meta_vals.get(0) + " " + r0.meta_keys.get(1) + "=" + r0.meta_vals.get(1));
+
+    val pe: Vec<i64> = hex_decode_bytes("4d5a9000030000005045000000");
+    println("pe header: " + names(sig_scan(& rs, pe)));
+    val pe_late: Vec<i64> = hex_decode_bytes("004d5a90000300005045");
+    println("mz not at 0: " + names(sig_scan(& rs, pe_late)));
+    val jump_too_far: Vec<i64> = hex_decode_bytes("4d5a900000000000005045");
+    println("jump too long: " + names(sig_scan(& rs, jump_too_far)));
+
+    val pk1: Vec<i64> = hex_decode_bytes("906a41426fe8000102c3");
+    println("packer alt 2: " + names(sig_scan(& rs, pk1)));
+    val pk2: Vec<i64> = hex_decode_bytes("6a4060e8c3");
+    println("packer alt 1, empty jump: " + names(sig_scan(& rs, pk2)));
+    val pk3: Vec<i64> = hex_decode_bytes("6a4070e8c3");
+    println("nibble mismatch: " + names(sig_scan(& rs, pk3)));
+
+    println("text: " + names(sig_scan_str(& rs, "THIS PROGRAM cannot run in DOS mode")));
+    println("one text only: " + names(sig_scan_str(& rs, "this program can run")));
+    var wide: Vec<i64> = str_bytes("kernel ");
+    val wk: Vec<i64> = hex_decode_bytes("6b00650072006e0065006c00");
+    var i: i64 = 0;
+    while i < wk.len() { wide.push(wk.get(i)); i = i + 1; }
+    println("wide+ascii: " + names(sig_scan(& rs, wide)));
+    println("not fullword: " + names(sig_scan_str(& rs, "kernel32 kernel32")));
+
+    val codes: Vec<SigHit> = sig_scan_str(& rs, "ABC-1 and then XYZ-42!");
+    println("regex: " + names(codes));
+    val m: SigStrMatch = codes.get(0).strings.get(0);
+    println("  " + m.id + " at " + int_to_str(m.offsets.get(0)) + "+" + int_to_str(m.lengths.get(0)) + ", " + int_to_str(m.offsets.get(1)) + "+" + int_to_str(m.lengths.get(1)));
+    println("regex early: " + names(sig_scan_str(& rs, "ABC-1XYZ-2")));
+    println("in range: " + names(sig_scan_str(& rs, "....XY")));
+    println("out of range: " + names(sig_scan_str(& rs, "XY.....XY")));
+    val empty: Vec<i64> = Vec::new();
+    println("empty buffer: " + names(sig_scan(& rs, empty)));
+
+    val one: SigRules = sig_compile("rule Q { strings: $a = \"ab\" $b = \"cd\" $c = \"ef\" condition: all of them }");
+    println("all of them: " + names(sig_scan_str(& one, "ab cd ef")) + " / " + names(sig_scan_str(& one, "ab cd")));
+
+    val bad1: SigRules = sig_compile("rule A {\n strings:\n $a = { 4D 5Z }\n condition: $a\n}");
+    println("error: " + bad1.error);
+    val bad2: SigRules = sig_compile("rule B {\n condition:\n $nope\n}");
+    println("error: " + bad2.error);
+    val bad3: SigRules = sig_compile("rule C { strings: $a = \"x\" condition: $a and }");
+    println("error: " + bad3.error);
+    val bad4: SigRules = sig_compile(rules);
+    println("error: " + bad4.error);
+    return 0;
+}

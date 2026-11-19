@@ -1,0 +1,142 @@
+// test_call_lowering_parity.fd — llvm-roadmap MI7 (one call lowering) and
+// MI17 (retire pe_ir's own lowering): the corners of call lowering that two
+// lowerings could disagree on. Windows has two today: pe_ir's own
+// (compiler/pe_ir.fd, Inst::Call / Inst::CallPtr: arguments loaded from rbp
+// slots into rcx/rdx/r8/r9 and the outgoing area) and the machine layer's
+// (compiler/nat_ir.fd ng_gen_call_std / ng_load_args_i, `fid emit --nat`
+// and every Linux/macOS target). Before pe_ir's is deleted, both must print
+// exactly what `fid run` prints for this file
+// (tests/nattools/mi7_call_parity.sh runs the three).
+//
+// Covered: ten integer arguments (stack arguments on every target), a call
+// whose arguments are its own parameters permuted (a move cycle when the
+// values sit in registers), f64 and i64 interleaved past the register
+// arguments, narrow types (bool, i32, u8) in stack positions, strings and
+// a struct among many arguments, nested calls as arguments (a call between
+// loading two arguments), a closure called with six arguments plus its
+// environment, a function value with stack arguments, non-tail recursion
+// with stack arguments, and a spawn of a function with seven arguments
+// (the varargs area of the task).
+//
+// Expected output:
+// 55
+// 3628800
+// 654321
+// 123456
+// 1001
+// 7 0 1 -3 250
+// a-b-c-d-e-f
+// 21 42 84
+// 325
+// 910 108
+// 175 353
+// 610
+// 143
+// 27
+// task 7008
+// 66
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn sum10(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64) -> i64 {
+    return a + b + c + d + e + f + g + h + i + j;
+}
+
+fn prod10(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, i: i64, j: i64) -> i64 {
+    return a * b * c * d * e * f * g * h * i * j;
+}
+
+fn digits6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f;
+}
+
+// calls digits6 with its own parameters reversed, not in tail position
+fn reversed6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    val r: i64 = digits6(f, e, d, c, b, a);
+    return r;
+}
+
+// f64 and i64 interleaved: on Win64 the position decides the register
+// (xmm1 for y, rdx for b, ...), past the fourth both go to the stack
+fn mixed(a: i64, x: f64, b: i64, y: f64, c: i64, z: f64, d: i64) -> i64 {
+    val t: f64 = x * 100.0 + y * 10.0 + z;
+    return a + b + c + d + (t as i64);
+}
+
+fn narrow(a: i64, b: i64, c: i64, d: i64, flag: bool, n: i32, m: i32, k: u8) -> str {
+    var s: str = int_to_str(a + b + c + d) + " ";
+    if flag {
+        s = s + "1 ";
+    } else {
+        s = s + "0 ";
+    }
+    s = s + int_to_str(n as i64) + " " + int_to_str(m as i64) + " " + int_to_str(k as i64);
+    return s;
+}
+
+fn join6(a: str, b: str, c: str, d: str, e: str, f: str) -> str {
+    return a + "-" + b + "-" + c + "-" + d + "-" + e + "-" + f;
+}
+
+fn with_pair(x: i64, y: i64, z: i64, w: i64, p: Pair, k: i64) -> str {
+    return int_to_str(p.a * k) + " " + int_to_str(p.b * k) + " " + int_to_str((p.a + p.b) * k + x + y + z + w);
+}
+
+fn add5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    return a + b + c + d + e;
+}
+
+fn make_weigh(base: i64, scale: i64) -> fn(i64, i64, i64, i64, i64, i64) -> i64 {
+    return fn(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) { base + scale * (a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f) };
+}
+
+fn apply6(g: fn(i64, i64, i64, i64, i64, i64) -> i64, v: i64) -> i64 {
+    return g(v, v + 1, v + 2, v + 3, v + 4, v + 5);
+}
+
+// non-tail recursion with stack arguments: fib(n) + the other arguments
+// carried down unchanged
+fn fibx(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    val l: i64 = fibx(n - 1, a, b, c, d, e, f);
+    val r: i64 = fibx(n - 2, a, b, c, d, e, f);
+    return l + r + (a - b) * (c - d) * (e - f);
+}
+
+fn weigh7(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
+    return a + b * 10 + c * 100 + d * 1000 + e - f + g;
+}
+
+fn task7(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
+    return a * 1000 + b * 1000 + c + d + e + f + g;
+}
+
+fn main() -> i64 {
+    println(sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+    println(prod10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+    println(reversed6(1, 2, 3, 4, 5, 6));
+    println(digits6(1, 2, 3, 4, 5, 6));
+    println(mixed(10, 9.0, 20, 4.0, 30, 0.5, 1));
+    println(narrow(1, 2, 3, 1, false, 1, -3, 250 as u8));
+    println(join6("a", "b", "c", "d", "e", "f"));
+    println(with_pair(4, 5, 6, 6, Pair { a: 7, b: 14 }, 3));
+    // a call between loading two arguments of the outer call
+    println(add5(add5(1, 2, 3, 4, 5), add5(6, 7, 8, 9, 10), add5(11, 12, 13, 14, 15), add5(16, 17, 18, 19, 20), add5(21, 22, 23, 24, 25)));
+    val w = make_weigh(0, 1);
+    val w2 = make_weigh(3, 5);
+    println(int_to_str(w(10, 20, 30, 40, 50, 60)) + " " + int_to_str(w2(1, 1, 1, 1, 1, 1)));
+    println(int_to_str(apply6(w, 5)) + " " + int_to_str(apply6(w2, 0)));
+    println(fibx(15, 1, 1, 1, 1, 1, 1));
+    println(fibx(10, 3, 2, 5, 4, 7, 6));
+    println(weigh7(1, 1, 0, 0, 3, 2, 15));
+    val t = spawn task7(3, 4, 1, 1, 1, 2, 3);
+    val tr = await t;
+    println("task " + int_to_str(tr));
+    println(sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) + digits6(0, 0, 0, 0, 1, 1));
+    return 0;
+}

@@ -41,6 +41,23 @@ pub fn md_escape(s: str) -> str {
     return out;
 }
 
+/// URL filter for rendered links and images: javascript:, vbscript: and
+/// data: URLs are active content in an HTML page — they become "#" (the
+/// link renders inert rather than executing script on click).
+pub fn md_safe_url(u: str) -> str {
+    var t: str = str_to_lower(str_trim(u));
+    if str_starts_with(t, "javascript:") {
+        return "#";
+    }
+    if str_starts_with(t, "vbscript:") {
+        return "#";
+    }
+    if str_starts_with(t, "data:") {
+        return "#";
+    }
+    return u;
+}
+
 // ─── Inline rendering ───────────────────────────────────────────────────
 
 // Find matching '*' or '**' run starting at `from`; returns index after
@@ -150,7 +167,7 @@ pub fn md_inline(s: str) -> str {
         } else if c == 60 && md_autolink_end(s, i) > 0 {
             var gt: i64 = md_autolink_end(s, i);
             var au: str = str_slice(s, i + 1, gt);
-            out = out + "<a href=\"" + md_escape(au) + "\">" + md_escape(au) + "</a>";
+            out = out + "<a href=\"" + md_escape(md_safe_url(au)) + "\">" + md_escape(au) + "</a>";
             i = gt + 1;
         } else if c == 96 {
             // `code`
@@ -232,7 +249,7 @@ pub fn md_inline(s: str) -> str {
             var img: str = md_link_body(s, i + 2, rb + i);
             if str_len(img) > 0 {
                 var parts: Vec = str_split_char(img, 7);
-                out = out + "<img src=\"" + md_escape(parts.get(1)) + "\" alt=\"" + md_escape(parts.get(0)) + "\" />";
+                out = out + "<img src=\"" + md_escape(md_safe_url(parts.get(1))) + "\" alt=\"" + md_escape(parts.get(0)) + "\" />";
                 i = rb + i + str_parse_int(parts.get(2));
             } else {
                 out = out + md_escape(str_slice(s, i, i + 1));
@@ -244,7 +261,7 @@ pub fn md_inline(s: str) -> str {
             var lnk: str = md_link_body(s, i + 1, rb2 + i);
             if str_len(lnk) > 0 {
                 var parts2: Vec = str_split_char(lnk, 7);
-                out = out + "<a href=\"" + md_escape(parts2.get(1)) + "\">" + md_inline(parts2.get(0)) + "</a>";
+                out = out + "<a href=\"" + md_escape(md_safe_url(parts2.get(1))) + "\">" + md_inline(parts2.get(0)) + "</a>";
                 i = rb2 + i + str_parse_int(parts2.get(2));
             } else {
                 out = out + md_escape(str_slice(s, i, i + 1));
@@ -397,6 +414,14 @@ fn md_continues(l: str) -> bool {
 }
 
 /// Convert Markdown text to an HTML fragment.
+///
+/// Example:
+///   assert_eq(md_escape("a<b & c"), "a&lt;b &amp; c");
+///   val h = md_to_html("# Title\n\nSome **bold** text.");
+///   assert(str_contains(h, "<h1>Title</h1>"));
+///   assert(str_contains(h, "<strong>bold</strong>"));
+///   assert(str_contains(md_inline("`x`"), "<code>x</code>"));
+///   assert(!str_contains(md_to_html("<script>"), "<script>"));
 pub fn md_to_html(text: str) -> str {
     var lines: Vec<str> = str_lines(text);
     var out: str = "";

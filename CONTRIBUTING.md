@@ -52,6 +52,20 @@ every back end it touches (`run`, `ccompile`, `emit`). Add a test for every
 fix and feature: `tests/bootstrap/test_<feature>.fd`, or `_fail.fd` for a
 program the compiler must reject (its first line is `// expect-error: <message>`).
 
+A miscompile (the compiler accepts a program and its output is wrong) is
+fixed only with a test that fails without the fix. Add or update its row in
+`docs/verification/miscompile-log.md`, name the test there, and show both
+halves: the test passes with the new compiler and fails with one built
+without the fix:
+
+```bash
+bash scripts/miscompile-gate.sh --fid release/fid-dev --run --only M<n>
+bash scripts/miscompile-gate.sh --only M<n> --before <fid built without the fix>
+```
+
+CI runs the gate on every push (every fixed entry names an existing test)
+and the before/after run for the entries a change fixes.
+
 ## Rules for the working tree
 
 These protect work in progress, yours and other people's:

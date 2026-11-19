@@ -1,0 +1,80 @@
+# Editor support beyond VS Code (competitive-roadmap TL10): the configs in
+# editors/ exercised by the editors themselves against this commit's
+# `fid lsp` (scripts/tl/editor-check.sh): Neovim headless (filetype, the
+# client attaches, diagnostics, inlay hints), Emacs in batch (fides-mode,
+# eglot, diagnostics through flymake), `hx --health fides`, the static
+# checks of every config (Sublime's selector has a syntax giving it to
+# *.fd, Emacs's auto-mode-alist pattern) and scripts/tl/lsp_probe.py.
+
+name: Editors
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'editors/**'
+      - 'compiler/lsp.fd'
+      - 'scripts/tl/**'
+      - 'tests/tooling/zed-check.sh'
+      - 'tests/tooling/ts_grammar_check.js'
+      - '.github/workflows/editors.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'editors/**'
+      - 'compiler/lsp.fd'
+      - 'scripts/tl/**'
+      - 'tests/tooling/zed-check.sh'
+      - 'tests/tooling/ts_grammar_check.js'
+      - '.github/workflows/editors.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: editors-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  editors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static checks of every config (no editor, no fid)
+        run: STATIC=1 bash scripts/tl/editor-check.sh
+      - name: Tree-sitter CLI
+        run: npm install -g tree-sitter-cli
+      - name: Tree-sitter grammar and Zed extension (generate, corpus, parse, queries)
+        run: REQUIRE=1 bash tests/tooling/zed-check.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mold
+      - name: The compiler's sources parse with stage 0
+        run: bash scripts/stage0-names-check.sh
+      - name: Build the Rust bootstrap compiler
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: ./scripts/build-selfhost.sh
+      - name: Neovim (stable)
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+      - name: Emacs, Helix
+        run: |
+          sudo apt-get install -y -qq emacs-nox
+          sudo snap install helix --classic
+      - name: The editors against fid lsp
+        env:
+          FID: release/fid-dev
+          REQUIRE: "1"
+        run: bash scripts/tl/editor-check.sh

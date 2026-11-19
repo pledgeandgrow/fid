@@ -1,0 +1,370 @@
+// Fides share sheet: one share request for Android and iOS
+//
+// What is real (pure Fides, tested in the interpreter):
+//   - share items: text, URLs, files with a MIME type (from the file
+//     extension through stdlib mime when not given)
+//   - the Android intent: ACTION_SEND for one item, ACTION_SEND_MULTIPLE
+//     for several; the type (one MIME, a shared "image/*", or "*/*");
+//     EXTRA_TEXT / EXTRA_SUBJECT / EXTRA_TITLE / EXTRA_STREAM (an
+//     ArrayList of URIs when several), FLAG_GRANT_READ_URI_PERMISSION and
+//     the ClipData that carries the grant, wrapped in ACTION_CHOOSER
+//   - FileProvider: content:// URIs for app files from the <paths>
+//     configuration (files-path, cache-path, external-files-path ...),
+//     with the file_paths XML that declares them; paths outside every
+//     root are refused
+//   - the same intent as an `adb shell am start` command line (for tests
+//     and debugging)
+//   - the iOS side: the activity items (NSString, NSURL from a string or
+//     a file path) and excluded activity types for
+//     UIActivityViewController; the iPad popover requirement
+//   - reading a share another app sent us (an incoming intent described
+//     as data) back into items
+//
+// The platform seam: starting the activity (Context.startActivity through
+// jni.fd) and presenting the controller (objc.fd) are the platform's; the
+// calls are given as data by `share_android_calls` / `share_ios_calls`.
+
+module share;
+use vec;
+use string;
+use mime;
+use encoding;
+
+pub const SHARE_TEXT: i64 = 0;
+pub const SHARE_URL: i64 = 1;
+pub const SHARE_FILE: i64 = 2;
+
+pub const ANDROID_ACTION_SEND: str = "android.intent.action.SEND";
+pub const ANDROID_ACTION_SEND_MULTIPLE: str = "android.intent.action.SEND_MULTIPLE";
+pub const ANDROID_ACTION_CHOOSER: str = "android.intent.action.CHOOSER";
+pub const ANDROID_EXTRA_TEXT: str = "android.intent.extra.TEXT";
+pub const ANDROID_EXTRA_SUBJECT: str = "android.intent.extra.SUBJECT";
+pub const ANDROID_EXTRA_TITLE: str = "android.intent.extra.TITLE";
+pub const ANDROID_EXTRA_STREAM: str = "android.intent.extra.STREAM";
+pub const ANDROID_EXTRA_INTENT: str = "android.intent.extra.INTENT";
+pub const ANDROID_FLAG_GRANT_READ_URI_PERMISSION: i64 = 1;
+/// Text above this many bytes risks the 1 MB binder transaction limit.
+pub const SHARE_TEXT_WARN_BYTES: i64 = 100000;
+
+pub struct ShareItem {
+    pub kind: i64,
+    pub value: str,    // the text, the URL, or the file path
+    pub mime: str,
+}
+
+pub fn share_text(t: str) -> ShareItem { return ShareItem { kind: SHARE_TEXT, value: t, mime: "text/plain" }; }
+pub fn share_url(u: str) -> ShareItem { return ShareItem { kind: SHARE_URL, value: u, mime: "text/plain" }; }
+
+/// A file; `mime` "" takes the type from the extension.
+pub fn share_file(path: str, mime_type: str) -> ShareItem {
+    val m: str = if str_len(mime_type) > 0 { mime_type } else { mime_from_path(path) };
+    return ShareItem { kind: SHARE_FILE, value: path, mime: m };
+}
+
+pub struct ShareRequest {
+    pub items: Vec<ShareItem>,
+    pub subject: str,
+    pub title: str,              // chooser title (Android) / unused on iOS
+    pub excluded: Vec<str>,      // iOS UIActivityType strings
+}
+
+pub fn share_request_new() -> ShareRequest {
+    return ShareRequest { items: Vec::new(), subject: "", title: "", excluded: Vec::new() };
+}
+
+pub fn share_add(r: &mut ShareRequest, item: ShareItem) { r.items.push(item); }
+
+/// The MIME type that covers all items: the common type, "<top>/*" when
+/// the top-level types agree, else "*/*".
+pub fn share_common_mime(items: &Vec<ShareItem>) -> str {
+    if items.len() == 0 { return "*/*"; }
+    var t: str = items.get(0).mime;
+    var i: i64 = 1;
+    while i < items.len() {
+        val m: str = items.get(i).mime;
+        if m != t {
+            val a: str = str_slice(t, 0, str_find(t, "/"));
+            val b: str = str_slice(m, 0, str_find(m, "/"));
+            if a == b && str_len(a) > 0 { t = a + "/*"; } else { return "*/*"; }
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+// ─── FileProvider ──────────────────────────────────────────────────────
+
+/// One <paths> entry: kind ("files-path", "cache-path",
+/// "external-files-path", ...), the URI segment `name`, the directory
+/// `root` it stands for on this device, and an optional sub `path`.
+pub struct ShareRoot {
+    pub kind: str,
+    pub name: str,
+    pub root: str,
+    pub sub: str,
+}
+
+pub struct FileProvider {
+    pub authority: str,          // e.g. "com.example.app.fileprovider"
+    pub roots: Vec<ShareRoot>,
+}
+
+pub fn share_file_provider(authority: str) -> FileProvider { return FileProvider { authority: authority, roots: Vec::new() }; }
+
+pub fn share_provider_root(fp: &mut FileProvider, kind: str, name: str, root: str, sub: str) {
+    fp.roots.push(ShareRoot { kind: kind, name: name, root: root, sub: sub });
+}
+
+fn share_join(a: str, b: str) -> str {
+    if str_len(b) == 0 { return a; }
+    if str_ends_with(a, "/") { return a + b; }
+    return a + "/" + b;
+}
+
+/// The content:// URI of a file ("" when no root contains it or the path
+/// climbs out with "..").
+pub fn share_content_uri(fp: &FileProvider, path: str) -> str {
+    if str_contains(path, "/../") || str_ends_with(path, "/..") { return ""; }
+    var best: i64 = -1;
+    var best_len: i64 = -1;
+    var i: i64 = 0;
+    while i < fp.roots.len() {
+        val r: ShareRoot = fp.roots.get(i);
+        var dir: str = share_join(r.root, r.sub);
+        if !str_ends_with(dir, "/") { dir = dir + "/"; }
+        if str_starts_with(path, dir) && str_len(dir) > best_len {
+            best = i;
+            best_len = str_len(dir);
+        }
+        i = i + 1;
+    }
+    if best < 0 { return ""; }
+    val rest: str = str_slice(path, best_len, str_len(path));
+    val parts: Vec<str> = str_split(rest, "/");
+    var enc: str = "";
+    i = 0;
+    while i < parts.len() {
+        if i > 0 { enc = enc + "/"; }
+        enc = enc + url_encode_component(parts.get(i));
+        i = i + 1;
+    }
+    return "content://" + fp.authority + "/" + url_encode_component(fp.roots.get(best).name) + "/" + enc;
+}
+
+/// res/xml/file_paths.xml for the provider.
+pub fn share_file_paths_xml(fp: &FileProvider) -> str {
+    var s: str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<paths>\n";
+    var i: i64 = 0;
+    while i < fp.roots.len() {
+        val r: ShareRoot = fp.roots.get(i);
+        s = s + "    <" + r.kind + " name=\"" + r.name + "\" path=\"" + (if str_len(r.sub) > 0 { r.sub } else { "." }) + "\" />\n";
+        i = i + 1;
+    }
+    return s + "</paths>\n";
+}
+
+// ─── The Android intent ────────────────────────────────────────────────
+
+/// An extra: kind "string", "uri", "uri-list", "intent".
+pub struct ShareExtra {
+    pub key: str,
+    pub kind: str,
+    pub values: Vec<str>,
+}
+
+pub struct ShareIntent {
+    pub ok: bool,
+    pub error: str,
+    pub action: str,
+    pub mime: str,
+    pub extras: Vec<ShareExtra>,
+    pub flags: i64,
+    pub clip_uris: Vec<str>,     // ClipData items that carry the URI grant
+    pub warnings: Vec<str>,
+}
+
+fn share_extra(key: str, kind: str, v: str) -> ShareExtra {
+    var vals: Vec<str> = Vec::new();
+    vals.push(v);
+    return ShareExtra { key: key, kind: kind, values: vals };
+}
+
+/// The ACTION_SEND / ACTION_SEND_MULTIPLE intent of a request. Files are
+/// turned into FileProvider URIs.
+pub fn share_android_intent(r: &ShareRequest, fp: &FileProvider) -> ShareIntent {
+    var it: ShareIntent = ShareIntent {
+        ok: true, error: "", action: "", mime: "", extras: Vec::new(), flags: 0, clip_uris: Vec::new(), warnings: Vec::new(),
+    };
+    if r.items.len() == 0 { it.ok = false; it.error = "nothing to share"; return it; }
+    var texts: Vec<str> = Vec::new();
+    var uris: Vec<str> = Vec::new();
+    var files: Vec<ShareItem> = Vec::new();
+    var i: i64 = 0;
+    while i < r.items.len() {
+        val item: ShareItem = r.items.get(i);
+        if item.kind == SHARE_FILE {
+            val u: str = share_content_uri(fp, item.value);
+            if str_len(u) == 0 { it.ok = false; it.error = "not under a FileProvider root: " + item.value; return it; }
+            uris.push(u);
+            files.push(item);
+        } else {
+            texts.push(item.value);
+        }
+        i = i + 1;
+    }
+    var text: str = "";
+    i = 0;
+    while i < texts.len() {
+        if i > 0 { text = text + "\n"; }
+        text = text + texts.get(i);
+        i = i + 1;
+    }
+    if str_len(text) > SHARE_TEXT_WARN_BYTES { it.warnings.push("EXTRA_TEXT of " + int_to_str(str_len(text)) + " bytes may exceed the binder limit"); }
+    it.action = if uris.len() > 1 { ANDROID_ACTION_SEND_MULTIPLE } else { ANDROID_ACTION_SEND };
+    it.mime = if files.len() > 0 { share_common_mime(&files) } else { "text/plain" };
+    if str_len(text) > 0 { it.extras.push(share_extra(ANDROID_EXTRA_TEXT, "string", text)); }
+    if str_len(r.subject) > 0 { it.extras.push(share_extra(ANDROID_EXTRA_SUBJECT, "string", r.subject)); }
+    if uris.len() == 1 { it.extras.push(share_extra(ANDROID_EXTRA_STREAM, "uri", uris.get(0))); }
+    if uris.len() > 1 { it.extras.push(ShareExtra { key: ANDROID_EXTRA_STREAM, kind: "uri-list", values: uris }); }
+    if uris.len() > 0 {
+        it.flags = ANDROID_FLAG_GRANT_READ_URI_PERMISSION;
+        it.clip_uris = uris;
+    }
+    return it;
+}
+
+/// Intent.createChooser(intent, title): ACTION_CHOOSER with the target in
+/// EXTRA_INTENT (described here by its action) and the title.
+pub fn share_android_chooser(target: &ShareIntent, title: str) -> ShareIntent {
+    var c: ShareIntent = ShareIntent {
+        ok: target.ok, error: target.error, action: ANDROID_ACTION_CHOOSER, mime: "", extras: Vec::new(),
+        flags: target.flags, clip_uris: target.clip_uris, warnings: Vec::new(),
+    };
+    c.extras.push(share_extra(ANDROID_EXTRA_INTENT, "intent", target.action));
+    if str_len(title) > 0 { c.extras.push(share_extra(ANDROID_EXTRA_TITLE, "string", title)); }
+    return c;
+}
+
+fn share_sh_quote(s: str) -> str { return "'" + str_replace(s, "'", "'\\''") + "'"; }
+
+/// The intent as `adb shell am start` arguments (single ACTION_SEND
+/// extras; a URI list as --eua).
+pub fn share_android_am_command(it: &ShareIntent) -> str {
+    var s: str = "am start -a " + it.action;
+    if str_len(it.mime) > 0 { s = s + " -t " + share_sh_quote(it.mime); }
+    var i: i64 = 0;
+    while i < it.extras.len() {
+        val e: ShareExtra = it.extras.get(i);
+        if e.kind == "string" { s = s + " --es " + e.key + " " + share_sh_quote(e.values.get(0)); }
+        else if e.kind == "uri" { s = s + " --eu " + e.key + " " + share_sh_quote(e.values.get(0)); }
+        else if e.kind == "uri-list" {
+            var v: str = "";
+            var k: i64 = 0;
+            while k < e.values.len() { if k > 0 { v = v + ","; } v = v + e.values.get(k); k = k + 1; }
+            s = s + " --eua " + e.key + " " + share_sh_quote(v);
+        }
+        i = i + 1;
+    }
+    if it.flags != 0 { s = s + " -f " + int_to_str(it.flags); }
+    return s;
+}
+
+/// Items of an intent another app sent us (ACTION_SEND or
+/// SEND_MULTIPLE), from its type and extras.
+pub fn share_android_received(action: str, mime_type: str, extras: Vec<ShareExtra>) -> Vec<ShareItem> {
+    var out: Vec<ShareItem> = Vec::new();
+    if action != ANDROID_ACTION_SEND && action != ANDROID_ACTION_SEND_MULTIPLE { return out; }
+    var i: i64 = 0;
+    while i < extras.len() {
+        val e: ShareExtra = extras.get(i);
+        if e.key == ANDROID_EXTRA_TEXT && e.values.len() > 0 {
+            val t: str = e.values.get(0);
+            if (str_starts_with(t, "http://") || str_starts_with(t, "https://")) && !str_contains(t, " ") && !str_contains(t, "\n") {
+                out.push(share_url(t));
+            } else {
+                out.push(share_text(t));
+            }
+        }
+        if e.key == ANDROID_EXTRA_STREAM {
+            var k: i64 = 0;
+            while k < e.values.len() {
+                out.push(ShareItem { kind: SHARE_FILE, value: e.values.get(k), mime: mime_type });
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── iOS ───────────────────────────────────────────────────────────────
+
+pub const IOS_ACTIVITY_POST_TO_FACEBOOK: str = "com.apple.UIKit.activity.PostToFacebook";
+pub const IOS_ACTIVITY_MESSAGE: str = "com.apple.UIKit.activity.Message";
+pub const IOS_ACTIVITY_MAIL: str = "com.apple.UIKit.activity.Mail";
+pub const IOS_ACTIVITY_PRINT: str = "com.apple.UIKit.activity.Print";
+pub const IOS_ACTIVITY_COPY: str = "com.apple.UIKit.activity.CopyToPasteboard";
+pub const IOS_ACTIVITY_AIRDROP: str = "com.apple.UIKit.activity.AirDrop";
+pub const IOS_ACTIVITY_SAVE_TO_CAMERA_ROLL: str = "com.apple.UIKit.activity.SaveToCameraRoll";
+
+/// One activity item: the Objective-C object to make ("NSString" with
+/// the text, "NSURL" with URLWithString:, "NSURL file" with
+/// fileURLWithPath:).
+pub struct ShareIosItem {
+    pub cls: str,
+    pub ctor: str,
+    pub value: str,
+}
+
+pub fn share_ios_items(r: &ShareRequest) -> Vec<ShareIosItem> {
+    var out: Vec<ShareIosItem> = Vec::new();
+    var i: i64 = 0;
+    while i < r.items.len() {
+        val it: ShareItem = r.items.get(i);
+        if it.kind == SHARE_TEXT { out.push(ShareIosItem { cls: "NSString", ctor: "stringWithUTF8String:", value: it.value }); }
+        else if it.kind == SHARE_URL { out.push(ShareIosItem { cls: "NSURL", ctor: "URLWithString:", value: it.value }); }
+        else { out.push(ShareIosItem { cls: "NSURL", ctor: "fileURLWithPath:", value: it.value }); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Problems presenting the sheet: no items, or an iPad without a source
+/// view for the popover (UIKit raises an exception then).
+pub fn share_ios_check(r: &ShareRequest, is_ipad: bool, has_source_view: bool) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    if r.items.len() == 0 { e.push("no activity items"); }
+    if is_ipad && !has_source_view { e.push("iPad: popoverPresentationController needs a sourceView or barButtonItem"); }
+    return e;
+}
+
+// ─── Platform calls (as data) ──────────────────────────────────────────
+
+pub struct ShareCall {
+    pub cls: str,
+    pub method: str,
+    pub sig: str,
+}
+
+pub fn share_android_calls() -> Vec<ShareCall> {
+    var v: Vec<ShareCall> = Vec::new();
+    v.push(ShareCall { cls: "android/content/Intent", method: "<init>", sig: "(Ljava/lang/String;)V" });
+    v.push(ShareCall { cls: "android/content/Intent", method: "setType", sig: "(Ljava/lang/String;)Landroid/content/Intent;" });
+    v.push(ShareCall { cls: "android/content/Intent", method: "putExtra", sig: "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;" });
+    v.push(ShareCall { cls: "android/content/Intent", method: "putParcelableArrayListExtra", sig: "(Ljava/lang/String;Ljava/util/ArrayList;)Landroid/content/Intent;" });
+    v.push(ShareCall { cls: "android/content/Intent", method: "addFlags", sig: "(I)Landroid/content/Intent;" });
+    v.push(ShareCall { cls: "androidx/core/content/FileProvider", method: "getUriForFile", sig: "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;" });
+    v.push(ShareCall { cls: "android/content/Intent", method: "createChooser", sig: "(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;" });
+    v.push(ShareCall { cls: "android/content/Context", method: "startActivity", sig: "(Landroid/content/Intent;)V" });
+    return v;
+}
+
+pub fn share_ios_calls() -> Vec<ShareCall> {
+    var v: Vec<ShareCall> = Vec::new();
+    v.push(ShareCall { cls: "UIActivityViewController", method: "initWithActivityItems:applicationActivities:", sig: "@@:@@" });
+    v.push(ShareCall { cls: "UIActivityViewController", method: "setExcludedActivityTypes:", sig: "v@:@" });
+    v.push(ShareCall { cls: "UIViewController", method: "popoverPresentationController", sig: "@@:" });
+    v.push(ShareCall { cls: "UIPopoverPresentationController", method: "setSourceView:", sig: "v@:@" });
+    v.push(ShareCall { cls: "UIViewController", method: "presentViewController:animated:completion:", sig: "v@:@B@?" });
+    return v;
+}

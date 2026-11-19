@@ -1,0 +1,586 @@
+// Fides x86-64 CPU structures, pure Fides with a port I/O seam.
+//
+// From the Intel SDM (vol. 2A CPUID, vol. 3A chapters 3, 5, 6, 7) and the
+// AMD APM vol. 2:
+//   - CPUID decoding: vendor string (leaf 0), family/model/stepping with
+//     the extended-family/model rules and the feature flags of leaf 1
+//     (EDX, ECX), leaf 7 (EBX, ECX) and 0x80000001 (EDX, ECX), the brand
+//     string (0x80000002..4), the APIC ID and logical CPU count,
+//   - MSR numbers and the layouts of IA32_EFER, IA32_STAR, IA32_APIC_BASE,
+//     IA32_PAT,
+//   - GDT segment descriptors (8 bytes), the 16-byte 64-bit TSS
+//     descriptor, IDT gates (16 bytes), the 104-byte TSS, selectors, and
+//     the GDTR/IDTR pseudo-descriptors, as words or little-endian bytes,
+//   - legacy device sequences over port I/O: 8259 PIC remap and masks,
+//     8254 PIT rate generator, CMOS index/data access.
+//
+// What is real and what is the seam:
+//   - CPUID and RDMSR/WRMSR need the instructions: CPUID decoding takes the
+//     four register values as data (CpuidRegs), however the caller got
+//     them; the MSR layouts are pure.
+//   - Port I/O goes through PortIo: mode 1 calls the compiler's port
+//     builtins p_inb/p_outb/p_inw/p_outw/p_inl/p_outl inside @unsafe
+//     functions (real in bare-metal builds; the hosted C runtime makes them
+//     no-ops), mode 0 is a fake port space (HashMap + log) for tests.
+
+module x86_cpu;
+ use vec; use string; use regmap;
+
+// ─── CPUID ──────────────────────────────────────────────────────────────
+
+/// The registers one CPUID leaf returned.
+pub struct CpuidRegs {
+    pub eax: i64,
+    pub ebx: i64,
+    pub ecx: i64,
+    pub edx: i64,
+}
+
+pub fn cpuid_regs(eax: i64, ebx: i64, ecx: i64, edx: i64) -> CpuidRegs {
+    return CpuidRegs { eax: eax, ebx: ebx, ecx: ecx, edx: edx };
+}
+
+fn x86_reg_chars(r: i64) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < 4 {
+        val c: i64 = (r >> (8 * i)) & 0xFF;
+        if c != 0 { out = out + byte_to_str(c); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Leaf 0: the vendor string, EBX EDX ECX ("GenuineIntel", "AuthenticAMD").
+pub fn cpuid_vendor(l0: CpuidRegs) -> str {
+    return x86_reg_chars(l0.ebx) + x86_reg_chars(l0.edx) + x86_reg_chars(l0.ecx);
+}
+
+/// Leaf 1 EAX: display family (base + extended when base is 0xF).
+pub fn cpuid_family(eax: i64) -> i64 {
+    val base: i64 = (eax >> 8) & 0xF;
+    if base == 0xF { return base + ((eax >> 20) & 0xFF); }
+    return base;
+}
+
+/// Display model: extended model << 4 added for families 6 and 0xF.
+pub fn cpuid_model(eax: i64) -> i64 {
+    val base: i64 = (eax >> 4) & 0xF;
+    val fam: i64 = (eax >> 8) & 0xF;
+    if fam == 6 || fam == 0xF { return base + (((eax >> 16) & 0xF) << 4); }
+    return base;
+}
+
+pub fn cpuid_stepping(eax: i64) -> i64 {
+    return eax & 0xF;
+}
+
+/// Leaf 1 EBX: initial APIC ID (31:24) and logical processor count (23:16).
+pub fn cpuid_apic_id(ebx: i64) -> i64 {
+    return (ebx >> 24) & 0xFF;
+}
+
+pub fn cpuid_logical_count(ebx: i64) -> i64 {
+    return (ebx >> 16) & 0xFF;
+}
+
+/// CLFLUSH line size in bytes (EBX 15:8 * 8).
+pub fn cpuid_clflush_size(ebx: i64) -> i64 {
+    return ((ebx >> 8) & 0xFF) * 8;
+}
+
+fn x86_flags(v: i64, names: str) -> Vec<str> {
+    // names: comma-separated, one per bit from bit 0; "" for a reserved bit.
+    val ns: Vec<str> = str_split(names, ",");
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < ns.len() && i < 32 {
+        if str_len(ns.get(i)) > 0 && ((v >> i) & 1) != 0 { out.push(ns.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Leaf 1 EDX feature names.
+pub fn cpuid_features_edx(edx: i64) -> Vec<str> {
+    return x86_flags(edx, "fpu,vme,de,pse,tsc,msr,pae,mce,cx8,apic,,sep,mtrr,pge,mca,cmov,pat,pse36,psn,clflush,,ds,acpi,mmx,fxsr,sse,sse2,ss,htt,tm,ia64,pbe");
+}
+
+/// Leaf 1 ECX feature names.
+pub fn cpuid_features_ecx(ecx: i64) -> Vec<str> {
+    return x86_flags(ecx, "sse3,pclmulqdq,dtes64,monitor,ds_cpl,vmx,smx,est,tm2,ssse3,cnxt_id,sdbg,fma,cx16,xtpr,pdcm,,pcid,dca,sse4_1,sse4_2,x2apic,movbe,popcnt,tsc_deadline,aes,xsave,osxsave,avx,f16c,rdrand,hypervisor");
+}
+
+/// Leaf 7 subleaf 0 EBX feature names.
+pub fn cpuid_features_7ebx(ebx: i64) -> Vec<str> {
+    return x86_flags(ebx, "fsgsbase,tsc_adjust,sgx,bmi1,hle,avx2,fdp_excptn_only,smep,bmi2,erms,invpcid,rtm,pqm,fpu_csds,mpx,pqe,avx512f,avx512dq,rdseed,adx,smap,avx512ifma,pcommit,clflushopt,clwb,intel_pt,avx512pf,avx512er,avx512cd,sha,avx512bw,avx512vl");
+}
+
+/// Leaf 7 subleaf 0 ECX feature names (the commonly checked ones).
+pub fn cpuid_features_7ecx(ecx: i64) -> Vec<str> {
+    return x86_flags(ecx, "prefetchwt1,avx512_vbmi,umip,pku,ospke,waitpkg,avx512_vbmi2,cet_ss,gfni,vaes,vpclmulqdq,avx512_vnni,avx512_bitalg,tme_en,avx512_vpopcntdq,,la57,,,,,,rdpid,kl,bus_lock_detect,cldemote,,movdiri,movdir64b,enqcmd,sgx_lc,pks");
+}
+
+/// Leaf 0x80000001 EDX (AMD-defined, Intel implements syscall/nx/pdpe1gb/rdtscp/lm).
+pub fn cpuid_features_ext_edx(edx: i64) -> Vec<str> {
+    return x86_flags(edx, ",,,,,,,,,,,syscall,,,,,,,,mp,nx,,mmxext,,,fxsr_opt,pdpe1gb,rdtscp,,lm,3dnowext,3dnow");
+}
+
+/// Leaf 0x80000001 ECX.
+pub fn cpuid_features_ext_ecx(ecx: i64) -> Vec<str> {
+    return x86_flags(ecx, "lahf_lm,cmp_legacy,svm,extapic,cr8_legacy,abm,sse4a,misalignsse,3dnowprefetch,osvw,ibs,xop,skinit,wdt,,lwp,fma4,tce,,nodeid_msr,,tbm,topoext,perfctr_core,perfctr_nb");
+}
+
+/// True when `name` is among the flags of a decoded feature list.
+pub fn cpuid_has(flags: Vec<str>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < flags.len() {
+        if str_equal(flags.get(i), name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The brand string from leaves 0x80000002, 0x80000003, 0x80000004,
+/// leading spaces trimmed.
+pub fn cpuid_brand(a: CpuidRegs, b: CpuidRegs, c: CpuidRegs) -> str {
+    var s: str = "";
+    s = s + x86_reg_chars(a.eax) + x86_reg_chars(a.ebx) + x86_reg_chars(a.ecx) + x86_reg_chars(a.edx);
+    s = s + x86_reg_chars(b.eax) + x86_reg_chars(b.ebx) + x86_reg_chars(b.ecx) + x86_reg_chars(b.edx);
+    s = s + x86_reg_chars(c.eax) + x86_reg_chars(c.ebx) + x86_reg_chars(c.ecx) + x86_reg_chars(c.edx);
+    return str_trim(s);
+}
+
+/// "family 6 model 0x9E stepping 10".
+pub fn cpuid_signature(eax: i64) -> str {
+    return "family " + int_to_str(cpuid_family(eax)) + " model " + regmap_hex(cpuid_model(eax), 2) + " stepping " + int_to_str(cpuid_stepping(eax));
+}
+
+// ─── MSRs (SDM vol. 4) ──────────────────────────────────────────────────
+
+pub const MSR_IA32_TSC: i64 = 0x10;
+pub const MSR_IA32_APIC_BASE: i64 = 0x1B;
+pub const MSR_IA32_FEATURE_CONTROL: i64 = 0x3A;
+pub const MSR_IA32_MTRRCAP: i64 = 0xFE;
+pub const MSR_IA32_SYSENTER_CS: i64 = 0x174;
+pub const MSR_IA32_SYSENTER_ESP: i64 = 0x175;
+pub const MSR_IA32_SYSENTER_EIP: i64 = 0x176;
+pub const MSR_IA32_MISC_ENABLE: i64 = 0x1A0;
+pub const MSR_IA32_PAT: i64 = 0x277;
+pub const MSR_IA32_TSC_DEADLINE: i64 = 0x6E0;
+pub const MSR_X2APIC_BASE: i64 = 0x800;
+pub const MSR_EFER: i64 = 0xC0000080;
+pub const MSR_STAR: i64 = 0xC0000081;
+pub const MSR_LSTAR: i64 = 0xC0000082;
+pub const MSR_CSTAR: i64 = 0xC0000083;
+pub const MSR_FMASK: i64 = 0xC0000084;
+pub const MSR_FS_BASE: i64 = 0xC0000100;
+pub const MSR_GS_BASE: i64 = 0xC0000101;
+pub const MSR_KERNEL_GS_BASE: i64 = 0xC0000102;
+pub const MSR_TSC_AUX: i64 = 0xC0000103;
+
+pub const EFER_SCE: i64 = 0x1;
+pub const EFER_LME: i64 = 0x100;
+pub const EFER_LMA: i64 = 0x400;
+pub const EFER_NXE: i64 = 0x800;
+
+pub fn x86_msr_name(m: i64) -> str {
+    if m == 0x10 { return "IA32_TSC"; }
+    if m == 0x1B { return "IA32_APIC_BASE"; }
+    if m == 0x3A { return "IA32_FEATURE_CONTROL"; }
+    if m == 0xFE { return "IA32_MTRRCAP"; }
+    if m == 0x174 { return "IA32_SYSENTER_CS"; }
+    if m == 0x175 { return "IA32_SYSENTER_ESP"; }
+    if m == 0x176 { return "IA32_SYSENTER_EIP"; }
+    if m == 0x1A0 { return "IA32_MISC_ENABLE"; }
+    if m == 0x277 { return "IA32_PAT"; }
+    if m == 0x6E0 { return "IA32_TSC_DEADLINE"; }
+    if m >= 0x800 && m <= 0x8FF { return "x2APIC " + regmap_hex(m, 3); }
+    if m == 0xC0000080 { return "IA32_EFER"; }
+    if m == 0xC0000081 { return "IA32_STAR"; }
+    if m == 0xC0000082 { return "IA32_LSTAR"; }
+    if m == 0xC0000083 { return "IA32_CSTAR"; }
+    if m == 0xC0000084 { return "IA32_FMASK"; }
+    if m == 0xC0000100 { return "IA32_FS_BASE"; }
+    if m == 0xC0000101 { return "IA32_GS_BASE"; }
+    if m == 0xC0000102 { return "IA32_KERNEL_GS_BASE"; }
+    if m == 0xC0000103 { return "IA32_TSC_AUX"; }
+    return "MSR " + regmap_hex(m, 8);
+}
+
+pub fn x86_efer_decode(v: i64) -> str {
+    var out: Vec<str> = Vec::new();
+    if (v & EFER_SCE) != 0 { out.push("SCE"); }
+    if (v & EFER_LME) != 0 { out.push("LME"); }
+    if (v & EFER_LMA) != 0 { out.push("LMA"); }
+    if (v & EFER_NXE) != 0 { out.push("NXE"); }
+    if (v & 0x1000) != 0 { out.push("SVME"); }
+    return str_join(out, " ");
+}
+
+/// IA32_STAR: SYSCALL loads CS = kernel_cs, SS = kernel_cs + 8; SYSRET to
+/// 64-bit loads CS = user_base + 16, SS = user_base + 8 (both | 3).
+pub fn x86_star(kernel_cs: i64, user_base: i64) -> i64 {
+    return ((user_base & 0xFFFF) << 48) | ((kernel_cs & 0xFFFF) << 32);
+}
+
+/// The selectors SYSCALL/SYSRET use with a STAR value:
+/// "syscall CS=0x10 SS=0x18 sysret CS=0x33 SS=0x2B".
+pub fn x86_star_decode(star: i64) -> str {
+    val k: i64 = (star >> 32) & 0xFFFF;
+    val u: i64 = (star >> 48) & 0xFFFF;
+    return "syscall CS=" + regmap_hex(k, 2) + " SS=" + regmap_hex(k + 8, 2) + " sysret CS=" + regmap_hex((u + 16) | 3, 2) + " SS=" + regmap_hex((u + 8) | 3, 2);
+}
+
+/// IA32_APIC_BASE: "base 0xFEE00000 BSP enabled" (+ "x2APIC").
+pub fn x86_apic_base_decode(v: i64) -> str {
+    var out: str = "base " + regmap_hex(v & 0xFFFFFF000, 8);
+    if (v & 0x100) != 0 { out = out + " BSP"; }
+    if (v & 0x800) != 0 { out = out + " enabled"; } else { out = out + " disabled"; }
+    if (v & 0x400) != 0 { out = out + " x2APIC"; }
+    return out;
+}
+
+/// PAT memory type names.
+pub fn x86_memtype_name(t: i64) -> str {
+    if t == 0 { return "UC"; }
+    if t == 1 { return "WC"; }
+    if t == 4 { return "WT"; }
+    if t == 5 { return "WP"; }
+    if t == 6 { return "WB"; }
+    if t == 7 { return "UC-"; }
+    return "reserved";
+}
+
+/// IA32_PAT from 8 entry types (PA0..PA7).
+pub fn x86_pat(types: Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < 8 && i < types.len() {
+        v = v | ((types.get(i) & 7) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn x86_pat_decode(v: i64) -> str {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        out.push("PA" + int_to_str(i) + "=" + x86_memtype_name((v >> (8 * i)) & 7));
+        i = i + 1;
+    }
+    return str_join(out, " ");
+}
+
+// ─── Segment descriptors (SDM 3A 3.4.5, 7.2.3, 6.14.1) ──────────────────
+
+/// Access byte values.
+pub const SEG_KERNEL_CODE: i64 = 0x9A;
+pub const SEG_KERNEL_DATA: i64 = 0x92;
+pub const SEG_USER_CODE: i64 = 0xFA;
+pub const SEG_USER_DATA: i64 = 0xF2;
+pub const SEG_TSS64: i64 = 0x89;
+/// Flags nibble: G (8), D/B (4), L (2).
+pub const SEG_FLAGS_LONG: i64 = 0xA;
+pub const SEG_FLAGS_32: i64 = 0xC;
+
+/// An 8-byte code/data descriptor.
+pub fn gdt_entry(base: i64, limit: i64, access: i64, flags: i64) -> i64 {
+    var d: i64 = limit & 0xFFFF;
+    d = d | ((base & 0xFFFFFF) << 16);
+    d = d | ((access & 0xFF) << 40);
+    d = d | (((limit >> 16) & 0xF) << 48);
+    d = d | ((flags & 0xF) << 52);
+    d = d | (((base >> 24) & 0xFF) << 56);
+    return d;
+}
+
+/// Decode an 8-byte descriptor: "code base=0x0 limit=0xFFFFF DPL0 P L G".
+pub fn gdt_decode(d: i64) -> str {
+    val limit: i64 = (d & 0xFFFF) | (((d >> 48) & 0xF) << 16);
+    val base: i64 = ((d >> 16) & 0xFFFFFF) | (((d >> 56) & 0xFF) << 24);
+    val access: i64 = (d >> 40) & 0xFF;
+    val flags: i64 = (d >> 52) & 0xF;
+    var kind: str = "system type " + int_to_str(access & 0xF);
+    if (access & 0x10) != 0 {
+        if (access & 8) != 0 { kind = "code"; } else { kind = "data"; }
+    } else if (access & 0xF) == 9 {
+        kind = "tss64 available";
+    } else if (access & 0xF) == 0xB {
+        kind = "tss64 busy";
+    }
+    var out: str = kind + " base=" + regmap_hex(base, 1) + " limit=" + regmap_hex(limit, 1) + " DPL" + int_to_str((access >> 5) & 3);
+    if (access & 0x80) != 0 { out = out + " P"; }
+    if (access & 0x10) != 0 && (access & 2) != 0 {
+        if (access & 8) != 0 { out = out + " R"; } else { out = out + " W"; }
+    }
+    if (flags & 2) != 0 { out = out + " L"; }
+    if (flags & 4) != 0 { out = out + " D"; }
+    if (flags & 8) != 0 { out = out + " G"; }
+    return out;
+}
+
+/// The two words of a 64-bit TSS descriptor (limit 103 for a TSS without
+/// an I/O bitmap).
+pub fn tss_desc_low(base: i64, limit: i64) -> i64 {
+    return gdt_entry(base & 0xFFFFFFFF, limit, SEG_TSS64, 0);
+}
+
+pub fn tss_desc_high(base: i64) -> i64 {
+    return (base >> 32) & 0xFFFFFFFF;
+}
+
+/// A segment selector.
+pub fn x86_selector(index: i64, ldt: bool, rpl: i64) -> i64 {
+    var s: i64 = (index << 3) | (rpl & 3);
+    if ldt { s = s | 4; }
+    return s;
+}
+
+/// Gate types.
+pub const GATE_INTERRUPT: i64 = 0xE;
+pub const GATE_TRAP: i64 = 0xF;
+
+/// Low and high words of a 16-byte IDT gate for `handler`.
+pub fn idt_gate_low(handler: i64, selector: i64, ist: i64, gate_type: i64, dpl: i64) -> i64 {
+    var g: i64 = handler & 0xFFFF;
+    g = g | ((selector & 0xFFFF) << 16);
+    g = g | ((ist & 7) << 32);
+    g = g | ((0x80 | ((dpl & 3) << 5) | (gate_type & 0xF)) << 40);
+    g = g | (((handler >> 16) & 0xFFFF) << 48);
+    return g;
+}
+
+pub fn idt_gate_high(handler: i64) -> i64 {
+    return (handler >> 32) & 0xFFFFFFFF;
+}
+
+/// The handler address a gate points to.
+pub fn idt_gate_target(low: i64, high: i64) -> i64 {
+    return (low & 0xFFFF) | (((low >> 48) & 0xFFFF) << 16) | ((high & 0xFFFFFFFF) << 32);
+}
+
+/// Exception vectors 0..31 (SDM 3A table 6-1).
+pub fn x86_vector_name(v: i64) -> str {
+    val names: Vec<str> = str_split("#DE Divide Error,#DB Debug,NMI,#BP Breakpoint,#OF Overflow,#BR BOUND Range Exceeded,#UD Invalid Opcode,#NM Device Not Available,#DF Double Fault,Coprocessor Segment Overrun,#TS Invalid TSS,#NP Segment Not Present,#SS Stack-Segment Fault,#GP General Protection,#PF Page Fault,Reserved,#MF x87 FPU Error,#AC Alignment Check,#MC Machine Check,#XM SIMD Floating-Point,#VE Virtualization,#CP Control Protection", ",");
+    if v >= 0 && v < names.len() { return names.get(v); }
+    if v < 32 { return "Reserved"; }
+    return "IRQ vector " + int_to_str(v);
+}
+
+/// Vectors that push an error code.
+pub fn x86_has_error_code(v: i64) -> bool {
+    return v == 8 || v == 10 || v == 11 || v == 12 || v == 13 || v == 14 || v == 17 || v == 21 || v == 29 || v == 30;
+}
+
+/// #PF error code decode: "present write user" style.
+pub fn x86_pf_error_decode(e: i64) -> str {
+    var out: Vec<str> = Vec::new();
+    if (e & 1) != 0 { out.push("protection"); } else { out.push("not-present"); }
+    if (e & 2) != 0 { out.push("write"); } else { out.push("read"); }
+    if (e & 4) != 0 { out.push("user"); } else { out.push("supervisor"); }
+    if (e & 8) != 0 { out.push("reserved-bit"); }
+    if (e & 16) != 0 { out.push("fetch"); }
+    if (e & 32) != 0 { out.push("pkey"); }
+    if (e & 64) != 0 { out.push("shadow-stack"); }
+    return str_join(out, " ");
+}
+
+// ─── Bytes of tables ────────────────────────────────────────────────────
+
+/// Append `v` as `n` little-endian bytes.
+pub fn x86_put_le(out: &mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+/// Words as little-endian bytes (a GDT or IDT image).
+pub fn x86_table_bytes(words: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < words.len() {
+        x86_put_le(&mut out, words.get(i), 8);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The 10-byte GDTR/IDTR operand of LGDT/LIDT: limit (size - 1), base.
+pub fn x86_pseudo_desc(base: i64, size_bytes: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    x86_put_le(&mut out, size_bytes - 1, 2);
+    x86_put_le(&mut out, base, 8);
+    return out;
+}
+
+/// The 104-byte 64-bit TSS: RSP0..2 at 4, 12, 20; IST1..7 at 36..84; the
+/// I/O map base at 102 (104 = no bitmap).
+pub fn x86_tss_bytes(rsp0: i64, ist: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::filled(104, 0);
+    var i: i64 = 0;
+    while i < 8 {
+        out.set(4 + i, (rsp0 >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+    var k: i64 = 0;
+    while k < ist.len() && k < 7 {
+        var j: i64 = 0;
+        while j < 8 {
+            out.set(36 + 8 * k + j, (ist.get(k) >> (8 * j)) & 0xFF);
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    out.set(102, 104);
+    out.set(103, 0);
+    return out;
+}
+
+/// A standard long-mode GDT: null, kernel code, kernel data, user data,
+/// user code (the order SYSRET needs: STAR user base = 0x18), then the
+/// TSS descriptor (two slots).
+pub fn x86_standard_gdt(tss_base: i64) -> Vec<i64> {
+    var g: Vec<i64> = Vec::new();
+    g.push(0);
+    g.push(gdt_entry(0, 0xFFFFF, SEG_KERNEL_CODE, SEG_FLAGS_LONG));
+    g.push(gdt_entry(0, 0xFFFFF, SEG_KERNEL_DATA, SEG_FLAGS_32));
+    g.push(gdt_entry(0, 0xFFFFF, SEG_USER_DATA, SEG_FLAGS_32));
+    g.push(gdt_entry(0, 0xFFFFF, SEG_USER_CODE, SEG_FLAGS_LONG));
+    g.push(tss_desc_low(tss_base, 103));
+    g.push(tss_desc_high(tss_base));
+    return g;
+}
+
+// ─── Port I/O seam ──────────────────────────────────────────────────────
+
+/// Port I/O: mode 0 fake (ports in a map, every access logged), mode 1
+/// real (in/out instructions through the port builtins).
+pub struct PortIo {
+    pub mode: i64,
+    pub ports: HashMap<i64, i64>,
+    pub log: Vec<str>,
+}
+
+pub fn portio_fake() -> PortIo {
+    return PortIo { mode: 0, ports: HashMap::new(), log: Vec::new() };
+}
+
+pub fn portio_real() -> PortIo {
+    return PortIo { mode: 1, ports: HashMap::new(), log: Vec::new() };
+}
+
+@unsafe
+fn x86_port_in(port: i64, width: i64) -> i64 {
+    if width == 8 { return p_inb(port); }
+    if width == 16 { return p_inw(port); }
+    return p_inl(port);
+}
+
+@unsafe
+fn x86_port_out(port: i64, width: i64, v: i64) {
+    if width == 8 { p_outb(port, v); return; }
+    if width == 16 { p_outw(port, v); return; }
+    p_outl(port, v);
+}
+
+pub fn portio_in(io: &mut PortIo, port: i64, width: i64) -> i64 {
+    if io.mode == 1 {
+        unsafe { return x86_port_in(port & 0xFFFF, width); }
+    }
+    var v: i64 = 0;
+    if io.ports.contains(port) { v = io.ports.get(port) & regmap_ones(width); }
+    io.log.push("in " + regmap_hex(port, 2) + " -> " + regmap_hex(v, width / 4));
+    return v;
+}
+
+pub fn portio_out(io: &mut PortIo, port: i64, width: i64, v: i64) {
+    val w: i64 = v & regmap_ones(width);
+    if io.mode == 1 {
+        unsafe { x86_port_out(port & 0xFFFF, width, w); }
+        return;
+    }
+    io.ports.insert(port, w);
+    io.log.push("out " + regmap_hex(port, 2) + " <- " + regmap_hex(w, width / 4));
+}
+
+pub fn x86_inb(io: &mut PortIo, port: i64) -> i64 { return portio_in(io, port, 8); }
+pub fn x86_outb(io: &mut PortIo, port: i64, v: i64) { portio_out(io, port, 8, v); }
+
+// ─── 8259 PIC, 8254 PIT, CMOS ───────────────────────────────────────────
+
+pub const PIC1_CMD: i64 = 0x20;
+pub const PIC1_DATA: i64 = 0x21;
+pub const PIC2_CMD: i64 = 0xA0;
+pub const PIC2_DATA: i64 = 0xA1;
+pub const PIC_EOI: i64 = 0x20;
+
+/// Remap the two 8259s to vectors off1..off1+7 and off2..off2+7 (ICW1
+/// with ICW4, ICW2 offsets, ICW3 cascade on IRQ2, ICW4 8086 mode), then
+/// restore the masks that were set.
+pub fn pic_remap(io: &mut PortIo, off1: i64, off2: i64) {
+    val m1: i64 = x86_inb(io, PIC1_DATA);
+    val m2: i64 = x86_inb(io, PIC2_DATA);
+    x86_outb(io, PIC1_CMD, 0x11);
+    x86_outb(io, PIC2_CMD, 0x11);
+    x86_outb(io, PIC1_DATA, off1);
+    x86_outb(io, PIC2_DATA, off2);
+    x86_outb(io, PIC1_DATA, 4);
+    x86_outb(io, PIC2_DATA, 2);
+    x86_outb(io, PIC1_DATA, 1);
+    x86_outb(io, PIC2_DATA, 1);
+    x86_outb(io, PIC1_DATA, m1);
+    x86_outb(io, PIC2_DATA, m2);
+}
+
+/// Mask (true) or unmask one IRQ line 0..15.
+pub fn pic_set_mask(io: &mut PortIo, irq: i64, masked: bool) {
+    var port: i64 = PIC1_DATA;
+    var line: i64 = irq;
+    if irq >= 8 {
+        port = PIC2_DATA;
+        line = irq - 8;
+    }
+    var m: i64 = x86_inb(io, port);
+    if masked { m = m | (1 << line); } else { m = m & ~(1 << line); }
+    x86_outb(io, port, m);
+}
+
+/// End of interrupt: the slave too for IRQs 8..15.
+pub fn pic_eoi(io: &mut PortIo, irq: i64) {
+    if irq >= 8 { x86_outb(io, PIC2_CMD, PIC_EOI); }
+    x86_outb(io, PIC1_CMD, PIC_EOI);
+}
+
+pub const PIT_HZ: i64 = 1193182;
+
+/// PIT channel 0 divisor for `hz` (1..65536; 0 is written for 65536).
+pub fn pit_divisor(hz: i64) -> i64 {
+    var d: i64 = (PIT_HZ + hz / 2) / hz;
+    if d < 1 { d = 1; }
+    if d > 65536 { d = 65536; }
+    return d;
+}
+
+/// Program channel 0 as a rate generator (mode 2) at `hz`: command 0x34
+/// (channel 0, lobyte/hibyte, mode 2, binary), then the divisor.
+pub fn pit_set_rate(io: &mut PortIo, hz: i64) {
+    val d: i64 = pit_divisor(hz) & 0xFFFF;
+    x86_outb(io, 0x43, 0x34);
+    x86_outb(io, 0x40, d & 0xFF);
+    x86_outb(io, 0x40, (d >> 8) & 0xFF);
+}
+
+/// Read CMOS register `reg` (NMI stays disabled while selecting: bit 7).
+pub fn cmos_read(io: &mut PortIo, reg: i64) -> i64 {
+    x86_outb(io, 0x70, 0x80 | (reg & 0x7F));
+    return x86_inb(io, 0x71);
+}
+
+pub fn cmos_write(io: &mut PortIo, reg: i64, v: i64) {
+    x86_outb(io, 0x70, 0x80 | (reg & 0x7F));
+    x86_outb(io, 0x71, v);
+}

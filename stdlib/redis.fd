@@ -1,0 +1,1158 @@
+// Fides Redis client: the RESP2 and RESP3 protocols, pipelining, pub/sub
+//
+// Real (pure computation):
+//   - an encoder for every RESP3 type (simple string, error, integer, bulk
+//     string, null, array, boolean, double, big number, bulk error,
+//     verbatim string, map, set, attribute, push) and for commands (an
+//     array of bulk strings, as clients send them);
+//   - an incremental decoder into a RespDoc, a flat tree of nodes (as
+//     stdlib/cbor's CborDoc): it says when the bytes stop before a whole
+//     reply (`need_more`, nothing consumed), and rejects malformed input
+//     (bad type byte, bad length, missing CRLF, nesting deeper than
+//     RESP_MAX_DEPTH). RESP2 null bulk ($-1) and null array (*-1) decode
+//     as RESP_NULL, like RESP3's `_`;
+//   - a client that queues commands and reads one reply per command
+//     (pipelining: all queued commands are written at once, then the
+//     replies are read in order), typed helpers (GET, SET with EX/NX,
+//     INCR, INCRBY, DEL, HSET, HGET, LPUSH, RPUSH, LRANGE, EXPIRE, TTL,
+//     PUBLISH, SUBSCRIBE, HELLO 3), and pub/sub message parsing for RESP2
+//     arrays and RESP3 push messages (message, pmessage, subscribe,
+//     unsubscribe, psubscribe, punsubscribe, pong).
+//
+// The transport seam: RedisTransport holds a connection id and two functions,
+// send(conn, bytes) -> bytes written (< 0 on error) and recv(conn, max)
+// -> bytes read (empty at the end of the stream). redis_tcp_transport(sock)
+// fills them with stdlib net's net_send_bytes / net_recv_bytes over a
+// connected TCP socket; tests use functions that replay captured bytes.
+// No TLS (use a TLS tunnel's transport) and no RESP3 client-side caching.
+//
+// Bytes are Vec<i64>, one value 0..255 each.
+//
+// Usage:
+//   use redis;
+//   var c: RedisClient = redis_client_new(redis_tcp_transport(sock));
+//   redis_set(&mut c, "k", "v");
+//   val v: Option<str> = redis_get(&mut c, "k");
+//   redis_queue(&mut c, redis_cmd2("INCR", "n"));
+//   redis_queue(&mut c, redis_cmd2("INCR", "n"));
+//   val replies: Vec<RespDoc> = redis_flush(&mut c);   // 2 replies
+
+module redis;
+ use vec; use string; use net;
+
+// Node kinds (the RESP3 type byte)
+pub const RESP_SIMPLE: i64 = 43;    // '+'
+pub const RESP_ERROR: i64 = 45;     // '-'
+pub const RESP_INT: i64 = 58;       // ':'
+pub const RESP_BULK: i64 = 36;      // '$'
+pub const RESP_ARRAY: i64 = 42;     // '*'
+pub const RESP_NULL: i64 = 95;      // '_'
+pub const RESP_BOOL: i64 = 35;      // '#'
+pub const RESP_DOUBLE: i64 = 44;    // ','
+pub const RESP_BIGNUM: i64 = 40;    // '('
+pub const RESP_BULK_ERROR: i64 = 33; // '!'
+pub const RESP_VERBATIM: i64 = 61;  // '='
+pub const RESP_MAP: i64 = 37;       // '%'
+pub const RESP_SET: i64 = 126;      // '~'
+pub const RESP_ATTR: i64 = 124;     // '|'
+pub const RESP_PUSH: i64 = 62;      // '>'
+
+/// Deepest nesting the decoder accepts.
+pub const RESP_MAX_DEPTH: i64 = 64;
+/// Largest bulk string accepted (Redis' own proto-max-bulk-len default).
+pub const RESP_MAX_BULK: i64 = 536870912;
+
+// ─── Encoding ─────────────────────────────────────────────────────────────
+
+fn rs_put_text(out: & mut Vec<i64>, s: str) {
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        out.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn rs_crlf(out: & mut Vec<i64>) {
+    out.push(13);
+    out.push(10);
+}
+
+fn rs_head(out: & mut Vec<i64>, kind: i64, n: i64) {
+    out.push(kind);
+    rs_put_text(out, int_to_str(n));
+    rs_crlf(out);
+}
+
+/// +text\r\n (text must not hold CR or LF)
+pub fn resp_put_simple(out: & mut Vec<i64>, s: str) {
+    out.push(RESP_SIMPLE);
+    rs_put_text(out, s);
+    rs_crlf(out);
+}
+
+/// -ERR message\r\n
+pub fn resp_put_error(out: & mut Vec<i64>, s: str) {
+    out.push(RESP_ERROR);
+    rs_put_text(out, s);
+    rs_crlf(out);
+}
+
+/// :n\r\n
+pub fn resp_put_int(out: & mut Vec<i64>, n: i64) {
+    rs_head(out, RESP_INT, n);
+}
+
+/// $len\r\nbytes\r\n (binary safe: a str carries its length)
+pub fn resp_put_bulk(out: & mut Vec<i64>, s: str) {
+    rs_head(out, RESP_BULK, str_len(s));
+    rs_put_text(out, s);
+    rs_crlf(out);
+}
+
+/// A bulk string from bytes.
+pub fn resp_put_bulk_bytes(out: & mut Vec<i64>, b: Vec<i64>) {
+    rs_head(out, RESP_BULK, b.len());
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
+    rs_crlf(out);
+}
+
+/// RESP3 null: _\r\n
+pub fn resp_put_null(out: & mut Vec<i64>) {
+    out.push(RESP_NULL);
+    rs_crlf(out);
+}
+
+/// RESP2 null bulk string: $-1\r\n
+pub fn resp_put_null_bulk(out: & mut Vec<i64>) {
+    rs_head(out, RESP_BULK, 0 - 1);
+}
+
+/// The head of an aggregate: kind is RESP_ARRAY, RESP_SET, RESP_PUSH, or
+/// RESP_MAP / RESP_ATTR with n = the number of pairs. The n items follow.
+pub fn resp_put_aggregate(out: & mut Vec<i64>, kind: i64, n: i64) {
+    rs_head(out, kind, n);
+}
+
+/// #t\r\n or #f\r\n
+pub fn resp_put_bool(out: & mut Vec<i64>, b: bool) {
+    out.push(RESP_BOOL);
+    if b {
+        out.push(116);
+    } else {
+        out.push(102);
+    }
+    rs_crlf(out);
+}
+
+/// ,1.5\r\n (inf, -inf and nan as RESP3 writes them)
+pub fn resp_put_double(out: & mut Vec<i64>, x: f64) {
+    out.push(RESP_DOUBLE);
+    if x != x {
+        rs_put_text(out, "nan");
+    } else if x > 1.7976931348623157e308 {
+        rs_put_text(out, "inf");
+    } else if x < - 1.7976931348623157e308 {
+        rs_put_text(out, "-inf");
+    } else {
+        rs_put_text(out, float_to_str(x));
+    }
+    rs_crlf(out);
+}
+
+/// (digits\r\n: a big number given as its decimal text
+pub fn resp_put_bignum(out: & mut Vec<i64>, digits: str) {
+    out.push(RESP_BIGNUM);
+    rs_put_text(out, digits);
+    rs_crlf(out);
+}
+
+/// !len\r\nmessage\r\n
+pub fn resp_put_bulk_error(out: & mut Vec<i64>, s: str) {
+    rs_head(out, RESP_BULK_ERROR, str_len(s));
+    rs_put_text(out, s);
+    rs_crlf(out);
+}
+
+/// =len\r\nfmt:text\r\n (fmt is three bytes, e.g. "txt" or "mkd")
+pub fn resp_put_verbatim(out: & mut Vec<i64>, fmt: str, s: str) {
+    rs_head(out, RESP_VERBATIM, str_len(s) + 4);
+    rs_put_text(out, fmt);
+    out.push(58);
+    rs_put_text(out, s);
+    rs_crlf(out);
+}
+
+/// A command as clients send it: an array of bulk strings.
+pub fn resp_encode_command(args: Vec<str>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    rs_head(& mut out, RESP_ARRAY, args.len());
+    var i: i64 = 0;
+    while i < args.len() {
+        resp_put_bulk(& mut out, args.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The inline form some tools send ("PING\r\n"): words joined by spaces.
+pub fn resp_encode_inline(args: Vec<str>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < args.len() {
+        if i > 0 {
+            out.push(32);
+        }
+        rs_put_text(& mut out, args.get(i));
+        i = i + 1;
+    }
+    rs_crlf(& mut out);
+    return out;
+}
+
+// ─── Decoded documents ────────────────────────────────────────────────────
+
+/// A decoded reply as a flat tree. Node i has kind[i] (RESP_*) and:
+///   SIMPLE/ERROR/BULK/BULK_ERROR/BIGNUM/DOUBLE: text = its bytes as a str;
+///   VERBATIM: text = the text after "fmt:", fmt = the format;
+///   INT: num = the value; BOOL: num = 1 or 0; DOUBLE: fnum = the value;
+///   ARRAY/SET/PUSH: children = the items; MAP/ATTR: key, value, key, ...
+/// An attribute (|) is decoded, kept in `attrs` of the node it describes,
+/// and not counted as an item. ok false: `error` says why; need_more true:
+/// the bytes end before a whole reply (read more and decode again).
+pub struct RespDoc {
+    pub kind: Vec<i64>,
+    pub num: Vec<i64>,
+    pub fnum: Vec<f64>,
+    pub text: Vec<str>,
+    pub fmt: Vec<str>,
+    pub first: Vec<i64>,
+    pub nkids: Vec<i64>,
+    pub attrs: Vec<i64>,
+    pub kids: Vec<i64>,
+    pub root: i64,
+    pub ok: bool,
+    pub need_more: bool,
+    pub error: str,
+    pub used: i64,
+}
+
+struct RsReader {
+    bytes: Vec<i64>,
+    pos: i64,
+    ok: bool,
+    more: bool,
+    error: str,
+}
+
+fn rs_doc_new() -> RespDoc {
+    return RespDoc {
+        kind: Vec::new(), num: Vec::new(), fnum: Vec::new(), text: Vec::new(), fmt: Vec::new(), first: Vec::new(), nkids: Vec::new(), attrs: Vec::new(), kids: Vec::new(), root: 0 - 1, ok: true, need_more: false, error: "", used: 0,
+    };
+}
+
+fn rs_node(d: & mut RespDoc, kind: i64) -> i64 {
+    val id: i64 = d.kind.len();
+    d.kind.push(kind);
+    d.num.push(0);
+    d.fnum.push(0.0);
+    d.text.push("");
+    d.fmt.push("");
+    d.first.push(0);
+    d.nkids.push(0);
+    d.attrs.push(0 - 1);
+    return id;
+}
+
+fn rs_fail(r: & mut RsReader, msg: str) {
+    if r.ok {
+        r.ok = false;
+        r.error = msg + " at byte " + int_to_str(r.pos);
+    }
+}
+
+// The line from pos to the next CRLF (pos moves past it).
+fn rs_line(r: & mut RsReader) -> str {
+    var i: i64 = r.pos;
+    while i < r.bytes.len() {
+        if r.bytes.get(i) == 13 {
+            if i + 1 >= r.bytes.len() {
+                r.more = true;
+                rs_fail(r, "need more bytes");
+                return "";
+            }
+            if r.bytes.get(i + 1) != 10 {
+                rs_fail(r, "CR without LF");
+                return "";
+            }
+            var b: Vec<i64> = Vec::new();
+            var k: i64 = r.pos;
+            while k < i {
+                b.push(r.bytes.get(k));
+                k = k + 1;
+            }
+            r.pos = i + 2;
+            return str_from_bytes(b);
+        }
+        if r.bytes.get(i) == 10 {
+            rs_fail(r, "LF without CR");
+            return "";
+        }
+        i = i + 1;
+    }
+    r.more = true;
+    rs_fail(r, "need more bytes");
+    return "";
+}
+
+// A decimal integer (optional sign); false in *ok when it is not one.
+fn rs_parse_int(s: str, ok: & mut bool) -> i64 {
+    val n: i64 = str_len(s);
+    if n == 0 || n > 20 {
+        *ok = false;
+        return 0;
+    }
+    var i: i64 = 0;
+    var neg: bool = false;
+    if str_byte_at(s, 0) == 45 || str_byte_at(s, 0) == 43 {
+        neg = str_byte_at(s, 0) == 45;
+        i = 1;
+        if n == 1 {
+            *ok = false;
+            return 0;
+        }
+    }
+    var v: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 {
+            *ok = false;
+            return 0;
+        }
+        if v > 922337203685477580 {
+            *ok = false;
+            return 0;
+        }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
+fn rs_len_line(r: & mut RsReader) -> i64 {
+    val line: str = rs_line(r);
+    if !r.ok {
+        return 0;
+    }
+    var good: bool = true;
+    val n: i64 = rs_parse_int(line, & mut good);
+    if !good || n < 0 - 1 {
+        rs_fail(r, "bad length");
+        return 0;
+    }
+    return n;
+}
+
+// n bytes then CRLF, as a str.
+fn rs_blob(r: & mut RsReader, n: i64) -> str {
+    if n > RESP_MAX_BULK {
+        rs_fail(r, "bulk string too long");
+        return "";
+    }
+    if r.pos + n + 2 > r.bytes.len() {
+        r.more = true;
+        rs_fail(r, "need more bytes");
+        return "";
+    }
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        b.push(r.bytes.get(r.pos + i));
+        i = i + 1;
+    }
+    if r.bytes.get(r.pos + n) != 13 || r.bytes.get(r.pos + n + 1) != 10 {
+        rs_fail(r, "bulk string not ended by CRLF");
+        return "";
+    }
+    r.pos = r.pos + n + 2;
+    return str_from_bytes(b);
+}
+
+fn rs_item(d: & mut RespDoc, r: & mut RsReader, depth: i64) -> i64 {
+    if depth > RESP_MAX_DEPTH {
+        rs_fail(r, "nested too deep");
+        return 0 - 1;
+    }
+    if r.pos >= r.bytes.len() {
+        r.more = true;
+        rs_fail(r, "need more bytes");
+        return 0 - 1;
+    }
+    val t: i64 = r.bytes.get(r.pos);
+    r.pos = r.pos + 1;
+    if t == RESP_ATTR {
+        // |n pairs, then the item they describe
+        val n: i64 = rs_len_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        val an: i64 = rs_node(d, RESP_ATTR);
+        var ids: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < n * 2 && r.ok {
+            ids.push(rs_item(d, r, depth + 1));
+            i = i + 1;
+        }
+        if !r.ok {
+            return 0 - 1;
+        }
+        rs_set_kids(d, an, ids);
+        val target: i64 = rs_item(d, r, depth);
+        if r.ok {
+            d.attrs.set(target, an);
+        }
+        return target;
+    }
+    if t == RESP_SIMPLE || t == RESP_ERROR || t == RESP_BIGNUM {
+        val s: str = rs_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        val id: i64 = rs_node(d, t);
+        d.text.set(id, s);
+        return id;
+    }
+    if t == RESP_INT {
+        val s: str = rs_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        var good: bool = true;
+        val v: i64 = rs_parse_int(s, & mut good);
+        if !good {
+            rs_fail(r, "bad integer");
+            return 0 - 1;
+        }
+        val id: i64 = rs_node(d, t);
+        d.num.set(id, v);
+        return id;
+    }
+    if t == RESP_NULL {
+        val s: str = rs_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        if str_len(s) != 0 {
+            rs_fail(r, "bad null");
+            return 0 - 1;
+        }
+        return rs_node(d, RESP_NULL);
+    }
+    if t == RESP_BOOL {
+        val s: str = rs_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        if s != "t" && s != "f" {
+            rs_fail(r, "bad boolean");
+            return 0 - 1;
+        }
+        val id: i64 = rs_node(d, t);
+        if s == "t" {
+            d.num.set(id, 1);
+        }
+        return id;
+    }
+    if t == RESP_DOUBLE {
+        val s: str = rs_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        val id: i64 = rs_node(d, t);
+        d.text.set(id, s);
+        if s == "inf" {
+            d.fnum.set(id, 1.0e308 * 10.0);
+        } else if s == "-inf" {
+            d.fnum.set(id, 0.0 - 1.0e308 * 10.0);
+        } else if s == "nan" {
+            val z: f64 = 0.0;
+            d.fnum.set(id, z / z);
+        } else {
+            d.fnum.set(id, str_parse_float(s));
+        }
+        return id;
+    }
+    if t == RESP_BULK || t == RESP_BULK_ERROR || t == RESP_VERBATIM {
+        val n: i64 = rs_len_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        if n == 0 - 1 {
+            if t != RESP_BULK {
+                rs_fail(r, "bad length");
+                return 0 - 1;
+            }
+            return rs_node(d, RESP_NULL);
+        }
+        val s: str = rs_blob(r, n);
+        if !r.ok {
+            return 0 - 1;
+        }
+        val id: i64 = rs_node(d, t);
+        if t == RESP_VERBATIM {
+            if n < 4 || str_byte_at(s, 3) != 58 {
+                rs_fail(r, "bad verbatim string");
+                return 0 - 1;
+            }
+            d.fmt.set(id, str_slice(s, 0, 3));
+            d.text.set(id, str_slice(s, 4, n));
+        } else {
+            d.text.set(id, s);
+        }
+        return id;
+    }
+    if t == RESP_ARRAY || t == RESP_SET || t == RESP_PUSH || t == RESP_MAP {
+        val n: i64 = rs_len_line(r);
+        if !r.ok {
+            return 0 - 1;
+        }
+        if n == 0 - 1 {
+            if t != RESP_ARRAY {
+                rs_fail(r, "bad length");
+                return 0 - 1;
+            }
+            return rs_node(d, RESP_NULL);
+        }
+        val id: i64 = rs_node(d, t);
+        var count: i64 = n;
+        if t == RESP_MAP {
+            count = n * 2;
+        }
+        var ids: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < count && r.ok {
+            ids.push(rs_item(d, r, depth + 1));
+            i = i + 1;
+        }
+        if !r.ok {
+            return 0 - 1;
+        }
+        rs_set_kids(d, id, ids);
+        return id;
+    }
+    r.pos = r.pos - 1;
+    rs_fail(r, "unknown type byte " + int_to_str(t));
+    return 0 - 1;
+}
+
+fn rs_set_kids(d: & mut RespDoc, node: i64, ids: Vec<i64>) {
+    d.first.set(node, d.kids.len());
+    d.nkids.set(node, ids.len());
+    var i: i64 = 0;
+    while i < ids.len() {
+        d.kids.push(ids.get(i));
+        i = i + 1;
+    }
+}
+
+/// Decode one reply starting at byte `at`. On success `used` is the
+/// number of bytes it took (the next reply starts at at + used).
+pub fn resp_decode_at(bytes: Vec<i64>, at: i64) -> RespDoc {
+    var d: RespDoc = rs_doc_new();
+    var r: RsReader = RsReader { bytes: bytes, pos: at, ok: true, more: false, error: "" };
+    val root: i64 = rs_item(& mut d, & mut r, 0);
+    d.ok = r.ok;
+    d.need_more = r.more;
+    d.error = r.error;
+    if r.ok {
+        d.root = root;
+        d.used = r.pos - at;
+    }
+    return d;
+}
+
+pub fn resp_decode(bytes: Vec<i64>) -> RespDoc {
+    return resp_decode_at(bytes, 0);
+}
+
+// ─── Reading a document ───────────────────────────────────────────────────
+
+pub fn resp_kind(d: & RespDoc, i: i64) -> i64 {
+    return d.kind.get(i);
+}
+
+pub fn resp_text(d: & RespDoc, i: i64) -> str {
+    return d.text.get(i);
+}
+
+pub fn resp_int(d: & RespDoc, i: i64) -> i64 {
+    return d.num.get(i);
+}
+
+pub fn resp_double(d: & RespDoc, i: i64) -> f64 {
+    return d.fnum.get(i);
+}
+
+/// Items of an array/set/push; key+value entries (2 per pair) of a map.
+pub fn resp_count(d: & RespDoc, i: i64) -> i64 {
+    return d.nkids.get(i);
+}
+
+pub fn resp_child(d: & RespDoc, i: i64, k: i64) -> i64 {
+    return d.kids.get(d.first.get(i) + k);
+}
+
+pub fn resp_is_error(d: & RespDoc, i: i64) -> bool {
+    val k: i64 = d.kind.get(i);
+    return k == RESP_ERROR || k == RESP_BULK_ERROR;
+}
+
+/// The attribute node attached to node i (-1 when none).
+pub fn resp_attrs(d: & RespDoc, i: i64) -> i64 {
+    return d.attrs.get(i);
+}
+
+/// The value of map node `i` whose key is the string `key` (-1 if none).
+pub fn resp_map_get(d: & RespDoc, i: i64, key: str) -> i64 {
+    var k: i64 = 0;
+    while k + 1 < d.nkids.get(i) {
+        if resp_text(d, resp_child(d, i, k)) == key {
+            return resp_child(d, i, k + 1);
+        }
+        k = k + 2;
+    }
+    return 0 - 1;
+}
+
+fn rs_quote(s: str) -> str {
+    var out: str = "\"";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 34 || c == 92 {
+            out = out + "\\" + char_to_str(c);
+        } else if c == 10 {
+            out = out + "\\n";
+        } else if c == 13 {
+            out = out + "\\r";
+        } else if c < 32 || c > 126 {
+            val hx: str = "0123456789abcdef";
+            out = out + "\\x" + str_slice(hx, c >> 4, (c >> 4) + 1) + str_slice(hx, c & 15, (c & 15) + 1);
+        } else {
+            out = out + char_to_str(c);
+        }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+/// A one-line rendering of node i (for logs and tests).
+pub fn resp_to_str(d: & RespDoc, i: i64) -> str {
+    val k: i64 = d.kind.get(i);
+    var pre: str = "";
+    if d.attrs.get(i) >= 0 {
+        pre = "|" + resp_to_str(d, d.attrs.get(i)) + " ";
+    }
+    if k == RESP_SIMPLE {
+        return pre + d.text.get(i);
+    }
+    if k == RESP_ERROR {
+        return pre + "(error) " + d.text.get(i);
+    }
+    if k == RESP_BULK_ERROR {
+        return pre + "(bulk error) " + d.text.get(i);
+    }
+    if k == RESP_INT {
+        return pre + "(integer) " + int_to_str(d.num.get(i));
+    }
+    if k == RESP_BULK {
+        return pre + rs_quote(d.text.get(i));
+    }
+    if k == RESP_VERBATIM {
+        return pre + d.fmt.get(i) + ":" + rs_quote(d.text.get(i));
+    }
+    if k == RESP_NULL {
+        return pre + "(nil)";
+    }
+    if k == RESP_BOOL {
+        if d.num.get(i) == 1 {
+            return pre + "(true)";
+        }
+        return pre + "(false)";
+    }
+    if k == RESP_DOUBLE {
+        return pre + "(double) " + d.text.get(i);
+    }
+    if k == RESP_BIGNUM {
+        return pre + "(big number) " + d.text.get(i);
+    }
+    var open: str = "[";
+    var close: str = "]";
+    if k == RESP_SET {
+        open = "~{";
+        close = "}";
+    } else if k == RESP_PUSH {
+        open = ">[";
+    } else if k == RESP_MAP || k == RESP_ATTR {
+        open = "{";
+        close = "}";
+    }
+    var out: str = pre + open;
+    var j: i64 = 0;
+    val n: i64 = d.nkids.get(i);
+    while j < n {
+        if j > 0 {
+            if (k == RESP_MAP || k == RESP_ATTR) && j % 2 == 1 {
+                out = out + ": ";
+            } else {
+                out = out + ", ";
+            }
+        }
+        out = out + resp_to_str(d, resp_child(d, i, j));
+        j = j + 1;
+    }
+    return out + close;
+}
+
+/// Re-encode node i (attributes included) to its RESP3 bytes.
+pub fn resp_encode_node(d: & RespDoc, i: i64, out: & mut Vec<i64>) {
+    val k: i64 = d.kind.get(i);
+    val a: i64 = d.attrs.get(i);
+    if a >= 0 {
+        rs_head(out, RESP_ATTR, d.nkids.get(a) / 2);
+        var j: i64 = 0;
+        while j < d.nkids.get(a) {
+            resp_encode_node(d, resp_child(d, a, j), out);
+            j = j + 1;
+        }
+    }
+    if k == RESP_SIMPLE {
+        resp_put_simple(out, d.text.get(i));
+    } else if k == RESP_ERROR {
+        resp_put_error(out, d.text.get(i));
+    } else if k == RESP_BIGNUM {
+        resp_put_bignum(out, d.text.get(i));
+    } else if k == RESP_INT {
+        resp_put_int(out, d.num.get(i));
+    } else if k == RESP_BULK {
+        resp_put_bulk(out, d.text.get(i));
+    } else if k == RESP_BULK_ERROR {
+        resp_put_bulk_error(out, d.text.get(i));
+    } else if k == RESP_VERBATIM {
+        resp_put_verbatim(out, d.fmt.get(i), d.text.get(i));
+    } else if k == RESP_NULL {
+        resp_put_null(out);
+    } else if k == RESP_BOOL {
+        resp_put_bool(out, d.num.get(i) == 1);
+    } else if k == RESP_DOUBLE {
+        out.push(RESP_DOUBLE);
+        rs_put_text(out, d.text.get(i));
+        rs_crlf(out);
+    } else {
+        var n: i64 = d.nkids.get(i);
+        if k == RESP_MAP {
+            rs_head(out, k, n / 2);
+        } else {
+            rs_head(out, k, n);
+        }
+        var j: i64 = 0;
+        while j < n {
+            resp_encode_node(d, resp_child(d, i, j), out);
+            j = j + 1;
+        }
+    }
+}
+
+// ─── Pub/sub messages ─────────────────────────────────────────────────────
+
+/// A pub/sub event. kind: "message", "pmessage", "smessage", "subscribe",
+/// "unsubscribe", "psubscribe", "punsubscribe", "pong", or "" when the
+/// reply is not a pub/sub event. count: the subscription count for the
+/// (un)subscribe kinds.
+pub struct RedisPubSub {
+    pub kind: str,
+    pub pattern: str,
+    pub channel: str,
+    pub payload: str,
+    pub count: i64,
+}
+
+/// Read a pub/sub event from node i: a RESP2 array or a RESP3 push.
+pub fn redis_pubsub_parse(d: & RespDoc, i: i64) -> RedisPubSub {
+    var ev: RedisPubSub = RedisPubSub { kind: "", pattern: "", channel: "", payload: "", count: 0 };
+    val k: i64 = d.kind.get(i);
+    if k != RESP_ARRAY && k != RESP_PUSH {
+        return ev;
+    }
+    val n: i64 = d.nkids.get(i);
+    if n < 2 {
+        return ev;
+    }
+    val word: str = str_to_lower(resp_text(d, resp_child(d, i, 0)));
+    if (word == "message" || word == "smessage") && n == 3 {
+        ev.kind = word;
+        ev.channel = resp_text(d, resp_child(d, i, 1));
+        ev.payload = resp_text(d, resp_child(d, i, 2));
+    } else if word == "pmessage" && n == 4 {
+        ev.kind = word;
+        ev.pattern = resp_text(d, resp_child(d, i, 1));
+        ev.channel = resp_text(d, resp_child(d, i, 2));
+        ev.payload = resp_text(d, resp_child(d, i, 3));
+    } else if (word == "subscribe" || word == "unsubscribe" || word == "psubscribe" || word == "punsubscribe" || word == "ssubscribe" || word == "sunsubscribe") && n == 3 {
+        ev.kind = word;
+        val ch: i64 = resp_child(d, i, 1);
+        if d.kind.get(ch) != RESP_NULL {
+            ev.channel = resp_text(d, ch);
+        }
+        ev.count = resp_int(d, resp_child(d, i, 2));
+    } else if word == "pong" {
+        ev.kind = word;
+        ev.payload = resp_text(d, resp_child(d, i, 1));
+    }
+    return ev;
+}
+
+// ─── Commands ─────────────────────────────────────────────────────────────
+
+pub fn redis_cmd1(a: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(a);
+    return v;
+}
+
+pub fn redis_cmd2(a: str, b: str) -> Vec<str> {
+    var v: Vec<str> = redis_cmd1(a);
+    v.push(b);
+    return v;
+}
+
+pub fn redis_cmd3(a: str, b: str, c: str) -> Vec<str> {
+    var v: Vec<str> = redis_cmd2(a, b);
+    v.push(c);
+    return v;
+}
+
+pub fn redis_cmd4(a: str, b: str, c: str, e: str) -> Vec<str> {
+    var v: Vec<str> = redis_cmd3(a, b, c);
+    v.push(e);
+    return v;
+}
+
+/// SET key value [EX seconds] [NX]: ex_seconds 0 = no expiry.
+pub fn redis_cmd_set(key: str, value: str, ex_seconds: i64, only_if_absent: bool) -> Vec<str> {
+    var v: Vec<str> = redis_cmd3("SET", key, value);
+    if ex_seconds > 0 {
+        v.push("EX");
+        v.push(int_to_str(ex_seconds));
+    }
+    if only_if_absent {
+        v.push("NX");
+    }
+    return v;
+}
+
+// ─── Transport and client ─────────────────────────────────────────────────
+
+pub struct RedisTransport {
+    pub conn: i64,
+    pub send: fn(i64, Vec<i64>) -> i64,
+    pub recv: fn(i64, i64) -> Vec<i64>,
+}
+
+/// A transport over a connected TCP socket (stdlib net).
+pub fn redis_tcp_transport(sock: i64) -> RedisTransport {
+    return RedisTransport { conn: sock, send: net_send_bytes, recv: net_recv_bytes };
+}
+
+/// A client: `queued` holds the commands not yet written, `inbuf` the
+/// bytes read and not yet decoded. ok false after a transport or protocol
+/// error (`error` says which); a Redis error reply does not set it.
+pub struct RedisClient {
+    pub tr: RedisTransport,
+    pub queued: Vec<i64>,
+    pub nqueued: i64,
+    pub inbuf: Vec<i64>,
+    pub ok: bool,
+    pub error: str,
+}
+
+pub fn redis_client_new(tr: RedisTransport) -> RedisClient {
+    return RedisClient { tr: tr, queued: Vec::new(), nqueued: 0, inbuf: Vec::new(), ok: true, error: "" };
+}
+
+/// Queue a command (pipelining): nothing is written yet.
+pub fn redis_queue(c: & mut RedisClient, args: Vec<str>) {
+    val b: Vec<i64> = resp_encode_command(args);
+    var i: i64 = 0;
+    while i < b.len() {
+        c.queued.push(b.get(i));
+        i = i + 1;
+    }
+    c.nqueued = c.nqueued + 1;
+}
+
+fn rs_write(c: & mut RedisClient) -> bool {
+    if c.queued.len() == 0 {
+        return true;
+    }
+    val send: fn(i64, Vec<i64>) -> i64 = c.tr.send;
+    val n: i64 = send(c.tr.conn, c.queued);
+    if n != c.queued.len() {
+        c.ok = false;
+        c.error = "send failed";
+        return false;
+    }
+    c.queued = Vec::new();
+    return true;
+}
+
+/// Read one reply (blocking on the transport until it is whole).
+pub fn redis_read_reply(c: & mut RedisClient) -> RespDoc {
+    while true {
+        val d: RespDoc = resp_decode(c.inbuf);
+        if d.ok {
+            var rest: Vec<i64> = Vec::new();
+            var i: i64 = d.used;
+            while i < c.inbuf.len() {
+                rest.push(c.inbuf.get(i));
+                i = i + 1;
+            }
+            c.inbuf = rest;
+            return d;
+        }
+        if !d.need_more {
+            c.ok = false;
+            c.error = "protocol error: " + d.error;
+            return d;
+        }
+        val recv: fn(i64, i64) -> Vec<i64> = c.tr.recv;
+        val got: Vec<i64> = recv(c.tr.conn, 65536);
+        if got.len() == 0 {
+            c.ok = false;
+            c.error = "connection closed";
+            return d;
+        }
+        var j: i64 = 0;
+        while j < got.len() {
+            c.inbuf.push(got.get(j));
+            j = j + 1;
+        }
+    }
+    return rs_doc_new();
+}
+
+/// Write every queued command, then read one reply for each, in order.
+pub fn redis_flush(c: & mut RedisClient) -> Vec<RespDoc> {
+    var out: Vec<RespDoc> = Vec::new();
+    val n: i64 = c.nqueued;
+    c.nqueued = 0;
+    if !rs_write(c) {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < n && c.ok {
+        out.push(redis_read_reply(c));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Send one command and read its reply.
+pub fn redis_call(c: & mut RedisClient, args: Vec<str>) -> RespDoc {
+    redis_queue(c, args);
+    val rs: Vec<RespDoc> = redis_flush(c);
+    if rs.len() == 0 {
+        var d: RespDoc = rs_doc_new();
+        d.ok = false;
+        d.error = c.error;
+        return d;
+    }
+    return rs.get(0);
+}
+
+// The root of a reply, or -1 (and the error noted) when it is an error.
+fn rs_root(c: & mut RedisClient, d: & RespDoc) -> i64 {
+    if !d.ok {
+        return 0 - 1;
+    }
+    if resp_is_error(d, d.root) {
+        c.error = resp_text(d, d.root);
+        return 0 - 1;
+    }
+    return d.root;
+}
+
+/// GET: None when the key does not exist (or on an error).
+pub fn redis_get(c: & mut RedisClient, key: str) -> Option<str> {
+    val d: RespDoc = redis_call(c, redis_cmd2("GET", key));
+    val r: i64 = rs_root(c, & d);
+    if r < 0 || resp_kind(& d, r) == RESP_NULL {
+        return Option::None;
+    }
+    return Option::Some(resp_text(& d, r));
+}
+
+/// SET: true on +OK.
+pub fn redis_set(c: & mut RedisClient, key: str, value: str) -> bool {
+    val d: RespDoc = redis_call(c, redis_cmd3("SET", key, value));
+    val r: i64 = rs_root(c, & d);
+    return r >= 0 && resp_kind(& d, r) == RESP_SIMPLE && resp_text(& d, r) == "OK";
+}
+
+/// SET with EX and/or NX: false when NX found the key (a null reply).
+pub fn redis_set_ex(c: & mut RedisClient, key: str, value: str, ex_seconds: i64, only_if_absent: bool) -> bool {
+    val d: RespDoc = redis_call(c, redis_cmd_set(key, value, ex_seconds, only_if_absent));
+    val r: i64 = rs_root(c, & d);
+    return r >= 0 && resp_kind(& d, r) == RESP_SIMPLE && resp_text(& d, r) == "OK";
+}
+
+fn rs_int_reply(c: & mut RedisClient, args: Vec<str>) -> i64 {
+    val d: RespDoc = redis_call(c, args);
+    val r: i64 = rs_root(c, & d);
+    if r < 0 || resp_kind(& d, r) != RESP_INT {
+        return 0 - 1;
+    }
+    return resp_int(& d, r);
+}
+
+/// INCR: the new value (-1 with c.error set on an error reply).
+pub fn redis_incr(c: & mut RedisClient, key: str) -> i64 {
+    return rs_int_reply(c, redis_cmd2("INCR", key));
+}
+
+pub fn redis_incrby(c: & mut RedisClient, key: str, by: i64) -> i64 {
+    return rs_int_reply(c, redis_cmd3("INCRBY", key, int_to_str(by)));
+}
+
+/// DEL: how many keys were removed.
+pub fn redis_del(c: & mut RedisClient, key: str) -> i64 {
+    return rs_int_reply(c, redis_cmd2("DEL", key));
+}
+
+/// HSET key field value: 1 when the field is new, 0 when updated.
+pub fn redis_hset(c: & mut RedisClient, key: str, field: str, value: str) -> i64 {
+    return rs_int_reply(c, redis_cmd4("HSET", key, field, value));
+}
+
+pub fn redis_hget(c: & mut RedisClient, key: str, field: str) -> Option<str> {
+    val d: RespDoc = redis_call(c, redis_cmd3("HGET", key, field));
+    val r: i64 = rs_root(c, & d);
+    if r < 0 || resp_kind(& d, r) == RESP_NULL {
+        return Option::None;
+    }
+    return Option::Some(resp_text(& d, r));
+}
+
+fn rs_push_cmd(cmd: str, key: str, values: Vec<str>) -> Vec<str> {
+    var a: Vec<str> = redis_cmd2(cmd, key);
+    var i: i64 = 0;
+    while i < values.len() {
+        a.push(values.get(i));
+        i = i + 1;
+    }
+    return a;
+}
+
+/// LPUSH key v1 v2 ...: the list's length after.
+pub fn redis_lpush(c: & mut RedisClient, key: str, values: Vec<str>) -> i64 {
+    return rs_int_reply(c, rs_push_cmd("LPUSH", key, values));
+}
+
+pub fn redis_rpush(c: & mut RedisClient, key: str, values: Vec<str>) -> i64 {
+    return rs_int_reply(c, rs_push_cmd("RPUSH", key, values));
+}
+
+/// LRANGE key start stop: the elements.
+pub fn redis_lrange(c: & mut RedisClient, key: str, start: i64, stop: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var a: Vec<str> = redis_cmd3("LRANGE", key, int_to_str(start));
+    a.push(int_to_str(stop));
+    val d: RespDoc = redis_call(c, a);
+    val r: i64 = rs_root(c, & d);
+    if r < 0 {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < resp_count(& d, r) {
+        out.push(resp_text(& d, resp_child(& d, r, i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// EXPIRE key seconds: true when the timeout was set.
+pub fn redis_expire(c: & mut RedisClient, key: str, seconds: i64) -> bool {
+    return rs_int_reply(c, redis_cmd3("EXPIRE", key, int_to_str(seconds))) == 1;
+}
+
+/// TTL key: seconds left, -1 no expiry, -2 no key.
+pub fn redis_ttl(c: & mut RedisClient, key: str) -> i64 {
+    val d: RespDoc = redis_call(c, redis_cmd2("TTL", key));
+    val r: i64 = rs_root(c, & d);
+    if r < 0 {
+        return 0 - 2;
+    }
+    return resp_int(& d, r);
+}
+
+/// PUBLISH channel message: how many subscribers received it.
+pub fn redis_publish(c: & mut RedisClient, channel: str, message: str) -> i64 {
+    return rs_int_reply(c, redis_cmd3("PUBLISH", channel, message));
+}
+
+/// SUBSCRIBE: writes the command and reads one confirmation per channel.
+/// Afterwards read events with redis_next_event.
+pub fn redis_subscribe(c: & mut RedisClient, channels: Vec<str>) -> Vec<RedisPubSub> {
+    var out: Vec<RedisPubSub> = Vec::new();
+    var a: Vec<str> = redis_cmd1("SUBSCRIBE");
+    var i: i64 = 0;
+    while i < channels.len() {
+        a.push(channels.get(i));
+        i = i + 1;
+    }
+    val b: Vec<i64> = resp_encode_command(a);
+    var k: i64 = 0;
+    while k < b.len() {
+        c.queued.push(b.get(k));
+        k = k + 1;
+    }
+    if !rs_write(c) {
+        return out;
+    }
+    i = 0;
+    while i < channels.len() && c.ok {
+        val d: RespDoc = redis_read_reply(c);
+        if d.ok {
+            out.push(redis_pubsub_parse(& d, d.root));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The next pub/sub event (blocking).
+pub fn redis_next_event(c: & mut RedisClient) -> RedisPubSub {
+    val d: RespDoc = redis_read_reply(c);
+    if !d.ok {
+        return RedisPubSub { kind: "", pattern: "", channel: "", payload: "", count: 0 };
+    }
+    return redis_pubsub_parse(& d, d.root);
+}
+
+/// HELLO 3 [AUTH user pass]: switch to RESP3. The server's map reply.
+pub fn redis_hello3(c: & mut RedisClient, user: str, pass: str) -> RespDoc {
+    var a: Vec<str> = redis_cmd2("HELLO", "3");
+    if str_len(user) > 0 {
+        a.push("AUTH");
+        a.push(user);
+        a.push(pass);
+    }
+    return redis_call(c, a);
+}

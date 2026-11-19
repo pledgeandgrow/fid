@@ -1,0 +1,454 @@
+// initrd: "newc" cpio archives, the Linux initramfs format
+// (Documentation/driver-api/early-userspace/buffer-format.rst), and
+// unpacking one into a file system the way the kernel's init/initramfs.c
+// populates rootfs.
+//
+// Real, no platform seam: archives are bytes in memory (Vec<i64>).
+//  - Reading: the 110-byte ASCII header ("070701", or "070702" with a
+//    checksum: the 32-bit sum of the data bytes, verified), thirteen
+//    8-digit hex fields, the name padded to 4 bytes after the header, the
+//    data padded to 4, "TRAILER!!!", and several archives one after
+//    another (zero padding between them is skipped, as the kernel does).
+//  - Writing: the same layout byte for byte as GNU cpio -H newc, the
+//    trailer, padding to 512-byte blocks.
+//  - Unpacking (initrd_unpack, initrd_mount): directories, regular files
+//    with their permission bits, symlinks (the data is the target), hard
+//    links (entries sharing ino/devmajor/devminor with nlink > 1 get the
+//    data the archive stores with one of them, GNU cpio puts it with the
+//    last). ramfs has no device or FIFO inodes: those entries are counted
+//    in `skipped`. Unpacking goes through vfs, so any vfs file system can
+//    be the target; initrd_mount makes a ramfs for it.
+module initrd;
+use vec;
+use string;
+use vfs;
+use ramfs;
+
+pub const CPIO_S_IFMT: i64 = 61440;
+pub const CPIO_S_IFSOCK: i64 = 49152;
+pub const CPIO_S_IFLNK: i64 = 40960;
+pub const CPIO_S_IFREG: i64 = 32768;
+pub const CPIO_S_IFBLK: i64 = 24576;
+pub const CPIO_S_IFDIR: i64 = 16384;
+pub const CPIO_S_IFCHR: i64 = 8192;
+pub const CPIO_S_IFIFO: i64 = 4096;
+
+pub const CPIO_HDR: i64 = 110;
+
+pub struct CpioEntry {
+    pub name: str,
+    pub ino: i64,
+    pub mode: i64,
+    pub uid: i64,
+    pub gid: i64,
+    pub nlink: i64,
+    pub mtime: i64,
+    pub devmajor: i64,
+    pub devminor: i64,
+    pub rdevmajor: i64,
+    pub rdevminor: i64,
+    pub check: i64,
+    pub data: Vec<i64>,
+}
+
+pub struct CpioArchive {
+    pub err: str,
+    pub crc: bool,
+    pub entries: Vec<CpioEntry>,
+}
+
+pub fn cpio_entry(name: str, mode: i64, data: Vec<i64>) -> CpioEntry {
+    return CpioEntry {
+        name: name, ino: 0, mode: mode, uid: 0, gid: 0, nlink: 1, mtime: 0, devmajor: 0, devminor: 0, rdevmajor: 0, rdevminor: 0, check: 0, data: data
+    };
+}
+
+pub fn cpio_file(name: str, perm: i64, data: Vec<i64>) -> CpioEntry {
+    return cpio_entry(name, CPIO_S_IFREG | (perm & 4095), data);
+}
+
+pub fn cpio_dir(name: str, perm: i64) -> CpioEntry {
+    var e: CpioEntry = cpio_entry(name, CPIO_S_IFDIR | (perm & 4095), Vec::new());
+    e.nlink = 2;
+    return e;
+}
+
+pub fn cpio_symlink(name: str, target: str) -> CpioEntry {
+    return cpio_entry(name, CPIO_S_IFLNK | 511, str_bytes(target));
+}
+
+pub fn cpio_kind(e: & CpioEntry) -> i64 {
+    return e.mode & CPIO_S_IFMT;
+}
+
+/// The newc checksum: the sum of the data bytes, modulo 2^32.
+pub fn cpio_checksum(data: & Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < data.len() {
+        s = (s + (data.get(i) & 255)) % 4294967296;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn cpio_hex8(b: & Vec<i64>, off: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < 8 {
+        val c: i64 = b.get(off + i);
+        var d: i64 = -1;
+        if c >= 48 && c <= 57 {
+            d = c - 48;
+        } else if c >= 65 && c <= 70 {
+            d = c - 55;
+        } else if c >= 97 && c <= 102 {
+            d = c - 87;
+        }
+        if d < 0 {
+            return -1;
+        }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn cpio_pad4(n: i64) -> i64 {
+    return (n + 3) / 4 * 4;
+}
+
+fn cpio_fail(msg: str, crc: bool, es: Vec<CpioEntry>) -> CpioArchive {
+    return CpioArchive { err: msg, crc: crc, entries: es };
+}
+
+/// Parse an archive (or several concatenated ones). `err` is "" on
+/// success; the trailers are not returned as entries.
+pub fn cpio_parse(b: Vec<i64>) -> CpioArchive {
+    var es: Vec<CpioEntry> = Vec::new();
+    var crc: bool = false;
+    var off: i64 = 0;
+    var ended: bool = false;
+    while off < b.len() {
+        if ended {
+            // between archives: zero padding, 4-byte aligned
+            if b.get(off) == 0 {
+                off = off + 1;
+                continue;
+            }
+            if off % 4 != 0 {
+                return cpio_fail("junk after trailer at " + int_to_str(off), crc, es);
+            }
+            ended = false;
+        }
+        if off + CPIO_HDR > b.len() {
+            return cpio_fail("truncated header at " + int_to_str(off), crc, es);
+        }
+        if b.get(off) != 48 || b.get(off + 1) != 55 || b.get(off + 2) != 48 || b.get(off + 3) != 55 || b.get(off + 4) != 48 || (b.get(off + 5) != 49 && b.get(off + 5) != 50) {
+            return cpio_fail("bad magic at " + int_to_str(off), crc, es);
+        }
+        val is_crc: bool = b.get(off + 5) == 50;
+        if is_crc {
+            crc = true;
+        }
+        var f: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < 13 {
+            val x: i64 = cpio_hex8(&b, off + 6 + 8 * k);
+            if x < 0 {
+                return cpio_fail("bad hex field at " + int_to_str(off + 6 + 8 * k), crc, es);
+            }
+            f.push(x);
+            k = k + 1;
+        }
+        val namesize: i64 = f.get(11);
+        val filesize: i64 = f.get(6);
+        val nstart: i64 = off + CPIO_HDR;
+        if namesize < 1 || nstart + namesize > b.len() || b.get(nstart + namesize - 1) != 0 {
+            return cpio_fail("bad name at " + int_to_str(off), crc, es);
+        }
+        var nb: Vec<i64> = Vec::new();
+        k = 0;
+        while k < namesize - 1 {
+            nb.push(b.get(nstart + k));
+            k = k + 1;
+        }
+        val name: str = str_from_bytes(nb);
+        val dstart: i64 = cpio_pad4(nstart + namesize);
+        if dstart + filesize > b.len() {
+            return cpio_fail("truncated data of " + name, crc, es);
+        }
+        var data: Vec<i64> = Vec::new();
+        k = 0;
+        while k < filesize {
+            data.push(b.get(dstart + k));
+            k = k + 1;
+        }
+        off = cpio_pad4(dstart + filesize);
+        if name == "TRAILER!!!" {
+            ended = true;
+            continue;
+        }
+        if is_crc && cpio_checksum(&data) != f.get(12) {
+            return cpio_fail("checksum mismatch for " + name, crc, es);
+        }
+        es.push(CpioEntry {
+            name: name, ino: f.get(0), mode: f.get(1), uid: f.get(2), gid: f.get(3), nlink: f.get(4), mtime: f.get(5), devmajor: f.get(7), devminor: f.get(8), rdevmajor: f.get(9), rdevminor: f.get(10), check: f.get(12), data: data
+        });
+    }
+    if !ended && es.len() > 0 {
+        return cpio_fail("no trailer", crc, es);
+    }
+    return CpioArchive { err: "", crc: crc, entries: es };
+}
+
+fn cpio_put_hex8(out: &mut Vec<i64>, v: i64) {
+    var i: i64 = 7;
+    var digits: Vec<i64> = Vec::filled(8, 48);
+    var x: i64 = v;
+    while i >= 0 {
+        val d: i64 = x % 16;
+        if d < 10 {
+            digits.set(i, 48 + d);
+        } else {
+            digits.set(i, 55 + d);
+        }
+        x = x / 16;
+        i = i - 1;
+    }
+    i = 0;
+    while i < 8 {
+        out.push(digits.get(i));
+        i = i + 1;
+    }
+}
+
+fn cpio_put_entry(out: &mut Vec<i64>, e: & CpioEntry, crc: bool) {
+    out.push(48);
+    out.push(55);
+    out.push(48);
+    out.push(55);
+    out.push(48);
+    if crc {
+        out.push(50);
+    } else {
+        out.push(49);
+    }
+    val nb: Vec<i64> = str_bytes(e.name);
+    cpio_put_hex8(out, e.ino);
+    cpio_put_hex8(out, e.mode);
+    cpio_put_hex8(out, e.uid);
+    cpio_put_hex8(out, e.gid);
+    cpio_put_hex8(out, e.nlink);
+    cpio_put_hex8(out, e.mtime);
+    cpio_put_hex8(out, e.data.len());
+    cpio_put_hex8(out, e.devmajor);
+    cpio_put_hex8(out, e.devminor);
+    cpio_put_hex8(out, e.rdevmajor);
+    cpio_put_hex8(out, e.rdevminor);
+    cpio_put_hex8(out, nb.len() + 1);
+    if crc {
+        cpio_put_hex8(out, cpio_checksum(&e.data));
+    } else {
+        cpio_put_hex8(out, 0);
+    }
+    var i: i64 = 0;
+    while i < nb.len() {
+        out.push(nb.get(i));
+        i = i + 1;
+    }
+    out.push(0);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    i = 0;
+    while i < e.data.len() {
+        out.push(e.data.get(i));
+        i = i + 1;
+    }
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
+/// Write an archive (newc, or with `crc` the 070702 form), then the
+/// trailer, padded to a multiple of `block` bytes (512 for GNU cpio's
+/// default, 4 for none).
+pub fn cpio_write(entries: Vec<CpioEntry>, crc: bool, block: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < entries.len() {
+        val e: CpioEntry = entries.get(i);
+        cpio_put_entry(&mut out, &e, crc);
+        i = i + 1;
+    }
+    val t: CpioEntry = cpio_entry("TRAILER!!!", 0, Vec::new());
+    cpio_put_entry(&mut out, &t, crc);
+    if block > 0 {
+        while out.len() % block != 0 {
+            out.push(0);
+        }
+    }
+    return out;
+}
+
+/// The index of the entry named `name` ("./" prefixes ignored), or -1.
+pub fn cpio_find(a: & CpioArchive, name: str) -> i64 {
+    val want: str = initrd_clean(name);
+    var i: i64 = 0;
+    while i < a.entries.len() {
+        if initrd_clean(a.entries.get(i).name) == want {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// --- unpacking -------------------------------------------------------------------
+
+/// Archive names as initramfs reads them: no leading "/" or "./".
+pub fn initrd_clean(name: str) -> str {
+    var s: str = name;
+    loop {
+        if str_starts_with(s, "./") {
+            s = str_slice(s, 2, str_len(s));
+        } else if str_starts_with(s, "/") {
+            s = str_slice(s, 1, str_len(s));
+        } else {
+            break;
+        }
+    }
+    if s == "." {
+        return "";
+    }
+    return s;
+}
+
+fn initrd_parent(path: str) -> str {
+    val i: i64 = str_rfind(path, "/");
+    if i <= 0 {
+        return "/";
+    }
+    return str_slice(path, 0, i);
+}
+
+pub struct InitrdStats {
+    pub err: i64,
+    pub dirs: i64,
+    pub files: i64,
+    pub symlinks: i64,
+    pub hardlinks: i64,
+    pub skipped: i64,
+    pub bytes: i64,
+}
+
+fn initrd_link_key(e: & CpioEntry) -> str {
+    return int_to_str(e.ino) + ":" + int_to_str(e.devmajor) + ":" + int_to_str(e.devminor);
+}
+
+/// Unpack the entries of `a` under directory `dest` of `v` (which must
+/// exist). Existing files are replaced, existing directories kept.
+pub fn initrd_unpack(v: &mut Vfs, dest: str, a: & CpioArchive) -> InitrdStats {
+    var st: InitrdStats = InitrdStats { err: 0, dirs: 0, files: 0, symlinks: 0, hardlinks: 0, skipped: 0, bytes: 0 };
+    var base: str = dest;
+    if str_ends_with(base, "/") {
+        base = str_slice(base, 0, str_len(base) - 1);
+    }
+    // hard link groups: the data stored with one of the names
+    var link_data: HashMap<str, i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < a.entries.len() {
+        val e: CpioEntry = a.entries.get(i);
+        if cpio_kind(&e) == CPIO_S_IFREG && e.nlink > 1 && e.data.len() > 0 {
+            link_data.insert(initrd_link_key(&e), i);
+        }
+        i = i + 1;
+    }
+    var seen: HashMap<str, i64> = HashMap::new();
+    i = 0;
+    while i < a.entries.len() {
+        val e: CpioEntry = a.entries.get(i);
+        val rel: str = initrd_clean(e.name);
+        val kind: i64 = cpio_kind(&e);
+        if str_len(rel) == 0 {
+            i = i + 1;
+            continue;
+        }
+        val path: str = base + "/" + rel;
+        val pr: i64 = vfs_mkdir_p(v, initrd_parent(path));
+        if pr < 0 {
+            st.err = pr;
+            return st;
+        }
+        if kind == CPIO_S_IFDIR {
+            val ex: VStat = vfs_stat(v, path);
+            if ex.err < 0 {
+                val r: i64 = vfs_mkdir(v, path, e.mode & 4095);
+                if r < 0 {
+                    st.err = r;
+                    return st;
+                }
+            }
+            st.dirs = st.dirs + 1;
+        } else if kind == CPIO_S_IFREG {
+            var data: Vec<i64> = e.data;
+            if e.nlink > 1 {
+                val key: str = initrd_link_key(&e);
+                if link_data.contains(key) {
+                    data = a.entries.get(link_data.get(key)).data;
+                }
+                if seen.contains(key) {
+                    st.hardlinks = st.hardlinks + 1;
+                } else {
+                    seen.insert(key, i);
+                }
+            }
+            vfs_unlink(v, path);
+            val fd: i64 = vfs_open_mode(v, path, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC, e.mode & 4095);
+            if fd < 0 {
+                st.err = fd;
+                return st;
+            }
+            val n: i64 = vfs_write(v, fd, data);
+            vfs_close(v, fd);
+            if n < 0 {
+                st.err = n;
+                return st;
+            }
+            st.files = st.files + 1;
+            st.bytes = st.bytes + n;
+        } else if kind == CPIO_S_IFLNK {
+            vfs_unlink(v, path);
+            val r: i64 = vfs_symlink(v, str_from_bytes(e.data), path);
+            if r < 0 {
+                st.err = r;
+                return st;
+            }
+            st.symlinks = st.symlinks + 1;
+        } else {
+            st.skipped = st.skipped + 1;
+        }
+        i = i + 1;
+    }
+    return st;
+}
+
+/// Parse `bytes`, make a ramfs, mount it on `path` (as "/" when `v` has
+/// nothing mounted yet) and unpack into it. `err` is -errno on failure
+/// (VFS_EINVAL for a bad archive).
+pub fn initrd_mount(v: &mut Vfs, path: str, bytes: Vec<i64>) -> InitrdStats {
+    val a: CpioArchive = cpio_parse(bytes);
+    if str_len(a.err) > 0 {
+        return InitrdStats { err: 0 - VFS_EINVAL, dirs: 0, files: 0, symlinks: 0, hardlinks: 0, skipped: 0, bytes: 0 };
+    }
+    var mp: str = path;
+    if v.mounts.len() == 0 {
+        mp = "/";
+    }
+    val fs: i64 = ramfs_mount(v, mp);
+    if fs < 0 {
+        return InitrdStats { err: fs, dirs: 0, files: 0, symlinks: 0, hardlinks: 0, skipped: 0, bytes: 0 };
+    }
+    return initrd_unpack(v, mp, &a);
+}

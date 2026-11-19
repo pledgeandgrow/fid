@@ -1,0 +1,227 @@
+// stdlib/behavior_tree: typed blackboard, reactive vs plain sequence (halting a running action), SequenceWithMemory, a BehaviorTree.CPP XML tree with ports, retry, repeat, inverter, subtree, parallel thresholds and a timeout on an injected clock, load errors
+// Expected output:
+// bb: n=3 kind=1 n as float=3.0000 speed as int=1 armed=true missing=false name=robot
+// reactive: RUNNING FAILURE halted=1 work=0
+// reactive log: BatteryOK:SUCCESS Work:RUNNING BatteryOK:FAILURE Work:HALT
+// sequence: RUNNING RUNNING SUCCESS battery checks=1
+// memory: FAILURE SUCCESS count=1 / plain: FAILURE SUCCESS count=2
+// xml ok=true root=main_seq
+// xml ticks: RUNNING RUNNING RUNNING RUNNING FAILURE
+// x=42 flaky=3 count=3 work=3 forever halts=2
+// xml log: SetValue:SUCCESS Check:SUCCESS Flaky:FAILURE Flaky:FAILURE Flaky:SUCCESS Count:SUCCESS Count:SUCCESS Count:SUCCESS Fail:FAILURE Fail:FAILURE Fail:FAILURE Work:RUNNING Ok:SUCCESS Forever:RUNNING Work:RUNNING Forever:RUNNING Work:SUCCESS Forever:HALT Forever:RUNNING Forever:RUNNING Forever:HALT
+// main_seq [FAILURE]
+//   SetValue [IDLE]
+//   Check [IDLE]
+//   RetryUntilSuccessful [IDLE]
+//     Flaky [IDLE]
+//   Repeat [IDLE]
+//     Count [IDLE]
+//   Inverter [IDLE]
+//     Fail [IDLE]
+//   Fallback [IDLE]
+//     Fail [IDLE]
+//     ForceSuccess [IDLE]
+//       Fail [IDLE]
+//   Parallel [IDLE]
+//     Work [IDLE]
+//     Ok [IDLE]
+//     Forever [IDLE]
+//   Timeout [IDLE]
+//     Forever [IDLE]
+// parallel all-success with a failure: FAILURE
+// error: unknown node <Jump> Jump
+// error: decorator <Inverter> needs exactly one child
+// error: no BehaviorTree with ID Missing
+use xml;
+use behavior_tree;
+
+fn leaves() -> Vec<BtLeaf> {
+    var v: Vec<BtLeaf> = Vec::new();
+    v.push(bt_leaf_condition("BatteryOK", fn(b: i64) -> i64 {
+        bb_set_int(b, "battery_checks", bb_get_int(b, "battery_checks", 0) + 1);
+        if bb_get_bool(b, "battery", true) {
+            return BT_SUCCESS;
+        }
+        return BT_FAILURE;
+    }));
+    v.push(bt_leaf_action_halt("Work", fn(b: i64) -> i64 {
+        val c: i64 = bb_get_int(b, "work", 0) + 1;
+        bb_set_int(b, "work", c);
+        if c >= 3 {
+            return BT_SUCCESS;
+        }
+        return BT_RUNNING;
+    }, fn(b: i64) -> i64 {
+        bb_set_int(b, "halted", bb_get_int(b, "halted", 0) + 1);
+        bb_set_int(b, "work", 0);
+        return 0;
+    }));
+    v.push(bt_leaf_action("Fail", fn(b: i64) -> i64 { return BT_FAILURE; }));
+    v.push(bt_leaf_action("Ok", fn(b: i64) -> i64 { return BT_SUCCESS; }));
+    v.push(bt_leaf_action("Flaky", fn(b: i64) -> i64 {
+        val c: i64 = bb_get_int(b, "flaky", 0) + 1;
+        bb_set_int(b, "flaky", c);
+        if c >= 3 {
+            return BT_SUCCESS;
+        }
+        return BT_FAILURE;
+    }));
+    v.push(bt_leaf_action("Flip", fn(b: i64) -> i64 {
+        val c: i64 = bb_get_int(b, "flip", 0) + 1;
+        bb_set_int(b, "flip", c);
+        if c % 2 == 0 {
+            return BT_SUCCESS;
+        }
+        return BT_FAILURE;
+    }));
+    v.push(bt_leaf_action("Count", fn(b: i64) -> i64 {
+        bb_set_int(b, "count", bb_get_int(b, "count", 0) + 1);
+        return BT_SUCCESS;
+    }));
+    v.push(bt_leaf_action_halt("Forever", fn(b: i64) -> i64 { return BT_RUNNING; }, fn(b: i64) -> i64 {
+        bb_set_int(b, "forever_halts", bb_get_int(b, "forever_halts", 0) + 1);
+        return 0;
+    }));
+    v.push(bt_leaf_action("SetValue", fn(b: i64) -> i64 {
+        if bt_port_set_int("output", bt_port_int("value", 0)) {
+            return BT_SUCCESS;
+        }
+        return BT_FAILURE;
+    }));
+    v.push(bt_leaf_condition("Check", fn(b: i64) -> i64 {
+        if bt_port_int("a", -1) == bt_port_int("b", -2) {
+            return BT_SUCCESS;
+        }
+        return BT_FAILURE;
+    }));
+    return v;
+}
+
+fn log_str(t: & BTree) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < t.log.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + t.log.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn two_node(kind: i64, first: str, second: str, bb: i64) -> BTree {
+    var t: BTree = bt_new(bb);
+    val lv: Vec<BtLeaf> = leaves();
+    var i: i64 = 0;
+    while i < lv.len() {
+        bt_register(&mut t, lv.get(i));
+        i = i + 1;
+    }
+    val root: i64 = bt_add_node(&mut t, kind, "root", 0, 0);
+    val c1: i64 = bt_add_leaf(&mut t, first);
+    bt_add_child(&mut t, root, c1);
+    val c2: i64 = bt_add_leaf(&mut t, second);
+    bt_add_child(&mut t, root, c2);
+    return t;
+}
+
+fn main() -> i64 {
+    val bb: i64 = bb_new();
+    bb_set_int(bb, "n", 3);
+    bb_set_float(bb, "speed", 1.5);
+    bb_set_str(bb, "name", "robot");
+    bb_set_bool(bb, "armed", true);
+    println("bb: n=" + bb_get_str(bb, "n", "?") + " kind=" + int_to_str(bb_kind(bb, "n")) + " n as float=" + fmt4(bb_get_float(bb, "n", 0.0)) + " speed as int=" + int_to_str(bb_get_int(bb, "speed", 0)) + " armed=" + bb_get_str(bb, "armed", "?") + " missing=" + bt_b(bb_get_bool(bb, "missing", false)) + " name=" + bb_get_str(bb, "name", "?"));
+
+    val b1: i64 = bb_new();
+    var t1: BTree = two_node(BTK_REACTIVE_SEQUENCE, "BatteryOK", "Work", b1);
+    val s1: i64 = bt_tick(&mut t1, 0.0);
+    bb_set_bool(b1, "battery", false);
+    val s2: i64 = bt_tick(&mut t1, 10.0);
+    println("reactive: " + bt_status_str(s1) + " " + bt_status_str(s2) + " halted=" + int_to_str(bb_get_int(b1, "halted", 0)) + " work=" + int_to_str(bb_get_int(b1, "work", -1)));
+    println("reactive log: " + log_str(&t1));
+
+    val b2: i64 = bb_new();
+    var t2: BTree = two_node(BTK_SEQUENCE, "BatteryOK", "Work", b2);
+    var s: str = "sequence:";
+    var k: i64 = 0;
+    while k < 3 {
+        s = s + " " + bt_status_str(bt_tick(&mut t2, (k * 10) as f64));
+        k = k + 1;
+    }
+    println(s + " battery checks=" + int_to_str(bb_get_int(b2, "battery_checks", 0)));
+
+    val b3: i64 = bb_new();
+    var t3: BTree = two_node(BTK_SEQUENCE_MEM, "Count", "Flip", b3);
+    val m1: i64 = bt_tick(&mut t3, 0.0);
+    val m2: i64 = bt_tick(&mut t3, 1.0);
+    val b4: i64 = bb_new();
+    var t4: BTree = two_node(BTK_SEQUENCE, "Count", "Flip", b4);
+    val p1: i64 = bt_tick(&mut t4, 0.0);
+    val p2: i64 = bt_tick(&mut t4, 1.0);
+    println("memory: " + bt_status_str(m1) + " " + bt_status_str(m2) + " count=" + int_to_str(bb_get_int(b3, "count", 0)) + " / plain: " + bt_status_str(p1) + " " + bt_status_str(p2) + " count=" + int_to_str(bb_get_int(b4, "count", 0)));
+
+    val xmltext: str = "<root BTCPP_format=\"4\" main_tree_to_execute=\"Main\">\n" +
+        "  <BehaviorTree ID=\"Main\">\n" +
+        "    <Sequence name=\"main_seq\">\n" +
+        "      <SetValue value=\"42\" output=\"{x}\"/>\n" +
+        "      <Condition ID=\"Check\" a=\"{x}\" b=\"42\"/>\n" +
+        "      <RetryUntilSuccessful num_attempts=\"5\"><Action ID=\"Flaky\"/></RetryUntilSuccessful>\n" +
+        "      <Repeat num_cycles=\"3\"><Count/></Repeat>\n" +
+        "      <Inverter><Fail/></Inverter>\n" +
+        "      <Fallback><Fail/><SubTree ID=\"Sub\"/></Fallback>\n" +
+        "      <Parallel success_count=\"2\" failure_count=\"2\"><Work/><Ok/><Forever/></Parallel>\n" +
+        "      <Timeout msec=\"100\"><Forever/></Timeout>\n" +
+        "    </Sequence>\n" +
+        "  </BehaviorTree>\n" +
+        "  <BehaviorTree ID=\"Sub\"><ForceSuccess><Fail/></ForceSuccess></BehaviorTree>\n" +
+        "</root>\n";
+    val bx: i64 = bb_new();
+    val lv: Vec<BtLeaf> = leaves();
+    val ld: BtLoad = bt_from_xml(xmltext, &lv, bx);
+    var tx: BTree = ld.tree;
+    println("xml ok=" + bt_b(ld.ok) + " root=" + tx.nodes.get(tx.root).name + ld.error);
+    var times: Vec<f64> = Vec::new();
+    times.push(0.0); times.push(10.0); times.push(20.0); times.push(60.0); times.push(120.0);
+    s = "xml ticks:";
+    k = 0;
+    while k < times.len() {
+        s = s + " " + bt_status_str(bt_tick(&mut tx, times.get(k)));
+        k = k + 1;
+    }
+    println(s);
+    println("x=" + int_to_str(bb_get_int(bx, "x", 0)) + " flaky=" + int_to_str(bb_get_int(bx, "flaky", 0)) + " count=" + int_to_str(bb_get_int(bx, "count", 0)) + " work=" + int_to_str(bb_get_int(bx, "work", 0)) + " forever halts=" + int_to_str(bb_get_int(bx, "forever_halts", 0)));
+    println("xml log: " + log_str(&tx));
+    val dump: str = bt_dump(&tx);
+    println(str_trim_end(dump));
+
+    val bp: i64 = bb_new();
+    var tp: BTree = two_node(BTK_PARALLEL, "Ok", "Fail", bp);
+    var pn: BtNode = tp.nodes.get(tp.root);
+    pn.p1 = -1;
+    pn.p2 = 1;
+    tp.nodes.set(tp.root, pn);
+    println("parallel all-success with a failure: " + bt_status_str(bt_tick(&mut tp, 0.0)));
+
+    println("error: " + bt_from_xml("<root><BehaviorTree ID=\"A\"><Sequence><Jump/></Sequence></BehaviorTree></root>", &lv, bx).error);
+    println("error: " + bt_from_xml("<root><BehaviorTree ID=\"A\"><Inverter><Ok/><Ok/></Inverter></BehaviorTree></root>", &lv, bx).error);
+    println("error: " + bt_from_xml("<root main_tree_to_execute=\"Missing\"><BehaviorTree ID=\"A\"><Ok/></BehaviorTree></root>", &lv, bx).error);
+    return 0;
+}
+
+fn fmt4(x: f64) -> str {
+    val v: i64 = (x * 10000.0 + 0.5) as i64;
+    var f: str = int_to_str(v % 10000);
+    while str_len(f) < 4 {
+        f = "0" + f;
+    }
+    return int_to_str(v / 10000) + "." + f;
+}
+
+fn bt_b(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

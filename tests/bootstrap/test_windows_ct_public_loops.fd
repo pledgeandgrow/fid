@@ -1,0 +1,150 @@
+// test_windows_ct_public_loops.fd — release J7 on the default Windows
+// backend (compiler/pe_ir.fd peir_ct_check): @constant_time code that loops
+// on public counters and lengths, keeps secrets in locals, struct fields,
+// Vec elements and an `&mut` out-parameter, and never branches or divides
+// on them. The source-level check and the backend's check both accept it,
+// so `fid emit` builds it and every backend prints the same.
+// Rejected programs: scripts/pe-ct-check.sh (the backend's check alone).
+//
+// Expected output:
+// 84
+// 1
+// 0
+// 1 2
+// 10 20
+// 2 1
+// 1 2
+// 14
+
+struct Pair {
+    lo: i64,
+    hi: i64,
+}
+
+/// All ones when bit is 1, zero when it is 0.
+@constant_time
+@wrapping
+fn ct_mask(bit: i64) -> i64 {
+    return 0 - (bit & 1);
+}
+
+/// a when bit is 1, b when it is 0, by masks.
+@constant_time
+@wrapping
+fn ct_select_pair(a: Pair, b: Pair, bit: i64) -> Pair {
+    val m = ct_mask(bit);
+    return Pair {
+        lo: (a.lo & m) | (b.lo & ~m), hi: (a.hi & m) | (b.hi & ~m)
+    };
+}
+
+/// Sum of a secret buffer: the loop runs to its (public) length.
+@constant_time
+@wrapping
+fn ct_sum(v: & Vec<i64>) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        acc = acc + v.get(i);
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// 1 when two secret buffers of the same length are equal, else 0, with no
+/// early exit: the OR of the XORs.
+@constant_time
+@wrapping
+fn ct_eq_bytes(a: & Vec<i64>, b: & Vec<i64>) -> i64 {
+    var diff: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        diff = diff | (a.get(i) ^ b.get(i));
+        i = i + 1;
+    }
+    val nz = ((diff | (0 - diff)) >> 63) & 1;
+    return 1 - nz;
+}
+
+/// Three rounds over a secret struct: swapped when bit is 1.
+@constant_time
+@wrapping
+fn ct_mix(p: Pair, bit: i64) -> Pair {
+    var cur: Pair = p;
+    var r: i64 = 0;
+    while r < 3 {
+        val swapped = Pair {
+            lo: cur.hi, hi: cur.lo
+        };
+        cur = ct_select_pair(swapped, cur, bit);
+        r = r + 1;
+    }
+    return cur;
+}
+
+/// Stores a secret through an out-parameter.
+@constant_time
+fn ct_store(out: &mut i64, v: i64) {
+    *out = v;
+}
+
+/// The secret comes back through `tmp`; the loop bound stays public.
+@constant_time
+@wrapping
+fn ct_twice(x: i64) -> i64 {
+    var tmp: i64 = 0;
+    ct_store(&mut tmp, x);
+    var r: i64 = 0;
+    var k: i64 = 0;
+    while k < 2 {
+        r = r + tmp;
+        k = k + 1;
+    }
+    return r;
+}
+
+fn main() {
+    var a: Vec<i64> = Vec::new();
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        a.push(i * 3);
+        b.push(i * 3);
+        i = i + 1;
+    }
+    print(ct_sum(& a));
+    print("\n");
+    print(ct_eq_bytes(& a, & b));
+    print("\n");
+    b.set(5, 0);
+    print(ct_eq_bytes(& a, & b));
+    print("\n");
+    val p = Pair {
+        lo: 1, hi: 2
+    };
+    val q = Pair {
+        lo: 10, hi: 20
+    };
+    val s1 = ct_select_pair(p, q, 1);
+    print(s1.lo);
+    print(" ");
+    print(s1.hi);
+    print("\n");
+    val s0 = ct_select_pair(p, q, 0);
+    print(s0.lo);
+    print(" ");
+    print(s0.hi);
+    print("\n");
+    val m1 = ct_mix(p, 1);
+    print(m1.lo);
+    print(" ");
+    print(m1.hi);
+    print("\n");
+    val m0 = ct_mix(p, 0);
+    print(m0.lo);
+    print(" ");
+    print(m0.hi);
+    print("\n");
+    print(ct_twice(7));
+    print("\n");
+}

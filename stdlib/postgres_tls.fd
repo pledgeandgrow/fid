@@ -1,0 +1,65 @@
+// Fides PostgreSQL over TLS: module `postgres` with its transport seam
+// (PgIo) filled from module `tls` (OpenSSL on Linux and macOS, Schannel on
+// Windows). Kept apart from `postgres` so a program that talks in clear
+// does not need a TLS library.
+//
+// The exchange (https://www.postgresql.org/docs/current/protocol-flow.html
+// § SSL Session Encryption): connect, send SSLRequest, read the server's
+// one-byte answer; 'S' starts the TLS handshake on the same socket and the
+// startup (authentication included) then runs inside the session; 'N'
+// means the server has no TLS: PG_SSL_PREFER goes on in clear,
+// PG_SSL_REQUIRE gives up. The server's certificate is always checked
+// against the system's trust store and its name against `host` (libpq's
+// sslmode=verify-full); there is no unchecked mode.
+//
+// Usage:
+//   use postgres; use postgres_tls;
+//   var c: PgConn = pg_connect_tls("db.example.com", 5432, "app", "secret", "appdb", PG_SSL_REQUIRE);
+//   if !c.ok { println(c.error); return 1; }
+//   println(pg_query(& c, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()").rows);
+//   pg_close(& mut c);
+
+module postgres_tls;
+ use postgres; use tls;
+
+/// The TLS handshake on the connected socket `fd`, checking `host`'s
+/// certificate. 0 on failure.
+pub fn pg_tls_start(fd: i64, host: str) -> i64 {
+    return tls_client(fd, host);
+}
+
+/// Write through the TLS session `s`.
+pub fn pg_tls_send(s: i64, addr: i64, n: i64) -> i64 {
+    return tls_session_send(s, addr, n);
+}
+
+/// Read through the TLS session `s`.
+pub fn pg_tls_recv(s: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
+    return tls_session_recv(s, addr, n, timeout_ms);
+}
+
+/// End the TLS session `s` (the socket stays open).
+pub fn pg_tls_close(s: i64) -> i64 {
+    return tls_session_close(s);
+}
+
+/// The transport through module `tls`.
+pub fn pg_tls_io() -> PgIo {
+    return PgIo {
+        send: pg_tls_send, recv: pg_tls_recv, close: pg_tls_close, start: pg_tls_start,
+    };
+}
+
+/// Connect to host:port and log in, asking for TLS first: `sslmode`
+/// PG_SSL_REQUIRE (TLS or no connection), PG_SSL_PREFER (TLS when the
+/// server has it) or PG_SSL_DISABLE (as pg_connect). `c.tls` says whether
+/// the session is encrypted.
+pub fn pg_connect_tls(host: str, port: i64, user: str, password: str, database: str, sslmode: i64) -> PgConn {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        var c: PgConn = pg_conn_new(fd, user, password);
+        c.error = "cannot connect to " + host + ":" + int_to_str(port);
+        return c;
+    }
+    return pg_connect_io(fd, host, user, password, database, sslmode, pg_plain_io(), pg_tls_io());
+}

@@ -1,0 +1,180 @@
+// DB2 (docs/roadmap/llvm-roadmap.md): DW_AT_decl_line from the `fn` line
+// (compiler/nat_enc.fd nat_dbg_decl_line, nat_dwarf_build,
+// nat_macho_dwarf). The functions of tests/bootstrap/test_nattools_decl_lines.fd
+// are looked up from the line of their body's first statement (what the
+// first line row holds): each must come back as its `fn` line, past doc
+// comments, an annotation-free method in an impl, a signature over three
+// lines, blank lines and a comment naming `fn sum_to` inside the body.
+// A closure, a file that cannot be read and a line past the end keep the
+// row's line. Then the DWARF writers themselves: nat_macho_dwarf (a Mach-O
+// image's __debug_info) and nat_dwarf_build (ELF and `--nat` PE, with
+// frame bases: g_nat_dbg_ext) must write those lines as DW_AT_decl_line.
+// Run (from the repository root):
+//   fid run tests/nattools/decl_line_unit.fd
+// Expected output:
+// Tally_add_upto 28 -> 25
+// sum_to 43 -> 40
+// weighted 55 -> 52
+// repeat_len__i64 67 -> 64
+// main 78 -> 76
+// __closure_1 43 -> 43
+// missing file 43 -> 43
+// past the end 500 -> 500
+// macho main decl 1:76
+// macho Tally::add_upto decl 1:25
+// elf main decl 1:76
+// elf Tally::add_upto decl 1:25
+
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn le16(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn src_path() -> str {
+    return "tests/bootstrap/test_nattools_decl_lines.fd";
+}
+
+fn look(src: &mut NatDeclSrc, path: str, line: i64, name: str, shown: str, label: str) {
+    var got: i64 = nat_dbg_decl_line(src, path, line, name, shown);
+    println(label + " " + int_to_str(line) + " -> " + int_to_str(got));
+}
+
+/// The offset in `b` just past the bytes of `s` and its NUL, where `s`
+/// follows the byte `code`; -1 when it is not there.
+fn after_name(b: &Vec<i64>, code: i64, s: str) -> i64 {
+    var n: i64 = str_len(s);
+    var i: i64 = 1;
+    while i + n < b.len() {
+        if b.get(i - 1) == code {
+            var k: i64 = 0;
+            while k < n && b.get(i + k) == str_byte_at(s, k) {
+                k = k + 1;
+            }
+            if k == n && b.get(i + n) == 0 {
+                return i + n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Past the linkage name `link` and its NUL at `p` (`p` itself when `link`
+/// is ""); -1 when it is not there.
+fn with_link(b: &Vec<i64>, p: i64, link: str) -> i64 {
+    var n: i64 = str_len(link);
+    if p < 0 || n == 0 {
+        return p;
+    }
+    var k: i64 = 0;
+    while k < n && p + k < b.len() && b.get(p + k) == str_byte_at(link, k) {
+        k = k + 1;
+    }
+    if k == n && p + n < b.len() && b.get(p + n) == 0 {
+        return p + n + 1;
+    }
+    return 0 - 1;
+}
+
+/// nat_macho_dwarf's entry (code 2, or 3 with a linkage name `link`):
+/// name, [link], low (8), size (8), decl_file (2), decl_line (4).
+fn macho_decl(info: &Vec<i64>, shown: str, link: str) {
+    var code: i64 = 2;
+    if str_len(link) > 0 {
+        code = 3;
+    }
+    var p: i64 = with_link(info, after_name(info, code, shown), link);
+    if p < 0 {
+        println("macho " + shown + " missing");
+        return;
+    }
+    p = p + 16;
+    println("macho " + shown + " decl " + int_to_str(le16(info, p)) + ":" + int_to_str(le32(info, p + 2)));
+}
+
+/// nat_dwarf_build's entry with a frame base (code 7, or 8 with a linkage
+/// name): name, [link], low (8), size (8), frame_base (exprloc: 1, 0x9C),
+/// decl_file (2), decl_line (4).
+fn elf_decl(info: &Vec<i64>, shown: str, link: str) {
+    var code: i64 = 7;
+    if str_len(link) > 0 {
+        code = 8;
+    }
+    var p: i64 = with_link(info, after_name(info, code, shown), link);
+    if p < 0 {
+        println("elf " + shown + " missing");
+        return;
+    }
+    p = p + 18;
+    println("elf " + shown + " decl " + int_to_str(le16(info, p)) + ":" + int_to_str(le32(info, p + 2)));
+}
+
+fn main() {
+    var src: NatDeclSrc = NatDeclSrc_new();
+    var path: str = src_path();
+    look(& mut src, path, 28, "Tally_add_upto", "Tally::add_upto", "Tally_add_upto");
+    look(& mut src, path, 43, "sum_to", "", "sum_to");
+    look(& mut src, path, 55, "weighted", "", "weighted");
+    look(& mut src, path, 67, "repeat_len__i64", "repeat_len<i64>", "repeat_len__i64");
+    look(& mut src, path, 78, "main", "", "main");
+    look(& mut src, path, 43, "__closure_1", "", "__closure_1");
+    look(& mut src, "tests/bootstrap/no_such_file_db2.fd", 43, "sum_to", "", "missing file");
+    look(& mut src, path, 500, "main", "", "past the end");
+
+    // the writers: main at [0, 64), Tally_add_upto at [64, 128), each
+    // with one row at its body's first statement
+    nat_line_files_reset(path);
+    var names: Vec<str> = Vec::new();
+    names.push("main");
+    names.push("Tally_add_upto");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(64);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    ends.push(128);
+    var rows: Vec<i64> = Vec::new();
+    rows.push(0);
+    rows.push(78);
+    rows.push(0);
+    rows.push(64);
+    rows.push(0);
+    rows.push(1);
+    rows.push(64);
+    rows.push(28);
+    rows.push(0);
+    rows.push(128);
+    rows.push(0);
+    rows.push(1);
+    var shown: Vec<str> = Vec::new();
+    shown.push("");
+    shown.push("Tally::add_upto");
+    g_nat_dbg_shown = shown;
+    var parts: Vec<Vec<i64>> = nat_macho_dwarf(& names, & starts, ends, path, rows, 0x100000000);
+    var minfo: Vec<i64> = parts.get(1);
+    macho_decl(& minfo, "main", "");
+    macho_decl(& minfo, "Tally::add_upto", "Tally_add_upto");
+
+    var image: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 128 {
+        image.push(0);
+        k = k + 1;
+    }
+    g_nat_dbg_ext = true;
+    var no_cfi: Vec<i64> = Vec::new();
+    var dw: NatDwarf = nat_dwarf_build(NAT_X64, image, 0x400000, names, starts, ends, path, rows, no_cfi, false);
+    g_nat_dbg_ext = false;
+    g_nat_dbg_shown = Vec::new();
+    var einfo: Vec<i64> = dw.info;
+    elf_decl(& einfo, "main", "");
+    elf_decl(& einfo, "Tally::add_upto", "Tally_add_upto");
+}

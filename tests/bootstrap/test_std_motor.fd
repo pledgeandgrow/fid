@@ -1,0 +1,188 @@
+// stdlib/motor: H-bridge commands with current fold-back, DC motor steady state, stepper tables, step timing (exact and Austin's ramp, values from a Python replica), servo pulses, BLDC six-step, Clarke/Park/SVPWM (checked against dwell-time SVPWM), quadrature decoding
+// Expected output:
+// fwd 0.5: in1=true in2=false duty=0.4750 mode=1 compare=475
+// rev -0.8 at 4 A: in1=false in2=true duty=0.3800 limited=true
+// rev -0.8 at 1 A: duty=0.4180 limited=false
+// zero: mode=0, with brake: mode=3
+// dc model 12 V: 239.044 rad/s (steady 239.044)
+// full: (1,1) (-1,1) (-1,-1) (1,-1)
+// half: (1,0) (1,1) (0,1) (-1,1) (-1,0) (-1,-1) (0,-1) (1,-1)
+// micro 4 dac: 100,0 92,38 71,71 38,92 0,100
+// unipolar: 1 3 2 6 4 12 8 9
+// exact 200 steps: total=0.894427 first=0.044721 min=0.002242
+// exact 1000 steps: total=2.500000 min=0.002000
+// ramp 200: steps=200 pos=200 time=0.836225 min=0.002231
+// ramp 1000: steps=1000 time=2.470755 min=0.002000
+// ramp -50: steps=50 pos=-50 time=0.391204
+// servo 90=1500 45=1250 1750us=135 2500us=180 ticks=1500 1688
+// hall 1 s0 A+B- rev B+A-
+// hall 3 s1 A+C- rev C+A-
+// hall 2 s2 B+C- rev C+B-
+// hall 6 s3 B+A- rev A+B-
+// hall 4 s4 C+A- rev A+C-
+// hall 5 s5 C+B- rev B+C-
+// hall 0 off hall 7 off
+// clarke(1,-0.5) = 1.0000 0.0000
+// clarke3 = 0.3000 0.7506 park = 0.7130 0.3808
+// round trip = 0.3000 0.5000 -0.8000
+// svpwm (0.5,0.2)/1 = 0.9616 0.3848 0.0384 sector 1
+// svpwm (1,0)/1 limited = 0.9330 0.0670 0.0670
+// svpwm (-3,5)/12 = 0.1321 0.8679 0.1462 sector 3
+// encoder count=7 errors=1 angle=0.1100 speed=10.9956
+use math;
+use quat;
+use motor;
+use string;
+
+fn coil(c: StepCoils) -> str {
+    return "(" + int_to_str(motor_round(c.a)) + "," + int_to_str(motor_round(c.b)) + ")";
+}
+
+fn min_of(v: & Vec<f64>) -> f64 {
+    var m: f64 = 1.0e9;
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) < m {
+            m = v.get(i);
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn sum_of(v: & Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn ramp(target: i64) -> str {
+    var g: StepGen = stepgen_new(1000.0, 500.0);
+    stepgen_move_to(&mut g, target);
+    var steps: i64 = 0;
+    var t: f64 = 0.0;
+    var mn: f64 = 1.0e9;
+    var d: f64 = stepgen_next(&mut g);
+    while d > 0.0 {
+        steps = steps + 1;
+        t = t + d;
+        mn = rmath_min(mn, d);
+        d = stepgen_next(&mut g);
+    }
+    return "steps=" + int_to_str(steps) + " pos=" + int_to_str(g.pos) + " time=" + rmath_fmt(t, 6) + " min=" + rmath_fmt(mn, 6);
+}
+
+fn main() -> i64 {
+    var m: DcMotor = dcm_new(0.95, 2.0);
+    val h1: HBridge = dcm_command(&mut m, 0.5, 1.0);
+    println("fwd 0.5: in1=" + bool_to_str(h1.in1) + " in2=" + bool_to_str(h1.in2) + " duty=" + rmath_fmt(h1.duty, 4) + " mode=" + int_to_str(h1.mode) + " compare=" + int_to_str(motor_pwm_compare(h1.duty, 1000)));
+    val h2: HBridge = dcm_command(&mut m, -0.8, 4.0);
+    println("rev -0.8 at 4 A: in1=" + bool_to_str(h2.in1) + " in2=" + bool_to_str(h2.in2) + " duty=" + rmath_fmt(h2.duty, 4) + " limited=" + bool_to_str(m.limited));
+    val h3: HBridge = dcm_command(&mut m, -0.8, 1.0);
+    println("rev -0.8 at 1 A: duty=" + rmath_fmt(h3.duty, 4) + " limited=" + bool_to_str(m.limited));
+    val h4: HBridge = dcm_command(&mut m, 0.0, 0.0);
+    dcm_set_brake_at_zero(&mut m, true);
+    val h5: HBridge = dcm_command(&mut m, 0.0, 0.0);
+    println("zero: mode=" + int_to_str(h4.mode) + ", with brake: mode=" + int_to_str(h5.mode));
+
+    var dm: DcModel = dcmodel_new(1.0, 0.001, 0.05, 0.05, 0.0001, 0.00001);
+    var k: i64 = 0;
+    while k < 2000 {
+        dcmodel_step(&mut dm, 12.0, 0.0, 0.001, 10);
+        k = k + 1;
+    }
+    println("dc model 12 V: " + rmath_fmt(dm.w, 3) + " rad/s (steady " + rmath_fmt(dcmodel_steady_speed(&dm, 12.0), 3) + ")");
+
+    var s: str = "full:";
+    var p: i64 = 0;
+    while p < 4 {
+        s = s + " " + coil(stp_coils(STEP_FULL, p, 1));
+        p = p + 1;
+    }
+    println(s);
+    s = "half:";
+    p = 0;
+    while p < 8 {
+        s = s + " " + coil(stp_coils(STEP_HALF, p, 1));
+        p = p + 1;
+    }
+    println(s);
+    s = "micro 4 dac:";
+    p = 0;
+    while p <= 4 {
+        val dac: Vec<i64> = stp_dac(stp_coils(STEP_MICRO, p, 4), 100);
+        s = s + " " + int_to_str(dac.get(0)) + "," + int_to_str(dac.get(1));
+        p = p + 1;
+    }
+    println(s);
+    s = "unipolar:";
+    p = 0;
+    while p < 8 {
+        s = s + " " + int_to_str(stp_unipolar_half_bits(p));
+        p = p + 1;
+    }
+    println(s);
+
+    val e1: Vec<f64> = stp_plan_exact(200, 1000.0, 500.0);
+    println("exact 200 steps: total=" + rmath_fmt(sum_of(&e1), 6) + " first=" + rmath_fmt(e1.get(0), 6) + " min=" + rmath_fmt(min_of(&e1), 6));
+    val e2: Vec<f64> = stp_plan_exact(1000, 1000.0, 500.0);
+    println("exact 1000 steps: total=" + rmath_fmt(sum_of(&e2), 6) + " min=" + rmath_fmt(min_of(&e2), 6));
+    println("ramp 200: " + ramp(200));
+    val r2: str = ramp(1000);
+    println("ramp 1000: " + str_replace(r2, " pos=1000", ""));
+    val r3: str = ramp(-50);
+    println("ramp -50: " + str_slice(r3, 0, str_len(r3) - 13));
+
+    val sv: Servo = servo_new(1000.0, 2000.0, 0.0, 180.0);
+    println("servo 90=" + rmath_fmt(servo_pulse_us(&sv, 90.0), 0) + " 45=" + rmath_fmt(servo_pulse_us(&sv, 45.0), 0) + " 1750us=" + rmath_fmt(servo_angle(&sv, 1750.0), 0) + " 2500us=" + rmath_fmt(servo_angle(&sv, 2500.0), 0) + " ticks=" + int_to_str(servo_ticks(1500.0, 1000000.0)) + " " + int_to_str(servo_ticks(1500.0, 1125000.0)));
+
+    var halls: Vec<i64> = Vec::new();
+    halls.push(1); halls.push(3); halls.push(2); halls.push(6); halls.push(4); halls.push(5);
+    var i: i64 = 0;
+    while i < 6 {
+        val hc: i64 = halls.get(i);
+        println("hall " + int_to_str(hc) + " s" + int_to_str(bldc_sector_from_hall(hc)) + " " + bldc_drive_str(bldc_commutate(hc, true)) + " rev " + bldc_drive_str(bldc_commutate(hc, false)));
+        i = i + 1;
+    }
+    println("hall 0 " + bldc_drive_str(bldc_commutate(0, true)) + " hall 7 " + bldc_drive_str(bldc_commutate(7, true)));
+
+    val c1: Ab = foc_clarke(1.0, -0.5);
+    println("clarke(1,-0.5) = " + rmath_fmt(c1.x, 4) + " " + rmath_fmt(c1.y, 4));
+    val c3: Ab = foc_clarke3(Abc { a: 0.3, b: 0.5, c: -0.8 });
+    val dq: Ab = foc_park(c3, 0.7);
+    println("clarke3 = " + rmath_fmt(c3.x, 4) + " " + rmath_fmt(c3.y, 4) + " park = " + rmath_fmt(dq.x, 4) + " " + rmath_fmt(dq.y, 4));
+    val back: Abc = foc_inv_clarke(foc_inv_park(dq, 0.7));
+    println("round trip = " + rmath_fmt(back.a, 4) + " " + rmath_fmt(back.b, 4) + " " + rmath_fmt(back.c, 4));
+    val v1: Ab = Ab { x: 0.5, y: 0.2 };
+    val d1: Abc = foc_svpwm(v1, 1.0);
+    println("svpwm (0.5,0.2)/1 = " + rmath_fmt(d1.a, 4) + " " + rmath_fmt(d1.b, 4) + " " + rmath_fmt(d1.c, 4) + " sector " + int_to_str(foc_sector(v1)));
+    val d2: Abc = foc_svpwm(Ab { x: 1.0, y: 0.0 }, 1.0);
+    println("svpwm (1,0)/1 limited = " + rmath_fmt(d2.a, 4) + " " + rmath_fmt(d2.b, 4) + " " + rmath_fmt(d2.c, 4));
+    val v3: Ab = Ab { x: -3.0, y: 5.0 };
+    val d3: Abc = foc_svpwm(v3, 12.0);
+    println("svpwm (-3,5)/12 = " + rmath_fmt(d3.a, 4) + " " + rmath_fmt(d3.b, 4) + " " + rmath_fmt(d3.c, 4) + " sector " + int_to_str(foc_sector(v3)));
+
+    var enc: QuadEnc = qenc_new(100, false, false);
+    var q: i64 = 1;
+    while q <= 10 {
+        val pat: i64 = qenc_pattern(q);
+        qenc_update(&mut enc, (pat & 2) != 0, (pat & 1) != 0);
+        q = q + 1;
+    }
+    q = 9;
+    while q >= 7 {
+        val pat: i64 = qenc_pattern(q);
+        qenc_update(&mut enc, (pat & 2) != 0, (pat & 1) != 0);
+        q = q - 1;
+    }
+    // the state is now pattern 7 (10); jumping to 01 changes both lines
+    qenc_update(&mut enc, false, true);
+    val ang: f64 = qenc_angle(&enc);
+    val spd: f64 = qenc_speed(&mut enc, 0.01);
+    println("encoder count=" + int_to_str(enc.count) + " errors=" + int_to_str(enc.errors) + " angle=" + rmath_fmt(ang, 4) + " speed=" + rmath_fmt(spd, 4));
+    return 0;
+}

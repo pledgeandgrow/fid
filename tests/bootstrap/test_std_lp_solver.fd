@@ -1,0 +1,137 @@
+// stdlib/lp_solver: two-phase simplex (Bland's rule), dual values and branch and bound
+// Problems and known optima: Wyndor Glass and radiation therapy (Hillier &
+// Lieberman, Introduction to Operations Research, ch. 3-4 and 6), Beale's
+// 1955 cycling example (optimum -1/20), Telfa (Winston, Operations Research,
+// branch and bound: LP 41.25, integer 40 at (5, 0)) and the 0-1 knapsack
+// 8x1+11x2+6x3+4x4, 5x1+7x2+4x3+3x4 <= 14 (LP 22, integer 21). All optima and
+// duals were also checked with scipy.optimize (HiGHS).
+// Expected output:
+// wyndor optimal z=36.0000 x=(2.0000, 6.0000) duals=(0.0000, 1.5000, 1.0000)
+// radiation optimal z=5.2500 x=(7.5000, 4.5000) duals=(-0.5000, 1.1000, 0.0000)
+// beale optimal z=-0.0500 x4=0.0400 x6=1.0000, bland only: optimal z=-0.0500
+// infeasible: infeasible
+// unbounded: unbounded
+// telfa lp optimal z=41.2500 x=(3.7500, 2.2500)
+// telfa ip optimal z=40.0000 x=(5.0000, 0.0000)
+// knapsack lp z=22.0000 ip z=21.0000 x=0 1 1 1
+// equality with redundant row: optimal z=6.0000 x=(1.0000, 2.0000)
+use lp_solver;
+use math;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn main() {
+    // Wyndor: max 3x1 + 5x2, x1 <= 4, 2x2 <= 12, 3x1 + 2x2 <= 18
+    var w = lp_new(2, true);
+    lp_set_objective(&mut w, 0, 3.0);
+    lp_set_objective(&mut w, 1, 5.0);
+    lp_add_constraint(&mut w, lp_row2(1.0, 0.0), LP_LE, 4.0);
+    lp_add_constraint(&mut w, lp_row2(0.0, 2.0), LP_LE, 12.0);
+    lp_add_constraint(&mut w, lp_row2(3.0, 2.0), LP_LE, 18.0);
+    val rw = lp_solve(&w);
+    println("wyndor " + lp_status_name(rw.status) + " z=" + fx(rw.objective, 4) + " x=(" + fx(rw.x.get(0), 4) + ", " + fx(rw.x.get(1), 4) + ") duals=(" + fx(rw.duals.get(0), 4) + ", " + fx(rw.duals.get(1), 4) + ", " + fx(rw.duals.get(2), 4) + ")");
+
+    // Radiation therapy: min 0.4x1 + 0.5x2, 0.3x1 + 0.1x2 <= 2.7,
+    // 0.5x1 + 0.5x2 = 6, 0.6x1 + 0.4x2 >= 6 (needs phase 1)
+    var r = lp_new(2, false);
+    lp_set_objective(&mut r, 0, 0.4);
+    lp_set_objective(&mut r, 1, 0.5);
+    lp_add_constraint(&mut r, lp_row2(0.3, 0.1), LP_LE, 2.7);
+    lp_add_constraint(&mut r, lp_row2(0.5, 0.5), LP_EQ, 6.0);
+    lp_add_constraint(&mut r, lp_row2(0.6, 0.4), LP_GE, 6.0);
+    val rr = lp_solve(&r);
+    println("radiation " + lp_status_name(rr.status) + " z=" + fx(rr.objective, 4) + " x=(" + fx(rr.x.get(0), 4) + ", " + fx(rr.x.get(1), 4) + ") duals=(" + fx(rr.duals.get(0), 4) + ", " + fx(rr.duals.get(1), 4) + ", " + fx(rr.duals.get(2), 4) + ")");
+
+    // Beale: cycles under the textbook largest-coefficient rule
+    var b = lp_new(4, false);
+    lp_set_objective(&mut b, 0, -0.75);
+    lp_set_objective(&mut b, 1, 150.0);
+    lp_set_objective(&mut b, 2, -0.02);
+    lp_set_objective(&mut b, 3, 6.0);
+    lp_add_constraint(&mut b, lp_row4(0.25, -60.0, -0.04, 9.0), LP_LE, 0.0);
+    lp_add_constraint(&mut b, lp_row4(0.5, -90.0, -0.02, 3.0), LP_LE, 0.0);
+    lp_add_constraint(&mut b, lp_row4(0.0, 0.0, 1.0, 0.0), LP_LE, 1.0);
+    val rb = lp_solve(&b);
+    b.bland_only = true;
+    val rb2 = lp_solve(&b);
+    println("beale " + lp_status_name(rb.status) + " z=" + fx(rb.objective, 4) + " x4=" + fx(rb.x.get(0), 4) + " x6=" + fx(rb.x.get(2), 4) + ", bland only: " + lp_status_name(rb2.status) + " z=" + fx(rb2.objective, 4));
+
+    // x1 + x2 <= 1 and x1 + x2 >= 2
+    var inf = lp_new(2, true);
+    lp_set_objective(&mut inf, 0, 1.0);
+    lp_add_constraint(&mut inf, lp_row2(1.0, 1.0), LP_LE, 1.0);
+    lp_add_constraint(&mut inf, lp_row2(1.0, 1.0), LP_GE, 2.0);
+    println("infeasible: " + lp_status_name(lp_solve(&inf).status));
+
+    // max x1 + x2 with x1 - x2 <= 1
+    var unb = lp_new(2, true);
+    lp_set_objective(&mut unb, 0, 1.0);
+    lp_set_objective(&mut unb, 1, 1.0);
+    lp_add_constraint(&mut unb, lp_row2(1.0, -1.0), LP_LE, 1.0);
+    println("unbounded: " + lp_status_name(lp_solve(&unb).status));
+
+    // Telfa: max 8x1 + 5x2, x1 + x2 <= 6, 9x1 + 5x2 <= 45, integer
+    var t = lp_new(2, true);
+    lp_set_objective(&mut t, 0, 8.0);
+    lp_set_objective(&mut t, 1, 5.0);
+    lp_add_constraint(&mut t, lp_row2(1.0, 1.0), LP_LE, 6.0);
+    lp_add_constraint(&mut t, lp_row2(9.0, 5.0), LP_LE, 45.0);
+    val tl = lp_solve(&t);
+    println("telfa lp " + lp_status_name(tl.status) + " z=" + fx(tl.objective, 4) + " x=(" + fx(tl.x.get(0), 4) + ", " + fx(tl.x.get(1), 4) + ")");
+    lp_set_integer(&mut t, 0);
+    lp_set_integer(&mut t, 1);
+    val ti = lp_solve_mip(&t);
+    println("telfa ip " + lp_status_name(ti.status) + " z=" + fx(ti.objective, 4) + " x=(" + fx(ti.x.get(0), 4) + ", " + fx(ti.x.get(1), 4) + ")");
+
+    // 0-1 knapsack
+    var k = lp_new(4, true);
+    lp_set_objective(&mut k, 0, 8.0);
+    lp_set_objective(&mut k, 1, 11.0);
+    lp_set_objective(&mut k, 2, 6.0);
+    lp_set_objective(&mut k, 3, 4.0);
+    lp_add_constraint(&mut k, lp_row4(5.0, 7.0, 4.0, 3.0), LP_LE, 14.0);
+    var j: i64 = 0;
+    while j < 4 {
+        lp_add_upper_bound(&mut k, j, 1.0);
+        lp_set_integer(&mut k, j);
+        j = j + 1;
+    }
+    val kl = lp_solve(&k);
+    val ki = lp_solve_mip(&k);
+    println("knapsack lp z=" + fx(kl.objective, 4) + " ip z=" + fx(ki.objective, 4) + " x=" + fx(ki.x.get(0), 0) + " " + fx(ki.x.get(1), 0) + " " + fx(ki.x.get(2), 0) + " " + fx(ki.x.get(3), 0));
+
+    // x1 + x2 = 3 written twice (a redundant row), x2 - x1 = 1; max 2x1 + 2x2
+    var e = lp_new(2, true);
+    lp_set_objective(&mut e, 0, 2.0);
+    lp_set_objective(&mut e, 1, 2.0);
+    lp_add_constraint(&mut e, lp_row2(1.0, 1.0), LP_EQ, 3.0);
+    lp_add_constraint(&mut e, lp_row2(2.0, 2.0), LP_EQ, 6.0);
+    lp_add_constraint(&mut e, lp_row2(-1.0, 1.0), LP_EQ, 1.0);
+    val re = lp_solve(&e);
+    println("equality with redundant row: " + lp_status_name(re.status) + " z=" + fx(re.objective, 4) + " x=(" + fx(re.x.get(0), 4) + ", " + fx(re.x.get(1), 4) + ")");
+}

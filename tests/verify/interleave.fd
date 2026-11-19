@@ -4,8 +4,31 @@
 // and parallel branches. Whatever order the threads run in, the printed
 // totals are the same; interleave.py runs it thousands of times under
 // different CPU sets and loads and reports any run that prints otherwise.
+// Nov 18 (VF18): green tasks too (task_go with yields between atomics, a
+// task pipeline through a channel), async fns awaited out of order, and a
+// select over two channels fed by threads. With --sched-random every run
+// also sets FIDES_SCHED_RANDOM=<seed> (the runtimes' seeded scheduler,
+// docs/perf/rl17-sched-random.md); a failing seed is printed for replay.
+//
+// Expected output (every backend, every schedule):
+// 20000
+// 9000
+// 100999000
+// 1894006
+// 2400
+// 150
+// 45150
+// 30
+// 10
+// 750500
+// 500
+// done
 
 use sync;
+use task;
+
+var g_green: i64 = 0;
+var g_async: i64 = 0;
 
 fn bump_atomic(addr: i64, n: i64) -> i64 {
     var i: i64 = 0;
@@ -42,6 +65,56 @@ fn work(k: i64) -> i64 {
     var i: i64 = 0;
     while i < 20000 { s = (s + i * k) % 1000003; i = i + 1; }
     return s;
+}
+
+// a green task: 400 atomic adds, giving up its turn every 40
+fn green_bump(k: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 400 {
+        sync_atomic_add(g_green, 1);
+        if i % 40 == 0 {
+            task_yield();
+        }
+        i = i + 1;
+    }
+    return k * 10;
+}
+
+// a task pipeline: the sender's channel holds all 300 values (it never
+// blocks); the receiver yields while the channel is empty
+fn green_send(ch: i64) -> i64 {
+    var i: i64 = 1;
+    while i <= 300 {
+        sync_channel_send(ch, i);
+        if i % 25 == 0 {
+            task_yield();
+        }
+        i = i + 1;
+    }
+    return 300;
+}
+
+fn green_recv(ch: i64) -> i64 {
+    var got: i64 = 0;
+    var s: i64 = 0;
+    while got < 300 {
+        val v: i64 = sync_channel_try_recv(ch);
+        if v == SYNC_CHAN_PENDING {
+            task_yield();
+        } else {
+            s = s + v;
+            got = got + 1;
+        }
+    }
+    return s;
+}
+
+// an async fn: runs as a task until it first waits
+async fn async_part(id: i64) -> Future<i64> {
+    task_sleep(1 + id % 3);
+    sync_atomic_add(g_async, id);
+    task_yield();
+    return id * id;
 }
 
 fn main() -> i64 {
@@ -90,5 +163,75 @@ fn main() -> i64 {
         | y = work(7);
     }
     println(x + y);
+
+    // green tasks on the task scheduler: atomics with yields between
+    g_green = sync_atomic_alloc(0);
+    var gts: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 6 {
+        gts.push(task_go("green_bump", k));
+        k = k + 1;
+    }
+    task_run();
+    println(sync_atomic_load(g_green));
+    var gsum: i64 = 0;
+    for t in gts {
+        gsum = gsum + task_result(t);
+    }
+    println(gsum);
+
+    // a task sends through a channel, another receives (the sender first:
+    // where a task runs to its end when it starts, the values are there)
+    val gch: i64 = sync_channel_create(512);
+    val gs = task_go("green_send", gch);
+    val gr = task_go("green_recv", gch);
+    task_run();
+    if task_result(gs) != 300 {
+        println("green_send returned " + int_to_str(task_result(gs)));
+    }
+    println(task_result(gr));
+
+    // async fns started together, awaited in another order
+    g_async = sync_atomic_alloc(0);
+    val f1 = async_part(1);
+    val f2 = async_part(2);
+    val f3 = async_part(3);
+    val f4 = async_part(4);
+    val r3: i64 = await f3;
+    val r1: i64 = await f1;
+    val r4: i64 = await f4;
+    val r2: i64 = await f2;
+    println(r1 + r2 + r3 + r4);
+    println(sync_atomic_load(g_async));
+
+    // select over two channels, each fed by a thread
+    val ca: i64 = sync_channel_create(64);
+    val cb: i64 = sync_channel_create(64);
+    val q1 = spawn producer(ca, 1, 500);
+    val q2 = spawn producer(cb, 1001, 500);
+    var ssum: i64 = 0;
+    var sgot: i64 = 0;
+    var from_a: i64 = 0;
+    while sgot < 1000 {
+        select {
+            case ca => va => {
+                ssum = ssum + va;
+                sgot = sgot + 1;
+                from_a = from_a + 1;
+            }
+            case cb => vb => {
+                ssum = ssum + vb;
+                sgot = sgot + 1;
+            }
+            default => {
+                task_yield();
+            }
+        }
+    }
+    await q1;
+    await q2;
+    println(ssum);
+    println(from_a);
+    println("done");
     return 0;
 }

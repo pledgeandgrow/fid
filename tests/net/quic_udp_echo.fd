@@ -1,0 +1,151 @@
+// stdlib/quic_udp (competitive SL2, part 2): a QUIC server and client in
+// one process over real UDP sockets on 127.0.0.1: the TLS 1.3 handshake,
+// a 20000-byte request on a bidirectional stream echoed back, a second
+// stream, then CONNECTION_CLOSE. It uses real sockets (port 47931), so it
+// is not in the suite. The sockets are stdlib/udp.fd's (the system's own
+// socket API: nothing to link by hand), so it builds every way:
+//   $FID ccompile tests/net/quic_udp_echo.fd -o qu.exe && ./qu.exe
+//   $FID emit tests/net/quic_udp_echo.fd -o qu.exe && ./qu.exe        (Windows, native)
+//   CC="zig cc" $FID ccompile tests/net/quic_udp_echo.fd --target x86_64-linux -o qu   (then ./qu in WSL)
+//
+// Expected output:
+// handshake over udp: h3
+// echo 20000 bytes over udp ok
+// second stream: pong
+// closed: 0 done
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use quic_udp;
+use encoding;
+
+fn append(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// Echo every client stream once it is finished.
+fn serve(sv: & mut QuicUdpServer, ids: & mut Vec<i64>, bufs: & mut Vec<Vec<i64>>) {
+    var k: i64 = 0;
+    while k < sv.conns.len() {
+        var c: QuicConn = sv.conns.get(k);
+        val fresh: Vec<i64> = quic_accept_streams(& mut c);
+        var f: i64 = 0;
+        while f < fresh.len() {
+            ids.push(fresh.get(f));
+            var none: Vec<i64> = Vec::new();
+            bufs.push(none);
+            f = f + 1;
+        }
+        var j: i64 = 0;
+        while j < ids.len() {
+            val id: i64 = ids.get(j);
+            if id >= 0 {
+                var b: Vec<i64> = bufs.get(j);
+                append(& mut b, quic_stream_read(& mut c, id));
+                if quic_stream_finished(& c, id) {
+                    if str_equal(str_from_bytes(b), "ping") {
+                        quic_stream_write(& mut c, id, str_bytes("pong"), true);
+                    } else {
+                        quic_stream_write(& mut c, id, b, true);
+                    }
+                    ids.set(j, - 1);
+                }
+                bufs.set(j, b);
+            }
+            j = j + 1;
+        }
+        sv.conns.set(k, c);
+        k = k + 1;
+    }
+}
+
+fn main() -> i64 {
+    val seed: Vec<i64> = hex_decode_bytes("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    var sv: QuicUdpServer = quic_udp_listen(47931, quic_config_server(alpn, cert, seed));
+    var ccfg: QuicConfig = quic_config_client(alpn, "localhost");
+    ccfg.peer_key = quic_cert_ed25519_key(cert);
+    var cl: QuicUdpClient = quic_udp_connect("127.0.0.1", 47931, ccfg);
+    var ids: Vec<i64> = Vec::new();
+    var bufs: Vec<Vec<i64>> = Vec::new();
+    var rounds: i64 = 0;
+    while rounds < 2000 && !quic_conn_established(& cl.conn) {
+        quic_udp_server_poll(& mut sv, 2);
+        quic_udp_client_poll(& mut cl, 2);
+        if quic_conn_done(& cl.conn) { p_panic("handshake failed: " + cl.conn.why); }
+        rounds = rounds + 1;
+    }
+    if !quic_conn_established(& cl.conn) { p_panic("no handshake"); }
+    println("handshake over udp: " + cl.conn.alpn);
+
+    var req: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 20000 {
+        req.push((i * 13) % 256);
+        i = i + 1;
+    }
+    val id: i64 = quic_open_bidi(& mut cl.conn);
+    quic_stream_write(& mut cl.conn, id, req, true);
+    var got: Vec<i64> = Vec::new();
+    rounds = 0;
+    while rounds < 5000 && !(quic_stream_finished(& cl.conn, id) && got.len() == 20000) {
+        quic_udp_client_poll(& mut cl, 2);
+        quic_udp_server_poll(& mut sv, 2);
+        serve(& mut sv, & mut ids, & mut bufs);
+        append(& mut got, quic_stream_read(& mut cl.conn, id));
+        rounds = rounds + 1;
+    }
+    var same: bool = got.len() == req.len();
+    i = 0;
+    while same && i < req.len() {
+        if got.get(i) != req.get(i) { same = false; }
+        i = i + 1;
+    }
+    if !same { p_panic("echo differs: " + int_to_str(got.len()) + " bytes"); }
+    println("echo 20000 bytes over udp ok");
+
+    val id2: i64 = quic_open_bidi(& mut cl.conn);
+    quic_stream_write(& mut cl.conn, id2, str_bytes("ping"), true);
+    var got2: Vec<i64> = Vec::new();
+    rounds = 0;
+    while rounds < 2000 && !(quic_stream_finished(& cl.conn, id2) && got2.len() > 0) {
+        quic_udp_client_poll(& mut cl, 2);
+        quic_udp_server_poll(& mut sv, 2);
+        serve(& mut sv, & mut ids, & mut bufs);
+        append(& mut got2, quic_stream_read(& mut cl.conn, id2));
+        rounds = rounds + 1;
+    }
+    println("second stream: " + str_from_bytes(got2));
+
+    quic_conn_close(& mut cl.conn, 0, "done", p_clock_now_ms());
+    rounds = 0;
+    var server_saw: bool = false;
+    while rounds < 500 && !server_saw {
+        quic_udp_client_poll(& mut cl, 2);
+        quic_udp_server_poll(& mut sv, 2);
+        var k: i64 = 0;
+        while k < sv.conns.len() {
+            if sv.conns.get(k).peer_closed { server_saw = true; }
+            k = k + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if !server_saw { p_panic("the server did not see the close"); }
+    var k2: i64 = 0;
+    while k2 < sv.conns.len() {
+        if sv.conns.get(k2).peer_closed {
+            println("closed: " + int_to_str(sv.conns.get(k2).error) + " " + sv.conns.get(k2).why);
+        }
+        k2 = k2 + 1;
+    }
+    quic_udp_client_free(& mut cl);
+    quic_udp_server_free(& mut sv);
+    return 0;
+}

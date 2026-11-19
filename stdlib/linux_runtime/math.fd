@@ -306,3 +306,84 @@ pub fn pert_c_pow(x: f64, y: f64) -> f64 {
     var elo: f64 = y * ltail + pe_fma(y, yl, 0.0 - ehi);
     return pe_exp_inline(ehi, elo, sign_bias, true);
 }
+
+// ─── fmod: `%` on floats (MI17) ─────────────────────────────────────────
+// The exact remainder x - trunc(x / y) * y, as C's fmod (the interpreter's
+// and the C backend's `%` on f64/f32). compiler/nat_ir.fd ng_gen_binop
+// calls it for BinOp::Mod on floats; a C `fmod` call comes here too.
+// musl's bit-by-bit long division of the significands: no rounding.
+
+/// The exponent of a finite, nonzero |x| (bits `a`, sign cleared); a
+/// subnormal's is normalized (below 1).
+@wrapping fn pe_fmod_exp(a: i64) -> i64 {
+    var e: i64 = (a >> 52) & 2047;
+    if e == 0 {
+        var i: i64 = a << 12;
+        while i >= 0 {
+            e = e - 1;
+            i = i << 1;
+        }
+    }
+    return e;
+}
+
+/// The significand of |x| (bits `a`, exponent `e` from pe_fmod_exp) with
+/// its implicit bit at bit 52.
+@wrapping fn pe_fmod_sig(a: i64, e: i64) -> i64 {
+    if ((a >> 52) & 2047) == 0 {
+        return a << (1 - e);
+    }
+    return (a & 4503599627370495) | 4503599627370496;
+}
+
+@wrapping pub fn pert_c_fmod(x: f64, y: f64) -> f64 {
+    var ux: i64 = pe_asu(x);
+    var uy: i64 = pe_asu(y);
+    var sign: i64 = ux & (0 - 9223372036854775807 - 1);
+    var ax: i64 = ux & 9223372036854775807;
+    var ay: i64 = uy & 9223372036854775807;
+    var ex: i64 = (ax >> 52) & 2047;
+    // y == 0, y NaN or x infinite/NaN: NaN
+    if ay == 0 || ay > 9218868437227405312 || ex == 2047 {
+        return (x * y) / (x * y);
+    }
+    if ax <= ay {
+        if ax == ay {
+            return 0.0 * x;
+        }
+        return x;
+    }
+    ex = pe_fmod_exp(ax);
+    var ey: i64 = pe_fmod_exp(ay);
+    var mx: i64 = pe_fmod_sig(ax, ex);
+    var my: i64 = pe_fmod_sig(ay, ey);
+    var i: i64 = 0;
+    while ex > ey {
+        i = mx - my;
+        if i >= 0 {
+            if i == 0 {
+                return 0.0 * x;
+            }
+            mx = i;
+        }
+        mx = mx << 1;
+        ex = ex - 1;
+    }
+    i = mx - my;
+    if i >= 0 {
+        if i == 0 {
+            return 0.0 * x;
+        }
+        mx = i;
+    }
+    while (mx >> 52) == 0 {
+        mx = mx << 1;
+        ex = ex - 1;
+    }
+    if ex > 0 {
+        mx = (mx - 4503599627370496) | (ex << 52);
+    } else {
+        mx = mx >> (1 - ex);
+    }
+    return pe_asd(mx | sign);
+}

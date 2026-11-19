@@ -10,9 +10,16 @@
 //   value line = io_readln();
 
 module io;
- use vec; use string;
+ use vec;
+// a test's fake file system (stdlib/world.fd, complaint CT1) also holds
+// the files of Reader::open and the file Writers
+use world;
 // ─── FFI declarations ───────────────────────────────────────────────────
 
+// SAFETY: the prototypes come from <stdio.h>, checked by the C compiler;
+// putchar/getchar take and return ints. printf and fgets are declared but not
+// called here: printf's format must not be user text, and fgets needs a
+// buffer of at least size bytes.
 extern "C" include "<stdio.h>" {
     fn printf as pledge_printf(fmt: str) -> i64;
     fn putchar as pledge_putchar(ch: i64) -> i64;
@@ -25,6 +32,13 @@ pub const STDIN: i64 = 0; pub const STDOUT: i64 = 1; pub const STDERR: i64 = 2;
 // ─── Print ──────────────────────────────────────────────────────────────
 
 /// Print a string without a newline.
+///
+/// Example:
+///   io_print("total: ");
+///   io_println_int(42);
+///   io_print_separator(45, 10);
+///   io_eprintln("diagnostics go to stderr");
+///   io_flush();
 pub fn io_print(s: str) -> void {
     print(s);
 }
@@ -174,4 +188,611 @@ pub fn io_print_header(title: str, width: i64) -> void {
     pledge_putchar(10);
     io_print_separator(61, width);
     // '='
+}
+
+// ─── Streams: Reader, Writer, BufReader, BufWriter (roadmap L4B) ────────
+//
+// A Reader reads bytes from a source: bytes in memory, a file, or
+// standard input. A Writer writes bytes to a sink: standard output,
+// standard error, a file, or bytes in memory. BufReader and BufWriter
+// take one over and add a buffer: a BufReader pulls standard input in
+// chunks (a Reader pulls exactly what is asked for, a line byte by byte,
+// so it never takes input past what it returns); a BufWriter keeps
+// writes until `cap` bytes are pending, then hands them to the sink in
+// one write. Bytes are Vec<i64> of 0..255, as everywhere in the stdlib.
+//
+// Everything runs on the p_file_* builtins, p_read_stdin, print and
+// p_eprint_str, so `fid run`, `ccompile` and `emit` behave the same (the
+// interpreter has no p_read_stdin: a standard-input stream needs a
+// compiled program). A file source is read whole when it is opened (the
+// runtime has no positional read on every backend yet; fs.fd's File does
+// the same). Standard output and error take text: a NUL byte ends what is
+// printed of a write.
+//
+// Usage:
+//   use io;
+//   match Reader::open("in.txt") {
+//       Option::Some(r) => {
+//           var br: BufReader = BufReader::new(r);
+//           var line: Option<str> = br.read_line();
+//           ...
+//       }
+//       Option::None => { println("cannot open"); }
+//   }
+//   var w: BufWriter = BufWriter::new(Writer::to_stdout());
+//   w.write_str("hello\n");
+//   w.flush();
+
+/// Reader sources.
+pub const IO_SRC_BYTES: i64 = 0; pub const IO_SRC_FILE: i64 = 1; pub const IO_SRC_STDIN: i64 = 2;
+/// Writer sinks.
+pub const IO_SINK_STDOUT: i64 = 0; pub const IO_SINK_STDERR: i64 = 1; pub const IO_SINK_FILE: i64 = 2; pub const IO_SINK_BYTES: i64 = 3;
+/// BufReader's chunk and BufWriter's pending bytes by default.
+pub const IO_BUF_SIZE: i64 = 8192;
+
+/// A byte source.
+pub struct Reader {
+    pub src: i64,
+    pub path: str,
+    data: Vec<i64>,   // bytes and file: everything; stdin: bytes pulled, not yet read
+    pos: i64,         // next byte of data
+    eof: bool,        // stdin: the stream has ended
+}
+
+/// The bytes of v from `from` (inclusive) to `to` (exclusive).
+fn io_slice(v: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        out.push(v.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Up to n bytes of standard input ([] at its end). p_read_stdin returns
+/// fewer only when the stream ends.
+fn io_stdin_pull(n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    match read_stdin(n) {
+        Option::Some(s) => {
+            out = str_bytes(s);
+        }
+        Option::None => {}
+    }
+    return out;
+}
+
+/// A line's bytes as text: without its '\n' and a '\r' before it.
+fn io_line_text(v: & Vec<i64>) -> str {
+    var end: i64 = v.len();
+    if end > 0 && v.get(end - 1) == 10 {
+        end = end - 1;
+    }
+    if end > 0 && v.get(end - 1) == 13 {
+        end = end - 1;
+    }
+    return str_from_bytes(io_slice(v, 0, end));
+}
+
+impl Reader {
+    /// A Reader over bytes in memory.
+    pub fn from_bytes(bytes: Vec<i64>) -> Reader {
+        return Reader { src: IO_SRC_BYTES, path: "", data: io_slice(& bytes, 0, bytes.len()), pos: 0, eof: true };
+    }
+
+    /// A Reader over the bytes of a string.
+    pub fn from_str(s: str) -> Reader {
+        return Reader { src: IO_SRC_BYTES, path: "", data: str_bytes(s), pos: 0, eof: true };
+    }
+
+    /// A Reader over a file; None if it does not exist or is a directory.
+    pub fn open(path: str) -> Option<Reader> {
+        if world_files_faked() {
+            match world_fs_read(path) {
+                Option::Some(text) => {
+                    return Option::Some(Reader { src: IO_SRC_FILE, path: path, data: str_bytes(text), pos: 0, eof: true });
+                }
+                Option::None => {
+                    return Option::None;
+                }
+            }
+        }
+        if p_file_exists(path) == 0 || p_is_dir(path) != 0 {
+            return Option::None;
+        }
+        return Option::Some(Reader { src: IO_SRC_FILE, path: path, data: p_file_read_bytes(path), pos: 0, eof: true });
+    }
+
+    /// A Reader over standard input.
+    pub fn from_stdin() -> Reader {
+        return Reader { src: IO_SRC_STDIN, path: "", data: Vec::new(), pos: 0, eof: false };
+    }
+
+    /// Up to n bytes; [] at the end. On standard input it waits for n
+    /// bytes or the end of the stream.
+    pub fn read(self: & mut Reader, n: i64) -> Vec<i64> {
+        var out: Vec<i64> = Vec::new();
+        if n <= 0 {
+            return out;
+        }
+        var take: i64 = self.data.len() - self.pos;
+        if take > n {
+            take = n;
+        }
+        out = io_slice(& self.data, self.pos, self.pos + take);
+        self.pos = self.pos + take;
+        if out.len() < n && self.src == IO_SRC_STDIN && !self.eof {
+            val more: Vec<i64> = io_stdin_pull(n - out.len());
+            if more.len() < n - out.len() {
+                self.eof = true;
+            }
+            var i: i64 = 0;
+            while i < more.len() {
+                out.push(more.get(i));
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    /// One byte, or -1 at the end.
+    pub fn read_byte(self: & mut Reader) -> i64 {
+        val b: Vec<i64> = self.read(1);
+        if b.len() == 0 {
+            return - 1;
+        }
+        return b.get(0);
+    }
+
+    /// Everything left.
+    pub fn read_to_end(self: & mut Reader) -> Vec<i64> {
+        var out: Vec<i64> = io_slice(& self.data, self.pos, self.data.len());
+        self.pos = self.data.len();
+        while self.src == IO_SRC_STDIN && !self.eof {
+            val more: Vec<i64> = io_stdin_pull(IO_BUF_SIZE);
+            if more.len() < IO_BUF_SIZE {
+                self.eof = true;
+            }
+            var i: i64 = 0;
+            while i < more.len() {
+                out.push(more.get(i));
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    /// Everything left, as text.
+    pub fn read_to_string(self: & mut Reader) -> str {
+        return str_from_bytes(self.read_to_end());
+    }
+
+    /// The next line without its newline (and a '\r' before it); None at
+    /// the end. On standard input it reads a byte at a time.
+    pub fn read_line(self: & mut Reader) -> Option<str> {
+        var line: Vec<i64> = Vec::new();
+        var b: i64 = self.read_byte();
+        if b < 0 {
+            return Option::None;
+        }
+        while b >= 0 {
+            line.push(b);
+            if b == 10 {
+                return Option::Some(io_line_text(& line));
+            }
+            b = self.read_byte();
+        }
+        return Option::Some(io_line_text(& line));
+    }
+
+    /// True when nothing is left (on standard input: once a read found
+    /// its end).
+    pub fn at_end(self: & Reader) -> bool {
+        return self.pos >= self.data.len() && self.eof;
+    }
+}
+
+/// A buffered byte source: a Reader that pulls standard input in chunks.
+pub struct BufReader {
+    pub src: i64,
+    pub path: str,
+    data: Vec<i64>,
+    pos: i64,
+    eof: bool,
+    pub cap: i64,     // stdin: bytes pulled at a time
+}
+
+impl BufReader {
+    /// Buffer a Reader, IO_BUF_SIZE bytes at a time.
+    pub fn new(r: Reader) -> BufReader {
+        return BufReader::with_capacity(r, IO_BUF_SIZE);
+    }
+
+    /// Buffer a Reader, `cap` bytes (at least 1) at a time.
+    pub fn with_capacity(r: Reader, cap: i64) -> BufReader {
+        var c: i64 = cap;
+        if c < 1 {
+            c = 1;
+        }
+        return BufReader { src: r.src, path: r.path, data: io_slice(& r.data, r.pos, r.data.len()), pos: 0, eof: r.eof, cap: c };
+    }
+
+    /// Pull the next chunk of standard input; false when none came.
+    fn fill(self: & mut BufReader) -> bool {
+        if self.eof || self.src != IO_SRC_STDIN {
+            return false;
+        }
+        val more: Vec<i64> = io_stdin_pull(self.cap);
+        if more.len() < self.cap {
+            self.eof = true;
+        }
+        if more.len() == 0 {
+            return false;
+        }
+        // keep only the unread bytes, then the new chunk
+        var keep: Vec<i64> = io_slice(& self.data, self.pos, self.data.len());
+        var i: i64 = 0;
+        while i < more.len() {
+            keep.push(more.get(i));
+            i = i + 1;
+        }
+        self.data = keep;
+        self.pos = 0;
+        return true;
+    }
+
+    /// Up to n bytes; [] at the end.
+    pub fn read(self: & mut BufReader, n: i64) -> Vec<i64> {
+        while self.data.len() - self.pos < n && self.fill() {
+        }
+        var take: i64 = self.data.len() - self.pos;
+        if take > n {
+            take = n;
+        }
+        if take < 0 {
+            take = 0;
+        }
+        val out: Vec<i64> = io_slice(& self.data, self.pos, self.pos + take);
+        self.pos = self.pos + take;
+        return out;
+    }
+
+    /// One byte, or -1 at the end.
+    pub fn read_byte(self: & mut BufReader) -> i64 {
+        if self.pos >= self.data.len() && !self.fill() {
+            return - 1;
+        }
+        val b: i64 = self.data.get(self.pos) & 255;
+        self.pos = self.pos + 1;
+        return b;
+    }
+
+    /// The bytes up to and including the next `delim` (or to the end);
+    /// [] at the end.
+    pub fn read_until(self: & mut BufReader, delim: i64) -> Vec<i64> {
+        var out: Vec<i64> = Vec::new();
+        while true {
+            if self.pos >= self.data.len() && !self.fill() {
+                return out;
+            }
+            var i: i64 = self.pos;
+            while i < self.data.len() {
+                val b: i64 = self.data.get(i) & 255;
+                out.push(b);
+                i = i + 1;
+                if b == (delim & 255) {
+                    self.pos = i;
+                    return out;
+                }
+            }
+            self.pos = i;
+        }
+        return out;
+    }
+
+    /// The next line without its newline (and a '\r' before it); None at
+    /// the end.
+    pub fn read_line(self: & mut BufReader) -> Option<str> {
+        val line: Vec<i64> = self.read_until(10);
+        if line.len() == 0 {
+            return Option::None;
+        }
+        return Option::Some(io_line_text(& line));
+    }
+
+    /// Every line left.
+    pub fn lines(self: & mut BufReader) -> Vec<str> {
+        var out: Vec<str> = Vec::new();
+        var more: bool = true;
+        while more {
+            match self.read_line() {
+                Option::Some(l) => {
+                    out.push(l);
+                }
+                Option::None => {
+                    more = false;
+                }
+            }
+        }
+        return out;
+    }
+
+    /// Everything left.
+    pub fn read_to_end(self: & mut BufReader) -> Vec<i64> {
+        while self.fill() {
+        }
+        val out: Vec<i64> = io_slice(& self.data, self.pos, self.data.len());
+        self.pos = self.data.len();
+        return out;
+    }
+
+    /// Everything left, as text.
+    pub fn read_to_string(self: & mut BufReader) -> str {
+        return str_from_bytes(self.read_to_end());
+    }
+
+    /// True when nothing is left (on standard input: once a read found
+    /// its end).
+    pub fn at_end(self: & BufReader) -> bool {
+        return self.pos >= self.data.len() && (self.eof || self.src != IO_SRC_STDIN);
+    }
+}
+
+/// Hand bytes to a sink: print them, append them to a file, or keep them
+/// in `mem`. False when a file write fails.
+fn io_sink_put(sink: i64, path: str, mem: & mut Vec<i64>, bytes: & Vec<i64>) -> bool {
+    if bytes.len() == 0 {
+        return true;
+    }
+    if sink == IO_SINK_BYTES {
+        var i: i64 = 0;
+        while i < bytes.len() {
+            mem.push(bytes.get(i) & 255);
+            i = i + 1;
+        }
+        return true;
+    }
+    if sink == IO_SINK_STDOUT {
+        print(str_from_bytes(io_slice(bytes, 0, bytes.len())));
+        return true;
+    }
+    if sink == IO_SINK_STDERR {
+        p_eprint_str(str_from_bytes(io_slice(bytes, 0, bytes.len())));
+        return true;
+    }
+    // a test's fake file system holds text: a NUL ends what it keeps
+    if world_files_faked() {
+        return world_fs_append(path, str_from_bytes(io_slice(bytes, 0, bytes.len())));
+    }
+    // a file: bytes without a NUL go through an append (it takes a C
+    // string); bytes with one rewrite the file
+    var has_nul: bool = false;
+    var j: i64 = 0;
+    while j < bytes.len() {
+        if (bytes.get(j) & 255) == 0 {
+            has_nul = true;
+        }
+        j = j + 1;
+    }
+    if !has_nul {
+        return p_file_append(path, str_from_bytes(io_slice(bytes, 0, bytes.len()))) == 0;
+    }
+    var all: Vec<i64> = p_file_read_bytes(path);
+    j = 0;
+    while j < bytes.len() {
+        all.push(bytes.get(j) & 255);
+        j = j + 1;
+    }
+    return p_file_write_vec(path, all) == 0;
+}
+
+/// A byte sink. Writes go out at once (a BufWriter batches them).
+pub struct Writer {
+    pub sink: i64,
+    pub path: str,
+    mem: Vec<i64>,     // IO_SINK_BYTES: everything written
+    failed: bool,      // a file write failed
+    written: i64,      // bytes accepted so far
+}
+
+impl Writer {
+    /// A Writer to standard output.
+    pub fn to_stdout() -> Writer {
+        return Writer { sink: IO_SINK_STDOUT, path: "", mem: Vec::new(), failed: false, written: 0 };
+    }
+
+    /// A Writer to standard error.
+    pub fn to_stderr() -> Writer {
+        return Writer { sink: IO_SINK_STDERR, path: "", mem: Vec::new(), failed: false, written: 0 };
+    }
+
+    /// A Writer that keeps what it is given (see bytes()).
+    pub fn memory() -> Writer {
+        return Writer { sink: IO_SINK_BYTES, path: "", mem: Vec::new(), failed: false, written: 0 };
+    }
+
+    /// A Writer to a new (or truncated) file; None if it cannot be created.
+    pub fn create(path: str) -> Option<Writer> {
+        if world_files_faked() {
+            world_fs_write(path, "");
+            return Option::Some(Writer { sink: IO_SINK_FILE, path: path, mem: Vec::new(), failed: false, written: 0 });
+        }
+        if p_file_write(path, "") != 0 {
+            return Option::None;
+        }
+        return Option::Some(Writer { sink: IO_SINK_FILE, path: path, mem: Vec::new(), failed: false, written: 0 });
+    }
+
+    /// A Writer to the end of a file, created if missing.
+    pub fn append(path: str) -> Option<Writer> {
+        if world_files_faked() {
+            if !world_file_exists(path) {
+                world_fs_write(path, "");
+            }
+            return Option::Some(Writer { sink: IO_SINK_FILE, path: path, mem: Vec::new(), failed: false, written: 0 });
+        }
+        if p_file_append(path, "") != 0 {
+            return Option::None;
+        }
+        return Option::Some(Writer { sink: IO_SINK_FILE, path: path, mem: Vec::new(), failed: false, written: 0 });
+    }
+
+    /// Write bytes; the number written (all of them, or 0 once a write
+    /// failed).
+    pub fn write(self: & mut Writer, bytes: Vec<i64>) -> i64 {
+        if self.failed {
+            return 0;
+        }
+        if !io_sink_put(self.sink, self.path, & mut self.mem, & bytes) {
+            self.failed = true;
+            return 0;
+        }
+        self.written = self.written + bytes.len();
+        return bytes.len();
+    }
+
+    /// Write all the bytes; false if the sink failed.
+    pub fn write_all(self: & mut Writer, bytes: Vec<i64>) -> bool {
+        return self.write(bytes) == bytes.len();
+    }
+
+    /// Write the bytes of a string; false if the sink failed.
+    pub fn write_str(self: & mut Writer, s: str) -> bool {
+        return self.write_all(str_bytes(s));
+    }
+
+    /// Write a string and a newline.
+    pub fn write_line(self: & mut Writer, s: str) -> bool {
+        return self.write_all(str_bytes(s + "\n"));
+    }
+
+    /// Push out what the runtime holds (standard output's buffer); false
+    /// once a write failed.
+    pub fn flush(self: & mut Writer) -> bool {
+        if self.sink == IO_SINK_STDOUT {
+            p_flush_stdout();
+        }
+        return !self.failed;
+    }
+
+    /// What a memory Writer was given.
+    pub fn bytes(self: & Writer) -> Vec<i64> {
+        return io_slice(& self.mem, 0, self.mem.len());
+    }
+
+    /// The bytes accepted so far.
+    pub fn written(self: & Writer) -> i64 {
+        return self.written;
+    }
+}
+
+/// A buffered byte sink: writes are kept until `cap` bytes are pending,
+/// then handed to the sink in one write; flush() hands over the rest.
+/// Call flush() (or into_inner()) before dropping it: what is pending is
+/// lost otherwise.
+pub struct BufWriter {
+    pub sink: i64,
+    pub path: str,
+    mem: Vec<i64>,
+    failed: bool,
+    written: i64,
+    buf: Vec<i64>,     // pending bytes
+    pub cap: i64,
+    pub writes: i64,   // writes handed to the sink so far
+}
+
+impl BufWriter {
+    /// Buffer a Writer, IO_BUF_SIZE bytes.
+    pub fn new(w: Writer) -> BufWriter {
+        return BufWriter::with_capacity(w, IO_BUF_SIZE);
+    }
+
+    /// Buffer a Writer, up to `cap` (at least 1) pending bytes.
+    pub fn with_capacity(w: Writer, cap: i64) -> BufWriter {
+        var c: i64 = cap;
+        if c < 1 {
+            c = 1;
+        }
+        return BufWriter {
+            sink: w.sink, path: w.path, mem: io_slice(& w.mem, 0, w.mem.len()), failed: w.failed,
+            written: w.written, buf: Vec::new(), cap: c, writes: 0
+        };
+    }
+
+    /// Hand the pending bytes to the sink.
+    fn drain(self: & mut BufWriter) -> bool {
+        if self.failed {
+            return false;
+        }
+        if self.buf.len() == 0 {
+            return true;
+        }
+        if !io_sink_put(self.sink, self.path, & mut self.mem, & self.buf) {
+            self.failed = true;
+            return false;
+        }
+        self.writes = self.writes + 1;
+        self.written = self.written + self.buf.len();
+        self.buf.clear();
+        return true;
+    }
+
+    /// Write bytes; the number accepted (all of them, or 0 once the sink
+    /// failed).
+    pub fn write(self: & mut BufWriter, bytes: Vec<i64>) -> i64 {
+        if self.failed {
+            return 0;
+        }
+        var i: i64 = 0;
+        while i < bytes.len() {
+            self.buf.push(bytes.get(i) & 255);
+            i = i + 1;
+        }
+        if self.buf.len() >= self.cap && !self.drain() {
+            return 0;
+        }
+        return bytes.len();
+    }
+
+    /// Write all the bytes; false if the sink failed.
+    pub fn write_all(self: & mut BufWriter, bytes: Vec<i64>) -> bool {
+        return self.write(bytes) == bytes.len();
+    }
+
+    /// Write the bytes of a string.
+    pub fn write_str(self: & mut BufWriter, s: str) -> bool {
+        return self.write_all(str_bytes(s));
+    }
+
+    /// Write a string and a newline.
+    pub fn write_line(self: & mut BufWriter, s: str) -> bool {
+        return self.write_all(str_bytes(s + "\n"));
+    }
+
+    /// Hand everything pending to the sink and flush it; false if the sink
+    /// failed.
+    pub fn flush(self: & mut BufWriter) -> bool {
+        val ok: bool = self.drain();
+        if self.sink == IO_SINK_STDOUT {
+            p_flush_stdout();
+        }
+        return ok;
+    }
+
+    /// The bytes waiting for the next write to the sink.
+    pub fn pending(self: & BufWriter) -> i64 {
+        return self.buf.len();
+    }
+
+    /// What a memory sink was given (pending bytes not included).
+    pub fn bytes(self: & BufWriter) -> Vec<i64> {
+        return io_slice(& self.mem, 0, self.mem.len());
+    }
+
+    /// Flush and give the Writer back.
+    pub fn into_inner(self: & mut BufWriter) -> Writer {
+        self.flush();
+        return Writer { sink: self.sink, path: self.path, mem: io_slice(& self.mem, 0, self.mem.len()), failed: self.failed, written: self.written };
+    }
 }

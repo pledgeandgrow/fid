@@ -1,0 +1,205 @@
+// stdlib/rtos: deterministic tick-driven scenarios (the test runs each task's script when the scheduler picks it): priority inversion avoided by inheritance, round robin, timeouts, a bounded queue, software timers, static capacity.
+// Expected output:
+// == priority inheritance
+// trace: HMLLHLLLLHHHMMMMLLLi
+// t4 H blocks on mutex 0 held by L
+// t4 L inherits priority 3
+// t8 L back to priority 1
+// L ran while M was ready: true; released M ran before H finished: false
+// == round robin
+// trace: AABBAABBAAB
+// == timeout
+// C take -> pending, result after wait: timeout at t3
+// == queue
+// received: 1 2 3 4 5 6
+// == timers
+// t3 timer 1, t5 timer 0, t6 timer 1, t9 timer 1
+// == capacity
+// third task: -1, second sem: -1
+use rtos;
+use vec;
+use string;
+
+struct Sim {
+    scripts: Vec<Vec<str>>,
+    pc: Vec<i64>,
+    work: Vec<i64>,
+    trace: str,
+    got: Vec<i64>,
+    waiting: Vec<bool>,
+}
+
+fn sim_new() -> Sim {
+    var s: Sim = Sim { scripts: Vec::new(), pc: Vec::new(), work: Vec::new(), trace: "", got: Vec::new(), waiting: Vec::new() };
+    // task 0 is idle
+    s.scripts.push(Vec::new());
+    s.pc.push(0);
+    s.work.push(0);
+    s.waiting.push(false);
+    return s;
+}
+
+fn add(r: &mut Rtos, s: &mut Sim, name: str, prio: i64, script: str) -> i64 {
+    val id: i64 = rtos_task_create(r, name, prio);
+    s.scripts.push(str_split(script, ";"));
+    s.pc.push(0);
+    s.work.push(0);
+    s.waiting.push(false);
+    return id;
+}
+
+fn arg(op: str, i: i64) -> i64 {
+    return str_parse_int(str_split(op, " ").get(i));
+}
+
+/// Run one step of the current task's script.
+fn step(r: &mut Rtos, s: &mut Sim) {
+    val cur: i64 = rtos_current(r);
+    if cur == 0 {
+        s.trace = s.trace + "i";
+        return;
+    }
+    s.trace = s.trace + str_slice(rtos_name(r, cur), 0, 1);
+    if s.waiting.get(cur) {
+        s.got.push(rtos_task_msg(r, cur));
+        s.waiting.set(cur, false);
+    }
+    val sc: Vec<str> = s.scripts.get(cur);
+    val pc: i64 = s.pc.get(cur);
+    if pc >= sc.len() {
+        rtos_suspend(r, cur);
+        return;
+    }
+    val op: str = sc.get(pc);
+    val name: str = str_split(op, " ").get(0);
+    if str_equal(name, "work") {
+        var w: i64 = s.work.get(cur);
+        if w == 0 { w = arg(op, 1); }
+        w = w - 1;
+        s.work.set(cur, w);
+        if w == 0 { s.pc.set(cur, pc + 1); }
+        return;
+    }
+    s.pc.set(cur, pc + 1);
+    if str_equal(name, "lock") { rtos_mutex_lock(r, arg(op, 1), -1); }
+    if str_equal(name, "unlock") { rtos_mutex_unlock(r, arg(op, 1)); }
+    if str_equal(name, "take") { rtos_sem_take(r, arg(op, 1), arg(op, 2)); }
+    if str_equal(name, "give") { rtos_sem_give(r, arg(op, 1)); }
+    if str_equal(name, "delay") { rtos_delay(r, arg(op, 1)); }
+    if str_equal(name, "send") { rtos_queue_send(r, arg(op, 1), arg(op, 2), -1); }
+    if str_equal(name, "recv") {
+        if rtos_queue_recv(r, arg(op, 1), -1) == RT_OK { s.got.push(rtos_task_msg(r, cur)); } else { s.waiting.set(cur, true); }
+    }
+}
+
+fn main() {
+    println("== priority inheritance");
+    var r: Rtos = rtos_new(8, 4, 2, 2, 2, 2);
+    var s: Sim = sim_new();
+    val sh: i64 = rtos_sem_create(&mut r, 0, 1);
+    val sm: i64 = rtos_sem_create(&mut r, 0, 1);
+    val m: i64 = rtos_mutex_create(&mut r);
+    add(&mut r, &mut s, "H", 3, "take 0 -1;lock 0;work 1;unlock 0");
+    add(&mut r, &mut s, "M", 2, "take 1 -1;work 3");
+    add(&mut r, &mut s, "L", 1, "lock 0;work 4;unlock 0;work 2");
+    rtos_schedule(&mut r);
+    var lw_m: bool = false;
+    var m_before_h: bool = false;
+    var h_done: bool = false;
+    var t: i64 = 0;
+    while t < 20 {
+        if r.tick == 4 { rtos_sem_give(&mut r, sh); }
+        if r.tick == 5 { rtos_sem_give(&mut r, sm); }
+        val cur: i64 = rtos_current(&r);
+        if cur == 3 && r.tasks.get(2).state == RT_READY { lw_m = true; }
+        if cur == 2 && !h_done && r.tick >= 5 { m_before_h = true; }
+        step(&mut r, &mut s);
+        if r.tasks.get(1).state == RT_SUSPENDED { h_done = true; }
+        rtos_tick(&mut r);
+        t = t + 1;
+    }
+    println("trace: " + s.trace);
+    var i: i64 = 0;
+    while i < r.log.len() {
+        if !str_contains(r.log.get(i), "switch") { println(r.log.get(i)); }
+        i = i + 1;
+    }
+    var bl: str = "false";
+    if lw_m { bl = "true"; }
+    var bm: str = "false";
+    if m_before_h { bm = "true"; }
+    println("L ran while M was ready: " + bl + "; released M ran before H finished: " + bm);
+
+    println("== round robin");
+    var r2: Rtos = rtos_new(4, 1, 1, 1, 1, 2);
+    var s2: Sim = sim_new();
+    add(&mut r2, &mut s2, "A", 2, "work 5");
+    add(&mut r2, &mut s2, "B", 2, "work 5");
+    rtos_schedule(&mut r2);
+    t = 0;
+    while t < 11 {
+        step(&mut r2, &mut s2);
+        rtos_tick(&mut r2);
+        t = t + 1;
+    }
+    println("trace: " + s2.trace);
+
+    println("== timeout");
+    var r3: Rtos = rtos_new(4, 1, 1, 1, 1, 2);
+    val sem: i64 = rtos_sem_create(&mut r3, 0, 1);
+    val c: i64 = rtos_task_create(&mut r3, "C", 1);
+    rtos_schedule(&mut r3);
+    val res: i64 = rtos_sem_take(&mut r3, sem, 3);
+    var pend: str = "?";
+    if res == RT_PENDING { pend = "pending"; }
+    var when: i64 = -1;
+    t = 0;
+    while t < 6 {
+        rtos_tick(&mut r3);
+        if when < 0 && r3.tasks.get(c).state != RT_BLOCKED { when = r3.tick; }
+        t = t + 1;
+    }
+    var rs: str = "ok";
+    if rtos_task_result(&r3, c) == RT_TIMEOUT { rs = "timeout"; }
+    println("C take -> " + pend + ", result after wait: " + rs + " at t" + int_to_str(when));
+
+    println("== queue");
+    var r4: Rtos = rtos_new(4, 1, 1, 1, 1, 2);
+    var s4: Sim = sim_new();
+    val q: i64 = rtos_queue_create(&mut r4, 2);
+    add(&mut r4, &mut s4, "P", 1, "send 0 1;send 0 2;send 0 3;send 0 4;send 0 5;send 0 6");
+    add(&mut r4, &mut s4, "Q", 2, "delay 3;recv 0;recv 0;recv 0;recv 0;recv 0;recv 0;delay 100");
+    rtos_schedule(&mut r4);
+    t = 0;
+    while t < 30 {
+        step(&mut r4, &mut s4);
+        rtos_tick(&mut r4);
+        t = t + 1;
+    }
+    var parts: Vec<str> = Vec::new();
+    i = 0;
+    while i < s4.got.len() {
+        parts.push(int_to_str(s4.got.get(i)));
+        i = i + 1;
+    }
+    println("received: " + str_join(parts, " "));
+
+    println("== timers");
+    var r5: Rtos = rtos_new(2, 1, 1, 1, 2, 2);
+    val one: i64 = rtos_timer_create(&mut r5, 5, false);
+    val per: i64 = rtos_timer_create(&mut r5, 3, true);
+    rtos_timer_start(&mut r5, one);
+    rtos_timer_start(&mut r5, per);
+    t = 0;
+    while t < 10 {
+        rtos_tick(&mut r5);
+        t = t + 1;
+    }
+    println(str_join(r5.timer_events, ", "));
+
+    println("== capacity");
+    var r6: Rtos = rtos_new(2, 1, 1, 1, 1, 2);
+    rtos_task_create(&mut r6, "X", 1);
+    rtos_sem_create(&mut r6, 0, 1);
+    println("third task: " + int_to_str(rtos_task_create(&mut r6, "Y", 1)) + ", second sem: " + int_to_str(rtos_sem_create(&mut r6, 0, 1)));
+}

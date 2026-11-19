@@ -1,0 +1,89 @@
+// ABI against C (own-backend roadmap RL25): float arguments mixed with
+// integer and pointer arguments in one C call, and f64 results back.
+// Win64 gives each argument a position (ldexp's x in xmm0, e in edx);
+// System V counts integer and float registers apart (x in xmm0, e in edi);
+// WASM passes typed values. A backend that puts the i32 of ldexp in the
+// wrong register, or reads an f64 result from rax, prints wrong numbers.
+//   ldexp(f64, i32) -> f64        float then int
+//   frexp(f64, *i32) -> f64       float then pointer, an int written back
+//   modf(f64, *f64) -> f64        float then pointer, an f64 written back
+//   strtod(*u8, *i64) -> f64      pointers in, f64 out, end pointer back
+//   fmod(f64, f64) -> f64         two floats, a negative result
+// Every result is exact in binary, so it is printed scaled to an integer.
+// tests/bootstrap/test_verify_abi_c_records.fd covers integer arguments
+// and callbacks from C.
+//
+// Expected output:
+// ldexp 24 -40 3
+// frexp 750 4
+// frexp -500 -3
+// modf 250 -7 -125 7
+// strtod 1625 5 -2250 5
+// fmod -500 1500
+// chain 96
+
+extern "C" include "<math.h>" link "m" {
+    fn ldexp(x: f64, e: i32) -> f64;
+    fn frexp(x: f64, e: *i32) -> f64;
+    fn modf(x: f64, ip: *f64) -> f64;
+    fn fmod(x: f64, y: f64) -> f64;
+}
+
+extern "C" include "<stdlib.h>" {
+    fn strtod(s: *u8, end: *i64) -> f64;
+}
+
+fn milli(x: f64) -> i64 {
+    return (x * 1000.0) as i64;
+}
+
+@unsafe
+fn main() -> i64 {
+    // float then int: 3 * 2^3, -5 * 2^3, 12 * 2^-2
+    println("ldexp " + int_to_str(ldexp(3.0, 3) as i64) + " " + int_to_str(ldexp(0.0 - 5.0, 3) as i64) + " " + int_to_str(ldexp(12.0, 0 - 2) as i64));
+
+    // frexp writes the exponent through an i32 pointer: 12 = 0.75 * 2^4
+    val ebuf: *u8 = p_malloc(16);
+    *(ebuf as *i64) = 0;
+    val m1: f64 = frexp(12.0, ebuf as *i32);
+    val e1: i32 = *(ebuf as *i32);
+    println("frexp " + int_to_str(milli(m1)) + " " + int_to_str(e1 as i64));
+    // -0.0625 = -0.5 * 2^-3: a negative exponent comes back sign-extended
+    *(ebuf as *i64) = 0;
+    val m2: f64 = frexp(0.0 - 0.0625, ebuf as *i32);
+    val e2: i32 = *(ebuf as *i32);
+    println("frexp " + int_to_str(milli(m2)) + " " + int_to_str(e2 as i64));
+
+    // modf writes the integer part through an f64 pointer
+    val fbuf: *u8 = p_malloc(16);
+    val fr1: f64 = modf(7.25, fbuf as *f64);
+    val ip1: f64 = *(fbuf as *f64);
+    val fr2: f64 = modf(0.0 - 7.125, fbuf as *f64);
+    val ip2: f64 = *(fbuf as *f64);
+    println("modf " + int_to_str(milli(fr1)) + " " + int_to_str(ip2 as i64) + " " + int_to_str(milli(fr2)) + " " + int_to_str(ip1 as i64));
+
+    // strtod: a C string in, an f64 out, the end pointer written back
+    val s1: str = "1.625xyz";
+    val s2: str = "-2.25";
+    val endbuf: *u8 = p_malloc(16);
+    val d1: f64 = strtod(s1 as *u8, endbuf as *i64);
+    val used1: i64 = *(endbuf as *i64) - (s1 as i64);
+    val d2: f64 = strtod(s2 as *u8, endbuf as *i64);
+    val used2: i64 = *(endbuf as *i64) - (s2 as i64);
+    println("strtod " + int_to_str(milli(d1)) + " " + int_to_str(used1) + " " + int_to_str(milli(d2)) + " " + int_to_str(used2));
+
+    // two floats in, the sign of the dividend kept
+    println("fmod " + int_to_str(milli(fmod(0.0 - 5.5, 2.5))) + " " + int_to_str(milli(fmod(7.5, 3.0))));
+
+    // results of C calls fed straight into the next one, with an int
+    // computed between them: ldexp(frexp(12) = 0.75, 4 + 3) = 96
+    *(ebuf as *i64) = 0;
+    val m3: f64 = frexp(12.0, ebuf as *i32);
+    val k: i32 = *(ebuf as *i32) + 3;
+    println("chain " + int_to_str(ldexp(m3, k) as i64));
+
+    p_free(ebuf);
+    p_free(fbuf);
+    p_free(endbuf);
+    return 0;
+}

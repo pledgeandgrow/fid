@@ -1,0 +1,44 @@
+// Test (stdlib-agent bug 19): a generic function with a capability bound
+// taking `&mut T`. Monomorphization did not bind T from `&mut m` (the
+// argument's type was not a reference to it), so the call went to
+// `use_store__T`, which no instance defines.
+// Expected output:
+// 13
+// 2 20
+cap Store {
+    fn put(self, v: i64);
+    fn total(self) -> i64;
+}
+
+struct Mem { sum: i64 }
+
+impl Store for Mem {
+    pub fn put(self: & mut Mem, v: i64) { self.sum = self.sum + v; }
+    pub fn total(self: & Mem) -> i64 { return self.sum; }
+}
+
+struct Log { n: i64, last: i64 }
+
+impl Store for Log {
+    pub fn put(self: & mut Log, v: i64) { self.n = self.n + 1; self.last = v; }
+    pub fn total(self: & Log) -> i64 { return self.n; }
+}
+
+fn use_store<T: Store>(s: & mut T) {
+    s.put(5);
+    s.put(7);
+}
+
+fn put_one<T: Store>(s: & mut T, v: i64) {
+    s.put(v);
+}
+
+fn main() {
+    var m: Mem = Mem { sum: 1 };
+    use_store(& mut m);
+    println(int_to_str(m.total()));
+    var l: Log = Log { n: 0, last: 0 };
+    put_one(& mut l, 10);
+    put_one(& mut l, 20);
+    println(int_to_str(l.total()) + " " + int_to_str(l.last));
+}

@@ -1,0 +1,77 @@
+// llvm-roadmap MI5/MI17: found while comparing `fid emit --nat` with the
+// default Windows `fid emit` (pe_ir); both native paths were wrong.
+//
+// A struct put into an enum payload is stored through the payload's field
+// address (typed *i64) by one Store whose explicit type is the struct: a
+// copy of every word (codegen_c: memcpy; pe_ir: PeirGen_emit_copy_rcx_to_rax).
+// The mid-end's scalar replacement (compiler/iropt_me.fd ime_sra, on by
+// default) took that Store for an 8-byte one and split the enum local into
+// one word per field: only the struct's first word reached the payload.
+// pe_ir printed 100 for the second and third lines and --nat printed an
+// address; `--no-opt` or FID_IROPT_OFF=sra printed the lines below, as do
+// the interpreter and the C path.
+//
+// Expected output:
+// 2
+// 123
+// 123
+// 456
+// 789
+// 0
+
+pub struct Small {
+    pub a: i64,
+    pub b: i64,
+    pub c: i64,
+}
+
+pub enum OptSmall {
+    Some(Small),
+    None,
+}
+
+pub fn get_b(s: Small) -> i64 {
+    return s.b;
+}
+
+pub fn make_local(s: Small) -> OptSmall {
+    var t: Small = s;
+    return OptSmall::Some(t);
+}
+
+pub fn make_some(s: Small) -> OptSmall {
+    return OptSmall::Some(s);
+}
+
+pub fn make_lit(a: i64) -> OptSmall {
+    return OptSmall::Some(Small { a: a, b: a + 1, c: a + 2 });
+}
+
+pub fn extract(opt: OptSmall) -> i64 {
+    match opt {
+        OptSmall::Some(s) => {
+            return s.a * 100 + s.b * 10 + s.c;
+        }
+        OptSmall::None => {
+            return 0;
+        }
+    }
+}
+
+fn main() {
+    var s: Small = Small { a: 1, b: 2, c: 3 };
+    println(get_b(s));
+    println(extract(make_local(s)));
+    println(extract(make_some(s)));
+    println(extract(make_lit(4)));
+    var opt: OptSmall = make_some(Small { a: 7, b: 8, c: 9 });
+    match opt {
+        OptSmall::Some(t) => {
+            println(t.a * 100 + t.b * 10 + t.c);
+        }
+        OptSmall::None => {
+            println(0);
+        }
+    }
+    println(extract(OptSmall::None));
+}

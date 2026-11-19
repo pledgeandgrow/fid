@@ -1,0 +1,712 @@
+// Fides SRTP and SRTCP (RFC 3711) with the DTLS-SRTP profiles of RFC 5764
+// and AEAD_AES_128_GCM (RFC 7714).
+//
+// Real (pure computation):
+//   - AES in counter mode (AES-CM, RFC 3711 §4.1.1) over aes_gcm.fd's
+//     block cipher, and the AES-CM PRF key derivation (§4.3): session
+//     encryption key, authentication key and salt for SRTP (labels 0..2)
+//     and SRTCP (labels 3..5), with a key derivation rate (r = index DIV
+//     kdr) for callers that want one (contexts use kdr = 0);
+//   - packet protection for the profiles SRTP_AES128_CM_HMAC_SHA1_80 and
+//     SRTP_AES128_CM_HMAC_SHA1_32 (RFC 5764 §4.1.2: 80- or 32-bit SRTP
+//     tag, 80-bit SRTCP tag for both), HMAC-SHA1 from kdf.fd over the
+//     authenticated portion and the ROC; and SRTP_AEAD_AES_128_GCM
+//     (RFC 7714: 12-byte IV = (00 00 || SSRC || ROC || SEQ) XOR salt, the
+//     RTP header as AAD, 16-byte tag; SRTCP with the E flag and the 31-bit
+//     index in the AAD, encrypted or tagging-only);
+//   - the RTP header length (CSRCs, header extension) to find the payload;
+//   - per-SSRC rollover counters with the receiver's index estimation
+//     (RFC 3711 Appendix A), sender ROC increments on sequence wrap, a
+//     64-packet replay window per SSRC for SRTP and for SRTCP (§3.3.2),
+//     updated only after a packet authenticates.
+//
+// Not done: MKI (no profile of RFC 5764 uses one), the f8 cipher and the
+// NULL cipher/auth, key lifetime counting and re-keying (the DTLS-SRTP
+// caller re-handshakes), AES-256 profiles. No platform seam: packets are
+// bytes in and bytes out.
+//
+// Secrecy: the AES keystream is @secret in aes_gcm.fd; srtp_aes_cm is the
+// one release (@declassify) here: it returns data XORed with keystream
+// (ciphertext on the wire, or a derived session key for the context).
+//
+// Checked against RFC 3711 Appendix B.2 (AES-CM keystream) and B.3 (key
+// derivation), libsrtp's reference packet for AES_CM_128_HMAC_SHA1_80,
+// and RFC 7714 §16.1.1 and §17.1.1/17.1.2 (AEAD_AES_128_GCM SRTP and
+// SRTCP), in tests/bootstrap/test_std_srtp.fd.
+//
+// Usage:
+//   use srtp;
+//   var tx: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mkey, msalt);
+//   val r: SrtpResult = srtp_protect(& mut tx, rtp_packet);   // r.ok, r.data
+//   var rx: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mkey, msalt);
+//   val p: SrtpResult = srtp_unprotect(& mut rx, r.data);     // the RTP packet
+module srtp;
+use vec;
+use aes_gcm;
+use kdf;
+
+/// DTLS-SRTP protection profile ids (RFC 5764 §4.1.2, RFC 7714 §14.2).
+pub const SRTP_AES128_CM_SHA1_80: i64 = 1;
+pub const SRTP_AES128_CM_SHA1_32: i64 = 2;
+pub const SRTP_AEAD_AES_128_GCM: i64 = 7;
+
+/// AES-CM PRF labels (RFC 3711 §4.3.1).
+pub const SRTP_LABEL_RTP_ENC: i64 = 0;
+pub const SRTP_LABEL_RTP_AUTH: i64 = 1;
+pub const SRTP_LABEL_RTP_SALT: i64 = 2;
+pub const SRTP_LABEL_RTCP_ENC: i64 = 3;
+pub const SRTP_LABEL_RTCP_AUTH: i64 = 4;
+pub const SRTP_LABEL_RTCP_SALT: i64 = 5;
+
+const SRP_WINDOW: i64 = 64;
+
+pub fn srtp_profile_name(p: i64) -> str {
+    if p == SRTP_AES128_CM_SHA1_80 { return "SRTP_AES128_CM_HMAC_SHA1_80"; }
+    if p == SRTP_AES128_CM_SHA1_32 { return "SRTP_AES128_CM_HMAC_SHA1_32"; }
+    if p == SRTP_AEAD_AES_128_GCM { return "SRTP_AEAD_AES_128_GCM"; }
+    return "";
+}
+
+pub fn srtp_profile_known(p: i64) -> bool {
+    return p == SRTP_AES128_CM_SHA1_80 || p == SRTP_AES128_CM_SHA1_32 || p == SRTP_AEAD_AES_128_GCM;
+}
+
+/// Master key length in bytes (16 for every profile here).
+pub fn srtp_profile_key_len(p: i64) -> i64 {
+    return 16;
+}
+
+/// Master salt length: 14 bytes for AES-CM, 12 for GCM.
+pub fn srtp_profile_salt_len(p: i64) -> i64 {
+    if p == SRTP_AEAD_AES_128_GCM { return 12; }
+    return 14;
+}
+
+/// SRTP authentication tag length in bytes.
+pub fn srtp_profile_tag_len(p: i64) -> i64 {
+    if p == SRTP_AES128_CM_SHA1_32 { return 4; }
+    if p == SRTP_AEAD_AES_128_GCM { return 16; }
+    return 10;
+}
+
+/// SRTCP authentication tag length (80 bits for both CM profiles).
+pub fn srtp_profile_rtcp_tag_len(p: i64) -> i64 {
+    if p == SRTP_AEAD_AES_128_GCM { return 16; }
+    return 10;
+}
+
+// ─── Bytes ────────────────────────────────────────────────────────────────
+
+fn srp_slice(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn srp_append(out: & mut Vec<i64>, b: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+fn srp_zeros(n: i64) -> Vec<i64> {
+    return Vec::filled(n, 0);
+}
+
+fn srp_u32(b: & Vec<i64>, at: i64) -> i64 {
+    return (b.get(at) << 24) | (b.get(at + 1) << 16) | (b.get(at + 2) << 8) | b.get(at + 3);
+}
+
+fn srp_put32(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 24) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+/// Constant-time comparison of two byte strings of the same length.
+fn srp_ct_eq(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        d = d | ((a.get(i) ^ b.get(i)) & 255);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+// ─── AES-CM and the key derivation ─────────────────────────────────────────
+
+/// AES in counter mode: `data` XORed with AES(key, iv), AES(key, iv + 1),
+/// ... (the 128-bit counter block incremented big-endian). The keystream
+/// itself is srtp_aes_cm(key, iv, zeros). Empty for a bad key or IV.
+@declassify pub fn srtp_aes_cm(@secret key: Vec<i64>, iv: Vec<i64>, data: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val k: AesKey = aes_key_expand(key);
+    if k.nr == 0 || iv.len() != 16 {
+        return out;
+    }
+    var ctr: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        ctr.push(iv.get(i) & 255);
+        i = i + 1;
+    }
+    i = 0;
+    while i < data.len() {
+        val ks: Vec<i64> = aes_encrypt_block(k, ctr);
+        var j: i64 = 0;
+        while j < 16 && i + j < data.len() {
+            out.push((data.get(i + j) ^ ks.get(j)) & 255);
+            j = j + 1;
+        }
+        var c: i64 = 15;
+        var carry: i64 = 1;
+        while c >= 0 && carry != 0 {
+            val v: i64 = ctr.get(c) + carry;
+            ctr.set(c, v & 255);
+            carry = v >> 8;
+            c = c - 1;
+        }
+        i = i + 16;
+    }
+    return out;
+}
+
+/// The AES-CM PRF (RFC 3711 §4.3.1, §4.3.3): `n` bytes for `label` with
+/// r = index DIV kdr (r = 0 when kdr is 0). The master salt is 14 bytes
+/// (a 12-byte GCM salt is used as its first 12 bytes, zeros after, as
+/// RFC 7714 implementations do).
+pub fn srtp_kdf(master_key: Vec<i64>, master_salt: Vec<i64>, label: i64, index: i64, kdr: i64, n: i64) -> Vec<i64> {
+    var r: i64 = 0;
+    if kdr > 0 {
+        r = index / kdr;
+    }
+    // key_id = label || r (7 bytes), XORed into the low end of the salt
+    var x: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 14 {
+        if i < master_salt.len() {
+            x.push(master_salt.get(i) & 255);
+        } else {
+            x.push(0);
+        }
+        i = i + 1;
+    }
+    x.set(7, x.get(7) ^ (label & 255));
+    i = 0;
+    while i < 6 {
+        x.set(13 - i, x.get(13 - i) ^ ((r >> (8 * i)) & 255));
+        i = i + 1;
+    }
+    x.push(0);
+    x.push(0);
+    return srtp_aes_cm(master_key, x, srp_zeros(n));
+}
+
+// ─── Contexts ─────────────────────────────────────────────────────────────
+
+/// One direction of an SRTP session (what one sender protects, or what
+/// one receiver unprotects): the session keys and per-SSRC state.
+pub struct SrtpContext {
+    pub ok: bool,
+    pub err: str,
+    pub profile: i64,
+    pub rtp_key: Vec<i64>,
+    pub rtp_auth: Vec<i64>,
+    pub rtp_salt: Vec<i64>,
+    pub rtcp_key: Vec<i64>,
+    pub rtcp_auth: Vec<i64>,
+    pub rtcp_salt: Vec<i64>,
+    pub ssrcs: Vec<i64>,
+    pub rocs: Vec<i64>,
+    pub seqs: Vec<i64>,
+    pub started: Vec<i64>,
+    pub tops: Vec<i64>,
+    pub wins: Vec<Vec<i64>>,
+    pub rtcp_next: Vec<i64>,
+    pub rtcp_tops: Vec<i64>,
+    pub rtcp_wins: Vec<Vec<i64>>,
+}
+
+/// The result of protecting or unprotecting one packet.
+pub struct SrtpResult {
+    pub ok: bool,
+    pub err: str,
+    pub data: Vec<i64>,
+}
+
+fn srp_fail(e: str) -> SrtpResult {
+    return SrtpResult { ok: false, err: e, data: Vec::new() };
+}
+
+fn srp_good(d: Vec<i64>) -> SrtpResult {
+    return SrtpResult { ok: true, err: "", data: d };
+}
+
+/// A context from session keys directly (what the RFC test vectors give).
+/// For GCM the auth keys are unused (pass empty).
+pub fn srtp_context_session(profile: i64, rtp_key: Vec<i64>, rtp_salt: Vec<i64>, rtp_auth: Vec<i64>, rtcp_key: Vec<i64>, rtcp_salt: Vec<i64>, rtcp_auth: Vec<i64>) -> SrtpContext {
+    var c: SrtpContext = SrtpContext {
+        ok: true, err: "", profile: profile,
+        rtp_key: rtp_key, rtp_auth: rtp_auth, rtp_salt: rtp_salt,
+        rtcp_key: rtcp_key, rtcp_auth: rtcp_auth, rtcp_salt: rtcp_salt,
+        ssrcs: Vec::new(), rocs: Vec::new(), seqs: Vec::new(), started: Vec::new(),
+        tops: Vec::new(), wins: Vec::new(),
+        rtcp_next: Vec::new(), rtcp_tops: Vec::new(), rtcp_wins: Vec::new()
+    };
+    if !srtp_profile_known(profile) {
+        c.ok = false;
+        c.err = "unknown profile";
+    } else if rtp_key.len() != 16 || rtcp_key.len() != 16 || rtp_salt.len() != srtp_profile_salt_len(profile) || rtcp_salt.len() != srtp_profile_salt_len(profile) {
+        c.ok = false;
+        c.err = "bad session key or salt length";
+    }
+    return c;
+}
+
+/// A context from a master key and salt (RFC 3711 §4.3, kdr = 0): what
+/// DTLS-SRTP hands over for each direction.
+pub fn srtp_context_new(profile: i64, master_key: Vec<i64>, master_salt: Vec<i64>) -> SrtpContext {
+    val sl: i64 = srtp_profile_salt_len(profile);
+    if master_key.len() != 16 || master_salt.len() != sl || !srtp_profile_known(profile) {
+        var c: SrtpContext = srtp_context_session(profile, srp_zeros(16), srp_zeros(sl), Vec::new(), srp_zeros(16), srp_zeros(sl), Vec::new());
+        c.ok = false;
+        c.err = "bad master key, salt or profile";
+        return c;
+    }
+    var al: i64 = 20;
+    if profile == SRTP_AEAD_AES_128_GCM {
+        al = 0;
+    }
+    return srtp_context_session(profile,
+        srtp_kdf(master_key, master_salt, SRTP_LABEL_RTP_ENC, 0, 0, 16),
+        srtp_kdf(master_key, master_salt, SRTP_LABEL_RTP_SALT, 0, 0, sl),
+        srtp_kdf(master_key, master_salt, SRTP_LABEL_RTP_AUTH, 0, 0, al),
+        srtp_kdf(master_key, master_salt, SRTP_LABEL_RTCP_ENC, 0, 0, 16),
+        srtp_kdf(master_key, master_salt, SRTP_LABEL_RTCP_SALT, 0, 0, sl),
+        srtp_kdf(master_key, master_salt, SRTP_LABEL_RTCP_AUTH, 0, 0, al));
+}
+
+// the slot of an SSRC, made on first use
+fn srp_slot(c: & mut SrtpContext, ssrc: i64) -> i64 {
+    var i: i64 = 0;
+    while i < c.ssrcs.len() {
+        if c.ssrcs.get(i) == ssrc {
+            return i;
+        }
+        i = i + 1;
+    }
+    c.ssrcs.push(ssrc);
+    c.rocs.push(0);
+    c.seqs.push(0);
+    c.started.push(0);
+    c.tops.push(0 - 1);
+    c.wins.push(Vec::filled(SRP_WINDOW, 0 - 1));
+    c.rtcp_next.push(0);
+    c.rtcp_tops.push(0 - 1);
+    c.rtcp_wins.push(Vec::filled(SRP_WINDOW, 0 - 1));
+    return i;
+}
+
+/// Set the rollover counter of an SSRC (signalled out of band, or to
+/// resume a stream).
+pub fn srtp_set_roc(c: & mut SrtpContext, ssrc: i64, roc: i64) {
+    val k: i64 = srp_slot(c, ssrc);
+    c.rocs.set(k, roc);
+}
+
+pub fn srtp_get_roc(c: & mut SrtpContext, ssrc: i64) -> i64 {
+    val k: i64 = srp_slot(c, ssrc);
+    return c.rocs.get(k);
+}
+
+/// Set the next SRTCP index a sender uses for an SSRC.
+pub fn srtcp_set_index(c: & mut SrtpContext, ssrc: i64, index: i64) {
+    val k: i64 = srp_slot(c, ssrc);
+    c.rtcp_next.set(k, index & 2147483647);
+}
+
+// ─── RTP header, index estimation, replay window ───────────────────────────
+
+/// The length of an RTP packet's header (fixed part, CSRCs, extension),
+/// or -1 when the packet is not RTP version 2 or is too short.
+pub fn srtp_rtp_header_len(p: & Vec<i64>) -> i64 {
+    if p.len() < 12 || (p.get(0) >> 6) != 2 {
+        return 0 - 1;
+    }
+    var n: i64 = 12 + 4 * (p.get(0) & 15);
+    if (p.get(0) & 16) != 0 {
+        if p.len() < n + 4 {
+            return 0 - 1;
+        }
+        n = n + 4 + 4 * ((p.get(n + 2) << 8) | p.get(n + 3));
+    }
+    if n > p.len() {
+        return 0 - 1;
+    }
+    return n;
+}
+
+/// The receiver's guess v of the ROC of a packet with sequence number
+/// `seq`, from its ROC and highest sequence number s_l (RFC 3711
+/// Appendix A). -1 when the packet would come from before ROC 0.
+pub fn srtp_estimate_roc(roc: i64, s_l: i64, seq: i64) -> i64 {
+    if s_l < 32768 {
+        if seq - s_l > 32768 {
+            return roc - 1;
+        }
+        return roc;
+    }
+    if s_l - 32768 > seq {
+        return roc + 1;
+    }
+    return roc;
+}
+
+// 0 = fresh, 1 = replayed, 2 = too old
+fn srp_replay_state(top: i64, win: & Vec<i64>, idx: i64) -> i64 {
+    if top < 0 || idx > top {
+        return 0;
+    }
+    if top - idx >= SRP_WINDOW {
+        return 2;
+    }
+    if win.get(idx % SRP_WINDOW) == idx {
+        return 1;
+    }
+    return 0;
+}
+
+// ─── SRTP ─────────────────────────────────────────────────────────────────
+
+// AES-CM IV: (salt * 2^16) XOR (SSRC * 2^64) XOR (index * 2^16)
+fn srp_cm_iv(salt: & Vec<i64>, ssrc: i64, index: i64) -> Vec<i64> {
+    var iv: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 14 {
+        iv.push(salt.get(i) & 255);
+        i = i + 1;
+    }
+    iv.push(0);
+    iv.push(0);
+    i = 0;
+    while i < 4 {
+        iv.set(4 + i, iv.get(4 + i) ^ ((ssrc >> (8 * (3 - i))) & 255));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 6 {
+        iv.set(8 + i, iv.get(8 + i) ^ ((index >> (8 * (5 - i))) & 255));
+        i = i + 1;
+    }
+    return iv;
+}
+
+// GCM IV: (00 00 || SSRC || ROC || SEQ) XOR salt (RFC 7714 §8.1)
+fn srp_gcm_iv(salt: & Vec<i64>, ssrc: i64, roc: i64, seq: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    b.push(0);
+    srp_put32(& mut b, ssrc);
+    srp_put32(& mut b, roc);
+    b.push((seq >> 8) & 255);
+    b.push(seq & 255);
+    var i: i64 = 0;
+    while i < 12 {
+        b.set(i, b.get(i) ^ (salt.get(i) & 255));
+        i = i + 1;
+    }
+    return b;
+}
+
+fn srp_rtp_tag(c: & SrtpContext, authed: & Vec<i64>, roc: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    srp_append(& mut m, authed);
+    srp_put32(& mut m, roc);
+    val mac: Vec<i64> = kdf_hmac_sha1(c.rtp_auth, m);
+    return srp_slice(& mac, 0, srtp_profile_tag_len(c.profile));
+}
+
+/// Protect an RTP packet: the SRTP packet, or ok false (bad packet or
+/// context). The sender's ROC for the SSRC goes up when the sequence
+/// number wraps.
+pub fn srtp_protect(c: & mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
+    if !c.ok {
+        return srp_fail(c.err);
+    }
+    val hl: i64 = srtp_rtp_header_len(& pkt);
+    if hl < 0 {
+        return srp_fail("not an RTP packet");
+    }
+    val seq: i64 = (pkt.get(2) << 8) | pkt.get(3);
+    val ssrc: i64 = srp_u32(& pkt, 8);
+    val k: i64 = srp_slot(c, ssrc);
+    var roc: i64 = c.rocs.get(k);
+    if c.started.get(k) != 0 {
+        val s_l: i64 = c.seqs.get(k);
+        if seq < s_l && s_l - seq > 32768 {
+            roc = (roc + 1) & 4294967295;
+        }
+        if roc != c.rocs.get(k) || seq > s_l {
+            c.seqs.set(k, seq);
+        }
+    } else {
+        c.started.set(k, 1);
+        c.seqs.set(k, seq);
+    }
+    c.rocs.set(k, roc);
+    val head: Vec<i64> = srp_slice(& pkt, 0, hl);
+    val payload: Vec<i64> = srp_slice(& pkt, hl, pkt.len());
+    var out: Vec<i64> = head;
+    if c.profile == SRTP_AEAD_AES_128_GCM {
+        val sealed: Vec<i64> = aes_gcm_seal(c.rtp_key, srp_gcm_iv(& c.rtp_salt, ssrc, roc, seq), head, payload);
+        srp_append(& mut out, & sealed);
+        return srp_good(out);
+    }
+    val index: i64 = roc * 65536 + seq;
+    val ct: Vec<i64> = srtp_aes_cm(c.rtp_key, srp_cm_iv(& c.rtp_salt, ssrc, index), payload);
+    srp_append(& mut out, & ct);
+    val tag: Vec<i64> = srp_rtp_tag(c, & out, roc);
+    srp_append(& mut out, & tag);
+    return srp_good(out);
+}
+
+/// Unprotect an SRTP packet: the RTP packet, or ok false with the reason
+/// ("authentication failed", "replayed", "too old", ...). State (ROC,
+/// highest sequence number, replay window) changes only for a packet
+/// that authenticates.
+pub fn srtp_unprotect(c: & mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
+    if !c.ok {
+        return srp_fail(c.err);
+    }
+    val tl: i64 = srtp_profile_tag_len(c.profile);
+    val hl: i64 = srtp_rtp_header_len(& pkt);
+    if hl < 0 || pkt.len() < hl + tl {
+        return srp_fail("not an SRTP packet");
+    }
+    val seq: i64 = (pkt.get(2) << 8) | pkt.get(3);
+    val ssrc: i64 = srp_u32(& pkt, 8);
+    val k: i64 = srp_slot(c, ssrc);
+    var v: i64 = c.rocs.get(k);
+    if c.started.get(k) != 0 {
+        v = srtp_estimate_roc(c.rocs.get(k), c.seqs.get(k), seq);
+    }
+    if v < 0 {
+        return srp_fail("too old");
+    }
+    val index: i64 = v * 65536 + seq;
+    val rs: i64 = srp_replay_state(c.tops.get(k), & c.wins.get(k), index);
+    if rs == 1 {
+        return srp_fail("replayed");
+    }
+    if rs == 2 {
+        return srp_fail("too old");
+    }
+    val head: Vec<i64> = srp_slice(& pkt, 0, hl);
+    var out: Vec<i64> = head;
+    if c.profile == SRTP_AEAD_AES_128_GCM {
+        val o: GcmOpened = aes_gcm_open(c.rtp_key, srp_gcm_iv(& c.rtp_salt, ssrc, v, seq), head, srp_slice(& pkt, hl, pkt.len()));
+        if !o.ok {
+            return srp_fail("authentication failed");
+        }
+        srp_append(& mut out, & o.plain);
+    } else {
+        val authed: Vec<i64> = srp_slice(& pkt, 0, pkt.len() - tl);
+        val got: Vec<i64> = srp_slice(& pkt, pkt.len() - tl, pkt.len());
+        val want: Vec<i64> = srp_rtp_tag(c, & authed, v);
+        if !srp_ct_eq(& got, & want) {
+            return srp_fail("authentication failed");
+        }
+        val pt: Vec<i64> = srtp_aes_cm(c.rtp_key, srp_cm_iv(& c.rtp_salt, ssrc, index), srp_slice(& pkt, hl, pkt.len() - tl));
+        srp_append(& mut out, & pt);
+    }
+    // update the replay window and the ROC / s_l
+    var w: Vec<i64> = c.wins.get(k);
+    w.set(index % SRP_WINDOW, index);
+    c.wins.set(k, w);
+    if index > c.tops.get(k) {
+        c.tops.set(k, index);
+    }
+    if c.started.get(k) == 0 {
+        c.started.set(k, 1);
+        c.seqs.set(k, seq);
+        c.rocs.set(k, v);
+    } else if v > c.rocs.get(k) {
+        c.rocs.set(k, v);
+        c.seqs.set(k, seq);
+    } else if v == c.rocs.get(k) && seq > c.seqs.get(k) {
+        c.seqs.set(k, seq);
+    }
+    return srp_good(out);
+}
+
+// ─── SRTCP ────────────────────────────────────────────────────────────────
+
+fn srp_rtcp_iv_gcm(salt: & Vec<i64>, ssrc: i64, index: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    b.push(0);
+    srp_put32(& mut b, ssrc);
+    b.push(0);
+    b.push(0);
+    srp_put32(& mut b, index & 2147483647);
+    var i: i64 = 0;
+    while i < 12 {
+        b.set(i, b.get(i) ^ (salt.get(i) & 255));
+        i = i + 1;
+    }
+    return b;
+}
+
+/// Protect an RTCP compound packet with encryption (the usual case).
+pub fn srtcp_protect(c: & mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
+    return srtcp_protect_opt(c, pkt, true);
+}
+
+/// Protect an RTCP packet; `encrypt` false sends it authenticated only
+/// (E flag 0). The SRTCP index of the sender's SSRC goes up by one.
+pub fn srtcp_protect_opt(c: & mut SrtpContext, pkt: Vec<i64>, encrypt: bool) -> SrtpResult {
+    if !c.ok {
+        return srp_fail(c.err);
+    }
+    if pkt.len() < 8 || (pkt.get(0) >> 6) != 2 {
+        return srp_fail("not an RTCP packet");
+    }
+    val ssrc: i64 = srp_u32(& pkt, 4);
+    val k: i64 = srp_slot(c, ssrc);
+    val index: i64 = c.rtcp_next.get(k);
+    c.rtcp_next.set(k, (index + 1) & 2147483647);
+    var eword: i64 = index;
+    if encrypt {
+        eword = eword | 2147483648;
+    }
+    var trailer: Vec<i64> = Vec::new();
+    srp_put32(& mut trailer, eword);
+    val head: Vec<i64> = srp_slice(& pkt, 0, 8);
+    val body: Vec<i64> = srp_slice(& pkt, 8, pkt.len());
+    if c.profile == SRTP_AEAD_AES_128_GCM {
+        val iv: Vec<i64> = srp_rtcp_iv_gcm(& c.rtcp_salt, ssrc, index);
+        var out: Vec<i64> = head;
+        if encrypt {
+            var aad: Vec<i64> = head;
+            srp_append(& mut aad, & trailer);
+            val sealed: Vec<i64> = aes_gcm_seal(c.rtcp_key, iv, aad, body);
+            srp_append(& mut out, & sealed);
+        } else {
+            var aad: Vec<i64> = pkt;
+            srp_append(& mut aad, & trailer);
+            var none: Vec<i64> = Vec::new();
+            val tag: Vec<i64> = aes_gcm_seal(c.rtcp_key, iv, aad, none);
+            srp_append(& mut out, & body);
+            srp_append(& mut out, & tag);
+        }
+        srp_append(& mut out, & trailer);
+        return srp_good(out);
+    }
+    var out: Vec<i64> = head;
+    if encrypt {
+        val ct: Vec<i64> = srtp_aes_cm(c.rtcp_key, srp_cm_iv(& c.rtcp_salt, ssrc, index), body);
+        srp_append(& mut out, & ct);
+    } else {
+        srp_append(& mut out, & body);
+    }
+    srp_append(& mut out, & trailer);
+    val mac: Vec<i64> = kdf_hmac_sha1(c.rtcp_auth, out);
+    srp_append(& mut out, & srp_slice(& mac, 0, srtp_profile_rtcp_tag_len(c.profile)));
+    return srp_good(out);
+}
+
+/// Unprotect an SRTCP packet (encrypted or authenticated only).
+pub fn srtcp_unprotect(c: & mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
+    if !c.ok {
+        return srp_fail(c.err);
+    }
+    val tl: i64 = srtp_profile_rtcp_tag_len(c.profile);
+    if pkt.len() < 8 + 4 + tl || (pkt.get(0) >> 6) != 2 {
+        return srp_fail("not an SRTCP packet");
+    }
+    val ssrc: i64 = srp_u32(& pkt, 4);
+    val k: i64 = srp_slot(c, ssrc);
+    var out: Vec<i64> = srp_slice(& pkt, 0, 8);
+    var eword: i64 = 0;
+    var index: i64 = 0;
+    var encrypted: bool = false;
+    if c.profile == SRTP_AEAD_AES_128_GCM {
+        // header || (ct || tag) || E|index
+        eword = srp_u32(& pkt, pkt.len() - 4);
+        index = eword & 2147483647;
+        encrypted = (eword & 2147483648) != 0;
+    } else {
+        // header || ct || E|index || tag
+        eword = srp_u32(& pkt, pkt.len() - tl - 4);
+        index = eword & 2147483647;
+        encrypted = (eword & 2147483648) != 0;
+    }
+    val rs: i64 = srp_replay_state(c.rtcp_tops.get(k), & c.rtcp_wins.get(k), index);
+    if rs == 1 {
+        return srp_fail("replayed");
+    }
+    if rs == 2 {
+        return srp_fail("too old");
+    }
+    var trailer: Vec<i64> = Vec::new();
+    srp_put32(& mut trailer, eword);
+    if c.profile == SRTP_AEAD_AES_128_GCM {
+        val iv: Vec<i64> = srp_rtcp_iv_gcm(& c.rtcp_salt, ssrc, index);
+        if encrypted {
+            var aad: Vec<i64> = srp_slice(& pkt, 0, 8);
+            srp_append(& mut aad, & trailer);
+            val o: GcmOpened = aes_gcm_open(c.rtcp_key, iv, aad, srp_slice(& pkt, 8, pkt.len() - 4));
+            if !o.ok {
+                return srp_fail("authentication failed");
+            }
+            srp_append(& mut out, & o.plain);
+        } else {
+            var aad: Vec<i64> = srp_slice(& pkt, 0, pkt.len() - 4 - 16);
+            srp_append(& mut aad, & trailer);
+            val o: GcmOpened = aes_gcm_open(c.rtcp_key, iv, aad, srp_slice(& pkt, pkt.len() - 20, pkt.len() - 4));
+            if !o.ok {
+                return srp_fail("authentication failed");
+            }
+            out = srp_slice(& pkt, 0, pkt.len() - 4 - 16);
+        }
+    } else {
+        val authed: Vec<i64> = srp_slice(& pkt, 0, pkt.len() - tl);
+        val got: Vec<i64> = srp_slice(& pkt, pkt.len() - tl, pkt.len());
+        val mac: Vec<i64> = kdf_hmac_sha1(c.rtcp_auth, authed);
+        val want: Vec<i64> = srp_slice(& mac, 0, tl);
+        if !srp_ct_eq(& got, & want) {
+            return srp_fail("authentication failed");
+        }
+        val body: Vec<i64> = srp_slice(& pkt, 8, pkt.len() - tl - 4);
+        if encrypted {
+            val pt: Vec<i64> = srtp_aes_cm(c.rtcp_key, srp_cm_iv(& c.rtcp_salt, ssrc, index), body);
+            srp_append(& mut out, & pt);
+        } else {
+            srp_append(& mut out, & body);
+        }
+    }
+    var w: Vec<i64> = c.rtcp_wins.get(k);
+    w.set(index % SRP_WINDOW, index);
+    c.rtcp_wins.set(k, w);
+    if index > c.rtcp_tops.get(k) {
+        c.rtcp_tops.set(k, index);
+    }
+    return srp_good(out);
+}
+
+/// RTP or RTCP? (RFC 5761 §4: payload types 192..223 are RTCP when RTP
+/// and RTCP share a port.)
+pub fn srtp_is_rtcp(pkt: & Vec<i64>) -> bool {
+    return pkt.len() >= 2 && pkt.get(1) >= 192 && pkt.get(1) <= 223;
+}

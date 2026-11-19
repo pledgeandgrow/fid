@@ -1,0 +1,774 @@
+// Fides sensor drivers over I2C / SPI: BME280, MPU6050, VL53L0X, SHT3x,
+// BH1750, INA219
+//
+// What is real (pure Fides, runs on any bus of stdlib i2c / spi, fake or
+// Linux or your own transport):
+//   - BME280: chip id, reset, oversampling/mode/filter settings, the
+//     calibration words (0x88..0xA1, 0xE1..0xE7) and the datasheet's
+//     integer compensation (32-bit temperature, 64-bit pressure in Q24.8,
+//     32-bit humidity in Q22.10) and its floating-point formulas
+//   - MPU6050: wake-up, full-scale ranges, one 14-byte burst of
+//     accelerometer / temperature / gyroscope, scaling to mg, m-dps, C
+//   - VL53L0X: identification, single-shot start, result polling, range
+//     and range status (the RESULT_RANGE_STATUS block at 0x14). NOT
+//     included: ST's full initialisation (reference SPAD management,
+//     temperature calibration and the tuning-settings table); without it
+//     a real module ranges with reduced accuracy
+//   - SHT3x: single-shot commands, the 6-byte answer with its CRC-8
+//     (polynomial 0x31, init 0xFF), conversion to C and %RH
+//   - BH1750: power/mode commands, measurement time register, lux
+//   - INA219: configuration, calibration register for a shunt and current
+//     LSB, shunt / bus voltage, current and power registers
+//
+// The seam: the bus (I2cBus or SpiBus); sensors that need time between
+// commands take the wait as the caller's job (a poll limit or a separate
+// read call), so nothing here sleeps.
+module sensor_drivers;
+ use vec;
+ use string;
+ use i2c;
+ use spi;
+
+// ─── Bus choice ─────────────────────────────────────────────────────────
+
+pub const SENSOR_I2C: i64 = 0;
+pub const SENSOR_SPI: i64 = 1;
+
+/// A sensor's link: an I2C address on a bus, or a chip select on an SPI
+/// bus (register reads with bit 7 set, writes with it clear).
+pub struct SensorBus {
+    pub kind: i64,
+    pub addr: i64,
+    pub i2c: I2cBus,
+    pub spi: SpiBus,
+}
+
+pub fn sensor_on_i2c(bus: I2cBus, addr: i64) -> SensorBus {
+    return SensorBus { kind: SENSOR_I2C, addr: addr, i2c: bus, spi: spi_bus_fake(spi_config(0, 8, 1000000)) };
+}
+
+pub fn sensor_on_spi(bus: SpiBus) -> SensorBus {
+    return SensorBus { kind: SENSOR_SPI, addr: 0, i2c: i2c_bus_fake(), spi: bus };
+}
+
+pub fn sensor_read_regs(s: & mut SensorBus, reg: i64, n: i64) -> Result<Vec<i64>, str> {
+    if s.kind == SENSOR_SPI {
+        return spi_read_regs(& mut s.spi, reg, n);
+    }
+    return i2c_read_regs(& mut s.i2c, s.addr, reg, n);
+}
+
+pub fn sensor_write_reg(s: & mut SensorBus, reg: i64, value: i64) -> bool {
+    if s.kind == SENSOR_SPI {
+        var v: Vec<i64> = Vec::new();
+        v.push(value & 0xFF);
+        return spi_write_regs(& mut s.spi, reg, v);
+    }
+    return i2c_write_reg8(& mut s.i2c, s.addr, reg, value);
+}
+
+pub fn sensor_read_reg(s: & mut SensorBus, reg: i64) -> i64 {
+    match sensor_read_regs(s, reg, 1) {
+        Result::Ok(b) => {
+            return b.get(0);
+        }
+        Result::Err(_) => {
+            return 0 - 1;
+        }
+    }
+}
+
+/// Send raw command bytes (I2C devices without registers).
+pub fn sensor_command(s: & mut SensorBus, bytes: Vec<i64>) -> bool {
+    match i2c_write(& mut s.i2c, s.addr, bytes) {
+        Result::Ok(_) => {
+            return true;
+        }
+        Result::Err(_) => {
+            return false;
+        }
+    }
+}
+
+pub fn sensor_read_raw(s: & mut SensorBus, n: i64) -> Result<Vec<i64>, str> {
+    return i2c_read(& mut s.i2c, s.addr, n);
+}
+
+fn sd_u16le(b: & Vec<i64>, i: i64) -> i64 {
+    return (b.get(i) & 0xFF) | ((b.get(i + 1) & 0xFF) << 8);
+}
+
+fn sd_s16le(b: & Vec<i64>, i: i64) -> i64 {
+    val v: i64 = sd_u16le(b, i);
+    if v >= 0x8000 {
+        return v - 0x10000;
+    }
+    return v;
+}
+
+fn sd_s16be(b: & Vec<i64>, i: i64) -> i64 {
+    val v: i64 = ((b.get(i) & 0xFF) << 8) | (b.get(i + 1) & 0xFF);
+    if v >= 0x8000 {
+        return v - 0x10000;
+    }
+    return v;
+}
+
+fn sd_s8(v: i64) -> i64 {
+    if (v & 0xFF) >= 0x80 {
+        return (v & 0xFF) - 0x100;
+    }
+    return v & 0xFF;
+}
+
+fn sd_s12(v: i64) -> i64 {
+    if (v & 0xFFF) >= 0x800 {
+        return (v & 0xFFF) - 0x1000;
+    }
+    return v & 0xFFF;
+}
+
+// ─── BME280 ─────────────────────────────────────────────────────────────
+
+pub const BME280_ADDR: i64 = 0x76;
+pub const BME280_ADDR_ALT: i64 = 0x77;
+pub const BME280_CHIP_ID: i64 = 0x60;
+pub const BMP280_CHIP_ID: i64 = 0x58;
+pub const BME280_REG_ID: i64 = 0xD0;
+pub const BME280_REG_RESET: i64 = 0xE0;
+pub const BME280_REG_CTRL_HUM: i64 = 0xF2;
+pub const BME280_REG_STATUS: i64 = 0xF3;
+pub const BME280_REG_CTRL_MEAS: i64 = 0xF4;
+pub const BME280_REG_CONFIG: i64 = 0xF5;
+pub const BME280_REG_DATA: i64 = 0xF7;
+pub const BME280_MODE_SLEEP: i64 = 0;
+pub const BME280_MODE_FORCED: i64 = 1;
+pub const BME280_MODE_NORMAL: i64 = 3;
+
+pub struct Bme280Cal {
+    pub t1: i64,
+    pub t2: i64,
+    pub t3: i64,
+    pub p1: i64,
+    pub p2: i64,
+    pub p3: i64,
+    pub p4: i64,
+    pub p5: i64,
+    pub p6: i64,
+    pub p7: i64,
+    pub p8: i64,
+    pub p9: i64,
+    pub h1: i64,
+    pub h2: i64,
+    pub h3: i64,
+    pub h4: i64,
+    pub h5: i64,
+    pub h6: i64,
+}
+
+/// Calibration from the 26 bytes at 0x88..0xA1 and the 7 at 0xE1..0xE7
+/// (pass an empty second block for a BMP280).
+pub fn bme280_parse_cal(a: & Vec<i64>, b: & Vec<i64>) -> Bme280Cal {
+    var c: Bme280Cal = Bme280Cal { t1: sd_u16le(a, 0), t2: sd_s16le(a, 2), t3: sd_s16le(a, 4), p1: sd_u16le(a, 6), p2: sd_s16le(a, 8), p3: sd_s16le(a, 10), p4: sd_s16le(a, 12), p5: sd_s16le(a, 14), p6: sd_s16le(a, 16), p7: sd_s16le(a, 18), p8: sd_s16le(a, 20), p9: sd_s16le(a, 22), h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 };
+    if a.len() >= 26 {
+        c.h1 = a.get(25) & 0xFF;
+    }
+    if b.len() >= 7 {
+        c.h2 = sd_s16le(b, 0);
+        c.h3 = b.get(2) & 0xFF;
+        c.h4 = sd_s12(((b.get(3) & 0xFF) << 4) | (b.get(4) & 0x0F));
+        c.h5 = sd_s12(((b.get(5) & 0xFF) << 4) | ((b.get(4) >> 4) & 0x0F));
+        c.h6 = sd_s8(b.get(6));
+    }
+    return c;
+}
+
+/// The datasheet's t_fine (shared by pressure and humidity).
+pub fn bme280_t_fine(c: & Bme280Cal, adc_t: i64) -> i64 {
+    val var1: i64 = (((adc_t >> 3) - (c.t1 << 1)) * c.t2) >> 11;
+    val d: i64 = (adc_t >> 4) - c.t1;
+    val var2: i64 = (((d * d) >> 12) * c.t3) >> 14;
+    return var1 + var2;
+}
+
+/// Temperature in 0.01 C ("5123" = 51.23 C).
+pub fn bme280_temp_c100(t_fine: i64) -> i64 {
+    return (t_fine * 5 + 128) >> 8;
+}
+
+/// Pressure in Pa as Q24.8 (divide by 256), the 64-bit formula.
+pub fn bme280_pressure_q24_8(c: & Bme280Cal, t_fine: i64, adc_p: i64) -> i64 {
+    var var1: i64 = t_fine - 128000;
+    var var2: i64 = var1 * var1 * c.p6;
+    var2 = var2 + ((var1 * c.p5) << 17);
+    var2 = var2 + (c.p4 << 35);
+    var1 = ((var1 * var1 * c.p3) >> 8) + ((var1 * c.p2) << 12);
+    var1 = (((1 << 47) + var1) * c.p1) >> 33;
+    if var1 == 0 {
+        return 0;
+    }
+    var p: i64 = 1048576 - adc_p;
+    p = (((p << 31) - var2) * 3125) / var1;
+    var1 = (c.p9 * (p >> 13) * (p >> 13)) >> 25;
+    var2 = (c.p8 * p) >> 19;
+    return ((p + var1 + var2) >> 8) + (c.p7 << 4);
+}
+
+/// Relative humidity in %RH as Q22.10 (divide by 1024).
+pub fn bme280_humidity_q22_10(c: & Bme280Cal, t_fine: i64, adc_h: i64) -> i64 {
+    var v: i64 = t_fine - 76800;
+    val a: i64 = (((adc_h << 14) - (c.h4 << 20) - (c.h5 * v)) + 16384) >> 15;
+    val b: i64 = ((((((v * c.h6) >> 10) * (((v * c.h3) >> 11) + 32768)) >> 10) + 2097152) * c.h2 + 8192) >> 14;
+    v = a * b;
+    v = v - (((((v >> 15) * (v >> 15)) >> 7) * c.h1) >> 4);
+    if v < 0 {
+        v = 0;
+    }
+    if v > 419430400 {
+        v = 419430400;
+    }
+    return v >> 12;
+}
+
+/// The datasheet's double-precision formulas: [temp C, pressure Pa, %RH].
+pub fn bme280_compensate_f64(c: & Bme280Cal, adc_t: i64, adc_p: i64, adc_h: i64) -> Vec<f64> {
+    var v1: f64 = ((adc_t as f64) / 16384.0 - (c.t1 as f64) / 1024.0) * (c.t2 as f64);
+    val dt: f64 = (adc_t as f64) / 131072.0 - (c.t1 as f64) / 8192.0;
+    var v2: f64 = dt * dt * (c.t3 as f64);
+    val t_fine: f64 = v1 + v2;
+    var out: Vec<f64> = Vec::new();
+    out.push(t_fine / 5120.0);
+    v1 = t_fine / 2.0 - 64000.0;
+    v2 = v1 * v1 * (c.p6 as f64) / 32768.0;
+    v2 = v2 + v1 * (c.p5 as f64) * 2.0;
+    v2 = v2 / 4.0 + (c.p4 as f64) * 65536.0;
+    v1 = ((c.p3 as f64) * v1 * v1 / 524288.0 + (c.p2 as f64) * v1) / 524288.0;
+    v1 = (1.0 + v1 / 32768.0) * (c.p1 as f64);
+    var p: f64 = 0.0;
+    if v1 != 0.0 {
+        p = 1048576.0 - (adc_p as f64);
+        p = (p - v2 / 4096.0) * 6250.0 / v1;
+        v1 = (c.p9 as f64) * p * p / 2147483648.0;
+        v2 = p * (c.p8 as f64) / 32768.0;
+        p = p + (v1 + v2 + (c.p7 as f64)) / 16.0;
+    }
+    out.push(p);
+    var h: f64 = t_fine - 76800.0;
+    h = ((adc_h as f64) - ((c.h4 as f64) * 64.0 + (c.h5 as f64) / 16384.0 * h)) * ((c.h2 as f64) / 65536.0 * (1.0 + (c.h6 as f64) / 67108864.0 * h * (1.0 + (c.h3 as f64) / 67108864.0 * h)));
+    h = h * (1.0 - (c.h1 as f64) * h / 524288.0);
+    if h > 100.0 {
+        h = 100.0;
+    }
+    if h < 0.0 {
+        h = 0.0;
+    }
+    out.push(h);
+    return out;
+}
+
+/// Raw ADC values from the 8 data bytes at 0xF7: [adc_p, adc_t, adc_h].
+pub fn bme280_parse_data(d: & Vec<i64>) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    r.push(((d.get(0) & 0xFF) << 12) | ((d.get(1) & 0xFF) << 4) | ((d.get(2) & 0xFF) >> 4));
+    r.push(((d.get(3) & 0xFF) << 12) | ((d.get(4) & 0xFF) << 4) | ((d.get(5) & 0xFF) >> 4));
+    if d.len() >= 8 {
+        r.push(((d.get(6) & 0xFF) << 8) | (d.get(7) & 0xFF));
+    } else {
+        r.push(0);
+    }
+    return r;
+}
+
+/// Oversampling setting code for 0,1,2,4,8,16 samples (0 skips).
+pub fn bme280_osrs(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    if n == 1 {
+        return 1;
+    }
+    if n == 2 {
+        return 2;
+    }
+    if n <= 4 {
+        return 3;
+    }
+    if n <= 8 {
+        return 4;
+    }
+    return 5;
+}
+
+pub struct Bme280 {
+    pub link: SensorBus,
+    pub cal: Bme280Cal,
+    pub has_humidity: bool,
+}
+
+/// Check the chip id, read calibration and set oversampling (x1 each),
+/// filter off and normal mode.
+pub fn bme280_init(link: SensorBus) -> Result<Bme280, str> {
+    var l: SensorBus = link;
+    val id: i64 = sensor_read_reg(& mut l, BME280_REG_ID);
+    if id != BME280_CHIP_ID && id != BMP280_CHIP_ID {
+        return Result::Err("unexpected chip id " + int_to_str(id));
+    }
+    var a: Vec<i64> = Vec::new();
+    match sensor_read_regs(& mut l, 0x88, 26) {
+        Result::Ok(v) => {
+            a = v;
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    var b: Vec<i64> = Vec::new();
+    val hum: bool = id == BME280_CHIP_ID;
+    if hum {
+        match sensor_read_regs(& mut l, 0xE1, 7) {
+            Result::Ok(v) => {
+                b = v;
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        sensor_write_reg(& mut l, BME280_REG_CTRL_HUM, bme280_osrs(1));
+    }
+    sensor_write_reg(& mut l, BME280_REG_CONFIG, 0x00);
+    sensor_write_reg(& mut l, BME280_REG_CTRL_MEAS, (bme280_osrs(1) << 5) | (bme280_osrs(1) << 2) | BME280_MODE_NORMAL);
+    return Result::Ok(Bme280 { link: l, cal: bme280_parse_cal(& a, & b), has_humidity: hum });
+}
+
+/// One reading: [temp 0.01 C, pressure Pa Q24.8, humidity Q22.10].
+pub fn bme280_read(dev: & mut Bme280) -> Result<Vec<i64>, str> {
+    var n: i64 = 6;
+    if dev.has_humidity {
+        n = 8;
+    }
+    match sensor_read_regs(& mut dev.link, BME280_REG_DATA, n) {
+        Result::Ok(d) => {
+            val raw: Vec<i64> = bme280_parse_data(& d);
+            val tf: i64 = bme280_t_fine(& dev.cal, raw.get(1));
+            var out: Vec<i64> = Vec::new();
+            out.push(bme280_temp_c100(tf));
+            out.push(bme280_pressure_q24_8(& dev.cal, tf, raw.get(0)));
+            if dev.has_humidity {
+                out.push(bme280_humidity_q22_10(& dev.cal, tf, raw.get(2)));
+            } else {
+                out.push(0);
+            }
+            return Result::Ok(out);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+// ─── MPU6050 ────────────────────────────────────────────────────────────
+
+pub const MPU6050_ADDR: i64 = 0x68;
+pub const MPU6050_WHO_AM_I_VALUE: i64 = 0x68;
+pub const MPU6050_REG_SMPLRT_DIV: i64 = 0x19;
+pub const MPU6050_REG_CONFIG: i64 = 0x1A;
+pub const MPU6050_REG_GYRO_CONFIG: i64 = 0x1B;
+pub const MPU6050_REG_ACCEL_CONFIG: i64 = 0x1C;
+pub const MPU6050_REG_ACCEL_XOUT_H: i64 = 0x3B;
+pub const MPU6050_REG_PWR_MGMT_1: i64 = 0x6B;
+pub const MPU6050_REG_WHO_AM_I: i64 = 0x75;
+
+/// LSB per g for AFS_SEL 0..3 (+-2, 4, 8, 16 g).
+pub fn mpu6050_accel_lsb_per_g(afs: i64) -> i64 {
+    return 16384 >> (afs & 3);
+}
+
+/// 10 x LSB per deg/s for FS_SEL 0..3 (+-250, 500, 1000, 2000): 1310,
+/// 655, 328, 164 (the datasheet's 131, 65.5, 32.8, 16.4).
+pub fn mpu6050_gyro_lsb10(fs: i64) -> i64 {
+    val f: i64 = fs & 3;
+    if f == 0 {
+        return 1310;
+    }
+    if f == 1 {
+        return 655;
+    }
+    if f == 2 {
+        return 328;
+    }
+    return 164;
+}
+
+pub struct Mpu6050 {
+    pub link: SensorBus,
+    pub afs: i64,
+    pub fs: i64,
+}
+
+/// Wake the device (clock from the X gyro PLL) and set the ranges.
+pub fn mpu6050_init(link: SensorBus, afs: i64, fs: i64) -> Result<Mpu6050, str> {
+    var l: SensorBus = link;
+    val who: i64 = sensor_read_reg(& mut l, MPU6050_REG_WHO_AM_I);
+    if who != MPU6050_WHO_AM_I_VALUE {
+        return Result::Err("unexpected WHO_AM_I " + int_to_str(who));
+    }
+    sensor_write_reg(& mut l, MPU6050_REG_PWR_MGMT_1, 0x01);
+    sensor_write_reg(& mut l, MPU6050_REG_GYRO_CONFIG, (fs & 3) << 3);
+    sensor_write_reg(& mut l, MPU6050_REG_ACCEL_CONFIG, (afs & 3) << 3);
+    return Result::Ok(Mpu6050 { link: l, afs: afs & 3, fs: fs & 3 });
+}
+
+/// Scale a 14-byte burst from 0x3B: [ax, ay, az] in mg, temperature in
+/// 0.001 C, [gx, gy, gz] in 0.001 deg/s.
+pub fn mpu6050_scale(raw: & Vec<i64>, afs: i64, fs: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val alsb: i64 = mpu6050_accel_lsb_per_g(afs);
+    var i: i64 = 0;
+    while i < 3 {
+        out.push((sd_s16be(raw, 2 * i) * 1000) / alsb);
+        i = i + 1;
+    }
+    // T = raw / 340 + 36.53
+    out.push((sd_s16be(raw, 6) * 1000) / 340 + 36530);
+    val glsb: i64 = mpu6050_gyro_lsb10(fs);
+    i = 4;
+    while i < 7 {
+        out.push((sd_s16be(raw, 2 * i) * 10000) / glsb);
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn mpu6050_read(dev: & mut Mpu6050) -> Result<Vec<i64>, str> {
+    match sensor_read_regs(& mut dev.link, MPU6050_REG_ACCEL_XOUT_H, 14) {
+        Result::Ok(b) => {
+            return Result::Ok(mpu6050_scale(& b, dev.afs, dev.fs));
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+// ─── VL53L0X ────────────────────────────────────────────────────────────
+
+pub const VL53L0X_ADDR: i64 = 0x29;
+pub const VL53L0X_REG_SYSRANGE_START: i64 = 0x00;
+pub const VL53L0X_REG_SYSTEM_INTERRUPT_CLEAR: i64 = 0x0B;
+pub const VL53L0X_REG_RESULT_INTERRUPT_STATUS: i64 = 0x13;
+pub const VL53L0X_REG_RESULT_RANGE_STATUS: i64 = 0x14;
+pub const VL53L0X_REG_MODEL_ID: i64 = 0xC0;
+pub const VL53L0X_REG_REVISION_ID: i64 = 0xC2;
+pub const VL53L0X_MODEL_ID_VALUE: i64 = 0xEE;
+
+/// The device range status (bits 6..3 of RESULT_RANGE_STATUS); 11 means
+/// the range is valid.
+pub fn vl53l0x_range_status(status_reg: i64) -> i64 {
+    return (status_reg & 0x78) >> 3;
+}
+
+pub fn vl53l0x_present(s: & mut SensorBus) -> bool {
+    return sensor_read_reg(s, VL53L0X_REG_MODEL_ID) == VL53L0X_MODEL_ID_VALUE;
+}
+
+/// Start a single measurement (the stop variable read at init time goes
+/// through the 0x80/0xFF/0x00 private page as in the ST API).
+pub fn vl53l0x_start_single(s: & mut SensorBus, stop_variable: i64) -> bool {
+    var ok: bool = sensor_write_reg(s, 0x80, 0x01);
+    ok = ok && sensor_write_reg(s, 0xFF, 0x01);
+    ok = ok && sensor_write_reg(s, 0x00, 0x00);
+    ok = ok && sensor_write_reg(s, 0x91, stop_variable);
+    ok = ok && sensor_write_reg(s, 0x00, 0x01);
+    ok = ok && sensor_write_reg(s, 0xFF, 0x00);
+    ok = ok && sensor_write_reg(s, 0x80, 0x00);
+    return ok && sensor_write_reg(s, VL53L0X_REG_SYSRANGE_START, 0x01);
+}
+
+/// Poll for the result (up to max_polls reads of the interrupt status),
+/// then read range and status and clear the interrupt. [range mm, device
+/// range status]; Err on timeout.
+pub fn vl53l0x_read_result(s: & mut SensorBus, max_polls: i64) -> Result<Vec<i64>, str> {
+    var n: i64 = 0;
+    while n < max_polls {
+        val st: i64 = sensor_read_reg(s, VL53L0X_REG_RESULT_INTERRUPT_STATUS);
+        if st < 0 {
+            return Result::Err("bus error");
+        }
+        if (st & 0x07) != 0 {
+            break;
+        }
+        n = n + 1;
+    }
+    if n == max_polls {
+        return Result::Err("timeout");
+    }
+    match sensor_read_regs(s, VL53L0X_REG_RESULT_RANGE_STATUS, 12) {
+        Result::Ok(b) => {
+            sensor_write_reg(s, VL53L0X_REG_SYSTEM_INTERRUPT_CLEAR, 0x01);
+            var r: Vec<i64> = Vec::new();
+            r.push(((b.get(10) & 0xFF) << 8) | (b.get(11) & 0xFF));
+            r.push(vl53l0x_range_status(b.get(0)));
+            return Result::Ok(r);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+// ─── SHT3x ──────────────────────────────────────────────────────────────
+
+pub const SHT3X_ADDR: i64 = 0x44;
+pub const SHT3X_ADDR_ALT: i64 = 0x45;
+pub const SHT3X_MEAS_HIGH_STRETCH: i64 = 0x2C06;
+pub const SHT3X_MEAS_MED_STRETCH: i64 = 0x2C0D;
+pub const SHT3X_MEAS_LOW_STRETCH: i64 = 0x2C10;
+pub const SHT3X_MEAS_HIGH: i64 = 0x2400;
+pub const SHT3X_MEAS_MED: i64 = 0x240B;
+pub const SHT3X_MEAS_LOW: i64 = 0x2416;
+pub const SHT3X_SOFT_RESET: i64 = 0x30A2;
+pub const SHT3X_HEATER_ON: i64 = 0x306D;
+pub const SHT3X_HEATER_OFF: i64 = 0x3066;
+pub const SHT3X_READ_STATUS: i64 = 0xF32D;
+pub const SHT3X_CLEAR_STATUS: i64 = 0x3041;
+
+/// Sensirion CRC-8: polynomial 0x31, initial 0xFF, no reflection.
+pub fn sht3x_crc8(bytes: & Vec<i64>) -> i64 {
+    var crc: i64 = 0xFF;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        crc = crc ^ (bytes.get(i) & 0xFF);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 0x80) != 0 {
+                crc = ((crc << 1) ^ 0x31) & 0xFF;
+            } else {
+                crc = (crc << 1) & 0xFF;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+pub fn sht3x_command_bytes(cmd: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push((cmd >> 8) & 0xFF);
+    v.push(cmd & 0xFF);
+    return v;
+}
+
+/// Temperature in 0.01 C: -45 + 175 * raw / 65535, rounded.
+pub fn sht3x_temp_c100(raw: i64) -> i64 {
+    return (17500 * raw + 32767) / 65535 - 4500;
+}
+
+/// Relative humidity in 0.01 %: 100 * raw / 65535, rounded.
+pub fn sht3x_rh100(raw: i64) -> i64 {
+    return (10000 * raw + 32767) / 65535;
+}
+
+/// Decode the 6-byte answer: [temp 0.01 C, RH 0.01 %], Err on a CRC error.
+pub fn sht3x_decode(b: & Vec<i64>) -> Result<Vec<i64>, str> {
+    if b.len() < 6 {
+        return Result::Err("short read");
+    }
+    var t: Vec<i64> = Vec::new();
+    t.push(b.get(0));
+    t.push(b.get(1));
+    var h: Vec<i64> = Vec::new();
+    h.push(b.get(3));
+    h.push(b.get(4));
+    if sht3x_crc8(& t) != (b.get(2) & 0xFF) {
+        return Result::Err("temperature CRC mismatch");
+    }
+    if sht3x_crc8(& h) != (b.get(5) & 0xFF) {
+        return Result::Err("humidity CRC mismatch");
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(sht3x_temp_c100(((b.get(0) & 0xFF) << 8) | (b.get(1) & 0xFF)));
+    out.push(sht3x_rh100(((b.get(3) & 0xFF) << 8) | (b.get(4) & 0xFF)));
+    return Result::Ok(out);
+}
+
+/// Single-shot high repeatability with clock stretching, then the answer.
+pub fn sht3x_measure(s: & mut SensorBus) -> Result<Vec<i64>, str> {
+    if !sensor_command(s, sht3x_command_bytes(SHT3X_MEAS_HIGH_STRETCH)) {
+        return Result::Err("no ACK");
+    }
+    match sensor_read_raw(s, 6) {
+        Result::Ok(b) => {
+            return sht3x_decode(& b);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+// ─── BH1750 ─────────────────────────────────────────────────────────────
+
+pub const BH1750_ADDR: i64 = 0x23;
+pub const BH1750_ADDR_ALT: i64 = 0x5C;
+pub const BH1750_POWER_DOWN: i64 = 0x00;
+pub const BH1750_POWER_ON: i64 = 0x01;
+pub const BH1750_RESET: i64 = 0x07;
+pub const BH1750_CONT_H: i64 = 0x10;
+pub const BH1750_CONT_H2: i64 = 0x11;
+pub const BH1750_CONT_L: i64 = 0x13;
+pub const BH1750_ONE_H: i64 = 0x20;
+pub const BH1750_ONE_H2: i64 = 0x21;
+pub const BH1750_ONE_L: i64 = 0x23;
+pub const BH1750_MTREG_DEFAULT: i64 = 69;
+
+/// The two commands that set the measurement time register (31..254).
+pub fn bh1750_mtreg_commands(mt: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0x40 | ((mt >> 5) & 0x07));
+    v.push(0x60 | (mt & 0x1F));
+    return v;
+}
+
+/// Illuminance in 0.01 lx: raw / 1.2 * (69 / mtreg), halved in the
+/// H-resolution mode 2.
+pub fn bh1750_lux100(raw: i64, mtreg: i64, mode: i64) -> i64 {
+    var div: i64 = 12 * mtreg;
+    if mode == BH1750_CONT_H2 || mode == BH1750_ONE_H2 {
+        div = div * 2;
+    }
+    return (raw * 1000 * 69 + div / 2) / div;
+}
+
+pub fn bh1750_read_lux100(s: & mut SensorBus, mtreg: i64, mode: i64) -> Result<i64, str> {
+    match sensor_read_raw(s, 2) {
+        Result::Ok(b) => {
+            return Result::Ok(bh1750_lux100(((b.get(0) & 0xFF) << 8) | (b.get(1) & 0xFF), mtreg, mode));
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+// ─── INA219 ─────────────────────────────────────────────────────────────
+
+pub const INA219_ADDR: i64 = 0x40;
+pub const INA219_REG_CONFIG: i64 = 0x00;
+pub const INA219_REG_SHUNT: i64 = 0x01;
+pub const INA219_REG_BUS: i64 = 0x02;
+pub const INA219_REG_POWER: i64 = 0x03;
+pub const INA219_REG_CURRENT: i64 = 0x04;
+pub const INA219_REG_CAL: i64 = 0x05;
+pub const INA219_CONFIG_DEFAULT: i64 = 0x399F;
+
+/// Configuration word: bus range 16 or 32 V, PGA gain 1/2/4/8 (40, 80,
+/// 160, 320 mV), ADC settings (4-bit codes), mode (0..7).
+pub fn ina219_config(brng_32v: bool, pga: i64, badc: i64, sadc: i64, mode: i64) -> i64 {
+    var g: i64 = 0;
+    if pga == 2 {
+        g = 1;
+    } else if pga == 4 {
+        g = 2;
+    } else if pga >= 8 {
+        g = 3;
+    }
+    var c: i64 = (g << 11) | ((badc & 0xF) << 7) | ((sadc & 0xF) << 3) | (mode & 7);
+    if brng_32v {
+        c = c | (1 << 13);
+    }
+    return c;
+}
+
+/// Calibration register: trunc(0.04096 / (current_lsb * r_shunt)), with
+/// current LSB in uA and shunt in milliohms (integers, no rounding drift).
+pub fn ina219_calibration(current_lsb_ua: i64, shunt_mohm: i64) -> i64 {
+    return 40960000 / (current_lsb_ua * shunt_mohm);
+}
+
+/// Shunt voltage in uV (signed register, 10 uV per bit).
+pub fn ina219_shunt_uv(reg: i64) -> i64 {
+    var r: i64 = reg & 0xFFFF;
+    if r >= 0x8000 {
+        r = r - 0x10000;
+    }
+    return r * 10;
+}
+
+/// Bus voltage in mV (bits 15..3, 4 mV per bit).
+pub fn ina219_bus_mv(reg: i64) -> i64 {
+    return ((reg & 0xFFFF) >> 3) * 4;
+}
+
+pub fn ina219_conversion_ready(reg: i64) -> bool {
+    return (reg & 2) != 0;
+}
+
+pub fn ina219_overflow(reg: i64) -> bool {
+    return (reg & 1) != 0;
+}
+
+/// Current in uA from the current register.
+pub fn ina219_current_ua(reg: i64, current_lsb_ua: i64) -> i64 {
+    var r: i64 = reg & 0xFFFF;
+    if r >= 0x8000 {
+        r = r - 0x10000;
+    }
+    return r * current_lsb_ua;
+}
+
+/// Power in uW from the power register (power LSB = 20 x current LSB).
+pub fn ina219_power_uw(reg: i64, current_lsb_ua: i64) -> i64 {
+    return (reg & 0xFFFF) * 20 * current_lsb_ua;
+}
+
+/// What the device computes: the current register for a shunt register.
+pub fn ina219_current_reg(shunt_reg: i64, cal: i64) -> i64 {
+    var r: i64 = shunt_reg & 0xFFFF;
+    if r >= 0x8000 {
+        r = r - 0x10000;
+    }
+    return (r * cal) / 4096;
+}
+
+/// And the power register from current and bus registers.
+pub fn ina219_power_reg(current_reg: i64, bus_reg: i64) -> i64 {
+    return (current_reg * ((bus_reg & 0xFFFF) >> 3)) / 5000;
+}
+
+pub struct Ina219 {
+    pub link: SensorBus,
+    pub current_lsb_ua: i64,
+    pub cal: i64,
+}
+
+fn ina_write16(s: & mut SensorBus, reg: i64, value: i64) -> bool {
+    return i2c_write_reg16_be(& mut s.i2c, s.addr, reg, value);
+}
+
+fn ina_read16(s: & mut SensorBus, reg: i64) -> i64 {
+    return i2c_read_reg16_be(& mut s.i2c, s.addr, reg);
+}
+
+pub fn ina219_init(link: SensorBus, current_lsb_ua: i64, shunt_mohm: i64, config: i64) -> Result<Ina219, str> {
+    var l: SensorBus = link;
+    val cal: i64 = ina219_calibration(current_lsb_ua, shunt_mohm);
+    if cal <= 0 || cal > 0xFFFE {
+        return Result::Err("calibration out of range");
+    }
+    if !ina_write16(& mut l, INA219_REG_CONFIG, config) {
+        return Result::Err("no ACK");
+    }
+    ina_write16(& mut l, INA219_REG_CAL, cal & 0xFFFE);
+    return Result::Ok(Ina219 { link: l, current_lsb_ua: current_lsb_ua, cal: cal & 0xFFFE });
+}
+
+/// [bus mV, shunt uV, current uA, power uW].
+pub fn ina219_read(dev: & mut Ina219) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(ina219_bus_mv(ina_read16(& mut dev.link, INA219_REG_BUS)));
+    out.push(ina219_shunt_uv(ina_read16(& mut dev.link, INA219_REG_SHUNT)));
+    out.push(ina219_current_ua(ina_read16(& mut dev.link, INA219_REG_CURRENT), dev.current_lsb_ua));
+    out.push(ina219_power_uw(ina_read16(& mut dev.link, INA219_REG_POWER), dev.current_lsb_ua));
+    return out;
+}

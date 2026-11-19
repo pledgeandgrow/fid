@@ -1,0 +1,274 @@
+// Fides CRC: table-driven cyclic redundancy checks of width 8 to 32 bits,
+// described by the Rocksoft/Williams model (width, polynomial, initial
+// value, input/output reflection, final XOR), as the "Catalogue of
+// parametrised CRC algorithms" lists them.
+//
+// Everything here is pure computation: no platform seam. A spec holds its
+// 256-entry table, built once by crc_spec. Reflected algorithms (CRC-32,
+// CRC-32C, Modbus, Kermit) run the right-shifting table on the reflected
+// polynomial; the others run the left-shifting one. Registers live in i64
+// values masked to the width, so nothing overflows.
+//
+// Each predefined spec is checked against its catalogue check value, the
+// CRC of the ASCII bytes "123456789", in tests/bootstrap/test_std_crc.fd.
+//
+// Usage:
+//   use crc;
+//   val c = crc32_bytes(str_bytes("123456789"));     // 0xcbf43926
+//   val s = crc_spec_crc16_modbus();
+//   var st = crc_begin(& s);
+//   crc_update(& s, & mut st, chunk1); crc_update(& s, & mut st, chunk2);
+//   val v = crc_finish(& s, st);
+
+module crc;
+use vec;
+
+/// A CRC algorithm in the Rocksoft model, with its lookup table.
+pub struct CrcSpec {
+    pub name: str,
+    pub width: i64,
+    pub poly: i64,
+    pub init: i64,
+    pub refin: bool,
+    pub refout: bool,
+    pub xorout: i64,
+    pub check: i64,
+    mask: i64,
+    table: Vec<i64>,
+}
+
+fn crc_mask_of(width: i64) -> i64 {
+    if width >= 63 { return -1; }
+    return (1 << width) - 1;
+}
+
+/// The low `width` bits of x in reverse order.
+pub fn crc_reflect(x: i64, width: i64) -> i64 {
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < width {
+        if ((x >> i) & 1) == 1 {
+            r = r | (1 << (width - 1 - i));
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// A spec from its parameters (width 8..32). `check` is the expected CRC
+/// of "123456789" (0 when unknown); crc_self_test compares against it.
+pub fn crc_spec(name: str, width: i64, poly: i64, init: i64, refin: bool, refout: bool, xorout: i64, check: i64) -> CrcSpec {
+    val mask: i64 = crc_mask_of(width);
+    var table: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    if refin {
+        val rpoly: i64 = crc_reflect(poly, width);
+        while i < 256 {
+            var r: i64 = i;
+            var k: i64 = 0;
+            while k < 8 {
+                if (r & 1) == 1 {
+                    r = (r >> 1) ^ rpoly;
+                } else {
+                    r = r >> 1;
+                }
+                k = k + 1;
+            }
+            table.push(r & mask);
+            i = i + 1;
+        }
+    } else {
+        val top: i64 = 1 << (width - 1);
+        while i < 256 {
+            var r: i64 = i << (width - 8);
+            var k: i64 = 0;
+            while k < 8 {
+                if (r & top) != 0 {
+                    r = ((r << 1) ^ poly) & mask;
+                } else {
+                    r = (r << 1) & mask;
+                }
+                k = k + 1;
+            }
+            table.push(r & mask);
+            i = i + 1;
+        }
+    }
+    return CrcSpec {
+        name: name, width: width, poly: poly & mask, init: init & mask,
+        refin: refin, refout: refout, xorout: xorout & mask, check: check,
+        mask: mask, table: table
+    };
+}
+
+// ─── Predefined algorithms (catalogue names) ───────────────────────────
+
+/// CRC-8/SMBUS: poly 0x07, check 0xf4.
+pub fn crc_spec_crc8() -> CrcSpec { return crc_spec("CRC-8/SMBUS", 8, 0x07, 0, false, false, 0, 0xf4); }
+/// CRC-8/MAXIM-DOW (1-Wire): reflected poly 0x31, check 0xa1.
+pub fn crc_spec_crc8_maxim() -> CrcSpec { return crc_spec("CRC-8/MAXIM-DOW", 8, 0x31, 0, true, true, 0, 0xa1); }
+/// CRC-16/IBM-3740, often called CCITT-FALSE: poly 0x1021, init 0xffff, check 0x29b1.
+pub fn crc_spec_crc16_ccitt_false() -> CrcSpec { return crc_spec("CRC-16/IBM-3740", 16, 0x1021, 0xffff, false, false, 0, 0x29b1); }
+/// CRC-16/KERMIT, the reflected "true CCITT": check 0x2189.
+pub fn crc_spec_crc16_kermit() -> CrcSpec { return crc_spec("CRC-16/KERMIT", 16, 0x1021, 0, true, true, 0, 0x2189); }
+/// CRC-16/XMODEM: poly 0x1021, init 0, check 0x31c3.
+pub fn crc_spec_crc16_xmodem() -> CrcSpec { return crc_spec("CRC-16/XMODEM", 16, 0x1021, 0, false, false, 0, 0x31c3); }
+/// CRC-16/MODBUS: reflected poly 0x8005, init 0xffff, check 0x4b37.
+pub fn crc_spec_crc16_modbus() -> CrcSpec { return crc_spec("CRC-16/MODBUS", 16, 0x8005, 0xffff, true, true, 0, 0x4b37); }
+/// CRC-16/ARC: reflected poly 0x8005, init 0, check 0xbb3d.
+pub fn crc_spec_crc16_arc() -> CrcSpec { return crc_spec("CRC-16/ARC", 16, 0x8005, 0, true, true, 0, 0xbb3d); }
+/// CRC-32/ISO-HDLC (zip, PNG, Ethernet): check 0xcbf43926.
+pub fn crc_spec_crc32() -> CrcSpec { return crc_spec("CRC-32/ISO-HDLC", 32, 0x04c11db7, 0xffffffff, true, true, 0xffffffff, 0xcbf43926); }
+/// CRC-32/ISCSI, Castagnoli (iSCSI, SCTP, ext4): check 0xe3069283.
+pub fn crc_spec_crc32c() -> CrcSpec { return crc_spec("CRC-32/ISCSI", 32, 0x1edc6f41, 0xffffffff, true, true, 0xffffffff, 0xe3069283); }
+/// CRC-32/BZIP2 (non-reflected CRC-32): check 0xfc891918.
+pub fn crc_spec_crc32_bzip2() -> CrcSpec { return crc_spec("CRC-32/BZIP2", 32, 0x04c11db7, 0xffffffff, false, false, 0xffffffff, 0xfc891918); }
+
+// ─── Streaming ─────────────────────────────────────────────────────────
+
+/// The register before any data. A reflected algorithm keeps its register
+/// reflected, so the initial value is reflected too.
+pub fn crc_begin(spec: & CrcSpec) -> i64 {
+    if spec.refin {
+        return crc_reflect(spec.init, spec.width);
+    }
+    return spec.init;
+}
+
+/// Feed bytes (0..255 each) into the register `state`.
+pub fn crc_update(spec: & CrcSpec, state: & mut i64, data: Vec<i64>) {
+    var r: i64 = *state;
+    var i: i64 = 0;
+    val n: i64 = data.len();
+    if spec.refin {
+        while i < n {
+            r = (r >> 8) ^ spec.table.get((r ^ data.get(i)) & 255);
+            i = i + 1;
+        }
+    } else {
+        val sh: i64 = spec.width - 8;
+        while i < n {
+            val idx: i64 = ((r >> sh) ^ data.get(i)) & 255;
+            r = ((r << 8) ^ spec.table.get(idx)) & spec.mask;
+            i = i + 1;
+        }
+    }
+    *state = r & spec.mask;
+}
+
+/// The CRC value from a register: output reflection and the final XOR.
+pub fn crc_finish(spec: & CrcSpec, state: i64) -> i64 {
+    var r: i64 = state;
+    if spec.refin != spec.refout {
+        r = crc_reflect(r, spec.width);
+    }
+    return (r ^ spec.xorout) & spec.mask;
+}
+
+/// The CRC of a whole byte vector.
+pub fn crc_compute(spec: & CrcSpec, data: Vec<i64>) -> i64 {
+    var st: i64 = crc_begin(spec);
+    crc_update(spec, & mut st, data);
+    return crc_finish(spec, st);
+}
+
+/// The CRC of "123456789" equals the spec's catalogue check value.
+pub fn crc_self_test(spec: & CrcSpec) -> bool {
+    return crc_compute(spec, str_bytes("123456789")) == spec.check;
+}
+
+/// Bit-at-a-time CRC without the table: the definition, for cross-checks.
+pub fn crc_compute_bitwise(spec: & CrcSpec, data: Vec<i64>) -> i64 {
+    val top: i64 = 1 << (spec.width - 1);
+    var r: i64 = spec.init;
+    var i: i64 = 0;
+    while i < data.len() {
+        var b: i64 = data.get(i) & 255;
+        if spec.refin { b = crc_reflect(b, 8); }
+        r = r ^ (b << (spec.width - 8));
+        var k: i64 = 0;
+        while k < 8 {
+            if (r & top) != 0 {
+                r = ((r << 1) ^ spec.poly) & spec.mask;
+            } else {
+                r = (r << 1) & spec.mask;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if spec.refout { r = crc_reflect(r, spec.width); }
+    return (r ^ spec.xorout) & spec.mask;
+}
+
+// ─── Shortcuts ─────────────────────────────────────────────────────────
+
+/// CRC-32 (zip/PNG) of bytes.
+pub fn crc32_bytes(data: Vec<i64>) -> i64 {
+    val s: CrcSpec = crc_spec_crc32();
+    return crc_compute(& s, data);
+}
+
+/// CRC-32C (Castagnoli) of bytes.
+pub fn crc32c_bytes(data: Vec<i64>) -> i64 {
+    val s: CrcSpec = crc_spec_crc32c();
+    return crc_compute(& s, data);
+}
+
+/// CRC-16/MODBUS of bytes. The frame carries it low byte first.
+pub fn crc16_modbus_bytes(data: Vec<i64>) -> i64 {
+    val s: CrcSpec = crc_spec_crc16_modbus();
+    return crc_compute(& s, data);
+}
+
+/// Append the Modbus RTU CRC to a frame (low byte, then high byte).
+pub fn crc16_modbus_append(frame: Vec<i64>) -> Vec<i64> {
+    val c: i64 = crc16_modbus_bytes(frame);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < frame.len() { out.push(frame.get(i) & 255); i = i + 1; }
+    out.push(c & 255);
+    out.push((c >> 8) & 255);
+    return out;
+}
+
+/// Whether a Modbus RTU frame ends with a correct CRC.
+pub fn crc16_modbus_check(frame: Vec<i64>) -> bool {
+    if frame.len() < 3 { return false; }
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < frame.len() - 2 { body.push(frame.get(i)); i = i + 1; }
+    val c: i64 = crc16_modbus_bytes(body);
+    return frame.get(frame.len() - 2) == (c & 255) && frame.get(frame.len() - 1) == ((c >> 8) & 255);
+}
+
+/// CRC-16/XMODEM of bytes.
+pub fn crc16_xmodem_bytes(data: Vec<i64>) -> i64 {
+    val s: CrcSpec = crc_spec_crc16_xmodem();
+    return crc_compute(& s, data);
+}
+
+/// CRC-16/CCITT-FALSE (IBM-3740) of bytes.
+pub fn crc16_ccitt_bytes(data: Vec<i64>) -> i64 {
+    val s: CrcSpec = crc_spec_crc16_ccitt_false();
+    return crc_compute(& s, data);
+}
+
+/// CRC-8/SMBUS of bytes.
+pub fn crc8_bytes(data: Vec<i64>) -> i64 {
+    val s: CrcSpec = crc_spec_crc8();
+    return crc_compute(& s, data);
+}
+
+/// A CRC as lowercase hex padded to the width (2, 4 or 8 digits).
+pub fn crc_hex(value: i64, width: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var n: i64 = (width + 3) / 4;
+    var out: str = "";
+    while n > 0 {
+        n = n - 1;
+        val d: i64 = (value >> (n * 4)) & 15;
+        out = out + str_slice(digits, d, d + 1);
+    }
+    return out;
+}

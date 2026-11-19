@@ -1,0 +1,354 @@
+// stdlib/opcua: the NodeId and String examples of OPC UA Part 6 (5.2.2.4, 5.2.2.9) byte for byte, Variants, Float rounding, DateTime, DataValue, Hello/Acknowledge/Error, MSG chunking, a Read request/response round trip; then the symmetric half of SecurityPolicy Basic256Sha256: P_SHA256 against a value computed with Python's hmac, AES-256 against FIPS 197 C.3 and CBC against SP 800-38A F.2.5/F.2.6, a secured MSG chunk byte for byte against one built independently (Python hmac + OpenSSL AES-CBC from the same nonces), tampering, replay, chunking, Sign mode and token renewal; SecurityPolicy None OPN messages; and the OpenSecureChannel and session service bodies. The RSA half (OPN messages, session signatures, password secrets) is in test_std_opcua_secure.fd, which runs compiled.
+// Expected output:
+// nodeids: 6 of 6 encode as expected and decode back
+// nodeid text: ns=1;s=Hot? i=72 ns=4;g=72962B91-FA75-4AE6-8D28-B404DC7DAF63
+// strings: 06000000e6b0b4426f79 ffffffff
+// variants: 7 of 7 encode as expected and decode back
+// float32: 7f7fffff 7f800000 00000001 4b800000 3dcccccd c0490fdb
+// datetime: 1970 is 00803ed5deb19d01, back to unix ms 1700000000123
+// datavalue: 0b0b00000000008035400000000000803ed5deb19d01 -> 21.5 status 0
+// hello: 48454c46380000000000000000000100000001000000000000000000180000006f
+// hello decoded: url opc.tcp://localhost:4840 buffers 65536
+// ack decoded: ok max message 16777216; small buffer ack rejected
+// err decoded: 80010000 reason bad things
+// read request body starts 01007702, 3 chunks of at most 64 bytes, joined ok
+// server got: handle 7 nodes ns=2;s=Temperature i=2258 attrs 13 13
+// client got: handle 7 results 2: 21.5 status 0, status 80340000
+// p_sha256: b72593c43fee5fafa0256cd6bb904ff40c066a225db95f66dd744e20858a2220 ddf75067e3d76ac714c08e24eabd85ff425d7f5fb25e6e083b94b174e29db89b c513e9172274d5ed54e52a3552901ae0
+// aes-256: 8ea2b7ca516745bfeafc49904b496089 back 00112233445566778899aabbccddeeff
+// cbc: f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d39f23369a9d9bacfa530e26304231461b2eb05e2c39be9fcda6c19078c6a9d1b back true
+// nonces 4ada9928fcdf54b854aa3b834a71007f5f4158e2a0ed65bf6303a3a42d63c54f 81c0aea4ba0d7742ca892b321fdd3a9c436e6866281e9ed8f4e16249319ebdad
+// secured chunk: 4d53474650000000070000000100000002b6a76c809b455027f7164847bb904d28b209c91404ea44ccb1a8a0e89121772afb5b67f51e97cc358c503e3e2fd1cf9d592c693c0124378779849dd86605b2
+// server opened: hello, secure channel seq 1 token 1
+// tampered: signature does not verify; replayed: sequence number 1 out of order
+// chunked: 8 chunks of at most 96 bytes, joined true
+// renew: client token 2, server answers with 1 (accepted true), switches to 2 on the client's message: 2 (accepted true)
+// sign only: ok true, readable body true
+// policy None OPN: 4f504e46 opened true body same true
+// opn request: renew true mode 3 nonce 32 lifetime 600000; response channel 7 token 2 result 0
+// create session: urn:fides:client opc.tcp://localhost:4840 fides nonce 32 timeout 60000
+// create session response: session ns=1;i=9 token ns=1;g=72962B91-FA75-4AE6-8D28-B404DC7DAF63 endpoints 1 tokens anon(0) user(1) max 0
+// activate: user alice password secret enc none; anonymous policy anon
+// close session: handle 12 result 0
+use opcua;
+use aes_gcm;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hb(s: str) -> Vec<i64> {
+    return hex_decode_bytes(s);
+}
+
+var nd_ok: i64 = 0;
+var nd_n: i64 = 0;
+
+fn nodeid(n: UaNodeId, want: str) {
+    nd_n = nd_n + 1;
+    var out: Vec<i64> = Vec::new();
+    ua_put_nodeid(&mut out, &n);
+    if hx(out) != want {
+        println("nodeid " + ua_nodeid_text(&n) + ": " + hx(out) + " want " + want);
+        return;
+    }
+    var r: UaReader = ua_reader(out);
+    val back: UaNodeId = ua_get_nodeid(&mut r);
+    if r.ok && ua_nodeid_eq(&back, &n) {
+        nd_ok = nd_ok + 1;
+    } else {
+        println("nodeid decode " + want + " differs");
+    }
+}
+
+var vr_ok: i64 = 0;
+var vr_n: i64 = 0;
+
+fn variant(v: UaVariant, want: str) {
+    vr_n = vr_n + 1;
+    var out: Vec<i64> = Vec::new();
+    ua_put_variant(&mut out, &v);
+    if hx(out) != want {
+        println("variant: " + hx(out) + " want " + want);
+        return;
+    }
+    var r: UaReader = ua_reader(out);
+    val back: UaVariant = ua_get_variant(&mut r);
+    var again: Vec<i64> = Vec::new();
+    ua_put_variant(&mut again, &back);
+    if r.ok && hx(again) == want {
+        vr_ok = vr_ok + 1;
+    } else {
+        println("variant decode " + want + " differs: " + hx(again));
+    }
+}
+
+fn f32hex(x: f64) -> str {
+    var out: Vec<i64> = Vec::new();
+    val b: i64 = ua_f64_to_f32_bits(x);
+    out.push((b >> 24) & 255);
+    out.push((b >> 16) & 255);
+    out.push((b >> 8) & 255);
+    out.push(b & 255);
+    return hx(out);
+}
+
+fn main() {
+    nodeid(ua_node_num(0, 72), "0048");
+    nodeid(ua_node_num(5, 1025), "01050104");
+    nodeid(ua_node_num(2, 70000), "02020070110100");
+    nodeid(ua_node_str(1, str_from_bytes(hb("486f74e6b0b4"))), "03010006000000486f74e6b0b4");
+    nodeid(ua_node_guid(4, "72962B91-FA75-4AE6-8D28-B404DC7DAF63"), "040400912b967275fae64a8d28b404dc7daf63");
+    var op: UaNodeId = ua_node_num(1, 0);
+    op.kind = UA_ID_OPAQUE;
+    op.bytes = hb("dead");
+    nodeid(op, "05010002000000dead");
+    println("nodeids: " + int_to_str(nd_ok) + " of " + int_to_str(nd_n) + " encode as expected and decode back");
+    val hot: UaNodeId = ua_node_str(1, "Hot?");
+    println("nodeid text: " + ua_nodeid_text(&hot) + " " + ua_nodeid_text(&ua_node_num(0, 72)) + " " + ua_nodeid_text(&ua_node_guid(4, "72962b91-fa75-4ae6-8d28-b404dc7daf63")));
+
+    var s1: Vec<i64> = Vec::new();
+    ua_put_string(&mut s1, str_from_bytes(hb("e6b0b4426f79")));
+    var s2: Vec<i64> = Vec::new();
+    ua_put_null_string(&mut s2);
+    println("strings: " + hx(s1) + " " + hx(s2));
+
+    variant(ua_var_int(UA_INT32, 5), "0605000000");
+    variant(ua_var_int(UA_INT16, -2), "04feff");
+    var arr: UaVariant = ua_var_double(1.5);
+    arr.is_array = true;
+    variant(arr, "8b01000000000000000000f83f");
+    variant(ua_var_float(1.5), "0a0000c03f");
+    variant(ua_var_string("x"), "0c0100000078");
+    variant(ua_var_int(UA_BOOLEAN, 1), "0101");
+    variant(ua_var_int(UA_UINT64, -1), "09ffffffffffffffff");
+    println("variants: " + int_to_str(vr_ok) + " of " + int_to_str(vr_n) + " encode as expected and decode back");
+
+    println("float32: " + f32hex(3.4028234663852886e+38) + " " + f32hex(1.0e39) + " " + f32hex(1.0e-45) + " " + f32hex(16777217.0) + " " + f32hex(0.1) + " " + f32hex(-3.14159265358979));
+
+    var dt: Vec<i64> = Vec::new();
+    ua_put_i64(&mut dt, ua_datetime_from_unix_ms(0));
+    println("datetime: 1970 is " + hx(dt) + ", back to unix ms " + int_to_str(ua_datetime_to_unix_ms(ua_datetime_from_unix_ms(1700000000123))));
+
+    var dv: UaDataValue = ua_datavalue(ua_var_double(21.5));
+    dv.has_status = true;
+    dv.has_server_ts = true;
+    dv.server_ts = ua_datetime_from_unix_ms(0);
+    var dvb: Vec<i64> = Vec::new();
+    ua_put_datavalue(&mut dvb, &dv);
+    var dr: UaReader = ua_reader(dvb);
+    val dvd: UaDataValue = ua_get_datavalue(&mut dr);
+    println("datavalue: " + hx(dvb) + " -> " + float_to_str(dvd.value.floats.get(0)) + " status " + int_to_str(dvd.status));
+
+    val hel: Vec<i64> = ua_encode_hello(&ua_hello("opc.tcp://localhost:4840", 65536));
+    println("hello: " + str_slice(hx(hel), 0, 66));
+    val hd: UaHello = ua_decode_hello(hel);
+    println("hello decoded: url " + hd.url + " buffers " + int_to_str(hd.recv_buf));
+    val ack: UaHello = ua_decode_hello(hb("41434b461c00000000000000000001000000010000000001" + "00000000"));
+    val small: UaHello = ua_decode_hello(hb("41434b461c00000000000000001000000000010000000001" + "00000000"));
+    var sm: str = "accepted";
+    if !small.ok {
+        sm = "rejected";
+    }
+    var ak: str = "bad";
+    if ack.ok {
+        ak = "ok";
+    }
+    println("ack decoded: " + ak + " max message " + int_to_str(ack.max_msg) + "; small buffer ack " + sm);
+    var e: UaHello = ua_hello("", 0);
+    e.mtype = "ERR";
+    e.error = 0x80010000;
+    e.reason = "bad things";
+    val ed: UaHello = ua_decode_hello(ua_encode_hello(&e));
+    println("err decoded: " + int_to_hex(ed.error) + " reason " + ed.reason);
+
+    // Read: client -> server -> client, through MSG chunks of 64 bytes
+    var q: UaReadRequest = ua_read_request(7, ua_datetime_from_unix_ms(1700000000000));
+    ua_read_add(&mut q, ua_node_str(2, "Temperature"), UA_ATTR_VALUE);
+    ua_read_add(&mut q, ua_node_num(0, 2258), UA_ATTR_VALUE);
+    val body: Vec<i64> = ua_encode_read_request(&q);
+    val chunks: Vec<Vec<i64>> = ua_msg_chunks(5, 1, 51, 3, &body, 64);
+    var longest: i64 = 0;
+    var i: i64 = 0;
+    while i < chunks.len() {
+        if chunks.get(i).len() > longest {
+            longest = chunks.get(i).len();
+        }
+        i = i + 1;
+    }
+    val joined: UaMsg = ua_msg_join(&chunks);
+    var jk: str = "failed: " + joined.error;
+    if joined.ok && hx(joined.body) == hx(body) {
+        jk = "ok";
+    }
+    var atmost: str = "more than";
+    if longest <= 64 {
+        atmost = "at most";
+    }
+    println("read request body starts " + str_slice(hx(body), 0, 8) + ", " + int_to_str(chunks.len()) + " chunks of " + atmost + " 64 bytes, joined " + jk);
+    val sq: UaReadRequest = ua_decode_read_request(joined.body);
+    println("server got: handle " + int_to_str(sq.handle) + " nodes " + ua_nodeid_text(&sq.nodes.get(0)) + " " + ua_nodeid_text(&sq.nodes.get(1)) + " attrs " + int_to_str(sq.attrs.get(0)) + " " + int_to_str(sq.attrs.get(1)));
+    var resp: UaReadResponse = ua_read_response(sq.handle, ua_datetime_from_unix_ms(1700000000500));
+    var v1: UaDataValue = ua_datavalue(ua_var_double(21.5));
+    v1.has_status = true;
+    v1.has_server_ts = true;
+    v1.server_ts = resp.timestamp;
+    resp.results.push(v1);
+    var v2: UaDataValue = ua_datavalue(ua_variant(0));
+    v2.has_value = false;
+    v2.has_status = true;
+    v2.status = UA_BAD_NODE_ID_UNKNOWN;
+    resp.results.push(v2);
+    val rchunks: Vec<Vec<i64>> = ua_msg_chunks(5, 1, 52, 3, &ua_encode_read_response(&resp), 8192);
+    val rj: UaMsg = ua_msg_join(&rchunks);
+    val cr: UaReadResponse = ua_decode_read_response(rj.body);
+    val r0: UaDataValue = cr.results.get(0);
+    val r1: UaDataValue = cr.results.get(1);
+    println("client got: handle " + int_to_str(cr.handle) + " results " + int_to_str(cr.results.len()) + ": " + float_to_str(r0.value.floats.get(0)) + " status " + int_to_str(r0.status) + ", status " + int_to_hex(r1.status));
+
+    secure_part();
+}
+
+fn yes(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn rep(b: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((b + i) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn opn_q(nonce: Vec<i64>, renew: bool) -> UaOpnRequest {
+    return UaOpnRequest { hdr: ua_request_header(ua_node_num(0, 0), 0, 1), renew: renew, mode: UA_MODE_SIGN_ENCRYPT, nonce: nonce, lifetime: 600000, error: "" };
+}
+
+fn secure_part() {
+    val km: UaKeys = ua_derive_keys(rep(0, 32), rep(32, 32));
+    println("p_sha256: " + hx(km.sign) + " " + hx(km.enc) + " " + hx(km.iv));
+    val k256: Vec<i64> = rep(0, 32);
+    val ct: Vec<i64> = aes_ecb_encrypt(k256, hb("00112233445566778899aabbccddeeff"));
+    val tab: Vec<i64> = ua_aes_tables();
+    val rk: Vec<i64> = ua_aes_round_keys(& k256, & tab);
+    println("aes-256: " + hx(ct) + " back " + hx(ua_aes_decrypt_block(& rk, & tab, & ct)));
+    val ck: Vec<i64> = hb("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+    val civ: Vec<i64> = hb("000102030405060708090a0b0c0d0e0f");
+    val cp: Vec<i64> = hb("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+    val cc: Vec<i64> = ua_aes_cbc_encrypt(& ck, & civ, & cp);
+    println("cbc: " + hx(cc) + " back " + yes(hx(ua_aes_cbc_decrypt(& ck, & civ, & cc)) == hx(cp)));
+
+    // the symmetric half of a Basic256Sha256 channel (nonces from seeded generators)
+    var cl: UaChannel = ua_channel(true, UA_POLICY_BASIC256SHA256, UA_MODE_SIGN_ENCRYPT, Vec::new(), ua_no_private_key(), Vec::new(), str_bytes("client seed"));
+    var sv: UaChannel = ua_channel(false, UA_POLICY_BASIC256SHA256, UA_MODE_SIGN_ENCRYPT, Vec::new(), ua_no_private_key(), Vec::new(), str_bytes("server seed"));
+    val cn: Vec<i64> = ua_channel_nonce(& mut cl);
+    val p1: UaOpnResponse = ua_channel_issue(& mut sv, & opn_q(cn, false), 7, 1700000000000, 600000);
+    ua_channel_install(& mut cl, & p1, 1700000000000);
+    println("nonces " + hx(cn) + " " + hx(p1.nonce));
+    val msg: Vec<Vec<i64>> = ua_sym_seal(& mut cl, "MSG", 1, & str_bytes("hello, secure channel"), 8192);
+    println("secured chunk: " + hx(msg.get(0)));
+    var bad: Vec<i64> = msg.get(0);
+    bad.set(40, bad.get(40) ^ 1);
+    var badl: Vec<Vec<i64>> = Vec::new();
+    badl.push(bad);
+    val ot: UaOpened = ua_sym_open(& mut sv, & badl);
+    val o1: UaOpened = ua_sym_open(& mut sv, & msg);
+    println("server opened: " + str_from_bytes(o1.body) + " seq " + int_to_str(o1.seq) + " token " + int_to_str(o1.token_id));
+    val orp: UaOpened = ua_sym_open(& mut sv, & msg);
+    println("tampered: " + ot.error + "; replayed: " + orp.error);
+    var big: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 {
+        big.push(i & 255);
+        i = i + 1;
+    }
+    val chunks: Vec<Vec<i64>> = ua_sym_seal(& mut cl, "MSG", 2, & big, 96);
+    var longest: i64 = 0;
+    i = 0;
+    while i < chunks.len() {
+        if chunks.get(i).len() > longest {
+            longest = chunks.get(i).len();
+        }
+        i = i + 1;
+    }
+    val ob: UaOpened = ua_sym_open(& mut sv, & chunks);
+    println("chunked: " + int_to_str(chunks.len()) + " chunks of at most " + int_to_str(longest) + " bytes, joined " + yes(ob.ok && hx(ob.body) == hx(big)));
+    // renewal
+    val cn2: Vec<i64> = ua_channel_nonce(& mut cl);
+    val p2: UaOpnResponse = ua_channel_issue(& mut sv, & opn_q(cn2, true), 7, 1700000400000, 600000);
+    ua_channel_install(& mut cl, & p2, 1700000400000);
+    val r1: Vec<Vec<i64>> = ua_sym_seal(& mut sv, "MSG", 2, & str_bytes("old"), 8192);
+    val a1: UaOpened = ua_sym_open(& mut cl, & r1);
+    val q2: Vec<Vec<i64>> = ua_sym_seal(& mut cl, "MSG", 3, & str_bytes("new"), 8192);
+    val a2: UaOpened = ua_sym_open(& mut sv, & q2);
+    val r2: Vec<Vec<i64>> = ua_sym_seal(& mut sv, "MSG", 3, & str_bytes("new"), 8192);
+    val a3: UaOpened = ua_sym_open(& mut cl, & r2);
+    println("renew: client token " + int_to_str(cl.token_id) + ", server answers with " + int_to_str(a1.token_id) + " (accepted " + yes(a1.ok) + "), switches to 2 on the client's message: " + int_to_str(a3.token_id) + " (accepted " + yes(a2.ok && a3.ok) + ")");
+    // Sign mode: signed, not encrypted
+    var sc: UaChannel = ua_channel(true, UA_POLICY_BASIC256SHA256, UA_MODE_SIGN, Vec::new(), ua_no_private_key(), Vec::new(), str_bytes("c2"));
+    var ss: UaChannel = ua_channel(false, UA_POLICY_BASIC256SHA256, UA_MODE_SIGN, Vec::new(), ua_no_private_key(), Vec::new(), str_bytes("s2"));
+    val sn: Vec<i64> = ua_channel_nonce(& mut sc);
+    val sp: UaOpnResponse = ua_channel_issue(& mut ss, & opn_q(sn, false), 9, 0, 600000);
+    ua_channel_install(& mut sc, & sp, 0);
+    val sm: Vec<Vec<i64>> = ua_sym_seal(& mut sc, "MSG", 1, & str_bytes("signed"), 8192);
+    val so: UaOpened = ua_sym_open(& mut ss, & sm);
+    println("sign only: ok " + yes(so.ok) + ", readable body " + yes(str_contains(hx(sm.get(0)), hx(str_bytes("signed")))));
+    // SecurityPolicy None: OPN in clear
+    var nc: UaChannel = ua_channel(true, UA_POLICY_NONE, UA_MODE_NONE, Vec::new(), ua_no_private_key(), Vec::new(), str_bytes("n"));
+    var ns: UaChannel = ua_channel(false, UA_POLICY_NONE, UA_MODE_NONE, Vec::new(), ua_no_private_key(), Vec::new(), str_bytes("m"));
+    val nb: Vec<i64> = ua_encode_opn_request(& opn_q(Vec::new(), false));
+    val nm: Vec<i64> = ua_opn_seal(& mut nc, 1, & nb);
+    val no: UaOpened = ua_opn_open(& mut ns, nm);
+    println("policy None OPN: " + str_slice(hx(nm), 0, 8) + " opened " + yes(no.ok) + " body same " + yes(hx(no.body) == hx(nb)));
+    val dq: UaOpnRequest = ua_decode_opn_request(ua_encode_opn_request(& opn_q(cn2, true)));
+    val dr: UaOpnResponse = ua_decode_opn_response(ua_encode_opn_response(& p2));
+    println("opn request: renew " + yes(dq.renew) + " mode " + int_to_str(dq.mode) + " nonce " + int_to_str(dq.nonce.len()) + " lifetime " + int_to_str(dq.lifetime) + "; response channel " + int_to_str(dr.channel_id) + " token " + int_to_str(dr.token_id) + " result " + int_to_str(dr.hdr.result));
+    // session services
+    val csq: UaCreateSessionRequest = UaCreateSessionRequest {
+        hdr: ua_request_header(ua_node_num(0, 0), 0, 10), app_uri: "urn:fides:client", app_name: "client", endpoint_url: "opc.tcp://localhost:4840", session_name: "fides",
+        nonce: rep(7, 32), cert: Vec::new(), timeout: 60000.0, max_response: 0, error: "",
+    };
+    val csd: UaCreateSessionRequest = ua_decode_create_session_request(ua_encode_create_session_request(& csq));
+    println("create session: " + csd.app_uri + " " + csd.endpoint_url + " " + csd.session_name + " nonce " + int_to_str(csd.nonce.len()) + " timeout " + float_to_str(csd.timeout) + csd.error);
+    var ep: UaEndpoint = UaEndpoint { url: "opc.tcp://localhost:4840", server_uri: "urn:fides:server", cert: Vec::new(), mode: UA_MODE_NONE, policy: UA_POLICY_NONE, token_ids: Vec::new(), token_types: Vec::new(), token_policies: Vec::new(), level: 1 };
+    ep.token_ids.push("anon");
+    ep.token_types.push(UA_TOKEN_ANONYMOUS);
+    ep.token_policies.push("");
+    ep.token_ids.push("user");
+    ep.token_types.push(UA_TOKEN_USERNAME);
+    ep.token_policies.push(UA_POLICY_NONE);
+    var csr: UaCreateSessionResponse = UaCreateSessionResponse {
+        hdr: UaResponseHeader { timestamp: 0, handle: 10, result: UA_GOOD }, session_id: ua_node_num(1, 9), auth_token: ua_node_guid(1, "72962B91-FA75-4AE6-8D28-B404DC7DAF63"),
+        timeout: 60000.0, nonce: rep(9, 32), cert: Vec::new(), endpoints: Vec::new(), sig_alg: "", signature: Vec::new(), max_request: 0, error: "",
+    };
+    csr.endpoints.push(ep);
+    val crd: UaCreateSessionResponse = ua_decode_create_session_response(ua_encode_create_session_response(& csr));
+    val e0: UaEndpoint = crd.endpoints.get(0);
+    println("create session response: session " + ua_nodeid_text(& crd.session_id) + " token " + ua_nodeid_text(& crd.auth_token) + " endpoints " + int_to_str(crd.endpoints.len()) + " tokens " + e0.token_ids.get(0) + "(" + int_to_str(e0.token_types.get(0)) + ") " + e0.token_ids.get(1) + "(" + int_to_str(e0.token_types.get(1)) + ") max " + int_to_str(crd.max_request) + crd.error);
+    var aq: UaActivateSessionRequest = UaActivateSessionRequest {
+        hdr: ua_request_header(crd.auth_token, 0, 11), sig_alg: "", signature: Vec::new(), locales: Vec::new(), token_type: UA_USERNAME_TOKEN_ID,
+        policy_id: "user", user: "alice", password: str_bytes("secret"), enc_alg: "", error: "",
+    };
+    aq.locales.push("en");
+    val ad: UaActivateSessionRequest = ua_decode_activate_session_request(ua_encode_activate_session_request(& aq));
+    aq.token_type = UA_ANONYMOUS_TOKEN_ID;
+    aq.policy_id = "anon";
+    val an: UaActivateSessionRequest = ua_decode_activate_session_request(ua_encode_activate_session_request(& aq));
+    var encs: str = ad.enc_alg;
+    if encs == "" {
+        encs = "none";
+    }
+    println("activate: user " + ad.user + " password " + str_from_bytes(ad.password) + " enc " + encs + ad.error + "; anonymous policy " + an.policy_id + an.error);
+    val chq: UaRequestHeader = ua_decode_close_session_request(ua_encode_close_session_request(& ua_request_header(crd.auth_token, 0, 12), true));
+    val chr: UaResponseHeader = ua_decode_response_header(ua_encode_close_session_response(& UaResponseHeader { timestamp: 0, handle: chq.handle, result: UA_GOOD }), UA_CLOSE_SESSION_RESPONSE_ID);
+    println("close session: handle " + int_to_str(chr.handle) + " result " + int_to_str(chr.result));
+}

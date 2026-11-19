@@ -1,0 +1,118 @@
+// Roadmap P6: tensor parallelism over several ranks (one process each).
+// tests/tp/check.sh builds this with `fid ccompile` and runs it on 2 ranks
+// (p_tp_init(2)) and on 3 (FID_TP_WORLD=3, which overrides the program).
+// Rank r owns a block of columns of A and the same block of rows of B; the
+// all-reduce of the partial products must equal A x B computed on one rank.
+use tensor;
+use shard;
+
+fn vec1(a: i64) -> Vec<i64> {
+    val v = Vec::new();
+    v.push(a);
+    return v;
+}
+
+fn vec2(a: i64, b: i64) -> Vec<i64> {
+    val v = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn a_at(i: i64, j: i64) -> f64 {
+    return ((i * 7 + j * 3) % 11) as f64 - 5.0;
+}
+
+fn b_at(i: i64, j: i64) -> f64 {
+    return ((i * 5 + j * 2) % 9) as f64 * 0.5;
+}
+
+// rows x cols of A (which == 0) or B, starting at row r0 and column c0
+fn block(which: i64, rows: i64, cols: i64, r0: i64, c0: i64) -> Tensor {
+    val t = zeros(vec2(rows, cols));
+    var i: i64 = 0;
+    while i < rows {
+        var j: i64 = 0;
+        while j < cols {
+            if which == 0 {
+                set(t, vec2(i, j), a_at(r0 + i, c0 + j));
+            } else {
+                set(t, vec2(i, j), b_at(r0 + i, c0 + j));
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return t;
+}
+
+@shard(dim=0)
+fn sharded_matmul(a: Tensor, b: Tensor) -> Tensor {
+    val partial = matmul(a, b);
+    return all_reduce(partial);
+}
+
+fn max_diff(x: Tensor, y: Tensor) -> f64 {
+    var worst: f64 = 0.0;
+    var i: i64 = 0;
+    while i < 4 {
+        var j: i64 = 0;
+        while j < 3 {
+            var d: f64 = get(x, vec2(i, j)) - get(y, vec2(i, j));
+            if d < 0.0 {
+                d = 0.0 - d;
+            }
+            if d > worst {
+                worst = d;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return worst;
+}
+
+fn main() {
+    val rank = p_tp_init(2) as i64;
+    val world = p_tp_world_size() as i64;
+    val k = 6 / world;
+
+    // all_reduce: A (4x6) x B (6x3), split along the inner dimension
+    val c = sharded_matmul(block(0, 4, k, 0, rank * k), block(1, k, 3, rank * k, 0));
+    val reference = matmul(block(0, 4, 6, 0, 0), block(1, 6, 3, 0, 0));
+    val diff = max_diff(c, reference);
+
+    // all_gather: every rank's number, in rank order
+    val ranks = all_gather(filled(vec1(1), rank as f64));
+
+    // broadcast: rank 0's 42 on every rank (summed: 42 x world)
+    var mine: f64 = rank as f64;
+    if rank == 0 {
+        mine = 42.0;
+    }
+    val bsum = all_reduce(broadcast(filled(vec1(1), mine)));
+
+    // scatter rows 0..5 of rank 0's tensor, gather them back
+    val rows = zeros(vec2(6, 1));
+    var i: i64 = 0;
+    while i < 6 {
+        set(rows, vec2(i, 0), (i * 10 + rank) as f64);
+        i = i + 1;
+    }
+    val back = all_gather(scatter(rows));
+
+    // ring: send to rank + 1, receive from rank - 1
+    send_tensor(filled(vec1(1), (rank * 100) as f64));
+    val got = all_gather(recv_tensor(vec1(1)));
+
+    if rank == 0 {
+        print("world " + int_to_str(world) + "\n");
+        print("ranks " + to_str(ranks) + "\n");
+        print("all_reduce matches one rank: " + if diff < 0.000000001 { "yes" } else { "no" } + "\n");
+        print("c[0] " + float_to_str(get(c, vec2(0, 0))) + " " + float_to_str(get(c, vec2(0, 1))) + " " + float_to_str(get(c, vec2(0, 2))) + "\n");
+        print("broadcast sum " + float_to_str(sum(bsum)) + "\n");
+        print("scatter/gather " + to_str(back) + "\n");
+        print("ring " + to_str(got) + "\n");
+    }
+    return 0;
+}

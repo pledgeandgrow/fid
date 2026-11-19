@@ -1,0 +1,47 @@
+// SP16 (llvm-roadmap): builtins the compiler itself calls that the machine
+// layer's runtime (stdlib/linux_runtime) lacked, so `fid emit
+// compiler/main.fd --target <arch>-linux` (or `--nat`) stopped with "not
+// available in native Linux executables yet": p_string_from and
+// p_string_substring (stdlib/string.fd), p_read_line and p_read_stdin
+// (core's read_line / read_stdin, compiler/lsp.fd) and p_stdin_eof
+// (compiler/lsp.fd). tests/nattools/selfhost_builtins_check.py lists what
+// is still missing. Compiled backends only: compiler/interp.fd has no
+// p_string_substring and gives p_string_from(null) a length of 1.
+//
+// With input: printf 'first line\r\nabcdefg' | ./test_machine_selfhost_rt
+// ends "line: first line", "bytes: abcd", "eof: 0".
+//
+// Run with empty (or closed) stdin, as the test harness runs it.
+// Expected output:
+// from: hello 5
+// from null: 0
+// sub: world
+// sub clamped: hello world
+// sub empty: 0
+// line: <none>
+// bytes: <none>
+// eof: 1
+use core;
+
+fn main() -> i64 {
+    val a: str = p_string_from("hello") as str;
+    println("from: " + a + " " + int_to_str(str_len(a)));
+    val z: str = p_string_from(0 as str) as str;
+    println("from null: " + int_to_str(str_len(z)));
+    val b: str = p_string_substring("hello world", 6, 11) as str;
+    println("sub: " + b);
+    val c: str = p_string_substring("hello world", 0 - 3, 99) as str;
+    println("sub clamped: " + c);
+    val d: str = p_string_substring("hello", 4, 2) as str;
+    println("sub empty: " + int_to_str(str_len(d)));
+    match read_line() {
+        Option::Some(l) => { println("line: " + l); }
+        Option::None => { println("line: <none>"); }
+    }
+    match read_stdin(4) {
+        Option::Some(s) => { println("bytes: " + s); }
+        Option::None => { println("bytes: <none>"); }
+    }
+    println("eof: " + int_to_str(p_stdin_eof()));
+    return 0;
+}

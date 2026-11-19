@@ -1,0 +1,90 @@
+// Capture groups of stdlib/regex.fd: the text of each group (nested,
+// optional, unmatched, repeated, inside alternatives, non-capturing),
+// with the expected output on each line. The positions use Python's re,
+// which picks the same match for these patterns.
+//
+// Expected output:
+// 1 [2026-11-16|2026|11|16]
+// 2 [ab|ab|b]
+// 3 [b|]
+// 4 spans 0 1 -1 -1
+// 5 [abc|c]
+// 6 [dog|dog|]
+// 7 [cat||cat]
+// 8 [x=1|x|1]
+// 9 groups 3
+// 10 [ac|a|c]
+// 11 [k:v|k|v] [x:yz|x|yz]
+// 12 none
+// 13 [aaa|aaa|]
+// 14 ann
+// 15 none
+// 16 [|]
+// 17 [user@example.com|user|example.com|.com]
+// 18 [<a><b>|<b>]
+use regex;
+
+fn show(c: Vec<str>) -> str {
+    if c.len() == 0 {
+        return "none";
+    }
+    var out: str = "[";
+    var i: i64 = 0;
+    while i < c.len() {
+        if i > 0 {
+            out = out + "|";
+        }
+        out = out + c.get(i);
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+fn main() -> i64 {
+    println("1 " + show(regex_captures("on 2026-11-16.", "(\\d{4})-(\\d{2})-(\\d{2})")));
+    // nested: the outer group and the inner one
+    println("2 " + show(regex_captures("xxab", "(a(b))")) );
+    // optional group that took no part
+    println("3 " + show(regex_captures("b", "(a)?b")));
+    var sp: Vec<i64> = regex_capture_spans("b", "(a)?b");
+    println("4 spans " + int_to_str(sp.get(0)) + " " + int_to_str(sp.get(1)) + " " + int_to_str(sp.get(2)) + " " + int_to_str(sp.get(3)));
+    // a repeated group holds its last round
+    println("5 " + show(regex_captures("abc", "([a-c])+")));
+    // alternatives: the group of the branch not taken is empty
+    println("6 " + show(regex_captures("hotdog", "(dog)|(cat)")));
+    println("7 " + show(regex_captures("a cat", "(dog)|(cat)")));
+    // non-capturing groups take no number
+    println("8 " + show(regex_captures("x=1", "(?:(\\w)=)(\\d)")));
+    println("9 groups " + int_to_str(regex_group_count("(a)(?:b)(c(d))")));
+    // the first alternative inside a group wins at the same end
+    println("10 " + show(regex_captures("ac", "(a|ab)(c|bcd)")));
+    // iterate matches with _from
+    var s: str = "k:v; x:yz";
+    var a: Vec<i64> = regex_capture_spans_from(s, "(\\w+):(\\w+)", 0);
+    var b: Vec<i64> = regex_capture_spans_from(s, "(\\w+):(\\w+)", a.get(1));
+    var m1: Vec<str> = Vec::new();
+    var m2: Vec<str> = Vec::new();
+    var g: i64 = 0;
+    while g < 3 {
+        m1.push(str_slice(s, a.get(g * 2), a.get(g * 2 + 1)));
+        m2.push(str_slice(s, b.get(g * 2), b.get(g * 2 + 1)));
+        g = g + 1;
+    }
+    println("11 " + show(m1) + " " + show(m2));
+    println("12 " + show(regex_captures("abc", "(\\d+)")));
+    // greedy: the first group takes all, the second is empty but matched
+    println("13 " + show(regex_captures("aaa", "(a*)(a*)")));
+    match regex_group("user=ann", "(\\w+)=(\\w+)", 2) {
+        Some(t) => { println("14 " + t); }
+        None => { println("14 none"); }
+    }
+    match regex_group("b", "(a)?b", 1) {
+        Some(t) => { println("15 " + t); }
+        None => { println("15 none"); }
+    }
+    // an empty match at the start, its group matched empty
+    println("16 " + show(regex_captures("xyz", "(a*)")));
+    println("17 " + show(regex_captures("mail user@example.com now", "(\\w+)@(\\w+(\\.\\w+))")));
+    println("18 " + show(regex_captures("<a><b>", "(<\\w>)*")));
+    return 0;
+}

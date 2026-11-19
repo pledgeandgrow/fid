@@ -1,0 +1,58 @@
+// HMAC-SHA512 (stdlib/sha512.fd) against the RFC 4231 test cases 1-4, 6
+// and 7 (case 5 is a truncated MAC). Case 6 and 7 use a 131-byte key,
+// longer than the 128-byte block, so the key is hashed first.
+// A wrong answer panics on every backend.
+use sha512;
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        p_panic(label + ": got " + got + ", want " + want);
+    }
+    println(label + " ok");
+}
+
+fn fill(n: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n { v.push(b); i = i + 1; }
+    return v;
+}
+
+fn seq(lo: i64, hi: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = lo;
+    while i <= hi { v.push(i); i = i + 1; }
+    return v;
+}
+
+fn main() -> i64 {
+    // Case 1: key = 0x0b * 20, data = "Hi There"
+    check("rfc4231 case 1", sha512_hex(hmac_sha512_bytes(fill(20, 11), str_bytes("Hi There"))),
+        "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde" +
+        "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854");
+    // Case 2: key = "Jefe"
+    check("rfc4231 case 2", sha512_hex(hmac_sha512("Jefe", "what do ya want for nothing?")),
+        "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554" +
+        "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737");
+    // Case 3: key = 0xaa * 20, data = 0xdd * 50
+    check("rfc4231 case 3", sha512_hex(hmac_sha512_bytes(fill(20, 170), fill(50, 221))),
+        "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39" +
+        "bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb");
+    // Case 4: key = 0x01..0x19, data = 0xcd * 50
+    check("rfc4231 case 4", sha512_hex(hmac_sha512_bytes(seq(1, 25), fill(50, 205))),
+        "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3db" +
+        "a91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd");
+    // Case 6: key = 0xaa * 131 (longer than the block)
+    check("rfc4231 case 6", sha512_hex(hmac_sha512_bytes(fill(131, 170),
+        str_bytes("Test Using Larger Than Block-Size Key - Hash Key First"))),
+        "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352" +
+        "6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598");
+    // Case 7: key = 0xaa * 131, long data
+    check("rfc4231 case 7", sha512_hex(hmac_sha512_bytes(fill(131, 170), str_bytes(
+        "This is a test using a larger than block-size key and a larger t" +
+        "han block-size data. The key needs to be hashed before being use" +
+        "d by the HMAC algorithm."))),
+        "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944" +
+        "b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58");
+    return 0;
+}

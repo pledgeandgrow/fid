@@ -1,0 +1,97 @@
+// The machine layer (compiler/nat_ir.fd) with f32 values next to f64
+// ones, as `fid run` and the C path compute them:
+// - an f64 constant stored into an f32 place (`var y: f32 = 3.75`, a
+//   struct field, a promoted local) is converted (ng_store_f64_to_f32;
+//   the low 32 bits of the f64 pattern were stored: 0);
+// - an f32 operand with an f64 one (`z * 4.0`, `w < 0.5`) is computed in
+//   f64 and an f32 result narrowed (ng_float_mixed; the f64 bits were read
+//   as an f32);
+// - an f32 converted to i64 keeps its sign, and an i64 converted to f32
+//   reads all 64 bits (ng_float_int64: `f2i v, v` made v an f32 class,
+//   and -2 came back as 4294967294).
+// Run on every backend (`fid run`, `fid ccompile`, `fid emit --nat`,
+// `fid emit --target x86_64-linux` / aarch64-linux / riscv64-linux).
+// Expected output:
+// 3 5 -7
+// 1 0 1
+// 11 -3 250
+// -2 -2 -9 7
+// -5 -3000000000 4294967296
+// 2 1 0
+// 9 -4
+
+struct Pt { x: f32, y: f32, n: i64 }
+
+fn add32(a: f32, b: f32) -> f32 {
+    return a + b;
+}
+
+fn scale(a: f32) -> f32 {
+    return a * 2.5;
+}
+
+fn to_i(a: f32) -> i64 {
+    return a as i64;
+}
+
+fn from_i(n: i64) -> f32 {
+    return n as f32;
+}
+
+fn below_half(w: f32) -> i64 {
+    if w < 0.5 {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() {
+    var y: f32 = 3.75;
+    var z: f32 = 1.25;
+    var q: f32 = 0.0 - 7.5;
+    println(int_to_str(y as i64) + " " + int_to_str((z * 4.0) as i64) + " " + int_to_str(q as i64));
+
+    println(int_to_str(below_half(z - 1.0)) + " " + int_to_str(below_half(z)) + " " + int_to_str(below_half(q)));
+
+    var p: Pt = Pt { x: 4.75, y: 0.0 - 3.5, n: 250 };
+    p.x = p.x * 2.5;
+    println(int_to_str(p.x as i64) + " " + int_to_str(p.y as i64) + " " + int_to_str(p.n));
+
+    val a: f32 = 6.5 as f32;
+    val b: f32 = (0.0 - 8.5) as f32;
+    val s: f32 = add32(a, b);
+    val k: i64 = s as i64;
+    var v: Vec<i64> = Vec::new();
+    v.push(add32(a, b) as i64);
+    println(int_to_str(k) + " " + int_to_str(v.get(0)) + " " + int_to_str(to_i(scale(q) + 9.5)) + " " + int_to_str(to_i(scale(3.0 as f32))));
+
+    val m: i64 = 0 - 5;
+    val big: i64 = 0 - 3000000000;
+    val two32: i64 = 4294967296;
+    println(int_to_str(to_i(from_i(m))) + " " + int_to_str(to_i(from_i(big))) + " " + int_to_str(to_i(from_i(two32))));
+
+    var acc: f32 = 0.0;
+    var i: i64 = 0;
+    while i < 4 {
+        acc = acc + 0.5;
+        i = i + 1;
+    }
+    var cnt: i64 = 0;
+    if acc > 1.5 {
+        cnt = cnt + 1;
+    }
+    if acc == 2.0 {
+        cnt = cnt + 1;
+    }
+    var neg: i64 = 0;
+    if acc < 0.0 {
+        neg = 1;
+    }
+    println(int_to_str(acc as i64) + " " + int_to_str(cnt - 1) + " " + int_to_str(neg));
+
+    var t: f32 = 2.25;
+    t = t * 4.0;
+    var u: f32 = 0.0 - 1.0;
+    u = u - 3.0;
+    println(int_to_str(t as i64) + " " + int_to_str(u as i64));
+}

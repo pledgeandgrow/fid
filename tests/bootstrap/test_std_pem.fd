@@ -1,0 +1,59 @@
+// stdlib/pem: RFC 8410 §10's Ed25519 PEM examples (private key, public
+// key, and the OneAsymmetricKey with attributes and the public key), an
+// OpenSSL P-256 PKCS#8 key, an OpenSSL encrypted PKCS#8 key and PKCS#12
+// file (recognized only), armor round trips and malformed armor.
+// Expected output:
+// blocks 2 PRIVATE KEY PUBLIC KEY
+// pkcs8 ok true v0 Ed25519 seed d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842
+// spki ok true Ed25519 19bf44096984cdfe8541bac167dc3b96c85086aa30b6b6cb0c5c38ad703166e1
+// v2 ok true v1 public 19bf44096984cdfe8541bac167dc3b96c85086aa30b6b6cb0c5c38ad703166e1
+// re-armor same true
+// ec ok true EC P-256 scalar 9bcc14...6956 pub 04efb2...7370
+// ec re-encode same true
+// encrypted PBES2
+// pkcs12 true false
+// bad label false bad base64 false
+// spki encode same true
+use pem;
+use asn1;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn short(v: Vec<i64>) -> str {
+    val h: str = hx(v);
+    return str_slice(h, 0, 6) + "..." + str_slice(h, str_len(h) - 4, str_len(h));
+}
+
+fn main() {
+    val rfc: str = "Some text before\n-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n\n-----BEGIN PUBLIC KEY-----\r\nMCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\r\n-----END PUBLIC KEY-----\r\n";
+    val all: Vec<PemBlock> = pem_decode_all(rfc);
+    println("blocks " + int_to_str(all.len()) + " " + all.get(0).label + " " + all.get(1).label);
+    val k: Pkcs8Key = pkcs8_parse(all.get(0).der);
+    println("pkcs8 ok " + bool_to_str(k.ok) + " v" + int_to_str(k.version) + " " + k.alg_name + " seed " + hx(k.secret));
+    val s: Spki = spki_parse(all.get(1).der);
+    println("spki ok " + bool_to_str(s.ok) + " " + pem_oid_name(s.alg) + " " + hx(s.key));
+    val v2: str = "-----BEGIN PRIVATE KEY-----\nMHICAQEwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\noB8wHQYKKoZIhvcNAQkJFDEPDA1DdXJkbGUgQ2hhaXJzgSEAGb9ECWmEzf6FQbrB\nZ9w7lshQhqowtrbLDFw4rXAxZuE=\n-----END PRIVATE KEY-----\n";
+    val k2: Pkcs8Key = pkcs8_parse(pem_decode(v2, "PRIVATE KEY").der);
+    println("v2 ok " + bool_to_str(k2.ok) + " v" + int_to_str(k2.version) + " public " + hx(k2.public_key));
+    val again: str = pem_encode("PRIVATE KEY", pkcs8_encode_ed25519(k.secret));
+    println("re-armor same " + bool_to_str(str_equal(again, "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n")));
+
+    val ec: str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgm8wUStRisLJ4zG3S\nyVUiQyaPmT2q04WAIAhC1di6aVahRANCAATvsgxN7JCeUbbGiSCI5r0MEek3I7fB\nyDiZX1XycDiOnbIsLd1sTNRKYrSOTvba12kObQHVaLf+0GhkDFrVH3Nw\n-----END PRIVATE KEY-----\n";
+    val eb: PemBlock = pem_decode(ec, "PRIVATE KEY");
+    val ek: Pkcs8Key = pkcs8_parse(eb.der);
+    println("ec ok " + bool_to_str(ek.ok) + " " + ek.alg_name + " " + pem_oid_name(ek.params) + " scalar " + short(ek.secret) + " pub " + short(ek.public_key));
+    val ere: Vec<i64> = pkcs8_encode_ec(PEM_OID_P256, ek.secret, ek.public_key);
+    // OpenSSL leaves the curve out of the inner ECPrivateKey too.
+    println("ec re-encode same " + bool_to_str(str_equal(hx(ere), hx(eb.der))));
+
+    val enc: str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIGjMF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBBz32BLRCNX9m9lS1nS\nNZPLAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQXkAe5wEvd7OaFZc5\nrgJe1ARAQvu/KflEAxkQanDgmMAjTixvmF/uwZnZDB89GFMNsDamT3jbw5XE2xQS\n+ZQJ41hTnRzUryv+aPqn1DgGCAkoRw==\n-----END ENCRYPTED PRIVATE KEY-----\n";
+    println("encrypted " + pem_oid_name(pkcs8_encryption_alg(pem_decode(enc, "ENCRYPTED PRIVATE KEY").der)));
+    val p12: Vec<i64> = b64_decode_bytes("MIIBLQIBAzCB5AYJKoZIhvcNAQcBoIHWBIHTMIHQMIHNBgkqhkiG9w0BBwGggb8EgbwwgbkwgbYGCyqGSIb3DQEMCgECoIGmMIGjMF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBCoMeR/+7l/By0lU9X3DoNLAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQDBA4DElz+DHmz/BBApSl1wRAmYHnx3jweQsFeWE7gUZ79KEDW4OxO6xBL8saM9/TkgjYL46Lt59Kp+A/QWsCm5vkKxKI+u2wr6PacuOAtNKd0zBBMDEwDQYJYIZIAWUDBAIBBQAEIIRBbTyq8UsCx0GHNsNmA/4bSX0lenei2QktRRKPkZUSBAjRYKvhz+nk6QICCAA=");
+    println("pkcs12 " + bool_to_str(pem_is_pkcs12(p12)) + " " + bool_to_str(pem_is_pkcs12(eb.der)));
+    val badlabel: PemBlock = pem_decode("-----BEGIN PRIVATE KEY-----\nMC4CAQAw\n-----END PUBLIC KEY-----\n", "");
+    val badb64: PemBlock = pem_decode("-----BEGIN X-----\nMC4*AQAw\n-----END X-----\n", "");
+    println("bad label " + bool_to_str(badlabel.ok) + " bad base64 " + bool_to_str(badb64.ok));
+    println("spki encode same " + bool_to_str(str_equal(hx(spki_encode(PEM_OID_ED25519, "", s.key)), hx(all.get(1).der))));
+}

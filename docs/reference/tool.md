@@ -29,34 +29,52 @@ binaries. Dispatch is in compiler/main.fd (docs/file-analysis/main.md).
 |---|---|---|
 | `run <file>` | IR interpreter. `--leaks` / `--checked-alloc` rebuild through C (`ccompile --debug`, needs `CC`) and run with the debug allocator | works |
 | `ccompile` (`compile`) `<file> -o <out>` | C, then a C compiler. `--target`, `--cc-opt`, `--debug`, `--release`, `--inc`, `--no-cache`, `--profile`, `--leaks`, `--checked-alloc` | works |
-| `emit` / `build <file> -o <out>` | native: Windows PE (pe_ir) by default on Windows; `--target aarch64-linux\|riscv64-linux\|x86_64-linux` and `--nat` use the machine layer; `--bare`, `--elf`, `--boot`; through C on a POSIX host without `--target`; `--no-opt`, `--debug`, `--checked-alloc` | works except `--boot` and `--native` with the default target (panic) |
+| `emit` / `build <file> -o <out>` | native: Windows PE (pe_ir) by default on Windows; `--target aarch64-linux\|riscv64-linux\|x86_64-linux` and `--nat` use the machine layer (also written OS first: `linux-arm64`, `linux-x64`, `macos-arm64`; TL6); `--target windows-x64` on any host is a pe_ir PE; `--bare`, `--elf`, `--boot`; through C on a POSIX host without `--target`; `--no-opt`, `--debug`, `--checked-alloc` | works except `--boot` and `--native` with the default target (panic) |
 | `dump-c`, `split-c <c> <prefix> <n>` | generated C to stdout; cut a C file into a header and n units | works |
 | `check <file> [--time]` | front end only: types, borrows, escapes | works |
 | `lint <file>` | unused functions and imports, `unwrap()` outside tests | works (does not resolve `compiler::` imports) |
 | `fmt <file> [--check]` | formatter, rewrites the file | **corrupts files** (known-bugs 2g.6) |
 | `test [<file>] [--fail]` | a file's `test_*`/`bench_*` functions, or the suite / expected-fail list | works on Windows; without a file broken on POSIX |
+| `fuzz <file> [--seeds N]` | a test file's `fuzz_*(data: Vec<u8>)` targets on N deterministic inputs (1000; `test --fuzz`: 100), coverage-guided (the harness is built with `ccompile --fuzz-cov`); failing inputs are saved under `testdata/fuzz/<target>/` and replayed by every `fid test`: [docs/fuzzing.md](../fuzzing.md) | new Nov 15 (TL1), checked by scripts/tl-check.sh |
+| `fix <file> [--check]` | applies the suggested fixes (`val` -> `var`, a narrowing `as T`, a misspelled name, an unused import), each kept only when the program then has fewer errors (or as many, none on the fixed line); `--check` writes nothing | new Nov 15 (TL3) |
 | `test-rules [--smt <dir>]` | checks the rewrite rules on values; writes SMT obligations | works |
 | `qualify <file>` | safety evidence as JSON | works |
 | `audit <file> [--stdlib] [--strict]` | unsafe code a program reaches and its `// SAFETY:` comments | works |
-| `doc` / `scribe` | documentation generator | works, buggy (CRLF, `::` names) |
+| `doc` / `scribe` | documentation generator; `doc <dir>`: a site, a page per module and an index with search (TL11, Nov 15) | works, buggy (CRLF) |
 | `veil` | coverage | **crashes** (Double free, 2g.2) |
-| `lsp` | language server | diagnostics only; symbol requests crash (2g.5) |
-| `ark ...` | package manager | works, buggy |
+| `lsp` | language server: diagnostics, completion, hover, definition, rename, references, formatting, signature help, inlay hints (parameter names), code actions (the fixes of `fix`) | symbol requests fixed Nov 15 (2g.5); rename and references are by whole word in one file |
+| `ark ...` | package manager: path and git pacts, `use` finds them in ark_modules/, ark.lock records git commits and file hashes, `install` checks out the locked commit, `audit` reports what a build pulls in | TL9, Nov 15; a pact's own dependencies resolved to one version each, a per-machine cache, dev-dependencies, an API check on publish (docs/reference/ark.md) |
 | `parse-header <h>` | C header to Fides bindings | works |
 | `profile <file>` | `ccompile --profile`, run, top-20 table | works |
 | `bench <file>`, `watch` | run an executable N times (`watch` is the same as `bench`) | works |
 | `repl` | compile and run each line with tcc/gcc | not checked Nov 9 |
-| `tokens`, `ast` (`dump-ast`, `dump-ast-raw`, `dump-ast-flat`), `ir`, `pir`, `verify`, `sourcemap` | dumps (the four `ast` forms print the same summary) | work; `pir --opt` panics |
-| `opt`, `codegen`, `build-x86`, `gpu`, `wasm` | old PIR path and experimental back ends | `opt` panics; `codegen` prints assembly; the rest produce broken output (platforms.md, Tier 3) |
+| `tokens`, `ast` (`dump-ast`, `dump-ast-raw`, `dump-ast-flat`), `ir`, `verify`, `sourcemap` | dumps (the four `ast` forms print the same summary) | work |
+| `opt <f> [--fn <n>]` | the IR after the IR optimizer the machine layer runs (iropt_native) | Nov 17 (llvm MI18; `pir`/`dump-pir` were retired with the PIR path and name this instead: docs/pir-retired.md) |
+| `codegen <f> [--target t] [--fn <n>] [--elf/--coff/--macho <o>]` | the machine layer: a disassembly, or an object file as `emit --obj` | Nov 17 (llvm MI18) |
+| `build-x86`, `gpu`, `wasm` | experimental back ends | produce broken output (platforms.md, Tier 3) |
 | `notebook` | HTML page of a file's code blocks (evaluates nothing) | works |
 | `version` | version string (`0.1.0`) | works |
 
 Global flags: `--borrowck=off|on` (`warn` prints nothing), `--timeout N`
 (parsed, not enforced); arguments after `--` go to the program. Environment:
 `CC`, `FIDES_CC_OPT`, `FIDES_CFLAGS`, `FIDES_NO_CACHE`, `FID_HOME`,
-`FID_VERIFY`, `FIDES_COW_CHECK`, `FIDES_INC_FLAT`, and the pass switches
+`FID_VERIFY`, `FIDES_COW_CHECK`, `FIDES_INC_FLAT`, `FIDES_INC_EFFECTS=off`
+and `FIDES_INC_DEBUG` (`ccompile --inc`: one unit; every prototype in
+every unit; print each unit's prototype count; checks in
+scripts/inc-check.sh), and the pass switches
 `FID_IROPT_OFF`/`FID_IROPT_ON`/`FID_NAT_OFF`/`FID_RULES_ON`
-(docs/reference/architecture.md, "Self-hosted pipeline"). Not in `fid`
+(docs/reference/architecture.md, "Self-hosted pipeline"); the flag
+`--no-pass=a,b` (or `--no-pass a,b`) adds names to the off lists of
+iropt, iropt_me, the rules (`rules`, `purecse`) and the e-graph
+(`egraph`, `forward`) for that command; `FID_IROPT_OFF=rangejoin` (or
+`--no-pass=rangejoin`) turns off the range facts met at joins in
+compiler/checks.fd (LF8/LF9), on every path, C included;
+`FID_IROPT_OFF=licmcall` keeps calls to effect-free functions in a loop's
+header where they are (`licm` moves them out otherwise, OP25). A program
+built by `fid emit` for Linux (x86-64, AArch64, RISC-V) profiles itself
+when run with `FID_PROF=1`: a sample per millisecond of CPU time, and at
+exit a table on stderr of the functions by self and total samples
+(llvm-roadmap DB9; scripts/prof-check.sh). Not in `fid`
 (`fidesc` only): `debug`, `replay`, `autopsy`, `diff-test`, `link`, `sbom`,
 `spdx`.
 
@@ -79,7 +97,9 @@ the packages (like crates). Package manifests are `ark.toml`, lock files are
   `fid`: run it as `fid ark <command>` (ark.fd has no `main` of its own).
   Nov 9: a directory path dependency is reported as missing on Windows,
   `lock` drops dependencies silently, and `update <name>` ignores the name
-  (docs/file-analysis/ark.md).
+  (docs/file-analysis/ark.md). Fixed Nov 15 (TL9): a directory pact is
+  copied (xcopy on Windows, `cp -R` elsewhere), `lock` names each pact that
+  is not installed and fails, `update <name>` updates that pact only.
 
 Supports path dependencies (files and directories), git dependencies (clone
 with `--depth 1`, branch/tag support), lock file generation, and a custom
@@ -90,14 +110,59 @@ planned for the future.
 ark init [name]              # create ark.toml
 ark add <dep> --path <path>  # add path dependency
 ark add <dep> --git <url>    # add git dependency
-ark install                  # install all deps to ark_modules/
+ark install                  # install all deps to ark_modules/ (git: the locked commit)
 ark list                     # list dependencies
 ark remove <dep>             # remove dependency
-ark lock                     # generate ark.lock
-ark update [dep]             # update dependencies
-ark search <query>           # search registry (future)
-ark publish                  # publish to registry (future)
+ark lock                     # ark.lock: git commits, fnv hashes of path pacts
+ark audit [--files]          # each pact against ark.lock; lines, unsafe, extern, effects
+ark update [dep]             # newest commits, installed and locked
+ark add <dep> --version 1.2  # a package of the index (ARK_INDEX), `fid ark` and Rust ark
+ark vendor                   # copy every pact into vendor/ + vendor/vendor.lock: offline builds
+ark search <query>           # packages of the index whose name holds <query>
+ark publish [--git <url>]    # add this package's tagged version (v<version>) to the index
+                             #   (a minor/patch version must keep the public API: CU5)
+ark api [--against <rev>]    # the public API; what changed since <rev>
+ark init app --author A --description D --license MIT   # [package] fields (L5A)
+ark add <dep> ... --dev      # [dev-dependencies]: ark_modules/.dev/ (L5A)
+ark install --no-dev         # without the dev-dependencies
+ark add <dep> ... --features a,b   # features = [...]: ark_modules/.features (L5A)
+ark build [names] [--release] [--dry-run]  # every [[bin]]/[[lib]]/[target] with fid (L5A)
+ark test [names] [--dry-run] # fid test on every [[test]] target (default tests/*.fd)
+ark targets                  # the build targets
+ark prebuild [--target <t>]  # the lib as a prebuilt library: prebuilt/<target>/ (L5E)
+ark add <dep> ... --binary   # binary = true: link its prebuilt library, not its source
+ark install --binary|--source  # every pact's prebuilt library, or none
+# ark update: newest version within each ^/~ constraint too (L5C)
+# in a [workspace] root: install/list/lock/update/audit/vendor/build/test
+# run in every member (L5F; --no-workspace: the root only)
 ```
+
+Nov 15 (docs/reference/ark.md): `ark install` also installs the pacts the
+pacts need, one version of each (the newest every requirement accepts; a
+conflict names each path that asks), keeps one copy of each git
+repository per machine (`ARK_CACHE`, else `~/.ark/cache`) that project
+checkouts borrow, and puts dev-dependencies in `ark_modules/.dev/`.
+Checks: `tests/ark/ark-features.sh`.
+
+`fid ark` (Nov 15) has the index commands of the Rust ark: the index is a
+Git repository (`ARK_INDEX`, else the default index), copied to
+`<ARK_HOME or home>/.ark/index`, one file per package, one line per version
+(`version git-url tag commit`). A registry pact is installed at its tag and
+refused when the tag no longer points at the recorded commit. `ark add`
+warns about a name one edit away from a known one. `use <name>` looks in
+`vendor/` before `ark_modules/`; `ark install` and `ark audit` check each
+vendored copy against `vendor/vendor.lock`. `ark audit` also lists each
+pact's C libraries and the capabilities its imports ask for.
+
+Nov 16 (docs/reference/ark.md): a workspace root resolves its members'
+pacts together, installs each one once in the root's `ark_modules/` and
+records it once in the root's ark.lock (L5F). `ark yank <version>
+[--undo]` keeps a version out of new locks, while existing locks keep it
+(N6). `[capabilities]` in ark.toml grants each pact what it may use, and
+install, build, test and audit fail when a pact uses more. `ark update`
+prints the capability diff (CD1). Checks: `tests/ark/ark-registry.sh`,
+and `tests/ark/ark-selfbuild.sh`, which builds `tools/ark.fd` with fid
+and runs every ark check against that build.
 
 ### forge — Formatter
 
@@ -315,8 +380,12 @@ fid qualify <file.fd> -o evidence.json
 |---|---|
 | `fid run <file.fd> --leaks` | The C runtime's debug allocator reports blocks never freed |
 | `fid run <file.fd> --checked-alloc` | The debug allocator detects use after free |
-| `fid emit <file.fd> --checked-alloc` | Written, not run: every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused |
+| `fid emit <file.fd> --checked-alloc` | Written, not run: every block on pages of its own, ending at a guard page; freed pages inaccessible, never reused (pe_ir, and since Nov 16 the machine layer's targets: stdlib/linux_runtime/base.fd) |
+| `fid emit <file.fd> --target <linux/macos target> --leaks` (or `--nat`) | Written Nov 16, not run: the blocks the program never freed, reported at exit by where they were allocated, as `fid run --leaks` does (RL16) |
 | `fid test <file.fd>` | Runs the file's functions whose names start with `test_` and `bench_` |
+| `fid test <file.fd> --filter <text> --jobs <n>` | Only the names holding `<text>`; tests `n` at a time, output in order. Each test runs with FIDES_TEST_NOW and FIDES_TEST_SEED fixed (`--real-clock`, or a test named `*_real_clock`, opts out) |
+| `fid run <file.fd> --trace f,g` | Each call of `f` and `g` (a method as `T::m`) with its arguments and result, on stderr |
+| `fid --version` | The version and `build: exe:<hash>` of this executable (with the release stamp's commit when there is one) |
 | `bench/run.sh`, `bench/check.sh` | `check.sh` fails on a slowdown over `LIMIT_PCT` against `bench/baseline.txt`; not in CI |
 | `scripts/sanitize.sh` | Written, not run: the tests through C under ASan/UBSan (clang with ASan, Linux/macOS); `FIDES_CFLAGS` passes extra C flags |
 | `scripts/fuzz/nightly.sh` | Written, not run; no CI workflow schedules it |

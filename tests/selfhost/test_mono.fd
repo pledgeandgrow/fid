@@ -81,15 +81,15 @@ fn test_mangle_type() -> void {
 fn test_mangle() -> void {
     print("Test 2: mangle...\n");
     var subst: Vec<SubstEntry> = Vec::new();
-    subst_set(subst, "T", Type::I32);
+    subst_set(& mut subst, "T", Type::I32);
     var type_params: Vec<str> = Vec::new();
     type_params.push("T");
     assert_eq(mangle("identity", subst, type_params), "identity__i32", "mangle identity<T> with I32");
 
     // Two type params
     var subst2: Vec<SubstEntry> = Vec::new();
-    subst_set(subst2, "T", Type::I64);
-    subst_set(subst2, "U", Type::F64);
+    subst_set(& mut subst2, "T", Type::I64);
+    subst_set(& mut subst2, "U", Type::F64);
     var tps2: Vec<str> = Vec::new();
     tps2.push("T");
     tps2.push("U");
@@ -100,7 +100,7 @@ fn test_mangle() -> void {
 fn test_mangle_method() -> void {
     print("Test 3: mangle_method...\n");
     var subst: Vec<SubstEntry> = Vec::new();
-    subst_set(subst, "T", Type::I32);
+    subst_set(& mut subst, "T", Type::I32);
     var type_params: Vec<str> = Vec::new();
     type_params.push("T");
     assert_eq(mangle_method("Vec", "push", subst, type_params), "Vec__push__i32", "mangle Vec::push<T> with I32");
@@ -112,7 +112,7 @@ fn test_subst_helpers() -> void {
     var subst: Vec<SubstEntry> = Vec::new();
     assert_false(subst_contains(subst, "T"), "empty subst does not contain T");
 
-    subst_set(subst, "T", Type::I32);
+    subst_set(& mut subst, "T", Type::I32);
     assert_true(subst_contains(subst, "T"), "subst contains T after set");
 
     match subst_get(subst, "T") {
@@ -136,7 +136,7 @@ fn test_subst_helpers() -> void {
     }
 
     // Overwrite
-    subst_set(subst, "T", Type::I64);
+    subst_set(& mut subst, "T", Type::I64);
     match subst_get(subst, "T") {
         OptType::Some(t) => {
             assert_eq(mangle_type(t), "i64", "subst_get T after overwrite returns I64");
@@ -152,7 +152,7 @@ fn test_subst_helpers() -> void {
 fn test_subst_type() -> void {
     print("Test 5: subst_type...\n");
     var subst: Vec<SubstEntry> = Vec::new();
-    subst_set(subst, "T", Type::I32);
+    subst_set(& mut subst, "T", Type::I32);
 
     // Named type gets substituted
     assert_eq(mangle_type(subst_type(Type::Named("T"), subst)), "i32", "subst_type Named(T) -> I32");
@@ -229,8 +229,9 @@ fn test_infer_expr_type() -> void {
     print("Test 8: infer_expr_type...\n");
     var func: Func = Func_new("test", Type::I32);
 
-    // IntLit within i32 range -> I32
-    assert_eq(mangle_type(infer_expr_type(Expr::IntLit(42), func)), "i32", "infer IntLit(42) -> I32");
+    // An integer literal is an i64, as everywhere in the language (mono.fd
+    // infer_expr_type; it was I32 for a literal in i32 range)
+    assert_eq(mangle_type(infer_expr_type(Expr::IntLit(42), func)), "i64", "infer IntLit(42) -> I64");
 
     // IntLit outside i32 range -> I64
     assert_eq(mangle_type(infer_expr_type(Expr::IntLit(3000000000), func)), "i64", "infer IntLit(3B) -> I64");
@@ -273,7 +274,7 @@ fn test_infer_expr_type_binary() -> void {
 
     // Arithmetic -> type of left operand
     var add_expr: Expr = Expr::Binary(BinOp::Add, Box::new(Expr::IntLit(42)), Box::new(Expr::IntLit(99)));
-    assert_eq(mangle_type(infer_expr_type(add_expr, func)), "i32", "infer Add -> I32 (from left)");
+    assert_eq(mangle_type(infer_expr_type(add_expr, func)), "i64", "infer Add -> I64 (from left)");
 }
 
 // ── Test 11: infer_expr_type Unary ──
@@ -287,7 +288,7 @@ fn test_infer_expr_type_unary() -> void {
 
     // Neg -> type of operand
     var neg_expr: Expr = Expr::Unary(UnaryOp::Neg, Box::new(Expr::IntLit(42)));
-    assert_eq(mangle_type(infer_expr_type(neg_expr, func)), "i32", "infer Neg -> I32");
+    assert_eq(mangle_type(infer_expr_type(neg_expr, func)), "i64", "infer Neg -> I64");
 }
 
 // ── Test 12: infer_expr_type Cast ──
@@ -320,14 +321,14 @@ fn test_rename_helpers() -> void {
         OptStr::None => { assert_true(true, "empty rename returns None"); }
     }
 
-    rename_set(renames, "foo", "foo__i32");
+    rename_set(& mut renames, "foo", "foo__i32");
     match rename_get(renames, "foo") {
         OptStr::Some(s) => { assert_eq(s, "foo__i32", "rename_get foo -> foo__i32"); }
         OptStr::None => { print("FAIL: rename_get foo returned None\n"); p_panic("test failed"); }
     }
 
     // Overwrite
-    rename_set(renames, "foo", "foo__i64");
+    rename_set(& mut renames, "foo", "foo__i64");
     match rename_get(renames, "foo") {
         OptStr::Some(s) => { assert_eq(s, "foo__i64", "rename_get foo after overwrite -> foo__i64"); }
         OptStr::None => { print("FAIL: rename_get foo returned None\n"); p_panic("test failed"); }

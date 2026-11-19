@@ -1,0 +1,498 @@
+// x86 interrupt controllers: Local APIC (xAPIC MMIO and x2APIC MSRs) and
+// IO APIC, with the MADT data that describes them.
+//
+// What is real: the Local APIC register map and the x2APIC MSR numbers
+// (MSR = 0x800 + offset / 16), the IA32_APIC_BASE MSR fields, LVT entry
+// encoding (vector, delivery mode, polarity, trigger, mask, timer mode),
+// the timer divide-configuration encoding and count / frequency math,
+// ICR encoding for fixed, NMI, INIT and STARTUP IPIs with destination
+// shorthands (written as ICR_HI then ICR_LO in xAPIC mode, one 64-bit MSR
+// write in x2APIC mode), the bring-up sequence of a Local APIC (spurious
+// vector, masked LVTs, ESR clear, TPR), the IO APIC indirect register
+// window, version register and 64-bit redirection entries, and ISA IRQ
+// routing from the MADT's interrupt source overrides (read with stdlib
+// acpi: processors, IO APICs, overrides, x2APIC entries).
+//
+// The seam: an ApicBus holds rd: fn(i64) -> i64 and wr: fn(i64, i64).
+// For a Local APIC in xAPIC mode the argument is the MMIO offset from the
+// APIC base (the kernel maps 0xFEE00000 uncached and does 32-bit volatile
+// accesses), in x2APIC mode it is the MSR number (rdmsr / wrmsr). For an
+// IO APIC it is the byte offset of IOREGSEL (0x00) or IOWIN (0x10).
+// Tests pass functions over a fake register file.
+module apic;
+ use vec; use acpi;
+
+// ─── Local APIC registers (xAPIC offsets) ───────────────────────────────
+
+pub const LAPIC_ID: i64 = 0x20;
+pub const LAPIC_VERSION: i64 = 0x30;
+pub const LAPIC_TPR: i64 = 0x80;
+pub const LAPIC_PPR: i64 = 0xA0;
+pub const LAPIC_EOI: i64 = 0xB0;
+pub const LAPIC_LDR: i64 = 0xD0;
+pub const LAPIC_DFR: i64 = 0xE0;
+pub const LAPIC_SVR: i64 = 0xF0;
+pub const LAPIC_ISR: i64 = 0x100;
+pub const LAPIC_TMR: i64 = 0x180;
+pub const LAPIC_IRR: i64 = 0x200;
+pub const LAPIC_ESR: i64 = 0x280;
+pub const LAPIC_LVT_CMCI: i64 = 0x2F0;
+pub const LAPIC_ICR_LO: i64 = 0x300;
+pub const LAPIC_ICR_HI: i64 = 0x310;
+pub const LAPIC_LVT_TIMER: i64 = 0x320;
+pub const LAPIC_LVT_THERMAL: i64 = 0x330;
+pub const LAPIC_LVT_PERF: i64 = 0x340;
+pub const LAPIC_LVT_LINT0: i64 = 0x350;
+pub const LAPIC_LVT_LINT1: i64 = 0x360;
+pub const LAPIC_LVT_ERROR: i64 = 0x370;
+pub const LAPIC_TIMER_INIT: i64 = 0x380;
+pub const LAPIC_TIMER_CUR: i64 = 0x390;
+pub const LAPIC_TIMER_DIV: i64 = 0x3E0;
+
+pub const MSR_APIC_BASE: i64 = 0x1B;
+pub const MSR_TSC_DEADLINE: i64 = 0x6E0;
+pub const MSR_X2APIC_ICR: i64 = 0x830;
+pub const MSR_X2APIC_SELF_IPI: i64 = 0x83F;
+
+pub const LAPIC_DEFAULT_BASE: i64 = 0xFEE00000;
+pub const IOAPIC_DEFAULT_BASE: i64 = 0xFEC00000;
+
+// Delivery modes (LVT and ICR bits 10:8).
+pub const APIC_DM_FIXED: i64 = 0;
+pub const APIC_DM_LOWEST: i64 = 1;
+pub const APIC_DM_SMI: i64 = 2;
+pub const APIC_DM_NMI: i64 = 4;
+pub const APIC_DM_INIT: i64 = 5;
+pub const APIC_DM_STARTUP: i64 = 6;
+pub const APIC_DM_EXTINT: i64 = 7;
+
+// ICR destination shorthands (bits 19:18).
+pub const APIC_DEST_NONE: i64 = 0;
+pub const APIC_DEST_SELF: i64 = 1;
+pub const APIC_DEST_ALL: i64 = 2;
+pub const APIC_DEST_OTHERS: i64 = 3;
+
+// LVT / redirection bits.
+pub const APIC_DELIVERY_PENDING: i64 = 0x1000;
+pub const APIC_ACTIVE_LOW: i64 = 0x2000;
+pub const APIC_REMOTE_IRR: i64 = 0x4000;
+pub const APIC_LEVEL: i64 = 0x8000;
+pub const APIC_MASKED: i64 = 0x10000;
+
+pub const APIC_TIMER_ONESHOT: i64 = 0;
+pub const APIC_TIMER_PERIODIC: i64 = 1;
+pub const APIC_TIMER_TSC_DEADLINE: i64 = 2;
+
+/// x2APIC MSR of an xAPIC register offset.
+pub fn apic_x2_msr(offset: i64) -> i64 {
+    return 0x800 + (offset >> 4);
+}
+
+// ─── IA32_APIC_BASE ─────────────────────────────────────────────────────
+
+pub struct ApicBaseMsr {
+    pub base: i64,
+    pub bsp: bool,
+    pub x2apic: bool,
+    pub enabled: bool,
+}
+
+pub fn apic_base_decode(v: i64) -> ApicBaseMsr {
+    return ApicBaseMsr {
+        base: v & 0xFFFFFF000, bsp: (v & 0x100) != 0, x2apic: (v & 0x400) != 0, enabled: (v & 0x800) != 0
+    };
+}
+
+pub fn apic_base_encode(m: ApicBaseMsr) -> i64 {
+    var v: i64 = m.base & 0xFFFFFF000;
+    if m.bsp { v = v | 0x100; }
+    if m.x2apic { v = v | 0x400 | 0x800; }
+    if m.enabled { v = v | 0x800; }
+    return v;
+}
+
+// ─── LVT entries ────────────────────────────────────────────────────────
+
+/// LVT entry: vector, delivery mode, active-low, level, masked.
+pub fn apic_lvt(vector: i64, mode: i64, active_low: bool, level: bool, masked: bool) -> i64 {
+    var v: i64 = (vector & 255) | ((mode & 7) << 8);
+    if active_low { v = v | APIC_ACTIVE_LOW; }
+    if level { v = v | APIC_LEVEL; }
+    if masked { v = v | APIC_MASKED; }
+    return v;
+}
+
+/// LVT timer entry: vector and timer mode (one-shot, periodic, TSC deadline).
+pub fn apic_lvt_timer(vector: i64, timer_mode: i64, masked: bool) -> i64 {
+    var v: i64 = (vector & 255) | ((timer_mode & 3) << 17);
+    if masked { v = v | APIC_MASKED; }
+    return v;
+}
+
+pub struct LvtInfo {
+    pub vector: i64,
+    pub mode: i64,
+    pub pending: bool,
+    pub active_low: bool,
+    pub level: bool,
+    pub masked: bool,
+    pub timer_mode: i64,
+}
+
+pub fn apic_lvt_decode(v: i64) -> LvtInfo {
+    return LvtInfo {
+        vector: v & 255, mode: (v >> 8) & 7, pending: (v & APIC_DELIVERY_PENDING) != 0, active_low: (v & APIC_ACTIVE_LOW) != 0, level: (v & APIC_LEVEL) != 0, masked: (v & APIC_MASKED) != 0, timer_mode: (v >> 17) & 3
+    };
+}
+
+// ─── Timer ──────────────────────────────────────────────────────────────
+
+/// Divide configuration register value for divisor 1, 2, 4, ... 128
+/// (bits 3,1,0); -1 for other divisors.
+pub fn apic_timer_div_encode(div: i64) -> i64 {
+    if div == 1 { return 0xB; }
+    var code: i64 = -1;
+    var d: i64 = 2;
+    var k: i64 = 0;
+    while d <= 128 {
+        if d == div {
+            code = k;
+        }
+        d = d * 2;
+        k = k + 1;
+    }
+    if code < 0 {
+        return -1;
+    }
+    return (code & 3) | ((code & 4) << 1);
+}
+
+/// Divisor of a divide configuration value.
+pub fn apic_timer_div_decode(v: i64) -> i64 {
+    var code: i64 = (v & 3) | ((v >> 1) & 4);
+    if code == 7 {
+        return 1;
+    }
+    return 2 << code;
+}
+
+/// Initial count for a period of ns nanoseconds at timer input frequency
+/// hz (the bus / core crystal clock) and a divisor.
+pub fn apic_timer_count(hz: i64, div: i64, ns: i64) -> i64 {
+    return (hz / div) * ns / 1000000000;
+}
+
+/// Timer input frequency from a calibration: the counter fell by `ticks`
+/// with divisor div during ref_ns nanoseconds of a reference timer.
+pub fn apic_timer_calibrate(ticks: i64, div: i64, ref_ns: i64) -> i64 {
+    return ticks * div * (1000000000 / ref_ns);
+}
+
+// ─── ICR (inter-processor interrupts) ───────────────────────────────────
+
+/// Low 32 bits of an ICR command (edge triggered, level asserted).
+pub fn apic_icr(vector: i64, mode: i64, logical: bool, shorthand: i64) -> i64 {
+    var v: i64 = (vector & 255) | ((mode & 7) << 8) | ((shorthand & 3) << 18);
+    if logical { v = v | 0x800; }
+    // level = assert: required for every mode except INIT de-assert
+    return v | 0x4000;
+}
+
+/// INIT IPI (to one APIC with shorthand none, or to all others).
+pub fn apic_icr_init(shorthand: i64) -> i64 {
+    return apic_icr(0, APIC_DM_INIT, false, shorthand);
+}
+
+/// INIT level de-assert (needed by 82489DX-era APICs, ignored by later ones).
+pub fn apic_icr_init_deassert() -> i64 {
+    return (APIC_DM_INIT << 8) | APIC_LEVEL;
+}
+
+/// STARTUP IPI: the AP starts in real mode at trampoline (4 KiB aligned,
+/// below 1 MiB): vector = trampoline >> 12.
+pub fn apic_icr_sipi(trampoline: i64, shorthand: i64) -> i64 {
+    return apic_icr((trampoline >> 12) & 255, APIC_DM_STARTUP, false, shorthand);
+}
+
+/// Full 64-bit ICR: xAPIC puts an 8-bit destination in bits 63:56,
+/// x2APIC a 32-bit one in bits 63:32.
+@wrapping pub fn apic_icr64(lo: i64, dest: i64, x2: bool) -> i64 {
+    if x2 {
+        return ((dest & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF);
+    }
+    return ((dest & 255) << 56) | (lo & 0xFFFFFFFF);
+}
+
+// ─── Local APIC driver over the bus seam ────────────────────────────────
+
+pub struct ApicBus {
+    pub x2: bool,
+    pub rd: fn(i64) -> i64,
+    pub wr: fn(i64, i64) -> void,
+}
+
+pub fn lapic_read(b: & ApicBus, offset: i64) -> i64 {
+    val f = b.rd;
+    if b.x2 {
+        return f(apic_x2_msr(offset));
+    }
+    return f(offset) & 0xFFFFFFFF;
+}
+
+pub fn lapic_write(b: & ApicBus, offset: i64, v: i64) {
+    val f = b.wr;
+    if b.x2 {
+        f(apic_x2_msr(offset), v);
+        return;
+    }
+    f(offset, v & 0xFFFFFFFF);
+}
+
+/// APIC id of this CPU: bits 31:24 in xAPIC mode, the whole register in x2APIC.
+pub fn lapic_id(b: & ApicBus) -> i64 {
+    var v: i64 = lapic_read(b, LAPIC_ID);
+    if b.x2 {
+        return v;
+    }
+    return (v >> 24) & 255;
+}
+
+/// Version register: version (bits 7:0) and number of LVT entries.
+pub fn lapic_max_lvt(b: & ApicBus) -> i64 {
+    return ((lapic_read(b, LAPIC_VERSION) >> 16) & 255) + 1;
+}
+
+pub fn lapic_eoi(b: & ApicBus) {
+    lapic_write(b, LAPIC_EOI, 0);
+}
+
+/// Bring up the Local APIC: flat logical mode (xAPIC), every LVT masked,
+/// errors cleared, TPR 0, then software-enable with the spurious vector.
+pub fn lapic_init(b: & ApicBus, spurious: i64, error_vector: i64) {
+    if !b.x2 {
+        lapic_write(b, LAPIC_DFR, 0xFFFFFFFF);
+        lapic_write(b, LAPIC_LDR, (1 << 24));
+    }
+    lapic_write(b, LAPIC_LVT_TIMER, APIC_MASKED);
+    lapic_write(b, LAPIC_LVT_LINT0, APIC_MASKED);
+    lapic_write(b, LAPIC_LVT_LINT1, APIC_MASKED);
+    lapic_write(b, LAPIC_LVT_ERROR, apic_lvt(error_vector, APIC_DM_FIXED, false, false, false));
+    // the ESR latches on a write: write twice, back to back
+    lapic_write(b, LAPIC_ESR, 0);
+    lapic_write(b, LAPIC_ESR, 0);
+    lapic_write(b, LAPIC_TPR, 0);
+    lapic_write(b, LAPIC_SVR, 0x100 | (spurious & 255));
+}
+
+/// Start the timer: divisor, LVT (vector, mode), then the initial count
+/// (writing the count starts it).
+pub fn lapic_timer_start(b: & ApicBus, vector: i64, mode: i64, div: i64, count: i64) {
+    lapic_write(b, LAPIC_TIMER_DIV, apic_timer_div_encode(div));
+    lapic_write(b, LAPIC_LVT_TIMER, apic_lvt_timer(vector, mode, false));
+    lapic_write(b, LAPIC_TIMER_INIT, count);
+}
+
+pub fn lapic_timer_stop(b: & ApicBus) {
+    lapic_write(b, LAPIC_TIMER_INIT, 0);
+    lapic_write(b, LAPIC_LVT_TIMER, APIC_MASKED);
+}
+
+/// Send an IPI. xAPIC: destination into ICR_HI, command into ICR_LO,
+/// then wait (at most `spins` reads) for the delivery status to clear.
+/// x2APIC: one write of the 64-bit ICR MSR. Returns false on a timeout.
+pub fn lapic_send_ipi(b: & ApicBus, dest: i64, lo: i64, spins: i64) -> bool {
+    if b.x2 {
+        val f = b.wr;
+        f(MSR_X2APIC_ICR, apic_icr64(lo, dest, true));
+        return true;
+    }
+    lapic_write(b, LAPIC_ICR_HI, (dest & 255) << 24);
+    lapic_write(b, LAPIC_ICR_LO, lo);
+    var i: i64 = 0;
+    while i < spins {
+        if (lapic_read(b, LAPIC_ICR_LO) & APIC_DELIVERY_PENDING) == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Bit `vector` of the 256-bit ISR / IRR / TMR array at `base`.
+pub fn lapic_vector_bit(b: & ApicBus, base: i64, vector: i64) -> bool {
+    var word: i64 = lapic_read(b, base + (vector / 32) * 16);
+    return ((word >> (vector % 32)) & 1) != 0;
+}
+
+// ─── IO APIC ────────────────────────────────────────────────────────────
+
+pub const IOAPIC_REG_ID: i64 = 0x00;
+pub const IOAPIC_REG_VER: i64 = 0x01;
+pub const IOAPIC_REG_ARB: i64 = 0x02;
+
+pub fn ioapic_read(io: & ApicBus, reg: i64) -> i64 {
+    val w = io.wr;
+    val r = io.rd;
+    w(0x00, reg & 255);
+    return r(0x10) & 0xFFFFFFFF;
+}
+
+pub fn ioapic_write(io: & ApicBus, reg: i64, v: i64) {
+    val w = io.wr;
+    w(0x00, reg & 255);
+    w(0x10, v & 0xFFFFFFFF);
+}
+
+/// Number of redirection entries (max redirection entry + 1).
+pub fn ioapic_entries(io: & ApicBus) -> i64 {
+    return ((ioapic_read(io, IOAPIC_REG_VER) >> 16) & 255) + 1;
+}
+
+pub fn ioapic_version(io: & ApicBus) -> i64 {
+    return ioapic_read(io, IOAPIC_REG_VER) & 255;
+}
+
+/// 64-bit redirection entry: vector, delivery mode, logical destination,
+/// polarity, trigger, mask, destination APIC id (bits 63:56).
+@wrapping pub fn ioapic_redir(vector: i64, mode: i64, logical: bool, active_low: bool, level: bool, masked: bool, dest: i64) -> i64 {
+    var v: i64 = apic_lvt(vector, mode, active_low, level, masked);
+    if logical { v = v | 0x800; }
+    return v | ((dest & 255) << 56);
+}
+
+@wrapping pub fn ioapic_get_redir(io: & ApicBus, n: i64) -> i64 {
+    var lo: i64 = ioapic_read(io, 0x10 + 2 * n);
+    var hi: i64 = ioapic_read(io, 0x11 + 2 * n);
+    return (hi << 32) | lo;
+}
+
+/// Program entry n: masked low half first, then the high half, then the
+/// final low half, so no half-written entry ever fires.
+@wrapping pub fn ioapic_set_redir(io: & ApicBus, n: i64, e: i64) {
+    ioapic_write(io, 0x10 + 2 * n, (e & 0xFFFFFFFF) | APIC_MASKED);
+    ioapic_write(io, 0x11 + 2 * n, (e >> 32) & 0xFFFFFFFF);
+    ioapic_write(io, 0x10 + 2 * n, e & 0xFFFFFFFF);
+}
+
+pub fn ioapic_mask(io: & ApicBus, n: i64, masked: bool) {
+    var lo: i64 = ioapic_read(io, 0x10 + 2 * n);
+    if masked {
+        lo = lo | APIC_MASKED;
+    } else {
+        lo = lo & ~APIC_MASKED;
+    }
+    ioapic_write(io, 0x10 + 2 * n, lo);
+}
+
+// ─── MADT ───────────────────────────────────────────────────────────────
+
+pub struct MadtCpu {
+    pub uid: i64,
+    pub apic_id: i64,
+    pub enabled: bool,
+    pub online_capable: bool,
+    pub x2: bool,
+}
+
+pub struct MadtIoApic {
+    pub id: i64,
+    pub addr: i64,
+    pub gsi_base: i64,
+}
+
+pub struct MadtOverride {
+    pub source: i64,
+    pub gsi: i64,
+    pub flags: i64,
+}
+
+pub struct MadtInfo {
+    pub lapic_addr: i64,
+    pub pcat_compat: bool,
+    // legacy 8259 PICs present: mask them
+    pub cpus: Vec<MadtCpu>,
+    pub ioapics: Vec<MadtIoApic>,
+    pub overrides: Vec<MadtOverride>,
+    pub nmi_lint: i64,  // LINT pin of the NMI entry for all CPUs, -1 none
+}
+
+/// Decode a MADT (the table bytes, header at offset 0).
+@wrapping pub fn madt_parse(m: Vec<i64>) -> MadtInfo {
+    var info: MadtInfo = MadtInfo {
+        lapic_addr: acpi_u32(m, 36), pcat_compat: (acpi_u32(m, 40) & 1) != 0, cpus: Vec::new(), ioapics: Vec::new(), overrides: Vec::new(), nmi_lint: -1
+    };
+    var len: i64 = acpi_u32(m, 4);
+    var o: i64 = 44;
+    while o + 2 <= len {
+        var ty: i64 = m.get(o);
+        var el: i64 = m.get(o + 1);
+        if el < 2 {
+            return info;
+        }
+        if ty == 0 {
+            var f: i64 = acpi_u32(m, o + 4);
+            info.cpus.push(MadtCpu { uid: m.get(o + 2), apic_id: m.get(o + 3), enabled: (f & 1) != 0, online_capable: (f & 2) != 0, x2: false });
+        }
+        if ty == 1 {
+            info.ioapics.push(MadtIoApic { id: m.get(o + 2), addr: acpi_u32(m, o + 4), gsi_base: acpi_u32(m, o + 8) });
+        }
+        if ty == 2 && m.get(o + 2) == 0 {
+            info.overrides.push(MadtOverride { source: m.get(o + 3), gsi: acpi_u32(m, o + 4), flags: acpi_u16(m, o + 8) });
+        }
+        if ty == 4 && m.get(o + 2) == 0xFF {
+            info.nmi_lint = m.get(o + 5);
+        }
+        if ty == 5 {
+            info.lapic_addr = acpi_u64(m, o + 4);
+            // 64-bit Local APIC address override
+        }
+        if ty == 9 {
+            var f2: i64 = acpi_u32(m, o + 8);
+            info.cpus.push(MadtCpu { uid: acpi_u32(m, o + 12), apic_id: acpi_u32(m, o + 4), enabled: (f2 & 1) != 0, online_capable: (f2 & 2) != 0, x2: true });
+        }
+        o = o + el;
+    }
+    return info;
+}
+
+pub struct IrqRoute {
+    pub gsi: i64,
+    pub active_low: bool,
+    pub level: bool,
+}
+
+/// Where ISA IRQ irq arrives: its override, or identity, edge, active high.
+pub fn madt_isa_route(info: & MadtInfo, irq: i64) -> IrqRoute {
+    var r: IrqRoute = IrqRoute { gsi: irq, active_low: false, level: false };
+    var i: i64 = 0;
+    while i < info.overrides.len() {
+        var ov: MadtOverride = info.overrides.get(i);
+        if ov.source == irq {
+            r.gsi = ov.gsi;
+            // MPS INTI flags: polarity bits 1:0, trigger bits 3:2 (00 = bus default)
+            r.active_low = (ov.flags & 3) == 3;
+            r.level = ((ov.flags >> 2) & 3) == 3;
+        }
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Index of the IO APIC serving gsi, given each one's entry count, or -1.
+pub fn madt_ioapic_for(info: & MadtInfo, gsi: i64, counts: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < info.ioapics.len() {
+        var a: MadtIoApic = info.ioapics.get(i);
+        if gsi >= a.gsi_base && gsi < a.gsi_base + counts.get(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Redirection entry for an ISA IRQ routed through the MADT.
+pub fn apic_isa_redir(info: & MadtInfo, irq: i64, vector: i64, dest: i64) -> i64 {
+    var r: IrqRoute = madt_isa_route(info, irq);
+    return ioapic_redir(vector, APIC_DM_FIXED, false, r.active_low, r.level, false, dest);
+}

@@ -32,6 +32,9 @@
 module sdl;
 // ─── SDL2 Core FFI ────────────────────────────────────────────────────────
 
+// SAFETY: the prototypes come from <SDL2/SDL.h> (the include), so the C
+// compiler checks each call; SDL objects travel as the i64 handles SDL
+// returned, and strings are NUL-terminated Fides strings.
 extern "C" include "<SDL2/SDL.h>" link "SDL2" {
     fn SDL_Init as sdl_init_raw(flags: i64) -> i64;
     fn SDL_Quit as sdl_quit_raw() -> void;
@@ -55,6 +58,8 @@ extern "C" include "<SDL2/SDL.h>" link "SDL2" {
 
 // ─── SDL2_image FFI (PNG/JPG loading) ─────────────────────────────────────
 
+// SAFETY: the prototypes come from <SDL2/SDL_image.h>, checked by the C
+// compiler; surfaces and textures are handles SDL returned.
 extern "C" include "<SDL2/SDL_image.h>" link "SDL2_image" {
     fn IMG_Load as img_load_raw(path: str) -> i64;
     fn SDL_CreateTextureFromSurface as sdl_texture_from_surface(ren: i64, surf: i64) -> i64;
@@ -66,6 +71,8 @@ extern "C" include "<SDL2/SDL_image.h>" link "SDL2_image" {
 
 // ─── SDL2_mixer FFI (audio playback) ──────────────────────────────────────
 
+// SAFETY: the prototypes come from <SDL2/SDL_mixer.h>, checked by the C
+// compiler; chunks are handles SDL_mixer returned.
 extern "C" include "<SDL2/SDL_mixer.h>" link "SDL2_mixer" {
     fn Mix_OpenAudio as mix_open(freq: i64, format: i64, channels: i64, chunksize: i64) -> i64;
     fn Mix_CloseAudio as mix_close() -> void;
@@ -194,6 +201,15 @@ pub struct SdlInputState {
 }
 
 /// Create a new input state tracker.
+///
+/// Example:
+///   var st = sdl_input_create();
+///   assert(!sdl_quit_requested(&st));
+///   assert(!sdl_key_held(&st, SDL_SCANCODE_A));
+///   st.keys.set(SDL_SCANCODE_A, 1);
+///   assert(sdl_key_held(&st, SDL_SCANCODE_A));
+///   assert(sdl_key_pressed(&st, SDL_SCANCODE_A));
+///   assert(!sdl_key_released(&st, SDL_SCANCODE_A));
 pub fn sdl_input_create() -> SdlInputState {
     var keys = Vec::new();
     var prev_keys = Vec::new();
@@ -235,6 +251,9 @@ pub fn sdl_poll_events(state: & mut SdlInputState) -> void {
 // Native runtime helper: polls SDL events and fills SdlInputState.
 // In the interpreter, this is a no-op.
 // In native builds, this calls SDL_PollEvent, SDL_GetKeyboardState, SDL_GetMouseState.
+// SAFETY: pledge_sdl.h is the runtime's own header, checked by the C
+// compiler; `state` is the address of an SdlInputState the caller owns, which
+// the helper fills field by field.
 extern "C" include "pledge_sdl.h" link "" {
     fn pledge_sdl_poll_events(state: i64) -> void;
 }
@@ -318,6 +337,8 @@ pub fn sdl_draw_texture(ren: i64, tex: i64, x: i64, y: i64, w: i64, h: i64) -> v
 }
 
 // Native helper: draws a texture at the given position.
+// SAFETY: pledge_sdl.h is the runtime's own header, checked by the C
+// compiler; the renderer and texture are handles SDL returned.
 extern "C" include "pledge_sdl.h" link "" {
     fn pledge_sdl_draw_texture(ren: i64, tex: i64, x: i64, y: i64, w: i64, h: i64) -> void;
 }

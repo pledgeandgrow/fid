@@ -1,0 +1,49 @@
+// sqlite's query_params (release B15): values bound to `?` round-trip as
+// data, never SQL: a quote, a would-be injection, an empty string, a
+// non-ASCII string, numbers compared as numbers through CAST, and a
+// parameter reused across calls. Needs SQLite: `fid emit` on Windows loads
+// sqlite3.dll or winsqlite3.dll; ccompile links -lsqlite3 (an
+// external-library test, like test_sqlite.fd).
+//
+// Expected output:
+// [{"id":2,"name":"O'Brien","note":"x'); DROP TABLE t; --"}]
+// [{"n":4}]
+// [{"name":""}]
+// [{"name":"Zoë 日本"}]
+// [{"name":"Alice"},{"name":"O'Brien"}]
+// []
+// [{"v":"?"}]
+// params ok
+use sqlite;
+
+fn one(v: str) -> Vec<str> {
+    var p: Vec<str> = Vec::new();
+    p.push(v);
+    return p;
+}
+
+fn main() -> i64 {
+    var db = SQLite::open_memory();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, note TEXT)");
+    var ins: Vec<str> = Vec::new();
+    ins.push("Alice"); ins.push("30"); ins.push("");
+    db.query_params("INSERT INTO t (name, age, note) VALUES (?, CAST(? AS INTEGER), ?)", ins);
+    var ins2: Vec<str> = Vec::new();
+    ins2.push("O'Brien"); ins2.push("41"); ins2.push("x'); DROP TABLE t; --");
+    db.query_params("INSERT INTO t (name, age, note) VALUES (?, CAST(? AS INTEGER), ?)", ins2);
+    db.query_params("INSERT INTO t (name, age) VALUES (?, 0)", one(""));
+    db.query_params("INSERT INTO t (name, age) VALUES (?, 5)", one("Zoë 日本"));
+    // the injection text is stored as data, and the table is still there
+    println(db.query_params("SELECT id, name, note FROM t WHERE name = ?", one("O'Brien")));
+    println(db.query("SELECT count(*) AS n FROM t"));
+    println(db.query_params("SELECT name FROM t WHERE name = ?", one("")));
+    println(db.query_params("SELECT name FROM t WHERE name = ?", one("Zoë 日本")));
+    println(db.query_params("SELECT name FROM t WHERE age >= CAST(? AS INTEGER) ORDER BY id", one("30")));
+    // a bound value that looks like SQL matches nothing
+    println(db.query_params("SELECT name FROM t WHERE name = ?", one("Alice' OR '1'='1")));
+    // a literal ? inside a bound value stays text
+    println(db.query_params("SELECT ? AS v", one("?")));
+    db.close();
+    println("params ok");
+    return 0;
+}

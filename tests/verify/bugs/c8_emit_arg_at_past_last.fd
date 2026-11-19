@@ -1,0 +1,33 @@
+// Chaos log C8 (docs/verification/miscompile-log.md; scripts/verify/chaos.py,
+// VF17). With `fid emit` (pe_ir), arg_at(i) for an i past the last argument
+// returns Some of a wild pointer, and reading it panics "Invalid memory
+// access (null or dangling pointer)", when the program has at least one
+// argument: the p_argv stub (compiler/pe_ir_stubs.fd PeirGen_gen_argv)
+// counts the tokens in rax and returns rax when none matched, so the count
+// (1 with one argument) comes back as the string's address. With no
+// argument the count is 0 and the result is right by luck. This is what
+// C2 and C3 were (chaos.fd reads arg_at(3) ?? "0" before every mode).
+//
+// The program runs itself with one argument; the child asks for a second.
+// arg_at under `fid run` sees fid's own command line (known-bugs 2g.60), so
+// the built backends only.
+//@ backends: ccompile,emit
+
+fn main() -> i64 {
+    match arg_at(1) {
+        Option::Some(a) => {
+            match arg_at(2) {
+                Option::Some(t) => {
+                    println("child " + a + ": a second argument " + int_to_str(str_len(t)));
+                    return 3;
+                }
+                Option::None => { return 0; }
+            }
+        }
+        Option::None => {}
+    }
+    val me: str = arg_at(0) ?? "";
+    println("child exit " + int_to_str(p_system(me + " one")));
+    return 0;
+}
+//> child exit 0

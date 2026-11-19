@@ -1,0 +1,52 @@
+// Cancellation tokens nest (CA7/CA8, stdlib/task.fd): a token's third word
+// names its parent, and a token counts as cancelled when its parent is, so
+// an inner `timeout(ms) { }` block's token also stops at the outer block's
+// deadline when it is handed to a wait (task_current_token()).
+// task_token_remaining gives the nearest deadline over the chain.
+//
+// Expected output:
+// inner alone: false
+// nearest deadline from the parent: true
+// inner after outer cancelled: true
+// remaining once cancelled: 0
+// no deadline: -1
+// own deadline nearer: true
+// outside any block: 0
+// in a block: true
+// nested block sees outer: true
+use string;
+use task;
+
+fn main() -> i64 {
+    val outer: i64 = task_token_with_timeout(10000);
+    val inner: i64 = task_token_new();
+    p_atomic_store(inner + 16, outer);
+    println("inner alone: " + bool_to_str(task_token_cancelled(inner)));
+    println("nearest deadline from the parent: " + bool_to_str(task_token_remaining(inner) > 9000));
+    task_token_cancel(outer);
+    println("inner after outer cancelled: " + bool_to_str(task_token_cancelled(inner)));
+    println("remaining once cancelled: " + int_to_str(task_token_remaining(inner)));
+    println("no deadline: " + int_to_str(task_token_remaining(task_token_new())));
+
+    val far: i64 = task_token_with_timeout(50000);
+    val near: i64 = task_token_with_timeout(1000);
+    p_atomic_store(near + 16, far);
+    println("own deadline nearer: " + bool_to_str(task_token_remaining(near) <= 1000));
+
+    println("outside any block: " + int_to_str(task_current_token()));
+    var in_block: bool = false;
+    var nested_ok: bool = false;
+    timeout(5000) {
+        val t1: i64 = task_current_token();
+        in_block = t1 != 0;
+        timeout(60000) {
+            // the inner block's token names the outer one: its remaining
+            // time is the outer block's
+            val r: i64 = task_token_remaining(task_current_token());
+            nested_ok = r >= 0 && r <= 5000;
+        }
+    }
+    println("in a block: " + bool_to_str(in_block));
+    println("nested block sees outer: " + bool_to_str(nested_ok));
+    return 0;
+}

@@ -1,0 +1,406 @@
+// Fides electricity tariffs and bill computation
+//
+// Pure computation, no platform seam. Energy is counted in whole Wh
+// (integers, exact) and money in exact decimals (stdlib `decimal`): every
+// bill line is quantity x rate rounded to cents (half to even), and the
+// total is the sum of the lines, so a bill adds up to the cent.
+//
+// A load profile is a run of equal intervals (e.g. 60 or 15 minutes)
+// starting at midnight on a given day of the week (0 = Monday), with the
+// energy imported from and exported to the grid in each interval. The
+// whole profile is one billing period.
+//
+// Tariff components:
+// - a fixed charge per bill;
+// - energy charges in one of four modes: flat; time-of-use (periods by
+//   day-of-week mask and hour range, overnight ranges allowed, the first
+//   matching period wins, otherwise the off-peak rate); tiered blocks on the
+//   period's total energy (inclining or declining); dynamic prices (one
+//   price per interval, e.g. day-ahead hourly prices);
+// - demand charges: rate x the highest interval demand (kW = Wh / interval
+//   hours / 1000), over all hours or only inside one time-of-use period;
+// - exports: none (exports earn nothing), net metering (exports offset
+//   imports in the same time-of-use period before pricing; an excess is
+//   credited at the excess rate), or net billing (imports billed in full,
+//   every exported kWh credited at the export rate, or at the dynamic
+//   price when the tariff has dynamic export prices).
+//
+// Usage:
+//   use tariff;
+//   var t = tariff_new("Residential TOU", TARIFF_TOU, "10.00", "0.12");
+//   tariff_add_tou(&mut t, "on-peak", TARIFF_WEEKDAYS, 16, 21, "0.40");
+//   val bill = tariff_bill(&t, &profile);
+//   println(tariff_bill_to_str(&bill));
+
+module tariff;
+use decimal;
+use bigint;
+use vec;
+use string;
+
+pub const TARIFF_FLAT: i64 = 0;
+pub const TARIFF_TOU: i64 = 1;
+pub const TARIFF_TIERED: i64 = 2;
+pub const TARIFF_DYNAMIC: i64 = 3;
+
+pub const TARIFF_EXPORT_NONE: i64 = 0;
+pub const TARIFF_NET_METERING: i64 = 1;
+pub const TARIFF_NET_BILLING: i64 = 2;
+
+/// Day-of-week masks (bit d = day d, 0 = Monday).
+pub const TARIFF_WEEKDAYS: i64 = 31;
+pub const TARIFF_WEEKENDS: i64 = 96;
+pub const TARIFF_ALL_DAYS: i64 = 127;
+
+pub struct TouPeriod {
+    pub name: str,
+    pub days: i64,
+    pub start_hour: i64,
+    pub end_hour: i64,
+    pub rate: Decimal,
+}
+
+pub struct Tariff {
+    pub name: str,
+    pub mode: i64,
+    pub fixed: Decimal,
+    pub base_rate: Decimal,
+    pub tou: Vec<TouPeriod>,
+    pub tier_limits_wh: Vec<i64>,
+    pub tier_rates: Vec<Decimal>,
+    pub dynamic_prices: Vec<Decimal>,
+    pub demand_rate: Decimal,
+    pub demand_period: str,
+    pub export_mode: i64,
+    pub export_rate: Decimal,
+    pub excess_rate: Decimal,
+    pub dynamic_export: Vec<Decimal>,
+}
+
+pub struct LoadProfile {
+    pub start_dow: i64,
+    pub interval_minutes: i64,
+    pub import_wh: Vec<i64>,
+    pub export_wh: Vec<i64>,
+}
+
+pub struct BillLine {
+    pub label: str,
+    pub quantity: Decimal,
+    pub unit: str,
+    pub rate: Decimal,
+    pub amount: Decimal,
+}
+
+pub struct Bill {
+    pub tariff: str,
+    pub lines: Vec<BillLine>,
+    pub total: Decimal,
+    pub import_wh: i64,
+    pub export_wh: i64,
+    pub peak_kw: Decimal,
+}
+
+// ─── Building tariffs and profiles ───
+
+/// A tariff of `mode` with a fixed charge and a base rate (the flat rate,
+/// the off-peak rate for TOU), amounts as decimal text.
+pub fn tariff_new(name: str, mode: i64, fixed: str, base_rate: str) -> Tariff {
+    return Tariff {
+        name: name, mode: mode, fixed: dec_parse(fixed), base_rate: dec_parse(base_rate), tou: Vec::new(), tier_limits_wh: Vec::new(), tier_rates: Vec::new(), dynamic_prices: Vec::new(), demand_rate: dec_zero(), demand_period: "", export_mode: TARIFF_EXPORT_NONE, export_rate: dec_zero(), excess_rate: dec_zero(), dynamic_export: Vec::new()
+    };
+}
+
+/// A time-of-use period: days mask, hours [start, end) (end <= start wraps
+/// past midnight), rate per kWh.
+pub fn tariff_add_tou(t: &mut Tariff, name: str, days: i64, start_hour: i64, end_hour: i64, rate: str) {
+    t.tou.push(TouPeriod {
+        name: name, days: days, start_hour: start_hour, end_hour: end_hour, rate: dec_parse(rate)
+    });
+}
+
+/// A block of the tiered schedule: up to `upto_kwh` (cumulative, -1 for
+/// the last, unbounded block) at `rate`. Blocks are added in order.
+pub fn tariff_add_tier(t: &mut Tariff, upto_kwh: i64, rate: str) {
+    if upto_kwh < 0 {
+        t.tier_limits_wh.push(-1);
+    } else {
+        t.tier_limits_wh.push(upto_kwh * 1000);
+    }
+    t.tier_rates.push(dec_parse(rate));
+}
+
+pub fn tariff_add_dynamic_price(t: &mut Tariff, price: str) {
+    t.dynamic_prices.push(dec_parse(price));
+}
+
+pub fn tariff_add_dynamic_export_price(t: &mut Tariff, price: str) {
+    t.dynamic_export.push(dec_parse(price));
+}
+
+/// Demand charge per kW of the highest interval demand; `period` names a
+/// TOU period to restrict it to ("" for all hours).
+pub fn tariff_set_demand(t: &mut Tariff, rate: str, period: str) {
+    t.demand_rate = dec_parse(rate);
+    t.demand_period = period;
+}
+
+pub fn tariff_set_export(t: &mut Tariff, mode: i64, export_rate: str, excess_rate: str) {
+    t.export_mode = mode;
+    t.export_rate = dec_parse(export_rate);
+    t.excess_rate = dec_parse(excess_rate);
+}
+
+pub fn tariff_profile(start_dow: i64, interval_minutes: i64) -> LoadProfile {
+    return LoadProfile {
+        start_dow: start_dow, interval_minutes: interval_minutes, import_wh: Vec::new(), export_wh: Vec::new()
+    };
+}
+
+pub fn LoadProfile_add(p: &mut LoadProfile, import_wh: i64, export_wh: i64) {
+    p.import_wh.push(import_wh);
+    p.export_wh.push(export_wh);
+}
+
+// ─── Time of an interval ───
+
+/// Hour of day (0..23) of interval i.
+pub fn tariff_hour(p: &LoadProfile, i: i64) -> i64 {
+    return ((i * p.interval_minutes) / 60) % 24;
+}
+
+/// Day of week (0 = Monday) of interval i.
+pub fn tariff_dow(p: &LoadProfile, i: i64) -> i64 {
+    return (p.start_dow + (i * p.interval_minutes) / 1440) % 7;
+}
+
+fn tariff_in_period(per: &TouPeriod, dow: i64, hour: i64) -> bool {
+    if ((per.days >> dow) & 1) == 0 {
+        return false;
+    }
+    if per.start_hour < per.end_hour {
+        return hour >= per.start_hour && hour < per.end_hour;
+    }
+    return hour >= per.start_hour || hour < per.end_hour;
+}
+
+/// Index of the TOU period of interval i, or -1 (off-peak / base rate).
+pub fn tariff_period_of(t: &Tariff, p: &LoadProfile, i: i64) -> i64 {
+    val dow: i64 = tariff_dow(p, i);
+    val hour: i64 = tariff_hour(p, i);
+    var k: i64 = 0;
+    while k < t.tou.len() {
+        val per: TouPeriod = t.tou.get(k);
+        if tariff_in_period(&per, dow, hour) {
+            return k;
+        }
+        k = k + 1;
+    }
+    return -1;
+}
+
+// ─── Money helpers ───
+
+fn tariff_kwh(wh: i64) -> Decimal {
+    return dec_from_units(wh, 3);
+}
+
+fn tariff_cents(d: Decimal) -> Decimal {
+    return dec_round(d, 2, DEC_HALF_EVEN);
+}
+
+fn tariff_line(label: str, qty: Decimal, unit: str, rate: Decimal) -> BillLine {
+    return BillLine {
+        label: label, quantity: qty, unit: unit, rate: rate, amount: tariff_cents(dec_mul(qty, rate))
+    };
+}
+
+/// The rate of TOU slot k (-1 = base).
+fn tariff_slot_rate(t: &Tariff, k: i64) -> Decimal {
+    if k < 0 {
+        return t.base_rate;
+    }
+    return t.tou.get(k).rate;
+}
+
+fn tariff_slot_name(t: &Tariff, k: i64) -> str {
+    if k < 0 {
+        if t.mode == TARIFF_TOU {
+            return "off-peak";
+        }
+        return "energy";
+    }
+    return t.tou.get(k).name;
+}
+
+// ─── The bill ───
+
+pub fn tariff_bill(t: &Tariff, p: &LoadProfile) -> Bill {
+    var lines: Vec<BillLine> = Vec::new();
+    val n: i64 = p.import_wh.len();
+    var imp_total: i64 = 0;
+    var exp_total: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        imp_total = imp_total + p.import_wh.get(i);
+        exp_total = exp_total + p.export_wh.get(i);
+        i = i + 1;
+    }
+    if dec_sign(t.fixed) != 0 {
+        lines.push(BillLine {
+            label: "fixed charge", quantity: dec_from_i64(1), unit: "bill", rate: t.fixed, amount: tariff_cents(t.fixed)
+        });
+    }
+    val netting: bool = t.export_mode == TARIFF_NET_METERING;
+    // energy per slot: slot 0 = base, slot k + 1 = TOU period k
+    val nslots: i64 = t.tou.len() + 1;
+    var slot_wh: Vec<i64> = Vec::new();
+    i = 0;
+    while i < nslots {
+        slot_wh.push(0);
+        i = i + 1;
+    }
+    var dyn_sum: Decimal = dec_zero();
+    var dyn_wh: i64 = 0;
+    i = 0;
+    while i < n {
+        var e: i64 = p.import_wh.get(i);
+        if netting {
+            e = e - p.export_wh.get(i);
+        }
+        if t.mode == TARIFF_TOU {
+            val k: i64 = tariff_period_of(t, p, i) + 1;
+            slot_wh.set(k, slot_wh.get(k) + e);
+        } else if t.mode == TARIFF_DYNAMIC {
+            dyn_sum = dec_add(dyn_sum, dec_mul(tariff_kwh(e), t.dynamic_prices.get(i)));
+            dyn_wh = dyn_wh + e;
+        } else {
+            slot_wh.set(0, slot_wh.get(0) + e);
+        }
+        i = i + 1;
+    }
+    var excess_wh: i64 = 0;
+    if t.mode == TARIFF_DYNAMIC {
+        lines.push(BillLine {
+            label: "energy (dynamic prices)", quantity: tariff_kwh(dyn_wh), unit: "kWh", rate: dec_zero(), amount: tariff_cents(dyn_sum)
+        });
+    } else if t.mode == TARIFF_TIERED {
+        var rest: i64 = slot_wh.get(0);
+        if rest < 0 {
+            excess_wh = 0 - rest;
+            rest = 0;
+        }
+        var prev: i64 = 0;
+        var b: i64 = 0;
+        while b < t.tier_limits_wh.len() && rest > 0 {
+            val lim: i64 = t.tier_limits_wh.get(b);
+            var take: i64 = rest;
+            if lim >= 0 && lim - prev < take {
+                take = lim - prev;
+            }
+            if take > 0 {
+                lines.push(tariff_line("tier " + int_to_str(b + 1), tariff_kwh(take), "kWh", t.tier_rates.get(b)));
+            }
+            rest = rest - take;
+            prev = lim;
+            b = b + 1;
+        }
+    } else {
+        var k: i64 = 0;
+        while k < nslots {
+            var wh: i64 = slot_wh.get(k);
+            if wh < 0 {
+                excess_wh = excess_wh - wh;
+                wh = 0;
+            }
+            if wh > 0 {
+                lines.push(tariff_line(tariff_slot_name(t, k - 1), tariff_kwh(wh), "kWh", tariff_slot_rate(t, k - 1)));
+            }
+            k = k + 1;
+        }
+    }
+    if excess_wh > 0 {
+        lines.push(tariff_line("excess generation credit", tariff_kwh(excess_wh), "kWh", dec_neg(t.excess_rate)));
+    }
+    // net billing: every exported kWh is credited
+    if t.export_mode == TARIFF_NET_BILLING && exp_total > 0 {
+        if t.dynamic_export.len() > 0 {
+            var credit: Decimal = dec_zero();
+            i = 0;
+            while i < n {
+                credit = dec_add(credit, dec_mul(tariff_kwh(p.export_wh.get(i)), t.dynamic_export.get(i)));
+                i = i + 1;
+            }
+            lines.push(BillLine {
+                label: "export credit (dynamic prices)", quantity: tariff_kwh(exp_total), unit: "kWh", rate: dec_zero(), amount: tariff_cents(dec_neg(credit))
+            });
+        } else {
+            lines.push(tariff_line("export credit", tariff_kwh(exp_total), "kWh", dec_neg(t.export_rate)));
+        }
+    }
+    // demand: highest interval import in Wh, as kW
+    var peak_wh: i64 = 0;
+    var period_idx: i64 = -1;
+    if str_len(t.demand_period) > 0 {
+        var k: i64 = 0;
+        while k < t.tou.len() {
+            if t.tou.get(k).name == t.demand_period {
+                period_idx = k;
+            }
+            k = k + 1;
+        }
+    }
+    i = 0;
+    while i < n {
+        var counts: bool = true;
+        if str_len(t.demand_period) > 0 {
+            counts = tariff_period_of(t, p, i) == period_idx;
+        }
+        if counts && p.import_wh.get(i) > peak_wh {
+            peak_wh = p.import_wh.get(i);
+        }
+        i = i + 1;
+    }
+    // kW = Wh * 60 / minutes / 1000, kept to 3 decimals
+    val peak_kw: Decimal = dec_div(dec_from_units(peak_wh * 60, 3), dec_from_i64(p.interval_minutes), 3, DEC_HALF_EVEN);
+    if dec_sign(t.demand_rate) != 0 {
+        var label: str = "demand charge";
+        if str_len(t.demand_period) > 0 {
+            label = "demand charge (" + t.demand_period + ")";
+        }
+        lines.push(tariff_line(label, peak_kw, "kW", t.demand_rate));
+    }
+    var total: Decimal = dec_zero();
+    i = 0;
+    while i < lines.len() {
+        total = dec_add(total, lines.get(i).amount);
+        i = i + 1;
+    }
+    return Bill {
+        tariff: t.name, lines: lines, total: total, import_wh: imp_total, export_wh: exp_total, peak_kw: peak_kw
+    };
+}
+
+/// The bill as text, one line per charge and a total.
+pub fn tariff_bill_to_str(b: &Bill) -> str {
+    var out: str = b.tariff + "\n";
+    var i: i64 = 0;
+    while i < b.lines.len() {
+        val l: BillLine = b.lines.get(i);
+        out = out + "  " + l.label + ": " + dec_to_str(dec_normalize(l.quantity)) + " " + l.unit;
+        if dec_sign(l.rate) != 0 && l.unit != "bill" {
+            out = out + " x " + dec_to_str(l.rate);
+        }
+        out = out + " = " + dec_to_str(l.amount) + "\n";
+        i = i + 1;
+    }
+    return out + "  total: " + dec_to_str(b.total);
+}
+
+/// Average cost per imported kWh, to 5 decimals (0 when nothing imported).
+pub fn tariff_average_rate(b: &Bill) -> Decimal {
+    if b.import_wh == 0 {
+        return dec_zero();
+    }
+    return dec_div(b.total, tariff_kwh(b.import_wh), 5, DEC_HALF_EVEN);
+}

@@ -1,0 +1,601 @@
+// Fides SQL query builder, pure Fides
+//
+// Builds SELECT, INSERT, UPDATE and DELETE statements as text plus a list
+// of bound parameters, for two placeholder dialects:
+//   - PostgreSQL: $1, $2, ... ; identifiers quoted "like_this"
+//   - SQLite: ?, ?, ... ; identifiers quoted "like_this"
+// Values never go into the SQL text: every value is a parameter, so the
+// statement is safe to send with the driver's bind API (stdlib postgres /
+// sqlite). Identifiers are quoted ("" doubles an embedded quote), and
+// t.col is quoted per part; `*` stays bare.
+//
+// Supported: SELECT [DISTINCT] columns FROM table [AS alias], INNER /
+// LEFT / RIGHT / FULL / CROSS JOIN ... ON, a WHERE tree (comparisons with
+// = <> < <= > >= LIKE, IS [NOT] NULL, IN (...), BETWEEN, AND, OR, NOT, and
+// a raw fragment with its own ? parameters), GROUP BY, HAVING, ORDER BY
+// col ASC/DESC, LIMIT, OFFSET; INSERT of one or many rows with ON
+// CONFLICT DO NOTHING and RETURNING; UPDATE ... SET ... WHERE ...
+// RETURNING; DELETE ... WHERE ... RETURNING. An UPDATE or DELETE without a
+// WHERE is refused unless allowed explicitly.
+//
+// Everything here is real; there is no platform seam (pass the text and
+// parameters to a driver).
+//
+// Usage:
+//   var q: SqlQuery = sql_select("users");
+//   q = sq_columns(q, "id,name");
+//   q = sq_where(q, sc_eq("status", sv_text("active")));
+//   q = sq_order(q, "name", false);
+//   q = sq_limit(q, 10);
+//   val out: SqlOut = sql_build(& q, SQL_POSTGRES);
+//   // SELECT "id", "name" FROM "users" WHERE "status" = $1 ORDER BY "name" ASC LIMIT 10
+
+module sql_builder;
+ use vec;
+
+pub const SQL_POSTGRES: i64 = 0;
+pub const SQL_SQLITE: i64 = 1;
+
+/// A bound value. kind: 0 NULL, 1 integer, 2 real, 3 text, 4 boolean.
+pub struct SqlVal {
+    pub kind: i64,
+    pub i: i64,
+    pub f: f64,
+    pub s: str,
+    pub b: bool,
+}
+
+pub fn sv_null() -> SqlVal { return SqlVal { kind: 0, i: 0, f: 0.0, s: "", b: false }; }
+pub fn sv_int(v: i64) -> SqlVal { return SqlVal { kind: 1, i: v, f: 0.0, s: "", b: false }; }
+pub fn sv_real(v: f64) -> SqlVal { return SqlVal { kind: 2, i: 0, f: v, s: "", b: false }; }
+pub fn sv_text(v: str) -> SqlVal { return SqlVal { kind: 3, i: 0, f: 0.0, s: v, b: false }; }
+pub fn sv_bool(v: bool) -> SqlVal { return SqlVal { kind: 4, i: 0, f: 0.0, s: "", b: v }; }
+
+/// A value as readable text (for logs and tests; never put into SQL).
+pub fn sv_show(v: & SqlVal) -> str {
+    if v.kind == 0 { return "NULL"; }
+    if v.kind == 1 { return int_to_str(v.i); }
+    if v.kind == 2 { return float_to_str(v.f); }
+    if v.kind == 4 {
+        if v.b { return "true"; }
+        return "false";
+    }
+    return "'" + v.s + "'";
+}
+
+/// A WHERE / HAVING condition tree.
+pub enum SqlCond {
+    Cmp(str, str, SqlVal),
+    Null(str, bool),
+    In(str, Vec<SqlVal>, bool),
+    Between(str, SqlVal, SqlVal),
+    And(Vec<SqlCond>),
+    Or(Vec<SqlCond>),
+    Not(Box<SqlCond>),
+    Raw(str, Vec<SqlVal>),
+}
+
+pub fn sc_cmp(col: str, op: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, op, v); }
+pub fn sc_eq(col: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, "=", v); }
+pub fn sc_ne(col: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, "<>", v); }
+pub fn sc_lt(col: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, "<", v); }
+pub fn sc_le(col: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, "<=", v); }
+pub fn sc_gt(col: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, ">", v); }
+pub fn sc_ge(col: str, v: SqlVal) -> SqlCond { return SqlCond::Cmp(col, ">=", v); }
+pub fn sc_like(col: str, pattern: str) -> SqlCond { return SqlCond::Cmp(col, "LIKE", sv_text(pattern)); }
+pub fn sc_is_null(col: str) -> SqlCond { return SqlCond::Null(col, false); }
+pub fn sc_not_null(col: str) -> SqlCond { return SqlCond::Null(col, true); }
+pub fn sc_in(col: str, vals: Vec<SqlVal>) -> SqlCond { return SqlCond::In(col, vals, false); }
+pub fn sc_not_in(col: str, vals: Vec<SqlVal>) -> SqlCond { return SqlCond::In(col, vals, true); }
+pub fn sc_between(col: str, lo: SqlVal, hi: SqlVal) -> SqlCond { return SqlCond::Between(col, lo, hi); }
+pub fn sc_and(cs: Vec<SqlCond>) -> SqlCond { return SqlCond::And(cs); }
+pub fn sc_or(cs: Vec<SqlCond>) -> SqlCond { return SqlCond::Or(cs); }
+pub fn sc_not(c: SqlCond) -> SqlCond { return SqlCond::Not(Box::new(c)); }
+/// A raw SQL fragment; each `?` in it becomes the next parameter.
+pub fn sc_raw(sql: str, vals: Vec<SqlVal>) -> SqlCond { return SqlCond::Raw(sql, vals); }
+
+/// Two conditions joined with AND / OR (a convenience).
+pub fn sc_and2(a: SqlCond, b: SqlCond) -> SqlCond {
+    var v: Vec<SqlCond> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return SqlCond::And(v);
+}
+
+pub fn sc_or2(a: SqlCond, b: SqlCond) -> SqlCond {
+    var v: Vec<SqlCond> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return SqlCond::Or(v);
+}
+
+pub struct SqlJoin {
+    pub kind: str,   // INNER LEFT RIGHT FULL CROSS
+    pub table: str,
+    pub alias: str,
+    pub on_left: str,
+    pub on_right: str,
+}
+
+/// A statement under construction. kind: 0 select, 1 insert, 2 update,
+/// 3 delete.
+pub struct SqlQuery {
+    pub kind: i64,
+    pub table: str,
+    pub alias: str,
+    pub distinct: bool,
+    pub columns: Vec<str>,
+    pub joins: Vec<SqlJoin>,
+    pub wheres: Vec<SqlCond>,
+    pub group_by: Vec<str>,
+    pub havings: Vec<SqlCond>,
+    pub order_cols: Vec<str>,
+    pub order_desc: Vec<bool>,
+    pub limit: i64,
+    pub offset: i64,
+    pub insert_cols: Vec<str>,
+    pub rows: Vec<Vec<SqlVal>>,
+    pub set_cols: Vec<str>,
+    pub set_vals: Vec<SqlVal>,
+    pub returning: Vec<str>,
+    pub on_conflict_nothing: bool,
+    pub allow_all_rows: bool,
+}
+
+/// The built statement: SQL text and the parameters in placeholder order.
+pub struct SqlOut {
+    pub ok: bool,
+    pub error: str,
+    pub sql: str,
+    pub params: Vec<SqlVal>,
+}
+
+fn sq_new(kind: i64, table: str) -> SqlQuery {
+    return SqlQuery { kind: kind, table: table, alias: "", distinct: false, columns: Vec::new(), joins: Vec::new(), wheres: Vec::new(), group_by: Vec::new(), havings: Vec::new(), order_cols: Vec::new(), order_desc: Vec::new(), limit: - 1, offset: - 1, insert_cols: Vec::new(), rows: Vec::new(), set_cols: Vec::new(), set_vals: Vec::new(), returning: Vec::new(), on_conflict_nothing: false, allow_all_rows: false };
+}
+
+pub fn sql_select(table: str) -> SqlQuery { return sq_new(0, table); }
+pub fn sql_insert(table: str) -> SqlQuery { return sq_new(1, table); }
+pub fn sql_update(table: str) -> SqlQuery { return sq_new(2, table); }
+pub fn sql_delete(table: str) -> SqlQuery { return sq_new(3, table); }
+
+fn sq_split(cols: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val parts: Vec<str> = str_split(cols, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val c: str = str_trim(parts.get(i));
+        if str_len(c) > 0 {
+            out.push(c);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Columns, comma-separated ("id, name, t.x"). An entry holding '(' or a
+/// space (count(*), x AS y) is written as given, not quoted.
+pub fn sq_columns(q: SqlQuery, cols: str) -> SqlQuery {
+    var r: SqlQuery = q;
+    val c: Vec<str> = sq_split(cols);
+    var i: i64 = 0;
+    while i < c.len() {
+        r.columns.push(c.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn sq_alias(q: SqlQuery, alias: str) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.alias = alias;
+    return r;
+}
+
+pub fn sq_distinct(q: SqlQuery) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.distinct = true;
+    return r;
+}
+
+/// A join: kind INNER/LEFT/RIGHT/FULL/CROSS, ON left = right (columns).
+pub fn sq_join(q: SqlQuery, kind: str, table: str, alias: str, on_left: str, on_right: str) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.joins.push(SqlJoin { kind: str_to_upper(kind), table: table, alias: alias, on_left: on_left, on_right: on_right });
+    return r;
+}
+
+/// Add a condition (several are ANDed).
+pub fn sq_where(q: SqlQuery, c: SqlCond) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.wheres.push(c);
+    return r;
+}
+
+pub fn sq_group_by(q: SqlQuery, cols: str) -> SqlQuery {
+    var r: SqlQuery = q;
+    val c: Vec<str> = sq_split(cols);
+    var i: i64 = 0;
+    while i < c.len() {
+        r.group_by.push(c.get(i));
+        i = i + 1;
+    }
+    return r;
+}
+
+pub fn sq_having(q: SqlQuery, c: SqlCond) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.havings.push(c);
+    return r;
+}
+
+pub fn sq_order(q: SqlQuery, col: str, desc: bool) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.order_cols.push(col);
+    r.order_desc.push(desc);
+    return r;
+}
+
+pub fn sq_limit(q: SqlQuery, n: i64) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.limit = n;
+    return r;
+}
+
+pub fn sq_offset(q: SqlQuery, n: i64) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.offset = n;
+    return r;
+}
+
+/// INSERT columns (comma-separated); then add rows with sq_row.
+pub fn sq_insert_columns(q: SqlQuery, cols: str) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.insert_cols = sq_split(cols);
+    return r;
+}
+
+pub fn sq_row(q: SqlQuery, vals: Vec<SqlVal>) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.rows.push(vals);
+    return r;
+}
+
+/// UPDATE ... SET col = value.
+pub fn sq_set(q: SqlQuery, col: str, v: SqlVal) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.set_cols.push(col);
+    r.set_vals.push(v);
+    return r;
+}
+
+pub fn sq_returning(q: SqlQuery, cols: str) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.returning = sq_split(cols);
+    return r;
+}
+
+pub fn sq_on_conflict_do_nothing(q: SqlQuery) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.on_conflict_nothing = true;
+    return r;
+}
+
+/// Let an UPDATE / DELETE run without a WHERE (it touches every row).
+pub fn sq_allow_all_rows(q: SqlQuery) -> SqlQuery {
+    var r: SqlQuery = q;
+    r.allow_all_rows = true;
+    return r;
+}
+
+// ─── rendering ──────────────────────────────────────────────────────────
+
+/// Quote one identifier: "a""b" for a"b.
+pub fn sql_quote_ident(name: str) -> str {
+    return "\"" + str_replace(name, "\"", "\"\"") + "\"";
+}
+
+/// Quote a column reference: t.col -> "t"."col"; * and t.* keep the star;
+/// an expression (holding '(' or a space) is returned unchanged.
+pub fn sql_quote_col(col: str) -> str {
+    if col == "*" {
+        return "*";
+    }
+    if str_find(col, "(") >= 0 || str_find(col, " ") >= 0 {
+        return col;
+    }
+    val parts: Vec<str> = str_split(col, ".");
+    var o: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { o = o + "."; }
+        if parts.get(i) == "*" {
+            o = o + "*";
+        } else {
+            o = o + sql_quote_ident(parts.get(i));
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+struct SqB {
+    dialect: i64,
+    params: Vec<SqlVal>,
+    err: str,
+}
+
+fn sqb_param(b: & mut SqB, v: SqlVal) -> str {
+    b.params.push(v);
+    if b.dialect == SQL_POSTGRES {
+        return "$" + int_to_str(b.params.len());
+    }
+    return "?";
+}
+
+fn sq_op_ok(op: str) -> bool {
+    return op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "LIKE" || op == "ILIKE" || op == "NOT LIKE";
+}
+
+fn sqb_cond(b: & mut SqB, c: & SqlCond) -> str {
+    match c {
+        SqlCond::Cmp(col, op, v) => {
+            val uop: str = str_to_upper(op);
+            if !sq_op_ok(uop) {
+                b.err = "operator not allowed: " + op;
+                return "";
+            }
+            return sql_quote_col(col) + " " + uop + " " + sqb_param(b, v);
+        }
+        SqlCond::Null(col, negated) => {
+            if negated {
+                return sql_quote_col(col) + " IS NOT NULL";
+            }
+            return sql_quote_col(col) + " IS NULL";
+        }
+        SqlCond::In(col, vals, negated) => {
+            if vals.len() == 0 {
+                // IN () is not SQL; an empty set matches nothing
+                if negated { return "1 = 1"; }
+                return "1 = 0";
+            }
+            var o: str = sql_quote_col(col);
+            if negated { o = o + " NOT IN ("; } else { o = o + " IN ("; }
+            var i: i64 = 0;
+            while i < vals.len() {
+                if i > 0 { o = o + ", "; }
+                o = o + sqb_param(b, vals.get(i));
+                i = i + 1;
+            }
+            return o + ")";
+        }
+        SqlCond::Between(col, lo, hi) => {
+            val a: str = sqb_param(b, lo);
+            val z: str = sqb_param(b, hi);
+            return sql_quote_col(col) + " BETWEEN " + a + " AND " + z;
+        }
+        SqlCond::And(cs) => {
+            return sqb_join(b, & cs, " AND ");
+        }
+        SqlCond::Or(cs) => {
+            return sqb_join(b, & cs, " OR ");
+        }
+        SqlCond::Not(inner) => {
+            val c2: SqlCond = *inner;
+            return "NOT (" + sqb_cond(b, & c2) + ")";
+        }
+        SqlCond::Raw(sql, vals) => {
+            // each ? takes the next value, numbered for the dialect
+            var o: str = "";
+            var k: i64 = 0;
+            var i: i64 = 0;
+            while i < str_len(sql) {
+                val ch: i64 = str_byte_at(sql, i);
+                if ch == 63 {
+                    if k >= vals.len() {
+                        b.err = "raw fragment has more ? than values";
+                        return "";
+                    }
+                    o = o + sqb_param(b, vals.get(k));
+                    k = k + 1;
+                } else {
+                    o = o + char_to_str(ch);
+                }
+                i = i + 1;
+            }
+            if k != vals.len() {
+                b.err = "raw fragment has fewer ? than values";
+            }
+            return "(" + o + ")";
+        }
+    }
+}
+
+fn sqb_join(b: & mut SqB, cs: & Vec<SqlCond>, sep: str) -> str {
+    if cs.len() == 0 {
+        if sep == " AND " { return "1 = 1"; }
+        return "1 = 0";
+    }
+    if cs.len() == 1 {
+        return sqb_cond(b, & cs.get(0));
+    }
+    var o: str = "(";
+    var i: i64 = 0;
+    while i < cs.len() {
+        if i > 0 { o = o + sep; }
+        o = o + sqb_cond(b, & cs.get(i));
+        i = i + 1;
+    }
+    return o + ")";
+}
+
+fn sqb_where_list(b: & mut SqB, cs: & Vec<SqlCond>) -> str {
+    // top-level ANDs without outer parentheses
+    var o: str = "";
+    var i: i64 = 0;
+    while i < cs.len() {
+        if i > 0 { o = o + " AND "; }
+        o = o + sqb_cond(b, & cs.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn sq_cols(cols: & Vec<str>) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < cols.len() {
+        if i > 0 { o = o + ", "; }
+        o = o + sql_quote_col(cols.get(i));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn sq_table(q: & SqlQuery) -> str {
+    var t: str = sql_quote_col(q.table);
+    if str_len(q.alias) > 0 {
+        t = t + " AS " + sql_quote_ident(q.alias);
+    }
+    return t;
+}
+
+fn sq_returning_sql(q: & SqlQuery) -> str {
+    if q.returning.len() == 0 {
+        return "";
+    }
+    return " RETURNING " + sq_cols(& q.returning);
+}
+
+/// Build the statement for a dialect.
+pub fn sql_build(q: & SqlQuery, dialect: i64) -> SqlOut {
+    var b: SqB = SqB { dialect: dialect, params: Vec::new(), err: "" };
+    var sql: str = "";
+    if str_len(q.table) == 0 {
+        return SqlOut { ok: false, error: "no table", sql: "", params: Vec::new() };
+    }
+    if q.kind == 0 {
+        sql = "SELECT ";
+        if q.distinct { sql = sql + "DISTINCT "; }
+        if q.columns.len() == 0 {
+            sql = sql + "*";
+        } else {
+            sql = sql + sq_cols(& q.columns);
+        }
+        sql = sql + " FROM " + sq_table(q);
+        var j: i64 = 0;
+        while j < q.joins.len() {
+            val jn: SqlJoin = q.joins.get(j);
+            var kind: str = jn.kind;
+            if kind != "INNER" && kind != "LEFT" && kind != "RIGHT" && kind != "FULL" && kind != "CROSS" {
+                return SqlOut { ok: false, error: "unknown join kind " + jn.kind, sql: "", params: Vec::new() };
+            }
+            sql = sql + " " + kind + " JOIN " + sql_quote_col(jn.table);
+            if str_len(jn.alias) > 0 {
+                sql = sql + " AS " + sql_quote_ident(jn.alias);
+            }
+            if kind != "CROSS" {
+                sql = sql + " ON " + sql_quote_col(jn.on_left) + " = " + sql_quote_col(jn.on_right);
+            }
+            j = j + 1;
+        }
+        if q.wheres.len() > 0 {
+            sql = sql + " WHERE " + sqb_where_list(& mut b, & q.wheres);
+        }
+        if q.group_by.len() > 0 {
+            sql = sql + " GROUP BY " + sq_cols(& q.group_by);
+        }
+        if q.havings.len() > 0 {
+            sql = sql + " HAVING " + sqb_where_list(& mut b, & q.havings);
+        }
+        if q.order_cols.len() > 0 {
+            sql = sql + " ORDER BY ";
+            var i: i64 = 0;
+            while i < q.order_cols.len() {
+                if i > 0 { sql = sql + ", "; }
+                sql = sql + sql_quote_col(q.order_cols.get(i));
+                if q.order_desc.get(i) { sql = sql + " DESC"; } else { sql = sql + " ASC"; }
+                i = i + 1;
+            }
+        }
+        if q.limit >= 0 {
+            sql = sql + " LIMIT " + int_to_str(q.limit);
+        }
+        if q.offset >= 0 {
+            if q.limit < 0 && dialect == SQL_SQLITE {
+                // SQLite needs a LIMIT before OFFSET
+                sql = sql + " LIMIT -1";
+            }
+            sql = sql + " OFFSET " + int_to_str(q.offset);
+        }
+    } else if q.kind == 1 {
+        if q.insert_cols.len() == 0 || q.rows.len() == 0 {
+            return SqlOut { ok: false, error: "INSERT needs columns and at least one row", sql: "", params: Vec::new() };
+        }
+        sql = "INSERT INTO " + sq_table(q) + " (" + sq_cols(& q.insert_cols) + ") VALUES ";
+        var r: i64 = 0;
+        while r < q.rows.len() {
+            val row: Vec<SqlVal> = q.rows.get(r);
+            if row.len() != q.insert_cols.len() {
+                return SqlOut { ok: false, error: "row " + int_to_str(r) + " has " + int_to_str(row.len()) + " values for " + int_to_str(q.insert_cols.len()) + " columns", sql: "", params: Vec::new() };
+            }
+            if r > 0 { sql = sql + ", "; }
+            sql = sql + "(";
+            var c: i64 = 0;
+            while c < row.len() {
+                if c > 0 { sql = sql + ", "; }
+                sql = sql + sqb_param(& mut b, row.get(c));
+                c = c + 1;
+            }
+            sql = sql + ")";
+            r = r + 1;
+        }
+        if q.on_conflict_nothing {
+            sql = sql + " ON CONFLICT DO NOTHING";
+        }
+        sql = sql + sq_returning_sql(q);
+    } else if q.kind == 2 {
+        if q.set_cols.len() == 0 {
+            return SqlOut { ok: false, error: "UPDATE needs at least one SET", sql: "", params: Vec::new() };
+        }
+        if q.wheres.len() == 0 && !q.allow_all_rows {
+            return SqlOut { ok: false, error: "UPDATE without WHERE (use sq_allow_all_rows)", sql: "", params: Vec::new() };
+        }
+        sql = "UPDATE " + sq_table(q) + " SET ";
+        var i: i64 = 0;
+        while i < q.set_cols.len() {
+            if i > 0 { sql = sql + ", "; }
+            sql = sql + sql_quote_ident(q.set_cols.get(i)) + " = " + sqb_param(& mut b, q.set_vals.get(i));
+            i = i + 1;
+        }
+        if q.wheres.len() > 0 {
+            sql = sql + " WHERE " + sqb_where_list(& mut b, & q.wheres);
+        }
+        sql = sql + sq_returning_sql(q);
+    } else {
+        if q.wheres.len() == 0 && !q.allow_all_rows {
+            return SqlOut { ok: false, error: "DELETE without WHERE (use sq_allow_all_rows)", sql: "", params: Vec::new() };
+        }
+        sql = "DELETE FROM " + sq_table(q);
+        if q.wheres.len() > 0 {
+            sql = sql + " WHERE " + sqb_where_list(& mut b, & q.wheres);
+        }
+        sql = sql + sq_returning_sql(q);
+    }
+    if str_len(b.err) > 0 {
+        return SqlOut { ok: false, error: b.err, sql: "", params: Vec::new() };
+    }
+    return SqlOut { ok: true, error: "", sql: sql, params: b.params };
+}
+
+/// The parameters as readable text: [1, 'x', NULL].
+pub fn sql_params_show(out: & SqlOut) -> str {
+    var o: str = "[";
+    var i: i64 = 0;
+    while i < out.params.len() {
+        if i > 0 { o = o + ", "; }
+        o = o + sv_show(& out.params.get(i));
+        i = i + 1;
+    }
+    return o + "]";
+}

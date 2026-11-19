@@ -1,0 +1,188 @@
+// stdlib/postgres (competitive SL12) without a server: every byte checked
+// against Python (struct/hashlib/hmac, the same messages built by hand
+// from the protocol documentation, https://www.postgresql.org/docs/current/
+// protocol-message-formats.html).
+//   - crypto: HMAC-SHA256 over bytes (RFC 4231 cases 2 and 6, the second
+//     with a key longer than a block), PBKDF2-HMAC-SHA256 (RFC 7914 §11
+//     c=1 with 64 bytes, and c=2), MD5 (RFC 1321 §A.5);
+//   - frontend messages: StartupMessage, Query, the extended query
+//     (Parse/Bind/Describe/Execute/Sync, a quote in a parameter stays
+//     data), Terminate;
+//   - startup: MD5 authentication, ParameterStatus, BackendKeyData,
+//     ReadyForQuery; SCRAM-SHA-256 end to end with a fixed nonce and two
+//     iterations (a wrong server signature and a nonce that does not
+//     extend ours are refused); an unsupported method is an error;
+//   - results: RowDescription + DataRow to JSON by type (int, text with a
+//     quote, bool, float NaN, jsonb, NULL), CommandComplete counts, an
+//     ErrorResponse with its SQLSTATE, a stream cut short.
+// The RFC 7677 SCRAM vector (4096 iterations) is in
+// test_stdlib_postgres_scram.fd. A wrong answer panics on every backend.
+//
+// Expected output:
+// hmac ok
+// pbkdf2 ok
+// md5 ok
+// messages ok
+// md5 auth ok
+// scram ok
+// results ok
+// postgres ok
+use postgres;
+use crypto;
+use encoding;
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn he(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn check(label: str, got: str, want: str) {
+    if !str_equal(got, want) {
+        println(label + ": got  " + got);
+        println(label + ": want " + want);
+        p_panic("postgres: wrong " + label);
+    }
+}
+
+fn check_i(label: str, got: i64, want: i64) {
+    if got != want {
+        p_panic("postgres: wrong " + label + ": got " + int_to_str(got) + ", want " + int_to_str(want));
+    }
+}
+
+fn check_b(label: str, got: bool, want: bool) {
+    if got != want {
+        p_panic("postgres: wrong " + label);
+    }
+}
+
+fn first_msg(hex: str) -> PgMsg {
+    var r: PgIn = pg_in_bytes(hb(hex));
+    return pg_next(& mut r);
+}
+
+fn collect(hex: str) -> PgResult {
+    var r: PgIn = pg_in_bytes(hb(hex));
+    return pg_collect(& mut r);
+}
+
+fn main() -> i64 {
+    // ── HMAC-SHA256, PBKDF2, MD5 ──
+    check("hmac 4231.2", he(crypto_hmac_sha256_bytes(str_bytes("Jefe"), str_bytes("what do ya want for nothing?"))), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    var long_key: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 131 {
+        long_key.push(170);
+        i = i + 1;
+    }
+    check("hmac 4231.6", he(crypto_hmac_sha256_bytes(long_key, str_bytes("Test Using Larger Than Block-Size Key - Hash Key First"))), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    println("hmac ok");
+    check("pbkdf2 c=1", he(crypto_pbkdf2_sha256(str_bytes("passwd"), str_bytes("salt"), 1, 64)), "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783");
+    check("pbkdf2 c=2", he(crypto_pbkdf2_sha256(str_bytes("password"), str_bytes("salt"), 2, 32)), "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+    println("pbkdf2 ok");
+    check("md5 empty", pg_hex(pg_md5(Vec::new())), "d41d8cd98f00b204e9800998ecf8427e");
+    check("md5 abc", pg_hex(pg_md5(str_bytes("abc"))), "900150983cd24fb0d6963f7d28e17f72");
+    check("md5 fox", pg_hex(pg_md5(str_bytes("The quick brown fox jumps over the lazy dog"))), "9e107d9d372bb6826bd81d3542a419d6");
+    check("md5 80 digits", pg_hex(pg_md5(str_bytes("12345678901234567890123456789012345678901234567890123456789012345678901234567890"))), "57edf4a22be3c955ac49da2e2107b67a");
+    println("md5 ok");
+
+    // ── Frontend messages ──
+    check("startup", he(pg_startup_message("ada", "lab")), "00000034000300007573657200616461006461746162617365006c616200636c69656e745f656e636f64696e6700555446380000");
+    check("query", he(pg_query_message("SELECT 1")), "510000000d53454c454354203100");
+    var params: Vec<str> = Vec::new();
+    params.push("1");
+    params.push("O'Brien");
+    check("extended", he(pg_extended_query("SELECT $1::int, $2", params)), "500000001a0053454c4543542024313a3a696e742c202432000000420000001c0000000000020000000131000000074f27427269656e000044000000065000450000000900000000005300000004");
+    check("terminate", he(pg_terminate_message()), "5800000004");
+    println("messages ok");
+
+    // ── Startup with MD5 authentication ──
+    var c: PgConn = pg_conn_new(- 1, "postgres", "secret");
+    var none: PgScram = pg_scram_new("", "secret", "unused");
+    check_i("md5 request", pg_startup_step(& mut c, & mut none, first_msg("520000000c00000005010203fe")), 0);
+    check("md5 reply", he(c.out), "70000000286d6435653961653832363739363831363833643935313033323434623636326130636100");
+    check("md5 password", pg_md5_password("postgres", "secret", hb("010203fe")), "md5e9ae82679681683d95103244b662a0ca");
+    c.out = Vec::new();
+    var r: PgIn = pg_in_bytes(hb("52000000080000000053000000187365727665725f76657273696f6e0031362e3400530000001154696d655a6f6e6500555443004b0000000c00001092deadbeef5a0000000549"));
+    var step: i64 = 0;
+    var steps: i64 = 0;
+    while step == 0 {
+        step = pg_startup_step(& mut c, & mut none, pg_next(& mut r));
+        steps = steps + 1;
+    }
+    check_i("ready", step, 1);
+    check_i("startup messages", steps, 5);
+    check_b("connected", c.ok, true);
+    check("auth", c.auth, "md5");
+    check("server_version", pg_parameter(& c, "server_version"), "16.4");
+    check("TimeZone", pg_parameter(& c, "TimeZone"), "UTC");
+    check("missing parameter", pg_parameter(& c, "nope"), "");
+    check_i("pid", c.pid, 4242);
+    check_i("secret", c.secret, - 559038737);
+    check_i("nothing sent", c.out.len(), 0);
+    println("md5 auth ok");
+
+    // ── SCRAM-SHA-256 ──
+    var sc: PgConn = pg_conn_new(- 1, "app", "fides-pw");
+    var s: PgScram = pg_scram_new("", "fides-pw", "abcdefghijklmnopqrstuvwx");
+    check_i("sasl", pg_startup_step(& mut sc, & mut s, first_msg("520000002a0000000a534352414d2d5348412d3235362d504c555300534352414d2d5348412d3235360000")), 0);
+    check("sasl initial", he(sc.out), "7000000036534352414d2d5348412d32353600000000206e2c2c6e3d2c723d6162636465666768696a6b6c6d6e6f707172737475767778");
+    sc.out = Vec::new();
+    check_i("sasl continue", pg_startup_step(& mut sc, & mut s, first_msg("520000004f0000000b723d6162636465666768696a6b6c6d6e6f7071727374757677785345525645526e6f6e63653132332c733d41414543417751464267634943516f4c4441304f44773d3d2c693d32")), 0);
+    check("sasl response", he(sc.out), "7000000062633d626977732c723d6162636465666768696a6b6c6d6e6f7071727374757677785345525645526e6f6e63653132332c703d433373386b4538496a587131506b444c6349644f3167337858356a374a5043755534335a63544e77427a4d3d");
+    check_b("server signature wrong", pg_scram_verify_server(& s, "v=lrRXqMPOkmczqGRVldsSEIHCmub7HIyFxle7WIobOnA="), false);
+    check_b("server signature missing", pg_scram_verify_server(& s, "e=other-error"), false);
+    check_i("sasl final", pg_startup_step(& mut sc, & mut s, first_msg("52000000360000000c763d6c725258714d504f6b6d637a714752566c647353454948436d75623748497946786c653757496f624f6e513d")), 0);
+    check_i("auth ok", pg_startup_step(& mut sc, & mut s, first_msg("520000000800000000")), 0);
+    check_i("scram ready", pg_startup_step(& mut sc, & mut s, first_msg("5a0000000549")), 1);
+    check("scram auth", sc.auth, "SCRAM-SHA-256");
+    // A server that signs wrongly is refused
+    var bad: PgConn = pg_conn_new(- 1, "app", "fides-pw");
+    var s2: PgScram = pg_scram_new("", "fides-pw", "abcdefghijklmnopqrstuvwx");
+    pg_scram_client_first(& mut s2);
+    pg_startup_step(& mut bad, & mut s2, first_msg("520000004f0000000b723d6162636465666768696a6b6c6d6e6f7071727374757677785345525645526e6f6e63653132332c733d41414543417751464267634943516f4c4441304f44773d3d2c693d32"));
+    check_i("bad signature", pg_startup_step(& mut bad, & mut s2, first_msg("52000000360000000c763d6c725258714d504f6b6d637a714752566c647353454948436d75623748497946786c653757496f624f6e413d")), - 1);
+    check_b("bad signature not connected", bad.ok, false);
+    check("bad signature error", bad.error, "SCRAM: the server's signature is wrong");
+    // A server nonce that does not start with ours
+    var s3: PgScram = pg_scram_new("", "pw", "clientnonce");
+    pg_scram_client_first(& mut s3);
+    check("foreign nonce", pg_scram_client_final(& mut s3, "r=othernonce123,s=AAECAwQFBgcICQoLDA0ODw==,i=4096"), "");
+    check_b("foreign nonce refused", s3.ok, false);
+    // saslname escaping and the gs2 header
+    var s4: PgScram = pg_scram_new("a=b,c", "pw", "N0nce");
+    check("client first", pg_scram_client_first(& mut s4), "n,,n=a=3Db=2Cc,r=N0nce");
+    // GSSAPI (7) is not supported
+    var g: PgConn = pg_conn_new(- 1, "app", "pw");
+    check_i("gss", pg_startup_step(& mut g, & mut none, first_msg("520000000800000007")), - 1);
+    check("gss error", g.error, "unsupported authentication method 7 (Kerberos, GSSAPI and SSPI are not supported)");
+    println("scram ok");
+
+    // ── Results ──
+    val rows: PgResult = collect("310000000432000000045400000075000569640000000000000000000017ffffffffffff00006e616d650000000000000000000019ffffffffffff00006f6b0000000000000000000010ffffffffffff000073636f726500000000000000000002bdffffffffffff0000646f630000000000000000000edaffffffffffff00004400000036000500000001310000000f416461202274686520666972737422000000017400000003312e35000000087b2261223a20317d440000001f00050000000132ffffffff0000000166000000034e614effffffff430000000d53454c4543542032005a0000000549");
+    check_b("rows ok", rows.ok, true);
+    check("rows", rows.rows, "[\x7b\"id\":1,\"name\":\"Ada \\\"the first\\\"\",\"ok\":true,\"score\":1.5,\"doc\":\x7b\"a\": 1\x7d\x7d,\x7b\"id\":2,\"name\":null,\"ok\":false,\"score\":\"NaN\",\"doc\":null\x7d]");
+    check_i("nrows", rows.nrows, 2);
+    check_i("columns", rows.columns.len(), 5);
+    check("column 2", rows.columns.get(1), "name");
+    check_i("type of score", rows.types.get(3), 701);
+    check("select tag", rows.tag, "SELECT 2");
+    check_i("select count", rows.affected, 2);
+    check_i("idle", rows.status, 73);
+    val err: PgResult = collect("450000003a534552524f5200564552524f5200433432503031004d72656c6174696f6e20226e6f70652220646f6573206e6f7420657869737400005a0000000549");
+    check_b("error not ok", err.ok, false);
+    check("error text", err.error, "ERROR 42P01: relation \"nope\" does not exist");
+    check("sqlstate", err.sqlstate, "42P01");
+    check("no rows", err.rows, "[]");
+    val ins: PgResult = collect("430000000f494e5345525420302033005a0000000554");
+    check_b("insert ok", ins.ok, true);
+    check_i("inserted", ins.affected, 3);
+    check_i("in transaction", ins.status, 84);
+    val cut: PgResult = collect("4300000011435245415445205441424c4500540000");
+    check_b("cut short", cut.ok, false);
+    check("cut short error", cut.error, "connection closed before ReadyForQuery");
+    check("create tag", cut.tag, "CREATE TABLE");
+    check_i("create count", cut.affected, 0);
+    println("results ok");
+    println("postgres ok");
+    return 0;
+}

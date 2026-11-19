@@ -1,0 +1,137 @@
+// stdlib/tls_record (RFC 8446 §5, competitive VF15): records split out of
+// a byte stream (an incomplete one left for the next read), handshake
+// messages out of a handshake fragment, an alert, each malformed header
+// rejected with the alert it calls for, and a protected record sealed and
+// opened with ChaCha20-Poly1305 (the wrong sequence number or one flipped
+// bit gives bad_record_mac). scripts/fuzz/fuzz_parsers.py fuzzes the same
+// parsers (parser "tls").
+//
+// Expected output:
+// records 2 consumed 19 error ok
+// record 0: type 22 version 771 length 7
+// handshake: 1 message, type 1, body 1,2,3
+// alert: level 2 description 40 error ok
+// partial handshake: 0 messages, consumed 0, error ok
+// bad type: unexpected_message
+// bad version: protocol_version
+// overflow: record_overflow
+// empty alert: unexpected_message (empty)
+// short alert: decode_error
+// nonce tail 0 1 2
+// sealed 27 bytes, record type 23 length 22
+// opened: type 22 content 5,6,7 error ok
+// wrong seq: bad_record_mac
+// tampered: bad_record_mac
+use tls_record;
+
+fn join(v: Vec<i64>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { out = out + ","; }
+        out = out + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn bytes5(a: i64, b: i64, c: i64, d: i64, e: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    v.push(e);
+    return v;
+}
+
+fn err_of(v: Vec<i64>) -> str {
+    val rs: TlsRecords = tls_records_parse(v);
+    return tls_rec_error_name(rs.error);
+}
+
+fn main() -> i64 {
+    var body: Vec<i64> = Vec::new();
+    body.push(1);
+    body.push(2);
+    body.push(3);
+    val hs: Vec<i64> = tls_handshake_encode(1, body);
+    var stream: Vec<i64> = tls_record_encode(TLS_CT_HANDSHAKE, hs);
+    var al: Vec<i64> = Vec::new();
+    al.push(2);
+    al.push(40);
+    val alrec: Vec<i64> = tls_record_encode(TLS_CT_ALERT, al);
+    var i: i64 = 0;
+    while i < alrec.len() { stream.push(alrec.get(i)); i = i + 1; }
+    // three bytes of a next header: incomplete
+    stream.push(23);
+    stream.push(3);
+    stream.push(3);
+    val rs: TlsRecords = tls_records_parse(stream);
+    println("records " + int_to_str(rs.records.len()) + " consumed " + int_to_str(rs.consumed)
+        + " error " + tls_rec_error_name(rs.error));
+    val r0: TlsRecord = rs.records.get(0);
+    println("record 0: type " + int_to_str(r0.ctype) + " version " + int_to_str(r0.version)
+        + " length " + int_to_str(r0.fragment.len()));
+    val hm: TlsHandshakes = tls_handshake_parse(r0.fragment);
+    val m0: TlsHandshake = hm.messages.get(0);
+    println("handshake: " + int_to_str(hm.messages.len()) + " message, type " + int_to_str(m0.msg_type)
+        + ", body " + join(m0.body));
+    val r1: TlsRecord = rs.records.get(1);
+    val a: TlsAlert = tls_alert_parse(r1.fragment);
+    println("alert: level " + int_to_str(a.level) + " description " + int_to_str(a.description)
+        + " error " + tls_rec_error_name(a.error));
+
+    // a handshake message whose body has not all arrived
+    var part: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 5 { part.push(hs.get(i)); i = i + 1; }
+    val hp: TlsHandshakes = tls_handshake_parse(part);
+    println("partial handshake: " + int_to_str(hp.messages.len()) + " messages, consumed "
+        + int_to_str(hp.consumed) + ", error " + tls_rec_error_name(hp.error));
+
+    // malformed headers
+    println("bad type: " + err_of(bytes5(99, 3, 3, 0, 1)));
+    println("bad version: " + err_of(bytes5(22, 2, 0, 0, 1)));
+    println("overflow: " + err_of(bytes5(22, 3, 3, 64, 1)));
+    println("empty alert: " + err_of(bytes5(21, 3, 3, 0, 0)));
+    var one: Vec<i64> = Vec::new();
+    one.push(1);
+    println("short alert: " + tls_rec_error_name(tls_alert_parse(one).error));
+
+    // the per-record nonce: IV XOR the sequence number
+    var zero_iv: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 12 { zero_iv.push(0); i = i + 1; }
+    val nz: Vec<i64> = tls_record_nonce(zero_iv, 258);
+    println("nonce tail " + int_to_str(nz.get(9)) + " " + int_to_str(nz.get(10)) + " " + int_to_str(nz.get(11)));
+
+    // a protected record
+    @secret var key: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 { key.push(i); i = i + 1; }
+    var iv: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 12 { iv.push(160 + i); i = i + 1; }
+    var content: Vec<i64> = Vec::new();
+    content.push(5);
+    content.push(6);
+    content.push(7);
+    val sealed: Vec<i64> = tls_record_seal(key, iv, 0, TLS_CT_HANDSHAKE, content, 2);
+    val ps: TlsRecords = tls_records_parse(sealed);
+    val pr: TlsRecord = ps.records.get(0);
+    println("sealed " + int_to_str(sealed.len()) + " bytes, record type " + int_to_str(pr.ctype)
+        + " length " + int_to_str(pr.fragment.len()));
+    val opened: TlsInner = tls_record_open(key, iv, 0, pr);
+    println("opened: type " + int_to_str(opened.ctype) + " content " + join(opened.content)
+        + " error " + tls_rec_error_name(opened.error));
+    val wrong: TlsInner = tls_record_open(key, iv, 1, pr);
+    println("wrong seq: " + tls_rec_error_name(wrong.error));
+    var bad: Vec<i64> = Vec::new();
+    i = 0;
+    while i < pr.fragment.len() { bad.push(pr.fragment.get(i)); i = i + 1; }
+    bad.set(3, bad.get(3) ^ 1);
+    val tampered: TlsInner = tls_record_open(key, iv, 0, TlsRecord { ctype: 23, version: 771, fragment: bad });
+    println("tampered: " + tls_rec_error_name(tampered.error));
+    return 0;
+}

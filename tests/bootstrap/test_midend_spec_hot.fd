@@ -1,0 +1,71 @@
+// WP14 hotness (compiler/iropt.fd iro_specialize, iro_call_weights,
+// iro_spec_hottest; opt-in FID_IROPT_ON=spec): a function called with a
+// constant at some call sites and a varying value at others gets a clone
+// per constant only when the sites passing it are hot: in a loop (8 per
+// loop around the call), or eight straight-line sites, or, with a profile
+// (`--profile-use`), callers the profiled run called often. Here `scale`
+// is called with 3 inside a loop (cloned as scale_sc1_3) and with 5 once
+// outside any loop (too cold: no clone); `mix` gets 7 in a nested loop and
+// 9 and 11 once each. With FID_IROPT_STATS=1 the "spec" count shows the
+// clones; the program prints the same with the pass on and off.
+//
+// Expected output:
+// 30
+// 54
+// 105
+// 43
+// 264
+// 20
+// 9
+// 11
+
+fn scale(x: i64, k: i64) -> i64 {
+    var r: i64 = 0;
+    var i: i64 = 0;
+    while i < k {
+        r = r + x;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn mix(a: i64, b: i64) -> i64 {
+    if b > 8 {
+        return a * 2 + b;
+    }
+    return a + b;
+}
+
+fn main() {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < 5 {
+        s = s + scale(i, 3);
+        i = i + 1;
+    }
+    println(s);
+    var v: i64 = 18;
+    println(scale(v, 3));
+    println(scale(21, 5));
+    var t: i64 = 0;
+    i = 0;
+    while i < s {
+        t = t + scale(1, i % 4);
+        i = i + 1;
+    }
+    println(t);
+    var m: i64 = 0;
+    var a: i64 = 0;
+    while a < 4 {
+        var b: i64 = 0;
+        while b < 6 {
+            m = m + mix(a + b, 7);
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    println(m);
+    println(mix(v, 2));
+    println(mix(0, 9));
+    println(mix(0, 11));
+}

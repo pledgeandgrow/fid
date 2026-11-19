@@ -1,0 +1,850 @@
+// Fides WebGPU: webgpu.h bindings (wgpu-native or Dawn) plus a WGSL helper
+// set that needs no GPU.
+//
+// Platform seam: the `extern "C"` block declares the webgpu.h entry points
+// (link wgpu_native; Dawn exports the same names). Running them needs that
+// library and a GPU; the tests make no such call. Every WGPU object is an
+// i64 handle, descriptor and data pointers are i64 addresses (build the
+// descriptor bytes with your own layout code or stdlib vulkan's VkBlob),
+// uint32_t parameters are u32, uint64_t/size_t are i64.
+//
+// Real, tested without a GPU, following the WebGPU and WGSL specifications
+// (names are the spec's strings, which do not change between header
+// versions, unlike webgpu.h's numeric enums):
+//   - GPUBufferUsage / GPUTextureUsage / GPUShaderStage / GPUMapMode /
+//     GPUColorWrite flag values, and buffer descriptor validation (MAP_READ
+//     only with COPY_DST, MAP_WRITE only with COPY_SRC, mapped-at-creation
+//     size a multiple of 4);
+//   - vertex formats: byte size, component count, WGSL type; a vertex
+//     buffer layout builder (offsets aligned to min(4, size), stride a
+//     multiple of 4, at most 16 attributes, 2048-byte stride, unique
+//     locations) that also writes the WGSL vertex input struct;
+//   - texture formats: texel block size and extent, sample type,
+//     renderable, blendable, storage-capable, depth/stencil aspects
+//     (the spec's texel format tables for the core formats);
+//   - a bind group layout builder: entries for uniform/storage/read-only
+//     storage buffers, samplers, textures and storage textures, checked
+//     against the spec's validation rules and default limits, and the
+//     matching WGSL declarations (@group(g) @binding(b) var...);
+//   - WGSL memory layout: alignment, size and member offsets of structs,
+//     arrays, vectors and matrices (WGSL section "Alignment and Size"),
+//     with the extra uniform address space rules (16-byte alignment of
+//     struct and array members, array stride a multiple of 16).
+//
+// Usage:
+//   use webgpu;
+//   var vb: WgpuVertexLayout = wgpu_vertex_layout_new();
+//   wgpu_vertex_add(&mut vb, 0, "float32x3", "position");
+//   wgpu_vertex_add(&mut vb, 1, "unorm8x4", "color");
+//   println(wgpu_vertex_wgsl(&vb, "VertexIn"));
+//   var bgl: WgpuBglBuilder = wgpu_bgl_new(0);
+//   wgpu_bgl_buffer(&mut bgl, 0, WGPU_STAGE_VERTEX, "uniform", "camera", "Camera");
+
+module webgpu;
+use vec;
+
+// ─── webgpu.h entry points (platform seam) ─────────────────────────────────
+
+// SAFETY: each declaration matches the webgpu.h prototype it names (written
+// by hand: objects and pointers as i64, uint32_t as u32, uint64_t and
+// size_t as i64). Descriptor pointers must be live C memory laid out as the
+// linked webgpu.h version defines them.
+extern "C" link "wgpu_native" {
+    fn wgpuCreateInstance as wgpu_create_instance(descriptor: i64) -> i64;
+    fn wgpuInstanceRelease as wgpu_instance_release(instance: i64) -> void;
+    fn wgpuAdapterRelease as wgpu_adapter_release(adapter: i64) -> void;
+    fn wgpuDeviceRelease as wgpu_device_release(device: i64) -> void;
+    fn wgpuDeviceGetQueue as wgpu_device_get_queue(device: i64) -> i64;
+    fn wgpuDeviceCreateBuffer as wgpu_device_create_buffer(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateTexture as wgpu_device_create_texture(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateSampler as wgpu_device_create_sampler(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateShaderModule as wgpu_device_create_shader_module(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateBindGroupLayout as wgpu_device_create_bind_group_layout(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateBindGroup as wgpu_device_create_bind_group(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreatePipelineLayout as wgpu_device_create_pipeline_layout(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateComputePipeline as wgpu_device_create_compute_pipeline(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateRenderPipeline as wgpu_device_create_render_pipeline(device: i64, descriptor: i64) -> i64;
+    fn wgpuDeviceCreateCommandEncoder as wgpu_device_create_command_encoder(device: i64, descriptor: i64) -> i64;
+    fn wgpuDevicePoll as wgpu_device_poll(device: i64, wait: u32, submissionIndex: i64) -> u32;
+    fn wgpuQueueWriteBuffer as wgpu_queue_write_buffer(queue: i64, buffer: i64, offset: i64, data: i64, size: i64) -> void;
+    fn wgpuQueueSubmit as wgpu_queue_submit(queue: i64, count: i64, commands: i64) -> void;
+    fn wgpuQueueRelease as wgpu_queue_release(queue: i64) -> void;
+    fn wgpuCommandEncoderBeginComputePass as wgpu_command_encoder_begin_compute_pass(encoder: i64, descriptor: i64) -> i64;
+    fn wgpuCommandEncoderBeginRenderPass as wgpu_command_encoder_begin_render_pass(encoder: i64, descriptor: i64) -> i64;
+    fn wgpuCommandEncoderCopyBufferToBuffer as wgpu_command_encoder_copy_buffer_to_buffer(encoder: i64, src: i64, srcOffset: i64, dst: i64, dstOffset: i64, size: i64) -> void;
+    fn wgpuCommandEncoderFinish as wgpu_command_encoder_finish(encoder: i64, descriptor: i64) -> i64;
+    fn wgpuCommandEncoderRelease as wgpu_command_encoder_release(encoder: i64) -> void;
+    fn wgpuCommandBufferRelease as wgpu_command_buffer_release(commands: i64) -> void;
+    fn wgpuComputePassEncoderSetPipeline as wgpu_compute_pass_set_pipeline(pass: i64, pipeline: i64) -> void;
+    fn wgpuComputePassEncoderSetBindGroup as wgpu_compute_pass_set_bind_group(pass: i64, index: u32, group: i64, dynamicOffsetCount: i64, dynamicOffsets: i64) -> void;
+    fn wgpuComputePassEncoderDispatchWorkgroups as wgpu_compute_pass_dispatch(pass: i64, x: u32, y: u32, z: u32) -> void;
+    fn wgpuComputePassEncoderEnd as wgpu_compute_pass_end(pass: i64) -> void;
+    fn wgpuRenderPassEncoderSetPipeline as wgpu_render_pass_set_pipeline(pass: i64, pipeline: i64) -> void;
+    fn wgpuRenderPassEncoderSetVertexBuffer as wgpu_render_pass_set_vertex_buffer(pass: i64, slot: u32, buffer: i64, offset: i64, size: i64) -> void;
+    fn wgpuRenderPassEncoderDraw as wgpu_render_pass_draw(pass: i64, vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32) -> void;
+    fn wgpuRenderPassEncoderEnd as wgpu_render_pass_end(pass: i64) -> void;
+    fn wgpuBufferGetMappedRange as wgpu_buffer_get_mapped_range(buffer: i64, offset: i64, size: i64) -> i64;
+    fn wgpuBufferUnmap as wgpu_buffer_unmap(buffer: i64) -> void;
+    fn wgpuBufferDestroy as wgpu_buffer_destroy(buffer: i64) -> void;
+    fn wgpuBufferRelease as wgpu_buffer_release(buffer: i64) -> void;
+    fn wgpuTextureCreateView as wgpu_texture_create_view(texture: i64, descriptor: i64) -> i64;
+    fn wgpuTextureRelease as wgpu_texture_release(texture: i64) -> void;
+}
+
+// ─── Flags (WebGPU spec constants) ─────────────────────────────────────────
+
+pub const WGPU_BUFFER_MAP_READ: i64 = 0x0001;
+pub const WGPU_BUFFER_MAP_WRITE: i64 = 0x0002;
+pub const WGPU_BUFFER_COPY_SRC: i64 = 0x0004;
+pub const WGPU_BUFFER_COPY_DST: i64 = 0x0008;
+pub const WGPU_BUFFER_INDEX: i64 = 0x0010;
+pub const WGPU_BUFFER_VERTEX: i64 = 0x0020;
+pub const WGPU_BUFFER_UNIFORM: i64 = 0x0040;
+pub const WGPU_BUFFER_STORAGE: i64 = 0x0080;
+pub const WGPU_BUFFER_INDIRECT: i64 = 0x0100;
+pub const WGPU_BUFFER_QUERY_RESOLVE: i64 = 0x0200;
+
+pub const WGPU_TEXTURE_COPY_SRC: i64 = 0x01;
+pub const WGPU_TEXTURE_COPY_DST: i64 = 0x02;
+pub const WGPU_TEXTURE_BINDING: i64 = 0x04;
+pub const WGPU_TEXTURE_STORAGE_BINDING: i64 = 0x08;
+pub const WGPU_TEXTURE_RENDER_ATTACHMENT: i64 = 0x10;
+
+pub const WGPU_STAGE_VERTEX: i64 = 0x1;
+pub const WGPU_STAGE_FRAGMENT: i64 = 0x2;
+pub const WGPU_STAGE_COMPUTE: i64 = 0x4;
+
+pub const WGPU_MAP_READ: i64 = 0x1;
+pub const WGPU_MAP_WRITE: i64 = 0x2;
+
+pub const WGPU_COLOR_WRITE_RED: i64 = 0x1;
+pub const WGPU_COLOR_WRITE_GREEN: i64 = 0x2;
+pub const WGPU_COLOR_WRITE_BLUE: i64 = 0x4;
+pub const WGPU_COLOR_WRITE_ALPHA: i64 = 0x8;
+pub const WGPU_COLOR_WRITE_ALL: i64 = 0xF;
+
+/// Usage flags as the spec spells them, joined by '|'.
+pub fn wgpu_buffer_usage_str(u: i64) -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("MAP_READ"); names.push("MAP_WRITE"); names.push("COPY_SRC"); names.push("COPY_DST"); names.push("INDEX");
+    names.push("VERTEX"); names.push("UNIFORM"); names.push("STORAGE"); names.push("INDIRECT"); names.push("QUERY_RESOLVE");
+    var s: str = "";
+    var i: i64 = 0;
+    while i < names.len() {
+        if ((u >> i) & 1) == 1 {
+            if str_len(s) > 0 {
+                s = s + "|";
+            }
+            s = s + names.get(i);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Problems of a GPUBufferDescriptor (createBuffer validation).
+pub fn wgpu_validate_buffer(size: i64, usage: i64, mapped_at_creation: bool) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    if usage == 0 {
+        e.push("usage must not be 0");
+    }
+    if (usage & ~0x3FF) != 0 {
+        e.push("unknown usage bits");
+    }
+    if (usage & WGPU_BUFFER_MAP_READ) != 0 && (usage & ~(WGPU_BUFFER_MAP_READ | WGPU_BUFFER_COPY_DST)) != 0 {
+        e.push("MAP_READ may only be combined with COPY_DST");
+    }
+    if (usage & WGPU_BUFFER_MAP_WRITE) != 0 && (usage & ~(WGPU_BUFFER_MAP_WRITE | WGPU_BUFFER_COPY_SRC)) != 0 {
+        e.push("MAP_WRITE may only be combined with COPY_SRC");
+    }
+    if mapped_at_creation && size % 4 != 0 {
+        e.push("a buffer mapped at creation needs a size that is a multiple of 4");
+    }
+    if size < 0 {
+        e.push("size must not be negative");
+    }
+    return e;
+}
+
+// ─── Vertex formats ────────────────────────────────────────────────────────
+
+pub struct WgpuVertexFormat {
+    pub name: str,
+    pub size: i64,
+    pub components: i64,
+    /// The WGSL type a shader reads it as.
+    pub wgsl: str,
+    pub known: bool,
+}
+
+/// A GPUVertexFormat by its spec name ("float32x3", "unorm8x4", ...).
+pub fn wgpu_vertex_format(name: str) -> WgpuVertexFormat {
+    var r: WgpuVertexFormat = WgpuVertexFormat { name: name, size: 0, components: 0, wgsl: "", known: false };
+    if name == "unorm10-10-10-2" {
+        r.size = 4; r.components = 4; r.wgsl = "vec4<f32>"; r.known = true;
+        return r;
+    }
+    if name == "unorm8x4-bgra" {
+        r.size = 4; r.components = 4; r.wgsl = "vec4<f32>"; r.known = true;
+        return r;
+    }
+    var base: str = name;
+    var n: i64 = 1;
+    val x: i64 = str_find(name, "x");
+    if x > 0 {
+        base = str_slice(name, 0, x);
+        n = str_parse_int(str_slice(name, x + 1, str_len(name)));
+    }
+    var bits: i64 = 0;
+    var scalar: str = "";
+    if str_starts_with(base, "uint") {
+        bits = str_parse_int(str_slice(base, 4, str_len(base)));
+        scalar = "u32";
+    } else if str_starts_with(base, "sint") {
+        bits = str_parse_int(str_slice(base, 4, str_len(base)));
+        scalar = "i32";
+    } else if str_starts_with(base, "unorm") || str_starts_with(base, "snorm") {
+        bits = str_parse_int(str_slice(base, 5, str_len(base)));
+        scalar = "f32";
+    } else if str_starts_with(base, "float") {
+        bits = str_parse_int(str_slice(base, 5, str_len(base)));
+        scalar = "f32";
+    } else {
+        return r;
+    }
+    if bits != 8 && bits != 16 && bits != 32 {
+        return r;
+    }
+    if scalar != "f32" || !str_starts_with(base, "float") {
+        // integer and normalized formats: 1, 2 or 4 components (8/16 bit),
+        // 32-bit ints also 3
+        if bits == 32 && scalar == "f32" {
+            return r;
+        }
+        if n == 3 && bits != 32 {
+            return r;
+        }
+    } else if bits == 8 || (bits == 16 && n == 3) {
+        return r;
+    }
+    if n < 1 || n > 4 {
+        return r;
+    }
+    r.size = bits / 8 * n;
+    r.components = n;
+    if n == 1 {
+        r.wgsl = scalar;
+    } else {
+        r.wgsl = "vec" + int_to_str(n) + "<" + scalar + ">";
+    }
+    r.known = true;
+    return r;
+}
+
+pub struct WgpuVertexLayout {
+    pub locations: Vec<i64>,
+    pub formats: Vec<str>,
+    pub names: Vec<str>,
+    pub offsets: Vec<i64>,
+    pub stride: i64,
+    pub errors: Vec<str>,
+}
+
+pub fn wgpu_vertex_layout_new() -> WgpuVertexLayout {
+    return WgpuVertexLayout { locations: Vec::new(), formats: Vec::new(), names: Vec::new(), offsets: Vec::new(), stride: 0, errors: Vec::new() };
+}
+
+/// Append an attribute at the next offset aligned to min(4, size).
+pub fn wgpu_vertex_add(l: &mut WgpuVertexLayout, location: i64, format: str, name: str) {
+    val f: WgpuVertexFormat = wgpu_vertex_format(format);
+    if !f.known {
+        l.errors.push("unknown vertex format " + format);
+        return;
+    }
+    var i: i64 = 0;
+    while i < l.locations.len() {
+        if l.locations.get(i) == location {
+            l.errors.push("location " + int_to_str(location) + " used twice");
+        }
+        i = i + 1;
+    }
+    if location < 0 || location >= 16 {
+        l.errors.push("location " + int_to_str(location) + " is not below maxVertexAttributes (16)");
+    }
+    var align: i64 = f.size;
+    if align > 4 {
+        align = 4;
+    }
+    var end: i64 = 0;
+    if l.offsets.len() > 0 {
+        val last: i64 = l.offsets.len() - 1;
+        end = l.offsets.get(last) + wgpu_vertex_format(l.formats.get(last)).size;
+    }
+    val off: i64 = ((end + align - 1) / align) * align;
+    l.locations.push(location);
+    l.formats.push(format);
+    l.names.push(name);
+    l.offsets.push(off);
+    l.stride = ((off + f.size + 3) / 4) * 4;
+    if l.locations.len() > 16 {
+        l.errors.push("more than 16 attributes");
+    }
+    if l.stride > 2048 {
+        l.errors.push("arrayStride above maxVertexBufferArrayStride (2048)");
+    }
+}
+
+/// The WGSL struct a vertex shader takes this buffer as.
+pub fn wgpu_vertex_wgsl(l: &WgpuVertexLayout, struct_name: str) -> str {
+    var s: str = "struct " + struct_name + " {\n";
+    var i: i64 = 0;
+    while i < l.locations.len() {
+        s = s + "    @location(" + int_to_str(l.locations.get(i)) + ") " + l.names.get(i) + ": " + wgpu_vertex_format(l.formats.get(i)).wgsl + ",\n";
+        i = i + 1;
+    }
+    return s + "}\n";
+}
+
+// ─── Texture formats ───────────────────────────────────────────────────────
+
+pub struct WgpuTextureFormat {
+    pub name: str,
+    pub known: bool,
+    /// Bytes per texel block (0: not copyable, e.g. depth24plus).
+    pub block_bytes: i64,
+    pub block_w: i64,
+    pub block_h: i64,
+    /// "float", "unfilterable-float", "uint", "sint" or "depth".
+    pub sample_type: str,
+    pub renderable: bool,
+    pub blendable: bool,
+    pub storage: bool,
+    pub has_depth: bool,
+    pub has_stencil: bool,
+    pub srgb: bool,
+}
+
+fn wgpu_tf(name: str, bytes: i64, st: str, rend: bool, blend: bool, storage: bool) -> WgpuTextureFormat {
+    return WgpuTextureFormat { name: name, known: true, block_bytes: bytes, block_w: 1, block_h: 1, sample_type: st, renderable: rend, blendable: blend, storage: storage, has_depth: false, has_stencil: false, srgb: str_ends_with(name, "-srgb") };
+}
+
+/// The spec's texel format table entry of a core format name.
+pub fn wgpu_texture_format(name: str) -> WgpuTextureFormat {
+    // 8-bit per channel
+    if name == "r8unorm" { return wgpu_tf(name, 1, "float", true, true, false); }
+    if name == "r8snorm" { return wgpu_tf(name, 1, "float", false, false, false); }
+    if name == "r8uint" || name == "r8sint" { return wgpu_tf(name, 1, str_slice(name, 2, 6), true, false, false); }
+    if name == "rg8unorm" { return wgpu_tf(name, 2, "float", true, true, false); }
+    if name == "rg8snorm" { return wgpu_tf(name, 2, "float", false, false, false); }
+    if name == "rg8uint" || name == "rg8sint" { return wgpu_tf(name, 2, str_slice(name, 3, 7), true, false, false); }
+    if name == "rgba8unorm" { return wgpu_tf(name, 4, "float", true, true, true); }
+    if name == "rgba8unorm-srgb" || name == "bgra8unorm" || name == "bgra8unorm-srgb" { return wgpu_tf(name, 4, "float", true, true, false); }
+    if name == "rgba8snorm" { return wgpu_tf(name, 4, "float", false, false, true); }
+    if name == "rgba8uint" || name == "rgba8sint" { return wgpu_tf(name, 4, str_slice(name, 5, 9), true, false, true); }
+    // 16-bit
+    if name == "r16uint" || name == "r16sint" { return wgpu_tf(name, 2, str_slice(name, 3, 7), true, false, false); }
+    if name == "r16float" { return wgpu_tf(name, 2, "float", true, true, false); }
+    if name == "rg16uint" || name == "rg16sint" { return wgpu_tf(name, 4, str_slice(name, 4, 8), true, false, false); }
+    if name == "rg16float" { return wgpu_tf(name, 4, "float", true, true, false); }
+    if name == "rgba16uint" || name == "rgba16sint" { return wgpu_tf(name, 8, str_slice(name, 6, 10), true, false, true); }
+    if name == "rgba16float" { return wgpu_tf(name, 8, "float", true, true, true); }
+    // 32-bit
+    if name == "r32uint" || name == "r32sint" { return wgpu_tf(name, 4, str_slice(name, 3, 7), true, false, true); }
+    if name == "r32float" { return wgpu_tf(name, 4, "unfilterable-float", true, false, true); }
+    if name == "rg32uint" || name == "rg32sint" { return wgpu_tf(name, 8, str_slice(name, 4, 8), true, false, true); }
+    if name == "rg32float" { return wgpu_tf(name, 8, "unfilterable-float", true, false, true); }
+    if name == "rgba32uint" || name == "rgba32sint" { return wgpu_tf(name, 16, str_slice(name, 6, 10), true, false, true); }
+    if name == "rgba32float" { return wgpu_tf(name, 16, "unfilterable-float", true, false, true); }
+    // packed
+    if name == "rgb10a2uint" { return wgpu_tf(name, 4, "uint", true, false, false); }
+    if name == "rgb10a2unorm" { return wgpu_tf(name, 4, "float", true, true, false); }
+    if name == "rg11b10ufloat" || name == "rgb9e5ufloat" { return wgpu_tf(name, 4, "float", false, false, false); }
+    // depth / stencil
+    if name == "stencil8" {
+        var f: WgpuTextureFormat = wgpu_tf(name, 1, "uint", true, false, false);
+        f.has_stencil = true;
+        return f;
+    }
+    if name == "depth16unorm" || name == "depth32float" || name == "depth24plus" {
+        var bytes: i64 = 2;
+        if name == "depth32float" {
+            bytes = 4;
+        }
+        if name == "depth24plus" {
+            bytes = 0;
+        }
+        var f: WgpuTextureFormat = wgpu_tf(name, bytes, "depth", true, false, false);
+        f.has_depth = true;
+        return f;
+    }
+    if name == "depth24plus-stencil8" || name == "depth32float-stencil8" {
+        var f: WgpuTextureFormat = wgpu_tf(name, 0, "depth", true, false, false);
+        f.has_depth = true;
+        f.has_stencil = true;
+        return f;
+    }
+    // compressed (features texture-compression-bc / -etc2 / -astc)
+    if str_starts_with(name, "bc") || str_starts_with(name, "etc2") || str_starts_with(name, "eac") || str_starts_with(name, "astc") {
+        var bytes: i64 = 16;
+        if str_starts_with(name, "bc1") || str_starts_with(name, "bc4") || str_starts_with(name, "etc2-rgb8") || name == "eac-r11unorm" || name == "eac-r11snorm" {
+            bytes = 8;
+        }
+        var f: WgpuTextureFormat = wgpu_tf(name, bytes, "float", false, false, false);
+        f.block_w = 4;
+        f.block_h = 4;
+        if str_starts_with(name, "astc-") {
+            val dims: str = str_slice(name, 5, str_find(name, "-unorm"));
+            val xpos: i64 = str_find(dims, "x");
+            f.block_w = str_parse_int(str_slice(dims, 0, xpos));
+            f.block_h = str_parse_int(str_slice(dims, xpos + 1, str_len(dims)));
+        }
+        return f;
+    }
+    return WgpuTextureFormat { name: name, known: false, block_bytes: 0, block_w: 1, block_h: 1, sample_type: "", renderable: false, blendable: false, storage: false, has_depth: false, has_stencil: false, srgb: false };
+}
+
+/// bytesPerRow of a copy: blocks per row times block bytes, aligned up to
+/// 256 for buffer-texture copies (copyBufferToTexture's requirement).
+pub fn wgpu_bytes_per_row(format: str, width: i64) -> i64 {
+    val f: WgpuTextureFormat = wgpu_texture_format(format);
+    val row: i64 = ((width + f.block_w - 1) / f.block_w) * f.block_bytes;
+    return ((row + 255) / 256) * 256;
+}
+
+// ─── Bind group layouts ────────────────────────────────────────────────────
+
+pub struct WgpuBglEntry {
+    pub binding: i64,
+    pub visibility: i64,
+    /// "buffer", "sampler", "texture" or "storage-texture".
+    pub kind: str,
+    /// buffer: "uniform" | "storage" | "read-only-storage"; sampler:
+    /// "filtering" | "non-filtering" | "comparison"; texture: sample type;
+    /// storage texture: "write-only" | "read-only" | "read-write".
+    pub sub: str,
+    /// texture view dimension ("2d", "cube", ...) or storage format.
+    pub extra: str,
+    pub multisampled: bool,
+    pub dynamic: bool,
+    pub var_name: str,
+    pub wgsl_type: str,
+}
+
+pub struct WgpuBglBuilder {
+    pub group: i64,
+    pub entries: Vec<WgpuBglEntry>,
+}
+
+pub fn wgpu_bgl_new(group: i64) -> WgpuBglBuilder {
+    return WgpuBglBuilder { group: group, entries: Vec::new() };
+}
+
+fn wgpu_bgl_push(b: &mut WgpuBglBuilder, binding: i64, vis: i64, kind: str, sub: str, extra: str, ms: bool, dynamic: bool, name: str, ty: str) {
+    b.entries.push(WgpuBglEntry { binding: binding, visibility: vis, kind: kind, sub: sub, extra: extra, multisampled: ms, dynamic: dynamic, var_name: name, wgsl_type: ty });
+}
+
+/// A buffer binding: kind "uniform", "storage" or "read-only-storage";
+/// `ty` is the WGSL type of the variable.
+pub fn wgpu_bgl_buffer(b: &mut WgpuBglBuilder, binding: i64, vis: i64, kind: str, name: str, ty: str) {
+    wgpu_bgl_push(b, binding, vis, "buffer", kind, "", false, false, name, ty);
+}
+
+pub fn wgpu_bgl_dynamic_buffer(b: &mut WgpuBglBuilder, binding: i64, vis: i64, kind: str, name: str, ty: str) {
+    wgpu_bgl_push(b, binding, vis, "buffer", kind, "", false, true, name, ty);
+}
+
+pub fn wgpu_bgl_sampler(b: &mut WgpuBglBuilder, binding: i64, vis: i64, kind: str, name: str) {
+    wgpu_bgl_push(b, binding, vis, "sampler", kind, "", false, false, name, "");
+}
+
+pub fn wgpu_bgl_texture(b: &mut WgpuBglBuilder, binding: i64, vis: i64, sample_type: str, view: str, multisampled: bool, name: str) {
+    wgpu_bgl_push(b, binding, vis, "texture", sample_type, view, multisampled, false, name, "");
+}
+
+pub fn wgpu_bgl_storage_texture(b: &mut WgpuBglBuilder, binding: i64, vis: i64, access: str, format: str, name: str) {
+    wgpu_bgl_push(b, binding, vis, "storage-texture", access, format, false, false, name, "");
+}
+
+/// Problems with the entries (GPUDevice.createBindGroupLayout validation
+/// with the default limits).
+pub fn wgpu_bgl_validate(b: &WgpuBglBuilder) -> Vec<str> {
+    var e: Vec<str> = Vec::new();
+    var dyn_u: i64 = 0;
+    var dyn_s: i64 = 0;
+    var i: i64 = 0;
+    while i < b.entries.len() {
+        val en: WgpuBglEntry = b.entries.get(i);
+        val tag: str = "binding " + int_to_str(en.binding) + ": ";
+        var j: i64 = i + 1;
+        while j < b.entries.len() {
+            if b.entries.get(j).binding == en.binding {
+                e.push(tag + "used twice");
+            }
+            j = j + 1;
+        }
+        if en.binding < 0 || en.binding >= 1000 {
+            e.push(tag + "not below maxBindingsPerBindGroup (1000)");
+        }
+        if (en.visibility & ~7) != 0 {
+            e.push(tag + "unknown visibility bits");
+        }
+        if en.kind == "buffer" {
+            if en.sub != "uniform" && en.sub != "storage" && en.sub != "read-only-storage" {
+                e.push(tag + "unknown buffer type " + en.sub);
+            }
+            if en.sub == "storage" && (en.visibility & WGPU_STAGE_VERTEX) != 0 {
+                e.push(tag + "a writable storage buffer cannot be visible to the vertex stage");
+            }
+            if en.dynamic {
+                if en.sub == "uniform" {
+                    dyn_u = dyn_u + 1;
+                } else {
+                    dyn_s = dyn_s + 1;
+                }
+            }
+        } else if en.kind == "sampler" {
+            if en.sub != "filtering" && en.sub != "non-filtering" && en.sub != "comparison" {
+                e.push(tag + "unknown sampler type " + en.sub);
+            }
+        } else if en.kind == "texture" {
+            if en.sub != "float" && en.sub != "unfilterable-float" && en.sub != "depth" && en.sub != "sint" && en.sub != "uint" {
+                e.push(tag + "unknown sample type " + en.sub);
+            }
+            if en.multisampled && en.extra != "2d" {
+                e.push(tag + "a multisampled texture must have view dimension 2d");
+            }
+            if en.multisampled && en.sub == "float" {
+                e.push(tag + "a multisampled texture cannot have sample type float");
+            }
+        } else if en.kind == "storage-texture" {
+            val f: WgpuTextureFormat = wgpu_texture_format(en.extra);
+            if !f.storage {
+                e.push(tag + "format " + en.extra + " cannot be a storage texture");
+            }
+            if en.sub == "read-write" && en.extra != "r32float" && en.extra != "r32uint" && en.extra != "r32sint" {
+                e.push(tag + "read-write storage textures are r32float, r32uint or r32sint");
+            }
+            if en.sub != "read-only" && (en.visibility & WGPU_STAGE_VERTEX) != 0 {
+                e.push(tag + "a writable storage texture cannot be visible to the vertex stage");
+            }
+        } else {
+            e.push(tag + "unknown binding kind " + en.kind);
+        }
+        i = i + 1;
+    }
+    if dyn_u > 8 {
+        e.push("more than maxDynamicUniformBuffersPerPipelineLayout (8)");
+    }
+    if dyn_s > 4 {
+        e.push("more than maxDynamicStorageBuffersPerPipelineLayout (4)");
+    }
+    // per-stage limits
+    var stage: i64 = 0;
+    while stage < 3 {
+        val bit: i64 = 1 << stage;
+        var samplers: i64 = 0;
+        var textures: i64 = 0;
+        var storage_tex: i64 = 0;
+        var uniforms: i64 = 0;
+        var storage_buf: i64 = 0;
+        i = 0;
+        while i < b.entries.len() {
+            val en: WgpuBglEntry = b.entries.get(i);
+            if (en.visibility & bit) != 0 {
+                if en.kind == "sampler" { samplers = samplers + 1; }
+                if en.kind == "texture" { textures = textures + 1; }
+                if en.kind == "storage-texture" { storage_tex = storage_tex + 1; }
+                if en.kind == "buffer" && en.sub == "uniform" { uniforms = uniforms + 1; }
+                if en.kind == "buffer" && en.sub != "uniform" { storage_buf = storage_buf + 1; }
+            }
+            i = i + 1;
+        }
+        val sname: str = wgpu_stage_name(bit);
+        if samplers > 16 { e.push(sname + ": more than 16 samplers"); }
+        if textures > 16 { e.push(sname + ": more than 16 sampled textures"); }
+        if storage_tex > 4 { e.push(sname + ": more than 4 storage textures"); }
+        if uniforms > 12 { e.push(sname + ": more than 12 uniform buffers"); }
+        if storage_buf > 8 { e.push(sname + ": more than 8 storage buffers"); }
+        stage = stage + 1;
+    }
+    return e;
+}
+
+pub fn wgpu_stage_name(bit: i64) -> str {
+    if bit == WGPU_STAGE_VERTEX {
+        return "vertex";
+    }
+    if bit == WGPU_STAGE_FRAGMENT {
+        return "fragment";
+    }
+    return "compute";
+}
+
+fn wgpu_texture_wgsl(en: &WgpuBglEntry) -> str {
+    var dim: str = en.extra;
+    if dim == "" {
+        dim = "2d";
+    }
+    dim = str_replace(dim, "-", "_");
+    if en.sub == "depth" {
+        if en.multisampled {
+            return "texture_depth_multisampled_2d";
+        }
+        return "texture_depth_" + dim;
+    }
+    var scalar: str = "f32";
+    if en.sub == "uint" {
+        scalar = "u32";
+    }
+    if en.sub == "sint" {
+        scalar = "i32";
+    }
+    if en.multisampled {
+        return "texture_multisampled_2d<" + scalar + ">";
+    }
+    return "texture_" + dim + "<" + scalar + ">";
+}
+
+/// The WGSL declarations of the layout's bindings, in binding order.
+pub fn wgpu_bgl_wgsl(b: &WgpuBglBuilder) -> str {
+    var s: str = "";
+    var done: Vec<bool> = Vec::filled(b.entries.len(), false);
+    var k: i64 = 0;
+    while k < b.entries.len() {
+        var best: i64 = - 1;
+        var i: i64 = 0;
+        while i < b.entries.len() {
+            if !done.get(i) && (best < 0 || b.entries.get(i).binding < b.entries.get(best).binding) {
+                best = i;
+            }
+            i = i + 1;
+        }
+        done.set(best, true);
+        val en: WgpuBglEntry = b.entries.get(best);
+        var decl: str = "@group(" + int_to_str(b.group) + ") @binding(" + int_to_str(en.binding) + ") var";
+        if en.kind == "buffer" {
+            if en.sub == "uniform" {
+                decl = decl + "<uniform> " + en.var_name + ": " + en.wgsl_type;
+            } else if en.sub == "storage" {
+                decl = decl + "<storage, read_write> " + en.var_name + ": " + en.wgsl_type;
+            } else {
+                decl = decl + "<storage, read> " + en.var_name + ": " + en.wgsl_type;
+            }
+        } else if en.kind == "sampler" {
+            if en.sub == "comparison" {
+                decl = decl + " " + en.var_name + ": sampler_comparison";
+            } else {
+                decl = decl + " " + en.var_name + ": sampler";
+            }
+        } else if en.kind == "texture" {
+            decl = decl + " " + en.var_name + ": " + wgpu_texture_wgsl(&en);
+        } else {
+            var access: str = "write";
+            if en.sub == "read-only" {
+                access = "read";
+            }
+            if en.sub == "read-write" {
+                access = "read_write";
+            }
+            decl = decl + " " + en.var_name + ": texture_storage_2d<" + en.extra + ", " + access + ">";
+        }
+        s = s + decl + ";\n";
+        k = k + 1;
+    }
+    return s;
+}
+
+// ─── WGSL memory layout ────────────────────────────────────────────────────
+
+pub struct WgslLayout {
+    pub ok: bool,
+    pub align: i64,
+    pub size: i64,
+    /// Member offsets (structs only).
+    pub offsets: Vec<i64>,
+    pub error: str,
+}
+
+/// A registry of WGSL struct types: name -> members "name: type" list.
+pub struct WgslTypes {
+    pub names: Vec<str>,
+    pub members: Vec<Vec<str>>,
+    pub types: Vec<Vec<str>>,
+}
+
+pub fn wgsl_types_new() -> WgslTypes {
+    return WgslTypes { names: Vec::new(), members: Vec::new(), types: Vec::new() };
+}
+
+/// Declare `struct name { m0: t0, m1: t1, ... }` from "m0: t0, m1: t1".
+pub fn wgsl_struct(t: &mut WgslTypes, name: str, body: str) {
+    var ms: Vec<str> = Vec::new();
+    var ts: Vec<str> = Vec::new();
+    // split on commas outside <...>
+    var depth: i64 = 0;
+    var cur: str = "";
+    var parts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(body) {
+        val c: i64 = str_byte_at(body, i);
+        if c == 60 { depth = depth + 1; }
+        if c == 62 { depth = depth - 1; }
+        if c == 44 && depth == 0 {
+            parts.push(cur);
+            cur = "";
+        } else {
+            cur = cur + byte_to_str(c);
+        }
+        i = i + 1;
+    }
+    if str_len(str_trim(cur)) > 0 {
+        parts.push(cur);
+    }
+    i = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        val colon: i64 = str_find(p, ":");
+        ms.push(str_trim(str_slice(p, 0, colon)));
+        ts.push(str_trim(str_slice(p, colon + 1, str_len(p))));
+        i = i + 1;
+    }
+    t.names.push(name);
+    t.members.push(ms);
+    t.types.push(ts);
+}
+
+fn wgsl_round(a: i64, n: i64) -> i64 {
+    return ((n + a - 1) / a) * a;
+}
+
+fn wgsl_err(msg: str) -> WgslLayout {
+    return WgslLayout { ok: false, align: 0, size: 0, offsets: Vec::new(), error: msg };
+}
+
+fn wgsl_ok(align: i64, size: i64) -> WgslLayout {
+    return WgslLayout { ok: true, align: align, size: size, offsets: Vec::new(), error: "" };
+}
+
+fn wgsl_is_composite(t: &WgslTypes, ty: str) -> bool {
+    if str_starts_with(ty, "array<") {
+        return true;
+    }
+    var i: i64 = 0;
+    while i < t.names.len() {
+        if t.names.get(i) == ty {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Alignment and size of a WGSL type. `uniform` applies the uniform
+/// address space rules (RequiredAlignOf rounded to 16 for struct and
+/// array members, array element stride a multiple of 16).
+pub fn wgsl_layout(t: &WgslTypes, ty_in: str, uniform: bool) -> WgslLayout {
+    val ty: str = str_trim(ty_in);
+    if ty == "f32" || ty == "i32" || ty == "u32" || ty == "atomic<u32>" || ty == "atomic<i32>" {
+        return wgsl_ok(4, 4);
+    }
+    if ty == "f16" {
+        return wgsl_ok(2, 2);
+    }
+    if str_starts_with(ty, "vec") && str_len(ty) > 4 {
+        val n: i64 = str_byte_at(ty, 3) - 48;
+        val inner: str = str_slice(ty, 5, str_len(ty) - 1);
+        val s: WgslLayout = wgsl_layout(t, inner, false);
+        if !s.ok || n < 2 || n > 4 {
+            return wgsl_err("bad vector type " + ty);
+        }
+        if n == 2 {
+            return wgsl_ok(2 * s.size, 2 * s.size);
+        }
+        if n == 3 {
+            return wgsl_ok(4 * s.size, 3 * s.size);
+        }
+        return wgsl_ok(4 * s.size, 4 * s.size);
+    }
+    if str_starts_with(ty, "mat") && str_len(ty) > 6 {
+        // matCxR<T>: C columns of vecR<T>
+        val c: i64 = str_byte_at(ty, 3) - 48;
+        val r: i64 = str_byte_at(ty, 5) - 48;
+        val inner: str = str_slice(ty, 7, str_len(ty) - 1);
+        val col: WgslLayout = wgsl_layout(t, "vec" + int_to_str(r) + "<" + inner + ">", false);
+        if !col.ok || c < 2 || c > 4 {
+            return wgsl_err("bad matrix type " + ty);
+        }
+        return wgsl_ok(col.align, c * wgsl_round(col.align, col.size));
+    }
+    if str_starts_with(ty, "array<") {
+        val body: str = str_slice(ty, 6, str_len(ty) - 1);
+        val comma: i64 = str_rfind(body, ",");
+        var elem: str = body;
+        var n: i64 = 0;
+        if comma > 0 && str_find(str_slice(body, comma, str_len(body)), ">") < 0 {
+            elem = str_trim(str_slice(body, 0, comma));
+            n = str_parse_int(str_trim(str_slice(body, comma + 1, str_len(body))));
+        }
+        val el: WgslLayout = wgsl_layout(t, elem, uniform);
+        if !el.ok {
+            return el;
+        }
+        var align: i64 = el.align;
+        val stride: i64 = wgsl_round(el.align, el.size);
+        if uniform {
+            if stride % 16 != 0 {
+                return wgsl_err("uniform: " + ty + " has element stride " + int_to_str(stride) + ", not a multiple of 16");
+            }
+            align = wgsl_round(16, align);
+        }
+        if n == 0 {
+            // runtime-sized: size is one element (valid as the last
+            // member of a storage struct only)
+            if uniform {
+                return wgsl_err("uniform: runtime-sized arrays are not allowed");
+            }
+            return wgsl_ok(align, stride);
+        }
+        return wgsl_ok(align, n * stride);
+    }
+    var k: i64 = 0;
+    while k < t.names.len() {
+        if t.names.get(k) == ty {
+            val ms: Vec<str> = t.types.get(k);
+            var off: i64 = 0;
+            var align: i64 = 1;
+            var offsets: Vec<i64> = Vec::new();
+            var prev_struct_end: i64 = - 1;
+            var i: i64 = 0;
+            while i < ms.len() {
+                val ml: WgslLayout = wgsl_layout(t, ms.get(i), uniform);
+                if !ml.ok {
+                    return ml;
+                }
+                var ma: i64 = ml.align;
+                if uniform && wgsl_is_composite(t, ms.get(i)) {
+                    ma = wgsl_round(16, ma);
+                }
+                off = wgsl_round(ma, off);
+                if uniform && prev_struct_end >= 0 && off < wgsl_round(16, prev_struct_end) {
+                    off = wgsl_round(16, prev_struct_end);
+                }
+                offsets.push(off);
+                if ma > align {
+                    align = ma;
+                }
+                off = off + ml.size;
+                prev_struct_end = - 1;
+                if uniform && wgsl_is_composite(t, ms.get(i)) && !str_starts_with(ms.get(i), "array<") {
+                    prev_struct_end = off;
+                }
+                i = i + 1;
+            }
+            var r: WgslLayout = wgsl_ok(align, wgsl_round(align, off));
+            r.offsets = offsets;
+            return r;
+        }
+        k = k + 1;
+    }
+    return wgsl_err("unknown type " + ty);
+}

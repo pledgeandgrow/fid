@@ -1,0 +1,163 @@
+// stdlib/packet: decode known frames (built with Python's struct/ipaddress, checksums computed there), dissect them, rebuild each with the builders byte for byte; the IPv4 header checksum example of RFC 1071 / Wikipedia (b861); RFC 5952 address text.
+// Expected output:
+// udp/dns:
+//   Ethernet 00:11:22:33:44:55 -> 66:77:88:99:aa:bb type 0x0800
+//   IPv4 192.168.0.1 -> 8.8.8.8 ttl 64 proto 17 len 57 checksum ok
+//   UDP 33333 -> 53 len 37 checksum ok
+//   DNS id 0x1234 query rcode 0 qd 1 an 0 q example.com type 1
+// vlan/tcp syn:
+//   Ethernet 00:11:22:33:44:55 -> 66:77:88:99:aa:bb type 0x0800
+//   VLAN 100 prio 5
+//   IPv4 10.0.0.1 -> 10.0.0.2 ttl 64 proto 6 len 60 checksum ok
+//   TCP 40000 -> 443 [SYN] seq 1000 ack 0 win 64240 mss 1460 len 0 checksum ok
+// ipv6/tcp:
+//   Ethernet 00:11:22:33:44:55 -> 66:77:88:99:aa:bb type 0x86dd
+//   IPv6 2001:db8::1 -> 2001:db8:0:1::2 hop 64 next 6 len 25
+//   TCP 443 -> 40000 [PSH,ACK] seq 7 ack 1001 win 512 len 5 checksum ok
+// icmpv6:
+//   Ethernet 00:11:22:33:44:55 -> 66:77:88:99:aa:bb type 0x86dd
+//   IPv6 fe80::1 -> ff02::1 hop 255 next 58 len 12
+//   ICMPv6 type 128 code 0 checksum ok
+// arp:
+//   Ethernet 00:11:22:33:44:55 -> ff:ff:ff:ff:ff:ff type 0x0806
+//   ARP request 00:11:22:33:44:55 192.168.1.10 -> 00:00:00:00:00:00 192.168.1.1
+// icmp:
+//   Ethernet 00:11:22:33:44:55 -> 66:77:88:99:aa:bb type 0x0800
+//   IPv4 192.168.0.5 -> 192.168.0.6 ttl 64 proto 1 len 36 checksum ok
+//   ICMP type 8 code 0 id 153 seq 3 checksum ok
+// dns query: 123401000001000000000000076578616d706c6503636f6d0000010001
+// udp/dns rebuilt: same bytes
+// vlan/tcp syn rebuilt: same bytes
+// options: n=4 mss=1460 ws=7 ts=12345
+// ipv6/tcp rebuilt: same bytes
+// icmpv6 rebuilt: same bytes
+// arp rebuilt: same bytes
+// icmp rebuilt: same bytes
+// rfc1071 example checksum: 0xb861
+// header verifies: true total 115 (end past the 20 bytes given: ok=false)
+// corrupted: IPv4 192.168.0.1 -> 9.8.8.8 ttl 64 proto 17 len 57 checksum BAD
+// response: ok=true qr=true rd=true ra=true an=1 q=example.com
+// pointer name: example.com next 31
+// v6: 2001:db8::ff00:42:8329 :: ::1 1:0:0:2::3 1:0:2:3:4:5:6:7
+// bad parses: 0 0 0
+use packet;
+use encoding;
+use vec;
+use string;
+
+fn h(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn show(label: str, frame: str) {
+    println(label + ":");
+    val lines: Vec<str> = pkt_dissect(h(frame));
+    var i: i64 = 0;
+    while i < lines.len() {
+        println("  " + lines.get(i));
+        i = i + 1;
+    }
+}
+
+fn same(label: str, got: Vec<i64>, want: str) {
+    if hex_encode_bytes(got) == want {
+        println(label + " rebuilt: same bytes");
+    } else {
+        println(label + " rebuilt: DIFFERENT " + hex_encode_bytes(got));
+    }
+}
+
+fn main() -> i64 {
+    val fa: str = "66778899aabb0011223344550800450000391c46400040114db5c0a8000108080808823500350025cade123401000001000000000000076578616d706c6503636f6d0000010001";
+    val fb: str = "66778899aabb0011223344558100a06408004500003c1c46400040060a740a0000010a0000029c4001bb000003e800000000a002faf066f00000020405b40402080a000030390000000001030307";
+    val fc: str = "66778899aabb00112233445586dd600000000019064020010db800000000000000000000000120010db800000001000000000000000201bb9c4000000007000003e9501802006c94000068656c6c6f";
+    val fd: str = "66778899aabb00112233445586dd60000000000c3afffe800000000000000000000000000001ff0200000000000000000000000000018000a35a0007000170696e67";
+    val fe: str = "ffffffffffff00112233445508060001080006040001001122334455c0a8010a000000000000c0a80101";
+    val ff: str = "66778899aabb001122334455080045000024000140004001b97cc0a80005c0a80006080065ce009900036162636465666768";
+    show("udp/dns", fa);
+    show("vlan/tcp syn", fb);
+    show("ipv6/tcp", fc);
+    show("icmpv6", fd);
+    show("arp", fe);
+    show("icmp", ff);
+
+    val m1: Vec<i64> = mac_parse("00:11:22:33:44:55");
+    val m2: Vec<i64> = mac_parse("66-77-88-99-AA-BB");
+    val none: Vec<i64> = Vec::new();
+
+    // A: Ethernet / IPv4 / UDP / DNS query
+    val q: Vec<i64> = dns_build(& dns_query_new(0x1234, "example.com", 1));
+    println("dns query: " + hex_encode_bytes(q));
+    val s4: Vec<i64> = ipv4_parse("192.168.0.1");
+    val d4: Vec<i64> = ipv4_parse("8.8.8.8");
+    var ip: Ipv4Hdr = ipv4_hdr(IP_UDP, s4, d4);
+    ip.id = 0x1c46;
+    val u: Vec<i64> = udp_build_v4(& s4, & d4, 33333, 53, & q);
+    same("udp/dns", eth_build(& m2, & m1, & none, ETH_IPV4, & ipv4_build(& ip, & u)), fa);
+
+    // B: VLAN 100 priority 5, TCP SYN with MSS, SACK-permitted, timestamps, NOP, window scale
+    val s4b: Vec<i64> = ipv4_parse("10.0.0.1");
+    val d4b: Vec<i64> = ipv4_parse("10.0.0.2");
+    var t: TcpHdr = tcp_hdr(40000, 443, 1000, 0, TCP_SYN);
+    t.window = 64240;
+    t.options.push(tcp_opt_mss(1460));
+    t.options.push(tcp_opt_sack_ok());
+    t.options.push(tcp_opt_timestamps(12345, 0));
+    t.options.push(tcp_opt(1, none));
+    t.options.push(tcp_opt_wscale(7));
+    var ipb: Ipv4Hdr = ipv4_hdr(IP_TCP, s4b, d4b);
+    ipb.id = 0x1c46;
+    var tags: Vec<i64> = Vec::new();
+    tags.push((5 << 13) | 100);
+    val seg: Vec<i64> = tcp_build_v4(& s4b, & d4b, & t, & none);
+    same("vlan/tcp syn", eth_build(& m2, & m1, & tags, ETH_IPV4, & ipv4_build(& ipb, & seg)), fb);
+    val dec: TcpHdr = tcp_decode(& seg, 0, seg.len());
+    println("options: n=" + int_to_str(dec.options.len()) + " mss=" + int_to_str(tcp_opt_value(& dec, 2)) + " ws=" + int_to_str(tcp_opt_value(& dec, 3)) + " ts=" + int_to_str(tcp_opt_value(& dec, 8)));
+
+    // C: IPv6 / TCP PSH,ACK with "hello"
+    val s6: Vec<i64> = ipv6_parse("2001:db8::1");
+    val d6: Vec<i64> = ipv6_parse("2001:db8:0:1::2");
+    var t6: TcpHdr = tcp_hdr(443, 40000, 7, 1001, TCP_PSH | TCP_ACK);
+    t6.window = 512;
+    val seg6: Vec<i64> = tcp_build_v6(& s6, & d6, & t6, & str_bytes("hello"));
+    same("ipv6/tcp", eth_build(& m2, & m1, & none, ETH_IPV6, & ipv6_build(0, 0, IP_TCP, 64, & s6, & d6, & seg6)), fc);
+
+    // D: ICMPv6 echo request to all-nodes
+    val l6: Vec<i64> = ipv6_parse("fe80::1");
+    val a6: Vec<i64> = ipv6_parse("ff02::1");
+    val ic6: Vec<i64> = icmpv6_build(& l6, & a6, 128, 0, (7 << 16) | 1, & str_bytes("ping"));
+    same("icmpv6", eth_build(& m2, & m1, & none, ETH_IPV6, & ipv6_build(0, 0, IP_ICMPV6, 255, & l6, & a6, & ic6)), fd);
+
+    // E: ARP who-has 192.168.1.1
+    val bc: Vec<i64> = mac_parse("ff:ff:ff:ff:ff:ff");
+    val zero: Vec<i64> = mac_parse("00:00:00:00:00:00");
+    val arp: Vec<i64> = arp_build(1, & m1, & ipv4_parse("192.168.1.10"), & zero, & ipv4_parse("192.168.1.1"));
+    same("arp", eth_build(& bc, & m1, & none, ETH_ARP, & arp), fe);
+
+    // F: ICMP echo request
+    val s4f: Vec<i64> = ipv4_parse("192.168.0.5");
+    val d4f: Vec<i64> = ipv4_parse("192.168.0.6");
+    var ipf: Ipv4Hdr = ipv4_hdr(IP_ICMP, s4f, d4f);
+    ipf.id = 1;
+    val icm: Vec<i64> = icmp_build(8, 0, (0x99 << 16) | 3, & str_bytes("abcdefgh"));
+    same("icmp", eth_build(& m2, & m1, & none, ETH_IPV4, & ipv4_build(& ipf, & icm)), ff);
+
+    // the classic header: 4500 0073 0000 4000 4011 [b861] c0a8 0001 c0a8 00c7
+    val wh: Vec<i64> = h("450000730000400040110000c0a80001c0a800c7");
+    println("rfc1071 example checksum: " + pk_hex16(inet_checksum(& wh)));
+    val wv: Ipv4Hdr = ipv4_decode(& h("45000073000040004011b861c0a80001c0a800c7"), 0);
+    println("header verifies: " + bool_to_str(wv.checksum_ok) + " total " + int_to_str(wv.total_len) + " (end past the 20 bytes given: ok=" + bool_to_str(wv.ok) + ")");
+    var bad: Vec<i64> = h(fa);
+    bad.set(30, 9);
+    val lines: Vec<str> = pkt_dissect(bad);
+    println("corrupted: " + lines.get(1));
+
+    // DNS response with a compression pointer in the answer
+    val r: DnsHdr = dns_decode(& h("123481800001000100000000076578616d706c6503636f6d0000010001c00c000100010000012c00045db8d822"));
+    println("response: ok=" + bool_to_str(r.ok) + " qr=" + bool_to_str(r.qr) + " rd=" + bool_to_str(r.rd) + " ra=" + bool_to_str(r.ra) + " an=" + int_to_str(r.ancount) + " q=" + r.questions.get(0).name);
+    var nm: str = "";
+    val after: i64 = dns_read_name(& h("123481800001000100000000076578616d706c6503636f6d0000010001c00c000100010000012c00045db8d822"), 29, & mut nm);
+    println("pointer name: " + nm + " next " + int_to_str(after));
+
+    println("v6: " + ipv6_to_str(& ipv6_parse("2001:0db8:0000:0000:0000:ff00:0042:8329")) + " " + ipv6_to_str(& ipv6_parse("::")) + " " + ipv6_to_str(& ipv6_parse("::1")) + " " + ipv6_to_str(& ipv6_parse("1:0:0:2:0:0:0:3")) + " " + ipv6_to_str(& ipv6_parse("1:0:2:3:4:5:6:7")));
+    println("bad parses: " + int_to_str(ipv6_parse("1::2::3").len()) + " " + int_to_str(ipv4_parse("1.2.3.256").len()) + " " + int_to_str(mac_parse("00:11").len()));
+    return 0;
+}

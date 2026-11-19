@@ -1,0 +1,654 @@
+// Fides Complex standard library
+//
+// Complex numbers as a pair of f64: `Complex { re, im }` is re + im*i.
+// Arithmetic, polar form, the elementary functions on their principal
+// branches, comparison with a tolerance and text.
+//
+// Usage:
+//   use complex;
+//   val z = complex(3.0, 4.0);
+//   println(complex_to_str(z));                          // 3+4i
+//   println(float_to_str(complex_abs(z)));               // 5
+//   val w = complex_div(complex(1.0, 0.0), z);           // 0.12-0.16i
+//   val i = complex_sqrt(complex(-1.0, 0.0));            // i
+//
+// Care is taken where the plain formulas fail:
+// - `complex_abs` is a hypot that neither overflows nor underflows when
+//   |z| itself is representable (3e300 + 4e300i has modulus 5e300);
+// - `complex_div` is Smith's algorithm on operands scaled by powers of two,
+//   so dividing by a value with a huge (or tiny) component does not
+//   overflow to infinity or lose everything to zero;
+// - `complex_sqrt` uses the stable form (no cancellation for negative
+//   real parts) and scales huge inputs;
+// - `complex_arg` is a full-precision atan2 written in Fides (Cephes'
+//   atan), so it gives the same bits on every backend.
+//
+// Branch cuts: `complex_arg`, `complex_ln` and `complex_sqrt` cut along the
+// negative real axis; the argument is in (-pi, pi], and a negative real
+// with a zero imaginary part has argument +pi (the sign of a zero is not
+// looked at).
+
+module complex;
+use math;
+
+// ─── The type ───
+
+/// A complex number re + im*i.
+///
+/// Example:
+///   val z = Complex { re: 1.0, im: -2.0 };
+///   assert(z.re == 1.0 && z.im == -2.0);
+pub struct Complex {
+    pub re: f64,
+    pub im: f64,
+}
+
+// ─── Constants and constructors ───
+
+/// The complex number re + im*i.
+///
+/// Example:
+///   val z = complex(3.0, 4.0);
+///   assert(z.re == 3.0);
+///   assert(z.im == 4.0);
+pub fn complex(re: f64, im: f64) -> Complex {
+    return Complex {
+        re: re, im: im
+    };
+}
+
+/// The real number x as a complex number (x + 0i).
+///
+/// Example:
+///   val z = complex_from_real(2.5);
+///   assert(z.re == 2.5 && z.im == 0.0);
+pub fn complex_from_real(x: f64) -> Complex {
+    return complex(x, 0.0);
+}
+
+/// The complex number with modulus r and argument theta (radians):
+/// r*cos(theta) + r*sin(theta)*i.
+///
+/// Example:
+///   val z = complex_from_polar(2.0, math_pi() / 2.0);
+///   assert(complex_approx_eq(z, complex(0.0, 2.0), 0.000000000001));
+pub fn complex_from_polar(r: f64, theta: f64) -> Complex {
+    return complex(r * math_cos(theta), r * math_sin(theta));
+}
+
+/// 0 + 0i.
+///
+/// Example:
+///   assert(complex_eq(complex_zero(), complex(0.0, 0.0)));
+pub fn complex_zero() -> Complex {
+    return complex(0.0, 0.0);
+}
+
+/// 1 + 0i.
+///
+/// Example:
+///   assert(complex_eq(complex_mul(complex_one(), complex(2.0, 3.0)), complex(2.0, 3.0)));
+pub fn complex_one() -> Complex {
+    return complex(1.0, 0.0);
+}
+
+/// The imaginary unit i (0 + 1i).
+///
+/// Example:
+///   val m = complex_mul(complex_i(), complex_i());
+///   assert(complex_eq(m, complex(-1.0, 0.0)));
+pub fn complex_i() -> Complex {
+    return complex(0.0, 1.0);
+}
+
+// ─── Arithmetic ───
+
+/// a + b.
+///
+/// Example:
+///   val s = complex_add(complex(1.0, 2.0), complex(3.0, -5.0));
+///   assert(complex_eq(s, complex(4.0, -3.0)));
+pub fn complex_add(a: Complex, b: Complex) -> Complex {
+    return complex(a.re + b.re, a.im + b.im);
+}
+
+/// a - b.
+///
+/// Example:
+///   val d = complex_sub(complex(1.0, 2.0), complex(3.0, -5.0));
+///   assert(complex_eq(d, complex(-2.0, 7.0)));
+pub fn complex_sub(a: Complex, b: Complex) -> Complex {
+    return complex(a.re - b.re, a.im - b.im);
+}
+
+/// a * b = (ac - bd) + (ad + bc)i.
+///
+/// Example:
+///   val p = complex_mul(complex(1.0, 2.0), complex(3.0, 4.0));
+///   assert(complex_eq(p, complex(-5.0, 10.0)));
+pub fn complex_mul(a: Complex, b: Complex) -> Complex {
+    return complex(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+
+/// z * k for a real k.
+///
+/// Example:
+///   assert(complex_eq(complex_scale(complex(1.0, -2.0), 3.0), complex(3.0, -6.0)));
+pub fn complex_scale(z: Complex, k: f64) -> Complex {
+    return complex(z.re * k, z.im * k);
+}
+
+/// a / b by Smith's algorithm on operands scaled by powers of two (exact
+/// scalings), so neither a huge nor a tiny component of `b` overflows or
+/// underflows an intermediate value when the quotient is representable.
+/// Dividing by 0 gives infinite or NaN parts, as f64 division does.
+///
+/// Example:
+///   val q = complex_div(complex(-5.0, 10.0), complex(3.0, 4.0));
+///   assert(complex_approx_eq(q, complex(1.0, 2.0), 0.000000000000001));
+///   val h = complex_div(complex(1.0e300, 1.0e300), complex(1.0e308, 1.0e308));
+///   assert(complex_approx_eq(h, complex(0.00000001, 0.0), 0.000000000000001));
+pub fn complex_div(a: Complex, b: Complex) -> Complex {
+    var c: f64 = b.re;
+    var d: f64 = b.im;
+    var ma: f64 = cx_max(math_fabs(a.re), math_fabs(a.im));
+    var mb: f64 = cx_max(math_fabs(c), math_fabs(d));
+    if !cx_finite(ma) || !cx_finite(mb) || mb == 0.0 || ma == 0.0 {
+        return cx_smith(a.re, a.im, c, d);
+    }
+    // a = a' * 2^ea, b = b' * 2^eb with |a'|, |b'| in [1, 2): the quotient
+    // of the scaled values is near 1, then 2^(ea - eb) puts it back.
+    var ea: i64 = cx_ilogb(ma);
+    var eb: i64 = cx_ilogb(mb);
+    var q: Complex = cx_smith(cx_ldexp(a.re, 0 - ea), cx_ldexp(a.im, 0 - ea), cx_ldexp(c, 0 - eb), cx_ldexp(d, 0 - eb));
+    return complex(cx_ldexp(q.re, ea - eb), cx_ldexp(q.im, ea - eb));
+}
+
+/// 1 / z (`complex_div(complex_one(), z)`).
+///
+/// Example:
+///   assert(complex_approx_eq(complex_recip(complex(0.0, 2.0)), complex(0.0, -0.5), 0.000000000000001));
+pub fn complex_recip(z: Complex) -> Complex {
+    return complex_div(complex_one(), z);
+}
+
+/// -z.
+///
+/// Example:
+///   assert(complex_eq(complex_neg(complex(1.0, -2.0)), complex(-1.0, 2.0)));
+pub fn complex_neg(z: Complex) -> Complex {
+    return complex(0.0 - z.re, 0.0 - z.im);
+}
+
+/// The conjugate re - im*i.
+///
+/// Example:
+///   assert(complex_eq(complex_conj(complex(1.0, 2.0)), complex(1.0, -2.0)));
+pub fn complex_conj(z: Complex) -> Complex {
+    return complex(z.re, 0.0 - z.im);
+}
+
+// ─── Polar form ───
+
+/// The modulus |z| = sqrt(re^2 + im^2), computed without overflow or
+/// underflow of the squares (a hypot): |3e300 + 4e300i| is 5e300.
+///
+/// Example:
+///   assert(complex_abs(complex(3.0, 4.0)) == 5.0);
+///   val big = complex_abs(complex(3.0e300, 4.0e300));
+///   assert(math_fabs(big / 5.0e300 - 1.0) < 0.000000000000001);
+pub fn complex_abs(z: Complex) -> f64 {
+    return cx_hypot(z.re, z.im);
+}
+
+/// re^2 + im^2 (the squared modulus; can overflow where `complex_abs`
+/// does not).
+///
+/// Example:
+///   assert(complex_norm(complex(3.0, 4.0)) == 25.0);
+pub fn complex_norm(z: Complex) -> f64 {
+    return z.re * z.re + z.im * z.im;
+}
+
+/// The argument of z in radians, in (-pi, pi] (atan2(im, re)); 0 for 0.
+///
+/// Example:
+///   assert(math_fabs(complex_arg(complex(0.0, 1.0)) - math_pi() / 2.0) < 0.000000000000001);
+///   assert(complex_arg(complex(-1.0, 0.0)) == math_pi());
+pub fn complex_arg(z: Complex) -> f64 {
+    return cx_atan2(z.im, z.re);
+}
+
+// ─── Elementary functions ───
+
+/// e^z = e^re * (cos(im) + i*sin(im)).
+///
+/// Example:
+///   val e = complex_exp(complex(0.0, math_pi()));
+///   assert(complex_approx_eq(e, complex(-1.0, 0.0), 0.000000000000001));
+pub fn complex_exp(z: Complex) -> Complex {
+    val m: f64 = math_exp(z.re);
+    if z.im == 0.0 {
+        return complex(m, 0.0);
+    }
+    return complex(m * math_cos(z.im), m * math_sin(z.im));
+}
+
+/// The principal natural logarithm ln|z| + i*arg(z); the imaginary part is
+/// in (-pi, pi]. ln(0) has a real part of -infinity.
+///
+/// Example:
+///   val l = complex_ln(complex(-1.0, 0.0));
+///   assert(complex_approx_eq(l, complex(0.0, math_pi()), 0.000000000000001));
+pub fn complex_ln(z: Complex) -> Complex {
+    return complex(math_log(cx_hypot(z.re, z.im)), cx_atan2(z.im, z.re));
+}
+
+/// The principal value of a^b = e^(b * ln a). 0^0 is 1; 0^b is 0 when the
+/// real part of b is positive, NaN otherwise.
+///
+/// Example:
+///   val p = complex_pow(complex(0.0, 1.0), complex(2.0, 0.0));
+///   assert(complex_approx_eq(p, complex(-1.0, 0.0), 0.000000000000001));
+///   val ii = complex_pow(complex_i(), complex_i());
+///   assert(complex_approx_eq(ii, complex(math_exp(0.0 - math_pi() / 2.0), 0.0), 0.000000000000001));
+pub fn complex_pow(a: Complex, b: Complex) -> Complex {
+    if a.re == 0.0 && a.im == 0.0 {
+        if b.re == 0.0 && b.im == 0.0 {
+            return complex_one();
+        }
+        if b.re > 0.0 {
+            return complex_zero();
+        }
+        val zero: f64 = 0.0;
+        return complex(zero / zero, zero / zero);
+    }
+    return complex_exp(complex_mul(b, complex_ln(a)));
+}
+
+/// The principal square root: real part >= 0, and the imaginary part has
+/// the sign of z's (a zero counts as positive), so sqrt(-1) is i. Stable
+/// for negative real parts and scaled for huge inputs.
+///
+/// Example:
+///   assert(complex_eq(complex_sqrt(complex(-1.0, 0.0)), complex(0.0, 1.0)));
+///   assert(complex_eq(complex_sqrt(complex(-4.0, 0.0)), complex(0.0, 2.0)));
+///   val r = complex_sqrt(complex(3.0, -4.0));
+///   assert(complex_approx_eq(r, complex(2.0, -1.0), 0.000000000000001));
+pub fn complex_sqrt(z: Complex) -> Complex {
+    val x: f64 = z.re;
+    val y: f64 = z.im;
+    if x == 0.0 && y == 0.0 {
+        return complex(0.0, y);
+    }
+    val m: f64 = cx_max(math_fabs(x), math_fabs(y));
+    if cx_finite(m) && m > 1.0e300 {
+        // sqrt(z) = 2 * sqrt(z / 4): |x| + |z| would overflow
+        val s: Complex = complex_sqrt(complex(x * 0.25, y * 0.25));
+        return complex(s.re * 2.0, s.im * 2.0);
+    }
+    if m < 1.0e-300 {
+        // scale by 2^600 (an even power, so the root scales by 2^300)
+        val s: Complex = complex_sqrt(complex(cx_ldexp(x, 600), cx_ldexp(y, 600)));
+        return complex(cx_ldexp(s.re, - 300), cx_ldexp(s.im, - 300));
+    }
+    val t: f64 = math_sqrt((math_fabs(x) + cx_hypot(x, y)) * 0.5);
+    if x >= 0.0 {
+        return complex(t, y / (2.0 * t));
+    }
+    if y < 0.0 {
+        return complex(math_fabs(y) / (2.0 * t), 0.0 - t);
+    }
+    return complex(math_fabs(y) / (2.0 * t), t);
+}
+
+/// sin z = sin(re)*cosh(im) + i*cos(re)*sinh(im).
+///
+/// Example:
+///   assert(complex_approx_eq(complex_sin(complex(math_pi() / 2.0, 0.0)), complex_one(), 0.000000000000001));
+///   val s = complex_sin(complex(0.0, 1.0));
+///   assert(complex_approx_eq(s, complex(0.0, 1.1752011936438014), 0.000000000000001));
+pub fn complex_sin(z: Complex) -> Complex {
+    return complex(math_sin(z.re) * cx_cosh(z.im), math_cos(z.re) * cx_sinh(z.im));
+}
+
+/// cos z = cos(re)*cosh(im) - i*sin(re)*sinh(im).
+///
+/// Example:
+///   assert(complex_approx_eq(complex_cos(complex_zero()), complex_one(), 0.0));
+///   val c = complex_cos(complex(0.0, 1.0));
+///   assert(complex_approx_eq(c, complex(1.5430806348152437, 0.0), 0.000000000000001));
+pub fn complex_cos(z: Complex) -> Complex {
+    return complex(math_cos(z.re) * cx_cosh(z.im), 0.0 - math_sin(z.re) * cx_sinh(z.im));
+}
+
+// ─── Comparison and text ───
+
+/// Exact equality of both parts (0.0 equals -0.0; NaN equals nothing).
+///
+/// Example:
+///   assert(complex_eq(complex(1.0, 2.0), complex(1.0, 2.0)));
+///   assert(!complex_eq(complex(1.0, 2.0), complex(1.0, 2.5)));
+pub fn complex_eq(a: Complex, b: Complex) -> bool {
+    return a.re == b.re && a.im == b.im;
+}
+
+/// True when |a - b| <= tol * max(1, |a|, |b|): an absolute tolerance near
+/// zero, a relative one for large values. NaN is near nothing.
+///
+/// Example:
+///   assert(complex_approx_eq(complex(1.0, 1.0), complex(1.0, 1.0000000001), 0.000000001));
+///   assert(!complex_approx_eq(complex(1.0, 1.0), complex(1.0, 1.001), 0.000000001));
+///   assert(complex_approx_eq(complex(1.0e20, 0.0), complex(1.0e20 + 1.0e10, 0.0), 0.000000001));
+pub fn complex_approx_eq(a: Complex, b: Complex, tol: f64) -> bool {
+    val d: f64 = cx_hypot(a.re - b.re, a.im - b.im);
+    var scale: f64 = cx_max(cx_hypot(a.re, a.im), cx_hypot(b.re, b.im));
+    if scale < 1.0 {
+        scale = 1.0;
+    }
+    return d <= tol * scale;
+}
+
+/// True when both parts are finite (not infinite, not NaN).
+///
+/// Example:
+///   assert(complex_is_finite(complex(1.0, -1.0)));
+///   val zero: f64 = 0.0;
+///   assert(!complex_is_finite(complex(1.0 / zero, 0.0)));
+pub fn complex_is_finite(z: Complex) -> bool {
+    return cx_finite(z.re) && cx_finite(z.im);
+}
+
+/// "re+imi" or "re-imi" with each part as `float_to_str` writes it:
+/// complex(3.0, -4.0) is "3-4i". Infinite parts are "inf"/"-inf", NaN is
+/// "nan".
+///
+/// Example:
+///   assert_eq(complex_to_str(complex(3.0, -4.0)), "3-4i");
+///   assert_eq(complex_to_str(complex(0.5, 2.0)), "0.5+2i");
+pub fn complex_to_str(z: Complex) -> str {
+    var im: f64 = z.im;
+    var sign: str = "+";
+    if im < 0.0 {
+        sign = "-";
+        im = 0.0 - im;
+    }
+    return cx_float_str(z.re) + sign + cx_float_str(im) + "i";
+}
+
+/// "re+imi" with each part rounded to `decimals` places (half away from
+/// zero), the same text on every backend; a part that rounds to zero has no
+/// sign. Parts of 1e15 or more (or that are not finite) are written as
+/// `complex_to_str` writes them.
+///
+/// Example:
+///   assert_eq(complex_to_str_prec(complex(1.0 / 3.0, -2.0 / 3.0), 4), "0.3333-0.6667i");
+///   assert_eq(complex_to_str_prec(complex(-0.00001, 2.5), 2), "0.00+2.50i");
+pub fn complex_to_str_prec(z: Complex, decimals: i64) -> str {
+    var im: str = cx_fixed(z.im, decimals);
+    var sign: str = "+";
+    if str_starts_with(im, "-") {
+        sign = "-";
+        im = str_slice(im, 1, str_len(im));
+    }
+    return cx_fixed(z.re, decimals) + sign + im + "i";
+}
+
+// ─── Helpers ───
+
+fn cx_max(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+/// Not infinite and not NaN.
+fn cx_finite(x: f64) -> bool {
+    return x == x && x <= 1.7976931348623157e308 && x >= - 1.7976931348623157e308;
+}
+
+/// floor(log2(m)) for a finite m > 0, by exact power-of-two steps.
+fn cx_ilogb(m: f64) -> i64 {
+    var x: f64 = m;
+    var e: i64 = 0;
+    val big: f64 = cx_pow2_64();
+    val small: f64 = 1.0 / big;
+    var more: bool = true;
+    while more {
+        if x >= big {
+            x = x * small;
+            e = e + 64;
+        } else if x >= 2.0 {
+            x = x * 0.5;
+            e = e + 1;
+        } else if x < small {
+            x = x * big;
+            e = e - 64;
+        } else if x < 1.0 {
+            x = x * 2.0;
+            e = e - 1;
+        } else {
+            more = false;
+        }
+    }
+    return e;
+}
+
+/// 2^64, exactly.
+fn cx_pow2_64() -> f64 {
+    var p: f64 = 2.0;
+    var i: i64 = 0;
+    while i < 6 {
+        p = p * p;
+        i = i + 1;
+    }
+    return p;
+}
+
+/// x * 2^k by exact steps: when the result is representable, no step
+/// overflows (the steps move monotonically toward it).
+fn cx_ldexp(x: f64, k: i64) -> f64 {
+    var r: f64 = x;
+    var n: i64 = k;
+    val big: f64 = cx_pow2_64();
+    val small: f64 = 1.0 / big;
+    while n != 0 {
+        if n >= 64 {
+            r = r * big;
+            n = n - 64;
+        } else if n <= - 64 {
+            r = r * small;
+            n = n + 64;
+        } else if n > 0 {
+            r = r * 2.0;
+            n = n - 1;
+        } else {
+            r = r * 0.5;
+            n = n + 1;
+        }
+    }
+    return r;
+}
+
+/// Smith's division (a + bi) / (c + di), unscaled.
+fn cx_smith(a: f64, b: f64, c: f64, d: f64) -> Complex {
+    if math_fabs(c) >= math_fabs(d) {
+        if c == 0.0 && d == 0.0 {
+            return complex(a / c, b / c);
+        }
+        val r: f64 = d / c;
+        val den: f64 = c + d * r;
+        return complex((a + b * r) / den, (b - a * r) / den);
+    }
+    val r: f64 = c / d;
+    val den: f64 = c * r + d;
+    return complex((a * r + b) / den, (b * r - a) / den);
+}
+
+/// sqrt(x^2 + y^2) without overflow or underflow of the squares.
+fn cx_hypot(x: f64, y: f64) -> f64 {
+    var a: f64 = math_fabs(x);
+    var b: f64 = math_fabs(y);
+    if a > 1.7976931348623157e308 || b > 1.7976931348623157e308 {
+        return a + b;
+    }
+    if a != a || b != b {
+        return a + b;
+    }
+    if a < b {
+        val t: f64 = a;
+        a = b;
+        b = t;
+    }
+    if a == 0.0 {
+        return 0.0;
+    }
+    val r: f64 = b / a;
+    return a * math_sqrt(1.0 + r * r);
+}
+
+/// atan(x) for x >= 0 (Cephes atan.c: range reduction, then a rational
+/// approximation good to the last bit).
+fn cx_atan_pos(xin: f64) -> f64 {
+    var x: f64 = xin;
+    var y: f64 = 0.0;
+    var flag: i64 = 0;
+    val pio2: f64 = 1.57079632679489661923;
+    val pio4: f64 = 0.785398163397448309616;
+    if x > 2.41421356237309504880 {
+        y = pio2;
+        flag = 1;
+        x = 0.0 - 1.0 / x;
+    } else if x > 0.66 {
+        y = pio4;
+        flag = 2;
+        x = (x - 1.0) / (x + 1.0);
+    }
+    val z: f64 = x * x;
+    val p: f64 = (((- 0.8750608600031904122785 * z - 16.15753718733365076637) * z - 75.00855792314704667340) * z - 122.8866684490136173410) * z - 64.85021904942025371773;
+    val q: f64 = ((((z + 24.85846490142306297962) * z + 165.0270098316988542046) * z + 432.8810604912902668951) * z + 485.3903996359136964868) * z + 194.5506571482613964425;
+    var w: f64 = z * p / q;
+    w = x * w + x;
+    if flag == 1 {
+        w = w + 0.00000000000000006123233995736765886130;
+    } else if flag == 2 {
+        w = w + 0.5 * 0.00000000000000006123233995736765886130;
+    }
+    return y + w;
+}
+
+/// atan2(y, x) in (-pi, pi]; 0 for (0, 0).
+fn cx_atan2(y: f64, x: f64) -> f64 {
+    val pi: f64 = 3.14159265358979323846;
+    if y != y || x != x {
+        return x + y;
+    }
+    if x == 0.0 {
+        if y > 0.0 {
+            return pi / 2.0;
+        }
+        if y < 0.0 {
+            return 0.0 - pi / 2.0;
+        }
+        return 0.0;
+    }
+    if y == 0.0 {
+        if x > 0.0 {
+            return 0.0;
+        }
+        return pi;
+    }
+    val ay: f64 = math_fabs(y);
+    val ax: f64 = math_fabs(x);
+    var a: f64 = 0.0;
+    if ax > 1.7976931348623157e308 && ay > 1.7976931348623157e308 {
+        a = pi / 4.0;
+    } else if ax > 1.7976931348623157e308 {
+        a = 0.0;
+    } else if ay > 1.7976931348623157e308 {
+        a = pi / 2.0;
+    } else {
+        a = cx_atan_pos(ay / ax);
+    }
+    if x < 0.0 {
+        a = pi - a;
+    }
+    if y < 0.0 {
+        return 0.0 - a;
+    }
+    return a;
+}
+
+/// sinh(x), by its series near 0 (no cancellation in e^x - e^-x).
+fn cx_sinh(x: f64) -> f64 {
+    if math_fabs(x) < 0.5 {
+        val z: f64 = x * x;
+        // x * (1 + z/3! + z^2/5! + ... + z^8/17!)
+        val s: f64 = 1.0 + z / 6.0 * (1.0 + z / 20.0 * (1.0 + z / 42.0 * (1.0 + z / 72.0 * (1.0 + z / 110.0 * (1.0 + z / 156.0 * (1.0 + z / 210.0 * (1.0 + z / 272.0)))))));
+        return x * s;
+    }
+    val e: f64 = math_exp(x);
+    return (e - 1.0 / e) * 0.5;
+}
+
+/// cosh(x).
+fn cx_cosh(x: f64) -> f64 {
+    val e: f64 = math_exp(x);
+    return (e + 1.0 / e) * 0.5;
+}
+
+/// float_to_str, with "inf", "-inf" and "nan" for the values it cannot
+/// write.
+fn cx_float_str(x: f64) -> str {
+    if x != x {
+        return "nan";
+    }
+    if x > 1.7976931348623157e308 {
+        return "inf";
+    }
+    if x < - 1.7976931348623157e308 {
+        return "-inf";
+    }
+    if x == 0.0 {
+        return "0";
+    }
+    return float_to_str(x);
+}
+
+/// x rounded to `decimals` places (half away from zero) as fixed-point text.
+fn cx_fixed(x: f64, decimals: i64) -> str {
+    var dp: i64 = decimals;
+    if dp < 0 {
+        dp = 0;
+    }
+    if dp > 15 {
+        dp = 15;
+    }
+    if !cx_finite(x) || math_fabs(x) >= 1.0e15 {
+        return cx_float_str(x);
+    }
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < dp {
+        p = p * 10;
+        i = i + 1;
+    }
+    val scaled: f64 = math_fabs(x) * (p as f64) + 0.5;
+    if scaled >= 9.0e18 {
+        return cx_float_str(x);
+    }
+    val v: i64 = math_floor(scaled) as i64;
+    var out: str = int_to_str(v / p);
+    if dp > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < dp {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}

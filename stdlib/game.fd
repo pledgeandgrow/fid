@@ -26,7 +26,7 @@
 //   }
 
 module game;
- use ecs; use arena;
+ use arena; use ecs; use image; use font;
 // ─── Game loop ───────────────────────────────────────────────────────────
 
 /// Game configuration — timing, window, etc.
@@ -41,6 +41,17 @@ pub struct GameConfig {
 }
 
 /// Create a default game configuration.
+///
+/// Example:
+///   val c = game_config_new();
+///   assert_eq(c.target_fps, 60);
+///   val c4 = game_config_with_fps(4);
+///   assert(c4.frame_time == 0.25);
+///   val (x, y) = physics_move(1.0, 2.0, 4.0, -8.0, 0.5);
+///   assert(x == 3.0);
+///   assert(y == -2.0);
+///   assert(physics_aabb_overlap(0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0));
+///   assert(!physics_aabb_overlap(0.0, 0.0, 1.0, 1.0, 5.0, 5.0, 1.0, 1.0));
 pub fn game_config_new() -> GameConfig {
     return GameConfig {
         target_fps: 60, frame_time: 0.016666666666666666, max_entities: 10000, running: true,
@@ -118,44 +129,141 @@ pub fn load_model(path: str) -> AssetHandle {
 /// Input event types.
 const INPUT_KEY_DOWN: i64 = 1; const INPUT_KEY_UP: i64 = 2; const INPUT_MOUSE_MOVE: i64 = 3; const INPUT_MOUSE_DOWN: i64 = 4; const INPUT_MOUSE_UP: i64 = 5;
 /// Dispatch a key down event.
-pub fn input_key_down(key: i64) -> void {
+pub fn input_key_down(_key: i64) -> void {
     ecs_dispatch_event("on_key_down");
 }
 
 /// Dispatch a key up event.
-pub fn input_key_up(key: i64) -> void {
+pub fn input_key_up(_key: i64) -> void {
     ecs_dispatch_event("on_key_up");
 }
 
 /// Dispatch a mouse move event.
-pub fn input_mouse_move(x: i64, y: i64) -> void {
+pub fn input_mouse_move(_x: i64, _y: i64) -> void {
     ecs_dispatch_event("on_mouse_move");
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────
 //
-// Rendering is done via the plot module (for 2D) or via GPU shaders
-// (for 3D). The game engine provides a simple 2D rendering API.
+// Software framebuffer: render_* functions draw into a module-owned RGBA
+// Image. render_present() saves it to "frame.png"; render_present_to(path)
+// chooses the file (PNG by extension, BMP otherwise). GPU backends can
+// replace this layer later; everything below is real and testable.
 
-/// Clear the screen with a color.
-pub fn render_clear(r: f64, g: f64, b: f64) -> void {  // In a real implementation, this would call the GPU.
-// For now, it's a no-op.
+var GAME_FB: Image = image_create(0, 0, 4);
+var GAME_FB_PATH: str = "frame.png";
+
+fn game_ensure_fb() -> void {
+    // Lazily allocate the default 320x240 surface so importing the module
+    // costs nothing.
+    if GAME_FB.width == 0 {
+        GAME_FB = image_create(320, 240, 4);
+    }
 }
 
-/// Draw a rectangle.
-pub fn render_rect(x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64) -> void {  // No-op placeholder
+/// Resize the software framebuffer (default 320x240, allocated lazily).
+pub fn render_init(w: i64, h: i64) -> void {
+    if w > 0 && h > 0 {
+        GAME_FB = image_create(w, h, 4);
+    }
 }
 
-/// Draw a circle.
-pub fn render_circle(x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64) -> void {  // No-op placeholder
+/// Borrow the framebuffer Image (e.g. to save it yourself).
+pub fn game_framebuffer() -> & Image {
+    return & GAME_FB;
 }
 
-/// Draw text.
-pub fn render_text(x: f64, y: f64, text: str) -> void {  // No-op placeholder
+fn game_chan(c: f64) -> i64 {
+    var v: i64 = (c * 255.0) as i64;
+    if v < 0 { v = 0; }
+    if v > 255 { v = 255; }
+    return v;
 }
 
-/// Present the rendered frame to the screen.
-pub fn render_present() -> void {  // No-op placeholder
+/// Clear the screen with a color (channels are 0.0-1.0 floats).
+pub fn render_clear(r: f64, g: f64, b: f64) -> void {
+    game_ensure_fb();
+    image_fill(& mut GAME_FB, game_chan(r), game_chan(g), game_chan(b), 255);
+}
+
+/// Draw a filled rectangle.
+pub fn render_rect(x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64) -> void {
+    game_ensure_fb();
+    var py: i64 = y as i64;
+    val yend: i64 = (y + h) as i64;
+    val xend: i64 = (x + w) as i64;
+    while py < yend {
+        var px: i64 = x as i64;
+        while px < xend {
+            image_set_pixel(& mut GAME_FB, px, py, game_chan(r), game_chan(g), game_chan(b), 255);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+/// Draw a filled circle.
+pub fn render_circle(x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64) -> void {
+    game_ensure_fb();
+    val r2: f64 = radius * radius;
+    var py: i64 = (y - radius) as i64;
+    while (py as f64) <= y + radius {
+        var px: i64 = (x - radius) as i64;
+        while (px as f64) <= x + radius {
+            val dx: f64 = (px as f64) - x;
+            val dy: f64 = (py as f64) - y;
+            if dx * dx + dy * dy <= r2 {
+                image_set_pixel(& mut GAME_FB, px, py, game_chan(r), game_chan(g), game_chan(b), 255);
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+/// Draw text using the built-in 8x8 bitmap font.
+pub fn render_text(x: f64, y: f64, text: str) -> void {
+    game_ensure_fb();
+    var i: i64 = 0;
+    val len: i64 = str_len(text);
+    while i < len {
+        val glyph: i64 = font8x8_glyph(str_byte_at(text, i));
+        var gy: i64 = 0;
+        while gy < 8 {
+            val rowbyte: i64 = (glyph >> (gy * 8)) & 255;
+            var gx: i64 = 0;
+            while gx < 8 {
+                if ((rowbyte >> gx) & 1) != 0 {
+                    image_set_pixel(& mut GAME_FB, x as i64 + i * 8 + gx, y as i64 + gy, 255, 255, 255, 255);
+                }
+                gx = gx + 1;
+            }
+            gy = gy + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// Present the frame: saves the framebuffer to "frame.png" (or the path
+/// set by render_set_output). Returns file_write_bytes' status.
+pub fn render_present() -> void {
+    game_ensure_fb();
+    image_save_png(& GAME_FB, GAME_FB_PATH);
+}
+
+/// Present the frame to a specific file (.png or .bmp by extension).
+pub fn render_present_to(path: str) -> void {
+    game_ensure_fb();
+    if str_ends_with(path, ".bmp") {
+        image_save_bmp(& GAME_FB, path);
+    } else {
+        image_save_png(& GAME_FB, path);
+    }
+}
+
+/// Set the file render_present() writes to.
+pub fn render_set_output(path: str) -> void {
+    GAME_FB_PATH = path;
 }
 
 // ─── Scripting via comptime gen ───────────────────────────────────────────
@@ -178,7 +286,7 @@ pub fn render_present() -> void {  // No-op placeholder
 
 /// Compile a game script. In comptime mode, this generates native code.
 /// For now, it's a no-op (scripts are compiled normally).
-pub fn compile_script(source: str) -> void {  // In comptime mode, this would generate and compile the script.
+pub fn compile_script(_source: str) -> void {  // In comptime mode, this would generate and compile the script.
 // For now, scripts are compiled as part of the main program.
 }
 

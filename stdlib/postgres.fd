@@ -1,0 +1,1343 @@
+// Fides PostgreSQL driver: the frontend/backend wire protocol, version 3.0
+// (https://www.postgresql.org/docs/current/protocol.html), in Fides over a
+// TCP socket, so no libpq is needed and native builds have it.
+//
+//   - startup: the StartupMessage (user, database, client_encoding UTF8),
+//     ParameterStatus, BackendKeyData, ReadyForQuery;
+//   - authentication: trust, cleartext password, MD5 (the legacy
+//     "md5" + md5(md5(password + user) + salt) form) and SCRAM-SHA-256
+//     (RFC 5802 / RFC 7677, the default since PostgreSQL 14), the server's
+//     signature checked before the connection is used;
+//   - the simple query protocol (`pg_query`: one or more statements, no
+//     parameters) and the extended one with parameter binding
+//     (`pg_query_params`: Parse, Bind, Describe, Execute, Sync; `$1`, `$2`
+//     ... are sent apart from the SQL as text values, so a value is data,
+//     never SQL; `pg_query_params_nulls` also binds SQL NULLs);
+//   - TLS: SSLRequest, then the TLS handshake on the same socket, through a
+//     transport seam (`PgIo`) that module `postgres_tls` fills from module
+//     `tls` (`pg_connect_tls`, sslmode prefer or require, the server's
+//     certificate and name always checked); this module itself needs no
+//     TLS library;
+//   - module `postgres_db` makes PgConn a `Database` (module db);
+//   - results: RowDescription and DataRow as a JSON array of objects, as
+//     module `sqlite` gives them (numbers and booleans by column type, json
+//     and jsonb columns as they are, NULL as null, the rest as strings),
+//     CommandComplete's tag and row count, ErrorResponse with its severity,
+//     SQLSTATE and message.
+//
+// Usage:
+//   use postgres;
+//   var c: PgConn = pg_connect("127.0.0.1", 5432, "app", "secret", "appdb");
+//   if !c.ok { println(c.error); return 1; }
+//   pg_exec(& c, "CREATE TABLE t (id int, name text)");
+//   val ins: PgResult = pg_query_params(& c, "INSERT INTO t VALUES ($1, $2)", args);
+//   val r: PgResult = pg_query(& c, "SELECT * FROM t");
+//   println(r.rows);          // [{"id":1,"name":"Ada"}]
+//   pg_close(& mut c);
+//
+// Every message builder and parser works on byte vectors (Vec<i64>, values
+// 0..255) and a connection with fd -1 only queues what it would send, so
+// the protocol is checked without a server (tests/bootstrap/
+// test_stdlib_postgres.fd).
+//
+// LIMITATIONS: no SCRAM-SHA-256-PLUS channel binding (over TLS the plain
+// SCRAM-SHA-256 is used), no TLS without a certificate check (libpq's
+// sslmode=require without verify), no direct TLS (PostgreSQL 17's
+// sslnegotiation=direct), parameters are sent as text (the server converts
+// them; NULL through pg_query_params_nulls), results are text format, passwords are not
+// SASLprep-normalized (ASCII passwords are unaffected), no COPY, no
+// LISTEN/NOTIFY delivery (notifications are read and dropped), no cancel
+// requests. An asynchronous message that arrives in the same read as a
+// ReadyForQuery is dropped with that read's buffer.
+
+module postgres;
+ use vec; use crypto; use encoding; use json; use trace;
+
+// ─── Constants ────────────────────────────────────────────────────────────
+
+/// Protocol version 3.0 (major 3 in the high 16 bits).
+pub const PG_PROTOCOL_3: i64 = 196608;
+/// How long a read waits for the server (ms).
+const PG_TIMEOUT_MS: i64 = 30000;
+/// Largest message we take (the server's own limit is 1 GB).
+const PG_MAX_MESSAGE: i64 = 268435456;
+
+// Message tags (one byte; frontend and backend share some letters)
+pub const PG_AUTH: i64 = 82;             // 'R' Authentication*
+pub const PG_PARAMETER_STATUS: i64 = 83; // 'S' (frontend: Sync)
+pub const PG_BACKEND_KEY: i64 = 75;      // 'K'
+pub const PG_READY: i64 = 90;            // 'Z' ReadyForQuery
+pub const PG_ROW_DESCRIPTION: i64 = 84;  // 'T'
+pub const PG_DATA_ROW: i64 = 68;         // 'D' (frontend: Describe)
+pub const PG_COMMAND_COMPLETE: i64 = 67; // 'C'
+pub const PG_ERROR: i64 = 69;            // 'E' (frontend: Execute)
+pub const PG_NOTICE: i64 = 78;           // 'N'
+pub const PG_EMPTY_QUERY: i64 = 73;      // 'I'
+
+/// The SSLRequest code: 1234 in the high 16 bits, 5679 in the low ones.
+pub const PG_SSL_REQUEST_CODE: i64 = 80877103;
+/// sslmode: never ask for TLS.
+pub const PG_SSL_DISABLE: i64 = 0;
+/// sslmode: TLS when the server has it, in clear when it answers 'N'.
+pub const PG_SSL_PREFER: i64 = 1;
+/// sslmode: TLS or no connection.
+pub const PG_SSL_REQUIRE: i64 = 2;
+
+// Type OIDs whose text is written into JSON as it is
+const PG_BOOL: i64 = 16; const PG_INT8: i64 = 20; const PG_INT2: i64 = 21; const PG_INT4: i64 = 23; const PG_OID: i64 = 26; const PG_JSON: i64 = 114; const PG_FLOAT4: i64 = 700; const PG_FLOAT8: i64 = 701; const PG_NUMERIC: i64 = 1700; const PG_JSONB: i64 = 3802;
+
+// ─── Bytes ────────────────────────────────────────────────────────────────
+
+fn pg_put_i32(b: & mut Vec<i64>, v: i64) {
+    b.push((v >> 24) & 255);
+    b.push((v >> 16) & 255);
+    b.push((v >> 8) & 255);
+    b.push(v & 255);
+}
+
+fn pg_put_i16(b: & mut Vec<i64>, v: i64) {
+    b.push((v >> 8) & 255);
+    b.push(v & 255);
+}
+
+// The bytes of `s`, no terminator.
+fn pg_put_text(b: & mut Vec<i64>, s: str) {
+    val n: i64 = str_len(s);
+    var i: i64 = 0;
+    while i < n {
+        b.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+// The bytes of `s` and the NUL that ends a protocol String.
+fn pg_put_cstr(b: & mut Vec<i64>, s: str) {
+    pg_put_text(b, s);
+    b.push(0);
+}
+
+fn pg_put_bytes(b: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        b.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// A signed big-endian Int32 at `off` of `b`.
+pub fn pg_i32(b: Vec<i64>, off: i64) -> i64 {
+    if off + 4 > b.len() {
+        return 0;
+    }
+    val v: i64 = (b.get(off) << 24) | (b.get(off + 1) << 16) | (b.get(off + 2) << 8) | b.get(off + 3);
+    if v >= 2147483648 {
+        return v - 4294967296;
+    }
+    return v;
+}
+
+/// A signed big-endian Int16 at `off` of `b`.
+pub fn pg_i16(b: Vec<i64>, off: i64) -> i64 {
+    if off + 2 > b.len() {
+        return 0;
+    }
+    val v: i64 = (b.get(off) << 8) | b.get(off + 1);
+    if v >= 32768 {
+        return v - 65536;
+    }
+    return v;
+}
+
+// Where the NUL that ends the String at `off` is (b.len() when there is
+// none).
+fn pg_cstr_end(b: Vec<i64>, off: i64) -> i64 {
+    var i: i64 = off;
+    while i < b.len() {
+        if b.get(i) == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return b.len();
+}
+
+// Bytes [start, end) of `b` as text.
+fn pg_text(b: Vec<i64>, start: i64, end: i64) -> str {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = start;
+    while i < end && i < b.len() {
+        v.push(b.get(i));
+        i = i + 1;
+    }
+    return str_from_bytes(v);
+}
+
+// ─── Frontend messages ────────────────────────────────────────────────────
+
+/// A message: its tag byte, the Int32 length (itself and the body), the
+/// body.
+pub fn pg_msg(tag: i64, body: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(tag);
+    pg_put_i32(& mut out, body.len() + 4);
+    pg_put_bytes(& mut out, body);
+    return out;
+}
+
+/// StartupMessage (no tag): protocol 3.0, then name/value Strings, then a
+/// NUL. `database` "" leaves it to the server (the user's name).
+pub fn pg_startup_message(user: str, database: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_i32(& mut body, PG_PROTOCOL_3);
+    pg_put_cstr(& mut body, "user");
+    pg_put_cstr(& mut body, user);
+    if str_len(database) > 0 {
+        pg_put_cstr(& mut body, "database");
+        pg_put_cstr(& mut body, database);
+    }
+    pg_put_cstr(& mut body, "client_encoding");
+    pg_put_cstr(& mut body, "UTF8");
+    body.push(0);
+    var out: Vec<i64> = Vec::new();
+    pg_put_i32(& mut out, body.len() + 4);
+    pg_put_bytes(& mut out, body);
+    return out;
+}
+
+/// Query ('Q'): the simple query protocol.
+pub fn pg_query_message(sql: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_cstr(& mut body, sql);
+    return pg_msg(81, body);
+}
+
+/// Parse ('P'): prepare `sql` as statement `name` ("" the unnamed one),
+/// no parameter types given (the server infers them).
+pub fn pg_parse_message(name: str, sql: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_cstr(& mut body, name);
+    pg_put_cstr(& mut body, sql);
+    pg_put_i16(& mut body, 0);
+    return pg_msg(80, body);
+}
+
+/// Bind ('B'): portal `portal` from statement `stmt` with text parameters,
+/// results in text.
+pub fn pg_bind_message(portal: str, stmt: str, params: Vec<str>) -> Vec<i64> {
+    return pg_bind_message_nulls(portal, stmt, params, Vec::new());
+}
+
+/// Bind ('B') where `nulls[i]` true sends parameter i as SQL NULL (length
+/// -1, its text ignored); `nulls` shorter than `params` means not NULL for
+/// the rest.
+pub fn pg_bind_message_nulls(portal: str, stmt: str, params: Vec<str>, nulls: Vec<bool>) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_cstr(& mut body, portal);
+    pg_put_cstr(& mut body, stmt);
+    // no parameter format codes: all text
+    pg_put_i16(& mut body, 0);
+    pg_put_i16(& mut body, params.len());
+    var i: i64 = 0;
+    while i < params.len() {
+        if i < nulls.len() && nulls.get(i) {
+            pg_put_i32(& mut body, - 1);
+        } else {
+            val p: str = params.get(i);
+            pg_put_i32(& mut body, str_len(p));
+            pg_put_text(& mut body, p);
+        }
+        i = i + 1;
+    }
+    // no result format codes: all text
+    pg_put_i16(& mut body, 0);
+    return pg_msg(66, body);
+}
+
+/// Describe ('D') of portal `portal`: the server answers RowDescription or
+/// NoData.
+pub fn pg_describe_portal_message(portal: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    body.push(80);
+    pg_put_cstr(& mut body, portal);
+    return pg_msg(68, body);
+}
+
+/// Execute ('E') portal `portal`, at most `max_rows` rows (0: all).
+pub fn pg_execute_message(portal: str, max_rows: i64) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_cstr(& mut body, portal);
+    pg_put_i32(& mut body, max_rows);
+    return pg_msg(69, body);
+}
+
+/// Sync ('S'): ends an extended query; the server answers ReadyForQuery.
+pub fn pg_sync_message() -> Vec<i64> {
+    return pg_msg(83, Vec::new());
+}
+
+/// Terminate ('X').
+pub fn pg_terminate_message() -> Vec<i64> {
+    return pg_msg(88, Vec::new());
+}
+
+/// PasswordMessage ('p') with a cleartext or an "md5..." password.
+pub fn pg_password_message(password: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_cstr(& mut body, password);
+    return pg_msg(112, body);
+}
+
+/// SASLInitialResponse ('p'): the mechanism, then the client's first
+/// message with its Int32 length.
+pub fn pg_sasl_initial_message(mechanism: str, data: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_cstr(& mut body, mechanism);
+    pg_put_i32(& mut body, str_len(data));
+    pg_put_text(& mut body, data);
+    return pg_msg(112, body);
+}
+
+/// SASLResponse ('p'): the data alone.
+pub fn pg_sasl_response_message(data: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    pg_put_text(& mut body, data);
+    return pg_msg(112, body);
+}
+
+/// SSLRequest (no tag): Int32 8, Int32 80877103. The server answers one
+/// byte, 'S' (go on with the TLS handshake) or 'N' (no TLS here).
+pub fn pg_ssl_request_message() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    pg_put_i32(& mut out, 8);
+    pg_put_i32(& mut out, PG_SSL_REQUEST_CODE);
+    return out;
+}
+
+/// What the server's answer to SSLRequest means under `sslmode`: 1 start
+/// TLS, 0 go on in clear, -1 give up ('N' under PG_SSL_REQUIRE, an
+/// ErrorResponse 'E' from a server too old for SSLRequest, anything else,
+/// or -1 for no answer).
+pub fn pg_ssl_answer(answer: i64, sslmode: i64) -> i64 {
+    if answer == 83 {
+        return 1;
+    }
+    if answer == 78 && sslmode != PG_SSL_REQUIRE {
+        return 0;
+    }
+    return - 1;
+}
+
+// ─── Transport ────────────────────────────────────────────────────────────
+
+/// How bytes reach the server: over the socket itself, or over a TLS
+/// session made on it (module postgres_tls). `conn` below is the socket
+/// for the first and the session for the second.
+pub struct PgIo {
+    /// (conn, address, n) -> bytes written, below 0 on an error
+    pub send: fn(i64, i64, i64) -> i64,
+    /// (conn, address, n, timeout ms) -> bytes read, 0 at the end, below 0
+    /// on an error or a timeout
+    pub recv: fn(i64, i64, i64, i64) -> i64,
+    /// End the session (the socket stays open; plain: nothing)
+    pub close: fn(i64) -> i64,
+    /// (socket, host) -> a TLS session over the socket, the server's
+    /// certificate checked for `host`; 0 on failure (plain: always 0)
+    pub start: fn(i64, str) -> i64,
+}
+
+/// Write over the socket itself.
+pub fn pg_plain_send(conn: i64, addr: i64, n: i64) -> i64 {
+    return p_co_send(conn, addr, n);
+}
+
+/// Read from the socket itself.
+pub fn pg_plain_recv(conn: i64, addr: i64, n: i64, timeout_ms: i64) -> i64 {
+    return p_co_recv(conn, addr, n, timeout_ms);
+}
+
+/// Nothing to end on a plain socket.
+pub fn pg_plain_close(_conn: i64) -> i64 {
+    return 0;
+}
+
+/// No TLS: every handshake fails.
+pub fn pg_plain_start(_fd: i64, _host: str) -> i64 {
+    return 0;
+}
+
+/// The socket itself, no TLS.
+pub fn pg_plain_io() -> PgIo {
+    return PgIo {
+        send: pg_plain_send, recv: pg_plain_recv, close: pg_plain_close, start: pg_plain_start,
+    };
+}
+
+// Write all of `bytes` through `io` on `conn`. False when it failed.
+fn pg_io_write(io: PgIo, conn: i64, bytes: Vec<i64>) -> bool {
+    val n: i64 = bytes.len();
+    if n == 0 {
+        return true;
+    }
+    var mem: i64 = p_malloc(n + 8);
+    var i: i64 = 0;
+    while i < n {
+        p_volatile_store8(mem + i, bytes.get(i));
+        i = i + 1;
+    }
+    val send: fn(i64, i64, i64) -> i64 = io.send;
+    val sent: i64 = send(conn, mem, n);
+    p_free(mem);
+    return sent == n;
+}
+
+// One byte through `io` (-1 when none came).
+fn pg_io_read_byte(io: PgIo, conn: i64) -> i64 {
+    var mem: i64 = p_malloc(8);
+    val recv: fn(i64, i64, i64, i64) -> i64 = io.recv;
+    val n: i64 = recv(conn, mem, 1, PG_TIMEOUT_MS);
+    var b: i64 = - 1;
+    if n == 1 {
+        b = p_volatile_load8(mem) & 255;
+    }
+    p_free(mem);
+    return b;
+}
+
+// ─── Backend messages ─────────────────────────────────────────────────────
+
+/// One backend message: tag -1 at the end of the input, on a timeout or on
+/// a malformed length.
+pub struct PgMsg {
+    pub tag: i64,
+    pub body: Vec<i64>,
+}
+
+/// What the server sent and has not been read yet. fd -1: only `buf`
+/// (tests put bytes there).
+pub struct PgIn {
+    pub fd: i64,
+    pub buf: Vec<i64>,
+    pub pos: i64,
+    /// What `recv` reads from: the socket, or the TLS session on it
+    pub conn: i64,
+    pub recv: fn(i64, i64, i64, i64) -> i64,
+}
+
+/// A reader over bytes already received (no socket).
+pub fn pg_in_bytes(bytes: Vec<i64>) -> PgIn {
+    var b: Vec<i64> = Vec::new();
+    pg_put_bytes(& mut b, bytes);
+    return PgIn {
+        fd: - 1, buf: b, pos: 0, conn: - 1, recv: pg_plain_recv,
+    };
+}
+
+// A reader of what the server sends on connection `c` (in clear or through
+// its TLS session).
+fn pg_in_conn(c: & PgConn) -> PgIn {
+    return PgIn {
+        fd: c.fd, buf: Vec::new(), pos: 0, conn: c.conn, recv: c.io.recv,
+    };
+}
+
+// More bytes from the socket. False at the end, on an error or a timeout.
+fn pg_fill(r: & mut PgIn) -> bool {
+    if r.fd < 0 {
+        return false;
+    }
+    if r.pos > 0 && r.pos * 2 >= r.buf.len() {
+        var rest: Vec<i64> = Vec::new();
+        var i: i64 = r.pos;
+        while i < r.buf.len() {
+            rest.push(r.buf.get(i));
+            i = i + 1;
+        }
+        r.buf = rest;
+        r.pos = 0;
+    }
+    var mem: i64 = p_malloc(16384);
+    val recv: fn(i64, i64, i64, i64) -> i64 = r.recv;
+    val n: i64 = recv(r.conn, mem, 16384, PG_TIMEOUT_MS);
+    var k: i64 = 0;
+    while k < n {
+        r.buf.push(p_volatile_load8(mem + k));
+        k = k + 1;
+    }
+    p_free(mem);
+    return n > 0;
+}
+
+// Wait until `n` unread bytes are there.
+fn pg_need(r: & mut PgIn, n: i64) -> bool {
+    while r.buf.len() - r.pos < n {
+        if !pg_fill(r) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn pg_no_msg() -> PgMsg {
+    return PgMsg {
+        tag: - 1, body: Vec::new(),
+    };
+}
+
+/// The next message.
+pub fn pg_next(r: & mut PgIn) -> PgMsg {
+    if !pg_need(r, 5) {
+        return pg_no_msg();
+    }
+    val tag: i64 = r.buf.get(r.pos);
+    val len: i64 = pg_i32(r.buf, r.pos + 1);
+    if len < 4 || len > PG_MAX_MESSAGE {
+        return pg_no_msg();
+    }
+    if !pg_need(r, 1 + len) {
+        return pg_no_msg();
+    }
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = r.pos + 5;
+    val end: i64 = r.pos + 1 + len;
+    while i < end {
+        body.push(r.buf.get(i));
+        i = i + 1;
+    }
+    r.pos = end;
+    return PgMsg {
+        tag: tag, body: body,
+    };
+}
+
+/// An ErrorResponse or NoticeResponse body as "SEVERITY SQLSTATE: message"
+/// (with " (detail)" when the server gave one).
+pub fn pg_error_text(body: Vec<i64>) -> str {
+    var severity: str = "";
+    var code: str = "";
+    var message: str = "";
+    var detail: str = "";
+    var i: i64 = 0;
+    while i < body.len() && body.get(i) != 0 {
+        val field: i64 = body.get(i);
+        val end: i64 = pg_cstr_end(body, i + 1);
+        val text: str = pg_text(body, i + 1, end);
+        // 'V' is the severity never translated, 'S' the localized one
+        if field == 86 || (field == 83 && str_len(severity) == 0) {
+            severity = text;
+        } else if field == 67 {
+            code = text;
+        } else if field == 77 {
+            message = text;
+        } else if field == 68 {
+            detail = text;
+        }
+        i = end + 1;
+    }
+    var out: str = severity + " " + code + ": " + message;
+    if str_len(detail) > 0 {
+        out = out + " (" + detail + ")";
+    }
+    return out;
+}
+
+/// The SQLSTATE field ('C') of an ErrorResponse body.
+pub fn pg_error_code(body: Vec<i64>) -> str {
+    var i: i64 = 0;
+    while i < body.len() && body.get(i) != 0 {
+        val field: i64 = body.get(i);
+        val end: i64 = pg_cstr_end(body, i + 1);
+        if field == 67 {
+            return pg_text(body, i + 1, end);
+        }
+        i = end + 1;
+    }
+    return "";
+}
+
+// ─── Results ──────────────────────────────────────────────────────────────
+
+/// The outcome of a query.
+pub struct PgResult {
+    pub ok: bool,
+    /// "SEVERITY SQLSTATE: message", "" when ok
+    pub error: str,
+    pub sqlstate: str,
+    /// Names and type OIDs of the last row set's columns
+    pub columns: Vec<str>,
+    pub types: Vec<i64>,
+    /// The last row set as a JSON array of objects ("[]" for none)
+    pub rows: str,
+    pub nrows: i64,
+    /// The last CommandComplete tag ("INSERT 0 2", "SELECT 3", ...) and the
+    /// row count at its end (0 when it has none)
+    pub tag: str,
+    pub affected: i64,
+    /// ReadyForQuery's transaction status: 73 'I' idle, 84 'T' in a
+    /// transaction, 69 'E' in a failed one; 0 when none came
+    pub status: i64,
+}
+
+fn pg_result_new() -> PgResult {
+    return PgResult {
+        ok: true, error: "", sqlstate: "", columns: Vec::new(), types: Vec::new(), rows: "[]", nrows: 0, tag: "", affected: 0, status: 0,
+    };
+}
+
+fn pg_result_fail(msg: str) -> PgResult {
+    var r: PgResult = pg_result_new();
+    r.ok = false;
+    r.error = msg;
+    return r;
+}
+
+// A column's text value as JSON, by its type.
+fn pg_json_value(oid: i64, text: str) -> str {
+    if oid == PG_BOOL {
+        if str_equal(text, "t") {
+            return "true";
+        }
+        if str_equal(text, "f") {
+            return "false";
+        }
+        return json_string(text);
+    }
+    if oid == PG_INT2 || oid == PG_INT4 || oid == PG_INT8 || oid == PG_OID {
+        return text;
+    }
+    if oid == PG_FLOAT4 || oid == PG_FLOAT8 || oid == PG_NUMERIC {
+        // NaN and the infinities have no JSON number
+        if str_equal(text, "NaN") || str_equal(text, "Infinity") || str_equal(text, "-Infinity") {
+            return json_string(text);
+        }
+        return text;
+    }
+    if oid == PG_JSON || oid == PG_JSONB {
+        return text;
+    }
+    return json_string(text);
+}
+
+// The row count at the end of a CommandComplete tag ("UPDATE 3" -> 3,
+// "INSERT 0 2" -> 2, "CREATE TABLE" -> 0).
+fn pg_tag_count(tag: str) -> i64 {
+    var i: i64 = str_len(tag);
+    while i > 0 && str_byte_at(tag, i - 1) >= 48 && str_byte_at(tag, i - 1) <= 57 {
+        i = i - 1;
+    }
+    if i == str_len(tag) || (i > 0 && str_byte_at(tag, i - 1) != 32) {
+        return 0;
+    }
+    return str_parse_int(str_slice(tag, i, str_len(tag)));
+}
+
+/// Read the answer to a query up to ReadyForQuery: row sets, command tags
+/// and errors (the first error is kept; the server still finishes with
+/// ReadyForQuery).
+pub fn pg_collect(r: & mut PgIn) -> PgResult {
+    var res: PgResult = pg_result_new();
+    var parts: Vec<str> = Vec::new();
+    loop {
+        val m: PgMsg = pg_next(r);
+        if m.tag < 0 {
+            if res.ok {
+                res.ok = false;
+                res.error = "connection closed before ReadyForQuery";
+            }
+            break;
+        }
+        if m.tag == PG_ROW_DESCRIPTION {
+            // A new row set: Int16 count, then per column its name, table
+            // OID, column number, type OID, size, modifier and format
+            var cols: Vec<str> = Vec::new();
+            var types: Vec<i64> = Vec::new();
+            val n: i64 = pg_i16(m.body, 0);
+            var off: i64 = 2;
+            var k: i64 = 0;
+            while k < n {
+                val end: i64 = pg_cstr_end(m.body, off);
+                cols.push(pg_text(m.body, off, end));
+                types.push(pg_i32(m.body, end + 7));
+                off = end + 19;
+                k = k + 1;
+            }
+            res.columns = cols;
+            res.types = types;
+            parts = Vec::new();
+        } else if m.tag == PG_DATA_ROW {
+            var sb: StringBuilder = StringBuilder::new();
+            sb.append_str("{");
+            val n: i64 = pg_i16(m.body, 0);
+            var off: i64 = 2;
+            var k: i64 = 0;
+            while k < n {
+                if k > 0 {
+                    sb.append_str(",");
+                }
+                var name: str = "c" + int_to_str(k + 1);
+                var oid: i64 = 0;
+                if k < res.columns.len() {
+                    name = res.columns.get(k);
+                    oid = res.types.get(k);
+                }
+                sb.append_str(json_string(name));
+                sb.append_str(":");
+                val len: i64 = pg_i32(m.body, off);
+                off = off + 4;
+                if len < 0 {
+                    sb.append_str("null");
+                } else {
+                    sb.append_str(pg_json_value(oid, pg_text(m.body, off, off + len)));
+                    off = off + len;
+                }
+                k = k + 1;
+            }
+            sb.append_str("}");
+            parts.push(sb.to_str());
+        } else if m.tag == PG_COMMAND_COMPLETE {
+            res.tag = pg_text(m.body, 0, pg_cstr_end(m.body, 0));
+            res.affected = pg_tag_count(res.tag);
+        } else if m.tag == PG_ERROR {
+            if res.ok {
+                res.ok = false;
+                res.error = pg_error_text(m.body);
+                res.sqlstate = pg_error_code(m.body);
+            }
+        } else if m.tag == PG_READY {
+            if m.body.len() > 0 {
+                res.status = m.body.get(0);
+            }
+            break;
+        }
+        // Others: ParseComplete '1', BindComplete '2', NoData 'n',
+        // EmptyQueryResponse 'I', PortalSuspended 's', ParameterDescription
+        // 't', NoticeResponse 'N', ParameterStatus 'S', notifications 'A'
+    }
+    var out: StringBuilder = StringBuilder::new();
+    out.append_str("[");
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 {
+            out.append_str(",");
+        }
+        out.append_str(parts.get(i));
+        i = i + 1;
+    }
+    out.append_str("]");
+    res.rows = out.to_str();
+    res.nrows = parts.len();
+    return res;
+}
+
+// ─── MD5 (RFC 1321), for the protocol's legacy "md5" authentication only ──
+//
+// Module `crypto` leaves MD5 out on purpose; PostgreSQL servers older than
+// 14 (and pg_hba.conf "md5" lines) still ask for it. Nothing else should
+// use this.
+
+fn md5_k() -> Vec<i64> {
+    var k: Vec<i64> = Vec::new();
+    k.push(0xd76aa478); k.push(0xe8c7b756); k.push(0x242070db); k.push(0xc1bdceee);
+    k.push(0xf57c0faf); k.push(0x4787c62a); k.push(0xa8304613); k.push(0xfd469501);
+    k.push(0x698098d8); k.push(0x8b44f7af); k.push(0xffff5bb1); k.push(0x895cd7be);
+    k.push(0x6b901122); k.push(0xfd987193); k.push(0xa679438e); k.push(0x49b40821);
+    k.push(0xf61e2562); k.push(0xc040b340); k.push(0x265e5a51); k.push(0xe9b6c7aa);
+    k.push(0xd62f105d); k.push(0x02441453); k.push(0xd8a1e681); k.push(0xe7d3fbc8);
+    k.push(0x21e1cde6); k.push(0xc33707d6); k.push(0xf4d50d87); k.push(0x455a14ed);
+    k.push(0xa9e3e905); k.push(0xfcefa3f8); k.push(0x676f02d9); k.push(0x8d2a4c8a);
+    k.push(0xfffa3942); k.push(0x8771f681); k.push(0x6d9d6122); k.push(0xfde5380c);
+    k.push(0xa4beea44); k.push(0x4bdecfa9); k.push(0xf6bb4b60); k.push(0xbebfbc70);
+    k.push(0x289b7ec6); k.push(0xeaa127fa); k.push(0xd4ef3085); k.push(0x04881d05);
+    k.push(0xd9d4d039); k.push(0xe6db99e5); k.push(0x1fa27cf8); k.push(0xc4ac5665);
+    k.push(0xf4292244); k.push(0x432aff97); k.push(0xab9423a7); k.push(0xfc93a039);
+    k.push(0x655b59c3); k.push(0x8f0ccc92); k.push(0xffeff47d); k.push(0x85845dd1);
+    k.push(0x6fa87e4f); k.push(0xfe2ce6e0); k.push(0xa3014314); k.push(0x4e0811a1);
+    k.push(0xf7537e82); k.push(0xbd3af235); k.push(0x2ad7d2bb); k.push(0xeb86d391);
+    return k;
+}
+
+// The rotation of each round: 7 12 17 22, 5 9 14 20, 4 11 16 23, 6 10 15 21,
+// each group four times.
+fn md5_shift(i: i64) -> i64 {
+    val r: i64 = i % 4;
+    if i < 16 {
+        if r == 0 { return 7; }
+        if r == 1 { return 12; }
+        if r == 2 { return 17; }
+        return 22;
+    }
+    if i < 32 {
+        if r == 0 { return 5; }
+        if r == 1 { return 9; }
+        if r == 2 { return 14; }
+        return 20;
+    }
+    if i < 48 {
+        if r == 0 { return 4; }
+        if r == 1 { return 11; }
+        if r == 2 { return 16; }
+        return 23;
+    }
+    if r == 0 { return 6; }
+    if r == 1 { return 10; }
+    if r == 2 { return 15; }
+    return 21;
+}
+
+@wrapping fn md5_rotl(x: i64, n: i64) -> i64 {
+    val m: i64 = x & 0xFFFFFFFF;
+    return ((m << n) | (m >> (32 - n))) & 0xFFFFFFFF;
+}
+
+/// MD5 of bytes: 16 bytes.
+pub fn pg_md5(msg: Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    pg_put_bytes(& mut p, msg);
+    p.push(0x80);
+    while p.len() % 64 != 56 {
+        p.push(0);
+    }
+    // the length in bits, 64-bit little-endian
+    val bits: i64 = msg.len() * 8;
+    var s: i64 = 0;
+    while s < 8 {
+        p.push((bits >> (s * 8)) & 255);
+        s = s + 1;
+    }
+    val k: Vec<i64> = md5_k();
+    var a0: i64 = 0x67452301;
+    var b0: i64 = 0xefcdab89;
+    var c0: i64 = 0x98badcfe;
+    var d0: i64 = 0x10325476;
+    var blk: i64 = 0;
+    while blk < p.len() {
+        var m: Vec<i64> = Vec::new();
+        var j: i64 = 0;
+        while j < 16 {
+            val o: i64 = blk + j * 4;
+            m.push(p.get(o) | (p.get(o + 1) << 8) | (p.get(o + 2) << 16) | (p.get(o + 3) << 24));
+            j = j + 1;
+        }
+        var a: i64 = a0;
+        var b: i64 = b0;
+        var c: i64 = c0;
+        var d: i64 = d0;
+        var i: i64 = 0;
+        while i < 64 {
+            var f: i64 = 0;
+            var g: i64 = 0;
+            if i < 16 {
+                f = (b & c) | ((~b & 0xFFFFFFFF) & d);
+                g = i;
+            } else if i < 32 {
+                f = (d & b) | ((~d & 0xFFFFFFFF) & c);
+                g = (5 * i + 1) % 16;
+            } else if i < 48 {
+                f = b ^ c ^ d;
+                g = (3 * i + 5) % 16;
+            } else {
+                f = c ^ (b | (~d & 0xFFFFFFFF));
+                g = (7 * i) % 16;
+            }
+            f = (f + a + k.get(i) + m.get(g)) & 0xFFFFFFFF;
+            a = d;
+            d = c;
+            c = b;
+            b = (b + md5_rotl(f, md5_shift(i))) & 0xFFFFFFFF;
+            i = i + 1;
+        }
+        a0 = (a0 + a) & 0xFFFFFFFF;
+        b0 = (b0 + b) & 0xFFFFFFFF;
+        c0 = (c0 + c) & 0xFFFFFFFF;
+        d0 = (d0 + d) & 0xFFFFFFFF;
+        blk = blk + 64;
+    }
+    // the digest: a0 b0 c0 d0, each little-endian
+    var out: Vec<i64> = Vec::new();
+    var words: Vec<i64> = Vec::new();
+    words.push(a0);
+    words.push(b0);
+    words.push(c0);
+    words.push(d0);
+    var w: i64 = 0;
+    while w < 4 {
+        val v: i64 = words.get(w);
+        out.push(v & 255);
+        out.push((v >> 8) & 255);
+        out.push((v >> 16) & 255);
+        out.push((v >> 24) & 255);
+        w = w + 1;
+    }
+    return out;
+}
+
+/// Lowercase hex of bytes.
+pub fn pg_hex(b: Vec<i64>) -> str {
+    return crypto_sha256_hex(b);
+}
+
+/// The answer to AuthenticationMD5Password: "md5" followed by
+/// md5_hex(md5_hex(password + user) + salt), salt the server's 4 bytes.
+pub fn pg_md5_password(user: str, password: str, salt: Vec<i64>) -> str {
+    val inner: str = pg_hex(pg_md5(str_bytes(password + user)));
+    var m: Vec<i64> = str_bytes(inner);
+    pg_put_bytes(& mut m, salt);
+    return "md5" + pg_hex(pg_md5(m));
+}
+
+// ─── SCRAM-SHA-256 (RFC 5802, RFC 7677) ───────────────────────────────────
+
+/// The client's side of one SCRAM exchange.
+pub struct PgScram {
+    pub user: str,
+    pub password: str,
+    pub cnonce: str,
+    pub client_first_bare: str,
+    /// ServerSignature we expect in the server's final message
+    pub server_sig: Vec<i64>,
+    pub ok: bool,
+    pub error: str,
+}
+
+/// A SCRAM exchange. PostgreSQL takes the user from the startup message
+/// and ignores the SCRAM one: `user` is "" there.
+pub fn pg_scram_new(user: str, password: str, cnonce: str) -> PgScram {
+    return PgScram {
+        user: user, password: password, cnonce: cnonce, client_first_bare: "", server_sig: Vec::new(), ok: true, error: "",
+    };
+}
+
+/// A fresh client nonce: 18 random bytes in base64 (24 printable
+/// characters, never a comma).
+pub fn pg_scram_nonce() -> str {
+    return b64_encode_bytes(crypto_random_bytes(18));
+}
+
+// A user name as a saslname: '=' as "=3D", ',' as "=2C".
+fn pg_sasl_name(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 61 {
+            out = out + "=3D";
+        } else if c == 44 {
+            out = out + "=2C";
+        } else {
+            out = out + str_slice(s, i, i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// client-first-message: "n,," (no channel binding) then
+/// "n=<user>,r=<nonce>".
+pub fn pg_scram_client_first(s: & mut PgScram) -> str {
+    s.client_first_bare = "n=" + pg_sasl_name(s.user) + ",r=" + s.cnonce;
+    return "n,," + s.client_first_bare;
+}
+
+// The value of attribute `name` ("r", "s", ...) in a SCRAM message, ""
+// when it is not there.
+fn pg_scram_attr(msg: str, name: str) -> str {
+    val parts: Vec<str> = str_split(msg, ",");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        if str_len(p) >= 2 && str_starts_with(p, name + "=") {
+            return str_slice(p, 2, str_len(p));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn pg_xor(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() && i < b.len() {
+        out.push(a.get(i) ^ b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// client-final-message for the server's first message, with the proof;
+/// "" and `s.ok` false when the server's message is unusable (a nonce
+/// that does not extend ours, no salt, a bad iteration count, an error).
+pub fn pg_scram_client_final(s: & mut PgScram, server_first: str) -> str {
+    val err: str = pg_scram_attr(server_first, "e");
+    if str_len(err) > 0 {
+        s.ok = false;
+        s.error = "SCRAM: server error " + err;
+        return "";
+    }
+    if str_starts_with(server_first, "m=") {
+        s.ok = false;
+        s.error = "SCRAM: unsupported mandatory extension";
+        return "";
+    }
+    val nonce: str = pg_scram_attr(server_first, "r");
+    val salt_b64: str = pg_scram_attr(server_first, "s");
+    val iter_text: str = pg_scram_attr(server_first, "i");
+    if str_len(nonce) <= str_len(s.cnonce) || !str_starts_with(nonce, s.cnonce) {
+        s.ok = false;
+        s.error = "SCRAM: the server nonce does not extend ours";
+        return "";
+    }
+    val salt: Vec<i64> = b64_decode_bytes(salt_b64);
+    val iters: i64 = str_parse_int(iter_text);
+    if salt.len() == 0 || iters < 1 {
+        s.ok = false;
+        s.error = "SCRAM: no salt or no iteration count";
+        return "";
+    }
+    // SaltedPassword := Hi(password, salt, i); "biws" is base64 of "n,,"
+    val salted: Vec<i64> = crypto_pbkdf2_sha256(str_bytes(s.password), salt, iters, 32);
+    val client_key: Vec<i64> = crypto_hmac_sha256_bytes(salted, str_bytes("Client Key"));
+    val stored_key: Vec<i64> = crypto_sha256_bytes(client_key);
+    val without_proof: str = "c=biws,r=" + nonce;
+    val auth_message: str = s.client_first_bare + "," + server_first + "," + without_proof;
+    val client_sig: Vec<i64> = crypto_hmac_sha256_bytes(stored_key, str_bytes(auth_message));
+    val proof: Vec<i64> = pg_xor(client_key, client_sig);
+    val server_key: Vec<i64> = crypto_hmac_sha256_bytes(salted, str_bytes("Server Key"));
+    s.server_sig = crypto_hmac_sha256_bytes(server_key, str_bytes(auth_message));
+    return without_proof + ",p=" + b64_encode_bytes(proof);
+}
+
+/// True when the server's final message carries the signature we expect
+/// (it proves the server knows the password too).
+pub fn pg_scram_verify_server(s: & PgScram, server_final: str) -> bool {
+    if s.server_sig.len() != 32 {
+        return false;
+    }
+    val v: str = pg_scram_attr(server_final, "v");
+    if str_len(v) == 0 {
+        return false;
+    }
+    return crypto_constant_time_eq(b64_decode_bytes(v), s.server_sig);
+}
+
+// ─── Connections ──────────────────────────────────────────────────────────
+
+/// A connection. `ok` false: `error` says why (it cannot be used).
+pub struct PgConn {
+    pub fd: i64,
+    pub ok: bool,
+    pub error: str,
+    pub user: str,
+    pub password: str,
+    /// "trust", "password", "md5" or "SCRAM-SHA-256"
+    pub auth: str,
+    /// The server's ParameterStatus values (server_version, ...)
+    pub param_names: Vec<str>,
+    pub param_vals: Vec<str>,
+    /// BackendKeyData
+    pub pid: i64,
+    pub secret: i64,
+    /// Bytes to send (written by pg_flush; kept when fd is -1)
+    pub out: Vec<i64>,
+    /// What `io` sends on: `fd`, or the TLS session over it
+    pub conn: i64,
+    pub io: PgIo,
+    /// True once the TLS handshake is done
+    pub tls: bool,
+}
+
+/// A connection over socket `fd` (-1: none, for tests) that has not
+/// started.
+pub fn pg_conn_new(fd: i64, user: str, password: str) -> PgConn {
+    return PgConn {
+        fd: fd, ok: false, error: "", user: user, password: password, auth: "trust", param_names: Vec::new(), param_vals: Vec::new(), pid: 0, secret: 0, out: Vec::new(), conn: fd, io: pg_plain_io(), tls: false,
+    };
+}
+
+/// Send what is queued in `c.out` (nothing happens with fd -1: the bytes
+/// stay for the caller to look at).
+pub fn pg_flush(c: & mut PgConn) -> bool {
+    if c.fd < 0 {
+        return true;
+    }
+    val ok: bool = pg_io_write(c.io, c.conn, c.out);
+    c.out = Vec::new();
+    return ok;
+}
+
+// End the TLS session (if any) and close the socket.
+fn pg_shut(c: & mut PgConn) {
+    if c.tls {
+        val close: fn(i64) -> i64 = c.io.close;
+        close(c.conn);
+    }
+    if c.fd >= 0 {
+        p_socket_close(c.fd);
+    }
+    c.fd = - 1;
+    c.conn = - 1;
+    c.tls = false;
+    c.io = pg_plain_io();
+}
+
+fn pg_fail(c: & mut PgConn, why: str) -> i64 {
+    c.ok = false;
+    c.error = why;
+    return - 1;
+}
+
+/// One message of the startup phase: answers authentication requests into
+/// `c.out`, records parameters and the key. Returns 0 to go on, 1 when the
+/// server is ready (c.ok true), -1 on failure (c.error says why).
+pub fn pg_startup_step(c: & mut PgConn, s: & mut PgScram, m: PgMsg) -> i64 {
+    if m.tag < 0 {
+        return pg_fail(c, "connection closed during startup");
+    }
+    if m.tag == PG_AUTH {
+        val code: i64 = pg_i32(m.body, 0);
+        if code == 0 {
+            // AuthenticationOk
+            return 0;
+        }
+        if code == 3 {
+            c.auth = "password";
+            pg_put_bytes(& mut c.out, pg_password_message(c.password));
+            return 0;
+        }
+        if code == 5 {
+            c.auth = "md5";
+            var salt: Vec<i64> = Vec::new();
+            var i: i64 = 4;
+            while i < 8 && i < m.body.len() {
+                salt.push(m.body.get(i));
+                i = i + 1;
+            }
+            pg_put_bytes(& mut c.out, pg_password_message(pg_md5_password(c.user, c.password, salt)));
+            return 0;
+        }
+        if code == 10 {
+            // AuthenticationSASL: the mechanisms, each a String, then a NUL
+            var off: i64 = 4;
+            var found: bool = false;
+            while off < m.body.len() && m.body.get(off) != 0 {
+                val end: i64 = pg_cstr_end(m.body, off);
+                if str_equal(pg_text(m.body, off, end), "SCRAM-SHA-256") {
+                    found = true;
+                }
+                off = end + 1;
+            }
+            if !found {
+                return pg_fail(c, "the server offers no SASL mechanism we have (SCRAM-SHA-256-PLUS needs TLS)");
+            }
+            c.auth = "SCRAM-SHA-256";
+            val first: str = pg_scram_client_first(s);
+            pg_put_bytes(& mut c.out, pg_sasl_initial_message("SCRAM-SHA-256", first));
+            return 0;
+        }
+        if code == 11 {
+            // AuthenticationSASLContinue: the server-first-message
+            val fin: str = pg_scram_client_final(s, pg_text(m.body, 4, m.body.len()));
+            if !s.ok {
+                return pg_fail(c, s.error);
+            }
+            pg_put_bytes(& mut c.out, pg_sasl_response_message(fin));
+            return 0;
+        }
+        if code == 12 {
+            // AuthenticationSASLFinal: check the server's signature
+            if !pg_scram_verify_server(s, pg_text(m.body, 4, m.body.len())) {
+                return pg_fail(c, "SCRAM: the server's signature is wrong");
+            }
+            return 0;
+        }
+        return pg_fail(c, "unsupported authentication method " + int_to_str(code) + " (Kerberos, GSSAPI and SSPI are not supported)");
+    }
+    if m.tag == PG_ERROR {
+        return pg_fail(c, pg_error_text(m.body));
+    }
+    if m.tag == PG_PARAMETER_STATUS {
+        val e1: i64 = pg_cstr_end(m.body, 0);
+        val e2: i64 = pg_cstr_end(m.body, e1 + 1);
+        c.param_names.push(pg_text(m.body, 0, e1));
+        c.param_vals.push(pg_text(m.body, e1 + 1, e2));
+        return 0;
+    }
+    if m.tag == PG_BACKEND_KEY {
+        c.pid = pg_i32(m.body, 0);
+        c.secret = pg_i32(m.body, 4);
+        return 0;
+    }
+    if m.tag == PG_READY {
+        c.ok = true;
+        return 1;
+    }
+    // NoticeResponse, NegotiateProtocolVersion ('v'): go on
+    return 0;
+}
+
+/// Connect and log in. `database` "" is the server's default (the user's
+/// name). The result's `ok` says whether it worked, `error` why not.
+pub fn pg_connect(host: str, port: i64, user: str, password: str, database: str) -> PgConn {
+    val fd: i64 = p_co_connect(host, port);
+    if fd < 0 {
+        var c: PgConn = pg_conn_new(fd, user, password);
+        c.error = "cannot connect to " + host + ":" + int_to_str(port);
+        return c;
+    }
+    return pg_connect_io(fd, host, user, password, database, PG_SSL_DISABLE, pg_plain_io(), pg_plain_io());
+}
+
+/// Log in over the connected socket `fd`: under `sslmode` PG_SSL_PREFER or
+/// PG_SSL_REQUIRE first SSLRequest and, when the server answers 'S', the
+/// TLS handshake `tls.start(fd, host)`; then the startup exchange through
+/// `plain` (in clear) or `tls`. On failure the session and the socket are
+/// closed and `ok` is false (`error` says why).
+pub fn pg_connect_io(fd: i64, host: str, user: str, password: str, database: str, sslmode: i64, plain: PgIo, tls: PgIo) -> PgConn {
+    var c: PgConn = pg_conn_new(fd, user, password);
+    c.io = plain;
+    if fd < 0 {
+        c.error = "not connected";
+        return c;
+    }
+    if sslmode != PG_SSL_DISABLE {
+        if !pg_io_write(c.io, c.conn, pg_ssl_request_message()) {
+            pg_fail(& mut c, "cannot write to the server");
+            pg_shut(& mut c);
+            return c;
+        }
+        // Exactly one byte: whatever follows it before the handshake would
+        // be unencrypted data slipped in by a man in the middle
+        // (CVE-2021-23214), so it is never read here.
+        val answer: i64 = pg_io_read_byte(c.io, c.conn);
+        val what: i64 = pg_ssl_answer(answer, sslmode);
+        if what < 0 {
+            if answer == 78 {
+                pg_fail(& mut c, "the server does not support TLS (sslmode require)");
+            } else if answer < 0 {
+                pg_fail(& mut c, "no answer to SSLRequest");
+            } else {
+                pg_fail(& mut c, "unexpected answer to SSLRequest: " + int_to_str(answer));
+            }
+            pg_shut(& mut c);
+            return c;
+        }
+        if what == 1 {
+            val start: fn(i64, str) -> i64 = tls.start;
+            val session: i64 = start(fd, host);
+            if session == 0 {
+                pg_fail(& mut c, "TLS handshake with " + host + " failed (certificate or name not accepted)");
+                pg_shut(& mut c);
+                return c;
+            }
+            c.conn = session;
+            c.io = tls;
+            c.tls = true;
+        }
+    }
+    pg_put_bytes(& mut c.out, pg_startup_message(user, database));
+    var s: PgScram = pg_scram_new("", password, pg_scram_nonce());
+    var r: PgIn = pg_in_conn(& c);
+    var phase: i64 = 0;
+    while phase == 0 {
+        if !pg_flush(& mut c) {
+            phase = pg_fail(& mut c, "cannot write to the server");
+        } else {
+            val m: PgMsg = pg_next(& mut r);
+            phase = pg_startup_step(& mut c, & mut s, m);
+        }
+    }
+    if phase < 0 {
+        pg_shut(& mut c);
+    }
+    return c;
+}
+
+/// A server parameter the server reported at startup ("server_version",
+/// "TimeZone", ...); "" when it did not.
+pub fn pg_parameter(c: & PgConn, name: str) -> str {
+    var i: i64 = 0;
+    while i < c.param_names.len() {
+        if str_equal(c.param_names.get(i), name) {
+            return c.param_vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Send `bytes` and read the answer up to ReadyForQuery.
+fn pg_round_trip(c: & PgConn, bytes: Vec<i64>) -> PgResult {
+    if !c.ok || c.fd < 0 {
+        return pg_result_fail("not connected: " + c.error);
+    }
+    if !pg_io_write(c.io, c.conn, bytes) {
+        return pg_result_fail("cannot write to the server");
+    }
+    var r: PgIn = pg_in_conn(c);
+    return pg_collect(& mut r);
+}
+
+/// Run SQL with the simple query protocol: one or more statements, no
+/// parameters. Never put outside input in `sql`: use pg_query_params.
+pub fn pg_query(c: & PgConn, sql: str) -> PgResult {
+    // CO2: a "pg.query" span under FIDES_TRACE (the SQL text)
+    val t0: i64 = trace_span_begin();
+    val r: PgResult = pg_round_trip(c, pg_query_message(sql));
+    trace_span_end(t0, "pg.query", sql, r.ok);
+    return r;
+}
+
+/// The bytes pg_query_params sends: Parse, Bind, Describe, Execute, Sync
+/// on the unnamed statement and portal.
+pub fn pg_extended_query(sql: str, params: Vec<str>) -> Vec<i64> {
+    return pg_extended_query_nulls(sql, params, Vec::new());
+}
+
+/// pg_extended_query where `nulls[i]` true binds parameter i as NULL.
+pub fn pg_extended_query_nulls(sql: str, params: Vec<str>, nulls: Vec<bool>) -> Vec<i64> {
+    var b: Vec<i64> = pg_parse_message("", sql);
+    pg_put_bytes(& mut b, pg_bind_message_nulls("", "", params, nulls));
+    pg_put_bytes(& mut b, pg_describe_portal_message(""));
+    pg_put_bytes(& mut b, pg_execute_message("", 0));
+    pg_put_bytes(& mut b, pg_sync_message());
+    return b;
+}
+
+/// Run one statement with parameters `$1`, `$2`, ... bound to `params`
+/// (text; the server converts them to the column types). The values never
+/// go through the SQL text.
+pub fn pg_query_params(c: & PgConn, sql: str, params: Vec<str>) -> PgResult {
+    // CO2: a "pg.query" span under FIDES_TRACE (the SQL text, not the
+    // parameter values)
+    val t0: i64 = trace_span_begin();
+    val r: PgResult = pg_round_trip(c, pg_extended_query(sql, params));
+    trace_span_end(t0, "pg.query", sql, r.ok);
+    return r;
+}
+
+/// pg_query_params where `nulls[i]` true binds `$<i+1>` as SQL NULL (the
+/// text in params[i] is then ignored).
+pub fn pg_query_params_nulls(c: & PgConn, sql: str, params: Vec<str>, nulls: Vec<bool>) -> PgResult {
+    val t0: i64 = trace_span_begin();
+    val r: PgResult = pg_round_trip(c, pg_extended_query_nulls(sql, params, nulls));
+    trace_span_end(t0, "pg.query", sql, r.ok);
+    return r;
+}
+
+/// Run a statement for its effect: the rows it changed, -1 on an error.
+pub fn pg_exec(c: & PgConn, sql: str) -> i64 {
+    val r: PgResult = pg_query(c, sql);
+    if !r.ok {
+        return - 1;
+    }
+    return r.affected;
+}
+
+/// Say goodbye (Terminate), end the TLS session if any and close the
+/// socket.
+pub fn pg_close(c: & mut PgConn) {
+    if c.fd >= 0 {
+        pg_io_write(c.io, c.conn, pg_terminate_message());
+    }
+    pg_shut(c);
+    c.ok = false;
+}
+

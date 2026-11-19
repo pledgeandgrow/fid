@@ -1,0 +1,100 @@
+// stdlib/semihosting: operation numbers, open modes and trap encodings; firmware-side calls building real parameter blocks in target memory, served by the host model (console, files, seek/read, exit codes on 32- and 64-bit targets).
+// Expected output:
+// modes r=0 wb=5 a+b=11 x=-1
+// traps BEAB BABC E10F0070 D45E0000 / 01F01013 00100073 40705013
+// tt handle 1, write left 0
+// open block: 40 00 00 20 04 00 00 00 07 00 00 00
+// log handle 2, flen 6
+// read 4: abcd, then: ef, after seek 1: bcd
+// missing: -1 errno 2
+// append: abcdefgh
+// console: hello|A|via tt|
+// 32-bit exit 0: true reason 0x20026 status 0
+// 32-bit exit 2: SYS_EXIT_EXTENDED status 2
+// 64-bit exit 3: SYS_EXIT reason 0x20026 status 3, block 26 00 02 00 00 00 00 00 03 00 00 00 00 00 00 00
+// elapsed 4886718345 freq 1000000, cmdline: fw --test
+// 23 calls, first SYS_WRITE0 last SYS_GET_CMDLINE
+use semihosting;
+use vec;
+use string;
+
+fn hx(b: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn hexw(v: i64, n: i64) -> str {
+    var out: str = "";
+    var i: i64 = n - 1;
+    while i >= 0 {
+        out = out + hx((v >> (8 * i)) & 255);
+        i = i - 1;
+    }
+    return out;
+}
+
+fn hexs(v: Vec<i64>) -> str {
+    var p: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        p.push(hx(v.get(i)));
+        i = i + 1;
+    }
+    return str_join(p, " ");
+}
+
+fn txt(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + byte_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println("modes r=" + int_to_str(semi_open_mode("r")) + " wb=" + int_to_str(semi_open_mode("wb")) + " a+b=" + int_to_str(semi_open_mode("a+b")) + " x=" + int_to_str(semi_open_mode("x")));
+    println("traps " + hexw(SEMI_BKPT_THUMB, 2) + " " + hexw(SEMI_HLT_T32, 2) + " " + hexw(SEMI_HLT_A32, 4) + " " + hexw(SEMI_HLT_A64, 4)
+        + " / " + hexw(SEMI_RISCV_SLLI, 4) + " " + hexw(SEMI_RISCV_EBREAK, 4) + " " + hexw(SEMI_RISCV_SRAI, 4));
+    var t: SemiTarget = semitarget_new(0x20000000, 1024, 4);
+    semi_puts(&mut t, "hello\n");
+    semi_putc(&mut t, 65);
+    semi_putc(&mut t, 10);
+    val tt: i64 = semi_open(&mut t, ":tt", "w");
+    val left: i64 = semi_write(&mut t, tt, str_bytes("via tt\n"));
+    println("tt handle " + int_to_str(tt) + ", write left " + int_to_str(left));
+    val fd: i64 = semi_open(&mut t, "log.txt", "w");
+    println("open block: " + hexs(semimem_read_bytes(&t.mem, t.scratch, 12)));
+    semi_write(&mut t, fd, str_bytes("abc"));
+    semi_write(&mut t, fd, str_bytes("def"));
+    println("log handle " + int_to_str(fd) + ", flen " + int_to_str(semi_flen(&mut t, fd)));
+    semi_close(&mut t, fd);
+    val rd: i64 = semi_open(&mut t, "log.txt", "r");
+    val r1: Vec<i64> = semi_read(&mut t, rd, 4);
+    val r2: Vec<i64> = semi_read(&mut t, rd, 4);
+    semi_seek(&mut t, rd, 1);
+    val r3: Vec<i64> = semi_read(&mut t, rd, 3);
+    println("read 4: " + txt(r1) + ", then: " + txt(r2) + ", after seek 1: " + txt(r3));
+    val miss: i64 = semi_open(&mut t, "missing", "r");
+    println("missing: " + int_to_str(miss) + " errno " + int_to_str(semi_trap(&mut t, SYS_ERRNO, 0)));
+    val ap: i64 = semi_open(&mut t, "log.txt", "a");
+    semi_write(&mut t, ap, str_bytes("gh"));
+    println("append: " + txt(t.host.files.get("log.txt")));
+    println("console: " + str_replace(t.host.console, "\n", "|"));
+    semi_exit(&mut t, 0);
+    println("32-bit exit 0: " + bool_to_str(t.host.exited) + " reason 0x" + int_to_hex(t.host.exit_reason) + " status " + int_to_str(t.host.exit_code));
+    var t2: SemiTarget = semitarget_new(0x20000000, 256, 4);
+    semi_exit(&mut t2, 2);
+    println("32-bit exit 2: " + t2.host.calls.get(0) + " status " + int_to_str(t2.host.exit_code));
+    var t3: SemiTarget = semitarget_new(0x40000000, 256, 8);
+    semi_exit(&mut t3, 3);
+    println("64-bit exit 3: " + t3.host.calls.get(0) + " reason 0x" + int_to_hex(t3.host.exit_reason) + " status " + int_to_str(t3.host.exit_code)
+        + ", block " + hexs(semimem_read_bytes(&t3.mem, t3.scratch, 16)));
+    t.host.ticks = 0x123456789;
+    t.host.cmdline = "fw --test";
+    val el: i64 = semi_elapsed(&mut t);
+    val fq: i64 = semi_trap(&mut t, SYS_TICKFREQ, 0);
+    println("elapsed " + int_to_str(el) + " freq " + int_to_str(fq) + ", cmdline: " + semi_cmdline(&mut t, 64));
+    println(int_to_str(t.host.calls.len()) + " calls, first " + t.host.calls.get(0) + " last " + t.host.calls.get(t.host.calls.len() - 1));
+}

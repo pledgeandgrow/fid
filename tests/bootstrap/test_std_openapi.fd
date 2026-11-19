@@ -1,0 +1,217 @@
+// stdlib/openapi: build a Pets API document from routes, serialize to JSON and YAML (the YAML reads back with stdlib yaml), parse the JSON back into the model, and validate requests (path templates, required and typed parameters, JSON bodies with $ref into components).
+// Expected output:
+// json valid: true
+// openapi: 3.1.0 title: "Pet Store"
+// paths: /pets /pets/mine /pets/{petId}
+// methods on /pets: get post
+// get petId param in: path
+// yaml:
+// components:
+//   schemas:
+//     Pet:
+//       properties:
+//         id:
+//           type: integer
+//         name:
+//           minLength: 1
+//           type: string
+//         tag:
+//           type: string
+//       required:
+//         - name
+//       type: object
+// info:
+//   title: Pet Store
+//   version: "1.0.0"
+// openapi: "3.1.0"
+// paths:
+//   /pets:
+//     get:
+//       operationId: listPets
+//       parameters:
+//         - in: query
+//           name: limit
+//           required: false
+//           schema:
+//             maximum: 100
+//             minimum: 1
+//             type: integer
+//       responses:
+//         "200":
+//           content:
+//             application/json:
+//               schema:
+//                 items:
+//                   "$ref": "#/components/schemas/Pet"
+//                 type: array
+//           description: A list of pets
+//       summary: List all pets
+//       tags:
+//         - pets
+//     post:
+//       operationId: createPet
+//       requestBody:
+//         content:
+//           application/json:
+//             schema:
+//               "$ref": "#/components/schemas/Pet"
+//         required: true
+//       responses:
+//         "201":
+//           description: Created
+//       tags:
+//         - pets
+//   /pets/mine:
+//     get:
+//       operationId: myPets
+//       responses:
+//         "200":
+//           description: Mine
+//   "/pets/{petId}":
+//     get:
+//       operationId: showPetById
+//       parameters:
+//         - in: path
+//           name: petId
+//           required: true
+//           schema:
+//             type: integer
+//         - in: header
+//           name: X-Request-Id
+//           required: true
+//           schema:
+//             pattern: "^[0-9a-f]{8}$"
+//             type: string
+//       responses:
+//         "200":
+//           content:
+//             application/json:
+//               schema:
+//                 "$ref": "#/components/schemas/Pet"
+//           description: Expected response
+//         "404":
+//           description: Not found
+// servers:
+//   - url: "https://api.example.com/v1"
+//
+// yaml reads back: true 
+//   openapi=3.1.0 title=Pet Store
+//   limit max=100
+//   required name=name
+// parsed: Pet Store 1.0.0 routes=4 schemas=1 server=https://api.example.com/v1
+// same json after parse: true
+// GET /pets?limit=20: ok
+// GET /pets?limit=500: 1 error(s)
+//   query parameter "limit": #: number 500 > maximum 100
+// GET /pets?limit=ten: 1 error(s)
+//   query parameter "limit": #: type is string, expected integer
+// GET /pets/42: ok
+// GET /pets/abc: 2 error(s)
+//   path parameter "petId": #: type is string, expected integer
+//   header parameter "X-Request-Id" is required
+// GET /pets/mine: ok
+// POST /pets: ok
+// POST /pets bad body: 2 error(s)
+//   body #: missing required property "name"
+//   body #/id: type is string, expected integer
+// POST /pets no body: 1 error(s)
+//   request body is required
+// DELETE /pets/1: 1 error(s)
+//   no operation for DELETE /pets/1
+use openapi;
+use json;
+use yaml;
+use vec;
+use string;
+
+fn show(label: str, errs: Vec<str>) {
+    if errs.len() == 0 {
+        println(label + ": ok");
+        return;
+    }
+    println(label + ": " + int_to_str(errs.len()) + " error(s)");
+    var i: i64 = 0;
+    while i < errs.len() { println("  " + errs.get(i)); i = i + 1; }
+}
+
+fn build() -> ApiDoc {
+    var d: ApiDoc = openapi_new("Pet Store", "1.0.0");
+    d.servers.push("https://api.example.com/v1");
+    openapi_schema(& mut d, "Pet", "{\"type\":\"object\",\"required\":[\"name\"],\"properties\":{\"id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\",\"minLength\":1},\"tag\":{\"type\":\"string\"}}}");
+
+    var list: ApiRoute = openapi_route("GET", "/pets", "listPets");
+    list.summary = "List all pets";
+    list.tags.push("pets");
+    openapi_param(& mut list, "limit", "query", false, "{\"type\":\"integer\",\"minimum\":1,\"maximum\":100}");
+    openapi_response(& mut list, "200", "A list of pets", "{\"type\":\"array\",\"items\":{\"$ref\":\"#/components/schemas/Pet\"}}");
+    d.routes.push(list);
+
+    var create: ApiRoute = openapi_route("post", "/pets", "createPet");
+    create.tags.push("pets");
+    openapi_body(& mut create, "{\"$ref\":\"#/components/schemas/Pet\"}", true);
+    openapi_response(& mut create, "201", "Created", "");
+    d.routes.push(create);
+
+    var get: ApiRoute = openapi_route("get", "/pets/{petId}", "showPetById");
+    openapi_param(& mut get, "petId", "path", true, "{\"type\":\"integer\"}");
+    openapi_param(& mut get, "X-Request-Id", "header", true, "{\"type\":\"string\",\"pattern\":\"^[0-9a-f]{8}$\"}");
+    openapi_response(& mut get, "200", "Expected response", "{\"$ref\":\"#/components/schemas/Pet\"}");
+    openapi_response(& mut get, "404", "Not found", "");
+    d.routes.push(get);
+
+    var mine: ApiRoute = openapi_route("get", "/pets/mine", "myPets");
+    openapi_response(& mut mine, "200", "Mine", "");
+    d.routes.push(mine);
+    return d;
+}
+
+fn main() -> i64 {
+    val d: ApiDoc = build();
+    val text: str = openapi_to_json(& d);
+    println("json valid: " + bool_to_str(json_is_valid(text)));
+    println("openapi: " + json_get_str(text, "openapi") + " title: " + json_path(text, "info.title"));
+    println("paths: " + str_join(json_keys(json_get(text, "paths")), " "));
+    println("methods on /pets: " + str_join(json_keys(json_path(text, "paths./pets")), " "));
+    println("get petId param in: " + json_get_str(json_at(json_path(text, "paths./pets/{petId}.get.parameters"), 0), "in"));
+
+    val y: str = openapi_to_yaml(& d);
+    println("yaml:");
+    println(y);
+    val yd: YamlDoc = yaml_load(y);
+    println("yaml reads back: " + bool_to_str(yd.ok) + " " + yd.error);
+    println("  openapi=" + yaml_get_str(yd.entries, "openapi") + " title=" + yaml_get_str(yd.entries, "info.title"));
+    println("  limit max=" + int_to_str(yaml_get_int(yd.entries, "paths./pets.get.parameters.0.schema.maximum", - 1)));
+    println("  required name=" + yaml_get_str(yd.entries, "components.schemas.Pet.required.0"));
+
+    val back: ApiDoc = openapi_parse(text);
+    println("parsed: " + back.title + " " + back.version + " routes=" + int_to_str(back.routes.len()) + " schemas=" + int_to_str(back.schemas.len()) + " server=" + back.servers.get(0));
+    println("same json after parse: " + bool_to_str(openapi_to_json(& back) == text));
+
+    var r1: ApiRequest = openapi_request("GET", "/pets");
+    openapi_req_query(& mut r1, "limit", "20");
+    show("GET /pets?limit=20", openapi_check_request(& d, & r1));
+    var r2: ApiRequest = openapi_request("GET", "/pets");
+    openapi_req_query(& mut r2, "limit", "500");
+    show("GET /pets?limit=500", openapi_check_request(& d, & r2));
+    var r3: ApiRequest = openapi_request("GET", "/pets");
+    openapi_req_query(& mut r3, "limit", "ten");
+    show("GET /pets?limit=ten", openapi_check_request(& d, & r3));
+    var r4: ApiRequest = openapi_request("GET", "/pets/42");
+    openapi_req_header(& mut r4, "x-request-id", "0badf00d");
+    show("GET /pets/42", openapi_check_request(& d, & r4));
+    var r5: ApiRequest = openapi_request("GET", "/pets/abc");
+    show("GET /pets/abc", openapi_check_request(& d, & r5));
+    val r6: ApiRequest = openapi_request("GET", "/pets/mine");
+    show("GET /pets/mine", openapi_check_request(& d, & r6));
+    var r7: ApiRequest = openapi_request("POST", "/pets");
+    r7.body = "{\"name\":\"Rex\",\"tag\":\"dog\"}";
+    show("POST /pets", openapi_check_request(& d, & r7));
+    var r8: ApiRequest = openapi_request("POST", "/pets");
+    r8.body = "{\"id\":\"seven\"}";
+    show("POST /pets bad body", openapi_check_request(& d, & r8));
+    val r9: ApiRequest = openapi_request("POST", "/pets");
+    show("POST /pets no body", openapi_check_request(& d, & r9));
+    val r10: ApiRequest = openapi_request("DELETE", "/pets/1");
+    show("DELETE /pets/1", openapi_check_request(& d, & r10));
+    return 0;
+}

@@ -26,15 +26,30 @@ pub fn str_join(parts: Vec<str>, sep: str) -> str {
     if parts.len() == 0 {
         return "";
     }
-    var result: str = parts.get(0);
-    var i = 1;
+    // Single pass through a byte buffer: O(total bytes) instead of the
+    // O(len^2) of repeated string concatenation, and embedded NUL bytes
+    // survive (str concat truncates at NUL).
+    var out: Vec<i64> = Vec::new();
+    var sep_len = str_len(sep);
+    var i = 0;
     while i < parts.len() {
-        result = result + sep;
+        if i > 0 {
+            var s = 0;
+            while s < sep_len {
+                out.push(str_byte_at(sep, s));
+                s = s + 1;
+            }
+        }
         var part: str = parts.get(i);
-        result = result + part;
+        var n = str_len(part);
+        var j = 0;
+        while j < n {
+            out.push(str_byte_at(part, j));
+            j = j + 1;
+        }
         i = i + 1;
     }
-    return result;
+    return str_from_bytes(out);
 }
 
 /// Efficient join that avoids O(n^2) memory by building in batches.
@@ -80,14 +95,13 @@ pub fn str_join_ints(nums: Vec<i64>, sep: str) -> str {
     if nums.len() == 0 {
         return "";
     }
-    var result = int_to_str(nums.get(0));
-    var i = 1;
+    var parts: Vec<str> = Vec::new();
+    var i = 0;
     while i < nums.len() {
-        result = result + sep;
-        result = result + int_to_str(nums.get(i));
+        parts.push(int_to_str(nums.get(i)));
         i = i + 1;
     }
-    return result;
+    return str_join(parts, sep);
 }
 
 // ─── Transformations ────────────────────────────────────────────────────
@@ -421,20 +435,34 @@ pub fn int_to_str_padded(n: i64, width: i64) -> str {
 }
 
 /// Convert an i64 to a hex string (lowercase, no prefix).
+/// Negative values print as their 64-bit two's-complement bit pattern
+/// (int_to_hex(-1) == "ffffffffffffffff"), so i64::MIN formats correctly.
 ///
 /// Example:
 ///   assert_eq(int_to_hex(255), "ff");
 ///   assert_eq(int_to_hex(0), "0");
+///   assert_eq(int_to_hex(-1), "ffffffffffffffff");
+///   assert_eq(int_to_hex(-255), "ffffffffffffff01");
 pub fn int_to_hex(n: i64) -> str {
     if n == 0 {
         return "0";
     }
     var hex_chars = "0123456789abcdef";
     var bytes = Vec::new();
-    var value = n;
-    while value > 0 {
-        bytes.push(str_byte_at(hex_chars, value & 0xF));
-        value = value >> 4;
+    if n > 0 {
+        var value = n;
+        while value > 0 {
+            bytes.push(str_byte_at(hex_chars, value & 0xF));
+            value = value >> 4;
+        }
+    } else {
+        // Two's complement: extract nibbles with a logical right shift
+        // (mask off the sign bits arithmetic shift reinserts).
+        var value = n;
+        while value != 0 {
+            bytes.push(str_byte_at(hex_chars, value & 0xF));
+            value = (value >> 4) & 0x0FFFFFFFFFFFFFFF;
+        }
     }
     // Reverse
     var result = Vec::new();
@@ -447,25 +475,37 @@ pub fn int_to_hex(n: i64) -> str {
 }
 
 /// Convert an i64 to a binary string (no prefix).
+/// Negative values print as their 64-bit two's-complement bit pattern.
 ///
 /// Example:
 ///   assert_eq(int_to_bin(5), "101");
 ///   assert_eq(int_to_bin(0), "0");
+///   assert_eq(str_len(int_to_bin(-1)), 64);
 pub fn int_to_bin(n: i64) -> str {
     if n == 0 {
         return "0";
     }
     var bytes = Vec::new();
-    var value = n;
-    while value > 0 {
-        if (value & 1) == 1 {
-            bytes.push(49);
-            // '1'
-        } else {
-            bytes.push(48);
-            // '0'
+    if n > 0 {
+        var value = n;
+        while value > 0 {
+            if (value & 1) == 1 {
+                bytes.push(49);
+            } else {
+                bytes.push(48);
+            }
+            value = value >> 1;
         }
-        value = value >> 1;
+    } else {
+        var value = n;
+        while value != 0 {
+            if (value & 1) == 1 {
+                bytes.push(49);
+            } else {
+                bytes.push(48);
+            }
+            value = (value >> 1) & 0x7FFFFFFFFFFFFFFF;
+        }
     }
     // Reverse
     var result = Vec::new();
@@ -535,7 +575,7 @@ pub fn smallstr_to_str(s: SmallStr) -> str {
 }
 
 /// Check if a SmallStr is stored inline (no heap allocation).
-pub fn smallstr_is_inline(s: SmallStr) -> bool {
+pub fn smallstr_is_inline(_s: SmallStr) -> bool {
     return false;
 }
 
@@ -565,39 +605,84 @@ pub fn smallstr_eq(a: SmallStr, b: SmallStr) -> bool {
 //   value s = rope_to_str(r);  // "Hello, world!"
 //   value len = rope_len(r);   // 13
 
-/// A rope node. Either a leaf (containing a string fragment) or an
-/// internal node (concatenation of two sub-ropes).
+/// A rope: an ordered list of string fragments. rope_push appends a
+/// fragment in amortized O(1), rope_concat merges two ropes' fragment
+/// lists in O(#fragments) (a pointer copy, no text copied), and
+/// rope_to_str flattens in O(total bytes) exactly once.
 struct Rope {
-    is_leaf: bool,
-    leaf_str: str,
-    // valid if is_leaf
-    left: i64,
-    // pointer to left child (0 if leaf)
-    right: i64,
-    // pointer to right child (0 if leaf)
-    length: i64,  // total length of this subtree
+    parts: Vec<str>,
+    length: i64,  // total byte length over all fragments
 }
 
-/// Create a rope leaf from a string.
+/// Create an empty rope.
+///
+/// Example:
+///   var r = rope_empty();
+///   rope_push(&mut r, "a");
+///   assert_eq(rope_to_str(r), "a");
+pub fn rope_empty() -> Rope {
+    return Rope {
+        parts: Vec::new(), length: 0
+    };
+}
+
+/// Create a rope holding one fragment.
 ///
 /// Example:
 ///   var r = rope_new("Hello");
 ///   assert_eq(rope_len(r), 5);
 ///   assert_eq(rope_to_str(r), "Hello");
 pub fn rope_new(s: str) -> Rope {
+    var parts: Vec<str> = Vec::new();
+    parts.push(s);
     return Rope {
-        is_leaf: true, leaf_str: s, left: 0, right: 0, length: str_len(s),
+        parts: parts, length: str_len(s)
     };
 }
 
-/// Concatenate two ropes. O(1) — just creates a new internal node.
-/// The resulting rope shares structure with the inputs (no copying).
+/// Append a string fragment to the rope. Amortized O(1).
+///
+/// Example:
+///   var r = rope_new("a");
+///   rope_push(&mut r, "b");
+///   rope_push(&mut r, "c");
+///   assert_eq(rope_to_str(r), "abc");
+pub fn rope_push(r: & mut Rope, s: str) -> void {
+    r.length = r.length + str_len(s);
+    r.parts.push(s);
+}
+
+/// Concatenate two ropes: the result has left's fragments then right's.
+/// O(#fragments) — fragment references are copied, never the text.
+///
+/// Example:
+///   var r = rope_concat(rope_new("Hello, "), rope_new("world!"));
+///   assert_eq(rope_to_str(r), "Hello, world!");
 pub fn rope_concat(left: Rope, right: Rope) -> Rope {
+    var parts: Vec<str> = Vec::new();
+    var i = 0;
+    while i < left.parts.len() {
+        parts.push(left.parts.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < right.parts.len() {
+        parts.push(right.parts.get(i));
+        i = i + 1;
+    }
     return Rope {
-        is_leaf: false, leaf_str: "", left: 0,  // would store pointer to left
-        right: 0,  // would store pointer to right
-        length: left.length + right.length,
+        parts: parts, length: left.length + right.length
     };
+}
+
+/// Append all of `other`'s fragments to `r`. O(#fragments of other).
+pub fn rope_append(r: & mut Rope, other: Rope) -> void {
+    var i = 0;
+    while i < other.parts.len() {
+        r.parts.push(other.parts.get(i));
+        i = i + 1;
+    }
+    r.length = r.length + other.length;
 }
 
 /// Get the total length of a rope. O(1) — stored in the node.
@@ -605,16 +690,50 @@ pub fn rope_len(r: Rope) -> i64 {
     return r.length;
 }
 
-/// Convert a rope to a regular string. O(n) — flattens the tree.
+/// The number of fragments in the rope.
+pub fn rope_fragments(r: Rope) -> i64 {
+    return r.parts.len();
+}
+
+/// Convert a rope to a regular string. O(total bytes) — builds through a
+/// byte buffer once, so embedded NULs in fragments are preserved.
 pub fn rope_to_str(r: Rope) -> str {
-    if r.is_leaf {
-        return r.leaf_str;
+    var out: Vec<i64> = Vec::new();
+    var i = 0;
+    while i < r.parts.len() {
+        var part: str = r.parts.get(i);
+        var n = str_len(part);
+        var j = 0;
+        while j < n {
+            out.push(str_byte_at(part, j));
+            j = j + 1;
+        }
+        i = i + 1;
     }
-    // For internal nodes, flatten by concatenating children.
-    // Since we can't easily dereference pointers in Fides, we return
-    // the leaf string for leaf nodes and empty for internal nodes.
-    // A full implementation would use a Vec-based stack to walk the tree.
-    return "";
+    return str_from_bytes(out);
+}
+
+/// The byte at position `idx` in the flattened rope (clamped to bounds).
+///
+/// Example:
+///   var r = rope_new("hello");
+///   assert_eq(rope_byte_at(r, 1), 101);
+pub fn rope_byte_at(r: Rope, idx: i64) -> i64 {
+    if idx < 0 || idx >= r.length {
+        return 0;
+    }
+    var pos = idx;
+    var i = 0;
+    while i < r.parts.len() {
+        var part: str = r.parts.get(i);
+        var n = str_len(part);
+        if pos < n {
+            return str_byte_at(part, pos);
+        }
+        pos = pos - n;
+        i = i + 1;
+    }
+    return 0;
 }
 
 /// Create a rope from a substring of another rope.
@@ -845,4 +964,40 @@ impl StrView {
 
 fn sv_is_ws(c: i64) -> bool {
     return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+/// Parse an i64 with an optional +/- sign, or Option::None when the
+/// string is not a well-formed integer — unlike str_parse_int, which
+/// returns 0 both on failure and for the literal "0".
+///
+/// Example:
+///   match str_parse_int_opt("-12") {
+///     Option::Some(v) => { assert_eq(v, -12); }
+///     Option::None => { assert(false); }
+///   }
+///   match str_parse_int_opt("x") {
+///     Option::Some(v) => { assert(false); }
+///     Option::None => { assert(true); }
+///   }
+pub fn str_parse_int_opt(s: str) -> Option<i64> {
+    var n = str_len(s);
+    if n == 0 {
+        return Option::None;
+    }
+    var start = 0;
+    var c0 = str_byte_at(s, 0);
+    if c0 == 45 || c0 == 43 {
+        start = 1;
+    }
+    if start >= n {
+        return Option::None;
+    }
+    var i = start;
+    while i < n {
+        if !char_is_digit(str_byte_at(s, i)) {
+            return Option::None;
+        }
+        i = i + 1;
+    }
+    return Option::Some(str_parse_int(s));
 }

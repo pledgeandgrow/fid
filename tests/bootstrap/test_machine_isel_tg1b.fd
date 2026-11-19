@@ -1,0 +1,182 @@
+// Track TG (docs/roadmap/llvm-roadmap.md TG1), the machine layer
+// (compiler/nat_ir.fd ng_isel_rows_tg1b): the operations the hand-written
+// selection kept until Nov 17, now rows of the selection table on every
+// machine-layer target: division and remainder, signed and unsigned
+// (x86-64 IDIV / DIV over rax:rdx, AArch64 SDIV / UDIV and MSUB, RISC-V
+// DIV / DIVU / REM / REMU), the high half of a product and the sign mask
+// a checked multiplication compares (MULH, ASR63), integer <-> float
+// conversions for f64 and f32, AND NOT and the lowest set bit (ANDN /
+// BLSR: BMI1 with --cpu x86-64-v3, Zbb with --cpu rva23u64, BIC on
+// AArch64), selects (CSEL: CMOV, CSEL, Zicond or a branch over a move),
+// test-bit-and-branch (TBNZ), RISC-V's ADDW / SUBW / MULW (OPW) and
+// x86-64's ALU operation on a memory operand (ALUM). The output is the
+// same with FID_NAT_OFF=isel (the hand-written selection), and the image
+// is byte for byte the same (tests/nattools/isel_tg1b_check.sh, also
+// under each --cpu); FID_VERIFY=1 builds compare the two selections on
+// every case (nat_isel_tg1b_check). Run:
+//   NATIVE=1 bash scripts/cross-test.sh aarch64-linux (riscv64-linux,
+//   x86_64-linux, x86_64-windows), bash tests/nattools/isel_tg1b_check.sh.
+// Expected output:
+// 14 -14 -14 14 2 -2 -2 2
+// 6148914691236517205 -2 3074457345618258602 0
+// 0 -1 -1 -1 13 0
+// 3 -3 2 -2 7 1000000
+// 42 -7 3 1 1
+// 72 0 96 15 8 0
+// 9 9 4 -5 7
+// 1 0 1 0 1 0
+// -1294967296 -2147483648 2147483647 -1294967296
+// 15 -6 13 23
+
+struct Acc { a: i64, b: i64 }
+
+fn sdiv(a: i64, b: i64) -> i64 { return a / b; }
+fn srem(a: i64, b: i64) -> i64 { return a % b; }
+fn udiv(a: i64, b: i64) -> i64 { return ((a as u64) / (b as u64)) as i64; }
+fn urem(a: i64, b: i64) -> i64 { return ((a as u64) % (b as u64)) as i64; }
+
+// a checked product: the high half and the sign mask decide overflow
+fn prod(a: i64, b: i64) -> i64 { return a * b; }
+@wrapping fn sign_of(a: i64) -> i64 { return a >> 63; }
+
+fn to_i(x: f64) -> i64 { return x as i64; }
+fn to_f(x: i64) -> f64 { return x as f64; }
+fn to_i32f(x: f32) -> i64 { return x as i64; }
+fn to_f32(x: i64) -> f32 { return x as f32; }
+
+@wrapping fn andn(a: i64, b: i64) -> i64 { return ~a & b; }
+@wrapping fn blsr(a: i64) -> i64 { return a & (a - 1); }
+@wrapping fn blsmsk(a: i64) -> i64 { return a ^ (a - 1); }
+@wrapping fn blsi(a: i64) -> i64 { return a & (0 - a); }
+
+fn max2(a: i64, b: i64) -> i64 {
+    var x: i64 = 0;
+    if a < b {
+        x = b;
+    } else {
+        x = a;
+    }
+    return x;
+}
+
+fn pick(c: i64, a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    if c != 0 {
+        x = b;
+    }
+    return x;
+}
+
+fn bit3(x: i64) -> i64 {
+    if (x & 8) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn bit40(x: i64) -> i64 {
+    if (x & 1099511627776) == 0 {
+        return 0;
+    }
+    return 1;
+}
+
+@wrapping fn add32(a: i32, b: i32) -> i32 { return a + b; }
+@wrapping fn sub32(a: i32, b: i32) -> i32 { return a - b; }
+@wrapping fn mul32(a: i32, b: i32) -> i32 { return a * b; }
+
+fn sum_a(a: i64, p: &Acc) -> i64 { return a + p.a; }
+fn sub_b(a: i64, p: &Acc) -> i64 { return a - p.b; }
+fn and_a(a: i64, p: &Acc) -> i64 { return a & p.a; }
+fn or_b(a: i64, p: &Acc) -> i64 { return a | p.b; }
+
+fn line(v: Vec<i64>) {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn main() {
+    var l1: Vec<i64> = Vec::new();
+    l1.push(sdiv(100, 7));
+    l1.push(sdiv(0 - 100, 7));
+    l1.push(sdiv(100, 0 - 7));
+    l1.push(sdiv(0 - 100, 0 - 7));
+    l1.push(srem(100, 7));
+    l1.push(srem(0 - 100, 7));
+    l1.push(srem(100, 0 - 7) - 4);
+    l1.push(srem(0 - 100, 0 - 7) + 4);
+    line(l1);
+    var l2: Vec<i64> = Vec::new();
+    l2.push(udiv(0 - 1, 3));
+    l2.push(urem(0 - 1, 3) - 2);
+    l2.push(udiv(0 - 2, 6));
+    l2.push(urem(12, 4));
+    line(l2);
+    var l3: Vec<i64> = Vec::new();
+    l3.push(sign_of(5));
+    l3.push(sign_of(0 - 5));
+    l3.push(sign_of(0 - 9223372036854775807));
+    l3.push(udiv(5, 7) - 1);
+    l3.push(udiv(91, 7));
+    l3.push(urem(91, 7));
+    line(l3);
+    var l4: Vec<i64> = Vec::new();
+    l4.push(to_i(3.99));
+    l4.push(to_i(0.0 - 3.99));
+    l4.push(to_i(to_f(2)));
+    l4.push(to_i(to_f(0 - 2)));
+    l4.push(to_i32f(7.5 as f32));
+    l4.push(to_i32f(to_f32(1000000)));
+    line(l4);
+    var l5: Vec<i64> = Vec::new();
+    l5.push(prod(6, 7));
+    l5.push(prod(0 - 1, 7));
+    l5.push(prod(3, 1));
+    l5.push(bit3(10) + bit3(7));
+    l5.push(bit40(1099511627776) + bit40(5));
+    line(l5);
+    var l6: Vec<i64> = Vec::new();
+    l6.push(andn(5, 77));
+    l6.push(andn(0 - 1, 77));
+    l6.push(blsr(104));
+    l6.push(blsmsk(8));
+    l6.push(blsi(104));
+    l6.push(blsr(0));
+    line(l6);
+    var l7: Vec<i64> = Vec::new();
+    l7.push(max2(3, 9));
+    l7.push(max2(9, 3));
+    l7.push(pick(0, 4, 5));
+    l7.push(pick(1, 4, 0 - 5));
+    l7.push(pick(7, 0, 7));
+    line(l7);
+    var l8: Vec<i64> = Vec::new();
+    l8.push(bit3(8));
+    l8.push(bit3(0));
+    l8.push(bit3(0 - 1));
+    l8.push(bit40(0));
+    l8.push(bit40(0 - 1));
+    l8.push(bit40(1099511627775));
+    line(l8);
+    var l9: Vec<i64> = Vec::new();
+    l9.push(add32(2000000000, 1000000000) as i64);
+    l9.push(sub32(0 - 2147483647, 1) as i64);
+    l9.push(mul32(2147483647, 1) as i64);
+    l9.push(mul32(1000000000, 3) as i64);
+    line(l9);
+    var acc: Acc = Acc { a: 5, b: 6 };
+    var l10: Vec<i64> = Vec::new();
+    l10.push(sum_a(10, & acc));
+    l10.push(sub_b(0, & acc));
+    l10.push(and_a(13, & acc) + 8);
+    l10.push(or_b(17, & acc));
+    line(l10);
+}

@@ -1,0 +1,2055 @@
+// Fides TLS 1.3 handshake for QUIC (RFC 9001 §4, RFC 8446), pure Fides
+//
+// QUIC carries the TLS 1.3 handshake messages in CRYPTO frames instead of
+// TLS records; this module is the handshake state machine both ends run,
+// fed with the bytes of the CRYPTO frames of each encryption level and
+// producing the bytes to send at each level, plus the traffic secrets
+// stdlib/quic.fd turns into packet keys.
+//
+//   - Cipher suites TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256
+//     (the SHA-256 suites of stdlib/tls13.fd), key exchange X25519
+//     (stdlib/x25519.fd), signatures Ed25519 (stdlib/ed25519.fd).
+//   - The server authenticates with a self-signed X.509 certificate holding
+//     an Ed25519 key (quic_self_signed_cert makes one from a 32-byte seed);
+//     the client checks the certificate's own signature, the
+//     CertificateVerify and the Finished, and pins the server's public key
+//     when it is given one. A client may instead give trust anchors
+//     (quic_tls_set_roots or QuicConfig.roots): the presented chain is then
+//     verified with x509_verify_chain and, when a server name is set, the
+//     leaf must name it (x509_matches_host). With neither a pinned key nor
+//     anchors a client accepts any certificate (like `curl -k`) — but the
+//     CertificateVerify is still verified against the certificate's own
+//     key for every offered signature scheme: Ed25519, ECDSA
+//     (P-256/P-384/P-521), RSA-PSS and RSA PKCS#1 v1.5.
+//   - ALPN (RFC 7301) is required, as QUIC requires (RFC 9001 §8.1), and
+//     the quic_transport_parameters extension (0x39) carries the transport
+//     parameters (RFC 9001 §8.2).
+//   - HelloRetryRequest (RFC 8446 §4.1.4): a server asks a client whose
+//     ClientHello has no X25519 share for one (message_hash in the
+//     transcript); a client answers one, echoing a cookie.
+//   - Resumption (RFC 8446 §4.6.1, §2.2): a server with a ticket key sends
+//     a NewSessionTicket after the client's Finished, the ticket being its
+//     own state sealed with AES-128-GCM; a client keeps it (QuicTicket)
+//     and offers it with a PSK binder (psk_dhe_ke); the resumed handshake
+//     has no Certificate. 0-RTT (§4.2.10, RFC 9001 §4.6): the client's
+//     early traffic secret, early_data in the ClientHello and the
+//     EncryptedExtensions, taken only for the same suite and ALPN, a
+//     believable ticket age, and limits not lower than the ticket's.
+//   - Not here: client certificates, RSA/ECDSA certificates of our own,
+//     external PSKs, a cookie of our own in HelloRetryRequest.
+//
+// Failures are TLS alerts (`alert`), which QUIC sends as CRYPTO_ERROR
+// 0x100 + alert (RFC 9001 §4.8).
+//
+// Secrets: the handshake keeps its traffic secrets in the QuicTls value so
+// that the connection can derive packet keys from them. Keeping them is the
+// audited release (`@declassify`, complaint CO1) of qhs_keep_*: they are
+// never output, only held in memory for the life of the connection.
+
+module quic_tls;
+ use vec; use aes_gcm; use crypto; use ed25519; use quic; use quic_frame; use tls13; use tls_crypto; use x25519; use x509; use pem; use ecdsa; use rsa; use kdf; use time;
+
+// ─── Constants ──────────────────────────────────────────────────────────
+
+/// Handshake message types (RFC 8446 §4).
+pub const QT_CLIENT_HELLO: i64 = 1;
+pub const QT_SERVER_HELLO: i64 = 2;
+pub const QT_NEW_SESSION_TICKET: i64 = 4;
+pub const QT_ENCRYPTED_EXTENSIONS: i64 = 8;
+pub const QT_CERTIFICATE: i64 = 11;
+pub const QT_CERTIFICATE_VERIFY: i64 = 15;
+pub const QT_FINISHED: i64 = 20;
+
+/// Cipher suites (RFC 8446 §B.4).
+pub const QT_TLS_AES_128_GCM_SHA256: i64 = 0x1301;
+pub const QT_TLS_CHACHA20_POLY1305_SHA256: i64 = 0x1303;
+
+/// Alerts (RFC 8446 §6).
+pub const QA_UNEXPECTED_MESSAGE: i64 = 10;
+pub const QA_HANDSHAKE_FAILURE: i64 = 40;
+pub const QA_BAD_CERTIFICATE: i64 = 42;
+pub const QA_UNSUPPORTED_CERTIFICATE: i64 = 43;
+pub const QA_ILLEGAL_PARAMETER: i64 = 47;
+pub const QA_DECODE_ERROR: i64 = 50;
+pub const QA_DECRYPT_ERROR: i64 = 51;
+pub const QA_PROTOCOL_VERSION: i64 = 70;
+pub const QA_INTERNAL_ERROR: i64 = 80;
+pub const QA_MISSING_EXTENSION: i64 = 109;
+pub const QA_NO_APPLICATION_PROTOCOL: i64 = 120;
+
+/// States of the handshake.
+pub const QTS_CLIENT_START: i64 = 0;
+pub const QTS_WAIT_SH: i64 = 1;
+pub const QTS_WAIT_EE: i64 = 2;
+pub const QTS_WAIT_CERT: i64 = 3;
+pub const QTS_WAIT_CV: i64 = 4;
+pub const QTS_WAIT_FIN: i64 = 5;
+pub const QTS_WAIT_CH: i64 = 6;
+pub const QTS_WAIT_CLIENT_FIN: i64 = 7;
+pub const QTS_DONE: i64 = 8;
+pub const QTS_FAILED: i64 = 9;
+
+/// The largest handshake message we take, and how much of a level may
+/// wait unparsed.
+const QHS_MAX_MESSAGE: i64 = 65536;
+
+/// One end of the handshake.
+///   - `out_initial`, `out_handshake`: bytes to send in CRYPTO frames at
+///     that level (the connection takes them and clears the field);
+///   - `hs_ready` once the handshake traffic secrets exist (`hs_client`,
+///     `hs_server`), `ap_ready` once the application ones do (`ap_client`,
+///     `ap_server`; a server has them as soon as it sent its Finished, and
+///     may send 1-RTT packets but must not read them before `complete`);
+///   - `complete` once the peer's Finished checked out (server) or ours
+///     is queued (client);
+///   - `alert` -1, or the alert the handshake failed with (`why` says why).
+pub struct QuicTls {
+    pub server: bool,
+    pub state: i64,
+    pub suites: Vec<i64>,
+    pub alpn_offer: Vec<str>,
+    pub alpn: str,
+    pub server_name: str,
+    pub peer_server_name: str,
+    pub cert: Vec<i64>,
+    pub key_seed: Vec<i64>,
+    pub peer_key: Vec<i64>,
+    pub peer_cert_key: Vec<i64>,
+    // The certificate the peer presented: its SubjectPublicKeyInfo, the
+    // parsed chain (leaf first) and the client's trust anchors (empty:
+    // accept any). `peer_cert_key` keeps the Ed25519 fast path.
+    pub peer_spki: Spki,
+    pub peer_chain: Vec<X509Cert>,
+    pub trust_anchors: Vec<X509Cert>,
+    pub eph_secret: Vec<i64>,
+    pub random: Vec<i64>,
+    pub local_params: Vec<i64>,
+    pub peer_params: Vec<i64>,
+    pub suite: i64,
+    pub transcript: Vec<i64>,
+    pub hs_client: Vec<i64>,
+    pub hs_server: Vec<i64>,
+    pub master: Vec<i64>,
+    pub ap_client: Vec<i64>,
+    pub ap_server: Vec<i64>,
+    pub in_initial: Vec<i64>,
+    pub in_handshake: Vec<i64>,
+    pub in_app: Vec<i64>,
+    pub out_initial: Vec<i64>,
+    pub out_handshake: Vec<i64>,
+    pub hs_ready: bool,
+    pub ap_ready: bool,
+    pub complete: bool,
+    pub alert: i64,
+    pub why: str,
+    // HelloRetryRequest (RFC 8446 §4.1.4): whether the client's first
+    // ClientHello carries its X25519 share (`key_share_first`), whether a
+    // HelloRetryRequest was sent or received, its cipher suite and cookie
+    pub key_share_first: bool,
+    pub hrr: bool,
+    pub hrr_suite: i64,
+    pub cookie: Vec<i64>,
+    // Resumption and 0-RTT (RFC 8446 §4.6.1, §4.2.10, §4.2.11; RFC 9001
+    // §4.6): the time (ms) the connection gives with each input, the
+    // server's ticket key (16 bytes; empty: no tickets) and whether it
+    // takes early data; the ticket a client resumes with (`offer`) and
+    // whether it offers early data; the PSK in use, the client's early
+    // traffic secret, the resumption master secret, the ticket a client
+    // received, 1-RTT handshake bytes to send (NewSessionTicket)
+    pub now: i64,
+    pub extra_rand: Vec<i64>,
+    pub ticket_key: Vec<i64>,
+    pub early_data: bool,
+    pub offer: QuicTicket,
+    pub has_offer: bool,
+    pub psk: Vec<i64>,
+    pub resumed: bool,
+    pub early_offered: bool,
+    pub early_ready: bool,
+    pub early_accepted: bool,
+    pub early_client: Vec<i64>,
+    pub resumption: Vec<i64>,
+    pub ticket: QuicTicket,
+    pub has_ticket: bool,
+    pub tickets_sent: i64,
+    pub out_app: Vec<i64>,
+}
+
+/// A session ticket a client keeps to resume a connection later (RFC 8446
+/// §4.6.1): the server's opaque `ticket`, the PSK it stands for (secret:
+/// keep it as you keep a key), the cipher suite, ALPN and server name of
+/// the connection it came from, the age obfuscator, its lifetime and when
+/// it was received (ms), the most early data the server takes (0: no
+/// 0-RTT; QUIC requires 0xffffffff), and the server's transport parameters
+/// (the limits 0-RTT data must stay within, RFC 9000 §7.4.1).
+pub struct QuicTicket {
+    pub ticket: Vec<i64>,
+    pub psk: Vec<i64>,
+    pub suite: i64,
+    pub alpn: str,
+    pub server_name: str,
+    pub age_add: i64,
+    pub lifetime_ms: i64,
+    pub received_ms: i64,
+    pub max_early_data: i64,
+    pub params: Vec<i64>,
+}
+
+/// No ticket.
+pub fn quic_ticket_none() -> QuicTicket {
+    return QuicTicket { ticket: qhs_none(), psk: qhs_none(), suite: 0, alpn: "", server_name: "",
+        age_add: 0, lifetime_ms: 0, received_ms: 0, max_early_data: 0, params: qhs_none() };
+}
+
+/// Whether a ticket can still be offered at `now` (ms).
+pub fn quic_ticket_valid(tk: & QuicTicket, now: i64) -> bool {
+    return tk.ticket.len() > 0 && tk.psk.len() == 32 && now >= tk.received_ms
+        && now - tk.received_ms < tk.lifetime_ms;
+}
+
+/// Handshake message types and extensions used for resumption and
+/// HelloRetryRequest.
+const QHS_MESSAGE_HASH: i64 = 254;
+const QHS_EXT_PSK: i64 = 0x0029;
+const QHS_EXT_EARLY_DATA: i64 = 0x002a;
+const QHS_EXT_COOKIE: i64 = 0x002c;
+const QHS_EXT_PSK_MODES: i64 = 0x002d;
+/// How long our tickets live (7 days at most, RFC 8446 §4.6.1).
+const QHS_TICKET_LIFETIME_S: i64 = 86400;
+/// The most a client's view of a ticket's age may differ from ours for
+/// its early data to be taken (RFC 8446 §8.3).
+const QHS_AGE_SKEW_MS: i64 = 10000;
+
+// ─── Bytes ──────────────────────────────────────────────────────────────
+
+fn qhs_none() -> Vec<i64> {
+    var none: Vec<i64> = Vec::new();
+    return none;
+}
+
+fn qhs_put(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+fn qhs_u16(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+fn qhs_u24(out: & mut Vec<i64>, v: i64) {
+    out.push((v >> 16) & 255);
+    out.push((v >> 8) & 255);
+    out.push(v & 255);
+}
+
+/// u16 length || v
+fn qhs_vec16(out: & mut Vec<i64>, v: Vec<i64>) {
+    qhs_u16(out, v.len());
+    qhs_put(out, v);
+}
+
+/// An extension: type, u16 length, data.
+fn qhs_ext(out: & mut Vec<i64>, etype: i64, data: Vec<i64>) {
+    qhs_u16(out, etype);
+    qhs_vec16(out, data);
+}
+
+/// A handshake message: type, u24 length, body.
+fn qhs_msg(mtype: i64, body: Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    m.push(mtype);
+    qhs_u24(& mut m, body.len());
+    qhs_put(& mut m, body);
+    return m;
+}
+
+fn qhs_same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if (a.get(i) & 255) != (b.get(i) & 255) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A bounds-checked reader: every read past the end sets `bad`.
+struct QhsReader {
+    b: Vec<i64>,
+    pos: i64,
+    end: i64,
+    bad: bool,
+}
+
+fn qhs_reader(b: Vec<i64>) -> QhsReader {
+    return QhsReader { b: b, pos: 0, end: b.len(), bad: false };
+}
+
+fn qhs_r8(r: & mut QhsReader) -> i64 {
+    if r.bad || r.pos + 1 > r.end {
+        r.bad = true;
+        return 0;
+    }
+    val v: i64 = r.b.get(r.pos) & 255;
+    r.pos = r.pos + 1;
+    return v;
+}
+
+fn qhs_r16(r: & mut QhsReader) -> i64 {
+    val hi: i64 = qhs_r8(r);
+    val lo: i64 = qhs_r8(r);
+    return (hi << 8) | lo;
+}
+
+fn qhs_r24(r: & mut QhsReader) -> i64 {
+    val a: i64 = qhs_r8(r);
+    val b: i64 = qhs_r8(r);
+    val c: i64 = qhs_r8(r);
+    return (a << 16) | (b << 8) | c;
+}
+
+fn qhs_r32(r: & mut QhsReader) -> i64 {
+    val hi: i64 = qhs_r16(r);
+    val lo: i64 = qhs_r16(r);
+    return (hi << 16) | lo;
+}
+
+fn qhs_rbytes(r: & mut QhsReader, n: i64) -> Vec<i64> {
+    if r.bad || n < 0 || r.pos + n > r.end {
+        r.bad = true;
+        return qhs_none();
+    }
+    val out: Vec<i64> = quic_slice(r.b, r.pos, r.pos + n);
+    r.pos = r.pos + n;
+    return out;
+}
+
+/// The extensions of a hello or EncryptedExtensions: types and data, in
+/// order. `dup` is set when a type appears twice (illegal_parameter).
+struct QhsExts {
+    types: Vec<i64>,
+    datas: Vec<Vec<i64>>,
+    ok: bool,
+    dup: bool,
+}
+
+fn qhs_parse_exts(b: Vec<i64>) -> QhsExts {
+    var e: QhsExts = QhsExts { types: Vec::new(), datas: Vec::new(), ok: true, dup: false };
+    var r: QhsReader = qhs_reader(b);
+    while r.pos < r.end && !r.bad {
+        val t: i64 = qhs_r16(& mut r);
+        val n: i64 = qhs_r16(& mut r);
+        val d: Vec<i64> = qhs_rbytes(& mut r, n);
+        if r.bad {
+            e.ok = false;
+            return e;
+        }
+        var k: i64 = 0;
+        while k < e.types.len() {
+            if e.types.get(k) == t {
+                e.dup = true;
+            }
+            k = k + 1;
+        }
+        e.types.push(t);
+        e.datas.push(d);
+    }
+    if r.bad {
+        e.ok = false;
+    }
+    return e;
+}
+
+fn qhs_ext_index(e: QhsExts, t: i64) -> i64 {
+    var k: i64 = 0;
+    while k < e.types.len() {
+        if e.types.get(k) == t {
+            return k;
+        }
+        k = k + 1;
+    }
+    return - 1;
+}
+
+// ─── Secrets kept by the connection (audited releases) ──────────────────
+
+/// X25519(secret, peer) kept by the handshake; empty when the peer's
+/// share is not 32 bytes or gives the all-zero secret.
+@declassify fn qhs_keep_shared(secret: Vec<i64>, peer_public: Vec<i64>) -> Vec<i64> {
+    if peer_public.len() != 32 || secret.len() != 32 {
+        return qhs_none();
+    }
+    match x25519_shared_secret(secret, peer_public) {
+        Option::Some(k) => {
+            return k;
+        }
+        Option::None => {
+            return qhs_none();
+        }
+    }
+    return qhs_none();
+}
+
+/// The handshake secrets of a (EC)DHE shared secret, kept by the handshake.
+@declassify fn qhs_keep_handshake(shared: Vec<i64>, hello_hash: Vec<i64>) -> Tls13Schedule {
+    return tls13_schedule_handshake(qhs_none(), shared, hello_hash);
+}
+
+/// The application secrets, kept by the handshake.
+@declassify fn qhs_keep_application(s: Tls13Schedule, finished_hash: Vec<i64>) -> Tls13Schedule {
+    return tls13_schedule_application(s, finished_hash);
+}
+
+/// The handshake secrets of a resumed handshake: the early secret from
+/// the PSK, then the (EC)DHE shared secret (psk_dhe_ke).
+@declassify fn qhs_keep_handshake_psk(psk: Vec<i64>, shared: Vec<i64>, hello_hash: Vec<i64>) -> Tls13Schedule {
+    return tls13_schedule_handshake(psk, shared, hello_hash);
+}
+
+/// The resumption master secret over Transcript-Hash(ClientHello..client
+/// Finished), kept to make or read session tickets.
+@declassify fn qhs_keep_resumption(master: Vec<i64>, client_finished_hash: Vec<i64>) -> Vec<i64> {
+    return tls13_derive_secret(master, "res master", client_finished_hash);
+}
+
+/// The PSK of a ticket (RFC 8446 §4.6.1): HKDF-Expand-Label(resumption
+/// master secret, "resumption", ticket_nonce, 32).
+@declassify fn qhs_keep_psk(resumption: Vec<i64>, nonce: Vec<i64>) -> Vec<i64> {
+    return hkdf_expand_label(resumption, "resumption", nonce, 32);
+}
+
+/// client_early_traffic_secret over Transcript-Hash(ClientHello).
+@declassify fn qhs_keep_early(psk: Vec<i64>, ch_hash: Vec<i64>) -> Vec<i64> {
+    return tls13_derive_secret(tls13_early_secret(psk), "c e traffic", ch_hash);
+}
+
+/// A PSK binder (RFC 8446 §4.2.11.2): the Finished MAC under the
+/// resumption binder key over the hash of the truncated ClientHello.
+/// Released: it is sent.
+@declassify fn qhs_binder(psk: Vec<i64>, truncated_hash: Vec<i64>) -> Vec<i64> {
+    return tls13_finished_verify_data(tls13_binder_key(tls13_early_secret(psk), false), truncated_hash);
+}
+
+/// A ticket the server sealed with its ticket key: the plaintext (it holds
+/// a PSK), [] when it does not open.
+@declassify fn qhs_open_ticket(key: Vec<i64>, ticket: Vec<i64>) -> Vec<i64> {
+    if ticket.len() < 12 + 16 || key.len() != 16 {
+        return qhs_none();
+    }
+    val o: GcmOpened = aes_gcm_open(key, quic_slice(ticket, 0, 12), str_bytes("fides quic ticket 1"),
+        quic_slice(ticket, 12, ticket.len()));
+    if !o.ok {
+        return qhs_none();
+    }
+    return o.plain;
+}
+
+/// Seal a ticket's plaintext: nonce || AES-128-GCM. Released: it is sent.
+@declassify fn qhs_seal_ticket(key: Vec<i64>, nonce: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = nonce;
+    qhs_put(& mut out, aes_gcm_seal(key, nonce, str_bytes("fides quic ticket 1"), plain));
+    return out;
+}
+
+/// The public key of the ephemeral X25519 secret.
+fn qhs_eph_public(t: & QuicTls) -> Vec<i64> {
+    return x25519_public_key(t.eph_secret);
+}
+
+// ─── Certificates (a self-signed Ed25519 X.509 certificate) ─────────────
+
+/// A DER element: tag, definite length, content.
+fn qhs_der(tag: i64, content: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(tag);
+    val n: i64 = content.len();
+    if n < 128 {
+        out.push(n);
+    } else if n < 256 {
+        out.push(0x81);
+        out.push(n);
+    } else {
+        out.push(0x82);
+        out.push((n >> 8) & 255);
+        out.push(n & 255);
+    }
+    qhs_put(& mut out, content);
+    return out;
+}
+
+fn qhs_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    qhs_put(& mut out, b);
+    return out;
+}
+
+/// AlgorithmIdentifier of Ed25519 (OID 1.3.101.112, no parameters).
+fn qhs_ed25519_alg() -> Vec<i64> {
+    var oid: Vec<i64> = Vec::new();
+    oid.push(0x2b);
+    oid.push(0x65);
+    oid.push(0x70);
+    return qhs_der(0x30, qhs_der(0x06, oid));
+}
+
+/// Name ::= SEQUENCE { SET { SEQUENCE { commonName, UTF8String } } }
+fn qhs_der_name(cn: str) -> Vec<i64> {
+    var oid: Vec<i64> = Vec::new();
+    oid.push(0x55);
+    oid.push(0x04);
+    oid.push(0x03);
+    val atv: Vec<i64> = qhs_der(0x30, qhs_cat(qhs_der(0x06, oid), qhs_der(0x0c, str_bytes(cn))));
+    return qhs_der(0x30, qhs_der(0x31, atv));
+}
+
+/// SubjectPublicKeyInfo of an Ed25519 key.
+fn qhs_der_spki(pk: Vec<i64>) -> Vec<i64> {
+    var bits: Vec<i64> = Vec::new();
+    bits.push(0);
+    qhs_put(& mut bits, pk);
+    return qhs_der(0x30, qhs_cat(qhs_ed25519_alg(), qhs_der(0x03, bits)));
+}
+
+/// The TBSCertificate of a self-signed certificate for `name`, valid from
+/// 2025-01-01 to 2049-12-31, with a subjectAltName dNSName.
+fn qhs_tbs(pk: Vec<i64>, name: str) -> Vec<i64> {
+    var body: Vec<i64> = Vec::new();
+    // [0] EXPLICIT Version v3
+    var v3: Vec<i64> = Vec::new();
+    v3.push(0x02);
+    v3.push(0x01);
+    v3.push(0x02);
+    qhs_put(& mut body, qhs_der(0xa0, v3));
+    // serialNumber: 8 bytes of SHA-256(pk), positive, minimal
+    val h: Vec<i64> = crypto_sha256_bytes(pk);
+    var serial: Vec<i64> = quic_slice(h, 0, 8);
+    serial.set(0, (serial.get(0) & 0x3f) | 0x40);
+    qhs_put(& mut body, qhs_der(0x02, serial));
+    qhs_put(& mut body, qhs_ed25519_alg());
+    qhs_put(& mut body, qhs_der_name(name));
+    val validity: Vec<i64> = qhs_der(0x30, qhs_cat(qhs_der(0x17, str_bytes("250101000000Z")),
+        qhs_der(0x17, str_bytes("491231235959Z"))));
+    qhs_put(& mut body, validity);
+    qhs_put(& mut body, qhs_der_name(name));
+    qhs_put(& mut body, qhs_der_spki(pk));
+    // [3] Extensions { subjectAltName { dNSName name } }
+    var san_oid: Vec<i64> = Vec::new();
+    san_oid.push(0x55);
+    san_oid.push(0x1d);
+    san_oid.push(0x11);
+    val gn: Vec<i64> = qhs_der(0x30, qhs_der(0x82, str_bytes(name)));
+    val ext: Vec<i64> = qhs_der(0x30, qhs_cat(qhs_der(0x06, san_oid), qhs_der(0x04, gn)));
+    qhs_put(& mut body, qhs_der(0xa3, qhs_der(0x30, ext)));
+    return qhs_der(0x30, body);
+}
+
+/// A self-signed X.509 v3 certificate (DER) for `name` whose key is the
+/// Ed25519 key of the 32-byte `seed`, signed with that key.
+pub fn quic_self_signed_cert(seed: Vec<i64>, name: str) -> Vec<i64> {
+    val pk: Vec<i64> = ed25519_public_key(seed);
+    val tbs: Vec<i64> = qhs_tbs(pk, name);
+    var sigbits: Vec<i64> = Vec::new();
+    sigbits.push(0);
+    qhs_put(& mut sigbits, ed25519_sign(seed, tbs));
+    var body: Vec<i64> = tbs;
+    qhs_put(& mut body, qhs_ed25519_alg());
+    qhs_put(& mut body, qhs_der(0x03, sigbits));
+    return qhs_der(0x30, body);
+}
+
+/// A DER element read at `off`: content from `start` for `len` bytes,
+/// the element ends at `end`.
+struct QhsDer {
+    ok: bool,
+    tag: i64,
+    start: i64,
+    len: i64,
+    end: i64,
+}
+
+fn qhs_der_at(b: Vec<i64>, off: i64, limit: i64) -> QhsDer {
+    val bad: QhsDer = QhsDer { ok: false, tag: 0, start: 0, len: 0, end: 0 };
+    if off + 2 > limit || limit > b.len() {
+        return bad;
+    }
+    val tag: i64 = b.get(off) & 255;
+    val l0: i64 = b.get(off + 1) & 255;
+    var start: i64 = off + 2;
+    var len: i64 = l0;
+    if l0 == 0x81 {
+        if off + 3 > limit {
+            return bad;
+        }
+        len = b.get(off + 2) & 255;
+        start = off + 3;
+    } else if l0 == 0x82 {
+        if off + 4 > limit {
+            return bad;
+        }
+        len = ((b.get(off + 2) & 255) << 8) | (b.get(off + 3) & 255);
+        start = off + 4;
+    } else if l0 >= 0x80 {
+        return bad;
+    }
+    if start + len > limit {
+        return bad;
+    }
+    return QhsDer { ok: true, tag: tag, start: start, len: len, end: start + len };
+}
+
+/// The parts of a certificate: the TBSCertificate's bytes, the subject's
+/// Ed25519 key, the signature algorithm and signature. `ok` false when it
+/// is not a well-formed certificate with an Ed25519 key.
+struct QhsCert {
+    ok: bool,
+    tbs: Vec<i64>,
+    key: Vec<i64>,
+    ed25519_signed: bool,
+    sig: Vec<i64>,
+}
+
+fn qhs_is_ed25519_alg(b: Vec<i64>, e: QhsDer) -> bool {
+    if !e.ok || e.tag != 0x30 || e.len != 5 {
+        return false;
+    }
+    return (b.get(e.start) & 255) == 0x06 && (b.get(e.start + 1) & 255) == 3
+        && (b.get(e.start + 2) & 255) == 0x2b && (b.get(e.start + 3) & 255) == 0x65
+        && (b.get(e.start + 4) & 255) == 0x70;
+}
+
+fn qhs_parse_cert(c: Vec<i64>) -> QhsCert {
+    val bad: QhsCert = QhsCert { ok: false, tbs: qhs_none(), key: qhs_none(), ed25519_signed: false, sig: qhs_none() };
+    val outer: QhsDer = qhs_der_at(c, 0, c.len());
+    if !outer.ok || outer.tag != 0x30 || outer.end != c.len() {
+        return bad;
+    }
+    val tbs: QhsDer = qhs_der_at(c, outer.start, outer.end);
+    if !tbs.ok || tbs.tag != 0x30 {
+        return bad;
+    }
+    val alg: QhsDer = qhs_der_at(c, tbs.end, outer.end);
+    if !alg.ok {
+        return bad;
+    }
+    val sig: QhsDer = qhs_der_at(c, alg.end, outer.end);
+    if !sig.ok || sig.tag != 0x03 || sig.len < 1 || (c.get(sig.start) & 255) != 0 {
+        return bad;
+    }
+    // TBSCertificate: [version], serial, signature, issuer, validity,
+    // subject, subjectPublicKeyInfo, ...
+    var off: i64 = tbs.start;
+    var idx: i64 = 0;
+    var e: QhsDer = qhs_der_at(c, off, tbs.end);
+    if e.ok && e.tag == 0xa0 {
+        off = e.end;
+    }
+    var spki: QhsDer = QhsDer { ok: false, tag: 0, start: 0, len: 0, end: 0 };
+    while idx < 6 {
+        e = qhs_der_at(c, off, tbs.end);
+        if !e.ok {
+            return bad;
+        }
+        if idx == 5 {
+            spki = e;
+        }
+        off = e.end;
+        idx = idx + 1;
+    }
+    if spki.tag != 0x30 {
+        return bad;
+    }
+    val salg: QhsDer = qhs_der_at(c, spki.start, spki.end);
+    if !qhs_is_ed25519_alg(c, salg) {
+        return bad;
+    }
+    val bits: QhsDer = qhs_der_at(c, salg.end, spki.end);
+    if !bits.ok || bits.tag != 0x03 || bits.len != 33 || (c.get(bits.start) & 255) != 0 {
+        return bad;
+    }
+    return QhsCert {
+        ok: true,
+        tbs: quic_slice(c, outer.start, tbs.end),
+        key: quic_slice(c, bits.start + 1, bits.end),
+        ed25519_signed: qhs_is_ed25519_alg(c, alg),
+        sig: quic_slice(c, sig.start + 1, sig.end),
+    };
+}
+
+/// The Ed25519 public key of a certificate (DER); empty when it is not a
+/// well-formed certificate for an Ed25519 key.
+pub fn quic_cert_ed25519_key(cert: Vec<i64>) -> Vec<i64> {
+    val p: QhsCert = qhs_parse_cert(cert);
+    if !p.ok {
+        return qhs_none();
+    }
+    return p.key;
+}
+
+/// Whether a certificate is signed with Ed25519 by its own key.
+pub fn quic_cert_self_signed_ok(cert: Vec<i64>) -> bool {
+    val p: QhsCert = qhs_parse_cert(cert);
+    if !p.ok || !p.ed25519_signed {
+        return false;
+    }
+    return ed25519_verify(p.key, p.tbs, p.sig);
+}
+
+// ─── The handshake ──────────────────────────────────────────────────────
+
+/// A handshake end. `random` is 32 bytes and `eph_secret` the 32-byte
+/// X25519 secret (the connection draws both). Client: `alpn` the protocols
+/// it offers, `server_name` the SNI (may be empty), `peer_key` the server's
+/// Ed25519 public key to pin (empty: accept any). Server: `alpn` the
+/// protocols it accepts in its order of preference, `cert` its DER
+/// certificate and `key_seed` the 32-byte seed of the certificate's key.
+/// `suites` the cipher suites in order of preference. `params` the
+/// encoded transport parameters to send.
+pub fn quic_tls_new(server: bool, suites: Vec<i64>, alpn: Vec<str>, server_name: str,
+        cert: Vec<i64>, key_seed: Vec<i64>, peer_key: Vec<i64>, random: Vec<i64>,
+        eph_secret: Vec<i64>, params: Vec<i64>) -> QuicTls {
+    var st: i64 = QTS_CLIENT_START;
+    if server {
+        st = QTS_WAIT_CH;
+    }
+    return QuicTls {
+        server: server, state: st, suites: suites, alpn_offer: alpn, alpn: "",
+        server_name: server_name, peer_server_name: "", cert: cert, key_seed: key_seed,
+        peer_key: peer_key, peer_cert_key: qhs_none(),
+        peer_spki: Spki { ok: false, alg: "", params: "", key: Vec::new() },
+        peer_chain: Vec::new(), trust_anchors: Vec::new(),
+        eph_secret: eph_secret, random: random,
+        local_params: params, peer_params: qhs_none(), suite: 0, transcript: Vec::new(),
+        hs_client: qhs_none(), hs_server: qhs_none(), master: qhs_none(),
+        ap_client: qhs_none(), ap_server: qhs_none(), in_initial: Vec::new(),
+        in_handshake: Vec::new(), in_app: Vec::new(), out_initial: Vec::new(),
+        out_handshake: Vec::new(), hs_ready: false, ap_ready: false, complete: false,
+        alert: - 1, why: "", key_share_first: true, hrr: false, hrr_suite: 0, cookie: qhs_none(),
+        now: 0, extra_rand: qhs_none(), ticket_key: qhs_none(), early_data: false,
+        offer: quic_ticket_none(), has_offer: false, psk: qhs_none(), resumed: false,
+        early_offered: false, early_ready: false, early_accepted: false, early_client: qhs_none(),
+        resumption: qhs_none(), ticket: quic_ticket_none(), has_ticket: false, tickets_sent: 0,
+        out_app: Vec::new(),
+    };
+}
+
+/// The AEAD of QUIC packet protection for a cipher suite (quic.fd).
+pub fn quic_tls_suite_aead(suite: i64) -> i64 {
+    if suite == QT_TLS_AES_128_GCM_SHA256 {
+        return QUIC_AEAD_AES_128_GCM;
+    }
+    if suite == QT_TLS_CHACHA20_POLY1305_SHA256 {
+        return QUIC_AEAD_CHACHA20_POLY1305;
+    }
+    return 0;
+}
+
+/// The trust anchors a client verifies the server's certificate chain
+/// against (x509_verify_chain at the wall clock); with `anchors` empty a
+/// client accepts any certificate. Set before the first input; a pinned
+/// `peer_key` takes precedence over anchors.
+pub fn quic_tls_set_roots(t: & mut QuicTls, anchors: Vec<X509Cert>) {
+    t.trust_anchors = anchors;
+}
+
+fn qhs_fail(t: & mut QuicTls, alert: i64, why: str) {
+    if t.alert < 0 {
+        t.alert = alert;
+        t.why = why;
+    }
+    t.state = QTS_FAILED;
+}
+
+fn qhs_add_transcript(t: & mut QuicTls, m: Vec<i64>) {
+    qhs_put(& mut t.transcript, m);
+}
+
+fn qhs_hash(t: & QuicTls) -> Vec<i64> {
+    return tls13_transcript_hash(t.transcript);
+}
+
+/// The ALPN extension body of a list of protocols.
+fn qhs_alpn_body(protos: Vec<str>) -> Vec<i64> {
+    var list: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < protos.len() {
+        val p: Vec<i64> = str_bytes(protos.get(i));
+        list.push(p.len());
+        qhs_put(& mut list, p);
+        i = i + 1;
+    }
+    var body: Vec<i64> = Vec::new();
+    qhs_vec16(& mut body, list);
+    return body;
+}
+
+/// The protocols of an ALPN extension body; an empty list when malformed.
+fn qhs_alpn_parse(b: Vec<i64>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var r: QhsReader = qhs_reader(b);
+    val n: i64 = qhs_r16(& mut r);
+    if r.bad || n + 2 != b.len() {
+        return out;
+    }
+    while r.pos < r.end {
+        val l: i64 = qhs_r8(& mut r);
+        val p: Vec<i64> = qhs_rbytes(& mut r, l);
+        if r.bad || l == 0 {
+            var none: Vec<str> = Vec::new();
+            return none;
+        }
+        out.push(str_from_bytes(p));
+    }
+    return out;
+}
+
+fn qhs_str_in(list: Vec<str>, s: str) -> bool {
+    var i: i64 = 0;
+    while i < list.len() {
+        if str_equal(list.get(i), s) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Start a client: queue the ClientHello at the Initial level. With a
+/// ticket to offer (`offer`, `has_offer`) it offers resumption, and early
+/// data when `early_data` is set and the ticket allows it: `early_ready`
+/// then tells that `early_client` holds the 0-RTT traffic secret.
+pub fn quic_tls_client_start(t: & mut QuicTls) {
+    if t.server || t.state != QTS_CLIENT_START {
+        return;
+    }
+    if t.has_offer && !(quic_ticket_valid(& t.offer, t.now) && qhs_str_in(t.alpn_offer, t.offer.alpn)
+        && qhs_suite_offered(t, t.offer.suite)) {
+        // an expired ticket, or one from a connection we would not make
+        t.has_offer = false;
+    }
+    t.early_offered = t.has_offer && t.early_data && t.offer.max_early_data == 0xffffffff;
+    qhs_client_hello(t);
+    if t.early_offered && t.state != QTS_FAILED {
+        t.early_client = qhs_keep_early(t.offer.psk, qhs_hash(t));
+        t.early_ready = true;
+    }
+    t.state = QTS_WAIT_SH;
+}
+
+fn qhs_suite_offered(t: & QuicTls, suite: i64) -> bool {
+    var i: i64 = 0;
+    while i < t.suites.len() {
+        if t.suites.get(i) == suite {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Build and queue a ClientHello (the first, or the second after a
+/// HelloRetryRequest: the same but for the key share, the cookie, no early
+/// data, and the binder over the new transcript).
+fn qhs_client_hello(t: & mut QuicTls) {
+    var body: Vec<i64> = Vec::new();
+    qhs_u16(& mut body, 0x0303);
+    qhs_put(& mut body, t.random);
+    body.push(0);
+    // legacy_session_id: empty (RFC 9001 §8.4: no middlebox compatibility)
+    var suites: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < t.suites.len() {
+        qhs_u16(& mut suites, t.suites.get(i));
+        i = i + 1;
+    }
+    qhs_vec16(& mut body, suites);
+    body.push(1);
+    body.push(0);
+    var exts: Vec<i64> = Vec::new();
+    if str_len(t.server_name) > 0 {
+        val name: Vec<i64> = str_bytes(t.server_name);
+        var entry: Vec<i64> = Vec::new();
+        entry.push(0);
+        qhs_vec16(& mut entry, name);
+        var sni: Vec<i64> = Vec::new();
+        qhs_vec16(& mut sni, entry);
+        qhs_ext(& mut exts, 0x0000, sni);
+    }
+    var groups: Vec<i64> = Vec::new();
+    qhs_u16(& mut groups, 2);
+    qhs_u16(& mut groups, 0x001d);
+    qhs_ext(& mut exts, 0x000a, groups);
+    var sig_list: Vec<i64> = Vec::new();
+    qhs_u16(& mut sig_list, 0x0807);
+    if t.peer_key.len() == 0 {
+        // Without a pinned key any server is accepted: offer what servers
+        // with RSA or ECDSA certificates sign with (qhs_cv_verify checks)
+        qhs_u16(& mut sig_list, 0x0403);
+        qhs_u16(& mut sig_list, 0x0804);
+        qhs_u16(& mut sig_list, 0x0503);
+        qhs_u16(& mut sig_list, 0x0805);
+        qhs_u16(& mut sig_list, 0x0806);
+        qhs_u16(& mut sig_list, 0x0401);
+        qhs_u16(& mut sig_list, 0x0501);
+        qhs_u16(& mut sig_list, 0x0601);
+    }
+    var sigs: Vec<i64> = Vec::new();
+    qhs_vec16(& mut sigs, sig_list);
+    qhs_ext(& mut exts, 0x000d, sigs);
+    qhs_ext(& mut exts, 0x0010, qhs_alpn_body(t.alpn_offer));
+    var versions: Vec<i64> = Vec::new();
+    versions.push(2);
+    qhs_u16(& mut versions, 0x0304);
+    qhs_ext(& mut exts, 0x002b, versions);
+    var share: Vec<i64> = Vec::new();
+    if t.key_share_first {
+        qhs_u16(& mut share, 0x001d);
+        qhs_vec16(& mut share, qhs_eph_public(t));
+    }
+    var shares: Vec<i64> = Vec::new();
+    qhs_vec16(& mut shares, share);
+    qhs_ext(& mut exts, 0x0033, shares);
+    qhs_ext(& mut exts, 0x0039, t.local_params);
+    if t.cookie.len() > 0 {
+        qhs_ext(& mut exts, QHS_EXT_COOKIE, t.cookie);
+    }
+    if !t.has_offer {
+        qhs_vec16(& mut body, exts);
+        val ch: Vec<i64> = qhs_msg(QT_CLIENT_HELLO, body);
+        qhs_add_transcript(t, ch);
+        qhs_put(& mut t.out_initial, ch);
+        return;
+    }
+    // Resumption: psk_dhe_ke only, early data, and pre_shared_key last
+    var modes: Vec<i64> = Vec::new();
+    modes.push(1);
+    modes.push(1);
+    qhs_ext(& mut exts, QHS_EXT_PSK_MODES, modes);
+    if t.early_offered && !t.hrr {
+        qhs_ext(& mut exts, QHS_EXT_EARLY_DATA, qhs_none());
+    }
+    var ident: Vec<i64> = Vec::new();
+    qhs_vec16(& mut ident, t.offer.ticket);
+    val age: i64 = (t.now - t.offer.received_ms + t.offer.age_add) & 0xffffffff;
+    ident.push((age >> 24) & 255);
+    ident.push((age >> 16) & 255);
+    ident.push((age >> 8) & 255);
+    ident.push(age & 255);
+    var psk_ext: Vec<i64> = Vec::new();
+    qhs_vec16(& mut psk_ext, ident);
+    // binders: one 32-byte binder, filled in below
+    qhs_u16(& mut psk_ext, 33);
+    psk_ext.push(32);
+    var z: i64 = 0;
+    while z < 32 {
+        psk_ext.push(0);
+        z = z + 1;
+    }
+    qhs_ext(& mut exts, QHS_EXT_PSK, psk_ext);
+    qhs_vec16(& mut body, exts);
+    var ch: Vec<i64> = qhs_msg(QT_CLIENT_HELLO, body);
+    // The binder covers the transcript so far (empty, or message_hash and
+    // the HelloRetryRequest) and the ClientHello up to the binders
+    var partial: Vec<i64> = t.transcript;
+    qhs_put(& mut partial, quic_slice(ch, 0, ch.len() - 35));
+    val binder: Vec<i64> = qhs_binder(t.offer.psk, tls13_transcript_hash(partial));
+    var bi: i64 = 0;
+    while bi < 32 {
+        ch.set(ch.len() - 32 + bi, binder.get(bi));
+        bi = bi + 1;
+    }
+    t.psk = t.offer.psk;
+    qhs_add_transcript(t, ch);
+    qhs_put(& mut t.out_initial, ch);
+}
+
+/// message_hash (RFC 8446 §4.4.1): what replaces the first ClientHello in
+/// the transcript after a HelloRetryRequest.
+fn qhs_message_hash(ch1: Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    m.push(QHS_MESSAGE_HASH);
+    m.push(0);
+    m.push(0);
+    m.push(32);
+    qhs_put(& mut m, tls13_transcript_hash(ch1));
+    return m;
+}
+
+/// Feed the bytes of CRYPTO frames received at `level` (in order: the
+/// connection reassembles them). Complete messages are processed; the
+/// state, secrets, output and alert change accordingly.
+pub fn quic_tls_input(t: & mut QuicTls, level: i64, data: Vec<i64>) {
+    if t.state == QTS_FAILED {
+        return;
+    }
+    if level == QL_INITIAL {
+        qhs_put(& mut t.in_initial, data);
+    } else if level == QL_HANDSHAKE {
+        qhs_put(& mut t.in_handshake, data);
+    } else {
+        qhs_put(& mut t.in_app, data);
+    }
+    while t.state != QTS_FAILED {
+        var buf: Vec<i64> = t.in_app;
+        if level == QL_INITIAL {
+            buf = t.in_initial;
+        } else if level == QL_HANDSHAKE {
+            buf = t.in_handshake;
+        }
+        if buf.len() < 4 {
+            return;
+        }
+        val mtype: i64 = buf.get(0) & 255;
+        val mlen: i64 = ((buf.get(1) & 255) << 16) | ((buf.get(2) & 255) << 8) | (buf.get(3) & 255);
+        if mlen > QHS_MAX_MESSAGE {
+            qhs_fail(t, QA_DECODE_ERROR, "handshake message too large");
+            return;
+        }
+        if buf.len() < 4 + mlen {
+            return;
+        }
+        val msg: Vec<i64> = quic_slice(buf, 0, 4 + mlen);
+        val rest: Vec<i64> = quic_slice(buf, 4 + mlen, buf.len());
+        if level == QL_INITIAL {
+            t.in_initial = rest;
+        } else if level == QL_HANDSHAKE {
+            t.in_handshake = rest;
+        } else {
+            t.in_app = rest;
+        }
+        qhs_message(t, level, mtype, msg);
+    }
+}
+
+fn qhs_message(t: & mut QuicTls, level: i64, mtype: i64, msg: Vec<i64>) {
+    val body: Vec<i64> = quic_slice(msg, 4, msg.len());
+    if t.server {
+        if t.state == QTS_WAIT_CH && level == QL_INITIAL && mtype == QT_CLIENT_HELLO {
+            qhs_add_transcript(t, msg);
+            qhs_server_hello(t, body, msg);
+            return;
+        }
+        if t.state == QTS_WAIT_CLIENT_FIN && level == QL_HANDSHAKE && mtype == QT_FINISHED {
+            if !tls13_finished_check(t.hs_client, qhs_hash(t), body) {
+                qhs_fail(t, QA_DECRYPT_ERROR, "the client's Finished does not verify");
+                return;
+            }
+            qhs_add_transcript(t, msg);
+            t.complete = true;
+            t.state = QTS_DONE;
+            qhs_server_ticket(t);
+            return;
+        }
+        qhs_fail(t, QA_UNEXPECTED_MESSAGE, "unexpected handshake message " + int_to_str(mtype));
+        return;
+    }
+    if t.state == QTS_DONE && level == QL_APP && mtype == QT_NEW_SESSION_TICKET {
+        qhs_client_ticket(t, body);
+        return;
+    }
+    if t.state == QTS_WAIT_SH && level == QL_INITIAL && mtype == QT_SERVER_HELLO {
+        qhs_add_transcript(t, msg);
+        qhs_client_server_hello(t, body, msg);
+        return;
+    }
+    if level == QL_HANDSHAKE {
+        if t.state == QTS_WAIT_EE && mtype == QT_ENCRYPTED_EXTENSIONS {
+            qhs_add_transcript(t, msg);
+            qhs_client_ee(t, body);
+            return;
+        }
+        if t.state == QTS_WAIT_CERT && mtype == QT_CERTIFICATE {
+            qhs_add_transcript(t, msg);
+            qhs_client_cert(t, body);
+            return;
+        }
+        if t.state == QTS_WAIT_CV && mtype == QT_CERTIFICATE_VERIFY {
+            // The signature covers the transcript up to the Certificate
+            val h: Vec<i64> = qhs_hash(t);
+            qhs_add_transcript(t, msg);
+            qhs_client_cv(t, body, h);
+            return;
+        }
+        if t.state == QTS_WAIT_FIN && mtype == QT_FINISHED {
+            val h: Vec<i64> = qhs_hash(t);
+            if !tls13_finished_check(t.hs_server, h, body) {
+                qhs_fail(t, QA_DECRYPT_ERROR, "the server's Finished does not verify");
+                return;
+            }
+            qhs_add_transcript(t, msg);
+            qhs_client_finish(t);
+            return;
+        }
+    }
+    qhs_fail(t, QA_UNEXPECTED_MESSAGE, "unexpected handshake message " + int_to_str(mtype));
+}
+
+/// CertificateVerify's signed content (RFC 8446 §4.4.3): 64 spaces, the
+/// context string, a zero byte, the transcript hash.
+fn qhs_cv_content(hash: Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        m.push(0x20);
+        i = i + 1;
+    }
+    qhs_put(& mut m, str_bytes("TLS 1.3, server CertificateVerify"));
+    m.push(0);
+    qhs_put(& mut m, hash);
+    return m;
+}
+
+// ── Server ──
+
+fn qhs_server_hello(t: & mut QuicTls, body: Vec<i64>, msg: Vec<i64>) {
+    var r: QhsReader = qhs_reader(body);
+    qhs_r16(& mut r);
+    qhs_rbytes(& mut r, 32);
+    val sid_len: i64 = qhs_r8(& mut r);
+    if sid_len > 32 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "legacy_session_id over 32 bytes");
+        return;
+    }
+    val sid: Vec<i64> = qhs_rbytes(& mut r, sid_len);
+    val cs_len: i64 = qhs_r16(& mut r);
+    val cs: Vec<i64> = qhs_rbytes(& mut r, cs_len);
+    val comp_len: i64 = qhs_r8(& mut r);
+    val comp: Vec<i64> = qhs_rbytes(& mut r, comp_len);
+    val ext_len: i64 = qhs_r16(& mut r);
+    val extb: Vec<i64> = qhs_rbytes(& mut r, ext_len);
+    if r.bad || r.pos != r.end || (cs_len & 1) != 0 {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed ClientHello");
+        return;
+    }
+    if comp.len() != 1 || comp.get(0) != 0 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "legacy_compression_methods is not [0]");
+        return;
+    }
+    val e: QhsExts = qhs_parse_exts(extb);
+    if !e.ok {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed ClientHello extensions");
+        return;
+    }
+    if e.dup {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "an extension twice in the ClientHello");
+        return;
+    }
+    // supported_versions must offer TLS 1.3
+    val vi: i64 = qhs_ext_index(e, 0x002b);
+    var tls13: bool = false;
+    if vi >= 0 {
+        val vd: Vec<i64> = e.datas.get(vi);
+        var k: i64 = 1;
+        while k + 1 < vd.len() {
+            if (vd.get(k) & 255) == 0x03 && (vd.get(k + 1) & 255) == 0x04 {
+                tls13 = true;
+            }
+            k = k + 2;
+        }
+    }
+    if !tls13 {
+        qhs_fail(t, QA_PROTOCOL_VERSION, "the client does not offer TLS 1.3");
+        return;
+    }
+    // the cipher suite: ours, in our order
+    var suite: i64 = 0;
+    var si: i64 = 0;
+    while si < t.suites.len() && suite == 0 {
+        var k: i64 = 0;
+        while k + 1 < cs.len() {
+            if ((cs.get(k) << 8) | cs.get(k + 1)) == t.suites.get(si) {
+                suite = t.suites.get(si);
+            }
+            k = k + 2;
+        }
+        si = si + 1;
+    }
+    if suite == 0 {
+        qhs_fail(t, QA_HANDSHAKE_FAILURE, "no common cipher suite");
+        return;
+    }
+    // Ed25519 signatures
+    val sgi: i64 = qhs_ext_index(e, 0x000d);
+    var ed: bool = false;
+    if sgi >= 0 {
+        val sd: Vec<i64> = e.datas.get(sgi);
+        var k: i64 = 2;
+        while k + 1 < sd.len() {
+            if (sd.get(k) & 255) == 0x08 && (sd.get(k + 1) & 255) == 0x07 {
+                ed = true;
+            }
+            k = k + 2;
+        }
+    }
+    if !ed {
+        qhs_fail(t, QA_HANDSHAKE_FAILURE, "the client does not accept Ed25519 signatures");
+        return;
+    }
+    // an X25519 key share (no HelloRetryRequest)
+    val ksi: i64 = qhs_ext_index(e, 0x0033);
+    if ksi < 0 {
+        qhs_fail(t, QA_MISSING_EXTENSION, "no key_share");
+        return;
+    }
+    var peer_share: Vec<i64> = Vec::new();
+    var kr: QhsReader = qhs_reader(e.datas.get(ksi));
+    val klen: i64 = qhs_r16(& mut kr);
+    if kr.bad || klen + 2 != kr.end {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed key_share");
+        return;
+    }
+    while kr.pos < kr.end && !kr.bad {
+        val group: i64 = qhs_r16(& mut kr);
+        val n: i64 = qhs_r16(& mut kr);
+        val key: Vec<i64> = qhs_rbytes(& mut kr, n);
+        if !kr.bad && group == 0x001d && peer_share.len() == 0 {
+            peer_share = key;
+        }
+    }
+    if kr.bad {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed key_share");
+        return;
+    }
+    if peer_share.len() == 0 {
+        if t.hrr {
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "no X25519 key share after HelloRetryRequest");
+            return;
+        }
+        if !qhs_offers_x25519(e) {
+            qhs_fail(t, QA_HANDSHAKE_FAILURE, "no key exchange group in common (X25519)");
+            return;
+        }
+        qhs_send_hrr(t, sid, suite, msg);
+        return;
+    }
+    if t.hrr && suite != t.hrr_suite {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "a cipher suite other than the HelloRetryRequest's");
+        return;
+    }
+    if t.hrr && qhs_ext_index(e, QHS_EXT_EARLY_DATA) >= 0 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "early_data after HelloRetryRequest");
+        return;
+    }
+    // ALPN, required by QUIC
+    val ai: i64 = qhs_ext_index(e, 0x0010);
+    if ai < 0 {
+        qhs_fail(t, QA_NO_APPLICATION_PROTOCOL, "no ALPN");
+        return;
+    }
+    val offered: Vec<str> = qhs_alpn_parse(e.datas.get(ai));
+    if offered.len() == 0 {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed ALPN");
+        return;
+    }
+    var chosen: str = "";
+    var pi: i64 = 0;
+    while pi < t.alpn_offer.len() && str_len(chosen) == 0 {
+        if qhs_str_in(offered, t.alpn_offer.get(pi)) {
+            chosen = t.alpn_offer.get(pi);
+        }
+        pi = pi + 1;
+    }
+    if str_len(chosen) == 0 {
+        qhs_fail(t, QA_NO_APPLICATION_PROTOCOL, "no common application protocol");
+        return;
+    }
+    // QUIC transport parameters
+    val tpi: i64 = qhs_ext_index(e, 0x0039);
+    if tpi < 0 {
+        qhs_fail(t, QA_MISSING_EXTENSION, "no quic_transport_parameters");
+        return;
+    }
+    t.peer_params = e.datas.get(tpi);
+    val sni: i64 = qhs_ext_index(e, 0x0000);
+    if sni >= 0 {
+        val sd: Vec<i64> = e.datas.get(sni);
+        if sd.len() > 5 {
+            t.peer_server_name = str_from_bytes(quic_slice(sd, 5, sd.len()));
+        }
+    }
+    t.suite = suite;
+    t.alpn = chosen;
+    val shared: Vec<i64> = qhs_keep_shared(t.eph_secret, peer_share);
+    if shared.len() == 0 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "bad X25519 key share");
+        return;
+    }
+    // A ticket to resume with (and early data to take)
+    qhs_server_psk(t, e, msg, suite, chosen);
+    if t.state == QTS_FAILED {
+        return;
+    }
+    // ServerHello
+    var sh: Vec<i64> = Vec::new();
+    qhs_u16(& mut sh, 0x0303);
+    qhs_put(& mut sh, t.random);
+    sh.push(sid.len());
+    qhs_put(& mut sh, sid);
+    qhs_u16(& mut sh, suite);
+    sh.push(0);
+    var exts: Vec<i64> = Vec::new();
+    var ver: Vec<i64> = Vec::new();
+    qhs_u16(& mut ver, 0x0304);
+    qhs_ext(& mut exts, 0x002b, ver);
+    var share: Vec<i64> = Vec::new();
+    qhs_u16(& mut share, 0x001d);
+    qhs_vec16(& mut share, qhs_eph_public(t));
+    qhs_ext(& mut exts, 0x0033, share);
+    if t.resumed {
+        // pre_shared_key: the first (only) identity
+        var sel: Vec<i64> = Vec::new();
+        qhs_u16(& mut sel, 0);
+        qhs_ext(& mut exts, QHS_EXT_PSK, sel);
+    }
+    qhs_vec16(& mut sh, exts);
+    val shm: Vec<i64> = qhs_msg(QT_SERVER_HELLO, sh);
+    qhs_add_transcript(t, shm);
+    qhs_put(& mut t.out_initial, shm);
+    var psk: Vec<i64> = qhs_none();
+    if t.resumed {
+        psk = t.psk;
+    }
+    val s1: Tls13Schedule = qhs_keep_handshake_psk(psk, shared, qhs_hash(t));
+    t.hs_client = s1.client_hs;
+    t.hs_server = s1.server_hs;
+    t.hs_ready = true;
+    // EncryptedExtensions: ALPN, the transport parameters, early_data
+    // when the client's 0-RTT is taken
+    var ee: Vec<i64> = Vec::new();
+    var one: Vec<str> = Vec::new();
+    one.push(chosen);
+    qhs_ext(& mut ee, 0x0010, qhs_alpn_body(one));
+    qhs_ext(& mut ee, 0x0039, t.local_params);
+    if t.early_accepted {
+        qhs_ext(& mut ee, QHS_EXT_EARLY_DATA, qhs_none());
+    }
+    var eeb: Vec<i64> = Vec::new();
+    qhs_vec16(& mut eeb, ee);
+    val eem: Vec<i64> = qhs_msg(QT_ENCRYPTED_EXTENSIONS, eeb);
+    qhs_add_transcript(t, eem);
+    qhs_put(& mut t.out_handshake, eem);
+    if !t.resumed {
+        qhs_server_cert(t);
+    }
+    // Finished
+    val fin: Vec<i64> = qhs_msg(QT_FINISHED, tls13_finished_verify_data(t.hs_server, qhs_hash(t)));
+    qhs_add_transcript(t, fin);
+    qhs_put(& mut t.out_handshake, fin);
+    val s2: Tls13Schedule = qhs_keep_application(s1, qhs_hash(t));
+    t.master = s2.master;
+    t.ap_client = s2.client_ap;
+    t.ap_server = s2.server_ap;
+    t.ap_ready = true;
+    t.state = QTS_WAIT_CLIENT_FIN;
+}
+
+/// The server's Certificate and CertificateVerify (a full handshake).
+fn qhs_server_cert(t: & mut QuicTls) {
+    // Certificate: no context, one entry, no entry extensions
+    var entry: Vec<i64> = Vec::new();
+    qhs_u24(& mut entry, t.cert.len());
+    qhs_put(& mut entry, t.cert);
+    qhs_u16(& mut entry, 0);
+    var cb: Vec<i64> = Vec::new();
+    cb.push(0);
+    qhs_u24(& mut cb, entry.len());
+    qhs_put(& mut cb, entry);
+    val cm: Vec<i64> = qhs_msg(QT_CERTIFICATE, cb);
+    qhs_add_transcript(t, cm);
+    qhs_put(& mut t.out_handshake, cm);
+    // CertificateVerify with Ed25519
+    val sig: Vec<i64> = ed25519_sign(t.key_seed, qhs_cv_content(qhs_hash(t)));
+    var cvb: Vec<i64> = Vec::new();
+    qhs_u16(& mut cvb, 0x0807);
+    qhs_vec16(& mut cvb, sig);
+    val cvm: Vec<i64> = qhs_msg(QT_CERTIFICATE_VERIFY, cvb);
+    qhs_add_transcript(t, cvm);
+    qhs_put(& mut t.out_handshake, cvm);
+}
+
+/// Whether a ClientHello's supported_groups names X25519.
+fn qhs_offers_x25519(e: QhsExts) -> bool {
+    val gi: i64 = qhs_ext_index(e, 0x000a);
+    if gi < 0 {
+        return false;
+    }
+    val gd: Vec<i64> = e.datas.get(gi);
+    var k: i64 = 2;
+    while k + 1 < gd.len() {
+        if (gd.get(k) & 255) == 0x00 && (gd.get(k + 1) & 255) == 0x1d {
+            return true;
+        }
+        k = k + 2;
+    }
+    return false;
+}
+
+/// Answer a ClientHello without an X25519 share with a HelloRetryRequest
+/// (RFC 8446 §4.1.4) asking for one: the first ClientHello becomes
+/// message_hash in the transcript, then the HelloRetryRequest; the server
+/// waits for the second ClientHello.
+fn qhs_send_hrr(t: & mut QuicTls, sid: Vec<i64>, suite: i64, ch1: Vec<i64>) {
+    var hr: Vec<i64> = Vec::new();
+    qhs_u16(& mut hr, 0x0303);
+    qhs_put(& mut hr, qhs_hrr_random());
+    hr.push(sid.len());
+    qhs_put(& mut hr, sid);
+    qhs_u16(& mut hr, suite);
+    hr.push(0);
+    var exts: Vec<i64> = Vec::new();
+    var ver: Vec<i64> = Vec::new();
+    qhs_u16(& mut ver, 0x0304);
+    qhs_ext(& mut exts, 0x002b, ver);
+    var grp: Vec<i64> = Vec::new();
+    qhs_u16(& mut grp, 0x001d);
+    qhs_ext(& mut exts, 0x0033, grp);
+    qhs_vec16(& mut hr, exts);
+    val hrm: Vec<i64> = qhs_msg(QT_SERVER_HELLO, hr);
+    t.transcript = qhs_message_hash(ch1);
+    qhs_add_transcript(t, hrm);
+    qhs_put(& mut t.out_initial, hrm);
+    t.hrr = true;
+    t.hrr_suite = suite;
+    t.peer_params = qhs_none();
+    t.alpn = "";
+    t.state = QTS_WAIT_CH;
+}
+
+/// Read the 4-byte big-endian integer at `off`.
+fn qhs_u32_at(b: Vec<i64>, off: i64) -> i64 {
+    if off + 4 > b.len() {
+        return 0;
+    }
+    return ((b.get(off) & 255) << 24) | ((b.get(off + 1) & 255) << 16) | ((b.get(off + 2) & 255) << 8) | (b.get(off + 3) & 255);
+}
+
+/// The server's side of resumption: take the client's first PSK identity
+/// when it is one of our tickets, still alive, its binder right, and the
+/// client allows psk_dhe_ke; then decide on its early data (RFC 8446
+/// §4.2.10: the same cipher suite and ALPN, our 0-RTT limits not lower
+/// than the ticket's, a believable ticket age, no HelloRetryRequest).
+/// A ticket we cannot read means a full handshake; a bad binder fails.
+fn qhs_server_psk(t: & mut QuicTls, e: QhsExts, ch: Vec<i64>, suite: i64, chosen: str) {
+    val pi: i64 = qhs_ext_index(e, QHS_EXT_PSK);
+    if pi < 0 {
+        return;
+    }
+    if pi != e.types.len() - 1 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "pre_shared_key is not the last extension");
+        return;
+    }
+    val mi: i64 = qhs_ext_index(e, QHS_EXT_PSK_MODES);
+    var dhe: bool = false;
+    if mi >= 0 {
+        val md: Vec<i64> = e.datas.get(mi);
+        var k: i64 = 1;
+        while k < md.len() {
+            if (md.get(k) & 255) == 1 {
+                dhe = true;
+            }
+            k = k + 1;
+        }
+    }
+    if !dhe || t.ticket_key.len() != 16 {
+        return;
+    }
+    // identities<7..>: identity<1..>, obfuscated_ticket_age; binders<33..>
+    val pd: Vec<i64> = e.datas.get(pi);
+    var r: QhsReader = qhs_reader(pd);
+    val ilen: i64 = qhs_r16(& mut r);
+    val ids_end: i64 = r.pos + ilen;
+    val tlen: i64 = qhs_r16(& mut r);
+    val ticket: Vec<i64> = qhs_rbytes(& mut r, tlen);
+    val obf_age: i64 = qhs_r32(& mut r);
+    if r.bad || ids_end > r.end {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed pre_shared_key");
+        return;
+    }
+    r.pos = ids_end;
+    val blen: i64 = qhs_r16(& mut r);
+    val binders_at: i64 = r.pos;
+    val b0len: i64 = qhs_r8(& mut r);
+    val binder: Vec<i64> = qhs_rbytes(& mut r, b0len);
+    if r.bad || binders_at + blen != r.end || blen < 33 {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed pre_shared_key binders");
+        return;
+    }
+    // The ticket: version, psk (32), suite (2), issued (8), age_add (4),
+    // early data allowed (1), ALPN (1 + n), parameters (2 + n)
+    val plain: Vec<i64> = qhs_open_ticket(t.ticket_key, ticket);
+    if plain.len() < 1 + 32 + 2 + 8 + 4 + 1 + 1 + 2 || plain.get(0) != 1 {
+        return;
+    }
+    val psk: Vec<i64> = quic_slice(plain, 1, 33);
+    val tsuite: i64 = ((plain.get(33) & 255) << 8) | (plain.get(34) & 255);
+    var issued: i64 = 0;
+    var k: i64 = 0;
+    while k < 8 {
+        issued = (issued << 8) | (plain.get(35 + k) & 255);
+        k = k + 1;
+    }
+    val age_add: i64 = qhs_u32_at(plain, 43);
+    val early_ok: bool = plain.get(47) == 1;
+    val alen: i64 = plain.get(48) & 255;
+    if 49 + alen + 2 > plain.len() {
+        return;
+    }
+    val talpn: str = str_from_bytes(quic_slice(plain, 49, 49 + alen));
+    val plen: i64 = ((plain.get(49 + alen) & 255) << 8) | (plain.get(50 + alen) & 255);
+    if 51 + alen + plen != plain.len() {
+        return;
+    }
+    val tparams: Vec<i64> = quic_slice(plain, 51 + alen, 51 + alen + plen);
+    val age: i64 = t.now - issued;
+    if age < 0 || age > QHS_TICKET_LIFETIME_S * 1000 {
+        return;
+    }
+    // The binder: over the transcript before this ClientHello (message_hash
+    // and the HelloRetryRequest after one) and the ClientHello up to the
+    // binders list
+    var partial: Vec<i64> = quic_slice(t.transcript, 0, t.transcript.len() - ch.len());
+    val cut: i64 = ch.len() - (2 + blen);
+    qhs_put(& mut partial, quic_slice(ch, 0, cut));
+    val want: Vec<i64> = qhs_binder(psk, tls13_transcript_hash(partial));
+    if binder.len() != 32 || !qhs_same(want, binder) {
+        qhs_fail(t, QA_DECRYPT_ERROR, "the PSK binder does not verify");
+        return;
+    }
+    t.resumed = true;
+    t.psk = psk;
+    // Early data
+    if qhs_ext_index(e, QHS_EXT_EARLY_DATA) < 0 || !t.early_data || !early_ok || t.hrr {
+        return;
+    }
+    val client_age: i64 = (obf_age - age_add) & 0xffffffff;
+    var skew: i64 = client_age - age;
+    if skew < 0 {
+        skew = 0 - skew;
+    }
+    if tsuite != suite || !str_equal(talpn, chosen) || skew > QHS_AGE_SKEW_MS
+        || !qhs_params_not_lower(t.local_params, tparams) {
+        return;
+    }
+    t.early_accepted = true;
+    t.early_client = qhs_keep_early(psk, qhs_hash(t));
+    t.early_ready = true;
+}
+
+/// Whether our transport parameters now grant at least what the ticket's
+/// did (RFC 9000 §7.4.1: the limits 0-RTT data was sent within).
+fn qhs_params_not_lower(now_params: Vec<i64>, then_params: Vec<i64>) -> bool {
+    val a: QuicParamsParsed = quic_params_parse(now_params, true);
+    val b: QuicParamsParsed = quic_params_parse(then_params, true);
+    if a.error >= 0 || b.error >= 0 {
+        return false;
+    }
+    val n: QuicParams = a.params;
+    val o: QuicParams = b.params;
+    return n.initial_max_data >= o.initial_max_data
+        && n.initial_max_stream_data_bidi_local >= o.initial_max_stream_data_bidi_local
+        && n.initial_max_stream_data_bidi_remote >= o.initial_max_stream_data_bidi_remote
+        && n.initial_max_stream_data_uni >= o.initial_max_stream_data_uni
+        && n.initial_max_streams_bidi >= o.initial_max_streams_bidi
+        && n.initial_max_streams_uni >= o.initial_max_streams_uni
+        && n.active_connection_id_limit >= o.active_connection_id_limit;
+}
+
+/// After the client's Finished: one NewSessionTicket (RFC 8446 §4.6.1),
+/// sent in 1-RTT CRYPTO frames, when the server has a ticket key. The
+/// ticket is the server's own state, sealed with that key: the PSK, the
+/// cipher suite, when it was issued, the age obfuscator, whether 0-RTT is
+/// allowed, the ALPN and our transport parameters.
+fn qhs_server_ticket(t: & mut QuicTls) {
+    if t.ticket_key.len() != 16 || t.tickets_sent > 0 || t.extra_rand.len() < 16 {
+        return;
+    }
+    t.resumption = qhs_keep_resumption(t.master, qhs_hash(t));
+    var nonce: Vec<i64> = Vec::new();
+    nonce.push(t.tickets_sent);
+    val psk: Vec<i64> = qhs_keep_psk(t.resumption, nonce);
+    val age_add: i64 = qhs_u32_at(t.extra_rand, 0);
+    var plain: Vec<i64> = Vec::new();
+    plain.push(1);
+    qhs_put(& mut plain, psk);
+    qhs_u16(& mut plain, t.suite);
+    var k: i64 = 7;
+    while k >= 0 {
+        plain.push((t.now >> (8 * k)) & 255);
+        k = k - 1;
+    }
+    plain.push((age_add >> 24) & 255);
+    plain.push((age_add >> 16) & 255);
+    plain.push((age_add >> 8) & 255);
+    plain.push(age_add & 255);
+    if t.early_data {
+        plain.push(1);
+    } else {
+        plain.push(0);
+    }
+    val ab: Vec<i64> = str_bytes(t.alpn);
+    plain.push(ab.len());
+    qhs_put(& mut plain, ab);
+    qhs_vec16(& mut plain, t.local_params);
+    val sealed: Vec<i64> = qhs_seal_ticket(t.ticket_key, quic_slice(t.extra_rand, 4, 16), plain);
+    var nst: Vec<i64> = Vec::new();
+    val life: i64 = QHS_TICKET_LIFETIME_S;
+    nst.push((life >> 24) & 255);
+    nst.push((life >> 16) & 255);
+    nst.push((life >> 8) & 255);
+    nst.push(life & 255);
+    nst.push((age_add >> 24) & 255);
+    nst.push((age_add >> 16) & 255);
+    nst.push((age_add >> 8) & 255);
+    nst.push(age_add & 255);
+    nst.push(nonce.len());
+    qhs_put(& mut nst, nonce);
+    qhs_vec16(& mut nst, sealed);
+    var exts: Vec<i64> = Vec::new();
+    if t.early_data {
+        // max_early_data_size: QUIC's 0xffffffff (RFC 9001 §4.6.1)
+        var med: Vec<i64> = Vec::new();
+        med.push(0xff);
+        med.push(0xff);
+        med.push(0xff);
+        med.push(0xff);
+        qhs_ext(& mut exts, QHS_EXT_EARLY_DATA, med);
+    }
+    qhs_vec16(& mut nst, exts);
+    qhs_put(& mut t.out_app, qhs_msg(QT_NEW_SESSION_TICKET, nst));
+    t.tickets_sent = t.tickets_sent + 1;
+}
+
+/// A NewSessionTicket from the server: kept as `ticket` (the latest), with
+/// the PSK it stands for and what 0-RTT on it may assume.
+fn qhs_client_ticket(t: & mut QuicTls, body: Vec<i64>) {
+    var r: QhsReader = qhs_reader(body);
+    val life: i64 = qhs_r32(& mut r);
+    val age_add: i64 = qhs_r32(& mut r);
+    val nlen: i64 = qhs_r8(& mut r);
+    val nonce: Vec<i64> = qhs_rbytes(& mut r, nlen);
+    val tlen: i64 = qhs_r16(& mut r);
+    val ticket: Vec<i64> = qhs_rbytes(& mut r, tlen);
+    val elen: i64 = qhs_r16(& mut r);
+    val extb: Vec<i64> = qhs_rbytes(& mut r, elen);
+    if r.bad || r.pos != r.end || tlen == 0 {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed NewSessionTicket");
+        return;
+    }
+    val e: QhsExts = qhs_parse_exts(extb);
+    if !e.ok {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed NewSessionTicket extensions");
+        return;
+    }
+    var max_early: i64 = 0;
+    val ei: i64 = qhs_ext_index(e, QHS_EXT_EARLY_DATA);
+    if ei >= 0 {
+        val ed: Vec<i64> = e.datas.get(ei);
+        if ed.len() != 4 {
+            qhs_fail(t, QA_DECODE_ERROR, "malformed early_data in NewSessionTicket");
+            return;
+        }
+        max_early = qhs_u32_at(ed, 0);
+        if max_early != 0xffffffff {
+            // RFC 9001 §4.6.1
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "max_early_data_size is not 0xffffffff");
+            return;
+        }
+    }
+    var lifetime: i64 = life;
+    if lifetime > 604800 {
+        lifetime = 604800;
+    }
+    if t.resumption.len() == 0 || lifetime == 0 {
+        return;
+    }
+    t.ticket = QuicTicket {
+        ticket: ticket, psk: qhs_keep_psk(t.resumption, nonce), suite: t.suite, alpn: t.alpn,
+        server_name: t.server_name, age_add: age_add, lifetime_ms: lifetime * 1000,
+        received_ms: t.now, max_early_data: max_early, params: t.peer_params,
+    };
+    t.has_ticket = true;
+}
+
+// ── Client ──
+
+/// HelloRetryRequest's special random (RFC 8446 §4.1.3).
+fn qhs_hrr_random() -> Vec<i64> {
+    var h: Vec<i64> = Vec::new();
+    h.push(0xCF); h.push(0x21); h.push(0xAD); h.push(0x74); h.push(0xE5); h.push(0x9A); h.push(0x61); h.push(0x11);
+    h.push(0xBE); h.push(0x1D); h.push(0x8C); h.push(0x02); h.push(0x1E); h.push(0x65); h.push(0xB8); h.push(0x91);
+    h.push(0xC2); h.push(0xA2); h.push(0x11); h.push(0x16); h.push(0x7A); h.push(0xBB); h.push(0x8C); h.push(0x5E);
+    h.push(0x07); h.push(0x9E); h.push(0x09); h.push(0xE2); h.push(0xC8); h.push(0xA8); h.push(0x33); h.push(0x9C);
+    return h;
+}
+
+fn qhs_client_server_hello(t: & mut QuicTls, body: Vec<i64>, msg: Vec<i64>) {
+    var r: QhsReader = qhs_reader(body);
+    qhs_r16(& mut r);
+    val random: Vec<i64> = qhs_rbytes(& mut r, 32);
+    val sid_len: i64 = qhs_r8(& mut r);
+    val sid: Vec<i64> = qhs_rbytes(& mut r, sid_len);
+    val suite: i64 = qhs_r16(& mut r);
+    val comp: i64 = qhs_r8(& mut r);
+    val ext_len: i64 = qhs_r16(& mut r);
+    val extb: Vec<i64> = qhs_rbytes(& mut r, ext_len);
+    if r.bad || r.pos != r.end {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed ServerHello");
+        return;
+    }
+    if qhs_same(random, qhs_hrr_random()) {
+        qhs_client_hrr(t, suite, sid, comp, extb, msg);
+        return;
+    }
+    if t.hrr && suite != t.hrr_suite {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "a cipher suite other than the HelloRetryRequest's");
+        return;
+    }
+    if sid.len() != 0 || comp != 0 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "ServerHello session id or compression");
+        return;
+    }
+    var offered: bool = false;
+    var i: i64 = 0;
+    while i < t.suites.len() {
+        if t.suites.get(i) == suite {
+            offered = true;
+        }
+        i = i + 1;
+    }
+    if !offered {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "a cipher suite we did not offer");
+        return;
+    }
+    val e: QhsExts = qhs_parse_exts(extb);
+    if !e.ok || e.dup {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed ServerHello extensions");
+        return;
+    }
+    val vi: i64 = qhs_ext_index(e, 0x002b);
+    if vi < 0 || !qhs_same(e.datas.get(vi), qhs_tls13_version()) {
+        qhs_fail(t, QA_PROTOCOL_VERSION, "the server did not choose TLS 1.3");
+        return;
+    }
+    val ki: i64 = qhs_ext_index(e, 0x0033);
+    if ki < 0 {
+        qhs_fail(t, QA_MISSING_EXTENSION, "no key_share in ServerHello");
+        return;
+    }
+    var kr: QhsReader = qhs_reader(e.datas.get(ki));
+    val group: i64 = qhs_r16(& mut kr);
+    val n: i64 = qhs_r16(& mut kr);
+    val key: Vec<i64> = qhs_rbytes(& mut kr, n);
+    if kr.bad || kr.pos != kr.end || group != 0x001d {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "the server's key share is not X25519");
+        return;
+    }
+    val shared: Vec<i64> = qhs_keep_shared(t.eph_secret, key);
+    if shared.len() == 0 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "bad X25519 key share");
+        return;
+    }
+    // pre_shared_key: the server took our ticket (identity 0)
+    val pi: i64 = qhs_ext_index(e, QHS_EXT_PSK);
+    var psk: Vec<i64> = qhs_none();
+    if pi >= 0 {
+        val pd: Vec<i64> = e.datas.get(pi);
+        if !t.has_offer || pd.len() != 2 || pd.get(0) != 0 || pd.get(1) != 0 {
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "pre_shared_key we did not offer");
+            return;
+        }
+        if suite != t.offer.suite {
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "a resumed connection with another cipher suite");
+            return;
+        }
+        t.resumed = true;
+        psk = t.offer.psk;
+    }
+    t.suite = suite;
+    val s1: Tls13Schedule = qhs_keep_handshake_psk(psk, shared, qhs_hash(t));
+    t.hs_client = s1.client_hs;
+    t.hs_server = s1.server_hs;
+    t.master = s1.master;
+    t.hs_ready = true;
+    t.state = QTS_WAIT_EE;
+}
+
+/// A HelloRetryRequest (RFC 8446 §4.1.4): at most one, for a suite we
+/// offered and the one group we have (X25519) when our first ClientHello
+/// had no share of it; a cookie is echoed. The first ClientHello becomes
+/// message_hash in the transcript, and the second goes out with the share
+/// and without early data (0-RTT is then refused).
+fn qhs_client_hrr(t: & mut QuicTls, suite: i64, sid: Vec<i64>, comp: i64, extb: Vec<i64>, msg: Vec<i64>) {
+    if t.hrr {
+        qhs_fail(t, QA_UNEXPECTED_MESSAGE, "a second HelloRetryRequest");
+        return;
+    }
+    if sid.len() != 0 || comp != 0 || !qhs_suite_offered(t, suite) {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "HelloRetryRequest session id, compression or suite");
+        return;
+    }
+    val e: QhsExts = qhs_parse_exts(extb);
+    if !e.ok || e.dup {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed HelloRetryRequest extensions");
+        return;
+    }
+    val vi: i64 = qhs_ext_index(e, 0x002b);
+    if vi < 0 || !qhs_same(e.datas.get(vi), qhs_tls13_version()) {
+        qhs_fail(t, QA_PROTOCOL_VERSION, "the HelloRetryRequest did not choose TLS 1.3");
+        return;
+    }
+    val ki: i64 = qhs_ext_index(e, 0x0033);
+    val ci: i64 = qhs_ext_index(e, QHS_EXT_COOKIE);
+    if ki < 0 && ci < 0 {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "a HelloRetryRequest that changes nothing");
+        return;
+    }
+    if ki >= 0 {
+        val kd: Vec<i64> = e.datas.get(ki);
+        if kd.len() != 2 || kd.get(0) != 0x00 || kd.get(1) != 0x1d || t.key_share_first {
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "HelloRetryRequest for a group we cannot or did offer");
+            return;
+        }
+    }
+    if ci >= 0 {
+        t.cookie = e.datas.get(ci);
+    }
+    // transcript: message_hash(ClientHello1), HelloRetryRequest
+    val ch1: Vec<i64> = quic_slice(t.transcript, 0, t.transcript.len() - msg.len());
+    t.transcript = qhs_message_hash(ch1);
+    qhs_add_transcript(t, msg);
+    t.hrr = true;
+    t.hrr_suite = suite;
+    t.key_share_first = true;
+    t.early_ready = false;
+    t.early_offered = false;
+    qhs_client_hello(t);
+    t.state = QTS_WAIT_SH;
+}
+
+/// The supported_versions body a ServerHello carries: 0x0304.
+fn qhs_tls13_version() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0x03);
+    v.push(0x04);
+    return v;
+}
+
+fn qhs_client_ee(t: & mut QuicTls, body: Vec<i64>) {
+    var r: QhsReader = qhs_reader(body);
+    val n: i64 = qhs_r16(& mut r);
+    val extb: Vec<i64> = qhs_rbytes(& mut r, n);
+    if r.bad || r.pos != r.end {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed EncryptedExtensions");
+        return;
+    }
+    val e: QhsExts = qhs_parse_exts(extb);
+    if !e.ok || e.dup {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed EncryptedExtensions");
+        return;
+    }
+    val ai: i64 = qhs_ext_index(e, 0x0010);
+    if ai < 0 {
+        qhs_fail(t, QA_NO_APPLICATION_PROTOCOL, "the server chose no application protocol");
+        return;
+    }
+    val chosen: Vec<str> = qhs_alpn_parse(e.datas.get(ai));
+    if chosen.len() != 1 || !qhs_str_in(t.alpn_offer, chosen.get(0)) {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "the server chose a protocol we did not offer");
+        return;
+    }
+    val tpi: i64 = qhs_ext_index(e, 0x0039);
+    if tpi < 0 {
+        qhs_fail(t, QA_MISSING_EXTENSION, "no quic_transport_parameters");
+        return;
+    }
+    t.alpn = chosen.get(0);
+    t.peer_params = e.datas.get(tpi);
+    if qhs_ext_index(e, QHS_EXT_EARLY_DATA) >= 0 {
+        if !t.early_offered || !t.resumed {
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "early_data we did not offer");
+            return;
+        }
+        if !str_equal(t.alpn, t.offer.alpn) {
+            // RFC 9001 §4.6.1 / RFC 8446 §4.2.10: 0-RTT keeps the protocol
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "0-RTT accepted with another application protocol");
+            return;
+        }
+        t.early_accepted = true;
+    }
+    if t.resumed {
+        // No certificate on a resumed connection: the Finished proves it
+        t.state = QTS_WAIT_FIN;
+    } else {
+        t.state = QTS_WAIT_CERT;
+    }
+}
+
+fn qhs_client_cert(t: & mut QuicTls, body: Vec<i64>) {
+    var r: QhsReader = qhs_reader(body);
+    val ctx_len: i64 = qhs_r8(& mut r);
+    qhs_rbytes(& mut r, ctx_len);
+    val list_len: i64 = qhs_r24(& mut r);
+    if r.bad || ctx_len != 0 || r.pos + list_len != r.end {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed Certificate");
+        return;
+    }
+    var ders: Vec<Vec<i64>> = Vec::new();
+    var chain: Vec<X509Cert> = Vec::new();
+    while r.pos < r.end {
+        val clen: i64 = qhs_r24(& mut r);
+        val cert: Vec<i64> = qhs_rbytes(& mut r, clen);
+        val elen: i64 = qhs_r16(& mut r);
+        qhs_rbytes(& mut r, elen);
+        if r.bad || clen == 0 {
+            qhs_fail(t, QA_DECODE_ERROR, "malformed Certificate");
+            return;
+        }
+        ders.push(cert);
+        chain.push(x509_parse(cert));
+    }
+    val cert: Vec<i64> = ders.get(0);
+    val leaf: X509Cert = chain.get(0);
+    t.peer_chain = chain;
+    if leaf.ok { t.peer_spki = leaf.spki; }
+    val key: Vec<i64> = quic_cert_ed25519_key(cert);
+    if t.peer_key.len() == 0 {
+        if key.len() == 32 { t.peer_cert_key = key; }
+        if t.trust_anchors.len() > 0 {
+            val now: i64 = clock_now_ns() / 1000000000;
+            val rc: X509ChainResult = x509_verify_chain(chain, t.trust_anchors, now);
+            if !rc.ok {
+                qhs_fail(t, QA_BAD_CERTIFICATE, "the certificate chain does not verify: " + rc.err);
+                return;
+            }
+            if str_len(t.server_name) > 0 && !x509_matches_host(leaf, t.server_name) {
+                qhs_fail(t, QA_BAD_CERTIFICATE, "the certificate does not name the server");
+                return;
+            }
+        }
+        // With no anchors either, any certificate is accepted (like
+        // `curl -k`); its CertificateVerify still verifies in
+        // qhs_client_cv against the key the certificate carries.
+        t.state = QTS_WAIT_CV;
+        return;
+    }
+    if key.len() != 32 {
+        qhs_fail(t, QA_UNSUPPORTED_CERTIFICATE, "the certificate's key is not Ed25519");
+        return;
+    }
+    if !quic_cert_self_signed_ok(cert) {
+        qhs_fail(t, QA_BAD_CERTIFICATE, "the certificate is not signed by its own key");
+        return;
+    }
+    if !qhs_same(t.peer_key, key) {
+        qhs_fail(t, QA_BAD_CERTIFICATE, "the server's key is not the pinned key");
+        return;
+    }
+    t.peer_cert_key = key;
+    t.state = QTS_WAIT_CV;
+}
+
+/// The RSA and ECDSA signature schemes a client without a pinned key
+/// offers (RFC 8446 §4.2.3), all checked by qhs_cv_verify: 0x0403, 0x0503,
+/// 0x0603 (ECDSA), 0x0804, 0x0805, 0x0806 (RSA-PSS), 0x0401, 0x0501,
+/// 0x0601 (RSA PKCS#1 v1.5).
+
+/// The ECDSA signature a TLS 1.3 `scheme` wants checked: the certificate's
+/// key must be on the scheme's named curve (RFC 8446 §4.2.3).
+fn qhs_cv_ecdsa(k: & Spki, curve_oid: str, scheme: i64, expect: i64, hash: i64, content: Vec<i64>, sig: Vec<i64>) -> bool {
+    if scheme != expect || !str_equal(k.alg, PEM_OID_EC) || !str_equal(k.params, curve_oid) {
+        return false;
+    }
+    val c: EcCurve = ec_curve_by_oid(curve_oid);
+    if c.len == 0 { return false; }
+    return ecdsa_verify_der(& c, k.key, hash, content, sig);
+}
+
+/// Whether a TLS 1.3 `scheme` signature over `content` verifies under the
+/// certificate's SubjectPublicKeyInfo `k` (RFC 8446 §4.2.3/§4.4.3):
+/// Ed25519, ECDSA on the named curves, RSA-PSS (salt length = digest
+/// length) and RSA PKCS#1 v1.5. A key restricted to RSASSA-PSS does not
+/// verify a PKCS#1 v1.5 signature. Exposed for tests and DTLS reuse.
+pub fn quic_tls_scheme_verify(k: Spki, scheme: i64, content: Vec<i64>, sig: Vec<i64>) -> bool {
+    if !k.ok { return false; }
+    if scheme == 0x0807 {
+        return str_equal(k.alg, PEM_OID_ED25519) && k.key.len() == 32 && ed25519_verify(k.key, content, sig);
+    }
+    if scheme == 0x0403 { return qhs_cv_ecdsa(& k, "1.2.840.10045.3.1.7", scheme, 0x0403, KDF_SHA256, content, sig); }
+    if scheme == 0x0503 { return qhs_cv_ecdsa(& k, "1.3.132.0.34", scheme, 0x0503, EC_SHA384, content, sig); }
+    if scheme == 0x0603 { return qhs_cv_ecdsa(& k, "1.3.132.0.35", scheme, 0x0603, KDF_SHA512, content, sig); }
+    val pss_key: bool = str_equal(k.alg, PEM_OID_RSA) || str_equal(k.alg, PEM_OID_RSA_PSS);
+    if scheme == 0x0401 { return str_equal(k.alg, PEM_OID_RSA) && x509_rsa_pkcs1_verify(rsa_public_from_der(k.key), KDF_SHA256, content, sig); }
+    if scheme == 0x0501 { return str_equal(k.alg, PEM_OID_RSA) && x509_rsa_pkcs1_verify(rsa_public_from_der(k.key), EC_SHA384, content, sig); }
+    if scheme == 0x0601 { return str_equal(k.alg, PEM_OID_RSA) && x509_rsa_pkcs1_verify(rsa_public_from_der(k.key), KDF_SHA512, content, sig); }
+    if scheme == 0x0804 { return pss_key && x509_rsa_pss_verify(rsa_public_from_der(k.key), KDF_SHA256, content, sig, 32); }
+    if scheme == 0x0805 { return pss_key && x509_rsa_pss_verify(rsa_public_from_der(k.key), EC_SHA384, content, sig, 48); }
+    if scheme == 0x0806 { return pss_key && x509_rsa_pss_verify(rsa_public_from_der(k.key), KDF_SHA512, content, sig, 64); }
+    return false;
+}
+
+/// The handshake's check of a CertificateVerify: the certificate's own
+/// Ed25519 key when it was kept, else the scheme table.
+fn qhs_cv_verify(t: & QuicTls, scheme: i64, content: Vec<i64>, sig: Vec<i64>) -> bool {
+    if scheme == 0x0807 {
+        var key: Vec<i64> = t.peer_cert_key;
+        if key.len() != 32 && t.peer_spki.ok { key = t.peer_spki.key; }
+        return key.len() == 32 && ed25519_verify(key, content, sig);
+    }
+    return quic_tls_scheme_verify(t.peer_spki, scheme, content, sig);
+}
+
+fn qhs_client_cv(t: & mut QuicTls, body: Vec<i64>, hash: Vec<i64>) {
+    var r: QhsReader = qhs_reader(body);
+    val scheme: i64 = qhs_r16(& mut r);
+    val n: i64 = qhs_r16(& mut r);
+    val sig: Vec<i64> = qhs_rbytes(& mut r, n);
+    if r.bad || r.pos != r.end {
+        qhs_fail(t, QA_DECODE_ERROR, "malformed CertificateVerify");
+        return;
+    }
+    if t.peer_key.len() > 0 {
+        // A pinned key is the certificate's Ed25519 key itself.
+        if scheme != 0x0807 || t.peer_cert_key.len() != 32 {
+            qhs_fail(t, QA_ILLEGAL_PARAMETER, "CertificateVerify is not Ed25519");
+            return;
+        }
+        if !ed25519_verify(t.peer_cert_key, qhs_cv_content(hash), sig) {
+            qhs_fail(t, QA_DECRYPT_ERROR, "CertificateVerify does not verify");
+            return;
+        }
+        t.state = QTS_WAIT_FIN;
+        return;
+    }
+    if !qhs_cv_verify(t, scheme, qhs_cv_content(hash), sig) {
+        qhs_fail(t, QA_DECRYPT_ERROR, "CertificateVerify does not verify");
+        return;
+    }
+    t.state = QTS_WAIT_FIN;
+}
+
+fn qhs_client_finish(t: & mut QuicTls) {
+    val h: Vec<i64> = qhs_hash(t);
+    var s: Tls13Schedule = Tls13Schedule {
+        early: qhs_none(), handshake: qhs_none(), client_hs: t.hs_client, server_hs: t.hs_server,
+        master: t.master, client_ap: qhs_none(), server_ap: qhs_none(), exporter: qhs_none(),
+        resumption: qhs_none(),
+    };
+    val s2: Tls13Schedule = qhs_keep_application(s, h);
+    t.ap_client = s2.client_ap;
+    t.ap_server = s2.server_ap;
+    val fin: Vec<i64> = qhs_msg(QT_FINISHED, tls13_finished_verify_data(t.hs_client, h));
+    qhs_add_transcript(t, fin);
+    qhs_put(& mut t.out_handshake, fin);
+    // The resumption master secret, for the tickets the server may send
+    t.resumption = qhs_keep_resumption(t.master, qhs_hash(t));
+    t.ap_ready = true;
+    t.complete = true;
+    t.state = QTS_DONE;
+}

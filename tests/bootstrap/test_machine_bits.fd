@@ -1,0 +1,145 @@
+// Track MI (docs/roadmap/llvm-roadmap.md MI3) and competitive OP20, the
+// machine layer (compiler/nat_ir.fd): target-specific operations chosen
+// by instruction selection, whose results must not change:
+//   ng_fuse_bits (MIR, before allocation; ng_sel_has says which target):
+//     ~a & b       -> ANDN: x86-64 BMI1 under --cpu x86-64-v3|v4, AArch64
+//                     BIC, RISC-V Zbb under --cpu rva22u64 (FID_NAT_OFF=andn)
+//     a & (a - 1)  -> BLSR: x86-64 BMI1 under --cpu x86-64-v3|v4
+//                     (FID_NAT_OFF=blsr)
+//   ng_a64_mac (AArch64, at emission): a * b + c -> MADD, c - a * b -> MSUB
+//     when the product dies at the ADD/SUB (FID_NAT_OFF=madd)
+// The functions are @wrapping (no overflow checks between the two
+// operations, which is where the fusions apply). Every result is the same
+// with each switch on or off, with and without --cpu: run
+//   NATIVE=1 bash scripts/cross-test.sh x86_64-linux   (and aarch64-linux,
+//   riscv64-linux), by hand with --cpu x86-64-v3 / --cpu rva22u64, and
+//   bash tests/nattools/machine_sel_check.sh (encodings in the image).
+// Expected output:
+// 8
+// 0
+// -16
+// 240
+// 24
+// 0
+// 192
+// 0
+// 0
+// 4
+// 3
+// 32
+// 7
+// 23
+// -17
+// 5
+// 6
+// -9223372036854775807
+// 57
+// -2
+// 14
+// 0
+// 6
+// 1
+// 1
+// 0
+
+@wrapping fn andn(a: i64, b: i64) -> i64 {
+    return ~a & b;
+}
+
+@wrapping fn andn_r(a: i64, b: i64) -> i64 {
+    return b & ~a;
+}
+
+@wrapping fn blsr(a: i64) -> i64 {
+    return a & (a - 1);
+}
+
+@wrapping fn blsr_r(a: i64) -> i64 {
+    return (a - 1) & a;
+}
+
+@wrapping fn blsr_add(a: i64) -> i64 {
+    return a & (a + (0 - 1));
+}
+
+@wrapping fn madd(a: i64, b: i64, c: i64) -> i64 {
+    return a * b + c;
+}
+
+@wrapping fn madd_r(a: i64, b: i64, c: i64) -> i64 {
+    return c + a * b;
+}
+
+@wrapping fn msub(a: i64, b: i64, c: i64) -> i64 {
+    return c - a * b;
+}
+
+@wrapping fn mul_sub(a: i64, b: i64, c: i64) -> i64 {
+    return a * b - c;
+}
+
+// The NOT's value is used twice: it must stay (no ANDN for the second use
+// to lose)
+@wrapping fn not_twice(a: i64, b: i64) -> i64 {
+    val n: i64 = ~a;
+    return (n & b) + n;
+}
+
+// Clear the lowest set bit until nothing is left: a popcount
+@wrapping fn popcount(x: i64) -> i64 {
+    var v: i64 = x;
+    var c: i64 = 0;
+    while v != 0 {
+        v = v & (v - 1);
+        c = c + 1;
+    }
+    return c;
+}
+
+// A dot product: the multiply-accumulate of a loop
+@wrapping fn dot(a: Vec<i64>, b: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < a.len() {
+        s = s + a.get(i) * b.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    println(andn(7, 15));
+    println(andn(0 - 1, 12345));
+    println(andn(15, 0 - 1));
+    println(andn_r(15, 255));
+    println(blsr(28));
+    println(blsr(0));
+    println(blsr_r(224));
+    println(blsr(0 - 9223372036854775807 - 1));
+    println(blsr_add(64));
+    println(blsr_add(6));
+    println(madd(0, 5, 3));
+    println(madd(5, 6, 2));
+    println(madd_r(2, 3, 1));
+    println(madd(4, 5, 3));
+    println(msub(3, 6, 1));
+    println(msub(2, 2, 9));
+    println(mul_sub(2, 4, 2));
+    println(madd(9223372036854775807, 1, 2));
+    println(not_twice(1, 255) + 0 - 254 + 2 + 57);
+    println(not_twice(1, 0));
+    println(popcount(0x3F) + popcount(0xFF));
+    println(popcount(0));
+    var a: Vec<i64> = Vec::new();
+    var b: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(1);
+    a.push(1);
+    b.push(1);
+    b.push(2);
+    b.push(3);
+    println(dot(a, b));
+    println(blsr(1) + 1);
+    println(andn(6, 7));
+    println(andn(7, 7));
+}

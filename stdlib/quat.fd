@@ -1,0 +1,622 @@
+// Fides quaternion standard library (robotics)
+//
+// Unit quaternions for 3D rotation on math's `quat` struct (w, x, y, z) and
+// `vec3`: Hamilton product, conjugate, inverse, normalization, rotation of a
+// vector, axis-angle, Euler angles in the ZYX (yaw-pitch-roll) convention,
+// 3x3 rotation matrices (`Mat3`) both ways, a true slerp (not the nlerp of
+// math.fd's `quat.slerp`), the shortest arc between two vectors, angular
+// distance and integration of an angular velocity.
+//
+// Conventions: q = w + xi + yj + zk; `qt_mul(a, b)` applies b first, then
+// a (a * b). `qt_rotate(q, v)` = q v q*. Euler ZYX: R = Rz(yaw) Ry(pitch)
+// Rx(roll), angles in radians; pitch is clamped to [-pi/2, pi/2] at the
+// singularity.
+//
+// The functions are `qt_*`, not `quat_*`: math's `impl quat { fn mul ...}`
+// methods are the functions `quat_mul`, `quat_normalize`, `quat_slerp`,
+// `quat_from_axis_angle`, ..., and a free function of the same name would
+// silently be one of them.
+//
+// This module is also the base of the robotics group (transform3d,
+// kinematics, kalman, pointcloud, lidar, planner, trajectory), which use its
+// scalar helpers: `rmath_atan2`, `rmath_asin`, `rmath_acos`,
+// `rmath_wrap_angle`, `rmath_hypot` (all pure Fides, Cephes' atan, so every
+// backend gives the same bits) and `rmath_fmt` (fixed decimals, rounded half
+// away from zero, never "-0.000").
+//
+// Everything here is pure computation; there is no platform seam.
+//
+// Usage:
+//   use math;
+//   use quat;
+//   val q = qt_from_axis_angle(vec3(0.0, 0.0, 1.0), math_pi() / 2.0);
+//   val v = qt_rotate(q, vec3(1.0, 0.0, 0.0));     // (0, 1, 0)
+//   val e = qt_to_euler_zyx(q);                    // yaw = pi/2
+
+module quat;
+use math;
+
+// ─── Scalar helpers shared by the robotics modules ───
+
+/// pi.
+pub fn rmath_pi() -> f64 {
+    return 3.14159265358979323846;
+}
+
+/// atan(x) for x >= 0 (Cephes atan.c: range reduction, then a rational
+/// approximation good to the last bit).
+fn rmath_atan_pos(xin: f64) -> f64 {
+    var x: f64 = xin;
+    var y: f64 = 0.0;
+    var flag: i64 = 0;
+    val pio2: f64 = 1.57079632679489661923;
+    val pio4: f64 = 0.785398163397448309616;
+    if x > 2.41421356237309504880 {
+        y = pio2;
+        flag = 1;
+        x = 0.0 - 1.0 / x;
+    } else if x > 0.66 {
+        y = pio4;
+        flag = 2;
+        x = (x - 1.0) / (x + 1.0);
+    }
+    val z: f64 = x * x;
+    val p: f64 = (((0.0 - 0.8750608600031904122785 * z - 16.15753718733365076637) * z - 75.00855792314704667340) * z - 122.8866684490136173410) * z - 64.85021904942025371773;
+    val q: f64 = ((((z + 24.85846490142306297962) * z + 165.0270098316988542046) * z + 432.8810604912902668951) * z + 485.3903996359136964868) * z + 194.5506571482613964425;
+    var w: f64 = z * p / q;
+    w = x * w + x;
+    if flag == 1 {
+        w = w + 0.00000000000000006123233995736765886130;
+    } else if flag == 2 {
+        w = w + 0.5 * 0.00000000000000006123233995736765886130;
+    }
+    return y + w;
+}
+
+/// atan(x) in (-pi/2, pi/2).
+pub fn rmath_atan(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    if x < 0.0 {
+        return 0.0 - rmath_atan_pos(0.0 - x);
+    }
+    return rmath_atan_pos(x);
+}
+
+/// atan2(y, x) in (-pi, pi]; 0 for (0, 0).
+pub fn rmath_atan2(y: f64, x: f64) -> f64 {
+    val pi: f64 = rmath_pi();
+    if y != y || x != x {
+        return x + y;
+    }
+    if x == 0.0 {
+        if y > 0.0 {
+            return pi / 2.0;
+        }
+        if y < 0.0 {
+            return 0.0 - pi / 2.0;
+        }
+        return 0.0;
+    }
+    if y == 0.0 {
+        if x > 0.0 {
+            return 0.0;
+        }
+        return pi;
+    }
+    var a: f64 = rmath_atan_pos(math_fabs(y) / math_fabs(x));
+    if x < 0.0 {
+        a = pi - a;
+    }
+    if y < 0.0 {
+        return 0.0 - a;
+    }
+    return a;
+}
+
+/// asin(x), x clamped to [-1, 1].
+pub fn rmath_asin(x: f64) -> f64 {
+    var c: f64 = x;
+    if c > 1.0 {
+        c = 1.0;
+    }
+    if c < - 1.0 {
+        c = - 1.0;
+    }
+    return rmath_atan2(c, math_sqrt(1.0 - c * c));
+}
+
+/// acos(x), x clamped to [-1, 1].
+pub fn rmath_acos(x: f64) -> f64 {
+    var c: f64 = x;
+    if c > 1.0 {
+        c = 1.0;
+    }
+    if c < - 1.0 {
+        c = - 1.0;
+    }
+    return rmath_atan2(math_sqrt(1.0 - c * c), c);
+}
+
+/// tan(x).
+pub fn rmath_tan(x: f64) -> f64 {
+    return math_sin(x) / math_cos(x);
+}
+
+/// sqrt(x*x + y*y) without overflow for large components.
+pub fn rmath_hypot(x: f64, y: f64) -> f64 {
+    var a: f64 = math_fabs(x);
+    var b: f64 = math_fabs(y);
+    if a < b {
+        val t: f64 = a;
+        a = b;
+        b = t;
+    }
+    if a == 0.0 {
+        return 0.0;
+    }
+    val r: f64 = b / a;
+    return a * math_sqrt(1.0 + r * r);
+}
+
+/// An angle wrapped to (-pi, pi].
+pub fn rmath_wrap_angle(a: f64) -> f64 {
+    val two_pi: f64 = 2.0 * rmath_pi();
+    var r: f64 = a - two_pi * math_floor(a / two_pi);
+    // r in [0, 2pi)
+    if r > rmath_pi() {
+        r = r - two_pi;
+    }
+    return r;
+}
+
+/// The larger of two floats.
+pub fn rmath_max(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+/// The smaller of two floats.
+pub fn rmath_min(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+/// x clamped to [lo, hi].
+pub fn rmath_clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        return lo;
+    }
+    if x > hi {
+        return hi;
+    }
+    return x;
+}
+
+/// x with `dp` decimals (0..12), rounded half away from zero; "-0.00" never
+/// appears ("0.00" instead). NaN prints "nan", infinities "inf"/"-inf".
+pub fn rmath_fmt(x: f64, dp: i64) -> str {
+    if x != x {
+        return "nan";
+    }
+    if x > 1.7976931348623157e308 {
+        return "inf";
+    }
+    if x < - 1.7976931348623157e308 {
+        return "-inf";
+    }
+    var d: i64 = dp;
+    if d < 0 {
+        d = 0;
+    }
+    if d > 12 {
+        d = 12;
+    }
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    val scaled: f64 = math_fabs(x) * (p as f64) + 0.5;
+    if scaled >= 9.0e18 {
+        return float_to_str(x);
+    }
+    val v: i64 = math_floor(scaled) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+/// A vec3 as "(x, y, z)" with `dp` decimals.
+pub fn rmath_vec3_str(v: vec3, dp: i64) -> str {
+    return "(" + rmath_fmt(v.x, dp) + ", " + rmath_fmt(v.y, dp) + ", " + rmath_fmt(v.z, dp) + ")";
+}
+
+// ─── 3x3 matrices ───
+
+/// A 3x3 matrix, row-major: mRC is row R, column C.
+pub struct Mat3 {
+    pub m00: f64,
+    pub m01: f64,
+    pub m02: f64,
+    pub m10: f64,
+    pub m11: f64,
+    pub m12: f64,
+    pub m20: f64,
+    pub m21: f64,
+    pub m22: f64,
+}
+
+/// The identity matrix.
+pub fn mat3_identity() -> Mat3 {
+    return Mat3 {
+        m00: 1.0, m01: 0.0, m02: 0.0, m10: 0.0, m11: 1.0, m12: 0.0, m20: 0.0, m21: 0.0, m22: 1.0
+    };
+}
+
+/// A matrix from its rows.
+pub fn mat3_from_rows(r0: vec3, r1: vec3, r2: vec3) -> Mat3 {
+    return Mat3 {
+        m00: r0.x, m01: r0.y, m02: r0.z, m10: r1.x, m11: r1.y, m12: r1.z, m20: r2.x, m21: r2.y, m22: r2.z
+    };
+}
+
+/// Column c (0..2) of m.
+pub fn mat3_col(m: Mat3, c: i64) -> vec3 {
+    if c == 0 {
+        return vec3(m.m00, m.m10, m.m20);
+    }
+    if c == 1 {
+        return vec3(m.m01, m.m11, m.m21);
+    }
+    return vec3(m.m02, m.m12, m.m22);
+}
+
+/// a * b.
+pub fn mat3_mul(a: Mat3, b: Mat3) -> Mat3 {
+    return Mat3 {
+        m00: a.m00 * b.m00 + a.m01 * b.m10 + a.m02 * b.m20, m01: a.m00 * b.m01 + a.m01 * b.m11 + a.m02 * b.m21, m02: a.m00 * b.m02 + a.m01 * b.m12 + a.m02 * b.m22, m10: a.m10 * b.m00 + a.m11 * b.m10 + a.m12 * b.m20, m11: a.m10 * b.m01 + a.m11 * b.m11 + a.m12 * b.m21, m12: a.m10 * b.m02 + a.m11 * b.m12 + a.m12 * b.m22, m20: a.m20 * b.m00 + a.m21 * b.m10 + a.m22 * b.m20, m21: a.m20 * b.m01 + a.m21 * b.m11 + a.m22 * b.m21, m22: a.m20 * b.m02 + a.m21 * b.m12 + a.m22 * b.m22
+    };
+}
+
+/// m * v.
+pub fn mat3_mul_vec(m: Mat3, v: vec3) -> vec3 {
+    return vec3(m.m00 * v.x + m.m01 * v.y + m.m02 * v.z, m.m10 * v.x + m.m11 * v.y + m.m12 * v.z, m.m20 * v.x + m.m21 * v.y + m.m22 * v.z);
+}
+
+/// The transpose (the inverse, for a rotation).
+pub fn mat3_transpose(m: Mat3) -> Mat3 {
+    return Mat3 {
+        m00: m.m00, m01: m.m10, m02: m.m20, m10: m.m01, m11: m.m11, m12: m.m21, m20: m.m02, m21: m.m12, m22: m.m22
+    };
+}
+
+/// The determinant.
+pub fn mat3_det(m: Mat3) -> f64 {
+    return m.m00 * (m.m11 * m.m22 - m.m12 * m.m21) - m.m01 * (m.m10 * m.m22 - m.m12 * m.m20) + m.m02 * (m.m10 * m.m21 - m.m11 * m.m20);
+}
+
+/// Largest absolute difference between the entries of a and b.
+pub fn mat3_max_diff(a: Mat3, b: Mat3) -> f64 {
+    var d: f64 = 0.0;
+    d = rmath_max(d, math_fabs(a.m00 - b.m00));
+    d = rmath_max(d, math_fabs(a.m01 - b.m01));
+    d = rmath_max(d, math_fabs(a.m02 - b.m02));
+    d = rmath_max(d, math_fabs(a.m10 - b.m10));
+    d = rmath_max(d, math_fabs(a.m11 - b.m11));
+    d = rmath_max(d, math_fabs(a.m12 - b.m12));
+    d = rmath_max(d, math_fabs(a.m20 - b.m20));
+    d = rmath_max(d, math_fabs(a.m21 - b.m21));
+    d = rmath_max(d, math_fabs(a.m22 - b.m22));
+    return d;
+}
+
+/// Rotation about x by `a` radians.
+pub fn mat3_rot_x(a: f64) -> Mat3 {
+    val c: f64 = math_cos(a);
+    val s: f64 = math_sin(a);
+    return Mat3 {
+        m00: 1.0, m01: 0.0, m02: 0.0, m10: 0.0, m11: c, m12: 0.0 - s, m20: 0.0, m21: s, m22: c
+    };
+}
+
+/// Rotation about y by `a` radians.
+pub fn mat3_rot_y(a: f64) -> Mat3 {
+    val c: f64 = math_cos(a);
+    val s: f64 = math_sin(a);
+    return Mat3 {
+        m00: c, m01: 0.0, m02: s, m10: 0.0, m11: 1.0, m12: 0.0, m20: 0.0 - s, m21: 0.0, m22: c
+    };
+}
+
+/// Rotation about z by `a` radians.
+pub fn mat3_rot_z(a: f64) -> Mat3 {
+    val c: f64 = math_cos(a);
+    val s: f64 = math_sin(a);
+    return Mat3 {
+        m00: c, m01: 0.0 - s, m02: 0.0, m10: s, m11: c, m12: 0.0, m20: 0.0, m21: 0.0, m22: 1.0
+    };
+}
+
+/// The matrix as three bracketed rows with `dp` decimals.
+pub fn mat3_to_str(m: Mat3, dp: i64) -> str {
+    return "[" + rmath_fmt(m.m00, dp) + " " + rmath_fmt(m.m01, dp) + " " + rmath_fmt(m.m02, dp) + "; " + rmath_fmt(m.m10, dp) + " " + rmath_fmt(m.m11, dp) + " " + rmath_fmt(m.m12, dp) + "; " + rmath_fmt(m.m20, dp) + " " + rmath_fmt(m.m21, dp) + " " + rmath_fmt(m.m22, dp) + "]";
+}
+
+// ─── Quaternions ───
+
+/// Axis (unit) and angle (radians, in [0, pi]) of a rotation.
+pub struct AxisAngle {
+    pub axis: vec3,
+    pub angle: f64,
+}
+
+/// Euler angles of the ZYX convention: R = Rz(yaw) Ry(pitch) Rx(roll).
+pub struct EulerZYX {
+    pub roll: f64,
+    pub pitch: f64,
+    pub yaw: f64,
+}
+
+/// The identity rotation.
+pub fn qt_identity() -> quat {
+    return quat(1.0, 0.0, 0.0, 0.0);
+}
+
+/// a * b (Hamilton product): rotating by the result is rotating by b, then a.
+pub fn qt_mul(a: quat, b: quat) -> quat {
+    return quat(a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z, a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x, a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w);
+}
+
+/// The conjugate w - xi - yj - zk.
+pub fn qt_conj(q: quat) -> quat {
+    return quat(q.w, 0.0 - q.x, 0.0 - q.y, 0.0 - q.z);
+}
+
+/// w*w + x*x + y*y + z*z.
+pub fn qt_norm_sq(q: quat) -> f64 {
+    return q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+}
+
+/// The norm |q|.
+pub fn qt_norm(q: quat) -> f64 {
+    return math_sqrt(qt_norm_sq(q));
+}
+
+/// q / |q|; the identity for a zero quaternion.
+pub fn qt_normalize(q: quat) -> quat {
+    val n: f64 = qt_norm(q);
+    if n == 0.0 {
+        return qt_identity();
+    }
+    return quat(q.w / n, q.x / n, q.y / n, q.z / n);
+}
+
+/// The inverse conj(q) / |q|^2 (the conjugate for a unit quaternion).
+pub fn qt_inverse(q: quat) -> quat {
+    val n: f64 = qt_norm_sq(q);
+    if n == 0.0 {
+        return qt_identity();
+    }
+    return quat(q.w / n, 0.0 - q.x / n, 0.0 - q.y / n, 0.0 - q.z / n);
+}
+
+/// The 4D dot product.
+pub fn qt_dot(a: quat, b: quat) -> f64 {
+    return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+/// q with w >= 0 (q and -q are the same rotation).
+pub fn qt_canonical(q: quat) -> quat {
+    if q.w < 0.0 {
+        return quat(0.0 - q.w, 0.0 - q.x, 0.0 - q.y, 0.0 - q.z);
+    }
+    return q;
+}
+
+/// v rotated by the unit quaternion q (q v q*).
+pub fn qt_rotate(q: quat, v: vec3) -> vec3 {
+    // t = 2 (q.xyz x v); v' = v + w t + q.xyz x t
+    val tx: f64 = 2.0 * (q.y * v.z - q.z * v.y);
+    val ty: f64 = 2.0 * (q.z * v.x - q.x * v.z);
+    val tz: f64 = 2.0 * (q.x * v.y - q.y * v.x);
+    return vec3(v.x + q.w * tx + (q.y * tz - q.z * ty), v.y + q.w * ty + (q.z * tx - q.x * tz), v.z + q.w * tz + (q.x * ty - q.y * tx));
+}
+
+/// The rotation by `angle` radians about `axis` (normalized here; a zero
+/// axis gives the identity).
+pub fn qt_from_axis_angle(axis: vec3, angle: f64) -> quat {
+    val n: f64 = axis.length();
+    if n == 0.0 {
+        return qt_identity();
+    }
+    val s: f64 = math_sin(angle * 0.5) / n;
+    return quat(math_cos(angle * 0.5), axis.x * s, axis.y * s, axis.z * s);
+}
+
+/// Axis and angle of q; angle in [0, pi]. The identity gives axis (1, 0, 0)
+/// and angle 0.
+pub fn qt_to_axis_angle(qin: quat) -> AxisAngle {
+    val q: quat = qt_canonical(qt_normalize(qin));
+    val s: f64 = math_sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+    if s < 0.000000000001 {
+        return AxisAngle {
+            axis: vec3(1.0, 0.0, 0.0), angle: 0.0
+        };
+    }
+    return AxisAngle {
+        axis: vec3(q.x / s, q.y / s, q.z / s), angle: 2.0 * rmath_atan2(s, q.w)
+    };
+}
+
+/// The rotation vector (axis * angle) of q.
+pub fn qt_to_rotvec(q: quat) -> vec3 {
+    val aa: AxisAngle = qt_to_axis_angle(q);
+    return aa.axis.scale(aa.angle);
+}
+
+/// The rotation of a rotation vector (axis * angle).
+pub fn qt_from_rotvec(r: vec3) -> quat {
+    val a: f64 = r.length();
+    if a < 0.000000000001 {
+        // first order: q = (1, r/2), normalized
+        return qt_normalize(quat(1.0, r.x * 0.5, r.y * 0.5, r.z * 0.5));
+    }
+    return qt_from_axis_angle(r, a);
+}
+
+/// The ZYX Euler rotation Rz(yaw) Ry(pitch) Rx(roll).
+pub fn qt_from_euler_zyx(roll: f64, pitch: f64, yaw: f64) -> quat {
+    val cr: f64 = math_cos(roll * 0.5);
+    val sr: f64 = math_sin(roll * 0.5);
+    val cp: f64 = math_cos(pitch * 0.5);
+    val sp: f64 = math_sin(pitch * 0.5);
+    val cy: f64 = math_cos(yaw * 0.5);
+    val sy: f64 = math_sin(yaw * 0.5);
+    return quat(cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy);
+}
+
+/// ZYX Euler angles of q: roll and yaw in (-pi, pi], pitch in [-pi/2, pi/2].
+/// At pitch = +-pi/2 (gimbal lock) roll is 0 and yaw takes the whole turn.
+pub fn qt_to_euler_zyx(qin: quat) -> EulerZYX {
+    val q: quat = qt_normalize(qin);
+    val sinp: f64 = 2.0 * (q.w * q.y - q.z * q.x);
+    if sinp >= 0.9999999999 || sinp <= - 0.9999999999 {
+        // gimbal lock: only yaw - roll (or yaw + roll) is defined
+        var sign: f64 = 1.0;
+        if sinp < 0.0 {
+            sign = - 1.0;
+        }
+        val yaw: f64 = 0.0 - sign * 2.0 * rmath_atan2(q.x, q.w);
+        return EulerZYX {
+            roll: 0.0, pitch: sign * rmath_pi() / 2.0, yaw: rmath_wrap_angle(yaw)
+        };
+    }
+    val roll: f64 = rmath_atan2(2.0 * (q.w * q.x + q.y * q.z), 1.0 - 2.0 * (q.x * q.x + q.y * q.y));
+    val pitch: f64 = rmath_asin(sinp);
+    val yaw: f64 = rmath_atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    return EulerZYX {
+        roll: roll, pitch: pitch, yaw: yaw
+    };
+}
+
+/// The rotation matrix of q (normalized first).
+pub fn qt_to_mat3(qin: quat) -> Mat3 {
+    val q: quat = qt_normalize(qin);
+    val xx: f64 = q.x * q.x;
+    val yy: f64 = q.y * q.y;
+    val zz: f64 = q.z * q.z;
+    val xy: f64 = q.x * q.y;
+    val xz: f64 = q.x * q.z;
+    val yz: f64 = q.y * q.z;
+    val wx: f64 = q.w * q.x;
+    val wy: f64 = q.w * q.y;
+    val wz: f64 = q.w * q.z;
+    return Mat3 {
+        m00: 1.0 - 2.0 * (yy + zz), m01: 2.0 * (xy - wz), m02: 2.0 * (xz + wy), m10: 2.0 * (xy + wz), m11: 1.0 - 2.0 * (xx + zz), m12: 2.0 * (yz - wx), m20: 2.0 * (xz - wy), m21: 2.0 * (yz + wx), m22: 1.0 - 2.0 * (xx + yy)
+    };
+}
+
+/// The quaternion (w >= 0) of a rotation matrix, by Shepperd's method (the
+/// largest of the four candidates, so no division by a small number).
+pub fn qt_from_mat3(m: Mat3) -> quat {
+    val tr: f64 = m.m00 + m.m11 + m.m22;
+    var q: quat = qt_identity();
+    if tr > m.m00 && tr > m.m11 && tr > m.m22 {
+        val s: f64 = math_sqrt(tr + 1.0) * 2.0;
+        // s = 4w
+        q = quat(0.25 * s, (m.m21 - m.m12) / s, (m.m02 - m.m20) / s, (m.m10 - m.m01) / s);
+    } else if m.m00 > m.m11 && m.m00 > m.m22 {
+        val s: f64 = math_sqrt(1.0 + m.m00 - m.m11 - m.m22) * 2.0;
+        // s = 4x
+        q = quat((m.m21 - m.m12) / s, 0.25 * s, (m.m01 + m.m10) / s, (m.m02 + m.m20) / s);
+    } else if m.m11 > m.m22 {
+        val s: f64 = math_sqrt(1.0 + m.m11 - m.m00 - m.m22) * 2.0;
+        // s = 4y
+        q = quat((m.m02 - m.m20) / s, (m.m01 + m.m10) / s, 0.25 * s, (m.m12 + m.m21) / s);
+    } else {
+        val s: f64 = math_sqrt(1.0 + m.m22 - m.m00 - m.m11) * 2.0;
+        // s = 4z
+        q = quat((m.m10 - m.m01) / s, (m.m02 + m.m20) / s, (m.m12 + m.m21) / s, 0.25 * s);
+    }
+    return qt_canonical(qt_normalize(q));
+}
+
+/// Spherical linear interpolation along the shorter arc: a at t = 0, b at
+/// t = 1, constant angular speed in between. Nearly equal inputs use a
+/// normalized lerp (sin(theta) would be ~0).
+pub fn qt_slerp(a: quat, bin: quat, t: f64) -> quat {
+    var b: quat = bin;
+    var d: f64 = qt_dot(a, b);
+    if d < 0.0 {
+        b = quat(0.0 - b.w, 0.0 - b.x, 0.0 - b.y, 0.0 - b.z);
+        d = 0.0 - d;
+    }
+    if d > 0.9999995 {
+        return qt_normalize(quat(a.w + (b.w - a.w) * t, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t));
+    }
+    val theta0: f64 = rmath_acos(d);
+    val s0: f64 = math_sin(theta0);
+    val ka: f64 = math_sin((1.0 - t) * theta0) / s0;
+    val kb: f64 = math_sin(t * theta0) / s0;
+    return quat(ka * a.w + kb * b.w, ka * a.x + kb * b.x, ka * a.y + kb * b.y, ka * a.z + kb * b.z);
+}
+
+/// The angle (radians, [0, pi]) of the rotation taking a to b.
+pub fn qt_angle_between(a: quat, b: quat) -> f64 {
+    var d: f64 = math_fabs(qt_dot(qt_normalize(a), qt_normalize(b)));
+    if d > 1.0 {
+        d = 1.0;
+    }
+    return 2.0 * rmath_acos(d);
+}
+
+/// The shortest rotation taking direction a to direction b.
+pub fn qt_from_two_vectors(ain: vec3, bin: vec3) -> quat {
+    val a: vec3 = ain.normalize();
+    val b: vec3 = bin.normalize();
+    val d: f64 = a.dot(b);
+    if d < - 0.999999999 {
+        // opposite: half turn about any axis perpendicular to a
+        var axis: vec3 = vec3(1.0, 0.0, 0.0).cross(a);
+        if axis.length() < 0.000001 {
+            axis = vec3(0.0, 1.0, 0.0).cross(a);
+        }
+        return qt_from_axis_angle(axis, rmath_pi());
+    }
+    val c: vec3 = a.cross(b);
+    return qt_normalize(quat(1.0 + d, c.x, c.y, c.z));
+}
+
+/// q advanced by the body angular velocity `omega` (rad/s, in the rotated
+/// frame) over dt seconds: q * exp(omega dt / 2). Exact for constant omega.
+pub fn qt_integrate(q: quat, omega: vec3, dt: f64) -> quat {
+    val dq: quat = qt_from_rotvec(omega.scale(dt));
+    return qt_normalize(qt_mul(q, dq));
+}
+
+/// True when a and b are the same rotation within `tol` (q and -q equal).
+pub fn qt_approx_eq(a: quat, b: quat, tol: f64) -> bool {
+    val d: f64 = math_fabs(qt_dot(qt_normalize(a), qt_normalize(b)));
+    return 1.0 - d <= tol;
+}
+
+/// q as "w + xi + yj + zk" style "(w, x, y, z)" with `dp` decimals.
+pub fn qt_to_str(q: quat, dp: i64) -> str {
+    return "(" + rmath_fmt(q.w, dp) + ", " + rmath_fmt(q.x, dp) + ", " + rmath_fmt(q.y, dp) + ", " + rmath_fmt(q.z, dp) + ")";
+}

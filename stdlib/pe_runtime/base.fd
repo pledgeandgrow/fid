@@ -51,6 +51,14 @@ extern "C" {
     fn strlen as pe_c_strlen(s: i64) -> i64;
     fn memcmp as pe_c_memcmp(a: i64, b: i64, n: i64) -> i32;
     fn memchr as pe_c_memchr(p: i64, c: i32, n: i64) -> i64;
+    // kernel32.dll: run-time loading (roadmap L6C) and console control
+    // events (p_signal_register)
+    fn LoadLibraryA as pe_k_load_library(path: str) -> i64;
+    fn GetProcAddress as pe_k_get_proc_address(h: i64, name: str) -> i64;
+    fn FreeLibrary as pe_k_free_library(h: i64) -> i32;
+    fn SetConsoleCtrlHandler as pe_k_set_ctrl_handler(handler: fn(i32) -> i32, add: i32) -> i32;
+    // Machine-code primitive (pe_ir_stubs.fd): call a C function by address
+    fn pe_call_c1(addr: i64, arg: i64) -> i64;
     // Machine-code primitives (pe.rs): a float travels as its bits
     fn pe_f64_to_bits(x: f64) -> i64;
     fn pe_bits_to_f64(bits: i64) -> f64;
@@ -105,7 +113,6 @@ pub fn pert_str_to_int(s: str) -> i64 {
     return pe_c_strtoi64(s, 0, 10);
 }
 
-/// p_str_equal for this backend: compare the lengths first, then the
 /// Core's copy, compare and byte search run msvcrt's vectorized routines
 /// (competitive roadmap OP23): string building, Vec growth and copies,
 /// `==` on byte runs and substring search no longer go a byte at a time.
@@ -123,12 +130,33 @@ pub fn pert_bytes_eq(a: i64, b: i64, n: i64) -> bool {
 }
 
 pub fn pert_mem_find_byte(p: i64, n: i64, b: i64) -> i64 {
-    if n <= 0 { return -1; }
+    // a value outside 0..255 is no byte (memchr would take its low byte)
+    if n <= 0 || b < 0 || b > 255 { return -1; }
     var r: i64 = pe_c_memchr(p, b as i32, n);
     if r == 0 { return -1; }
     return r - p;
 }
 
+/// OP23: core's p_str_compare (bytes up to the first NUL of either; the
+/// first difference as a - b, 0 when equal). strlen finds the NULs, msvcrt's
+/// memcmp skips equal 64-byte runs (it gives only the sign, so the
+/// difference itself is found byte by byte inside the run that differs).
+pub fn pert_str_compare(a: i64, b: i64) -> i64 {
+    if a == b { return 0; }
+    if a == 0 { return 0 - 1; }
+    if b == 0 { return 1; }
+    var m: i64 = pe_c_strlen(a);
+    var lb: i64 = pe_c_strlen(b);
+    if lb < m { m = lb; }
+    m = m + 1;
+    var i: i64 = 0;
+    while i + 64 <= m && pe_c_memcmp(a + i, b + i, 64) == 0 { i = i + 64; }
+    while i < m && pe_byte_at(a, i) == pe_byte_at(b, i) { i = i + 1; }
+    if i >= m { return 0; }
+    return pe_byte_at(a, i) - pe_byte_at(b, i);
+}
+
+/// p_str_equal for this backend: compare the lengths first, then the
 /// memory in one msvcrt memcmp — not byte by byte (pe-roadmap item 74).
 pub fn pert_str_equal(a: i64, b: i64) -> bool {
     if a == b { return true; }
@@ -136,12 +164,44 @@ pub fn pert_str_equal(a: i64, b: i64) -> bool {
     if b == 0 { return false; }
     // The header's length when the string has one (D16), so a zero byte
     // inside a string is compared too; else strlen
-    var la: i64 = p_str_hdr_len(a);
+    var la: i64 = pe_hdr_len(a);
     if la < 0 { la = pe_c_strlen(a); }
-    var lb: i64 = p_str_hdr_len(b);
+    var lb: i64 = pe_hdr_len(b);
     if lb < 0 { lb = pe_c_strlen(b); }
     if la != lb { return false; }
     return pe_c_memcmp(a, b, la) == 0;
+}
+
+const PERT_STR_MAGIC: i64 = 0x4649444553545201;    // core's P_STR_MAGIC
+const PERT_STR_RC: i64 = 0x4649444500000000;       // core's P_STR_RC
+
+/// The header length of a non-null string, or -1 when it has no header:
+/// core's p_str_hdr_len (with p_str_len_word and p_str_count_of) in one
+/// function, for string == (two of these per compare). Same tests in the
+/// same order: 8-aligned, a plausible length word at s - 8, and at s - 16
+/// the literal magic, a static header or a counted one (P_STR_RC + a
+/// count in 1..2^30 with the append bit clear).
+@wrapping
+fn pe_hdr_len(s: i64) -> i64 {
+    if (s & 7) != 0 { return 0 - 1; }
+    var mp: *mut i64 = s - 16;
+    var lp: *mut i64 = s - 8;
+    var w: i64 = 0;
+    var l: i64 = 0;
+    // SAFETY: s != 0 and 8-aligned: a headered string has [magic or
+    // count][len] at s - 16; for another pointer these are the allocator's
+    // header or the bytes before it, only read (as core's p_str_hdr_len).
+    unsafe {
+        w = *mp;
+        l = *lp;
+    }
+    if l < 0 || l >= 0x10000000000 { return 0 - 1; }
+    if w == PERT_STR_MAGIC || w == PERT_STR_STATIC { return l; }
+    var d: i64 = w - PERT_STR_RC;
+    if d < 0 || d >= 0x100000000 { return 0 - 1; }
+    if (d & 0x40000000) != 0 { return 0 - 1; }
+    if (d & 0x3FFFFFFF) >= 1 { return l; }
+    return 0 - 1;
 }
 
 /// Native-only replacement for `p_str_hash` (pe-roadmap item 77). The
@@ -155,35 +215,50 @@ pub fn pert_str_equal(a: i64, b: i64) -> bool {
     var hash: i64 = -3750763034362895579; // FNV-1a offset basis
     if s == 0 { return 0; }
     var addr: i64 = s;
+    // SAFETY: s != 0 is a NUL-terminated string; the loop stops at its NUL
+    // and reads a whole word only while it stays in the page of the bytes
+    // already read (see above), so no read faults or leaves the mapping.
     unsafe {
-        while true {
-            var w: i64 = 0;
-            var whole: bool = true;
-            if (addr & 4095) <= 4088 {
+        // OP23: the words of each page in a tight loop (one page test per
+        // page, one 64-bit zero-byte test per word: the function wraps),
+        // then the word that crosses into the next page byte by byte. The
+        // values are the same as one word at a time with both tests.
+        var going: bool = true;
+        while going {
+            // whole words while (addr & 4095) <= 4088
+            var lim: i64 = (addr | 4095) - 7;
+            while addr <= lim {
                 var word_ptr: *mut i64 = addr;
-                w = *word_ptr;
-                // Zero-byte test per 32-bit half (no i64 overflow):
-                // (x - 0x01010101) & ~x & 0x80808080 detects a zero byte.
-                var lo: i64 = w & 4294967295;
-                var hi: i64 = (w >> 32) & 4294967295;
-                if ((lo - 16843009) & (~lo) & 2155905152) != 0
-                    || ((hi - 16843009) & (~hi) & 2155905152) != 0 {
-                    whole = false;
+                var w: i64 = *word_ptr;
+                // (w - 0x0101010101010101) & ~w & 0x8080808080808080: a zero byte
+                if ((w - 72340172838076673) & (~w) & -9187201950435737472) != 0 {
+                    going = false;
+                    lim = addr - 1;
+                } else {
+                    hash = hash ^ w;
+                    hash = hash * 1099511628211;
+                    addr = addr + 8;
                 }
-            } else {
+            }
+            if going {
+                var wc: i64 = 0;
+                var whole: bool = true;
                 var k: i64 = 0;
                 while k < 8 && whole {
                     var bp: *mut u8 = addr + k;
                     var b: i64 = *bp;
                     if b == 0 { whole = false; }
-                    w = w | (b << (k * 8));
+                    wc = wc | (b << (k * 8));
                     k = k + 1;
                 }
+                if whole {
+                    hash = hash ^ wc;
+                    hash = hash * 1099511628211;
+                    addr = addr + 8;
+                } else {
+                    going = false;
+                }
             }
-            if !whole { break; }
-            hash = hash ^ w;
-            hash = hash * 1099511628211;
-            addr = addr + 8;
         }
         // The last bytes, fewer than 8
         var byte_ptr: *mut u8 = addr;
@@ -252,8 +327,11 @@ pub fn pert_to_str_float(val: f64) -> str {
     var prec: i64 = 0;
     while prec <= max_prec {
         pe_c_fmt_prec(buf, 511, "%.*f", prec, val);
-        var back: str = pe_buf_str(buf);
-        if pe_c_strtod(back, 0) == val {
+        // M7: no str local owns buf: it would be dropped at the function's
+        // end, after pe_trim_fraction_zeros freed buf (Str_drop then read
+        // buf - 16 of the freed block); the temporary goes at this statement
+        val same: bool = pe_c_strtod(pe_buf_str(buf), 0) == val;
+        if same {
             return pe_trim_fraction_zeros(buf);
         }
         prec = prec + 1;
@@ -302,17 +380,55 @@ fn pe_trim_fraction_zeros(buf: i64) -> str {
 fn pe_byte_at(buf: i64, i: i64) -> i64 {
     var p: *mut u8 = buf + i;
     var b: i64 = 0;
+    // SAFETY: NOT checked here: the runtime's callers pass a byte inside a
+    // block or string they hold (a string's bytes up to its NUL, a buffer
+    // they allocated); user code reaches it only through p_volatile_load8.
     unsafe { b = *p; }
     return b;
 }
 
 fn pe_set_byte(buf: i64, i: i64, b: i64) {
     var p: *mut u8 = buf + i;
+    // SAFETY: NOT checked here: as pe_byte_at, a byte of a block the caller
+    // allocated and owns.
     unsafe { *p = b; }
 }
 
 fn pe_str_addr(s: i64) -> i64 {
     return s;
+}
+
+// RT3: the 256 one-byte strings are static, laid out as literals are
+// ([P_STR_STATIC][1] byte NUL, 24 bytes each), made once and never freed
+// (dropping a static string does nothing). p_char_to_str and core's
+// one-byte slices hand them out without allocating, as on the C path
+// (codegen_c.fd __p_chr1). Replaces pe_ir's p_char_to_str stub.
+var pert_chr1: i64 = 0;
+const PERT_STR_STATIC: i64 = 0x4649444553545202;   // core's P_STR_STATIC
+
+pub fn pert_char_to_str(c: i64) -> str {
+    var t: i64 = pert_chr1;
+    if t == 0 {
+        t = p_malloc(256 * 24);
+        var i: i64 = 0;
+        while i < 256 {
+            var mp: *mut i64 = t + i * 24;
+            var lp: *mut i64 = t + i * 24 + 8;
+            var dp: *mut i64 = t + i * 24 + 16;
+            // SAFETY: the three words of entry i (i < 256) of the 256 * 24
+            // bytes just allocated; the data word is the byte, its NUL and
+            // zero padding.
+            unsafe {
+                *mp = PERT_STR_STATIC;
+                *lp = 1;
+                *dp = i;
+            }
+            i = i + 1;
+        }
+        // two threads may both build one; either table stays valid
+        pert_chr1 = t;
+    }
+    return t + (c & 255) * 24 + 16;
 }
 
 // ─── Files (C stdio, binary mode) ───────────────────────────────────────
@@ -331,8 +447,14 @@ pub fn pert_file_append(path: str, content: str) -> i64 {
     if f == 0 {
         return -1;
     }
-    pe_c_fputs(content, f);
-    pe_c_fclose(f);
+    // C4: a failed write or flush (full disk) is -1, as on the C runtime
+    var bad: bool = (pe_c_fputs(content, f) as i64) < 0;
+    if (pe_c_fclose(f) as i64) != 0 {
+        bad = true;
+    }
+    if bad {
+        return -1;
+    }
     return 0;
 }
 
@@ -385,6 +507,7 @@ pub fn pert_file_write_vec(path: str, v: Vec<i64>) -> i64 {
         return -1;
     }
     var n: i64 = v.len();
+    var w: i64 = 0;
     if n > 0 {
         var buf: i64 = p_malloc(n);
         var i: i64 = 0;
@@ -392,10 +515,139 @@ pub fn pert_file_write_vec(path: str, v: Vec<i64>) -> i64 {
             pe_set_byte(buf, i, v.get(i) & 255);
             i = i + 1;
         }
-        pe_c_fwrite(buf, 1, n, f);
+        w = pe_c_fwrite(buf, 1, n, f);
+        p_free(buf);
     }
     pe_c_fclose(f);
+    if w != n {
+        return -1;
+    }
     return 0;
+}
+
+/// RT2: the `n` bytes at `data`, zero bytes included (p_file_write stops
+/// at the first, as fputs does); 0, or -1 when the file cannot be written.
+pub fn pert_file_write_bin(path: str, data: str, n: i64) -> i64 {
+    if n < 0 {
+        return -1;
+    }
+    var f: i64 = pe_c_fopen(path, "wb");
+    if f == 0 {
+        return -1;
+    }
+    var w: i64 = 0;
+    if n > 0 {
+        w = pe_c_fwrite(data as i64, 1, n, f);
+    }
+    pe_c_fclose(f);
+    if w != n {
+        return -1;
+    }
+    return 0;
+}
+
+// roadmap L4B (streaming file handles, stdlib/fs.fd File; core.fd declares
+// p_file_read_at / p_file_append_vec): as the C runtime's.
+extern "C" {
+    fn _fseeki64 as pe_c_fseeki64(f: i64, offset: i64, whence: i64) -> i32;
+}
+
+extern "C" link "kernel32.dll" {
+    fn GetFileAttributesExA as pe_k_attrs_ex(path: str, level: i64, data: i64) -> i32;
+}
+
+/// Up to n bytes from byte `offset`, one element each; empty past the end
+/// or when the file cannot be read. Only those bytes are read.
+pub fn pert_file_read_at(path: str, offset: i64, n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if pe_str_is_null(path) || offset < 0 || n <= 0 {
+        return v;
+    }
+    var f: i64 = pe_c_fopen(path, "rb");
+    if f == 0 {
+        return v;
+    }
+    if pe_c_fseeki64(f, offset, 0) != 0 {
+        pe_c_fclose(f);
+        return v;
+    }
+    var left: i64 = n;
+    if left > 1073741824 {
+        left = 1073741824;
+    }
+    var chunk: i64 = 65536;
+    if left < chunk {
+        chunk = left;
+    }
+    var buf: i64 = p_malloc(chunk);
+    while left > 0 {
+        var want: i64 = chunk;
+        if left < want {
+            want = left;
+        }
+        var got: i64 = pe_c_fread(buf, 1, want, f);
+        var i: i64 = 0;
+        while i < got {
+            v.push(pe_byte_at(buf, i));
+            i = i + 1;
+        }
+        left = left - got;
+        if got < want {
+            left = 0;
+        }
+    }
+    p_free(buf);
+    pe_c_fclose(f);
+    return v;
+}
+
+/// Each element's low byte after what the file holds (created if missing),
+/// zero bytes included: 0, or -1 when it cannot be written.
+pub fn pert_file_append_vec(path: str, v: Vec<i64>) -> i64 {
+    if pe_str_is_null(path) {
+        return -1;
+    }
+    var f: i64 = pe_c_fopen(path, "ab");
+    if f == 0 {
+        return -1;
+    }
+    var n: i64 = v.len();
+    var w: i64 = 0;
+    if n > 0 {
+        var buf: i64 = p_malloc(n);
+        var i: i64 = 0;
+        while i < n {
+            pe_set_byte(buf, i, v.get(i) & 255);
+            i = i + 1;
+        }
+        w = pe_c_fwrite(buf, 1, n, f);
+        p_free(buf);
+    }
+    var c: i64 = pe_c_fclose(f) as i64;
+    if w != n || c != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+/// The time the file was last written, in ms since 1970 (UTC); -1 when it
+/// does not exist (as the C runtime's p_file_mtime_ms).
+pub fn pert_file_mtime_ms(path: str) -> i64 {
+    if pe_str_is_null(path) {
+        return -1;
+    }
+    // WIN32_FILE_ATTRIBUTE_DATA: attributes (4), creation, access, write
+    // FILETIMEs (8 each, from 4), size (8): 36 bytes
+    var data: i64 = p_malloc(40);
+    if pe_k_attrs_ex(path, 0, data) == 0 {
+        p_free(data);
+        return -1;
+    }
+    var lo: i64 = pe_byte_at(data, 20) | (pe_byte_at(data, 21) << 8) | (pe_byte_at(data, 22) << 16) | (pe_byte_at(data, 23) << 24);
+    var hi: i64 = pe_byte_at(data, 24) | (pe_byte_at(data, 25) << 8) | (pe_byte_at(data, 26) << 16) | (pe_byte_at(data, 27) << 24);
+    p_free(data);
+    var ft: i64 = (hi << 32) | lo;
+    return (ft - 116444736000000000) / 10000;
 }
 
 /// 64-bit FNV-1a of the file's bytes; 0 if it cannot be read.
@@ -444,25 +696,55 @@ fn pe_time_100ns() -> i64 {
     pe_k_system_time(ft);
     var p: *mut i64 = ft;
     var t: i64 = 0;
+    // SAFETY: ft is the 8-byte block allocated above, which
+    // GetSystemTimeAsFileTime filled.
     unsafe { t = *p; }
     return t - 116444736000000000;
 }
 
 /// 64 bits from the operating system's secure generator (msvcrt's rand_s,
 /// over RtlGenRandom).
+/// Regions freed in one step (proposal 0005) need the C runtime's arenas:
+/// here no region is ever open, so regions stay scopes and core's region
+/// checks fall through.
+pub fn pert_region_word(op: i64, x: i64) -> i64 {
+    return 0;
+}
+
 pub fn pert_os_random_u64() -> i64 {
     var cell: i64 = p_malloc(8);
     var lo: *mut i32 = cell;
     var hi: *mut i32 = cell + 4;
+    // SAFETY: the two 4-byte halves of the 8-byte block allocated above.
     unsafe { *lo = 0; *hi = 0; }
     if pe_c_rand_s(cell) != 0 || pe_c_rand_s(cell + 4) != 0 {
         p_panic("no random source in the operating system");
     }
     var p: *mut i64 = cell;
     var v: i64 = 0;
+    // SAFETY: the 8-byte block allocated above, filled by rand_s, read
+    // before it is freed.
     unsafe { v = *p; }
     p_free(cell);
     return v;
+}
+
+extern "C" {
+    // kernel32.dll (static import list, pe_ir_enc.fd pe_kernel32_imports)
+    fn K32GetProcessMemoryInfo as pe_k_mem_info(proc: i64, counters: i64, cb: i64) -> i32;
+}
+
+/// RT7: the bytes of the process in physical memory: the working set,
+/// WorkingSetSize at offset 16 of a 72-byte PROCESS_MEMORY_COUNTERS
+/// (the current process is the handle -1); -1 when Windows does not say.
+pub fn pert_mem_resident() -> i64 {
+    val pmc: i64 = p_malloc(72);
+    var r: i64 = 0 - 1;
+    if pe_k_mem_info(0 - 1, pmc, 72) != 0 {
+        r = pe_cr_ld(pmc + 16);
+    }
+    p_free(pmc);
+    return r;
 }
 
 pub fn pert_clock_now() -> i64 {
@@ -480,7 +762,13 @@ pub fn pert_clock_now_ms() -> i64 {
 /// End the process with this exit code (output is written unbuffered, so
 /// nothing is lost).
 pub fn pert_exit(code: i64) {
-    pe_k_exit_process(code);
+    // roadmap P6: rank 0 waits for the other ranks (tensor.fd pert_tp_exit)
+    val tp_code: i64 = pert_tp_exit(code);
+    // SL15: the sampling profiler's report (conc.fd), when it is on
+    pe_pf_at_exit();
+    // RL16: --leaks' report, when the program was built with it
+    pe_lk_at_exit();
+    pe_k_exit_process(tp_code);
 }
 
 /// The variable's value, a counted copy (proposal 0004); null when it is
@@ -489,6 +777,127 @@ pub fn pert_getenv(name: str) -> str {
     var r: i64 = pe_c_getenv(name) as i64;
     if r == 0 { return r; }
     return p_str_from_ptr(r);
+}
+
+// ─── The command line ───────────────────────────────────────────────────
+
+// SAFETY: GetCommandLineA is on pe_ir's kernel32 list; it returns the
+// process's command line, which this section only reads.
+extern "C" {
+    fn GetCommandLineA as pe_argv_command_line() -> i64;
+}
+
+/// Walk the command line `cl` by the C runtime's rules (UCRT's: what a C
+/// program's argv gets; CommandLineToArgvW's but for `""` inside quotes).
+/// argv[0], the program name, runs to its closing quote or to a space or
+/// tab, with no escapes. Each later argument is separated by spaces and
+/// tabs; a double quote starts or ends a quoted part (spaces in it are
+/// kept); 2n backslashes then a quote give n backslashes and the quote
+/// keeps its meaning, 2n+1 backslashes then a quote give n backslashes and
+/// a literal quote; backslashes before anything else are themselves; `""`
+/// inside a quoted part is a literal quote.
+/// want >= 0: the length of argument `want` (its bytes written at dst when
+/// dst != 0, no NUL), -1 when there is none. want < 0: the argument count.
+fn pe_argv_scan(cl: i64, want: i64, dst: i64) -> i64 {
+    var none: i64 = -1;
+    if want < 0 { none = 0; }
+    if cl == 0 { return none; }
+    if pe_byte_at(cl, 0) == 0 { return none; }
+    var p: i64 = 0;
+    var len: i64 = 0;
+    var inq: bool = false;
+    var c: i64 = pe_byte_at(cl, 0);
+    // argv[0]
+    while c != 0 && (inq || (c != 32 && c != 9)) {
+        if c == 34 {
+            inq = !inq;
+        } else {
+            if want == 0 && dst != 0 { pe_set_byte(dst, len, c); }
+            len = len + 1;
+        }
+        p = p + 1;
+        c = pe_byte_at(cl, p);
+    }
+    if want == 0 { return len; }
+    var idx: i64 = 1;
+    while true {
+        c = pe_byte_at(cl, p);
+        while c == 32 || c == 9 {
+            p = p + 1;
+            c = pe_byte_at(cl, p);
+        }
+        if c == 0 {
+            if want < 0 { return idx; }
+            return -1;
+        }
+        var mine: bool = idx == want;
+        len = 0;
+        inq = false;
+        var more: bool = true;
+        while more {
+            c = pe_byte_at(cl, p);
+            if c == 0 || (!inq && (c == 32 || c == 9)) {
+                more = false;
+            } else if c == 92 {
+                var bs: i64 = 0;
+                while pe_byte_at(cl, p) == 92 {
+                    bs = bs + 1;
+                    p = p + 1;
+                }
+                val quote: bool = pe_byte_at(cl, p) == 34;
+                var out: i64 = bs;
+                if quote { out = bs / 2; }
+                var k: i64 = 0;
+                while k < out {
+                    if mine && dst != 0 { pe_set_byte(dst, len, 92); }
+                    len = len + 1;
+                    k = k + 1;
+                }
+                if quote && bs % 2 == 1 {
+                    if mine && dst != 0 { pe_set_byte(dst, len, 34); }
+                    len = len + 1;
+                    p = p + 1;
+                }
+            } else if c == 34 {
+                if inq && pe_byte_at(cl, p + 1) == 34 {
+                    if mine && dst != 0 { pe_set_byte(dst, len, 34); }
+                    len = len + 1;
+                    p = p + 2;
+                } else {
+                    inq = !inq;
+                    p = p + 1;
+                }
+            } else {
+                if mine && dst != 0 { pe_set_byte(dst, len, c); }
+                len = len + 1;
+                p = p + 1;
+            }
+        }
+        if mine { return len; }
+        idx = idx + 1;
+    }
+    return -1;
+}
+
+/// The number of command-line arguments, the program's name included, as
+/// a C program's argc (the machine stub split at every space).
+pub fn pert_argc() -> i64 {
+    return pe_argv_scan(pe_argv_command_line(), -1, 0);
+}
+
+/// Command-line argument i, by the C runtime's rules (pe_argv_scan: `"a b"`
+/// is one argument without its quotes); null when there is none.
+pub fn pert_argv(i: i64) -> str {
+    var none: i64 = 0;
+    if i < 0 { return none; }
+    val cl: i64 = pe_argv_command_line();
+    val n: i64 = pe_argv_scan(cl, i, 0);
+    if n < 0 { return none; }
+    val buf: i64 = p_malloc(n + 1);
+    if buf == 0 { return none; }
+    val _w: i64 = pe_argv_scan(cl, i, buf);
+    pe_set_byte(buf, n, 0);
+    return p_str_adopt(buf);
 }
 
 // ─── Directories, processes ─────────────────────────────────────────────
@@ -623,14 +1032,22 @@ pub fn pert_process_run(cmd: str) -> i64 {
     }
     var rec: i64 = p_malloc(24);
     // The record address is unique per live call — a safe temp-name tag.
-    var of: str = ".fprc_" + int_to_str(rec) + ".out";
-    var ef: str = ".fprc_" + int_to_str(rec) + ".err";
+    // The capture files go in the temp directory (known-bugs 2g.44): the
+    // current one may not be writable.
+    var dir: str = pe_capture_dir();
+    var of: str = dir + ".fprc_" + int_to_str(rec) + ".out";
+    var ef: str = dir + ".fprc_" + int_to_str(rec) + ".err";
     var code: i64 = pe_c_system("( " + cmd + " ) > \"" + of + "\" 2> \"" + ef + "\"");
     var outp: *mut i64 = rec;
     var errp: *mut i64 = rec + 8;
     var codep: *mut i64 = rec + 16;
-    var outv: i64 = pe_str_addr(pe_read_all(of));
-    var errv: i64 = pe_str_addr(pe_read_all(ef));
+    // `as i64` hands each string's owner to the record (proposal 0004): a
+    // call such as pe_str_addr(...) borrowed a temporary that was freed at
+    // the end of its statement, so the second read reused its block and
+    // stdout showed stderr's text (known-bugs 2g.43)
+    var outv: i64 = pe_read_all(of) as i64;
+    var errv: i64 = pe_read_all(ef) as i64;
+    // SAFETY: the three words of the 24-byte record allocated above.
     unsafe { *outp = outv; *errp = errv; *codep = code; }
     pe_c_remove(of);
     pe_c_remove(ef);
@@ -643,15 +1060,38 @@ fn pe_proc_field(h: i64, off: i64) -> i64 {
     }
     var p: *mut i64 = h + off;
     var v: i64 = 0;
+    // SAFETY: NOT checked: h != 0 is taken to be a record pert_process_run
+    // made and not yet closed, off one of its words (0, 8, 16); a forged or
+    // closed handle reads freed or foreign memory.
     unsafe { v = *p; }
     return v;
 }
 
+/// The directory for capture files, with its separator: %TEMP%, %TMP%,
+/// else the current directory.
+fn pe_capture_dir() -> str {
+    var t: i64 = pe_c_getenv("TEMP") as i64;
+    if t == 0 {
+        t = pe_c_getenv("TMP") as i64;
+    }
+    if t == 0 {
+        return "";
+    }
+    return p_str_from_ptr(t) + "\\";
+}
+
 pub fn pert_process_stdout(h: i64) -> str {
+    // a handle that did not start: "" as on the C backend, not null
+    if h == 0 {
+        return "";
+    }
     return pe_proc_field(h, 0);
 }
 
 pub fn pert_process_stderr(h: i64) -> str {
+    if h == 0 {
+        return "";
+    }
     return pe_proc_field(h, 8);
 }
 
@@ -713,12 +1153,14 @@ pub fn pert_regex_match(s: str, pattern: str) -> bool {
 fn pe_sb_get(sb: i64, i: i64) -> i64 {
     var p: *mut i64 = sb + i * 8;
     var v: i64 = 0;
+    // SAFETY: word i (0..2) of a string builder's 3-word block.
     unsafe { v = *p; }
     return v;
 }
 
 fn pe_sb_set(sb: i64, i: i64, v: i64) {
     var p: *mut i64 = sb + i * 8;
+    // SAFETY: word i (0..2) of a string builder's 3-word block.
     unsafe { *p = v; }
 }
 
@@ -763,12 +1205,15 @@ pub fn pert_alloc(size: i64) -> i64 {
 pub fn pert_volatile_load(addr: i64) -> i64 {
     var p: *mut i64 = addr;
     var v: i64 = 0;
+    // SAFETY: NOT checked: p_volatile_load is a raw-address API (MMIO,
+    // buffers the caller made); the address is the caller's to vouch for.
     unsafe { v = *p; }
     return v;
 }
 
 pub fn pert_volatile_store(addr: i64, val: i64) {
     var p: *mut i64 = addr;
+    // SAFETY: NOT checked: a raw-address store, as pert_volatile_load.
     unsafe { *p = val; }
 }
 
@@ -783,12 +1228,14 @@ pub fn pert_volatile_store8(addr: i64, val: i64) {
 pub fn pert_volatile_load32(addr: i64) -> i64 {
     var p: *mut u32 = addr;
     var v: i64 = 0;
+    // SAFETY: NOT checked: a raw 4-byte load, as pert_volatile_load.
     unsafe { v = *p; }
     return v;
 }
 
 pub fn pert_volatile_store32(addr: i64, val: i64) {
     var p: *mut u32 = addr;
+    // SAFETY: NOT checked: a raw 4-byte store, as pert_volatile_load.
     unsafe { *p = val; }
 }
 
@@ -925,9 +1372,133 @@ pub fn pert_dl_sym(handle: i64, symbol: str) -> i64 {
 pub fn pert_dl_close(handle: i64) {
 }
 
-/// Simulated: the argument back.
+/// A simulated symbol (p_dl_sym: below 64 KiB, where no code is) gives the
+/// argument back; a real one (p_dl_find) is called as i64 -> i64, the C
+/// convention (C backend: the same test).
 pub fn pert_dl_call(func: i64, arg: i64) -> i64 {
-    return arg;
+    if func >= 0 && func < 65536 {
+        return arg;
+    }
+    return pe_call_c1(func, arg);
+}
+
+// ─── Dynamic loading through the OS loader (roadmap L6C) ────────────────
+// The C backend's p_dl_load / p_dl_find / p_dl_unload: a handle is the
+// HMODULE, 0 is failure.
+
+pub fn pert_dl_load(path: str) -> i64 {
+    if pe_str_is_null(path) || p_str_length(path) == 0 {
+        return 0;
+    }
+    return pe_k_load_library(path);
+}
+
+pub fn pert_dl_find(handle: i64, name: str) -> i64 {
+    if handle == 0 || pe_str_is_null(name) || p_str_length(name) == 0 {
+        return 0;
+    }
+    return pe_k_get_proc_address(handle, name);
+}
+
+pub fn pert_dl_unload(handle: i64) -> i64 {
+    if handle == 0 {
+        return 0 - 1;
+    }
+    if pe_k_free_library(handle) != 0 {
+        return 0;
+    }
+    return 0 - 1;
+}
+
+// ─── Signals: console control events ────────────────────────────────────
+// Windows has no POSIX signals for a console program: Ctrl-C and
+// Ctrl-Break arrive as SIGINT, closing the console, logging off and shutting
+// down as SIGTERM, through SetConsoleCtrlHandler. As in the C backend the
+// handler only notes the signal; p_signal_check returns 1 once per arrival.
+// An event whose signal is not registered gets the default (the process
+// ends). After a close/logoff/shutdown event Windows ends the process
+// shortly after the handler returns.
+
+var pert_sig_int_reg: i64 = 0;
+var pert_sig_term_reg: i64 = 0;
+var pert_sig_int_flag: i64 = 0;
+var pert_sig_term_flag: i64 = 0;
+var pert_sig_installed: i64 = 0;
+
+/// The console control handler (runs on a thread the system creates):
+/// CTRL_C_EVENT 0, CTRL_BREAK_EVENT 1, CTRL_CLOSE_EVENT 2,
+/// CTRL_LOGOFF_EVENT 5, CTRL_SHUTDOWN_EVENT 6. TRUE: handled here.
+fn pe_console_ctrl(kind: i32) -> i32 {
+    // SL15: Ctrl-Break asks the sampling profiler (conc.fd) for its report
+    // while it runs, as SIGUSR2 does on Linux
+    if kind == 1 && pe_pf_on != 0 {
+        pe_pf_req = 1;
+        return 1;
+    }
+    if kind == 0 || kind == 1 {
+        if pert_sig_int_reg != 0 {
+            pert_sig_int_flag = 1;
+            return 1;
+        }
+        return 0;
+    }
+    if pert_sig_term_reg != 0 {
+        pert_sig_term_flag = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/// SIGINT (2) and SIGTERM (15) can be registered; -1 for any other.
+pub fn pert_signal_register(sig: i64) -> i64 {
+    if sig != 2 && sig != 15 {
+        return 0 - 1;
+    }
+    if pert_sig_installed == 0 {
+        if pe_k_set_ctrl_handler(pe_console_ctrl, 1) == 0 {
+            return 0 - 1;
+        }
+        pert_sig_installed = 1;
+    }
+    if sig == 2 {
+        pert_sig_int_reg = 1;
+    } else {
+        pert_sig_term_reg = 1;
+    }
+    return 0;
+}
+
+/// 1 when `sig` arrived since the last check (and clears it), else 0.
+pub fn pert_signal_check(sig: i64) -> i64 {
+    if sig == 2 && pert_sig_int_flag != 0 {
+        pert_sig_int_flag = 0;
+        return 1;
+    }
+    if sig == 15 && pert_sig_term_flag != 0 {
+        pert_sig_term_flag = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/// msvcrt's raise for these two: a registered signal is noted (0); an
+/// unregistered one ends the process with status 3 (the default action).
+pub fn pert_signal_raise(sig: i64) -> i64 {
+    if sig == 2 {
+        if pert_sig_int_reg == 0 {
+            pe_k_exit_process(3);
+        }
+        pert_sig_int_flag = 1;
+        return 0;
+    }
+    if sig == 15 {
+        if pert_sig_term_reg == 0 {
+            pe_k_exit_process(3);
+        }
+        pert_sig_term_flag = 1;
+        return 0;
+    }
+    return 0 - 1;
 }
 
 // ─── Allocators: the general heap ───────────────────────────────────────
@@ -1159,6 +1730,7 @@ pub fn pert_vec_zeroize(v: i64) {
     var cap_p: *mut i64 = v + 16;
     var data: i64 = 0;
     var cap: i64 = 0;
+    // SAFETY: v != 0 is a Vec header (40 bytes, AGENTS 25): words 0 and 2.
     unsafe { data = *data_p; cap = *cap_p; }
     if data != 0 && cap > 0 {
         p_memset(data, 0, cap * vec_esz(vec_code(v)));
@@ -1186,12 +1758,15 @@ fn pert_sens_table() -> i64 {
 fn pert_sens_ld(a: i64) -> i64 {
     var p: *mut i64 = a;
     var v: i64 = 0;
+    // SAFETY: a word of the registry table (256 entries of 24 bytes) or of
+    // a Vec header the registry tracks.
     unsafe { v = *p; }
     return v;
 }
 
 fn pert_sens_st(a: i64, val: i64) {
     var p: *mut i64 = a;
+    // SAFETY: a word of an entry (< 256) of the registry table.
     unsafe { *p = val; }
 }
 
@@ -1249,3 +1824,1253 @@ pub fn pert_sensitive_free(v: i64, buf: i64, cap: i64) {
 }
 
 pub fn pert_sensitive_wipes() -> i64 { return pert_sens_wipes; }
+
+// ─── CO9: crash reports ─────────────────────────────────────────────────
+// With FID_CRASH_REPORT=<file> in the environment, a panic also writes a
+// report there, in the format of `fid run --crash-file` (compiler/
+// interp.fd interp_crash_report_text), of programs built through C
+// (codegen_c.fd __p_crash_report) and of the Linux runtime
+// (linux_runtime/base.fd pe_crash_report), which `fid inspect <file>`
+// prints:
+//   fid-crash-report 1
+//   version: <the fid that built the program> (native)
+//   program: <argv[0]>
+//   message: <a line of the panic message>     (one per line of it)
+//   trace:
+//   <the frames, innermost call first>
+//   end
+// pe_ir's p_panic stub (compiler/pe_ir_stubs.fd PeirGen_gen_panic) calls
+// pert_crash_report(message) after it printed "Panic: <message>"; a CPU
+// fault (a stack overflow, an invalid access, a division by zero) reaches
+// that stub too, through the vectored handler (pe_ir.fd crash_filter). The
+// trace follows the rbp frame records (every pe_ir function starts `push
+// rbp; mov rbp, rsp`), each checked with VirtualQuery before it is read,
+// and names a frame by the function of nat_fn_names (MI20's table,
+// declared in conc.fd) its return address is in; the runtime's own
+// functions (pe_, pert_, nat_, p_, __) are left out. A frame of the
+// system's exception dispatch ends a fault's trace early.
+
+extern "C" {
+    // kernel32.dll (static import list)
+    fn CreateFileA as pe_cr_create(path: i64, access: i64, share: i64, sa: i64, disposition: i64, flags: i64, tmpl: i64) -> i64;
+    fn WriteFile as pe_cr_write_file(h: i64, buf: i64, n: i64, written: i64, ovl: i64) -> i32;
+    fn VirtualQuery as pe_cr_vquery(addr: i64, mbi: i64, len: i64) -> i64;
+    // Machine-code primitive (pe_ir_stubs.fd, MI20): this function's rbp
+    fn nat_frame_fp() -> i64;
+}
+
+/// The fid that made this runtime's programs: compiler/build_info.fd
+/// fid_version (keep the two in step), "(native)" as the C path says "(C)".
+fn pe_cr_version() -> i64 {
+    return "fid 1.0.0+dev (native)" as i64;
+}
+
+/// 1 once a report was started: a fault while writing one writes no other.
+var pe_cr_busy: i64 = 0;
+
+/// The word at addr.
+fn pe_cr_ld(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    var v: i64 = 0;
+    // SAFETY: NOT checked here: callers read a word of the scratch block
+    // pert_crash_report allocated, of nat_fn_names' table, or of a stack
+    // frame record pe_cr_readable found committed and readable.
+    unsafe { v = *p; }
+    return v;
+}
+
+/// n bytes at s to handle h (cell: 8 bytes for WriteFile's count).
+fn pe_cr_put(h: i64, cell: i64, s: i64, n: i64) {
+    if n > 0 {
+        pe_cr_write_file(h, s, n, cell, 0);
+    }
+}
+
+/// The NUL-ended text at s to handle h.
+fn pe_cr_puts(h: i64, cell: i64, s: i64) {
+    if s == 0 {
+        return;
+    }
+    pe_cr_put(h, cell, s, pe_c_strlen(s));
+}
+
+/// v in decimal to handle h (buf: 32 bytes of scratch).
+fn pe_cr_put_int(h: i64, cell: i64, buf: i64, v: i64) {
+    var n: i64 = 0;
+    var x: i64 = v;
+    if x < 0 {
+        x = 0 - x;
+    }
+    while x > 0 || n == 0 {
+        pe_set_byte(buf, 31 - n, 48 + x % 10);
+        x = x / 10;
+        n = n + 1;
+    }
+    if v < 0 {
+        pe_set_byte(buf, 31 - n, 45);
+        n = n + 1;
+    }
+    pe_cr_put(h, cell, buf + 32 - n, n);
+}
+
+/// A frame record [rbp, return address] at fp can be read: its 16 bytes
+/// are in one committed region that is readable and not a guard page.
+/// mbi: 48 bytes of scratch (MEMORY_BASIC_INFORMATION).
+fn pe_cr_readable(mbi: i64, fp: i64) -> bool {
+    if pe_cr_vquery(fp, mbi, 48) < 48 {
+        return false;
+    }
+    var base: i64 = pe_cr_ld(mbi);
+    var size: i64 = pe_cr_ld(mbi + 24);
+    var state: i64 = pe_cr_ld(mbi + 32) & 4294967295;
+    var protect: i64 = (pe_cr_ld(mbi + 32) >> 32) & 4294967295;
+    if state != 4096 {                                   // MEM_COMMIT
+        return false;
+    }
+    // PAGE_NOACCESS (1) or PAGE_GUARD (0x100): no; any readable protection
+    if (protect & 257) != 0 || (protect & 238) == 0 {
+        return false;
+    }
+    return fp + 16 <= base + size;
+}
+
+/// A runtime function's name (pe_, pert_, nat_, p_, __): not in a trace.
+fn pe_cr_rt_name(n: i64) -> bool {
+    var a: i64 = pe_byte_at(n, 0);
+    var b: i64 = pe_byte_at(n, 1);
+    if a == 95 && b == 95 {
+        return true;
+    }
+    if a == 112 && b == 95 {
+        return true;
+    }
+    if a == 112 && b == 101 {
+        var c: i64 = pe_byte_at(n, 2);
+        if c == 95 {
+            return true;
+        }
+        if c == 114 && pe_byte_at(n, 3) == 116 && pe_byte_at(n, 4) == 95 {
+            return true;
+        }
+    }
+    return a == 110 && b == 97 && pe_byte_at(n, 2) == 116 && pe_byte_at(n, 3) == 95;
+}
+
+/// "    -| called from <name>" (with " (N times)" for a repeat).
+fn pe_cr_flush(h: i64, cell: i64, buf: i64, name: i64, reps: i64) {
+    if name == 0 {
+        return;
+    }
+    pe_cr_puts(h, cell, "    -| called from " as i64);
+    pe_cr_puts(h, cell, name);
+    if reps > 1 {
+        pe_cr_puts(h, cell, " (" as i64);
+        pe_cr_put_int(h, cell, buf, reps);
+        pe_cr_puts(h, cell, " times)" as i64);
+    }
+    pe_cr_puts(h, cell, "\n" as i64);
+}
+
+/// The trace from frame fp0 to handle h, as the C path writes it in a
+/// report: "    - <innermost>", then "    -| called from <caller>".
+fn pe_cr_trace(h: i64, cell: i64, buf: i64, mbi: i64, fp0: i64) {
+    var tab: i64 = nat_fn_names();
+    if tab == 0 {
+        return;
+    }
+    var m: i64 = 0;
+    while pe_cr_ld(tab + m * 16 + 8) != 0 {
+        m = m + 1;
+    }
+    if m == 0 {
+        return;
+    }
+    var lo_code: i64 = pe_cr_ld(tab);
+    var end_code: i64 = pe_cr_ld(tab + m * 16);
+    var fp: i64 = fp0;
+    var k: i64 = 0;
+    var shown: bool = false;
+    var last: i64 = 0;
+    var reps: i64 = 0;
+    while fp != 0 && (fp & 7) == 0 && k < 256 && pe_cr_readable(mbi, fp) {
+        var pc: i64 = pe_cr_ld(fp + 8) - 1;
+        var next: i64 = pe_cr_ld(fp);
+        k = k + 1;
+        if pc >= lo_code && pc < end_code {
+            var lo: i64 = 0;
+            var hi: i64 = m - 1;
+            while lo < hi {
+                var mid: i64 = (lo + hi + 1) / 2;
+                if pe_cr_ld(tab + mid * 16) <= pc {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            var name: i64 = pe_cr_ld(tab + lo * 16 + 8);
+            if !pe_cr_rt_name(name) {
+                if !shown {
+                    pe_cr_puts(h, cell, "    - " as i64);
+                    pe_cr_puts(h, cell, name);
+                    pe_cr_puts(h, cell, "\n" as i64);
+                    shown = true;
+                } else if last != 0 && pe_c_strlen(name) == pe_c_strlen(last) && pe_c_memcmp(name, last, pe_c_strlen(name)) == 0 {
+                    reps = reps + 1;
+                } else {
+                    pe_cr_flush(h, cell, buf, last, reps);
+                    last = name;
+                    reps = 1;
+                }
+            }
+        }
+        // the records go up the stack: anything else is not one
+        if next <= fp {
+            fp = 0;
+        } else {
+            fp = next;
+        }
+    }
+    pe_cr_flush(h, cell, buf, last, reps);
+}
+
+/// CO9: called by pe_ir's p_panic stub with the panic's message (a
+/// NUL-ended text) after it printed it: the crash report, when
+/// FID_CRASH_REPORT names a file; stderr says where it is.
+pub fn pert_crash_report(msg: i64) {
+    if pe_cr_busy != 0 {
+        return;
+    }
+    pe_cr_busy = 1;
+    var path: i64 = pe_c_getenv("FID_CRASH_REPORT") as i64;
+    if path == 0 {
+        return;
+    }
+    if pe_byte_at(path, 0) == 0 {
+        return;
+    }
+    // scratch: [0, 8) WriteFile's count, [8, 40) digits, [64, 112) the
+    // MEMORY_BASIC_INFORMATION of pe_cr_readable
+    var scratch: i64 = p_malloc(128);
+    var cell: i64 = scratch;
+    var buf: i64 = scratch + 8;
+    var mbi: i64 = scratch + 64;
+    var err: i64 = pe_k_std_handle(-12);
+    // GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
+    var h: i64 = pe_cr_create(path, 1073741824, 1, 0, 2, 128, 0);
+    if h == 0 - 1 || h == 0 {
+        pe_cr_puts(err, cell, "crash report: cannot write " as i64);
+        pe_cr_puts(err, cell, path);
+        pe_cr_puts(err, cell, "\n" as i64);
+        return;
+    }
+    pe_cr_puts(h, cell, "fid-crash-report 1\nversion: " as i64);
+    pe_cr_puts(h, cell, pe_cr_version());
+    pe_cr_puts(h, cell, "\nprogram: " as i64);
+    var arg0: i64 = p_argv(0) as i64;
+    if arg0 != 0 && pe_byte_at(arg0, 0) != 0 {
+        pe_cr_puts(h, cell, arg0);
+    } else {
+        pe_cr_puts(h, cell, "(unknown)" as i64);
+    }
+    pe_cr_puts(h, cell, "\n" as i64);
+    // a "message:" line per line of the message, a CR before a newline
+    // left out
+    var n: i64 = 0;
+    if msg != 0 {
+        n = pe_c_strlen(msg);
+    }
+    var at: i64 = 0;
+    var more: bool = true;
+    while more {
+        var e: i64 = at;
+        while e < n && pe_byte_at(msg, e) != 10 {
+            e = e + 1;
+        }
+        var len: i64 = e - at;
+        if len > 0 && pe_byte_at(msg, at + len - 1) == 13 {
+            len = len - 1;
+        }
+        pe_cr_puts(h, cell, "message: " as i64);
+        if len > 0 {
+            pe_cr_put(h, cell, msg + at, len);
+        }
+        pe_cr_puts(h, cell, "\n" as i64);
+        if e >= n {
+            more = false;
+        } else {
+            at = e + 1;
+        }
+    }
+    pe_cr_puts(h, cell, "trace:\n" as i64);
+    pe_cr_trace(h, cell, buf, mbi, nat_frame_fp());
+    pe_cr_puts(h, cell, "end\n" as i64);
+    pe_k_close_handle(h);
+    pe_cr_puts(err, cell, "crash report: " as i64);
+    pe_cr_puts(err, cell, path);
+    pe_cr_puts(err, cell, " (read it with: fid inspect " as i64);
+    pe_cr_puts(err, cell, path);
+    pe_cr_puts(err, cell, ")\n" as i64);
+}
+
+// ─── Child processes (roadmap AD4) ──────────────────────────────────────
+// stdlib/process.fd's fid_proc_* (process_spawn, process_wait,
+// process_kill), as the C runtime's (compiler/codegen_c.fd, "AD4"): argv
+// and env are lists in one string with byte 31 between the items; an env
+// item KEY=VALUE is set for the child on top of our environment, a bare
+// KEY removed; dir 0 or "" keeps ours; out is a list too: the file for the
+// child's stdout, then the one for its stderr ("" or none: the stdout file,
+// or ours). The program is started
+// with CreateProcessA (no shell; the command line is quoted for the C
+// runtime's parser). A handle is a 7-word record [process handle, ended,
+// exit code, process id, then our ends of its stdin / stdout / stderr pipes
+// (roadmap L4H, -1: none)]; 0 when the program could not start.
+
+// SAFETY: kernel32 functions pe_ir does not import by itself (its list is
+// fixed, pe_ir_enc.fd pe_kernel32_imports): `link "kernel32.dll"` makes
+// them extra imports, which the program binds at start-up only when it
+// calls them. Prototypes as the Windows SDK's: handles and pointers are
+// words, BOOL an i32.
+extern "C" link "kernel32.dll" {
+    fn GetExitCodeProcess as pe_px_exit_code(h: i64, code_out: i64) -> i32;
+    fn TerminateProcess as pe_px_terminate(h: i64, code: i64) -> i32;
+    fn GetEnvironmentStringsA as pe_px_env_strings() -> i64;
+    fn FreeEnvironmentStringsA as pe_px_env_free(block: i64) -> i32;
+    // roadmap L4H: why a pipe read failed (109 ERROR_BROKEN_PIPE: the end)
+    fn GetLastError as pe_px_last_error() -> i32;
+}
+
+// SAFETY: CreateProcessA is on pe_ir's kernel32 list; the SDK's prototype,
+// every pointer a word (the command line a buffer this runtime owns, as
+// CreateProcessA may write to it).
+extern "C" {
+    fn CreateProcessA as pe_px_create(app: i64, line: i64, pattr: i64, tattr: i64, inherit: i64, flags: i64, env: i64, dir: i64, si: i64, pi: i64) -> i32;
+}
+
+/// The word at addr.
+fn pe_px_ld(addr: i64) -> i64 {
+    var p: *mut i64 = addr;
+    var v: i64 = 0;
+    // SAFETY: NOT checked here: a word of a record or block this section
+    // allocated (a handle, STARTUPINFOA, PROCESS_INFORMATION, a result
+    // cell), or a handle record process.fd got from pert_c_fid_proc_spawn.
+    unsafe { v = *p; }
+    return v;
+}
+
+fn pe_px_st(addr: i64, v: i64) {
+    var p: *mut i64 = addr;
+    // SAFETY: NOT checked here: as pe_px_ld, a word of a block this section
+    // allocated or a handle record it made.
+    unsafe { *p = v; }
+}
+
+fn pe_px_st32(addr: i64, v: i64) {
+    var i: i64 = 0;
+    while i < 4 {
+        pe_set_byte(addr, i, (v >> (i * 8)) & 255);
+        i = i + 1;
+    }
+}
+
+fn pe_px_zero(addr: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        pe_set_byte(addr, i, 0);
+        i = i + 1;
+    }
+}
+
+/// The items of list s (byte 31 between them), each a fresh NUL-terminated
+/// copy (pe_px_free_items frees them).
+fn pe_px_split(s: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    if s == 0 { return v; }
+    val n: i64 = pe_c_strlen(s);
+    if n == 0 { return v; }
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        if i == n || pe_byte_at(s, i) == 31 {
+            var item: i64 = p_malloc(i - start + 1);
+            var k: i64 = 0;
+            while k < i - start {
+                pe_set_byte(item, k, pe_byte_at(s, start + k));
+                k = k + 1;
+            }
+            pe_set_byte(item, i - start, 0);
+            v.push(item);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn pe_px_free_items(v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        p_free(v.get(i));
+        i = i + 1;
+    }
+}
+
+/// Does environment entry e ("KEY=..") have the key of item o ("KEY=.." or
+/// "KEY")? Windows keys ignore ASCII case.
+fn pe_px_same_key(e: i64, o: i64) -> bool {
+    var i: i64 = 0;
+    while pe_byte_at(o, i) != 0 && pe_byte_at(o, i) != 61 {
+        var a: i64 = pe_byte_at(e, i);
+        var b: i64 = pe_byte_at(o, i);
+        if a >= 97 && a <= 122 { a = a - 32; }
+        if b >= 97 && b <= 122 { b = b - 32; }
+        if a == 0 || a != b { return false; }
+        i = i + 1;
+    }
+    return pe_byte_at(e, i) == 61;
+}
+
+fn pe_px_has_eq(o: i64) -> bool {
+    var i: i64 = 0;
+    while pe_byte_at(o, i) != 0 {
+        if pe_byte_at(o, i) == 61 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Copy n bytes from src to dst.
+fn pe_px_copy(dst: i64, src: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        pe_set_byte(dst, i, pe_byte_at(src, i));
+        i = i + 1;
+    }
+}
+
+/// Argument a quoted for the C runtime's command-line parser
+/// (CommandLineToArgvW's rules), written at `at`; returns the end.
+fn pe_px_quote(at: i64, a: i64) -> i64 {
+    val n: i64 = pe_c_strlen(a);
+    var plain: bool = n > 0;
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = pe_byte_at(a, i);
+        if c == 32 || c == 9 || c == 10 || c == 11 || c == 34 { plain = false; }
+        i = i + 1;
+    }
+    if plain {
+        pe_px_copy(at, a, n);
+        return at + n;
+    }
+    var w: i64 = at;
+    pe_set_byte(w, 0, 34);
+    w = w + 1;
+    var q: i64 = 0;
+    var more: bool = true;
+    while more {
+        var bs: i64 = 0;
+        while q < n && pe_byte_at(a, q) == 92 {
+            bs = bs + 1;
+            q = q + 1;
+        }
+        var reps: i64 = bs;
+        if q >= n {
+            reps = bs * 2;
+            more = false;
+        } else if pe_byte_at(a, q) == 34 {
+            reps = bs * 2 + 1;
+        }
+        var r: i64 = 0;
+        while r < reps {
+            pe_set_byte(w, 0, 92);
+            w = w + 1;
+            r = r + 1;
+        }
+        if more {
+            pe_set_byte(w, 0, pe_byte_at(a, q));
+            w = w + 1;
+            q = q + 1;
+        }
+    }
+    pe_set_byte(w, 0, 34);
+    return w + 1;
+}
+
+/// Our environment block less the keys items `ov` name, then the items
+/// that set a value; double-NUL ended (0 when there are no items).
+fn pe_px_env_block(ov: & Vec<i64>) -> i64 {
+    if ov.len() == 0 { return 0; }
+    var cur: i64 = pe_px_env_strings();
+    var need: i64 = 2;
+    if cur != 0 {
+        var e: i64 = cur;
+        while pe_byte_at(e, 0) != 0 {
+            val l: i64 = pe_c_strlen(e);
+            need = need + l + 1;
+            e = e + l + 1;
+        }
+    }
+    var j: i64 = 0;
+    while j < ov.len() {
+        need = need + pe_c_strlen(ov.get(j)) + 1;
+        j = j + 1;
+    }
+    var blk: i64 = p_malloc(need);
+    var w: i64 = blk;
+    if cur != 0 {
+        var e2: i64 = cur;
+        while pe_byte_at(e2, 0) != 0 {
+            val l2: i64 = pe_c_strlen(e2);
+            var drop: bool = false;
+            if pe_byte_at(e2, 0) != 61 {
+                var k: i64 = 0;
+                while k < ov.len() && !drop {
+                    if pe_px_same_key(e2, ov.get(k)) { drop = true; }
+                    k = k + 1;
+                }
+            }
+            if !drop {
+                pe_px_copy(w, e2, l2 + 1);
+                w = w + l2 + 1;
+            }
+            e2 = e2 + l2 + 1;
+        }
+        pe_px_env_free(cur);
+    }
+    j = 0;
+    while j < ov.len() {
+        val o: i64 = ov.get(j);
+        if pe_px_has_eq(o) {
+            val lo: i64 = pe_c_strlen(o);
+            pe_px_copy(w, o, lo + 1);
+            w = w + lo + 1;
+        }
+        j = j + 1;
+    }
+    pe_set_byte(w, 0, 0);
+    w = w + 1;
+    if w == blk + 1 { pe_set_byte(w, 0, 0); }
+    return blk;
+}
+
+pub fn pert_c_fid_proc_spawn(argv_list: i64, env_list: i64, dir: i64, out: i64) -> i64 {
+    return pe_px_spawn(argv_list, env_list, dir, out, 0);
+}
+
+/// roadmap L4H (stdlib/process.fd process_spawn_io, Command::spawn): io bits
+/// 1 / 2 / 4 give the child a pipe as its stdin / stdout / stderr
+/// (pert_c_fid_proc_write / _read / _close_in), 8 sends its stderr where
+/// its stdout goes; a piped stream takes no file.
+pub fn pert_c_fid_proc_spawn_io(argv_list: i64, env_list: i64, dir: i64, out: i64, io: i64) -> i64 {
+    return pe_px_spawn(argv_list, env_list, dir, out, io & 15);
+}
+
+/// The child: a 7-word record [process handle, ended, exit code, process
+/// id, our end of its stdin pipe, of its stdout pipe, of its stderr pipe]
+/// (-1: no pipe); 0 when it could not start.
+fn pe_px_spawn(argv_list: i64, env_list: i64, dir: i64, out: i64, io: i64) -> i64 {
+    var av: Vec<i64> = pe_px_split(argv_list);
+    if av.len() == 0 { return 0; }
+    var ov: Vec<i64> = pe_px_split(env_list);
+    var len: i64 = 1;
+    var i: i64 = 0;
+    while i < av.len() {
+        len = len + pe_c_strlen(av.get(i)) * 2 + 3;
+        i = i + 1;
+    }
+    var line: i64 = p_malloc(len);
+    var at: i64 = line;
+    i = 0;
+    while i < av.len() {
+        if i > 0 {
+            pe_set_byte(at, 0, 32);
+            at = at + 1;
+        }
+        at = pe_px_quote(at, av.get(i));
+        i = i + 1;
+    }
+    pe_set_byte(at, 0, 0);
+    var envb: i64 = pe_px_env_block(& ov);
+    pe_px_free_items(av);
+    pe_px_free_items(ov);
+    // STARTUPINFOA (104 bytes: cb, then dwFlags at 60, the three standard
+    // handles at 80, 88, 96) and PROCESS_INFORMATION (24 bytes)
+    var si: i64 = p_malloc(104);
+    pe_px_zero(si, 104);
+    pe_px_st32(si, 104);
+    var pi: i64 = p_malloc(24);
+    pe_px_zero(pi, 24);
+    // out: the file for stdout, then the one for stderr ("" or none: the
+    // stdout file, or ours)
+    var fv: Vec<i64> = pe_px_split(out);
+    var of: i64 = 0;
+    var ef: i64 = 0;
+    if fv.len() > 0 && pe_byte_at(fv.get(0), 0) != 0 { of = fv.get(0); }
+    if fv.len() > 1 && pe_byte_at(fv.get(1), 0) != 0 { ef = fv.get(1); }
+    if (io & 2) != 0 { of = 0; }
+    if (io & 12) != 0 { ef = 0; }
+    var fh: i64 = -1;
+    var eh: i64 = -1;
+    if of != 0 || ef != 0 {
+        // SECURITY_ATTRIBUTES {24, NULL, bInheritHandle TRUE}: the child
+        // gets the files as its stdout and stderr
+        var sa: i64 = p_malloc(24);
+        pe_px_zero(sa, 24);
+        pe_px_st32(sa, 24);
+        pe_px_st32(sa + 16, 1);
+        // GENERIC_WRITE, share read|write|delete, CREATE_ALWAYS, NORMAL
+        if of != 0 { fh = pe_cr_create(of, 1073741824, 7, sa, 2, 128, 0); }
+        if ef != 0 { eh = pe_cr_create(ef, 1073741824, 7, sa, 2, 128, 0); }
+        p_free(sa);
+        if (of != 0 && fh == -1) || (ef != 0 && eh == -1) {
+            if fh != -1 { pe_k_close_handle(fh); }
+            if eh != -1 { pe_k_close_handle(eh); }
+            pe_px_free_items(fv);
+            p_free(line);
+            if envb != 0 { p_free(envb); }
+            p_free(si);
+            p_free(pi);
+            return 0;
+        }
+    }
+    pe_px_free_items(fv);
+    // roadmap L4H: the pipes, inheritable (SECURITY_ATTRIBUTES {24, NULL,
+    // TRUE}); our ends are made not to be, so a later child does not hold
+    // them open. pend: our ends (stdin's write end, stdout's and stderr's
+    // read ends), cend: the child's; -1 where there is no pipe.
+    var pend: i64 = p_malloc(24);
+    var cend: i64 = p_malloc(24);
+    var k: i64 = 0;
+    while k < 3 {
+        pe_px_st(pend + k * 8, -1);
+        pe_px_st(cend + k * 8, -1);
+        k = k + 1;
+    }
+    var pipes_ok: bool = true;
+    if (io & 7) != 0 {
+        var psa: i64 = p_malloc(24);
+        pe_px_zero(psa, 24);
+        pe_px_st32(psa, 24);
+        pe_px_st32(psa + 16, 1);
+        var cells: i64 = p_malloc(16);
+        k = 0;
+        while k < 3 && pipes_ok {
+            if (io & (1 << k)) != 0 {
+                pe_px_st(cells, 0);
+                pe_px_st(cells + 8, 0);
+                if (pe_tpw_pipe(cells, cells + 8, psa, 0) as i64) == 0 {
+                    pipes_ok = false;
+                } else {
+                    val rd: i64 = pe_px_ld(cells);
+                    val wr: i64 = pe_px_ld(cells + 8);
+                    if k == 0 {
+                        pe_px_st(cend, rd);
+                        pe_px_st(pend, wr);
+                    } else {
+                        pe_px_st(cend + k * 8, wr);
+                        pe_px_st(pend + k * 8, rd);
+                    }
+                    pe_tpw_set_info(pe_px_ld(pend + k * 8), 1, 0);  // HANDLE_FLAG_INHERIT off
+                }
+            }
+            k = k + 1;
+        }
+        p_free(cells);
+        p_free(psa);
+    }
+    if !pipes_ok {
+        pe_px_close_ends(pend);
+        pe_px_close_ends(cend);
+        p_free(pend);
+        p_free(cend);
+        if fh != -1 { pe_k_close_handle(fh); }
+        if eh != -1 { pe_k_close_handle(eh); }
+        p_free(line);
+        if envb != 0 { p_free(envb); }
+        p_free(si);
+        p_free(pi);
+        return 0;
+    }
+    var inherit: i64 = 0;
+    if of != 0 || ef != 0 || (io & 15) != 0 {
+        inherit = 1;
+        pe_px_st32(si + 60, 256);                       // STARTF_USESTDHANDLES
+        var sin: i64 = pe_k_std_handle(-10);            // STD_INPUT_HANDLE
+        if (io & 1) != 0 { sin = pe_px_ld(cend); }
+        var so: i64 = pe_k_std_handle(-11);             // STD_OUTPUT_HANDLE
+        if (io & 2) != 0 {
+            so = pe_px_ld(cend + 8);
+        } else if of != 0 {
+            so = fh;
+        }
+        var se: i64 = pe_k_std_handle(-12);             // STD_ERROR_HANDLE
+        if (io & 4) != 0 {
+            se = pe_px_ld(cend + 16);
+        } else if (io & 8) != 0 {
+            se = so;
+        } else if ef != 0 {
+            se = eh;
+        } else if of != 0 {
+            se = fh;
+        }
+        pe_px_st(si + 80, sin);
+        pe_px_st(si + 88, so);
+        pe_px_st(si + 96, se);
+    }
+    var d: i64 = 0;
+    if dir != 0 && pe_byte_at(dir, 0) != 0 { d = dir; }
+    pe_c_fflush(0);
+    val ok: i64 = pe_px_create(0, line, 0, 0, inherit, 0, envb, d, si, pi) as i64;
+    if fh != -1 { pe_k_close_handle(fh); }
+    if eh != -1 { pe_k_close_handle(eh); }
+    pe_px_close_ends(cend);
+    p_free(cend);
+    p_free(line);
+    if envb != 0 { p_free(envb); }
+    p_free(si);
+    if ok == 0 {
+        pe_px_close_ends(pend);
+        p_free(pend);
+        p_free(pi);
+        return 0;
+    }
+    val hp: i64 = pe_px_ld(pi);
+    pe_k_close_handle(pe_px_ld(pi + 8));
+    val pid: i64 = pe_px_ld(pi + 16) & 4294967295;
+    p_free(pi);
+    var rec: i64 = p_malloc(56);
+    pe_px_st(rec, hp);
+    pe_px_st(rec + 8, 0);
+    pe_px_st(rec + 16, -1);
+    pe_px_st(rec + 24, pid);
+    pe_px_st(rec + 32, pe_px_ld(pend));
+    pe_px_st(rec + 40, pe_px_ld(pend + 8));
+    pe_px_st(rec + 48, pe_px_ld(pend + 16));
+    p_free(pend);
+    return rec;
+}
+
+/// Close the three handles at ends (a pend / cend block; -1: none).
+fn pe_px_close_ends(ends: i64) {
+    var k: i64 = 0;
+    while k < 3 {
+        val h: i64 = pe_px_ld(ends + k * 8);
+        if h != -1 {
+            pe_k_close_handle(h);
+            pe_px_st(ends + k * 8, -1);
+        }
+        k = k + 1;
+    }
+}
+
+/// All n bytes at data to the child's stdin pipe: n, or -1 when it has
+/// none or the child closed it.
+pub fn pert_c_fid_proc_write(h: i64, data: i64, n: i64) -> i64 {
+    if h == 0 || n < 0 { return -1; }
+    val ph: i64 = pe_px_ld(h + 32);
+    if ph == -1 { return -1; }
+    var cell: i64 = p_malloc(8);
+    var done: i64 = 0;
+    var failed: bool = false;
+    while done < n && !failed {
+        var k: i64 = n - done;
+        if k > 1073741824 { k = 1073741824; }
+        pe_px_st(cell, 0);
+        val okw: i64 = pe_cr_write_file(ph, data + done, k, cell, 0) as i64;
+        val w: i64 = pe_px_ld(cell) & 4294967295;
+        if okw == 0 || w == 0 {
+            failed = true;
+        } else {
+            done = done + w;
+        }
+    }
+    p_free(cell);
+    if failed { return -1; }
+    return done;
+}
+
+/// Up to max bytes the child wrote to its stdout (which 1) or stderr (2)
+/// pipe, into buf, waiting for at least one: 0 once the pipe is closed and
+/// empty (the child ended), -1 when there is no such pipe.
+pub fn pert_c_fid_proc_read(h: i64, which: i64, buf: i64, max: i64) -> i64 {
+    if h == 0 || buf == 0 || max <= 0 { return -1; }
+    var ph: i64 = pe_px_ld(h + 40);
+    if which == 2 { ph = pe_px_ld(h + 48); }
+    if ph == -1 { return -1; }
+    var n: i64 = max;
+    if n > 1073741824 { n = 1073741824; }
+    var cell: i64 = p_malloc(8);
+    var result: i64 = 0;
+    var going: bool = true;
+    while going {
+        pe_px_st(cell, 0);
+        val okr: i64 = pe_k_read_file(ph, buf, n, cell, 0) as i64;
+        val got: i64 = pe_px_ld(cell) & 4294967295;
+        if okr == 0 {
+            val er: i64 = (pe_px_last_error() as i64) & 4294967295;
+            result = -1;
+            if er == 109 || er == 38 { result = 0; }   // BROKEN_PIPE, HANDLE_EOF
+            going = false;
+        } else if got > 0 {
+            result = got;
+            going = false;
+        }
+    }
+    p_free(cell);
+    return result;
+}
+
+/// Close our end of the child's stdin pipe: it reads the end of its input.
+pub fn pert_c_fid_proc_close_in(h: i64) -> i64 {
+    if h == 0 { return -1; }
+    val ph: i64 = pe_px_ld(h + 32);
+    if ph != -1 {
+        pe_k_close_handle(ph);
+        pe_px_st(h + 32, -1);
+    }
+    return 0;
+}
+
+/// 1 once the child has ended (its code kept), 0 while it is still running
+/// after timeout_ms (< 0: no limit), -1 for a bad handle.
+pub fn pert_c_fid_proc_wait(h: i64, timeout_ms: i64) -> i64 {
+    if h == 0 { return -1; }
+    if pe_px_ld(h + 8) != 0 { return 1; }
+    var ms: i64 = timeout_ms;
+    if ms < 0 {
+        ms = 4294967295;                                // INFINITE
+    } else if ms > 2147483646 {
+        ms = 2147483646;
+    }
+    val r: i64 = (pe_k_wait(pe_px_ld(h), ms) as i64) & 4294967295;
+    if r == 258 { return 0; }                           // WAIT_TIMEOUT
+    if r != 0 { return -1; }
+    var cell: i64 = p_malloc(8);
+    pe_px_st(cell, 0);
+    val got: i64 = pe_px_exit_code(pe_px_ld(h), cell) as i64;
+    var code: i64 = pe_px_ld(cell) & 4294967295;
+    p_free(cell);
+    if got == 0 { return -1; }
+    if code >= 2147483648 { code = code - 4294967296; }
+    pe_px_st(h + 16, code);
+    pe_px_st(h + 8, 1);
+    return 1;
+}
+
+/// Its exit code once pert_c_fid_proc_wait said it ended, else -1.
+pub fn pert_c_fid_proc_code(h: i64) -> i64 {
+    if h == 0 { return -1; }
+    if pe_px_ld(h + 8) == 0 { return -1; }
+    return pe_px_ld(h + 16);
+}
+
+/// TerminateProcess with code 137 (128 + SIGKILL, as POSIX reports a
+/// killed child): 1 when asked, 0 when it had ended or could not be.
+pub fn pert_c_fid_proc_kill(h: i64) -> i64 {
+    if h == 0 { return 0; }
+    if pe_px_ld(h + 8) != 0 { return 0; }
+    if (pe_px_terminate(pe_px_ld(h), 137) as i64) != 0 { return 1; }
+    return 0;
+}
+
+pub fn pert_c_fid_proc_pid(h: i64) -> i64 {
+    if h == 0 { return -1; }
+    return pe_px_ld(h + 24);
+}
+
+/// Forget the handle (a child still running keeps running).
+pub fn pert_c_fid_proc_free(h: i64) -> i64 {
+    if h == 0 { return -1; }
+    pe_k_close_handle(pe_px_ld(h));
+    pe_px_close_ends(h + 32);
+    p_free(h);
+    return 0;
+}
+
+// ─── RL16: --leaks on pe_ir ─────────────────────────────────────────────
+// `fid emit --leaks` for Windows (pe_ir, the default backend): the C
+// runtime's leak report (codegen_c.fd P_LEAKS, __p_mc_report) and the
+// machine layer's (linux_runtime/base.fd pe_dbg_malloc, pe_leak_report),
+// in the same words. The backend (compiler/pe_ir_stubs.fd g_pe_leaks)
+// builds its block allocator as the primitives pe_lk_raw_malloc /
+// pe_lk_raw_free and makes p_malloc / p_free thunks that align the stack
+// and call pert_leak_malloc / pert_leak_free (env first, as for any Fides
+// function), so every allocation of the executable comes here: the
+// program's, core's, the machine stubs' and this runtime's. A block the
+// program asks for (p_malloc's caller is not runtime code: pe_, pert_,
+// nat_, as the machine layer decides) has PE_LK_PREFIX bytes before its
+// payload p:
+//   p-48 / p-40 the previous / next tracked block   p-32 the size asked
+//   p-24 / p-16 the first two program functions on the stack then (names
+//   from nat_fn_names; 0 for none)   p-8 PE_LK_LIVE, PE_LK_DEAD once freed
+// The word at p-8 is negative as an allocator header is (core's
+// p_str_len_word must not take it for a length) and differs from every
+// allocator header, so pert_leak_free tells a tracked block from any other
+// (an untracked block goes straight back to the allocator). The list is
+// under a spinlock. The stack walk checks each frame record is readable
+// (VirtualQuery, the region cached: one query per stack, not per block)
+// and stops at main or once a return address is outside the program's
+// code. At exit (main's return: the backend calls pert_leak_exit; or
+// pert_exit) pe_lk_report prints the blocks still on the list, grouped by
+// where they were allocated, most bytes first; "fid --leaks: every block
+// was freed" when there are none.
+
+extern "C" {
+    // Machine-code primitives (compiler/pe_ir_stubs.fd, with --leaks): the
+    // block allocator that p_malloc / p_free are without --leaks
+    fn pe_lk_raw_malloc(size: i64) -> i64;
+    fn pe_lk_raw_free(p: i64);
+    // MI20 primitives: a frame record's return address and saved rbp
+    fn nat_frame_ret(fp: i64) -> i64;
+    fn nat_frame_next(fp: i64) -> i64;
+}
+
+const PE_LK_PREFIX: i64 = 48;
+const PE_LK_LIVE: i64 = 0xF1DE5D00000000A5;
+const PE_LK_DEAD: i64 = 0xF1DE5E00000000A5;
+
+var pe_lk_page: i64 = 0;   // [0] lock [8, 16) cached readable region [64, 112) MBI [128] count cell [160, 192) digits
+var pe_lk_on: i64 = 0;     // 1 once an allocation came through here
+var pe_lk_done: i64 = 0;   // 1 once the report was printed
+var pe_lk_head: i64 = 0;   // the newest tracked block (payload address)
+var pe_lk_count: i64 = 0;
+var pe_lk_nfn: i64 = 0;    // entries of nat_fn_names' table (0: not counted yet)
+// the last stack walk's results (under the lock)
+var pe_lk_w_prog: i64 = 0;
+var pe_lk_w_s1: i64 = 0;
+var pe_lk_w_s2: i64 = 0;
+
+/// The lock and scratch page, made by the first allocation (the main
+/// thread, before any other thread runs).
+fn pe_lk_setup() {
+    if pe_lk_page == 0 {
+        var pg: i64 = pe_k_valloc(0, 4096, 0x3000, 4);   // MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+        if pg == 0 { return; }
+        pe_lk_page = pg;
+    }
+}
+
+fn pe_lk_lock() {
+    while pe_atomic_cas(pe_lk_page, 0, 1) == false {
+        pe_k_sleep(0);
+    }
+}
+
+fn pe_lk_unlock() {
+    pe_atomic_store(pe_lk_page, 0);
+}
+
+/// The frame record at fp (16 bytes) can be read; the region VirtualQuery
+/// found is kept, so a walk on the same stack asks once (under the lock).
+fn pe_lk_readable(fp: i64) -> bool {
+    var pg: i64 = pe_lk_page;
+    if fp >= pe_cr_ld(pg + 8) && fp + 16 <= pe_cr_ld(pg + 16) {
+        return true;
+    }
+    if !pe_cr_readable(pg + 64, fp) {
+        return false;
+    }
+    var base: i64 = pe_cr_ld(pg + 64);
+    pe_store(pg + 8, base);
+    pe_store(pg + 16, base + pe_cr_ld(pg + 88));
+    return true;
+}
+
+/// Entries of nat_fn_names' table ([address, name] ..., then [end, 0]).
+fn pe_lk_fn_count(tab: i64) -> i64 {
+    if pe_lk_nfn == 0 {
+        var c: i64 = 0;
+        while pe_cr_ld(tab + c * 16 + 8) != 0 {
+            c = c + 1;
+        }
+        pe_lk_nfn = c;
+    }
+    return pe_lk_nfn;
+}
+
+/// pc is in the program's code (between the first function and the end).
+fn pe_lk_in_code(pc: i64) -> bool {
+    var tab: i64 = nat_fn_names();
+    if tab == 0 { return false; }
+    var m: i64 = pe_lk_fn_count(tab);
+    if m == 0 { return false; }
+    return pc >= pe_cr_ld(tab) && pc < pe_cr_ld(tab + m * 16);
+}
+
+/// The name of the function pc is in (0 when outside the code).
+fn pe_lk_name_at(pc: i64) -> i64 {
+    if !pe_lk_in_code(pc) { return 0; }
+    var tab: i64 = nat_fn_names();
+    var lo: i64 = 0;
+    var hi: i64 = pe_lk_nfn - 1;
+    while lo < hi {
+        var mid: i64 = (lo + hi + 1) / 2;
+        if pe_cr_ld(tab + mid * 16) <= pc {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return pe_cr_ld(tab + lo * 16 + 8);
+}
+
+/// The NUL-ended name n is the text lit.
+fn pe_lk_name_is(n: i64, lit: i64) -> bool {
+    var i: i64 = 0;
+    while true {
+        var a: i64 = pe_byte_at(n, i);
+        if a != pe_byte_at(lit, i) { return false; }
+        if a == 0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Runtime code (pe_, pert_, nat_), whose blocks are not the program's.
+fn pe_lk_rt_name(n: i64) -> bool {
+    var a: i64 = pe_byte_at(n, 0);
+    var b: i64 = pe_byte_at(n, 1);
+    if a == 112 && b == 101 {
+        var c: i64 = pe_byte_at(n, 2);
+        if c == 95 { return true; }
+        if c == 114 && pe_byte_at(n, 3) == 116 && pe_byte_at(n, 4) == 95 { return true; }
+    }
+    return a == 110 && b == 97 && pe_byte_at(n, 2) == 116 && pe_byte_at(n, 3) == 95;
+}
+
+/// The allocator's own entry points (the backend's p_malloc / p_free
+/// thunks): not the caller.
+fn pe_lk_is_entry(n: i64) -> bool {
+    return pe_lk_name_is(n, "p_malloc" as i64) || pe_lk_name_is(n, "p_free" as i64);
+}
+
+/// Walk the stack from frame fp0 (pert_leak_malloc's): whether the first
+/// function past the allocator is the program's (pe_lk_w_prog) and the
+/// first two program functions (pe_lk_w_s1, pe_lk_w_s2). Under the lock.
+fn pe_lk_walk(fp0: i64) {
+    pe_lk_w_prog = 0;
+    pe_lk_w_s1 = 0;
+    pe_lk_w_s2 = 0;
+    var fp: i64 = fp0;
+    var first: bool = true;
+    var seen: i64 = 0;
+    var steps: i64 = 0;
+    while fp != 0 && (fp & 7) == 0 && steps < 64 && pe_lk_readable(fp) {
+        var ret: i64 = nat_frame_ret(fp);
+        fp = nat_frame_next(fp);
+        steps = steps + 1;
+        // past the program's code: system code (a thread's start), stop
+        if !pe_lk_in_code(ret - 1) { return; }
+        var name: i64 = pe_lk_name_at(ret - 1);
+        if name != 0 && !pe_lk_is_entry(name) {
+            var rt: bool = pe_lk_rt_name(name);
+            if first {
+                first = false;
+                if !rt { pe_lk_w_prog = 1; }
+            }
+            if !rt {
+                if seen == 0 {
+                    pe_lk_w_s1 = name;
+                } else {
+                    pe_lk_w_s2 = name;
+                }
+                seen = seen + 1;
+                if seen >= 2 { return; }
+            }
+            // main's caller is the entry code: nothing above it
+            if pe_lk_name_is(name, "main" as i64) { return; }
+        }
+    }
+}
+
+/// p_malloc under --leaks (the backend's thunk calls it).
+pub fn pert_leak_malloc(size: i64) -> i64 {
+    pe_lk_setup();
+    var n: i64 = size;
+    if n < 0 { n = 0; }
+    if pe_lk_page == 0 { return pe_lk_raw_malloc(n); }
+    pe_lk_on = 1;
+    pe_lk_lock();
+    pe_lk_walk(nat_frame_fp());
+    var prog: i64 = pe_lk_w_prog;
+    var s1: i64 = pe_lk_w_s1;
+    var s2: i64 = pe_lk_w_s2;
+    pe_lk_unlock();
+    if prog == 0 {
+        return pe_lk_raw_malloc(n);
+    }
+    var raw: i64 = pe_lk_raw_malloc(n + PE_LK_PREFIX);
+    if raw == 0 { return 0; }
+    var p: i64 = raw + PE_LK_PREFIX;
+    pe_store(p - 48, 0);
+    pe_store(p - 32, n);
+    pe_store(p - 24, s1);
+    pe_store(p - 16, s2);
+    pe_store(p - 8, PE_LK_LIVE);
+    pe_lk_lock();
+    pe_store(p - 40, pe_lk_head);
+    if pe_lk_head != 0 { pe_store(pe_lk_head - 48, p); }
+    pe_lk_head = p;
+    pe_lk_count = pe_lk_count + 1;
+    pe_lk_unlock();
+    return p;
+}
+
+/// p_free under --leaks: a tracked block leaves the list and goes back
+/// whole; any other block straight to the allocator (which panics on a
+/// pointer that is no block, or one freed twice).
+pub fn pert_leak_free(p: i64) {
+    if p == 0 || pe_lk_page == 0 {
+        pe_lk_raw_free(p);
+        return;
+    }
+    var tag: i64 = pe_cr_ld(p - 8);
+    if tag == PE_LK_LIVE {
+        pe_lk_lock();
+        var prev: i64 = pe_cr_ld(p - 48);
+        var next: i64 = pe_cr_ld(p - 40);
+        if prev != 0 { pe_store(prev - 40, next); } else { pe_lk_head = next; }
+        if next != 0 { pe_store(next - 48, prev); }
+        pe_lk_count = pe_lk_count - 1;
+        pe_store(p - 8, PE_LK_DEAD);
+        pe_lk_unlock();
+        pe_lk_raw_free(p - PE_LK_PREFIX);
+        return;
+    }
+    // a tracked block freed a second time: its tag is not an allocator
+    // header, so the allocator stops the program (Invalid free)
+    pe_lk_raw_free(p);
+}
+
+fn pe_lk_say(s: i64) {
+    pe_cr_puts(pe_k_std_handle(0 - 12), pe_lk_page + 128, s);
+}
+
+fn pe_lk_int(v: i64) {
+    pe_cr_put_int(pe_k_std_handle(0 - 12), pe_lk_page + 128, pe_lk_page + 160, v);
+}
+
+/// v right-aligned in `width` columns (v >= 0)
+fn pe_lk_pad(v: i64, width: i64) {
+    var digits: i64 = 1;
+    var t: i64 = v;
+    while t >= 10 {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    var k: i64 = digits;
+    while k < width {
+        pe_lk_say(" " as i64);
+        k = k + 1;
+    }
+    pe_lk_int(v);
+}
+
+/// The report (once): the blocks never freed, by where they were
+/// allocated, the most bytes first, at most 20 places (linux_runtime
+/// pe_leak_report, the C runtime's __p_mc_report).
+fn pe_lk_report() {
+    if pe_lk_done != 0 { return; }
+    pe_lk_done = 1;
+    pe_lk_setup();
+    if pe_lk_page == 0 { return; }
+    pe_lk_lock();
+    if pe_lk_head == 0 {
+        pe_lk_unlock();
+        pe_lk_say("fid --leaks: every block was freed\n" as i64);
+        return;
+    }
+    // [site 1, site 2, bytes, blocks] per place, in pages of their own
+    var cap: i64 = 256;
+    var tab: i64 = pe_k_valloc(0, cap * 32, 0x3000, 4);
+    if tab == 0 {
+        pe_lk_unlock();
+        return;
+    }
+    var places: i64 = 0;
+    var blocks: i64 = 0;
+    var bytes: i64 = 0;
+    var p: i64 = pe_lk_head;
+    while p != 0 {
+        var sz: i64 = pe_cr_ld(p - 32);
+        var s1: i64 = pe_cr_ld(p - 24);
+        var s2: i64 = pe_cr_ld(p - 16);
+        blocks = blocks + 1;
+        bytes = bytes + sz;
+        var j: i64 = 0;
+        while j < places && (pe_cr_ld(tab + j * 32) != s1 || pe_cr_ld(tab + j * 32 + 8) != s2) {
+            j = j + 1;
+        }
+        if j == places && places < cap {
+            pe_store(tab + j * 32, s1);
+            pe_store(tab + j * 32 + 8, s2);
+            places = places + 1;
+        }
+        if j < places {
+            pe_store(tab + j * 32 + 16, pe_cr_ld(tab + j * 32 + 16) + sz);
+            pe_store(tab + j * 32 + 24, pe_cr_ld(tab + j * 32 + 24) + 1);
+        }
+        p = pe_cr_ld(p - 40);
+    }
+    pe_lk_unlock();
+    pe_lk_say("fid --leaks: " as i64);
+    pe_lk_int(blocks);
+    pe_lk_say(" block(s), " as i64);
+    pe_lk_int(bytes);
+    pe_lk_say(" bytes, never freed; by where they were allocated:\n" as i64);
+    var shown: i64 = 0;
+    while shown < 20 && shown < places {
+        var best: i64 = 0 - 1;
+        var j2: i64 = 0;
+        while j2 < places {
+            if pe_cr_ld(tab + j2 * 32 + 24) > 0 && (best < 0 || pe_cr_ld(tab + j2 * 32 + 16) > pe_cr_ld(tab + best * 32 + 16)) {
+                best = j2;
+            }
+            j2 = j2 + 1;
+        }
+        if best < 0 {
+            shown = places;
+        } else {
+            pe_lk_say("  " as i64);
+            pe_lk_pad(pe_cr_ld(tab + best * 32 + 16), 8);
+            pe_lk_say(" bytes in " as i64);
+            pe_lk_pad(pe_cr_ld(tab + best * 32 + 24), 6);
+            pe_lk_say(" block(s): " as i64);
+            var n1: i64 = pe_cr_ld(tab + best * 32);
+            var n2: i64 = pe_cr_ld(tab + best * 32 + 8);
+            if n1 == 0 {
+                pe_lk_say("(no Fides frame)" as i64);
+            } else {
+                pe_lk_say(n1);
+                if n2 != 0 {
+                    pe_lk_say(" <- " as i64);
+                    pe_lk_say(n2);
+                }
+            }
+            pe_lk_say("\n" as i64);
+            pe_store(tab + best * 32 + 24, 0 - pe_cr_ld(tab + best * 32 + 24));
+            shown = shown + 1;
+        }
+    }
+    if places > 20 {
+        pe_lk_say("  ... and " as i64);
+        pe_lk_int(places - 20);
+        pe_lk_say(" more place(s)\n" as i64);
+    }
+    pe_k_vfree(tab, 0, 0x8000);                      // MEM_RELEASE
+}
+
+/// After main returns (the backend calls it under --leaks, main's result
+/// in): the report; main's result back.
+pub fn pert_leak_exit(code: i64) -> i64 {
+    pe_lk_report();
+    return code;
+}
+
+/// pert_exit's part: the report, when this program was built with --leaks
+/// (an allocation came through pert_leak_malloc).
+fn pe_lk_at_exit() {
+    if pe_lk_on != 0 {
+        pe_lk_report();
+    }
+}

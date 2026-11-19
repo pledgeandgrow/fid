@@ -1,0 +1,175 @@
+// stdlib/wav: real ffmpeg WAV files (u8, s16, s24/s32 extensible, float32, 5.1) decoded, re-encoded byte-exact, conversions, f32 bits
+// Expected output:
+// st_u8: fmt 1 ch 2 rate 8000 bits 8 mask 0 frames 4
+//   0.000000000 0.148437500 0.171875000 0.140625000 0.320312500 0.125000000 0.429687500 0.093750000
+//   re-encoded: same bytes (52)
+// st_s16le: fmt 1 ch 2 rate 8000 bits 16 mask 0 frames 4
+//   0.000000000 0.149993896 0.169372559 0.143096924 0.318725586 0.122741699 0.430358887 0.090087891
+//   re-encoded: same bytes (60)
+// st_s24le: fmt 1 ext ch 2 rate 8000 bits 24 mask 3 frames 4
+//   0.000000000 0.149999976 0.169368863 0.143092394 0.318711877 0.122751594 0.430370927 0.090101480
+//   re-encoded: same bytes (92)
+// st_s32le: fmt 1 ext ch 2 rate 8000 bits 32 mask 3 frames 4
+//   0.000000000 0.150000000 0.169368960 0.143092480 0.318711995 0.122751631 0.430371013 0.090101491
+//   re-encoded: same bytes (100)
+// st_f32le: fmt 3 ch 2 rate 8000 bits 32 mask 0 frames 4
+//   0.000000000 0.150000006 0.169368967 0.143092483 0.318711996 0.122751631 0.430371016 0.090101488
+//   re-encoded: same bytes (90)
+// six: fmt 1 ext ch 6 rate 8000 bits 16 mask 63 frames 2
+//   0.100006104 0.200012207 0.299987793 -0.399993896 0.500000000 -0.600006104 0.100006104 0.200012207 0.299987793 -0.399993896 0.500000000 -0.600006104
+//   re-encoded: same bytes (92)
+// f32 0.15 3e19999a 1 3f800000 -2.5 c0200000 -0 80000000 1/3 3eaaaaab
+// f32 0.1+2^-30 3dcccccd 1e-45 00000001 max 7f7fffff 1e39 7f800000
+// f32 2^-127 00400000 largest subnormal 007fffff
+// from bits 3e19999a 0.150000006 c0200000 -2.500 smallest subnormal * 2^149 1.000
+// frames 3 duration us 68
+// mono 0.1250 0.0000 -0.3500
+// stereo again 2 ch, frame 2 -0.3500 -0.3500
+// right channel -0.25 -1.00 -0.70
+// as 8-bit 0.500000 -0.250000 0.992188 -1.000000 0.000000 -0.703125
+// as 24-bit 0.000100017 ext yes
+// quantize 16: 16384 -32768 32767 -1 8: 0 255
+// float32 0.000099999997 -0.699999988
+// error: not a RIFF/WAVE file
+// error: unsupported format code 85
+// error: no fmt chunk
+use wav;
+use encoding;
+
+// x rounded to d decimals ("-" only when the rounded value is not zero)
+fn fx(x: f64, d: i64) -> str {
+    var scale: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        scale = scale * 10;
+        i = i + 1;
+    }
+    var neg: bool = x < 0.0;
+    var a: f64 = x;
+    if neg { a = 0.0 - x; }
+    val n: i64 = (a * (scale as f64) + 0.5) as i64;
+    if n == 0 { neg = false; }
+    var s: str = int_to_str(n / scale);
+    if d > 0 {
+        var fr: str = int_to_str(n % scale);
+        while str_len(fr) < d { fr = "0" + fr; }
+        s = s + "." + fr;
+    }
+    if neg { return "-" + s; }
+    return s;
+}
+
+fn le32(b: &Vec<i64>, o: i64) -> i64 {
+    return b.get(o) + b.get(o + 1) * 256 + b.get(o + 2) * 65536 + b.get(o + 3) * 16777216;
+}
+
+// The file without its LIST chunk (ffmpeg writes one with the encoder
+// name; wav_encode writes none), RIFF size fixed up.
+fn strip_list(b: &Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 12 {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    var p: i64 = 12;
+    while p + 8 <= b.len() {
+        val size: i64 = le32(b, p + 4);
+        val pad: i64 = size + (size & 1);
+        val is_list: bool = b.get(p) == 76 && b.get(p + 1) == 73 && b.get(p + 2) == 83 && b.get(p + 3) == 84;
+        if !is_list {
+            var k: i64 = 0;
+            while k < 8 + pad && p + k < b.len() {
+                out.push(b.get(p + k));
+                k = k + 1;
+            }
+        }
+        p = p + 8 + pad;
+    }
+    val riff: i64 = out.len() - 8;
+    out.set(4, riff & 255);
+    out.set(5, (riff >> 8) & 255);
+    out.set(6, (riff >> 16) & 255);
+    out.set(7, (riff >> 24) & 255);
+    return out;
+}
+
+fn check(name: str, hex: str, format: i64, bits: i64) {
+    val bytes: Vec<i64> = hex_decode_bytes(hex);
+    val w: Wav = wav_decode(&bytes);
+    if !w.ok {
+        println(name + ": ERROR " + w.error);
+        return;
+    }
+    var line: str = name + ": fmt " + int_to_str(w.format) + if w.extensible { " ext" } else { "" } + " ch " + int_to_str(w.channels) + " rate " + int_to_str(w.sample_rate) + " bits " + int_to_str(w.bits) + " mask " + int_to_str(w.channel_mask) + " frames " + int_to_str(wav_frames(&w));
+    println(line);
+    var s: str = " ";
+    var i: i64 = 0;
+    while i < w.samples.len() {
+        s = s + " " + fx(w.samples.get(i), 9);
+        i = i + 1;
+    }
+    println(s);
+    val again: Vec<i64> = wav_encode(&w, format, bits);
+    val want: Vec<i64> = strip_list(&bytes);
+    if hex_encode_bytes(again) == hex_encode_bytes(want) {
+        println("  re-encoded: same bytes (" + int_to_str(again.len()) + ")");
+    } else {
+        println("  re-encoded: DIFFERENT " + hex_encode_bytes(again));
+        println("               want    " + hex_encode_bytes(want));
+    }
+}
+
+fn hex32(v: i64) -> str {
+    var s: str = "";
+    var k: i64 = 7;
+    while k >= 0 {
+        val d: i64 = (v >> (4 * k)) & 15;
+        s = s + char_to_str(str_byte_at("0123456789abcdef", d));
+        k = k - 1;
+    }
+    return s;
+}
+
+fn main() {
+    check("st_u8", "524946464e00000057415645666d74201000000001000200401f0000803e0000020008004c4953541a000000494e464f495346540e0000004c61766636322e31322e31303200646174610800000080939692a990b78c", WAV_PCM, 8);
+    check("st_s16le", "524946465600000057415645666d74201000000001000200401f0000007d0000040010004c4953541a000000494e464f495346540e0000004c61766636322e31322e31303200646174611000000000003313ae155112cc28b60f1637880b", WAV_PCM, 16);
+    check("st_s24le", "524946467600000057415645666d742028000000feff0200401f000080bb00000600180016001800030000000100000000001000800000aa00389b714c4953541a000000494e464f495346540e0000004c61766636322e31322e313032006461746118000000000000333313e1ad15da50128dcb2853b60f65163772880b", WAV_PCM, 24);
+    check("st_s32le", "524946467e00000057415645666d742028000000feff0200401f000000fa00000800200016002000030000000100000000001000800000aa00389b714c4953541a000000494e464f495346540e0000004c61766636322e31322e3130320064617461200000000000000033333313d0e1ad15b9da5012fd8dcb285053b60fba6516371772880b", WAV_PCM, 32);
+    check("st_f32le", "524946467400000057415645666d74201200000003000200401f000000fa00000800200000006661637404000000040000004c4953541a000000494e464f495346540e0000004c61766636322e31322e313032006461746120000000000000009a99193e0f6f2d3ed686123e382ea33e3565fb3d9759dc3e2187b83d", WAV_FLOAT, 32);
+    check("six", "524946467600000057415645666d742028000000feff0600401f0000007701000c001000160010003f0000000100000000001000800000aa00389b714c4953541a000000494e464f495346540e0000004c61766636322e31322e313032006461746118000000cd0c9a196626cdcc004033b3cd0c9a196626cdcc004033b3", WAV_PCM, 16);
+
+    // float32 bit patterns (round to nearest even, subnormals, overflow)
+    println("f32 0.15 " + hex32(wav_f32_bits(0.15)) + " 1 " + hex32(wav_f32_bits(1.0)) + " -2.5 " + hex32(wav_f32_bits(-2.5)) + " -0 " + hex32(wav_f32_bits(-0.0)) + " 1/3 " + hex32(wav_f32_bits(0.333333333)));
+    println("f32 0.1+2^-30 " + hex32(wav_f32_bits(0.10000000093132258)) + " 1e-45 " + hex32(wav_f32_bits(0.000000000000000000000000000000000000000000001)) + " max " + hex32(wav_f32_bits(340282346638528860000000000000000000000.0)) + " 1e39 " + hex32(wav_f32_bits(1000000000000000000000000000000000000000.0)));
+    println("f32 2^-127 " + hex32(wav_f32_bits(0.000000000000000000000000000000000000005877471754111438)) + " largest subnormal " + hex32(wav_f32_bits(0.000000000000000000000000000000000000011754942106924411)));
+    println("from bits 3e19999a " + fx(wav_f32_from_bits(1041865114), 9) + " c0200000 " + fx(wav_f32_from_bits(3223322624), 3) + " smallest subnormal * 2^149 " + fx(wav_f32_from_bits(1) * p_f64_from_bits((1023 + 149) << 52), 3));
+
+    // conversions
+    var w: Wav = wav_new(2, 44100);
+    w.samples.push(0.5);
+    w.samples.push(-0.25);
+    w.samples.push(1.0);
+    w.samples.push(-1.0);
+    w.samples.push(0.0001);
+    w.samples.push(-0.7);
+    println("frames " + int_to_str(wav_frames(&w)) + " duration us " + int_to_str((wav_duration(&w) * 1000000.0) as i64));
+    val mono: Wav = wav_to_mono(&w);
+    println("mono " + fx(mono.samples.get(0), 4) + " " + fx(mono.samples.get(1), 4) + " " + fx(mono.samples.get(2), 4));
+    val st: Wav = wav_to_stereo(&mono);
+    println("stereo again " + int_to_str(st.channels) + " ch, frame 2 " + fx(wav_sample(&st, 2, 0), 4) + " " + fx(wav_sample(&st, 2, 1), 4));
+    val right: Wav = wav_channel(&w, 1);
+    println("right channel " + fx(right.samples.get(0), 2) + " " + fx(right.samples.get(1), 2) + " " + fx(right.samples.get(2), 2));
+    val r8: Wav = wav_requantize(&w, WAV_PCM, 8);
+    println("as 8-bit " + fx(r8.samples.get(0), 6) + " " + fx(r8.samples.get(1), 6) + " " + fx(r8.samples.get(2), 6) + " " + fx(r8.samples.get(3), 6) + " " + fx(r8.samples.get(4), 6) + " " + fx(r8.samples.get(5), 6));
+    val r24: Wav = wav_requantize(&w, WAV_PCM, 24);
+    println("as 24-bit " + fx(r24.samples.get(4), 9) + " ext " + if r24.extensible { "yes" } else { "no" });
+    println("quantize 16: " + int_to_str(wav_quantize(0.5, 16)) + " " + int_to_str(wav_quantize(-1.0, 16)) + " " + int_to_str(wav_quantize(1.0, 16)) + " " + int_to_str(wav_quantize(-0.00002, 16)) + " 8: " + int_to_str(wav_quantize(-1.0, 8)) + " " + int_to_str(wav_quantize(0.999, 8)));
+    val fl: Wav = wav_requantize(&w, WAV_FLOAT, 32);
+    println("float32 " + fx(fl.samples.get(4), 12) + " " + fx(fl.samples.get(5), 9));
+
+    // malformed input
+    println("error: " + wav_decode(&hex_decode_bytes("52494646")).error);
+    println("error: " + wav_decode(&hex_decode_bytes("524946461c00000057415645666d74201000000055000200401f0000007d000004001000")).error);
+    println("error: " + wav_decode(&hex_decode_bytes("524946460c0000005741564564617461000000000000")).error);
+}

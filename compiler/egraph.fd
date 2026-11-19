@@ -1,9 +1,14 @@
 // compiler/egraph.fd — an e-graph mid-end (own-backend roadmap ME6–ME11)
 // and store-to-load forwarding for locals (a first step of ME3).
 //
-// Per function, every pure integer or boolean value (constants, binary and
-// unary operations, integer casts) becomes an e-node; anything else is a
-// leaf of its own. Equality saturation applies rewrite rules until nothing
+// Per function, every pure integer or boolean value (constants, binary
+// operations, and since Nov 15 unary ones: -x, ~x, !b, with operations on
+// parameters) becomes an e-node; since Nov 16 (ME7) casts between integer,
+// bool and float types and float constants, arithmetic, comparisons and
+// negation too (eg_cast_class, eg_float_rules), a bit cast to its own type
+// being its operand. Anything else is a leaf of its own: memory, calls, the
+// side-effecting instructions, which stay where the IR has them (the
+// skeleton). Equality saturation applies rewrite rules until nothing
 // changes or a limit is reached: commuted operations and flipped
 // comparisons, the identities of rules.fd, constant folding, x * 2 = x + x,
 // and in @wrapping code (where overflow does not panic) reassociation of
@@ -18,22 +23,48 @@
 // stored to becomes the stored value when that store is the local's only
 // one and dominates the load, or the last store before it in its block.
 //
-// Switches: FID_NAT_OFF=egraph, FID_NAT_OFF=forward.
+// ME7, opt-in (FID_IROPT_ON=egskel): a separate side-effect skeleton
+// (eg_skeleton, Cranelift's aegraph). The pure values that cannot panic
+// leave their blocks; the rest keeps the IR's order, and every operand that
+// was a pure value is elaborated from its class where it is read: an equal
+// value available there, else the cheapest form made in the block with the
+// fewest loops between its operands and the use. New instructions may be
+// added; pure values nothing reads go.
+//
+// ME8, on by default since Nov 17 (FID_NAT_OFF=egplace or
+// FID_IROPT_OFF=egplace turns it off): placement (eg_place, Click's global
+// code motion) after the rewrites: a pure value that cannot panic moves to
+// the block of fewest loops between its operands and its uses, the latest
+// among equals: loop-invariant values leave their loops, values one branch
+// needs move into it.
+//
+// ME7: `fid test-rules --smt <dir>` also writes SMT-LIB proof obligations
+// of the rewrites here (egraph_smt, at the end of this file), from the same
+// rule tables eg_round reads (docs/perf/mid-end/me7-skeleton-smt.txt).
+//
+// Switches: FID_NAT_OFF=egraph, FID_NAT_OFF=forward; FID_EGRAPH_OFF=<rule
+// family>,... turns single rule families off (RL3, eg_rules_off_mask);
+// FID_NAT_MUTATE=eg<family> breaks one on purpose (RL11, eg_mutate_mask).
 
-module compiler::egraph;
- use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::iropt;
- const EG_MAX_NODES: i64 = 20000; const EG_MAX_ROUNDS: i64 = 8;
-// Node kinds
+module compiler::egraph; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks; use compiler::iropt; use compiler::inc; use compiler::ir_ser; use compiler::ssa; const EG_MAX_NODES: i64 = 20000; const EG_MAX_ROUNDS: i64 = 8;  // Node kinds
 const EK_LEAF: i64 = 0;  // an opaque value: `a` is its id
 const EK_CONST: i64 = 1;  // `a` is the integer (booleans 0 / 1)
 const EK_BIN: i64 = 2;  // `op` a binary code, children a, b
 const EK_NEG: i64 = 3;  // child a
 const EK_NOT: i64 = 4;  // boolean not, child a
 const EK_BNOT: i64 = 5;  // bitwise not, child a
+// ME7 (Nov 16): integer casts and float values are nodes too
+const EK_CAST: i64 = 6;  // `op` a cast code (EC_*), child a, `b` the source type's code (eg_ty_code), ty the target
+const EK_FCONST: i64 = 7;  // a float constant: `a` its f64 bit pattern (p_f64_to_bits)
+const EK_FBIN: i64 = 8;  // a float operation: `op` a binary code, children a, b, ty the operands' type
+const EK_FNEG: i64 = 9;  // float negation, child a
+// Cast codes
+const EC_EXT: i64 = 1; const EC_TRUNC: i64 = 2; const EC_BITCAST: i64 = 3; const EC_I2F: i64 = 4; const EC_F2I: i64 = 5;
+// f64 bit patterns the float rules look for
+const EG_F_ONE: i64 = 4607182418800017408;  // 1.0
 
 // Binary codes (as compiler/rules.fd)
-const EB_ADD: i64 = 1; const EB_SUB: i64 = 2; const EB_MUL: i64 = 3; const EB_DIV: i64 = 4; const EB_MOD: i64 = 5; const EB_AND: i64 = 6; const EB_OR: i64 = 7; const EB_XOR: i64 = 8; const EB_SHL: i64 = 9; const EB_SHR: i64 = 10; const EB_EQ: i64 = 11; const EB_NE: i64 = 12; const EB_LT: i64 = 13; const EB_LE: i64 = 14; const EB_GT: i64 = 15; const EB_GE: i64 = 16;
- pub struct ENode {
+const EB_ADD: i64 = 1; const EB_SUB: i64 = 2; const EB_MUL: i64 = 3; const EB_DIV: i64 = 4; const EB_MOD: i64 = 5; const EB_AND: i64 = 6; const EB_OR: i64 = 7; const EB_XOR: i64 = 8; const EB_SHL: i64 = 9; const EB_SHR: i64 = 10; const EB_EQ: i64 = 11; const EB_NE: i64 = 12; const EB_LT: i64 = 13; const EB_LE: i64 = 14; const EB_GT: i64 = 15; const EB_GE: i64 = 16; pub struct ENode {
     pub kind: i64,
     pub op: i64,
     pub a: i64,
@@ -50,14 +81,246 @@ pub struct EGraph {
     // canonical node key -> node
     pub wrapping: bool,
     pub unions: i64,
+    // SP14: what keeps a round linear in the graph's size. kconst / kfconst:
+    // class -> the lowest-numbered integer / float constant node in it (-1:
+    // none), kept by eg_add and eg_union, so a class's constant is found
+    // without a scan of every node. unary: the unary nodes (-x, ~x, !b,
+    // float -x), adds: the integer additions, in the order they were made
+    // (the scans of double negation and reassociation look only at those).
+    pub kconst: Vec<i64>,
+    pub kfconst: Vec<i64>,
+    pub unary: Vec<i64>,
+    pub adds: Vec<i64>,
+    // SP14: the work done (nodes visited by rounds, rebuilds and the scans)
+    // and the function's budgets, both set from its size before the first
+    // round (eg_budget): no time is read, so the result is the same on every
+    // run and host (RL13)
+    pub work: i64,
+    pub work_limit: i64,
+    pub node_limit: i64,
+}
+
+// SP14: the e-graph's budget per function, in proportion to its size (the
+// nodes made from its instructions, the seed): at most EG_GROW_PER_SEED
+// nodes per seed node plus EG_GROW_BASE (never above EG_MAX_NODES), and
+// EG_WORK_PER_SEED units of work per seed node plus EG_WORK_BASE (never
+// above EG_MAX_WORK). Every round, rebuild and scan step counts one unit
+// per node it visits, so the whole pass is linear in the size of the
+// program, and release mode stays within 2x of debug mode (`emit --debug`
+// runs no e-graph; scripts/egraph-budget-check.sh measures both).
+const EG_GROW_PER_SEED: i64 = 16;
+const EG_GROW_BASE: i64 = 512;
+const EG_WORK_PER_SEED: i64 = 400;
+const EG_WORK_BASE: i64 = 20000;
+const EG_MAX_WORK: i64 = 4000000;
+
+// SP14: what the last egraph_run did, for FID_EGRAPH_STATS=1 (stderr) and
+// egraph_stats(): functions given an e-graph, seed nodes, nodes at the end,
+// rounds, work, and the functions stopped by each limit (rounds, nodes,
+// work) before nothing more changed.
+var g_eg_st_fns: i64 = 0;
+var g_eg_st_seed: i64 = 0;
+var g_eg_st_nodes: i64 = 0;
+var g_eg_st_rounds: i64 = 0;
+var g_eg_st_work: i64 = 0;
+var g_eg_st_cap_rounds: i64 = 0;
+var g_eg_st_cap_nodes: i64 = 0;
+var g_eg_st_cap_work: i64 = 0;
+
+// ME7: the side-effect skeleton (eg_skeleton, opt-in FID_IROPT_ON=egskel):
+// on for this run; what it changed in the function eg_function last saw;
+// and for FID_EGRAPH_STATS=1: functions it ran on, pure values taken out
+// of the skeleton, values made by elaboration (an original instruction
+// placed again, a new copy), originals never needed again, and functions
+// put back because something could not be elaborated.
+var g_eg_skel: bool = false;
+var g_eg_last_skel: i64 = 0;
+var g_eg_st_sk_fns: i64 = 0;
+var g_eg_st_sk_float: i64 = 0;
+var g_eg_st_sk_reused: i64 = 0;
+var g_eg_st_sk_fresh: i64 = 0;
+var g_eg_st_sk_dead: i64 = 0;
+var g_eg_st_sk_undone: i64 = 0;
+
+// ME8: what placement (eg_place) did this run, for FID_EGRAPH_STATS=1:
+// functions it moved a value in, values moved, of those moved to a block
+// in fewer loops (hoisted) and moved down the dominator tree (sunk), and
+// functions it left alone because of asm! or TryUnwrap.
+var g_eg_st_pl_fns: i64 = 0;
+var g_eg_st_pl_moved: i64 = 0;
+var g_eg_st_pl_hoisted: i64 = 0;
+var g_eg_st_pl_sunk: i64 = 0;
+var g_eg_st_pl_skipped: i64 = 0;
+
+/// SP14: set g's budgets from its seed (the nodes there are now).
+fn eg_budget(g: & mut EGraph) {
+    var seed: i64 = g.nodes.len();
+    var nl: i64 = EG_MAX_NODES;
+    if seed < (EG_MAX_NODES - EG_GROW_BASE) / EG_GROW_PER_SEED {
+        nl = seed * EG_GROW_PER_SEED + EG_GROW_BASE;
+    }
+    var wl: i64 = EG_MAX_WORK;
+    if seed < (EG_MAX_WORK - EG_WORK_BASE) / EG_WORK_PER_SEED {
+        wl = seed * EG_WORK_PER_SEED + EG_WORK_BASE;
+    }
+    g.node_limit = nl;
+    g.work_limit = wl;
+}
+
+/// SP14: true while g may still grow and work (a round stops at either).
+fn eg_room(g: & EGraph) -> bool {
+    return g.nodes.len() < g.node_limit && g.work < g.work_limit;
+}
+
+/// SP14: the counters of the last egraph_run: [functions, seed nodes,
+/// final nodes, rounds, work, stopped by rounds, by nodes, by work].
+pub fn egraph_stats() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(g_eg_st_fns);
+    out.push(g_eg_st_seed);
+    out.push(g_eg_st_nodes);
+    out.push(g_eg_st_rounds);
+    out.push(g_eg_st_work);
+    out.push(g_eg_st_cap_rounds);
+    out.push(g_eg_st_cap_nodes);
+    out.push(g_eg_st_cap_work);
+    return out;
 }
 
 fn eg_on(name: str) -> bool {
-    var off: str = p_getenv("FID_NAT_OFF");
+    // FID_NAT_OFF, or the `--no-pass` flag (ME5)
+    return !iro_named_off(p_getenv("FID_NAT_OFF"), name);
+}
+
+// RL3: the rule families of eg_round, each of which the pass matrix
+// (scripts/pass-matrix.sh) turns off on its own with
+// FID_EGRAPH_OFF=<name>,... (`all`: every family). With a family off the
+// e-graph still runs and extracts; only the equalities that family would
+// have joined are missing, so the output must not change.
+const EGR_COMM: i64 = 1;  // comm: a + b = b + a for + * & | ^ == !=
+const EGR_FLIP: i64 = 2;  // flip: a < b = b > a (and <=, >=)
+const EGR_FOLD: i64 = 4;  // fold: a binary operation of two constants
+const EGR_IDENT: i64 = 8;  // ident: x + 0, x - 0, x | 0, x ^ 0, x << 0, x >> 0, x * 1, x / 1, x & -1 = x
+const EGR_ZERO: i64 = 16;  // zero: x * 0 = 0, x & 0 = 0
+const EGR_DOUBLE: i64 = 32;  // double: x * 2 = x + x
+const EGR_SHIFT: i64 = 64;  // shift: @wrapping x * 2^s = x << s
+const EGR_REASSOC: i64 = 128;  // reassoc: @wrapping (x + c1) + c2 = x + (c1 + c2)
+const EGR_SAME: i64 = 256;  // same: x - x, x ^ x = 0; x & x, x | x = x; x == x ...
+const EGR_UFOLD: i64 = 512;  // unaryfold: -c, ~c, !c of a constant
+const EGR_INVOL: i64 = 1024;  // invol: !!b = b, ~~x = x, @wrapping -(-x) = x
+const EGR_CASTFOLD: i64 = 2048;  // castfold: a cast of a constant
+const EGR_IDCAST: i64 = 4096;  // idcast: a bit cast to its own type is its operand
+const EGR_FLOAT: i64 = 8192;  // float: the IEEE-exact float rules (eg_float_rules)
+var g_eg_rules_off: i64 = 0;
+
+fn eg_rule_named(off: str, name: str) -> bool {
+    var list: str = "," + off + ",";
+    return str_contains(list, "," + name + ",") || str_contains(list, ",all,");
+}
+
+/// RL3: the EGR_* bits of the families named in `off` (FID_EGRAPH_OFF).
+fn eg_rules_off_mask(off: str) -> i64 {
     if (off as i64) == 0 || str_len(off) == 0 {
-        return true;
+        return 0;
     }
-    return !str_contains("," + off + ",", "," + name + ",");
+    var m: i64 = 0;
+    if eg_rule_named(off, "comm") {
+        m = m | EGR_COMM;
+    }
+    if eg_rule_named(off, "flip") {
+        m = m | EGR_FLIP;
+    }
+    if eg_rule_named(off, "fold") {
+        m = m | EGR_FOLD;
+    }
+    if eg_rule_named(off, "ident") {
+        m = m | EGR_IDENT;
+    }
+    if eg_rule_named(off, "zero") {
+        m = m | EGR_ZERO;
+    }
+    if eg_rule_named(off, "double") {
+        m = m | EGR_DOUBLE;
+    }
+    if eg_rule_named(off, "shift") {
+        m = m | EGR_SHIFT;
+    }
+    if eg_rule_named(off, "reassoc") {
+        m = m | EGR_REASSOC;
+    }
+    if eg_rule_named(off, "same") {
+        m = m | EGR_SAME;
+    }
+    if eg_rule_named(off, "unaryfold") {
+        m = m | EGR_UFOLD;
+    }
+    if eg_rule_named(off, "invol") {
+        m = m | EGR_INVOL;
+    }
+    if eg_rule_named(off, "castfold") {
+        m = m | EGR_CASTFOLD;
+    }
+    if eg_rule_named(off, "idcast") {
+        m = m | EGR_IDCAST;
+    }
+    if eg_rule_named(off, "float") {
+        m = m | EGR_FLOAT;
+    }
+    return m;
+}
+
+/// RL3: true unless FID_EGRAPH_OFF turned the family `bit` off.
+fn eg_rule(bit: i64) -> bool {
+    return (g_eg_rules_off & bit) == 0;
+}
+
+// RL11 (mutation testing of the backend): `FID_NAT_MUTATE=eg<family>[,...]`
+// breaks one rule family on purpose, so scripts/mutation-check.sh can ask
+// whether the suite notices: egcomm (a - b = b - a), egflip (a < b =
+// b < a), egfold (a folded constant one off; a folded comparison negated),
+// egident (x + 1 = x, x * 2 = x, x & 0 = x: the identity's constant one
+// off), egzero (x * 0 = 1), egdouble (x * 2 = x - x), egsame (x - x =
+// x ^ x = 1). FID_NAT_MUTATE is part of nat_ir's cache key. Never set in a
+// real build.
+var g_eg_mutate: i64 = 0;
+
+fn eg_mutant_named(mu: str, name: str) -> bool {
+    return str_contains("," + mu + ",", "," + name + ",");
+}
+
+/// RL11: the EGR_* bits of the families FID_NAT_MUTATE breaks.
+fn eg_mutate_mask(mu: str) -> i64 {
+    if (mu as i64) == 0 || str_len(mu) == 0 {
+        return 0;
+    }
+    var m: i64 = 0;
+    if eg_mutant_named(mu, "egcomm") {
+        m = m | EGR_COMM;
+    }
+    if eg_mutant_named(mu, "egflip") {
+        m = m | EGR_FLIP;
+    }
+    if eg_mutant_named(mu, "egfold") {
+        m = m | EGR_FOLD;
+    }
+    if eg_mutant_named(mu, "egident") {
+        m = m | EGR_IDENT;
+    }
+    if eg_mutant_named(mu, "egzero") {
+        m = m | EGR_ZERO;
+    }
+    if eg_mutant_named(mu, "egdouble") {
+        m = m | EGR_DOUBLE;
+    }
+    if eg_mutant_named(mu, "egsame") {
+        m = m | EGR_SAME;
+    }
+    return m;
+}
+
+/// RL11: true when FID_NAT_MUTATE broke the family `bit`.
+fn eg_mut(bit: i64) -> bool {
+    return (g_eg_mutate & bit) != 0;
 }
 
 fn eg_find(g: & mut EGraph, c: i64) -> i64 {
@@ -77,11 +340,11 @@ fn eg_find(g: & mut EGraph, c: i64) -> i64 {
 fn eg_key(g: & mut EGraph, n: ENode) -> str {
     var a: i64 = n.a;
     var b: i64 = n.b;
-    if n.kind == EK_BIN {
+    if n.kind == EK_BIN || n.kind == EK_FBIN {
         a = eg_find(g, a);
         b = eg_find(g, b);
     }
-    if n.kind == EK_NEG || n.kind == EK_NOT || n.kind == EK_BNOT {
+    if n.kind == EK_NEG || n.kind == EK_NOT || n.kind == EK_BNOT || n.kind == EK_CAST || n.kind == EK_FNEG {
         a = eg_find(g, a);
     }
     return int_to_str(n.kind) + "," + int_to_str(n.op) + "," + int_to_str(a) + "," + int_to_str(b) + "," + n.ty;
@@ -99,7 +362,35 @@ fn eg_add(g: & mut EGraph, n: ENode) -> i64 {
     g.parent.push(c);
     g.node_class.push(c);
     HashMap_insert(g.hash, key, id);
+    // SP14: the indexes the rounds read instead of scanning every node
+    if n.kind == EK_CONST {
+        g.kconst.push(id);
+    } else {
+        g.kconst.push(0 - 1);
+    }
+    if n.kind == EK_FCONST {
+        g.kfconst.push(id);
+    } else {
+        g.kfconst.push(0 - 1);
+    }
+    if n.kind == EK_NEG || n.kind == EK_NOT || n.kind == EK_BNOT || n.kind == EK_FNEG {
+        g.unary.push(id);
+    }
+    if n.kind == EK_BIN && n.op == EB_ADD {
+        g.adds.push(id);
+    }
     return c;
+}
+
+/// SP14: the lower of two node indexes, -1 meaning none.
+fn eg_min_node(a: i64, b: i64) -> i64 {
+    if a < 0 {
+        return b;
+    }
+    if b < 0 || a < b {
+        return a;
+    }
+    return b;
 }
 
 fn eg_union(g: & mut EGraph, a: i64, b: i64) -> bool {
@@ -113,6 +404,14 @@ fn eg_union(g: & mut EGraph, a: i64, b: i64) -> bool {
     } else {
         g.parent.set(ra, rb);
     }
+    // SP14: the root keeps the lowest constant node of the two classes (the
+    // one a scan of every node in order would meet first)
+    var root: i64 = ra;
+    if rb < ra {
+        root = rb;
+    }
+    g.kconst.set(root, eg_min_node(g.kconst.get(ra), g.kconst.get(rb)));
+    g.kfconst.set(root, eg_min_node(g.kfconst.get(ra), g.kfconst.get(rb)));
     g.unions = g.unions + 1;
     return true;
 }
@@ -124,6 +423,7 @@ fn eg_rebuild(g: & mut EGraph) {
     while changed {
         changed = false;
         var seen: i64 = HashMap_new();
+        g.work = g.work + g.nodes.len();
         var i: i64 = 0;
         while i < g.nodes.len() {
             var key: str = eg_key(g, g.nodes.get(i));
@@ -140,19 +440,17 @@ fn eg_rebuild(g: & mut EGraph) {
     }
 }
 
-/// The constant of class c: [1, value] or [0].
+/// The constant of class c: [1, value] or [0]. SP14: read from the class's
+/// root (kconst), not from a scan of every node.
 fn eg_class_const(g: & mut EGraph, c: i64) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var rc: i64 = eg_find(g, c);
-    var i: i64 = 0;
-    while i < g.nodes.len() {
-        var n: ENode = g.nodes.get(i);
-        if n.kind == EK_CONST && eg_find(g, g.node_class.get(i)) == rc {
-            out.push(1);
-            out.push(n.a);
-            return out;
-        }
-        i = i + 1;
+    var k: i64 = g.kconst.get(rc);
+    if k >= 0 {
+        var kn: ENode = g.nodes.get(k);
+        out.push(1);
+        out.push(kn.a);
+        return out;
     }
     out.push(0);
     return out;
@@ -273,39 +571,432 @@ fn eg_signed(ty: str) -> bool {
     return out;
 }
 
+/// ME7: fold a unary operation (EK_NEG, EK_BNOT, EK_NOT) of constant a of
+/// type ty as the program computes it: [1, value], or [0] when it would
+/// panic or not fit (the negation of the minimum, of an unsigned value
+/// other than 0, or a result outside a narrow type).
+@wrapping fn eg_fold_unary(kind: i64, a: i64, ty: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var min: i64 = 0 - 9223372036854775807 - 1;
+    var bits: i64 = eg_bits(ty);
+    var r: i64 = 0;
+    if kind == EK_NOT {
+        if ty != "bool" || (a != 0 && a != 1) {
+            out.push(0);
+            return out;
+        }
+        out.push(1);
+        out.push(1 - a);
+        return out;
+    }
+    if ty == "bool" || ty == "u64" {
+        out.push(0);
+        return out;
+    }
+    if kind == EK_NEG {
+        if a == min {
+            out.push(0);
+            return out;
+        }
+        r = 0 - a;
+    } else if kind == EK_BNOT {
+        r = 0 - a - 1;
+        // ~x of an unsigned type keeps its width
+        if !eg_signed(ty) && bits < 64 {
+            r = r & ((1 << bits) - 1);
+        }
+    } else {
+        out.push(0);
+        return out;
+    }
+    if bits < 64 {
+        var lo: i64 = 0;
+        var hi: i64 = (1 << bits) - 1;
+        if eg_signed(ty) {
+            lo = 0 - (1 << (bits - 1));
+            hi = (1 << (bits - 1)) - 1;
+        }
+        if r < lo || r > hi {
+            out.push(0);
+            return out;
+        }
+    }
+    out.push(1);
+    out.push(r);
+    return out;
+}
+
+/// ME7: a type's code in a cast node's `b` (0: not a type the e-graph
+/// knows).
+fn eg_ty_code(ty: str) -> i64 {
+    if ty == "i8" {
+        return 1;
+    }
+    if ty == "u8" {
+        return 2;
+    }
+    if ty == "i16" {
+        return 3;
+    }
+    if ty == "u16" {
+        return 4;
+    }
+    if ty == "i32" {
+        return 5;
+    }
+    if ty == "u32" {
+        return 6;
+    }
+    if ty == "i64" {
+        return 7;
+    }
+    if ty == "u64" {
+        return 8;
+    }
+    if ty == "bool" {
+        return 9;
+    }
+    if ty == "f32" {
+        return 10;
+    }
+    if ty == "f64" {
+        return 11;
+    }
+    return 0;
+}
+
+fn eg_code_ty(code: i64) -> str {
+    if code == 1 {
+        return "i8";
+    }
+    if code == 2 {
+        return "u8";
+    }
+    if code == 3 {
+        return "i16";
+    }
+    if code == 4 {
+        return "u16";
+    }
+    if code == 5 {
+        return "i32";
+    }
+    if code == 6 {
+        return "u32";
+    }
+    if code == 7 {
+        return "i64";
+    }
+    if code == 8 {
+        return "u64";
+    }
+    if code == 9 {
+        return "bool";
+    }
+    if code == 10 {
+        return "f32";
+    }
+    if code == 11 {
+        return "f64";
+    }
+    return "";
+}
+
+/// ME7: does integer c lie in the values of integer type ty? (u64: only
+/// the values below 2^63, which an i64 holds; a float type: no.)
+fn eg_in_range(c: i64, ty: str) -> bool {
+    if ty == "bool" {
+        return c == 0 || c == 1;
+    }
+    if ty == "i64" {
+        return true;
+    }
+    if ty == "u64" {
+        return c >= 0;
+    }
+    if eg_ty_code(ty) == 0 || ty == "f32" || ty == "f64" {
+        return false;
+    }
+    var bits: i64 = eg_bits(ty);
+    if eg_signed(ty) {
+        return c >= 0 - (1 << (bits - 1)) && c <= (1 << (bits - 1)) - 1;
+    }
+    return c >= 0 && c <= (1 << bits) - 1;
+}
+
+/// ME7: fold cast `op` of integer constant c from type `from` to `to`:
+/// [1, value] or [0]. Only where every backend gives the same bits: the
+/// value must lie in both types (a cast of a value both types hold keeps
+/// it), and a truncation only of a value that is not negative (pe_ir
+/// zero-extends a truncated narrow value, the interpreter sign-adjusts it:
+/// the two agree on values >= 0 alone). Float conversions are not folded.
+fn eg_fold_cast(op: i64, c: i64, from: str, to: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if op != EC_EXT && op != EC_TRUNC && op != EC_BITCAST {
+        out.push(0);
+        return out;
+    }
+    if !eg_in_range(c, from) || !eg_in_range(c, to) || to == "bool" {
+        out.push(0);
+        return out;
+    }
+    if op == EC_TRUNC && c < 0 {
+        out.push(0);
+        return out;
+    }
+    out.push(1);
+    out.push(c);
+    return out;
+}
+
+/// ME7: "f64"/"f32" for a float type, else "".
+fn eg_float_ty(t: IrType) -> str {
+    if ir_type_eq(t, IrType::F64) {
+        return "f64";
+    }
+    if ir_type_eq(t, IrType::F32) {
+        return "f32";
+    }
+    return "";
+}
+
+/// ME7: eg_int_ty, or a float type's name.
+fn eg_num_ty(t: IrType) -> str {
+    var s: str = eg_int_ty(t);
+    if s != "" {
+        return s;
+    }
+    return eg_float_ty(t);
+}
+
+/// ME7: the f64 bit pattern of class c's float constant: [1, bits] or [0].
+/// SP14: read from the class's root (kfconst), not from a scan.
+fn eg_class_fconst(g: & mut EGraph, c: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var rc: i64 = eg_find(g, c);
+    var k: i64 = g.kfconst.get(rc);
+    if k >= 0 {
+        var kn: ENode = g.nodes.get(k);
+        out.push(1);
+        out.push(kn.a);
+        return out;
+    }
+    out.push(0);
+    return out;
+}
+
+/// ME7: the float rules of node n (kind EK_FBIN or EK_FNEG) of class c,
+/// over the first `count` nodes: true if anything was joined. Only what
+/// IEEE 754 makes exact for every operand, NaNs, infinities and -0.0
+/// included: a < b is b > a (a NaN makes both false), x * 1.0 = x,
+/// x / 1.0 = x, x - 0.0 = x (-0.0 - 0.0 is -0.0), x + -0.0 = x, and
+/// -(-x) = x. Not x + 0.0 (-0.0 + 0.0 is +0.0), x * 0.0, x - x or x == x,
+/// and no reassociation or constant folding.
+fn eg_float_rules(g: & mut EGraph, n: ENode, c: i64, count: i64) -> bool {
+    var any: bool = false;
+    if n.kind == EK_FBIN {
+        var flip: i64 = 0;
+        if n.op == EB_LT {
+            flip = EB_GT;
+        }
+        if n.op == EB_GT {
+            flip = EB_LT;
+        }
+        if n.op == EB_LE {
+            flip = EB_GE;
+        }
+        if n.op == EB_GE {
+            flip = EB_LE;
+        }
+        if n.op == EB_EQ || n.op == EB_NE {
+            flip = n.op;
+        }
+        if flip != 0 {
+            if eg_union(g, c, eg_add(g, ENode {
+                kind: EK_FBIN, op: flip, a: n.b, b: n.a, ty: n.ty
+            })) {
+                any = true;
+            }
+        }
+        var kb: Vec<i64> = eg_class_fconst(g, n.b);
+        if kb.get(0) == 1 {
+            var bits: i64 = kb.get(1);
+            var min: i64 = 0 - 9223372036854775807 - 1;
+            if ((n.op == EB_MUL || n.op == EB_DIV) && bits == EG_F_ONE) || (n.op == EB_SUB && bits == 0) || (n.op == EB_ADD && bits == min) {
+                if eg_union(g, c, n.a) {
+                    any = true;
+                }
+            }
+        }
+    }
+    if n.kind == EK_FNEG {
+        // SP14: only the unary nodes, in order (the first `count` nodes)
+        var u: i64 = 0;
+        while u < g.unary.len() && g.unary.get(u) < count {
+            var j: i64 = g.unary.get(u);
+            g.work = g.work + 1;
+            var m: ENode = g.nodes.get(j);
+            if m.kind == EK_FNEG && m.ty == n.ty && eg_find(g, g.node_class.get(j)) == eg_find(g, n.a) {
+                if eg_union(g, c, m.a) {
+                    any = true;
+                }
+            }
+            u = u + 1;
+        }
+    }
+    return any;
+}
+
+// ME7: the tables of eg_round's integer rules, read by the rewriter and by
+// the SMT proof obligations (egraph_smt), RL11's mutants included, so a
+// proof is of the rule the pass applies.
+
+/// comm: is a op b = b op a? (RL11 egcomm: - too)
+fn eg_comm_op(op: i64) -> bool {
+    return op == EB_ADD || op == EB_MUL || op == EB_AND || op == EB_OR || op == EB_XOR || op == EB_EQ || op == EB_NE || (op == EB_SUB && eg_mut(EGR_COMM));
+}
+
+/// flip: the comparison f with a op b = b f a (0: op is no ordering). RL11
+/// egflip: op itself (a < b joined with b < a).
+fn eg_flip_op(op: i64) -> i64 {
+    var flip: i64 = 0;
+    if op == EB_LT {
+        flip = EB_GT;
+    }
+    if op == EB_GT {
+        flip = EB_LT;
+    }
+    if op == EB_LE {
+        flip = EB_GE;
+    }
+    if op == EB_GE {
+        flip = EB_LE;
+    }
+    if flip != 0 && eg_mut(EGR_FLIP) {
+        flip = op;
+    }
+    return flip;
+}
+
+/// ident: [1, k] when x op k = x, else [0] (exact under checked
+/// arithmetic: none of these can overflow).
+fn eg_ident_k(op: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if op == EB_ADD || op == EB_SUB || op == EB_OR || op == EB_XOR || op == EB_SHL || op == EB_SHR {
+        out.push(1);
+        out.push(0);
+        return out;
+    }
+    if op == EB_MUL || op == EB_DIV {
+        out.push(1);
+        out.push(1);
+        return out;
+    }
+    if op == EB_AND {
+        out.push(1);
+        out.push(0 - 1);
+        return out;
+    }
+    out.push(0);
+    return out;
+}
+
+/// zero: the value of x * 0 and x & 0 (RL11 egzero: 1).
+fn eg_zero_value() -> i64 {
+    if eg_mut(EGR_ZERO) {
+        return 1;
+    }
+    return 0;
+}
+
+/// double: the operation x * 2 equals over x, x (RL11 egdouble: -).
+fn eg_double_op() -> i64 {
+    if eg_mut(EGR_DOUBLE) {
+        return EB_SUB;
+    }
+    return EB_ADD;
+}
+
+/// same: what x op x is: [1, v] the constant v of x's type, [2] x itself,
+/// [3, v] the boolean v, [0] nothing known. RL11 egsame: x - x = x ^ x = 1.
+fn eg_same_of(op: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if op == EB_SUB || op == EB_XOR {
+        out.push(1);
+        out.push(eg_zero_value_same());
+        return out;
+    }
+    if op == EB_AND || op == EB_OR {
+        out.push(2);
+        return out;
+    }
+    if op == EB_EQ || op == EB_LE || op == EB_GE {
+        out.push(3);
+        out.push(1);
+        return out;
+    }
+    if op == EB_NE || op == EB_LT || op == EB_GT {
+        out.push(3);
+        out.push(0);
+        return out;
+    }
+    out.push(0);
+    return out;
+}
+
+fn eg_zero_value_same() -> i64 {
+    if eg_mut(EGR_SAME) {
+        return 1;
+    }
+    return 0;
+}
+
+/// fold: a op b of two constants as eg_round joins it: eg_fold, with RL11's
+/// egfold mutant (the value one off, a comparison negated).
+fn eg_fold_rule(op: i64, a: i64, b: i64, ty: str, wrapping: bool) -> Vec<i64> {
+    var f: Vec<i64> = eg_fold(op, a, b, ty, wrapping);
+    if f.get(0) != 1 || !eg_mut(EGR_FOLD) {
+        return f;
+    }
+    var fv: i64 = f.get(1);
+    if eg_is_cmp(op) {
+        fv = 1 - fv;
+    } else if fv < 9223372036854775807 {
+        fv = fv + 1;
+    } else {
+        fv = 0;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(1);
+    out.push(fv);
+    return out;
+}
+
 /// One round of every rule over the nodes there are now: true if anything
 /// was joined.
 fn eg_round(g: & mut EGraph) -> bool {
     var any: bool = false;
     var count: i64 = g.nodes.len();
+    var unions0: i64 = g.unions;
     var i: i64 = 0;
-    while i < count && g.nodes.len() < EG_MAX_NODES {
+    // SP14: within the function's budgets (eg_budget), not only EG_MAX_NODES
+    while i < count && eg_room(g) {
+        g.work = g.work + 1;
         var n: ENode = g.nodes.get(i);
         var c: i64 = g.node_class.get(i);
         if n.kind == EK_BIN {
             var op: i64 = n.op;
-            // Commutative operations, flipped comparisons
-            if op == EB_ADD || op == EB_MUL || op == EB_AND || op == EB_OR || op == EB_XOR || op == EB_EQ || op == EB_NE {
+            // Commutative operations, flipped comparisons (ME7: from the
+            // tables egraph_smt proves, eg_comm_op and eg_flip_op)
+            if eg_rule(EGR_COMM) && eg_comm_op(op) {
                 if eg_union(g, c, eg_add(g, ENode {
                     kind: EK_BIN, op: op, a: n.b, b: n.a, ty: n.ty
                 })) {
                     any = true;
                 }
             }
-            var flip: i64 = 0;
-            if op == EB_LT {
-                flip = EB_GT;
-            }
-            if op == EB_GT {
-                flip = EB_LT;
-            }
-            if op == EB_LE {
-                flip = EB_GE;
-            }
-            if op == EB_GE {
-                flip = EB_LE;
-            }
-            if flip != 0 {
+            var flip: i64 = eg_flip_op(op);
+            if flip != 0 && eg_rule(EGR_FLIP) {
                 if eg_union(g, c, eg_add(g, ENode {
                     kind: EK_BIN, op: flip, a: n.b, b: n.a, ty: n.ty
                 })) {
@@ -315,15 +1006,17 @@ fn eg_round(g: & mut EGraph) -> bool {
             // Constants
             var ka: Vec<i64> = eg_class_const(g, n.a);
             var kb: Vec<i64> = eg_class_const(g, n.b);
-            if ka.get(0) == 1 && kb.get(0) == 1 {
-                var f: Vec<i64> = eg_fold(op, ka.get(1), kb.get(1), n.ty, g.wrapping);
+            if ka.get(0) == 1 && kb.get(0) == 1 && eg_rule(EGR_FOLD) {
+                // RL11 egfold is in eg_fold_rule (ME7: what egraph_smt checks)
+                var f: Vec<i64> = eg_fold_rule(op, ka.get(1), kb.get(1), n.ty, g.wrapping);
                 if f.get(0) == 1 {
                     var cty: str = n.ty;
+                    var fv: i64 = f.get(1);
                     if eg_is_cmp(op) {
                         cty = "bool";
                     }
                     if eg_union(g, c, eg_add(g, ENode {
-                        kind: EK_CONST, op: 0, a: f.get(1), b: 0, ty: cty
+                        kind: EK_CONST, op: 0, a: fv, b: 0, ty: cty
                     })) {
                         any = true;
                     }
@@ -332,28 +1025,39 @@ fn eg_round(g: & mut EGraph) -> bool {
             // Identities (exact under checked arithmetic)
             if kb.get(0) == 1 {
                 var k: i64 = kb.get(1);
-                if ((op == EB_ADD || op == EB_SUB || op == EB_OR || op == EB_XOR || op == EB_SHL || op == EB_SHR) && k == 0) || ((op == EB_MUL || op == EB_DIV) && k == 1) || (op == EB_AND && k == 0 - 1) {
+                // RL11 egident: the identity's constant one off (x + 1 = x)
+                var ki: i64 = k;
+                if eg_mut(EGR_IDENT) && k > 0 - 9223372036854775807 {
+                    ki = k - 1;
+                }
+                // ME7: the identity constants from eg_ident_k (egraph_smt)
+                var idk: Vec<i64> = eg_ident_k(op);
+                if eg_rule(EGR_IDENT) && idk.get(0) == 1 && ki == idk.get(1) {
                     if eg_union(g, c, n.a) {
                         any = true;
                     }
                 }
-                if (op == EB_MUL || op == EB_AND) && k == 0 {
+                if eg_rule(EGR_ZERO) && (op == EB_MUL || op == EB_AND) && k == 0 {
+                    // RL11 egzero (x * 0 = 1) is in eg_zero_value
+                    var zv: i64 = eg_zero_value();
                     if eg_union(g, c, eg_add(g, ENode {
-                        kind: EK_CONST, op: 0, a: 0, b: 0, ty: n.ty
+                        kind: EK_CONST, op: 0, a: zv, b: 0, ty: n.ty
                     })) {
                         any = true;
                     }
                 }
                 // x * 2 = x + x (both overflow exactly when 2x does not fit)
-                if op == EB_MUL && k == 2 {
+                if op == EB_MUL && k == 2 && eg_rule(EGR_DOUBLE) {
+                    // RL11 egdouble (x * 2 = x - x) is in eg_double_op
+                    var dop: i64 = eg_double_op();
                     if eg_union(g, c, eg_add(g, ENode {
-                        kind: EK_BIN, op: EB_ADD, a: n.a, b: n.a, ty: n.ty
+                        kind: EK_BIN, op: dop, a: n.a, b: n.a, ty: n.ty
                     })) {
                         any = true;
                     }
                 }
                 // Wrapping code: x * 2^s = x << s, (x + c1) + c2 = x + (c1 + c2)
-                if g.wrapping && op == EB_MUL && k > 2 && (k & (k - 1)) == 0 && k < 4611686018427387904 {
+                if g.wrapping && op == EB_MUL && k > 2 && (k & (k - 1)) == 0 && k < 4611686018427387904 && eg_rule(EGR_SHIFT) {
                     var s: i64 = 0;
                     while (1 << s) < k {
                         s = s + 1;
@@ -367,11 +1071,21 @@ fn eg_round(g: & mut EGraph) -> bool {
                         any = true;
                     }
                 }
-                if g.wrapping && op == EB_ADD {
+                if g.wrapping && op == EB_ADD && eg_rule(EGR_REASSOC) {
                     var inner: Vec<i64> = eg_add_const_child(g, n.a, n.ty);
+                    // ME7: c1 + c2 as the program computes it (wrapped in
+                    // i64, within a narrow type, never u64): the sum in this
+                    // checked function panicked on i64 constants near the
+                    // limits, and a narrow sum outside the type made a
+                    // constant the type does not hold
+                    var csum: Vec<i64> = Vec::new();
+                    csum.push(0);
                     if inner.get(0) == 1 {
+                        csum = eg_fold(EB_ADD, inner.get(2), k, n.ty, true);
+                    }
+                    if inner.get(0) == 1 && csum.get(0) == 1 {
                         var sumc: i64 = eg_add(g, ENode {
-                            kind: EK_CONST, op: 0, a: inner.get(2) + k, b: 0, ty: n.ty
+                            kind: EK_CONST, op: 0, a: csum.get(1), b: 0, ty: n.ty
                         });
                         if eg_union(g, c, eg_add(g, ENode {
                             kind: EK_BIN, op: EB_ADD, a: inner.get(1), b: sumc, ty: n.ty
@@ -381,59 +1095,99 @@ fn eg_round(g: & mut EGraph) -> bool {
                     }
                 }
             }
-            if n.a == n.b || eg_find(g, n.a) == eg_find(g, n.b) {
-                if op == EB_SUB || op == EB_XOR {
+            if eg_rule(EGR_SAME) && (n.a == n.b || eg_find(g, n.a) == eg_find(g, n.b)) {
+                // ME7: x op x from eg_same_of (egraph_smt); RL11 egsame there
+                var so: Vec<i64> = eg_same_of(op);
+                if so.get(0) == 1 {
                     if eg_union(g, c, eg_add(g, ENode {
-                        kind: EK_CONST, op: 0, a: 0, b: 0, ty: n.ty
+                        kind: EK_CONST, op: 0, a: so.get(1), b: 0, ty: n.ty
                     })) {
                         any = true;
                     }
                 }
-                if op == EB_AND || op == EB_OR {
+                if so.get(0) == 2 {
                     if eg_union(g, c, n.a) {
                         any = true;
                     }
                 }
-                if op == EB_EQ || op == EB_LE || op == EB_GE {
+                if so.get(0) == 3 {
                     if eg_union(g, c, eg_add(g, ENode {
-                        kind: EK_CONST, op: 0, a: 1, b: 0, ty: "bool"
-                    })) {
-                        any = true;
-                    }
-                }
-                if op == EB_NE || op == EB_LT || op == EB_GT {
-                    if eg_union(g, c, eg_add(g, ENode {
-                        kind: EK_CONST, op: 0, a: 0, b: 0, ty: "bool"
+                        kind: EK_CONST, op: 0, a: so.get(1), b: 0, ty: "bool"
                     })) {
                         any = true;
                     }
                 }
             }
-        } else if n.kind == EK_NOT {
-            // !!b = b
-            var j: i64 = 0;
-            while j < count {
-                var m: ENode = g.nodes.get(j);
-                if m.kind == EK_NOT && eg_find(g, g.node_class.get(j)) == eg_find(g, n.a) {
-                    if eg_union(g, c, m.a) {
+        } else if n.kind == EK_NOT || n.kind == EK_BNOT || n.kind == EK_NEG {
+            // ME7: a unary operation of a constant is that constant's result
+            var ku: Vec<i64> = eg_class_const(g, n.a);
+            if ku.get(0) == 1 && eg_rule(EGR_UFOLD) {
+                var fu: Vec<i64> = eg_fold_unary(n.kind, ku.get(1), n.ty);
+                if fu.get(0) == 1 {
+                    if eg_union(g, c, eg_add(g, ENode {
+                        kind: EK_CONST, op: 0, a: fu.get(1), b: 0, ty: n.ty
+                    })) {
                         any = true;
                     }
                 }
-                j = j + 1;
+            }
+            // !!b = b and ~~x = x always; -(-x) = x only in @wrapping code
+            // (elsewhere the inner negation of the minimum would panic and
+            // x does not: the forms must panic alike)
+            if (n.kind != EK_NEG || g.wrapping) && eg_rule(EGR_INVOL) {
+                // SP14: only the unary nodes, in order (the first `count`)
+                var u: i64 = 0;
+                while u < g.unary.len() && g.unary.get(u) < count {
+                    var j: i64 = g.unary.get(u);
+                    g.work = g.work + 1;
+                    var m: ENode = g.nodes.get(j);
+                    if m.kind == n.kind && m.ty == n.ty && eg_find(g, g.node_class.get(j)) == eg_find(g, n.a) {
+                        if eg_union(g, c, m.a) {
+                            any = true;
+                        }
+                    }
+                    u = u + 1;
+                }
+            }
+        } else if n.kind == EK_CAST {
+            // ME7: a cast of a constant is the constant, where every backend
+            // agrees on its bits (eg_fold_cast)
+            var kc: Vec<i64> = eg_class_const(g, n.a);
+            if kc.get(0) == 1 && eg_rule(EGR_CASTFOLD) {
+                var fc: Vec<i64> = eg_fold_cast(n.op, kc.get(1), eg_code_ty(n.b), n.ty);
+                if fc.get(0) == 1 {
+                    if eg_union(g, c, eg_add(g, ENode {
+                        kind: EK_CONST, op: 0, a: fc.get(1), b: 0, ty: n.ty
+                    })) {
+                        any = true;
+                    }
+                }
+            }
+        } else if n.kind == EK_FBIN || n.kind == EK_FNEG {
+            if eg_rule(EGR_FLOAT) && eg_float_rules(g, n, c, count) {
+                any = true;
             }
         }
         i = i + 1;
     }
-    eg_rebuild(g);
+    // SP14: no union this round leaves every canonical key as it was, so
+    // the rebuild would find nothing (and keep the same table)
+    if g.unions != unions0 {
+        eg_rebuild(g);
+    }
     return any;
 }
 
 /// Class c holds x + k for a constant k: [1, class of x, k], else [0].
+/// SP14: only the additions (g.adds, in order), not every node.
 fn eg_add_const_child(g: & mut EGraph, c: i64, ty: str) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var rc: i64 = eg_find(g, c);
-    var i: i64 = 0;
-    while i < g.nodes.len() {
+    var ai: i64 = 0;
+    while ai < g.adds.len() {
+        var i: i64 = g.adds.get(ai);
+        ai = ai + 1;
+        g.work = g.work + 1;
         var n: ENode = g.nodes.get(i);
         if n.kind == EK_BIN && n.op == EB_ADD && n.ty == ty && eg_find(g, g.node_class.get(i)) == rc {
             var kb: Vec<i64> = eg_class_const(g, n.b);
@@ -444,7 +1198,6 @@ fn eg_add_const_child(g: & mut EGraph, c: i64, ty: str) -> Vec<i64> {
                 return out;
             }
         }
-        i = i + 1;
     }
     out.push(0);
     return out;
@@ -609,18 +1362,39 @@ fn eg_meta_ty(f: & IrFunction, id: i64) -> IrType {
     return IrType::Void;
 }
 
+/// eg_meta_ty, and for a parameter its declared type. ME7: a parameter
+/// has no instruction (AGENTS.md item 27): its type is in func.params, so
+/// an operation on a parameter becomes a node too. (Forwarding keeps
+/// eg_meta_ty: it never forwards a parameter.)
+fn eg_value_ty(f: & IrFunction, id: i64) -> IrType {
+    var t: IrType = eg_meta_ty(f, id);
+    if !ir_type_eq(t, IrType::Void) {
+        return t;
+    }
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        if f.params.get(pi).id == id {
+            return f.params.get(pi).ty;
+        }
+        pi = pi + 1;
+    }
+    return IrType::Void;
+}
+
 fn eg_set_inst(f: & mut IrFunction, id: i64, inst: Inst) {
     var at: i64 = f.inst_at.get(id) - 1;
     var ve: ValueIdInst = f.insts.get(at);
     ve.inst = inst;
     f.insts.set(at, ve);
+    // CS1: the memo replays this write (ir_ser.fd mec_*)
+    mec_log_inst(at);
 }
 
 /// The e-graph pass over one function: how many instructions it rewrote.
 fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     var cfg: IroCfg = iro_cfg(f);
     var g: EGraph = EGraph {
-        nodes: Vec::new(), node_class: Vec::new(), parent: Vec::new(), hash: HashMap_new(), wrapping: f.is_wrapping, unions: 0
+        nodes: Vec::new(), node_class: Vec::new(), parent: Vec::new(), hash: HashMap_new(), wrapping: f.is_wrapping, unions: 0, kconst: Vec::new(), kfconst: Vec::new(), unary: Vec::new(), adds: Vec::new(), work: 0, work_limit: EG_MAX_WORK, node_limit: EG_MAX_NODES
     };
     var n: i64 = f.next_value;
     var i: i64 = 0;
@@ -643,11 +1417,16 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     // value id -> block index
     var pos: Vec<i64> = Vec::new();
     // value id -> position in its block
+    var own: Vec<i64> = Vec::new();
+    // ME7 (skeleton): value id -> 1 when its class comes from its own
+    // instruction (not a leaf made for an operand)
+    g_eg_last_skel = 0;
     i = 0;
     while i < n {
         cls.push(0 - 1);
         blk.push(0 - 1);
         pos.push(0 - 1);
+        own.push(0);
         i = i + 1;
     }
     // Values in dominance order (reverse postorder of blocks)
@@ -696,13 +1475,96 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                     }
                     Inst::BinOp(op, a, b2, t) => {
                         var code: i64 = eg_binop(op);
-                        var ots: str = eg_int_ty(eg_meta_ty(f, a));
-                        if code != 0 && ots != "" && ots != "bool" && eg_int_ty(eg_meta_ty(f, b2)) == ots && eg_int_ty(t) != "" {
+                        var ots: str = eg_int_ty(eg_value_ty(f, a));
+                        if code != 0 && ots != "" && ots != "bool" && eg_int_ty(eg_value_ty(f, b2)) == ots && eg_int_ty(t) != "" {
                             var ca: i64 = eg_value(& mut g, & mut cls, a);
                             var cb: i64 = eg_value(& mut g, & mut cls, b2);
                             c = eg_add(& mut g, ENode {
                                 kind: EK_BIN, op: code, a: ca, b: cb, ty: ots
                             });
+                        }
+                        // ME7: float arithmetic and comparisons (operands of
+                        // one float type; bit operations are not float)
+                        var fts: str = eg_float_ty(eg_value_ty(f, a));
+                        if c < 0 && fts != "" && eg_float_ty(eg_value_ty(f, b2)) == fts && (code == EB_ADD || code == EB_SUB || code == EB_MUL || code == EB_DIV || eg_is_cmp(code)) && eg_num_ty(t) != "" {
+                            var fa: i64 = eg_value(& mut g, & mut cls, a);
+                            var fb: i64 = eg_value(& mut g, & mut cls, b2);
+                            c = eg_add(& mut g, ENode {
+                                kind: EK_FBIN, op: code, a: fa, b: fb, ty: fts
+                            });
+                        }
+                    }
+                    Inst::ConstFloat(fv, ft) => {
+                        var cfs: str = eg_float_ty(ft);
+                        if cfs != "" {
+                            c = eg_add(& mut g, ENode {
+                                kind: EK_FCONST, op: 0, a: p_f64_to_bits(fv), b: 0, ty: cfs
+                            });
+                        }
+                    }
+                    // ME7: casts between the integer, bool and float types.
+                    // A bit cast to its own type is its operand (the move
+                    // this pass and the inliner write).
+                    Inst::BitCast(xv, xf, xt) => {
+                        c = eg_cast_class(& mut g, & mut cls, f, EC_BITCAST, xv, xf, xt);
+                    }
+                    Inst::IntExtend(xv2, xf2, xt2) => {
+                        c = eg_cast_class(& mut g, & mut cls, f, EC_EXT, xv2, xf2, xt2);
+                    }
+                    Inst::IntTrunc(xv3, xf3, xt3) => {
+                        c = eg_cast_class(& mut g, & mut cls, f, EC_TRUNC, xv3, xf3, xt3);
+                    }
+                    Inst::IntToFloat(xv4, xf4, xt4) => {
+                        c = eg_cast_class(& mut g, & mut cls, f, EC_I2F, xv4, xf4, xt4);
+                    }
+                    Inst::FloatToInt(xv5, xf5, xt5) => {
+                        c = eg_cast_class(& mut g, & mut cls, f, EC_F2I, xv5, xf5, xt5);
+                    }
+                    // ME7: unary operations are pure values too: -x and ~x
+                    // of an integer, !b of a boolean (operand and result of
+                    // one type)
+                    Inst::UnaryOp(uop, ua, ut) => {
+                        var uts: str = eg_int_ty(ut);
+                        if uts != "" && eg_int_ty(eg_value_ty(f, ua)) == uts {
+                            var ukind: i64 = 0;
+                            match uop {
+                                UnaryOp::Neg => {
+                                    if uts != "bool" {
+                                        ukind = EK_NEG;
+                                    }
+                                }
+                                UnaryOp::Not => {
+                                    if uts == "bool" {
+                                        ukind = EK_NOT;
+                                    }
+                                }
+                                UnaryOp::BitNot => {
+                                    if uts != "bool" {
+                                        ukind = EK_BNOT;
+                                    }
+                                }
+                            }
+                            if ukind != 0 {
+                                var cu: i64 = eg_value(& mut g, & mut cls, ua);
+                                c = eg_add(& mut g, ENode {
+                                    kind: ukind, op: 0, a: cu, b: 0, ty: uts
+                                });
+                            }
+                        }
+                        // ME7: float negation (flips the sign bit: never
+                        // panics, -(-x) = x for every x)
+                        var ufs: str = eg_float_ty(ut);
+                        if ufs != "" && eg_float_ty(eg_value_ty(f, ua)) == ufs {
+                            match uop {
+                                UnaryOp::Neg => {
+                                    var cuf: i64 = eg_value(& mut g, & mut cls, ua);
+                                    c = eg_add(& mut g, ENode {
+                                        kind: EK_FNEG, op: 0, a: cuf, b: 0, ty: ufs
+                                    });
+                                }
+                                _ => {
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -710,6 +1572,7 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                 }
                 if c >= 0 {
                     cls.set(id2, c);
+                    own.set(id2, 1);
                 }
             }
             OptInst::None => {
@@ -720,11 +1583,48 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
     if g.nodes.len() == 0 {
         return 0;
     }
+    // SP14: a graph of only values and constants has no rule to apply (no
+    // round would join anything): stop before the first round
+    var ops: i64 = 0;
+    var si: i64 = 0;
+    while si < g.nodes.len() {
+        var sn: ENode = g.nodes.get(si);
+        if sn.kind != EK_LEAF && sn.kind != EK_CONST && sn.kind != EK_FCONST {
+            ops = ops + 1;
+        }
+        si = si + 1;
+    }
+    if ops == 0 {
+        return 0;
+    }
+    // SP14: the budgets follow the function's size; the rounds stop at the
+    // first of EG_MAX_ROUNDS, the node limit and the work limit
+    eg_budget(& mut g);
+    var seed: i64 = g.nodes.len();
     var round: i64 = 0;
-    while round < EG_MAX_ROUNDS && g.nodes.len() < EG_MAX_NODES && eg_round(& mut g) {
+    var more: bool = true;
+    while more && round < EG_MAX_ROUNDS && eg_room(& g) {
+        more = eg_round(& mut g);
         round = round + 1;
     }
-    if g.unions == 0 {
+    g_eg_st_fns = g_eg_st_fns + 1;
+    g_eg_st_seed = g_eg_st_seed + seed;
+    g_eg_st_nodes = g_eg_st_nodes + g.nodes.len();
+    g_eg_st_rounds = g_eg_st_rounds + round;
+    g_eg_st_work = g_eg_st_work + g.work;
+    if more {
+        // stopped while the last round still joined classes
+        if round >= EG_MAX_ROUNDS {
+            g_eg_st_cap_rounds = g_eg_st_cap_rounds + 1;
+        } else if g.nodes.len() >= g.node_limit {
+            g_eg_st_cap_nodes = g_eg_st_cap_nodes + 1;
+        } else {
+            g_eg_st_cap_work = g_eg_st_cap_work + 1;
+        }
+    }
+    // ME7: with the skeleton on, a graph without unions still has equal
+    // values to share and pure values to place
+    if g.unions == 0 && !g_eg_skel {
         return 0;
     }
 
@@ -759,6 +1659,25 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                 var y: i64 = bcost.get(eg_find(& mut g, nd.b));
                 if x < 1000000000 && y < 1000000000 {
                     cost = eg_cost(nd.op) + x + y;
+                }
+            }
+            // ME7: a unary operation costs one more than its operand
+            if nd.kind == EK_FCONST {
+                cost = 1;
+            }
+            // ME7: a float operation costs as an integer one; a cast one
+            // more than its operand
+            if nd.kind == EK_FBIN {
+                var fx: i64 = bcost.get(eg_find(& mut g, nd.a));
+                var fy: i64 = bcost.get(eg_find(& mut g, nd.b));
+                if fx < 1000000000 && fy < 1000000000 {
+                    cost = eg_cost(nd.op) + fx + fy;
+                }
+            }
+            if nd.kind == EK_NEG || nd.kind == EK_NOT || nd.kind == EK_BNOT || nd.kind == EK_CAST || nd.kind == EK_FNEG {
+                var ux: i64 = bcost.get(eg_find(& mut g, nd.a));
+                if ux < 1000000000 {
+                    cost = 1 + ux;
                 }
             }
             if cost < bcost.get(rc) {
@@ -830,6 +1749,11 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                     Inst::ConstBool(_) => {
                         is_const_now = true;
                     }
+                    // ME7: a float constant stays one (not a move of an
+                    // earlier equal constant)
+                    Inst::ConstFloat(_, _) => {
+                        is_const_now = true;
+                    }
                     _ => {
                     }
                 }
@@ -845,9 +1769,24 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
                 if !done && !is_const_now {
                     // An earlier value of the same class: a move
                     var prev: i64 = eg_member_before(& members, & cfg, & blk, & pos, rc3, id3, f);
-                    if prev >= 0 && ir_type_eq(eg_meta_ty(f, prev), tty) {
-                        eg_set_inst(f, id3, Inst::BitCast(prev, tty, tty));
-                        done = true;
+                    if prev >= 0 && ir_type_eq(eg_value_ty(f, prev), tty) {
+                        // ME7: a bit cast to its own type is in its operand's
+                        // class: already the move it would become
+                        var same_move: bool = false;
+                        match cur {
+                            Inst::BitCast(mv, mf, mt) => {
+                                same_move = mv == prev && ir_type_eq(mf, tty) && ir_type_eq(mt, tty);
+                            }
+                            _ => {
+                            }
+                        }
+                        if !same_move {
+                            eg_set_inst(f, id3, Inst::BitCast(prev, tty, tty));
+                            done = true;
+                        } else {
+                            done = true;
+                            rewrites = rewrites - 1;
+                        }
                     }
                 }
                 if !done && bnode.kind == EK_BIN && !is_const_now {
@@ -873,6 +1812,12 @@ fn eg_function(f: & mut IrFunction, module: & IrModule) -> i64 {
             }
         }
         oi = oi + 1;
+    }
+    // ME7: the pure values leave the skeleton and are elaborated from
+    // their classes (eg_skeleton); not in @constant_time code or code that
+    // holds a secret, where where work happens is part of the contract
+    if g_eg_skel && !f.is_constant_time && !f.has_secret {
+        g_eg_last_skel = eg_skeleton(f, & mut g, & cls, & own, & best, & cfg);
     }
     return rewrites;
 }
@@ -900,6 +1845,24 @@ fn eg_value(g: & mut EGraph, cls: & mut Vec<i64>, v: i64) -> i64 {
         cls.set(v, c);
     }
     return c;
+}
+
+/// ME7: the class of cast `op` of value v from type `from` to type `to`:
+/// -1 when either type is not one the e-graph knows or v is not of type
+/// `from`; v's own class for a bit cast to the same type; else a cast node.
+fn eg_cast_class(g: & mut EGraph, cls: & mut Vec<i64>, f: & IrFunction, op: i64, v: i64, from: IrType, to: IrType) -> i64 {
+    var fs: str = eg_num_ty(from);
+    var ts: str = eg_num_ty(to);
+    if fs == "" || ts == "" || eg_num_ty(eg_value_ty(f, v)) != fs {
+        return 0 - 1;
+    }
+    if op == EC_BITCAST && fs == ts && eg_rule(EGR_IDCAST) {
+        return eg_value(g, cls, v);
+    }
+    var cv: i64 = eg_value(g, cls, v);
+    return eg_add(g, ENode {
+        kind: EK_CAST, op: op, a: cv, b: eg_ty_code(fs), ty: ts
+    });
 }
 
 /// A value of class rc available at `at`: a parameter, or an instruction
@@ -1100,26 +2063,1323 @@ fn eg_forward(f: & mut IrFunction) -> i64 {
     return count;
 }
 
-/// The pass over every function: [loads forwarded, instructions rewritten].
+// --- Placement (ME8) ------------------------------------------------------
+//
+// Each pure value that can neither panic nor read memory is placed at the
+// latest block that dominates all its uses, then moved up the dominator
+// tree, as far as its operands allow, to the block of fewest loops around
+// it (Click's global code motion): loop-invariant values leave their loops
+// (LICM) and values only one branch needs move into it (sinking). A value
+// never moves into a loop that does not hold its block now, so nothing runs
+// more often than it did; a comparison a branch reads is not taken away
+// from its branch (backends join the two). On by default since Nov 17
+// (eg_place_on; it was opt-in, FID_IROPT_ON=egplace, which still names it
+// on): FID_NAT_OFF=egplace or FID_IROPT_OFF=egplace (or `--no-pass
+// egplace`) turns it off. Functions with asm! (whose outputs are operands
+// peir_inst_operands does not list) or TryUnwrap (a terminator that defines
+// a value) are left as they are.
+
+/// ME8: is placement on? On by default; off when FID_NAT_OFF or
+/// FID_IROPT_OFF names `egplace` (iro_named_off also reads --no-pass).
+fn eg_place_on() -> bool {
+    if !eg_on("egplace") {
+        return false;
+    }
+    return !iro_named_off(p_getenv("FID_IROPT_OFF"), "egplace");
+}
+
+/// Is the opt-in part `name` of this pass asked for? (FID_IROPT_ON names
+/// it or `all`, as iropt_me's ime_on.)
+fn eg_opt_in(name: str) -> bool {
+    var on: str = p_getenv("FID_IROPT_ON");
+    if (on as i64) == 0 || str_len(on) == 0 {
+        return false;
+    }
+    var list: str = "," + on + ",";
+    if !str_contains(list, "," + name + ",") && !str_contains(list, ",all,") {
+        return false;
+    }
+    return eg_on(name);
+}
+
+/// ME8: may instruction `inst` of `f` move to any block its operands
+/// dominate? Pure, reads no memory, cannot panic: bit operations and
+/// comparisons of integers and bools, integer arithmetic in @wrapping code,
+/// float arithmetic and comparisons, !, ~, a float's or @wrapping integer's
+/// negation, integer widening and narrowing, integer to float, and moves.
+/// 1: movable, 2: movable and a comparison, 0: stays.
+fn eg_place_kind(f: & IrFunction, inst: Inst) -> i64 {
+    match inst {
+        Inst::BinOp(op, a, b, _) => {
+            var code: i64 = eg_binop(op);
+            if code == 0 {
+                return 0;
+            }
+            var ta: str = eg_num_ty(eg_value_ty(f, a));
+            if ta == "" || eg_num_ty(eg_value_ty(f, b)) != ta {
+                return 0;
+            }
+            if ta == "f64" || ta == "f32" {
+                if eg_is_cmp(code) {
+                    return 2;
+                }
+                if code == EB_ADD || code == EB_SUB || code == EB_MUL || code == EB_DIV {
+                    return 1;
+                }
+                return 0;
+            }
+            if eg_is_cmp(code) {
+                return 2;
+            }
+            if code == EB_AND || code == EB_OR || code == EB_XOR {
+                return 1;
+            }
+            if f.is_wrapping && ta != "bool" && (code == EB_ADD || code == EB_SUB || code == EB_MUL) {
+                return 1;
+            }
+            return 0;
+        }
+        Inst::UnaryOp(uop, ua, ut) => {
+            var tu: str = eg_num_ty(ut);
+            if tu == "" || eg_num_ty(eg_value_ty(f, ua)) != tu {
+                return 0;
+            }
+            match uop {
+                UnaryOp::Neg => {
+                    if tu == "f64" || tu == "f32" || (f.is_wrapping && tu != "bool") {
+                        return 1;
+                    }
+                    return 0;
+                }
+                UnaryOp::Not => {
+                    if tu == "bool" {
+                        return 1;
+                    }
+                    return 0;
+                }
+                UnaryOp::BitNot => {
+                    if tu != "bool" && tu != "f64" && tu != "f32" {
+                        return 1;
+                    }
+                    return 0;
+                }
+            }
+            return 0;
+        }
+        Inst::IntExtend(v, from, to) => {
+            if eg_int_ty(from) != "" && eg_int_ty(to) != "" && eg_int_ty(eg_value_ty(f, v)) == eg_int_ty(from) {
+                return 1;
+            }
+            return 0;
+        }
+        Inst::IntTrunc(v2, from2, to2) => {
+            if eg_int_ty(from2) != "" && eg_int_ty(to2) != "" && eg_int_ty(eg_value_ty(f, v2)) == eg_int_ty(from2) {
+                return 1;
+            }
+            return 0;
+        }
+        Inst::IntToFloat(v3, from3, to3) => {
+            if eg_int_ty(from3) != "" && eg_float_ty(to3) != "" && eg_int_ty(eg_value_ty(f, v3)) == eg_int_ty(from3) {
+                return 1;
+            }
+            return 0;
+        }
+        Inst::BitCast(v4, from4, to4) => {
+            var t4: str = eg_num_ty(to4);
+            if t4 != "" && eg_num_ty(from4) == t4 && eg_num_ty(eg_value_ty(f, v4)) == t4 {
+                return 1;
+            }
+            return 0;
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+/// The nearest common dominator of blocks a and b (block indexes).
+fn eg_dom_lca(cfg: & IroCfg, a0: i64, b: i64) -> i64 {
+    var a: i64 = a0;
+    var hops: i64 = 0;
+    while !iro_dominates(cfg, a, b) && hops <= cfg.n {
+        var up: i64 = cfg.idom.get(a);
+        if up < 0 || up == a {
+            return 0 - 1;
+        }
+        a = up;
+        hops = hops + 1;
+    }
+    if !iro_dominates(cfg, a, b) {
+        return 0 - 1;
+    }
+    return a;
+}
+
+/// Is block `b` a place a value of block `home` may go without running
+/// more often: outside every loop, or in a loop that holds `home` too?
+fn eg_place_ok(lt: & IroLoops, b: i64, home: i64) -> bool {
+    if b < 0 || b >= lt.head_of.len() {
+        return false;
+    }
+    var h: i64 = lt.head_of.get(b);
+    if h < 0 {
+        return true;
+    }
+    var body: Vec<i64> = iro_loop_body(lt, h);
+    return home >= 0 && home < body.len() && body.get(home) != 0;
+}
+
+/// ME8: place every movable value of `f` (eg_place_kind): how many moved.
+fn eg_place(f: & mut IrFunction) -> i64 {
+    if f.blocks.len() < 2 {
+        return 0;
+    }
+    var cfg: IroCfg = iro_cfg(f);
+    var lt: IroLoops = iro_loops(& cfg);
+    var n: i64 = f.next_value;
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        if f.insts.get(i).id >= n {
+            n = f.insts.get(i).id + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < f.params.len() {
+        if f.params.get(i).id >= n {
+            n = f.params.get(i).id + 1;
+        }
+        i = i + 1;
+    }
+    var blk: Vec<i64> = peir_zeros(n);
+    i = 0;
+    while i < n {
+        blk.set(i, 0 - 1);
+        i = i + 1;
+    }
+    // Every instruction of a reachable block, in dominance order, and the
+    // instructions reading each value
+    var order: Vec<i64> = Vec::new();
+    var users: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < n {
+        var e: Vec<i64> = Vec::new();
+        users.push(e);
+        i = i + 1;
+    }
+    var unreach_use: Vec<i64> = peir_zeros(n);
+    var by_branch: Vec<i64> = peir_zeros(n);
+    var unhandled: bool = false;
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var reachable: bool = bi < cfg.tin.len() && cfg.tin.get(bi) >= 0;
+        var ids: Vec<i64> = f.blocks.get(bi).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            if id >= 0 && id < n {
+                blk.set(id, bi);
+                var inst: Inst = peir_inst_of(f, id);
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(inst, & mut ops);
+                var is_branch: bool = false;
+                match inst {
+                    Inst::Branch(_, _, _) => {
+                        is_branch = true;
+                    }
+                    Inst::Asm(_, _, _, _) => {
+                        // its outputs are operands this walk does not see
+                        unhandled = true;
+                    }
+                    Inst::TryUnwrap(_, _, _, _) => {
+                        // a terminator that defines a value: "before the
+                        // terminator" would be before an operand
+                        unhandled = true;
+                    }
+                    _ => {
+                    }
+                }
+                var o: i64 = 0;
+                while o < ops.len() {
+                    var v: i64 = ops.get(o);
+                    if v >= 0 && v < n {
+                        var ul: Vec<i64> = users.get(v);
+                        ul.push(id);
+                        users.set(v, ul);
+                        if !reachable {
+                            unreach_use.set(v, 1);
+                        }
+                        if is_branch {
+                            by_branch.set(v, 1);
+                        }
+                    }
+                    o = o + 1;
+                }
+            }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    if unhandled {
+        g_eg_st_pl_skipped = g_eg_st_pl_skipped + 1;
+        return 0;
+    }
+    var ri: i64 = 0;
+    while ri < cfg.rpo.len() {
+        var rb: i64 = cfg.rpo.get(ri);
+        var rids: Vec<i64> = f.blocks.get(rb).instructions;
+        var rk: i64 = 0;
+        while rk < rids.len() {
+            order.push(rids.get(rk));
+            rk = rk + 1;
+        }
+        ri = ri + 1;
+    }
+    var entry_b: i64 = 0;
+    if cfg.rpo.len() > 0 {
+        entry_b = cfg.rpo.get(0);
+    }
+    // Last value first: a value's users are placed before it is
+    var moved: i64 = 0;
+    var oi: i64 = order.len() - 1;
+    while oi >= 0 {
+        var id2: i64 = order.get(oi);
+        oi = oi - 1;
+        if id2 < 0 || id2 >= n || unreach_use.get(id2) != 0 {
+            continue;
+        }
+        var ulist: Vec<i64> = users.get(id2);
+        if ulist.len() == 0 {
+            continue;
+        }
+        var inst2: Inst = peir_inst_of(f, id2);
+        var kind: i64 = eg_place_kind(f, inst2);
+        if kind == 0 {
+            continue;
+        }
+        var home: i64 = blk.get(id2);
+        if home < 0 {
+            continue;
+        }
+        // late: the nearest block dominating every use
+        var late: i64 = 0 - 1;
+        var ui: i64 = 0;
+        while ui < ulist.len() {
+            var ub: i64 = blk.get(ulist.get(ui));
+            if ub < 0 {
+                late = 0 - 2;
+                ui = ulist.len();
+            } else if late == 0 - 1 {
+                late = ub;
+            } else {
+                late = eg_dom_lca(& cfg, late, ub);
+                if late < 0 {
+                    late = 0 - 2;
+                    ui = ulist.len();
+                }
+            }
+            ui = ui + 1;
+        }
+        if late < 0 || !iro_dominates(& cfg, home, late) {
+            continue;
+        }
+        // early: the deepest block of its operands (they all dominate home)
+        var early: i64 = entry_b;
+        var ops2: Vec<i64> = Vec::new();
+        peir_inst_operands(inst2, & mut ops2);
+        var oj: i64 = 0;
+        while oj < ops2.len() {
+            var ov: i64 = ops2.get(oj);
+            if ov >= 0 && ov < n && blk.get(ov) >= 0 {
+                var obk: i64 = blk.get(ov);
+                if iro_dominates(& cfg, early, obk) {
+                    early = obk;
+                }
+            }
+            oj = oj + 1;
+        }
+        if !iro_dominates(& cfg, early, home) {
+            continue;
+        }
+        // From late up to early: the allowed block in the fewest loops,
+        // the latest one among equals. A comparison a branch reads stays
+        // at or below its block (late or home).
+        var best: i64 = home;
+        var cur: i64 = late;
+        var steps: i64 = 0;
+        var found: bool = false;
+        while steps <= cfg.n {
+            var allowed: bool = eg_place_ok(& lt, cur, home);
+            if kind == 2 && by_branch.get(id2) != 0 && cur != late && cur != home {
+                allowed = false;
+            }
+            if allowed {
+                if !found || lt.depth.get(cur) < lt.depth.get(best) {
+                    best = cur;
+                    found = true;
+                }
+            }
+            if cur == early {
+                steps = cfg.n + 1;
+            } else {
+                var up2: i64 = cfg.idom.get(cur);
+                if up2 < 0 || up2 == cur {
+                    steps = cfg.n + 1;
+                } else {
+                    cur = up2;
+                }
+            }
+            steps = steps + 1;
+        }
+        if !found || best == home {
+            continue;
+        }
+        // Move: out of home; into best before its first user there, else
+        // before its terminator
+        var hb: BasicBlock = f.blocks.get(home);
+        hb.instructions = eg_vec_without(hb.instructions, id2);
+        f.blocks.set(home, hb);
+        mec_log_block(home);
+        var tb: BasicBlock = f.blocks.get(best);
+        var at: i64 = tb.instructions.len() - 1;
+        if at < 0 {
+            at = 0;
+        }
+        var ti: i64 = 0;
+        while ti < tb.instructions.len() {
+            var tid: i64 = tb.instructions.get(ti);
+            var tu: i64 = 0;
+            var uses_it: bool = false;
+            while tu < ulist.len() {
+                if ulist.get(tu) == tid {
+                    uses_it = true;
+                }
+                tu = tu + 1;
+            }
+            if uses_it {
+                at = ti;
+                ti = tb.instructions.len();
+            }
+            ti = ti + 1;
+        }
+        var nl: Vec<i64> = Vec::new();
+        var tk: i64 = 0;
+        while tk < tb.instructions.len() {
+            if tk == at {
+                nl.push(id2);
+            }
+            nl.push(tb.instructions.get(tk));
+            tk = tk + 1;
+        }
+        if tb.instructions.len() == 0 {
+            nl.push(id2);
+        }
+        tb.instructions = nl;
+        f.blocks.set(best, tb);
+        mec_log_block(best);
+        blk.set(id2, best);
+        moved = moved + 1;
+        if lt.depth.get(best) < lt.depth.get(home) {
+            g_eg_st_pl_hoisted = g_eg_st_pl_hoisted + 1;
+        }
+        if iro_dominates(& cfg, home, best) {
+            g_eg_st_pl_sunk = g_eg_st_pl_sunk + 1;
+        }
+    }
+    if moved > 0 {
+        g_eg_st_pl_fns = g_eg_st_pl_fns + 1;
+        g_eg_st_pl_moved = g_eg_st_pl_moved + moved;
+    }
+    return moved;
+}
+
+// --- ME7: the side-effect skeleton (Cranelift's aegraph) -------------------
+//
+// Opt-in: FID_IROPT_ON=egskel (or `all`); FID_NAT_OFF=egskel turns it off
+// again. After extraction (eg_function), a function's instructions are
+// split in two. The skeleton is everything with an effect or a possible
+// panic (stores, calls, loads, checked arithmetic, division, shifts outside
+// @wrapping code, float-to-int), the constants, the terminators, and any
+// pure value pinned to it: one an unreachable block or an instruction this
+// pass cannot rename (ssa_remap) reads, or one the function's name tables
+// (locals, persist, drops, @zeroize) name. The skeleton keeps the IR's
+// order exactly. The pure values (eg_place_kind: they read no memory and
+// cannot panic) leave their blocks. Walking the skeleton in dominance order
+// (reverse postorder), each operand that was a pure value is elaborated
+// from its e-class:
+//  - an equal value already available there (one whose block dominates
+//    the use, or earlier in its block): GVN across blocks, equal forms
+//    (a + b, b + a) included;
+//  - else the class's cheapest node whose operands can be elaborated (then
+//    its other nodes), made in the block with the fewest loops on the
+//    dominator path between its operands and the use, the latest one among
+//    equals (LICM falls out); a comparison a branch reads is made right
+//    before that branch. Only nodes that cannot panic are made (eg_sk_safe);
+//    a constant only within its type.
+// A pure value no skeleton instruction needs is not made again: dead pure
+// code goes. The first copy of a class with its type reuses an original
+// instruction's id; copies in blocks the first does not dominate are new
+// instructions. If anything cannot be elaborated, the function is put back
+// as it was before the skeleton (the e-graph's in-place rewrites stay).
+
+pub struct EgSk {
+    // value id -> block index (-2: a parameter, -1: not placed)
+    pub blk: Vec<i64>,
+    // value id -> 1: a pure value taken out of the skeleton
+    pub floating: Vec<i64>,
+    // value id -> 1: defined at blk[id] before the walk's current point
+    pub seen: Vec<i64>,
+    // value id -> 1: an original pure value placed again
+    pub placed: Vec<i64>,
+    // class -> the values of it placed or visited so far
+    pub avail: Vec<Vec<i64>>,
+    // class -> its nodes
+    pub nodes_of: Vec<Vec<i64>>,
+    // class -> its original pure values (in the skeleton walk's order)
+    pub orig: Vec<Vec<i64>>,
+    // class -> 1 while it is being elaborated (a class reached again
+    // through its own nodes is not made from them)
+    pub busy: Vec<i64>,
+    // class -> its cheapest node (extraction)
+    pub best: Vec<i64>,
+    pub entry: i64,
+    pub work: i64,
+    pub ok: bool,
+    pub reused: i64,
+    pub fresh: i64,
+}
+
+const EG_SK_MAX_WORK: i64 = 4000000;
+
+/// ME7: the IR type of an e-graph type name (Void for "" and others).
+fn eg_ir_ty(ts: str) -> IrType {
+    if ts == "i8" {
+        return IrType::I8;
+    }
+    if ts == "u8" {
+        return IrType::U8;
+    }
+    if ts == "i16" {
+        return IrType::I16;
+    }
+    if ts == "u16" {
+        return IrType::U16;
+    }
+    if ts == "i32" {
+        return IrType::I32;
+    }
+    if ts == "u32" {
+        return IrType::U32;
+    }
+    if ts == "i64" {
+        return IrType::I64;
+    }
+    if ts == "u64" {
+        return IrType::U64;
+    }
+    if ts == "bool" {
+        return IrType::Bool;
+    }
+    if ts == "f32" {
+        return IrType::F32;
+    }
+    if ts == "f64" {
+        return IrType::F64;
+    }
+    return IrType::Void;
+}
+
+/// ME7: the type of the value node n computes.
+fn eg_sk_node_ty(n: ENode) -> IrType {
+    if n.kind == EK_NOT {
+        return IrType::Bool;
+    }
+    if n.kind == EK_BIN || n.kind == EK_FBIN {
+        if eg_is_cmp(n.op) {
+            return IrType::Bool;
+        }
+        return eg_ir_ty(n.ty);
+    }
+    if n.kind == EK_CONST || n.kind == EK_FCONST || n.kind == EK_NEG || n.kind == EK_BNOT || n.kind == EK_FNEG || n.kind == EK_CAST {
+        return eg_ir_ty(n.ty);
+    }
+    return IrType::Void;
+}
+
+/// ME7: the type node n's operands must have.
+fn eg_sk_operand_ty(n: ENode) -> IrType {
+    if n.kind == EK_NOT {
+        return IrType::Bool;
+    }
+    if n.kind == EK_CAST {
+        return eg_ir_ty(eg_code_ty(n.b));
+    }
+    if n.kind == EK_BIN || n.kind == EK_FBIN || n.kind == EK_NEG || n.kind == EK_BNOT || n.kind == EK_FNEG {
+        return eg_ir_ty(n.ty);
+    }
+    return IrType::Void;
+}
+
+/// ME7: may node n be made anywhere its operands are? It reads no memory
+/// and cannot panic: the eg_place_kind instructions, a constant within its
+/// type, and in @wrapping code a shift by a constant below the width.
+fn eg_sk_safe(g: & mut EGraph, n: ENode) -> bool {
+    var is_float: bool = n.ty == "f32" || n.ty == "f64";
+    if n.kind == EK_CONST {
+        return eg_ty_code(n.ty) != 0 && !is_float && eg_in_range(n.a, n.ty);
+    }
+    if n.kind == EK_FCONST {
+        return is_float;
+    }
+    if n.kind == EK_BIN {
+        if eg_ty_code(n.ty) == 0 || is_float {
+            return false;
+        }
+        if eg_is_cmp(n.op) || n.op == EB_AND || n.op == EB_OR || n.op == EB_XOR {
+            return true;
+        }
+        if !g.wrapping || n.ty == "bool" {
+            return false;
+        }
+        if n.op == EB_ADD || n.op == EB_SUB || n.op == EB_MUL {
+            return true;
+        }
+        if n.op == EB_SHL || n.op == EB_SHR {
+            var kb: Vec<i64> = eg_class_const(g, n.b);
+            return kb.get(0) == 1 && kb.get(1) >= 0 && kb.get(1) < eg_bits(n.ty);
+        }
+        return false;
+    }
+    if n.kind == EK_FBIN {
+        return is_float && (n.op == EB_ADD || n.op == EB_SUB || n.op == EB_MUL || n.op == EB_DIV || eg_is_cmp(n.op));
+    }
+    if n.kind == EK_NOT {
+        return n.ty == "bool";
+    }
+    if n.kind == EK_BNOT {
+        return eg_ty_code(n.ty) != 0 && !is_float && n.ty != "bool";
+    }
+    if n.kind == EK_NEG {
+        return g.wrapping && eg_ty_code(n.ty) != 0 && !is_float && n.ty != "bool";
+    }
+    if n.kind == EK_FNEG {
+        return is_float;
+    }
+    if n.kind == EK_CAST {
+        var from: str = eg_code_ty(n.b);
+        var fint: bool = from != "" && from != "f32" && from != "f64";
+        var tint: bool = eg_ty_code(n.ty) != 0 && !is_float;
+        if n.op == EC_EXT || n.op == EC_TRUNC {
+            return fint && tint;
+        }
+        if n.op == EC_I2F {
+            return fint && is_float;
+        }
+        if n.op == EC_BITCAST {
+            return from != "" && from == n.ty;
+        }
+        return false;
+    }
+    return false;
+}
+
+/// ME7: the instruction of node n over operand values va, vb.
+fn eg_sk_inst(n: ENode, va: i64, vb: i64) -> Inst {
+    if n.kind == EK_CONST {
+        if n.ty == "bool" {
+            return Inst::ConstBool(n.a != 0);
+        }
+        return Inst::ConstInt(n.a, eg_ir_ty(n.ty));
+    }
+    if n.kind == EK_FCONST {
+        return Inst::ConstFloat(p_f64_from_bits(n.a), eg_ir_ty(n.ty));
+    }
+    if n.kind == EK_BIN || n.kind == EK_FBIN {
+        return Inst::BinOp(eg_to_binop(n.op), va, vb, eg_sk_node_ty(n));
+    }
+    if n.kind == EK_NEG || n.kind == EK_FNEG {
+        return Inst::UnaryOp(UnaryOp::Neg, va, eg_ir_ty(n.ty));
+    }
+    if n.kind == EK_NOT {
+        return Inst::UnaryOp(UnaryOp::Not, va, IrType::Bool);
+    }
+    if n.kind == EK_BNOT {
+        return Inst::UnaryOp(UnaryOp::BitNot, va, eg_ir_ty(n.ty));
+    }
+    if n.kind == EK_CAST {
+        var from: IrType = eg_ir_ty(eg_code_ty(n.b));
+        var to: IrType = eg_ir_ty(n.ty);
+        if n.op == EC_EXT {
+            return Inst::IntExtend(va, from, to);
+        }
+        if n.op == EC_TRUNC {
+            return Inst::IntTrunc(va, from, to);
+        }
+        if n.op == EC_I2F {
+            return Inst::IntToFloat(va, from, to);
+        }
+        return Inst::BitCast(va, from, to);
+    }
+    return Inst::Unreachable;
+}
+
+fn eg_sk_grow(s: & mut EgSk, id: i64) {
+    while s.blk.len() <= id {
+        s.blk.push(0 - 1);
+        s.floating.push(0);
+        s.seen.push(0);
+        s.placed.push(0);
+    }
+}
+
+fn eg_sk_new(nv: i64, nc: i64, best: & Vec<i64>) -> EgSk {
+    var s: EgSk = EgSk {
+        blk: Vec::new(), floating: Vec::new(), seen: Vec::new(), placed: Vec::new(), avail: Vec::new(), nodes_of: Vec::new(), orig: Vec::new(), busy: Vec::new(), best: Vec::new(), entry: 0, work: 0, ok: true, reused: 0, fresh: 0
+    };
+    if nv > 0 {
+        eg_sk_grow(& mut s, nv - 1);
+    }
+    var i: i64 = 0;
+    while i < nc {
+        var e1: Vec<i64> = Vec::new();
+        s.avail.push(e1);
+        var e2: Vec<i64> = Vec::new();
+        s.nodes_of.push(e2);
+        var e3: Vec<i64> = Vec::new();
+        s.orig.push(e3);
+        s.busy.push(0);
+        var bn: i64 = 0 - 1;
+        if i < best.len() {
+            bn = best.get(i);
+        }
+        s.best.push(bn);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// ME7: is value v available at the walk's current point in block u?
+fn eg_sk_avail(s: & EgSk, cfg: & IroCfg, v: i64, u: i64) -> bool {
+    if v < 0 || v >= s.blk.len() {
+        return false;
+    }
+    var b: i64 = s.blk.get(v);
+    if b == 0 - 2 {
+        return true;
+    }
+    if b < 0 || s.seen.get(v) == 0 {
+        return false;
+    }
+    return b == u || iro_dominates(cfg, b, u);
+}
+
+/// ME7: where a value made for a use in block u goes: on the dominator
+/// path from u up to `early` (the block of its deepest operand), the block
+/// in the fewest loops, the latest one among equals.
+fn eg_sk_block(cfg: & IroCfg, lt: & IroLoops, early: i64, u: i64) -> i64 {
+    if u < 0 || u >= lt.depth.len() {
+        return u;
+    }
+    var best: i64 = u;
+    var cur: i64 = u;
+    var steps: i64 = 0;
+    while steps <= cfg.n {
+        if cur >= 0 && cur < lt.depth.len() && iro_dominates(cfg, early, cur) && lt.depth.get(cur) < lt.depth.get(best) {
+            best = cur;
+        }
+        if cur == early {
+            steps = cfg.n + 1;
+        } else {
+            var up: i64 = 0 - 1;
+            if cur >= 0 && cur < cfg.idom.len() {
+                up = cfg.idom.get(cur);
+            }
+            if up < 0 || up == cur {
+                steps = cfg.n + 1;
+            } else {
+                cur = up;
+            }
+        }
+        steps = steps + 1;
+    }
+    return best;
+}
+
+/// ME7: put value `id` into block b, before its terminator.
+fn eg_sk_insert(f: & mut IrFunction, b: i64, id: i64) {
+    var bb: BasicBlock = f.blocks.get(b);
+    var l: Vec<i64> = bb.instructions;
+    var at: i64 = l.len();
+    if l.len() > 0 && inst_is_terminator(peir_inst_of(f, l.get(l.len() - 1))) {
+        at = l.len() - 1;
+    }
+    var nl: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < l.len() {
+        if k == at {
+            nl.push(id);
+        }
+        nl.push(l.get(k));
+        k = k + 1;
+    }
+    if at == l.len() {
+        nl.push(id);
+    }
+    bb.instructions = nl;
+    f.blocks.set(b, bb);
+    mec_log_block(b);
+}
+
+/// ME7: a new instruction of `f` in no block yet (its type from `inst`).
+fn eg_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+    var keep: i64 = f.current_block_idx;
+    if keep < 0 || keep >= f.blocks.len() {
+        f.current_block_idx = 0;
+    }
+    var id: i64 = IrFunction_emit(f, inst);
+    var bi: i64 = f.current_block_idx;
+    var blk: BasicBlock = f.blocks.get(bi);
+    blk.instructions.pop();
+    f.blocks.set(bi, blk);
+    f.current_block_idx = keep;
+    return id;
+}
+
+/// ME7: a value of class c available for a use in block u (the walk's
+/// current point), elaborated if there is none: its id, or -1. A value
+/// made in u goes to `cur`, the part of u's new list before the use.
+fn eg_sk_elab(f: & mut IrFunction, g: & mut EGraph, s: & mut EgSk, cfg: & IroCfg, lt: & IroLoops, c: i64, u: i64, for_branch: bool, cur: & mut Vec<i64>) -> i64 {
+    s.work = s.work + 1;
+    if s.work > EG_SK_MAX_WORK || !s.ok {
+        s.ok = false;
+        return 0 - 1;
+    }
+    if c < 0 {
+        return 0 - 1;
+    }
+    var rc: i64 = eg_find(g, c);
+    if rc < 0 || rc >= s.avail.len() {
+        return 0 - 1;
+    }
+    // an equal value available here: the latest one first
+    var al: Vec<i64> = s.avail.get(rc);
+    var k: i64 = al.len() - 1;
+    while k >= 0 {
+        var v: i64 = al.get(k);
+        s.work = s.work + 1;
+        if eg_sk_avail(s, cfg, v, u) {
+            return v;
+        }
+        k = k - 1;
+    }
+    if s.busy.get(rc) != 0 {
+        return 0 - 1;
+    }
+    s.busy.set(rc, 1);
+    var r: i64 = 0 - 1;
+    var bn: i64 = s.best.get(rc);
+    if bn >= 0 {
+        r = eg_sk_make(f, g, s, cfg, lt, rc, bn, u, for_branch, cur);
+    }
+    var nl: Vec<i64> = s.nodes_of.get(rc);
+    var j: i64 = 0;
+    while r < 0 && j < nl.len() && s.ok {
+        var nd: i64 = nl.get(j);
+        if nd != bn {
+            r = eg_sk_make(f, g, s, cfg, lt, rc, nd, u, for_branch, cur);
+        }
+        j = j + 1;
+    }
+    s.busy.set(rc, 0);
+    return r;
+}
+
+/// ME7: make node nd of class rc for a use in block u: its value, or -1
+/// when it cannot be made there (a leaf not available, a node that may
+/// panic, an operand that cannot be elaborated, a type that differs).
+fn eg_sk_make(f: & mut IrFunction, g: & mut EGraph, s: & mut EgSk, cfg: & IroCfg, lt: & IroLoops, rc: i64, nd: i64, u: i64, for_branch: bool, cur: & mut Vec<i64>) -> i64 {
+    var n: ENode = g.nodes.get(nd);
+    if n.kind == EK_LEAF {
+        var lv: i64 = n.a;
+        if lv >= 0 && lv < s.floating.len() && s.floating.get(lv) == 0 && eg_sk_avail(s, cfg, lv, u) {
+            return lv;
+        }
+        return 0 - 1;
+    }
+    if !eg_sk_safe(g, n) {
+        return 0 - 1;
+    }
+    var rt: IrType = eg_sk_node_ty(n);
+    if ir_type_eq(rt, IrType::Void) {
+        return 0 - 1;
+    }
+    var ol: Vec<i64> = s.orig.get(rc);
+    if ol.len() > 0 && !ir_type_eq(eg_meta_ty(f, ol.get(0)), rt) {
+        return 0 - 1;
+    }
+    var unary: bool = n.kind == EK_NEG || n.kind == EK_NOT || n.kind == EK_BNOT || n.kind == EK_FNEG || n.kind == EK_CAST;
+    var binary: bool = n.kind == EK_BIN || n.kind == EK_FBIN;
+    var want: IrType = eg_sk_operand_ty(n);
+    var va: i64 = 0 - 1;
+    var vb: i64 = 0 - 1;
+    if unary || binary {
+        va = eg_sk_elab(f, g, s, cfg, lt, n.a, u, false, cur);
+        if va < 0 || !ir_type_eq(eg_value_ty(f, va), want) {
+            return 0 - 1;
+        }
+    }
+    if binary {
+        vb = eg_sk_elab(f, g, s, cfg, lt, n.b, u, false, cur);
+        if vb < 0 || !ir_type_eq(eg_value_ty(f, vb), want) {
+            return 0 - 1;
+        }
+    }
+    var inst: Inst = eg_sk_inst(n, va, vb);
+    // Where: between its deepest operand and the use, in the fewest loops
+    var early: i64 = s.entry;
+    if va >= 0 && s.blk.get(va) >= 0 && iro_dominates(cfg, early, s.blk.get(va)) {
+        early = s.blk.get(va);
+    }
+    if vb >= 0 && s.blk.get(vb) >= 0 && iro_dominates(cfg, early, s.blk.get(vb)) {
+        early = s.blk.get(vb);
+    }
+    var b: i64 = u;
+    if !(for_branch && binary && eg_is_cmp(n.op)) {
+        b = eg_sk_block(cfg, lt, early, u);
+    }
+    // Which id: an original value of the class not placed yet, else new
+    var id: i64 = 0 - 1;
+    var k: i64 = 0;
+    while k < ol.len() && id < 0 {
+        if s.placed.get(ol.get(k)) == 0 {
+            id = ol.get(k);
+        }
+        k = k + 1;
+    }
+    if id >= 0 {
+        eg_set_inst(f, id, inst);
+        s.placed.set(id, 1);
+        s.reused = s.reused + 1;
+    } else {
+        id = eg_detached(f, inst);
+        eg_sk_grow(s, id);
+        s.fresh = s.fresh + 1;
+    }
+    s.blk.set(id, b);
+    s.seen.set(id, 1);
+    var avl: Vec<i64> = s.avail.get(rc);
+    avl.push(id);
+    s.avail.set(rc, avl);
+    if b == u {
+        cur.push(id);
+    } else {
+        eg_sk_insert(f, b, id);
+    }
+    return id;
+}
+
+fn eg_sk_pin(pinned: & mut Vec<i64>, v: i64) {
+    if v >= 0 && v < pinned.len() {
+        pinned.set(v, 1);
+    }
+}
+
+/// ME7: the side-effect skeleton of `f` (see above), after extraction:
+/// `cls` value id -> class, `own` value id -> 1 when the class came from
+/// its own instruction, `best` class -> cheapest node. How many pure values
+/// left the skeleton (0: nothing changed, also when it was put back).
+fn eg_skeleton(f: & mut IrFunction, g: & mut EGraph, cls: & Vec<i64>, own: & Vec<i64>, best: & Vec<i64>, cfg: & IroCfg) -> i64 {
+    if f.blocks.len() == 0 || cfg.rpo.len() == 0 {
+        return 0;
+    }
+    var nv: i64 = cls.len();
+    var lt: IroLoops = iro_loops(cfg);
+    // Pure values pinned to the skeleton: read in an unreachable block or
+    // by an instruction ssa_remap cannot rename (checked by renaming every
+    // operand to `nv` and counting), or named by the name tables
+    var pinned: Vec<i64> = peir_zeros(nv);
+    var tm: Vec<i64> = peir_zeros(nv);
+    var bi: i64 = 0;
+    while bi < f.blocks.len() {
+        var reachable: bool = bi < cfg.tin.len() && cfg.tin.get(bi) >= 0;
+        var ids: Vec<i64> = f.blocks.get(bi).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var inst: Inst = peir_inst_of(f, ids.get(k));
+            var ops: Vec<i64> = Vec::new();
+            peir_inst_operands(inst, & mut ops);
+            if ops.len() > 0 {
+                var pin_all: bool = !reachable;
+                if !pin_all {
+                    var inr: i64 = 0;
+                    var o: i64 = 0;
+                    while o < ops.len() {
+                        var v: i64 = ops.get(o);
+                        if v >= 0 && v < nv {
+                            tm.set(v, nv + 1);
+                            inr = inr + 1;
+                        }
+                        o = o + 1;
+                    }
+                    var ops2: Vec<i64> = Vec::new();
+                    peir_inst_operands(ssa_remap(inst, & tm), & mut ops2);
+                    var got: i64 = 0;
+                    o = 0;
+                    while o < ops2.len() {
+                        if ops2.get(o) == nv {
+                            got = got + 1;
+                        }
+                        o = o + 1;
+                    }
+                    o = 0;
+                    while o < ops.len() {
+                        var v2: i64 = ops.get(o);
+                        if v2 >= 0 && v2 < nv {
+                            tm.set(v2, 0);
+                        }
+                        o = o + 1;
+                    }
+                    pin_all = got != inr;
+                }
+                if pin_all {
+                    var p: i64 = 0;
+                    while p < ops.len() {
+                        eg_sk_pin(& mut pinned, ops.get(p));
+                        p = p + 1;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    var li: i64 = 0;
+    while li < f.locals.len() {
+        eg_sk_pin(& mut pinned, f.locals.get(li).id);
+        li = li + 1;
+    }
+    li = 0;
+    while li < f.persist_vars.len() {
+        eg_sk_pin(& mut pinned, f.persist_vars.get(li).id);
+        li = li + 1;
+    }
+    li = 0;
+    while li < f.drop_locals.len() {
+        eg_sk_pin(& mut pinned, f.drop_locals.get(li).id);
+        li = li + 1;
+    }
+    li = 0;
+    while li < f.zeroize_locals.len() {
+        eg_sk_pin(& mut pinned, f.zeroize_locals.get(li).id);
+        li = li + 1;
+    }
+    // Classes, blocks, and the pure values that leave the skeleton
+    var s: EgSk = eg_sk_new(nv, g.parent.len(), best);
+    s.entry = cfg.rpo.get(0);
+    var ni: i64 = 0;
+    while ni < g.nodes.len() {
+        var nrc: i64 = eg_find(g, g.node_class.get(ni));
+        if nrc >= 0 && nrc < s.nodes_of.len() {
+            var nl: Vec<i64> = s.nodes_of.get(nrc);
+            nl.push(ni);
+            s.nodes_of.set(nrc, nl);
+        }
+        ni = ni + 1;
+    }
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        var pv: i64 = f.params.get(pi).id;
+        if pv >= 0 && pv < nv {
+            s.blk.set(pv, 0 - 2);
+            s.seen.set(pv, 1);
+        }
+        pi = pi + 1;
+    }
+    var nfloat: i64 = 0;
+    var ri: i64 = 0;
+    while ri < cfg.rpo.len() {
+        var rb: i64 = cfg.rpo.get(ri);
+        var rids: Vec<i64> = f.blocks.get(rb).instructions;
+        var rk: i64 = 0;
+        while rk < rids.len() {
+            var id: i64 = rids.get(rk);
+            if id >= 0 && id < nv && s.blk.get(id) != 0 - 2 {
+                s.blk.set(id, rb);
+                if own.get(id) == 1 && pinned.get(id) == 0 && cls.get(id) >= 0 && eg_place_kind(f, peir_inst_of(f, id)) != 0 {
+                    var frc: i64 = eg_find(g, cls.get(id));
+                    if frc >= 0 && frc < s.orig.len() {
+                        s.floating.set(id, 1);
+                        s.blk.set(id, 0 - 1);
+                        var fl: Vec<i64> = s.orig.get(frc);
+                        fl.push(id);
+                        s.orig.set(frc, fl);
+                        nfloat = nfloat + 1;
+                    }
+                }
+            }
+            rk = rk + 1;
+        }
+        ri = ri + 1;
+    }
+    if nfloat == 0 {
+        return 0;
+    }
+    // What is put back if anything cannot be elaborated
+    var sv_blocks: Vec<BasicBlock> = f.blocks;
+    var sv_insts: Vec<ValueIdInst> = f.insts;
+    var sv_at: Vec<i64> = f.inst_at;
+    var sv_metas: Vec<ValueIdMeta> = f.value_metas;
+    var sv_next: i64 = f.next_value;
+    // New values take ids after every one there is, each with its meta
+    var top: i64 = f.next_value;
+    if nv > top {
+        top = nv;
+    }
+    if f.value_metas.len() > top {
+        top = f.value_metas.len();
+    }
+    while f.value_metas.len() < top {
+        f.value_metas.push(ValueIdMeta_new(f.value_metas.len(), ValueMeta_new(IrType::Void)));
+    }
+    f.next_value = top;
+    // The walk: the skeleton in dominance order; each operand that was a
+    // pure value is elaborated where it is read
+    ri = 0;
+    while ri < cfg.rpo.len() && s.ok {
+        var u: i64 = cfg.rpo.get(ri);
+        var uids: Vec<i64> = f.blocks.get(u).instructions;
+        var cur: Vec<i64> = Vec::new();
+        var uk: i64 = 0;
+        while uk < uids.len() && s.ok {
+            var sid: i64 = uids.get(uk);
+            uk = uk + 1;
+            if sid >= 0 && sid < nv && s.floating.get(sid) == 1 {
+                continue;
+            }
+            var sinst: Inst = peir_inst_of(f, sid);
+            var sops: Vec<i64> = Vec::new();
+            peir_inst_operands(sinst, & mut sops);
+            var is_br: bool = false;
+            match sinst {
+                Inst::Branch(_, _, _) => {
+                    is_br = true;
+                }
+                _ => {
+                }
+            }
+            var mapped: Vec<i64> = Vec::new();
+            var so: i64 = 0;
+            while so < sops.len() && s.ok {
+                var ov: i64 = sops.get(so);
+                if ov >= 0 && ov < nv && s.floating.get(ov) == 1 && tm.get(ov) == 0 {
+                    var e: i64 = eg_sk_elab(f, g, & mut s, cfg, & lt, cls.get(ov), u, is_br, & mut cur);
+                    // the value read in its place must have its type (an
+                    // equal value of a class is reused without a check)
+                    if e >= 0 && e != ov && !ir_type_eq(eg_value_ty(f, e), eg_value_ty(f, ov)) {
+                        e = 0 - 1;
+                    }
+                    if e < 0 {
+                        s.ok = false;
+                    } else if e != ov {
+                        tm.set(ov, e + 1);
+                        mapped.push(ov);
+                    }
+                }
+                so = so + 1;
+            }
+            if mapped.len() > 0 {
+                eg_set_inst(f, sid, ssa_remap(sinst, & tm));
+                var mi: i64 = 0;
+                while mi < mapped.len() {
+                    tm.set(mapped.get(mi), 0);
+                    mi = mi + 1;
+                }
+            }
+            cur.push(sid);
+            if sid >= 0 && sid < nv {
+                s.seen.set(sid, 1);
+                if cls.get(sid) >= 0 {
+                    var src: i64 = eg_find(g, cls.get(sid));
+                    if src >= 0 && src < s.avail.len() {
+                        var sal: Vec<i64> = s.avail.get(src);
+                        sal.push(sid);
+                        s.avail.set(src, sal);
+                    }
+                }
+            }
+        }
+        var ub: BasicBlock = f.blocks.get(u);
+        ub.instructions = cur;
+        f.blocks.set(u, ub);
+        mec_log_block(u);
+        ri = ri + 1;
+    }
+    if !s.ok {
+        f.blocks = sv_blocks;
+        f.insts = sv_insts;
+        f.inst_at = sv_at;
+        f.value_metas = sv_metas;
+        f.next_value = sv_next;
+        g_eg_st_sk_undone = g_eg_st_sk_undone + 1;
+        return 0;
+    }
+    g_eg_st_sk_fns = g_eg_st_sk_fns + 1;
+    g_eg_st_sk_float = g_eg_st_sk_float + nfloat;
+    g_eg_st_sk_reused = g_eg_st_sk_reused + s.reused;
+    g_eg_st_sk_fresh = g_eg_st_sk_fresh + s.fresh;
+    g_eg_st_sk_dead = g_eg_st_sk_dead + (nfloat - s.reused);
+    return nfloat;
+}
+
+/// `xs` without the element `v`.
+fn eg_vec_without(xs: Vec<i64>, v: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < xs.len() {
+        if xs.get(i) != v {
+            out.push(xs.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Forwarding, the e-graph and placing on one function: [loads forwarded,
+/// instructions rewritten, values placed].
+fn eg_one(f: & mut IrFunction, module: & IrModule, on_f: bool, on_e: bool, on_p: bool) -> Vec<i64> {
+    var a: i64 = 0;
+    var e: i64 = 0;
+    var pl: i64 = 0;
+    if on_f {
+        a = eg_forward(f);
+    }
+    g_eg_last_skel = 0;
+    if on_e {
+        e = eg_function(f, module);
+        // ME7: values the skeleton took out and elaborated count as placed
+        pl = pl + g_eg_last_skel;
+    }
+    // ME8: after the rewrites, which leave moves and cheaper forms in
+    // place; not in @constant_time code, where moving work into one
+    // branch's block would change its timing
+    if on_p && !f.is_constant_time && !f.has_secret {
+        // added to the skeleton's count (it was overwritten)
+        pl = pl + eg_place(f);
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(a);
+    out.push(e);
+    out.push(pl);
+    return out;
+}
+
+/// The pass over every function: [loads forwarded, instructions rewritten,
+/// values placed (ME8, opt-in)].
 pub fn egraph_run(module: & mut IrModule) -> Vec<i64> {
     var nf: i64 = 0;
     var ne: i64 = 0;
+    var np: i64 = 0;
     var on_f: bool = eg_on("forward");
     var on_e: bool = eg_on("egraph");
+    // ME8: placement, on by default since Nov 17 (eg_place_on)
+    var on_p: bool = on_e && eg_place_on();
+    g_eg_st_pl_fns = 0;
+    g_eg_st_pl_moved = 0;
+    g_eg_st_pl_hoisted = 0;
+    g_eg_st_pl_sunk = 0;
+    g_eg_st_pl_skipped = 0;
+    // ME7: the side-effect skeleton (eg_skeleton), opt-in
+    g_eg_skel = on_e && eg_opt_in("egskel");
+    g_eg_st_sk_fns = 0;
+    g_eg_st_sk_float = 0;
+    g_eg_st_sk_reused = 0;
+    g_eg_st_sk_fresh = 0;
+    g_eg_st_sk_dead = 0;
+    g_eg_st_sk_undone = 0;
+    // RL3: the rule families FID_EGRAPH_OFF turns off (read once per run;
+    // it is in nat_ir's cache key)
+    g_eg_rules_off = eg_rules_off_mask(p_getenv("FID_EGRAPH_OFF"));
+    // RL11: the families FID_NAT_MUTATE breaks on purpose (mutation testing)
+    g_eg_mutate = eg_mutate_mask(p_getenv("FID_NAT_MUTATE"));
+    // SP14: this run's counters (egraph_stats, FID_EGRAPH_STATS)
+    g_eg_st_fns = 0;
+    g_eg_st_seed = 0;
+    g_eg_st_nodes = 0;
+    g_eg_st_rounds = 0;
+    g_eg_st_work = 0;
+    g_eg_st_cap_rounds = 0;
+    g_eg_st_cap_nodes = 0;
+    g_eg_st_cap_work = 0;
+    // CS1: the memo of what this pass did to a function of the same IR
+    // (ir_ser.fd mec_*), keyed by the function's hash and the switches
+    // above; the hash comes from the rules just before when they left it
+    // (mec_chain_*). FID_EGRAPH_STATS counts every function's e-graph, so
+    // it runs the pass on all of them.
+    var st0: str = env_or_empty("FID_EGRAPH_STATS");
+    // ME7: the skeleton adds instructions, which a memo entry cannot replay
+    // (mec_delta records rewritten instructions and blocks only): not memoized
+    var memo: bool = (on_f || on_e) && !g_eg_skel && !(str_len(st0) > 0 && st0 != "0") && mec_begin();
+    var cfg_h: i64 = 0;
+    var chain: bool = false;
+    if memo {
+        mec_pass_begin();
+        cfg_h = mec_mix(mec_mix(mec_mix(MEC_EGRAPH, mec_b(on_f)), mec_b(on_e)), mec_b(on_p));
+        cfg_h = mec_mix(mec_mix(cfg_h, g_eg_rules_off), g_eg_mutate);
+        chain = mec_chain_len() == module.functions.len();
+    }
+    // SP3: only the functions main reaches (iropt.fd iro_mid_reach; every
+    // function without main or with FID_IROPT_OFF=midreach), as the rules
+    var reach: i64 = 0;
+    if on_f || on_e {
+        reach = iro_mid_reach(module);
+    }
     var i: i64 = 0;
     while i < module.functions.len() {
         var entry: IrFunctionEntry = module.functions.get(i);
+        if !iro_in_reach(reach, entry.name) {
+            i = i + 1;
+            continue;
+        }
         var f: IrFunction = entry.func;
         var c: i64 = 0;
-        if on_f {
-            var a: i64 = eg_forward(& mut f);
-            nf = nf + a;
-            c = c + a;
-        }
-        if on_e {
-            var e: i64 = eg_function(& mut f, module);
-            ne = ne + e;
-            c = c + e;
+        if memo {
+            var pre_h: i64 = 0;
+            if chain {
+                pre_h = mec_chain_get(i, f.name, f.insts.len());
+            }
+            if pre_h == 0 {
+                pre_h = mec_fn_hash(f);
+            }
+            var key: i64 = mec_key(MEC_EGRAPH, pre_h, cfg_h);
+            var at: i64 = mec_lookup(key, f.name);
+            var done: bool = false;
+            if at > 0 {
+                if mec_apply_at(at, & mut f) {
+                    done = true;
+                    var e: MecEntry = mec_entry(at);
+                    nf = nf + e.c1;
+                    ne = ne + e.c2;
+                    np = np + e.c3;
+                    c = e.c1 + e.c2 + e.c3;
+                }
+            }
+            if !done {
+                var pre: IrFunction = f;
+                mec_log_begin();
+                var cs: Vec<i64> = eg_one(& mut f, module, on_f, on_e, on_p);
+                mec_log_end();
+                nf = nf + cs.get(0);
+                ne = ne + cs.get(1);
+                np = np + cs.get(2);
+                c = cs.get(0) + cs.get(1) + cs.get(2);
+                var _post: i64 = mec_note(key, pre, pre_h, f, c > 0, cs.get(0), cs.get(1), cs.get(2));
+            }
+        } else {
+            var cs2: Vec<i64> = eg_one(& mut f, module, on_f, on_e, on_p);
+            nf = nf + cs2.get(0);
+            ne = ne + cs2.get(1);
+            np = np + cs2.get(2);
+            c = cs2.get(0) + cs2.get(1) + cs2.get(2);
         }
         if c > 0 {
             entry.func = f;
@@ -1127,8 +3387,693 @@ pub fn egraph_run(module: & mut IrModule) -> Vec<i64> {
         }
         i = i + 1;
     }
+    if memo {
+        mec_pass_end("egraph");
+    }
+    // CS1: the last pass of the mid-end writes the memo's entries
+    mec_finish();
+    // SP14: FID_EGRAPH_STATS=1 prints what the e-graph did and which limit
+    // stopped it (counts only: the same on every run, RL13)
+    var st: str = p_getenv("FID_EGRAPH_STATS");
+    if (st as i64) != 0 && str_len(st) > 0 && st != "0" {
+        p_eprint_str("[egraph] functions " + int_to_str(g_eg_st_fns) + ", seed nodes " + int_to_str(g_eg_st_seed) + ", nodes " + int_to_str(g_eg_st_nodes) + ", rounds " + int_to_str(g_eg_st_rounds) + ", work " + int_to_str(g_eg_st_work) + ", stopped by rounds " + int_to_str(g_eg_st_cap_rounds) + ", by nodes " + int_to_str(g_eg_st_cap_nodes) + ", by work " + int_to_str(g_eg_st_cap_work) + ", rewritten " + int_to_str(ne) + ", forwarded " + int_to_str(nf) + "\n");
+        if g_eg_skel {
+            p_eprint_str("[egskel] functions " + int_to_str(g_eg_st_sk_fns) + ", floated " + int_to_str(g_eg_st_sk_float) + ", originals placed " + int_to_str(g_eg_st_sk_reused) + ", new " + int_to_str(g_eg_st_sk_fresh) + ", dead " + int_to_str(g_eg_st_sk_dead) + ", undone " + int_to_str(g_eg_st_sk_undone) + "\n");
+        }
+        // ME8: placement (the memo is off with FID_EGRAPH_STATS, so every
+        // function ran eg_place and the counts are exact)
+        if on_p {
+            p_eprint_str("[egplace] functions " + int_to_str(g_eg_st_pl_fns) + ", placed " + int_to_str(g_eg_st_pl_moved) + ", hoisted " + int_to_str(g_eg_st_pl_hoisted) + ", sunk " + int_to_str(g_eg_st_pl_sunk) + ", skipped " + int_to_str(g_eg_st_pl_skipped) + "\n");
+        } else {
+            p_eprint_str("[egplace] off\n");
+        }
+    } else if env_or_empty("FID_IROPT_STATS") == "1" {
+        // ME8: with the memo on, the total (memo entries included) only
+        if on_p {
+            p_eprint_str("[egplace] placed " + int_to_str(np) + "\n");
+        } else {
+            p_eprint_str("[egplace] off\n");
+        }
+    }
     var out: Vec<i64> = Vec::new();
     out.push(nf);
     out.push(ne);
+    out.push(np);
     return out;
+}
+
+// --- ME7: SMT proof obligations of the e-graph's rewrites ------------------
+//
+// `fid test-rules --smt <dir>` writes these beside the obligations of
+// rules.fd (rules_smt calls egraph_smt), and scripts/rules-smt.sh asks a
+// solver about every file there: each must be `unsat`. One file per rule
+// family (the FID_EGRAPH_OFF names), type and mode: eg_<family>_<type>_c
+// for checked code, _w for @wrapping code. Each file asserts that one of
+// its rules has a counterexample, so `unsat` proves them all.
+//
+// The rules come from the tables eg_round reads (eg_comm_op, eg_flip_op,
+// eg_ident_k, eg_zero_value, eg_double_op, eg_same_of, eg_fold_rule,
+// eg_fold_unary, eg_fold_cast), RL11's mutants included: with
+// FID_NAT_MUTATE=eg<family> the obligations of that family fail as the pass
+// would (tests/tooling/egraph-smt-check.sh). The model:
+//  - a w-bit integer type is a w-bit vector; division and shifts signed or
+//    not by the type;
+//  - two forms of checked code are equal only if they panic on the same
+//    operands and agree wherever they do not: a panic is a result outside
+//    the type (add, sub, mul) or a division by zero (and of the minimum by
+//    -1); @wrapping arithmetic never panics (its division still does);
+//  - the folds of constants (fold, unaryfold) are checked on sample values
+//    of each type (ground terms): the folded value equals the operation's,
+//    and the operation does not panic there;
+//  - a cast of a constant (castfold) is proved for every constant
+//    eg_fold_cast's conditions accept (both types hold it, a truncation of
+//    a value >= 0), and checked on samples through eg_fold_cast itself;
+//  - the float rules (eg_float_rules) in IEEE 754 arithmetic (QF_FP, round
+//    to nearest even), with SMT-LIB's `=`: +0.0 and -0.0 differ, every NaN
+//    is the one NaN (the proofs hold up to NaN payloads: x * 1.0 quiets a
+//    signaling NaN).
+// Not here: idcast (a bit cast to its own type is its operand by the IR's
+// definition) and the float constants (never folded).
+
+/// ME7: the integer types the e-graph knows.
+fn eg_smt_int_tys() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    out.push("i8");
+    out.push("u8");
+    out.push("i16");
+    out.push("u16");
+    out.push("i32");
+    out.push("u32");
+    out.push("i64");
+    out.push("u64");
+    return out;
+}
+
+/// ME7: the 64-bit pattern of v as an SMT-LIB literal (#x and 16 digits).
+@wrapping fn eg_smt_hex(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "#x";
+    var i: i64 = 15;
+    while i >= 0 {
+        var d: i64 = (v >> (i * 4)) & 15;
+        out = out + str_slice(digits, d, d + 1);
+        i = i - 1;
+    }
+    return out;
+}
+
+/// ME7: the low w bits of v as an SMT-LIB bit-vector constant.
+fn eg_smt_k(v: i64, w: i64) -> str {
+    if w >= 64 {
+        return eg_smt_hex(v);
+    }
+    return "((_ extract " + int_to_str(w - 1) + " 0) " + eg_smt_hex(v) + ")";
+}
+
+/// ME7: the minimum of a signed w-bit type.
+fn eg_smt_min(w: i64) -> i64 {
+    if w >= 64 {
+        return 0 - 9223372036854775807 - 1;
+    }
+    return 0 - (1 << (w - 1));
+}
+
+/// ME7: the SMT term of binary operation op (EB_*) over a, b.
+fn eg_smt_bin(op: i64, signed: bool, a: str, b: str) -> str {
+    var o: str = "";
+    if op == EB_ADD {
+        o = "bvadd";
+    } else if op == EB_SUB {
+        o = "bvsub";
+    } else if op == EB_MUL {
+        o = "bvmul";
+    } else if op == EB_DIV {
+        o = "bvudiv";
+        if signed {
+            o = "bvsdiv";
+        }
+    } else if op == EB_MOD {
+        o = "bvurem";
+        if signed {
+            o = "bvsrem";
+        }
+    } else if op == EB_AND {
+        o = "bvand";
+    } else if op == EB_OR {
+        o = "bvor";
+    } else if op == EB_XOR {
+        o = "bvxor";
+    } else if op == EB_SHL {
+        o = "bvshl";
+    } else if op == EB_SHR {
+        o = "bvlshr";
+        if signed {
+            o = "bvashr";
+        }
+    } else if op == EB_EQ {
+        o = "=";
+    } else if op == EB_NE {
+        return "(not (= " + a + " " + b + "))";
+    } else if op == EB_LT {
+        o = "bvult";
+        if signed {
+            o = "bvslt";
+        }
+    } else if op == EB_LE {
+        o = "bvule";
+        if signed {
+            o = "bvsle";
+        }
+    } else if op == EB_GT {
+        o = "bvugt";
+        if signed {
+            o = "bvsgt";
+        }
+    } else {
+        o = "bvuge";
+        if signed {
+            o = "bvsge";
+        }
+    }
+    return "(" + o + " " + a + " " + b + ")";
+}
+
+/// ME7: does a op b panic in a w-bit type? An SMT Bool term.
+fn eg_smt_panic(op: i64, signed: bool, w: i64, wrapping: bool, a: str, b: str) -> str {
+    if op == EB_DIV || op == EB_MOD {
+        // the backends divide in 64 bits (nat_ir.fd's header): a narrow
+        // remainder of the minimum by -1 is 0 and fits, a narrow quotient
+        // does not fit; i64 MIN / -1 and MIN % -1 trap
+        var zero: str = eg_smt_k(0, w);
+        if signed && (op == EB_DIV || w >= 64) {
+            return "(or (= " + b + " " + zero + ") (and (= " + a + " " + eg_smt_k(eg_smt_min(w), w) + ") (= " + b + " " + eg_smt_k(0 - 1, w) + ")))";
+        }
+        return "(= " + b + " " + zero + ")";
+    }
+    if wrapping {
+        return "false";
+    }
+    if op == EB_ADD || op == EB_SUB || op == EB_MUL {
+        // the operation in a wider vector differs from the w-bit one
+        // extended: the result does not fit the type
+        var e: i64 = 1;
+        if op == EB_MUL {
+            e = w;
+        }
+        var ext: str = "(_ zero_extend " + int_to_str(e) + ")";
+        if signed {
+            ext = "(_ sign_extend " + int_to_str(e) + ")";
+        }
+        var narrow: str = "(" + ext + " " + eg_smt_bin(op, signed, a, b) + ")";
+        var wide: str = eg_smt_bin(op, signed, "(" + ext + " " + a + ")", "(" + ext + " " + b + ")");
+        return "(not (= " + narrow + " " + wide + "))";
+    }
+    return "false";
+}
+
+/// ME7: "the two forms differ": value vl with panic pl against vr, pr.
+fn eg_smt_differ(vl: str, pl: str, vr: str, pr: str) -> str {
+    return "(not (and (= " + pl + " " + pr + ") (or " + pl + " (= " + vl + " " + vr + "))))";
+}
+
+/// ME7: samples of type ty for the folds (the values it holds of a fixed
+/// list: zero, small, the limits of every width).
+fn eg_smt_samples(ty: str) -> Vec<i64> {
+    var c: Vec<i64> = Vec::new();
+    c.push(0);
+    c.push(1);
+    c.push(2);
+    c.push(3);
+    c.push(7);
+    c.push(0 - 1);
+    c.push(0 - 2);
+    c.push(0 - 7);
+    c.push(100);
+    c.push(0 - 100);
+    c.push(127);
+    c.push(0 - 128);
+    c.push(255);
+    c.push(32767);
+    c.push(0 - 32768);
+    c.push(65535);
+    c.push(2147483647);
+    c.push(0 - 2147483647 - 1);
+    c.push(4294967295);
+    c.push(3037000499);
+    c.push(0 - 3037000499);
+    c.push(9223372036854775807);
+    c.push(0 - 9223372036854775807 - 1);
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < c.len() {
+        if eg_in_range(c.get(i), ty) {
+            out.push(c.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn eg_smt_bool(v: i64) -> str {
+    if v != 0 {
+        return "true";
+    }
+    return "false";
+}
+
+/// ME7: the obligations of integer family `fam` for type ty in checked
+/// (wrapping false) or @wrapping code, over the constants x, y, c1, c2.
+fn eg_smt_family(fam: str, ty: str, wrapping: bool) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var w: i64 = eg_bits(ty);
+    var sg: bool = eg_signed(ty);
+    var op: i64 = EB_ADD;
+    if fam == "comm" {
+        while op <= EB_GE {
+            if eg_comm_op(op) {
+                out.push(eg_smt_differ(eg_smt_bin(op, sg, "x", "y"), eg_smt_panic(op, sg, w, wrapping, "x", "y"), eg_smt_bin(op, sg, "y", "x"), eg_smt_panic(op, sg, w, wrapping, "y", "x")));
+            }
+            op = op + 1;
+        }
+    }
+    if fam == "flip" {
+        while op <= EB_GE {
+            var fl: i64 = eg_flip_op(op);
+            if fl != 0 {
+                out.push("(not (= " + eg_smt_bin(op, sg, "x", "y") + " " + eg_smt_bin(fl, sg, "y", "x") + "))");
+            }
+            op = op + 1;
+        }
+    }
+    if fam == "ident" {
+        while op <= EB_GE {
+            var idk: Vec<i64> = eg_ident_k(op);
+            if idk.get(0) == 1 {
+                // RL11 egident: eg_round joins x op (k + 1) with x
+                var k: i64 = idk.get(1);
+                if eg_mut(EGR_IDENT) {
+                    k = k + 1;
+                }
+                var kk: str = eg_smt_k(k, w);
+                out.push(eg_smt_differ(eg_smt_bin(op, sg, "x", kk), eg_smt_panic(op, sg, w, wrapping, "x", kk), "x", "false"));
+            }
+            op = op + 1;
+        }
+    }
+    if fam == "zero" {
+        var z: str = eg_smt_k(0, w);
+        out.push(eg_smt_differ(eg_smt_bin(EB_MUL, sg, "x", z), eg_smt_panic(EB_MUL, sg, w, wrapping, "x", z), eg_smt_k(eg_zero_value(), w), "false"));
+        out.push(eg_smt_differ(eg_smt_bin(EB_AND, sg, "x", z), "false", eg_smt_k(eg_zero_value(), w), "false"));
+    }
+    if fam == "double" {
+        var two: str = eg_smt_k(2, w);
+        var dop: i64 = eg_double_op();
+        out.push(eg_smt_differ(eg_smt_bin(EB_MUL, sg, "x", two), eg_smt_panic(EB_MUL, sg, w, wrapping, "x", two), eg_smt_bin(dop, sg, "x", "x"), eg_smt_panic(dop, sg, w, wrapping, "x", "x")));
+    }
+    if fam == "shift" && wrapping {
+        // eg_round: k = 2^s with 2 < k < 2^62, a constant of the type
+        var s: i64 = 2;
+        while s <= 61 && eg_in_range(1 << s, ty) {
+            out.push("(not (= " + eg_smt_bin(EB_MUL, sg, "x", eg_smt_k(1 << s, w)) + " " + eg_smt_bin(EB_SHL, sg, "x", eg_smt_k(s, w)) + "))");
+            s = s + 1;
+        }
+    }
+    if fam == "reassoc" && wrapping {
+        // c1 + c2 folded as eg_fold does in @wrapping code: modulo 2^w
+        out.push("(not (= (bvadd (bvadd x c1) c2) (bvadd x (bvadd c1 c2))))");
+    }
+    if fam == "same" {
+        while op <= EB_GE {
+            var so: Vec<i64> = eg_same_of(op);
+            var lhs: str = eg_smt_bin(op, sg, "x", "x");
+            var pl: str = eg_smt_panic(op, sg, w, wrapping, "x", "x");
+            if so.get(0) == 1 {
+                out.push(eg_smt_differ(lhs, pl, eg_smt_k(so.get(1), w), "false"));
+            }
+            if so.get(0) == 2 {
+                out.push(eg_smt_differ(lhs, pl, "x", "false"));
+            }
+            if so.get(0) == 3 {
+                out.push(eg_smt_differ(lhs, pl, eg_smt_bool(so.get(1)), "false"));
+            }
+            op = op + 1;
+        }
+    }
+    if fam == "invol" {
+        if !wrapping {
+            out.push("(not (= (bvnot (bvnot x)) x))");
+        } else {
+            // -(-x) = x only in @wrapping code (eg_round)
+            out.push("(not (= (bvneg (bvneg x)) x))");
+        }
+    }
+    if fam == "unaryfold" {
+        var us: Vec<i64> = eg_smt_samples(ty);
+        var ui: i64 = 0;
+        while ui < us.len() {
+            var a: i64 = us.get(ui);
+            var ka: str = eg_smt_k(a, w);
+            var fneg: Vec<i64> = eg_fold_unary(EK_NEG, a, ty);
+            if fneg.get(0) == 1 {
+                // the negation of the minimum, or of an unsigned value
+                // other than 0, panics or does not fit
+                var pn: str = "(not (= " + ka + " " + eg_smt_k(0, w) + "))";
+                if sg {
+                    pn = "(= " + ka + " " + eg_smt_k(eg_smt_min(w), w) + ")";
+                }
+                out.push("(or " + pn + " (not (= (bvneg " + ka + ") " + eg_smt_k(fneg.get(1), w) + ")))");
+            }
+            var fbn: Vec<i64> = eg_fold_unary(EK_BNOT, a, ty);
+            if fbn.get(0) == 1 {
+                out.push("(not (= (bvnot " + ka + ") " + eg_smt_k(fbn.get(1), w) + "))");
+            }
+            ui = ui + 1;
+        }
+    }
+    if fam == "fold" {
+        var fs: Vec<i64> = eg_smt_samples(ty);
+        while op <= EB_GE {
+            var ai: i64 = 0;
+            while ai < fs.len() {
+                var bi: i64 = 0;
+                while bi < fs.len() {
+                    var av: i64 = fs.get(ai);
+                    var bv: i64 = fs.get(bi);
+                    var f: Vec<i64> = eg_fold_rule(op, av, bv, ty, wrapping);
+                    if f.get(0) == 1 {
+                        var ka2: str = eg_smt_k(av, w);
+                        var kb2: str = eg_smt_k(bv, w);
+                        if eg_is_cmp(op) {
+                            out.push("(not (= " + eg_smt_bin(op, sg, ka2, kb2) + " " + eg_smt_bool(f.get(1)) + "))");
+                        } else {
+                            out.push("(or " + eg_smt_panic(op, sg, w, wrapping, ka2, kb2) + " (not (= " + eg_smt_bin(op, sg, ka2, kb2) + " " + eg_smt_k(f.get(1), w) + ")))");
+                        }
+                    }
+                    bi = bi + 1;
+                }
+                ai = ai + 1;
+            }
+            op = op + 1;
+        }
+    }
+    return out;
+}
+
+/// ME7: the bits of cast `op` (EC_EXT, EC_TRUNC, EC_BITCAST) from type
+/// `from` to `to` of the source bits `src` ("" when the IR has no such
+/// cast: a widening must not narrow, a truncation not widen, a bit cast
+/// keeps the width).
+fn eg_smt_conv(op: i64, from: str, to: str, src: str) -> str {
+    var wf: i64 = eg_bits(from);
+    if from == "bool" {
+        wf = 1;
+    }
+    var wt: i64 = eg_bits(to);
+    if op == EC_EXT {
+        if wt < wf {
+            return "";
+        }
+        if wt == wf {
+            return src;
+        }
+        if eg_signed(from) {
+            return "((_ sign_extend " + int_to_str(wt - wf) + ") " + src + ")";
+        }
+        return "((_ zero_extend " + int_to_str(wt - wf) + ") " + src + ")";
+    }
+    if op == EC_TRUNC {
+        if wt > wf {
+            return "";
+        }
+        if wt == wf {
+            return src;
+        }
+        return "((_ extract " + int_to_str(wt - 1) + " 0) " + src + ")";
+    }
+    if op == EC_BITCAST && wt == wf {
+        return src;
+    }
+    return "";
+}
+
+/// ME7: is the 64-bit vector c a value of type ty? An SMT Bool term.
+fn eg_smt_range(ty: str, c: str) -> str {
+    if ty == "bool" {
+        return "(or (= " + c + " " + eg_smt_k(0, 64) + ") (= " + c + " " + eg_smt_k(1, 64) + "))";
+    }
+    if ty == "i64" {
+        return "true";
+    }
+    if ty == "u64" {
+        return "(bvsge " + c + " " + eg_smt_k(0, 64) + ")";
+    }
+    var w: i64 = eg_bits(ty);
+    if eg_signed(ty) {
+        return "(and (bvsge " + c + " " + eg_smt_k(eg_smt_min(w), 64) + ") (bvsle " + c + " " + eg_smt_k((1 << (w - 1)) - 1, 64) + "))";
+    }
+    return "(and (bvsge " + c + " " + eg_smt_k(0, 64) + ") (bvsle " + c + " " + eg_smt_k((1 << w) - 1, 64) + "))";
+}
+
+/// ME7: the castfold obligations of cast `op` from type `from` to every
+/// integer type: for every constant c (the i64 the e-graph holds) that
+/// eg_fold_cast's conditions accept, the cast's bits are c's in the target
+/// width; and on samples, through eg_fold_cast itself.
+fn eg_smt_castfold(op: i64, from: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var tys: Vec<str> = eg_smt_int_tys();
+    var wf: i64 = eg_bits(from);
+    if from == "bool" {
+        wf = 1;
+    }
+    var src: str = "((_ extract " + int_to_str(wf - 1) + " 0) c)";
+    var samples: Vec<i64> = eg_smt_samples(from);
+    if from == "bool" {
+        samples = Vec::new();
+        samples.push(0);
+        samples.push(1);
+    }
+    var ti: i64 = 0;
+    while ti < tys.len() {
+        var to: str = tys.get(ti);
+        var wt: i64 = eg_bits(to);
+        var conv: str = eg_smt_conv(op, from, to, src);
+        if conv != "" {
+            var cond: str = "(and " + eg_smt_range(from, "c") + " " + eg_smt_range(to, "c");
+            if op == EC_TRUNC {
+                cond = cond + " (bvsge c " + eg_smt_k(0, 64) + ")";
+            }
+            out.push(cond + " (not (= " + conv + " ((_ extract " + int_to_str(wt - 1) + " 0) c))))");
+            var si: i64 = 0;
+            while si < samples.len() {
+                var a: i64 = samples.get(si);
+                var fc: Vec<i64> = eg_fold_cast(op, a, from, to);
+                if fc.get(0) == 1 {
+                    var sa: str = "((_ extract " + int_to_str(wf - 1) + " 0) " + eg_smt_hex(a) + ")";
+                    out.push("(not (= " + eg_smt_conv(op, from, to, sa) + " " + eg_smt_k(fc.get(1), wt) + "))");
+                }
+                si = si + 1;
+            }
+        }
+        ti = ti + 1;
+    }
+    return out;
+}
+
+/// ME7: the obligations of eg_float_rules for float type ft ("f32", "f64")
+/// over x, y.
+fn eg_smt_float(ft: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var es: str = "11 53";
+    var eb: i64 = 11;
+    var sb: i64 = 53;
+    if ft == "f32" {
+        es = "8 24";
+        eb = 8;
+        sb = 24;
+    }
+    // 1.0: sign 0, the exponent's bias (0 then eb - 1 ones), a zero
+    // significand (sb - 1 bits)
+    var ebits: str = "#b0";
+    var i: i64 = 1;
+    while i < eb {
+        ebits = ebits + "1";
+        i = i + 1;
+    }
+    var sbits: str = "#b";
+    i = 1;
+    while i < sb {
+        sbits = sbits + "0";
+        i = i + 1;
+    }
+    var one: str = "(fp #b0 " + ebits + " " + sbits + ")";
+    // a < b is b > a, a <= b is b >= a; == and != commute (a NaN makes
+    // < > <= >= == false and != true on either side)
+    out.push("(not (= (fp.lt x y) (fp.gt y x)))");
+    out.push("(not (= (fp.gt x y) (fp.lt y x)))");
+    out.push("(not (= (fp.leq x y) (fp.geq y x)))");
+    out.push("(not (= (fp.geq x y) (fp.leq y x)))");
+    out.push("(not (= (fp.eq x y) (fp.eq y x)))");
+    out.push("(not (= (not (fp.eq x y)) (not (fp.eq y x))))");
+    // x * 1.0, x / 1.0, x - 0.0, x + -0.0 are x; -(-x) is x
+    out.push("(not (= (fp.mul RNE x " + one + ") x))");
+    out.push("(not (= (fp.div RNE x " + one + ") x))");
+    out.push("(not (= (fp.sub RNE x (_ +zero " + es + ")) x))");
+    out.push("(not (= (fp.add RNE x (_ -zero " + es + ")) x))");
+    out.push("(not (= (fp.neg (fp.neg x)) x))");
+    return out;
+}
+
+/// ME7: write dir/eg_<name>.smt2 asserting one of `obs` (an obligation's
+/// negation each); 1 written, 0 nothing to write, -1 not written.
+fn eg_smt_write(dir: str, name: str, logic: str, decls: str, obs: & Vec<str>) -> i64 {
+    if obs.len() == 0 {
+        return 0;
+    }
+    var body: str = obs.get(0);
+    if obs.len() > 1 {
+        var parts: Vec<str> = Vec::new();
+        var i: i64 = 0;
+        while i < obs.len() {
+            parts.push(obs.get(i));
+            i = i + 1;
+        }
+        body = "(or\n  " + str_join_fast(parts, "\n  ") + ")";
+    }
+    var text: str = "; e-graph " + name + " (" + int_to_str(obs.len()) + " obligations): unsat proves it\n(set-logic " + logic + ")\n" + decls + "(assert " + body + ")\n(check-sat)\n";
+    var path: str = dir + "/eg_" + name + ".smt2";
+    p_file_write(path, text);
+    if c_file_exists(path) {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+/// ME7: write the e-graph's SMT-LIB proof obligations into `dir` (see the
+/// section's comment): how many files could not be written.
+pub fn egraph_smt(dir: str) -> i64 {
+    // RL11: the mutants FID_NAT_MUTATE asks for, as egraph_run reads them
+    g_eg_mutate = eg_mutate_mask(p_getenv("FID_NAT_MUTATE"));
+    var written: i64 = 0;
+    var failed: i64 = 0;
+    var tys: Vec<str> = eg_smt_int_tys();
+    // checked only (no panic differs), both modes, @wrapping only
+    var fams: Vec<str> = Vec::new();
+    fams.push("comm");
+    fams.push("flip");
+    fams.push("ident");
+    fams.push("zero");
+    fams.push("double");
+    fams.push("shift");
+    fams.push("reassoc");
+    fams.push("same");
+    fams.push("invol");
+    fams.push("unaryfold");
+    fams.push("fold");
+    var ti: i64 = 0;
+    while ti < tys.len() {
+        var ty: str = tys.get(ti);
+        var w: str = int_to_str(eg_bits(ty));
+        var decls: str = "(declare-const x (_ BitVec " + w + "))\n(declare-const y (_ BitVec " + w + "))\n(declare-const c1 (_ BitVec " + w + "))\n(declare-const c2 (_ BitVec " + w + "))\n";
+        var fi: i64 = 0;
+        while fi < fams.len() {
+            var fam: str = fams.get(fi);
+            var m: i64 = 0;
+            while m < 2 {
+                var wrapping: bool = m == 1;
+                var both: bool = fam == "comm" || fam == "double" || fam == "fold" || fam == "invol";
+                var wonly: bool = fam == "shift" || fam == "reassoc";
+                var want: bool = (wrapping && (both || wonly)) || (!wrapping && !wonly);
+                if want {
+                    var obs: Vec<str> = eg_smt_family(fam, ty, wrapping);
+                    var mode: str = "_c";
+                    if wrapping {
+                        mode = "_w";
+                    }
+                    var r: i64 = eg_smt_write(dir, fam + "_" + ty + mode, "QF_BV", decls, & obs);
+                    if r > 0 {
+                        written = written + 1;
+                    }
+                    if r < 0 {
+                        failed = failed + 1;
+                    }
+                }
+                m = m + 1;
+            }
+            fi = fi + 1;
+        }
+        ti = ti + 1;
+    }
+    // Booleans: !!b = b, and !c of a constant (eg_fold_unary)
+    var bobs: Vec<str> = Vec::new();
+    bobs.push("(not (= (not (not b)) b))");
+    var bv: i64 = 0;
+    while bv < 2 {
+        var fb: Vec<i64> = eg_fold_unary(EK_NOT, bv, "bool");
+        if fb.get(0) == 1 {
+            bobs.push("(not (= (not " + eg_smt_bool(bv) + ") " + eg_smt_bool(fb.get(1)) + "))");
+        }
+        bv = bv + 1;
+    }
+    var rb: i64 = eg_smt_write(dir, "invol_unaryfold_bool", "QF_BV", "(declare-const b Bool)\n", & bobs);
+    if rb > 0 {
+        written = written + 1;
+    }
+    if rb < 0 {
+        failed = failed + 1;
+    }
+    // Casts of constants
+    var froms: Vec<str> = eg_smt_int_tys();
+    froms.push("bool");
+    var cops: Vec<i64> = Vec::new();
+    cops.push(EC_EXT);
+    cops.push(EC_TRUNC);
+    cops.push(EC_BITCAST);
+    var ci: i64 = 0;
+    while ci < cops.len() {
+        var cop: i64 = cops.get(ci);
+        var cname: str = "ext";
+        if cop == EC_TRUNC {
+            cname = "trunc";
+        }
+        if cop == EC_BITCAST {
+            cname = "bitcast";
+        }
+        var fj: i64 = 0;
+        while fj < froms.len() {
+            var from: str = froms.get(fj);
+            var cobs: Vec<str> = eg_smt_castfold(cop, from);
+            var rc: i64 = eg_smt_write(dir, "castfold_" + cname + "_" + from, "QF_BV", "(declare-const c (_ BitVec 64))\n", & cobs);
+            if rc > 0 {
+                written = written + 1;
+            }
+            if rc < 0 {
+                failed = failed + 1;
+            }
+            fj = fj + 1;
+        }
+        ci = ci + 1;
+    }
+    // Floats
+    var fts: Vec<str> = Vec::new();
+    fts.push("f32");
+    fts.push("f64");
+    var fk: i64 = 0;
+    while fk < fts.len() {
+        var ft: str = fts.get(fk);
+        var es: str = "11 53";
+        if ft == "f32" {
+            es = "8 24";
+        }
+        var fobs: Vec<str> = eg_smt_float(ft);
+        var rf: i64 = eg_smt_write(dir, "float_" + ft, "QF_FP", "(declare-const x (_ FloatingPoint " + es + "))\n(declare-const y (_ FloatingPoint " + es + "))\n", & fobs);
+        if rf > 0 {
+            written = written + 1;
+        }
+        if rf < 0 {
+            failed = failed + 1;
+        }
+        fk = fk + 1;
+    }
+    print(int_to_str(written) + " e-graph SMT-LIB files in " + dir + "\n");
+    return failed;
 }

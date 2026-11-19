@@ -1,0 +1,571 @@
+// stdlib/http3 (competitive SL2, part 3): an HTTP/3 client and server in
+// one process over stdlib/quic_conn.fd, their datagrams carried by a
+// simulated network that delays each by one 5 ms step (and drops one in 7
+// during the large request).
+//   - SETTINGS on both control streams, the QPACK streams opened;
+//   - GET, a 50000-byte POST echoed back with a trailer while datagrams
+//     are lost, an interim 103 before the final response, HEAD with a
+//     content-length and no body, three requests answered out of order,
+//     a 404;
+//   - a reserved frame type before HEADERS and a reserved stream type are
+//     ignored;
+//   - stream errors: a request without :path and a body shorter than its
+//     content-length are reset with H3_MESSAGE_ERROR;
+//   - GOAWAY: the request in flight is answered, new ones are refused;
+//     then CONNECTION_CLOSE with H3_NO_ERROR;
+//   - connection errors, each on its own connection: DATA before HEADERS,
+//     an HTTP/2 setting, a control stream that does not start with
+//     SETTINGS, a QPACK dynamic-table reference, the control stream closed,
+//     a frame cut short by FIN, a server-initiated bidirectional stream.
+// Too slow for the interpreter (pure-Fides X25519, Ed25519 and AES-GCM):
+// run it through C (`fid ccompile`). A wrong answer panics.
+//
+// Expected output:
+// handshake ok: h3
+// settings exchanged: 65536
+// GET / -> 200 hello http3
+// POST /echo 50000 bytes echoed, x-sum 6374818
+// losses recovered
+// interim responses: 1 then 200 late
+// HEAD /head -> 200 content-length 1234, no body
+// three requests answered out of order: /c /b /a
+// GET /missing -> 404
+// reserved frame and stream ignored: 200
+// no :path: 270
+// short body: 270
+// goaway: in-flight 200, new requests refused
+// closed: 256
+// data before headers: 261
+// http/2 setting: 265
+// missing settings: 266
+// dynamic reference: 512
+// control stream closed: 260
+// frame cut short: 262
+// server bidi stream: 259
+// http3 ok
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use qpack;
+use http3;
+use ed25519;
+use encoding;
+
+/// The simulated network: datagrams sent during a step arrive at the next.
+struct Net {
+    to_server: Vec<Vec<i64>>,
+    to_client: Vec<Vec<i64>>,
+    now: i64,
+    drop_every: i64,
+    sent_cs: i64,
+    sent_sc: i64,
+}
+
+/// Both ends: the QUIC connections and their HTTP/3 states. `client_h3`
+/// false: the client writes raw bytes on its streams (error cases).
+struct World {
+    c: QuicConn,
+    s: QuicConn,
+    hc: H3Conn,
+    hs: H3Conn,
+    n: Net,
+    client_h3: bool,
+    held: Vec<i64>,
+    release: i64,
+}
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn alpn1(p: str) -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push(p);
+    return v;
+}
+
+fn server_seed() -> Vec<i64> {
+    return hb("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+}
+
+fn append(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+fn no_strs() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    return v;
+}
+
+fn no_bytes() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    return v;
+}
+
+fn world(client_h3: bool) -> World {
+    val seed: Vec<i64> = server_seed();
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    var ccfg: QuicConfig = quic_config_client(alpn1("h3"), "localhost");
+    ccfg.peer_key = ed25519_public_key(seed);
+    ccfg.seed = str_bytes("h3 client seed");
+    var scfg: QuicConfig = quic_config_server(alpn1("h3"), cert, seed);
+    scfg.seed = str_bytes("h3 server seed");
+    var n: Net = Net { to_server: Vec::new(), to_client: Vec::new(), now: 0, drop_every: 0, sent_cs: 0, sent_sc: 0 };
+    var c: QuicConn = quic_connect(ccfg, 0);
+    val first: Vec<i64> = quic_conn_send(& mut c, 0);
+    n.now = 5;
+    val s: QuicConn = quic_accept(scfg, first, 5);
+    if quic_conn_closed(& s) { p_panic("server refused the Initial: " + s.why); }
+    var w: World = World { c: c, s: s, hc: h3_new(false), hs: h3_new(true), n: n, client_h3: client_h3, held: Vec::new(), release: 0 };
+    var rounds: i64 = 0;
+    while rounds < 400 && !(quic_conn_established(& w.c) && quic_conn_established(& w.s)) {
+        step(& mut w);
+        rounds = rounds + 1;
+    }
+    if !quic_conn_established(& w.c) || !quic_conn_established(& w.s) {
+        p_panic("handshake failed: " + w.c.why + " / " + w.s.why);
+    }
+    return w;
+}
+
+/// One step: deliver what was sent last step, run due timers, let both
+/// HTTP/3 ends and the server's application work, send.
+fn step(w: & mut World) {
+    w.n.now = w.n.now + 5;
+    val now: i64 = w.n.now;
+    val ts: Vec<Vec<i64>> = w.n.to_server;
+    w.n.to_server = Vec::new();
+    var i: i64 = 0;
+    while i < ts.len() {
+        quic_conn_recv(& mut w.s, ts.get(i), now);
+        i = i + 1;
+    }
+    val tc: Vec<Vec<i64>> = w.n.to_client;
+    w.n.to_client = Vec::new();
+    i = 0;
+    while i < tc.len() {
+        quic_conn_recv(& mut w.c, tc.get(i), now);
+        i = i + 1;
+    }
+    val tcl: i64 = quic_conn_timeout(& w.c);
+    if tcl >= 0 && tcl <= now { quic_conn_on_timeout(& mut w.c, now); }
+    val tsv: i64 = quic_conn_timeout(& w.s);
+    if tsv >= 0 && tsv <= now { quic_conn_on_timeout(& mut w.s, now); }
+    if w.client_h3 {
+        h3_poll(& mut w.hc, & mut w.c);
+    }
+    h3_poll(& mut w.hs, & mut w.s);
+    serve(w);
+    var guard: i64 = 0;
+    while guard < 200 {
+        val d: Vec<i64> = quic_conn_send(& mut w.c, now);
+        if d.len() == 0 { guard = 200; } else {
+            w.n.sent_cs = w.n.sent_cs + 1;
+            if w.n.drop_every == 0 || w.n.sent_cs % w.n.drop_every != 0 {
+                w.n.to_server.push(d);
+            }
+        }
+        guard = guard + 1;
+    }
+    guard = 0;
+    while guard < 200 {
+        val d: Vec<i64> = quic_conn_send(& mut w.s, now);
+        if d.len() == 0 { guard = 200; } else {
+            w.n.sent_sc = w.n.sent_sc + 1;
+            if w.n.drop_every == 0 || w.n.sent_sc % w.n.drop_every != 0 {
+                w.n.to_client.push(d);
+            }
+        }
+        guard = guard + 1;
+    }
+}
+
+fn byte_sum(b: Vec<i64>) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        t = t + b.get(i);
+        i = i + 1;
+    }
+    return t;
+}
+
+fn text(ct: str) -> Vec<Vec<str>> {
+    var n: Vec<str> = Vec::new();
+    var v: Vec<str> = Vec::new();
+    n.push("content-type");
+    v.push(ct);
+    var out: Vec<Vec<str>> = Vec::new();
+    out.push(n);
+    out.push(v);
+    return out;
+}
+
+/// The server's application.
+fn serve(w: & mut World) {
+    if w.release > 0 {
+        // the held requests, one per step: /b, then /a
+        val hid: i64 = w.held.get(w.release - 1);
+        val hm: H3Message = h3_message(& w.hs, hid);
+        val tq: Vec<Vec<str>> = text("text/plain");
+        h3_respond(& mut w.hs, & mut w.s, hid, 200, tq.get(0), tq.get(1), str_bytes(hm.path));
+        w.release = w.release - 1;
+        if w.release == 0 {
+            w.held = Vec::new();
+        }
+    }
+    val ids: Vec<i64> = h3_requests(& mut w.hs);
+    var i: i64 = 0;
+    while i < ids.len() {
+        val id: i64 = ids.get(i);
+        val m: H3Message = h3_message(& w.hs, id);
+        val tp: Vec<Vec<str>> = text("text/plain");
+        if m.path == "/" && m.method == "GET" {
+            h3_respond(& mut w.hs, & mut w.s, id, 200, tp.get(0), tp.get(1), str_bytes("hello http3"));
+        } else if m.path == "/echo" {
+            var tn: Vec<str> = Vec::new();
+            var tv: Vec<str> = Vec::new();
+            tn.push("x-sum");
+            tv.push(int_to_str(byte_sum(m.body)));
+            h3_respond_trailers(& mut w.hs, & mut w.s, id, 200, tp.get(0), tp.get(1), m.body, tn, tv);
+        } else if m.path == "/early" {
+            var ln: Vec<str> = Vec::new();
+            var lv: Vec<str> = Vec::new();
+            ln.push("link");
+            lv.push("</style.css>; rel=preload");
+            if !h3_respond_interim(& mut w.hs, & mut w.s, id, 103, ln, lv) { p_panic("interim refused"); }
+            h3_respond(& mut w.hs, & mut w.s, id, 200, tp.get(0), tp.get(1), str_bytes("late"));
+        } else if m.path == "/head" && m.method == "HEAD" {
+            var hn: Vec<str> = Vec::new();
+            var hv: Vec<str> = Vec::new();
+            hn.push("content-length");
+            hv.push("1234");
+            h3_respond(& mut w.hs, & mut w.s, id, 200, hn, hv, no_bytes());
+        } else if m.path == "/a" || m.path == "/b" || m.path == "/c" {
+            // held until all three are here, then answered c, b, a
+            // (one per step)
+            w.held.push(id);
+            if w.held.len() == 3 {
+                val hid: i64 = w.held.get(2);
+                val hm: H3Message = h3_message(& w.hs, hid);
+                h3_respond(& mut w.hs, & mut w.s, hid, 200, tp.get(0), tp.get(1), str_bytes(hm.path));
+                w.release = 2;
+            }
+        } else if m.path == "/inflight" {
+            // answered later by the GOAWAY test
+            w.held.push(id);
+        } else {
+            h3_respond(& mut w.hs, & mut w.s, id, 404, tp.get(0), tp.get(1), str_bytes("not found"));
+        }
+        i = i + 1;
+    }
+}
+
+fn send_req(w: & mut World, method: str, path: str, body: Vec<i64>) -> i64 {
+    var id: i64 = - 1;
+    var rounds: i64 = 0;
+    while id < 0 && rounds < 100 {
+        id = h3_request(& mut w.hc, & mut w.c, method, "https", "localhost", path, no_strs(), no_strs(), body);
+        if id < 0 { step(w); }
+        rounds = rounds + 1;
+    }
+    if id < 0 { p_panic("request refused: " + path); }
+    return id;
+}
+
+fn wait(w: & mut World, id: i64) -> H3Message {
+    var rounds: i64 = 0;
+    while rounds < 20000 && !h3_done(& w.hc, id) {
+        step(w);
+        if quic_conn_done(& w.c) || quic_conn_done(& w.s) {
+            p_panic("connection closed: " + w.c.why + " / " + w.s.why + " / " + w.hs.why + " / " + w.hc.why);
+        }
+        rounds = rounds + 1;
+    }
+    return h3_response(& mut w.hc, id);
+}
+
+fn fetch(w: & mut World, method: str, path: str, body: Vec<i64>) -> H3Message {
+    val id: i64 = send_req(w, method, path, body);
+    val m: H3Message = wait(w, id);
+    if !m.ok { p_panic(method + " " + path + " failed: " + m.why); }
+    return m;
+}
+
+fn pattern(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((i * 13 + i / 97) % 256);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fields(pairs: Vec<str>) -> Vec<Vec<str>> {
+    var n: Vec<str> = Vec::new();
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < pairs.len() {
+        n.push(pairs.get(i));
+        v.push(pairs.get(i + 1));
+        i = i + 2;
+    }
+    var out: Vec<Vec<str>> = Vec::new();
+    out.push(n);
+    out.push(v);
+    return out;
+}
+
+fn get_fields(path: str) -> Vec<Vec<str>> {
+    var p: Vec<str> = Vec::new();
+    p.push(":method");
+    p.push("GET");
+    p.push(":scheme");
+    p.push("https");
+    p.push(":authority");
+    p.push("localhost");
+    p.push(":path");
+    p.push(path);
+    return fields(p);
+}
+
+fn headers_frame(f: Vec<Vec<str>>) -> Vec<i64> {
+    return h3_frame(H3F_HEADERS, qpack_encode(f.get(0), f.get(1), true));
+}
+
+/// A connection where the client sends `bytes` on a new stream of its own
+/// (unidirectional when `uni`): the HTTP/3 error the server closes with.
+fn conn_error(bytes: Vec<i64>, uni: bool, fin: bool) -> i64 {
+    var w: World = world(false);
+    var id: i64 = - 1;
+    if uni {
+        id = quic_open_uni(& mut w.c);
+    } else {
+        id = quic_open_bidi(& mut w.c);
+    }
+    quic_stream_write(& mut w.c, id, bytes, fin);
+    var rounds: i64 = 0;
+    while rounds < 400 && !w.c.peer_closed {
+        step(& mut w);
+        rounds = rounds + 1;
+    }
+    if !w.c.peer_closed || !w.c.app_error { p_panic("no connection error for stream " + int_to_str(id)); }
+    if w.hs.error != w.c.error { p_panic("server error " + int_to_str(w.hs.error) + " vs " + int_to_str(w.c.error)); }
+    return w.c.error;
+}
+
+fn main() -> i64 {
+    var w: World = world(true);
+    println("handshake ok: " + w.c.alpn);
+    var rounds: i64 = 0;
+    while rounds < 100 && !(w.hc.peer_settings && w.hs.peer_settings) {
+        step(& mut w);
+        rounds = rounds + 1;
+    }
+    if !w.hc.peer_settings || !w.hs.peer_settings || w.hc.peer_ctrl != 3 || w.hs.peer_ctrl != 2
+        || w.hc.peer_enc < 0 || w.hc.peer_dec < 0 || w.hs.peer_enc < 0 || w.hs.peer_dec < 0 {
+        p_panic("settings were not exchanged");
+    }
+    println("settings exchanged: " + int_to_str(w.hc.peer_max_field_section));
+
+    val m1: H3Message = fetch(& mut w, "GET", "/", no_bytes());
+    if m1.status != 200 || h3_field(& m1, "content-type") != "text/plain" { p_panic("GET / status or type"); }
+    println("GET / -> " + int_to_str(m1.status) + " " + str_from_bytes(m1.body));
+
+    w.n.drop_every = 7;
+    val big: Vec<i64> = pattern(50000);
+    val m2: H3Message = fetch(& mut w, "POST", "/echo", big);
+    if !same(m2.body, big) { p_panic("echo differs: " + int_to_str(m2.body.len()) + " bytes"); }
+    if m2.trailer_names.len() != 1 || m2.trailer_names.get(0) != "x-sum" { p_panic("no trailer"); }
+    if str_parse_int(m2.trailer_values.get(0)) != byte_sum(big) { p_panic("trailer value"); }
+    println("POST /echo " + int_to_str(m2.body.len()) + " bytes echoed, x-sum " + m2.trailer_values.get(0));
+    if w.c.packets_lost + w.s.packets_lost == 0 { p_panic("no loss was detected"); }
+    println("losses recovered");
+    w.n.drop_every = 0;
+
+    val m3: H3Message = fetch(& mut w, "GET", "/early", no_bytes());
+    if m3.interim != 1 || m3.status != 200 { p_panic("interim"); }
+    println("interim responses: " + int_to_str(m3.interim) + " then " + int_to_str(m3.status) + " " + str_from_bytes(m3.body));
+
+    val m4: H3Message = fetch(& mut w, "HEAD", "/head", no_bytes());
+    if m4.status != 200 || m4.body.len() != 0 || h3_field(& m4, "content-length") != "1234" { p_panic("HEAD"); }
+    println("HEAD /head -> 200 content-length 1234, no body");
+
+    val ia: i64 = send_req(& mut w, "GET", "/a", no_bytes());
+    val ib: i64 = send_req(& mut w, "GET", "/b", no_bytes());
+    val ic: i64 = send_req(& mut w, "GET", "/c", no_bytes());
+    var order: str = "";
+    var got: Vec<bool> = Vec::new();
+    got.push(false);
+    got.push(false);
+    got.push(false);
+    rounds = 0;
+    while rounds < 400 && order != " /c /b /a" && str_len(order) < 9 {
+        step(& mut w);
+        var k: i64 = 0;
+        while k < 3 {
+            var id: i64 = ia;
+            if k == 1 { id = ib; }
+            if k == 2 { id = ic; }
+            if !got.get(k) && h3_done(& w.hc, id) {
+                val m: H3Message = h3_response(& mut w.hc, id);
+                if !m.ok { p_panic("out of order: " + m.why); }
+                order = order + " " + str_from_bytes(m.body);
+                got.set(k, true);
+            }
+            k = k + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if order != " /c /b /a" { p_panic("order:" + order); }
+    println("three requests answered out of order:" + order);
+
+    val m5: H3Message = fetch(& mut w, "GET", "/missing", no_bytes());
+    println("GET /missing -> " + int_to_str(m5.status));
+
+    // A reserved frame type (0x21) before HEADERS, and a reserved stream
+    // type: both ignored
+    val gu: i64 = quic_open_uni(& mut w.c);
+    var grease: Vec<i64> = Vec::new();
+    grease.push(0x21);
+    append(& mut grease, pattern(30));
+    quic_stream_write(& mut w.c, gu, grease, true);
+    var rb: Vec<i64> = h3_frame(0x21, pattern(5));
+    append(& mut rb, headers_frame(get_fields("/")));
+    val rid: i64 = quic_open_bidi(& mut w.c);
+    quic_stream_write(& mut w.c, rid, rb, true);
+    var raw: Vec<i64> = Vec::new();
+    rounds = 0;
+    while rounds < 400 && !quic_stream_finished(& w.c, rid) {
+        step(& mut w);
+        append(& mut raw, quic_stream_read(& mut w.c, rid));
+        rounds = rounds + 1;
+    }
+    append(& mut raw, quic_stream_read(& mut w.c, rid));
+    val t0: QuicVarint = quic_varint_decode(raw, 0);
+    val l0: QuicVarint = quic_varint_decode(raw, 1);
+    if !t0.ok || t0.value != H3F_HEADERS || !l0.ok { p_panic("no HEADERS in the raw response"); }
+    var block: Vec<i64> = Vec::new();
+    var bi: i64 = 0;
+    while bi < l0.value {
+        block.push(raw.get(1 + l0.len + bi));
+        bi = bi + 1;
+    }
+    val rf: QpackFields = qpack_decode(block, - 1);
+    if !rf.ok || rf.names.get(0) != ":status" { p_panic("raw response fields"); }
+    if quic_conn_done(& w.s) { p_panic("reserved types closed the connection"); }
+    println("reserved frame and stream ignored: " + rf.values.get(0));
+
+    // Stream errors: no :path; a body shorter than content-length
+    var np: Vec<str> = Vec::new();
+    np.push(":method");
+    np.push("GET");
+    np.push(":scheme");
+    np.push("https");
+    np.push(":authority");
+    np.push("localhost");
+    val sid1: i64 = quic_open_bidi(& mut w.c);
+    quic_stream_write(& mut w.c, sid1, headers_frame(fields(np)), true);
+    h3_track(& mut w.hc, sid1, "GET");
+    val m0: H3Message = wait(& mut w, sid1);
+    if m0.ok { p_panic("a request without :path was answered"); }
+    println("no :path: " + int_to_str(m0.error));
+    var cn: Vec<str> = Vec::new();
+    var cv: Vec<str> = Vec::new();
+    cn.push("content-length");
+    cv.push("10");
+    val sid2: i64 = h3_request(& mut w.hc, & mut w.c, "POST", "https", "localhost", "/echo", cn, cv, str_bytes("short"));
+    val m6: H3Message = wait(& mut w, sid2);
+    if m6.ok || m6.error != H3_MESSAGE_ERROR { p_panic("short body accepted"); }
+    println("short body: " + int_to_str(m6.error));
+
+    // GOAWAY: the request in flight is answered, new ones are refused
+    val fid: i64 = send_req(& mut w, "GET", "/inflight", no_bytes());
+    rounds = 0;
+    while rounds < 200 && w.held.len() == 0 {
+        step(& mut w);
+        rounds = rounds + 1;
+    }
+    if w.held.len() != 1 { p_panic("in-flight request did not arrive"); }
+    h3_goaway(& mut w.hs, & mut w.s);
+    if w.hs.goaway_sent != fid + 4 { p_panic("goaway id " + int_to_str(w.hs.goaway_sent)); }
+    rounds = 0;
+    while rounds < 200 && w.hc.goaway_recv < 0 {
+        step(& mut w);
+        rounds = rounds + 1;
+    }
+    if w.hc.goaway_recv != fid + 4 { p_panic("client goaway " + int_to_str(w.hc.goaway_recv)); }
+    if h3_request(& mut w.hc, & mut w.c, "GET", "https", "localhost", "/", no_strs(), no_strs(), no_bytes()) >= 0 {
+        p_panic("a request after GOAWAY");
+    }
+    val tp: Vec<Vec<str>> = text("text/plain");
+    h3_respond(& mut w.hs, & mut w.s, w.held.get(0), 200, tp.get(0), tp.get(1), str_bytes("done"));
+    w.held = Vec::new();
+    val m7: H3Message = wait(& mut w, fid);
+    if !m7.ok || m7.status != 200 { p_panic("in-flight request after GOAWAY"); }
+    println("goaway: in-flight " + int_to_str(m7.status) + ", new requests refused");
+
+    h3_close(& mut w.hc, & mut w.c, w.n.now);
+    rounds = 0;
+    while rounds < 50 && !w.s.peer_closed {
+        step(& mut w);
+        rounds = rounds + 1;
+    }
+    if !w.s.peer_closed || w.s.error != H3_NO_ERROR { p_panic("close"); }
+    println("closed: " + int_to_str(w.s.error));
+
+    // Connection errors
+    var data_first: Vec<i64> = h3_frame(H3F_DATA, str_bytes("body"));
+    append(& mut data_first, headers_frame(get_fields("/")));
+    println("data before headers: " + int_to_str(conn_error(data_first, false, true)));
+    var s2: Vec<i64> = Vec::new();
+    s2.push(H3_STREAM_CONTROL);
+    var ids: Vec<i64> = Vec::new();
+    var vals: Vec<i64> = Vec::new();
+    ids.push(0x02);
+    vals.push(1);
+    append(& mut s2, h3_settings_frame(ids, vals));
+    println("http/2 setting: " + int_to_str(conn_error(s2, true, false)));
+    var ms: Vec<i64> = Vec::new();
+    ms.push(H3_STREAM_CONTROL);
+    append(& mut ms, h3_varint_frame(H3F_GOAWAY, 0));
+    println("missing settings: " + int_to_str(conn_error(ms, true, false)));
+    // HEADERS whose prefix has Required Insert Count 2
+    println("dynamic reference: " + int_to_str(conn_error(h3_frame(H3F_HEADERS, hb("0200d1")), false, true)));
+    var cc: Vec<i64> = Vec::new();
+    cc.push(H3_STREAM_CONTROL);
+    var none_i: Vec<i64> = Vec::new();
+    append(& mut cc, h3_settings_frame(none_i, none_i));
+    println("control stream closed: " + int_to_str(conn_error(cc, true, true)));
+    // HEADERS of 10 bytes, 3 sent, then FIN
+    println("frame cut short: " + int_to_str(conn_error(hb("010a000051"), false, true)));
+
+    // The server opens a bidirectional stream: the client closes the
+    // connection
+    var w2: World = world(true);
+    val bid: i64 = quic_open_bidi(& mut w2.s);
+    quic_stream_write(& mut w2.s, bid, headers_frame(get_fields("/")), true);
+    rounds = 0;
+    while rounds < 400 && !w2.s.peer_closed {
+        step(& mut w2);
+        rounds = rounds + 1;
+    }
+    if !w2.s.peer_closed || w2.hc.error != H3_STREAM_CREATION_ERROR { p_panic("server bidi stream"); }
+    println("server bidi stream: " + int_to_str(w2.s.error));
+    println("http3 ok");
+    return 0;
+}

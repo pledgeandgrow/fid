@@ -1,0 +1,167 @@
+// competitive-roadmap OP21: the simd module's integer intrinsics over
+// Vec<i64> (stdlib/simd.fd add_i64, sub_i64, and_i64, or_i64, xor_i64,
+// wrapping at 64 bits). `fid run` and the C path run their Fides loops;
+// `fid emit` turns simd_lanes_*_i64 into vector loops (compiler/nat_ir.fd
+// ng_simd_call, mode 3: paddq/psubq/pand/por/pxor, AVX2 under --cpu
+// x86-64-v3; NEON .2d / .16b on AArch64; RVV under --cpu rv64gcv) of two
+// lanes a step (four under AVX2), then a scalar loop for the rest.
+// Lengths 0..9, 33 and 1001 cover an empty input, a tail only, whole
+// vectors only and both; the values include i64 MIN and MAX so that the
+// additions wrap in some lanes; b longer than a, a shared buffer, a result
+// that grows afterwards and a value kept live across the vector code.
+// tests/nattools/simd_i64_check.sh builds it for every target and checks
+// that the vector operations were selected.
+// Expected output:
+// n=0 add=1 sub=0 and=0 or=0 xor=0 len=1
+// n=1 add=-97 sub=0 and=-48 or=-48 xor=0 len=2
+// n=2 add=674423 sub=-674427 and=674424 or=-3 xor=-674427 len=3
+// n=3 add=674259 sub=-674435 and=674332 or=-71 xor=-674403 len=4
+// n=4 add=674332 sub=674445 and=674398 or=-69 xor=-674467 len=5
+// n=5 add=-257 sub=-132 and=-182 or=-72 xor=110 len=6
+// n=6 add=-82 sub=-102 and=-17 or=-69 xor=-52 len=7
+// n=7 add=-162 sub=-30 and=-17 or=-141 xor=-124 len=8
+// n=8 add=7 sub=26 and=107 or=-105 xor=-212 len=9
+// n=9 add=-163 sub=-54 and=-13 or=-145 xor=-132 len=10
+// n=33 add=-673414 sub=-673875 and=350 or=-673747 xor=-674097 len=34
+// n=1001 add=551450 sub=-546819 and=647122 or=-95171 xor=606651 len=1002
+// wrap: [-9223372036854775808, 9223372036854775807, 0, -2] [-9223372036854775806, 9223372036854775807, 2, 0]
+// add: [12, 14, 16, 18, 20]
+// sub: [-10, -10, -10, -10, -10]
+// and: [1, 0, 1, 4, 5]
+// or: [11, 14, 15, 14, 15]
+// xor: [10, 14, 14, 10, 10]
+// longer b: [101, 202, 303]
+// shared: [2, 4, 6, 8, 10] [0, 0, 0, 0, 0]
+// kept 7 41
+// done
+
+use simd;
+
+/// A deterministic mix of small, negative and extreme values.
+@wrapping fn val(i: i64, salt: i64) -> i64 {
+    var k: i64 = (i * 7 + salt) % 11;
+    if k == 0 {
+        return 9223372036854775807;
+    }
+    if k == 1 {
+        return 0 - 9223372036854775807 - 1;
+    }
+    if k == 2 {
+        return 0 - 1;
+    }
+    return (i * salt) % 97 - 48;
+}
+
+fn make(n: i64, salt: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(val(i, salt));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// sum of v[i] * w(i) for weights 1, -1, 2, -2, ..., wrapping, folded to a
+/// small number (the high bits of a wrapped lane still change it)
+@wrapping fn check(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        var w: i64 = i / 2 + 1;
+        if i % 2 == 1 {
+            w = 0 - w;
+        }
+        s = s + v.get(i) * w;
+        i = i + 1;
+    }
+    var h: i64 = s % 1000003;
+    var q: i64 = s / 1000003 % 1000003;
+    return h - q % 1000;
+}
+
+fn show(v: Vec<i64>) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+fn case_n(n: i64) {
+    var a: Vec<i64> = make(n, 3);
+    var b: Vec<i64> = make(n, 5);
+    var s: Vec<i64> = add_i64(a, b);
+    var d: Vec<i64> = sub_i64(a, b);
+    var x: Vec<i64> = and_i64(a, b);
+    var o: Vec<i64> = or_i64(a, b);
+    var e: Vec<i64> = xor_i64(a, b);
+    // the result must grow like any other Vec
+    s.push(1);
+    print("n=" + int_to_str(n) + " add=" + int_to_str(check(s)) + " sub=" + int_to_str(check(d)) + " and=" + int_to_str(check(x)) + " or=" + int_to_str(check(o)) + " xor=" + int_to_str(check(e)) + " len=" + int_to_str(s.len()) + "\n");
+}
+
+fn main() {
+    case_n(0);
+    case_n(1);
+    case_n(2);
+    case_n(3);
+    case_n(4);
+    case_n(5);
+    case_n(6);
+    case_n(7);
+    case_n(8);
+    case_n(9);
+    case_n(33);
+    case_n(1001);
+    // wrapping lanes: MAX + 1, MIN + (-1), -1 + 1, -1 + -1
+    var wa: Vec<i64> = Vec::new();
+    wa.push(9223372036854775807);
+    wa.push(0 - 9223372036854775807 - 1);
+    wa.push(0 - 1);
+    wa.push(0 - 1);
+    var wb: Vec<i64> = Vec::new();
+    wb.push(1);
+    wb.push(0 - 1);
+    wb.push(1);
+    wb.push(0 - 1);
+    print("wrap: " + show(add_i64(wa, wb)) + " " + show(sub_i64(wb, wa)) + "\n");
+    var p: Vec<i64> = Vec::new();
+    var q: Vec<i64> = Vec::new();
+    var i: i64 = 1;
+    while i <= 5 {
+        p.push(i);
+        q.push(i + 10);
+        i = i + 1;
+    }
+    print("add: " + show(add_i64(p, q)) + "\n");
+    print("sub: " + show(sub_i64(p, q)) + "\n");
+    print("and: " + show(and_i64(p, q)) + "\n");
+    print("or: " + show(or_i64(p, q)) + "\n");
+    print("xor: " + show(xor_i64(p, q)) + "\n");
+    // b longer than a: a's length
+    var la: Vec<i64> = Vec::new();
+    la.push(1);
+    la.push(2);
+    la.push(3);
+    var lb: Vec<i64> = Vec::new();
+    var j: i64 = 1;
+    while j <= 7 {
+        lb.push(j * 100);
+        j = j + 1;
+    }
+    print("longer b: " + show(add_i64(la, lb)) + "\n");
+    // a Vec sharing its buffer with another
+    var sh: Vec<i64> = p;
+    print("shared: " + show(add_i64(sh, p)) + " " + show(xor_i64(p, sh)) + "\n");
+    // a value live across the vector code
+    var live: i64 = 7;
+    var lv: Vec<i64> = xor_i64(q, p);
+    print("kept " + int_to_str(live) + " " + int_to_str(live + lv.get(0) + lv.get(4) + lv.get(1)) + "\n");
+    print("done\n");
+}

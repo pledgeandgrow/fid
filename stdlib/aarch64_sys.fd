@@ -1,0 +1,706 @@
+// Fides AArch64 system architecture helpers, pure Fides.
+//
+// From the Arm Architecture Reference Manual for A-profile (DDI 0487):
+//   - exception levels, PSTATE/SPSR_ELx fields (C5.2.18) and the
+//     exception-return mode encodings,
+//   - ESR_ELx decode (D17.2.37): exception class names, the data/
+//     instruction abort ISS (fault status codes with their translation
+//     level, WnR, SRT, FAR validity), SVC/HVC/SMC/BRK immediates,
+//   - the MRS/MSR instruction encoding of system registers (op0, op1,
+//     CRn, CRm, op2) for the registers a kernel touches,
+//   - the generic timer (CNTP_CTL, CNTFRQ, TVAL/CVAL arithmetic),
+//   - VMSAv8-64 stage-1 translation with the 4 KiB granule and 48-bit
+//     VAs (D8): table/block/page descriptor encoding, MAIR attributes,
+//     TCR_EL1 composition, and a software page-table builder and walker,
+//   - the GICv2 distributor and CPU interface register maps (IHI 0048B)
+//     and the GICv3 distributor/redistributor maps and ICC_SGI1R_EL1
+//     (IHI 0069), with the standard init sequences.
+//
+// What is real and what is the seam. Encoders, decoders, the page-table
+// builder/walker and the register sequences are real. System registers
+// need MRS/MSR, which Fides inline asm cannot emit (it is x86 only): the
+// module gives the 32-bit MRS/MSR instructions (a64_mrs/a64_msr) for a
+// boot stub, and treats the register values as data. The GIC is memory-
+// mapped: its accesses go through a regmap.fd RegBus (regbus_mmio() on
+// hardware, regbus_fake() in tests). Page tables are built in a Vec-backed
+// physical memory model (A64Mem); copying them to real RAM is the caller's.
+
+module aarch64_sys;
+ use vec; use string; use regmap;
+
+// ─── Exception levels and PSTATE ────────────────────────────────────────
+
+/// CurrentEL register value -> EL number (bits 3:2).
+pub fn a64_current_el(v: i64) -> i64 {
+    return (v >> 2) & 3;
+}
+
+/// SPSR M[3:0] for returning to `el` with SP_ELx (h) or SP_EL0 (t).
+pub fn a64_spsr_mode(el: i64, use_spx: bool) -> i64 {
+    var m: i64 = el << 2;
+    if use_spx && el > 0 { m = m | 1; }
+    return m;
+}
+
+pub const PSTATE_D: i64 = 0x200;
+pub const PSTATE_A: i64 = 0x100;
+pub const PSTATE_I: i64 = 0x80;
+pub const PSTATE_F: i64 = 0x40;
+
+/// SPSR value for an ERET to `el` (h variant) with the given DAIF masks.
+pub fn a64_spsr(el: i64, daif: i64) -> i64 {
+    return a64_spsr_mode(el, true) | (daif & 0x3C0);
+}
+
+/// Decode an SPSR_ELx: "EL1h DAIF=0101 NZCV=0000".
+pub fn a64_spsr_decode(v: i64) -> str {
+    var mode: str = "";
+    if ((v >> 4) & 1) != 0 {
+        mode = "AArch32 mode " + regmap_hex(v & 0x1F, 2);
+    } else {
+        val el: i64 = (v >> 2) & 3;
+        mode = "EL" + int_to_str(el);
+        if el == 0 { mode = mode + "t"; } else if (v & 1) != 0 { mode = mode + "h"; } else { mode = mode + "t"; }
+    }
+    var daif: str = "";
+    var b: i64 = 9;
+    while b >= 6 {
+        daif = daif + int_to_str((v >> b) & 1);
+        b = b - 1;
+    }
+    var nzcv: str = "";
+    b = 31;
+    while b >= 28 {
+        nzcv = nzcv + int_to_str((v >> b) & 1);
+        b = b - 1;
+    }
+    var out: str = mode + " DAIF=" + daif + " NZCV=" + nzcv;
+    if ((v >> 21) & 1) != 0 { out = out + " SS"; }
+    if ((v >> 20) & 1) != 0 { out = out + " IL"; }
+    if ((v >> 22) & 1) != 0 { out = out + " PAN"; }
+    return out;
+}
+
+// ─── ESR_ELx ────────────────────────────────────────────────────────────
+
+pub fn a64_esr_ec(esr: i64) -> i64 {
+    return (esr >> 26) & 0x3F;
+}
+
+pub fn a64_esr_iss(esr: i64) -> i64 {
+    return esr & 0x1FFFFFF;
+}
+
+pub fn a64_ec_name(ec: i64) -> str {
+    if ec == 0x00 { return "Unknown reason"; }
+    if ec == 0x01 { return "Trapped WFI/WFE"; }
+    if ec == 0x07 { return "SVE/SIMD/FP access trap"; }
+    if ec == 0x0E { return "Illegal execution state"; }
+    if ec == 0x11 { return "SVC (AArch32)"; }
+    if ec == 0x15 { return "SVC (AArch64)"; }
+    if ec == 0x16 { return "HVC (AArch64)"; }
+    if ec == 0x17 { return "SMC (AArch64)"; }
+    if ec == 0x18 { return "Trapped MSR/MRS/system instruction"; }
+    if ec == 0x19 { return "SVE access trap"; }
+    if ec == 0x20 { return "Instruction abort from a lower EL"; }
+    if ec == 0x21 { return "Instruction abort from the same EL"; }
+    if ec == 0x22 { return "PC alignment fault"; }
+    if ec == 0x24 { return "Data abort from a lower EL"; }
+    if ec == 0x25 { return "Data abort from the same EL"; }
+    if ec == 0x26 { return "SP alignment fault"; }
+    if ec == 0x2C { return "Floating-point exception (AArch64)"; }
+    if ec == 0x2F { return "SError interrupt"; }
+    if ec == 0x30 { return "Breakpoint from a lower EL"; }
+    if ec == 0x31 { return "Breakpoint from the same EL"; }
+    if ec == 0x32 { return "Software step from a lower EL"; }
+    if ec == 0x33 { return "Software step from the same EL"; }
+    if ec == 0x34 { return "Watchpoint from a lower EL"; }
+    if ec == 0x35 { return "Watchpoint from the same EL"; }
+    if ec == 0x3C { return "BRK instruction (AArch64)"; }
+    return "EC " + regmap_hex(ec, 2);
+}
+
+/// Fault status code (DFSC/IFSC) name, with the translation level.
+pub fn a64_fsc_name(fsc: i64) -> str {
+    val lvl: i64 = fsc & 3;
+    val kind: i64 = fsc >> 2;
+    if kind == 0 { return "Address size fault, level " + int_to_str(lvl); }
+    if kind == 1 { return "Translation fault, level " + int_to_str(lvl); }
+    if kind == 2 { return "Access flag fault, level " + int_to_str(lvl); }
+    if kind == 3 { return "Permission fault, level " + int_to_str(lvl); }
+    if fsc == 0x10 { return "Synchronous external abort"; }
+    if fsc == 0x11 { return "Synchronous tag check fault"; }
+    if fsc >= 0x14 && fsc <= 0x17 { return "Synchronous external abort on table walk, level " + int_to_str(lvl); }
+    if fsc == 0x21 { return "Alignment fault"; }
+    if fsc == 0x30 { return "TLB conflict abort"; }
+    return "FSC " + regmap_hex(fsc, 2);
+}
+
+/// One line for an ESR (and FAR when the syndrome says it is valid).
+pub fn a64_esr_decode(esr: i64, far: i64) -> str {
+    val ec: i64 = a64_esr_ec(esr);
+    val iss: i64 = a64_esr_iss(esr);
+    var out: str = a64_ec_name(ec);
+    if ec == 0x15 || ec == 0x16 || ec == 0x17 || ec == 0x3C {
+        return out + " #" + int_to_str(iss & 0xFFFF);
+    }
+    if ec == 0x24 || ec == 0x25 {
+        out = out + ": " + a64_fsc_name(iss & 0x3F);
+        if ((iss >> 6) & 1) != 0 { out = out + ", write"; } else { out = out + ", read"; }
+        if ((iss >> 24) & 1) != 0 {
+            val sas: i64 = (iss >> 22) & 3;
+            out = out + ", " + int_to_str(1 << sas) + " bytes into x" + int_to_str((iss >> 16) & 31);
+        }
+        if ((iss >> 7) & 1) != 0 { out = out + ", stage-2 walk"; }
+        if ((iss >> 10) & 1) == 0 { out = out + ", FAR " + regmap_hex(far, 16); }
+        return out;
+    }
+    if ec == 0x20 || ec == 0x21 {
+        out = out + ": " + a64_fsc_name(iss & 0x3F);
+        if ((iss >> 10) & 1) == 0 { out = out + ", FAR " + regmap_hex(far, 16); }
+        return out;
+    }
+    if ec == 0x18 {
+        // ISS: Op0 21:20, Op2 19:17, Op1 16:14, CRn 13:10, Rt 9:5, CRm 4:1, Direction 0 (1 = read).
+        var dir: str = "MSR";
+        if (iss & 1) != 0 { dir = "MRS"; }
+        return out + ": " + dir + " S" + int_to_str((iss >> 20) & 3) + "_" + int_to_str((iss >> 14) & 7) + "_C"
+            + int_to_str((iss >> 10) & 15) + "_C" + int_to_str((iss >> 1) & 15) + "_" + int_to_str((iss >> 17) & 7)
+            + " x" + int_to_str((iss >> 5) & 31);
+    }
+    return out + ", ISS " + regmap_hex(iss, 7);
+}
+
+/// The vector-table offset VBAR_ELx + offset for an exception: `kind` 0
+/// synchronous, 1 IRQ, 2 FIQ, 3 SError; from the current EL with SP_EL0
+/// (0), with SP_ELx (1), from a lower EL in AArch64 (2) or AArch32 (3).
+pub fn a64_vector_offset(source: i64, kind: i64) -> i64 {
+    return source * 0x200 + kind * 0x80;
+}
+
+// ─── System registers: MRS / MSR encoding ───────────────────────────────
+
+/// A system register as op0:op1:CRn:CRm:op2 packed (op0 << 14 | op1 << 11
+/// | CRn << 7 | CRm << 3 | op2), the order of the MRS/MSR fields.
+pub fn a64_sysreg(op0: i64, op1: i64, crn: i64, crm: i64, op2: i64) -> i64 {
+    return (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+}
+
+pub fn A64_CURRENTEL() -> i64 { return a64_sysreg(3, 0, 4, 2, 2); }
+pub fn A64_DAIF() -> i64 { return a64_sysreg(3, 3, 4, 2, 1); }
+pub fn A64_SPSR_EL1() -> i64 { return a64_sysreg(3, 0, 4, 0, 0); }
+pub fn A64_ELR_EL1() -> i64 { return a64_sysreg(3, 0, 4, 0, 1); }
+pub fn A64_SCTLR_EL1() -> i64 { return a64_sysreg(3, 0, 1, 0, 0); }
+pub fn A64_TTBR0_EL1() -> i64 { return a64_sysreg(3, 0, 2, 0, 0); }
+pub fn A64_TTBR1_EL1() -> i64 { return a64_sysreg(3, 0, 2, 0, 1); }
+pub fn A64_TCR_EL1() -> i64 { return a64_sysreg(3, 0, 2, 0, 2); }
+pub fn A64_ESR_EL1() -> i64 { return a64_sysreg(3, 0, 5, 2, 0); }
+pub fn A64_FAR_EL1() -> i64 { return a64_sysreg(3, 0, 6, 0, 0); }
+pub fn A64_MAIR_EL1() -> i64 { return a64_sysreg(3, 0, 10, 2, 0); }
+pub fn A64_VBAR_EL1() -> i64 { return a64_sysreg(3, 0, 12, 0, 0); }
+pub fn A64_MPIDR_EL1() -> i64 { return a64_sysreg(3, 0, 0, 0, 5); }
+pub fn A64_CNTFRQ_EL0() -> i64 { return a64_sysreg(3, 3, 14, 0, 0); }
+pub fn A64_CNTPCT_EL0() -> i64 { return a64_sysreg(3, 3, 14, 0, 1); }
+pub fn A64_CNTVCT_EL0() -> i64 { return a64_sysreg(3, 3, 14, 0, 2); }
+pub fn A64_CNTP_TVAL_EL0() -> i64 { return a64_sysreg(3, 3, 14, 2, 0); }
+pub fn A64_CNTP_CTL_EL0() -> i64 { return a64_sysreg(3, 3, 14, 2, 1); }
+pub fn A64_CNTP_CVAL_EL0() -> i64 { return a64_sysreg(3, 3, 14, 2, 2); }
+pub fn A64_CNTV_CTL_EL0() -> i64 { return a64_sysreg(3, 3, 14, 3, 1); }
+pub fn A64_CNTV_CVAL_EL0() -> i64 { return a64_sysreg(3, 3, 14, 3, 2); }
+pub fn A64_ICC_PMR_EL1() -> i64 { return a64_sysreg(3, 0, 4, 6, 0); }
+pub fn A64_ICC_IAR1_EL1() -> i64 { return a64_sysreg(3, 0, 12, 12, 0); }
+pub fn A64_ICC_EOIR1_EL1() -> i64 { return a64_sysreg(3, 0, 12, 12, 1); }
+pub fn A64_ICC_SGI1R_EL1() -> i64 { return a64_sysreg(3, 0, 12, 11, 5); }
+pub fn A64_ICC_SRE_EL1() -> i64 { return a64_sysreg(3, 0, 12, 12, 5); }
+pub fn A64_ICC_IGRPEN1_EL1() -> i64 { return a64_sysreg(3, 0, 12, 12, 7); }
+
+/// MRS Xt, <sysreg>.
+pub fn a64_mrs(rt: i64, sysreg: i64) -> i64 {
+    return 0xD5200000 | ((sysreg & 0xFFFF) << 5) | (rt & 31);
+}
+
+/// MSR <sysreg>, Xt.
+pub fn a64_msr(sysreg: i64, rt: i64) -> i64 {
+    return 0xD5000000 | ((sysreg & 0xFFFF) << 5) | (rt & 31);
+}
+
+pub const A64_ERET: i64 = 0xD69F03E0;
+pub const A64_WFI: i64 = 0xD503207F;
+pub const A64_ISB: i64 = 0xD5033FDF;
+pub const A64_DSB_SY: i64 = 0xD5033F9F;
+
+/// The name of a packed system register (those above), else S<op0>_...
+pub fn a64_sysreg_name(r: i64) -> str {
+    if r == A64_CURRENTEL() { return "CurrentEL"; }
+    if r == A64_DAIF() { return "DAIF"; }
+    if r == A64_SPSR_EL1() { return "SPSR_EL1"; }
+    if r == A64_ELR_EL1() { return "ELR_EL1"; }
+    if r == A64_SCTLR_EL1() { return "SCTLR_EL1"; }
+    if r == A64_TTBR0_EL1() { return "TTBR0_EL1"; }
+    if r == A64_TTBR1_EL1() { return "TTBR1_EL1"; }
+    if r == A64_TCR_EL1() { return "TCR_EL1"; }
+    if r == A64_ESR_EL1() { return "ESR_EL1"; }
+    if r == A64_FAR_EL1() { return "FAR_EL1"; }
+    if r == A64_MAIR_EL1() { return "MAIR_EL1"; }
+    if r == A64_VBAR_EL1() { return "VBAR_EL1"; }
+    if r == A64_MPIDR_EL1() { return "MPIDR_EL1"; }
+    if r == A64_CNTFRQ_EL0() { return "CNTFRQ_EL0"; }
+    if r == A64_CNTPCT_EL0() { return "CNTPCT_EL0"; }
+    if r == A64_CNTP_CTL_EL0() { return "CNTP_CTL_EL0"; }
+    if r == A64_CNTP_CVAL_EL0() { return "CNTP_CVAL_EL0"; }
+    if r == A64_CNTP_TVAL_EL0() { return "CNTP_TVAL_EL0"; }
+    return "S" + int_to_str((r >> 14) & 3) + "_" + int_to_str((r >> 11) & 7) + "_C" + int_to_str((r >> 7) & 15)
+        + "_C" + int_to_str((r >> 3) & 15) + "_" + int_to_str(r & 7);
+}
+
+/// Disassemble an MRS/MSR: "mrs x0, CurrentEL"; "" otherwise.
+pub fn a64_sysreg_disasm(insn: i64) -> str {
+    val top: i64 = insn & 0xFFF00000;
+    val r: i64 = (insn >> 5) & 0xFFFF;
+    val rt: i64 = insn & 31;
+    // op0 is 2 or 3 for system registers, so bit 20 is always set.
+    if top == 0xD5300000 {
+        return "mrs x" + int_to_str(rt) + ", " + a64_sysreg_name(r);
+    }
+    if top == 0xD5100000 { return "msr " + a64_sysreg_name(r) + ", x" + int_to_str(rt); }
+    return "";
+}
+
+/// MPIDR_EL1 affinity as "Aff3.Aff2.Aff1.Aff0".
+pub fn a64_mpidr_decode(v: i64) -> str {
+    return int_to_str((v >> 32) & 0xFF) + "." + int_to_str((v >> 16) & 0xFF) + "." + int_to_str((v >> 8) & 0xFF) + "." + int_to_str(v & 0xFF);
+}
+
+// ─── Generic timer ──────────────────────────────────────────────────────
+
+pub const CNT_CTL_ENABLE: i64 = 1;
+pub const CNT_CTL_IMASK: i64 = 2;
+pub const CNT_CTL_ISTATUS: i64 = 4;
+
+/// TVAL for an interrupt `us` microseconds from now.
+pub fn a64_timer_tval(freq: i64, us: i64) -> i64 {
+    return freq / 1000000 * us + (freq % 1000000) * us / 1000000;
+}
+
+/// CVAL for a deadline `us` after the counter value `now`.
+pub fn a64_timer_cval(now: i64, freq: i64, us: i64) -> i64 {
+    return now + a64_timer_tval(freq, us);
+}
+
+/// TVAL as the hardware reads it: CVAL - counter, as a signed 32-bit
+/// value (negative once the deadline has passed).
+pub fn a64_timer_tval_read(cval: i64, now: i64) -> i64 {
+    var d: i64 = (cval - now) & 0xFFFFFFFF;
+    if d >= 0x80000000 { d = d - 0x100000000; }
+    return d;
+}
+
+/// The timer condition: ISTATUS is set when the counter has reached CVAL
+/// (and the timer is enabled); the interrupt fires unless IMASK.
+pub fn a64_timer_ctl(enabled: bool, masked: bool, cval: i64, now: i64) -> i64 {
+    var v: i64 = 0;
+    if enabled { v = v | CNT_CTL_ENABLE; }
+    if masked { v = v | CNT_CTL_IMASK; }
+    if enabled && now >= cval { v = v | CNT_CTL_ISTATUS; }
+    return v;
+}
+
+pub fn a64_timer_fires(ctl: i64) -> bool {
+    return (ctl & 7) == 5;
+}
+
+// ─── MMU: VMSAv8-64, 4 KiB granule, 48-bit VA ───────────────────────────
+
+pub const DESC_INVALID: i64 = 0;
+pub const DESC_BLOCK: i64 = 1;
+pub const DESC_TABLE: i64 = 3;
+pub const DESC_PAGE: i64 = 3;
+
+// Attribute bits of block/page descriptors.
+pub const DESC_NS: i64 = 0x20;
+pub const DESC_AP_RW_EL1: i64 = 0x00;
+pub const DESC_AP_RW_ALL: i64 = 0x40;
+pub const DESC_AP_RO_EL1: i64 = 0x80;
+pub const DESC_AP_RO_ALL: i64 = 0xC0;
+pub const DESC_SH_NONE: i64 = 0x000;
+pub const DESC_SH_OUTER: i64 = 0x200;
+pub const DESC_SH_INNER: i64 = 0x300;
+pub const DESC_AF: i64 = 0x400;
+pub const DESC_NG: i64 = 0x800;
+pub const DESC_CONT: i64 = 0x10000000000000;
+pub const DESC_PXN: i64 = 0x20000000000000;
+pub const DESC_UXN: i64 = 0x40000000000000;
+
+/// MAIR attribute bytes.
+pub const MAIR_DEVICE_NGNRNE: i64 = 0x00;
+pub const MAIR_DEVICE_NGNRE: i64 = 0x04;
+pub const MAIR_NORMAL_NC: i64 = 0x44;
+pub const MAIR_NORMAL_WB: i64 = 0xFF;
+
+/// MAIR_EL1 from up to 8 attribute bytes (index i in byte i).
+pub fn a64_mair(attrs: Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < attrs.len() && i < 8 {
+        v = v | ((attrs.get(i) & 0xFF) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// TCR_EL1 for 4 KiB granules on both halves, `va_bits` of VA, inner
+/// shareable write-back walks, physical address size code `ips`
+/// (0 32-bit, 1 36, 2 40, 3 42, 4 44, 5 48, 6 52).
+pub fn a64_tcr(va_bits: i64, ips: i64) -> i64 {
+    val tsz: i64 = 64 - va_bits;
+    var v: i64 = tsz | (1 << 8) | (1 << 10) | (3 << 12) | (0 << 14);
+    v = v | (tsz << 16) | (1 << 24) | (1 << 26) | (3 << 28) | (2 << 30);
+    v = v | ((ips & 7) << 32);
+    return v;
+}
+
+/// Index of `va` in the table of level `lvl` (0..3).
+pub fn a64_va_index(va: i64, lvl: i64) -> i64 {
+    return (va >> (39 - 9 * lvl)) & 0x1FF;
+}
+
+/// Bytes mapped by one entry of level `lvl`: 512G, 1G, 2M, 4K.
+pub fn a64_level_size(lvl: i64) -> i64 {
+    return 1 << (39 - 9 * lvl);
+}
+
+/// A table descriptor pointing at the next-level table at `pa`.
+pub fn a64_table_desc(pa: i64) -> i64 {
+    if (pa & 0xFFF) != 0 { p_panic("aarch64_sys: table address not 4 KiB aligned"); }
+    return (pa & 0xFFFFFFFFF000) | DESC_TABLE;
+}
+
+/// A block (lvl 1 or 2) or page (lvl 3) descriptor: output address `pa`,
+/// MAIR index `attr_idx`, and the other attribute bits in `attrs` (AP, SH,
+/// AF, nG, PXN, UXN ...).
+pub fn a64_leaf_desc(lvl: i64, pa: i64, attr_idx: i64, attrs: i64) -> i64 {
+    if lvl < 1 || lvl > 3 { p_panic("aarch64_sys: 4 KiB granule blocks exist at levels 1 and 2 only"); }
+    val sz: i64 = a64_level_size(lvl);
+    if (pa & (sz - 1)) != 0 { p_panic("aarch64_sys: output address not aligned to the level size"); }
+    var t: i64 = DESC_BLOCK;
+    if lvl == 3 { t = DESC_PAGE; }
+    return (pa & 0xFFFFFFFFF000) | ((attr_idx & 7) << 2) | attrs | t;
+}
+
+/// Decode a descriptor at level `lvl`.
+pub fn a64_desc_decode(d: i64, lvl: i64) -> str {
+    val t: i64 = d & 3;
+    if (t & 1) == 0 { return "invalid"; }
+    if t == 3 && lvl < 3 { return "table -> " + regmap_hex(d & 0xFFFFFFFFF000, 8); }
+    if t == 1 && lvl == 3 { return "reserved"; }
+    var kind: str = "page";
+    if lvl < 3 { kind = "block"; }
+    var out: str = kind + " " + regmap_hex(d & 0xFFFFFFFFF000, 8) + " attr" + int_to_str((d >> 2) & 7);
+    val ap: i64 = (d >> 6) & 3;
+    if ap == 0 { out = out + " EL1-RW"; }
+    if ap == 1 { out = out + " RW"; }
+    if ap == 2 { out = out + " EL1-RO"; }
+    if ap == 3 { out = out + " RO"; }
+    val sh: i64 = (d >> 8) & 3;
+    if sh == 2 { out = out + " OSH"; }
+    if sh == 3 { out = out + " ISH"; }
+    if (d & DESC_AF) != 0 { out = out + " AF"; }
+    if (d & DESC_NG) != 0 { out = out + " nG"; }
+    if (d & DESC_PXN) != 0 { out = out + " PXN"; }
+    if (d & DESC_UXN) != 0 { out = out + " UXN"; }
+    return out;
+}
+
+/// Page tables in a model of physical memory: each 4 KiB table is 512
+/// descriptors, allocated from `next_pa` upwards.
+pub struct A64Mem {
+    pub tables: HashMap<i64, Vec<i64>>,
+    pub root: i64,
+    pub next_pa: i64,
+}
+
+pub fn a64mem_new(table_pool_pa: i64) -> A64Mem {
+    var m: A64Mem = A64Mem { tables: HashMap::new(), root: table_pool_pa, next_pa: table_pool_pa + 4096 };
+    m.tables.insert(table_pool_pa, Vec::filled(512, 0));
+    return m;
+}
+
+fn a64mem_table(m: &A64Mem, pa: i64) -> Vec<i64> {
+    return m.tables.get(pa);
+}
+
+/// The next-level table under entry `idx` of table `pa`, made when absent.
+fn a64mem_next(m: &mut A64Mem, pa: i64, idx: i64) -> i64 {
+    var t: Vec<i64> = m.tables.get(pa);
+    val d: i64 = t.get(idx);
+    if (d & 3) == DESC_TABLE { return d & 0xFFFFFFFFF000; }
+    if (d & 1) != 0 { p_panic("aarch64_sys: mapping over an existing block"); }
+    val npa: i64 = m.next_pa;
+    m.next_pa = m.next_pa + 4096;
+    m.tables.insert(npa, Vec::filled(512, 0));
+    t.set(idx, a64_table_desc(npa));
+    m.tables.insert(pa, t);
+    return npa;
+}
+
+/// Map [va, va+size) to [pa, pa+size) with `attr_idx`/`attrs`, using
+/// 1 GiB and 2 MiB blocks where both addresses are aligned and enough
+/// remains, 4 KiB pages otherwise. Returns the number of descriptors
+/// written.
+pub fn a64mem_map(m: &mut A64Mem, va: i64, pa: i64, size: i64, attr_idx: i64, attrs: i64) -> i64 {
+    if ((va | pa | size) & 0xFFF) != 0 { p_panic("aarch64_sys: map needs 4 KiB alignment"); }
+    var off: i64 = 0;
+    var n: i64 = 0;
+    while off < size {
+        val v: i64 = va + off;
+        val p: i64 = pa + off;
+        val left: i64 = size - off;
+        var lvl: i64 = 3;
+        if ((v | p) & (a64_level_size(1) - 1)) == 0 && left >= a64_level_size(1) {
+            lvl = 1;
+        } else if ((v | p) & (a64_level_size(2) - 1)) == 0 && left >= a64_level_size(2) {
+            lvl = 2;
+        }
+        var t: i64 = m.root;
+        var l: i64 = 0;
+        while l < lvl {
+            t = a64mem_next(m, t, a64_va_index(v, l));
+            l = l + 1;
+        }
+        var tab: Vec<i64> = m.tables.get(t);
+        tab.set(a64_va_index(v, lvl), a64_leaf_desc(lvl, p, attr_idx, attrs));
+        m.tables.insert(t, tab);
+        off = off + a64_level_size(lvl);
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Result of a translation-table walk.
+pub struct A64Walk {
+    pub ok: bool,
+    pub pa: i64,
+    pub level: i64,
+    pub desc: i64,
+    pub fault: str,
+}
+
+/// Walk the tables for `va` as the MMU does (stage 1, TTBR0 region): the
+/// output address, the level of the leaf, or the translation fault.
+pub fn a64mem_walk(m: &A64Mem, va: i64) -> A64Walk {
+    if (va >> 48) != 0 {
+        return A64Walk { ok: false, pa: 0, level: 0, desc: 0, fault: "Translation fault, level 0 (VA outside TTBR0 range)" };
+    }
+    var t: i64 = m.root;
+    var lvl: i64 = 0;
+    while lvl <= 3 {
+        val tab: Vec<i64> = a64mem_table(m, t);
+        val d: i64 = tab.get(a64_va_index(va, lvl));
+        if (d & 1) == 0 || (lvl == 3 && (d & 3) == 1) || (lvl == 0 && (d & 3) == 1) {
+            return A64Walk { ok: false, pa: 0, level: lvl, desc: d, fault: a64_fsc_name(4 + lvl) };
+        }
+        if (d & 3) == DESC_TABLE && lvl < 3 {
+            t = d & 0xFFFFFFFFF000;
+            lvl = lvl + 1;
+        } else {
+            if (d & DESC_AF) == 0 {
+                return A64Walk { ok: false, pa: 0, level: lvl, desc: d, fault: a64_fsc_name(8 + lvl) };
+            }
+            val sz: i64 = a64_level_size(lvl);
+            val pa: i64 = (d & 0xFFFFFFFFF000 & ~(sz - 1)) | (va & (sz - 1));
+            return A64Walk { ok: true, pa: pa, level: lvl, desc: d, fault: "" };
+        }
+    }
+    return A64Walk { ok: false, pa: 0, level: 3, desc: 0, fault: "walk error" };
+}
+
+/// Would an access be permitted by the leaf descriptor? `el` 0 or 1,
+/// `write`, `exec`. Returns "" or the reason (a permission fault).
+pub fn a64_check_access(d: i64, el: i64, write: bool, exec: bool) -> str {
+    val ap: i64 = (d >> 6) & 3;
+    if el == 0 && (ap & 1) == 0 { return "EL0 has no access"; }
+    if write && (ap & 2) != 0 { return "read-only"; }
+    if exec && el == 0 && (d & DESC_UXN) != 0 { return "UXN"; }
+    if exec && el == 1 && (d & DESC_PXN) != 0 { return "PXN"; }
+    if exec && el == 1 && (ap & 1) != 0 && (ap & 2) == 0 { return "EL1 cannot execute EL0-writable memory"; }
+    return "";
+}
+
+// ─── GICv2 (IHI 0048B) ──────────────────────────────────────────────────
+
+pub const GICD_CTLR: i64 = 0x000;
+pub const GICD_TYPER: i64 = 0x004;
+pub const GICD_IIDR: i64 = 0x008;
+pub const GICD_IGROUPR: i64 = 0x080;
+pub const GICD_ISENABLER: i64 = 0x100;
+pub const GICD_ICENABLER: i64 = 0x180;
+pub const GICD_ISPENDR: i64 = 0x200;
+pub const GICD_ICPENDR: i64 = 0x280;
+pub const GICD_ISACTIVER: i64 = 0x300;
+pub const GICD_ICACTIVER: i64 = 0x380;
+pub const GICD_IPRIORITYR: i64 = 0x400;
+pub const GICD_ITARGETSR: i64 = 0x800;
+pub const GICD_ICFGR: i64 = 0xC00;
+pub const GICD_SGIR: i64 = 0xF00;
+pub const GICD_IROUTER: i64 = 0x6100;
+
+pub const GICC_CTLR: i64 = 0x00;
+pub const GICC_PMR: i64 = 0x04;
+pub const GICC_BPR: i64 = 0x08;
+pub const GICC_IAR: i64 = 0x0C;
+pub const GICC_EOIR: i64 = 0x10;
+pub const GICC_RPR: i64 = 0x14;
+pub const GICC_HPPIR: i64 = 0x18;
+
+pub const GIC_SPURIOUS: i64 = 1023;
+
+/// Number of interrupt lines from GICD_TYPER.ITLinesNumber.
+pub fn gic_lines(typer: i64) -> i64 {
+    var n: i64 = 32 * ((typer & 0x1F) + 1);
+    if n > 1020 { n = 1020; }
+    return n;
+}
+
+pub fn gic_kind(intid: i64) -> str {
+    if intid < 16 { return "SGI"; }
+    if intid < 32 { return "PPI"; }
+    if intid < 1020 { return "SPI"; }
+    if intid < 1024 { return "special"; }
+    if intid >= 8192 { return "LPI"; }
+    return "reserved";
+}
+
+pub fn gic_enable(bus: &mut RegBus, gicd: i64, intid: i64) {
+    regbus_write(bus, gicd + GICD_ISENABLER + 4 * (intid >> 5), 32, 1 << (intid & 31));
+}
+
+pub fn gic_disable(bus: &mut RegBus, gicd: i64, intid: i64) {
+    regbus_write(bus, gicd + GICD_ICENABLER + 4 * (intid >> 5), 32, 1 << (intid & 31));
+}
+
+/// Priority byte (byte-accessible register).
+pub fn gic_set_priority(bus: &mut RegBus, gicd: i64, intid: i64, prio: i64) {
+    regbus_write(bus, gicd + GICD_IPRIORITYR + intid, 8, prio & 0xFF);
+}
+
+/// GICv2 target CPU mask byte of an SPI.
+pub fn gic_set_targets(bus: &mut RegBus, gicd: i64, intid: i64, cpu_mask: i64) {
+    regbus_write(bus, gicd + GICD_ITARGETSR + intid, 8, cpu_mask & 0xFF);
+}
+
+/// Edge (true) or level (false) triggering: bit 2n+1 of ICFGR.
+pub fn gic_set_edge(bus: &mut RegBus, gicd: i64, intid: i64, edge: bool) {
+    val a: i64 = gicd + GICD_ICFGR + 4 * (intid >> 4);
+    val bit: i64 = 1 << (2 * (intid & 15) + 1);
+    var v: i64 = regbus_read(bus, a, 32);
+    if edge { v = v | bit; } else { v = v & ~bit; }
+    regbus_write(bus, a, 32, v);
+}
+
+/// GICD_SGIR value: filter 0 (the CPU list), 1 (all but self), 2 (self).
+pub fn gicv2_sgir(intid: i64, filter: i64, cpu_list: i64) -> i64 {
+    return ((filter & 3) << 24) | ((cpu_list & 0xFF) << 16) | (intid & 0xF);
+}
+
+pub fn gicv2_send_sgi(bus: &mut RegBus, gicd: i64, intid: i64, cpu_list: i64) {
+    regbus_write(bus, gicd + GICD_SGIR, 32, gicv2_sgir(intid, 0, cpu_list));
+}
+
+/// GICv2 distributor init: off, every SPI level-triggered at priority
+/// 0xA0 targeting CPU 0 and disabled, then on.
+pub fn gicv2_init_dist(bus: &mut RegBus, gicd: i64) {
+    regbus_write(bus, gicd + GICD_CTLR, 32, 0);
+    val lines: i64 = gic_lines(regbus_read(bus, gicd + GICD_TYPER, 32));
+    var i: i64 = 32;
+    while i < lines {
+        regbus_write(bus, gicd + GICD_ICFGR + 4 * (i >> 4), 32, 0);
+        i = i + 16;
+    }
+    i = 32;
+    while i < lines {
+        regbus_write(bus, gicd + GICD_IPRIORITYR + i, 32, 0xA0A0A0A0);
+        regbus_write(bus, gicd + GICD_ITARGETSR + i, 32, 0x01010101);
+        i = i + 4;
+    }
+    i = 32;
+    while i < lines {
+        regbus_write(bus, gicd + GICD_ICENABLER + 4 * (i >> 5), 32, 0xFFFFFFFF);
+        i = i + 32;
+    }
+    regbus_write(bus, gicd + GICD_CTLR, 32, 1);
+}
+
+/// GICv2 CPU interface init: priority mask (let everything above `pmr`
+/// through), binary point 0, enable.
+pub fn gicv2_init_cpu(bus: &mut RegBus, gicc: i64, pmr: i64) {
+    regbus_write(bus, gicc + GICC_PMR, 32, pmr & 0xFF);
+    regbus_write(bus, gicc + GICC_BPR, 32, 0);
+    regbus_write(bus, gicc + GICC_CTLR, 32, 1);
+}
+
+/// Acknowledge: the IAR value (INTID in bits 9:0, source CPU 12:10 for
+/// SGIs). Pass the whole value to gicv2_eoi.
+pub fn gicv2_ack(bus: &mut RegBus, gicc: i64) -> i64 {
+    return regbus_read(bus, gicc + GICC_IAR, 32);
+}
+
+pub fn gicv2_eoi(bus: &mut RegBus, gicc: i64, iar: i64) {
+    regbus_write(bus, gicc + GICC_EOIR, 32, iar);
+}
+
+// ─── GICv3 (IHI 0069) ───────────────────────────────────────────────────
+
+pub const GICR_CTLR: i64 = 0x0000;
+pub const GICR_TYPER: i64 = 0x0008;
+pub const GICR_WAKER: i64 = 0x0014;
+pub const GICR_SGI_BASE: i64 = 0x10000;
+pub const GICR_STRIDE: i64 = 0x20000;
+
+/// RD_base of the redistributor of CPU number `cpu`.
+pub fn gicr_base(gicr0: i64, cpu: i64) -> i64 {
+    return gicr0 + cpu * GICR_STRIDE;
+}
+
+/// GICD_IROUTER<n> value for an SPI routed to affinity a3.a2.a1.a0
+/// (irm: any participating PE).
+pub fn gicv3_irouter(a3: i64, a2: i64, a1: i64, a0: i64, irm: bool) -> i64 {
+    var v: i64 = ((a3 & 0xFF) << 32) | ((a2 & 0xFF) << 16) | ((a1 & 0xFF) << 8) | (a0 & 0xFF);
+    if irm { v = v | (1 << 31); }
+    return v;
+}
+
+/// ICC_SGI1R_EL1 for SGI `intid` to the PEs in `target_list` (bit n =
+/// Aff0 n) of cluster aff3.aff2.aff1, or to all but self (irm).
+pub fn gicv3_sgi1r(intid: i64, aff3: i64, aff2: i64, aff1: i64, target_list: i64, irm: bool) -> i64 {
+    var v: i64 = (target_list & 0xFFFF) | ((aff1 & 0xFF) << 16) | ((intid & 0xF) << 24) | ((aff2 & 0xFF) << 32) | ((aff3 & 0xFF) << 48);
+    if irm { v = v | (1 << 40); }
+    return v;
+}
+
+/// Wake a redistributor: clear GICR_WAKER.ProcessorSleep (bit 1) and wait
+/// for ChildrenAsleep (bit 2) to clear. False when it never did.
+pub fn gicv3_wake(bus: &mut RegBus, rd: i64, tries: i64) -> bool {
+    val w: i64 = regbus_read(bus, rd + GICR_WAKER, 32);
+    regbus_write(bus, rd + GICR_WAKER, 32, w & ~2);
+    var n: i64 = 0;
+    while n < tries {
+        if (regbus_read(bus, rd + GICR_WAKER, 32) & 4) == 0 { return true; }
+        n = n + 1;
+    }
+    return false;
+}
+
+/// Enable an SGI/PPI (0..31) in a redistributor's SGI frame, in Group 1.
+pub fn gicv3_enable_ppi(bus: &mut RegBus, rd: i64, intid: i64, prio: i64) {
+    val sgi: i64 = rd + GICR_SGI_BASE;
+    val g: i64 = regbus_read(bus, sgi + GICD_IGROUPR, 32);
+    regbus_write(bus, sgi + GICD_IGROUPR, 32, g | (1 << intid));
+    regbus_write(bus, sgi + GICD_IPRIORITYR + intid, 8, prio & 0xFF);
+    regbus_write(bus, sgi + GICD_ISENABLER, 32, 1 << intid);
+}
+
+/// Route an SPI with GICv3 affinity routing (GICD_IROUTER<n>, 64-bit).
+pub fn gicv3_route_spi(bus: &mut RegBus, gicd: i64, intid: i64, route: i64) {
+    if intid < 32 { p_panic("aarch64_sys: only SPIs are routed by IROUTER"); }
+    regbus_write(bus, gicd + GICD_IROUTER + 8 * (intid - 32), 64, route);
+}

@@ -1,0 +1,81 @@
+// CS6 (competitive-roadmap): the memo of iropt_native's per-function
+// passes (compiler/iropt.fd iro_imc_key, compiler/ir_ser.fd imc_*,
+// FID_IROCACHE). A function's key holds the IR of every function it names,
+// transitively: `leaf`'s constant reaches `mid` and `top` by inlining,
+// `Sq_area` reaches `use_dyn` through its dyn call (the key names every
+// `<Type>_area` of a type implementing Shape), and `sq` reaches `main`
+// through a function reference. tests/tooling/irocache-check.sh builds
+// this program with the memo, then copies of it with the line marked
+// IROCACHE-EDIT1 (or EDIT2, EDIT3) changed, with the same memo file: the
+// functions that name the changed one, transitively, must miss (a stale
+// hit would print the old values), the others (`other`) must hit, and
+// each executable must equal one built without the memo.
+//
+// Expected output:
+// 3
+// 9
+// 30
+// 300
+// 7
+// 4
+// 25
+// 10
+
+cap Shape {
+    fn area(self) -> i64;
+}
+
+struct Sq { s: i64 }
+
+impl Shape for Sq {
+    pub fn area(self: Sq) -> i64 {
+        return self.s * self.s; // IROCACHE-EDIT2
+    }
+}
+
+fn leaf() -> i64 {
+    return 3; // IROCACHE-EDIT1
+}
+
+fn mid(x: i64) -> i64 {
+    return leaf() * x;
+}
+
+fn top(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + mid(1);
+        i = i + 1;
+    }
+    return s;
+}
+
+// names none of the edited functions: a hit after each edit
+fn other(a: i64) -> i64 {
+    return a + 4;
+}
+
+fn use_dyn(d: dyn Shape) -> i64 {
+    return d.area();
+}
+
+fn sq(x: i64) -> i64 {
+    return x * x; // IROCACHE-EDIT3
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn main() -> i64 {
+    println(leaf());
+    println(mid(3));
+    println(top(10));
+    println(top(100));
+    println(other(3));
+    println(use_dyn(Sq { s: 2 } as dyn Shape));
+    println(apply(sq, 5));
+    println(other(6));
+    return 0;
+}

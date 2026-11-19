@@ -1,0 +1,39 @@
+// Release M2: a program file that declares its module (`module x;`) may use
+// raw memory inside `unsafe` and in an @unsafe function, as a program
+// without the declaration may (test_frontend_unsafe_module_decl_fail.fd:
+// the same allocation outside `unsafe` is an error).
+// Expected output:
+// 42
+// 7
+
+module unsafe_module_decl_ok;
+
+// SAFETY: p is a live, aligned word the caller owns.
+@unsafe
+fn put_word(p: i64, v: i64) {
+    var w: * mut i64 = p;
+    * w = v;
+}
+
+fn main() -> i64 {
+    var p: i64 = 0;
+    var got: i64 = 0;
+    // SAFETY: an 8-byte block of our own, written and read inside it, then
+    // freed.
+    unsafe {
+        p = p_malloc(8);
+        put_word(p, 42);
+        var w: * mut i64 = p;
+        got = * w;
+    }
+    println(got);
+    // SAFETY: p is still the 8-byte block above; freed here, not used after.
+    unsafe {
+        put_word(p, 7);
+        var w2: * mut i64 = p;
+        got = * w2;
+        p_free(p);
+    }
+    println(got);
+    return 0;
+}

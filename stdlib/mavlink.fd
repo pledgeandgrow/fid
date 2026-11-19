@@ -1,0 +1,901 @@
+// Fides MAVLink library (robotics / drones)
+//
+// MAVLink v1 and v2 framing and a set of common.xml messages:
+//   - CRC-16/MCRF4XX (the X.25 CRC MAVLink calls crc_accumulate: init
+//     0xFFFF, check value 0x6F91 for "123456789");
+//   - message definitions with fields in XML order; the wire order (by
+//     type size, largest first, stable; extension fields last in XML
+//     order), the payload lengths and CRC_EXTRA are computed from the
+//     definition exactly as mavgen does (CRC over "NAME " and "type name "
+//     of every base field), so the table below checks itself:
+//       HEARTBEAT 0 (extra 50), SYS_STATUS 1 (124), GPS_RAW_INT 24 (24),
+//       ATTITUDE 30 (39), GLOBAL_POSITION_INT 33 (104),
+//       COMMAND_LONG 76 (152), COMMAND_ACK 77 (143);
+//   - payload encoding (little-endian; float as IEEE single, rounded to
+//     nearest even), v1 frames (0xFE, len, seq, sysid, compid, msgid,
+//     payload, CRC), v2 frames (0xFD, len, incompat flags, compat flags,
+//     seq, sysid, compid, 24-bit msgid, payload with trailing zero bytes
+//     removed (at least one byte kept), CRC, optional 13-byte signature);
+//   - v2 signing: link id, 48-bit timestamp (10 us units since
+//     2015-01-01), and the first 6 bytes of SHA-256(secret key (32) +
+//     header + payload + CRC + link id + timestamp) (stdlib/crypto);
+//   - a byte-at-a-time parser state machine that resynchronises after
+//     garbage or a bad CRC, zero-extends truncated v2 payloads, checks
+//     signatures when given a key, and counts lost packets from sequence
+//     numbers per (sysid, compid).
+// Bytes are Vec<i64>, 0..255 each. Pure computation; the seam is the
+// transport: the caller writes frames to a UART (stdlib/uart) or a UDP
+// socket (stdlib/net) and feeds received bytes to the parser.
+//
+// Usage:
+//   use mavlink;
+//   val defs: Vec<MavDef> = mav_common_defs();
+//   var m: MavMsg = mav_msg_new(defs.get(0));             // HEARTBEAT
+//   mav_set(&mut m, "type", 2.0);
+//   val bytes: Vec<i64> = mav_frame_v2(&m, 1, 1, seq);
+//   var p: MavParser = mav_parser_new(defs);
+//   val n: i64 = mav_parser_feed(&mut p, bytes);         // frames in p.frames
+
+module mavlink;
+use math;
+use crypto;
+
+// ─── CRC ───
+
+/// Accumulate one byte into a CRC-16/MCRF4XX value.
+pub fn mav_crc_acc(crc: i64, b: i64) -> i64 {
+    var t: i64 = (b & 255) ^ (crc & 255);
+    t = (t ^ (t << 4)) & 255;
+    return ((crc >> 8) ^ (t << 8) ^ (t << 3) ^ (t >> 4)) & 65535;
+}
+
+/// The CRC of bytes, starting from `crc` (0xFFFF for a fresh one).
+pub fn mav_crc_bytes(crc: i64, data: & Vec<i64>) -> i64 {
+    var c: i64 = crc;
+    var i: i64 = 0;
+    while i < data.len() {
+        c = mav_crc_acc(c, data.get(i));
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The CRC of the bytes of a string.
+pub fn mav_crc_str(crc: i64, s: str) -> i64 {
+    var c: i64 = crc;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        c = mav_crc_acc(c, str_byte_at(s, i));
+        i = i + 1;
+    }
+    return c;
+}
+
+// ─── Field types and message definitions ───
+
+pub const MAV_U8: i64 = 1;
+pub const MAV_I8: i64 = 2;
+pub const MAV_U16: i64 = 3;
+pub const MAV_I16: i64 = 4;
+pub const MAV_U32: i64 = 5;
+pub const MAV_I32: i64 = 6;
+pub const MAV_U64: i64 = 7;
+pub const MAV_I64: i64 = 8;
+pub const MAV_F32: i64 = 9;
+pub const MAV_F64: i64 = 10;
+
+pub fn mav_type_size(t: i64) -> i64 {
+    if t == MAV_U8 || t == MAV_I8 {
+        return 1;
+    }
+    if t == MAV_U16 || t == MAV_I16 {
+        return 2;
+    }
+    if t == MAV_U32 || t == MAV_I32 || t == MAV_F32 {
+        return 4;
+    }
+    return 8;
+}
+
+/// The C type name mavgen uses for CRC_EXTRA.
+pub fn mav_type_name(t: i64) -> str {
+    if t == MAV_U8 { return "uint8_t"; }
+    if t == MAV_I8 { return "int8_t"; }
+    if t == MAV_U16 { return "uint16_t"; }
+    if t == MAV_I16 { return "int16_t"; }
+    if t == MAV_U32 { return "uint32_t"; }
+    if t == MAV_I32 { return "int32_t"; }
+    if t == MAV_U64 { return "uint64_t"; }
+    if t == MAV_I64 { return "int64_t"; }
+    if t == MAV_F32 { return "float"; }
+    return "double";
+}
+
+/// A message definition. The field vectors are in wire order after
+/// `mav_def_finish`.
+pub struct MavDef {
+    pub id: i64,
+    pub name: str,
+    pub names: Vec<str>,
+    pub types: Vec<i64>,
+    pub ext: Vec<bool>,
+    pub offsets: Vec<i64>,
+    // payload length without / with the extension fields
+    pub min_len: i64,
+    pub max_len: i64,
+    pub crc_extra: i64,
+}
+
+pub fn mav_def_new(id: i64, name: str) -> MavDef {
+    return MavDef { id: id, name: name, names: Vec::new(), types: Vec::new(), ext: Vec::new(), offsets: Vec::new(), min_len: 0, max_len: 0, crc_extra: 0 };
+}
+
+/// Add a field in XML order (`ext`: after <extensions/>).
+pub fn mav_def_field(d: & mut MavDef, t: i64, name: str, ext: bool) {
+    d.names.push(name);
+    d.types.push(t);
+    d.ext.push(ext);
+}
+
+/// Put the fields in wire order and compute offsets, lengths and CRC_EXTRA.
+pub fn mav_def_finish(d: & mut MavDef) {
+    var names: Vec<str> = Vec::new();
+    var types: Vec<i64> = Vec::new();
+    var ext: Vec<bool> = Vec::new();
+    // base fields: sizes 8, 4, 2, 1, stable within a size
+    var size: i64 = 8;
+    while size >= 1 {
+        var i: i64 = 0;
+        while i < d.names.len() {
+            if !d.ext.get(i) && mav_type_size(d.types.get(i)) == size {
+                names.push(d.names.get(i));
+                types.push(d.types.get(i));
+                ext.push(false);
+            }
+            i = i + 1;
+        }
+        size = size / 2;
+    }
+    var i: i64 = 0;
+    while i < d.names.len() {
+        if d.ext.get(i) {
+            names.push(d.names.get(i));
+            types.push(d.types.get(i));
+            ext.push(true);
+        }
+        i = i + 1;
+    }
+    var offs: Vec<i64> = Vec::new();
+    var off: i64 = 0;
+    var min_len: i64 = 0;
+    var crc: i64 = mav_crc_str(65535, d.name + " ");
+    i = 0;
+    while i < names.len() {
+        offs.push(off);
+        off = off + mav_type_size(types.get(i));
+        if !ext.get(i) {
+            min_len = off;
+            crc = mav_crc_str(crc, mav_type_name(types.get(i)) + " ");
+            crc = mav_crc_str(crc, names.get(i) + " ");
+        }
+        i = i + 1;
+    }
+    d.names = names;
+    d.types = types;
+    d.ext = ext;
+    d.offsets = offs;
+    d.min_len = min_len;
+    d.max_len = off;
+    d.crc_extra = (crc & 255) ^ (crc >> 8);
+}
+
+fn mav_f(d: & mut MavDef, t: i64, name: str) {
+    mav_def_field(d, t, name, false);
+}
+
+fn mav_fx(d: & mut MavDef, t: i64, name: str) {
+    mav_def_field(d, t, name, true);
+}
+
+/// HEARTBEAT, SYS_STATUS, GPS_RAW_INT, ATTITUDE, GLOBAL_POSITION_INT,
+/// COMMAND_LONG and COMMAND_ACK from common.xml (with their extensions).
+pub fn mav_common_defs() -> Vec<MavDef> {
+    var out: Vec<MavDef> = Vec::new();
+    var hb: MavDef = mav_def_new(0, "HEARTBEAT");
+    mav_f(&mut hb, MAV_U8, "type");
+    mav_f(&mut hb, MAV_U8, "autopilot");
+    mav_f(&mut hb, MAV_U8, "base_mode");
+    mav_f(&mut hb, MAV_U32, "custom_mode");
+    mav_f(&mut hb, MAV_U8, "system_status");
+    mav_f(&mut hb, MAV_U8, "mavlink_version");
+    mav_def_finish(&mut hb);
+    out.push(hb);
+
+    var ss: MavDef = mav_def_new(1, "SYS_STATUS");
+    mav_f(&mut ss, MAV_U32, "onboard_control_sensors_present");
+    mav_f(&mut ss, MAV_U32, "onboard_control_sensors_enabled");
+    mav_f(&mut ss, MAV_U32, "onboard_control_sensors_health");
+    mav_f(&mut ss, MAV_U16, "load");
+    mav_f(&mut ss, MAV_U16, "voltage_battery");
+    mav_f(&mut ss, MAV_I16, "current_battery");
+    mav_f(&mut ss, MAV_I8, "battery_remaining");
+    mav_f(&mut ss, MAV_U16, "drop_rate_comm");
+    mav_f(&mut ss, MAV_U16, "errors_comm");
+    mav_f(&mut ss, MAV_U16, "errors_count1");
+    mav_f(&mut ss, MAV_U16, "errors_count2");
+    mav_f(&mut ss, MAV_U16, "errors_count3");
+    mav_f(&mut ss, MAV_U16, "errors_count4");
+    mav_fx(&mut ss, MAV_U32, "onboard_control_sensors_present_extended");
+    mav_fx(&mut ss, MAV_U32, "onboard_control_sensors_enabled_extended");
+    mav_fx(&mut ss, MAV_U32, "onboard_control_sensors_health_extended");
+    mav_def_finish(&mut ss);
+    out.push(ss);
+
+    var gps: MavDef = mav_def_new(24, "GPS_RAW_INT");
+    mav_f(&mut gps, MAV_U64, "time_usec");
+    mav_f(&mut gps, MAV_U8, "fix_type");
+    mav_f(&mut gps, MAV_I32, "lat");
+    mav_f(&mut gps, MAV_I32, "lon");
+    mav_f(&mut gps, MAV_I32, "alt");
+    mav_f(&mut gps, MAV_U16, "eph");
+    mav_f(&mut gps, MAV_U16, "epv");
+    mav_f(&mut gps, MAV_U16, "vel");
+    mav_f(&mut gps, MAV_U16, "cog");
+    mav_f(&mut gps, MAV_U8, "satellites_visible");
+    mav_fx(&mut gps, MAV_I32, "alt_ellipsoid");
+    mav_fx(&mut gps, MAV_U32, "h_acc");
+    mav_fx(&mut gps, MAV_U32, "v_acc");
+    mav_fx(&mut gps, MAV_U32, "vel_acc");
+    mav_fx(&mut gps, MAV_U32, "hdg_acc");
+    mav_fx(&mut gps, MAV_U16, "yaw");
+    mav_def_finish(&mut gps);
+    out.push(gps);
+
+    var att: MavDef = mav_def_new(30, "ATTITUDE");
+    mav_f(&mut att, MAV_U32, "time_boot_ms");
+    mav_f(&mut att, MAV_F32, "roll");
+    mav_f(&mut att, MAV_F32, "pitch");
+    mav_f(&mut att, MAV_F32, "yaw");
+    mav_f(&mut att, MAV_F32, "rollspeed");
+    mav_f(&mut att, MAV_F32, "pitchspeed");
+    mav_f(&mut att, MAV_F32, "yawspeed");
+    mav_def_finish(&mut att);
+    out.push(att);
+
+    var gp: MavDef = mav_def_new(33, "GLOBAL_POSITION_INT");
+    mav_f(&mut gp, MAV_U32, "time_boot_ms");
+    mav_f(&mut gp, MAV_I32, "lat");
+    mav_f(&mut gp, MAV_I32, "lon");
+    mav_f(&mut gp, MAV_I32, "alt");
+    mav_f(&mut gp, MAV_I32, "relative_alt");
+    mav_f(&mut gp, MAV_I16, "vx");
+    mav_f(&mut gp, MAV_I16, "vy");
+    mav_f(&mut gp, MAV_I16, "vz");
+    mav_f(&mut gp, MAV_U16, "hdg");
+    mav_def_finish(&mut gp);
+    out.push(gp);
+
+    var cl: MavDef = mav_def_new(76, "COMMAND_LONG");
+    mav_f(&mut cl, MAV_U8, "target_system");
+    mav_f(&mut cl, MAV_U8, "target_component");
+    mav_f(&mut cl, MAV_U16, "command");
+    mav_f(&mut cl, MAV_U8, "confirmation");
+    mav_f(&mut cl, MAV_F32, "param1");
+    mav_f(&mut cl, MAV_F32, "param2");
+    mav_f(&mut cl, MAV_F32, "param3");
+    mav_f(&mut cl, MAV_F32, "param4");
+    mav_f(&mut cl, MAV_F32, "param5");
+    mav_f(&mut cl, MAV_F32, "param6");
+    mav_f(&mut cl, MAV_F32, "param7");
+    mav_def_finish(&mut cl);
+    out.push(cl);
+
+    var ack: MavDef = mav_def_new(77, "COMMAND_ACK");
+    mav_f(&mut ack, MAV_U16, "command");
+    mav_f(&mut ack, MAV_U8, "result");
+    mav_fx(&mut ack, MAV_U8, "progress");
+    mav_fx(&mut ack, MAV_I32, "result_param2");
+    mav_fx(&mut ack, MAV_U8, "target_system");
+    mav_fx(&mut ack, MAV_U8, "target_component");
+    mav_def_finish(&mut ack);
+    out.push(ack);
+    return out;
+}
+
+/// The definition with this message id (index into defs, -1 if none).
+pub fn mav_find_def(defs: & Vec<MavDef>, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < defs.len() {
+        if defs.get(i).id == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The definition with this name.
+pub fn mav_find_def_name(defs: & Vec<MavDef>, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < defs.len() {
+        if defs.get(i).name == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// ─── Message values ───
+
+/// A message: its definition and one value per field (wire order); integer
+/// fields hold whole numbers, float fields any f64 (sent as float/double).
+pub struct MavMsg {
+    pub def: MavDef,
+    pub vals: Vec<f64>,
+    // integer fields as exact integers (u64/i64 do not fit an f64)
+    pub ivals: Vec<i64>,
+}
+
+pub fn mav_msg_new(d: MavDef) -> MavMsg {
+    var v: Vec<f64> = Vec::new();
+    var iv: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < d.names.len() {
+        v.push(0.0);
+        iv.push(0);
+        i = i + 1;
+    }
+    return MavMsg { def: d, vals: v, ivals: iv };
+}
+
+fn mav_field(d: & MavDef, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < d.names.len() {
+        if d.names.get(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+fn mav_is_float(t: i64) -> bool {
+    return t == MAV_F32 || t == MAV_F64;
+}
+
+/// Set a field (an integer field takes the value truncated); false when
+/// the message has no such field.
+pub fn mav_set(m: & mut MavMsg, name: str, v: f64) -> bool {
+    val i: i64 = mav_field(&m.def, name);
+    if i < 0 {
+        return false;
+    }
+    m.vals.set(i, v);
+    m.ivals.set(i, v as i64);
+    return true;
+}
+
+/// Set an integer field exactly.
+pub fn mav_set_int(m: & mut MavMsg, name: str, v: i64) -> bool {
+    val i: i64 = mav_field(&m.def, name);
+    if i < 0 {
+        return false;
+    }
+    m.ivals.set(i, v);
+    m.vals.set(i, v as f64);
+    return true;
+}
+
+pub fn mav_get(m: & MavMsg, name: str) -> f64 {
+    val i: i64 = mav_field(&m.def, name);
+    if i < 0 {
+        return 0.0;
+    }
+    return m.vals.get(i);
+}
+
+pub fn mav_get_int(m: & MavMsg, name: str) -> i64 {
+    val i: i64 = mav_field(&m.def, name);
+    if i < 0 {
+        return 0;
+    }
+    return m.ivals.get(i);
+}
+
+// ─── IEEE single precision ───
+
+/// IEEE-754 single bits of x (round to nearest even; overflow to infinity).
+@wrapping
+pub fn mav_f32_bits(x: f64) -> i64 {
+    val b: i64 = p_f64_to_bits(x);
+    val sign: i64 = (b >> 63) & 1;
+    val e: i64 = (b >> 52) & 2047;
+    val m: i64 = b & 4503599627370495;
+    val s32: i64 = sign << 31;
+    if e == 2047 {
+        if m != 0 {
+            return s32 | 2143289344;
+        }
+        return s32 | 2139095040;
+    }
+    if e == 0 {
+        return s32;
+    }
+    var exp: i64 = e - 1023 + 127;
+    val sig: i64 = m | 4503599627370496;
+    var shift: i64 = 29;
+    if exp <= 0 {
+        shift = 30 - exp;
+        exp = 0;
+        if shift > 60 {
+            return s32;
+        }
+    }
+    var q: i64 = sig >> shift;
+    val rem: i64 = sig - (q << shift);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (q & 1) == 1) {
+        q = q + 1;
+    }
+    if exp == 0 {
+        return s32 | q;
+    }
+    if q >= 16777216 {
+        q = q >> 1;
+        exp = exp + 1;
+    }
+    if exp >= 255 {
+        return s32 | 2139095040;
+    }
+    return s32 | (exp << 23) | (q & 8388607);
+}
+
+/// The value of IEEE-754 single bits.
+@wrapping
+pub fn mav_f32_from_bits(bits: i64) -> f64 {
+    val sign: i64 = (bits >> 31) & 1;
+    val e: i64 = (bits >> 23) & 255;
+    val m: i64 = bits & 8388607;
+    var b64: i64 = 0;
+    if e == 255 {
+        b64 = (2047 << 52) | (m << 29);
+    } else if e == 0 {
+        if m == 0 {
+            b64 = 0;
+        } else {
+            // subnormal single: normalise into an f64
+            var mm: i64 = m;
+            var ee: i64 = - 126;
+            while (mm & 8388608) == 0 {
+                mm = mm << 1;
+                ee = ee - 1;
+            }
+            b64 = ((ee + 1023) << 52) | ((mm & 8388607) << 29);
+        }
+    } else {
+        b64 = ((e - 127 + 1023) << 52) | (m << 29);
+    }
+    if sign == 1 {
+        b64 = b64 | (1 << 63);
+    }
+    return p_f64_from_bits(b64);
+}
+
+// ─── Payloads and frames ───
+
+@wrapping
+fn mav_put(out: & mut Vec<i64>, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.push((v >> (8 * i)) & 255);
+        i = i + 1;
+    }
+}
+
+@wrapping
+fn mav_take(b: & Vec<i64>, off: i64, n: i64, signed: bool) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var x: i64 = 0;
+        if off + i < b.len() {
+            x = b.get(off + i);
+        }
+        v = v | (x << (8 * i));
+        i = i + 1;
+    }
+    if signed && n < 8 {
+        val top: i64 = 1 << (8 * n - 1);
+        if (v & top) != 0 {
+            v = v - (top << 1);
+        }
+    }
+    return v;
+}
+
+/// The full payload (max_len bytes, extensions included).
+pub fn mav_encode_payload(m: & MavMsg) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < m.def.types.len() {
+        val t: i64 = m.def.types.get(i);
+        if t == MAV_F32 {
+            mav_put(&mut out, mav_f32_bits(m.vals.get(i)), 4);
+        } else if t == MAV_F64 {
+            mav_put(&mut out, p_f64_to_bits(m.vals.get(i)), 8);
+        } else {
+            mav_put(&mut out, m.ivals.get(i), mav_type_size(t));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A message from a payload (zero-extended when shorter than max_len).
+pub fn mav_decode_payload(d: MavDef, payload: & Vec<i64>) -> MavMsg {
+    var m: MavMsg = mav_msg_new(d);
+    var i: i64 = 0;
+    while i < d.types.len() {
+        val t: i64 = d.types.get(i);
+        val off: i64 = d.offsets.get(i);
+        if t == MAV_F32 {
+            m.vals.set(i, mav_f32_from_bits(mav_take(payload, off, 4, false)));
+        } else if t == MAV_F64 {
+            m.vals.set(i, p_f64_from_bits(mav_take(payload, off, 8, false)));
+        } else {
+            val signed: bool = t == MAV_I8 || t == MAV_I16 || t == MAV_I32 || t == MAV_I64;
+            val v: i64 = mav_take(payload, off, mav_type_size(t), signed);
+            m.ivals.set(i, v);
+            m.vals.set(i, v as f64);
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// A MAVLink 1 frame (the base fields only; msgid must be < 256).
+pub fn mav_frame_v1(m: & MavMsg, sysid: i64, compid: i64, seq: i64) -> Vec<i64> {
+    val full: Vec<i64> = mav_encode_payload(m);
+    var f: Vec<i64> = Vec::new();
+    f.push(254);
+    f.push(m.def.min_len);
+    f.push(seq & 255);
+    f.push(sysid & 255);
+    f.push(compid & 255);
+    f.push(m.def.id & 255);
+    var i: i64 = 0;
+    while i < m.def.min_len {
+        f.push(full.get(i));
+        i = i + 1;
+    }
+    var crc: i64 = 65535;
+    i = 1;
+    while i < f.len() {
+        crc = mav_crc_acc(crc, f.get(i));
+        i = i + 1;
+    }
+    crc = mav_crc_acc(crc, m.def.crc_extra);
+    f.push(crc & 255);
+    f.push(crc >> 8);
+    return f;
+}
+
+/// The v2 payload: full payload with trailing zero bytes removed (one
+/// byte is always kept).
+pub fn mav_truncate(p: & Vec<i64>) -> Vec<i64> {
+    var n: i64 = p.len();
+    while n > 1 && p.get(n - 1) == 0 {
+        n = n - 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(p.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn mav_v2_unsigned(m: & MavMsg, sysid: i64, compid: i64, seq: i64, incompat: i64) -> Vec<i64> {
+    val full: Vec<i64> = mav_encode_payload(m);
+    val p: Vec<i64> = mav_truncate(&full);
+    var f: Vec<i64> = Vec::new();
+    f.push(253);
+    f.push(p.len());
+    f.push(incompat);
+    f.push(0);
+    f.push(seq & 255);
+    f.push(sysid & 255);
+    f.push(compid & 255);
+    f.push(m.def.id & 255);
+    f.push((m.def.id >> 8) & 255);
+    f.push((m.def.id >> 16) & 255);
+    var i: i64 = 0;
+    while i < p.len() {
+        f.push(p.get(i));
+        i = i + 1;
+    }
+    var crc: i64 = 65535;
+    i = 1;
+    while i < f.len() {
+        crc = mav_crc_acc(crc, f.get(i));
+        i = i + 1;
+    }
+    crc = mav_crc_acc(crc, m.def.crc_extra);
+    f.push(crc & 255);
+    f.push(crc >> 8);
+    return f;
+}
+
+/// A MAVLink 2 frame (unsigned).
+pub fn mav_frame_v2(m: & MavMsg, sysid: i64, compid: i64, seq: i64) -> Vec<i64> {
+    return mav_v2_unsigned(m, sysid, compid, seq, 0);
+}
+
+/// The 6-byte signature of a v2 frame (everything up to and including the
+/// CRC) for link id and timestamp.
+pub fn mav_signature(key: & Vec<i64>, frame: & Vec<i64>, link_id: i64, timestamp: i64) -> Vec<i64> {
+    var msg: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < key.len() {
+        msg.push(key.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < frame.len() {
+        msg.push(frame.get(i));
+        i = i + 1;
+    }
+    msg.push(link_id & 255);
+    mav_put(&mut msg, timestamp, 6);
+    val h: Vec<i64> = crypto_sha256_bytes(msg);
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 6 {
+        out.push(h.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A signed MAVLink 2 frame (incompat flag 0x01, 13 signature bytes).
+pub fn mav_frame_v2_signed(m: & MavMsg, sysid: i64, compid: i64, seq: i64, key: & Vec<i64>, link_id: i64, timestamp: i64) -> Vec<i64> {
+    var f: Vec<i64> = mav_v2_unsigned(m, sysid, compid, seq, 1);
+    val sig: Vec<i64> = mav_signature(key, &f, link_id, timestamp);
+    f.push(link_id & 255);
+    mav_put(&mut f, timestamp, 6);
+    var i: i64 = 0;
+    while i < 6 {
+        f.push(sig.get(i));
+        i = i + 1;
+    }
+    return f;
+}
+
+/// The signing timestamp (10 us units since 2015-01-01 00:00 UTC) for a
+/// Unix time in microseconds.
+pub fn mav_sign_timestamp(unix_us: i64) -> i64 {
+    return (unix_us - 1420070400000000) / 10;
+}
+
+// ─── Parser ───
+
+/// A received frame.
+pub struct MavFrame {
+    pub version: i64,
+    pub len: i64,
+    pub incompat: i64,
+    pub compat: i64,
+    pub seq: i64,
+    pub sysid: i64,
+    pub compid: i64,
+    pub msgid: i64,
+    // payload as sent (v2: possibly truncated)
+    pub payload: Vec<i64>,
+    pub signed: bool,
+    pub link_id: i64,
+    pub timestamp: i64,
+    // index into the parser's defs (-1: unknown message, CRC unchecked)
+    pub def: i64,
+}
+
+pub struct MavParser {
+    pub defs: Vec<MavDef>,
+    pub buf: Vec<i64>,
+    pub frames: Vec<MavFrame>,
+    pub crc_errors: i64,
+    pub sig_errors: i64,
+    pub unknown: i64,
+    pub dropped_bytes: i64,
+    pub lost: i64,
+    pub key: Vec<i64>,
+    pub check_sig: bool,
+    // last sequence number per (sysid << 8 | compid)
+    pub seq_keys: Vec<i64>,
+    pub seq_last: Vec<i64>,
+}
+
+pub fn mav_parser_new(defs: Vec<MavDef>) -> MavParser {
+    return MavParser { defs: defs, buf: Vec::new(), frames: Vec::new(), crc_errors: 0, sig_errors: 0, unknown: 0, dropped_bytes: 0, lost: 0, key: Vec::new(), check_sig: false, seq_keys: Vec::new(), seq_last: Vec::new() };
+}
+
+/// Check signatures of signed frames with this 32-byte key.
+pub fn mav_parser_set_key(p: & mut MavParser, key: Vec<i64>) {
+    p.key = key;
+    p.check_sig = true;
+}
+
+fn mav_drop_front(p: & mut MavParser, n: i64) {
+    var nb: Vec<i64> = Vec::new();
+    var i: i64 = n;
+    while i < p.buf.len() {
+        nb.push(p.buf.get(i));
+        i = i + 1;
+    }
+    p.buf = nb;
+}
+
+fn mav_track_seq(p: & mut MavParser, sysid: i64, compid: i64, seq: i64) {
+    val key: i64 = (sysid << 8) | compid;
+    var i: i64 = 0;
+    while i < p.seq_keys.len() {
+        if p.seq_keys.get(i) == key {
+            val expect: i64 = (p.seq_last.get(i) + 1) & 255;
+            p.lost = p.lost + ((seq - expect + 256) & 255);
+            p.seq_last.set(i, seq);
+            return;
+        }
+        i = i + 1;
+    }
+    p.seq_keys.push(key);
+    p.seq_last.push(seq);
+}
+
+// Try to take one frame from the front of the buffer: 1 taken, 2 a whole
+// frame dropped (bad signature), 0 need more bytes, -1 the front byte
+// cannot start a valid frame (dropped).
+fn mav_try_frame(p: & mut MavParser) -> i64 {
+    if p.buf.len() == 0 {
+        return 0;
+    }
+    val stx: i64 = p.buf.get(0);
+    if stx != 254 && stx != 253 {
+        return - 1;
+    }
+    if p.buf.len() < 3 {
+        return 0;
+    }
+    val len: i64 = p.buf.get(1);
+    var hdr: i64 = 6;
+    var sig: i64 = 0;
+    if stx == 253 {
+        hdr = 10;
+        if (p.buf.get(2) & 1) != 0 {
+            sig = 13;
+        }
+        if (p.buf.get(2) & 254) != 0 {
+            // an incompatibility flag we do not know: cannot handle
+            return - 1;
+        }
+    }
+    val total: i64 = hdr + len + 2 + sig;
+    if p.buf.len() < total {
+        return 0;
+    }
+    var msgid: i64 = p.buf.get(5);
+    if stx == 253 {
+        msgid = p.buf.get(7) | (p.buf.get(8) << 8) | (p.buf.get(9) << 16);
+    }
+    val di: i64 = mav_find_def(&p.defs, msgid);
+    var crc: i64 = 65535;
+    var i: i64 = 1;
+    while i < hdr + len {
+        crc = mav_crc_acc(crc, p.buf.get(i));
+        i = i + 1;
+    }
+    if di >= 0 {
+        crc = mav_crc_acc(crc, p.defs.get(di).crc_extra);
+        val got: i64 = p.buf.get(hdr + len) | (p.buf.get(hdr + len + 1) << 8);
+        if got != crc {
+            p.crc_errors = p.crc_errors + 1;
+            return - 1;
+        }
+    } else {
+        p.unknown = p.unknown + 1;
+    }
+    var payload: Vec<i64> = Vec::new();
+    i = 0;
+    while i < len {
+        payload.push(p.buf.get(hdr + i));
+        i = i + 1;
+    }
+    var fr: MavFrame = MavFrame { version: 1, len: len, incompat: 0, compat: 0, seq: p.buf.get(2), sysid: p.buf.get(3), compid: p.buf.get(4), msgid: msgid, payload: payload, signed: false, link_id: 0, timestamp: 0, def: di };
+    if stx == 253 {
+        fr.version = 2;
+        fr.incompat = p.buf.get(2);
+        fr.compat = p.buf.get(3);
+        fr.seq = p.buf.get(4);
+        fr.sysid = p.buf.get(5);
+        fr.compid = p.buf.get(6);
+        if sig > 0 {
+            val s0: i64 = hdr + len + 2;
+            fr.signed = true;
+            fr.link_id = p.buf.get(s0);
+            fr.timestamp = mav_take(&p.buf, s0 + 1, 6, false);
+            if p.check_sig {
+                var body: Vec<i64> = Vec::new();
+                i = 0;
+                while i < s0 {
+                    body.push(p.buf.get(i));
+                    i = i + 1;
+                }
+                val want: Vec<i64> = mav_signature(&p.key, &body, fr.link_id, fr.timestamp);
+                var same: bool = true;
+                i = 0;
+                while i < 6 {
+                    if want.get(i) != p.buf.get(s0 + 7 + i) {
+                        same = false;
+                    }
+                    i = i + 1;
+                }
+                if !same {
+                    p.sig_errors = p.sig_errors + 1;
+                    mav_drop_front(p, total);
+                    return 2;
+                }
+            }
+        }
+    }
+    mav_track_seq(p, fr.sysid, fr.compid, fr.seq);
+    p.frames.push(fr);
+    mav_drop_front(p, total);
+    return 1;
+}
+
+/// Feed received bytes; returns how many good frames were added to
+/// p.frames. Bytes that cannot start a frame, and the start byte of a
+/// frame with a bad CRC, are skipped (the parser resynchronises on the
+/// next start byte).
+pub fn mav_parser_feed(p: & mut MavParser, bytes: Vec<i64>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        p.buf.push(bytes.get(i) & 255);
+        var go: bool = true;
+        while go {
+            val r: i64 = mav_try_frame(p);
+            if r == 1 {
+                n = n + 1;
+            } else if r == - 1 {
+                p.dropped_bytes = p.dropped_bytes + 1;
+                mav_drop_front(p, 1);
+            } else {
+                go = false;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The message of a received frame (requires a known definition).
+pub fn mav_frame_msg(p: & MavParser, f: & MavFrame) -> MavMsg {
+    return mav_decode_payload(p.defs.get(f.def), &f.payload);
+}
+
+/// Hex dump "fe 09 00 ..." of bytes.
+pub fn mav_hex(b: & Vec<i64>) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        val v: i64 = b.get(i);
+        s = s + str_slice(digits, (v >> 4) & 15, ((v >> 4) & 15) + 1) + str_slice(digits, v & 15, (v & 15) + 1);
+        i = i + 1;
+    }
+    return s;
+}

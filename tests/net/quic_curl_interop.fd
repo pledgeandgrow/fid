@@ -1,0 +1,108 @@
+// stdlib/quic_udp against another QUIC implementation: a QUIC server on
+// UDP port 47940 that curl (built with ngtcp2 and nghttp3) talks HTTP/3
+// to. The HTTP/3 here is hand-written bytes, just enough for a GET: a
+// control stream with an empty SETTINGS, and the response HEADERS (QPACK
+// static entry 25, ":status 200") and DATA "hello from fides quic". It
+// checks the transport (handshake with OpenSSL's TLS 1.3, X25519 and our
+// Ed25519 certificate, streams, ACKs, flow control, CONNECTION_CLOSE), not
+// HTTP/3: that is stdlib/http3.fd's.
+//
+// Not in the suite (needs curl with HTTP/3). Build as
+// tests/net/quic_udp_echo.fd says, then on Linux:
+//   ./qi & sleep 1; curl -s --http3-only -k https://127.0.0.1:47940/; echo; wait
+// curl prints the body; the server prints:
+//
+// Expected output:
+// handshake: h3
+// request on stream 0
+// response sent
+// closed by the client
+use quic;
+use quic_frame;
+use quic_tls;
+use quic_conn;
+use quic_udp;
+use encoding;
+
+fn append(out: & mut Vec<i64>, v: Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    val seed: Vec<i64> = hex_decode_bytes("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+    val cert: Vec<i64> = quic_self_signed_cert(seed, "localhost");
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    var sv: QuicUdpServer = quic_udp_listen(47940, quic_config_server(alpn, cert, seed));
+    var started: bool = false;
+    var answered: bool = false;
+    var control: bool = false;
+    var printed_close: bool = false;
+    val t0: i64 = p_clock_now_ms();
+    while p_clock_now_ms() - t0 < 20000 && !printed_close {
+        quic_udp_server_poll(& mut sv, 5);
+        var k: i64 = 0;
+        while k < sv.conns.len() {
+            var c: QuicConn = sv.conns.get(k);
+            if quic_conn_established(& c) && !started {
+                started = true;
+                println("handshake: " + c.alpn);
+            }
+            if quic_conn_established(& c) && !control {
+                // Our HTTP/3 control stream: type 0x00, SETTINGS (0x04) empty
+                val cs: i64 = quic_open_uni(& mut c);
+                if cs >= 0 {
+                    var b: Vec<i64> = Vec::new();
+                    b.push(0x00);
+                    b.push(0x04);
+                    b.push(0x00);
+                    quic_stream_write(& mut c, cs, b, false);
+                    control = true;
+                }
+            }
+            // Drain what the client's streams carry; answer stream 0
+            val fresh: Vec<i64> = quic_accept_streams(& mut c);
+            var f: i64 = 0;
+            while f < fresh.len() {
+                if fresh.get(f) == 0 {
+                    println("request on stream 0");
+                }
+                f = f + 1;
+            }
+            val ready: Vec<i64> = quic_readable_streams(& c);
+            var r: i64 = 0;
+            while r < ready.len() {
+                quic_stream_read(& mut c, ready.get(r));
+                r = r + 1;
+            }
+            if !answered && quic_stream_index(& c, 0) >= 0 && quic_stream_finished(& c, 0) {
+                var resp: Vec<i64> = Vec::new();
+                // HEADERS: required insert count 0, base 0, static index 25
+                resp.push(0x01);
+                resp.push(0x03);
+                resp.push(0x00);
+                resp.push(0x00);
+                resp.push(0xd9);
+                val body: Vec<i64> = str_bytes("hello from fides quic");
+                resp.push(0x00);
+                resp.push(body.len());
+                append(& mut resp, body);
+                quic_stream_write(& mut c, 0, resp, true);
+                answered = true;
+                println("response sent");
+            }
+            if c.peer_closed && !printed_close {
+                printed_close = true;
+                println("closed by the client");
+            }
+            sv.conns.set(k, c);
+            k = k + 1;
+        }
+    }
+    quic_udp_server_free(& mut sv);
+    return 0;
+}

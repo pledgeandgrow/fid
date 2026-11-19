@@ -1,0 +1,164 @@
+// stdlib/json string scanning a word at a time (competitive SL6). In
+// compiled code a long run of plain string bytes is skipped 8 bytes at a
+// time (json.fd j_plain_words: SWAR tests for a quote, a backslash and a
+// byte below 0x20); the interpreter keeps the byte loop. This test puts
+// each kind of byte that ends or breaks a run (a raw quote, a raw control
+// byte, escapes) and bytes that do not (0x7f, 0x80 and up, UTF-8) at
+// position 16..31 of a run of plain bytes (one kind at 0..15), the
+// string starting at alignment (position + kind) % 8, and checks
+// json_is_valid, json_index (where the string ends: the member after it
+// must be found) and the decoded value against what the byte-by-byte
+// grammar says. A word loop that skipped past a
+// quote, a backslash or a control byte gives a wrong answer and panics.
+//
+// Expected output:
+// cases 176
+// long strings ok
+// swar ok
+use json;
+
+fn fail(what: str, doc: str) {
+    println("wrong " + what + " for: " + doc);
+    p_panic("json swar: wrong " + what);
+}
+
+// The byte `b` as a one-byte string.
+fn one_byte(b: i64) -> str {
+    return char_to_str(b);
+}
+
+// kind 0..9: what goes at position k of the run. Returns the text that
+// is put there (raw, as it appears inside the JSON string).
+fn piece(kind: i64) -> str {
+    if kind == 0 {
+        // an escaped quote
+        return "\\\"";
+    }
+    if kind == 1 {
+        // an escaped backslash
+        return "\\\\";
+    }
+    if kind == 2 {
+        // a \u escape
+        return "\\u0041";
+    }
+    if kind == 3 {
+        // a raw quote: the string ends here, the rest is junk
+        return "\"";
+    }
+    if kind == 4 {
+        // a raw tab: a control byte must be escaped
+        return one_byte(9);
+    }
+    if kind == 5 {
+        // a raw 0x01
+        return one_byte(1);
+    }
+    if kind == 6 {
+        // 0x1f, the last control byte
+        return one_byte(31);
+    }
+    if kind == 7 {
+        // 0x7f is not a control byte in JSON
+        return one_byte(127);
+    }
+    if kind == 8 {
+        // UTF-8 for e-acute: 0xc3 0xa9
+        return one_byte(195) + one_byte(169);
+    }
+    // 0x20, the first plain byte, then 0xff
+    return " " + one_byte(255);
+}
+
+fn piece_valid(kind: i64) -> bool {
+    return kind != 3 && kind != 4 && kind != 5 && kind != 6;
+}
+
+// What the piece decodes to.
+fn piece_value(kind: i64) -> str {
+    if kind == 0 {
+        return "\"";
+    }
+    if kind == 1 {
+        return "\\";
+    }
+    if kind == 2 {
+        return "A";
+    }
+    return piece(kind);
+}
+
+fn main() -> i64 {
+    var cases: i64 = 0;
+    var k: i64 = 0;
+    while k < 32 {
+        // before the word loop can start (16 plain bytes) one kind a
+        // position, then every kind
+        var kind: i64 = 0;
+        var kinds_end: i64 = 10;
+        if k < 16 {
+            kind = k % 10;
+            kinds_end = kind + 1;
+        }
+        while kind < kinds_end {
+            // the string starts at alignment (k + kind) % 8; the run: k
+            // plain bytes, the piece, 24 more plain bytes
+            val pad: i64 = (k + kind) % 8;
+            val before: str = str_repeat("a", k);
+            val after: str = str_repeat("b", 24);
+            val body: str = before + piece(kind) + after;
+            val doc: str = str_repeat(" ", pad) + "{\"s\": \"" + body + "\", \"z\": 7}";
+            val want: bool = piece_valid(kind);
+            if json_is_valid(doc) != want {
+                fail("json_is_valid", doc);
+            }
+            val d: JsonDoc = json_index(doc);
+            if d.ok != want {
+                fail("json_index ok", doc);
+            }
+            if want {
+                val root: i64 = jd_root(& d);
+                if jd_int(& d, jd_get(& d, root, "z"), 0) != 7 {
+                    fail("member after the string", doc);
+                }
+                if !str_equal(jd_str(& d, jd_get(& d, root, "s")), before + piece_value(kind) + after) {
+                    fail("decoded string", doc);
+                }
+            }
+            cases = cases + 1;
+            kind = kind + 1;
+        }
+        k = k + 1;
+    }
+    println("cases " + int_to_str(cases));
+
+    // long strings: plain runs of every length 0..33 end at their quote,
+    // and a string that is never closed is refused
+    var len: i64 = 0;
+    while len <= 33 {
+        val body: str = str_repeat("x", len);
+        val doc: str = "[\"" + body + "\", " + int_to_str(len) + "]";
+        val d: JsonDoc = json_index(doc);
+        if !d.ok || !json_is_valid(doc) {
+            fail("long string", doc);
+        }
+        if str_len(jd_str(& d, jd_at(& d, jd_root(& d), 0))) != len {
+            fail("long string length", doc);
+        }
+        if jd_int(& d, jd_at(& d, jd_root(& d), 1), - 1) != len {
+            fail("element after a long string", doc);
+        }
+        val open: str = "[\"" + body;
+        if json_is_valid(open) || json_index(open).ok {
+            fail("unclosed string", open);
+        }
+        val ctl: str = "\"" + body + one_byte(10) + body + "\"";
+        if json_is_valid(ctl) {
+            fail("raw newline", ctl);
+        }
+        len = len + 1;
+    }
+    println("long strings ok");
+    println("swar ok");
+    return 0;
+}

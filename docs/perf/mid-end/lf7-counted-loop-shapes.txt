@@ -1,0 +1,39 @@
+LF7 (llvm-roadmap): counted loops of more shapes (Nov 17)
+=========================================================
+
+compiler/checks.fd, used by pe_ir, nat_ir (through iropt's facts) and the C
+generator (peir_unchecked_ops):
+
+peir_counted_loop (counting up)
+  - tests written the other way round: `right > i` is `i < right`,
+    `right >= i` is `i <= right`;
+  - bounds that are a length minus a constant: `i < v.len() - d`, or a
+    local set once before the loop to `v.len() - d` (peir_len_minus,
+    0 <= d <= 2^20); `i <= v.len() - d` (d >= 1) is `i < v.len() - (d - 1)`;
+  - reads at an offset (peir_loop_index): `v.get(i + e)`, `v.get(e + i)`,
+    `v.get(i - e)` read before the step are in bounds when
+    start_min + e >= 0 and e <= d (start_min: the smallest constant start;
+    0 when an entry guard `i >= k` gives the start); the offset arithmetic
+    then needs no overflow check either.
+
+peir_counted_down (counting down)
+  - tests `i >= K`, `i > K`, `K <= i`, `K < i` for a constant K
+    (as kmin = K or K + 1; -1 <= K <= 2^20, kmin >= 0);
+  - steps `i = i - c` for any constant c in 1..2^20 (the decrement needs no
+    overflow check: i >= kmin >= 0 when it runs);
+  - starts L - d for any d >= 0 (directly or through a local set once),
+    the smallest d of all starts, or constants below kmin;
+  - reads at i + o: before the decrement when kmin + o >= 0 and
+    o <= d - 1; after it when kmin - c + o >= 0 and o <= d + c - 1.
+
+Not covered: `i < n` with n neither a length (minus a constant) nor
+bounded by a guard on the loop's only way in (peir_entry_guard; loop
+versioning makes one), steps that are not constants, reads at offsets
+that are not constants.
+
+Tests: tests/bootstrap/test_counted_loop_shapes.fd (+ _fail),
+test_counted_loop_step_down_fail.fd, test_counted_loop_down.fd (keep_down
+is proved now); tests/tooling/param-range-check.sh runs `fid explain` on
+them and the programs. Not built or run yet: the stage-0 compiler of this
+run predates the change (its `explain` keeps every bounds check of the new
+test's functions).

@@ -1,0 +1,157 @@
+// LF13 (llvm roadmap): a string made by `a + b` and kept in a local that is
+// only read (printed, measured, compared, searched, an operand of another
+// `+`) and dropped is built in a 128-byte stack area (lower.fd
+// lw_rc_stack_strs_fn: core's Str_concat_into) with a literal's header, so
+// its drop frees nothing. A result longer than 111 bytes, or one built from
+// a string already in that area, is a heap string as before and its drop
+// frees it. A string that is returned, copied, kept in a Vec or passed to
+// the program's own function stays on the heap. The output must be the same
+// either way.
+//
+// Expected output:
+//     hello bob!
+//     len 9 10
+//     same yes
+//     find 6 starts yes ends yes has yes
+//     line 0: item-0
+//     line 1: item-1
+//     line 2: item-2
+//     wrap <<<x>>>
+//     wrap 7
+//     long 150 0
+//     made made-here
+//     kept 2 a1 b2
+//     shout HEY!
+//     copy cc cc
+//     order before
+//     done
+
+fn greet(name: str) {
+    var s: str = "hello " + name;
+    var t: str = s + "!";
+    println(t);
+    println("len " + int_to_str(str_len(s)) + " " + int_to_str(str_len(t)));
+}
+
+fn same(a: str, b: str) {
+    var x: str = a + b;
+    if x == "abcd" {
+        println("same yes");
+    } else {
+        println("same no");
+    }
+}
+
+fn search() {
+    var s: str = "alpha " + "beta gamma";
+    var f: i64 = str_find(s, "beta");
+    var st: str = "no";
+    if str_starts_with(s, "alpha") {
+        st = "yes";
+    }
+    var en: str = "no";
+    if str_ends_with(s, "gamma") {
+        en = "yes";
+    }
+    var hs: str = "no";
+    if str_contains(s, "a b") {
+        hs = "yes";
+    }
+    println("find " + int_to_str(f) + " starts " + st + " ends " + en + " has " + hs);
+}
+
+// made again each pass: the area is filled again, the old value dropped
+fn lines() {
+    var cur: str = "";
+    var i: i64 = 0;
+    while i < 3 {
+        cur = "item-" + int_to_str(i);
+        println("line " + int_to_str(i) + ": " + cur);
+        i = i + 1;
+    }
+}
+
+// built from the value already in the area: a heap string, alternating
+fn wrap() {
+    var w: str = "x";
+    var i: i64 = 0;
+    while i < 3 {
+        w = "<" + w;
+        w = w + ">";
+        i = i + 1;
+    }
+    println("wrap " + w);
+    println("wrap " + int_to_str(str_len(w)));
+}
+
+// longer than the area: a heap string
+fn long() {
+    var a: str = "";
+    var i: i64 = 0;
+    while i < 15 {
+        a = a + "yyyyyyyyyy";
+        i = i + 1;
+    }
+    var big: str = a + "";
+    println("long " + int_to_str(str_len(big)) + " " + int_to_str(str_find(big, "yyy")));
+}
+
+// returned: stays on the heap
+fn make() -> str {
+    var s: str = "made-" + "here";
+    return s;
+}
+
+// kept in a Vec: stays on the heap
+fn kept() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    var a: str = "a" + "1";
+    var b: str = "b" + "2";
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn loud(s: str) -> str {
+    return s + "!";
+}
+
+// passed to the program's own function: stays on the heap
+fn shout() {
+    var s: str = "H" + "EY";
+    println("shout " + loud(s));
+}
+
+// copied into another variable: stays on the heap
+fn copy() {
+    var s: str = "c" + "c";
+    var t: str = s;
+    println("copy " + s + " " + t);
+}
+
+// compared by order
+fn order() {
+    var a: str = "be" + "fore";
+    var b: str = "af" + "ter";
+    if str_compare(a, b) > 0 {
+        println("order " + a);
+    } else {
+        println("order " + b);
+    }
+}
+
+fn main() {
+    greet("bob");
+    same("ab", "cd");
+    search();
+    lines();
+    wrap();
+    long();
+    println("made " + make());
+    var k: Vec<str> = kept();
+    println("kept " + int_to_str(k.len()) + " " + k.get(0) + " " + k.get(1));
+    shout();
+    copy();
+    order();
+    println("done");
+}

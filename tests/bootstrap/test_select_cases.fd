@@ -1,0 +1,83 @@
+// Known bug 2g.60: a `select` whose ready channel is not the first case
+// crashed under `fid run` ("Invalid memory access"): the cases bind the
+// same name, and the lowering stores the second case's value into the
+// first case's variable, made in a block that has not run. C declares
+// every local at the function's start; the interpreter now makes such a
+// local when it is first used (compiler/interp.fd,
+// Interpreter_run_function). Every backend prints:
+//   slow 2
+//   first 5
+//   second 6
+//   third 7
+//   nothing ready
+//   got 9 then 10
+
+use channel;
+
+fn pick(a: i64, b: i64, c: i64) -> i64 {
+    select {
+        case a => v => {
+            println("first " + int_to_str(v));
+            return v;
+        }
+        case b => v => {
+            println("second " + int_to_str(v));
+            return v;
+        }
+        case c => v => {
+            println("third " + int_to_str(v));
+            return v;
+        }
+        default => {
+            println("nothing ready");
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    // the book's example (docs/book/08-concurrency.md)
+    val fast = channel_create(1);
+    val slow = channel_create(1);
+    channel_send(slow, 2);
+    select {
+        case fast => v => {
+            println("fast " + int_to_str(v));
+        }
+        case slow => v => {
+            println("slow " + int_to_str(v));
+        }
+        default => {
+            println("nothing ready");
+        }
+    }
+    val a = channel_create(1);
+    val b = channel_create(1);
+    val c = channel_create(1);
+    channel_send(a, 5);
+    pick(a, b, c);
+    channel_send(b, 6);
+    pick(a, b, c);
+    channel_send(c, 7);
+    pick(a, b, c);
+    pick(a, b, c);
+    // a value received in one select, then another in a loop
+    channel_send(c, 9);
+    channel_send(b, 10);
+    var got: Vec<i64> = Vec::new();
+    while got.len() < 2 {
+        select {
+            case c => x => {
+                got.push(x);
+            }
+            case b => x => {
+                got.push(x);
+            }
+            default => {
+                println("empty");
+            }
+        }
+    }
+    println("got " + int_to_str(got.get(0)) + " then " + int_to_str(got.get(1)));
+    return 0;
+}

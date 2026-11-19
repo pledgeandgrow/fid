@@ -1,0 +1,34 @@
+// Log OW6 (docs/verification/miscompile-log.md; VF11,
+// scripts/verify/own_diff.py base: `let a = new; { a.push(a) }; let b =
+// a.pop()`, and the callee f2 `p.kids.push(*p)`). Proposal 0004 rule 6:
+// push takes an owner and pop gives one back; the last owner frees. With
+// stage 0 of Nov 16, a struct with a Vec field pushed into a `Vec<Bx>`
+// (an inline struct, LOWER_INLINE_STRUCTS) and popped out again leaks:
+// `fid run --leaks` on this program reports 4 blocks never freed — c's
+// Vec (40 bytes, line of `var c`), a.kids's buffer (128 bytes,
+// `vec_buf_alloc <- ... <- Vec_push_mem`), and the shares made for the
+// copy of a (56 bytes, `Vec_share <- __own_dup_0`). Pushing a into itself
+// and popping (`a.kids.push(a); var b = a.kids.pop();`) leaks the share
+// the same way. The values are right.
+// Check: fid run tests/verify/bugs/ow6_pop_struct_element_leaks.fd --leaks must
+// print the lines below and "fid --leaks: every block was freed".
+//> 5
+//> 0
+
+struct Bx {
+    n: i64,
+    kids: Vec<Bx>,
+}
+
+fn main() -> i64 {
+    var a: Bx = Bx { n: 0, kids: Vec::new() };
+    var c: Bx = Bx { n: 5, kids: Vec::new() };
+    a.kids.push(c);
+    var b: Bx = a.kids.pop();
+    println(b.n);
+    var d: Bx = a;
+    a.kids.push(d);
+    var e: Bx = a.kids.pop();
+    println(e.n);
+    return 0;
+}

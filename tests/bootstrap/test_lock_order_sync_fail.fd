@@ -1,0 +1,48 @@
+// expect-error: Deadlock error: locks are taken in an inconsistent order
+// Complaint roadmap CA4: a cycle of three locks across three functions,
+// through stdlib/sync. `a_then_b` takes A then B (its unlock of A is
+// deferred, so A is held when it takes B), `b_then_c` takes B then the
+// rwlock C, and `c_then_a` holds C's read lock (with_read_lock) around
+// `lock_a`, which takes A. A -> B -> C -> A: three threads, one in each
+// function, can each wait for the next one's lock forever.
+
+use sync;
+
+var A: i64 = 0;
+var B: i64 = 0;
+var C: i64 = 0;
+
+fn a_then_b() -> i64 {
+    sync_mutex_lock(A);
+    defer {
+        sync_mutex_unlock(A);
+    }
+    sync_mutex_lock(B);
+    sync_mutex_unlock(B);
+    return 1;
+}
+
+fn b_then_c() -> i64 {
+    sync_mutex_lock(B);
+    sync_rwlock_write_lock(C);
+    sync_rwlock_write_unlock(C);
+    sync_mutex_unlock(B);
+    return 2;
+}
+
+fn lock_a() -> i64 {
+    sync_mutex_lock(A);
+    sync_mutex_unlock(A);
+    return 3;
+}
+
+fn c_then_a() -> i64 {
+    return with_read_lock(C, lock_a);
+}
+
+fn main() {
+    A = sync_mutex_create();
+    B = sync_mutex_create();
+    C = sync_rwlock_create();
+    println(int_to_str(a_then_b() + b_then_c() + c_then_a()));
+}

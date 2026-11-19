@@ -1,0 +1,124 @@
+// ABI against C (own-backend roadmap RL25): C's qsort and bsearch call a
+// Fides comparison on 16-byte records (two i64: a key and a payload), so the
+// callback gets pointers into the middle of a C-owned array and its i32
+// result, negative included, must reach C as C reads it; then plain calls
+// into C with integer arguments (labs, memcmp) whose results come back
+// signed. Every key is distinct, so a stable and an unstable sort agree.
+// tests/bootstrap/test_c_callback.fd covers 8-byte elements.
+//
+// Expected output:
+// 1:10 2:20 4:40 5:50 9:90
+// 9:90 5:50 4:40 2:20 1:10
+// found 4 at 2 payload 40
+// missing 3
+// labs 12345
+// memcmp less equal greater
+
+extern "C" include "<stdlib.h>" {
+    fn qsort as c_qsort(base: *u8, n: i64, size: i64, cmp: fn(*u8, *u8) -> i32);
+    fn bsearch as c_bsearch(key: *u8, base: *u8, n: i64, size: i64, cmp: fn(*u8, *u8) -> i32) -> *u8;
+    fn labs as c_labs(x: i64) -> i64;
+}
+
+extern "C" include "<string.h>" {
+    fn memcmp as c_memcmp(a: *u8, b: *u8, n: i64) -> i32;
+}
+
+@unsafe
+fn word(base: *u8, i: i64) -> *i64 {
+    return (base as i64 + i * 8) as *i64;
+}
+
+@unsafe
+fn by_key(a: *u8, b: *u8) -> i32 {
+    // keys are small: the difference fits an i32 and is negative half the time
+    val x: i64 = *(a as *i64);
+    val y: i64 = *(b as *i64);
+    return (x - y) as i32;
+}
+
+@unsafe
+fn by_key_desc(a: *u8, b: *u8) -> i32 {
+    return by_key(b, a);
+}
+
+@unsafe
+fn show(base: *u8, n: i64) {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < n {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(*word(base, 2 * i)) + ":" + int_to_str(*word(base, 2 * i + 1));
+        i = i + 1;
+    }
+    println(s);
+}
+
+fn sign(r: i32) -> str {
+    if r < 0 {
+        return "less";
+    }
+    if r > 0 {
+        return "greater";
+    }
+    return "equal";
+}
+
+@unsafe
+fn main() -> i64 {
+    val n: i64 = 5;
+    val base: *u8 = p_malloc(n * 16);
+    // keys 5 2 9 1 4, payload = key * 10
+    var keys: Vec<i64> = Vec::new();
+    keys.push(5);
+    keys.push(2);
+    keys.push(9);
+    keys.push(1);
+    keys.push(4);
+    var i: i64 = 0;
+    while i < n {
+        *word(base, 2 * i) = keys.get(i);
+        *word(base, 2 * i + 1) = keys.get(i) * 10;
+        i = i + 1;
+    }
+    c_qsort(base, n, 16, by_key);
+    show(base, n);
+    c_qsort(base, n, 16, by_key_desc);
+    show(base, n);
+    c_qsort(base, n, 16, by_key);
+
+    val key: *u8 = p_malloc(16);
+    *(key as *i64) = 4;
+    val found: *u8 = c_bsearch(key, base, n, 16, by_key);
+    if (found as i64) == 0 {
+        println("not found 4");
+    } else {
+        val at: i64 = (found as i64 - base as i64) / 16;
+        println("found 4 at " + int_to_str(at) + " payload " + int_to_str(*word(found, 1)));
+    }
+    *(key as *i64) = 3;
+    if (c_bsearch(key, base, n, 16, by_key) as i64) == 0 {
+        println("missing 3");
+    } else {
+        println("found 3 (wrong)");
+    }
+
+    println("labs " + int_to_str(c_labs(0 - 12345)));
+
+    // memcmp on the first record's key bytes against copies
+    val a: *u8 = p_malloc(8);
+    val b: *u8 = p_malloc(8);
+    *(a as *i64) = 1;
+    *(b as *i64) = 2;
+    val lt: str = sign(c_memcmp(a, b, 1));
+    val eq: str = sign(c_memcmp(a, a, 8));
+    val gt: str = sign(c_memcmp(b, a, 1));
+    println("memcmp " + lt + " " + eq + " " + gt);
+    p_free(a);
+    p_free(b);
+    p_free(key);
+    p_free(base);
+    return 0;
+}

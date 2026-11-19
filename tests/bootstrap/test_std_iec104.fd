@@ -1,0 +1,108 @@
+// stdlib/iec104: APCI I/S/U frame encode+parse with sequence numbers, ASDU
+// header + common type ids (M_SP_NA_1, M_ME_NC_1, M_ME_TF_1, C_SC_NA_1,
+// C_IC_NA_1), CP56Time2a, and the k/w window + t1/t2/t3 timer state.
+// Expected output:
+// u startdt act: 680407000000, parse U func 7
+// s frame nr 5: 680401000a00, parse S nr 5
+// i frame ns 3 nr 1: parse I ns 3 nr 1 asdu 10
+// sp: type 1 cot 3 ca 1 ioa 100 val 1
+// me_nc: type 13 val 23.5 q 0
+// me_tf: type 36 val -5.25 time 2024-11-17 13:45:30.500
+// sc: type 45 ioa 200 scs 1 sel 1 qu 0
+// interrogation: type 100 cot 6 qoi 20
+// window: can send after 3 sends with k=3: no; after ack: yes
+// recv owes ack at w=2: yes; timers: t1 expired = 1
+use iec104;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn fstr(x: f64) -> str {
+    return float_to_str(x);
+}
+
+fn main() {
+    // U-format STARTDT act
+    val u: Vec<i64> = iec104_u_frame(U_STARTDT_ACT);
+    val up: Iec104Frame = iec104_parse(& u);
+    println("u startdt act: " + hx(u) + ", parse U func " + int_to_str(up.ufunc));
+
+    // S-format ack N(R)=5
+    val s: Vec<i64> = iec104_s_frame(5);
+    val sp: Iec104Frame = iec104_parse(& s);
+    println("s frame nr 5: " + hx(s) + ", parse S nr " + int_to_str(sp.nr));
+
+    // I-format ns=3 nr=1 with a 10-byte ASDU (an M_SP_NA_1)
+    val asdu: Vec<i64> = iec104_sp_na(COT_SPONT, 1, 100, true);
+    val iframe: Vec<i64> = iec104_i_frame(3, 1, & asdu);
+    val ip: Iec104Frame = iec104_parse(& iframe);
+    println("i frame ns 3 nr 1: parse I ns " + int_to_str(ip.ns) + " nr " + int_to_str(ip.nr) + " asdu " + int_to_str(ip.asdu.len()));
+
+    // Decode the single point
+    val a1: Iec104Asdu = iec104_asdu_decode(& ip.asdu);
+    val ioa1: i64 = iec104_get_ioa(& ip.asdu, a1.body_start);
+    val siq: i64 = ip.asdu.get(a1.body_start + 3);
+    println("sp: type " + int_to_str(a1.type_id) + " cot " + int_to_str(a1.cot) + " ca " + int_to_str(a1.common_addr) + " ioa " + int_to_str(ioa1) + " val " + int_to_str(siq & 1));
+
+    // M_ME_NC_1 short float 23.5
+    val nc: Vec<i64> = iec104_me_nc(COT_SPONT, 1, 101, 23.5, 0);
+    val anc: Iec104Asdu = iec104_asdu_decode(& nc);
+    val vnc: f64 = iec104_get_f32(& nc, anc.body_start + 3);
+    val qnc: i64 = nc.get(anc.body_start + 7);
+    println("me_nc: type " + int_to_str(anc.type_id) + " val " + fstr(vnc) + " q " + int_to_str(qnc));
+
+    // M_ME_TF_1 short float -5.25 with a time tag
+    val time: Vec<i64> = iec104_cp56_encode(30500, 45, 13, 17, 0, 11, 24);
+    val tf: Vec<i64> = iec104_me_tf(COT_SPONT, 1, 102, -5.25, 0, & time);
+    val atf: Iec104Asdu = iec104_asdu_decode(& tf);
+    val vtf: f64 = iec104_get_f32(& tf, atf.body_start + 3);
+    val ct: Cp56Time = iec104_cp56_decode(& tf, atf.body_start + 8);
+    println("me_tf: type " + int_to_str(atf.type_id) + " val " + fstr(vtf) + " time " + int_to_str(ct.year) + "-" + pad2(ct.month) + "-" + pad2(ct.day) + " " + pad2(ct.hour) + ":" + pad2(ct.minute) + ":" + pad2(ct.second) + "." + int_to_str(ct.ms));
+
+    // C_SC_NA_1 single command, select, ON
+    val sc: Vec<i64> = iec104_sc_na(COT_ACT, 1, 200, true, true, 0);
+    val asc: Iec104Asdu = iec104_asdu_decode(& sc);
+    val ioasc: i64 = iec104_get_ioa(& sc, asc.body_start);
+    val sco: i64 = sc.get(asc.body_start + 3);
+    println("sc: type " + int_to_str(asc.type_id) + " ioa " + int_to_str(ioasc) + " scs " + int_to_str(sco & 1) + " sel " + int_to_str((sco >> 7) & 1) + " qu " + int_to_str((sco >> 2) & 31));
+
+    // C_IC_NA_1 interrogation, QOI=20
+    val ic: Vec<i64> = iec104_interrogation(COT_ACT, 1, 20);
+    val aic: Iec104Asdu = iec104_asdu_decode(& ic);
+    val qoi: i64 = ic.get(aic.body_start + 3);
+    println("interrogation: type " + int_to_str(aic.type_id) + " cot " + int_to_str(aic.cot) + " qoi " + int_to_str(qoi));
+
+    // Window: k=3, send 3, then the window is full
+    var st: Iec104State = iec104_state_new(3, 2, 15, 10, 20);
+    iec104_on_send(& mut st, 1);
+    iec104_on_send(& mut st, 2);
+    iec104_on_send(& mut st, 3);
+    var canstr: str = "no";
+    if iec104_can_send(& st) { canstr = "yes"; }
+    // peer acks up to N(S)=3
+    iec104_on_recv_s(& mut st, 3, 4);
+    var canstr2: str = "no";
+    if iec104_can_send(& st) { canstr2 = "yes"; }
+    println("window: can send after 3 sends with k=3: " + canstr + "; after ack: " + canstr2);
+
+    // Receive: w=2, two I-frames -> owe an ack
+    var st2: Iec104State = iec104_state_new(3, 2, 15, 10, 20);
+    iec104_on_recv_i(& mut st2, 0, 0, 1);
+    val owe: bool = iec104_on_recv_i(& mut st2, 1, 0, 2);
+    var owestr: str = "no";
+    if owe { owestr = "yes"; }
+    // t1: an outstanding send at tick 0, now 20 >= t1(15)
+    var st3: Iec104State = iec104_state_new(3, 2, 15, 10, 20);
+    iec104_on_send(& mut st3, 0);
+    val exp: i64 = iec104_timer_expired(& st3, 20);
+    println("recv owes ack at w=2: " + owestr + "; timers: t1 expired = " + int_to_str(exp));
+}
+
+fn pad2(n: i64) -> str {
+    if n < 10 { return "0" + int_to_str(n); }
+    return int_to_str(n);
+}

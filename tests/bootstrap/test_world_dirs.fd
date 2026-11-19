@@ -1,0 +1,168 @@
+// stdlib/world (complaint CT1), directories and File handles: a test
+// replaces the file system for code it does not change, including its
+// directories. The backup tool below is ordinary code over fs: File
+// handles (File::create, File::append, File::open, read_line,
+// write_line, close), directories (fs_mkdir_all, fs_mkdir, fs_list_dir,
+// fs_is_dir, fs_walk_files, fs_rename, fs_rmdir, fs_rmdir_all) and
+// fs_copy_file. The test seeds an in-memory tree, runs the tool, and reads
+// what it made. Nothing reaches the disk. `run_backup` is @hermetic: every
+// call it makes reaches the files only through functions that consult
+// stdlib/world (compiler/typechecker.fd TypeChecker_verify_hermetic).
+//
+// Expected output:
+// saved = true true
+// notes/a.txt = buy milk|-- end
+// first = buy milk
+// missing = (none)
+// docs = a.txt,b.txt,old
+// is dir = true false false
+// backup = 3
+// tree = bak/docs/a.txt,bak/docs/b.txt,bak/docs/old/c.txt
+// log = backup 3|backup done
+// mkdir twice = true false
+// mkdir no parent = false
+// rename dir = true
+// moved = arch/c.txt
+// rmdir full = false
+// rmdir empty = true
+// rmdir_all = true false
+// root = bak,docs,log.txt,notes
+// reads = 4 writes = 19
+// on disk = false false
+// fresh = 0
+use fs;
+use world;
+
+// ─── the code under test: no test hooks, no parameters for fakes ─────────
+
+fn save_note(dir: str, name: str, text: str) -> bool {
+    if !fs_mkdir_all(dir) { return false; }
+    match File::create(fs_join(dir, name)) {
+        Option::Some(f0) => {
+            var f: File = f0;
+            f.write_line(text);
+            f.write_str("-- end");
+            return f.close();
+        }
+        Option::None => {
+            return false;
+        }
+    }
+    return false;
+}
+
+fn first_line(path: str) -> str {
+    match File::open(path) {
+        Option::Some(f0) => {
+            var f: File = f0;
+            match f.read_line() {
+                Option::Some(l) => {
+                    return l;
+                }
+                Option::None => {
+                    return "";
+                }
+            }
+        }
+        Option::None => {
+            return "(none)";
+        }
+    }
+    return "";
+}
+
+fn log_line(path: str, text: str) -> void {
+    match File::append(path) {
+        Option::Some(f0) => {
+            var f: File = f0;
+            f.write_line(text);
+            f.close();
+        }
+        Option::None => {
+        }
+    }
+}
+
+// copy every file under src to the same place under dst
+fn backup(src: str, dst: str) -> i64 {
+    if !fs_mkdir_all(dst) { return -1; }
+    val files: Vec<str> = fs_walk_files(src);
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < files.len() {
+        val p: str = files.get(i);
+        val target: str = fs_join(dst, p);
+        if fs_mkdir_all(fs_dirname(target)) && fs_copy_file(p, target) >= 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    log_line("log.txt", "backup " + int_to_str(n));
+    return n;
+}
+
+@hermetic
+fn run_backup() -> i64 {
+    val n: i64 = backup("docs", "bak");
+    log_line("log.txt", "backup done");
+    return n;
+}
+
+// ─── the test ────────────────────────────────────────────────────────────
+
+fn joined(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + ","; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    world_fake_files();
+    world_file_put("docs/b.txt", "second\n");
+    world_file_put("docs/old/c.txt", "third\n");
+    world_dir_put("docs");
+
+    val s1: bool = save_note("notes", "a.txt", "buy milk");
+    val s2: bool = save_note("docs", "a.txt", "first");
+    println("saved = " + yes(s1) + " " + yes(s2));
+    println("notes/a.txt = " + str_replace(world_file_text("notes/a.txt"), "\n", "|"));
+    println("first = " + first_line("notes/a.txt"));
+    println("missing = " + first_line("notes/zz.txt"));
+    println("docs = " + joined(fs_list_dir("docs")));
+    println("is dir = " + yes(fs_is_dir("docs/old")) + " " + yes(fs_is_dir("docs/a.txt")) + " " + yes(fs_is_dir("nope")));
+
+    println("backup = " + int_to_str(run_backup()));
+    println("tree = " + joined(fs_walk_files("bak")));
+    println("log = " + str_replace(str_trim(world_file_text("log.txt")), "\n", "|"));
+
+    val m1: bool = fs_mkdir("empty");
+    val m2: bool = fs_mkdir("empty");
+    println("mkdir twice = " + yes(m1) + " " + yes(m2));
+    println("mkdir no parent = " + yes(fs_mkdir("x/y")));
+    println("rename dir = " + yes(fs_rename("bak/docs/old", "arch")));
+    println("moved = " + joined(fs_walk_files("arch")));
+    println("rmdir full = " + yes(fs_rmdir("arch")));
+    println("rmdir empty = " + yes(fs_rmdir("empty")));
+    val r1: bool = fs_rmdir_all("arch");
+    println("rmdir_all = " + yes(r1) + " " + yes(fs_exists("arch/c.txt")));
+    println("root = " + joined(fs_list_dir(".")));
+    println("reads = " + int_to_str(world_file_reads()) + " writes = " + int_to_str(world_file_writes()));
+
+    // the fake kept the tree off the disk
+    world_real_files();
+    println("on disk = " + yes(fs_is_dir("bak")) + " " + yes(fs_exists("notes/a.txt")));
+    // a new fake starts empty
+    world_fake_files();
+    println("fresh = " + int_to_str(fs_list_dir("").len()));
+    return 0;
+}

@@ -19,9 +19,7 @@
 // 6. parallel_functions -> sequential (MIN_PARALLEL_FUNCTIONS=999 means always sequential)
 // 7. Option<T> -> Opt* enums or i64 sentinel values
 
-module compiler::opt;
- use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::pir;
-// --- Pass enum -----------------------------------------------------------
+module compiler::opt; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::pir;  // --- Pass enum -----------------------------------------------------------
 
 pub enum Pass {
     ConstFold,
@@ -273,8 +271,7 @@ pub fn OptStats_total(s: OptStats) -> i64 {
 // Actually, the simplest approach: LTO only affects inline limits,
 // and we can check max_iters > 8 as a proxy for LTO mode.
 
-var g_lto_mode: bool = false;
- pub fn set_lto_mode(enabled: bool) {
+var g_lto_mode: bool = false; pub fn set_lto_mode(enabled: bool) {
     g_lto_mode = enabled;
 }
 
@@ -3948,12 +3945,16 @@ fn jump_thread_function(f: & mut L2Function) -> i64 {
                     OptL2Inst::Some(term_inst) => {
                         match term_inst {
                             L2Inst::Jump(target) => {
-                                if target != bi {
+                                // Jump targets and predecessors are block ids,
+                                // not indexes in f.blocks (2g.17: the index was
+                                // used as an id and an id as an index, which
+                                // panicked on hello world)
+                                if target != b.id {
                                     var pred_count: i64 = 0;
                                     var pi: i64 = 0;
                                     while pi < b.predecessors.len() {
                                         var pred_id: i64 = b.predecessors.get(pi);
-                                        pred_count = pred_count + jump_thread_redirect(f, pred_id, bi, target);
+                                        pred_count = pred_count + jump_thread_redirect(f, pred_id, b.id, target);
                                         pi = pi + 1;
                                     }
                                     if pred_count > 0 {
@@ -3981,16 +3982,22 @@ fn jump_thread_function(f: & mut L2Function) -> i64 {
                         match term_inst {
                             L2Inst::Branch(cond, then_b, else_b) => {
                                 // Check then-block
+                                // (a target that is the block itself is not a
+                                // change: it would never reach the fixpoint)
                                 var threaded: i64 = jump_thread_correlated(f, term_vid, cond, then_b, true);
-                                if threaded >= 0 {
+                                if threaded >= 0 && threaded != then_b {
                                     L2Function_set_value(f, term_vid, L2Inst::Branch(cond, threaded, else_b));
                                     count = count + 1;
                                     changed = true;
                                 }
                                 // Check else-block
                                 var threaded2: i64 = jump_thread_correlated(f, term_vid, cond, else_b, false);
-                                if threaded2 >= 0 {
-                                    L2Function_set_value(f, term_vid, L2Inst::Branch(cond, then_b, threaded2));
+                                var then_now: i64 = then_b;
+                                if threaded >= 0 && threaded != then_b {
+                                    then_now = threaded;
+                                }
+                                if threaded2 >= 0 && threaded2 != else_b {
+                                    L2Function_set_value(f, term_vid, L2Inst::Branch(cond, then_now, threaded2));
                                     count = count + 1;
                                     changed = true;
                                 }
@@ -4013,13 +4020,12 @@ fn jump_thread_function(f: & mut L2Function) -> i64 {
 /// Check if a target block has a single Branch on the same cond.
 /// Returns the new target to thread to, or -1 if not applicable.
 fn jump_thread_correlated(f: & mut L2Function, branch_vid: i64, cond: i64, target_block: i64, is_then: bool) -> i64 {
-    if target_block < 0 {
+    // target_block is a block id: its index in f.blocks may differ
+    var tidx: i64 = find_block_index(f, target_block);
+    if tidx < 0 {
         return - 1;
     }
-    if target_block >= f.blocks.len() {
-        return - 1;
-    }
-    var b: L2Block = f.blocks.get(target_block);
+    var b: L2Block = f.blocks.get(tidx);
     if b.instructions.len() != 1 {
         return - 1;
     }
@@ -4047,7 +4053,12 @@ fn jump_thread_correlated(f: & mut L2Function, branch_vid: i64, cond: i64, targe
 }
 
 fn jump_thread_redirect(f: & mut L2Function, pred_id: i64, from_block: i64, to_block: i64) -> i64 {
-    var b: L2Block = f.blocks.get(pred_id);
+    // pred_id, from_block and to_block are block ids
+    var pidx: i64 = find_block_index(f, pred_id);
+    if pidx < 0 {
+        return 0;
+    }
+    var b: L2Block = f.blocks.get(pidx);
     if b.instructions.len() == 0 {
         return 0;
     }

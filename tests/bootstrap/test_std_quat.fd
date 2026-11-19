@@ -1,0 +1,93 @@
+// stdlib/quat: quaternion product, rotation, axis-angle, ZYX Euler and matrix conversions (values checked against scipy.spatial.transform), slerp at constant speed, shortest arc, integration, atan2/asin/acos
+// Expected output:
+// atan2(-1,-1) = -2.356194490 atan2(1,-3) = 2.819842099
+// asin(0.3) = 0.304692654 acos(-0.7) = 2.346193823
+// rot z90 (1,0,0) = (0.000000, 1.000000, 0.000000)
+// z90*x90 = (0.500000, 0.500000, 0.500000, 0.500000) applied to (0,1,0) = (0.000000, 0.000000, 1.000000)
+// q * inverse(q) = (1.000000, 0.000000, 0.000000, 0.000000)
+// euler q = (0.299228, 0.203744, -0.016083, 0.932037)
+// euler back = 0.100000 -0.400000 2.500000
+// matrix = [-0.737902 -0.564336 0.370169; 0.551229 -0.820408 -0.151911; 0.389418 0.091953 0.916460]
+// det = 1.000000
+// R*(1,2,3) = (-0.756068, -1.545319, 3.322702) q*(1,2,3) = (-0.756068, -1.545319, 3.322702)
+// from matrix = (0.299228, 0.203744, -0.016083, 0.932037)
+// half turn about y from matrix = (0.000000, 0.000000, 1.000000, 0.000000)
+// axis-angle = (0.577350, 0.577350, 0.577350) 2.000000
+// rotvec = (1.154701, 1.154701, 1.154701)
+// gimbal lock: pitch 1.570796 yaw-roll 0.500000
+// slerp 0.5 = (0.923880, 0.000000, 0.000000, 0.382683)
+// slerp angles 0.392699 0.785398 1.178097
+// two vectors (1,0,0)->(0,0,1) = (0.000000, 0.000000, 1.000000)
+// two vectors opposite angle = 3.141593
+// integrate 100 x 0.01 s at 1 rad/s about z: yaw = 1.000000
+// approx_eq q -q: true
+use math;
+use quat;
+
+fn main() -> i64 {
+    println("atan2(-1,-1) = " + rmath_fmt(rmath_atan2(-1.0, -1.0), 9) + " atan2(1,-3) = " + rmath_fmt(rmath_atan2(1.0, -3.0), 9));
+    println("asin(0.3) = " + rmath_fmt(rmath_asin(0.3), 9) + " acos(-0.7) = " + rmath_fmt(rmath_acos(-0.7), 9));
+
+    val pi: f64 = rmath_pi();
+    val qz: quat = qt_from_axis_angle(vec3(0.0, 0.0, 1.0), pi / 2.0);
+    println("rot z90 (1,0,0) = " + rmath_vec3_str(qt_rotate(qz, vec3(1.0, 0.0, 0.0)), 6));
+    val qx: quat = qt_from_axis_angle(vec3(2.0, 0.0, 0.0), pi / 2.0);
+    val c: quat = qt_mul(qz, qx);
+    println("z90*x90 = " + qt_to_str(c, 6) + " applied to (0,1,0) = " + rmath_vec3_str(qt_rotate(c, vec3(0.0, 1.0, 0.0)), 6));
+    val qa: quat = quat(0.3, -1.2, 0.5, 2.0);
+    println("q * inverse(q) = " + qt_to_str(qt_mul(qa, qt_inverse(qa)), 6));
+
+    // ZYX Euler: roll 0.1, pitch -0.4, yaw 2.5
+    val qe: quat = qt_from_euler_zyx(0.1, -0.4, 2.5);
+    println("euler q = " + qt_to_str(qe, 6));
+    val e: EulerZYX = qt_to_euler_zyx(qe);
+    println("euler back = " + rmath_fmt(e.roll, 6) + " " + rmath_fmt(e.pitch, 6) + " " + rmath_fmt(e.yaw, 6));
+    val m: Mat3 = qt_to_mat3(qe);
+    println("matrix = " + mat3_to_str(m, 6));
+    println("det = " + rmath_fmt(mat3_det(m), 6));
+    // the same matrix from elementary rotations
+    val m2: Mat3 = mat3_mul(mat3_rot_z(2.5), mat3_mul(mat3_rot_y(-0.4), mat3_rot_x(0.1)));
+    if mat3_max_diff(m, m2) > 0.000000001 {
+        println("Rz Ry Rx differs");
+    }
+    val p: vec3 = vec3(1.0, 2.0, 3.0);
+    println("R*(1,2,3) = " + rmath_vec3_str(mat3_mul_vec(m, p), 6) + " q*(1,2,3) = " + rmath_vec3_str(qt_rotate(qe, p), 6));
+    println("from matrix = " + qt_to_str(qt_from_mat3(m), 6));
+    println("half turn about y from matrix = " + qt_to_str(qt_from_mat3(mat3_rot_y(pi)), 6));
+
+    val qr: quat = qt_from_axis_angle(vec3(1.0, 1.0, 1.0), 2.0);
+    val aa: AxisAngle = qt_to_axis_angle(qr);
+    println("axis-angle = " + rmath_vec3_str(aa.axis, 6) + " " + rmath_fmt(aa.angle, 6));
+    println("rotvec = " + rmath_vec3_str(qt_to_rotvec(qr), 6));
+    if !qt_approx_eq(qt_from_rotvec(qt_to_rotvec(qr)), qr, 0.000000000001) {
+        println("rotvec round trip differs");
+    }
+
+    // pitch = pi/2: roll and yaw are not separable, yaw - roll is kept
+    val gl: EulerZYX = qt_to_euler_zyx(qt_from_euler_zyx(0.2, pi / 2.0, 0.7));
+    println("gimbal lock: pitch " + rmath_fmt(gl.pitch, 6) + " yaw-roll " + rmath_fmt(gl.yaw - gl.roll, 6));
+
+    val id: quat = qt_identity();
+    println("slerp 0.5 = " + qt_to_str(qt_slerp(id, qz, 0.5), 6));
+    println("slerp angles " + rmath_fmt(qt_angle_between(id, qt_slerp(id, qz, 0.25)), 6) + " " + rmath_fmt(qt_angle_between(id, qt_slerp(id, qz, 0.5)), 6) + " " + rmath_fmt(qt_angle_between(id, qt_slerp(id, qz, 0.75)), 6));
+
+    val tv: quat = qt_from_two_vectors(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 3.0));
+    println("two vectors (1,0,0)->(0,0,1) = " + rmath_vec3_str(qt_rotate(tv, vec3(1.0, 0.0, 0.0)), 6));
+    val op: quat = qt_from_two_vectors(vec3(0.0, 1.0, 0.0), vec3(0.0, -2.0, 0.0));
+    println("two vectors opposite angle = " + rmath_fmt(qt_to_axis_angle(op).angle, 6));
+
+    var q: quat = qt_identity();
+    var i: i64 = 0;
+    while i < 100 {
+        q = qt_integrate(q, vec3(0.0, 0.0, 1.0), 0.01);
+        i = i + 1;
+    }
+    println("integrate 100 x 0.01 s at 1 rad/s about z: yaw = " + rmath_fmt(qt_to_euler_zyx(q).yaw, 6));
+    val neg: quat = quat(0.0 - qe.w, 0.0 - qe.x, 0.0 - qe.y, 0.0 - qe.z);
+    if qt_approx_eq(qe, neg, 0.000000001) {
+        println("approx_eq q -q: true");
+    } else {
+        println("approx_eq q -q: false");
+    }
+    return 0;
+}

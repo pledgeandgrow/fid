@@ -1,0 +1,311 @@
+// stdlib/vision: BT.601 gray, Gaussian kernel and blur (values from a numpy replica), Sobel, Otsu, morphology, connected components, Canny on a rectangle, FAST corners, ORB descriptors under translation and 90-degree rotation, Brown-Conrady projection and undistortion (OpenCV's formula), homography by DLT (checked against numpy.linalg.solve)
+// Expected output:
+// gray: red=76 green=150 blue=29 white=255
+// gaussian(1): 0.004433 0.054006 0.242036 0.399050 0.242036 0.054006 0.004433
+// blur: centre=200.0000 edge=145.9145 corner=108.0804 outside=74.0855
+// sobel at the left edge: gx=720.0 gy=0.0
+// otsu: rect only=20 noisy=49 foreground=320
+// erode=252 dilate=396 open removes a speck: 320
+// components 8-conn: 3 [9 (2,2)-(4,4) c=(3.00,3.00)] [320 (10,8)-(29,23) c=(19.50,15.50)] [2 (35,28)-(36,29) c=(35.50,28.50)]
+// components 4-conn: 4
+// canny: edges=68 all on the boundary band=true pieces=1
+// fast corners: (10,8) (29,8) (10,23) (29,23)
+// orb: keypoints=129 shifted keypoints match=true matches=15 wrong=0 max dist=0
+// orb rotated: matches=19 wrong=0 max dist=0
+// camera: project=(369.468750, 145.020000) undistort back=(0.100000, -0.200000)
+// undistort with no distortion is the identity: true
+// homography: 76.989796 -4.846939 10.000000 5.816327 82.755102 10.000000 -0.209184 0.030612 1.000000
+// H(0.5,0.5)=(50.588235, 59.607843) inverse(60,60)=(0.594456, 0.482974)
+// least squares from 9 points: max error=0.000000
+use math;
+use quat;
+use vision;
+
+fn rect_img() -> GrayImg {
+    var g: GrayImg = vis_gray_new(40, 32, 20);
+    var y: i64 = 8;
+    while y < 24 {
+        var x: i64 = 10;
+        while x < 30 {
+            vis_set(&mut g, x, y, 200);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return g;
+}
+
+@wrapping
+fn noise_img(n: i64) -> GrayImg {
+    var g: GrayImg = vis_gray_new(n, n, 128);
+    var s: i64 = 99;
+    var by: i64 = 0;
+    while by < n / 4 {
+        var bx: i64 = 0;
+        while bx < n / 4 {
+            s = (s * 1103515245 + 12345) & 2147483647;
+            val v: i64 = (s >> 16) % 256;
+            var y: i64 = 0;
+            while y < 4 {
+                var x: i64 = 0;
+                while x < 4 {
+                    vis_set(&mut g, bx * 4 + x, by * 4 + y, v);
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            bx = bx + 1;
+        }
+        by = by + 1;
+    }
+    return g;
+}
+
+fn main() -> i64 {
+    var rgb: Vec<i64> = Vec::new();
+    rgb.push(255); rgb.push(0); rgb.push(0);
+    rgb.push(0); rgb.push(255); rgb.push(0);
+    rgb.push(0); rgb.push(0); rgb.push(255);
+    rgb.push(255); rgb.push(255); rgb.push(255);
+    val gr: GrayImg = vis_from_rgb(4, 1, 3, &rgb);
+    println("gray: red=" + int_to_str(gr.data.get(0)) + " green=" + int_to_str(gr.data.get(1)) + " blue=" + int_to_str(gr.data.get(2)) + " white=" + int_to_str(gr.data.get(3)));
+    val k: Vec<f64> = vis_gaussian_kernel(1.0);
+    var ks: str = "gaussian(1):";
+    var i: i64 = 0;
+    while i < k.len() {
+        ks = ks + " " + rmath_fmt(k.get(i), 6);
+        i = i + 1;
+    }
+    println(ks);
+    val a: GrayImg = rect_img();
+    val af: FImg = vis_to_float(&a);
+    val bl: FImg = vis_gaussian_blur(&af, 1.0);
+    println("blur: centre=" + rmath_fmt(vis_fget(&bl, 20, 15), 4) + " edge=" + rmath_fmt(vis_fget(&bl, 10, 15), 4) + " corner=" + rmath_fmt(vis_fget(&bl, 10, 8), 4) + " outside=" + rmath_fmt(vis_fget(&bl, 9, 15), 4));
+    val sb: Gradient = vis_sobel(&af);
+    println("sobel at the left edge: gx=" + rmath_fmt(vis_fget(&sb.gx, 10, 15), 1) + " gy=" + rmath_fmt(vis_fget(&sb.gy, 10, 15), 1));
+
+    var nb: GrayImg = vis_gray_new(40, 32, 0);
+    var y: i64 = 0;
+    while y < 32 {
+        var x: i64 = 0;
+        while x < 40 {
+            var v: i64 = (x * 7 + y * 13) % 50;
+            if x >= 10 && x < 30 && y >= 8 && y < 24 {
+                v = v + 100;
+            }
+            vis_set(&mut nb, x, y, v);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    val tn: i64 = vis_otsu(&nb);
+    println("otsu: rect only=" + int_to_str(vis_otsu(&a)) + " noisy=" + int_to_str(tn) + " foreground=" + int_to_str(vis_count_nonzero(&vis_threshold(&nb, tn))));
+
+    val bin: GrayImg = vis_threshold(&a, 100);
+    var speck: GrayImg = bin;
+    vis_set(&mut speck, 2, 30, 255);
+    println("erode=" + int_to_str(vis_count_nonzero(&vis_erode(&bin, 1))) + " dilate=" + int_to_str(vis_count_nonzero(&vis_dilate(&bin, 1))) + " open removes a speck: " + int_to_str(vis_count_nonzero(&vis_open(&speck, 1))));
+
+    var cc: GrayImg = bin;
+    y = 2;
+    while y <= 4 {
+        var x: i64 = 2;
+        while x <= 4 {
+            vis_set(&mut cc, x, y, 255);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    vis_set(&mut cc, 35, 28, 255);
+    vis_set(&mut cc, 36, 29, 255);
+    val c8: Components = vis_components(&cc, true);
+    var cs: str = "components 8-conn: " + int_to_str(c8.count);
+    i = 0;
+    while i < c8.count {
+        cs = cs + " [" + int_to_str(c8.area.get(i)) + " (" + int_to_str(c8.min_x.get(i)) + "," + int_to_str(c8.min_y.get(i)) + ")-(" + int_to_str(c8.max_x.get(i)) + "," + int_to_str(c8.max_y.get(i)) + ") c=(" + rmath_fmt(c8.cx.get(i), 2) + "," + rmath_fmt(c8.cy.get(i), 2) + ")]";
+        i = i + 1;
+    }
+    println(cs);
+    println("components 4-conn: " + int_to_str(vis_components(&cc, false).count));
+
+    val ed: GrayImg = vis_canny(&a, 1.0, 50.0, 150.0);
+    var on: bool = true;
+    y = 0;
+    while y < 32 {
+        var x: i64 = 0;
+        while x < 40 {
+            if vis_get(&ed, x, y) > 0 {
+                // within one pixel of the rectangle's boundary
+                val inx: bool = x >= 9 && x <= 30 && y >= 7 && y <= 24;
+                val deep: bool = x >= 11 && x <= 28 && y >= 9 && y <= 22;
+                if !inx || deep {
+                    on = false;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    println("canny: edges=" + int_to_str(vis_count_nonzero(&ed)) + " all on the boundary band=" + vb(on) + " pieces=" + int_to_str(vis_components(&ed, true).count));
+
+    val fk: Vec<Keypoint> = vis_fast(&a, 20, true);
+    var fs: str = "fast corners:";
+    i = 0;
+    while i < fk.len() {
+        fs = fs + " (" + int_to_str(fk.get(i).x) + "," + int_to_str(fk.get(i).y) + ")";
+        i = i + 1;
+    }
+    println(fs);
+
+    // ORB: a textured image, a shifted copy and a copy turned 90 degrees
+    val n: i64 = 64;
+    val c: GrayImg = noise_img(n);
+    var d: GrayImg = vis_gray_new(n, n, 128);
+    var r: GrayImg = vis_gray_new(n, n, 0);
+    y = 0;
+    while y < n {
+        var x: i64 = 0;
+        while x < n {
+            vis_set(&mut d, x, y, vis_get(&c, x - 3, y - 2));
+            // R(x, y) = C(n - 1 - y, x): C's (a, b) appears at (b, n - 1 - a)
+            vis_set(&mut r, x, y, vis_get(&c, n - 1 - y, x));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var kc: Vec<Keypoint> = vis_fast(&c, 25, true);
+    var kd: Vec<Keypoint> = vis_fast(&d, 25, true);
+    // keypoints well inside both images must be the same, shifted
+    var same: bool = true;
+    var inner: i64 = 0;
+    i = 0;
+    while i < kc.len() {
+        val p: Keypoint = kc.get(i);
+        if p.x >= 8 && p.y >= 8 && p.x < n - 12 && p.y < n - 12 {
+            inner = inner + 1;
+            var found: bool = false;
+            var j: i64 = 0;
+            while j < kd.len() {
+                if kd.get(j).x == p.x + 3 && kd.get(j).y == p.y + 2 {
+                    found = true;
+                }
+                j = j + 1;
+            }
+            if !found {
+                same = false;
+            }
+        }
+        i = i + 1;
+    }
+    val dc: Vec<Vec<i64>> = vis_orb(&c, &mut kc);
+    val dd: Vec<Vec<i64>> = vis_orb(&d, &mut kd);
+    val m1: Vec<Match> = vis_match(&dc, &dd, 64);
+    var wrong: i64 = 0;
+    var maxd: i64 = 0;
+    i = 0;
+    while i < m1.len() {
+        val mm: Match = m1.get(i);
+        if kd.get(mm.j).x != kc.get(mm.i).x + 3 || kd.get(mm.j).y != kc.get(mm.i).y + 2 {
+            wrong = wrong + 1;
+        }
+        if mm.dist > maxd {
+            maxd = mm.dist;
+        }
+        i = i + 1;
+    }
+    println("orb: keypoints=" + int_to_str(kc.len()) + " shifted keypoints match=" + vb(same && inner > 0) + " matches=" + int_to_str(m1.len()) + " wrong=" + int_to_str(wrong) + " max dist=" + int_to_str(maxd));
+    var kr: Vec<Keypoint> = Vec::new();
+    i = 0;
+    while i < kc.len() {
+        val p: Keypoint = kc.get(i);
+        kr.push(Keypoint { x: p.y, y: n - 1 - p.x, score: p.score, angle: 0.0 });
+        i = i + 1;
+    }
+    val dr: Vec<Vec<i64>> = vis_orb(&r, &mut kr);
+    val m2: Vec<Match> = vis_match(&dc, &dr, 64);
+    wrong = 0;
+    maxd = 0;
+    i = 0;
+    while i < m2.len() {
+        val mm: Match = m2.get(i);
+        if mm.i != mm.j {
+            wrong = wrong + 1;
+        }
+        if mm.dist > maxd {
+            maxd = mm.dist;
+        }
+        i = i + 1;
+    }
+    println("orb rotated: matches=" + int_to_str(m2.len()) + " wrong=" + int_to_str(wrong) + " max dist=" + int_to_str(maxd));
+
+    var cam: Camera = cam_pinhole(500.0, 480.0, 320.0, 240.0);
+    cam_set_distortion(&mut cam, -0.2, 0.05, 0.001, -0.0005, 0.0);
+    val px: vec2 = cam_project(&cam, vec3(0.1, -0.2, 1.0));
+    val back: vec2 = cam_pixel_to_norm(&cam, px.x, px.y);
+    println("camera: project=(" + rmath_fmt(px.x, 6) + ", " + rmath_fmt(px.y, 6) + ") undistort back=(" + rmath_fmt(back.x, 6) + ", " + rmath_fmt(back.y, 6) + ")");
+    val ideal: Camera = cam_pinhole(30.0, 30.0, 20.0, 16.0);
+    val ud: GrayImg = vis_undistort(&a, &ideal);
+    var ident: bool = true;
+    i = 0;
+    while i < a.data.len() {
+        if ud.data.get(i) != a.data.get(i) {
+            ident = false;
+        }
+        i = i + 1;
+    }
+    println("undistort with no distortion is the identity: " + vb(ident));
+
+    var sx: Vec<f64> = Vec::new();
+    var sy: Vec<f64> = Vec::new();
+    var dx: Vec<f64> = Vec::new();
+    var dy: Vec<f64> = Vec::new();
+    sx.push(0.0); sy.push(0.0); dx.push(10.0); dy.push(10.0);
+    sx.push(1.0); sy.push(0.0); dx.push(110.0); dy.push(20.0);
+    sx.push(1.0); sy.push(1.0); dx.push(100.0); dy.push(120.0);
+    sx.push(0.0); sy.push(1.0); dx.push(5.0); dy.push(90.0);
+    val hm: Homography = vis_homography(&sx, &sy, &dx, &dy);
+    var hs: str = "homography:";
+    i = 0;
+    while i < 9 {
+        hs = hs + " " + rmath_fmt(hm.h.get(i), 6);
+        i = i + 1;
+    }
+    println(hs);
+    val hp: vec2 = vis_hom_apply(&hm.h, 0.5, 0.5);
+    val hinv: Vec<f64> = vis_mat3_inverse(&hm.h);
+    val hq: vec2 = vis_hom_apply(&hinv, 60.0, 60.0);
+    println("H(0.5,0.5)=(" + rmath_fmt(hp.x, 6) + ", " + rmath_fmt(hp.y, 6) + ") inverse(60,60)=(" + rmath_fmt(hq.x, 6) + ", " + rmath_fmt(hq.y, 6) + ")");
+    var lx: Vec<f64> = Vec::new();
+    var ly: Vec<f64> = Vec::new();
+    var lu: Vec<f64> = Vec::new();
+    var lv: Vec<f64> = Vec::new();
+    var gy: i64 = 0;
+    while gy < 3 {
+        var gx: i64 = 0;
+        while gx < 3 {
+            val p: vec2 = vis_hom_apply(&hm.h, (gx as f64) * 0.5, (gy as f64) * 0.5);
+            lx.push((gx as f64) * 0.5);
+            ly.push((gy as f64) * 0.5);
+            lu.push(p.x);
+            lv.push(p.y);
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    val h9: Homography = vis_homography(&lx, &ly, &lu, &lv);
+    var err: f64 = 0.0;
+    i = 0;
+    while i < 9 {
+        err = rmath_max(err, math_fabs(h9.h.get(i) - hm.h.get(i)));
+        i = i + 1;
+    }
+    println("least squares from 9 points: max error=" + rmath_fmt(err, 6));
+    return 0;
+}
+
+fn vb(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

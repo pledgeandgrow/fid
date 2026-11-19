@@ -1,0 +1,115 @@
+// tests/projects/game: a game (release-roadmap N11).
+//
+// Conway's Game of Life on a 12 x 8 board whose edges wrap around, run as a
+// fixed-step game loop: each tick updates the world into a second buffer,
+// swaps the buffers, and reports the population; the board is drawn after
+// the last tick. It starts with a glider and a blinker, so the output is
+// the same on every backend (expected.txt).
+//
+// Built and run by scripts/projects-check.sh: `fid run` and `fid ccompile`.
+
+const W: i64 = 12;
+const H: i64 = 8;
+const TICKS: i64 = 6;
+
+/// The cell at column x, row y; the board wraps at its edges.
+fn cell_at(x: i64, y: i64) -> i64 {
+    val xx: i64 = (x + W) % W;
+    val yy: i64 = (y + H) % H;
+    return yy * W + xx;
+}
+
+/// How many of the eight cells around (x, y) are alive.
+fn neighbours(cells: & Vec<i64>, x: i64, y: i64) -> i64 {
+    var n: i64 = 0;
+    var dy: i64 = -1;
+    while dy <= 1 {
+        var dx: i64 = -1;
+        while dx <= 1 {
+            if dx != 0 || dy != 0 {
+                n = n + cells.get(cell_at(x + dx, y + dy));
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return n;
+}
+
+/// One tick: the next generation of `cur`, written into `nxt`.
+fn update(cur: & Vec<i64>, nxt: & mut Vec<i64>) {
+    var y: i64 = 0;
+    while y < H {
+        var x: i64 = 0;
+        while x < W {
+            val n: i64 = neighbours(cur, x, y);
+            val alive: i64 = cur.get(cell_at(x, y));
+            var born: i64 = 0;
+            if n == 3 || (alive == 1 && n == 2) {
+                born = 1;
+            }
+            nxt.set(cell_at(x, y), born);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn population(cells: & Vec<i64>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < cells.len() {
+        n = n + cells.get(i);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The board, one row per line: '#' alive, '.' dead.
+fn draw(cells: & Vec<i64>) {
+    var y: i64 = 0;
+    while y < H {
+        var row: str = "";
+        var x: i64 = 0;
+        while x < W {
+            if cells.get(cell_at(x, y)) == 1 {
+                row = row + "#";
+            } else {
+                row = row + ".";
+            }
+            x = x + 1;
+        }
+        print(row + "\n");
+        y = y + 1;
+    }
+}
+
+fn main() -> i64 {
+    var cur: Vec<i64> = Vec::filled(W * H, 0);
+    var nxt: Vec<i64> = Vec::filled(W * H, 0);
+    // a glider in the top-left corner, heading down and right
+    cur.set(cell_at(1, 0), 1);
+    cur.set(cell_at(2, 1), 1);
+    cur.set(cell_at(0, 2), 1);
+    cur.set(cell_at(1, 2), 1);
+    cur.set(cell_at(2, 2), 1);
+    // a blinker on the right
+    cur.set(cell_at(8, 4), 1);
+    cur.set(cell_at(9, 4), 1);
+    cur.set(cell_at(10, 4), 1);
+    print("tick 0: " + int_to_str(population(& cur)) + " alive\n");
+    var t: i64 = 1;
+    while t <= TICKS {
+        update(& cur, & mut nxt);
+        // swap the buffers: the new generation becomes the current one
+        var i: i64 = 0;
+        while i < W * H {
+            cur.set(i, nxt.get(i));
+            i = i + 1;
+        }
+        print("tick " + int_to_str(t) + ": " + int_to_str(population(& cur)) + " alive\n");
+        t = t + 1;
+    }
+    draw(& cur);
+    return 0;
+}

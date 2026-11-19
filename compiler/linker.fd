@@ -9,16 +9,11 @@
 //   - ARM64 and RISC-V internal relocation types
 //   - Runtime symbol resolution
 
-module compiler::linker;
- use core; use vec; use string;
-// --- Constants ------------------------------------------------------------
+module compiler::linker; use core; use vec; use string; use compiler::image_writer;  // --- Constants ------------------------------------------------------------
 
-pub const LK_R_X86_64_64: i64 = 1; pub const LK_R_X86_64_PC32: i64 = 2; pub const LK_R_X86_64_PLT32: i64 = 4;
-// ARM64 internal relocation codes
-pub const R_ARM64_BL: i64 = 10; pub const R_ARM64_B: i64 = 11; pub const R_ARM64_BCOND: i64 = 12; pub const R_ARM64_ADRP: i64 = 14; pub const R_ARM64_ADD_LO12: i64 = 15;
-// RISC-V internal relocation codes
-pub const R_RISCV_JAL: i64 = 20; pub const R_RISCV_BRANCH: i64 = 21;
-// --- Structs --------------------------------------------------------------
+pub const LK_R_X86_64_64: i64 = 1; pub const LK_R_X86_64_PC32: i64 = 2; pub const LK_R_X86_64_PLT32: i64 = 4;  // ARM64 internal relocation codes
+pub const R_ARM64_BL: i64 = 10; pub const R_ARM64_B: i64 = 11; pub const R_ARM64_BCOND: i64 = 12; pub const R_ARM64_ADRP: i64 = 14; pub const R_ARM64_ADD_LO12: i64 = 15;  // RISC-V internal relocation codes
+pub const R_RISCV_JAL: i64 = 20; pub const R_RISCV_BRANCH: i64 = 21;  // --- Structs --------------------------------------------------------------
 
 pub struct LinkerSymbol {
     pub name: str,
@@ -1025,132 +1020,48 @@ pub fn Linker_link(self: & mut Linker, entry: str) -> LinkerResult {
 // --- Linker::build_executable ---
 
 pub fn Linker_build_executable(self: & Linker, entry_offset: i64) -> LinkerResult {
-    // ELF64 executable layout:
-    //   - ELF header (64 bytes)
-    //   - Program headers (56 bytes each, 1 PT_LOAD)
-    //   - .text section
-    //   - .rodata section (if any)
+    // TG13: the records come from compiler/image_writer.fd (the old body,
+    // checked byte for byte against this one on Nov 17, is gone:
+    // docs/image-writer.md)
+    return Linker_build_executable_img(self, entry_offset);
+}
 
-    var text_size: i64 = self.text_bytes.len();
-    var rodata_size: i64 = self.rodata.len();
-
-    // Program header: load everything at virtual address 0x400000
-    var base_addr: i64 = 0x400000;
-    var phdr_offset: i64 = 64;
-    // right after ELF header
-    var phdr_size: i64 = 56;
-    var text_file_offset: i64 = phdr_offset + phdr_size;
-    var text_vaddr: i64 = base_addr + text_file_offset;
-
-    var buf: Vec = Vec::new();
-
-    // --- ELF Header ---
-    buf.push(0x7f);
-    buf.push(0x45);
-    buf.push(0x4c);
-    buf.push(0x46);
-    // e_ident magic
-    buf.push(2);
-    // ELFCLASS64
-    buf.push(1);
-    // ELFDATA2LSB
-    buf.push(1);
-    // EV_CURRENT
-    buf.push(0);
-    // ELFOSABI_NONE
-    // 8 bytes padding
-    var pi: i64 = 0;
-    while pi < 8 {
-        buf.push(0);
-        pi = pi + 1;
-    }
-    // e_type = ET_EXEC (2)
-    buf.push(2);
-    buf.push(0);
-    // e_machine
-    var e_machine: i64 = 62;
-    // EM_X86_64
-    if self.target == "arm64" || self.target == "aarch64" {
-        e_machine = 183;
+/// e_machine of a Linker target.
+fn linker_elf_machine(target: str) -> i64 {
+    if target == "arm64" || target == "aarch64" {
+        return 183;
         // EM_AARCH64
-    } else if self.target == "riscv" || self.target == "riscv64" {
-        e_machine = 243;
+    }
+    if target == "riscv" || target == "riscv64" {
+        return 243;
         // EM_RISCV
     }
-    buf.push(e_machine & 0xFF);
-    buf.push((e_machine >> 8) & 0xFF);
-    // e_version = 1
-    buf.push(1);
-    buf.push(0);
-    buf.push(0);
-    buf.push(0);
-    // e_entry = virtual address of entry
-    write_u64(& mut buf, buf.len(), text_vaddr + entry_offset);
-    // e_phoff
-    write_u64(& mut buf, buf.len(), phdr_offset);
-    // e_shoff (no section headers)
-    write_u64(& mut buf, buf.len(), 0);
-    // e_flags
-    buf.push(0);
-    buf.push(0);
-    buf.push(0);
-    buf.push(0);
-    // e_ehsize = 64
-    buf.push(64);
-    buf.push(0);
-    // e_phentsize = 56
-    buf.push(56);
-    buf.push(0);
-    // e_phnum = 1
-    buf.push(1);
-    buf.push(0);
-    // e_shentsize = 0
-    buf.push(0);
-    buf.push(0);
-    // e_shnum = 0
-    buf.push(0);
-    buf.push(0);
-    // e_shstrndx = 0
-    buf.push(0);
-    buf.push(0);
+    return 62;
+    // EM_X86_64
+}
 
-    // --- Program Header (PT_LOAD for .text) ---
-    // p_type = PT_LOAD (1)
-    buf.push(1);
-    buf.push(0);
-    buf.push(0);
-    buf.push(0);
-    // p_flags = PF_R | PF_X (5)
-    buf.push(5);
-    buf.push(0);
-    buf.push(0);
-    buf.push(0);
-    // p_offset
-    write_u64(& mut buf, buf.len(), text_file_offset);
-    // p_vaddr
-    write_u64(& mut buf, buf.len(), text_vaddr);
-    // p_paddr
-    write_u64(& mut buf, buf.len(), text_vaddr);
-    // p_filesz
-    write_u64(& mut buf, buf.len(), text_size + rodata_size);
-    // p_memsz
-    write_u64(& mut buf, buf.len(), text_size + rodata_size);
-    // p_align = 0x1000
-    write_u64(& mut buf, buf.len(), 0x1000);
-
-    // --- .text section ---
+/// TG13: Linker_build_executable as a layout over image_writer (the same
+/// bytes): the ELF header (ET_EXEC, no section headers: e_shentsize 0 as
+/// well), one PT_LOAD (read/execute) of .text and .rodata from file
+/// offset 120 at 0x400000 + 120, then .text and .rodata.
+pub fn Linker_build_executable_img(self: & Linker, entry_offset: i64) -> LinkerResult {
+    var text_file_offset: i64 = 64 + 56;
+    var text_vaddr: i64 = 0x400000 + text_file_offset;
+    var size: i64 = self.text_bytes.len() + self.rodata.len();
+    var buf: Vec<i64> = Vec::new();
+    img_elf_header(& mut buf, 2, linker_elf_machine(self.target), text_vaddr + entry_offset, 64, 0, 0, 56, 1, 0, 0);
+    img_set_u16(& mut buf, 0x3A, 0);
+    // e_shentsize: 0, as the old body wrote it
+    img_elf_phdr(& mut buf, 1, 5, text_file_offset, text_vaddr, size, size, 0x1000);
     var ti: i64 = 0;
     while ti < self.text_bytes.len() {
         buf.push(self.text_bytes.get(ti));
         ti = ti + 1;
     }
-
-    // --- .rodata section ---
     var ri: i64 = 0;
     while ri < self.rodata.len() {
         buf.push(self.rodata.get(ri));
         ri = ri + 1;
     }
-
     return LinkerResult::Ok(buf);
 }

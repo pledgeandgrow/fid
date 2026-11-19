@@ -1,0 +1,586 @@
+// stdlib/mysql: SHA-1/SHA-256 vectors (FIPS 180), both password scrambles (checked against Python's hashlib), and the packets of the MySQL internals manual's examples: Handshake v10, OK, ERR, COM_QUERY, a text resultset, COM_STMT_PREPARE's answer, COM_STMT_EXECUTE, a binary row; then sessions over a replayed transport: login + query + prepared statement, auth switch, caching_sha2 fast auth, full-auth refusal, access denied; then the RSA password exchange with a 2048-bit key made by OpenSSL 3.5 (openssl genpkey; its OAEP-SHA-1 ciphertext of the XORed password is decrypted here, and openssl pkeyutl -decrypt recovered the XORed password from our ciphertext when this test was written) against a fake server that decrypts with the private key: caching_sha2_password full authentication with the key requested, configured, or a secure transport, a wrong password, an unreadable key, and sha256_password with and without a configured key. Run through C (fid ccompile): RSA-2048 private-key operations run out of memory in fid run (docs/stdlib-agent-bugs.md, bugs 20 and 52).
+// Expected output:
+// sha1 abc: a9993e364706816aba3e25717850c26c9cd0d89d
+// sha1 448: 84983e441c3bd26ebaae4aa1f95129e5e54670f1
+// sha1 a*1000: 291e9a6c66994949b57ba5e650361e98fc36b1ba
+// sha256 abc: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+// sha256 448: 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+// sha256 empty: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+// handshake: ok true v10 5.5.2-m2 id 11 caps 800ff7ff charset 8 status 2 plugin mysql_native_password
+// nonce: dvH@I-CJ*4d|cZwk4^]: (20 bytes)
+// native scramble: c5d53afed8964d85fe3ec57842b3cdb6b83bb2cb
+// sha2 scramble: a739a160b9de72e188db815b6d86658ccb4459a5d71d95906076a7e48c6e8af8
+// empty password: 0 bytes
+// client caps: aa20d
+// response: 0da20a00ffffff002d00000000000000000000000000000000000000000000006170700014c5d53afed8964d85fe3ec57842b3cdb6b83bb2cb73686f70006d7973716c5f6e61746976655f70617373776f726400
+// ok: OK affected 0 id 0 status 2 warnings 0
+// ok big: affected 10000 id 1000000 warnings 1
+// err: ERR 1096 HY000 No tables used
+// eof: EOF status 2
+// com_query: 210000000373656c65637420404076657273696f6e5f636f6d6d656e74206c696d69742031
+// read back: complete true used 37 seq 0
+// cut packet: complete false
+// lenenc: fafcfb00fd000001fe0000000100000000
+// lenenc back: 250 251 65536 16777216
+// text resultset (5 packets): @@version_comment(253), 1 rows
+//   MySQL Community Server (GPL)
+//   column: charset 8 length 28 decimals 31
+// prepare: ok true id 1 params 2 columns 1 (col1) used 6
+// execute: 120000001701000000000100000000010f0003666f6f
+// execute mixed: 170700000000010000000201080006000500fd00feffffffffffffff0000000000000c4005636166c3a9
+// binary row: foobar
+// connect: ok true  server 5.5.2-m2 plugin mysql_native_password
+//   sent: 540000010da20a00ffffff002d00000000000000000000000000000000000000000000006170700014c5d53afed8964d85fe3ec57842b3cdb6b83bb2cb73686f70006d7973716c5f6e61746976655f70617373776f726400
+// query: id(8) name(253), 2 rows
+//   1 | Ada
+//   2 | NULL
+//   name column: 1, sent 1b0000000353454c4543542069642c206e616d652046524f4d207573657273
+// update: ok, 3 rows affected, insert id 0, warnings 0
+// missing table: error 1146 42S02 Table 'shop.nope' doesn't exist
+// prepare: ok true id 5 params 1 columns 4
+// execute: id(8) score(5) small(1) born(12), 2 rows
+//   42 | 1.25 | -2 | 2026-11-17 10:07:00.123456
+//   7 | -1 | 5 | NULL
+//   sent 12000000170500000000010000000001fd0003416461
+// wrong arity: the statement takes 1 parameters, got 0
+// auth switch: ok true plugin mysql_native_password server 8.0.36
+//   switch answer is the native scramble of the new nonce: true
+// fast auth: ok true plugin caching_sha2_password
+// full auth: ok false caching_sha2_password needs full authentication (TLS or the server's RSA key), which this client does not do
+// denied: ok false access denied: 1045 (28000): Access denied for user 'u'
+// server key: ok true bits 2048, private key matches true
+// xor password: 6257504606421638
+// openssl ciphertext: ok true password Secr3t!
+// our ciphertext: 256 bytes, decrypts to Secr3t!
+// longest password: 213 bytes 256, 214 bytes 0
+// full auth, key requested: ok full true key kept true
+//   client sent: handshake response with a 32-byte scramble, key request, 256-byte RSA ciphertext (decrypts to Secr3t!)
+// full auth, configured key: ok
+//   client sent: handshake response with a 32-byte scramble, 256-byte RSA ciphertext (decrypts to Secr3t!)
+// full auth, secure transport: ok
+//   client sent: handshake response with a 32-byte scramble, clear password Secr3t!
+// full auth, wrong password: failed: access denied: 1045 (28000): Access denied for user 'app'@'localhost' (using password: YES)
+// full auth, unreadable key: failed: the server's RSA public key cannot be read
+// sha256_password: ok plugin sha256_password
+//   client sent: handshake response asking for the key, 256-byte RSA ciphertext (decrypts to Secr3t!)
+// sha256_password, configured key: ok
+//   client sent: 256-byte RSA ciphertext (decrypts to Secr3t!)
+use mysql;
+use rsa;
+use pem;
+use bigint;
+use encoding;
+use vec;
+use string;
+
+var INQ: Vec<i64> = Vec::new();
+var SENT: Vec<i64> = Vec::new();
+
+fn mock_send(conn: i64, b: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < b.len() {
+        SENT.push(b.get(i));
+        i = i + 1;
+    }
+    return b.len();
+}
+
+fn mock_recv(conn: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while INQ.len() > 0 && out.len() < 13 {
+        out.push(INQ.remove(0));
+    }
+    return out;
+}
+
+fn hb(h: str) -> Vec<i64> {
+    return hex_decode_bytes(h);
+}
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+// A packet: header with `seq`, then the payload given in hex.
+fn feed(seq: i64, payload_hex: str) {
+    val b: Vec<i64> = mysql_packets(hb(payload_hex), seq);
+    var i: i64 = 0;
+    while i < b.len() {
+        INQ.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn feed_raw(h: str) {
+    val b: Vec<i64> = hb(h);
+    var i: i64 = 0;
+    while i < b.len() {
+        INQ.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn reset() {
+    INQ = Vec::new();
+    SENT = Vec::new();
+}
+
+fn lenenc_text(s: str) -> str {
+    var out: Vec<i64> = Vec::new();
+    out.push(str_len(s));
+    val b: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return hx(out);
+}
+
+// A ColumnDefinition41 payload (hex) for table shop.users.
+fn coldef(name: str, kind: i64, flags: i64) -> str {
+    var tail: Vec<i64> = Vec::new();
+    tail.push(12);
+    tail.push(63);
+    tail.push(0);
+    tail.push(20);
+    tail.push(0);
+    tail.push(0);
+    tail.push(0);
+    tail.push(kind);
+    tail.push(flags & 255);
+    tail.push(flags >> 8);
+    tail.push(0);
+    tail.push(0);
+    tail.push(0);
+    return lenenc_text("def") + lenenc_text("shop") + lenenc_text("users") + lenenc_text("users") + lenenc_text(name) + lenenc_text(name) + hx(tail);
+}
+
+fn transport() -> MysqlTransport {
+    val t: MysqlTransport = MysqlTransport { conn: 9, send: mock_send, recv: mock_recv };
+    return t;
+}
+
+fn show_result(label: str, r: & MysqlResult) {
+    if !r.ok {
+        println(label + ": error " + int_to_str(r.error_code) + " " + r.sql_state + " " + r.message);
+        return;
+    }
+    if r.columns.len() == 0 {
+        println(label + ": ok, " + int_to_str(r.affected_rows) + " rows affected, insert id " + int_to_str(r.last_insert_id) + ", warnings " + int_to_str(r.warnings));
+        return;
+    }
+    var head: str = label + ":";
+    var i: i64 = 0;
+    while i < r.columns.len() {
+        head = head + " " + r.columns.get(i).name + "(" + int_to_str(r.columns.get(i).kind) + ")";
+        i = i + 1;
+    }
+    println(head + ", " + int_to_str(r.nrows) + " rows");
+    var row: i64 = 0;
+    while row < r.nrows {
+        var line: str = "  ";
+        var c: i64 = 0;
+        while c < r.columns.len() {
+            if c > 0 {
+                line = line + " | ";
+            }
+            if mysql_is_null(r, row, c) {
+                line = line + "NULL";
+            } else {
+                line = line + mysql_cell(r, row, c);
+            }
+            c = c + 1;
+        }
+        println(line);
+        row = row + 1;
+    }
+}
+
+fn main() -> i64 {
+    // Hashes (FIPS 180 examples)
+    println("sha1 abc: " + hx(mysql_sha1(str_bytes("abc"))));
+    println("sha1 448: " + hx(mysql_sha1(str_bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))));
+    println("sha1 a*1000: " + hx(mysql_sha1(str_bytes(str_repeat("a", 1000)))));
+    println("sha256 abc: " + hx(mysql_sha256(str_bytes("abc"))));
+    println("sha256 448: " + hx(mysql_sha256(str_bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))));
+    println("sha256 empty: " + hx(mysql_sha256(Vec::new())));
+
+    // The manual's Handshake v10 (server 5.5.2-m2)
+    val hs_hex: str = "0a352e352e322d6d32000b00000064764840492d434a00fff7080200" + "0f801500000000000000000000" + "2a34647c635a776b345e5d3a00";
+    val h: MysqlHandshake = mysql_parse_handshake(hb(hs_hex));
+    println("handshake: ok " + bool_to_str(h.ok) + " v" + int_to_str(h.protocol) + " " + h.server_version + " id " + int_to_str(h.connection_id) + " caps " + int_to_hex(h.capabilities) + " charset " + int_to_str(h.charset) + " status " + int_to_str(h.status) + " plugin " + h.plugin);
+    println("nonce: " + str_from_bytes(h.nonce) + " (" + int_to_str(h.nonce.len()) + " bytes)");
+    println("native scramble: " + hx(mysql_native_scramble("secret", h.nonce)));
+    println("sha2 scramble: " + hx(mysql_sha2_scramble("secret", h.nonce)));
+    println("empty password: " + int_to_str(mysql_native_scramble("", h.nonce).len()) + " bytes");
+    val caps: i64 = mysql_client_caps(h.capabilities, true);
+    println("client caps: " + int_to_hex(caps));
+    println("response: " + hx(mysql_handshake_response(caps, "app", mysql_native_scramble("secret", h.nonce), "shop", h.plugin)));
+
+    // OK, ERR, EOF (the manual's examples)
+    val ok: MysqlStatus = mysql_parse_status(hb("00000002000000"));
+    println("ok: " + ok.kind + " affected " + int_to_str(ok.affected_rows) + " id " + int_to_str(ok.last_insert_id) + " status " + int_to_str(ok.status_flags) + " warnings " + int_to_str(ok.warnings));
+    val ok2: MysqlStatus = mysql_parse_status(hb("00fc1027fd40420f02000100") );
+    println("ok big: affected " + int_to_str(ok2.affected_rows) + " id " + int_to_str(ok2.last_insert_id) + " warnings " + int_to_str(ok2.warnings));
+    val err: MysqlStatus = mysql_parse_status(hb("ff48042348593030304e6f207461626c65732075736564"));
+    println("err: " + err.kind + " " + int_to_str(err.error_code) + " " + err.sql_state + " " + err.message);
+    val eof: MysqlStatus = mysql_parse_status(hb("fe00000200"));
+    println("eof: " + eof.kind + " status " + int_to_str(eof.status_flags));
+
+    // Packets
+    val q: Vec<i64> = mysql_packets(mysql_com_query("select @@version_comment limit 1"), 0);
+    println("com_query: " + hx(q));
+    val rp: MysqlPacket = mysql_read_packet(q, 0);
+    println("read back: complete " + bool_to_str(rp.complete) + " used " + int_to_str(rp.used) + " seq " + int_to_str(rp.seq));
+    var cut: Vec<i64> = q;
+    cut.pop();
+    println("cut packet: complete " + bool_to_str(mysql_read_packet(cut, 0).complete));
+    var le: Vec<i64> = Vec::new();
+    mysql_put_lenenc(& mut le, 250);
+    mysql_put_lenenc(& mut le, 251);
+    mysql_put_lenenc(& mut le, 65536);
+    mysql_put_lenenc(& mut le, 16777216);
+    println("lenenc: " + hx(le));
+    var lr: MysqlReader = mysql_reader(le);
+    println("lenenc back: " + int_to_str(mysql_get_lenenc(& mut lr)) + " " + int_to_str(mysql_get_lenenc(& mut lr)) + " " + int_to_str(mysql_get_lenenc(& mut lr)) + " " + int_to_str(mysql_get_lenenc(& mut lr)));
+
+    // The manual's text resultset (no DEPRECATE_EOF)
+    var ps: Vec<Vec<i64>> = Vec::new();
+    ps.push(hb("01"));
+    ps.push(hb("0364656600000011404076657273696f6e5f636f6d6d656e74000c08001c000000fd00001f0000"));
+    ps.push(hb("fe00000200"));
+    ps.push(hb("1c4d7953514c20436f6d6d756e69747920536572766572202847504c29"));
+    ps.push(hb("fe00000200"));
+    var rs: MysqlResult = MysqlResult { ok: false, error_code: 0, sql_state: "", message: "", affected_rows: 0, last_insert_id: 0, warnings: 0, columns: Vec::new(), nrows: 0, vals: Vec::new(), nulls: Vec::new() };
+    val used: i64 = mysql_read_result(ps, false, false, & mut rs);
+    show_result("text resultset (" + int_to_str(used) + " packets)", & rs);
+    val c0: MysqlColumn = rs.columns.get(0);
+    println("  column: charset " + int_to_str(c0.charset) + " length " + int_to_str(c0.length) + " decimals " + int_to_str(c0.decimals));
+
+    // COM_STMT_PREPARE's answer, COM_STMT_EXECUTE, a binary row
+    var pp: Vec<Vec<i64>> = Vec::new();
+    pp.push(hb("000100000001000200000000"));
+    pp.push(hb("03646566000000013f000c3f0000000000fd8000000000"));
+    pp.push(hb("03646566000000013f000c3f0000000000fd8000000000"));
+    pp.push(hb("fe00000200"));
+    pp.push(hb("0364656600000004636f6c31000c3f0000000000fd80001f0000"));
+    pp.push(hb("fe00000200"));
+    var pused: i64 = 0;
+    val st: MysqlStmt = mysql_read_prepare(pp, false, & mut pused);
+    println("prepare: ok " + bool_to_str(st.ok) + " id " + int_to_str(st.id) + " params " + int_to_str(st.nparams) + " columns " + int_to_str(st.columns.len()) + " (" + st.columns.get(0).name + ") used " + int_to_str(pused));
+    var one: Vec<MysqlParam> = Vec::new();
+    one.push(mysql_param_varchar("foo"));
+    println("execute: " + hx(mysql_packets(mysql_com_stmt_execute(1, one), 0)));
+    var mixed: Vec<MysqlParam> = Vec::new();
+    mixed.push(mysql_param_int(0 - 2));
+    mixed.push(mysql_param_null());
+    mixed.push(mysql_param_double(3.5));
+    mixed.push(mysql_param_text("caf\u{e9}"));
+    println("execute mixed: " + hx(mysql_com_stmt_execute(7, mixed)));
+    var cols: Vec<MysqlColumn> = Vec::new();
+    cols.push(mysql_parse_column(hb(coldef("col1", MYSQL_TYPE_VAR_STRING, 0))));
+    var bv: Vec<str> = Vec::new();
+    var bn: Vec<bool> = Vec::new();
+    mysql_parse_binary_row(hb("000006666f6f626172"), cols, & mut bv, & mut bn);
+    println("binary row: " + bv.get(0));
+
+    // Session: login, query, prepared statement
+    reset();
+    feed(0, hs_hex);
+    feed(2, "00000002000000");
+    var c: MysqlConn = mysql_connect(transport(), "app", "secret", "shop");
+    println("connect: ok " + bool_to_str(c.ok) + " " + c.error + " server " + c.server_version + " plugin " + c.plugin);
+    println("  sent: " + hx(SENT));
+    reset();
+    feed(1, "02");
+    feed(2, coldef("id", MYSQL_TYPE_LONGLONG, 0));
+    feed(3, coldef("name", MYSQL_TYPE_VAR_STRING, 0));
+    feed(4, "fe00000200");
+    feed(5, "0131" + lenenc_text("Ada"));
+    feed(6, "0132fb");
+    feed(7, "fe00000200");
+    var r1: MysqlResult = mysql_query(& mut c, "SELECT id, name FROM users");
+    show_result("query", & r1);
+    println("  name column: " + int_to_str(mysql_column_index(& r1, "name")) + ", sent " + hx(SENT));
+    reset();
+    feed(1, "0003000000");
+    var r2: MysqlResult = mysql_query(& mut c, "UPDATE users SET seen = 1");
+    show_result("update", & r2);
+    reset();
+    feed(1, "ff7a042334325330325461626c65202773686f702e6e6f70652720646f65736e2774206578697374");
+    var r3: MysqlResult = mysql_query(& mut c, "SELECT * FROM nope");
+    show_result("missing table", & r3);
+    reset();
+    feed(1, "000500000004000100000000");
+    feed(2, coldef("?", MYSQL_TYPE_VAR_STRING, 0));
+    feed(3, "fe00000200");
+    feed(4, coldef("id", MYSQL_TYPE_LONGLONG, 0));
+    feed(5, coldef("score", MYSQL_TYPE_DOUBLE, 0));
+    feed(6, coldef("small", MYSQL_TYPE_TINY, 0));
+    feed(7, coldef("born", MYSQL_TYPE_DATETIME, 0));
+    feed(8, "fe00000200");
+    val stmt: MysqlStmt = mysql_prepare(& mut c, "SELECT id, score, small, born FROM users WHERE name = ?");
+    println("prepare: ok " + bool_to_str(stmt.ok) + " id " + int_to_str(stmt.id) + " params " + int_to_str(stmt.nparams) + " columns " + int_to_str(stmt.columns.len()));
+    reset();
+    feed(1, "04");
+    feed(2, coldef("id", MYSQL_TYPE_LONGLONG, 0));
+    feed(3, coldef("score", MYSQL_TYPE_DOUBLE, 0));
+    feed(4, coldef("small", MYSQL_TYPE_TINY, 0));
+    feed(5, coldef("born", MYSQL_TYPE_DATETIME, 0));
+    feed(6, "fe00000200");
+    feed(7, "0000" + "2a00000000000000" + "000000000000f43f" + "fe" + "0bea070b110a070040e20100");
+    feed(8, "0020" + "0700000000000000" + "000000000000f0bf" + "05" );
+    feed(9, "fe00000200");
+    var args: Vec<MysqlParam> = Vec::new();
+    args.push(mysql_param_text("Ada"));
+    var r4: MysqlResult = mysql_execute(& mut c, & stmt, args);
+    show_result("execute", & r4);
+    println("  sent " + hx(SENT));
+    var none: Vec<MysqlParam> = Vec::new();
+    println("wrong arity: " + mysql_execute(& mut c, & stmt, none).message);
+
+    // Auth switch: caching_sha2_password offered, the account uses
+    // mysql_native_password
+    reset();
+    val v8: str = "0a382e302e333600" + "08000000" + "3132333435363738" + "00" + "fff7" + "ff" + "0200" + "ffdf" + "15" + "00000000000000000000" + "393031323334353637383930" + "00" + "63616368696e675f736861325f70617373776f726400";
+    feed(0, v8);
+    feed(2, "fe" + hx(str_bytes("mysql_native_password")) + "00" + hx(str_bytes("ABCDEFGHIJKLMNOPQRST")) + "00");
+    feed(4, "00000002000000");
+    var c2: MysqlConn = mysql_connect(transport(), "u", "pw", "");
+    println("auth switch: ok " + bool_to_str(c2.ok) + " plugin " + c2.plugin + " server " + c2.server_version);
+    val expect: Vec<i64> = mysql_native_scramble("pw", str_bytes("ABCDEFGHIJKLMNOPQRST"));
+    println("  switch answer is the native scramble of the new nonce: " + bool_to_str(str_ends_with(hx(SENT), "140000" + "03" + hx(expect))));
+    // caching_sha2 fast auth
+    reset();
+    feed(0, v8);
+    feed(2, "0103");
+    feed(3, "00000002000000");
+    var c3: MysqlConn = mysql_connect(transport(), "u", "pw", "");
+    println("fast auth: ok " + bool_to_str(c3.ok) + " plugin " + c3.plugin);
+    reset();
+    feed(0, v8);
+    feed(2, "0104");
+    var c4: MysqlConn = mysql_connect(transport(), "u", "pw", "");
+    println("full auth: ok " + bool_to_str(c4.ok) + " " + c4.error);
+    reset();
+    feed(0, hs_hex);
+    feed(2, "ff15042332383030304163636573732064656e69656420666f72207573657220277527");
+    var c5: MysqlConn = mysql_connect(transport(), "u", "bad", "");
+    println("denied: ok " + bool_to_str(c5.ok) + " " + c5.error);
+
+    // RSA password exchange: an OpenSSL-made ciphertext of (password NUL)
+    // XOR nonce (openssl pkeyutl -encrypt, OAEP with SHA-1) decrypted
+    val sk: RsaPrivateKey = rsa_private_from_pkcs8(pem_decode(PRIV_PEM(), "PRIVATE KEY").der);
+    val pk: RsaPublicKey = mysql_rsa_key_from_pem(PUB_PEM());
+    val nonce20: Vec<i64> = str_bytes("12345678901234567890");
+    println("server key: ok " + bool_to_str(pk.ok) + " bits " + int_to_str(pk.bits) + ", private key matches " + bool_to_str(bigint_eq(sk.n, pk.n)));
+    println("xor password: " + hx(mysql_xor_password("Secr3t!", nonce20)));
+    val ossl: RsaPlain = mysql_rsa_decrypt_password(sk, nonce20, hb(OPENSSL_CT()));
+    println("openssl ciphertext: ok " + bool_to_str(ossl.ok) + " password " + str_from_bytes(ossl.data));
+    val mine: Vec<i64> = mysql_rsa_encrypt_password("Secr3t!", nonce20, pk, hb("000102030405060708090a0b0c0d0e0f10111213"));
+    val back: RsaPlain = mysql_rsa_decrypt_password(sk, nonce20, mine);
+    println("our ciphertext: " + int_to_str(mine.len()) + " bytes, decrypts to " + str_from_bytes(back.data));
+    println("longest password: 213 bytes " + int_to_str(mysql_rsa_encrypt_password(str_repeat("x", 213), nonce20, pk, hb("000102030405060708090a0b0c0d0e0f10111213")).len()) + ", 214 bytes " + int_to_str(mysql_rsa_encrypt_password(str_repeat("x", 214), nonce20, pk, hb("000102030405060708090a0b0c0d0e0f10111213")).len()));
+
+    // caching_sha2_password full authentication against the fake server:
+    // asking for the key, a configured key, a secure transport
+    var o1: MysqlAuthOpts = mysql_auth_opts();
+    o1.get_server_public_key = true;
+    srv_start(1, "caching_sha2_password", "Secr3t!");
+    var k1: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", o1);
+    println("full auth, key requested: " + conn_state(& k1) + " full " + bool_to_str(k1.full_auth) + " key kept " + bool_to_str(k1.server_public_key == PUB_PEM()));
+    println("  client sent: " + str_join(SRV_LOG, ", "));
+    var o2: MysqlAuthOpts = mysql_auth_opts();
+    o2.server_public_key = PUB_PEM();
+    srv_start(1, "caching_sha2_password", "Secr3t!");
+    var k2: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", o2);
+    println("full auth, configured key: " + conn_state(& k2));
+    println("  client sent: " + str_join(SRV_LOG, ", "));
+    var o3: MysqlAuthOpts = mysql_auth_opts();
+    o3.secure = true;
+    srv_start(1, "caching_sha2_password", "Secr3t!");
+    var k3: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", o3);
+    println("full auth, secure transport: " + conn_state(& k3));
+    println("  client sent: " + str_join(SRV_LOG, ", "));
+    srv_start(1, "caching_sha2_password", "other");
+    var k4: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", o2);
+    println("full auth, wrong password: " + conn_state(& k4));
+    srv_start(2, "caching_sha2_password", "Secr3t!");
+    var k5: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", o1);
+    println("full auth, unreadable key: " + conn_state(& k5));
+
+    // sha256_password: the key asked for in the handshake response, then
+    // a configured key (the ciphertext is the response itself)
+    srv_start(1, "sha256_password", "Secr3t!");
+    var k6: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", mysql_auth_opts());
+    println("sha256_password: " + conn_state(& k6) + " plugin " + k6.plugin);
+    println("  client sent: " + str_join(SRV_LOG, ", "));
+    srv_start(1, "sha256_password", "Secr3t!");
+    var k7: MysqlConn = mysql_connect_opts(srv_transport(), "app", "Secr3t!", "", o2);
+    println("sha256_password, configured key: " + conn_state(& k7));
+    println("  client sent: " + str_join(SRV_LOG, ", "));
+    return 0;
+}
+
+// ─── A fake server for the RSA exchanges ──────────────────────────────────
+// It answers each client packet as a MySQL 8 server would: the handshake
+// (plugin as asked), AuthMoreData 0x01 0x04 (full authentication) after a
+// caching_sha2 scramble, its public key after a request (0x02, or 0x01 for
+// sha256_password), and OK or ERR 1045 after decrypting the password with
+// its private key. Mode 2 sends a damaged key. SRV_LOG says what came in.
+
+var SRV_MODE: i64 = 0;
+var SRV_STAGE: i64 = 0;
+var SRV_SHA256: bool = false;
+var SRV_PW: Vec<i64> = Vec::new();
+var SRV_LOG: Vec<str> = Vec::new();
+
+fn hs8(plugin: str) -> str {
+    return "0a382e302e333600" + "08000000" + "3132333435363738" + "00" + "fff7" + "ff" + "0200" + "ffdf" + "15" + "00000000000000000000" + "393031323334353637383930" + "00" + hx(str_bytes(plugin)) + "00";
+}
+
+fn srv_start(mode: i64, plugin: str, password: str) {
+    reset();
+    SRV_MODE = mode;
+    SRV_STAGE = 0;
+    SRV_SHA256 = plugin == "sha256_password";
+    SRV_PW = str_bytes(password);
+    SRV_LOG = Vec::new();
+    feed(0, hs8(plugin));
+}
+
+fn srv_transport() -> MysqlTransport {
+    val t: MysqlTransport = MysqlTransport { conn: 7, send: srv_send, recv: mock_recv };
+    return t;
+}
+
+fn srv_key_packet(seq: i64) {
+    var pem: str = PUB_PEM();
+    if SRV_MODE == 2 {
+        pem = str_replace(pem, "MIIB", "AAAA");
+    }
+    feed(seq, "01" + hx(str_bytes(pem)));
+}
+
+// The auth data of a HandshakeResponse41 (lenenc length after the user).
+fn srv_auth_of(p: Vec<i64>) -> Vec<i64> {
+    var i: i64 = 32;
+    while p.get(i) != 0 {
+        i = i + 1;
+    }
+    i = i + 1;
+    var n: i64 = p.get(i);
+    if n == 252 {
+        n = p.get(i + 1) + p.get(i + 2) * 256;
+        i = i + 2;
+    }
+    var out: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < n {
+        out.push(p.get(i + 1 + k));
+        k = k + 1;
+    }
+    return out;
+}
+
+fn srv_check_password(seq: i64, ct: Vec<i64>) {
+    val sk: RsaPrivateKey = rsa_private_from_pkcs8(pem_decode(PRIV_PEM(), "PRIVATE KEY").der);
+    val got: RsaPlain = mysql_rsa_decrypt_password(sk, str_bytes("12345678901234567890"), ct);
+    SRV_LOG.push(int_to_str(ct.len()) + "-byte RSA ciphertext (decrypts to " + str_from_bytes(got.data) + ")");
+    srv_verdict(seq, got.ok && hx(got.data) == hx(SRV_PW));
+}
+
+fn srv_verdict(seq: i64, good: bool) {
+    if good {
+        feed(seq, "00000002000000");
+    } else {
+        feed(seq, "ff15042332383030304163636573732064656e69656420666f72207573657220276170702740276c6f63616c686f73742720287573696e672070617373776f72643a2059455329");
+    }
+}
+
+fn srv_send(conn: i64, b: Vec<i64>) -> i64 {
+    val pk: MysqlPacket = mysql_read_packet(b, 0);
+    val p: Vec<i64> = pk.payload;
+    val next: i64 = pk.seq + 1;
+    if SRV_STAGE == 0 {
+        SRV_STAGE = 1;
+        val auth: Vec<i64> = srv_auth_of(p);
+        if !SRV_SHA256 {
+            SRV_LOG.push("handshake response with a " + int_to_str(auth.len()) + "-byte scramble");
+            feed(next, "0104");
+        } else if auth.len() == 1 && auth.get(0) == 1 {
+            SRV_LOG.push("handshake response asking for the key");
+            srv_key_packet(next);
+        } else {
+            srv_check_password(next, auth);
+        }
+        return b.len();
+    }
+    if p.len() == 1 && p.get(0) == 2 {
+        SRV_LOG.push("key request");
+        srv_key_packet(next);
+    } else if p.len() > 0 && p.get(p.len() - 1) == 0 && p.len() < 64 {
+        var clear: Vec<i64> = p;
+        clear.pop();
+        SRV_LOG.push("clear password " + str_from_bytes(clear));
+        srv_verdict(next, hx(clear) == hx(SRV_PW));
+    } else {
+        srv_check_password(next, p);
+    }
+    return b.len();
+}
+
+fn OPENSSL_CT() -> str {
+    return "6d2f3c616c00e026b31f88dae6d882d53ba600ff86bab6f3a98d082b4f2ef12582b0cefe7390c626a85593870569248dd791ab99119856af8f89107fecd5dda34383c8a11a8e49b0b812a03dde54a876edf3d4580f77b00682fd0a62a6fc393400c9e6956d5c6e2d2eea084ef57456b878bc099cf21ecd0d44bc82571d91b0ae9cd40a14423a22add12e1352f9549f955dcd27164b49a1b489f3897f755cd25b8513f5eb1eb633fdbe4f1217ec31587ad89ad36a885ab24b9dc7ae98d7f2f557a2fb4e7f7bafa3143369f9468494a8811ae88dae27346fa294aa28deac7ebf16e150a063c052cb9befb501ba84afcc45dfaf5af227c94eca0538b330d4c88271";
+}
+
+fn PUB_PEM() -> str {
+    return "-----BEGIN PUBLIC KEY-----\n" +
+        "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs4EifK7LgLVBafb0SmOm\n" +
+        "H2Ej/hbaM8b0w6jtR8IG/T2cZd9tGR5aHKrmbzoTP4XGNs8tD7wa+4tpzd9UPN0y\n" +
+        "FvS2oPNyePSixrSsEFi6S1b/nv3LPdTYkfn6uMDYCzw4uCTMdexCmtbX7NIQd+ij\n" +
+        "oROJAh8xESlzcbuLyUdAq+ALSDCqCTM4lFvFAssIXWOzrqkzBts+Y6+nDGyIuMt/\n" +
+        "cKozqXXTWnkuoUYLmmVKGlz7cT2ZOhHWajnk2QZGqLt/kk65iRifSpv95R366I6g\n" +
+        "Uy6otCrRpgQupgL81+BmoNxKP4Id1wiKNLTC+HvMtm/TgCvRfh498LGaltE+abeg\n" +
+        "jQIDAQAB\n" +
+        "-----END PUBLIC KEY-----\n";
+}
+
+fn PRIV_PEM() -> str {
+    return "-----BEGIN PRIVATE KEY-----\n" +
+        "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCzgSJ8rsuAtUFp\n" +
+        "9vRKY6YfYSP+FtozxvTDqO1Hwgb9PZxl320ZHlocquZvOhM/hcY2zy0PvBr7i2nN\n" +
+        "31Q83TIW9Lag83J49KLGtKwQWLpLVv+e/cs91NiR+fq4wNgLPDi4JMx17EKa1tfs\n" +
+        "0hB36KOhE4kCHzERKXNxu4vJR0Cr4AtIMKoJMziUW8UCywhdY7OuqTMG2z5jr6cM\n" +
+        "bIi4y39wqjOpddNaeS6hRguaZUoaXPtxPZk6EdZqOeTZBkaou3+STrmJGJ9Km/3l\n" +
+        "HfrojqBTLqi0KtGmBC6mAvzX4Gag3Eo/gh3XCIo0tML4e8y2b9OAK9F+Hj3wsZqW\n" +
+        "0T5pt6CNAgMBAAECggEAAsZLNywofxvOIAouKnwx1ChXOxU1WDmKDQAucr6ABygN\n" +
+        "o9F5STsb33eQykVWiNPThYNcSfL5Y8v63bDHB43PuWUc8Y3xxgbaAUJHqpUEhCeb\n" +
+        "GeUIYDNLCa6YfoSUkk/i/I2tD2GQgf4yJjn1ATV6WgIISx0aUA6Y9zgT6A+O41kz\n" +
+        "ku0J9EwENXm/KJ6xoml3KOazgbrPI10Lf3VbLmRMrYcmhMZa+sCd2JefJJC5J9S8\n" +
+        "LvXZg+SOENdyFNHgWPGdf8tIx63YP+hD1owHbuF0ZTJLQx7hlIfnm/0mu7jYu4Ky\n" +
+        "davH/yb1dyNblKqzDd0vVZYOIgMXoqrWj9YDTA9nTQKBgQDWy2UeGN3i1FhQ+E6L\n" +
+        "lgYOxg+kj5Qks6s2keqVeT3tvnKUO1nkTQNl2yg8wYBIP7QBdeD2ji5wv9wWIv1R\n" +
+        "MPT1whBT28uamnEKCXXh484BoqSQ01FOVQ7e5xTeGwqgBOsjy/MQFnb/XW+DZXW5\n" +
+        "ZOLX465gc+3O5qy5gxSsUYlwHwKBgQDV8KLjzHSLM4PsvvY7TIVtuWCXtRzuLVFM\n" +
+        "t/REr6MIQ1Gj/3OwGXCUKA0yHetlSJ5b3ARRXMVVpO4ghgenK/h2waQYm7SmPEtd\n" +
+        "SZ8BSUQ26XqP0CJe0jnDArfbS3jqJtOXEbKEi4J54m9FILnTfffUwEbtGxBtlWXd\n" +
+        "HbMvxRzp0wKBgHOl832u+djlZ9/AsdmqHvzZWxbJT4QrUKYDDoEIVHWrMtno0s9/\n" +
+        "P7MZuqJrtPwxgGPA6i0WBJ8kTgWFNUr/xwSDRnNARnGpce9rhJLpKsPqpBxuCrrY\n" +
+        "RTdyx+OGP8REoa4WY3pn/g4kaqQefrIhRZnjtsGr6YCa5qjDkN/uzscVAoGAZDEB\n" +
+        "1/UUT2ycx+7WmgbIJg6+8c1b8x8+B9POjaxDiccdINStdTc0xe3L4ECq0RAlOZfc\n" +
+        "Xc44jFdlPc4HH380KUmec/fXrlJmaRXlZVDOpXjKcTdkIUwKyQ0o1YaO5fmw9frP\n" +
+        "w8siG7qzqYgd/rHrsrMphDk8hFWHEvqpxCFn3QkCgYB5YGh65FBadQ+5tABupRm0\n" +
+        "sCyrzqdhcoYE/fGzrsUlrl1Ijb4b3fZPxpADcZfp0MtXu69LdUNZ6Wu0XS4r3kYx\n" +
+        "W4OcD8sLQfpNoW6HNuwl53Nbgd2Xw7O+5eruHjA31jW2XV9Z+URghud6j/hJx1dl\n" +
+        "kvMYlV32+4+eEaCoKTpj1Q==\n" +
+        "-----END PRIVATE KEY-----\n";
+}
+
+fn conn_state(c: & MysqlConn) -> str {
+    if c.ok {
+        return "ok";
+    }
+    return "failed: " + c.error;
+}

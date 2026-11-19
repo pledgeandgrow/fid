@@ -1,0 +1,265 @@
+// stdlib/sensor_drivers: the BMP280/BME280 datasheet compensation example (calibration words, adc_T=519888, adc_P=415148: 25.08 C, 100653.27 Pa), BME280 over fake I2C and fake SPI, MPU6050 scaling, VL53L0X result block, SHT3x CRC (0xBEEF -> 0x92) and conversion, BH1750 (datasheet 0x8390 -> 28067 lx), INA219 calibration and registers
+// Expected output:
+// cal: T1 27504 T2 26435 T3 -1000 P1 36477 P9 6000 H1 75 H2 362 H4 313 H5 50 H6 30
+// t_fine: 128422
+// temp c100: 2508
+// pressure q24.8: 25767233 = Pa x100 10065325
+// double: T x100 2508 P x100 10065327
+// humidity q22.10: 56317 double x1000 55001
+// i2c bme280: 2508 25767233 56317 ctrl_meas 27
+// spi bme280: 2508 25767233 56317 ctrl_meas 27
+// bad chip: unexpected chip id 0
+// mpu6050: 1000 -1000 500 34998 -1000 1000 0
+// mpu6050 config: pwr 1 gyro 0 accel 0
+// mpu6050 +-8g 1g: 1000
+// vl53l0x: present true range 300 status 11 cleared 1
+// vl53l0x idle: timeout
+// sht3x crc beef: 92
+// sht3x: 2500 5000
+// sht3x bad crc: humidity CRC mismatch
+// sht3x command: 2c06
+// bh1750: 2806667 h2 1403333 mt138 1403333
+// bh1750 mtreg 138: 446a
+// bh1750 read: 2806667
+// ina219 config: 399f cal 4096
+// ina219 regs: 320000 -320000 12000 true false
+// ina219 chip: 5000 3000
+// ina219 read: 12000 50000 500000 6000000
+use sensor_drivers;
+use i2c;
+use spi;
+use encoding;
+use string;
+
+fn r(x: f64) -> i64 {
+    return (x + 0.5) as i64;
+}
+
+fn ina_fake(h: i64, req: Vec<i64>) -> Vec<i64> {
+    val msgs: Vec<I2cMsg> = i2c_decode_request(& req);
+    var out: Vec<i64> = Vec::new();
+    out.push(0);
+    if msgs.len() == 2 {
+        val reg: i64 = msgs.get(0).data.get(0);
+        var v: i64 = 0;
+        if reg == 1 {
+            v = 0x1388;
+        } else if reg == 2 {
+            v = 0x5DC2;
+        } else if reg == 3 {
+            v = 3000;
+        } else if reg == 4 {
+            v = 5000;
+        }
+        out.push((v >> 8) & 0xFF);
+        out.push(v & 0xFF);
+    }
+    return out;
+}
+
+fn bme_fake_i2c() -> I2cBus {
+    var bus: I2cBus = i2c_bus_fake();
+    var d: I2cFakeDev = i2c_fake_dev(0x76, 256);
+    i2c_fake_dev_set(& mut d, 0xD0, hex_decode_bytes("60"));
+    i2c_fake_dev_set(& mut d, 0x88, hex_decode_bytes("706b436718fc7d8e43d6d00b270b8c00f9ff8c3cf8c67017004b"));
+    i2c_fake_dev_set(& mut d, 0xE1, hex_decode_bytes("6a01001329031e"));
+    i2c_fake_dev_set(& mut d, 0xF7, hex_decode_bytes("655ac07eed007530"));
+    i2c_fake_add(& mut bus, d);
+    return bus;
+}
+
+fn bme_fake_spi() -> SpiBus {
+    var bus: SpiBus = spi_bus_fake(spi_config(SPI_MODE_0, 8, 1000000));
+    var d: SpiFakeDev = spi_fake_regdev(0, 128);
+    // in SPI mode the BME280 drops bit 7 of register addresses
+    spi_fake_set(& mut d, 0xD0 & 0x7F, hex_decode_bytes("60"));
+    spi_fake_set(& mut d, 0x88 & 0x7F, hex_decode_bytes("706b436718fc7d8e43d6d00b270b8c00f9ff8c3cf8c67017004b"));
+    spi_fake_set(& mut d, 0xE1 & 0x7F, hex_decode_bytes("6a01001329031e"));
+    spi_fake_set(& mut d, 0xF7 & 0x7F, hex_decode_bytes("655ac07eed007530"));
+    spi_fake_add(& mut bus, d);
+    return bus;
+}
+
+fn show3(label: str, r: Result<Vec<i64>, str>, ctrl: i64) {
+    match r {
+        Result::Ok(v) => {
+            println(label + ": " + int_to_str(v.get(0)) + " " + int_to_str(v.get(1)) + " " + int_to_str(v.get(2)) + " ctrl_meas " + int_to_hex(ctrl));
+        }
+        Result::Err(e) => {
+            println(label + ": " + e);
+        }
+    }
+}
+
+fn hexb(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn main() {
+    val a: Vec<i64> = hex_decode_bytes("706b436718fc7d8e43d6d00b270b8c00f9ff8c3cf8c67017004b");
+    val b: Vec<i64> = hex_decode_bytes("6a01001329031e");
+    val cal: Bme280Cal = bme280_parse_cal(& a, & b);
+    println("cal: T1 " + int_to_str(cal.t1) + " T2 " + int_to_str(cal.t2) + " T3 " + int_to_str(cal.t3) + " P1 " + int_to_str(cal.p1) + " P9 " + int_to_str(cal.p9) + " H1 " + int_to_str(cal.h1) + " H2 " + int_to_str(cal.h2) + " H4 " + int_to_str(cal.h4) + " H5 " + int_to_str(cal.h5) + " H6 " + int_to_str(cal.h6));
+    val tf: i64 = bme280_t_fine(& cal, 519888);
+    println("t_fine: " + int_to_str(tf));
+    println("temp c100: " + int_to_str(bme280_temp_c100(tf)));
+    val pq: i64 = bme280_pressure_q24_8(& cal, tf, 415148);
+    println("pressure q24.8: " + int_to_str(pq) + " = Pa x100 " + int_to_str((pq * 100 + 128) / 256));
+    val dbl: Vec<f64> = bme280_compensate_f64(& cal, 519888, 415148, 30000);
+    println("double: T x100 " + int_to_str((dbl.get(0) * 100.0) as i64) + " P x100 " + int_to_str(r(dbl.get(1) * 100.0)));
+    println("humidity q22.10: " + int_to_str(bme280_humidity_q22_10(& cal, tf, 30000)) + " double x1000 " + int_to_str(r(dbl.get(2) * 1000.0)));
+
+    match bme280_init(sensor_on_i2c(bme_fake_i2c(), BME280_ADDR)) {
+        Result::Ok(dev) => {
+            var d: Bme280 = dev;
+            val ctrl: i64 = i2c_fake_get(& d.link.i2c, 0x76).regs.get(0xF4);
+            show3("i2c bme280", bme280_read(& mut d), ctrl);
+        }
+        Result::Err(e) => {
+            println("i2c bme280: " + e);
+        }
+    }
+    match bme280_init(sensor_on_spi(bme_fake_spi())) {
+        Result::Ok(dev) => {
+            var d: Bme280 = dev;
+            val ctrl: i64 = spi_fake_get(& d.link.spi, 0).regs.get(0xF4 & 0x7F);
+            show3("spi bme280", bme280_read(& mut d), ctrl);
+        }
+        Result::Err(e) => {
+            println("spi bme280: " + e);
+        }
+    }
+    var empty: I2cBus = i2c_bus_fake();
+    i2c_fake_add(& mut empty, i2c_fake_dev(0x77, 256));
+    match bme280_init(sensor_on_i2c(empty, 0x77)) {
+        Result::Ok(_) => {
+            println("bad chip: accepted");
+        }
+        Result::Err(e) => {
+            println("bad chip: " + e);
+        }
+    }
+
+    var mbus: I2cBus = i2c_bus_fake();
+    var md: I2cFakeDev = i2c_fake_dev(0x68, 128);
+    i2c_fake_dev_set(& mut md, 0x75, hex_decode_bytes("68"));
+    i2c_fake_dev_set(& mut md, 0x1B, hex_decode_bytes("18"));
+    i2c_fake_dev_set(& mut md, 0x3B, hex_decode_bytes("4000c0002000fdf7ff7d00830000"));
+    i2c_fake_add(& mut mbus, md);
+    match mpu6050_init(sensor_on_i2c(mbus, MPU6050_ADDR), 0, 0) {
+        Result::Ok(dev) => {
+            var m: Mpu6050 = dev;
+            match mpu6050_read(& mut m) {
+                Result::Ok(v) => {
+                    var s: str = "mpu6050:";
+                    var i: i64 = 0;
+                    while i < v.len() {
+                        s = s + " " + int_to_str(v.get(i));
+                        i = i + 1;
+                    }
+                    println(s);
+                }
+                Result::Err(e) => {
+                    println("mpu6050: " + e);
+                }
+            }
+            val fd: I2cFakeDev = i2c_fake_get(& m.link.i2c, 0x68);
+            println("mpu6050 config: pwr " + int_to_str(fd.regs.get(0x6B)) + " gyro " + int_to_str(fd.regs.get(0x1B)) + " accel " + int_to_str(fd.regs.get(0x1C)));
+        }
+        Result::Err(e) => {
+            println("mpu6050: " + e);
+        }
+    }
+    println("mpu6050 +-8g 1g: " + int_to_str(mpu6050_scale(& hex_decode_bytes("1000000000000000000000000000"), 2, 0).get(0)));
+
+    var vbus: I2cBus = i2c_bus_fake();
+    var vd: I2cFakeDev = i2c_fake_dev(0x29, 256);
+    i2c_fake_dev_set(& mut vd, 0xC0, hex_decode_bytes("ee"));
+    i2c_fake_dev_set(& mut vd, 0x13, hex_decode_bytes("04"));
+    i2c_fake_dev_set(& mut vd, 0x14, hex_decode_bytes("58"));
+    i2c_fake_dev_set(& mut vd, 0x1E, hex_decode_bytes("012c"));
+    i2c_fake_add(& mut vbus, vd);
+    var vl: SensorBus = sensor_on_i2c(vbus, VL53L0X_ADDR);
+    val present: bool = vl53l0x_present(& mut vl);
+    vl53l0x_start_single(& mut vl, 0x3C);
+    match vl53l0x_read_result(& mut vl, 10) {
+        Result::Ok(v) => {
+            val cleared: i64 = i2c_fake_get(& vl.i2c, 0x29).regs.get(0x0B);
+            println("vl53l0x: present " + bool_to_str(present) + " range " + int_to_str(v.get(0)) + " status " + int_to_str(v.get(1)) + " cleared " + int_to_str(cleared));
+        }
+        Result::Err(e) => {
+            println("vl53l0x: " + e);
+        }
+    }
+    sensor_write_reg(& mut vl, 0x13, 0);
+    match vl53l0x_read_result(& mut vl, 5) {
+        Result::Ok(_) => {
+            println("vl53l0x idle: ready");
+        }
+        Result::Err(e) => {
+            println("vl53l0x idle: " + e);
+        }
+    }
+
+    println("sht3x crc beef: " + hexb(sht3x_crc8(& hex_decode_bytes("beef"))));
+    var sbus: I2cBus = i2c_bus_fake();
+    var sd: I2cFakeDev = i2c_fake_dev(0x44, 1);
+    sd.queue = hex_decode_bytes("666693800000");
+    sd.queue.set(5, sht3x_crc8(& hex_decode_bytes("8000")));
+    i2c_fake_add(& mut sbus, sd);
+    var sl: SensorBus = sensor_on_i2c(sbus, SHT3X_ADDR);
+    match sht3x_measure(& mut sl) {
+        Result::Ok(v) => {
+            println("sht3x: " + int_to_str(v.get(0)) + " " + int_to_str(v.get(1)));
+        }
+        Result::Err(e) => {
+            println("sht3x: " + e);
+        }
+    }
+    match sht3x_decode(& hex_decode_bytes("666693800001")) {
+        Result::Ok(_) => {
+            println("sht3x bad crc: accepted");
+        }
+        Result::Err(e) => {
+            println("sht3x bad crc: " + e);
+        }
+    }
+    val sw: I2cFakeDev = i2c_fake_get(& sl.i2c, 0x44);
+    println("sht3x command: " + hex_encode_bytes(sw.written));
+
+    println("bh1750: " + int_to_str(bh1750_lux100(0x8390, 69, BH1750_CONT_H)) + " h2 " + int_to_str(bh1750_lux100(0x8390, 69, BH1750_CONT_H2)) + " mt138 " + int_to_str(bh1750_lux100(0x8390, 138, BH1750_CONT_H)));
+    println("bh1750 mtreg 138: " + hex_encode_bytes(bh1750_mtreg_commands(138)));
+    var lbus: I2cBus = i2c_bus_fake();
+    var ld: I2cFakeDev = i2c_fake_dev(0x23, 1);
+    ld.queue = hex_decode_bytes("8390");
+    i2c_fake_add(& mut lbus, ld);
+    var ll: SensorBus = sensor_on_i2c(lbus, BH1750_ADDR);
+    var cmd: Vec<i64> = Vec::new();
+    cmd.push(BH1750_ONE_H);
+    sensor_command(& mut ll, cmd);
+    match bh1750_read_lux100(& mut ll, 69, BH1750_ONE_H) {
+        Result::Ok(v) => {
+            println("bh1750 read: " + int_to_str(v));
+        }
+        Result::Err(e) => {
+            println("bh1750 read: " + e);
+        }
+    }
+
+    println("ina219 config: " + int_to_hex(ina219_config(true, 8, 3, 3, 7)) + " cal " + int_to_str(ina219_calibration(100, 100)));
+    println("ina219 regs: " + int_to_str(ina219_shunt_uv(0x7D00)) + " " + int_to_str(ina219_shunt_uv(0x8300)) + " " + int_to_str(ina219_bus_mv(0x5DC2)) + " " + bool_to_str(ina219_conversion_ready(0x5DC2)) + " " + bool_to_str(ina219_overflow(0x5DC2)));
+    val creg: i64 = ina219_current_reg(0x1388, 4096);
+    println("ina219 chip: " + int_to_str(creg) + " " + int_to_str(ina219_power_reg(creg, 0x5DC2)));
+    match ina219_init(sensor_on_i2c(i2c_bus_custom(0, ina_fake), INA219_ADDR), 100, 100, INA219_CONFIG_DEFAULT) {
+        Result::Ok(dev) => {
+            var ina: Ina219 = dev;
+            val v: Vec<i64> = ina219_read(& mut ina);
+            println("ina219 read: " + int_to_str(v.get(0)) + " " + int_to_str(v.get(1)) + " " + int_to_str(v.get(2)) + " " + int_to_str(v.get(3)));
+        }
+        Result::Err(e) => {
+            println("ina219 read: " + e);
+        }
+    }
+}

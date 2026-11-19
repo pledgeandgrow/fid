@@ -1,0 +1,137 @@
+// stdlib/flash: NOR program/erase rules, CRC-32 vector, the log-structured key-value store (updates, deletes, remount, wear levelling) and a power-cut sweep over a write that triggers compaction.
+// Expected output:
+// crc32 123456789 = 0xCBF43926
+// program 0x5A over 0xFF: true, then 0xA5 over 0x5A: false (0->1 bit change at 0 needs an erase)
+// once mode second program: false (unit at 8 already programmed)
+// unaligned: false
+// after erase: 0xff erases 1
+// put 3 keys, count 3, boot=7 name=sensor-12
+// update+delete: name=sensor-12b has rate false count 2
+// remount: count 2 boot=7 name=sensor-12b
+// 200 updates: counter=199 boot=7, compactions > 0: true
+// wear min..max spread <= 1: true
+// remount after rotations: counter=199 name=sensor-12b
+// torn put: false power lost during program
+// after power cut: cfg=v1 torn records 1
+// next put works: cfg=v3
+// sweep: every cut leaves cfg old or new and the other keys intact: true
+// sweep outcomes: both seen true
+use flash;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn one(b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(b);
+    v.push(0xFF);
+    v.push(0xFF);
+    v.push(0xFF);
+    return v;
+}
+
+fn hex32(v: i64) -> str {
+    val d: str = "0123456789ABCDEF";
+    var out: str = "";
+    var i: i64 = 7;
+    while i >= 0 {
+        val n: i64 = (v >> (4 * i)) & 15;
+        out = out + str_slice(d, n, n + 1);
+        i = i - 1;
+    }
+    return "0x" + out;
+}
+
+fn main() {
+    println("crc32 123456789 = " + hex32(flash_crc32(str_bytes("123456789"), 0, 9, 0)));
+    var d: FlashDev = flash_new(256, 4, 4, false);
+    val p1: bool = flash_program(&mut d, 0, one(0x5A));
+    val p2: bool = flash_program(&mut d, 0, one(0xA5));
+    println("program 0x5A over 0xFF: " + bs(p1) + ", then 0xA5 over 0x5A: " + bs(p2) + " (" + d.error + ")");
+    var o: FlashDev = flash_new(256, 2, 4, true);
+    flash_program(&mut o, 8, one(0xF0));
+    val p3: bool = flash_program(&mut o, 8, one(0x70));
+    println("once mode second program: " + bs(p3) + " (" + o.error + ")");
+    println("unaligned: " + bs(flash_program(&mut d, 2, one(0))));
+    flash_erase(&mut d, 0);
+    println("after erase: 0x" + int_to_hex(flash_read(&d, 0)) + " erases " + int_to_str(d.erases.get(0)));
+
+    var f: FlashDev = flash_new(256, 4, 4, true);
+    var kv: FlashKv = fkv_mount(&mut f, 0, 4);
+    fkv_put_str(&mut f, &mut kv, "boot", "7");
+    fkv_put_str(&mut f, &mut kv, "name", "sensor-12");
+    fkv_put_str(&mut f, &mut kv, "rate", "100");
+    println("put 3 keys, count " + int_to_str(fkv_count(&kv)) + ", boot=" + fkv_get_str(&f, &kv, "boot") + " name=" + fkv_get_str(&f, &kv, "name"));
+    fkv_put_str(&mut f, &mut kv, "name", "sensor-12b");
+    fkv_delete(&mut f, &mut kv, "rate");
+    println("update+delete: name=" + fkv_get_str(&f, &kv, "name") + " has rate " + bs(fkv_has(&kv, "rate")) + " count " + int_to_str(fkv_count(&kv)));
+    var kv2: FlashKv = fkv_mount(&mut f, 0, 4);
+    println("remount: count " + int_to_str(fkv_count(&kv2)) + " boot=" + fkv_get_str(&f, &kv2, "boot") + " name=" + fkv_get_str(&f, &kv2, "name"));
+    var i: i64 = 0;
+    var ok: bool = true;
+    while i < 200 {
+        if !fkv_put_str(&mut f, &mut kv2, "counter", int_to_str(i)) { ok = false; }
+        i = i + 1;
+    }
+    println("200 updates: counter=" + fkv_get_str(&f, &kv2, "counter") + " boot=" + fkv_get_str(&f, &kv2, "boot") + ", compactions > 0: " + bs(ok && kv2.compactions > 0));
+    val wear: Vec<i64> = flash_wear(&f);
+    println("wear min..max spread <= 1: " + bs(wear.get(1) - wear.get(0) <= 1 && wear.get(0) > 0));
+    val kv3: FlashKv = fkv_mount(&mut f, 0, 4);
+    println("remount after rotations: counter=" + fkv_get_str(&f, &kv3, "counter") + " name=" + fkv_get_str(&f, &kv3, "name"));
+
+    var g: FlashDev = flash_new(256, 4, 4, true);
+    var kg: FlashKv = fkv_mount(&mut g, 0, 4);
+    fkv_put_str(&mut g, &mut kg, "cfg", "v1");
+    g.fail_after = 10;
+    val torn: bool = fkv_put_str(&mut g, &mut kg, "cfg", "v2-a-longer-value");
+    println("torn put: " + bs(torn) + " " + g.error);
+    flash_power_on(&mut g);
+    var kg2: FlashKv = fkv_mount(&mut g, 0, 4);
+    println("after power cut: cfg=" + fkv_get_str(&g, &kg2, "cfg") + " torn records " + int_to_str(kg2.torn));
+    fkv_put_str(&mut g, &mut kg2, "cfg", "v3");
+    val kg3: FlashKv = fkv_mount(&mut g, 0, 4);
+    println("next put works: cfg=" + fkv_get_str(&g, &kg3, "cfg"));
+
+    // Fill the active page until the next put must roll over and compact.
+    var base: FlashDev = flash_new(128, 3, 4, true);
+    var kb: FlashKv = fkv_mount(&mut base, 0, 3);
+    fkv_put_str(&mut base, &mut kb, "a", "AAAA");
+    fkv_put_str(&mut base, &mut kb, "b", "BBBB");
+    var fill: i64 = 0;
+    while kb.woff + fkv_record_size(&base, 3, 6) <= base.page_size || kb.active == 0 {
+        fkv_put_str(&mut base, &mut kb, "cfg", "old" + int_to_str(fill % 10) + "xx");
+        fill = fill + 1;
+    }
+    val oldv: str = fkv_get_str(&base, &kb, "cfg");
+    var probe: FlashDev = base;
+    var kp: FlashKv = fkv_mount(&mut probe, 0, 3);
+    val before: i64 = probe.programmed;
+    fkv_put_str(&mut probe, &mut kp, "cfg", "NEWVAL");
+    val total: i64 = probe.programmed - before;
+    var all_ok: bool = true;
+    var saw_old: bool = false;
+    var saw_new: bool = false;
+    var cut: i64 = 0;
+    while cut <= total {
+        var t: FlashDev = base;
+        var kt: FlashKv = fkv_mount(&mut t, 0, 3);
+        t.fail_after = cut;
+        fkv_put_str(&mut t, &mut kt, "cfg", "NEWVAL");
+        flash_power_on(&mut t);
+        var kr: FlashKv = fkv_mount(&mut t, 0, 3);
+        val c: str = fkv_get_str(&t, &kr, "cfg");
+        if str_equal(c, oldv) { saw_old = true; } else if str_equal(c, "NEWVAL") { saw_new = true; } else { all_ok = false; }
+        if !str_equal(fkv_get_str(&t, &kr, "a"), "AAAA") || !str_equal(fkv_get_str(&t, &kr, "b"), "BBBB") { all_ok = false; }
+        // The store must still accept writes and keep them.
+        if !fkv_put_str(&mut t, &mut kr, "a", "A2") { all_ok = false; }
+        val kz: FlashKv = fkv_mount(&mut t, 0, 3);
+        if !str_equal(fkv_get_str(&t, &kz, "a"), "A2") || !str_equal(fkv_get_str(&t, &kz, "b"), "BBBB") { all_ok = false; }
+        cut = cut + 1;
+    }
+    println("sweep: every cut leaves cfg old or new and the other keys intact: " + bs(all_ok && total > 20));
+    println("sweep outcomes: both seen " + bs(saw_old && saw_new));
+}

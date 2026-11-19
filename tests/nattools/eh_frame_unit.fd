@@ -1,0 +1,360 @@
+// DB6 (docs/roadmap/llvm-roadmap.md): .eh_frame and .eh_frame_hdr in the
+// Linux executables of the machine layer (compiler/nat_enc.fd
+// nat_elf_eh_frame, nat_eh_frame, nat_eh_frame_hdr, called by
+// nat_elf_debug), and the frame rows of saves RA12 defers
+// (compiler/nat_ir.fd ng_dbg_sw_to: n = 0 is a restore, which
+// nat_dwarf_build writes as DW_CFA_restore).
+//
+// A stand-in x86-64 image: `f` (frame record, sub rsp 32, a deferred
+// save of rbx at 13..18 given back at 18..23, then the epilogue) and a
+// leaf `g`. Its frame rows say rbx is saved at CFA - 24 from 18 and back
+// from 23. The test reads the executable back the way an unwinder does:
+// PT_GNU_EH_FRAME -> .eh_frame_hdr -> the search table -> the FDE ->
+// its CIE, and checks the FDE programs are .debug_frame's. The last part
+// gives nat_eh_frame_hdr FDEs out of order and twice at one address.
+// With FID_EH_UNIT_OUT=<file> the executable is also written there (for
+// tests/nattools/eh_frame_check.py and readelf).
+// Run (from the repository root):
+//   fid run tests/nattools/eh_frame_unit.fd
+// Expected output:
+// phnum 2
+// load filesz covers eh true
+// eh_frame phdr flags 4 at header true
+// sections hdr true frame true
+// hdr version 1 enc 1b 03 3b
+// hdr eh_frame_ptr ok true
+// hdr fdes 2
+// table 0: f at 4198400 fde ok true
+// table 1: g at 4198432 fde ok true
+// cie zR ra 16 enc 1b
+// fde f range 32 same rules true
+// fde g range 16 same rules true
+// f rules 41 0e 10 86 02 43 0d 06 4e 83 03 45 c3 47 0a 0c 07 08 c6 41 0b
+// sorted 3: 100 200 300
+// fde offsets 16 24 8
+// ptr ok true
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn le16(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: &Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+// a signed 32-bit field
+fn se32(b: &Vec<i64>, at: i64) -> i64 {
+    var v: i64 = le32(b, at);
+    if v >= 2147483648 {
+        v = v - 4294967296;
+    }
+    return v;
+}
+
+fn le64(b: &Vec<i64>, at: i64) -> i64 {
+    return le32(b, at) | (le32(b, at + 4) << 32);
+}
+
+fn cstr_at(b: &Vec<i64>, at: i64) -> str {
+    var out: str = "";
+    var i: i64 = at;
+    while i < b.len() && b.get(i) != 0 {
+        out = out + char_to_str(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hex2(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    return str_slice(digits, (v >> 4) & 15, ((v >> 4) & 15) + 1) + str_slice(digits, v & 15, (v & 15) + 1);
+}
+
+// ULEB128 at `at`; next.get(0) becomes the offset after it.
+fn uleb_at(b: &Vec<i64>, at: i64, next: &mut Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var shift: i64 = 0;
+    var i: i64 = at;
+    while true {
+        var c: i64 = b.get(i);
+        v = v | ((c & 127) << shift);
+        shift = shift + 7;
+        i = i + 1;
+        if (c & 128) == 0 {
+            break;
+        }
+    }
+    next.set(0, i);
+    return v;
+}
+
+fn push_all(v: &mut Vec<i64>, bytes: Vec<i64>) {
+    var i: i64 = 0;
+    while i < bytes.len() {
+        v.push(bytes.get(i));
+        i = i + 1;
+    }
+}
+
+fn bytes2(a: i64, b: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+// The stand-in image (48 bytes of code)
+fn image() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    // f: push rbp; mov rbp, rsp; sub rsp, 32
+    v.push(0x55);
+    v.push(0x48);
+    v.push(0x89);
+    v.push(0xE5);
+    v.push(0x48);
+    v.push(0x83);
+    v.push(0xEC);
+    v.push(0x20);
+    // 8: test rdi, rdi; je 26
+    v.push(0x48);
+    v.push(0x85);
+    v.push(0xFF);
+    push_all(& mut v, bytes2(0x74, 0x0D));
+    // 13: mov [rsp + 24], rbx (the deferred save)
+    v.push(0x48);
+    v.push(0x89);
+    v.push(0x5C);
+    v.push(0x24);
+    v.push(0x18);
+    // 18: mov rbx, [rsp + 24] (given back early)
+    v.push(0x48);
+    v.push(0x8B);
+    v.push(0x5C);
+    v.push(0x24);
+    v.push(0x18);
+    // 23: nops
+    v.push(0x90);
+    v.push(0x90);
+    v.push(0x90);
+    // 26: mov rsp, rbp; pop rbp; ret
+    v.push(0x48);
+    v.push(0x89);
+    v.push(0xEC);
+    v.push(0x5D);
+    v.push(0xC3);
+    // 31: padding to 32
+    v.push(0xCC);
+    // g (32): a leaf, ret
+    v.push(0xC3);
+    while v.len() < 48 {
+        v.push(0xCC);
+    }
+    return v;
+}
+
+fn row3(v: &mut Vec<i64>, a: i64, b: i64, c: i64) {
+    v.push(a);
+    v.push(b);
+    v.push(c);
+}
+
+// The rules of an entry from `at` to `end` without the trailing
+// DW_CFA_nop padding, as hex
+fn rules_hex(b: &Vec<i64>, at: i64, end: i64) -> str {
+    var e: i64 = end;
+    while e > at && b.get(e - 1) == 0 {
+        e = e - 1;
+    }
+    var out: str = "";
+    var i: i64 = at;
+    while i < e {
+        if i > at {
+            out = out + " ";
+        }
+        out = out + hex2(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+struct Sec {
+    addr: i64,
+    off: i64,
+    size: i64,
+}
+
+fn section(elf: &Vec<i64>, name: str) -> Sec {
+    var shoff: i64 = le64(elf, 0x28);
+    var shnum: i64 = le16(elf, 0x3C);
+    var shstr: i64 = le16(elf, 0x3E);
+    var stroff: i64 = le64(elf, shoff + 64 * shstr + 24);
+    var i: i64 = 0;
+    while i < shnum {
+        var at: i64 = shoff + 64 * i;
+        if cstr_at(elf, stroff + le32(elf, at)) == name {
+            return Sec { addr: le64(elf, at + 16), off: le64(elf, at + 24), size: le64(elf, at + 32) };
+        }
+        i = i + 1;
+    }
+    return Sec { addr: 0, off: 0 - 1, size: 0 };
+}
+
+// The rules of the .debug_frame FDE of the function at `start`
+fn debug_rules(elf: &Vec<i64>, start: i64) -> str {
+    var df: Sec = section(elf, ".debug_frame");
+    var p: i64 = df.off + 4 + le32(elf, df.off);
+    while p < df.off + df.size {
+        var len: i64 = le32(elf, p);
+        if le64(elf, p + 8) == start {
+            return rules_hex(elf, p + 24, p + 4 + len);
+        }
+        p = p + 4 + len;
+    }
+    return "none";
+}
+
+fn main() -> i64 {
+    var names: Vec<str> = Vec::new();
+    names.push("f");
+    names.push("g");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    starts.push(32);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(32);
+    ends.push(48);
+    var rows: Vec<i64> = Vec::new();
+    row3(& mut rows, 0, 10, 0);
+    row3(& mut rows, 13, 11, 0);
+    row3(& mut rows, 26, 12, 0);
+    row3(& mut rows, 32, 0, 1);
+    row3(& mut rows, 32, 20, 0);
+    row3(& mut rows, 48, 0, 1);
+    var cfi: Vec<i64> = Vec::new();
+    // rbx (DWARF 3) at CFA - 24 from 18 (nat_ir.fd ng_dbg_sw_to), back
+    // from 23 (n = 0), the epilogue from 30 to 31
+    row3(& mut cfi, 18, 0 - 2 - (3 | (3 << 8)), 18);
+    row3(& mut cfi, 23, 0 - 2 - 3, 23);
+    row3(& mut cfi, 30, 0 - 1, 31);
+    var img: Vec<i64> = image();
+    var elf: Vec<i64> = nat_elf_debug(NAT_X64, img, 0, names, starts, ends, "main.fd", rows, cfi);
+    match env_var("FID_EH_UNIT_OUT") {
+        Option::Some(path) => {
+            p_file_write_vec(path, elf);
+        }
+        Option::None => {
+        }
+    }
+    var base: i64 = nat_elf_image_base();
+    var phoff: i64 = le64(& elf, 0x20);
+    var phnum: i64 = le16(& elf, 0x38);
+    println("phnum " + int_to_str(phnum));
+    var hdr: Sec = section(& elf, ".eh_frame_hdr");
+    var ehs: Sec = section(& elf, ".eh_frame");
+    var ehp: i64 = 0 - 1;
+    var load_ok: bool = false;
+    var i: i64 = 0;
+    while i < phnum {
+        var at: i64 = phoff + 56 * i;
+        var kind: i64 = le32(& elf, at);
+        if kind == 1 {
+            var poff: i64 = le64(& elf, at + 8);
+            var pfs: i64 = le64(& elf, at + 32);
+            load_ok = poff + pfs >= ehs.off + ehs.size && le64(& elf, at + 40) == pfs && le64(& elf, at + 16) - poff == ehs.addr - ehs.off;
+        }
+        if kind == 0x6474E550 {
+            ehp = at;
+        }
+        i = i + 1;
+    }
+    println("load filesz covers eh " + bool_to_str(load_ok));
+    println("eh_frame phdr flags " + int_to_str(le32(& elf, ehp + 4)) + " at header " + bool_to_str(le64(& elf, ehp + 8) == hdr.off && le64(& elf, ehp + 16) == hdr.addr && le64(& elf, ehp + 32) == hdr.size));
+    println("sections hdr " + bool_to_str(hdr.off > 0 && hdr.addr == base + hdr.off - 0x1000) + " frame " + bool_to_str(ehs.off > hdr.off && ehs.addr == base + ehs.off - 0x1000));
+    // the header
+    var h: i64 = hdr.off;
+    println("hdr version " + int_to_str(elf.get(h)) + " enc " + hex2(elf.get(h + 1)) + " " + hex2(elf.get(h + 2)) + " " + hex2(elf.get(h + 3)));
+    println("hdr eh_frame_ptr ok " + bool_to_str(hdr.addr + 4 + se32(& elf, h + 4) == ehs.addr));
+    var nf: i64 = le32(& elf, h + 8);
+    println("hdr fdes " + int_to_str(nf));
+    var fn_names: Vec<str> = Vec::new();
+    fn_names.push("f");
+    fn_names.push("g");
+    var t: i64 = 0;
+    while t < nf {
+        var st: i64 = hdr.addr + se32(& elf, h + 12 + 8 * t);
+        var fde_addr: i64 = hdr.addr + se32(& elf, h + 16 + 8 * t);
+        var fo: i64 = ehs.off + (fde_addr - ehs.addr);
+        // the FDE's pc_begin (pcrel sdata4) names the same start
+        var pc: i64 = fde_addr + 8 + se32(& elf, fo + 8);
+        var nm: str = "?";
+        if t < fn_names.len() {
+            nm = fn_names.get(t);
+        }
+        println("table " + int_to_str(t) + ": " + nm + " at " + int_to_str(st) + " fde ok " + bool_to_str(pc == st && le32(& elf, fo + 4) == fo + 4 - ehs.off));
+        t = t + 1;
+    }
+    // the CIE
+    var c: i64 = ehs.off;
+    var aug: str = cstr_at(& elf, c + 9);
+    var nx: Vec<i64> = Vec::new();
+    nx.push(0);
+    var q: i64 = c + 9 + str_len(aug) + 1;
+    uleb_at(& elf, q, & mut nx);
+    q = nx.get(0);
+    uleb_at(& elf, q, & mut nx);
+    q = nx.get(0);
+    var ra: i64 = uleb_at(& elf, q, & mut nx);
+    q = nx.get(0);
+    var alen: i64 = uleb_at(& elf, q, & mut nx);
+    q = nx.get(0);
+    println("cie " + aug + " ra " + int_to_str(ra) + " enc " + hex2(elf.get(q)) + "");
+    if alen != 1 {
+        println("augmentation data length " + int_to_str(alen));
+    }
+    // the FDEs: their rules are .debug_frame's
+    var p: i64 = c + 4 + le32(& elf, c);
+    var k: i64 = 0;
+    while le32(& elf, p) != 0 && k < 4 {
+        var len: i64 = le32(& elf, p);
+        var start: i64 = p - ehs.off + ehs.addr + 8 + se32(& elf, p + 8);
+        var range: i64 = le32(& elf, p + 12);
+        var mine: str = rules_hex(& elf, p + 17, p + 4 + len);
+        var nm2: str = "?";
+        if k < fn_names.len() {
+            nm2 = fn_names.get(k);
+        }
+        println("fde " + nm2 + " range " + int_to_str(range) + " same rules " + bool_to_str(mine == debug_rules(& elf, start)));
+        p = p + 4 + len;
+        k = k + 1;
+    }
+    println("f rules " + debug_rules(& elf, base));
+    // out of order, one start twice: sorted, the first kept
+    var fdes: Vec<i64> = Vec::new();
+    fdes.push(300);
+    fdes.push(8);
+    fdes.push(100);
+    fdes.push(16);
+    fdes.push(200);
+    fdes.push(24);
+    fdes.push(100);
+    fdes.push(32);
+    var h2: Vec<i64> = nat_eh_frame_hdr(1000, 2000, & fdes);
+    var n2: i64 = le32(& h2, 8);
+    var line: str = "sorted " + int_to_str(n2) + ":";
+    // the FDE of 100 is the first given (offset 16), 200 at 24, 300 at 8
+    var line2: str = "fde offsets";
+    t = 0;
+    while t < n2 {
+        line = line + " " + int_to_str(1000 + se32(& h2, 12 + 8 * t));
+        line2 = line2 + " " + int_to_str(1000 + se32(& h2, 16 + 8 * t) - 2000);
+        t = t + 1;
+    }
+    println(line);
+    println(line2);
+    println("ptr ok " + bool_to_str(1004 + se32(& h2, 4) == 2000));
+    return 0;
+}

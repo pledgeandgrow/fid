@@ -1,0 +1,126 @@
+// VF5, two function passes of compiler/iropt.fd: promote (a local whose
+// every load has exactly one reaching store becomes an SSA value; a load
+// that two different stores reach must stay in memory) and branchfacts
+// (what a branch condition says about its operands settles the same
+// comparison in the blocks that edge alone reaches). Each case prints a
+// value a wrong pass changes:
+//   promote     `pick` stores 1 or 2 on the two sides of an if and loads at
+//               the join; `last` stores in a loop and loads after it;
+//               `maybe` loads where a store reaches on one path only
+//   branchfacts `either` reaches the inner `a < b` both from `a < b` and
+//               from `flag` (the join has two predecessors: no fact
+//               holds there); `outside` compares again after the if has
+//               ended; `nan_test` has a NaN, for which `!(x < y)` does not
+//               give `x >= y`
+// The functions take their inputs as arguments from a Vec so nothing is a
+// constant before the passes run. scripts/verify/variants.py has a mutant
+// for each pass (promote-join-first-store, facts-join-assumed,
+// facts-float-negated): under each, this test's output changes. Since
+// Nov 17 promote runs only where compiler/ssa.fd does not take the
+// function, unless it is named: the file names it (line below), so the
+// pass runs here.
+//
+//@ env: FID_IROPT_ON=promote
+//
+// Expected output:
+// 1 2
+// 10 0
+// 7 3
+// A B A
+// 1 0
+// ordered unordered
+// ordered unordered unordered
+// 21
+
+fn pick(c: bool) -> i64 {
+    var x: i64 = 0;
+    if c {
+        x = 1;
+    } else {
+        x = 2;
+    }
+    return x;
+}
+
+fn last(n: i64) -> i64 {
+    var x: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        x = i + 1;
+        i = i + 1;
+    }
+    return x;
+}
+
+fn maybe(c: bool, v: i64) -> i64 {
+    var x: i64 = 3;
+    if c {
+        x = v;
+    }
+    return x;
+}
+
+fn either(a: i64, b: i64, flag: bool) -> str {
+    if a < b || flag {
+        if a < b {
+            return "A";
+        }
+        return "B";
+    }
+    return "C";
+}
+
+fn outside(a: i64, b: i64) -> i64 {
+    var r: i64 = 0;
+    if a > b {
+        r = 1;
+    }
+    if a > b {
+        return r;
+    }
+    return r * 10;
+}
+
+fn nan_test(x: f64, y: f64) -> str {
+    if !(x < y) {
+        if x >= y {
+            return "ordered";
+        }
+        return "unordered";
+    }
+    return "less";
+}
+
+/// The false edge of `x < y` alone reaches the code after the if: there a
+/// NaN still makes `x >= y` false.
+fn nan_test2(x: f64, y: f64) -> str {
+    if x < y {
+        return "less";
+    }
+    if x >= y {
+        return "ordered";
+    }
+    return "unordered";
+}
+
+fn main() -> i64 {
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(0);
+    a.push(10);
+    a.push(7);
+    a.push(5);
+    a.push(9);
+    println(int_to_str(pick(a.get(0) == 1)) + " " + int_to_str(pick(a.get(1) == 1)));
+    println(int_to_str(last(a.get(2))) + " " + int_to_str(last(a.get(1))));
+    println(int_to_str(maybe(true, a.get(3))) + " " + int_to_str(maybe(a.get(1) == 1, a.get(3))));
+    // A: 5 < 9; B: 9 < 5 is false but flag is true; A again
+    println(either(a.get(4), a.get(5), false) + " " + either(a.get(5), a.get(4), true) + " " + either(a.get(4), a.get(5), true));
+    println(int_to_str(outside(a.get(5), a.get(4))) + " " + int_to_str(outside(a.get(4), a.get(5))));
+    val zero: f64 = (a.get(1) as f64);
+    val nan: f64 = zero / zero;
+    println(nan_test(a.get(5) as f64, a.get(4) as f64) + " " + nan_test(nan, 1.0));
+    println(nan_test2(a.get(5) as f64, a.get(4) as f64) + " " + nan_test2(nan, 1.0) + " " + nan_test2(1.0, nan));
+    println(pick(true) + last(3) * 5 + maybe(false, 99) + 2);
+    return 0;
+}

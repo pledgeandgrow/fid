@@ -19,11 +19,16 @@
 //       return 0;
 //   }
 //
-// A body is text: it cannot hold a zero byte. Module `https` adds TLS and
+// A body is a `str` that carries its length (D16), so it may hold any bytes,
+// zero bytes included: hc_text makes counted strings, and Content-Length is
+// str_len (test_stdlib_http_binary). Build one from bytes with
+// str_from_bytes, read it with str_byte_at. Module `https` adds TLS and
 // making requests.
 
 module http;
- use json; use task; use signal;
+ use json; use signal; use task; use trace;
+ // SAFETY: the prototype comes from <string.h>; hc_copy moves bytes inside
+ // the connection's read buffer, within the bytes it holds.
  extern "C" include "<string.h>" {
     fn memmove as hc_memmove(dst: * u8, src: * u8, n: i64) -> * u8;
 }
@@ -252,6 +257,9 @@ pub fn status_text(code: i64) -> str {
     if code == 204 {
         return "No Content";
     }
+    if code == 206 {
+        return "Partial Content";
+    }
     if code == 301 {
         return "Moved Permanently";
     }
@@ -260,6 +268,12 @@ pub fn status_text(code: i64) -> str {
     }
     if code == 304 {
         return "Not Modified";
+    }
+    if code == 307 {
+        return "Temporary Redirect";
+    }
+    if code == 308 {
+        return "Permanent Redirect";
     }
     if code == 400 {
         return "Bad Request";
@@ -282,8 +296,26 @@ pub fn status_text(code: i64) -> str {
     if code == 409 {
         return "Conflict";
     }
+    if code == 410 {
+        return "Gone";
+    }
+    if code == 411 {
+        return "Length Required";
+    }
     if code == 413 {
         return "Payload Too Large";
+    }
+    if code == 414 {
+        return "URI Too Long";
+    }
+    if code == 415 {
+        return "Unsupported Media Type";
+    }
+    if code == 416 {
+        return "Range Not Satisfiable";
+    }
+    if code == 422 {
+        return "Unprocessable Content";
     }
     if code == 429 {
         return "Too Many Requests";
@@ -316,6 +348,8 @@ pub fn status_text(code: i64) -> str {
 fn hc_get(c: i64, i: i64) -> i64 {
     var p: * mut i64 = c + i * 8;
     var v: i64 = 0;
+    // SAFETY: private helper; c is a 6-word connection block from
+    // p_malloc(48) and i is one of its word indexes (0..5).
     unsafe {
         v = * p;
     }
@@ -324,6 +358,7 @@ fn hc_get(c: i64, i: i64) -> i64 {
 
 fn hc_set(c: i64, i: i64, v: i64) {
     var p: * mut i64 = c + i * 8;
+    // SAFETY: private helper; as hc_get, word i (0..5) of a connection block.
     unsafe {
         * p = v;
     }
@@ -332,6 +367,8 @@ fn hc_set(c: i64, i: i64, v: i64) {
 fn hc_byte(addr: i64) -> i64 {
     var p: * mut u8 = addr;
     var v: i64 = 0;
+    // SAFETY: private helper; callers read buf + i with i below the bytes in
+    // the connection's read buffer (the scan loops stop at hc_get(c, 4)).
     unsafe {
         v = (* p) as i64;
     }
@@ -340,6 +377,8 @@ fn hc_byte(addr: i64) -> i64 {
 
 fn hc_set_byte(addr: i64, v: i64) {
     var p: * mut u8 = addr;
+    // SAFETY: private helper; callers write inside a block they allocated,
+    // below its length.
     unsafe {
         * p = v as u8;
     }
@@ -439,7 +478,10 @@ fn hc_text(addr: i64, n: i64) -> str {
     // (Content-Length is the real length; p_str_buf keeps it).
     val copy: i64 = p_str_buf(n);
     hc_copy(copy, addr, n);
-    return copy as str;
+    // p_str_adopt hands the one owner over (VF16): `copy as str` is not a
+    // temporary, so returning it took a second owner and every request
+    // body (hc_take) stayed allocated after its request was dropped
+    return p_str_adopt(copy);
 }
 
 /// The offset of the next "\r\n" from `from`, past the first unread byte, or -1.
@@ -527,6 +569,12 @@ fn hc_hex(s: str) -> i64 {
         } else {
             return n;
         }
+        // A peer can stream hex digits until i64 overflows (negative
+        // sizes slip past the HTTP_MAX_BODY checks); stop accumulating
+        // well before that.
+        if n >= HTTP_MAX_BODY {
+            return n;
+        }
         i = i + 1;
     }
     return n;
@@ -540,7 +588,7 @@ fn hc_chunked(c: i64, timeout_ms: i64) -> str {
         if size == 0 {
             break;
         }
-        if str_len(body) + size > HTTP_MAX_BODY {
+        if size < 0 || str_len(body) + size > HTTP_MAX_BODY {
             return "";
         }
         body = body + hc_take(c, size, timeout_ms);
@@ -572,8 +620,9 @@ pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
     }
     val head: str = hc_text(hc_get(c, 2) + hc_get(c, 5), at);
     hc_set(c, 5, hc_get(c, 5) + at + 4);
+    // `head` is dropped by its variable (proposal 0004); freeing it here as
+    // well left the drop reading a freed header (VF16)
     var msg: HttpRequest = http_parse_head(head);
-    hs_free(head);
     val len: str = http_header(msg, "content-length");
     if hs_same(http_header(msg, "transfer-encoding"), "chunked") {
         msg.body = hc_chunked(c, timeout_ms);
@@ -624,7 +673,14 @@ fn http_scoped_dispatch(req: HttpRequest) -> str {
         method: req.method, target: req.target, path: req.path, query: req.query, version: req.version, body: req.body, raw: req,
     };
     val h: fn(ScopedRequest) -> str = http_scoped_user;
-    return h(sreq);
+    // VF16: the result of a call through a function value is not taken as
+    // a temporary by the lowering, so `return h(sreq)` gave the response a
+    // second owner and every response of a kept-alive connection stayed
+    // allocated (~95-265 bytes a request, docs/verification/soak-http.md).
+    // As a raw word it has the one owner the handler gave it; p_str_adopt
+    // hands that over (and stays right once such calls are temporaries:
+    // `as i64` then claims the temporary).
+    return p_str_adopt(h(sreq) as i64);
 }
 
 // Shared server state (CO8): [0] shutdown flag, [8] live-connection count,
@@ -634,6 +690,9 @@ var http_st: i64 = 0;
 /// safe to call again.
 pub fn http_state_init() {
     if http_st == 0 {
+        // SAFETY: p_shared_alloc is unsafe because it hands out raw memory;
+        // the 24 bytes are only touched as three atomic words at offsets 0, 8
+        // and 16.
         unsafe {
             http_st = p_shared_alloc(24);
         }
@@ -669,7 +728,8 @@ pub fn http_health_handler(req: HttpRequest) -> str {
         return build_response(200, "application/json", "{\"status\":\"ok\"}\n");
     }
     val h: fn(HttpRequest) -> str = http_user_handler;
-    return h(req);
+    // one owner for the handler's response (VF16, as http_scoped_dispatch)
+    return p_str_adopt(h(req) as i64);
 }
 
 /// Serve one connection until it closes. The TLS handshake is here, so a client
@@ -701,14 +761,23 @@ pub fn http_conn_task(c: i64) -> i64 {
             break;
         }
         val keep: bool = http_keep_alive(req);
+        // CO2: each request is an "http.server" root span under
+        // FIDES_TRACE ("GET /path"); the handler's traced calls are its
+        // children
+        val span: i64 = trace_span_begin_under(0);
         var response: str = "";
         if http_scoped {
             response = http_scoped_dispatch(req);
         } else {
             val handler: fn(HttpRequest) -> str = http_handler;
-            response = handler(req);
+            // one owner for the handler's response (VF16, as
+            // http_scoped_dispatch)
+            response = p_str_adopt(handler(req) as i64);
         }
         val sent: bool = http_conn_write(c, response);
+        if span >= 0 {
+            trace_span_end(span, "http.server", req.method + " " + req.path, sent);
+        }
         // The request and the response are dropped by their variables at
         // the end of this turn (proposal 0004); freeing them here as well
         // was a double free (known-bugs 2g.35)
@@ -776,6 +845,15 @@ pub fn http_serve_scoped(port: i64, handler: fn(ScopedRequest) -> str) -> bool {
 pub fn http_set_scoped(handler: fn(ScopedRequest) -> str) {
     http_scoped = true;
     http_scoped_user = handler;
+}
+
+/// For servers that take connections themselves and hand some to
+/// http_conn_task (module `http2_tls`: TLS clients that chose HTTP/1.1 by
+/// ALPN): the handler those connections run; /health answers itself once
+/// http_state_init has run.
+pub fn http_set_handler(handler: fn(HttpRequest) -> str) {
+    http_user_handler = handler;
+    http_handler = http_health_handler;
 }
 
 /// Serve a listening socket from tasks and return: the caller goes on, and they
@@ -920,7 +998,8 @@ pub fn router_dispatch(router: Router, method: str, path: str) -> str {
         var route = router.routes.get(i);
         if str_equal(route.method, method) && str_equal(route.path, path) {
             val handler = route.handler;
-            return handler(path);
+            // one owner for the handler's response (VF16)
+            return p_str_adopt(handler(path) as i64);
         }
         i = i + 1;
     }
@@ -937,7 +1016,8 @@ pub fn router_dispatch_request(router: Router, request: str) -> str {
         var route = router.routes.get(i);
         if str_equal(route.method, method) && str_equal(route.path, path) {
             val handler = route.handler;
-            return handler(request);
+            // one owner for the handler's response (VF16)
+            return p_str_adopt(handler(request) as i64);
         }
         i = i + 1;
     }

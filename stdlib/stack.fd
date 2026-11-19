@@ -1,31 +1,37 @@
 // Fides Stack standard library
 //
-// LIFO stack built on top of Vec.
-// All operations are O(1) amortized.
+// LIFO stack backed by Vec. All operations are O(1) amortized. Empty reads
+// return Option::None rather than a placeholder; `pop_or`/`peek_or`/
+// `peek_at_or` supply a default when that is more convenient.
+//
+// Elements are i64 (words). The struct is declared generic for
+// compatibility, but non-word element types (str, Vec, structs) cannot be
+// used yet: the compiler's monomorphization corrupts heap-typed values
+// passed through generic functions and generic impl methods.
 //
 // Usage:
 //   use stack;
-//   value s = Stack::new();
+//   var s = Stack::new();
 //   s.push(1);
 //   s.push(2);
-//   println(s.pop());  // 2
-//   println(s.peek()); // 1
+//   println(s.pop_or(0));   // 2
+//   println(s.peek_or(0));  // 1
 
 module stack;
  use vec;
-/// A LIFO stack backed by Vec.
+/// A LIFO stack of i64 values backed by Vec.
 ///
 /// Example:
 ///   var s = Stack::new();
 ///   s.push(1);
 ///   s.push(2);
 ///   s.push(3);
-///   assert_eq(s.pop(), 3);
-///   assert_eq(s.peek(), 2);
-///   assert_eq(s.peek_at(1), 1);
+///   assert_eq(s.pop_or(0), 3);
+///   assert_eq(s.peek_or(0), 2);
+///   assert_eq(s.peek_at_or(1, 0), 1);
 ///   assert_eq(s.len(), 2);
 ///   assert(s.contains(1));
-///   var rest = s.drain();
+///   var rest: Vec<i64> = s.drain();
 ///   assert_eq(rest.get(0), 2);
 ///   assert(s.is_empty());
 pub struct Stack<T> {
@@ -45,21 +51,44 @@ impl Stack {
         self.data.push(value);
     }
 
-    /// Pop the top value off the stack. Returns 0 if empty.
-    pub fn pop(self: & mut Stack) -> i64 {
+    /// Pop the top value off the stack, or Option::None if empty.
+    pub fn pop(self: & mut Stack) -> Option<i64> {
         if self.data.is_empty() {
-            return 0;
+            return Option::None;
         }
-        return self.data.pop();
+        return Option::Some(self.data.pop());
     }
 
-    /// Peek at the top value without removing it. Returns 0 if empty.
-    pub fn peek(self: Stack) -> i64 {
-        var d = self.data;
-        if d.is_empty() {
-            return 0;
+    /// pop, or `default` when the stack is empty.
+    pub fn pop_or(self: & mut Stack, default: i64) -> i64 {
+        match self.pop() {
+            Option::Some(v) => {
+                return v;
+            }
+            Option::None => {
+                return default;
+            }
         }
-        return d.last();
+    }
+
+    /// Peek at the top value without removing it, or Option::None.
+    pub fn peek(self: Stack) -> Option<i64> {
+        if self.data.is_empty() {
+            return Option::None;
+        }
+        return Option::Some(self.data.last());
+    }
+
+    /// peek, or `default` when the stack is empty.
+    pub fn peek_or(self: Stack, default: i64) -> i64 {
+        match self.peek() {
+            Option::Some(v) => {
+                return v;
+            }
+            Option::None => {
+                return default;
+            }
+        }
     }
 
     /// Check if the stack is empty.
@@ -79,16 +108,36 @@ impl Stack {
 
     /// Check if the stack contains a value.
     pub fn contains(self: Stack, value: i64) -> bool {
-        return self.data.contains(value);
+        var i = 0;
+        while i < self.data.len() {
+            if self.data.get(i) == value {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
     }
 
-    /// Get the element at a given depth from the top (0 = top).
-    pub fn peek_at(self: Stack, depth: i64) -> i64 {
+    /// Get the element at a given depth from the top (0 = top), or
+    /// Option::None when out of range.
+    pub fn peek_at(self: Stack, depth: i64) -> Option<i64> {
         var n = self.data.len();
         if depth < 0 || depth >= n {
-            return 0;
+            return Option::None;
         }
-        return self.data.get(n - 1 - depth);
+        return Option::Some(self.data.get(n - 1 - depth));
+    }
+
+    /// peek_at, or `default` when out of range.
+    pub fn peek_at_or(self: Stack, depth: i64, default: i64) -> i64 {
+        match self.peek_at(depth) {
+            Option::Some(v) => {
+                return v;
+            }
+            Option::None => {
+                return default;
+            }
+        }
     }
 
     /// Pop all elements into a Vec (top of stack = first element).

@@ -25,11 +25,14 @@ module ota;
  use vec; use crypto;
 // ─── Simple Hash (for verification) ────────────────────────────────────
 //
-// Uses a simple FNV-1a hash for checksum verification.
-// For production use, replace with crypto_sha256 from crypto.fd.
+// Checksums are real SHA-256 (crypto.fd). ota_hash_hex below is a
+// non-cryptographic FNV-1a kept only as a small debugging digest —
+// verification never uses it.
 
-/// Compute a simple hash of binary data and return as hex string.
-@wrapping fn ota_hash_hex(data: Vec<i64>) -> str {
+/// Compute a simple non-cryptographic hash of binary data as a hex
+/// string (FNV-1a, 64 bit). NOT a checksum for integrity or security —
+/// use crypto_sha256_bytes for that.
+@wrapping pub fn ota_hash_hex(data: Vec<i64>) -> str {
     var h = 0xcbf29ce484222325;
     for i in 0..data.len() {
         h = (h ^ data.get(i)) & 0xFFFFFFFFFFFFFFFF;
@@ -101,6 +104,13 @@ pub struct OTAManifest {
 }
 
 /// Create a new OTA manifest.
+///
+/// Example:
+///   var m = ota_manifest_new("fw.bin", 5, "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+///   assert(ota_verify_manifest(m));
+///   assert(ota_verify_payload(m, "hello"));
+///   assert(!ota_verify_payload(m, "hellO"));
+///   assert(!ota_verify_manifest(ota_manifest_new("fw.bin", 5, "md5:x")));
 pub fn ota_manifest_new(filename: str, size: i64, checksum: str) -> OTAManifest {
     return OTAManifest {
         version: "", filename: filename, size: size, checksum: checksum, signature: "", min_version: "", max_version: "", timestamp: 0, description: "",
@@ -135,6 +145,8 @@ pub fn ota_verify_payload(manifest: OTAManifest, payload: str) -> bool {
 
 /// Are the manifest's fields well formed? This only looks at the manifest: it
 /// says nothing about the update itself, which is ota_verify_payload's work.
+/// The checksum must be "sha256:" + 64 lowercase hex digits — anything
+/// shorter is a truncated or foreign hash, not a SHA-256.
 pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
     if manifest.filename == "" {
         return false;
@@ -142,16 +154,26 @@ pub fn ota_verify_manifest(manifest: OTAManifest) -> bool {
     if manifest.size <= 0 {
         return false;
     }
-    if manifest.checksum == "" {
-        return false;
-    }
-    // Check checksum starts with "sha256:"
-    if str_len(manifest.checksum) < 8 {
+    if str_len(manifest.checksum) != 71 {
         return false;
     }
     var prefix = str_slice(manifest.checksum, 0, 7);
     if !str_equal(prefix, "sha256:") {
         return false;
+    }
+    var i: i64 = 7;
+    while i < 71 {
+        var c: i64 = str_byte_at(manifest.checksum, i);
+        var hex: bool = false;
+        if c >= 48 && c <= 57 {
+            hex = true;
+        } else if c >= 97 && c <= 102 {
+            hex = true;
+        }
+        if !hex {
+            return false;
+        }
+        i = i + 1;
     }
     return true;
 }
@@ -224,8 +246,8 @@ pub fn ota_session_verify(session: & mut OTASession, binary_data: Vec<i64>) -> b
         session.state = OTA_STATE_FAILED;
         return false;
     }
-    // Compute hash of binary data
-    var computed_hash = ota_hash_hex(binary_data);
+    // Real SHA-256 over the downloaded bytes (crypto.fd).
+    var computed_hash = crypto_sha256_hex(crypto_sha256_bytes(binary_data));
     // Extract expected hash from manifest (after "sha256:")
     var expected_hash = str_slice(session.manifest.checksum, 7, str_len(session.manifest.checksum));
     if !str_equal(computed_hash, expected_hash) {

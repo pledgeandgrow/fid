@@ -1,0 +1,141 @@
+// OP9 (compiler/iropt_me.fd ime_vec_data, opt-in FID_IROPT_ON=vecdata):
+// in a loop that cannot move a Vec<i64>'s buffer, its data pointer is
+// loaded once before the loop and each read the counted-loop proof found
+// in bounds becomes a load from it. The program prints the same with the
+// pass on and off; tests/tooling/licmguard-check.sh also checks that the
+// pass rewrote reads (FID_IROPT_STATS=1: "vecdata N reads", N > 0).
+// - sum_len: `while i < v.len()`, v a parameter.
+// - sum_n: the bound is a local set to `v.len()` before the loop.
+// - doubled: reads v, sets w (another local, sharing v's buffer until
+//   its first set copies it): v's data pointer does not move, and v keeps
+//   its elements.
+// - bump: reads and sets the same Vec: left as it was (a set may copy the
+//   buffer it reads).
+// - grid_sum: the inner loop over a row of a Vec<Vec<i64>>.
+// - grow: pushes onto the Vec it reads: left as it was.
+// - empty: a Vec with no element, the loop runs no time.
+//
+// Expected output:
+// 15
+// 15
+// 2 4 6 8 10
+// 1 2 3 4 5
+// 2 3 4 5 6
+// 45
+// 10
+// 0
+// 9223372036854775807
+
+fn sum_len(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn sum_n(v: Vec<i64>) -> i64 {
+    var n: i64 = v.len();
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn show(v: Vec<i64>) {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    println(out);
+}
+
+fn doubled(v: Vec<i64>) -> Vec<i64> {
+    var w: Vec<i64> = v;
+    var i: i64 = 0;
+    while i < v.len() {
+        w.set(i, v.get(i) * 2);
+        i = i + 1;
+    }
+    return w;
+}
+
+fn bump(v: Vec<i64>) -> Vec<i64> {
+    var u: Vec<i64> = v;
+    var i: i64 = 0;
+    while i < u.len() {
+        u.set(i, u.get(i) + 1);
+        i = i + 1;
+    }
+    return u;
+}
+
+fn grid_sum(g: Vec<Vec<i64>>) -> i64 {
+    var s: i64 = 0;
+    var r: i64 = 0;
+    while r < g.len() {
+        var row: Vec<i64> = g.get(r);
+        var j: i64 = 0;
+        while j < row.len() {
+            s = s + row.get(j);
+            j = j + 1;
+        }
+        r = r + 1;
+    }
+    return s;
+}
+
+fn grow(v: Vec<i64>) -> i64 {
+    var u: Vec<i64> = v;
+    var n: i64 = u.len();
+    var i: i64 = 0;
+    while i < n {
+        u.push(u.get(i));
+        i = i + 1;
+    }
+    return u.len();
+}
+
+fn main() {
+    var v: Vec<i64> = Vec::new();
+    var k: i64 = 1;
+    while k <= 5 {
+        v.push(k);
+        k = k + 1;
+    }
+    println(sum_len(v));
+    println(sum_n(v));
+    show(doubled(v));
+    show(v);
+    show(bump(v));
+    var g: Vec<Vec<i64>> = Vec::new();
+    var r: i64 = 0;
+    while r < 3 {
+        var row: Vec<i64> = Vec::new();
+        var c: i64 = 0;
+        while c < 3 {
+            row.push(r * 3 + c + 1);
+            c = c + 1;
+        }
+        g.push(row);
+        r = r + 1;
+    }
+    println(grid_sum(g));
+    println(grow(v));
+    var e: Vec<i64> = Vec::new();
+    println(sum_len(e));
+    var big: Vec<i64> = Vec::new();
+    big.push(9223372036854775806);
+    big.push(1);
+    println(sum_n(big));
+}

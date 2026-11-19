@@ -1,0 +1,119 @@
+// stdlib/ecdsa: RFC 6979 §A.2.5 (P-256, SHA-256, messages "sample" and
+// "test"): the public key from the private key, the nonce k, and the
+// signature r || s byte-exact, each verified; tampering rejected; SEC 1
+// compressed points round trip; an OpenSSL P-256 DER signature and an
+// OpenSSL P-384 signature (SHA-512, truncated to 384 bits) verified; ECDH
+// between two OpenSSL P-256 keys gives OpenSSL's shared secret both ways;
+// a point off the curve is refused. SHA-384 and HMAC-SHA384 against
+// FIPS 180 / RFC 4231 values (Python's hashlib); P-384/SHA-384 and
+// P-521/SHA-512 deterministic signatures byte-exact against OpenSSL 3.5
+// (-pkeyopt nonce-type:1), an OpenSSL P-521/SHA-384 DER signature
+// verified, a P-521 compressed point round trip. Big-number work runs out
+// of memory in the interpreter (docs/stdlib-agent-bugs.md 20, 51): run it
+// through the C backend.
+// Expected output:
+// public key ok true
+// sample k a6e3c57dd01abe90086538398355dd4c3b17aa873382b0f24d6129493d8aad60
+// sample r efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716
+// sample s f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8
+// sample verify true tampered false
+// test r f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367
+// test s 019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083
+// compressed 0360fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6 round trip true
+// openssl p256 der verify true der round trip true
+// openssl p384 sha512 verify true wrong msg false
+// ecdh 8cf9b072f90e1d2b106abdc683d50b57970ac383d143308ec68e2d417c6e4b3e symmetric true
+// off curve refused true
+// sha384 abc cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7
+// sha384 empty 38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b
+// sha384 two blocks 09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039
+// hmac-sha384 jefe af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649
+// hmac-sha384 long key 4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952
+// p384 sha384 same as openssl true verify true
+// p521 public key same as openssl true
+// p521 sha512 same as openssl true verify true tampered false
+// p521 openssl der verify true sha384 der verify true
+// p521 compressed round trip true
+use ecdsa;
+use kdf;
+use asn1;
+use vec;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+fn hb(s: str) -> Vec<i64> { return hex_decode_bytes(s); }
+
+fn main() {
+    val c: EcCurve = ec_p256();
+    val x: Vec<i64> = hb("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+    val u: Vec<i64> = hb("0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299");
+    println("public key ok " + bool_to_str(str_equal(hx(ec_public_key(& c, x)), hx(u))));
+    val m1: Vec<i64> = str_bytes("sample");
+    println("sample k " + hx(ecdsa_rfc6979_k(& c, KDF_SHA256, x, kdf_hash(KDF_SHA256, m1))));
+    val s1: Vec<i64> = ecdsa_sign(& c, x, KDF_SHA256, m1);
+    println("sample r " + hx(asn1_slice(& s1, 0, 32)));
+    println("sample s " + hx(asn1_slice(& s1, 32, 64)));
+    var bad: Vec<i64> = s1;
+    bad.set(40, bad.get(40) ^ 4);
+    println("sample verify " + bool_to_str(ecdsa_verify(& c, u, KDF_SHA256, m1, s1)) + " tampered " + bool_to_str(ecdsa_verify(& c, u, KDF_SHA256, m1, bad)));
+    val s2: Vec<i64> = ecdsa_sign(& c, x, KDF_SHA256, str_bytes("test"));
+    println("test r " + hx(asn1_slice(& s2, 0, 32)));
+    println("test s " + hx(asn1_slice(& s2, 32, 64)));
+    val up: EcPoint = ec_point_decode(& c, u);
+    val comp: Vec<i64> = ec_point_encode(& c, & up, true);
+    val back: EcPoint = ec_point_decode(& c, comp);
+    println("compressed " + hx(comp) + " round trip " + bool_to_str(str_equal(hx(ec_point_encode(& c, & back, false)), hx(u))));
+
+    val msg: Vec<i64> = str_bytes("Fides RSA test message");
+    val pub1: Vec<i64> = hb("04efb20c4dec909e51b6c6892088e6bd0c11e93723b7c1c838995f55f270388e9db22c2ddd6c4cd44a62b48e4ef6dad7690e6d01d568b7fed068640c5ad51f7370");
+    val der1: Vec<i64> = hb("3046022100d9108bf728c358fa1f15610a9215294b510693116369d0ab3be27fc7885b8fba022100a275aff835d11647acbffbc3780e7ad181da50b171380e9e3bc88a21164995ab");
+    val raw1: Vec<i64> = ecdsa_sig_from_der(der1, 32);
+    println("openssl p256 der verify " + bool_to_str(ecdsa_verify_der(& c, pub1, KDF_SHA256, msg, der1)) + " der round trip " + bool_to_str(str_equal(hx(ecdsa_sig_to_der(raw1)), hx(der1))));
+    val c384: EcCurve = ec_p384();
+    val pub384: Vec<i64> = hb("04c122840fbe3a6afc91ba7255963f0e21145d15a886a603ec9741a29c931daaa9cf2643e53251236c82ed7554d62ac64fe1949aed81b38393bc655259349721733161172397aeef7a8662de0ff829d27c54e7ae325c73f542b089cbeb243f7f1a");
+    val der384: Vec<i64> = hb("3066023100f1a6470d8df3653d823bbec915a644f1b886791e8e1b9151924b272a6148e04793f2234db310b8dbf13d2dc6763131fc023100da30ed7d44e4a861b0b29883ee0f9efd44384d2c3653bc932adc388152d199086da6e3e08aa459d55533ccfd795a969c");
+    println("openssl p384 sha512 verify " + bool_to_str(ecdsa_verify_der(& c384, pub384, KDF_SHA512, msg, der384)) + " wrong msg " + bool_to_str(ecdsa_verify_der(& c384, pub384, KDF_SHA512, str_bytes("x"), der384)));
+
+    val d1: Vec<i64> = hb("9bcc144ad462b0b278cc6dd2c9552243268f993daad385802008" + "42d5d8ba6956");
+    val d2: Vec<i64> = hb("c3364ab22f23b702bc46558170b6cf60c0e849e98bb1472bb9fc64c9fd236477");
+    val pub2: Vec<i64> = hb("04b823427222982ef1789e18cb17791b4516e52350ed6ffbeb31f14e87ed81b60fdb0d46f2f95d278bcb498642788189869127b7d5fef8c6ef9cdd1e36df220a70");
+    val z1: Vec<i64> = ecdh_shared(& c, d1, pub2);
+    val z2: Vec<i64> = ecdh_shared(& c, d2, pub1);
+    println("ecdh " + hx(z1) + " symmetric " + bool_to_str(str_equal(hx(z1), hx(z2))));
+    var off: Vec<i64> = u;
+    off.set(64, off.get(64) ^ 1);
+    val op: EcPoint = ec_point_decode(& c, off);
+    println("off curve refused " + bool_to_str(op.inf && ecdh_shared(& c, x, off).len() == 0));
+
+    // SHA-384 (FIPS 180 examples, RFC 4231 cases 2 and 6), checked with Python's hashlib.
+    println("sha384 abc " + hx(ec_sha384(str_bytes("abc"))));
+    println("sha384 empty " + hx(ec_sha384(Vec::new())));
+    println("sha384 two blocks " + hx(ec_sha384(str_bytes("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"))));
+    println("hmac-sha384 jefe " + hx(ec_hmac(EC_SHA384, str_bytes("Jefe"), str_bytes("what do ya want for nothing?"))));
+    var lk: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 131 { lk.push(0xaa); i = i + 1; }
+    println("hmac-sha384 long key " + hx(ec_hmac(EC_SHA384, lk, str_bytes("Test Using Larger Than Block-Size Key - Hash Key First"))));
+
+    // Deterministic (RFC 6979) signatures made by OpenSSL 3.5 with -pkeyopt nonce-type:1.
+    val d384: Vec<i64> = hb("6e9bf0a5fcf19c17b188f0c782a2f4ed1d2b605bca2d8bbc437ba874fbf73fda3a88646f90ed3c22e78b4384026e58cb");
+    val q384: Vec<i64> = hb("0457174f0c93d7000d87839ab5690db06cb803fc619d25fcd5671c4652f98411d9b97c7a25e0605ce7e31486bfc5c096e06eb40b92483f93bfde0659f4c00698db0e7829b34074c9b89cc90303fc5342c7583d9ce4f5be1115639c93bf898eb263");
+    val sig384: Vec<i64> = ecdsa_sign(& c384, d384, EC_SHA384, m1);
+    val want384: str = "97dc0c5f35ea1a5b3a3cc1e106be4ba8d5c2ac3e946e912c420178c0d3149fc89eed6b047c811c8b67c2f83095c96dbc7773fa4d871af7c2c98360ce7d132dae8f7cda787e95975294426464fbae108f1b58bc2bc173397c96365266aabdaf76";
+    println("p384 sha384 same as openssl " + bool_to_str(str_equal(hx(sig384), want384)) + " verify " + bool_to_str(ecdsa_verify(& c384, q384, EC_SHA384, m1, sig384)));
+    val c521: EcCurve = ec_p521();
+    val d521: Vec<i64> = hb("0116b6f34101dd3b64fa2972796ef576edebbcb92c62039020ba1c7ba787c5e1e1fe43129f799f994ddf6a48e9ef1d4ea04546c04bc01c6d4c709f822d592c592a17");
+    val q521: Vec<i64> = hb("04003c320dd639cd227e3423331c2208afb8d96effe8d5d13e8c7df514bcb66ce06efb8fd19ed650da714bb42de3ac699c2fb5c9dca07154b12014c4267a0365b781dd00956e98d185d8968c7c41904494ec2d0f98d628d12e101b3343af3172c91332101a5a7f9bdf67529c4597978b3dea0906ec66a5b5635358f8ff4f0fac2eda8ceb5d");
+    println("p521 public key same as openssl " + bool_to_str(str_equal(hx(ec_public_key(& c521, d521)), hx(q521))));
+    val sig521: Vec<i64> = ecdsa_sign(& c521, d521, KDF_SHA512, m1);
+    val want521: str = "000570dee32275c07de268ee87b115f602585d1aeb6aeaca1e7b92e0c9c65b742e4bd3c0c2c5bf3dc0dc09b1f14c89452fcdda4ef9c390c492e54798090448ca7268005603b7bae19db12ff8e44652477ea0535973bbed98d98b3b2ad4610e8cafe799bcc044c6ce0e2ef7df1fc4746ee80799b8565fff527bd587381872e77be2daa809";
+    var bad521: Vec<i64> = sig521;
+    bad521.set(100, bad521.get(100) ^ 1);
+    println("p521 sha512 same as openssl " + bool_to_str(str_equal(hx(sig521), want521)) + " verify " + bool_to_str(ecdsa_verify(& c521, q521, KDF_SHA512, m1, sig521)) + " tampered " + bool_to_str(ecdsa_verify(& c521, q521, KDF_SHA512, m1, bad521)));
+    val der521: Vec<i64> = hb("308188024200a8169948d16f4f6c7e9328b4d286c207de24e76348ed7a13df0313f32fa72e3b4a8a2257428b293c2a47364c431737af4d2e30d7ee076563c448210bccdf9743c4024201431a944ec6f418d7b4644430abffed9bd9e9aa8b862d9ea6285ed1760391d2c97ebaf070234913e9b006b752eb2da7e485fab2ef191e26924c6cf125eafb459404");
+    println("p521 openssl der verify " + bool_to_str(ecdsa_verify_der(& c521, q521, KDF_SHA512, m1, ecdsa_sig_to_der(hb(want521)))) + " sha384 der verify " + bool_to_str(ecdsa_verify_der(& c521, q521, EC_SHA384, str_bytes("abc"), der521)));
+    val p521pt: EcPoint = ec_point_decode(& c521, q521);
+    val comp521: Vec<i64> = ec_point_encode(& c521, & p521pt, true);
+    val back521: EcPoint = ec_point_decode(& c521, comp521);
+    println("p521 compressed round trip " + bool_to_str(comp521.len() == 67 && str_equal(hx(ec_point_encode(& c521, & back521, false)), hx(q521))));
+}

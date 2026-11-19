@@ -1,0 +1,85 @@
+// Competitive roadmap RT5: struct and tuple keys in a HashMap, hashed and
+// compared field by field (core's HashMap_insert_k and the lowering's
+// __p_key_hash / __p_key_eq: a string field as text). Keys built apart
+// from the ones inserted, with the same fields, find their values; keys
+// that differ in any field (a later one too, which a key hashed as the
+// text of its first bytes missed) do not. Every block is freed
+// (scripts/leak-check.sh).
+// Expected output:
+// grid 400 found 400 wrong 0
+// absent 0
+// named 3 alpha 1 beta 2 none 0
+// removed 399 has 0
+// tuples 3 7
+// done
+
+struct Cell {
+    x: i64,
+    y: i64,
+}
+
+struct Named {
+    id: i64,
+    name: str,
+}
+
+fn main() {
+    var grid: HashMap<Cell, i64> = HashMap::new();
+    var x: i64 = 0;
+    while x < 20 {
+        var y: i64 = 0;
+        while y < 20 {
+            grid.insert(Cell { x: x, y: y }, x * 100 + y);
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    var found: i64 = 0;
+    var wrong: i64 = 0;
+    x = 0;
+    while x < 20 {
+        var y2: i64 = 0;
+        while y2 < 20 {
+            val k: Cell = Cell { x: x, y: y2 };
+            if grid.contains(k) {
+                found = found + 1;
+                if grid.get(k) != x * 100 + y2 {
+                    wrong = wrong + 1;
+                }
+            }
+            y2 = y2 + 1;
+        }
+        x = x + 1;
+    }
+    println("grid " + int_to_str(grid.len()) + " found " + int_to_str(found) + " wrong " + int_to_str(wrong));
+    var absent: i64 = 0;
+    if grid.contains(Cell { x: 1, y: 25 }) {
+        absent = absent + 1;
+    }
+    if grid.contains(Cell { x: 25, y: 1 }) {
+        absent = absent + 1;
+    }
+    println("absent " + int_to_str(absent));
+
+    var named: HashMap<Named, i64> = HashMap::new();
+    named.insert(Named { id: 1, name: "al" + "pha" }, 1);
+    named.insert(Named { id: 1, name: "beta" }, 2);
+    named.insert(Named { id: 2, name: "alpha" }, 3);
+    var a: i64 = named.get_or(Named { id: 1, name: "alpha" }, 0);
+    var b: i64 = named.get_or(Named { id: 1, name: "be" + "ta" }, 0);
+    var none: i64 = named.get_or(Named { id: 3, name: "alpha" }, 0);
+    println("named " + int_to_str(named.len()) + " alpha " + int_to_str(a) + " beta " + int_to_str(b) + " none " + int_to_str(none));
+
+    grid.remove(Cell { x: 3, y: 4 });
+    var has: i64 = 0;
+    if grid.contains(Cell { x: 3, y: 4 }) {
+        has = 1;
+    }
+    println("removed " + int_to_str(grid.len()) + " has " + int_to_str(has));
+
+    var pairs: HashMap<(i64, i64), i64> = HashMap::new();
+    pairs.insert((1, 2), 3);
+    pairs.insert((2, 1), 7);
+    println("tuples " + int_to_str(pairs.get((1, 2))) + " " + int_to_str(pairs.get((2, 1))));
+    println("done");
+}

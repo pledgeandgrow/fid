@@ -1,0 +1,370 @@
+// regex-redux (the Benchmarks Game, roadmap BM3): fasta's output for
+// n = 500000 (three headers, 60-character lines), made in memory instead of
+// read from stdin. `>.*\n|\n` is removed; then the matches of the nine
+// variant patterns (agggtaaa|tttaccct, [cgt]gggtaaa|tttaccc[acg], ...) are
+// counted, and five substitutions (tHa[Nt] -> <4>, aND|caN|Ha[DS]|WaS -> <3>,
+// a[NSt]|BY -> <2>, <[^>]*> -> |, \|[^|][^|]*\| -> -) are made one after the
+// other on the whole sequence. The program folds into a 32-bit hash,
+// h = h * 31 + v, the nine counts, then the input's, the cleaned and the
+// final length (bench/game/reference.py gives the value, with Python's re).
+//
+// Rust and Zig have no regular expressions in their standard libraries, so
+// every language runs this same small matcher: a pattern is alternatives of
+// items, an item a set of bytes (a character, `.`, `[..]`, `[^..]`, `\x`),
+// matched once or, with `*`, as many times as possible, giving back one at a
+// time on failure (a backtracking matcher, Perl's leftmost-first order).
+// tests/bootstrap/test_verify_bm_regexredux.fd is this program with
+// n = 200.
+
+// a compiled pattern
+struct Pat {
+    sets: Vec<u8>,
+    // 256 entries per item: 1 when the item's set holds the byte
+    star: Vec<u8>,
+    // per item: 1 for `x*`
+    alts: Vec<i64>,
+    // the first item of each alternative, then the number of items
+    first: Vec<u8>,
+    // 256 entries: 1 when a match can start with the byte
+}
+
+// the number of items of a pattern (each `x`, `.`, `[..]` or `\x`, with or
+// without a `*`)
+fn count_items(b: Vec<i64>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c == 124 {
+            i = i + 1;
+        } else {
+            if c == 91 {
+                while b.get(i) != 93 {
+                    i = i + 1;
+                }
+                i = i + 1;
+            } else if c == 92 {
+                i = i + 2;
+            } else {
+                i = i + 1;
+            }
+            if i < b.len() && b.get(i) == 42 {
+                i = i + 1;
+            }
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// The tables start all zero (`Vec::filled`, what Rust's `[false; 256]` is);
+// a byte that the first item of an alternative holds is marked in `first`
+// as the item is read, as the other languages' loop over the first items
+// marks it.
+fn compile(pattern: str) -> Pat {
+    val b: Vec<i64> = str_bytes(pattern);
+    var sets: Vec<u8> = Vec::filled(count_items(b) * 256, 0);
+    var first: Vec<u8> = Vec::filled(256, 0);
+    var star: Vec<u8> = Vec::new();
+    var alts: Vec<i64> = Vec::new();
+    alts.push(0);
+    var nitems: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        if c == 124 {
+            // `|` between alternatives
+            alts.push(nitems);
+            i = i + 1;
+        } else {
+            val base: i64 = nitems * 256;
+            // the first item of its alternative
+            val lead: bool = nitems == alts.get(alts.len() - 1);
+            var z: i64 = 0;
+            if c == 91 {
+                // `[..]` or `[^..]`
+                i = i + 1;
+                var neg: bool = false;
+                if b.get(i) == 94 {
+                    neg = true;
+                    i = i + 1;
+                }
+                while b.get(i) != 93 {
+                    sets.set(base + b.get(i), 1 as u8);
+                    if lead && !neg {
+                        first.set(b.get(i), 1 as u8);
+                    }
+                    i = i + 1;
+                }
+                i = i + 1;
+                if neg {
+                    z = 0;
+                    while z < 256 {
+                        val v: i64 = 1 - (sets.get(base + z) as i64);
+                        sets.set(base + z, v as u8);
+                        if lead && v == 1 {
+                            first.set(z, 1 as u8);
+                        }
+                        z = z + 1;
+                    }
+                }
+            } else if c == 92 {
+                // `\x`: x itself
+                sets.set(base + b.get(i + 1), 1 as u8);
+                if lead {
+                    first.set(b.get(i + 1), 1 as u8);
+                }
+                i = i + 2;
+            } else if c == 46 {
+                // `.`: any byte but a newline
+                z = 0;
+                while z < 256 {
+                    if z != 10 {
+                        sets.set(base + z, 1 as u8);
+                        if lead {
+                            first.set(z, 1 as u8);
+                        }
+                    }
+                    z = z + 1;
+                }
+                i = i + 1;
+            } else {
+                sets.set(base + c, 1 as u8);
+                if lead {
+                    first.set(c, 1 as u8);
+                }
+                i = i + 1;
+            }
+            if i < b.len() && b.get(i) == 42 {
+                star.push(1 as u8);
+                i = i + 1;
+                if lead {
+                    // `x*` can match nothing: any byte can start a match
+                    z = 0;
+                    while z < 256 {
+                        first.set(z, 1 as u8);
+                        z = z + 1;
+                    }
+                }
+            } else {
+                star.push(0 as u8);
+            }
+            nitems = nitems + 1;
+        }
+    }
+    alts.push(nitems);
+    return Pat {
+        sets: sets, star: star, alts: alts, first: first
+    };
+}
+
+// where a match of items it .. end - 1 that starts at pos ends, or -1
+fn match_at(p: Pat, it: i64, end: i64, s: Vec<u8>, pos: i64) -> i64 {
+    if it == end {
+        return pos;
+    }
+    val base: i64 = it * 256;
+    if (p.star.get(it) as i64) == 1 {
+        var j: i64 = pos;
+        while j < s.len() && (p.sets.get(base + (s.get(j) as i64)) as i64) == 1 {
+            j = j + 1;
+        }
+        while j >= pos {
+            val e: i64 = match_at(p, it + 1, end, s, j);
+            if e >= 0 {
+                return e;
+            }
+            j = j - 1;
+        }
+        return -1;
+    }
+    if pos < s.len() && (p.sets.get(base + (s.get(pos) as i64)) as i64) == 1 {
+        return match_at(p, it + 1, end, s, pos + 1);
+    }
+    return -1;
+}
+
+// where the match that starts at pos ends (the first alternative that
+// matches), or -1
+fn find_at(p: Pat, s: Vec<u8>, pos: i64) -> i64 {
+    if (p.first.get(s.get(pos) as i64) as i64) == 0 {
+        return -1;
+    }
+    var a: i64 = 0;
+    while a < p.alts.len() - 1 {
+        val e: i64 = match_at(p, p.alts.get(a), p.alts.get(a + 1), s, pos);
+        if e > pos {
+            return e;
+        }
+        a = a + 1;
+    }
+    return -1;
+}
+
+fn count_matches(pattern: str, s: Vec<u8>) -> i64 {
+    val p: Pat = compile(pattern);
+    var n: i64 = 0;
+    var pos: i64 = 0;
+    while pos < s.len() {
+        val e: i64 = find_at(p, s, pos);
+        if e > pos {
+            n = n + 1;
+            pos = e;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    return n;
+}
+
+fn replace_all(pattern: str, s: Vec<u8>, rep: str) -> Vec<u8> {
+    val p: Pat = compile(pattern);
+    val r: Vec<i64> = str_bytes(rep);
+    var out: Vec<u8> = Vec::new();
+    var pos: i64 = 0;
+    while pos < s.len() {
+        val e: i64 = find_at(p, s, pos);
+        if e > pos {
+            var k: i64 = 0;
+            while k < r.len() {
+                out.push(r.get(k) as u8);
+                k = k + 1;
+            }
+            pos = e;
+        } else {
+            out.push(s.get(pos));
+            pos = pos + 1;
+        }
+    }
+    return out;
+}
+
+// --- the input: fasta's output ---------------------------------------------
+
+fn alu_seq() -> str {
+    return "GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGAGGCGGGCGGATCACCTGAGGTCAGGAGTTCGAGACCAGCCTGGCCAACATGGTGAAACCCCGTCTCTACTAAAAATACAAAAATTAGCCGGGCGTGGTGGCGCGCGCCTGTAATCCCAGCTACTCGGGAGGCTGAGGCAGGAGAATCGCTTGAACCCGGGAGGCGGAGGTTGCAGTGAGCCGAGATCGCGCCACTGCACTCCAGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA";
+}
+
+fn repeat_section(m: i64) -> Vec<u8> {
+    val alu: Vec<i64> = str_bytes(alu_seq());
+    val len: i64 = alu.len();
+    var out: Vec<u8> = Vec::new();
+    var k: i64 = 0;
+    while k < m {
+        out.push(alu.get(k % len) as u8);
+        k = k + 1;
+    }
+    return out;
+}
+
+// random_section draws m characters; seed holds the generator's state
+// (seed.get(0)), carried from one section to the next
+fn random_section(seed: &mut Vec<i64>, chars: str, probs: Vec<f64>, m: i64) -> Vec<u8> {
+    val codes: Vec<i64> = str_bytes(chars);
+    var cum: Vec<f64> = Vec::new();
+    var p: f64 = 0.0;
+    var j: i64 = 0;
+    while j < probs.len() {
+        p = p + probs.get(j);
+        cum.push(p);
+        j = j + 1;
+    }
+    val last_i: i64 = cum.len() - 1;
+    var last: i64 = seed.get(0);
+    var out: Vec<u8> = Vec::new();
+    var k: i64 = 0;
+    while k < m {
+        last = (last * 3877 + 29573) % 139968;
+        val r: f64 = (last as f64) / 139968.0;
+        var i: i64 = 0;
+        while i < last_i && r >= cum.get(i) {
+            i = i + 1;
+        }
+        out.push(codes.get(i) as u8);
+        k = k + 1;
+    }
+    seed.set(0, last);
+    return out;
+}
+
+// a header line, then the section in lines of 60 characters
+fn put_section(out: &mut Vec<u8>, title: str, sec: Vec<u8>) {
+    val t: Vec<i64> = str_bytes(title);
+    var k: i64 = 0;
+    while k < t.len() {
+        out.push(t.get(k) as u8);
+        k = k + 1;
+    }
+    out.push(10 as u8);
+    var i: i64 = 0;
+    while i < sec.len() {
+        out.push(sec.get(i));
+        i = i + 1;
+        if i % 60 == 0 || i == sec.len() {
+            out.push(10 as u8);
+        }
+    }
+}
+
+fn fasta_text(n: i64) -> Vec<u8> {
+    var seed: Vec<i64> = Vec::new();
+    seed.push(42);
+    var iub: Vec<f64> = Vec::new();
+    iub.push(0.27);
+    iub.push(0.12);
+    iub.push(0.12);
+    iub.push(0.27);
+    var j: i64 = 0;
+    while j < 11 {
+        iub.push(0.02);
+        j = j + 1;
+    }
+    var homo: Vec<f64> = Vec::new();
+    homo.push(0.3029549426680);
+    homo.push(0.1979883004921);
+    homo.push(0.1975473066391);
+    homo.push(0.3015094502008);
+    val one: Vec<u8> = repeat_section(2 * n);
+    val two: Vec<u8> = random_section(&mut seed, "acgtBDHKMNRSVWY", iub, 3 * n);
+    val three: Vec<u8> = random_section(&mut seed, "acgt", homo, 5 * n);
+    var out: Vec<u8> = Vec::new();
+    put_section(&mut out, ">ONE Homo sapiens alu", one);
+    put_section(&mut out, ">TWO IUB ambiguity codes", two);
+    put_section(&mut out, ">THREE Homo sapiens frequency", three);
+    return out;
+}
+
+fn fold(h: i64, v: i64) -> i64 {
+    return (h * 31 + v) & 4294967295;
+}
+
+fn regexredux(n: i64) -> i64 {
+    val text: Vec<u8> = fasta_text(n);
+    val ilen: i64 = text.len();
+    val seq: Vec<u8> = replace_all(">.*\n|\n", text, "");
+    val clen: i64 = seq.len();
+    var h: i64 = 0;
+    h = fold(h, count_matches("agggtaaa|tttaccct", seq));
+    h = fold(h, count_matches("[cgt]gggtaaa|tttaccc[acg]", seq));
+    h = fold(h, count_matches("a[act]ggtaaa|tttacc[agt]t", seq));
+    h = fold(h, count_matches("ag[act]gtaaa|tttac[agt]ct", seq));
+    h = fold(h, count_matches("agg[act]taaa|ttta[agt]cct", seq));
+    h = fold(h, count_matches("aggg[acg]aaa|ttt[cgt]ccct", seq));
+    h = fold(h, count_matches("agggt[cgt]aa|tt[acg]accct", seq));
+    h = fold(h, count_matches("agggta[cgt]a|t[acg]taccct", seq));
+    h = fold(h, count_matches("agggtaa[cgt]|[acg]ttaccct", seq));
+    val s1: Vec<u8> = replace_all("tHa[Nt]", seq, "<4>");
+    val s2: Vec<u8> = replace_all("aND|caN|Ha[DS]|WaS", s1, "<3>");
+    val s3: Vec<u8> = replace_all("a[NSt]|BY", s2, "<2>");
+    val s4: Vec<u8> = replace_all("<[^>]*>", s3, "|");
+    val s5: Vec<u8> = replace_all("\\|[^|][^|]*\\|", s4, "-");
+    h = fold(h, ilen);
+    h = fold(h, clen);
+    h = fold(h, s5.len());
+    return h;
+}
+
+fn main() -> i64 {
+    println(regexredux(500000));
+    return 0;
+}

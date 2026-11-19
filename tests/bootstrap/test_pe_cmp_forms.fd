@@ -1,0 +1,272 @@
+// D13 (release-roadmap Track D): compares and moves in pe_ir (the default
+// Windows `fid emit`). A comparison whose left operand is a constant is
+// emitted mirrored (`5 < x` as `cmp x, 5` with the condition swapped, also
+// when the fused branch tests the flags), as is a commutative add, mul,
+// and, or, xor with a constant on the left; a comparison whose left
+// operand is in a stack slot reads it there (`cmp [rbp+l], r/imm`); a move
+// that repeats or undoes the one just before is left out. Each function
+// below exercises one form on signed, unsigned and narrow types, with
+// constants that fit an immediate and ones that do not, in branches and
+// as stored booleans. Every backend prints the same lines.
+//
+// Expected output:
+// lt 3 gt 3 le 4 ge 4 eq 1 ne 6
+// u 4 2 2 1
+// big 1 1
+// neg 4 3
+// narrow 2 1 1
+// bools 4
+// comm 1061 4880 13 253 194
+// slot 1 0 1 1 0 1
+// mixed 135 105
+
+fn bump(x: i64) -> i64 {
+    return x + 1;
+}
+
+fn signed_consts(xs: Vec<i64>) -> str {
+    var lt: i64 = 0;
+    var gt: i64 = 0;
+    var le: i64 = 0;
+    var ge: i64 = 0;
+    var eq: i64 = 0;
+    var ne: i64 = 0;
+    var i: i64 = 0;
+    while i < xs.len() {
+        var x: i64 = xs.get(i);
+        if 4 < x {
+            lt = lt + 1;
+        }
+        if 4 > x {
+            gt = gt + 1;
+        }
+        if 4 <= x {
+            le = le + 1;
+        }
+        if 4 >= x {
+            ge = ge + 1;
+        }
+        if 4 == x {
+            eq = eq + 1;
+        }
+        if 4 != x {
+            ne = ne + 1;
+        }
+        i = i + 1;
+    }
+    return "lt " + int_to_str(lt) + " gt " + int_to_str(gt) + " le " + int_to_str(le) + " ge " + int_to_str(ge) + " eq " + int_to_str(eq) + " ne " + int_to_str(ne);
+}
+
+fn unsigned_consts(a: u64, b: u64, c: u64, d: u64) -> str {
+    var n1: i64 = 0;
+    var n2: i64 = 0;
+    var n3: i64 = 0;
+    var n4: i64 = 0;
+    var vals: Vec<u64> = Vec::new();
+    vals.push(a);
+    vals.push(b);
+    vals.push(c);
+    vals.push(d);
+    var i: i64 = 0;
+    while i < vals.len() {
+        var v: u64 = vals.get(i);
+        // 0 <= v always holds for unsigned values
+        if 0 <= v {
+            n1 = n1 + 1;
+        }
+        if 100 < v {
+            n2 = n2 + 1;
+        }
+        if 100 >= v {
+            n3 = n3 + 1;
+        }
+        if 9223372036854775807 < v {
+            n4 = n4 + 1;
+        }
+        i = i + 1;
+    }
+    return "u " + int_to_str(n1) + " " + int_to_str(n2) + " " + int_to_str(n3) + " " + int_to_str(n4);
+}
+
+fn big_consts(x: i64, y: i64) -> str {
+    var n1: i64 = 0;
+    var n2: i64 = 0;
+    if 5000000000 < x {
+        n1 = n1 + 1;
+    }
+    if 5000000000 < y {
+        n1 = n1 + 1;
+    }
+    if 0 - 2147483648 == x - 6000000000 - 2147483648 {
+        n2 = n2 + 1;
+    }
+    return "big " + int_to_str(n1) + " " + int_to_str(n2);
+}
+
+fn neg_consts(xs: Vec<i64>) -> str {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var i: i64 = 0;
+    while i < xs.len() {
+        if - 5 < xs.get(i) {
+            a = a + 1;
+        }
+        if - 100 >= xs.get(i) - 95 {
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return "neg " + int_to_str(a) + " " + int_to_str(b);
+}
+
+fn narrow_consts(p: i32, q: i32, r: u8, s: u8) -> str {
+    var n1: i64 = 0;
+    var n2: i64 = 0;
+    var n3: i64 = 0;
+    if 10 < p {
+        n1 = n1 + 1;
+    }
+    if 10 < q {
+        n1 = n1 + 1;
+    }
+    if 0 - 10 > q {
+        n1 = n1 + 1;
+    }
+    if 200 <= r {
+        n2 = n2 + 1;
+    }
+    if 200 <= s {
+        n2 = n2 + 1;
+    }
+    if 7 != r {
+        n3 = n3 + 1;
+    }
+    if 7 != s {
+        n3 = n3 + 1;
+    }
+    return "narrow " + int_to_str(n1) + " " + int_to_str(n2) + " " + int_to_str(n3);
+}
+
+fn stored_bools(x: i64) -> str {
+    var b1: bool = 10 > x;
+    var b2: bool = 3 <= x;
+    var b3: bool = 7 == x;
+    var n: i64 = 0;
+    if b1 {
+        n = n + 1;
+    }
+    if b2 {
+        n = n + 1;
+    }
+    if b1 && b2 {
+        n = n + 1;
+    }
+    if b3 {
+        n = n + 1;
+    }
+    if b1 || b3 {
+        n = n + 1;
+    }
+    return "bools " + int_to_str(n);
+}
+
+fn commutative(x: i64) -> str {
+    var a: i64 = 1000 + x;
+    var b: i64 = 80 * x;
+    var c: i64 = 15 & x;
+    var d: i64 = 200 | x;
+    var e: i64 = 255 ^ x;
+    return "comm " + int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c) + " " + int_to_str(d) + " " + int_to_str(e);
+}
+
+/// More values live across calls than registers hold: some compare from
+/// their stack slots, against registers and immediates.
+fn slot_compares(seed: i64) -> str {
+    var v1: i64 = bump(seed);
+    var v2: i64 = bump(v1);
+    var v3: i64 = bump(v2);
+    var v4: i64 = bump(v3);
+    var v5: i64 = bump(v4);
+    var v6: i64 = bump(v5);
+    var v7: i64 = bump(v6);
+    var v8: i64 = bump(v7);
+    var v9: i64 = bump(v8);
+    var v10: i64 = bump(v9);
+    var v11: i64 = bump(v10);
+    var v12: i64 = bump(v11);
+    var r1: i64 = 0;
+    var r2: i64 = 0;
+    var r3: i64 = 0;
+    var r4: i64 = 0;
+    var r5: i64 = 0;
+    var r6: i64 = 0;
+    if v1 < v12 {
+        r1 = 1;
+    }
+    if v2 > v11 {
+        r2 = 1;
+    }
+    if v3 <= 64 {
+        r3 = 1;
+    }
+    if v4 != 1000000 {
+        r4 = 1;
+    }
+    if v5 >= 3000000000 {
+        r5 = 1;
+    }
+    if v6 == v7 - 1 {
+        r6 = 1;
+    }
+    var keep: i64 = bump(v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12);
+    if keep < 0 {
+        return "unreachable";
+    }
+    return "slot " + int_to_str(r1) + " " + int_to_str(r2) + " " + int_to_str(r3) + " " + int_to_str(r4) + " " + int_to_str(r5) + " " + int_to_str(r6);
+}
+
+/// Divisions by constants and moves between registers in a loop.
+fn mixed(n: i64) -> str {
+    var s: i64 = 0;
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var q: i64 = i / 3;
+        var m: i64 = i % 7;
+        s = s + q;
+        t = t + m;
+        if 10 <= i {
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+    return "mixed " + int_to_str(s) + " " + int_to_str(t);
+}
+
+fn main() {
+    var xs: Vec<i64> = Vec::new();
+    xs.push(1);
+    xs.push(4);
+    xs.push(9);
+    xs.push(- 3);
+    xs.push(12);
+    xs.push(5);
+    xs.push(0);
+    println(signed_consts(xs));
+    println(unsigned_consts(5, 101, 18446744073709551615, 100));
+    println(big_consts(6000000000, 4000000000));
+    var ns: Vec<i64> = Vec::new();
+    ns.push(- 10);
+    ns.push(- 5);
+    ns.push(- 4);
+    ns.push(0);
+    ns.push(3);
+    ns.push(- 6);
+    ns.push(7);
+    println(neg_consts(ns));
+    println(narrow_consts(11, - 20, 200, 7));
+    println(stored_bools(5));
+    println(commutative(61));
+    println(slot_compares(40));
+    println(mixed(30));
+}

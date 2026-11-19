@@ -1,0 +1,84 @@
+// MI25 (docs/roadmap/llvm-roadmap.md): an f32 is its 32-bit pattern in the
+// machine layer (compiler/nat_ir.fd), never an f64 widened. The C functions
+// the Linux dynamic linker binds (CI2 / TG15: ng_gen_ldyn_stubs,
+// ng_gen_ldyn_stubs_risc) take an f32 argument as a single (movd / fmov s /
+// fmv.w.x of the pattern) and give an f32 result back as its pattern; the
+// `p_f32_to_bits` builtin keeps an f32 argument's pattern and narrows an
+// f64 one, sign-extended as C's `(int64_t)` of the int32_t. Before the fix
+// the stubs moved the pattern as if it were f64 bits and narrowed it
+// (cvtsd2ss / fcvt s, d / fcvt.s.d of a tiny denormal: 0 or garbage), and
+// widened each f32 result to f64 bits, which the program then read as an
+// f32 pattern (the low half of a double: 0 for these values).
+// Native check: tests/nattools/machine_f32_ffi_check.sh (x86-64, AArch64,
+// RISC-V, with floats in float registers and without, FID_VERIFY=1).
+// `fid run` cannot call libm's f32 functions (so it lives here, not in
+// tests/bootstrap/, whose harness runs every file through it); the C path
+// can: fid ccompile with -lm prints the same.
+//@ backends: ccompile
+// Expected output:
+// 1.4142135381698608
+// 2.5
+// 5
+// 12
+// 0.20000000298023224
+// 7.5
+// 1065353216
+// -1073741824
+// 1036831949
+// 1036831949
+// 1
+// 6.25 3
+// 29.25
+
+extern "C" link "m" {
+    fn copysignf(x: f32, y: f32) -> f32;
+    fn fminf(x: f32, y: f32) -> f32;
+    fn hypotf(x: f32, y: f32) -> f32;
+    fn ldexpf(x: f32, e: i32) -> f32;
+    fn fmaxf(x: f32, y: f32) -> f32;
+    fn fmaf(x: f32, y: f32, z: f32) -> f32;
+}
+
+// an f32 that arrives as a parameter (its type from func.params, not from
+// an instruction) and goes to a C function
+@unsafe
+fn root_of(x: f32) -> f32 {
+    return hypotf(x, x);
+}
+
+// f32 results kept and combined with f64 and integer values around calls
+@unsafe
+fn mixed(a: f32, n: i64, b: f64) -> f64 {
+    val r: f32 = fmaf(a, a, 0.0 as f32);
+    val s: f32 = ldexpf(a, n as i32);
+    return (r as f64) + (s as f64) + b;
+}
+
+@unsafe
+fn main() {
+    println(float_to_str(root_of(1.0 as f32) as f64));
+    println(float_to_str(copysignf(2.5 as f32, (0.0 - 1.0) as f32) as f64 * (0.0 - 1.0)));
+    println(float_to_str(hypotf(3.0 as f32, 4.0 as f32) as f64));
+    println(float_to_str(ldexpf(1.5 as f32, 3) as f64));
+    println(float_to_str(fmaxf(0.1 as f32, 0.2 as f32) as f64));
+    println(float_to_str(fmaf(2.0 as f32, 3.0 as f32, 1.5 as f32) as f64));
+    // the bits of an f32: its pattern, sign-extended
+    val one: f32 = 1.0 as f32;
+    val mtwo: f32 = (0.0 - 2.0) as f32;
+    println(int_to_str(p_f32_to_bits(one)));
+    println(int_to_str(p_f32_to_bits(mtwo)));
+    val tenth: f32 = 0.1 as f32;
+    println(int_to_str(p_f32_to_bits(tenth)));
+    // an f64 narrowed to single on the way in
+    val tenth64: f64 = 0.1;
+    println(int_to_str(p_f32_to_bits(tenth64 as f32)));
+    // an f32 result compared with an f32 computed here
+    val q: f32 = fminf(6.25 as f32, 2.5 as f32);
+    var same: i64 = 0;
+    if q == (2.5 as f32) {
+        same = 1;
+    }
+    println(int_to_str(same));
+    println(float_to_str(copysignf((0.0 as f32) - (6.25 as f32), 1.0 as f32) as f64) + " " + int_to_str(ldexpf(0.75 as f32, 2) as i64));
+    println(float_to_str(mixed(1.5 as f32, 4, 3.0)));
+}

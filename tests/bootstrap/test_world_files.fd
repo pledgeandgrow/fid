@@ -1,0 +1,162 @@
+// stdlib/world (complaint CT1), the file system: a test replaces the
+// files for code it does not change. `NoteStore` below is ordinary code
+// over fs (fs_exists, fs_read_text, fs_write_text, fs_append_text,
+// fs_file_size, fs_delete, fs_read_lines) and io (Reader::open with a
+// BufReader, Writer::create, Writer::append); the test seeds an in-memory
+// file system, runs it, and reads what it wrote. Nothing reaches the disk.
+//
+// Expected output:
+// count = 2
+// add = true
+// count = 3
+// notes.txt = buy milk|call bob|fix bike
+// export = true
+// export.txt = 3 notes|- buy milk|- call bob|- fix bike
+// audit.log = add fix bike|export 3
+// size = 27
+// longest = buy milk
+// missing = 0 none
+// drop = true then false
+// files = notes.txt,audit.log,export.txt
+// reads = 6 writes = 8
+// on disk = false false false
+// fresh = true
+use fs;
+use io;
+use world;
+
+// ─── the code under test: no test hooks, no parameters for fakes ─────────
+
+fn note_count(path: str) -> i64 {
+    if !fs_exists(path) { return 0; }
+    var n: i64 = 0;
+    val lines: Vec<str> = fs_read_lines(path);
+    var i: i64 = 0;
+    while i < lines.len() {
+        if str_len(str_trim(lines.get(i))) > 0 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn add_note(path: str, text: str) -> bool {
+    val old: str = fs_read_text(path);
+    if !fs_write_text(path, old + text + "\n") { return false; }
+    return fs_append_text("audit.log", "add " + text + "\n");
+}
+
+// io streams over the same files: read line by line, write a report
+fn export_notes(path: str, out: str) -> bool {
+    var lines: Vec<str> = Vec::new();
+    match Reader::open(path) {
+        Option::Some(r) => {
+            var br: BufReader = BufReader::new(r);
+            var going: bool = true;
+            while going {
+                val l: Option<str> = br.read_line();
+                match l {
+                    Option::Some(s) => {
+                        if str_len(s) > 0 { lines.push(s); }
+                    }
+                    Option::None => { going = false; }
+                }
+            }
+        }
+        Option::None => { return false; }
+    }
+    match Writer::create(out) {
+        Option::Some(w0) => {
+            var w: Writer = w0;
+            w.write_line(int_to_str(lines.len()) + " notes");
+            var i: i64 = 0;
+            while i < lines.len() {
+                w.write_line("- " + lines.get(i));
+                i = i + 1;
+            }
+        }
+        Option::None => { return false; }
+    }
+    match Writer::append("audit.log") {
+        Option::Some(a0) => {
+            var a: Writer = a0;
+            a.write_str("export " + int_to_str(lines.len()) + "\n");
+        }
+        Option::None => { return false; }
+    }
+    return true;
+}
+
+fn longest_note(path: str) -> str {
+    var best: str = "";
+    val lines: Vec<str> = fs_read_lines(path);
+    var i: i64 = 0;
+    while i < lines.len() {
+        if str_len(lines.get(i)) > str_len(best) { best = lines.get(i); }
+        i = i + 1;
+    }
+    return best;
+}
+
+// ─── the test ────────────────────────────────────────────────────────────
+
+fn shown(path: str) -> str {
+    return str_replace(str_trim(world_file_text(path)), "\n", "|");
+}
+
+fn joined(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 { s = s + ","; }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn opens(path: str) -> str {
+    match Reader::open(path) {
+        Option::Some(_) => {
+            return "some";
+        }
+        Option::None => {
+            return "none";
+        }
+    }
+    return "?";
+}
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn main() -> i64 {
+    world_fake_files();
+    world_file_put("notes.txt", "buy milk\ncall bob\n");
+
+    println("count = " + int_to_str(note_count("notes.txt")));
+    println("add = " + yes(add_note("notes.txt", "fix bike")));
+    println("count = " + int_to_str(note_count("notes.txt")));
+    println("notes.txt = " + shown("notes.txt"));
+    println("export = " + yes(export_notes("notes.txt", "export.txt")));
+    println("export.txt = " + shown("export.txt"));
+    println("audit.log = " + shown("audit.log"));
+    println("size = " + int_to_str(fs_file_size("notes.txt")));
+    println("longest = " + longest_note("notes.txt"));
+    println("missing = " + int_to_str(note_count("nope.txt")) + " " + opens("nope.txt"));
+    world_file_put("tmp.txt", "x");
+    val d1: bool = fs_delete("tmp.txt");
+    val d2: bool = fs_delete("tmp.txt");
+    println("drop = " + yes(d1) + " then " + yes(d2));
+    println("files = " + joined(world_file_list()));
+    println("reads = " + int_to_str(world_file_reads()) + " writes = " + int_to_str(world_file_writes()));
+
+    // the fake kept every file off the disk
+    world_real_files();
+    println("on disk = " + yes(fs_exists("notes.txt")) + " " + yes(fs_exists("export.txt")) + " " + yes(fs_exists("audit.log")));
+    // a new fake starts empty
+    world_fake_files();
+    println("fresh = " + yes(world_file_list().len() == 0 && note_count("notes.txt") == 0));
+    return 0;
+}

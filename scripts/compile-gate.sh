@@ -17,7 +17,14 @@
 #   RUNS=<n>         best-of runs per program (default 3)
 #   MIN_MS=<n>       stages under this many ms are noise and skipped
 #                    (default 40; the `total` line is always compared)
+#   COMPILE_GATE_BASE=<file>  the baseline file (default
+#                    scripts/compile-gate.baseline)
 #   --save           replace the baseline with this run's numbers
+#
+# Times depend on the machine. CI (.github/workflows/bench.yml) builds the
+# base commit's fid and this commit's on the same runner: the base one
+# records a scratch baseline (COMPILE_GATE_BASE, --save), this one is
+# checked against it. The checked-in baseline is for one local machine.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 FID="${FID:-}"
@@ -28,7 +35,7 @@ TARGET="${TARGET:-x86_64-linux}"
 LIMIT_PCT="${LIMIT_PCT:-10}"
 RUNS="${RUNS:-3}"
 MIN_MS="${MIN_MS:-40}"
-BASE=scripts/compile-gate.baseline
+BASE="${COMPILE_GATE_BASE:-scripts/compile-gate.baseline}"
 SAVE=0
 [ "${1:-}" = "--save" ] && SAVE=1
 mkdir -p build/compile-gate

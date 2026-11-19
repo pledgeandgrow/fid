@@ -1,0 +1,61 @@
+// TG15 (docs/roadmap/llvm-roadmap.md): a `--nat` Windows executable
+// calling C functions of DLLs through the import table the machine layer
+// writes itself: kernel32.dll (`link "kernel32"`: MulDiv, lstrlenA, and
+// MultiByteToWideChar with six arguments, two of them on the stack above
+// the shadow space), ucrtbase.dll for libm (`link "m"`: hypot, ldexp with
+// an f64 then an integer by position, fmaxf with f32 arguments and result)
+// and msvcrt.dll for the C library (atoi, atof, toupper). Each call goes
+// through a stub per signature (compiler/nat_enc.fd nat_pe_win64_stub; the
+// DLL from nat_pe_dll_for) that moves the arguments to the Windows x64
+// convention and calls through the IAT entry.
+// Windows only (kernel32), so it is not in tests/bootstrap/. Check:
+//   bash tests/nattools/tg15_win_dll_check.sh $FID
+// which builds it with `fid emit --nat`, checks the import table
+// (tests/nattools/pe_imports_check.py) and runs it.
+// Expected output:
+// 1050
+// -15
+// 7
+// 6
+// 13
+// 24
+// 9
+// -123
+// 10
+// 65
+
+extern "C" link "kernel32" {
+    fn MulDiv(a: i32, b: i32, c: i32) -> i32;
+    fn lstrlenA(s: str) -> i32;
+    fn MultiByteToWideChar(cp: u32, flags: u32, s: str, n: i32, w: i64, wn: i32) -> i32;
+}
+
+extern "C" link "m" {
+    fn hypot(x: f64, y: f64) -> f64;
+    fn ldexp(x: f64, e: i32) -> f64;
+    fn fmaxf(x: f32, y: f32) -> f32;
+}
+
+extern "C" {
+    fn atoi(s: str) -> i32;
+    fn atof(s: str) -> f64;
+    fn toupper(c: i32) -> i32;
+}
+
+@unsafe
+fn main() {
+    println(MulDiv(300, 7, 2) as i64);
+    println(MulDiv(0 - 5, 9, 3) as i64);
+    println(lstrlenA("machine") as i64);
+    // "héllo": six UTF-16 units with the terminating NUL (n = -1)
+    println(MultiByteToWideChar(65001 as u32, 0 as u32, "h\u{e9}llo", 0 - 1, 0, 0) as i64);
+    println(hypot(5.0, 12.0) as i64);
+    println(ldexp(1.5, 4) as i64);
+    var a: f32 = 1.5 as f32;
+    var b: f32 = 2.25 as f32;
+    var m: f32 = fmaxf(a, b);
+    println(((m as f64) * 4.0) as i64);
+    println(atoi("-123") as i64);
+    println((atof("2.5") * 4.0) as i64);
+    println(toupper(97) as i64);
+}

@@ -1,0 +1,228 @@
+// tools/check_stdlib.fd — import every stdlib module on its own: a module
+// that only compiles when another program happens to import what it needs
+// fails here. The Fides port of scripts/check-stdlib.sh (roadmap AD4), with
+// the same output; JOBS=n builds n modules at once (stdlib/process.fd
+// process_spawn_to / process_wait), the output staying in module order.
+//
+//   fid ccompile tools/check_stdlib.fd -o check_stdlib.exe
+//   check_stdlib.exe [compiler]          (default: target/release/fidesc)
+//   JOBS=8 check_stdlib.exe release/fid.exe
+//   fid run tools/check_stdlib.fd [compiler]
+//
+// For each stdlib/*.fd (byte order, as the script's glob in the C locale),
+// a program `use <name>; fn main() -> i64 { return 0; }` is built with
+// `<compiler> emit <program> -o <exe> --no-cache`; it fails when the
+// compiler does or no executable appears, and the first three lines of its
+// output holding "rror" are printed. tls_windows / tls_unix are `use tls`
+// and crypto_bind_unix is `use crypto_bind`, each built once. Run from the
+// repository root. Exit status 1 when a module fails.
+
+use core;
+use args;
+use fs;
+use io;
+use process;
+
+fn cs_lt(a: str, b: str) -> bool {
+    val n: i64 = str_len(a);
+    val m: i64 = str_len(b);
+    var i: i64 = 0;
+    while i < n && i < m {
+        val x: i64 = str_byte_at(a, i);
+        val y: i64 = str_byte_at(b, i);
+        if x != y { return x < y; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+fn cs_sort(v: &mut Vec<str>) {
+    var i: i64 = 1;
+    while i < v.len() {
+        val x: str = v.get(i);
+        var j: i64 = i - 1;
+        while j >= 0 && cs_lt(x, v.get(j)) {
+            v.set(j + 1, v.get(j));
+            j = j - 1;
+        }
+        v.set(j + 1, x);
+        i = i + 1;
+    }
+}
+
+fn cs_join(a: str, b: str) -> str {
+    if process_is_windows() { return a + "\\" + b; }
+    return a + "/" + b;
+}
+
+fn cs_temp_dir() -> str {
+    var names: Vec<str> = Vec::new();
+    names.push("TMPDIR");
+    names.push("TEMP");
+    names.push("TMP");
+    var i: i64 = 0;
+    while i < names.len() {
+        match env_var(names.get(i)) {
+            Option::Some(s) => {
+                if str_len(s) > 0 { return s; }
+            }
+            Option::None => { }
+        }
+        i = i + 1;
+    }
+    return "/tmp";
+}
+
+/// The first `max` lines of `text` that hold `word`.
+fn cs_grep(text: str, word: str, max: i64) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val lines: Vec<str> = str_split(str_replace(text, "\r\n", "\n"), "\n");
+    var i: i64 = 0;
+    while i < lines.len() && out.len() < max {
+        if str_contains(lines.get(i), word) { out.push(lines.get(i)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val all: Vec<str> = args_all();
+    var first: i64 = 1;
+    if all.len() >= 3 && all.get(1) == "run" && str_ends_with(all.get(2), ".fd") { first = 3; }
+    var compiler: str = "target/release/fidesc";
+    if all.len() > first { compiler = all.get(first); }
+    if process_is_windows() { compiler = str_replace(compiler, "/", "\\"); }
+    var jobs: i64 = 1;
+    match env_var("JOBS") {
+        Option::Some(j) => {
+            val v: i64 = str_parse_int(str_trim(j));
+            if v > 0 { jobs = v; }
+        }
+        Option::None => { }
+    }
+    val dir: str = cs_join(cs_temp_dir(), "fid-check-stdlib-" + int_to_str(p_getpid()) + "_" + int_to_str(p_clock_now_us()));
+    fs_mkdir(dir);
+
+    // the modules, each once, in the glob's order
+    var files: Vec<str> = fs_list_dir("stdlib");
+    cs_sort(&mut files);
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < files.len() {
+        val file: str = files.get(i);
+        i = i + 1;
+        if !str_ends_with(file, ".fd") || fs_is_dir("stdlib/" + file) { continue; }
+        var name: str = str_slice(file, 0, str_len(file) - 3);
+        if name == "tls_windows" || name == "tls_unix" { name = "tls"; }
+        if name == "crypto_bind_unix" { name = "crypto_bind"; }
+        var seen: bool = false;
+        var k: i64 = 0;
+        while k < names.len() {
+            if names.get(k) == name { seen = true; }
+            k = k + 1;
+        }
+        if !seen { names.push(name); }
+    }
+
+    // build them, `jobs` at a time
+    val n: i64 = names.len();
+    var handles: Vec<i64> = Vec::new();
+    var codes: Vec<i64> = Vec::new();
+    var state: Vec<i64> = Vec::new();         // 0 waiting, 1 running, 2 ended
+    i = 0;
+    while i < n {
+        handles.push(0);
+        codes.push(-1);
+        state.push(0);
+        i = i + 1;
+    }
+    var next: i64 = 0;
+    var printed: i64 = 0;
+    var running: i64 = 0;
+    var ok: i64 = 0;
+    var bad: i64 = 0;
+    while printed < n {
+        while running < jobs && next < n {
+            val name: str = names.get(next);
+            val prog: str = cs_join(dir, "u_" + name + ".fd");
+            fs_write_text(prog, "use " + name + ";\nfn main() -> i64 { return 0; }\n");
+            var argv: Vec<str> = Vec::new();
+            argv.push(compiler);
+            argv.push("emit");
+            argv.push(prog);
+            argv.push("-o");
+            argv.push(cs_join(dir, "u_" + name + ".exe"));
+            argv.push("--no-cache");
+            val h: i64 = process_spawn_to(argv, Vec::new(), "", cs_join(dir, name + ".log"));
+            handles.set(next, h);
+            if h == 0 {
+                state.set(next, 2);
+            } else {
+                state.set(next, 1);
+                running = running + 1;
+            }
+            next = next + 1;
+        }
+        // whatever has ended
+        var moved: bool = false;
+        var r: i64 = printed;
+        while r < next {
+            if state.get(r) == 1 {
+                match process_wait(handles.get(r), 0) {
+                    Option::Some(c) => {
+                        codes.set(r, c);
+                        state.set(r, 2);
+                        process_release(handles.get(r));
+                        running = running - 1;
+                        moved = true;
+                    }
+                    Option::None => { }
+                }
+            }
+            r = r + 1;
+        }
+        // the results in order
+        while printed < next && state.get(printed) == 2 {
+            val name2: str = names.get(printed);
+            val built: bool = codes.get(printed) == 0 && fs_exists(cs_join(dir, "u_" + name2 + ".exe"));
+            if built {
+                ok = ok + 1;
+            } else {
+                bad = bad + 1;
+                println("FAIL " + name2);
+                var log: str = "";
+                match read_file(cs_join(dir, name2 + ".log")) {
+                    Option::Some(t) => { log = t; }
+                    Option::None => { }
+                }
+                val lines: Vec<str> = cs_grep(log, "rror", 3);
+                var l: i64 = 0;
+                while l < lines.len() {
+                    println(lines.get(l));
+                    l = l + 1;
+                }
+            }
+            printed = printed + 1;
+            moved = true;
+        }
+        // nothing ended: wait a little on the oldest one still running
+        if !moved {
+            var w: i64 = printed;
+            while w < next && state.get(w) != 1 { w = w + 1; }
+            if w < next {
+                match process_wait(handles.get(w), 20) {
+                    Option::Some(c2) => {
+                        codes.set(w, c2);
+                        state.set(w, 2);
+                        process_release(handles.get(w));
+                        running = running - 1;
+                    }
+                    Option::None => { }
+                }
+            }
+        }
+    }
+    println("stdlib: " + int_to_str(ok) + " compiled, " + int_to_str(bad) + " failed");
+    if bad > 0 { return 1; }
+    return 0;
+}

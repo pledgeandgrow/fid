@@ -1,0 +1,817 @@
+// Fides 1-Wire: reset/presence, bit timing, ROM commands, search, DS18B20
+//
+// What is real (pure Fides, runs everywhere):
+//   - the time-slot model: reset/presence, write-0, write-1 and read slots
+//     as steps (drive low, release, sample, wait) with the standard and
+//     overdrive timings recommended by Maxim (AN126 values A..J)
+//   - byte I/O LSB first, ROM commands (READ, MATCH, SKIP, SEARCH, ALARM
+//     SEARCH) and the search ROM algorithm with discrepancy tracking
+//     (Maxim AN187: last discrepancy, last family discrepancy, last device)
+//   - CRC-8 of the Dallas/Maxim polynomial X^8 + X^5 + X^4 + 1
+//   - DS18B20: function commands, scratchpad layout and CRC check,
+//     resolution, raw <-> temperature, conversion time
+//   - a fake bus at the bit-slot level: devices with their ROM code and
+//     state machines (wired-AND of the line), including a DS18B20 model, so
+//     search and reads run exactly as on a real line
+//
+// The seam (what touches hardware): OwPins, four functions over one GPIO
+// (drive low, release, read the line, delay in ns). ow_bus_pins runs the
+// slot steps through them, which is how bare-metal bit-banging works; the
+// precision of the delays is the platform's job.
+module onewire;
+ use vec;
+ use string;
+
+pub const OW_READ_ROM: i64 = 0x33;
+pub const OW_MATCH_ROM: i64 = 0x55;
+pub const OW_SKIP_ROM: i64 = 0xCC;
+pub const OW_SEARCH_ROM: i64 = 0xF0;
+pub const OW_ALARM_SEARCH: i64 = 0xEC;
+
+pub const DS18B20_FAMILY: i64 = 0x28;
+pub const DS18B20_CONVERT_T: i64 = 0x44;
+pub const DS18B20_WRITE_SCRATCHPAD: i64 = 0x4E;
+pub const DS18B20_READ_SCRATCHPAD: i64 = 0xBE;
+pub const DS18B20_COPY_SCRATCHPAD: i64 = 0x48;
+pub const DS18B20_RECALL_E2: i64 = 0xB8;
+pub const DS18B20_READ_POWER: i64 = 0xB4;
+
+pub const OW_STEP_LOW: i64 = 0;
+pub const OW_STEP_RELEASE: i64 = 1;
+pub const OW_STEP_SAMPLE: i64 = 2;
+
+// ─── CRC-8 ──────────────────────────────────────────────────────────────
+
+/// Dallas/Maxim CRC-8 (polynomial 0x31 reflected = 0x8C, initial 0). A
+/// ROM code or scratchpad with its CRC appended gives 0.
+pub fn ow_crc8(bytes: & Vec<i64>) -> i64 {
+    var crc: i64 = 0;
+    var i: i64 = 0;
+    while i < bytes.len() {
+        var b: i64 = bytes.get(i) & 0xFF;
+        var k: i64 = 0;
+        while k < 8 {
+            val mix: i64 = (crc ^ b) & 1;
+            crc = crc >> 1;
+            if mix != 0 {
+                crc = crc ^ 0x8C;
+            }
+            b = b >> 1;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+pub fn ow_rom_valid(rom: & Vec<i64>) -> bool {
+    if rom.len() != 8 {
+        return false;
+    }
+    var all_zero: bool = true;
+    var i: i64 = 0;
+    while i < 8 {
+        if rom.get(i) != 0 {
+            all_zero = false;
+        }
+        i = i + 1;
+    }
+    return !all_zero && ow_crc8(rom) == 0;
+}
+
+/// A ROM code from family and 48-bit serial, with its CRC.
+pub fn ow_rom_make(family: i64, serial: i64) -> Vec<i64> {
+    var rom: Vec<i64> = Vec::new();
+    rom.push(family & 0xFF);
+    var i: i64 = 0;
+    while i < 6 {
+        rom.push((serial >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+    rom.push(ow_crc8(& rom));
+    return rom;
+}
+
+pub fn ow_rom_hex(rom: & Vec<i64>) -> str {
+    val digits: str = "0123456789ABCDEF";
+    var s: str = "";
+    var i: i64 = 0;
+    while i < rom.len() {
+        val b: i64 = rom.get(i) & 0xFF;
+        s = s + char_to_str(str_byte_at(digits, b >> 4)) + char_to_str(str_byte_at(digits, b & 15));
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── Slot timing ────────────────────────────────────────────────────────
+
+/// Recommended times in ns (AN126): A write-1 low, B write-1 release,
+/// C write-0 low, D write-0 recovery, E read sample delay, F read
+/// recovery, G reset delay, H reset low, I presence sample, J reset end.
+pub struct OwTiming {
+    pub a: i64,
+    pub b: i64,
+    pub c: i64,
+    pub d: i64,
+    pub e: i64,
+    pub f: i64,
+    pub g: i64,
+    pub h: i64,
+    pub i: i64,
+    pub j: i64,
+}
+
+pub fn ow_timing_standard() -> OwTiming {
+    return OwTiming { a: 6000, b: 64000, c: 60000, d: 10000, e: 9000, f: 55000, g: 0, h: 480000, i: 70000, j: 410000 };
+}
+
+pub fn ow_timing_overdrive() -> OwTiming {
+    return OwTiming { a: 1000, b: 7500, c: 7500, d: 2500, e: 1000, f: 7000, g: 2500, h: 70000, i: 8500, j: 40000 };
+}
+
+/// One step: do `action` on the line, then wait wait_ns.
+pub struct OwStep {
+    pub action: i64,
+    pub wait_ns: i64,
+}
+
+pub fn ow_steps_reset(t: & OwTiming) -> Vec<OwStep> {
+    var s: Vec<OwStep> = Vec::new();
+    s.push(OwStep { action: OW_STEP_RELEASE, wait_ns: t.g });
+    s.push(OwStep { action: OW_STEP_LOW, wait_ns: t.h });
+    s.push(OwStep { action: OW_STEP_RELEASE, wait_ns: t.i });
+    s.push(OwStep { action: OW_STEP_SAMPLE, wait_ns: t.j });
+    return s;
+}
+
+pub fn ow_steps_write(t: & OwTiming, bit: i64) -> Vec<OwStep> {
+    var s: Vec<OwStep> = Vec::new();
+    if (bit & 1) == 1 {
+        s.push(OwStep { action: OW_STEP_LOW, wait_ns: t.a });
+        s.push(OwStep { action: OW_STEP_RELEASE, wait_ns: t.b });
+    } else {
+        s.push(OwStep { action: OW_STEP_LOW, wait_ns: t.c });
+        s.push(OwStep { action: OW_STEP_RELEASE, wait_ns: t.d });
+    }
+    return s;
+}
+
+pub fn ow_steps_read(t: & OwTiming) -> Vec<OwStep> {
+    var s: Vec<OwStep> = Vec::new();
+    s.push(OwStep { action: OW_STEP_LOW, wait_ns: t.a });
+    s.push(OwStep { action: OW_STEP_RELEASE, wait_ns: t.e });
+    s.push(OwStep { action: OW_STEP_SAMPLE, wait_ns: t.f });
+    return s;
+}
+
+pub fn ow_steps_ns(steps: & Vec<OwStep>) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < steps.len() {
+        n = n + steps.get(i).wait_ns;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// One GPIO, open drain with a pull-up.
+pub struct OwPins {
+    pub drive_low: fn(i64) -> i64,
+    pub release: fn(i64) -> i64,
+    pub read: fn(i64) -> i64,
+    pub delay_ns: fn(i64) -> i64,
+}
+
+/// Run steps on the pins; the last sampled level (1 if none).
+pub fn ow_run_steps(p: & OwPins, steps: & Vec<OwStep>) -> i64 {
+    val low = p.drive_low;
+    val rel = p.release;
+    val rd = p.read;
+    val delay = p.delay_ns;
+    var level: i64 = 1;
+    var i: i64 = 0;
+    while i < steps.len() {
+        val s: OwStep = steps.get(i);
+        if s.action == OW_STEP_LOW {
+            low(0);
+        } else if s.action == OW_STEP_RELEASE {
+            rel(0);
+        } else {
+            level = rd(0) & 1;
+        }
+        if s.wait_ns > 0 {
+            delay(s.wait_ns);
+        }
+        i = i + 1;
+    }
+    return level;
+}
+
+// ─── Fake devices (bit-slot level) ──────────────────────────────────────
+
+pub const OWF_ROM: i64 = 0;
+pub const OWF_SEARCH: i64 = 1;
+pub const OWF_MATCH: i64 = 2;
+pub const OWF_SEND: i64 = 3;
+pub const OWF_FUNC: i64 = 4;
+pub const OWF_RECV: i64 = 5;
+pub const OWF_DONE: i64 = 6;
+pub const OWF_IDLE: i64 = 7;
+
+pub struct OwFakeDev {
+    pub rom: Vec<i64>,
+    pub state: i64,
+    pub after: i64,
+    pub shift: i64,
+    pub nbits: i64,
+    pub pos: i64,
+    pub phase: i64,
+    pub out: Vec<i64>,
+    pub recv: Vec<i64>,
+    pub need: i64,
+    pub is_ds18b20: bool,
+    pub temp_raw: i64,
+    pub scratch: Vec<i64>,
+    pub eeprom: Vec<i64>,
+}
+
+fn ow_ds_scratch(raw: i64, th: i64, tl: i64, cfg: i64) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    s.push(raw & 0xFF);
+    s.push((raw >> 8) & 0xFF);
+    s.push(th & 0xFF);
+    s.push(tl & 0xFF);
+    s.push(cfg & 0xFF);
+    s.push(0xFF);
+    s.push(0x0C);
+    s.push(0x10);
+    s.push(ow_crc8(& s));
+    return s;
+}
+
+/// A device that only has a ROM code (DS2401 serial number style).
+pub fn ow_fake_rom(rom: Vec<i64>) -> OwFakeDev {
+    return OwFakeDev { rom: rom, state: OWF_IDLE, after: OWF_IDLE, shift: 0, nbits: 0, pos: 0, phase: 0, out: Vec::new(), recv: Vec::new(), need: 0, is_ds18b20: false, temp_raw: 0, scratch: Vec::new(), eeprom: Vec::new() };
+}
+
+/// A DS18B20 that will measure temp_raw (1/16 C units); power-up
+/// scratchpad 85 C, alarms TH=75 TL=70, 12-bit.
+pub fn ow_fake_ds18b20(serial: i64, temp_raw: i64) -> OwFakeDev {
+    var d: OwFakeDev = ow_fake_rom(ow_rom_make(DS18B20_FAMILY, serial));
+    d.is_ds18b20 = true;
+    d.temp_raw = temp_raw;
+    d.scratch = ow_ds_scratch(0x0550, 75, 70, 0x7F);
+    var e: Vec<i64> = Vec::new();
+    e.push(75);
+    e.push(70);
+    e.push(0x7F);
+    d.eeprom = e;
+    return d;
+}
+
+fn ow_bits_of(bytes: & Vec<i64>) -> Vec<i64> {
+    var bits: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < bytes.len() {
+        var k: i64 = 0;
+        while k < 8 {
+            bits.push((bytes.get(i) >> k) & 1);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return bits;
+}
+
+fn ow_rom_bit(d: & OwFakeDev, n: i64) -> i64 {
+    return (d.rom.get(n / 8) >> (n % 8)) & 1;
+}
+
+fn ow_ds_alarm(d: & OwFakeDev) -> bool {
+    var t: i64 = d.scratch.get(0) | (d.scratch.get(1) << 8);
+    if t >= 0x8000 {
+        t = t - 0x10000;
+    }
+    var th: i64 = d.scratch.get(2);
+    var tl: i64 = d.scratch.get(3);
+    if th >= 128 {
+        th = th - 256;
+    }
+    if tl >= 128 {
+        tl = tl - 256;
+    }
+    return (t >> 4) >= th || (t >> 4) <= tl;
+}
+
+/// What the device drives in the coming slot: 0 pulls the line low.
+fn ow_fake_output(d: & OwFakeDev) -> i64 {
+    if d.state == OWF_SEARCH {
+        if d.phase == 0 {
+            return ow_rom_bit(d, d.pos);
+        }
+        if d.phase == 1 {
+            return 1 - ow_rom_bit(d, d.pos);
+        }
+        return 1;
+    }
+    if d.state == OWF_SEND && d.pos < d.out.len() {
+        return d.out.get(d.pos);
+    }
+    return 1;
+}
+
+fn ow_fake_send(d: & mut OwFakeDev, bytes: & Vec<i64>, after: i64) {
+    d.out = ow_bits_of(bytes);
+    d.pos = 0;
+    d.state = OWF_SEND;
+    d.after = after;
+}
+
+fn ow_fake_function(d: & mut OwFakeDev, cmd: i64) {
+    if !d.is_ds18b20 {
+        d.state = OWF_IDLE;
+        return;
+    }
+    if cmd == DS18B20_CONVERT_T {
+        val cfg: i64 = d.scratch.get(4);
+        val res: i64 = (cfg >> 5) & 3;
+        var raw: i64 = d.temp_raw & 0xFFFF;
+        // undefined low bits read as 0 at lower resolutions
+        raw = raw & (0xFFFF ^ ((1 << (3 - res)) - 1));
+        d.scratch = ow_ds_scratch(raw, d.scratch.get(2), d.scratch.get(3), cfg);
+        d.state = OWF_DONE;
+    } else if cmd == DS18B20_READ_SCRATCHPAD {
+        val sp: Vec<i64> = d.scratch;
+        ow_fake_send(d, & sp, OWF_IDLE);
+    } else if cmd == DS18B20_WRITE_SCRATCHPAD {
+        d.recv = Vec::new();
+        d.need = 3;
+        d.shift = 0;
+        d.nbits = 0;
+        d.state = OWF_RECV;
+    } else if cmd == DS18B20_COPY_SCRATCHPAD {
+        var e: Vec<i64> = Vec::new();
+        e.push(d.scratch.get(2));
+        e.push(d.scratch.get(3));
+        e.push(d.scratch.get(4));
+        d.eeprom = e;
+        d.state = OWF_DONE;
+    } else if cmd == DS18B20_RECALL_E2 {
+        d.scratch = ow_ds_scratch(d.scratch.get(0) | (d.scratch.get(1) << 8), d.eeprom.get(0), d.eeprom.get(1), d.eeprom.get(2));
+        d.state = OWF_DONE;
+    } else if cmd == DS18B20_READ_POWER {
+        // externally powered: read slots return 1
+        d.state = OWF_DONE;
+    } else {
+        d.state = OWF_IDLE;
+    }
+}
+
+/// The device sees the line level of a finished slot.
+fn ow_fake_consume(d: & mut OwFakeDev, level: i64) {
+    if d.state == OWF_ROM || d.state == OWF_FUNC || d.state == OWF_RECV || d.state == OWF_MATCH {
+        d.shift = d.shift | ((level & 1) << d.nbits);
+        d.nbits = d.nbits + 1;
+        if d.state == OWF_MATCH {
+            if (level & 1) != ow_rom_bit(d, d.nbits - 1) {
+                d.state = OWF_IDLE;
+                return;
+            }
+            if d.nbits == 64 {
+                d.state = OWF_FUNC;
+                d.shift = 0;
+                d.nbits = 0;
+            }
+            return;
+        }
+        if d.nbits < 8 {
+            return;
+        }
+        val byte: i64 = d.shift;
+        d.shift = 0;
+        d.nbits = 0;
+        if d.state == OWF_RECV {
+            d.recv.push(byte);
+            if d.recv.len() == d.need {
+                val raw: i64 = d.scratch.get(0) | (d.scratch.get(1) << 8);
+                d.scratch = ow_ds_scratch(raw, d.recv.get(0), d.recv.get(1), (d.recv.get(2) & 0x60) | 0x1F);
+                d.state = OWF_DONE;
+            }
+            return;
+        }
+        if d.state == OWF_FUNC {
+            ow_fake_function(d, byte);
+            return;
+        }
+        // a ROM command
+        if byte == OW_READ_ROM {
+            val r: Vec<i64> = d.rom;
+            ow_fake_send(d, & r, OWF_FUNC);
+        } else if byte == OW_MATCH_ROM {
+            d.state = OWF_MATCH;
+        } else if byte == OW_SKIP_ROM {
+            d.state = OWF_FUNC;
+        } else if byte == OW_SEARCH_ROM || (byte == OW_ALARM_SEARCH && d.is_ds18b20 && ow_ds_alarm(d)) {
+            d.state = OWF_SEARCH;
+            d.pos = 0;
+            d.phase = 0;
+        } else {
+            d.state = OWF_IDLE;
+        }
+        return;
+    }
+    if d.state == OWF_SEARCH {
+        if d.phase < 2 {
+            d.phase = d.phase + 1;
+            return;
+        }
+        if (level & 1) != ow_rom_bit(d, d.pos) {
+            d.state = OWF_IDLE;
+            return;
+        }
+        d.pos = d.pos + 1;
+        d.phase = 0;
+        if d.pos == 64 {
+            d.state = OWF_FUNC;
+            d.shift = 0;
+            d.nbits = 0;
+        }
+        return;
+    }
+    if d.state == OWF_SEND {
+        d.pos = d.pos + 1;
+        if d.pos >= d.out.len() {
+            d.state = d.after;
+            d.shift = 0;
+            d.nbits = 0;
+        }
+    }
+}
+
+// ─── The bus ────────────────────────────────────────────────────────────
+
+pub const OW_BUS_FAKE: i64 = 0;
+pub const OW_BUS_PINS: i64 = 1;
+
+pub struct OneWire {
+    pub kind: i64,
+    pub timing: OwTiming,
+    pub pins: OwPins,
+    pub devs: Vec<OwFakeDev>,
+    pub slots: i64,
+    pub bus_ns: i64,
+}
+
+fn ow_nop(x: i64) -> i64 {
+    return 1;
+}
+
+pub fn ow_bus_fake() -> OneWire {
+    val p: OwPins = OwPins { drive_low: ow_nop, release: ow_nop, read: ow_nop, delay_ns: ow_nop };
+    return OneWire { kind: OW_BUS_FAKE, timing: ow_timing_standard(), pins: p, devs: Vec::new(), slots: 0, bus_ns: 0 };
+}
+
+pub fn ow_bus_pins(p: OwPins, t: OwTiming) -> OneWire {
+    return OneWire { kind: OW_BUS_PINS, timing: t, pins: p, devs: Vec::new(), slots: 0, bus_ns: 0 };
+}
+
+pub fn ow_fake_add(bus: & mut OneWire, d: OwFakeDev) {
+    bus.devs.push(d);
+}
+
+/// Reset pulse; true when at least one device answers with presence.
+pub fn ow_reset(bus: & mut OneWire) -> bool {
+    val steps: Vec<OwStep> = ow_steps_reset(& bus.timing);
+    bus.bus_ns = bus.bus_ns + ow_steps_ns(& steps);
+    if bus.kind == OW_BUS_PINS {
+        return ow_run_steps(& bus.pins, & steps) == 0;
+    }
+    var i: i64 = 0;
+    while i < bus.devs.len() {
+        var d: OwFakeDev = bus.devs.get(i);
+        d.state = OWF_ROM;
+        d.shift = 0;
+        d.nbits = 0;
+        bus.devs.set(i, d);
+        i = i + 1;
+    }
+    return bus.devs.len() > 0;
+}
+
+/// One time slot: the master sends bit (1 = a read slot); the level of
+/// the line after the devices had their say (wired-AND).
+pub fn ow_touch_bit(bus: & mut OneWire, bit: i64) -> i64 {
+    bus.slots = bus.slots + 1;
+    if bus.kind == OW_BUS_PINS {
+        if (bit & 1) == 1 {
+            val steps: Vec<OwStep> = ow_steps_read(& bus.timing);
+            bus.bus_ns = bus.bus_ns + ow_steps_ns(& steps);
+            return ow_run_steps(& bus.pins, & steps);
+        }
+        val w0: Vec<OwStep> = ow_steps_write(& bus.timing, 0);
+        bus.bus_ns = bus.bus_ns + ow_steps_ns(& w0);
+        ow_run_steps(& bus.pins, & w0);
+        return 0;
+    }
+    bus.bus_ns = bus.bus_ns + ow_steps_ns(& ow_steps_write(& bus.timing, bit));
+    var level: i64 = bit & 1;
+    var i: i64 = 0;
+    while i < bus.devs.len() {
+        val d: OwFakeDev = bus.devs.get(i);
+        level = level & ow_fake_output(& d);
+        i = i + 1;
+    }
+    i = 0;
+    while i < bus.devs.len() {
+        var d: OwFakeDev = bus.devs.get(i);
+        ow_fake_consume(& mut d, level);
+        bus.devs.set(i, d);
+        i = i + 1;
+    }
+    return level;
+}
+
+pub fn ow_write_bit(bus: & mut OneWire, bit: i64) {
+    ow_touch_bit(bus, bit);
+}
+
+pub fn ow_read_bit(bus: & mut OneWire) -> i64 {
+    return ow_touch_bit(bus, 1);
+}
+
+pub fn ow_write_byte(bus: & mut OneWire, b: i64) {
+    var k: i64 = 0;
+    while k < 8 {
+        ow_touch_bit(bus, (b >> k) & 1);
+        k = k + 1;
+    }
+}
+
+pub fn ow_read_byte(bus: & mut OneWire) -> i64 {
+    var v: i64 = 0;
+    var k: i64 = 0;
+    while k < 8 {
+        v = v | (ow_touch_bit(bus, 1) << k);
+        k = k + 1;
+    }
+    return v;
+}
+
+pub fn ow_write_bytes(bus: & mut OneWire, bytes: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < bytes.len() {
+        ow_write_byte(bus, bytes.get(i));
+        i = i + 1;
+    }
+}
+
+pub fn ow_read_bytes(bus: & mut OneWire, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(ow_read_byte(bus));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── ROM commands ───────────────────────────────────────────────────────
+
+/// READ ROM (only valid with one device on the bus): the code, or empty
+/// when there is no presence or the CRC fails (several devices answered).
+pub fn ow_read_rom(bus: & mut OneWire) -> Vec<i64> {
+    if !ow_reset(bus) {
+        return Vec::new();
+    }
+    ow_write_byte(bus, OW_READ_ROM);
+    val rom: Vec<i64> = ow_read_bytes(bus, 8);
+    if !ow_rom_valid(& rom) {
+        return Vec::new();
+    }
+    return rom;
+}
+
+/// Reset and address one device (MATCH ROM), or all (SKIP ROM) when rom
+/// is empty. False without presence.
+pub fn ow_select(bus: & mut OneWire, rom: & Vec<i64>) -> bool {
+    if !ow_reset(bus) {
+        return false;
+    }
+    if rom.len() == 0 {
+        ow_write_byte(bus, OW_SKIP_ROM);
+    } else {
+        ow_write_byte(bus, OW_MATCH_ROM);
+        ow_write_bytes(bus, rom);
+    }
+    return true;
+}
+
+/// Search state (AN187).
+pub struct OwSearch {
+    pub rom: Vec<i64>,
+    pub last_discrepancy: i64,
+    pub last_family_discrepancy: i64,
+    pub last_device: bool,
+    pub command: i64,
+}
+
+pub fn ow_search_new(command: i64) -> OwSearch {
+    return OwSearch { rom: Vec::filled(8, 0), last_discrepancy: 0, last_family_discrepancy: 0, last_device: false, command: command };
+}
+
+/// Start the search at devices of one family (the first one found is of
+/// that family if any is present).
+pub fn ow_search_family(family: i64) -> OwSearch {
+    var s: OwSearch = ow_search_new(OW_SEARCH_ROM);
+    s.rom.set(0, family & 0xFF);
+    s.last_discrepancy = 64;
+    return s;
+}
+
+/// The next device; empty when the search is over.
+pub fn ow_search_next(bus: & mut OneWire, s: & mut OwSearch) -> Vec<i64> {
+    if s.last_device {
+        return Vec::new();
+    }
+    if !ow_reset(bus) {
+        s.last_discrepancy = 0;
+        s.last_family_discrepancy = 0;
+        s.last_device = false;
+        return Vec::new();
+    }
+    ow_write_byte(bus, s.command);
+    var last_zero: i64 = 0;
+    var id_bit_number: i64 = 1;
+    while id_bit_number <= 64 {
+        val id_bit: i64 = ow_read_bit(bus);
+        val cmp_id_bit: i64 = ow_read_bit(bus);
+        if id_bit == 1 && cmp_id_bit == 1 {
+            // nobody answered
+            s.last_discrepancy = 0;
+            s.last_family_discrepancy = 0;
+            s.last_device = false;
+            return Vec::new();
+        }
+        val byte_i: i64 = (id_bit_number - 1) / 8;
+        val mask: i64 = 1 << ((id_bit_number - 1) % 8);
+        var dir: i64 = 0;
+        if id_bit != cmp_id_bit {
+            dir = id_bit;
+        } else {
+            if id_bit_number < s.last_discrepancy {
+                if (s.rom.get(byte_i) & mask) != 0 {
+                    dir = 1;
+                }
+            } else if id_bit_number == s.last_discrepancy {
+                dir = 1;
+            }
+            if dir == 0 {
+                last_zero = id_bit_number;
+                if last_zero < 9 {
+                    s.last_family_discrepancy = last_zero;
+                }
+            }
+        }
+        if dir == 1 {
+            s.rom.set(byte_i, s.rom.get(byte_i) | mask);
+        } else {
+            s.rom.set(byte_i, s.rom.get(byte_i) & (0xFF ^ mask));
+        }
+        ow_write_bit(bus, dir);
+        id_bit_number = id_bit_number + 1;
+    }
+    s.last_discrepancy = last_zero;
+    if s.last_discrepancy == 0 {
+        s.last_device = true;
+    }
+    if !ow_rom_valid(& s.rom) {
+        return Vec::new();
+    }
+    return s.rom;
+}
+
+/// Every device that answers `command` (SEARCH ROM or ALARM SEARCH).
+pub fn ow_search_all(bus: & mut OneWire, command: i64) -> Vec<Vec<i64>> {
+    var all: Vec<Vec<i64>> = Vec::new();
+    var s: OwSearch = ow_search_new(command);
+    var guard: i64 = 0;
+    while guard < 256 {
+        val rom: Vec<i64> = ow_search_next(bus, & mut s);
+        if rom.len() == 0 {
+            break;
+        }
+        all.push(rom);
+        if s.last_device {
+            break;
+        }
+        guard = guard + 1;
+    }
+    return all;
+}
+
+// ─── DS18B20 ────────────────────────────────────────────────────────────
+
+/// Temperature in 1/10000 C from the raw register (two's complement,
+/// 1/16 C per unit).
+pub fn ds18b20_raw_to_c10000(raw: i64) -> i64 {
+    var r: i64 = raw & 0xFFFF;
+    if r >= 0x8000 {
+        r = r - 0x10000;
+    }
+    return r * 625;
+}
+
+pub fn ds18b20_raw_to_celsius(raw: i64) -> f64 {
+    return (ds18b20_raw_to_c10000(raw) as f64) / 10000.0;
+}
+
+/// The register value for a temperature (nearest 1/16 C).
+pub fn ds18b20_celsius_to_raw(c: f64) -> i64 {
+    var x: f64 = c * 16.0;
+    var r: i64 = 0;
+    if x >= 0.0 {
+        r = (x + 0.5) as i64;
+    } else {
+        r = 0 - ((0.5 - x) as i64);
+    }
+    return r & 0xFFFF;
+}
+
+/// Configuration register for 9..12 bits resolution.
+pub fn ds18b20_config(bits: i64) -> i64 {
+    var b: i64 = bits;
+    if b < 9 {
+        b = 9;
+    }
+    if b > 12 {
+        b = 12;
+    }
+    return ((b - 9) << 5) | 0x1F;
+}
+
+pub fn ds18b20_resolution(config: i64) -> i64 {
+    return 9 + ((config >> 5) & 3);
+}
+
+/// Maximum conversion time in microseconds (93.75 ms at 9 bits, doubling).
+pub fn ds18b20_conversion_us(bits: i64) -> i64 {
+    return 93750 << (bits - 9);
+}
+
+/// Start a conversion on one device (or all with an empty rom).
+pub fn ds18b20_convert(bus: & mut OneWire, rom: & Vec<i64>) -> bool {
+    if !ow_select(bus, rom) {
+        return false;
+    }
+    ow_write_byte(bus, DS18B20_CONVERT_T);
+    return true;
+}
+
+/// Read the 9-byte scratchpad; empty when absent or the CRC is wrong.
+pub fn ds18b20_read_scratchpad(bus: & mut OneWire, rom: & Vec<i64>) -> Vec<i64> {
+    if !ow_select(bus, rom) {
+        return Vec::new();
+    }
+    ow_write_byte(bus, DS18B20_READ_SCRATCHPAD);
+    val sp: Vec<i64> = ow_read_bytes(bus, 9);
+    if ow_crc8(& sp) != 0 {
+        return Vec::new();
+    }
+    var all_ones: bool = true;
+    var i: i64 = 0;
+    while i < 9 {
+        if sp.get(i) != 0xFF {
+            all_ones = false;
+        }
+        i = i + 1;
+    }
+    if all_ones {
+        return Vec::new();
+    }
+    return sp;
+}
+
+/// Convert, then read: temperature in 1/10000 C, or an error.
+pub fn ds18b20_read_temp(bus: & mut OneWire, rom: & Vec<i64>) -> Result<i64, str> {
+    if !ds18b20_convert(bus, rom) {
+        return Result::Err("no presence pulse");
+    }
+    val sp: Vec<i64> = ds18b20_read_scratchpad(bus, rom);
+    if sp.len() == 0 {
+        return Result::Err("scratchpad CRC error");
+    }
+    return Result::Ok(ds18b20_raw_to_c10000(sp.get(0) | (sp.get(1) << 8)));
+}
+
+/// Write TH, TL and the resolution into the scratchpad.
+pub fn ds18b20_write_config(bus: & mut OneWire, rom: & Vec<i64>, th: i64, tl: i64, bits: i64) -> bool {
+    if !ow_select(bus, rom) {
+        return false;
+    }
+    ow_write_byte(bus, DS18B20_WRITE_SCRATCHPAD);
+    ow_write_byte(bus, th & 0xFF);
+    ow_write_byte(bus, tl & 0xFF);
+    ow_write_byte(bus, ds18b20_config(bits));
+    return true;
+}

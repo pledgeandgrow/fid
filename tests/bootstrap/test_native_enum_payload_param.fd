@@ -1,0 +1,142 @@
+// CI4: a struct parameter wrapped into an enum variant keeps every field
+// on every backend. Found on Nov 17 running the native suite
+// (test_enum_struct_field2: `fid run` and C print 82, pe_ir, `emit --nat`
+// and `emit --target x86_64-linux` printed other numbers): a struct that
+// came in as a parameter and went into `E::Some(p)` kept its first field
+// only; built in place (`E::Some(P { .. })` or a local), it was right.
+// Each line is the same on the interpreter, C, pe_ir and the machine layer.
+//
+// Expected output:
+// direct 34
+// param 34
+// literal arg 56
+// wide param 55
+// nested param 82
+// option param 78
+// caller match 34
+
+pub struct P {
+    pub a: i64,
+    pub b: i64,
+}
+
+pub struct Wide {
+    pub a: i64, pub b: i64, pub c: i64, pub d: i64, pub e: i64,
+    pub f: i64, pub g: i64, pub h: i64, pub i: i64, pub j: i64,
+}
+
+pub struct Inner {
+    pub a: i64,
+    pub b: i64,
+    pub c: i64,
+    pub d: i64,
+    pub e: i64,
+}
+
+pub struct Outer {
+    pub a: i64,
+    pub inner: Inner,
+    pub f: i64,
+    pub o: i64,
+}
+
+pub enum OptP {
+    Some(P),
+    None,
+}
+
+pub enum OptWide {
+    Some(Wide),
+    None,
+}
+
+pub enum OptOuter {
+    Some(Outer),
+    None,
+}
+
+pub fn wrap(p: P) -> OptP {
+    return OptP::Some(p);
+}
+
+pub fn sum_p(o: OptP) -> i64 {
+    match o {
+        OptP::Some(p) => {
+            return p.a * 10 + p.b;
+        }
+        OptP::None => {
+            return 0 - 1;
+        }
+    }
+}
+
+pub fn wrap_wide(w: Wide) -> OptWide {
+    return OptWide::Some(w);
+}
+
+pub fn sum_wide(o: OptWide) -> i64 {
+    match o {
+        OptWide::Some(w) => {
+            return w.a + w.b + w.c + w.d + w.e + w.f + w.g + w.h + w.i + w.j;
+        }
+        OptWide::None => {
+            return 0 - 1;
+        }
+    }
+}
+
+pub fn wrap_outer(x: Outer) -> OptOuter {
+    return OptOuter::Some(x);
+}
+
+pub fn sum_outer(o: OptOuter) -> i64 {
+    match o {
+        OptOuter::Some(x) => {
+            return x.a + x.f + x.o + x.inner.a + x.inner.e;
+        }
+        OptOuter::None => {
+            return 0 - 1;
+        }
+    }
+}
+
+pub fn some_p(p: P) -> Option<P> {
+    return Option::Some(p);
+}
+
+fn main() -> i64 {
+    var p: P = P { a: 3, b: 4 };
+    var o1: OptP = OptP::Some(p);
+    println("direct " + int_to_str(sum_p(o1)));
+    var o2: OptP = wrap(p);
+    println("param " + int_to_str(sum_p(o2)));
+    var o3: OptP = wrap(P { a: 5, b: 6 });
+    println("literal arg " + int_to_str(sum_p(o3)));
+    var w: Wide = Wide { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 };
+    println("wide param " + int_to_str(sum_wide(wrap_wide(w))));
+    var x: Outer = Outer {
+        a: 1,
+        inner: Inner { a: 10, b: 20, c: 30, d: 40, e: 50 },
+        f: 6,
+        o: 15,
+    };
+    println("nested param " + int_to_str(sum_outer(wrap_outer(x))));
+    var q: P = P { a: 7, b: 8 };
+    match some_p(q) {
+        Option::Some(r) => {
+            println("option param " + int_to_str(r.a * 10 + r.b));
+        }
+        Option::None => {
+            println("option param none");
+        }
+    }
+    match wrap(p) {
+        OptP::Some(r) => {
+            println("caller match " + int_to_str(r.a * 10 + r.b));
+        }
+        OptP::None => {
+            println("caller match none");
+        }
+    }
+    return 0;
+}

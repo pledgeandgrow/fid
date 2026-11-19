@@ -1,0 +1,52 @@
+// MI17: a runtime function with state is not a pure call. The native
+// mid-end merges two calls of the same function with the same arguments
+// when the callee has no effects (rules.fd purecse). The wrappers below
+// only call runtime builtins (sync_tls_* over p_tls_*; random_word over
+// p_os_random_u64, as crypto_random_u64 does); a builtin that
+// runtime_effects (lower.fd) gives no effect counted as pure, so on
+// `fid emit --nat` the second sync_tls_get read the first's value (0, not
+// 42), and the second key and random value were the first ones again
+// (test_new_features' test_tls failed the same way).
+// Expected output:
+//   tls 0 42 100
+//   keys differ
+//   key2 unset
+//   random differs
+use sync;
+
+extern fn p_os_random_u64() -> i64;
+
+// a program function that only calls the builtin, like crypto_random_u64
+fn random_word() -> i64 {
+    return p_os_random_u64();
+}
+
+fn main() -> i64 {
+    val key = sync_tls_create();
+    val a = sync_tls_get(key);
+    sync_tls_set(key, 42);
+    val b = sync_tls_get(key);
+    sync_tls_set(key, 100);
+    val c = sync_tls_get(key);
+    println("tls " + int_to_str(a) + " " + int_to_str(b) + " " + int_to_str(c));
+    val k2 = sync_tls_create();
+    if k2 != key {
+        println("keys differ");
+    } else {
+        println("keys same");
+    }
+    if sync_tls_get(k2) == 0 {
+        println("key2 unset");
+    } else {
+        println("key2 holds " + int_to_str(sync_tls_get(k2)));
+    }
+    val r1 = random_word();
+    val r2 = random_word();
+    val r3 = random_word();
+    if r1 != r2 || r2 != r3 {
+        println("random differs");
+    } else {
+        println("random repeated");
+    }
+    return 0;
+}

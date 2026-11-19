@@ -1,0 +1,663 @@
+// Fides HTTP cookies: Cookie / Set-Cookie (RFC 6265), signed values and a
+// session store, pure Fides
+//
+//   - the Cookie request header: "a=1; b=2" into name/value pairs (pairs
+//     without "=" or with an empty name are skipped; a value in double
+//     quotes keeps its quotes, as RFC 6265 §4.1.1 makes them part of it)
+//   - Set-Cookie: building (name must be an RFC 9110 token, value only
+//     cookie-octets, Path/Domain without ";" or controls; SameSite=None
+//     needs Secure; the __Secure- prefix needs Secure, __Host- needs
+//     Secure, Path=/ and no Domain: a header breaking these is refused with
+//     "") and parsing by the user-agent algorithm of RFC 6265 §5.2
+//     (attributes case-insensitive, the last one of a kind wins, Max-Age
+//     only "-"? digits, a leading "." of Domain dropped and the rest
+//     lower-cased, a Path not starting with "/" ignored)
+//   - an IMF-fixdate for Expires from Unix seconds
+//   - signed values: value + "." + HMAC-SHA512(secret, name=value) in hex
+//     (RFC 2104 over stdlib sha512; RFC 4231 vectors in the test), checked
+//     in constant time; the name is signed too, so a value cannot be moved
+//     to another cookie
+//   - a session store: per-session string data with an expiry time,
+//     sliding renewal, sweeping; time is passed in (seconds), and session
+//     ids come from the caller's random bytes (session_id_from_words), so
+//     the store itself needs no randomness or clock
+//
+// Everything here is real; there is no platform seam.
+//
+// Usage:
+//   val cs: Vec<Cookie> = cookie_parse_header("sid=abc; theme=dark");
+//   var sc: SetCookie = set_cookie_new("sid", "abc");
+//   sc.http_only = true; sc.secure = true; sc.same_site = "Lax";
+//   val header: str = set_cookie_serialize(sc);
+//   val signed: str = cookie_sign("secret", "sid", "abc");
+//   match cookie_unsign("secret", "sid", signed) { Option::Some(v) => { } Option::None => { } }
+
+module cookie;
+ use vec;
+ use sha512;
+
+/// A name/value pair of a Cookie request header.
+pub struct Cookie {
+    pub name: str,
+    pub value: str,
+}
+
+/// A Set-Cookie header. `max_age` is used only when `has_max_age`;
+/// `expires` is an HTTP date or ""; `same_site` is "Strict", "Lax",
+/// "None" or "".
+pub struct SetCookie {
+    pub name: str,
+    pub value: str,
+    pub expires: str,
+    pub has_max_age: bool,
+    pub max_age: i64,
+    pub domain: str,
+    pub path: str,
+    pub secure: bool,
+    pub http_only: bool,
+    pub same_site: str,
+}
+
+pub fn set_cookie_new(name: str, value: str) -> SetCookie {
+    return SetCookie { name: name, value: value, expires: "", has_max_age: false, max_age: 0, domain: "", path: "", secure: false, http_only: false, same_site: "" };
+}
+
+// --- character classes -----------------------------------------------------
+
+/// RFC 9110 tchar: ALPHA / DIGIT / "!#$%&'*+-.^_`|~"
+fn cookie_is_tchar(c: i64) -> bool {
+    if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+        return true;
+    }
+    return c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126;
+}
+
+/// RFC 6265 cookie-octet: %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+fn cookie_is_octet(c: i64) -> bool {
+    if c == 33 {
+        return true;
+    }
+    if c >= 35 && c <= 43 {
+        return true;
+    }
+    if c >= 45 && c <= 58 {
+        return true;
+    }
+    if c >= 60 && c <= 91 {
+        return true;
+    }
+    return c >= 93 && c <= 126;
+}
+
+/// Whether `s` is a non-empty token (a valid cookie name).
+pub fn cookie_name_ok(s: str) -> bool {
+    val n: i64 = str_len(s);
+    if n == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if !cookie_is_tchar(str_byte_at(s, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Whether `s` is a valid cookie value: cookie-octets, optionally inside
+/// one pair of double quotes.
+pub fn cookie_value_ok(s: str) -> bool {
+    var t: str = s;
+    val n: i64 = str_len(s);
+    if n >= 2 && str_byte_at(s, 0) == 34 && str_byte_at(s, n - 1) == 34 {
+        t = str_slice(s, 1, n - 1);
+    }
+    var i: i64 = 0;
+    while i < str_len(t) {
+        if !cookie_is_octet(str_byte_at(t, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An attribute value (Path, Domain): no controls and no ";".
+fn cookie_av_ok(s: str) -> bool {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 32 || c == 127 || c == 59 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// --- the Cookie request header ------------------------------------------------
+
+/// The pairs of a Cookie header, in order.
+pub fn cookie_parse_header(h: str) -> Vec<Cookie> {
+    var out: Vec<Cookie> = Vec::new();
+    val parts: Vec<str> = str_split(h, ";");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = str_trim(parts.get(i));
+        val eq: i64 = str_find(p, "=");
+        if eq > 0 {
+            val name: str = str_trim(str_slice(p, 0, eq));
+            val value: str = str_trim(str_slice(p, eq + 1, str_len(p)));
+            if str_len(name) > 0 {
+                out.push(Cookie { name: name, value: value });
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The value of the first cookie called `name`.
+pub fn cookie_get(cs: Vec<Cookie>, name: str) -> Option<str> {
+    var i: i64 = 0;
+    while i < cs.len() {
+        if cs.get(i).name == name {
+            return Option::Some(cs.get(i).value);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// A Cookie request header from pairs ("" when a pair is invalid).
+pub fn cookie_header(cs: Vec<Cookie>) -> str {
+    var o: str = "";
+    var i: i64 = 0;
+    while i < cs.len() {
+        val c: Cookie = cs.get(i);
+        if !cookie_name_ok(c.name) || !cookie_value_ok(c.value) {
+            return "";
+        }
+        if i > 0 {
+            o = o + "; ";
+        }
+        o = o + c.name + "=" + c.value;
+        i = i + 1;
+    }
+    return o;
+}
+
+// --- Set-Cookie -----------------------------------------------------------------
+
+/// The Set-Cookie header value, or "" when the cookie breaks a rule (see
+/// the header comment).
+pub fn set_cookie_serialize(c: SetCookie) -> str {
+    if !cookie_name_ok(c.name) || !cookie_value_ok(c.value) {
+        return "";
+    }
+    if !cookie_av_ok(c.path) || !cookie_av_ok(c.domain) || !cookie_av_ok(c.expires) {
+        return "";
+    }
+    val ss: str = c.same_site;
+    if !(ss == "" || ss == "Strict" || ss == "Lax" || ss == "None") {
+        return "";
+    }
+    if ss == "None" && !c.secure {
+        return "";
+    }
+    if str_starts_with(c.name, "__Secure-") && !c.secure {
+        return "";
+    }
+    if str_starts_with(c.name, "__Host-") {
+        if !c.secure || c.path != "/" || str_len(c.domain) > 0 {
+            return "";
+        }
+    }
+    var o: str = c.name + "=" + c.value;
+    if str_len(c.expires) > 0 {
+        o = o + "; Expires=" + c.expires;
+    }
+    if c.has_max_age {
+        o = o + "; Max-Age=" + int_to_str(c.max_age);
+    }
+    if str_len(c.domain) > 0 {
+        o = o + "; Domain=" + c.domain;
+    }
+    if str_len(c.path) > 0 {
+        o = o + "; Path=" + c.path;
+    }
+    if c.secure {
+        o = o + "; Secure";
+    }
+    if c.http_only {
+        o = o + "; HttpOnly";
+    }
+    if str_len(ss) > 0 {
+        o = o + "; SameSite=" + ss;
+    }
+    return o;
+}
+
+/// Whether `s` is "-"? DIGIT+ (RFC 6265 §5.2.2).
+fn cookie_max_age_ok(s: str) -> bool {
+    val n: i64 = str_len(s);
+    if n == 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    if str_byte_at(s, 0) == 45 {
+        i = 1;
+        if n == 1 {
+            return false;
+        }
+    }
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A Set-Cookie header read as a user agent does (RFC 6265 §5.2). The
+/// name is "" when the header holds no "=" before its first ";" or the
+/// name is empty (the header is then to be ignored).
+pub fn set_cookie_parse(h: str) -> SetCookie {
+    var c: SetCookie = set_cookie_new("", "");
+    var pair: str = h;
+    var rest: str = "";
+    val semi: i64 = str_find(h, ";");
+    if semi >= 0 {
+        pair = str_slice(h, 0, semi);
+        rest = str_slice(h, semi, str_len(h));
+    }
+    val eq: i64 = str_find(pair, "=");
+    if eq < 0 {
+        return c;
+    }
+    val name: str = str_trim(str_slice(pair, 0, eq));
+    if str_len(name) == 0 {
+        return c;
+    }
+    c.name = name;
+    c.value = str_trim(str_slice(pair, eq + 1, str_len(pair)));
+    val avs: Vec<str> = str_split(rest, ";");
+    var i: i64 = 0;
+    while i < avs.len() {
+        val av: str = avs.get(i);
+        var key: str = av;
+        var val_s: str = "";
+        val e: i64 = str_find(av, "=");
+        if e >= 0 {
+            key = str_slice(av, 0, e);
+            val_s = str_slice(av, e + 1, str_len(av));
+        }
+        key = str_to_lower(str_trim(key));
+        val_s = str_trim(val_s);
+        if key == "expires" {
+            c.expires = val_s;
+        } else if key == "max-age" {
+            if cookie_max_age_ok(val_s) {
+                c.has_max_age = true;
+                c.max_age = str_parse_int(val_s);
+            }
+        } else if key == "domain" {
+            var d: str = val_s;
+            if str_starts_with(d, ".") {
+                d = str_slice(d, 1, str_len(d));
+            }
+            c.domain = str_to_lower(d);
+        } else if key == "path" {
+            if str_starts_with(val_s, "/") {
+                c.path = val_s;
+            } else {
+                c.path = "";
+            }
+        } else if key == "secure" {
+            c.secure = true;
+        } else if key == "httponly" {
+            c.http_only = true;
+        } else if key == "samesite" {
+            val l: str = str_to_lower(val_s);
+            if l == "strict" {
+                c.same_site = "Strict";
+            } else if l == "lax" {
+                c.same_site = "Lax";
+            } else if l == "none" {
+                c.same_site = "None";
+            } else {
+                c.same_site = "";
+            }
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The default path of a cookie set by a response to `request_path`
+/// (RFC 6265 §5.1.4).
+pub fn cookie_default_path(request_path: str) -> str {
+    if !str_starts_with(request_path, "/") {
+        return "/";
+    }
+    var last: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < str_len(request_path) {
+        if str_byte_at(request_path, i) == 47 {
+            last = i;
+        }
+        i = i + 1;
+    }
+    if last <= 0 {
+        return "/";
+    }
+    return str_slice(request_path, 0, last);
+}
+
+/// Whether a cookie with `cookie_path` is sent with `request_path`
+/// (RFC 6265 §5.1.4 path-match).
+pub fn cookie_path_match(cookie_path: str, request_path: str) -> bool {
+    if cookie_path == request_path {
+        return true;
+    }
+    if !str_starts_with(request_path, cookie_path) {
+        return false;
+    }
+    if str_ends_with(cookie_path, "/") {
+        return true;
+    }
+    return str_byte_at(request_path, str_len(cookie_path)) == 47;
+}
+
+/// Whether a cookie with `domain` (no leading dot, lower case) is sent to
+/// `host` (RFC 6265 §5.1.3 domain-match).
+pub fn cookie_domain_match(domain: str, host: str) -> bool {
+    val h: str = str_to_lower(host);
+    if h == domain {
+        return true;
+    }
+    if !str_ends_with(h, domain) {
+        return false;
+    }
+    val k: i64 = str_len(h) - str_len(domain);
+    return k > 0 && str_byte_at(h, k - 1) == 46;
+}
+
+// --- dates -------------------------------------------------------------------
+
+fn cookie_pad2(n: i64) -> str {
+    if n < 10 {
+        return "0" + int_to_str(n);
+    }
+    return int_to_str(n);
+}
+
+/// Unix seconds as an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT").
+pub fn cookie_http_date(ts: i64) -> str {
+    var days: i64 = ts / 86400;
+    var secs: i64 = ts % 86400;
+    if secs < 0 {
+        secs = secs + 86400;
+        days = days - 1;
+    }
+    // weekday: 1970-01-01 was a Thursday
+    var wd: i64 = (days + 4) % 7;
+    if wd < 0 {
+        wd = wd + 7;
+    }
+    // civil date from days (H. Hinnant's algorithm)
+    val z: i64 = days + 719468;
+    var era: i64 = z / 146097;
+    if z < 0 && z % 146097 != 0 {
+        era = era - 1;
+    }
+    val doe: i64 = z - era * 146097;
+    val yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: i64 = yoe + era * 400;
+    val doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    val mp: i64 = (5 * doy + 2) / 153;
+    val d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    var m: i64 = mp + 3;
+    if mp >= 10 {
+        m = mp - 9;
+    }
+    if m <= 2 {
+        y = y + 1;
+    }
+    val wdays: Vec<str> = str_split("Sun,Mon,Tue,Wed,Thu,Fri,Sat", ",");
+    val months: Vec<str> = str_split("Jan,Feb,Mar,Apr,May,Jun,Jul,Aug,Sep,Oct,Nov,Dec", ",");
+    val hh: i64 = secs / 3600;
+    val mi: i64 = (secs % 3600) / 60;
+    val ss: i64 = secs % 60;
+    return wdays.get(wd) + ", " + cookie_pad2(d) + " " + months.get(m - 1) + " " + int_to_str(y) + " " + cookie_pad2(hh) + ":" + cookie_pad2(mi) + ":" + cookie_pad2(ss) + " GMT";
+}
+
+// --- HMAC-SHA512 and signed values ------------------------------------------------
+
+/// HMAC-SHA512 (RFC 2104) of `msg` under `key`, both as bytes.
+pub fn cookie_hmac_sha512(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    var k: Vec<i64> = key;
+    if k.len() > 128 {
+        k = sha512_bytes(k);
+    }
+    var ipad: Vec<i64> = Vec::new();
+    var opad: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 128 {
+        var b: i64 = 0;
+        if i < k.len() {
+            b = k.get(i);
+        }
+        ipad.push(b ^ 54);
+        opad.push(b ^ 92);
+        i = i + 1;
+    }
+    var inner: Vec<i64> = ipad;
+    var j: i64 = 0;
+    while j < msg.len() {
+        inner.push(msg.get(j));
+        j = j + 1;
+    }
+    val ih: Vec<i64> = sha512_bytes(inner);
+    var outer: Vec<i64> = opad;
+    j = 0;
+    while j < ih.len() {
+        outer.push(ih.get(j));
+        j = j + 1;
+    }
+    return sha512_bytes(outer);
+}
+
+/// Whether two strings are equal, in time that depends only on their
+/// lengths.
+pub fn cookie_ct_eq(a: str, b: str) -> bool {
+    if str_len(a) != str_len(b) {
+        return false;
+    }
+    var d: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(a) {
+        d = d | (str_byte_at(a, i) ^ str_byte_at(b, i));
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+fn cookie_mac_hex(secret: str, name: str, value: str) -> str {
+    return sha512_hex(cookie_hmac_sha512(str_bytes(secret), str_bytes(name + "=" + value)));
+}
+
+/// `value` signed for the cookie `name`: value + "." + 128 hex digits. The
+/// value must be a valid cookie value without quotes ("" otherwise).
+pub fn cookie_sign(secret: str, name: str, value: str) -> str {
+    if !cookie_value_ok(value) || str_starts_with(value, "\"") {
+        return "";
+    }
+    return value + "." + cookie_mac_hex(secret, name, value);
+}
+
+/// The value inside a signed cookie when its signature is right for
+/// `name` under `secret`.
+pub fn cookie_unsign(secret: str, name: str, signed: str) -> Option<str> {
+    val n: i64 = str_len(signed);
+    if n < 129 {
+        return Option::None;
+    }
+    if str_byte_at(signed, n - 129) != 46 {
+        return Option::None;
+    }
+    val value: str = str_slice(signed, 0, n - 129);
+    val mac: str = str_slice(signed, n - 128, n);
+    if cookie_ct_eq(mac, cookie_mac_hex(secret, name, value)) {
+        return Option::Some(value);
+    }
+    return Option::None;
+}
+
+// --- sessions -------------------------------------------------------------------
+
+/// One session: its id, data and expiry (seconds).
+pub struct Session {
+    pub id: str,
+    pub keys: Vec<str>,
+    pub vals: Vec<str>,
+    pub expires: i64,
+}
+
+/// Sessions living `ttl` seconds after their last use.
+pub struct SessionStore {
+    pub sessions: Vec<Session>,
+    pub ttl: i64,
+}
+
+pub fn session_store_new(ttl: i64) -> SessionStore {
+    return SessionStore { sessions: Vec::new(), ttl: ttl };
+}
+
+/// A session id from caller-supplied random words (take them from the
+/// OS: four 64-bit words give 256 bits); lower-case hex.
+pub fn session_id_from_words(words: Vec<i64>) -> str {
+    val hexd: str = "0123456789abcdef";
+    var o: str = "";
+    var i: i64 = 0;
+    while i < words.len() {
+        val w: i64 = words.get(i);
+        var sh: i64 = 60;
+        while sh >= 0 {
+            val nib: i64 = (w >> sh) & 15;
+            o = o + str_slice(hexd, nib, nib + 1);
+            sh = sh - 4;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn session_find(st: & SessionStore, id: str, now: i64) -> i64 {
+    var i: i64 = 0;
+    while i < st.sessions.len() {
+        val s: Session = st.sessions.get(i);
+        if s.id == id {
+            if s.expires <= now {
+                return 0 - 1;
+            }
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// Start a session with `id` (false when one with that id is alive).
+pub fn session_create(st: & mut SessionStore, id: str, now: i64) -> bool {
+    if session_find(st, id, now) >= 0 {
+        return false;
+    }
+    session_sweep(st, now);
+    st.sessions.push(Session { id: id, keys: Vec::new(), vals: Vec::new(), expires: now + st.ttl });
+    return true;
+}
+
+/// Whether session `id` is alive; renews it (sliding expiry).
+pub fn session_touch(st: & mut SessionStore, id: str, now: i64) -> bool {
+    val i: i64 = session_find(st, id, now);
+    if i < 0 {
+        return false;
+    }
+    var s: Session = st.sessions.get(i);
+    s.expires = now + st.ttl;
+    st.sessions.set(i, s);
+    return true;
+}
+
+/// Set `key` in session `id` (false when the session is gone); renews it.
+pub fn session_set(st: & mut SessionStore, id: str, key: str, value: str, now: i64) -> bool {
+    val i: i64 = session_find(st, id, now);
+    if i < 0 {
+        return false;
+    }
+    var s: Session = st.sessions.get(i);
+    var k: i64 = 0;
+    var found: bool = false;
+    while k < s.keys.len() {
+        if s.keys.get(k) == key {
+            s.vals.set(k, value);
+            found = true;
+        }
+        k = k + 1;
+    }
+    if !found {
+        s.keys.push(key);
+        s.vals.push(value);
+    }
+    s.expires = now + st.ttl;
+    st.sessions.set(i, s);
+    return true;
+}
+
+/// The value of `key` in session `id`, when both exist.
+pub fn session_get(st: & SessionStore, id: str, key: str, now: i64) -> Option<str> {
+    val i: i64 = session_find(st, id, now);
+    if i < 0 {
+        return Option::None;
+    }
+    val s: Session = st.sessions.get(i);
+    var k: i64 = 0;
+    while k < s.keys.len() {
+        if s.keys.get(k) == key {
+            return Option::Some(s.vals.get(k));
+        }
+        k = k + 1;
+    }
+    return Option::None;
+}
+
+/// End session `id` (logout).
+pub fn session_destroy(st: & mut SessionStore, id: str) {
+    var keep: Vec<Session> = Vec::new();
+    var i: i64 = 0;
+    while i < st.sessions.len() {
+        if st.sessions.get(i).id != id {
+            keep.push(st.sessions.get(i));
+        }
+        i = i + 1;
+    }
+    st.sessions = keep;
+}
+
+/// Drop expired sessions; how many are left.
+pub fn session_sweep(st: & mut SessionStore, now: i64) -> i64 {
+    var keep: Vec<Session> = Vec::new();
+    var i: i64 = 0;
+    while i < st.sessions.len() {
+        if st.sessions.get(i).expires > now {
+            keep.push(st.sessions.get(i));
+        }
+        i = i + 1;
+    }
+    st.sessions = keep;
+    return st.sessions.len();
+}

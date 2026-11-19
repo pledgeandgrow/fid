@@ -1,0 +1,279 @@
+// stdlib/redis: RESP command encoding, the RESP3 spec's examples decoded and re-encoded byte for byte, RESP2 nulls, malformed and partial input, a pipelined client over a replayed transport that hands out 5 bytes per read, typed helpers and pub/sub events.
+// Expected output:
+// command: 2a330d0a24330d0a5345540d0a24350d0a6d796b65790d0a24370d0a6d7976616c75650d0a
+// inline: PING\r\n
+// resp3 examples: 14 of 14 decode and re-encode to the same bytes
+// [(integer) 1, (integer) 2, (integer) 3]
+// {first: (integer) 1, second: (integer) 2}
+// ~{orange, apple, (true), (integer) 100, (integer) 999}
+// |{key-popularity: {"a": (double) 0.1923, "b": (double) 0.0012}} [(integer) 2039123, (integer) 9543892]
+// >[pubsub, message, somechannel, this is the message]
+// txt:"Some string"
+// (big number) 3492890328409238509324850943850943825024385
+// double: 1.23 inf true
+// resp2 nulls: (nil) (nil)
+// malformed: 6 of 6 rejected
+// partial: need more at every cut of 40 bytes
+// sent: 2a320d0a24330d0a4745540d0a24310d0a6b0d0a
+// get k: hello
+// get missing: none
+// pipeline: 3 replies, 1 2 3, sent in one write
+// set ex nx: true false
+// hset 1 hget v lpush 3 lrange c,b,a
+// error: false ERR value is not an integer or out of range
+// expire true ttl 99 publish 2
+// subscribe: subscribe news 1, subscribe sport 2
+// event: message news hello
+// event: pmessage n* news hi
+// resp3 push: message news x
+// hello: proto 3 role master
+use redis;
+use vec;
+use string;
+use encoding;
+
+var INQ: Vec<i64> = Vec::new();
+var SENT: Vec<i64> = Vec::new();
+var WRITES: i64 = 0;
+
+fn mock_send(h: i64, b: Vec<i64>) -> i64 {
+    var i: i64 = 0;
+    while i < b.len() {
+        SENT.push(b.get(i));
+        i = i + 1;
+    }
+    WRITES = WRITES + 1;
+    return b.len();
+}
+
+// Five bytes per read, so replies arrive in pieces.
+fn mock_recv(h: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while INQ.len() > 0 && out.len() < 5 && out.len() < max {
+        out.push(INQ.remove(0));
+    }
+    return out;
+}
+
+fn feed(s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        INQ.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn reset() {
+    INQ = Vec::new();
+    SENT = Vec::new();
+    WRITES = 0;
+}
+
+fn client() -> RedisClient {
+    val t: RedisTransport = RedisTransport { conn: 1, send: mock_send, recv: mock_recv };
+    return redis_client_new(t);
+}
+
+fn roundtrip(s: str) -> bool {
+    val b: Vec<i64> = str_bytes(s);
+    val d: RespDoc = resp_decode(b);
+    if !d.ok || d.used != b.len() {
+        println("decode failed: " + d.error);
+        return false;
+    }
+    var out: Vec<i64> = Vec::new();
+    resp_encode_node(& d, d.root, & mut out);
+    return hex_encode_bytes(out) == hex_encode_bytes(b);
+}
+
+fn show(s: str) -> str {
+    val d: RespDoc = resp_decode(str_bytes(s));
+    if !d.ok {
+        return "error: " + d.error;
+    }
+    return resp_to_str(& d, d.root);
+}
+
+fn main() -> i64 {
+    // Commands
+    println("command: " + hex_encode_bytes(resp_encode_command(redis_cmd3("SET", "mykey", "myvalue"))));
+    val inl: str = str_from_bytes(resp_encode_inline(redis_cmd1("PING")));
+    println("inline: " + str_replace(str_replace(inl, "\r", "\\r"), "\n", "\\n"));
+
+    // The examples of the RESP3 specification
+    var ex: Vec<str> = Vec::new();
+    ex.push("*3\r\n:1\r\n:2\r\n:3\r\n");
+    ex.push("%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n");
+    ex.push("~5\r\n+orange\r\n+apple\r\n#t\r\n:100\r\n:999\r\n");
+    ex.push("|1\r\n+key-popularity\r\n%2\r\n$1\r\na\r\n,0.1923\r\n$1\r\nb\r\n,0.0012\r\n*2\r\n:2039123\r\n:9543892\r\n");
+    ex.push(">4\r\n+pubsub\r\n+message\r\n+somechannel\r\n+this is the message\r\n");
+    ex.push("=15\r\ntxt:Some string\r\n");
+    ex.push("(3492890328409238509324850943850943825024385\r\n");
+    ex.push("!21\r\nSYNTAX invalid syntax\r\n");
+    ex.push("_\r\n");
+    ex.push("#f\r\n");
+    ex.push(",-inf\r\n");
+    ex.push("$12\r\nhello\r\nworld\r\n");
+    ex.push("*2\r\n*1\r\n+a\r\n%1\r\n+k\r\n$0\r\n\r\n");
+    ex.push("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    var good: i64 = 0;
+    var i: i64 = 0;
+    while i < ex.len() {
+        if roundtrip(ex.get(i)) {
+            good = good + 1;
+        }
+        i = i + 1;
+    }
+    println("resp3 examples: " + int_to_str(good) + " of " + int_to_str(ex.len()) + " decode and re-encode to the same bytes");
+    println(show(ex.get(0)));
+    println(show(ex.get(1)));
+    println(show(ex.get(2)));
+    println(show(ex.get(3)));
+    println(show(ex.get(4)));
+    println(show(ex.get(5)));
+    println(show(ex.get(6)));
+    val dd: RespDoc = resp_decode(str_bytes(",1.23\r\n"));
+    val di: RespDoc = resp_decode(str_bytes(",inf\r\n"));
+    println("double: " + float_to_str(resp_double(& dd, dd.root)) + " " + resp_text(& di, di.root) + " " + bool_to_str(resp_double(& di, di.root) > 1.0e308));
+    println("resp2 nulls: " + show("$-1\r\n") + " " + show("*-1\r\n"));
+
+    // Malformed input
+    var bad: Vec<str> = Vec::new();
+    bad.push("?x\r\n");
+    bad.push(":12a\r\n");
+    bad.push("$3\r\nabcd\r\n");
+    bad.push("#x\r\n");
+    bad.push("+ok\n");
+    bad.push("*-2\r\n");
+    var rejected: i64 = 0;
+    i = 0;
+    while i < bad.len() {
+        val d: RespDoc = resp_decode(str_bytes(bad.get(i)));
+        if !d.ok && !d.need_more {
+            rejected = rejected + 1;
+        }
+        i = i + 1;
+    }
+    println("malformed: " + int_to_str(rejected) + " of " + int_to_str(bad.len()) + " rejected");
+
+    // Every proper prefix of a reply asks for more bytes
+    val whole: Vec<i64> = str_bytes("*4\r\n$3\r\nfoo\r\n%1\r\n+a\r\n:-7\r\n~1\r\n#t\r\n,2.5\r\n");
+    var cuts_ok: bool = true;
+    var cut: i64 = 0;
+    while cut < whole.len() {
+        var part: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < cut {
+            part.push(whole.get(k));
+            k = k + 1;
+        }
+        val d: RespDoc = resp_decode(part);
+        if d.ok || !d.need_more {
+            cuts_ok = false;
+        }
+        cut = cut + 1;
+    }
+    if cuts_ok && resp_decode(whole).ok {
+        println("partial: need more at every cut of " + int_to_str(whole.len()) + " bytes");
+    } else {
+        println("partial: FAILED");
+    }
+
+    // Client over a replayed transport
+    var c: RedisClient = client();
+    feed("$5\r\nhello\r\n");
+    val g: Option<str> = redis_get(& mut c, "k");
+    println("sent: " + hex_encode_bytes(SENT));
+    match g {
+        Option::Some(v) => { println("get k: " + v); }
+        Option::None => { println("get k: none"); }
+    }
+    feed("$-1\r\n");
+    match redis_get(& mut c, "missing") {
+        Option::Some(v) => { println("get missing: " + v); }
+        Option::None => { println("get missing: none"); }
+    }
+
+    reset();
+    redis_queue(& mut c, redis_cmd2("INCR", "n"));
+    redis_queue(& mut c, redis_cmd2("INCR", "n"));
+    redis_queue(& mut c, redis_cmd2("INCR", "n"));
+    feed(":1\r\n:2\r\n:3\r\n");
+    val rs: Vec<RespDoc> = redis_flush(& mut c);
+    var line: str = "pipeline: " + int_to_str(rs.len()) + " replies,";
+    i = 0;
+    while i < rs.len() {
+        val d: RespDoc = rs.get(i);
+        line = line + " " + int_to_str(resp_int(& d, d.root));
+        i = i + 1;
+    }
+    val expect: Vec<i64> = resp_encode_command(redis_cmd2("INCR", "n"));
+    if WRITES == 1 && SENT.len() == 3 * expect.len() {
+        line = line + ", sent in one write";
+    }
+    println(line);
+
+    reset();
+    feed("+OK\r\n_\r\n");
+    val s1: bool = redis_set_ex(& mut c, "lock", "me", 10, true);
+    val s2: bool = redis_set_ex(& mut c, "lock", "me", 10, true);
+    println("set ex nx: " + bool_to_str(s1) + " " + bool_to_str(s2));
+
+    feed(":1\r\n$1\r\nv\r\n:3\r\n*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n");
+    val hs: i64 = redis_hset(& mut c, "h", "f", "v");
+    var hv: str = "";
+    match redis_hget(& mut c, "h", "f") {
+        Option::Some(v) => { hv = v; }
+        Option::None => { hv = "none"; }
+    }
+    var vals: Vec<str> = Vec::new();
+    vals.push("a");
+    vals.push("b");
+    vals.push("c");
+    val ln: i64 = redis_lpush(& mut c, "l", vals);
+    val lr: Vec<str> = redis_lrange(& mut c, "l", 0, 0 - 1);
+    println("hset " + int_to_str(hs) + " hget " + hv + " lpush " + int_to_str(ln) + " lrange " + str_join(lr, ","));
+
+    feed("-ERR value is not an integer or out of range\r\n");
+    val bad_incr: i64 = redis_incr(& mut c, "h");
+    println("error: " + bool_to_str(bad_incr >= 0) + " " + c.error);
+
+    feed(":1\r\n:99\r\n:2\r\n");
+    val e1: bool = redis_expire(& mut c, "k", 100);
+    val t1: i64 = redis_ttl(& mut c, "k");
+    val p1: i64 = redis_publish(& mut c, "news", "hi");
+    println("expire " + bool_to_str(e1) + " ttl " + int_to_str(t1) + " publish " + int_to_str(p1));
+
+    // Pub/sub
+    feed("*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n*3\r\n$9\r\nsubscribe\r\n$5\r\nsport\r\n:2\r\n");
+    var chans: Vec<str> = Vec::new();
+    chans.push("news");
+    chans.push("sport");
+    val subs: Vec<RedisPubSub> = redis_subscribe(& mut c, chans);
+    var sl: str = "subscribe:";
+    i = 0;
+    while i < subs.len() {
+        val ev: RedisPubSub = subs.get(i);
+        if i > 0 {
+            sl = sl + ",";
+        }
+        sl = sl + " " + ev.kind + " " + ev.channel + " " + int_to_str(ev.count);
+        i = i + 1;
+    }
+    println(sl);
+    feed("*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n");
+    val m1: RedisPubSub = redis_next_event(& mut c);
+    println("event: " + m1.kind + " " + m1.channel + " " + m1.payload);
+    feed("*4\r\n$8\r\npmessage\r\n$2\r\nn*\r\n$4\r\nnews\r\n$2\r\nhi\r\n");
+    val m2: RedisPubSub = redis_next_event(& mut c);
+    println("event: " + m2.kind + " " + m2.pattern + " " + m2.channel + " " + m2.payload);
+    val pd: RespDoc = resp_decode(str_bytes(">3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$1\r\nx\r\n"));
+    val m3: RedisPubSub = redis_pubsub_parse(& pd, pd.root);
+    println("resp3 push: " + m3.kind + " " + m3.channel + " " + m3.payload);
+
+    // HELLO 3
+    feed("%3\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$4\r\nrole\r\n$6\r\nmaster\r\n");
+    val hd: RespDoc = redis_hello3(& mut c, "", "");
+    println("hello: proto " + int_to_str(resp_int(& hd, resp_map_get(& hd, hd.root, "proto"))) + " role " + resp_text(& hd, resp_map_get(& hd, hd.root, "role")));
+    return 0;
+}

@@ -1,0 +1,152 @@
+// stdlib/dynlib.fd — load a C shared library at run time (roadmap L6C)
+//
+// Library::open asks the operating system's loader for a library
+// (LoadLibrary on Windows, dlopen elsewhere) and symbol() for the address
+// of one of its functions (GetProcAddress, dlsym). Over the builtins
+// p_dl_load / p_dl_find / p_dl_unload, with what each backend does:
+//
+//   fid ccompile (C)        the OS loader (dlopen / LoadLibraryA)
+//   fid emit, Windows       the OS loader (pe_ir: LoadLibraryA)
+//   fid run                 the loader of the `fid` running it
+//   fid emit, Linux / --nat static executables: no library ever loads
+//                           (open gives None)
+//
+// Loading a library reads a file and runs its initialisers: it needs the
+// FS capability (a module without it is refused at compile time, and
+// inside `sandbox` it is refused like every capability).
+//
+//   use dynlib;
+//   match Library::open_first(dynlib_libc_names()) {
+//       Option::Some(lib) => {
+//           var l: Library = lib;
+//           match l.symbol("llabs") {
+//               Option::Some(f) => { println(int_to_str(dynlib_call(f, 0 - 5))); }
+//               Option::None => { println("no llabs"); }
+//           }
+//           l.close();
+//       }
+//       Option::None => { println("no C library"); }
+//   }
+//
+// A symbol is an address: dynlib_call calls it as a C function taking and
+// returning one 64-bit integer (p_dl_call). For any other signature, bind
+// it with its type where it is found:
+//   val f: fn(f64) -> f64 = p_dl_find(l.raw(), "sqrt");
+// (the parameters and result must be C types; roadmap L6C, typechecker
+// TypeChecker_check_dl_sym).
+
+/// A loaded library (`Library::open`). Closed by close(); a closed one
+/// finds nothing.
+pub struct Library {
+    pub path: str,
+    handle: i64,
+}
+
+impl Library {
+    /// Load the library at `path` (a file name the loader searches for,
+    /// or a path). None when it cannot be loaded (missing, not a library
+    /// of this machine, or no loader in this build).
+    pub fn open(path: str) -> Option<Library> {
+        if str_len(path) == 0 {
+            return Option::None;
+        }
+        val h: i64 = p_dl_load(path);
+        if h == 0 {
+            return Option::None;
+        }
+        return Option::Some(Library { path: path, handle: h });
+    }
+
+    /// The first of `paths` that loads (for a library named differently
+    /// on each system), or None when none does.
+    pub fn open_first(paths: Vec<str>) -> Option<Library> {
+        var i: i64 = 0;
+        while i < paths.len() {
+            val p: str = paths.get(i);
+            if str_len(p) > 0 {
+                val h: i64 = p_dl_load(p);
+                if h != 0 {
+                    return Option::Some(Library { path: p, handle: h });
+                }
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// True until close().
+    pub fn is_open(self: & Library) -> bool {
+        return self.handle != 0;
+    }
+
+    /// The loader's handle (0 once closed), for p_dl_find with a function
+    /// type.
+    pub fn raw(self: & Library) -> i64 {
+        return self.handle;
+    }
+
+    /// The address of the function or variable `name` exports, or None
+    /// when it has none of that name (or the library is closed).
+    pub fn symbol(self: & Library, name: str) -> Option<i64> {
+        if self.handle == 0 || str_len(name) == 0 {
+            return Option::None;
+        }
+        val a: i64 = p_dl_find(self.handle, name);
+        if a == 0 {
+            return Option::None;
+        }
+        return Option::Some(a);
+    }
+
+    /// Whether the library exports `name`.
+    pub fn has(self: & Library, name: str) -> bool {
+        match self.symbol(name) {
+            Option::Some(_) => {
+                return true;
+            }
+            Option::None => {
+            }
+        }
+        return false;
+    }
+
+    /// Release the library (its symbols must not be called after). True
+    /// when the loader released it; false when it was already closed.
+    pub fn close(self: & mut Library) -> bool {
+        if self.handle == 0 {
+            return false;
+        }
+        val r: i64 = p_dl_unload(self.handle);
+        self.handle = 0;
+        return r == 0;
+    }
+}
+
+/// Call the C function at `sym` (from Library::symbol) with one 64-bit
+/// integer argument, returning its 64-bit integer result.
+pub fn dynlib_call(sym: i64, arg: i64) -> i64 {
+    return p_dl_call(sym, arg);
+}
+
+/// The names of the C library on each system, for Library::open_first.
+pub fn dynlib_libc_names() -> Vec<str> {
+    var names: Vec<str> = Vec::new();
+    names.push("ucrtbase.dll");
+    names.push("msvcrt.dll");
+    names.push("libc.so.6");
+    names.push("libc.so");
+    names.push("libc.dylib");
+    names.push("/usr/lib/libSystem.B.dylib");
+    return names;
+}
+
+/// The file names a library called `name` has on the systems (name.dll on
+/// Windows, libname.so on Linux and the BSDs, libname.dylib on macOS), for
+/// Library::open_first: each loader finds only its own kind.
+pub fn dynlib_names_of(name: str) -> Vec<str> {
+    var names: Vec<str> = Vec::new();
+    names.push(name + ".dll");
+    names.push("lib" + name + ".so");
+    names.push("lib" + name + ".dylib");
+    return names;
+}

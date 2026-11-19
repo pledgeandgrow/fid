@@ -1,0 +1,364 @@
+// Fides GOAP (goal-oriented action planning) standard library
+//
+// The planner of F.E.A.R.-style game AI, pure computation (no seam):
+//   - a world state is a set of named integer facts (a missing fact is 0,
+//     so booleans are 0/1); kept sorted by name, so equal states compare
+//     and hash equal;
+//   - an action has a name, a cost (> 0), preconditions (fact OP value with
+//     OP one of == != < <= > >=) and effects (set a fact, or add to it);
+//   - a goal is a list of conditions;
+//   - `goap_plan` runs A* forward from the current state over the states
+//     the actions reach, and returns the cheapest action sequence. The
+//     heuristic is ceil(unmet goal conditions / most facts one action
+//     changes) * cheapest action cost, which never overestimates, so the
+//     plan found is optimal. A node budget bounds the search when effects
+//     that add make the state space infinite.
+//
+// Usage:
+//   use goap;
+//   var acts: Vec<GoapAction> = Vec::new();
+//   var chop: GoapAction = goap_action("chop", 2.0);
+//   goap_pre(&mut chop, "has_axe", GOAP_EQ, 1);
+//   goap_add(&mut chop, "wood", 1);
+//   acts.push(chop);
+//   val plan: GoapPlan = goap_plan(start, goal, &acts, 10000);
+
+module goap;
+use vec;
+use string;
+
+pub const GOAP_EQ: i64 = 0;
+pub const GOAP_NE: i64 = 1;
+pub const GOAP_LT: i64 = 2;
+pub const GOAP_LE: i64 = 3;
+pub const GOAP_GT: i64 = 4;
+pub const GOAP_GE: i64 = 5;
+
+pub const GOAP_SET: i64 = 0;
+pub const GOAP_ADD: i64 = 1;
+
+// ─── World state ──────────────────────────────────────────────────────────
+
+/// Facts, sorted by name.
+pub struct GoapState {
+    pub keys: Vec<str>,
+    pub vals: Vec<i64>,
+}
+
+pub fn goap_state() -> GoapState {
+    return GoapState { keys: Vec::new(), vals: Vec::new() };
+}
+
+// index of `key`, or -(insertion point) - 1
+fn gp_find(s: &GoapState, key: str) -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = s.keys.len();
+    while lo < hi {
+        val mid: i64 = (lo + hi) / 2;
+        val c: i64 = str_compare(s.keys.get(mid), key);
+        if c == 0 {
+            return mid;
+        }
+        if c < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return - lo - 1;
+}
+
+/// The value of fact `key` (0 when it is not set).
+pub fn goap_get(s: &GoapState, key: str) -> i64 {
+    val i: i64 = gp_find(s, key);
+    if i < 0 {
+        return 0;
+    }
+    return s.vals.get(i);
+}
+
+/// Set fact `key` to `value`.
+pub fn goap_set(s: &mut GoapState, key: str, value: i64) {
+    val i: i64 = gp_find(s, key);
+    if i >= 0 {
+        s.vals.set(i, value);
+        return;
+    }
+    val at: i64 = - i - 1;
+    s.keys.insert(at, key);
+    s.vals.insert(at, value);
+}
+
+/// The state as text, "k=v;" per fact in name order (facts equal to 0 are
+/// left out, as a missing fact reads 0).
+pub fn goap_state_key(s: &GoapState) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < s.keys.len() {
+        if s.vals.get(i) != 0 {
+            out = out + s.keys.get(i) + "=" + int_to_str(s.vals.get(i)) + ";";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn gp_copy(s: &GoapState) -> GoapState {
+    var c: GoapState = goap_state();
+    var i: i64 = 0;
+    while i < s.keys.len() {
+        c.keys.push(s.keys.get(i));
+        c.vals.push(s.vals.get(i));
+        i = i + 1;
+    }
+    return c;
+}
+
+// ─── Conditions, actions, goals ───────────────────────────────────────────
+
+pub struct GoapCond {
+    pub key: str,
+    pub op: i64,
+    pub value: i64,
+}
+
+pub struct GoapEffect {
+    pub key: str,
+    pub kind: i64,
+    // GOAP_SET or GOAP_ADD
+    pub value: i64,
+}
+
+pub struct GoapAction {
+    pub name: str,
+    pub cost: f64,
+    pub pre: Vec<GoapCond>,
+    pub effects: Vec<GoapEffect>,
+}
+
+pub fn goap_action(name: str, cost: f64) -> GoapAction {
+    return GoapAction { name: name, cost: cost, pre: Vec::new(), effects: Vec::new() };
+}
+
+/// Add a precondition: fact `key` OP `value`.
+pub fn goap_pre(a: &mut GoapAction, key: str, op: i64, value: i64) {
+    a.pre.push(GoapCond { key: key, op: op, value: value });
+}
+
+/// Add an effect: fact `key` becomes `value`.
+pub fn goap_effect_set(a: &mut GoapAction, key: str, value: i64) {
+    a.effects.push(GoapEffect { key: key, kind: GOAP_SET, value: value });
+}
+
+/// Add an effect: `delta` is added to fact `key`.
+pub fn goap_add(a: &mut GoapAction, key: str, delta: i64) {
+    a.effects.push(GoapEffect { key: key, kind: GOAP_ADD, value: delta });
+}
+
+/// A goal: every condition must hold.
+pub struct GoapGoal {
+    pub conds: Vec<GoapCond>,
+}
+
+pub fn goap_goal() -> GoapGoal {
+    return GoapGoal { conds: Vec::new() };
+}
+
+pub fn goap_goal_add(g: &mut GoapGoal, key: str, op: i64, value: i64) {
+    g.conds.push(GoapCond { key: key, op: op, value: value });
+}
+
+/// Does `c` hold in `s`?
+pub fn goap_cond_holds(s: &GoapState, c: &GoapCond) -> bool {
+    val v: i64 = goap_get(s, c.key);
+    if c.op == GOAP_EQ { return v == c.value; }
+    if c.op == GOAP_NE { return v != c.value; }
+    if c.op == GOAP_LT { return v < c.value; }
+    if c.op == GOAP_LE { return v <= c.value; }
+    if c.op == GOAP_GT { return v > c.value; }
+    return v >= c.value;
+}
+
+fn gp_all_hold(s: &GoapState, conds: &Vec<GoapCond>) -> bool {
+    var i: i64 = 0;
+    while i < conds.len() {
+        val c: GoapCond = conds.get(i);
+        if !goap_cond_holds(s, &c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Number of goal conditions not met in `s`.
+pub fn goap_unmet(s: &GoapState, g: &GoapGoal) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < g.conds.len() {
+        val c: GoapCond = g.conds.get(i);
+        if !goap_cond_holds(s, &c) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Can `a` run in `s`?
+pub fn goap_usable(s: &GoapState, a: &GoapAction) -> bool {
+    return gp_all_hold(s, &a.pre);
+}
+
+/// The state after running `a` in `s`.
+pub fn goap_apply(s: &GoapState, a: &GoapAction) -> GoapState {
+    var n: GoapState = gp_copy(s);
+    var i: i64 = 0;
+    while i < a.effects.len() {
+        val e: GoapEffect = a.effects.get(i);
+        if e.kind == GOAP_SET {
+            goap_set(&mut n, e.key, e.value);
+        } else {
+            goap_set(&mut n, e.key, goap_get(&n, e.key) + e.value);
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ─── A* planner ───────────────────────────────────────────────────────────
+
+pub struct GoapPlan {
+    pub ok: bool,
+    pub actions: Vec<str>,
+    // action names, in order
+    pub cost: f64,
+    pub expanded: i64,  // nodes taken off the open list
+}
+
+struct GpNode {
+    state: GoapState,
+    g: f64,
+    f: f64,
+    parent: i64,
+    action: i64,
+    closed: bool,
+}
+
+/// The cheapest sequence of `actions` that takes `start` to a state where
+/// `goal` holds. Gives up (ok false) after `max_nodes` expansions or when
+/// every reachable state has been tried.
+pub fn goap_plan(start: &GoapState, goal: &GoapGoal, actions: &Vec<GoapAction>, max_nodes: i64) -> GoapPlan {
+    var min_cost: f64 = 0.0;
+    var max_eff: i64 = 1;
+    var i: i64 = 0;
+    while i < actions.len() {
+        val a: GoapAction = actions.get(i);
+        if i == 0 || a.cost < min_cost {
+            min_cost = a.cost;
+        }
+        if a.effects.len() > max_eff {
+            max_eff = a.effects.len();
+        }
+        i = i + 1;
+    }
+    var nodes: Vec<GpNode> = Vec::new();
+    var index: HashMap<str, i64> = HashMap::new();
+    val h0: f64 = (((goap_unmet(start, goal) + max_eff - 1) / max_eff) as f64) * min_cost;
+    nodes.push(GpNode { state: gp_copy(start), g: 0.0, f: h0, parent: - 1, action: - 1, closed: false });
+    index.insert(goap_state_key(start), 0);
+    var expanded: i64 = 0;
+    while expanded < max_nodes {
+        // the open node with the lowest f (oldest first on ties)
+        var best: i64 = - 1;
+        var bf: f64 = 0.0;
+        var k: i64 = 0;
+        while k < nodes.len() {
+            val nd: GpNode = nodes.get(k);
+            if !nd.closed && (best < 0 || nd.f < bf) {
+                best = k;
+                bf = nd.f;
+            }
+            k = k + 1;
+        }
+        if best < 0 {
+            break;
+        }
+        var cur: GpNode = nodes.get(best);
+        cur.closed = true;
+        nodes.set(best, cur);
+        expanded = expanded + 1;
+        if goap_unmet(&cur.state, goal) == 0 {
+            var names: Vec<str> = Vec::new();
+            var at: i64 = best;
+            while nodes.get(at).parent >= 0 {
+                names.insert(0, actions.get(nodes.get(at).action).name);
+                at = nodes.get(at).parent;
+            }
+            return GoapPlan { ok: true, actions: names, cost: cur.g, expanded: expanded };
+        }
+        var ai: i64 = 0;
+        while ai < actions.len() {
+            val a: GoapAction = actions.get(ai);
+            if goap_usable(&cur.state, &a) {
+                val next: GoapState = goap_apply(&cur.state, &a);
+                val key: str = goap_state_key(&next);
+                val g: f64 = cur.g + a.cost;
+                val h: f64 = (((goap_unmet(&next, goal) + max_eff - 1) / max_eff) as f64) * min_cost;
+                if index.contains(key) {
+                    val j: i64 = index.get(key);
+                    var old: GpNode = nodes.get(j);
+                    if g < old.g {
+                        old.g = g;
+                        old.f = g + h;
+                        old.parent = best;
+                        old.action = ai;
+                        old.closed = false;
+                        nodes.set(j, old);
+                    }
+                } else {
+                    index.insert(key, nodes.len());
+                    nodes.push(GpNode { state: next, g: g, f: g + h, parent: best, action: ai, closed: false });
+                }
+            }
+            ai = ai + 1;
+        }
+    }
+    return GoapPlan { ok: false, actions: Vec::new(), cost: 0.0, expanded: expanded };
+}
+
+/// Run a plan's actions in order from `start` (a check that the plan works:
+/// each action's preconditions must hold when it runs). The final state,
+/// or the state where an action could not run when `ok` is false.
+pub struct GoapRun {
+    pub ok: bool,
+    pub state: GoapState,
+    pub failed_at: i64,
+}
+
+pub fn goap_simulate(start: &GoapState, plan: &GoapPlan, actions: &Vec<GoapAction>) -> GoapRun {
+    var s: GoapState = gp_copy(start);
+    var i: i64 = 0;
+    while i < plan.actions.len() {
+        val name: str = plan.actions.get(i);
+        var found: i64 = - 1;
+        var k: i64 = 0;
+        while k < actions.len() {
+            if actions.get(k).name == name {
+                found = k;
+                break;
+            }
+            k = k + 1;
+        }
+        if found < 0 {
+            return GoapRun { ok: false, state: s, failed_at: i };
+        }
+        val a: GoapAction = actions.get(found);
+        if !goap_usable(&s, &a) {
+            return GoapRun { ok: false, state: s, failed_at: i };
+        }
+        s = goap_apply(&s, &a);
+        i = i + 1;
+    }
+    return GoapRun { ok: true, state: s, failed_at: - 1 };
+}

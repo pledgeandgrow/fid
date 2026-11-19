@@ -1,0 +1,79 @@
+// Yields that hand the worker straight to the next task (complaint CP5,
+// stdlib/pe_runtime/conc.fd pe_co_handoff): tasks with different numbers of
+// yields finish in the middle of each other's chains, async calls (entered
+// by their caller, so they yield the scheduler's way) mix with plain yields,
+// and every result still arrives once. Natively, run it also with
+// FIDES_WORKERS=1, where the worker's queue is used without its lock.
+use task;
+
+fn uneven(n: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        total = total + i;
+        task_yield();
+        i = i + 1;
+    }
+    return total;
+}
+
+async fn step(x: i64) -> Future<i64> {
+    task_yield();
+    return x * 3;
+}
+
+fn chained(n: i64) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        acc = acc + (await step(i));
+        task_yield();
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i64 {
+    var ids: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 200 {
+        ids.push(task_go("uneven", i % 17));
+        i = i + 1;
+    }
+    var cs: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 20 {
+        cs.push(task_go("chained", i));
+        i = i + 1;
+    }
+    println(task_run());
+    var sum: i64 = 0;
+    i = 0;
+    while i < ids.len() {
+        sum = sum + task_result(ids.get(i));
+        i = i + 1;
+    }
+    println(sum);
+    var csum: i64 = 0;
+    i = 0;
+    while i < cs.len() {
+        csum = csum + task_result(cs.get(i));
+        i = i + 1;
+    }
+    println(csum);
+    var done: i64 = 0;
+    i = 0;
+    while i < ids.len() {
+        if task_done(ids.get(i)) {
+            done = done + 1;
+        }
+        i = i + 1;
+    }
+    println(done);
+    return 0;
+}
+// Expected output:
+// 410
+// 7766
+// 3420
+// 200

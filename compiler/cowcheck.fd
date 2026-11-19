@@ -10,8 +10,7 @@
 // not a type rule: a copy that is meant to be a copy is reported too. Each
 // report names the local, the place it was copied from and the change.
 
-use core; use vec; use string; use compiler::ast;
- struct CowCopy {
+use core; use vec; use string; use compiler::ast; struct CowCopy {
     name: str,
     src: str,
     line: i64,
@@ -675,8 +674,7 @@ fn cow_inner_use(e: Expr, name: str) -> bool {
 /// COW_MANY when one use may run more than once (inside a loop), when the
 /// variable is assigned, borrowed with `&`, captured by a closure or
 /// shadowed, or when a construct is not looked into.
-pub const COW_MANY: i64 = 1000;
- fn cow_add(a: i64, b: i64) -> i64 {
+pub const COW_MANY: i64 = 1000; fn cow_add(a: i64, b: i64) -> i64 {
     if a >= COW_MANY || b >= COW_MANY {
         return COW_MANY;
     }
@@ -969,4 +967,347 @@ pub fn cow_uses_expr(e: Expr, name: str) -> i64 {
     }
     // f-strings, try blocks, spawn, asm, comptime: not looked into
     return COW_MANY;
+}
+
+// --- SP12: every name cow_uses_stmt counts, in one walk ----------------------
+//
+// `cow_uses_stmt(s, name) != 0` holds exactly when cow_names_stmt(s, out)
+// pushed `name` onto `out` or returned true ("every name": a
+// statement or expression cow_uses_stmt does not look into counts COW_MANY
+// for any name). cow_add, cow_loop and the Ref / Closure rules never turn a
+// nonzero count into 0, nor 0 into nonzero, so only which names occur
+// matters. The lowering (lower.fd Lowerer_last_use) asked cow_uses_stmt of
+// every statement after a variable's use, once per kept variable: a walk of
+// the rest of the function each time. Keep these in step with cow_uses_*:
+// a construct cow_uses_* counts for no name returns 0 here too, one it does
+// not look into returns true.
+
+/// Names `s` uses (cow_uses_stmt != 0) pushed onto `out` (a name may come
+/// more than once); true when every name counts.
+pub fn cow_names_stmt(s: Stmt, out: & mut Vec<str>) -> bool {
+    match s {
+        Stmt::Let(n2, _, e, _, _, _, _) => {
+            out.push(n2);
+            return cow_names_expr(e, out);
+        }
+        Stmt::LetTuple(ns, e, _) => {
+            var k: i64 = 0;
+            while k < ns.len() {
+                out.push(ns.get(k));
+                k = k + 1;
+            }
+            return cow_names_expr(e, out);
+        }
+        Stmt::LetUninit(n3, _, _, _) => {
+            out.push(n3);
+            return false;
+        }
+        Stmt::Assign(t, _, e, _) => {
+            out.push(t);
+            return cow_names_expr(e, out);
+        }
+        Stmt::IndexAssign(t2, idx, _, e2, _) => {
+            out.push(t2);
+            var a1: bool = cow_names_expr(idx, out);
+            var a2: bool = cow_names_expr(e2, out);
+            return a1 || a2;
+        }
+        Stmt::DerefAssign(pe, _, e3, _) => {
+            var b1: bool = cow_names_expr(pe, out);
+            var b2: bool = cow_names_expr(e3, out);
+            return b1 || b2;
+        }
+        Stmt::FieldAssign(obj, _, _, e4, _) => {
+            var c1: bool = cow_names_expr(obj, out);
+            var c2: bool = cow_names_expr(e4, out);
+            return c1 || c2;
+        }
+        Stmt::Expr(e5, _) => {
+            return cow_names_expr(e5, out);
+        }
+        Stmt::Return(oe, _) => {
+            match oe {
+                OptBoxExpr::Some(re) => {
+                    return cow_names_expr(box_expr_unbox(re), out);
+                }
+                OptBoxExpr::None => {
+                }
+            }
+            return false;
+        }
+        Stmt::Break(ob, _) => {
+            match ob {
+                OptBoxExpr::Some(be) => {
+                    return cow_names_expr(box_expr_unbox(be), out);
+                }
+                OptBoxExpr::None => {
+                }
+            }
+            return false;
+        }
+        Stmt::Continue(_) => {
+            return false;
+        }
+        Stmt::Use(_, _, _) => {
+            return false;
+        }
+        Stmt::CancelScope(_) => {
+            return false;
+        }
+        Stmt::If(c, tb, eb, _) => {
+            var d1: bool = cow_names_expr(c, out);
+            var d2: bool = cow_names_stmts(tb, out);
+            var d3: bool = false;
+            match eb {
+                OptStmts::Some(b) => {
+                    d3 = cow_names_stmts(b, out);
+                }
+                OptStmts::None => {
+                }
+            }
+            return d1 || d2 || d3;
+        }
+        Stmt::While(c2, b, _) => {
+            var w1: bool = cow_names_expr(c2, out);
+            var w2: bool = cow_names_stmts(b, out);
+            return w1 || w2;
+        }
+        Stmt::For(fv, it, b2, _) => {
+            out.push(fv);
+            var f1: bool = cow_names_expr(it, out);
+            var f2: bool = cow_names_stmts(b2, out);
+            return f1 || f2;
+        }
+        Stmt::Loop(b3, _) => {
+            return cow_names_stmts(b3, out);
+        }
+        Stmt::Match(me, arms, _) => {
+            var all: bool = cow_names_expr(me, out);
+            var a: i64 = 0;
+            while a < arms.len() {
+                if cow_names_stmts(arms.get(a).body, out) {
+                    all = true;
+                }
+                a = a + 1;
+            }
+            return all;
+        }
+        Stmt::RegionBlock(_, _, _, _, _, rb, _) => {
+            return cow_names_stmts(rb, out);
+        }
+        Stmt::Unsafe(ub, _) => {
+            return cow_names_stmts(ub, out);
+        }
+        Stmt::Sandbox(sb, _) => {
+            return cow_names_stmts(sb, out);
+        }
+        _ => {
+        }
+    }
+    // what cow_uses_stmt does not look into
+    return true;
+}
+
+/// cow_names_stmt into a raw map: each name `s` uses -> `v`. True when
+/// every name counts.
+pub fn cow_names_into(s: Stmt, m: i64, v: i64) -> bool {
+    var names: Vec<str> = Vec::new();
+    var all: bool = cow_names_stmt(s, & mut names);
+    var i: i64 = 0;
+    while i < names.len() {
+        HashMap_insert(m, names.get(i), v);
+        i = i + 1;
+    }
+    return all;
+}
+
+/// The value cow_names_into put into `m` for `name` (0: none).
+pub fn cow_names_get(m: i64, name: str) -> i64 {
+    return HashMap_get(m, name);
+}
+
+/// cow_names_stmt over a statement list (cow_uses_stmts).
+pub fn cow_names_stmts(stmts: Vec<Stmt>, out: & mut Vec<str>) -> bool {
+    var all: bool = false;
+    var i: i64 = 0;
+    while i < stmts.len() {
+        if cow_names_stmt(stmts.get(i), out) {
+            all = true;
+        }
+        i = i + 1;
+    }
+    return all;
+}
+
+/// cow_names_expr over expressions (cow_uses_exprs).
+fn cow_names_exprs(es: Vec<Expr>, out: & mut Vec<str>) -> bool {
+    var all: bool = false;
+    var i: i64 = 0;
+    while i < es.len() {
+        if cow_names_expr(es.get(i), out) {
+            all = true;
+        }
+        i = i + 1;
+    }
+    return all;
+}
+
+/// Names `e` uses (cow_uses_expr != 0) pushed onto `out`; true when every
+/// name counts.
+pub fn cow_names_expr(e: Expr, out: & mut Vec<str>) -> bool {
+    match e {
+        Expr::IntLit(_) => {
+            return false;
+        }
+        Expr::FloatLit(_) => {
+            return false;
+        }
+        Expr::StringLit(_) => {
+            return false;
+        }
+        Expr::BoolLit(_) => {
+            return false;
+        }
+        Expr::ComptimeReflect(_, _) => {
+            return false;
+        }
+        Expr::Ident(n) => {
+            out.push(n);
+            return false;
+        }
+        Expr::Binary(_, l, r) => {
+            var b1: bool = cow_names_expr(box_expr_unbox(l), out);
+            var b2: bool = cow_names_expr(box_expr_unbox(r), out);
+            return b1 || b2;
+        }
+        Expr::Unary(_, x) => {
+            return cow_names_expr(box_expr_unbox(x), out);
+        }
+        Expr::Call(_, args) => {
+            return cow_names_exprs(args, out);
+        }
+        Expr::FieldAccess(o, _) => {
+            return cow_names_expr(box_expr_unbox(o), out);
+        }
+        Expr::OptionalFieldAccess(o2, _) => {
+            return cow_names_expr(box_expr_unbox(o2), out);
+        }
+        Expr::StructLit(_, fields, spread) => {
+            var all: bool = false;
+            var fi: i64 = 0;
+            while fi < fields.len() {
+                if cow_names_expr(fields.get(fi).value, out) {
+                    all = true;
+                }
+                fi = fi + 1;
+            }
+            match spread {
+                OptBoxExpr::Some(sp) => {
+                    if cow_names_expr(box_expr_unbox(sp), out) {
+                        all = true;
+                    }
+                }
+                OptBoxExpr::None => {
+                }
+            }
+            return all;
+        }
+        Expr::If(c, tb, eb) => {
+            var i1: bool = cow_names_expr(box_expr_unbox(c), out);
+            var i2: bool = cow_names_stmts(tb, out);
+            var i3: bool = false;
+            match eb {
+                OptStmts::Some(b) => {
+                    i3 = cow_names_stmts(b, out);
+                }
+                OptStmts::None => {
+                }
+            }
+            return i1 || i2 || i3;
+        }
+        Expr::Range(a, b, _) => {
+            var r1: bool = cow_names_expr(box_expr_unbox(a), out);
+            var r2: bool = cow_names_expr(box_expr_unbox(b), out);
+            return r1 || r2;
+        }
+        Expr::Block(bs) => {
+            return cow_names_stmts(bs, out);
+        }
+        Expr::MethodCall(rc, _, margs) => {
+            var m1: bool = cow_names_expr(box_expr_unbox(rc), out);
+            var m2: bool = cow_names_exprs(margs, out);
+            return m1 || m2;
+        }
+        Expr::ArrayLit(_, els) => {
+            return cow_names_exprs(els, out);
+        }
+        Expr::Index(ia, ib) => {
+            var x1: bool = cow_names_expr(box_expr_unbox(ia), out);
+            var x2: bool = cow_names_expr(box_expr_unbox(ib), out);
+            return x1 || x2;
+        }
+        Expr::Match(me, arms) => {
+            var all2: bool = cow_names_expr(box_expr_unbox(me), out);
+            var ai: i64 = 0;
+            while ai < arms.len() {
+                if cow_names_stmts(arms.get(ai).body, out) {
+                    all2 = true;
+                }
+                ai = ai + 1;
+            }
+            return all2;
+        }
+        Expr::EnumLit(_, _, eargs) => {
+            return cow_names_exprs(eargs, out);
+        }
+        Expr::Ref(rx, _) => {
+            return cow_names_expr(box_expr_unbox(rx), out);
+        }
+        Expr::Deref(dx) => {
+            return cow_names_expr(box_expr_unbox(dx), out);
+        }
+        Expr::StrConcat(sl, sr) => {
+            var s1: bool = cow_names_expr(box_expr_unbox(sl), out);
+            var s2: bool = cow_names_expr(box_expr_unbox(sr), out);
+            return s1 || s2;
+        }
+        Expr::Try(tx) => {
+            return cow_names_expr(box_expr_unbox(tx), out);
+        }
+        Expr::Coalesce(ca, cb) => {
+            var c1: bool = cow_names_expr(box_expr_unbox(ca), out);
+            var c2: bool = cow_names_expr(box_expr_unbox(cb), out);
+            return c1 || c2;
+        }
+        Expr::IsCheck(ix, _) => {
+            return cow_names_expr(box_expr_unbox(ix), out);
+        }
+        Expr::TupleLit(tels) => {
+            return cow_names_exprs(tels, out);
+        }
+        Expr::Closure(_, cbody, _) => {
+            return cow_names_stmts(cbody, out);
+        }
+        Expr::Cast(cx, _) => {
+            return cow_names_expr(box_expr_unbox(cx), out);
+        }
+        Expr::QuantCast(qx, _) => {
+            return cow_names_expr(box_expr_unbox(qx), out);
+        }
+        Expr::Await(ax) => {
+            return cow_names_expr(box_expr_unbox(ax), out);
+        }
+        Expr::NamedArg(_, nx) => {
+            return cow_names_expr(box_expr_unbox(nx), out);
+        }
+        Expr::PipeForward(pa, pb) => {
+            var p1: bool = cow_names_expr(box_expr_unbox(pa), out);
+            var p2: bool = cow_names_expr(box_expr_unbox(pb), out);
+            return p1 || p2;
+        }
+        _ => {
+        }
+    }
+    // what cow_uses_expr does not look into
+    return true;
 }

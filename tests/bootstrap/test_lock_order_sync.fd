@@ -1,0 +1,56 @@
+// Complaint roadmap CA4: lock order checked across the call graph, through
+// stdlib/sync. The three locks are always taken in the order A, B, C:
+// directly with a `defer`red unlock (`a_then_b`), with a rwlock
+// (`b_then_c`), and around a function by with_lock/with_read_lock. `main`
+// holds C while it spawns `a_then_b`, but a spawned call starts in a new
+// thread with no lock held, so that is no C -> A edge (which with
+// `b_then_c`'s B -> C would close a cycle). The program is accepted.
+// Expected output:
+// 1
+// 2
+// 4
+// 1
+// done
+
+use sync;
+
+var A: i64 = 0;
+var B: i64 = 0;
+var C: i64 = 0;
+
+fn a_then_b() -> i64 {
+    sync_mutex_lock(A);
+    defer {
+        sync_mutex_unlock(A);
+    }
+    sync_mutex_lock(B);
+    sync_mutex_unlock(B);
+    return 1;
+}
+
+fn b_then_c() -> i64 {
+    sync_mutex_lock(B);
+    sync_rwlock_write_lock(C);
+    sync_rwlock_write_unlock(C);
+    sync_mutex_unlock(B);
+    return 2;
+}
+
+fn four() -> i64 {
+    return 4;
+}
+
+fn main() {
+    A = sync_mutex_create();
+    B = sync_mutex_create();
+    C = sync_rwlock_create();
+    println(int_to_str(a_then_b()));
+    println(int_to_str(with_lock(A, b_then_c)));
+    println(int_to_str(with_read_lock(C, four)));
+    sync_rwlock_write_lock(C);
+    val t = spawn a_then_b();
+    sync_rwlock_write_unlock(C);
+    val r: i64 = await t;
+    println(int_to_str(r));
+    println("done");
+}

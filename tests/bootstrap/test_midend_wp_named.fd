@@ -1,0 +1,50 @@
+// WP7, WP15 (native mid-end, compiler/iropt.fd iro_conv_pinned and
+// iro_env_trim, compiler/ir.fd IrModule_dead_function_elimination; both
+// passes on by default since Nov 17): task entries are looked up by name
+// at run time and called with the env slot first. `triple` is also called
+// directly, which alone would let envtrim drop its unused env; `twin` is
+// named only inside entry_name and called by no instruction, which alone
+// would let deadf remove it. Both must stay as they are. The program
+// prints the same with FID_IROPT_OFF=envtrim,deadf, through pe_ir and
+// `--nat`. (A name held only by a global's string initializer is kept by
+// the mid-end too, ir.fd ir_data_named_fns, but the native backends do
+// not put such names in their run-time table yet: task_go panics "no such
+// function" there with every pass off, so it is not tested here.)
+//
+// Expected output:
+// 21
+// 6
+// 10
+// 20
+
+use task;
+
+fn triple(x: i64) -> i64 {
+    return x * 3;
+}
+
+fn twin(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn quad(x: i64) -> i64 {
+    return x * 4;
+}
+
+fn entry_name(k: i64) -> str {
+    if k == 0 {
+        return "triple";
+    }
+    return "twin";
+}
+
+fn main() -> i64 {
+    val t = task_go(entry_name(0), 7);
+    val u = task_go(entry_name(1), 5);
+    task_run();
+    println(task_result(t));
+    println(triple(2));
+    println(task_result(u));
+    println(quad(5));
+    return 0;
+}

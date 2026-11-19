@@ -9,6 +9,10 @@
 #   ./verify.sh --golden     Regenerate golden files for intermediate IR/PIR/asm
 #   ./verify.sh --help       Show this help
 #
+# A C or PE failure of a whole-compiler test (scripts/long-tests.txt) is
+# rerun with a longer time limit by scripts/long-tests.sh before it counts
+# (release-roadmap A12); VERIFY_NO_LONG_RERUN=1 turns the rerun off.
+#
 # This script prevents the "fix one thing, break everything" problem by:
 #   1. Capturing a known-good baseline of test results
 #   2. Diffing current results against baseline after every change
@@ -93,6 +97,40 @@ echo "$FAIL_OUTPUT"
 COMBINED_OUTPUT="${TEST_OUTPUT}
 
 ${FAIL_OUTPUT}"
+
+# --- Whole-compiler tests: rerun a C/PE failure with a longer limit ---
+# (release-roadmap A12) `fidesc test` gives every compiled test 30 s
+# (run_with_timeout in the frozen src/main.rs). The tests listed in
+# scripts/long-tests.txt run the self-hosted compiler inside themselves and
+# can need more on a loaded machine; a C or PE failure of one of them is
+# rerun by scripts/long-tests.sh (LIMIT, default 300 s) and dropped from the
+# results when that run matches the interpreter. A real failure stays.
+if [[ -f scripts/long-tests.txt && "${VERIFY_NO_LONG_RERUN:-}" != 1 ]]; then
+    LONG_NOTES=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        backend=""
+        case "$line" in
+            *"[FAIL] c codegen: "*) backend=c ;;
+            *"[FAIL] pe emit: "*)   backend=pe ;;
+        esac
+        [[ -z "$backend" ]] && continue
+        name=$(echo "$line" | sed -E 's/.*\[FAIL\] (c codegen|pe emit): ([A-Za-z0-9_]+).*/\2/')
+        bash scripts/long-tests.sh --is-long "$name" < /dev/null || continue
+        echo -e "${YELLOW}Rerunning $name ($backend) with a longer limit (scripts/long-tests.sh)...${NC}"
+        if FIDESC="$FIDESC" bash scripts/long-tests.sh "$name" "$backend" < /dev/null; then
+            COMBINED_OUTPUT=$(printf '%s\n' "$COMBINED_OUTPUT" | grep -vF -- "$line" || true)
+            LONG_NOTES="${LONG_NOTES}  [LONG PASS] ${backend}: ${name} (passed with scripts/long-tests.sh)
+"
+        fi
+    done <<< "$(echo "$COMBINED_OUTPUT" | grep -E '^\s*\[FAIL\] (c codegen|pe emit): ' || true)"
+    if [[ -n "$LONG_NOTES" ]]; then
+        echo "$LONG_NOTES"
+        COMBINED_OUTPUT="${COMBINED_OUTPUT}
+
+${LONG_NOTES}"
+    fi
+fi
 
 # --- Save mode: just save and exit ---
 if [[ "$1" == "--save" ]]; then

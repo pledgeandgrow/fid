@@ -1,0 +1,1286 @@
+// Fides packet decoding and building, pure Fides
+//
+// The headers a packet capture holds, decoded from bytes and built back:
+//   Ethernet II (with 802.1Q / 802.1ad VLAN tags), ARP (RFC 826), IPv4
+//   (RFC 791, header checksum), IPv6 (RFC 8200, extension headers skipped
+//   to the upper layer), ICMP (RFC 792), ICMPv6 (RFC 4443, checksum over
+//   the IPv6 pseudo-header), TCP (RFC 9293: options, checksum with the
+//   IPv4 or IPv6 pseudo-header), UDP (RFC 768) and the DNS header and
+//   question section (RFC 1035, with name compression).
+// A dissector (`pkt_dissect`) walks an Ethernet frame and returns one line
+// per layer. Addresses print as aa:bb:cc:dd:ee:ff, dotted quads and
+// RFC 5952 IPv6 text.
+//
+// Everything is real computation over byte vectors (Vec<i64>, 0..255);
+// there is no platform seam (capture packets with a pcap file or a raw
+// socket elsewhere and pass the bytes).
+//
+// Usage:
+//   val ip: Ipv4Hdr = ipv4_decode(bytes, 14);
+//   if ip.ok && ip.checksum_ok { ... }
+//   val seg: Vec<i64> = tcp_build_v4(src, dst, tcp, payload);  // checksum set
+//   val lines: Vec<str> = pkt_dissect(frame);
+
+module packet;
+ use vec;
+
+pub const ETH_IPV4: i64 = 0x0800;
+pub const ETH_ARP: i64 = 0x0806;
+pub const ETH_IPV6: i64 = 0x86DD;
+pub const ETH_VLAN: i64 = 0x8100;
+pub const ETH_QINQ: i64 = 0x88A8;
+pub const IP_ICMP: i64 = 1;
+pub const IP_TCP: i64 = 6;
+pub const IP_UDP: i64 = 17;
+pub const IP_ICMPV6: i64 = 58;
+
+pub const TCP_FIN: i64 = 1;
+pub const TCP_SYN: i64 = 2;
+pub const TCP_RST: i64 = 4;
+pub const TCP_PSH: i64 = 8;
+pub const TCP_ACK: i64 = 16;
+pub const TCP_URG: i64 = 32;
+
+// ─── bytes ──────────────────────────────────────────────────────────────
+
+fn pk_u16(b: & Vec<i64>, o: i64) -> i64 {
+    return ((b.get(o) & 255) << 8) | (b.get(o + 1) & 255);
+}
+
+fn pk_u32(b: & Vec<i64>, o: i64) -> i64 {
+    return (pk_u16(b, o) << 16) | pk_u16(b, o + 2);
+}
+
+fn pk_put16(o: & mut Vec<i64>, v: i64) {
+    o.push((v >> 8) & 255);
+    o.push(v & 255);
+}
+
+fn pk_put32(o: & mut Vec<i64>, v: i64) {
+    pk_put16(o, (v >> 16) & 65535);
+    pk_put16(o, v & 65535);
+}
+
+fn pk_take(b: & Vec<i64>, o: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n && o + i < b.len() {
+        out.push(b.get(o + i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pk_append(o: & mut Vec<i64>, v: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < v.len() {
+        o.push(v.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+fn pk_hex2(b: i64) -> str {
+    val d: str = "0123456789abcdef";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+/// 0x-prefixed lowercase hex of a 16-bit value, four digits.
+pub fn pk_hex16(v: i64) -> str {
+    return "0x" + pk_hex2((v >> 8) & 255) + pk_hex2(v & 255);
+}
+
+// ─── checksums and addresses ────────────────────────────────────────────
+
+/// One's-complement sum of `b` as 16-bit words (odd length: a zero pad),
+/// added to `start` and folded to 16 bits (not inverted).
+pub fn inet_sum(b: & Vec<i64>, start: i64) -> i64 {
+    var s: i64 = start;
+    var i: i64 = 0;
+    while i + 1 < b.len() {
+        s = s + pk_u16(b, i);
+        i = i + 2;
+    }
+    if i < b.len() {
+        s = s + ((b.get(i) & 255) << 8);
+    }
+    while s > 65535 {
+        s = (s & 65535) + (s >> 16);
+    }
+    return s;
+}
+
+/// The Internet checksum (RFC 1071) of `b`.
+pub fn inet_checksum(b: & Vec<i64>) -> i64 {
+    return (~inet_sum(b, 0)) & 65535;
+}
+
+fn pk_pseudo4(src: & Vec<i64>, dst: & Vec<i64>, proto: i64, len: i64) -> i64 {
+    var p: Vec<i64> = Vec::new();
+    pk_append(& mut p, src);
+    pk_append(& mut p, dst);
+    p.push(0);
+    p.push(proto);
+    pk_put16(& mut p, len);
+    return inet_sum(& p, 0);
+}
+
+fn pk_pseudo6(src: & Vec<i64>, dst: & Vec<i64>, next: i64, len: i64) -> i64 {
+    var p: Vec<i64> = Vec::new();
+    pk_append(& mut p, src);
+    pk_append(& mut p, dst);
+    pk_put32(& mut p, len);
+    p.push(0);
+    p.push(0);
+    p.push(0);
+    p.push(next);
+    return inet_sum(& p, 0);
+}
+
+/// The upper-layer checksum of `seg` (its checksum field zero or not: the
+/// caller zeroes it when building) over the IPv4 pseudo-header.
+pub fn pk_checksum_v4(src: & Vec<i64>, dst: & Vec<i64>, proto: i64, seg: & Vec<i64>) -> i64 {
+    return (~inet_sum(seg, pk_pseudo4(src, dst, proto, seg.len()))) & 65535;
+}
+
+/// The upper-layer checksum of `seg` over the IPv6 pseudo-header.
+pub fn pk_checksum_v6(src: & Vec<i64>, dst: & Vec<i64>, next: i64, seg: & Vec<i64>) -> i64 {
+    return (~inet_sum(seg, pk_pseudo6(src, dst, next, seg.len()))) & 65535;
+}
+
+/// aa:bb:cc:dd:ee:ff
+pub fn mac_to_str(m: & Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < m.len() {
+        if i > 0 {
+            s = s + ":";
+        }
+        s = s + pk_hex2(m.get(i) & 255);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Parse aa:bb:cc:dd:ee:ff (or with '-'); [] when malformed.
+pub fn mac_parse(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var nd: i64 = 0;
+    var i: i64 = 0;
+    while i <= str_len(s) {
+        var c: i64 = 58;
+        if i < str_len(s) {
+            c = str_byte_at(s, i);
+        }
+        if c == 58 || c == 45 {
+            if nd == 0 || nd > 2 {
+                return Vec::new();
+            }
+            out.push(cur);
+            cur = 0;
+            nd = 0;
+        } else {
+            var d: i64 = - 1;
+            if c >= 48 && c <= 57 { d = c - 48; }
+            if c >= 97 && c <= 102 { d = c - 87; }
+            if c >= 65 && c <= 70 { d = c - 55; }
+            if d < 0 {
+                return Vec::new();
+            }
+            cur = cur * 16 + d;
+            nd = nd + 1;
+        }
+        i = i + 1;
+    }
+    if out.len() != 6 {
+        return Vec::new();
+    }
+    return out;
+}
+
+/// 192.168.0.1
+pub fn ipv4_to_str(a: & Vec<i64>) -> str {
+    return int_to_str(a.get(0)) + "." + int_to_str(a.get(1)) + "." + int_to_str(a.get(2)) + "." + int_to_str(a.get(3));
+}
+
+/// Parse a dotted quad; [] when malformed.
+pub fn ipv4_parse(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var nd: i64 = 0;
+    var i: i64 = 0;
+    while i <= str_len(s) {
+        var c: i64 = 46;
+        if i < str_len(s) {
+            c = str_byte_at(s, i);
+        }
+        if c == 46 {
+            if nd == 0 || cur > 255 {
+                return Vec::new();
+            }
+            out.push(cur);
+            cur = 0;
+            nd = 0;
+        } else if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48);
+            nd = nd + 1;
+            if nd > 3 {
+                return Vec::new();
+            }
+        } else {
+            return Vec::new();
+        }
+        i = i + 1;
+    }
+    if out.len() != 4 {
+        return Vec::new();
+    }
+    return out;
+}
+
+/// RFC 5952 text of a 16-byte IPv6 address (lowercase, the longest run of
+/// two or more zero groups as "::", the first such run on a tie).
+pub fn ipv6_to_str(a: & Vec<i64>) -> str {
+    var g: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        g.push(pk_u16(a, i * 2));
+        i = i + 1;
+    }
+    var best: i64 = - 1;
+    var blen: i64 = 0;
+    i = 0;
+    while i < 8 {
+        if g.get(i) == 0 {
+            var j: i64 = i;
+            while j < 8 && g.get(j) == 0 {
+                j = j + 1;
+            }
+            if j - i > blen && j - i >= 2 {
+                best = i;
+                blen = j - i;
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    var s: str = "";
+    i = 0;
+    while i < 8 {
+        if i == best {
+            s = s + "::";
+            i = i + blen;
+        } else {
+            if i > 0 && i != best + blen {
+                s = s + ":";
+            }
+            s = s + int_to_hex(g.get(i));
+            i = i + 1;
+        }
+    }
+    return s;
+}
+
+fn pk_hexval(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return - 1;
+}
+
+fn pk_groups(s: str) -> Vec<i64> {
+    // hex groups separated by ':'; [-1] when malformed; [] for ""
+    var out: Vec<i64> = Vec::new();
+    if str_len(s) == 0 {
+        return out;
+    }
+    val parts: Vec<str> = str_split(s, ":");
+    var i: i64 = 0;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        if str_len(p) == 0 || str_len(p) > 4 {
+            var bad: Vec<i64> = Vec::new();
+            bad.push(- 1);
+            return bad;
+        }
+        var v: i64 = 0;
+        var k: i64 = 0;
+        while k < str_len(p) {
+            val d: i64 = pk_hexval(str_byte_at(p, k));
+            if d < 0 {
+                var bad2: Vec<i64> = Vec::new();
+                bad2.push(- 1);
+                return bad2;
+            }
+            v = v * 16 + d;
+            k = k + 1;
+        }
+        out.push(v);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse IPv6 text (with "::"; no embedded IPv4); [] when malformed.
+pub fn ipv6_parse(s: str) -> Vec<i64> {
+    var head: Vec<i64> = Vec::new();
+    var tail: Vec<i64> = Vec::new();
+    val dc: i64 = str_find(s, "::");
+    if dc >= 0 {
+        head = pk_groups(str_slice(s, 0, dc));
+        tail = pk_groups(str_slice(s, dc + 2, str_len(s)));
+        if str_find(str_slice(s, dc + 2, str_len(s)), "::") >= 0 {
+            return Vec::new();
+        }
+    } else {
+        head = pk_groups(s);
+    }
+    if (head.len() > 0 && head.get(0) < 0) || (tail.len() > 0 && tail.get(0) < 0) {
+        return Vec::new();
+    }
+    val n: i64 = head.len() + tail.len();
+    if (dc < 0 && n != 8) || (dc >= 0 && n > 7) {
+        return Vec::new();
+    }
+    var g: Vec<i64> = head;
+    while g.len() + tail.len() < 8 {
+        g.push(0);
+    }
+    var i: i64 = 0;
+    while i < tail.len() {
+        g.push(tail.get(i));
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 {
+        pk_put16(& mut out, g.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Ethernet ───────────────────────────────────────────────────────────
+
+/// An Ethernet II header. `vlans` holds each 802.1Q/802.1ad tag's TCI
+/// (priority << 13 | DEI << 12 | VLAN id), outermost first; `ethertype` is
+/// the type after the tags; `payload` the offset of the next header.
+pub struct EthHdr {
+    pub ok: bool,
+    pub dst: Vec<i64>,
+    pub src: Vec<i64>,
+    pub vlans: Vec<i64>,
+    pub ethertype: i64,
+    pub payload: i64,
+}
+
+pub fn eth_decode(b: & Vec<i64>) -> EthHdr {
+    var h: EthHdr = EthHdr { ok: false, dst: Vec::new(), src: Vec::new(), vlans: Vec::new(), ethertype: 0, payload: 0 };
+    if b.len() < 14 {
+        return h;
+    }
+    h.dst = pk_take(b, 0, 6);
+    h.src = pk_take(b, 6, 6);
+    var o: i64 = 12;
+    var t: i64 = pk_u16(b, o);
+    while (t == ETH_VLAN || t == ETH_QINQ) && o + 6 <= b.len() {
+        h.vlans.push(pk_u16(b, o + 2));
+        o = o + 4;
+        t = pk_u16(b, o);
+    }
+    h.ethertype = t;
+    h.payload = o + 2;
+    h.ok = h.payload <= b.len();
+    return h;
+}
+
+/// An Ethernet II frame; `vlans` are TCIs to tag it with (802.1Q each).
+pub fn eth_build(dst: & Vec<i64>, src: & Vec<i64>, vlans: & Vec<i64>, ethertype: i64, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    pk_append(& mut o, dst);
+    pk_append(& mut o, src);
+    var i: i64 = 0;
+    while i < vlans.len() {
+        pk_put16(& mut o, ETH_VLAN);
+        pk_put16(& mut o, vlans.get(i));
+        i = i + 1;
+    }
+    pk_put16(& mut o, ethertype);
+    pk_append(& mut o, payload);
+    return o;
+}
+
+// ─── ARP ────────────────────────────────────────────────────────────────
+
+pub struct ArpPkt {
+    pub ok: bool,
+    pub htype: i64,
+    pub ptype: i64,
+    pub op: i64,
+    pub sha: Vec<i64>,
+    pub spa: Vec<i64>,
+    pub tha: Vec<i64>,
+    pub tpa: Vec<i64>,
+}
+
+pub fn arp_decode(b: & Vec<i64>, off: i64) -> ArpPkt {
+    var a: ArpPkt = ArpPkt { ok: false, htype: 0, ptype: 0, op: 0, sha: Vec::new(), spa: Vec::new(), tha: Vec::new(), tpa: Vec::new() };
+    if off + 8 > b.len() {
+        return a;
+    }
+    a.htype = pk_u16(b, off);
+    a.ptype = pk_u16(b, off + 2);
+    val hl: i64 = b.get(off + 4);
+    val pl: i64 = b.get(off + 5);
+    a.op = pk_u16(b, off + 6);
+    if off + 8 + 2 * (hl + pl) > b.len() {
+        return a;
+    }
+    var o: i64 = off + 8;
+    a.sha = pk_take(b, o, hl);
+    a.spa = pk_take(b, o + hl, pl);
+    a.tha = pk_take(b, o + hl + pl, hl);
+    a.tpa = pk_take(b, o + 2 * hl + pl, pl);
+    a.ok = true;
+    return a;
+}
+
+/// An Ethernet/IPv4 ARP packet (op 1 request, 2 reply).
+pub fn arp_build(op: i64, sha: & Vec<i64>, spa: & Vec<i64>, tha: & Vec<i64>, tpa: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    pk_put16(& mut o, 1);
+    pk_put16(& mut o, ETH_IPV4);
+    o.push(6);
+    o.push(4);
+    pk_put16(& mut o, op);
+    pk_append(& mut o, sha);
+    pk_append(& mut o, spa);
+    pk_append(& mut o, tha);
+    pk_append(& mut o, tpa);
+    return o;
+}
+
+// ─── IPv4 ───────────────────────────────────────────────────────────────
+
+/// An IPv4 header. `flags` is the 3-bit field (2 = DF, 1 = MF), `frag` the
+/// fragment offset in 8-byte units; `payload` the offset after the header,
+/// `end` the offset after the packet (from the total length).
+pub struct Ipv4Hdr {
+    pub ok: bool,
+    pub ihl: i64,
+    pub tos: i64,
+    pub total_len: i64,
+    pub id: i64,
+    pub flags: i64,
+    pub frag: i64,
+    pub ttl: i64,
+    pub proto: i64,
+    pub checksum: i64,
+    pub checksum_ok: bool,
+    pub src: Vec<i64>,
+    pub dst: Vec<i64>,
+    pub options: Vec<i64>,
+    pub payload: i64,
+    pub end: i64,
+}
+
+/// A fresh header for building: ttl 64, DF set, no options.
+pub fn ipv4_hdr(proto: i64, src: Vec<i64>, dst: Vec<i64>) -> Ipv4Hdr {
+    return Ipv4Hdr { ok: true, ihl: 5, tos: 0, total_len: 0, id: 0, flags: 2, frag: 0, ttl: 64, proto: proto, checksum: 0, checksum_ok: true, src: src, dst: dst, options: Vec::new(), payload: 0, end: 0 };
+}
+
+pub fn ipv4_decode(b: & Vec<i64>, off: i64) -> Ipv4Hdr {
+    var h: Ipv4Hdr = ipv4_hdr(0, Vec::new(), Vec::new());
+    h.ok = false;
+    if off + 20 > b.len() || ((b.get(off) >> 4) & 15) != 4 {
+        return h;
+    }
+    h.ihl = b.get(off) & 15;
+    val hl: i64 = h.ihl * 4;
+    if h.ihl < 5 || off + hl > b.len() {
+        return h;
+    }
+    h.tos = b.get(off + 1);
+    h.total_len = pk_u16(b, off + 2);
+    h.id = pk_u16(b, off + 4);
+    val ff: i64 = pk_u16(b, off + 6);
+    h.flags = ff >> 13;
+    h.frag = ff & 0x1FFF;
+    h.ttl = b.get(off + 8);
+    h.proto = b.get(off + 9);
+    h.checksum = pk_u16(b, off + 10);
+    h.src = pk_take(b, off + 12, 4);
+    h.dst = pk_take(b, off + 16, 4);
+    h.options = pk_take(b, off + 20, hl - 20);
+    val hdr: Vec<i64> = pk_take(b, off, hl);
+    h.checksum_ok = inet_sum(& hdr, 0) == 65535;
+    h.payload = off + hl;
+    h.end = off + h.total_len;
+    h.ok = h.total_len >= hl && h.end <= b.len();
+    return h;
+}
+
+/// The header bytes with its checksum computed (total length from the
+/// payload length; options padded to 32 bits).
+pub fn ipv4_header_bytes(h: & Ipv4Hdr, payload_len: i64) -> Vec<i64> {
+    var opts: Vec<i64> = h.options;
+    while opts.len() % 4 != 0 {
+        opts.push(0);
+    }
+    val hl: i64 = 20 + opts.len();
+    var o: Vec<i64> = Vec::new();
+    o.push(0x40 | (hl / 4));
+    o.push(h.tos & 255);
+    pk_put16(& mut o, hl + payload_len);
+    pk_put16(& mut o, h.id);
+    pk_put16(& mut o, ((h.flags & 7) << 13) | (h.frag & 0x1FFF));
+    o.push(h.ttl & 255);
+    o.push(h.proto & 255);
+    pk_put16(& mut o, 0);
+    pk_append(& mut o, & h.src);
+    pk_append(& mut o, & h.dst);
+    pk_append(& mut o, & opts);
+    val c: i64 = inet_checksum(& o);
+    o.set(10, (c >> 8) & 255);
+    o.set(11, c & 255);
+    return o;
+}
+
+/// Header plus payload.
+pub fn ipv4_build(h: & Ipv4Hdr, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = ipv4_header_bytes(h, payload.len());
+    pk_append(& mut o, payload);
+    return o;
+}
+
+// ─── IPv6 ───────────────────────────────────────────────────────────────
+
+/// An IPv6 header. `next` is the upper-layer protocol after any extension
+/// headers (hop-by-hop, routing, fragment, destination options), found at
+/// `payload`; `first_next` the Next Header field of the fixed header;
+/// `end` the offset after the packet (from the payload length).
+pub struct Ipv6Hdr {
+    pub ok: bool,
+    pub tclass: i64,
+    pub flow: i64,
+    pub payload_len: i64,
+    pub first_next: i64,
+    pub next: i64,
+    pub hop_limit: i64,
+    pub src: Vec<i64>,
+    pub dst: Vec<i64>,
+    pub payload: i64,
+    pub end: i64,
+}
+
+pub fn ipv6_decode(b: & Vec<i64>, off: i64) -> Ipv6Hdr {
+    var h: Ipv6Hdr = Ipv6Hdr { ok: false, tclass: 0, flow: 0, payload_len: 0, first_next: 0, next: 0, hop_limit: 0, src: Vec::new(), dst: Vec::new(), payload: 0, end: 0 };
+    if off + 40 > b.len() || ((b.get(off) >> 4) & 15) != 6 {
+        return h;
+    }
+    val w: i64 = pk_u32(b, off);
+    h.tclass = (w >> 20) & 255;
+    h.flow = w & 0xFFFFF;
+    h.payload_len = pk_u16(b, off + 4);
+    h.first_next = b.get(off + 6);
+    h.hop_limit = b.get(off + 7);
+    h.src = pk_take(b, off + 8, 16);
+    h.dst = pk_take(b, off + 24, 16);
+    var nh: i64 = h.first_next;
+    var o: i64 = off + 40;
+    while (nh == 0 || nh == 43 || nh == 44 || nh == 60) && o + 8 <= b.len() {
+        val next: i64 = b.get(o);
+        if nh == 44 {
+            o = o + 8;
+        } else {
+            o = o + 8 + b.get(o + 1) * 8;
+        }
+        nh = next;
+    }
+    h.next = nh;
+    h.payload = o;
+    h.end = off + 40 + h.payload_len;
+    h.ok = o <= h.end && h.end <= b.len();
+    return h;
+}
+
+/// A fixed IPv6 header (no extension headers) plus payload.
+pub fn ipv6_build(tclass: i64, flow: i64, next: i64, hop_limit: i64, src: & Vec<i64>, dst: & Vec<i64>, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    pk_put32(& mut o, (6 << 28) | ((tclass & 255) << 20) | (flow & 0xFFFFF));
+    pk_put16(& mut o, payload.len());
+    o.push(next & 255);
+    o.push(hop_limit & 255);
+    pk_append(& mut o, src);
+    pk_append(& mut o, dst);
+    pk_append(& mut o, payload);
+    return o;
+}
+
+// ─── ICMP / ICMPv6 ──────────────────────────────────────────────────────
+
+/// An ICMP or ICMPv6 message. `rest` is the 4-byte "rest of header" (for
+/// echo: identifier << 16 | sequence); `data` what follows.
+pub struct IcmpHdr {
+    pub ok: bool,
+    pub kind: i64,
+    pub code: i64,
+    pub checksum: i64,
+    pub checksum_ok: bool,
+    pub rest: i64,
+    pub data: Vec<i64>,
+}
+
+fn icmp_parse(b: & Vec<i64>, off: i64, end: i64) -> IcmpHdr {
+    var m: IcmpHdr = IcmpHdr { ok: false, kind: 0, code: 0, checksum: 0, checksum_ok: false, rest: 0, data: Vec::new() };
+    if off + 8 > end || end > b.len() {
+        return m;
+    }
+    m.kind = b.get(off);
+    m.code = b.get(off + 1);
+    m.checksum = pk_u16(b, off + 2);
+    m.rest = pk_u32(b, off + 4);
+    m.data = pk_take(b, off + 8, end - off - 8);
+    m.ok = true;
+    return m;
+}
+
+/// ICMP over IPv4 at `off` up to `end`; the checksum covers the message.
+pub fn icmp_decode(b: & Vec<i64>, off: i64, end: i64) -> IcmpHdr {
+    var m: IcmpHdr = icmp_parse(b, off, end);
+    if m.ok {
+        val msg: Vec<i64> = pk_take(b, off, end - off);
+        m.checksum_ok = inet_sum(& msg, 0) == 65535;
+    }
+    return m;
+}
+
+/// ICMPv6: the checksum covers the IPv6 pseudo-header too.
+pub fn icmpv6_decode(b: & Vec<i64>, off: i64, end: i64, src: & Vec<i64>, dst: & Vec<i64>) -> IcmpHdr {
+    var m: IcmpHdr = icmp_parse(b, off, end);
+    if m.ok {
+        val msg: Vec<i64> = pk_take(b, off, end - off);
+        m.checksum_ok = inet_sum(& msg, pk_pseudo6(src, dst, IP_ICMPV6, msg.len())) == 65535;
+    }
+    return m;
+}
+
+fn icmp_body(kind: i64, code: i64, rest: i64, data: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    o.push(kind & 255);
+    o.push(code & 255);
+    pk_put16(& mut o, 0);
+    pk_put32(& mut o, rest);
+    pk_append(& mut o, data);
+    return o;
+}
+
+pub fn icmp_build(kind: i64, code: i64, rest: i64, data: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = icmp_body(kind, code, rest, data);
+    val c: i64 = inet_checksum(& o);
+    o.set(2, (c >> 8) & 255);
+    o.set(3, c & 255);
+    return o;
+}
+
+pub fn icmpv6_build(src: & Vec<i64>, dst: & Vec<i64>, kind: i64, code: i64, rest: i64, data: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = icmp_body(kind, code, rest, data);
+    val c: i64 = pk_checksum_v6(src, dst, IP_ICMPV6, & o);
+    o.set(2, (c >> 8) & 255);
+    o.set(3, c & 255);
+    return o;
+}
+
+// ─── TCP ────────────────────────────────────────────────────────────────
+
+/// A TCP option: kind and its data (without kind and length bytes).
+pub struct TcpOpt {
+    pub kind: i64,
+    pub data: Vec<i64>,
+}
+
+/// A TCP header; `flags` holds the 8 flag bits (CWR ECE URG ACK PSH RST
+/// SYN FIN). `checksum_ok` is set by tcp_decode_v4/v6.
+pub struct TcpHdr {
+    pub ok: bool,
+    pub src_port: i64,
+    pub dst_port: i64,
+    pub seq: i64,
+    pub ack: i64,
+    pub data_off: i64,
+    pub flags: i64,
+    pub window: i64,
+    pub checksum: i64,
+    pub checksum_ok: bool,
+    pub urgent: i64,
+    pub options: Vec<TcpOpt>,
+    pub payload: Vec<i64>,
+}
+
+/// A header to build: no options, window 65535.
+pub fn tcp_hdr(src_port: i64, dst_port: i64, seq: i64, ack: i64, flags: i64) -> TcpHdr {
+    return TcpHdr { ok: true, src_port: src_port, dst_port: dst_port, seq: seq, ack: ack, data_off: 5, flags: flags, window: 65535, checksum: 0, checksum_ok: true, urgent: 0, options: Vec::new(), payload: Vec::new() };
+}
+
+pub fn tcp_opt(kind: i64, data: Vec<i64>) -> TcpOpt {
+    return TcpOpt { kind: kind, data: data };
+}
+
+/// MSS (kind 2), window scale (3), SACK permitted (4), timestamps (8).
+pub fn tcp_opt_mss(mss: i64) -> TcpOpt {
+    var d: Vec<i64> = Vec::new();
+    pk_put16(& mut d, mss);
+    return tcp_opt(2, d);
+}
+
+pub fn tcp_opt_wscale(shift: i64) -> TcpOpt {
+    var d: Vec<i64> = Vec::new();
+    d.push(shift & 255);
+    return tcp_opt(3, d);
+}
+
+pub fn tcp_opt_sack_ok() -> TcpOpt {
+    return tcp_opt(4, Vec::new());
+}
+
+pub fn tcp_opt_timestamps(tsval: i64, tsecr: i64) -> TcpOpt {
+    var d: Vec<i64> = Vec::new();
+    pk_put32(& mut d, tsval);
+    pk_put32(& mut d, tsecr);
+    return tcp_opt(8, d);
+}
+
+/// The option of `kind`'s value as a number (MSS, window scale, the
+/// timestamp value), or -1 when absent.
+pub fn tcp_opt_value(h: & TcpHdr, kind: i64) -> i64 {
+    var i: i64 = 0;
+    while i < h.options.len() {
+        val o: TcpOpt = h.options.get(i);
+        if o.kind == kind {
+            var v: i64 = 0;
+            var j: i64 = 0;
+            while j < o.data.len() && j < 4 {
+                v = (v << 8) | o.data.get(j);
+                j = j + 1;
+            }
+            return v;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// Flag letters, "SYN,ACK" style.
+pub fn tcp_flags_str(f: i64) -> str {
+    var parts: Vec<str> = Vec::new();
+    if (f & TCP_FIN) != 0 { parts.push("FIN"); }
+    if (f & TCP_SYN) != 0 { parts.push("SYN"); }
+    if (f & TCP_RST) != 0 { parts.push("RST"); }
+    if (f & TCP_PSH) != 0 { parts.push("PSH"); }
+    if (f & TCP_ACK) != 0 { parts.push("ACK"); }
+    if (f & TCP_URG) != 0 { parts.push("URG"); }
+    if (f & 64) != 0 { parts.push("ECE"); }
+    if (f & 128) != 0 { parts.push("CWR"); }
+    var s: str = "";
+    var i: i64 = 0;
+    while i < parts.len() {
+        if i > 0 { s = s + ","; }
+        s = s + parts.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Decode a TCP segment at `off` up to `end` (no checksum check).
+pub fn tcp_decode(b: & Vec<i64>, off: i64, end: i64) -> TcpHdr {
+    var h: TcpHdr = tcp_hdr(0, 0, 0, 0, 0);
+    h.ok = false;
+    h.checksum_ok = false;
+    if off + 20 > end || end > b.len() {
+        return h;
+    }
+    h.src_port = pk_u16(b, off);
+    h.dst_port = pk_u16(b, off + 2);
+    h.seq = pk_u32(b, off + 4);
+    h.ack = pk_u32(b, off + 8);
+    h.data_off = (b.get(off + 12) >> 4) & 15;
+    h.flags = b.get(off + 13);
+    h.window = pk_u16(b, off + 14);
+    h.checksum = pk_u16(b, off + 16);
+    h.urgent = pk_u16(b, off + 18);
+    val hl: i64 = h.data_off * 4;
+    if h.data_off < 5 || off + hl > end {
+        return h;
+    }
+    var o: i64 = off + 20;
+    while o < off + hl {
+        val kind: i64 = b.get(o);
+        if kind == 0 {
+            o = off + hl;
+        } else if kind == 1 {
+            o = o + 1;
+        } else {
+            if o + 1 >= off + hl {
+                return h;
+            }
+            val n: i64 = b.get(o + 1);
+            if n < 2 || o + n > off + hl {
+                return h;
+            }
+            h.options.push(tcp_opt(kind, pk_take(b, o + 2, n - 2)));
+            o = o + n;
+        }
+    }
+    h.payload = pk_take(b, off + hl, end - off - hl);
+    h.ok = true;
+    return h;
+}
+
+pub fn tcp_decode_v4(b: & Vec<i64>, ip: & Ipv4Hdr) -> TcpHdr {
+    var h: TcpHdr = tcp_decode(b, ip.payload, ip.end);
+    if h.ok {
+        val seg: Vec<i64> = pk_take(b, ip.payload, ip.end - ip.payload);
+        h.checksum_ok = inet_sum(& seg, pk_pseudo4(& ip.src, & ip.dst, IP_TCP, seg.len())) == 65535;
+    }
+    return h;
+}
+
+pub fn tcp_decode_v6(b: & Vec<i64>, ip: & Ipv6Hdr) -> TcpHdr {
+    var h: TcpHdr = tcp_decode(b, ip.payload, ip.end);
+    if h.ok {
+        val seg: Vec<i64> = pk_take(b, ip.payload, ip.end - ip.payload);
+        h.checksum_ok = inet_sum(& seg, pk_pseudo6(& ip.src, & ip.dst, IP_TCP, seg.len())) == 65535;
+    }
+    return h;
+}
+
+/// The TCP segment bytes: header length from the options (padded to 32
+/// bits with end-of-option-list zeros), checksum field zero.
+fn tcp_bytes(h: & TcpHdr, payload: & Vec<i64>) -> Vec<i64> {
+    var opts: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < h.options.len() {
+        val op: TcpOpt = h.options.get(i);
+        opts.push(op.kind & 255);
+        if op.kind != 0 && op.kind != 1 {
+            opts.push(op.data.len() + 2);
+            pk_append(& mut opts, & op.data);
+        }
+        i = i + 1;
+    }
+    while opts.len() % 4 != 0 {
+        opts.push(0);
+    }
+    var o: Vec<i64> = Vec::new();
+    pk_put16(& mut o, h.src_port);
+    pk_put16(& mut o, h.dst_port);
+    pk_put32(& mut o, h.seq);
+    pk_put32(& mut o, h.ack);
+    o.push(((5 + opts.len() / 4) << 4) & 255);
+    o.push(h.flags & 255);
+    pk_put16(& mut o, h.window);
+    pk_put16(& mut o, 0);
+    pk_put16(& mut o, h.urgent);
+    pk_append(& mut o, & opts);
+    pk_append(& mut o, payload);
+    return o;
+}
+
+/// A TCP segment for IPv4 with its checksum.
+pub fn tcp_build_v4(src: & Vec<i64>, dst: & Vec<i64>, h: & TcpHdr, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = tcp_bytes(h, payload);
+    val c: i64 = pk_checksum_v4(src, dst, IP_TCP, & o);
+    o.set(16, (c >> 8) & 255);
+    o.set(17, c & 255);
+    return o;
+}
+
+/// A TCP segment for IPv6 with its checksum.
+pub fn tcp_build_v6(src: & Vec<i64>, dst: & Vec<i64>, h: & TcpHdr, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = tcp_bytes(h, payload);
+    val c: i64 = pk_checksum_v6(src, dst, IP_TCP, & o);
+    o.set(16, (c >> 8) & 255);
+    o.set(17, c & 255);
+    return o;
+}
+
+// ─── UDP ────────────────────────────────────────────────────────────────
+
+pub struct UdpHdr {
+    pub ok: bool,
+    pub src_port: i64,
+    pub dst_port: i64,
+    pub length: i64,
+    pub checksum: i64,
+    pub checksum_ok: bool,
+    pub payload: Vec<i64>,
+}
+
+/// Decode a UDP datagram at `off`, its length from the UDP header (must fit
+/// before `end`); no checksum check.
+pub fn udp_decode(b: & Vec<i64>, off: i64, end: i64) -> UdpHdr {
+    var u: UdpHdr = UdpHdr { ok: false, src_port: 0, dst_port: 0, length: 0, checksum: 0, checksum_ok: false, payload: Vec::new() };
+    if off + 8 > end || end > b.len() {
+        return u;
+    }
+    u.src_port = pk_u16(b, off);
+    u.dst_port = pk_u16(b, off + 2);
+    u.length = pk_u16(b, off + 4);
+    u.checksum = pk_u16(b, off + 6);
+    if u.length < 8 || off + u.length > end {
+        return u;
+    }
+    u.payload = pk_take(b, off + 8, u.length - 8);
+    u.ok = true;
+    return u;
+}
+
+/// UDP over IPv4; a zero checksum means "none" (RFC 768) and is accepted.
+pub fn udp_decode_v4(b: & Vec<i64>, ip: & Ipv4Hdr) -> UdpHdr {
+    var u: UdpHdr = udp_decode(b, ip.payload, ip.end);
+    if u.ok {
+        val seg: Vec<i64> = pk_take(b, ip.payload, u.length);
+        u.checksum_ok = u.checksum == 0 || inet_sum(& seg, pk_pseudo4(& ip.src, & ip.dst, IP_UDP, u.length)) == 65535;
+    }
+    return u;
+}
+
+/// UDP over IPv6, where the checksum is mandatory (RFC 8200 8.1).
+pub fn udp_decode_v6(b: & Vec<i64>, ip: & Ipv6Hdr) -> UdpHdr {
+    var u: UdpHdr = udp_decode(b, ip.payload, ip.end);
+    if u.ok {
+        val seg: Vec<i64> = pk_take(b, ip.payload, u.length);
+        u.checksum_ok = u.checksum != 0 && inet_sum(& seg, pk_pseudo6(& ip.src, & ip.dst, IP_UDP, u.length)) == 65535;
+    }
+    return u;
+}
+
+fn udp_bytes(sp: i64, dp: i64, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    pk_put16(& mut o, sp);
+    pk_put16(& mut o, dp);
+    pk_put16(& mut o, payload.len() + 8);
+    pk_put16(& mut o, 0);
+    pk_append(& mut o, payload);
+    return o;
+}
+
+/// A UDP datagram for IPv4 with its checksum (0 is sent as 0xFFFF).
+pub fn udp_build_v4(src: & Vec<i64>, dst: & Vec<i64>, sp: i64, dp: i64, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = udp_bytes(sp, dp, payload);
+    var c: i64 = pk_checksum_v4(src, dst, IP_UDP, & o);
+    if c == 0 {
+        c = 65535;
+    }
+    o.set(6, (c >> 8) & 255);
+    o.set(7, c & 255);
+    return o;
+}
+
+pub fn udp_build_v6(src: & Vec<i64>, dst: & Vec<i64>, sp: i64, dp: i64, payload: & Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = udp_bytes(sp, dp, payload);
+    var c: i64 = pk_checksum_v6(src, dst, IP_UDP, & o);
+    if c == 0 {
+        c = 65535;
+    }
+    o.set(6, (c >> 8) & 255);
+    o.set(7, c & 255);
+    return o;
+}
+
+// ─── DNS header and questions ───────────────────────────────────────────
+
+pub struct DnsQuestion {
+    pub name: str,
+    pub qtype: i64,
+    pub qclass: i64,
+}
+
+/// The DNS header (RFC 1035 4.1.1) and the question section.
+pub struct DnsHdr {
+    pub ok: bool,
+    pub id: i64,
+    pub qr: bool,
+    pub opcode: i64,
+    pub aa: bool,
+    pub tc: bool,
+    pub rd: bool,
+    pub ra: bool,
+    pub rcode: i64,
+    pub qdcount: i64,
+    pub ancount: i64,
+    pub nscount: i64,
+    pub arcount: i64,
+    pub questions: Vec<DnsQuestion>,
+}
+
+/// The offset after a DNS name at `off` of message `m` (offset 0 = the DNS
+/// header), or -1 when malformed; the name text goes into `name`.
+/// Compression pointers are followed (at most 64); labels join with '.'
+/// and the root name is ".".
+pub fn dns_read_name(m: & Vec<i64>, off: i64, name: & mut str) -> i64 {
+    var acc: str = "";
+    var o: i64 = off;
+    var after: i64 = - 1;
+    var hops: i64 = 0;
+    while true {
+        if o >= m.len() || hops > 64 {
+            return - 1;
+        }
+        val len: i64 = m.get(o);
+        if len == 0 {
+            if after < 0 {
+                after = o + 1;
+            }
+            if str_len(acc) == 0 {
+                acc = ".";
+            }
+            * name = acc;
+            return after;
+        }
+        if (len & 0xC0) == 0xC0 {
+            if o + 1 >= m.len() {
+                return - 1;
+            }
+            if after < 0 {
+                after = o + 2;
+            }
+            o = ((len & 0x3F) << 8) | m.get(o + 1);
+            hops = hops + 1;
+        } else if (len & 0xC0) != 0 {
+            return - 1;
+        } else {
+            if o + 1 + len > m.len() {
+                return - 1;
+            }
+            if str_len(acc) > 0 {
+                acc = acc + ".";
+            }
+            acc = acc + str_from_bytes(pk_take(m, o + 1, len));
+            o = o + 1 + len;
+        }
+    }
+    return - 1;
+}
+
+/// Decode the header and questions of a DNS message (a UDP payload).
+pub fn dns_decode(m: & Vec<i64>) -> DnsHdr {
+    var d: DnsHdr = DnsHdr { ok: false, id: 0, qr: false, opcode: 0, aa: false, tc: false, rd: false, ra: false, rcode: 0, qdcount: 0, ancount: 0, nscount: 0, arcount: 0, questions: Vec::new() };
+    if m.len() < 12 {
+        return d;
+    }
+    d.id = pk_u16(m, 0);
+    val f: i64 = pk_u16(m, 2);
+    d.qr = (f & 0x8000) != 0;
+    d.opcode = (f >> 11) & 15;
+    d.aa = (f & 0x0400) != 0;
+    d.tc = (f & 0x0200) != 0;
+    d.rd = (f & 0x0100) != 0;
+    d.ra = (f & 0x0080) != 0;
+    d.rcode = f & 15;
+    d.qdcount = pk_u16(m, 4);
+    d.ancount = pk_u16(m, 6);
+    d.nscount = pk_u16(m, 8);
+    d.arcount = pk_u16(m, 10);
+    var o: i64 = 12;
+    var i: i64 = 0;
+    while i < d.qdcount {
+        var nm: str = "";
+        o = dns_read_name(m, o, & mut nm);
+        if o < 0 || o + 4 > m.len() {
+            return d;
+        }
+        d.questions.push(DnsQuestion { name: nm, qtype: pk_u16(m, o), qclass: pk_u16(m, o + 2) });
+        o = o + 4;
+        i = i + 1;
+    }
+    d.ok = true;
+    return d;
+}
+
+/// A DNS name in wire form (no compression).
+pub fn dns_encode_name(name: str) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    if name != "." && str_len(name) > 0 {
+        val labels: Vec<str> = str_split(name, ".");
+        var i: i64 = 0;
+        while i < labels.len() {
+            val l: Vec<i64> = str_bytes(labels.get(i));
+            if l.len() > 0 {
+                o.push(l.len());
+                pk_append(& mut o, & l);
+            }
+            i = i + 1;
+        }
+    }
+    o.push(0);
+    return o;
+}
+
+/// A DNS message of a header and its questions (counts from `d`, except
+/// qdcount which is the number of questions).
+pub fn dns_build(d: & DnsHdr) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    pk_put16(& mut o, d.id);
+    var f: i64 = ((d.opcode & 15) << 11) | (d.rcode & 15);
+    if d.qr { f = f | 0x8000; }
+    if d.aa { f = f | 0x0400; }
+    if d.tc { f = f | 0x0200; }
+    if d.rd { f = f | 0x0100; }
+    if d.ra { f = f | 0x0080; }
+    pk_put16(& mut o, f);
+    pk_put16(& mut o, d.questions.len());
+    pk_put16(& mut o, d.ancount);
+    pk_put16(& mut o, d.nscount);
+    pk_put16(& mut o, d.arcount);
+    var i: i64 = 0;
+    while i < d.questions.len() {
+        val q: DnsQuestion = d.questions.get(i);
+        val n: Vec<i64> = dns_encode_name(q.name);
+        pk_append(& mut o, & n);
+        pk_put16(& mut o, q.qtype);
+        pk_put16(& mut o, q.qclass);
+        i = i + 1;
+    }
+    return o;
+}
+
+/// A recursive query for one name (id, qtype; class IN).
+pub fn dns_query_new(id: i64, name: str, qtype: i64) -> DnsHdr {
+    var q: Vec<DnsQuestion> = Vec::new();
+    q.push(DnsQuestion { name: name, qtype: qtype, qclass: 1 });
+    return DnsHdr { ok: true, id: id, qr: false, opcode: 0, aa: false, tc: false, rd: true, ra: false, rcode: 0, qdcount: 1, ancount: 0, nscount: 0, arcount: 0, questions: q };
+}
+
+// ─── dissector ──────────────────────────────────────────────────────────
+
+fn pk_ok(b: bool) -> str {
+    if b {
+        return "ok";
+    }
+    return "BAD";
+}
+
+fn pk_dns_line(u: & UdpHdr) -> str {
+    val d: DnsHdr = dns_decode(& u.payload);
+    if !d.ok {
+        return "DNS (malformed)";
+    }
+    var line: str = "DNS id " + pk_hex16(d.id);
+    if d.qr {
+        line = line + " response";
+    } else {
+        line = line + " query";
+    }
+    line = line + " rcode " + int_to_str(d.rcode) + " qd " + int_to_str(d.qdcount) + " an " + int_to_str(d.ancount);
+    var i: i64 = 0;
+    while i < d.questions.len() {
+        line = line + " q " + d.questions.get(i).name + " type " + int_to_str(d.questions.get(i).qtype);
+        i = i + 1;
+    }
+    return line;
+}
+
+fn pk_tcp_line(t: & TcpHdr) -> str {
+    if !t.ok {
+        return "TCP (malformed)";
+    }
+    var line: str = "TCP " + int_to_str(t.src_port) + " -> " + int_to_str(t.dst_port) + " [" + tcp_flags_str(t.flags) + "] seq " + int_to_str(t.seq) + " ack " + int_to_str(t.ack) + " win " + int_to_str(t.window);
+    val mss: i64 = tcp_opt_value(t, 2);
+    if mss >= 0 {
+        line = line + " mss " + int_to_str(mss);
+    }
+    return line + " len " + int_to_str(t.payload.len()) + " checksum " + pk_ok(t.checksum_ok);
+}
+
+fn pk_udp_lines(out: & mut Vec<str>, u: & UdpHdr) {
+    if !u.ok {
+        out.push("UDP (malformed)");
+        return;
+    }
+    out.push("UDP " + int_to_str(u.src_port) + " -> " + int_to_str(u.dst_port) + " len " + int_to_str(u.length) + " checksum " + pk_ok(u.checksum_ok));
+    if u.src_port == 53 || u.dst_port == 53 || u.src_port == 5353 || u.dst_port == 5353 {
+        out.push(pk_dns_line(u));
+    }
+}
+
+/// One summary line per layer of an Ethernet frame.
+pub fn pkt_dissect(b: Vec<i64>) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val e: EthHdr = eth_decode(& b);
+    if !e.ok {
+        out.push("Ethernet (truncated)");
+        return out;
+    }
+    out.push("Ethernet " + mac_to_str(& e.src) + " -> " + mac_to_str(& e.dst) + " type " + pk_hex16(e.ethertype));
+    var i: i64 = 0;
+    while i < e.vlans.len() {
+        val tci: i64 = e.vlans.get(i);
+        out.push("VLAN " + int_to_str(tci & 0xFFF) + " prio " + int_to_str(tci >> 13));
+        i = i + 1;
+    }
+    if e.ethertype == ETH_ARP {
+        val a: ArpPkt = arp_decode(& b, e.payload);
+        if a.ok {
+            var what: str = "request";
+            if a.op == 2 {
+                what = "reply";
+            }
+            out.push("ARP " + what + " " + mac_to_str(& a.sha) + " " + ipv4_to_str(& a.spa) + " -> " + mac_to_str(& a.tha) + " " + ipv4_to_str(& a.tpa));
+        } else {
+            out.push("ARP (malformed)");
+        }
+    } else if e.ethertype == ETH_IPV4 {
+        val v4: Ipv4Hdr = ipv4_decode(& b, e.payload);
+        if !v4.ok {
+            out.push("IPv4 (malformed)");
+            return out;
+        }
+        out.push("IPv4 " + ipv4_to_str(& v4.src) + " -> " + ipv4_to_str(& v4.dst) + " ttl " + int_to_str(v4.ttl) + " proto " + int_to_str(v4.proto) + " len " + int_to_str(v4.total_len) + " checksum " + pk_ok(v4.checksum_ok));
+        if v4.frag != 0 {
+            out.push("fragment offset " + int_to_str(v4.frag * 8));
+        } else if v4.proto == IP_TCP {
+            val t: TcpHdr = tcp_decode_v4(& b, & v4);
+            out.push(pk_tcp_line(& t));
+        } else if v4.proto == IP_UDP {
+            val u: UdpHdr = udp_decode_v4(& b, & v4);
+            pk_udp_lines(& mut out, & u);
+        } else if v4.proto == IP_ICMP {
+            val m: IcmpHdr = icmp_decode(& b, v4.payload, v4.end);
+            if m.ok {
+                out.push("ICMP type " + int_to_str(m.kind) + " code " + int_to_str(m.code) + " id " + int_to_str((m.rest >> 16) & 65535) + " seq " + int_to_str(m.rest & 65535) + " checksum " + pk_ok(m.checksum_ok));
+            } else {
+                out.push("ICMP (malformed)");
+            }
+        } else {
+            out.push("protocol " + int_to_str(v4.proto));
+        }
+    } else if e.ethertype == ETH_IPV6 {
+        val v6: Ipv6Hdr = ipv6_decode(& b, e.payload);
+        if !v6.ok {
+            out.push("IPv6 (malformed)");
+            return out;
+        }
+        out.push("IPv6 " + ipv6_to_str(& v6.src) + " -> " + ipv6_to_str(& v6.dst) + " hop " + int_to_str(v6.hop_limit) + " next " + int_to_str(v6.next) + " len " + int_to_str(v6.payload_len));
+        if v6.next == IP_TCP {
+            val t: TcpHdr = tcp_decode_v6(& b, & v6);
+            out.push(pk_tcp_line(& t));
+        } else if v6.next == IP_UDP {
+            val u: UdpHdr = udp_decode_v6(& b, & v6);
+            pk_udp_lines(& mut out, & u);
+        } else if v6.next == IP_ICMPV6 {
+            val m: IcmpHdr = icmpv6_decode(& b, v6.payload, v6.end, & v6.src, & v6.dst);
+            if m.ok {
+                out.push("ICMPv6 type " + int_to_str(m.kind) + " code " + int_to_str(m.code) + " checksum " + pk_ok(m.checksum_ok));
+            } else {
+                out.push("ICMPv6 (malformed)");
+            }
+        } else {
+            out.push("protocol " + int_to_str(v6.next));
+        }
+    } else {
+        out.push("ethertype " + pk_hex16(e.ethertype));
+    }
+    return out;
+}

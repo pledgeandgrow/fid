@@ -9,6 +9,15 @@ operational semantics. It is not mechanised, and it leaves out floats,
 strings, enums, generics, closures, references, effects, concurrency and
 memory release (see [What is left](#what-is-left)).
 
+**Part 2:** [semantics-2.md](semantics-2.md) (Nov 16–17) continues the
+numbering (§5–22) with floats and `f32`, strings, enums, `Option`/`Result`,
+generics, closures, references, effects, memory, `i128`, arrays and tuples,
+traits and `dyn`, `defer`, regions, `@linear`, effect handlers, channels
+and `select`, threads and green tasks, and the points the reference
+settled on Nov 17 (float to integer casts, HashMap order, the output of
+threads). Its rules are tested line by line by
+`tests/bootstrap/test_verify_semantics_ext.fd`.
+
 It is also executable: `scripts/fuzz/gen_vs_c.py` writes, for each random
 program, a C program whose helper functions (`add_i8`, `div_u32`, `shl_i16`,
 `vget`, …) are exactly the rules of §3 below, and checks every backend
@@ -154,6 +163,9 @@ These are the rules above that some backend breaks; each has a repro in
 - `println` of a u64 ≥ 2^63 (M3): printed signed.
 
 ## What is left
+
+Most of this list is now in [semantics-2.md](semantics-2.md) (§5–20);
+what neither part covers is in its §22.
 
 - Floats (IEEE-754 binary64, the text `println` gives them), `str` (C
   strings: a NUL ends them, §1.8), enums and `Option`/`Result`, `?` and

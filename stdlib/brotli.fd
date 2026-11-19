@@ -1,7 +1,8 @@
 // Fides Brotli standard library
 //
-// Pure-Fides Brotli decompressor (RFC 7932). Decoding only; there is no
-// Brotli compressor.
+// Pure-Fides Brotli decompressor (RFC 7932), and a compressor
+// (brotli_compress, brotli_compress_level, brotli_compress_str; see
+// "Compression" at the end of this file).
 //
 // Implements the whole format:
 //   - the stream header (window bits, WBITS 10..24);
@@ -1581,6 +1582,18 @@ pub fn brotli_error(data: Vec<i64>) -> str {
 /// True when `data` is a complete, valid Brotli stream. This decodes the
 /// stream; an empty brotli_decompress result with brotli_ok true is an
 /// empty stream, with brotli_ok false an error.
+///
+/// Example:
+///   var empty: Vec<i64> = Vec::new();
+///   empty.push(59);
+///   assert(brotli_ok(empty));
+///   assert_eq(brotli_error(empty), "");
+///   assert_eq(brotli_decompress(empty).len(), 0);
+///   var cut: Vec<i64> = Vec::new();
+///   cut.push(27); cut.push(22); cut.push(0);
+///   assert(!brotli_ok(cut));
+///   assert(str_len(brotli_error(cut)) > 0);
+///   assert_eq(brotli_decompress_str(cut), "");
 pub fn brotli_ok(data: Vec<i64>) -> bool {
     return str_len(brotli_error(data)) == 0;
 }
@@ -1597,4 +1610,842 @@ pub fn brotli_decompress_str(data: Vec<i64>) -> str {
         i = i + 1;
     }
     return sb.to_str();
+}
+
+// ─── Compression ────────────────────────────────────────────────────────
+//
+// `brotli_compress_level(bytes, quality)` writes a stream with the
+// smallest window (WBITS 16, 18..24) that holds the input, cut into
+// meta-blocks of 1 MB. Each meta-block is the shorter of an uncompressed
+// one and a compressed one with one block type per category, no context
+// modelling (one literal and one distance tree), NPOSTFIX = NDIRECT = 0:
+//   matches:   hash chains on 4-byte prefixes over the window (quality 1-2:
+//              4 candidates, 3-5: 16, 6-8: 64, 9-11: 256); the last
+//              distance is tried first and coded with distance code 0,
+//              implicitly when the command's cell allows it
+//   codes:     Huffman code lengths of at most 15 bits, sent as simple
+//              prefix codes (up to 4 symbols) or complex ones with the
+//              repeat codes 16 and 17 (as the reference encoder writes
+//              them)
+// Quality 0 stores (uncompressed meta-blocks). No static dictionary
+// references, block splitting or context maps: the ratio is below the
+// reference encoder's at the same quality.
+
+struct BcBits {
+    out: Vec<i64>,
+    acc: i64,
+    n: i64,
+}
+
+fn bc_bits_new() -> BcBits {
+    return BcBits {
+        out: Vec::new(), acc: 0, n: 0
+    };
+}
+
+// The low `nbits` bits of v, least significant first.
+fn bc_put(w: & mut BcBits, v: i64, nbits: i64) -> void {
+    if nbits <= 0 {
+        return;
+    }
+    w.acc = w.acc | ((v & ((1 << nbits) - 1)) << w.n);
+    w.n = w.n + nbits;
+    while w.n >= 8 {
+        w.out.push(w.acc & 255);
+        w.acc = w.acc >> 8;
+        w.n = w.n - 8;
+    }
+}
+
+// A prefix code: its first bit is the code's most significant one.
+fn bc_code(w: & mut BcBits, code: i64, len: i64) -> void {
+    var rev: i64 = 0;
+    var i: i64 = 0;
+    while i < len {
+        rev = (rev << 1) | ((code >> i) & 1);
+        i = i + 1;
+    }
+    bc_put(w, rev, len);
+}
+
+// A code table entry (code | length << 16).
+fn bc_sym(w: & mut BcBits, tab: Vec<i64>, s: i64) -> void {
+    val e: i64 = tab[s];
+    bc_code(w, e & 65535, e >> 16);
+}
+
+fn bc_align(w: & mut BcBits) -> void {
+    if w.n > 0 {
+        w.out.push(w.acc & 255);
+        w.acc = 0;
+        w.n = 0;
+    }
+}
+
+// Append the bits of `src` (not aligned) to w.
+fn bc_append(w: & mut BcBits, src: BcBits) -> void {
+    var i: i64 = 0;
+    while i < src.out.len() {
+        bc_put(w, src.out[i], 8);
+        i = i + 1;
+    }
+    bc_put(w, src.acc, src.n);
+}
+
+fn bc_bitlen(w: BcBits) -> i64 {
+    return w.out.len() * 8 + w.n;
+}
+
+// Huffman code lengths of at most `limit` bits for the counts of symbols
+// 0..n-1 (two or more non-zero), rebuilt from flattened counts while the
+// tree is too deep.
+fn bc_lengths(freq: Vec<i64>, n: i64, limit: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    var used: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        f.push(freq[i]);
+        if freq[i] > 0 {
+            used = used + 1;
+        }
+        i = i + 1;
+    }
+    while true {
+        var w: Vec<i64> = Vec::new();
+        var parent: Vec<i64> = Vec::new();
+        var alive: Vec<i64> = Vec::new();
+        var node: Vec<i64> = Vec::filled(n, - 1);
+        i = 0;
+        while i < n {
+            if f[i] > 0 {
+                node.set(i, w.len());
+                w.push(f[i]);
+                parent.push(- 1);
+                alive.push(1);
+            }
+            i = i + 1;
+        }
+        var left: i64 = used;
+        while left > 1 {
+            var a: i64 = - 1;
+            var b: i64 = - 1;
+            var j: i64 = 0;
+            while j < w.len() {
+                if alive[j] == 1 {
+                    if a < 0 || w[j] < w[a] {
+                        b = a;
+                        a = j;
+                    } else if b < 0 || w[j] < w[b] {
+                        b = j;
+                    }
+                }
+                j = j + 1;
+            }
+            alive.set(a, 0);
+            alive.set(b, 0);
+            parent.set(a, w.len());
+            parent.set(b, w.len());
+            w.push(w[a] + w[b]);
+            parent.push(- 1);
+            alive.push(1);
+            left = left - 1;
+        }
+        var lens: Vec<i64> = Vec::filled(n, 0);
+        var maxl: i64 = 0;
+        i = 0;
+        while i < n {
+            var nd: i64 = node[i];
+            if nd >= 0 {
+                var d: i64 = 0;
+                while parent[nd] >= 0 {
+                    nd = parent[nd];
+                    d = d + 1;
+                }
+                lens.set(i, d);
+                if d > maxl {
+                    maxl = d;
+                }
+            }
+            i = i + 1;
+        }
+        if maxl <= limit {
+            return lens;
+        }
+        i = 0;
+        while i < n {
+            if f[i] > 0 {
+                f.set(i, (f[i] >> 1) | 1);
+            }
+            i = i + 1;
+        }
+    }
+    return Vec::new();
+}
+
+// Canonical codes (shorter codes first, symbols in order within a length,
+// as h_add lays them out) as table entries code | length << 16.
+fn bc_canon(lens: Vec<i64>) -> Vec<i64> {
+    val n: i64 = lens.len();
+    var count: Vec<i64> = Vec::filled(17, 0);
+    var i: i64 = 0;
+    while i < n {
+        if lens[i] > 0 {
+            count.set(lens[i], count[lens[i]] + 1);
+        }
+        i = i + 1;
+    }
+    var next: Vec<i64> = Vec::filled(17, 0);
+    var code: i64 = 0;
+    var b: i64 = 1;
+    while b <= 16 {
+        code = (code + count[b - 1]) << 1;
+        if b - 1 == 0 {
+            code = 0;
+        }
+        next.set(b, code);
+        b = b + 1;
+    }
+    var tab: Vec<i64> = Vec::filled(n, 0);
+    i = 0;
+    while i < n {
+        val l: i64 = lens[i];
+        if l > 0 {
+            tab.set(i, next[l] | (l << 16));
+            next.set(l, next[l] + 1);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Repeat codes for `reps` (3 or more) repetitions: code 16 (2 extra bits)
+// or 17 (3), several in a row multiplying (RFC 7932 3.5).
+fn bc_rep_tokens(codes: & mut Vec<i64>, extras: & mut Vec<i64>, code: i64, bits: i64, reps: i64) -> void {
+    var r: i64 = reps - 3;
+    var digits: Vec<i64> = Vec::new();
+    while true {
+        digits.push(r & ((1 << bits) - 1));
+        r = r >> bits;
+        if r == 0 {
+            break;
+        }
+        r = r - 1;
+    }
+    var k: i64 = digits.len() - 1;
+    while k >= 0 {
+        codes.push(code);
+        extras.push(digits[k]);
+        k = k - 1;
+    }
+}
+
+// The fixed code of a code-length code length (RFC 7932 3.5).
+fn bc_cl_len(w: & mut BcBits, v: i64) -> void {
+    if v == 0 {
+        bc_put(w, 0, 2);
+    } else if v == 1 {
+        bc_put(w, 7, 4);
+    } else if v == 2 {
+        bc_put(w, 3, 3);
+    } else if v == 3 {
+        bc_put(w, 2, 2);
+    } else if v == 4 {
+        bc_put(w, 1, 2);
+    } else {
+        bc_put(w, 15, 4);
+    }
+}
+
+// Write the prefix code for symbol counts `freq` over an alphabet of
+// `asize` symbols; returns the code table (code | length << 16; a code
+// with one symbol has 0 bits).
+fn bc_tree(w: & mut BcBits, freq: Vec<i64>, asize: i64) -> Vec<i64> {
+    var syms: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < asize {
+        if freq[i] > 0 {
+            syms.push(i);
+        }
+        i = i + 1;
+    }
+    var nbits: i64 = 0;
+    while (1 << nbits) < asize {
+        nbits = nbits + 1;
+    }
+    if syms.len() <= 1 {
+        var only: i64 = 0;
+        if syms.len() == 1 {
+            only = syms[0];
+        }
+        bc_put(w, 1, 2);
+        bc_put(w, 0, 2);
+        bc_put(w, only, nbits);
+        return Vec::filled(asize, 0);
+    }
+    val lens: Vec<i64> = bc_lengths(freq, asize, 15);
+    val tab: Vec<i64> = bc_canon(lens);
+    val nsym: i64 = syms.len();
+    if nsym <= 4 {
+        // simple prefix code: symbols listed shortest code first
+        var order: Vec<i64> = Vec::new();
+        var l: i64 = 1;
+        while l <= 3 {
+            var k: i64 = 0;
+            while k < nsym {
+                if lens[syms[k]] == l {
+                    order.push(syms[k]);
+                }
+                k = k + 1;
+            }
+            l = l + 1;
+        }
+        bc_put(w, 1, 2);
+        bc_put(w, nsym - 1, 2);
+        var k2: i64 = 0;
+        while k2 < nsym {
+            bc_put(w, order[k2], nbits);
+            k2 = k2 + 1;
+        }
+        if nsym == 4 {
+            if lens[order[0]] == 1 {
+                bc_put(w, 1, 1);
+            } else {
+                bc_put(w, 0, 1);
+            }
+        }
+        return tab;
+    }
+    // complex prefix code: the code lengths with repeat codes, as tokens
+    var last: i64 = asize - 1;
+    while lens[last] == 0 {
+        last = last - 1;
+    }
+    var tcode: Vec<i64> = Vec::new();
+    var textra: Vec<i64> = Vec::new();
+    var prev: i64 = 8;
+    i = 0;
+    while i <= last {
+        val v: i64 = lens[i];
+        var r: i64 = 1;
+        while i + r <= last && lens[i + r] == v {
+            r = r + 1;
+        }
+        if v == 0 {
+            var z: i64 = r;
+            if z == 11 {
+                tcode.push(0);
+                textra.push(0);
+                z = 10;
+            }
+            if z < 3 {
+                while z > 0 {
+                    tcode.push(0);
+                    textra.push(0);
+                    z = z - 1;
+                }
+            } else {
+                bc_rep_tokens(& mut tcode, & mut textra, 17, 3, z);
+            }
+        } else {
+            var k3: i64 = r;
+            if prev != v {
+                tcode.push(v);
+                textra.push(0);
+                k3 = k3 - 1;
+            }
+            if k3 == 7 {
+                tcode.push(v);
+                textra.push(0);
+                k3 = k3 - 1;
+            }
+            if k3 < 3 {
+                while k3 > 0 {
+                    tcode.push(v);
+                    textra.push(0);
+                    k3 = k3 - 1;
+                }
+            } else {
+                bc_rep_tokens(& mut tcode, & mut textra, 16, 2, k3);
+            }
+            prev = v;
+        }
+        i = i + r;
+    }
+    // the code-length code (lengths at most 5)
+    var cfreq: Vec<i64> = Vec::filled(18, 0);
+    var cused: i64 = 0;
+    i = 0;
+    while i < tcode.len() {
+        if cfreq[tcode[i]] == 0 {
+            cused = cused + 1;
+        }
+        cfreq.set(tcode[i], cfreq[tcode[i]] + 1);
+        i = i + 1;
+    }
+    var clens: Vec<i64> = Vec::filled(18, 0);
+    var ctab: Vec<i64> = Vec::filled(18, 0);
+    if cused == 1 {
+        // one code-length symbol: a 0-bit code, all 18 lengths written
+        clens.set(tcode[0], 1);
+    } else {
+        clens = bc_lengths(cfreq, 18, 5);
+        ctab = bc_canon(clens);
+    }
+    bc_put(w, 0, 2);
+    var space: i64 = 32;
+    i = 0;
+    while i < 18 {
+        val cv: i64 = clens[cl_order(i)];
+        bc_cl_len(w, cv);
+        if cv != 0 {
+            space = space - (32 >> cv);
+            if space <= 0 {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < tcode.len() {
+        val tc: i64 = tcode[i];
+        if cused > 1 {
+            bc_sym(w, ctab, tc);
+        }
+        if tc == 16 {
+            bc_put(w, textra[i], 2);
+        } else if tc == 17 {
+            bc_put(w, textra[i], 3);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Compression state: the input, hash chains, search effort, window, the
+// last distance (the decoder's ring) and the last match found.
+struct BcCtx {
+    data: Vec<i64>,
+    n: i64,
+    head: Vec<i64>,
+    prev: Vec<i64>,
+    hbits: i64,
+    ins: i64,
+    depth: i64,
+    lazy: bool,
+    win: i64,
+    last: i64,
+    ml_len: i64,
+    ml_off: i64,
+    insb: Vec<i64>,
+    cpyb: Vec<i64>,
+}
+
+fn bc_hash(d: Vec<i64>, p: i64, hbits: i64) -> i64 {
+    val v: i64 = d[p] | (d[p + 1] << 8) | (d[p + 2] << 16) | (d[p + 3] << 24);
+    return ((v * 739982445) >> 20) & ((1 << hbits) - 1);
+}
+
+fn bc_insert_upto(c: & mut BcCtx, p: i64) -> void {
+    while c.ins < p {
+        val q: i64 = c.ins;
+        if q + 4 <= c.n {
+            val h: i64 = bc_hash(c.data, q, c.hbits);
+            c.prev.set(q, c.head[h]);
+            c.head.set(h, q);
+        }
+        c.ins = q + 1;
+    }
+}
+
+fn bc_mlen(d: Vec<i64>, a: i64, b: i64, max: i64) -> i64 {
+    var l: i64 = 0;
+    while l < max && d[a + l] == d[b + l] {
+        l = l + 1;
+    }
+    return l;
+}
+
+// The longest match at p ending by `end` (c.ml_len, c.ml_off; ml_len is 0
+// without one of 4 bytes or more): the last distance first, then the chain.
+fn bc_find(c: & mut BcCtx, p: i64, end: i64) -> void {
+    c.ml_len = 0;
+    c.ml_off = 0;
+    val maxlen: i64 = end - p;
+    if maxlen < 4 || p + 4 > c.n {
+        return;
+    }
+    var best: i64 = 3;
+    if c.last <= p && c.last <= c.win {
+        val l: i64 = bc_mlen(c.data, p - c.last, p, maxlen);
+        if l > best {
+            best = l;
+            c.ml_len = l;
+            c.ml_off = c.last;
+        }
+    }
+    if best >= maxlen {
+        return;
+    }
+    var cand: i64 = c.head[bc_hash(c.data, p, c.hbits)];
+    var depth: i64 = c.depth;
+    while cand >= 0 && depth > 0 {
+        if p - cand > c.win {
+            break;
+        }
+        if c.data[cand + best] == c.data[p + best] {
+            val l2: i64 = bc_mlen(c.data, cand, p, maxlen);
+            if l2 > best {
+                best = l2;
+                c.ml_len = l2;
+                c.ml_off = p - cand;
+                if l2 >= maxlen {
+                    break;
+                }
+            }
+        }
+        cand = c.prev[cand];
+        depth = depth - 1;
+    }
+}
+
+// The insert-length or copy-length code of v: the largest whose base is <= v.
+fn bc_len_code(bases: Vec<i64>, v: i64) -> i64 {
+    var k: i64 = 23;
+    while k > 0 && bases[k] > v {
+        k = k - 1;
+    }
+    return k;
+}
+
+// The command cell (RFC 7932 5) of insert code base ib and copy code base cb
+// (0, 8 or 16) with an explicit distance.
+fn bc_cell(ib: i64, cb: i64) -> i64 {
+    if ib == 0 {
+        if cb == 0 {
+            return 2;
+        }
+        if cb == 8 {
+            return 3;
+        }
+        return 6;
+    }
+    if ib == 8 {
+        if cb == 0 {
+            return 4;
+        }
+        if cb == 8 {
+            return 5;
+        }
+        return 8;
+    }
+    if cb == 0 {
+        return 7;
+    }
+    if cb == 8 {
+        return 9;
+    }
+    return 10;
+}
+
+// One compressed meta-block body for data[ms..me) (from NBLTYPESL on).
+fn bc_meta(c: & mut BcCtx, w: & mut BcBits, ms: i64, me: i64) -> void {
+    // commands: literals start, insert length, copy length (0: literals
+    // only, the meta-block's last), command symbol, distance symbol (-1:
+    // none), distance extra bits and their count
+    var cpos: Vec<i64> = Vec::new();
+    var cins: Vec<i64> = Vec::new();
+    var ccpy: Vec<i64> = Vec::new();
+    var csym: Vec<i64> = Vec::new();
+    var cdst: Vec<i64> = Vec::new();
+    var cdx: Vec<i64> = Vec::new();
+    var cdn: Vec<i64> = Vec::new();
+    var litf: Vec<i64> = Vec::filled(256, 0);
+    var cmdf: Vec<i64> = Vec::filled(704, 0);
+    var dstf: Vec<i64> = Vec::filled(64, 0);
+    var p: i64 = ms;
+    var anchor: i64 = ms;
+    while p <= me {
+        var len: i64 = 0;
+        var off: i64 = 0;
+        if p + 4 <= me {
+            bc_insert_upto(c, p);
+            bc_find(c, p, me);
+            len = c.ml_len;
+            off = c.ml_off;
+            if len >= 4 && c.lazy && p + 5 <= me {
+                bc_insert_upto(c, p + 1);
+                bc_find(c, p + 1, me);
+                if c.ml_len > len {
+                    p = p + 1;
+                    len = c.ml_len;
+                    off = c.ml_off;
+                }
+            }
+        }
+        if len < 4 && p < me {
+            p = p + 1;
+            continue;
+        }
+        if len < 4 && anchor == me {
+            break;
+        }
+        // a command: the literals anchor..p, then the match (if any)
+        val ilen: i64 = p - anchor;
+        val ic: i64 = bc_len_code(c.insb, ilen);
+        var cc: i64 = 0;
+        if len >= 4 {
+            cc = bc_len_code(c.cpyb, len);
+        }
+        var sym: i64 = 0;
+        var dsym: i64 = - 1;
+        var dx: i64 = 0;
+        var dn: i64 = 0;
+        if len < 4 {
+            sym = (bc_cell(ic & 24, 0) << 6) | ((ic & 7) << 3);
+        } else if off == c.last && ic < 8 && cc < 16 {
+            var cell: i64 = 0;
+            if cc >= 8 {
+                cell = 1;
+            }
+            sym = (cell << 6) | ((ic & 7) << 3) | (cc & 7);
+        } else {
+            sym = (bc_cell(ic & 24, cc & 24) << 6) | ((ic & 7) << 3) | (cc & 7);
+            if off == c.last {
+                dsym = 0;
+            } else {
+                val x: i64 = off + 3;
+                var h: i64 = 0;
+                while (x >> (h + 1)) > 0 {
+                    h = h + 1;
+                }
+                dn = h - 1;
+                dsym = 16 + 2 * (dn - 1) + ((x >> dn) & 1);
+                dx = x & ((1 << dn) - 1);
+                c.last = off;
+            }
+            dstf.set(dsym, dstf[dsym] + 1);
+        }
+        cmdf.set(sym, cmdf[sym] + 1);
+        var k: i64 = anchor;
+        while k < p {
+            litf.set(c.data[k], litf[c.data[k]] + 1);
+            k = k + 1;
+        }
+        cpos.push(anchor);
+        cins.push(ilen);
+        if len >= 4 {
+            ccpy.push(len);
+        } else {
+            ccpy.push(0);
+        }
+        csym.push(sym);
+        cdst.push(dsym);
+        cdx.push(dx);
+        cdn.push(dn);
+        if len < 4 {
+            break;
+        }
+        p = p + len;
+        anchor = p;
+        if p == me {
+            break;
+        }
+    }
+    // header: one block type per category, NPOSTFIX 0, NDIRECT 0, context
+    // mode LSB6, one literal tree, one distance tree
+    bc_put(w, 0, 1);
+    bc_put(w, 0, 1);
+    bc_put(w, 0, 1);
+    bc_put(w, 0, 2);
+    bc_put(w, 0, 4);
+    bc_put(w, 0, 2);
+    bc_put(w, 0, 1);
+    bc_put(w, 0, 1);
+    val ltab: Vec<i64> = bc_tree(w, litf, 256);
+    val ctab: Vec<i64> = bc_tree(w, cmdf, 704);
+    val dtab: Vec<i64> = bc_tree(w, dstf, 64);
+    var i: i64 = 0;
+    while i < cins.len() {
+        val s: i64 = csym[i];
+        bc_sym(w, ctab, s);
+        val ilen2: i64 = cins[i];
+        val ic2: i64 = bc_len_code(c.insb, ilen2);
+        bc_put(w, ilen2 - c.insb[ic2], ins_extra(ic2));
+        val clen: i64 = ccpy[i];
+        if clen > 0 {
+            val cc2: i64 = bc_len_code(c.cpyb, clen);
+            bc_put(w, clen - c.cpyb[cc2], cpy_extra(cc2));
+        }
+        var k2: i64 = 0;
+        while k2 < ilen2 {
+            bc_sym(w, ltab, c.data[cpos[i] + k2]);
+            k2 = k2 + 1;
+        }
+        if clen > 0 && cdst[i] >= 0 {
+            bc_sym(w, dtab, cdst[i]);
+            bc_put(w, cdx[i], cdn[i]);
+        }
+        i = i + 1;
+    }
+}
+
+/// Compress `bytes` (values 0..255; higher bits are dropped) into a Brotli
+/// stream (RFC 7932). `quality` 0 only stores (uncompressed meta-blocks);
+/// 1 to 11 search for matches, harder at higher qualities (6 is
+/// brotli_compress's). Any Brotli decoder reads the result; the ratio is
+/// below the reference encoder's (no dictionary, no context modelling).
+///
+/// Example:
+///   var b: Vec<i64> = Vec::new();
+///   var i: i64 = 0;
+///   while i < 300 { b.push(120 + i % 4); i = i + 1; }
+///   val z: Vec<i64> = brotli_compress_level(b, 6);
+///   assert(z.len() < 40);
+///   assert(brotli_ok(z));
+///   assert_eq(brotli_decompress(z).len(), 300);
+///   assert_eq(brotli_decompress(brotli_compress_level(b, 0)).len(), 300);
+pub fn brotli_compress_level(bytes: Vec<i64>, quality: i64) -> Vec<i64> {
+    val n: i64 = bytes.len();
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        data.push(bytes[i] & 255);
+        i = i + 1;
+    }
+    var w: BcBits = bc_bits_new();
+    var wbits: i64 = 16;
+    while wbits < 24 && (1 << wbits) - 16 < n {
+        wbits = wbits + 1;
+    }
+    if wbits == 17 {
+        wbits = 18;
+    }
+    if wbits == 16 {
+        bc_put(& mut w, 0, 1);
+    } else {
+        bc_put(& mut w, 1, 1);
+        bc_put(& mut w, wbits - 17, 3);
+    }
+    if n == 0 {
+        bc_put(& mut w, 1, 1);
+        bc_put(& mut w, 1, 1);
+        bc_align(& mut w);
+        return w.out;
+    }
+    var depth: i64 = 0;
+    var lazy: bool = false;
+    if quality >= 1 {
+        depth = 4;
+    }
+    if quality >= 3 {
+        depth = 16;
+    }
+    if quality >= 5 {
+        lazy = true;
+    }
+    if quality >= 6 {
+        depth = 64;
+    }
+    if quality >= 9 {
+        depth = 256;
+    }
+    var hb: i64 = 8;
+    var plen: i64 = 1;
+    if depth > 0 {
+        while hb < 16 && (1 << hb) < n {
+            hb = hb + 1;
+        }
+        plen = n + 1;
+    }
+    var insb: Vec<i64> = Vec::new();
+    var cpyb: Vec<i64> = Vec::new();
+    var ib: i64 = 0;
+    var cb: i64 = 2;
+    var k: i64 = 0;
+    while k < 24 {
+        insb.push(ib);
+        ib = ib + (1 << ins_extra(k));
+        cpyb.push(cb);
+        cb = cb + (1 << cpy_extra(k));
+        k = k + 1;
+    }
+    var c: BcCtx = BcCtx {
+        data: data, n: n, head: Vec::filled(1 << hb, - 1), prev: Vec::filled(plen, - 1), hbits: hb, ins: 0, depth: depth, lazy: lazy, win: (1 << wbits) - 16, last: 4, ml_len: 0, ml_off: 0, insb: insb, cpyb: cpyb
+    };
+    var ms: i64 = 0;
+    var ended: bool = false;
+    while ms < n {
+        var me: i64 = ms + 1048576;
+        if me > n {
+            me = n;
+        }
+        val islast: bool = me == n;
+        val mlen: i64 = me - ms;
+        var body: BcBits = bc_bits_new();
+        var saved_last: i64 = c.last;
+        var packed: bool = false;
+        if depth > 0 {
+            bc_meta(& mut c, & mut body, ms, me);
+            packed = bc_bitlen(body) < 8 * mlen;
+        }
+        // ISLAST (and ISLASTEMPTY 0); an uncompressed meta-block cannot be
+        // the last one, an empty last one follows it
+        if islast && packed {
+            bc_put(& mut w, 1, 1);
+            bc_put(& mut w, 0, 1);
+            ended = true;
+        } else {
+            bc_put(& mut w, 0, 1);
+        }
+        var nib: i64 = 4;
+        if mlen - 1 >= 65536 {
+            nib = 5;
+        }
+        if mlen - 1 >= 1048576 {
+            nib = 6;
+        }
+        bc_put(& mut w, nib - 4, 2);
+        bc_put(& mut w, mlen - 1, 4 * nib);
+        if packed {
+            if !islast {
+                bc_put(& mut w, 0, 1);
+            }
+            bc_append(& mut w, body);
+        } else {
+            c.last = saved_last;
+            bc_put(& mut w, 1, 1);
+            bc_align(& mut w);
+            var j: i64 = ms;
+            while j < me {
+                w.out.push(c.data[j]);
+                j = j + 1;
+            }
+        }
+        ms = me;
+    }
+    if !ended {
+        bc_put(& mut w, 1, 1);
+        bc_put(& mut w, 1, 1);
+    }
+    bc_align(& mut w);
+    return w.out;
+}
+
+/// Compress `bytes` into a Brotli stream at quality 6 (see
+/// brotli_compress_level).
+pub fn brotli_compress(bytes: Vec<i64>) -> Vec<i64> {
+    return brotli_compress_level(bytes, 6);
+}
+
+/// Compress the bytes of a string at quality 6; brotli_decompress_str gives
+/// the string back.
+pub fn brotli_compress_str(s: str) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(s);
+    while i < n {
+        b.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    return brotli_compress_level(b, 6);
 }

@@ -1,0 +1,341 @@
+// stdlib/mqtt: packets of MQTT 3.1.1 and 5.0 against hand-checked bytes (spec remaining-length table, CONNECT variable header example), decode/re-encode, malformed packets, topic filter examples of section 4.7, and client QoS 0/1/2, subscribe, keep-alive and session-resume flows against a scripted broker.
+// Expected output:
+// remaining length: 00 7f 8001 ff7f 808001 ffff7f 80808001 ffffff7f
+// packets: 20 of 20 encode as expected and decode back
+// connect v5: session expiry 3600, client test
+// connect example: 00044d51545404ce000a, user u, will w/t qos 1
+// malformed: 8 of 8 rejected
+// topics: 21 of 21 as section 4.7 says
+// client: connected after 101500044d5154540402003c000973656e736f722d3031
+// client: qos 0 sent 30080006612f622f6331
+// client: qos 1 id 1 completed [1]
+// client: qos 2 id 2 sent pubrel 62020002, completed [1, 2]
+// client: suback id 3 codes [1, 128]
+// client: incoming qos 2 delivered 1 time(s), sent 50020007 50020007 70020007
+// client: message s/t "on" qos 2 then qos 1 "x" acked 40020009
+// client: ping c000 then timeout: keep alive timeout
+// client: resume sends 3a080003612f62000178 (dup), inflight 1
+// client v5: receive maximum 1, second publish -1, unsuback ok
+use mqtt;
+use vec;
+use string;
+use encoding;
+
+fn hx(v: Vec<i64>) -> str {
+    return hex_encode_bytes(v);
+}
+
+fn hb(s: str) -> Vec<i64> {
+    return hex_decode_bytes(s);
+}
+
+fn bytes_of(s: str) -> Vec<i64> {
+    return str_bytes(s);
+}
+
+var pk_ok: i64 = 0;
+var pk_n: i64 = 0;
+
+fn check_pkt(p: & MqttPacket, want: str) {
+    pk_n = pk_n + 1;
+    val got: str = hx(mqtt_encode(p));
+    if got != want {
+        println("encode " + int_to_str(p.ptype) + ": got " + got + " want " + want);
+        return;
+    }
+    val d: MqttDecoded = mqtt_decode(hb(want), p.version);
+    if !d.ok {
+        println("decode " + want + ": " + d.error);
+        return;
+    }
+    val again: str = hx(mqtt_encode(&d.packet));
+    if again != want {
+        println("re-encode " + want + ": " + again);
+        return;
+    }
+    pk_ok = pk_ok + 1;
+}
+
+var bad_ok: i64 = 0;
+var bad_n: i64 = 0;
+
+fn bad(hex: str, version: i64) {
+    bad_n = bad_n + 1;
+    val d: MqttDecoded = mqtt_decode(hb(hex), version);
+    if !d.ok {
+        bad_ok = bad_ok + 1;
+    } else {
+        println("accepted " + hex);
+    }
+}
+
+var tp_ok: i64 = 0;
+var tp_n: i64 = 0;
+
+fn tm(filter: str, topic: str, want: bool) {
+    tp_n = tp_n + 1;
+    if mqtt_topic_matches(filter, topic) == want {
+        tp_ok = tp_ok + 1;
+    } else {
+        println("topic " + filter + " vs " + topic + ": wrong");
+    }
+}
+
+fn joined(v: Vec<Vec<i64>>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + hx(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn ints(v: Vec<i64>) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + ", ";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+fn feed_hex(c: &mut MqttClient, h: str, now: i64) {
+    if !mqtt_client_feed(c, hb(h), now) {
+        println("feed failed: " + c.error);
+    }
+}
+
+fn main() {
+    // Remaining length (MQTT 3.1.1 table 2.4)
+    var rl: str = "";
+    val lens: Vec<i64> = Vec::new();
+    var lv: Vec<i64> = lens;
+    lv.push(0); lv.push(127); lv.push(128); lv.push(16383); lv.push(16384);
+    lv.push(2097151); lv.push(2097152); lv.push(268435455);
+    var i: i64 = 0;
+    while i < lv.len() {
+        var o: Vec<i64> = Vec::new();
+        mqtt_put_varint(&mut o, lv.get(i));
+        if i > 0 {
+            rl = rl + " ";
+        }
+        rl = rl + hx(o);
+        i = i + 1;
+    }
+    println("remaining length: " + rl);
+
+    // Packets
+    var c1: MqttPacket = mqtt_packet(MQTT_CONNECT, MQTT_V311);
+    c1.client_id = "test";
+    check_pkt(&c1, "101000044d5154540402003c000474657374");
+    var c5: MqttPacket = mqtt_packet(MQTT_CONNECT, MQTT_V5);
+    c5.client_id = "test";
+    mqtt_prop_int(&mut c5.props, MQTT_P_SESSION_EXPIRY, 3600);
+    check_pkt(&c5, "101600044d5154540502003c051100000e10000474657374");
+    var ca: MqttPacket = mqtt_packet(MQTT_CONNACK, MQTT_V311);
+    check_pkt(&ca, "20020000");
+    ca.session_present = true;
+    ca.reason = 5;
+    check_pkt(&ca, "20020105");
+    var pb: MqttPacket = mqtt_packet(MQTT_PUBLISH, MQTT_V311);
+    pb.topic = "a/b";
+    pb.payload = bytes_of("hi");
+    check_pkt(&pb, "30070003612f626869");
+    pb.qos = 1;
+    pb.packet_id = 10;
+    check_pkt(&pb, "32090003612f62000a6869");
+    pb.version = MQTT_V5;
+    check_pkt(&pb, "320a0003612f62000a006869");
+    pb.qos = 2;
+    pb.dup = true;
+    pb.retain = true;
+    mqtt_prop_str(&mut pb.props, MQTT_P_CONTENT_TYPE, "t");
+    mqtt_prop_user(&mut pb.props, "k", "v");
+    check_pkt(&pb, "3d150003612f62000a0b030001742600016b0001766869");
+    var ack: MqttPacket = mqtt_packet(MQTT_PUBACK, MQTT_V311);
+    ack.packet_id = 10;
+    check_pkt(&ack, "4002000a");
+    ack.version = MQTT_V5;
+    ack.reason = 0x10;
+    check_pkt(&ack, "4003000a10");
+    var rel: MqttPacket = mqtt_packet(MQTT_PUBREL, MQTT_V311);
+    rel.packet_id = 10;
+    check_pkt(&rel, "6202000a");
+    var sub: MqttPacket = mqtt_packet(MQTT_SUBSCRIBE, MQTT_V311);
+    sub.packet_id = 1;
+    sub.filters.push("a/#");
+    sub.options.push(1);
+    check_pkt(&sub, "820800010003612f2301");
+    var sa: MqttPacket = mqtt_packet(MQTT_SUBACK, MQTT_V311);
+    sa.packet_id = 1;
+    sa.codes.push(1);
+    sa.codes.push(0x80);
+    check_pkt(&sa, "9004000101" + "80");
+    var un: MqttPacket = mqtt_packet(MQTT_UNSUBSCRIBE, MQTT_V311);
+    un.packet_id = 1;
+    un.filters.push("a/#");
+    check_pkt(&un, "a20700010003612f23");
+    var ua: MqttPacket = mqtt_packet(MQTT_UNSUBACK, MQTT_V311);
+    ua.packet_id = 1;
+    check_pkt(&ua, "b0020001");
+    ua.version = MQTT_V5;
+    ua.codes.push(0);
+    check_pkt(&ua, "b00400010000");
+    check_pkt(&mqtt_packet(MQTT_PINGREQ, MQTT_V311), "c000");
+    check_pkt(&mqtt_packet(MQTT_PINGRESP, MQTT_V311), "d000");
+    check_pkt(&mqtt_packet(MQTT_DISCONNECT, MQTT_V311), "e000");
+    var dc: MqttPacket = mqtt_packet(MQTT_DISCONNECT, MQTT_V5);
+    dc.reason = 4;
+    check_pkt(&dc, "e00104");
+    println("packets: " + int_to_str(pk_ok) + " of " + int_to_str(pk_n) + " encode as expected and decode back");
+
+    val d5: MqttDecoded = mqtt_decode(hb("101600044d5154540502003c051100000e10000474657374"), MQTT_V311);
+    println("connect v5: session expiry " + int_to_str(mqtt_prop_get_int(&d5.packet.props, MQTT_P_SESSION_EXPIRY, 0)) + ", client " + d5.packet.client_id);
+
+    // The 3.1.1 spec's CONNECT variable header example: flags CE, keep alive 10
+    var ce: MqttPacket = mqtt_packet(MQTT_CONNECT, MQTT_V311);
+    ce.client_id = "c";
+    ce.keep_alive = 10;
+    ce.has_will = true;
+    ce.will_qos = 1;
+    ce.will_topic = "w/t";
+    ce.will_payload = bytes_of("bye");
+    ce.has_username = true;
+    ce.username = "u";
+    ce.has_password = true;
+    ce.password = bytes_of("p");
+    val ceb: Vec<i64> = mqtt_encode(&ce);
+    var vh: Vec<i64> = Vec::new();
+    i = 2;
+    while i < 12 {
+        vh.push(ceb.get(i));
+        i = i + 1;
+    }
+    val ced: MqttDecoded = mqtt_decode(ceb, MQTT_V311);
+    println("connect example: " + hx(vh) + ", user " + ced.packet.username + ", will " + ced.packet.will_topic + " qos " + int_to_str(ced.packet.will_qos));
+
+    bad("36070003612f626869", MQTT_V311);      // QoS 3
+    bad("6002000a", MQTT_V311);                // PUBREL with flags 0
+    bad("30ffffffff7f", MQTT_V311);            // remaining length of 5 bytes
+    bad("101000044d5154540403003c000474657374", MQTT_V311); // reserved connect flag
+    bad("82020001", MQTT_V311);                // SUBSCRIBE without a filter
+    bad("4004000a1001", MQTT_V5);              // property length past the end
+    bad("4005000a0001a0", MQTT_V5);            // unknown property 0xa0
+    bad("101000044d5154540702003c000474657374", MQTT_V311); // protocol level 7
+    println("malformed: " + int_to_str(bad_ok) + " of " + int_to_str(bad_n) + " rejected");
+
+    // Section 4.7 examples
+    tm("sport/tennis/player1/#", "sport/tennis/player1", true);
+    tm("sport/tennis/player1/#", "sport/tennis/player1/ranking", true);
+    tm("sport/tennis/player1/#", "sport/tennis/player1/score/wimbledon", true);
+    tm("sport/#", "sport", true);
+    tm("#", "sport/tennis", true);
+    tm("sport/tennis#", "sport/tennis", false);
+    tm("sport/tennis/#/ranking", "sport/tennis/x/ranking", false);
+    tm("sport/tennis/+", "sport/tennis/player1", true);
+    tm("sport/tennis/+", "sport/tennis/player1/ranking", false);
+    tm("sport/+", "sport", false);
+    tm("sport/+", "sport/", true);
+    tm("+/+", "/finance", true);
+    tm("/+", "/finance", true);
+    tm("+", "/finance", false);
+    tm("sport+", "sport1", false);
+    tm("#", "$SYS/monitor/Clients", false);
+    tm("+/monitor/Clients", "$SYS/monitor/Clients", false);
+    tm("$SYS/#", "$SYS/monitor/Clients", true);
+    tm("$SYS/monitor/+", "$SYS/monitor/Clients", true);
+    tm("a/b", "a/b", true);
+    tm("a/b", "a/B", false);
+    println("topics: " + int_to_str(tp_ok) + " of " + int_to_str(tp_n) + " as section 4.7 says");
+
+    // Client flows against a scripted broker
+    var c: MqttClient = mqtt_client_new("sensor-01", MQTT_V311, 60);
+    mqtt_client_connect(&mut c, true, 0);
+    val conn: str = joined(mqtt_client_take_outbox(&mut c));
+    feed_hex(&mut c, "20020000", 10);
+    if c.state == MQTT_ST_CONNECTED {
+        println("client: connected after " + conn);
+    }
+    mqtt_client_publish(&mut c, "a/b/c1", bytes_of(""), 0, false, 20);
+    println("client: qos 0 sent " + joined(mqtt_client_take_outbox(&mut c)));
+    val id1: i64 = mqtt_client_publish(&mut c, "a/b", bytes_of("x"), 1, false, 30);
+    mqtt_client_take_outbox(&mut c);
+    feed_hex(&mut c, "40020001", 40);
+    println("client: qos 1 id " + int_to_str(id1) + " completed " + ints(c.completed));
+    val id2: i64 = mqtt_client_publish(&mut c, "a/b", bytes_of("y"), 2, false, 50);
+    mqtt_client_take_outbox(&mut c);
+    feed_hex(&mut c, "50020002", 60);
+    val relb: str = joined(mqtt_client_take_outbox(&mut c));
+    feed_hex(&mut c, "70020002", 70);
+    println("client: qos 2 id " + int_to_str(id2) + " sent pubrel " + relb + ", completed " + ints(c.completed));
+    var fs: Vec<str> = Vec::new();
+    fs.push("s/#");
+    fs.push("$SYS/#");
+    var qs: Vec<i64> = Vec::new();
+    qs.push(2);
+    qs.push(0);
+    val sid: i64 = mqtt_client_subscribe(&mut c, fs, qs, 80);
+    mqtt_client_take_outbox(&mut c);
+    feed_hex(&mut c, "9004000301" + "80", 90);
+    println("client: suback id " + int_to_str(sid) + " codes " + ints(c.suback_codes.get(0)));
+    // incoming QoS 2, sent twice (the second with DUP), byte by byte
+    val inq2: Vec<i64> = hb("34090003732f740007" + "6f6e");
+    i = 0;
+    while i < inq2.len() {
+        var one: Vec<i64> = Vec::new();
+        one.push(inq2.get(i));
+        mqtt_client_feed(&mut c, one, 100);
+        i = i + 1;
+    }
+    feed_hex(&mut c, "3c090003732f740007" + "6f6e", 110);
+    feed_hex(&mut c, "62020007", 120);
+    val msgs: Vec<MqttPacket> = mqtt_client_take_messages(&mut c);
+    println("client: incoming qos 2 delivered " + int_to_str(msgs.len()) + " time(s), sent " + joined(mqtt_client_take_outbox(&mut c)));
+    feed_hex(&mut c, "32080003732f740009" + "78", 130);
+    val m2: Vec<MqttPacket> = mqtt_client_take_messages(&mut c);
+    val ma: MqttPacket = msgs.get(0);
+    val mb: MqttPacket = m2.get(0);
+    println("client: message " + ma.topic + " \"" + str_from_bytes(ma.payload) + "\" qos " + int_to_str(ma.qos) + " then qos " + int_to_str(mb.qos) + " \"" + str_from_bytes(mb.payload) + "\" acked " + joined(mqtt_client_take_outbox(&mut c)));
+    // keep alive: 60 s idle -> PINGREQ; answered; again; unanswered -> lost
+    mqtt_client_tick(&mut c, 60130);
+    val ping: str = joined(mqtt_client_take_outbox(&mut c));
+    feed_hex(&mut c, "d000", 60200);
+    mqtt_client_tick(&mut c, 120130);
+    mqtt_client_take_outbox(&mut c);
+    mqtt_client_tick(&mut c, 180130);
+    println("client: ping " + ping + " then timeout: " + c.error);
+    // resume: a QoS 1 message unacknowledged, reconnect to a kept session
+    var r: MqttClient = mqtt_client_new("r", MQTT_V311, 0);
+    mqtt_client_connect(&mut r, false, 0);
+    feed_hex(&mut r, "20020000", 1);
+    mqtt_client_publish(&mut r, "a/b", bytes_of("x"), 1, false, 2);
+    mqtt_client_lost(&mut r, "socket closed");
+    mqtt_client_take_outbox(&mut r);
+    mqtt_client_connect(&mut r, false, 3);
+    mqtt_client_take_outbox(&mut r);
+    feed_hex(&mut r, "20020100", 4);
+    println("client: resume sends " + joined(mqtt_client_take_outbox(&mut r)) + " (dup), inflight " + int_to_str(mqtt_client_inflight(&r)));
+    // v5: the server's Receive Maximum of 1
+    var v: MqttClient = mqtt_client_new("v", MQTT_V5, 30);
+    mqtt_client_connect(&mut v, true, 0);
+    feed_hex(&mut v, "2006000003210001", 1);
+    mqtt_client_publish(&mut v, "t", bytes_of("1"), 1, false, 2);
+    val second: i64 = mqtt_client_publish(&mut v, "t", bytes_of("2"), 1, false, 3);
+    var uf: Vec<str> = Vec::new();
+    uf.push("t");
+    val uid: i64 = mqtt_client_unsubscribe(&mut v, uf, 4);
+    feed_hex(&mut v, "b004000" + int_to_str(uid) + "0000", 5);
+    var unsub_ok: str = "pending";
+    if v.ack_ids.len() == 0 {
+        unsub_ok = "ok";
+    }
+    println("client v5: receive maximum " + int_to_str(v.receive_max) + ", second publish " + int_to_str(second) + ", unsuback " + unsub_ok);
+}

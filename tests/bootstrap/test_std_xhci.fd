@@ -1,0 +1,197 @@
+// stdlib/xhci: capability decoding, bring-up order, command/transfer rings with cycle bits and link TRBs, the event ring, contexts and ports, against a modelled controller and fake DMA memory.
+// Expected output:
+// caps len 0x20 version 0x110 slots 64 intrs 8 ports 4 erst 3 scratch 1 ac64 true csz64 false db 0x3000 rt 0x2000
+// ext caps: 1@0x500 2@0x510 2@0x520
+// legacy handoff true
+// protocol USB  2.0 ports 1+2, USB  3.0 ports 3+2
+// reset true start true
+// config 8 dcbaap 0x102000 crcr 0x100001 erstsz 1 erdp 0x101000 erstba 0x100800 usbcmd 0xd erstba last true
+// enable slot at 0x100000 control 0x2401 doorbell 0x0
+// event type 33 cc Success slot 1 for 0x100000, erdp 0x101018
+// noops at 0x100010 0x100020, link 0x1803 pcs 0, full -1
+// after completions space 2, next at 0x100000 control 0x5c00
+// events: 34 port 3, 33, 33, 32; ccs 0 pending false
+// input ctx add 0x3 slot 0x8400000 0x30000 ep0 0x2000026 0x100101 avg 8
+// address device 0x103000 0x1002c00
+// setup 0x0012000001000680 8 0x30841
+// data 0x10c01 status 0x1021 doorbell 0x1
+// transfer event ep 1 slot 1 cc Success residual 0
+// port3 connected true enabled true powered true speed 4 changes 0x20000
+// port3 after ack 0x1203
+// port1 after reset 0x200203 enabled true
+// dci ep1 in 3 ep2 out 4, types intr-in 7 bulk-out 2, ep0 max 8 64 512
+use xhci;
+use vmm;
+use vec;
+use string;
+
+var g_r: Vec<i64> = Vec::new();
+var g_log: Vec<i64> = Vec::new();
+
+fn h(v: i64) -> str {
+    return "0x" + int_to_hex(v);
+}
+
+fn hx16(v: i64) -> str {
+    var d: str = "0123456789abcdef";
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 15;
+    while i >= 0 {
+        out.push(str_byte_at(d, (v >> (i * 4)) & 15));
+        i = i - 1;
+    }
+    return "0x" + str_from_bytes(out);
+}
+
+fn rd(off: i64) -> i64 {
+    return g_r.get(off / 4);
+}
+
+// the modelled controller: reset completes at once, R/S drives HCH,
+// legacy ownership is released by the BIOS, PORTSC has RW1C bits and a
+// reset that completes immediately
+fn wr(off: i64, v: i64) {
+    g_log.push(off);
+    if off == 0x20 {
+        if (v & USBCMD_HCRST) != 0 {
+            g_r.set(0x20 / 4, 0);
+            g_r.set(0x24 / 4, USBSTS_HCH);
+            return;
+        }
+        g_r.set(0x20 / 4, v);
+        if (v & USBCMD_RS) != 0 { g_r.set(0x24 / 4, 0); } else { g_r.set(0x24 / 4, USBSTS_HCH); }
+        return;
+    }
+    if off == 0x500 {
+        var nv: i64 = v;
+        if (v & (1 << 24)) != 0 { nv = nv & ~(1 << 16); }
+        g_r.set(off / 4, nv);
+        return;
+    }
+    if off >= 0x420 && off < 0x460 && (off & 15) == 0 {
+        var cur: i64 = g_r.get(off / 4);
+        cur = cur & ~(v & 0x00FE0000);
+        if (v & PORTSC_PR) != 0 {
+            cur = cur | PORTSC_PED | PORTSC_PRC;
+        }
+        g_r.set(off / 4, cur);
+        return;
+    }
+    g_r.set(off / 4, v);
+}
+
+fn post(m: &mut PhysMem, seg: i64, idx: i64, cyc: i64, t: Trb) {
+    xhci_trb_write(m, seg + idx * 16, Trb { param: t.param, status: t.status, control: (t.control & ~1) | cyc });
+}
+
+fn main() {
+    g_r = Vec::filled(0x3100 / 4, 0);
+    g_r.set(0, 0x01100020);
+    g_r.set(XHCI_HCSPARAMS1 / 4, 0x04000840);
+    g_r.set(XHCI_HCSPARAMS2 / 4, 0x08000031);
+    g_r.set(XHCI_HCCPARAMS1 / 4, 0x01400009);
+    g_r.set(XHCI_DBOFF / 4, 0x3000);
+    g_r.set(XHCI_RTSOFF / 4, 0x2000);
+    g_r.set(0x24 / 4, USBSTS_CNR);
+    g_r.set(0x500 / 4, 0x00010401);
+    g_r.set(0x510 / 4, 0x02000402);
+    g_r.set(0x514 / 4, 0x20425355);
+    g_r.set(0x518 / 4, 0x0201);
+    g_r.set(0x520 / 4, 0x03000002);
+    g_r.set(0x524 / 4, 0x20425355);
+    g_r.set(0x528 / 4, 0x0203);
+    g_r.set(0x420 / 4, 0x00000201);
+    g_r.set(0x440 / 4, 0x00021203);
+    val b: XhciBus = XhciBus { rd: rd, wr: wr };
+    val c: XhciCaps = xhci_caps(&b);
+    println("caps len " + h(c.caplength) + " version " + h(c.version) + " slots " + int_to_str(c.max_slots) + " intrs " + int_to_str(c.max_intrs) + " ports " + int_to_str(c.max_ports) + " erst " + int_to_str(c.erst_max) + " scratch " + int_to_str(c.scratchpads) + " ac64 " + bool_to_str(c.ac64) + " csz64 " + bool_to_str(c.csz64) + " db " + h(c.db) + " rt " + h(c.rt));
+    val xs: Vec<i64> = xhci_ext_caps(&b, &c);
+    var line: str = "ext caps:";
+    var i: i64 = 0;
+    while i < xs.len() {
+        line = line + " " + int_to_str(xs.get(i) >> 32) + "@" + h(xs.get(i) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    println(line);
+    println("legacy handoff " + bool_to_str(xhci_legacy_handoff(&b, 0x500, 10)));
+    val p2: XhciProtocol = xhci_protocol(&b, 0x510);
+    val p3: XhciProtocol = xhci_protocol(&b, 0x520);
+    println("protocol " + p2.name + " " + int_to_str(p2.major) + "." + int_to_str(p2.minor) + " ports " + int_to_str(p2.first_port) + "+" + int_to_str(p2.port_count) + ", " + p3.name + " " + int_to_str(p3.major) + "." + int_to_str(p3.minor) + " ports " + int_to_str(p3.first_port) + "+" + int_to_str(p3.port_count));
+
+    var m: PhysMem = physmem_fake(0x100000, 5);
+    var cmd: XhciRing = xhci_ring_new(&mut m, 0x100000, 4);
+    var er: XhciEventRing = xhci_event_ring_new(&mut m, 0x100800, 0x101000, 4);
+    val rs: bool = xhci_reset(&b, &c, 10);
+    g_log = Vec::new();
+    val st: bool = xhci_start(&b, &c, 0x102000, &cmd, &er, 8, 10);
+    println("reset " + bool_to_str(rs) + " start " + bool_to_str(st));
+    var erdp_at: i64 = -1;
+    var erstba_at: i64 = -1;
+    i = 0;
+    while i < g_log.len() {
+        if g_log.get(i) == xhci_ir_off(&c, 0, 0x18) { erdp_at = i; }
+        if g_log.get(i) == xhci_ir_off(&c, 0, 0x10) { erstba_at = i; }
+        i = i + 1;
+    }
+    println("config " + int_to_str(rd(0x58)) + " dcbaap " + h(xhci_rd64(&b, 0x50)) + " crcr " + h(xhci_rd64(&b, 0x38)) + " erstsz " + int_to_str(rd(xhci_ir_off(&c, 0, 8))) + " erdp " + h(xhci_rd64(&b, xhci_ir_off(&c, 0, 0x18))) + " erstba " + h(xhci_rd64(&b, xhci_ir_off(&c, 0, 0x10))) + " usbcmd " + h(rd(0x20)) + " erstba last " + bool_to_str(erstba_at > erdp_at));
+
+    val a1: i64 = xhci_ring_push(&mut m, &mut cmd, trb_enable_slot(0));
+    xhci_ring_doorbell(&b, &c, 0, 0, 0);
+    println("enable slot at " + h(a1) + " control " + h(xhci_trb_read(&m, a1).control) + " doorbell " + h(rd(xhci_db_off(&c, 0))));
+    // controller: completion event in event ring slot 0 with cycle 1
+    post(&mut m, 0x101000, 0, 1, Trb { param: a1, status: CC_SUCCESS << 24, control: (TRB_CMD_COMPLETION << 10) | (1 << 24) });
+    val ev: Trb = xhci_event_pop(&mut er, &m);
+    xhci_ring_consumed(&mut cmd, ev.param);
+    println("event type " + int_to_str(trb_type(&ev)) + " cc " + xhci_cc_name(trb_cc(&ev)) + " slot " + int_to_str(trb_slot(&ev)) + " for " + h(ev.param) + ", erdp " + h(xhci_erdp(&er)));
+
+    val n1: i64 = xhci_ring_push(&mut m, &mut cmd, trb_noop_cmd());
+    val n2: i64 = xhci_ring_push(&mut m, &mut cmd, trb_noop_cmd());
+    val full: i64 = xhci_ring_push(&mut m, &mut cmd, trb_noop_cmd());
+    println("noops at " + h(n1) + " " + h(n2) + ", link " + h(xhci_trb_read(&m, 0x100030).control) + " pcs " + int_to_str(cmd.pcs) + ", full " + int_to_str(full));
+    xhci_ring_consumed(&mut cmd, n2);
+    val sp: i64 = xhci_ring_space(&cmd);
+    val n3: i64 = xhci_ring_push(&mut m, &mut cmd, trb_noop_cmd());
+    println("after completions space " + int_to_str(sp) + ", next at " + h(n3) + " control " + h(xhci_trb_read(&m, n3).control));
+
+    post(&mut m, 0x101000, 1, 1, Trb { param: 3 << 24, status: CC_SUCCESS << 24, control: TRB_PORT_STATUS << 10 });
+    post(&mut m, 0x101000, 2, 1, Trb { param: n1, status: CC_SUCCESS << 24, control: TRB_CMD_COMPLETION << 10 });
+    post(&mut m, 0x101000, 3, 1, Trb { param: n2, status: CC_SUCCESS << 24, control: TRB_CMD_COMPLETION << 10 });
+    post(&mut m, 0x101000, 0, 0, Trb { param: 0, status: CC_SUCCESS << 24, control: TRB_TRANSFER_EVENT << 10 });
+    var evl: str = "events:";
+    var e: Trb = xhci_event_pop(&mut er, &m);
+    while e.control != -1 {
+        evl = evl + " " + int_to_str(trb_type(&e));
+        if trb_type(&e) == TRB_PORT_STATUS { evl = evl + " port " + int_to_str(trb_port(&e)); }
+        evl = evl + ",";
+        e = xhci_event_pop(&mut er, &m);
+    }
+    println(str_trim_end_char(evl, 44) + "; ccs " + int_to_str(er.ccs) + " pending " + bool_to_str(xhci_event_pending(&er, &m)));
+
+    xhci_input_ctx_address(&mut m, 0x103000, false, 3, XHCI_SPEED_SUPER, 0x100100);
+    println("input ctx add " + h(xhci_ctx_dword(&m, 0x103000, false, 0, 1)) + " slot " + h(xhci_ctx_dword(&m, 0x103000, false, 1, 0)) + " " + h(xhci_ctx_dword(&m, 0x103000, false, 1, 1)) + " ep0 " + h(xhci_ctx_dword(&m, 0x103000, false, 2, 1)) + " " + h(xhci_ctx_dword(&m, 0x103000, false, 2, 2)) + " avg " + int_to_str(xhci_ctx_dword(&m, 0x103000, false, 2, 4)));
+    val ad: Trb = trb_address_device(0x103000, 1, false);
+    val ada: i64 = xhci_ring_push(&mut m, &mut cmd, ad);
+    println("address device " + h(xhci_trb_read(&m, ada).param) + " " + h(xhci_trb_read(&m, ada).control));
+
+    var tr: XhciRing = xhci_ring_new(&mut m, 0x100100, 16);
+    val sa: i64 = xhci_ring_push(&mut m, &mut tr, trb_setup(0x80, 6, 0x0100, 0, 18, 3));
+    val da: i64 = xhci_ring_push(&mut m, &mut tr, trb_data(0x104000, 18, true));
+    val sta: i64 = xhci_ring_push(&mut m, &mut tr, trb_status(false));
+    xhci_ring_doorbell(&b, &c, 1, xhci_dci(0, false), 0);
+    val ts: Trb = xhci_trb_read(&m, sa);
+    println("setup " + hx16(ts.param) + " " + int_to_str(ts.status) + " " + h(ts.control));
+    println("data " + h(xhci_trb_read(&m, da).control) + " status " + h(xhci_trb_read(&m, sta).control) + " doorbell " + h(rd(xhci_db_off(&c, 1))));
+    post(&mut m, 0x101000, 1, 0, Trb { param: sta, status: CC_SUCCESS << 24, control: (TRB_TRANSFER_EVENT << 10) | (1 << 24) | (1 << 16) });
+    val te: Trb = xhci_event_pop(&mut er, &m);
+    xhci_ring_consumed(&mut tr, te.param);
+    println("transfer event ep " + int_to_str(trb_ep(&te)) + " slot " + int_to_str(trb_slot(&te)) + " cc " + xhci_cc_name(trb_cc(&te)) + " residual " + int_to_str(trb_residual(&te)));
+
+    val ps: PortStatus = xhci_port_decode(xhci_rd(&b, xhci_portsc_off(&c, 3)));
+    println("port3 connected " + bool_to_str(ps.connected) + " enabled " + bool_to_str(ps.enabled) + " powered " + bool_to_str(ps.powered) + " speed " + int_to_str(ps.speed) + " changes " + h(ps.changes));
+    xhci_port_ack(&b, &c, 3, PORTSC_CSC);
+    println("port3 after ack " + h(xhci_rd(&b, xhci_portsc_off(&c, 3))));
+    xhci_port_reset(&b, &c, 1, false);
+    val p1v: i64 = xhci_rd(&b, xhci_portsc_off(&c, 1));
+    println("port1 after reset " + h(p1v) + " enabled " + bool_to_str(xhci_port_decode(p1v).enabled));
+    println("dci ep1 in " + int_to_str(xhci_dci(1, true)) + " ep2 out " + int_to_str(xhci_dci(2, false)) + ", types intr-in " + int_to_str(xhci_ep_type(3, true)) + " bulk-out " + int_to_str(xhci_ep_type(2, false)) + ", ep0 max " + int_to_str(xhci_ep0_max_packet(XHCI_SPEED_FULL)) + " " + int_to_str(xhci_ep0_max_packet(XHCI_SPEED_HIGH)) + " " + int_to_str(xhci_ep0_max_packet(XHCI_SPEED_SUPER)));
+}

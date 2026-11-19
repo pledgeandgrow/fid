@@ -1,0 +1,429 @@
+// TLS 1.3 over loopback with a local self-signed certificate (competitive
+// SL4, release I7): no network, no files of its own. The certificate below
+// (CN=localhost, RSA 2048, valid until 2126; a test key, never use it for
+// anything else) is written to the temporary directory as PEM files for
+// OpenSSL or as a .pfx (password "test") for Schannel. A tls_server13
+// that also answers ALPN ("h2,http/1.1") serves two connections:
+//   [1] tls_connect13_unchecked: a 1.3-only client offering no ALPN;
+//   [2] tls_connect_alpn_unchecked offering "h2": a client that is not
+//       pinned to 1.3, so the 1.3 comes from the server's side.
+// Both sides check the version (772 = TLS 1.3) and one message each way.
+// Then tls_server_close frees the server (on Windows it deletes the key
+// that importing the .pfx put in the user's key store) and the files go.
+//
+// Needs tasks that run side by side and the system's TLS library: C and
+// native builds (`fid ccompile`, `fid emit`), Windows 11 / Server 2022 or
+// later (Schannel TLS 1.3), OpenSSL 1.1.1 or later elsewhere. `fid run`
+// cannot call Schannel or libssl.
+//
+// Expected output:
+// [1] server version 772
+// [1] server alpn: (none)
+// [1] server got ping
+// [1] client version 772
+// [1] client alpn: (none)
+// [1] client got pong
+// [2] server version 772
+// [2] server alpn: h2
+// [2] server got ping
+// [2] client version 772
+// [2] client alpn: h2
+// [2] client got pong
+// server closed
+// tls13 local ok
+use tls;
+use task;
+use fs;
+use vec;
+use string;
+
+var g_server: i64 = 0;
+var g_port: i64 = 0;
+var g_log: Vec<str> = Vec::new();
+var g_failed: bool = false;
+
+fn hex_digit(c: i64) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    return c - 87;
+}
+
+fn hex_bytes(h: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(h) {
+        out.push(hex_digit(str_byte_at(h, i)) * 16 + hex_digit(str_byte_at(h, i + 1)));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn temp_dir() -> str {
+    match env_var("TMPDIR") {
+        Option::Some(d) => {
+            if d != "" {
+                return d;
+            }
+        }
+        Option::None => {}
+    }
+    match env_var("TEMP") {
+        Option::Some(d) => {
+            if d != "" {
+                return d;
+            }
+        }
+        Option::None => {}
+    }
+    return "/tmp";
+}
+
+@unsafe
+fn recv_text(s: i64) -> str {
+    var buf: i64 = 0;
+    // SAFETY: a 256-byte block of our own; tls_session_recv writes at most
+    // 255 bytes into it and the loop reads only the n it wrote
+    unsafe { buf = p_malloc(256); }
+    val n: i64 = tls_session_recv(s, buf, 255, 10000);
+    var out: str = "";
+    if n > 0 {
+        var bytes: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < n {
+            bytes.push(p_volatile_load8(buf + i));
+            i = i + 1;
+        }
+        out = str_from_bytes(bytes);
+    }
+    unsafe { p_free(buf); }
+    return out;
+}
+
+fn send_text(s: i64, t: str) -> bool {
+    return tls_session_send(s, t as i64, str_len(t)) == str_len(t);
+}
+
+fn alpn_text(s: i64) -> str {
+    val a: str = tls_session_alpn(s);
+    if a == "" {
+        return "(none)";
+    }
+    return a;
+}
+
+fn check(line: str, want: str) {
+    println(line);
+    if line != want {
+        g_failed = true;
+    }
+}
+
+// The server: two connections, one after the other. What it sees goes to
+// g_log; the client prints it once it has the reply (sent after the log).
+fn serve(lfd: i64) -> i64 {
+    var k: i64 = 1;
+    while k <= 2 {
+        val tag: str = "[" + int_to_str(k) + "] ";
+        val c: i64 = p_co_accept(lfd);
+        if c < 0 {
+            g_log.push(tag + "server: accept failed");
+            return 1;
+        }
+        val s: i64 = tls_accept(g_server, c);
+        if s == 0 {
+            g_log.push(tag + "server: handshake failed");
+            p_socket_close(c);
+            return 1;
+        }
+        g_log.push(tag + "server version " + int_to_str(tls_session_version(s)));
+        g_log.push(tag + "server alpn: " + alpn_text(s));
+        var got: str = "";
+        // SAFETY: recv_text is @unsafe (release M10); s is the session
+        // tls_accept just made
+        unsafe { got = recv_text(s); }
+        g_log.push(tag + "server got " + got);
+        send_text(s, "pong");
+        tls_session_close(s);
+        p_socket_close(c);
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn print_server_log(want: Vec<str>) {
+    var i: i64 = 0;
+    while i < g_log.len() {
+        if i < want.len() {
+            check(g_log.get(i), want.get(i));
+        } else {
+            check(g_log.get(i), "");
+        }
+        i = i + 1;
+    }
+    if g_log.len() != want.len() {
+        g_failed = true;
+    }
+    g_log = Vec::new();
+}
+
+fn round(k: i64, s: i64, want_alpn: str) {
+    val tag: str = "[" + int_to_str(k) + "] ";
+    if s == 0 {
+        println(tag + "client: handshake failed");
+        g_failed = true;
+        return;
+    }
+    send_text(s, "ping");
+    var reply: str = "";
+    // SAFETY: recv_text is @unsafe (release M10); s is a live session
+    // (round's caller connected it; 0 returned above)
+    unsafe { reply = recv_text(s); }
+    var want: Vec<str> = Vec::new();
+    want.push(tag + "server version 772");
+    want.push(tag + "server alpn: " + want_alpn);
+    want.push(tag + "server got ping");
+    print_server_log(want);
+    check(tag + "client version " + int_to_str(tls_session_version(s)), tag + "client version 772");
+    check(tag + "client alpn: " + alpn_text(s), tag + "client alpn: " + want_alpn);
+    check(tag + "client got " + reply, tag + "client got pong");
+    val fd: i64 = tls_session_fd(s);
+    tls_session_close(s);
+    p_socket_close(fd);
+}
+
+fn clients(n: i64) -> i64 {
+    round(1, tls_connect13_unchecked("localhost", g_port), "(none)");
+    round(2, tls_connect_alpn_unchecked("localhost", g_port, "h2"), "h2");
+    return n;
+}
+
+fn main() -> i64 {
+    val dir: str = temp_dir();
+    val stamp: str = int_to_str(p_clock_now_us() % 1000000007);
+    val pfx_path: str = dir + "/fides_tls13_" + stamp + ".pfx";
+    val cert_path: str = dir + "/fides_tls13_" + stamp + "_cert.pem";
+    val key_path: str = dir + "/fides_tls13_" + stamp + "_key.pem";
+    var written: bool = false;
+    if tls_library() == "schannel" {
+        written = fs_write_bytes(pfx_path, hex_bytes(pfx_hex()));
+        if written {
+            g_server = tls_server13(pfx_path, "test");
+        }
+    } else {
+        written = fs_write_text(cert_path, cert_pem()) && fs_write_text(key_path, key_pem());
+        if written {
+            g_server = tls_server13(cert_path, key_path);
+        }
+    }
+    if !written {
+        println("FAIL: could not write the certificate to " + dir);
+        return 1;
+    }
+    var ok: bool = g_server != 0 && tls_server_alpn(g_server, "h2,http/1.1");
+    if !ok {
+        println("FAIL: tls_server13 could not load the certificate or has no TLS 1.3");
+    } else {
+        var port: i64 = 18700;
+        var lfd: i64 = p_socket_listen(port);
+        while lfd < 0 && port < 18740 {
+            port = port + 1;
+            lfd = p_socket_listen(port);
+        }
+        g_port = port;
+        val s: i64 = task_go("serve", lfd);
+        val c: i64 = task_go("clients", 0);
+        task_run();
+        p_socket_close(lfd);
+        if task_result(s) != 0 {
+            // what the server logged after the last client round
+            print_server_log(Vec::new());
+            g_failed = true;
+        }
+    }
+    if g_server != 0 {
+        tls_server_close(g_server);
+        println("server closed");
+    }
+    if tls_library() == "schannel" {
+        fs_delete(pfx_path);
+    } else {
+        fs_delete(cert_path);
+        fs_delete(key_path);
+    }
+    if !ok || g_failed {
+        println("FAIL");
+        return 1;
+    }
+    println("tls13 local ok");
+    return 0;
+}
+
+// ─── the test certificate ───────────────────────────────────────────────
+
+fn pfx_hex() -> str {
+    var h: str = "";
+    h = h + "30820a6402010330820a1a06092a864886f70d010701a0820a0b04820a0730820a033082044a06092a864886f70d0107";
+    h = h + "06a082043b308204370201003082043006092a864886f70d010701305f06092a864886f70d01050d3052303106092a86";
+    h = h + "4886f70d01050c30240410b3b3867e35947091fb6e9ac638f9499502020800300c06082a864886f70d02090500301d06";
+    h = h + "0960864801650304012a0410f1bcc11e0c25d6e8d0fc4c6656830e07808203c0cb0546eb544c4fd863c8f2e177b18aaa";
+    h = h + "77748c1c801198e29ea95e5038f51b3a9f54a96e0789c5911d4021d711f5d99570167b3c593a68f40eab87adc3fdb9da";
+    h = h + "434582510008dfb5cc327f5084b2a966db56c592c224539562be102a360f492c5062b3ace4738ddfa8f389be7a0fa4e7";
+    h = h + "8ca3834abddf57106de9e6b3b80f4697a623e9c9c07feea2e110a3d2ebdec556c1a102d8ac7687735736259f47bdeb47";
+    h = h + "9e6ec482870b5bcb810a3829010aa73e89ab3ade90f5533bd7f73402379cc12d3b3f286e9c6a0fbe1c63341edaf2f2e7";
+    h = h + "730fe9fcb0f84981f3bc8f7cd409933b7a8fa3184f4588c22d3bf04c99c8ebb410adf5be915daf59a38a796bd6e4635b";
+    h = h + "7949777067a7ab2de757cf8562359c56104afcfde9e1ee2800aadb68e7959018fe0f23a1eb75c5921c932c333431fc74";
+    h = h + "3e9f26ea10c9da93b0e6479682243dafee70748633f99cece776073e3456bd16962308a46cc7e779aba8ab09b5517094";
+    h = h + "e70d44d009ed923352e3d55a9380741d8f270e0995b99ecc20aaab6fbbba432d7904daed7397c3f618fa8ec1a81952d9";
+    h = h + "5c82d69249fcb79c1d98a4e50ba1dcfca5a9f5a9a8a148a664f1ff51b2322f22790282fe7967cfb0a63cc2afce36d609";
+    h = h + "8bb8906806a5a7456045965a42690a2a098f9dd300633c2fa3324b7479e249d85bb7f28caab2b4ecd682d4cb212b8510";
+    h = h + "b544bff86845e81177f4c264935f9cb632b4338f6ee98bee15b05f7374249ecff5843d5c72205834b8a731375dc1741a";
+    h = h + "4acfe3378a0de21846feecd7acf783e0be1ecb8482d6e5baf85af5d5ed419e3f7215760c29e1cf2f3687ad68123ab97a";
+    h = h + "1bc1fa30e374977afbc79c84b655ab64832743489bf42643b2bd05b7aeaf192109e7add9c0b2c5c230b0f9e7a3955200";
+    h = h + "6d5767e366f9f7e19df28fe01cc57c0fc9f14bd97605ce3a3d6d9b23a1fd114354bb81e1379ca2842253cb8fe188372a";
+    h = h + "2334ea633671493f7896671ecf32aea4576b63f7ebfdaeac880c9f9d9f9d353858a3a3004498fd402237f008f34f1d57";
+    h = h + "c514ecc946c492d91ac0ffaa8ea58f1fd6f6dfda190f98f28b950289ee911f1be5b54605e9358cdfdc5806e60144f457";
+    h = h + "aff40fdf38a68d8a1a731573474b3669066f75041060eb418039dd9e63c160b2072ff8d8f012557e406a23c7a8d1612b";
+    h = h + "d1582a291c69d21c7f2aba9b2efe98e6bfca5bfdac1ac4bd10d7df4e0dc6b33149e57c1f4f9dac7778a5bc1834a8e437";
+    h = h + "01beb7911fb8ce7685b23f42684dfaa3da4935b7b53aa51eeab224269c5af3231cf4340dbf81179c88f2c53a912818d8";
+    h = h + "e22dbe3440a5ba229d33b80371cae5fac703d1bdd008ba43620a6b63bd27b1a1308205b106092a864886f70d010701a0";
+    h = h + "8205a20482059e3082059a30820596060b2a864886f70d010c0a0102a082053930820535305f06092a864886f70d0105";
+    h = h + "0d3052303106092a864886f70d01050c302404107c299f7b6f11586975e5dcbb74efa8e302020800300c06082a864886";
+    h = h + "f70d02090500301d060960864801650304012a0410c998c5a2db37faab1ddf8f56b32d7fb2048204d019cabd313867b9";
+    h = h + "fc5374d433249cb7cebd34291e4347ceaeae0d1a38799dcb2d7ae9452caa8bf20e2545d87c1d8d7b58e50639797527e8";
+    h = h + "f004725b62526f9fdd8c8b79c730844a3d0a5aaca7d848c29245616f17861f9d99f757de4152553257cd43ecf15a02f7";
+    h = h + "b5d7ba36d0a356aeb7aef31f067b88435a722d51d47400db11cd4be52c6bb92b7ee77698e7a98b354103bfa85b076e89";
+    h = h + "5ad627d832f8edf06c014bb49cf2b3134ec95e37c970d72286b02e108323097e0b6cf7d2e0ba7c3dfd0ff733fd39dcf2";
+    h = h + "8a938cb5d2b7b37cc75f352e3d325ce6906687195229c07e9b0b641948fa1f3200e85bd2d490421ab5599beadb9d5679";
+    h = h + "d7a9099f88dbb1a6a102075e22c99057c3a91d25d78f1651e3bb2ac7afaf71cc70ad2b592b411565e6c081f9c0feee37";
+    h = h + "f4b7c33faa996846fece4db2696a2233ea4f4215065d00acaf09e5167c1a12241299ea7e98a169f36d9ee4c6568f7e9b";
+    h = h + "1c7a5d179b4afc9bf2d246b8e2a5a14f43da491d626670bed75ad62da907483914eacda44f888c51b01c017ea1a8eead";
+    h = h + "bb0179ae5e3a38f741fba0a98ab48e6802db34235b2cb5e752d8187a546b91b981752400ad92f4cc58e6eba71ace5e76";
+    h = h + "a238e73e7c3d01f0c48d1c857479e56e94ce972b612886938ab44008cdc88f4349c71a62387e76817557aa3b65936f41";
+    h = h + "3e5468f5c9abf71afa7fa234f0ee96f55778aca3acea51226c046b336052dafe51892e64b7c046aed10a776c2b937841";
+    h = h + "cc92beb3a14c533ae0dca1938c565d9794dcda87702ceaef70eb64f618f610fa23cf2d04f6a394ca6d03e53f6e03bac9";
+    h = h + "de75ab0aa4eed41bcfa3be23a966756cecb15f1d3100a235e378650397869eb6a59f1187d2c97065d446ab3e7520a191";
+    h = h + "47d3ab575cc441e08d40136e10dd41843bcac646cfbdd0755af83800fe21321d50276f59384ef27e8beecd70cac08f11";
+    h = h + "6e42125e1eea8d2cc6d42cd6b532fdf01f3c8fe5e188db2f97c540d5998df2398d0c153f12352284afc6f8b59fde6d06";
+    h = h + "0f8e22e49da301ff610cd1f4bf381f46599aa8438da5f8fcb3bd40fc3855f16bbb69876c38f37cbe72bee7446d25871d";
+    h = h + "4cd861a9f72990905caf918cc568e349f0cf9d871ae62d2c2488370ee3846a756cda505ccd29b0eae0751df3d11ed8bc";
+    h = h + "e0e00c1f4061bd8e3579b051b41961cea662a44687510cd4fbc6b81298ccc0612f32c1d6803caefdfa8e0c558bd50a33";
+    h = h + "7312b39e0bdc5475e5cb63ab91d7a022be2888e9eaa9b417720c92062a129b1bf05944e5e76cfdd0159b59088c4dfd2e";
+    h = h + "f9871f9fa2a59f960f6a60f08ad06996d818b92493e6ab519796e288b2f3b763cd6ebbd22a13848ccf51dbd0086f1740";
+    h = h + "6ed5f5e6af717cd0648f1af2a24240098c9da106416de89f4b12aae5443cc97b403a7eccdbfdfe3c54e064d9acd3d957";
+    h = h + "7b21518a5b07662c2da6715085ec147e1688be553628d08c01aaaf875995784f56d06c47cfef36213ba5102dacc6a35b";
+    h = h + "841d842b81136c86aeb0cd439371e66802e0fb3e6f34bc657d60226e61f506f1712b4653e7ef37f3042c126fc7b54159";
+    h = h + "a0e9356f98578e03b805f8fc2206f036c0eaf6e7794927c002a9d6da55d7440498b7de41c41d0667e50ef44a6a764b7b";
+    h = h + "b80f35d6f5769d93491376d6a7e3c52f37e63616777bdb87913c37b4c9496e115e50ccfd64d3b923e2189fa8bd6b6709";
+    h = h + "d0113a31bf3603203fa3a269e06c9658fe01dc2714766c4fa7314a302306092a864886f70d01091431161e1400660069";
+    h = h + "006400650073002d0074006500730074302306092a864886f70d010915311604148f09608d978fe835de653303fd1c0e";
+    h = h + "02c5ac14f330413031300d0609608648016503040201050004202630bbb448198a1552214d34ef64f2516049437f2f04";
+    h = h + "1efaceeb1e8f0e9374020408d02a0751d22b1b9002020800";
+    return h;
+}
+
+fn cert_pem() -> str {
+    var p: str = "";
+    p = p + "-----BEGIN CERTIFICATE-----
+";
+    p = p + "MIIDOjCCAiKgAwIBAgIUDPy4uUexIO3bh/bbhgjbgWr15s4wDQYJKoZIhvcNAQEL
+";
+    p = p + "BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExNzE0MTc0NFoYDzIxMjYx
+";
+    p = p + "MDI0MTQxNzQ0WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+";
+    p = p + "AQUAA4IBDwAwggEKAoIBAQDWiGeuDBZReL0582dXF+saZRObWy9oo8gbrLSNZ5Zu
+";
+    p = p + "EVOG5AzUr8b2yNxxsxD/Uga9EaHlrGB6tzKfEJrS3LHpSmIyWLWvk/2U3sgQxKw1
+";
+    p = p + "Qhyn40tmMoXNO5gwfRslYdEXqJMtMooSye4NF76YVL2dMUnpLuxa2p9m4ucPI4nU
+";
+    p = p + "6sCSm4+tys7Ck6sblAFyDdZ7Ves1rfp8EGccmk3OyFzb1s1n6kX1k2k3ViZ3k1R1
+";
+    p = p + "atR1Zg87rlAp4iKgsCeIks8hDOiXrJIqlfT6OF6ZdoBd6V1W3UpZZj1fv/qhmT4s
+";
+    p = p + "pC3nlzAgZGcLCNHkfHS35RYDOCe7OmeOTbZwbNGDRxchAgMBAAGjgYEwfzAdBgNV
+";
+    p = p + "HQ4EFgQUbWuDXaC7KR2PxNqNLW07NPn2gd0wHwYDVR0jBBgwFoAUbWuDXaC7KR2P
+";
+    p = p + "xNqNLW07NPn2gd0wDwYDVR0TAQH/BAUwAwEB/zAsBgNVHREEJTAjgglsb2NhbGhv
+";
+    p = p + "c3SHBH8AAAGHEAAAAAAAAAAAAAAAAAAAAAEwDQYJKoZIhvcNAQELBQADggEBAFV8
+";
+    p = p + "nRLCp7TpeKE+VDmAxlGI6lNRPPRld85UUCMNQkW//tk1NmlRl/tL6F5vKfxXWGiM
+";
+    p = p + "dO8hTmefi8A/gZk0uq84mT8U6xHrzewqLjUnKsNT7Pe1/eYLqmnpQRTpJzH65umJ
+";
+    p = p + "0SWljQH2g34RyejMXrRE4AA0hjlYqVARnMma+z72CBZC2SXoXEV0ahjO7BDoC+zZ
+";
+    p = p + "Tb8mWVM2FKmkyISsDHTf16QUdyJXc/4XwOgAqfuEKpBzEzNEryo6nES9lfJu39Ux
+";
+    p = p + "uzh4Gbr9dQln9/fzjeUnkO1+AGmOakgESTqc86uxzVWsywTIswZImmcm9YKYJFZU
+";
+    p = p + "N/D5QsEhKNRuLWXJaxU=
+";
+    p = p + "-----END CERTIFICATE-----
+";
+    return p;
+}
+
+fn key_pem() -> str {
+    var p: str = "";
+    p = p + "-----BEGIN PRIVATE KEY-----
+";
+    p = p + "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDWiGeuDBZReL05
+";
+    p = p + "82dXF+saZRObWy9oo8gbrLSNZ5ZuEVOG5AzUr8b2yNxxsxD/Uga9EaHlrGB6tzKf
+";
+    p = p + "EJrS3LHpSmIyWLWvk/2U3sgQxKw1Qhyn40tmMoXNO5gwfRslYdEXqJMtMooSye4N
+";
+    p = p + "F76YVL2dMUnpLuxa2p9m4ucPI4nU6sCSm4+tys7Ck6sblAFyDdZ7Ves1rfp8EGcc
+";
+    p = p + "mk3OyFzb1s1n6kX1k2k3ViZ3k1R1atR1Zg87rlAp4iKgsCeIks8hDOiXrJIqlfT6
+";
+    p = p + "OF6ZdoBd6V1W3UpZZj1fv/qhmT4spC3nlzAgZGcLCNHkfHS35RYDOCe7OmeOTbZw
+";
+    p = p + "bNGDRxchAgMBAAECggEADBErdnXFl5rpVzt4DO+9JgSYyryhTmB6tAZ4jW+jMtkU
+";
+    p = p + "pVoUgq4fIeiAcIDNrEmKiX4BaPAo6R4pjHBG/89cI9mEQSgOPYG0hM2B3AzuptGW
+";
+    p = p + "LQyy7rJZe7F7c6wbJ8ojFGfuB1/NYRXXUbM2jE5P8BSX/17H+qr2G7fC9Bi1UF2I
+";
+    p = p + "SX7dZyJ7po/38IKfOA2m2txIxmrGxJyCscXDERzHbvooer6PuatBlYuCNc/gtMNT
+";
+    p = p + "50ilK2SnDKEJITKsVvgKae3iPcHf0DVzhiUcXk59hHSfjns5u7xJEtGEEGmO8eDx
+";
+    p = p + "g36pv7BFetr8I5fYvzNvzwA3zYrqVkcd/vhxGqhgsQKBgQDz9T5L83bl/qxZqxA0
+";
+    p = p + "SOatY3ftJXFrprt7Lh4Yv4YIUHtbIKVCQ+39T8b2uSB7jQgQKsiKmnRLEWregXq7
+";
+    p = p + "6WkhBInR10I65CFTGIef9IHOMtZvuY0hNCqWJqKnnhoNGZWu7SMN75zGj1IqJBXO
+";
+    p = p + "rjWKdSlCqmRsYekkRpNGIgCCBQKBgQDhH1U9MzHBwbsdpWS7UAdEppdwEVUg/VYU
+";
+    p = p + "uQy8I+UqaGKLYNKgva9J0gxAhwxJS7yy7xInxznN0gTWGovduQQ46YqZroN2unU0
+";
+    p = p + "21Om3WzNjoiXbNT+1SM+p2Bk0eR8+KzOEdg2BxCOayc0OSUXZJ+qIH6B9dFiCD/i
+";
+    p = p + "dbNMPza/bQKBgBvVLf9STo1c6eLtDlM4wgCkKYmHzRHgGuGp2EswhqUqMXirF8+g
+";
+    p = p + "mmVdFbEOW/Ncmr/lca3Gg2ARI6UxFoSb05+tud+T9H1ti5PEZ6zLI4gX6rkibUSN
+";
+    p = p + "hBJPZB1Ff2lhMt+bNHWhkbxhm5ktNsO2wmsChOuTLxPic8vstV66AF7VAoGAOHjb
+";
+    p = p + "sRZ+jNREVBOBSVux9w6zPnGaoUPrrBcfkrKOciztS3lmXNw4dJQ0bptyAZD2LQy7
+";
+    p = p + "yS642WCtxeey3lPjM0OieRrF76qmbDP4sAsrmAUBTrsGU0a0KKtkCuZ8Ir1e2/Ku
+";
+    p = p + "Ah+Tj6Zhl0AehdfAFbVBBujbNXRMUkqkR6Qz36ECgYATHIZ3jgDVWD75BIa/HPbg
+";
+    p = p + "4OXpe4YzuH4D708AN0HHjhvkPEFSsvldSSnRAdilNDdp1wv0J7fOuYM30DRhELNX
+";
+    p = p + "SGzpmHxL/EXp4s2nlG5gnTLW49N1EQAjYGXQth93jqcLIaXoqx/jqS99UM4B7tGl
+";
+    p = p + "rBzAkzG5j0I0iKZTttxoFg==
+";
+    p = p + "-----END PRIVATE KEY-----
+";
+    return p;
+}

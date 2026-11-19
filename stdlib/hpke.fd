@@ -1,0 +1,293 @@
+// Fides HPKE (RFC 9180, Hybrid Public Key Encryption) for the suite
+// DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / ChaCha20Poly1305
+// (KEM 0x0020, KDF 0x0001, AEAD 0x0003): DeriveKeyPair, Encap/Decap and
+// AuthEncap/AuthDecap, the key schedule for all four modes (base, psk,
+// auth, auth_psk), the encryption context (Seal/Open with the sequence
+// number nonce, the secret exporter), and single-shot seal/open.
+//
+// Pure computation over x25519.fd, kdf.fd (HKDF-SHA256) and
+// chacha20poly1305.fd. The seam is randomness: the sender's ephemeral key
+// is derived from `ikm_e`, 32 random bytes the caller supplies
+// (crypto_random_bytes(32) in real use; the RFC's ikmE in tests), exactly
+// as RFC 9180's test vectors are built.
+//
+// Checked against RFC 9180 Appendix A.2.1 (base mode, this suite: key
+// pairs from ikmE/ikmR, enc, shared_secret, key, base_nonce,
+// exporter_secret, the first encryptions and exported values) in
+// tests/bootstrap/test_std_hpke.fd.
+//
+// Usage:
+//   use hpke;
+//   val s = hpke_setup_base_s(pk_r, info, ikm_e);        // s.enc goes to the receiver
+//   var ctx = s.ctx;
+//   val ct = hpke_seal(& mut ctx, aad, plain);
+//   var rctx = hpke_setup_base_r(s.enc, sk_r, info);
+//   val pt = hpke_open(& mut rctx, aad, ct);             // pt.ok, pt.data
+
+module hpke;
+use vec;
+use kdf;
+use x25519;
+use chacha20poly1305;
+
+pub const HPKE_MODE_BASE: i64 = 0;
+pub const HPKE_MODE_PSK: i64 = 1;
+pub const HPKE_MODE_AUTH: i64 = 2;
+pub const HPKE_MODE_AUTH_PSK: i64 = 3;
+
+/// An encryption context (one direction).
+pub struct HpkeContext {
+    pub ok: bool,
+    pub key: Vec<i64>,
+    pub base_nonce: Vec<i64>,
+    pub exporter_secret: Vec<i64>,
+    pub seq: i64,
+}
+
+/// What Encap gives: the encapsulated key for the receiver and the KEM
+/// shared secret.
+pub struct HpkeEncap {
+    pub ok: bool,
+    pub enc: Vec<i64>,
+    pub shared_secret: Vec<i64>,
+}
+
+/// A sender's setup: the encapsulated key and the context.
+pub struct HpkeSender {
+    pub enc: Vec<i64>,
+    pub ctx: HpkeContext,
+}
+
+/// A key pair: 32-byte X25519 secret and public keys.
+pub struct HpkeKeyPair {
+    pub sk: Vec<i64>,
+    pub pk: Vec<i64>,
+}
+
+fn hpke_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() { out.push(a.get(i) & 255); i = i + 1; }
+    i = 0;
+    while i < b.len() { out.push(b.get(i) & 255); i = i + 1; }
+    return out;
+}
+
+fn hpke_i2osp2(v: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    o.push((v >> 8) & 255);
+    o.push(v & 255);
+    return o;
+}
+
+/// suite_id of the KEM: "KEM" || I2OSP(0x0020, 2).
+pub fn hpke_kem_suite() -> Vec<i64> {
+    return hpke_cat(str_bytes("KEM"), hpke_i2osp2(0x20));
+}
+
+/// suite_id of the whole suite: "HPKE" || kem || kdf || aead.
+pub fn hpke_suite() -> Vec<i64> {
+    return hpke_cat(hpke_cat(hpke_cat(str_bytes("HPKE"), hpke_i2osp2(0x20)), hpke_i2osp2(1)), hpke_i2osp2(3));
+}
+
+/// LabeledExtract(salt, label, ikm) = Extract(salt, "HPKE-v1" || suite || label || ikm).
+pub fn hpke_labeled_extract(suite: Vec<i64>, salt: Vec<i64>, label: str, ikm: Vec<i64>) -> Vec<i64> {
+    val m: Vec<i64> = hpke_cat(hpke_cat(hpke_cat(str_bytes("HPKE-v1"), suite), str_bytes(label)), ikm);
+    return kdf_hkdf_extract(KDF_SHA256, salt, m);
+}
+
+/// LabeledExpand(prk, label, info, L) = Expand(prk, I2OSP(L, 2) || "HPKE-v1" || suite || label || info, L).
+pub fn hpke_labeled_expand(suite: Vec<i64>, prk: Vec<i64>, label: str, info: Vec<i64>, len: i64) -> Vec<i64> {
+    val m: Vec<i64> = hpke_cat(hpke_cat(hpke_cat(hpke_cat(hpke_i2osp2(len), str_bytes("HPKE-v1")), suite), str_bytes(label)), info);
+    return kdf_hkdf_expand(KDF_SHA256, prk, m, len);
+}
+
+// ─── DHKEM(X25519, HKDF-SHA256) (RFC 9180 §4.1, §7.1.3) ────────────────
+
+/// DeriveKeyPair(ikm): sk = LabeledExpand(dkp_prk, "sk", "", 32).
+pub fn hpke_derive_keypair(ikm: Vec<i64>) -> HpkeKeyPair {
+    val s: Vec<i64> = hpke_kem_suite();
+    val prk: Vec<i64> = hpke_labeled_extract(s, Vec::new(), "dkp_prk", ikm);
+    val sk: Vec<i64> = hpke_labeled_expand(s, prk, "sk", Vec::new(), 32);
+    return HpkeKeyPair { sk: sk, pk: x25519_public_key(sk) };
+}
+
+fn hpke_dh(sk: Vec<i64>, pk: Vec<i64>) -> Vec<i64> {
+    if pk.len() != 32 || sk.len() != 32 { return Vec::new(); }
+    val z: Vec<i64> = x25519_scalarmult(sk, pk);
+    if x25519_is_all_zero(z) { return Vec::new(); }
+    return z;
+}
+
+fn hpke_extract_and_expand(dh: Vec<i64>, kem_context: Vec<i64>) -> Vec<i64> {
+    val s: Vec<i64> = hpke_kem_suite();
+    val prk: Vec<i64> = hpke_labeled_extract(s, Vec::new(), "eae_prk", dh);
+    return hpke_labeled_expand(s, prk, "shared_secret", kem_context, 32);
+}
+
+fn hpke_bad_encap() -> HpkeEncap {
+    return HpkeEncap { ok: false, enc: Vec::new(), shared_secret: Vec::new() };
+}
+
+/// Encap(pkR) with the ephemeral key derived from ikm_e.
+pub fn hpke_encap(pk_r: Vec<i64>, ikm_e: Vec<i64>) -> HpkeEncap {
+    val e: HpkeKeyPair = hpke_derive_keypair(ikm_e);
+    val dh: Vec<i64> = hpke_dh(e.sk, pk_r);
+    if dh.len() == 0 { return hpke_bad_encap(); }
+    val ss: Vec<i64> = hpke_extract_and_expand(dh, hpke_cat(e.pk, pk_r));
+    return HpkeEncap { ok: true, enc: e.pk, shared_secret: ss };
+}
+
+/// Decap(enc, skR): the shared secret, empty on a bad encapsulation.
+pub fn hpke_decap(enc: Vec<i64>, sk_r: Vec<i64>) -> Vec<i64> {
+    val dh: Vec<i64> = hpke_dh(sk_r, enc);
+    if dh.len() == 0 { return Vec::new(); }
+    return hpke_extract_and_expand(dh, hpke_cat(enc, x25519_public_key(sk_r)));
+}
+
+/// AuthEncap(pkR, skS): authenticates the sender's static key too.
+pub fn hpke_auth_encap(pk_r: Vec<i64>, sk_s: Vec<i64>, ikm_e: Vec<i64>) -> HpkeEncap {
+    val e: HpkeKeyPair = hpke_derive_keypair(ikm_e);
+    val dh1: Vec<i64> = hpke_dh(e.sk, pk_r);
+    val dh2: Vec<i64> = hpke_dh(sk_s, pk_r);
+    if dh1.len() == 0 || dh2.len() == 0 { return hpke_bad_encap(); }
+    val ctx: Vec<i64> = hpke_cat(hpke_cat(e.pk, pk_r), x25519_public_key(sk_s));
+    return HpkeEncap { ok: true, enc: e.pk, shared_secret: hpke_extract_and_expand(hpke_cat(dh1, dh2), ctx) };
+}
+
+/// AuthDecap(enc, skR, pkS).
+pub fn hpke_auth_decap(enc: Vec<i64>, sk_r: Vec<i64>, pk_s: Vec<i64>) -> Vec<i64> {
+    val dh1: Vec<i64> = hpke_dh(sk_r, enc);
+    val dh2: Vec<i64> = hpke_dh(sk_r, pk_s);
+    if dh1.len() == 0 || dh2.len() == 0 { return Vec::new(); }
+    val ctx: Vec<i64> = hpke_cat(hpke_cat(enc, x25519_public_key(sk_r)), pk_s);
+    return hpke_extract_and_expand(hpke_cat(dh1, dh2), ctx);
+}
+
+// ─── Key schedule (§5.1) and contexts (§5.2, §5.3) ─────────────────────
+
+fn hpke_bad_ctx() -> HpkeContext {
+    return HpkeContext { ok: false, key: Vec::new(), base_nonce: Vec::new(), exporter_secret: Vec::new(), seq: 0 };
+}
+
+/// KeySchedule(mode, shared_secret, info, psk, psk_id). psk and psk_id
+/// must both be empty (base/auth) or both non-empty (psk modes).
+pub fn hpke_key_schedule(mode: i64, shared_secret: Vec<i64>, info: Vec<i64>, psk: Vec<i64>, psk_id: Vec<i64>) -> HpkeContext {
+    if shared_secret.len() == 0 { return hpke_bad_ctx(); }
+    val with_psk: bool = mode == HPKE_MODE_PSK || mode == HPKE_MODE_AUTH_PSK;
+    if with_psk != (psk.len() > 0) || (psk.len() > 0) != (psk_id.len() > 0) { return hpke_bad_ctx(); }
+    val s: Vec<i64> = hpke_suite();
+    val psk_id_hash: Vec<i64> = hpke_labeled_extract(s, Vec::new(), "psk_id_hash", psk_id);
+    val info_hash: Vec<i64> = hpke_labeled_extract(s, Vec::new(), "info_hash", info);
+    var ctx: Vec<i64> = Vec::new();
+    ctx.push(mode);
+    ctx = hpke_cat(hpke_cat(ctx, psk_id_hash), info_hash);
+    val secret: Vec<i64> = hpke_labeled_extract(s, shared_secret, "secret", psk);
+    return HpkeContext {
+        ok: true,
+        key: hpke_labeled_expand(s, secret, "key", ctx, 32),
+        base_nonce: hpke_labeled_expand(s, secret, "base_nonce", ctx, 12),
+        exporter_secret: hpke_labeled_expand(s, secret, "exp", ctx, 32),
+        seq: 0
+    };
+}
+
+/// The key schedule context bytes (mode || psk_id_hash || info_hash),
+/// as RFC 9180's test vectors list them.
+pub fn hpke_key_schedule_context(mode: i64, info: Vec<i64>, psk_id: Vec<i64>) -> Vec<i64> {
+    val s: Vec<i64> = hpke_suite();
+    var ctx: Vec<i64> = Vec::new();
+    ctx.push(mode);
+    return hpke_cat(hpke_cat(ctx, hpke_labeled_extract(s, Vec::new(), "psk_id_hash", psk_id)), hpke_labeled_extract(s, Vec::new(), "info_hash", info));
+}
+
+/// SetupBaseS(pkR, info).
+pub fn hpke_setup_base_s(pk_r: Vec<i64>, info: Vec<i64>, ikm_e: Vec<i64>) -> HpkeSender {
+    val e: HpkeEncap = hpke_encap(pk_r, ikm_e);
+    if !e.ok { return HpkeSender { enc: Vec::new(), ctx: hpke_bad_ctx() }; }
+    return HpkeSender { enc: e.enc, ctx: hpke_key_schedule(HPKE_MODE_BASE, e.shared_secret, info, Vec::new(), Vec::new()) };
+}
+
+/// SetupBaseR(enc, skR, info).
+pub fn hpke_setup_base_r(enc: Vec<i64>, sk_r: Vec<i64>, info: Vec<i64>) -> HpkeContext {
+    return hpke_key_schedule(HPKE_MODE_BASE, hpke_decap(enc, sk_r), info, Vec::new(), Vec::new());
+}
+
+/// SetupPSKS(pkR, info, psk, psk_id).
+pub fn hpke_setup_psk_s(pk_r: Vec<i64>, info: Vec<i64>, psk: Vec<i64>, psk_id: Vec<i64>, ikm_e: Vec<i64>) -> HpkeSender {
+    val e: HpkeEncap = hpke_encap(pk_r, ikm_e);
+    if !e.ok { return HpkeSender { enc: Vec::new(), ctx: hpke_bad_ctx() }; }
+    return HpkeSender { enc: e.enc, ctx: hpke_key_schedule(HPKE_MODE_PSK, e.shared_secret, info, psk, psk_id) };
+}
+
+/// SetupPSKR(enc, skR, info, psk, psk_id).
+pub fn hpke_setup_psk_r(enc: Vec<i64>, sk_r: Vec<i64>, info: Vec<i64>, psk: Vec<i64>, psk_id: Vec<i64>) -> HpkeContext {
+    return hpke_key_schedule(HPKE_MODE_PSK, hpke_decap(enc, sk_r), info, psk, psk_id);
+}
+
+/// SetupAuthS(pkR, info, skS).
+pub fn hpke_setup_auth_s(pk_r: Vec<i64>, info: Vec<i64>, sk_s: Vec<i64>, ikm_e: Vec<i64>) -> HpkeSender {
+    val e: HpkeEncap = hpke_auth_encap(pk_r, sk_s, ikm_e);
+    if !e.ok { return HpkeSender { enc: Vec::new(), ctx: hpke_bad_ctx() }; }
+    return HpkeSender { enc: e.enc, ctx: hpke_key_schedule(HPKE_MODE_AUTH, e.shared_secret, info, Vec::new(), Vec::new()) };
+}
+
+/// SetupAuthR(enc, skR, info, pkS).
+pub fn hpke_setup_auth_r(enc: Vec<i64>, sk_r: Vec<i64>, info: Vec<i64>, pk_s: Vec<i64>) -> HpkeContext {
+    return hpke_key_schedule(HPKE_MODE_AUTH, hpke_auth_decap(enc, sk_r, pk_s), info, Vec::new(), Vec::new());
+}
+
+/// The nonce of the current message: base_nonce XOR I2OSP(seq, 12).
+pub fn hpke_nonce(ctx: & HpkeContext) -> Vec<i64> {
+    var n: Vec<i64> = ctx.base_nonce;
+    var i: i64 = 0;
+    while i < 8 {
+        val b: i64 = (ctx.seq >> (i * 8)) & 255;
+        n.set(11 - i, n.get(11 - i) ^ b);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Seal one message (ciphertext || tag) and advance the sequence number.
+pub fn hpke_seal(ctx: & mut HpkeContext, aad: Vec<i64>, plain: Vec<i64>) -> Vec<i64> {
+    if !ctx.ok { return Vec::new(); }
+    val ct: Vec<i64> = aead_chacha20poly1305_seal(ctx.key, hpke_nonce(ctx), aad, plain);
+    ctx.seq = ctx.seq + 1;
+    return ct;
+}
+
+/// Open one message; the sequence number advances only on success.
+pub fn hpke_open(ctx: & mut HpkeContext, aad: Vec<i64>, ct: Vec<i64>) -> AeadOpened {
+    if !ctx.ok { return AeadOpened { ok: false, data: Vec::new() }; }
+    val o: AeadOpened = aead_chacha20poly1305_open(ctx.key, hpke_nonce(ctx), aad, ct);
+    if o.ok { ctx.seq = ctx.seq + 1; }
+    return o;
+}
+
+/// Export(exporter_context, L): a secret for another protocol.
+pub fn hpke_export(ctx: & HpkeContext, exporter_context: Vec<i64>, len: i64) -> Vec<i64> {
+    return hpke_labeled_expand(hpke_suite(), ctx.exporter_secret, "sec", exporter_context, len);
+}
+
+/// Single-shot base mode: enc (32 bytes) || ciphertext || tag.
+pub fn hpke_seal_base(pk_r: Vec<i64>, info: Vec<i64>, aad: Vec<i64>, plain: Vec<i64>, ikm_e: Vec<i64>) -> Vec<i64> {
+    val s: HpkeSender = hpke_setup_base_s(pk_r, info, ikm_e);
+    if !s.ctx.ok { return Vec::new(); }
+    var ctx: HpkeContext = s.ctx;
+    return hpke_cat(s.enc, hpke_seal(& mut ctx, aad, plain));
+}
+
+/// Single-shot base mode open of enc || ciphertext || tag.
+pub fn hpke_open_base(sk_r: Vec<i64>, info: Vec<i64>, aad: Vec<i64>, msg: Vec<i64>) -> AeadOpened {
+    if msg.len() < 48 { return AeadOpened { ok: false, data: Vec::new() }; }
+    var enc: Vec<i64> = Vec::new();
+    var ct: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < msg.len() {
+        if i < 32 { enc.push(msg.get(i)); } else { ct.push(msg.get(i)); }
+        i = i + 1;
+    }
+    var ctx: HpkeContext = hpke_setup_base_r(enc, sk_r, info);
+    return hpke_open(& mut ctx, aad, ct);
+}

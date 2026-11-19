@@ -1,0 +1,156 @@
+// stdlib/webgpu: vertex formats and a packed vertex layout with its WGSL struct, buffer descriptor validation, texture format table and bytesPerRow, bind group layout validation and WGSL declarations, WGSL memory layout (the WGSL spec's struct A/B example, matrices, uniform address space rules). No webgpu.h call is made (no GPU needed).
+// Expected output:
+// formats: float32x3 12 vec3<f32>, unorm8x4 4 vec4<f32>, uint16x2 4 vec2<u32>, sint32x3 12 vec3<i32>, unorm10-10-10-2 4, float16x3 known false, snorm32 known false
+// vertex layout: offsets 0 12 16 20, stride 24, errors 0
+// struct VertexIn {
+//     @location(0) position: vec3<f32>,
+//     @location(1) color: vec4<f32>,
+//     @location(2) material: u32,
+//     @location(3) uv: vec2<f32>,
+// }
+// duplicate: location 1 used twice
+// buffer MAP_READ|COPY_DST: 0 problems
+// buffer MAP_READ|STORAGE: MAP_READ may only be combined with COPY_DST
+// buffer mapped, size 6: a buffer mapped at creation needs a size that is a multiple of 4
+// rgba8unorm: 4B float renderable true blendable true storage true
+// r32float: 4B unfilterable-float renderable true blendable false storage true
+// bgra8unorm-srgb: srgb true storage false; depth24plus-stencil8: depth true stencil true copy bytes 0
+// bc7-rgba-unorm 16B 4x4, astc-10x8-unorm 16B 10x8, rgb9e5ufloat renderable false
+// bytesPerRow: rgba8unorm x100 512, bc1-rgba-unorm x100 256
+// bind group: 0 problems
+// @group(1) @binding(0) var<uniform> camera: Camera;
+// @group(1) @binding(1) var samp: sampler;
+// @group(1) @binding(2) var albedo: texture_2d<f32>;
+// @group(1) @binding(3) var<storage, read_write> particles: array<Particle>;
+// @group(1) @binding(4) var outImg: texture_storage_2d<rgba8unorm, write>;
+// @group(1) @binding(5) var shadow: texture_depth_2d;
+// @group(1) @binding(6) var<storage, read> lights: array<vec4<f32>>;
+// bad: binding 0: used twice
+// bad: binding 0: a writable storage buffer cannot be visible to the vertex stage
+// bad: binding 2: format bgra8unorm cannot be a storage texture
+// bad: binding 3: read-write storage textures are r32float, r32uint or r32sint
+// bad: binding 4: a multisampled texture must have view dimension 2d
+// bad: binding 4: a multisampled texture cannot have sample type float
+// wgsl A: align 8 size 24
+// wgsl B: align 16 size 160 offsets 0 16 28 32 40 64 80 152
+// wgsl B in uniform: uniform: array<A, 3> has element stride 24, not a multiple of 16
+// wgsl mat4x4<f32> 16/64, mat3x3<f32> 16/48, mat2x2<f32> 8/16, vec3<f16> 8/6, array<vec3<f32>, 4> 16/64
+// wgsl Valid: storage offsets 0 4 size 8, uniform offsets 0 16 size 32
+use webgpu;
+
+fn yes(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn vf(n: str) -> str {
+    val f: WgpuVertexFormat = wgpu_vertex_format(n);
+    if !f.known { return n + " known false"; }
+    if str_starts_with(n, "unorm10") { return n + " " + int_to_str(f.size); }
+    return n + " " + int_to_str(f.size) + " " + f.wgsl;
+}
+
+fn tf(n: str) -> str {
+    val f: WgpuTextureFormat = wgpu_texture_format(n);
+    return n + ": " + int_to_str(f.block_bytes) + "B " + f.sample_type + " renderable " + yes(f.renderable) + " blendable " + yes(f.blendable) + " storage " + yes(f.storage);
+}
+
+fn blk(n: str) -> str {
+    val f: WgpuTextureFormat = wgpu_texture_format(n);
+    return n + " " + int_to_str(f.block_bytes) + "B " + int_to_str(f.block_w) + "x" + int_to_str(f.block_h);
+}
+
+fn first(v: Vec<str>) -> str {
+    if v.len() == 0 { return "0 problems"; }
+    return v.get(0);
+}
+
+fn ints(v: &Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + " " + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn lay(t: &WgslTypes, ty: str) -> str {
+    val l: WgslLayout = wgsl_layout(t, ty, false);
+    return ty + " " + int_to_str(l.align) + "/" + int_to_str(l.size);
+}
+
+fn main() {
+    println("formats: " + vf("float32x3") + ", " + vf("unorm8x4") + ", " + vf("uint16x2") + ", " + vf("sint32x3") + ", " + vf("unorm10-10-10-2") + ", " + vf("float16x3") + ", " + vf("snorm32"));
+    var vl: WgpuVertexLayout = wgpu_vertex_layout_new();
+    wgpu_vertex_add(&mut vl, 0, "float32x3", "position");
+    wgpu_vertex_add(&mut vl, 1, "unorm8x4", "color");
+    wgpu_vertex_add(&mut vl, 2, "uint8", "material");
+    wgpu_vertex_add(&mut vl, 3, "float16x2", "uv");
+    println("vertex layout: offsets" + ints(&vl.offsets) + ", stride " + int_to_str(vl.stride) + ", errors " + int_to_str(vl.errors.len()));
+    val ws: Vec<str> = str_lines(wgpu_vertex_wgsl(&vl, "VertexIn"));
+    var i: i64 = 0;
+    while i < ws.len() {
+        if str_len(ws.get(i)) > 0 { println(ws.get(i)); }
+        i = i + 1;
+    }
+    var dup: WgpuVertexLayout = wgpu_vertex_layout_new();
+    wgpu_vertex_add(&mut dup, 1, "float32", "a");
+    wgpu_vertex_add(&mut dup, 1, "float32", "b");
+    println("duplicate: " + dup.errors.get(0));
+
+    println("buffer " + wgpu_buffer_usage_str(WGPU_BUFFER_MAP_READ | WGPU_BUFFER_COPY_DST) + ": " + first(wgpu_validate_buffer(64, WGPU_BUFFER_MAP_READ | WGPU_BUFFER_COPY_DST, false)));
+    println("buffer " + wgpu_buffer_usage_str(WGPU_BUFFER_MAP_READ | WGPU_BUFFER_STORAGE) + ": " + first(wgpu_validate_buffer(64, WGPU_BUFFER_MAP_READ | WGPU_BUFFER_STORAGE, false)));
+    println("buffer mapped, size 6: " + first(wgpu_validate_buffer(6, WGPU_BUFFER_VERTEX, true)));
+
+    println(tf("rgba8unorm"));
+    println(tf("r32float"));
+    val bs: WgpuTextureFormat = wgpu_texture_format("bgra8unorm-srgb");
+    val ds: WgpuTextureFormat = wgpu_texture_format("depth24plus-stencil8");
+    println("bgra8unorm-srgb: srgb " + yes(bs.srgb) + " storage " + yes(bs.storage) + "; depth24plus-stencil8: depth " + yes(ds.has_depth) + " stencil " + yes(ds.has_stencil) + " copy bytes " + int_to_str(ds.block_bytes));
+    println(blk("bc7-rgba-unorm") + ", " + blk("astc-10x8-unorm") + ", rgb9e5ufloat renderable " + yes(wgpu_texture_format("rgb9e5ufloat").renderable));
+    println("bytesPerRow: rgba8unorm x100 " + int_to_str(wgpu_bytes_per_row("rgba8unorm", 100)) + ", bc1-rgba-unorm x100 " + int_to_str(wgpu_bytes_per_row("bc1-rgba-unorm", 100)));
+
+    var g: WgpuBglBuilder = wgpu_bgl_new(1);
+    wgpu_bgl_storage_texture(&mut g, 4, WGPU_STAGE_COMPUTE, "write-only", "rgba8unorm", "outImg");
+    wgpu_bgl_buffer(&mut g, 0, WGPU_STAGE_VERTEX | WGPU_STAGE_FRAGMENT, "uniform", "camera", "Camera");
+    wgpu_bgl_sampler(&mut g, 1, WGPU_STAGE_FRAGMENT, "filtering", "samp");
+    wgpu_bgl_texture(&mut g, 2, WGPU_STAGE_FRAGMENT, "float", "2d", false, "albedo");
+    wgpu_bgl_buffer(&mut g, 3, WGPU_STAGE_COMPUTE, "storage", "particles", "array<Particle>");
+    wgpu_bgl_texture(&mut g, 5, WGPU_STAGE_FRAGMENT, "depth", "2d", false, "shadow");
+    wgpu_bgl_buffer(&mut g, 6, WGPU_STAGE_VERTEX | WGPU_STAGE_FRAGMENT, "read-only-storage", "lights", "array<vec4<f32>>");
+    println("bind group: " + first(wgpu_bgl_validate(&g)));
+    val decls: Vec<str> = str_lines(wgpu_bgl_wgsl(&g));
+    i = 0;
+    while i < decls.len() {
+        if str_len(decls.get(i)) > 0 { println(decls.get(i)); }
+        i = i + 1;
+    }
+    var bad: WgpuBglBuilder = wgpu_bgl_new(0);
+    wgpu_bgl_buffer(&mut bad, 0, WGPU_STAGE_VERTEX, "storage", "a", "array<u32>");
+    wgpu_bgl_buffer(&mut bad, 0, WGPU_STAGE_FRAGMENT, "uniform", "b", "B");
+    wgpu_bgl_storage_texture(&mut bad, 2, WGPU_STAGE_COMPUTE, "write-only", "bgra8unorm", "c");
+    wgpu_bgl_storage_texture(&mut bad, 3, WGPU_STAGE_COMPUTE, "read-write", "rgba8unorm", "d");
+    wgpu_bgl_texture(&mut bad, 4, WGPU_STAGE_FRAGMENT, "float", "cube", true, "e");
+    val be: Vec<str> = wgpu_bgl_validate(&bad);
+    i = 0;
+    while i < be.len() {
+        println("bad: " + be.get(i));
+        i = i + 1;
+    }
+
+    var t: WgslTypes = wgsl_types_new();
+    wgsl_struct(&mut t, "A", "u: f32, v: f32, w: vec2<f32>, x: f32");
+    wgsl_struct(&mut t, "B", "a: vec2<f32>, b: vec3<f32>, c: f32, d: f32, e: A, f: vec3<f32>, g: array<A, 3>, h: i32");
+    val la: WgslLayout = wgsl_layout(&t, "A", false);
+    println("wgsl A: align " + int_to_str(la.align) + " size " + int_to_str(la.size));
+    val lb: WgslLayout = wgsl_layout(&t, "B", false);
+    println("wgsl B: align " + int_to_str(lb.align) + " size " + int_to_str(lb.size) + " offsets" + ints(&lb.offsets));
+    println("wgsl B in uniform: " + wgsl_layout(&t, "B", true).error);
+    println("wgsl " + lay(&t, "mat4x4<f32>") + ", " + lay(&t, "mat3x3<f32>") + ", " + lay(&t, "mat2x2<f32>") + ", " + lay(&t, "vec3<f16>") + ", " + lay(&t, "array<vec3<f32>, 4>"));
+    wgsl_struct(&mut t, "S", "x: f32");
+    wgsl_struct(&mut t, "Valid", "a: S, b: f32");
+    val vs: WgslLayout = wgsl_layout(&t, "Valid", false);
+    val vu: WgslLayout = wgsl_layout(&t, "Valid", true);
+    println("wgsl Valid: storage offsets" + ints(&vs.offsets) + " size " + int_to_str(vs.size) + ", uniform offsets" + ints(&vu.offsets) + " size " + int_to_str(vu.size));
+}

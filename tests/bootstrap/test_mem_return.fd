@@ -1,0 +1,121 @@
+// RT7: memory a program frees goes back to the operating system.
+// p_mem_resident() is the process's bytes in physical memory (the working
+// set on Windows, /proc/self/statm on Linux, task_info on macOS). Three
+// cases, each measured while the memory is held and after it is freed:
+//   - 3072 strings of 32000 bytes (the 32 KB class, 4 MB arena chunks):
+//     their chunks empty out and are unmapped (C runtime: __p_mem_trim);
+//   - one 16 MB string: a block of its own pages, unmapped by p_free;
+//   - 120 strings of 300000 bytes (the 384 KB class) with a small string
+//     kept between each two, so no chunk empties: the big free blocks'
+//     inside pages are decommitted (C: __p_mem_trim; native Linux: at free).
+// Held memory must show (at least 3/4 of it), and after the free at most
+// half of it may still be resident. Where the resident size is not known
+// (-1: the interpreter, pe_ir's Windows executables, the --nat Windows,
+// macOS and WASI layers) every line prints true without a measurement.
+//
+// Expected output:
+//   small blocks used: true
+//   small blocks returned: true
+//   large block used: true
+//   large block returned: true
+//   big free blocks used: true
+//   big free blocks returned: true
+
+const MB: i64 = 1048576;
+
+fn report(name: str, ok: bool) {
+    if ok {
+        println(name + ": true");
+    } else {
+        println(name + ": false");
+    }
+}
+
+/// The two lines of one case: used (at least 3/4 of `bytes` resident while
+/// held) and returned (at most half of what was held is left after it).
+fn check_case(name: str, base: i64, held: i64, after: i64, bytes: i64) {
+    val used: bool = held - base >= bytes / 4 * 3;
+    val returned: bool = after - base <= (held - base) / 2;
+    if !used || !returned {
+        p_eprint_str(name + ": resident " + int_to_str(base / MB) + " MB before, " + int_to_str(held / MB) + " MB held, " + int_to_str(after / MB) + " MB after\n");
+    }
+    report(name + " used", used);
+    report(name + " returned", returned);
+}
+
+/// `n` strings of 32000 bytes held at once; the resident bytes then. They
+/// are all freed when `v` goes out of scope.
+fn hold_small(n: i64) -> i64 {
+    val k: str = str_repeat("0123456789", 100);
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(str_repeat(k, 32));
+        i = i + 1;
+    }
+    var r: i64 = p_mem_resident();
+    if v.len() != n {
+        r = 0;
+    }
+    return r;
+}
+
+/// One 16 MB string held; the resident bytes then.
+fn hold_large() -> i64 {
+    val k: str = str_repeat("0123456789", 100);
+    val s: str = str_repeat(k, 16000);
+    var r: i64 = p_mem_resident();
+    if str_len(s) != 16000000 {
+        r = 0;
+    }
+    return r;
+}
+
+/// 120 strings of 300000 bytes held, a 40-byte string kept in `pins`
+/// after each (so their chunks never empty); the resident bytes then.
+fn hold_big_blocks(pins: & mut Vec<str>) -> i64 {
+    val k: str = str_repeat("0123456789", 100);
+    var v: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < 120 {
+        v.push(str_repeat(k, 300));
+        pins.push(str_repeat("pin-", 10));
+        i = i + 1;
+    }
+    var r: i64 = p_mem_resident();
+    if v.len() != 120 {
+        r = 0;
+    }
+    return r;
+}
+
+fn main() -> i64 {
+    val base: i64 = p_mem_resident();
+    if base < 0 {
+        report("small blocks used", true);
+        report("small blocks returned", true);
+        report("large block used", true);
+        report("large block returned", true);
+        report("big free blocks used", true);
+        report("big free blocks returned", true);
+        return 0;
+    }
+    val held: i64 = hold_small(3072);
+    val after: i64 = p_mem_resident();
+    check_case("small blocks", base, held, after, 3072 * 32000);
+
+    val base2: i64 = p_mem_resident();
+    val held2: i64 = hold_large();
+    val after2: i64 = p_mem_resident();
+    check_case("large block", base2, held2, after2, 16000000);
+
+    var pins: Vec<str> = Vec::new();
+    val base3: i64 = p_mem_resident();
+    val held3: i64 = hold_big_blocks(& mut pins);
+    val after3: i64 = p_mem_resident();
+    check_case("big free blocks", base3, held3, after3, 120 * 300000);
+    if pins.len() != 120 {
+        println("pins lost");
+    }
+    return 0;
+}

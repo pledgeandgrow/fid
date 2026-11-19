@@ -1,0 +1,156 @@
+// stdlib/initrd: a GNU cpio -H newc archive read, rewritten byte for byte, and mounted through vfs into ramfs.
+// Expected output:
+// gnu archive: 6 entries, err ""
+// . mode 40755 size 0
+// bin mode 40755 size 0
+// bin/sh mode 120777 size 7
+// etc mode 40755 size 0
+// etc/passwd mode 100644 size 26
+// init mode 100755 size 18
+// rewrite: same 1024 bytes
+// mount: 2 dirs, 2 files, 1 symlinks, 44 bytes
+// /init: #!/bin/sh
+// /bin/sh -> ../init, through the link: #!/bin/sh
+// /etc/passwd mode 100644
+// crc archive: checksum 1603, read back ok
+// corrupted data: checksum mismatch for a
+// two archives back to back: 2 entries
+// hard links: 1 extra, both read "shared"
+// device node skipped: 1
+// bad magic: bad magic at 0
+use initrd;
+use vfs;
+use ramfs;
+use vec;
+use string;
+use encoding;
+
+fn GNU_CPIO() -> str {
+    return "303730373031303030303030303030303030343145443030303030303030303030303030303030303030303030323635" +
+        "353346313030303030303030303030303030303030303030303030303030303030303030303030303030303030303030" +
+        "30303030303230303030303030302e003037303730313030303030303031303030303431454430303030303030303030" +
+        "303030303030303030303030303236353533463130303030303030303030303030303030303030303030303030303030" +
+        "30303030303030303030303030303030303030303034303030303030303062696e000000303730373031303030303030" +
+        "303230303030413146463030303030303030303030303030303030303030303030313635353346313030303030303030" +
+        "303730303030303030303030303030303030303030303030303030303030303030303030303030303037303030303030" +
+        "303062696e2f7368000000002e2e2f696e69740030373037303130303030303030333030303034314544303030303030" +
+        "303030303030303030303030303030303032363535334631303030303030303030303030303030303030303030303030" +
+        "303030303030303030303030303030303030303030303030303430303030303030306574630000003037303730313030" +
+        "303030303034303030303831413430303030303030303030303030303030303030303030303136353533463130303030" +
+        "303030303141303030303030303030303030303030303030303030303030303030303030303030303030303030423030" +
+        "3030303030306574632f70617373776400000000726f6f743a783a303a303a3a2f726f6f743a2f62696e2f73680a0000" +
+        "303730373031303030303030303530303030383145443030303030303030303030303030303030303030303030313635" +
+        "353346313030303030303030313230303030303030303030303030303030303030303030303030303030303030303030" +
+        "3030303030353030303030303030696e6974000023212f62696e2f73680a6563686f2068690a00003037303730313030" +
+        "303030303030303030303030303030303030303030303030303030303030303030303030303130303030303030303030" +
+        "303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030423030" +
+        "303030303030545241494c4552212121";
+}
+
+fn octal(n: i64) -> str {
+    if n == 0 {
+        return "0";
+    }
+    var s: str = "";
+    var x: i64 = n;
+    while x > 0 {
+        s = int_to_str(x % 8) + s;
+        x = x / 8;
+    }
+    return s;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn first_line(b: Vec<i64>) -> str {
+    return str_split_char(str_from_bytes(b), 10).get(0);
+}
+
+fn main() {
+    var raw: Vec<i64> = hex_decode_bytes(GNU_CPIO());
+    while raw.len() < 1024 {
+        raw.push(0);
+    }
+    val a: CpioArchive = cpio_parse(raw);
+    println("gnu archive: " + int_to_str(a.entries.len()) + " entries, err \"" + a.err + "\"");
+    var i: i64 = 0;
+    while i < a.entries.len() {
+        val e: CpioEntry = a.entries.get(i);
+        println(e.name + " mode " + octal(e.mode) + " size " + int_to_str(e.data.len()));
+        i = i + 1;
+    }
+    val w: Vec<i64> = cpio_write(a.entries, false, 512);
+    if same(w, raw) {
+        println("rewrite: same " + int_to_str(w.len()) + " bytes");
+    } else {
+        println("rewrite: DIFFERENT");
+    }
+
+    var v: Vfs = vfs_new();
+    val st: InitrdStats = initrd_mount(&mut v, "/", raw);
+    println("mount: " + int_to_str(st.dirs) + " dirs, " + int_to_str(st.files) + " files, " + int_to_str(st.symlinks) + " symlinks, " + int_to_str(st.bytes) + " bytes");
+    println("/init: " + first_line(vfs_read_file(&mut v, "/init")));
+    println("/bin/sh -> " + vfs_readlink(&mut v, "/bin/sh") + ", through the link: " + first_line(vfs_read_file(&mut v, "/bin/sh")));
+    println("/etc/passwd mode " + octal(vfs_stat(&mut v, "/etc/passwd").mode));
+
+    // the 070702 form carries the sum of the data bytes
+    var es: Vec<CpioEntry> = Vec::new();
+    es.push(cpio_file("a", 420, str_bytes("checksummed data")));
+    val c: Vec<i64> = cpio_write(es, true, 4);
+    val ca: CpioArchive = cpio_parse(c);
+    if str_len(ca.err) == 0 && ca.crc {
+        println("crc archive: checksum " + int_to_str(ca.entries.get(0).check) + ", read back ok");
+    }
+    var bad: Vec<i64> = c;
+    bad.set(CPIO_HDR + 4, 88);
+    println("corrupted data: " + cpio_parse(bad).err);
+
+    // initramfs images are often several archives concatenated
+    var two: Vec<i64> = cpio_write(es, false, 512);
+    var es2: Vec<CpioEntry> = Vec::new();
+    es2.push(cpio_dir("d", 493));
+    val second: Vec<i64> = cpio_write(es2, false, 4);
+    i = 0;
+    while i < second.len() {
+        two.push(second.get(i));
+        i = i + 1;
+    }
+    println("two archives back to back: " + int_to_str(cpio_parse(two).entries.len()) + " entries");
+
+    // hard links: GNU cpio stores the data with the last name
+    var hl: Vec<CpioEntry> = Vec::new();
+    var h1: CpioEntry = cpio_file("x/one", 420, Vec::new());
+    h1.ino = 77;
+    h1.nlink = 2;
+    var h2: CpioEntry = cpio_file("x/two", 420, str_bytes("shared"));
+    h2.ino = 77;
+    h2.nlink = 2;
+    hl.push(h1);
+    hl.push(h2);
+    var dev: CpioEntry = cpio_entry("dev/console", CPIO_S_IFCHR | 384, Vec::new());
+    dev.rdevmajor = 5;
+    dev.rdevminor = 1;
+    hl.push(dev);
+    vfs_mkdir(&mut v, "/new", 493);
+    val ha: CpioArchive = cpio_parse(cpio_write(hl, false, 4));
+    val hs: InitrdStats = initrd_unpack(&mut v, "/new", &ha);
+    println("hard links: " + int_to_str(hs.hardlinks) + " extra, both read \"" + str_from_bytes(vfs_read_file(&mut v, "/new/x/one")) + "\"");
+    println("device node skipped: " + int_to_str(hs.skipped));
+    var junk: Vec<i64> = str_bytes("070799");
+    while junk.len() < 120 {
+        junk.push(48);
+    }
+    println("bad magic: " + cpio_parse(junk).err);
+}

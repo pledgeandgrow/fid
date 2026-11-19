@@ -24,13 +24,24 @@ module volatile;
 //
 // T is stored as i64 (Fides uses i64 for all values), so Volatile<T>
 // works for any type that fits in 8 bytes.
+//
+// Release M10: an address is a promise only the caller can make, so the
+// functions that take one are @unsafe: Volatile::new and the ptr_read* /
+// ptr_write* functions below. Outside the standard library they are called
+// from an `unsafe` block or an @unsafe function; once made, a Volatile's
+// loads and stores need nothing more (its address is private: only new
+// sets it). ptr_add and ptr_offset only compute an address and stay safe.
 
 pub struct Volatile {
-    pub addr: i64,
+    addr: i64,
 }
 
 impl Volatile {
     // Create a Volatile pointing to the given address
+    // SAFETY: the caller's promise: addr is a live, aligned word (MMIO or
+    // memory it owns) for as long as the Volatile is used; every load and
+    // store of the Volatile goes to that address.
+    @unsafe
     pub fn new(addr: i64) -> Volatile {
         return Volatile {
             addr: addr
@@ -95,6 +106,13 @@ impl Volatile {
 // These operate on raw i64 addresses. In Fides, pointers are i64 values.
 
 // Add a byte offset to a pointer
+/// Example:
+///   assert_eq(ptr_add(0x1000, 8), 0x1008);
+///   assert_eq(ptr_offset(0x1000, 16), 0x1010);
+///   unsafe {
+///       val v = Volatile::new(0x1000);
+///       assert_eq(v.offset(4).addr_of(), 0x1004);
+///   }
 pub fn ptr_add(ptr: i64, n: i64) -> i64 {
     return ptr + n;
 }
@@ -105,46 +123,68 @@ pub fn ptr_offset(ptr: i64, n: i64) -> i64 {
 }
 
 // Volatile read 64-bit from pointer
+// SAFETY: the caller's promise: ptr is a live, aligned 8-byte word.
+@unsafe
 pub fn ptr_read_volatile(ptr: i64) -> i64 {
     return p_volatile_load(ptr);
 }
 
 // Volatile write 64-bit to pointer
+// SAFETY: the caller's promise: ptr is a live, aligned, writable 8-byte word.
+@unsafe
 pub fn ptr_write_volatile(ptr: i64, value: i64) -> void {
     p_volatile_store(ptr, value);
 }
 
 // Volatile read 8-bit from pointer
+// SAFETY: the caller's promise: ptr is a live byte.
+@unsafe
 pub fn ptr_read_volatile8(ptr: i64) -> i64 {
     return p_volatile_load8(ptr);
 }
 
 // Volatile write 8-bit to pointer
+// SAFETY: the caller's promise: ptr is a live, writable byte.
+@unsafe
 pub fn ptr_write_volatile8(ptr: i64, value: i64) -> void {
     p_volatile_store8(ptr, value);
 }
 
 // Volatile read 32-bit from pointer
+// SAFETY: the caller's promise: ptr is a live, aligned 4-byte word.
+@unsafe
 pub fn ptr_read_volatile32(ptr: i64) -> i64 {
     return p_volatile_load32(ptr);
 }
 
 // Volatile write 32-bit to pointer
+// SAFETY: the caller's promise: ptr is a live, aligned, writable 4-byte word.
+@unsafe
 pub fn ptr_write_volatile32(ptr: i64, value: i64) -> void {
     p_volatile_store32(ptr, value);
 }
 
 // Non-volatile read (for when you want a normal load from a raw address)
+// SAFETY: the caller's promise (@unsafe): ptr is the address of a live,
+// aligned 8-byte word (MMIO or memory the caller owns).
+@unsafe
 pub fn ptr_read(ptr: i64) -> i64 {
     var p: * mut i64 = ptr;
+    // SAFETY: the function's @unsafe contract above: ptr is a live, aligned
+    // 8-byte word.
     unsafe {
         return * p;
     }
 }
 
 // Non-volatile write
+// SAFETY: the caller's promise (@unsafe): ptr is a live, aligned, writable
+// 8-byte word the caller owns.
+@unsafe
 pub fn ptr_write(ptr: i64, value: i64) -> void {
     var p: * mut i64 = ptr;
+    // SAFETY: the function's @unsafe contract above: ptr is a live, aligned,
+    // writable 8-byte word.
     unsafe {
         * p = value;
     }

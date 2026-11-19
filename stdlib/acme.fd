@@ -1,0 +1,739 @@
+// Fides ACME client (RFC 8555): the directory (§7.1.1), nonces
+// (§7.2: Replay-Nonce pool, newNonce, badNonce retries), JWS-signed
+// requests in the flattened JSON serialization with "jwk" or "kid"
+// (§6.2, via jose.fd: ES256 with P-256 account keys, EdDSA and RS256
+// too), POST-as-GET (§6.3), external account binding (§7.3.4), the
+// message bodies of newAccount, newOrder, challenge responses, finalize,
+// account deactivation and revocation, error documents (§6.7), the
+// http-01 key authorization (§8.1, §8.3, with the RFC 7638 thumbprint)
+// and the dns-01 TXT record (§8.4), PKCS#10 CSRs (RFC 2986, with a
+// subjectAltName extension request) for P-256 or Ed25519 certificate
+// keys, built and checked, and the order state machine: account, order,
+// authorizations, challenge, polling (with Retry-After), finalize,
+// certificate download.
+//
+// Pure computation. The seams: HTTP is the caller's (acme_next_request
+// gives method, URL, headers and body; acme_handle_response takes status,
+// Location, Replay-Nonce, Retry-After and body), publishing the
+// challenge is the caller's (the client stops at ACME_ST_PUBLISH with the
+// path and body for http-01 or the TXT name and value for dns-01 until
+// acme_challenge_published), and time is injected (`now`, for polling).
+// PS256 account keys would draw salts from crypto_random_bytes.
+//
+// Checked in tests/bootstrap/test_std_acme.fd against a scripted fake
+// ACME server written in Fides that verifies every JWS (signature, nonce,
+// url, kid/jwk), checks the key authorization or TXT value of each
+// challenge and the CSR's signature and names, and injects a badNonce
+// error; the test runs with Ed25519 keys (P-256 in the interpreter takes
+// minutes per signature); the same flow with ES256 and a P-256 CSR was
+// run from a C build, and OpenSSL 3.5 accepts both CSRs (`openssl req
+// -verify`).
+//
+// Usage:
+//   use acme;
+//   var c = acme_client_new("https://acme.example/dir", account_key, "ES256", contacts, domains);
+//   acme_set_csr_key(& mut c, cert_key);
+//   loop: val req = acme_next_request(& mut c, now);
+//         if c.state == ACME_ST_PUBLISH { publish c.http01_path/c.key_authorization; acme_challenge_published(& mut c); }
+//         else send req, then acme_handle_response(& mut c, status, location, nonce, retry_after, body, now);
+//   until c.state == ACME_ST_DONE (c.certificate holds the PEM chain) or ACME_ST_ERROR (c.err).
+
+module acme;
+use vec;
+use string;
+use encoding;
+use json;
+use crypto;
+use kdf;
+use asn1;
+use pem;
+use ecdsa;
+use ed25519;
+use jose;
+
+pub const ACME_ST_DIRECTORY: i64 = 0;
+pub const ACME_ST_ACCOUNT: i64 = 1;
+pub const ACME_ST_ORDER: i64 = 2;
+pub const ACME_ST_AUTHZ: i64 = 3;
+pub const ACME_ST_PUBLISH: i64 = 4;
+pub const ACME_ST_CHALLENGE: i64 = 5;
+pub const ACME_ST_POLL_AUTHZ: i64 = 6;
+pub const ACME_ST_FINALIZE: i64 = 7;
+pub const ACME_ST_POLL_ORDER: i64 = 8;
+pub const ACME_ST_CERT: i64 = 9;
+pub const ACME_ST_DONE: i64 = 10;
+pub const ACME_ST_ERROR: i64 = 11;
+
+/// The directory object.
+pub struct AcmeDirectory {
+    pub ok: bool,
+    pub new_nonce: str,
+    pub new_account: str,
+    pub new_order: str,
+    pub revoke_cert: str,
+    pub key_change: str,
+    pub terms_of_service: str,
+    pub eab_required: bool,
+}
+
+/// One HTTP request ("" method: nothing to send right now).
+pub struct AcmeHttpRequest {
+    pub method: str,
+    pub url: str,
+    pub headers: str,
+    pub body: str,
+}
+
+/// An error document (application/problem+json).
+pub struct AcmeProblem {
+    pub ok: bool,
+    pub kind: str,
+    pub detail: str,
+    pub status: i64,
+}
+
+/// An order object.
+pub struct AcmeOrder {
+    pub ok: bool,
+    pub status: str,
+    pub authorizations: Vec<str>,
+    pub finalize: str,
+    pub certificate: str,
+}
+
+/// An authorization with its challenges (parallel lists).
+pub struct AcmeAuthz {
+    pub ok: bool,
+    pub status: str,
+    pub identifier: str,
+    pub wildcard: bool,
+    pub chal_types: Vec<str>,
+    pub chal_urls: Vec<str>,
+    pub chal_tokens: Vec<str>,
+    pub chal_status: Vec<str>,
+}
+
+/// What a CSR says, once its signature checked.
+pub struct AcmeCsrInfo {
+    pub ok: bool,
+    pub err: str,
+    pub common_name: str,
+    pub domains: Vec<str>,
+    pub key_alg: str,
+    pub spki: Vec<i64>,
+}
+
+/// The client's state machine.
+pub struct AcmeClient {
+    pub state: i64,
+    pub err: str,
+    pub directory_url: str,
+    pub dir: AcmeDirectory,
+    pub key: Jwk,
+    pub alg: str,
+    pub kid: str,
+    pub contacts: Vec<str>,
+    pub domains: Vec<str>,
+    pub eab_kid: str,
+    pub eab_key: Vec<i64>,
+    pub nonces: Vec<str>,
+    pub fetching_nonce: bool,
+    pub bad_nonce_retries: i64,
+    pub order_url: str,
+    pub finalize_url: str,
+    pub cert_url: str,
+    pub authz_urls: Vec<str>,
+    pub authz_index: i64,
+    pub prefer: str,
+    pub chal_type: str,
+    pub chal_url: str,
+    pub chal_token: str,
+    pub key_authorization: str,
+    pub http01_path: str,
+    pub dns01_name: str,
+    pub dns01_value: str,
+    pub next_poll: i64,
+    pub polls: i64,
+    pub max_polls: i64,
+    pub csr_key: Jwk,
+    pub certificate: str,
+}
+
+fn acme_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() { out.push(b.get(i)); i = i + 1; }
+    return out;
+}
+
+// ─── Directory, problems, objects ──────────────────────────────────────
+
+/// Parse the directory; newNonce, newAccount and newOrder are required.
+pub fn acme_parse_directory(body: str) -> AcmeDirectory {
+    var d: AcmeDirectory = AcmeDirectory {
+        ok: false, new_nonce: "", new_account: "", new_order: "", revoke_cert: "",
+        key_change: "", terms_of_service: "", eab_required: false
+    };
+    if !str_equal(json_type_safe(body), "object") { return d; }
+    d.new_nonce = json_get_str(body, "newNonce");
+    d.new_account = json_get_str(body, "newAccount");
+    d.new_order = json_get_str(body, "newOrder");
+    d.revoke_cert = json_get_str(body, "revokeCert");
+    d.key_change = json_get_str(body, "keyChange");
+    val meta: str = json_get_safe(body, "meta");
+    if str_equal(json_type_safe(meta), "object") {
+        d.terms_of_service = json_get_str(meta, "termsOfService");
+        d.eab_required = json_get_bool(meta, "externalAccountRequired", false);
+    }
+    d.ok = str_len(d.new_nonce) > 0 && str_len(d.new_account) > 0 && str_len(d.new_order) > 0;
+    return d;
+}
+
+/// Parse a problem document; ok false when the body is not one.
+pub fn acme_parse_problem(body: str) -> AcmeProblem {
+    if !str_equal(json_type_safe(body), "object") || !json_has(body, "type") {
+        return AcmeProblem { ok: false, kind: "", detail: "", status: 0 };
+    }
+    return AcmeProblem { ok: true, kind: json_get_str(body, "type"), detail: json_get_str(body, "detail"), status: json_get_int(body, "status", 0) };
+}
+
+fn acme_str_list(arr: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = json_len_safe(arr);
+    while str_equal(json_type_safe(arr), "array") && i < n {
+        out.push(json_at_str(arr, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse an order object.
+pub fn acme_parse_order(body: str) -> AcmeOrder {
+    var o: AcmeOrder = AcmeOrder { ok: false, status: "", authorizations: Vec::new(), finalize: "", certificate: "" };
+    if !str_equal(json_type_safe(body), "object") { return o; }
+    o.status = json_get_str(body, "status");
+    o.authorizations = acme_str_list(json_get_safe(body, "authorizations"));
+    o.finalize = json_get_str(body, "finalize");
+    o.certificate = json_get_str(body, "certificate");
+    o.ok = str_len(o.status) > 0 && str_len(o.finalize) > 0;
+    return o;
+}
+
+/// Parse an authorization object.
+pub fn acme_parse_authz(body: str) -> AcmeAuthz {
+    var a: AcmeAuthz = AcmeAuthz {
+        ok: false, status: "", identifier: "", wildcard: false,
+        chal_types: Vec::new(), chal_urls: Vec::new(), chal_tokens: Vec::new(), chal_status: Vec::new()
+    };
+    if !str_equal(json_type_safe(body), "object") { return a; }
+    a.status = json_get_str(body, "status");
+    a.identifier = json_get_str(json_get_safe(body, "identifier"), "value");
+    a.wildcard = json_get_bool(body, "wildcard", false);
+    val chals: Vec<str> = json_items(json_get_safe(body, "challenges"));
+    var types: Vec<str> = Vec::new();
+    var urls: Vec<str> = Vec::new();
+    var tokens: Vec<str> = Vec::new();
+    var stats: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < chals.len() {
+        val ch: str = chals.get(i);
+        types.push(json_get_str(ch, "type"));
+        urls.push(json_get_str(ch, "url"));
+        tokens.push(json_get_str(ch, "token"));
+        stats.push(json_get_str(ch, "status"));
+        i = i + 1;
+    }
+    a.chal_types = types;
+    a.chal_urls = urls;
+    a.chal_tokens = tokens;
+    a.chal_status = stats;
+    a.ok = str_len(a.status) > 0 && str_len(a.identifier) > 0;
+    return a;
+}
+
+// ─── JWS requests (§6.2) ───────────────────────────────────────────────
+
+/// A flattened JWS for an ACME request. With an empty `kid` the header
+/// carries the public JWK (newAccount, revocation by certificate key).
+/// An empty `payload` is POST-as-GET.
+pub fn acme_jws(key: & Jwk, alg: str, url: str, nonce: str, kid: str, payload: str) -> str {
+    var h: str = "{\"alg\":" + json_string(alg);
+    if str_len(kid) > 0 {
+        h = h + ",\"kid\":" + json_string(kid);
+    } else {
+        val pubk: Jwk = jwk_public(key);
+        h = h + ",\"jwk\":" + jwk_to_json(& pubk, false);
+    }
+    h = h + ",\"nonce\":" + json_string(nonce) + ",\"url\":" + json_string(url) + "}";
+    val h64: str = jose_b64url_str(h);
+    val p64: str = jose_b64url_str(payload);
+    var salt: Vec<i64> = Vec::new();
+    if str_starts_with(alg, "PS") { salt = crypto_random_bytes(32); }
+    val sig: Vec<i64> = jws_raw_sign(alg, key, str_bytes(h64 + "." + p64), salt);
+    if sig.len() == 0 { return ""; }
+    return "{\"protected\":\"" + h64 + "\",\"payload\":\"" + p64 + "\",\"signature\":\"" + jose_b64url_encode(sig) + "\"}";
+}
+
+/// The externalAccountBinding object (§7.3.4): an HS256 JWS over the
+/// account's public JWK with the CA-issued MAC key.
+pub fn acme_eab(eab_kid: str, mac_key: Vec<i64>, account_key: & Jwk, url: str) -> str {
+    val pubk: Jwk = jwk_public(account_key);
+    val h64: str = jose_b64url_str("{\"alg\":\"HS256\",\"kid\":" + json_string(eab_kid) + ",\"url\":" + json_string(url) + "}");
+    val p64: str = jose_b64url_str(jwk_to_json(& pubk, false));
+    val mac: Vec<i64> = kdf_hmac(KDF_SHA256, mac_key, str_bytes(h64 + "." + p64));
+    return "{\"protected\":\"" + h64 + "\",\"payload\":\"" + p64 + "\",\"signature\":\"" + jose_b64url_encode(mac) + "\"}";
+}
+
+fn acme_json_list(items: & Vec<str>) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < items.len() {
+        if i > 0 { s = s + ","; }
+        s = s + json_string(items.get(i));
+        i = i + 1;
+    }
+    return s + "]";
+}
+
+/// newAccount payload (§7.3); `eab` is acme_eab's object or "".
+pub fn acme_new_account_payload(contacts: & Vec<str>, agree_tos: bool, eab: str) -> str {
+    var s: str = "{\"termsOfServiceAgreed\":" + bool_to_str(agree_tos);
+    if contacts.len() > 0 { s = s + ",\"contact\":" + acme_json_list(contacts); }
+    if str_len(eab) > 0 { s = s + ",\"externalAccountBinding\":" + eab; }
+    return s + "}";
+}
+
+/// newOrder payload (§7.4) for DNS names.
+pub fn acme_new_order_payload(domains: & Vec<str>) -> str {
+    var s: str = "{\"identifiers\":[";
+    var i: i64 = 0;
+    while i < domains.len() {
+        if i > 0 { s = s + ","; }
+        s = s + "{\"type\":\"dns\",\"value\":" + json_string(domains.get(i)) + "}";
+        i = i + 1;
+    }
+    return s + "]}";
+}
+
+/// finalize payload: the CSR's DER as base64url.
+pub fn acme_finalize_payload(csr_der: Vec<i64>) -> str {
+    return "{\"csr\":\"" + jose_b64url_encode(csr_der) + "\"}";
+}
+
+/// revokeCert payload (§7.6) with an RFC 5280 reason code.
+pub fn acme_revoke_payload(cert_der: Vec<i64>, reason: i64) -> str {
+    return "{\"certificate\":\"" + jose_b64url_encode(cert_der) + "\",\"reason\":" + int_to_str(reason) + "}";
+}
+
+/// The payload that deactivates an account or authorization (§7.3.6, §7.5.2).
+pub fn acme_deactivate_payload() -> str {
+    return "{\"status\":\"deactivated\"}";
+}
+
+// ─── Challenges (§8) ───────────────────────────────────────────────────
+
+/// keyAuthorization = token || "." || base64url(JWK thumbprint) (§8.1).
+pub fn acme_key_authorization(token: str, account_key: & Jwk) -> str {
+    return token + "." + jwk_thumbprint_b64(account_key);
+}
+
+/// Where http-01 must serve the key authorization (§8.3).
+pub fn acme_http01_path(token: str) -> str {
+    return "/.well-known/acme-challenge/" + token;
+}
+
+/// The dns-01 record name for a domain (wildcards drop "*.").
+pub fn acme_dns01_name(domain: str) -> str {
+    var d: str = domain;
+    if str_starts_with(d, "*.") { d = str_slice(d, 2, str_len(d)); }
+    return "_acme-challenge." + d;
+}
+
+/// The dns-01 TXT value: base64url(SHA-256(keyAuthorization)) (§8.4).
+pub fn acme_dns01_value(token: str, account_key: & Jwk) -> str {
+    return jose_b64url_encode(crypto_sha256_bytes(str_bytes(acme_key_authorization(token, account_key))));
+}
+
+// ─── CSRs (RFC 2986, RFC 5280 §4.2.1.6, RFC 8410) ──────────────────────
+
+fn acme_spki(key: & Jwk) -> Vec<i64> {
+    if str_equal(key.kty, "EC") { return spki_encode(PEM_OID_EC, PEM_OID_P256, jwk_ec_point(key)); }
+    return spki_encode(PEM_OID_ED25519, "", key.x);
+}
+
+fn acme_sig_alg(key: & Jwk) -> Vec<i64> {
+    if str_equal(key.kty, "EC") { return asn1_enc_seq(asn1_enc_oid("1.2.840.10045.4.3.2")); }
+    return asn1_enc_seq(asn1_enc_oid(PEM_OID_ED25519));
+}
+
+/// The DER CSR for `domains` (first one also the CN), signed with a P-256
+/// (ecdsa-with-SHA256) or Ed25519 private key; empty for other keys.
+pub fn acme_csr(key: & Jwk, domains: & Vec<str>) -> Vec<i64> {
+    val ec: bool = str_equal(key.kty, "EC") && key.d.len() == 32;
+    val ed: bool = str_equal(key.kty, "OKP") && str_equal(key.crv, "Ed25519") && key.d.len() == 32;
+    if (!ec && !ed) || domains.len() == 0 { return Vec::new(); }
+    val cn: Vec<i64> = asn1_enc_seq(asn1_cat(asn1_enc_oid("2.5.4.3"), asn1_enc_utf8(domains.get(0))));
+    val name: Vec<i64> = asn1_enc_seq(asn1_enc_set(cn));
+    var gn: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < domains.len() {
+        gn = asn1_cat(gn, asn1_enc_implicit(2, false, str_bytes(domains.get(i))));
+        i = i + 1;
+    }
+    val san: Vec<i64> = asn1_enc_seq(asn1_cat(asn1_enc_oid("2.5.29.17"), asn1_enc_octets(asn1_enc_seq(gn))));
+    val ext_req: Vec<i64> = asn1_enc_seq(asn1_cat(asn1_enc_oid("1.2.840.113549.1.9.14"), asn1_enc_set(asn1_enc_seq(san))));
+    var cri: Vec<i64> = asn1_cat(asn1_enc_int(0), name);
+    cri = asn1_cat(cri, acme_spki(key));
+    cri = asn1_enc_seq(asn1_cat(cri, asn1_enc_implicit(0, true, ext_req)));
+    var sig: Vec<i64> = Vec::new();
+    if ec {
+        val c: EcCurve = ec_p256();
+        sig = ecdsa_sig_to_der(ecdsa_sign(& c, key.d, KDF_SHA256, cri));
+    } else {
+        sig = ed25519_sign(key.d, cri);
+    }
+    return asn1_enc_seq(asn1_cat(asn1_cat(cri, acme_sig_alg(key)), asn1_enc_bits(sig, 0)));
+}
+
+/// The CSR as a PEM "CERTIFICATE REQUEST" block.
+pub fn acme_csr_pem(key: & Jwk, domains: & Vec<str>) -> str {
+    return pem_encode("CERTIFICATE REQUEST", acme_csr(key, domains));
+}
+
+fn acme_csr_fail(err: str) -> AcmeCsrInfo {
+    return AcmeCsrInfo { ok: false, err: err, common_name: "", domains: Vec::new(), key_alg: "", spki: Vec::new() };
+}
+
+/// Parse a DER CSR, check its self-signature (P-256/SHA-256 or Ed25519)
+/// and return its CN and subjectAltName DNS names.
+pub fn acme_csr_check(der: Vec<i64>) -> AcmeCsrInfo {
+    val top: Asn1Tlv = asn1_read_der(& der, 0, der.len());
+    if !top.ok || top.end != der.len() { return acme_csr_fail("not DER"); }
+    val parts: Vec<Asn1Tlv> = asn1_children(& der, top);
+    if parts.len() != 3 { return acme_csr_fail("not a CSR"); }
+    val cri_t: Asn1Tlv = parts.get(0);
+    val cri: Vec<i64> = asn1_raw(& der, cri_t);
+    val alg: str = pem_alg_id(& der, parts.get(1));
+    val sig: Vec<i64> = asn1_get_bits(& der, parts.get(2));
+    val f: Vec<Asn1Tlv> = asn1_children(& der, cri_t);
+    if f.len() < 3 || asn1_get_int(& der, f.get(0)) != 0 { return acme_csr_fail("bad CertificationRequestInfo"); }
+    val sp: Spki = spki_parse_at(& der, f.get(2));
+    var info: AcmeCsrInfo = acme_csr_fail("");
+    info.spki = asn1_raw(& der, f.get(2));
+    var good: bool = false;
+    if str_equal(alg, "1.2.840.10045.4.3.2") && str_equal(sp.alg, PEM_OID_EC) && str_equal(sp.params, PEM_OID_P256) {
+        val c: EcCurve = ec_p256();
+        good = ecdsa_verify_der(& c, sp.key, KDF_SHA256, cri, sig);
+        info.key_alg = "P-256";
+    } else if str_equal(alg, PEM_OID_ED25519) && str_equal(sp.alg, PEM_OID_ED25519) {
+        good = ed25519_verify(sp.key, cri, sig);
+        info.key_alg = "Ed25519";
+    } else {
+        return acme_csr_fail("unsupported key or signature algorithm");
+    }
+    if !good { return acme_csr_fail("bad CSR signature"); }
+    // subject CN
+    val rdns: Vec<Asn1Tlv> = asn1_children(& der, f.get(1));
+    var i: i64 = 0;
+    while i < rdns.len() {
+        val atvs: Vec<Asn1Tlv> = asn1_children(& der, rdns.get(i));
+        var j: i64 = 0;
+        while j < atvs.len() {
+            val kv: Vec<Asn1Tlv> = asn1_children(& der, atvs.get(j));
+            if kv.len() == 2 && str_equal(asn1_get_oid(& der, kv.get(0)), "2.5.4.3") { info.common_name = asn1_get_str(& der, kv.get(1)); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    // attributes [0]: extensionRequest -> subjectAltName dNSNames
+    var doms: Vec<str> = Vec::new();
+    if f.len() >= 4 && asn1_is_ctx(f.get(3), 0) {
+        val attrs: Vec<Asn1Tlv> = asn1_children(& der, f.get(3));
+        var a: i64 = 0;
+        while a < attrs.len() {
+            val at: Vec<Asn1Tlv> = asn1_children(& der, attrs.get(a));
+            if at.len() == 2 && str_equal(asn1_get_oid(& der, at.get(0)), "1.2.840.113549.1.9.14") {
+                val sets: Vec<Asn1Tlv> = asn1_children(& der, at.get(1));
+                if sets.len() > 0 {
+                    val exts: Vec<Asn1Tlv> = asn1_children(& der, sets.get(0));
+                    var e: i64 = 0;
+                    while e < exts.len() {
+                        val ef: Vec<Asn1Tlv> = asn1_children(& der, exts.get(e));
+                        if ef.len() >= 2 && str_equal(asn1_get_oid(& der, ef.get(0)), "2.5.29.17") {
+                            val inner: Vec<i64> = asn1_content(& der, ef.get(ef.len() - 1));
+                            val gt: Asn1Tlv = asn1_read_der(& inner, 0, inner.len());
+                            val names: Vec<Asn1Tlv> = asn1_children(& inner, gt);
+                            var k: i64 = 0;
+                            while k < names.len() {
+                                if asn1_is_ctx(names.get(k), 2) { doms.push(str_from_bytes(asn1_content(& inner, names.get(k)))); }
+                                k = k + 1;
+                            }
+                        }
+                        e = e + 1;
+                    }
+                }
+            }
+            a = a + 1;
+        }
+    }
+    info.domains = doms;
+    info.ok = true;
+    return info;
+}
+
+// ─── The order state machine ───────────────────────────────────────────
+
+/// A client for `domains` with an account key and its JWS algorithm
+/// ("ES256", "EdDSA", "RS256"). The certificate key defaults to the
+/// account key; set another with acme_set_csr_key (recommended).
+pub fn acme_client_new(directory_url: str, key: Jwk, alg: str, contacts: Vec<str>, domains: Vec<str>) -> AcmeClient {
+    return AcmeClient {
+        state: ACME_ST_DIRECTORY, err: "", directory_url: directory_url, dir: acme_parse_directory(""),
+        key: key, alg: alg, kid: "", contacts: contacts, domains: domains, eab_kid: "", eab_key: Vec::new(),
+        nonces: Vec::new(), fetching_nonce: false, bad_nonce_retries: 0,
+        order_url: "", finalize_url: "", cert_url: "", authz_urls: Vec::new(), authz_index: 0,
+        prefer: "http-01", chal_type: "", chal_url: "", chal_token: "", key_authorization: "",
+        http01_path: "", dns01_name: "", dns01_value: "", next_poll: 0, polls: 0, max_polls: 10,
+        csr_key: key, certificate: ""
+    };
+}
+
+/// The certificate's key (P-256 or Ed25519 with its private part).
+pub fn acme_set_csr_key(c: & mut AcmeClient, key: Jwk) {
+    c.csr_key = key;
+}
+
+/// External account binding credentials from the CA.
+pub fn acme_set_eab(c: & mut AcmeClient, kid: str, mac_key: Vec<i64>) {
+    c.eab_kid = kid;
+    c.eab_key = mac_key;
+}
+
+fn acme_error(c: & mut AcmeClient, err: str) {
+    c.state = ACME_ST_ERROR;
+    c.err = err;
+}
+
+fn acme_none() -> AcmeHttpRequest {
+    return AcmeHttpRequest { method: "", url: "", headers: "", body: "" };
+}
+
+fn acme_post(c: & mut AcmeClient, url: str, payload: str, use_jwk: bool) -> AcmeHttpRequest {
+    if c.nonces.len() == 0 {
+        c.fetching_nonce = true;
+        return AcmeHttpRequest { method: "HEAD", url: c.dir.new_nonce, headers: "", body: "" };
+    }
+    val nonce: str = c.nonces.get(c.nonces.len() - 1);
+    var rest: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < c.nonces.len() - 1 { rest.push(c.nonces.get(i)); i = i + 1; }
+    c.nonces = rest;
+    var kid: str = c.kid;
+    if use_jwk { kid = ""; }
+    val body: str = acme_jws(& c.key, c.alg, url, nonce, kid, payload);
+    if str_len(body) == 0 {
+        acme_error(c, "the account key does not fit the algorithm");
+        return acme_none();
+    }
+    return AcmeHttpRequest { method: "POST", url: url, headers: "Content-Type: application/jose+json", body: body };
+}
+
+/// The next request to send at `now` (method "" when waiting: for the
+/// challenge to be published, for a poll time, or at the end).
+pub fn acme_next_request(c: & mut AcmeClient, now: i64) -> AcmeHttpRequest {
+    val st: i64 = c.state;
+    if st == ACME_ST_DIRECTORY {
+        return AcmeHttpRequest { method: "GET", url: c.directory_url, headers: "", body: "" };
+    }
+    if st == ACME_ST_ACCOUNT {
+        var eab: str = "";
+        if str_len(c.eab_kid) > 0 { eab = acme_eab(c.eab_kid, c.eab_key, & c.key, c.dir.new_account); }
+        val p: str = acme_new_account_payload(& c.contacts, true, eab);
+        return acme_post(c, c.dir.new_account, p, true);
+    }
+    if st == ACME_ST_ORDER { return acme_post(c, c.dir.new_order, acme_new_order_payload(& c.domains), false); }
+    if st == ACME_ST_AUTHZ || st == ACME_ST_POLL_AUTHZ {
+        if st == ACME_ST_POLL_AUTHZ && now < c.next_poll { return acme_none(); }
+        return acme_post(c, c.authz_urls.get(c.authz_index), "", false);
+    }
+    if st == ACME_ST_CHALLENGE { return acme_post(c, c.chal_url, "{}", false); }
+    if st == ACME_ST_FINALIZE {
+        val csr: Vec<i64> = acme_csr(& c.csr_key, & c.domains);
+        if csr.len() == 0 {
+            acme_error(c, "cannot build the CSR with this key");
+            return acme_none();
+        }
+        return acme_post(c, c.finalize_url, acme_finalize_payload(csr), false);
+    }
+    if st == ACME_ST_POLL_ORDER {
+        if now < c.next_poll { return acme_none(); }
+        return acme_post(c, c.order_url, "", false);
+    }
+    if st == ACME_ST_CERT { return acme_post(c, c.cert_url, "", false); }
+    return acme_none();
+}
+
+/// The caller has published the challenge response (http-01 file or
+/// dns-01 record): tell the server to validate.
+pub fn acme_challenge_published(c: & mut AcmeClient) {
+    if c.state == ACME_ST_PUBLISH { c.state = ACME_ST_CHALLENGE; }
+}
+
+fn acme_poll_later(c: & mut AcmeClient, retry_after: i64, now: i64) {
+    c.polls = c.polls + 1;
+    if c.polls > c.max_polls {
+        acme_error(c, "gave up polling");
+        return;
+    }
+    var wait: i64 = retry_after;
+    if wait <= 0 { wait = 2; }
+    c.next_poll = now + wait;
+}
+
+/// Pick a challenge of an authorization and expose what to publish.
+fn acme_pick_challenge(c: & mut AcmeClient, a: & AcmeAuthz) -> bool {
+    var pick: i64 = -1;
+    var i: i64 = 0;
+    while i < a.chal_types.len() {
+        if str_equal(a.chal_types.get(i), c.prefer) && pick < 0 { pick = i; }
+        i = i + 1;
+    }
+    // wildcards can only be proven with dns-01
+    if a.wildcard || pick < 0 {
+        pick = -1;
+        i = 0;
+        while i < a.chal_types.len() {
+            if str_equal(a.chal_types.get(i), "dns-01") && pick < 0 { pick = i; }
+            i = i + 1;
+        }
+    }
+    if pick < 0 { return false; }
+    c.chal_type = a.chal_types.get(pick);
+    c.chal_url = a.chal_urls.get(pick);
+    c.chal_token = a.chal_tokens.get(pick);
+    c.key_authorization = acme_key_authorization(c.chal_token, & c.key);
+    c.http01_path = "";
+    c.dns01_name = "";
+    c.dns01_value = "";
+    if str_equal(c.chal_type, "http-01") {
+        c.http01_path = acme_http01_path(c.chal_token);
+    } else {
+        var d: str = a.identifier;
+        if a.wildcard { d = "*." + d; }
+        c.dns01_name = acme_dns01_name(d);
+        c.dns01_value = acme_dns01_value(c.chal_token, & c.key);
+    }
+    return true;
+}
+
+fn acme_next_authz(c: & mut AcmeClient) {
+    c.authz_index = c.authz_index + 1;
+    c.polls = 0;
+    if c.authz_index >= c.authz_urls.len() {
+        c.state = ACME_ST_FINALIZE;
+    } else {
+        c.state = ACME_ST_AUTHZ;
+    }
+}
+
+/// Handle the response to the last request. `nonce` is the Replay-Nonce
+/// header ("" if none), `location` the Location header, `retry_after`
+/// the Retry-After seconds (0 if none).
+pub fn acme_handle_response(c: & mut AcmeClient, status: i64, location: str, nonce: str, retry_after: i64, body: str, now: i64) {
+    if str_len(nonce) > 0 { c.nonces.push(nonce); }
+    if c.fetching_nonce {
+        c.fetching_nonce = false;
+        if str_len(nonce) == 0 { acme_error(c, "newNonce gave no nonce"); }
+        return;
+    }
+    if c.state == ACME_ST_DIRECTORY {
+        if status != 200 { acme_error(c, "directory: HTTP " + int_to_str(status)); return; }
+        c.dir = acme_parse_directory(body);
+        if !c.dir.ok { acme_error(c, "bad directory"); return; }
+        if c.dir.eab_required && str_len(c.eab_kid) == 0 { acme_error(c, "the CA requires external account binding"); return; }
+        c.state = ACME_ST_ACCOUNT;
+        return;
+    }
+    if status >= 400 {
+        val pr: AcmeProblem = acme_parse_problem(body);
+        if pr.ok && str_equal(pr.kind, "urn:ietf:params:acme:error:badNonce") && c.bad_nonce_retries < 3 {
+            c.bad_nonce_retries = c.bad_nonce_retries + 1;
+            return;
+        }
+        if pr.ok {
+            acme_error(c, pr.kind + ": " + pr.detail);
+        } else {
+            acme_error(c, "HTTP " + int_to_str(status));
+        }
+        return;
+    }
+    c.bad_nonce_retries = 0;
+    val st: i64 = c.state;
+    if st == ACME_ST_ACCOUNT {
+        if str_len(location) == 0 { acme_error(c, "newAccount gave no account URL"); return; }
+        val acct: str = json_get_str(body, "status");
+        if str_len(acct) > 0 && !str_equal(acct, "valid") { acme_error(c, "account is " + acct); return; }
+        c.kid = location;
+        c.state = ACME_ST_ORDER;
+        return;
+    }
+    if st == ACME_ST_ORDER || st == ACME_ST_FINALIZE || st == ACME_ST_POLL_ORDER {
+        val o: AcmeOrder = acme_parse_order(body);
+        if !o.ok { acme_error(c, "bad order object"); return; }
+        if st == ACME_ST_ORDER {
+            if str_len(location) == 0 || o.authorizations.len() == 0 { acme_error(c, "newOrder gave no order URL or no authorizations"); return; }
+            c.order_url = location;
+            c.finalize_url = o.finalize;
+            c.authz_urls = o.authorizations;
+            c.authz_index = 0;
+            c.polls = 0;
+            c.state = ACME_ST_AUTHZ;
+            if str_equal(o.status, "ready") { c.state = ACME_ST_FINALIZE; }
+            return;
+        }
+        if str_equal(o.status, "valid") {
+            if str_len(o.certificate) == 0 { acme_error(c, "valid order without certificate URL"); return; }
+            c.cert_url = o.certificate;
+            c.state = ACME_ST_CERT;
+            return;
+        }
+        if str_equal(o.status, "processing") || (st == ACME_ST_POLL_ORDER && str_equal(o.status, "ready")) {
+            if st == ACME_ST_FINALIZE { c.polls = 0; }
+            c.state = ACME_ST_POLL_ORDER;
+            acme_poll_later(c, retry_after, now);
+            return;
+        }
+        acme_error(c, "order is " + o.status);
+        return;
+    }
+    if st == ACME_ST_AUTHZ || st == ACME_ST_POLL_AUTHZ {
+        val a: AcmeAuthz = acme_parse_authz(body);
+        if !a.ok { acme_error(c, "bad authorization object"); return; }
+        if str_equal(a.status, "valid") { acme_next_authz(c); return; }
+        if str_equal(a.status, "pending") && st == ACME_ST_AUTHZ {
+            if !acme_pick_challenge(c, & a) { acme_error(c, "no usable challenge for " + a.identifier); return; }
+            c.state = ACME_ST_PUBLISH;
+            return;
+        }
+        if str_equal(a.status, "pending") || str_equal(a.status, "processing") {
+            acme_poll_later(c, retry_after, now);
+            return;
+        }
+        acme_error(c, "authorization for " + a.identifier + " is " + a.status);
+        return;
+    }
+    if st == ACME_ST_CHALLENGE {
+        c.state = ACME_ST_POLL_AUTHZ;
+        c.polls = 0;
+        c.next_poll = now;
+        return;
+    }
+    if st == ACME_ST_CERT {
+        val blocks: Vec<PemBlock> = pem_decode_all(body);
+        if blocks.len() == 0 { acme_error(c, "no certificate in the response"); return; }
+        c.certificate = body;
+        c.state = ACME_ST_DONE;
+        return;
+    }
+}

@@ -1,0 +1,144 @@
+// RL9 (docs/roadmap/llvm-roadmap.md): a COFF object with symbol names
+// longer than 8 bytes, written by this tree's compiler/coff.fd
+// (emit_coff_file -> CoffEmitter_build_coff_img -> image_writer.fd
+// img_coff_symbols, the helper the machine layer's `fid codegen --coff`
+// object, nat_enc.fd nat_coff_object, writes its symbols with too). Until
+// TG13 every long name had string-table offset 0 (coff.fd's
+// symbol_name_map_lookup found none of them): image-lint.py reported
+// "symbol names outside the string table", objdump showed them nameless.
+//
+// Usage: fid ccompile tests/nattools/rl9_coff_long.fd -o cl && ./cl out.obj
+// writes out.obj and prints, reading the object back the way a linker does
+// (the 18-byte records, a long name as 0 then its string-table offset):
+// Expected output:
+// coff long names: 4
+// a_rather_long_function_name
+// another_long_helper_function
+// .rodata_table_with_long_name
+// fid_main_entry_point
+// rl9_coff_long: ok
+// (tests/nattools/rl9_writer_check.sh then runs image-lint.py, objdump -t
+// and dumpbin /symbols on out.obj and looks for the same four names.)
+use core;
+use vec;
+use string;
+use file;
+use compiler::elf64;
+use compiler::coff;
+
+fn asm_long() -> str {
+    var s: str = "fid_main_entry_point:\n";
+    s = s + "    pushq %rbp\n";
+    s = s + "    movq %rsp, %rbp\n";
+    s = s + "    leaq .rodata_table_with_long_name(%rip), %rdi\n";
+    s = s + "    call a_rather_long_function_name\n";
+    s = s + "    call another_long_helper_function\n";
+    s = s + "    call f\n";
+    s = s + "    leave\n";
+    s = s + "    ret\n";
+    s = s + "a_rather_long_function_name:\n";
+    s = s + "    call another_long_helper_function\n";
+    s = s + "    ret\n";
+    s = s + "f:\n";
+    s = s + "    ret\n";
+    s = s + ".rodata_table_with_long_name: .quad a_rather_long_function_name\n";
+    return s;
+}
+
+fn rd32(b: & Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 4 > b.len() {
+        return 0 - 1;
+    }
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+fn rdname(b: & Vec<i64>, at: i64, end: i64) -> str {
+    var s: str = "";
+    var i: i64 = at;
+    while i >= 0 && i < end && i < b.len() {
+        var c: i64 = b.get(i);
+        if c == 0 {
+            return s;
+        }
+        s = s + char_from_byte(c);
+        i = i + 1;
+    }
+    return "<unterminated>";
+}
+
+fn main() -> i64 {
+    var outpath: str = "";
+    match arg_at(1) {
+        Option::Some(a) => {
+            outpath = a;
+        }
+        Option::None => {
+            println("usage: rl9_coff_long <out.obj>");
+            return 1;
+        }
+    }
+    var b: Vec<i64> = Vec::new();
+    match emit_coff_file(0, asm_long()) {
+        ResultVec::Ok(v) => {
+            b = v;
+        }
+        ResultVec::Err(e) => {
+            println("coff error: " + e);
+            return 1;
+        }
+    }
+    if file_write_bytes(outpath, b) != 0 {
+        println("rl9_coff_long: cannot write " + outpath);
+        return 1;
+    }
+    var symptr: i64 = rd32(& b, 8);
+    var nsyms: i64 = rd32(& b, 12);
+    var strtab: i64 = symptr + 18 * nsyms;
+    var strsize: i64 = rd32(& b, strtab);
+    var bad: i64 = 0;
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < nsyms {
+        var at: i64 = symptr + 18 * i;
+        if rd32(& b, at) == 0 {
+            var off: i64 = rd32(& b, at + 4);
+            if off < 4 || off >= strsize {
+                bad = bad + 1;
+            } else {
+                names.push(rdname(& b, strtab + off, strtab + strsize));
+            }
+        }
+        i = i + 1;
+    }
+    println("coff long names: " + int_to_str(names.len()));
+    // in a fixed order, whatever order the writer put the symbols in
+    var want: Vec<str> = Vec::new();
+    want.push("a_rather_long_function_name");
+    want.push("another_long_helper_function");
+    want.push(".rodata_table_with_long_name");
+    want.push("fid_main_entry_point");
+    var w: i64 = 0;
+    while w < want.len() {
+        var found: bool = false;
+        var k: i64 = 0;
+        while k < names.len() {
+            if names.get(k) == want.get(w) {
+                found = true;
+            }
+            k = k + 1;
+        }
+        if found {
+            println(want.get(w));
+        } else {
+            println("MISSING " + want.get(w));
+            bad = bad + 1;
+        }
+        w = w + 1;
+    }
+    if bad == 0 && names.len() == want.len() {
+        println("rl9_coff_long: ok");
+        return 0;
+    }
+    println("rl9_coff_long: " + int_to_str(bad) + " bad names");
+    return 1;
+}

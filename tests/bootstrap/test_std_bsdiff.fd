@@ -1,0 +1,166 @@
+// stdlib/bsdiff: CRC-32 check value, the suffix array (sorted, every suffix once), diff/patch round trips on text, a 3000-byte firmware-like image with edits, insertions, a deletion and a shifted block, empty files, and patches refused for the wrong old file or a damaged patch.
+// Expected output:
+// crc32: cbf43926
+// suffix array of banana: 6 5 3 1 0 4 2
+// suffix array of 3000 bytes: sorted true, a permutation true
+// text: patch applies true, same as new true
+// firmware: patch applies true, same as new true
+// firmware: patch of 3053 bytes is smaller than half the image: true
+// zero runs: 302 bytes coded in 7, decoded the same true
+// empty old: true; empty new: true; both empty: true
+// wrong old: refused (the old file is not the one the patch was made from)
+// truncated: refused (patch length does not match its header)
+// flipped last byte: refused (result CRC mismatch)
+use bsdiff;
+use vec;
+use string;
+
+fn ints(v: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn same(a: & Vec<i64>, b: & Vec<i64>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// old[a..] < old[b..] (shorter prefix first)
+fn suffix_less(v: & Vec<i64>, a: i64, b: i64) -> bool {
+    var i: i64 = 0;
+    while a + i < v.len() && b + i < v.len() {
+        if v.get(a + i) != v.get(b + i) {
+            return v.get(a + i) < v.get(b + i);
+        }
+        i = i + 1;
+    }
+    return a + i == v.len() && b + i < v.len();
+}
+
+fn roundtrip(old: & Vec<i64>, nw: & Vec<i64>) -> bool {
+    val p: Vec<i64> = bsdiff_diff(old, nw);
+    val r: BsdiffResult = bsdiff_apply(old, &p);
+    return r.ok && same(&r.data, nw);
+}
+
+fn main() {
+    println("crc32: " + int_to_hex(bsdiff_crc32(&str_bytes("123456789"))));
+    println("suffix array of banana: " + ints(bsdiff_suffix_array(&str_bytes("banana"))));
+
+    // a firmware-like image: repetitive structure plus noise
+    var old: Vec<i64> = Vec::new();
+    var seed: i64 = 99;
+    var i: i64 = 0;
+    while i < 3000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        if i % 64 < 40 {
+            old.push((i / 64 * 7 + i % 8) & 255);
+        } else {
+            old.push((seed >> 16) & 255);
+        }
+        i = i + 1;
+    }
+    val sa: Vec<i64> = bsdiff_suffix_array(&old);
+    var sorted: bool = true;
+    i = 1;
+    while i < sa.len() {
+        if !suffix_less(&old, sa.get(i - 1), sa.get(i)) {
+            sorted = false;
+        }
+        i = i + 1;
+    }
+    var seen: Vec<i64> = Vec::filled(old.len() + 1, 0);
+    var perm: bool = sa.len() == old.len() + 1;
+    i = 0;
+    while i < sa.len() {
+        if seen.get(sa.get(i)) != 0 {
+            perm = false;
+        }
+        seen.set(sa.get(i), 1);
+        i = i + 1;
+    }
+    println("suffix array of 3000 bytes: sorted " + bool_to_str(sorted) + ", a permutation " + bool_to_str(perm));
+
+    val t_old: Vec<i64> = str_bytes("The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.");
+    val t_new: Vec<i64> = str_bytes("The quick brown cat jumps over the lazy dog! Pack my box with six dozen liquor jugs, please.");
+    val tp: Vec<i64> = bsdiff_diff(&t_old, &t_new);
+    val tr: BsdiffResult = bsdiff_apply(&t_old, &tp);
+    println("text: patch applies " + bool_to_str(tr.ok) + ", same as new " + bool_to_str(same(&tr.data, &t_new)));
+
+    // the new image: a constant changed all over (every 64th byte + 1),
+    // 50 bytes inserted, 30 deleted, a block moved
+    var nw: Vec<i64> = Vec::new();
+    i = 0;
+    while i < old.len() {
+        if i == 1000 {
+            var k: i64 = 0;
+            while k < 50 {
+                nw.push((k * 13) & 255);
+                k = k + 1;
+            }
+        }
+        if i >= 2000 && i < 2030 {
+            i = i + 1;
+            continue;
+        }
+        var b: i64 = old.get(i);
+        if i % 64 == 3 {
+            b = (b + 1) & 255;
+        }
+        nw.push(b);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 33 {
+        nw.push(old.get(100 + i));
+        i = i + 1;
+    }
+    val fp: Vec<i64> = bsdiff_diff(&old, &nw);
+    val fr: BsdiffResult = bsdiff_apply(&old, &fp);
+    println("firmware: patch applies " + bool_to_str(fr.ok) + ", same as new " + bool_to_str(same(&fr.data, &nw)));
+    println("firmware: patch of " + int_to_str(nw.len()) + " bytes is smaller than half the image: " + bool_to_str(fp.len() * 2 < nw.len()));
+    var runs: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 300 {
+        runs.push(0);
+        i = i + 1;
+    }
+    runs.push(7);
+    runs.push(0);
+    val coded: Vec<i64> = bsdiff_rle_encode(&runs);
+    var rok: bool = true;
+    val decoded: Vec<i64> = bsdiff_rle_decode(&coded, 0, coded.len(), &mut rok);
+    println("zero runs: 302 bytes coded in " + int_to_str(coded.len()) + ", decoded the same " + bool_to_str(rok && same(&decoded, &runs)));
+    val empty: Vec<i64> = Vec::new();
+    println("empty old: " + bool_to_str(roundtrip(&empty, &t_new)) + "; empty new: " + bool_to_str(roundtrip(&t_old, &empty)) + "; both empty: " + bool_to_str(roundtrip(&empty, &empty)));
+
+    val w: BsdiffResult = bsdiff_apply(&t_new, &tp);
+    println("wrong old: refused (" + w.error + ")");
+    var cut: Vec<i64> = Vec::new();
+    i = 0;
+    while i < fp.len() - 1 {
+        cut.push(fp.get(i));
+        i = i + 1;
+    }
+    println("truncated: refused (" + bsdiff_apply(&old, &cut).error + ")");
+    var flip: Vec<i64> = fp;
+    flip.set(flip.len() - 1, flip.get(flip.len() - 1) ^ 1);
+    println("flipped last byte: refused (" + bsdiff_apply(&old, &flip).error + ")");
+}

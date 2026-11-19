@@ -10,15 +10,21 @@
 //   os_exit(0);
 
 module os;
- use vec; use string;
+ use vec;
 // ─── FFI declarations ───────────────────────────────────────────────────
 
+// SAFETY: the prototypes come from <stdlib.h>, checked by the C compiler;
+// names and commands are NUL-terminated Fides strings, and a NULL from getenv
+// is read as "" (str_len of a null string is 0).
 extern "C" include "<stdlib.h>" {
     fn getenv as pledge_getenv(name: str) -> str;
     fn exit as pledge_exit(code: i64) -> void;
     fn system as pledge_system(cmd: str) -> i64;
 }
 
+// SAFETY: the prototype comes from <stdio.h>; nothing in os calls it (a
+// format with % conversions would read missing arguments: do not pass user
+// text as the format).
 extern "C" include "<stdio.h>" {
     fn printf as pledge_printf(fmt: str) -> i64;
 }
@@ -36,6 +42,13 @@ pub fn os_getenv(name: str) -> str {
 }
 
 /// Get an environment variable, or a default value if not set.
+///
+/// Example:
+///   assert_eq(os_getenv_or("FIDDOC_NO_SUCH_VAR", "dflt"), "dflt");
+///   assert(!os_hasenv("FIDDOC_NO_SUCH_VAR"));
+///   assert_eq(os_getenv("FIDDOC_NO_SUCH_VAR"), "");
+///   assert(os_argc() >= 1);
+///   assert(str_len(os_name()) > 0);
 pub fn os_getenv_or(name: str, default: str) -> str {
     var value = pledge_getenv(name);
     if str_len(value) == 0 {
@@ -103,18 +116,52 @@ pub fn os_system(cmd: str) -> i64 {
 }
 
 // ─── System information ─────────────────────────────────────────────────
+// @cfg picks the compile-time target (host for `fid run`, --target for a
+// cross build); an env-var override still wins where one exists.
 
-/// Get the operating system name (best-effort, from environment).
+/// Get the operating system name: "windows", "linux", "macos", "freebsd"
+/// or "wasi" — decided at compile time by @cfg for the target.
+@cfg(windows)
 pub fn os_name() -> str {
-    var os = pledge_getenv("OS");
-    if str_len(os) > 0 {
-        return os;
-    }
-    // On Linux, "OS" is usually not set. Check uname via system.
+    return "windows";
+}
+
+@cfg(linux)
+pub fn os_name() -> str {
     return "linux";
 }
 
+@cfg(macos)
+pub fn os_name() -> str {
+    return "macos";
+}
+
+@cfg(freebsd)
+pub fn os_name() -> str {
+    return "freebsd";
+}
+
+@cfg(wasi)
+pub fn os_name() -> str {
+    return "wasi";
+}
+
 /// Get the user's home directory.
+@cfg(windows)
+pub fn os_home_dir() -> str {
+    var home = pledge_getenv("USERPROFILE");
+    if str_len(home) > 0 {
+        return home;
+    }
+    var drive = pledge_getenv("HOMEDRIVE");
+    var path = pledge_getenv("HOMEPATH");
+    if str_len(drive) > 0 && str_len(path) > 0 {
+        return drive + path;
+    }
+    return ".";
+}
+
+@cfg(unix)
 pub fn os_home_dir() -> str {
     var home = pledge_getenv("HOME");
     if str_len(home) > 0 {
@@ -124,6 +171,7 @@ pub fn os_home_dir() -> str {
 }
 
 /// Get the current working directory (from PWD env var).
+/// No getcwd builtin exists yet; PWD is set by shells on POSIX hosts.
 pub fn os_cwd() -> str {
     var pwd = pledge_getenv("PWD");
     if str_len(pwd) > 0 {
@@ -132,7 +180,17 @@ pub fn os_cwd() -> str {
     return ".";
 }
 
-/// Get the user name (from USER env var).
+/// Get the user name.
+@cfg(windows)
+pub fn os_user() -> str {
+    var user = pledge_getenv("USERNAME");
+    if str_len(user) > 0 {
+        return user;
+    }
+    return "unknown";
+}
+
+@cfg(unix)
 pub fn os_user() -> str {
     var user = pledge_getenv("USER");
     if str_len(user) > 0 {
@@ -145,16 +203,30 @@ pub fn os_user() -> str {
     return "unknown";
 }
 
-/// Get the hostname (from HOSTNAME env var, best-effort).
+/// Get the hostname (env-var best-effort; no gethostname builtin yet).
 pub fn os_hostname() -> str {
     var host = pledge_getenv("HOSTNAME");
+    if str_len(host) > 0 {
+        return host;
+    }
+    host = pledge_getenv("COMPUTERNAME");
     if str_len(host) > 0 {
         return host;
     }
     return "localhost";
 }
 
-/// Get the shell (from SHELL env var).
+/// Get the user's shell.
+@cfg(windows)
+pub fn os_shell() -> str {
+    var shell = pledge_getenv("COMSPEC");
+    if str_len(shell) > 0 {
+        return shell;
+    }
+    return "cmd.exe";
+}
+
+@cfg(unix)
 pub fn os_shell() -> str {
     var shell = pledge_getenv("SHELL");
     if str_len(shell) > 0 {
@@ -178,24 +250,34 @@ pub fn os_path() -> Vec<str> {
     if str_len(path) == 0 {
         return Vec::new();
     }
-    return str_split(path, ":");
+    return str_split(path, os_path_list_sep());
 }
 
 // ─── Temp directory ─────────────────────────────────────────────────────
 
 /// Get the system temporary directory.
+@cfg(windows)
+pub fn os_tmp_dir() -> str {
+    var tmp = pledge_getenv("TEMP");
+    if str_len(tmp) > 0 {
+        return tmp;
+    }
+    tmp = pledge_getenv("TMP");
+    if str_len(tmp) > 0 {
+        return tmp;
+    }
+    var profile = pledge_getenv("USERPROFILE");
+    if str_len(profile) > 0 {
+        return profile + "\\AppData\\Local\\Temp";
+    }
+    return "C:\\Windows\\Temp";
+}
+
+@cfg(unix)
 pub fn os_tmp_dir() -> str {
     var tmpdir = pledge_getenv("TMPDIR");
     if str_len(tmpdir) > 0 {
         return tmpdir;
-    }
-    var tmp = pledge_getenv("TMP");
-    if str_len(tmp) > 0 {
-        return tmp;
-    }
-    var temp = pledge_getenv("TEMP");
-    if str_len(temp) > 0 {
-        return temp;
     }
     return "/tmp";
 }
@@ -203,11 +285,69 @@ pub fn os_tmp_dir() -> str {
 // ─── Path separator ─────────────────────────────────────────────────────
 
 /// Get the path separator for this OS.
+@cfg(windows)
+pub fn os_path_sep() -> str {
+    return "\\";
+}
+
+@cfg(unix)
 pub fn os_path_sep() -> str {
     return "/";
 }
 
 /// Get the path list separator (for PATH-like variables).
+@cfg(windows)
+pub fn os_path_list_sep() -> str {
+    return ";";
+}
+
+@cfg(unix)
+pub fn os_path_list_sep() -> str {
+    return ":";
+}
+
+
+// ─── WASI fallbacks ─────────────────────────────────────────────────────
+// No user/home/shell concept; env vars are all there is.
+
+@cfg(wasi)
+pub fn os_home_dir() -> str {
+    var home = pledge_getenv("HOME");
+    if str_len(home) > 0 {
+        return home;
+    }
+    return "/";
+}
+
+@cfg(wasi)
+pub fn os_user() -> str {
+    var user = pledge_getenv("USER");
+    if str_len(user) > 0 {
+        return user;
+    }
+    return "unknown";
+}
+
+@cfg(wasi)
+pub fn os_shell() -> str {
+    return "/bin/sh";
+}
+
+@cfg(wasi)
+pub fn os_tmp_dir() -> str {
+    var tmpdir = pledge_getenv("TMPDIR");
+    if str_len(tmpdir) > 0 {
+        return tmpdir;
+    }
+    return "/tmp";
+}
+
+@cfg(wasi)
+pub fn os_path_sep() -> str {
+    return "/";
+}
+
+@cfg(wasi)
 pub fn os_path_list_sep() -> str {
     return ":";
 }

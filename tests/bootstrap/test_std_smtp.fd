@@ -1,0 +1,319 @@
+// stdlib/smtp: reply parsing (multi-line, enhanced codes, partial input), EHLO capabilities, AUTH PLAIN (RFC 4616's example), dot-stuffing, quoted-printable, encoded-words and dates, a MIME message with alternative parts and an attachment, and whole sessions against scripted servers: STARTTLS + AUTH LOGIN, AUTH PLAIN with a rejected recipient, HELO fallback, failures.
+// Expected output:
+// ehlo reply: complete true code 250 lines 8 used 154
+// caps: starttls true auth PLAIN,LOGIN size 35882577 8bit true pipelining true enhanced true
+// 550: enhanced 5.1.1 text 5.1.1 <nobody@example.com>: Recipient address rejected
+// partial: complete false
+// mixed codes: ok false (reply code changed inside a multi-line reply)
+// garbage: ok false
+// auth plain: AHRpbQB0YW5zdGFhZnRhbnN0YWFm
+// addr: <ada@example.org> <bob@example.com>
+// dot-stuff: one\r\n..two\r\n...three\r\nend\r\n.\r\n
+// qp: Caf=C3=A9 =3D 5=E2=82=AC=20\r\ntrailing tab=09\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=\r\nxxxxx
+// word: =?UTF-8?B?Q2Fmw6kg4piV?= | plain
+// date: Tue, 17 Nov 2026 10:07:00 +0000 | Tue, 17 Nov 2026 05:07:00 -0500 | Tue, 29 Feb 2000 01:00:00 +0100
+// base64 lines: YWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJj\r\nYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJjYWJj\r\n
+// | From: Ada Lovelace <ada@example.org>
+// | To: Bob <bob@example.com>,
+// |  =?UTF-8?B?Wm/Dqw==?= <zoe@example.net>
+// | Cc: carol@example.com
+// | Subject: =?UTF-8?B?Tm90ZXMg4oCUIGVuZ2luZQ==?=
+// | Date: Tue, 17 Nov 2026 10:07:00 +0000
+// | Message-ID: <6afc2744.000a95514aaa@example.org>
+// | X-Mailer: fides-smtp
+// | MIME-Version: 1.0
+// | Content-Type: multipart/mixed; boundary="=_mix_399cd1d1497a"
+// | 
+// | This is a multi-part message in MIME format.
+// | --=_mix_399cd1d1497a
+// | Content-Type: multipart/alternative; boundary="=_alt_aafdf80202bf"
+// | 
+// | --=_alt_aafdf80202bf
+// | Content-Type: text/plain; charset=us-ascii
+// | Content-Transfer-Encoding: 7bit
+// | 
+// | Hello Bob,
+// | .
+// | The engine works.
+// | 
+// | --=_alt_aafdf80202bf
+// | Content-Type: text/html; charset=us-ascii
+// | Content-Transfer-Encoding: 7bit
+// | 
+// | <p>Hello Bob,</p><p>The engine works.</p>
+// | --=_alt_aafdf80202bf--
+// | 
+// | --=_mix_399cd1d1497a
+// | Content-Type: text/plain; name="notes.txt"
+// | Content-Disposition: attachment; filename="notes.txt"
+// | Content-Transfer-Encoding: base64
+// | 
+// | bGluZSBvbmUKbGluZSB0d28K
+// | 
+// | --=_mix_399cd1d1497a--
+// | 
+// envelope: <ada@example.org> -> Bob <bob@example.com>; Zoë <zoe@example.net>; carol@example.com; audit@example.org
+// result: ok=true step=DATA code=250 (2.0.0) tls=true auth=LOGIN accepted=4 rejected=0
+//   message: 2.0.0 Ok: queued as 4FK2Q
+//   tls upgraded: true
+//   S: 220 mail.example.com ESMTP ready
+//   C: EHLO client.example.org
+//   S: 250 mail.example.com STARTTLS SIZE 1000000
+//   C: STARTTLS
+//   S: 220 2.0.0 Ready to start TLS
+//   C: EHLO client.example.org
+//   S: 250 mail.example.com AUTH LOGIN SIZE 1000000
+//   C: AUTH LOGIN
+//   S: 334 VXNlcm5hbWU6
+//   C: (user)
+//   S: 334 UGFzc3dvcmQ6
+//   C: (password)
+//   S: 235 2.7.0 Authentication successful
+//   C: MAIL FROM:<ada@example.org> SIZE=1024
+//   S: 250 2.1.0 Ok
+//   C: RCPT TO:<bob@example.com>
+//   S: 250 2.1.5 Ok
+//   C: RCPT TO:<zoe@example.net>
+//   S: 250 2.1.5 Ok
+//   C: RCPT TO:<carol@example.com>
+//   S: 250 2.1.5 Ok
+//   C: RCPT TO:<audit@example.org>
+//   S: 250 2.1.5 Ok
+//   C: DATA
+//   S: 354 End data with <CR><LF>.<CR><LF>
+//   C: (message, 1024 bytes)
+//   S: 250 2.0.0 Ok: queued as 4FK2Q
+//   C: QUIT
+//   S: 221 2.0.0 Bye
+//   sent: login user true, dot line stuffed true, ends with CRLF.CRLF then QUIT true
+// result: ok=true step=DATA code=250 tls=false auth=PLAIN accepted=1 rejected=1
+//   message: OK id=1
+//   rejected: nobody@example.net plain sent: true
+// result: ok=true step=DATA code=250 tls=false auth= accepted=2 rejected=0
+//   message: ok
+//   helo sent: true, no SIZE: true
+// result: ok=false step=AUTH code=535 (5.7.8) tls=false auth= accepted=0 rejected=0
+//   message: 5.7.8 Authentication credentials invalid
+// result: ok=false step=RCPT code=553 tls=false auth= accepted=0 rejected=2
+//   message: no
+// result: ok=false step=STARTTLS code=250 tls=false auth= accepted=0 rejected=0
+//   message: the server does not offer STARTTLS
+// result: ok=false step=MAIL code=250 tls=false auth= accepted=0 rejected=0
+//   message: message of 19 bytes is over the server's SIZE 10
+// result: ok=false step=EHLO code=0 tls=false auth= accepted=0 rejected=0
+//   message: connection closed
+use smtp;
+use encoding;
+use vec;
+use string;
+
+var INQ: Vec<i64> = Vec::new();
+var SENT: str = "";
+var TLS_UP: bool = false;
+
+fn mock_send(conn: i64, b: Vec<i64>) -> i64 {
+    SENT = SENT + str_from_bytes(b);
+    return b.len();
+}
+
+fn mock_recv(conn: i64, max: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    // at most 7 bytes, and never past the end of a line: a server sends a
+    // line and waits (and nothing comes before a TLS handshake)
+    while INQ.len() > 0 && out.len() < 7 {
+        val c: i64 = INQ.remove(0);
+        out.push(c);
+        if c == 10 {
+            return out;
+        }
+    }
+    return out;
+}
+
+fn mock_tls(conn: i64) -> bool {
+    TLS_UP = true;
+    return true;
+}
+
+fn script(lines: Vec<str>) {
+    INQ = Vec::new();
+    SENT = "";
+    TLS_UP = false;
+    var i: i64 = 0;
+    while i < lines.len() {
+        val b: Vec<i64> = str_bytes(lines.get(i) + "\r\n");
+        var k: i64 = 0;
+        while k < b.len() {
+            INQ.push(b.get(k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn transport() -> SmtpTransport {
+    val t: SmtpTransport = SmtpTransport { conn: 3, send: mock_send, recv: mock_recv, starttls: mock_tls };
+    return t;
+}
+
+fn visible(s: str) -> str {
+    return str_replace(str_replace(s, "\r", "\\r"), "\n", "\\n");
+}
+
+fn report(r: & SmtpResult) {
+    var line: str = "result: ok=" + bool_to_str(r.ok) + " step=" + r.step + " code=" + int_to_str(r.code);
+    if str_len(r.enhanced) > 0 {
+        line = line + " (" + r.enhanced + ")";
+    }
+    line = line + " tls=" + bool_to_str(r.tls) + " auth=" + r.auth + " accepted=" + int_to_str(r.accepted.len()) + " rejected=" + int_to_str(r.rejected.len());
+    println(line);
+    println("  message: " + r.message);
+}
+
+fn main() -> i64 {
+    // Replies
+    val r1: SmtpReply = smtp_parse_reply("250-mail.example.com Hello\r\n250-SIZE 35882577\r\n250-8BITMIME\r\n250-STARTTLS\r\n250-AUTH PLAIN LOGIN\r\n250-AUTH=LOGIN\r\n250-ENHANCEDSTATUSCODES\r\n250 PIPELINING\r\n");
+    println("ehlo reply: complete " + bool_to_str(r1.complete) + " code " + int_to_str(r1.code) + " lines " + int_to_str(r1.lines.len()) + " used " + int_to_str(r1.used));
+    val caps: SmtpCaps = smtp_parse_caps(& r1);
+    println("caps: starttls " + bool_to_str(caps.starttls) + " auth " + str_join(caps.auth, ",") + " size " + int_to_str(caps.size) + " 8bit " + bool_to_str(caps.eightbit) + " pipelining " + bool_to_str(caps.pipelining) + " enhanced " + bool_to_str(caps.enhanced));
+    val r2: SmtpReply = smtp_parse_reply("550 5.1.1 <nobody@example.com>: Recipient address rejected\r\n");
+    println("550: enhanced " + r2.enhanced + " text " + smtp_reply_text(& r2));
+    val r3: SmtpReply = smtp_parse_reply("250-first\r\n250-sec");
+    println("partial: complete " + bool_to_str(r3.complete));
+    val r4: SmtpReply = smtp_parse_reply("250-a\r\n251 b\r\n");
+    println("mixed codes: ok " + bool_to_str(r4.ok) + " (" + r4.error + ")");
+    val r5: SmtpReply = smtp_parse_reply("hello\r\n");
+    println("garbage: ok " + bool_to_str(r5.ok));
+
+    // Pieces
+    println("auth plain: " + smtp_auth_plain("tim", "tanstaaftanstaaf"));
+    println("addr: " + smtp_addr_spec("Ada Lovelace <ada@example.org>") + " " + smtp_addr_spec("bob@example.com"));
+    println("dot-stuff: " + visible(smtp_dot_stuff("one\n.two\n..three\nend")));
+    println("qp: " + visible(mail_quoted_printable("Caf\u{e9} = 5\u{20ac} \ntrailing tab\t\n" + str_repeat("x", 80))));
+    println("word: " + mail_encode_word("Caf\u{e9} \u{2615}") + " | " + mail_encode_word("plain"));
+    println("date: " + mail_date(1794910020, 0) + " | " + mail_date(1794910020, 0 - 300) + " | " + mail_date(951782400, 60));
+    println("base64 lines: " + visible(mail_base64_lines(str_bytes(str_repeat("abc", 30)))));
+
+    // A message
+    var m: MailMessage = mail_new("Ada Lovelace <ada@example.org>", "Notes \u{2014} engine");
+    mail_add_to(& mut m, "Bob <bob@example.com>");
+    mail_add_to(& mut m, "Zo\u{eb} <zoe@example.net>");
+    mail_add_cc(& mut m, "carol@example.com");
+    mail_add_bcc(& mut m, "audit@example.org");
+    mail_set_text(& mut m, "Hello Bob,\n.\nThe engine works.\n");
+    mail_set_html(& mut m, "<p>Hello Bob,</p><p>The engine works.</p>");
+    mail_attach(& mut m, "notes.txt", "text/plain", str_bytes("line one\nline two\n"));
+    mail_add_header(& mut m, "X-Mailer", "fides-smtp");
+    val raw: str = mail_build(& m, 1794910020, 0, 42);
+    val lines: Vec<str> = str_split(raw, "\r\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        println("| " + lines.get(i));
+        i = i + 1;
+    }
+    println("envelope: " + mail_envelope_from(& m) + " -> " + str_join(mail_recipients(& m), "; "));
+
+    // Session 1: STARTTLS, then AUTH LOGIN (the server offers only LOGIN)
+    var s1: Vec<str> = Vec::new();
+    s1.push("220 mail.example.com ESMTP ready");
+    s1.push("250-mail.example.com");
+    s1.push("250-STARTTLS");
+    s1.push("250 SIZE 1000000");
+    s1.push("220 2.0.0 Ready to start TLS");
+    s1.push("250-mail.example.com");
+    s1.push("250-AUTH LOGIN");
+    s1.push("250 SIZE 1000000");
+    s1.push("334 VXNlcm5hbWU6");
+    s1.push("334 UGFzc3dvcmQ6");
+    s1.push("235 2.7.0 Authentication successful");
+    s1.push("250 2.1.0 Ok");
+    s1.push("250 2.1.5 Ok");
+    s1.push("250 2.1.5 Ok");
+    s1.push("250 2.1.5 Ok");
+    s1.push("250 2.1.5 Ok");
+    s1.push("354 End data with <CR><LF>.<CR><LF>");
+    s1.push("250 2.0.0 Ok: queued as 4FK2Q");
+    s1.push("221 2.0.0 Bye");
+    script(s1);
+    val res1: SmtpResult = smtp_send(transport(), smtp_config("client.example.org", "ada", "secret"), mail_envelope_from(& m), mail_recipients(& m), raw);
+    report(& res1);
+    println("  tls upgraded: " + bool_to_str(TLS_UP));
+    i = 0;
+    while i < res1.transcript.len() {
+        println("  " + res1.transcript.get(i));
+        i = i + 1;
+    }
+    val dot_line: bool = str_contains(SENT, "Hello Bob,\r\n..\r\nThe engine");
+    val ends: bool = str_ends_with(SENT, "\r\n.\r\nQUIT\r\n");
+    println("  sent: login user " + bool_to_str(str_contains(SENT, "YWRh\r\n")) + ", dot line stuffed " + bool_to_str(dot_line) + ", ends with CRLF.CRLF then QUIT " + bool_to_str(ends));
+
+    // Session 2: AUTH PLAIN, one recipient rejected, no STARTTLS offered
+    var s2: Vec<str> = Vec::new();
+    s2.push("220 smtp.example.net");
+    s2.push("250-smtp.example.net");
+    s2.push("250 AUTH PLAIN LOGIN");
+    s2.push("235 2.7.0 Accepted");
+    s2.push("250 OK");
+    s2.push("550 5.1.1 No such user");
+    s2.push("250 OK");
+    s2.push("354 go ahead");
+    s2.push("250 OK id=1");
+    s2.push("221 bye");
+    script(s2);
+    var rc: Vec<str> = Vec::new();
+    rc.push("nobody@example.net");
+    rc.push("zoe@example.net");
+    val res2: SmtpResult = smtp_send(transport(), smtp_config("client", "tim", "tanstaaftanstaaf"), "<tim@example.net>", rc, "Subject: hi\r\n\r\nhi\r\n");
+    report(& res2);
+    println("  rejected: " + str_join(res2.rejected, ",") + " plain sent: " + bool_to_str(str_contains(SENT, "AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n")));
+
+    // Session 3: EHLO refused, HELO, no auth
+    var s3: Vec<str> = Vec::new();
+    s3.push("220 old.example.com SMTP");
+    s3.push("502 Command not implemented");
+    s3.push("250 old.example.com");
+    s3.push("250 ok");
+    s3.push("250 ok");
+    s3.push("250 ok");
+    s3.push("354 send");
+    s3.push("250 ok");
+    s3.push("221 bye");
+    script(s3);
+    val res3: SmtpResult = smtp_send(transport(), smtp_config("client", "", ""), "a@b.c", rc, "x");
+    report(& res3);
+    println("  helo sent: " + bool_to_str(str_contains(SENT, "HELO client\r\n")) + ", no SIZE: " + bool_to_str(!str_contains(SENT, "SIZE=")));
+
+    // Failures: bad password, every recipient refused, required TLS, a
+    // message over SIZE, a server that hangs up
+    var s4: Vec<str> = Vec::new();
+    s4.push("220 x");
+    s4.push("250-x");
+    s4.push("250 AUTH PLAIN");
+    s4.push("535 5.7.8 Authentication credentials invalid");
+    script(s4);
+    report(& smtp_send(transport(), smtp_config("c", "u", "wrong"), "a@b.c", rc, "x"));
+    var s5: Vec<str> = Vec::new();
+    s5.push("220 x");
+    s5.push("250 x");
+    s5.push("250 ok");
+    s5.push("550 no");
+    s5.push("553 no");
+    s5.push("250 reset");
+    script(s5);
+    report(& smtp_send(transport(), smtp_config("c", "", ""), "a@b.c", rc, "x"));
+    script(s5);
+    var strict: SmtpConfig = smtp_config("c", "", "");
+    strict.require_tls = true;
+    report(& smtp_send(transport(), strict, "a@b.c", rc, "x"));
+    var s6: Vec<str> = Vec::new();
+    s6.push("220 x");
+    s6.push("250-x");
+    s6.push("250 SIZE 10");
+    script(s6);
+    report(& smtp_send(transport(), smtp_config("c", "", ""), "a@b.c", rc, "more than ten bytes"));
+    var s7: Vec<str> = Vec::new();
+    s7.push("220 x");
+    script(s7);
+    report(& smtp_send(transport(), smtp_config("c", "", ""), "a@b.c", rc, "x"));
+    return 0;
+}

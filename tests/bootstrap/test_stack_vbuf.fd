@@ -1,0 +1,198 @@
+// LF13 (llvm roadmap): a small local `Vec::filled(n, x)` of plain values
+// (n a constant, at most 512 bytes of elements) that is only read, changed
+// in place (get, set, len, first, last, contains, reverse, clone, a for
+// loop) and dropped keeps its buffer on the stack as well as its header
+// (lower.fd lw_rc_vbuf_fits / lw_rc_stack_vbuf_rewrite: core's
+// Vec_init_filled_at and Vec_drop_stackbuf). The results must be those of
+// a heap buffer: in a loop the buffer is filled again each time, a clone is
+// its own heap Vec, and a Vec that grows, is returned, kept, passed to the
+// program's own function or too big stays on the heap.
+//
+// Expected output:
+//     letters 3 1 2
+//     sum 10 last 4 first 1
+//     has 3 true has 9 false
+//     rev 4 3 2 1
+//     row 0 sum 0
+//     row 1 sum 5
+//     row 2 sum 10
+//     bytes 255 0 7
+//     flags 2
+//     clone 5 1
+//     grown 9 7
+//     big 1000 999
+//     made 3 6
+//     passed 12
+//     runtime 6 1
+//     done
+
+fn letters(word: str) -> str {
+    var counts: Vec<i64> = Vec::filled(26, 0);
+    var i: i64 = 0;
+    while i < str_len(word) {
+        var c: i64 = str_byte_at(word, i) - 97;
+        if c >= 0 && c < 26 {
+            counts.set(c, counts.get(c) + 1);
+        }
+        i = i + 1;
+    }
+    var best: i64 = 0;
+    for x in counts {
+        if x > best {
+            best = x;
+        }
+    }
+    return int_to_str(best) + " " + int_to_str(counts.get(1)) + " " + int_to_str(counts[13]);
+}
+
+fn small_sums() -> str {
+    var v: Vec<i64> = Vec::filled(4, 0);
+    var i: i64 = 0;
+    while i < v.len() {
+        v.set(i, i + 1);
+        i = i + 1;
+    }
+    var s: i64 = 0;
+    for x in v {
+        s = s + x;
+    }
+    var first: i64 = v.first();
+    var last: i64 = v.last();
+    return "sum " + int_to_str(s) + " last " + int_to_str(last) + " first " + int_to_str(first);
+}
+
+fn has() -> str {
+    var v: Vec<i64> = Vec::filled(4, 0);
+    v.set(0, 1);
+    v.set(1, 2);
+    v.set(2, 3);
+    v.set(3, 4);
+    var a: bool = v.contains(3);
+    var b: bool = v.contains(9);
+    var out: str = "has 3 false";
+    if a {
+        out = "has 3 true";
+    }
+    if b {
+        return out + " has 9 true";
+    }
+    return out + " has 9 false";
+}
+
+fn rev() -> str {
+    var v: Vec<i64> = Vec::filled(4, 0);
+    v.set(0, 1);
+    v.set(1, 2);
+    v.set(2, 3);
+    v.set(3, 4);
+    v.reverse();
+    return "rev " + int_to_str(v.get(0)) + " " + int_to_str(v.get(1)) + " " + int_to_str(v.get(2)) + " " + int_to_str(v.get(3));
+}
+
+// made again each pass of the loop: filled again, never the last pass's
+fn rows() {
+    var r: i64 = 0;
+    while r < 3 {
+        var row: Vec<i64> = Vec::filled(5, r);
+        var s: i64 = 0;
+        var j: i64 = 0;
+        while j < row.len() {
+            s = s + row.get(j);
+            j = j + 1;
+        }
+        row.set(0, 100);
+        println("row " + int_to_str(r) + " sum " + int_to_str(s));
+        r = r + 1;
+    }
+}
+
+fn bytes() -> str {
+    var b: Vec<u8> = Vec::filled(3, 0 as u8);
+    b.set(0, 255 as u8);
+    b.set(2, 7 as u8);
+    return "bytes " + int_to_str(b.get(0) as i64) + " " + int_to_str(b.get(1) as i64) + " " + int_to_str(b.get(2) as i64);
+}
+
+fn flags() -> i64 {
+    var f: Vec<bool> = Vec::filled(6, false);
+    f.set(1, true);
+    f.set(4, true);
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < f.len() {
+        if f.get(i) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// a clone is a heap Vec of its own: it may leave the function
+fn cloned() -> Vec<i64> {
+    var v: Vec<i64> = Vec::filled(5, 1);
+    var c: Vec<i64> = v.clone();
+    v.set(0, 50);
+    return c;
+}
+
+// pushed to: the buffer must grow, so it stays on the heap
+fn grown() -> str {
+    var v: Vec<i64> = Vec::filled(8, 7);
+    v.push(9);
+    return "grown " + int_to_str(v.len()) + " " + int_to_str(v.get(0));
+}
+
+// more than 512 bytes: the buffer stays on the heap
+fn big() -> str {
+    var v: Vec<i64> = Vec::filled(1000, 0);
+    v.set(999, 999);
+    return "big " + int_to_str(v.len()) + " " + int_to_str(v.get(999));
+}
+
+// returned: header and buffer stay on the heap
+fn make() -> Vec<i64> {
+    var v: Vec<i64> = Vec::filled(3, 6);
+    return v;
+}
+
+fn total(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+// passed to the program's own function: the buffer stays on the heap
+fn passed() -> i64 {
+    var v: Vec<i64> = Vec::filled(4, 3);
+    return total(v);
+}
+
+// a length known only at run time: the buffer stays on the heap
+fn runtime(n: i64) -> str {
+    var v: Vec<i64> = Vec::filled(n, 1);
+    return "runtime " + int_to_str(v.len()) + " " + int_to_str(v.get(n - 1));
+}
+
+fn main() {
+    println("letters " + letters("banana"));
+    println(small_sums());
+    println(has());
+    println(rev());
+    rows();
+    println(bytes());
+    println("flags " + int_to_str(flags()));
+    var c: Vec<i64> = cloned();
+    println("clone " + int_to_str(c.len()) + " " + int_to_str(c.get(0)));
+    println(grown());
+    println(big());
+    var m: Vec<i64> = make();
+    println("made " + int_to_str(m.len()) + " " + int_to_str(m.get(2)));
+    println("passed " + int_to_str(passed()));
+    println(runtime(6));
+    println("done");
+}

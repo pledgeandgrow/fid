@@ -1,0 +1,219 @@
+// stdlib/gpio: v2 ioctl numbers and flags, a fake chip (outputs, pulls, open drain, active low), debounced edge events with injected time, the gpio_v2_line_request image, event record decoding, the sysfs write sequence
+// Expected output:
+// chipinfo: 8044b401
+// get_line: c250b407
+// set_config: c110b40d
+// get_values: c010b40e
+// set_values: c010b40f
+// flags: 310
+// out: 1 0 1
+// write input: false
+// pull-up: 1 0 1
+// open drain: 0 1 0
+// active low: 1 0
+// busy: line 0 is busy
+// no line: no line 99 on gpiochip0
+// held 4ms: 0 events, deadline 17000000
+// falling at 17000000 line 3 seq 1/1
+// rising at 40000000 line 3 seq 2/2
+// rising only: rising at 40000000 line 4 seq 3/1
+// request offsets: 110000001b000000
+// request consumer: 6669646573
+// request flags: 0800000000000000 attrs 1
+// request attr: 02000000000000000300000000000000030000000000000002000000
+// request debounce: 03000000000000008813000000000000ff00000000000000
+// decoded: rising at 1000 line 17 seq 1/1
+// decoded: falling at 5000 line 27 seq 2/1
+// sysfs: /sys/class/gpio/export <- 17
+// sysfs: /sys/class/gpio/gpio17/active_low <- 0
+// sysfs: /sys/class/gpio/gpio17/direction <- high
+// sysfs: /sys/class/gpio/export <- 4
+// sysfs: /sys/class/gpio/gpio4/active_low <- 1
+// sysfs: /sys/class/gpio/gpio4/direction <- in
+// sysfs: /sys/class/gpio/gpio4/edge <- both
+// sysfs value: 1 0 -1
+use gpio;
+use encoding;
+use string;
+
+fn hex32(v: i64) -> str {
+    var b: Vec<i64> = Vec::new();
+    b.push((v >> 24) & 0xFF);
+    b.push((v >> 16) & 0xFF);
+    b.push((v >> 8) & 0xFF);
+    b.push(v & 0xFF);
+    return hex_encode_bytes(b);
+}
+
+fn slice(v: & Vec<i64>, a: i64, b: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = a;
+    while i < b {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return hex_encode_bytes(out);
+}
+
+fn show_events(prefix: str, evs: Vec<GpioEvent>) {
+    var i: i64 = 0;
+    while i < evs.len() {
+        val e: GpioEvent = evs.get(i);
+        println(prefix + gpio_event_name(e.id) + " at " + int_to_str(e.timestamp_ns) + " line " + int_to_str(e.offset) + " seq " + int_to_str(e.seqno) + "/" + int_to_str(e.line_seqno));
+        i = i + 1;
+    }
+}
+
+fn err_of(r: Result<i64, str>) -> str {
+    match r {
+        Result::Ok(_) => {
+            return "ok";
+        }
+        Result::Err(e) => {
+            return e;
+        }
+    }
+}
+
+fn put_le(v: & mut Vec<i64>, off: i64, x: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        v.set(off + i, (x >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn main() {
+    println("chipinfo: " + hex32(gpio_get_chipinfo_ioctl()));
+    println("get_line: " + hex32(gpio_v2_get_line_ioctl()));
+    println("set_config: " + hex32(gpio_v2_line_set_config_ioctl()));
+    println("get_values: " + hex32(gpio_v2_line_get_values_ioctl()));
+    println("set_values: " + hex32(gpio_v2_line_set_values_ioctl()));
+    var ec: GpioConfig = gpio_edge_input(GPIO_PULL_UP, GPIO_EDGE_BOTH, 0);
+    ec.active_low = true;
+    println("flags: " + int_to_str(gpio_v2_flags(& ec)));
+
+    var chip: GpioChip = gpio_fake_chip("gpiochip0", 8);
+    gpio_request(& mut chip, 0, gpio_output(1), 0);
+    val o1: i64 = gpio_read(& chip, 0);
+    gpio_write(& mut chip, 0, 0);
+    val o2: i64 = gpio_read(& chip, 0);
+    gpio_toggle(& mut chip, 0);
+    println("out: " + int_to_str(o1) + " " + int_to_str(o2) + " " + int_to_str(gpio_read(& chip, 0)));
+
+    gpio_request(& mut chip, 1, gpio_input(GPIO_PULL_UP), 0);
+    println("write input: " + bool_to_str(gpio_write(& mut chip, 1, 1)));
+    val p1: i64 = gpio_read(& chip, 1);
+    gpio_fake_drive(& mut chip, 1, 0, 0);
+    val p2: i64 = gpio_read(& chip, 1);
+    gpio_fake_drive(& mut chip, 1, GPIO_FLOATING, 0);
+    println("pull-up: " + int_to_str(p1) + " " + int_to_str(p2) + " " + int_to_str(gpio_read(& chip, 1)));
+
+    var od: GpioConfig = gpio_output(1);
+    od.drive = GPIO_DRIVE_OPEN_DRAIN;
+    gpio_request(& mut chip, 2, od, 0);
+    val d1: i64 = gpio_read(& chip, 2);
+    gpio_fake_drive(& mut chip, 2, 1, 0);
+    val d2: i64 = gpio_read(& chip, 2);
+    gpio_write(& mut chip, 2, 0);
+    println("open drain: " + int_to_str(d1) + " " + int_to_str(d2) + " " + int_to_str(gpio_read(& chip, 2)));
+
+    var al: GpioConfig = gpio_input(GPIO_PULL_DOWN);
+    al.active_low = true;
+    gpio_request(& mut chip, 5, al, 0);
+    val a1: i64 = gpio_read(& chip, 5);
+    gpio_fake_drive(& mut chip, 5, 1, 0);
+    println("active low: " + int_to_str(a1) + " " + int_to_str(gpio_read(& chip, 5)));
+
+    println("busy: " + err_of(gpio_request(& mut chip, 0, gpio_output(0), 0)));
+    println("no line: " + err_of(gpio_request(& mut chip, 99, gpio_output(0), 0)));
+
+    // a button to ground on line 3 (pull-up), 5 ms debounce, both edges;
+    // line 4 the same, rising only
+    val ms: i64 = 1000000;
+    gpio_request(& mut chip, 3, gpio_edge_input(GPIO_PULL_UP, GPIO_EDGE_BOTH, 5 * ms), 0);
+    gpio_request(& mut chip, 4, gpio_edge_input(GPIO_PULL_UP, GPIO_EDGE_RISING, 5 * ms), 0);
+    var line: i64 = 3;
+    while line <= 4 {
+        gpio_fake_drive(& mut chip, line, 0, 10 * ms);
+        gpio_fake_drive(& mut chip, line, 1, 11 * ms);
+        gpio_fake_drive(& mut chip, line, 0, 12 * ms);
+        line = line + 1;
+    }
+    gpio_tick(& mut chip, 16 * ms);
+    val pending: GpioLine = chip.lines.get(3);
+    println("held 4ms: " + int_to_str(chip.events.len()) + " events, deadline " + int_to_str(gpio_debounce_deadline(& pending.deb)));
+    gpio_tick(& mut chip, 17 * ms);
+    show_events("", gpio_take_events(& mut chip));
+    line = 3;
+    while line <= 4 {
+        gpio_fake_drive(& mut chip, line, 1, 30 * ms);
+        gpio_fake_drive(& mut chip, line, 0, 31 * ms);
+        gpio_fake_drive(& mut chip, line, 1, 32 * ms);
+        line = line + 1;
+    }
+    gpio_tick(& mut chip, 40 * ms);
+    val evs: Vec<GpioEvent> = gpio_take_events(& mut chip);
+    var only3: Vec<GpioEvent> = Vec::new();
+    var only4: Vec<GpioEvent> = Vec::new();
+    var k: i64 = 0;
+    while k < evs.len() {
+        if evs.get(k).offset == 3 {
+            only3.push(evs.get(k));
+        } else {
+            only4.push(evs.get(k));
+        }
+        k = k + 1;
+    }
+    show_events("", only3);
+    show_events("rising only: ", only4);
+
+    var offs: Vec<i64> = Vec::new();
+    offs.push(17);
+    offs.push(27);
+    val img: Vec<i64> = gpio_v2_request_image(& offs, "fides", & gpio_output(1));
+    println("request offsets: " + slice(& img, 0, 8));
+    println("request consumer: " + slice(& img, 256, 261));
+    println("request flags: " + slice(& img, 288, 296) + " attrs " + int_to_str(img.get(296)));
+    println("request attr: " + slice(& img, 320, 344) + slice(& img, 560, 564));
+    var inc: GpioConfig = gpio_edge_input(GPIO_PULL_UP, GPIO_EDGE_BOTH, 5 * ms);
+    var eight: Vec<i64> = Vec::new();
+    var e8: i64 = 0;
+    while e8 < 8 {
+        eight.push(e8);
+        e8 = e8 + 1;
+    }
+    val img2: Vec<i64> = gpio_v2_request_image(& eight, "fides", & inc);
+    println("request debounce: " + slice(& img2, 320, 344));
+
+    var rec: Vec<i64> = Vec::filled(96, 0);
+    put_le(& mut rec, 0, 1000, 8);
+    put_le(& mut rec, 8, 1, 4);
+    put_le(& mut rec, 12, 17, 4);
+    put_le(& mut rec, 16, 1, 4);
+    put_le(& mut rec, 20, 1, 4);
+    put_le(& mut rec, 48, 5000, 8);
+    put_le(& mut rec, 56, 2, 4);
+    put_le(& mut rec, 60, 27, 4);
+    put_le(& mut rec, 64, 2, 4);
+    put_le(& mut rec, 68, 1, 4);
+    show_events("decoded: ", gpio_v2_decode_events(& rec));
+
+    val w1: Vec<GpioSysfsWrite> = gpio_sysfs_setup("/sys/class/gpio", 17, & gpio_output(1));
+    var al2: GpioConfig = gpio_edge_input(GPIO_PULL_NONE, GPIO_EDGE_BOTH, 0);
+    al2.active_low = true;
+    val w2: Vec<GpioSysfsWrite> = gpio_sysfs_setup("/sys/class/gpio", 4, & al2);
+    var all: Vec<GpioSysfsWrite> = w1;
+    var wi: i64 = 0;
+    while wi < w2.len() {
+        all.push(w2.get(wi));
+        wi = wi + 1;
+    }
+    wi = 0;
+    while wi < all.len() {
+        val w: GpioSysfsWrite = all.get(wi);
+        println("sysfs: " + w.path + " <- " + w.value);
+        wi = wi + 1;
+    }
+    println("sysfs value: " + int_to_str(gpio_sysfs_parse_value("1\n")) + " " + int_to_str(gpio_sysfs_parse_value("0\n")) + " " + int_to_str(gpio_sysfs_parse_value("")));
+}

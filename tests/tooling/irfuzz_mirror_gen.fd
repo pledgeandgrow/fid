@@ -1,0 +1,62 @@
+// RL10 (docs/roadmap/llvm-roadmap.md): the generator of
+// tests/tooling/irfuzz-mirror-check.sh. For seeds IRFUZZ_FIRST ..
+// IRFUZZ_FIRST + IRFUZZ_COUNT - 1 (default 1, 40) it prints, after a
+// `//SEED <n>` line, the source of each function `fid ir-fuzz <n>` makes
+// (compiler/ir_ser.fd irfuzz_unit_source: fz_h0.., fz_target with its heap
+// buffer as a Vec), then after `//MAIN` a main that prints what each
+// returns, then `//EXPECT <v>` lines: the values compiler/ir_ser.fd
+// irf_eval_unit works out from the same descriptions. The check renames
+// each seed's functions apart, runs the program and compares: the
+// evaluator that fuzz_ir.sh trusts agrees with the language itself.
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::ast_ser;
+use compiler::inc;
+use compiler::ir_ser;
+
+@wrapping fn mg_int(x: i64) -> str {
+    if x < 0 {
+        return "(0 - " + int_to_str(0 - x) + ")";
+    }
+    return int_to_str(x);
+}
+
+fn mg_env_int(name: str, dflt: i64) -> i64 {
+    var s: str = env_or_empty(name);
+    if s == "" {
+        return dflt;
+    }
+    return str_parse_int(s);
+}
+
+fn main() -> i64 {
+    var first: i64 = mg_env_int("IRFUZZ_FIRST", 1);
+    var count: i64 = mg_env_int("IRFUZZ_COUNT", 40);
+    var calls: str = "";
+    var expect: str = "";
+    var s: i64 = first;
+    while s < first + count {
+        println("//SEED " + int_to_str(s));
+        var a: i64 = irfuzz_arg(s, 0);
+        var b: i64 = irfuzz_arg(s, 1);
+        var pre: str = "s" + int_to_str(s) + "_";
+        var k: i64 = 0;
+        while k < IRFUZZ_HELPERS {
+            print(irfuzz_unit_source(s, k, "fz_h" + int_to_str(k)));
+            calls = calls + "    println(" + pre + "fz_h" + int_to_str(k) + "(" + mg_int(a) + ", " + mg_int(b) + "));\n";
+            expect = expect + "//EXPECT " + int_to_str(irf_eval_unit(s, k, a, b)) + "\n";
+            k = k + 1;
+        }
+        print(irfuzz_unit_source(s, 0 - 1, "fz_target"));
+        calls = calls + "    println(" + pre + "fz_target(" + mg_int(a) + ", " + mg_int(b) + "));\n";
+        expect = expect + "//EXPECT " + int_to_str(irfuzz_eval(s)) + "\n";
+        s = s + 1;
+    }
+    println("//MAIN");
+    print("fn main() -> i64 {\n" + calls + "    return 0;\n}\n");
+    print(expect);
+    return 0;
+}

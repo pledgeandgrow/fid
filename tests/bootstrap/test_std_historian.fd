@@ -1,0 +1,145 @@
+// stdlib/historian: tag registry, exception deadband, swinging-door compression, interpolated and aggregate retrieval
+// Checks: a ramp compresses to its two end points; a step keeps its corner
+// (exception reporting passes the sample before the jump); a sampled sine
+// round-trips within the compression deviation for every raw sample (the
+// swinging-door guarantee, Bristol 1990), and within 2 x exception
+// deviation + compression deviation with the deadband in front; the
+// time-weighted average of the triangle (0,0) (10,10) (20,0) is 5 over
+// [0, 20] and 7.5 over [5, 15]. Archive sizes were reproduced by a Python
+// port of the same algorithm.
+// Expected output:
+// tags: FIC101.PV=0 TI200.PV=1 again=0 unknown=-1
+// ramp: 101 samples -> 2 archived (0,0) (100,50)
+// step: archived 0:1.0 49:1.0 50:5.0 99:5.0
+// sine sdt only: 2001 samples -> 45 archived, ratio 44.5, max error 0.0500 <= 0.05: true
+// sine with deadband 0.02: passed 1156 -> 48 archived, max error 0.0633 <= 0.09: true
+// value at 2.5: 2.5000, interpolated 0..20 x5: 0.00 5.00 10.00 5.00 0.00
+// aggregate 0..20: avg 5.0000 min 0.0000 max 10.0000 count 3 sample avg 3.3333
+// aggregate 5..15: avg 7.5000 min 5.0000 max 10.0000 count 1
+// recorded 5..20: 10:10 20:0
+// exc max 10 s, comp max 30 s on a flat signal: 100 samples -> 5 archived
+use historian;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn sine(i: i64) -> f64 {
+    return math_sin((i as f64) * 0.01) + 0.3 * math_sin((i as f64) * 0.037);
+}
+
+fn main() {
+    var h = historian_new();
+    val a = historian_add_tag(&mut h, "FIC101.PV", "m3/h", 0.0, 0.0, 0.5, 0.0);
+    val b = historian_add_tag(&mut h, "TI200.PV", "degC", 0.0, 0.0, 0.05, 0.0);
+    println("tags: FIC101.PV=" + int_to_str(a) + " TI200.PV=" + int_to_str(b) + " again=" + int_to_str(historian_add_tag(&mut h, "FIC101.PV", "", 0.0, 0.0, 0.0, 0.0)) + " unknown=" + int_to_str(historian_tag_id(&h, "XX")));
+
+    var i: i64 = 0;
+    while i <= 100 {
+        historian_add(&mut h, a, i as f64, 0.5 * (i as f64));
+        i = i + 1;
+    }
+    historian_flush(&mut h, a);
+    val ra = h.tags.get(a);
+    println("ramp: 101 samples -> " + int_to_str(ra.times.len()) + " archived (" + fx(ra.times.get(0), 0) + "," + fx(ra.values.get(0), 0) + ") (" + fx(ra.times.get(1), 0) + "," + fx(ra.values.get(1), 0) + ")");
+
+    var st = historian_add_tag(&mut h, "XV1.STATE", "", 0.1, 0.0, 0.1, 0.0);
+    i = 0;
+    while i < 100 {
+        var v: f64 = 1.0;
+        if i >= 50 {
+            v = 5.0;
+        }
+        historian_add(&mut h, st, i as f64, v);
+        i = i + 1;
+    }
+    historian_flush(&mut h, st);
+    val rs = h.tags.get(st);
+    var line: str = "step: archived";
+    i = 0;
+    while i < rs.times.len() {
+        line = line + " " + fx(rs.times.get(i), 0) + ":" + fx(rs.values.get(i), 1);
+        i = i + 1;
+    }
+    println(line);
+
+    i = 0;
+    while i <= 2000 {
+        historian_add(&mut h, b, (i as f64) * 0.5, sine(i));
+        i = i + 1;
+    }
+    historian_flush(&mut h, b);
+    val tb = h.tags.get(b);
+    var err: f64 = 0.0;
+    i = 0;
+    while i <= 2000 {
+        err = math_max_f64(err, math_fabs(HistTag_value_at(&tb, (i as f64) * 0.5) - sine(i)));
+        i = i + 1;
+    }
+    println("sine sdt only: 2001 samples -> " + int_to_str(tb.times.len()) + " archived, ratio " + fx(HistTag_compression_ratio(&tb), 1) + ", max error " + fx(err, 4) + " <= 0.05: " + bool_to_str(err <= 0.05));
+
+    val c = historian_add_tag(&mut h, "TI201.PV", "degC", 0.02, 0.0, 0.05, 0.0);
+    i = 0;
+    while i <= 2000 {
+        historian_add(&mut h, c, (i as f64) * 0.5, sine(i));
+        i = i + 1;
+    }
+    historian_flush(&mut h, c);
+    val tc = h.tags.get(c);
+    err = 0.0;
+    i = 0;
+    while i <= 2000 {
+        err = math_max_f64(err, math_fabs(HistTag_value_at(&tc, (i as f64) * 0.5) - sine(i)));
+        i = i + 1;
+    }
+    println("sine with deadband 0.02: passed " + int_to_str(tc.passed) + " -> " + int_to_str(tc.times.len()) + " archived, max error " + fx(err, 4) + " <= 0.09: " + bool_to_str(err <= 0.09));
+
+    val tri = historian_add_tag(&mut h, "TRI", "", 0.0, 0.0, 0.0, 0.0);
+    historian_add(&mut h, tri, 0.0, 0.0);
+    historian_add(&mut h, tri, 10.0, 10.0);
+    historian_add(&mut h, tri, 20.0, 0.0);
+    historian_flush(&mut h, tri);
+    val tt = h.tags.get(tri);
+    val iv = HistTag_interpolated(&tt, 0.0, 20.0, 5);
+    println("value at 2.5: " + fx(HistTag_value_at(&tt, 2.5), 4) + ", interpolated 0..20 x5: " + fx(iv.get(0), 2) + " " + fx(iv.get(1), 2) + " " + fx(iv.get(2), 2) + " " + fx(iv.get(3), 2) + " " + fx(iv.get(4), 2));
+    val ag = HistTag_aggregate(&tt, 0.0, 20.0);
+    println("aggregate 0..20: avg " + fx(ag.time_avg, 4) + " min " + fx(ag.min, 4) + " max " + fx(ag.max, 4) + " count " + int_to_str(ag.count) + " sample avg " + fx(ag.sample_avg, 4));
+    val ag2 = HistTag_aggregate(&tt, 5.0, 15.0);
+    println("aggregate 5..15: avg " + fx(ag2.time_avg, 4) + " min " + fx(ag2.min, 4) + " max " + fx(ag2.max, 4) + " count " + int_to_str(ag2.count));
+    val rec = HistTag_recorded(&tt, 5.0, 20.0);
+    println("recorded 5..20: " + fx(rec.get(0), 0) + ":" + fx(rec.get(1), 0) + " " + fx(rec.get(2), 0) + ":" + fx(rec.get(3), 0));
+
+    val flat = historian_add_tag(&mut h, "FLAT", "", 0.0, 10.0, 1.0, 30.0);
+    i = 0;
+    while i < 100 {
+        historian_add(&mut h, flat, i as f64, 7.0);
+        i = i + 1;
+    }
+    historian_flush(&mut h, flat);
+    println("exc max 10 s, comp max 30 s on a flat signal: 100 samples -> " + int_to_str(h.tags.get(flat).times.len()) + " archived");
+}

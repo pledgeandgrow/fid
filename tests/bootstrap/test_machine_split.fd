@@ -1,0 +1,147 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), RA4: live-range splitting in the
+// machine layer (compiler/nat_ir.fd ng_mir_alloc_split, ng_split_plan;
+// `FID_NAT_OFF=split` turns it off). `wide` keeps sixteen values live
+// across calls, more than any target has callee-saved registers, so some
+// spill; a call-free loop then reads and writes them many times, where a
+// piece of each spilled value may take a register (on AArch64 x8-x11 and
+// RISC-V t4 no call crosses), loaded before the loop and stored where it
+// leaves it; `runs` reads and writes spilled values several times between
+// calls (a piece per run); `leave` leaves a loop from its middle (the
+// store at that exit goes in an edge block). A value split wrong (a stale
+// slot read after the loop, a piece clobbered by a call) changes what is
+// printed. tests/nattools/machine_split_check.sh builds it on every target
+// with FID_VERIFY=1 (the allocation checker and the split checker,
+// ng_split_check) with and without the switch and with FID_NAT_ON=splitall
+// (every value split), runs it where it can, and checks that
+// FID_NAT_MUTATE=split (stores at loop exits left out) is rejected.
+// Expected output:
+// 547685
+// 1889
+// 831
+// 29621
+
+// (a loop count that depends on the operands: never unrolled or inlined)
+fn mix(a: i64, b: i64) -> i64 {
+    var s: i64 = a;
+    var i: i64 = 0;
+    var n: i64 = 2 + (a & 1);
+    while i < n {
+        s = (s * 17 + b + i) % 1000003;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn wide(seed: i64, rounds: i64) -> i64 {
+    var a: i64 = mix(seed, 1);
+    var b: i64 = mix(seed, 2);
+    var c: i64 = mix(seed, 3);
+    var d: i64 = mix(seed, 4);
+    var e: i64 = mix(seed, 5);
+    var f: i64 = mix(seed, 6);
+    var g: i64 = mix(seed, 7);
+    var h: i64 = mix(seed, 8);
+    var p: i64 = mix(seed, 9);
+    var q: i64 = mix(seed, 10);
+    var r: i64 = mix(seed, 11);
+    var s: i64 = mix(seed, 12);
+    var t: i64 = mix(seed, 13);
+    var u: i64 = mix(seed, 14);
+    var v: i64 = mix(seed, 15);
+    var w: i64 = mix(seed, 16);
+    var i: i64 = 0;
+    while i < rounds {
+        a = (a + b * 3 + i) % 1000003;
+        b = (b + c + a) % 1000003;
+        c = (c * 5 + d) % 1000003;
+        d = (d + e + i) % 1000003;
+        e = (e * 7 + f) % 1000003;
+        f = (f + g + a) % 1000003;
+        g = (g + h * 3) % 1000003;
+        h = (h + p + b) % 1000003;
+        p = (p * 3 + q) % 1000003;
+        q = (q + r + c) % 1000003;
+        r = (r + s * 5) % 1000003;
+        s = (s + t + d) % 1000003;
+        t = (t * 3 + u) % 1000003;
+        u = (u + v + e) % 1000003;
+        v = (v + w * 7) % 1000003;
+        w = (w + a + f) % 1000003;
+        i = i + 1;
+    }
+    var x: i64 = mix(a, b) + mix(c, d) + mix(e, f) + mix(g, h);
+    var y: i64 = mix(p, q) + mix(r, s) + mix(t, u) + mix(v, w);
+    return (x + y + a + b + c + d + e + f + g + h + p + q + r + s + t + u + v + w) % 1000003;
+}
+
+fn runs(n: i64) -> i64 {
+    var a: i64 = mix(n, 1);
+    var b: i64 = mix(n, 2);
+    var c: i64 = mix(n, 3);
+    var d: i64 = mix(n, 4);
+    var e: i64 = mix(n, 5);
+    var f: i64 = mix(n, 6);
+    var g: i64 = mix(n, 7);
+    var h: i64 = mix(n, 8);
+    var k: i64 = mix(n, 9);
+    var m: i64 = mix(n, 10);
+    var z: i64 = mix(a, 1);
+    a = a * 3 + a % 7 + (a ^ 5);
+    b = b * 5 + b % 11 + (b & 255);
+    c = c + c * c % 13;
+    z = z + mix(a, b);
+    d = d * 7 + d % 3 + (d | 9);
+    e = e + e % 17 + (e ^ 3);
+    z = z + mix(c, d) + mix(e, 1);
+    f = f * 3 + f % 19;
+    g = g + g * g % 23 + (g & 63);
+    z = z + mix(f, g);
+    h = h + h % 29 + (h ^ 7);
+    k = k * 11 + k % 31;
+    m = m + m % 37 + (m | 1);
+    z = z + mix(h, k) + mix(m, 2);
+    return (z + a + b + c + d + e + f + g + h + k + m) % 10007;
+}
+
+fn leave(n: i64, lim: i64) -> i64 {
+    var a: i64 = mix(n, 1);
+    var b: i64 = mix(n, 2);
+    var c: i64 = mix(n, 3);
+    var d: i64 = mix(n, 4);
+    var e: i64 = mix(n, 5);
+    var f: i64 = mix(n, 6);
+    var g: i64 = mix(n, 7);
+    var h: i64 = mix(n, 8);
+    var k: i64 = mix(n, 9);
+    var m: i64 = mix(n, 10);
+    var p: i64 = mix(n, 11);
+    var q: i64 = mix(n, 12);
+    var i: i64 = 0;
+    while i < 1000 {
+        a = (a + b) % 1009;
+        b = (b + c + 1) % 1009;
+        c = (c + d) % 1009;
+        d = (d + e + 2) % 1009;
+        e = (e + f) % 1009;
+        f = (f + g + 3) % 1009;
+        if a + b > lim {
+            break;
+        }
+        g = (g + h) % 1009;
+        h = (h + k + 4) % 1009;
+        k = (k + m) % 1009;
+        m = (m + p + 5) % 1009;
+        p = (p + q) % 1009;
+        q = (q + a + 6) % 1009;
+        i = i + 1;
+    }
+    var z: i64 = mix(a, b) + mix(c, d) + mix(e, f);
+    return (z + i + a + b + c + d + e + f + g + h + k + m + p + q) % 1009;
+}
+
+fn main() {
+    println(int_to_str(wide(17, 200)));
+    println(int_to_str(runs(5) + runs(8)));
+    println(int_to_str(leave(3, 1500)));
+    println(int_to_str(wide(4, 37) % 100003 + leave(9, 1900) + runs(2)));
+}

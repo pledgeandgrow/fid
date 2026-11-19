@@ -1,111 +1,147 @@
 // Fides Queue standard library
 //
-// FIFO queue built on top of Vec.
-// Uses a head index for O(1) dequeue (amortized, with periodic compaction).
+// FIFO queue: a two-stack queue (an inbox stack and an outbox stack) so
+// enqueue and dequeue are O(1) amortized. Empty reads return Option::None
+// rather than a placeholder; `dequeue_or`/`peek_or` supply a default when
+// that is more convenient.
+//
+// Elements are i64 (words). The struct is declared generic for
+// compatibility, but non-word element types (str, Vec, structs) cannot be
+// used yet: the compiler's monomorphization corrupts heap-typed values
+// passed through generic functions and generic impl methods.
 //
 // Usage:
 //   use queue;
-//   value q = Queue::new();
+//   var q = Queue::new();
 //   q.enqueue(1);
 //   q.enqueue(2);
-//   println(q.dequeue());   // 1
-//   println(q.peek());      // 2
+//   println(q.dequeue_or(0));      // 1
+//   match q.dequeue() {
+//     Option::Some(v) => { println(v); }
+//     Option::None => {}
+//   }
 
 module queue;
  use vec;
-/// A FIFO queue backed by Vec with a head index.
+/// A FIFO queue of i64 values backed by an inbox and an outbox stack.
 ///
 /// Example:
 ///   var q = Queue::new();
 ///   q.enqueue(1);
 ///   q.enqueue(2);
 ///   q.enqueue(3);
-///   assert_eq(q.dequeue(), 1);
-///   assert_eq(q.peek(), 2);
+///   assert_eq(q.dequeue_or(0), 1);
+///   assert_eq(q.peek_or(0), 2);
 ///   assert_eq(q.len(), 2);
 ///   assert(q.contains(3));
 ///   q.clear();
 ///   assert(q.is_empty());
 pub struct Queue<T> {
-    pub data: Vec<i64>, pub head: i64,
+    pub inbox: Vec<i64>,
+    pub outbox: Vec<i64>,
 }
 
 impl Queue {
     /// Create a new empty queue.
     pub fn new() -> Queue {
         return Queue {
-            data: Vec::new(), head: 0
+            inbox: Vec::new(), outbox: Vec::new()
+        };
+    }
+
+    /// A queue holding the elements of `v` in order (v[0] dequeues first).
+    pub fn from_vec(v: Vec<i64>) -> Queue {
+        return Queue {
+            inbox: v, outbox: Vec::new()
         };
     }
 
     /// Add a value to the back of the queue.
     pub fn enqueue(self: & mut Queue, value: i64) -> void {
-        self.data.push(value);
+        self.inbox.push(value);
     }
 
-    /// Remove and return the front value. Returns 0 if empty.
-    pub fn dequeue(self: & mut Queue) -> i64 {
-        if self.head >= self.data.len() {
-            return 0;
+    // Move pending inbox items onto the outbox, restoring FIFO order.
+    fn refill(self: & mut Queue) -> void {
+        while !self.inbox.is_empty() {
+            self.outbox.push(self.inbox.pop());
         }
-        var value = self.data.get(self.head);
-        self.head = self.head + 1;
-        // Compact when head reaches half the data size
-        if self.head > 32 && self.head * 2 >= self.data.len() {
-            self.compact();
-        }
-        return value;
     }
 
-    /// Peek at the front value without removing it. Returns 0 if empty.
-    pub fn peek(self: Queue) -> i64 {
-        if self.head >= self.data.len() {
-            return 0;
+    /// Remove and return the front value, or Option::None if empty.
+    pub fn dequeue(self: & mut Queue) -> Option<i64> {
+        if self.outbox.is_empty() {
+            self.refill();
         }
-        return self.data.get(self.head);
+        if self.outbox.is_empty() {
+            return Option::None;
+        }
+        return Option::Some(self.outbox.pop());
+    }
+
+    /// dequeue, or `default` when the queue is empty.
+    pub fn dequeue_or(self: & mut Queue, default: i64) -> i64 {
+        match self.dequeue() {
+            Option::Some(v) => {
+                return v;
+            }
+            Option::None => {
+                return default;
+            }
+        }
+    }
+
+    /// Peek at the front value without removing it, or Option::None.
+    pub fn peek(self: & mut Queue) -> Option<i64> {
+        if self.outbox.is_empty() {
+            self.refill();
+        }
+        if self.outbox.is_empty() {
+            return Option::None;
+        }
+        return Option::Some(self.outbox.last());
+    }
+
+    /// peek, or `default` when the queue is empty.
+    pub fn peek_or(self: & mut Queue, default: i64) -> i64 {
+        match self.peek() {
+            Option::Some(v) => {
+                return v;
+            }
+            Option::None => {
+                return default;
+            }
+        }
     }
 
     /// Check if the queue is empty.
     pub fn is_empty(self: Queue) -> bool {
-        return self.head >= self.data.len();
+        return self.inbox.is_empty() && self.outbox.is_empty();
     }
 
     /// Get the number of elements in the queue.
     pub fn len(self: Queue) -> i64 {
-        var n = self.data.len() - self.head;
-        if n < 0 {
-            return 0;
-        }
-        return n;
+        return self.inbox.len() + self.outbox.len();
     }
 
     /// Clear all elements from the queue.
     pub fn clear(self: & mut Queue) -> void {
-        self.data.clear();
-        self.head = 0;
+        self.inbox.clear();
+        self.outbox.clear();
     }
 
-    /// Compact internal storage by removing dequeued elements.
-    fn compact(self: & mut Queue) -> void {
-        // Shift elements to the front
-        var i = self.head;
-        var j = 0;
-        while i < self.data.len() {
-            self.data.set(j, self.data.get(i));
-            i = i + 1;
-            j = j + 1;
-        }  // Pop the remaining elements
-        while self.data.len() > j {
-            self.data.pop();
-        }
-        self.head = 0;
-    }
-
-    /// Check if the queue contains a value (searches remaining elements).
+    /// Check if the queue contains a value.
     pub fn contains(self: Queue, value: i64) -> bool {
-        var i = self.head;
-        while i < self.data.len() {
-            if self.data.get(i) == value {
+        var i = 0;
+        while i < self.inbox.len() {
+            if self.inbox.get(i) == value {
+                return true;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < self.outbox.len() {
+            if self.outbox.get(i) == value {
                 return true;
             }
             i = i + 1;
@@ -114,10 +150,10 @@ impl Queue {
     }
 
     /// Drain all elements into a Vec (front = first element).
-    pub fn drain(self: Queue) -> Vec<i64> {
+    pub fn drain(self: & mut Queue) -> Vec<i64> {
         var result = Vec::new();
         while !self.is_empty() {
-            result.push(self.dequeue());
+            result.push(self.dequeue_or(0));
         }
         return result;
     }

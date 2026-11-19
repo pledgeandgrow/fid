@@ -245,3 +245,59 @@ pub fn sha512_hex(d: Vec<i64>) -> str {
     }
     return out;
 }
+
+// ─── HMAC-SHA512 (RFC 2104, RFC 4231) ──────────────────────────────────
+
+/// HMAC-SHA512 of byte vectors (each element 0..255): the 64-byte MAC.
+/// The block is 128 bytes: a longer key is hashed first, then padded with
+/// zeros. Checked against RFC 4231 in tests/bootstrap/test_hmac_sha512.fd.
+/// The key is `@secret` (complaint CO1); the MAC is an audited release.
+@declassify pub fn hmac_sha512_bytes(@secret key: Vec<i64>, message: Vec<i64>) -> Vec<i64> {
+    var kb: Vec<i64> = Vec::new();
+    if key.len() > 128 {
+        val kh: Vec<i64> = sha512_bytes(key);
+        var hi: i64 = 0;
+        while hi < 64 {
+            kb.push(kh.get(hi));
+            hi = hi + 1;
+        }
+    } else {
+        var ki: i64 = 0;
+        while ki < key.len() {
+            kb.push(key.get(ki) & 255);
+            ki = ki + 1;
+        }
+    }
+    while kb.len() < 128 {
+        kb.push(0);
+    }
+    var inner: Vec<i64> = Vec::new();
+    var j: i64 = 0;
+    while j < 128 {
+        inner.push(kb.get(j) ^ 0x36);
+        j = j + 1;
+    }
+    j = 0;
+    while j < message.len() {
+        inner.push(message.get(j) & 255);
+        j = j + 1;
+    }
+    val ih: Vec<i64> = sha512_bytes(inner);
+    var outer: Vec<i64> = Vec::new();
+    j = 0;
+    while j < 128 {
+        outer.push(kb.get(j) ^ 0x5c);
+        j = j + 1;
+    }
+    j = 0;
+    while j < 64 {
+        outer.push(ih.get(j));
+        j = j + 1;
+    }
+    return sha512_bytes(outer);
+}
+
+/// HMAC-SHA512 of the bytes of two strings.
+@declassify pub fn hmac_sha512(@secret key: str, message: str) -> Vec<i64> {
+    return hmac_sha512_bytes(str_bytes(key), str_bytes(message));
+}

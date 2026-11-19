@@ -1,0 +1,101 @@
+// test_machine_pgo_layout.fd — competitive OP15 with a block profile, on
+// the machine layer (compiler/nat_ir.fd ng_pgo_cold_labels, ng_cold_last):
+// `fid run --profile p.prof` counts each block of each called function
+// (compiler/pgo.fd lines "<1 + entries> <function>@<block id>"), and
+// `fid emit ... --profile-use p.prof` lays the blocks the run never or
+// rarely entered (under 1 in 1000 calls) after the hot code of their
+// function. The rare sides here are not marked (@cold, cold_path()) and do
+// not panic: only the profile knows them. They sit in loops, fallen into
+// and falling out, so a wrong jump changes the numbers.
+// FID_NAT_OFF=pgolayout: the profile's blocks stay in place; every build
+// prints the same.
+// Check (Linux targets through WSL qemu-user):
+//   $FID run tests/bootstrap/test_machine_pgo_layout.fd --profile p.prof
+//   grep '^[0-9]* scale@' p.prof        (block lines, "1 scale@<id>" among them)
+//   FID_NAT_DUMP=scale $FID emit tests/bootstrap/test_machine_pgo_layout.fd \
+//       --target x86_64-linux --profile-use p.prof -o t.out
+//   (the `* 7 + 3` block comes after scale's epilogue), run t.out: the
+//   output below, and the same with FID_NAT_OFF=pgolayout and FID_VERIFY=1.
+//
+// Expected output:
+// 9900
+// 4950
+// 328350
+// 1200
+// 100
+
+// The rare side: v > 1000000 never happens in this run
+fn scale(v: i64) -> i64 {
+    var r: i64 = v;
+    if v > 1000000 {
+        r = v * 7 + 3;
+        r = r - v / 2;
+    }
+    return r * 2;
+}
+
+// A loop with a rare branch whose block falls out into the loop's step
+fn sum_odd_rare(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i < 0 {
+            s = s - 100;
+            s = s * 2;
+        }
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+// A rare else side (fallen into from the test)
+fn tri(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i >= 0 {
+            s = s + i * i;
+        } else {
+            s = s - i;
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// A rare early return
+fn clamp_sum(v: Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) > 999999 {
+            return 0 - 1;
+        }
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 100 {
+        t = t + scale(i);
+        i = i + 1;
+    }
+    println(t);
+    println(sum_odd_rare(100));
+    println(tri(100));
+    var v: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 16 {
+        v.push(i * 10);
+        i = i + 1;
+    }
+    println(clamp_sum(v));
+    println(scale(50));
+    return 0;
+}

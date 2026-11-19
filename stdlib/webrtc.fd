@@ -1,0 +1,2024 @@
+// Fides WebRTC: SDP, ICE, STUN, and a peer connection over DTLS-SRTP
+//
+// Real (pure computation):
+//   - SDP (RFC 8866) parse and generate: v= o= s= c= t= lines, session and
+//     media attributes, m= sections (media, port, proto, formats); helpers
+//     for rtpmap/fmtp codecs, direction, mid, BUNDLE groups, ICE ufrag/pwd
+//     (media level, else session level), DTLS fingerprint and setup role;
+//     an answer from an offer (RFC 3264 / JSEP): codecs intersected by
+//     name in the answerer's order with the offerer's payload types and
+//     fmtp kept, directions mirrored (sendonly <-> recvonly), setup actpass
+//     answered active, rejected sections get port 0, data channel sections
+//     (webrtc-datachannel, sctp-port) carried, our ICE credentials and
+//     fingerprint, rtcp-mux and the BUNDLE group kept;
+//   - ICE (RFC 8445): candidate lines parsed and written (foundation,
+//     component, transport, priority, address, port, typ, raddr/rport,
+//     tcptype, extensions kept), candidate priority (type preference
+//     host 126, prflx 110, srflx 100, relay 0), pair priority
+//     2^32*MIN(G,D) + 2*MAX(G,D) + (G>D ? 1 : 0), pairing of local and
+//     remote candidates of the same component, transport and address
+//     family, sorted, with server-reflexive locals pruned when their host
+//     base is there (6.1.2.4);
+//   - STUN (RFC 5389/8489): message type (method and class), header with
+//     the magic cookie and transaction id, TLV attributes padded to 4
+//     bytes, MAPPED-ADDRESS and XOR-MAPPED-ADDRESS (IPv4 and IPv6),
+//     USERNAME, SOFTWARE, ERROR-CODE, PRIORITY, USE-CANDIDATE,
+//     ICE-CONTROLLED/CONTROLLING; MESSAGE-INTEGRITY (HMAC-SHA1 with the
+//     short-term credential, SHA-1 implemented here) and FINGERPRINT
+//     (CRC-32 implemented here, XOR 0x5354554e), made and checked
+//     (RFC 5769's test vectors are the test);
+//   - a peer connection (WebrtcPeer, like RTCPeerConnection) that ties
+//     them together: an offer or answer with our ICE credentials, host
+//     candidate, DTLS fingerprint and setup role; ICE connectivity checks
+//     (RFC 8445 §7: Binding requests with USERNAME, PRIORITY,
+//     ICE-CONTROLLING/CONTROLLED, USE-CANDIDATE from the controlling side
+//     (aggressive nomination), MESSAGE-INTEGRITY and FINGERPRINT;
+//     responses checked; triggered checks; paced every 50 ms,
+//     retransmitted with a doubling timeout, a pair failed after 7 tries);
+//     then DTLS 1.2 (stdlib/dtls.fd) on the selected pair, the role from
+//     a=setup, the peer certificate checked against a=fingerprint; then
+//     SRTP/SRTCP (stdlib/srtp.fd) keyed by the DTLS-SRTP exporter;
+//     datagrams demultiplexed by first byte (RFC 7983); the state goes
+//     new -> checking -> connected, or failed (ICE found no working pair
+//     or timed out, DTLS failed, wrong fingerprint), or closed.
+//
+// The seam: no sockets and no clock. A WebrtcPeer gets datagrams through
+// webrtc_peer_receive (with the sender's address), the time through
+// webrtc_peer_poll (milliseconds), and hands back WebrtcDatagrams to
+// send (webrtc_peer_drain); the caller's UDP socket (stdlib net) moves
+// them. Entropy comes from WebrtcConfig.seed.
+//
+// Out of scope: SCTP for data channels, TURN (relay candidates and the
+// long-term credential mechanism), candidate gathering (the caller gives
+// its host address; server-reflexive candidates come from the caller's
+// STUN exchange), peer-reflexive candidates, ICE restarts, consent
+// freshness, trickle ICE, more than one media section per transport
+// (everything is bundled on one component, rtcp-mux).
+//
+// Usage:
+//   use webrtc;
+//   val offer: Sdp = sdp_parse(text);
+//   val ans: Sdp = sdp_answer(&offer, cfg);
+//   println(sdp_to_str(&ans));
+//   var m: StunMsg = stun_new(STUN_BINDING, STUN_REQUEST, txid);
+//   stun_add_username(&mut m, "remote:local");
+//   val bytes: Vec<i64> = stun_encode(&m, str_bytes(remote_pwd), true);
+//
+//   var a: WebrtcPeer = webrtc_peer_new(webrtc_config(cert_pem, key_pem, "ufrag", "pwd...", "10.0.0.1", 5000), true);
+//   val offer: str = webrtc_peer_offer(& mut a);   // to the other side
+//   webrtc_peer_set_remote(& mut a, answer_text);
+//   loop: webrtc_peer_receive(& mut a, ip, port, bytes, now); webrtc_peer_poll(& mut a, now);
+//         send each of webrtc_peer_drain(& mut a)
+//   if a.state == WEBRTC_CONNECTED { webrtc_peer_send_rtp(& mut a, rtp); }
+
+module webrtc;
+ use vec; use string; use kdf; use crypto; use dtls; use srtp;
+
+// ─── SDP ──────────────────────────────────────────────────────────────────
+
+pub struct SdpMedia {
+    pub kind: str,
+    pub port: i64,
+    pub proto: str,
+    pub fmts: Vec<str>,
+    pub conn: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+}
+
+pub struct Sdp {
+    pub ok: bool,
+    pub error: str,
+    pub version: i64,
+    pub origin: str,
+    pub session_name: str,
+    pub timing: str,
+    pub conn: str,
+    pub names: Vec<str>,
+    pub vals: Vec<str>,
+    pub media: Vec<SdpMedia>,
+}
+
+pub fn sdp_new(origin: str) -> Sdp {
+    return Sdp { ok: true, error: "", version: 0, origin: origin, session_name: "-", timing: "0 0", conn: "", names: Vec::new(), vals: Vec::new(), media: Vec::new() };
+}
+
+fn wr_media_new(kind: str, port: i64, proto: str) -> SdpMedia {
+    return SdpMedia { kind: kind, port: port, proto: proto, fmts: Vec::new(), conn: "", names: Vec::new(), vals: Vec::new() };
+}
+
+/// Parse SDP text (CRLF or LF lines). ok false with `error` on a line that
+/// is not "x=...", a missing v=, or a bad m= line.
+pub fn sdp_parse(text: str) -> Sdp {
+    var s: Sdp = sdp_new("");
+    s.session_name = "";
+    s.timing = "";
+    val lines: Vec<str> = str_split(text, "\n");
+    var cur: i64 = 0 - 1;
+    var m: SdpMedia = wr_media_new("", 0, "");
+    var saw_v: bool = false;
+    var i: i64 = 0;
+    while i < lines.len() {
+        var line: str = lines.get(i);
+        if str_len(line) > 0 && str_byte_at(line, str_len(line) - 1) == 13 {
+            line = str_slice(line, 0, str_len(line) - 1);
+        }
+        i = i + 1;
+        if str_len(line) == 0 {
+            continue;
+        }
+        if str_len(line) < 2 || str_byte_at(line, 1) != 61 {
+            s.ok = false;
+            s.error = "bad line: " + line;
+            return s;
+        }
+        val t: str = str_slice(line, 0, 1);
+        val v: str = str_slice(line, 2, str_len(line));
+        if t == "v" {
+            s.version = str_parse_int(v);
+            saw_v = true;
+        } else if t == "m" {
+            if cur >= 0 {
+                s.media.push(m);
+            }
+            val parts: Vec<str> = str_split(v, " ");
+            if parts.len() < 3 {
+                s.ok = false;
+                s.error = "bad m= line: " + line;
+                return s;
+            }
+            var port_s: str = parts.get(1);
+            val slash: i64 = str_find(port_s, "/");
+            if slash >= 0 {
+                port_s = str_slice(port_s, 0, slash);
+            }
+            m = wr_media_new(parts.get(0), str_parse_int(port_s), parts.get(2));
+            var k: i64 = 3;
+            while k < parts.len() {
+                if str_len(parts.get(k)) > 0 {
+                    m.fmts.push(parts.get(k));
+                }
+                k = k + 1;
+            }
+            cur = s.media.len();
+        } else if t == "a" {
+            val colon: i64 = str_find(v, ":");
+            var name: str = v;
+            var val_s: str = "";
+            if colon >= 0 {
+                name = str_slice(v, 0, colon);
+                val_s = str_slice(v, colon + 1, str_len(v));
+            }
+            if cur >= 0 {
+                m.names.push(name);
+                m.vals.push(val_s);
+            } else {
+                s.names.push(name);
+                s.vals.push(val_s);
+            }
+        } else if t == "c" {
+            if cur >= 0 {
+                m.conn = v;
+            } else {
+                s.conn = v;
+            }
+        } else if t == "o" {
+            s.origin = v;
+        } else if t == "s" {
+            s.session_name = v;
+        } else if t == "t" {
+            s.timing = v;
+        }
+    }
+    if cur >= 0 {
+        s.media.push(m);
+    }
+    if !saw_v {
+        s.ok = false;
+        s.error = "no v= line";
+    }
+    return s;
+}
+
+fn wr_attr_lines(names: Vec<str>, vals: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < names.len() {
+        if str_len(vals.get(i)) > 0 {
+            out = out + "a=" + names.get(i) + ":" + vals.get(i) + "\r\n";
+        } else {
+            out = out + "a=" + names.get(i) + "\r\n";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// SDP text with CRLF line ends, in the order RFC 8866 gives.
+pub fn sdp_to_str(s: & Sdp) -> str {
+    var out: str = "v=" + int_to_str(s.version) + "\r\no=" + s.origin + "\r\ns=" + s.session_name + "\r\n";
+    if str_len(s.conn) > 0 {
+        out = out + "c=" + s.conn + "\r\n";
+    }
+    out = out + "t=" + s.timing + "\r\n" + wr_attr_lines(s.names, s.vals);
+    var i: i64 = 0;
+    while i < s.media.len() {
+        val m: SdpMedia = s.media.get(i);
+        out = out + "m=" + m.kind + " " + int_to_str(m.port) + " " + m.proto;
+        var k: i64 = 0;
+        while k < m.fmts.len() {
+            out = out + " " + m.fmts.get(k);
+            k = k + 1;
+        }
+        out = out + "\r\n";
+        if str_len(m.conn) > 0 {
+            out = out + "c=" + m.conn + "\r\n";
+        }
+        out = out + wr_attr_lines(m.names, m.vals);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The first value of attribute `name` ("" when absent).
+pub fn sdp_attr(names: Vec<str>, vals: Vec<str>, name: str) -> str {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name {
+            return vals.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn sdp_has_attr(names: Vec<str>, name: str) -> bool {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Every value of attribute `name`.
+pub fn sdp_attrs(names: Vec<str>, vals: Vec<str>, name: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == name {
+            out.push(vals.get(i));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// sendrecv, sendonly, recvonly or inactive (sendrecv by default).
+pub fn sdp_direction(m: & SdpMedia) -> str {
+    var i: i64 = 0;
+    while i < m.names.len() {
+        val n: str = m.names.get(i);
+        if n == "sendrecv" || n == "sendonly" || n == "recvonly" || n == "inactive" {
+            return n;
+        }
+        i = i + 1;
+    }
+    return "sendrecv";
+}
+
+/// The rtpmap of payload type `pt`: "opus/48000/2", or "".
+pub fn sdp_rtpmap(m: & SdpMedia, pt: str) -> str {
+    val maps: Vec<str> = sdp_attrs(m.names, m.vals, "rtpmap");
+    var i: i64 = 0;
+    while i < maps.len() {
+        val sp: i64 = str_find(maps.get(i), " ");
+        if sp > 0 && str_slice(maps.get(i), 0, sp) == pt {
+            return str_slice(maps.get(i), sp + 1, str_len(maps.get(i)));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn wr_fmtp(m: & SdpMedia, pt: str) -> str {
+    val fs: Vec<str> = sdp_attrs(m.names, m.vals, "fmtp");
+    var i: i64 = 0;
+    while i < fs.len() {
+        val sp: i64 = str_find(fs.get(i), " ");
+        if sp > 0 && str_slice(fs.get(i), 0, sp) == pt {
+            return str_slice(fs.get(i), sp + 1, str_len(fs.get(i)));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The codec of each format: "111 opus/48000/2", ...
+pub fn sdp_codecs(m: & SdpMedia) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < m.fmts.len() {
+        out.push(m.fmts.get(i) + " " + sdp_rtpmap(m, m.fmts.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// ICE ufrag of a media section, else of the session.
+pub fn sdp_ice_ufrag(s: & Sdp, m: & SdpMedia) -> str {
+    val v: str = sdp_attr(m.names, m.vals, "ice-ufrag");
+    if str_len(v) > 0 {
+        return v;
+    }
+    return sdp_attr(s.names, s.vals, "ice-ufrag");
+}
+
+pub fn sdp_ice_pwd(s: & Sdp, m: & SdpMedia) -> str {
+    val v: str = sdp_attr(m.names, m.vals, "ice-pwd");
+    if str_len(v) > 0 {
+        return v;
+    }
+    return sdp_attr(s.names, s.vals, "ice-pwd");
+}
+
+pub fn sdp_fingerprint(s: & Sdp, m: & SdpMedia) -> str {
+    val v: str = sdp_attr(m.names, m.vals, "fingerprint");
+    if str_len(v) > 0 {
+        return v;
+    }
+    return sdp_attr(s.names, s.vals, "fingerprint");
+}
+
+/// What the answerer accepts and its own identity.
+pub struct SdpAnswerConfig {
+    pub origin: str,
+    pub ufrag: str,
+    pub pwd: str,
+    pub fingerprint: str,
+    pub codecs: Vec<str>,
+    pub data_channels: bool,
+}
+
+fn wr_mirror(dir: str) -> str {
+    if dir == "sendonly" {
+        return "recvonly";
+    }
+    if dir == "recvonly" {
+        return "sendonly";
+    }
+    return dir;
+}
+
+fn wr_codec_name(rtpmap: str) -> str {
+    val sl: i64 = str_find(rtpmap, "/");
+    if sl < 0 {
+        return str_to_lower(rtpmap);
+    }
+    return str_to_lower(str_slice(rtpmap, 0, sl));
+}
+
+/// The answer to `offer` under `cfg` (JSEP-style, all sections bundled
+/// when the offer bundles them).
+pub fn sdp_answer(offer: & Sdp, cfg: SdpAnswerConfig) -> Sdp {
+    var a: Sdp = sdp_new(cfg.origin);
+    val bundle: str = sdp_attr(offer.names, offer.vals, "group");
+    var accepted_mids: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < offer.media.len() {
+        val om: SdpMedia = offer.media.get(i);
+        var m: SdpMedia = wr_media_new(om.kind, 9, om.proto);
+        m.conn = "IN IP4 0.0.0.0";
+        val mid: str = sdp_attr(om.names, om.vals, "mid");
+        var keep: bool = om.port != 0;
+        if om.kind == "application" {
+            keep = keep && cfg.data_channels;
+            if keep {
+                var k: i64 = 0;
+                while k < om.fmts.len() {
+                    m.fmts.push(om.fmts.get(k));
+                    k = k + 1;
+                }
+            }
+        } else if keep {
+            // codecs in our order, with the offer's payload types
+            var c: i64 = 0;
+            while c < cfg.codecs.len() {
+                val want: str = str_to_lower(cfg.codecs.get(c));
+                var k: i64 = 0;
+                while k < om.fmts.len() {
+                    val pt: str = om.fmts.get(k);
+                    val map: str = sdp_rtpmap(& om, pt);
+                    if wr_codec_name(map) == want && !sdp_has_attr(m.fmts, pt) {
+                        m.fmts.push(pt);
+                        m.names.push("rtpmap");
+                        m.vals.push(pt + " " + map);
+                        val fp: str = wr_fmtp(& om, pt);
+                        if str_len(fp) > 0 {
+                            m.names.push("fmtp");
+                            m.vals.push(pt + " " + fp);
+                        }
+                    }
+                    k = k + 1;
+                }
+                c = c + 1;
+            }
+            keep = m.fmts.len() > 0;
+        }
+        if !keep {
+            m.port = 0;
+            m.fmts = Vec::new();
+            if om.fmts.len() > 0 {
+                m.fmts.push(om.fmts.get(0));
+            }
+            m.names = Vec::new();
+            m.vals = Vec::new();
+            if str_len(mid) > 0 {
+                m.names.push("mid");
+                m.vals.push(mid);
+            }
+            a.media.push(m);
+            i = i + 1;
+            continue;
+        }
+        var nm: Vec<str> = Vec::new();
+        var nv: Vec<str> = Vec::new();
+        nm.push("ice-ufrag");
+        nv.push(cfg.ufrag);
+        nm.push("ice-pwd");
+        nv.push(cfg.pwd);
+        nm.push("fingerprint");
+        nv.push(cfg.fingerprint);
+        val setup: str = sdp_attr(om.names, om.vals, "setup");
+        if setup == "active" {
+            nm.push("setup");
+            nv.push("passive");
+        } else {
+            nm.push("setup");
+            nv.push("active");
+        }
+        if str_len(mid) > 0 {
+            nm.push("mid");
+            nv.push(mid);
+            accepted_mids.push(mid);
+        }
+        if om.kind == "application" {
+            val port: str = sdp_attr(om.names, om.vals, "sctp-port");
+            if str_len(port) > 0 {
+                nm.push("sctp-port");
+                nv.push(port);
+            }
+        } else {
+            nm.push(wr_mirror(sdp_direction(& om)));
+            nv.push("");
+            if sdp_has_attr(om.names, "rtcp-mux") {
+                nm.push("rtcp-mux");
+                nv.push("");
+            }
+        }
+        var k: i64 = 0;
+        while k < m.names.len() {
+            nm.push(m.names.get(k));
+            nv.push(m.vals.get(k));
+            k = k + 1;
+        }
+        m.names = nm;
+        m.vals = nv;
+        a.media.push(m);
+        i = i + 1;
+    }
+    if str_starts_with(bundle, "BUNDLE") && accepted_mids.len() > 0 {
+        a.names.push("group");
+        a.vals.push("BUNDLE " + str_join(accepted_mids, " "));
+    }
+    val sem: str = sdp_attr(offer.names, offer.vals, "msid-semantic");
+    if str_len(sem) > 0 {
+        a.names.push("msid-semantic");
+        a.vals.push(sem);
+    }
+    return a;
+}
+
+// ─── ICE candidates ───────────────────────────────────────────────────────
+
+pub struct IceCandidate {
+    pub ok: bool,
+    pub foundation: str,
+    pub component: i64,
+    pub transport: str,
+    pub priority: i64,
+    pub address: str,
+    pub port: i64,
+    pub typ: str,
+    pub raddr: str,
+    pub rport: i64,
+    pub tcptype: str,
+    pub ext: str,
+}
+
+/// Parse "candidate:..." (with or without "a=").
+pub fn ice_parse_candidate(line: str) -> IceCandidate {
+    var c: IceCandidate = IceCandidate { ok: false, foundation: "", component: 0, transport: "", priority: 0, address: "", port: 0, typ: "", raddr: "", rport: 0 - 1, tcptype: "", ext: "" };
+    var t: str = str_trim(line);
+    if str_starts_with(t, "a=") {
+        t = str_slice(t, 2, str_len(t));
+    }
+    if str_starts_with(t, "candidate:") {
+        t = str_slice(t, 10, str_len(t));
+    }
+    val p: Vec<str> = str_split(t, " ");
+    if p.len() < 8 || p.get(6) != "typ" {
+        return c;
+    }
+    c.foundation = p.get(0);
+    c.component = str_parse_int(p.get(1));
+    c.transport = str_to_lower(p.get(2));
+    c.priority = str_parse_int(p.get(3));
+    c.address = p.get(4);
+    c.port = str_parse_int(p.get(5));
+    c.typ = p.get(7);
+    var k: i64 = 8;
+    while k + 1 < p.len() {
+        val key: str = p.get(k);
+        if key == "raddr" {
+            c.raddr = p.get(k + 1);
+        } else if key == "rport" {
+            c.rport = str_parse_int(p.get(k + 1));
+        } else if key == "tcptype" {
+            c.tcptype = p.get(k + 1);
+        } else {
+            if str_len(c.ext) > 0 {
+                c.ext = c.ext + " ";
+            }
+            c.ext = c.ext + key + " " + p.get(k + 1);
+        }
+        k = k + 2;
+    }
+    c.ok = c.component >= 1 && c.port >= 0 && c.port < 65536 && (c.typ == "host" || c.typ == "srflx" || c.typ == "prflx" || c.typ == "relay");
+    return c;
+}
+
+pub fn ice_candidate_to_str(c: & IceCandidate) -> str {
+    var out: str = "candidate:" + c.foundation + " " + int_to_str(c.component) + " " + c.transport + " " + int_to_str(c.priority) + " " + c.address + " " + int_to_str(c.port) + " typ " + c.typ;
+    if str_len(c.raddr) > 0 {
+        out = out + " raddr " + c.raddr + " rport " + int_to_str(c.rport);
+    }
+    if str_len(c.tcptype) > 0 {
+        out = out + " tcptype " + c.tcptype;
+    }
+    if str_len(c.ext) > 0 {
+        out = out + " " + c.ext;
+    }
+    return out;
+}
+
+/// RFC 8445's recommended type preferences.
+pub fn ice_type_pref(typ: str) -> i64 {
+    if typ == "host" { return 126; }
+    if typ == "prflx" { return 110; }
+    if typ == "srflx" { return 100; }
+    return 0;
+}
+
+/// priority = 2^24 * type pref + 2^8 * local pref + (256 - component).
+pub fn ice_priority(type_pref: i64, local_pref: i64, component: i64) -> i64 {
+    return type_pref * 16777216 + local_pref * 256 + (256 - component);
+}
+
+/// Pair priority from the controlling (g) and controlled (d) candidates'
+/// priorities.
+pub fn ice_pair_priority(g: i64, d: i64) -> i64 {
+    var lo: i64 = g;
+    var hi: i64 = d;
+    if d < g {
+        lo = d;
+        hi = g;
+    }
+    var extra: i64 = 0;
+    if g > d {
+        extra = 1;
+    }
+    return lo * 4294967296 + 2 * hi + extra;
+}
+
+fn wr_is_v6(a: str) -> bool {
+    return str_contains(a, ":");
+}
+
+pub struct IcePair {
+    pub local: i64,
+    pub remote: i64,
+    pub priority: i64,
+    pub foundation: str,
+}
+
+/// Candidate pairs, highest priority first. A local srflx candidate is
+/// left out when the host candidate it comes from (raddr/rport) is there:
+/// checks are sent from the base, so the pair would repeat the host's.
+pub fn ice_pairs(locals: Vec<IceCandidate>, remotes: Vec<IceCandidate>, controlling: bool) -> Vec<IcePair> {
+    var out: Vec<IcePair> = Vec::new();
+    var i: i64 = 0;
+    while i < locals.len() {
+        val l: IceCandidate = locals.get(i);
+        var redundant: bool = false;
+        if l.typ == "srflx" {
+            var h: i64 = 0;
+            while h < locals.len() {
+                val b: IceCandidate = locals.get(h);
+                if b.typ == "host" && b.address == l.raddr && b.port == l.rport && b.component == l.component {
+                    redundant = true;
+                }
+                h = h + 1;
+            }
+        }
+        var j: i64 = 0;
+        while j < remotes.len() && !redundant {
+            val r: IceCandidate = remotes.get(j);
+            if l.component == r.component && l.transport == r.transport && wr_is_v6(l.address) == wr_is_v6(r.address) {
+                var pr: i64 = 0;
+                if controlling {
+                    pr = ice_pair_priority(l.priority, r.priority);
+                } else {
+                    pr = ice_pair_priority(r.priority, l.priority);
+                }
+                val p: IcePair = IcePair { local: i, remote: j, priority: pr, foundation: l.foundation + ":" + r.foundation };
+                // insert in order (stable among equals)
+                var at: i64 = out.len();
+                while at > 0 && out.get(at - 1).priority < pr {
+                    at = at - 1;
+                }
+                out.insert(at, p);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── SHA-1, HMAC-SHA1, CRC-32 ─────────────────────────────────────────────
+
+fn wr_rotl(x: i64, n: i64) -> i64 {
+    return ((x << n) | (x >> (32 - n))) & 4294967295;
+}
+
+/// SHA-1 (FIPS 180-4).
+pub fn webrtc_sha1(msg: Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < msg.len() {
+        p.push(msg.get(i) & 255);
+        i = i + 1;
+    }
+    p.push(128);
+    while p.len() % 64 != 56 {
+        p.push(0);
+    }
+    val bits: i64 = msg.len() * 8;
+    var k: i64 = 7;
+    while k >= 0 {
+        p.push((bits >> (k * 8)) & 255);
+        k = k - 1;
+    }
+    var h0: i64 = 1732584193;
+    var h1: i64 = 4023233417;
+    var h2: i64 = 2562383102;
+    var h3: i64 = 271733878;
+    var h4: i64 = 3285377520;
+    var w: Vec<i64> = Vec::filled(80, 0);
+    var blk: i64 = 0;
+    while blk < p.len() {
+        var t: i64 = 0;
+        while t < 16 {
+            val at: i64 = blk + t * 4;
+            w.set(t, (p.get(at) << 24) | (p.get(at + 1) << 16) | (p.get(at + 2) << 8) | p.get(at + 3));
+            t = t + 1;
+        }
+        while t < 80 {
+            w.set(t, wr_rotl(w.get(t - 3) ^ w.get(t - 8) ^ w.get(t - 14) ^ w.get(t - 16), 1));
+            t = t + 1;
+        }
+        var a: i64 = h0;
+        var b: i64 = h1;
+        var c: i64 = h2;
+        var d: i64 = h3;
+        var e: i64 = h4;
+        t = 0;
+        while t < 80 {
+            var f: i64 = 0;
+            var kk: i64 = 0;
+            if t < 20 {
+                f = (b & c) | ((b ^ 4294967295) & d);
+                kk = 1518500249;
+            } else if t < 40 {
+                f = b ^ c ^ d;
+                kk = 1859775393;
+            } else if t < 60 {
+                f = (b & c) | (b & d) | (c & d);
+                kk = 2400959708;
+            } else {
+                f = b ^ c ^ d;
+                kk = 3395469782;
+            }
+            val tmp: i64 = (wr_rotl(a, 5) + f + e + kk + w.get(t)) & 4294967295;
+            e = d;
+            d = c;
+            c = wr_rotl(b, 30);
+            b = a;
+            a = tmp;
+            t = t + 1;
+        }
+        h0 = (h0 + a) & 4294967295;
+        h1 = (h1 + b) & 4294967295;
+        h2 = (h2 + c) & 4294967295;
+        h3 = (h3 + d) & 4294967295;
+        h4 = (h4 + e) & 4294967295;
+        blk = blk + 64;
+    }
+    var out: Vec<i64> = Vec::new();
+    var hs: Vec<i64> = Vec::new();
+    hs.push(h0);
+    hs.push(h1);
+    hs.push(h2);
+    hs.push(h3);
+    hs.push(h4);
+    i = 0;
+    while i < 5 {
+        val v: i64 = hs.get(i);
+        out.push((v >> 24) & 255);
+        out.push((v >> 16) & 255);
+        out.push((v >> 8) & 255);
+        out.push(v & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// HMAC-SHA1 (RFC 2104).
+pub fn webrtc_hmac_sha1(key: Vec<i64>, msg: Vec<i64>) -> Vec<i64> {
+    var k: Vec<i64> = key;
+    if k.len() > 64 {
+        k = webrtc_sha1(key);
+    }
+    var ipad: Vec<i64> = Vec::new();
+    var opad: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        var b: i64 = 0;
+        if i < k.len() {
+            b = k.get(i) & 255;
+        }
+        ipad.push(b ^ 54);
+        opad.push(b ^ 92);
+        i = i + 1;
+    }
+    i = 0;
+    while i < msg.len() {
+        ipad.push(msg.get(i) & 255);
+        i = i + 1;
+    }
+    val inner: Vec<i64> = webrtc_sha1(ipad);
+    i = 0;
+    while i < inner.len() {
+        opad.push(inner.get(i));
+        i = i + 1;
+    }
+    return webrtc_sha1(opad);
+}
+
+/// CRC-32 (ISO-HDLC, the zlib one).
+pub fn webrtc_crc32(b: Vec<i64>) -> i64 {
+    var crc: i64 = 4294967295;
+    var i: i64 = 0;
+    while i < b.len() {
+        crc = crc ^ (b.get(i) & 255);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 3988292384;
+            } else {
+                crc = crc >> 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc ^ 4294967295;
+}
+
+// ─── STUN ─────────────────────────────────────────────────────────────────
+
+pub const STUN_BINDING: i64 = 1;
+pub const STUN_REQUEST: i64 = 0;
+pub const STUN_INDICATION: i64 = 1;
+pub const STUN_SUCCESS: i64 = 2;
+pub const STUN_ERROR: i64 = 3;
+pub const STUN_MAGIC: i64 = 554869826;
+
+pub const STUN_MAPPED_ADDRESS: i64 = 1;
+pub const STUN_USERNAME: i64 = 6;
+pub const STUN_MESSAGE_INTEGRITY: i64 = 8;
+pub const STUN_ERROR_CODE: i64 = 9;
+pub const STUN_XOR_MAPPED_ADDRESS: i64 = 32;
+pub const STUN_PRIORITY: i64 = 36;
+pub const STUN_USE_CANDIDATE: i64 = 37;
+pub const STUN_SOFTWARE: i64 = 32802;
+pub const STUN_FINGERPRINT: i64 = 32808;
+pub const STUN_ICE_CONTROLLED: i64 = 32809;
+pub const STUN_ICE_CONTROLLING: i64 = 32810;
+
+/// The 14-bit message type of a method and class.
+pub fn stun_type(method: i64, class: i64) -> i64 {
+    return (method & 15) | ((method & 112) << 1) | ((method & 3968) << 2) | ((class & 1) << 4) | ((class & 2) << 7);
+}
+
+pub fn stun_class(mtype: i64) -> i64 {
+    return ((mtype >> 4) & 1) | ((mtype >> 7) & 2);
+}
+
+pub fn stun_method(mtype: i64) -> i64 {
+    return (mtype & 15) | ((mtype >> 1) & 112) | ((mtype >> 2) & 3968);
+}
+
+/// A message: type, transaction id (12 bytes) and attributes in order.
+/// After stun_decode: integrity_at / fingerprint_at are the byte offsets
+/// of those attributes (-1 when absent).
+pub struct StunMsg {
+    pub ok: bool,
+    pub error: str,
+    pub mtype: i64,
+    pub txid: Vec<i64>,
+    pub types: Vec<i64>,
+    pub vals: Vec<Vec<i64>>,
+    pub integrity_at: i64,
+    pub fingerprint_at: i64,
+    pub pad: i64,
+}
+
+pub fn stun_new(method: i64, class: i64, txid: Vec<i64>) -> StunMsg {
+    return StunMsg { ok: true, error: "", mtype: stun_type(method, class), txid: txid, types: Vec::new(), vals: Vec::new(), integrity_at: 0 - 1, fingerprint_at: 0 - 1, pad: 0 };
+}
+
+pub fn stun_add_attr(m: & mut StunMsg, t: i64, v: Vec<i64>) {
+    m.types.push(t);
+    m.vals.push(v);
+}
+
+fn wr_be(v: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = n - 1;
+    while i >= 0 {
+        out.push((v >> (i * 8)) & 255);
+        i = i - 1;
+    }
+    return out;
+}
+
+pub fn stun_add_username(m: & mut StunMsg, user: str) {
+    stun_add_attr(m, STUN_USERNAME, str_bytes(user));
+}
+
+pub fn stun_add_software(m: & mut StunMsg, name: str) {
+    stun_add_attr(m, STUN_SOFTWARE, str_bytes(name));
+}
+
+pub fn stun_add_priority(m: & mut StunMsg, prio: i64) {
+    stun_add_attr(m, STUN_PRIORITY, wr_be(prio, 4));
+}
+
+pub fn stun_add_use_candidate(m: & mut StunMsg) {
+    var e: Vec<i64> = Vec::new();
+    stun_add_attr(m, STUN_USE_CANDIDATE, e);
+}
+
+/// ICE-CONTROLLING (controlling true) or ICE-CONTROLLED with a tiebreaker
+/// given as 8 bytes.
+pub fn stun_add_ice_role(m: & mut StunMsg, controlling: bool, tiebreaker: Vec<i64>) {
+    if controlling {
+        stun_add_attr(m, STUN_ICE_CONTROLLING, tiebreaker);
+    } else {
+        stun_add_attr(m, STUN_ICE_CONTROLLED, tiebreaker);
+    }
+}
+
+pub fn stun_add_error(m: & mut StunMsg, code: i64, reason: str) {
+    var v: Vec<i64> = Vec::new();
+    v.push(0);
+    v.push(0);
+    v.push(code / 100);
+    v.push(code % 100);
+    val r: Vec<i64> = str_bytes(reason);
+    var i: i64 = 0;
+    while i < r.len() {
+        v.push(r.get(i));
+        i = i + 1;
+    }
+    stun_add_attr(m, STUN_ERROR_CODE, v);
+}
+
+/// IPv4 "a.b.c.d" or IPv6 text to bytes (empty when not an address).
+pub fn webrtc_ip_bytes(ip: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if !str_contains(ip, ":") {
+        val p: Vec<str> = str_split(ip, ".");
+        if p.len() != 4 {
+            return out;
+        }
+        var i: i64 = 0;
+        while i < 4 {
+            out.push(str_parse_int(p.get(i)) & 255);
+            i = i + 1;
+        }
+        return out;
+    }
+    // IPv6 with at most one "::"
+    var head: Vec<str> = Vec::new();
+    var tail: Vec<str> = Vec::new();
+    val dc: i64 = str_find(ip, "::");
+    if dc >= 0 {
+        val a: str = str_slice(ip, 0, dc);
+        val b: str = str_slice(ip, dc + 2, str_len(ip));
+        if str_len(a) > 0 { head = str_split(a, ":"); }
+        if str_len(b) > 0 { tail = str_split(b, ":"); }
+    } else {
+        head = str_split(ip, ":");
+    }
+    var groups: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < head.len() {
+        groups.push(wr_hex_group(head.get(i)));
+        i = i + 1;
+    }
+    while groups.len() + tail.len() < 8 {
+        groups.push(0);
+    }
+    i = 0;
+    while i < tail.len() {
+        groups.push(wr_hex_group(tail.get(i)));
+        i = i + 1;
+    }
+    if groups.len() != 8 {
+        var e: Vec<i64> = Vec::new();
+        return e;
+    }
+    i = 0;
+    while i < 8 {
+        out.push((groups.get(i) >> 8) & 255);
+        out.push(groups.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn wr_hex_group(s: str) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        var d: i64 = 0;
+        if c >= 48 && c <= 57 { d = c - 48; }
+        else if c >= 97 && c <= 102 { d = c - 87; }
+        else if c >= 65 && c <= 70 { d = c - 55; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v & 65535;
+}
+
+/// Address bytes as text (IPv6 per RFC 5952: lowercase, longest zero run
+/// of two or more groups as "::").
+pub fn webrtc_ip_text(b: Vec<i64>) -> str {
+    if b.len() == 4 {
+        return int_to_str(b.get(0)) + "." + int_to_str(b.get(1)) + "." + int_to_str(b.get(2)) + "." + int_to_str(b.get(3));
+    }
+    if b.len() != 16 {
+        return "";
+    }
+    var g: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        g.push((b.get(i * 2) << 8) | b.get(i * 2 + 1));
+        i = i + 1;
+    }
+    var best: i64 = 0 - 1;
+    var best_len: i64 = 0;
+    i = 0;
+    while i < 8 {
+        if g.get(i) == 0 {
+            var j: i64 = i;
+            while j < 8 && g.get(j) == 0 {
+                j = j + 1;
+            }
+            if j - i > best_len {
+                best = i;
+                best_len = j - i;
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    if best_len < 2 {
+        best = 0 - 1;
+    }
+    val hx: str = "0123456789abcdef";
+    var out: str = "";
+    i = 0;
+    while i < 8 {
+        if i == best {
+            out = out + "::";
+            i = i + best_len;
+            continue;
+        }
+        if str_len(out) > 0 && !str_ends_with(out, ":") {
+            out = out + ":";
+        }
+        val v: i64 = g.get(i);
+        var s: str = "";
+        var k: i64 = 3;
+        var started: bool = false;
+        while k >= 0 {
+            val d: i64 = (v >> (k * 4)) & 15;
+            if d != 0 || started || k == 0 {
+                s = s + str_slice(hx, d, d + 1);
+                started = true;
+            }
+            k = k - 1;
+        }
+        out = out + s;
+        i = i + 1;
+    }
+    return out;
+}
+
+/// XOR-MAPPED-ADDRESS (xor true) or MAPPED-ADDRESS for an IP and port.
+pub fn stun_add_address(m: & mut StunMsg, xor: bool, ip: str, port: i64) {
+    val ipb: Vec<i64> = webrtc_ip_bytes(ip);
+    var v: Vec<i64> = Vec::new();
+    v.push(0);
+    if ipb.len() == 16 {
+        v.push(2);
+    } else {
+        v.push(1);
+    }
+    var p: i64 = port;
+    if xor {
+        p = port ^ (STUN_MAGIC >> 16);
+    }
+    v.push((p >> 8) & 255);
+    v.push(p & 255);
+    val key: Vec<i64> = wr_xor_key(m.txid);
+    var i: i64 = 0;
+    while i < ipb.len() {
+        if xor {
+            v.push(ipb.get(i) ^ key.get(i));
+        } else {
+            v.push(ipb.get(i));
+        }
+        i = i + 1;
+    }
+    if xor {
+        stun_add_attr(m, STUN_XOR_MAPPED_ADDRESS, v);
+    } else {
+        stun_add_attr(m, STUN_MAPPED_ADDRESS, v);
+    }
+}
+
+// magic cookie then transaction id: what addresses are XORed with
+fn wr_xor_key(txid: Vec<i64>) -> Vec<i64> {
+    var k: Vec<i64> = wr_be(STUN_MAGIC, 4);
+    var i: i64 = 0;
+    while i < 12 {
+        if i < txid.len() {
+            k.push(txid.get(i));
+        } else {
+            k.push(0);
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+fn wr_put(out: & mut Vec<i64>, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+}
+
+fn wr_set16(out: & mut Vec<i64>, at: i64, v: i64) {
+    out.set(at, (v >> 8) & 255);
+    out.set(at + 1, v & 255);
+}
+
+/// Encode: attributes (padded with m.pad bytes), then MESSAGE-INTEGRITY
+/// when `key` is not empty (short-term: the password's bytes), then
+/// FINGERPRINT when asked.
+pub fn stun_encode(m: & StunMsg, key: Vec<i64>, fingerprint: bool) -> Vec<i64> {
+    var out: Vec<i64> = wr_be(m.mtype, 2);
+    out.push(0);
+    out.push(0);
+    wr_put(& mut out, wr_be(STUN_MAGIC, 4));
+    wr_put(& mut out, m.txid);
+    var i: i64 = 0;
+    while i < m.types.len() {
+        val v: Vec<i64> = m.vals.get(i);
+        wr_put(& mut out, wr_be(m.types.get(i), 2));
+        wr_put(& mut out, wr_be(v.len(), 2));
+        wr_put(& mut out, v);
+        while out.len() % 4 != 0 {
+            out.push(m.pad);
+        }
+        i = i + 1;
+    }
+    if key.len() > 0 {
+        wr_set16(& mut out, 2, out.len() - 20 + 24);
+        val mac: Vec<i64> = webrtc_hmac_sha1(key, out);
+        wr_put(& mut out, wr_be(STUN_MESSAGE_INTEGRITY, 2));
+        wr_put(& mut out, wr_be(20, 2));
+        wr_put(& mut out, mac);
+    }
+    if fingerprint {
+        wr_set16(& mut out, 2, out.len() - 20 + 8);
+        val crc: i64 = webrtc_crc32(out) ^ 1398035790;
+        wr_put(& mut out, wr_be(STUN_FINGERPRINT, 2));
+        wr_put(& mut out, wr_be(4, 2));
+        wr_put(& mut out, wr_be(crc, 4));
+    }
+    wr_set16(& mut out, 2, out.len() - 20);
+    return out;
+}
+
+/// Is this datagram STUN (first two bits 0, the magic cookie)?
+pub fn stun_is_stun(b: Vec<i64>) -> bool {
+    return b.len() >= 20 && (b.get(0) & 192) == 0 && b.get(4) == 33 && b.get(5) == 18 && b.get(6) == 164 && b.get(7) == 66;
+}
+
+/// Decode a message; attributes after MESSAGE-INTEGRITY other than
+/// FINGERPRINT are ignored (RFC 5389 15.4).
+pub fn stun_decode(b: Vec<i64>) -> StunMsg {
+    var m: StunMsg = stun_new(0, 0, Vec::new());
+    if !stun_is_stun(b) {
+        m.ok = false;
+        m.error = "not a STUN message";
+        return m;
+    }
+    m.mtype = (b.get(0) << 8) | b.get(1);
+    val len: i64 = (b.get(2) << 8) | b.get(3);
+    if len % 4 != 0 || 20 + len != b.len() {
+        m.ok = false;
+        m.error = "bad length";
+        return m;
+    }
+    var tx: Vec<i64> = Vec::new();
+    var i: i64 = 8;
+    while i < 20 {
+        tx.push(b.get(i));
+        i = i + 1;
+    }
+    m.txid = tx;
+    var at: i64 = 20;
+    while at < b.len() {
+        if at + 4 > b.len() {
+            m.ok = false;
+            m.error = "truncated attribute";
+            return m;
+        }
+        val t: i64 = (b.get(at) << 8) | b.get(at + 1);
+        val n: i64 = (b.get(at + 2) << 8) | b.get(at + 3);
+        if at + 4 + n > b.len() {
+            m.ok = false;
+            m.error = "attribute runs past the end";
+            return m;
+        }
+        var v: Vec<i64> = Vec::new();
+        var k: i64 = 0;
+        while k < n {
+            v.push(b.get(at + 4 + k));
+            k = k + 1;
+        }
+        if t == STUN_FINGERPRINT {
+            m.fingerprint_at = at;
+        } else if m.integrity_at < 0 {
+            if t == STUN_MESSAGE_INTEGRITY {
+                m.integrity_at = at;
+            }
+            m.types.push(t);
+            m.vals.push(v);
+        }
+        at = at + 4 + ((n + 3) / 4) * 4;
+    }
+    return m;
+}
+
+/// The value of attribute t (empty when absent).
+pub fn stun_attr(m: & StunMsg, t: i64) -> Vec<i64> {
+    var i: i64 = 0;
+    while i < m.types.len() {
+        if m.types.get(i) == t {
+            return m.vals.get(i);
+        }
+        i = i + 1;
+    }
+    var e: Vec<i64> = Vec::new();
+    return e;
+}
+
+pub fn stun_has_attr(m: & StunMsg, t: i64) -> bool {
+    var i: i64 = 0;
+    while i < m.types.len() {
+        if m.types.get(i) == t {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// "ip:port" ("[ip]:port" for IPv6) of (XOR-)MAPPED-ADDRESS; "" if none.
+pub fn stun_mapped_address(m: & StunMsg) -> str {
+    var xor: bool = true;
+    var v: Vec<i64> = stun_attr(m, STUN_XOR_MAPPED_ADDRESS);
+    if v.len() == 0 {
+        xor = false;
+        v = stun_attr(m, STUN_MAPPED_ADDRESS);
+    }
+    if v.len() < 8 {
+        return "";
+    }
+    var port: i64 = (v.get(2) << 8) | v.get(3);
+    val key: Vec<i64> = wr_xor_key(m.txid);
+    var n: i64 = 4;
+    if v.get(1) == 2 {
+        n = 16;
+    }
+    if v.len() < 4 + n {
+        return "";
+    }
+    var ip: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        if xor {
+            ip.push(v.get(4 + i) ^ key.get(i));
+        } else {
+            ip.push(v.get(4 + i));
+        }
+        i = i + 1;
+    }
+    if xor {
+        port = port ^ (STUN_MAGIC >> 16);
+    }
+    if n == 16 {
+        return "[" + webrtc_ip_text(ip) + "]:" + int_to_str(port);
+    }
+    return webrtc_ip_text(ip) + ":" + int_to_str(port);
+}
+
+/// ERROR-CODE as "code reason" ("" if none).
+pub fn stun_error(m: & StunMsg) -> str {
+    val v: Vec<i64> = stun_attr(m, STUN_ERROR_CODE);
+    if v.len() < 4 {
+        return "";
+    }
+    var r: Vec<i64> = Vec::new();
+    var i: i64 = 4;
+    while i < v.len() {
+        r.push(v.get(i));
+        i = i + 1;
+    }
+    return int_to_str((v.get(2) & 7) * 100 + v.get(3)) + " " + str_from_bytes(r);
+}
+
+/// Check MESSAGE-INTEGRITY of the raw message `b` with `key`.
+pub fn stun_check_integrity(b: Vec<i64>, key: Vec<i64>) -> bool {
+    val m: StunMsg = stun_decode(b);
+    if !m.ok || m.integrity_at < 0 {
+        return false;
+    }
+    var head: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < m.integrity_at {
+        head.push(b.get(i));
+        i = i + 1;
+    }
+    wr_set16(& mut head, 2, m.integrity_at - 20 + 24);
+    val mac: Vec<i64> = webrtc_hmac_sha1(key, head);
+    i = 0;
+    var diff: i64 = 0;
+    while i < 20 {
+        diff = diff | (mac.get(i) ^ b.get(m.integrity_at + 4 + i));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+/// Check FINGERPRINT (it must be the last attribute).
+pub fn stun_check_fingerprint(b: Vec<i64>) -> bool {
+    val m: StunMsg = stun_decode(b);
+    if !m.ok || m.fingerprint_at < 0 || m.fingerprint_at + 8 != b.len() {
+        return false;
+    }
+    var head: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < m.fingerprint_at {
+        head.push(b.get(i));
+        i = i + 1;
+    }
+    val want: i64 = webrtc_crc32(head) ^ 1398035790;
+    val got: i64 = (b.get(b.len() - 4) << 24) | (b.get(b.len() - 3) << 16) | (b.get(b.len() - 2) << 8) | b.get(b.len() - 1);
+    return want == got;
+}
+
+/// A Binding success response to request `req`, from `ip`:`port`, with
+/// integrity under `key` and a fingerprint (what an ICE agent answers).
+pub fn stun_binding_response(req: & StunMsg, ip: str, port: i64, key: Vec<i64>) -> Vec<i64> {
+    var r: StunMsg = stun_new(STUN_BINDING, STUN_SUCCESS, req.txid);
+    stun_add_address(& mut r, true, ip, port);
+    return stun_encode(& r, key, true);
+}
+
+// ─── Peer connection: ICE checks, DTLS, SRTP ──────────────────────────────
+
+pub const WEBRTC_NEW: i64 = 0;
+pub const WEBRTC_CHECKING: i64 = 1;
+pub const WEBRTC_CONNECTED: i64 = 2;
+pub const WEBRTC_FAILED: i64 = 3;
+pub const WEBRTC_CLOSED: i64 = 4;
+
+const WR_WAITING: i64 = 0;
+const WR_IN_PROGRESS: i64 = 1;
+const WR_SUCCEEDED: i64 = 2;
+const WR_PAIR_FAILED: i64 = 3;
+const WR_TA: i64 = 50;
+const WR_RTO: i64 = 500;
+const WR_MAX_TRIES: i64 = 7;
+
+/// One endpoint: certificate and P-256 key (PEM), ICE credentials, the
+/// host address it receives on, its codecs ("111 opus/48000/2", in
+/// preference order), entropy, the DTLS MTU and how long ICE may take.
+pub struct WebrtcConfig {
+    pub cert_pem: str,
+    pub key_pem: str,
+    pub ufrag: str,
+    pub pwd: str,
+    pub ip: str,
+    pub port: i64,
+    pub codecs: Vec<str>,
+    pub seed: Vec<i64>,
+    pub mtu: i64,
+    pub ice_timeout_ms: i64,
+}
+
+/// A datagram to send to ip:port (from our host address).
+pub struct WebrtcDatagram {
+    pub ip: str,
+    pub port: i64,
+    pub data: Vec<i64>,
+}
+
+/// A peer connection. `history` lists the states it went through
+/// ("new > checking > connected").
+pub struct WebrtcPeer {
+    pub cfg: WebrtcConfig,
+    pub state: i64,
+    pub ice_state: i64,
+    pub history: str,
+    pub err: str,
+    pub offerer: bool,
+    pub has_remote: bool,
+    pub fingerprint: str,
+    pub remote_sdp: str,
+    pub remote_ufrag: str,
+    pub remote_pwd: str,
+    pub remote_fingerprint: str,
+    pub dtls_client: bool,
+    pub locals: Vec<IceCandidate>,
+    pub remotes: Vec<IceCandidate>,
+    pub pairs: Vec<IcePair>,
+    pub p_state: Vec<i64>,
+    pub p_tries: Vec<i64>,
+    pub p_next: Vec<i64>,
+    pub p_rto: Vec<i64>,
+    pub p_nominated: Vec<i64>,
+    pub p_txid: Vec<Vec<i64>>,
+    pub selected: i64,
+    pub tiebreaker: Vec<i64>,
+    pub rng_key: Vec<i64>,
+    pub rng_ctr: i64,
+    pub started_at: i64,
+    pub next_check: i64,
+    pub now: i64,
+    pub dtls: DtlsConn,
+    pub dtls_started: bool,
+    pub dtls_ip: str,
+    pub dtls_port: i64,
+    pub media: bool,
+    pub srtp_tx: SrtpContext,
+    pub srtp_rx: SrtpContext,
+    pub out: Vec<WebrtcDatagram>,
+    pub rtp_in: Vec<Vec<i64>>,
+    pub rtcp_in: Vec<Vec<i64>>,
+    pub checks_sent: i64,
+    pub srtp_dropped: i64,
+}
+
+pub fn webrtc_state_name(s: i64) -> str {
+    if s == WEBRTC_NEW { return "new"; }
+    if s == WEBRTC_CHECKING { return "checking"; }
+    if s == WEBRTC_CONNECTED { return "connected"; }
+    if s == WEBRTC_FAILED { return "failed"; }
+    return "closed";
+}
+
+/// A configuration with Opus and PCMU, a 1200-byte MTU, a 30 s ICE
+/// limit and a seed from the OS generator.
+pub fn webrtc_config(cert_pem: str, key_pem: str, ufrag: str, pwd: str, ip: str, port: i64) -> WebrtcConfig {
+    var codecs: Vec<str> = Vec::new();
+    codecs.push("111 opus/48000/2");
+    codecs.push("0 PCMU/8000");
+    return WebrtcConfig { cert_pem: cert_pem, key_pem: key_pem, ufrag: ufrag, pwd: pwd, ip: ip, port: port, codecs: codecs, seed: crypto_random_bytes(32), mtu: 1200, ice_timeout_ms: 30000 };
+}
+
+fn wr_rand(p: & mut WebrtcPeer, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    while out.len() < n {
+        val blk: Vec<i64> = kdf_hmac(KDF_SHA256, p.rng_key, wr_be(p.rng_ctr, 8));
+        p.rng_ctr = p.rng_ctr + 1;
+        var i: i64 = 0;
+        while i < blk.len() && out.len() < n {
+            out.push(blk.get(i));
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn wr_be_value(b: Vec<i64>) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        v = v * 256 + (b.get(i) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn wr_bytes_hex(b: Vec<i64>) -> str {
+    val hx: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        val hi: i64 = (b.get(i) >> 4) & 15;
+        val lo: i64 = b.get(i) & 15;
+        out = out + str_slice(hx, hi, hi + 1) + str_slice(hx, lo, lo + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn wr_placeholder_srtp() -> SrtpContext {
+    var none: Vec<i64> = Vec::new();
+    return srtp_context_session(0, none, none, none, none, none, none);
+}
+
+/// A peer connection; `offerer` true makes it the side that offers (and
+/// the ICE controlling agent).
+pub fn webrtc_peer_new(cfg: WebrtcConfig, offerer: bool) -> WebrtcPeer {
+    val dcfg: DtlsConfig = dtls_config(true, cfg.cert_pem, cfg.key_pem, "");
+    var fp: str = "";
+    if dcfg.cert_der.len() > 0 {
+        fp = dtls_fingerprint(dcfg.cert_der);
+    }
+    val rk: Vec<i64> = kdf_hmac(KDF_SHA256, cfg.seed, str_bytes("fides webrtc"));
+    val host: IceCandidate = IceCandidate { ok: true, foundation: "1", component: 1, transport: "udp", priority: ice_priority(126, 65535, 1), address: cfg.ip, port: cfg.port, typ: "host", raddr: "", rport: 0 - 1, tcptype: "", ext: "" };
+    var locals: Vec<IceCandidate> = Vec::new();
+    locals.push(host);
+    var p: WebrtcPeer = WebrtcPeer {
+        cfg: cfg, state: WEBRTC_NEW, ice_state: WEBRTC_NEW, history: "new", err: "", offerer: offerer, has_remote: false,
+        fingerprint: fp, remote_sdp: "", remote_ufrag: "", remote_pwd: "", remote_fingerprint: "", dtls_client: false,
+        locals: locals, remotes: Vec::new(), pairs: Vec::new(),
+        p_state: Vec::new(), p_tries: Vec::new(), p_next: Vec::new(), p_rto: Vec::new(), p_nominated: Vec::new(), p_txid: Vec::new(),
+        selected: 0 - 1, tiebreaker: Vec::new(), rng_key: rk, rng_ctr: 0, started_at: 0 - 1, next_check: 0, now: 0,
+        dtls: dtls_new(dcfg), dtls_started: false, dtls_ip: "", dtls_port: 0,
+        media: false, srtp_tx: wr_placeholder_srtp(), srtp_rx: wr_placeholder_srtp(),
+        out: Vec::new(), rtp_in: Vec::new(), rtcp_in: Vec::new(), checks_sent: 0, srtp_dropped: 0
+    };
+    p.tiebreaker = wr_rand(& mut p, 8);
+    if str_len(fp) == 0 || p.dtls.state == DTLS_FAILED {
+        wr_peer_fail(& mut p, "no certificate or P-256 key");
+    }
+    return p;
+}
+
+fn wr_peer_fail(p: & mut WebrtcPeer, why: str) {
+    if p.state != WEBRTC_FAILED {
+        p.state = WEBRTC_FAILED;
+        p.err = why;
+        p.history = p.history + " > failed";
+    }
+}
+
+// a candidate as an a=candidate value (no "candidate:" prefix)
+fn wr_candidate_value(c: IceCandidate) -> str {
+    val s: str = ice_candidate_to_str(& c);
+    return str_slice(s, 10, str_len(s));
+}
+
+/// The offer: one bundled audio section (UDP/TLS/RTP/SAVPF, rtcp-mux)
+/// with our codecs, ICE credentials, host candidate, fingerprint and
+/// a=setup:actpass.
+pub fn webrtc_peer_offer(p: & mut WebrtcPeer) -> str {
+    var s: Sdp = sdp_new("- " + int_to_str(wr_be_value(wr_rand(p, 6))) + " 2 IN IP4 127.0.0.1");
+    s.names.push("group");
+    s.vals.push("BUNDLE 0");
+    s.names.push("msid-semantic");
+    s.vals.push(" WMS");
+    var m: SdpMedia = wr_media_new("audio", 9, "UDP/TLS/RTP/SAVPF");
+    m.conn = "IN IP4 0.0.0.0";
+    var nm: Vec<str> = Vec::new();
+    var nv: Vec<str> = Vec::new();
+    nm.push("ice-ufrag");
+    nv.push(p.cfg.ufrag);
+    nm.push("ice-pwd");
+    nv.push(p.cfg.pwd);
+    nm.push("fingerprint");
+    nv.push(p.fingerprint);
+    nm.push("setup");
+    nv.push("actpass");
+    nm.push("mid");
+    nv.push("0");
+    nm.push("sendrecv");
+    nv.push("");
+    nm.push("rtcp-mux");
+    nv.push("");
+    var fmts: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < p.cfg.codecs.len() {
+        val cdc: str = p.cfg.codecs.get(i);
+        val sp: i64 = str_find(cdc, " ");
+        if sp > 0 {
+            fmts.push(str_slice(cdc, 0, sp));
+            nm.push("rtpmap");
+            nv.push(cdc);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.locals.len() {
+        nm.push("candidate");
+        nv.push(wr_candidate_value(p.locals.get(i)));
+        i = i + 1;
+    }
+    m.fmts = fmts;
+    m.names = nm;
+    m.vals = nv;
+    s.media.push(m);
+    return sdp_to_str(& s);
+}
+
+/// The answer to the offer given with webrtc_peer_set_remote: sdp_answer
+/// with our codecs, credentials and fingerprint, plus our candidates.
+pub fn webrtc_peer_answer(p: & mut WebrtcPeer) -> str {
+    val offer: Sdp = sdp_parse(p.remote_sdp);
+    var names: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < p.cfg.codecs.len() {
+        val cdc: str = p.cfg.codecs.get(i);
+        val sp: i64 = str_find(cdc, " ");
+        names.push(wr_codec_name(str_slice(cdc, sp + 1, str_len(cdc))));
+        i = i + 1;
+    }
+    val origin: str = "- " + int_to_str(wr_be_value(wr_rand(p, 6))) + " 2 IN IP4 127.0.0.1";
+    val cfg: SdpAnswerConfig = SdpAnswerConfig { origin: origin, ufrag: p.cfg.ufrag, pwd: p.cfg.pwd, fingerprint: p.fingerprint, codecs: names, data_channels: false };
+    var a: Sdp = sdp_answer(& offer, cfg);
+    var media: Vec<SdpMedia> = Vec::new();
+    i = 0;
+    while i < a.media.len() {
+        var m: SdpMedia = a.media.get(i);
+        if m.port != 0 {
+            var k: i64 = 0;
+            while k < p.locals.len() {
+                m.names.push("candidate");
+                m.vals.push(wr_candidate_value(p.locals.get(k)));
+                k = k + 1;
+            }
+        }
+        media.push(m);
+        i = i + 1;
+    }
+    a.media = media;
+    return sdp_to_str(& a);
+}
+
+/// Take the other side's offer (answerer) or answer (offerer): ICE
+/// credentials, candidates, fingerprint and DTLS role of the first media
+/// section; candidate pairs are formed. False (and failed) when the SDP
+/// is unusable.
+pub fn webrtc_peer_set_remote(p: & mut WebrtcPeer, text: str) -> bool {
+    val s: Sdp = sdp_parse(text);
+    if !s.ok || s.media.len() == 0 {
+        wr_peer_fail(p, "bad remote description: " + s.error);
+        return false;
+    }
+    val m: SdpMedia = s.media.get(0);
+    if m.port == 0 {
+        wr_peer_fail(p, "remote side rejected the media section");
+        return false;
+    }
+    p.remote_ufrag = sdp_ice_ufrag(& s, & m);
+    p.remote_pwd = sdp_ice_pwd(& s, & m);
+    p.remote_fingerprint = sdp_fingerprint(& s, & m);
+    if str_len(p.remote_ufrag) == 0 || str_len(p.remote_pwd) == 0 || !str_starts_with(str_to_lower(p.remote_fingerprint), "sha-256 ") {
+        wr_peer_fail(p, "remote description lacks ICE credentials or a sha-256 fingerprint");
+        return false;
+    }
+    var setup: str = sdp_attr(m.names, m.vals, "setup");
+    if str_len(setup) == 0 {
+        setup = sdp_attr(s.names, s.vals, "setup");
+    }
+    if p.offerer {
+        // the answer chose: active means it is the DTLS client
+        p.dtls_client = setup == "passive";
+    } else {
+        // our answer says active unless the offer is active (sdp_answer)
+        p.dtls_client = setup != "active";
+    }
+    val cands: Vec<str> = sdp_attrs(m.names, m.vals, "candidate");
+    var i: i64 = 0;
+    while i < cands.len() {
+        val c: IceCandidate = ice_parse_candidate(cands.get(i));
+        if c.ok && c.component == 1 && c.transport == "udp" {
+            p.remotes.push(c);
+        }
+        i = i + 1;
+    }
+    var dcfg: DtlsConfig = dtls_config(!p.dtls_client, p.cfg.cert_pem, p.cfg.key_pem, p.remote_fingerprint);
+    dcfg.mtu = p.cfg.mtu;
+    dcfg.seed = wr_rand(p, 32);
+    dcfg.cookie_secret = wr_rand(p, 32);
+    p.dtls = dtls_new(dcfg);
+    p.pairs = ice_pairs(p.locals, p.remotes, p.offerer);
+    i = 0;
+    while i < p.pairs.len() {
+        p.p_state.push(WR_WAITING);
+        p.p_tries.push(0);
+        p.p_next.push(0);
+        p.p_rto.push(WR_RTO);
+        p.p_nominated.push(0);
+        val tx: Vec<i64> = wr_rand(p, 12);
+        p.p_txid.push(tx);
+        i = i + 1;
+    }
+    p.remote_sdp = text;
+    p.has_remote = true;
+    return true;
+}
+
+fn wr_emit(p: & mut WebrtcPeer, ip: str, port: i64, data: Vec<i64>) {
+    p.out.push(WebrtcDatagram { ip: ip, port: port, data: data });
+}
+
+/// Datagrams to send, in order; the queue is emptied.
+pub fn webrtc_peer_drain(p: & mut WebrtcPeer) -> Vec<WebrtcDatagram> {
+    val o: Vec<WebrtcDatagram> = p.out;
+    p.out = Vec::new();
+    return o;
+}
+
+fn wr_send_check(p: & mut WebrtcPeer, k: i64) {
+    val pr: IcePair = p.pairs.get(k);
+    val r: IceCandidate = p.remotes.get(pr.remote);
+    var m: StunMsg = stun_new(STUN_BINDING, STUN_REQUEST, p.p_txid.get(k));
+    stun_add_username(& mut m, p.remote_ufrag + ":" + p.cfg.ufrag);
+    stun_add_priority(& mut m, ice_priority(110, 65535, 1));
+    stun_add_ice_role(& mut m, p.offerer, p.tiebreaker);
+    if p.offerer {
+        stun_add_use_candidate(& mut m);
+    }
+    val bytes: Vec<i64> = stun_encode(& m, str_bytes(p.remote_pwd), true);
+    wr_emit(p, r.address, r.port, bytes);
+    p.checks_sent = p.checks_sent + 1;
+}
+
+fn wr_start_check(p: & mut WebrtcPeer, k: i64) {
+    p.p_state.set(k, WR_IN_PROGRESS);
+    p.p_tries.set(k, 1);
+    p.p_rto.set(k, WR_RTO);
+    p.p_next.set(k, p.now + WR_RTO);
+    wr_send_check(p, k);
+}
+
+fn wr_pair_from(p: & WebrtcPeer, ip: str, port: i64) -> i64 {
+    var k: i64 = 0;
+    while k < p.pairs.len() {
+        val pr: IcePair = p.pairs.get(k);
+        val r: IceCandidate = p.remotes.get(pr.remote);
+        if r.address == ip && r.port == port {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+fn wr_flush_dtls(p: & mut WebrtcPeer) {
+    val dgs: Vec<Vec<i64>> = dtls_drain(& mut p.dtls);
+    val ip: str = p.dtls_ip;
+    val port: i64 = p.dtls_port;
+    var i: i64 = 0;
+    while i < dgs.len() {
+        wr_emit(p, ip, port, dgs.get(i));
+        i = i + 1;
+    }
+}
+
+fn wr_start_dtls(p: & mut WebrtcPeer, ip: str, port: i64) {
+    p.dtls_ip = ip;
+    p.dtls_port = port;
+    p.dtls_started = true;
+    val now: i64 = p.now;
+    dtls_start(& mut p.dtls, now);
+    wr_flush_dtls(p);
+}
+
+fn wr_select(p: & mut WebrtcPeer, k: i64) {
+    if p.selected >= 0 {
+        return;
+    }
+    p.selected = k;
+    p.ice_state = WEBRTC_CONNECTED;
+    val pr: IcePair = p.pairs.get(k);
+    val r: IceCandidate = p.remotes.get(pr.remote);
+    if !p.dtls_started {
+        wr_start_dtls(p, r.address, r.port);
+    }
+}
+
+fn wr_on_stun(p: & mut WebrtcPeer, ip: str, port: i64, b: Vec<i64>) {
+    val m: StunMsg = stun_decode(b);
+    if !m.ok || stun_method(m.mtype) != STUN_BINDING {
+        return;
+    }
+    val cls: i64 = stun_class(m.mtype);
+    if cls == STUN_REQUEST {
+        if !stun_check_fingerprint(b) {
+            return;
+        }
+        val user: str = str_from_bytes(stun_attr(& m, STUN_USERNAME));
+        if !stun_check_integrity(b, str_bytes(p.cfg.pwd)) || !str_starts_with(user, p.cfg.ufrag + ":") {
+            var e: StunMsg = stun_new(STUN_BINDING, STUN_ERROR, m.txid);
+            stun_add_error(& mut e, 401, "Unauthorized");
+            var nokey: Vec<i64> = Vec::new();
+            wr_emit(p, ip, port, stun_encode(& e, nokey, true));
+            return;
+        }
+        wr_emit(p, ip, port, stun_binding_response(& m, ip, port, str_bytes(p.cfg.pwd)));
+        val k: i64 = wr_pair_from(p, ip, port);
+        if k < 0 || p.ice_state == WEBRTC_FAILED {
+            return;
+        }
+        if !p.offerer && stun_has_attr(& m, STUN_USE_CANDIDATE) {
+            p.p_nominated.set(k, 1);
+        }
+        val ps: i64 = p.p_state.get(k);
+        if p.selected < 0 && (ps == WR_WAITING || ps == WR_PAIR_FAILED) {
+            // triggered check (RFC 8445 §7.3.1.4)
+            wr_start_check(p, k);
+        }
+        if p.selected < 0 && p.p_nominated.get(k) == 1 && p.p_state.get(k) == WR_SUCCEEDED {
+            wr_select(p, k);
+        }
+        return;
+    }
+    // a response: find the check by transaction id
+    val want: str = wr_bytes_hex(m.txid);
+    var k: i64 = 0;
+    while k < p.pairs.len() && wr_bytes_hex(p.p_txid.get(k)) != want {
+        k = k + 1;
+    }
+    if k == p.pairs.len() || p.p_state.get(k) != WR_IN_PROGRESS {
+        return;
+    }
+    val pr: IcePair = p.pairs.get(k);
+    val r: IceCandidate = p.remotes.get(pr.remote);
+    if r.address != ip || r.port != port {
+        return;
+    }
+    if cls == STUN_SUCCESS {
+        if !stun_check_integrity(b, str_bytes(p.remote_pwd)) {
+            return;
+        }
+        p.p_state.set(k, WR_SUCCEEDED);
+        if p.offerer || p.p_nominated.get(k) == 1 {
+            wr_select(p, k);
+        }
+    } else if cls == STUN_ERROR {
+        p.p_state.set(k, WR_PAIR_FAILED);
+    }
+}
+
+// the overall state from ICE, DTLS and SRTP
+fn wr_update(p: & mut WebrtcPeer) {
+    if p.state == WEBRTC_FAILED || p.state == WEBRTC_CLOSED {
+        return;
+    }
+    if p.ice_state == WEBRTC_FAILED {
+        wr_peer_fail(p, "ICE failed: no candidate pair answered");
+        return;
+    }
+    if p.dtls_started && p.dtls.state == DTLS_FAILED {
+        wr_peer_fail(p, "DTLS: " + p.dtls.err);
+        return;
+    }
+    var ns: i64 = p.state;
+    if p.dtls_started && p.dtls.state == DTLS_CLOSED {
+        ns = WEBRTC_CLOSED;
+    } else if p.selected >= 0 && p.dtls.state == DTLS_CONNECTED {
+        if !p.media {
+            val k: DtlsSrtpKeys = dtls_srtp_keys(& p.dtls);
+            if !k.ok {
+                wr_peer_fail(p, "no SRTP profile negotiated");
+                return;
+            }
+            if p.dtls_client {
+                p.srtp_tx = srtp_context_new(k.profile, k.client_key, k.client_salt);
+                p.srtp_rx = srtp_context_new(k.profile, k.server_key, k.server_salt);
+            } else {
+                p.srtp_tx = srtp_context_new(k.profile, k.server_key, k.server_salt);
+                p.srtp_rx = srtp_context_new(k.profile, k.client_key, k.client_salt);
+            }
+            p.media = true;
+        }
+        ns = WEBRTC_CONNECTED;
+    } else if p.started_at >= 0 {
+        ns = WEBRTC_CHECKING;
+    }
+    if ns != p.state {
+        p.state = ns;
+        p.history = p.history + " > " + webrtc_state_name(ns);
+    }
+}
+
+/// Run timers at `now` (milliseconds): paced and retransmitted ICE checks,
+/// the ICE time limit, DTLS retransmission.
+pub fn webrtc_peer_poll(p: & mut WebrtcPeer, now: i64) {
+    p.now = now;
+    if p.state == WEBRTC_FAILED || p.state == WEBRTC_CLOSED || !p.has_remote {
+        return;
+    }
+    if p.started_at < 0 {
+        p.started_at = now;
+        p.ice_state = WEBRTC_CHECKING;
+    }
+    if p.selected < 0 && p.ice_state != WEBRTC_FAILED {
+        // one new check per Ta, highest priority waiting pair first
+        if now >= p.next_check {
+            var w: i64 = 0;
+            while w < p.pairs.len() && p.p_state.get(w) != WR_WAITING {
+                w = w + 1;
+            }
+            if w < p.pairs.len() {
+                wr_start_check(p, w);
+                p.next_check = now + WR_TA;
+            }
+        }
+        var all_failed: bool = true;
+        var k: i64 = 0;
+        while k < p.pairs.len() {
+            if p.p_state.get(k) == WR_IN_PROGRESS && now >= p.p_next.get(k) {
+                if p.p_tries.get(k) >= WR_MAX_TRIES {
+                    p.p_state.set(k, WR_PAIR_FAILED);
+                } else {
+                    p.p_tries.set(k, p.p_tries.get(k) + 1);
+                    var rto: i64 = p.p_rto.get(k) * 2;
+                    if rto > 4000 {
+                        rto = 4000;
+                    }
+                    p.p_rto.set(k, rto);
+                    p.p_next.set(k, now + rto);
+                    wr_send_check(p, k);
+                }
+            }
+            if p.p_state.get(k) != WR_PAIR_FAILED {
+                all_failed = false;
+            }
+            k = k + 1;
+        }
+        if all_failed || now - p.started_at > p.cfg.ice_timeout_ms {
+            p.ice_state = WEBRTC_FAILED;
+        }
+    }
+    if p.dtls_started {
+        dtls_poll(& mut p.dtls, now);
+        wr_flush_dtls(p);
+    }
+    wr_update(p);
+}
+
+/// A datagram from ip:port: STUN, DTLS or SRTP/SRTCP by its first byte
+/// (RFC 7983).
+pub fn webrtc_peer_receive(p: & mut WebrtcPeer, ip: str, port: i64, data: Vec<i64>, now: i64) {
+    p.now = now;
+    if data.len() == 0 || p.state == WEBRTC_FAILED || p.state == WEBRTC_CLOSED || !p.has_remote {
+        return;
+    }
+    val b0: i64 = data.get(0);
+    if b0 <= 3 {
+        wr_on_stun(p, ip, port, data);
+    } else if b0 >= 20 && b0 <= 63 {
+        if !p.dtls_started && !p.dtls_client && wr_pair_from(p, ip, port) >= 0 {
+            // the DTLS client was faster than our own check
+            wr_start_dtls(p, ip, port);
+        }
+        if p.dtls_started {
+            if !p.dtls_client {
+                p.dtls_ip = ip;
+                p.dtls_port = port;
+            }
+            dtls_receive(& mut p.dtls, data, now);
+            wr_flush_dtls(p);
+        }
+    } else if b0 >= 128 && b0 <= 191 && p.media {
+        if srtp_is_rtcp(& data) {
+            val r: SrtpResult = srtcp_unprotect(& mut p.srtp_rx, data);
+            if r.ok {
+                p.rtcp_in.push(r.data);
+            } else {
+                p.srtp_dropped = p.srtp_dropped + 1;
+            }
+        } else {
+            val r: SrtpResult = srtp_unprotect(& mut p.srtp_rx, data);
+            if r.ok {
+                p.rtp_in.push(r.data);
+            } else {
+                p.srtp_dropped = p.srtp_dropped + 1;
+            }
+        }
+    }
+    wr_update(p);
+}
+
+/// Protect and send an RTP or RTCP packet; false before connected.
+pub fn webrtc_peer_send_rtp(p: & mut WebrtcPeer, pkt: Vec<i64>) -> bool {
+    if p.state != WEBRTC_CONNECTED || !p.media {
+        return false;
+    }
+    var ok: bool = false;
+    var data: Vec<i64> = Vec::new();
+    if srtp_is_rtcp(& pkt) {
+        val r: SrtpResult = srtcp_protect(& mut p.srtp_tx, pkt);
+        ok = r.ok;
+        data = r.data;
+    } else {
+        val r: SrtpResult = srtp_protect(& mut p.srtp_tx, pkt);
+        ok = r.ok;
+        data = r.data;
+    }
+    if !ok {
+        return false;
+    }
+    val ip: str = p.dtls_ip;
+    val port: i64 = p.dtls_port;
+    wr_emit(p, ip, port, data);
+    return true;
+}
+
+/// RTP packets received (decrypted), in order; the queue is emptied.
+pub fn webrtc_peer_read_rtp(p: & mut WebrtcPeer) -> Vec<Vec<i64>> {
+    val o: Vec<Vec<i64>> = p.rtp_in;
+    p.rtp_in = Vec::new();
+    return o;
+}
+
+/// RTCP packets received (decrypted); the queue is emptied.
+pub fn webrtc_peer_read_rtcp(p: & mut WebrtcPeer) -> Vec<Vec<i64>> {
+    val o: Vec<Vec<i64>> = p.rtcp_in;
+    p.rtcp_in = Vec::new();
+    return o;
+}
+
+/// The selected pair as "local ip:port -> remote ip:port" ("" before).
+pub fn webrtc_peer_selected(p: & WebrtcPeer) -> str {
+    if p.selected < 0 {
+        return "";
+    }
+    val pr: IcePair = p.pairs.get(p.selected);
+    val l: IceCandidate = p.locals.get(pr.local);
+    val r: IceCandidate = p.remotes.get(pr.remote);
+    return l.address + ":" + int_to_str(l.port) + " -> " + r.address + ":" + int_to_str(r.port);
+}
+
+/// Close: DTLS close_notify to the peer, state closed.
+pub fn webrtc_peer_close(p: & mut WebrtcPeer) {
+    if p.dtls_started {
+        dtls_close(& mut p.dtls);
+        wr_flush_dtls(p);
+    }
+    if p.state != WEBRTC_CLOSED {
+        p.state = WEBRTC_CLOSED;
+        p.history = p.history + " > closed";
+    }
+}

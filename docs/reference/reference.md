@@ -65,17 +65,25 @@ with async await comptime defer spawn yield move static try in
 as dyn where region sandbox unsafe txn persist for while
 loop break continue handle do interrupt extern guard is resume true false
 layer model grad backward kernel component system query state on
-i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 bool str void q8 q4
+i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 bool str void
 ```
 
-- `q8` and `q4` are other spellings of `i8`.
+- Only the exact word is a keyword: `i8x`, `u16v`, `f64s` are identifiers.
+- `q8` and `q4` are other spellings of `i8` in a type (`parse_type`), not
+  reserved words: they may also name a variable (`val q4: i64 = 1;`;
+  stdlib-agent-bugs 13, `test_fix_type_word_idents.fd`). The type names
+  above are reserved: `val f32 = 1;` is an error that says so
+  (`test_fix_type_word_name_fail.fd`).
 - `move` and `where` are reserved but no grammar rule uses them.
 - `kernel` is used only as the annotation `@kernel`.
 - The word keywords (all but the type names) may also be used as the name of a
   function, method, parameter, field or local variable (`expect_ident_or_keyword`,
   `token.fd:is_word_keyword`). A keyword that starts a statement (`query`,
   `select`, `region`, `do`, …; `parse_stmt`) still does so there, and one that
-  starts an item does so at the top level (`state`, `system`, `on`, …).
+  starts an item does so at the top level (`state`, `system`, `on`, …). A
+  keyword followed by an assignment operator or `.` at the start of a
+  statement is a variable (`handle.fd = 3;`, `state += 1;`), and `handle`
+  starts a handler only as `handle {`.
 
 Contextual words have a meaning only in one position: `parallel` (statement
 start), `scope` (`spawn scope`, `cancel scope`), `gen` (`comptime gen`), `case`
@@ -99,9 +107,10 @@ A minus sign is never part of a literal; `-1` is negation applied to `1`.
 ### 1.6 Floating-point literals
 
 A float literal is digits, `.`, at least one digit, and an optional exponent
-`e`/`E` with an optional sign: `3.14`, `1.5e-3`, `1_000.25`. A literal with an
-exponent and no fraction (`1e5`) is not a float: it lexes as `1` followed by the
-identifier `e5`. `1.` and `.5` are not floats either.
+`e`/`E` with an optional sign: `3.14`, `1.5e-3`, `1_000.25`. Digits followed
+by an exponent and no fraction (`1e5`, `5e3`, `1E-9`) are also a float
+(known-bugs 2g.18; only when digits follow the `e`). `1.` and `.5` are not
+floats.
 
 ### 1.7 Character literals
 
@@ -112,8 +121,11 @@ character (`read_char_lit`): `val c: i64 = 'A';` gives 65. Escapes: `\n` `\t`
 ### 1.8 String literals
 
 - `"…"`: escapes `\n` `\t` `\r` `\\` `\"` `\0` `\xHH` `\u{H…}`. Any other escape
-  (including `\'`) is a lex error. A string is a C string: `\0`, `\x00` or
-  `\u{0}` ends it, and the rest of the literal is dropped.
+  (including `\'`) is a lex error. `\0`, `\x00` and `\u{0}` are a zero byte
+  of the string, and the rest of the literal is kept: a string carries its
+  length, so `str_len("ab\0cd")` is 5. A builtin that hands the string to the
+  system as text (`p_file_write`, `p_file_append`) stops at the zero byte;
+  `p_file_write_bin` and the byte functions do not.
 - Raw strings `r"…"` and `r#"…"#` (any number of `#`) take their content
   literally; the closing delimiter is `"` followed by the same number of `#`.
 - Format strings `f"…{expr}…"`: text outside braces takes the same escapes as a
@@ -121,7 +133,10 @@ character (`read_char_lit`): `val c: i64 = 'A';` gives 65. Escapes: `\n` `\t`
   expression (`parser.fd:parse_fstring_parts`). The result has type `str`.
   There is no escape for a literal brace, and there are no format specifiers:
   the parser reads one expression from the braces and ignores any tokens after
-  it (`{x:#x}` is `{x}`).
+  it (`{x:#x}` is `{x}`). Each expression is type-checked; it may be text, a
+  number, a bool or a `Vec` — a struct (or a reference to one) is an error,
+  since it has no text form (`TypeChecker_check_fstring_part`;
+  `test_frontend_fstring.fd`, `test_frontend_fstring_struct_fail.fd`).
 - There are no byte-string literals (`b"…"`).
 
 ### 1.9 Operators and punctuation
@@ -156,10 +171,14 @@ fn main() -> i64 {
 ## 2. Items
 
 Source: `parser.fd:parse_top_level_item`. A file is a sequence of items, each
-optionally preceded by `pub`. Items can be in any order, with one exception: a
-struct literal `Name { … }` parses only if the parser already knows `Name` as a
-struct (§4.3), so a struct of the same file must be declared above its first
-literal. Structs and enums of `core` and of imported modules are known before
+optionally preceded by `pub`. Items can be in any order. A struct literal
+`Name { … }` parses when the parser already knows `Name` as a struct (§4.3),
+or, whatever it knows, when `Name` is capitalised and `{` is followed by a
+field name (an identifier or a word keyword) and `:`, or by `..`
+(`pd_field_init_follows`): `Dev { handle: h }` is a literal even when `Dev`
+is declared further down or in a module that is parsed later. An empty
+literal `Name {}` is recognised only for a struct the parser already knows.
+Structs and enums of `core` and of imported modules are known before
 the file is parsed.
 
 ### 2.1 Functions
@@ -194,9 +213,14 @@ effects    = "!" name | "!" "{" [name {"," name}] "}"
 - Default values: `fn add(a: i64, b: i64 = 10)`. A call may leave out trailing
   parameters that have defaults (`TypeChecker_register_program` counts the
   required ones); lowering supplies the default.
-- Named arguments: `add(b: 2, a: 1)`. Lowering puts them in parameter order. A
-  named argument's type is not checked (`TypeChecker_check_expr_inner`,
-  `Expr::NamedArg`).
+- Named arguments: `add(b: 2, a: 1)`. Lowering puts them in parameter order:
+  positional arguments fill the first parameters, a named one the parameter
+  of its name, one left out takes its default. In `fid` a call with named
+  arguments is checked (`TypeChecker_check_named_args`): a name that is no
+  parameter, a parameter given twice, a positional argument after a named
+  one, a parameter without a default left out, and a named argument of the
+  wrong type are errors (`test_frontend_named_args.fd` and three `_fail`
+  tests). Named arguments to methods are not checked.
 - `...name` (variadic) is parsed and ignored: not implemented.
 - `given e` is a precondition. A call whose arguments are constants and make
   `e` false is a compile error (`TypeChecker_verify_contracts`,
@@ -210,7 +234,7 @@ effects    = "!" name | "!" "{" [name {"," name}] "}"
 ### 2.2 Structs
 
 ```
-struct = "struct" Name ["<" T {"," T} ">"] "{" {["pub"] field ":" type [","]} "}"
+struct = "struct" Name ["<" T {"," T} ">"] "{" {["pub"] field ":" type ["=" expr] [","]} "}"
 ```
 
 - A field without `pub` is private to the module that declares the struct:
@@ -222,6 +246,14 @@ struct = "struct" Name ["<" T {"," T} ">"] "{" {["pub"] field ":" type [","]} "}
   left out is not reported. `..base` copies the remaining fields from another
   value of the same struct (`parse_struct_lit_expr`, `test_spread.fd`). There
   is no shorthand `Point { x, y }`.
+- A field may declare a default: `port: i64 = 8080`. A literal ending in a
+  bare `..` (`Config { port: 80, .. }`) gives every field it leaves out its
+  default; a field left out that has none is an error
+  (`TypeChecker_check_struct_defaults`). The default expression is written in
+  at each such literal during monomorphization (`mn_fill_struct_defaults`),
+  so it is evaluated once per literal; it is type-checked against the field.
+  Not in `fidesc`; not in a global's or constant's initializer
+  (`test_frontend_struct_defaults.fd`, `_fail.fd`).
 - Struct values are copied on assignment and when passed by value (§8.1).
 - `==` and `!=` on two structs compare field by field (`test_struct_eq.fd`).
 
@@ -254,8 +286,8 @@ impl = "impl" ["<" T {"," T} ">"] Name ["<" … ">"] "{" {["pub"] function} "}"
 - `impl<T> Slot<T> { … }`: the type parameters after `impl` are in scope in the
   methods. The argument list after the type name is skipped by the parser
   (`parse_impl_or_trait_impl`).
-- Annotations cannot be written on methods: the parser reads `fn` directly, and
-  `@x fn` inside an `impl` block is a parse error. The same holds in trait impls.
+- Annotations may be written before a method of an `impl` block (CU3:
+  `@deprecated(use = "m2") fn m`); in a trait impl `@x fn` is a parse error.
 - A method whose name is `drop` is called for some locals at function exit
   (§8.3).
 
@@ -288,15 +320,34 @@ impl Show for Pt {
   must provide them (`compiler.fd` merges supertrait methods before checking).
 - An impl must provide every method without a default and every associated
   type, and the trait must exist (`TypeChecker_verify_trait_impls`;
-  `test_trait_verify_fail.fd`). Parameter and return types of impl methods are
-  not compared with the trait's.
-- Type parameters on a trait method (`fn m<U>(…)`) are parsed and dropped.
-- The type after `for` is a single name. `impl<T> Show for Slot<T>` is a parse
-  error.
+  `test_trait_verify_fail.fd`). In `fid`, an impl method's parameter count,
+  parameter types and return type are compared with the trait's wherever the
+  trait writes a concrete type (`TypeChecker_check_impl_sig`;
+  `test_trait_sig_fail.fd`).
+- A trait method may be generic (`fn m<U: Show>(self, x: U) -> U`). A call
+  binds the method's type parameters from its arguments, on a value of a
+  concrete type or through a bound `T: Trait`, and is monomorphized per type;
+  bounds on them are checked at the call and usable in the body. An impl's
+  method must declare the same number of type parameters (it may name them
+  differently) and no bound the trait lacks; a default body that an impl
+  does not override keeps its type parameters
+  (`test_trait_generic_method.fd`, `test_trait_generic_method_generic_impl.fd`,
+  `test_trait_generic_default_method.fd`, `test_trait_generic_method_arity_fail.fd`,
+  `test_trait_generic_method_bound_fail.fd`,
+  `test_trait_generic_method_impl_bound_fail.fd`). A generic method cannot be
+  called through `dyn Trait` (it is not object-safe); the trait's other
+  methods still can (`test_trait_generic_method_dyn_fail.fd`).
+- `impl<T> Show for Slot<T>` implements a trait for a generic struct
+  (`test_trait_generic_impl.fd`).
 - `dyn Trait` is a trait-object type; a value is made with `v as dyn Trait`
-  and its methods are dispatched at run time (`test_trait_object.fd`). The type
-  checker treats `dyn T` as compatible with every type
-  (`TypeChecker_types_compatible`).
+  and its methods, defaults included, are dispatched at run time
+  (`test_trait_object.fd`, `test_frontend_dyn_default.fd`). The cast needs
+  the type to implement the trait (`test_dyn_not_impl_fail.fd`). In `fid` a
+  struct, enum, string, bool or number given where a `dyn T` is wanted, or a
+  `dyn T` where one of those is wanted, is a type error: the object exists only
+  where the cast made it (`TypeChecker_dyn_incompatible`;
+  `test_frontend_dyn_coerce_fail.fd`, `test_frontend_dyn_unwrap_fail.fd`).
+  Another `dyn` type and a type parameter stay compatible.
 
 ### 2.6 Constants
 
@@ -314,7 +365,9 @@ constant is an error (`test_const_assign_fail.fd`).
 global = ("var" | "static") name ":" type ["=" expr] [";"]
 ```
 
-`static` is another spelling of `var`. Without an initialiser the global holds
+`static` is another spelling of `var`. There is no top-level `val`: it is a
+parse error that suggests `const` (a fixed value) or `var`
+(`test_fix_top_level_val_fail.fd`). Without an initialiser the global holds
 the zero value of its type (`0`, `0.0`, `""`). An initialiser that is not a
 constant runs before `main` (`Lowerer_lower_program`, `global_inits`;
 `test_global_init.fd`). A global cannot carry an annotation (the parser accepts
@@ -376,7 +429,12 @@ extern "C" include "<math.h>" link "m" {
 - In the program's own module, calling an extern function whose name does not
   start with `p_` needs `unsafe` (`TypeChecker_check_expr_inner`, `Expr::Call`).
 - Only named functions can be passed to a C function expecting a callback
-  (`TypeChecker_check_c_callbacks`; `test_c_callback_closure_fail.fd`).
+  (`TypeChecker_check_c_callbacks`; `test_c_callback_closure_fail.fd`). A
+  closure is refused, its captures named, with the fix: the callback's state
+  goes through the C function's user data pointer, `&mut state as *u8` in
+  the call (the struct's address; parsed `&mut (state as *u8)`), and the
+  callback turns it back with `ctx as *State` (`test_c_callback_user_data.fd`,
+  `test_c_callback_capture_fail.fd`).
 
 ### 2.11 Domain declarations
 
@@ -541,10 +599,22 @@ in use (`parse_expr_iterative` is not called).
 Consequences:
 
 - `&&` binds tighter than `|`, `^`, `&`, `<<` and `>>`. `flags & 1 != 0`
-  parses as `flags & (1 != 0)`; write `(flags & 1) != 0`.
+  parses as `flags & (1 != 0)`; write `(flags & 1) != 0`. Likewise
+  `(x & 255) >> 5 != m` is `(x & 255) >> (5 != m)`, a type error; write
+  `((x & 255) >> 5) != m`. This differs from Rust, where `&` and `>>` bind
+  tighter than `==`; it is the language's rule (stdlib-agent-bugs 7,
+  `test_fix_deref_cast.fd`), so parenthesise a masked or shifted operand.
 - `+` binds tighter than `<<`: `1 << 2 + 1` is `8`.
 - `as` is a postfix operator, so it binds tighter than any prefix or binary
-  operator: `-x as i32` is `-(x as i32)`, `a + b as i64` is `a + (b as i64)`.
+  operator: `-x as i32` is `-(x as i32)`, `a + b as i64` is `a + (b as i64)`,
+  and `*s as f64` is `*(s as f64)` (an error, "cannot dereference
+  non-reference type f64", which says to write `(*s) as f64`;
+  stdlib-agent-bugs 5/41, `test_fix_deref_cast_line_fail.fd`).
+- A call's result can be called on the same line: `pick(1)(5)`,
+  `fs.get(1)(5)`, `(fn(x: i64) -> i64 { return x * x; })(7)`. The parser
+  reads `e(args)` as `{ val __pcall_k = e; __pcall_k(args) }`
+  (`parse_postfix`; `test_fix_call_result_call.fd`). A `(` on the next line
+  starts a new statement.
 - `await e`, `spawn e` and `yield e` take a prefix-level operand:
   `await a + await b` is `(await a) + (await b)`.
 - Assignment is a statement (§5.3), not an operator.
@@ -593,6 +663,8 @@ Consequences:
 ### 4.4 Field access, methods, indexing
 
 - `e.f` reads a field; through a reference it reads the referent's field.
+  A tuple has no `.0`: `p.0` is a parse error that points to destructuring
+  (`val (a, b) = p;`, §5.1; `test_fix_tuple_dot_fail.fd`).
 - `e.m(args)` calls a method. `Vec`, `HashMap`, `Rc`, `Arc` and the core
   struct `String` have built-in methods (§13); other types use their `impl`
   blocks. `str` has no methods: use the `str_*` functions (§13.4).
@@ -614,6 +686,20 @@ Consequences:
 between numeric types, between integers and raw pointers, between `str` and
 `i64`, and from a concrete type to `dyn Trait`. `e ~> T` is a quantisation cast
 (`QuantCast`).
+
+Numeric casts (decided Nov 17, docs/verification/semantics-2.md §5, §10,
+§20.1):
+
+- integer to integer: the low bits are kept, read in the target type
+  (`200u8 as i8` is −56; semantics.md §3);
+- integer or `f64` to `f32` / `f64`: rounded to the nearest value of the
+  target, ties to even; `f32` to `f64` is exact;
+- float to integer: truncated toward zero; a value outside the target's
+  range gives the nearest end of the range (`1.0e300 as i64` is
+  `9223372036854775807`, `-5.5 as u8` is 0, `300.7 as u8` is 255), +∞ the
+  maximum, −∞ the minimum, NaN gives 0. A cast never panics. The
+  compiler does not do this yet out of range and for NaN
+  (`tests/verify/bugs/d21_float_to_int_saturates.fd`, miscompile-log D21).
 
 ### 4.7 if and match as expressions
 
@@ -649,7 +735,9 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
 - Without `-> type` the return type is inferred from the body and its
   `return` statements.
 - A closure captures the variables it names by value when it is created; the
-  values are copied into a heap environment (`lower.fd:Lowerer_make_fn_env`).
+  values are copied into an environment (`lower.fd:Lowerer_make_fn_env`), on
+  the heap, or in the frame when the closure is only called there
+  (`lw_stack_envs`). To capture by reference, capture a `&` or `&mut`.
 - A closure that captures a linear variable is an error
   (`test_linear_closure_fail.fd`); one that captures a reference cannot escape
   (§8.4).
@@ -660,7 +748,22 @@ fn make_adder(n: i64) -> fn(i64) -> i64 {
   (`compiler/comptime_eval.fd`).
 - `comptime fn` marks a function for compile-time calls; a call with literal
   arguments is evaluated at compile time.
-- `comptime gen { … }` (statement) generates code (`test_comptime_gen.fd`).
+- `comptime gen { … }` (statement) generates code (`test_comptime_gen.fd`):
+  the block's value, a string, is parsed and its functions, structs, enums,
+  constants, impl blocks and trait impls are added to the program. A
+  generated name already declared is an error
+  (`test_comptime_gen_clash_fail.fd`, `test_frontend_gen_enum_clash_fail.fd`),
+  and so is a generated trait, global, type alias, extern block or `use`.
+  `gensym("helper")` in the block gives a name nothing in the program
+  declares (`helper__gs1`, …), for helpers that must not collide with the
+  program's names (`test_frontend_gensym.fd`); it is also known in a
+  `comptime fn` (`test_frontend_gensym_comptime_fn.fd`); `==` compares a
+  generated struct or enum by content (`test_frontend_gen_eq.fd`).
+- `comptime splice { ... }` / `comptime splice make(args)` (expression): the
+  block's value, or the comptime fn call's, is a string that is parsed as
+  one expression in the splice's place before type checking
+  (docs/reference/comptime-splice.md, `test_frontend_comptime_splice.fd`,
+  `test_frontend_comptime_splice_call.fd`).
 - Reflection: `comptime type_name(T)`, `is_struct(T)`, `is_enum(T)`,
   `field_count(T)`, `field_names(T)`, `field_types(T)`, `enum_variants(E)`,
   `struct_size(T)`, `field_offset(T.f)`, `enum_discriminant(E.V)`,
@@ -723,8 +826,9 @@ op     = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | "
   fn f(v: Vec<i64>) { v.push(1); }   // error: 'v' is a by-value parameter of 'f'
   ```
 
-  Take `&mut Vec<i64>` instead. `var v = v;` silences the check, but for a
-  `Vec` or `HashMap` it is the same handle (§8.1).
+  Take `&mut Vec<i64>` instead. `var v = v;` silences the check and gives a
+  copy of its own (proposal 0004, §8.1): changing the copy leaves the
+  caller's value as it was (`tests/conformance/s5_3_copy_then_change.fd`).
 
 ### 5.4 Control flow
 
@@ -797,7 +901,9 @@ binding = name [":" type-name]
 - `Variant(x, y)` without the enum name works when the variant can be resolved
   from the scrutinee's type or is unique (`TypeChecker_resolve_pattern_enum`).
 - Bindings are names (`_` allowed), optionally with a type name
-  (`Some(v: i64)`). There are no nested, tuple, struct or `|` patterns.
+  (`Some(v: i64)`). Constructor patterns nest (`Some(Ok(x))`, LG8: parser.fd
+  `pd_desugar_arms` makes inner matches); there are no tuple, struct or `|`
+  patterns.
 - An arm guard `if expr` is checked after the pattern matches
   (`test_match_guard.fd`).
 - A `match` on an enum must cover every variant, and one on `bool` both values,
@@ -902,6 +1008,19 @@ status 1 (`safety/test_oob_vec_get.fd`, `test_unwrap_none.fd`,
 - In a bare-metal build (`fid emit --bare`) a panic calls the program's
   `@panic_handler` function if it has one, else prints on COM1 and halts.
 
+**Tasks are not killed.** Cancelling a task (`task_token_cancel`, a token's
+deadline from `task_token_with_timeout`, `task_scope_cancel`) is a request
+the task sees at its next checkpoint: a cancellable wait
+(`task_sleep_cancellable`, `task_recv_cancellable`,
+`task_wait_read_cancellable`/`task_wait_write_cancellable`,
+`task_join_cancellable`) returns early and reports that it was cancelled,
+and the task returns along its normal path, so its drops and `defer` blocks
+run. A task that reaches no checkpoint runs to its end. No backend has a
+mid-way kill: it would skip the drops of what the task owns, and nothing
+unwinds. `fid run` interleaves tasks as the C and native runtimes do,
+switching at yields, sleeps, awaits, joins and channel receives
+(docs/interp-tasks.md, `test_task_interleave.fd`).
+
 ### 8.3 What is freed automatically
 
 There is no garbage collector and no general destructor mechanism. The compiler
@@ -959,10 +1078,41 @@ A borrow ends at the borrower's last use. `&s.x` and `&s.y` may coexist. Code in
 - A reference may not be stored: not in a struct field, enum variant, array,
   `Vec` (`v.push(&x)`, `test_escape_store_fail.fd`), `Box`, global, or through
   another reference; not passed to a non-reference parameter of a generic or
-  storing function; not sent to another task (`spawn f(&x)`).
+  storing function; not sent to another task (`spawn f(&x)`). The exception
+  is a struct with a lifetime parameter: `struct View<'a> { r: &'a T }` may
+  hold a reference in a field, and a value of it is held like a reference
+  (rooted where its fields point; a local, a parameter, a result or a field
+  of another such struct, never stored; `test_frontend_lifetime_struct.fd`,
+  docs/reference/lifetimes-across-calls.md).
 - `&&T` and `&mut &T` are errors.
 - A closure that captures a reference is rooted like that reference
   (`test_escape_closure_fail.fd`).
+
+**Lifetimes** (`fid` only; parser, `compiler/escape.fd`, `compiler/borrowck.fd`).
+Without them, which reference parameters a function's result borrows from is
+inferred from its body. A signature can name it instead:
+
+```fides
+fn first<'a>(x: &'a i64, y: &i64) -> &'a i64 { return x; }
+```
+
+- Lifetimes are declared in the function's `<...>` (`'b: 'a` bounds are
+  accepted and not used); `'static` needs no declaration. A lifetime of the
+  result must be one a parameter carries. Either mistake is a parse error
+  (`test_frontend_lifetime_undeclared_fail.fd`).
+- The result borrows from exactly the parameters whose type carries one of the
+  result's lifetimes: callers see that, not the body's inference, and a body
+  returning a borrow of another parameter is an error
+  (`test_frontend_lifetime_body_fail.fd`).
+- `val r = first(&a, &b)` makes `r` a borrower of `a` (the first tied
+  argument written `&path`), so the borrow rules above hold across the call
+  (`test_frontend_lifetime_borrow_fail.fd`; `test_frontend_lifetime.fd`).
+- The type stays `&T`: the names are kept as `@lifetime` annotations on the
+  parameters and the function. Lifetimes on trait-method signatures are kept
+  and an impl's method may tie its result only to the parameters the trait's
+  ties it to. A struct may declare lifetime parameters
+  (`struct View<'a> { r: &'a T }`) to hold a reference (escape rules above);
+  `View<'a>` is the type `View`.
 
 Passing `&c` where `&mut Counter` is expected is a type error
 (`test_mut_ref_fail.fd`).
@@ -978,9 +1128,15 @@ need an `unsafe { }` block or an `@unsafe` function
 - `p_malloc`, `p_alloc`, `p_free`, `p_realloc`, `p_memcpy`, `p_memset`
   (`test_malloc_safe_fail.fd`);
 - making a pointer from an integer (`test_int_to_ptr_safe_fail.fd`);
-- calling an `extern "C"` function whose name does not start with `p_`.
+- calling an `extern "C"` function whose name does not start with `p_`;
+- calling an `@unsafe` function, method or associated function
+  (``calling the @unsafe function f() needs an `unsafe` block``;
+  `test_unsafe_call_user_fail.fd`).
 
-Imported modules are not held to these rules. `&T` converts to `*mut T` without
+The rules hold in the program (also when it declares `module x;`) and in the
+modules it imports from outside the standard library; the stdlib and the
+compiler's own modules wait for M10. Detail is in
+docs/reference/unsafe-calls.md. `&T` converts to `*mut T` without
 `unsafe`. A double free panics with `Double free`, a free of anything that is
 not a live block with `Invalid free` (`test_double_free_fail.fd`,
 `test_bad_free_fail.fd`).
@@ -1012,6 +1168,16 @@ frees the `Vec`s and `HashMap`s declared in it that provably never leave it
 (release C6, `lower.fd:lw_drop_function_vecs`, `Inst::RegionEnd`;
 `test_mem_owned_drop.fd`); anything else allocated in a region lives on, and
 there is no check that nothing uses a region's memory after its end.
+
+A C build made with `FID_REGION_ARENA=1` gives each region an arena
+(proposal 0005; a region that awaits or yields, a `gpu` and a `kv_cache`
+region keep none). What is allocated while the region runs comes from the
+arena and goes back at its end at once. A value kept by something outside
+the region (a variable declared before it, a field or element of one, a
+return value, a global, a channel, another task) is copied out of it
+first, so programs print the same with or without the arenas. A raw
+pointer or an `as i64` handle kept past the region is not followed (§8.5).
+Other backends keep regions as scopes.
 
 ### 8.7 Linear types
 
@@ -1139,6 +1305,23 @@ the `handle` block after the `do`, and `resume(cont, v)` runs it
   are all `@send`, and `Vec`, `HashMap`, `Option`, `Result`, `Box`, `Future`,
   `Mutex`, `Channel` of such types are `@send`. References and raw pointers are
   not.
+- No task is left behind (CA6, `docs/reference/structured-concurrency.md`):
+  a `spawn f(x)` is accepted only when its handle is read later in the
+  function (awaited, joined, passed on, returned or stored:
+  `val t = spawn f(x); ... await t`), when it is inside `spawn scope { }`
+  (§10.4), or when it is detached by name, `spawn detached f(x)`. A spawn
+  whose handle is dropped (`spawn f(x);` as a statement) or never read is a
+  "Concurrency error" (`test_spawn_unjoined_fail.fd`,
+  `test_spawn_unjoined_handle_fail.fd`).
+- `spawn detached f(x)` starts the task as `spawn f(x)` does, with the same
+  checks of its arguments, and gives `void`: there is no handle. `detached`
+  is a contextual word (`spawn detached(5)` still calls a function named
+  `detached`). A detached green task's block is freed when it finishes; the
+  end of a `spawn scope` still joins every thread, detached ones included
+  (`test_spawn_detached.fd`).
+- A struct, enum or tuple that holds a string or a collection is not
+  accepted as a spawn argument (its copies would share it, CA5): pass the
+  strings and Vecs as arguments of their own.
 
 ### 10.2 async and await
 
@@ -1154,7 +1337,21 @@ val r = await compute_value(1);
   and runs until it first waits, then the caller continues. Float and struct
   arguments and results pass through an adapter; an `async fn` whose
   parameters or result the task cannot carry runs to its end at the call
-  (`lower.fd:lw_is_async_task`, `Lowerer_task_adaptable`).
+  (`lower.fd:lw_is_async_task`, `Lowerer_task_adaptable`). That includes
+  a reference parameter, since a reference cannot reach another task
+  (§8.4): the function runs on its caller's stack, and where it waits its
+  caller waits (`test_lowering_async_ref.fd`).
+- An `async fn` may be a method of an impl block or a trait impl, and a
+  `cap` may declare `async fn m(..) -> Future<T>;`. The method runs as a
+  task as an async function does, through `dyn` too
+  (`lower.fd:lw_split_async_methods`; `test_lowering_async_method.fd`).
+  An async method of a generic impl runs as a task per instance (its
+  `self` and any generic struct argument travel as heap copies:
+  `Lowerer_task_gstruct`; `test_lowering_async_generic_method.fd`,
+  `test_lowering_async_generic_task.fd`), and a `cap`'s `async fn` with a
+  default body gives each impl that uses the default an async method
+  (`test_lowering_async_cap_default.fd`). A `dyn` value of a generic trait
+  impl is not supported.
   The stdlib module `task` provides `task_go`, `task_yield`, `task_run`,
   `task_sleep`, `task_result`, …
 - `yield e` evaluates `e`: not implemented as a suspension.
@@ -1208,6 +1405,21 @@ calls a function whose name ends in `mutex_lock` or `write_lock`
 (`TypeChecker_verify_no_races`; `test_race_global_fail.fd`). Data shared
 through pointers is not checked.
 
+### 10.7 Output of threads and tasks
+
+Decided Nov 17 (docs/verification/semantics-2.md §20.3):
+
+- The text of one `print` or `println` call is written whole: another
+  thread's output never appears inside it.
+- Calls are ordered when one happens before the other: in program order
+  inside a thread or task; a thread's or task's calls before it returns
+  before those its awaiter makes after `await` returns
+  (`test_verify_semantics_ext.fd`, line O2); before and after the joins at
+  the end of `spawn scope` and `parallel`; a sender's calls before
+  `channel_send` before the receiver's after the `channel_recv` that takes
+  that value. Calls that no such order relates may appear in either order;
+  a program whose output depends on it has more than one correct output.
+
 ---
 
 ## 11. Annotations
@@ -1218,8 +1430,9 @@ arg        = name ["=" arg] | int | float | string | "[" arg {"," arg} "]"
 ```
 
 Annotations are written before a top-level `fn` or `struct` (after or before
-`pub`), before a function parameter, and before a `val`/`var` statement. They
-cannot be written on methods (§2.4), struct fields, enums, globals or other
+`pub`), before a method of an `impl` block (§2.4), before a function
+parameter, and before a `val`/`var` statement. They cannot be written on
+methods of a trait impl (§2.4), struct fields, enums, globals or other
 items, and an annotated function cannot also be `async`, `comptime` or
 `interrupt` (the parser expects `fn` after the annotations).
 
@@ -1260,6 +1473,7 @@ Every annotation name is checked: a name not in the table below is an error
 | `@declassify` | fn | An audited release: the function may return, or write through reference parameters, secret or sensitive values, and its result is not secret | `secrecy.fd:sec_analyze_func`, `sec_ret` |
 | `@zeroize` | local | The variable (and the bytes of a `str` or `Vec` it holds) is overwritten with zeros at function exit | `lower.fd:Lowerer_lower_let_stmt`, `Lowerer_emit_zeroize` |
 | `@wrapping` | fn | Integer arithmetic wraps instead of panicking on overflow | `lower.fd:Lowerer_lower_func` |
+| `@deprecated[(use = "f")]`, `@deprecated("text")` | fn | Each call of the function (other than its own) is a warning, which names the replacement `f` or gives the text; `fid lint` prints it (`test_frontend_deprecated.fd`) | `typechecker.fd:TypeChecker_warn_deprecated` |
 | `@unsafe` | fn | The whole body is an `unsafe` block | `typechecker.fd:TypeChecker_check_func` |
 | `@allocator(name)` | fn | Requires an argument; nothing else | `typechecker.fd:TypeChecker_verify_allocator_params` |
 | `@interrupt(N)` | fn | An interrupt handler for vector `N` (also `interrupt fn`) | `lower.fd:Lowerer_lower_func` |
@@ -1270,7 +1484,7 @@ Every annotation name is checked: a name not in the table below is an error
 | `@sync` | struct | Recorded; no check reads it: not implemented | `typechecker.fd:TypeChecker_register_program` |
 | `@repr(C)` | struct | C-compatible field layout | `lower.fd:Lowerer_make_struct_layout` |
 | `@packed` | struct | Fields with no padding | `lower.fd:Lowerer_make_struct_layout` |
-| `@derive(…)` | struct | Generates `S_debug_str` (Debug), `S_clone` (Clone), `S_to_json` (Serialize), `S_default` (Default), `S_from_json` (Deserialize), `S_equals` (PartialEq, Eq) | `compiler.fd:process_derive` |
+| `@derive(…)` | struct | Generates `S_debug_str` (Debug), `S_clone` (Clone), `S_to_json` (Serialize), `S_default` (Default), `S_from_json` and `S_from_json_error` (Deserialize: each field read from its key; the error names a missing key or a wrong type), `S_equals` (PartialEq, Eq) | `compiler.fd:process_derive` |
 | `@cfg(…)` | fn, struct | §12 | `compiler.fd:apply_cfg_filter`, `check_cfg` |
 | `@test`, `@bounded`, `@sanitizer`, `@sink`, `@panic_handler`, `@cpu_local` | various | Accepted by the name check; no pass reads them: not implemented. `@cpu_local` is valid only on globals, which cannot carry annotations. | `typechecker.fd:annotation_target_mask` |
 
@@ -1292,10 +1506,10 @@ holds (`compiler.fd:apply_cfg_filter`, `check_cfg`; `test_cfg.fd`). Arguments:
 | Argument | Holds when |
 |---|---|
 | `linux`, `windows`, `macos`; `platform = "…"`, `os = "…"` with those values | `fid` itself runs on that system (from the `OS` environment variable and `/proc/self/exe`) |
-| `target_arch = "x86_64"`, `arch = "x86_64"` | always |
-| `aarch64`, `arm64`, `riscv64`, `riscv`; `arch`/`target_arch` = `"aarch64"` or `"riscv64"` | never |
-| `release` | always |
-| `debug` | never |
+| `x86_64`, `aarch64`, `arm64`, `riscv64`, `riscv`; `arch = "…"`, `target_arch = "…"` with those values | the target's architecture is that one (`compiler.fd:cfg_arch_is`; `arm64` is `aarch64`, `riscv` is `riscv64`; `x86_64` when there is no `--target`) |
+| `feature = "f"` | ark turned feature `f` on for the project |
+| `release` | the build is not under `--debug` |
+| `debug` | the build is under `--debug` |
 | anything else | always |
 
 The platform is the host's, not the target's: `--target` does not change it.
@@ -1344,6 +1558,14 @@ each `x` (Rust's `vec![x; n]`), for numbers, bools, strings, Vecs and maps; a
 `HashMap<K, V>`: `HashMap::new()`, `insert`, `get`, `contains`, `remove`, `len`,
 `is_empty`, `clear`, `get_or`, `keys`, `values`, `clone`. Without type
 arguments it is `HashMap<str, i64>`.
+
+`m.keys()` gives the keys in ascending order (decided Nov 17,
+docs/verification/semantics-2.md §20.2): integer keys by value, `str` keys
+byte by byte as `str_compare`. `m.values()` gives the values in the order of
+`m.keys()`. The order does not depend on insertion order, capacity or where
+the strings are in memory. (`stdlib/core.fd` `HashMap_keys` sorts `str` keys
+as words for now: `tests/verify/bugs/d22_hashmap_str_keys_order.fd`,
+miscompile-log D22.)
 
 `Box::new(x)` gives `Box<T>`; `*b` gives the `T`. `Rc::new` and `Arc::new` give
 `Rc<T>`/`Arc<T>` with `clone`, `drop`, `get`, `count`.

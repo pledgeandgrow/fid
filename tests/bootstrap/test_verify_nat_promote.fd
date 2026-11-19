@@ -1,0 +1,141 @@
+// VF5, the machine layer's promotion of locals (compiler/nat_ir.fd
+// ng_promotable, `FID_NAT_OFF=promote`): a scalar local whose address is
+// only loaded from and stored to lives in a register instead of its frame
+// slot. It is wrong to promote a local whose address goes anywhere else (a
+// `&mut` argument: the callee writes the slot, the register keeps the old
+// value), and a promoted narrow local must be cut to its width on every
+// store, as memory cuts it (a u8 counter that wraps, an i8 that goes
+// negative, a u16 and an i32 near their bounds, a bool). Each line prints a
+// value that changes when the pass gets one of these wrong; scripts/verify/
+// variants.py has the mutants promote-addr-escapes and promote-no-narrow.
+// Built on run, ccompile, emit and the machine layer (`emit --nat`,
+// `--target x86_64-linux|aarch64-linux|riscv64-linux`); only the last
+// group runs this pass.
+//
+// Expected output:
+// 3 13
+// 21
+// 4 250
+// -126
+// 65535 1
+// 2147483647 -2147483648
+// 7 true
+// 120
+
+fn bump(r: &mut i64) {
+    *r = *r + 1;
+}
+
+fn add_to(r: &mut i64, k: i64) {
+    *r = *r + k;
+}
+
+// a local passed by address inside a loop, read in the same iteration
+fn by_addr_loop(n: i64) -> i64 {
+    var c: i64 = 0;
+    var seen: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        add_to(&mut c, i);
+        seen = seen + c;
+        i = i + 1;
+    }
+    return seen;
+}
+
+@wrapping fn wrap_u8(start: u8, steps: i64) -> u8 {
+    var b: u8 = start;
+    var i: i64 = 0;
+    while i < steps {
+        b = b + 10;
+        i = i + 1;
+    }
+    return b;
+}
+
+@wrapping fn wrap_i8(start: i8, steps: i64) -> i8 {
+    var b: i8 = start;
+    var i: i64 = 0;
+    while i < steps {
+        b = b + 1;
+        i = i + 1;
+    }
+    return b;
+}
+
+@wrapping fn wrap_u16(x: u16) -> u16 {
+    var w: u16 = x;
+    w = w - 1;
+    return w;
+}
+
+@wrapping fn wrap_i32(x: i32) -> i32 {
+    var w: i32 = x;
+    w = w + 1;
+    return w;
+}
+
+fn flag_count(n: i64) -> i64 {
+    var on: bool = false;
+    var k: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        on = !on;
+        if on {
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return k;
+}
+
+fn sum_promoted(n: i64) -> i64 {
+    // nothing escapes: every local here may be promoted (the right case)
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        val t: i64 = a + b;
+        a = b;
+        b = t;
+        s = s + a;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    var c: i64 = 1;
+    bump(&mut c);
+    bump(&mut c);
+    var d: i64 = c + 10;
+    println(int_to_str(c) + " " + int_to_str(d));
+
+    // c is 0, 1, 3, 6, 10 after each call: seen = 20
+    println(by_addr_loop(5) + 1);
+
+    // 250 + 10 wraps to 4; 250 + 0 stays
+    println(int_to_str(wrap_u8(250, 1) as i64) + " " + int_to_str(wrap_u8(250, 0) as i64));
+
+    // 127 + 3 wraps to -126
+    println(wrap_i8(127, 3) as i64);
+
+    println(int_to_str(wrap_u16(0) as i64) + " " + int_to_str(wrap_u16(2) as i64));
+
+    val big: i32 = 2147483646;
+    val top: i32 = 2147483647;
+    println(int_to_str(wrap_i32(big) as i64) + " " + int_to_str(wrap_i32(top) as i64));
+
+    val k: i64 = flag_count(13);
+    var kw: str = " false";
+    if k == 7 {
+        kw = " true";
+    }
+    println(int_to_str(k) + kw);
+
+    // 1, 1, 2, 3, 5, 8, 13, 21, 34 -> sum of the first 10 Fibonacci numbers
+    // after the first: 1+1+2+3+5+8+13+21+34+55 = 143; minus 23 makes 120
+    println(sum_promoted(10) - 23);
+    return 0;
+}

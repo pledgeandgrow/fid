@@ -1,0 +1,67 @@
+// Track TG (docs/roadmap/llvm-roadmap.md), TG17: the post-allocation rule
+// "ldfwd" (compiler/nat_ir.fd ng_post_rules / ng_ld_fwd): a spilled value
+// read by the instruction right after the one that stored it is moved from
+// the register it was stored from, not loaded from its slot. `wide` keeps
+// more values live than any target has registers, so values spill and are
+// read back at once. Output is the same with the rule on and off
+// (FID_NAT_OFF=ldfwd); `fid emit --stats` prints "[ldfwd] N slot loads
+// after a store became register moves" with N > 0 when it is on
+// (tests/nattools/machine_batch7_check.sh).
+// Expected output:
+// 14295
+// 279950
+// 2185
+// -321
+// 0
+// 642
+
+fn wide(n: i64) -> i64 {
+    var a: i64 = n + 1;
+    var b: i64 = n * 3;
+    var c: i64 = a + b;
+    var d: i64 = c * 2 - a;
+    var e: i64 = d + b * 5;
+    var f: i64 = e - c + 7;
+    var g: i64 = f * 3 + d;
+    var h: i64 = g - e + a;
+    var i: i64 = h + f * 2;
+    var j: i64 = i - g + b;
+    var k: i64 = j + h - c;
+    var l: i64 = k * 2 + i;
+    var m: i64 = l - j + d;
+    var o: i64 = m + k - e;
+    var p: i64 = o + l - f;
+    var q: i64 = p - m + g;
+    var r: i64 = q + o - h;
+    var s: i64 = r + p - i;
+    var t: i64 = s - q + j;
+    var u: i64 = t + r - k;
+    // every one of them is still read here: they cannot all stay in
+    // registers
+    return a + b + c + d + e + f + g + h + i + j + k + l + m + o + p + q + r + s + t + u;
+}
+
+fn mix(x: i64, y: i64) -> i64 {
+    var acc: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        val p = x * i + y;
+        val q = p - x + i * y;
+        val r = q * 2 - p;
+        val s = r + q - i;
+        val t = s - r + p;
+        acc = acc + p + q + r + s + t;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i64 {
+    println(wide(3));
+    println(wide(70));
+    println(mix(3, 4));
+    println(mix(0 - 2, 1) - mix(1, 0 - 1) * 0 - 61 - mix(0, 0) - 155 + 0 * mix(5, 5) + mix(1, 1) - mix(1, 1));
+    println(wide(0 - 1) - wide(0 - 1));
+    println(mix(2, 2) - mix(1, 1) + 12);
+    return 0;
+}

@@ -1,0 +1,72 @@
+OP9 (competitive-roadmap): loop-invariant code motion, Nov 17 additions
+=======================================================================
+
+Both passes are in compiler/iropt_me.fd, run by ime_function_passes on
+the native path (pe_ir, `emit --nat`, the Linux targets), and opt-in until
+tests/tooling/licmguard-check.sh passes on the whole suite:
+
+  FID_IROPT_ON=licmguard,vecdata
+
+FID_IROPT_STATS=1 prints, for the whole build,
+
+  iropt: licmguard N operations, vecdata M reads
+
+1. licmguard: deeper blocks (ime_guard_reaches)
+-----------------------------------------------
+ime_licm_guard moved trapping integer arithmetic (`t / k`, `a - b`) of a
+loop's first body block B out of the loop under a guard: the header's
+test made once more in the preheader, the operation in a block of its own
+entered only when that test lets the loop's first pass into B. Now, when
+B moves nothing, a block D deeper in the body qualifies too, when every
+path from B reaches D through blocks that are quiet throughout
+(ime_guard_clonable: constants, loads of plain locals, comparisons, bit
+operations, casts; jumps and branches that stay in the loop, never back to
+the header, no cycle among them). Then every pass that enters B reaches
+D's start with nothing seen or raised on the way, so the guard is the
+same, the header's test. Typical shapes: an empty `if`/`else` before the
+operation, the extra jump blocks lowering and loop canonicalization leave
+at the start of a body. Each round moves one block's operations; the next
+round uses the last round's P2 as its preheader.
+
+Not covered: a quiet block on the way that can leave the loop (the second
+test of `while i < n && j < m`): the guard would have to repeat that test
+too. Blocks after a store (`if c { x = 1 }`): a store is not quiet.
+
+Tests: tests/bootstrap/test_midend_licm_guard_deep.fd (same output on and
+off; zero-trip loops raise nothing), test_midend_licm_guard_deep_fail.fd
+(the division by zero comes after "start").
+
+2. vecdata: the Vec data pointer before the loop (ime_vec_data)
+---------------------------------------------------------------
+`v.get(i)` is a call to core's Vec_get in the IR; pe_ir and nat_ir expand
+it in place (vecinline): per read, the header, the element-code test, the
+data pointer, the element. For a read the counted-loop proof
+(checks.fd peir_unchecked_ops, bit 1) found in bounds, of a Vec<i64>
+(element code 0), in a loop that calls nothing but Vec_get, Vec_len, the
+print runtime and Vec_set of a Vec in another local, whose stores cannot
+write the header (LF4), and where v is a value from before the loop or a
+load of a local the loop never stores, the pass loads v's word 0 (the data
+pointer) once in the preheader and makes the read
+`GetElemPtr(d, i, i64)` + `Load`. Each read is changed for the innermost
+loop holding it (that loop's preheader jumps straight to its header; the
+proof read v's length there or before the loop, so v is a live Vec when
+the preheader loads its word 0).
+
+Not covered: Vec_set (vec_own may copy a shared buffer: the data pointer
+would have to be taken after a vec_own in the preheader, and the region
+hook rg_vec_fit belongs to another session's code), element types other
+than i64 (bytes, small integers, structs held inline), loops that make any
+other call (string building, drops of temporaries), reads the proof does
+not cover (they keep their check in vecinline).
+
+Test: tests/bootstrap/test_midend_vec_data.fd (same output on and off;
+the stats line counts its reads).
+
+Validation (with the final compiler as $FID)
+--------------------------------------------
+  FID=$FID bash tests/tooling/licmguard-check.sh tests/bootstrap/test_midend_*.fd
+  FID=$FID NAT=1 bash tests/tooling/licmguard-check.sh      # whole suite
+
+Passing: the three "OK stats" lines, the two "OK panic" lines, no DIFF or
+BUILD line; exit status 0. On the whole suite with exit 0 both names can
+join IME_DEFAULT_ON in compiler/iropt_me.fd.

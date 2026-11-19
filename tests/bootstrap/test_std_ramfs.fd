@@ -1,0 +1,110 @@
+// stdlib/ramfs: the file system operations called directly, then through vfs.
+// Expected output:
+// root 1 is dir, nlink 2
+// create a.txt, write 5, read hello
+// sparse write: size 10, bytes 104 0 0 0 0 0 0 0 120 121
+// mkdir sub: parent nlink 3
+// lookup . and ..: true true
+// duplicate: EEXIST, bad names: EINVAL EINVAL ENAMETOOLONG
+// readdir: a.txt sub link
+// symlink target: a.txt, size 5
+// rmdir non-empty: ENOTEMPTY
+// rename file into sub: 0, old ENOENT, new found
+// rename dir into itself: EINVAL
+// rename file over dir: EISDIR
+// rename dir over file: ENOTDIR
+// rename over empty dir: 0
+// unlink dir: EISDIR, rmdir file: ENOTDIR
+// truncate 2: he, grow 4: 104 101 0 0
+// usage: 5 inodes, 4 bytes
+// inode reuse: true
+// two instances: lookup across ENOENT
+// vfs: /r/x/y.txt = deep, rename /r/x -> /r/z: deep
+use ramfs;
+use vfs;
+use vec;
+use string;
+
+fn en(r: i64) -> str {
+    return vfs_errno_name(r);
+}
+
+fn main() {
+    val fs: i64 = ramfs_new();
+    val root: i64 = ramfs_root(fs);
+    val ra: Vec<i64> = ramfs_getattr(fs, root);
+    if ra.get(VFS_ST_KIND) == VFS_DIR {
+        println("root " + int_to_str(root) + " is dir, nlink " + int_to_str(ra.get(VFS_ST_NLINK)));
+    }
+    val a: i64 = ramfs_create(fs, root, "a.txt", 420);
+    val w: i64 = ramfs_write(fs, a, 0, str_bytes("hello"));
+    println("create a.txt, write " + int_to_str(w) + ", read " + str_from_bytes(ramfs_read(fs, a, 0, 100)));
+
+    val s: i64 = ramfs_create(fs, root, "s", 420);
+    ramfs_write(fs, s, 0, str_bytes("h"));
+    ramfs_write(fs, s, 8, str_bytes("xy"));
+    println("sparse write: size " + int_to_str(ramfs_getattr(fs, s).get(VFS_ST_SIZE)) + ", bytes " + str_join_ints(ramfs_read(fs, s, 0, 10), " "));
+    ramfs_unlink(fs, root, "s");
+
+    val sub: i64 = ramfs_mkdir(fs, root, "sub", 493);
+    println("mkdir sub: parent nlink " + int_to_str(ramfs_getattr(fs, root).get(VFS_ST_NLINK)));
+    println("lookup . and ..: " + bool_to_str(ramfs_lookup(fs, sub, ".") == sub) + " " + bool_to_str(ramfs_lookup(fs, sub, "..") == root));
+    var long: str = "";
+    var i: i64 = 0;
+    while i < 256 {
+        long = long + "n";
+        i = i + 1;
+    }
+    println("duplicate: " + en(ramfs_create(fs, root, "a.txt", 420)) + ", bad names: " + en(ramfs_create(fs, root, "a/b", 420)) + " " + en(ramfs_create(fs, root, "..", 420)) + " " + en(ramfs_create(fs, root, long, 420)));
+
+    val l: i64 = ramfs_symlink(fs, root, "link", "a.txt");
+    var names: Vec<str> = Vec::new();
+    i = 0;
+    loop {
+        val n: str = ramfs_readdir(fs, root, i);
+        if str_len(n) == 0 {
+            break;
+        }
+        names.push(n);
+        i = i + 1;
+    }
+    println("readdir: " + str_join(names, " "));
+    println("symlink target: " + ramfs_readlink(fs, l) + ", size " + int_to_str(ramfs_getattr(fs, l).get(VFS_ST_SIZE)));
+
+    val inner: i64 = ramfs_mkdir(fs, sub, "inner", 493);
+    println("rmdir non-empty: " + en(ramfs_rmdir(fs, root, "sub")));
+    val r1: i64 = ramfs_rename(fs, root, "a.txt", sub, "b.txt");
+    println("rename file into sub: " + int_to_str(r1) + ", old " + en(ramfs_lookup(fs, root, "a.txt")) + ", new " + str_replace(bool_to_str(ramfs_lookup(fs, sub, "b.txt") == a), "true", "found"));
+    println("rename dir into itself: " + en(ramfs_rename(fs, root, "sub", inner, "x")));
+    println("rename file over dir: " + en(ramfs_rename(fs, sub, "b.txt", sub, "inner")));
+    println("rename dir over file: " + en(ramfs_rename(fs, sub, "inner", sub, "b.txt")));
+    val empty: i64 = ramfs_mkdir(fs, root, "empty", 493);
+    println("rename over empty dir: " + int_to_str(ramfs_rename(fs, sub, "inner", root, "empty")));
+    println("unlink dir: " + en(ramfs_unlink(fs, root, "empty")) + ", rmdir file: " + en(ramfs_rmdir(fs, sub, "b.txt")));
+
+    ramfs_truncate(fs, a, 2);
+    val t2: str = str_from_bytes(ramfs_read(fs, a, 0, 10));
+    ramfs_truncate(fs, a, 4);
+    println("truncate 2: " + t2 + ", grow 4: " + str_join_ints(ramfs_read(fs, a, 0, 10), " "));
+    val u: Vec<i64> = ramfs_usage(fs);
+    println("usage: " + int_to_str(u.get(0)) + " inodes, " + int_to_str(u.get(1)) + " bytes");
+
+    // an unlinked inode number is handed out again
+    val t: i64 = ramfs_create(fs, root, "tmp", 420);
+    ramfs_unlink(fs, root, "tmp");
+    val t3: i64 = ramfs_create(fs, root, "tmp2", 420);
+    println("inode reuse: " + bool_to_str(t == t3));
+
+    val fs2: i64 = ramfs_new();
+    println("two instances: lookup across " + en(ramfs_lookup(fs2, sub, "b.txt")));
+
+    var v: Vfs = vfs_new();
+    vfs_mount(&mut v, "/", ramfs_ops(), ramfs_new());
+    vfs_mkdir(&mut v, "/r", 493);
+    ramfs_mount(&mut v, "/r");
+    vfs_mkdir_p(&mut v, "/r/x");
+    vfs_write_file(&mut v, "/r/x/y.txt", str_bytes("deep"));
+    val before: str = str_from_bytes(vfs_read_file(&mut v, "/r/x/y.txt"));
+    vfs_rename(&mut v, "/r/x", "/r/z");
+    println("vfs: /r/x/y.txt = " + before + ", rename /r/x -> /r/z: " + str_from_bytes(vfs_read_file(&mut v, "/r/z/y.txt")));
+}

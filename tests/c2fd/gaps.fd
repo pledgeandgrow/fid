@@ -1,0 +1,114 @@
+// Translated from gaps.c by c2fd (C to Fid, best effort): review it before use.
+// C headers: <stdio.h>, <stdlib.h> (their calls are mapped to Fid's).
+
+// C that c2fd cannot translate faithfully: each part needs a manual edit.
+// check.sh only checks the golden translation of this file.
+
+// 1. goto for error cleanup: Fid has no goto.
+fn parse_digits(s: str, out: &mut i64) -> i64 {
+    var value: i64 = 0;
+    if c_char(s, 0) == '\0' {
+        // TODO(c2fd): goto fail; (Fid has no goto: restructure this jump)
+    }
+    while c_char(s, 0) != 0 {
+        if c_char(s, 0) < '0' || c_char(s, 0) > '9' {
+            // TODO(c2fd): goto fail; (Fid has no goto: restructure this jump)
+        }
+        value = value * 10 + (c_char(s, 0) - '0');
+        s = c_skip(s, 1);
+    }
+    *out = value;
+    return 1;
+    // TODO(c2fd): label fail: (a goto target)
+    *out = -1;
+    return 0;
+}
+
+// 2. A union read through another member (type punning).
+// TODO(c2fd): the union bits became a struct: its fields no longer share memory
+struct bits {
+    f: f64,
+    u: u32,
+}
+
+fn float_bits(f: f64) -> u32 {
+    var b: bits = bits { f: 0.0, u: 0 };
+    b.f = f;
+    return b.u;
+}
+
+// 3. A pointer walking an int array (no longer a gap: c2fd writes it as an
+// index into the array, see cursors.c).
+fn sum_until_zero(p: &Vec<i64>) -> i64 {
+    var p_at: i64 = 0;
+    var total: i64 = 0;
+    while p[p_at] != 0 {
+        val _t1: i64 = p_at;
+        p_at += 1;
+        total += p[_t1];
+    }
+    return total;
+}
+
+fn main() -> i64 {
+    var v: i64 = 0;
+    println(int_to_str(parse_digits("1234", &mut v)) + " " + int_to_str(v));
+    println(int_to_str(parse_digits("12x4", &mut v)) + " " + int_to_str(v));
+    println(f"{c_hex(float_bits(1.0) as i64, false)}");
+    var data: Vec<i64> = Vec::new();
+    for x in [3, 4, 5, 0, 9] {
+        data.push(x);
+    }
+    println(sum_until_zero(&data));
+    return 0;
+}
+
+// --- c2fd helpers: the C library behaviour this translation relies on ---
+
+/// s[i] of a C string: its NUL (0) at the end.
+fn c_char(s: str, i: i64) -> i64 {
+    if i < 0 || i >= str_len(s) {
+        return 0;
+    }
+    return str_byte_at(s, i);
+}
+
+/// s + n for a C string: what follows its first n bytes.
+fn c_skip(s: str, n: i64) -> str {
+    if n >= str_len(s) {
+        return "";
+    }
+    return str_slice(s, n, str_len(s));
+}
+
+/// printf's "%x" / "%X" (the value as an unsigned 64-bit number).
+fn c_hex(n: i64, upper: bool) -> str {
+    var digits: str = "0123456789abcdef";
+    if upper {
+        digits = "0123456789ABCDEF";
+    }
+    if n == 0 {
+        return "0";
+    }
+    var out: str = "";
+    var v: u64 = n as u64;
+    while v != 0 {
+        out = char_to_str(str_byte_at(digits, (v & 15) as i64)) + out;
+        v = v >> 4;
+    }
+    return out;
+}
+
+/// printf's "%o".
+fn c_oct(n: i64) -> str {
+    if n == 0 {
+        return "0";
+    }
+    var out: str = "";
+    var v: u64 = n as u64;
+    while v != 0 {
+        out = char_to_str('0' + (v & 7) as i64) + out;
+        v = v >> 3;
+    }
+    return out;
+}

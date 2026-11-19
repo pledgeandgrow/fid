@@ -1,0 +1,145 @@
+// A local TLS 1.3 server check (release I7): tls_server13 accepts on a
+// local port, a task-side client connects with tls_connect13_unchecked
+// (1.3 only, self-signed certificate accepted), and both sides print the
+// negotiated version as its wire number (772 = TLS 1.3). Exits 1 unless
+// both are 772 and one message goes through each way. It takes a
+// certificate of your own; tests/bootstrap/test_tls13_local.fd is the
+// suite's version with a built-in one. On Windows tls_server13 imports the
+// .pfx key into the user's key store (Schannel cannot use an in-memory
+// key) and tls_server_close deletes it again.
+//
+// A self-signed certificate (Git for Windows ships openssl):
+//   openssl req -x509 -newkey rsa:2048 -nodes -days 7 -subj /CN=localhost \
+//       -keyout key.pem -out cert.pem
+//   openssl pkcs12 -export -in cert.pem -inkey key.pem -out cert.pfx -passout pass:test
+//
+// Windows (Schannel, Windows 11 / Server 2022 or later):
+//   fid emit tests/tls/tls13_server_live.fd -o t13.exe && ./t13.exe cert.pfx test
+// Linux / macOS (OpenSSL 1.1.1 or later):
+//   fid ccompile tests/tls/tls13_server_live.fd -o t13 && ./t13 cert.pem key.pem
+//
+// Expected output (exit 0):
+//   server version 772
+//   client version 772
+//   server got ping
+//   client got pong
+//   ok
+use tls;
+use task;
+
+var g_server: i64 = 0;
+
+@unsafe
+fn recv_text(s: i64) -> str {
+    var buf: i64 = 0;
+    // SAFETY: a 256-byte block of our own; tls_session_recv writes at
+    // most 255 bytes into it and the loop reads only the n it wrote
+    unsafe { buf = p_malloc(256); }
+    val n: i64 = tls_session_recv(s, buf, 255, 10000);
+    var out: str = "";
+    if n > 0 {
+        var bytes: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < n {
+            var p: * mut u8 = buf + i;
+            var b: i64 = 0;
+            unsafe { b = (* p) as i64; }
+            bytes.push(b);
+            i = i + 1;
+        }
+        out = str_from_bytes(bytes);
+    }
+    unsafe { p_free(buf); }
+    return out;
+}
+
+fn send_text(s: i64, t: str) -> bool {
+    return tls_session_send(s, t as i64, str_len(t)) == str_len(t);
+}
+
+fn server_task(fd: i64) -> i64 {
+    val c: i64 = p_co_accept(fd);
+    if c < 0 {
+        println("server: accept failed");
+        return 0;
+    }
+    val s: i64 = tls_accept(g_server, c);
+    if s == 0 {
+        println("server: handshake failed");
+        p_socket_close(c);
+        return 0;
+    }
+    println("server version " + int_to_str(tls_session_version(s)));
+    var got: str = "";
+    // SAFETY: recv_text is @unsafe (release M10); s is the session
+    // tls_accept just made
+    unsafe { got = recv_text(s); }
+    println("server got " + got);
+    send_text(s, "pong");
+    tls_session_close(s);
+    p_socket_close(c);
+    return 0;
+}
+
+async fn client(port: i64) -> Future<i64> {
+    val s: i64 = tls_connect13_unchecked("localhost", port);
+    if s == 0 {
+        println("client: TLS 1.3 handshake failed");
+        return 1;
+    }
+    val v: i64 = tls_session_version(s);
+    println("client version " + int_to_str(v));
+    send_text(s, "ping");
+    var reply: str = "";
+    // SAFETY: recv_text is @unsafe (release M10); s is the session
+    // tls_connect13_unchecked just made
+    unsafe { reply = recv_text(s); }
+    println("client got " + reply);
+    val fd: i64 = tls_session_fd(s);
+    tls_session_close(s);
+    p_socket_close(fd);
+    if v != 772 || reply != "pong" {
+        return 1;
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    var a: str = "";
+    var b: str = "";
+    match arg_at(1) {
+        Option::Some(x) => { a = x; }
+        Option::None => {}
+    }
+    match arg_at(2) {
+        Option::Some(x) => { b = x; }
+        Option::None => {}
+    }
+    if a == "" {
+        println("usage: tls13_server_live <cert.pfx> <password>   (Windows)");
+        println("       tls13_server_live <cert.pem> <key.pem>    (OpenSSL)");
+        return 2;
+    }
+    g_server = tls_server13(a, b);
+    if g_server == 0 {
+        println("FAIL: tls_server13 could not load the certificate or has no TLS 1.3");
+        return 1;
+    }
+    var port: i64 = 18520;
+    var fd: i64 = p_socket_listen(port);
+    while fd < 0 && port < 18540 {
+        port = port + 1;
+        fd = p_socket_listen(port);
+    }
+    task_detach(task_go("server_task", fd));
+    val rc: i64 = await client(port);
+    p_socket_close(fd);
+    // on Windows this also deletes the key the .pfx import stored
+    tls_server_close(g_server);
+    if rc != 0 {
+        println("FAIL");
+        return 1;
+    }
+    println("ok");
+    return 0;
+}

@@ -1,0 +1,102 @@
+// fs_copy_file (stdlib/fs.fd, competitive roadmap RT14): the kernel copies
+// the bytes where the system allows it (copy_file_range / sendfile on
+// Linux, fcopyfile on macOS, CopyFileA on Windows: compiler/codegen_c.fd
+// __p_zc_copy_file; native Linux: stdlib/linux_runtime/sys.fd
+// pert_fs_copy_file), the portable body (p_fs_copy_file) reads and writes
+// elsewhere. Every back end must give the same files: empty, one byte, a
+// size just under a page, one past the 64 KB buffer of the fallback,
+// binary bytes (NULs included), a copy over a longer file (emptied first),
+// a file copied onto itself (left as it is), a missing source, a target in
+// a missing folder, and the fake file system of stdlib/world.fd.
+//
+// Expected output:
+// copy 0: 0 true
+// copy 1: 1 true
+// copy 4095: 4095 true
+// copy 70200: 70200 true
+// over a longer file: 5 hello
+// binary: 2560 2560 true
+// self: 27 true
+// missing: -1 false
+// no such folder: -1
+// fake: 11 hello world
+use fs;
+use world;
+
+fn b2s(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn check(n: i64, text: str) {
+    val src: str = "fid_zc_src.tmp";
+    val dst: str = "fid_zc_dst.tmp";
+    fs_write_text(src, text);
+    val got: i64 = fs_copy_file(src, dst);
+    val same: bool = fs_read_text(dst) == text && fs_file_size(dst) == n;
+    println("copy " + int_to_str(n) + ": " + int_to_str(got) + " " + b2s(same));
+    fs_delete(src);
+    fs_delete(dst);
+}
+
+fn main() -> i64 {
+    val line: str = "abcdefghijklmnopqrstuvwxyz\n";
+    check(0, "");
+    check(1, "x");
+    check(4095, str_slice(str_repeat(line, 152), 0, 4095));
+    check(70200, str_repeat(line, 2600));
+
+    // A copy over a longer file leaves only the copied bytes
+    fs_write_text("fid_zc_long.tmp", str_repeat(line, 40));
+    fs_write_text("fid_zc_short.tmp", "hello");
+    val over: i64 = fs_copy_file("fid_zc_short.tmp", "fid_zc_long.tmp");
+    println("over a longer file: " + int_to_str(over) + " " + fs_read_text("fid_zc_long.tmp"));
+    fs_delete("fid_zc_long.tmp");
+    fs_delete("fid_zc_short.tmp");
+
+    // Every byte value, NUL included, 10 times
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 2560 {
+        bytes.push(i % 256);
+        i = i + 1;
+    }
+    fs_write_bytes("fid_zc_bin.tmp", bytes);
+    val nb: i64 = fs_copy_file("fid_zc_bin.tmp", "fid_zc_bin2.tmp");
+    val back: Vec<i64> = fs_read_bytes("fid_zc_bin2.tmp");
+    var same: bool = back.len() == bytes.len();
+    var k: i64 = 0;
+    while same && k < back.len() {
+        if back.get(k) != bytes.get(k) {
+            same = false;
+        }
+        k = k + 1;
+    }
+    println("binary: " + int_to_str(nb) + " " + int_to_str(back.len()) + " " + b2s(same));
+    fs_delete("fid_zc_bin.tmp");
+    fs_delete("fid_zc_bin2.tmp");
+
+    // Onto itself: nothing is lost
+    fs_write_text("fid_zc_self.tmp", line);
+    val selfn: i64 = fs_copy_file("fid_zc_self.tmp", "fid_zc_self.tmp");
+    println("self: " + int_to_str(selfn) + " " + b2s(fs_read_text("fid_zc_self.tmp") == line));
+    fs_delete("fid_zc_self.tmp");
+
+    // Failures: no source (and no target made), no folder for the target
+    val miss: i64 = fs_copy_file("fid_zc_no_such_file.tmp", "fid_zc_never.tmp");
+    println("missing: " + int_to_str(miss) + " " + b2s(fs_exists("fid_zc_never.tmp")));
+    fs_write_text("fid_zc_src2.tmp", "data");
+    val nodir: i64 = fs_copy_file("fid_zc_src2.tmp", "fid_zc_no_such_dir/out.tmp");
+    println("no such folder: " + int_to_str(nodir));
+    fs_delete("fid_zc_src2.tmp");
+
+    // Under the fake file system the copy stays in it
+    world_fake_files();
+    fs_write_text("a.txt", "hello world");
+    val fk: i64 = fs_copy_file("a.txt", "b.txt");
+    println("fake: " + int_to_str(fk) + " " + fs_read_text("b.txt"));
+    world_real_files();
+    return 0;
+}

@@ -1,0 +1,492 @@
+// Fides SD card over SPI, pure Fides with the SPI byte exchange as seam.
+//
+// From the SD Physical Layer Simplified Specification (version 9.00),
+// chapter 7 (SPI mode):
+//   - command frames: 0x40 | index, 32-bit argument (big-endian), CRC7
+//     (polynomial x^7 + x^3 + 1) << 1 | end bit; CRC16 (CCITT, polynomial
+//     0x1021, initial 0) on data blocks;
+//   - responses R1 (idle, erase reset, illegal command, CRC error, erase
+//     sequence, address and parameter errors), R3 (OCR) and R7 (voltage
+//     check echo), the start block token 0xFE, the data response token
+//     (xxx0 sss1: 010 accepted, 101 CRC error, 110 write error) and the busy
+//     signal (0x00 while programming);
+//   - the initialisation flow (figure 7-2): at least 74 clocks with CS
+//     high, CMD0 (GO_IDLE_STATE) -> R1 = 0x01, CMD8 (SEND_IF_COND, 0x1AA)
+//     telling version 2 cards (echo) from version 1 (illegal command),
+//     CMD55 + ACMD41 (HCS set for v2) repeated until the card leaves idle,
+//     CMD58 (READ_OCR) whose CCS bit says block (SDHC/SDXC) or byte
+//     (SDSC) addressing, and CMD16 (512-byte blocks) for SDSC;
+//   - single block read (CMD17) and write (CMD24).
+//
+// The seam: every byte goes through sd_xfer(bus, out) -> in, the SPI
+// full-duplex exchange (on a port, write the SPI data register and read
+// it back). Here the bus holds SdCardSim, a byte-level model of a card's
+// SPI side (command decoding, CRC checking of CMD0/CMD8, the ACMD41
+// warm-up, response latency, read/write data phases, busy time) used by
+// the tests; it can inject CRC faults.
+
+module sdcard;
+ use vec; use string;
+
+// ─── CRCs ───────────────────────────────────────────────────────────────
+
+/// CRC7 of bytes[0..n) (polynomial 0x09), 7 bits.
+pub fn sd_crc7(b: Vec<i64>, n: i64) -> i64 {
+    var crc: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var d: i64 = b.get(i) & 0xFF;
+        var k: i64 = 0;
+        while k < 8 {
+            crc = (crc << 1) & 0xFF;
+            if ((d ^ crc) & 0x80) != 0 { crc = crc ^ 0x09; }
+            d = (d << 1) & 0xFF;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc & 0x7F;
+}
+
+/// CRC16-CCITT (XMODEM: polynomial 0x1021, initial 0) of bytes[from..from+n).
+pub fn sd_crc16(b: Vec<i64>, from: i64, n: i64) -> i64 {
+    var crc: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        crc = crc ^ ((b.get(from + i) & 0xFF) << 8);
+        var k: i64 = 0;
+        while k < 8 {
+            if (crc & 0x8000) != 0 { crc = ((crc << 1) ^ 0x1021) & 0xFFFF; } else { crc = (crc << 1) & 0xFFFF; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+/// The 6-byte frame of command `index` with argument `arg`.
+pub fn sd_cmd_frame(index: i64, arg: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    f.push(0x40 | (index & 0x3F));
+    f.push((arg >> 24) & 0xFF);
+    f.push((arg >> 16) & 0xFF);
+    f.push((arg >> 8) & 0xFF);
+    f.push(arg & 0xFF);
+    f.push((sd_crc7(f, 5) << 1) | 1);
+    return f;
+}
+
+pub const R1_IDLE: i64 = 0x01;
+pub const R1_ERASE_RESET: i64 = 0x02;
+pub const R1_ILLEGAL: i64 = 0x04;
+pub const R1_CRC: i64 = 0x08;
+pub const R1_ERASE_SEQ: i64 = 0x10;
+pub const R1_ADDRESS: i64 = 0x20;
+pub const R1_PARAMETER: i64 = 0x40;
+
+pub fn sd_r1_decode(r: i64) -> str {
+    if r == 0 { return "ready"; }
+    if (r & 0x80) != 0 { return "no response"; }
+    var out: Vec<str> = Vec::new();
+    if (r & R1_IDLE) != 0 { out.push("idle"); }
+    if (r & R1_ERASE_RESET) != 0 { out.push("erase-reset"); }
+    if (r & R1_ILLEGAL) != 0 { out.push("illegal-command"); }
+    if (r & R1_CRC) != 0 { out.push("crc-error"); }
+    if (r & R1_ERASE_SEQ) != 0 { out.push("erase-sequence"); }
+    if (r & R1_ADDRESS) != 0 { out.push("address-error"); }
+    if (r & R1_PARAMETER) != 0 { out.push("parameter-error"); }
+    return str_join(out, ",");
+}
+
+// ─── Card model ─────────────────────────────────────────────────────────
+
+pub const SD_V1: i64 = 1;
+pub const SD_V2_SC: i64 = 2;
+pub const SD_V2_HC: i64 = 3;
+
+pub struct SdCardSim {
+    pub kind: i64,
+    pub blocks: i64,
+    pub data: Vec<i64>,
+    pub idle: bool,
+    pub acmd: bool,
+    pub warmup: i64,
+    pub cmd: Vec<i64>,
+    pub out: Vec<i64>,
+    pub rx_mode: i64,
+    pub rx: Vec<i64>,
+    pub rx_addr: i64,
+    pub blocklen: i64,
+    pub busy: i64,
+    pub corrupt_next_read: bool,
+    pub log: Vec<str>,
+}
+
+/// A card of `blocks` 512-byte blocks; `warmup` ACMD41 calls before ready.
+pub fn sdsim_new(kind: i64, blocks: i64, warmup: i64) -> SdCardSim {
+    return SdCardSim {
+        kind: kind, blocks: blocks, data: Vec::filled(blocks * 512, 0), idle: false, acmd: false, warmup: warmup,
+        cmd: Vec::new(), out: Vec::new(), rx_mode: 0, rx: Vec::new(), rx_addr: 0, blocklen: 512, busy: 0,
+        corrupt_next_read: false, log: Vec::new()
+    };
+}
+
+fn sim_r1(c: &SdCardSim, bits: i64) -> i64 {
+    if c.idle { return bits | R1_IDLE; }
+    return bits;
+}
+
+fn sim_queue(c: &mut SdCardSim, b: i64) {
+    c.out.push(b & 0xFF);
+}
+
+/// Block index for a command address (byte address on SDSC/v1).
+fn sim_block(c: &SdCardSim, arg: i64) -> i64 {
+    if c.kind == SD_V2_HC { return arg; }
+    if arg % 512 != 0 { return -1; }
+    return arg / 512;
+}
+
+fn sim_command(c: &mut SdCardSim) {
+    val idx: i64 = c.cmd.get(0) & 0x3F;
+    val arg: i64 = (c.cmd.get(1) << 24) | (c.cmd.get(2) << 16) | (c.cmd.get(3) << 8) | c.cmd.get(4);
+    val crc_ok: bool = (c.cmd.get(5) >> 1) == sd_crc7(c.cmd, 5);
+    val was_acmd: bool = c.acmd;
+    c.acmd = false;
+    var name: str = "CMD" + int_to_str(idx);
+    if was_acmd { name = "ACMD" + int_to_str(idx); }
+    c.log.push(name);
+    sim_queue(c, 0xFF);
+    // CRC is checked for CMD0 and CMD8 in SPI mode (CRC off otherwise).
+    if (idx == 0 || idx == 8) && !crc_ok {
+        sim_queue(c, sim_r1(c, R1_CRC));
+        return;
+    }
+    if idx == 0 {
+        c.idle = true;
+        sim_queue(c, R1_IDLE);
+        return;
+    }
+    if idx == 8 {
+        if c.kind == SD_V1 {
+            sim_queue(c, sim_r1(c, R1_ILLEGAL));
+            return;
+        }
+        sim_queue(c, sim_r1(c, 0));
+        sim_queue(c, 0);
+        sim_queue(c, 0);
+        sim_queue(c, (arg >> 8) & 0x0F);
+        sim_queue(c, arg & 0xFF);
+        return;
+    }
+    if idx == 55 {
+        c.acmd = true;
+        sim_queue(c, sim_r1(c, 0));
+        return;
+    }
+    if idx == 41 && was_acmd {
+        // A high-capacity card never leaves idle for a host that does not
+        // set HCS (it cannot address it).
+        if c.kind != SD_V2_HC || (arg & 0x40000000) != 0 {
+            if c.warmup > 0 { c.warmup = c.warmup - 1; } else { c.idle = false; }
+        }
+        sim_queue(c, sim_r1(c, 0));
+        return;
+    }
+    if idx == 58 {
+        sim_queue(c, sim_r1(c, 0));
+        var ocr: i64 = 0x00FF8000;
+        if !c.idle { ocr = ocr | 0x80000000; }
+        if c.kind == SD_V2_HC && !c.idle { ocr = ocr | 0x40000000; }
+        sim_queue(c, ocr >> 24);
+        sim_queue(c, ocr >> 16);
+        sim_queue(c, ocr >> 8);
+        sim_queue(c, ocr);
+        return;
+    }
+    if c.idle {
+        sim_queue(c, sim_r1(c, R1_ILLEGAL));
+        return;
+    }
+    if idx == 16 {
+        if arg != 512 { sim_queue(c, R1_PARAMETER); return; }
+        c.blocklen = arg;
+        sim_queue(c, 0);
+        return;
+    }
+    if idx == 17 {
+        val blk: i64 = sim_block(c, arg);
+        if blk < 0 || blk >= c.blocks {
+            sim_queue(c, R1_ADDRESS);
+            return;
+        }
+        sim_queue(c, 0);
+        sim_queue(c, 0xFF);
+        sim_queue(c, 0xFF);
+        sim_queue(c, 0xFE);
+        var block: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < 512 {
+            block.push(c.data.get(blk * 512 + i));
+            i = i + 1;
+        }
+        val crc: i64 = sd_crc16(block, 0, 512);
+        if c.corrupt_next_read {
+            block.set(100, block.get(100) ^ 0x10);
+            c.corrupt_next_read = false;
+        }
+        i = 0;
+        while i < 512 {
+            sim_queue(c, block.get(i));
+            i = i + 1;
+        }
+        sim_queue(c, crc >> 8);
+        sim_queue(c, crc);
+        return;
+    }
+    if idx == 24 {
+        val blk: i64 = sim_block(c, arg);
+        if blk < 0 || blk >= c.blocks {
+            sim_queue(c, R1_ADDRESS);
+            return;
+        }
+        sim_queue(c, 0);
+        c.rx_mode = 1;
+        c.rx_addr = blk;
+        c.rx.clear();
+        return;
+    }
+    sim_queue(c, R1_ILLEGAL);
+}
+
+/// One SPI byte exchange from the card's side.
+pub fn sdsim_xfer(c: &mut SdCardSim, b: i64) -> i64 {
+    var reply: i64 = 0xFF;
+    if c.out.len() > 0 {
+        reply = c.out.get(0);
+        c.out.remove(0);
+    } else if c.busy > 0 {
+        c.busy = c.busy - 1;
+        reply = 0x00;
+    }
+    if c.rx_mode == 1 {
+        // Waiting for the start block token.
+        if b == 0xFE { c.rx_mode = 2; }
+        return reply;
+    }
+    if c.rx_mode == 2 {
+        c.rx.push(b);
+        if c.rx.len() == 514 {
+            c.rx_mode = 0;
+            val crc: i64 = (c.rx.get(512) << 8) | c.rx.get(513);
+            if crc != sd_crc16(c.rx, 0, 512) {
+                sim_queue(c, 0x0B);
+            } else {
+                var i: i64 = 0;
+                while i < 512 {
+                    c.data.set(c.rx_addr * 512 + i, c.rx.get(i));
+                    i = i + 1;
+                }
+                sim_queue(c, 0x05);
+                c.busy = 3;
+            }
+        }
+        return reply;
+    }
+    if c.cmd.len() > 0 || (b & 0xC0) == 0x40 {
+        c.cmd.push(b);
+        if c.cmd.len() == 6 {
+            sim_command(c);
+            c.cmd.clear();
+        }
+    }
+    return reply;
+}
+
+// ─── Host driver ────────────────────────────────────────────────────────
+
+pub struct SdBus {
+    pub card: SdCardSim,
+    pub cs: bool,
+    pub bytes: i64,
+}
+
+pub fn sdbus_new(card: SdCardSim) -> SdBus {
+    return SdBus { card: card, cs: false, bytes: 0 };
+}
+
+/// The seam: one full-duplex SPI byte. With CS high the card ignores the
+/// bus (the line reads 0xFF).
+pub fn sd_xfer(bus: &mut SdBus, b: i64) -> i64 {
+    bus.bytes = bus.bytes + 1;
+    if !bus.cs { return 0xFF; }
+    return sdsim_xfer(&mut bus.card, b);
+}
+
+pub struct SdDriver {
+    pub ok: bool,
+    pub version: i64,
+    pub block_addr: bool,
+    pub error: str,
+    pub steps: Vec<str>,
+    pub acmd41_tries: i64,
+}
+
+/// Send a command and wait (up to 8 bytes, NCR) for R1. Returns R1 (0xFF:
+/// no response). Extra response bytes are read by the caller.
+pub fn sd_command(bus: &mut SdBus, index: i64, arg: i64) -> i64 {
+    sd_xfer(bus, 0xFF);
+    val f: Vec<i64> = sd_cmd_frame(index, arg);
+    var i: i64 = 0;
+    while i < 6 {
+        sd_xfer(bus, f.get(i));
+        i = i + 1;
+    }
+    var n: i64 = 0;
+    while n < 8 {
+        val r: i64 = sd_xfer(bus, 0xFF);
+        if (r & 0x80) == 0 { return r; }
+        n = n + 1;
+    }
+    return 0xFF;
+}
+
+fn sd_read_u32(bus: &mut SdBus) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        v = (v << 8) | sd_xfer(bus, 0xFF);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn sd_fail(d0: SdDriver, why: str) -> SdDriver {
+    var d: SdDriver = d0;
+    d.ok = false;
+    d.error = why;
+    return d;
+}
+
+/// The SPI-mode initialisation flow.
+pub fn sd_init(bus: &mut SdBus, max_tries: i64) -> SdDriver {
+    var d: SdDriver = SdDriver { ok: false, version: 0, block_addr: false, error: "", steps: Vec::new(), acmd41_tries: 0 };
+    bus.cs = false;
+    var i: i64 = 0;
+    while i < 10 {
+        sd_xfer(bus, 0xFF);
+        i = i + 1;
+    }
+    d.steps.push("80 clocks with CS high");
+    bus.cs = true;
+    val r0: i64 = sd_command(bus, 0, 0);
+    d.steps.push("CMD0 -> " + sd_r1_decode(r0));
+    if r0 != R1_IDLE { return sd_fail(d, "CMD0 failed"); }
+    val r8: i64 = sd_command(bus, 8, 0x1AA);
+    if (r8 & R1_ILLEGAL) != 0 {
+        d.version = 1;
+        d.steps.push("CMD8 -> illegal: version 1 card");
+    } else {
+        val echo: i64 = sd_read_u32(bus);
+        d.steps.push("CMD8 -> echo " + int_to_str(echo & 0xFFF));
+        if (echo & 0xFFF) != 0x1AA { return sd_fail(d, "CMD8 echo mismatch"); }
+        d.version = 2;
+    }
+    var hcs: i64 = 0;
+    if d.version == 2 { hcs = 0x40000000; }
+    var r41: i64 = 1;
+    while r41 != 0 && d.acmd41_tries < max_tries {
+        sd_command(bus, 55, 0);
+        r41 = sd_command(bus, 41, hcs);
+        d.acmd41_tries = d.acmd41_tries + 1;
+    }
+    d.steps.push("ACMD41 x" + int_to_str(d.acmd41_tries) + " -> " + sd_r1_decode(r41));
+    if r41 != 0 { return sd_fail(d, "card did not leave idle"); }
+    if d.version == 2 {
+        sd_command(bus, 58, 0);
+        val ocr: i64 = sd_read_u32(bus);
+        d.block_addr = (ocr & 0x40000000) != 0;
+        if d.block_addr { d.steps.push("CMD58 -> CCS=1: SDHC/SDXC, block addressing"); } else { d.steps.push("CMD58 -> CCS=0: SDSC, byte addressing"); }
+    }
+    if !d.block_addr {
+        val r16: i64 = sd_command(bus, 16, 512);
+        d.steps.push("CMD16 512 -> " + sd_r1_decode(r16));
+        if r16 != 0 { return sd_fail(d, "CMD16 failed"); }
+    }
+    d.ok = true;
+    return d;
+}
+
+pub struct SdBlock {
+    pub ok: bool,
+    pub data: Vec<i64>,
+    pub error: str,
+}
+
+fn sd_addr(d: &SdDriver, lba: i64) -> i64 {
+    if d.block_addr { return lba; }
+    return lba * 512;
+}
+
+/// CMD17: read one block, checking its CRC16.
+pub fn sd_read_block(bus: &mut SdBus, d: &SdDriver, lba: i64) -> SdBlock {
+    var b: SdBlock = SdBlock { ok: false, data: Vec::new(), error: "" };
+    val r: i64 = sd_command(bus, 17, sd_addr(d, lba));
+    if r != 0 {
+        b.error = "CMD17: " + sd_r1_decode(r);
+        return b;
+    }
+    var n: i64 = 0;
+    var tok: i64 = 0xFF;
+    while n < 1000 && tok == 0xFF {
+        tok = sd_xfer(bus, 0xFF);
+        n = n + 1;
+    }
+    if tok != 0xFE {
+        b.error = "no start token";
+        return b;
+    }
+    var i: i64 = 0;
+    while i < 512 {
+        b.data.push(sd_xfer(bus, 0xFF));
+        i = i + 1;
+    }
+    val crc: i64 = (sd_xfer(bus, 0xFF) << 8) | sd_xfer(bus, 0xFF);
+    if crc != sd_crc16(b.data, 0, 512) {
+        b.error = "data CRC mismatch";
+        return b;
+    }
+    b.ok = true;
+    return b;
+}
+
+/// CMD24: write one block; "" on success, else why.
+pub fn sd_write_block(bus: &mut SdBus, d: &SdDriver, lba: i64, data: Vec<i64>) -> str {
+    if data.len() != 512 { return "a block is 512 bytes"; }
+    val r: i64 = sd_command(bus, 24, sd_addr(d, lba));
+    if r != 0 { return "CMD24: " + sd_r1_decode(r); }
+    sd_xfer(bus, 0xFF);
+    sd_xfer(bus, 0xFE);
+    var i: i64 = 0;
+    while i < 512 {
+        sd_xfer(bus, data.get(i));
+        i = i + 1;
+    }
+    val crc: i64 = sd_crc16(data, 0, 512);
+    sd_xfer(bus, crc >> 8);
+    sd_xfer(bus, crc & 0xFF);
+    var resp: i64 = 0xFF;
+    var n: i64 = 0;
+    while n < 8 && resp == 0xFF {
+        resp = sd_xfer(bus, 0xFF);
+        n = n + 1;
+    }
+    val status: i64 = (resp >> 1) & 7;
+    if status == 5 { return "card reported a CRC error"; }
+    if status == 6 { return "card reported a write error"; }
+    if status != 2 { return "no data response"; }
+    // Wait while the card holds the line low (busy).
+    n = 0;
+    while n < 100000 && sd_xfer(bus, 0xFF) == 0 { n = n + 1; }
+    return "";
+}

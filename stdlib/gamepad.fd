@@ -1,0 +1,745 @@
+// Fides gamepad: game controller support in the style of SDL's
+// GameController API.
+//
+//   - Mapping strings (the SDL_GameControllerDB format):
+//     "GUID,name,a:b0,leftx:a0,lefty:a1~,dpup:h0.1,+rightx:b5,lefttrigger:+a2,
+//      platform:Windows," parsed into bindings from raw joystick inputs
+//     (button bN, axis aN with an optional +/- half and ~ inversion, hat
+//     hN.M) to the standard buttons and axes (also half axes +leftx/-leftx).
+//     GUIDs decode to bus, vendor, product, version (SDL 2 layout).
+//   - Applying a mapping to a raw joystick state gives the standard state
+//     with SDL's value ranges (sticks -32768..32767, triggers 0..32767).
+//   - Normalisation to -1..1 / 0..1 and dead zones: axial (per axis),
+//     radial (on the stick vector, rescaled so output starts at 0 at the
+//     edge of the dead zone), and an outer saturation zone.
+//   - Rumble: effects with low/high frequency motor strengths, duration,
+//     attack and fade; a mixer turns the active effects into the two 16-bit
+//     motor values SDL_GameControllerRumble takes.
+//   - Hotplug: a hub that turns device added/removed notifications into
+//     player slots (lowest free slot; a controller that comes back gets the
+//     slot it had, when still free) and an event queue.
+//
+// All of the above is pure computation and tested. Platform seam: the
+// `extern "C"` block declares SDL2's GameController functions (link SDL2;
+// SDL must be initialised with SDL_INIT_GAMECONTROLLER, see stdlib sdl);
+// gp_sdl_poll reads a real controller into the same GpState. Running it
+// needs SDL2 and a controller; the test does not call it.
+//
+// Usage:
+//   use gamepad;
+//   val m: GpMapping = gp_mapping_parse(line).unwrap();
+//   val s: GpState = gp_apply(&m, &raw);
+//   val st: GpStick = gp_deadzone_radial(gp_axis_norm(s.axes.get(GP_AXIS_LEFTX)),
+//                                        gp_axis_norm(s.axes.get(GP_AXIS_LEFTY)), 0.2, 0.95);
+
+module gamepad;
+use vec;
+use math;
+
+// ─── SDL2 GameController (platform seam) ───────────────────────────────────
+
+// SAFETY: the prototypes come from <SDL2/SDL.h> (checked by the C
+// compiler); controllers are the handles SDL_GameControllerOpen returned
+// and strings are NUL-terminated.
+extern "C" include "<SDL2/SDL.h>" link "SDL2" {
+    fn SDL_NumJoysticks as gp_sdl_num_joysticks() -> i32;
+    fn SDL_IsGameController as gp_sdl_is_game_controller(index: i64) -> i32;
+    fn SDL_GameControllerOpen as gp_sdl_open(index: i64) -> i64;
+    fn SDL_GameControllerClose as gp_sdl_close(controller: i64) -> void;
+    fn SDL_GameControllerGetAxis as gp_sdl_get_axis(controller: i64, axis: i64) -> i16;
+    fn SDL_GameControllerGetButton as gp_sdl_get_button(controller: i64, button: i64) -> u8;
+    fn SDL_GameControllerRumble as gp_sdl_rumble(controller: i64, low: i64, high: i64, ms: i64) -> i32;
+    fn SDL_GameControllerAddMapping as gp_sdl_add_mapping(mapping: str) -> i32;
+    fn SDL_GameControllerNameForIndex as gp_sdl_name_for_index(index: i64) -> str;
+    fn SDL_JoystickGetDeviceInstanceID as gp_sdl_instance_id(index: i64) -> i32;
+}
+
+/// Read an open SDL controller into a GpState.
+pub fn gp_sdl_poll(controller: i64) -> GpState {
+    var s: GpState = gp_state_new();
+    var b: i64 = 0;
+    while b < GP_BUTTON_COUNT {
+        s.buttons.set(b, (gp_sdl_get_button(controller, b) as i64) != 0);
+        b = b + 1;
+    }
+    var a: i64 = 0;
+    while a < GP_AXIS_COUNT {
+        s.axes.set(a, gp_sdl_get_axis(controller, a) as i64);
+        a = a + 1;
+    }
+    return s;
+}
+
+// ─── Standard buttons and axes (SDL order) ─────────────────────────────────
+
+pub const GP_BUTTON_A: i64 = 0;
+pub const GP_BUTTON_B: i64 = 1;
+pub const GP_BUTTON_X: i64 = 2;
+pub const GP_BUTTON_Y: i64 = 3;
+pub const GP_BUTTON_BACK: i64 = 4;
+pub const GP_BUTTON_GUIDE: i64 = 5;
+pub const GP_BUTTON_START: i64 = 6;
+pub const GP_BUTTON_LEFTSTICK: i64 = 7;
+pub const GP_BUTTON_RIGHTSTICK: i64 = 8;
+pub const GP_BUTTON_LEFTSHOULDER: i64 = 9;
+pub const GP_BUTTON_RIGHTSHOULDER: i64 = 10;
+pub const GP_BUTTON_DPAD_UP: i64 = 11;
+pub const GP_BUTTON_DPAD_DOWN: i64 = 12;
+pub const GP_BUTTON_DPAD_LEFT: i64 = 13;
+pub const GP_BUTTON_DPAD_RIGHT: i64 = 14;
+pub const GP_BUTTON_MISC1: i64 = 15;
+pub const GP_BUTTON_TOUCHPAD: i64 = 20;
+pub const GP_BUTTON_COUNT: i64 = 21;
+
+pub const GP_AXIS_LEFTX: i64 = 0;
+pub const GP_AXIS_LEFTY: i64 = 1;
+pub const GP_AXIS_RIGHTX: i64 = 2;
+pub const GP_AXIS_RIGHTY: i64 = 3;
+pub const GP_AXIS_TRIGGERLEFT: i64 = 4;
+pub const GP_AXIS_TRIGGERRIGHT: i64 = 5;
+pub const GP_AXIS_COUNT: i64 = 6;
+
+fn gp_button_names() -> Vec<str> {
+    var n: Vec<str> = Vec::new();
+    n.push("a"); n.push("b"); n.push("x"); n.push("y"); n.push("back"); n.push("guide"); n.push("start");
+    n.push("leftstick"); n.push("rightstick"); n.push("leftshoulder"); n.push("rightshoulder");
+    n.push("dpup"); n.push("dpdown"); n.push("dpleft"); n.push("dpright"); n.push("misc1");
+    n.push("paddle1"); n.push("paddle2"); n.push("paddle3"); n.push("paddle4"); n.push("touchpad");
+    return n;
+}
+
+fn gp_axis_names() -> Vec<str> {
+    var n: Vec<str> = Vec::new();
+    n.push("leftx"); n.push("lefty"); n.push("rightx"); n.push("righty"); n.push("lefttrigger"); n.push("righttrigger");
+    return n;
+}
+
+pub fn gp_button_name(b: i64) -> str {
+    val n: Vec<str> = gp_button_names();
+    if b < 0 || b >= n.len() {
+        return "";
+    }
+    return n.get(b);
+}
+
+pub fn gp_axis_name(a: i64) -> str {
+    val n: Vec<str> = gp_axis_names();
+    if a < 0 || a >= n.len() {
+        return "";
+    }
+    return n.get(a);
+}
+
+fn gp_index_of(names: &Vec<str>, s: str) -> i64 {
+    var i: i64 = 0;
+    while i < names.len() {
+        if names.get(i) == s {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+// ─── Mappings ──────────────────────────────────────────────────────────────
+
+pub const GP_SRC_BUTTON: i64 = 0;
+pub const GP_SRC_AXIS: i64 = 1;
+pub const GP_SRC_HAT: i64 = 2;
+
+/// One binding: a raw input to a standard output.
+pub struct GpBinding {
+    /// true: output is an axis; false: a button.
+    pub to_axis: bool,
+    pub target: i64,
+    /// Output half: 0 full, 1 positive (+leftx), -1 negative (-leftx).
+    pub out_half: i64,
+    pub src: i64,
+    pub index: i64,
+    /// Hat direction mask (1 up, 2 right, 4 down, 8 left).
+    pub hat_mask: i64,
+    /// Input half: 0 full, 1 positive (+a2), -1 negative (-a2).
+    pub in_half: i64,
+    pub invert: bool,
+}
+
+pub struct GpMapping {
+    pub guid: str,
+    pub name: str,
+    pub platform: str,
+    pub bindings: Vec<GpBinding>,
+}
+
+pub struct GpGuid {
+    pub bus: i64,
+    pub crc: i64,
+    pub vendor: i64,
+    pub product: i64,
+    pub version: i64,
+    /// SDL driver signature byte ('x' XInput, 'h' HIDAPI, 'r' raw input), 0
+    /// when none.
+    pub driver: i64,
+}
+
+fn gp_hex(c: i64) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    return - 1;
+}
+
+/// Decode a 32-hex-digit SDL 2 joystick GUID.
+pub fn gp_guid_decode(s: str) -> Result<GpGuid, str> {
+    if str_len(s) != 32 {
+        return Result::Err("GUID must be 32 hex digits");
+    }
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        val hi: i64 = gp_hex(str_byte_at(s, 2 * i));
+        val lo: i64 = gp_hex(str_byte_at(s, 2 * i + 1));
+        if hi < 0 || lo < 0 {
+            return Result::Err("GUID has a non-hex digit");
+        }
+        b.push(hi * 16 + lo);
+        i = i + 1;
+    }
+    return Result::Ok(GpGuid { bus: b.get(0) | (b.get(1) << 8), crc: b.get(2) | (b.get(3) << 8), vendor: b.get(4) | (b.get(5) << 8), product: b.get(8) | (b.get(9) << 8), version: b.get(12) | (b.get(13) << 8), driver: b.get(14) });
+}
+
+// "b3", "a2", "+a2", "-a2", "a1~", "h0.4"
+fn gp_parse_source(v: str, bnd: &mut GpBinding) -> bool {
+    var s: str = v;
+    if str_starts_with(s, "+") {
+        bnd.in_half = 1;
+        s = str_slice(s, 1, str_len(s));
+    } else if str_starts_with(s, "-") {
+        bnd.in_half = - 1;
+        s = str_slice(s, 1, str_len(s));
+    }
+    if str_ends_with(s, "~") {
+        bnd.invert = true;
+        s = str_slice(s, 0, str_len(s) - 1);
+    }
+    if str_len(s) < 2 {
+        return false;
+    }
+    val kind: i64 = str_byte_at(s, 0);
+    val rest: str = str_slice(s, 1, str_len(s));
+    if kind == 98 {
+        bnd.src = GP_SRC_BUTTON;
+    } else if kind == 97 {
+        bnd.src = GP_SRC_AXIS;
+    } else if kind == 104 {
+        bnd.src = GP_SRC_HAT;
+        val dot: i64 = str_find(rest, ".");
+        if dot <= 0 {
+            return false;
+        }
+        bnd.index = str_parse_int(str_slice(rest, 0, dot));
+        bnd.hat_mask = str_parse_int(str_slice(rest, dot + 1, str_len(rest)));
+        return bnd.hat_mask > 0 && bnd.hat_mask < 16;
+    } else {
+        return false;
+    }
+    var k: i64 = 0;
+    while k < str_len(rest) {
+        val c: i64 = str_byte_at(rest, k);
+        if c < 48 || c > 57 {
+            return false;
+        }
+        k = k + 1;
+    }
+    bnd.index = str_parse_int(rest);
+    if bnd.src == GP_SRC_BUTTON && (bnd.in_half != 0 || bnd.invert) {
+        return false;
+    }
+    return true;
+}
+
+/// Parse a mapping line. Unknown target names are skipped (newer SDL
+/// versions add some); malformed sources are errors.
+pub fn gp_mapping_parse(line: str) -> Result<GpMapping, str> {
+    val parts: Vec<str> = str_split(str_trim(line), ",");
+    if parts.len() < 2 {
+        return Result::Err("mapping needs a GUID and a name");
+    }
+    val guid: str = parts.get(0);
+    match gp_guid_decode(guid) {
+        Result::Ok(_) => {
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    var m: GpMapping = GpMapping { guid: guid, name: parts.get(1), platform: "", bindings: Vec::new() };
+    val bnames: Vec<str> = gp_button_names();
+    val anames: Vec<str> = gp_axis_names();
+    var i: i64 = 2;
+    while i < parts.len() {
+        val p: str = parts.get(i);
+        i = i + 1;
+        if str_len(p) == 0 {
+            continue;
+        }
+        val colon: i64 = str_find(p, ":");
+        if colon <= 0 {
+            return Result::Err("bad field '" + p + "'");
+        }
+        var key: str = str_slice(p, 0, colon);
+        val val_s: str = str_slice(p, colon + 1, str_len(p));
+        if key == "platform" {
+            m.platform = val_s;
+            continue;
+        }
+        var bnd: GpBinding = GpBinding { to_axis: false, target: - 1, out_half: 0, src: 0, index: 0, hat_mask: 0, in_half: 0, invert: false };
+        if str_starts_with(key, "+") {
+            bnd.out_half = 1;
+            key = str_slice(key, 1, str_len(key));
+        } else if str_starts_with(key, "-") {
+            bnd.out_half = - 1;
+            key = str_slice(key, 1, str_len(key));
+        }
+        val bi: i64 = gp_index_of(&bnames, key);
+        val ai: i64 = gp_index_of(&anames, key);
+        if bi >= 0 && bnd.out_half == 0 {
+            bnd.target = bi;
+        } else if ai >= 0 {
+            bnd.to_axis = true;
+            bnd.target = ai;
+        } else {
+            continue;
+        }
+        if !gp_parse_source(val_s, &mut bnd) {
+            return Result::Err("bad source '" + val_s + "' for " + key);
+        }
+        m.bindings.push(bnd);
+    }
+    return Result::Ok(m);
+}
+
+/// The mapping back as a line (fields in binding order).
+pub fn gp_mapping_to_str(m: &GpMapping) -> str {
+    var s: str = m.guid + "," + m.name + ",";
+    var i: i64 = 0;
+    while i < m.bindings.len() {
+        val b: GpBinding = m.bindings.get(i);
+        var key: str = gp_button_name(b.target);
+        if b.to_axis {
+            key = gp_axis_name(b.target);
+            if b.out_half == 1 { key = "+" + key; }
+            if b.out_half == - 1 { key = "-" + key; }
+        }
+        var src: str = "";
+        if b.in_half == 1 { src = "+"; }
+        if b.in_half == - 1 { src = "-"; }
+        if b.src == GP_SRC_BUTTON {
+            src = src + "b" + int_to_str(b.index);
+        } else if b.src == GP_SRC_AXIS {
+            src = src + "a" + int_to_str(b.index);
+        } else {
+            src = src + "h" + int_to_str(b.index) + "." + int_to_str(b.hat_mask);
+        }
+        if b.invert {
+            src = src + "~";
+        }
+        s = s + key + ":" + src + ",";
+        i = i + 1;
+    }
+    if str_len(m.platform) > 0 {
+        s = s + "platform:" + m.platform + ",";
+    }
+    return s;
+}
+
+// ─── Applying a mapping ────────────────────────────────────────────────────
+
+/// A raw joystick: buttons, axes (-32768..32767), hats (direction masks).
+pub struct GpRaw {
+    pub buttons: Vec<bool>,
+    pub axes: Vec<i64>,
+    pub hats: Vec<i64>,
+}
+
+pub struct GpState {
+    pub buttons: Vec<bool>,
+    /// Sticks -32768..32767, triggers 0..32767.
+    pub axes: Vec<i64>,
+}
+
+pub fn gp_state_new() -> GpState {
+    return GpState { buttons: Vec::filled(GP_BUTTON_COUNT, false), axes: Vec::filled(GP_AXIS_COUNT, 0) };
+}
+
+fn gp_clamp16(v: i64) -> i64 {
+    if v > 32767 { return 32767; }
+    if v < - 32768 { return - 32768; }
+    return v;
+}
+
+// raw input value of a binding, and whether it lies in the input range;
+// result in the binding's input range scaled to 0..32767 for halves
+fn gp_input_value(b: &GpBinding, raw: &GpRaw) -> i64 {
+    if b.src == GP_SRC_BUTTON {
+        if b.index < raw.buttons.len() && raw.buttons.get(b.index) {
+            return 32767;
+        }
+        return 0;
+    }
+    if b.src == GP_SRC_HAT {
+        if b.index < raw.hats.len() && (raw.hats.get(b.index) & b.hat_mask) != 0 {
+            return 32767;
+        }
+        return 0;
+    }
+    var v: i64 = 0;
+    if b.index < raw.axes.len() {
+        v = raw.axes.get(b.index);
+    }
+    if b.invert {
+        v = gp_clamp16(0 - v);
+    }
+    return v;
+}
+
+/// The standard state of a raw joystick under a mapping (SDL semantics:
+/// a half input uses only its side; a full axis feeding a trigger maps
+/// -32768..32767 to 0..32767; a button or hat feeding an axis gives the
+/// output's maximum; an axis feeding a button presses it past half way).
+pub fn gp_apply(m: &GpMapping, raw: &GpRaw) -> GpState {
+    var s: GpState = gp_state_new();
+    var i: i64 = 0;
+    while i < m.bindings.len() {
+        val b: GpBinding = m.bindings.get(i);
+        val v: i64 = gp_input_value(&b, raw);
+        // value as a fraction of the input range, 0..32767 or full
+        var frac: i64 = v;
+        var full: bool = b.src == GP_SRC_AXIS && b.in_half == 0;
+        if b.src == GP_SRC_AXIS && b.in_half == 1 {
+            frac = v;
+            if frac < 0 { frac = 0; }
+        }
+        if b.src == GP_SRC_AXIS && b.in_half == - 1 {
+            frac = 0 - v;
+            if frac < 0 { frac = 0; }
+            if frac > 32767 { frac = 32767; }
+        }
+        if b.to_axis {
+            val trigger: bool = b.target == GP_AXIS_TRIGGERLEFT || b.target == GP_AXIS_TRIGGERRIGHT;
+            var out: i64 = 0;
+            if full {
+                if trigger {
+                    out = (v + 32768) / 2;
+                } else if b.out_half == 1 {
+                    out = (v + 32768) / 2;
+                } else if b.out_half == - 1 {
+                    out = 0 - (v + 32768) / 2;
+                } else {
+                    out = v;
+                }
+            } else {
+                // half input or button/hat: 0..32767
+                if b.out_half == - 1 {
+                    out = 0 - frac;
+                } else if b.out_half == 1 || trigger {
+                    out = frac;
+                } else {
+                    // a half input feeding a whole stick axis spans it
+                    out = frac * 2 - 32767;
+                }
+            }
+            // several bindings on one axis: the larger magnitude wins
+            val cur: i64 = s.axes.get(b.target);
+            var ac: i64 = cur;
+            if ac < 0 { ac = 0 - ac; }
+            var ao: i64 = out;
+            if ao < 0 { ao = 0 - ao; }
+            if ao >= ac {
+                s.axes.set(b.target, gp_clamp16(out));
+            }
+        } else {
+            var pressed: bool = false;
+            if full {
+                pressed = v > 16383 || v < - 16384;
+            } else {
+                pressed = frac > 16383;
+            }
+            if pressed {
+                s.buttons.set(b.target, true);
+            }
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── Normalisation and dead zones ──────────────────────────────────────────
+
+/// A stick axis as -1..1 (negative side divided by 32768).
+pub fn gp_axis_norm(v: i64) -> f64 {
+    if v < 0 {
+        return (v as f64) / 32768.0;
+    }
+    return (v as f64) / 32767.0;
+}
+
+/// A trigger as 0..1.
+pub fn gp_trigger_norm(v: i64) -> f64 {
+    if v <= 0 {
+        return 0.0;
+    }
+    return (v as f64) / 32767.0;
+}
+
+/// One axis with a dead zone `dz` and saturation at `outer` (both 0..1),
+/// rescaled so the output runs 0..1 between them.
+pub fn gp_deadzone_axial(x: f64, dz: f64, outer: f64) -> f64 {
+    var a: f64 = math_fabs(x);
+    if a <= dz {
+        return 0.0;
+    }
+    var t: f64 = (a - dz) / (outer - dz);
+    if t > 1.0 {
+        t = 1.0;
+    }
+    if x < 0.0 {
+        return 0.0 - t;
+    }
+    return t;
+}
+
+pub struct GpStick {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Radial dead zone: inside `dz` of the centre the stick reads (0, 0);
+/// beyond, the direction is kept and the magnitude rescaled from dz..outer
+/// to 0..1 (no axis-aligned snapping, no corner square).
+pub fn gp_deadzone_radial(x: f64, y: f64, dz: f64, outer: f64) -> GpStick {
+    val mag: f64 = math_sqrt(x * x + y * y);
+    if mag <= dz {
+        return GpStick { x: 0.0, y: 0.0 };
+    }
+    var t: f64 = (mag - dz) / (outer - dz);
+    if t > 1.0 {
+        t = 1.0;
+    }
+    return GpStick { x: x / mag * t, y: y / mag * t };
+}
+
+/// Per-axis dead zone on both axes (snaps towards the axes).
+pub fn gp_deadzone_axial2(x: f64, y: f64, dz: f64, outer: f64) -> GpStick {
+    return GpStick { x: gp_deadzone_axial(x, dz, outer), y: gp_deadzone_axial(y, dz, outer) };
+}
+
+/// A response curve: sign(x) * |x|^exponent (2 gives fine aim near the
+/// centre).
+pub fn gp_curve(x: f64, exponent: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0;
+    }
+    val r: f64 = math_pow(math_fabs(x), exponent);
+    if x < 0.0 {
+        return 0.0 - r;
+    }
+    return r;
+}
+
+// ─── Rumble ────────────────────────────────────────────────────────────────
+
+pub struct GpRumble {
+    /// Low-frequency (heavy) and high-frequency (light) motors, 0..1.
+    pub low: f64,
+    pub high: f64,
+    pub start_ms: i64,
+    pub duration_ms: i64,
+    pub attack_ms: i64,
+    pub fade_ms: i64,
+}
+
+pub struct GpRumbleMixer {
+    pub effects: Vec<GpRumble>,
+}
+
+pub fn gp_rumble_mixer_new() -> GpRumbleMixer {
+    return GpRumbleMixer { effects: Vec::new() };
+}
+
+pub fn gp_rumble_play(m: &mut GpRumbleMixer, low: f64, high: f64, now_ms: i64, duration_ms: i64, attack_ms: i64, fade_ms: i64) {
+    m.effects.push(GpRumble { low: low, high: high, start_ms: now_ms, duration_ms: duration_ms, attack_ms: attack_ms, fade_ms: fade_ms });
+}
+
+/// Envelope of an effect at a time: ramps up over attack, down over fade.
+pub fn gp_rumble_envelope(e: &GpRumble, now_ms: i64) -> f64 {
+    val t: i64 = now_ms - e.start_ms;
+    if t < 0 || t >= e.duration_ms {
+        return 0.0;
+    }
+    var g: f64 = 1.0;
+    if e.attack_ms > 0 && t < e.attack_ms {
+        g = (t as f64) / (e.attack_ms as f64);
+    }
+    val left: i64 = e.duration_ms - t;
+    if e.fade_ms > 0 && left < e.fade_ms {
+        val f: f64 = (left as f64) / (e.fade_ms as f64);
+        if f < g {
+            g = f;
+        }
+    }
+    return g;
+}
+
+/// The two motor values (0..65535) at a time: the strongest active effect
+/// per motor; finished effects are dropped. Returns [low, high].
+pub fn gp_rumble_mix(m: &mut GpRumbleMixer, now_ms: i64) -> Vec<i64> {
+    var low: f64 = 0.0;
+    var high: f64 = 0.0;
+    var i: i64 = 0;
+    while i < m.effects.len() {
+        val e: GpRumble = m.effects.get(i);
+        if now_ms - e.start_ms >= e.duration_ms {
+            m.effects.remove(i);
+            continue;
+        }
+        val g: f64 = gp_rumble_envelope(&e, now_ms);
+        if e.low * g > low { low = e.low * g; }
+        if e.high * g > high { high = e.high * g; }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(gp_motor(low));
+    out.push(gp_motor(high));
+    return out;
+}
+
+fn gp_motor(x: f64) -> i64 {
+    var v: f64 = x;
+    if v < 0.0 { v = 0.0; }
+    if v > 1.0 { v = 1.0; }
+    return (v * 65535.0 + 0.5) as i64;
+}
+
+/// Send the mix to a controller for the next `ms` milliseconds (SDL).
+pub fn gp_rumble_send(controller: i64, motors: &Vec<i64>, ms: i64) -> i64 {
+    return gp_sdl_rumble(controller, motors.get(0), motors.get(1), ms) as i64;
+}
+
+// ─── Hotplug ───────────────────────────────────────────────────────────────
+
+pub const GP_EVENT_CONNECTED: i64 = 1;
+pub const GP_EVENT_DISCONNECTED: i64 = 2;
+pub const GP_EVENT_RECONNECTED: i64 = 3;
+
+pub struct GpEvent {
+    pub kind: i64,
+    pub player: i64,
+    pub instance: i64,
+    pub guid: str,
+}
+
+pub struct GpHub {
+    pub max_players: i64,
+    /// Per player slot: the connected instance (-1 none) and the GUID that
+    /// last used it ("" never).
+    pub instance: Vec<i64>,
+    pub guid: Vec<str>,
+    pub events: Vec<GpEvent>,
+}
+
+pub fn gp_hub_new(max_players: i64) -> GpHub {
+    var g: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < max_players {
+        g.push("");
+        i = i + 1;
+    }
+    return GpHub { max_players: max_players, instance: Vec::filled(max_players, - 1), guid: g, events: Vec::new() };
+}
+
+/// The player slot of a connected instance, or -1.
+pub fn gp_hub_player_of(h: &GpHub, instance: i64) -> i64 {
+    var i: i64 = 0;
+    while i < h.max_players {
+        if h.instance.get(i) == instance {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// A device was added (SDL_CONTROLLERDEVICEADDED). Returns its player slot
+/// or -1 when all slots are taken (or it is already connected).
+pub fn gp_hub_added(h: &mut GpHub, instance: i64, guid: str) -> i64 {
+    if gp_hub_player_of(h, instance) >= 0 {
+        return - 1;
+    }
+    // a free slot this GUID used before
+    var slot: i64 = - 1;
+    var i: i64 = 0;
+    while i < h.max_players {
+        if h.instance.get(i) < 0 && h.guid.get(i) == guid {
+            slot = i;
+            break;
+        }
+        i = i + 1;
+    }
+    var kind: i64 = GP_EVENT_RECONNECTED;
+    if slot < 0 {
+        kind = GP_EVENT_CONNECTED;
+        // the lowest slot never used, else the lowest free one
+        i = 0;
+        while i < h.max_players && slot < 0 {
+            if h.instance.get(i) < 0 && h.guid.get(i) == "" {
+                slot = i;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < h.max_players && slot < 0 {
+            if h.instance.get(i) < 0 {
+                slot = i;
+            }
+            i = i + 1;
+        }
+    }
+    if slot < 0 {
+        return - 1;
+    }
+    h.instance.set(slot, instance);
+    h.guid.set(slot, guid);
+    h.events.push(GpEvent { kind: kind, player: slot, instance: instance, guid: guid });
+    return slot;
+}
+
+/// A device was removed (SDL_CONTROLLERDEVICEREMOVED). Returns the slot it
+/// had, or -1 for an unknown instance. The slot remembers the GUID.
+pub fn gp_hub_removed(h: &mut GpHub, instance: i64) -> i64 {
+    val slot: i64 = gp_hub_player_of(h, instance);
+    if slot < 0 {
+        return - 1;
+    }
+    h.instance.set(slot, - 1);
+    h.events.push(GpEvent { kind: GP_EVENT_DISCONNECTED, player: slot, instance: instance, guid: h.guid.get(slot) });
+    return slot;
+}
+
+/// Take the queued events.
+pub fn gp_hub_take(h: &mut GpHub) -> Vec<GpEvent> {
+    val out: Vec<GpEvent> = h.events;
+    h.events = Vec::new();
+    return out;
+}
+
+pub fn gp_hub_connected(h: &GpHub) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < h.max_players {
+        if h.instance.get(i) >= 0 {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}

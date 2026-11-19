@@ -12,12 +12,13 @@
 //   config_load(&mut c, "app.ini", "APP_");
 //   // --port=9090 > APP_PORT=9090 > port = 9090 in app.ini > "8080"
 //   println(config_int(c, "port"));
+//   val key = config_secret(c, "api_key");   // @secret: cannot be printed
 //
 // A dotted name ("db.port") reads [db] port in the file and env DB_PORT
 // with the prefix, so nested config maps to flat sources.
 
 module config;
- use ini; use env; use args; use file;
+ use args; use env; use file; use ini;
  pub const CONFIG_STR: i64 = 0; pub const CONFIG_INT: i64 = 1; pub const CONFIG_BOOL: i64 = 2; pub const CONFIG_FLOAT: i64 = 3;
 // Where a value came from: 0 unresolved, 1 flag, 2 env, 3 file, 4 default.
 const SRC_FLAG: i64 = 1; const SRC_ENV: i64 = 2; const SRC_FILE: i64 = 3; const SRC_DEFAULT: i64 = 4;
@@ -34,6 +35,19 @@ pub struct Config {
     fields: Vec<ConfigField>,
 }
 
+/// An empty set of declared keys.
+///
+/// Example:
+///   var c = config_new();
+///   config_opt(&mut c, "port", CONFIG_INT, "8080");
+///   config_opt(&mut c, "debug", CONFIG_BOOL, "yes");
+///   config_opt(&mut c, "ratio", CONFIG_FLOAT, "0.5");
+///   config_load(&mut c, "", "FIDDOC_NO_SUCH_PREFIX_");
+///   assert_eq(config_int(c, "port"), 8080);
+///   assert(config_bool(c, "debug"));
+///   assert(config_float(c, "ratio") == 0.5);
+///   assert(!config_given(c, "port"));
+///   assert_eq(config_str(c, "port"), "8080");
 pub fn config_new() -> Config {
     return Config {
         fields: Vec::new()
@@ -212,6 +226,15 @@ fn config_find(c: Config, name: str) -> ConfigField {
 }
 
 pub fn config_str(c: Config, name: str) -> str {
+    return config_find(c, name).value;
+}
+
+/// A key that holds a credential (`api_key`, a password, a token), as text.
+/// The result is `@secret` (complaint CO1): the compiler rejects a program
+/// in which it reaches print, a log, a file, the network, a global or
+/// another task. Send it as a credential from a function you mark
+/// `@declassify` (an audited release).
+@secret pub fn config_secret(c: Config, name: str) -> str {
     return config_find(c, name).value;
 }
 

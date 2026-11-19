@@ -1,0 +1,1434 @@
+// Fides post-quantum KEM and signatures: ML-KEM-768 (FIPS 203, the
+// standardized Kyber) key generation, encapsulation and decapsulation with
+// implicit rejection; ML-DSA-44 and ML-DSA-65 (FIPS 204, the standardized
+// Dilithium) key generation, signing (deterministic or hedged) and
+// verification with context strings; and the SHA-3 family they are built
+// on (FIPS 202): Keccak-f[1600], SHA3-256, SHA3-512, SHAKE128, SHAKE256.
+//
+// Pure computation. The seam is randomness: key generation takes the
+// 64-byte seed d || z and encapsulation the 32-byte message m from the
+// caller (crypto_random_bytes in real use), which are also the inputs of
+// FIPS 203's ML-KEM.KeyGen_internal and Encaps_internal, so known-answer
+// tests run unchanged. Polynomials are Vec<i64> of 256 coefficients mod
+// q = 3329; the NTT, base-case multiplication, CBD sampling, rejection
+// sampling, compression and byte encodings follow FIPS 203 Algorithms 3-18
+// directly (no Montgomery or Barrett tricks, so the code reads like the
+// standard). Not constant time: the comparison of re-encrypted
+// ciphertexts in decapsulation is, but the arithmetic uses % and branches.
+//
+// Lanes of Keccak are u64 inside @wrapping functions; the round constants
+// and rotation offsets are generated from their definitions (the LFSR and
+// the (t+1)(t+2)/2 rule) rather than typed in.
+//
+// Checked in tests/bootstrap/test_std_pqc.fd: SHA-3/SHAKE against FIPS 202
+// examples and Python's hashlib; ML-KEM-768 against OpenSSL 3.5: the same
+// seed gives the same encapsulation key, an OpenSSL ciphertext decapsulates
+// to OpenSSL's shared secret, OpenSSL decapsulates our ciphertext to our
+// secret, and a corrupted ciphertext gives the implicit-rejection key
+// OpenSSL gives. ML-DSA in tests/bootstrap/test_std_pqc_mldsa.fd against
+// OpenSSL 3.5: keys from the same seed, deterministic signatures (with and
+// without context) and hedged ones with fixed randomness are byte-exact,
+// and a randomized OpenSSL signature verifies. ML-DSA's seam is the same:
+// keygen takes the 32-byte seed xi, hedged signing the 32 bytes rnd. Like
+// ML-KEM it is not constant time (rejection loop timings are inherent to
+// the scheme; the arithmetic uses % and branches). HashML-DSA (pre-hash)
+// and ML-DSA-87 are not implemented.
+//
+// Usage:
+//   use pqc;
+//   val kp = mlkem768_keygen(seed64);                // kp.ek (1184 B), kp.dk (2400 B)
+//   val e = mlkem768_encaps(kp.ek, m32);              // e.ct (1088 B), e.key (32 B)
+//   val k = mlkem768_decaps(kp.dk, e.ct);             // == e.key
+//   val p = mldsa44_params();
+//   val kp2 = mldsa_keygen(& p, xi32);                // kp2.pk (1312 B), kp2.sk (2560 B)
+//   val sig = mldsa_sign(& p, kp2.sk, msg, ctx, rnd32); // 2420 B
+//   val good = mldsa_verify(& p, kp2.pk, msg, ctx, sig);
+
+module pqc;
+use vec;
+
+// ─── Keccak / SHA-3 (FIPS 202) ─────────────────────────────────────────
+
+@wrapping fn kc_rotl(x: u64, n: u64) -> u64 {
+    if n == 0 { return x; }
+    return (x << n) | (x >> (64 - n));
+}
+
+/// The 24 round constants, from the LFSR of FIPS 202 §3.2.5.
+@wrapping fn kc_round_constants() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var lfsr: i64 = 1;
+    var r: i64 = 0;
+    while r < 24 {
+        var rc: u64 = 0;
+        var j: i64 = 0;
+        while j < 7 {
+            val bit: i64 = lfsr & 1;
+            if (lfsr & 0x80) != 0 { lfsr = ((lfsr << 1) ^ 0x71) & 255; } else { lfsr = (lfsr << 1) & 255; }
+            if bit == 1 { rc = rc | ((1 as u64) << (((1 << j) - 1) as u64)); }
+            j = j + 1;
+        }
+        out.push(rc as i64);
+        r = r + 1;
+    }
+    return out;
+}
+
+/// The rotation offset of each lane x + 5 y (FIPS 202 §3.2.2).
+fn kc_rotations() -> Vec<i64> {
+    var rot: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 25 { rot.push(0); i = i + 1; }
+    var x: i64 = 1;
+    var y: i64 = 0;
+    var t: i64 = 0;
+    while t < 24 {
+        rot.set(x + 5 * y, ((t + 1) * (t + 2) / 2) % 64);
+        val nx: i64 = y;
+        y = (2 * x + 3 * y) % 5;
+        x = nx;
+        t = t + 1;
+    }
+    return rot;
+}
+
+/// Keccak-f[1600] on 25 lanes, in place.
+@wrapping pub fn keccak_f1600(a: & mut Vec<i64>) {
+    val rc: Vec<i64> = kc_round_constants();
+    val rot: Vec<i64> = kc_rotations();
+    var c: Vec<i64> = Vec::new();
+    var b: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 5 { c.push(0); i = i + 1; }
+    i = 0;
+    while i < 25 { b.push(0); i = i + 1; }
+    var round: i64 = 0;
+    while round < 24 {
+        var x: i64 = 0;
+        while x < 5 {
+            c.set(x, a.get(x) ^ a.get(x + 5) ^ a.get(x + 10) ^ a.get(x + 15) ^ a.get(x + 20));
+            x = x + 1;
+        }
+        x = 0;
+        while x < 5 {
+            val d: u64 = (c.get((x + 4) % 5) as u64) ^ kc_rotl(c.get((x + 1) % 5) as u64, 1);
+            var y: i64 = 0;
+            while y < 25 {
+                a.set(x + y, ((a.get(x + y) as u64) ^ d) as i64);
+                y = y + 5;
+            }
+            x = x + 1;
+        }
+        x = 0;
+        while x < 5 {
+            var y2: i64 = 0;
+            while y2 < 5 {
+                val idx: i64 = x + 5 * y2;
+                b.set(y2 + 5 * ((2 * x + 3 * y2) % 5), kc_rotl(a.get(idx) as u64, rot.get(idx) as u64) as i64);
+                y2 = y2 + 1;
+            }
+            x = x + 1;
+        }
+        var y3: i64 = 0;
+        while y3 < 25 {
+            x = 0;
+            while x < 5 {
+                val nb: u64 = ~(b.get((x + 1) % 5 + y3) as u64);
+                a.set(x + y3, ((b.get(x + y3) as u64) ^ (nb & (b.get((x + 2) % 5 + y3) as u64))) as i64);
+                x = x + 1;
+            }
+            y3 = y3 + 5;
+        }
+        a.set(0, ((a.get(0) as u64) ^ (rc.get(round) as u64)) as i64);
+        round = round + 1;
+    }
+}
+
+/// The sponge: absorb msg with the domain/padding byte `ds` at rate
+/// `rate` bytes, then squeeze `out_len` bytes.
+pub fn keccak_sponge(rate: i64, ds: i64, msg: Vec<i64>, out_len: i64) -> Vec<i64> {
+    var st: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 25 { st.push(0); i = i + 1; }
+    var padded: Vec<i64> = Vec::new();
+    i = 0;
+    while i < msg.len() { padded.push(msg.get(i) & 255); i = i + 1; }
+    padded.push(ds);
+    while padded.len() % rate != 0 { padded.push(0); }
+    padded.set(padded.len() - 1, padded.get(padded.len() - 1) | 0x80);
+    var off: i64 = 0;
+    while off < padded.len() {
+        i = 0;
+        while i < rate {
+            val lane: i64 = i / 8;
+            st.set(lane, st.get(lane) ^ (padded.get(off + i) << ((i % 8) * 8)));
+            i = i + 1;
+        }
+        keccak_f1600(& mut st);
+        off = off + rate;
+    }
+    var out: Vec<i64> = Vec::new();
+    while out.len() < out_len {
+        i = 0;
+        while i < rate && out.len() < out_len {
+            out.push((st.get(i / 8) >> ((i % 8) * 8)) & 255);
+            i = i + 1;
+        }
+        if out.len() < out_len { keccak_f1600(& mut st); }
+    }
+    return out;
+}
+
+/// SHA3-256.
+pub fn sha3_256(msg: Vec<i64>) -> Vec<i64> { return keccak_sponge(136, 0x06, msg, 32); }
+/// SHA3-512.
+pub fn sha3_512(msg: Vec<i64>) -> Vec<i64> { return keccak_sponge(72, 0x06, msg, 64); }
+/// SHAKE128 with `n` output bytes.
+pub fn shake128(msg: Vec<i64>, n: i64) -> Vec<i64> { return keccak_sponge(168, 0x1f, msg, n); }
+/// SHAKE256 with `n` output bytes.
+pub fn shake256(msg: Vec<i64>, n: i64) -> Vec<i64> { return keccak_sponge(136, 0x1f, msg, n); }
+
+// ─── ML-KEM arithmetic (FIPS 203 §4) ───────────────────────────────────
+
+pub const MLKEM_Q: i64 = 3329;
+pub const MLKEM_K: i64 = 3;
+
+fn mk_bitrev7(i: i64) -> i64 {
+    var r: i64 = 0;
+    var k: i64 = 0;
+    while k < 7 {
+        if ((i >> k) & 1) == 1 { r = r | (1 << (6 - k)); }
+        k = k + 1;
+    }
+    return r;
+}
+
+fn mk_pow17(e: i64) -> i64 {
+    var r: i64 = 1;
+    var k: i64 = 0;
+    while k < e { r = (r * 17) % MLKEM_Q; k = k + 1; }
+    return r;
+}
+
+/// zeta_i = 17^BitRev7(i) mod q, i = 0..127.
+fn mk_zetas() -> Vec<i64> {
+    var z: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 128 { z.push(mk_pow17(mk_bitrev7(i))); i = i + 1; }
+    return z;
+}
+
+/// gamma_i = 17^(2 BitRev7(i) + 1) mod q, i = 0..127.
+fn mk_gammas() -> Vec<i64> {
+    var g: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 128 { g.push(mk_pow17(2 * mk_bitrev7(i) + 1)); i = i + 1; }
+    return g;
+}
+
+/// Precomputed tables, built once per operation.
+pub struct MlkemTables {
+    zetas: Vec<i64>,
+    gammas: Vec<i64>,
+}
+
+fn mk_tables() -> MlkemTables {
+    return MlkemTables { zetas: mk_zetas(), gammas: mk_gammas() };
+}
+
+/// NTT (Algorithm 9), in place.
+fn mk_ntt(f: & mut Vec<i64>, t: & MlkemTables) {
+    var i: i64 = 1;
+    var len: i64 = 128;
+    while len >= 2 {
+        var start: i64 = 0;
+        while start < 256 {
+            val zeta: i64 = t.zetas.get(i);
+            i = i + 1;
+            var j: i64 = start;
+            while j < start + len {
+                val x: i64 = (zeta * f.get(j + len)) % MLKEM_Q;
+                f.set(j + len, (f.get(j) - x + MLKEM_Q) % MLKEM_Q);
+                f.set(j, (f.get(j) + x) % MLKEM_Q);
+                j = j + 1;
+            }
+            start = start + 2 * len;
+        }
+        len = len / 2;
+    }
+}
+
+/// Inverse NTT (Algorithm 10), in place.
+fn mk_intt(f: & mut Vec<i64>, t: & MlkemTables) {
+    var i: i64 = 127;
+    var len: i64 = 2;
+    while len <= 128 {
+        var start: i64 = 0;
+        while start < 256 {
+            val zeta: i64 = t.zetas.get(i);
+            i = i - 1;
+            var j: i64 = start;
+            while j < start + len {
+                val x: i64 = f.get(j);
+                f.set(j, (x + f.get(j + len)) % MLKEM_Q);
+                f.set(j + len, (zeta * ((f.get(j + len) - x + MLKEM_Q) % MLKEM_Q)) % MLKEM_Q);
+                j = j + 1;
+            }
+            start = start + 2 * len;
+        }
+        len = len * 2;
+    }
+    var k: i64 = 0;
+    while k < 256 { f.set(k, (f.get(k) * 3303) % MLKEM_Q); k = k + 1; }
+}
+
+/// MultiplyNTTs (Algorithm 11) accumulated into acc: acc += f * g.
+fn mk_mul_acc(acc: & mut Vec<i64>, f: & Vec<i64>, g: & Vec<i64>, t: & MlkemTables) {
+    var i: i64 = 0;
+    while i < 128 {
+        val a0: i64 = f.get(2 * i);
+        val a1: i64 = f.get(2 * i + 1);
+        val b0: i64 = g.get(2 * i);
+        val b1: i64 = g.get(2 * i + 1);
+        val c0: i64 = (a0 * b0 + ((a1 * b1) % MLKEM_Q) * t.gammas.get(i)) % MLKEM_Q;
+        val c1: i64 = (a0 * b1 + a1 * b0) % MLKEM_Q;
+        acc.set(2 * i, (acc.get(2 * i) + c0) % MLKEM_Q);
+        acc.set(2 * i + 1, (acc.get(2 * i + 1) + c1) % MLKEM_Q);
+        i = i + 1;
+    }
+}
+
+fn mk_zero() -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { p.push(0); i = i + 1; }
+    return p;
+}
+
+fn mk_add(a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { p.push((a.get(i) + b.get(i)) % MLKEM_Q); i = i + 1; }
+    return p;
+}
+
+/// SampleNTT (Algorithm 7) from SHAKE128(rho || j || i).
+fn mk_sample_ntt(rho: & Vec<i64>, j: i64, i: i64) -> Vec<i64> {
+    var seed: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 32 { seed.push(rho.get(k)); k = k + 1; }
+    seed.push(j);
+    seed.push(i);
+    var blocks: i64 = 3;
+    while true {
+        val c: Vec<i64> = shake128(seed, 168 * blocks);
+        var a: Vec<i64> = Vec::new();
+        var p: i64 = 0;
+        while a.len() < 256 && p + 3 <= c.len() {
+            val d1: i64 = c.get(p) + 256 * (c.get(p + 1) % 16);
+            val d2: i64 = c.get(p + 1) / 16 + 16 * c.get(p + 2);
+            if d1 < MLKEM_Q { a.push(d1); }
+            if d2 < MLKEM_Q && a.len() < 256 { a.push(d2); }
+            p = p + 3;
+        }
+        if a.len() == 256 { return a; }
+        blocks = blocks + 2;
+    }
+    return mk_zero();
+}
+
+/// SamplePolyCBD_eta (Algorithm 8) from 64 eta bytes.
+fn mk_cbd(b: & Vec<i64>, eta: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 {
+        var x: i64 = 0;
+        var y: i64 = 0;
+        var j: i64 = 0;
+        while j < eta {
+            val bx: i64 = 2 * i * eta + j;
+            val by: i64 = 2 * i * eta + eta + j;
+            x = x + ((b.get(bx / 8) >> (bx % 8)) & 1);
+            y = y + ((b.get(by / 8) >> (by % 8)) & 1);
+            j = j + 1;
+        }
+        f.push((x - y + MLKEM_Q) % MLKEM_Q);
+        i = i + 1;
+    }
+    return f;
+}
+
+/// PRF_eta(s, b) = SHAKE256(s || b, 64 eta).
+fn mk_prf(s: & Vec<i64>, b: i64, eta: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 32 { m.push(s.get(k)); k = k + 1; }
+    m.push(b);
+    return shake256(m, 64 * eta);
+}
+
+/// ByteEncode_d (Algorithm 5) of one polynomial, appended to out.
+fn mk_encode(out: & mut Vec<i64>, f: & Vec<i64>, d: i64) {
+    var acc: i64 = 0;
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < 256 {
+        acc = acc | (f.get(i) << bits);
+        bits = bits + d;
+        while bits >= 8 {
+            out.push(acc & 255);
+            acc = acc >> 8;
+            bits = bits - 8;
+        }
+        i = i + 1;
+    }
+}
+
+/// ByteDecode_d (Algorithm 6) of one polynomial at b[off..].
+fn mk_decode(b: & Vec<i64>, off: i64, d: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    var acc: i64 = 0;
+    var bits: i64 = 0;
+    var p: i64 = off;
+    val mask: i64 = (1 << d) - 1;
+    while f.len() < 256 {
+        while bits < d {
+            acc = acc | ((b.get(p) & 255) << bits);
+            p = p + 1;
+            bits = bits + 8;
+        }
+        var v: i64 = acc & mask;
+        if d == 12 { v = v % MLKEM_Q; }
+        f.push(v);
+        acc = acc >> d;
+        bits = bits - d;
+    }
+    return f;
+}
+
+fn mk_compress(f: & Vec<i64>, d: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 {
+        o.push((((f.get(i) << d) + MLKEM_Q / 2) / MLKEM_Q) & ((1 << d) - 1));
+        i = i + 1;
+    }
+    return o;
+}
+
+fn mk_decompress(f: & Vec<i64>, d: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 {
+        o.push((f.get(i) * MLKEM_Q + (1 << (d - 1))) >> d);
+        i = i + 1;
+    }
+    return o;
+}
+
+fn mk_slice(b: & Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var o: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    while i < to { o.push(b.get(i) & 255); i = i + 1; }
+    return o;
+}
+
+fn mk_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() { o.push(b.get(i) & 255); i = i + 1; }
+    return o;
+}
+
+// ─── K-PKE (FIPS 203 §5) ───────────────────────────────────────────────
+
+/// A_hat[i][j] = SampleNTT(rho || j || i), as a flat list (index 3 i + j).
+fn mk_matrix(rho: & Vec<i64>) -> Vec<Vec<i64>> {
+    var a: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < MLKEM_K {
+        var j: i64 = 0;
+        while j < MLKEM_K {
+            a.push(mk_sample_ntt(rho, j, i));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return a;
+}
+
+/// K-PKE.Encrypt (Algorithm 14).
+fn mk_pke_encrypt(ek: & Vec<i64>, m: & Vec<i64>, r: & Vec<i64>, t: & MlkemTables) -> Vec<i64> {
+    var that: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < MLKEM_K { that.push(mk_decode(ek, 384 * i, 12)); i = i + 1; }
+    val rho: Vec<i64> = mk_slice(ek, 384 * MLKEM_K, 384 * MLKEM_K + 32);
+    val a: Vec<Vec<i64>> = mk_matrix(& rho);
+    var n: i64 = 0;
+    var yhat: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < MLKEM_K {
+        var y: Vec<i64> = mk_cbd(& mk_prf(r, n, 2), 2);
+        n = n + 1;
+        mk_ntt(& mut y, t);
+        yhat.push(y);
+        i = i + 1;
+    }
+    var e1: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < MLKEM_K {
+        e1.push(mk_cbd(& mk_prf(r, n, 2), 2));
+        n = n + 1;
+        i = i + 1;
+    }
+    val e2: Vec<i64> = mk_cbd(& mk_prf(r, n, 2), 2);
+    var c: Vec<i64> = Vec::new();
+    i = 0;
+    while i < MLKEM_K {
+        // u[i] = NTT^-1(sum_j A_hat[j][i] * y_hat[j]) + e1[i]  (A transposed)
+        var acc: Vec<i64> = mk_zero();
+        var j: i64 = 0;
+        while j < MLKEM_K {
+            val aji: Vec<i64> = a.get(3 * j + i);
+            val yj: Vec<i64> = yhat.get(j);
+            mk_mul_acc(& mut acc, & aji, & yj, t);
+            j = j + 1;
+        }
+        mk_intt(& mut acc, t);
+        val e1i: Vec<i64> = e1.get(i);
+        val u: Vec<i64> = mk_add(& acc, & e1i);
+        mk_encode(& mut c, & mk_compress(& u, 10), 10);
+        i = i + 1;
+    }
+    var vacc: Vec<i64> = mk_zero();
+    i = 0;
+    while i < MLKEM_K {
+        val ti: Vec<i64> = that.get(i);
+        val yi: Vec<i64> = yhat.get(i);
+        mk_mul_acc(& mut vacc, & ti, & yi, t);
+        i = i + 1;
+    }
+    mk_intt(& mut vacc, t);
+    val mu: Vec<i64> = mk_decompress(& mk_decode(m, 0, 1), 1);
+    val v: Vec<i64> = mk_add(& mk_add(& vacc, & e2), & mu);
+    mk_encode(& mut c, & mk_compress(& v, 4), 4);
+    return c;
+}
+
+/// K-PKE.Decrypt (Algorithm 15).
+fn mk_pke_decrypt(dk: & Vec<i64>, c: & Vec<i64>, t: & MlkemTables) -> Vec<i64> {
+    var acc: Vec<i64> = mk_zero();
+    var i: i64 = 0;
+    while i < MLKEM_K {
+        var u: Vec<i64> = mk_decompress(& mk_decode(c, 320 * i, 10), 10);
+        mk_ntt(& mut u, t);
+        val s: Vec<i64> = mk_decode(dk, 384 * i, 12);
+        mk_mul_acc(& mut acc, & s, & u, t);
+        i = i + 1;
+    }
+    mk_intt(& mut acc, t);
+    val v: Vec<i64> = mk_decompress(& mk_decode(c, 320 * MLKEM_K, 4), 4);
+    var w: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 256 { w.push((v.get(i) - acc.get(i) + MLKEM_Q) % MLKEM_Q); i = i + 1; }
+    var m: Vec<i64> = Vec::new();
+    mk_encode(& mut m, & mk_compress(& w, 1), 1);
+    return m;
+}
+
+// ─── ML-KEM-768 (FIPS 203 §6, §7) ──────────────────────────────────────
+
+/// A key pair: ek (1184 bytes) and dk (2400 bytes).
+pub struct MlkemKeyPair {
+    pub ek: Vec<i64>,
+    pub dk: Vec<i64>,
+}
+
+/// The result of encapsulation: ciphertext (1088 bytes) and key (32).
+pub struct MlkemEncap {
+    pub ok: bool,
+    pub ct: Vec<i64>,
+    pub key: Vec<i64>,
+}
+
+/// ML-KEM.KeyGen_internal(d, z) from the 64-byte seed d || z.
+pub fn mlkem768_keygen(seed: Vec<i64>) -> MlkemKeyPair {
+    val t: MlkemTables = mk_tables();
+    val d: Vec<i64> = mk_slice(& seed, 0, 32);
+    val z: Vec<i64> = mk_slice(& seed, 32, 64);
+    var dk3: Vec<i64> = d;
+    dk3.push(MLKEM_K);
+    val g: Vec<i64> = sha3_512(dk3);
+    val rho: Vec<i64> = mk_slice(& g, 0, 32);
+    val sigma: Vec<i64> = mk_slice(& g, 32, 64);
+    val a: Vec<Vec<i64>> = mk_matrix(& rho);
+    var n: i64 = 0;
+    var shat: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < MLKEM_K {
+        var s: Vec<i64> = mk_cbd(& mk_prf(& sigma, n, 2), 2);
+        n = n + 1;
+        mk_ntt(& mut s, & t);
+        shat.push(s);
+        i = i + 1;
+    }
+    var ek: Vec<i64> = Vec::new();
+    var dkp: Vec<i64> = Vec::new();
+    i = 0;
+    while i < MLKEM_K {
+        var e: Vec<i64> = mk_cbd(& mk_prf(& sigma, n, 2), 2);
+        n = n + 1;
+        mk_ntt(& mut e, & t);
+        var acc: Vec<i64> = e;
+        var j: i64 = 0;
+        while j < MLKEM_K {
+            val aij: Vec<i64> = a.get(3 * i + j);
+            val sj: Vec<i64> = shat.get(j);
+            mk_mul_acc(& mut acc, & aij, & sj, & t);
+            j = j + 1;
+        }
+        mk_encode(& mut ek, & acc, 12);
+        i = i + 1;
+    }
+    ek = mk_cat(ek, rho);
+    i = 0;
+    while i < MLKEM_K {
+        val si: Vec<i64> = shat.get(i);
+        mk_encode(& mut dkp, & si, 12);
+        i = i + 1;
+    }
+    val dk: Vec<i64> = mk_cat(mk_cat(mk_cat(dkp, ek), sha3_256(ek)), z);
+    return MlkemKeyPair { ek: ek, dk: dk };
+}
+
+/// The encapsulation key check of FIPS 203 §7.2: the right length and
+/// every coefficient below q (decoding then encoding changes nothing).
+pub fn mlkem768_ek_valid(ek: Vec<i64>) -> bool {
+    if ek.len() != 384 * MLKEM_K + 32 { return false; }
+    var re: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < MLKEM_K {
+        mk_encode(& mut re, & mk_decode(& ek, 384 * i, 12), 12);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 384 * MLKEM_K {
+        if re.get(i) != ek.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// ML-KEM.Encaps_internal(ek, m) with the caller's 32 random bytes m.
+pub fn mlkem768_encaps(ek: Vec<i64>, m: Vec<i64>) -> MlkemEncap {
+    if !mlkem768_ek_valid(ek) || m.len() != 32 { return MlkemEncap { ok: false, ct: Vec::new(), key: Vec::new() }; }
+    val t: MlkemTables = mk_tables();
+    val g: Vec<i64> = sha3_512(mk_cat(m, sha3_256(ek)));
+    val key: Vec<i64> = mk_slice(& g, 0, 32);
+    val r: Vec<i64> = mk_slice(& g, 32, 64);
+    val c: Vec<i64> = mk_pke_encrypt(& ek, & m, & r, & t);
+    return MlkemEncap { ok: true, ct: c, key: key };
+}
+
+/// ML-KEM.Decaps_internal(dk, c): the shared key, or the implicit-rejection
+/// key J(z || c) when the ciphertext does not re-encrypt to itself.
+/// Empty only when the lengths are wrong.
+pub fn mlkem768_decaps(dk: Vec<i64>, c: Vec<i64>) -> Vec<i64> {
+    if dk.len() != 768 * MLKEM_K + 96 || c.len() != 32 * (10 * MLKEM_K + 4) { return Vec::new(); }
+    val t: MlkemTables = mk_tables();
+    val dkp: Vec<i64> = mk_slice(& dk, 0, 384 * MLKEM_K);
+    val ek: Vec<i64> = mk_slice(& dk, 384 * MLKEM_K, 768 * MLKEM_K + 32);
+    val h: Vec<i64> = mk_slice(& dk, 768 * MLKEM_K + 32, 768 * MLKEM_K + 64);
+    val z: Vec<i64> = mk_slice(& dk, 768 * MLKEM_K + 64, 768 * MLKEM_K + 96);
+    val m2: Vec<i64> = mk_pke_decrypt(& dkp, & c, & t);
+    val g: Vec<i64> = sha3_512(mk_cat(m2, h));
+    val k2: Vec<i64> = mk_slice(& g, 0, 32);
+    val r2: Vec<i64> = mk_slice(& g, 32, 64);
+    val kbar: Vec<i64> = shake256(mk_cat(z, c), 32);
+    val c2: Vec<i64> = mk_pke_encrypt(& ek, & m2, & r2, & t);
+    var diff: i64 = 0;
+    var i: i64 = 0;
+    while i < c.len() { diff = diff | ((c.get(i) ^ c2.get(i)) & 255); i = i + 1; }
+    // Select without a branch on the comparison: mask is -1 when equal.
+    val mask: i64 = ((diff - 1) >> 8) & 255;
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 32 {
+        out.push((k2.get(i) & mask) | (kbar.get(i) & (255 ^ mask)));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── ML-DSA (FIPS 204) ─────────────────────────────────────────────────
+//
+// ML-DSA-44 and ML-DSA-65: KeyGen_internal (Algorithm 6) from the 32-byte
+// seed xi, Sign_internal (Algorithm 7) with the caller's 32 bytes rnd
+// (all zero = the deterministic variant), Verify_internal (Algorithm 8),
+// and the pure ML-DSA.Sign / ML-DSA.Verify wrappers (Algorithms 2, 3) that
+// prefix the message with 0 || |ctx| || ctx. Polynomials are Vec<i64> of
+// 256 coefficients in 0..q-1, q = 8380417; the NTT is Algorithms 41/42
+// with zeta = 1753, the rest follows Algorithms 9-40 directly.
+
+pub const MLDSA_Q: i64 = 8380417;
+
+/// The parameter set (FIPS 204 Table 1).
+pub struct MldsaParams {
+    pub name: str,
+    pub k: i64,
+    pub l: i64,
+    pub eta: i64,
+    pub tau: i64,
+    pub beta: i64,
+    pub gamma1: i64,
+    pub gamma2: i64,
+    pub omega: i64,
+    pub ctilde: i64,
+    pub pk_len: i64,
+    pub sk_len: i64,
+    pub sig_len: i64,
+}
+
+/// ML-DSA-44 (security category 2).
+pub fn mldsa44_params() -> MldsaParams {
+    return MldsaParams {
+        name: "ML-DSA-44", k: 4, l: 4, eta: 2, tau: 39, beta: 78,
+        gamma1: 131072, gamma2: 95232, omega: 80, ctilde: 32,
+        pk_len: 1312, sk_len: 2560, sig_len: 2420
+    };
+}
+
+/// ML-DSA-65 (security category 3).
+pub fn mldsa65_params() -> MldsaParams {
+    return MldsaParams {
+        name: "ML-DSA-65", k: 6, l: 5, eta: 4, tau: 49, beta: 196,
+        gamma1: 524288, gamma2: 261888, omega: 55, ctilde: 48,
+        pk_len: 1952, sk_len: 4032, sig_len: 3309
+    };
+}
+
+/// A key pair: pk and sk as FIPS 204 encodes them.
+pub struct MldsaKeyPair {
+    pub ok: bool,
+    pub pk: Vec<i64>,
+    pub sk: Vec<i64>,
+}
+
+fn md_powmod(b: i64, e: i64) -> i64 {
+    var r: i64 = 1;
+    var x: i64 = b % MLDSA_Q;
+    var n: i64 = e;
+    while n > 0 {
+        if (n & 1) == 1 { r = (r * x) % MLDSA_Q; }
+        x = (x * x) % MLDSA_Q;
+        n = n >> 1;
+    }
+    return r;
+}
+
+fn md_bitrev8(i: i64) -> i64 {
+    var r: i64 = 0;
+    var k: i64 = 0;
+    while k < 8 {
+        if ((i >> k) & 1) == 1 { r = r | (1 << (7 - k)); }
+        k = k + 1;
+    }
+    return r;
+}
+
+/// zetas[k] = 1753^BitRev8(k) mod q, k = 0..255.
+fn md_zetas() -> Vec<i64> {
+    var z: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { z.push(md_powmod(1753, md_bitrev8(i))); i = i + 1; }
+    return z;
+}
+
+/// NTT (Algorithm 41), in place.
+fn md_ntt(w: & mut Vec<i64>, zetas: & Vec<i64>) {
+    var m: i64 = 0;
+    var len: i64 = 128;
+    while len >= 1 {
+        var start: i64 = 0;
+        while start < 256 {
+            m = m + 1;
+            val z: i64 = zetas.get(m);
+            var j: i64 = start;
+            while j < start + len {
+                val t: i64 = (z * w.get(j + len)) % MLDSA_Q;
+                val a: i64 = w.get(j);
+                w.set(j + len, (a - t + MLDSA_Q) % MLDSA_Q);
+                w.set(j, (a + t) % MLDSA_Q);
+                j = j + 1;
+            }
+            start = start + 2 * len;
+        }
+        len = len / 2;
+    }
+}
+
+/// Inverse NTT (Algorithm 42), in place.
+fn md_intt(w: & mut Vec<i64>, zetas: & Vec<i64>) {
+    var m: i64 = 256;
+    var len: i64 = 1;
+    while len < 256 {
+        var start: i64 = 0;
+        while start < 256 {
+            m = m - 1;
+            val z: i64 = MLDSA_Q - zetas.get(m);
+            var j: i64 = start;
+            while j < start + len {
+                val t: i64 = w.get(j);
+                val u: i64 = w.get(j + len);
+                w.set(j, (t + u) % MLDSA_Q);
+                w.set(j + len, (z * ((t - u + MLDSA_Q) % MLDSA_Q)) % MLDSA_Q);
+                j = j + 1;
+            }
+            start = start + 2 * len;
+        }
+        len = len * 2;
+    }
+    var k: i64 = 0;
+    while k < 256 { w.set(k, (w.get(k) * 8347681) % MLDSA_Q); k = k + 1; }
+}
+
+fn md_zero() -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { p.push(0); i = i + 1; }
+    return p;
+}
+
+/// acc += a * b (pointwise, NTT domain).
+fn md_mul_acc(acc: & mut Vec<i64>, a: & Vec<i64>, b: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < 256 {
+        acc.set(i, (acc.get(i) + a.get(i) * b.get(i)) % MLDSA_Q);
+        i = i + 1;
+    }
+}
+
+fn md_mul(a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { p.push((a.get(i) * b.get(i)) % MLDSA_Q); i = i + 1; }
+    return p;
+}
+
+fn md_add(a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { p.push((a.get(i) + b.get(i)) % MLDSA_Q); i = i + 1; }
+    return p;
+}
+
+fn md_sub(a: & Vec<i64>, b: & Vec<i64>) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { p.push((a.get(i) - b.get(i) + MLDSA_Q) % MLDSA_Q); i = i + 1; }
+    return p;
+}
+
+/// x mod+- q for x in 0..q-1: the representative in -(q-1)/2..(q-1)/2.
+fn md_center(x: i64) -> i64 {
+    if x > (MLDSA_Q - 1) / 2 { return x - MLDSA_Q; }
+    return x;
+}
+
+/// The infinity norm of a polynomial (centered coefficients).
+fn md_norm(a: & Vec<i64>) -> i64 {
+    var m: i64 = 0;
+    var i: i64 = 0;
+    while i < 256 {
+        var v: i64 = md_center(a.get(i));
+        if v < 0 { v = 0 - v; }
+        if v > m { m = v; }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn md_cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var o: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() { o.push(b.get(i) & 255); i = i + 1; }
+    return o;
+}
+
+// ─── Sampling (Algorithms 29-34) ───────────────────────────────────────
+
+/// RejNTTPoly (Algorithm 30) on rho || s || r (ExpandA's seed).
+fn md_rej_ntt(rho: & Vec<i64>, s: i64, r: i64) -> Vec<i64> {
+    var seed: Vec<i64> = mk_slice(rho, 0, 32);
+    seed.push(s);
+    seed.push(r);
+    var blocks: i64 = 5;
+    while true {
+        val c: Vec<i64> = shake128(seed, 168 * blocks);
+        var a: Vec<i64> = Vec::new();
+        var p: i64 = 0;
+        while a.len() < 256 && p + 3 <= c.len() {
+            val z: i64 = c.get(p) + 256 * c.get(p + 1) + 65536 * (c.get(p + 2) & 127);
+            if z < MLDSA_Q { a.push(z); }
+            p = p + 3;
+        }
+        if a.len() == 256 { return a; }
+        blocks = blocks + 2;
+    }
+    return md_zero();
+}
+
+/// ExpandA (Algorithm 32): A_hat[r][s] at index r l + s.
+fn md_expand_a(p: & MldsaParams, rho: & Vec<i64>) -> Vec<Vec<i64>> {
+    var a: Vec<Vec<i64>> = Vec::new();
+    var r: i64 = 0;
+    while r < p.k {
+        var s: i64 = 0;
+        while s < p.l {
+            a.push(md_rej_ntt(rho, s, r));
+            s = s + 1;
+        }
+        r = r + 1;
+    }
+    return a;
+}
+
+/// CoeffFromHalfByte (Algorithm 15) as a value mod q, -1 when rejected.
+fn md_half_byte(b: i64, eta: i64) -> i64 {
+    if eta == 2 && b < 15 { return (2 - (b % 5) + MLDSA_Q) % MLDSA_Q; }
+    if eta == 4 && b < 9 { return (4 - b + MLDSA_Q) % MLDSA_Q; }
+    return -1;
+}
+
+/// RejBoundedPoly (Algorithm 31) on the 66-byte seed rho' || IntegerToBytes(r, 2).
+fn md_rej_bounded(rho: & Vec<i64>, r: i64, eta: i64) -> Vec<i64> {
+    var seed: Vec<i64> = mk_slice(rho, 0, 64);
+    seed.push(r & 255);
+    seed.push((r >> 8) & 255);
+    var n: i64 = 272;
+    while true {
+        val c: Vec<i64> = shake256(seed, n);
+        var a: Vec<i64> = Vec::new();
+        var p: i64 = 0;
+        while a.len() < 256 && p < c.len() {
+            val z0: i64 = md_half_byte(c.get(p) % 16, eta);
+            val z1: i64 = md_half_byte(c.get(p) / 16, eta);
+            if z0 >= 0 { a.push(z0); }
+            if z1 >= 0 && a.len() < 256 { a.push(z1); }
+            p = p + 1;
+        }
+        if a.len() == 256 { return a; }
+        n = n + 136;
+    }
+    return md_zero();
+}
+
+/// SampleInBall (Algorithm 29): tau coefficients +-1, the rest 0.
+fn md_sample_in_ball(p: & MldsaParams, ct: & Vec<i64>) -> Vec<i64> {
+    var n: i64 = 136;
+    while true {
+        val h: Vec<i64> = shake256(*ct, n);
+        var c: Vec<i64> = md_zero();
+        var pos: i64 = 8;
+        var i: i64 = 256 - p.tau;
+        var ok: bool = true;
+        while i < 256 && ok {
+            while pos < n && h.get(pos) > i { pos = pos + 1; }
+            if pos >= n {
+                ok = false;
+            } else {
+                val j: i64 = h.get(pos);
+                pos = pos + 1;
+                val bit: i64 = i + p.tau - 256;
+                c.set(i, c.get(j));
+                if ((h.get(bit / 8) >> (bit % 8)) & 1) == 1 { c.set(j, MLDSA_Q - 1); } else { c.set(j, 1); }
+                i = i + 1;
+            }
+        }
+        if ok { return c; }
+        n = n + 136;
+    }
+    return md_zero();
+}
+
+// ─── Bit packing (Algorithms 16-21) ────────────────────────────────────
+
+/// Append 256 values of `d` bits each, little-endian bit order.
+fn md_pack(out: & mut Vec<i64>, f: & Vec<i64>, d: i64) {
+    var acc: i64 = 0;
+    var bits: i64 = 0;
+    var i: i64 = 0;
+    while i < 256 {
+        acc = acc | (f.get(i) << bits);
+        bits = bits + d;
+        while bits >= 8 {
+            out.push(acc & 255);
+            acc = acc >> 8;
+            bits = bits - 8;
+        }
+        i = i + 1;
+    }
+}
+
+/// 256 values of `d` bits each from b[off..].
+fn md_unpack(b: & Vec<i64>, off: i64, d: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    var acc: i64 = 0;
+    var bits: i64 = 0;
+    var p: i64 = off;
+    val mask: i64 = (1 << d) - 1;
+    while f.len() < 256 {
+        while bits < d {
+            acc = acc | ((b.get(p) & 255) << bits);
+            p = p + 1;
+            bits = bits + 8;
+        }
+        f.push(acc & mask);
+        acc = acc >> d;
+        bits = bits - d;
+    }
+    return f;
+}
+
+/// BitPack(w, a, b) for a polynomial mod q: the values b - w_i.
+fn md_pack_signed(out: & mut Vec<i64>, w: & Vec<i64>, b: i64, d: i64) {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { v.push(b - md_center(w.get(i))); i = i + 1; }
+    md_pack(out, & v, d);
+}
+
+/// BitUnpack(v, a, b) back to a polynomial mod q.
+fn md_unpack_signed(v: & Vec<i64>, off: i64, b: i64, d: i64) -> Vec<i64> {
+    val raw: Vec<i64> = md_unpack(v, off, d);
+    var w: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 256 { w.push((b - raw.get(i) + MLDSA_Q) % MLDSA_Q); i = i + 1; }
+    return w;
+}
+
+fn md_eta_bits(eta: i64) -> i64 {
+    if eta == 2 { return 3; }
+    return 4;
+}
+
+fn md_gamma1_bits(gamma1: i64) -> i64 {
+    if gamma1 == 131072 { return 18; }
+    return 20;
+}
+
+fn md_w1_bits(gamma2: i64) -> i64 {
+    if gamma2 == 95232 { return 6; }
+    return 4;
+}
+
+// ─── Rounding (Algorithms 35-40) ───────────────────────────────────────
+
+/// Decompose (Algorithm 36) of r in 0..q-1: returns r1, r0 (centered)
+/// through r0_out.
+fn md_decompose(r: i64, gamma2: i64, r0_out: & mut i64) -> i64 {
+    var r0: i64 = r % (2 * gamma2);
+    if r0 > gamma2 { r0 = r0 - 2 * gamma2; }
+    if r - r0 == MLDSA_Q - 1 {
+        *r0_out = r0 - 1;
+        return 0;
+    }
+    *r0_out = r0;
+    return (r - r0) / (2 * gamma2);
+}
+
+fn md_high_bits(r: i64, gamma2: i64) -> i64 {
+    var r0: i64 = 0;
+    return md_decompose(r, gamma2, & mut r0);
+}
+
+fn md_low_bits(r: i64, gamma2: i64) -> i64 {
+    var r0: i64 = 0;
+    md_decompose(r, gamma2, & mut r0);
+    return r0;
+}
+
+/// UseHint (Algorithm 40).
+fn md_use_hint(h: i64, r: i64, gamma2: i64) -> i64 {
+    val m: i64 = (MLDSA_Q - 1) / (2 * gamma2);
+    var r0: i64 = 0;
+    val r1: i64 = md_decompose(r, gamma2, & mut r0);
+    if h == 1 {
+        if r0 > 0 { return (r1 + 1) % m; }
+        return (r1 - 1 + m) % m;
+    }
+    return r1;
+}
+
+/// w1Encode (Algorithm 28).
+fn md_w1_encode(p: & MldsaParams, w1: & Vec<Vec<i64>>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < p.k {
+        val w: Vec<i64> = w1.get(i);
+        md_pack(& mut out, & w, md_w1_bits(p.gamma2));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── ML-DSA internal algorithms ────────────────────────────────────────
+
+/// KeyGen_internal (Algorithm 6) from the 32-byte seed xi
+/// (crypto_random_bytes(32) in real use).
+pub fn mldsa_keygen(p: & MldsaParams, xi: Vec<i64>) -> MldsaKeyPair {
+    if xi.len() != 32 { return MldsaKeyPair { ok: false, pk: Vec::new(), sk: Vec::new() }; }
+    val zetas: Vec<i64> = md_zetas();
+    var hin: Vec<i64> = mk_slice(& xi, 0, 32);
+    hin.push(p.k);
+    hin.push(p.l);
+    val hh: Vec<i64> = shake256(hin, 128);
+    val rho: Vec<i64> = mk_slice(& hh, 0, 32);
+    val rhop: Vec<i64> = mk_slice(& hh, 32, 96);
+    val kk: Vec<i64> = mk_slice(& hh, 96, 128);
+    val a: Vec<Vec<i64>> = md_expand_a(p, & rho);
+    var s1: Vec<Vec<i64>> = Vec::new();
+    var s1h: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < p.l {
+        val s: Vec<i64> = md_rej_bounded(& rhop, i, p.eta);
+        var sh: Vec<i64> = s;
+        md_ntt(& mut sh, & zetas);
+        s1.push(s);
+        s1h.push(sh);
+        i = i + 1;
+    }
+    var s2: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < p.k { s2.push(md_rej_bounded(& rhop, p.l + i, p.eta)); i = i + 1; }
+    var t0s: Vec<Vec<i64>> = Vec::new();
+    var t1enc: Vec<i64> = Vec::new();
+    i = 0;
+    while i < p.k {
+        var acc: Vec<i64> = md_zero();
+        var j: i64 = 0;
+        while j < p.l {
+            val aij: Vec<i64> = a.get(i * p.l + j);
+            val sj: Vec<i64> = s1h.get(j);
+            md_mul_acc(& mut acc, & aij, & sj);
+            j = j + 1;
+        }
+        md_intt(& mut acc, & zetas);
+        val s2i: Vec<i64> = s2.get(i);
+        val t: Vec<i64> = md_add(& acc, & s2i);
+        // Power2Round (Algorithm 35), d = 13.
+        var t1: Vec<i64> = Vec::new();
+        var t0: Vec<i64> = Vec::new();
+        var c: i64 = 0;
+        while c < 256 {
+            val r: i64 = t.get(c);
+            var r0: i64 = r & 8191;
+            if r0 > 4096 { r0 = r0 - 8192; }
+            t1.push((r - r0) >> 13);
+            t0.push((r0 + MLDSA_Q) % MLDSA_Q);
+            c = c + 1;
+        }
+        md_pack(& mut t1enc, & t1, 10);
+        t0s.push(t0);
+        i = i + 1;
+    }
+    val pk: Vec<i64> = md_cat(rho, t1enc);
+    val tr: Vec<i64> = shake256(pk, 64);
+    var sk: Vec<i64> = md_cat(md_cat(mk_slice(& hh, 0, 32), kk), tr);
+    val eb: i64 = md_eta_bits(p.eta);
+    i = 0;
+    while i < p.l {
+        val s1i: Vec<i64> = s1.get(i);
+        md_pack_signed(& mut sk, & s1i, p.eta, eb);
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.k {
+        val s2i2: Vec<i64> = s2.get(i);
+        md_pack_signed(& mut sk, & s2i2, p.eta, eb);
+        i = i + 1;
+    }
+    i = 0;
+    while i < p.k {
+        val t0i: Vec<i64> = t0s.get(i);
+        md_pack_signed(& mut sk, & t0i, 4096, 13);
+        i = i + 1;
+    }
+    return MldsaKeyPair { ok: true, pk: pk, sk: sk };
+}
+
+/// Sign_internal (Algorithm 7) of the already-formatted message M' with
+/// the 32 bytes rnd; empty when sk or rnd has the wrong length.
+pub fn mldsa_sign_internal(p: & MldsaParams, sk: Vec<i64>, mp: Vec<i64>, rnd: Vec<i64>) -> Vec<i64> {
+    if sk.len() != p.sk_len || rnd.len() != 32 { return Vec::new(); }
+    val zetas: Vec<i64> = md_zetas();
+    val rho: Vec<i64> = mk_slice(& sk, 0, 32);
+    val kk: Vec<i64> = mk_slice(& sk, 32, 64);
+    val tr: Vec<i64> = mk_slice(& sk, 64, 128);
+    val eb: i64 = md_eta_bits(p.eta);
+    var off: i64 = 128;
+    var s1h: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < p.l {
+        var s: Vec<i64> = md_unpack_signed(& sk, off, p.eta, eb);
+        md_ntt(& mut s, & zetas);
+        s1h.push(s);
+        off = off + 32 * eb;
+        i = i + 1;
+    }
+    var s2h: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < p.k {
+        var s2: Vec<i64> = md_unpack_signed(& sk, off, p.eta, eb);
+        md_ntt(& mut s2, & zetas);
+        s2h.push(s2);
+        off = off + 32 * eb;
+        i = i + 1;
+    }
+    var t0h: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < p.k {
+        var t0: Vec<i64> = md_unpack_signed(& sk, off, 4096, 13);
+        md_ntt(& mut t0, & zetas);
+        t0h.push(t0);
+        off = off + 416;
+        i = i + 1;
+    }
+    val a: Vec<Vec<i64>> = md_expand_a(p, & rho);
+    val mu: Vec<i64> = shake256(md_cat(tr, mp), 64);
+    val rhopp: Vec<i64> = shake256(md_cat(md_cat(kk, rnd), mu), 64);
+    val gb: i64 = md_gamma1_bits(p.gamma1);
+    var kappa: i64 = 0;
+    while kappa < 65536 {
+        // y = ExpandMask(rho'', kappa) (Algorithm 34).
+        var yh: Vec<Vec<i64>> = Vec::new();
+        var y: Vec<Vec<i64>> = Vec::new();
+        i = 0;
+        while i < p.l {
+            var seed: Vec<i64> = rhopp;
+            seed.push((kappa + i) & 255);
+            seed.push(((kappa + i) >> 8) & 255);
+            val yi: Vec<i64> = md_unpack_signed(& shake256(seed, 32 * gb), 0, p.gamma1, gb);
+            var yhi: Vec<i64> = yi;
+            md_ntt(& mut yhi, & zetas);
+            y.push(yi);
+            yh.push(yhi);
+            i = i + 1;
+        }
+        var w: Vec<Vec<i64>> = Vec::new();
+        var w1: Vec<Vec<i64>> = Vec::new();
+        i = 0;
+        while i < p.k {
+            var acc: Vec<i64> = md_zero();
+            var j: i64 = 0;
+            while j < p.l {
+                val aij: Vec<i64> = a.get(i * p.l + j);
+                val yj: Vec<i64> = yh.get(j);
+                md_mul_acc(& mut acc, & aij, & yj);
+                j = j + 1;
+            }
+            md_intt(& mut acc, & zetas);
+            var hb: Vec<i64> = Vec::new();
+            var c: i64 = 0;
+            while c < 256 { hb.push(md_high_bits(acc.get(c), p.gamma2)); c = c + 1; }
+            w.push(acc);
+            w1.push(hb);
+            i = i + 1;
+        }
+        val ctilde: Vec<i64> = shake256(md_cat(mu, md_w1_encode(p, & w1)), p.ctilde);
+        var ch: Vec<i64> = md_sample_in_ball(p, & ctilde);
+        md_ntt(& mut ch, & zetas);
+        var good: bool = true;
+        var z: Vec<Vec<i64>> = Vec::new();
+        i = 0;
+        while i < p.l && good {
+            val s1i: Vec<i64> = s1h.get(i);
+            var cs1: Vec<i64> = md_mul(& ch, & s1i);
+            md_intt(& mut cs1, & zetas);
+            val yi2: Vec<i64> = y.get(i);
+            val zi: Vec<i64> = md_add(& yi2, & cs1);
+            if md_norm(& zi) >= p.gamma1 - p.beta { good = false; }
+            z.push(zi);
+            i = i + 1;
+        }
+        var hints: Vec<Vec<i64>> = Vec::new();
+        var ones: i64 = 0;
+        i = 0;
+        while i < p.k && good {
+            val s2i: Vec<i64> = s2h.get(i);
+            var cs2: Vec<i64> = md_mul(& ch, & s2i);
+            md_intt(& mut cs2, & zetas);
+            val wi: Vec<i64> = w.get(i);
+            val wcs2: Vec<i64> = md_sub(& wi, & cs2);
+            var c2: i64 = 0;
+            while c2 < 256 && good {
+                var r0: i64 = md_low_bits(wcs2.get(c2), p.gamma2);
+                if r0 < 0 { r0 = 0 - r0; }
+                if r0 >= p.gamma2 - p.beta { good = false; }
+                c2 = c2 + 1;
+            }
+            if good {
+                val t0i: Vec<i64> = t0h.get(i);
+                var ct0: Vec<i64> = md_mul(& ch, & t0i);
+                md_intt(& mut ct0, & zetas);
+                if md_norm(& ct0) >= p.gamma2 { good = false; }
+                // MakeHint(-ct0, w - cs2 + ct0): the high bits of
+                // w - cs2 + ct0 against those of w - cs2.
+                val r: Vec<i64> = md_add(& wcs2, & ct0);
+                var hi: Vec<i64> = Vec::new();
+                var c3: i64 = 0;
+                while c3 < 256 {
+                    if md_high_bits(r.get(c3), p.gamma2) != md_high_bits(wcs2.get(c3), p.gamma2) {
+                        hi.push(1);
+                        ones = ones + 1;
+                    } else {
+                        hi.push(0);
+                    }
+                    c3 = c3 + 1;
+                }
+                hints.push(hi);
+            }
+            i = i + 1;
+        }
+        if good && ones <= p.omega {
+            // sigEncode (Algorithm 26) with HintBitPack (Algorithm 20).
+            var sig: Vec<i64> = ctilde;
+            i = 0;
+            while i < p.l {
+                val zi2: Vec<i64> = z.get(i);
+                md_pack_signed(& mut sig, & zi2, p.gamma1, gb);
+                i = i + 1;
+            }
+            var y2: Vec<i64> = Vec::new();
+            var counts: Vec<i64> = Vec::new();
+            i = 0;
+            while i < p.k {
+                val hi2: Vec<i64> = hints.get(i);
+                var c4: i64 = 0;
+                while c4 < 256 {
+                    if hi2.get(c4) == 1 { y2.push(c4); }
+                    c4 = c4 + 1;
+                }
+                counts.push(y2.len());
+                i = i + 1;
+            }
+            while y2.len() < p.omega { y2.push(0); }
+            return md_cat(md_cat(sig, y2), counts);
+        }
+        kappa = kappa + p.l;
+    }
+    return Vec::new();
+}
+
+/// HintBitUnpack (Algorithm 21): k rows of 0/1, empty when malformed.
+fn md_hint_unpack(p: & MldsaParams, y: & Vec<i64>, off: i64) -> Vec<Vec<i64>> {
+    var h: Vec<Vec<i64>> = Vec::new();
+    var bad: Vec<Vec<i64>> = Vec::new();
+    var index: i64 = 0;
+    var i: i64 = 0;
+    while i < p.k {
+        var row: Vec<i64> = md_zero();
+        val end: i64 = y.get(off + p.omega + i);
+        if end < index || end > p.omega { return bad; }
+        val first: i64 = index;
+        while index < end {
+            if index > first {
+                if y.get(off + index - 1) >= y.get(off + index) { return bad; }
+            }
+            row.set(y.get(off + index), 1);
+            index = index + 1;
+        }
+        h.push(row);
+        i = i + 1;
+    }
+    while index < p.omega {
+        if y.get(off + index) != 0 { return bad; }
+        index = index + 1;
+    }
+    return h;
+}
+
+/// Verify_internal (Algorithm 8) of a signature over M'.
+pub fn mldsa_verify_internal(p: & MldsaParams, pk: Vec<i64>, mp: Vec<i64>, sig: Vec<i64>) -> bool {
+    if pk.len() != p.pk_len || sig.len() != p.sig_len { return false; }
+    val zetas: Vec<i64> = md_zetas();
+    val rho: Vec<i64> = mk_slice(& pk, 0, 32);
+    val gb: i64 = md_gamma1_bits(p.gamma1);
+    val ctilde: Vec<i64> = mk_slice(& sig, 0, p.ctilde);
+    val h: Vec<Vec<i64>> = md_hint_unpack(p, & sig, p.ctilde + 32 * gb * p.l);
+    if h.len() != p.k { return false; }
+    var zh: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < p.l {
+        var z: Vec<i64> = md_unpack_signed(& sig, p.ctilde + 32 * gb * i, p.gamma1, gb);
+        if md_norm(& z) >= p.gamma1 - p.beta { return false; }
+        md_ntt(& mut z, & zetas);
+        zh.push(z);
+        i = i + 1;
+    }
+    val a: Vec<Vec<i64>> = md_expand_a(p, & rho);
+    val tr: Vec<i64> = shake256(pk, 64);
+    val mu: Vec<i64> = shake256(md_cat(tr, mp), 64);
+    var ch: Vec<i64> = md_sample_in_ball(p, & ctilde);
+    md_ntt(& mut ch, & zetas);
+    var w1: Vec<Vec<i64>> = Vec::new();
+    i = 0;
+    while i < p.k {
+        var acc: Vec<i64> = md_zero();
+        var j: i64 = 0;
+        while j < p.l {
+            val aij: Vec<i64> = a.get(i * p.l + j);
+            val zj: Vec<i64> = zh.get(j);
+            md_mul_acc(& mut acc, & aij, & zj);
+            j = j + 1;
+        }
+        val t1: Vec<i64> = md_unpack(& pk, 32 + 320 * i, 10);
+        var t1d: Vec<i64> = Vec::new();
+        var c: i64 = 0;
+        while c < 256 { t1d.push((t1.get(c) * 8192) % MLDSA_Q); c = c + 1; }
+        md_ntt(& mut t1d, & zetas);
+        var wa: Vec<i64> = md_sub(& acc, & md_mul(& ch, & t1d));
+        md_intt(& mut wa, & zetas);
+        val hi: Vec<i64> = h.get(i);
+        var w1i: Vec<i64> = Vec::new();
+        c = 0;
+        while c < 256 { w1i.push(md_use_hint(hi.get(c), wa.get(c), p.gamma2)); c = c + 1; }
+        w1.push(w1i);
+        i = i + 1;
+    }
+    val c2: Vec<i64> = shake256(md_cat(mu, md_w1_encode(p, & w1)), p.ctilde);
+    var diff: i64 = 0;
+    i = 0;
+    while i < p.ctilde { diff = diff | (c2.get(i) ^ ctilde.get(i)); i = i + 1; }
+    return diff == 0;
+}
+
+/// M' = 0 || |ctx| || ctx || M (Algorithms 2, 3).
+fn md_format(msg: Vec<i64>, ctx: Vec<i64>) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    m.push(0);
+    m.push(ctx.len());
+    return md_cat(md_cat(m, ctx), msg);
+}
+
+/// ML-DSA.Sign (Algorithm 2), hedged: rnd is 32 fresh random bytes
+/// (crypto_random_bytes(32) in real use). ctx is at most 255 bytes (often
+/// empty). Empty when an input has the wrong size.
+pub fn mldsa_sign(p: & MldsaParams, sk: Vec<i64>, msg: Vec<i64>, ctx: Vec<i64>, rnd: Vec<i64>) -> Vec<i64> {
+    if ctx.len() > 255 { return Vec::new(); }
+    return mldsa_sign_internal(p, sk, md_format(msg, ctx), rnd);
+}
+
+/// ML-DSA.Sign, deterministic variant (rnd = 32 zero bytes).
+pub fn mldsa_sign_deterministic(p: & MldsaParams, sk: Vec<i64>, msg: Vec<i64>, ctx: Vec<i64>) -> Vec<i64> {
+    var rnd: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 32 { rnd.push(0); i = i + 1; }
+    return mldsa_sign(p, sk, msg, ctx, rnd);
+}
+
+/// ML-DSA.Verify (Algorithm 3).
+pub fn mldsa_verify(p: & MldsaParams, pk: Vec<i64>, msg: Vec<i64>, ctx: Vec<i64>, sig: Vec<i64>) -> bool {
+    if ctx.len() > 255 { return false; }
+    return mldsa_verify_internal(p, pk, md_format(msg, ctx), sig);
+}

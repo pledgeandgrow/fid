@@ -1,0 +1,108 @@
+// TG15 (docs/roadmap/llvm-roadmap.md): the Windows x64 stubs of `--nat`
+// executables that call C functions of DLLs through their own import
+// table (compiler/nat_enc.fd nat_pe_win64_stub, nat_pe_dll_for).
+// For each signature it prints the stub's bytes in hex, then `fix <pos>`
+// for the IAT entry's rip-relative word (resolved by the code generator,
+// here still 0); then the same (`a64`, `a64fix`) for the Apple arm64 stubs
+// of macOS executables (nat_macho_a64_stub), variadic calls included
+// (`.` in a signature: the arguments after it go on the stack).
+// tests/nattools/tg15_win64_stub_check.py assembles the instructions each
+// stub must be (Windows x64: positional registers, floats in xmm and the
+// integer register, stack arguments above 32 bytes of shadow space, the
+// result back in rdi; Apple arm64: AAPCS64 for the fixed arguments, 8-byte
+// stack slots for the variadic ones, a frame record, the result back in
+// x0) with clang (`zig cc`) and compares every byte. The first lines check
+// the DLL names.
+// Run (from the repository root):
+//   python3 tests/nattools/tg15_win64_stub_check.py --fid $FID
+// or by hand: fid run tests/nattools/tg15_win64_stub_unit.fd
+// Expected first lines:
+// dll  msvcrt.dll
+// dll c msvcrt.dll
+// dll m ucrtbase.dll
+// dll kernel32 kernel32.dll
+// dll user32 user32.dll
+// dll foo.dll foo.dll
+// dll GL opengl32.dll
+
+use compiler::nat_enc;
+
+fn hex2(b: i64) -> str {
+    var d: str = "0123456789abcdef";
+    return str_slice(d, (b >> 4) & 15, ((b >> 4) & 15) + 1) + str_slice(d, b & 15, (b & 15) + 1);
+}
+
+fn show_dll(lib: str) {
+    println("dll " + lib + " " + nat_pe_dll_for(lib));
+}
+
+fn show_stub(sig: str) {
+    var e: NatEnc = NatEnc_new();
+    var slot: i64 = NatEnc_label(& mut e);
+    nat_pe_win64_stub(& mut e, sig, slot);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < e.code.len() {
+        s = s + hex2(e.code.get(i));
+        i = i + 1;
+    }
+    println("stub " + sig + " " + s);
+    var f: i64 = 0;
+    while f < e.fixups.len() {
+        println("fix " + sig + " " + int_to_str(e.fixups.get(f).pos));
+        f = f + 1;
+    }
+}
+
+fn show_a64(sig: str) {
+    var e: NatEnc = NatEnc_new();
+    var slot: i64 = NatEnc_label(& mut e);
+    nat_macho_a64_stub(& mut e, sig, slot);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < e.code.len() {
+        s = s + hex2(e.code.get(i));
+        i = i + 1;
+    }
+    println("a64 " + sig + " " + s);
+    var f: i64 = 0;
+    while f < e.fixups.len() {
+        println("a64fix " + sig + " " + int_to_str(e.fixups.get(f).pos));
+        f = f + 1;
+    }
+}
+
+fn main() {
+    show_dll("");
+    show_dll("c");
+    show_dll("m");
+    show_dll("kernel32");
+    show_dll("user32");
+    show_dll("foo.dll");
+    show_dll("GL");
+    show_stub(">v");
+    show_stub("i>w");
+    show_stub("ii>i");
+    show_stub("iii>W");
+    show_stub("di>d");
+    show_stub("dd>d");
+    show_stub("s>s");
+    show_stub("idis>h");
+    show_stub("iiiiii>w");
+    show_stub("iiiidi>B");
+    show_stub("iiiii>b");
+    show_stub("i>H");
+    show_stub("i.id>w");
+    show_a64(">v");
+    show_a64("ii>w");
+    show_a64("di>d");
+    show_a64("idsi>s");
+    show_a64("iiiiiiddd>i");
+    show_a64("i.i>w");
+    show_a64("i.ds>w");
+    show_a64("ii.iiiiiiiii>W");
+    show_a64("i>B");
+    show_a64("i>h");
+    show_a64("i>H");
+    show_a64("i>b");
+}

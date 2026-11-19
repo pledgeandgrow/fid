@@ -1,0 +1,102 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), the machine layer's register
+// allocator (compiler/nat_ir.fd):
+//   RA2 liveness from use lists (ng_use_liveness) and the main allocation
+//       over live ranges that are segments with holes (ng_seg_scan, and
+//       ng_greedy_assign with FID_NAT_ON=greedy): a range takes a register
+//       where the ranges holding it are not live.
+//   `far`   six values made before a branch are read only on its far
+//           side, while the near side, in a loop with a call, keeps more
+//           values of its own live
+//   `reuse` variables written again after their last read (a hole between
+//           the read and the new value) next to values live through
+//   `alt`   two arms of a loop body, each with values of its own, and
+//           values that live only in one arm of the next iteration
+// `fid emit --stats` prints a `[segs]` line per function (ranges, how
+// many have holes); FID_NAT_OFF=holes allocates over hulls (more reloads
+// in `[stats]`); tests/nattools/machine_segs_check.sh compares, with
+// FID_VERIFY=1 (allocation checker; the use-list liveness checked against
+// the block fixed point).
+// Expected output:
+// -236
+// 2427
+// -23103
+// 727
+// 76208
+// 1310
+// 1443
+
+fn bump(x: i64) -> i64 {
+    return x * 2 + 1;
+}
+
+fn far(n: i64, k: i64) -> i64 {
+    var a: i64 = n * 3 + 1;
+    var b: i64 = n * 5 + 2;
+    var c: i64 = n * 7 + 3;
+    var d: i64 = n * 11 + 4;
+    var e: i64 = n * 13 + 5;
+    var f: i64 = n * 17 + 6;
+    var r: i64 = 0;
+    if k % 3 != 0 {
+        var i: i64 = 0;
+        while i < k {
+            var p: i64 = i * 2 + k;
+            var q: i64 = i * 3 + 1;
+            var s: i64 = i * 5 + 2;
+            var t: i64 = i * 7 + 3;
+            var u: i64 = bump(p + q);
+            r = r + p * q - s * t + u + p * t - q * s;
+            i = i + 1;
+        }
+    } else {
+        r = a * b - c + d * e - f + a * f - b * e + c * d;
+    }
+    return r;
+}
+
+fn reuse(n: i64) -> i64 {
+    var x: i64 = n + 1;
+    var y: i64 = n * 2;
+    var keep1: i64 = n * 3 + 7;
+    var keep2: i64 = n * 5 + 9;
+    var acc: i64 = x * y;
+    x = acc + keep1;
+    y = x - keep2;
+    acc = acc + x * y;
+    var z: i64 = acc % 1000;
+    x = z + keep1;
+    y = z - keep2;
+    acc = acc + x + y + keep1 * keep2;
+    return acc;
+}
+
+fn alt(m: i64) -> i64 {
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        if i % 2 == 0 {
+            var a1: i64 = i + 1;
+            var a2: i64 = i + 2;
+            var a3: i64 = i + 3;
+            var a4: i64 = i + 4;
+            total = total + a1 * a2 - a3 + a4;
+        } else {
+            var b1: i64 = i * 2;
+            var b2: i64 = i * 3;
+            var b3: i64 = bump(i);
+            total = total + b1 + b2 * b3;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    println(far(3, 4));
+    println(far(3, 6));
+    println(far(9, 17));
+    println(reuse(2));
+    println(reuse(11));
+    println(alt(10));
+    println(alt(11));
+}

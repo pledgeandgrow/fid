@@ -1,0 +1,1778 @@
+// Fides IEC 61131-3 PLC runtime: a Structured Text subset and ladder logic
+//
+// Pure computation; the seam is the process image. The caller copies field
+// inputs into a `PlcIo` (by IEC address: %IX0.0, %IW3, %QX1.2 ...), runs a
+// scan with the current time in milliseconds, and drives outputs from the
+// output image. Nothing here touches hardware.
+//
+// Structured Text (interpreted from source text):
+// - Declarations: [PROGRAM name] VAR / VAR_INPUT / VAR_OUTPUT ... END_VAR
+//   blocks with `name [AT %addr] : TYPE [:= initial];` for BOOL, INT
+//   (also SINT, DINT, LINT, UINT, WORD...), REAL (LREAL) and TIME, and
+//   function block instances TON, TOF, TP, CTU, CTD, R_TRIG, F_TRIG.
+// - Statements: assignment, IF/ELSIF/ELSE, CASE with value lists and
+//   ranges and ELSE, FOR ... TO ... [BY] DO, WHILE, REPEAT ... UNTIL, EXIT,
+//   RETURN, function block calls `t1(IN := x, PT := T#2s);` and member
+//   access `t1.Q`.
+// - Expressions: OR, XOR, AND (&), = <>, < > <= >=, + -, * / MOD, NOT and
+//   unary minus, parentheses; literals (integers, reals, TRUE/FALSE,
+//   16#FF, 2#1010, time literals T#1m30s / TIME#250ms); functions ABS, SQRT,
+//   MIN, MAX, LIMIT, SEL. INT division truncates toward zero; INT stores
+//   truncate; BOOL is any non-zero value.
+// - Function blocks with IEC semantics: TON (on delay), TOF (off delay),
+//   TP (pulse), CTU / CTD (edge-counting up/down counters), R_TRIG / F_TRIG.
+// - Scan cycle: copy %I addresses from the input image into their variables,
+//   execute the program once, copy %Q variables to the output image. A step
+//   budget per scan acts as a watchdog for endless loops; division by zero
+//   and the watchdog stop the PLC with `error` set.
+//
+// Ladder logic as data: contacts (normally open / closed) on bit addresses
+// combined into series and parallel networks, driving coils (normal,
+// negated, set, reset). Rungs are evaluated top to bottom over a memory map,
+// each rung seeing the coils written by the rungs above it.
+
+module plc;
+use vec;
+use string;
+use math;
+
+// ─── Types ───
+
+pub const PLC_BOOL: i64 = 0;
+pub const PLC_INT: i64 = 1;
+pub const PLC_REAL: i64 = 2;
+pub const PLC_TIME: i64 = 3;
+pub const PLC_TON: i64 = 10;
+pub const PLC_TOF: i64 = 11;
+pub const PLC_TP: i64 = 12;
+pub const PLC_CTU: i64 = 13;
+pub const PLC_CTD: i64 = 14;
+pub const PLC_RTRIG: i64 = 15;
+pub const PLC_FTRIG: i64 = 16;
+
+// tokens
+const TK_ID: i64 = 0;
+const TK_NUM: i64 = 1;
+const TK_OP: i64 = 2;
+const TK_ADDR: i64 = 3;
+const TK_EOF: i64 = 4;
+
+// expression and statement nodes
+const N_NUM: i64 = 0;
+const N_VAR: i64 = 1;
+const N_NEG: i64 = 2;
+const N_NOT: i64 = 3;
+const N_BIN: i64 = 4;
+const N_CALL: i64 = 5;
+const N_BLOCK: i64 = 10;
+const N_ASSIGN: i64 = 11;
+const N_IF: i64 = 12;
+const N_CASE: i64 = 13;
+const N_FOR: i64 = 14;
+const N_WHILE: i64 = 15;
+const N_REPEAT: i64 = 16;
+const N_EXIT: i64 = 17;
+const N_RETURN: i64 = 18;
+const N_FBCALL: i64 = 19;
+const N_LABEL: i64 = 20;
+const N_LABELS: i64 = 21;
+const N_EMPTY: i64 = 22;
+
+// binary operators
+const OP_OR: i64 = 0;
+const OP_XOR: i64 = 1;
+const OP_AND: i64 = 2;
+const OP_EQ: i64 = 3;
+const OP_NE: i64 = 4;
+const OP_LT: i64 = 5;
+const OP_GT: i64 = 6;
+const OP_LE: i64 = 7;
+const OP_GE: i64 = 8;
+const OP_ADD: i64 = 9;
+const OP_SUB: i64 = 10;
+const OP_MUL: i64 = 11;
+const OP_DIV: i64 = 12;
+const OP_MOD: i64 = 13;
+
+/// A compiled ST program with its variables and runtime state.
+pub struct PlcProgram {
+    pub name: str,
+    pub error: str,
+    // variables
+    pub var_names: Vec<str>,
+    pub var_types: Vec<i64>,
+    pub var_addr: Vec<str>,
+    pub values: Vec<f64>,
+    pub index: HashMap<str, i64>,
+    // syntax tree arena
+    pub kind: Vec<i64>,
+    pub op: Vec<i64>,
+    pub num: Vec<f64>,
+    pub num2: Vec<f64>,
+    pub ty: Vec<i64>,
+    pub kid_start: Vec<i64>,
+    pub kid_count: Vec<i64>,
+    pub kids: Vec<i64>,
+    pub body: i64,
+    // runtime
+    pub now_ms: f64,
+    pub scans: i64,
+    pub steps: i64,
+    pub max_steps: i64,
+}
+
+/// Process images keyed by address without the '%' (e.g. "IX0.0").
+pub struct PlcIo {
+    pub inputs: HashMap<str, f64>,
+    pub outputs: HashMap<str, f64>,
+}
+
+struct PlcLex {
+    kind: Vec<i64>,
+    text: Vec<str>,
+    num: Vec<f64>,
+    isreal: Vec<bool>,
+    line: Vec<i64>,
+    pos: i64,
+    error: str,
+}
+
+// ─── Lexer ───
+
+fn plc_is_digit(c: i64) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn plc_is_alpha(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+fn plc_upper(c: i64) -> i64 {
+    if c >= 97 && c <= 122 {
+        return c - 32;
+    }
+    return c;
+}
+
+fn plc_push_tok(lx: &mut PlcLex, kind: i64, text: str, num: f64, isreal: bool, line: i64) {
+    lx.kind.push(kind);
+    lx.text.push(text);
+    lx.num.push(num);
+    lx.isreal.push(isreal);
+    lx.line.push(line);
+}
+
+/// Read a decimal number (digits, '_', optional fraction and exponent) at i;
+/// returns [value, end index, is_real (0/1)].
+fn plc_read_number(s: str, start: i64) -> Vec<f64> {
+    val n: i64 = str_len(s);
+    var i: i64 = start;
+    var v: f64 = 0.0;
+    var real: bool = false;
+    while i < n && (plc_is_digit(str_byte_at(s, i)) || str_byte_at(s, i) == 95) {
+        if str_byte_at(s, i) != 95 {
+            v = v * 10.0 + ((str_byte_at(s, i) - 48) as f64);
+        }
+        i = i + 1;
+    }
+    if i + 1 < n && str_byte_at(s, i) == 46 && plc_is_digit(str_byte_at(s, i + 1)) {
+        real = true;
+        i = i + 1;
+        var scale: f64 = 0.1;
+        while i < n && plc_is_digit(str_byte_at(s, i)) {
+            v = v + scale * ((str_byte_at(s, i) - 48) as f64);
+            scale = scale / 10.0;
+            i = i + 1;
+        }
+    }
+    if i < n && (str_byte_at(s, i) == 69 || str_byte_at(s, i) == 101) {
+        var j: i64 = i + 1;
+        var neg: bool = false;
+        if j < n && (str_byte_at(s, j) == 43 || str_byte_at(s, j) == 45) {
+            neg = str_byte_at(s, j) == 45;
+            j = j + 1;
+        }
+        if j < n && plc_is_digit(str_byte_at(s, j)) {
+            var e: i64 = 0;
+            while j < n && plc_is_digit(str_byte_at(s, j)) {
+                e = e * 10 + (str_byte_at(s, j) - 48);
+                j = j + 1;
+            }
+            var k: i64 = 0;
+            while k < e {
+                if neg {
+                    v = v / 10.0;
+                } else {
+                    v = v * 10.0;
+                }
+                k = k + 1;
+            }
+            real = true;
+            i = j;
+        }
+    }
+    var out: Vec<f64> = Vec::new();
+    out.push(v);
+    out.push(i as f64);
+    if real {
+        out.push(1.0);
+    } else {
+        out.push(0.0);
+    }
+    return out;
+}
+
+/// Duration literal after "T#": groups of number + unit (d h m s ms).
+/// Returns [milliseconds, end index].
+fn plc_read_time(s: str, start: i64) -> Vec<f64> {
+    val n: i64 = str_len(s);
+    var i: i64 = start;
+    var total: f64 = 0.0;
+    var neg: bool = false;
+    if i < n && str_byte_at(s, i) == 45 {
+        neg = true;
+        i = i + 1;
+    }
+    while i < n && plc_is_digit(str_byte_at(s, i)) {
+        val nv: Vec<f64> = plc_read_number(s, i);
+        i = nv.get(1) as i64;
+        var unit: str = "";
+        while i < n && plc_is_alpha(str_byte_at(s, i)) {
+            unit = unit + str_to_upper(str_slice(s, i, i + 1));
+            i = i + 1;
+        }
+        // "MS" is one unit; "M" followed by digits is minutes
+        var f: f64 = 0.0;
+        if unit == "D" {
+            f = 86400000.0;
+        } else if unit == "H" {
+            f = 3600000.0;
+        } else if unit == "M" {
+            f = 60000.0;
+        } else if unit == "S" {
+            f = 1000.0;
+        } else if unit == "MS" {
+            f = 1.0;
+        }
+        total = total + nv.get(0) * f;
+        if i < n && str_byte_at(s, i) == 95 {
+            i = i + 1;
+        }
+    }
+    if neg {
+        total = 0.0 - total;
+    }
+    var out: Vec<f64> = Vec::new();
+    out.push(total);
+    out.push(i as f64);
+    return out;
+}
+
+fn plc_lex(src: str) -> PlcLex {
+    var lx = PlcLex {
+        kind: Vec::new(), text: Vec::new(), num: Vec::new(), isreal: Vec::new(), line: Vec::new(), pos: 0, error: ""
+    };
+    val n: i64 = str_len(src);
+    var i: i64 = 0;
+    var line: i64 = 1;
+    while i < n {
+        val c: i64 = str_byte_at(src, i);
+        if c == 10 {
+            line = line + 1;
+            i = i + 1;
+            continue;
+        }
+        if c == 32 || c == 9 || c == 13 {
+            i = i + 1;
+            continue;
+        }
+        // (* comment *) and // comment
+        if c == 40 && i + 1 < n && str_byte_at(src, i + 1) == 42 {
+            i = i + 2;
+            while i + 1 < n && !(str_byte_at(src, i) == 42 && str_byte_at(src, i + 1) == 41) {
+                if str_byte_at(src, i) == 10 {
+                    line = line + 1;
+                }
+                i = i + 1;
+            }
+            i = i + 2;
+            continue;
+        }
+        if c == 47 && i + 1 < n && str_byte_at(src, i + 1) == 47 {
+            while i < n && str_byte_at(src, i) != 10 {
+                i = i + 1;
+            }
+            continue;
+        }
+        if plc_is_digit(c) {
+            val nv: Vec<f64> = plc_read_number(src, i);
+            var end: i64 = nv.get(1) as i64;
+            // base literal 16#FF, 2#1010, 8#17
+            if end < n && str_byte_at(src, end) == 35 && nv.get(2) == 0.0 {
+                val base: i64 = nv.get(0) as i64;
+                var v: i64 = 0;
+                var j: i64 = end + 1;
+                loop {
+                    if j >= n {
+                        break;
+                    }
+                    val d: i64 = plc_upper(str_byte_at(src, j));
+                    var dv: i64 = -1;
+                    if plc_is_digit(d) {
+                        dv = d - 48;
+                    } else if d >= 65 && d <= 70 {
+                        dv = d - 55;
+                    } else if d == 95 {
+                        j = j + 1;
+                        continue;
+                    }
+                    if dv < 0 || dv >= base {
+                        break;
+                    }
+                    v = v * base + dv;
+                    j = j + 1;
+                }
+                plc_push_tok(&mut lx, TK_NUM, "", v as f64, false, line);
+                i = j;
+                continue;
+            }
+            plc_push_tok(&mut lx, TK_NUM, "", nv.get(0), nv.get(2) == 1.0, line);
+            i = end;
+            continue;
+        }
+        if plc_is_alpha(c) {
+            var j: i64 = i;
+            while j < n && (plc_is_alpha(str_byte_at(src, j)) || plc_is_digit(str_byte_at(src, j))) {
+                j = j + 1;
+            }
+            val word: str = str_to_upper(str_slice(src, i, j));
+            if j < n && str_byte_at(src, j) == 35 && (word == "T" || word == "TIME") {
+                val tv: Vec<f64> = plc_read_time(src, j + 1);
+                plc_push_tok(&mut lx, TK_NUM, "TIME", tv.get(0), false, line);
+                i = tv.get(1) as i64;
+                continue;
+            }
+            plc_push_tok(&mut lx, TK_ID, word, 0.0, false, line);
+            i = j;
+            continue;
+        }
+        if c == 37 {
+            // %IX0.0, %QW3, %MX1.2
+            var j: i64 = i + 1;
+            while j < n && (plc_is_alpha(str_byte_at(src, j)) || plc_is_digit(str_byte_at(src, j)) || str_byte_at(src, j) == 46) {
+                j = j + 1;
+            }
+            plc_push_tok(&mut lx, TK_ADDR, str_to_upper(str_slice(src, i + 1, j)), 0.0, false, line);
+            i = j;
+            continue;
+        }
+        // operators: two-character first
+        if i + 1 < n {
+            val two: str = str_slice(src, i, i + 2);
+            if two == ":=" || two == "<>" || two == "<=" || two == ">=" || two == ".." || two == "=>" {
+                plc_push_tok(&mut lx, TK_OP, two, 0.0, false, line);
+                i = i + 2;
+                continue;
+            }
+        }
+        val one: str = str_slice(src, i, i + 1);
+        if str_contains("+-*/()=<>,;:.&[]", one) {
+            plc_push_tok(&mut lx, TK_OP, one, 0.0, false, line);
+            i = i + 1;
+            continue;
+        }
+        lx.error = "line " + int_to_str(line) + ": unexpected character '" + one + "'";
+        break;
+    }
+    plc_push_tok(&mut lx, TK_EOF, "", 0.0, false, line);
+    return lx;
+}
+
+// ─── Parser ───
+
+struct PlcParser {
+    lx: PlcLex,
+    prog: PlcProgram,
+    error: str,
+}
+
+fn pp_kind(p: &PlcParser) -> i64 {
+    return p.lx.kind.get(p.lx.pos);
+}
+
+fn pp_text(p: &PlcParser) -> str {
+    return p.lx.text.get(p.lx.pos);
+}
+
+fn pp_is(p: &PlcParser, t: str) -> bool {
+    val k: i64 = pp_kind(p);
+    return (k == TK_ID || k == TK_OP) && pp_text(p) == t;
+}
+
+fn pp_fail(p: &mut PlcParser, msg: str) {
+    if str_len(p.error) == 0 {
+        p.error = "line " + int_to_str(p.lx.line.get(p.lx.pos)) + ": " + msg;
+    }
+}
+
+fn pp_expect(p: &mut PlcParser, t: str) -> bool {
+    if pp_is(p, t) {
+        p.lx.pos = p.lx.pos + 1;
+        return true;
+    }
+    var got: str = pp_text(p);
+    if pp_kind(p) == TK_NUM {
+        got = "a number";
+    }
+    if pp_kind(p) == TK_EOF {
+        got = "end of text";
+    }
+    pp_fail(p, "expected " + t + ", found " + got);
+    return false;
+}
+
+fn pp_node(p: &mut PlcParser, kind: i64, op: i64, num: f64, num2: f64, ty: i64, kids: &Vec<i64>) -> i64 {
+    p.prog.kind.push(kind);
+    p.prog.op.push(op);
+    p.prog.num.push(num);
+    p.prog.num2.push(num2);
+    p.prog.ty.push(ty);
+    p.prog.kid_start.push(p.prog.kids.len());
+    p.prog.kid_count.push(kids.len());
+    var i: i64 = 0;
+    while i < kids.len() {
+        p.prog.kids.push(kids.get(i));
+        i = i + 1;
+    }
+    return p.prog.kind.len() - 1;
+}
+
+fn pp_leaf(p: &mut PlcParser, kind: i64, op: i64, num: f64, ty: i64) -> i64 {
+    val none: Vec<i64> = Vec::new();
+    return pp_node(p, kind, op, num, 0.0, ty, &none);
+}
+
+fn plc_add_var(prog: &mut PlcProgram, name: str, ty: i64, addr: str, init: f64) -> i64 {
+    prog.var_names.push(name);
+    prog.var_types.push(ty);
+    prog.var_addr.push(addr);
+    prog.values.push(init);
+    val id: i64 = prog.var_names.len() - 1;
+    prog.index.insert(name, id);
+    return id;
+}
+
+fn plc_type_of(name: str) -> i64 {
+    if name == "BOOL" {
+        return PLC_BOOL;
+    }
+    if name == "REAL" || name == "LREAL" {
+        return PLC_REAL;
+    }
+    if name == "TIME" {
+        return PLC_TIME;
+    }
+    if name == "TON" {
+        return PLC_TON;
+    }
+    if name == "TOF" {
+        return PLC_TOF;
+    }
+    if name == "TP" {
+        return PLC_TP;
+    }
+    if name == "CTU" {
+        return PLC_CTU;
+    }
+    if name == "CTD" {
+        return PLC_CTD;
+    }
+    if name == "R_TRIG" {
+        return PLC_RTRIG;
+    }
+    if name == "F_TRIG" {
+        return PLC_FTRIG;
+    }
+    if name == "INT" || name == "SINT" || name == "DINT" || name == "LINT" || name == "UINT" || name == "USINT" || name == "UDINT" || name == "ULINT" || name == "BYTE" || name == "WORD" || name == "DWORD" || name == "LWORD" {
+        return PLC_INT;
+    }
+    return -1;
+}
+
+/// Member names of a function block type, in storage order.
+fn plc_fb_members(ty: i64) -> Vec<str> {
+    var m: Vec<str> = Vec::new();
+    if ty == PLC_TON || ty == PLC_TOF || ty == PLC_TP {
+        m.push("IN");
+        m.push("PT");
+        m.push("Q");
+        m.push("ET");
+        m.push("$S");
+        m.push("$P");
+    } else if ty == PLC_CTU {
+        m.push("CU");
+        m.push("R");
+        m.push("PV");
+        m.push("Q");
+        m.push("CV");
+        m.push("$P");
+    } else if ty == PLC_CTD {
+        m.push("CD");
+        m.push("LD");
+        m.push("PV");
+        m.push("Q");
+        m.push("CV");
+        m.push("$P");
+    } else {
+        m.push("CLK");
+        m.push("Q");
+        m.push("$P");
+    }
+    return m;
+}
+
+fn plc_member_type(name: str) -> i64 {
+    if name == "PT" || name == "ET" || name == "$S" {
+        return PLC_TIME;
+    }
+    if name == "PV" || name == "CV" {
+        return PLC_INT;
+    }
+    return PLC_BOOL;
+}
+
+fn pp_decls(p: &mut PlcParser) {
+    while pp_is(p, "VAR") || pp_is(p, "VAR_INPUT") || pp_is(p, "VAR_OUTPUT") || pp_is(p, "VAR_IN_OUT") {
+        p.lx.pos = p.lx.pos + 1;
+        while !pp_is(p, "END_VAR") && pp_kind(p) != TK_EOF && str_len(p.error) == 0 {
+            var names: Vec<str> = Vec::new();
+            if pp_kind(p) != TK_ID {
+                pp_fail(p, "expected a variable name");
+                return;
+            }
+            names.push(pp_text(p));
+            p.lx.pos = p.lx.pos + 1;
+            while pp_is(p, ",") {
+                p.lx.pos = p.lx.pos + 1;
+                names.push(pp_text(p));
+                p.lx.pos = p.lx.pos + 1;
+            }
+            var addr: str = "";
+            if pp_is(p, "AT") {
+                p.lx.pos = p.lx.pos + 1;
+                if pp_kind(p) != TK_ADDR {
+                    pp_fail(p, "expected an address after AT");
+                    return;
+                }
+                addr = pp_text(p);
+                p.lx.pos = p.lx.pos + 1;
+            }
+            if !pp_expect(p, ":") {
+                return;
+            }
+            val tname: str = pp_text(p);
+            val ty: i64 = plc_type_of(tname);
+            if ty < 0 {
+                pp_fail(p, "unknown type " + tname);
+                return;
+            }
+            p.lx.pos = p.lx.pos + 1;
+            var init: f64 = 0.0;
+            if pp_is(p, ":=") {
+                p.lx.pos = p.lx.pos + 1;
+                var neg: bool = false;
+                if pp_is(p, "-") {
+                    neg = true;
+                    p.lx.pos = p.lx.pos + 1;
+                }
+                if pp_kind(p) == TK_NUM {
+                    init = p.lx.num.get(p.lx.pos);
+                } else if pp_is(p, "TRUE") {
+                    init = 1.0;
+                } else if !pp_is(p, "FALSE") {
+                    pp_fail(p, "expected a constant initial value");
+                    return;
+                }
+                if neg {
+                    init = 0.0 - init;
+                }
+                p.lx.pos = p.lx.pos + 1;
+            }
+            if !pp_expect(p, ";") {
+                return;
+            }
+            var k: i64 = 0;
+            while k < names.len() {
+                val nm: str = names.get(k);
+                if p.prog.index.contains(nm) {
+                    pp_fail(p, "duplicate variable " + nm);
+                    return;
+                }
+                plc_add_var(&mut p.prog, nm, ty, addr, init);
+                if ty >= PLC_TON {
+                    val mem: Vec<str> = plc_fb_members(ty);
+                    var j: i64 = 0;
+                    while j < mem.len() {
+                        plc_add_var(&mut p.prog, nm + "." + mem.get(j), plc_member_type(mem.get(j)), "", 0.0);
+                        j = j + 1;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        pp_expect(p, "END_VAR");
+    }
+}
+
+// expressions, lowest precedence first
+fn pp_expr(p: &mut PlcParser) -> i64 {
+    return pp_binary(p, 0);
+}
+
+fn pp_level_op(p: &PlcParser, level: i64) -> i64 {
+    if level == 0 && pp_is(p, "OR") {
+        return OP_OR;
+    }
+    if level == 1 && pp_is(p, "XOR") {
+        return OP_XOR;
+    }
+    if level == 2 && (pp_is(p, "AND") || pp_is(p, "&")) {
+        return OP_AND;
+    }
+    if level == 3 {
+        if pp_is(p, "=") {
+            return OP_EQ;
+        }
+        if pp_is(p, "<>") {
+            return OP_NE;
+        }
+    }
+    if level == 4 {
+        if pp_is(p, "<") {
+            return OP_LT;
+        }
+        if pp_is(p, ">") {
+            return OP_GT;
+        }
+        if pp_is(p, "<=") {
+            return OP_LE;
+        }
+        if pp_is(p, ">=") {
+            return OP_GE;
+        }
+    }
+    if level == 5 {
+        if pp_is(p, "+") {
+            return OP_ADD;
+        }
+        if pp_is(p, "-") {
+            return OP_SUB;
+        }
+    }
+    if level == 6 {
+        if pp_is(p, "*") {
+            return OP_MUL;
+        }
+        if pp_is(p, "/") {
+            return OP_DIV;
+        }
+        if pp_is(p, "MOD") {
+            return OP_MOD;
+        }
+    }
+    return -1;
+}
+
+fn plc_result_type(op: i64, ta: i64, tb: i64) -> i64 {
+    if op <= OP_AND {
+        if ta == PLC_BOOL && tb == PLC_BOOL {
+            return PLC_BOOL;
+        }
+        return PLC_INT;
+    }
+    if op <= OP_GE {
+        return PLC_BOOL;
+    }
+    if ta == PLC_REAL || tb == PLC_REAL {
+        return PLC_REAL;
+    }
+    if ta == PLC_TIME || tb == PLC_TIME {
+        return PLC_TIME;
+    }
+    return PLC_INT;
+}
+
+fn pp_binary(p: &mut PlcParser, level: i64) -> i64 {
+    if level > 6 {
+        return pp_unary(p);
+    }
+    var left: i64 = pp_binary(p, level + 1);
+    loop {
+        if str_len(p.error) > 0 {
+            return left;
+        }
+        val op: i64 = pp_level_op(p, level);
+        if op < 0 {
+            break;
+        }
+        p.lx.pos = p.lx.pos + 1;
+        val right: i64 = pp_binary(p, level + 1);
+        var kids: Vec<i64> = Vec::new();
+        kids.push(left);
+        kids.push(right);
+        val ty: i64 = plc_result_type(op, p.prog.ty.get(left), p.prog.ty.get(right));
+        left = pp_node(p, N_BIN, op, 0.0, 0.0, ty, &kids);
+    }
+    return left;
+}
+
+fn pp_unary(p: &mut PlcParser) -> i64 {
+    if pp_is(p, "NOT") {
+        p.lx.pos = p.lx.pos + 1;
+        val a: i64 = pp_unary(p);
+        var kids: Vec<i64> = Vec::new();
+        kids.push(a);
+        return pp_node(p, N_NOT, 0, 0.0, 0.0, p.prog.ty.get(a), &kids);
+    }
+    if pp_is(p, "-") {
+        p.lx.pos = p.lx.pos + 1;
+        val a: i64 = pp_unary(p);
+        var kids: Vec<i64> = Vec::new();
+        kids.push(a);
+        return pp_node(p, N_NEG, 0, 0.0, 0.0, p.prog.ty.get(a), &kids);
+    }
+    if pp_is(p, "+") {
+        p.lx.pos = p.lx.pos + 1;
+    }
+    return pp_primary(p);
+}
+
+/// A variable reference `name` or `inst.member`; returns its id or -1.
+fn pp_var_ref(p: &mut PlcParser) -> i64 {
+    var name: str = pp_text(p);
+    p.lx.pos = p.lx.pos + 1;
+    if pp_is(p, ".") && p.lx.kind.get(p.lx.pos + 1) == TK_ID {
+        name = name + "." + p.lx.text.get(p.lx.pos + 1);
+        p.lx.pos = p.lx.pos + 2;
+    }
+    if !p.prog.index.contains(name) {
+        pp_fail(p, "undeclared variable " + name);
+        return -1;
+    }
+    return p.prog.index.get(name);
+}
+
+fn pp_primary(p: &mut PlcParser) -> i64 {
+    val k: i64 = pp_kind(p);
+    if k == TK_NUM {
+        val v: f64 = p.lx.num.get(p.lx.pos);
+        var ty: i64 = PLC_INT;
+        if p.lx.isreal.get(p.lx.pos) {
+            ty = PLC_REAL;
+        }
+        if p.lx.text.get(p.lx.pos) == "TIME" {
+            ty = PLC_TIME;
+        }
+        p.lx.pos = p.lx.pos + 1;
+        return pp_leaf(p, N_NUM, 0, v, ty);
+    }
+    if pp_is(p, "(") {
+        p.lx.pos = p.lx.pos + 1;
+        val e: i64 = pp_expr(p);
+        pp_expect(p, ")");
+        return e;
+    }
+    if k == TK_ID {
+        val word: str = pp_text(p);
+        if word == "TRUE" || word == "FALSE" {
+            p.lx.pos = p.lx.pos + 1;
+            var v: f64 = 0.0;
+            if word == "TRUE" {
+                v = 1.0;
+            }
+            return pp_leaf(p, N_NUM, 0, v, PLC_BOOL);
+        }
+        if p.lx.text.get(p.lx.pos + 1) == "(" && p.lx.kind.get(p.lx.pos + 1) == TK_OP {
+            // function call
+            var fid: i64 = -1;
+            if word == "ABS" {
+                fid = 0;
+            } else if word == "SQRT" {
+                fid = 1;
+            } else if word == "MIN" {
+                fid = 2;
+            } else if word == "MAX" {
+                fid = 3;
+            } else if word == "LIMIT" {
+                fid = 4;
+            } else if word == "SEL" {
+                fid = 5;
+            }
+            if fid < 0 {
+                pp_fail(p, "unknown function " + word);
+                return pp_leaf(p, N_NUM, 0, 0.0, PLC_INT);
+            }
+            p.lx.pos = p.lx.pos + 2;
+            var args: Vec<i64> = Vec::new();
+            if !pp_is(p, ")") {
+                args.push(pp_expr(p));
+                while pp_is(p, ",") {
+                    p.lx.pos = p.lx.pos + 1;
+                    args.push(pp_expr(p));
+                }
+            }
+            pp_expect(p, ")");
+            var ty: i64 = PLC_INT;
+            var i: i64 = 0;
+            while i < args.len() {
+                if p.prog.ty.get(args.get(i)) == PLC_REAL {
+                    ty = PLC_REAL;
+                }
+                i = i + 1;
+            }
+            if fid == 1 {
+                ty = PLC_REAL;
+            }
+            if fid == 5 && args.len() == 3 {
+                ty = p.prog.ty.get(args.get(1));
+            }
+            return pp_node(p, N_CALL, fid, 0.0, 0.0, ty, &args);
+        }
+        val id: i64 = pp_var_ref(p);
+        var ty: i64 = PLC_INT;
+        if id >= 0 {
+            ty = p.prog.var_types.get(id);
+        }
+        return pp_leaf(p, N_VAR, id, 0.0, ty);
+    }
+    pp_fail(p, "expected an expression");
+    p.lx.pos = p.lx.pos + 1;
+    return pp_leaf(p, N_NUM, 0, 0.0, PLC_INT);
+}
+
+fn pp_at_end(p: &PlcParser, a: str, b: str, c: str) -> bool {
+    return pp_kind(p) == TK_EOF || pp_is(p, a) || pp_is(p, b) || pp_is(p, c);
+}
+
+/// Statements until one of the terminators (not consumed).
+fn pp_block(p: &mut PlcParser, t1: str, t2: str, t3: str) -> i64 {
+    var stmts: Vec<i64> = Vec::new();
+    while !pp_at_end(p, t1, t2, t3) && str_len(p.error) == 0 {
+        // a CASE branch label ends the statement list of the previous branch
+        stmts.push(pp_stmt(p));
+    }
+    return pp_node(p, N_BLOCK, 0, 0.0, 0.0, 0, &stmts);
+}
+
+fn pp_case_label_ahead(p: &PlcParser) -> bool {
+    // NUM [.. NUM] {, ...} ':'   or  '-' NUM ...
+    var i: i64 = p.lx.pos;
+    loop {
+        if p.lx.kind.get(i) == TK_OP && p.lx.text.get(i) == "-" {
+            i = i + 1;
+        }
+        if p.lx.kind.get(i) != TK_NUM {
+            return false;
+        }
+        i = i + 1;
+        if p.lx.kind.get(i) == TK_OP && p.lx.text.get(i) == ".." {
+            i = i + 1;
+            if p.lx.kind.get(i) == TK_OP && p.lx.text.get(i) == "-" {
+                i = i + 1;
+            }
+            if p.lx.kind.get(i) != TK_NUM {
+                return false;
+            }
+            i = i + 1;
+        }
+        if p.lx.kind.get(i) == TK_OP && p.lx.text.get(i) == ":" {
+            return true;
+        }
+        if !(p.lx.kind.get(i) == TK_OP && p.lx.text.get(i) == ",") {
+            return false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn pp_signed_const(p: &mut PlcParser) -> f64 {
+    var neg: bool = false;
+    if pp_is(p, "-") {
+        neg = true;
+        p.lx.pos = p.lx.pos + 1;
+    }
+    val v: f64 = p.lx.num.get(p.lx.pos);
+    p.lx.pos = p.lx.pos + 1;
+    if neg {
+        return 0.0 - v;
+    }
+    return v;
+}
+
+fn pp_stmt(p: &mut PlcParser) -> i64 {
+    var none: Vec<i64> = Vec::new();
+    if pp_is(p, ";") {
+        p.lx.pos = p.lx.pos + 1;
+        return pp_node(p, N_EMPTY, 0, 0.0, 0.0, 0, &none);
+    }
+    if pp_is(p, "IF") {
+        p.lx.pos = p.lx.pos + 1;
+        var kids: Vec<i64> = Vec::new();
+        kids.push(pp_expr(p));
+        pp_expect(p, "THEN");
+        kids.push(pp_block(p, "ELSIF", "ELSE", "END_IF"));
+        while pp_is(p, "ELSIF") && str_len(p.error) == 0 {
+            p.lx.pos = p.lx.pos + 1;
+            kids.push(pp_expr(p));
+            pp_expect(p, "THEN");
+            kids.push(pp_block(p, "ELSIF", "ELSE", "END_IF"));
+        }
+        if pp_is(p, "ELSE") {
+            p.lx.pos = p.lx.pos + 1;
+            kids.push(pp_block(p, "END_IF", "END_IF", "END_IF"));
+        }
+        pp_expect(p, "END_IF");
+        if pp_is(p, ";") {
+            p.lx.pos = p.lx.pos + 1;
+        }
+        return pp_node(p, N_IF, 0, 0.0, 0.0, 0, &kids);
+    }
+    if pp_is(p, "CASE") {
+        p.lx.pos = p.lx.pos + 1;
+        var kids: Vec<i64> = Vec::new();
+        kids.push(pp_expr(p));
+        pp_expect(p, "OF");
+        var has_else: f64 = 0.0;
+        while pp_case_label_ahead(p) && str_len(p.error) == 0 {
+            var labels: Vec<i64> = Vec::new();
+            loop {
+                val lo: f64 = pp_signed_const(p);
+                var hi: f64 = lo;
+                if pp_is(p, "..") {
+                    p.lx.pos = p.lx.pos + 1;
+                    hi = pp_signed_const(p);
+                }
+                labels.push(pp_node(p, N_LABEL, 0, lo, hi, 0, &none));
+                if pp_is(p, ",") {
+                    p.lx.pos = p.lx.pos + 1;
+                } else {
+                    break;
+                }
+            }
+            pp_expect(p, ":");
+            kids.push(pp_node(p, N_LABELS, 0, 0.0, 0.0, 0, &labels));
+            // the branch's statements run until the next label, ELSE or END_CASE
+            var stmts: Vec<i64> = Vec::new();
+            while !pp_at_end(p, "ELSE", "END_CASE", "END_CASE") && !pp_case_label_ahead(p) && str_len(p.error) == 0 {
+                stmts.push(pp_stmt(p));
+            }
+            kids.push(pp_node(p, N_BLOCK, 0, 0.0, 0.0, 0, &stmts));
+        }
+        if pp_is(p, "ELSE") {
+            p.lx.pos = p.lx.pos + 1;
+            kids.push(pp_block(p, "END_CASE", "END_CASE", "END_CASE"));
+            has_else = 1.0;
+        }
+        pp_expect(p, "END_CASE");
+        if pp_is(p, ";") {
+            p.lx.pos = p.lx.pos + 1;
+        }
+        return pp_node(p, N_CASE, 0, has_else, 0.0, 0, &kids);
+    }
+    if pp_is(p, "FOR") {
+        p.lx.pos = p.lx.pos + 1;
+        if pp_kind(p) != TK_ID {
+            pp_fail(p, "expected the loop variable");
+            return pp_node(p, N_EMPTY, 0, 0.0, 0.0, 0, &none);
+        }
+        val v: i64 = pp_var_ref(p);
+        pp_expect(p, ":=");
+        var kids: Vec<i64> = Vec::new();
+        kids.push(pp_expr(p));
+        pp_expect(p, "TO");
+        kids.push(pp_expr(p));
+        if pp_is(p, "BY") {
+            p.lx.pos = p.lx.pos + 1;
+            kids.push(pp_expr(p));
+        } else {
+            kids.push(pp_leaf(p, N_NUM, 0, 1.0, PLC_INT));
+        }
+        pp_expect(p, "DO");
+        kids.push(pp_block(p, "END_FOR", "END_FOR", "END_FOR"));
+        pp_expect(p, "END_FOR");
+        if pp_is(p, ";") {
+            p.lx.pos = p.lx.pos + 1;
+        }
+        return pp_node(p, N_FOR, v, 0.0, 0.0, 0, &kids);
+    }
+    if pp_is(p, "WHILE") {
+        p.lx.pos = p.lx.pos + 1;
+        var kids: Vec<i64> = Vec::new();
+        kids.push(pp_expr(p));
+        pp_expect(p, "DO");
+        kids.push(pp_block(p, "END_WHILE", "END_WHILE", "END_WHILE"));
+        pp_expect(p, "END_WHILE");
+        if pp_is(p, ";") {
+            p.lx.pos = p.lx.pos + 1;
+        }
+        return pp_node(p, N_WHILE, 0, 0.0, 0.0, 0, &kids);
+    }
+    if pp_is(p, "REPEAT") {
+        p.lx.pos = p.lx.pos + 1;
+        var kids: Vec<i64> = Vec::new();
+        kids.push(pp_block(p, "UNTIL", "UNTIL", "UNTIL"));
+        pp_expect(p, "UNTIL");
+        kids.push(pp_expr(p));
+        pp_expect(p, "END_REPEAT");
+        if pp_is(p, ";") {
+            p.lx.pos = p.lx.pos + 1;
+        }
+        return pp_node(p, N_REPEAT, 0, 0.0, 0.0, 0, &kids);
+    }
+    if pp_is(p, "EXIT") || pp_is(p, "RETURN") {
+        var kind: i64 = N_EXIT;
+        if pp_is(p, "RETURN") {
+            kind = N_RETURN;
+        }
+        p.lx.pos = p.lx.pos + 1;
+        pp_expect(p, ";");
+        return pp_node(p, kind, 0, 0.0, 0.0, 0, &none);
+    }
+    if pp_kind(p) == TK_ID {
+        // function block call: inst(name := expr, ...);
+        val name: str = pp_text(p);
+        if p.lx.kind.get(p.lx.pos + 1) == TK_OP && p.lx.text.get(p.lx.pos + 1) == "(" {
+            if !p.prog.index.contains(name) || p.prog.var_types.get(p.prog.index.get(name)) < PLC_TON {
+                pp_fail(p, name + " is not a function block instance");
+                return pp_node(p, N_EMPTY, 0, 0.0, 0.0, 0, &none);
+            }
+            val inst: i64 = p.prog.index.get(name);
+            p.lx.pos = p.lx.pos + 2;
+            var kids: Vec<i64> = Vec::new();
+            while !pp_is(p, ")") && str_len(p.error) == 0 {
+                val pname: str = pp_text(p);
+                val full: str = name + "." + pname;
+                if !p.prog.index.contains(full) {
+                    pp_fail(p, "no input " + pname + " on " + name);
+                    return pp_node(p, N_EMPTY, 0, 0.0, 0.0, 0, &none);
+                }
+                p.lx.pos = p.lx.pos + 1;
+                pp_expect(p, ":=");
+                val e: i64 = pp_expr(p);
+                var ak: Vec<i64> = Vec::new();
+                ak.push(e);
+                kids.push(pp_node(p, N_ASSIGN, p.prog.index.get(full), 0.0, 0.0, 0, &ak));
+                if pp_is(p, ",") {
+                    p.lx.pos = p.lx.pos + 1;
+                }
+            }
+            pp_expect(p, ")");
+            pp_expect(p, ";");
+            return pp_node(p, N_FBCALL, inst, 0.0, 0.0, 0, &kids);
+        }
+        val v: i64 = pp_var_ref(p);
+        pp_expect(p, ":=");
+        var kids: Vec<i64> = Vec::new();
+        kids.push(pp_expr(p));
+        pp_expect(p, ";");
+        return pp_node(p, N_ASSIGN, v, 0.0, 0.0, 0, &kids);
+    }
+    pp_fail(p, "expected a statement");
+    p.lx.pos = p.lx.pos + 1;
+    return pp_node(p, N_EMPTY, 0, 0.0, 0.0, 0, &none);
+}
+
+/// Compile ST source. On a syntax error the program has `error` set (with
+/// the line) and runs nothing.
+pub fn plc_compile(src: str) -> PlcProgram {
+    val lx: PlcLex = plc_lex(src);
+    var prog = PlcProgram {
+        name: "", error: "", var_names: Vec::new(), var_types: Vec::new(), var_addr: Vec::new(), values: Vec::new(), index: HashMap::new(), kind: Vec::new(), op: Vec::new(), num: Vec::new(), num2: Vec::new(), ty: Vec::new(), kid_start: Vec::new(), kid_count: Vec::new(), kids: Vec::new(), body: -1, now_ms: 0.0, scans: 0, steps: 0, max_steps: 1000000
+    };
+    if str_len(lx.error) > 0 {
+        prog.error = lx.error;
+        return prog;
+    }
+    var p = PlcParser {
+        lx: lx, prog: prog, error: ""
+    };
+    var wrapped: bool = false;
+    if pp_is(&p, "PROGRAM") {
+        p.lx.pos = p.lx.pos + 1;
+        p.prog.name = pp_text(&p);
+        p.lx.pos = p.lx.pos + 1;
+        wrapped = true;
+    }
+    pp_decls(&mut p);
+    if str_len(p.error) == 0 {
+        val body: i64 = pp_block(&mut p, "END_PROGRAM", "END_PROGRAM", "END_PROGRAM");
+        p.prog.body = body;
+        if wrapped {
+            pp_expect(&mut p, "END_PROGRAM");
+        }
+        if pp_kind(&p) != TK_EOF {
+            pp_fail(&mut p, "unexpected " + pp_text(&p));
+        }
+    }
+    var out: PlcProgram = p.prog;
+    out.error = p.error;
+    return out;
+}
+
+// ─── Execution ───
+
+fn plc_kid(prog: &PlcProgram, node: i64, k: i64) -> i64 {
+    return prog.kids.get(prog.kid_start.get(node) + k);
+}
+
+fn plc_trunc(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - math_floor(0.0 - x);
+    }
+    return math_floor(x);
+}
+
+fn plc_store(prog: &mut PlcProgram, v: i64, x: f64) {
+    val ty: i64 = prog.var_types.get(v);
+    if ty == PLC_BOOL {
+        if x != 0.0 {
+            prog.values.set(v, 1.0);
+        } else {
+            prog.values.set(v, 0.0);
+        }
+    } else if ty == PLC_INT || ty == PLC_TIME {
+        prog.values.set(v, plc_trunc(x));
+    } else {
+        prog.values.set(v, x);
+    }
+}
+
+fn plc_bool(x: f64) -> f64 {
+    if x != 0.0 {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+fn plc_eval(prog: &mut PlcProgram, node: i64) -> f64 {
+    val k: i64 = prog.kind.get(node);
+    if k == N_NUM {
+        return prog.num.get(node);
+    }
+    if k == N_VAR {
+        return prog.values.get(prog.op.get(node));
+    }
+    if k == N_NOT {
+        val a: f64 = plc_eval(prog, plc_kid(prog, node, 0));
+        if prog.ty.get(node) == PLC_BOOL {
+            return 1.0 - plc_bool(a);
+        }
+        // bitwise NOT of an integer
+        return (0 - (a as i64) - 1) as f64;
+    }
+    if k == N_NEG {
+        return 0.0 - plc_eval(prog, plc_kid(prog, node, 0));
+    }
+    if k == N_CALL {
+        val f: i64 = prog.op.get(node);
+        val n: i64 = prog.kid_count.get(node);
+        var args: Vec<f64> = Vec::new();
+        var i: i64 = 0;
+        while i < n {
+            args.push(plc_eval(prog, plc_kid(prog, node, i)));
+            i = i + 1;
+        }
+        if n == 0 {
+            return 0.0;
+        }
+        if f == 0 {
+            return math_fabs(args.get(0));
+        }
+        if f == 1 {
+            return math_sqrt(args.get(0));
+        }
+        if f == 2 || f == 3 {
+            var r: f64 = args.get(0);
+            i = 1;
+            while i < n {
+                if (f == 2 && args.get(i) < r) || (f == 3 && args.get(i) > r) {
+                    r = args.get(i);
+                }
+                i = i + 1;
+            }
+            return r;
+        }
+        if f == 4 && n == 3 {
+            return math_min_f64(math_max_f64(args.get(1), args.get(0)), args.get(2));
+        }
+        if f == 5 && n == 3 {
+            if args.get(0) != 0.0 {
+                return args.get(2);
+            }
+            return args.get(1);
+        }
+        return args.get(0);
+    }
+    // binary
+    val op: i64 = prog.op.get(node);
+    val a: f64 = plc_eval(prog, plc_kid(prog, node, 0));
+    if op == OP_AND && prog.ty.get(node) == PLC_BOOL && a == 0.0 {
+        return 0.0;
+    }
+    if op == OP_OR && prog.ty.get(node) == PLC_BOOL && a != 0.0 {
+        return 1.0;
+    }
+    val b: f64 = plc_eval(prog, plc_kid(prog, node, 1));
+    val ty: i64 = prog.ty.get(node);
+    if op == OP_OR || op == OP_XOR || op == OP_AND {
+        if ty == PLC_BOOL {
+            val x: f64 = plc_bool(a);
+            val y: f64 = plc_bool(b);
+            if op == OP_OR {
+                return math_max_f64(x, y);
+            }
+            if op == OP_AND {
+                return x * y;
+            }
+            return math_fabs(x - y);
+        }
+        val ia: i64 = a as i64;
+        val ib: i64 = b as i64;
+        if op == OP_OR {
+            return (ia | ib) as f64;
+        }
+        if op == OP_AND {
+            return (ia & ib) as f64;
+        }
+        return (ia ^ ib) as f64;
+    }
+    if op == OP_EQ {
+        if a == b {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if op == OP_NE {
+        if a != b {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if op == OP_LT {
+        if a < b {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if op == OP_GT {
+        if a > b {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if op == OP_LE {
+        if a <= b {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if op == OP_GE {
+        if a >= b {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    if op == OP_ADD {
+        return a + b;
+    }
+    if op == OP_SUB {
+        return a - b;
+    }
+    if op == OP_MUL {
+        return a * b;
+    }
+    if b == 0.0 {
+        if str_len(prog.error) == 0 {
+            prog.error = "division by zero";
+        }
+        return 0.0;
+    }
+    if op == OP_DIV {
+        if ty == PLC_REAL {
+            return a / b;
+        }
+        return plc_trunc(a / b);
+    }
+    // MOD: sign of the dividend, as in C and IEC
+    return a - b * plc_trunc(a / b);
+}
+
+fn plc_rising(prog: &mut PlcProgram, prev_slot: i64, now: f64) -> bool {
+    val was: f64 = prog.values.get(prev_slot);
+    prog.values.set(prev_slot, plc_bool(now));
+    return now != 0.0 && was == 0.0;
+}
+
+/// Execute function block instance `inst` (its inputs already stored).
+fn plc_run_fb(prog: &mut PlcProgram, inst: i64) {
+    val ty: i64 = prog.var_types.get(inst);
+    val t: f64 = prog.now_ms;
+    if ty == PLC_TON || ty == PLC_TOF || ty == PLC_TP {
+        // members: IN PT Q ET $S $P
+        val inp: f64 = prog.values.get(inst + 1);
+        val pt: f64 = prog.values.get(inst + 2);
+        val was: f64 = prog.values.get(inst + 6);
+        prog.values.set(inst + 6, plc_bool(inp));
+        if ty == PLC_TON {
+            if inp == 0.0 {
+                prog.values.set(inst + 3, 0.0);
+                prog.values.set(inst + 4, 0.0);
+            } else {
+                if was == 0.0 {
+                    prog.values.set(inst + 5, t);
+                }
+                val et: f64 = math_min_f64(t - prog.values.get(inst + 5), pt);
+                prog.values.set(inst + 4, et);
+                prog.values.set(inst + 3, plc_bool(if et >= pt { 1.0 } else { 0.0 }));
+            }
+        } else if ty == PLC_TOF {
+            if inp != 0.0 {
+                prog.values.set(inst + 3, 1.0);
+                prog.values.set(inst + 4, 0.0);
+            } else if prog.values.get(inst + 3) != 0.0 {
+                if was != 0.0 {
+                    prog.values.set(inst + 5, t);
+                }
+                val et: f64 = math_min_f64(t - prog.values.get(inst + 5), pt);
+                prog.values.set(inst + 4, et);
+                if et >= pt {
+                    prog.values.set(inst + 3, 0.0);
+                }
+            }
+        } else {
+            // TP: a rising IN starts a pulse of PT unless one is running
+            val q: f64 = prog.values.get(inst + 3);
+            if q == 0.0 && inp != 0.0 && was == 0.0 && prog.values.get(inst + 4) == 0.0 {
+                prog.values.set(inst + 5, t);
+                prog.values.set(inst + 3, 1.0);
+            }
+            if prog.values.get(inst + 3) != 0.0 {
+                val et: f64 = math_min_f64(t - prog.values.get(inst + 5), pt);
+                prog.values.set(inst + 4, et);
+                if et >= pt {
+                    prog.values.set(inst + 3, 0.0);
+                }
+            } else if inp == 0.0 {
+                prog.values.set(inst + 4, 0.0);
+            }
+        }
+        return;
+    }
+    if ty == PLC_CTU {
+        // CU R PV Q CV $P
+        val edge: bool = plc_rising(prog, inst + 6, prog.values.get(inst + 1));
+        if prog.values.get(inst + 2) != 0.0 {
+            prog.values.set(inst + 5, 0.0);
+        } else if edge && prog.values.get(inst + 5) < 32767.0 {
+            prog.values.set(inst + 5, prog.values.get(inst + 5) + 1.0);
+        }
+        prog.values.set(inst + 4, plc_bool(if prog.values.get(inst + 5) >= prog.values.get(inst + 3) { 1.0 } else { 0.0 }));
+        return;
+    }
+    if ty == PLC_CTD {
+        // CD LD PV Q CV $P
+        val edge: bool = plc_rising(prog, inst + 6, prog.values.get(inst + 1));
+        if prog.values.get(inst + 2) != 0.0 {
+            prog.values.set(inst + 5, prog.values.get(inst + 3));
+        } else if edge && prog.values.get(inst + 5) > -32768.0 {
+            prog.values.set(inst + 5, prog.values.get(inst + 5) - 1.0);
+        }
+        prog.values.set(inst + 4, plc_bool(if prog.values.get(inst + 5) <= 0.0 { 1.0 } else { 0.0 }));
+        return;
+    }
+    // R_TRIG / F_TRIG: CLK Q $P
+    val clk: f64 = plc_bool(prog.values.get(inst + 1));
+    val prev: f64 = prog.values.get(inst + 3);
+    prog.values.set(inst + 3, clk);
+    if ty == PLC_RTRIG {
+        prog.values.set(inst + 2, plc_bool(if clk != 0.0 && prev == 0.0 { 1.0 } else { 0.0 }));
+    } else {
+        prog.values.set(inst + 2, plc_bool(if clk == 0.0 && prev != 0.0 { 1.0 } else { 0.0 }));
+    }
+}
+
+// signals from statements
+const SIG_NONE: i64 = 0;
+const SIG_EXIT: i64 = 1;
+const SIG_RETURN: i64 = 2;
+const SIG_ERROR: i64 = 3;
+
+fn plc_exec(prog: &mut PlcProgram, node: i64) -> i64 {
+    prog.steps = prog.steps + 1;
+    if prog.steps > prog.max_steps {
+        if str_len(prog.error) == 0 {
+            prog.error = "watchdog: more than " + int_to_str(prog.max_steps) + " steps in one scan";
+        }
+        return SIG_ERROR;
+    }
+    if str_len(prog.error) > 0 {
+        return SIG_ERROR;
+    }
+    val k: i64 = prog.kind.get(node);
+    val n: i64 = prog.kid_count.get(node);
+    if k == N_BLOCK {
+        var i: i64 = 0;
+        while i < n {
+            val s: i64 = plc_exec(prog, plc_kid(prog, node, i));
+            if s != SIG_NONE {
+                return s;
+            }
+            i = i + 1;
+        }
+        return SIG_NONE;
+    }
+    if k == N_ASSIGN {
+        val x: f64 = plc_eval(prog, plc_kid(prog, node, 0));
+        plc_store(prog, prog.op.get(node), x);
+        if str_len(prog.error) > 0 {
+            return SIG_ERROR;
+        }
+        return SIG_NONE;
+    }
+    if k == N_IF {
+        var i: i64 = 0;
+        while i + 1 < n {
+            if plc_eval(prog, plc_kid(prog, node, i)) != 0.0 {
+                return plc_exec(prog, plc_kid(prog, node, i + 1));
+            }
+            i = i + 2;
+        }
+        if i < n {
+            return plc_exec(prog, plc_kid(prog, node, i));
+        }
+        return SIG_NONE;
+    }
+    if k == N_CASE {
+        val sel: f64 = plc_eval(prog, plc_kid(prog, node, 0));
+        val has_else: bool = prog.num.get(node) != 0.0;
+        var last: i64 = n;
+        if has_else {
+            last = n - 1;
+        }
+        var i: i64 = 1;
+        while i + 1 < last + 1 && i < last {
+            val labels: i64 = plc_kid(prog, node, i);
+            var j: i64 = 0;
+            while j < prog.kid_count.get(labels) {
+                val lab: i64 = plc_kid(prog, labels, j);
+                if sel >= prog.num.get(lab) && sel <= prog.num2.get(lab) {
+                    return plc_exec(prog, plc_kid(prog, node, i + 1));
+                }
+                j = j + 1;
+            }
+            i = i + 2;
+        }
+        if has_else {
+            return plc_exec(prog, plc_kid(prog, node, n - 1));
+        }
+        return SIG_NONE;
+    }
+    if k == N_FOR {
+        val v: i64 = prog.op.get(node);
+        val from: f64 = plc_eval(prog, plc_kid(prog, node, 0));
+        val to: f64 = plc_eval(prog, plc_kid(prog, node, 1));
+        val by: f64 = plc_eval(prog, plc_kid(prog, node, 2));
+        if by == 0.0 {
+            prog.error = "FOR with BY 0";
+            return SIG_ERROR;
+        }
+        plc_store(prog, v, from);
+        loop {
+            val cur: f64 = prog.values.get(v);
+            if (by > 0.0 && cur > to) || (by < 0.0 && cur < to) {
+                break;
+            }
+            val s: i64 = plc_exec(prog, plc_kid(prog, node, 3));
+            if s == SIG_EXIT {
+                break;
+            }
+            if s != SIG_NONE {
+                return s;
+            }
+            plc_store(prog, v, prog.values.get(v) + by);
+        }
+        return SIG_NONE;
+    }
+    if k == N_WHILE {
+        loop {
+            if plc_eval(prog, plc_kid(prog, node, 0)) == 0.0 {
+                break;
+            }
+            val s: i64 = plc_exec(prog, plc_kid(prog, node, 1));
+            if s == SIG_EXIT {
+                break;
+            }
+            if s != SIG_NONE {
+                return s;
+            }
+            if str_len(prog.error) > 0 {
+                return SIG_ERROR;
+            }
+        }
+        return SIG_NONE;
+    }
+    if k == N_REPEAT {
+        loop {
+            val s: i64 = plc_exec(prog, plc_kid(prog, node, 0));
+            if s == SIG_EXIT {
+                break;
+            }
+            if s != SIG_NONE {
+                return s;
+            }
+            if plc_eval(prog, plc_kid(prog, node, 1)) != 0.0 {
+                break;
+            }
+        }
+        return SIG_NONE;
+    }
+    if k == N_EXIT {
+        return SIG_EXIT;
+    }
+    if k == N_RETURN {
+        return SIG_RETURN;
+    }
+    if k == N_FBCALL {
+        var i: i64 = 0;
+        while i < n {
+            val s: i64 = plc_exec(prog, plc_kid(prog, node, i));
+            if s != SIG_NONE {
+                return s;
+            }
+            i = i + 1;
+        }
+        plc_run_fb(prog, prog.op.get(node));
+        return SIG_NONE;
+    }
+    return SIG_NONE;
+}
+
+// ─── Scan cycle and I/O ───
+
+pub fn plc_io_new() -> PlcIo {
+    return PlcIo {
+        inputs: HashMap::new(), outputs: HashMap::new()
+    };
+}
+
+fn plc_addr_key(addr: str) -> str {
+    var a: str = str_to_upper(addr);
+    if str_starts_with(a, "%") {
+        a = str_slice(a, 1, str_len(a));
+    }
+    return a;
+}
+
+pub fn plc_set_input(io: &mut PlcIo, addr: str, v: f64) {
+    io.inputs.insert(plc_addr_key(addr), v);
+}
+
+/// Output image value (0 when never written).
+pub fn plc_get_output(io: &PlcIo, addr: str) -> f64 {
+    val k: str = plc_addr_key(addr);
+    if io.outputs.contains(k) {
+        val x: f64 = io.outputs.get(k);
+        return x;
+    }
+    return 0.0;
+}
+
+/// One scan at time `now_ms`: inputs -> program -> outputs. Returns false
+/// when the program is stopped with an error.
+pub fn plc_scan(prog: &mut PlcProgram, io: &mut PlcIo, now_ms: f64) -> bool {
+    if str_len(prog.error) > 0 || prog.body < 0 {
+        return false;
+    }
+    prog.now_ms = now_ms;
+    prog.steps = 0;
+    var i: i64 = 0;
+    while i < prog.var_names.len() {
+        val a: str = prog.var_addr.get(i);
+        if str_starts_with(a, "I") && io.inputs.contains(a) {
+            // a HashMap<str, f64> value must go through a typed local: passed
+            // straight on as an f64 argument it arrives as the raw word
+            val x: f64 = io.inputs.get(a);
+            plc_store(prog, i, x);
+        }
+        i = i + 1;
+    }
+    val body: i64 = prog.body;
+    plc_exec(prog, body);
+    i = 0;
+    while i < prog.var_names.len() {
+        val a: str = prog.var_addr.get(i);
+        if str_starts_with(a, "Q") {
+            io.outputs.insert(a, prog.values.get(i));
+        }
+        i = i + 1;
+    }
+    prog.scans = prog.scans + 1;
+    return str_len(prog.error) == 0;
+}
+
+/// Value of a variable by name (case-insensitive, `inst.member` allowed).
+pub fn plc_get(prog: &PlcProgram, name: str) -> f64 {
+    val k: str = str_to_upper(name);
+    if prog.index.contains(k) {
+        return prog.values.get(prog.index.get(k));
+    }
+    return 0.0;
+}
+
+pub fn plc_set(prog: &mut PlcProgram, name: str, v: f64) {
+    val k: str = str_to_upper(name);
+    if prog.index.contains(k) {
+        plc_store(prog, prog.index.get(k), v);
+    }
+}
+
+// ─── Ladder logic ───
+
+pub const LAD_NO: i64 = 0;
+pub const LAD_NC: i64 = 1;
+pub const LAD_SERIES: i64 = 2;
+pub const LAD_PARALLEL: i64 = 3;
+
+pub const COIL_OUT: i64 = 0;
+pub const COIL_NEG: i64 = 1;
+pub const COIL_SET: i64 = 2;
+pub const COIL_RESET: i64 = 3;
+
+/// Ladder networks as an arena of elements; each rung is a network root
+/// and its coils.
+pub struct Ladder {
+    pub kind: Vec<i64>,
+    pub addr: Vec<str>,
+    pub kid_start: Vec<i64>,
+    pub kid_count: Vec<i64>,
+    pub kids: Vec<i64>,
+    pub rung_net: Vec<i64>,
+    pub coil_start: Vec<i64>,
+    pub coil_count: Vec<i64>,
+    pub coil_addr: Vec<str>,
+    pub coil_kind: Vec<i64>,
+}
+
+pub fn ladder_new() -> Ladder {
+    return Ladder {
+        kind: Vec::new(), addr: Vec::new(), kid_start: Vec::new(), kid_count: Vec::new(), kids: Vec::new(), rung_net: Vec::new(), coil_start: Vec::new(), coil_count: Vec::new(), coil_addr: Vec::new(), coil_kind: Vec::new()
+    };
+}
+
+fn lad_elem(l: &mut Ladder, kind: i64, addr: str, parts: &Vec<i64>) -> i64 {
+    l.kind.push(kind);
+    l.addr.push(plc_addr_key(addr));
+    l.kid_start.push(l.kids.len());
+    l.kid_count.push(parts.len());
+    var i: i64 = 0;
+    while i < parts.len() {
+        l.kids.push(parts.get(i));
+        i = i + 1;
+    }
+    return l.kind.len() - 1;
+}
+
+/// A normally open (closed when `nc`) contact on a bit address.
+pub fn lad_contact(l: &mut Ladder, addr: str, nc: bool) -> i64 {
+    val none: Vec<i64> = Vec::new();
+    if nc {
+        return lad_elem(l, LAD_NC, addr, &none);
+    }
+    return lad_elem(l, LAD_NO, addr, &none);
+}
+
+pub fn lad_series(l: &mut Ladder, parts: Vec<i64>) -> i64 {
+    return lad_elem(l, LAD_SERIES, "", &parts);
+}
+
+pub fn lad_parallel(l: &mut Ladder, parts: Vec<i64>) -> i64 {
+    return lad_elem(l, LAD_PARALLEL, "", &parts);
+}
+
+/// A rung: network `net` driving coils (parallel `addrs` and `kinds`).
+pub fn lad_rung(l: &mut Ladder, net: i64, addrs: Vec<str>, kinds: Vec<i64>) {
+    l.rung_net.push(net);
+    l.coil_start.push(l.coil_addr.len());
+    l.coil_count.push(addrs.len());
+    var i: i64 = 0;
+    while i < addrs.len() {
+        l.coil_addr.push(plc_addr_key(addrs.get(i)));
+        l.coil_kind.push(kinds.get(i));
+        i = i + 1;
+    }
+}
+
+fn lad_bit(mem: &HashMap<str, f64>, addr: str) -> bool {
+    if mem.contains(addr) {
+        val x: f64 = mem.get(addr);
+        return x != 0.0;
+    }
+    return false;
+}
+
+/// Power flow through element e.
+pub fn lad_eval(l: &Ladder, mem: &HashMap<str, f64>, e: i64) -> bool {
+    val k: i64 = l.kind.get(e);
+    if k == LAD_NO {
+        return lad_bit(mem, l.addr.get(e));
+    }
+    if k == LAD_NC {
+        return !lad_bit(mem, l.addr.get(e));
+    }
+    val n: i64 = l.kid_count.get(e);
+    var i: i64 = 0;
+    if k == LAD_SERIES {
+        while i < n {
+            if !lad_eval(l, mem, l.kids.get(l.kid_start.get(e) + i)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    while i < n {
+        if lad_eval(l, mem, l.kids.get(l.kid_start.get(e) + i)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Evaluate every rung in order over `mem` (bit address -> 0/1).
+pub fn ladder_scan(l: &Ladder, mem: &mut HashMap<str, f64>) {
+    var r: i64 = 0;
+    while r < l.rung_net.len() {
+        val power: bool = lad_eval(l, mem, l.rung_net.get(r));
+        var c: i64 = 0;
+        while c < l.coil_count.get(r) {
+            val at: i64 = l.coil_start.get(r) + c;
+            val a: str = l.coil_addr.get(at);
+            val kind: i64 = l.coil_kind.get(at);
+            if kind == COIL_OUT {
+                mem.insert(a, if power { 1.0 } else { 0.0 });
+            } else if kind == COIL_NEG {
+                mem.insert(a, if power { 0.0 } else { 1.0 });
+            } else if kind == COIL_SET {
+                if power {
+                    mem.insert(a, 1.0);
+                }
+            } else if power {
+                mem.insert(a, 0.0);
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+}

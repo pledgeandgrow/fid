@@ -1,0 +1,69 @@
+OP10 / OP11 (competitive-roadmap), Nov 17: the mid-end's strength reduction
+outside @wrapping code, and loop unrolling on by default.
+
+What changed (compiler/iropt_me.fd, compiler/checks.fd, compiler/iropt.fd)
+---------------------------------------------------------------------------
+
+OP10, ime_strength_reduce (pass `ivsr`, still opt-in: FID_IROPT_ON=ivsr)
+  - The @wrapping gate is gone. Outside @wrapping code a product
+    `load(i) * c` is replaced only when checks.fd iro_iv_bounded proves no
+    value of the stepped copy can overflow: the header tests i against a
+    constant K (`<`/`<=` stepping up, `>`/`>=` stepping down, either branch
+    order), i's entry value is a constant c0 (the last store on the one way
+    into the preheader), |c0|, |K| <= 2^40 and |c|, |step| <= 2^20. This is
+    the proof iropt.fd's `iv` (iro_iv_loop) already used.
+  - iro_iv_bounded now also requires that the block holding i's one store
+    is on no cycle of the loop body that avoids the header: an inner loop
+    stepping i would take it past K between two tests (both `iv` and
+    `ivsr` use the proof, so both gain the check).
+  - FID_IROPT_OFF=ivbound keeps ivsr (and iv) to @wrapping functions.
+  - Exit values of the loop's variable: ssaexit (compiler/ssa.fd), on by
+    default since OP2 (IME_DEFAULT_ON), covers constant bounds; no second
+    exit-value pass on the slot path.
+
+OP11, ime_unroll (pass `unroll`, now in IME_DEFAULT_ON)
+  - Full unrolling (<= 8 trips), partial by 4 or 2, the remainder peeled in
+    front of the header, and trip counts known only at run time (a guard
+    block runs 4 copies while n - i > 3 * step, else the old body) were
+    written earlier (Nov 15-16). New safety checks:
+      * the body block's only predecessor is the header (the natural loop
+        of bb -> h could hold other blocks reaching bb);
+      * the header's comparison reads a load the header itself makes;
+      * step <= 2^20, |c0|, |limit| <= 2^60, so the trip count's
+        arithmetic stays inside i64 in the compiler;
+      * a loop whose body calls Vec_get/Vec_set (p_vec_get/p_vec_set) is
+        left alone (ime_unroll_proved_calls): checks.fd peir_counted_loop
+        needs one store to i in the loop to drop the bounds checks, and
+        copies of the step would bring them back (the cause of the inline2
+        slowdowns of OP5, docs/perf/mid-end/op5-inline2-default.txt).
+  - FID_IROPT_OFF=unroll turns it off.
+
+Counters (FID_IROPT_STATS=1, one line after the licmguard line):
+  iropt: ivsr N products (M outside @wrapping), unroll F full, P partial,
+  R peeled, T run-time
+(P counts the partial unrollings of constant trip counts, R those of them
+with a peeled remainder, T those with a trip count known only at run time.)
+
+Tests and checks
+----------------
+  tests/bootstrap/test_midend_ivsr_bounded.fd        ivsr outputs
+  tests/bootstrap/test_midend_ivsr_bounded_fail.fd   panic placement
+  tests/bootstrap/test_midend_unroll_peel_fail.fd    panic in a peeled group
+  tests/bootstrap/test_midend_unroll_runtime_fail.fd panic in a run-time group
+  (and the earlier test_midend_iv_bounded*.fd, test_unroll.fd,
+  test_midend_unroll_partial/remainder/runtime.fd)
+  tests/tooling/ivsr-check.sh         counters, on/off outputs, SUITE=1
+  tests/tooling/unroll-check.sh       default-on counters, on/off outputs,
+                                      SUITE=1, BENCH=1
+  tests/tooling/midend-pass-suite-check.sh  any pass (PASS=...) on/off over
+                                      the suite, or BENCH=1 over bench/
+
+Measured so far (Nov 17, with the old stage-0 compiler: no counters, its
+unroll opt-in, its ivsr still gated): the new tests' expected outputs come
+from `fid run`; emitted through pe_ir with FID_IROPT_ON=ivsr,unroll and with
+FID_IROPT_OFF=unroll every one printed the same, and the _fail tests
+panicked after the same lines. compiler/iropt.fd (with iropt_me.fd and
+checks.fd) type-checks clean with stage 0 (`fid check`). The new code has
+not been built: the gate before unroll stays on by default is
+`SUITE=1 BENCH=1 bash tests/tooling/unroll-check.sh` (and NAT=1) passing
+with the final compiler.

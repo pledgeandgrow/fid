@@ -1,0 +1,137 @@
+// Track MI (docs/roadmap/llvm-roadmap.md), MI1: block parameters of the
+// machine IR (compiler/mir.fd; docs/reference/mir.md). With
+// FID_NAT_ON=bparams the machine layer (compiler/nat_ir.fd
+// ng_bparams_round) puts each function in block-parameter form before
+// allocation: locals written in several places (loop counters, sums,
+// values merged after an if, a select, floats) become one value per write,
+// passed into loop heads and merge points as block arguments, then moves
+// on the edges again. FID_VERIFY=1 checks the form (verifier, SSA) and the
+// lowered MIR, and the allocation checker runs after. Every machine-layer
+// target must print the same with and without it.
+// Native check: bash tests/nattools/machine_bparams_check.sh
+// Expected output:
+// 55
+// 25 30
+// 7 3
+// 27
+// 1 0 4
+// 6.5
+// 2 1 3
+// 40
+
+fn sum_to(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 1;
+    while i <= n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+// Two values swapped and changed in a loop (a cycle of block arguments).
+fn odd_even(n: i64) -> i64 {
+    var a: i64 = 0;
+    var b: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        if i % 2 == 1 {
+            a = a + i;
+        } else {
+            b = b + i;
+        }
+        i = i + 1;
+    }
+    println(int_to_str(a) + " " + int_to_str(b));
+    return a + b;
+}
+
+fn swap_steps(k: i64) {
+    var x: i64 = 3;
+    var y: i64 = 7;
+    var i: i64 = 0;
+    while i < k {
+        var t: i64 = x;
+        x = y;
+        y = t;
+        i = i + 1;
+    }
+    println(int_to_str(x) + " " + int_to_str(y));
+}
+
+// break and continue: edges out of the middle of a loop
+fn skip_sum(n: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while true {
+        i = i + 1;
+        if i > n {
+            break;
+        }
+        if i % 3 == 0 {
+            continue;
+        }
+        s = s + i;
+    }
+    return s;
+}
+
+// a value chosen by an if (a select or a merge)
+fn pick(c: i64) -> i64 {
+    var v: i64 = 4;
+    if c > 0 {
+        v = 1;
+    }
+    if c < 0 {
+        v = 0;
+    }
+    return v;
+}
+
+fn half_sum(n: i64) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < n {
+        s = s + 0.5 * (i as f64);
+        i = i + 1;
+    }
+    return s;
+}
+
+// nested loops, the inner counter written in both
+fn nested() {
+    var outer: i64 = 0;
+    var inner: i64 = 0;
+    var i: i64 = 0;
+    while i < 3 {
+        var j: i64 = 0;
+        while j < i {
+            inner = inner + 1;
+            j = j + 1;
+        }
+        outer = outer + 1;
+        i = i + 1;
+    }
+    println(int_to_str(i - 1) + " " + int_to_str(inner - 2) + " " + int_to_str(outer));
+}
+
+fn fact_like(n: i64) -> i64 {
+    var acc: i64 = 1;
+    var m: i64 = n;
+    while m > 1 {
+        acc = acc * 2;
+        m = m - 1;
+    }
+    return acc * 5;
+}
+
+fn main() {
+    println(int_to_str(sum_to(10)));
+    var t: i64 = odd_even(11);
+    swap_steps(3);
+    println(int_to_str(skip_sum(8)));
+    println(int_to_str(pick(5)) + " " + int_to_str(pick(0 - 5)) + " " + int_to_str(pick(0)));
+    println(float_to_str(half_sum(6) - 1.0));
+    nested();
+    println(int_to_str(fact_like(4) + t - 55));
+}

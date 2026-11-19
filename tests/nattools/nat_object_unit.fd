@@ -1,0 +1,384 @@
+// TG12 (docs/roadmap/llvm-roadmap.md): the COFF and Mach-O objects of the
+// machine layer (compiler/nat_enc.fd nat_coff_object, nat_macho_object) on
+// small hand-made images laid out as nat_ir.fd lays out a program's: the
+// code, the data from a page boundary, the import tables of a `--nat` PE
+// (ng_gen_win_imports) or the GOT of a Mach-O (ng_gen_mac_got). Each image
+// holds every kind of reference an object must turn into a relocation:
+// rip-relative / ADRP + ADD from the code to the data, absolute words from
+// the data to the data and to the code, and the imported functions.
+//
+// Writes into $NAT_OBJ_DIR (default "."):
+//   coff_exe.exe     the PE of the Windows image (nat_pe): prints
+//                    "coff object ok"
+//   coff.obj         its COFF object; linked with fid_main as the entry it
+//                    must print the same
+//   macho_x64.o      x86-64 Mach-O object (write "macho object ok", exit)
+//   macho_a64.o      AArch64 Mach-O object (the same)
+//   coff_export.obj, macho_x64_export.o, elf_x64_export.o
+//                    the same with a C-callable entry point
+//                    (g_nat_obj_exports): `fid_probe` at the Windows
+//                    image's `bye` (ExitProcess(0)), a C main calls it
+// and prints what the object must hold. tests/nattools/tg12_objects_check.sh
+// runs it, links the objects (zig cc) and runs the Windows one.
+// Expected output:
+// coff machine 8664 sections 3 symbols 8
+// coff text relocs 6 data relocs 11
+// coff directives /DEFAULTLIB:kernel32.lib /STACK:268435456,65536
+// coff with an export: symbols 9 text relocs 6 data relocs 11
+// macho x64 filetype 1 ncmds 4 nsyms 6
+// macho x64 text relocs 3 data relocs 3
+// macho with an export: nsyms 7 extdef 2 undef 2
+// elf with an export: globals 2
+// macho a64 filetype 1 ncmds 4 nsyms 8
+// macho a64 text relocs 6 data relocs 3
+// a64 adrp immediates cleared
+// done
+use core;
+use vec;
+use string;
+use compiler::image_writer;
+use compiler::nat_enc;
+
+fn env_or(name: str, dflt: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+        }
+    }
+    return dflt;
+}
+
+fn u16_at(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn u32_at(b: & Vec<i64>, at: i64) -> i64 {
+    return img_get_u32(b, at);
+}
+
+fn put_text(e: & mut NatEnc, s: str) {
+    var i: i64 = 0;
+    while i < str_len(s) {
+        NatEnc_byte(e, str_byte_at(s, i));
+        i = i + 1;
+    }
+}
+
+fn hex(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var x: i64 = v;
+    if x == 0 {
+        return "0";
+    }
+    while x > 0 {
+        out = str_slice(digits, x & 15, (x & 15) + 1) + out;
+        x = x >> 4;
+    }
+    return out;
+}
+
+/// The Windows image: GetStdHandle(-11); WriteFile(h, msg, n, &written, 0)
+/// through the slot address an absolute word in the data holds; a call
+/// through an absolute word in the data to `bye`, which calls
+/// ExitProcess(0). Import tables as ng_gen_win_imports writes them.
+fn check_coff(dir: str) {
+    var text: str = "coff object ok\n";
+    var e: NatEnc = NatEnc_new();
+    var entry: i64 = NatEnc_label(& mut e);
+    var bye: i64 = NatEnc_label(& mut e);
+    var msg: i64 = NatEnc_label(& mut e);
+    var written: i64 = NatEnc_label(& mut e);
+    var wf_ptr: i64 = NatEnc_label(& mut e);
+    var bye_ptr: i64 = NatEnc_label(& mut e);
+    var imp: i64 = NatEnc_label(& mut e);
+    var imp_end: i64 = NatEnc_label(& mut e);
+    var ilt: i64 = NatEnc_label(& mut e);
+    var iat: i64 = NatEnc_label(& mut e);
+    var iat_end: i64 = NatEnc_label(& mut e);
+    var dname: i64 = NatEnc_label(& mut e);
+    var fnames: Vec<str> = Vec::new();
+    fnames.push("GetStdHandle");
+    fnames.push("WriteFile");
+    fnames.push("ExitProcess");
+    var slots: Vec<i64> = Vec::new();
+    var hints: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < fnames.len() {
+        slots.push(NatEnc_label(& mut e));
+        hints.push(NatEnc_label(& mut e));
+        k = k + 1;
+    }
+    // the code
+    NatEnc_place(& mut e, entry);
+    x64_sub_imm(& mut e, 4, 56);
+    x64_li(& mut e, 1, 0 - 11);
+    x64_load_label(& mut e, 0, slots.get(0));
+    x64_call_r(& mut e, 0);
+    x64_mov(& mut e, 1, 0);
+    x64_lea_label(& mut e, 2, msg);
+    x64_li(& mut e, 8, str_len(text));
+    x64_lea_label(& mut e, 9, written);
+    x64_li(& mut e, 0, 0);
+    x64_store(& mut e, 0, 4, 32, 8);
+    x64_load_label(& mut e, 0, wf_ptr);
+    x64_load(& mut e, 0, 0, 0, 8, false);
+    x64_call_r(& mut e, 0);
+    x64_load_label(& mut e, 0, bye_ptr);
+    x64_call_r(& mut e, 0);
+    x64_ud2(& mut e);
+    NatEnc_align(& mut e, 16);
+    var bye_at: i64 = NatEnc_pos(& e);
+    NatEnc_place(& mut e, bye);
+    x64_sub_imm(& mut e, 4, 40);
+    x64_li(& mut e, 1, 0);
+    x64_load_label(& mut e, 0, slots.get(2));
+    x64_call_r(& mut e, 0);
+    x64_ud2(& mut e);
+    var code_end: i64 = NatEnc_pos(& e);
+    // the data, from a page
+    NatEnc_align(& mut e, 4096);
+    var data_off: i64 = NatEnc_pos(& e);
+    NatEnc_place(& mut e, msg);
+    put_text(& mut e, text);
+    NatEnc_align(& mut e, 8);
+    NatEnc_place(& mut e, written);
+    NatEnc_quad(& mut e, 0);
+    NatEnc_place(& mut e, wf_ptr);
+    NatEnc_fix(& mut e, slots.get(1), NATFIX_ABS64);
+    NatEnc_quad(& mut e, 0);
+    NatEnc_place(& mut e, bye_ptr);
+    NatEnc_fix(& mut e, bye, NATFIX_ABS64);
+    NatEnc_quad(& mut e, 0);
+    // the import directory: one DLL, then the null descriptor
+    NatEnc_align(& mut e, 8);
+    NatEnc_place(& mut e, imp);
+    NatEnc_rva32(& mut e, ilt);
+    NatEnc_u32(& mut e, 0);
+    NatEnc_u32(& mut e, 0);
+    NatEnc_rva32(& mut e, dname);
+    NatEnc_rva32(& mut e, iat);
+    var z: i64 = 0;
+    while z < 5 {
+        NatEnc_u32(& mut e, 0);
+        z = z + 1;
+    }
+    NatEnc_place(& mut e, imp_end);
+    NatEnc_align(& mut e, 8);
+    NatEnc_place(& mut e, ilt);
+    k = 0;
+    while k < fnames.len() {
+        NatEnc_rva32(& mut e, hints.get(k));
+        NatEnc_u32(& mut e, 0);
+        k = k + 1;
+    }
+    NatEnc_quad(& mut e, 0);
+    NatEnc_align(& mut e, 8);
+    NatEnc_place(& mut e, iat);
+    k = 0;
+    while k < fnames.len() {
+        NatEnc_place(& mut e, slots.get(k));
+        NatEnc_rva32(& mut e, hints.get(k));
+        NatEnc_u32(& mut e, 0);
+        k = k + 1;
+    }
+    NatEnc_quad(& mut e, 0);
+    NatEnc_place(& mut e, iat_end);
+    k = 0;
+    while k < fnames.len() {
+        NatEnc_align(& mut e, 2);
+        NatEnc_place(& mut e, hints.get(k));
+        NatEnc_byte(& mut e, 0);
+        NatEnc_byte(& mut e, 0);
+        put_text(& mut e, fnames.get(k));
+        NatEnc_byte(& mut e, 0);
+        k = k + 1;
+    }
+    NatEnc_place(& mut e, dname);
+    put_text(& mut e, "kernel32.dll");
+    NatEnc_byte(& mut e, 0);
+    NatEnc_align(& mut e, 8);
+    var rerr: str = NatEnc_resolve(& mut e);
+    if rerr != "" {
+        println("coff resolve: " + rerr);
+        return;
+    }
+    var entry_off: i64 = e.labels.get(entry);
+    var imp_off: i64 = e.labels.get(imp);
+    var imp_size: i64 = e.labels.get(imp_end) - imp_off;
+    var iat_off: i64 = e.labels.get(iat);
+    var iat_size: i64 = e.labels.get(iat_end) - iat_off;
+    var exe: Vec<i64> = nat_pe(e.code, entry_off, data_off, imp_off, imp_size, iat_off, iat_size);
+    p_file_write_vec(dir + "/coff_exe.exe", exe);
+    var names: Vec<str> = Vec::new();
+    names.push("entry");
+    names.push("bye");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(entry_off);
+    starts.push(bye_at);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(bye_at);
+    ends.push(code_end);
+    var obj: Vec<i64> = nat_coff_object(& e, entry_off, data_off, imp_off, imp_size, iat_off, iat_size, & names, & starts, & ends);
+    if obj.len() == 0 {
+        println("coff object: " + g_nat_obj_err);
+        return;
+    }
+    p_file_write_vec(dir + "/coff.obj", obj);
+    println("coff machine " + hex(u16_at(& obj, 0)) + " sections " + int_to_str(u16_at(& obj, 2)) + " symbols " + int_to_str(u32_at(& obj, 12)));
+    // section headers at 20: NumberOfRelocations at +32
+    println("coff text relocs " + int_to_str(u16_at(& obj, 20 + 32)) + " data relocs " + int_to_str(u16_at(& obj, 60 + 32)));
+    var dir_at: i64 = u32_at(& obj, 100 + 20);
+    var dir_len: i64 = u32_at(& obj, 100 + 16);
+    var db: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < dir_len {
+        db.push(obj.get(dir_at + i));
+        i = i + 1;
+    }
+    println("coff directives " + str_trim(str_from_bytes(db)));
+    // a C-callable entry point (g_nat_obj_exports): `bye` as fid_probe
+    g_nat_obj_exports.push("fid_probe");
+    g_nat_obj_export_offs.push(bye_at);
+    var xobj: Vec<i64> = nat_coff_object(& e, entry_off, data_off, imp_off, imp_size, iat_off, iat_size, & names, & starts, & ends);
+    g_nat_obj_exports = Vec::new();
+    g_nat_obj_export_offs = Vec::new();
+    if xobj.len() == 0 {
+        println("coff export object: " + g_nat_obj_err);
+        return;
+    }
+    p_file_write_vec(dir + "/coff_export.obj", xobj);
+    println("coff with an export: symbols " + int_to_str(u32_at(& xobj, 12)) + " text relocs " + int_to_str(u16_at(& xobj, 20 + 32)) + " data relocs " + int_to_str(u16_at(& xobj, 60 + 32)));
+}
+
+/// A Mach-O image for `arch`: write(1, msg, n) and exit(0) through the
+/// GOT, an absolute word in the data pointing at the entry; on AArch64 an
+/// ADRP + ADD inside the code too (no relocation: same section).
+fn check_macho(dir: str, arch: i64, tag: str) {
+    var text: str = "macho object ok\n";
+    var e: NatEnc = NatEnc_new();
+    var entry: i64 = NatEnc_label(& mut e);
+    var msg: i64 = NatEnc_label(& mut e);
+    var got: i64 = NatEnc_label(& mut e);
+    var ptr: i64 = NatEnc_label(& mut e);
+    var tab: i64 = NatEnc_label(& mut e);
+    var page: i64 = 4096;
+    NatEnc_place(& mut e, entry);
+    var adrp_at: i64 = 0;
+    if arch == NAT_A64 {
+        page = 16384;
+        adrp_at = NatEnc_pos(& e);
+        a64_addr(& mut e, 1, msg);
+        a64_movz_hw(& mut e, 0, 1, 0);
+        a64_movz_hw(& mut e, 2, str_len(text), 0);
+        a64_addr(& mut e, 9, got);
+        a64_ldr(& mut e, 9, 9, 0);
+        a64_blr(& mut e, 9);
+        a64_addr(& mut e, 10, tab);
+        a64_movz_hw(& mut e, 0, 0, 0);
+        a64_addr(& mut e, 9, got);
+        a64_ldr(& mut e, 9, 9, 8);
+        a64_blr(& mut e, 9);
+        NatEnc_place(& mut e, tab);
+        NatEnc_word(& mut e, 0);
+    } else {
+        x64_push(& mut e, 5);
+        x64_lea_label(& mut e, 6, msg);
+        x64_li(& mut e, 7, 1);
+        x64_li(& mut e, 2, str_len(text));
+        x64_lea_label(& mut e, 11, got);
+        x64_load(& mut e, 0, 11, 0, 8, false);
+        x64_call_r(& mut e, 0);
+        x64_li(& mut e, 7, 0);
+        x64_lea_label(& mut e, 11, got);
+        x64_load(& mut e, 0, 11, 8, 8, false);
+        x64_call_r(& mut e, 0);
+        x64_ud2(& mut e);
+    }
+    var code_end: i64 = NatEnc_pos(& e);
+    NatEnc_align(& mut e, page);
+    var data_off: i64 = NatEnc_pos(& e);
+    NatEnc_place(& mut e, msg);
+    put_text(& mut e, text);
+    NatEnc_align(& mut e, 8);
+    NatEnc_place(& mut e, got);
+    NatEnc_quad(& mut e, 0);
+    NatEnc_quad(& mut e, 0);
+    NatEnc_place(& mut e, ptr);
+    NatEnc_fix(& mut e, entry, NATFIX_ABS64);
+    NatEnc_quad(& mut e, 0);
+    g_nat_abs_base = NAT_MACHO_BASE + NAT_MACHO_HDR;
+    var rerr: str = NatEnc_resolve(& mut e);
+    if rerr != "" {
+        println("macho resolve: " + rerr);
+        return;
+    }
+    var imp_names: Vec<str> = Vec::new();
+    imp_names.push("_write");
+    imp_names.push("_exit");
+    var imp_offs: Vec<i64> = Vec::new();
+    imp_offs.push(e.labels.get(got));
+    imp_offs.push(e.labels.get(got) + 8);
+    var names: Vec<str> = Vec::new();
+    names.push("entry");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(code_end);
+    var obj: Vec<i64> = nat_macho_object(arch, & e, 0, data_off, & imp_names, & imp_offs, & names, & starts, & ends);
+    if obj.len() == 0 {
+        println("macho object: " + g_nat_obj_err);
+        return;
+    }
+    p_file_write_vec(dir + "/macho_" + tag + ".o", obj);
+    // header: filetype at 12, ncmds at 16; LC_SEGMENT_64 at 32, its two
+    // sections at 32 + 72 and 32 + 152 (nreloc at +60 of each); LC_SYMTAB
+    // after LC_BUILD_VERSION: 32 + 232 + 24, nsyms at +12
+    println("macho " + tag + " filetype " + int_to_str(u32_at(& obj, 12)) + " ncmds " + int_to_str(u32_at(& obj, 16)) + " nsyms " + int_to_str(u32_at(& obj, 32 + 232 + 24 + 12)));
+    println("macho " + tag + " text relocs " + int_to_str(u32_at(& obj, 32 + 72 + 60)) + " data relocs " + int_to_str(u32_at(& obj, 32 + 152 + 60)));
+    if arch == NAT_X64 {
+        // a C-callable entry point (g_nat_obj_exports) in the Mach-O and
+        // the ELF object of the same image: one more defined external /
+        // global symbol each
+        g_nat_obj_exports.push("fid_probe");
+        g_nat_obj_export_offs.push(0);
+        var xm: Vec<i64> = nat_macho_object(arch, & e, 0, data_off, & imp_names, & imp_offs, & names, & starts, & ends);
+        var xe: Vec<i64> = nat_elf_object(NAT_X64, e.code, 0, names, starts, ends, e.fixups);
+        g_nat_obj_exports = Vec::new();
+        g_nat_obj_export_offs = Vec::new();
+        if xm.len() == 0 {
+            println("macho export object: " + g_nat_obj_err);
+            return;
+        }
+        p_file_write_vec(dir + "/macho_x64_export.o", xm);
+        p_file_write_vec(dir + "/elf_x64_export.o", xe);
+        // LC_DYSYMTAB after LC_SYMTAB: nextdefsym at +20, nundefsym at +28
+        var dys: i64 = 32 + 232 + 24 + 24;
+        println("macho with an export: nsyms " + int_to_str(u32_at(& xm, 32 + 232 + 24 + 12)) + " extdef " + int_to_str(u32_at(& xm, dys + 20)) + " undef " + int_to_str(u32_at(& xm, dys + 28)));
+        // ELF: e_shoff at 0x28; .symtab is section 3 (sh_size +32, sh_info +44)
+        var shoff: i64 = u32_at(& xe, 0x28);
+        var symsh: i64 = shoff + 3 * 64;
+        var nsym: i64 = u32_at(& xe, symsh + 32) / 24;
+        println("elf with an export: globals " + int_to_str(nsym - u32_at(& xe, symsh + 44)));
+    }
+    if arch == NAT_A64 {
+        var text_at: i64 = u32_at(& obj, 32 + 72 + 48);
+        var adrp: i64 = u32_at(& obj, text_at + adrp_at);
+        var add: i64 = u32_at(& obj, text_at + adrp_at + 4);
+        if (adrp & 0x60FFFFE0) == 0 && ((add >> 10) & 0xFFF) == 0 {
+            println("a64 adrp immediates cleared");
+        } else {
+            println("a64 adrp immediates kept: " + hex(adrp) + " " + hex(add));
+        }
+    }
+}
+
+fn main() {
+    var dir: str = env_or("NAT_OBJ_DIR", ".");
+    check_coff(dir);
+    check_macho(dir, NAT_X64, "x64");
+    check_macho(dir, NAT_A64, "a64");
+    println("done");
+}

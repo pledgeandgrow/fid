@@ -1,0 +1,118 @@
+// stdlib/deep_link: URL parsing with decoding, route matching (static
+// beats parameter beats tail; host wildcards; excluded paths), link
+// building, the apple-app-site-association and assetlinks.json files, and
+// Android intent filters.
+// Expected output:
+// parse https host.com 8080 [a/b|c] x=1 y=a b frag frag
+// parse custom myapp host product [42]
+// bad pattern 1 https://example.com/a/*x/b: * only as the last segment
+// myapp://product/42?ref=email -> product id=42 ref=email
+// https://example.com/users/me -> user_me
+// https://example.com/users/ann%20b -> user user=ann b
+// https://example.com/users/ann/posts/7#top -> user_post user=ann post=7
+// https://example.com/docs/guide/intro.html -> docs path=guide/intro.html
+// https://shop.example.com/promo/SUMMER -> promo code=SUMMER
+// https://example.com/promo/X -> none
+// https://example.com/admin/users -> none
+// HTTPS://Example.COM:443/users/x -> user user=x
+// ftp://example.com/users/x -> none
+// build https://example.com/users/ann%20b/posts/7?utm=x%20y
+// build docs https://example.com/docs/a/b%20c missing ""
+// {"applinks":{"details":[{"appIDs":["ABCDE12345.com.example.app"],"components":[{"/":"/admin/*","exclude":true},{"/":"/users/*/posts/*","comment":"user_post"},{"/":"/users/*","comment":"user"},{"/":"/users/me","comment":"user_me"},{"/":"/docs/*","comment":"docs"}]}]},"webcredentials":{"apps":["ABCDE12345.com.example.app"]}}
+// [{"relation":["delegate_permission/common.handle_all_urls"],"target":{"namespace":"android_app","package_name":"com.example.app","sha256_cert_fingerprints":["14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5"]}}]
+// bad fingerprint ""
+// <intent-filter>
+//     <action android:name="android.intent.action.VIEW" />
+//     <category android:name="android.intent.category.DEFAULT" />
+//     <category android:name="android.intent.category.BROWSABLE" />
+//     <data android:scheme="myapp" />
+//     <data android:host="product" />
+//     <data android:pathPattern="/.*" />
+// </intent-filter>
+// <intent-filter android:autoVerify="true">
+//     <action android:name="android.intent.action.VIEW" />
+//     <category android:name="android.intent.category.DEFAULT" />
+//     <category android:name="android.intent.category.BROWSABLE" />
+//     <data android:scheme="https" />
+//     <data android:host="example.com" />
+//     <data android:pathPrefix="/docs/" />
+// </intent-filter>
+// path attrs android:path="/users/me" android:pathPattern="/files/v1\\.2/.*"
+use deep_link;
+use vec;
+use string;
+
+fn show(r: &DlRouter, url: str) {
+    val m: DlMatch = dl_route(r, url);
+    if !m.ok { println(url + " -> none"); return; }
+    var s: str = url + " -> " + m.name;
+    var i: i64 = 0;
+    while i < m.keys.len() { s = s + " " + m.keys.get(i) + "=" + m.vals.get(i); i = i + 1; }
+    println(s);
+}
+
+fn segs(u: &DlUrl) -> str {
+    var s: str = "[";
+    var i: i64 = 0;
+    while i < u.segments.len() { if i > 0 { s = s + "|"; } s = s + u.segments.get(i); i = i + 1; }
+    return s + "]";
+}
+
+fn main() {
+    val u: DlUrl = dl_parse("https://u:p@host.com:8080/a%2Fb/c?x=1&y=a+b#frag");
+    println("parse " + u.scheme + " " + u.host + " " + int_to_str(u.port) + " " + segs(&u) + " x=" + dl_query(&u, "x")
+        + " y=" + dl_query(&u, "y") + " frag " + u.fragment);
+    val c: DlUrl = dl_parse("myapp://product/42");
+    println("parse custom " + c.scheme + " host " + c.host + " " + segs(&c));
+
+    var r: DlRouter = dl_router_new();
+    dl_add(&mut r, "product", "myapp://product/:id");
+    dl_add(&mut r, "user_post", "https://example.com/users/:user/posts/:post");
+    dl_add(&mut r, "user", "https://example.com/users/:user");
+    dl_add(&mut r, "user_me", "https://example.com/users/me");
+    dl_add(&mut r, "docs", "https://example.com/docs/*path");
+    dl_add(&mut r, "promo", "https://*.example.com/promo/:code");
+    dl_exclude(&mut r, "https://example.com/admin/*rest");
+    dl_add(&mut r, "bad", "https://example.com/a/*x/b");
+    println("bad pattern " + int_to_str(r.errors.len()) + " " + r.errors.get(0));
+    show(&r, "myapp://product/42?ref=email");
+    show(&r, "https://example.com/users/me");
+    show(&r, "https://example.com/users/ann%20b");
+    show(&r, "https://example.com/users/ann/posts/7#top");
+    show(&r, "https://example.com/docs/guide/intro.html");
+    show(&r, "https://shop.example.com/promo/SUMMER");
+    show(&r, "https://example.com/promo/X");
+    show(&r, "https://example.com/admin/users");
+    show(&r, "HTTPS://Example.COM:443/users/x");
+    show(&r, "ftp://example.com/users/x");
+
+    var ks: Vec<str> = Vec::new();
+    ks.push("user"); ks.push("post"); ks.push("utm");
+    var vs: Vec<str> = Vec::new();
+    vs.push("ann b"); vs.push("7"); vs.push("x y");
+    println("build " + dl_build(&r, "user_post", ks, vs));
+    var dk: Vec<str> = Vec::new();
+    dk.push("path");
+    var dv: Vec<str> = Vec::new();
+    dv.push("a/b c");
+    println("build docs " + dl_build(&r, "docs", dk, dv) + " missing \"" + dl_build(&r, "user", Vec::new(), Vec::new()) + "\"");
+
+    var ids: Vec<str> = Vec::new();
+    ids.push("ABCDE12345.com.example.app");
+    println(dl_aasa(&r, ids, "example.com"));
+    var fps: Vec<str> = Vec::new();
+    fps.push("14:6d:e9:83:c5:73:06:50:d8:ee:b9:95:2f:34:fc:64:16:a0:83:42:e6:1d:be:a8:8a:04:96:b2:3f:cf:44:e5");
+    println(dl_assetlinks("com.example.app", fps));
+    var bad: Vec<str> = Vec::new();
+    bad.push("14:6d");
+    println("bad fingerprint \"" + dl_assetlinks("com.example.app", bad) + "\"");
+
+    var small: DlRouter = dl_router_new();
+    dl_add(&mut small, "product", "myapp://product/:id");
+    dl_add(&mut small, "docs", "https://example.com/docs/*path");
+    print(dl_intent_filters(&small));
+    var p2: DlRouter = dl_router_new();
+    dl_add(&mut p2, "me", "https://example.com/users/me");
+    dl_add(&mut p2, "file", "https://example.com/files/v1.2/:name");
+    println("path attrs " + dl_android_path_attr(&p2.routes.get(0)) + " " + dl_android_path_attr(&p2.routes.get(1)));
+}

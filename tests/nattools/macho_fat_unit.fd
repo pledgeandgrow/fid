@@ -1,0 +1,98 @@
+// L2B (docs/roadmap/roadmap.md): the universal-binary writer of
+// compiler/nat_enc.fd (nat_macho_fat) on two small stand-in slices with
+// real 64-bit Mach-O headers (x86-64 and AArch64). Run:
+//   fid run tests/nattools/macho_fat_unit.fd
+// Expected output:
+// magic cafebabe
+// narch 2
+// arch0 16777223 3 16384 100 14
+// arch1 16777228 0 32768 200 14
+// size 32968
+// slice0 ok
+// slice1 ok
+// same cpu rejected
+// not macho rejected
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+
+fn le32(out: &mut Vec<i64>, v: i64) {
+    out.push(v & 255);
+    out.push((v >> 8) & 255);
+    out.push((v >> 16) & 255);
+    out.push((v >> 24) & 255);
+}
+
+fn slice(cpu: i64, sub: i64, n: i64, fill: i64) -> Vec<i64> {
+    var s: Vec<i64> = Vec::new();
+    le32(&mut s, 0xFEEDFACF);
+    le32(&mut s, cpu);
+    le32(&mut s, sub);
+    while s.len() < n {
+        s.push((s.len() * fill) & 255);
+    }
+    return s;
+}
+
+fn be32(b: &Vec<i64>, at: i64) -> i64 {
+    return (b.get(at) << 24) | (b.get(at + 1) << 16) | (b.get(at + 2) << 8) | b.get(at + 3);
+}
+
+fn hex8(v: i64) -> str {
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var i: i64 = 7;
+    while i >= 0 {
+        var d: i64 = (v >> (i * 4)) & 15;
+        out = out + str_slice(digits, d, d + 1);
+        i = i - 1;
+    }
+    return out;
+}
+
+fn same_at(fat: &Vec<i64>, off: i64, s: &Vec<i64>) -> bool {
+    var i: i64 = 0;
+    while i < s.len() {
+        if fat.get(off + i) != s.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i64 {
+    var x: Vec<i64> = slice(0x01000007, 3, 100, 7);
+    var a: Vec<i64> = slice(0x0100000C, 0, 200, 13);
+    var fat: Vec<i64> = nat_macho_fat(x, a);
+    println("magic " + hex8(be32(&fat, 0)));
+    println("narch " + int_to_str(be32(&fat, 4)));
+    var k: i64 = 0;
+    while k < 2 {
+        var o: i64 = 8 + k * 20;
+        println("arch" + int_to_str(k) + " " + int_to_str(be32(&fat, o)) + " " + int_to_str(be32(&fat, o + 4)) + " " + int_to_str(be32(&fat, o + 8)) + " " + int_to_str(be32(&fat, o + 12)) + " " + int_to_str(be32(&fat, o + 16)));
+        k = k + 1;
+    }
+    println("size " + int_to_str(fat.len()));
+    var x2: Vec<i64> = slice(0x01000007, 3, 100, 7);
+    var a2: Vec<i64> = slice(0x0100000C, 0, 200, 13);
+    if same_at(&fat, be32(&fat, 16), &x2) {
+        println("slice0 ok");
+    }
+    if same_at(&fat, be32(&fat, 36), &a2) {
+        println("slice1 ok");
+    }
+    var x3: Vec<i64> = slice(0x01000007, 3, 100, 7);
+    var x4: Vec<i64> = slice(0x01000007, 3, 100, 7);
+    if nat_macho_fat(x3, x4).len() == 0 {
+        println("same cpu rejected");
+    }
+    var bad: Vec<i64> = Vec::new();
+    bad.push(1);
+    var a3: Vec<i64> = slice(0x0100000C, 0, 200, 13);
+    if nat_macho_fat(bad, a3).len() == 0 {
+        println("not macho rejected");
+    }
+    return 0;
+}

@@ -1,0 +1,886 @@
+// Fides ROS 2 messages and CDR serialization (robotics middleware)
+//
+// The common ROS 2 message types as structs, and their serialization in
+// the format ROS 2 puts on the wire (rmw_fastrtps / rmw_cyclonedds):
+// XCDR version 1, plain CDR, with the 4-byte encapsulation header
+// (00 01 00 00 = CDR little-endian, 00 00 00 00 = big-endian).
+// CDR rules (OMG CDR, XTypes 7.4.3.5 for XCDR1):
+//   - every primitive is aligned to its own size (1, 2, 4 or 8), measured
+//     from the end of the encapsulation header; padding bytes are zero;
+//   - string: uint32 length including the terminating NUL, the bytes, NUL;
+//   - sequence<T>: uint32 element count, then the elements;
+//   - array T[N]: the N elements, no count;
+//   - nested structures: their members in order, no extra alignment.
+// Messages:
+//   builtin_interfaces/Time; std_msgs/Header;
+//   geometry_msgs/Point, Vector3, Quaternion, Pose, Twist, Transform,
+//   TransformStamped, PoseStamped, PoseWithCovariance (float64[36]),
+//   TwistWithCovariance;
+//   sensor_msgs/Imu (float64[9] covariances), LaserScan (float32 fields,
+//   float32[] ranges and intensities), PointField and PointCloud2 (with
+//   helpers to pack and unpack x, y, z float32 clouds);
+//   nav_msgs/Odometry.
+// Reading accepts both byte orders; writing produces little-endian.
+// A reader that runs out of bytes sets `ok = false` (the values read are
+// then zero), so a truncated message is detected rather than misread.
+//
+// Bytes are Vec<i64> (0..255). Pure computation; the seam is the DDS layer
+// (stdlib/dds) that carries the serialized bytes in RTPS DATA submessages.
+//
+// Usage:
+//   use ros2_msg;
+//   val t: RosTwist = ros_twist(ros_vec3(0.5, 0.0, 0.0), ros_vec3(0.0, 0.0, 0.2));
+//   val bytes: Vec<i64> = ros_serialize_twist(&t);
+//   var r: CdrReader = cdr_reader(bytes);
+//   val back: RosTwist = ros_read_twist(&mut r);   // r.ok
+
+module ros2_msg;
+
+// ─── CDR writer ───
+
+pub struct CdrWriter {
+    pub buf: Vec<i64>,
+    // alignment origin: the first byte after the encapsulation header
+    pub origin: i64,
+}
+
+/// A writer with the little-endian encapsulation header (00 01 00 00).
+pub fn cdr_writer() -> CdrWriter {
+    var b: Vec<i64> = Vec::new();
+    b.push(0);
+    b.push(1);
+    b.push(0);
+    b.push(0);
+    return CdrWriter { buf: b, origin: 4 };
+}
+
+/// A writer with no encapsulation header (for a nested buffer).
+pub fn cdr_writer_raw() -> CdrWriter {
+    return CdrWriter { buf: Vec::new(), origin: 0 };
+}
+
+pub fn cdr_align(w: & mut CdrWriter, n: i64) {
+    while (w.buf.len() - w.origin) % n != 0 {
+        w.buf.push(0);
+    }
+}
+
+@wrapping
+fn cdr_put(w: & mut CdrWriter, v: i64, n: i64) {
+    cdr_align(w, n);
+    var i: i64 = 0;
+    while i < n {
+        w.buf.push((v >> (8 * i)) & 255);
+        i = i + 1;
+    }
+}
+
+pub fn cdr_write_u8(w: & mut CdrWriter, v: i64) { cdr_put(w, v, 1); }
+pub fn cdr_write_bool(w: & mut CdrWriter, v: bool) {
+    if v {
+        cdr_put(w, 1, 1);
+    } else {
+        cdr_put(w, 0, 1);
+    }
+}
+pub fn cdr_write_u16(w: & mut CdrWriter, v: i64) { cdr_put(w, v, 2); }
+pub fn cdr_write_u32(w: & mut CdrWriter, v: i64) { cdr_put(w, v, 4); }
+pub fn cdr_write_i32(w: & mut CdrWriter, v: i64) { cdr_put(w, v, 4); }
+pub fn cdr_write_u64(w: & mut CdrWriter, v: i64) { cdr_put(w, v, 8); }
+pub fn cdr_write_f64(w: & mut CdrWriter, v: f64) { cdr_put(w, p_f64_to_bits(v), 8); }
+pub fn cdr_write_f32(w: & mut CdrWriter, v: f64) { cdr_put(w, cdr_f32_bits(v), 4); }
+
+pub fn cdr_write_string(w: & mut CdrWriter, s: str) {
+    val n: i64 = str_len(s);
+    cdr_write_u32(w, n + 1);
+    var i: i64 = 0;
+    while i < n {
+        w.buf.push(str_byte_at(s, i));
+        i = i + 1;
+    }
+    w.buf.push(0);
+}
+
+pub fn cdr_write_f64_array(w: & mut CdrWriter, v: & Vec<f64>, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        var x: f64 = 0.0;
+        if i < v.len() {
+            x = v.get(i);
+        }
+        cdr_write_f64(w, x);
+        i = i + 1;
+    }
+}
+
+pub fn cdr_write_f32_seq(w: & mut CdrWriter, v: & Vec<f64>) {
+    cdr_write_u32(w, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        cdr_write_f32(w, v.get(i));
+        i = i + 1;
+    }
+}
+
+pub fn cdr_write_u8_seq(w: & mut CdrWriter, v: & Vec<i64>) {
+    cdr_write_u32(w, v.len());
+    var i: i64 = 0;
+    while i < v.len() {
+        w.buf.push(v.get(i) & 255);
+        i = i + 1;
+    }
+}
+
+// ─── CDR reader ───
+
+pub struct CdrReader {
+    pub buf: Vec<i64>,
+    pub pos: i64,
+    pub origin: i64,
+    pub little: bool,
+    pub ok: bool,
+}
+
+/// A reader over a serialized message with its encapsulation header.
+pub fn cdr_reader(b: Vec<i64>) -> CdrReader {
+    var r: CdrReader = CdrReader { buf: b, pos: 4, origin: 4, little: true, ok: true };
+    if r.buf.len() < 4 {
+        r.ok = false;
+        return r;
+    }
+    val kind: i64 = (r.buf.get(0) << 8) | r.buf.get(1);
+    // 0 CDR_BE, 1 CDR_LE (2/3: PL_CDR, not plain structures)
+    if kind == 0 {
+        r.little = false;
+    } else if kind != 1 {
+        r.ok = false;
+    }
+    return r;
+}
+
+/// A reader without encapsulation header.
+pub fn cdr_reader_raw(b: Vec<i64>, little: bool) -> CdrReader {
+    return CdrReader { buf: b, pos: 0, origin: 0, little: little, ok: true };
+}
+
+@wrapping
+fn cdr_get(r: & mut CdrReader, n: i64) -> i64 {
+    while (r.pos - r.origin) % n != 0 {
+        r.pos = r.pos + 1;
+    }
+    if r.pos + n > r.buf.len() {
+        r.ok = false;
+        r.pos = r.buf.len();
+        return 0;
+    }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var sh: i64 = 8 * i;
+        if !r.little {
+            sh = 8 * (n - 1 - i);
+        }
+        v = v | (r.buf.get(r.pos + i) << sh);
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return v;
+}
+
+pub fn cdr_read_u8(r: & mut CdrReader) -> i64 { return cdr_get(r, 1); }
+pub fn cdr_read_bool(r: & mut CdrReader) -> bool { return cdr_get(r, 1) != 0; }
+pub fn cdr_read_u16(r: & mut CdrReader) -> i64 { return cdr_get(r, 2); }
+pub fn cdr_read_u32(r: & mut CdrReader) -> i64 { return cdr_get(r, 4); }
+
+/// A signed 32-bit value.
+pub fn cdr_read_i32(r: & mut CdrReader) -> i64 {
+    val v: i64 = cdr_get(r, 4);
+    if v >= 2147483648 {
+        return v - 4294967296;
+    }
+    return v;
+}
+
+pub fn cdr_read_u64(r: & mut CdrReader) -> i64 { return cdr_get(r, 8); }
+pub fn cdr_read_f64(r: & mut CdrReader) -> f64 { return p_f64_from_bits(cdr_get(r, 8)); }
+pub fn cdr_read_f32(r: & mut CdrReader) -> f64 { return cdr_f32_from_bits(cdr_get(r, 4)); }
+
+pub fn cdr_read_string(r: & mut CdrReader) -> str {
+    val n: i64 = cdr_read_u32(r);
+    if !r.ok || n == 0 || r.pos + n > r.buf.len() {
+        if n != 0 {
+            r.ok = false;
+        }
+        return "";
+    }
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n - 1 {
+        bytes.push(r.buf.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return str_from_bytes(bytes);
+}
+
+pub fn cdr_read_f64_array(r: & mut CdrReader, n: i64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(cdr_read_f64(r));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn cdr_read_f32_seq(r: & mut CdrReader) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    val n: i64 = cdr_read_u32(r);
+    if !r.ok || n * 4 > r.buf.len() - r.pos {
+        r.ok = false;
+        return out;
+    }
+    var i: i64 = 0;
+    while i < n {
+        out.push(cdr_read_f32(r));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn cdr_read_u8_seq(r: & mut CdrReader) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val n: i64 = cdr_read_u32(r);
+    if !r.ok || r.pos + n > r.buf.len() {
+        r.ok = false;
+        return out;
+    }
+    var i: i64 = 0;
+    while i < n {
+        out.push(r.buf.get(r.pos + i));
+        i = i + 1;
+    }
+    r.pos = r.pos + n;
+    return out;
+}
+
+// ─── IEEE single precision (float32 fields) ───
+
+/// IEEE-754 single bits of x (round to nearest even).
+@wrapping
+pub fn cdr_f32_bits(x: f64) -> i64 {
+    val b: i64 = p_f64_to_bits(x);
+    val sign: i64 = (b >> 63) & 1;
+    val e: i64 = (b >> 52) & 2047;
+    val m: i64 = b & 4503599627370495;
+    val s32: i64 = sign << 31;
+    if e == 2047 {
+        if m != 0 {
+            return s32 | 2143289344;
+        }
+        return s32 | 2139095040;
+    }
+    if e == 0 {
+        return s32;
+    }
+    var exp: i64 = e - 1023 + 127;
+    val sig: i64 = m | 4503599627370496;
+    var shift: i64 = 29;
+    if exp <= 0 {
+        shift = 30 - exp;
+        exp = 0;
+        if shift > 60 {
+            return s32;
+        }
+    }
+    var q: i64 = sig >> shift;
+    val rem: i64 = sig - (q << shift);
+    val half: i64 = 1 << (shift - 1);
+    if rem > half || (rem == half && (q & 1) == 1) {
+        q = q + 1;
+    }
+    if exp == 0 {
+        return s32 | q;
+    }
+    if q >= 16777216 {
+        q = q >> 1;
+        exp = exp + 1;
+    }
+    if exp >= 255 {
+        return s32 | 2139095040;
+    }
+    return s32 | (exp << 23) | (q & 8388607);
+}
+
+/// The value of IEEE-754 single bits.
+@wrapping
+pub fn cdr_f32_from_bits(bits: i64) -> f64 {
+    val sign: i64 = (bits >> 31) & 1;
+    val e: i64 = (bits >> 23) & 255;
+    val m: i64 = bits & 8388607;
+    var b64: i64 = 0;
+    if e == 255 {
+        b64 = (2047 << 52) | (m << 29);
+    } else if e == 0 {
+        if m != 0 {
+            var mm: i64 = m;
+            var ee: i64 = - 126;
+            while (mm & 8388608) == 0 {
+                mm = mm << 1;
+                ee = ee - 1;
+            }
+            b64 = ((ee + 1023) << 52) | ((mm & 8388607) << 29);
+        }
+    } else {
+        b64 = ((e - 127 + 1023) << 52) | (m << 29);
+    }
+    if sign == 1 {
+        b64 = b64 | (1 << 63);
+    }
+    return p_f64_from_bits(b64);
+}
+
+// ─── Messages ───
+
+pub struct RosTime {
+    pub sec: i64,
+    pub nanosec: i64,
+}
+
+pub struct RosHeader {
+    pub stamp: RosTime,
+    pub frame_id: str,
+}
+
+pub struct RosVector3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+pub struct RosQuaternion {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub w: f64,
+}
+
+pub struct RosPose {
+    // geometry_msgs/Point has the same layout as Vector3
+    pub position: RosVector3,
+    pub orientation: RosQuaternion,
+}
+
+pub struct RosTwist {
+    pub linear: RosVector3,
+    pub angular: RosVector3,
+}
+
+pub struct RosTransform {
+    pub translation: RosVector3,
+    pub rotation: RosQuaternion,
+}
+
+pub struct RosTransformStamped {
+    pub header: RosHeader,
+    pub child_frame_id: str,
+    pub transform: RosTransform,
+}
+
+pub struct RosPoseStamped {
+    pub header: RosHeader,
+    pub pose: RosPose,
+}
+
+pub struct RosPoseWithCov {
+    pub pose: RosPose,
+    // 36 values, row-major 6x6 (x, y, z, rot x, rot y, rot z)
+    pub covariance: Vec<f64>,
+}
+
+pub struct RosTwistWithCov {
+    pub twist: RosTwist,
+    pub covariance: Vec<f64>,
+}
+
+pub struct RosImu {
+    pub header: RosHeader,
+    pub orientation: RosQuaternion,
+    pub orientation_covariance: Vec<f64>,
+    pub angular_velocity: RosVector3,
+    pub angular_velocity_covariance: Vec<f64>,
+    pub linear_acceleration: RosVector3,
+    pub linear_acceleration_covariance: Vec<f64>,
+}
+
+pub struct RosLaserScan {
+    pub header: RosHeader,
+    pub angle_min: f64,
+    pub angle_max: f64,
+    pub angle_increment: f64,
+    pub time_increment: f64,
+    pub scan_time: f64,
+    pub range_min: f64,
+    pub range_max: f64,
+    pub ranges: Vec<f64>,
+    pub intensities: Vec<f64>,
+}
+
+/// PointField datatypes.
+pub const ROS_PF_INT8: i64 = 1;
+pub const ROS_PF_UINT8: i64 = 2;
+pub const ROS_PF_INT16: i64 = 3;
+pub const ROS_PF_UINT16: i64 = 4;
+pub const ROS_PF_INT32: i64 = 5;
+pub const ROS_PF_UINT32: i64 = 6;
+pub const ROS_PF_FLOAT32: i64 = 7;
+pub const ROS_PF_FLOAT64: i64 = 8;
+
+pub struct RosPointField {
+    pub name: str,
+    pub offset: i64,
+    pub datatype: i64,
+    pub count: i64,
+}
+
+pub struct RosPointCloud2 {
+    pub header: RosHeader,
+    pub height: i64,
+    pub width: i64,
+    pub fields: Vec<RosPointField>,
+    pub is_bigendian: bool,
+    pub point_step: i64,
+    pub row_step: i64,
+    pub data: Vec<i64>,
+    pub is_dense: bool,
+}
+
+pub struct RosOdometry {
+    pub header: RosHeader,
+    pub child_frame_id: str,
+    pub pose: RosPoseWithCov,
+    pub twist: RosTwistWithCov,
+}
+
+// constructors
+
+pub fn ros_time(sec: i64, nanosec: i64) -> RosTime {
+    return RosTime { sec: sec, nanosec: nanosec };
+}
+
+pub fn ros_header(sec: i64, nanosec: i64, frame: str) -> RosHeader {
+    return RosHeader { stamp: ros_time(sec, nanosec), frame_id: frame };
+}
+
+pub fn ros_vec3(x: f64, y: f64, z: f64) -> RosVector3 {
+    return RosVector3 { x: x, y: y, z: z };
+}
+
+pub fn ros_quat(x: f64, y: f64, z: f64, w: f64) -> RosQuaternion {
+    return RosQuaternion { x: x, y: y, z: z, w: w };
+}
+
+pub fn ros_pose(p: RosVector3, q: RosQuaternion) -> RosPose {
+    return RosPose { position: p, orientation: q };
+}
+
+pub fn ros_twist(lin: RosVector3, ang: RosVector3) -> RosTwist {
+    return RosTwist { linear: lin, angular: ang };
+}
+
+/// n zeros (covariance arrays).
+pub fn ros_zeros(n: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+// writers and readers (one pair per type)
+
+pub fn ros_write_time(w: & mut CdrWriter, t: & RosTime) {
+    cdr_write_i32(w, t.sec);
+    cdr_write_u32(w, t.nanosec);
+}
+
+pub fn ros_read_time(r: & mut CdrReader) -> RosTime {
+    val s: i64 = cdr_read_i32(r);
+    val n: i64 = cdr_read_u32(r);
+    return RosTime { sec: s, nanosec: n };
+}
+
+pub fn ros_write_header(w: & mut CdrWriter, h: & RosHeader) {
+    ros_write_time(w, &h.stamp);
+    cdr_write_string(w, h.frame_id);
+}
+
+pub fn ros_read_header(r: & mut CdrReader) -> RosHeader {
+    val t: RosTime = ros_read_time(r);
+    val f: str = cdr_read_string(r);
+    return RosHeader { stamp: t, frame_id: f };
+}
+
+pub fn ros_write_vec3(w: & mut CdrWriter, v: & RosVector3) {
+    cdr_write_f64(w, v.x);
+    cdr_write_f64(w, v.y);
+    cdr_write_f64(w, v.z);
+}
+
+pub fn ros_read_vec3(r: & mut CdrReader) -> RosVector3 {
+    val x: f64 = cdr_read_f64(r);
+    val y: f64 = cdr_read_f64(r);
+    val z: f64 = cdr_read_f64(r);
+    return RosVector3 { x: x, y: y, z: z };
+}
+
+pub fn ros_write_quat(w: & mut CdrWriter, q: & RosQuaternion) {
+    cdr_write_f64(w, q.x);
+    cdr_write_f64(w, q.y);
+    cdr_write_f64(w, q.z);
+    cdr_write_f64(w, q.w);
+}
+
+pub fn ros_read_quat(r: & mut CdrReader) -> RosQuaternion {
+    val x: f64 = cdr_read_f64(r);
+    val y: f64 = cdr_read_f64(r);
+    val z: f64 = cdr_read_f64(r);
+    val w: f64 = cdr_read_f64(r);
+    return RosQuaternion { x: x, y: y, z: z, w: w };
+}
+
+pub fn ros_write_pose(w: & mut CdrWriter, p: & RosPose) {
+    ros_write_vec3(w, &p.position);
+    ros_write_quat(w, &p.orientation);
+}
+
+pub fn ros_read_pose(r: & mut CdrReader) -> RosPose {
+    val p: RosVector3 = ros_read_vec3(r);
+    val q: RosQuaternion = ros_read_quat(r);
+    return RosPose { position: p, orientation: q };
+}
+
+pub fn ros_write_twist(w: & mut CdrWriter, t: & RosTwist) {
+    ros_write_vec3(w, &t.linear);
+    ros_write_vec3(w, &t.angular);
+}
+
+pub fn ros_read_twist(r: & mut CdrReader) -> RosTwist {
+    val l: RosVector3 = ros_read_vec3(r);
+    val a: RosVector3 = ros_read_vec3(r);
+    return RosTwist { linear: l, angular: a };
+}
+
+pub fn ros_write_transform(w: & mut CdrWriter, t: & RosTransform) {
+    ros_write_vec3(w, &t.translation);
+    ros_write_quat(w, &t.rotation);
+}
+
+pub fn ros_read_transform(r: & mut CdrReader) -> RosTransform {
+    val tr: RosVector3 = ros_read_vec3(r);
+    val q: RosQuaternion = ros_read_quat(r);
+    return RosTransform { translation: tr, rotation: q };
+}
+
+pub fn ros_write_transform_stamped(w: & mut CdrWriter, t: & RosTransformStamped) {
+    ros_write_header(w, &t.header);
+    cdr_write_string(w, t.child_frame_id);
+    ros_write_transform(w, &t.transform);
+}
+
+pub fn ros_read_transform_stamped(r: & mut CdrReader) -> RosTransformStamped {
+    val h: RosHeader = ros_read_header(r);
+    val c: str = cdr_read_string(r);
+    val t: RosTransform = ros_read_transform(r);
+    return RosTransformStamped { header: h, child_frame_id: c, transform: t };
+}
+
+pub fn ros_write_pose_stamped(w: & mut CdrWriter, p: & RosPoseStamped) {
+    ros_write_header(w, &p.header);
+    ros_write_pose(w, &p.pose);
+}
+
+pub fn ros_read_pose_stamped(r: & mut CdrReader) -> RosPoseStamped {
+    val h: RosHeader = ros_read_header(r);
+    val p: RosPose = ros_read_pose(r);
+    return RosPoseStamped { header: h, pose: p };
+}
+
+pub fn ros_write_pose_cov(w: & mut CdrWriter, p: & RosPoseWithCov) {
+    ros_write_pose(w, &p.pose);
+    cdr_write_f64_array(w, &p.covariance, 36);
+}
+
+pub fn ros_read_pose_cov(r: & mut CdrReader) -> RosPoseWithCov {
+    val p: RosPose = ros_read_pose(r);
+    val c: Vec<f64> = cdr_read_f64_array(r, 36);
+    return RosPoseWithCov { pose: p, covariance: c };
+}
+
+pub fn ros_write_twist_cov(w: & mut CdrWriter, t: & RosTwistWithCov) {
+    ros_write_twist(w, &t.twist);
+    cdr_write_f64_array(w, &t.covariance, 36);
+}
+
+pub fn ros_read_twist_cov(r: & mut CdrReader) -> RosTwistWithCov {
+    val t: RosTwist = ros_read_twist(r);
+    val c: Vec<f64> = cdr_read_f64_array(r, 36);
+    return RosTwistWithCov { twist: t, covariance: c };
+}
+
+pub fn ros_write_imu(w: & mut CdrWriter, m: & RosImu) {
+    ros_write_header(w, &m.header);
+    ros_write_quat(w, &m.orientation);
+    cdr_write_f64_array(w, &m.orientation_covariance, 9);
+    ros_write_vec3(w, &m.angular_velocity);
+    cdr_write_f64_array(w, &m.angular_velocity_covariance, 9);
+    ros_write_vec3(w, &m.linear_acceleration);
+    cdr_write_f64_array(w, &m.linear_acceleration_covariance, 9);
+}
+
+pub fn ros_read_imu(r: & mut CdrReader) -> RosImu {
+    val h: RosHeader = ros_read_header(r);
+    val q: RosQuaternion = ros_read_quat(r);
+    val qc: Vec<f64> = cdr_read_f64_array(r, 9);
+    val av: RosVector3 = ros_read_vec3(r);
+    val avc: Vec<f64> = cdr_read_f64_array(r, 9);
+    val la: RosVector3 = ros_read_vec3(r);
+    val lac: Vec<f64> = cdr_read_f64_array(r, 9);
+    return RosImu { header: h, orientation: q, orientation_covariance: qc, angular_velocity: av, angular_velocity_covariance: avc, linear_acceleration: la, linear_acceleration_covariance: lac };
+}
+
+pub fn ros_write_laser_scan(w: & mut CdrWriter, s: & RosLaserScan) {
+    ros_write_header(w, &s.header);
+    cdr_write_f32(w, s.angle_min);
+    cdr_write_f32(w, s.angle_max);
+    cdr_write_f32(w, s.angle_increment);
+    cdr_write_f32(w, s.time_increment);
+    cdr_write_f32(w, s.scan_time);
+    cdr_write_f32(w, s.range_min);
+    cdr_write_f32(w, s.range_max);
+    cdr_write_f32_seq(w, &s.ranges);
+    cdr_write_f32_seq(w, &s.intensities);
+}
+
+pub fn ros_read_laser_scan(r: & mut CdrReader) -> RosLaserScan {
+    val h: RosHeader = ros_read_header(r);
+    val a0: f64 = cdr_read_f32(r);
+    val a1: f64 = cdr_read_f32(r);
+    val ai: f64 = cdr_read_f32(r);
+    val ti: f64 = cdr_read_f32(r);
+    val st: f64 = cdr_read_f32(r);
+    val r0: f64 = cdr_read_f32(r);
+    val r1: f64 = cdr_read_f32(r);
+    val rs: Vec<f64> = cdr_read_f32_seq(r);
+    val its: Vec<f64> = cdr_read_f32_seq(r);
+    return RosLaserScan { header: h, angle_min: a0, angle_max: a1, angle_increment: ai, time_increment: ti, scan_time: st, range_min: r0, range_max: r1, ranges: rs, intensities: its };
+}
+
+pub fn ros_write_point_field(w: & mut CdrWriter, f: & RosPointField) {
+    cdr_write_string(w, f.name);
+    cdr_write_u32(w, f.offset);
+    cdr_write_u8(w, f.datatype);
+    cdr_write_u32(w, f.count);
+}
+
+pub fn ros_read_point_field(r: & mut CdrReader) -> RosPointField {
+    val n: str = cdr_read_string(r);
+    val o: i64 = cdr_read_u32(r);
+    val d: i64 = cdr_read_u8(r);
+    val c: i64 = cdr_read_u32(r);
+    return RosPointField { name: n, offset: o, datatype: d, count: c };
+}
+
+pub fn ros_write_point_cloud2(w: & mut CdrWriter, c: & RosPointCloud2) {
+    ros_write_header(w, &c.header);
+    cdr_write_u32(w, c.height);
+    cdr_write_u32(w, c.width);
+    cdr_write_u32(w, c.fields.len());
+    var i: i64 = 0;
+    while i < c.fields.len() {
+        val f: RosPointField = c.fields.get(i);
+        ros_write_point_field(w, &f);
+        i = i + 1;
+    }
+    cdr_write_bool(w, c.is_bigendian);
+    cdr_write_u32(w, c.point_step);
+    cdr_write_u32(w, c.row_step);
+    cdr_write_u8_seq(w, &c.data);
+    cdr_write_bool(w, c.is_dense);
+}
+
+pub fn ros_read_point_cloud2(r: & mut CdrReader) -> RosPointCloud2 {
+    val h: RosHeader = ros_read_header(r);
+    val height: i64 = cdr_read_u32(r);
+    val width: i64 = cdr_read_u32(r);
+    val nf: i64 = cdr_read_u32(r);
+    var fields: Vec<RosPointField> = Vec::new();
+    var i: i64 = 0;
+    while i < nf && r.ok {
+        fields.push(ros_read_point_field(r));
+        i = i + 1;
+    }
+    val be: bool = cdr_read_bool(r);
+    val ps: i64 = cdr_read_u32(r);
+    val rs: i64 = cdr_read_u32(r);
+    val data: Vec<i64> = cdr_read_u8_seq(r);
+    val dense: bool = cdr_read_bool(r);
+    return RosPointCloud2 { header: h, height: height, width: width, fields: fields, is_bigendian: be, point_step: ps, row_step: rs, data: data, is_dense: dense };
+}
+
+pub fn ros_write_odometry(w: & mut CdrWriter, o: & RosOdometry) {
+    ros_write_header(w, &o.header);
+    cdr_write_string(w, o.child_frame_id);
+    ros_write_pose_cov(w, &o.pose);
+    ros_write_twist_cov(w, &o.twist);
+}
+
+pub fn ros_read_odometry(r: & mut CdrReader) -> RosOdometry {
+    val h: RosHeader = ros_read_header(r);
+    val c: str = cdr_read_string(r);
+    val p: RosPoseWithCov = ros_read_pose_cov(r);
+    val t: RosTwistWithCov = ros_read_twist_cov(r);
+    return RosOdometry { header: h, child_frame_id: c, pose: p, twist: t };
+}
+
+// whole-message helpers (with the encapsulation header)
+
+pub fn ros_serialize_header(h: & RosHeader) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_header(&mut w, h);
+    return w.buf;
+}
+
+pub fn ros_serialize_twist(t: & RosTwist) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_twist(&mut w, t);
+    return w.buf;
+}
+
+pub fn ros_serialize_pose_stamped(p: & RosPoseStamped) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_pose_stamped(&mut w, p);
+    return w.buf;
+}
+
+pub fn ros_serialize_transform_stamped(t: & RosTransformStamped) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_transform_stamped(&mut w, t);
+    return w.buf;
+}
+
+pub fn ros_serialize_imu(m: & RosImu) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_imu(&mut w, m);
+    return w.buf;
+}
+
+pub fn ros_serialize_laser_scan(s: & RosLaserScan) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_laser_scan(&mut w, s);
+    return w.buf;
+}
+
+pub fn ros_serialize_point_cloud2(c: & RosPointCloud2) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_point_cloud2(&mut w, c);
+    return w.buf;
+}
+
+pub fn ros_serialize_odometry(o: & RosOdometry) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    ros_write_odometry(&mut w, o);
+    return w.buf;
+}
+
+/// std_msgs/String.
+pub fn ros_serialize_string(s: str) -> Vec<i64> {
+    var w: CdrWriter = cdr_writer();
+    cdr_write_string(&mut w, s);
+    return w.buf;
+}
+
+// ─── PointCloud2 helpers ───
+
+/// An unorganized (height 1) cloud of x, y, z float32 points, little-endian.
+pub fn ros_cloud_xyz(h: RosHeader, xs: & Vec<f64>, ys: & Vec<f64>, zs: & Vec<f64>) -> RosPointCloud2 {
+    var fields: Vec<RosPointField> = Vec::new();
+    fields.push(RosPointField { name: "x", offset: 0, datatype: ROS_PF_FLOAT32, count: 1 });
+    fields.push(RosPointField { name: "y", offset: 4, datatype: ROS_PF_FLOAT32, count: 1 });
+    fields.push(RosPointField { name: "z", offset: 8, datatype: ROS_PF_FLOAT32, count: 1 });
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    var dense: bool = true;
+    while i < xs.len() {
+        var k: i64 = 0;
+        while k < 3 {
+            var v: f64 = xs.get(i);
+            if k == 1 {
+                v = ys.get(i);
+            } else if k == 2 {
+                v = zs.get(i);
+            }
+            if v != v {
+                dense = false;
+            }
+            val b: i64 = cdr_f32_bits(v);
+            data.push(b & 255);
+            data.push((b >> 8) & 255);
+            data.push((b >> 16) & 255);
+            data.push((b >> 24) & 255);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return RosPointCloud2 { header: h, height: 1, width: xs.len(), fields: fields, is_bigendian: false, point_step: 12, row_step: 12 * xs.len(), data: data, is_dense: dense };
+}
+
+/// The offset of a named field (-1 when the cloud has none).
+pub fn ros_cloud_field_offset(c: & RosPointCloud2, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < c.fields.len() {
+        if c.fields.get(i).name == name {
+            return c.fields.get(i).offset;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// A float32 field of point i (0.0 when out of range or absent).
+pub fn ros_cloud_get_f32(c: & RosPointCloud2, i: i64, name: str) -> f64 {
+    val off: i64 = ros_cloud_field_offset(c, name);
+    val base: i64 = i * c.point_step + off;
+    if off < 0 || base + 4 > c.data.len() {
+        return 0.0;
+    }
+    var b: i64 = 0;
+    var k: i64 = 0;
+    while k < 4 {
+        var sh: i64 = 8 * k;
+        if c.is_bigendian {
+            sh = 8 * (3 - k);
+        }
+        b = b | (c.data.get(base + k) << sh);
+        k = k + 1;
+    }
+    return cdr_f32_from_bits(b);
+}
+
+/// Hex dump "00 01 00 00 ..." of bytes.
+pub fn cdr_hex(b: & Vec<i64>) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        val v: i64 = b.get(i);
+        s = s + str_slice(digits, (v >> 4) & 15, ((v >> 4) & 15) + 1) + str_slice(digits, v & 15, (v & 15) + 1);
+        i = i + 1;
+    }
+    return s;
+}

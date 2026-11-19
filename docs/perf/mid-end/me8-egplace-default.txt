@@ -1,0 +1,71 @@
+# me8-egplace-default: placement in the e-graph pass (compiler/egraph.fd
+# eg_place, Click's global code motion; docs/roadmap/llvm-roadmap.md ME8)
+# made the default on the native paths (Nov 17).
+#
+# What changed in compiler/egraph.fd (Nov 17):
+#  - egraph_run: placement runs unless FID_NAT_OFF=egplace,
+#    FID_IROPT_OFF=egplace or `--no-pass egplace` names it off (eg_place_on;
+#    it was opt-in, FID_IROPT_ON=egplace, which still names it on and is
+#    now the default build). FID_NAT_OFF=egraph turns the e-graph and so
+#    placement off.
+#  - eg_place leaves functions with asm! (the outputs of an Asm are
+#    operands peir_inst_operands does not list, so a value read only there
+#    could have been moved after it) or TryUnwrap (a terminator defining a
+#    value: "before the terminator" would be before an operand) as they are.
+#  - eg_one: the placement count is added to the skeleton's (egskel) count
+#    instead of replacing it.
+#  - counts: FID_EGRAPH_STATS=1 prints
+#      [egplace] functions F, placed N, hoisted H, sunk S, skipped K
+#    (hoisted: moved to a block in fewer loops; sunk: moved down the
+#    dominator tree; skipped: functions left alone for asm!/TryUnwrap), or
+#    "[egplace] off"; FID_IROPT_STATS=1 prints "[egplace] placed N" (the
+#    memo's entries included). The build's "[prof] native mid-end" line
+#    (compiler/main.fd) already ends with "N placed by the e-graph".
+#
+# Evidence before the change (stage0, the one-stage fid of Nov 16, whose
+# eg_place is the same algorithm, opt-in): `emit --nat` (Windows x64 on
+# the machine layer) with FID_IROPT_ON=egplace FID_VERIFY=1 vs without:
+#   test_midend_egplace.fd: both print the expected 14 lines, the
+#     executables differ; "783 placed by the e-graph" (core and runtime
+#     included) vs 0.
+#   the per-program results of the small suite run with stage0 are below
+#   (program, on/off result, values placed, exit of the "on" build).
+#
+# With this run's final compiler the numbers that decide whether placement
+# stays on are taken by tests/tooling/egplace-default-check.sh (SAVE=1
+# writes docs/perf/mid-end/me8-egplace.txt): default vs FID_NAT_OFF=egplace
+# vs FID_NAT_OFF=egraph, FID_VERIFY=1, per program: placed, hoisted, sunk,
+# build and run ms. If any program DIFFs or fails to build only with
+# placement on and the cause cannot be fixed in eg_place, turn the default
+# back off: in egraph_run, `var on_p: bool = on_e && eg_opt_in("egplace");`
+# (and note it here).
+#
+# scripts/me-measure.sh does not measure this pass: it builds through
+# `emit` without --nat (pe_ir on Windows, which runs no e-graph) and reads
+# iropt's instruction counts, which placement does not change (it moves
+# instructions, it adds or removes none).
+#
+# stage0 suite (FID_IROPT_ON=egplace vs default, --nat, FID_VERIFY=1):
+#   midend_egraph_cast same placed=780 exit 0
+#   ssa_merge same placed=779 exit 0
+#   mem2reg_promote same placed=779 exit 0
+#   unroll same placed=779 42exit 0
+#   counted_loop_step same placed=779 exit 0
+#   midend_iv_bounded same placed=778 exit 0
+#   matrix_mul same placed=791 1344532150300exit 0
+#   collections same placed=664 exit 0
+#   match_range same placed=779 1020100200300exit 0
+#   struct_copy_vec same placed=778 exit 0
+#   vec_loop same placed=779 3exit 0
+#   hashmap same placed=754 230true1falseexit 0
+#   closure_capture same placed=779 15exit 0
+#   opt_dce same placed=779 exit 0
+#   lib_bigint same placed=778 exit 0
+#   midend_shared_analyses same placed=779 exit 0
+#   checked_arith same placed=785 exit 0
+#   crypto_vectors same placed= nobuild
+#   (the text before "exit" is the last line of a program's output where
+#   it ends without a newline; crypto_vectors builds on neither side with
+#   stage0: @secret errors in crypto_hmac_sha256_bytes, not placement.)
+# 17 programs built both ways: 17 print the same and exit the same, every
+# one with values placed (664-791, mostly in core and the runtime).

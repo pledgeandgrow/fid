@@ -1,0 +1,79 @@
+// SP6 (docs/roadmap/llvm-roadmap.md): the per-function native cache
+// (compiler/nat_ir.fd CS6, FID_FNCACHE) keeps the conventions a build
+// without it uses: struct results of two words in two registers (ME27 /
+// LF24, ng_rr_plan; the cache used to turn them off), the clobber masks of
+// callees (IPRA) and, on RISC-V, one-word calls to callees within 1 MB
+// (TG6; also off under the cache before). Each entry keeps what its code
+// took for granted of the functions it calls (nat_ir.fd nc_note_deps,
+// checked by nc_validate / nc_masks_hold). tests/nattools/
+// machine_fncache_check.sh builds this program on a miss and on a hit
+// (byte-identical), with FID_NAT_OFF=retregs (another image: the
+// convention is in use under the cache), by default (a cache file beside
+// the output) and runs it; every backend prints the same.
+// Expected output:
+// 3 4
+// 7 3
+// 55 89
+// 42
+// 221
+// 890
+// done
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+fn make_pair(a: i64, b: i64) -> Pair {
+    return Pair { a: a, b: b };
+}
+
+fn swap_sum(p: Pair, k: i64) -> Pair {
+    return make_pair(p.a + p.b, k);
+}
+
+/// (F(n), F(n + 1)), each level returning a pair to the next
+fn fib_pair(n: i64) -> Pair {
+    if n == 0 {
+        return Pair { a: 0, b: 1 };
+    }
+    val p: Pair = fib_pair(n - 1);
+    return Pair { a: p.b, b: p.a + p.b };
+}
+
+fn twice(x: i64) -> i64 {
+    return x * 2;
+}
+
+/// twice's address is taken here: it is called through a register
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+/// Values live across calls, kept where the callees' masks allow (IPRA)
+fn spread(n: i64) -> i64 {
+    val a: i64 = n * 3;
+    val b: i64 = n + 11;
+    val p: Pair = make_pair(n, n + 1);
+    val c: i64 = twice(a);
+    return a + b + c + p.a * p.b;
+}
+
+fn main() {
+    val p: Pair = make_pair(3, 4);
+    println(int_to_str(p.a) + " " + int_to_str(p.b));
+    val q: Pair = swap_sum(p, 3);
+    println(int_to_str(q.a) + " " + int_to_str(q.b));
+    val f: Pair = fib_pair(10);
+    println(int_to_str(f.a) + " " + int_to_str(f.b));
+    println(apply(twice, 21));
+    println(spread(10));
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        total = total + spread(i);
+        i = i + 1;
+    }
+    println(total);
+    println("done");
+}

@@ -1,0 +1,70 @@
+// Test (stdlib-agent bug 28): a closure capturing a struct that holds a
+// Vec and a string, returned from the function that made it, and called
+// after that function's struct was dropped. The env kept the address of
+// the maker's struct, so the Vec was read dangling ("Vec index out of
+// bounds" / "Invalid memory access"); the closure now keeps a copy of its
+// own (an owner of the Vec and the string). A struct parameter, and an
+// enum, are captured the same way. Also run it through `fid ccompile`.
+// Expected output:
+// 12
+// 22
+// h 2
+// p 31
+// some 4
+struct H {
+    name: str,
+    xs: Vec<i64>,
+}
+
+fn mk() -> fn(i64) -> i64 {
+    var v: Vec<i64> = Vec::new();
+    v.push(10);
+    v.push(20);
+    val h: H = H { name: "h", xs: v };
+    return fn(i: i64) -> i64 {
+        return h.xs.get(i) + h.xs.len();
+    };
+}
+
+fn namer() -> fn(i64) -> str {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    val h: H = H { name: "h", xs: v };
+    return fn(i: i64) -> str {
+        return h.name + " " + int_to_str(h.xs.get(i));
+    };
+}
+
+fn from_param(p: H) -> fn(i64) -> str {
+    return fn(i: i64) -> str {
+        return p.name + " " + int_to_str(p.xs.get(i) + 1);
+    };
+}
+
+fn opt_adder(o: Option<i64>) -> fn(i64) -> str {
+    return fn(x: i64) -> str {
+        match o {
+            Option::Some(n) => {
+                return "some " + int_to_str(n + x);
+            }
+            Option::None => {
+                return "none";
+            }
+        }
+    };
+}
+
+fn main() {
+    val f = mk();
+    println(f(0));
+    println(f(1));
+    val g = namer();
+    println(g(1));
+    var pv: Vec<i64> = Vec::new();
+    pv.push(30);
+    val q = from_param(H { name: "p", xs: pv });
+    println(q(0));
+    val o = opt_adder(Option::Some(3));
+    println(o(1));
+}

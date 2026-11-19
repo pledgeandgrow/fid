@@ -315,6 +315,13 @@ impl Display for Point {
 - Supertraits: `cap NamedGreet: Greet + Show { ... }`. A subtrait inherits
   every method of its supertraits, so `impl NamedGreet for T` must provide
   them too, and a `dyn NamedGreet` value can call them.
+- Generic methods: `fn pick<U: Show>(self, a: U, b: U) -> U;` in a cap. A
+  call binds `U` from its arguments and is monomorphized per type; bounds on
+  `U` are checked at the call. An impl must declare the same number of type
+  parameters and no extra bounds, and a default body keeps its type
+  parameters in every impl that uses it. A generic method cannot be called
+  through `dyn Trait` (it is not object-safe); the trait's other methods
+  still can.
 
 A function that never returns (it always panics or loops) declares `-> !`;
 a call to it fits wherever a value of any type is expected.
@@ -399,8 +406,9 @@ one writer, and references cannot outlive what they point to.
 
 - Numbers, `bool`, structs, enums, tuples and arrays are copied on assignment
   and when passed by value.
-- `Vec`, `HashMap` and `str` are handles: assigning one gives a second name for
-  the same data. There is no move check for them.
+- `Vec`, `HashMap` and `str` behave as values too: assigning one gives an
+  independent value (the data is shared until the first write copies it).
+  There is no move check for them.
 - Only `@linear` struct types move (used exactly once, §4.5).
 
 ```fides
@@ -408,14 +416,14 @@ val a = 5;
 val b = a;       // a still valid
 
 val v: Vec<i64> = Vec::new();
-var w = v;       // same Vec
-w.push(1);       // v.len() is 1
+var w = v;       // its own Vec: the data is shared until a write
+w.push(1);       // v.len() is still 0
 ```
 
 Copy-on-write for `Vec`, `str` and `HashMap` is decided (proposal 0001) and
-written behind `LOWER_COW`, which is off: with it on, the compiler compiling
-itself reaches its fixpoint but uses 4.7 GB instead of 1.8 GB (Nov 6), and
-the full suite has not run with it on yet.
+enforced by the ownership rule of proposal 0004 (`LOWER_RC` in
+`compiler/lower.fd`; the older `LOWER_COW` lowering stays off). See
+reference.md §8.1.
 
 ### Module Names
 
@@ -676,7 +684,7 @@ caller of `x_of(&p)` knows the result points into `p`. No annotation says so.
 |------|------------------|-----|
 | A returned reference must come from a reference parameter | `fn f() -> &i64 { var x = 1; return &x; }` | `x` is freed when `f` returns |
 | | `fn f(p: Point) -> &i64 { return &p.x; }` | A by-value parameter is a local of `f` |
-| References are not stored | `struct S { r: &i64 }`, `Vec<&i64>`, `Box<&T>`, a global of type `&T` | Storage can outlive the referent |
+| References are not stored | `struct S { r: &i64 }`, `Vec<&i64>`, `Box<&T>`, a global of type `&T` | Storage can outlive the referent; `struct S<'a> { r: &'a T }` may hold a reference, and a value of it is held like one (never stored itself) |
 | | `v.push(&x)`, `S { r: &x }`, `arr[i] = &x` | Same, at the point of storing |
 | No reference to a reference | `&&T`, `&mut &T` | A callee could store a reference into the caller's variable |
 | A reference must not outlive its block | `var r = &a; { var b = 2; r = &b; } use(r)` | `b` is freed at the end of the block |
@@ -1552,8 +1560,9 @@ reserve is insufficient for the compiler's deep recursion.
   builds of Nov 9 afternoon (an iropt bug; fixed again in the evening's fid31, known-bugs 2f.2).
 - **Other targets**: native Linux AArch64/RISC-V/x86-64 work through the
   machine layer (273/271/272 of 317 suite tests, Nov 9); macOS (C only, not
-  run), WASM (`fid wasm` does not validate) and bare metal (`emit --bare`
-  builds, not run under QEMU) are incomplete.
+  run), WASM (`fid wasm` writes valid WASI modules since Nov 15: 316 of
+  344 suite tests match) and bare metal (`emit --bare` boots under QEMU
+  since Nov 15, release G1) are incomplete.
 - **Self-compile speed**: 74 s with the compiler built at -O2 (Nov 9), ~3.5x
   slower than `fidesc`.
 - **Written, not run yet**: `fid emit --checked-alloc` (guard pages),

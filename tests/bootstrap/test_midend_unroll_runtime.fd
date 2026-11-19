@@ -1,0 +1,162 @@
+// OP11 (compiler/iropt_me.fd ime_unroll_one, opt-in FID_IROPT_ON=unroll on
+// the native paths): unrolling with a remainder. A loop whose bound is a
+// value it does not change (`i < n`, a parameter or a local the body never
+// stores, i starting at a constant >= 0 and stepping up) runs 4 copies of
+// its body while n - i > 3 * step and the old body for the trips left; a
+// loop of a constant trip count that is no multiple of 4 (9, 10, 13, 15
+// trips) peels the remainder in front of a loop unrolled by 4. Every
+// result must be what the plain loop computes, for every trip count from
+// 0 up (the remainder of 0, 1, 2 and 3 trips), with `<` and `<=`, a step
+// of 3, and a bound read from a local.
+//
+// Expected output:
+// 0 0 1 5 14 30 55 91 140 204 285
+// 0 0 1 1 1 2 2 2 3 3 3
+// 0 1 3 6 10 15 21 28 36 45 55
+// 285
+// 385
+// 650
+// 1015
+// 119
+// 50
+// 9 10 13 15
+// 1240
+
+fn squares(n: i64) -> i64 {
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        t = t + i * i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn by3(n: i64) -> i64 {
+    // step 3: the trips of 0..n
+    var c: i64 = 0;
+    var i: i64 = 1;
+    while i < n {
+        c = c + 1;
+        i = i + 3;
+    }
+    return c;
+}
+
+fn upto(n: i64) -> i64 {
+    // `<=`: 0 + 1 + ... + n
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i <= n {
+        t = t + i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn sq10() -> i64 {
+    // 10 trips: 2 peeled, then by 4
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 10 {
+        t = t + i * i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn sq11() -> i64 {
+    // `<=` 10: 11 trips, 3 peeled
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i <= 10 {
+        t = t + i * i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn sq13() -> i64 {
+    // 13 trips: 1 peeled
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 13 {
+        t = t + i * i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn sq15() -> i64 {
+    // 15 trips: 3 peeled
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < 15 {
+        t = t + i * i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn local_bound(a: i64, b: i64) -> i64 {
+    // the bound is a local the loop only reads
+    var lim: i64 = a + b;
+    var t: i64 = 0;
+    var i: i64 = 2;
+    while i < lim {
+        t = t + i;
+        i = i + 1;
+    }
+    return t;
+}
+
+fn count_trips(m: i64) -> i64 {
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        c = c + 1;
+        i = i + 1;
+    }
+    return c;
+}
+
+fn main() {
+    var line: str = "";
+    var n: i64 = 0;
+    while n <= 10 {
+        if n > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(squares(n));
+        n = n + 1;
+    }
+    println(line);
+    line = "";
+    n = 0;
+    while n <= 10 {
+        if n > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(by3(n));
+        n = n + 1;
+    }
+    println(line);
+    line = "";
+    n = 0;
+    while n <= 10 {
+        if n > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(upto(n));
+        n = n + 1;
+    }
+    println(line);
+    println(sq10());
+    println(sq11());
+    println(sq13());
+    println(sq15());
+    println(local_bound(7, 9));
+    println(local_bound(2, 7) + local_bound(1, 1) + 15);
+    println(int_to_str(count_trips(9)) + " " + int_to_str(count_trips(10)) + " " + int_to_str(count_trips(13)) + " " + int_to_str(count_trips(15)));
+    println(squares(16));
+}

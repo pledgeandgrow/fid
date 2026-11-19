@@ -1,0 +1,67 @@
+// Complaint CP5 / competitive RT9: what a task switch costs through the
+// scheduler, not only the bare context switch (ctx_swap_bench.fd).
+//
+//   fid emit tests/ctx_switch/task_pingpong_bench.fd -o pp.exe
+//   FIDES_WORKERS=1 ./pp.exe [yields]
+//
+// Two green tasks on one worker take turns: each calls task_yield() `yields`
+// times, so every yield hands the worker to the other task (one task switch
+// per yield). Prints the time per task switch and exit code 0 when it is
+// under 20 ns. Run it with FIDES_WORKERS=1 (stdlib/pe_runtime/conc.fd): with
+// several workers each task can get a worker of its own and a yield that
+// finds nothing else to run returns at once, which is not a switch.
+use task;
+
+var g_turns: i64 = 0;
+
+fn pinger(n: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        g_turns = g_turns + 1;
+        task_yield();
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i64 {
+    var n: i64 = 2000000;
+    match arg_at(1) {
+        Option::Some(a) => {
+            n = str_parse_int(a);
+        }
+        Option::None => {
+        }
+    }
+    // Warm up: the workers, the stack cache
+    val w = task_go("pinger", 10);
+    task_run();
+    g_turns = 0;
+    var t0: i64 = p_clock_now();
+    val a = task_go("pinger", n);
+    val b = task_go("pinger", n);
+    task_run();
+    var t1: i64 = p_clock_now();
+    print("yields: ");
+    print(task_result(a) + task_result(b));
+    print("\n");
+    print("turns: ");
+    print(g_turns);
+    print("\n");
+    // tenths of a nanosecond per switch (one switch per yield)
+    var tenths: i64 = (t1 - t0) * 10 / (2 * n);
+    print("ns per task switch: ");
+    print(tenths / 10);
+    print(".");
+    print(tenths % 10);
+    print("\n");
+    if task_done(w) == false {
+        print("warm-up task not done\n");
+    }
+    if tenths < 200 {
+        print("under 20 ns: yes\n");
+        return 0;
+    }
+    print("under 20 ns: no\n");
+    return 1;
+}

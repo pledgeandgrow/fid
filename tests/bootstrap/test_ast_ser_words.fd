@@ -1,0 +1,71 @@
+// CS1/CS2: compiler/ast_ser.fd ar_i64 reads back what aw_i64 wrote (8
+// little-endian bytes, two's complement), decoded in place; past the end
+// it gives 0 and clears ok, and once a read has failed it gives 0.
+//
+// Expected output:
+// 0
+// 1
+// -1
+// 9223372036854775807
+// -9223372036854775808
+// 81985529216486895
+// -2
+// 255
+// 256
+// ok true
+// pos 72
+// short 0 false
+// after 0 false
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ast_ser;
+
+fn bool_text(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    var vals: Vec<i64> = Vec::new();
+    vals.push(0);
+    vals.push(1);
+    vals.push(0 - 1);
+    vals.push(9223372036854775807);
+    vals.push(0 - 9223372036854775807 - 1);
+    vals.push(81985529216486895);
+    vals.push(0 - 2);
+    vals.push(255);
+    vals.push(256);
+    var w: AwBuf = AwBuf {
+        bytes: Vec::new()
+    };
+    var i: i64 = 0;
+    while i < vals.len() {
+        aw_i64(& mut w, vals.get(i));
+        i = i + 1;
+    }
+    // three bytes more: too few for a word
+    aw_u8(& mut w, 7);
+    aw_u8(& mut w, 8);
+    aw_u8(& mut w, 9);
+    var r: ArBuf = ArBuf {
+        v: w.bytes, pos: 0, ok: true
+    };
+    i = 0;
+    while i < vals.len() {
+        print(int_to_str(ar_i64(& mut r)) + "\n");
+        i = i + 1;
+    }
+    print("ok " + bool_text(r.ok) + "\n");
+    print("pos " + int_to_str(r.pos) + "\n");
+    var short: i64 = ar_i64(& mut r);
+    print("short " + int_to_str(short) + " " + bool_text(r.ok) + "\n");
+    r.pos = 0;
+    var after: i64 = ar_i64(& mut r);
+    print("after " + int_to_str(after) + " " + bool_text(r.ok) + "\n");
+    return 0;
+}

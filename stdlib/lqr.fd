@@ -1,0 +1,669 @@
+// Fides dense matrices and discrete LQR (robotics / control)
+//
+// `DMat` is a small dense row-major f64 matrix with the helpers control and
+// estimation code needs: arithmetic, transpose, blocks, Gaussian elimination
+// with partial pivoting (solve, inverse, determinant), Cholesky, and the
+// matrix exponential (scaling and squaring of a Taylor series). The robotics
+// modules kinematics and kalman use it too.
+//
+// Control:
+//   lqr_c2d(A, B, dt)      zero-order-hold discretization: exp([[A, B],
+//                          [0, 0]] dt) = [[Ad, Bd], [0, I]] (the series
+//                          sum_k (A dt)^k / k! and its integral, in one
+//                          exponential)
+//   lqr_dare(A, B, Q, R)   the discrete algebraic Riccati equation by
+//                          iterating P <- Q + A'PA - A'PB (R + B'PB)^-1 B'PA
+//                          from P = Q until it stops changing
+//   lqr_dlqr(A, B, Q, R)   the gain K = (R + B'PB)^-1 B'PA of u = -K x
+//   lqr_simulate           x[k+1] = (A - BK) x[k]
+//
+// Errors (a singular matrix, no convergence) come back as Result::Err.
+// Everything here is pure computation; there is no platform seam.
+//
+// Usage:
+//   use lqr;
+//   val a = dm_parse("0 1; 0 0");
+//   val b = dm_parse("0; 1");
+//   val d = lqr_c2d(&a, &b, 0.1);
+//   match lqr_dlqr(&d.ad, &d.bd, &dm_identity(2), &dm_identity(1)) {
+//       Result::Ok(r) => { println(dm_to_str(&r.k, 4)); }
+//       Result::Err(e) => { println(e); }
+//   }
+
+module lqr;
+use math;
+use quat;
+
+// ─── Dense matrices ───
+
+/// A rows x cols matrix, row-major.
+pub struct DMat {
+    pub rows: i64,
+    pub cols: i64,
+    pub data: Vec<f64>,
+}
+
+/// A rows x cols matrix of zeros.
+pub fn dm_zeros(rows: i64, cols: i64) -> DMat {
+    var d: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < rows * cols {
+        d.push(0.0);
+        i = i + 1;
+    }
+    return DMat {
+        rows: rows, cols: cols, data: d
+    };
+}
+
+/// The n x n identity.
+pub fn dm_identity(n: i64) -> DMat {
+    var m: DMat = dm_zeros(n, n);
+    var i: i64 = 0;
+    while i < n {
+        m.data.set(i * n + i, 1.0);
+        i = i + 1;
+    }
+    return m;
+}
+
+/// A matrix from row-major values (missing values are 0, extra ignored).
+pub fn dm_from(rows: i64, cols: i64, vals: Vec<f64>) -> DMat {
+    var m: DMat = dm_zeros(rows, cols);
+    var i: i64 = 0;
+    while i < rows * cols && i < vals.len() {
+        m.data.set(i, vals.get(i));
+        i = i + 1;
+    }
+    return m;
+}
+
+/// A matrix from text: rows separated by ';', entries by spaces or commas
+/// ("1 0.1; 0 1"). Short rows are padded with zeros.
+pub fn dm_parse(text: str) -> DMat {
+    val rows: Vec<str> = str_split(text, ";");
+    var vals: Vec<Vec<f64>> = Vec::new();
+    var cols: i64 = 0;
+    var i: i64 = 0;
+    while i < rows.len() {
+        var row: Vec<f64> = Vec::new();
+        var tok: str = "";
+        val line: str = rows.get(i) + " ";
+        var j: i64 = 0;
+        while j < str_len(line) {
+            val c: i64 = str_byte_at(line, j);
+            if c == 32 || c == 44 || c == 9 || c == 10 || c == 13 {
+                if str_len(tok) > 0 {
+                    row.push(str_parse_float(tok));
+                    tok = "";
+                }
+            } else {
+                tok = tok + byte_to_str(c);
+            }
+            j = j + 1;
+        }
+        if row.len() > cols {
+            cols = row.len();
+        }
+        vals.push(row);
+        i = i + 1;
+    }
+    var m: DMat = dm_zeros(vals.len(), cols);
+    i = 0;
+    while i < vals.len() {
+        val row: Vec<f64> = vals.get(i);
+        var j: i64 = 0;
+        while j < row.len() {
+            m.data.set(i * cols + j, row.get(j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// A column vector (n x 1) of `vals`.
+pub fn dm_col_vec(vals: Vec<f64>) -> DMat {
+    return dm_from(vals.len(), 1, vals);
+}
+
+/// A square diagonal matrix of `vals`.
+pub fn dm_diag(vals: Vec<f64>) -> DMat {
+    val n: i64 = vals.len();
+    var m: DMat = dm_zeros(n, n);
+    var i: i64 = 0;
+    while i < n {
+        m.data.set(i * n + i, vals.get(i));
+        i = i + 1;
+    }
+    return m;
+}
+
+/// Entry (i, j).
+pub fn dm_get(m: & DMat, i: i64, j: i64) -> f64 {
+    return m.data.get(i * m.cols + j);
+}
+
+/// Set entry (i, j).
+pub fn dm_set(m: & mut DMat, i: i64, j: i64, v: f64) {
+    m.data.set(i * m.cols + j, v);
+}
+
+/// All entries, row-major (for a column vector: its elements).
+pub fn dm_to_vec(m: & DMat) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < m.data.len() {
+        out.push(m.data.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Column j as a Vec.
+pub fn dm_col(m: & DMat, j: i64) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < m.rows {
+        out.push(m.data.get(i * m.cols + j));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// a + b (same shape).
+pub fn dm_add(a: & DMat, b: & DMat) -> DMat {
+    var m: DMat = dm_zeros(a.rows, a.cols);
+    var i: i64 = 0;
+    while i < a.data.len() {
+        m.data.set(i, a.data.get(i) + b.data.get(i));
+        i = i + 1;
+    }
+    return m;
+}
+
+/// a - b (same shape).
+pub fn dm_sub(a: & DMat, b: & DMat) -> DMat {
+    var m: DMat = dm_zeros(a.rows, a.cols);
+    var i: i64 = 0;
+    while i < a.data.len() {
+        m.data.set(i, a.data.get(i) - b.data.get(i));
+        i = i + 1;
+    }
+    return m;
+}
+
+/// s * a.
+pub fn dm_scale(a: & DMat, s: f64) -> DMat {
+    var m: DMat = dm_zeros(a.rows, a.cols);
+    var i: i64 = 0;
+    while i < a.data.len() {
+        m.data.set(i, a.data.get(i) * s);
+        i = i + 1;
+    }
+    return m;
+}
+
+/// a * b (a.cols == b.rows).
+pub fn dm_mul(a: & DMat, b: & DMat) -> DMat {
+    if a.cols != b.rows {
+        panic("dm_mul: shape mismatch " + int_to_str(a.rows) + "x" + int_to_str(a.cols) + " * " + int_to_str(b.rows) + "x" + int_to_str(b.cols));
+    }
+    var m: DMat = dm_zeros(a.rows, b.cols);
+    var i: i64 = 0;
+    while i < a.rows {
+        var j: i64 = 0;
+        while j < b.cols {
+            var s: f64 = 0.0;
+            var k: i64 = 0;
+            while k < a.cols {
+                s = s + a.data.get(i * a.cols + k) * b.data.get(k * b.cols + j);
+                k = k + 1;
+            }
+            m.data.set(i * b.cols + j, s);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// The transpose.
+pub fn dm_transpose(a: & DMat) -> DMat {
+    var m: DMat = dm_zeros(a.cols, a.rows);
+    var i: i64 = 0;
+    while i < a.rows {
+        var j: i64 = 0;
+        while j < a.cols {
+            m.data.set(j * a.rows + i, a.data.get(i * a.cols + j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// (m + m') / 2.
+pub fn dm_symmetrize(a: & DMat) -> DMat {
+    val t: DMat = dm_transpose(a);
+    return dm_scale(&dm_add(a, &t), 0.5);
+}
+
+/// The nr x nc block of a at (r0, c0).
+pub fn dm_block(a: & DMat, r0: i64, c0: i64, nr: i64, nc: i64) -> DMat {
+    var m: DMat = dm_zeros(nr, nc);
+    var i: i64 = 0;
+    while i < nr {
+        var j: i64 = 0;
+        while j < nc {
+            m.data.set(i * nc + j, a.data.get((r0 + i) * a.cols + c0 + j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// Copy b into a at (r0, c0).
+pub fn dm_set_block(a: & mut DMat, r0: i64, c0: i64, b: & DMat) {
+    var i: i64 = 0;
+    while i < b.rows {
+        var j: i64 = 0;
+        while j < b.cols {
+            a.data.set((r0 + i) * a.cols + c0 + j, b.data.get(i * b.cols + j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// The trace.
+pub fn dm_trace(a: & DMat) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < a.rows && i < a.cols {
+        s = s + a.data.get(i * a.cols + i);
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The largest absolute entry.
+pub fn dm_max_abs(a: & DMat) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < a.data.len() {
+        s = rmath_max(s, math_fabs(a.data.get(i)));
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The largest absolute difference between entries of a and b.
+pub fn dm_max_diff(a: & DMat, b: & DMat) -> f64 {
+    val d: DMat = dm_sub(a, b);
+    return dm_max_abs(&d);
+}
+
+/// The Euclidean norm of all entries (Frobenius).
+pub fn dm_norm(a: & DMat) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < a.data.len() {
+        s = s + a.data.get(i) * a.data.get(i);
+        i = i + 1;
+    }
+    return math_sqrt(s);
+}
+
+/// The solution X of A X = B (A square), by Gaussian elimination with
+/// partial pivoting. Err when A is singular (a pivot below 1e-14 times the
+/// largest entry).
+pub fn dm_solve(a: & DMat, b: & DMat) -> Result<DMat, str> {
+    val n: i64 = a.rows;
+    if a.cols != n || b.rows != n {
+        return Result::Err("dm_solve: shape mismatch");
+    }
+    var m: DMat = dm_block(a, 0, 0, n, n);
+    var x: DMat = dm_block(b, 0, 0, n, b.cols);
+    val scale: f64 = rmath_max(dm_max_abs(a), 1.0e-300);
+    var col: i64 = 0;
+    while col < n {
+        // pivot: largest |m[r][col]| for r >= col
+        var piv: i64 = col;
+        var best: f64 = math_fabs(m.data.get(col * n + col));
+        var r: i64 = col + 1;
+        while r < n {
+            val v: f64 = math_fabs(m.data.get(r * n + col));
+            if v > best {
+                best = v;
+                piv = r;
+            }
+            r = r + 1;
+        }
+        if best <= 1.0e-14 * scale {
+            return Result::Err("dm_solve: singular matrix");
+        }
+        if piv != col {
+            var j: i64 = 0;
+            while j < n {
+                val t: f64 = m.data.get(col * n + j);
+                m.data.set(col * n + j, m.data.get(piv * n + j));
+                m.data.set(piv * n + j, t);
+                j = j + 1;
+            }
+            j = 0;
+            while j < x.cols {
+                val t: f64 = x.data.get(col * x.cols + j);
+                x.data.set(col * x.cols + j, x.data.get(piv * x.cols + j));
+                x.data.set(piv * x.cols + j, t);
+                j = j + 1;
+            }
+        }
+        val p: f64 = m.data.get(col * n + col);
+        r = col + 1;
+        while r < n {
+            val f: f64 = m.data.get(r * n + col) / p;
+            if f != 0.0 {
+                var j: i64 = col;
+                while j < n {
+                    m.data.set(r * n + j, m.data.get(r * n + j) - f * m.data.get(col * n + j));
+                    j = j + 1;
+                }
+                j = 0;
+                while j < x.cols {
+                    x.data.set(r * x.cols + j, x.data.get(r * x.cols + j) - f * x.data.get(col * x.cols + j));
+                    j = j + 1;
+                }
+            }
+            r = r + 1;
+        }
+        col = col + 1;
+    }
+    // back substitution
+    var i: i64 = n - 1;
+    while i >= 0 {
+        val p: f64 = m.data.get(i * n + i);
+        var j: i64 = 0;
+        while j < x.cols {
+            var s: f64 = x.data.get(i * x.cols + j);
+            var k: i64 = i + 1;
+            while k < n {
+                s = s - m.data.get(i * n + k) * x.data.get(k * x.cols + j);
+                k = k + 1;
+            }
+            x.data.set(i * x.cols + j, s / p);
+            j = j + 1;
+        }
+        i = i - 1;
+    }
+    return Result::Ok(x);
+}
+
+/// The inverse of a square matrix; Err when singular.
+pub fn dm_inverse(a: & DMat) -> Result<DMat, str> {
+    val id: DMat = dm_identity(a.rows);
+    return dm_solve(a, &id);
+}
+
+/// The determinant (Gaussian elimination with partial pivoting).
+pub fn dm_det(a: & DMat) -> f64 {
+    val n: i64 = a.rows;
+    var m: DMat = dm_block(a, 0, 0, n, n);
+    var det: f64 = 1.0;
+    var col: i64 = 0;
+    while col < n {
+        var piv: i64 = col;
+        var best: f64 = math_fabs(m.data.get(col * n + col));
+        var r: i64 = col + 1;
+        while r < n {
+            if math_fabs(m.data.get(r * n + col)) > best {
+                best = math_fabs(m.data.get(r * n + col));
+                piv = r;
+            }
+            r = r + 1;
+        }
+        if best == 0.0 {
+            return 0.0;
+        }
+        if piv != col {
+            var j: i64 = 0;
+            while j < n {
+                val t: f64 = m.data.get(col * n + j);
+                m.data.set(col * n + j, m.data.get(piv * n + j));
+                m.data.set(piv * n + j, t);
+                j = j + 1;
+            }
+            det = 0.0 - det;
+        }
+        val p: f64 = m.data.get(col * n + col);
+        det = det * p;
+        r = col + 1;
+        while r < n {
+            val f: f64 = m.data.get(r * n + col) / p;
+            var j: i64 = col;
+            while j < n {
+                m.data.set(r * n + j, m.data.get(r * n + j) - f * m.data.get(col * n + j));
+                j = j + 1;
+            }
+            r = r + 1;
+        }
+        col = col + 1;
+    }
+    return det;
+}
+
+/// The lower-triangular L with L L' = a, for a symmetric positive definite
+/// a. Err when a is not positive definite.
+pub fn dm_cholesky(a: & DMat) -> Result<DMat, str> {
+    val n: i64 = a.rows;
+    var l: DMat = dm_zeros(n, n);
+    var j: i64 = 0;
+    while j < n {
+        var s: f64 = a.data.get(j * n + j);
+        var k: i64 = 0;
+        while k < j {
+            s = s - l.data.get(j * n + k) * l.data.get(j * n + k);
+            k = k + 1;
+        }
+        if s <= 0.0 {
+            return Result::Err("dm_cholesky: matrix is not positive definite");
+        }
+        val d: f64 = math_sqrt(s);
+        l.data.set(j * n + j, d);
+        var i: i64 = j + 1;
+        while i < n {
+            var t: f64 = a.data.get(i * n + j);
+            k = 0;
+            while k < j {
+                t = t - l.data.get(i * n + k) * l.data.get(j * n + k);
+                k = k + 1;
+            }
+            l.data.set(i * n + j, t / d);
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    return Result::Ok(l);
+}
+
+/// exp(a) for a square matrix: a is scaled by 2^-s until its norm is below
+/// 0.5, the Taylor series is summed to 20 terms (or until a term is
+/// negligible), then the result is squared s times.
+pub fn dm_expm(a: & DMat) -> DMat {
+    val n: i64 = a.rows;
+    var norm: f64 = dm_norm(a);
+    var s: i64 = 0;
+    var scale: f64 = 1.0;
+    while norm * scale > 0.5 && s < 60 {
+        scale = scale * 0.5;
+        s = s + 1;
+    }
+    val x: DMat = dm_scale(a, scale);
+    var sum: DMat = dm_identity(n);
+    var term: DMat = dm_identity(n);
+    var k: i64 = 1;
+    while k <= 20 {
+        val t2: DMat = dm_mul(&term, &x);
+        term = dm_scale(&t2, 1.0 / (k as f64));
+        sum = dm_add(&sum, &term);
+        if dm_max_abs(&term) < 1.0e-18 * rmath_max(dm_max_abs(&sum), 1.0) {
+            break;
+        }
+        k = k + 1;
+    }
+    var i: i64 = 0;
+    while i < s {
+        sum = dm_mul(&sum, &sum);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// The matrix as "[a b; c d]" with `dp` decimals.
+pub fn dm_to_str(a: & DMat, dp: i64) -> str {
+    var out: str = "[";
+    var i: i64 = 0;
+    while i < a.rows {
+        if i > 0 {
+            out = out + "; ";
+        }
+        var j: i64 = 0;
+        while j < a.cols {
+            if j > 0 {
+                out = out + " ";
+            }
+            out = out + rmath_fmt(a.data.get(i * a.cols + j), dp);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+// ─── Discretization and LQR ───
+
+/// A discrete-time model x[k+1] = ad x[k] + bd u[k].
+pub struct DiscreteSys {
+    pub ad: DMat,
+    pub bd: DMat,
+    pub dt: f64,
+}
+
+/// Zero-order-hold discretization of x' = A x + B u with step dt:
+/// Ad = exp(A dt), Bd = (integral_0^dt exp(A s) ds) B, both read off
+/// exp([[A, B], [0, 0]] dt).
+pub fn lqr_c2d(a: & DMat, b: & DMat, dt: f64) -> DiscreteSys {
+    val n: i64 = a.rows;
+    val m: i64 = b.cols;
+    var big: DMat = dm_zeros(n + m, n + m);
+    dm_set_block(&mut big, 0, 0, a);
+    dm_set_block(&mut big, 0, n, b);
+    val e: DMat = dm_expm(&dm_scale(&big, dt));
+    return DiscreteSys {
+        ad: dm_block(&e, 0, 0, n, n), bd: dm_block(&e, 0, n, n, m), dt: dt
+    };
+}
+
+/// The result of a discrete LQR design.
+pub struct LqrResult {
+    // u = -k x
+    pub k: DMat,
+    // the Riccati solution
+    pub p: DMat,
+    pub iterations: i64,
+}
+
+/// The stabilizing solution P of the discrete algebraic Riccati equation
+/// P = Q + A'PA - A'PB (R + B'PB)^-1 B'PA, by fixed-point iteration from
+/// P = Q. Stops when no entry changes by more than tol (relative to the
+/// largest entry); Err after max_iter iterations or on a singular R + B'PB.
+pub fn lqr_dare(a: & DMat, b: & DMat, q: & DMat, r: & DMat, max_iter: i64, tol: f64) -> Result<LqrResult, str> {
+    val at: DMat = dm_transpose(a);
+    val bt: DMat = dm_transpose(b);
+    var p: DMat = dm_block(q, 0, 0, q.rows, q.cols);
+    var it: i64 = 0;
+    while it < max_iter {
+        val pa: DMat = dm_mul(&p, a);
+        val pb: DMat = dm_mul(&p, b);
+        val s: DMat = dm_add(r, &dm_mul(&bt, &pb));
+        val btpa: DMat = dm_mul(&bt, &pa);
+        match dm_solve(&s, &btpa) {
+            Result::Ok(k) => {
+                // P' = Q + A'PA - A'PB K
+                val atpa: DMat = dm_mul(&at, &pa);
+                val atpb: DMat = dm_mul(&at, &pb);
+                val corr: DMat = dm_mul(&atpb, &k);
+                val pn0: DMat = dm_sub(&dm_add(q, &atpa), &corr);
+                val pn: DMat = dm_symmetrize(&pn0);
+                val diff: f64 = dm_max_diff(&pn, &p);
+                p = pn;
+                it = it + 1;
+                if diff <= tol * rmath_max(dm_max_abs(&p), 1.0) {
+                    val pb2: DMat = dm_mul(&p, b);
+                    val s2: DMat = dm_add(r, &dm_mul(&bt, &pb2));
+                    val pa2: DMat = dm_mul(&p, a);
+                    val rhs: DMat = dm_mul(&bt, &pa2);
+                    match dm_solve(&s2, &rhs) {
+                        Result::Ok(kf) => {
+                            return Result::Ok(LqrResult {
+                                k: kf, p: p, iterations: it
+                            });
+                        }
+                        Result::Err(e) => {
+                            return Result::Err(e);
+                        }
+                    }
+                }
+            }
+            Result::Err(e) => {
+                return Result::Err("lqr_dare: R + B'PB is singular");
+            }
+        }
+    }
+    return Result::Err("lqr_dare: no convergence after " + int_to_str(max_iter) + " iterations");
+}
+
+/// The discrete LQR gain K (u = -K x) minimizing sum x'Qx + u'Ru for
+/// x[k+1] = A x[k] + B u[k] (10000 iterations, tolerance 1e-12).
+pub fn lqr_dlqr(a: & DMat, b: & DMat, q: & DMat, r: & DMat) -> Result<LqrResult, str> {
+    return lqr_dare(a, b, q, r, 10000, 0.000000000001);
+}
+
+/// The closed-loop matrix A - B K.
+pub fn lqr_closed_loop(a: & DMat, b: & DMat, k: & DMat) -> DMat {
+    val bk: DMat = dm_mul(b, k);
+    return dm_sub(a, &bk);
+}
+
+/// The states x[0..=steps] of x[k+1] = (A - BK) x[k] from x0 (a column).
+pub fn lqr_simulate(a: & DMat, b: & DMat, k: & DMat, x0: & DMat, steps: i64) -> Vec<DMat> {
+    val acl: DMat = lqr_closed_loop(a, b, k);
+    var out: Vec<DMat> = Vec::new();
+    var x: DMat = dm_block(x0, 0, 0, x0.rows, 1);
+    out.push(x);
+    var i: i64 = 0;
+    while i < steps {
+        x = dm_mul(&acl, &x);
+        out.push(x);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The cost sum_k x'Qx + u'Ru (u = -Kx) over a simulated trajectory.
+pub fn lqr_cost(traj: & Vec<DMat>, k: & DMat, q: & DMat, r: & DMat) -> f64 {
+    var c: f64 = 0.0;
+    var i: i64 = 0;
+    while i < traj.len() {
+        val x: DMat = traj.get(i);
+        val xt: DMat = dm_transpose(&x);
+        val qx: DMat = dm_mul(q, &x);
+        val u: DMat = dm_scale(&dm_mul(k, &x), - 1.0);
+        val ut: DMat = dm_transpose(&u);
+        val ru: DMat = dm_mul(r, &u);
+        c = c + dm_get(&dm_mul(&xt, &qx), 0, 0) + dm_get(&dm_mul(&ut, &ru), 0, 0);
+        i = i + 1;
+    }
+    return c;
+}

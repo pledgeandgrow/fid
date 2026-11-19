@@ -1,0 +1,310 @@
+// HashMap floods (competitive roadmap RT4, stdlib/core.fd "Floods"): keys
+// chosen so that their unseeded hashes share a home group pile into one run
+// of slots; the first insert that lands HM_FLOOD_GROUPS (64) groups past
+// its home makes the map take a random seed of its own and hash every key
+// again. The test makes such keys (integers by inverting core's
+// hm_int_hash, strings by trying names against p_str_hash and hm_mix),
+// checks that a plain map stays unseeded, that a flooded map is seeded and
+// still answers every lookup, remove, copy and clone right, and that what a
+// program sees (keys() order, values) is the same in every run although the
+// seed is not. The output is the same on every backend.
+//
+// Expected output:
+// int keys made
+// plain map not seeded
+// int flood seeded
+// int lookups ok
+// int removes ok
+// int keys sorted ok
+// shared copy ok
+// clone ok
+// string keys made
+// string flood seeded
+// string lookups ok
+// hashmap flood ok
+
+fn fail(what: str) {
+    println("hashmap flood: " + what);
+    p_panic("hashmap flood: " + what);
+}
+
+// core's HM_INT_XOR: an integer key k is stored (and hashed) as k ^ this
+const INT_XOR: i64 = 0x5DEECE66D1234567;
+const C1: i64 = 0x7FB5D329728EA185;
+const C2: i64 = 0x1B03738712FAD5C9;
+const NKEYS: i64 = 600;
+
+/// core's hm_int_hash (>> is arithmetic on i64, as there)
+@wrapping fn int_hash(k: i64) -> i64 {
+    var x: i64 = k;
+    x = (x ^ (x >> 31)) * C1;
+    x = (x ^ (x >> 27)) * C2;
+    x = x ^ (x >> 33);
+    return x & 0x3FFFFFFFFFFFFFFF;
+}
+
+/// The inverse of an odd number modulo 2^64 (Newton's iteration).
+@wrapping fn inv_odd(c: i64) -> i64 {
+    var x: i64 = c;
+    var i: i64 = 0;
+    while i < 6 {
+        x = x * (2 - c * x);
+        i = i + 1;
+    }
+    return x;
+}
+
+/// The x >= 0 with x ^ (x >> s) == y, for y >= 0 (for x >= 0 the shift
+/// brings in zeros, so it is the logical one).
+@wrapping fn unxorshift(y: i64, s: i64) -> i64 {
+    var mask: i64 = (1 << (64 - s)) - 1;
+    var x: i64 = y;
+    var i: i64 = 0;
+    while i < 3 {
+        x = y ^ ((x >> s) & mask);
+        i = i + 1;
+    }
+    return x;
+}
+
+/// NKEYS integer keys whose hashes are j * 1024 (j = 1, 2, ...): all in
+/// home group 0 of any table of 1024 slots or fewer, and all with control
+/// byte 0, so every lane of their run matches.
+@wrapping fn flood_int_keys() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val i1: i64 = inv_odd(C1);
+    val i2: i64 = inv_odd(C2);
+    var j: i64 = 1;
+    while out.len() < NKEYS {
+        val a5: i64 = j * 1024;
+        val a4: i64 = unxorshift(a5, 33);
+        val a3: i64 = a4 * i2;
+        if a3 >= 0 {
+            val a2: i64 = unxorshift(a3, 27);
+            val a1: i64 = a2 * i1;
+            if a1 >= 0 {
+                val a0: i64 = unxorshift(a1, 31);
+                if int_hash(a0) != a5 {
+                    fail("inverse of the integer hash");
+                }
+                if a0 != 0 {
+                    out.push(a0 ^ INT_XOR);
+                }
+            }
+        }
+        j = j + 1;
+    }
+    return out;
+}
+
+/// core's hm_mix
+@wrapping fn mix(h0: i64) -> i64 {
+    var h: i64 = h0;
+    h = h ^ ((h >> 33) & 0x7FFFFFFF);
+    h = h * - 49064778989728563;
+    h = h ^ ((h >> 33) & 0x7FFFFFFF);
+    return h & 9223372036854775807;
+}
+
+/// NKEYS names "f<i>" whose unseeded map hash has bits 3..9 zero (home
+/// group 0 of a table of 1024 slots or fewer), found by trying names.
+fn flood_str_keys() -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while out.len() < NKEYS && i < 400000 {
+        val s: str = "f" + int_to_str(i);
+        val h: i64 = mix(p_str_hash(s as i64));
+        if (h & 1016) == 0 {
+            out.push(s);
+        }
+        i = i + 1;
+    }
+    if out.len() < NKEYS {
+        fail("only " + int_to_str(out.len()) + " colliding names");
+    }
+    return out;
+}
+
+fn int_part() {
+    val keys: Vec<i64> = flood_int_keys();
+    println("int keys made");
+
+    // ordinary keys: no insert goes far from home, the map is not seeded
+    var plain: HashMap<i64, i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < 5000 {
+        plain.insert(i * 7, i);
+        i = i + 1;
+    }
+    if HashMap_seeded(plain as i64) || plain.len() != 5000 || plain.get(7 * 4999) != 4999 {
+        fail("plain map");
+    }
+    println("plain map not seeded");
+
+    var m: HashMap<i64, i64> = HashMap::new();
+    i = 0;
+    while i < NKEYS {
+        m.insert(keys.get(i), i);
+        i = i + 1;
+    }
+    if !HashMap_seeded(m as i64) {
+        fail("the flooded int map took no seed");
+    }
+    if m.len() != NKEYS {
+        fail("int flood len");
+    }
+    println("int flood seeded");
+
+    i = 0;
+    while i < NKEYS {
+        if !m.contains(keys.get(i)) || m.get(keys.get(i)) != i {
+            fail("int lookup " + int_to_str(i));
+        }
+        i = i + 1;
+    }
+    // keys never inserted (small numbers; none of the chosen keys is one)
+    i = 0;
+    while i < 100 {
+        if m.contains(i) || m.get_or(i, - 7) != - 7 {
+            fail("absent int key " + int_to_str(i));
+        }
+        i = i + 1;
+    }
+    // inserting an existing key again replaces its value
+    m.insert(keys.get(5), 5005);
+    if m.get(keys.get(5)) != 5005 || m.len() != NKEYS {
+        fail("int replace");
+    }
+    m.insert(keys.get(5), 5);
+    println("int lookups ok");
+
+    i = 0;
+    while i < NKEYS {
+        if i % 2 == 0 {
+            m.remove(keys.get(i));
+        }
+        i = i + 1;
+    }
+    if m.len() != NKEYS / 2 {
+        fail("int removes len");
+    }
+    i = 0;
+    while i < NKEYS {
+        if m.contains(keys.get(i)) != (i % 2 == 1) {
+            fail("int remove " + int_to_str(i));
+        }
+        i = i + 1;
+    }
+    // removed keys go in again
+    i = 0;
+    while i < NKEYS {
+        if i % 2 == 0 {
+            m.insert(keys.get(i), i);
+        }
+        i = i + 1;
+    }
+    if m.len() != NKEYS || m.get(keys.get(0)) != 0 || m.get(keys.get(598)) != 598 {
+        fail("int reinsert");
+    }
+    println("int removes ok");
+
+    // keys() sorts: the same order whatever the seed
+    val ks: Vec<i64> = m.keys();
+    if ks.len() != NKEYS {
+        fail("keys() len");
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < ks.len() {
+        if i > 0 && ks.get(i - 1) >= ks.get(i) {
+            fail("keys() order");
+        }
+        sum = sum + m.get(ks.get(i));
+        i = i + 1;
+    }
+    if sum != NKEYS * (NKEYS - 1) / 2 {
+        fail("values sum");
+    }
+    println("int keys sorted ok");
+
+    // a second owner: its own copy keeps the seed with the hashes
+    var b: HashMap<i64, i64> = m;
+    b.insert(keys.get(1), 77);
+    b.remove(keys.get(2));
+    if !HashMap_seeded(b as i64) || b.len() != NKEYS - 1 || b.get(keys.get(1)) != 77 || b.contains(keys.get(2)) {
+        fail("shared copy");
+    }
+    if m.len() != NKEYS || m.get(keys.get(1)) != 1 || !m.contains(keys.get(2)) {
+        fail("first owner changed");
+    }
+    i = 3;
+    while i < NKEYS {
+        if b.get(keys.get(i)) != i {
+            fail("shared copy lookup " + int_to_str(i));
+        }
+        i = i + 1;
+    }
+    println("shared copy ok");
+
+    // a clone hashes every key again (it starts unseeded)
+    val c: HashMap<i64, i64> = m.clone();
+    if c.len() != NKEYS {
+        fail("clone len");
+    }
+    i = 0;
+    while i < NKEYS {
+        if c.get(keys.get(i)) != i {
+            fail("clone lookup " + int_to_str(i));
+        }
+        i = i + 1;
+    }
+    println("clone ok");
+}
+
+fn str_part() {
+    val names: Vec<str> = flood_str_keys();
+    println("string keys made");
+    var m: HashMap<str, i64> = HashMap::new();
+    var i: i64 = 0;
+    while i < NKEYS {
+        m.insert(names.get(i), i);
+        i = i + 1;
+    }
+    if !HashMap_seeded(m as i64) {
+        fail("the flooded string map took no seed");
+    }
+    println("string flood seeded");
+    i = 0;
+    while i < NKEYS {
+        if m.get(names.get(i)) != i {
+            fail("string lookup " + names.get(i));
+        }
+        // the same text in another string
+        val again: str = "" + names.get(i);
+        if !m.contains(again) {
+            fail("string lookup by an equal string " + again);
+        }
+        i = i + 1;
+    }
+    if m.contains("f") || m.contains("g1") || m.get_or("zz", 3) != 3 {
+        fail("absent string key");
+    }
+    i = 0;
+    while i < NKEYS {
+        if i % 3 == 0 {
+            m.remove(names.get(i));
+        }
+        i = i + 1;
+    }
+    if m.len() != NKEYS - NKEYS / 3 || m.contains(names.get(0)) || m.get(names.get(1)) != 1 {
+        fail("string removes");
+    }
+    println("string lookups ok");
+}
+
+fn main() -> i64 {
+    int_part();
+    str_part();
+    println("hashmap flood ok");
+    return 0;
+}

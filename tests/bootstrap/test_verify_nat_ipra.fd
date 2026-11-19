@@ -1,0 +1,183 @@
+// VF5, interprocedural register allocation of the machine layer
+// (compiler/nat_ir.fd, `FID_NAT_OFF=ipra`): a call clobbers only the
+// caller-saved registers its callee (and what that calls) writes, so the
+// caller may keep values in the others across the call. It is wrong to
+// leave out a register the callee writes: through a callee of the callee,
+// through recursion (the set of a function that is still being allocated),
+// through a call by a function value (the callee is not known: every
+// register), or through a runtime call (Vec growth, string building). Fourteen
+// values stay live across each kind of call and are printed after it.
+// scripts/verify/variants.py's mutant ra-calls-clobber-nothing breaks it.
+//
+// Expected output:
+// 105 3628800
+// 105 55
+// 105 9
+// 105 21
+// 105 abcabcabc
+// 105 64
+// -1216
+// 405 1182
+
+fn heavy(a: i64, b: i64) -> i64 {
+    // many values at once: the callee uses most of the registers
+    val p: i64 = a * 3 + b;
+    val q: i64 = a * 5 - b;
+    val r: i64 = p * q + a;
+    val s: i64 = q * r - p;
+    val t: i64 = r + s * 2;
+    val u: i64 = s - t + q;
+    val w: i64 = t * u + r;
+    val x: i64 = u + w - s;
+    return (p + q + r + s + t + u + w + x) % 1000;
+}
+
+fn middle(a: i64) -> i64 {
+    return heavy(a, a + 1) + heavy(a + 2, a);
+}
+
+fn fact(n: i64) -> i64 {
+    if n <= 1 {
+        return 1;
+    }
+    val m: i64 = n * 2;
+    val k: i64 = m - n;
+    return k * fact(n - 1);
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn is_even(n: i64) -> bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: i64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn triple_plus(x: i64) -> i64 {
+    return heavy(x, 1) * 0 + x * 3;
+}
+
+// k, computed by a loop the optimizer does not see through, so the
+// values below are not constants
+fn opaque(k: i64) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < k {
+        s = s + 1;
+        i = i + 1;
+    }
+    if s > 1000000 {
+        println("unreachable");
+    }
+    return s;
+}
+
+fn leaf_add(a: i64, b: i64) -> i64 {
+    return a + b;
+}
+
+fn sum8(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> i64 {
+    return a + b + c + d + e + f + g + h;
+}
+
+fn main() -> i64 {
+    var v1: i64 = opaque(1);
+    var v2: i64 = opaque(2);
+    var v3: i64 = opaque(3);
+    var v4: i64 = opaque(4);
+    var v5: i64 = opaque(5);
+    var v6: i64 = opaque(6);
+    var v7: i64 = opaque(7);
+    var v8: i64 = opaque(8);
+    var v9: i64 = opaque(9);
+    var v10: i64 = opaque(10);
+    var v11: i64 = opaque(11);
+    var v12: i64 = opaque(12);
+    var v13: i64 = opaque(13);
+    var v14: i64 = opaque(14);
+
+    // recursion
+    val f10: i64 = fact(10);
+    println(int_to_str(sum8(v1, v2, v3, v4, v5, v6, v7, v8) + v9 + v10 + v11 + v12 + v13 + v14) + " " + int_to_str(f10));
+
+    val fb: i64 = fib(10);
+    println(int_to_str(sum8(v1, v2, v3, v4, v5, v6, v7, v8) + v9 + v10 + v11 + v12 + v13 + v14) + " " + int_to_str(fb));
+
+    // mutual recursion
+    var ev: i64 = 0;
+    var n: i64 = 0;
+    while n < 17 {
+        if is_even(n) {
+            ev = ev + 1;
+        }
+        n = n + 1;
+    }
+    println(int_to_str(sum8(v1, v2, v3, v4, v5, v6, v7, v8) + v9 + v10 + v11 + v12 + v13 + v14) + " " + int_to_str(ev));
+
+    // a call through a function value
+    val tp: i64 = apply(triple_plus, 7);
+    println(int_to_str(sum8(v1, v2, v3, v4, v5, v6, v7, v8) + v9 + v10 + v11 + v12 + v13 + v14) + " " + int_to_str(tp));
+
+    // runtime calls: string building
+    var s: str = "";
+    var i: i64 = 0;
+    while i < 3 {
+        s = s + "abc";
+        i = i + 1;
+    }
+    println(int_to_str(sum8(v1, v2, v3, v4, v5, v6, v7, v8) + v9 + v10 + v11 + v12 + v13 + v14) + " " + s);
+
+    // runtime calls: a Vec that grows
+    var vs: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 64 {
+        vs.push(i);
+        i = i + 1;
+    }
+    println(int_to_str(sum8(v1, v2, v3, v4, v5, v6, v7, v8) + v9 + v10 + v11 + v12 + v13 + v14) + " " + int_to_str(vs.len()));
+
+    // a callee of a callee, inside a loop that changes the live values
+    var acc: i64 = 0;
+    i = 0;
+    while i < 3 {
+        acc = acc + middle(i);
+        v1 = v1 + 1;
+        v8 = v8 + 2;
+        i = i + 1;
+    }
+    println(acc + v1 * 100 + v8);
+
+    // a small leaf callee in a loop while fourteen values live: with the
+    // callee's own clobber set the values may sit in caller-saved
+    // registers across the call
+    var lsum: i64 = 0;
+    i = 0;
+    while i < 10 {
+        lsum = lsum + leaf_add(i, v9) + v2 + v3 + v4 + v5 + v6 + v7;
+        v10 = v10 + 1;
+        v11 = v11 + v10;
+        v12 = v12 + leaf_add(v11, 1);
+        v13 = v13 + v12 % 7;
+        v14 = v14 + v1;
+        i = i + 1;
+    }
+    println(int_to_str(lsum) + " " + int_to_str(v10 + v11 + v12 + v13 + v14));
+    return 0;
+}

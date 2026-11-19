@@ -1,0 +1,249 @@
+// Competitive roadmap OP23: the runtime's copy, byte search, equality,
+// ordering and hashing go a word (or a vector) at a time, not a byte at a
+// time. This program times each runtime routine on 1 MB strings against
+// the byte loop it replaced (the same loops core.fd keeps for the
+// interpreter), in the same build. tests/tooling/op23-memops-bench.sh
+// builds it on the C back end and natively and checks that every routine
+// is at least twice as fast as its byte loop, and that both give the same
+// results (the lines before the timings).
+//
+// Output: one "<op>: <result> <same>" line per routine, then one
+// "time <op> <runtime us> <byte loop us>" line per routine.
+
+const N: i64 = 1048576;
+const ROUNDS: i64 = 40;
+
+fn b2s(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+/// Byte loops: what the runtime routines replaced, with the byte reads
+/// in the loop (as core's bodies have them).
+@unsafe
+fn loop_eq(a: i64, b: i64, n: i64) -> bool {
+    var i: i64 = 0;
+    while i < n {
+        var pa: * mut u8 = (a + i) as * mut u8;
+        var pb: * mut u8 = (b + i) as * mut u8;
+        var x: i64 = 0;
+        var y: i64 = 0;
+        // SAFETY: i < n: inside both blocks of n bytes.
+        unsafe {
+            x = * pa;
+            y = * pb;
+        }
+        if x != y {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+@unsafe
+fn loop_find(p: i64, n: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        var bp: * mut u8 = (p + i) as * mut u8;
+        var x: i64 = 0;
+        // SAFETY: i < n: inside the block of n bytes.
+        unsafe {
+            x = * bp;
+        }
+        if x == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+@unsafe
+fn loop_cmp(a: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while true {
+        var pa: * mut u8 = (a + i) as * mut u8;
+        var pb: * mut u8 = (b + i) as * mut u8;
+        var x: i64 = 0;
+        var y: i64 = 0;
+        // SAFETY: both are NUL-terminated strings and the loop stops at the
+        // first NUL or difference, so i stays inside both.
+        unsafe {
+            x = * pa;
+            y = * pb;
+        }
+        if x != y || x == 0 {
+            return x - y;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+@unsafe
+fn loop_copy(dst: i64, src: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        var d: * mut u8 = (dst + i) as * mut u8;
+        var s: * mut u8 = (src + i) as * mut u8;
+        // SAFETY: i < n: inside both blocks of n bytes.
+        unsafe {
+            * d = * s;
+        }
+        i = i + 1;
+    }
+}
+
+@unsafe
+@wrapping fn loop_hash(s: i64) -> i64 {
+    var hash: i64 = - 3750763034362895579;
+    var addr: i64 = s;
+    var bp: * mut u8 = addr as * mut u8;
+    // SAFETY: s is a NUL-terminated string and the loop stops at its NUL.
+    unsafe {
+        var b: i64 = * bp;
+        while b != 0 {
+            hash = hash ^ b;
+            hash = hash * 1099511628211;
+            addr = addr + 1;
+            bp = addr as * mut u8;
+            b = * bp;
+        }
+    }
+    return hash;
+}
+
+fn report(op: str, rt: i64, lp: i64) {
+    println("time " + op + " " + int_to_str(rt) + " " + int_to_str(lp));
+}
+
+// SAFETY: (release M10: the loop_* references are @unsafe) every address
+// they get is inside a, b, c (N bytes each) or buf, all live to the end.
+@unsafe
+fn main() -> i64 {
+    // two equal strings of N bytes, a third with '#' as its last byte
+    val unit: str = "the quick brown fox jumps over the lazy dog 0123456789abcdefghij";
+    val a: str = str_repeat(unit, N / 64);
+    val b: str = str_repeat(unit, N / 64);
+    val c: str = str_slice(a, 0, N - 1) + "#";
+    val pa: i64 = a as i64;
+    val pb: i64 = b as i64;
+    val pc: i64 = c as i64;
+
+    // equality
+    var t0: i64 = p_clock_now_us();
+    var hits: i64 = 0;
+    var r: i64 = 0;
+    while r < ROUNDS {
+        if a == b {
+            hits = hits + 1;
+        }
+        r = r + 1;
+    }
+    var rt: i64 = p_clock_now_us() - t0;
+    t0 = p_clock_now_us();
+    var hits2: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        if loop_eq(pa, pb, N) {
+            hits2 = hits2 + 1;
+        }
+        r = r + 1;
+    }
+    var lp: i64 = p_clock_now_us() - t0;
+    println("eq: " + int_to_str(hits) + " " + b2s(hits == hits2));
+    report("eq", rt, lp);
+
+    // byte search (substring search starts with it)
+    t0 = p_clock_now_us();
+    var at: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        at = at + str_find(c, "#");
+        r = r + 1;
+    }
+    rt = p_clock_now_us() - t0;
+    t0 = p_clock_now_us();
+    var at2: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        at2 = at2 + loop_find(pc, N, 35);
+        r = r + 1;
+    }
+    lp = p_clock_now_us() - t0;
+    println("find: " + int_to_str(at / ROUNDS) + " " + b2s(at == at2));
+    report("find", rt, lp);
+
+    // ordering
+    t0 = p_clock_now_us();
+    var d: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        d = d + str_compare(a, c);
+        r = r + 1;
+    }
+    rt = p_clock_now_us() - t0;
+    t0 = p_clock_now_us();
+    var d2: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        d2 = d2 + loop_cmp(pa, pc);
+        r = r + 1;
+    }
+    lp = p_clock_now_us() - t0;
+    println("compare: " + int_to_str(d / ROUNDS) + " " + b2s(d == d2));
+    report("compare", rt, lp);
+
+    // copy
+    var buf: i64 = 0;
+    // SAFETY: a block of N bytes, freed below after its last use.
+    unsafe {
+        buf = p_malloc(N);
+    }
+    t0 = p_clock_now_us();
+    r = 0;
+    while r < ROUNDS {
+        p_mem_copy(buf, pa, N);
+        r = r + 1;
+    }
+    rt = p_clock_now_us() - t0;
+    val ok1: bool = loop_eq(buf, pa, N);
+    t0 = p_clock_now_us();
+    r = 0;
+    while r < ROUNDS {
+        loop_copy(buf, pc, N);
+        r = r + 1;
+    }
+    lp = p_clock_now_us() - t0;
+    val ok2: bool = loop_eq(buf, pc, N);
+    // SAFETY: buf came from p_malloc above and is not used again.
+    unsafe {
+        p_free(buf);
+    }
+    println("copy: " + b2s(ok1) + " " + b2s(ok2));
+    report("copy", rt, lp);
+
+    // hashing (each back end has its own function: only the time counts)
+    t0 = p_clock_now_us();
+    var h: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        h = h ^ p_str_hash(pa + r);
+        r = r + 1;
+    }
+    rt = p_clock_now_us() - t0;
+    t0 = p_clock_now_us();
+    var h2: i64 = 0;
+    r = 0;
+    while r < ROUNDS {
+        h2 = h2 ^ loop_hash(pa + r);
+        r = r + 1;
+    }
+    lp = p_clock_now_us() - t0;
+    println("hash: " + b2s(h != 0 || h2 != 0));
+    report("hash", rt, lp);
+    return 0;
+}

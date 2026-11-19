@@ -1,0 +1,673 @@
+# Weekly verification (competitive roadmap Track VF, BM8): the runs that
+# build whole compilers or take hours. The nightly fuzzers and sanitizers
+# are in verify-nightly.yml, the per-push checks in ci.yml.
+#
+#   bootstrap  VF13 scripts/verify/clean-bootstrap.sh: `git archive HEAD`
+#                   into a new directory, the Rust compiler, three stages,
+#                   the fixpoint (stage 2 == stage 3), hello on stage 3
+#   mutants    VF7  scripts/verify/variants.py mutate: compilers with one
+#                   deliberate bug each (mid-end and backend); a mutant no
+#                   test notices fails the job
+#   toggles    VF4  scripts/verify/variants.py toggle: every run-time pass
+#                   switch off in turn, and the bounds-check ranges off; the
+#                   output of every test must not change
+#   toggles-peir VF4 the same on Windows for the five PEIR_* constants
+#                   (pe_ir), one compiler per variant, the whole suite
+#   coverage   VF8  scripts/verify/vf8-run.sh (cov_instrument.py +
+#                   coverage.py): block (branch) and source-line coverage of
+#                   compiler/*.fd from the suite and the fuzzers' programs,
+#                   per module, in the run's summary
+#   repro      VF12 scripts/verify/repro.sh: the same input built twice in
+#                   different directories gives the same bytes
+#   interleave VF18 scripts/verify/interleave.py: thousands of runs of the
+#                   threaded programs on random CPU sets, with and without
+#                   load
+#   bench      BM8  bench/run.sh on Linux, every language, best of 5 with
+#                   the spread: the core set, SUITE=game (BM3) and
+#                   SUITE=work (BM4); bench/size.sh (BM7) and
+#                   bench/compile-speed.sh (BM6; 1M lines in a step of
+#                   its own); bench/service/run.sh under wrk (BM5); the
+#                   tables go to the
+#                   summary and the artifact; bench/history.sh adds them
+#                   to the results history (artifact bench-weekly-history),
+#                   which pages.yml puts on the website's results page: BM10
+#   suite-fid  A4   the suite run by fidesc's harness with fid as the
+#                   compiler (`fidesc test --compiler release/fid-dev`),
+#                   normal and expected-fail tests, Linux and Windows
+#   flake      A12  the whole-compiler tests (scripts/long-tests.txt) built
+#                   once and run 10 times beside 2 busy processes
+#                   (scripts/flake-repeat.sh): times against the harness's
+#                   30 s limit, and outputs compared run to run; then
+#                   scripts/long-tests.sh with its longer limit
+#   native-fixpoint RL14 scripts/native-fixpoint.sh: compiler/main.fd built
+#                   by `fid emit` twice (BACKEND linux, pe, nat), stage 2 ==
+#                   stage 3, stage 3 compiles hello
+#   own-model  VF11 scripts/verify/own_model.py --size 5: the ownership
+#                   calculus, every program up to 5 statements
+#
+# Every job uploads what it found; the job fails when its check fails.
+
+name: Verify (weekly)
+
+on:
+  schedule:
+    - cron: "41 1 * * 6"   # Saturdays 01:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-weekly
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CC: zig cc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: VF13 clean-tree bootstrap, 3 stages, fixpoint
+        run: bash scripts/verify/clean-bootstrap.sh build/clean-bootstrap
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-bootstrap-${{ github.run_id }}
+          path: build/clean-bootstrap/*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      CC: zig cc
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: VF7 mutation testing (each mutant is a compiler build)
+        run: |
+          python scripts/verify/variants.py mutate --fid "$FID" --tree . \
+            --tests 'tests/bootstrap/test_opt_*.fd,tests/bootstrap/test_verify_*.fd' \
+            --gen 20 -j 4 --out build/variants
+      - name: Report
+        if: always()
+        run: cat build/variants/mutate-report.txt >> "$GITHUB_STEP_SUMMARY" || true
+
+  toggles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CC: zig cc
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: VF4 every pass off in turn
+        # the run-time switches need no build; of the constants only the
+        # bounds-check ranges (compiler/checks.fd) reach Linux: the PEIR_*
+        # ones are pe_ir's, the Windows backend
+        run: |
+          ONLY=$(python scripts/verify/variants.py list --tree . \
+                 | awk '$1 == "toggle" && ($3 == "env" || $2 == "ranges") { print $2 }' | paste -sd, -)
+          echo "toggles: $ONLY"
+          python scripts/verify/variants.py toggle --fid "$FID" --tree . --only "$ONLY" \
+            --sample 120 --gen 20 -j 4 --out build/variants
+      - name: Report
+        if: always()
+        run: cat build/variants/toggle-report.txt >> "$GITHUB_STEP_SUMMARY" || true
+
+  toggles-peir:
+    # VF4 on Windows: the PEIR_* constants are pe_ir's (the default Windows
+    # native backend), so a compiler rebuilt with one of them off
+    # (scripts/verify/build-variant.sh) is compared with the normal one on
+    # Windows, over the whole suite (no --sample) and 20 generated programs.
+    # One variant per matrix job: each needs its own compiler build.
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [peir-global-ra, peir-coalesce, peir-volatile-ra, peir-xmm-ra, peir-rotate]
+    runs-on: windows-latest
+    timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: zig cc
+      FID: release/fid-dev.exe
+    steps:
+      - name: keep LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: VF4 ${{ matrix.variant }} off over the whole suite
+        run: |
+          python scripts/verify/variants.py toggle --fid "$FID" --tree . --only "${{ matrix.variant }}" \
+            --gen 20 -j 4 --out build/variants
+      - name: Report
+        if: always()
+        run: cat build/variants/toggle-report.txt >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: toggles-${{ matrix.variant }}-${{ github.run_id }}
+          path: build/variants/*.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CC: zig cc
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      # VF8: the counter compiler (block and source-line counters; vf8-run.sh
+      # sets FID_C_LINE_MARKS=1 itself), the suite and the fuzzers' programs
+      # through it, the per-module report and the 90% goal (listed; not a
+      # gate yet)
+      - name: VF8 line and block coverage of compiler/*.fd
+        run: |
+          FID=release/fid-dev OUT=build/cov RECORD=none GEN=50 J=4 \
+            MODES=check,run,ccompile,emit:x86_64-linux,emit:aarch64-linux,emit:riscv64-linux \
+            bash scripts/verify/vf8-run.sh || true
+      - name: VF8 summary
+        if: always()
+        run: |
+          { echo '```'; cat build/cov/report.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; grep 'below the\|every goal' build/cov/goal.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}
+          path: |
+            build/cov/report.txt
+            build/cov/uncovered-lines.txt
+            build/cov/low-modules.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CC: zig cc
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: VF12 reproducible outputs
+        run: MANIFEST=build/repro-linux.txt bash scripts/verify/repro.sh
+      - name: B9 the compiler built per module (--inc) reaches the fixpoint
+        # builds compiler/main.fd with `ccompile --inc`, requires its C for
+        # compiler/main.fd to equal fid-dev's, and a second --inc self-build
+        # to reuse every unit's object ("All N units up to date")
+        if: always()
+        run: FIXPOINT=1 bash scripts/inc-check.sh
+      - name: "Manifest (compare it with a Windows one through repro.sh --compare)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-manifest-${{ github.run_id }}
+          path: build/repro-linux.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
+  interleave:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CC: zig cc
+      FID: release/fid-dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: VF18 thousands of interleavings
+        run: |
+          python -m pip install --quiet psutil
+          python scripts/verify/interleave.py --fid "$FID" -n 3000 --shards 4 \
+            --backends ccompile,emit --out build/interleave --record build/interleave/record.md
+      - name: VF18 the runtime's seeded scheduler (RL17)
+        run: |
+          python scripts/verify/interleave.py --fid "$FID" -n 300 --shards 8 --sched-random \
+            --timeout 300 --backends ccompile \
+            --programs tests/bootstrap/test_runtime_sched_random.fd,tests/verify/interleave.fd \
+            --out build/interleave
+      - name: VF18 the harness checks itself
+        run: FID=$FID bash tests/tooling/vf18-interleave-check.sh
+      - name: Findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interleave-${{ github.run_id }}
+          path: build/interleave/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    # actions: read — BM10 fetches last week's bench-weekly-history artifact
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CC: zig cc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: mold, g++
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold g++
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: BM8 every language, best of 5, with the spread
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          RUNS: "5"
+        run: |
+          mkdir -p build/bench
+          bash bench/run.sh | tee build/bench/run-linux.md
+          # BM3 (the Benchmarks Game set) and BM4 (real work)
+          SUITE=game bash bench/run.sh | tee build/bench/game-linux.md
+          SUITE=work bash bench/run.sh | tee build/bench/work-linux.md
+          cat build/bench/run-linux.md build/bench/game-linux.md build/bench/work-linux.md >> "$GITHUB_STEP_SUMMARY"
+      - name: BM6 compile speed (hello, 10k, 100k lines)
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+        run: |
+          bash bench/compile-speed.sh | tee build/bench/compile-linux.md
+          cat build/bench/compile-linux.md >> "$GITHUB_STEP_SUMMARY"
+      - name: BM7 size, startup and peak memory
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+        run: |
+          bash bench/size.sh | tee build/bench/size-linux.md
+          cat build/bench/size-linux.md >> "$GITHUB_STEP_SUMMARY"
+      # BM5: plaintext, JSON, one row, 20 rows; Fides (native and through C),
+      # Go net/http, Node under wrk. Client and server share this runner,
+      # which the table's footer says (TechEmpower's client is on another
+      # machine: run.sh serve / load split them)
+      - name: BM5 service benchmarks (wrk)
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          LOADGEN: wrk
+          DURATION: "15"
+        run: |
+          sudo apt-get install -y -qq wrk
+          bash scripts/service-bench-check.sh
+          bash bench/service/run.sh | tee build/bench/service-linux.md
+          cat build/bench/service-linux.md >> "$GITHUB_STEP_SUMMARY"
+      # RT11: idle connections parked on epoll, the server's memory and the
+      # latency of fresh and idle connections at each step. A hosted runner
+      # has 7 GB, so the steps stop at 250k (1M needs ~10 GB with client
+      # and server on one machine: bench/idle/idle.py says what to raise)
+      - name: RT11 idle connections
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          STEPS: "1000,10000,100000,250000"
+          SAMPLES: "200"
+        run: |
+          # vm.max_map_count: each task's stack is two mappings (its guard
+          # page is mprotect'ed): 1048576 stops the C path near 590k tasks
+          sudo sysctl -w fs.nr_open=2200000 fs.file-max=4400000 vm.max_map_count=4194304 \
+            net.ipv4.ip_local_port_range="1024 65535" \
+            net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+          sudo prlimit --pid $$ --nofile=1100000:1100000
+          ulimit -n 1100000
+          bash bench/idle/run.sh | tee build/bench/idle-linux.md
+          cat build/bench/idle-linux.md >> "$GITHUB_STEP_SUMMARY"
+      # BM9: the 5% gate of bench.yml must not fail an unchanged compiler:
+      # one build as base and head, the --ab comparison three times over
+      # every set; the largest difference per program goes to the summary
+      - name: BM9 the 5% gate on an unchanged compiler (no false failure)
+        if: always()
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          LIMIT_PCT: "5"
+          RUNS: "5"
+          ROUNDS: "3"
+          SUITES: "game work"
+        run: |
+          bash scripts/bench-noise-check.sh | tee build/bench/gate-noise-linux.md
+          cat build/bench/gate-noise-linux.md >> "$GITHUB_STEP_SUMMARY"
+      # BM6 at 1M lines: its own step and time limit, so a slow size does not
+      # cost the tables above
+      - name: BM6 compile speed at 1M lines
+        if: always()
+        timeout-minutes: 120
+        env:
+          FID: ${{ github.workspace }}/release/fid-dev
+          SIZES: "1000000"
+        run: |
+          bash bench/compile-speed.sh | tee build/bench/compile-1m-linux.md
+          cat build/bench/compile-1m-linux.md >> "$GITHUB_STEP_SUMMARY"
+      # BM10: this run's tables go into the results history without a hand
+      # step. weekly-history.md (a `## Results` line, then one section per
+      # run, newest first) is last week's `bench-weekly-history` artifact plus
+      # this run, added by bench/history.sh; pages.yml merges it into
+      # docs/benchmarks.md (bench/page-merge.sh) when it builds the website,
+      # and runs when this workflow ends.
+      - name: BM10 add this run to the results history
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build/bench/page build/bench/prev
+          H=build/bench/page/weekly-history.md
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=bench-weekly-history&per_page=1" \
+               -q '.artifacts[0].id' 2>/dev/null || true)
+          if [ -n "$id" ] && [ "$id" != "null" ] &&
+             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > build/bench/prev/h.zip 2>/dev/null &&
+             unzip -o -q build/bench/prev/h.zip -d build/bench/prev && [ -f build/bench/prev/weekly-history.md ]; then
+            cp build/bench/prev/weekly-history.md "$H"
+          else
+            echo "no earlier bench-weekly-history: starting one"
+            printf '## Results\n' > "$H"
+          fi
+          : > build/bench/run-all.md
+          for t in run game work compile compile-1m size service idle gate-noise; do
+            f=build/bench/$t-linux.md
+            [ -s "$f" ] && { cat "$f"; echo; } >> build/bench/run-all.md
+          done
+          if [ -s build/bench/run-all.md ]; then
+            PAGE="$H" bash bench/history.sh build/bench/run-all.md \
+              "Linux x64, GitHub runner (verify-weekly run ${{ github.run_id }})"
+          fi
+          grep -c '^### ' "$H" | sed 's/^/runs in the history: /'
+      - name: BM10 results history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-weekly-history
+          path: build/bench/page/weekly-history.md
+          if-no-files-found: ignore
+          retention-days: 400
+      - name: Tables
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux-${{ github.run_id }}
+          path: build/bench/
+          if-no-files-found: ignore
+          retention-days: 400
+
+  suite-fid:
+    # release-roadmap A4: the suite on the self-hosted compiler. fidesc's
+    # harness drives it; `--compiler` sends run, ccompile and emit to fid.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: zig cc
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: Normal tests, fid as the compiler
+        run: |
+          x=""; [ "$RUNNER_OS" = Windows ] && x=".exe"
+          mkdir -p build/suite-fid
+          ./target/release/fidesc test --compiler "$PWD/release/fid-dev$x" 2>&1 | tee build/suite-fid/normal.txt
+      - name: Expected-fail tests, fid as the compiler
+        if: always()
+        run: |
+          x=""; [ "$RUNNER_OS" = Windows ] && x=".exe"
+          ./target/release/fidesc test --fail --compiler "$PWD/release/fid-dev$x" 2>&1 | tee build/suite-fid/fail.txt
+      - name: Summary
+        if: always()
+        run: grep -hE '^(Interpreter|C Codegen|PE Emitter):|\[FAIL\]|\[UNEXPECTED' build/suite-fid/*.txt >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Pass counts against fidesc's baseline
+        if: always()
+        run: |
+          bash scripts/suite-fid-compare.sh build/suite-fid/normal.txt build/suite-fid/fail.txt \
+            | tee build/suite-fid/compare.txt
+          rc=${PIPESTATUS[0]}
+          { echo '```'; cat build/suite-fid/compare.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-fid-${{ matrix.os }}-${{ github.run_id }}
+          path: build/suite-fid/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  flake:
+    # release-roadmap A12: is a whole-compiler test's failure a timeout under
+    # load or a real nondeterminism? Native Windows (fid emit, where it
+    # failed once) and Linux (through C).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: zig cc
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: 10 runs beside 2 busy processes (flake-repeat.sh)
+        run: |
+          x=""; [ "$RUNNER_OS" = Windows ] && x=".exe"
+          bad=0
+          for name in $(grep -v '^#' scripts/long-tests.txt | awk '{print $1}'); do
+            src=tests/selfhost/$name.fd; [ -f "$src" ] || src=tests/bootstrap/$name.fd
+            FID="release/fid-dev$x" LOAD=2 bash scripts/flake-repeat.sh "$src" 10 \
+              | tee -a build-flake.txt || bad=$((bad + 1))
+          done
+          exit $bad
+      - name: The same tests with the longer limit (long-tests.sh)
+        if: always()
+        run: bash scripts/long-tests.sh --all | tee -a build-flake.txt
+      - name: Summary
+        if: always()
+        run: grep -E 'flake-repeat:|long-tests:' build-flake.txt >> "$GITHUB_STEP_SUMMARY" || true
+
+  native-fixpoint:
+    # RL14: the compiler built by our own backend, no C compiler: stage 2 is
+    # compiler/main.fd through `fid emit`, stage 3 the same by stage 2, and
+    # the two must be equal byte for byte (scripts/native-fixpoint.sh).
+    # Stage 1 is a one-stage fid built through C.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: linux
+          - os: windows-latest
+            backend: pe
+          - os: windows-latest
+            backend: nat
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: Fixpoint through ${{ matrix.backend }}
+        env:
+          # when stage 2 != stage 3, stage 4 tells a drift that settles from
+          # one that does not; the functions that differ go to drift.txt
+          STAGE4: 1
+        run: |
+          x=""; [ "$RUNNER_OS" = Windows ] && x=".exe"
+          FID="release/fid-dev$x" BACKEND=${{ matrix.backend }} FID_VERIFY=1 \
+            bash scripts/native-fixpoint.sh | tee build-native-fixpoint.txt
+          exit ${PIPESTATUS[0]}
+      - name: Summary
+        if: always()
+        run: grep -E 'stage|fixpoint|differ' build-native-fixpoint.txt >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Stage logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-fixpoint-${{ matrix.backend }}-${{ github.run_id }}
+          path: |
+            build/native-fixpoint/*.log
+            build/native-fixpoint/drift.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  own-model:
+    # VF11: the ownership calculus checked exhaustively up to 5 statements
+    # (3.4 million programs, about 2 minutes); the gates job of ci.yml runs
+    # 4 statements and the mutants on every push; then the model's programs
+    # through a one-stage fid (own_diff.py)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every program up to 5 statements (scripts/verify/own_model.py)
+        shell: bash
+        run: python3 scripts/verify/own_model.py --size 5 | tee -a "$GITHUB_STEP_SUMMARY"
+      # VF11: the model's programs through fid (run, --leaks,
+      # --checked-alloc), each accepted program against the model's output
+      # and 10 rejected programs per feature
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: cargo build --release && ./scripts/build-selfhost.sh
+      - name: The model against fid (scripts/verify/own_diff.py)
+        shell: bash
+        env:
+          CC: zig cc
+        run: |
+          python3 scripts/verify/own_diff.py --fid release/fid-dev --size 4 --per 60 --rejected 10 --out build/own-diff | tee -a "$GITHUB_STEP_SUMMARY"
+          exit ${PIPESTATUS[0]}
+      - name: own_diff's programs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: own-diff-${{ github.run_id }}
+          path: build/own-diff
+          if-no-files-found: ignore
+          retention-days: 14

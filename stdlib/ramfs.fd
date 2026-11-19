@@ -1,0 +1,503 @@
+// ramfs: an in-memory file system implementing every vfs operation
+// (stdlib/vfs.fd FsOps): regular files, directories, symlinks; create,
+// read, write (sparse writes fill the hole with zeros), truncate, mkdir,
+// unlink, rmdir (ENOTEMPTY), rename (replaces a file or an empty
+// directory, refuses to move a directory into itself: EINVAL),
+// readdir in creation order, readlink, and a logical clock for mtime.
+//
+// All of it is real; there is no platform seam. The inode table is global
+// (function values cannot carry state), shared by every ramfs instance:
+// an instance is the inode number of its root, and every inode records
+// the instance it belongs to. Inode numbers start at 1. Freed inodes are
+// reused. Like a kernel ramfs without an open-file count, unlinking a
+// file frees it at once, also while a descriptor still refers to it.
+module ramfs;
+use vec;
+use string;
+use vfs;
+
+var rf_kind: Vec<i64> = Vec::new();
+var rf_fs: Vec<i64> = Vec::new();
+var rf_mode: Vec<i64> = Vec::new();
+var rf_mtime: Vec<i64> = Vec::new();
+var rf_parent: Vec<i64> = Vec::new();
+var rf_data: Vec<Vec<i64>> = Vec::new();
+var rf_link: Vec<str> = Vec::new();
+var rf_names: Vec<Vec<str>> = Vec::new();
+var rf_inos: Vec<Vec<i64>> = Vec::new();
+var rf_freelist: Vec<i64> = Vec::new();
+var rf_clock: i64 = 0;
+
+/// Largest file ramfs accepts (EFBIG beyond it).
+pub const RAMFS_MAX_FILE: i64 = 268435456;
+
+fn rf_tick() -> i64 {
+    rf_clock = rf_clock + 1;
+    return rf_clock;
+}
+
+fn rf_alloc(fs: i64, kind: i64, mode: i64, parent: i64) -> i64 {
+    if rf_kind.len() == 0 {
+        // inode 0 is never used
+        rf_kind.push(0);
+        rf_fs.push(-1);
+        rf_mode.push(0);
+        rf_mtime.push(0);
+        rf_parent.push(0);
+        rf_data.push(Vec::new());
+        rf_link.push("");
+        rf_names.push(Vec::new());
+        rf_inos.push(Vec::new());
+    }
+    var ino: i64 = 0;
+    if rf_freelist.len() > 0 {
+        ino = rf_freelist.pop();
+        rf_kind.set(ino, kind);
+        rf_fs.set(ino, fs);
+        rf_mode.set(ino, mode);
+        rf_mtime.set(ino, rf_tick());
+        rf_parent.set(ino, parent);
+        rf_data.set(ino, Vec::new());
+        rf_link.set(ino, "");
+        rf_names.set(ino, Vec::new());
+        rf_inos.set(ino, Vec::new());
+    } else {
+        ino = rf_kind.len();
+        rf_kind.push(kind);
+        rf_fs.push(fs);
+        rf_mode.push(mode);
+        rf_mtime.push(rf_tick());
+        rf_parent.push(parent);
+        rf_data.push(Vec::new());
+        rf_link.push("");
+        rf_names.push(Vec::new());
+        rf_inos.push(Vec::new());
+    }
+    return ino;
+}
+
+fn rf_release(ino: i64) {
+    rf_kind.set(ino, 0);
+    rf_fs.set(ino, -1);
+    rf_data.set(ino, Vec::new());
+    rf_names.set(ino, Vec::new());
+    rf_inos.set(ino, Vec::new());
+    rf_link.set(ino, "");
+    rf_freelist.push(ino);
+}
+
+/// Is `ino` a live inode of instance `fs`?
+fn rf_valid(fs: i64, ino: i64) -> bool {
+    if ino <= 0 || ino >= rf_kind.len() {
+        return false;
+    }
+    return rf_kind.get(ino) != 0 && rf_fs.get(ino) == fs;
+}
+
+fn rf_name_check(name: str) -> i64 {
+    val n: i64 = str_len(name);
+    if n == 0 || name == "." || name == ".." {
+        return 0 - VFS_EINVAL;
+    }
+    if n > VFS_NAME_MAX {
+        return 0 - VFS_ENAMETOOLONG;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(name, i);
+        if c == 47 || c == 0 {
+            return 0 - VFS_EINVAL;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn rf_find(dir: i64, name: str) -> i64 {
+    val ns: Vec<str> = rf_names.get(dir);
+    var i: i64 = 0;
+    while i < ns.len() {
+        if ns.get(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn rf_add_entry(dir: i64, name: str, ino: i64) {
+    var ns: Vec<str> = rf_names.get(dir);
+    var is: Vec<i64> = rf_inos.get(dir);
+    ns.push(name);
+    is.push(ino);
+    rf_names.set(dir, ns);
+    rf_inos.set(dir, is);
+    rf_mtime.set(dir, rf_tick());
+}
+
+fn rf_remove_entry(dir: i64, idx: i64) {
+    val ns: Vec<str> = rf_names.get(dir);
+    val is: Vec<i64> = rf_inos.get(dir);
+    var nn: Vec<str> = Vec::new();
+    var ni: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < ns.len() {
+        if i != idx {
+            nn.push(ns.get(i));
+            ni.push(is.get(i));
+        }
+        i = i + 1;
+    }
+    rf_names.set(dir, nn);
+    rf_inos.set(dir, ni);
+    rf_mtime.set(dir, rf_tick());
+}
+
+// --- the operations ---------------------------------------------------------------
+
+/// A new, empty ramfs instance; the result is its handle (and root inode).
+pub fn ramfs_new() -> i64 {
+    val root: i64 = rf_alloc(0, VFS_DIR, 493, 0);
+    rf_fs.set(root, root);
+    rf_parent.set(root, root);
+    return root;
+}
+
+pub fn ramfs_root(fs: i64) -> i64 {
+    if !rf_valid(fs, fs) {
+        return 0 - VFS_EINVAL;
+    }
+    return fs;
+}
+
+pub fn ramfs_lookup(fs: i64, dir: i64, name: str) -> i64 {
+    if !rf_valid(fs, dir) {
+        return 0 - VFS_ENOENT;
+    }
+    if rf_kind.get(dir) != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    if name == "." {
+        return dir;
+    }
+    if name == ".." {
+        return rf_parent.get(dir);
+    }
+    val i: i64 = rf_find(dir, name);
+    if i < 0 {
+        return 0 - VFS_ENOENT;
+    }
+    return rf_inos.get(dir).get(i);
+}
+
+/// [err, kind, size, nlink, mode, mtime] (vfs VFS_ST_*).
+pub fn ramfs_getattr(fs: i64, ino: i64) -> Vec<i64> {
+    var w: Vec<i64> = Vec::new();
+    if !rf_valid(fs, ino) {
+        w.push(0 - VFS_ENOENT);
+        w.push(0);
+        w.push(0);
+        w.push(0);
+        w.push(0);
+        w.push(0);
+        return w;
+    }
+    val k: i64 = rf_kind.get(ino);
+    var size: i64 = 0;
+    var nlink: i64 = 1;
+    var fmt: i64 = VFS_S_IFREG;
+    if k == VFS_REG {
+        size = rf_data.get(ino).len();
+    } else if k == VFS_DIR {
+        size = rf_names.get(ino).len();
+        fmt = VFS_S_IFDIR;
+        // "." + the entry in the parent + each subdirectory's ".."
+        nlink = 2;
+        val is: Vec<i64> = rf_inos.get(ino);
+        var i: i64 = 0;
+        while i < is.len() {
+            if rf_kind.get(is.get(i)) == VFS_DIR {
+                nlink = nlink + 1;
+            }
+            i = i + 1;
+        }
+    } else {
+        size = str_len(rf_link.get(ino));
+        fmt = VFS_S_IFLNK;
+    }
+    w.push(0);
+    w.push(k);
+    w.push(size);
+    w.push(nlink);
+    w.push(fmt | (rf_mode.get(ino) & 4095));
+    w.push(rf_mtime.get(ino));
+    return w;
+}
+
+pub fn ramfs_read(fs: i64, ino: i64, off: i64, len: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    if !rf_valid(fs, ino) || rf_kind.get(ino) != VFS_REG {
+        return out;
+    }
+    val d: Vec<i64> = rf_data.get(ino);
+    var i: i64 = off;
+    while i < d.len() && i < off + len {
+        out.push(d.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn ramfs_write(fs: i64, ino: i64, off: i64, data: Vec<i64>) -> i64 {
+    if !rf_valid(fs, ino) {
+        return 0 - VFS_ENOENT;
+    }
+    if rf_kind.get(ino) != VFS_REG {
+        return 0 - VFS_EISDIR;
+    }
+    if off + data.len() > RAMFS_MAX_FILE {
+        return 0 - VFS_EFBIG;
+    }
+    var d: Vec<i64> = rf_data.get(ino);
+    while d.len() < off {
+        d.push(0);
+    }
+    var i: i64 = 0;
+    while i < data.len() {
+        val p: i64 = off + i;
+        if p < d.len() {
+            d.set(p, data.get(i) & 255);
+        } else {
+            d.push(data.get(i) & 255);
+        }
+        i = i + 1;
+    }
+    rf_data.set(ino, d);
+    rf_mtime.set(ino, rf_tick());
+    return data.len();
+}
+
+pub fn ramfs_truncate(fs: i64, ino: i64, size: i64) -> i64 {
+    if !rf_valid(fs, ino) {
+        return 0 - VFS_ENOENT;
+    }
+    if rf_kind.get(ino) != VFS_REG {
+        return 0 - VFS_EISDIR;
+    }
+    if size > RAMFS_MAX_FILE {
+        return 0 - VFS_EFBIG;
+    }
+    val d: Vec<i64> = rf_data.get(ino);
+    var nd: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < size {
+        if i < d.len() {
+            nd.push(d.get(i));
+        } else {
+            nd.push(0);
+        }
+        i = i + 1;
+    }
+    rf_data.set(ino, nd);
+    rf_mtime.set(ino, rf_tick());
+    return 0;
+}
+
+fn rf_make(fs: i64, dir: i64, name: str, kind: i64, mode: i64) -> i64 {
+    if !rf_valid(fs, dir) {
+        return 0 - VFS_ENOENT;
+    }
+    if rf_kind.get(dir) != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    val e: i64 = rf_name_check(name);
+    if e < 0 {
+        return e;
+    }
+    if rf_find(dir, name) >= 0 {
+        return 0 - VFS_EEXIST;
+    }
+    val ino: i64 = rf_alloc(fs, kind, mode, dir);
+    rf_add_entry(dir, name, ino);
+    return ino;
+}
+
+pub fn ramfs_create(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+    return rf_make(fs, dir, name, VFS_REG, mode);
+}
+
+pub fn ramfs_mkdir(fs: i64, dir: i64, name: str, mode: i64) -> i64 {
+    return rf_make(fs, dir, name, VFS_DIR, mode);
+}
+
+pub fn ramfs_symlink(fs: i64, dir: i64, name: str, target: str) -> i64 {
+    if str_len(target) == 0 {
+        return 0 - VFS_ENOENT;
+    }
+    val ino: i64 = rf_make(fs, dir, name, VFS_LNK, 511);
+    if ino >= 0 {
+        rf_link.set(ino, target);
+    }
+    return ino;
+}
+
+pub fn ramfs_readlink(fs: i64, ino: i64) -> str {
+    if !rf_valid(fs, ino) || rf_kind.get(ino) != VFS_LNK {
+        return "";
+    }
+    return rf_link.get(ino);
+}
+
+pub fn ramfs_unlink(fs: i64, dir: i64, name: str) -> i64 {
+    if !rf_valid(fs, dir) {
+        return 0 - VFS_ENOENT;
+    }
+    val i: i64 = rf_find(dir, name);
+    if i < 0 {
+        return 0 - VFS_ENOENT;
+    }
+    val ino: i64 = rf_inos.get(dir).get(i);
+    if rf_kind.get(ino) == VFS_DIR {
+        return 0 - VFS_EISDIR;
+    }
+    rf_remove_entry(dir, i);
+    rf_release(ino);
+    return 0;
+}
+
+pub fn ramfs_rmdir(fs: i64, dir: i64, name: str) -> i64 {
+    if !rf_valid(fs, dir) {
+        return 0 - VFS_ENOENT;
+    }
+    val i: i64 = rf_find(dir, name);
+    if i < 0 {
+        return 0 - VFS_ENOENT;
+    }
+    val ino: i64 = rf_inos.get(dir).get(i);
+    if rf_kind.get(ino) != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    if rf_names.get(ino).len() > 0 {
+        return 0 - VFS_ENOTEMPTY;
+    }
+    rf_remove_entry(dir, i);
+    rf_release(ino);
+    return 0;
+}
+
+/// Is `a` the directory `d` or one of its ancestors?
+fn rf_is_ancestor(a: i64, d: i64) -> bool {
+    var cur: i64 = d;
+    var steps: i64 = 0;
+    while steps < 4096 {
+        if cur == a {
+            return true;
+        }
+        val p: i64 = rf_parent.get(cur);
+        if p == cur {
+            return false;
+        }
+        cur = p;
+        steps = steps + 1;
+    }
+    return false;
+}
+
+pub fn ramfs_rename(fs: i64, odir: i64, oname: str, ndir: i64, nname: str) -> i64 {
+    if !rf_valid(fs, odir) || !rf_valid(fs, ndir) {
+        return 0 - VFS_ENOENT;
+    }
+    if rf_kind.get(ndir) != VFS_DIR {
+        return 0 - VFS_ENOTDIR;
+    }
+    val e: i64 = rf_name_check(nname);
+    if e < 0 {
+        return e;
+    }
+    val si: i64 = rf_find(odir, oname);
+    if si < 0 {
+        return 0 - VFS_ENOENT;
+    }
+    val src: i64 = rf_inos.get(odir).get(si);
+    val skind: i64 = rf_kind.get(src);
+    val di: i64 = rf_find(ndir, nname);
+    if di >= 0 {
+        val dst: i64 = rf_inos.get(ndir).get(di);
+        if dst == src {
+            return 0;
+        }
+        val dkind: i64 = rf_kind.get(dst);
+        if skind == VFS_DIR && dkind != VFS_DIR {
+            return 0 - VFS_ENOTDIR;
+        }
+        if skind != VFS_DIR && dkind == VFS_DIR {
+            return 0 - VFS_EISDIR;
+        }
+        if dkind == VFS_DIR && rf_names.get(dst).len() > 0 {
+            return 0 - VFS_ENOTEMPTY;
+        }
+    }
+    if skind == VFS_DIR && rf_is_ancestor(src, ndir) {
+        return 0 - VFS_EINVAL;
+    }
+    // Remove the replaced entry, then move the source's entry.
+    if di >= 0 {
+        val dst: i64 = rf_inos.get(ndir).get(di);
+        rf_remove_entry(ndir, di);
+        rf_release(dst);
+    }
+    val si2: i64 = rf_find(odir, oname);
+    rf_remove_entry(odir, si2);
+    rf_add_entry(ndir, nname, src);
+    rf_parent.set(src, ndir);
+    return 0;
+}
+
+/// Entry `index` of directory `dir`, "" past the end.
+pub fn ramfs_readdir(fs: i64, dir: i64, index: i64) -> str {
+    if !rf_valid(fs, dir) || rf_kind.get(dir) != VFS_DIR {
+        return "";
+    }
+    val ns: Vec<str> = rf_names.get(dir);
+    if index < 0 || index >= ns.len() {
+        return "";
+    }
+    return ns.get(index);
+}
+
+/// The operations to mount a ramfs instance with vfs_mount.
+pub fn ramfs_ops() -> FsOps {
+    return FsOps {
+        name: "ramfs", root: ramfs_root, lookup: ramfs_lookup, getattr: ramfs_getattr, read: ramfs_read, write: ramfs_write, truncate: ramfs_truncate, create: ramfs_create, mkdir: ramfs_mkdir, unlink: ramfs_unlink, rmdir: ramfs_rmdir, rename: ramfs_rename, readdir: ramfs_readdir, symlink: ramfs_symlink, readlink: ramfs_readlink
+    };
+}
+
+/// Inodes and file bytes an instance holds: [inodes, bytes].
+pub fn ramfs_usage(fs: i64) -> Vec<i64> {
+    var inodes: i64 = 0;
+    var bytes: i64 = 0;
+    var i: i64 = 1;
+    while i < rf_kind.len() {
+        if rf_kind.get(i) != 0 && rf_fs.get(i) == fs {
+            inodes = inodes + 1;
+            if rf_kind.get(i) == VFS_REG {
+                bytes = bytes + rf_data.get(i).len();
+            }
+        }
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    out.push(inodes);
+    out.push(bytes);
+    return out;
+}
+
+/// A new ramfs mounted on `path` of `v`; returns the instance or -errno.
+pub fn ramfs_mount(v: &mut Vfs, path: str) -> i64 {
+    val fs: i64 = ramfs_new();
+    val r: i64 = vfs_mount(v, path, ramfs_ops(), fs);
+    if r < 0 {
+        return r;
+    }
+    return fs;
+}

@@ -1,0 +1,655 @@
+// Fides Android NDK bindings and a native-activity event loop
+//
+// What is real (pure Fides, tested in the interpreter):
+//   - the constants of the NDK headers: <android/input.h> (event types,
+//     sources, motion actions with the pointer-index bits, key actions,
+//     key codes, meta state), <android/looper.h> (poll results, fd events),
+//     <android/log.h> priorities, <android/native_window.h> formats,
+//     <android/asset_manager.h> open modes, and the APP_CMD_* values of
+//     android_native_app_glue
+//   - the memory layouts of ANativeActivity, ANativeActivityCallbacks and
+//     ANativeWindow_Buffer (64-bit offsets) and readers for them
+//   - motion event decoding (action, pointer index) and a multi-touch
+//     pointer tracker; key event classification
+//   - the app state machine of the glue (start/resume/pause/stop, window,
+//     focus) deciding when to draw and how long to block in the looper
+//   - an event loop skeleton: poll, read the command or input event,
+//     update the state, draw when animating
+//   - logcat lines (the "D/tag: msg" form) and splitting of long messages
+//     at the logger's payload limit; pixel packing for RGBA_8888, RGBX_8888
+//     and RGB_565 window buffers with stride
+//
+// The platform seam:
+//   - the NDK C API is declared in the extern "C" blocks below (libandroid,
+//     liblog). On a device these are called directly; the interpreter
+//     cannot reach them.
+//   - the event loop takes an `NdkLoopSeam` of function values: poll the
+//     looper (ALooper_pollOnce), read the next glue command, read the next
+//     input event (AInputQueue_getEvent + the AInputEvent accessors, filled
+//     into an NdkInput the loop passes by &mut). On a device these wrap the
+//     extern calls; tests feed scripted events.
+//
+// Usage:
+//   use android_ndk;
+//   var app: NdkApp = ndk_app_new();
+//   ndk_run_loop(&mut app, seam, -1);       // until destroy
+//   ndk_log(ANDROID_LOG_INFO, "game", "started");
+
+module android_ndk;
+use vec;
+use string;
+
+// ─── NDK C API ─────────────────────────────────────────────────────────
+
+// SAFETY: prototypes of the NDK headers with pointers as i64 words;
+// objects are the handles the NDK returned. Device builds only.
+extern "C" link "android" {
+    fn ALooper_forThread as ndk_c_looper_for_thread() -> i64;
+    fn ALooper_prepare as ndk_c_looper_prepare(opts: i64) -> i64;
+    fn ALooper_pollOnce as ndk_c_looper_poll_once(timeout_ms: i64, out_fd: i64, out_events: i64, out_data: i64) -> i64;
+    fn ALooper_wake as ndk_c_looper_wake(looper: i64) -> void;
+    fn ALooper_addFd as ndk_c_looper_add_fd(looper: i64, fd: i64, ident: i64, events: i64, callback: i64, data: i64) -> i64;
+    fn ALooper_removeFd as ndk_c_looper_remove_fd(looper: i64, fd: i64) -> i64;
+    fn AInputQueue_attachLooper as ndk_c_queue_attach(queue: i64, looper: i64, ident: i64, callback: i64, data: i64) -> void;
+    fn AInputQueue_detachLooper as ndk_c_queue_detach(queue: i64) -> void;
+    fn AInputQueue_getEvent as ndk_c_queue_get_event(queue: i64, out_event: i64) -> i64;
+    fn AInputQueue_preDispatchEvent as ndk_c_queue_predispatch(queue: i64, event: i64) -> i64;
+    fn AInputQueue_finishEvent as ndk_c_queue_finish(queue: i64, event: i64, handled: i64) -> void;
+    fn AInputEvent_getType as ndk_c_event_type(event: i64) -> i64;
+    fn AInputEvent_getSource as ndk_c_event_source(event: i64) -> i64;
+    fn AInputEvent_getDeviceId as ndk_c_event_device(event: i64) -> i64;
+    fn AMotionEvent_getAction as ndk_c_motion_action(event: i64) -> i64;
+    fn AMotionEvent_getPointerCount as ndk_c_motion_pointer_count(event: i64) -> i64;
+    fn AMotionEvent_getPointerId as ndk_c_motion_pointer_id(event: i64, index: i64) -> i64;
+    fn AMotionEvent_getX as ndk_c_motion_x(event: i64, index: i64) -> f32;
+    fn AMotionEvent_getY as ndk_c_motion_y(event: i64, index: i64) -> f32;
+    fn AMotionEvent_getPressure as ndk_c_motion_pressure(event: i64, index: i64) -> f32;
+    fn AMotionEvent_getEventTime as ndk_c_motion_time(event: i64) -> i64;
+    fn AKeyEvent_getAction as ndk_c_key_action(event: i64) -> i64;
+    fn AKeyEvent_getKeyCode as ndk_c_key_code(event: i64) -> i64;
+    fn AKeyEvent_getMetaState as ndk_c_key_meta(event: i64) -> i64;
+    fn AKeyEvent_getRepeatCount as ndk_c_key_repeat(event: i64) -> i64;
+    fn ANativeWindow_acquire as ndk_c_window_acquire(window: i64) -> void;
+    fn ANativeWindow_release as ndk_c_window_release(window: i64) -> void;
+    fn ANativeWindow_getWidth as ndk_c_window_width(window: i64) -> i64;
+    fn ANativeWindow_getHeight as ndk_c_window_height(window: i64) -> i64;
+    fn ANativeWindow_getFormat as ndk_c_window_format(window: i64) -> i64;
+    fn ANativeWindow_setBuffersGeometry as ndk_c_window_set_geometry(window: i64, w: i64, h: i64, format: i64) -> i64;
+    fn ANativeWindow_lock as ndk_c_window_lock(window: i64, out_buffer: i64, in_out_dirty: i64) -> i64;
+    fn ANativeWindow_unlockAndPost as ndk_c_window_unlock_and_post(window: i64) -> i64;
+    fn AAssetManager_fromJava as ndk_c_asset_manager_from_java(env: i64, jmgr: i64) -> i64;
+    fn AAssetManager_open as ndk_c_asset_open(mgr: i64, name: str, mode: i64) -> i64;
+    fn AAsset_read as ndk_c_asset_read(asset: i64, buf: i64, count: i64) -> i64;
+    fn AAsset_getLength64 as ndk_c_asset_length(asset: i64) -> i64;
+    fn AAsset_close as ndk_c_asset_close(asset: i64) -> void;
+    fn ANativeActivity_finish as ndk_c_activity_finish(activity: i64) -> void;
+    fn ANativeActivity_setWindowFlags as ndk_c_activity_set_window_flags(activity: i64, add: i64, remove: i64) -> void;
+}
+
+// SAFETY: __android_log_write(int prio, const char* tag, const char* text);
+// the variadic __android_log_print is not used: Fides formats the text.
+extern "C" link "log" {
+    fn __android_log_write as ndk_c_log_write(prio: i64, tag: str, text: str) -> i64;
+}
+
+// ─── Constants ─────────────────────────────────────────────────────────
+
+// <android/log.h>
+pub const ANDROID_LOG_UNKNOWN: i64 = 0;
+pub const ANDROID_LOG_DEFAULT: i64 = 1;
+pub const ANDROID_LOG_VERBOSE: i64 = 2;
+pub const ANDROID_LOG_DEBUG: i64 = 3;
+pub const ANDROID_LOG_INFO: i64 = 4;
+pub const ANDROID_LOG_WARN: i64 = 5;
+pub const ANDROID_LOG_ERROR: i64 = 6;
+pub const ANDROID_LOG_FATAL: i64 = 7;
+pub const ANDROID_LOG_SILENT: i64 = 8;
+/// LOGGER_ENTRY_MAX_PAYLOAD: one log entry's tag + text + NULs at most.
+pub const NDK_LOG_MAX_PAYLOAD: i64 = 4068;
+
+// <android/looper.h>
+pub const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: i64 = 1;
+pub const ALOOPER_POLL_WAKE: i64 = -1;
+pub const ALOOPER_POLL_CALLBACK: i64 = -2;
+pub const ALOOPER_POLL_TIMEOUT: i64 = -3;
+pub const ALOOPER_POLL_ERROR: i64 = -4;
+pub const ALOOPER_EVENT_INPUT: i64 = 1;
+pub const ALOOPER_EVENT_OUTPUT: i64 = 2;
+pub const ALOOPER_EVENT_ERROR: i64 = 4;
+pub const ALOOPER_EVENT_HANGUP: i64 = 8;
+
+// android_native_app_glue: looper idents and commands
+pub const LOOPER_ID_MAIN: i64 = 1;
+pub const LOOPER_ID_INPUT: i64 = 2;
+pub const LOOPER_ID_USER: i64 = 3;
+pub const APP_CMD_INPUT_CHANGED: i64 = 0;
+pub const APP_CMD_INIT_WINDOW: i64 = 1;
+pub const APP_CMD_TERM_WINDOW: i64 = 2;
+pub const APP_CMD_WINDOW_RESIZED: i64 = 3;
+pub const APP_CMD_WINDOW_REDRAW_NEEDED: i64 = 4;
+pub const APP_CMD_CONTENT_RECT_CHANGED: i64 = 5;
+pub const APP_CMD_GAINED_FOCUS: i64 = 6;
+pub const APP_CMD_LOST_FOCUS: i64 = 7;
+pub const APP_CMD_CONFIG_CHANGED: i64 = 8;
+pub const APP_CMD_LOW_MEMORY: i64 = 9;
+pub const APP_CMD_START: i64 = 10;
+pub const APP_CMD_RESUME: i64 = 11;
+pub const APP_CMD_SAVE_STATE: i64 = 12;
+pub const APP_CMD_PAUSE: i64 = 13;
+pub const APP_CMD_STOP: i64 = 14;
+pub const APP_CMD_DESTROY: i64 = 15;
+
+// <android/input.h>
+pub const AINPUT_EVENT_TYPE_KEY: i64 = 1;
+pub const AINPUT_EVENT_TYPE_MOTION: i64 = 2;
+pub const AINPUT_SOURCE_KEYBOARD: i64 = 0x00000101;
+pub const AINPUT_SOURCE_DPAD: i64 = 0x00000201;
+pub const AINPUT_SOURCE_GAMEPAD: i64 = 0x00000401;
+pub const AINPUT_SOURCE_TOUCHSCREEN: i64 = 0x00001002;
+pub const AINPUT_SOURCE_MOUSE: i64 = 0x00002002;
+pub const AINPUT_SOURCE_STYLUS: i64 = 0x00004002;
+pub const AINPUT_SOURCE_JOYSTICK: i64 = 0x01000010;
+pub const AMOTION_EVENT_ACTION_MASK: i64 = 0xff;
+pub const AMOTION_EVENT_ACTION_POINTER_INDEX_MASK: i64 = 0xff00;
+pub const AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT: i64 = 8;
+pub const AMOTION_EVENT_ACTION_DOWN: i64 = 0;
+pub const AMOTION_EVENT_ACTION_UP: i64 = 1;
+pub const AMOTION_EVENT_ACTION_MOVE: i64 = 2;
+pub const AMOTION_EVENT_ACTION_CANCEL: i64 = 3;
+pub const AMOTION_EVENT_ACTION_OUTSIDE: i64 = 4;
+pub const AMOTION_EVENT_ACTION_POINTER_DOWN: i64 = 5;
+pub const AMOTION_EVENT_ACTION_POINTER_UP: i64 = 6;
+pub const AMOTION_EVENT_ACTION_HOVER_MOVE: i64 = 7;
+pub const AMOTION_EVENT_ACTION_SCROLL: i64 = 8;
+pub const AKEY_EVENT_ACTION_DOWN: i64 = 0;
+pub const AKEY_EVENT_ACTION_UP: i64 = 1;
+pub const AKEY_EVENT_ACTION_MULTIPLE: i64 = 2;
+pub const AMETA_ALT_ON: i64 = 0x02;
+pub const AMETA_SHIFT_ON: i64 = 0x01;
+pub const AMETA_CTRL_ON: i64 = 0x1000;
+pub const AKEYCODE_BACK: i64 = 4;
+pub const AKEYCODE_0: i64 = 7;
+pub const AKEYCODE_DPAD_UP: i64 = 19;
+pub const AKEYCODE_DPAD_DOWN: i64 = 20;
+pub const AKEYCODE_DPAD_LEFT: i64 = 21;
+pub const AKEYCODE_DPAD_RIGHT: i64 = 22;
+pub const AKEYCODE_DPAD_CENTER: i64 = 23;
+pub const AKEYCODE_VOLUME_UP: i64 = 24;
+pub const AKEYCODE_VOLUME_DOWN: i64 = 25;
+pub const AKEYCODE_A: i64 = 29;
+pub const AKEYCODE_SPACE: i64 = 62;
+pub const AKEYCODE_ENTER: i64 = 66;
+pub const AKEYCODE_DEL: i64 = 67;
+pub const AKEYCODE_MENU: i64 = 82;
+pub const AKEYCODE_ESCAPE: i64 = 111;
+pub const AKEYCODE_BUTTON_A: i64 = 96;
+pub const AKEYCODE_BUTTON_B: i64 = 97;
+
+// <android/native_window.h>
+pub const WINDOW_FORMAT_RGBA_8888: i64 = 1;
+pub const WINDOW_FORMAT_RGBX_8888: i64 = 2;
+pub const WINDOW_FORMAT_RGB_565: i64 = 4;
+
+// <android/asset_manager.h>
+pub const AASSET_MODE_UNKNOWN: i64 = 0;
+pub const AASSET_MODE_RANDOM: i64 = 1;
+pub const AASSET_MODE_STREAMING: i64 = 2;
+pub const AASSET_MODE_BUFFER: i64 = 3;
+
+// ─── Struct layouts (LP64) ─────────────────────────────────────────────
+
+// ANativeActivity
+pub const NDK_ACTIVITY_CALLBACKS: i64 = 0;
+pub const NDK_ACTIVITY_VM: i64 = 8;
+pub const NDK_ACTIVITY_ENV: i64 = 16;
+pub const NDK_ACTIVITY_CLAZZ: i64 = 24;
+pub const NDK_ACTIVITY_INTERNAL_PATH: i64 = 32;
+pub const NDK_ACTIVITY_EXTERNAL_PATH: i64 = 40;
+pub const NDK_ACTIVITY_SDK_VERSION: i64 = 48;   // int32_t
+pub const NDK_ACTIVITY_INSTANCE: i64 = 56;
+pub const NDK_ACTIVITY_ASSET_MANAGER: i64 = 64;
+pub const NDK_ACTIVITY_OBB_PATH: i64 = 72;
+
+/// The callback slots of ANativeActivityCallbacks, in header order.
+pub fn ndk_callback_names() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("onStart"); v.push("onResume"); v.push("onSaveInstanceState"); v.push("onPause");
+    v.push("onStop"); v.push("onDestroy"); v.push("onWindowFocusChanged");
+    v.push("onNativeWindowCreated"); v.push("onNativeWindowResized");
+    v.push("onNativeWindowRedrawNeeded"); v.push("onNativeWindowDestroyed");
+    v.push("onInputQueueCreated"); v.push("onInputQueueDestroyed");
+    v.push("onContentRectChanged"); v.push("onConfigurationChanged"); v.push("onLowMemory");
+    return v;
+}
+
+/// Byte offset of a callback in ANativeActivityCallbacks, -1 if unknown.
+pub fn ndk_callback_offset(name: str) -> i64 {
+    val v: Vec<str> = ndk_callback_names();
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == name { return i * 8; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The glue command an ANativeActivity callback turns into (-1: none;
+/// focus and window callbacks depend on their argument).
+pub fn ndk_callback_cmd(name: str, arg: i64) -> i64 {
+    if name == "onStart" { return APP_CMD_START; }
+    if name == "onResume" { return APP_CMD_RESUME; }
+    if name == "onSaveInstanceState" { return APP_CMD_SAVE_STATE; }
+    if name == "onPause" { return APP_CMD_PAUSE; }
+    if name == "onStop" { return APP_CMD_STOP; }
+    if name == "onDestroy" { return APP_CMD_DESTROY; }
+    if name == "onWindowFocusChanged" { return if arg != 0 { APP_CMD_GAINED_FOCUS } else { APP_CMD_LOST_FOCUS }; }
+    if name == "onNativeWindowCreated" { return APP_CMD_INIT_WINDOW; }
+    if name == "onNativeWindowDestroyed" { return APP_CMD_TERM_WINDOW; }
+    if name == "onNativeWindowResized" { return APP_CMD_WINDOW_RESIZED; }
+    if name == "onNativeWindowRedrawNeeded" { return APP_CMD_WINDOW_REDRAW_NEEDED; }
+    if name == "onInputQueueCreated" || name == "onInputQueueDestroyed" { return APP_CMD_INPUT_CHANGED; }
+    if name == "onContentRectChanged" { return APP_CMD_CONTENT_RECT_CHANGED; }
+    if name == "onConfigurationChanged" { return APP_CMD_CONFIG_CHANGED; }
+    if name == "onLowMemory" { return APP_CMD_LOW_MEMORY; }
+    return -1;
+}
+
+/// Name of a glue command.
+pub fn ndk_cmd_name(cmd: i64) -> str {
+    val n: Vec<str> = str_split("INPUT_CHANGED,INIT_WINDOW,TERM_WINDOW,WINDOW_RESIZED,WINDOW_REDRAW_NEEDED,CONTENT_RECT_CHANGED,GAINED_FOCUS,LOST_FOCUS,CONFIG_CHANGED,LOW_MEMORY,START,RESUME,SAVE_STATE,PAUSE,STOP,DESTROY", ",");
+    if cmd < 0 || cmd >= n.len() { return "?"; }
+    return n.get(cmd);
+}
+
+/// ANativeWindow_Buffer: width, height, stride (pixels), format, bits.
+pub struct NdkWindowBuffer {
+    pub width: i64,
+    pub height: i64,
+    pub stride: i64,
+    pub format: i64,
+    pub bits: i64,
+}
+
+fn ndk_rd32(addr: i64) -> i64 {
+    var v: i64 = 0;
+    // SAFETY: addr is inside a struct the NDK filled in.
+    unsafe {
+        val p: *mut u32 = addr;
+        v = *p;
+    }
+    return v;
+}
+
+fn ndk_rd64(addr: i64) -> i64 {
+    var v: i64 = 0;
+    // SAFETY: addr is inside a struct the NDK filled in.
+    unsafe {
+        val p: *mut i64 = addr;
+        v = *p;
+    }
+    return v;
+}
+
+/// Read an ANativeWindow_Buffer at `addr` (after ANativeWindow_lock).
+pub fn ndk_read_window_buffer(addr: i64) -> NdkWindowBuffer {
+    return NdkWindowBuffer {
+        width: ndk_rd32(addr), height: ndk_rd32(addr + 4), stride: ndk_rd32(addr + 8),
+        format: ndk_rd32(addr + 12), bits: ndk_rd64(addr + 16),
+    };
+}
+
+/// The SDK version an ANativeActivity reports.
+pub fn ndk_activity_sdk_version(activity: i64) -> i64 { return ndk_rd32(activity + NDK_ACTIVITY_SDK_VERSION); }
+
+/// The AAssetManager* of an ANativeActivity.
+pub fn ndk_activity_asset_manager(activity: i64) -> i64 { return ndk_rd64(activity + NDK_ACTIVITY_ASSET_MANAGER); }
+
+// ─── Pixels ────────────────────────────────────────────────────────────
+
+/// Bytes per pixel of a window format (0 if unknown).
+pub fn ndk_format_bpp(format: i64) -> i64 {
+    if format == WINDOW_FORMAT_RGBA_8888 || format == WINDOW_FORMAT_RGBX_8888 { return 4; }
+    if format == WINDOW_FORMAT_RGB_565 { return 2; }
+    return 0;
+}
+
+/// One pixel as the word the buffer holds (little-endian memory: R is
+/// the first byte of RGBA_8888; RGB_565 is R in the top 5 bits).
+pub fn ndk_pack_pixel(format: i64, r: i64, g: i64, b: i64, a: i64) -> i64 {
+    if format == WINDOW_FORMAT_RGBA_8888 { return (a << 24) | (b << 16) | (g << 8) | r; }
+    if format == WINDOW_FORMAT_RGBX_8888 { return (255 << 24) | (b << 16) | (g << 8) | r; }
+    if format == WINDOW_FORMAT_RGB_565 { return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3); }
+    return 0;
+}
+
+/// Fill a rectangle of a pixel buffer held as words (one per pixel,
+/// `stride` per row), clipped to width x height.
+pub fn ndk_fill_rect(pixels: &mut Vec<i64>, width: i64, height: i64, stride: i64, x: i64, y: i64, w: i64, h: i64, px: i64) {
+    var y0: i64 = if y < 0 { 0 } else { y };
+    var y1: i64 = if y + h > height { height } else { y + h };
+    val x0: i64 = if x < 0 { 0 } else { x };
+    val x1: i64 = if x + w > width { width } else { x + w };
+    while y0 < y1 {
+        var xi: i64 = x0;
+        while xi < x1 {
+            pixels.set(y0 * stride + xi, px);
+            xi = xi + 1;
+        }
+        y0 = y0 + 1;
+    }
+}
+
+// ─── Input events ──────────────────────────────────────────────────────
+
+/// An input event as the accessors report it. `kind` is 0 (no event),
+/// AINPUT_EVENT_TYPE_KEY or AINPUT_EVENT_TYPE_MOTION.
+pub struct NdkInput {
+    pub kind: i64,
+    pub source: i64,
+    pub action: i64,        // the raw action (motion: with pointer index bits)
+    pub key_code: i64,
+    pub meta: i64,
+    pub ids: Vec<i64>,      // motion: pointer ids by index
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+}
+
+pub fn ndk_no_input() -> NdkInput {
+    return NdkInput { kind: 0, source: 0, action: 0, key_code: 0, meta: 0, ids: Vec::new(), xs: Vec::new(), ys: Vec::new() };
+}
+
+pub fn ndk_key_input(action: i64, code: i64, meta: i64) -> NdkInput {
+    var e: NdkInput = ndk_no_input();
+    e.kind = AINPUT_EVENT_TYPE_KEY;
+    e.source = AINPUT_SOURCE_KEYBOARD;
+    e.action = action;
+    e.key_code = code;
+    e.meta = meta;
+    return e;
+}
+
+/// The masked action of a motion event (AMOTION_EVENT_ACTION_*).
+pub fn ndk_motion_action(action: i64) -> i64 { return action & AMOTION_EVENT_ACTION_MASK; }
+
+/// The pointer index of a POINTER_DOWN / POINTER_UP action.
+pub fn ndk_motion_pointer_index(action: i64) -> i64 {
+    return (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+}
+
+/// The raw action for a masked action and a pointer index.
+pub fn ndk_motion_make_action(masked: i64, index: i64) -> i64 {
+    return masked | (index << AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+}
+
+/// Does `source` include class bits `cls` (e.g. AINPUT_SOURCE_TOUCHSCREEN)?
+pub fn ndk_source_is(source: i64, cls: i64) -> bool { return (source & cls) == cls; }
+
+/// Active touch pointers by id.
+pub struct NdkPointers {
+    pub ids: Vec<i64>,
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+    pub downs: i64,         // pointers that went down so far
+    pub ups: i64,
+}
+
+pub fn ndk_pointers_new() -> NdkPointers {
+    return NdkPointers { ids: Vec::new(), xs: Vec::new(), ys: Vec::new(), downs: 0, ups: 0 };
+}
+
+fn ndk_ptr_find(p: &NdkPointers, id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < p.ids.len() {
+        if p.ids.get(i) == id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn ndk_ptr_remove(p: &mut NdkPointers, id: i64) {
+    val k: i64 = ndk_ptr_find(p, id);
+    if k < 0 { return; }
+    p.ids.remove(k);
+    p.xs.remove(k);
+    p.ys.remove(k);
+    p.ups = p.ups + 1;
+}
+
+fn ndk_ptr_set(p: &mut NdkPointers, id: i64, x: f64, y: f64) {
+    val k: i64 = ndk_ptr_find(p, id);
+    if k < 0 {
+        p.ids.push(id);
+        p.xs.push(x);
+        p.ys.push(y);
+        p.downs = p.downs + 1;
+    } else {
+        p.xs.set(k, x);
+        p.ys.set(k, y);
+    }
+}
+
+/// Update the tracker with a motion event (the AMotionEvent semantics:
+/// DOWN/POINTER_DOWN add the indexed pointer, MOVE updates all,
+/// UP/POINTER_UP remove the indexed pointer, CANCEL removes all).
+pub fn ndk_pointers_update(p: &mut NdkPointers, e: &NdkInput) {
+    val a: i64 = ndk_motion_action(e.action);
+    val idx: i64 = ndk_motion_pointer_index(e.action);
+    if a == AMOTION_EVENT_ACTION_CANCEL {
+        while p.ids.len() > 0 { ndk_ptr_remove(p, p.ids.get(0)); }
+        return;
+    }
+    if a == AMOTION_EVENT_ACTION_DOWN || a == AMOTION_EVENT_ACTION_POINTER_DOWN {
+        if idx < e.ids.len() { ndk_ptr_set(p, e.ids.get(idx), e.xs.get(idx), e.ys.get(idx)); }
+        return;
+    }
+    if a == AMOTION_EVENT_ACTION_MOVE {
+        var i: i64 = 0;
+        while i < e.ids.len() {
+            ndk_ptr_set(p, e.ids.get(i), e.xs.get(i), e.ys.get(i));
+            i = i + 1;
+        }
+        return;
+    }
+    if a == AMOTION_EVENT_ACTION_UP || a == AMOTION_EVENT_ACTION_POINTER_UP {
+        if idx < e.ids.len() { ndk_ptr_remove(p, e.ids.get(idx)); }
+    }
+}
+
+// ─── App state (android_native_app_glue semantics) ─────────────────────
+
+pub struct NdkApp {
+    pub started: bool,
+    pub resumed: bool,
+    pub has_window: bool,
+    pub focused: bool,
+    pub destroy_requested: bool,
+    pub width: i64,
+    pub height: i64,
+    pub frames: i64,
+    pub state_saves: i64,
+    pub low_memory: i64,
+    pub back_pressed: i64,
+    pub pointers: NdkPointers,
+    pub log: Vec<str>,
+}
+
+pub fn ndk_app_new() -> NdkApp {
+    return NdkApp {
+        started: false, resumed: false, has_window: false, focused: false, destroy_requested: false,
+        width: 0, height: 0, frames: 0, state_saves: 0, low_memory: 0, back_pressed: 0,
+        pointers: ndk_pointers_new(), log: Vec::new(),
+    };
+}
+
+/// Should the loop draw frames (and so poll without blocking)?
+pub fn ndk_app_animating(app: &NdkApp) -> bool {
+    return app.resumed && app.has_window && app.focused && !app.destroy_requested;
+}
+
+/// The timeout for ALooper_pollOnce: 0 while animating, -1 (block) else.
+pub fn ndk_poll_timeout(app: &NdkApp) -> i64 {
+    if ndk_app_animating(app) { return 0; }
+    return -1;
+}
+
+/// Apply a glue command. `w`/`h` are the window size for INIT_WINDOW and
+/// WINDOW_RESIZED (ANativeWindow_getWidth/Height on a device).
+pub fn ndk_app_handle_cmd(app: &mut NdkApp, cmd: i64, w: i64, h: i64) {
+    app.log.push(ndk_cmd_name(cmd));
+    if cmd == APP_CMD_START { app.started = true; }
+    else if cmd == APP_CMD_RESUME { app.resumed = true; }
+    else if cmd == APP_CMD_PAUSE { app.resumed = false; }
+    else if cmd == APP_CMD_STOP { app.started = false; }
+    else if cmd == APP_CMD_INIT_WINDOW { app.has_window = true; app.width = w; app.height = h; }
+    else if cmd == APP_CMD_WINDOW_RESIZED { app.width = w; app.height = h; }
+    else if cmd == APP_CMD_TERM_WINDOW { app.has_window = false; }
+    else if cmd == APP_CMD_GAINED_FOCUS { app.focused = true; }
+    else if cmd == APP_CMD_LOST_FOCUS { app.focused = false; }
+    else if cmd == APP_CMD_SAVE_STATE { app.state_saves = app.state_saves + 1; }
+    else if cmd == APP_CMD_LOW_MEMORY { app.low_memory = app.low_memory + 1; }
+    else if cmd == APP_CMD_DESTROY { app.destroy_requested = true; }
+}
+
+/// Handle an input event: true when consumed (passed to
+/// AInputQueue_finishEvent as `handled`). BACK is consumed and counted.
+pub fn ndk_app_handle_input(app: &mut NdkApp, e: &NdkInput) -> bool {
+    if e.kind == AINPUT_EVENT_TYPE_MOTION {
+        ndk_pointers_update(&mut app.pointers, e);
+        return true;
+    }
+    if e.kind == AINPUT_EVENT_TYPE_KEY {
+        if e.key_code == AKEYCODE_BACK && e.action == AKEY_EVENT_ACTION_UP {
+            app.back_pressed = app.back_pressed + 1;
+            return true;
+        }
+        return e.key_code == AKEYCODE_BACK;
+    }
+    return false;
+}
+
+// ─── The event loop ────────────────────────────────────────────────────
+
+/// What the loop needs from the platform (see the header).
+pub struct NdkLoopSeam {
+    pub poll: fn(i64) -> i64,            // timeout ms -> ident or ALOOPER_POLL_*
+    pub read_cmd: fn() -> i64,           // the next glue command
+    pub window_w: fn() -> i64,
+    pub window_h: fn() -> i64,
+    pub read_input: fn(&mut NdkInput) -> void,  // fills the next event; kind 0: queue empty
+    pub draw: fn(i64, i64, i64) -> void, // frame number, width, height
+}
+
+/// Run the loop until DESTROY (or `max_polls` polls when >= 0): what
+/// android_main does with the glue.
+pub fn ndk_run_loop(app: &mut NdkApp, seam: NdkLoopSeam, max_polls: i64) -> i64 {
+    val poll: fn(i64) -> i64 = seam.poll;
+    val read_cmd: fn() -> i64 = seam.read_cmd;
+    val ww: fn() -> i64 = seam.window_w;
+    val wh: fn() -> i64 = seam.window_h;
+    val read_input: fn(&mut NdkInput) -> void = seam.read_input;
+    val draw: fn(i64, i64, i64) -> void = seam.draw;
+    var polls: i64 = 0;
+    while !app.destroy_requested && (max_polls < 0 || polls < max_polls) {
+        val ident: i64 = poll(ndk_poll_timeout(app));
+        polls = polls + 1;
+        if ident == LOOPER_ID_MAIN {
+            val cmd: i64 = read_cmd();
+            ndk_app_handle_cmd(app, cmd, ww(), wh());
+        } else if ident == LOOPER_ID_INPUT {
+            var e: NdkInput = ndk_no_input();
+            read_input(&mut e);
+            while e.kind != 0 {
+                ndk_app_handle_input(app, &e);
+                e = ndk_no_input();
+                read_input(&mut e);
+            }
+        } else if ident == ALOOPER_POLL_ERROR {
+            return ALOOPER_POLL_ERROR;
+        }
+        if ndk_app_animating(app) {
+            app.frames = app.frames + 1;
+            draw(app.frames, app.width, app.height);
+        }
+    }
+    return polls;
+}
+
+// ─── Logging ───────────────────────────────────────────────────────────
+
+/// The priority letter logcat prints (V D I W E F; '?' otherwise).
+pub fn ndk_log_letter(prio: i64) -> str {
+    if prio == ANDROID_LOG_VERBOSE { return "V"; }
+    if prio == ANDROID_LOG_DEBUG { return "D"; }
+    if prio == ANDROID_LOG_INFO { return "I"; }
+    if prio == ANDROID_LOG_WARN { return "W"; }
+    if prio == ANDROID_LOG_ERROR { return "E"; }
+    if prio == ANDROID_LOG_FATAL { return "F"; }
+    return "?";
+}
+
+/// A message as `logcat -v brief` shows it: "I/tag: text".
+pub fn ndk_log_line(prio: i64, tag: str, text: str) -> str {
+    return ndk_log_letter(prio) + "/" + tag + ": " + text;
+}
+
+/// Split a message so each entry (prio byte, tag, NUL, text, NUL) fits
+/// the logger payload; cuts fall on a newline when there is one in the
+/// chunk, and never inside a UTF-8 sequence.
+pub fn ndk_log_chunks(tag: str, text: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    val room: i64 = NDK_LOG_MAX_PAYLOAD - str_len(tag) - 3;
+    val n: i64 = str_len(text);
+    var start: i64 = 0;
+    if n == 0 { out.push(""); return out; }
+    while start < n {
+        var end: i64 = start + room;
+        if end >= n {
+            out.push(str_slice(text, start, n));
+            return out;
+        }
+        var cut: i64 = end;
+        while cut > start && str_byte_at(text, cut - 1) != 10 { cut = cut - 1; }
+        if cut == start {
+            cut = end;
+            while cut > start && (str_byte_at(text, cut) & 0xC0) == 0x80 { cut = cut - 1; }
+        }
+        out.push(str_slice(text, start, cut));
+        start = cut;
+    }
+    return out;
+}
+
+/// Write a message to logcat (device builds), split as ndk_log_chunks.
+pub fn ndk_log(prio: i64, tag: str, text: str) {
+    val chunks: Vec<str> = ndk_log_chunks(tag, text);
+    var i: i64 = 0;
+    while i < chunks.len() {
+        // SAFETY: liblog copies both NUL-terminated strings.
+        unsafe { ndk_c_log_write(prio, tag, chunks.get(i)); }
+        i = i + 1;
+    }
+}
+
+/// Read a whole asset through AAssetManager (device builds): the bytes,
+/// empty when it does not open.
+pub fn ndk_asset_read_all(mgr: i64, name: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    // SAFETY: mgr is the activity's AAssetManager; buf holds `len` bytes.
+    unsafe {
+        val a: i64 = ndk_c_asset_open(mgr, name, AASSET_MODE_BUFFER);
+        if a != 0 {
+            val len: i64 = ndk_c_asset_length(a);
+            val buf: i64 = p_malloc(len + 1);
+            val got: i64 = ndk_c_asset_read(a, buf, len);
+            var i: i64 = 0;
+            while i < got {
+                val p: *mut u8 = buf + i;
+                out.push(*p);
+                i = i + 1;
+            }
+            p_free(buf);
+            ndk_c_asset_close(a);
+        }
+    }
+    return out;
+}

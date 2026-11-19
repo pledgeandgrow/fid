@@ -1,0 +1,150 @@
+// stdlib/tariff: flat, TOU, tiered, dynamic, demand charges, net metering and net billing
+// One week of hourly data from Monday: 1 kWh an hour, 2 kWh an hour from
+// 16:00 to 21:00, nothing imported and 1.5 kWh exported an hour from 10:00
+// to 14:00. Totals: 175 kWh imported, 42 kWh exported, 50 kWh on-peak
+// (weekdays 16-21), peak demand 2 kW. Every amount is hand-checkable, e.g.
+// TOU 50 x 0.40 + 125 x 0.12 = 35.00; tiers 100 x 0.10 + 50 x 0.15 +
+// 25 x 0.25 = 23.75; net metering off-peak (125 - 42) x 0.12 = 9.96. The
+// dynamic-price totals (21.49 import, 2.226 export) were checked with
+// Python's decimal module. A home importing 10 kWh and exporting 30 kWh under
+// net metering gets its 20 kWh excess credited at 0.04.
+// Expected output:
+// imported 175000 Wh exported 42000 Wh, interval 100 is Friday 04:00
+// Flat
+//   fixed charge: 1 bill = 10.00
+//   energy: 175 kWh x 0.15 = 26.25
+//   total: 36.25
+// TOU
+//   fixed charge: 1 bill = 10.00
+//   off-peak: 125 kWh x 0.12 = 15.00
+//   on-peak: 50 kWh x 0.40 = 20.00
+//   demand charge (on-peak): 2 kW x 12.50 = 25.00
+//   total: 70.00
+// Tiered
+//   tier 1: 100 kWh x 0.10 = 10.00
+//   tier 2: 50 kWh x 0.15 = 7.50
+//   tier 3: 25 kWh x 0.25 = 6.25
+//   demand charge: 2 kW x 8.00 = 16.00
+//   total: 39.75
+// NEM TOU
+//   fixed charge: 1 bill = 10.00
+//   off-peak: 83 kWh x 0.12 = 9.96
+//   on-peak: 50 kWh x 0.40 = 20.00
+//   total: 39.96
+// NEM excess
+//   excess generation credit: 20 kWh x -0.04 = -0.80
+//   total: -0.80
+// average rate per imported kWh: -0.08000
+// Net billing
+//   fixed charge: 1 bill = 10.00
+//   energy: 175 kWh x 0.15 = 26.25
+//   export credit: 42 kWh x -0.05 = -2.10
+//   total: 34.15
+// Dynamic
+//   energy (dynamic prices): 175 kWh = 21.49
+//   export credit (dynamic prices): 42 kWh = -2.23
+//   total: 19.26
+// 15-minute demand: peak 3.2 kW, charge 32.00
+use tariff;
+use decimal;
+use string;
+
+fn week() -> LoadProfile {
+    var p = tariff_profile(0, 60);
+    var d: i64 = 0;
+    while d < 7 {
+        var h: i64 = 0;
+        while h < 24 {
+            if h >= 10 && h <= 13 {
+                LoadProfile_add(&mut p, 0, 1500);
+            } else if h >= 16 && h <= 20 {
+                LoadProfile_add(&mut p, 2000, 0);
+            } else {
+                LoadProfile_add(&mut p, 1000, 0);
+            }
+            h = h + 1;
+        }
+        d = d + 1;
+    }
+    return p;
+}
+
+fn price_text(cents_thousandths: i64) -> str {
+    // a price given in 1/1000 of a currency unit as "0.xyz"
+    var s: str = int_to_str(cents_thousandths);
+    while str_len(s) < 3 {
+        s = "0" + s;
+    }
+    return "0." + s;
+}
+
+fn main() {
+    val p = week();
+    val days: str = "MonTueWedThuFriSatSun";
+    val dw = tariff_dow(&p, 100);
+    var hh: str = int_to_str(tariff_hour(&p, 100));
+    if str_len(hh) < 2 {
+        hh = "0" + hh;
+    }
+    val b0 = tariff_bill(&tariff_new("x", TARIFF_FLAT, "0", "0.15"), &p);
+    println("imported " + int_to_str(b0.import_wh) + " Wh exported " + int_to_str(b0.export_wh) + " Wh, interval 100 is " + str_slice(days, dw * 3, dw * 3 + 3) + "day " + hh + ":00");
+
+    val flat = tariff_new("Flat", TARIFF_FLAT, "10.00", "0.15");
+    println(tariff_bill_to_str(&tariff_bill(&flat, &p)));
+
+    var tou = tariff_new("TOU", TARIFF_TOU, "10.00", "0.12");
+    tariff_add_tou(&mut tou, "on-peak", TARIFF_WEEKDAYS, 16, 21, "0.40");
+    tariff_set_demand(&mut tou, "12.50", "on-peak");
+    println(tariff_bill_to_str(&tariff_bill(&tou, &p)));
+
+    var tier = tariff_new("Tiered", TARIFF_TIERED, "0", "0");
+    tariff_add_tier(&mut tier, 100, "0.10");
+    tariff_add_tier(&mut tier, 150, "0.15");
+    tariff_add_tier(&mut tier, -1, "0.25");
+    tariff_set_demand(&mut tier, "8.00", "");
+    println(tariff_bill_to_str(&tariff_bill(&tier, &p)));
+
+    var nem = tariff_new("NEM TOU", TARIFF_TOU, "10.00", "0.12");
+    tariff_add_tou(&mut nem, "on-peak", TARIFF_WEEKDAYS, 16, 21, "0.40");
+    tariff_set_export(&mut nem, TARIFF_NET_METERING, "0", "0.04");
+    println(tariff_bill_to_str(&tariff_bill(&nem, &p)));
+
+    // a home that exports more than it imports: 20 kWh net excess
+    var small = tariff_profile(0, 60);
+    LoadProfile_add(&mut small, 0, 30000);
+    LoadProfile_add(&mut small, 10000, 0);
+    var nx = tariff_new("NEM excess", TARIFF_FLAT, "0", "0.15");
+    tariff_set_export(&mut nx, TARIFF_NET_METERING, "0", "0.04");
+    val bx = tariff_bill(&nx, &small);
+    println(tariff_bill_to_str(&bx));
+    println("average rate per imported kWh: " + dec_to_str(tariff_average_rate(&bx)));
+
+    var nb = tariff_new("Net billing", TARIFF_FLAT, "10.00", "0.15");
+    tariff_set_export(&mut nb, TARIFF_NET_BILLING, "0.05", "0");
+    println(tariff_bill_to_str(&tariff_bill(&nb, &p)));
+
+    var dy = tariff_new("Dynamic", TARIFF_DYNAMIC, "0", "0");
+    tariff_set_export(&mut dy, TARIFF_NET_BILLING, "0", "0");
+    var i: i64 = 0;
+    while i < 168 {
+        val h: i64 = i % 24;
+        var milli: i64 = 50 + 10 * (h % 6);
+        if h >= 17 && h <= 19 {
+            milli = milli + 200;
+        }
+        tariff_add_dynamic_price(&mut dy, price_text(milli));
+        tariff_add_dynamic_export_price(&mut dy, "0.0" + int_to_str(30 + 2 * h));
+        i = i + 1;
+    }
+    println(tariff_bill_to_str(&tariff_bill(&dy, &p)));
+
+    // 15-minute data: 800 Wh in one quarter hour is a 3.2 kW peak
+    var q = tariff_profile(2, 15);
+    LoadProfile_add(&mut q, 200, 0);
+    LoadProfile_add(&mut q, 800, 0);
+    LoadProfile_add(&mut q, 300, 0);
+    var dq = tariff_new("Demand", TARIFF_FLAT, "0", "0");
+    tariff_set_demand(&mut dq, "10.00", "");
+    val bq = tariff_bill(&dq, &q);
+    println("15-minute demand: peak " + dec_to_str(dec_normalize(bq.peak_kw)) + " kW, charge " + dec_to_str(bq.total));
+}

@@ -1,0 +1,130 @@
+// stdlib/power_flow: Newton-Raphson, Gauss-Seidel, fast-decoupled and DC load flow
+// System: the five-bus example of Glover, Sarma & Overbye, "Power System
+// Analysis and Design", Example 6.9 / Tables 6.1-6.3 (100 MVA base). The
+// textbook's solution (Table 6.6): V2 = 0.834 at -22.407 deg, V3 = 1.050 at
+// -0.597, V4 = 1.019 at -2.834, V5 = 0.974 at -4.548, slack P1 = 3.948 pu,
+// Q1 = 1.143 pu, QG3 = 3.375 pu. The Q-limit case (QG3 held at 2.8 pu) and the
+// tap / phase-shifter case (1-5 tap 0.975, 3-4 shift -3 deg) were checked
+// with an independent numpy Newton solver; DC angles with numpy.linalg.solve.
+// Expected output:
+// nr converged=true iterations=6
+// bus 1 V=1.0000 ang=0.000
+// bus 2 V=0.8338 ang=-22.406
+// bus 3 V=1.0500 ang=-0.597
+// bus 4 V=1.0193 ang=-2.834
+// bus 5 V=0.9743 ang=-4.548
+// slack gen P=3.9484 Q=1.1428, bus 3 gen Q=3.3748
+// losses P=0.3484 Q=1.3176
+// line 2-4 from P=-2.9184 Q=-1.3911 to P=3.0368 Q=1.2154 loss=0.1184
+// gauss-seidel converged=true, max |V| difference from NR < 1e-5: true
+// fast decoupled converged=true, max |V| difference from NR < 1e-6: true
+// dc angles: 0.000 -18.695 0.524 -1.997 -4.125
+// dc flows: 3.6000 4.4000 -2.9143 -5.0857 1.4857
+// q limit: bus 3 held=1 V=0.7777 1.0006 0.9743 0.9464 slack Q=2.5349
+// tap+shift: V2=0.8570 ang3=-3.273 slack P=3.9257 Q=1.5070 Q3=2.2621
+use power_flow;
+use math;
+use complex;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn glover(tap15: f64, shift34: f64) -> PfNetwork {
+    var net = pf_network(100.0);
+    pf_add_bus(&mut net, pf_slack_bus(1.0, 0.0));
+    pf_add_bus(&mut net, pf_pq_bus(8.0, 2.8));
+    pf_add_bus(&mut net, pf_pv_bus(1.05, 5.2, 0.8, 0.4));
+    pf_add_bus(&mut net, pf_pq_bus(0.0, 0.0));
+    pf_add_bus(&mut net, pf_pq_bus(0.0, 0.0));
+    pf_add_transformer(&mut net, 0, 4, 0.0015, 0.02, tap15, 0.0);
+    pf_add_transformer(&mut net, 2, 3, 0.00075, 0.01, 1.0, shift34);
+    pf_add_line(&mut net, 1, 3, 0.009, 0.1, 1.72);
+    pf_add_line(&mut net, 1, 4, 0.0045, 0.05, 0.88);
+    pf_add_line(&mut net, 3, 4, 0.00225, 0.025, 0.44);
+    return net;
+}
+
+fn vdiff(a: &PfResult, b: &PfResult) -> f64 {
+    var e: f64 = 0.0;
+    var i: i64 = 0;
+    while i < a.v.len() {
+        val za = complex_from_polar(a.v.get(i), a.theta.get(i));
+        val zb = complex_from_polar(b.v.get(i), b.theta.get(i));
+        e = math_max_f64(e, complex_abs(complex_sub(za, zb)));
+        i = i + 1;
+    }
+    return e;
+}
+
+fn main() {
+    val net = glover(1.0, 0.0);
+    val r = pf_newton(&net, 0.0000000001, 20);
+    println("nr converged=" + bool_to_str(r.converged) + " iterations=" + int_to_str(r.iterations));
+    var i: i64 = 0;
+    while i < 5 {
+        println("bus " + int_to_str(i + 1) + " V=" + fx(r.v.get(i), 4) + " ang=" + fx(pf_deg(r.theta.get(i)), 3));
+        i = i + 1;
+    }
+    val g1 = pf_generation(&net, &r, 0);
+    val g3 = pf_generation(&net, &r, 2);
+    println("slack gen P=" + fx(g1.re, 4) + " Q=" + fx(g1.im, 4) + ", bus 3 gen Q=" + fx(g3.im, 4));
+    val loss = pf_total_losses(&r);
+    println("losses P=" + fx(loss.re, 4) + " Q=" + fx(loss.im, 4));
+    val f24 = pf_branch_flow(&net, &r, 2);
+    println("line 2-4 from P=" + fx(f24.p_from, 4) + " Q=" + fx(f24.q_from, 4) + " to P=" + fx(f24.p_to, 4) + " Q=" + fx(f24.q_to, 4) + " loss=" + fx(f24.p_loss, 4));
+
+    val gs = pf_gauss_seidel(&net, 0.00000001, 5000, 1.6);
+    println("gauss-seidel converged=" + bool_to_str(gs.converged) + ", max |V| difference from NR < 1e-5: " + bool_to_str(vdiff(&gs, &r) < 0.00001));
+    val fd = pf_fast_decoupled(&net, 0.0000000001, 100);
+    println("fast decoupled converged=" + bool_to_str(fd.converged) + ", max |V| difference from NR < 1e-6: " + bool_to_str(vdiff(&fd, &r) < 0.000001));
+
+    val th = pf_dc(&net);
+    println("dc angles: " + fx(pf_deg(th.get(0)), 3) + " " + fx(pf_deg(th.get(1)), 3) + " " + fx(pf_deg(th.get(2)), 3) + " " + fx(pf_deg(th.get(3)), 3) + " " + fx(pf_deg(th.get(4)), 3));
+    var fl: str = "";
+    var k: i64 = 0;
+    while k < 5 {
+        if k > 0 {
+            fl = fl + " ";
+        }
+        fl = fl + fx(pf_dc_flow(&net, &th, k), 4);
+        k = k + 1;
+    }
+    println("dc flows: " + fl);
+
+    var lim = glover(1.0, 0.0);
+    pf_set_q_limits(&mut lim, 2, -1.0, 2.8);
+    var held: Vec<i64> = Vec::new();
+    val rq = pf_newton_qlim(&lim, 0.0000000001, 30, &mut held);
+    val gq = pf_generation(&lim, &rq, 0);
+    println("q limit: bus 3 held=" + int_to_str(held.get(2)) + " V=" + fx(rq.v.get(1), 4) + " " + fx(rq.v.get(2), 4) + " " + fx(rq.v.get(3), 4) + " " + fx(rq.v.get(4), 4) + " slack Q=" + fx(gq.im, 4));
+
+    val ts = glover(0.975, 0.0 - 3.0 / 57.29577951308232);
+    val rt = pf_newton(&ts, 0.0000000001, 20);
+    val gt = pf_generation(&ts, &rt, 0);
+    println("tap+shift: V2=" + fx(rt.v.get(1), 4) + " ang3=" + fx(pf_deg(rt.theta.get(2)), 3) + " slack P=" + fx(gt.re, 4) + " Q=" + fx(gt.im, 4) + " Q3=" + fx(rt.q.get(2), 4));
+}

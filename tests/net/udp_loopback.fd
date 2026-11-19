@@ -1,0 +1,108 @@
+// stdlib/udp.fd sockets on the loopback interface (competitive SL2: UDP in
+// every runtime, IPv4 and IPv6). Build it each way and run it; every build
+// prints the same lines:
+//   fid ccompile tests/net/udp_loopback.fd -o ul.exe     (C: Windows, Linux, macOS)
+//   fid emit tests/net/udp_loopback.fd -o ul.exe          (native Windows, pe_ir)
+//   fid emit tests/net/udp_loopback.fd --target x86_64-linux -o ul   (native Linux)
+// The interpreter cannot call the socket API: not for `fid run`.
+// A host without IPv6 on its loopback prints "ipv6 unavailable" instead of
+// the two IPv6 lines.
+//
+// Expected output:
+// ipv4: 1200 bytes from 127.0.0.1 ok
+// ipv4 reply ok
+// timeout: nothing after 50 ms
+// ipv6: 1200 bytes from ::1 ok
+// dual stack: ipv4 sender seen as 127.0.0.1 ok
+// udp loopback ok
+
+use udp;
+
+fn pattern(n: i64, k: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push((i * 13 + k) & 255);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    if a.len() != b.len() { return false; }
+    var i: i64 = 0;
+    while i < a.len() {
+        if a.get(i) != b.get(i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fail(why: str) {
+    println("FAILED: " + why);
+    panic(why);
+}
+
+fn main() {
+    // IPv4: a server on an ephemeral port, a client sending to it
+    val sv: i64 = udp_listen(& udp_addr_loopback(UDP_V4, 0));
+    if sv < 0 { fail("ipv4 bind"); }
+    val port: i64 = udp_local_port(sv);
+    if port <= 0 { fail("ipv4 local port"); }
+    val cl: i64 = udp_open(UDP_V4);
+    if cl < 0 { fail("ipv4 socket"); }
+    val msg: Vec<i64> = pattern(1200, 1);
+    if udp_send(cl, msg, & udp_addr_loopback(UDP_V4, port)) != 1200 { fail("ipv4 send"); }
+    var from: UdpAddr = udp_addr_none();
+    val got: Vec<i64> = udp_recv(sv, 1500, 2000, & mut from);
+    if !same(got, msg) { fail("ipv4 data: " + int_to_str(got.len()) + " bytes"); }
+    println("ipv4: " + int_to_str(got.len()) + " bytes from " + udp_addr_ip_text(& from) + " ok");
+    val reply: Vec<i64> = pattern(300, 2);
+    udp_send(sv, reply, & from);
+    var from2: UdpAddr = udp_addr_none();
+    val back: Vec<i64> = udp_recv(cl, 1500, 2000, & mut from2);
+    if !same(back, reply) || from2.port != port { fail("ipv4 reply"); }
+    println("ipv4 reply ok");
+    val t0: i64 = p_clock_now_ms();
+    val none: Vec<i64> = udp_recv(sv, 1500, 50, & mut from);
+    val waited: i64 = p_clock_now_ms() - t0;
+    if none.len() != 0 || waited < 30 { fail("timeout: " + int_to_str(waited) + " ms"); }
+    println("timeout: nothing after 50 ms");
+    udp_close(cl);
+    udp_close(sv);
+
+    // IPv6 on ::1
+    val sv6: i64 = udp_listen(& udp_addr_loopback(UDP_V6, 0));
+    if sv6 < 0 {
+        println("ipv6 unavailable");
+    } else {
+        val p6: i64 = udp_local_port(sv6);
+        val cl6: i64 = udp_open(UDP_V6);
+        val m6: Vec<i64> = pattern(1200, 3);
+        if udp_send(cl6, m6, & udp_addr_loopback(UDP_V6, p6)) != 1200 { fail("ipv6 send"); }
+        var f6: UdpAddr = udp_addr_none();
+        val g6: Vec<i64> = udp_recv(sv6, 1500, 2000, & mut f6);
+        if !same(g6, m6) || f6.family != UDP_V6 { fail("ipv6 data"); }
+        println("ipv6: " + int_to_str(g6.len()) + " bytes from " + udp_addr_ip_text(& f6) + " ok");
+        udp_close(cl6);
+        udp_close(sv6);
+        // A dual-stack socket on :: takes IPv4 too
+        val ds: i64 = udp_listen(& udp_addr_any(UDP_V6, 0));
+        val pd: i64 = udp_local_port(ds);
+        val c4: i64 = udp_open(UDP_V4);
+        val m4: Vec<i64> = pattern(100, 4);
+        udp_send(c4, m4, & udp_addr_loopback(UDP_V4, pd));
+        var fd: UdpAddr = udp_addr_none();
+        val gd: Vec<i64> = udp_recv(ds, 1500, 2000, & mut fd);
+        if !same(gd, m4) || fd.family != UDP_V4 { fail("dual stack"); }
+        // and answers an IPv4 peer through the v4-mapped form
+        udp_send_on(ds, UDP_V6, m4, & fd);
+        var fb: UdpAddr = udp_addr_none();
+        val gb: Vec<i64> = udp_recv(c4, 1500, 2000, & mut fb);
+        if !same(gb, m4) { fail("dual stack reply"); }
+        println("dual stack: ipv4 sender seen as " + udp_addr_ip_text(& fd) + " ok");
+        udp_close(c4);
+        udp_close(ds);
+    }
+    println("udp loopback ok");
+}

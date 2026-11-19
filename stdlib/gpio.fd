@@ -1,0 +1,717 @@
+// Fides GPIO: pin direction, levels, pulls, edge events with debouncing
+//
+// What is real (pure Fides, runs everywhere):
+//   - line configuration: direction, bias (pull-up / pull-down / none),
+//     active-low, drive (push-pull, open-drain, open-source), edges
+//   - a software debouncer: a level must stay unchanged for the debounce
+//     period before it counts; time is passed in (nanoseconds), so the
+//     same code runs from a timer interrupt, a poll loop or a test
+//   - edge detection (rising / falling / both) on the debounced level and
+//     an event queue with sequence numbers, like the kernel's
+//   - a fake chip: lines driven from outside (or floating, then the pull
+//     decides), outputs, open-drain wired-AND, events
+//   - the Linux GPIO character device v2 ABI: ioctl numbers, the
+//     592-byte struct gpio_v2_line_request, struct gpio_v2_line_values,
+//     and decoding of 48-byte struct gpio_v2_line_event records
+//   - the sysfs interface (/sys/class/gpio): the paths and the writes to
+//     export and configure a pin, through stdlib file (no FFI; works where
+//     the kernel still has CONFIG_GPIO_SYSFS)
+//
+// The seam (what touches hardware): the character-device calls
+// gpio_linux_* (open /dev/gpiochipN, ioctl, read) in the extern "C" block
+// below, @cfg(linux), C backend only; the sysfs functions take the sysfs
+// root as a parameter so tests and other mounts can point elsewhere.
+module gpio;
+ use vec;
+ use string;
+ use file;
+
+extern "C" include "<fcntl.h>" {
+    fn open as gpio_sys_open(path: str, flags: i64) -> i64;
+}
+extern "C" include "<unistd.h>" {
+    fn close as gpio_sys_close(fd: i64) -> i64;
+    fn read as gpio_sys_read(fd: i64, buf: i64, n: i64) -> i64;
+}
+// No header: <sys/ioctl.h> is missing on Windows; only @cfg(linux) code calls it.
+extern "C" {
+    fn ioctl as gpio_sys_ioctl(fd: i64, req: i64, arg: i64) -> i64;
+}
+
+pub const GPIO_IN: i64 = 0;
+pub const GPIO_OUT: i64 = 1;
+pub const GPIO_PULL_NONE: i64 = 0;
+pub const GPIO_PULL_UP: i64 = 1;
+pub const GPIO_PULL_DOWN: i64 = 2;
+pub const GPIO_DRIVE_PUSH_PULL: i64 = 0;
+pub const GPIO_DRIVE_OPEN_DRAIN: i64 = 1;
+pub const GPIO_DRIVE_OPEN_SOURCE: i64 = 2;
+pub const GPIO_EDGE_NONE: i64 = 0;
+pub const GPIO_EDGE_RISING: i64 = 1;
+pub const GPIO_EDGE_FALLING: i64 = 2;
+pub const GPIO_EDGE_BOTH: i64 = 3;
+pub const GPIO_FLOATING: i64 = 0 - 1;
+
+// <linux/gpio.h> v2 flags, attribute ids, event ids
+pub const GPIO_V2_LINE_FLAG_USED: i64 = 0x1;
+pub const GPIO_V2_LINE_FLAG_ACTIVE_LOW: i64 = 0x2;
+pub const GPIO_V2_LINE_FLAG_INPUT: i64 = 0x4;
+pub const GPIO_V2_LINE_FLAG_OUTPUT: i64 = 0x8;
+pub const GPIO_V2_LINE_FLAG_EDGE_RISING: i64 = 0x10;
+pub const GPIO_V2_LINE_FLAG_EDGE_FALLING: i64 = 0x20;
+pub const GPIO_V2_LINE_FLAG_OPEN_DRAIN: i64 = 0x40;
+pub const GPIO_V2_LINE_FLAG_OPEN_SOURCE: i64 = 0x80;
+pub const GPIO_V2_LINE_FLAG_BIAS_PULL_UP: i64 = 0x100;
+pub const GPIO_V2_LINE_FLAG_BIAS_PULL_DOWN: i64 = 0x200;
+pub const GPIO_V2_LINE_FLAG_BIAS_DISABLED: i64 = 0x400;
+pub const GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME: i64 = 0x800;
+pub const GPIO_V2_LINE_ATTR_ID_FLAGS: i64 = 1;
+pub const GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES: i64 = 2;
+pub const GPIO_V2_LINE_ATTR_ID_DEBOUNCE: i64 = 3;
+pub const GPIO_V2_LINE_EVENT_RISING_EDGE: i64 = 1;
+pub const GPIO_V2_LINE_EVENT_FALLING_EDGE: i64 = 2;
+pub const GPIO_V2_LINES_MAX: i64 = 64;
+pub const GPIO_V2_LINE_NUM_ATTRS_MAX: i64 = 10;
+pub const GPIO_V2_REQUEST_SIZE: i64 = 592;
+pub const GPIO_V2_CONFIG_SIZE: i64 = 272;
+pub const GPIO_V2_EVENT_SIZE: i64 = 48;
+
+/// _IOC(dir, type, nr, size) (asm-generic encoding).
+pub fn gpio_ioc(dir: i64, ty: i64, nr: i64, size: i64) -> i64 {
+    return (dir << 30) | ((size & 0x3FFF) << 16) | ((ty & 0xFF) << 8) | (nr & 0xFF);
+}
+
+pub fn gpio_get_chipinfo_ioctl() -> i64 {
+    return gpio_ioc(2, 0xB4, 0x01, 68);
+}
+
+pub fn gpio_v2_get_line_ioctl() -> i64 {
+    return gpio_ioc(3, 0xB4, 0x07, GPIO_V2_REQUEST_SIZE);
+}
+
+pub fn gpio_v2_line_set_config_ioctl() -> i64 {
+    return gpio_ioc(3, 0xB4, 0x0D, GPIO_V2_CONFIG_SIZE);
+}
+
+pub fn gpio_v2_line_get_values_ioctl() -> i64 {
+    return gpio_ioc(3, 0xB4, 0x0E, 16);
+}
+
+pub fn gpio_v2_line_set_values_ioctl() -> i64 {
+    return gpio_ioc(3, 0xB4, 0x0F, 16);
+}
+
+// ─── Configuration ──────────────────────────────────────────────────────
+
+pub struct GpioConfig {
+    pub dir: i64,
+    pub pull: i64,
+    pub active_low: bool,
+    pub drive: i64,
+    pub edge: i64,
+    pub debounce_ns: i64,
+    pub initial: i64,
+}
+
+pub fn gpio_input(pull: i64) -> GpioConfig {
+    return GpioConfig { dir: GPIO_IN, pull: pull, active_low: false, drive: GPIO_DRIVE_PUSH_PULL, edge: GPIO_EDGE_NONE, debounce_ns: 0, initial: 0 };
+}
+
+pub fn gpio_output(initial: i64) -> GpioConfig {
+    return GpioConfig { dir: GPIO_OUT, pull: GPIO_PULL_NONE, active_low: false, drive: GPIO_DRIVE_PUSH_PULL, edge: GPIO_EDGE_NONE, debounce_ns: 0, initial: initial };
+}
+
+/// An input that reports edges, debounced over debounce_ns.
+pub fn gpio_edge_input(pull: i64, edge: i64, debounce_ns: i64) -> GpioConfig {
+    return GpioConfig { dir: GPIO_IN, pull: pull, active_low: false, drive: GPIO_DRIVE_PUSH_PULL, edge: edge, debounce_ns: debounce_ns, initial: 0 };
+}
+
+/// The v2 flags word for a configuration.
+pub fn gpio_v2_flags(c: & GpioConfig) -> i64 {
+    var f: i64 = 0;
+    if c.dir == GPIO_OUT {
+        f = f | GPIO_V2_LINE_FLAG_OUTPUT;
+        if c.drive == GPIO_DRIVE_OPEN_DRAIN {
+            f = f | GPIO_V2_LINE_FLAG_OPEN_DRAIN;
+        }
+        if c.drive == GPIO_DRIVE_OPEN_SOURCE {
+            f = f | GPIO_V2_LINE_FLAG_OPEN_SOURCE;
+        }
+    } else {
+        f = f | GPIO_V2_LINE_FLAG_INPUT;
+        if (c.edge & GPIO_EDGE_RISING) != 0 {
+            f = f | GPIO_V2_LINE_FLAG_EDGE_RISING;
+        }
+        if (c.edge & GPIO_EDGE_FALLING) != 0 {
+            f = f | GPIO_V2_LINE_FLAG_EDGE_FALLING;
+        }
+    }
+    if c.active_low {
+        f = f | GPIO_V2_LINE_FLAG_ACTIVE_LOW;
+    }
+    if c.pull == GPIO_PULL_UP {
+        f = f | GPIO_V2_LINE_FLAG_BIAS_PULL_UP;
+    } else if c.pull == GPIO_PULL_DOWN {
+        f = f | GPIO_V2_LINE_FLAG_BIAS_PULL_DOWN;
+    }
+    return f;
+}
+
+// ─── Debouncer ──────────────────────────────────────────────────────────
+
+/// Debounce state of one input. `stable` is the accepted level (-1 before
+/// the first sample), `candidate` a level seen since `since_ns`.
+pub struct GpioDebounce {
+    pub stable: i64,
+    pub candidate: i64,
+    pub since_ns: i64,
+    pub period_ns: i64,
+}
+
+pub fn gpio_debounce_new(period_ns: i64) -> GpioDebounce {
+    return GpioDebounce { stable: 0 - 1, candidate: 0 - 1, since_ns: 0, period_ns: period_ns };
+}
+
+/// Feed a raw level sampled at t_ns. Returns 0 (no change), 1 (the
+/// stable level rose) or 2 (it fell). The first sample sets the level
+/// without an edge. A change counts once the level has held for the
+/// period; a bounce back resets the wait. Call it again with the same
+/// level later (poll / timer) to let a pending change through.
+pub fn gpio_debounce_feed(d: & mut GpioDebounce, level: i64, t_ns: i64) -> i64 {
+    val lv: i64 = level & 1;
+    if d.stable < 0 {
+        d.stable = lv;
+        d.candidate = lv;
+        d.since_ns = t_ns;
+        return 0;
+    }
+    if lv == d.stable {
+        d.candidate = lv;
+        d.since_ns = t_ns;
+        return 0;
+    }
+    if lv != d.candidate {
+        d.candidate = lv;
+        d.since_ns = t_ns;
+    }
+    if t_ns - d.since_ns >= d.period_ns {
+        d.stable = lv;
+        if lv == 1 {
+            return 1;
+        }
+        return 2;
+    }
+    return 0;
+}
+
+/// When a pending change will be accepted (or -1 if none is pending).
+pub fn gpio_debounce_deadline(d: & GpioDebounce) -> i64 {
+    if d.stable < 0 || d.candidate == d.stable {
+        return 0 - 1;
+    }
+    return d.since_ns + d.period_ns;
+}
+
+/// Whether an edge (1 rising / 2 falling) passes an edge filter.
+pub fn gpio_edge_matches(edge_cfg: i64, ev: i64) -> bool {
+    if ev == 1 {
+        return (edge_cfg & GPIO_EDGE_RISING) != 0;
+    }
+    if ev == 2 {
+        return (edge_cfg & GPIO_EDGE_FALLING) != 0;
+    }
+    return false;
+}
+
+// ─── Fake chip ──────────────────────────────────────────────────────────
+
+pub struct GpioEvent {
+    pub timestamp_ns: i64,
+    pub id: i64,
+    pub offset: i64,
+    pub seqno: i64,
+    pub line_seqno: i64,
+}
+
+pub struct GpioLine {
+    pub offset: i64,
+    pub cfg: GpioConfig,
+    pub requested: bool,
+    pub out_value: i64,
+    pub ext_level: i64,
+    pub deb: GpioDebounce,
+    pub line_seqno: i64,
+}
+
+pub struct GpioChip {
+    pub name: str,
+    pub lines: Vec<GpioLine>,
+    pub events: Vec<GpioEvent>,
+    pub seqno: i64,
+}
+
+pub fn gpio_fake_chip(name: str, nlines: i64) -> GpioChip {
+    var lines: Vec<GpioLine> = Vec::new();
+    var i: i64 = 0;
+    while i < nlines {
+        lines.push(GpioLine { offset: i, cfg: gpio_input(GPIO_PULL_NONE), requested: false, out_value: 0, ext_level: GPIO_FLOATING, deb: gpio_debounce_new(0), line_seqno: 0 });
+        i = i + 1;
+    }
+    return GpioChip { name: name, lines: lines, events: Vec::new(), seqno: 0 };
+}
+
+/// The physical level on the pin: the output when one drives it (an
+/// open-drain output only drives low, open-source only high), else the
+/// outside driver, else the pull (a floating pin with no pull reads 0).
+pub fn gpio_fake_physical(l: & GpioLine) -> i64 {
+    if l.requested && l.cfg.dir == GPIO_OUT {
+        val v: i64 = l.out_value & 1;
+        if l.cfg.drive == GPIO_DRIVE_PUSH_PULL {
+            return v;
+        }
+        if l.cfg.drive == GPIO_DRIVE_OPEN_DRAIN && v == 0 {
+            return 0;
+        }
+        if l.cfg.drive == GPIO_DRIVE_OPEN_SOURCE && v == 1 {
+            return 1;
+        }
+        // released: wired with the outside (wired-AND for open drain)
+    }
+    if l.ext_level != GPIO_FLOATING {
+        return l.ext_level & 1;
+    }
+    if l.cfg.pull == GPIO_PULL_UP {
+        return 1;
+    }
+    return 0;
+}
+
+fn gpio_logical(l: & GpioLine, phys: i64) -> i64 {
+    if l.cfg.active_low {
+        return 1 - phys;
+    }
+    return phys;
+}
+
+/// Request (configure) a line. Fails on a line already requested.
+pub fn gpio_request(chip: & mut GpioChip, offset: i64, cfg: GpioConfig, t_ns: i64) -> Result<i64, str> {
+    if offset < 0 || offset >= chip.lines.len() {
+        return Result::Err("no line " + int_to_str(offset) + " on " + chip.name);
+    }
+    var l: GpioLine = chip.lines.get(offset);
+    if l.requested {
+        return Result::Err("line " + int_to_str(offset) + " is busy");
+    }
+    l.requested = true;
+    l.cfg = cfg;
+    if cfg.dir == GPIO_OUT {
+        var v: i64 = cfg.initial & 1;
+        if cfg.active_low {
+            v = 1 - v;
+        }
+        l.out_value = v;
+    }
+    l.deb = gpio_debounce_new(cfg.debounce_ns);
+    val lv0: i64 = gpio_logical(& l, gpio_fake_physical(& l));
+    gpio_debounce_feed(& mut l.deb, lv0, t_ns);
+    chip.lines.set(offset, l);
+    return Result::Ok(offset);
+}
+
+pub fn gpio_release(chip: & mut GpioChip, offset: i64) {
+    if offset >= 0 && offset < chip.lines.len() {
+        var l: GpioLine = chip.lines.get(offset);
+        l.requested = false;
+        l.cfg = gpio_input(GPIO_PULL_NONE);
+        chip.lines.set(offset, l);
+    }
+}
+
+/// Read a line's logical value (active-low applied).
+pub fn gpio_read(chip: & GpioChip, offset: i64) -> i64 {
+    val l: GpioLine = chip.lines.get(offset);
+    return gpio_logical(& l, gpio_fake_physical(& l));
+}
+
+/// Set an output's logical value. False if the line is not an output.
+pub fn gpio_write(chip: & mut GpioChip, offset: i64, value: i64) -> bool {
+    var l: GpioLine = chip.lines.get(offset);
+    if !l.requested || l.cfg.dir != GPIO_OUT {
+        return false;
+    }
+    var v: i64 = value & 1;
+    if l.cfg.active_low {
+        v = 1 - v;
+    }
+    l.out_value = v;
+    chip.lines.set(offset, l);
+    return true;
+}
+
+pub fn gpio_toggle(chip: & mut GpioChip, offset: i64) -> bool {
+    return gpio_write(chip, offset, 1 - gpio_read(chip, offset));
+}
+
+fn gpio_sample_line(chip: & mut GpioChip, offset: i64, t_ns: i64) {
+    var l: GpioLine = chip.lines.get(offset);
+    if !l.requested || l.cfg.dir != GPIO_IN {
+        return;
+    }
+    val lv: i64 = gpio_logical(& l, gpio_fake_physical(& l));
+    val ev: i64 = gpio_debounce_feed(& mut l.deb, lv, t_ns);
+    if ev != 0 && gpio_edge_matches(l.cfg.edge, ev) {
+        chip.seqno = chip.seqno + 1;
+        l.line_seqno = l.line_seqno + 1;
+        var id: i64 = GPIO_V2_LINE_EVENT_RISING_EDGE;
+        if ev == 2 {
+            id = GPIO_V2_LINE_EVENT_FALLING_EDGE;
+        }
+        chip.events.push(GpioEvent { timestamp_ns: t_ns, id: id, offset: offset, seqno: chip.seqno, line_seqno: l.line_seqno });
+    }
+    chip.lines.set(offset, l);
+}
+
+/// Drive a pin from outside (a button, another chip) at time t_ns; level
+/// GPIO_FLOATING lets go of it.
+pub fn gpio_fake_drive(chip: & mut GpioChip, offset: i64, level: i64, t_ns: i64) {
+    var l: GpioLine = chip.lines.get(offset);
+    l.ext_level = level;
+    chip.lines.set(offset, l);
+    gpio_sample_line(chip, offset, t_ns);
+}
+
+/// Let time pass: every edge input is sampled at t_ns (a pending change
+/// that has now held for its debounce period becomes an event).
+pub fn gpio_tick(chip: & mut GpioChip, t_ns: i64) {
+    var i: i64 = 0;
+    while i < chip.lines.len() {
+        gpio_sample_line(chip, i, t_ns);
+        i = i + 1;
+    }
+}
+
+/// Take the queued events, oldest first.
+pub fn gpio_take_events(chip: & mut GpioChip) -> Vec<GpioEvent> {
+    val ev: Vec<GpioEvent> = chip.events;
+    chip.events = Vec::new();
+    return ev;
+}
+
+// ─── Linux character device v2 images ───────────────────────────────────
+
+fn gpio_put_le(out: & mut Vec<i64>, off: i64, v: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        out.set(off + i, (v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+fn gpio_get_le(b: & Vec<i64>, off: i64, n: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        v = v | ((b.get(off + i) & 0xFF) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// struct gpio_v2_line_config (272 bytes) at `off` in out: flags, then
+/// attributes for per-line output values and debounce. outputs_mask /
+/// output_bits index the request's lines (bit i = offsets[i]).
+pub fn gpio_v2_config_into(out: & mut Vec<i64>, off: i64, flags: i64, out_mask: i64, out_bits: i64, debounce_us: i64, deb_mask: i64) {
+    gpio_put_le(out, off, flags, 8);
+    var nattr: i64 = 0;
+    var a: i64 = off + 32;
+    if out_mask != 0 {
+        gpio_put_le(out, a, GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES, 4);
+        gpio_put_le(out, a + 8, out_bits, 8);
+        gpio_put_le(out, a + 16, out_mask, 8);
+        nattr = nattr + 1;
+        a = a + 24;
+    }
+    if debounce_us > 0 && deb_mask != 0 {
+        gpio_put_le(out, a, GPIO_V2_LINE_ATTR_ID_DEBOUNCE, 4);
+        gpio_put_le(out, a + 8, debounce_us, 4);
+        gpio_put_le(out, a + 16, deb_mask, 8);
+        nattr = nattr + 1;
+    }
+    gpio_put_le(out, off + 8, nattr, 4);
+}
+
+/// struct gpio_v2_line_request (592 bytes): offsets[64]@0, consumer[32]@256,
+/// config@288, num_lines@560, event_buffer_size@564, fd@588. All lines
+/// share `cfg`; outputs start at cfg.initial.
+pub fn gpio_v2_request_image(offsets: & Vec<i64>, consumer: str, cfg: & GpioConfig) -> Vec<i64> {
+    var img: Vec<i64> = Vec::filled(GPIO_V2_REQUEST_SIZE, 0);
+    var i: i64 = 0;
+    while i < offsets.len() && i < GPIO_V2_LINES_MAX {
+        gpio_put_le(& mut img, 4 * i, offsets.get(i), 4);
+        i = i + 1;
+    }
+    val cb: Vec<i64> = str_bytes(consumer);
+    var j: i64 = 0;
+    while j < cb.len() && j < 31 {
+        img.set(256 + j, cb.get(j));
+        j = j + 1;
+    }
+    val n: i64 = offsets.len();
+    var all: i64 = (1 << n) - 1;
+    if n >= 63 {
+        all = 0 - 1;
+    }
+    var out_mask: i64 = 0;
+    var out_bits: i64 = 0;
+    if cfg.dir == GPIO_OUT {
+        out_mask = all;
+        if (cfg.initial & 1) == 1 {
+            out_bits = all;
+        }
+    }
+    var deb_mask: i64 = 0;
+    if cfg.dir == GPIO_IN {
+        deb_mask = all;
+    }
+    gpio_v2_config_into(& mut img, 288, gpio_v2_flags(cfg), out_mask, out_bits, cfg.debounce_ns / 1000, deb_mask);
+    gpio_put_le(& mut img, 560, n, 4);
+    return img;
+}
+
+/// The line-request fd the kernel wrote back into a request image.
+pub fn gpio_v2_request_fd(img: & Vec<i64>) -> i64 {
+    val v: i64 = gpio_get_le(img, 588, 4);
+    if v >= 0x80000000 {
+        return v - 0x100000000;
+    }
+    return v;
+}
+
+/// struct gpio_v2_line_values { u64 bits; u64 mask; }
+pub fn gpio_v2_values_image(bits: i64, mask: i64) -> Vec<i64> {
+    var img: Vec<i64> = Vec::filled(16, 0);
+    gpio_put_le(& mut img, 0, bits, 8);
+    gpio_put_le(& mut img, 8, mask, 8);
+    return img;
+}
+
+/// Decode the records of a read() on a line-request fd (48 bytes each).
+pub fn gpio_v2_decode_events(bytes: & Vec<i64>) -> Vec<GpioEvent> {
+    var evs: Vec<GpioEvent> = Vec::new();
+    var p: i64 = 0;
+    while p + GPIO_V2_EVENT_SIZE <= bytes.len() {
+        evs.push(GpioEvent { timestamp_ns: gpio_get_le(bytes, p, 8), id: gpio_get_le(bytes, p + 8, 4), offset: gpio_get_le(bytes, p + 12, 4), seqno: gpio_get_le(bytes, p + 16, 4), line_seqno: gpio_get_le(bytes, p + 20, 4) });
+        p = p + GPIO_V2_EVENT_SIZE;
+    }
+    return evs;
+}
+
+pub fn gpio_event_name(id: i64) -> str {
+    if id == GPIO_V2_LINE_EVENT_RISING_EDGE {
+        return "rising";
+    }
+    if id == GPIO_V2_LINE_EVENT_FALLING_EDGE {
+        return "falling";
+    }
+    return "unknown";
+}
+
+pub fn gpio_c_int(r: i64) -> i64 {
+    val w: i64 = r & 0xFFFFFFFF;
+    if w >= 0x80000000 {
+        return w - 0x100000000;
+    }
+    return w;
+}
+
+/// Lines requested from a Linux gpiochip (the kernel's line-request fd).
+pub struct GpioLinuxLines {
+    pub fd: i64,
+    pub offsets: Vec<i64>,
+}
+
+@cfg(linux)
+fn gpio_linux_ioctl_image(fd: i64, req: i64, img: & Vec<i64>) -> Vec<i64> {
+    var back: Vec<i64> = Vec::new();
+    unsafe {
+        val n: i64 = img.len();
+        val p: i64 = p_malloc(n);
+        var i: i64 = 0;
+        while i < n {
+            p_volatile_store8(p + i, img.get(i));
+            i = i + 1;
+        }
+        val r: i64 = gpio_c_int(gpio_sys_ioctl(fd, req, p));
+        if r >= 0 {
+            i = 0;
+            while i < n {
+                back.push(p_volatile_load8(p + i) & 0xFF);
+                i = i + 1;
+            }
+        }
+        p_free(p);
+    }
+    return back;
+}
+
+/// Request lines of /dev/gpiochip<chip> with one configuration.
+@cfg(linux)
+pub fn gpio_linux_request(chip: i64, offsets: Vec<i64>, consumer: str, cfg: GpioConfig) -> Result<GpioLinuxLines, str> {
+    val path: str = "/dev/gpiochip" + int_to_str(chip);
+    var cfd: i64 = 0 - 1;
+    unsafe {
+        cfd = gpio_c_int(gpio_sys_open(path, 2));
+    }
+    if cfd < 0 {
+        return Result::Err("cannot open " + path);
+    }
+    val back: Vec<i64> = gpio_linux_ioctl_image(cfd, gpio_v2_get_line_ioctl(), & gpio_v2_request_image(& offsets, consumer, & cfg));
+    unsafe {
+        gpio_sys_close(cfd);
+    }
+    if back.len() == 0 {
+        return Result::Err("GPIO_V2_GET_LINE_IOCTL failed on " + path);
+    }
+    return Result::Ok(GpioLinuxLines { fd: gpio_v2_request_fd(& back), offsets: offsets });
+}
+
+/// Logical values of the requested lines: bit i for offsets[i]; -1 on error.
+@cfg(linux)
+pub fn gpio_linux_get(lines: & GpioLinuxLines) -> i64 {
+    val mask: i64 = (1 << lines.offsets.len()) - 1;
+    val back: Vec<i64> = gpio_linux_ioctl_image(lines.fd, gpio_v2_line_get_values_ioctl(), & gpio_v2_values_image(0, mask));
+    if back.len() < 8 {
+        return 0 - 1;
+    }
+    return gpio_get_le(& back, 0, 8) & mask;
+}
+
+@cfg(linux)
+pub fn gpio_linux_set(lines: & GpioLinuxLines, bits: i64, mask: i64) -> bool {
+    val back: Vec<i64> = gpio_linux_ioctl_image(lines.fd, gpio_v2_line_set_values_ioctl(), & gpio_v2_values_image(bits, mask));
+    return back.len() == 16;
+}
+
+/// Block until edge events arrive and decode them (up to 16 at a time).
+@cfg(linux)
+pub fn gpio_linux_read_events(lines: & GpioLinuxLines) -> Vec<GpioEvent> {
+    var bytes: Vec<i64> = Vec::new();
+    unsafe {
+        val n: i64 = 16 * GPIO_V2_EVENT_SIZE;
+        val p: i64 = p_malloc(n);
+        val got: i64 = gpio_c_int(gpio_sys_read(lines.fd, p, n));
+        var i: i64 = 0;
+        while i < got {
+            bytes.push(p_volatile_load8(p + i) & 0xFF);
+            i = i + 1;
+        }
+        p_free(p);
+    }
+    return gpio_v2_decode_events(& bytes);
+}
+
+@cfg(linux)
+pub fn gpio_linux_release(lines: & mut GpioLinuxLines) {
+    if lines.fd >= 0 {
+        unsafe {
+            gpio_sys_close(lines.fd);
+        }
+        lines.fd = 0 - 1;
+    }
+}
+
+// ─── sysfs (/sys/class/gpio) ────────────────────────────────────────────
+
+/// One write of the sysfs sequence: the file and what goes in it.
+pub struct GpioSysfsWrite {
+    pub path: str,
+    pub value: str,
+}
+
+pub fn gpio_sysfs_pin_dir(root: str, pin: i64) -> str {
+    return root + "/gpio" + int_to_str(pin);
+}
+
+/// The writes that export and configure a pin: export, active_low,
+/// direction ("in", or "high"/"low" to set an output glitch-free), edge.
+pub fn gpio_sysfs_setup(root: str, pin: i64, cfg: & GpioConfig) -> Vec<GpioSysfsWrite> {
+    var w: Vec<GpioSysfsWrite> = Vec::new();
+    val dir: str = gpio_sysfs_pin_dir(root, pin);
+    w.push(GpioSysfsWrite { path: root + "/export", value: int_to_str(pin) });
+    if cfg.active_low {
+        w.push(GpioSysfsWrite { path: dir + "/active_low", value: "1" });
+    } else {
+        w.push(GpioSysfsWrite { path: dir + "/active_low", value: "0" });
+    }
+    if cfg.dir == GPIO_OUT {
+        var phys: i64 = cfg.initial & 1;
+        if cfg.active_low {
+            phys = 1 - phys;
+        }
+        if phys == 1 {
+            w.push(GpioSysfsWrite { path: dir + "/direction", value: "high" });
+        } else {
+            w.push(GpioSysfsWrite { path: dir + "/direction", value: "low" });
+        }
+    } else {
+        w.push(GpioSysfsWrite { path: dir + "/direction", value: "in" });
+        var edge: str = "none";
+        if cfg.edge == GPIO_EDGE_RISING {
+            edge = "rising";
+        } else if cfg.edge == GPIO_EDGE_FALLING {
+            edge = "falling";
+        } else if cfg.edge == GPIO_EDGE_BOTH {
+            edge = "both";
+        }
+        w.push(GpioSysfsWrite { path: dir + "/edge", value: edge });
+    }
+    return w;
+}
+
+/// Perform writes; the number that failed.
+pub fn gpio_sysfs_apply(writes: & Vec<GpioSysfsWrite>) -> i64 {
+    var failed: i64 = 0;
+    var i: i64 = 0;
+    while i < writes.len() {
+        val w: GpioSysfsWrite = writes.get(i);
+        if file_write(w.path, w.value) != 0 {
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    return failed;
+}
+
+/// Parse a sysfs value file ("0\n" / "1\n"); -1 when unreadable.
+pub fn gpio_sysfs_parse_value(text: str) -> i64 {
+    if str_len(text) == 0 {
+        return 0 - 1;
+    }
+    val c: i64 = str_byte_at(text, 0);
+    if c == 48 {
+        return 0;
+    }
+    if c == 49 {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+pub fn gpio_sysfs_read(root: str, pin: i64) -> i64 {
+    match file_read_result(gpio_sysfs_pin_dir(root, pin) + "/value") {
+        Result::Ok(t) => {
+            return gpio_sysfs_parse_value(t);
+        }
+        Result::Err(_) => {
+            return 0 - 1;
+        }
+    }
+}
+
+pub fn gpio_sysfs_write(root: str, pin: i64, value: i64) -> bool {
+    return file_write(gpio_sysfs_pin_dir(root, pin) + "/value", int_to_str(value & 1)) == 0;
+}
+
+pub fn gpio_sysfs_unexport(root: str, pin: i64) -> bool {
+    return file_write(root + "/unexport", int_to_str(pin)) == 0;
+}

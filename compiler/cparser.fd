@@ -21,14 +21,13 @@
 //   other pointers, function ptrs   i64 (an address)
 //   enums                           i32
 //   C `long`                        i32 (the Windows x64 ABI)
+//   other integers keep their width, in parameters and results alike
+//   (int i32, unsigned u32, short i16, long long i64, size_t u64)
 //   a struct by value, va_list, `...`  not expressible yet: skipped
 
-module compiler::cparser;
- use core; use vec; use string;
-// --- Token kinds ----------------------------------------------------------
+module compiler::cparser; use core; use vec; use string;  // --- Token kinds ----------------------------------------------------------
 
-const CTK_IDENT: i64 = 1; const CTK_NUM: i64 = 2; const CTK_PUNCT: i64 = 3; const CTK_STR: i64 = 4; const CTK_CHAR: i64 = 5;
-/// The state of one parse: macros, headers read, the code, the types seen.
+const CTK_IDENT: i64 = 1; const CTK_NUM: i64 = 2; const CTK_PUNCT: i64 = 3; const CTK_STR: i64 = 4; const CTK_CHAR: i64 = 5;  /// The state of one parse: macros, headers read, the code, the types seen.
 pub struct CHeaderState {
     // Macros: name -> 1 + index
     pub macro_index: i64,
@@ -57,11 +56,55 @@ pub struct CHeaderState {
     pub fn_index: i64,
     pub fn_lines: Vec<str>,
     pub skipped: Vec<str>,
+    // LG16: a C++ header (.hpp, .hh, .hxx, or one with namespace/class);
+    // for each token, its namespace path ("a_b" for a::b) and whether it has
+    // C linkage (inside `extern "C"`, or any token of a C header)
+    pub cpp: bool,
+    pub tok_ns: Vec<str>,
+    pub tok_c: Vec<bool>,
+    // LG15: #include. The system include directories (searched for <x.h>
+    // first, for "x.h" after the including file's own directory), the
+    // directory of the header imported (searched after them), how many
+    // includes deep the file being read is, and the includes not read
+    pub inc_dirs: Vec<str>,
+    pub inc_top: str,
+    pub inc_depth: i64,
+    pub inc_notes: Vec<str>,
+    // LG16 C++ shims. The tokens before noise was dropped (`const` and the
+    // rest a C++ declaration needs), each kept token's index among them,
+    // whether it came from a header outside the imported one's directory
+    // (a system header: nothing of it is shimmed), and its namespace as C++
+    // writes it ("a::b")
+    pub raw: Vec<str>,
+    pub rawk: Vec<i64>,
+    pub tok_raw: Vec<i64>,
+    pub tok_sys: Vec<bool>,
+    pub tok_nsq: Vec<str>,
+    // The extern "C" lines of the shims, the C++ text of the shims, the
+    // Fides names given (name -> 1), the classes known (qualified C++ name
+    // and its simple name), the notes on the bindings
+    pub cx_lines: Vec<str>,
+    pub cx_code: Vec<str>,
+    pub cx_names: i64,
+    pub cx_class_q: Vec<str>,
+    pub cx_class_s: Vec<str>,
+    pub cx_notes: Vec<str>,
+    // Function templates: Fides prefix (a_b_name), C++ name (a::b::name),
+    // type parameters joined by ",", and the declaration's tokens (from
+    // cx_tt/cx_tk at cx_tmpl_at, cx_tmpl_len of them)
+    pub cx_tmpl_prefix: Vec<str>,
+    pub cx_tmpl_q: Vec<str>,
+    pub cx_tmpl_params: Vec<str>,
+    pub cx_tmpl_at: Vec<i64>,
+    pub cx_tmpl_len: Vec<i64>,
+    pub cx_tt: Vec<str>,
+    pub cx_tk: Vec<i64>,
 }
 
 pub fn CHeaderState_new() -> CHeaderState {
     return CHeaderState {
-        macro_index: HashMap_new(), macro_names: Vec::new(), macro_bodies: Vec::new(), macro_params: Vec::new(), macro_noise: Vec::new(), included: Vec::new(), code: StringBuilder::new(), toks: Vec::new(), kinds: Vec::new(), td_index: HashMap_new(), td_names: Vec::new(), td_base: Vec::new(), td_ptr: Vec::new(), const_index: HashMap_new(), const_names: Vec::new(), const_values: Vec::new(), fn_index: HashMap_new(), fn_lines: Vec::new(), skipped: Vec::new(),
+        macro_index: HashMap_new(), macro_names: Vec::new(), macro_bodies: Vec::new(), macro_params: Vec::new(), macro_noise: Vec::new(), included: Vec::new(), code: StringBuilder::new(), toks: Vec::new(), kinds: Vec::new(), td_index: HashMap_new(), td_names: Vec::new(), td_base: Vec::new(), td_ptr: Vec::new(), const_index: HashMap_new(), const_names: Vec::new(), const_values: Vec::new(), fn_index: HashMap_new(), fn_lines: Vec::new(), skipped: Vec::new(), cpp: false, tok_ns: Vec::new(), tok_c: Vec::new(), inc_dirs: Vec::new(), inc_top: "", inc_depth: 0, inc_notes: Vec::new(),
+        raw: Vec::new(), rawk: Vec::new(), tok_raw: Vec::new(), tok_sys: Vec::new(), tok_nsq: Vec::new(), cx_lines: Vec::new(), cx_code: Vec::new(), cx_names: HashMap_new(), cx_class_q: Vec::new(), cx_class_s: Vec::new(), cx_notes: Vec::new(), cx_tmpl_prefix: Vec::new(), cx_tmpl_q: Vec::new(), cx_tmpl_params: Vec::new(), cx_tmpl_at: Vec::new(), cx_tmpl_len: Vec::new(), cx_tt: Vec::new(), cx_tk: Vec::new(),
     };
 }
 
@@ -71,13 +114,63 @@ pub fn CHeaderState_new() -> CHeaderState {
 /// Fides source. `link` is the library for the `extern` block; `module_name`
 /// becomes the `module` line ("" for none).
 pub fn cparse_header_file(path: str, link: str, module_name: str) -> str {
+    return cparse_header_file_with(path, link, module_name, "");
+}
+
+/// LG15: as cparse_header_file; `include` ("<stdio.h>", or "" for none)
+/// becomes the extern block's `include`, so the C code includes the header
+/// and calls its functions as it declares them (no prototype of ours).
+pub fn cparse_header_file_with(path: str, link: str, module_name: str, include: str) -> str {
+    return cparse_header_file_for(path, link, module_name, include, "");
+}
+
+/// LG16: as cparse_header_file_with; `program` is the source of the program
+/// that imports the header ("" for none). A C++ header's function template
+/// is instantiated for each name of the form `<ns>_<name>_<types>` the
+/// program uses (`shapes_biggest_f64` is `shapes::biggest<double>`), besides
+/// the instantiations the header names (`template int biggest<int>(int,
+/// int);` is `shapes_biggest_i32`).
+pub fn cparse_header_file_for(path: str, link: str, module_name: str, include: str, program: str) -> str {
     var st: CHeaderState = CHeaderState_new();
+    st.cpp = str_ends_with(path, ".hpp") || str_ends_with(path, ".hh") || str_ends_with(path, ".hxx") || str_ends_with(path, ".h++");
+    cp_predefine(& mut st);
+    if st.cpp {
+        cp_add_define(& mut st, "__cplusplus 201703");
+    }
+    cp_init_include_dirs(& mut st, path);
     cp_load_file(& mut st, path);
     var code: str = st.code.to_str();
     cp_tokenize(& mut st, code);
     cp_parse_decls(& mut st);
+    if st.cpp && str_len(program) > 0 {
+        cpx_instantiate_wanted(& mut st, program);
+    }
     cp_collect_define_consts(& mut st);
-    return cp_render(& mut st, path, link, module_name);
+    return cp_render_with(& mut st, path, link, module_name, include);
+}
+
+/// LG15: the macros a C compiler predefines that headers test most: the
+/// system (from the host), C itself, and none of C++ (`__cplusplus` stays
+/// undefined, so `extern "C" {` guards drop out).
+fn cp_predefine(st: & mut CHeaderState) {
+    var os: str = "";
+    match env_var("OS") {
+        Option::Some(v) => {
+            os = v;
+        }
+        Option::None => {
+        }
+    }
+    if os == "Windows_NT" {
+        cp_add_define(st, "_WIN32 1");
+        cp_add_define(st, "_WIN64 1");
+        cp_add_define(st, "_M_X64 100");
+    } else {
+        cp_add_define(st, "__unix__ 1");
+        cp_add_define(st, "__x86_64__ 1");
+    }
+    cp_add_define(st, "__STDC__ 1");
+    cp_add_define(st, "__STDC_VERSION__ 201112");
 }
 
 // --- Small string helpers -------------------------------------------------
@@ -184,7 +277,9 @@ fn cp_strip(src: str) -> str {
     return out.to_str();
 }
 
-fn cp_load_file(st: & mut CHeaderState, path: str) {
+fn cp_load_file(st: & mut CHeaderState, path0: str) {
+    // LG15: one spelling per file (cp_norm_path)
+    var path: str = cp_norm_path(path0);
     if cp_strs_has(st.included, path) {
         return;
     }
@@ -196,19 +291,32 @@ fn cp_load_file(st: & mut CHeaderState, path: str) {
     var text: str = cp_strip(src);
     var dir: str = cp_dir_of(path);
     var lines: Vec<str> = str_lines(text);
+    // LG15: #if/#ifdef/#ifndef/#elif/#else/#endif. Each open group is one
+    // of CP_IF_ON (this branch is read), CP_IF_WAIT (no branch taken yet),
+    // CP_IF_DONE (a branch was taken) or CP_IF_OFF (inside a dropped
+    // branch). Only a condition known to be false drops a branch: one that
+    // cannot be evaluated is taken, as every branch was before.
+    var conds: Vec<i64> = Vec::new();
     var li: i64 = 0;
     while li < lines.len() {
         var line: str = str_trim(lines.get(li));
+        var cdir: str = "";
+        if str_starts_with(line, "#") {
+            cdir = str_trim(str_slice(line, 1, str_len(line)));
+        }
+        if cp_is_cond_directive(cdir) {
+            cp_cond_step(st, & mut conds, cdir);
+            li = li + 1;
+            continue;
+        }
+        if cp_cond_active(conds) == false {
+            li = li + 1;
+            continue;
+        }
         if str_starts_with(line, "#") {
             var d: str = str_trim(str_slice(line, 1, str_len(line)));
             if str_starts_with(d, "include") {
-                var rest: str = str_trim(str_slice(d, 7, str_len(d)));
-                if str_starts_with(rest, "\"") {
-                    var close: i64 = str_find(str_slice(rest, 1, str_len(rest)), "\"");
-                    if close > 0 {
-                        cp_load_file(st, dir + str_slice(rest, 1, close + 1));
-                    }
-                }
+                cp_include(st, dir, d);
             } else if str_starts_with(d, "define") {
                 cp_add_define(st, str_trim(str_slice(d, 6, str_len(d))));
             }
@@ -218,6 +326,514 @@ fn cp_load_file(st: & mut CHeaderState, path: str) {
         }
         li = li + 1;
     }
+}
+
+// --- LG15: #include inside a header ---------------------------------------
+// `#include "x.h"` is looked for beside the including file, then in the
+// system include directories, then beside the header imported;
+// `#include <x.h>` in the system directories, then beside the header
+// imported; `#include_next` takes the next one not read yet. A header is
+// read once (its path; include guards work through #ifndef), at most
+// CP_INCLUDE_MAX_DEPTH includes deep and CP_INCLUDE_MAX_FILES in all. One
+// not found is noted in the bindings and left out, as before.
+
+const CP_INCLUDE_MAX_DEPTH: i64 = 16; const CP_INCLUDE_MAX_FILES: i64 = 400;
+
+/// The value of the environment variable `name`, "" when it is not set.
+fn cp_env(name: str) -> str {
+    var out: str = "";
+    match env_var(name) {
+        Option::Some(v) => {
+            out = v;
+        }
+        Option::None => {
+        }
+    }
+    return out;
+}
+
+fn cp_add_include_dir(st: & mut CHeaderState, d: str) {
+    if str_len(d) == 0 {
+        return;
+    }
+    var dd: str = d;
+    if !str_ends_with(dd, "/") && !str_ends_with(dd, "\\") {
+        dd = dd + "/";
+    }
+    if !cp_strs_has(st.inc_dirs, dd) {
+        st.inc_dirs.push(dd);
+    }
+}
+
+/// The directories an include is looked for in: FID_INCLUDE,
+/// C_INCLUDE_PATH (CPLUS_INCLUDE_PATH for a C++ header), INCLUDE (MSVC's),
+/// then the usual Unix and macOS ones (as compiler.fd
+/// cc_system_include_dirs finds a system header, plus the per-architecture
+/// glibc directories and the macOS SDK's).
+fn cp_init_include_dirs(st: & mut CHeaderState, path: str) {
+    st.inc_top = cp_dir_of(cp_norm_path(path));
+    var on_windows: bool = cp_env("OS") == "Windows_NT";
+    var vars: Vec<str> = Vec::new();
+    vars.push("FID_INCLUDE");
+    vars.push("C_INCLUDE_PATH");
+    if st.cpp {
+        vars.push("CPLUS_INCLUDE_PATH");
+    }
+    vars.push("INCLUDE");
+    var vi: i64 = 0;
+    while vi < vars.len() {
+        var v: str = cp_env(vars.get(vi));
+        if str_len(v) > 0 {
+            if on_windows == false {
+                v = str_replace(v, ":", ";");
+            }
+            var parts: Vec<str> = str_split(v, ";");
+            var pi: i64 = 0;
+            while pi < parts.len() {
+                cp_add_include_dir(st, str_trim(parts.get(pi)));
+                pi = pi + 1;
+            }
+        }
+        vi = vi + 1;
+    }
+    cp_add_include_dir(st, "/usr/local/include");
+    cp_add_include_dir(st, "/usr/include/x86_64-linux-gnu");
+    cp_add_include_dir(st, "/usr/include/aarch64-linux-gnu");
+    cp_add_include_dir(st, "/usr/include/riscv64-linux-gnu");
+    cp_add_include_dir(st, "/usr/include");
+    cp_add_include_dir(st, "/opt/homebrew/include");
+    cp_add_include_dir(st, "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
+}
+
+fn cp_inc_note(st: & mut CHeaderState, s: str) {
+    if !cp_strs_has(st.inc_notes, s) {
+        st.inc_notes.push(s);
+    }
+}
+
+/// LG15: `path` without its `.` steps and `dir/..` pairs, so that a header
+/// reached under two spellings (cinc_sub/../cinc_types.h and
+/// cinc_types.h) is one file to the once-only guard, and a header that
+/// includes itself under a longer path each time stops at once. The
+/// separators become `/` (Windows takes either); a leading `/` or `//` and
+/// a drive (`C:`) stay, and so does a `..` above where a relative path
+/// starts.
+fn cp_norm_path(path: str) -> str {
+    var n: i64 = str_len(path);
+    var lead: str = "";
+    var i: i64 = 0;
+    if n >= 2 && (str_byte_at(path, 0) == 47 || str_byte_at(path, 0) == 92) && (str_byte_at(path, 1) == 47 || str_byte_at(path, 1) == 92) {
+        lead = "//";
+        i = 2;
+    } else if n >= 1 && (str_byte_at(path, 0) == 47 || str_byte_at(path, 0) == 92) {
+        lead = "/";
+        i = 1;
+    }
+    var parts: Vec<str> = Vec::new();
+    var s: i64 = i;
+    while i <= n {
+        if i == n || str_byte_at(path, i) == 47 || str_byte_at(path, i) == 92 {
+            var part: str = str_slice(path, s, i);
+            if part != "" && part != "." {
+                var top: str = "";
+                if parts.len() > 0 {
+                    top = parts.get(parts.len() - 1);
+                }
+                var is_drive: bool = parts.len() == 1 && lead == "" && str_ends_with(top, ":");
+                if part == ".." && parts.len() > 0 && top != ".." && !is_drive {
+                    parts.pop();
+                } else if part == ".." && lead != "" && parts.len() == 0 {
+                    // above the root: the root
+                    s = i + 1;
+                    i = i + 1;
+                    continue;
+                } else {
+                    parts.push(part);
+                }
+            }
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    var out: str = lead + str_join(parts, "/");
+    if out == "" {
+        return ".";
+    }
+    return out;
+}
+
+// --- LG15: the Windows DLL that exports a C function -------------------------
+// A header's functions are declared with no `link` (they are the C
+// library's or the system's). The C path links them through the C
+// compiler; the native Windows backend (pe_ir) imports each one a program
+// calls from the DLL that exports it: msvcrt.dll (the C library pe_ir uses)
+// or kernel32.dll, as their export tables in the system folder say.
+
+/// The system DLLs searched, in order.
+fn cp_system_dlls() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("msvcrt.dll");
+    v.push("kernel32.dll");
+    return v;
+}
+
+// C name -> 1 + index into cp_system_dlls(); 0: not read yet, 1: read, no
+// DLL found (another system), 2: read
+var g_cp_dll_exports: i64 = 0;
+var g_cp_dll_state: i64 = 0;
+
+fn cp_u16(b: Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 2 > b.len() {
+        return 0;
+    }
+    return b.get(at) + b.get(at + 1) * 256;
+}
+
+fn cp_u32(b: Vec<i64>, at: i64) -> i64 {
+    if at < 0 || at + 4 > b.len() {
+        return 0;
+    }
+    return b.get(at) + b.get(at + 1) * 256 + b.get(at + 2) * 65536 + b.get(at + 3) * 16777216;
+}
+
+/// The file offset of the RVA `rva` of a PE image whose section table
+/// (`nsec` entries) starts at `sec`; -1 when no section holds it.
+fn cp_pe_rva_off(b: Vec<i64>, sec: i64, nsec: i64, rva: i64) -> i64 {
+    var k: i64 = 0;
+    while k < nsec {
+        var h: i64 = sec + k * 40;
+        var size: i64 = cp_u32(b, h + 8);
+        var va: i64 = cp_u32(b, h + 12);
+        var raw_size: i64 = cp_u32(b, h + 16);
+        if raw_size > size {
+            size = raw_size;
+        }
+        if rva >= va && rva < va + size {
+            return rva - va + cp_u32(b, h + 20);
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+/// The names the DLL (any PE image) at `path` exports, from its export
+/// directory; none when the file is missing or not a PE image.
+pub fn cparse_dll_exports(path: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    if p_file_exists(path) == 0 {
+        return out;
+    }
+    var b: Vec<i64> = p_file_read_bytes(path);
+    // "MZ", then "PE\0\0" at e_lfanew
+    if b.len() < 64 || cp_u16(b, 0) != 23117 {
+        return out;
+    }
+    var pe: i64 = cp_u32(b, 60);
+    if cp_u32(b, pe) != 17744 {
+        return out;
+    }
+    var nsec: i64 = cp_u16(b, pe + 6);
+    var opt: i64 = pe + 24;
+    var sec: i64 = opt + cp_u16(b, pe + 20);
+    // the data directories: after 96 bytes of a PE32 optional header, 112
+    // of a PE32+ one (magic 0x20b); the export directory is the first
+    var dd: i64 = opt + 96;
+    if cp_u16(b, opt) == 523 {
+        dd = opt + 112;
+    }
+    var exp_rva: i64 = cp_u32(b, dd);
+    if exp_rva == 0 {
+        return out;
+    }
+    var ed: i64 = cp_pe_rva_off(b, sec, nsec, exp_rva);
+    if ed < 0 {
+        return out;
+    }
+    var count: i64 = cp_u32(b, ed + 24);
+    var names: i64 = cp_pe_rva_off(b, sec, nsec, cp_u32(b, ed + 32));
+    if names < 0 {
+        return out;
+    }
+    var i: i64 = 0;
+    while i < count {
+        var at: i64 = cp_pe_rva_off(b, sec, nsec, cp_u32(b, names + 4 * i));
+        if at >= 0 {
+            var nb: Vec<i64> = Vec::new();
+            var j: i64 = at;
+            while j < b.len() && b.get(j) != 0 && j - at < 512 {
+                nb.push(b.get(j));
+                j = j + 1;
+            }
+            if nb.len() > 0 {
+                out.push(str_from_bytes(nb));
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// LG15: the system DLL a native Windows program imports the C function
+/// `c_name` from when its declaration names no library (a header's
+/// functions): "msvcrt.dll" or "kernel32.dll", whichever exports it first,
+/// "" when neither does. When neither DLL can be read (a build on another
+/// system), "msvcrt.dll": the C library, which the program's start-up
+/// loader checks (a missing function is reported when it is called).
+pub fn cparse_system_dll_of(c_name: str) -> str {
+    var dlls: Vec<str> = cp_system_dlls();
+    if g_cp_dll_state == 0 {
+        g_cp_dll_exports = HashMap_new();
+        g_cp_dll_state = 1;
+        var root: str = cp_env("SystemRoot");
+        if root == "" {
+            root = "C:\\Windows";
+        }
+        var d: i64 = 0;
+        while d < dlls.len() {
+            var names: Vec<str> = cparse_dll_exports(root + "\\System32\\" + dlls.get(d));
+            if names.len() > 0 {
+                g_cp_dll_state = 2;
+            }
+            var k: i64 = 0;
+            while k < names.len() {
+                if !HashMap_contains(g_cp_dll_exports, names.get(k)) {
+                    HashMap_insert(g_cp_dll_exports, names.get(k), d + 1);
+                }
+                k = k + 1;
+            }
+            d = d + 1;
+        }
+    }
+    if HashMap_contains(g_cp_dll_exports, c_name) {
+        return dlls.get(HashMap_get(g_cp_dll_exports, c_name) - 1);
+    }
+    if g_cp_dll_state == 1 {
+        return "msvcrt.dll";
+    }
+    return "";
+}
+
+/// The file `#include` names, "" when it is not found. `dir` is the
+/// including file's directory; `next` is #include_next.
+fn cp_find_include(st: & mut CHeaderState, dir: str, name: str, quoted: bool, next: bool) -> str {
+    var cands: Vec<str> = Vec::new();
+    if str_starts_with(name, "/") || str_starts_with(name, "\\") || (str_len(name) > 2 && str_byte_at(name, 1) == 58) {
+        cands.push(name);
+    } else {
+        if quoted {
+            cands.push(dir + name);
+        }
+        var i: i64 = 0;
+        while i < st.inc_dirs.len() {
+            cands.push(st.inc_dirs.get(i) + name);
+            i = i + 1;
+        }
+        cands.push(st.inc_top + name);
+    }
+    var k: i64 = 0;
+    while k < cands.len() {
+        var c: str = cp_norm_path(cands.get(k));
+        var skip: bool = next && cp_strs_has(st.included, c);
+        if !skip && p_file_exists(c) != 0 {
+            return c;
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+/// `#include "x.h"`, `#include <x.h>` or `#include_next <x.h>` (`d` is the
+/// directive without its `#`), read from the including file in `dir`.
+fn cp_include(st: & mut CHeaderState, dir: str, d: str) {
+    var word: str = cp_dir_word(d);
+    if word != "include" && word != "include_next" {
+        return;
+    }
+    var next: bool = word == "include_next";
+    var rest: str = str_trim(str_slice(d, str_len(word), str_len(d)));
+    var quoted: bool = str_starts_with(rest, "\"");
+    var close_ch: str = ">";
+    if quoted {
+        close_ch = "\"";
+    } else if !str_starts_with(rest, "<") {
+        // `#include MACRO`: not followed
+        return;
+    }
+    var close: i64 = str_find(str_slice(rest, 1, str_len(rest)), close_ch);
+    if close <= 0 {
+        return;
+    }
+    var name: str = str_slice(rest, 1, close + 1);
+    var shown: str = "<" + name + ">";
+    if quoted {
+        shown = "\"" + name + "\"";
+    }
+    var found: str = cp_find_include(st, dir, name, quoted, next);
+    if found == "" {
+        cp_inc_note(st, shown + ": not found");
+        return;
+    }
+    if cp_strs_has(st.included, found) {
+        return;
+    }
+    if st.inc_depth >= CP_INCLUDE_MAX_DEPTH {
+        cp_inc_note(st, shown + ": more than " + int_to_str(CP_INCLUDE_MAX_DEPTH) + " includes deep, not read");
+        return;
+    }
+    if st.included.len() >= CP_INCLUDE_MAX_FILES {
+        cp_inc_note(st, shown + ": more than " + int_to_str(CP_INCLUDE_MAX_FILES) + " headers in all, not read");
+        return;
+    }
+    st.inc_depth = st.inc_depth + 1;
+    // LG16: the code of a header outside the imported header's directory
+    // (a system or library header) is marked, so no C++ shim wraps it
+    var foreign: bool = cpx_is_foreign_file(st, found);
+    if foreign {
+        st.code.append_str("\n__fidcpp_sys_push__\n");
+    }
+    cp_load_file(st, found);
+    if foreign {
+        st.code.append_str("\n__fidcpp_sys_pop__\n");
+    }
+    st.inc_depth = st.inc_depth - 1;
+}
+
+const CP_IF_ON: i64 = 1; const CP_IF_WAIT: i64 = 2; const CP_IF_DONE: i64 = 3; const CP_IF_OFF: i64 = 4;
+
+fn cp_is_cond_directive(d: str) -> bool {
+    return cp_dir_word(d) == "if" || cp_dir_word(d) == "ifdef" || cp_dir_word(d) == "ifndef" || cp_dir_word(d) == "elif" || cp_dir_word(d) == "else" || cp_dir_word(d) == "endif";
+}
+
+/// The directive's word: "ifdef" for "ifdef FOO".
+fn cp_dir_word(d: str) -> str {
+    var n: i64 = str_len(d);
+    var i: i64 = 0;
+    while i < n && cp_is_ident_char(str_byte_at(d, i)) {
+        i = i + 1;
+    }
+    return str_slice_len(d, n, 0, i);
+}
+
+fn cp_cond_active(conds: Vec<i64>) -> bool {
+    if conds.len() == 0 {
+        return true;
+    }
+    return conds.get(conds.len() - 1) == CP_IF_ON;
+}
+
+/// 1 when `cond` holds, 0 when it does not, -1 when it cannot be told.
+fn cp_cond_value(st: & mut CHeaderState, cond: str) -> i64 {
+    var t: Vec<str> = Vec::new();
+    var k: Vec<i64> = Vec::new();
+    cp_tokens_of(cond, & mut t, & mut k);
+    // defined(X) and defined X become 1 or 0
+    var t2: Vec<str> = Vec::new();
+    var k2: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < t.len() {
+        if t.get(i) == "defined" {
+            var j: i64 = i + 1;
+            var paren: bool = j < t.len() && t.get(j) == "(";
+            if paren {
+                j = j + 1;
+            }
+            if j >= t.len() {
+                return 0 - 1;
+            }
+            var known: bool = HashMap_contains(st.macro_index, t.get(j));
+            if known {
+                t2.push("1");
+            } else {
+                t2.push("0");
+            }
+            k2.push(CTK_NUM);
+            i = j + 1;
+            if paren {
+                i = i + 1;
+            }
+        } else {
+            t2.push(t.get(i));
+            k2.push(k.get(i));
+            i = i + 1;
+        }
+    }
+    var r: CpEval = cp_eval_tokens(st, t2, k2, 0);
+    if r.ok == false {
+        return 0 - 1;
+    }
+    if r.value != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+/// One conditional directive `d` (without its `#`).
+fn cp_cond_step(st: & mut CHeaderState, conds: & mut Vec<i64>, d: str) {
+    var w: str = cp_dir_word(d);
+    var rest: str = str_trim(str_slice(d, str_len(w), str_len(d)));
+    var outer: bool = true;
+    if conds.len() > 0 {
+        outer = conds.get(conds.len() - 1) == CP_IF_ON;
+    }
+    if w == "if" || w == "ifdef" || w == "ifndef" {
+        if outer == false {
+            conds.push(CP_IF_OFF);
+            return;
+        }
+        var v: i64 = 0 - 1;
+        if w == "if" {
+            v = cp_cond_value(st, rest);
+        } else {
+            var known: bool = HashMap_contains(st.macro_index, cp_dir_word(rest));
+            if w == "ifdef" {
+                if known {
+                    v = 1;
+                } else {
+                    v = 0;
+                }
+            } else {
+                if known {
+                    v = 0;
+                } else {
+                    v = 1;
+                }
+            }
+        }
+        if v == 0 {
+            conds.push(CP_IF_WAIT);
+        } else {
+            conds.push(CP_IF_ON);
+        }
+        return;
+    }
+    if conds.len() == 0 {
+        return;
+    }
+    var top: i64 = conds.get(conds.len() - 1);
+    if w == "endif" {
+        conds.pop();
+        return;
+    }
+    if top == CP_IF_OFF {
+        return;
+    }
+    if w == "else" {
+        if top == CP_IF_WAIT {
+            conds.set(conds.len() - 1, CP_IF_ON);
+        } else {
+            conds.set(conds.len() - 1, CP_IF_DONE);
+        }
+        return;
+    }
+    // elif
+    if top == CP_IF_WAIT {
+        if cp_cond_value(st, rest) == 0 {
+            return;
+        }
+        conds.set(conds.len() - 1, CP_IF_ON);
+        return;
+    }
+    conds.set(conds.len() - 1, CP_IF_DONE);
 }
 
 /// `#define NAME body` or `#define NAME(a, b) body`: the first definition wins.
@@ -318,18 +934,118 @@ fn cp_tokenize(st: & mut CHeaderState, code: str) {
     var rk: Vec<i64> = Vec::new();
     cp_tokens_of(code, & mut raw, & mut rk);
     var depth: i64 = 0;
+    // LG16: what each open brace is: 0 a body of the code, 1 `extern "C" {`,
+    // 2 `namespace N {`; the namespaces open, and how many `extern "C"`
+    if st.cpp == false {
+        var ci: i64 = 0;
+        while ci < raw.len() {
+            if rk.get(ci) == CTK_IDENT && raw.get(ci) == "namespace" {
+                st.cpp = true;
+                break;
+            }
+            ci = ci + 1;
+        }
+    }
+    var braces: Vec<i64> = Vec::new();
+    var nss: Vec<str> = Vec::new();
+    // LG16: the namespaces as C++ names them, and how many system headers
+    // deep the token is (cp_include's markers)
+    var nssq: Vec<str> = Vec::new();
+    var sys: i64 = 0;
+    // the raw tokens, for the C++ shims (cpx_clean reads them again)
+    st.raw = raw;
+    st.rawk = rk;
+    var c_open: i64 = 0;
+    var c_next: bool = false;
     var i: i64 = 0;
     while i < raw.len() {
         var t: str = raw.get(i);
         var k: i64 = rk.get(i);
+        if k == CTK_IDENT && t == "__fidcpp_sys_push__" {
+            sys = sys + 1;
+            i = i + 1;
+            continue;
+        }
+        if k == CTK_IDENT && t == "__fidcpp_sys_pop__" {
+            sys = sys - 1;
+            i = i + 1;
+            continue;
+        }
         if k == CTK_IDENT && t == "extern" && i + 2 < raw.len() && rk.get(i + 1) == CTK_STR && raw.get(i + 2) == "{" {
+            braces.push(1);
+            c_open = c_open + 1;
             i = i + 3;
             continue;
         }
-        if k == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {
-            // An attribute group after it goes too: __declspec(x), NAME(args)
+        // `extern "C" int f(int);`: one declaration with C linkage
+        if k == CTK_IDENT && t == "extern" && i + 1 < raw.len() && rk.get(i + 1) == CTK_STR {
+            c_next = true;
+            i = i + 2;
+            continue;
+        }
+        if st.cpp && k == CTK_IDENT && t == "namespace" {
+            var nj: i64 = i + 1;
+            var nname: str = "";
+            var nq: str = "";
+            // namespace a::b {  (C++17) or namespace a {  or namespace {
+            while nj < raw.len() && raw.get(nj) != "{" && raw.get(nj) != ";" {
+                if rk.get(nj) == CTK_IDENT {
+                    if str_len(nname) > 0 {
+                        nname = nname + "_";
+                        nq = nq + "::";
+                    }
+                    nname = nname + raw.get(nj);
+                    nq = nq + raw.get(nj);
+                }
+                nj = nj + 1;
+            }
+            if nj < raw.len() && raw.get(nj) == "{" {
+                braces.push(2);
+                nss.push(nname);
+                nssq.push(nq);
+                i = nj + 1;
+                continue;
+            }
+            // `namespace x = y;` or `using namespace`: nothing to bind
+            i = nj + 1;
+            continue;
+        }
+        // LG16: a class (or a struct with member functions) or a template
+        // of the header itself gets shims (cpx_construct); one of a system
+        // header is skipped without a note
+        if st.cpp && sys == 0 && k == CTK_IDENT && (t == "class" || t == "template" || (t == "struct" && cpx_struct_is_class(raw, rk, i))) && !(i > 0 && raw.get(i - 1) == "enum") {
+            var cend: i64 = cp_skip_cpp_construct_q(st, raw, rk, i, true);
+            cpx_construct(st, i, cend, cpx_ns_us(nss), cpx_ns_q(nssq));
+            i = cend;
+            continue;
+        }
+        if st.cpp && k == CTK_IDENT && (t == "class" || t == "template" || t == "using" || t == "typename" || t == "friend" || t == "operator") {
+            // LG16: `T& operator<<(..);` -- the type before `operator` was
+            // kept already: drop it, or it runs into the next declaration
+            if t == "operator" || t == "friend" {
+                cpx_drop_partial(st);
+                if t == "operator" && sys == 0 {
+                    st.skipped.push("operator" + cpx_raw_text(raw, i + 1, i + 3) + ": a C++ operator is not bound (wrap it in a named function)");
+                }
+            }
+            // `enum class E { .. };`: the `enum` kept goes too
+            if t == "class" && i > 0 && raw.get(i - 1) == "enum" {
+                cpx_drop_partial(st);
+                if sys == 0 && i + 1 < raw.len() {
+                    st.skipped.push("enum class " + raw.get(i + 1) + ": a scoped enum's values are not bound (pass them as integers)");
+                }
+                i = cp_skip_cpp_construct_q(st, raw, rk, i, true);
+                continue;
+            }
+            i = cp_skip_cpp_construct_q(st, raw, rk, i, sys > 0);
+            continue;
+        }
+        if k == CTK_IDENT && (cp_is_noise_word(t) || cp_is_annotation_word(t) || cp_macro_is_noise(st, t)) {
+            // An attribute group after it goes too: __declspec(x), NAME(args);
+            // LG15: an annotation the header does not define, with arguments
+            // (_In_reads_(n), __nonnull((1)), _When_(a, b))
             i = i + 1;
-            if i < raw.len() && raw.get(i) == "(" && (t == "__declspec" || t == "__attribute__" || t == "__attribute" || cp_macro_is_fn(st, t) || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "__declspec") {
+            if i < raw.len() && raw.get(i) == "(" && (t == "__declspec" || t == "__attribute__" || t == "__attribute" || cp_macro_is_fn(st, t) || (cp_is_annotation_word(t) && cp_macro_at(st, t) < 0) || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "__declspec") {
                 var pd: i64 = 0;
                 while i < raw.len() {
                     if raw.get(i) == "(" {
@@ -349,24 +1065,126 @@ fn cp_tokenize(st: & mut CHeaderState, code: str) {
         }
         if t == "{" {
             depth = depth + 1;
+            braces.push(0);
         }
         if t == "}" {
-            if depth == 0 {
+            if braces.len() == 0 {
                 i = i + 1;
                 continue;
             }
-            // the end of `extern "C" {`
+            var closing: i64 = braces.get(braces.len() - 1);
+            braces.pop();
+            if closing == 1 {
+                // the end of `extern "C" {`
+                c_open = c_open - 1;
+                i = i + 1;
+                continue;
+            }
+            if closing == 2 {
+                nss.pop();
+                nssq.pop();
+                i = i + 1;
+                continue;
+            }
             depth = depth - 1;
         }
         st.toks.push(t);
         st.kinds.push(k);
+        st.tok_ns.push(str_join(nss, "_"));
+        st.tok_c.push(st.cpp == false || c_open > 0 || c_next);
+        st.tok_raw.push(i);
+        st.tok_sys.push(sys > 0);
+        st.tok_nsq.push(cpx_ns_q(nssq));
+        if t == ";" || t == "}" {
+            c_next = false;
+        }
         i = i + 1;
     }
+}
+
+/// LG16: a C++ class, template, `using`, `friend` or operator: not bound.
+/// Skips it (to its `;` outside brackets, or the end of its body) and
+/// notes it (unless `quiet`: one cpx_construct binds, or one of a system
+/// header); returns the index after it.
+fn cp_skip_cpp_construct_q(st: & mut CHeaderState, raw: Vec<str>, rk: Vec<i64>, at: i64, quiet: bool) -> i64 {
+    var what: str = raw.get(at);
+    var name: str = "";
+    if at + 1 < raw.len() && rk.get(at + 1) == CTK_IDENT {
+        name = raw.get(at + 1);
+    }
+    var bd: i64 = 0;
+    var i: i64 = at;
+    while i < raw.len() {
+        var t: str = raw.get(i);
+        if t == "{" {
+            bd = bd + 1;
+        } else if t == "}" {
+            bd = bd - 1;
+            if bd < 0 {
+                // the end of what holds it (a namespace): leave the `}`
+                return i;
+            }
+            if bd == 0 {
+                // `class X { ... };` -- or `{ ... }` with no `;`
+                if i + 1 < raw.len() && raw.get(i + 1) == ";" {
+                    i = i + 1;
+                }
+                break;
+            }
+        } else if t == ";" && bd == 0 {
+            break;
+        }
+        i = i + 1;
+    }
+    if !quiet && (what == "class" || what == "template") {
+        var label: str = what;
+        if str_len(name) > 0 && what == "class" {
+            label = "class " + name;
+        }
+        st.skipped.push(label + ": a C++ " + what + " is not bound (C++ interop binds functions with C linkage and plain structs; wrap a class's methods in extern \"C\" functions)");
+    }
+    return i + 1;
 }
 
 /// Words that never matter to a binding.
 fn cp_is_noise_word(t: str) -> bool {
     return t == "extern" || t == "__declspec" || t == "__attribute__" || t == "__attribute" || t == "__cdecl" || t == "__stdcall" || t == "__fastcall" || t == "__vectorcall" || t == "__inline" || t == "__inline__" || t == "inline" || t == "__forceinline" || t == "__extension__" || t == "restrict" || t == "__restrict" || t == "__restrict__" || t == "const" || t == "volatile" || t == "register" || t == "_Printf_format_string_" || t == "__unaligned" || t == "__ptr64" || t == "__ptr32" || t == "_Noreturn" || t == "__cdecl__" || t == "_Pragma" || t == "__pragma" || t == "__asm__" || t == "__asm" || t == "_Alignas" || t == "WINAPI" || t == "APIENTRY" || t == "CALLBACK";
+}
+
+// LG15: the attribute and annotation macros of the C libraries' and SDKs'
+// headers (MSVC's UCRT and SAL, glibc's sys/cdefs.h, mingw, Apple's
+// availability macros, the Windows SDK): noise even when the header that
+// defines them is not read (or defines them through macros the parser cannot
+// follow). One with arguments drops its group when it is not defined.
+const CP_ANNOT_WORDS: str = " _ACRTIMP _ACRTIMP_ALT _DCRTIMP _CRTIMP _CRTIMP2 _CRTIMP_ALTERNATIVE _VCRTIMP _CRTALLOCATOR _CRTRESTRICT _CRTNOALIAS _CRT_GUARDOVERFLOW _CRT_JIT_INTRINSIC _CRT_HYBRIDPATCHABLE _CRT_STDIO_INLINE _NODISCARD _SECIMP _CONST_RETURN __THROW __THROWNL __wur __LEAF __LEAF_ATTR __COLD __BEGIN_DECLS __END_DECLS __BEGIN_NAMESPACE_STD __END_NAMESPACE_STD __BEGIN_NAMESPACE_C99 __END_NAMESPACE_C99 __restrict_arr __fortify_function __extern_inline __extern_always_inline __always_inline __returns_nonnull __nonnull __MINGW_NOTHROW __MINGW_IMPORT __MINGW_EXTENSION __MINGW_CDECL __dead2 __pure2 __result_use_check __cold __deprecated __deprecated_msg __unavailable _Nullable _Nonnull _Null_unspecified __nullable __null_unspecified __printflike __scanflike __alloc_size __DARWIN_ALIAS __DARWIN_ALIAS_C __DARWIN_ALIAS_I __DARWIN_INODE64 __DARWIN_EXTSN __DARWIN_EXTSN_C __DARWIN_NOCANCEL WINBASEAPI WINUSERAPI WINADVAPI WINGDIAPI WINSOCK_API_LINKAGE NTSYSAPI NTSYSCALLAPI DECLSPEC_IMPORT DECLSPEC_NORETURN DECLSPEC_ALLOCATOR DECLSPEC_NOTHROW DECLSPEC_DEPRECATED WINAPI_INLINE NTAPI WSAAPI PASCAL FAR NEAR IN OUT OPTIONAL CONST __RPC_FAR __RPC_API __RPC_USER RPC_ENTRY STDAPICALLTYPE STDMETHODCALLTYPE __in __out __inout __in_opt __out_opt __inout_opt __reserved __success __checkReturn __nullterminated __callback ";
+
+const CP_ANNOT_PREFIXES: str = "_In_ _Inout _Out _Ret_ _Pre_ _Post_ _Deref_ _Deref2_ _When_ _At_ _Success_ _Check_return_ _Must_inspect_result_ _Printf_format_string _Scanf_format_string _Scanf_s_format_string _Field_ _COM_Outptr _Frees_ptr _Null_terminated_ _NullNull_terminated_ _Analysis_ _Use_decl_annotations_ _Maybenull_ _Notnull_ _Reserved_ _Always_ _Struct_size_bytes_ _Writable_ _Readable_ _Return_type_success_ _Acquires_ _Releases_ _Requires_ _Guarded_by_ _Write_guarded_by_ _Interlocked_operand_ _Strict_type_match_ _Points_to_data_ _Literal_ _Notliteral_ _Translates_ _Kernel_ _IRQL_ _Function_class_ _Raises_SEH_exception_ _Maybe_raises_SEH_exception_ _Unchanged_ _On_failure_ _Result_nullonfailure_ _Result_zeroonfailure_ _Group_ _Has_lock_kind_ _Create_lock_level_ _Lock_level_order_ _No_competing_thread_ _Benign_race_ _Notref_ _Pre1_impl_ _SA_annotes _SAL_ _SAL1_ _SAL2_ _CRT_DEPRECATE _CRT_INSECURE_DEPRECATE _CRT_NONSTDC_DEPRECATE _CRT_OBSOLETE __attribute_ __attr_ __MINGW_ATTRIB_ __API_ __OSX_ __IOS_ __TVOS_ __WATCHOS_ __SWIFT_ __swift_ __in_ __out_ __inout_ __deref_ __drv_ __ecount __bcount";
+
+var g_cp_annot_prefixes: Vec<str> = Vec::new();
+
+/// LG15: is `t` one of CP_ANNOT_WORDS, or does it start with one of
+/// CP_ANNOT_PREFIXES?
+fn cp_is_annotation_word(t: str) -> bool {
+    if str_len(t) < 2 {
+        return false;
+    }
+    if str_find(CP_ANNOT_WORDS, " " + t + " ") >= 0 {
+        return true;
+    }
+    if str_byte_at(t, 0) != 95 {
+        return false;
+    }
+    if g_cp_annot_prefixes.len() == 0 {
+        g_cp_annot_prefixes = str_split(CP_ANNOT_PREFIXES, " ");
+    }
+    var i: i64 = 0;
+    while i < g_cp_annot_prefixes.len() {
+        if str_starts_with(t, g_cp_annot_prefixes.get(i)) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
 }
 
 fn cp_macro_at(st: & CHeaderState, name: str) -> i64 {
@@ -409,7 +1227,7 @@ fn cp_macro_is_noise(st: & mut CHeaderState, name: str) -> bool {
         } else if t == "(" && i > 0 {
             depth = 1;
             // the argument group of an attribute
-        } else if kinds.get(i) == CTK_IDENT && (cp_is_noise_word(t) || cp_macro_is_noise(st, t)) {  // fine
+        } else if kinds.get(i) == CTK_IDENT && (cp_is_noise_word(t) || cp_is_annotation_word(t) || cp_macro_is_noise(st, t)) {  // fine
         } else {
             noise = false;
         }
@@ -439,7 +1257,15 @@ fn cp_parse_decls(st: & mut CHeaderState) {
         }
         if t == "{" && depth == 0 {
             // a function definition: `) {` -- skip its body
-            if i > start && st.toks.get(i - 1) == ")" {
+            // LG16: (`) noexcept {` in C++); an inline C++ function of the
+            // header gets a shim
+            if i > start && (st.toks.get(i - 1) == ")" || (st.cpp && cpx_def_tail(st, start, i))) {
+                if st.cpp {
+                    var shimmed: bool = cpx_cpp_function(st, start, i);
+                    if !shimmed {
+                        // a definition with C linkage: not bound, as before
+                    }
+                }
                 var bd: i64 = 0;
                 while i < st.toks.len() {
                     if st.toks.get(i) == "{" {
@@ -969,6 +1795,11 @@ fn cp_safe_name(name: str) -> str {
 
 /// A function prototype in [a, b), or nothing.
 fn cp_function(st: & mut CHeaderState, a: i64, b: i64) {
+    // LG16: a function with C++ linkage gets a C++ shim (or, in a system
+    // header, nothing)
+    if st.cpp && cpx_cpp_function_p(st, a, b, true) {
+        return;
+    }
     // NAME ( params ) with the return type before NAME
     var lp: i64 = cp_find(st, a, b, "(");
     if lp <= a || st.kinds.get(lp - 1) != CTK_IDENT {
@@ -1023,11 +1854,27 @@ fn cp_function(st: & mut CHeaderState, a: i64, b: i64) {
         }
     }
     HashMap_insert(st.fn_index, name, 1);
+    // LG16: a C++ function without C linkage has a mangled symbol
+    if lp - 1 < st.tok_c.len() && st.tok_c.get(lp - 1) == false {
+        st.skipped.push(name + ": C++ linkage (its symbol name is mangled): declare it extern \"C\" to call it");
+        return;
+    }
     if why != "" {
         st.skipped.push(name + ": " + why);
         return;
     }
-    var line: str = "    fn " + name + "(" + str_join(params, ", ") + ")";
+    // LG15: a header read through #include can declare a function named
+    // like a Fides keyword (`select`, `match`): the binding would not parse
+    if cp_safe_name(name) != name {
+        st.skipped.push(name + ": its name is a Fides keyword (call it through a C wrapper of another name)");
+        return;
+    }
+    // LG16: a function of namespace a::b is a_b_name in Fides
+    var fides_name: str = name;
+    if lp - 1 < st.tok_ns.len() && str_len(st.tok_ns.get(lp - 1)) > 0 {
+        fides_name = name + " as " + st.tok_ns.get(lp - 1) + "_" + name;
+    }
+    var line: str = "    fn " + fides_name + "(" + str_join(params, ", ") + ")";
     if ret != "void" {
         line = line + " -> " + ret;
     }
@@ -1102,11 +1949,11 @@ fn cp_param(st: & CHeaderState, a: i64, b: i64, index: i64) -> str {
     if ty == "void" {
         return "!parameter " + pname2 + " is void";
     }
-    // An integer argument is passed as i64: C reads only its low bits, and
-    // the i64 constants above pass without a cast (results keep their type)
-    if ty == "i8" || ty == "i16" || ty == "i32" || ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64" {
-        ty = "i64";
-    }
+    // A parameter keeps its C type, like the result (2g.62: `int`
+    // parameters came out as i64 and an `int` result as i32). An i64 value
+    // or one of the i64 constants above still passes without a cast: an
+    // integer argument converts to a narrower parameter type, keeping its
+    // low bits, which is all C reads.
     return cp_safe_name(pname2) + ": " + ty;
 }
 
@@ -1545,6 +2392,10 @@ fn cp_collect_define_consts(st: & mut CHeaderState) {
 // --- Output ---------------------------------------------------------------
 
 fn cp_render(st: & mut CHeaderState, path: str, link: str, module_name: str) -> str {
+    return cp_render_with(st, path, link, module_name, "");
+}
+
+fn cp_render_with(st: & mut CHeaderState, path: str, link: str, module_name: str, include: str) -> str {
     var out: StringBuilder = StringBuilder::new();
     out.append_str("// Generated by `fid parse-header` from " + cp_base_name(path));
     if st.included.len() > 1 {
@@ -1564,18 +2415,1849 @@ fn cp_render(st: & mut CHeaderState, path: str, link: str, module_name: str) -> 
         }
         i = i + 1;
     }
-    out.append_str("\nextern \"C\" link \"" + link + "\" {\n");
+    if str_len(include) > 0 {
+        out.append_str("\nextern \"C\" include \"" + include + "\" link \"" + link + "\" {\n");
+    } else {
+        out.append_str("\nextern \"C\" link \"" + link + "\" {\n");
+    }
     i = 0;
     while i < st.fn_lines.len() {
         out.append_str(st.fn_lines.get(i) + "\n");
         i = i + 1;
     }
     out.append_str("}\n");
+    // LG16: the C++ functions, classes and templates, through extern "C"
+    // shims in a C++ file the link step compiles with the program
+    if st.cx_lines.len() > 0 {
+        out.append_str(cpx_render(st, path));
+    }
     if st.skipped.len() > 0 {
         out.append_str("\n// Not expressible yet (" + int_to_str(st.skipped.len()) + "):\n");
         i = 0;
         while i < st.skipped.len() {
             out.append_str("//   " + st.skipped.get(i) + "\n");
+            i = i + 1;
+        }
+    }
+    // LG15: the includes not followed (not found, or past a limit)
+    if st.inc_notes.len() > 0 {
+        out.append_str("\n// Includes not read (" + int_to_str(st.inc_notes.len()) + "):\n");
+        i = 0;
+        while i < st.inc_notes.len() {
+            out.append_str("//   #include " + st.inc_notes.get(i) + "\n");
+            i = i + 1;
+        }
+    }
+    return out.to_str();
+}
+
+// --- LG16: C++ through extern "C" shims ------------------------------------
+// A C++ header's own declarations with C++ linkage (not those of a system
+// header it includes) are called through generated `extern "C"` functions
+// in a C++ file (cpx_render): the link step compiles it with the program
+// (`link "cpp:<file>"`, compiler/main.fd) and links the C++ library.
+//   - a free function `a::b::f` is `a_b_f` (an overload `a_b_f_2`, ...)
+//   - a class `a::C` is an opaque handle (i64): `a_C_new(..)` for each
+//     public constructor (`a_C_new_2`, ...; a default one when none is
+//     declared, none for an abstract class), `a_C_delete(h)`, `a_C_m(h, ..)`
+//     for each public method (a static one without the handle),
+//     `a_C_get_x(h)` / `a_C_set_x(h, v)` for each public field
+//   - a function template is instantiated for the types the header names
+//     (`template int f<int>(int);`: `a_f_i32`) and the program names
+//     (`a_f_f64` is `a::f<double>`; cparse_header_file_for)
+//   - types: the C ones (cp_resolve), `T&` as `*T` (`const T&` by value),
+//     std::string and std::string_view as str (a result is a copy the
+//     program keeps), a class by pointer, by reference or by value as a
+//     handle (a class result by value is a new object: delete it)
+//   - an exception is caught: the call returns 0 (or "", or a null handle),
+//     `<stem>_cpp_failed()` is 1 and `<stem>_cpp_error()` the message,
+//     until the next call
+//   - `<stem>.cpp` beside the header is compiled with the shims (the
+//     definitions of a library that is not header-only)
+// A base class's methods are called on a derived handle through the base's
+// shims (single inheritance: the handle is the same address). Not bound:
+// class templates, operators, rvalue references, function pointers,
+// variadic functions, containers (std::vector ..).
+
+const CPX_VAL: i64 = 1; const CPX_REFP: i64 = 2; const CPX_STR: i64 = 3; const CPX_OBJP: i64 = 4; const CPX_OBJR: i64 = 5; const CPX_OBJV: i64 = 6; const CPX_VOID: i64 = 7;
+
+// A pointer to (CPX_ANYP), or a reference to (CPX_REFA), a type named by a
+// typedef or a struct: the shim takes a void* and converts it through
+// fidcpp_any / fidcpp_ref, so it never spells the name (it may be one of
+// the header's namespaces)
+const CPX_ANYP: i64 = 8; const CPX_REFA: i64 = 9;
+
+const CPX_FREE: i64 = 1; const CPX_METHOD: i64 = 2; const CPX_STATIC: i64 = 3; const CPX_CTOR: i64 = 4;
+
+/// How a C++ type crosses the shim: `why` is "" when it can; `fides` is the
+/// Fides type, `cty` the shim's C type, `cls` the class (CPX_OBJ*).
+pub struct CpxTy {
+    pub why: str,
+    pub kind: i64,
+    pub fides: str,
+    pub cty: str,
+    pub cls: str,
+}
+
+fn cpx_ty_bad(why: str) -> CpxTy {
+    return CpxTy { why: why, kind: 0, fides: "", cty: "", cls: "" };
+}
+
+fn cpx_ty(kind: i64, fides: str, cty: str, cls: str) -> CpxTy {
+    return CpxTy { why: "", kind: kind, fides: fides, cty: cty, cls: cls };
+}
+
+/// The namespaces joined for Fides ("a_b"), empty ones (anonymous) left out.
+fn cpx_ns_us(nss: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < nss.len() {
+        if str_len(nss.get(i)) > 0 {
+            if str_len(out) > 0 {
+                out = out + "_";
+            }
+            out = out + nss.get(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The namespaces joined as C++ writes them ("a::b").
+fn cpx_ns_q(nssq: Vec<str>) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < nssq.len() {
+        if str_len(nssq.get(i)) > 0 {
+            if str_len(out) > 0 {
+                out = out + "::";
+            }
+            out = out + nssq.get(i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cpx_qualify(ns_q: str, name: str) -> str {
+    if str_len(ns_q) == 0 {
+        return name;
+    }
+    return ns_q + "::" + name;
+}
+
+fn cpx_prefix(ns_us: str) -> str {
+    if str_len(ns_us) == 0 {
+        return "";
+    }
+    return ns_us + "_";
+}
+
+/// Is `f` (a header #include found) outside the imported header's
+/// directory?
+fn cpx_is_foreign_file(st: & CHeaderState, f: str) -> bool {
+    if str_len(st.inc_top) == 0 {
+        // the header was named without a directory: its own includes are
+        // relative paths
+        return str_starts_with(f, "/") || str_starts_with(f, "\\") || (str_len(f) > 2 && str_byte_at(f, 1) == 58);
+    }
+    return !str_starts_with(f, st.inc_top);
+}
+
+/// The raw tokens [a, b) joined, up to a `(` that is not the first.
+fn cpx_raw_text(raw: Vec<str>, a: i64, b: i64) -> str {
+    var out: str = "";
+    var i: i64 = a;
+    while i < b && i < raw.len() {
+        if raw.get(i) == "(" && i > a {
+            break;
+        }
+        out = out + raw.get(i);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Drops the tokens kept since the last `;`, `{` or `}` (the start of a
+/// declaration cp_tokenize then skips).
+fn cpx_drop_partial(st: & mut CHeaderState) {
+    while st.toks.len() > 0 {
+        var last: str = st.toks.get(st.toks.len() - 1);
+        if last == ";" || last == "{" || last == "}" {
+            return;
+        }
+        st.toks.pop();
+        st.kinds.pop();
+        st.tok_ns.pop();
+        st.tok_c.pop();
+        st.tok_raw.pop();
+        st.tok_sys.pop();
+        st.tok_nsq.pop();
+    }
+}
+
+/// Is the `struct` at `at` a C++ class (a body with member functions,
+/// access specifiers, a constructor or a destructor)?
+fn cpx_struct_is_class(raw: Vec<str>, rk: Vec<i64>, at: i64) -> bool {
+    if at > 0 && raw.get(at - 1) == "typedef" {
+        return false;
+    }
+    if at + 1 >= raw.len() || rk.get(at + 1) != CTK_IDENT {
+        return false;
+    }
+    var name: str = raw.get(at + 1);
+    var i: i64 = at + 2;
+    while i < raw.len() && raw.get(i) != "{" {
+        if raw.get(i) == ";" || raw.get(i) == "(" || raw.get(i) == "=" {
+            return false;
+        }
+        i = i + 1;
+    }
+    var depth: i64 = 0;
+    while i < raw.len() {
+        var t: str = raw.get(i);
+        if t == "{" {
+            depth = depth + 1;
+        } else if t == "}" {
+            depth = depth - 1;
+            if depth == 0 {
+                return false;
+            }
+        } else if depth == 1 {
+            if t == "public" || t == "private" || t == "protected" || t == "virtual" || t == "operator" || t == "explicit" || t == "~" || t == "static" {
+                return true;
+            }
+            if t == name && i + 1 < raw.len() && raw.get(i + 1) == "(" {
+                return true;
+            }
+            if rk.get(i) == CTK_IDENT && i + 2 < raw.len() && raw.get(i + 1) == "(" && raw.get(i + 2) != "*" && raw.get(i + 2) != "^" && !cpx_is_type_word(t) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The words of C and C++ that name a type by themselves.
+fn cpx_is_type_word(t: str) -> bool {
+    return t == "int" || t == "char" || t == "short" || t == "long" || t == "unsigned" || t == "signed" || t == "float" || t == "double" || t == "void" || t == "_Bool" || t == "bool" || t == "wchar_t" || t == "char8_t" || t == "char16_t" || t == "char32_t" || t == "auto";
+}
+
+/// The raw tokens [a, b) as C++ reads them: noise words other than `const`,
+/// attribute macros and groups, `[[..]]`, `alignas(..)` and cp_include's
+/// markers dropped.
+fn cpx_clean(st: & mut CHeaderState, a: i64, b: i64, t: & mut Vec<str>, k: & mut Vec<i64>) {
+    var i: i64 = a;
+    var end: i64 = b;
+    if end > st.raw.len() {
+        end = st.raw.len();
+    }
+    while i < end {
+        var x: str = st.raw.get(i);
+        var xk: i64 = st.rawk.get(i);
+        if xk == CTK_IDENT && (x == "__fidcpp_sys_push__" || x == "__fidcpp_sys_pop__") {
+            i = i + 1;
+            continue;
+        }
+        if x == "[" && i + 1 < end && st.raw.get(i + 1) == "[" {
+            var bd: i64 = 0;
+            while i < end {
+                if st.raw.get(i) == "[" {
+                    bd = bd + 1;
+                }
+                if st.raw.get(i) == "]" {
+                    bd = bd - 1;
+                    if bd == 0 {
+                        i = i + 1;
+                        break;
+                    }
+                }
+                i = i + 1;
+            }
+            continue;
+        }
+        if xk == CTK_IDENT && x != "const" && (cp_is_noise_word(x) || cp_is_annotation_word(x) || cp_macro_is_noise(st, x) || x == "alignas" || x == "constexpr" || x == "consteval" || x == "constinit") {
+            i = i + 1;
+            if i < end && st.raw.get(i) == "(" && (x == "__declspec" || x == "__attribute__" || x == "__attribute" || x == "alignas" || x == "_Pragma" || x == "__pragma" || x == "__asm__" || x == "__asm" || x == "_Alignas" || cp_macro_is_fn(st, x) || (cp_is_annotation_word(x) && cp_macro_at(st, x) < 0)) {
+                var pd: i64 = 0;
+                while i < end {
+                    if st.raw.get(i) == "(" {
+                        pd = pd + 1;
+                    }
+                    if st.raw.get(i) == ")" {
+                        pd = pd - 1;
+                        if pd == 0 {
+                            i = i + 1;
+                            break;
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+            continue;
+        }
+        t.push(x);
+        k.push(xk);
+        i = i + 1;
+    }
+}
+
+/// The index of the bracket closing the one at `open` in `t` (its last
+/// index when it is not closed).
+fn cpx_close(t: Vec<str>, open: i64) -> i64 {
+    var o: str = t.get(open);
+    var c: str = ")";
+    if o == "{" {
+        c = "}";
+    }
+    if o == "[" {
+        c = "]";
+    }
+    var depth: i64 = 0;
+    var i: i64 = open;
+    while i < t.len() {
+        if t.get(i) == o {
+            depth = depth + 1;
+        }
+        if t.get(i) == c {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return t.len() - 1;
+}
+
+/// The index of the `>` closing the `<` at `open` (a `>>` closes two).
+fn cpx_angle_close(t: Vec<str>, open: i64) -> i64 {
+    var depth: i64 = 0;
+    var pd: i64 = 0;
+    var i: i64 = open;
+    while i < t.len() {
+        var x: str = t.get(i);
+        if x == "(" {
+            pd = pd + 1;
+        } else if x == ")" {
+            pd = pd - 1;
+        } else if pd == 0 && x == "<" {
+            depth = depth + 1;
+        } else if pd == 0 && x == ">" {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        } else if pd == 0 && x == ">>" {
+            depth = depth - 2;
+            if depth <= 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The pieces of [a, b) split at the commas outside brackets, as the
+/// indices where each starts and ends (`starts`, `ends`).
+fn cpx_split_commas(t: Vec<str>, a: i64, b: i64, starts: & mut Vec<i64>, ends: & mut Vec<i64>) {
+    var depth: i64 = 0;
+    var s: i64 = a;
+    var i: i64 = a;
+    while i < b {
+        var x: str = t.get(i);
+        if x == "(" || x == "[" || x == "{" || x == "<" {
+            depth = depth + 1;
+        } else if x == ")" || x == "]" || x == "}" || x == ">" {
+            depth = depth - 1;
+        } else if x == ">>" {
+            depth = depth - 2;
+        } else if x == "," && depth == 0 {
+            starts.push(s);
+            ends.push(i);
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    if b > s {
+        starts.push(s);
+        ends.push(b);
+    }
+}
+
+/// The tokens [a, b) as C++ text: identifiers and numbers apart, the rest
+/// joined.
+fn cpx_text(t: Vec<str>, k: Vec<i64>, a: i64, b: i64) -> str {
+    var out: str = "";
+    var prev_word: bool = false;
+    var i: i64 = a;
+    while i < b {
+        var word: bool = k.get(i) == CTK_IDENT || k.get(i) == CTK_NUM;
+        if word && prev_word {
+            out = out + " ";
+        }
+        out = out + t.get(i);
+        prev_word = word;
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The base of a C type in words [a, b), as cp_base_of reads one.
+fn cpx_base_of(w: Vec<str>, wk: Vec<i64>, a: i64, b: i64) -> str {
+    var unsigned: bool = false;
+    var signed: bool = false;
+    var longs: i64 = 0;
+    var short: bool = false;
+    var word: str = "";
+    var i: i64 = a;
+    while i < b {
+        var t: str = w.get(i);
+        if t == "unsigned" {
+            unsigned = true;
+        } else if t == "signed" {
+            signed = true;
+        } else if t == "long" {
+            longs = longs + 1;
+        } else if t == "short" {
+            short = true;
+        } else if t == "int" {
+            if word == "" {
+                word = "int";
+            }
+        } else if t == "struct" || t == "union" || t == "enum" {
+            if i + 1 < b {
+                return t + " " + w.get(i + 1);
+            }
+            return "?";
+        } else if wk.get(i) == CTK_IDENT {
+            word = t;
+        } else {
+            return "?";
+        }
+        i = i + 1;
+    }
+    if longs >= 2 {
+        if unsigned {
+            return "ullong";
+        }
+        return "llong";
+    }
+    if longs == 1 && word == "double" {
+        return "double";
+    }
+    if longs == 1 {
+        if unsigned {
+            return "ulong";
+        }
+        return "long";
+    }
+    if short {
+        if unsigned {
+            return "ushort";
+        }
+        return "short";
+    }
+    if word == "char" {
+        if unsigned {
+            return "uchar";
+        }
+        return "char";
+    }
+    if word == "" || word == "int" {
+        if unsigned {
+            return "uint";
+        }
+        if signed || word == "int" {
+            return "int";
+        }
+        return "?";
+    }
+    if word == "float" || word == "double" || word == "void" {
+        return word;
+    }
+    if word == "_Bool" || word == "bool" {
+        return "bool";
+    }
+    if unsigned {
+        return "uint";
+    }
+    return "td " + word;
+}
+
+/// The C type the shim gives a Fides scalar.
+fn cpx_prim_cty(f: str) -> str {
+    if f == "i8" {
+        return "int8_t";
+    }
+    if f == "i16" {
+        return "int16_t";
+    }
+    if f == "i32" {
+        return "int32_t";
+    }
+    if f == "u8" {
+        return "uint8_t";
+    }
+    if f == "u16" {
+        return "uint16_t";
+    }
+    if f == "u32" {
+        return "uint32_t";
+    }
+    if f == "u64" {
+        return "uint64_t";
+    }
+    if f == "f32" {
+        return "float";
+    }
+    if f == "f64" {
+        return "double";
+    }
+    if f == "bool" {
+        return "bool";
+    }
+    return "int64_t";
+}
+
+/// Is a cpx_base_of base a type C++ names the same everywhere (not a
+/// typedef or struct, which may live in a namespace)?
+fn cpx_is_fundamental(base: str) -> bool {
+    return base == "int" || base == "uint" || base == "char" || base == "uchar" || base == "short" || base == "ushort" || base == "long" || base == "ulong" || base == "llong" || base == "ullong" || base == "float" || base == "double" || base == "bool" || base == "void";
+}
+
+fn cpx_is_prim(f: str) -> bool {
+    return f == "i8" || f == "i16" || f == "i32" || f == "i64" || f == "u8" || f == "u16" || f == "u32" || f == "u64" || f == "f32" || f == "f64" || f == "bool";
+}
+
+/// The class `text` names (simple or qualified), as an index of
+/// cx_class_q, or -1.
+fn cpx_class_at(st: & CHeaderState, text: str) -> i64 {
+    var i: i64 = 0;
+    while i < st.cx_class_q.len() {
+        var q: str = st.cx_class_q.get(i);
+        if q == text || str_ends_with(q, "::" + text) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// How the C++ type in tokens [a, b) (no declarator name) crosses a shim.
+fn cpx_type(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, a: i64, b: i64) -> CpxTy {
+    var words: Vec<str> = Vec::new();
+    var wk: Vec<i64> = Vec::new();
+    var is_const: bool = false;
+    var refs: i64 = 0;
+    var ptr: i64 = 0;
+    var i: i64 = a;
+    while i < b {
+        var x: str = t.get(i);
+        if x == "const" || x == "volatile" {
+            if ptr == 0 && x == "const" {
+                is_const = true;
+            }
+        } else if x == "typename" || x == "mutable" {
+            // nothing to cross
+        } else if x == "&" {
+            refs = refs + 1;
+        } else if x == "&&" {
+            return cpx_ty_bad("an rvalue reference (&&)");
+        } else if x == "*" {
+            if refs > 0 {
+                return cpx_ty_bad("a pointer to a reference");
+            }
+            ptr = ptr + 1;
+        } else if x == "(" || x == ")" {
+            return cpx_ty_bad("a function pointer (pass an address)");
+        } else if x == "[" || x == "]" {
+            return cpx_ty_bad("an array");
+        } else if x == "..." {
+            return cpx_ty_bad("variadic");
+        } else {
+            if refs > 0 || ptr > 0 {
+                return cpx_ty_bad("a type this parser does not know");
+            }
+            words.push(x);
+            wk.push(k.get(i));
+        }
+        i = i + 1;
+    }
+    if refs > 1 {
+        return cpx_ty_bad("a reference to a reference");
+    }
+    if refs > 0 && ptr > 0 {
+        return cpx_ty_bad("a reference to a pointer");
+    }
+    if words.len() == 0 {
+        return cpx_ty_bad("no type");
+    }
+    var w0: i64 = 0;
+    var std_q: bool = false;
+    if words.len() >= 3 && words.get(0) == "std" && words.get(1) == ":" && words.get(2) == ":" {
+        w0 = 3;
+        std_q = true;
+    } else if words.len() >= 2 && words.get(0) == ":" && words.get(1) == ":" {
+        w0 = 2;
+    }
+    var text: str = cpx_text(words, wk, w0, words.len());
+    var full: str = cpx_text(words, wk, 0, words.len());
+    if str_contains(text, "<") {
+        return cpx_ty_bad("a template type (" + full + ")");
+    }
+    if std_q && (text == "string" || text == "string_view") {
+        if ptr > 0 {
+            return cpx_ty_bad("a pointer to " + full);
+        }
+        return cpx_ty(CPX_STR, "str", "const char*", "");
+    }
+    if text == "auto" || str_starts_with(text, "decltype") {
+        return cpx_ty_bad("auto");
+    }
+    var ci: i64 = - 1;
+    if !std_q {
+        ci = cpx_class_at(st, text);
+    }
+    if ci >= 0 {
+        var q: str = st.cx_class_q.get(ci);
+        if ptr == 1 && refs == 0 {
+            return cpx_ty(CPX_OBJP, "i64", "void*", q);
+        }
+        if ptr == 0 && refs == 1 {
+            return cpx_ty(CPX_OBJR, "i64", "void*", q);
+        }
+        if ptr == 0 && refs == 0 {
+            return cpx_ty(CPX_OBJV, "i64", "void*", q);
+        }
+        return cpx_ty_bad("a pointer to a pointer to " + q);
+    }
+    // `std::size_t`, `std::int32_t`: the C names
+    var base: str = cpx_base_of(words, wk, w0, words.len());
+    if base == "?" {
+        return cpx_ty_bad("a type this parser does not know (" + full + ")");
+    }
+    if refs == 1 {
+        var rf: str = cp_resolve(st, base, 0, 0);
+        if !cpx_is_prim(rf) {
+            return cpx_ty_bad("a reference to " + full);
+        }
+        if is_const {
+            return cpx_ty(CPX_VAL, rf, cpx_prim_cty(rf), "");
+        }
+        if !cpx_is_fundamental(base) {
+            return cpx_ty(CPX_REFA, "*" + rf, "void*", "");
+        }
+        return cpx_ty(CPX_REFP, "*" + rf, full + "*", "");
+    }
+    var f: str = cp_resolve(st, base, ptr, 0);
+    if f == "?" {
+        return cpx_ty_bad("a type this parser does not know (" + full + ")");
+    }
+    if f == "valist" {
+        return cpx_ty_bad("a va_list");
+    }
+    if str_starts_with(f, "struct:") {
+        return cpx_ty_bad("a struct by value (" + full + ")");
+    }
+    if f == "void" {
+        return cpx_ty(CPX_VOID, "void", "void", "");
+    }
+    if ptr == 0 {
+        return cpx_ty(CPX_VAL, f, cpx_prim_cty(f), "");
+    }
+    if !cpx_is_fundamental(base) {
+        return cpx_ty(CPX_ANYP, f, "void*", "");
+    }
+    // a pointer keeps the type as written (C++ converts no pointer types)
+    var cty: str = full;
+    if is_const {
+        cty = "const " + cty;
+    }
+    var p: i64 = 0;
+    while p < ptr {
+        cty = cty + "*";
+        p = p + 1;
+    }
+    return cpx_ty(CPX_VAL, f, cty, "");
+}
+
+/// A Fides name not given yet: `base`, else `base_2`, `base_3`, ...
+fn cpx_unique_name(st: & mut CHeaderState, base: str) -> str {
+    var name: str = cp_safe_name(base);
+    var n: i64 = 2;
+    while HashMap_contains(st.cx_names, name) {
+        name = base + "_" + int_to_str(n);
+        n = n + 1;
+    }
+    HashMap_insert(st.cx_names, name, 1);
+    return name;
+}
+
+/// Is there a type word in [a, b) (anything but const and volatile)?
+fn cpx_has_type_before(t: Vec<str>, a: i64, b: i64) -> bool {
+    var i: i64 = a;
+    while i < b {
+        if t.get(i) != "const" && t.get(i) != "volatile" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Binds one C++ function declaration, tokens [a, b) of `t` (its type,
+/// name, parameters and what follows them; no body), through a shim.
+/// `mode` is CPX_FREE, CPX_METHOD, CPX_STATIC or CPX_CTOR; `cls_q` the
+/// class (methods, constructors); `ns_q` the namespace (free functions);
+/// `fides_prefix` goes before the C++ name ("a_b_", "a_C_"); `callee` and
+/// `fides` replace the name called and the Fides name when not "".
+fn cpx_bind(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, a: i64, b: i64, mode: i64, cls_q: str, ns_q: str, fides_prefix: str, callee: str, fides: str) {
+    cpx_bind_w(st, t, k, a, b, mode, cls_q, ns_q, fides_prefix, callee, fides, false);
+}
+
+/// cpx_bind; `weak`: a free function the header declares without a body
+/// is called through a weak reference, so a program links without its
+/// library as long as it does not call it (a call is then an error value).
+fn cpx_bind_w(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, a: i64, b: i64, mode: i64, cls_q: str, ns_q: str, fides_prefix: str, callee: str, fides: str, weak: bool) {
+    // the parameters: the first `(`
+    var lp: i64 = - 1;
+    var i: i64 = a;
+    while i < b {
+        if t.get(i) == "(" {
+            lp = i;
+            break;
+        }
+        if t.get(i) == "operator" {
+            return;
+        }
+        i = i + 1;
+    }
+    if lp <= a {
+        return;
+    }
+    var rp: i64 = cpx_close(t, lp);
+    if rp >= b {
+        return;
+    }
+    // the name: before `(`, or before `<..>` (an explicit instantiation)
+    var name_at: i64 = lp - 1;
+    if t.get(name_at) == ">" || t.get(name_at) == ">>" {
+        var d: i64 = 0;
+        var j: i64 = name_at;
+        while j > a {
+            if t.get(j) == ">" {
+                d = d + 1;
+            } else if t.get(j) == ">>" {
+                d = d + 2;
+            } else if t.get(j) == "<" {
+                d = d - 1;
+                if d == 0 {
+                    break;
+                }
+            }
+            j = j - 1;
+        }
+        name_at = j - 1;
+    }
+    if name_at < a || k.get(name_at) != CTK_IDENT {
+        return;
+    }
+    var name: str = t.get(name_at);
+    // `int C::f() { .. }` -- a method defined outside its class: bound with
+    // the class
+    if mode == CPX_FREE && name_at > a && t.get(name_at - 1) == ":" {
+        return;
+    }
+    var label: str = cpx_qualify(ns_q, name);
+    if mode == CPX_METHOD || mode == CPX_STATIC {
+        label = cls_q + "::" + name;
+    }
+    if mode == CPX_CTOR {
+        label = cls_q + "::" + name + " (a constructor)";
+    }
+    // what follows the parameters
+    var j2: i64 = rp + 1;
+    while j2 < b {
+        var x: str = t.get(j2);
+        if x == "=" && j2 + 1 < b && t.get(j2 + 1) == "delete" {
+            return;
+        }
+        if x == "->" {
+            st.skipped.push(label + ": a trailing result type (-> T) is not bound");
+            return;
+        }
+        if x == ":" && mode == CPX_CTOR {
+            // a constructor's member initializers
+            break;
+        }
+        j2 = j2 + 1;
+    }
+    // the result type: what is before the name, without the specifiers
+    var ra: i64 = a;
+    while ra < name_at && (t.get(ra) == "static" || t.get(ra) == "virtual" || t.get(ra) == "explicit" || t.get(ra) == "friend" || t.get(ra) == "template" || t.get(ra) == "typename" || t.get(ra) == "inline") {
+        if t.get(ra) == "friend" {
+            return;
+        }
+        ra = ra + 1;
+    }
+    var ret: CpxTy = cpx_ty(CPX_OBJP, "i64", "void*", cls_q);
+    if mode != CPX_CTOR {
+        if ra >= name_at {
+            return;
+        }
+        ret = cpx_type(st, t, k, ra, name_at);
+        if ret.why != "" {
+            st.skipped.push(label + ": the result is " + ret.why);
+            return;
+        }
+    }
+    // the parameters
+    var fparams: Vec<str> = Vec::new();
+    var cparams: Vec<str> = Vec::new();
+    var args: Vec<str> = Vec::new();
+    // the parameters as declared, without default values (the weak
+    // redeclaration)
+    var pdecl: Vec<str> = Vec::new();
+    var prelude: str = "";
+    if mode == CPX_METHOD {
+        fparams.push("self_: i64");
+        cparams.push("void* self");
+    }
+    var empty: bool = rp == lp + 1 || (rp == lp + 2 && t.get(lp + 1) == "void");
+    if !empty {
+        var ps: Vec<i64> = Vec::new();
+        var pe: Vec<i64> = Vec::new();
+        cpx_split_commas(t, lp + 1, rp, & mut ps, & mut pe);
+        var pi: i64 = 0;
+        while pi < ps.len() {
+            var pa: i64 = ps.get(pi);
+            var pb: i64 = pe.get(pi);
+            // a default value
+            var q2: i64 = pa;
+            var dd: i64 = 0;
+            while q2 < pb {
+                var y: str = t.get(q2);
+                if y == "(" || y == "<" || y == "[" || y == "{" {
+                    dd = dd + 1;
+                } else if y == ")" || y == ">" || y == "]" || y == "}" {
+                    dd = dd - 1;
+                } else if y == "=" && dd == 0 {
+                    pb = q2;
+                    break;
+                }
+                q2 = q2 + 1;
+            }
+            var pname: str = "arg" + int_to_str(pi);
+            var te: i64 = pb;
+            if pb - 1 > pa && k.get(pb - 1) == CTK_IDENT && !cpx_is_type_word(t.get(pb - 1)) && t.get(pb - 2) != ":" && cpx_has_type_before(t, pa, pb - 1) {
+                pname = t.get(pb - 1);
+                te = pb - 1;
+            }
+            var pty: CpxTy = cpx_type(st, t, k, pa, te);
+            if pty.why != "" {
+                st.skipped.push(label + ": parameter " + pname + " is " + pty.why);
+                return;
+            }
+            if pty.kind == CPX_VOID {
+                st.skipped.push(label + ": parameter " + pname + " is void");
+                return;
+            }
+            var an: str = "a" + int_to_str(pi);
+            fparams.push(cp_safe_name(pname) + ": " + pty.fides);
+            cparams.push(pty.cty + " " + an);
+            pdecl.push(cpx_text(t, k, pa, pb));
+            if pty.kind == CPX_REFP {
+                args.push("*" + an);
+            } else if pty.kind == CPX_ANYP {
+                args.push("fidcpp_any{" + an + "}");
+            } else if pty.kind == CPX_REFA {
+                args.push("fidcpp_ref{" + an + "}");
+            } else if pty.kind == CPX_STR {
+                prelude = prelude + "std::string s" + int_to_str(pi) + "(" + an + " ? " + an + " : \"\"); ";
+                args.push("s" + int_to_str(pi));
+            } else if pty.kind == CPX_OBJP {
+                args.push("(" + pty.cls + "*)" + an);
+            } else if pty.kind == CPX_OBJR || pty.kind == CPX_OBJV {
+                args.push("*(" + pty.cls + "*)" + an);
+            } else {
+                args.push(an);
+            }
+            pi = pi + 1;
+        }
+    }
+    // the Fides name and the call
+    var fname: str = fides;
+    if fname == "" {
+        if mode == CPX_CTOR {
+            fname = fides_prefix + "new";
+        } else {
+            fname = fides_prefix + name;
+        }
+    }
+    var base_name: str = cp_safe_name(fname);
+    fname = cpx_unique_name(st, fname);
+    if fname != base_name {
+        st.cx_notes.push(label + ": an overload, bound as " + fname);
+    }
+    var call: str = callee;
+    // LG16: the weak reference: in the function's namespace, a weak
+    // redeclaration and a pointer to it (which picks the overload)
+    var wref: str = "";
+    if weak && mode == CPX_FREE && call == "" {
+        var wid: str = "fidcpp_w" + int_to_str(st.cx_code.len());
+        var nsl: Vec<str> = Vec::new();
+        if str_len(ns_q) > 0 {
+            nsl = str_split(ns_q, "::");
+        }
+        var wopen: str = "";
+        var wclose: str = "";
+        var ni: i64 = 0;
+        while ni < nsl.len() {
+            wopen = wopen + "namespace " + nsl.get(ni) + " { ";
+            wclose = wclose + " }";
+            ni = ni + 1;
+        }
+        var rtext: str = cpx_text(t, k, ra, name_at);
+        var ptext: str = str_join(pdecl, ", ");
+        var trail: str = "";
+        var tj: i64 = rp + 1;
+        while tj < b && t.get(tj) != "=" {
+            trail = trail + " " + t.get(tj);
+            tj = tj + 1;
+        }
+        st.cx_code.push(wopen + "__attribute__((weak)) " + rtext + " " + name + "(" + ptext + ")" + trail + "; static " + rtext + " (*" + wid + ")(" + ptext + ")" + trail + " = &" + name + ";" + wclose);
+        wref = cpx_qualify(ns_q, wid);
+        call = wref;
+    }
+    if call == "" {
+        if mode == CPX_FREE {
+            call = cpx_qualify(ns_q, name);
+        } else if mode == CPX_STATIC {
+            call = cls_q + "::" + name;
+        } else if mode == CPX_METHOD {
+            call = "((" + cls_q + "*)self)->" + name;
+        } else {
+            call = "new " + cls_q;
+        }
+    }
+    var e: str = call + "(" + str_join(args, ", ") + ")";
+    var body: str = "";
+    var fallback: str = "    return {};";
+    if mode == CPX_CTOR {
+        body = "return (void*)(" + e + ");";
+        fallback = "    return nullptr;";
+    } else if ret.kind == CPX_VOID {
+        body = e + "; return;";
+        fallback = "";
+    } else if ret.kind == CPX_REFP {
+        body = "return &(" + e + ");";
+    } else if ret.kind == CPX_STR {
+        body = "return fidcpp_dup(std::string(" + e + "));";
+        fallback = "    return \"\";";
+    } else if ret.kind == CPX_OBJP {
+        body = "return (void*)(" + e + ");";
+        fallback = "    return nullptr;";
+    } else if ret.kind == CPX_OBJR {
+        body = "return (void*)&(" + e + ");";
+        fallback = "    return nullptr;";
+    } else if ret.kind == CPX_OBJV {
+        body = "return (void*)new " + ret.cls + "(" + e + ");";
+        fallback = "    return nullptr;";
+    } else if ret.kind == CPX_ANYP {
+        body = "return (void*)(" + e + ");";
+        fallback = "    return nullptr;";
+    } else if ret.kind == CPX_REFA {
+        body = "return (void*)&(" + e + ");";
+        fallback = "    return nullptr;";
+    } else {
+        body = "return " + e + ";";
+    }
+    var cps: str = str_join(cparams, ", ");
+    if cps == "" {
+        cps = "void";
+    }
+    st.cx_code.push("extern \"C\" " + ret.cty + " __fidcpp_" + fname + "(" + cps + ") {");
+    st.cx_code.push("    fidcpp_fail = 0;");
+    if wref != "" {
+        st.cx_code.push("    if (!" + wref + ") { fidcpp_set(\"" + label + " is not defined: link the library that defines it\"); }");
+        st.cx_code.push("    else try { " + prelude + body + " }");
+    } else {
+        st.cx_code.push("    try { " + prelude + body + " }");
+    }
+    st.cx_code.push("    FIDCPP_CATCH");
+    if fallback != "" {
+        st.cx_code.push(fallback);
+    }
+    st.cx_code.push("}");
+    var line: str = "    fn __fidcpp_" + fname + " as " + fname + "(" + str_join(fparams, ", ") + ")";
+    if ret.kind != CPX_VOID {
+        line = line + " -> " + ret.fides;
+    }
+    st.cx_lines.push(line + ";");
+}
+
+/// LG16: a declaration [a, b) of the code's tokens with C++ linkage: a shim
+/// (or, in a system header, nothing). False when it has C linkage. `proto`:
+/// a declaration without a body (called through a weak reference).
+fn cpx_cpp_function(st: & mut CHeaderState, a: i64, b: i64) -> bool {
+    return cpx_cpp_function_p(st, a, b, false);
+}
+
+fn cpx_cpp_function_p(st: & mut CHeaderState, a: i64, b: i64, proto: bool) -> bool {
+    if a >= b || b > st.tok_c.len() {
+        return false;
+    }
+    var lp: i64 = cp_find(st, a, b, "(");
+    if lp <= a {
+        return false;
+    }
+    var at: i64 = lp - 1;
+    if st.tok_c.get(at) {
+        return false;
+    }
+    if st.tok_sys.get(at) {
+        return true;
+    }
+    var t: Vec<str> = Vec::new();
+    var k: Vec<i64> = Vec::new();
+    // the raw tokens dropped before the first kept one belong to it too
+    // (`const char* f()`: `const`)
+    var ra: i64 = st.tok_raw.get(a);
+    while ra > 0 && st.rawk.get(ra - 1) == CTK_IDENT && (st.raw.get(ra - 1) == "const" || st.raw.get(ra - 1) == "volatile" || cp_is_noise_word(st.raw.get(ra - 1)) || cp_is_annotation_word(st.raw.get(ra - 1)) || cp_macro_is_noise(st, st.raw.get(ra - 1))) {
+        ra = ra - 1;
+    }
+    cpx_clean(st, ra, st.tok_raw.get(b - 1) + 1, & mut t, & mut k);
+    var ns_q: str = st.tok_nsq.get(at);
+    var fp: str = cpx_prefix(st.tok_ns.get(at));
+    cpx_bind_w(st, t, k, 0, t.len(), CPX_FREE, "", ns_q, fp, "", "", proto);
+    return true;
+}
+
+/// Does a function definition's body start at `brace` (`) noexcept {`,
+/// `) override {`)? cp_parse_decls checks `) {` itself.
+fn cpx_def_tail(st: & CHeaderState, start: i64, brace: i64) -> bool {
+    var j: i64 = brace - 1;
+    while j > start {
+        var x: str = st.toks.get(j);
+        if x == "noexcept" || x == "override" || x == "final" {
+            j = j - 1;
+            continue;
+        }
+        if x == ")" {
+            // noexcept(expr)
+            var o: i64 = j;
+            var pd: i64 = 0;
+            while o > start {
+                if st.toks.get(o) == ")" {
+                    pd = pd + 1;
+                }
+                if st.toks.get(o) == "(" {
+                    pd = pd - 1;
+                    if pd == 0 {
+                        break;
+                    }
+                }
+                o = o - 1;
+            }
+            if o > start && st.toks.get(o - 1) == "noexcept" {
+                j = o - 2;
+                continue;
+            }
+        }
+        return x == ")" && j < brace - 1;
+    }
+    return false;
+}
+
+/// A class, struct or template of the header itself, raw tokens [at, end).
+fn cpx_construct(st: & mut CHeaderState, at: i64, end: i64, ns_us: str, ns_q: str) {
+    var t: Vec<str> = Vec::new();
+    var k: Vec<i64> = Vec::new();
+    cpx_clean(st, at, end, & mut t, & mut k);
+    if t.len() < 2 {
+        return;
+    }
+    if t.get(0) == "template" {
+        cpx_template(st, t, k, ns_us, ns_q);
+        return;
+    }
+    cpx_class(st, t, k, ns_us, ns_q);
+}
+
+/// The index after the specifiers a member starts with (virtual, explicit,
+/// inline, static, mutable).
+fn cpx_skip_specifiers(t: Vec<str>, s: i64, e: i64) -> i64 {
+    var i: i64 = s;
+    while i < e && (t.get(i) == "virtual" || t.get(i) == "explicit" || t.get(i) == "static" || t.get(i) == "mutable" || t.get(i) == "inline") {
+        i = i + 1;
+    }
+    return i;
+}
+
+/// Is `x` followed by `y` somewhere in [a, b)?
+fn cpx_has_seq(t: Vec<str>, a: i64, b: i64, x: str, y: str) -> bool {
+    var i: i64 = a;
+    while i + 1 < b {
+        if t.get(i) == x && t.get(i + 1) == y {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `class N { .. };` or `struct N { .. };` in `t`.
+fn cpx_class(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, ns_us: str, ns_q: str) {
+    if k.get(1) != CTK_IDENT {
+        return;
+    }
+    var name: str = t.get(1);
+    var q: str = cpx_qualify(ns_q, name);
+    var fp: str = cpx_prefix(ns_us) + name + "_";
+    if !cp_strs_has(st.cx_class_q, q) {
+        st.cx_class_q.push(q);
+        st.cx_class_s.push(name);
+    }
+    var lb: i64 = - 1;
+    var i: i64 = 2;
+    while i < t.len() {
+        if t.get(i) == "{" {
+            lb = i;
+            break;
+        }
+        if t.get(i) == ";" {
+            break;
+        }
+        i = i + 1;
+    }
+    if lb < 0 {
+        // a declaration only: a handle other functions can take
+        return;
+    }
+    var rb: i64 = cpx_close(t, lb);
+    // the members: [ms, me) each, with its access
+    var ms: Vec<i64> = Vec::new();
+    var me: Vec<i64> = Vec::new();
+    var mpub: Vec<bool> = Vec::new();
+    var public: bool = t.get(0) == "struct";
+    i = lb + 1;
+    while i < rb {
+        var x: str = t.get(i);
+        if (x == "public" || x == "private" || x == "protected") && i + 1 < rb && t.get(i + 1) == ":" {
+            public = x == "public";
+            i = i + 2;
+            continue;
+        }
+        if x == ";" {
+            i = i + 1;
+            continue;
+        }
+        var s: i64 = i;
+        var e: i64 = rb;
+        var pd: i64 = 0;
+        while i < rb {
+            var y: str = t.get(i);
+            if y == "(" || y == "[" {
+                pd = pd + 1;
+            } else if y == ")" || y == "]" {
+                pd = pd - 1;
+            } else if y == ";" && pd == 0 {
+                e = i;
+                i = i + 1;
+                break;
+            } else if y == "{" && pd == 0 {
+                e = i;
+                i = cpx_close(t, i) + 1;
+                if i < rb && t.get(i) == ";" {
+                    i = i + 1;
+                }
+                break;
+            }
+            i = i + 1;
+        }
+        ms.push(s);
+        me.push(e);
+        mpub.push(public);
+    }
+    // what the class has: a constructor, a pure virtual method, a destructor
+    // that is not public
+    var abstract: bool = false;
+    var has_ctor: bool = false;
+    var no_delete: bool = false;
+    var mi: i64 = 0;
+    while mi < ms.len() {
+        var s2: i64 = cpx_skip_specifiers(t, ms.get(mi), me.get(mi));
+        var e2: i64 = me.get(mi);
+        if s2 < e2 {
+            if t.get(s2) == name && s2 + 1 < e2 && t.get(s2 + 1) == "(" {
+                has_ctor = true;
+            }
+            if t.get(s2) == "~" {
+                if !mpub.get(mi) || cpx_has_seq(t, s2, e2, "=", "delete") {
+                    no_delete = true;
+                }
+            }
+            if cpx_has_seq(t, s2, e2, "=", "0") {
+                abstract = true;
+            }
+        }
+        mi = mi + 1;
+    }
+    // the bindings
+    mi = 0;
+    while mi < ms.len() {
+        if mpub.get(mi) {
+            cpx_member(st, t, k, ms.get(mi), me.get(mi), name, q, fp, abstract);
+        }
+        mi = mi + 1;
+    }
+    if !has_ctor && !abstract {
+        var dt: Vec<str> = Vec::new();
+        var dk: Vec<i64> = Vec::new();
+        dt.push(name);
+        dk.push(CTK_IDENT);
+        dt.push("(");
+        dk.push(CTK_PUNCT);
+        dt.push(")");
+        dk.push(CTK_PUNCT);
+        cpx_bind(st, dt, dk, 0, 3, CPX_CTOR, q, ns_q, fp, "", "");
+    }
+    if !no_delete {
+        var dname: str = cpx_unique_name(st, fp + "delete");
+        st.cx_code.push("extern \"C\" void __fidcpp_" + dname + "(void* self) {");
+        st.cx_code.push("    fidcpp_fail = 0;");
+        st.cx_code.push("    try { delete (" + q + "*)self; }");
+        st.cx_code.push("    FIDCPP_CATCH");
+        st.cx_code.push("}");
+        st.cx_lines.push("    fn __fidcpp_" + dname + " as " + dname + "(self_: i64);");
+    }
+}
+
+/// One public member [s, e) of class `name` (`q` in C++, `fp` the Fides
+/// prefix "a_C_").
+fn cpx_member(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, s: i64, e: i64, name: str, q: str, fp: str, abstract: bool) {
+    var j: i64 = s;
+    var is_static: bool = false;
+    while j < e && (t.get(j) == "virtual" || t.get(j) == "explicit" || t.get(j) == "static" || t.get(j) == "mutable" || t.get(j) == "inline") {
+        if t.get(j) == "static" {
+            is_static = true;
+        }
+        j = j + 1;
+    }
+    if j >= e {
+        return;
+    }
+    var first: str = t.get(j);
+    if first == "friend" || first == "using" || first == "typedef" || first == "static_assert" || first == "enum" || first == "~" {
+        return;
+    }
+    if first == "class" || first == "struct" || first == "union" {
+        st.skipped.push(q + "::" + cpx_text(t, k, j + 1, j + 2) + ": a nested class is not bound");
+        return;
+    }
+    if first == "template" {
+        st.skipped.push(q + ": a member template is not bound");
+        return;
+    }
+    var lp: i64 = - 1;
+    var i: i64 = j;
+    while i < e {
+        if t.get(i) == "(" {
+            lp = i;
+            break;
+        }
+        if t.get(i) == "operator" {
+            st.skipped.push(q + "::operator" + cpx_text(t, k, i + 1, i + 2) + ": a C++ operator is not bound (wrap it in a named function)");
+            return;
+        }
+        if t.get(i) == "=" || t.get(i) == "[" || t.get(i) == "{" {
+            break;
+        }
+        i = i + 1;
+    }
+    if lp < 0 {
+        if !is_static {
+            cpx_field(st, t, k, j, e, q, fp);
+        }
+        return;
+    }
+    if first == name && lp == j + 1 {
+        if abstract {
+            return;
+        }
+        // a copy or move constructor: not bound (a handle is copied as a
+        // number, the object is not)
+        var rp: i64 = cpx_close(t, lp);
+        var one: bool = true;
+        var ref_self: bool = false;
+        var cc: i64 = lp + 1;
+        while cc < rp {
+            if t.get(cc) == "," {
+                one = false;
+            }
+            if t.get(cc) == name && cc + 1 < rp && (t.get(cc + 1) == "&" || t.get(cc + 1) == "&&") {
+                ref_self = true;
+            }
+            cc = cc + 1;
+        }
+        if one && ref_self {
+            return;
+        }
+        cpx_bind(st, t, k, j, e, CPX_CTOR, q, "", fp, "", "");
+        return;
+    }
+    if is_static {
+        cpx_bind(st, t, k, j, e, CPX_STATIC, q, "", fp, "", "");
+    } else {
+        cpx_bind(st, t, k, j, e, CPX_METHOD, q, "", fp, "", "");
+    }
+}
+
+/// A public field [s, e) of class `q`: a getter, and a setter unless it is
+/// const or an object held by value.
+fn cpx_field(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, s: i64, e: i64, q: str, fp: str) {
+    // `int a = 1;`, `int a{1};`: the initializer goes; `int a, b;`: the
+    // first only
+    var end: i64 = e;
+    var i: i64 = s;
+    while i < e {
+        var x: str = t.get(i);
+        if x == "=" || x == "{" || x == "," {
+            end = i;
+            break;
+        }
+        if x == "[" {
+            st.skipped.push(q + ": an array field is not bound");
+            return;
+        }
+        if x == ":" && !(i + 1 < e && t.get(i + 1) == ":") && !(i > s && t.get(i - 1) == ":") {
+            // a bit field
+            return;
+        }
+        i = i + 1;
+    }
+    if end - 1 <= s || k.get(end - 1) != CTK_IDENT {
+        return;
+    }
+    var fname: str = t.get(end - 1);
+    var ty: CpxTy = cpx_type(st, t, k, s, end - 1);
+    if ty.why != "" {
+        st.skipped.push(q + "::" + fname + ": the field is " + ty.why);
+        return;
+    }
+    if ty.kind == CPX_REFP || ty.kind == CPX_REFA || ty.kind == CPX_OBJR || ty.kind == CPX_VOID {
+        st.skipped.push(q + "::" + fname + ": a reference field is not bound");
+        return;
+    }
+    // const after the last `*`, or with no `*`: the field cannot change
+    var konst: bool = false;
+    var c: i64 = s;
+    while c < end - 1 {
+        if t.get(c) == "const" {
+            konst = true;
+        }
+        if t.get(c) == "*" {
+            konst = false;
+        }
+        c = c + 1;
+    }
+    var self_f: str = "((" + q + "*)self)->" + fname;
+    var gname: str = cpx_unique_name(st, fp + "get_" + fname);
+    var gbody: str = "return " + self_f + ";";
+    if ty.kind == CPX_STR {
+        gbody = "return fidcpp_dup(std::string(" + self_f + "));";
+    } else if ty.kind == CPX_OBJV {
+        gbody = "return (void*)&(" + self_f + ");";
+    } else if ty.kind == CPX_OBJP || ty.kind == CPX_ANYP {
+        gbody = "return (void*)(" + self_f + ");";
+    }
+    st.cx_code.push("extern \"C\" " + ty.cty + " __fidcpp_" + gname + "(void* self) { " + gbody + " }");
+    st.cx_lines.push("    fn __fidcpp_" + gname + " as " + gname + "(self_: i64) -> " + ty.fides + ";");
+    if konst || ty.kind == CPX_OBJV {
+        return;
+    }
+    var sname: str = cpx_unique_name(st, fp + "set_" + fname);
+    var sbody: str = self_f + " = v;";
+    if ty.kind == CPX_STR {
+        sbody = self_f + " = std::string(v ? v : \"\");";
+    } else if ty.kind == CPX_OBJP {
+        sbody = self_f + " = (" + ty.cls + "*)v;";
+    } else if ty.kind == CPX_ANYP {
+        sbody = self_f + " = fidcpp_any{v};";
+    }
+    st.cx_code.push("extern \"C\" void __fidcpp_" + sname + "(void* self, " + ty.cty + " v) { " + sbody + " }");
+    st.cx_lines.push("    fn __fidcpp_" + sname + " as " + sname + "(self_: i64, v: " + ty.fides + ");");
+}
+
+/// `template <..> ...` in `t`: a function template is recorded (its
+/// instantiations are bound), an explicit instantiation bound, anything
+/// else noted.
+fn cpx_template(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, ns_us: str, ns_q: str) {
+    if t.get(1) != "<" {
+        cpx_explicit_instance(st, t, k, 1, ns_us, ns_q);
+        return;
+    }
+    var gt: i64 = cpx_angle_close(t, 1);
+    if gt < 0 {
+        return;
+    }
+    if gt == 2 {
+        // template <>: a specialization of a template already recorded
+        return;
+    }
+    var ps: Vec<i64> = Vec::new();
+    var pe: Vec<i64> = Vec::new();
+    cpx_split_commas(t, 2, gt, & mut ps, & mut pe);
+    var params: Vec<str> = Vec::new();
+    var ok: bool = true;
+    var pi: i64 = 0;
+    while pi < ps.len() {
+        var pa: i64 = ps.get(pi);
+        if (t.get(pa) == "typename" || t.get(pa) == "class") && pa + 1 < pe.get(pi) && k.get(pa + 1) == CTK_IDENT {
+            params.push(t.get(pa + 1));
+        } else {
+            ok = false;
+        }
+        pi = pi + 1;
+    }
+    var rest: i64 = gt + 1;
+    if rest >= t.len() {
+        return;
+    }
+    var what: str = t.get(rest);
+    if what == "class" || what == "struct" || what == "union" {
+        var cname: str = "";
+        if rest + 1 < t.len() && k.get(rest + 1) == CTK_IDENT {
+            cname = t.get(rest + 1);
+        }
+        st.skipped.push("class template " + cpx_qualify(ns_q, cname) + ": a class template is not bound (a function template is, for the types named)");
+        return;
+    }
+    if what == "template" || what == "using" || what == "friend" {
+        return;
+    }
+    // a function template: its declaration, to its body or its end
+    var lp: i64 = - 1;
+    var i: i64 = rest;
+    while i < t.len() {
+        if t.get(i) == "(" {
+            lp = i;
+            break;
+        }
+        if t.get(i) == ";" || t.get(i) == "{" || t.get(i) == "=" {
+            break;
+        }
+        i = i + 1;
+    }
+    if lp <= rest || k.get(lp - 1) != CTK_IDENT {
+        return;
+    }
+    var name: str = t.get(lp - 1);
+    if !ok {
+        st.skipped.push("template " + cpx_qualify(ns_q, name) + ": a template with a non-type parameter is not bound");
+        return;
+    }
+    var rp: i64 = cpx_close(t, lp);
+    var de: i64 = rp + 1;
+    while de < t.len() && t.get(de) != "{" && t.get(de) != ";" {
+        de = de + 1;
+    }
+    st.cx_tmpl_prefix.push(cpx_prefix(ns_us) + name);
+    st.cx_tmpl_q.push(cpx_qualify(ns_q, name));
+    st.cx_tmpl_params.push(str_join(params, ","));
+    st.cx_tmpl_at.push(st.cx_tt.len());
+    st.cx_tmpl_len.push(de - rest);
+    i = rest;
+    while i < de {
+        st.cx_tt.push(t.get(i));
+        st.cx_tk.push(k.get(i));
+        i = i + 1;
+    }
+}
+
+/// `template RET name<ARGS>(..);` (`extern template` too): binds that
+/// instantiation of a template recorded before it.
+fn cpx_explicit_instance(st: & mut CHeaderState, t: Vec<str>, k: Vec<i64>, from: i64, ns_us: str, ns_q: str) {
+    var lp: i64 = - 1;
+    var i: i64 = from;
+    while i < t.len() {
+        if t.get(i) == "(" {
+            lp = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if lp <= from {
+        return;
+    }
+    var gt: i64 = lp - 1;
+    if t.get(gt) != ">" {
+        if k.get(gt) == CTK_IDENT {
+            st.skipped.push("template " + cpx_qualify(ns_q, t.get(gt)) + ": an explicit instantiation is bound when it names its template arguments (f<int>)");
+        }
+        return;
+    }
+    // the `<` that opens the arguments
+    var d: i64 = 0;
+    var lt: i64 = gt;
+    while lt > from {
+        if t.get(lt) == ">" {
+            d = d + 1;
+        } else if t.get(lt) == "<" {
+            d = d - 1;
+            if d == 0 {
+                break;
+            }
+        }
+        lt = lt - 1;
+    }
+    if lt <= from || k.get(lt - 1) != CTK_IDENT {
+        return;
+    }
+    var name: str = t.get(lt - 1);
+    var ti: i64 = cpx_template_at(st, cpx_prefix(ns_us) + name);
+    if ti < 0 {
+        return;
+    }
+    var as_: Vec<i64> = Vec::new();
+    var ae: Vec<i64> = Vec::new();
+    cpx_split_commas(t, lt + 1, gt, & mut as_, & mut ae);
+    var targs: Vec<str> = Vec::new();
+    var ai: i64 = 0;
+    while ai < as_.len() {
+        targs.push(cpx_text(t, k, as_.get(ai), ae.get(ai)));
+        ai = ai + 1;
+    }
+    cpx_instantiate(st, ti, targs, "");
+}
+
+fn cpx_template_at(st: & CHeaderState, prefix: str) -> i64 {
+    var i: i64 = 0;
+    while i < st.cx_tmpl_prefix.len() {
+        if st.cx_tmpl_prefix.get(i) == prefix {
+            return i;
+        }
+        i = i + 1;
+    }
+    return - 1;
+}
+
+/// The Fides name of a C++ template argument ("i32" for int, "str" for
+/// std::string), "" for one without a short name.
+fn cpx_arg_name(st: & mut CHeaderState, arg: str) -> str {
+    var t: Vec<str> = Vec::new();
+    var k: Vec<i64> = Vec::new();
+    cp_tokens_of(arg, & mut t, & mut k);
+    var ty: CpxTy = cpx_type(st, t, k, 0, t.len());
+    if ty.why != "" {
+        return "";
+    }
+    if ty.kind == CPX_STR {
+        return "str";
+    }
+    if ty.kind == CPX_VAL && cpx_is_prim(ty.fides) {
+        return ty.fides;
+    }
+    return "";
+}
+
+/// The C++ type a Fides type name stands for in a template argument.
+fn cpx_fides_to_cpp(f: str) -> str {
+    if f == "i8" {
+        return "signed char";
+    }
+    if f == "i16" {
+        return "short";
+    }
+    if f == "i32" {
+        return "int";
+    }
+    if f == "i64" {
+        return "long long";
+    }
+    if f == "u8" {
+        return "unsigned char";
+    }
+    if f == "u16" {
+        return "unsigned short";
+    }
+    if f == "u32" {
+        return "unsigned int";
+    }
+    if f == "u64" {
+        return "unsigned long long";
+    }
+    if f == "f32" {
+        return "float";
+    }
+    if f == "f64" {
+        return "double";
+    }
+    if f == "bool" {
+        return "bool";
+    }
+    if f == "str" {
+        return "std::string";
+    }
+    return "";
+}
+
+/// Binds template `ti` for the C++ type arguments `targs` (as `fides`, or
+/// the template's prefix and each argument's Fides name).
+fn cpx_instantiate(st: & mut CHeaderState, ti: i64, targs: Vec<str>, fides: str) {
+    var params: Vec<str> = str_split(st.cx_tmpl_params.get(ti), ",");
+    if params.len() != targs.len() {
+        return;
+    }
+    var fname: str = fides;
+    if fname == "" {
+        fname = st.cx_tmpl_prefix.get(ti);
+        var ai: i64 = 0;
+        while ai < targs.len() {
+            var an: str = cpx_arg_name(st, targs.get(ai));
+            if an == "" {
+                st.skipped.push("template " + st.cx_tmpl_q.get(ti) + "<" + str_join(targs, ", ") + ">: an argument has no Fides name (bound for C scalars and std::string)");
+                return;
+            }
+            fname = fname + "_" + an;
+            ai = ai + 1;
+        }
+    }
+    if HashMap_contains(st.cx_names, fname) {
+        return;
+    }
+    // the declaration with each parameter replaced by its argument
+    var nt: Vec<str> = Vec::new();
+    var nk: Vec<i64> = Vec::new();
+    var at: i64 = st.cx_tmpl_at.get(ti);
+    var n: i64 = st.cx_tmpl_len.get(ti);
+    var i: i64 = 0;
+    while i < n {
+        var x: str = st.cx_tt.get(at + i);
+        var xk: i64 = st.cx_tk.get(at + i);
+        var pj: i64 = - 1;
+        if xk == CTK_IDENT {
+            var p: i64 = 0;
+            while p < params.len() {
+                if params.get(p) == x {
+                    pj = p;
+                }
+                p = p + 1;
+            }
+        }
+        if pj >= 0 {
+            cp_tokens_of(targs.get(pj), & mut nt, & mut nk);
+        } else {
+            nt.push(x);
+            nk.push(xk);
+        }
+        i = i + 1;
+    }
+    var callee: str = st.cx_tmpl_q.get(ti) + "<" + str_join(targs, ", ") + ">";
+    cpx_bind(st, nt, nk, 0, nt.len(), CPX_FREE, "", "", "", callee, fname);
+}
+
+/// The instantiations the program names: `<prefix>_<t1>_<t2>..` with one
+/// Fides type name for each template parameter.
+fn cpx_instantiate_wanted(st: & mut CHeaderState, program: str) {
+    if st.cx_tmpl_prefix.len() == 0 {
+        return;
+    }
+    var pt: Vec<str> = Vec::new();
+    var pk: Vec<i64> = Vec::new();
+    cp_tokens_of(cp_strip(program), & mut pt, & mut pk);
+    var seen: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < pt.len() {
+        var x: str = pt.get(i);
+        if pk.get(i) == CTK_IDENT && !HashMap_contains(seen, x) {
+            HashMap_insert(seen, x, 1);
+            var ti: i64 = 0;
+            while ti < st.cx_tmpl_prefix.len() {
+                var pre: str = st.cx_tmpl_prefix.get(ti) + "_";
+                if str_starts_with(x, pre) && str_len(x) > str_len(pre) && !HashMap_contains(st.cx_names, x) {
+                    var parts: Vec<str> = str_split(str_slice(x, str_len(pre), str_len(x)), "_");
+                    var targs: Vec<str> = Vec::new();
+                    var ok: bool = true;
+                    var p: i64 = 0;
+                    while p < parts.len() {
+                        var c: str = cpx_fides_to_cpp(parts.get(p));
+                        if c == "" {
+                            ok = false;
+                        }
+                        targs.push(c);
+                        p = p + 1;
+                    }
+                    var nparams: i64 = str_split(st.cx_tmpl_params.get(ti), ",").len();
+                    if ok && targs.len() == nparams {
+                        cpx_instantiate(st, ti, targs, x);
+                    }
+                }
+                ti = ti + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// `s` as a Fides identifier: other characters become `_`.
+fn cpx_ident(s: str) -> str {
+    var out: str = "";
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var c: i64 = str_byte_at(s, i);
+        if cp_is_ident_char(c) {
+            out = out + str_slice(s, i, i + 1);
+        } else {
+            out = out + "_";
+        }
+        i = i + 1;
+    }
+    if str_len(out) == 0 || cp_is_digit(str_byte_at(out, 0)) {
+        out = "h" + out;
+    }
+    return out;
+}
+
+/// FNV-1a of `s`, as 16 hex digits.
+@wrapping fn cpx_hash_hex(s: str) -> str {
+    var h: i64 = 8834263827529598795;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        h = h ^ (str_byte_at(s, i) & 0xFF);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    var digits: str = "0123456789abcdef";
+    var out: str = "";
+    var d: i64 = 15;
+    while d >= 0 {
+        var v: i64 = (h >> (d * 4)) & 15;
+        out = out + str_slice(digits, v, v + 1);
+        d = d - 1;
+    }
+    return out;
+}
+
+/// The directory the shims are written to: TEMP, TMP or TMPDIR, else /tmp.
+fn cpx_temp_dir() -> str {
+    var d: str = cp_env("TEMP");
+    if str_len(d) == 0 {
+        d = cp_env("TMP");
+    }
+    if str_len(d) == 0 {
+        d = cp_env("TMPDIR");
+    }
+    if str_len(d) == 0 {
+        d = "/tmp";
+    }
+    d = str_replace(d, "\\", "/");
+    if !str_ends_with(d, "/") {
+        d = d + "/";
+    }
+    return d;
+}
+
+/// The shims of header `path` written to a C++ file, and the Fides block
+/// that calls them (`link "cpp:<file>"`).
+fn cpx_render(st: & mut CHeaderState, path: str) -> str {
+    var hpath: str = str_replace(path, "\\", "/");
+    var base: str = cp_base_name(hpath);
+    var stem: str = base;
+    var dot: i64 = str_len(stem) - 1;
+    while dot > 0 && str_byte_at(stem, dot) != 46 {
+        dot = dot - 1;
+    }
+    if dot > 0 {
+        stem = str_slice(stem, 0, dot);
+    }
+    var sid: str = cpx_ident(stem);
+    var cpp_beside: str = cp_dir_of(hpath) + stem + ".cpp";
+    var src: StringBuilder = StringBuilder::new();
+    src.append_str("// Generated by fid (compiler/cparser.fd, LG16) from " + base + ": extern \"C\"\n");
+    src.append_str("// shims of its C++ functions, classes and templates. Regenerated by\n");
+    src.append_str("// each build; a header named by a relative path is found from the\n");
+    src.append_str("// directory the build runs in (-iquote .).\n");
+    src.append_str("#include \"" + hpath + "\"\n");
+    if p_file_exists(cpp_beside) != 0 {
+        src.append_str("#include \"" + cpp_beside + "\"\n");
+    }
+    src.append_str("#include <cstdint>\n#include <cstdlib>\n#include <cstring>\n#include <exception>\n#include <string>\n\n");
+    src.append_str("static thread_local std::string fidcpp_err;\n");
+    src.append_str("static thread_local int fidcpp_fail = 0;\n");
+    src.append_str("static void fidcpp_set(const char* m) { fidcpp_fail = 1; fidcpp_err = m ? m : \"\"; }\n");
+    src.append_str("// A string result is a copy the program keeps (malloc)\n");
+    src.append_str("static const char* fidcpp_dup(const std::string& s) {\n");
+    src.append_str("    char* p = (char*)std::malloc(s.size() + 1);\n");
+    src.append_str("    if (!p) { return \"\"; }\n");
+    src.append_str("    std::memcpy(p, s.c_str(), s.size() + 1);\n");
+    src.append_str("    return p;\n}\n");
+    src.append_str("// An address as whatever pointer (or reference) a parameter takes\n");
+    src.append_str("struct fidcpp_any { void* p; template <typename T> operator T*() const { return (T*)p; } };\n");
+    src.append_str("struct fidcpp_ref { void* p; template <typename T> operator T&() const { return *(T*)p; } };\n");
+    src.append_str("#define FIDCPP_CATCH catch (const std::exception& e) { fidcpp_set(e.what()); } catch (...) { fidcpp_set(\"a C++ exception\"); }\n\n");
+    src.append_str("extern \"C\" int32_t __fidcpp_" + sid + "_cpp_failed(void) { return fidcpp_fail; }\n");
+    src.append_str("extern \"C\" const char* __fidcpp_" + sid + "_cpp_error(void) { return fidcpp_dup(fidcpp_err); }\n");
+    var i: i64 = 0;
+    while i < st.cx_code.len() {
+        src.append_str(st.cx_code.get(i) + "\n");
+        i = i + 1;
+    }
+    var text: str = src.to_str();
+    // the file's name changes with the shims and with the code they compile
+    // (the header's own files and <stem>.cpp): a build that changes only an
+    // inline function's body still makes different C, so it is rebuilt
+    var key: StringBuilder = StringBuilder::new();
+    key.append_str(text);
+    var fi: i64 = 0;
+    while fi < st.included.len() {
+        var inc: str = st.included.get(fi);
+        if fi == 0 || !cpx_is_foreign_file(st, inc) {
+            match read_file(inc) {
+                Option::Some(body) => {
+                    key.append_str(body);
+                }
+                Option::None => {
+                }
+            }
+        }
+        fi = fi + 1;
+    }
+    match read_file(cpp_beside) {
+        Option::Some(cbody) => {
+            key.append_str(cbody);
+        }
+        Option::None => {
+        }
+    }
+    var file: str = cpx_temp_dir() + "fidcpp_" + sid + "_" + cpx_hash_hex(key.to_str()) + ".cpp";
+    if p_file_exists(file) == 0 {
+        p_file_write(file, text);
+    }
+    var out: StringBuilder = StringBuilder::new();
+    out.append_str("\n// C++ (LG16): " + int_to_str(st.cx_lines.len()) + " functions through the extern \"C\" shims in\n");
+    out.append_str("// " + file + ",\n");
+    out.append_str("// compiled with the program by the link step (zig c++). A class is an\n");
+    out.append_str("// opaque handle (i64): <Class>_new(..) makes one, <Class>_delete frees it.\n");
+    out.append_str("// After a call that threw, " + sid + "_cpp_failed() is 1 and " + sid + "_cpp_error()\n");
+    out.append_str("// its message (the call returned 0, \"\" or a null handle).\n");
+    out.append_str("extern \"C\" link \"cpp:" + file + "\" {\n");
+    out.append_str("    fn __fidcpp_" + sid + "_cpp_failed as " + sid + "_cpp_failed() -> i32;\n");
+    out.append_str("    fn __fidcpp_" + sid + "_cpp_error as " + sid + "_cpp_error() -> str;\n");
+    i = 0;
+    while i < st.cx_lines.len() {
+        out.append_str(st.cx_lines.get(i) + "\n");
+        i = i + 1;
+    }
+    out.append_str("}\n");
+    if st.cx_notes.len() > 0 {
+        out.append_str("\n// C++ notes (" + int_to_str(st.cx_notes.len()) + "):\n");
+        i = 0;
+        while i < st.cx_notes.len() {
+            out.append_str("//   " + st.cx_notes.get(i) + "\n");
             i = i + 1;
         }
     }

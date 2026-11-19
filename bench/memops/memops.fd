@@ -1,0 +1,253 @@
+// Runtime memory routines against plain byte loops (competitive roadmap
+// OP23). Each case runs the runtime's routine (core's p_mem_find_byte,
+// p_bytes_eq, p_mem_copy, str_compare, p_str_hash: the C library on the C
+// path, msvcrt on pe_ir, stdlib/linux_runtime's word loops on the machine
+// layer) and the same work as a byte loop written here, on the same data,
+// and prints the two times and how many times faster the runtime is.
+//
+// Output, one line per case:   <case> <runtime us> <byte loop us> <x faster>
+// then "check ok" when the runtime and the byte loops agreed on every
+// result (any other last line is a wrong result, not a slow one).
+//
+// Run: bash bench/memops/run.sh (every backend this machine has).
+
+const SIZE: i64 = 1048576; // 1 MB buffers
+const REPS: i64 = 64;      // passes over them per case
+
+@unsafe
+fn ldb(a: i64) -> i64 {
+    var p: *mut u8 = a;
+    return *p;
+}
+
+@unsafe
+fn stb(a: i64, v: i64) {
+    var p: *mut u8 = a;
+    *p = v;
+}
+
+// ─── the byte loops ──────────────────────────────────────────────────────
+// Each is @unsafe (release M10: ldb and stb are): the caller vouches that
+// the addresses are bytes of blocks it owns.
+
+@unsafe
+fn byte_find(p: i64, n: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while i < n {
+        if ldb(p + i) == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+@unsafe
+fn byte_eq(a: i64, b: i64, n: i64) -> bool {
+    var i: i64 = 0;
+    while i < n {
+        if ldb(a + i) != ldb(b + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+@unsafe
+fn byte_copy(dst: i64, src: i64, n: i64) {
+    var i: i64 = 0;
+    while i < n {
+        stb(dst + i, ldb(src + i));
+        i = i + 1;
+    }
+}
+
+// up to the first NUL of either; the first difference as a - b
+@unsafe
+fn byte_compare(a: i64, b: i64) -> i64 {
+    var i: i64 = 0;
+    while true {
+        val x: i64 = ldb(a + i);
+        val y: i64 = ldb(b + i);
+        if x != y {
+            return x - y;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// FNV-1a, a byte at a time (the runtime's hash mixes words: the values
+// differ, the work is the same)
+@unsafe
+@wrapping
+fn byte_hash(s: i64) -> i64 {
+    var h: i64 = 0 - 3750763034362895579;
+    var a: i64 = s;
+    var b: i64 = ldb(a);
+    while b != 0 {
+        h = (h ^ b) * 1099511628211;
+        a = a + 1;
+        b = ldb(a);
+    }
+    return h & 9223372036854775807;
+}
+
+// ─── timing ──────────────────────────────────────────────────────────────
+
+fn ratio(rt: i64, bl: i64) -> str {
+    var r: i64 = rt;
+    if r < 1 {
+        r = 1;
+    }
+    val tenths: i64 = bl * 10 / r;
+    return int_to_str(tenths / 10) + "." + int_to_str(tenths % 10);
+}
+
+fn report(name: str, rt: i64, bl: i64) {
+    println(name + " " + int_to_str(rt) + " " + int_to_str(bl) + " " + ratio(rt, bl));
+}
+
+@unsafe
+fn main() -> i64 {
+    val a: i64 = p_malloc(SIZE + 16);
+    val b: i64 = p_malloc(SIZE + 16);
+    val c: i64 = p_malloc(SIZE + 16);
+    var i: i64 = 0;
+    while i < SIZE {
+        stb(a + i, 97 + i % 23);
+        i = i + 1;
+    }
+    stb(a + SIZE - 1, 0);               // the byte the searches look for
+    byte_copy(b, a, SIZE);
+    var ok: bool = true;
+
+    // memchr: the zero byte at the end of 1 MB
+    var t0: i64 = p_clock_now_us();
+    var found: i64 = 0;
+    var r: i64 = 0;
+    while r < REPS {
+        found = found + p_mem_find_byte(a, SIZE, 0);
+        r = r + 1;
+    }
+    var t1: i64 = p_clock_now_us();
+    var found2: i64 = 0;
+    r = 0;
+    while r < REPS {
+        found2 = found2 + byte_find(a, SIZE, 0);
+        r = r + 1;
+    }
+    var t2: i64 = p_clock_now_us();
+    if found != found2 || found != REPS * (SIZE - 1) {
+        ok = false;
+    }
+    report("memchr", t1 - t0, t2 - t1);
+
+    // memcmp: two equal 1 MB blocks
+    t0 = p_clock_now_us();
+    var same: i64 = 0;
+    r = 0;
+    while r < REPS {
+        if p_bytes_eq(a, b, SIZE) {
+            same = same + 1;
+        }
+        r = r + 1;
+    }
+    t1 = p_clock_now_us();
+    var same2: i64 = 0;
+    r = 0;
+    while r < REPS {
+        if byte_eq(a, b, SIZE) {
+            same2 = same2 + 1;
+        }
+        r = r + 1;
+    }
+    t2 = p_clock_now_us();
+    if same != REPS || same2 != REPS {
+        ok = false;
+    }
+    report("memcmp", t1 - t0, t2 - t1);
+
+    // memcpy: 1 MB into another block
+    t0 = p_clock_now_us();
+    r = 0;
+    while r < REPS {
+        p_mem_copy(c, a, SIZE);
+        r = r + 1;
+    }
+    t1 = p_clock_now_us();
+    if !byte_eq(a, c, SIZE) {
+        ok = false;
+    }
+    r = 0;
+    while r < REPS {
+        byte_copy(c, b, SIZE);
+        r = r + 1;
+    }
+    t2 = p_clock_now_us();
+    if !byte_eq(b, c, SIZE) {
+        ok = false;
+    }
+    report("memcpy", t1 - t0, t2 - t1);
+
+    // string compare and hash: 64 KB strings (one differs in its last byte)
+    val s1: str = str_repeat("abcdefghijklmnop", 4096);
+    val s2: str = str_repeat("abcdefghijklmnop", 4096);
+    val s3: str = str_slice(s1, 0, 65535) + "q";
+    val reps2: i64 = REPS * 16;
+    t0 = p_clock_now_us();
+    var cmp: i64 = 0;
+    r = 0;
+    while r < reps2 {
+        cmp = cmp + str_compare(s1, s2) + str_compare(s3, s1);
+        r = r + 1;
+    }
+    t1 = p_clock_now_us();
+    var cmp2: i64 = 0;
+    r = 0;
+    while r < reps2 {
+        cmp2 = cmp2 + byte_compare(s1 as i64, s2 as i64) + byte_compare(s3 as i64, s1 as i64);
+        r = r + 1;
+    }
+    t2 = p_clock_now_us();
+    // the sign is what str_compare promises; both are > 0 here ('q' > 'p')
+    if (cmp > 0) != (cmp2 > 0) || cmp2 != reps2 {
+        ok = false;
+    }
+    report("strcmp", t1 - t0, t2 - t1);
+
+    t0 = p_clock_now_us();
+    var hx: i64 = 0;
+    r = 0;
+    while r < reps2 {
+        hx = hx ^ p_str_hash(s1 as i64);
+        r = r + 1;
+    }
+    t1 = p_clock_now_us();
+    var hy: i64 = 0;
+    r = 0;
+    while r < reps2 {
+        hy = hy ^ byte_hash(s1 as i64);
+        r = r + 1;
+    }
+    t2 = p_clock_now_us();
+    // reps2 is even: each xor of equal hashes cancels
+    if hx != 0 || hy != 0 || p_str_hash(s1 as i64) != p_str_hash(s2 as i64) {
+        ok = false;
+    }
+    report("strhash", t1 - t0, t2 - t1);
+
+    p_free(a);
+    p_free(b);
+    p_free(c);
+    if ok {
+        println("check ok");
+        return 0;
+    }
+    println("check FAILED");
+    return 1;
+}

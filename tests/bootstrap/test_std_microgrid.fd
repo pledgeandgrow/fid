@@ -1,0 +1,153 @@
+// stdlib/microgrid: rule-based and LP dispatch (via lp_solver), islanding state machine
+// Hand case: 40 kW load in two hours priced 0.10 and 0.30 per kWh, a 100 kWh
+// battery with 90 % charge and discharge efficiency: the optimum charges
+// 40 / 0.81 kWh in the cheap hour and serves the second hour from storage,
+// cost 0.10 x (40 + 40/0.81) = 8.9383; the rule-based dispatch (no
+// look-ahead) imports in both hours, 16.00. The 24-hour case must be
+// balanced in every hour, keep the stored energy within its window and end
+// with at least the initial energy, cost no more than the rules, and import
+// nothing in the hours the grid is down (the rule-based cost, 171.47, was
+// reproduced by a Python port of the rules). Islanding follows IEEE 1547 timing:
+// trip 0.16 s after the voltage leaves 0.88..1.10 pu, 300 s in band before
+// resynchronising, close only within 10 %, 0.3 Hz and 20 deg.
+// Expected output:
+// two hours: lp cost 8.9383 charge 49.3827 then discharge 40.0000, rules cost 16.0000
+// 24 h rules: cost 171.47 shed 0.00 balance ok true
+// 24 h lp: feasible true cost 104.05 balance ok true soc window ok true final >= initial true
+// lp <= rules: true, import while islanded 0.00, diesel 228.2 kWh vs rules 677.3 kWh
+// state after fault: islanded
+// state after 299 s in band: islanded
+// state after 300 s in band: resync
+// out of sync (35 deg): resync
+// in sync: connected
+// t=1160ms open PCC (grid out of band)
+// t=301500ms grid stable, synchronising
+// t=301540ms close PCC (in sync)
+// command island: islanded breaker closed false
+use microgrid;
+use lp_solver;
+use math;
+use string;
+
+// x rounded to d places (half away from zero) as fixed-point text
+fn fx(x: f64, d: i64) -> str {
+    var p: i64 = 1;
+    var i: i64 = 0;
+    while i < d {
+        p = p * 10;
+        i = i + 1;
+    }
+    var ax: f64 = x;
+    if ax < 0.0 {
+        ax = 0.0 - ax;
+    }
+    val v: i64 = math_floor(ax * (p as f64) + 0.5) as i64;
+    var out: str = int_to_str(v / p);
+    if d > 0 {
+        var frac: str = int_to_str(v % p);
+        while str_len(frac) < d {
+            frac = "0" + frac;
+        }
+        out = out + "." + frac;
+    }
+    if x < 0.0 && v != 0 {
+        return "-" + out;
+    }
+    return out;
+}
+
+fn sum(v: &Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val small_st = MgStorage { capacity_kwh: 100.0, p_charge_max: 50.0, p_discharge_max: 50.0, eta_charge: 0.9, eta_discharge: 0.9, soc_min: 0.0, soc_max: 1.0, soc_init: 0.0 };
+    var two = mg_new(small_st, 1.0, 100.0, 0.0, 10.0);
+    mg_add_step(&mut two, 40.0, 0.0, 0.10, 0.0, true);
+    mg_add_step(&mut two, 40.0, 0.0, 0.30, 0.0, true);
+    val d2 = mg_dispatch_lp(&two, false);
+    val r2 = mg_dispatch_rules(&two);
+    println("two hours: lp cost " + fx(d2.cost, 4) + " charge " + fx(d2.charge.get(0), 4) + " then discharge " + fx(d2.discharge.get(1), 4) + ", rules cost " + fx(r2.cost, 4));
+
+    val st = MgStorage { capacity_kwh: 200.0, p_charge_max: 50.0, p_discharge_max: 50.0, eta_charge: 0.95, eta_discharge: 0.95, soc_min: 0.1, soc_max: 0.9, soc_init: 0.5 };
+    var m = mg_new(st, 1.0, 80.0, 60.0, 5.0);
+    mg_add_generator(&mut m, "diesel", 10.0, 80.0, 0.25);
+    var h: i64 = 0;
+    while h < 24 {
+        var load: f64 = 50.0;
+        if h >= 7 && h < 9 {
+            load = 70.0;
+        }
+        if h >= 17 && h < 22 {
+            load = 95.0;
+        }
+        var pv: f64 = 0.0;
+        if h >= 6 && h <= 18 {
+            val x: f64 = ((h - 12) as f64) / 6.0;
+            pv = 120.0 * (1.0 - x * x);
+        }
+        var price: f64 = 0.10;
+        if h >= 17 && h < 21 {
+            price = 0.30;
+        }
+        val up: bool = !(h >= 12 && h <= 14);
+        mg_add_step(&mut m, load, pv, price, 0.04, up);
+        h = h + 1;
+    }
+    val rules = mg_dispatch_rules(&m);
+    println("24 h rules: cost " + fx(rules.cost, 2) + " shed " + fx(sum(&rules.shed), 2) + " balance ok " + bool_to_str(mg_balance_error(&m, &rules) < 0.000001));
+    val lp = mg_dispatch_lp(&m, true);
+    var window: bool = true;
+    var islanded_import: f64 = 0.0;
+    h = 0;
+    while h < 24 {
+        if lp.soc.get(h) < 20.0 - 0.000001 || lp.soc.get(h) > 180.0 + 0.000001 {
+            window = false;
+        }
+        if !m.grid_up.get(h) {
+            islanded_import = islanded_import + lp.import.get(h);
+        }
+        h = h + 1;
+    }
+    println("24 h lp: feasible " + bool_to_str(lp.feasible) + " cost " + fx(lp.cost, 2) + " balance ok " + bool_to_str(mg_balance_error(&m, &lp) < 0.000001) + " soc window ok " + bool_to_str(window) + " final >= initial " + bool_to_str(lp.soc.get(23) >= 100.0 - 0.000001));
+    println("lp <= rules: " + bool_to_str(lp.cost <= rules.cost + 0.000001) + ", import while islanded " + fx(islanded_import, 2) + ", diesel " + fx(sum(&lp.gen), 1) + " kWh vs rules " + fx(sum(&rules.gen), 1) + " kWh");
+
+    var c = mg_island_controller(mg_island_limits_1547());
+    var k: i64 = 0;
+    while k < 50 {
+        IslandController_step(&mut c, 0.02, 1.0, 60.0, 0.0, 0.0, 0.0);
+        k = k + 1;
+    }
+    k = 0;
+    while k < 25 {
+        IslandController_step(&mut c, 0.02, 0.5, 60.0, 0.0, 0.0, 0.0);
+        k = k + 1;
+    }
+    println("state after fault: " + mg_state_name(c.state));
+    k = 0;
+    while k < 299 {
+        IslandController_step(&mut c, 1.0, 1.0, 60.0, 0.0, 0.0, 0.0);
+        k = k + 1;
+    }
+    println("state after 299 s in band: " + mg_state_name(c.state));
+    IslandController_step(&mut c, 1.0, 1.0, 60.0, 0.0, 0.0, 0.0);
+    println("state after 300 s in band: " + mg_state_name(c.state));
+    IslandController_step(&mut c, 0.02, 1.0, 60.0, 0.02, 0.1, 35.0);
+    println("out of sync (35 deg): " + mg_state_name(c.state));
+    IslandController_step(&mut c, 0.02, 1.0, 60.0, 0.02, 0.1, 10.0);
+    println("in sync: " + mg_state_name(c.state));
+    k = 0;
+    while k < c.events.len() {
+        println(c.events.get(k));
+        k = k + 1;
+    }
+    IslandController_command(&mut c, true);
+    IslandController_step(&mut c, 400.0, 1.0, 60.0, 0.0, 0.0, 0.0);
+    println("command island: " + mg_state_name(c.state) + " breaker closed " + bool_to_str(c.breaker_closed));
+}

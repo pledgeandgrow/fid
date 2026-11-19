@@ -1,0 +1,433 @@
+// Fides steering standard library
+//
+// Craig Reynolds' steering behaviors over 2D vectors (math's vec2), for
+// game agents. Pure computation, no platform seam:
+//   seek, flee (with a panic radius), arrive (slowing radius), pursue and
+//   evade (target position predicted from its velocity), wander (a jittered
+//   point on a circle ahead; the agent carries its own seeded generator, so
+//   a run is reproducible), obstacle avoidance against circles (a detection
+//   box ahead of the agent, lateral push from the nearest obstacle that
+//   intersects it plus braking), path following (predict, project onto the
+//   nearest path segment, steer to a point further along when outside the
+//   path's radius), and flocking: separation, alignment, cohesion, and a
+//   weighted sum of the three.
+//
+// Every behavior returns a steering force (already limited to the agent's
+// max_force); `steer_apply` integrates a force over dt (Euler, velocity
+// capped at max_speed).
+//
+// Usage:
+//   use steering;
+//   var a: SteerAgent = steer_agent(vec2(0.0, 0.0), 5.0, 2.0);
+//   val f: vec2 = steer_arrive(&a, vec2(10.0, 0.0), 3.0);
+//   steer_apply(&mut a, f, 0.1);
+
+module steering;
+use vec;
+use math;
+
+pub struct SteerAgent {
+    pub pos: vec2,
+    pub vel: vec2,
+    pub max_speed: f64,
+    pub max_force: f64,
+    pub mass: f64,
+    pub radius: f64,
+    // body radius (obstacle avoidance, separation)
+    pub wander_angle: f64,
+    // angle of the wander target on its circle
+    pub rng: i64,  // state of the agent's generator (wander)
+}
+
+/// An agent at rest at `pos`, mass 1, radius 0.5.
+pub fn steer_agent(pos: vec2, max_speed: f64, max_force: f64) -> SteerAgent {
+    return SteerAgent {
+        pos: pos, vel: vec2(0.0, 0.0), max_speed: max_speed, max_force: max_force, mass: 1.0, radius: 0.5, wander_angle: 0.0, rng: 88172645463325252,
+    };
+}
+
+/// Seed the agent's wander generator.
+pub fn steer_seed(a: &mut SteerAgent, seed: i64) {
+    a.rng = seed;
+    if a.rng == 0 {
+        a.rng = 88172645463325252;
+    }
+}
+
+// ─── vector helpers ───────────────────────────────────────────────────────
+
+/// `v` shortened to length `max` when it is longer.
+pub fn steer_truncate(v: vec2, max: f64) -> vec2 {
+    val len: f64 = v.length();
+    if len > max && len > 0.0 {
+        return v.scale(max / len);
+    }
+    return v;
+}
+
+fn st_zero() -> vec2 {
+    return vec2(0.0, 0.0);
+}
+
+/// The direction the agent faces: its velocity, or +x when at rest.
+pub fn steer_heading(a: &SteerAgent) -> vec2 {
+    if a.vel.length() > 0.000000001 {
+        return a.vel.normalize();
+    }
+    return vec2(1.0, 0.0);
+}
+
+// xorshift64* : the next value in [0, 1)
+@wrapping
+fn st_rand(a: &mut SteerAgent) -> f64 {
+    var x: i64 = a.rng;
+    x = x ^ ((x >> 12) & 4503599627370495);
+    x = x ^ (x << 25);
+    x = x ^ ((x >> 27) & 137438953471);
+    a.rng = x;
+    val y: i64 = x * 2685821657736338717;
+    val top: i64 = (y >> 11) & 9007199254740991;
+    return (top as f64) / 9007199254740992.0;
+}
+
+// ─── basic behaviors ──────────────────────────────────────────────────────
+
+/// Head for `target` at full speed.
+pub fn steer_seek(a: &SteerAgent, target: vec2) -> vec2 {
+    val desired: vec2 = target.sub(a.pos).normalize().scale(a.max_speed);
+    return steer_truncate(desired.sub(a.vel), a.max_force);
+}
+
+/// Run from `threat` while it is closer than `panic_dist` (<= 0: always).
+pub fn steer_flee(a: &SteerAgent, threat: vec2, panic_dist: f64) -> vec2 {
+    val away: vec2 = a.pos.sub(threat);
+    if panic_dist > 0.0 && away.length() > panic_dist {
+        return st_zero();
+    }
+    val desired: vec2 = away.normalize().scale(a.max_speed);
+    return steer_truncate(desired.sub(a.vel), a.max_force);
+}
+
+/// Seek `target`, slowing down linearly inside `slow_radius` to stop on it.
+pub fn steer_arrive(a: &SteerAgent, target: vec2, slow_radius: f64) -> vec2 {
+    val off: vec2 = target.sub(a.pos);
+    val dist: f64 = off.length();
+    if dist < 0.000000001 {
+        return steer_truncate(st_zero().sub(a.vel), a.max_force);
+    }
+    var speed: f64 = a.max_speed;
+    if slow_radius > 0.0 && dist < slow_radius {
+        speed = a.max_speed * dist / slow_radius;
+    }
+    val desired: vec2 = off.scale(speed / dist);
+    return steer_truncate(desired.sub(a.vel), a.max_force);
+}
+
+// Where a target moving at `tvel` will be when we could reach it
+// (look-ahead dist / max_speed, at most `max_predict` seconds).
+fn st_predict(a: &SteerAgent, tpos: vec2, tvel: vec2, max_predict: f64) -> vec2 {
+    val dist: f64 = tpos.sub(a.pos).length();
+    var t: f64 = 0.0;
+    if a.max_speed > 0.0 {
+        t = dist / a.max_speed;
+    }
+    if t > max_predict {
+        t = max_predict;
+    }
+    return tpos.add(tvel.scale(t));
+}
+
+/// Seek where a target at `tpos` moving at `tvel` is going to be.
+pub fn steer_pursue(a: &SteerAgent, tpos: vec2, tvel: vec2, max_predict: f64) -> vec2 {
+    return steer_seek(a, st_predict(a, tpos, tvel, max_predict));
+}
+
+/// Flee from where a pursuer at `tpos` moving at `tvel` is going to be.
+pub fn steer_evade(a: &SteerAgent, tpos: vec2, tvel: vec2, max_predict: f64) -> vec2 {
+    return steer_flee(a, st_predict(a, tpos, tvel, max_predict), 0.0);
+}
+
+/// Wander: a target on a circle of `radius` at `distance` ahead; its angle
+/// moves by up to +-`jitter` radians per call.
+pub fn steer_wander(a: &mut SteerAgent, distance: f64, radius: f64, jitter: f64) -> vec2 {
+    val r: f64 = st_rand(a);
+    a.wander_angle = a.wander_angle + (r * 2.0 - 1.0) * jitter;
+    val h: vec2 = steer_heading(a);
+    val center: vec2 = a.pos.add(h.scale(distance));
+    // the circle is in the agent's frame: angle 0 points along the heading
+    val ca: f64 = math_cos(a.wander_angle);
+    val sa: f64 = math_sin(a.wander_angle);
+    val off: vec2 = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca).scale(radius);
+    return steer_seek(a, center.add(off));
+}
+
+// ─── obstacle avoidance ───────────────────────────────────────────────────
+
+pub struct SteerObstacle {
+    pub center: vec2,
+    pub radius: f64,
+}
+
+pub fn steer_obstacle(center: vec2, radius: f64) -> SteerObstacle {
+    return SteerObstacle { center: center, radius: radius };
+}
+
+/// What the detection box of `steer_avoid` found.
+pub struct SteerHit {
+    pub index: i64,
+    // obstacle index, -1: the way is clear
+    pub ahead: f64,
+    // obstacle centre, distance ahead of the agent
+    pub lateral: f64,
+    // obstacle centre, distance to the agent's left (negative: right)
+    pub box_len: f64,
+}
+
+/// The nearest obstacle overlapping a box `min_len` long (longer with
+/// speed: up to 2x at max_speed) and as wide as the agent, ahead of it.
+pub fn steer_detect(a: &SteerAgent, obstacles: &Vec<SteerObstacle>, min_len: f64) -> SteerHit {
+    var speed_frac: f64 = 0.0;
+    if a.max_speed > 0.0 {
+        speed_frac = a.vel.length() / a.max_speed;
+    }
+    val box_len: f64 = min_len + min_len * speed_frac;
+    val h: vec2 = steer_heading(a);
+    val side: vec2 = vec2(- h.y, h.x);
+    var hit = SteerHit { index: - 1, ahead: 0.0, lateral: 0.0, box_len: box_len };
+    var best_ix: f64 = 0.0;
+    var i: i64 = 0;
+    while i < obstacles.len() {
+        val ob: SteerObstacle = obstacles.get(i);
+        val rel: vec2 = ob.center.sub(a.pos);
+        // local coordinates: x ahead, y to the left
+        val lx: f64 = rel.dot(h);
+        val ly: f64 = rel.dot(side);
+        val reach: f64 = ob.radius + a.radius;
+        if lx + ob.radius > 0.0 && lx - ob.radius < box_len && math_fabs(ly) < reach {
+            // nearest intersection of the heading axis with the expanded circle
+            val sq: f64 = math_sqrt(reach * reach - ly * ly);
+            var ix: f64 = lx - sq;
+            if ix <= 0.0 {
+                ix = lx + sq;
+            }
+            if hit.index < 0 || ix < best_ix {
+                hit.index = i;
+                hit.ahead = lx;
+                hit.lateral = ly;
+                best_ix = ix;
+            }
+        }
+        i = i + 1;
+    }
+    return hit;
+}
+
+/// Avoid circular obstacles: the nearest one in the detection box
+/// (`steer_detect`) pushes the agent sideways, harder the closer it is, and
+/// brakes it. Zero when the way is clear.
+pub fn steer_avoid(a: &SteerAgent, obstacles: &Vec<SteerObstacle>, min_len: f64) -> vec2 {
+    val hit: SteerHit = steer_detect(a, obstacles, min_len);
+    if hit.index < 0 {
+        return st_zero();
+    }
+    val ob: SteerObstacle = obstacles.get(hit.index);
+    val reach: f64 = ob.radius + a.radius;
+    val mult: f64 = 1.0 + (hit.box_len - hit.ahead) / hit.box_len;
+    var lateral: f64 = (reach - math_fabs(hit.lateral)) * mult;
+    if hit.lateral >= 0.0 {
+        lateral = - lateral;
+    }
+    val brake: f64 = (ob.radius - hit.ahead) * 0.2;
+    val h: vec2 = steer_heading(a);
+    val side: vec2 = vec2(- h.y, h.x);
+    // back to world coordinates
+    return steer_truncate(h.scale(brake).add(side.scale(lateral)), a.max_force);
+}
+
+// ─── path following ───────────────────────────────────────────────────────
+
+pub struct SteerPath {
+    pub points: Vec<vec2>,
+    pub radius: f64,
+}
+
+pub fn steer_path(radius: f64) -> SteerPath {
+    return SteerPath { points: Vec::new(), radius: radius };
+}
+
+pub fn steer_path_add(p: &mut SteerPath, pt: vec2) {
+    p.points.push(pt);
+}
+
+/// The point of segment a-b nearest to `p`.
+pub fn steer_closest_on_segment(p: vec2, a: vec2, b: vec2) -> vec2 {
+    val ab: vec2 = b.sub(a);
+    val len2: f64 = ab.dot(ab);
+    if len2 <= 0.0 {
+        return a;
+    }
+    var t: f64 = p.sub(a).dot(ab) / len2;
+    if t < 0.0 { t = 0.0; }
+    if t > 1.0 { t = 1.0; }
+    return a.add(ab.scale(t));
+}
+
+/// Index of the path segment (from point i to i+1) nearest to `p`.
+pub fn steer_path_segment(path: &SteerPath, p: vec2) -> i64 {
+    var best: i64 = 0;
+    var best_d: f64 = - 1.0;
+    var i: i64 = 0;
+    while i + 1 < path.points.len() {
+        val c: vec2 = steer_closest_on_segment(p, path.points.get(i), path.points.get(i + 1));
+        val d: f64 = c.sub(p).length();
+        if best_d < 0.0 || d < best_d {
+            best_d = d;
+            best = i;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// Follow `path`: look `lookahead` units ahead along the velocity; if that
+/// point is outside the path's radius, seek the point `lookahead` further
+/// along the nearest segment. Zero while the agent stays inside. On the
+/// last segment the agent arrives at the final point.
+pub fn steer_follow_path(a: &SteerAgent, path: &SteerPath, lookahead: f64) -> vec2 {
+    if path.points.len() == 0 {
+        return st_zero();
+    }
+    if path.points.len() == 1 {
+        return steer_arrive(a, path.points.get(0), lookahead);
+    }
+    val future: vec2 = a.pos.add(steer_heading(a).scale(lookahead));
+    val seg: i64 = steer_path_segment(path, future);
+    val p0: vec2 = path.points.get(seg);
+    val p1: vec2 = path.points.get(seg + 1);
+    val near: vec2 = steer_closest_on_segment(future, p0, p1);
+    val last: vec2 = path.points.get(path.points.len() - 1);
+    if seg + 2 == path.points.len() && last.sub(a.pos).length() < lookahead * 2.0 {
+        return steer_arrive(a, last, lookahead * 2.0);
+    }
+    if near.sub(future).length() <= path.radius {
+        return st_zero();
+    }
+    val dir: vec2 = p1.sub(p0).normalize();
+    var target: vec2 = near.add(dir.scale(lookahead));
+    if target.sub(p0).length() > p1.sub(p0).length() {
+        target = p1;
+    }
+    return steer_seek(a, target);
+}
+
+// ─── flocking ─────────────────────────────────────────────────────────────
+
+/// Steer away from neighbours of `flock[self_i]` within `radius` (each
+/// pushes with 1/distance).
+pub fn steer_separation(flock: &Vec<SteerAgent>, self_i: i64, radius: f64) -> vec2 {
+    val me: SteerAgent = flock.get(self_i);
+    var sum: vec2 = st_zero();
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < flock.len() {
+        if i != self_i {
+            val off: vec2 = me.pos.sub(flock.get(i).pos);
+            val d: f64 = off.length();
+            if d > 0.0 && d < radius {
+                sum = sum.add(off.scale(1.0 / (d * d)));
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if n == 0 {
+        return st_zero();
+    }
+    val desired: vec2 = sum.normalize().scale(me.max_speed);
+    return steer_truncate(desired.sub(me.vel), me.max_force);
+}
+
+/// Match the average heading of neighbours within `radius`.
+pub fn steer_alignment(flock: &Vec<SteerAgent>, self_i: i64, radius: f64) -> vec2 {
+    val me: SteerAgent = flock.get(self_i);
+    var sum: vec2 = st_zero();
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < flock.len() {
+        if i != self_i {
+            val o: SteerAgent = flock.get(i);
+            if o.pos.sub(me.pos).length() < radius {
+                sum = sum.add(o.vel);
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if n == 0 || sum.length() < 0.000000001 {
+        return st_zero();
+    }
+    val desired: vec2 = sum.normalize().scale(me.max_speed);
+    return steer_truncate(desired.sub(me.vel), me.max_force);
+}
+
+/// Seek the centre of mass of neighbours within `radius`.
+pub fn steer_cohesion(flock: &Vec<SteerAgent>, self_i: i64, radius: f64) -> vec2 {
+    val me: SteerAgent = flock.get(self_i);
+    var sum: vec2 = st_zero();
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < flock.len() {
+        if i != self_i {
+            val o: SteerAgent = flock.get(i);
+            if o.pos.sub(me.pos).length() < radius {
+                sum = sum.add(o.pos);
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if n == 0 {
+        return st_zero();
+    }
+    return steer_seek(&me, sum.scale(1.0 / (n as f64)));
+}
+
+/// Weighted sum of separation, alignment and cohesion, limited to max_force.
+pub fn steer_flock(flock: &Vec<SteerAgent>, self_i: i64, radius: f64, w_sep: f64, w_ali: f64, w_coh: f64) -> vec2 {
+    val s: vec2 = steer_separation(flock, self_i, radius).scale(w_sep);
+    val al: vec2 = steer_alignment(flock, self_i, radius).scale(w_ali);
+    val c: vec2 = steer_cohesion(flock, self_i, radius).scale(w_coh);
+    return steer_truncate(s.add(al).add(c), flock.get(self_i).max_force);
+}
+
+/// One flocking step for every agent: forces from the current state, then
+/// all agents move (so the order of agents does not matter).
+pub fn steer_flock_step(flock: &mut Vec<SteerAgent>, radius: f64, w_sep: f64, w_ali: f64, w_coh: f64, dt: f64) {
+    var forces: Vec<vec2> = Vec::new();
+    var i: i64 = 0;
+    while i < flock.len() {
+        forces.push(steer_flock(flock, i, radius, w_sep, w_ali, w_coh));
+        i = i + 1;
+    }
+    i = 0;
+    while i < flock.len() {
+        var ag: SteerAgent = flock.get(i);
+        steer_apply(&mut ag, forces.get(i), dt);
+        flock.set(i, ag);
+        i = i + 1;
+    }
+}
+
+// ─── integration ──────────────────────────────────────────────────────────
+
+/// Apply `force` for `dt` seconds: velocity += force / mass * dt (capped at
+/// max_speed), position += velocity * dt.
+pub fn steer_apply(a: &mut SteerAgent, force: vec2, dt: f64) {
+    val f: vec2 = steer_truncate(force, a.max_force);
+    var m: f64 = a.mass;
+    if m <= 0.0 {
+        m = 1.0;
+    }
+    a.vel = steer_truncate(a.vel.add(f.scale(dt / m)), a.max_speed);
+    a.pos = a.pos.add(a.vel.scale(dt));
+}

@@ -1,0 +1,162 @@
+// stdlib/x86_cpu: CPUID decoding of real register dumps, MSR layouts, GDT/TSS/IDT encodings, and PIC/PIT/CMOS port sequences on a fake port space.
+// Expected output:
+// GenuineIntel / AuthenticAMD
+// family 6 model 0x9E stepping 10
+// family 23 model 0x71 stepping 0
+// apic id 12, 16 logical, clflush 64
+// edx: 28 flags, sse2=true htt=true psn=false
+// ecx: avx=true aes=true x2apic=true hypervisor=false
+// 7.ebx: fsgsbase bmi1 avx2 smep bmi2 erms invpcid
+// ext: syscall nx pdpe1gb rdtscp lm / lahf_lm abm
+// Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz
+// IA32_EFER IA32_LSTAR x2APIC 0x830
+// EFER SCE LME LMA NXE
+// STAR 0x0013000800000000 syscall CS=0x08 SS=0x10 sysret CS=0x23 SS=0x1B
+// base 0xFEE00000 BSP enabled
+// PAT 0x0007040600070406 PA0=WB PA1=WT PA2=UC- PA3=UC PA4=WB PA5=WT PA6=UC- PA7=UC
+// 0x0000000000000000
+// 0x00AF9A000000FFFF code base=0x0 limit=0xFFFFF DPL0 P R L G
+// 0x00CF92000000FFFF data base=0x0 limit=0xFFFFF DPL0 P W D G
+// 0x00CFF2000000FFFF data base=0x0 limit=0xFFFFF DPL3 P W D G
+// 0x00AFFA000000FFFF code base=0x0 limit=0xFFFFF DPL3 P R L G
+// 0x0000891234500067 tss64 available base=0x123450 limit=0x67 DPL0 P
+// 0x0000000000000000
+// selectors: kernel code 0x8 user code 0x23 tss 0x28
+// gate 0x81008E0100080ABC 0x00000000FFFFFFFF -> 0xFFFFFFFF81000ABC
+// #PF Page Fault (error code: true), #BP Breakpoint (error code: false), IRQ vector 32
+// protection write user / not-present read supervisor fetch
+// gdtr bytes: 37 00 00 10 00 00 00 00 00 00
+// gdt image 56 bytes, byte 13 = 0x9A
+// tss rsp0 bytes 00 F0 1F 00, ist1 byte 36 = 0x00 37 = 0x80, iomap 104
+// out 0x20 <- 0x11
+// out 0xA0 <- 0x11
+// out 0x21 <- 0x20
+// out 0xA1 <- 0x28
+// out 0x21 <- 0x04
+// out 0xA1 <- 0x02
+// out 0x21 <- 0x01
+// out 0xA1 <- 0x01
+// out 0x21 <- 0xFB
+// out 0xA1 <- 0xFF
+// out 0xA1 <- 0xFB
+// out 0xA0 <- 0x20
+// out 0x20 <- 0x20
+// pit 100 Hz divisor 11932, 18 Hz -> 65536
+// out 0x43 <- 0x34
+// out 0x40 <- 0x9C
+// out 0x40 <- 0x2E
+// cmos[0x0A] = 0x26: out 0x70 <- 0x8A / in 0x71 -> 0x26
+use x86_cpu;
+use regmap;
+use vec;
+use string;
+
+fn bs(b: bool) -> str {
+    if b { return "true"; }
+    return "false";
+}
+
+fn pack4(s: str, at: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < 4 {
+        var c: i64 = 0;
+        if at + i < str_len(s) { c = str_byte_at(s, at + i); }
+        v = v | (c << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn brand_leaf(s: str, leaf: i64) -> CpuidRegs {
+    val o: i64 = 16 * leaf;
+    return cpuid_regs(pack4(s, o), pack4(s, o + 4), pack4(s, o + 8), pack4(s, o + 12));
+}
+
+fn hexbytes(v: Vec<i64>, from: i64, n: i64) -> str {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(regmap_hex_digits(v.get(from + i), 2));
+        i = i + 1;
+    }
+    return str_join(out, " ");
+}
+
+fn flush(io: &mut PortIo) {
+    var i: i64 = 0;
+    while i < io.log.len() {
+        if str_starts_with(io.log.get(i), "out") { println(io.log.get(i)); }
+        i = i + 1;
+    }
+    io.log.clear();
+}
+
+fn main() {
+    println(cpuid_vendor(cpuid_regs(0x16, 0x756E6547, 0x6C65746E, 0x49656E69)) + " / " + cpuid_vendor(cpuid_regs(0x10, 0x68747541, 0x444D4163, 0x69746E65)));
+    println(cpuid_signature(0x000906EA));
+    println(cpuid_signature(0x00870F10));
+    val ebx: i64 = 0x0C100800;
+    println("apic id " + int_to_str(cpuid_apic_id(ebx)) + ", " + int_to_str(cpuid_logical_count(ebx)) + " logical, clflush " + int_to_str(cpuid_clflush_size(ebx)));
+    val fe: Vec<str> = cpuid_features_edx(0xBFEBFBFF);
+    println("edx: " + int_to_str(fe.len()) + " flags, sse2=" + bs(cpuid_has(fe, "sse2")) + " htt=" + bs(cpuid_has(fe, "htt")) + " psn=" + bs(cpuid_has(fe, "psn")));
+    val fc: Vec<str> = cpuid_features_ecx(0x7FFAFBBF);
+    println("ecx: avx=" + bs(cpuid_has(fc, "avx")) + " aes=" + bs(cpuid_has(fc, "aes")) + " x2apic=" + bs(cpuid_has(fc, "x2apic")) + " hypervisor=" + bs(cpuid_has(fc, "hypervisor")));
+    println("7.ebx: " + str_join(cpuid_features_7ebx(0x000007A9), " "));
+    println("ext: " + str_join(cpuid_features_ext_edx(0x2C100800), " ") + " / " + str_join(cpuid_features_ext_ecx(0x00000021), " "));
+    val b: str = "        Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz";
+    println(cpuid_brand(brand_leaf(b, 0), brand_leaf(b, 1), brand_leaf(b, 2)));
+
+    println(x86_msr_name(MSR_EFER) + " " + x86_msr_name(MSR_LSTAR) + " " + x86_msr_name(0x830));
+    println("EFER " + x86_efer_decode(0xD01));
+    val star: i64 = x86_star(0x08, 0x13);
+    println("STAR " + regmap_hex(star, 16) + " " + x86_star_decode(star));
+    println(x86_apic_base_decode(0xFEE00900));
+    var pt: Vec<i64> = Vec::new();
+    pt.push(6); pt.push(4); pt.push(7); pt.push(0);
+    pt.push(6); pt.push(4); pt.push(7); pt.push(0);
+    val pat: i64 = x86_pat(pt);
+    println("PAT " + regmap_hex(pat, 16) + " " + x86_pat_decode(pat));
+
+    val gdt: Vec<i64> = x86_standard_gdt(0x123450);
+    var i: i64 = 0;
+    while i < gdt.len() {
+        val d: i64 = gdt.get(i);
+        if d == 0 || i == 6 {
+            println(regmap_hex(d, 16));
+        } else {
+            println(regmap_hex(d, 16) + " " + gdt_decode(d));
+        }
+        i = i + 1;
+    }
+    println("selectors: kernel code " + regmap_hex(x86_selector(1, false, 0), 1) + " user code " + regmap_hex(x86_selector(4, false, 3), 1)
+        + " tss " + regmap_hex(x86_selector(5, false, 0), 1));
+    val handler: i64 = (0xFFFFFFFF << 32) | 0x81000ABC;
+    val lo: i64 = idt_gate_low(handler, 0x08, 1, GATE_INTERRUPT, 0);
+    val hi: i64 = idt_gate_high(handler);
+    println("gate " + regmap_hex(lo, 16) + " " + regmap_hex(hi, 16) + " -> " + regmap_hex(idt_gate_target(lo, hi), 16));
+    println(x86_vector_name(14) + " (error code: " + bs(x86_has_error_code(14)) + "), " + x86_vector_name(3) + " (error code: " + bs(x86_has_error_code(3)) + "), " + x86_vector_name(32));
+    println(x86_pf_error_decode(7) + " / " + x86_pf_error_decode(0x10));
+    println("gdtr bytes: " + hexbytes(x86_pseudo_desc(0x1000, 8 * gdt.len()), 0, 10));
+    val img: Vec<i64> = x86_table_bytes(gdt);
+    println("gdt image " + int_to_str(img.len()) + " bytes, byte 13 = " + regmap_hex(img.get(13), 2));
+    var ist: Vec<i64> = Vec::new();
+    ist.push(0x8000);
+    val tss: Vec<i64> = x86_tss_bytes(0x1FF000, ist);
+    println("tss rsp0 bytes " + hexbytes(tss, 4, 4) + ", ist1 byte 36 = " + regmap_hex(tss.get(36), 2) + " 37 = " + regmap_hex(tss.get(37), 2)
+        + ", iomap " + int_to_str(tss.get(102) + 256 * tss.get(103)));
+
+    var io: PortIo = portio_fake();
+    io.ports.insert(PIC1_DATA, 0xFB);
+    io.ports.insert(PIC2_DATA, 0xFF);
+    pic_remap(&mut io, 0x20, 0x28);
+    pic_set_mask(&mut io, 10, false);
+    pic_eoi(&mut io, 10);
+    flush(&mut io);
+    println("pit 100 Hz divisor " + int_to_str(pit_divisor(100)) + ", 18 Hz -> " + int_to_str(pit_divisor(18)));
+    pit_set_rate(&mut io, 100);
+    flush(&mut io);
+    io.ports.insert(0x71, 0x26);
+    val v: i64 = cmos_read(&mut io, 0x0A);
+    println("cmos[0x0A] = " + regmap_hex(v, 2) + ": " + io.log.get(0) + " / " + io.log.get(1));
+}

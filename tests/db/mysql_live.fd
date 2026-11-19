@@ -1,0 +1,90 @@
+// stdlib/mysql and stdlib/mysql_db against a real MySQL or MariaDB server
+// (competitive SL12). Not in the suite: it needs a server.
+// tests/db/mysql_live.sh starts a private MariaDB (the distribution's
+// packages, a throwaway data directory, 127.0.0.1:53306, user "fides" with
+// a mysql_native_password password) and runs this program.
+//
+// Settings from the environment: MYT_HOST (127.0.0.1), MYT_PORT (53306),
+// MYT_USER (fides), MYT_PASSWORD (fides-pw), MYT_DB (fides).
+//
+// Expected output (exit 0):
+//   connected
+//   created
+//   inserted 3
+//   rows [{"id":1,"name":"Ada","note":null},{"id":2,"name":"O'Brien","note":"x"},{"id":3,"name":"Robert'); DROP TABLE fides_live;--","note":null}]
+//   prepared [{"id":2,"name":"O'Brien","note":"x"}]
+//   one {"n":3}
+//   error 1146 42S02
+//   database 2
+//   ok
+use mysql;
+use mysql_db;
+use db;
+
+fn setting(name: str, default: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+            return default;
+        }
+    }
+    return default;
+}
+
+fn fail(what: str) -> i64 {
+    println("FAILED: " + what);
+    return 1;
+}
+
+fn main() -> i64 {
+    var c: MysqlConn = mysql_connect_tcp(setting("MYT_HOST", "127.0.0.1"), str_parse_int(setting("MYT_PORT", "53306")), setting("MYT_USER", "fides"), setting("MYT_PASSWORD", "fides-pw"), setting("MYT_DB", "fides"));
+    if !c.ok {
+        return fail("connect: " + c.error);
+    }
+    println("connected");
+    mysql_query(& mut c, "DROP TABLE IF EXISTS fides_live");
+    val made: MysqlResult = mysql_query(& mut c, "CREATE TABLE fides_live (id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, note VARCHAR(16))");
+    if !made.ok {
+        return fail("create: " + made.message);
+    }
+    println("created");
+    // Parameters bound through COM_STMT_EXECUTE: quotes and SQL stay data
+    val ins: MysqlStmt = mysql_prepare(& mut c, "INSERT INTO fides_live VALUES (?, ?, ?)");
+    if !ins.ok {
+        return fail("prepare: " + ins.error);
+    }
+    var total: i64 = 0;
+    var a1: Vec<MysqlParam> = Vec::new();
+    a1.push(mysql_param_int(1));
+    a1.push(mysql_param_text("Ada"));
+    a1.push(mysql_param_null());
+    total = total + mysql_execute(& mut c, & ins, a1).affected_rows;
+    var a2: Vec<MysqlParam> = Vec::new();
+    a2.push(mysql_param_int(2));
+    a2.push(mysql_param_text("O'Brien"));
+    a2.push(mysql_param_text("x"));
+    total = total + mysql_execute(& mut c, & ins, a2).affected_rows;
+    var a3: Vec<MysqlParam> = Vec::new();
+    a3.push(mysql_param_int(3));
+    a3.push(mysql_param_text("Robert'); DROP TABLE fides_live;--"));
+    a3.push(mysql_param_null());
+    total = total + mysql_execute(& mut c, & ins, a3).affected_rows;
+    mysql_close_stmt(& mut c, & ins);
+    println("inserted " + int_to_str(total));
+    println("rows " + mysql_query_json(& mut c, "SELECT id, name, note FROM fides_live ORDER BY id"));
+    val sel: MysqlStmt = mysql_prepare(& mut c, "SELECT id, name, note FROM fides_live WHERE id = ?");
+    var a4: Vec<MysqlParam> = Vec::new();
+    a4.push(mysql_param_int(2));
+    println("prepared " + mysql_execute_json(& mut c, & sel, a4));
+    mysql_close_stmt(& mut c, & sel);
+    println("one " + query_one(c, "SELECT COUNT(*) AS n FROM fides_live"));
+    val bad: MysqlResult = mysql_query(& mut c, "SELECT * FROM fides_no_such_table");
+    println("error " + int_to_str(bad.error_code) + " " + bad.sql_state);
+    println("database " + int_to_str(c.exec("DELETE FROM fides_live WHERE note IS NULL")));
+    mysql_query(& mut c, "DROP TABLE fides_live");
+    mysql_close_tcp(& mut c);
+    println("ok");
+    return 0;
+}

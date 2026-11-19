@@ -1,0 +1,92 @@
+// Track RA (docs/roadmap/llvm-roadmap.md), the machine layer's register
+// allocator (compiler/nat_ir.fd):
+//   RA12 shrink wrapping (ng_sw_plan): a function whose first block ends
+//       in the branch of an early exit that calls nothing saves, in its
+//       prologue, only the callee-saved registers the first block and the
+//       exit write; the others are saved on the other way out of the first
+//       block only, and the exit's epilogue restores only what the
+//       prologue saved. `fib` and `walk` exit early through the branch's
+//       fall-through (`if n < 2 { return n; }`), `pick` through the
+//       branch's target. The callers keep values live across the calls in
+//       their own callee-saved registers, so an exit that restored a
+//       register it never saved, or wrote one it does not save, changes
+//       what they print. `fid emit --stats` prints a `[shrinkwrap]` line
+//       for each function that defers saves (none with
+//       FID_NAT_OFF=shrinkwrap; tests/nattools/machine_batch5_check.sh,
+//       with FID_VERIFY=1).
+// Expected output:
+// 6765
+// 17711
+// 4181
+// 2584
+// 610
+// 1
+// 479
+// 226
+// 1442
+// 52928
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn mixw(a: i64, b: i64, c: i64) -> i64 {
+    return (a * 31 + b * 7 + c) % 1000003;
+}
+
+// Early exit when the list is short; otherwise many values across calls
+fn walk(n: i64, seed: i64) -> i64 {
+    if n < 2 {
+        return seed;
+    }
+    var a: i64 = seed * 3 + n;
+    var b: i64 = seed * 5 + 1;
+    var c: i64 = walk(n - 1, a % 97);
+    var d: i64 = walk(n - 2, b % 89);
+    var e: i64 = mixw(a, b, c);
+    var f: i64 = mixw(c, d, e);
+    return (a + b + c + d + e + f) % 10007;
+}
+
+// The early exit is the branch's target: the slow path comes first
+fn pick(k: i64, x: i64) -> i64 {
+    if k != 0 {
+        var p: i64 = x * 2;
+        var q: i64 = fib(k % 10);
+        var r: i64 = fib((k + 3) % 10);
+        return p + q + r;
+    }
+    return x;
+}
+
+fn keep_live(m: i64) -> i64 {
+    // values the caller holds across every call (its callee-saved
+    // registers): the callees must give them back unchanged
+    var u: i64 = m * 7;
+    var v: i64 = m * 11;
+    var w: i64 = m * 13;
+    var t: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        t = t + fib(i % 3) + pick(i % 2, i) + walk(i % 3, i);
+        t = t + u - v + w;
+        i = i + 1;
+    }
+    return t + u + v + w;
+}
+
+fn main() {
+    println(fib(20));
+    println(fib(22));
+    println(fib(19));
+    println(fib(18));
+    println(fib(15));
+    println(fib(1));
+    println(walk(10, 3));
+    println(pick(5, 100));
+    println(keep_live(5));
+    println(keep_live(31));
+}

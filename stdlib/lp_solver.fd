@@ -1,0 +1,666 @@
+// Fides linear programming: two-phase tableau simplex and branch and bound
+//
+// Solves
+//     maximize or minimize  c . x
+//     subject to            a_i . x  (<= | >= | =)  b_i     i = 1..m
+//                           x >= 0,  x_j integer for the chosen j
+//
+// All of it is real computation, there is no platform seam:
+// - `lp_solve`: the two-phase simplex method on a dense tableau. Rows with a
+//   negative right-hand side are negated first; <= rows get a slack, >= rows
+//   a surplus and an artificial, = rows an artificial. Phase 1 minimises the
+//   sum of the artificials (infeasible when it stays above 0), then the
+//   artificials are pivoted out of the basis and phase 2 optimises the real
+//   objective. Anti-cycling by Bland's rule (entering: the lowest-index
+//   column with a negative reduced cost; leaving: the lowest-index basic
+//   variable among the ratio-test ties). By default the entering column is
+//   the most negative reduced cost (Dantzig, far fewer pivots on large
+//   problems) and pricing falls back to Bland's rule after
+//   LP_DEGENERATE_RUN degenerate pivots in a row, which keeps the
+//   no-cycling guarantee; `bland_only = true` uses Bland's rule throughout.
+// - Dual values (shadow prices): `duals[i]` is d(optimal objective)/d(b_i)
+//   of the problem as stated (maximise or minimise), read from the reduced
+//   costs of the slack, surplus or artificial column of row i.
+// - `lp_solve_mip`: depth-first branch and bound on the LP relaxation for the
+//   variables marked integer; it branches on the most fractional variable and
+//   prunes nodes whose relaxation is no better than the incumbent.
+//
+// Usage:
+//   use lp_solver;
+//   var p = lp_new(2, true);                 // 2 variables, maximise
+//   lp_set_objective(&mut p, 0, 3.0);
+//   lp_set_objective(&mut p, 1, 5.0);
+//   lp_add_constraint(&mut p, lp_row2(1.0, 0.0), LP_LE, 4.0);
+//   val r = lp_solve(&p);                    // r.status == LP_OPTIMAL
+//
+// Tolerances: LP_EPS (1e-9) for pivots and reduced costs, LP_INT_TOL (1e-6)
+// for integrality.
+
+module lp_solver;
+use math;
+use vec;
+
+pub const LP_LE: i64 = 0;
+pub const LP_GE: i64 = 1;
+pub const LP_EQ: i64 = 2;
+
+pub const LP_OPTIMAL: i64 = 0;
+pub const LP_INFEASIBLE: i64 = 1;
+pub const LP_UNBOUNDED: i64 = 2;
+pub const LP_ITER_LIMIT: i64 = 3;
+
+pub const LP_EPS: f64 = 0.000000001;
+pub const LP_INT_TOL: f64 = 0.000001;
+/// Degenerate pivots in a row after which pricing switches to Bland's rule.
+pub const LP_DEGENERATE_RUN: i64 = 30;
+
+/// A linear program. `rows[i]` holds the coefficients of constraint i (one
+/// per variable), `rel[i]` its relation (LP_LE, LP_GE, LP_EQ) and `rhs[i]`
+/// its right-hand side.
+pub struct LpProblem {
+    pub nvars: i64,
+    pub maximize: bool,
+    pub c: Vec<f64>,
+    pub rows: Vec<Vec<f64>>,
+    pub rel: Vec<i64>,
+    pub rhs: Vec<f64>,
+    pub is_int: Vec<bool>,
+    pub max_iter: i64,
+    pub bland_only: bool,
+}
+
+/// The solution. `x` and `duals` are filled when `status` is LP_OPTIMAL;
+/// `nodes` counts the branch-and-bound nodes solved (1 for a plain LP).
+pub struct LpResult {
+    pub status: i64,
+    pub x: Vec<f64>,
+    pub objective: f64,
+    pub duals: Vec<f64>,
+    pub iterations: i64,
+    pub nodes: i64,
+}
+
+/// A problem with `nvars` variables, all objective coefficients 0.
+pub fn lp_new(nvars: i64, maximize: bool) -> LpProblem {
+    var c: Vec<f64> = Vec::new();
+    var ints: Vec<bool> = Vec::new();
+    var j: i64 = 0;
+    while j < nvars {
+        c.push(0.0);
+        ints.push(false);
+        j = j + 1;
+    }
+    return LpProblem {
+        nvars: nvars, maximize: maximize, c: c, rows: Vec::new(), rel: Vec::new(), rhs: Vec::new(), is_int: ints, max_iter: 100000, bland_only: false
+    };
+}
+
+pub fn lp_set_objective(p: &mut LpProblem, j: i64, coef: f64) {
+    p.c.set(j, coef);
+}
+
+/// Mark variable j as integer (used by `lp_solve_mip`).
+pub fn lp_set_integer(p: &mut LpProblem, j: i64) {
+    p.is_int.set(j, true);
+}
+
+/// Add a dense constraint (one coefficient per variable); returns its index.
+pub fn lp_add_constraint(p: &mut LpProblem, coeffs: Vec<f64>, rel: i64, rhs: f64) -> i64 {
+    if coeffs.len() != p.nvars {
+        panic("lp_add_constraint: wrong number of coefficients");
+    }
+    p.rows.push(coeffs);
+    p.rel.push(rel);
+    p.rhs.push(rhs);
+    return p.rows.len() - 1;
+}
+
+/// Add a sparse constraint: `vals[k]` is the coefficient of variable
+/// `idx[k]`, every other coefficient is 0. Returns the constraint index.
+pub fn lp_add_sparse(p: &mut LpProblem, idx: Vec<i64>, vals: Vec<f64>, rel: i64, rhs: f64) -> i64 {
+    var row: Vec<f64> = Vec::new();
+    var j: i64 = 0;
+    while j < p.nvars {
+        row.push(0.0);
+        j = j + 1;
+    }
+    var k: i64 = 0;
+    while k < idx.len() {
+        row.set(idx.get(k), row.get(idx.get(k)) + vals.get(k));
+        k = k + 1;
+    }
+    return lp_add_constraint(p, row, rel, rhs);
+}
+
+/// x_j <= ub as a constraint row.
+pub fn lp_add_upper_bound(p: &mut LpProblem, j: i64, ub: f64) -> i64 {
+    var idx: Vec<i64> = Vec::new();
+    idx.push(j);
+    var v: Vec<f64> = Vec::new();
+    v.push(1.0);
+    return lp_add_sparse(p, idx, v, LP_LE, ub);
+}
+
+/// Convenience rows for small problems.
+pub fn lp_row2(a: f64, b: f64) -> Vec<f64> {
+    var r: Vec<f64> = Vec::new();
+    r.push(a);
+    r.push(b);
+    return r;
+}
+
+pub fn lp_row3(a: f64, b: f64, c: f64) -> Vec<f64> {
+    var r = lp_row2(a, b);
+    r.push(c);
+    return r;
+}
+
+pub fn lp_row4(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
+    var r = lp_row3(a, b, c);
+    r.push(d);
+    return r;
+}
+
+pub fn lp_status_name(s: i64) -> str {
+    if s == LP_OPTIMAL {
+        return "optimal";
+    }
+    if s == LP_INFEASIBLE {
+        return "infeasible";
+    }
+    if s == LP_UNBOUNDED {
+        return "unbounded";
+    }
+    return "iteration limit";
+}
+
+// ─── The tableau ───
+
+struct LpTab {
+    m: i64,
+    ncols: i64,
+    stride: i64,
+    t: Vec<f64>,
+    basis: Vec<i64>,
+    is_art: Vec<bool>,
+    iters: i64,
+}
+
+fn lpt_get(tb: &LpTab, i: i64, j: i64) -> f64 {
+    return tb.t.get(i * tb.stride + j);
+}
+
+fn lpt_pivot(tb: &mut LpTab, pr: i64, pc: i64) {
+    val stride: i64 = tb.stride;
+    val base: i64 = pr * stride;
+    val pv: f64 = tb.t.get(base + pc);
+    // the pivot row's non-zero columns: rows are sparse, so the updates
+    // below touch only these
+    var nz: Vec<i64> = Vec::new();
+    var nzv: Vec<f64> = Vec::new();
+    var j: i64 = 0;
+    while j < stride {
+        val v: f64 = tb.t.get(base + j);
+        if v != 0.0 {
+            val nv: f64 = v / pv;
+            tb.t.set(base + j, nv);
+            nz.push(j);
+            nzv.push(nv);
+        }
+        j = j + 1;
+    }
+    tb.t.set(base + pc, 1.0);
+    val cnt: i64 = nz.len();
+    var i: i64 = 0;
+    while i <= tb.m {
+        if i != pr {
+            val rb: i64 = i * stride;
+            val f: f64 = tb.t.get(rb + pc);
+            if f != 0.0 {
+                var k: i64 = 0;
+                while k < cnt {
+                    val c: i64 = nz.get(k);
+                    tb.t.set(rb + c, tb.t.get(rb + c) - f * nzv.get(k));
+                    k = k + 1;
+                }
+                tb.t.set(rb + pc, 0.0);
+            }
+        }
+        i = i + 1;
+    }
+    tb.basis.set(pr, pc);
+    tb.iters = tb.iters + 1;
+}
+
+/// Simplex iterations on the objective row (row m). Entering column:
+/// Bland's rule (the lowest index with a negative reduced cost) when
+/// `bland_only`, or after LP_DEGENERATE_RUN degenerate pivots in a row;
+/// otherwise Dantzig's rule (the most negative reduced cost). Leaving row:
+/// minimum ratio, ties to the lowest-index basic variable (Bland).
+/// Returns LP_OPTIMAL, LP_UNBOUNDED or LP_ITER_LIMIT.
+fn lpt_run(tb: &mut LpTab, allow_art: bool, max_iter: i64, bland_only: bool) -> i64 {
+    val rhs_col: i64 = tb.ncols;
+    var degenerate: i64 = 0;
+    loop {
+        if tb.iters >= max_iter {
+            return LP_ITER_LIMIT;
+        }
+        val bland: bool = bland_only || degenerate >= LP_DEGENERATE_RUN;
+        var pc: i64 = -1;
+        var most: f64 = 0.0 - LP_EPS;
+        var j: i64 = 0;
+        val ob: i64 = tb.m * tb.stride;
+        while j < tb.ncols {
+            if allow_art || !tb.is_art.get(j) {
+                val d: f64 = tb.t.get(ob + j);
+                if d < most {
+                    pc = j;
+                    if bland {
+                        break;
+                    }
+                    most = d;
+                }
+            }
+            j = j + 1;
+        }
+        if pc < 0 {
+            return LP_OPTIMAL;
+        }
+        var pr: i64 = -1;
+        var best: f64 = 0.0;
+        var i: i64 = 0;
+        while i < tb.m {
+            val a: f64 = lpt_get(tb, i, pc);
+            if a > LP_EPS {
+                val ratio: f64 = lpt_get(tb, i, rhs_col) / a;
+                if pr < 0 || ratio < best - LP_EPS {
+                    pr = i;
+                    best = ratio;
+                } else if ratio <= best + LP_EPS && tb.basis.get(i) < tb.basis.get(pr) {
+                    pr = i;
+                    best = ratio;
+                }
+            }
+            i = i + 1;
+        }
+        if pr < 0 {
+            return LP_UNBOUNDED;
+        }
+        if best <= LP_EPS {
+            degenerate = degenerate + 1;
+        } else {
+            degenerate = 0;
+        }
+        lpt_pivot(tb, pr, pc);
+    }
+    return LP_OPTIMAL;
+}
+
+/// Set the objective row to the reduced costs of `cost` (one per column)
+/// for the current basis.
+fn lpt_set_objective(tb: &mut LpTab, cost: &Vec<f64>) {
+    val ob: i64 = tb.m * tb.stride;
+    var j: i64 = 0;
+    while j <= tb.ncols {
+        var d: f64 = 0.0;
+        if j < tb.ncols {
+            d = cost.get(j);
+        }
+        var i: i64 = 0;
+        while i < tb.m {
+            val cb: f64 = cost.get(tb.basis.get(i));
+            if cb != 0.0 {
+                d = d - cb * lpt_get(tb, i, j);
+            }
+            i = i + 1;
+        }
+        tb.t.set(ob + j, d);
+        j = j + 1;
+    }
+}
+
+fn lp_zeros(n: i64) -> Vec<f64> {
+    var v: Vec<f64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0.0);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Solve the LP relaxation (integrality is ignored).
+pub fn lp_solve(p: &LpProblem) -> LpResult {
+    val n: i64 = p.nvars;
+    val m: i64 = p.rows.len();
+    // Normalised rows: rhs >= 0.
+    var flip: Vec<bool> = Vec::new();
+    var rel: Vec<i64> = Vec::new();
+    var nslack: i64 = 0;
+    var nart: i64 = 0;
+    var i: i64 = 0;
+    while i < m {
+        var r: i64 = p.rel.get(i);
+        val f: bool = p.rhs.get(i) < 0.0;
+        if f {
+            if r == LP_LE {
+                r = LP_GE;
+            } else if r == LP_GE {
+                r = LP_LE;
+            }
+        }
+        flip.push(f);
+        rel.push(r);
+        if r != LP_EQ {
+            nslack = nslack + 1;
+        }
+        if r != LP_LE {
+            nart = nart + 1;
+        }
+        i = i + 1;
+    }
+    val ncols: i64 = n + nslack + nart;
+    val stride: i64 = ncols + 1;
+    var t: Vec<f64> = lp_zeros((m + 1) * stride);
+    var basis: Vec<i64> = Vec::new();
+    var is_art: Vec<bool> = Vec::new();
+    var j: i64 = 0;
+    while j < ncols {
+        is_art.push(j >= n + nslack);
+        j = j + 1;
+    }
+    // The column holding row i's slack/surplus (-1 if none) and its
+    // artificial (-1 if none), and the sign of the slack.
+    var slack_col: Vec<i64> = Vec::new();
+    var art_col: Vec<i64> = Vec::new();
+    var s_next: i64 = n;
+    var a_next: i64 = n + nslack;
+    i = 0;
+    while i < m {
+        var sign: f64 = 1.0;
+        if flip.get(i) {
+            sign = -1.0;
+        }
+        val row: Vec<f64> = p.rows.get(i);
+        j = 0;
+        while j < n {
+            t.set(i * stride + j, sign * row.get(j));
+            j = j + 1;
+        }
+        t.set(i * stride + ncols, sign * p.rhs.get(i));
+        val r: i64 = rel.get(i);
+        var sc: i64 = -1;
+        var ac: i64 = -1;
+        if r == LP_LE {
+            sc = s_next;
+            s_next = s_next + 1;
+            t.set(i * stride + sc, 1.0);
+            basis.push(sc);
+        } else if r == LP_GE {
+            sc = s_next;
+            s_next = s_next + 1;
+            t.set(i * stride + sc, -1.0);
+            ac = a_next;
+            a_next = a_next + 1;
+            t.set(i * stride + ac, 1.0);
+            basis.push(ac);
+        } else {
+            ac = a_next;
+            a_next = a_next + 1;
+            t.set(i * stride + ac, 1.0);
+            basis.push(ac);
+        }
+        slack_col.push(sc);
+        art_col.push(ac);
+        i = i + 1;
+    }
+    var tb = LpTab {
+        m: m, ncols: ncols, stride: stride, t: t, basis: basis, is_art: is_art, iters: 0
+    };
+    var fail = LpResult {
+        status: LP_INFEASIBLE, x: Vec::new(), objective: 0.0, duals: Vec::new(), iterations: 0, nodes: 1
+    };
+    // Phase 1.
+    if nart > 0 {
+        var c1: Vec<f64> = lp_zeros(ncols);
+        j = n + nslack;
+        while j < ncols {
+            c1.set(j, 1.0);
+            j = j + 1;
+        }
+        lpt_set_objective(&mut tb, &c1);
+        val st: i64 = lpt_run(&mut tb, true, p.max_iter, p.bland_only);
+        if st == LP_ITER_LIMIT {
+            fail.status = LP_ITER_LIMIT;
+            fail.iterations = tb.iters;
+            return fail;
+        }
+        // objective value = -(rhs cell of the objective row)
+        val w: f64 = 0.0 - lpt_get(&tb, m, ncols);
+        if w > 0.0000001 {
+            fail.iterations = tb.iters;
+            return fail;
+        }
+        // Drive artificials out of the basis where a real column can replace them.
+        i = 0;
+        while i < m {
+            if tb.is_art.get(tb.basis.get(i)) {
+                j = 0;
+                while j < n + nslack {
+                    if math_fabs(lpt_get(&tb, i, j)) > LP_EPS {
+                        lpt_pivot(&mut tb, i, j);
+                        break;
+                    }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    // Phase 2.
+    var c2: Vec<f64> = lp_zeros(ncols);
+    j = 0;
+    while j < n {
+        if p.maximize {
+            c2.set(j, 0.0 - p.c.get(j));
+        } else {
+            c2.set(j, p.c.get(j));
+        }
+        j = j + 1;
+    }
+    lpt_set_objective(&mut tb, &c2);
+    val st2: i64 = lpt_run(&mut tb, false, p.max_iter, p.bland_only);
+    if st2 != LP_OPTIMAL {
+        fail.status = st2;
+        fail.iterations = tb.iters;
+        return fail;
+    }
+    var x: Vec<f64> = lp_zeros(n);
+    i = 0;
+    while i < m {
+        val b: i64 = tb.basis.get(i);
+        if b < n {
+            x.set(b, lpt_get(&tb, i, ncols));
+        }
+        i = i + 1;
+    }
+    var obj: f64 = 0.0;
+    j = 0;
+    while j < n {
+        obj = obj + p.c.get(j) * x.get(j);
+        j = j + 1;
+    }
+    // Duals of the minimisation: y_i = -d(slack) for a +1 column,
+    // +d(surplus) for a -1 column; then undo the row flip and the max->min.
+    var duals: Vec<f64> = Vec::new();
+    i = 0;
+    while i < m {
+        var y: f64 = 0.0;
+        val r: i64 = rel.get(i);
+        if r == LP_LE {
+            y = 0.0 - lpt_get(&tb, m, slack_col.get(i));
+        } else if r == LP_GE {
+            y = lpt_get(&tb, m, slack_col.get(i));
+        } else {
+            y = 0.0 - lpt_get(&tb, m, art_col.get(i));
+        }
+        if flip.get(i) {
+            y = 0.0 - y;
+        }
+        if p.maximize {
+            y = 0.0 - y;
+        }
+        if math_fabs(y) < LP_EPS {
+            y = 0.0;
+        }
+        duals.push(y);
+        i = i + 1;
+    }
+    return LpResult {
+        status: LP_OPTIMAL, x: x, objective: obj, duals: duals, iterations: tb.iters, nodes: 1
+    };
+}
+
+// ─── Branch and bound ───
+
+fn lp_with_bounds(p: &LpProblem, lo: &Vec<f64>, hi: &Vec<f64>) -> LpProblem {
+    var q: LpProblem = LpProblem {
+        nvars: p.nvars, maximize: p.maximize, c: p.c, rows: p.rows, rel: p.rel, rhs: p.rhs, is_int: p.is_int, max_iter: p.max_iter, bland_only: p.bland_only
+    };
+    var j: i64 = 0;
+    while j < p.nvars {
+        if lo.get(j) > 0.0 {
+            var idx: Vec<i64> = Vec::new();
+            idx.push(j);
+            var v: Vec<f64> = Vec::new();
+            v.push(1.0);
+            lp_add_sparse(&mut q, idx, v, LP_GE, lo.get(j));
+        }
+        if hi.get(j) >= 0.0 {
+            lp_add_upper_bound(&mut q, j, hi.get(j));
+        }
+        j = j + 1;
+    }
+    return q;
+}
+
+/// Solve with the integrality constraints of `lp_set_integer`. Without any
+/// integer variable this is `lp_solve`. `duals` are those of the LP at the
+/// best node (with its branching bounds), objective and `x` the best integer
+/// solution; status LP_INFEASIBLE when no integer point is feasible.
+pub fn lp_solve_mip(p: &LpProblem) -> LpResult {
+    val n: i64 = p.nvars;
+    // A node is [lo_0..lo_n-1, hi_0..hi_n-1]; hi < 0 means no upper bound.
+    var stack: Vec<Vec<f64>> = Vec::new();
+    var root: Vec<f64> = Vec::new();
+    var j: i64 = 0;
+    while j < n {
+        root.push(0.0);
+        j = j + 1;
+    }
+    j = 0;
+    while j < n {
+        root.push(-1.0);
+        j = j + 1;
+    }
+    stack.push(root);
+    var best = LpResult {
+        status: LP_INFEASIBLE, x: Vec::new(), objective: 0.0, duals: Vec::new(), iterations: 0, nodes: 0
+    };
+    var have: bool = false;
+    var nodes: i64 = 0;
+    var iters: i64 = 0;
+    var unbounded: bool = false;
+    while stack.len() > 0 {
+        val node: Vec<f64> = stack.pop();
+        var lo: Vec<f64> = Vec::new();
+        var hi: Vec<f64> = Vec::new();
+        j = 0;
+        while j < n {
+            lo.push(node.get(j));
+            hi.push(node.get(n + j));
+            j = j + 1;
+        }
+        val q: LpProblem = lp_with_bounds(p, &lo, &hi);
+        val r: LpResult = lp_solve(&q);
+        nodes = nodes + 1;
+        iters = iters + r.iterations;
+        if r.status == LP_UNBOUNDED {
+            unbounded = true;
+            continue;
+        }
+        if r.status != LP_OPTIMAL {
+            continue;
+        }
+        if have {
+            if p.maximize && r.objective <= best.objective + LP_INT_TOL {
+                continue;
+            }
+            if !p.maximize && r.objective >= best.objective - LP_INT_TOL {
+                continue;
+            }
+        }
+        // the most fractional integer variable
+        var bj: i64 = -1;
+        var bfrac: f64 = 0.0;
+        j = 0;
+        while j < n {
+            if p.is_int.get(j) {
+                val v: f64 = r.x.get(j);
+                val f: f64 = v - math_floor(v);
+                var dist: f64 = f;
+                if 1.0 - f < dist {
+                    dist = 1.0 - f;
+                }
+                if dist > LP_INT_TOL && dist > bfrac {
+                    bfrac = dist;
+                    bj = j;
+                }
+            }
+            j = j + 1;
+        }
+        if bj < 0 {
+            // integer feasible: round the integer variables exactly
+            var xr: Vec<f64> = r.x;
+            j = 0;
+            while j < n {
+                if p.is_int.get(j) {
+                    xr.set(j, math_floor(xr.get(j) + 0.5));
+                }
+                j = j + 1;
+            }
+            var obj: f64 = 0.0;
+            j = 0;
+            while j < n {
+                obj = obj + p.c.get(j) * xr.get(j);
+                j = j + 1;
+            }
+            best = LpResult {
+                status: LP_OPTIMAL, x: xr, objective: obj, duals: r.duals, iterations: 0, nodes: 0
+            };
+            have = true;
+            continue;
+        }
+        val v: f64 = r.x.get(bj);
+        val fl: f64 = math_floor(v);
+        // down branch x <= floor(v), up branch x >= floor(v) + 1; the branch
+        // nearer the relaxation is pushed last so it is explored first
+        var down: Vec<f64> = node;
+        down.set(n + bj, fl);
+        var up: Vec<f64> = node;
+        up.set(bj, fl + 1.0);
+        if v - fl >= 0.5 {
+            stack.push(down);
+            stack.push(up);
+        } else {
+            stack.push(up);
+            stack.push(down);
+        }
+    }
+    if !have && unbounded {
+        best.status = LP_UNBOUNDED;
+    }
+    best.nodes = nodes;
+    best.iterations = iters;
+    return best;
+}

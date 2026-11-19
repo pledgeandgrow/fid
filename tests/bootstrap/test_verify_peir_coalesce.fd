@@ -1,0 +1,80 @@
+// VF5, PEIR_COALESCE (compiler/pe_ir.fd): copy coalescing gives a local's
+// loads and stores one register. It is wrong to merge two values that are
+// live at the same time: a copy whose source changes afterwards, two copies
+// of one value changed differently, a copy made in one branch only, a swap
+// done with arithmetic on parameters. Each case prints a value that changes
+// if the two are merged.
+//
+// Expected output:
+// 65
+// 606
+// 703
+// 31 30
+// 12 4
+// 9
+
+fn swap_sum(a: i64, b: i64) -> i64 {
+    var x: i64 = a;
+    var y: i64 = b;
+    x = x + y;
+    y = x - y;
+    x = x - y;
+    return x * 100 + y;
+}
+
+fn pick(c: bool, x: i64) -> i64 {
+    var y: i64 = 0;
+    var z: i64 = x;
+    if c {
+        y = z;
+    } else {
+        y = z + 1;
+    }
+    z = 0;
+    return y + z;
+}
+
+fn main() -> i64 {
+    // the copy keeps the old value when its source changes
+    var a: i64 = 5;
+    val b: i64 = a;
+    a = a + 1;
+    println(a * 10 + b);
+
+    // two copies of one value, each changed its own way
+    var s: i64 = 1;
+    var r: i64 = 0;
+    while r < 5 {
+        var p: i64 = s;
+        var q: i64 = s;
+        p = p * 2;
+        q = q + 3;
+        s = p + q;
+        r = r + 1;
+    }
+    println(s);
+
+    // a swap through arithmetic, on copies of the parameters
+    println(swap_sum(3, 7));
+
+    // the last value of a counter, copied before the counter moves on
+    var last: i64 = 0;
+    var i: i64 = 0;
+    while i < 31 {
+        last = i;
+        i = i + 1;
+    }
+    println(int_to_str(i) + " " + int_to_str(last));
+
+    // a copy made in one branch only
+    println(int_to_str(pick(true, 12)) + " " + int_to_str(pick(false, 3)));
+
+    // copies in a chain, the first changed after the last is made
+    var c1: i64 = 4;
+    var c2: i64 = c1;
+    val c3: i64 = c2;
+    c1 = c1 + 1;
+    c2 = c2 * 0;
+    println(c1 + c2 + c3);
+    return 0;
+}

@@ -1,0 +1,91 @@
+// Lab 11 solution: layouts in memory and on the wire.
+//! lab: 11
+//! check: runs
+//! playground: yes
+
+// Largest alignment first: id (8), len (4), tag (1) gives 13 bytes of
+// fields and 3 of tail padding (the size is a multiple of 8), against
+// 24 for tag, id, len (7 bytes of padding after tag, 4 at the end).
+@repr(C)
+struct Header {
+    id: u64,
+    len: u32,
+    tag: u8,
+}
+
+@packed
+struct Wire {
+    tag: u8,
+    len: u32,
+    id: u64,
+}
+
+fn hex2(x: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    return str_slice(digits, (x >> 4) & 15, ((x >> 4) & 15) + 1) + str_slice(digits, x & 15, (x & 15) + 1);
+}
+
+fn put_le(out: &mut Vec<u8>, x: i64, bytes: i64) {
+    for i in 0..bytes { out.push(((x >> (i * 8)) & 255) as u8); }
+}
+
+fn get_le(b: &Vec<u8>, at: i64, bytes: i64) -> i64 {
+    var x: i64 = 0;
+    for i in 0..bytes { x = x | ((b.get(at + i) as i64) << (i * 8)); }
+    return x;
+}
+
+fn encode(h: Header) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new();
+    put_le(&mut out, h.tag as i64, 1);
+    put_le(&mut out, h.len as i64, 4);
+    put_le(&mut out, h.id as i64, 8);
+    return out;
+}
+
+fn decode(b: &Vec<u8>) -> Option<Header> {
+    if b.len() != 13 { return Option::None; }
+    return Option::Some(Header {
+        id: get_le(b, 5, 8) as u64,
+        len: get_le(b, 1, 4) as u32,
+        tag: get_le(b, 0, 1) as u8,
+    });
+}
+
+fn same(a: Header, b: Header) -> bool {
+    return a.tag == b.tag && a.len == b.len && a.id == b.id;
+}
+
+fn round_trip(h: Header) -> str {
+    val bytes: Vec<u8> = encode(h);
+    match decode(&bytes) {
+        Option::Some(back) => {
+            if same(h, back) { return "ok"; }
+            return "CHANGED";
+        }
+        Option::None => { return "rejected"; }
+    }
+}
+
+fn main() -> i64 {
+    println("Header: " + int_to_str(comptime struct_size(Header)) + " bytes");
+    println("Wire:   " + int_to_str(comptime struct_size(Wire)) + " bytes");
+    val h: Header = Header { tag: 7, id: 4294967295, len: 513 };
+    var line: str = "";
+    for b in encode(h) {
+        if str_len(line) > 0 { line = line + " "; }
+        line = line + hex2(b as i64);
+    }
+    println("encoded: " + line);
+    println("zeros: " + round_trip(Header { tag: 0, id: 0, len: 0 }));
+    println("255s: " + round_trip(Header { tag: 255, id: 255, len: 255 }));
+    println("0xffffffff: " + round_trip(Header { tag: 255, id: 4294967295, len: 4294967295 }));
+    println("2^40: " + round_trip(Header { tag: 1, id: 1099511627776, len: 65536 }));
+    var short: Vec<u8> = Vec::new();
+    short.push(1);
+    match decode(&short) {
+        Option::Some(x) => { println("1 byte: decoded"); }
+        Option::None => { println("1 byte: rejected"); }
+    }
+    return 0;
+}

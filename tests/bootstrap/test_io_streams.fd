@@ -1,0 +1,165 @@
+// stdlib/io.fd streams (roadmap L4B): Reader, Writer, BufReader and
+// BufWriter over memory, a file and standard output. Standard input is in
+// test_io_stdin.fd (the interpreter has no p_read_stdin).
+//
+// Expected output:
+// 1 hel lo [] 3
+// 2 [alpha|beta||gamma]
+// 3 alpha|beta|gamma
+// 4 line one|line two|end
+// 5 written 3 writes 1 pending 0
+// 6 abc,defg,hi
+// 7 to stdout
+// 8 tail 11
+// 9 file 3 lines: x=1|y=2|z=3
+// 10 bytes 0 255 7
+// 11 read_until [a,] [b,] [c]
+// 12 at_end true
+use io;
+
+fn bstr(v: Vec<i64>) -> str {
+    return str_from_bytes(v);
+}
+
+fn opt(o: Option<str>) -> str {
+    match o {
+        Option::Some(s) => {
+            return s;
+        }
+        Option::None => {
+            return "<none>";
+        }
+    }
+}
+
+fn main() -> i64 {
+    // Reader over memory: read(n), read_to_end
+    var r: Reader = Reader::from_str("hello");
+    val a: Vec<i64> = r.read(3);
+    val b: Vec<i64> = r.read(10);
+    val c: Vec<i64> = r.read(1);
+    println("1 " + bstr(a) + " " + bstr(b) + " [" + bstr(c) + "] " + int_to_str(a.len()));
+
+    // Reader::read_line: CRLF and a last line without a newline
+    var r2: Reader = Reader::from_str("alpha\r\nbeta\n\ngamma");
+    var parts: str = "[" + opt(r2.read_line()) + "|" + opt(r2.read_line()) + "|";
+    parts = parts + opt(r2.read_line()) + "|" + opt(r2.read_line()) + "]";
+    println("2 " + parts);
+
+    // BufReader with a small capacity: lines()
+    var br: BufReader = BufReader::with_capacity(Reader::from_str("alpha\nbeta\ngamma\n"), 4);
+    val ls: Vec<str> = br.lines();
+    var j: str = "";
+    var i: i64 = 0;
+    while i < ls.len() {
+        if i > 0 {
+            j = j + "|";
+        }
+        j = j + ls.get(i);
+        i = i + 1;
+    }
+    println("3 " + j);
+
+    // a file: BufWriter writes it, BufReader reads it back
+    val path: str = "test_io_streams.tmp";
+    match Writer::create(path) {
+        Option::Some(w) => {
+            var bw: BufWriter = BufWriter::with_capacity(w, 64);
+            bw.write_line("line one");
+            bw.write_str("line two\n");
+            bw.write_all(str_bytes("end"));
+            bw.flush();
+        }
+        Option::None => {
+            println("cannot create");
+        }
+    }
+    match Reader::open(path) {
+        Option::Some(fr) => {
+            var fb: BufReader = BufReader::new(fr);
+            println("4 " + opt(fb.read_line()) + "|" + opt(fb.read_line()) + "|" + opt(fb.read_line()));
+        }
+        Option::None => {
+            println("4 cannot open");
+        }
+    }
+
+    // BufWriter batches writes: three small writes, one write to the sink
+    var mw: BufWriter = BufWriter::with_capacity(Writer::memory(), 100);
+    mw.write_str("a");
+    mw.write_str("b");
+    mw.write_str("c");
+    mw.flush();
+    println("5 written " + int_to_str(mw.bytes().len()) + " writes " + int_to_str(mw.writes) + " pending " + int_to_str(mw.pending()));
+
+    // a full buffer goes out by itself
+    var cw: BufWriter = BufWriter::with_capacity(Writer::memory(), 4);
+    cw.write_str("abc,");
+    cw.write_str("defg");
+    cw.write_str(",hi");
+    var inner: Writer = cw.into_inner();
+    println("6 " + bstr(inner.bytes()));
+
+    // stdout through a BufWriter: 12 bytes fill an 8-byte buffer, so the
+    // write goes out by itself (flush() would also run p_flush_stdout,
+    // which the interpreter does not have)
+    var so: BufWriter = BufWriter::with_capacity(Writer::to_stdout(), 8);
+    so.write_str("7 to stdout\n");
+
+    // Reader::read_to_end after a partial read
+    var r3: Reader = Reader::from_str("0123456789abcdefghij");
+    r3.read(9);
+    println("8 tail " + int_to_str(r3.read_to_end().len()));
+
+    // Writer::append adds to the file; read it back whole
+    match Writer::create(path) {
+        Option::Some(w0) => {
+            var w1: Writer = w0;
+            w1.write_line("x=1");
+        }
+        Option::None => {}
+    }
+    match Writer::append(path) {
+        Option::Some(w2) => {
+            var w3: Writer = w2;
+            w3.write_line("y=2");
+            w3.write_str("z=3");
+            w3.flush();
+        }
+        Option::None => {}
+    }
+    match Reader::open(path) {
+        Option::Some(fr2) => {
+            var b2: BufReader = BufReader::new(fr2);
+            val fl: Vec<str> = b2.lines();
+            println("9 file " + int_to_str(fl.len()) + " lines: " + fl.get(0) + "|" + fl.get(1) + "|" + fl.get(2));
+        }
+        Option::None => {
+            println("9 cannot open");
+        }
+    }
+
+    // bytes, not only text, through a memory Writer
+    var bm: Writer = Writer::memory();
+    var raw: Vec<i64> = Vec::new();
+    raw.push(0);
+    raw.push(255);
+    raw.push(7);
+    bm.write_all(raw);
+    val got: Vec<i64> = bm.bytes();
+    println("10 bytes " + int_to_str(got.get(0)) + " " + int_to_str(got.get(1)) + " " + int_to_str(got.get(2)));
+
+    // read_until a delimiter
+    var bu: BufReader = BufReader::with_capacity(Reader::from_str("a,b,c"), 2);
+    val u1: Vec<i64> = bu.read_until(44);
+    val u2: Vec<i64> = bu.read_until(44);
+    val u3: Vec<i64> = bu.read_until(44);
+    println("11 read_until [" + bstr(u1) + "] [" + bstr(u2) + "] [" + bstr(u3) + "]");
+    if bu.at_end() {
+        println("12 at_end true");
+    } else {
+        println("12 at_end false");
+    }
+    p_file_delete(path);
+    return 0;
+}

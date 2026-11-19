@@ -1,0 +1,33 @@
+// Miscompile log M26 (docs/verification/miscompile-log.md; VF5 finding O1).
+// An assignment to a local that has the name of a module-level global
+// writes the global and leaves the local alone, on every backend (run,
+// ccompile, emit, --nat): compiler/lower.fd lowers `Stmt::Assign` by
+// looking the name up among the globals before the locals. Reads look at
+// the locals first, so the function below reads its local (1) and the
+// global gets 1 + 5. Core's own functions have locals too: a HashMap
+// insert runs core's hm_set_hashed, whose `base = ...` overwrote the
+// user's global `base` (262144). The stray stores also made gconst
+// (compiler/iropt.fd iro_const_globals) see every such global as written,
+// so it folded nothing (O1). Found Nov 17 with the Nov 16 compiler.
+
+var base: i64 = 100;
+
+fn shadow(c: bool) -> i64 {
+    var base: i64 = 1;
+    if c {
+        base = base + 5;
+    }
+    return base;
+}
+
+fn main() -> i64 {
+    println(shadow(true));
+    println(base);
+    var m: HashMap<str, i64> = HashMap::new();
+    m.insert("a", 1);
+    println(base);
+    return 0;
+}
+//> 6
+//> 100
+//> 100

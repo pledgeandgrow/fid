@@ -1,0 +1,279 @@
+// stdlib/quic_frame (competitive SL2, part 2): every QUIC frame type is
+// encoded and parsed back (RFC 9000 §19), ACK ranges round-trip and merge,
+// malformed frames are FRAME_ENCODING_ERROR, frames a packet type may not
+// carry are PROTOCOL_VIOLATION (§12.4), and transport parameters (§18)
+// round-trip with their bounds checked. A wrong answer panics.
+//
+// Expected output:
+// stream frame ok
+// crypto frame ok
+// ack frame ok
+// control frames ok
+// close frames ok
+// padding and ping ok
+// bad frames rejected
+// levels ok
+// ack ranges ok
+// transport parameters ok
+// bad transport parameters rejected
+// quic frames ok
+use quic;
+use quic_frame;
+use encoding;
+
+fn he(v: Vec<i64>) -> str { return hex_encode_bytes(v); }
+
+fn hb(h: str) -> Vec<i64> { return hex_decode_bytes(h); }
+
+fn one(payload: Vec<i64>, level: i64) -> QuicFrame {
+    val fs: QuicFrames = quic_frames_parse(payload, level);
+    if fs.error >= 0 {
+        p_panic("parse failed: " + fs.why);
+    }
+    if fs.frames.len() != 1 {
+        p_panic("expected one frame, got " + int_to_str(fs.frames.len()));
+    }
+    return fs.frames.get(0);
+}
+
+fn same(a: Vec<i64>, b: Vec<i64>) -> bool {
+    return str_equal(he(a), he(b));
+}
+
+fn main() -> i64 {
+    // STREAM: offset 0 omits the offset; the Length field is always sent
+    var s: QuicFrame = quic_frame_blank(QF_STREAM);
+    s.stream_id = 4;
+    s.data = str_bytes("hello");
+    s.fin = true;
+    val se: Vec<i64> = quic_frame_encode(s);
+    if !str_equal(he(se), "0b040568656c6c6f") { p_panic("stream encode: " + he(se)); }
+    val sp: QuicFrame = one(se, QL_APP);
+    if sp.ftype != QF_STREAM || sp.stream_id != 4 || sp.offset != 0 || !sp.fin
+        || !str_equal(str_from_bytes(sp.data), "hello") {
+        p_panic("stream parse");
+    }
+    var s2: QuicFrame = quic_frame_blank(QF_STREAM);
+    s2.stream_id = 1;
+    s2.offset = 1000;
+    s2.data = str_bytes("abc");
+    val s2e: Vec<i64> = quic_frame_encode(s2);
+    if s2e.len() != quic_stream_frame_overhead(1, 1000, 3) + 3 { p_panic("stream overhead"); }
+    val s2p: QuicFrame = one(s2e, QL_APP);
+    if s2p.offset != 1000 || s2p.fin || s2p.stream_id != 1 { p_panic("stream offset parse"); }
+    // A STREAM frame without LEN runs to the end of the packet (type 0x0c)
+    val s3p: QuicFrame = one(hb("0c0844d0787978"), QL_APP);
+    if s3p.stream_id != 8 || s3p.offset != 1232 || !str_equal(str_from_bytes(s3p.data), "xyx") {
+        p_panic("stream without length");
+    }
+    println("stream frame ok");
+
+    var c: QuicFrame = quic_frame_blank(QF_CRYPTO);
+    c.offset = 70;
+    c.data = hb("0100");
+    val ce: Vec<i64> = quic_frame_encode(c);
+    if !str_equal(he(ce), "0640460201" + "00") { p_panic("crypto encode: " + he(ce)); }
+    if ce.len() != quic_crypto_frame_overhead(70, 2) + 2 { p_panic("crypto overhead"); }
+    val cp: QuicFrame = one(ce, QL_INITIAL);
+    if cp.offset != 70 || !same(cp.data, c.data) { p_panic("crypto parse"); }
+    println("crypto frame ok");
+
+    // ACK of 0..2, 5..9 and 20: highest range first
+    var r: Vec<i64> = Vec::new();
+    r = quic_ranges_add(r, 0, 32);
+    r = quic_ranges_add(r, 1, 32);
+    r = quic_ranges_add(r, 2, 32);
+    r = quic_ranges_add(r, 9, 32);
+    r = quic_ranges_add(r, 5, 32);
+    r = quic_ranges_add(r, 7, 32);
+    r = quic_ranges_add(r, 6, 32);
+    r = quic_ranges_add(r, 8, 32);
+    r = quic_ranges_add(r, 20, 32);
+    if !str_equal(he(r), "141405090002") { p_panic("ranges: " + he(r)); }
+    var a: QuicFrame = quic_frame_blank(QF_ACK);
+    a.ranges = r;
+    a.ack_delay = 9;
+    val ae: Vec<i64> = quic_frame_encode(a);
+    // largest 20, delay 9, 2 more ranges, first 0; gap 20-9-2=9 len 4; gap 5-2-2=1 len 2
+    if !str_equal(he(ae), "02140902000904010" + "2") { p_panic("ack encode: " + he(ae)); }
+    val ap: QuicFrame = one(ae, QL_HANDSHAKE);
+    if !same(ap.ranges, r) || ap.ack_delay != 9 { p_panic("ack parse"); }
+    var ae2: QuicFrame = quic_frame_blank(QF_ACK_ECN);
+    ae2.ranges = r;
+    ae2.ecn.push(1);
+    ae2.ecn.push(2);
+    ae2.ecn.push(3);
+    val ae2p: QuicFrame = one(quic_frame_encode(ae2), QL_APP);
+    if ae2p.ftype != QF_ACK_ECN || ae2p.ecn.len() != 3 || ae2p.ecn.get(2) != 3 || !same(ae2p.ranges, r) {
+        p_panic("ack ecn");
+    }
+    println("ack frame ok");
+
+    // Every control frame, one packet, round trip
+    var payload: Vec<i64> = Vec::new();
+    var f1: QuicFrame = quic_frame_blank(QF_RESET_STREAM);
+    f1.stream_id = 8; f1.error_code = 0x10c; f1.final_size = 99;
+    quic_frame_put(& mut payload, f1);
+    var f2: QuicFrame = quic_frame_blank(QF_STOP_SENDING);
+    f2.stream_id = 3; f2.error_code = 7;
+    quic_frame_put(& mut payload, f2);
+    var f3: QuicFrame = quic_frame_blank(QF_NEW_TOKEN);
+    f3.data = hb("aabbcc");
+    quic_frame_put(& mut payload, f3);
+    var f4: QuicFrame = quic_frame_blank(QF_MAX_DATA);
+    f4.limit = 1048576;
+    quic_frame_put(& mut payload, f4);
+    var f5: QuicFrame = quic_frame_blank(QF_MAX_STREAM_DATA);
+    f5.stream_id = 0; f5.limit = 65536;
+    quic_frame_put(& mut payload, f5);
+    var f6: QuicFrame = quic_frame_blank(QF_MAX_STREAMS_UNI);
+    f6.limit = 103;
+    quic_frame_put(& mut payload, f6);
+    var f7: QuicFrame = quic_frame_blank(QF_STREAM_DATA_BLOCKED);
+    f7.stream_id = 12; f7.limit = 4096;
+    quic_frame_put(& mut payload, f7);
+    var f8: QuicFrame = quic_frame_blank(QF_NEW_CONNECTION_ID);
+    f8.seq = 1; f8.retire_prior_to = 0; f8.data = hb("0102030405060708");
+    f8.reset_token = hb("00112233445566778899aabbccddeeff");
+    quic_frame_put(& mut payload, f8);
+    var f9: QuicFrame = quic_frame_blank(QF_RETIRE_CONNECTION_ID);
+    f9.seq = 5;
+    quic_frame_put(& mut payload, f9);
+    var f10: QuicFrame = quic_frame_blank(QF_PATH_CHALLENGE);
+    f10.data = hb("0807060504030201");
+    quic_frame_put(& mut payload, f10);
+    var f11: QuicFrame = quic_frame_blank(QF_DATA_BLOCKED);
+    f11.limit = 77;
+    quic_frame_put(& mut payload, f11);
+    quic_frame_put(& mut payload, quic_frame_blank(QF_HANDSHAKE_DONE));
+    val cfs: QuicFrames = quic_frames_parse(payload, QL_APP);
+    if cfs.error >= 0 || cfs.frames.len() != 12 || !cfs.ack_eliciting { p_panic("control frames: " + cfs.why); }
+    val g1: QuicFrame = cfs.frames.get(0);
+    val g2: QuicFrame = cfs.frames.get(1);
+    val g3: QuicFrame = cfs.frames.get(2);
+    val g4: QuicFrame = cfs.frames.get(3);
+    val g5: QuicFrame = cfs.frames.get(4);
+    val g6: QuicFrame = cfs.frames.get(5);
+    val g7: QuicFrame = cfs.frames.get(6);
+    val g8: QuicFrame = cfs.frames.get(7);
+    val g9: QuicFrame = cfs.frames.get(8);
+    val g10: QuicFrame = cfs.frames.get(9);
+    val g11: QuicFrame = cfs.frames.get(10);
+    val g12: QuicFrame = cfs.frames.get(11);
+    if g1.ftype != QF_RESET_STREAM || g1.stream_id != 8 || g1.error_code != 0x10c || g1.final_size != 99 { p_panic("reset_stream"); }
+    if g2.ftype != QF_STOP_SENDING || g2.stream_id != 3 || g2.error_code != 7 { p_panic("stop_sending"); }
+    if g3.ftype != QF_NEW_TOKEN || !same(g3.data, f3.data) { p_panic("new_token"); }
+    if g4.ftype != QF_MAX_DATA || g4.limit != 1048576 { p_panic("max_data"); }
+    if g5.ftype != QF_MAX_STREAM_DATA || g5.limit != 65536 { p_panic("max_stream_data"); }
+    if g6.ftype != QF_MAX_STREAMS_UNI || g6.limit != 103 { p_panic("max_streams"); }
+    if g7.ftype != QF_STREAM_DATA_BLOCKED || g7.stream_id != 12 || g7.limit != 4096 { p_panic("stream_data_blocked"); }
+    if g8.ftype != QF_NEW_CONNECTION_ID || g8.seq != 1 || !same(g8.data, f8.data) || !same(g8.reset_token, f8.reset_token) { p_panic("new_connection_id"); }
+    if g9.ftype != QF_RETIRE_CONNECTION_ID || g9.seq != 5 { p_panic("retire_connection_id"); }
+    if g10.ftype != QF_PATH_CHALLENGE || !same(g10.data, f10.data) { p_panic("path_challenge"); }
+    if g11.ftype != QF_DATA_BLOCKED || g11.limit != 77 { p_panic("data_blocked"); }
+    if g12.ftype != QF_HANDSHAKE_DONE { p_panic("handshake_done"); }
+    println("control frames ok");
+
+    var cc: QuicFrame = quic_frame_blank(QF_CONNECTION_CLOSE);
+    cc.error_code = QE_PROTOCOL_VIOLATION;
+    cc.frame_type = QF_STREAM;
+    cc.data = str_bytes("bad");
+    val ccp: QuicFrame = one(quic_frame_encode(cc), QL_INITIAL);
+    if ccp.error_code != 10 || ccp.frame_type != 8 || !str_equal(str_from_bytes(ccp.data), "bad") { p_panic("close"); }
+    var ca: QuicFrame = quic_frame_blank(QF_CONNECTION_CLOSE_APP);
+    ca.error_code = 0x100;
+    val cap: QuicFrame = one(quic_frame_encode(ca), QL_APP);
+    if cap.ftype != QF_CONNECTION_CLOSE_APP || cap.error_code != 256 { p_panic("close app"); }
+    val cfs2: QuicFrames = quic_frames_parse(quic_frame_encode(ca), QL_APP);
+    if cfs2.ack_eliciting { p_panic("CONNECTION_CLOSE is not ack-eliciting"); }
+    println("close frames ok");
+
+    // PADDING runs are skipped; PING elicits an ACK; ACK alone does not
+    val pp: QuicFrames = quic_frames_parse(hb("0000000100000000"), QL_INITIAL);
+    if pp.error >= 0 || pp.frames.len() != 1 || pp.frames.get(0).ftype != QF_PING || !pp.ack_eliciting { p_panic("padding/ping"); }
+    val ao: QuicFrames = quic_frames_parse(ae, QL_APP);
+    if ao.ack_eliciting { p_panic("ACK is not ack-eliciting"); }
+    println("padding and ping ok");
+
+    // Malformed: cut short, an ACK range below 0, an unknown type, an
+    // empty payload, a NEW_CONNECTION_ID of length 0
+    if quic_frames_parse(hb("0b0405686c"), QL_APP).error != QE_FRAME_ENCODING_ERROR { p_panic("cut stream accepted"); }
+    if quic_frames_parse(hb("0205000006"), QL_APP).error != QE_FRAME_ENCODING_ERROR { p_panic("ack first range above largest accepted"); }
+    if quic_frames_parse(hb("020500010103"), QL_APP).error != QE_FRAME_ENCODING_ERROR { p_panic("ack below zero accepted"); }
+    if quic_frames_parse(hb("4021"), QL_APP).error != QE_FRAME_ENCODING_ERROR { p_panic("unknown type accepted"); }
+    val nothing: Vec<i64> = Vec::new();
+    if quic_frames_parse(nothing, QL_APP).error != QE_PROTOCOL_VIOLATION { p_panic("empty payload accepted"); }
+    if quic_frames_parse(hb("18010000"), QL_APP).error != QE_FRAME_ENCODING_ERROR { p_panic("zero-length cid accepted"); }
+    if quic_frames_parse(hb("07"), QL_APP).error != QE_FRAME_ENCODING_ERROR { p_panic("cut new_token accepted"); }
+    println("bad frames rejected");
+
+    // §12.4: STREAM in an Initial packet, HANDSHAKE_DONE in a Handshake one
+    if quic_frames_parse(se, QL_INITIAL).error != QE_PROTOCOL_VIOLATION { p_panic("stream in Initial accepted"); }
+    if quic_frames_parse(hb("1e"), QL_HANDSHAKE).error != QE_PROTOCOL_VIOLATION { p_panic("handshake_done in Handshake accepted"); }
+    if quic_frames_parse(quic_frame_encode(ca), QL_HANDSHAKE).error != QE_PROTOCOL_VIOLATION { p_panic("app close in Handshake accepted"); }
+    if !quic_frame_allowed(QF_STREAM, QL_0RTT) || quic_frame_allowed(QF_ACK, QL_0RTT) { p_panic("0-RTT table"); }
+    println("levels ok");
+
+    // Ranges: duplicates, merge across a gap, the cap on ranges kept
+    var q: Vec<i64> = Vec::new();
+    q = quic_ranges_add(q, 10, 2);
+    q = quic_ranges_add(q, 10, 2);
+    q = quic_ranges_add(q, 12, 2);
+    q = quic_ranges_add(q, 14, 2);
+    if !str_equal(he(q), "0e0e0c0c") { p_panic("range cap: " + he(q)); }
+    q = quic_ranges_add(q, 13, 2);
+    if !str_equal(he(q), "0c0e") { p_panic("range merge: " + he(q)); }
+    if !quic_ranges_contain(q, 13) || quic_ranges_contain(q, 11) { p_panic("range contain"); }
+    println("ack ranges ok");
+
+    var tp: QuicParams = quic_params_default();
+    tp.has_original_dcid = true;
+    tp.original_dcid = hb("8394c8f03e515708");
+    tp.max_idle_timeout = 30000;
+    tp.initial_max_data = 1048576;
+    tp.initial_max_stream_data_bidi_local = 262144;
+    tp.initial_max_stream_data_bidi_remote = 262144;
+    tp.initial_max_stream_data_uni = 65536;
+    tp.initial_max_streams_bidi = 100;
+    tp.initial_max_streams_uni = 3;
+    tp.max_ack_delay = 20;
+    tp.disable_active_migration = true;
+    tp.has_initial_scid = true;
+    tp.initial_scid = hb("f067a5502a4262b5");
+    tp.stateless_reset_token = hb("00112233445566778899aabbccddeeff");
+    val tpe: Vec<i64> = quic_params_encode(tp);
+    val tpp: QuicParamsParsed = quic_params_parse(tpe, true);
+    if tpp.error >= 0 { p_panic("params: " + tpp.why); }
+    val t2: QuicParams = tpp.params;
+    if !same(t2.original_dcid, tp.original_dcid) || t2.max_idle_timeout != 30000
+        || t2.initial_max_data != 1048576 || t2.initial_max_stream_data_bidi_local != 262144
+        || t2.initial_max_stream_data_uni != 65536 || t2.initial_max_streams_bidi != 100
+        || t2.initial_max_streams_uni != 3 || t2.max_ack_delay != 20 || !t2.disable_active_migration
+        || !same(t2.initial_scid, tp.initial_scid) || t2.ack_delay_exponent != 3
+        || !same(t2.stateless_reset_token, tp.stateless_reset_token) || t2.has_retry_scid {
+        p_panic("params round trip");
+    }
+    // An unknown (greased) parameter is skipped
+    var grease: Vec<i64> = hb("4b27" + "02" + "abcd");
+    var gi: i64 = 0;
+    while gi < tpe.len() {
+        grease.push(tpe.get(gi));
+        gi = gi + 1;
+    }
+    if quic_params_parse(grease, true).error >= 0 { p_panic("grease rejected"); }
+    println("transport parameters ok");
+
+    // From a client, original_destination_connection_id is not allowed;
+    // twice the same parameter; ack_delay_exponent 21; missing initial scid
+    if quic_params_parse(tpe, false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("server-only accepted"); }
+    if quic_params_parse(hb("0f0101" + "0f0101"), false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("duplicate accepted"); }
+    if quic_params_parse(hb("0a0115" + "0f0101"), false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("exponent 21 accepted"); }
+    if quic_params_parse(hb("030243e8" + "0f0101"), false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("payload 1000 accepted"); }
+    if quic_params_parse(hb("0e0101" + "0f0101"), false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("cid limit 1 accepted"); }
+    if quic_params_parse(hb("0402" + "4000"), false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("no initial scid accepted"); }
+    if quic_params_parse(hb("040144" + "0f0101"), false).error != QE_TRANSPORT_PARAMETER_ERROR { p_panic("cut value accepted"); }
+    if quic_params_parse(hb("0f0101"), false).error >= 0 { p_panic("minimal client params rejected"); }
+    println("bad transport parameters rejected");
+    println("quic frames ok");
+    return 0;
+}

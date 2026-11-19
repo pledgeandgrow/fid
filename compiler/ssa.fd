@@ -1,0 +1,1829 @@
+// compiler/ssa.fd — SSA form inside the mid-end (docs/roadmap/llvm-roadmap.md
+// ME3 mem2reg with merges, ME15 dead phis and stores on SSA, ME23 exit
+// values of counted loops).
+//
+// The IR every backend reads keeps locals in memory: an Alloca, Stores and
+// Loads (Jump and Branch carry no block arguments). This module builds SSA
+// from that slot form for one function, optimizes it there, and converts it
+// back before any backend sees it, so the backends keep the IR shape they
+// read today:
+//
+//   1. candidates: scalar allocas whose address goes only to loads and
+//      stores of their own type, in blocks the alloca dominates, and that
+//      the backend does not read by itself (drops, @zeroize, @persist)
+//   2. dominance frontiers from the shared CFG (iro_cfg, compiler/checks.fd)
+//      and phis at the iterated frontiers of each candidate's stores
+//   3. renaming over the dominator tree: a load becomes the value that
+//      reaches it, a store pushes its value, each edge fills the phis of
+//      the block it enters
+//   4. on SSA: a phi whose inputs all agree is that input (trivial phis);
+//      a phi nothing reads is dropped (ME15: dead phis; every store to a
+//      candidate is dead once its value has a name, so all of them go); the
+//      value a counted loop's variable has after the loop becomes a
+//      constant (ME23, `ssaexit`), or (Nov 17) the loop's bound when that
+//      is a value from before the loop: `i != n` always, `i < n` (n) and
+//      `i <= n` (n + 1) when a guard on the way in says i starts <= n
+//   5. out of SSA: each phi left gets a slot of its own (a new Alloca at the
+//      top of the entry block), each predecessor stores its input into the
+//      slot right before its terminator, and the phi is a Load of the slot
+//      at the top of its block. No edge is split: every entry into the
+//      block comes straight from a predecessor's store and the slot is read
+//      nowhere else, so a store made on an edge that goes elsewhere is
+//      overwritten before anything reads it. The candidate's own loads and
+//      stores are removed (its Alloca stays, unused, so `locals` and debug
+//      info still name a value that exists).
+//
+// Left in memory, as the program had it: a candidate a load of which can
+// see no store on some path (a read of an uninitialized local), or that a
+// phi read by the program merges with such a path. Left alone: functions
+// with TryUnwrap or Asm (they name values the renaming does not see),
+// @constant_time functions, and functions whose entry block has
+// predecessors. Run by iropt_me's ime_function_passes, on by default
+// since Nov 16 (OP2: `ssa`, and `ssaexit` for exit values, are in
+// iropt_me.fd IME_DEFAULT_ON); FID_IROPT_OFF=ssa (or ssaexit) turns it
+// off. With --validate (compiler/tv.fd) the result is checked against the
+// function as it was before.
+
+module compiler::ssa; use core; use vec; use string; use compiler::ast; use compiler::ir; use compiler::checks;  /// Most phis placed in one function; with more, it is left as it is.
+const SSA_MAX_PHIS: i64 = 20000;
+
+// --- Helpers ----------------------------------------------------------------
+
+fn ssa_fill(n: i64, v: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(v);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A type a local of which can be a value: integers, bool, floats, pointers.
+fn ssa_scalar(t: IrType) -> bool {
+    match t {
+        IrType::I8 => {
+            return true;
+        }
+        IrType::I16 => {
+            return true;
+        }
+        IrType::I32 => {
+            return true;
+        }
+        IrType::I64 => {
+            return true;
+        }
+        IrType::U8 => {
+            return true;
+        }
+        IrType::U16 => {
+            return true;
+        }
+        IrType::U32 => {
+            return true;
+        }
+        IrType::U64 => {
+            return true;
+        }
+        IrType::F32 => {
+            return true;
+        }
+        IrType::F64 => {
+            return true;
+        }
+        IrType::Bool => {
+            return true;
+        }
+        IrType::Ptr(_) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// The type of value `id`: a parameter's declared type (it has no
+/// instruction), else its recorded type; Void when neither is known.
+pub fn ssa_vty(f: & IrFunction, id: i64) -> IrType {
+    var pi: i64 = 0;
+    while pi < f.params.len() {
+        if f.params.get(pi).id == id {
+            return f.params.get(pi).ty;
+        }
+        pi = pi + 1;
+    }
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => {
+            return m.ty;
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return IrType::Void;
+}
+
+fn ssa_alloca_ty(f: & IrFunction, a: i64) -> IrType {
+    match peir_inst_of(f, a) {
+        Inst::Alloca(t, _) => {
+            return t;
+        }
+        _ => {
+            return IrType::Void;
+        }
+    }
+}
+
+/// Does a store of `sv` (declared type `ot`) put a value of exactly the
+/// local's type `t` in it?
+fn ssa_store_ok(f: & IrFunction, ot: OptIrType, sv: i64, t: IrType) -> bool {
+    match ot {
+        OptIrType::Some(st) => {
+            if !ir_type_eq(st, t) {
+                return false;
+            }
+        }
+        OptIrType::None => {
+        }
+    }
+    return ir_type_eq(ssa_vty(f, sv), t);
+}
+
+fn ssa_is_jump(inst: Inst) -> bool {
+    match inst {
+        Inst::Jump(_) => {
+            return true;
+        }
+        Inst::Branch(_, _, _) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// Does `f` hold an instruction whose value operands the renaming cannot
+/// follow (TryUnwrap names a destination, Asm its outputs)?
+fn ssa_has_unhandled(f: & IrFunction) -> bool {
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            match peir_inst_of(f, ids.get(k)) {
+                Inst::TryUnwrap(_, _, _, _) => {
+                    return true;
+                }
+                Inst::Asm(_, _, _, _) => {
+                    return true;
+                }
+                _ => {
+                }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return false;
+}
+
+/// What `v0` names after the replacements in `repl` (id -> new id + 1).
+fn ssa_resolve(repl: & Vec<i64>, v0: i64) -> i64 {
+    var v: i64 = v0;
+    var hops: i64 = 0;
+    while v >= 0 && v < repl.len() && repl.get(v) != 0 && hops < 1000000 {
+        v = repl.get(v) - 1;
+        hops = hops + 1;
+    }
+    return v;
+}
+
+fn ssa_top(stacks: & Vec<Vec<i64>>, c: i64) -> i64 {
+    var s: Vec<i64> = stacks.get(c);
+    if s.len() == 0 {
+        return - 1;
+    }
+    return s.get(s.len() - 1);
+}
+
+/// A new instruction in `f` that is in no block yet.
+fn ssa_detached(f: & mut IrFunction, inst: Inst) -> i64 {
+    var saved: i64 = f.current_block_idx;
+    if saved < 0 || saved >= f.blocks.len() {
+        f.current_block_idx = 0;
+    }
+    var id: i64 = IrFunction_emit(f, inst);
+    var last: i64 = f.current_block_idx;
+    var blk: BasicBlock = f.blocks.get(last);
+    blk.instructions.pop();
+    f.blocks.set(last, blk);
+    f.current_block_idx = saved;
+    return id;
+}
+
+fn ssa_is_const(f: & IrFunction, nv: i64, v: i64) -> bool {
+    if v < 0 || v >= nv {
+        return false;
+    }
+    match peir_inst_of(f, v) {
+        Inst::ConstInt(_, _) => {
+            return true;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+fn ssa_const_val(f: & IrFunction, v: i64) -> i64 {
+    match peir_inst_of(f, v) {
+        Inst::ConstInt(c, _) => {
+            return c;
+        }
+        _ => {
+            return 0;
+        }
+    }
+}
+
+fn ssa_m(map: & Vec<i64>, id: i64) -> i64 {
+    if id >= 0 && id < map.len() && map.get(id) != 0 {
+        return map.get(id) - 1;
+    }
+    return id;
+}
+
+fn ssa_m_vec(map: & Vec<i64>, v: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        out.push(ssa_m(map, v.get(i)));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// `inst` with its value operands renamed through `map` (id -> new id + 1).
+/// TryUnwrap and Asm never reach here (ssa_has_unhandled).
+pub fn ssa_remap(inst: Inst, map: & Vec<i64>) -> Inst {
+    match inst {
+        Inst::BinOp(op, a, b, t) => {
+            return Inst::BinOp(op, ssa_m(map, a), ssa_m(map, b), t);
+        }
+        Inst::UnaryOp(op, a, t) => {
+            return Inst::UnaryOp(op, ssa_m(map, a), t);
+        }
+        Inst::Load(p, t) => {
+            return Inst::Load(ssa_m(map, p), t);
+        }
+        Inst::Store(p, v, t) => {
+            return Inst::Store(ssa_m(map, p), ssa_m(map, v), t);
+        }
+        Inst::StructCopy(d, s0, t) => {
+            return Inst::StructCopy(ssa_m(map, d), ssa_m(map, s0), t);
+        }
+        Inst::GetFieldPtr(p, idx, t) => {
+            return Inst::GetFieldPtr(ssa_m(map, p), idx, t);
+        }
+        Inst::GetElemPtr(p, i, t) => {
+            return Inst::GetElemPtr(ssa_m(map, p), ssa_m(map, i), t);
+        }
+        Inst::Branch(c, t, e) => {
+            return Inst::Branch(ssa_m(map, c), t, e);
+        }
+        Inst::Return(rv) => {
+            match rv {
+                OptValueId::Some(v) => {
+                    return Inst::Return(OptValueId::Some(ssa_m(map, v)));
+                }
+                OptValueId::None => {
+                }
+            }
+        }
+        Inst::Call(nm, args, t, e) => {
+            return Inst::Call(nm, ssa_m_vec(map, args), t, e);
+        }
+        Inst::CallPtr(fp, args, t, e, z) => {
+            return Inst::CallPtr(ssa_m(map, fp), ssa_m_vec(map, args), t, e, z);
+        }
+        Inst::DynCall(a1, a2, args, t, e) => {
+            return Inst::DynCall(a1, a2, ssa_m_vec(map, args), t, e);
+        }
+        Inst::MakeDyn(v, a1, a2) => {
+            return Inst::MakeDyn(ssa_m(map, v), a1, a2);
+        }
+        Inst::BitCast(v, a, b) => {
+            return Inst::BitCast(ssa_m(map, v), a, b);
+        }
+        Inst::IntExtend(v, a, b) => {
+            return Inst::IntExtend(ssa_m(map, v), a, b);
+        }
+        Inst::IntTrunc(v, a, b) => {
+            return Inst::IntTrunc(ssa_m(map, v), a, b);
+        }
+        Inst::IntToFloat(v, a, b) => {
+            return Inst::IntToFloat(ssa_m(map, v), a, b);
+        }
+        Inst::FloatToInt(v, a, b) => {
+            return Inst::FloatToInt(ssa_m(map, v), a, b);
+        }
+        Inst::Print(v, t) => {
+            return Inst::Print(ssa_m(map, v), t);
+        }
+        Inst::PersistLoad(nm, d, t) => {
+            return Inst::PersistLoad(nm, ssa_m(map, d), t);
+        }
+        Inst::PersistSave(nm, v) => {
+            return Inst::PersistSave(nm, ssa_m(map, v));
+        }
+        Inst::Backward(l) => {
+            return Inst::Backward(ssa_m(map, l));
+        }
+        _ => {
+        }
+    }
+    return inst;
+}
+
+/// Rename the operands of every instruction of `f` through `map`.
+fn ssa_apply_map(f: & mut IrFunction, map: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        var entry: ValueIdInst = f.insts.get(i);
+        entry.inst = ssa_remap(entry.inst, map);
+        f.insts.set(i, entry);
+        i = i + 1;
+    }
+}
+
+// --- The state of one function's SSA form -------------------------------------
+
+/// Candidates, phis and the renaming of one function. Phi k is the virtual
+/// value `nv + k` until it is converted out of SSA.
+pub struct SsaState {
+    pub nv: i64,
+    // candidate allocas, and per value its candidate index (-1: none)
+    pub cands: Vec<i64>,
+    pub cidx: Vec<i64>,
+    // per block index: dominance frontier, children in the dominator tree
+    pub df: Vec<Vec<i64>>,
+    pub kids: Vec<Vec<i64>>,
+    // per phi: its block index, its candidate, its inputs in the order of
+    // the block's predecessors (cfg.preds): a value, -1 no store reaches,
+    // -4 the predecessor is unreachable
+    pub ph_block: Vec<i64>,
+    pub ph_cand: Vec<i64>,
+    pub ph_in: Vec<Vec<i64>>,
+    // per block index: its phis
+    pub ph_at: Vec<Vec<i64>>,
+    // per phi: 1 replaced by its one input (trivial), 1 read (live)
+    pub ph_gone: Vec<i64>,
+    pub ph_live: Vec<i64>,
+    // per value (virtual phis included): replacement + 1 (0: none)
+    pub repl: Vec<i64>,
+    // per value: 1 a load or store of a candidate (removed)
+    pub kill: Vec<i64>,
+    // per candidate: 1 when it must stay in memory
+    pub bad: Vec<i64>,
+}
+
+/// The scalar allocas of `f` that can become values (step 1).
+fn ssa_candidates(f: & IrFunction, cfg: & IroCfg, blk_of: & Vec<i64>, pos_of: & Vec<i64>) -> Vec<i64> {
+    var nv: i64 = blk_of.len();
+    var ok: Vec<i64> = peir_zeros(nv);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        if cfg.rpo_num.get(b) >= 0 {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                var id: i64 = ids.get(k);
+                match peir_inst_of(f, id) {
+                    Inst::Alloca(at0, _) => {
+                        if id >= 0 && id < nv && ssa_scalar(at0) {
+                            ok.set(id, 1);
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    // the backend reads these by itself
+    var d: i64 = 0;
+    while d < f.drop_locals.len() {
+        var lid: i64 = f.drop_locals.get(d).id;
+        if lid >= 0 && lid < nv {
+            ok.set(lid, 0);
+        }
+        d = d + 1;
+    }
+    d = 0;
+    while d < f.zeroize_locals.len() {
+        var zid: i64 = f.zeroize_locals.get(d).id;
+        if zid >= 0 && zid < nv {
+            ok.set(zid, 0);
+        }
+        d = d + 1;
+    }
+    d = 0;
+    while d < f.persist_vars.len() {
+        var pid: i64 = f.persist_vars.get(d).id;
+        if pid >= 0 && pid < nv {
+            ok.set(pid, 0);
+        }
+        d = d + 1;
+    }
+    // every use is a load or a store of the local's own type, in a block the
+    // alloca dominates (after it in its own block); uses in unreachable
+    // blocks never run and are left as they are
+    b = 0;
+    while b < f.blocks.len() {
+        if cfg.rpo_num.get(b) >= 0 {
+            var ids2: Vec<i64> = f.blocks.get(b).instructions;
+            var k2: i64 = 0;
+            while k2 < ids2.len() {
+                var uid: i64 = ids2.get(k2);
+                var inst: Inst = peir_inst_of(f, uid);
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(inst, & mut ops);
+                var o: i64 = 0;
+                while o < ops.len() {
+                    var v: i64 = ops.get(o);
+                    if v >= 0 && v < nv && ok.get(v) == 1 {
+                        var good: bool = false;
+                        var t: IrType = ssa_alloca_ty(f, v);
+                        match inst {
+                            Inst::Load(p, lt) => {
+                                good = p == v && ir_type_eq(lt, t);
+                            }
+                            Inst::Store(p, sv, ot) => {
+                                good = p == v && sv != v && ssa_store_ok(f, ot, sv, t);
+                            }
+                            _ => {
+                            }
+                        }
+                        if good {
+                            var ab: i64 = blk_of.get(v);
+                            if ab == b {
+                                good = pos_of.get(v) < k2;
+                            } else {
+                                good = iro_dominates(cfg, ab, b);
+                            }
+                        }
+                        if !good {
+                            ok.set(v, 0);
+                        }
+                    }
+                    o = o + 1;
+                }
+                k2 = k2 + 1;
+            }
+        }
+        b = b + 1;
+    }
+    return ok;
+}
+
+/// Dominance frontiers (Cooper, Harvey and Kennedy) of the reachable blocks.
+fn ssa_frontiers(cfg: & IroCfg) -> Vec<Vec<i64>> {
+    var n: i64 = cfg.n;
+    var df: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < n {
+        df.push(Vec::new());
+        b = b + 1;
+    }
+    var mark: Vec<i64> = ssa_fill(n, - 1);
+    b = 0;
+    while b < n {
+        if cfg.rpo_num.get(b) >= 0 {
+            var ps: Vec<i64> = cfg.preds.get(b);
+            var nreach: i64 = 0;
+            var pi: i64 = 0;
+            while pi < ps.len() {
+                if cfg.rpo_num.get(ps.get(pi)) >= 0 {
+                    nreach = nreach + 1;
+                }
+                pi = pi + 1;
+            }
+            if nreach >= 2 {
+                var stop: i64 = cfg.idom.get(b);
+                pi = 0;
+                while pi < ps.len() {
+                    var runner: i64 = ps.get(pi);
+                    var hops: i64 = 0;
+                    if cfg.rpo_num.get(runner) >= 0 {
+                        while runner >= 0 && runner != stop && hops <= n {
+                            if mark.get(runner) != b {
+                                mark.set(runner, b);
+                                var l: Vec<i64> = df.get(runner);
+                                l.push(b);
+                                df.set(runner, l);
+                            }
+                            var up: i64 = cfg.idom.get(runner);
+                            if up == runner {
+                                runner = - 1;
+                            } else {
+                                runner = up;
+                            }
+                            hops = hops + 1;
+                        }
+                    }
+                    pi = pi + 1;
+                }
+            }
+        }
+        b = b + 1;
+    }
+    return df;
+}
+
+/// The dominator tree as children lists.
+fn ssa_dom_kids(cfg: & IroCfg) -> Vec<Vec<i64>> {
+    var kids: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < cfg.n {
+        kids.push(Vec::new());
+        b = b + 1;
+    }
+    b = 0;
+    while b < cfg.n {
+        var p: i64 = cfg.idom.get(b);
+        if p >= 0 && p != b && cfg.rpo_num.get(b) >= 0 {
+            var l: Vec<i64> = kids.get(p);
+            l.push(b);
+            kids.set(p, l);
+        }
+        b = b + 1;
+    }
+    return kids;
+}
+
+/// Step 2: phis at the iterated dominance frontiers of each candidate's
+/// stores. False when there would be too many.
+fn ssa_place_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) -> bool {
+    var n: i64 = cfg.n;
+    var nc: i64 = st.cands.len();
+    // the blocks that store each candidate
+    var defs: Vec<Vec<i64>> = Vec::new();
+    var lastb: Vec<i64> = ssa_fill(nc, - 1);
+    var c: i64 = 0;
+    while c < nc {
+        defs.push(Vec::new());
+        c = c + 1;
+    }
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        if cfg.rpo_num.get(b) >= 0 {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                match peir_inst_of(f, ids.get(k)) {
+                    Inst::Store(p, _, _) => {
+                        if p >= 0 && p < st.nv && st.cidx.get(p) >= 0 {
+                            var ci: i64 = st.cidx.get(p);
+                            if lastb.get(ci) != b {
+                                lastb.set(ci, b);
+                                var dl: Vec<i64> = defs.get(ci);
+                                dl.push(b);
+                                defs.set(ci, dl);
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    var has_phi: Vec<i64> = ssa_fill(n, - 1);
+    var queued: Vec<i64> = ssa_fill(n, - 1);
+    c = 0;
+    while c < nc {
+        var work: Vec<i64> = Vec::new();
+        var d0: Vec<i64> = defs.get(c);
+        var di: i64 = 0;
+        while di < d0.len() {
+            work.push(d0.get(di));
+            queued.set(d0.get(di), c);
+            di = di + 1;
+        }
+        while work.len() > 0 {
+            var x: i64 = work.pop();
+            var fx: Vec<i64> = st.df.get(x);
+            var fi: i64 = 0;
+            while fi < fx.len() {
+                var y: i64 = fx.get(fi);
+                if has_phi.get(y) != c {
+                    has_phi.set(y, c);
+                    if st.ph_block.len() >= SSA_MAX_PHIS {
+                        return false;
+                    }
+                    var k2: i64 = st.ph_block.len();
+                    st.ph_block.push(y);
+                    st.ph_cand.push(c);
+                    // inputs: -1 until the renaming fills them, -4 for an
+                    // unreachable predecessor
+                    var ins: Vec<i64> = Vec::new();
+                    var ps: Vec<i64> = cfg.preds.get(y);
+                    var pj: i64 = 0;
+                    while pj < ps.len() {
+                        if cfg.rpo_num.get(ps.get(pj)) >= 0 {
+                            ins.push(- 1);
+                        } else {
+                            ins.push(- 4);
+                        }
+                        pj = pj + 1;
+                    }
+                    st.ph_in.push(ins);
+                    st.ph_gone.push(0);
+                    st.ph_live.push(0);
+                    // the phi's virtual value nv + k2 can be replaced too
+                    st.repl.push(0);
+                    var at: Vec<i64> = st.ph_at.get(y);
+                    at.push(k2);
+                    st.ph_at.set(y, at);
+                    if queued.get(y) != c {
+                        queued.set(y, c);
+                        work.push(y);
+                    }
+                }
+                fi = fi + 1;
+            }
+        }
+        c = c + 1;
+    }
+    return true;
+}
+
+/// Push value `v` on candidate `c`'s stack and log the push.
+fn ssa_push(stacks: & mut Vec<Vec<i64>>, plog: & mut Vec<i64>, c: i64, v: i64) {
+    var s: Vec<i64> = stacks.get(c);
+    s.push(v);
+    stacks.set(c, s);
+    plog.push(c);
+}
+
+/// Step 3 for one block: its phis and instructions, then the phi inputs of
+/// its successors.
+fn ssa_rename_block(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState, stacks: & mut Vec<Vec<i64>>, plog: & mut Vec<i64>, b: i64) {
+    var lb: Vec<i64> = st.ph_at.get(b);
+    var li: i64 = 0;
+    while li < lb.len() {
+        var k: i64 = lb.get(li);
+        ssa_push(stacks, plog, st.ph_cand.get(k), st.nv + k);
+        li = li + 1;
+    }
+    var ids: Vec<i64> = f.blocks.get(b).instructions;
+    var j: i64 = 0;
+    while j < ids.len() {
+        var id: i64 = ids.get(j);
+        match peir_inst_of(f, id) {
+            Inst::Load(p, _) => {
+                if p >= 0 && p < st.nv && st.cidx.get(p) >= 0 && id >= 0 && id < st.nv {
+                    var c: i64 = st.cidx.get(p);
+                    var top: i64 = ssa_top(stacks, c);
+                    if top < 0 {
+                        st.bad.set(c, 1);
+                    } else {
+                        st.repl.set(id, top + 1);
+                    }
+                    st.kill.set(id, 1);
+                }
+            }
+            Inst::Store(p, sv, _) => {
+                if p >= 0 && p < st.nv && st.cidx.get(p) >= 0 && id >= 0 && id < st.nv {
+                    var c2: i64 = st.cidx.get(p);
+                    ssa_push(stacks, plog, c2, ssa_resolve(& st.repl, sv));
+                    st.kill.set(id, 1);
+                }
+            }
+            _ => {
+            }
+        }
+        j = j + 1;
+    }
+    var ss: Vec<i64> = cfg.succs.get(b);
+    var si: i64 = 0;
+    while si < ss.len() {
+        var s: i64 = ss.get(si);
+        var sp: Vec<i64> = cfg.preds.get(s);
+        var pj: i64 = 0;
+        while pj < sp.len() {
+            if sp.get(pj) == b {
+                var sl: Vec<i64> = st.ph_at.get(s);
+                var sk: i64 = 0;
+                while sk < sl.len() {
+                    var k3: i64 = sl.get(sk);
+                    var ins: Vec<i64> = st.ph_in.get(k3);
+                    ins.set(pj, ssa_top(stacks, st.ph_cand.get(k3)));
+                    st.ph_in.set(k3, ins);
+                    sk = sk + 1;
+                }
+            }
+            pj = pj + 1;
+        }
+        si = si + 1;
+    }
+}
+
+/// Step 3: rename over the dominator tree (an explicit stack: deep trees do
+/// not recurse).
+fn ssa_rename(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
+    var stacks: Vec<Vec<i64>> = Vec::new();
+    var c: i64 = 0;
+    while c < st.cands.len() {
+        var s0: Vec<i64> = Vec::new();
+        s0.push(- 1);
+        stacks.push(s0);
+        c = c + 1;
+    }
+    var plog: Vec<i64> = Vec::new();
+    var fb: Vec<i64> = Vec::new();
+    var fk: Vec<i64> = Vec::new();
+    var fl: Vec<i64> = Vec::new();
+    var pending: i64 = 0;
+    var entering: bool = true;
+    var running: bool = true;
+    while running {
+        if entering {
+            fb.push(pending);
+            fk.push(0);
+            fl.push(plog.len());
+            ssa_rename_block(f, cfg, st, & mut stacks, & mut plog, pending);
+            entering = false;
+        }
+        if fb.len() == 0 {
+            running = false;
+        } else {
+            var top: i64 = fb.len() - 1;
+            var cb: i64 = fb.get(top);
+            var ck: i64 = fk.get(top);
+            var kl: Vec<i64> = st.kids.get(cb);
+            if ck < kl.len() {
+                fk.set(top, ck + 1);
+                pending = kl.get(ck);
+                entering = true;
+            } else {
+                var keep: i64 = fl.get(top);
+                while plog.len() > keep {
+                    var lc: i64 = plog.pop();
+                    var ls: Vec<i64> = stacks.get(lc);
+                    ls.pop();
+                    stacks.set(lc, ls);
+                }
+                fb.pop();
+                fk.pop();
+                fl.pop();
+            }
+        }
+    }
+}
+
+/// Step 4a: a phi whose inputs (other than itself) are all one value is that
+/// value. An input no store reaches keeps the phi.
+fn ssa_trivial_phis(st: & mut SsaState) {
+    var np: i64 = st.ph_block.len();
+    var again: bool = true;
+    var round: i64 = 0;
+    while again && round <= np + 1 {
+        again = false;
+        var k: i64 = 0;
+        while k < np {
+            if st.ph_gone.get(k) == 0 {
+                var me: i64 = st.nv + k;
+                var only: i64 = - 2;
+                var ins: Vec<i64> = st.ph_in.get(k);
+                var j: i64 = 0;
+                while j < ins.len() {
+                    var x: i64 = ins.get(j);
+                    if x != - 4 {
+                        var r: i64 = ssa_resolve(& st.repl, x);
+                        if r != me {
+                            if only == - 2 {
+                                only = r;
+                            } else if only != r {
+                                only = - 3;
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+                if only >= 0 {
+                    st.repl.set(me, only + 1);
+                    st.ph_gone.set(k, 1);
+                    again = true;
+                }
+            }
+            k = k + 1;
+        }
+        round = round + 1;
+    }
+}
+
+/// The phi value `v` names after the replacements (-1 when it names none).
+fn ssa_phi_of(st: & SsaState, v: i64) -> i64 {
+    var r: i64 = ssa_resolve(& st.repl, v);
+    if r >= st.nv && r < st.nv + st.ph_block.len() {
+        return r - st.nv;
+    }
+    return - 1;
+}
+
+/// Step 4b (ME15): the phis the program reads, directly or through other
+/// phis; then a read phi with an input no store reaches keeps its
+/// candidate in memory.
+fn ssa_live_phis(f: & IrFunction, cfg: & IroCfg, st: & mut SsaState) {
+    var work: Vec<i64> = Vec::new();
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        if cfg.rpo_num.get(b) >= 0 {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                var id: i64 = ids.get(k);
+                if id < 0 || id >= st.nv || st.kill.get(id) == 0 {
+                    var ops: Vec<i64> = Vec::new();
+                    peir_inst_operands(peir_inst_of(f, id), & mut ops);
+                    var o: i64 = 0;
+                    while o < ops.len() {
+                        var p: i64 = ssa_phi_of(st, ops.get(o));
+                        if p >= 0 && st.ph_live.get(p) == 0 {
+                            st.ph_live.set(p, 1);
+                            work.push(p);
+                        }
+                        o = o + 1;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    while work.len() > 0 {
+        var q: i64 = work.pop();
+        var ins: Vec<i64> = st.ph_in.get(q);
+        var j: i64 = 0;
+        while j < ins.len() {
+            var x: i64 = ins.get(j);
+            if x != - 4 {
+                var p2: i64 = ssa_phi_of(st, x);
+                if p2 >= 0 && st.ph_live.get(p2) == 0 {
+                    st.ph_live.set(p2, 1);
+                    work.push(p2);
+                }
+            }
+            j = j + 1;
+        }
+    }
+    var k2: i64 = 0;
+    while k2 < st.ph_block.len() {
+        if st.ph_live.get(k2) == 1 && st.ph_gone.get(k2) == 0 {
+            var ins2: Vec<i64> = st.ph_in.get(k2);
+            var j2: i64 = 0;
+            while j2 < ins2.len() {
+                var x2: i64 = ins2.get(j2);
+                if x2 != - 4 && ssa_resolve(& st.repl, x2) < 0 {
+                    st.bad.set(st.ph_cand.get(k2), 1);
+                }
+                j2 = j2 + 1;
+            }
+        }
+        k2 = k2 + 1;
+    }
+}
+
+/// A fresh state for the candidates flagged in `ok` (per value).
+fn ssa_state(f: & IrFunction, cfg: & IroCfg, ok: & Vec<i64>, df: Vec<Vec<i64>>, kids: Vec<Vec<i64>>) -> SsaState {
+    var nv: i64 = ok.len();
+    var cands: Vec<i64> = Vec::new();
+    var cidx: Vec<i64> = ssa_fill(nv, - 1);
+    var v: i64 = 0;
+    while v < nv {
+        if ok.get(v) == 1 {
+            cidx.set(v, cands.len());
+            cands.push(v);
+        }
+        v = v + 1;
+    }
+    var at: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < cfg.n {
+        at.push(Vec::new());
+        b = b + 1;
+    }
+    var bad: Vec<i64> = peir_zeros(cands.len());
+    return SsaState {
+        nv: nv, cands: cands, cidx: cidx, df: df, kids: kids, ph_block: Vec::new(), ph_cand: Vec::new(), ph_in: Vec::new(), ph_at: at, ph_gone: Vec::new(), ph_live: Vec::new(), repl: peir_zeros(nv), kill: peir_zeros(nv), bad: bad
+    };
+}
+
+// --- ME23: exit values of counted loops ----------------------------------------
+
+// ME2: a loop's body comes from the shared loop tree (compiler/checks.fd
+// iro_loops / iro_loop_body: `h` and every reachable block that reaches one
+// of h's latches without passing through h). ssa_exit_values only takes a
+// header with exactly two predecessors, one of them dominated by h, so h
+// has one latch and that body is the one a walk back from it finds.
+
+/// One loop variable whose value after the loop is known: the constant
+/// `value` (vid -1), or (Nov 17) the value `vid` from before the loop, plus
+/// one when `plus1` (a bound that is not a constant).
+pub struct SsaExit {
+    pub phi: i64,
+    pub value: i64,
+    pub out_block: i64,
+    pub body: Vec<i64>,
+    pub vid: i64,
+    pub plus1: bool,
+}
+
+/// ME23 counts: exit values that are constants, and ones taken from a bound
+/// that is not (tests/tooling/ssaexit-check.sh reads them).
+var g_ssa_exit_const_n: i64 = 0;
+var g_ssa_exit_bound_n: i64 = 0;
+
+pub fn ssa_exit_stats_line() -> str {
+    return "iropt: ssaexit " + int_to_str(g_ssa_exit_const_n) + " constant, " + int_to_str(g_ssa_exit_bound_n) + " from a bound\n";
+}
+
+/// Is resolved value `r` (a phi when >= st.nv) an i64 defined outside the
+/// loop `body` (a parameter, or in a block the loop does not hold)?
+fn ssa_outside_i64(f: & IrFunction, st: & SsaState, blk_of: & Vec<i64>, body: & Vec<i64>, r: i64) -> bool {
+    if r < 0 {
+        return false;
+    }
+    if r >= st.nv {
+        var k: i64 = r - st.nv;
+        if k >= st.ph_block.len() {
+            return false;
+        }
+        if body.get(st.ph_block.get(k)) != 0 {
+            return false;
+        }
+        return ir_type_eq(ssa_alloca_ty(f, st.cands.get(st.ph_cand.get(k))), IrType::I64);
+    }
+    if r < blk_of.len() && blk_of.get(r) >= 0 && body.get(blk_of.get(r)) != 0 {
+        return false;
+    }
+    if r < blk_of.len() && blk_of.get(r) < 0 {
+        // no instruction in a block: only a parameter qualifies
+        var pi: i64 = 0;
+        var is_param: bool = false;
+        while pi < f.params.len() {
+            if f.params.get(pi).id == r {
+                is_param = true;
+            }
+            pi = pi + 1;
+        }
+        if !is_param {
+            return false;
+        }
+    }
+    return ir_type_eq(ssa_vty(f, r), IrType::I64);
+}
+
+/// Is resolved value `r` (a phi when >= st.nv) a signed 64-bit integer?
+fn ssa_r_i64(f: & IrFunction, st: & SsaState, r: i64) -> bool {
+    if r < 0 {
+        return false;
+    }
+    if r >= st.nv {
+        var k: i64 = r - st.nv;
+        if k >= st.ph_block.len() {
+            return false;
+        }
+        return ir_type_eq(ssa_alloca_ty(f, st.cands.get(st.ph_cand.get(k))), IrType::I64);
+    }
+    match peir_inst_of(f, r) {
+        Inst::ConstInt(_, kt) => {
+            return ir_type_eq(kt, IrType::I64);
+        }
+        _ => {
+        }
+    }
+    return ir_type_eq(ssa_vty(f, r), IrType::I64);
+}
+
+/// One side of a guard's comparison: a constant (`is_k`, `k`) or a value
+/// (`v`, resolved).
+struct SsaSide {
+    is_k: bool,
+    k: i64,
+    v: i64,
+}
+
+fn ssa_side(f: & IrFunction, st: & SsaState, v: i64) -> SsaSide {
+    var r: i64 = ssa_resolve(& st.repl, v);
+    if ssa_is_const(f, st.nv, r) {
+        return SsaSide {
+            is_k: true, k: ssa_const_val(f, r), v: r
+        };
+    }
+    return SsaSide {
+        is_k: false, k: 0, v: r
+    };
+}
+
+fn ssa_side_same(a: SsaSide, b: SsaSide) -> bool {
+    if a.is_k && b.is_k {
+        return a.k == b.k;
+    }
+    if !a.is_k && !b.is_k {
+        return a.v == b.v && a.v >= 0;
+    }
+    return false;
+}
+
+/// From the fact `x < y` (strict) or `x <= y`, does `lo <= hi` follow?
+fn ssa_fact_gives_le(x: SsaSide, y: SsaSide, strict: bool, lo: SsaSide, hi: SsaSide) -> bool {
+    if ssa_side_same(x, lo) && ssa_side_same(y, hi) {
+        return true;
+    }
+    // hi is a value bounded below by a constant: hi >= y-bound
+    if !hi.is_k && ssa_side_same(y, hi) && x.is_k && lo.is_k {
+        if strict {
+            // hi > x.k, so hi >= x.k + 1
+            if x.k == 9223372036854775807 {
+                return false;
+            }
+            return lo.k <= x.k + 1;
+        }
+        return lo.k <= x.k;
+    }
+    // lo is a value bounded above by a constant
+    if !lo.is_k && ssa_side_same(x, lo) && y.is_k && hi.is_k {
+        if strict {
+            if y.k == 0 - 9223372036854775807 - 1 {
+                return false;
+            }
+            return y.k - 1 <= hi.k;
+        }
+        return y.k <= hi.k;
+    }
+    return false;
+}
+
+/// Does the condition `c` (resolved), true when `pos` and false otherwise,
+/// prove `lo <= hi`? Signed i64 comparisons only; `&&` taken apart when
+/// true, `||` when false.
+fn ssa_cond_gives_le(f: & IrFunction, st: & SsaState, blk_of: & Vec<i64>, c: i64, pos: bool, lo: SsaSide, hi: SsaSide, depth: i64) -> bool {
+    if c < 0 || c >= st.nv || depth > 4 {
+        return false;
+    }
+    match peir_inst_of(f, c) {
+        Inst::BinOp(op, a, b, _) => {
+            if (binop_eq(op, BinOp::And) && pos) || (binop_eq(op, BinOp::Or) && !pos) {
+                return ssa_cond_gives_le(f, st, blk_of, ssa_resolve(& st.repl, a), pos, lo, hi, depth + 1) || ssa_cond_gives_le(f, st, blk_of, ssa_resolve(& st.repl, b), pos, lo, hi, depth + 1);
+            }
+            var isrel: bool = binop_eq(op, BinOp::Lt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::GtEq);
+            if !isrel {
+                return false;
+            }
+            var sa: SsaSide = ssa_side(f, st, a);
+            var sb: SsaSide = ssa_side(f, st, b);
+            // both operands signed 64-bit integers
+            if !ssa_r_i64(f, st, sa.v) || !ssa_r_i64(f, st, sb.v) {
+                return false;
+            }
+            // x < y or x <= y
+            var x: SsaSide = sa;
+            var y: SsaSide = sb;
+            var strict: bool = false;
+            if pos {
+                if binop_eq(op, BinOp::Lt) {
+                    strict = true;
+                } else if binop_eq(op, BinOp::Gt) {
+                    x = sb;
+                    y = sa;
+                    strict = true;
+                } else if binop_eq(op, BinOp::GtEq) {
+                    x = sb;
+                    y = sa;
+                }
+            } else {
+                // not (a < b): b <= a; not (a <= b): b < a; not (a > b):
+                // a <= b; not (a >= b): a < b
+                if binop_eq(op, BinOp::Lt) {
+                    x = sb;
+                    y = sa;
+                } else if binop_eq(op, BinOp::LtEq) {
+                    x = sb;
+                    y = sa;
+                    strict = true;
+                } else if binop_eq(op, BinOp::GtEq) {
+                    strict = true;
+                }
+            }
+            return ssa_fact_gives_le(x, y, strict, lo, hi);
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// ME23 (Nov 17): does a guard on the loop's way in prove `lo <= hi`?
+/// Up from `pre` (the header's predecessor outside the loop) through
+/// blocks of one predecessor, each Branch whose edge leads down to the
+/// loop adds its condition (true on the true edge, false on the false
+/// one). SSA values cannot change between the guard and the loop.
+fn ssa_guard_le(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec<i64>, body: & Vec<i64>, pre: i64, h: i64, lo: SsaSide, hi: SsaSide) -> bool {
+    var cur: i64 = pre;
+    var into: i64 = h;
+    var steps: i64 = 0;
+    while steps < 6 {
+        if cur < 0 || cur >= cfg.n || body.get(cur) != 0 {
+            return false;
+        }
+        var ids: Vec<i64> = f.blocks.get(cur).instructions;
+        if ids.len() > 0 {
+            match peir_inst_of(f, ids.get(ids.len() - 1)) {
+                Inst::Branch(c, t, e) => {
+                    var ti: i64 = - 1;
+                    var ei: i64 = - 1;
+                    if t >= 0 && t < cfg.index.len() {
+                        ti = cfg.index.get(t);
+                    }
+                    if e >= 0 && e < cfg.index.len() {
+                        ei = cfg.index.get(e);
+                    }
+                    var rc: i64 = ssa_resolve(& st.repl, c);
+                    if ti == into && ei != into {
+                        if ssa_cond_gives_le(f, st, blk_of, rc, true, lo, hi, 0) {
+                            return true;
+                        }
+                    } else if ei == into && ti != into {
+                        if ssa_cond_gives_le(f, st, blk_of, rc, false, lo, hi, 0) {
+                            return true;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        if cur == 0 || cfg.preds.get(cur).len() != 1 {
+            return false;
+        }
+        into = cur;
+        cur = cfg.preds.get(cur).get(0);
+        steps = steps + 1;
+    }
+    return false;
+}
+
+/// Is `s` (a value after the replacements) `phi + 1`?
+fn ssa_is_step(f: & IrFunction, st: & SsaState, s: i64, me: i64) -> bool {
+    if s < 0 || s >= st.nv {
+        return false;
+    }
+    match peir_inst_of(f, s) {
+        Inst::BinOp(op, a, c, _) => {
+            if !binop_eq(op, BinOp::Add) {
+                return false;
+            }
+            var ra: i64 = ssa_resolve(& st.repl, a);
+            var rc: i64 = ssa_resolve(& st.repl, c);
+            if ra == me && ssa_is_const(f, st.nv, rc) && ssa_const_val(f, rc) == 1 {
+                return true;
+            }
+            if rc == me && ssa_is_const(f, st.nv, ra) && ssa_const_val(f, ra) == 1 {
+                return true;
+            }
+            return false;
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// ME23: a loop `i = c0; while i < N { ...; i = i + 1 }` (also `<=` and
+/// `!=`) with constants c0 and N, whose only exit is the header's branch to
+/// a block only the header enters: after the loop, i is a constant. The
+/// step cannot overflow (i < N <= the type's maximum before it).
+/// Nov 17: c0 and N may be values (N from before the loop): with `!=` i is
+/// N after the loop; with `<` / `<=` it is N / N + 1 when a guard on the
+/// loop's way in (ssa_guard_le) proves c0 <= N.
+fn ssa_exit_values(f: & IrFunction, cfg: & IroCfg, st: & SsaState, blk_of: & Vec<i64>) -> Vec<SsaExit> {
+    var out: Vec<SsaExit> = Vec::new();
+    if st.ph_block.len() == 0 {
+        return out;
+    }
+    // the shared loop tree (ME2), cached with this CFG's `gen`
+    var lt: IroLoops = iro_loops(cfg);
+    var k: i64 = 0;
+    while k < st.ph_block.len() {
+        var c: i64 = st.ph_cand.get(k);
+        var ok: bool = st.ph_live.get(k) == 1 && st.ph_gone.get(k) == 0 && st.bad.get(c) == 0;
+        if ok {
+            ok = ir_type_eq(ssa_alloca_ty(f, st.cands.get(c)), IrType::I64);
+        }
+        var h: i64 = st.ph_block.get(k);
+        var ps: Vec<i64> = cfg.preds.get(h);
+        if ok {
+            ok = ps.len() == 2;
+        }
+        var pre_j: i64 = - 1;
+        var lat_j: i64 = - 1;
+        if ok {
+            var j: i64 = 0;
+            while j < 2 {
+                if iro_dominates(cfg, h, ps.get(j)) {
+                    lat_j = j;
+                } else {
+                    pre_j = j;
+                }
+                j = j + 1;
+            }
+            ok = pre_j >= 0 && lat_j >= 0;
+        }
+        var me: i64 = st.nv + k;
+        var c0: i64 = 0;
+        // Nov 17: the value i enters with may be any value (c0s), not only
+        // a constant; then a guard has to say how it compares with the bound
+        var c0s: SsaSide = SsaSide {
+            is_k: false, k: 0, v: - 1
+        };
+        if ok {
+            var ins: Vec<i64> = st.ph_in.get(k);
+            var r0: i64 = ssa_resolve(& st.repl, ins.get(pre_j));
+            ok = r0 >= 0 && ssa_is_step(f, st, ssa_resolve(& st.repl, ins.get(lat_j)), me);
+            if ok {
+                c0s = ssa_side(f, st, r0);
+                c0 = c0s.k;
+                ok = ssa_r_i64(f, st, r0);
+            }
+        }
+        // the header's branch: i < N (or <=, !=) into the loop, out otherwise
+        var lim: i64 = 0;
+        var lims: SsaSide = SsaSide {
+            is_k: false, k: 0, v: - 1
+        };
+        var kind: i64 = 0;
+        var ti: i64 = - 1;
+        var ei: i64 = - 1;
+        if ok {
+            ok = false;
+            var hids: Vec<i64> = f.blocks.get(h).instructions;
+            if hids.len() > 0 {
+                match peir_inst_of(f, hids.get(hids.len() - 1)) {
+                    Inst::Branch(cnd, t, e) => {
+                        if t >= 0 && t < cfg.index.len() && e >= 0 && e < cfg.index.len() {
+                            ti = cfg.index.get(t);
+                            ei = cfg.index.get(e);
+                        }
+                        var rc: i64 = ssa_resolve(& st.repl, cnd);
+                        if rc >= 0 && rc < st.nv && ti >= 0 && ei >= 0 {
+                            match peir_inst_of(f, rc) {
+                                Inst::BinOp(op, x, y, _) => {
+                                    var ry: i64 = ssa_resolve(& st.repl, y);
+                                    // Nov 17: the bound may be a value from
+                                    // before the loop (checked below, once
+                                    // the body is known)
+                                    if ssa_resolve(& st.repl, x) == me && ry >= 0 && ssa_r_i64(f, st, ry) {
+                                        lims = ssa_side(f, st, ry);
+                                        lim = lims.k;
+                                        if binop_eq(op, BinOp::Lt) {
+                                            kind = 1;
+                                        } else if binop_eq(op, BinOp::LtEq) {
+                                            kind = 2;
+                                        } else if binop_eq(op, BinOp::Neq) {
+                                            kind = 3;
+                                        }
+                                        ok = kind > 0;
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        var body: Vec<i64> = Vec::new();
+        if ok {
+            body = iro_loop_body(& lt, h);
+            ok = body.get(ti) == 1 && body.get(ei) == 0 && cfg.preds.get(ei).len() == 1;
+        }
+        if ok {
+            // no other way out of the loop
+            var bb: i64 = 0;
+            while bb < cfg.n && ok {
+                if body.get(bb) == 1 {
+                    var ss: Vec<i64> = cfg.succs.get(bb);
+                    var si: i64 = 0;
+                    while si < ss.len() {
+                        var sx: i64 = ss.get(si);
+                        if body.get(sx) == 0 && !(bb == h && sx == ei) {
+                            ok = false;
+                        }
+                        si = si + 1;
+                    }
+                }
+                bb = bb + 1;
+            }
+        }
+        var value: i64 = 0;
+        var vid: i64 = - 1;
+        var plus1: bool = false;
+        var both_k: bool = c0s.is_k && lims.is_k;
+        if ok && !both_k {
+            // ME23 (Nov 17): a bound or a start that is not a constant. A
+            // value bound must come from before the loop. `i != N` exits
+            // only with i == N; `i < N` / `i <= N` exit with N / N + 1 when
+            // i started at most N, which a guard on the way in must say
+            // (else the start itself would be the answer: no select here).
+            if !lims.is_k && !ssa_outside_i64(f, st, blk_of, & body, lims.v) {
+                ok = false;
+            }
+            if ok && kind == 3 {
+                if lims.is_k {
+                    value = lim;
+                } else {
+                    vid = lims.v;
+                }
+            } else if ok {
+                if lims.is_k && kind == 2 && lim == 9223372036854775807 {
+                    ok = false;
+                } else if ssa_guard_le(f, cfg, st, blk_of, & body, ps.get(pre_j), h, c0s, lims) {
+                    if lims.is_k {
+                        value = lim;
+                        if kind == 2 {
+                            value = lim + 1;
+                        }
+                    } else {
+                        vid = lims.v;
+                        plus1 = kind == 2;
+                    }
+                } else {
+                    ok = false;
+                }
+            }
+        } else if ok {
+            if kind == 1 {
+                if c0 < lim {
+                    value = lim;
+                } else {
+                    value = c0;
+                }
+            } else if kind == 2 {
+                // i <= N with N the maximum never ends without overflow
+                if lim == 9223372036854775807 {
+                    ok = false;
+                } else if c0 <= lim {
+                    value = lim + 1;
+                } else {
+                    value = c0;
+                }
+            } else {
+                // i != N from above N steps until it overflows
+                if c0 <= lim {
+                    value = lim;
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            if vid >= 0 {
+                g_ssa_exit_bound_n = g_ssa_exit_bound_n + 1;
+            } else {
+                g_ssa_exit_const_n = g_ssa_exit_const_n + 1;
+            }
+            out.push(SsaExit {
+                phi: k, value: value, out_block: ei, body: body, vid: vid, plus1: plus1
+            });
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// --- Step 5: out of SSA --------------------------------------------------------
+
+/// What value `v` names once the phis are slots: the load of a phi's slot,
+/// or the value itself (-1: none).
+fn ssa_final(st: & SsaState, vreal: & Vec<i64>, v: i64) -> i64 {
+    var r: i64 = ssa_resolve(& st.repl, v);
+    if r >= st.nv && r < st.nv + st.ph_block.len() {
+        return vreal.get(r - st.nv);
+    }
+    return r;
+}
+
+fn ssa_materialize(f: & mut IrFunction, cfg: & IroCfg, st: & SsaState, exits: & Vec<SsaExit>) {
+    var np: i64 = st.ph_block.len();
+    var nb: i64 = f.blocks.len();
+    var heads: Vec<Vec<i64>> = Vec::new();
+    var tails: Vec<Vec<i64>> = Vec::new();
+    var b: i64 = 0;
+    while b < nb {
+        heads.push(Vec::new());
+        tails.push(Vec::new());
+        b = b + 1;
+    }
+    var entry_new: Vec<i64> = Vec::new();
+    // a slot and a load for each phi the program reads
+    var vreal: Vec<i64> = ssa_fill(np, - 1);
+    var slot: Vec<i64> = ssa_fill(np, - 1);
+    var k: i64 = 0;
+    while k < np {
+        if st.ph_live.get(k) == 1 && st.ph_gone.get(k) == 0 {
+            var a: i64 = st.cands.get(st.ph_cand.get(k));
+            var ty: IrType = ssa_alloca_ty(f, a);
+            var sl: i64 = 0;
+            var ainst: Inst = peir_inst_of(f, a);
+            match ainst {
+                Inst::Alloca(at, reg) => {
+                    sl = ssa_detached(f, Inst::Alloca(at, reg));
+                }
+                _ => {
+                    sl = ssa_detached(f, Inst::Alloca(ty, Region::Stack));
+                }
+            }
+            var ld: i64 = ssa_detached(f, Inst::Load(sl, ty));
+            slot.set(k, sl);
+            vreal.set(k, ld);
+            entry_new.push(sl);
+            var hb: i64 = st.ph_block.get(k);
+            var hl: Vec<i64> = heads.get(hb);
+            hl.push(ld);
+            heads.set(hb, hl);
+        }
+        k = k + 1;
+    }
+    // each predecessor stores its input before its terminator
+    k = 0;
+    while k < np {
+        if st.ph_live.get(k) == 1 && st.ph_gone.get(k) == 0 {
+            var ty2: IrType = ssa_alloca_ty(f, st.cands.get(st.ph_cand.get(k)));
+            var ins: Vec<i64> = st.ph_in.get(k);
+            var ps: Vec<i64> = cfg.preds.get(st.ph_block.get(k));
+            var j: i64 = 0;
+            while j < ins.len() && j < ps.len() {
+                if ins.get(j) != - 4 {
+                    var v: i64 = ssa_final(st, & vreal, ins.get(j));
+                    if v >= 0 {
+                        var sid: i64 = ssa_detached(f, Inst::Store(slot.get(k), v, OptIrType::Some(ty2)));
+                        var pb: i64 = ps.get(j);
+                        var tl: Vec<i64> = tails.get(pb);
+                        tl.push(sid);
+                        tails.set(pb, tl);
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    // ME23: the exit values, at the top of each exit block
+    var ex_const: Vec<i64> = Vec::new();
+    var e: i64 = 0;
+    while e < exits.len() {
+        var ex: SsaExit = exits.get(e);
+        if ex.vid >= 0 {
+            // Nov 17: the bound itself (a value from before the loop, so it
+            // reaches the exit block), plus one for `<=`
+            var nreal: i64 = ssa_final(st, & vreal, ex.vid);
+            if ex.plus1 && nreal >= 0 {
+                var one: i64 = ssa_detached(f, Inst::ConstInt(1, IrType::I64));
+                var add: i64 = ssa_detached(f, Inst::BinOp(BinOp::Add, nreal, one, IrType::I64));
+                ex_const.push(add);
+                var el2: Vec<i64> = heads.get(ex.out_block);
+                el2.insert(0, add);
+                el2.insert(0, one);
+                heads.set(ex.out_block, el2);
+            } else {
+                ex_const.push(nreal);
+            }
+        } else {
+            var cid: i64 = ssa_detached(f, Inst::ConstInt(ex.value, IrType::I64));
+            ex_const.push(cid);
+            var el: Vec<i64> = heads.get(ex.out_block);
+            el.insert(0, cid);
+            heads.set(ex.out_block, el);
+        }
+        e = e + 1;
+    }
+    // removed loads read what reaches them
+    var map: Vec<i64> = peir_zeros(f.next_value + 1);
+    var v2: i64 = 0;
+    while v2 < st.nv {
+        if st.kill.get(v2) == 1 {
+            match peir_inst_of(f, v2) {
+                Inst::Load(_, _) => {
+                    var r: i64 = ssa_final(st, & vreal, v2);
+                    if r >= 0 && r != v2 {
+                        map.set(v2, r + 1);
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        v2 = v2 + 1;
+    }
+    // the blocks: new slots first in the entry block, phi loads at the top,
+    // the candidates' loads and stores gone, stores into slots before the
+    // terminator
+    b = 0;
+    while b < nb {
+        var blk: BasicBlock = f.blocks.get(b);
+        var ids: Vec<i64> = blk.instructions;
+        var nl: Vec<i64> = Vec::new();
+        if b == 0 {
+            var ei2: i64 = 0;
+            while ei2 < entry_new.len() {
+                nl.push(entry_new.get(ei2));
+                ei2 = ei2 + 1;
+            }
+        }
+        var hl2: Vec<i64> = heads.get(b);
+        var hi: i64 = 0;
+        while hi < hl2.len() {
+            nl.push(hl2.get(hi));
+            hi = hi + 1;
+        }
+        var term: i64 = - 1;
+        if ids.len() > 0 && ssa_is_jump(peir_inst_of(f, ids.get(ids.len() - 1))) {
+            term = ids.get(ids.len() - 1);
+        }
+        var j2: i64 = 0;
+        while j2 < ids.len() {
+            var id: i64 = ids.get(j2);
+            var drop: bool = id == term;
+            if id >= 0 && id < st.nv && st.kill.get(id) == 1 {
+                drop = true;
+            }
+            if !drop {
+                nl.push(id);
+            }
+            j2 = j2 + 1;
+        }
+        var tl2: Vec<i64> = tails.get(b);
+        var ti: i64 = 0;
+        while ti < tl2.len() {
+            nl.push(tl2.get(ti));
+            ti = ti + 1;
+        }
+        if term >= 0 {
+            nl.push(term);
+        }
+        blk.instructions = nl;
+        f.blocks.set(b, blk);
+        b = b + 1;
+    }
+    ssa_apply_map(f, & map);
+    // ME23: outside its loop, the variable is its exit value
+    e = 0;
+    while e < exits.len() {
+        var ex2: SsaExit = exits.get(e);
+        var pv: i64 = vreal.get(ex2.phi);
+        if pv >= 0 {
+            var m2: Vec<i64> = peir_zeros(f.next_value + 1);
+            m2.set(pv, ex_const.get(e) + 1);
+            var bb: i64 = 0;
+            while bb < nb {
+                if ex2.body.get(bb) == 0 {
+                    var bids: Vec<i64> = f.blocks.get(bb).instructions;
+                    var q: i64 = 0;
+                    while q < bids.len() {
+                        var qid: i64 = bids.get(q);
+                        var qi: Inst = ssa_remap(peir_inst_of(f, qid), & m2);
+                        IrFunction_set_inst(f, qid, qi);
+                        q = q + 1;
+                    }
+                }
+                bb = bb + 1;
+            }
+        }
+        e = e + 1;
+    }
+}
+
+// --- Cleanup: values nothing reads ---------------------------------------------
+
+fn ssa_quiet_binop(f: & IrFunction, op: BinOp, l: i64) -> bool {
+    var cmp: bool = binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq) || binop_eq(op, BinOp::Lt) || binop_eq(op, BinOp::Gt) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq);
+    var bits: bool = binop_eq(op, BinOp::BitAnd) || binop_eq(op, BinOp::BitOr) || binop_eq(op, BinOp::BitXor) || binop_eq(op, BinOp::And) || binop_eq(op, BinOp::Or);
+    if !cmp && !bits {
+        return false;
+    }
+    // only on integers and bools (a text comparison calls the runtime)
+    var t: IrType = ssa_vty(f, l);
+    return ir_type_is_int(t) || ir_type_eq(t, IrType::Bool);
+}
+
+/// Can `inst` go when nothing reads it: constants, addresses, comparisons
+/// and bit operations on integers, loads of locals.
+fn ssa_pure(f: & IrFunction, inst: Inst) -> bool {
+    match inst {
+        Inst::ConstInt(_, _) => {
+            return true;
+        }
+        Inst::ConstFloat(_, _) => {
+            return true;
+        }
+        Inst::ConstBool(_) => {
+            return true;
+        }
+        Inst::ConstStr(_) => {
+            return true;
+        }
+        Inst::ConstNull(_) => {
+            return true;
+        }
+        Inst::ConstFnRef(_) => {
+            return true;
+        }
+        Inst::GlobalAddr(_, _) => {
+            return true;
+        }
+        Inst::GetFieldPtr(_, _, _) => {
+            return true;
+        }
+        Inst::BitCast(_, _, _) => {
+            return true;
+        }
+        Inst::BinOp(op, l, _, _) => {
+            return ssa_quiet_binop(f, op, l);
+        }
+        Inst::Load(p, _) => {
+            match peir_inst_of(f, p) {
+                Inst::Alloca(_, _) => {
+                    return true;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        _ => {
+            return false;
+        }
+    }
+}
+
+/// ME15: drop values nothing reads (the stored values of removed stores,
+/// the loads they read) until none is left, a few rounds at most.
+pub fn ssa_dce(f: & mut IrFunction) -> bool {
+    var any: bool = false;
+    var round: i64 = 0;
+    var removed: bool = true;
+    while removed && round < 8 {
+        removed = false;
+        var uses: Vec<i64> = peir_zeros(f.next_value + 1);
+        var b: i64 = 0;
+        while b < f.blocks.len() {
+            var ids: Vec<i64> = f.blocks.get(b).instructions;
+            var k: i64 = 0;
+            while k < ids.len() {
+                var ops: Vec<i64> = Vec::new();
+                peir_inst_operands(peir_inst_of(f, ids.get(k)), & mut ops);
+                var o: i64 = 0;
+                while o < ops.len() {
+                    var v: i64 = ops.get(o);
+                    if v >= 0 && v < uses.len() {
+                        uses.set(v, uses.get(v) + 1);
+                    }
+                    o = o + 1;
+                }
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+        b = 0;
+        while b < f.blocks.len() {
+            var blk: BasicBlock = f.blocks.get(b);
+            var keep: Vec<i64> = Vec::new();
+            var dropped: bool = false;
+            var k2: i64 = 0;
+            while k2 < blk.instructions.len() {
+                var id: i64 = blk.instructions.get(k2);
+                if id >= 0 && id < uses.len() && uses.get(id) == 0 && ssa_pure(f, peir_inst_of(f, id)) {
+                    dropped = true;
+                } else {
+                    keep.push(id);
+                }
+                k2 = k2 + 1;
+            }
+            if dropped {
+                blk.instructions = keep;
+                f.blocks.set(b, blk);
+                removed = true;
+                any = true;
+            }
+            b = b + 1;
+        }
+        round = round + 1;
+    }
+    return any;
+}
+
+// --- The pass ------------------------------------------------------------------
+
+/// Does ssa_round_trip work on `f` at all? Not on @constant_time functions,
+/// functions with TryUnwrap or Asm (ssa_has_unhandled), or functions whose
+/// entry block has predecessors. ME3: iropt's `promote` (iro_promote), which
+/// ssa subsumes, still runs on exactly these when ssa is on (iropt.fd
+/// iro_promote_here), so no function loses the load forwarding it had.
+pub fn ssa_takes(f: & IrFunction) -> bool {
+    if f.is_constant_time || f.blocks.len() == 0 {
+        return false;
+    }
+    if ssa_has_unhandled(f) {
+        return false;
+    }
+    var cfg: IroCfg = iro_cfg(f);
+    if cfg.n == 0 || cfg.preds.get(0).len() > 0 {
+        return false;
+    }
+    return true;
+}
+
+/// ME3 + ME15 (+ ME23 when `exit_values`): build SSA for `f`'s promotable
+/// locals, optimize it, convert it back to slots. True when `f` changed.
+pub fn ssa_round_trip(f: & mut IrFunction, exit_values: bool) -> bool {
+    if !ssa_takes(f) {
+        return false;
+    }
+    var cfg: IroCfg = iro_cfg(f);
+    var nv: i64 = f.next_value + 1;
+    var blk_of: Vec<i64> = ssa_fill(nv, - 1);
+    var pos_of: Vec<i64> = ssa_fill(nv, - 1);
+    var b: i64 = 0;
+    while b < f.blocks.len() {
+        var ids: Vec<i64> = f.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            var id: i64 = ids.get(k);
+            if id >= 0 && id < nv {
+                blk_of.set(id, b);
+                pos_of.set(id, k);
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var ok: Vec<i64> = ssa_candidates(f, & cfg, & blk_of, & pos_of);
+    var df: Vec<Vec<i64>> = ssa_frontiers(& cfg);
+    var kids: Vec<Vec<i64>> = ssa_dom_kids(& cfg);
+    // a candidate found to need memory is dropped and the rest rebuilt
+    var round: i64 = 0;
+    while round < 4 {
+        var st: SsaState = ssa_state(f, & cfg, & ok, df, kids);
+        if st.cands.len() == 0 {
+            return false;
+        }
+        if !ssa_place_phis(f, & cfg, & mut st) {
+            return false;
+        }
+        ssa_rename(f, & cfg, & mut st);
+        ssa_trivial_phis(& mut st);
+        ssa_live_phis(f, & cfg, & mut st);
+        var nbad: i64 = 0;
+        var c: i64 = 0;
+        while c < st.cands.len() {
+            if st.bad.get(c) == 1 {
+                ok.set(st.cands.get(c), 0);
+                nbad = nbad + 1;
+            }
+            c = c + 1;
+        }
+        if nbad == 0 {
+            var nkill: i64 = 0;
+            var v: i64 = 0;
+            while v < nv {
+                if st.kill.get(v) == 1 {
+                    nkill = nkill + 1;
+                }
+                v = v + 1;
+            }
+            if nkill == 0 {
+                return false;
+            }
+            var exits: Vec<SsaExit> = Vec::new();
+            if exit_values {
+                exits = ssa_exit_values(f, & cfg, & st, & blk_of);
+            }
+            ssa_materialize(f, & cfg, & st, & exits);
+            ssa_dce(f);
+            return true;
+        }
+        round = round + 1;
+    }
+    return false;
+}

@@ -1,0 +1,631 @@
+// tar: POSIX ustar archives (IEEE Std 1003.1 "pax" interchange format).
+//
+// Real, no platform seam: reading and writing archives held in memory as
+// bytes (Vec<i64>, one byte per element).
+//  - Reading: 512-byte headers, header checksum (unsigned sum, the signed
+//    sum some old tars wrote is accepted too), octal numeric fields and
+//    the base-256 form GNU tar uses for large values, ustar `prefix` +
+//    `name`, pax extended headers ('x', per entry; 'g', global) for path,
+//    linkpath, size, uid, gid, uname, gname, mtime, GNU long names ('L',
+//    'K'), the end-of-archive zero block(s).
+//  - Writing: ustar headers laid out as Python's tarfile and GNU tar write
+//    them (octal fields zero-padded with a NUL, checksum as 6 octal digits,
+//    NUL, space); a name longer than 100 bytes is split into prefix/name
+//    when possible, otherwise (and for long link names, a uname/gname over
+//    31 bytes, sizes of 8 GiB and more, ids of 2^21 and more) a pax 'x'
+//    header named "././@PaxHeader" carries the value; the archive ends
+//    with two zero blocks and is padded to 10240-byte records.
+module tar;
+use vec;
+use string;
+
+pub const TAR_BLOCK: i64 = 512;
+pub const TAR_RECORD: i64 = 10240;
+
+// typeflag values (the ASCII character)
+pub const TAR_REG: i64 = 48;
+pub const TAR_AREG: i64 = 0;
+pub const TAR_LNK: i64 = 49;
+pub const TAR_SYM: i64 = 50;
+pub const TAR_CHR: i64 = 51;
+pub const TAR_BLK: i64 = 52;
+pub const TAR_DIR: i64 = 53;
+pub const TAR_FIFO: i64 = 54;
+pub const TAR_CONT: i64 = 55;
+pub const TAR_PAX: i64 = 120;
+pub const TAR_PAX_GLOBAL: i64 = 103;
+pub const TAR_GNU_LONGNAME: i64 = 76;
+pub const TAR_GNU_LONGLINK: i64 = 75;
+
+pub struct TarEntry {
+    pub name: str,
+    pub mode: i64,
+    pub uid: i64,
+    pub gid: i64,
+    pub size: i64,
+    pub mtime: i64,
+    pub typeflag: i64,
+    pub linkname: str,
+    pub uname: str,
+    pub gname: str,
+    pub devmajor: i64,
+    pub devminor: i64,
+    pub data: Vec<i64>,
+}
+
+pub struct TarArchive {
+    pub err: str,
+    pub entries: Vec<TarEntry>,
+}
+
+pub fn tar_entry(name: str, typeflag: i64, mode: i64, data: Vec<i64>) -> TarEntry {
+    return TarEntry {
+        name: name, mode: mode, uid: 0, gid: 0, size: data.len(), mtime: 0, typeflag: typeflag, linkname: "", uname: "", gname: "", devmajor: 0, devminor: 0, data: data
+    };
+}
+
+/// A regular file entry.
+pub fn tar_file(name: str, data: Vec<i64>, mode: i64) -> TarEntry {
+    return tar_entry(name, TAR_REG, mode, data);
+}
+
+/// A directory entry (name conventionally ends in "/").
+pub fn tar_dir(name: str, mode: i64) -> TarEntry {
+    return tar_entry(name, TAR_DIR, mode, Vec::new());
+}
+
+/// A symbolic link entry.
+pub fn tar_symlink(name: str, target: str) -> TarEntry {
+    var e: TarEntry = tar_entry(name, TAR_SYM, 511, Vec::new());
+    e.linkname = target;
+    return e;
+}
+
+pub fn tar_is_dir(e: & TarEntry) -> bool {
+    return e.typeflag == TAR_DIR;
+}
+
+pub fn tar_is_file(e: & TarEntry) -> bool {
+    return e.typeflag == TAR_REG || e.typeflag == TAR_AREG || e.typeflag == TAR_CONT;
+}
+
+// --- field codecs ------------------------------------------------------------------
+
+fn tar_is_zero_block(b: & Vec<i64>, off: i64) -> bool {
+    var i: i64 = 0;
+    while i < TAR_BLOCK {
+        if b.get(off + i) != 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A NUL-terminated string field of at most `len` bytes.
+fn tar_field_str(b: & Vec<i64>, off: i64, len: i64) -> str {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < len {
+        val c: i64 = b.get(off + i);
+        if c == 0 {
+            break;
+        }
+        out.push(c);
+        i = i + 1;
+    }
+    return str_from_bytes(out);
+}
+
+/// A numeric field: octal digits (leading spaces or NULs skipped, ended by
+/// a space or NUL) or, with the top bit of the first byte set, the GNU
+/// base-256 big-endian form.
+pub fn tar_field_num(b: & Vec<i64>, off: i64, len: i64) -> i64 {
+    val first: i64 = b.get(off);
+    if (first & 128) != 0 {
+        var v: i64 = first & 63;
+        var i: i64 = 1;
+        while i < len {
+            v = v * 256 + b.get(off + i);
+            i = i + 1;
+        }
+        return v;
+    }
+    var i: i64 = 0;
+    while i < len && (b.get(off + i) == 32 || b.get(off + i) == 0) {
+        i = i + 1;
+    }
+    var v: i64 = 0;
+    while i < len {
+        val c: i64 = b.get(off + i);
+        if c < 48 || c > 55 {
+            break;
+        }
+        v = v * 8 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The checksum of the header at `off`: every byte summed with the
+/// checksum field (148..155) counted as spaces. [unsigned, signed].
+pub fn tar_checksums(b: & Vec<i64>, off: i64) -> Vec<i64> {
+    var u: i64 = 0;
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < TAR_BLOCK {
+        var c: i64 = b.get(off + i);
+        if i >= 148 && i < 156 {
+            c = 32;
+        }
+        u = u + c;
+        if c >= 128 {
+            s = s + c - 256;
+        } else {
+            s = s + c;
+        }
+        i = i + 1;
+    }
+    var r: Vec<i64> = Vec::new();
+    r.push(u);
+    r.push(s);
+    return r;
+}
+
+fn tar_put_str(h: &mut Vec<i64>, off: i64, len: i64, s: str) {
+    val bs: Vec<i64> = str_bytes(s);
+    var i: i64 = 0;
+    while i < len && i < bs.len() {
+        h.set(off + i, bs.get(i));
+        i = i + 1;
+    }
+}
+
+/// `v` as `len - 1` zero-padded octal digits and a NUL; values that do not
+/// fit are written in base-256 (they only arise for fields a pax record
+/// also carries).
+fn tar_put_octal(h: &mut Vec<i64>, off: i64, len: i64, v: i64) {
+    var lim: i64 = 1;
+    var k: i64 = 0;
+    while k < len - 1 {
+        lim = lim * 8;
+        k = k + 1;
+    }
+    if v >= 0 && v < lim {
+        var x: i64 = v;
+        var i: i64 = len - 2;
+        while i >= 0 {
+            h.set(off + i, 48 + (x % 8));
+            x = x / 8;
+            i = i - 1;
+        }
+        h.set(off + len - 1, 0);
+        return;
+    }
+    var x: i64 = v;
+    var i: i64 = len - 1;
+    while i >= 1 {
+        h.set(off + i, x % 256);
+        x = x / 256;
+        i = i - 1;
+    }
+    h.set(off, 128);
+}
+
+fn tar_octal_fits(v: i64, digits: i64) -> bool {
+    var lim: i64 = 1;
+    var k: i64 = 0;
+    while k < digits {
+        lim = lim * 8;
+        k = k + 1;
+    }
+    return v >= 0 && v < lim;
+}
+
+// --- pax records -----------------------------------------------------------------
+
+/// One pax record "LEN key=value\n", LEN counting the whole record.
+pub fn tar_pax_record(key: str, value: str) -> str {
+    val body: i64 = str_len(key) + str_len(value) + 3;
+    var n: i64 = body + 1;
+    loop {
+        val total: i64 = body + str_len(int_to_str(n));
+        if total == n {
+            break;
+        }
+        n = total;
+    }
+    return int_to_str(n) + " " + key + "=" + value + "\n";
+}
+
+/// Parse pax records into parallel key/value lists.
+fn tar_pax_parse(d: & Vec<i64>, keys: &mut Vec<str>, vals: &mut Vec<str>) -> bool {
+    var p: i64 = 0;
+    while p < d.len() {
+        if d.get(p) == 0 {
+            break;
+        }
+        var n: i64 = 0;
+        var q: i64 = p;
+        while q < d.len() && d.get(q) >= 48 && d.get(q) <= 57 {
+            n = n * 10 + d.get(q) - 48;
+            q = q + 1;
+        }
+        if n <= 0 || p + n > d.len() || q >= d.len() || d.get(q) != 32 || d.get(p + n - 1) != 10 {
+            return false;
+        }
+        q = q + 1;
+        var kb: Vec<i64> = Vec::new();
+        while q < p + n - 1 && d.get(q) != 61 {
+            kb.push(d.get(q));
+            q = q + 1;
+        }
+        q = q + 1;
+        var vb: Vec<i64> = Vec::new();
+        while q < p + n - 1 {
+            vb.push(d.get(q));
+            q = q + 1;
+        }
+        keys.push(str_from_bytes(kb));
+        vals.push(str_from_bytes(vb));
+        p = p + n;
+    }
+    return true;
+}
+
+fn tar_dec(s: str) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c < 48 || c > 57 {
+            break;
+        }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn tar_apply_pax(e: &mut TarEntry, keys: & Vec<str>, vals: & Vec<str>) {
+    var i: i64 = 0;
+    while i < keys.len() {
+        val k: str = keys.get(i);
+        val v: str = vals.get(i);
+        if k == "path" {
+            e.name = v;
+        } else if k == "linkpath" {
+            e.linkname = v;
+        } else if k == "uname" {
+            e.uname = v;
+        } else if k == "gname" {
+            e.gname = v;
+        } else if k == "uid" {
+            e.uid = tar_dec(v);
+        } else if k == "gid" {
+            e.gid = tar_dec(v);
+        } else if k == "size" {
+            e.size = tar_dec(v);
+        } else if k == "mtime" {
+            e.mtime = tar_dec(v);
+        }
+        i = i + 1;
+    }
+}
+
+// --- reading ---------------------------------------------------------------------
+
+fn tar_fail(msg: str, es: Vec<TarEntry>) -> TarArchive {
+    return TarArchive { err: msg, entries: es };
+}
+
+/// Parse a whole archive. `err` is "" on success; entries read before an
+/// error are kept.
+pub fn tar_parse(b: Vec<i64>) -> TarArchive {
+    var es: Vec<TarEntry> = Vec::new();
+    var gkeys: Vec<str> = Vec::new();
+    var gvals: Vec<str> = Vec::new();
+    var pkeys: Vec<str> = Vec::new();
+    var pvals: Vec<str> = Vec::new();
+    var long_name: str = "";
+    var long_link: str = "";
+    var off: i64 = 0;
+    while off + TAR_BLOCK <= b.len() {
+        if tar_is_zero_block(&b, off) {
+            return TarArchive { err: "", entries: es };
+        }
+        val stored: i64 = tar_field_num(&b, off + 148, 8);
+        val sums: Vec<i64> = tar_checksums(&b, off);
+        if stored != sums.get(0) && stored != sums.get(1) {
+            return tar_fail("bad header checksum at " + int_to_str(off), es);
+        }
+        var e: TarEntry = tar_entry("", 0, 0, Vec::new());
+        e.name = tar_field_str(&b, off, 100);
+        e.mode = tar_field_num(&b, off + 100, 8);
+        e.uid = tar_field_num(&b, off + 108, 8);
+        e.gid = tar_field_num(&b, off + 116, 8);
+        e.size = tar_field_num(&b, off + 124, 12);
+        e.mtime = tar_field_num(&b, off + 136, 12);
+        e.typeflag = b.get(off + 156);
+        e.linkname = tar_field_str(&b, off + 157, 100);
+        val magic: str = tar_field_str(&b, off + 257, 6);
+        if magic == "ustar" || magic == "ustar " {
+            e.uname = tar_field_str(&b, off + 265, 32);
+            e.gname = tar_field_str(&b, off + 297, 32);
+            e.devmajor = tar_field_num(&b, off + 329, 8);
+            e.devminor = tar_field_num(&b, off + 337, 8);
+            // GNU tar ("ustar  ") uses the prefix area for other fields
+            if magic == "ustar" && b.get(off + 263) == 48 {
+                val prefix: str = tar_field_str(&b, off + 345, 155);
+                if str_len(prefix) > 0 {
+                    e.name = prefix + "/" + e.name;
+                }
+            }
+        }
+        var t: i64 = e.typeflag;
+        // the header's size field still counts for the data of x/g/L/K
+        var size: i64 = e.size;
+        if t == TAR_PAX || t == TAR_PAX_GLOBAL || t == TAR_GNU_LONGNAME || t == TAR_GNU_LONGLINK {
+            size = tar_field_num(&b, off + 124, 12);
+        } else {
+            tar_apply_pax(&mut e, &gkeys, &gvals);
+            tar_apply_pax(&mut e, &pkeys, &pvals);
+            size = e.size;
+        }
+        // links, directories and devices carry no data
+        if t == TAR_LNK || t == TAR_SYM || t == TAR_DIR || t == TAR_CHR || t == TAR_BLK || t == TAR_FIFO {
+            size = 0;
+        }
+        val dstart: i64 = off + TAR_BLOCK;
+        if dstart + size > b.len() {
+            return tar_fail("truncated data at " + int_to_str(dstart), es);
+        }
+        var data: Vec<i64> = Vec::new();
+        var i: i64 = 0;
+        while i < size {
+            data.push(b.get(dstart + i));
+            i = i + 1;
+        }
+        off = dstart + ((size + TAR_BLOCK - 1) / TAR_BLOCK) * TAR_BLOCK;
+        if t == TAR_PAX {
+            pkeys = Vec::new();
+            pvals = Vec::new();
+            if !tar_pax_parse(&data, &mut pkeys, &mut pvals) {
+                return tar_fail("bad pax header", es);
+            }
+            continue;
+        }
+        if t == TAR_PAX_GLOBAL {
+            if !tar_pax_parse(&data, &mut gkeys, &mut gvals) {
+                return tar_fail("bad pax global header", es);
+            }
+            continue;
+        }
+        if t == TAR_GNU_LONGNAME {
+            long_name = tar_field_str(&data, 0, data.len());
+            continue;
+        }
+        if t == TAR_GNU_LONGLINK {
+            long_link = tar_field_str(&data, 0, data.len());
+            continue;
+        }
+        if str_len(long_name) > 0 {
+            e.name = long_name;
+            long_name = "";
+        }
+        if str_len(long_link) > 0 {
+            e.linkname = long_link;
+            long_link = "";
+        }
+        e.size = data.len();
+        e.data = data;
+        es.push(e);
+        pkeys = Vec::new();
+        pvals = Vec::new();
+    }
+    if off < b.len() {
+        return tar_fail("trailing partial block", es);
+    }
+    // no end-of-archive marker: accepted, as GNU tar does with a warning
+    return TarArchive { err: "", entries: es };
+}
+
+/// The index of the entry named `name`, or -1 (the last one wins, as an
+/// extracting tar would leave it).
+pub fn tar_find(a: & TarArchive, name: str) -> i64 {
+    var found: i64 = -1;
+    var i: i64 = 0;
+    while i < a.entries.len() {
+        if a.entries.get(i).name == name {
+            found = i;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+// --- writing ---------------------------------------------------------------------
+
+/// Where to split `name` into prefix "/" name (ustar): the index of the
+/// '/', or -1 when no split gives prefix <= 155 and name <= 100 bytes.
+pub fn tar_split_point(name: str) -> i64 {
+    val n: i64 = str_len(name);
+    var i: i64 = n - 1;
+    if i > 155 {
+        i = 155;
+    }
+    while i > 0 {
+        if str_byte_at(name, i) == 47 {
+            if n - i - 1 <= 100 && n - i - 1 > 0 {
+                return i;
+            }
+            return -1;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// Recompute the checksum field of the header block at the start of `h`.
+pub fn tar_fix_checksum(h: &mut Vec<i64>) {
+    var i: i64 = 148;
+    while i < 156 {
+        h.set(i, 32);
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < TAR_BLOCK {
+        sum = sum + h.get(i);
+        i = i + 1;
+    }
+    tar_put_octal(h, 148, 7, sum);
+    h.set(155, 32);
+}
+
+/// One ustar header block for `e`, with `name`/`prefix` as given.
+fn tar_raw_header(e: & TarEntry, name: str, prefix: str, size: i64) -> Vec<i64> {
+    var h: Vec<i64> = Vec::filled(TAR_BLOCK, 0);
+    tar_put_str(&mut h, 0, 100, name);
+    tar_put_octal(&mut h, 100, 8, e.mode & 4095);
+    tar_put_octal(&mut h, 108, 8, e.uid);
+    tar_put_octal(&mut h, 116, 8, e.gid);
+    tar_put_octal(&mut h, 124, 12, size);
+    tar_put_octal(&mut h, 136, 12, e.mtime);
+    h.set(156, e.typeflag);
+    tar_put_str(&mut h, 157, 100, e.linkname);
+    tar_put_str(&mut h, 257, 6, "ustar");
+    h.set(263, 48);
+    h.set(264, 48);
+    tar_put_str(&mut h, 265, 32, e.uname);
+    tar_put_str(&mut h, 297, 32, e.gname);
+    if e.typeflag == TAR_CHR || e.typeflag == TAR_BLK {
+        tar_put_octal(&mut h, 329, 8, e.devmajor);
+        tar_put_octal(&mut h, 337, 8, e.devminor);
+    }
+    tar_put_str(&mut h, 345, 155, prefix);
+    tar_fix_checksum(&mut h);
+    return h;
+}
+
+fn tar_push_data(out: &mut Vec<i64>, data: & Vec<i64>) {
+    var i: i64 = 0;
+    while i < data.len() {
+        out.push(data.get(i));
+        i = i + 1;
+    }
+    while out.len() % TAR_BLOCK != 0 {
+        out.push(0);
+    }
+}
+
+/// The header block(s) of one entry: a pax header first when a value does
+/// not fit the ustar fields.
+pub fn tar_header(e: & TarEntry) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var name: str = e.name;
+    var prefix: str = "";
+    var pax: str = "";
+    val nl: i64 = str_len(e.name);
+    if nl > 100 {
+        val sp: i64 = tar_split_point(e.name);
+        if sp >= 0 {
+            prefix = str_slice(e.name, 0, sp);
+            name = str_slice(e.name, sp + 1, nl);
+        } else {
+            pax = pax + tar_pax_record("path", e.name);
+            name = str_slice(e.name, 0, 100);
+        }
+    }
+    if str_len(e.linkname) > 100 {
+        pax = pax + tar_pax_record("linkpath", e.linkname);
+    }
+    if str_len(e.uname) > 31 {
+        pax = pax + tar_pax_record("uname", e.uname);
+    }
+    if str_len(e.gname) > 31 {
+        pax = pax + tar_pax_record("gname", e.gname);
+    }
+    if !tar_octal_fits(e.uid, 7) {
+        pax = pax + tar_pax_record("uid", int_to_str(e.uid));
+    }
+    if !tar_octal_fits(e.gid, 7) {
+        pax = pax + tar_pax_record("gid", int_to_str(e.gid));
+    }
+    var size: i64 = e.data.len();
+    if e.typeflag != TAR_REG && e.typeflag != TAR_AREG && e.typeflag != TAR_CONT {
+        size = 0;
+    }
+    if !tar_octal_fits(size, 11) {
+        pax = pax + tar_pax_record("size", int_to_str(size));
+    }
+    if str_len(pax) > 0 {
+        val pd: Vec<i64> = str_bytes(pax);
+        val ph: TarEntry = tar_entry("././@PaxHeader", TAR_PAX, 0, Vec::new());
+        val hb: Vec<i64> = tar_raw_header(&ph, "././@PaxHeader", "", pd.len());
+        tar_push_data(&mut out, &hb);
+        tar_push_data(&mut out, &pd);
+    }
+    val h: Vec<i64> = tar_raw_header(e, name, prefix, size);
+    tar_push_data(&mut out, &h);
+    return out;
+}
+
+/// A whole archive: every entry, two zero blocks, padded to `TAR_RECORD`.
+pub fn tar_write(entries: Vec<TarEntry>) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < entries.len() {
+        val e: TarEntry = entries.get(i);
+        val h: Vec<i64> = tar_header(&e);
+        var j: i64 = 0;
+        while j < h.len() {
+            out.push(h.get(j));
+            j = j + 1;
+        }
+        if e.typeflag == TAR_REG || e.typeflag == TAR_AREG || e.typeflag == TAR_CONT {
+            tar_push_data(&mut out, &e.data);
+        }
+        i = i + 1;
+    }
+    var z: i64 = 0;
+    while z < 2 * TAR_BLOCK {
+        out.push(0);
+        z = z + 1;
+    }
+    while out.len() % TAR_RECORD != 0 {
+        out.push(0);
+    }
+    return out;
+}
+
+/// "-rw-r--r--"-style mode string of an entry (as `tar tv` prints it).
+pub fn tar_mode_str(e: & TarEntry) -> str {
+    var s: str = "-";
+    if e.typeflag == TAR_DIR {
+        s = "d";
+    } else if e.typeflag == TAR_SYM {
+        s = "l";
+    } else if e.typeflag == TAR_LNK {
+        s = "h";
+    } else if e.typeflag == TAR_CHR {
+        s = "c";
+    } else if e.typeflag == TAR_BLK {
+        s = "b";
+    } else if e.typeflag == TAR_FIFO {
+        s = "p";
+    }
+    val chars: str = "rwxrwxrwx";
+    var bit: i64 = 256;
+    var i: i64 = 0;
+    while i < 9 {
+        if (e.mode & bit) != 0 {
+            s = s + str_slice(chars, i, i + 1);
+        } else {
+            s = s + "-";
+        }
+        bit = bit / 2;
+        i = i + 1;
+    }
+    return s;
+}

@@ -1,0 +1,51 @@
+// stdlib/io.fd on standard input (roadmap L4B): a Reader reads one line
+// byte by byte, then a BufReader takes over and reads the rest in 4-byte
+// chunks, and both report the end. Compiled backends only: the
+// interpreter has no p_read_stdin.
+//
+// Run with the input "first\nsecond\r\nthird\nfourth" on stdin:
+//   printf 'first\nsecond\r\nthird\nfourth' | ./test_io_stdin
+// Expected output:
+// reader: first
+// buf: second|third|fourth
+// end: true none
+// With empty (or closed) stdin, as the test harness runs it:
+// reader: <none>
+// buf:
+// end: true none
+use io;
+
+fn main() -> i64 {
+    var r: Reader = Reader::from_stdin();
+    // bound first: `match r.read_line()` on a local struct picks no arm
+    // (a lowering bug, reported separately)
+    val first: Option<str> = r.read_line();
+    match first {
+        Option::Some(l) => { println("reader: " + l); }
+        Option::None => { println("reader: <none>"); }
+    }
+    var br: BufReader = BufReader::with_capacity(r, 4);
+    val rest: Vec<str> = br.lines();
+    var j: str = "";
+    var i: i64 = 0;
+    while i < rest.len() {
+        if i > 0 {
+            j = j + "|";
+        }
+        j = j + rest.get(i);
+        i = i + 1;
+    }
+    println("buf: " + j);
+    var tail: str = "none";
+    val last: Option<str> = br.read_line();
+    match last {
+        Option::Some(l2) => { tail = l2; }
+        Option::None => {}
+    }
+    if br.at_end() {
+        println("end: true " + tail);
+    } else {
+        println("end: false " + tail);
+    }
+    return 0;
+}

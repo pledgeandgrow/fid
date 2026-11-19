@@ -31,14 +31,22 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-FIDESC="./target/release/fidesc"
+# fid, the release compiler (the frozen fidesc can no longer compile these
+# tests): FID=<path> to pick another; LIMIT=<s> per run (default 300)
+if [[ -z "${FID:-}" ]]; then
+    if [[ -x release/fid.exe ]]; then FID=release/fid.exe; else FID=release/fid; fi
+fi
+LIMIT="${LIMIT:-300}"
+export CC="${CC:-zig cc}"   # for ccompile
 TEST_DIR="tests/selfhost"
 BASELINE_DIR="tests/selfhost/baseline"
 BASELINE_FILE="$BASELINE_DIR/test_results.txt"
 
 # Temp file for capturing test output (shown on failure)
 TMP_OUT=$(mktemp)
-trap 'rm -f "$TMP_OUT"' EXIT
+# executables of the C and native runs
+EXE_DIR=$(mktemp -d)
+trap 'rm -f "$TMP_OUT"; rm -rf "$EXE_DIR"' EXIT
 
 # --verbose: show output even for passing tests
 VERBOSE=0
@@ -52,9 +60,9 @@ if [[ "$1" == "--help" || "$1" == "-h" ]]; then
 verify-selfhost.sh â€” Self-hosting compiler component verification
 
 Commands:
-  (default)  Build release + run all tests/selfhost/*.fd on 3 backends, diff vs baseline
-  --save     Build release + run all tests, save results as new baseline
-  --quick    Build release only (no tests)
+  (default)  Run all tests/selfhost/*.fd on 3 backends, diff vs baseline
+  --save     Run all tests, save results as new baseline
+  --quick    Check that fid is there (no tests)
   --verbose  Show test output even for passing tests (always shown on failure)
   --list     List all self-host test files
   --help     This help message
@@ -65,10 +73,11 @@ Test suites:
   verify.sh            â†’ tests/bootstrap/ (Rust compiler in src/)
   verify-selfhost.sh   â†’ tests/selfhost/ (self-hosted Fides components in compiler/)
 
-Backends tested:
-  1. Interpreter   (fidesc run)
-  2. C codegen     (fidesc ccompile + run .exe)
-  3. PE emitter    (fidesc build + run native binary)
+Backends tested (FID=<fid>, default release/fid.exe; the files in
+tests/selfhost/skip.txt are left out; each run under timeout $LIMIT, 300 s):
+  1. Interpreter   (fid run)
+  2. C codegen     (fid ccompile + run the executable; CC default zig cc)
+  3. Native        (fid emit + run the executable)
 
 Workflow:
   1. Before making changes:    ./verify-selfhost.sh          (confirm baseline passes)
@@ -89,26 +98,20 @@ if [[ "$1" == "--list" ]]; then
     exit 0
 fi
 
-# --- Quick mode: build only ---
+# --- The compiler (built by scripts/bootstrap.sh, not here) ---
+if [[ ! -x "$FID" ]]; then
+    echo -e "${RED}ERROR: fid not found at $FID (build it with scripts/bootstrap.sh, or set FID)${NC}"
+    exit 1
+fi
 if [[ "$1" == "--quick" ]]; then
-    echo -e "${YELLOW}Building (release)...${NC}"
-    cargo build --release 2>&1 | tail -3
-    echo -e "${GREEN}Build OK${NC}"
+    echo -e "${GREEN}fid found: $FID${NC}"
     exit 0
 fi
 
-# --- Build ---
-echo -e "${YELLOW}Building (release)...${NC}"
-cargo build --release 2>&1 | grep -E "^(error|Finished)" || true
-
-if [[ ! -x "$FIDESC" ]]; then
-    echo -e "${RED}ERROR: fidesc binary not found at $FIDESC${NC}"
-    exit 1
-fi
-
 # --- Collect test files ---
-# Skip harness tests that require file arguments (not standalone tests)
-SKIP_TESTS="test_fmt_harness.fd test_lexer_harness.fd test_parser_harness.fd test_sl_debug.fd"
+# Skip the files that are not standalone tests: tests/selfhost/skip.txt,
+# one file name per line (then why), # comments
+SKIP_TESTS="$(grep -v '^#' tests/selfhost/skip.txt 2>/dev/null | tr -d '\r' | awk 'NF {print $1}' | tr '\n' ' ')"
 
 TEST_FILES=()
 for f in "$TEST_DIR"/*.fd; do
@@ -160,9 +163,14 @@ PE_FAIL=0
 # --- Backend 1: Interpreter ---
 echo -e "${YELLOW}=== Interpreter ===${NC}"
 OUTPUT="${OUTPUT}=== Interpreter ===\n"
+# the tests of tests/selfhost/interp-slow.txt take minutes in the
+# interpreter: LIMIT_SLOW (default 1200 s) in place of LIMIT for them
+SLOW="$(grep -v '^#' tests/selfhost/interp-slow.txt 2>/dev/null | tr -d '\r' | awk 'NF {print $1}')"
 for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
-    if $FIDESC run "$f" > "$TMP_OUT" 2>&1; then
+    lim=$LIMIT
+    echo "$SLOW" | grep -qxF "$name" && lim=${LIMIT_SLOW:-1200}
+    if timeout "$lim" "$FID" run "$f" > "$TMP_OUT" 2>&1; then
         echo -e "  ${GREEN}PASS${NC} $name"
         [[ $VERBOSE -eq 1 ]] && sed 's/^/    /' "$TMP_OUT" | head -20
         OUTPUT="${OUTPUT}${name}: PASS\n"
@@ -178,17 +186,15 @@ for f in "${TEST_FILES[@]}"; do
 done
 
 # --- Backend 2: C codegen ---
-# Note: we use `fidesc run --backend c` instead of `fidesc ccompile` + running
-# the .exe directly, because the standalone C-compiled binaries can segfault
-# on complex tests with heavy string concatenation (pre-existing C codegen
-# limitation with large functions). Running via `fidesc run --backend c`
-# executes in-process and is reliable.
+# `fid ccompile` and the executable it builds, each under the time limit
 echo ""
 echo -e "${YELLOW}=== C Codegen ===${NC}"
 OUTPUT="${OUTPUT}\n=== C Codegen ===\n"
 for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
-    if $FIDESC run "$f" --backend c > "$TMP_OUT" 2>&1; then
+    exe="$EXE_DIR/${name%.fd}-c.exe"
+    if timeout "$LIMIT" "$FID" ccompile "$f" -o "$exe" > "$TMP_OUT" 2>&1 \
+       && timeout "$LIMIT" "$exe" > "$TMP_OUT" 2>&1; then
         echo -e "  ${GREEN}PASS${NC} $name"
         [[ $VERBOSE -eq 1 ]] && sed 's/^/    /' "$TMP_OUT" | head -20
         OUTPUT="${OUTPUT}${name}: PASS\n"
@@ -203,17 +209,17 @@ for f in "${TEST_FILES[@]}"; do
     fi
 done
 
-# --- Backend 3: PE emitter ---
-# Note: we use `fidesc run --backend pe` instead of `fidesc build` + running
-# the binary directly, because the PE-emitted standalone binaries segfault on
-# complex tests when stdout is redirected (pre-existing PE emitter limitation).
-# Running via `fidesc run --backend pe` executes in-process and is reliable.
+# --- Backend 3: native (fid emit: pe_ir on Windows) ---
+# `fid emit` and the executable it builds, each under the time limit. The
+# results keep the "PE Emitter" name so baselines compare.
 echo ""
 echo -e "${YELLOW}=== PE Emitter ===${NC}"
 OUTPUT="${OUTPUT}\n=== PE Emitter ===\n"
 for f in "${TEST_FILES[@]}"; do
     name=$(basename "$f")
-    if $FIDESC run "$f" --backend pe > "$TMP_OUT" 2>&1; then
+    exe="$EXE_DIR/${name%.fd}-native.exe"
+    if timeout "$LIMIT" "$FID" emit "$f" -o "$exe" > "$TMP_OUT" 2>&1 \
+       && timeout "$LIMIT" "$exe" > "$TMP_OUT" 2>&1; then
         echo -e "  ${GREEN}PASS${NC} $name"
         [[ $VERBOSE -eq 1 ]] && sed 's/^/    /' "$TMP_OUT" | head -20
         OUTPUT="${OUTPUT}${name}: PASS\n"

@@ -1,0 +1,256 @@
+# PL3 (competitive-roadmap): Tier 2 targets are built on every push to main
+# and their structure checked; the suite is run where a runner (or qemu) can
+# run it. A failure here does not block a commit the way tier1.yml does, but
+# a Tier 2 target stays Tier 2 only while this is green.
+#
+#   macos-x64      macos-15-intel   `fid emit --target x86_64-macos`: hello
+#                                   and the suite, each binary checked with
+#                                   scripts/macho-check.py, then run on the
+#                                   Intel Mac against `fid run`
+#                                   (scripts/cross-test.sh NATIVE=1).
+#                                   (GitHub retired macos-13: macos-15-intel
+#                                   is its Intel runner now.)
+#   riscv64-linux  ubuntu-latest    `fid emit --target riscv64-linux`: hello
+#                                   and the suite under qemu-riscv64 (user
+#                                   mode), against `fid run`
+#   Both also run the suite through C (`fid ccompile`, zig cc) with
+#   scripts/tier2.sh: lane c:x86_64-macos on the Intel Mac, c:riscv64-linux
+#   under qemu.
+#   aarch64-windows and x86_64-freebsd (C through zig cc): the suite is
+#   built on ubuntu-latest by scripts/tier2.sh (job build-only: every binary
+#   checked by scripts/bin-target-check.py), then run where it runs:
+#   windows-arm64 on a windows-11-arm runner, freebsd in a FreeBSD VM
+#   (vmactions/freebsd-vm); each compares with the references made at build
+#   time (scripts/cross-test.sh COMPARE_ONLY=1).
+#
+# Locally: bash scripts/tier2.sh (all four through C; WITH_NATIVE=1 adds
+# the native lanes), or NATIVE=1 bash scripts/cross-test.sh
+# x86_64-macos|riscv64-linux.
+
+name: Tier 2 (PL3)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tier2:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-x64
+            os: macos-15-intel
+            target: x86_64-macos
+          - platform: riscv64-linux
+            os: ubuntu-latest
+            target: riscv64-linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUST_MIN_STACK: "268435456"   # rustc overflowed its stack on macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold and qemu-user (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold qemu-user
+      - name: RISC-V C library for qemu-user (CI4; dynamic native programs)
+        if: matrix.target == 'riscv64-linux'
+        run: sudo apt-get install -y -qq libc6-riscv64-cross
+      - name: coreutils (macOS; GNU timeout for the suite scripts)
+        if: runner.os == 'macOS'
+        run: |
+          brew install coreutils || true
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: The compiler's sources parse with stage 0
+        run: bash scripts/stage0-names-check.sh
+      - name: Build the Rust bootstrap compiler (stage 0)
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: |
+          ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+
+      - name: hello on ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          mkdir -p build/tier2
+          ./release/fid emit tests/bootstrap/hello.fd --target "$TARGET" -o build/tier2/hello
+          case "$TARGET" in
+            *-macos) python3 scripts/macho-check.py build/tier2/hello ;;
+          esac
+          chmod +x build/tier2/hello
+          ./release/fid run tests/bootstrap/hello.fd > build/tier2/hello.ref
+          case "$TARGET" in
+            riscv64-linux) qemu-riscv64 build/tier2/hello > build/tier2/hello.got ;;
+            *)             ./build/tier2/hello > build/tier2/hello.got ;;
+          esac
+          diff -u build/tier2/hello.ref build/tier2/hello.got
+
+      - name: The suite on ${{ matrix.target }}, compared with the interpreter
+        env:
+          TARGET: ${{ matrix.target }}
+        run: NATIVE=1 FID=release/fid JOBS=3 bash scripts/cross-test.sh "$TARGET"
+
+      - name: The suite through C on ${{ matrix.target }} (scripts/tier2.sh)
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          CC: zig cc
+        run: LANES="c:$TARGET" FID=release/fid JOBS=3 bash scripts/tier2.sh
+
+      - name: Every suite binary is a well-formed Mach-O (x86_64-macos)
+        if: always() && matrix.target == 'x86_64-macos'
+        run: |
+          bad=0; n=0
+          for b in build/cross/x86_64-macos-native/*.bin; do
+            [ -f "$b" ] || continue
+            n=$((n + 1))
+            python3 scripts/macho-check.py "$b" --quiet || { echo "macho-check: $b"; bad=$((bad + 1)); }
+          done
+          echo "macho-check: $n binaries, $bad bad"
+          [ "$n" -gt 0 ] && [ "$bad" = 0 ]
+
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-${{ matrix.platform }}-${{ github.run_id }}
+          path: |
+            build/cross/${{ matrix.target }}-native/results.txt
+            build/tier2/summary.md
+            build/tier2/lanes/*/results.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Windows ARM64 and FreeBSD through C: built here (zig cc cross-compiles),
+  # each binary checked, then run on the target by the two jobs below
+  build-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUST_MIN_STACK: "268435456"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: mold (the linker .cargo/config.toml asks for) and qemu-user
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold qemu-user
+      - name: Build the Rust bootstrap compiler (stage 0)
+        run: cargo build --release
+      - name: Build fid (one stage)
+        env:
+          CC: zig cc
+        run: |
+          ./scripts/build-selfhost.sh
+          cp release/fid-dev release/fid
+      - name: The Tier 2 targets in both spellings, binaries checked (riscv64 run)
+        run: FID=release/fid bash tests/tooling/tier2-targets-check.sh
+      - name: A lane built here and run elsewhere is compared (no compiler)
+        run: bash tests/tooling/tier2_compare_check.sh
+      - name: The suite built for aarch64-windows and x86_64-freebsd
+        env:
+          CC: zig cc
+        run: LANES="c:aarch64-windows c:x86_64-freebsd" FID=release/fid JOBS=4 bash scripts/tier2.sh
+      - name: The Windows ARM64 binaries and their references
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-aarch64-windows-${{ github.run_id }}
+          path: build/tier2/lanes/c-aarch64-windows/
+          if-no-files-found: error
+          retention-days: 3
+      - name: The FreeBSD binaries and their references
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-x86_64-freebsd-${{ github.run_id }}
+          path: build/tier2/lanes/c-x86_64-freebsd/
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-arm64:
+    needs: build-only
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out with LF line endings (bash reads the scripts)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tier2-aarch64-windows-${{ github.run_id }}
+          path: build/tier2/lanes/c-aarch64-windows
+      - name: Run the suite's ARM64 executables
+        run: bash build/tier2/lanes/c-aarch64-windows/run-all.sh
+      - name: Compare with the interpreter's output
+        env:
+          HOST_ARCH: aarch64
+        run: COMPARE_ONLY=1 OUT=build/tier2/lanes/c-aarch64-windows bash scripts/cross-test.sh aarch64-windows
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-windows-arm64-results-${{ github.run_id }}
+          path: build/tier2/lanes/c-aarch64-windows/results.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  freebsd:
+    needs: build-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tier2-x86_64-freebsd-${{ github.run_id }}
+          path: build/tier2/lanes/c-x86_64-freebsd
+      - name: Run the suite's FreeBSD executables in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y bash
+          run: |
+            chmod +x build/tier2/lanes/c-x86_64-freebsd/*.bin
+            bash build/tier2/lanes/c-x86_64-freebsd/run-all.sh
+      - name: Compare with the interpreter's output
+        run: COMPARE_ONLY=1 OUT=build/tier2/lanes/c-x86_64-freebsd bash scripts/cross-test.sh x86_64-freebsd
+      - name: Keep the per-test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-freebsd-results-${{ github.run_id }}
+          path: build/tier2/lanes/c-x86_64-freebsd/results.txt
+          if-no-files-found: ignore
+          retention-days: 14

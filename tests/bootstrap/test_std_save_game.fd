@@ -1,0 +1,165 @@
+// stdlib/save_game: CRC-32 vectors, header/sections round trip, corruption and truncation, migrations 1->3, crash-safe file writes with .bak fallback
+// Expected output:
+// crc32 '123456789' cbf43926
+// crc32 '' 00000000
+// crc32 fox 414fa339
+// encoded 77 bytes
+//   46534156010000000300000002000000350000002ee793d80600706c617965721a000000040000004172696150fbffffffffffff0000000000000e4001c805006c6576656c0400000007000000
+// decoded ok version 3 sections 2
+// player Aria -1200 3.75 true 200 all read yes
+// level 7, reading past the end: 0 ok no
+// missing section empty: yes
+// flipped bit: checksum mismatch (corrupted file)
+// changed version: checksum mismatch (corrupted file)
+// truncated: length mismatch (truncated or padded file)
+// magic: not a save file (bad magic)
+// migrate 1 -> 3: ok in 2 steps, version 3, has hp no
+// stats 42/100 gold 12.5
+// skipping step: migration from version 1 gave version 3
+// failing step: migration from version 1 failed
+// too new: save version 3 is newer than 2
+// already current: ok steps 0
+// first write ok
+// read ok version 3 backup no
+// overwrite ok, temp left no, bak left no
+// read version 4
+// after a torn write: ok version 4 from backup yes
+// missing: no such file
+// cleaned up yes
+use save_game;
+use encoding;
+use fs;
+
+fn crc_hex(v: i64) -> str {
+    var s: str = "";
+    var k: i64 = 7;
+    while k >= 0 {
+        s = s + char_to_str(str_byte_at("0123456789abcdef", (v >> (4 * k)) & 15));
+        k = k - 1;
+    }
+    return s;
+}
+
+// version 1: "hp" = i64; version 2: "stats" = hp, max_hp; version 3 adds "gold" f64
+fn migrate(s: &mut SaveGame) -> bool {
+    if s.version == 1 {
+        var r: SaveReader = save_game_reader(s, "hp");
+        val hp: i64 = save_get_i64(&mut r);
+        if !r.ok {
+            return false;
+        }
+        var w: SaveWriter = save_writer();
+        save_put_i64(&mut w, hp);
+        save_put_i64(&mut w, 100);
+        save_game_remove(s, "hp");
+        save_game_set(s, "stats", w.bytes);
+        s.version = 2;
+        return true;
+    }
+    if s.version == 2 {
+        var w: SaveWriter = save_writer();
+        save_put_f64(&mut w, 12.5);
+        save_game_set(s, "gold", w.bytes);
+        s.version = 3;
+        return true;
+    }
+    return false;
+}
+
+fn skips(s: &mut SaveGame) -> bool {
+    s.version = s.version + 2;
+    return true;
+}
+
+fn refuses(s: &mut SaveGame) -> bool {
+    return false;
+}
+
+fn main() {
+    println("crc32 '123456789' " + crc_hex(save_crc32(&str_bytes("123456789"))));
+    println("crc32 '' " + crc_hex(save_crc32(&str_bytes(""))));
+    println("crc32 fox " + crc_hex(save_crc32(&str_bytes("The quick brown fox jumps over the lazy dog"))));
+
+    var sg: SaveGame = save_game_new(3);
+    var w: SaveWriter = save_writer();
+    save_put_str(&mut w, "Aria");
+    save_put_i64(&mut w, -1200);
+    save_put_f64(&mut w, 3.75);
+    save_put_bool(&mut w, true);
+    save_put_u8(&mut w, 200);
+    save_game_set(&mut sg, "player", w.bytes);
+    var w2: SaveWriter = save_writer();
+    save_put_u32(&mut w2, 7);
+    save_game_set(&mut sg, "level", w2.bytes);
+    val bytes: Vec<i64> = save_game_encode(&sg);
+    println("encoded " + int_to_str(bytes.len()) + " bytes");
+    println("  " + hex_encode_bytes(bytes));
+
+    val back: SaveLoad = save_game_decode(&bytes);
+    println("decoded " + if back.ok { "ok" } else { back.error } + " version " + int_to_str(back.save.version) + " sections " + int_to_str(back.save.names.len()));
+    var r: SaveReader = save_game_reader(&back.save, "player");
+    val name: str = save_get_str(&mut r);
+    val gold: i64 = save_get_i64(&mut r);
+    val x: f64 = save_get_f64(&mut r);
+    val flag: bool = save_get_bool(&mut r);
+    val b: i64 = save_get_u8(&mut r);
+    println("player " + name + " " + int_to_str(gold) + " " + float_to_str(x) + " " + if flag { "true" } else { "false" } + " " + int_to_str(b) + " all read " + if save_reader_done(&r) { "yes" } else { "no" });
+    var r2: SaveReader = save_game_reader(&back.save, "level");
+    println("level " + int_to_str(save_get_u32(&mut r2)) + ", reading past the end: " + int_to_str(save_get_i64(&mut r2)) + " ok " + if r2.ok { "yes" } else { "no" });
+    println("missing section empty: " + if save_game_get(&back.save, "nope").len() == 0 { "yes" } else { "no" });
+
+    // damage
+    var bad: Vec<i64> = bytes;
+    bad.set(30, bad.get(30) ^ 1);
+    println("flipped bit: " + save_game_decode(&bad).error);
+    var badv: Vec<i64> = bytes;
+    badv.set(8, 9);
+    println("changed version: " + save_game_decode(&badv).error);
+    var cut: Vec<i64> = bytes;
+    cut.pop();
+    println("truncated: " + save_game_decode(&cut).error);
+    var magic: Vec<i64> = bytes;
+    magic.set(0, 88);
+    println("magic: " + save_game_decode(&magic).error);
+
+    // migrations
+    var old: SaveGame = save_game_new(1);
+    var wh: SaveWriter = save_writer();
+    save_put_i64(&mut wh, 42);
+    save_game_set(&mut old, "hp", wh.bytes);
+    val m: SaveMigrate = save_game_migrate(&old, 3, migrate);
+    println("migrate 1 -> 3: " + if m.ok { "ok" } else { m.error } + " in " + int_to_str(m.steps) + " steps, version " + int_to_str(m.save.version) + ", has hp " + if save_game_has(&m.save, "hp") { "yes" } else { "no" });
+    var rs: SaveReader = save_game_reader(&m.save, "stats");
+    val hp: i64 = save_get_i64(&mut rs);
+    val maxhp: i64 = save_get_i64(&mut rs);
+    var rg: SaveReader = save_game_reader(&m.save, "gold");
+    println("stats " + int_to_str(hp) + "/" + int_to_str(maxhp) + " gold " + float_to_str(save_get_f64(&mut rg)));
+    val m2: SaveMigrate = save_game_migrate(&old, 3, skips);
+    println("skipping step: " + m2.error);
+    val m5: SaveMigrate = save_game_migrate(&old, 3, refuses);
+    println("failing step: " + m5.error);
+    val m3: SaveMigrate = save_game_migrate(&sg, 2, migrate);
+    println("too new: " + m3.error);
+    val m4: SaveMigrate = save_game_migrate(&sg, 3, migrate);
+    println("already current: " + if m4.ok { "ok" } else { m4.error } + " steps " + int_to_str(m4.steps));
+
+    // files
+    val dir: str = fs_temp_dir(".", "fdsave");
+    val path: str = fs_join(dir, "slot1.sav");
+    println("first write " + if save_game_write_file(path, &sg) { "ok" } else { "FAILED" });
+    val l1: SaveLoad = save_game_read_file(path);
+    println("read " + if l1.ok { "ok" } else { l1.error } + " version " + int_to_str(l1.save.version) + " backup " + if l1.from_backup { "yes" } else { "no" });
+    var sg2: SaveGame = save_game_new(4);
+    save_game_set(&mut sg2, "level", w2.bytes);
+    println("overwrite " + if save_game_write_file(path, &sg2) { "ok" } else { "FAILED" } + ", temp left " + if fs_exists(path + ".tmp") { "yes" } else { "no" } + ", bak left " + if fs_exists(path + ".bak") { "yes" } else { "no" });
+    println("read version " + int_to_str(save_game_read_file(path).save.version));
+    // an interrupted write: the old save renamed to .bak, a torn new file
+    fs_rename(path, path + ".bak");
+    fs_write_bytes(path, cut);
+    val l2: SaveLoad = save_game_read_file(path);
+    println("after a torn write: " + if l2.ok { "ok" } else { l2.error } + " version " + int_to_str(l2.save.version) + " from backup " + if l2.from_backup { "yes" } else { "no" });
+    fs_delete(path);
+    fs_delete(path + ".bak");
+    println("missing: " + save_game_read_file(path).error);
+    println("cleaned up " + if fs_rmdir_all(dir) { "yes" } else { "no" });
+}

@@ -1,0 +1,124 @@
+// LG4: generic methods on traits. `fn choose<U>(self, a: U, b: U) -> U` in
+// a trait keeps its type parameter (parser.fd, TraitMethod.type_params);
+// each impl's method is checked against it (typechecker.fd
+// TypeChecker_check_impl_sig: as many type parameters, no bound the trait
+// lacks, the trait's types read with the impl's names); a call on a value
+// of a concrete type, or through a bound `T: Chooser`, binds U from the
+// arguments (TypeChecker_lg4_method_call) and runs the instantiation for
+// those types (mono.fd: `Pos__choose__str`, ...). A bound on the method's
+// own parameter (`V: Show`) is checked at the call and usable in the body.
+// Through `dyn Chooser` the non-generic methods still dispatch (a generic
+// one cannot be called there: test_trait_generic_method_dyn_fail.fd).
+// Before, `fn choose<U>` in a trait was parsed and dropped, the call's type
+// was `U` (`p.choose(3, 4) + 1` was a type error) and the method was never
+// instantiated (it printed `ptr(..)` for an i64).
+// Expected output:
+// 3
+// 4
+// a
+// b
+// true
+// 2.5
+// 103
+// y!
+// 11
+// 18
+// left
+// right
+// pos Pt(7)
+// neg Pt(7)
+// [1, 2]
+// 1
+// inherent
+// 5
+
+cap Show {
+    fn show(self) -> str;
+}
+
+struct Pt { x: i64 }
+
+impl Show for Pt {
+    fn show(self) -> str { return "Pt(" + int_to_str(self.x) + ")"; }
+}
+
+cap Chooser {
+    fn choose<U>(self, a: U, b: U) -> U;
+    fn label<V: Show>(self, v: V) -> str;
+    fn both<U>(self, a: U, b: U) -> Vec<U>;
+    fn tag(self) -> i64;
+}
+
+struct Pos { n: i64 }
+struct Neg { n: i64 }
+
+impl Chooser for Pos {
+    fn choose<U>(self, a: U, b: U) -> U { return a; }
+    // the impl may name its parameter differently (W for the trait's V)
+    fn label<W: Show>(self, v: W) -> str { return "pos " + v.show(); }
+    fn both<U>(self, a: U, b: U) -> Vec<U> {
+        var out: Vec<U> = Vec::new();
+        out.push(a);
+        out.push(b);
+        return out;
+    }
+    fn tag(self) -> i64 { return self.n; }
+}
+
+impl Chooser for Neg {
+    fn choose<U>(self, a: U, b: U) -> U { return b; }
+    fn label<V: Show>(self, v: V) -> str { return "neg " + v.show(); }
+    fn both<U>(self, a: U, b: U) -> Vec<U> {
+        var out: Vec<U> = Vec::new();
+        out.push(b);
+        out.push(a);
+        return out;
+    }
+    fn tag(self) -> i64 { return 0 - self.n; }
+}
+
+// Through a bound: the instantiation for T = Pos calls Pos__choose__i64
+fn pick_int<T: Chooser>(c: T) -> i64 {
+    return c.choose(10, 20) + c.tag();
+}
+
+fn pick_str<T: Chooser>(c: T, a: str, b: str) -> str {
+    return c.choose(a, b);
+}
+
+// An inherent impl's generic method is instantiated the same way
+struct Holder { v: i64 }
+
+impl Holder {
+    fn same<U>(self, a: U) -> U { return a; }
+}
+
+fn main() -> i64 {
+    val p = Pos { n: 1 };
+    val q = Neg { n: 2 };
+    println(p.choose(3, 4));
+    println(q.choose(3, 4));
+    println(p.choose("a", "b"));
+    println(q.choose("a", "b"));
+    println(p.choose(true, false));
+    val f: f64 = q.choose(1.5, 2.5);
+    println(f);
+    println(p.choose(3, 4) + 100);
+    val s: str = q.choose("x", "y");
+    println(s + "!");
+    println(pick_int(p));
+    println(pick_int(q));
+    println(pick_str(p, "left", "right"));
+    println(pick_str(q, "left", "right"));
+    val pt = Pt { x: 7 };
+    println(p.label(pt));
+    println(q.label(pt));
+    val v: Vec<i64> = p.both(1, 2);
+    println(v);
+    val h = Holder { v: 0 };
+    val d = p as dyn Chooser;
+    println(d.tag());
+    println(h.same("inherent"));
+    println(h.same(5));
+    return 0;
+}

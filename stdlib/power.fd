@@ -1,0 +1,433 @@
+// Fides MCU clock tree and low-power mode model, pure Fides.
+//
+// Clocks:
+//   - PLL math with the constraints of the STM32F4 main PLL (RM0090
+//     6.3.2): f_vco_in = f_in / M must be 1..2 MHz (M 2..63), f_vco =
+//     f_vco_in * N in 100..432 MHz (N 50..432), f_sys = f_vco / P with P in
+//     {2, 4, 6, 8}, f_usb = f_vco / Q (Q 2..15) wanted at exactly 48 MHz.
+//     pll_solve searches every (M, N, P, Q) for an exact system clock,
+//     preferring an exact 48 MHz USB clock and then the highest VCO input
+//     (less jitter).
+//   - bus prescalers: AHB {1..512}, APB1/APB2 {1..16}, the timer clock
+//     rule (x2 when the APB prescaler is not 1), bus limits, and the flash
+//     wait states the HCLK needs at a supply voltage range.
+//   - a generic clock tree (sources, PLLs as num/den multipliers,
+//     dividers, muxes, gates) with per-node maximum frequencies:
+//     frequencies are computed through the tree and every limit checked.
+// Power:
+//   - the Cortex-M / STM32 low-power modes RUN, SLEEP, STOP, STANDBY and
+//     the rules between them: SLEEP and STOP are entered from RUN only
+//     (WFI/WFE; STOP and STANDBY with SLEEPDEEP), a pending enabled
+//     interrupt makes WFI return at once, STOP needs an enabled EXTI
+//     wakeup line, STANDBY one of the wakeup sources (WKUP pin, RTC alarm,
+//     IWDG, reset) and a cleared wakeup flag; waking from STOP leaves the
+//     system on the internal HSI oscillator (the PLL must be restarted),
+//     waking from STANDBY is a reset and SRAM is lost;
+//   - current per mode and the average current and battery life of a
+//     duty cycle.
+//
+// The seam: writing RCC/PWR registers and executing WFI are the port's;
+// these functions decide values and check sequences.
+
+module power;
+ use vec; use string;
+
+// ─── PLL ────────────────────────────────────────────────────────────────
+
+pub struct PllConfig {
+    pub ok: bool,
+    pub m: i64,
+    pub n: i64,
+    pub p: i64,
+    pub q: i64,
+    pub vco: i64,
+    pub sys: i64,
+    pub usb: i64,
+}
+
+fn pll_none() -> PllConfig {
+    return PllConfig { ok: false, m: 0, n: 0, p: 0, q: 0, vco: 0, sys: 0, usb: 0 };
+}
+
+/// Check one configuration against the limits; "" when valid.
+pub fn pll_check(fin: i64, m: i64, n: i64, p: i64, q: i64, sys_max: i64) -> str {
+    if m < 2 || m > 63 { return "M out of 2..63"; }
+    if n < 50 || n > 432 { return "N out of 50..432"; }
+    if p != 2 && p != 4 && p != 6 && p != 8 { return "P must be 2, 4, 6 or 8"; }
+    if q < 2 || q > 15 { return "Q out of 2..15"; }
+    val vin: i64 = fin / m;
+    if vin < 1000000 || vin > 2000000 { return "VCO input " + int_to_str(vin) + " Hz out of 1..2 MHz"; }
+    val vco: i64 = fin * n / m;
+    if vco < 100000000 || vco > 432000000 { return "VCO " + int_to_str(vco) + " Hz out of 100..432 MHz"; }
+    if vco / p > sys_max { return "system clock above " + int_to_str(sys_max); }
+    if vco / q > 48000000 { return "USB clock above 48 MHz"; }
+    return "";
+}
+
+/// Find (M, N, P, Q) giving exactly `target` Hz from `fin` Hz.
+pub fn pll_solve(fin: i64, target: i64, sys_max: i64) -> PllConfig {
+    var best: PllConfig = pll_none();
+    var best_score: i64 = -1;
+    var m: i64 = 2;
+    while m <= 63 {
+        val vin: i64 = fin / m;
+        if fin % m == 0 && vin >= 1000000 && vin <= 2000000 {
+            var p: i64 = 2;
+            while p <= 8 {
+                val vco: i64 = target * p;
+                if vco >= 100000000 && vco <= 432000000 && vco % vin == 0 {
+                    val n: i64 = vco / vin;
+                    if n >= 50 && n <= 432 {
+                        // Q: exact 48 MHz if possible, else the closest below.
+                        var q: i64 = (vco + 47999999) / 48000000;
+                        if q < 2 { q = 2; }
+                        if q <= 15 {
+                            val usb: i64 = vco / q;
+                            var score: i64 = vin / 1000;
+                            if vco % 48000000 == 0 && usb == 48000000 { score = score + 10000000; }
+                            if score > best_score && str_len(pll_check(fin, m, n, p, q, sys_max)) == 0 {
+                                best_score = score;
+                                best = PllConfig { ok: true, m: m, n: n, p: p, q: q, vco: vco, sys: target, usb: usb };
+                            }
+                        }
+                    }
+                }
+                p = p + 2;
+            }
+        }
+        m = m + 1;
+    }
+    return best;
+}
+
+/// RCC_PLLCFGR value (STM32F4): M[5:0], N[14:6], P[17:16] ((P/2)-1),
+/// PLLSRC[22] (1 = HSE), Q[27:24].
+pub fn pll_cfgr(c: PllConfig, hse: bool) -> i64 {
+    var v: i64 = c.m | (c.n << 6) | (((c.p / 2) - 1) << 16) | (c.q << 24);
+    if hse { v = v | (1 << 22); }
+    return v;
+}
+
+// ─── Buses ──────────────────────────────────────────────────────────────
+
+pub fn ahb_prescaler_ok(d: i64) -> bool {
+    return d == 1 || d == 2 || d == 4 || d == 8 || d == 16 || d == 64 || d == 128 || d == 256 || d == 512;
+}
+
+pub fn apb_prescaler_ok(d: i64) -> bool {
+    return d == 1 || d == 2 || d == 4 || d == 8 || d == 16;
+}
+
+pub struct BusClocks {
+    pub ok: bool,
+    pub why: str,
+    pub hclk: i64,
+    pub pclk1: i64,
+    pub pclk2: i64,
+    pub tim1: i64,
+    pub tim2: i64,
+    pub wait_states: i64,
+}
+
+/// Flash wait states for HCLK at a voltage range (STM32F4 table 10):
+/// 30 MHz per wait state at 2.7-3.6 V, 24 at 2.4-2.7, 22 at 2.1-2.4,
+/// 20 at 1.8-2.1 (mv = supply in millivolts).
+pub fn flash_wait_states(hclk: i64, mv: i64) -> i64 {
+    var step: i64 = 20000000;
+    if mv >= 2700 { step = 30000000; } else if mv >= 2400 { step = 24000000; } else if mv >= 2100 { step = 22000000; }
+    if hclk <= 0 { return 0; }
+    return (hclk - 1) / step;
+}
+
+/// The bus clocks from SYSCLK and prescalers, checked against the limits
+/// (HCLK <= sys_max, PCLK1 <= apb1_max, PCLK2 <= apb2_max).
+pub fn bus_clocks(sysclk: i64, ahb: i64, apb1: i64, apb2: i64, sys_max: i64, apb1_max: i64, apb2_max: i64, mv: i64) -> BusClocks {
+    var b: BusClocks = BusClocks { ok: true, why: "", hclk: 0, pclk1: 0, pclk2: 0, tim1: 0, tim2: 0, wait_states: 0 };
+    if !ahb_prescaler_ok(ahb) || !apb_prescaler_ok(apb1) || !apb_prescaler_ok(apb2) {
+        b.ok = false;
+        b.why = "invalid prescaler";
+        return b;
+    }
+    b.hclk = sysclk / ahb;
+    b.pclk1 = b.hclk / apb1;
+    b.pclk2 = b.hclk / apb2;
+    b.tim1 = b.pclk1;
+    if apb1 != 1 { b.tim1 = 2 * b.pclk1; }
+    b.tim2 = b.pclk2;
+    if apb2 != 1 { b.tim2 = 2 * b.pclk2; }
+    b.wait_states = flash_wait_states(b.hclk, mv);
+    if b.hclk > sys_max { b.ok = false; b.why = "HCLK above " + int_to_str(sys_max); }
+    else if b.pclk1 > apb1_max { b.ok = false; b.why = "PCLK1 " + int_to_str(b.pclk1) + " above " + int_to_str(apb1_max); }
+    else if b.pclk2 > apb2_max { b.ok = false; b.why = "PCLK2 " + int_to_str(b.pclk2) + " above " + int_to_str(apb2_max); }
+    return b;
+}
+
+/// The smallest APB prescaler keeping PCLK <= max.
+pub fn apb_prescaler_for(hclk: i64, max: i64) -> i64 {
+    var d: i64 = 1;
+    while d <= 16 {
+        if hclk / d <= max { return d; }
+        d = d * 2;
+    }
+    return -1;
+}
+
+// ─── Generic clock tree ─────────────────────────────────────────────────
+
+pub const CLK_SOURCE: i64 = 0;
+pub const CLK_MUL: i64 = 1;
+pub const CLK_DIV: i64 = 2;
+pub const CLK_MUX: i64 = 3;
+pub const CLK_GATE: i64 = 4;
+
+pub struct ClkNode {
+    pub name: str,
+    pub kind: i64,
+    pub parents: Vec<i64>,
+    pub sel: i64,
+    pub num: i64,
+    pub den: i64,
+    pub hz: i64,
+    pub on: bool,
+    pub max_hz: i64,
+}
+
+pub struct ClockTree {
+    pub nodes: Vec<ClkNode>,
+}
+
+pub fn clktree_new() -> ClockTree {
+    return ClockTree { nodes: Vec::new() };
+}
+
+fn clk_add(t: &mut ClockTree, n: ClkNode) -> i64 {
+    t.nodes.push(n);
+    return t.nodes.len() - 1;
+}
+
+fn clk_node(name: str, kind: i64) -> ClkNode {
+    return ClkNode { name: name, kind: kind, parents: Vec::new(), sel: 0, num: 1, den: 1, hz: 0, on: true, max_hz: 0 };
+}
+
+pub fn clk_source(t: &mut ClockTree, name: str, hz: i64) -> i64 {
+    var n: ClkNode = clk_node(name, CLK_SOURCE);
+    n.hz = hz;
+    return clk_add(t, n);
+}
+
+/// A node multiplying its parent by num/den (a PLL).
+pub fn clk_mul(t: &mut ClockTree, name: str, parent: i64, num: i64, den: i64, max_hz: i64) -> i64 {
+    var n: ClkNode = clk_node(name, CLK_MUL);
+    n.parents.push(parent);
+    n.num = num;
+    n.den = den;
+    n.max_hz = max_hz;
+    return clk_add(t, n);
+}
+
+pub fn clk_div(t: &mut ClockTree, name: str, parent: i64, div: i64, max_hz: i64) -> i64 {
+    var n: ClkNode = clk_node(name, CLK_DIV);
+    n.parents.push(parent);
+    n.den = div;
+    n.max_hz = max_hz;
+    return clk_add(t, n);
+}
+
+pub fn clk_mux(t: &mut ClockTree, name: str, parents: Vec<i64>, sel: i64, max_hz: i64) -> i64 {
+    var n: ClkNode = clk_node(name, CLK_MUX);
+    n.parents = parents;
+    n.sel = sel;
+    n.max_hz = max_hz;
+    return clk_add(t, n);
+}
+
+pub fn clk_gate(t: &mut ClockTree, name: str, parent: i64, on: bool) -> i64 {
+    var n: ClkNode = clk_node(name, CLK_GATE);
+    n.parents.push(parent);
+    n.on = on;
+    return clk_add(t, n);
+}
+
+/// Change a multiplier's num/den or a divider's den.
+pub fn clk_set_ratio(t: &mut ClockTree, id: i64, num: i64, den: i64) {
+    var n: ClkNode = t.nodes.get(id);
+    n.num = num;
+    n.den = den;
+    t.nodes.set(id, n);
+}
+
+pub fn clk_set(t: &mut ClockTree, id: i64, on: bool) {
+    var n: ClkNode = t.nodes.get(id);
+    n.on = on;
+    t.nodes.set(id, n);
+}
+
+pub fn clk_select(t: &mut ClockTree, id: i64, sel: i64) {
+    var n: ClkNode = t.nodes.get(id);
+    n.sel = sel;
+    t.nodes.set(id, n);
+}
+
+/// Frequency of a node (0 when gated off or a source is off).
+pub fn clk_freq(t: &ClockTree, id: i64) -> i64 {
+    val n: ClkNode = t.nodes.get(id);
+    if !n.on { return 0; }
+    if n.kind == CLK_SOURCE { return n.hz; }
+    if n.kind == CLK_MUX { return clk_freq(t, n.parents.get(n.sel)); }
+    val p: i64 = clk_freq(t, n.parents.get(0));
+    if n.kind == CLK_MUL { return p * n.num / n.den; }
+    if n.kind == CLK_DIV { return p / n.den; }
+    return p;
+}
+
+pub fn clk_find(t: &ClockTree, name: str) -> i64 {
+    var i: i64 = 0;
+    while i < t.nodes.len() {
+        if str_equal(t.nodes.get(i).name, name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Every node above its maximum: "name: f > max".
+pub fn clk_check(t: &ClockTree) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < t.nodes.len() {
+        val n: ClkNode = t.nodes.get(i);
+        val f: i64 = clk_freq(t, i);
+        if n.max_hz > 0 && f > n.max_hz { out.push(n.name + ": " + int_to_str(f) + " > " + int_to_str(n.max_hz)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ─── Low-power modes ────────────────────────────────────────────────────
+
+pub const PM_RUN: i64 = 0;
+pub const PM_SLEEP: i64 = 1;
+pub const PM_STOP: i64 = 2;
+pub const PM_STANDBY: i64 = 3;
+
+pub const WAKE_IRQ: i64 = 1;
+pub const WAKE_EXTI: i64 = 2;
+pub const WAKE_RTC: i64 = 4;
+pub const WAKE_PIN: i64 = 8;
+pub const WAKE_IWDG: i64 = 16;
+pub const WAKE_RESET: i64 = 32;
+
+pub fn pm_name(m: i64) -> str {
+    val n: Vec<str> = str_split("RUN,SLEEP,STOP,STANDBY", ",");
+    return n.get(m);
+}
+
+pub struct PowerSim {
+    pub mode: i64,
+    pub sysclk_src: str,
+    pub ram_ok: bool,
+    pub irq_pending: bool,
+    pub exti_enabled: bool,
+    pub wake_sources: i64,
+    pub wuf: bool,
+    pub resets: i64,
+    pub log: Vec<str>,
+}
+
+pub fn powersim_new() -> PowerSim {
+    return PowerSim { mode: PM_RUN, sysclk_src: "PLL", ram_ok: true, irq_pending: false, exti_enabled: false, wake_sources: WAKE_RESET, wuf: false, resets: 0, log: Vec::new() };
+}
+
+/// Try to enter a mode; false (with the reason logged) when the rules
+/// forbid it or WFI returns at once.
+pub fn power_enter(s: &mut PowerSim, m: i64) -> bool {
+    if s.mode != PM_RUN {
+        s.log.push(pm_name(m) + " refused: only entered from RUN (now " + pm_name(s.mode) + ")");
+        return false;
+    }
+    if m == PM_RUN { return true; }
+    if s.irq_pending && m != PM_STANDBY {
+        s.log.push(pm_name(m) + ": WFI returned at once (interrupt pending)");
+        return false;
+    }
+    if m == PM_STOP && !s.exti_enabled && (s.wake_sources & WAKE_RTC) == 0 {
+        s.log.push("STOP refused: no EXTI or RTC wakeup enabled, only a reset would end it");
+        return false;
+    }
+    if m == PM_STANDBY {
+        if s.wuf {
+            s.log.push("STANDBY refused: clear the wakeup flag (WUF) first");
+            return false;
+        }
+        if (s.wake_sources & (WAKE_PIN | WAKE_RTC | WAKE_IWDG)) == 0 {
+            s.log.push("STANDBY warning: only a reset wakes it");
+        }
+    }
+    s.mode = m;
+    s.log.push("enter " + pm_name(m));
+    return true;
+}
+
+/// A wakeup event; false when it does not wake the current mode.
+pub fn power_wake(s: &mut PowerSim, src: i64) -> bool {
+    if s.mode == PM_RUN { return false; }
+    if s.mode == PM_SLEEP {
+        if src == WAKE_IRQ || src == WAKE_EXTI || src == WAKE_RTC || src == WAKE_RESET {
+            s.mode = PM_RUN;
+            s.log.push("wake from SLEEP: clocks unchanged");
+            return true;
+        }
+        return false;
+    }
+    if s.mode == PM_STOP {
+        if (src == WAKE_EXTI && s.exti_enabled) || (src == WAKE_RTC && (s.wake_sources & WAKE_RTC) != 0) || src == WAKE_RESET {
+            s.mode = PM_RUN;
+            if src == WAKE_RESET {
+                s.resets = s.resets + 1;
+                s.log.push("reset during STOP");
+            } else {
+                s.log.push("wake from STOP: SYSCLK = HSI, restart the PLL");
+            }
+            s.sysclk_src = "HSI";
+            return true;
+        }
+        return false;
+    }
+    // STANDBY: only its wakeup sources and reset; waking is a reset.
+    if src == WAKE_RESET || (src & s.wake_sources & (WAKE_PIN | WAKE_RTC | WAKE_IWDG)) != 0 {
+        s.mode = PM_RUN;
+        s.ram_ok = false;
+        s.sysclk_src = "HSI";
+        s.resets = s.resets + 1;
+        s.wuf = src != WAKE_RESET;
+        s.log.push("wake from STANDBY: reset, SRAM lost, WUF=" + bool_to_str(s.wuf));
+        return true;
+    }
+    return false;
+}
+
+/// After waking from STOP: switch back to the PLL.
+pub fn power_restore_pll(s: &mut PowerSim) {
+    s.sysclk_src = "PLL";
+    s.log.push("SYSCLK = PLL");
+}
+
+/// Average current in nA of a cycle spending `durations[i]` microseconds in
+/// `modes[i]`, given the current in nA of each mode (index by mode).
+pub fn power_average_na(modes: Vec<i64>, durations: Vec<i64>, current_na: Vec<i64>) -> i64 {
+    var charge: i64 = 0;
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while i < modes.len() {
+        charge = charge + current_na.get(modes.get(i)) * durations.get(i);
+        total = total + durations.get(i);
+        i = i + 1;
+    }
+    if total == 0 { return 0; }
+    return charge / total;
+}
+
+/// Hours a battery of `mah` lasts at an average current of `avg_na`.
+pub fn power_battery_hours(mah: i64, avg_na: i64) -> i64 {
+    if avg_na <= 0 { return -1; }
+    return mah * 1000000 / avg_na;
+}

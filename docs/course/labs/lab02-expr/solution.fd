@@ -1,0 +1,111 @@
+// Lab 2 solution: an expression evaluator that cannot panic.
+//! lab: 2
+//! check: runs
+//! playground: yes
+
+enum Expr {
+    Num(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Div(Box<Expr>, Box<Expr>),
+    Neg(Box<Expr>),
+}
+
+fn eval(e: &Expr) -> Result<i64, str> {
+    match e {
+        Expr::Num(n) => { return Result::Ok(n); }
+        Expr::Add(a, b) => {
+            val x: i64 = eval(a)?;
+            val y: i64 = eval(b)?;
+            return Result::Ok(x + y);
+        }
+        Expr::Mul(a, b) => {
+            val x: i64 = eval(a)?;
+            val y: i64 = eval(b)?;
+            return Result::Ok(x * y);
+        }
+        Expr::Div(a, b) => {
+            val x: i64 = eval(a)?;
+            val y: i64 = eval(b)?;
+            if y == 0 { return Result::Err("division by zero"); }
+            return Result::Ok(x / y);
+        }
+        Expr::Neg(a) => {
+            val x: i64 = eval(a)?;
+            return Result::Ok(0 - x);
+        }
+    }
+}
+
+fn show(e: &Expr) -> str {
+    match e {
+        Expr::Num(n) => { return int_to_str(n); }
+        Expr::Add(a, b) => { return "(" + show(a) + " + " + show(b) + ")"; }
+        Expr::Mul(a, b) => { return "(" + show(a) + " * " + show(b) + ")"; }
+        Expr::Div(a, b) => { return "(" + show(a) + " / " + show(b) + ")"; }
+        Expr::Neg(a) => { return "-" + show(a); }
+    }
+}
+
+fn is_num(e: &Expr, k: i64) -> bool {
+    match e {
+        Expr::Num(n) => { return n == k; }
+        _ => { return false; }
+    }
+}
+
+// Every recursive call is on a strict subtree of `e`, so simplify
+// terminates; each rule only removes nodes.
+fn simplify(e: &Expr) -> Expr {
+    match e {
+        Expr::Num(n) => { return Expr::Num(n); }
+        Expr::Add(a, b) => {
+            val x: Expr = simplify(a);
+            val y: Expr = simplify(b);
+            if is_num(&y, 0) { return x; }
+            if is_num(&x, 0) { return y; }
+            return Expr::Add(Box::new(x), Box::new(y));
+        }
+        Expr::Mul(a, b) => {
+            val x: Expr = simplify(a);
+            val y: Expr = simplify(b);
+            if is_num(&y, 1) { return x; }
+            if is_num(&x, 1) { return y; }
+            return Expr::Mul(Box::new(x), Box::new(y));
+        }
+        Expr::Div(a, b) => {
+            return Expr::Div(Box::new(simplify(a)), Box::new(simplify(b)));
+        }
+        Expr::Neg(a) => {
+            match a {
+                Expr::Neg(inner) => { return simplify(inner); }
+                _ => { return Expr::Neg(Box::new(simplify(a))); }
+            }
+        }
+    }
+}
+
+fn num(n: i64) -> Box<Expr> { return Box::new(Expr::Num(n)); }
+
+fn report(e: &Expr) {
+    match eval(e) {
+        Result::Ok(v) => { println(show(e) + " = " + int_to_str(v)); }
+        Result::Err(msg) => {
+            val why: str = msg;
+            println(show(e) + ": error: " + why);
+        }
+    }
+}
+
+fn main() -> i64 {
+    val e1: Expr = Expr::Mul(Box::new(Expr::Add(num(2), num(3))), Box::new(Expr::Neg(num(4))));
+    report(&e1);
+    val e2: Expr = Expr::Div(Box::new(Expr::Add(num(7), num(5))), num(4));
+    report(&e2);
+    val e3: Expr = Expr::Div(num(1), Box::new(Expr::Add(num(2), Box::new(Expr::Neg(num(2))))));
+    report(&e3);
+    val messy: Expr = Expr::Add(Box::new(Expr::Mul(Box::new(Expr::Neg(Box::new(Expr::Neg(num(9))))), num(1))), num(0));
+    val tidy: Expr = simplify(&messy);
+    println(show(&messy) + "  simplifies to  " + show(&tidy));
+    return 0;
+}

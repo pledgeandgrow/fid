@@ -1,0 +1,133 @@
+// stdlib/net (release I9): the reliable layer over UDP. Two connections with
+// no socket (sock -1) queue the packets they would send; the test moves them
+// by hand, so it runs without a network. Checked: the wire format, an ACK
+// that clears the sender's pending message, a duplicate that is re-ACKed
+// but not delivered twice, a lost packet sent again by net_reliable_update,
+// PING/PONG, the round-trip estimate from an ACK, and short packets ignored.
+//
+// Expected output:
+// packet 0 0 0 1 44 9 7
+// id 300
+// send 7 pending 1 queued 1
+// recv kind 2 id 1 len 2 bytes 9 7
+// ack queued 1 type 1 id 1
+// ack kind 1 pending 0
+// dup kind 3 len 0 acked again 1
+// lost: pending 1 retransmits 1 type 0 id 2
+// early update sends 0
+// delivered after loss 2 payload 5
+// pending after update 0
+// ping kind 4 pong type 3 id 77
+// pong kind 5
+// rtt 925
+// short kind 0 unknown kind 0
+use net;
+
+fn show(label: str, v: Vec<i64>) -> str {
+    var out: str = label;
+    var i: i64 = 0;
+    while i < v.len() {
+        out = out + " " + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(ok: bool, what: str) {
+    if !ok {
+        p_panic("net reliable: " + what);
+    }
+}
+
+fn main() -> i64 {
+    // The wire format: type byte, big-endian u32 id, payload
+    var pl: Vec<i64> = Vec::new();
+    pl.push(9);
+    pl.push(7);
+    var p: Vec<i64> = net_reliable_packet(MSG_TYPE_DATA, 300, pl);
+    println(show("packet", p));
+    println("id " + int_to_str(net_reliable_packet_id(p)));
+    check(p.len() == NET_RELIABLE_HEADER + 2, "packet length");
+
+    var a: ReliableConnection = net_reliable_create(- 1, net_addr_none());
+    var b: ReliableConnection = net_reliable_create(- 1, net_addr_none());
+
+    // a sends message 1 to b
+    val sent: i64 = net_reliable_send_at(& mut a, pl, 1000);
+    val qa: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut a);
+    println("send " + int_to_str(sent) + " pending " + int_to_str(net_reliable_pending_count(& a)) + " queued " + int_to_str(qa.len()));
+    check(qa.len() == 1, "one packet queued");
+    val pkt1: Vec<i64> = qa.get(0);
+
+    // b receives it: delivered once, and an ACK goes back
+    val r1: NetReceived = net_reliable_recv(& mut b, pkt1);
+    println(show("recv kind " + int_to_str(r1.kind) + " id " + int_to_str(r1.msg_id) + " len " + int_to_str(r1.data.len()) + " bytes", r1.data));
+    check(r1.kind == NET_RECV_DATA, "data delivered");
+    val qb: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut b);
+    check(qb.len() == 1, "one ACK");
+    val ack1: Vec<i64> = qb.get(0);
+    println("ack queued " + int_to_str(qb.len()) + " type " + int_to_str(ack1.get(0)) + " id " + int_to_str(net_reliable_packet_id(ack1)));
+
+    // the ACK reaches a: nothing pending any more (RTT sample: 1040 - 1000)
+    val r2: NetReceived = net_reliable_recv_at(& mut a, ack1, 1040);
+    println("ack kind " + int_to_str(r2.kind) + " pending " + int_to_str(net_reliable_pending_count(& a)));
+    check(r2.kind == NET_RECV_ACK, "ack recognised");
+    check(net_reliable_pending_count(& a) == 0, "ack clears pending");
+
+    // the same DATA again (as if the ACK had been lost): ACKed, not delivered
+    val r3: NetReceived = net_reliable_recv(& mut b, pkt1);
+    val qb2: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut b);
+    println("dup kind " + int_to_str(r3.kind) + " len " + int_to_str(r3.data.len()) + " acked again " + int_to_str(qb2.len()));
+    check(r3.kind == NET_RECV_DUPLICATE, "duplicate spotted");
+
+    // message 2 is lost on the way: net_reliable_update sends it again
+    var pl2: Vec<i64> = Vec::new();
+    pl2.push(5);
+    net_reliable_send_at(& mut a, pl2, 2000);
+    net_reliable_take_outgoing(& mut a);
+    // not yet timed out (timeout 200 ms): nothing is sent
+    net_reliable_update(& mut a, 2100);
+    val early: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut a);
+    net_reliable_update(& mut a, 2300);
+    val again: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut a);
+    check(again.len() == 1, "one retransmission");
+    val re: Vec<i64> = again.get(0);
+    println("lost: pending " + int_to_str(net_reliable_pending_count(& a)) + " retransmits " + int_to_str(again.len()) + " type " + int_to_str(re.get(0)) + " id " + int_to_str(net_reliable_packet_id(re)));
+    println("early update sends " + int_to_str(early.len()));
+    val r4: NetReceived = net_reliable_recv(& mut b, re);
+    println(show("delivered after loss " + int_to_str(r4.kind) + " payload", r4.data));
+    check(r4.kind == NET_RECV_DATA, "retransmission delivered");
+    val qb3: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut b);
+    // the ACK of a retransmitted message gives no RTT sample (Karn)
+    net_reliable_recv_at(& mut a, qb3.get(0), 9999);
+    net_reliable_update(& mut a, 2400);
+    println("pending after update " + int_to_str(net_reliable_pending_count(& a)));
+    check(a.pending.len() == 0, "acked messages forgotten");
+
+    // PING is answered with a PONG of the same id
+    net_reliable_ping(& mut a, 77);
+    val pings: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut a);
+    val r5: NetReceived = net_reliable_recv(& mut b, pings.get(0));
+    val pongs: Vec<Vec<i64>> = net_reliable_take_outgoing(& mut b);
+    val pong: Vec<i64> = pongs.get(0);
+    println("ping kind " + int_to_str(r5.kind) + " pong type " + int_to_str(pong.get(0)) + " id " + int_to_str(net_reliable_packet_id(pong)));
+    val r6: NetReceived = net_reliable_recv(& mut a, pong);
+    println("pong kind " + int_to_str(r6.kind));
+
+    // rtt: 100 * 0.875 + 40 * 0.125 = 92.5, and no sample from the
+    // retransmitted message (printed in tenths of a ms)
+    val rtt10: i64 = (net_reliable_rtt(& a) * 10.0) as i64;
+    println("rtt " + int_to_str(rtt10));
+    check(rtt10 == 925, "rtt estimate");
+
+    // too short for a header, and an unknown type: ignored, nothing sent
+    var short: Vec<i64> = Vec::new();
+    short.push(0);
+    short.push(1);
+    val r7: NetReceived = net_reliable_recv(& mut b, short);
+    val odd: Vec<i64> = net_reliable_packet(9, 5, Vec::new());
+    val r8: NetReceived = net_reliable_recv(& mut b, odd);
+    println("short kind " + int_to_str(r7.kind) + " unknown kind " + int_to_str(r8.kind));
+    check(net_reliable_take_outgoing(& mut b).len() == 0, "nothing answered");
+    return 0;
+}

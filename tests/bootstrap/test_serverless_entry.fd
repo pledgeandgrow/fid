@@ -1,0 +1,44 @@
+// Roadmap Phase 9 (serverless, F32), the cold-start side: a @serverless
+// handler that `fid emit|build|ccompile <file> --entry handle_request` makes
+// the entry point (compiler/main.fd entry_wrap_source). Run as a whole
+// program, main calls the handler twice and a report only main uses; built
+// with --entry, the executable answers one request (argv[1], else a line of
+// stdin) and neither main nor main_only_report is lowered
+// (tests/tooling/serverless-entry-check.sh, bench/coldstart.sh).
+// Expected output:
+//   200 /hello 11
+//   404 /missing 0
+//   report: 2 requests
+
+const MAX_BODY: i64 = 1024;
+var GREETING: str = "hello world";
+
+fn route(path: str) -> i64 {
+    if path == "/hello" {
+        return 200;
+    }
+    return 404;
+}
+
+@serverless
+fn handle_request(path: str) -> str {
+    val status: i64 = route(path);
+    var body_len: i64 = 0;
+    if status == 200 {
+        body_len = str_len(GREETING);
+    }
+    if body_len > MAX_BODY {
+        body_len = MAX_BODY;
+    }
+    return int_to_str(status) + " " + path + " " + int_to_str(body_len);
+}
+
+fn main_only_report(n: i64) -> str {
+    return "report: " + int_to_str(n) + " requests";
+}
+
+fn main() {
+    println(handle_request("/hello"));
+    println(handle_request("/missing"));
+    println(main_only_report(2));
+}

@@ -1,0 +1,142 @@
+// stdlib/framebuffer: pixel formats, drawing with clipping, blits, overlapping copies, scrolling, the 8x16 font and the text console on in-memory framebuffers.
+// Expected output:
+// pack 0x123456: xrgb 0x123456 xbgr 0x563412 rgb565 0x11aa bgr565 0x51a2 rgb555 0x8ca
+// unpack rgb565 0x11aa -> 0x103452, rgb555 0x7fff -> 0xffffff
+// xrgb bytes at (1,0): 56 34 12 00, rgb888 at (1,0): 56 34 12, pitch 128 96
+// clipped fill 12, corner fill 16, outline 16, diagonal 4, blit 4 (31,9)=0x00ff00
+// copy overlap: 1 2 1 2 3 4 5 6
+// scroll rows: 0x202020 0x303030 0x404040 0x505050 0xffffff 0xffffff
+// glyph A: 38 38 44 44 44 44 7c 7c 44 44 44 44 44 44 00 00
+// A pixels 36, '?' for 200 true
+// console 8x3
+// row0 'fides' row1 'X' row2 'line3' scrolls 1 cursor 5,2
+// pixel f (3,0) 0xadaaad (0,0) 0x0
+// red R fg 0xaa0000 drawn 0xad0000, reset fg 0xaaaaaa
+// cursor after ESC[2;3H 2,1 row1 'X Z'
+// after ESC[2J row0 '' cursor 0,0
+use framebuffer;
+use vec;
+use string;
+
+fn h(v: i64) -> str {
+    return "0x" + int_to_hex(v);
+}
+
+fn b2(v: i64) -> str {
+    val d: str = "0123456789abcdef";
+    var o: Vec<i64> = Vec::new();
+    o.push(str_byte_at(d, (v >> 4) & 15));
+    o.push(str_byte_at(d, v & 15));
+    return str_from_bytes(o);
+}
+
+fn count(fb: &Framebuffer, rgb: i64) -> i64 {
+    var n: i64 = 0;
+    var y: i64 = 0;
+    while y < fb.height {
+        var x: i64 = 0;
+        while x < fb.width {
+            if fb_get_pixel(fb, x, y) == rgb { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return n;
+}
+
+fn main() {
+    val c: i64 = 0x123456;
+    println("pack 0x123456: xrgb " + h(fb_pack(&fb_format(FB_XRGB8888), c)) + " xbgr " + h(fb_pack(&fb_format(FB_XBGR8888), c)) + " rgb565 " + h(fb_pack(&fb_format(FB_RGB565), c)) + " bgr565 " + h(fb_pack(&fb_format(FB_BGR565), c)) + " rgb555 " + h(fb_pack(&fb_format(FB_RGB555), c)));
+    println("unpack rgb565 0x11aa -> " + h(fb_unpack(&fb_format(FB_RGB565), 0x11AA)) + ", rgb555 0x7fff -> " + h(fb_unpack(&fb_format(FB_RGB555), 0x7FFF)));
+    var fx: Framebuffer = fb_new(32, 2, FB_XRGB8888);
+    fb_put_pixel(&mut fx, 1, 0, c);
+    var fy: Framebuffer = fb_new(32, 2, FB_RGB888);
+    fb_put_pixel(&mut fy, 1, 0, c);
+    println("xrgb bytes at (1,0): " + b2(fx.mem.get(4)) + " " + b2(fx.mem.get(5)) + " " + b2(fx.mem.get(6)) + " " + b2(fx.mem.get(7)) + ", rgb888 at (1,0): " + b2(fy.mem.get(3)) + " " + b2(fy.mem.get(4)) + " " + b2(fy.mem.get(5)) + ", pitch " + int_to_str(fx.pitch) + " " + int_to_str(fy.pitch));
+
+    var fb: Framebuffer = fb_new(32, 16, FB_RGB565);
+    fb_fill_rect(&mut fb, -2, -2, 6, 5, 0xF80000);
+    val n1: i64 = count(&fb, 0xFF0000);
+    fb_fill_rect(&mut fb, 28, 12, 10, 10, 0x00FC00);
+    val n2: i64 = count(&fb, 0x00FF00);
+    fb_rect(&mut fb, 10, 4, 6, 4, 0x0000F8);
+    val n3: i64 = count(&fb, 0x0000FF);
+    fb_line(&mut fb, 16, 0, 19, 3, 0xFFFFFF);
+    val n4: i64 = count(&fb, 0xFFFFFF);
+    var img: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 6 {
+        if k == 4 { img.push(0x00FF00); } else { img.push(0xF8FC00); }
+        k = k + 1;
+    }
+    fb_blit(&mut fb, 30, 8, 3, 2, img);
+    val n5: i64 = count(&fb, 0xFFFF00) + count(&fb, 0x00FF00) - n2;
+    println("clipped fill " + int_to_str(n1) + ", corner fill " + int_to_str(n2) + ", outline " + int_to_str(n3) + ", diagonal " + int_to_str(n4) + ", blit " + int_to_str(n5) + " (31,9)=" + "0x" + str_pad_left(int_to_hex(fb_get_pixel(&fb, 31, 9)), 6, 48));
+
+    var cf: Framebuffer = fb_new(8, 1, FB_XRGB8888);
+    k = 0;
+    while k < 6 {
+        fb_put_pixel(&mut cf, k, 0, k + 1);
+        k = k + 1;
+    }
+    fb_copy_rect(&mut cf, 0, 0, 6, 1, 2, 0);
+    var row: str = "copy overlap:";
+    k = 0;
+    while k < 8 {
+        row = row + " " + int_to_str(fb_get_pixel(&cf, k, 0));
+        k = k + 1;
+    }
+    println(row);
+
+    var sf: Framebuffer = fb_new(4, 6, FB_XRGB8888);
+    k = 0;
+    while k < 6 {
+        fb_fill_rect(&mut sf, 0, k, 4, 1, 0x101010 * k);
+        k = k + 1;
+    }
+    fb_scroll_up(&mut sf, 2, 0xFFFFFF);
+    var srow: str = "scroll rows:";
+    k = 0;
+    while k < 6 {
+        srow = srow + " " + h(fb_get_pixel(&sf, 3, k));
+        k = k + 1;
+    }
+    println(srow);
+
+    var gl: str = "glyph A:";
+    k = 0;
+    while k < 16 {
+        gl = gl + " " + b2(fb_glyph_row(65, k));
+        k = k + 1;
+    }
+    println(gl);
+    var gf: Framebuffer = fb_new(8, 16, FB_RGB565);
+    fb_draw_char(&mut gf, 0, 0, 65, 0xFFFFFF, 0, true);
+    var same: bool = true;
+    k = 0;
+    while k < 16 {
+        if fb_glyph_row(200, k) != fb_glyph_row(63, k) { same = false; }
+        k = k + 1;
+    }
+    println("A pixels " + int_to_str(count(&gf, 0xFFFFFF)) + ", '?' for 200 " + bool_to_str(same));
+
+    var con: Console = con_new(fb_new(64, 48, FB_RGB565), 0xAAAAAA, 0x000000);
+    println("console " + int_to_str(con.cols) + "x" + int_to_str(con.rows));
+    con_write(&mut con, "Hello\nfides\tX\nline3");
+    println("row0 '" + con_row_text(&con, 0) + "' row1 '" + con_row_text(&con, 1) + "' row2 '" + con_row_text(&con, 2) + "' scrolls " + int_to_str(con.scrolls) + " cursor " + int_to_str(con.cx) + "," + int_to_str(con.cy));
+    println("pixel f (3,0) " + h(fb_get_pixel(&con.fb, 3, 0)) + " (0,0) " + h(fb_get_pixel(&con.fb, 0, 0)));
+    con_putc(&mut con, 27);
+    con_write(&mut con, "[31mR");
+    val red_fg: i64 = con.fg;
+    // 'R' is at column 5 of row 2; its top-left glyph pixel is set
+    val drawn: i64 = fb_get_pixel(&con.fb, 5 * 8 + 1, 2 * 16);
+    con_putc(&mut con, 27);
+    con_write(&mut con, "[0m");
+    println("red R fg " + h(red_fg) + " drawn " + h(drawn) + ", reset fg " + h(con.fg));
+    con_putc(&mut con, 27);
+    con_write(&mut con, "[2;3HZ");
+    println("cursor after ESC[2;3H " + int_to_str(con.cx - 1) + "," + int_to_str(con.cy) + " row1 '" + con_row_text(&con, 1) + "'");
+    con_putc(&mut con, 27);
+    con_write(&mut con, "[2J");
+    println("after ESC[2J row0 '" + con_row_text(&con, 0) + "' cursor " + int_to_str(con.cx) + "," + int_to_str(con.cy));
+}

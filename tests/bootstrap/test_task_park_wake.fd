@@ -1,0 +1,141 @@
+// Competitive roadmap RT11: tasks parked on the poller with no deadline.
+// The C runtime takes such a task out of the scheduler's list (__p_co_round
+// in compiler/codegen_c.fd) until its socket is ready (__p_co_unpark), so a
+// pass costs the tasks that can run, not every connection held open. Here
+// 24 reader tasks park on their sockets with no time limit; a client sends
+// to each (in reverse order), then parks on each connection for the reply,
+// then closes them all. Twice every task is parked at the end of a pass
+// (the client waiting for a reply while the readers' data is not yet
+// polled; the readers waiting for the end of their streams once the client
+// has finished): task_run must still wait for them. A scheduler that
+// forgot the parked tasks returns early ("closed" below 24, the client's
+// lines missing), one that lost a wake never returns.
+// Expected output:
+// sent 24
+// replies 24
+// sum 90
+// closed 24
+// done
+use task;
+
+const N: i64 = 24;
+
+var g_sum: i64 = 0;
+var g_closed: i64 = 0;
+
+fn reader_task(fd: i64) -> i64 {
+    var buf: i64 = 0;
+    // SAFETY: a 64-byte receive buffer, written only by p_co_recv (at most
+    // 63 bytes) and freed once below
+    unsafe {
+        buf = p_malloc(64);
+    }
+    var going: bool = true;
+    while going {
+        // -1: no time limit, the task is parked until the socket is ready
+        val n: i64 = p_co_recv(fd, buf, 63, - 1);
+        if n <= 0 {
+            going = false;
+        } else {
+            p_atomic_add(g_sum, n);
+            val k: str = "k";
+            if p_co_send(fd, k as i64, 1) != 1 {
+                going = false;
+            }
+        }
+    }
+    unsafe {
+        p_free(buf);
+    }
+    p_socket_close(fd);
+    p_atomic_add(g_closed, 1);
+    return 0;
+}
+
+fn accept_task(fd: i64) -> i64 {
+    var i: i64 = 0;
+    while i < N {
+        val c: i64 = p_co_accept(fd);
+        if c >= 0 {
+            task_detach(task_go("reader_task", c));
+            i = i + 1;
+        } else {
+            println("accept failed");
+            i = N;
+        }
+    }
+    p_socket_close(fd);
+    return 0;
+}
+
+fn client_task(port: i64) -> i64 {
+    var fds: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < N {
+        fds.push(p_co_connect("127.0.0.1", port));
+        i = i + 1;
+    }
+    // every reader gets to its p_co_recv and parks
+    task_sleep(20);
+    val msg: str = "abcdefg";
+    var sent: i64 = 0;
+    i = N - 1;
+    while i >= 0 {
+        val len: i64 = i % 7 + 1;
+        if p_co_send(fds.get(i), msg as i64, len) == len {
+            sent = sent + 1;
+        }
+        i = i - 1;
+    }
+    println("sent " + int_to_str(sent));
+    var replies: i64 = 0;
+    var buf: i64 = 0;
+    // SAFETY: an 8-byte buffer for one reply byte, freed below
+    unsafe {
+        buf = p_malloc(8);
+    }
+    i = 0;
+    while i < N {
+        if p_co_recv(fds.get(i), buf, 1, - 1) == 1 {
+            replies = replies + 1;
+        }
+        i = i + 1;
+    }
+    unsafe {
+        p_free(buf);
+    }
+    println("replies " + int_to_str(replies));
+    println("sum " + int_to_str(p_atomic_load(g_sum)));
+    i = 0;
+    while i < N {
+        p_socket_close(fds.get(i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    // SAFETY: two words, touched only through p_atomic_*
+    unsafe {
+        g_sum = p_shared_alloc(8);
+        g_closed = p_shared_alloc(8);
+    }
+    p_atomic_store(g_sum, 0);
+    p_atomic_store(g_closed, 0);
+    var port: i64 = 18530;
+    var fd: i64 = p_socket_listen(port);
+    while fd < 0 && port < 18560 {
+        port = port + 1;
+        fd = p_socket_listen(port);
+    }
+    if fd < 0 {
+        println("cannot listen");
+        return 1;
+    }
+    task_detach(task_go("accept_task", fd));
+    task_detach(task_go("client_task", port));
+    task_run();
+    println("closed " + int_to_str(p_atomic_load(g_closed)));
+    println("done");
+    return 0;
+}

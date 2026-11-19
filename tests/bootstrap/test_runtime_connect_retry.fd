@@ -1,0 +1,45 @@
+// Connect tries every address of a name (competitive SL5): "localhost"
+// has an IPv4 and an IPv6 address; the dual-stack listening socket takes
+// either, so connect succeeds whichever the runtime tries first. A port
+// nobody listens on fails on every address and gives -1 (no hang, no
+// socket left open). Native Linux also asks the next nameserver of
+// /etc/resolv.conf when the first does not answer, which needs a network
+// and is not checked here. Native and C only: the interpreter simulates
+// sockets (p_net_connect always gives a handle), so its last line differs.
+//
+// Expected output:
+// listening: true
+// localhost: true
+// 127.0.0.1: true
+// ::1: true
+// closed port: -1
+
+use string;
+
+fn connect_ok(host: str, port: i64) -> bool {
+    var fd: i64 = p_net_connect(host, port);
+    if fd < 0 {
+        return false;
+    }
+    p_net_close(fd);
+    return true;
+}
+
+fn main() -> i64 {
+    var port: i64 = 47311;
+    var lfd: i64 = 0 - 1;
+    while lfd < 0 && port < 47331 {
+        lfd = p_socket_listen(port);
+        if lfd < 0 {
+            port = port + 2;
+        }
+    }
+    println("listening: " + bool_to_str(lfd >= 0));
+    println("localhost: " + bool_to_str(connect_ok("localhost", port)));
+    println("127.0.0.1: " + bool_to_str(connect_ok("127.0.0.1", port)));
+    println("::1: " + bool_to_str(connect_ok("::1", port)));
+    var closed: i64 = p_net_connect("127.0.0.1", port + 1);
+    println("closed port: " + int_to_str(closed));
+    p_socket_close(lfd);
+    return 0;
+}

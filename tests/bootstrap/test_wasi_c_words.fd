@@ -1,0 +1,76 @@
+// Release F9 (WebAssembly through C: `fid ccompile --target wasm32-wasi`,
+// run by scripts/cross-test.sh wasm32-wasi). A value is a 64-bit word
+// where a pointer is 32 bits: an element read (`v[i]`, for-in) keeps the
+// whole word (it went through p_vec_get's void*: the high half of an f64,
+// the sign of a negative i64 were lost), an integer cast keeps 64 bits
+// (`(int64_t)(intptr_t)` kept 32: u64::MAX printed -17179869195), and a
+// task whose function takes a Vec or a str is called through a thunk of
+// the type the runtime calls it with (WebAssembly checks a call's type:
+// it trapped). The same on every backend.
+//
+// Expected output:
+// true
+// true
+// true
+// -1
+// -7
+// 9223372036854775807
+// -8
+// 18446744073709551615
+// -1
+// 4
+// 5
+// words ok
+
+async fn count_with(v: Vec<i64>, extra: i64) -> Future<i64> {
+    var w: Vec<i64> = v;
+    w.push(extra);
+    return w.len();
+}
+
+async fn name_len(s: str) -> Future<i64> {
+    return str_len(s);
+}
+
+fn sum(v: Vec<f64>) -> f64 {
+    var s: f64 = 0.0;
+    for x in v {
+        s = s + x;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    var f: Vec<f64> = Vec::new();
+    f.push(1.5);
+    f.push(2.25);
+    f.push(-0.5);
+    println(f[0] == 1.5);
+    println(f[2] == -0.5);
+    println(sum(f) == 3.25);
+    var n: Vec<i64> = Vec::new();
+    n.push(-1);
+    n.push(-7);
+    n.push(9223372036854775807);
+    println(n[0]);
+    println(n[1]);
+    println(n[2]);
+    var total: i64 = 0;
+    for x in n {
+        if x < 0 {
+            total = total + x;
+        }
+    }
+    println(total);
+    var u: u64 = 18446744073709551615;
+    print(u);
+    print("\n");
+    val back: i64 = u as i64;
+    println(back);
+    val t = count_with(n, 5);
+    println(await t);
+    val s = name_len("hello");
+    println(await s);
+    println("words ok");
+    return 0;
+}

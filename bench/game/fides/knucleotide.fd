@@ -1,0 +1,127 @@
+// k-nucleotide (the Benchmarks Game, roadmap BM3): the THREE section of
+// fasta's output (5n characters drawn from the Homo sapiens frequencies, the
+// generator seeded 42 and first run through TWO's 3n draws), n = 1000000,
+// made in memory instead of read from stdin. For each length k of 1, 2, 3,
+// 4, 6, 12 and 18 a hash table counts every k-long substring (keyed by two
+// bits per nucleotide, A C G T = 0 1 2 3, the first one highest). The
+// program folds into a 32-bit hash, h = h * 31 + v: the number of different
+// keys of each table, the count of every key for k = 1 and 2 (key order),
+// and the count of GGT, GGTA, GGTATT, GGTATTTTAATT and GGTATTTTAATTTATAGT
+// (bench/game/reference.py gives the value).
+// tests/bootstrap/test_verify_bm_knucleotide.fd is this program with
+// n = 200.
+
+// the THREE section as codes: the index of each drawn character in "acgt"
+fn three_codes(n: i64) -> Vec<u8> {
+    var last: i64 = 42;
+    var k: i64 = 0;
+    while k < 3 * n {
+        last = (last * 3877 + 29573) % 139968;
+        k = k + 1;
+    }
+    var probs: Vec<f64> = Vec::new();
+    probs.push(0.3029549426680);
+    probs.push(0.1979883004921);
+    probs.push(0.1975473066391);
+    probs.push(0.3015094502008);
+    var cum: Vec<f64> = Vec::new();
+    var p: f64 = 0.0;
+    var j: i64 = 0;
+    while j < probs.len() {
+        p = p + probs.get(j);
+        cum.push(p);
+        j = j + 1;
+    }
+    val last_i: i64 = cum.len() - 1;
+    var out: Vec<u8> = Vec::new();
+    k = 0;
+    while k < 5 * n {
+        last = (last * 3877 + 29573) % 139968;
+        val r: f64 = (last as f64) / 139968.0;
+        var i: i64 = 0;
+        while i < last_i && r >= cum.get(i) {
+            i = i + 1;
+        }
+        out.push(i as u8);
+        k = k + 1;
+    }
+    return out;
+}
+
+// every k-long substring of codes, counted
+fn count_kmers(codes: Vec<u8>, k: i64) -> HashMap<i64, i64> {
+    val mask: i64 = (1 << (2 * k)) - 1;
+    var m: HashMap<i64, i64> = HashMap::new();
+    var key: i64 = 0;
+    var i: i64 = 0;
+    while i < codes.len() {
+        key = ((key << 2) | (codes.get(i) as i64)) & mask;
+        if i >= k - 1 {
+            m.insert(key, m.get_or(key, 0) + 1);
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// the key of a substring written in A C G T
+fn encode(s: str) -> i64 {
+    val b: Vec<i64> = str_bytes(s);
+    var key: i64 = 0;
+    var i: i64 = 0;
+    while i < b.len() {
+        val c: i64 = b.get(i);
+        var v: i64 = 0;
+        if c == 67 {
+            v = 1;
+        } else if c == 71 {
+            v = 2;
+        } else if c == 84 {
+            v = 3;
+        }
+        key = (key << 2) | v;
+        i = i + 1;
+    }
+    return key;
+}
+
+fn fold(h: i64, v: i64) -> i64 {
+    return (h * 31 + v) & 4294967295;
+}
+
+// the frequencies of every k-long substring (k = 1, 2)
+fn frequencies(h0: i64, codes: Vec<u8>, k: i64) -> i64 {
+    val m: HashMap<i64, i64> = count_kmers(codes, k);
+    var h: i64 = fold(h0, m.len());
+    var key: i64 = 0;
+    while key < (1 << (2 * k)) {
+        h = fold(h, m.get_or(key, 0));
+        key = key + 1;
+    }
+    return h;
+}
+
+// the count of one substring, from the table of every substring as long
+fn count_of(h0: i64, codes: Vec<u8>, s: str) -> i64 {
+    val m: HashMap<i64, i64> = count_kmers(codes, str_len(s));
+    var h: i64 = fold(h0, m.len());
+    h = fold(h, m.get_or(encode(s), 0));
+    return h;
+}
+
+fn knucleotide(n: i64) -> i64 {
+    val codes: Vec<u8> = three_codes(n);
+    var h: i64 = frequencies(0, codes, 1);
+    h = frequencies(h, codes, 2);
+    h = count_of(h, codes, "GGT");
+    h = count_of(h, codes, "GGTA");
+    h = count_of(h, codes, "GGTATT");
+    h = count_of(h, codes, "GGTATTTTAATT");
+    h = count_of(h, codes, "GGTATTTTAATTTATAGT");
+    return h;
+}
+
+fn main() -> i64 {
+    println(knucleotide(1000000));
+    return 0;
+}

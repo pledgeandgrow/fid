@@ -1,0 +1,102 @@
+// LG15 (fid): compiler/cparser.fd follows `#include` inside a header and
+// reads the annotation macros of the C libraries' headers as noise even
+// where nothing defines them. Runs cparse_header_file (what `fid
+// parse-header` and `@import("x.h")` use) on at_import/cinc.h, which
+// includes headers beside it ("cinc_types.h"), by angle brackets
+// (<cinc_sys_lg15.h>, found beside it), in a subdirectory
+// (cinc_sub/cinc_leaf.h, whose "../cinc_types.h" is read once through its
+// guard), one that includes itself under a longer path each time (read
+// once: cparser.fd cp_norm_path takes `dir/..` out of the path), a chain of
+// 17 includes (cinc_chain/: the 17th is past the depth limit of 16) and one
+// that exists nowhere (noted). Without the include
+// following, cinc_word is unknown and cinc_twice is skipped; without the
+// annotation words, _ACRTIMP/_In_/__THROW/__nonnull((1))/_In_reads_(1)/
+// _Nonnull/__API_AVAILABLE(...) make the declarations unreadable.
+//
+// Expected output:
+// typedef from quoted include ok
+// glibc attributes ok
+// msvc sal group ok
+// apple annotations ok
+// annotated libc function ok
+// angle include ok
+// subdirectory leaf ok
+// constant from include ok
+// constant from angle include ok
+// constant from leaf ok
+// read once ok
+// depth limit ok
+// past the limit not read ok
+// self include bound once ok
+// self include not a depth note ok
+// missing include noted ok
+// keyword name skipped ok
+// headers counted ok
+
+use core;
+use vec;
+use string;
+use compiler::cparser;
+
+fn count_of(s: str, sub: str) -> i64 {
+    var n: i64 = 0;
+    var rest: str = s;
+    var at: i64 = str_find(rest, sub);
+    while at >= 0 {
+        n = n + 1;
+        rest = str_slice(rest, at + str_len(sub), str_len(rest));
+        at = str_find(rest, sub);
+    }
+    return n;
+}
+
+fn check(label: str, out: str, want: str) {
+    if str_contains(out, want) {
+        println(label + " ok");
+    } else {
+        println(label + " MISSING: " + want);
+    }
+}
+
+fn main() -> i64 {
+    val out: str = cparse_header_file("tests/bootstrap/at_import/cinc.h", "", "");
+    check("typedef from quoted include", out, "fn cinc_twice(x: i32) -> i32;");
+    check("glibc attributes", out, "fn cinc_add(a: i32, b: i32) -> i32;");
+    check("msvc sal group", out, "fn cinc_neg(x: i32) -> i32;");
+    check("apple annotations", out, "fn cinc_mac(p: *i32) -> i32;");
+    check("annotated libc function", out, "fn toupper(c: i32) -> i32;");
+    check("angle include", out, "fn cinc_sys_one() -> i32;");
+    check("subdirectory leaf", out, "fn cinc_leaf_fn(w: i32) -> i32;");
+    check("constant from include", out, "pub const CINC_LIMIT: i64 = 42;");
+    check("constant from angle include", out, "pub const CINC_SYS: i64 = 5;");
+    check("constant from leaf", out, "pub const CINC_LEAF: i64 = 7;");
+    if count_of(out, "pub const CINC_LIMIT") == 1 && count_of(out, "fn cinc_twice(") == 1 {
+        println("read once ok");
+    } else {
+        println("read once FAILED");
+    }
+    check("depth limit", out, "#include \"c17.h\": more than 16 includes deep, not read");
+    if str_contains(out, "pub const CINC_CHAIN: i64 = 16;") && !str_contains(out, "CINC_CHAIN_TOO_DEEP") {
+        println("past the limit not read ok");
+    } else {
+        println("past the limit not read FAILED");
+    }
+    if count_of(out, "fn cinc_deep_fn(") == 1 {
+        println("self include bound once ok");
+    } else {
+        println("self include bound once FAILED");
+    }
+    if !str_contains(out, "cinc_deep.h\": more than") {
+        println("self include not a depth note ok");
+    } else {
+        println("self include not a depth note FAILED");
+    }
+    check("missing include noted", out, "#include <cinc_no_such_header.h>: not found");
+    check("keyword name skipped", out, "select: its name is a Fides keyword");
+    if str_contains(out, " headers it includes") {
+        println("headers counted ok");
+    } else {
+        println("headers counted FAILED");
+    }
+    return 0;
+}

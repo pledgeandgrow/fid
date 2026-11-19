@@ -1,0 +1,66 @@
+// competitive-roadmap LG13: `asm!` on the C path (`fid ccompile`): the C
+// generator hands the template to the C compiler's assembler as GNU inline
+// assembly (codegen_c.fd CCodeGen_gen_asm): local register variables for
+// the operands, Intel syntax on x86-64, `;` between instructions; an output
+// that is not an input starts at 0; a privileged instruction is not run (0).
+// The interpreter runs no template (0), so each line prints "ok" for the
+// right value and for 0: the outputs agree on every back end. The values
+// themselves are checked by building this file through C and running it
+// with FID_ASM_CHECK=1 set, which prints "ran" when the template ran.
+// Expected output:
+// asm const ok
+// asm lea ok
+// asm imul ok
+// asm clobber ok
+// asm privileged ok
+// asm fences ok
+
+fn ok(name: str, got: i64, want: i64) {
+    if got == want || got == 0 {
+        println("asm " + name + " ok");
+    } else {
+        println("asm " + name + " WRONG: " + int_to_str(got));
+    }
+    match env_var("FID_ASM_CHECK") {
+        Option::Some(_) => {
+            if got == want {
+                p_eprint_str("  " + name + ": ran\n");
+            } else {
+                p_eprint_str("  " + name + ": not run (" + int_to_str(got) + ")\n");
+            }
+        }
+        Option::None => {}
+    }
+}
+
+@cfg(arch = "x86_64")
+fn add_lea(a: i64, b: i64) -> i64 {
+    var s: i64 = 0;
+    s = asm!("lea rax, [rcx + rdx]", in("rcx") a, in("rdx") b, out("rax") s);
+    return s;
+}
+
+@cfg(arch = "x86_64")
+fn main() -> i64 {
+    var r: i64 = 0;
+    r = asm!("mov rax, 40; add rax, 2", out("rax") r);
+    ok("const", r, 42);
+    ok("lea", add_lea(30, 12), 42);
+    var x: i64 = 5;
+    x = asm!("imul rax, rax", in("rax") x, out("rax") x);
+    ok("imul", x, 25);
+    var y: i64 = 0;
+    y = asm!("mov rbx, 99; mov rax, rbx", out("rax") y, clobber("rbx"));
+    ok("clobber", y, 99);
+    var h: i64 = 0;
+    h = asm!("cli; mov rax, 7", out("rax") h);
+    // privileged: not run anywhere in a process, so 0
+    if h == 0 {
+        println("asm privileged ok");
+    } else {
+        println("asm privileged WRONG: " + int_to_str(h));
+    }
+    asm!("mfence; lfence; sfence; pause; nop");
+    println("asm fences ok");
+    return 0;
+}

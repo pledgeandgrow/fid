@@ -1,0 +1,1025 @@
+// Fides UDP sockets over IPv4 and IPv6, on every backend
+//
+// The operating system's own socket API, called directly: Winsock
+// (ws2_32) on Windows, the C library's BSD sockets on Linux, macOS and
+// FreeBSD. Nothing else has to be linked, so the same program builds
+// through C (`fid ccompile`, any target), natively for Windows (`fid emit`,
+// pe_ir imports ws2_32.dll) and natively for Linux (`fid emit --target
+// x86_64-linux`, the C library's functions bound at load time). (net.fd's
+// older UDP functions go through runtime/pledge_net.c, which has to be
+// compiled and linked by hand.) The interpreter (`fid run`) cannot call
+// the socket API: it stops at the first socket call; address functions
+// work everywhere.
+//
+// Addresses are UdpAddr values: a family (UDP_V4, UDP_V6), the address's
+// bytes (4 or 16) and a port. udp_addr parses "192.0.2.1", "::1",
+// "[2001:db8::1]", "::ffff:192.0.2.1" and a zone index ("fe80::1%3").
+// Host names are not resolved here (dns.fd).
+//
+//   val s: i64 = udp_open(UDP_V6);              // -1 on failure
+//   udp_bind(s, & udp_addr_any(UDP_V6, 4433));  // a v6 socket also takes
+//                                               // IPv4 (v4-mapped peers)
+//   var from: UdpAddr = udp_addr_none();
+//   val d: Vec<i64> = udp_recv(s, 1500, 50, & mut from);   // [] after 50 ms
+//   udp_send(s, d, & from);
+//   udp_close(s);
+//
+// Bytes are Vec<i64> of 0..255. A datagram's buffer belongs to this module
+// for the length of one call.
+
+module udp;
+ use vec; use string;
+
+/// Address families.
+pub const UDP_V4: i64 = 4;
+pub const UDP_V6: i64 = 6;
+
+/// An address: `family` UDP_V4 or UDP_V6 (0: none or unparsable), `ip`
+/// its 4 or 16 bytes, `port`, and `scope` the IPv6 zone index (0: none).
+pub struct UdpAddr {
+    pub family: i64,
+    pub ip: Vec<i64>,
+    pub port: i64,
+    pub scope: i64,
+}
+
+// ─── The system's socket functions ──────────────────────────────────────
+//
+// SAFETY: each declaration names the system's own function (Winsock or
+// the BSD socket API, both declared by the headers every generated C file
+// includes: hence `<stdint.h>`, which only makes the C backend use the
+// system's prototypes). Integers are passed as i64 and pointers as i64
+// addresses of blocks this module allocated, each at least as long as the
+// length passed with it. The Windows functions are only called from
+// @cfg(windows) functions, the others only from @cfg(unix) ones.
+extern "C" include "<stdint.h>" link "ws2_32" {
+    fn WSAStartup as uw_startup(version: i64, data: i64) -> i32;
+    fn socket as uw_socket(family: i64, kind: i64, proto: i64) -> i64;
+    fn bind as uw_bind(s: i64, addr: i64, len: i64) -> i32;
+    fn sendto as uw_sendto(s: i64, buf: i64, len: i64, flags: i64, to: i64, tolen: i64) -> i32;
+    fn recvfrom as uw_recvfrom(s: i64, buf: i64, len: i64, flags: i64, from: i64, fromlen: i64) -> i32;
+    fn getsockname as uw_getsockname(s: i64, addr: i64, len: i64) -> i32;
+    fn setsockopt as uw_setsockopt(s: i64, level: i64, name: i64, val: i64, len: i64) -> i32;
+    fn WSAPoll as uw_poll(fds: i64, n: i64, timeout: i64) -> i32;
+    fn WSAIoctl as uw_ioctl(s: i64, code: i64, inb: i64, inlen: i64, outb: i64, outlen: i64, done: i64, ov: i64, cb: i64) -> i32;
+    fn closesocket as uw_close(s: i64) -> i32;
+}
+
+// SAFETY: the BSD socket API, as the block above: the system's own
+// functions, integers as i64, pointers as addresses of blocks this module
+// allocated, each at least as long as the length passed with it.
+extern "C" include "<stdint.h>" link "" {
+    fn socket as ux_socket(family: i64, kind: i64, proto: i64) -> i32;
+    fn bind as ux_bind(s: i64, addr: i64, len: i64) -> i32;
+    fn sendto as ux_sendto(s: i64, buf: i64, len: i64, flags: i64, to: i64, tolen: i64) -> i64;
+    fn recvfrom as ux_recvfrom(s: i64, buf: i64, len: i64, flags: i64, from: i64, fromlen: i64) -> i64;
+    fn getsockname as ux_getsockname(s: i64, addr: i64, len: i64) -> i32;
+    fn setsockopt as ux_setsockopt(s: i64, level: i64, name: i64, val: i64, len: i64) -> i32;
+    fn close as ux_close(s: i64) -> i32;
+}
+
+const UD_SOCK_DGRAM: i64 = 2;
+const UD_IPPROTO_UDP: i64 = 17;
+const UD_IPPROTO_IPV6: i64 = 41;
+/// sockaddr_storage is 128 bytes everywhere.
+const UD_ADDR_MAX: i64 = 128;
+
+// ─── Raw memory ─────────────────────────────────────────────────────────
+
+/// A zeroed block of n bytes (0 when the allocation fails); the caller
+/// frees it with p_free.
+fn ud_block(n: i64) -> i64 {
+    val b: i64 = p_malloc(n);
+    if b == 0 {
+        return 0;
+    }
+    var i: i64 = 0;
+    while i < n {
+        ud_put(b, i, 0);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn ud_put(buf: i64, off: i64, v: i64) {
+    var p: * mut u8 = buf + off;
+    // SAFETY: every caller passes an offset inside a block it allocated
+    // with ud_block or p_malloc at a size covering it.
+    unsafe {
+        * p = (v & 255) as u8;
+    }
+}
+
+fn ud_get(buf: i64, off: i64) -> i64 {
+    var p: * mut u8 = buf + off;
+    var b: i64 = 0;
+    // SAFETY: as ud_put: inside a block the caller allocated.
+    unsafe {
+        b = (* p) as i64;
+    }
+    return b & 255;
+}
+
+fn ud_put32le(buf: i64, off: i64, v: i64) {
+    ud_put(buf, off, v);
+    ud_put(buf, off + 1, v >> 8);
+    ud_put(buf, off + 2, v >> 16);
+    ud_put(buf, off + 3, v >> 24);
+}
+
+fn ud_get32le(buf: i64, off: i64) -> i64 {
+    return ud_get(buf, off) | (ud_get(buf, off + 1) << 8) | (ud_get(buf, off + 2) << 16) | (ud_get(buf, off + 3) << 24);
+}
+
+fn ud_none() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    return v;
+}
+
+// ─── Per-system details (@cfg) ──────────────────────────────────────────
+// sockaddr_in:  family, port (big-endian), 4 address bytes, 8 zeros (16)
+// sockaddr_in6: family, port, flowinfo (4), 16 address bytes, scope (28)
+// The family is a little-endian u16 on Windows and Linux; macOS and
+// FreeBSD have a length byte, then a one-byte family.
+
+@cfg(windows)
+fn ud_af(family: i64) -> i64 {
+    if family == UDP_V6 {
+        return 23;
+    }
+    return 2;
+}
+
+@cfg(linux)
+fn ud_af(family: i64) -> i64 {
+    if family == UDP_V6 {
+        return 10;
+    }
+    return 2;
+}
+
+@cfg(macos)
+fn ud_af(family: i64) -> i64 {
+    if family == UDP_V6 {
+        return 30;
+    }
+    return 2;
+}
+
+@cfg(freebsd)
+fn ud_af(family: i64) -> i64 {
+    if family == UDP_V6 {
+        return 28;
+    }
+    return 2;
+}
+
+@cfg(windows)
+fn ud_len_byte() -> bool {
+    return false;
+}
+
+@cfg(linux)
+fn ud_len_byte() -> bool {
+    return false;
+}
+
+@cfg(macos)
+fn ud_len_byte() -> bool {
+    return true;
+}
+
+@cfg(freebsd)
+fn ud_len_byte() -> bool {
+    return true;
+}
+
+/// IPV6_V6ONLY.
+@cfg(linux)
+fn ud_v6only_opt() -> i64 {
+    return 26;
+}
+
+@cfg(windows)
+fn ud_v6only_opt() -> i64 {
+    return 27;
+}
+
+@cfg(macos)
+fn ud_v6only_opt() -> i64 {
+    return 27;
+}
+
+@cfg(freebsd)
+fn ud_v6only_opt() -> i64 {
+    return 27;
+}
+
+/// Winsock is started once per process (WSAStartup counts its calls, so
+/// a C runtime that started it too is not disturbed).
+var g_udp_wsa: bool = false;
+
+@cfg(windows)
+fn ud_os_socket(af: i64) -> i64 {
+    if !g_udp_wsa {
+        val data: i64 = ud_block(512);
+        uw_startup(0x0202, data);
+        p_free(data);
+        g_udp_wsa = true;
+    }
+    val s: i64 = uw_socket(af, UD_SOCK_DGRAM, UD_IPPROTO_UDP);
+    if s == - 1 || s == 0 {
+        return - 1;
+    }
+    // SIO_UDP_CONNRESET off: an ICMP "port unreachable" from an earlier
+    // datagram would otherwise fail every later recvfrom
+    val off: i64 = ud_block(8);
+    val done: i64 = ud_block(8);
+    uw_ioctl(s, 0x9800000C, off, 4, 0, 0, done, 0, 0);
+    p_free(off);
+    p_free(done);
+    return s;
+}
+
+@cfg(unix)
+fn ud_os_socket(af: i64) -> i64 {
+    val s: i64 = ux_socket(af, UD_SOCK_DGRAM, UD_IPPROTO_UDP) as i64;
+    if s < 0 {
+        return - 1;
+    }
+    return s;
+}
+
+@cfg(windows)
+fn ud_os_bind(s: i64, sa: i64, len: i64) -> i64 {
+    return uw_bind(s, sa, len) as i64;
+}
+
+@cfg(unix)
+fn ud_os_bind(s: i64, sa: i64, len: i64) -> i64 {
+    return ux_bind(s, sa, len) as i64;
+}
+
+@cfg(windows)
+fn ud_os_setopt(s: i64, level: i64, name: i64, value: i64) -> i64 {
+    val b: i64 = ud_block(8);
+    ud_put32le(b, 0, value);
+    val r: i64 = uw_setsockopt(s, level, name, b, 4) as i64;
+    p_free(b);
+    return r;
+}
+
+@cfg(unix)
+fn ud_os_setopt(s: i64, level: i64, name: i64, value: i64) -> i64 {
+    val b: i64 = ud_block(8);
+    ud_put32le(b, 0, value);
+    val r: i64 = ux_setsockopt(s, level, name, b, 4) as i64;
+    p_free(b);
+    return r;
+}
+
+@cfg(windows)
+fn ud_os_sendto(s: i64, buf: i64, n: i64, sa: i64, len: i64) -> i64 {
+    return uw_sendto(s, buf, n, 0, sa, len) as i64;
+}
+
+@cfg(unix)
+fn ud_os_sendto(s: i64, buf: i64, n: i64, sa: i64, len: i64) -> i64 {
+    return ux_sendto(s, buf, n, 0, sa, len);
+}
+
+/// recvfrom with a 4-byte length cell `lenp` holding the address room.
+@cfg(windows)
+fn ud_os_recvfrom(s: i64, buf: i64, n: i64, sa: i64, lenp: i64) -> i64 {
+    return uw_recvfrom(s, buf, n, 0, sa, lenp) as i64;
+}
+
+@cfg(unix)
+fn ud_os_recvfrom(s: i64, buf: i64, n: i64, sa: i64, lenp: i64) -> i64 {
+    return ux_recvfrom(s, buf, n, 0, sa, lenp);
+}
+
+@cfg(windows)
+fn ud_os_getsockname(s: i64, sa: i64, lenp: i64) -> i64 {
+    return uw_getsockname(s, sa, lenp) as i64;
+}
+
+@cfg(unix)
+fn ud_os_getsockname(s: i64, sa: i64, lenp: i64) -> i64 {
+    return ux_getsockname(s, sa, lenp) as i64;
+}
+
+/// Whether a datagram (or an error to collect) is waiting, within
+/// `timeout_ms` (0: just look). WSAPOLLFD is {SOCKET, short, short} (16
+/// bytes), POLLRDNORM 0x100.
+@cfg(windows)
+fn ud_os_wait(s: i64, timeout_ms: i64) -> bool {
+    val fds: i64 = ud_block(16);
+    ud_put32le(fds, 0, s);
+    ud_put32le(fds, 4, s >> 32);
+    ud_put(fds, 8, 0x00);
+    ud_put(fds, 9, 0x01);
+    val r: i64 = uw_poll(fds, 1, timeout_ms) as i64;
+    val rev: i64 = ud_get(fds, 10) | (ud_get(fds, 11) << 8);
+    p_free(fds);
+    return r > 0 && rev != 0;
+}
+
+/// SOL_SOCKET, SO_RCVTIMEO and MSG_DONTWAIT of the BSD-derived systems.
+@cfg(linux)
+fn ud_rcvtimeo() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(20);
+    v.push(0x40);
+    return v;
+}
+
+@cfg(macos)
+fn ud_rcvtimeo() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0xffff);
+    v.push(0x1006);
+    v.push(0x80);
+    return v;
+}
+
+@cfg(freebsd)
+fn ud_rcvtimeo() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0xffff);
+    v.push(0x1006);
+    v.push(0x80);
+    return v;
+}
+
+/// Without poll (the generated C declares <poll.h> only after the
+/// program's functions): the receive timeout (SO_RCVTIMEO, a 16-byte
+/// struct timeval) and a 1-byte MSG_PEEK recvfrom, which leaves the
+/// datagram queued; MSG_DONTWAIT for a timeout of 0.
+@cfg(unix)
+fn ud_os_wait(s: i64, timeout_ms: i64) -> bool {
+    val k: Vec<i64> = ud_rcvtimeo();
+    var flags: i64 = 2;
+    if timeout_ms <= 0 {
+        flags = flags | k.get(2);
+    } else {
+        val tv: i64 = ud_block(16);
+        ud_put32le(tv, 0, timeout_ms / 1000);
+        ud_put32le(tv, 8, (timeout_ms % 1000) * 1000);
+        ux_setsockopt(s, k.get(0), k.get(1), tv, 16);
+        p_free(tv);
+    }
+    val one: i64 = ud_block(8);
+    val r: i64 = ux_recvfrom(s, one, 1, flags, 0, 0);
+    p_free(one);
+    return r >= 0;
+}
+
+@cfg(windows)
+fn ud_os_close(s: i64) {
+    uw_close(s);
+}
+
+@cfg(unix)
+fn ud_os_close(s: i64) {
+    ux_close(s);
+}
+
+// ─── Addresses ──────────────────────────────────────────────────────────
+
+/// No address (family 0).
+pub fn udp_addr_none() -> UdpAddr {
+    return UdpAddr { family: 0, ip: ud_none(), port: 0, scope: 0 };
+}
+
+/// Whether an address was parsed (or received).
+pub fn udp_addr_ok(a: & UdpAddr) -> bool {
+    return (a.family == UDP_V4 && a.ip.len() == 4) || (a.family == UDP_V6 && a.ip.len() == 16);
+}
+
+/// Every address of a family (0.0.0.0 or ::), for binding.
+pub fn udp_addr_any(family: i64, port: i64) -> UdpAddr {
+    var ip: Vec<i64> = Vec::new();
+    var n: i64 = 4;
+    if family == UDP_V6 {
+        n = 16;
+    }
+    var i: i64 = 0;
+    while i < n {
+        ip.push(0);
+        i = i + 1;
+    }
+    return UdpAddr { family: family, ip: ip, port: port, scope: 0 };
+}
+
+/// The loopback address of a family (127.0.0.1 or ::1).
+pub fn udp_addr_loopback(family: i64, port: i64) -> UdpAddr {
+    var ip: Vec<i64> = Vec::new();
+    if family == UDP_V6 {
+        var i: i64 = 0;
+        while i < 15 {
+            ip.push(0);
+            i = i + 1;
+        }
+        ip.push(1);
+    } else {
+        ip.push(127);
+        ip.push(0);
+        ip.push(0);
+        ip.push(1);
+    }
+    return UdpAddr { family: family, ip: ip, port: port, scope: 0 };
+}
+
+fn ud_hex(b: i64) -> i64 {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    return - 1;
+}
+
+/// Dotted IPv4 in bytes[from..to): its 4 bytes, [] when malformed.
+fn ud_parse_v4(b: Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = from;
+    var cur: i64 = 0;
+    var digits: i64 = 0;
+    while i <= to {
+        if i == to || b.get(i) == 46 {
+            if digits == 0 || cur > 255 {
+                return ud_none();
+            }
+            out.push(cur);
+            cur = 0;
+            digits = 0;
+        } else if b.get(i) >= 48 && b.get(i) <= 57 {
+            if digits > 0 && cur == 0 {
+                // no leading zeros (octal in some parsers)
+                return ud_none();
+            }
+            cur = cur * 10 + (b.get(i) - 48);
+            digits = digits + 1;
+            if digits > 3 {
+                return ud_none();
+            }
+        } else {
+            return ud_none();
+        }
+        i = i + 1;
+    }
+    if out.len() != 4 {
+        return ud_none();
+    }
+    return out;
+}
+
+/// IPv6 text in bytes[from..to) (RFC 4291 §2.2: hex groups, one "::", a
+/// dotted IPv4 tail): its 16 bytes, [] when malformed.
+fn ud_parse_v6(b: Vec<i64>, from: i64, to: i64) -> Vec<i64> {
+    var head: Vec<i64> = Vec::new();
+    var tail: Vec<i64> = Vec::new();
+    var gap: bool = false;
+    var i: i64 = from;
+    if to - from >= 2 && b.get(from) == 58 && b.get(from + 1) == 58 {
+        gap = true;
+        i = from + 2;
+    } else if to > from && b.get(from) == 58 {
+        return ud_none();
+    }
+    while i < to {
+        // one group: hex digits, or a dotted IPv4 tail
+        var j: i64 = i;
+        var dotted: bool = false;
+        while j < to && b.get(j) != 58 {
+            if b.get(j) == 46 {
+                dotted = true;
+            }
+            j = j + 1;
+        }
+        var groupb: Vec<i64> = Vec::new();
+        if dotted {
+            if j != to {
+                return ud_none();
+            }
+            groupb = ud_parse_v4(b, i, j);
+            if groupb.len() != 4 {
+                return ud_none();
+            }
+        } else {
+            if j == i || j - i > 4 {
+                return ud_none();
+            }
+            var v: i64 = 0;
+            var k: i64 = i;
+            while k < j {
+                val h: i64 = ud_hex(b.get(k));
+                if h < 0 {
+                    return ud_none();
+                }
+                v = v * 16 + h;
+                k = k + 1;
+            }
+            groupb.push(v >> 8);
+            groupb.push(v & 255);
+        }
+        var g: i64 = 0;
+        while g < groupb.len() {
+            if gap {
+                tail.push(groupb.get(g));
+            } else {
+                head.push(groupb.get(g));
+            }
+            g = g + 1;
+        }
+        if j == to {
+            i = to;
+        } else if j + 1 < to && b.get(j + 1) == 58 {
+            if gap {
+                return ud_none();
+            }
+            gap = true;
+            i = j + 2;
+        } else if j + 1 == to {
+            // a trailing single ':'
+            return ud_none();
+        } else {
+            i = j + 1;
+        }
+    }
+    val have: i64 = head.len() + tail.len();
+    if have > 16 || (!gap && have != 16) || (gap && have > 14) {
+        return ud_none();
+    }
+    var out: Vec<i64> = head;
+    while out.len() + tail.len() < 16 {
+        out.push(0);
+    }
+    var t: i64 = 0;
+    while t < tail.len() {
+        out.push(tail.get(t));
+        t = t + 1;
+    }
+    return out;
+}
+
+/// An address from text: dotted IPv4, or IPv6 (brackets allowed, a zone
+/// index after '%'). Family 0 when it is neither.
+pub fn udp_addr(text: str, port: i64) -> UdpAddr {
+    val b: Vec<i64> = str_bytes(text);
+    var from: i64 = 0;
+    var to: i64 = b.len();
+    if to >= 2 && b.get(0) == 91 && b.get(to - 1) == 93 {
+        from = 1;
+        to = to - 1;
+    }
+    var colon: bool = false;
+    var i: i64 = from;
+    while i < to {
+        if b.get(i) == 58 {
+            colon = true;
+        }
+        i = i + 1;
+    }
+    if !colon {
+        val v4: Vec<i64> = ud_parse_v4(b, from, to);
+        if v4.len() != 4 {
+            return udp_addr_none();
+        }
+        return UdpAddr { family: UDP_V4, ip: v4, port: port, scope: 0 };
+    }
+    var scope: i64 = 0;
+    var end: i64 = to;
+    i = from;
+    while i < to {
+        if b.get(i) == 37 {
+            end = i;
+            var k: i64 = i + 1;
+            if k >= to {
+                return udp_addr_none();
+            }
+            while k < to {
+                if b.get(k) < 48 || b.get(k) > 57 {
+                    return udp_addr_none();
+                }
+                scope = scope * 10 + (b.get(k) - 48);
+                k = k + 1;
+            }
+            i = to;
+        } else {
+            i = i + 1;
+        }
+    }
+    val v6: Vec<i64> = ud_parse_v6(b, from, end);
+    if v6.len() != 16 {
+        return udp_addr_none();
+    }
+    return UdpAddr { family: UDP_V6, ip: v6, port: port, scope: scope };
+}
+
+fn ud_hex_group(v: i64) -> str {
+    val digits: str = "0123456789abcdef";
+    var s: str = "";
+    var started: bool = false;
+    var shift: i64 = 12;
+    while shift >= 0 {
+        val d: i64 = (v >> shift) & 15;
+        if d != 0 || started || shift == 0 {
+            s = s + str_slice(digits, d, d + 1);
+            started = true;
+        }
+        shift = shift - 4;
+    }
+    return s;
+}
+
+/// The address without the port: "192.0.2.1", or IPv6 in its RFC 5952
+/// form ("2001:db8::1", the longest run of zero groups as "::").
+pub fn udp_addr_ip_text(a: & UdpAddr) -> str {
+    if a.family == UDP_V4 && a.ip.len() == 4 {
+        return int_to_str(a.ip.get(0)) + "." + int_to_str(a.ip.get(1)) + "." + int_to_str(a.ip.get(2)) + "." + int_to_str(a.ip.get(3));
+    }
+    if a.family != UDP_V6 || a.ip.len() != 16 {
+        return "";
+    }
+    val plain: UdpAddr = udp_addr_unmapped(a);
+    if plain.family == UDP_V4 {
+        // a v4-mapped address keeps its dotted tail (RFC 5952 §5)
+        return "::ffff:" + udp_addr_ip_text(& plain);
+    }
+    var groups: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 8 {
+        groups.push((a.ip.get(2 * i) << 8) | a.ip.get(2 * i + 1));
+        i = i + 1;
+    }
+    // the longest run of at least two zero groups (the first if tied)
+    var best: i64 = - 1;
+    var best_len: i64 = 1;
+    i = 0;
+    while i < 8 {
+        if groups.get(i) == 0 {
+            var j: i64 = i;
+            while j < 8 && groups.get(j) == 0 {
+                j = j + 1;
+            }
+            if j - i > best_len {
+                best = i;
+                best_len = j - i;
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    var s: str = "";
+    i = 0;
+    while i < 8 {
+        if i == best {
+            s = s + "::";
+            i = i + best_len;
+        } else {
+            if str_len(s) > 0 && !str_ends_with(s, ":") {
+                s = s + ":";
+            }
+            s = s + ud_hex_group(groups.get(i));
+            i = i + 1;
+        }
+    }
+    if a.scope != 0 {
+        s = s + "%" + int_to_str(a.scope);
+    }
+    return s;
+}
+
+/// "192.0.2.1:443" or "[2001:db8::1]:443".
+pub fn udp_addr_text(a: & UdpAddr) -> str {
+    if a.family == UDP_V6 {
+        return "[" + udp_addr_ip_text(a) + "]:" + int_to_str(a.port);
+    }
+    return udp_addr_ip_text(a) + ":" + int_to_str(a.port);
+}
+
+/// Whether two addresses are the same family, address, port and zone.
+pub fn udp_addr_same(a: & UdpAddr, b: & UdpAddr) -> bool {
+    if a.family != b.family || a.port != b.port || a.scope != b.scope || a.ip.len() != b.ip.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < a.ip.len() {
+        if a.ip.get(i) != b.ip.get(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An address as bytes (family, port, address), to compare, hash or bind
+/// a token to (QUIC address validation).
+pub fn udp_addr_key(a: & UdpAddr) -> Vec<i64> {
+    var k: Vec<i64> = Vec::new();
+    k.push(a.family);
+    k.push((a.port >> 8) & 255);
+    k.push(a.port & 255);
+    var i: i64 = 0;
+    while i < a.ip.len() {
+        k.push(a.ip.get(i) & 255);
+        i = i + 1;
+    }
+    return k;
+}
+
+/// An IPv4 address as the IPv4-mapped IPv6 address ::ffff:a.b.c.d (what a
+/// dual-stack IPv6 socket sends to), others unchanged.
+pub fn udp_addr_mapped(a: & UdpAddr) -> UdpAddr {
+    if a.family != UDP_V4 || a.ip.len() != 4 {
+        return UdpAddr { family: a.family, ip: a.ip, port: a.port, scope: a.scope };
+    }
+    var ip: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 10 {
+        ip.push(0);
+        i = i + 1;
+    }
+    ip.push(255);
+    ip.push(255);
+    i = 0;
+    while i < 4 {
+        ip.push(a.ip.get(i));
+        i = i + 1;
+    }
+    return UdpAddr { family: UDP_V6, ip: ip, port: a.port, scope: 0 };
+}
+
+/// A v4-mapped IPv6 address as plain IPv4; others unchanged.
+pub fn udp_addr_unmapped(a: & UdpAddr) -> UdpAddr {
+    if a.family == UDP_V6 && a.ip.len() == 16 {
+        var mapped: bool = a.ip.get(10) == 255 && a.ip.get(11) == 255;
+        var i: i64 = 0;
+        while i < 10 {
+            if a.ip.get(i) != 0 {
+                mapped = false;
+            }
+            i = i + 1;
+        }
+        if mapped {
+            var ip: Vec<i64> = Vec::new();
+            i = 12;
+            while i < 16 {
+                ip.push(a.ip.get(i));
+                i = i + 1;
+            }
+            return UdpAddr { family: UDP_V4, ip: ip, port: a.port, scope: 0 };
+        }
+    }
+    return UdpAddr { family: a.family, ip: a.ip, port: a.port, scope: a.scope };
+}
+
+/// Write `a` as a sockaddr into the 128-byte block `sa`: its length.
+fn ud_write_sockaddr(sa: i64, a: & UdpAddr) -> i64 {
+    val af: i64 = ud_af(a.family);
+    var len: i64 = 16;
+    if a.family == UDP_V6 {
+        len = 28;
+    }
+    if ud_len_byte() {
+        ud_put(sa, 0, len);
+        ud_put(sa, 1, af);
+    } else {
+        ud_put(sa, 0, af);
+        ud_put(sa, 1, af >> 8);
+    }
+    ud_put(sa, 2, a.port >> 8);
+    ud_put(sa, 3, a.port);
+    if a.family == UDP_V6 {
+        var i: i64 = 0;
+        while i < 16 {
+            ud_put(sa, 8 + i, a.ip.get(i));
+            i = i + 1;
+        }
+        ud_put32le(sa, 24, a.scope);
+    } else {
+        var i: i64 = 0;
+        while i < 4 {
+            ud_put(sa, 4 + i, a.ip.get(i));
+            i = i + 1;
+        }
+    }
+    return len;
+}
+
+/// The address a sockaddr block holds (family 0 for anything else).
+fn ud_read_sockaddr(sa: i64) -> UdpAddr {
+    var af: i64 = 0;
+    if ud_len_byte() {
+        af = ud_get(sa, 1);
+    } else {
+        af = ud_get(sa, 0) | (ud_get(sa, 1) << 8);
+    }
+    val port: i64 = (ud_get(sa, 2) << 8) | ud_get(sa, 3);
+    var ip: Vec<i64> = Vec::new();
+    if af == ud_af(UDP_V6) {
+        var i: i64 = 0;
+        while i < 16 {
+            ip.push(ud_get(sa, 8 + i));
+            i = i + 1;
+        }
+        return UdpAddr { family: UDP_V6, ip: ip, port: port, scope: ud_get32le(sa, 24) };
+    }
+    if af == ud_af(UDP_V4) {
+        var i: i64 = 0;
+        while i < 4 {
+            ip.push(ud_get(sa, 4 + i));
+            i = i + 1;
+        }
+        return UdpAddr { family: UDP_V4, ip: ip, port: port, scope: 0 };
+    }
+    return udp_addr_none();
+}
+
+// ─── Sockets ────────────────────────────────────────────────────────────
+
+/// A UDP socket of a family (UDP_V4, UDP_V6): its descriptor, -1 on
+/// failure. An IPv6 socket is made dual-stack (IPV6_V6ONLY off), so it
+/// also talks to IPv4 peers, which it sees as v4-mapped addresses.
+pub fn udp_open(family: i64) -> i64 {
+    if family != UDP_V4 && family != UDP_V6 {
+        return - 1;
+    }
+    val s: i64 = ud_os_socket(ud_af(family));
+    if s < 0 {
+        return - 1;
+    }
+    if family == UDP_V6 {
+        ud_os_setopt(s, UD_IPPROTO_IPV6, ud_v6only_opt(), 0);
+    }
+    return s;
+}
+
+/// Bind a socket to a local address (udp_addr_any for every address of
+/// the family; port 0: one the system picks, udp_local_port tells which).
+/// An IPv4 address is bound as v4-mapped on an IPv6 socket.
+pub fn udp_bind(sock: i64, a: & UdpAddr) -> bool {
+    if sock < 0 || !udp_addr_ok(a) {
+        return false;
+    }
+    val sa: i64 = ud_block(UD_ADDR_MAX);
+    if sa == 0 {
+        return false;
+    }
+    val len: i64 = ud_write_sockaddr(sa, a);
+    val r: i64 = ud_os_bind(sock, sa, len);
+    p_free(sa);
+    return r == 0;
+}
+
+/// A socket of the address's family bound to it: -1 on failure.
+pub fn udp_listen(a: & UdpAddr) -> i64 {
+    val s: i64 = udp_open(a.family);
+    if s < 0 {
+        return - 1;
+    }
+    if !udp_bind(s, a) {
+        ud_os_close(s);
+        return - 1;
+    }
+    return s;
+}
+
+/// The address a socket is bound to (family 0 when unknown).
+pub fn udp_local_addr(sock: i64) -> UdpAddr {
+    if sock < 0 {
+        return udp_addr_none();
+    }
+    val sa: i64 = ud_block(UD_ADDR_MAX);
+    val lenp: i64 = ud_block(8);
+    if sa == 0 || lenp == 0 {
+        return udp_addr_none();
+    }
+    ud_put32le(lenp, 0, UD_ADDR_MAX);
+    var a: UdpAddr = udp_addr_none();
+    if ud_os_getsockname(sock, sa, lenp) == 0 {
+        a = ud_read_sockaddr(sa);
+    }
+    p_free(sa);
+    p_free(lenp);
+    return a;
+}
+
+/// The port a socket is bound to, -1 when unknown.
+pub fn udp_local_port(sock: i64) -> i64 {
+    val a: UdpAddr = udp_local_addr(sock);
+    if a.family == 0 {
+        return - 1;
+    }
+    return a.port;
+}
+
+/// Send one datagram: the number of bytes sent, -1 on error. `to` is
+/// written in the socket's family: pass `sock_family` UDP_V6 for an IPv6
+/// socket and an IPv4 `to` is sent v4-mapped.
+pub fn udp_send_on(sock: i64, sock_family: i64, data: Vec<i64>, to: & UdpAddr) -> i64 {
+    if sock < 0 || !udp_addr_ok(to) {
+        return - 1;
+    }
+    var dest: UdpAddr = udp_addr_unmapped(to);
+    if sock_family == UDP_V6 {
+        dest = udp_addr_mapped(to);
+    }
+    val n: i64 = data.len();
+    var room: i64 = n;
+    if room < 1 {
+        room = 1;
+    }
+    val buf: i64 = p_malloc(room);
+    val sa: i64 = ud_block(UD_ADDR_MAX);
+    if buf == 0 || sa == 0 {
+        return - 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        ud_put(buf, i, data.get(i));
+        i = i + 1;
+    }
+    val len: i64 = ud_write_sockaddr(sa, & dest);
+    val r: i64 = ud_os_sendto(sock, buf, n, sa, len);
+    p_free(buf);
+    p_free(sa);
+    if r < 0 {
+        return - 1;
+    }
+    return r;
+}
+
+/// Send one datagram on a socket of `to`'s own family.
+pub fn udp_send(sock: i64, data: Vec<i64>, to: & UdpAddr) -> i64 {
+    return udp_send_on(sock, to.family, data, to);
+}
+
+/// Whether a datagram is waiting, within `timeout_ms` (0: just look).
+pub fn udp_wait(sock: i64, timeout_ms: i64) -> bool {
+    if sock < 0 {
+        return false;
+    }
+    var t: i64 = timeout_ms;
+    if t < 0 {
+        t = 0;
+    }
+    return ud_os_wait(sock, t);
+}
+
+/// Receive one datagram of up to `max` bytes, waiting up to `timeout_ms`:
+/// its bytes ([] on a timeout or an error); the sender goes to `from`
+/// (v4-mapped senders of a dual-stack socket as IPv4).
+pub fn udp_recv(sock: i64, max: i64, timeout_ms: i64, from: & mut UdpAddr) -> Vec<i64> {
+    if sock < 0 || max <= 0 {
+        return ud_none();
+    }
+    if !udp_wait(sock, timeout_ms) {
+        return ud_none();
+    }
+    val buf: i64 = p_malloc(max);
+    val sa: i64 = ud_block(UD_ADDR_MAX);
+    val lenp: i64 = ud_block(8);
+    if buf == 0 || sa == 0 || lenp == 0 {
+        return ud_none();
+    }
+    ud_put32le(lenp, 0, UD_ADDR_MAX);
+    val r: i64 = ud_os_recvfrom(sock, buf, max, sa, lenp);
+    var out: Vec<i64> = Vec::new();
+    if r > 0 {
+        var n: i64 = r;
+        if n > max {
+            n = max;
+        }
+        var i: i64 = 0;
+        while i < n {
+            out.push(ud_get(buf, i));
+            i = i + 1;
+        }
+        val got: UdpAddr = ud_read_sockaddr(sa);
+        val plain: UdpAddr = udp_addr_unmapped(& got);
+        from.family = plain.family;
+        from.ip = plain.ip;
+        from.port = plain.port;
+        from.scope = plain.scope;
+    }
+    p_free(buf);
+    p_free(sa);
+    p_free(lenp);
+    return out;
+}
+
+/// Close a socket.
+pub fn udp_close(sock: i64) {
+    if sock >= 0 {
+        ud_os_close(sock);
+    }
+}

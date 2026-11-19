@@ -1,0 +1,66 @@
+// LG9: `comptime splice { block }` is an expression written by compile-time
+// code. The block runs in the compiler and returns source text; that text,
+// parsed as one expression, takes the splice's place before type checking.
+// Locals the generated expression declares are named with gensym, so they
+// never capture the caller's names: offset_by_100("t") reads the caller's
+// `t` (7), not its own temporary (100). gensym is known in a `comptime fn`
+// (type-checked as compile-time code); a comptime fn the program calls at
+// run time gets a fresh `<prefix>__gsr<n>` string from each call.
+// Expected output:
+// 107
+// 10
+// 6
+// 5
+// 21
+// 30
+// 12
+// true
+// true
+// false
+
+comptime fn offset_by_100(e: str) -> str {
+    val t = gensym("t");
+    return "{ val " + t + " = 100; " + t + " + " + e + " }";
+}
+
+comptime fn sum_upto(n: i64) -> str {
+    var s: str = "0";
+    var i: i64 = 1;
+    while i <= n {
+        s = s + " + " + int_to_str(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+struct Pt { x: i64, y: i64 }
+
+impl Pt {
+    fn total(self: Pt) -> i64 {
+        return comptime splice { return "self.x + self.y"; };
+    }
+}
+
+const SPLICED: i64 = comptime splice { return "3 * 10"; };
+
+// Not a comptime fn: offset_by_100 runs when the program does
+fn rt_text(e: str) -> str {
+    return offset_by_100(e);
+}
+
+fn main() -> i64 {
+    val t = 7;
+    println(comptime splice { return offset_by_100("t"); });
+    println(comptime splice { return sum_upto(4); });
+    val n = 3;
+    println(comptime splice { return "n * " + int_to_str(2); });
+    comptime splice { return "println(5)"; };
+    val p = Pt { x: 20, y: 1 };
+    println(p.total());
+    println(SPLICED);
+    println(comptime splice { return "comptime splice { return \"6\"; } * 2"; });
+    println(str_starts_with(comptime splice { return "\"" + gensym("helper") + "\""; }, "helper__gs"));
+    println(str_starts_with(rt_text("x"), "{ val t__gsr"));
+    println(rt_text("x") == rt_text("x"));
+    return 0;
+}

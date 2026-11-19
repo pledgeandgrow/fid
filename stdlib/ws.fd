@@ -20,7 +20,7 @@
 //   }
 
 module ws;
- use vec; use string; use encoding; use random;
+ use vec; use string; use encoding; use crypto;
 // ─── SHA-1 (RFC 3174) — needed only for the handshake ───────────────────
 
 fn sha1_rol(x: i64, n: i64) -> i64 {
@@ -180,13 +180,9 @@ pub fn ws_accept_key(key: str) -> str {
 }
 
 fn ws_gen_key() -> str {
-    var b: Vec = Vec::new();
-    var i: i64 = 0;
-    while i < 16 {
-        b.push(random_int_range(0, 255));
-        i = i + 1;
-    }
-    return b64_encode_bytes(b);
+    // RFC 6455 §4.1: the key must be unpredictable — OS entropy, not the
+    // process PRNG.
+    return b64_encode_bytes(crypto_random_bytes(16));
 }
 
 // ─── I/O: the socket, or the TLS session module `wss` handed over ────────
@@ -372,12 +368,8 @@ pub fn ws_frame_encode(opcode: i64, payload: Vec, mask: bool) -> Vec {
     }
     var maskkey: Vec = Vec::new();
     if mask {
+        maskkey = crypto_random_bytes(4);
         var i: i64 = 0;
-        while i < 4 {
-            maskkey.push(random_int_range(0, 255));
-            i = i + 1;
-        }
-        i = 0;
         while i < 4 {
             f.push(maskkey.get(i));
             i = i + 1;
@@ -408,8 +400,17 @@ fn ws_write_bytes(fd: i64, tls: i64, data: Vec) -> i64 {
 }
 
 // Read exactly n bytes (may block); returns Vec (possibly short on EOF).
+/// Largest payload one frame may declare (16 MiB). A peer controls the
+/// length word — unchecked, it picked the size of the receive allocation.
+fn WS_MAX_PAYLOAD() -> i64 {
+    return 16777216;
+}
+
 fn ws_read_n(fd: i64, tls: i64, n: i64) -> Vec {
     var out: Vec = Vec::new();
+    if n < 0 || n > WS_MAX_PAYLOAD() {
+        return out;
+    }
     var buf: i64 = p_malloc(n + 4);
     var got: i64 = 0;
     var grd: i64 = 0;
@@ -475,6 +476,11 @@ pub fn ws_recv(c: WsConn) -> WsFrame {
                 q = q + 1;
             }
         }
+        // The peer picked len: a negative or huge value must not size an
+        // allocation. Reject the frame (treated like a broken connection).
+        if len < 0 || len > WS_MAX_PAYLOAD() {
+            return dead;
+        }
         var maskkey: Vec = Vec::new();
         if masked {
             maskkey = ws_read_n(c.fd, c.tls, 4);
@@ -522,6 +528,11 @@ pub fn ws_recv(c: WsConn) -> WsFrame {
                 acc.push(payload.get(pj));
                 pj = pj + 1;
             }
+        }
+        // Same bound on the reassembled message as on one frame —
+        // fragments must not bypass WS_MAX_PAYLOAD.
+        if acc.len() > WS_MAX_PAYLOAD() {
+            return dead;
         }
         grd = grd + 1;
     }

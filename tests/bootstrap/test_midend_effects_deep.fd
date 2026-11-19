@@ -1,0 +1,78 @@
+// WP9, WP10 (compiler/rules.fd, iropt.fd iro_effect_masks): a call merged
+// with an earlier one must not hide what the callee does further down.
+// - twice_deep: wrap2 calls wrap, which calls bump, which writes a global.
+//   Lowering records no effects on a call to a program function, so wrap2
+//   and wrap looked pure one level down and the second wrap2() became a
+//   copy of the first (bump ran once). The effects a caller sees are now
+//   joined over everything a function calls.
+// - loop_reads: peek only reads, poke writes what peek reads. The second
+//   peek() call sits in a loop body after the first one (outside the loop)
+//   and poke runs after it in the same block, so every way from one call
+//   to the next passes a write: with FID_RULES_ON=readcse they stay apart.
+// The program prints the same with the passes on and off.
+//
+// Expected output:
+// 14
+// 2
+// 23
+// 12
+
+var g_count: i64 = 0;
+var g_val: i64 = 1;
+
+fn bump() -> i64 {
+    if g_count > 1000 {
+        g_count = 0;
+    } else {
+        g_count = g_count + 1;
+    }
+    return g_count;
+}
+
+fn wrap() -> i64 {
+    val unused: i64 = bump();
+    return 7;
+}
+
+fn wrap2() -> i64 {
+    return wrap();
+}
+
+fn peek() -> i64 {
+    return g_val;
+}
+
+fn poke(v: i64) {
+    if v > 100 {
+        g_val = 0;
+    } else {
+        g_val = v;
+    }
+}
+
+fn twice_deep() -> i64 {
+    val a: i64 = wrap2();
+    val b: i64 = wrap2();
+    return a + b;
+}
+
+fn loop_reads() -> i64 {
+    var total: i64 = peek();
+    var i: i64 = 0;
+    while i < 3 {
+        total = total + peek();
+        poke(i + 10);
+        if i > 5 {
+            total = total + 1000;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    println(twice_deep());
+    println(g_count);
+    println(loop_reads());
+    println(g_val);
+}

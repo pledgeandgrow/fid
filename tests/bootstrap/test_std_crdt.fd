@@ -1,0 +1,218 @@
+// stdlib/crdt: vector clock ordering, G-/PN-counters, LWW ties, OR-Set
+// add-wins semantics, RGA text editing with concurrent inserts and
+// deletes, deltas and the text serialization; every type is merged from
+// three replicas in 12 shuffled orders (with repeated merges) and must
+// converge to the same state.
+// Expected output:
+// vclock concurrent before after equal A=2,B=1
+// escape a%7Cb%2Cc%3D%25 -> a|b,c=%
+// gcounter 10 converged true idempotent 10 decoded 10
+// pncounter 3 converged true decoded 3
+// lww Bob wins true converged true decoded Bob
+// orset eggs,jam,milk converged true bread false
+// orset delta eggs,milk same as state true decoded eggs,jam,milk
+// rga Hello! world converged true
+// rga same-place concurrent abXY / abXY
+// rga decoded Hello! world delta Hello! world
+use crdt;
+use vec;
+use string;
+
+var seed: i64 = 12345;
+
+fn rnd(n: i64) -> i64 {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+}
+
+// A shuffled order of 0, 1, 2 with each index listed twice.
+fn order() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(0); v.push(1); v.push(2); v.push(0); v.push(1); v.push(2);
+    var i: i64 = v.len() - 1;
+    while i > 0 {
+        val j: i64 = rnd(i + 1);
+        val t: i64 = v.get(i);
+        v.set(i, v.get(j));
+        v.set(j, t);
+        i = i - 1;
+    }
+    return v;
+}
+
+fn join(v: Vec<str>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() { if i > 0 { s = s + ","; } s = s + v.get(i); i = i + 1; }
+    return s;
+}
+
+fn cmp_name(c: i64) -> str {
+    if c == CRDT_EQUAL { return "equal"; }
+    if c == CRDT_BEFORE { return "before"; }
+    if c == CRDT_AFTER { return "after"; }
+    return "concurrent";
+}
+
+fn main() {
+    var a: VClock = vclock_new();
+    vclock_tick(&mut a, "B");
+    vclock_tick(&mut a, "A");
+    vclock_tick(&mut a, "A");
+    var b: VClock = vclock_new();
+    vclock_tick(&mut b, "A");
+    vclock_tick(&mut b, "B");
+    vclock_tick(&mut b, "B");
+    var m: VClock = a;
+    vclock_merge(&mut m, &b);
+    println("vclock " + cmp_name(vclock_compare(&a, &b)) + " " + cmp_name(vclock_compare(&a, &m)) + " "
+        + cmp_name(vclock_compare(&m, &b)) + " " + cmp_name(vclock_compare(&m, &m)) + " " + vclock_encode(&a));
+    val esc: str = crdt_esc("a|b,c=%");
+    println("escape " + esc + " -> " + crdt_unesc(esc));
+
+    // G-Counter
+    var gs: Vec<GCounter> = Vec::new();
+    var g0: GCounter = gcounter_new(); gcounter_inc(&mut g0, "A", 3); gs.push(g0);
+    var g1: GCounter = gcounter_new(); gcounter_inc(&mut g1, "B", 5); gs.push(g1);
+    var g2: GCounter = gcounter_new(); gcounter_inc(&mut g2, "C", 1); gcounter_inc(&mut g2, "C", 1); gs.push(g2);
+    var first: str = "";
+    var conv: bool = true;
+    var k: i64 = 0;
+    while k < 12 {
+        val o: Vec<i64> = order();
+        var acc: GCounter = gcounter_new();
+        var i: i64 = 0;
+        while i < o.len() { gcounter_merge(&mut acc, &gs.get(o.get(i))); i = i + 1; }
+        val enc: str = gcounter_encode(&acc);
+        if k == 0 { first = enc; } else if enc != first { conv = false; }
+        k = k + 1;
+    }
+    var gall: GCounter = gcounter_decode(first);
+    val gv: i64 = gcounter_value(&gall);
+    gcounter_merge(&mut gall, &gs.get(1));
+    println("gcounter " + int_to_str(gv) + " converged " + bool_to_str(conv) + " idempotent " + int_to_str(gcounter_value(&gall))
+        + " decoded " + int_to_str(gcounter_value(&gcounter_decode(first))));
+
+    // PN-Counter
+    var ps: Vec<PNCounter> = Vec::new();
+    var p0: PNCounter = pncounter_new(); pncounter_add(&mut p0, "A", 5); ps.push(p0);
+    var p1: PNCounter = pncounter_new(); pncounter_add(&mut p1, "B", -3); ps.push(p1);
+    var p2: PNCounter = pncounter_new(); pncounter_add(&mut p2, "C", 2); pncounter_add(&mut p2, "C", -1); ps.push(p2);
+    conv = true;
+    k = 0;
+    while k < 12 {
+        val o: Vec<i64> = order();
+        var acc: PNCounter = pncounter_new();
+        var i: i64 = 0;
+        while i < o.len() { pncounter_merge(&mut acc, &ps.get(o.get(i))); i = i + 1; }
+        val enc: str = pncounter_encode(&acc);
+        if k == 0 { first = enc; } else if enc != first { conv = false; }
+        k = k + 1;
+    }
+    println("pncounter " + int_to_str(pncounter_value(&pncounter_decode(first))) + " converged " + bool_to_str(conv)
+        + " decoded " + int_to_str(pncounter_value(&pncounter_decode(first))));
+
+    // LWW-Register: equal timestamps, the larger node id wins
+    var ls: Vec<LwwRegister> = Vec::new();
+    var l0: LwwRegister = lww_new(); lww_set(&mut l0, "Alice", 100, "n1"); ls.push(l0);
+    var l1: LwwRegister = lww_new(); lww_set(&mut l1, "Bob", 100, "n2"); ls.push(l1);
+    var l2: LwwRegister = lww_new(); lww_set(&mut l2, "Carol", 90, "n3"); ls.push(l2);
+    conv = true;
+    k = 0;
+    while k < 12 {
+        val o: Vec<i64> = order();
+        var acc: LwwRegister = lww_new();
+        var i: i64 = 0;
+        while i < o.len() { lww_merge(&mut acc, &ls.get(o.get(i))); i = i + 1; }
+        val enc: str = lww_encode(&acc);
+        if k == 0 { first = enc; } else if enc != first { conv = false; }
+        k = k + 1;
+    }
+    val lw: LwwRegister = lww_decode(first);
+    println("lww " + lw.value + " wins " + bool_to_str(lw.node == "n2") + " converged " + bool_to_str(conv) + " decoded " + lw.value);
+
+    // OR-Set: B removes milk while A re-adds it: the re-add survives
+    var sa: ORSet = orset_new();
+    orset_add(&mut sa, "A", "milk");
+    orset_add(&mut sa, "A", "eggs");
+    var sb: ORSet = orset_new();
+    orset_merge(&mut sb, &sa);
+    val b_clock: VClock = sb.clock;
+    orset_remove(&mut sb, "milk");
+    orset_add(&mut sa, "A", "milk");
+    var sc: ORSet = orset_new();
+    orset_add(&mut sc, "C", "bread");
+    orset_remove(&mut sc, "bread");
+    orset_add(&mut sc, "C", "jam");
+    var sets: Vec<ORSet> = Vec::new();
+    sets.push(sa); sets.push(sb); sets.push(sc);
+    conv = true;
+    var firstv: str = "";
+    var last: ORSet = orset_new();
+    k = 0;
+    while k < 12 {
+        val o: Vec<i64> = order();
+        var acc: ORSet = orset_new();
+        var i: i64 = 0;
+        while i < o.len() { orset_merge(&mut acc, &sets.get(o.get(i))); i = i + 1; }
+        val vals: str = join(orset_values(&acc));
+        if k == 0 { firstv = vals; last = acc; } else if vals != firstv { conv = false; }
+        k = k + 1;
+    }
+    println("orset " + firstv + " converged " + bool_to_str(conv) + " bread " + bool_to_str(orset_contains(&last, "bread")));
+    // B catches up with A through a delta since what B had seen
+    var viad: ORSet = sets.get(1);
+    orset_merge(&mut viad, &orset_delta(&sets.get(0), &b_clock));
+    var vias: ORSet = sets.get(1);
+    orset_merge(&mut vias, &sets.get(0));
+    println("orset delta " + join(orset_values(&viad)) + " same as state " + bool_to_str(join(orset_values(&viad)) == join(orset_values(&vias)))
+        + " decoded " + join(orset_values(&orset_decode(orset_encode(&last)))));
+
+    // RGA: "hello" shared, then concurrent edits on three replicas
+    var ra: Rga = rga_new();
+    rga_insert_text(&mut ra, "A", 0, "hello");
+    var rb: Rga = rga_new();
+    rga_merge(&mut rb, &ra);
+    var rc: Rga = rga_new();
+    rga_merge(&mut rc, &ra);
+    val shared: VClock = ra.clock;
+    rga_insert_text(&mut ra, "A", 5, " world");
+    rga_insert(&mut rb, "B", 5, "!");
+    rga_delete_at(&mut rc, 0);
+    rga_insert(&mut rc, "C", 0, "H");
+    var reps: Vec<Rga> = Vec::new();
+    reps.push(ra); reps.push(rb); reps.push(rc);
+    conv = true;
+    var firstt: str = "";
+    var lastr: Rga = rga_new();
+    k = 0;
+    while k < 12 {
+        val o: Vec<i64> = order();
+        var acc: Rga = rga_new();
+        var i: i64 = 0;
+        while i < o.len() { rga_merge(&mut acc, &reps.get(o.get(i))); i = i + 1; }
+        val t: str = rga_encode(&acc);
+        if k == 0 { firstt = t; lastr = acc; } else if t != firstt { conv = false; }
+        k = k + 1;
+    }
+    println("rga " + rga_text(&lastr) + " converged " + bool_to_str(conv));
+    // two replicas insert at the same place: both see the same order
+    var x: Rga = rga_new();
+    rga_insert_text(&mut x, "A", 0, "ab");
+    var y: Rga = rga_new();
+    rga_merge(&mut y, &x);
+    rga_insert(&mut x, "A", 2, "Y");
+    rga_insert(&mut y, "B", 2, "X");
+    var xy: Rga = x;
+    rga_merge(&mut xy, &y);
+    var yx: Rga = y;
+    rga_merge(&mut yx, &x);
+    println("rga same-place concurrent " + rga_text(&xy) + " / " + rga_text(&yx));
+    var dec: Rga = rga_new();
+    rga_decode_into(&mut dec, rga_encode(&lastr));
+    // replica B receives A's and C's changes as deltas since "hello"
+    var bd: Rga = reps.get(1);
+    rga_decode_into(&mut bd, rga_encode(&rga_delta(&reps.get(0), &shared)));
+    rga_decode_into(&mut bd, rga_encode(&rga_delta(&reps.get(2), &shared)));
+    println("rga decoded " + rga_text(&dec) + " delta " + rga_text(&bd));
+}

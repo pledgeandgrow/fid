@@ -11,7 +11,7 @@
 #
 # Users check a download with:
 #   sha256sum -c SHA256SUMS.txt --ignore-missing          (Linux, Git Bash)
-#   Get-FileHash Fides-Setup-1.0.0.exe -Algorithm SHA256  (PowerShell)
+#   Get-FileHash Fid-Setup-1.0.0.exe -Algorithm SHA256  (PowerShell)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,7 +19,7 @@ cd "$ROOT"
 
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
-    for f in installer/Fides-Setup-*.exe release/fid.exe release/fidesc.exe \
+    for f in installer/Fid-Setup-*.exe installer/Fides-Setup-*.exe release/fid.exe release/fidesc.exe \
              release/ark.exe release/scribe.exe release/veil.exe; do
         [ -f "$f" ] && files+=("$f")
     done

@@ -1,0 +1,540 @@
+// Fides ARM semihosting, pure Fides with the trap behind a seam.
+//
+// Semihosting lets firmware running under a debugger (OpenOCD, pyOCD,
+// QEMU -semihosting) use the host's console and files: the program puts
+// an operation number in r0 (w0/x0, a0 on RISC-V), the address of a
+// parameter block (or a value) in r1, and executes the trap instruction;
+// the debugger performs the call and returns the result in r0. From the
+// Arm "Semihosting for AArch32 and AArch64" specification (release 2.0):
+//   - operation numbers (SYS_OPEN 0x01 ... SYS_EXIT 0x18, SYS_EXIT_EXTENDED
+//     0x20, SYS_ELAPSED 0x30, SYS_TICKFREQ 0x31) and their parameter
+//     blocks: consecutive fields of the target's word size (4 bytes on
+//     AArch32/M-profile, 8 on AArch64),
+//   - the fopen() mode numbers (0 "r" .. 11 "a+b") and the ":tt" console
+//     file name, SYS_EXIT reason codes (ADP_Stopped_ApplicationExit
+//     0x20026 ...), the return conventions (SYS_WRITE/SYS_READ return the
+//     number of bytes NOT transferred, -1 on error),
+//   - the trap instructions: BKPT 0xAB (Thumb, M-profile), HLT #0x3C
+//     (T32), HLT #0xF000 (A32 and A64), and the RISC-V
+//     slli/ebreak/srai sequence.
+//
+// The seam: the trap itself. Fides inline asm is x86 only, so semi_trap
+// hands the call to a SemiHost, a software model of the debugger's side
+// (in-memory files, captured console, clock, exit status) that reads the
+// parameter blocks from a model of target memory (SemiMem) byte for byte
+// as a debugger reads them over SWD/JTAG. Firmware code written against
+// SemiTarget builds exactly the blocks the real trap needs; on hardware
+// semi_trap is replaced by the one instruction (the encodings are below).
+
+module semihosting;
+ use vec; use string;
+
+pub const SYS_OPEN: i64 = 0x01;
+pub const SYS_CLOSE: i64 = 0x02;
+pub const SYS_WRITEC: i64 = 0x03;
+pub const SYS_WRITE0: i64 = 0x04;
+pub const SYS_WRITE: i64 = 0x05;
+pub const SYS_READ: i64 = 0x06;
+pub const SYS_READC: i64 = 0x07;
+pub const SYS_ISERROR: i64 = 0x08;
+pub const SYS_ISTTY: i64 = 0x09;
+pub const SYS_SEEK: i64 = 0x0A;
+pub const SYS_FLEN: i64 = 0x0C;
+pub const SYS_TMPNAM: i64 = 0x0D;
+pub const SYS_REMOVE: i64 = 0x0E;
+pub const SYS_RENAME: i64 = 0x0F;
+pub const SYS_CLOCK: i64 = 0x10;
+pub const SYS_TIME: i64 = 0x11;
+pub const SYS_SYSTEM: i64 = 0x12;
+pub const SYS_ERRNO: i64 = 0x13;
+pub const SYS_GET_CMDLINE: i64 = 0x15;
+pub const SYS_HEAPINFO: i64 = 0x16;
+pub const SYS_EXIT: i64 = 0x18;
+pub const SYS_EXIT_EXTENDED: i64 = 0x20;
+pub const SYS_ELAPSED: i64 = 0x30;
+pub const SYS_TICKFREQ: i64 = 0x31;
+
+pub const ADP_STOPPED_BRANCH_THROUGH_ZERO: i64 = 0x20000;
+pub const ADP_STOPPED_UNDEFINED_INSTR: i64 = 0x20001;
+pub const ADP_STOPPED_SOFTWARE_INTERRUPT: i64 = 0x20002;
+pub const ADP_STOPPED_PREFETCH_ABORT: i64 = 0x20003;
+pub const ADP_STOPPED_DATA_ABORT: i64 = 0x20004;
+pub const ADP_STOPPED_INTERNAL_ERROR: i64 = 0x20024;
+pub const ADP_STOPPED_RUNTIME_ERROR_UNKNOWN: i64 = 0x20023;
+pub const ADP_STOPPED_APPLICATION_EXIT: i64 = 0x20026;
+
+// Trap instructions.
+pub const SEMI_BKPT_THUMB: i64 = 0xBEAB;
+pub const SEMI_HLT_T32: i64 = 0xBABC;
+pub const SEMI_HLT_A32: i64 = 0xE10F0070;
+pub const SEMI_HLT_A64: i64 = 0xD45E0000;
+pub const SEMI_RISCV_SLLI: i64 = 0x01F01013;
+pub const SEMI_RISCV_EBREAK: i64 = 0x00100073;
+pub const SEMI_RISCV_SRAI: i64 = 0x40705013;
+
+pub fn semi_op_name(op: i64) -> str {
+    if op == 0x01 { return "SYS_OPEN"; }
+    if op == 0x02 { return "SYS_CLOSE"; }
+    if op == 0x03 { return "SYS_WRITEC"; }
+    if op == 0x04 { return "SYS_WRITE0"; }
+    if op == 0x05 { return "SYS_WRITE"; }
+    if op == 0x06 { return "SYS_READ"; }
+    if op == 0x07 { return "SYS_READC"; }
+    if op == 0x08 { return "SYS_ISERROR"; }
+    if op == 0x09 { return "SYS_ISTTY"; }
+    if op == 0x0A { return "SYS_SEEK"; }
+    if op == 0x0C { return "SYS_FLEN"; }
+    if op == 0x0D { return "SYS_TMPNAM"; }
+    if op == 0x0E { return "SYS_REMOVE"; }
+    if op == 0x0F { return "SYS_RENAME"; }
+    if op == 0x10 { return "SYS_CLOCK"; }
+    if op == 0x11 { return "SYS_TIME"; }
+    if op == 0x12 { return "SYS_SYSTEM"; }
+    if op == 0x13 { return "SYS_ERRNO"; }
+    if op == 0x15 { return "SYS_GET_CMDLINE"; }
+    if op == 0x16 { return "SYS_HEAPINFO"; }
+    if op == 0x18 { return "SYS_EXIT"; }
+    if op == 0x20 { return "SYS_EXIT_EXTENDED"; }
+    if op == 0x30 { return "SYS_ELAPSED"; }
+    if op == 0x31 { return "SYS_TICKFREQ"; }
+    return "op " + int_to_str(op);
+}
+
+/// fopen() mode string to the SYS_OPEN mode number; -1 when unknown.
+pub fn semi_open_mode(m: str) -> i64 {
+    val modes: Vec<str> = str_split("r,rb,r+,r+b,w,wb,w+,w+b,a,ab,a+,a+b", ",");
+    var i: i64 = 0;
+    while i < modes.len() {
+        if str_equal(modes.get(i), m) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ─── Target memory ──────────────────────────────────────────────────────
+
+pub struct SemiMem {
+    pub base: i64,
+    pub bytes: Vec<i64>,
+    pub word: i64,
+}
+
+/// `size` bytes of target RAM at `base`; `word` 4 (AArch32) or 8 (AArch64).
+pub fn semimem_new(base: i64, size: i64, word: i64) -> SemiMem {
+    return SemiMem { base: base, bytes: Vec::filled(size, 0), word: word };
+}
+
+pub fn semimem_rd8(m: &SemiMem, a: i64) -> i64 {
+    return m.bytes.get(a - m.base);
+}
+
+pub fn semimem_wr8(m: &mut SemiMem, a: i64, v: i64) {
+    m.bytes.set(a - m.base, v & 0xFF);
+}
+
+/// A target word (little-endian; sign-extended so -1 reads as -1).
+pub fn semimem_rdw(m: &SemiMem, a: i64) -> i64 {
+    var v: i64 = 0;
+    var i: i64 = m.word - 1;
+    while i >= 0 {
+        v = (v << 8) | m.bytes.get(a - m.base + i);
+        i = i - 1;
+    }
+    if m.word == 4 && v >= 0x80000000 { v = v - 0x100000000; }
+    return v;
+}
+
+pub fn semimem_wrw(m: &mut SemiMem, a: i64, v: i64) {
+    var i: i64 = 0;
+    while i < m.word {
+        m.bytes.set(a - m.base + i, (v >> (8 * i)) & 0xFF);
+        i = i + 1;
+    }
+}
+
+pub fn semimem_write_bytes(m: &mut SemiMem, a: i64, b: Vec<i64>) {
+    var i: i64 = 0;
+    while i < b.len() {
+        semimem_wr8(m, a + i, b.get(i));
+        i = i + 1;
+    }
+}
+
+pub fn semimem_read_bytes(m: &SemiMem, a: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(semimem_rd8(m, a + i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The NUL-terminated string at `a`.
+pub fn semimem_cstr(m: &SemiMem, a: i64) -> str {
+    var out: str = "";
+    var p: i64 = a;
+    while semimem_rd8(m, p) != 0 {
+        out = out + byte_to_str(semimem_rd8(m, p));
+        p = p + 1;
+    }
+    return out;
+}
+
+fn semi_bytes_str(b: Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        s = s + byte_to_str(b.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+// ─── The host (debugger) side ───────────────────────────────────────────
+
+pub struct SemiFile {
+    pub name: str,
+    pub pos: i64,
+    pub mode: i64,
+    pub open: bool,
+    pub tty: bool,
+}
+
+pub struct SemiHost {
+    pub files: HashMap<str, Vec<i64>>,
+    pub handles: Vec<SemiFile>,
+    pub console: str,
+    pub input: Vec<i64>,
+    pub errno: i64,
+    pub exited: bool,
+    pub exit_reason: i64,
+    pub exit_code: i64,
+    pub clock_cs: i64,
+    pub time: i64,
+    pub ticks: i64,
+    pub tick_freq: i64,
+    pub cmdline: str,
+    pub calls: Vec<str>,
+}
+
+pub fn semihost_new() -> SemiHost {
+    return SemiHost {
+        files: HashMap::new(), handles: Vec::new(), console: "", input: Vec::new(), errno: 0, exited: false,
+        exit_reason: 0, exit_code: 0, clock_cs: 0, time: 0, ticks: 0, tick_freq: 1000000, cmdline: "", calls: Vec::new()
+    };
+}
+
+const SEMI_ENOENT: i64 = 2;
+const SEMI_EBADF: i64 = 9;
+const SEMI_EINVAL: i64 = 22;
+
+fn semi_handle_ok(h: &SemiHost, fd: i64) -> bool {
+    return fd >= 1 && fd <= h.handles.len() && h.handles.get(fd - 1).open;
+}
+
+/// Perform one semihosting call as the debugger does: r0 = op, r1 = the
+/// parameter block address (or value). Returns the new r0.
+pub fn semihost_call(h: &mut SemiHost, m: &mut SemiMem, op: i64, r1: i64) -> i64 {
+    h.calls.push(semi_op_name(op));
+    val w: i64 = m.word;
+    if op == SYS_WRITEC {
+        h.console = h.console + byte_to_str(semimem_rd8(m, r1));
+        return 0;
+    }
+    if op == SYS_WRITE0 {
+        h.console = h.console + semimem_cstr(m, r1);
+        return 0;
+    }
+    if op == SYS_OPEN {
+        val name: str = semi_bytes_str(semimem_read_bytes(m, semimem_rdw(m, r1), semimem_rdw(m, r1 + 2 * w)));
+        val mode: i64 = semimem_rdw(m, r1 + w);
+        if mode < 0 || mode > 11 { h.errno = SEMI_EINVAL; return -1; }
+        val tty: bool = str_equal(name, ":tt");
+        if !tty {
+            if mode < 4 && !h.files.contains(name) { h.errno = SEMI_ENOENT; return -1; }
+            if mode >= 4 && mode < 8 { h.files.insert(name, Vec::new()); }
+            if mode >= 8 && !h.files.contains(name) { h.files.insert(name, Vec::new()); }
+        }
+        var pos: i64 = 0;
+        if mode >= 8 && !tty { pos = h.files.get(name).len(); }
+        h.handles.push(SemiFile { name: name, pos: pos, mode: mode, open: true, tty: tty });
+        return h.handles.len();
+    }
+    if op == SYS_CLOSE {
+        val fd: i64 = semimem_rdw(m, r1);
+        if !semi_handle_ok(h, fd) { h.errno = SEMI_EBADF; return -1; }
+        var f: SemiFile = h.handles.get(fd - 1);
+        f.open = false;
+        h.handles.set(fd - 1, f);
+        return 0;
+    }
+    if op == SYS_WRITE {
+        val fd: i64 = semimem_rdw(m, r1);
+        val ptr: i64 = semimem_rdw(m, r1 + w);
+        val len: i64 = semimem_rdw(m, r1 + 2 * w);
+        if !semi_handle_ok(h, fd) { h.errno = SEMI_EBADF; return len; }
+        var f: SemiFile = h.handles.get(fd - 1);
+        if f.mode < 2 { h.errno = SEMI_EBADF; return len; }
+        val data: Vec<i64> = semimem_read_bytes(m, ptr, len);
+        if f.tty {
+            h.console = h.console + semi_bytes_str(data);
+            return 0;
+        }
+        var content: Vec<i64> = h.files.get(f.name);
+        if f.mode >= 8 { f.pos = content.len(); }
+        var i: i64 = 0;
+        while i < len {
+            if f.pos < content.len() { content.set(f.pos, data.get(i)); } else { content.push(data.get(i)); }
+            f.pos = f.pos + 1;
+            i = i + 1;
+        }
+        h.files.insert(f.name, content);
+        h.handles.set(fd - 1, f);
+        return 0;
+    }
+    if op == SYS_READ {
+        val fd: i64 = semimem_rdw(m, r1);
+        val ptr: i64 = semimem_rdw(m, r1 + w);
+        val len: i64 = semimem_rdw(m, r1 + 2 * w);
+        if !semi_handle_ok(h, fd) { h.errno = SEMI_EBADF; return -1; }
+        var f: SemiFile = h.handles.get(fd - 1);
+        var got: Vec<i64> = Vec::new();
+        if f.tty {
+            while got.len() < len && h.input.len() > 0 {
+                got.push(h.input.get(0));
+                h.input.remove(0);
+            }
+        } else {
+            val content: Vec<i64> = h.files.get(f.name);
+            while got.len() < len && f.pos < content.len() {
+                got.push(content.get(f.pos));
+                f.pos = f.pos + 1;
+            }
+            h.handles.set(fd - 1, f);
+        }
+        semimem_write_bytes(m, ptr, got);
+        return len - got.len();
+    }
+    if op == SYS_READC {
+        if h.input.len() == 0 { return -1; }
+        val c: i64 = h.input.get(0);
+        h.input.remove(0);
+        return c;
+    }
+    if op == SYS_ISERROR {
+        if semimem_rdw(m, r1) < 0 { return 1; }
+        return 0;
+    }
+    if op == SYS_ISTTY {
+        val fd: i64 = semimem_rdw(m, r1);
+        if !semi_handle_ok(h, fd) { h.errno = SEMI_EBADF; return -1; }
+        if h.handles.get(fd - 1).tty { return 1; }
+        return 0;
+    }
+    if op == SYS_SEEK {
+        val fd: i64 = semimem_rdw(m, r1);
+        val pos: i64 = semimem_rdw(m, r1 + w);
+        if !semi_handle_ok(h, fd) || pos < 0 { h.errno = SEMI_EBADF; return -1; }
+        var f: SemiFile = h.handles.get(fd - 1);
+        f.pos = pos;
+        h.handles.set(fd - 1, f);
+        return 0;
+    }
+    if op == SYS_FLEN {
+        val fd: i64 = semimem_rdw(m, r1);
+        if !semi_handle_ok(h, fd) || h.handles.get(fd - 1).tty { h.errno = SEMI_EBADF; return -1; }
+        return h.files.get(h.handles.get(fd - 1).name).len();
+    }
+    if op == SYS_REMOVE {
+        val name: str = semi_bytes_str(semimem_read_bytes(m, semimem_rdw(m, r1), semimem_rdw(m, r1 + w)));
+        if !h.files.contains(name) { h.errno = SEMI_ENOENT; return -1; }
+        h.files.remove(name);
+        return 0;
+    }
+    if op == SYS_CLOCK { return h.clock_cs; }
+    if op == SYS_TIME { return h.time; }
+    if op == SYS_ERRNO { return h.errno; }
+    if op == SYS_TICKFREQ { return h.tick_freq; }
+    if op == SYS_ELAPSED {
+        // Writes a 64-bit tick count into the block (two words on AArch32).
+        if w == 4 {
+            semimem_wrw(m, r1, h.ticks & 0xFFFFFFFF);
+            semimem_wrw(m, r1 + 4, (h.ticks >> 32) & 0xFFFFFFFF);
+        } else {
+            semimem_wrw(m, r1, h.ticks);
+        }
+        return 0;
+    }
+    if op == SYS_GET_CMDLINE {
+        val buf: i64 = semimem_rdw(m, r1);
+        val cap: i64 = semimem_rdw(m, r1 + w);
+        if str_len(h.cmdline) + 1 > cap { return -1; }
+        var b: Vec<i64> = str_bytes(h.cmdline);
+        b.push(0);
+        semimem_write_bytes(m, buf, b);
+        semimem_wrw(m, r1 + w, str_len(h.cmdline));
+        return 0;
+    }
+    if op == SYS_EXIT {
+        h.exited = true;
+        if w == 8 {
+            h.exit_reason = semimem_rdw(m, r1);
+            h.exit_code = semimem_rdw(m, r1 + 8);
+        } else {
+            h.exit_reason = r1;
+            h.exit_code = 0;
+            if r1 != ADP_STOPPED_APPLICATION_EXIT { h.exit_code = 1; }
+        }
+        return 0;
+    }
+    if op == SYS_EXIT_EXTENDED {
+        h.exited = true;
+        h.exit_reason = semimem_rdw(m, r1);
+        h.exit_code = semimem_rdw(m, r1 + w);
+        return 0;
+    }
+    h.errno = SEMI_EINVAL;
+    return -1;
+}
+
+// ─── The target side ────────────────────────────────────────────────────
+
+/// Firmware view: target memory with a scratch area for parameter blocks
+/// and strings, and the trap (here: the host model).
+pub struct SemiTarget {
+    pub mem: SemiMem,
+    pub scratch: i64,
+    pub host: SemiHost,
+}
+
+pub fn semitarget_new(base: i64, size: i64, word: i64) -> SemiTarget {
+    return SemiTarget { mem: semimem_new(base, size, word), scratch: base, host: semihost_new() };
+}
+
+/// The seam: on hardware r0 = op, r1 = arg, then the trap instruction
+/// (SEMI_BKPT_THUMB / SEMI_HLT_A64 ...), result in r0.
+pub fn semi_trap(t: &mut SemiTarget, op: i64, r1: i64) -> i64 {
+    return semihost_call(&mut t.host, &mut t.mem, op, r1);
+}
+
+/// Lay out a parameter block of words at the scratch area; its address.
+pub fn semi_block(t: &mut SemiTarget, words: Vec<i64>) -> i64 {
+    val a: i64 = t.scratch;
+    var i: i64 = 0;
+    while i < words.len() {
+        semimem_wrw(&mut t.mem, a + i * t.mem.word, words.get(i));
+        i = i + 1;
+    }
+    return a;
+}
+
+/// Copy bytes into target memory after the parameter block area (offset
+/// 64 of the scratch area); returns their address.
+fn semi_stage(t: &mut SemiTarget, b: Vec<i64>) -> i64 {
+    val a: i64 = t.scratch + 64;
+    semimem_write_bytes(&mut t.mem, a, b);
+    return a;
+}
+
+pub fn semi_putc(t: &mut SemiTarget, c: i64) {
+    var b: Vec<i64> = Vec::new();
+    b.push(c);
+    semi_trap(t, SYS_WRITEC, semi_stage(t, b));
+}
+
+pub fn semi_puts(t: &mut SemiTarget, s: str) {
+    var b: Vec<i64> = str_bytes(s);
+    b.push(0);
+    semi_trap(t, SYS_WRITE0, semi_stage(t, b));
+}
+
+/// SYS_OPEN: a handle (>= 1) or -1.
+pub fn semi_open(t: &mut SemiTarget, name: str, mode: str) -> i64 {
+    var b: Vec<i64> = str_bytes(name);
+    b.push(0);
+    val na: i64 = semi_stage(t, b);
+    var w: Vec<i64> = Vec::new();
+    w.push(na);
+    w.push(semi_open_mode(mode));
+    w.push(str_len(name));
+    return semi_trap(t, SYS_OPEN, semi_block(t, w));
+}
+
+/// SYS_WRITE: bytes not written (0 = all).
+pub fn semi_write(t: &mut SemiTarget, fd: i64, data: Vec<i64>) -> i64 {
+    val da: i64 = semi_stage(t, data);
+    var w: Vec<i64> = Vec::new();
+    w.push(fd);
+    w.push(da);
+    w.push(data.len());
+    return semi_trap(t, SYS_WRITE, semi_block(t, w));
+}
+
+/// SYS_READ up to n bytes: what was read.
+pub fn semi_read(t: &mut SemiTarget, fd: i64, n: i64) -> Vec<i64> {
+    val buf: i64 = t.scratch + 64;
+    var w: Vec<i64> = Vec::new();
+    w.push(fd);
+    w.push(buf);
+    w.push(n);
+    val left: i64 = semi_trap(t, SYS_READ, semi_block(t, w));
+    if left < 0 { return Vec::new(); }
+    return semimem_read_bytes(&t.mem, buf, n - left);
+}
+
+pub fn semi_close(t: &mut SemiTarget, fd: i64) -> i64 {
+    var w: Vec<i64> = Vec::new();
+    w.push(fd);
+    return semi_trap(t, SYS_CLOSE, semi_block(t, w));
+}
+
+pub fn semi_seek(t: &mut SemiTarget, fd: i64, pos: i64) -> i64 {
+    var w: Vec<i64> = Vec::new();
+    w.push(fd);
+    w.push(pos);
+    return semi_trap(t, SYS_SEEK, semi_block(t, w));
+}
+
+pub fn semi_flen(t: &mut SemiTarget, fd: i64) -> i64 {
+    var w: Vec<i64> = Vec::new();
+    w.push(fd);
+    return semi_trap(t, SYS_FLEN, semi_block(t, w));
+}
+
+/// SYS_EXIT with ApplicationExit and a status: on AArch64 the block
+/// {reason, status}; on AArch32 r1 is the reason (status 0 only), so a
+/// non-zero status uses SYS_EXIT_EXTENDED.
+pub fn semi_exit(t: &mut SemiTarget, status: i64) {
+    var w: Vec<i64> = Vec::new();
+    w.push(ADP_STOPPED_APPLICATION_EXIT);
+    w.push(status);
+    if t.mem.word == 8 {
+        semi_trap(t, SYS_EXIT, semi_block(t, w));
+    } else if status == 0 {
+        semi_trap(t, SYS_EXIT, ADP_STOPPED_APPLICATION_EXIT);
+    } else {
+        semi_trap(t, SYS_EXIT_EXTENDED, semi_block(t, w));
+    }
+}
+
+/// The 64-bit tick counter (SYS_ELAPSED) and its frequency.
+pub fn semi_elapsed(t: &mut SemiTarget) -> i64 {
+    var w: Vec<i64> = Vec::new();
+    w.push(0);
+    w.push(0);
+    val a: i64 = semi_block(t, w);
+    semi_trap(t, SYS_ELAPSED, a);
+    if t.mem.word == 4 { return (semimem_rdw(&t.mem, a) & 0xFFFFFFFF) | (semimem_rdw(&t.mem, a + 4) << 32); }
+    return semimem_rdw(&t.mem, a);
+}
+
+pub fn semi_cmdline(t: &mut SemiTarget, cap: i64) -> str {
+    val buf: i64 = t.scratch + 64;
+    var w: Vec<i64> = Vec::new();
+    w.push(buf);
+    w.push(cap);
+    val a: i64 = semi_block(t, w);
+    if semi_trap(t, SYS_GET_CMDLINE, a) != 0 { return ""; }
+    return semimem_cstr(&t.mem, buf);
+}

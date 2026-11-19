@@ -1,0 +1,3207 @@
+// compiler/nat_thumb.fd — PL5: Cortex-M (ARMv7-M, Thumb-2) code generator.
+//
+// IR -> Thumb-2 machine code for a 32-bit target, over the encoders of
+// compiler/nat_enc.fd (t2_* / t_*). Two images:
+//
+//   --target thumbv7m-none   no OS: an ELF for a Cortex-M3 board (vector
+//                            table, reset stub that copies .data to RAM,
+//                            UART output, exit through semihosting). Boards
+//                            (FID_THUMB_BOARD): mps2-an385 (default; QEMU
+//                            `-M mps2-an385`, CMSDK UART0, 16 MB PSRAM heap)
+//                            and lm3s6965evb (PL011 UART0, 64 KB RAM).
+//   --target thumbv7m-linux  the same code over Linux system calls (ARM
+//                            EABI), a static ELF that qemu-arm runs: the
+//                            test bed of the code generator.
+//
+// The IR is the 64-bit one every backend gets: a value is 64 bits, held as
+// a pair of registers (low word, high word); a pointer is its 32-bit
+// address in the low word and 0 in the high one, so memory layouts are the
+// 64-bit ones (8-byte words, the same struct offsets). Each value has an
+// 8-byte slot in the frame; an operation loads its operands into r0:r1 and
+// r2:r3, computes into r0:r1 and stores the result. Calls pass every
+// argument in an 8-byte slot of the caller's outgoing area at [sp + 8k]
+// and return in r0:r1; r4-r8 are saved by every function (push {r4-r8,
+// lr}), r12 is scratch.
+//
+// The runtime is stdlib/linux_runtime (merged in, as for the other machine
+// targets): its two machine primitives nat_syscall and nat_start_sp are
+// written here. On Linux nat_syscall maps the generic system call numbers
+// to the ARM EABI ones (mmap -> mmap2, clock_gettime -> clock_gettime64);
+// with no OS it implements them: write to fd 1/2 goes to the UART, exit
+// and exit_group end the program through semihosting SYS_EXIT_EXTENDED,
+// mmap bump-allocates zeroed heap memory, the rest return -ENOSYS.
+// 64-bit division, the overflow-checked multiplications and the variable
+// shifts are helper routines (__th_*); integer arithmetic panics exactly as
+// on the other native targets.
+//
+// Not supported (an operation that needs them panics with a message when
+// it is reached, and the build notes where they are): floating-point
+// arithmetic and conversions (an f64 is still moved and printed as bits),
+// threads and tasks, signals, C functions.
+
+module compiler::nat_thumb;
+
+use core;
+use vec;
+use string;
+use compiler::ast;
+use compiler::ir;
+use compiler::nat_enc;
+
+const TH_SP: i64 = 13;
+const TH_LR: i64 = 14;
+const TH_R12: i64 = 12;
+
+// Conditions (ARM numbering)
+const TC_EQ: i64 = 0;
+const TC_NE: i64 = 1;
+const TC_CS: i64 = 2;
+const TC_CC: i64 = 3;
+const TC_HI: i64 = 8;
+const TC_LS: i64 = 9;
+const TC_GE: i64 = 10;
+const TC_LT: i64 = 11;
+
+// Fixups: [pos, label, kind, extra]
+const TH_FIX_BL: i64 = 1;
+const TH_FIX_B: i64 = 2;
+const TH_FIX_BCC: i64 = 3;
+const TH_FIX_MOVW: i64 = 4;
+const TH_FIX_ABS32: i64 = 5;
+
+// push {r4-r8, lr} / pop {r4-r8, pc}: 24 bytes
+const TH_SAVE_MASK: i64 = 0x41F0;
+const TH_RESTORE_MASK: i64 = 0x81F0;
+const TH_SAVED: i64 = 24;
+
+// Extensions of the low word into a pair
+const TX_SB: i64 = 1;
+const TX_SH: i64 = 2;
+const TX_SW: i64 = 3;
+const TX_ZB: i64 = 4;
+const TX_ZH: i64 = 5;
+const TX_ZW: i64 = 6;
+
+// The panics of integer arithmetic (as nat_ir.fd's)
+const TP_ADD: i64 = 0;
+const TP_SUB: i64 = 1;
+const TP_MUL: i64 = 2;
+const TP_DIV_OVF: i64 = 3;
+const TP_DIV_ZERO: i64 = 4;
+const TP_MOD_ZERO: i64 = 5;
+
+/// What nat_arch() answers on this target (1 AArch64, 2 RISC-V, 3 x86-64)
+pub const NAT_THUMB: i64 = 4;
+
+/// The board a no-OS image is for: FID_THUMB_BOARD (mps2-an385 or
+/// lm3s6965evb); "" = mps2-an385.
+pub var g_th_board: str = "";
+
+fn th_np_messages() -> Vec<str> {
+    var v: Vec<str> = Vec::new();
+    v.push("Integer overflow on addition");
+    v.push("Integer overflow on subtraction");
+    v.push("Integer overflow on multiplication");
+    v.push("Integer overflow on division");
+    v.push("Division by zero");
+    v.push("Modulo by zero");
+    return v;
+}
+
+pub struct ThGen {
+    // code and read-only data (flash); the writable data (RAM)
+    pub e: NatEnc,
+    pub d: NatEnc,
+    pub bare: bool,
+    // 0 mps2-an385, 1 lm3s6965evb
+    pub board: i64,
+    pub fixes: Vec<i64>,
+    pub dfixes: Vec<i64>,
+    // label -> 1 for labels placed in d (their position is d's)
+    pub ram_labels: i64,
+    pub code_vma: i64,
+    pub data_vma: i64,
+    // functions: name -> label (compiled, queued, or a primitive)
+    pub fn_labels: i64,
+    pub all_fns: i64,
+    pub queue: Vec<str>,
+    pub str_labels: i64,
+    pub strs: Vec<str>,
+    pub glob_labels: i64,
+    pub globs: Vec<str>,
+    pub c_names: i64,
+    pub c_list: Vec<str>,
+    pub dyn_types: Vec<str>,
+    // panic stubs: message -> label, and the messages whose stub is not
+    // emitted yet
+    pub msg_labels: i64,
+    pub msgs: Vec<str>,
+    pub msgs_done: i64,
+    // the current function
+    pub cur_name: str,
+    pub wrapping: bool,
+    pub slots: Vec<i64>,
+    pub adata: Vec<i64>,
+    pub frame: i64,
+    pub epi: i64,
+    pub block_labels: i64,
+    pub next_block_label: i64,
+    // RAM words of the runtime: the heap's next byte, the thread word, the
+    // start block; read-only tables
+    pub heap_label: i64,
+    pub tls_label: i64,
+    pub start_sp_label: i64,
+    pub zero_block_label: i64,
+    pub names_label: i64,
+    pub fn_table_label: i64,
+    pub data_start_label: i64,
+    pub data_end_label: i64,
+    pub data_lma_label: i64,
+    pub entry_label: i64,
+    pub fault_label: i64,
+    // what this target does not support, where (notes for the build)
+    pub notes: Vec<str>,
+    pub notes_seen: i64,
+    pub n_fns: i64,
+}
+
+fn ThGen_new(bare: bool) -> ThGen {
+    return ThGen {
+        e: NatEnc_new(), d: NatEnc_new(), bare: bare, board: 0, fixes: Vec::new(), dfixes: Vec::new(), ram_labels: HashMap_new(), code_vma: 0, data_vma: 0, fn_labels: HashMap_new(), all_fns: HashMap_new(), queue: Vec::new(), str_labels: HashMap_new(), strs: Vec::new(), glob_labels: HashMap_new(), globs: Vec::new(), c_names: HashMap_new(), c_list: Vec::new(), dyn_types: Vec::new(), msg_labels: HashMap_new(), msgs: Vec::new(), msgs_done: 0, cur_name: "", wrapping: false, slots: Vec::new(), adata: Vec::new(), frame: 0, epi: 0, block_labels: HashMap_new(), next_block_label: 0 - 1, heap_label: 0, tls_label: 0, start_sp_label: 0, zero_block_label: 0, names_label: 0, fn_table_label: 0, data_start_label: 0, data_end_label: 0, data_lma_label: 0, entry_label: 0, fault_label: 0, notes: Vec::new(), notes_seen: HashMap_new(), n_fns: 0
+    };
+}
+
+// ===========================================================================
+// Boards (no OS)
+// ===========================================================================
+
+/// Where code starts (flash / code RAM)
+fn th_flash_base(g: & ThGen) -> i64 {
+    if g.board == 2 {
+        // (the file offset of the code, page-congruent for a loader)
+        return 0x100000 + TH_CODE_OFF;
+    }
+    return 0;
+}
+
+/// The RAM: [ram, ram + stack) the stack (growing down from its top, so
+/// an overflow leaves the RAM and faults), then .data, then (lm3s6965evb)
+/// the heap up to the RAM's end. mps2-an385 has its heap in the 16 MB of
+/// PSRAM at 0x21000000.
+fn th_ram_base(g: & ThGen) -> i64 {
+    return 0x20000000;
+}
+
+fn th_ram_end(g: & ThGen) -> i64 {
+    if g.board == 1 {
+        return 0x20010000;
+    }
+    return 0x20400000;
+}
+
+fn th_stack_size(g: & ThGen) -> i64 {
+    if g.board == 1 {
+        return 0x4000;
+    }
+    return 0x100000;
+}
+
+fn th_heap_in_psram(g: & ThGen) -> bool {
+    return g.board != 1;
+}
+
+fn th_heap_end(g: & ThGen) -> i64 {
+    if g.board == 1 {
+        return th_ram_end(g);
+    }
+    return 0x22000000;
+}
+
+/// Board name -> index; -1 for an unknown one
+pub fn nat_thumb_board_index(name: str) -> i64 {
+    if name == "" || name == "mps2-an385" || name == "mps2" {
+        return 0;
+    }
+    if name == "lm3s6965evb" || name == "lm3s6965" {
+        return 1;
+    }
+    // the no-OS image's own code (reset, .data copy, the system calls it
+    // implements) run by qemu-arm: the mps2-an385 layout with the code at
+    // 1 MB, the UART a write(2) and the semihosting exit an exit_group
+    if name == "qemu-user" {
+        return 2;
+    }
+    return 0 - 1;
+}
+
+// ===========================================================================
+// Emission helpers
+// ===========================================================================
+
+fn th_fix(g: & mut ThGen, label: i64, kind: i64, extra: i64) {
+    g.fixes.push(NatEnc_pos(& g.e));
+    g.fixes.push(label);
+    g.fixes.push(kind);
+    g.fixes.push(extra);
+}
+
+/// A 32-bit word in d that holds the address of `label` (+ extra)
+fn th_dword_fix(g: & mut ThGen, label: i64, extra: i64) {
+    g.dfixes.push(NatEnc_pos(& g.d));
+    g.dfixes.push(label);
+    g.dfixes.push(TH_FIX_ABS32);
+    g.dfixes.push(extra);
+    NatEnc_word(& mut g.d, 0);
+}
+
+/// A 32-bit word in the code / read-only data with the address of `label`
+fn th_word_fix(g: & mut ThGen, label: i64, extra: i64) {
+    th_fix(g, label, TH_FIX_ABS32, extra);
+    NatEnc_word(& mut g.e, 0);
+}
+
+fn th_new_label(g: & mut ThGen) -> i64 {
+    return NatEnc_label(& mut g.e);
+}
+
+fn th_place(g: & mut ThGen, label: i64) {
+    NatEnc_place(& mut g.e, label);
+}
+
+/// A label for a word in RAM (d), placed at d's current position
+fn th_ram_place(g: & mut ThGen, label: i64) {
+    NatEnc_align(& mut g.d, 8);
+    g.e.labels.set(label, NatEnc_pos(& g.d));
+    HashMap_insert_i(g.ram_labels, label, 1);
+}
+
+fn th_bl(g: & mut ThGen, label: i64) {
+    th_fix(g, label, TH_FIX_BL, 0);
+    t2_bl(& mut g.e, 0);
+}
+
+fn th_b(g: & mut ThGen, label: i64) {
+    th_fix(g, label, TH_FIX_B, 0);
+    t2_b(& mut g.e, 0);
+}
+
+fn th_bcc(g: & mut ThGen, cond: i64, label: i64) {
+    th_fix(g, label, TH_FIX_BCC, cond);
+    t2_bcc(& mut g.e, cond, 4);
+}
+
+/// bl label when `cond` holds (b<not cond> over the bl)
+fn th_bl_if(g: & mut ThGen, cond: i64, label: i64) {
+    t2_bcc(& mut g.e, cond ^ 1, 4);
+    th_bl(g, label);
+}
+
+/// r = the address of `label` + extra (movw + movt, patched)
+fn th_addr(g: & mut ThGen, r: i64, label: i64, extra: i64) {
+    th_fix(g, label, TH_FIX_MOVW, extra);
+    t2_movw(& mut g.e, r, 0);
+    t2_movt(& mut g.e, r, 0);
+}
+
+/// r = the low 32 bits of v
+fn th_li32(g: & mut ThGen, r: i64, v: i64) {
+    var w: i64 = v & 0xFFFFFFFF;
+    t2_movw(& mut g.e, r, w & 0xFFFF);
+    if ((w >> 16) & 0xFFFF) != 0 {
+        t2_movt(& mut g.e, r, (w >> 16) & 0xFFFF);
+    }
+}
+
+/// lo:hi = v
+fn th_li64(g: & mut ThGen, lo: i64, hi: i64, v: i64) {
+    th_li32(g, lo, v);
+    th_li32(g, hi, (v >> 32) & 0xFFFFFFFF);
+}
+
+fn th_mov(g: & mut ThGen, d: i64, m: i64) {
+    if d != m {
+        t2_mov(& mut g.e, d, m);
+    }
+}
+
+/// ldr / str of a word at [base + off], any off >= 0 (r12 the address
+/// past 4095)
+fn th_mem(g: & mut ThGen, load: bool, r: i64, base: i64, off: i64) {
+    if off >= 0 && off <= 4095 {
+        t2_ldst(& mut g.e, load, false, r, base, off);
+        return;
+    }
+    th_li32(g, TH_R12, off);
+    t2_dp(& mut g.e, TDP_ADD, false, TH_R12, base, TH_R12, 0, 0);
+    t2_ldst(& mut g.e, load, false, r, TH_R12, 0);
+}
+
+/// r = sp + off
+fn th_sp_addr(g: & mut ThGen, r: i64, off: i64) {
+    if off >= 0 && off <= 4095 {
+        t2_addw(& mut g.e, r, TH_SP, off);
+        return;
+    }
+    th_li32(g, TH_R12, off);
+    t2_dp(& mut g.e, TDP_ADD, false, r, TH_SP, TH_R12, 0, 0);
+}
+
+fn th_sp_sub(g: & mut ThGen, n: i64) {
+    if n == 0 {
+        return;
+    }
+    if n <= 4095 {
+        t2_subw(& mut g.e, TH_SP, TH_SP, n);
+        return;
+    }
+    th_li32(g, TH_R12, n);
+    t2_dp(& mut g.e, TDP_SUB, false, TH_SP, TH_SP, TH_R12, 0, 0);
+}
+
+fn th_sp_add(g: & mut ThGen, n: i64) {
+    if n == 0 {
+        return;
+    }
+    if n <= 4095 {
+        t2_addw(& mut g.e, TH_SP, TH_SP, n);
+        return;
+    }
+    th_li32(g, TH_R12, n);
+    t2_dp(& mut g.e, TDP_ADD, false, TH_SP, TH_SP, TH_R12, 0, 0);
+}
+
+/// cmp r, #imm8
+fn th_cmpi(g: & mut ThGen, r: i64, imm: i64) {
+    t2_dpi(& mut g.e, TDP_SUB, true, 15, r, imm);
+}
+
+/// lo:hi = -(lo:hi)
+fn th_neg64(g: & mut ThGen, lo: i64, hi: i64) {
+    t2_movw(& mut g.e, TH_R12, 0);
+    t2_dp(& mut g.e, TDP_SUB, true, lo, TH_R12, lo, 0, 0);
+    t2_dp(& mut g.e, TDP_SBC, false, hi, TH_R12, hi, 0, 0);
+}
+
+/// dlo:dhi = the low word s extended (TX_*)
+fn th_ext_pair(g: & mut ThGen, kind: i64, dlo: i64, dhi: i64, s: i64) {
+    if kind == TX_SB || kind == TX_SH || kind == TX_SW {
+        if kind == TX_SB {
+            t2_ext(& mut g.e, 0, dlo, s);
+        } else if kind == TX_SH {
+            t2_ext(& mut g.e, 1, dlo, s);
+        } else {
+            th_mov(g, dlo, s);
+        }
+        t2_shift_imm(& mut g.e, 2, dhi, dlo, 31);
+        return;
+    }
+    if kind == TX_ZB {
+        t2_ext(& mut g.e, 2, dlo, s);
+    } else if kind == TX_ZH {
+        t2_ext(& mut g.e, 3, dlo, s);
+    } else {
+        th_mov(g, dlo, s);
+    }
+    t2_movw(& mut g.e, dhi, 0);
+}
+
+fn th_narrow_kind(t: IrType) -> i64 {
+    match t {
+        IrType::I8 => {
+            return TX_SB;
+        }
+        IrType::I16 => {
+            return TX_SH;
+        }
+        IrType::I32 => {
+            return TX_SW;
+        }
+        IrType::U8 => {
+            return TX_ZB;
+        }
+        IrType::U16 => {
+            return TX_ZH;
+        }
+        IrType::U32 => {
+            return TX_ZW;
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+// ===========================================================================
+// Values, names, strings, globals
+// ===========================================================================
+
+fn th_slot(g: & ThGen, id: i64) -> i64 {
+    if id < 0 || id >= g.slots.len() {
+        return 0 - 1;
+    }
+    return g.slots.get(id);
+}
+
+/// lo:hi = value id (0 for a value without a slot, and for id -1)
+fn th_ld(g: & mut ThGen, lo: i64, hi: i64, id: i64) {
+    var off: i64 = th_slot(g, id);
+    if off < 0 {
+        t2_movw(& mut g.e, lo, 0);
+        t2_movw(& mut g.e, hi, 0);
+        return;
+    }
+    th_mem(g, true, lo, TH_SP, off);
+    th_mem(g, true, hi, TH_SP, off + 4);
+}
+
+/// r = the low word of value id
+fn th_ldlo(g: & mut ThGen, r: i64, id: i64) {
+    var off: i64 = th_slot(g, id);
+    if off < 0 {
+        t2_movw(& mut g.e, r, 0);
+        return;
+    }
+    th_mem(g, true, r, TH_SP, off);
+}
+
+fn th_st(g: & mut ThGen, id: i64, lo: i64, hi: i64) {
+    var off: i64 = th_slot(g, id);
+    if off < 0 {
+        return;
+    }
+    th_mem(g, false, lo, TH_SP, off);
+    th_mem(g, false, hi, TH_SP, off + 4);
+}
+
+fn th_st_imm(g: & mut ThGen, id: i64, v: i64) {
+    th_li64(g, 0, 1, v);
+    th_st(g, id, 0, 1);
+}
+
+fn th_copy_val(g: & mut ThGen, id: i64, src: i64) {
+    th_ld(g, 0, 1, src);
+    th_st(g, id, 0, 1);
+}
+
+/// Outgoing argument k = value id / an immediate / r0:r1
+fn th_arg_val(g: & mut ThGen, k: i64, id: i64) {
+    th_ld(g, 0, 1, id);
+    th_mem(g, false, 0, TH_SP, 8 * k);
+    th_mem(g, false, 1, TH_SP, 8 * k + 4);
+}
+
+fn th_arg_imm(g: & mut ThGen, k: i64, v: i64) {
+    th_li64(g, 0, 1, v);
+    th_mem(g, false, 0, TH_SP, 8 * k);
+    th_mem(g, false, 1, TH_SP, 8 * k + 4);
+}
+
+fn th_arg_r01(g: & mut ThGen, k: i64) {
+    th_mem(g, false, 0, TH_SP, 8 * k);
+    th_mem(g, false, 1, TH_SP, 8 * k + 4);
+}
+
+fn th_has_fn(g: & ThGen, name: str) -> bool {
+    return HashMap_contains(g.all_fns, name);
+}
+
+/// The function a call to `name` runs (as nat_ir.fd ng_resolve)
+fn th_resolve(g: & ThGen, name: str) -> str {
+    var alias: str = pe_runtime_alias(name);
+    if alias != name {
+        return alias;
+    }
+    var p: str = pert_name(name);
+    if p != "" && th_has_fn(g, p) {
+        return p;
+    }
+    return name;
+}
+
+/// The label of function `name` (queued for compilation), 0 when the
+/// program has no such function and it is not a primitive
+fn th_fn_label(g: & mut ThGen, name: str) -> i64 {
+    if HashMap_contains(g.fn_labels, name) {
+        return HashMap_get(g.fn_labels, name);
+    }
+    if !th_has_fn(g, name) {
+        return 0;
+    }
+    var l: i64 = th_new_label(g);
+    HashMap_insert(g.fn_labels, name, l);
+    g.queue.push(name);
+    return l;
+}
+
+fn th_prim_label(g: & mut ThGen, name: str) -> i64 {
+    if HashMap_contains(g.fn_labels, name) {
+        return HashMap_get(g.fn_labels, name);
+    }
+    var l: i64 = th_new_label(g);
+    HashMap_insert(g.fn_labels, name, l);
+    return l;
+}
+
+fn th_str_label(g: & mut ThGen, s: str) -> i64 {
+    if HashMap_contains(g.str_labels, s) {
+        return HashMap_get(g.str_labels, s);
+    }
+    var l: i64 = th_new_label(g);
+    HashMap_insert(g.str_labels, s, l);
+    g.strs.push(s);
+    return l;
+}
+
+fn th_glob_label(g: & mut ThGen, name: str) -> i64 {
+    if HashMap_contains(g.glob_labels, name) {
+        return HashMap_get(g.glob_labels, name);
+    }
+    var l: i64 = th_new_label(g);
+    HashMap_insert(g.glob_labels, name, l);
+    g.globs.push(name);
+    return l;
+}
+
+/// The stub that panics with `msg` (emitted after the functions)
+fn th_msg_label(g: & mut ThGen, msg: str) -> i64 {
+    if HashMap_contains(g.msg_labels, msg) {
+        return HashMap_get(g.msg_labels, msg);
+    }
+    var l: i64 = th_new_label(g);
+    HashMap_insert(g.msg_labels, msg, l);
+    g.msgs.push(msg);
+    return l;
+}
+
+fn th_np_label(g: & mut ThGen, which: i64, line: i64) -> i64 {
+    var msg: str = th_np_messages().get(which);
+    if line > 0 {
+        msg = msg + " at line " + int_to_str(line);
+    }
+    return th_msg_label(g, msg);
+}
+
+/// What this target does not support, reached in the current function: a
+/// panic when it runs, and a note for the build
+fn th_unsupported(g: & mut ThGen, what: str) {
+    var key: str = g.cur_name + ": " + what;
+    if !HashMap_contains(g.notes_seen, key) {
+        HashMap_insert(g.notes_seen, key, 1);
+        g.notes.push(key);
+    }
+    th_bl(g, th_msg_label(g, what + " is not supported on thumbv7m (in " + g.cur_name + ")"));
+}
+
+/// Call `fname` (a function or a primitive), or the unsupported panic
+fn th_call_or_missing(g: & mut ThGen, fname: str) {
+    var l: i64 = th_fn_label(g, fname);
+    if l == 0 {
+        th_unsupported(g, "`" + fname + "`");
+        return;
+    }
+    th_bl(g, l);
+}
+
+fn th_meta_ty(func: & IrFunction, id: i64) -> IrType {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            return m.ty;
+        }
+        OptValueMeta::None => {
+        }
+    }
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        if func.params.get(pi).id == id {
+            return func.params.get(pi).ty;
+        }
+        pi = pi + 1;
+    }
+    return IrType::I64;
+}
+
+fn th_meta_line(func: & IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(func, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => {
+                    return v as i64;
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return 0;
+}
+
+fn th_is_ptr(t: IrType) -> bool {
+    match t {
+        IrType::Ptr(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn th_is_unsigned(t: IrType) -> bool {
+    return ir_type_eq(t, IrType::U8) || ir_type_eq(t, IrType::U16) || ir_type_eq(t, IrType::U32) || ir_type_eq(t, IrType::U64);
+}
+
+fn th_log2_exact(n: i64) -> i64 {
+    if n <= 0 {
+        return 0 - 1;
+    }
+    var k: i64 = 0;
+    while k < 62 {
+        if (1 << k) == n {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// ===========================================================================
+// 64-bit arithmetic on r0:r1 (a) and r2:r3 (b), the result in r0:r1
+// ===========================================================================
+
+fn th_mul64(g: & mut ThGen) {
+    t2_umull(& mut g.e, 4, 5, 0, 2);
+    t2_mla(& mut g.e, 5, 0, 3, 5);
+    t2_mla(& mut g.e, 5, 1, 2, 5);
+    t2_mov(& mut g.e, 0, 4);
+    t2_mov(& mut g.e, 1, 5);
+}
+
+/// r0:r1 narrowed to `ty` (nothing for a 64-bit type); a narrow result
+/// that changed panics with `which` when which >= 0
+fn th_narrow(g: & mut ThGen, ty: IrType, which: i64, line: i64) {
+    var kind: i64 = th_narrow_kind(ty);
+    if kind == 0 {
+        return;
+    }
+    th_ext_pair(g, kind, 4, 5, 0);
+    if which >= 0 {
+        t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 4, 0, 0, 0);
+        t2_dp(& mut g.e, TDP_EOR, false, 6, 5, 1, 0, 0);
+        t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
+        th_bl_if(g, TC_NE, th_np_label(g, which, line));
+    }
+    t2_mov(& mut g.e, 0, 4);
+    t2_mov(& mut g.e, 1, 5);
+}
+
+/// add (0), sub (1), mul (2) with the overflow checks of nat_ir.fd
+/// ng_gen_checked
+fn th_arith(g: & mut ThGen, kind: i64, ty: IrType, checked: bool) {
+    var which: i64 = TP_ADD;
+    if kind == 1 {
+        which = TP_SUB;
+    }
+    if kind == 2 {
+        which = TP_MUL;
+    }
+    if checked && ir_type_eq(ty, IrType::I64) {
+        if kind == 0 {
+            t2_dp(& mut g.e, TDP_ADD, true, 4, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_ADC, false, 5, 1, 3, 0, 0);
+            // overflow when a and b have one sign and the sum the other
+            t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 5, 0, 0);
+            t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 3, 5, 0, 0);
+            t2_dp(& mut g.e, TDP_AND, false, 6, 6, TH_R12, 0, 0);
+            th_cmpi(g, 6, 0);
+            th_bl_if(g, TC_LT, th_np_label(g, which, 0));
+            t2_mov(& mut g.e, 0, 4);
+            t2_mov(& mut g.e, 1, 5);
+        } else if kind == 1 {
+            t2_dp(& mut g.e, TDP_SUB, true, 4, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_SBC, false, 5, 1, 3, 0, 0);
+            // overflow when a and b differ in sign and the result's is b's
+            t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
+            t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 1, 5, 0, 0);
+            t2_dp(& mut g.e, TDP_AND, false, 6, 6, TH_R12, 0, 0);
+            th_cmpi(g, 6, 0);
+            th_bl_if(g, TC_LT, th_np_label(g, which, 0));
+            t2_mov(& mut g.e, 0, 4);
+            t2_mov(& mut g.e, 1, 5);
+        } else {
+            th_bl(g, th_prim_label(g, "__th_smul_ovf"));
+            th_cmpi(g, 2, 0);
+            th_bl_if(g, TC_NE, th_np_label(g, which, 0));
+        }
+        return;
+    }
+    if checked && ir_type_eq(ty, IrType::U64) {
+        if kind == 0 {
+            t2_dp(& mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_ADC, true, 1, 1, 3, 0, 0);
+            th_bl_if(g, TC_CS, th_np_label(g, which, 0));
+        } else if kind == 1 {
+            t2_dp(& mut g.e, TDP_SUB, true, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_SBC, true, 1, 1, 3, 0, 0);
+            th_bl_if(g, TC_CC, th_np_label(g, which, 0));
+        } else {
+            th_bl(g, th_prim_label(g, "__th_umul_ovf"));
+            th_cmpi(g, 2, 0);
+            th_bl_if(g, TC_NE, th_np_label(g, which, 0));
+        }
+        return;
+    }
+    if kind == 0 {
+        t2_dp(& mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
+        t2_dp(& mut g.e, TDP_ADC, false, 1, 1, 3, 0, 0);
+    } else if kind == 1 {
+        t2_dp(& mut g.e, TDP_SUB, true, 0, 0, 2, 0, 0);
+        t2_dp(& mut g.e, TDP_SBC, false, 1, 1, 3, 0, 0);
+    } else {
+        th_mul64(g);
+    }
+    if checked {
+        th_narrow(g, ty, which, 0);
+    } else {
+        th_narrow(g, ty, 0 - 1, 0);
+    }
+}
+
+/// r0:r1 = a / b or a % b in `ty` (nat_ir.fd ng_gen_divmod's meaning)
+fn th_divmod(g: & mut ThGen, is_mod: bool, ty: IrType, checked: bool, line: i64) {
+    // division by zero panics, even in @wrapping code
+    t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 2, 3, 0, 0);
+    if is_mod {
+        th_bl_if(g, TC_EQ, th_np_label(g, TP_MOD_ZERO, line));
+    } else {
+        th_bl_if(g, TC_EQ, th_np_label(g, TP_DIV_ZERO, line));
+    }
+    if th_is_unsigned(ty) {
+        th_bl(g, th_prim_label(g, "__th_udivmod"));
+        if is_mod {
+            t2_mov(& mut g.e, 0, 2);
+            t2_mov(& mut g.e, 1, 3);
+        }
+        return;
+    }
+    var normal: i64 = th_new_label(g);
+    var done: i64 = th_new_label(g);
+    // b == -1: -a (and a % -1 == 0), without the division
+    t2_dp(& mut g.e, TDP_AND, false, TH_R12, 2, 3, 0, 0);
+    t2_dpi(& mut g.e, TDP_ADD, true, 15, TH_R12, 1);
+    th_bcc(g, TC_NE, normal);
+    if is_mod {
+        t2_movw(& mut g.e, 0, 0);
+        t2_movw(& mut g.e, 1, 0);
+    } else {
+        if checked && ir_type_eq(ty, IrType::I64) {
+            th_li32(g, TH_R12, 0x80000000);
+            t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 1, TH_R12, 0, 0);
+            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 0, 0, 0);
+            th_bl_if(g, TC_EQ, th_np_label(g, TP_DIV_OVF, line));
+        }
+        th_neg64(g, 0, 1);
+    }
+    th_b(g, done);
+    th_place(g, normal);
+    th_bl(g, th_prim_label(g, "__th_sdivmod"));
+    if is_mod {
+        t2_mov(& mut g.e, 0, 2);
+        t2_mov(& mut g.e, 1, 3);
+    }
+    th_place(g, done);
+}
+
+/// The condition that holds after th_cmp_flags for compare kind (0 eq,
+/// 1 ne, 2 lt, 3 le, 4 gt, 5 ge) of a and b
+fn th_cmp_flags(g: & mut ThGen, kind: i64, unsigned: bool) -> i64 {
+    if kind == 0 || kind == 1 {
+        t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 0, 2, 0, 0);
+        t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
+        t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
+        if kind == 0 {
+            return TC_EQ;
+        }
+        return TC_NE;
+    }
+    // a < b: a - b borrows (unsigned) / is negative without overflow
+    // (signed); a > b and a <= b compare b with a
+    var swap: bool = kind == 3 || kind == 4;
+    if swap {
+        t2_cmp(& mut g.e, 2, 0);
+        t2_dp(& mut g.e, TDP_SBC, true, TH_R12, 3, 1, 0, 0);
+    } else {
+        t2_cmp(& mut g.e, 0, 2);
+        t2_dp(& mut g.e, TDP_SBC, true, TH_R12, 1, 3, 0, 0);
+    }
+    var lt: bool = kind == 2 || kind == 4;
+    if unsigned {
+        if lt {
+            return TC_CC;
+        }
+        return TC_CS;
+    }
+    if lt {
+        return TC_LT;
+    }
+    return TC_GE;
+}
+
+/// r0:r1 = (a <kind> b) as 0 / 1
+fn th_setcc(g: & mut ThGen, kind: i64, unsigned: bool) {
+    var cond: i64 = th_cmp_flags(g, kind, unsigned);
+    t2_movw(& mut g.e, 0, 1);
+    t2_bcc(& mut g.e, cond, 4);
+    t2_movw(& mut g.e, 0, 0);
+    t2_movw(& mut g.e, 1, 0);
+}
+
+fn th_gen_binop(g: & mut ThGen, id: i64, op: BinOp, left: i64, right: i64, ty: IrType, func: & IrFunction) {
+    var lty: IrType = th_meta_ty(func, left);
+    var rty: IrType = th_meta_ty(func, right);
+    if ir_type_is_float(ty) || ir_type_is_float(lty) {
+        th_unsupported(g, "floating-point arithmetic");
+        th_st_imm(g, id, 0);
+        return;
+    }
+    th_ld(g, 0, 1, left);
+    th_ld(g, 2, 3, right);
+    var checked: bool = !g.wrapping;
+    var unsigned_cmp: bool = ir_type_eq(lty, IrType::U64) || ir_type_eq(rty, IrType::U64);
+    match op {
+        BinOp::Add => {
+            th_arith(g, 0, ty, checked);
+        }
+        BinOp::Sub => {
+            th_arith(g, 1, ty, checked);
+        }
+        BinOp::Mul => {
+            th_arith(g, 2, ty, checked);
+        }
+        BinOp::Div => {
+            var dl: i64 = th_meta_line(func, id);
+            th_divmod(g, false, ty, checked, dl);
+            if checked {
+                th_narrow(g, ty, TP_DIV_OVF, dl);
+            } else {
+                th_narrow(g, ty, 0 - 1, 0);
+            }
+        }
+        BinOp::Mod => {
+            th_divmod(g, true, ty, checked, th_meta_line(func, id));
+        }
+        BinOp::BitAnd => {
+            t2_dp(& mut g.e, TDP_AND, false, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_AND, false, 1, 1, 3, 0, 0);
+        }
+        BinOp::BitOr => {
+            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_ORR, false, 1, 1, 3, 0, 0);
+        }
+        BinOp::BitXor => {
+            t2_dp(& mut g.e, TDP_EOR, false, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_EOR, false, 1, 1, 3, 0, 0);
+        }
+        BinOp::Shl => {
+            th_bl(g, th_prim_label(g, "__th_lsl"));
+            th_narrow(g, ty, 0 - 1, 0);
+        }
+        BinOp::Shr => {
+            if ir_type_eq(ty, IrType::U64) {
+                th_bl(g, th_prim_label(g, "__th_lsr"));
+            } else {
+                th_bl(g, th_prim_label(g, "__th_asr"));
+            }
+        }
+        BinOp::And => {
+            // (a != 0) & (b != 0)
+            var zero: i64 = th_new_label(g);
+            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 0, 1, 0, 0);
+            t2_movw(& mut g.e, 0, 0);
+            th_bcc(g, TC_EQ, zero);
+            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 2, 3, 0, 0);
+            th_bcc(g, TC_EQ, zero);
+            t2_movw(& mut g.e, 0, 1);
+            th_place(g, zero);
+            t2_movw(& mut g.e, 1, 0);
+        }
+        BinOp::Or => {
+            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 1, 0, 0);
+            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_ORR, true, 0, 0, 3, 0, 0);
+            t2_movw(& mut g.e, 0, 0);
+            t2_bcc(& mut g.e, TC_EQ, 4);
+            t2_movw(& mut g.e, 0, 1);
+            t2_movw(& mut g.e, 1, 0);
+        }
+        BinOp::Eq => {
+            th_setcc(g, 0, unsigned_cmp);
+        }
+        BinOp::Neq => {
+            th_setcc(g, 1, unsigned_cmp);
+        }
+        BinOp::Lt => {
+            th_setcc(g, 2, unsigned_cmp);
+        }
+        BinOp::LtEq => {
+            th_setcc(g, 3, unsigned_cmp);
+        }
+        BinOp::Gt => {
+            th_setcc(g, 4, unsigned_cmp);
+        }
+        BinOp::GtEq => {
+            th_setcc(g, 5, unsigned_cmp);
+        }
+    }
+    th_st(g, id, 0, 1);
+}
+
+// ===========================================================================
+// Instructions
+// ===========================================================================
+
+fn th_block_label(g: & ThGen, block: i64) -> i64 {
+    return HashMap_get(g.block_labels, int_to_str(block));
+}
+
+/// A call of runtime builtin `name` with these values (the runtime's
+/// Fides function takes the environment first)
+fn th_call_builtin(g: & mut ThGen, name: str, vals: Vec<i64>) {
+    var resolved: str = th_resolve(g, name);
+    var k0: i64 = 0;
+    if th_has_fn(g, resolved) && !th_has_fn(g, name) {
+        k0 = 1;
+    }
+    var i: i64 = 0;
+    while i < vals.len() {
+        th_arg_val(g, k0 + i, vals.get(i));
+        i = i + 1;
+    }
+    if k0 == 1 {
+        th_arg_imm(g, 0, 0);
+    }
+    th_call_or_missing(g, resolved);
+}
+
+fn th_gen_call(g: & mut ThGen, id: i64, call_name: str, args: Vec<i64>, func: & IrFunction) {
+    // an f64 is its bits in a slot
+    if (call_name == "p_f64_to_bits" || call_name == "p_f64_from_bits") && args.len() == 1 {
+        th_copy_val(g, id, args.get(0));
+        return;
+    }
+    if (call_name == "p_int_to_float" || call_name == "p_float_to_int" || call_name == "p_f32_to_bits") && args.len() == 1 {
+        th_unsupported(g, "floating-point conversion");
+        th_st_imm(g, id, 0);
+        return;
+    }
+    if call_name == "p_thread_spawn" || call_name == "p_co_async" || call_name == "p_executor_spawn" {
+        th_unsupported(g, "threads and tasks");
+        th_st_imm(g, id, 0);
+        return;
+    }
+    // extern "C": the runtime's Fides pert_c_<C name>
+    if HashMap_contains(g.c_names, call_name) && !th_has_fn(g, call_name) {
+        var cname: str = g.c_list.get(HashMap_get(g.c_names, call_name) - 1);
+        var over: str = "pert_c_" + cname;
+        if th_has_fn(g, over) {
+            th_arg_imm(g, 0, 0);
+            var ci: i64 = 0;
+            while ci < args.len() {
+                th_arg_val(g, ci + 1, args.get(ci));
+                ci = ci + 1;
+            }
+            th_call_or_missing(g, over);
+            th_st(g, id, 0, 1);
+            return;
+        }
+    }
+    var target: str = call_name;
+    if call_name == "print" {
+        target = "p_print_int";
+        if args.len() > 0 {
+            var aty: IrType = th_meta_ty(func, args.get(0));
+            if th_is_ptr(aty) {
+                target = "p_print_str";
+            } else if ir_type_is_float(aty) {
+                target = "p_print_float";
+            } else if ir_type_eq(aty, IrType::Bool) {
+                target = "p_print_bool";
+            } else if ir_type_is_opaque_named(aty, "Vec") {
+                target = "p_print_vec";
+            } else if ir_type_is_opaque_named(aty, "HashMap") {
+                target = "p_print_map";
+            } else if ir_type_is_opaque_named(aty, "Tensor") {
+                target = "p_print_tensor";
+            }
+        }
+    } else if call_name == "p_to_str" {
+        if args.len() > 0 {
+            var aty2: IrType = th_meta_ty(func, args.get(0));
+            if ir_type_is_opaque_named(aty2, "Vec") {
+                target = "p_to_str_vec";
+            } else if ir_type_is_float(aty2) {
+                target = "p_to_str_float";
+            } else if th_is_ptr(aty2) {
+                target = "p_to_str_str";
+            } else if ir_type_eq(aty2, IrType::Bool) {
+                target = "p_to_str_bool";
+            }
+        }
+    }
+    var resolved: str = th_resolve(g, target);
+    var k0: i64 = 0;
+    if th_has_fn(g, resolved) && !th_has_fn(g, call_name) {
+        k0 = 1;
+    }
+    var ai: i64 = 0;
+    while ai < args.len() {
+        th_arg_val(g, k0 + ai, args.get(ai));
+        ai = ai + 1;
+    }
+    if k0 == 1 {
+        th_arg_imm(g, 0, 0);
+    }
+    th_call_or_missing(g, resolved);
+    th_st(g, id, 0, 1);
+}
+
+fn th_gen_inst(g: & mut ThGen, id: i64, inst: Inst, func: & IrFunction, module: & IrModule) {
+    match inst {
+        Inst::ConstInt(value, _) => {
+            th_st_imm(g, id, value);
+        }
+        Inst::ConstBool(value) => {
+            if value {
+                th_st_imm(g, id, 1);
+            } else {
+                th_st_imm(g, id, 0);
+            }
+        }
+        Inst::ConstFloat(value, ty) => {
+            if ir_type_eq(ty, IrType::F32) {
+                th_st_imm(g, id, p_f32_to_bits(value) & 0xFFFFFFFF);
+            } else {
+                th_st_imm(g, id, p_f64_to_bits(value));
+            }
+        }
+        Inst::ConstStr(value) => {
+            th_addr(g, 0, th_str_label(g, value), 0);
+            t2_movw(& mut g.e, 1, 0);
+            th_st(g, id, 0, 1);
+        }
+        Inst::ConstFnRef(name) => {
+            var fl: i64 = th_fn_label(g, c_fn_target(name));
+            if fl == 0 {
+                th_st_imm(g, id, 0);
+            } else {
+                // a Thumb address: bit 0 set
+                th_addr(g, 0, fl, 1);
+                t2_movw(& mut g.e, 1, 0);
+                th_st(g, id, 0, 1);
+            }
+        }
+        Inst::ConstNull(_) => {
+            th_st_imm(g, id, 0);
+        }
+        Inst::GlobalAddr(name, _) => {
+            th_addr(g, 0, th_glob_label(g, name), 0);
+            t2_movw(& mut g.e, 1, 0);
+            th_st(g, id, 0, 1);
+        }
+        Inst::BinOp(op, left, right, ty) => {
+            th_gen_binop(g, id, op, left, right, ty, func);
+        }
+        Inst::UnaryOp(op, operand, ty) => {
+            th_ld(g, 0, 1, operand);
+            match op {
+                UnaryOp::Neg => {
+                    if ir_type_eq(ty, IrType::F32) {
+                        th_li32(g, TH_R12, 0x80000000);
+                        t2_dp(& mut g.e, TDP_EOR, false, 0, 0, TH_R12, 0, 0);
+                    } else if ir_type_is_float(ty) {
+                        th_li32(g, TH_R12, 0x80000000);
+                        t2_dp(& mut g.e, TDP_EOR, false, 1, 1, TH_R12, 0, 0);
+                    } else {
+                        th_neg64(g, 0, 1);
+                    }
+                }
+                UnaryOp::Not => {
+                    t2_dpi(& mut g.e, TDP_EOR, false, 0, 0, 1);
+                }
+                UnaryOp::BitNot => {
+                    t2_dp(& mut g.e, TDP_ORN, false, 0, 15, 0, 0, 0);
+                    t2_dp(& mut g.e, TDP_ORN, false, 1, 15, 1, 0, 0);
+                }
+            }
+            th_st(g, id, 0, 1);
+        }
+        Inst::Alloca(_, _) => {
+            var data: i64 = 0 - 1;
+            if id >= 0 && id < g.adata.len() {
+                data = g.adata.get(id);
+            }
+            if data >= 0 {
+                th_sp_addr(g, 0, data);
+                t2_movw(& mut g.e, 1, 0);
+                th_st(g, id, 0, 1);
+            }
+        }
+        Inst::Load(ptr, ty) => {
+            var size: i64 = IrModule_type_size(module, ty);
+            var unsigned: bool = false;
+            match ty {
+                IrType::U8 => {
+                    unsigned = true;
+                }
+                IrType::U16 => {
+                    unsigned = true;
+                }
+                IrType::U32 => {
+                    unsigned = true;
+                }
+                IrType::Bool => {
+                    unsigned = true;
+                }
+                _ => {
+                }
+            }
+            th_ldlo(g, 2, ptr);
+            if size <= 1 {
+                if unsigned {
+                    t2_ldst(& mut g.e, true, true, 0, 2, 0);
+                    t2_movw(& mut g.e, 1, 0);
+                } else {
+                    t2_ldst_x(& mut g.e, 2, 0, 2, 0);
+                    t2_shift_imm(& mut g.e, 2, 1, 0, 31);
+                }
+            } else if size == 2 {
+                if unsigned {
+                    t2_ldst_x(& mut g.e, 1, 0, 2, 0);
+                    t2_movw(& mut g.e, 1, 0);
+                } else {
+                    t2_ldst_x(& mut g.e, 3, 0, 2, 0);
+                    t2_shift_imm(& mut g.e, 2, 1, 0, 31);
+                }
+            } else if size == 4 {
+                t2_ldst(& mut g.e, true, false, 0, 2, 0);
+                if unsigned {
+                    t2_movw(& mut g.e, 1, 0);
+                } else {
+                    t2_shift_imm(& mut g.e, 2, 1, 0, 31);
+                }
+            } else {
+                t2_ldst(& mut g.e, true, false, 0, 2, 0);
+                t2_ldst(& mut g.e, true, false, 1, 2, 4);
+            }
+            th_st(g, id, 0, 1);
+        }
+        Inst::Store(ptr, value, explicit_ty) => {
+            // the explicit store type, else the pointee's, else the value's
+            var store_ty: IrType = IrType::I64;
+            var have: bool = false;
+            match explicit_ty {
+                OptIrType::Some(t0) => {
+                    store_ty = t0;
+                    have = true;
+                }
+                OptIrType::None => {
+                }
+            }
+            if !have {
+                match th_meta_ty(func, ptr) {
+                    IrType::Ptr(inner) => {
+                        store_ty = box_ir_type_unbox(inner);
+                        have = true;
+                    }
+                    _ => {
+                    }
+                }
+            }
+            if !have {
+                store_ty = th_meta_ty(func, value);
+            }
+            th_ldlo(g, 2, ptr);
+            th_ld(g, 0, 1, value);
+            var wide: bool = false;
+            var is_struct: bool = false;
+            match store_ty {
+                IrType::Struct(_) => {
+                    is_struct = true;
+                }
+                IrType::Array(_, _) => {
+                    wide = true;
+                }
+                IrType::Ptr(_) => {
+                    wide = true;
+                }
+                IrType::Opaque(_) => {
+                    wide = true;
+                }
+                IrType::Generic(_, _) => {
+                    wide = true;
+                }
+                _ => {
+                }
+            }
+            if is_struct {
+                // copy the struct: r0 dst, r1 src, r2 bytes
+                t2_mov(& mut g.e, 1, 0);
+                t2_mov(& mut g.e, 0, 2);
+                th_li32(g, 2, IrModule_type_size(module, store_ty));
+                th_bl(g, th_prim_label(g, "__th_copy"));
+            } else {
+                var sz: i64 = 8;
+                if !wide {
+                    sz = IrModule_type_size(module, store_ty);
+                }
+                if sz == 1 {
+                    t2_ldst(& mut g.e, false, true, 0, 2, 0);
+                } else if sz == 2 {
+                    t2_ldst_x(& mut g.e, 0, 0, 2, 0);
+                } else if sz == 4 {
+                    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+                } else {
+                    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+                    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+                }
+            }
+        }
+        Inst::StructCopy(dst_v, src_v, ty) => {
+            th_ldlo(g, 0, dst_v);
+            th_ldlo(g, 1, src_v);
+            th_li32(g, 2, IrModule_type_size(module, ty));
+            th_bl(g, th_prim_label(g, "__th_copy"));
+        }
+        Inst::GetFieldPtr(struct_ptr, field_index, _) => {
+            var offset: i64 = field_index * 8;
+            var sname: str = "";
+            match th_meta_ty(func, struct_ptr) {
+                IrType::Ptr(inner) => {
+                    match box_ir_type_unbox(inner) {
+                        IrType::Struct(n) => {
+                            sname = n;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                IrType::Struct(n2) => {
+                    sname = n2;
+                }
+                _ => {
+                }
+            }
+            if sname != "" {
+                match IrModule_get_struct(module, sname) {
+                    OptStructLayout::Some(layout) => {
+                        if field_index >= 0 && field_index < layout.fields.len() {
+                            offset = layout.fields.get(field_index).offset;
+                        }
+                    }
+                    OptStructLayout::None => {
+                    }
+                }
+            }
+            th_ld(g, 0, 1, struct_ptr);
+            if offset != 0 {
+                th_li32(g, TH_R12, offset);
+                t2_dp(& mut g.e, TDP_ADD, true, 0, 0, TH_R12, 0, 0);
+                th_li32(g, TH_R12, (offset >> 32) & 0xFFFFFFFF);
+                t2_dp(& mut g.e, TDP_ADC, false, 1, 1, TH_R12, 0, 0);
+            }
+            th_st(g, id, 0, 1);
+        }
+        Inst::GetElemPtr(array_ptr, index, elem_ty) => {
+            var esize: i64 = IrModule_type_size(module, elem_ty);
+            if esize < 1 {
+                esize = 1;
+            }
+            th_ld(g, 2, 3, index);
+            var esh: i64 = th_log2_exact(esize);
+            if esh >= 1 && esh <= 31 {
+                // r2:r3 <<= esh
+                t2_shift_imm(& mut g.e, 0, 3, 3, esh);
+                t2_dp(& mut g.e, TDP_ORR, false, 3, 3, 2, 1, 32 - esh);
+                t2_shift_imm(& mut g.e, 0, 2, 2, esh);
+            } else if esh != 0 {
+                t2_mov(& mut g.e, 0, 2);
+                t2_mov(& mut g.e, 1, 3);
+                th_li64(g, 2, 3, esize);
+                th_mul64(g);
+                t2_mov(& mut g.e, 2, 0);
+                t2_mov(& mut g.e, 3, 1);
+            }
+            th_ld(g, 0, 1, array_ptr);
+            t2_dp(& mut g.e, TDP_ADD, true, 0, 0, 2, 0, 0);
+            t2_dp(& mut g.e, TDP_ADC, false, 1, 1, 3, 0, 0);
+            th_st(g, id, 0, 1);
+        }
+        Inst::Jump(target) => {
+            var bl: i64 = th_block_label(g, target);
+            if bl != g.next_block_label {
+                th_b(g, bl);
+            }
+        }
+        Inst::Switch(sv, sw_keys, sw_targets, sw_dflt) => {
+            th_ld(g, 0, 1, sv);
+            var ki: i64 = 0;
+            while ki < sw_keys.len() && ki < sw_targets.len() {
+                th_li64(g, 2, 3, sw_keys.get(ki));
+                t2_dp(& mut g.e, TDP_EOR, false, TH_R12, 0, 2, 0, 0);
+                t2_dp(& mut g.e, TDP_EOR, false, 6, 1, 3, 0, 0);
+                t2_dp(& mut g.e, TDP_ORR, true, TH_R12, TH_R12, 6, 0, 0);
+                th_bcc(g, TC_EQ, th_block_label(g, sw_targets.get(ki)));
+                ki = ki + 1;
+            }
+            var dl: i64 = th_block_label(g, sw_dflt);
+            if dl != g.next_block_label {
+                th_b(g, dl);
+            }
+        }
+        Inst::Branch(cond, then, else_) => {
+            var tl: i64 = th_block_label(g, then);
+            var el: i64 = th_block_label(g, else_);
+            th_ld(g, 0, 1, cond);
+            t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 0, 1, 0, 0);
+            if tl == g.next_block_label {
+                th_bcc(g, TC_EQ, el);
+            } else {
+                th_bcc(g, TC_NE, tl);
+                if el != g.next_block_label {
+                    th_b(g, el);
+                }
+            }
+        }
+        Inst::Return(ret) => {
+            match ret {
+                OptValueId::Some(v) => {
+                    th_ld(g, 0, 1, v);
+                }
+                OptValueId::None => {
+                    t2_movw(& mut g.e, 0, 0);
+                    t2_movw(& mut g.e, 1, 0);
+                }
+            }
+            th_b(g, g.epi);
+        }
+        Inst::Unreachable => {
+            t_udf(& mut g.e);
+        }
+        Inst::Call(call_name, args, _, _) => {
+            th_gen_call(g, id, call_name, args, func);
+        }
+        Inst::CallPtr(fn_ptr, args, _, _, _) => {
+            // a closure: its environment first; its word 0 is the function
+            th_arg_val(g, 0, fn_ptr);
+            var ai: i64 = 0;
+            while ai < args.len() {
+                th_arg_val(g, ai + 1, args.get(ai));
+                ai = ai + 1;
+            }
+            th_ldlo(g, TH_R12, fn_ptr);
+            t2_ldst(& mut g.e, true, false, TH_R12, TH_R12, 0);
+            t_blx(& mut g.e, TH_R12);
+            th_st(g, id, 0, 1);
+        }
+        Inst::DynCall(_, method, args, _, _) => {
+            // env 0, the receiver, then args[1..]; a dyn value is
+            // {type id, receiver}
+            th_arg_imm(g, 0, 0);
+            var ai: i64 = 1;
+            while ai < args.len() {
+                th_arg_val(g, ai + 1, args.get(ai));
+                ai = ai + 1;
+            }
+            t2_movw(& mut g.e, 4, 0);
+            if args.len() > 0 {
+                th_ldlo(g, 2, args.get(0));
+                t2_ldst(& mut g.e, true, false, 4, 2, 0);
+                t2_ldst(& mut g.e, true, false, 0, 2, 8);
+                t2_ldst(& mut g.e, true, false, 1, 2, 12);
+                th_arg_r01(g, 1);
+            }
+            var done: i64 = th_new_label(g);
+            var ti: i64 = 0;
+            while ti < g.dyn_types.len() {
+                var mname: str = g.dyn_types.get(ti) + "_" + method;
+                if th_has_fn(g, mname) {
+                    var next: i64 = th_new_label(g);
+                    th_li32(g, TH_R12, ti + 1);
+                    t2_cmp(& mut g.e, 4, TH_R12);
+                    th_bcc(g, TC_NE, next);
+                    th_bl(g, th_fn_label(g, mname));
+                    th_b(g, done);
+                    th_place(g, next);
+                }
+                ti = ti + 1;
+            }
+            // no implementation for this type
+            t_udf(& mut g.e);
+            th_place(g, done);
+            th_st(g, id, 0, 1);
+        }
+        Inst::MakeDyn(value, type_name, _) => {
+            var resolved: str = th_resolve(g, "p_malloc");
+            var k0: i64 = 0;
+            if th_has_fn(g, resolved) {
+                k0 = 1;
+            }
+            th_arg_imm(g, k0, 16);
+            if k0 == 1 {
+                th_arg_imm(g, 0, 0);
+            }
+            th_call_or_missing(g, resolved);
+            t2_mov(& mut g.e, 4, 0);
+            var tid: i64 = 0;
+            var ti2: i64 = 0;
+            while ti2 < g.dyn_types.len() {
+                if g.dyn_types.get(ti2) == type_name {
+                    tid = ti2 + 1;
+                }
+                ti2 = ti2 + 1;
+            }
+            th_li32(g, 2, tid);
+            t2_movw(& mut g.e, 3, 0);
+            t2_ldst(& mut g.e, false, false, 2, 4, 0);
+            t2_ldst(& mut g.e, false, false, 3, 4, 4);
+            th_ld(g, 0, 1, value);
+            t2_ldst(& mut g.e, false, false, 0, 4, 8);
+            t2_ldst(& mut g.e, false, false, 1, 4, 12);
+            t2_mov(& mut g.e, 0, 4);
+            t2_movw(& mut g.e, 1, 0);
+            th_st(g, id, 0, 1);
+        }
+        Inst::BitCast(value, bc_from, bc_to) => {
+            if (ir_type_eq(bc_from, IrType::F64) && ir_type_eq(bc_to, IrType::F32)) || (ir_type_eq(bc_from, IrType::F32) && ir_type_eq(bc_to, IrType::F64)) {
+                th_unsupported(g, "f32/f64 conversion");
+            }
+            th_copy_val(g, id, value);
+        }
+        Inst::IntExtend(value, from, _) => {
+            th_ld(g, 0, 1, value);
+            var xk: i64 = 0;
+            match from {
+                IrType::I8 => {
+                    xk = TX_SB;
+                }
+                IrType::I16 => {
+                    xk = TX_SH;
+                }
+                IrType::I32 => {
+                    xk = TX_SW;
+                }
+                _ => {
+                }
+            }
+            if xk != 0 {
+                th_ext_pair(g, xk, 0, 1, 0);
+            }
+            th_st(g, id, 0, 1);
+        }
+        Inst::IntTrunc(value, _, to) => {
+            th_ld(g, 0, 1, value);
+            var tk: i64 = 0;
+            match to {
+                IrType::I8 => {
+                    tk = TX_ZB;
+                }
+                IrType::U8 => {
+                    tk = TX_ZB;
+                }
+                IrType::I16 => {
+                    tk = TX_ZH;
+                }
+                IrType::U16 => {
+                    tk = TX_ZH;
+                }
+                IrType::I32 => {
+                    tk = TX_ZW;
+                }
+                IrType::U32 => {
+                    tk = TX_ZW;
+                }
+                _ => {
+                }
+            }
+            if tk != 0 {
+                th_ext_pair(g, tk, 0, 1, 0);
+            }
+            th_st(g, id, 0, 1);
+        }
+        Inst::IntToFloat(_, _, _) => {
+            th_unsupported(g, "integer to float conversion");
+            th_st_imm(g, id, 0);
+        }
+        Inst::FloatToInt(_, _, _) => {
+            th_unsupported(g, "float to integer conversion");
+            th_st_imm(g, id, 0);
+        }
+        Inst::Print(value, ty) => {
+            var formatter: str = pe_ir_print_formatter(ty);
+            if formatter != "" {
+                // collections print through their Fides formatter
+                th_arg_imm(g, 0, 0);
+                th_arg_val(g, 1, value);
+                th_call_or_missing(g, th_resolve(g, formatter));
+                var pr: str = th_resolve(g, "p_print_str");
+                if th_has_fn(g, pr) {
+                    th_arg_r01(g, 1);
+                    th_arg_imm(g, 0, 0);
+                } else {
+                    th_arg_r01(g, 0);
+                }
+                th_call_or_missing(g, pr);
+            } else {
+                var print_fn: str = "p_print_int";
+                match ty {
+                    IrType::Ptr(_) => {
+                        print_fn = "p_print_str";
+                    }
+                    IrType::Opaque(n) => {
+                        if n == "String" {
+                            print_fn = "p_print_str";
+                        }
+                    }
+                    IrType::F64 => {
+                        print_fn = "p_print_float";
+                    }
+                    IrType::F32 => {
+                        print_fn = "p_print_float";
+                    }
+                    IrType::Bool => {
+                        print_fn = "p_print_bool";
+                    }
+                    _ => {
+                    }
+                }
+                if ir_type_eq(ty, IrType::F32) {
+                    th_unsupported(g, "printing an f32");
+                } else {
+                    var pv: Vec<i64> = Vec::new();
+                    pv.push(value);
+                    th_call_builtin(g, print_fn, pv);
+                }
+            }
+        }
+        Inst::Panic(message) => {
+            var resolved: str = th_resolve(g, "p_panic");
+            var k0: i64 = 0;
+            if th_has_fn(g, resolved) {
+                k0 = 1;
+            }
+            th_addr(g, 0, th_str_label(g, message), 0);
+            t2_movw(& mut g.e, 1, 0);
+            th_arg_r01(g, k0);
+            if k0 == 1 {
+                th_arg_imm(g, 0, 0);
+            }
+            th_call_or_missing(g, resolved);
+            t_udf(& mut g.e);
+        }
+        Inst::PersistLoad(_, default, _) => {
+            th_copy_val(g, id, default);
+        }
+        Inst::PersistSave(_, _) => {
+        }
+        Inst::TxnBegin => {
+        }
+        Inst::TxnEnd => {
+        }
+        Inst::UnsafeBegin => {
+        }
+        Inst::UnsafeEnd => {
+        }
+        Inst::GradBegin(_) => {
+            th_unsupported(g, "autograd");
+        }
+        Inst::GradEnd => {
+            th_unsupported(g, "autograd");
+        }
+        Inst::Backward(_) => {
+            th_unsupported(g, "autograd");
+        }
+        Inst::TryUnwrap(_, _, _, _) => {
+        }
+        Inst::Asm(_, _, _, _) => {
+            // no inline assembly on this target (as nat_ir.fd with asm off)
+            th_st_imm(g, id, 0);
+        }
+        Inst::RegionBegin(_, _, _, _) => {
+            th_st_imm(g, id, 0);
+        }
+        Inst::RegionEnd(_, _, _) => {
+        }
+    }
+}
+
+// ===========================================================================
+// Functions
+// ===========================================================================
+
+fn th_note_id(maxid: i64, id: i64) -> i64 {
+    if id > maxid {
+        return id;
+    }
+    return maxid;
+}
+
+fn th_gen_function(g: & mut ThGen, name: str, func: & IrFunction, module: & IrModule) {
+    g.cur_name = name;
+    g.wrapping = func.is_wrapping || is_pe_runtime_fn(name);
+    g.n_fns = g.n_fns + 1;
+    NatEnc_align(& mut g.e, 4);
+    th_place(g, HashMap_get(g.fn_labels, name));
+
+    var maxid: i64 = 0;
+    var i: i64 = 0;
+    while i < func.value_metas.len() {
+        maxid = th_note_id(maxid, func.value_metas.get(i).id);
+        i = i + 1;
+    }
+    i = 0;
+    while i < func.insts.len() {
+        maxid = th_note_id(maxid, func.insts.get(i).id);
+        i = i + 1;
+    }
+    i = 0;
+    while i < func.params.len() {
+        maxid = th_note_id(maxid, func.params.get(i).id);
+        i = i + 1;
+    }
+    var slots: Vec<i64> = Vec::new();
+    var adata: Vec<i64> = Vec::new();
+    var is_param: Vec<i64> = Vec::new();
+    i = 0;
+    while i <= maxid {
+        slots.push(0 - 1);
+        adata.push(0 - 1);
+        is_param.push(0 - 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < func.params.len() {
+        var pid: i64 = func.params.get(i).id;
+        if pid >= 0 {
+            is_param.set(pid, i);
+        }
+        i = i + 1;
+    }
+    // the outgoing area: the widest call (+ its environment), at least 4
+    var most: i64 = 4;
+    i = 0;
+    while i < func.insts.len() {
+        var n: i64 = 0;
+        match func.insts.get(i).inst {
+            Inst::Call(_, a1, _, _) => {
+                n = a1.len() + 1;
+            }
+            Inst::CallPtr(_, a2, _, _, _) => {
+                n = a2.len() + 1;
+            }
+            Inst::DynCall(_, _, a3, _, _) => {
+                n = a3.len() + 1;
+            }
+            _ => {
+            }
+        }
+        if n > most {
+            most = n;
+        }
+        i = i + 1;
+    }
+    var cur: i64 = most * 8;
+    i = 0;
+    while i < func.value_metas.len() {
+        var vid: i64 = func.value_metas.get(i).id;
+        if vid >= 0 && slots.get(vid) < 0 && is_param.get(vid) < 0 {
+            slots.set(vid, cur);
+            cur = cur + 8;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(i);
+        if ve.id >= 0 && slots.get(ve.id) < 0 && is_param.get(ve.id) < 0 {
+            slots.set(ve.id, cur);
+            cur = cur + 8;
+        }
+        match ve.inst {
+            Inst::Alloca(aty, _) => {
+                var dsize: i64 = IrModule_type_size(module, aty);
+                if dsize < 8 {
+                    dsize = 8;
+                }
+                dsize = (dsize + 7) & (0 - 8);
+                if ve.id >= 0 {
+                    adata.set(ve.id, cur);
+                }
+                cur = cur + dsize;
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    var frame: i64 = (cur + 7) & (0 - 8);
+    // parameters stay where the caller put them: above the saved registers
+    i = 0;
+    while i < func.params.len() {
+        var pid2: i64 = func.params.get(i).id;
+        if pid2 >= 0 {
+            slots.set(pid2, frame + TH_SAVED + 8 * i);
+        }
+        i = i + 1;
+    }
+    g.slots = slots;
+    g.adata = adata;
+    g.frame = frame;
+    g.epi = th_new_label(g);
+
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    th_sp_sub(g, frame);
+
+    g.block_labels = HashMap_new();
+    var bi: i64 = 0;
+    while bi < func.blocks.len() {
+        HashMap_insert(g.block_labels, int_to_str(func.blocks.get(bi).id), th_new_label(g));
+        bi = bi + 1;
+    }
+    bi = 0;
+    while bi < func.blocks.len() {
+        var block: BasicBlock = func.blocks.get(bi);
+        th_place(g, th_block_label(g, block.id));
+        g.next_block_label = 0 - 1;
+        if bi + 1 < func.blocks.len() {
+            g.next_block_label = th_block_label(g, func.blocks.get(bi + 1).id);
+        }
+        var ii: i64 = 0;
+        while ii < block.instructions.len() {
+            var iid: i64 = block.instructions.get(ii);
+            match IrFunction_get_inst(func, iid) {
+                OptInst::Some(inst) => {
+                    th_gen_inst(g, iid, inst, func, module);
+                }
+                OptInst::None => {
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    // falling off the end returns 0
+    t2_movw(& mut g.e, 0, 0);
+    t2_movw(& mut g.e, 1, 0);
+    th_place(g, g.epi);
+    th_sp_add(g, frame);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+}
+
+// ===========================================================================
+// Primitives and helper routines
+// ===========================================================================
+
+fn th_prim(g: & mut ThGen, name: str) {
+    NatEnc_align(& mut g.e, 4);
+    th_place(g, th_prim_label(g, name));
+}
+
+/// r0:r1 = v; bx lr
+fn th_ret_imm(g: & mut ThGen, v: i64) {
+    th_li64(g, 0, 1, v);
+    t_bx(& mut g.e, TH_LR);
+}
+
+/// The generic (asm-generic/unistd.h) system call numbers the runtime
+/// uses, and the ARM EABI numbers of the same calls: [generic, arm]...
+fn th_linux_sysmap() -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(64);
+    v.push(4);
+    // write
+    v.push(63);
+    v.push(3);
+    // read
+    v.push(222);
+    v.push(192);
+    // mmap -> mmap2 (the offset is 0)
+    v.push(215);
+    v.push(91);
+    // munmap
+    v.push(94);
+    v.push(248);
+    // exit_group
+    v.push(93);
+    v.push(1);
+    // exit
+    v.push(113);
+    v.push(403);
+    // clock_gettime -> clock_gettime64 (a 64-bit timespec, as generic)
+    v.push(98);
+    v.push(422);
+    // futex -> futex_time64
+    v.push(56);
+    v.push(322);
+    // openat
+    v.push(57);
+    v.push(6);
+    // close
+    v.push(62);
+    v.push(19);
+    // lseek (32-bit offsets)
+    v.push(35);
+    v.push(328);
+    // unlinkat
+    v.push(34);
+    v.push(323);
+    // mkdirat
+    v.push(38);
+    v.push(329);
+    // renameat
+    v.push(48);
+    v.push(334);
+    // faccessat
+    v.push(61);
+    v.push(217);
+    // getdents64
+    v.push(78);
+    v.push(332);
+    // readlinkat
+    v.push(17);
+    v.push(183);
+    // getcwd
+    v.push(49);
+    v.push(12);
+    // chdir
+    v.push(23);
+    v.push(41);
+    // dup
+    v.push(24);
+    v.push(358);
+    // dup3
+    v.push(59);
+    v.push(359);
+    // pipe2
+    v.push(260);
+    v.push(114);
+    // wait4
+    v.push(124);
+    v.push(158);
+    // sched_yield
+    v.push(129);
+    v.push(37);
+    // kill
+    v.push(172);
+    v.push(20);
+    // getpid
+    v.push(178);
+    v.push(224);
+    // gettid
+    v.push(214);
+    v.push(45);
+    // brk
+    v.push(226);
+    v.push(125);
+    // mprotect
+    v.push(233);
+    v.push(220);
+    // madvise
+    v.push(261);
+    v.push(369);
+    // prlimit64
+    v.push(278);
+    v.push(384);
+    // getrandom
+    v.push(198);
+    v.push(281);
+    // socket
+    v.push(200);
+    v.push(282);
+    // bind
+    v.push(201);
+    v.push(284);
+    // listen
+    v.push(202);
+    v.push(285);
+    // accept
+    v.push(203);
+    v.push(283);
+    // connect
+    v.push(206);
+    v.push(290);
+    // sendto
+    v.push(207);
+    v.push(292);
+    // recvfrom
+    v.push(208);
+    v.push(294);
+    // setsockopt
+    v.push(210);
+    v.push(293);
+    // shutdown
+    return v;
+}
+
+/// nat_syscall(n, a, b, c, d, e, f) over Linux (svc 0, the number in r7);
+/// a result in [-4095, -1] is an error, any other a 32-bit unsigned value
+fn th_prim_syscall_linux(g: & mut ThGen) {
+    th_prim(g, "nat_syscall");
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    th_mem(g, true, TH_R12, TH_SP, TH_SAVED);
+    var call: i64 = th_new_label(g);
+    var map: Vec<i64> = th_linux_sysmap();
+    var i: i64 = 0;
+    while i + 1 < map.len() {
+        th_li32(g, 7, map.get(i + 1));
+        th_li32(g, 0, map.get(i));
+        t2_cmp(& mut g.e, TH_R12, 0);
+        th_bcc(g, TC_EQ, call);
+        i = i + 2;
+    }
+    // not one this target maps: -ENOSYS
+    th_li64(g, 0, 1, 0 - 38);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    th_place(g, call);
+    var k: i64 = 0;
+    while k < 6 {
+        // a..f in r0..r5 (the low words: every argument fits in 32 bits)
+        th_mem(g, true, k, TH_SP, TH_SAVED + 8 + 8 * k);
+        k = k + 1;
+    }
+    t_svc(& mut g.e, 0);
+    var done: i64 = th_new_label(g);
+    t2_movw(& mut g.e, 1, 0);
+    th_li32(g, TH_R12, 0xFFFFF001);
+    t2_cmp(& mut g.e, 0, TH_R12);
+    th_bcc(g, TC_CC, done);
+    th_li32(g, 1, 0xFFFFFFFF);
+    th_place(g, done);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+}
+
+/// r0 = the byte to send on the UART (clobbers r2, r3)
+fn th_prim_putc(g: & mut ThGen) {
+    th_prim(g, "__th_putc");
+    if g.board == 2 {
+        // write(1, &byte, 1) (clobbers r0-r2)
+        t2_push(& mut g.e, (1 << 7) | (1 << 14));
+        t2_subw(& mut g.e, TH_SP, TH_SP, 8);
+        t2_ldst(& mut g.e, false, true, 0, TH_SP, 0);
+        t2_movw(& mut g.e, 0, 1);
+        t_mov(& mut g.e, 1, TH_SP);
+        t2_movw(& mut g.e, 2, 1);
+        t2_movw(& mut g.e, 7, 4);
+        t_svc(& mut g.e, 0);
+        t2_addw(& mut g.e, TH_SP, TH_SP, 8);
+        t2_pop(& mut g.e, (1 << 7) | (1 << 15));
+        return;
+    }
+    var wait: i64 = th_new_label(g);
+    if g.board == 1 {
+        // PL011 (Stellaris UART0): wait while the FIFO is full (FR.TXFF)
+        th_li32(g, 2, 0x4000C000);
+        th_place(g, wait);
+        t2_ldst(& mut g.e, true, false, 3, 2, 0x18);
+        t2_dpi(& mut g.e, TDP_AND, true, 15, 3, 0x20);
+        th_bcc(g, TC_NE, wait);
+    } else {
+        // CMSDK APB UART0: wait while STATE.TXFULL
+        th_li32(g, 2, 0x40004000);
+        th_place(g, wait);
+        t2_ldst(& mut g.e, true, false, 3, 2, 4);
+        t2_dpi(& mut g.e, TDP_AND, true, 15, 3, 1);
+        th_bcc(g, TC_NE, wait);
+    }
+    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    t_bx(& mut g.e, TH_LR);
+}
+
+/// Exit with code r4 through semihosting: SYS_EXIT_EXTENDED (0x20) with
+/// [ADP_Stopped_ApplicationExit, code], then SYS_EXIT (0x18) for an older
+/// host (the code is lost there), then wait forever
+fn th_prim_exit(g: & mut ThGen) {
+    th_prim(g, "__th_exit");
+    if g.board == 2 {
+        t2_mov(& mut g.e, 0, 4);
+        t2_movw(& mut g.e, 7, 248);
+        t_svc(& mut g.e, 0);
+        t_udf(& mut g.e);
+        return;
+    }
+    t2_subw(& mut g.e, TH_SP, TH_SP, 8);
+    th_li32(g, 0, 0x20026);
+    t2_ldst(& mut g.e, false, false, 0, TH_SP, 0);
+    t2_ldst(& mut g.e, false, false, 4, TH_SP, 4);
+    t_mov(& mut g.e, 1, TH_SP);
+    t2_movw(& mut g.e, 0, 0x20);
+    t_bkpt(& mut g.e, 0xAB);
+    t2_movw(& mut g.e, 0, 0x18);
+    th_li32(g, 1, 0x20026);
+    t_bkpt(& mut g.e, 0xAB);
+    var hang: i64 = th_new_label(g);
+    th_place(g, hang);
+    th_b(g, hang);
+}
+
+/// nat_syscall with no OS: the calls the runtime needs, on the board
+fn th_prim_syscall_bare(g: & mut ThGen) {
+    th_prim(g, "nat_syscall");
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    th_mem(g, true, TH_R12, TH_SP, TH_SAVED);
+    var w_write: i64 = th_new_label(g);
+    var w_exit: i64 = th_new_label(g);
+    var w_mmap: i64 = th_new_label(g);
+    var w_zero: i64 = th_new_label(g);
+    var w_one: i64 = th_new_label(g);
+    var w_clock: i64 = th_new_label(g);
+    var cases: Vec<i64> = Vec::new();
+    cases.push(64);
+    cases.push(w_write);
+    cases.push(93);
+    cases.push(w_exit);
+    cases.push(94);
+    cases.push(w_exit);
+    cases.push(222);
+    cases.push(w_mmap);
+    // munmap, mprotect, madvise, sigaltstack, rt_sigaction,
+    // rt_sigprocmask, sched_yield, futex: nothing to do
+    cases.push(215);
+    cases.push(w_zero);
+    cases.push(226);
+    cases.push(w_zero);
+    cases.push(233);
+    cases.push(w_zero);
+    cases.push(132);
+    cases.push(w_zero);
+    cases.push(134);
+    cases.push(w_zero);
+    cases.push(135);
+    cases.push(w_zero);
+    cases.push(124);
+    cases.push(w_zero);
+    cases.push(98);
+    cases.push(w_zero);
+    // getpid, gettid: 1
+    cases.push(172);
+    cases.push(w_one);
+    cases.push(178);
+    cases.push(w_one);
+    cases.push(113);
+    cases.push(w_clock);
+    var i: i64 = 0;
+    while i + 1 < cases.len() {
+        th_li32(g, 0, cases.get(i));
+        t2_cmp(& mut g.e, TH_R12, 0);
+        th_bcc(g, TC_EQ, cases.get(i + 1));
+        i = i + 2;
+    }
+    th_li64(g, 0, 1, 0 - 38);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    // nothing to do: 0
+    th_place(g, w_zero);
+    th_li64(g, 0, 1, 0);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    th_place(g, w_one);
+    th_li64(g, 0, 1, 1);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    // clock_gettime(clock, ts): no clock, the time is 0
+    th_place(g, w_clock);
+    th_mem(g, true, 2, TH_SP, TH_SAVED + 16);
+    t2_movw(& mut g.e, 0, 0);
+    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    t2_ldst(& mut g.e, false, false, 0, 2, 4);
+    t2_ldst(& mut g.e, false, false, 0, 2, 8);
+    t2_ldst(& mut g.e, false, false, 0, 2, 12);
+    t2_movw(& mut g.e, 1, 0);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    // write(fd, buf, len): every byte to the UART
+    th_place(g, w_write);
+    th_mem(g, true, 4, TH_SP, TH_SAVED + 16);
+    th_mem(g, true, 5, TH_SP, TH_SAVED + 24);
+    t2_movw(& mut g.e, 6, 0);
+    var wloop: i64 = th_new_label(g);
+    var wdone: i64 = th_new_label(g);
+    th_place(g, wloop);
+    t2_cmp(& mut g.e, 6, 5);
+    th_bcc(g, TC_GE, wdone);
+    t2_ldst(& mut g.e, true, true, 0, 4, 0);
+    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 1);
+    th_bl(g, th_prim_label(g, "__th_putc"));
+    t2_dpi(& mut g.e, TDP_ADD, false, 6, 6, 1);
+    th_b(g, wloop);
+    th_place(g, wdone);
+    t2_mov(& mut g.e, 0, 5);
+    t2_movw(& mut g.e, 1, 0);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+    // exit_group(code)
+    th_place(g, w_exit);
+    th_mem(g, true, 4, TH_SP, TH_SAVED + 8);
+    th_bl(g, th_prim_label(g, "__th_exit"));
+    // mmap(0, len, ...): the next len bytes (8-aligned) of the heap,
+    // zeroed up to the heap's end; past it the memory faults
+    th_place(g, w_mmap);
+    th_mem(g, true, 0, TH_SP, TH_SAVED + 16);
+    t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 7);
+    t2_dpi(& mut g.e, TDP_BIC, false, 0, 0, 7);
+    th_addr(g, 2, g.heap_label, 0);
+    t2_ldst(& mut g.e, true, false, 3, 2, 0);
+    t2_dp(& mut g.e, TDP_ADD, false, 1, 3, 0, 0, 0);
+    t2_ldst(& mut g.e, false, false, 1, 2, 0);
+    var inside: i64 = th_new_label(g);
+    th_li32(g, TH_R12, th_heap_end(g));
+    t2_cmp(& mut g.e, 1, TH_R12);
+    th_bcc(g, TC_LS, inside);
+    t2_mov(& mut g.e, 1, TH_R12);
+    th_place(g, inside);
+    t2_mov(& mut g.e, 4, 3);
+    t2_movw(& mut g.e, 0, 0);
+    var zloop: i64 = th_new_label(g);
+    var zdone: i64 = th_new_label(g);
+    th_place(g, zloop);
+    t2_cmp(& mut g.e, 4, 1);
+    th_bcc(g, TC_CS, zdone);
+    t2_ldst(& mut g.e, false, false, 0, 4, 0);
+    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 4);
+    th_b(g, zloop);
+    th_place(g, zdone);
+    t2_mov(& mut g.e, 0, 3);
+    t2_movw(& mut g.e, 1, 0);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+}
+
+/// The helper routines of 64-bit arithmetic (operands r0:r1, r2:r3)
+fn th_prim_arith(g: & mut ThGen) {
+    // __th_udivmod: r0:r1 = n / d, r2:r3 = n % d (d != 0), unsigned
+    th_prim(g, "__th_udivmod");
+    var slow: i64 = th_new_label(g);
+    t2_dp(& mut g.e, TDP_ORR, true, TH_R12, 1, 3, 0, 0);
+    th_bcc(g, TC_NE, slow);
+    // both fit in 32 bits: one udiv
+    t2_div(& mut g.e, TH_R12, 0, 2, true);
+    t2_mls(& mut g.e, 2, TH_R12, 2, 0);
+    t2_mov(& mut g.e, 0, TH_R12);
+    t2_movw(& mut g.e, 1, 0);
+    t2_movw(& mut g.e, 3, 0);
+    t_bx(& mut g.e, TH_LR);
+    th_place(g, slow);
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_mov(& mut g.e, 4, 0);
+    t2_mov(& mut g.e, 5, 1);
+    t2_movw(& mut g.e, 6, 0);
+    t2_movw(& mut g.e, 7, 0);
+    t2_movw(& mut g.e, 8, 64);
+    var loop: i64 = th_new_label(g);
+    var do_sub: i64 = th_new_label(g);
+    var next: i64 = th_new_label(g);
+    th_place(g, loop);
+    // rem:q <<= 1 (the bit shifted out of rem in C)
+    t2_dp(& mut g.e, TDP_ADD, true, 4, 4, 4, 0, 0);
+    t2_dp(& mut g.e, TDP_ADC, true, 5, 5, 5, 0, 0);
+    t2_dp(& mut g.e, TDP_ADC, true, 6, 6, 6, 0, 0);
+    t2_dp(& mut g.e, TDP_ADC, true, 7, 7, 7, 0, 0);
+    th_bcc(g, TC_CS, do_sub);
+    t2_cmp(& mut g.e, 6, 2);
+    t2_dp(& mut g.e, TDP_SBC, true, TH_R12, 7, 3, 0, 0);
+    th_bcc(g, TC_CC, next);
+    th_place(g, do_sub);
+    t2_dp(& mut g.e, TDP_SUB, true, 6, 6, 2, 0, 0);
+    t2_dp(& mut g.e, TDP_SBC, false, 7, 7, 3, 0, 0);
+    t2_dpi(& mut g.e, TDP_ORR, false, 4, 4, 1);
+    th_place(g, next);
+    t2_dpi(& mut g.e, TDP_SUB, true, 8, 8, 1);
+    th_bcc(g, TC_NE, loop);
+    t2_mov(& mut g.e, 0, 4);
+    t2_mov(& mut g.e, 1, 5);
+    t2_mov(& mut g.e, 2, 6);
+    t2_mov(& mut g.e, 3, 7);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+
+    // __th_sdivmod: truncating signed division (the quotient's sign is
+    // the operands' xor, the remainder's the dividend's)
+    th_prim(g, "__th_sdivmod");
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_dp(& mut g.e, TDP_EOR, false, 4, 1, 3, 0, 0);
+    t2_mov(& mut g.e, 5, 1);
+    var apos: i64 = th_new_label(g);
+    th_cmpi(g, 1, 0);
+    th_bcc(g, TC_GE, apos);
+    th_neg64(g, 0, 1);
+    th_place(g, apos);
+    var bpos: i64 = th_new_label(g);
+    th_cmpi(g, 3, 0);
+    th_bcc(g, TC_GE, bpos);
+    th_neg64(g, 2, 3);
+    th_place(g, bpos);
+    th_bl(g, th_prim_label(g, "__th_udivmod"));
+    var qpos: i64 = th_new_label(g);
+    th_cmpi(g, 4, 0);
+    th_bcc(g, TC_GE, qpos);
+    th_neg64(g, 0, 1);
+    th_place(g, qpos);
+    var rpos: i64 = th_new_label(g);
+    th_cmpi(g, 5, 0);
+    th_bcc(g, TC_GE, rpos);
+    th_neg64(g, 2, 3);
+    th_place(g, rpos);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+
+    // __th_umul_ovf: r0:r1 = a * b mod 2^64, r2 = 1 when the product
+    // needs more than 64 bits
+    th_prim(g, "__th_umul_ovf");
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_movw(& mut g.e, 8, 0);
+    var ok1: i64 = th_new_label(g);
+    th_cmpi(g, 1, 0);
+    th_bcc(g, TC_EQ, ok1);
+    th_cmpi(g, 3, 0);
+    th_bcc(g, TC_EQ, ok1);
+    t2_movw(& mut g.e, 8, 1);
+    th_place(g, ok1);
+    t2_umull(& mut g.e, 4, 5, 0, 2);
+    t2_umull(& mut g.e, 6, 7, 1, 2);
+    th_cmpi(g, 7, 0);
+    t2_bcc(& mut g.e, TC_EQ, 4);
+    t2_movw(& mut g.e, 8, 1);
+    t2_dp(& mut g.e, TDP_ADD, true, 5, 5, 6, 0, 0);
+    t2_bcc(& mut g.e, TC_CC, 4);
+    t2_movw(& mut g.e, 8, 1);
+    t2_umull(& mut g.e, 6, 7, 0, 3);
+    th_cmpi(g, 7, 0);
+    t2_bcc(& mut g.e, TC_EQ, 4);
+    t2_movw(& mut g.e, 8, 1);
+    t2_dp(& mut g.e, TDP_ADD, true, 5, 5, 6, 0, 0);
+    t2_bcc(& mut g.e, TC_CC, 4);
+    t2_movw(& mut g.e, 8, 1);
+    t2_mov(& mut g.e, 0, 4);
+    t2_mov(& mut g.e, 1, 5);
+    t2_mov(& mut g.e, 2, 8);
+    t2_movw(& mut g.e, 3, 0);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+
+    // __th_smul_ovf: r0:r1 = a * b mod 2^64, r2 = 1 when the product is
+    // not an i64
+    th_prim(g, "__th_smul_ovf");
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_dp(& mut g.e, TDP_EOR, false, 8, 1, 3, 0, 0);
+    var sa: i64 = th_new_label(g);
+    th_cmpi(g, 1, 0);
+    th_bcc(g, TC_GE, sa);
+    th_neg64(g, 0, 1);
+    th_place(g, sa);
+    var sb: i64 = th_new_label(g);
+    th_cmpi(g, 3, 0);
+    th_bcc(g, TC_GE, sb);
+    th_neg64(g, 2, 3);
+    th_place(g, sb);
+    th_bl(g, th_prim_label(g, "__th_umul_ovf"));
+    var ovf: i64 = th_new_label(g);
+    var fits: i64 = th_new_label(g);
+    var fin: i64 = th_new_label(g);
+    th_cmpi(g, 2, 0);
+    th_bcc(g, TC_NE, ovf);
+    th_cmpi(g, 1, 0);
+    th_bcc(g, TC_GE, fits);
+    // |a * b| >= 2^63: an i64 only as -2^63 exactly
+    th_cmpi(g, 8, 0);
+    th_bcc(g, TC_GE, ovf);
+    th_cmpi(g, 0, 0);
+    th_bcc(g, TC_NE, ovf);
+    th_li32(g, TH_R12, 0x80000000);
+    t2_cmp(& mut g.e, 1, TH_R12);
+    th_bcc(g, TC_NE, ovf);
+    t2_movw(& mut g.e, 2, 0);
+    th_b(g, fin);
+    th_place(g, fits);
+    var pos: i64 = th_new_label(g);
+    th_cmpi(g, 8, 0);
+    th_bcc(g, TC_GE, pos);
+    th_neg64(g, 0, 1);
+    th_place(g, pos);
+    t2_movw(& mut g.e, 2, 0);
+    th_b(g, fin);
+    th_place(g, ovf);
+    t2_movw(& mut g.e, 2, 1);
+    th_place(g, fin);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+
+    // __th_lsl / __th_lsr / __th_asr: r0:r1 shifted by r2 & 63 (clobbers
+    // r3, r12)
+    var kind: i64 = 0;
+    while kind < 3 {
+        if kind == 0 {
+            th_prim(g, "__th_lsl");
+        } else if kind == 1 {
+            th_prim(g, "__th_lsr");
+        } else {
+            th_prim(g, "__th_asr");
+        }
+        var big: i64 = th_new_label(g);
+        t2_dpi(& mut g.e, TDP_AND, false, 2, 2, 63);
+        t2_dpi(& mut g.e, TDP_SUB, true, TH_R12, 2, 32);
+        th_bcc(g, TC_GE, big);
+        t2_dpi(& mut g.e, TDP_RSB, false, 3, 2, 32);
+        if kind == 0 {
+            // hi = hi << n | lo >> (32 - n); lo <<= n
+            t2_shift(& mut g.e, 1, 3, 0, 3);
+            t2_shift(& mut g.e, 0, 1, 1, 2);
+            t2_dp(& mut g.e, TDP_ORR, false, 1, 1, 3, 0, 0);
+            t2_shift(& mut g.e, 0, 0, 0, 2);
+        } else {
+            // lo = lo >> n | hi << (32 - n); hi >>= n
+            t2_shift(& mut g.e, 0, 3, 1, 3);
+            t2_shift(& mut g.e, 1, 0, 0, 2);
+            t2_dp(& mut g.e, TDP_ORR, false, 0, 0, 3, 0, 0);
+            if kind == 1 {
+                t2_shift(& mut g.e, 1, 1, 1, 2);
+            } else {
+                t2_shift(& mut g.e, 2, 1, 1, 2);
+            }
+        }
+        t_bx(& mut g.e, TH_LR);
+        th_place(g, big);
+        if kind == 0 {
+            t2_shift(& mut g.e, 0, 1, 0, TH_R12);
+            t2_movw(& mut g.e, 0, 0);
+        } else if kind == 1 {
+            t2_shift(& mut g.e, 1, 0, 1, TH_R12);
+            t2_movw(& mut g.e, 1, 0);
+        } else {
+            t2_shift(& mut g.e, 2, 0, 1, TH_R12);
+            t2_shift_imm(& mut g.e, 2, 1, 1, 31);
+        }
+        t_bx(& mut g.e, TH_LR);
+        kind = kind + 1;
+    }
+
+    // __th_copy: r2 bytes from r1 to r0 (clobbers r0-r3)
+    th_prim(g, "__th_copy");
+    var cloop: i64 = th_new_label(g);
+    var cdone: i64 = th_new_label(g);
+    th_place(g, cloop);
+    th_cmpi(g, 2, 0);
+    th_bcc(g, TC_EQ, cdone);
+    t2_ldst(& mut g.e, true, true, 3, 1, 0);
+    t2_ldst(& mut g.e, false, true, 3, 0, 0);
+    t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 1);
+    t2_dpi(& mut g.e, TDP_ADD, false, 1, 1, 1);
+    t2_dpi(& mut g.e, TDP_SUB, false, 2, 2, 1);
+    th_b(g, cloop);
+    th_place(g, cdone);
+    t_bx(& mut g.e, TH_LR);
+}
+
+/// The runtime's other primitives (stdlib/linux_runtime/base.fd's extern
+/// block): one thread, no signals, no frame records
+fn th_prim_runtime(g: & mut ThGen) {
+    // nat_start_sp: the start block (argc, argv, envp as 8-byte words)
+    th_prim(g, "nat_start_sp");
+    if g.bare {
+        th_addr(g, 0, g.zero_block_label, 0);
+    } else {
+        th_addr(g, 2, g.start_sp_label, 0);
+        t2_ldst(& mut g.e, true, false, 0, 2, 0);
+    }
+    t2_movw(& mut g.e, 1, 0);
+    t_bx(& mut g.e, TH_LR);
+
+    // one core, no interrupt touches these: plain loads and stores
+    th_prim(g, "nat_atomic_load");
+    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(& mut g.e, true, false, 0, 2, 0);
+    t2_ldst(& mut g.e, true, false, 1, 2, 4);
+    t_bx(& mut g.e, TH_LR);
+
+    th_prim(g, "nat_atomic_store");
+    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(& mut g.e, true, false, 0, TH_SP, 8);
+    t2_ldst(& mut g.e, true, false, 1, TH_SP, 12);
+    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+    th_ret_imm(g, 0);
+
+    // nat_atomic_add(addr, v) -> the old value
+    th_prim(g, "nat_atomic_add");
+    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(& mut g.e, true, false, 0, 2, 0);
+    t2_ldst(& mut g.e, true, false, 1, 2, 4);
+    t2_ldst(& mut g.e, true, false, 3, TH_SP, 8);
+    t2_ldst(& mut g.e, true, false, TH_R12, TH_SP, 12);
+    t2_dp(& mut g.e, TDP_ADD, true, 3, 0, 3, 0, 0);
+    t2_dp(& mut g.e, TDP_ADC, false, TH_R12, 1, TH_R12, 0, 0);
+    t2_ldst(& mut g.e, false, false, 3, 2, 0);
+    t2_ldst(& mut g.e, false, false, TH_R12, 2, 4);
+    t_bx(& mut g.e, TH_LR);
+
+    // nat_atomic_cas(addr, expected, new) -> 1 when *addr was expected
+    th_prim(g, "nat_atomic_cas");
+    var fail: i64 = th_new_label(g);
+    t2_ldst(& mut g.e, true, false, 2, TH_SP, 0);
+    t2_ldst(& mut g.e, true, false, 0, 2, 0);
+    t2_ldst(& mut g.e, true, false, 3, TH_SP, 8);
+    t2_cmp(& mut g.e, 0, 3);
+    th_bcc(g, TC_NE, fail);
+    t2_ldst(& mut g.e, true, false, 0, 2, 4);
+    t2_ldst(& mut g.e, true, false, 3, TH_SP, 12);
+    t2_cmp(& mut g.e, 0, 3);
+    th_bcc(g, TC_NE, fail);
+    t2_ldst(& mut g.e, true, false, 3, TH_SP, 16);
+    t2_ldst(& mut g.e, false, false, 3, 2, 0);
+    t2_ldst(& mut g.e, true, false, 3, TH_SP, 20);
+    t2_ldst(& mut g.e, false, false, 3, 2, 4);
+    th_ret_imm(g, 1);
+    th_place(g, fail);
+    th_ret_imm(g, 0);
+
+    // tasks and threads do not run on this target
+    th_prim(g, "nat_ctx_swap");
+    t_udf(& mut g.e);
+    th_prim(g, "nat_ctx_tramp");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_clone_thread");
+    th_ret_imm(g, 0 - 38);
+
+    // nat_call_fn(addr, nargs, argv): addr(env 0, argv[0..8])
+    th_prim(g, "nat_call_fn");
+    t2_push(& mut g.e, TH_SAVE_MASK);
+    t2_ldst(& mut g.e, true, false, 4, TH_SP, TH_SAVED);
+    t2_ldst(& mut g.e, true, false, 6, TH_SP, TH_SAVED + 16);
+    t2_subw(& mut g.e, TH_SP, TH_SP, 72);
+    t2_movw(& mut g.e, 0, 0);
+    t2_ldst(& mut g.e, false, false, 0, TH_SP, 0);
+    t2_ldst(& mut g.e, false, false, 0, TH_SP, 4);
+    var k: i64 = 0;
+    while k < 8 {
+        t2_ldst(& mut g.e, true, false, 0, 6, 8 * k);
+        t2_ldst(& mut g.e, false, false, 0, TH_SP, 8 + 8 * k);
+        t2_ldst(& mut g.e, true, false, 0, 6, 8 * k + 4);
+        t2_ldst(& mut g.e, false, false, 0, TH_SP, 12 + 8 * k);
+        k = k + 1;
+    }
+    t_blx(& mut g.e, 4);
+    t2_addw(& mut g.e, TH_SP, TH_SP, 72);
+    t2_pop(& mut g.e, TH_RESTORE_MASK);
+
+    th_prim(g, "nat_fn_table");
+    th_addr(g, 0, g.fn_table_label, 0);
+    t2_movw(& mut g.e, 1, 0);
+    t_bx(& mut g.e, TH_LR);
+    th_prim(g, "nat_fn_names");
+    th_addr(g, 0, g.names_label, 0);
+    t2_movw(& mut g.e, 1, 0);
+    t_bx(& mut g.e, TH_LR);
+
+    th_prim(g, "nat_tls_get");
+    th_addr(g, 2, g.tls_label, 0);
+    t2_ldst(& mut g.e, true, false, 0, 2, 0);
+    t2_ldst(& mut g.e, true, false, 1, 2, 4);
+    t_bx(& mut g.e, TH_LR);
+    th_prim(g, "nat_tls_set");
+    th_addr(g, 2, g.tls_label, 0);
+    t2_ldst(& mut g.e, true, false, 0, TH_SP, 0);
+    t2_ldst(& mut g.e, true, false, 1, TH_SP, 4);
+    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+    th_ret_imm(g, 0);
+
+    // no frame records: a panic prints no trace
+    th_prim(g, "nat_frame_fp");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_frame_ret");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_frame_next");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_sig_handler");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_sig_restorer");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_fma");
+    th_ret_imm(g, 0);
+    th_prim(g, "nat_arch");
+    th_ret_imm(g, NAT_THUMB);
+    // the Linux system call interface, on both images
+    th_prim(g, "nat_os");
+    th_ret_imm(g, 0);
+}
+
+/// Every pending panic stub: [sp] env 0, [sp + 8] the message; the
+/// runtime's p_panic prints "Panic: <message>" and exits with 1
+fn th_gen_msg_stubs(g: & mut ThGen) {
+    while g.msgs_done < g.msgs.len() {
+        var msg: str = g.msgs.get(g.msgs_done);
+        g.msgs_done = g.msgs_done + 1;
+        NatEnc_align(& mut g.e, 4);
+        th_place(g, HashMap_get(g.msg_labels, msg));
+        t2_subw(& mut g.e, TH_SP, TH_SP, 24);
+        var resolved: str = th_resolve(g, "p_panic");
+        if th_has_fn(g, resolved) {
+            th_arg_imm(g, 0, 0);
+            th_addr(g, 0, th_str_label(g, msg), 0);
+            t2_movw(& mut g.e, 1, 0);
+            th_arg_r01(g, 1);
+            th_bl(g, th_fn_label(g, resolved));
+        } else {
+            // no runtime: exit_group(1)
+            th_arg_imm(g, 0, 94);
+            th_arg_imm(g, 1, 1);
+            th_bl(g, th_prim_label(g, "nat_syscall"));
+        }
+        t_udf(& mut g.e);
+    }
+}
+
+// ===========================================================================
+// Entry points
+// ===========================================================================
+
+/// _start (Linux): the kernel's argc, argv, envp (32-bit words) copied as
+/// 8-byte words below the stack for nat_start_sp, then main(env 0) and
+/// exit_group(its result)
+fn th_gen_start_linux(g: & mut ThGen) {
+    g.entry_label = th_new_label(g);
+    NatEnc_align(& mut g.e, 4);
+    th_place(g, g.entry_label);
+    t_mov(& mut g.e, 4, TH_SP);
+    t2_dpi(& mut g.e, TDP_ADD, false, 6, 4, 4);
+    t2_movw(& mut g.e, 7, 0);
+    var scan: i64 = th_new_label(g);
+    th_place(g, scan);
+    t2_ldst(& mut g.e, true, false, TH_R12, 6, 0);
+    t2_dpi(& mut g.e, TDP_ADD, false, 6, 6, 4);
+    th_cmpi(g, TH_R12, 0);
+    th_bcc(g, TC_NE, scan);
+    t2_dpi(& mut g.e, TDP_ADD, false, 7, 7, 1);
+    th_cmpi(g, 7, 2);
+    th_bcc(g, TC_LT, scan);
+    // r6: after envp's NULL; room for twice the bytes and 4 words more
+    t2_dp(& mut g.e, TDP_SUB, false, 5, 6, 4, 0, 0);
+    t2_shift_imm(& mut g.e, 0, 5, 5, 1);
+    t2_dpi(& mut g.e, TDP_ADD, false, 5, 5, 32);
+    t2_dp(& mut g.e, TDP_SUB, false, TH_R12, 4, 5, 0, 0);
+    t2_dpi(& mut g.e, TDP_BIC, false, TH_R12, TH_R12, 15);
+    t_mov(& mut g.e, TH_SP, TH_R12);
+    t2_mov(& mut g.e, 8, TH_R12);
+    var copy: i64 = th_new_label(g);
+    var cdone: i64 = th_new_label(g);
+    th_place(g, copy);
+    t2_cmp(& mut g.e, 4, 6);
+    th_bcc(g, TC_CS, cdone);
+    t2_ldst(& mut g.e, true, false, 0, 4, 0);
+    t2_ldst(& mut g.e, false, false, 0, 8, 0);
+    t2_movw(& mut g.e, 1, 0);
+    t2_ldst(& mut g.e, false, false, 1, 8, 4);
+    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 4);
+    t2_dpi(& mut g.e, TDP_ADD, false, 8, 8, 8);
+    th_b(g, copy);
+    th_place(g, cdone);
+    t2_movw(& mut g.e, 1, 0);
+    t2_ldst(& mut g.e, false, false, 1, 8, 0);
+    t2_ldst(& mut g.e, false, false, 1, 8, 4);
+    t2_ldst(& mut g.e, false, false, 1, 8, 8);
+    t2_ldst(& mut g.e, false, false, 1, 8, 12);
+    t_mov(& mut g.e, 0, TH_SP);
+    th_addr(g, 2, g.start_sp_label, 0);
+    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    t2_ldst(& mut g.e, false, false, 1, 2, 4);
+    // main(env 0)
+    t2_subw(& mut g.e, TH_SP, TH_SP, 8);
+    t2_ldst(& mut g.e, false, false, 1, TH_SP, 0);
+    t2_ldst(& mut g.e, false, false, 1, TH_SP, 4);
+    th_bl(g, th_fn_label(g, "main"));
+    t2_movw(& mut g.e, 7, 248);
+    t_svc(& mut g.e, 0);
+    t_udf(& mut g.e);
+}
+
+/// The vector table (initial sp, reset, the 14 system exceptions), the
+/// reset handler (UART on, .data copied from flash to RAM, the heap's
+/// start, main(env 0), exit with its result) and the fault handler
+fn th_gen_start_bare(g: & mut ThGen) {
+    g.entry_label = th_new_label(g);
+    g.fault_label = th_new_label(g);
+    NatEnc_word(& mut g.e, th_ram_base(g) + th_stack_size(g));
+    th_word_fix(g, g.entry_label, 1);
+    var v: i64 = 2;
+    while v < 16 {
+        th_word_fix(g, g.fault_label, 1);
+        v = v + 1;
+    }
+    NatEnc_align(& mut g.e, 4);
+    th_place(g, g.entry_label);
+    // the UART
+    if g.board == 2 {
+        // (qemu-arm: the UART is write(2))
+    } else if g.board == 1 {
+        th_li32(g, 2, 0x4000C000);
+        th_li32(g, 3, 0x301);
+        t2_ldst(& mut g.e, false, false, 3, 2, 0x30);
+    } else {
+        th_li32(g, 2, 0x40004000);
+        t2_movw(& mut g.e, 3, 16);
+        t2_ldst(& mut g.e, false, false, 3, 2, 0x10);
+        t2_movw(& mut g.e, 3, 1);
+        t2_ldst(& mut g.e, false, false, 3, 2, 8);
+    }
+    // .data: its image in flash to its place in RAM
+    th_addr(g, 0, g.data_lma_label, 0);
+    th_addr(g, 1, g.data_start_label, 0);
+    th_addr(g, 2, g.data_end_label, 0);
+    var copy: i64 = th_new_label(g);
+    var cdone: i64 = th_new_label(g);
+    th_place(g, copy);
+    t2_cmp(& mut g.e, 1, 2);
+    th_bcc(g, TC_CS, cdone);
+    t2_ldst(& mut g.e, true, false, 3, 0, 0);
+    t2_ldst(& mut g.e, false, false, 3, 1, 0);
+    t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 4);
+    t2_dpi(& mut g.e, TDP_ADD, false, 1, 1, 4);
+    th_b(g, copy);
+    th_place(g, cdone);
+    // the heap: PSRAM, or the RAM after .data
+    if th_heap_in_psram(g) {
+        th_li32(g, 0, 0x21000000);
+    } else {
+        th_addr(g, 0, g.data_end_label, 0);
+        t2_dpi(& mut g.e, TDP_ADD, false, 0, 0, 7);
+        t2_dpi(& mut g.e, TDP_BIC, false, 0, 0, 7);
+    }
+    th_addr(g, 2, g.heap_label, 0);
+    t2_ldst(& mut g.e, false, false, 0, 2, 0);
+    // main(env 0), then exit with its result
+    t2_subw(& mut g.e, TH_SP, TH_SP, 8);
+    t2_movw(& mut g.e, 1, 0);
+    t2_ldst(& mut g.e, false, false, 1, TH_SP, 0);
+    t2_ldst(& mut g.e, false, false, 1, TH_SP, 4);
+    th_bl(g, th_fn_label(g, "main"));
+    t2_mov(& mut g.e, 4, 0);
+    th_bl(g, th_prim_label(g, "__th_exit"));
+
+    // a fault (a bad address, the stack or the heap overrun): say so on
+    // the UART and exit with 1
+    NatEnc_align(& mut g.e, 4);
+    th_place(g, g.fault_label);
+    th_addr(g, 4, th_str_label(g, "Panic: hard fault (an invalid memory access, or out of memory)\n"), 0);
+    var floop: i64 = th_new_label(g);
+    var fdone: i64 = th_new_label(g);
+    th_place(g, floop);
+    t2_ldst(& mut g.e, true, true, 0, 4, 0);
+    th_cmpi(g, 0, 0);
+    th_bcc(g, TC_EQ, fdone);
+    th_bl(g, th_prim_label(g, "__th_putc"));
+    t2_dpi(& mut g.e, TDP_ADD, false, 4, 4, 1);
+    th_b(g, floop);
+    th_place(g, fdone);
+    t2_movw(& mut g.e, 4, 1);
+    th_bl(g, th_prim_label(g, "__th_exit"));
+}
+
+// ===========================================================================
+// Data, layout, the image
+// ===========================================================================
+
+/// RAM: the runtime's words, then the program's globals (their initial
+/// values; with no OS the reset handler copies them from flash). Flash /
+/// read-only: the function tables (empty: no traces), the start block of
+/// a no-OS program, the strings ([static magic][length] before the bytes,
+/// as on the other targets).
+fn th_gen_data(g: & mut ThGen, module: & IrModule) {
+    th_ram_place(g, g.data_start_label);
+    th_ram_place(g, g.heap_label);
+    NatEnc_quad(& mut g.d, 0);
+    th_ram_place(g, g.tls_label);
+    NatEnc_quad(& mut g.d, 0);
+    th_ram_place(g, g.start_sp_label);
+    NatEnc_quad(& mut g.d, 0);
+    var gi: i64 = 0;
+    while gi < g.globs.len() {
+        var gname: str = g.globs.get(gi);
+        th_ram_place(g, HashMap_get(g.glob_labels, gname));
+        var size: i64 = 8;
+        var bits: i64 = 0;
+        var str_label: i64 = 0;
+        match IrModule_get_global(module, gname) {
+            OptGlobalLookup::Some(gty, init_expr) => {
+                size = IrModule_type_size(module, gty);
+                if size < 8 {
+                    size = 8;
+                }
+                size = (size + 7) & (0 - 8);
+                match init_expr {
+                    Expr::IntLit(v) => {
+                        bits = v;
+                    }
+                    Expr::BoolLit(b) => {
+                        if b {
+                            bits = 1;
+                        }
+                    }
+                    Expr::FloatLit(f) => {
+                        if ir_type_eq(gty, IrType::F32) {
+                            bits = p_f32_to_bits(f) & 0xFFFFFFFF;
+                        } else {
+                            bits = p_f64_to_bits(f);
+                        }
+                    }
+                    Expr::StringLit(s) => {
+                        str_label = th_str_label(g, s);
+                    }
+                    _ => {
+                    }
+                }
+            }
+            OptGlobalLookup::None => {
+            }
+        }
+        // the runtime's allocator mode: the plain allocator here
+        if gname == "lrt_mem_mode" || str_ends_with(gname, "::lrt_mem_mode") {
+            bits = 0;
+        }
+        if str_label != 0 {
+            th_dword_fix(g, str_label, 0);
+            NatEnc_word(& mut g.d, 0);
+        } else {
+            NatEnc_quad(& mut g.d, bits);
+        }
+        var k: i64 = 8;
+        while k < size {
+            NatEnc_byte(& mut g.d, 0);
+            k = k + 1;
+        }
+        gi = gi + 1;
+    }
+    th_ram_place(g, g.data_end_label);
+
+    NatEnc_align(& mut g.e, 8);
+    th_place(g, g.names_label);
+    var z: i64 = 0;
+    while z < 6 {
+        NatEnc_quad(& mut g.e, 0);
+        z = z + 1;
+    }
+    th_place(g, g.fn_table_label);
+    NatEnc_quad(& mut g.e, 0);
+    NatEnc_quad(& mut g.e, 0);
+    th_place(g, g.zero_block_label);
+    z = 0;
+    while z < 4 {
+        NatEnc_quad(& mut g.e, 0);
+        z = z + 1;
+    }
+    var si: i64 = 0;
+    while si < g.strs.len() {
+        var s: str = g.strs.get(si);
+        NatEnc_align(& mut g.e, 8);
+        var n: i64 = str_len(s);
+        NatEnc_quad(& mut g.e, 0x4649444553545202);
+        NatEnc_quad(& mut g.e, n);
+        th_place(g, HashMap_get(g.str_labels, s));
+        var bi: i64 = 0;
+        while bi < n {
+            NatEnc_byte(& mut g.e, str_byte_at(s, bi));
+            bi = bi + 1;
+        }
+        NatEnc_byte(& mut g.e, 0);
+        si = si + 1;
+    }
+    // the flash image of .data follows the code
+    NatEnc_align(& mut g.e, 8);
+    th_place(g, g.data_lma_label);
+}
+
+/// The address of a placed label (-1: never placed)
+fn th_label_addr(g: & ThGen, label: i64) -> i64 {
+    if label <= 0 || label >= g.e.labels.len() {
+        return 0 - 1;
+    }
+    var pos: i64 = g.e.labels.get(label);
+    if pos < 0 {
+        return 0 - 1;
+    }
+    if HashMap_contains_i(g.ram_labels, label) {
+        return g.data_vma + pos;
+    }
+    return g.code_vma + pos;
+}
+
+fn th_put32(code: & mut Vec<i64>, pos: i64, w: i64) {
+    code.set(pos, w & 0xFF);
+    code.set(pos + 1, (w >> 8) & 0xFF);
+    code.set(pos + 2, (w >> 16) & 0xFF);
+    code.set(pos + 3, (w >> 24) & 0xFF);
+}
+
+/// Patch every fixup: "" or the first error
+fn th_resolve_fixes(g: & mut ThGen) -> str {
+    var i: i64 = 0;
+    while i + 3 < g.fixes.len() {
+        var pos: i64 = g.fixes.get(i);
+        var label: i64 = g.fixes.get(i + 1);
+        var kind: i64 = g.fixes.get(i + 2);
+        var extra: i64 = g.fixes.get(i + 3);
+        var target: i64 = th_label_addr(g, label);
+        if target < 0 {
+            return "thumbv7m: a label was never placed (fixup " + int_to_str(i / 4) + ")";
+        }
+        var tmp: NatEnc = NatEnc_new();
+        if kind == TH_FIX_BL || kind == TH_FIX_B || kind == TH_FIX_BCC {
+            var off: i64 = target - (g.code_vma + pos + 4);
+            if kind == TH_FIX_BCC {
+                if off < 0 - 1048576 || off >= 1048576 {
+                    return "thumbv7m: a conditional branch is out of range (more than 1 MB) in the code";
+                }
+                t2_bcc(& mut tmp, extra, off);
+            } else {
+                if off < 0 - 16777216 || off >= 16777216 {
+                    return "thumbv7m: a call or branch is out of range (more than 16 MB)";
+                }
+                if kind == TH_FIX_BL {
+                    t2_bl(& mut tmp, off);
+                } else {
+                    t2_b(& mut tmp, off);
+                }
+            }
+            var k: i64 = 0;
+            while k < 4 {
+                g.e.code.set(pos + k, tmp.code.get(k));
+                k = k + 1;
+            }
+        } else if kind == TH_FIX_MOVW {
+            var v: i64 = (target + extra) & 0xFFFFFFFF;
+            var reg: i64 = g.e.code.get(pos + 3) & 15;
+            t2_movw(& mut tmp, reg, v & 0xFFFF);
+            t2_movt(& mut tmp, reg, (v >> 16) & 0xFFFF);
+            var k2: i64 = 0;
+            while k2 < 8 {
+                g.e.code.set(pos + k2, tmp.code.get(k2));
+                k2 = k2 + 1;
+            }
+        } else {
+            th_put32(& mut g.e.code, pos, target + extra);
+        }
+        i = i + 4;
+    }
+    var j: i64 = 0;
+    while j + 3 < g.dfixes.len() {
+        var dtarget: i64 = th_label_addr(g, g.dfixes.get(j + 1));
+        if dtarget < 0 {
+            return "thumbv7m: a data label was never placed";
+        }
+        th_put32(& mut g.d.code, g.dfixes.get(j), dtarget + g.dfixes.get(j + 3));
+        j = j + 4;
+    }
+    return "";
+}
+
+fn th_u16(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 0xFF);
+    out.push((v >> 8) & 0xFF);
+}
+
+fn th_u32(out: & mut Vec<i64>, v: i64) {
+    out.push(v & 0xFF);
+    out.push((v >> 8) & 0xFF);
+    out.push((v >> 16) & 0xFF);
+    out.push((v >> 24) & 0xFF);
+}
+
+fn th_phdr(out: & mut Vec<i64>, offset: i64, vaddr: i64, paddr: i64, size: i64, flags: i64, align: i64) {
+    th_u32(out, 1);
+    th_u32(out, offset);
+    th_u32(out, vaddr);
+    th_u32(out, paddr);
+    th_u32(out, size);
+    th_u32(out, size);
+    th_u32(out, flags);
+    th_u32(out, align);
+}
+
+/// A segment of zeroed memory (no bytes in the file)
+fn th_phdr_bss(out: & mut Vec<i64>, vaddr: i64, size: i64) {
+    th_u32(out, 1);
+    th_u32(out, 0);
+    th_u32(out, vaddr);
+    th_u32(out, vaddr);
+    th_u32(out, 0);
+    th_u32(out, size);
+    th_u32(out, 6);
+    th_u32(out, 0x1000);
+}
+
+/// Where the code starts in the file (the ELF header and program headers
+/// before it)
+const TH_CODE_OFF: i64 = 0x100;
+/// Where a Linux image is loaded
+const TH_LINUX_BASE: i64 = 0x10000;
+
+/// The ELF32 image: Linux, one RWX segment of headers, code and data; no
+/// OS, the code in flash and .data in RAM with its image (LMA) in flash
+/// right after the code, as a loader for a board expects
+fn th_elf(g: & ThGen) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(0x7F);
+    out.push(69);
+    out.push(76);
+    out.push(70);
+    out.push(1);
+    out.push(1);
+    out.push(1);
+    while out.len() < 16 {
+        out.push(0);
+    }
+    th_u16(& mut out, 2);
+    th_u16(& mut out, 40);
+    th_u32(& mut out, 1);
+    th_u32(& mut out, th_label_addr(g, g.entry_label) | 1);
+    th_u32(& mut out, 52);
+    th_u32(& mut out, 0);
+    // EABI version 5, soft float
+    th_u32(& mut out, 0x05000200);
+    th_u16(& mut out, 52);
+    th_u16(& mut out, 32);
+    if g.bare && g.board == 2 {
+        th_u16(& mut out, 3);
+    } else if g.bare {
+        th_u16(& mut out, 2);
+    } else {
+        th_u16(& mut out, 1);
+    }
+    th_u16(& mut out, 40);
+    th_u16(& mut out, 0);
+    th_u16(& mut out, 0);
+    var elen: i64 = g.e.code.len();
+    var dlen: i64 = g.d.code.len();
+    if g.bare && g.board == 2 {
+        // qemu-arm loads by virtual address: the flash (code, then .data's
+        // image), the RAM and the PSRAM as zeroed memory
+        th_phdr(& mut out, TH_CODE_OFF, g.code_vma, g.code_vma, elen + dlen, 5, 0x1000);
+        th_phdr_bss(& mut out, th_ram_base(g), th_ram_end(g) - th_ram_base(g));
+        th_phdr_bss(& mut out, 0x21000000, 0x1000000);
+    } else if g.bare {
+        th_phdr(& mut out, TH_CODE_OFF, g.code_vma, g.code_vma, elen, 5, 4);
+        th_phdr(& mut out, TH_CODE_OFF + elen, g.data_vma, g.code_vma + elen, dlen, 6, 4);
+    } else {
+        th_phdr(& mut out, 0, TH_LINUX_BASE, TH_LINUX_BASE, TH_CODE_OFF + elen + dlen, 7, 0x1000);
+    }
+    while out.len() < TH_CODE_OFF {
+        out.push(0);
+    }
+    var i: i64 = 0;
+    while i < elen {
+        out.push(g.e.code.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < dlen {
+        out.push(g.d.code.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The flash contents of a no-OS image (code, then .data's image), for a
+/// flasher that takes a raw binary at the flash's start
+fn th_flat(g: & ThGen) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < g.e.code.len() {
+        out.push(g.e.code.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < g.d.code.len() {
+        out.push(g.d.code.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// An environment variable, "" when it is not set
+fn th_env(name: str) -> str {
+    match env_var(name) {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+        }
+    }
+    return "";
+}
+
+/// "thumbv7m-none" (no OS) rather than "thumbv7m-linux": set by
+/// nat_ir.fd nat_target_arch from the target name main.fd passes it
+pub var g_nat_thumb_bare: bool = false;
+
+/// The machine code of `module` (with stdlib/linux_runtime merged in) for
+/// ARMv7-M: an ELF32 for a board (bare) or for Linux (qemu-arm).
+/// FID_THUMB_FLAT=1: the raw flash contents of a no-OS image instead.
+pub fn nat_thumb_generate(module: IrModule, bare: bool) -> ResultBytes {
+    var g: ThGen = ThGen_new(bare);
+    var bname: str = g_th_board;
+    if bname == "" {
+        bname = th_env("FID_THUMB_BOARD");
+    }
+    var bix: i64 = nat_thumb_board_index(bname);
+    if bix < 0 {
+        return ResultBytes::Err(c_vec1("thumbv7m: unknown board '" + bname + "' (FID_THUMB_BOARD: mps2-an385, lm3s6965evb or qemu-user)"));
+    }
+    g.board = bix;
+    if !pe_module_has_fn(& module, "main") {
+        return ResultBytes::Err(c_vec1("thumbv7m: the program has no `main` function"));
+    }
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        HashMap_insert(g.all_fns, module.functions.get(fi).name, 1);
+        fi = fi + 1;
+    }
+    var ei: i64 = 0;
+    while ei < module.extern_decls.len() {
+        var ext: ExternDecl = module.extern_decls.get(ei);
+        if !HashMap_contains(g.c_names, ext.pledge_name) {
+            g.c_list.push(ext.c_name);
+            HashMap_insert(g.c_names, ext.pledge_name, g.c_list.len());
+        }
+        ei = ei + 1;
+    }
+    th_collect_dyn_types(& mut g, & module);
+    g.heap_label = th_new_label(& mut g);
+    g.tls_label = th_new_label(& mut g);
+    g.start_sp_label = th_new_label(& mut g);
+    g.zero_block_label = th_new_label(& mut g);
+    g.names_label = th_new_label(& mut g);
+    g.fn_table_label = th_new_label(& mut g);
+    g.data_start_label = th_new_label(& mut g);
+    g.data_end_label = th_new_label(& mut g);
+    g.data_lma_label = th_new_label(& mut g);
+    // the entry first: with no OS the vector table is the image's start
+    if bare {
+        th_gen_start_bare(& mut g);
+        th_prim_syscall_bare(& mut g);
+        th_prim_putc(& mut g);
+        th_prim_exit(& mut g);
+    } else {
+        th_gen_start_linux(& mut g);
+        th_prim_syscall_linux(& mut g);
+    }
+    th_prim_runtime(& mut g);
+    th_prim_arith(& mut g);
+    // the functions main reaches, then the panic stubs they need (which
+    // may reach more functions), until nothing is left
+    var qi: i64 = 0;
+    var more: bool = true;
+    while more {
+        while qi < g.queue.len() {
+            var name: str = g.queue.get(qi);
+            qi = qi + 1;
+            match IrModule_get_function(& module, name) {
+                OptIrFunction::Some(f) => {
+                    th_gen_function(& mut g, name, & f, & module);
+                }
+                OptIrFunction::None => {
+                    return ResultBytes::Err(c_vec1("thumbv7m: no function " + name));
+                }
+            }
+        }
+        th_gen_msg_stubs(& mut g);
+        more = qi < g.queue.len();
+    }
+    th_gen_data(& mut g, & module);
+    if bare {
+        g.code_vma = th_flash_base(& g);
+        g.data_vma = th_ram_base(& g) + th_stack_size(& g);
+        if g.data_vma + g.d.code.len() > th_ram_end(& g) {
+            return ResultBytes::Err(c_vec1("thumbv7m: the program's data (" + int_to_str(g.d.code.len()) + " bytes) does not fit in the board's RAM"));
+        }
+        var flash: i64 = 0x400000;
+        if g.board == 1 {
+            flash = 0x40000;
+        }
+        if g.e.code.len() + g.d.code.len() > flash {
+            return ResultBytes::Err(c_vec1("thumbv7m: the image (" + int_to_str(g.e.code.len() + g.d.code.len()) + " bytes) does not fit in the board's flash (" + int_to_str(flash) + " bytes)"));
+        }
+    } else {
+        g.code_vma = TH_LINUX_BASE + TH_CODE_OFF;
+        g.data_vma = g.code_vma + g.e.code.len();
+    }
+    var err: str = th_resolve_fixes(& mut g);
+    if err != "" {
+        return ResultBytes::Err(c_vec1(err));
+    }
+    if g.notes.len() > 0 {
+        var shown: str = "";
+        var ni: i64 = 0;
+        while ni < g.notes.len() && ni < 6 {
+            if ni > 0 {
+                shown = shown + "; ";
+            }
+            shown = shown + g.notes.get(ni);
+            ni = ni + 1;
+        }
+        if g.notes.len() > 6 {
+            shown = shown + "; ...";
+        }
+        p_eprint_str("[thumb] " + int_to_str(g.notes.len()) + " operation(s) this target does not support (a panic if reached): " + shown + "\n");
+    }
+    p_eprint_str("[thumb] " + int_to_str(g.n_fns) + " functions, " + int_to_str(g.e.code.len()) + " bytes of code and read-only data, " + int_to_str(g.d.code.len()) + " of data\n");
+    if bare {
+        var flat: str = th_env("FID_THUMB_FLAT");
+        if str_len(flat) > 0 && flat != "0" {
+            return ResultBytes::Ok(th_flat(& g));
+        }
+    }
+    return ResultBytes::Ok(th_elf(& g));
+}
+
+/// The dyn types (as nat_ir.fd ng_collect_dyn_types): every type made into
+/// a dyn value or named by a trait impl, sorted
+fn th_collect_dyn_types(g: & mut ThGen, module: & IrModule) {
+    var types: Vec<str> = Vec::new();
+    var ti: i64 = 0;
+    while ti < module.trait_impls.len() {
+        var items: Vec<str> = module.trait_impls.get(ti).items;
+        var ii: i64 = 0;
+        while ii < items.len() {
+            types = th_insert_sorted(types, items.get(ii));
+            ii = ii + 1;
+        }
+        ti = ti + 1;
+    }
+    var fi: i64 = 0;
+    while fi < module.functions.len() {
+        var f: IrFunction = module.functions.get(fi).func;
+        var k: i64 = 0;
+        while k < f.insts.len() {
+            match f.insts.get(k).inst {
+                Inst::MakeDyn(_, tname, _) => {
+                    types = th_insert_sorted(types, tname);
+                }
+                _ => {
+                }
+            }
+            k = k + 1;
+        }
+        fi = fi + 1;
+    }
+    g.dyn_types = types;
+}
+
+fn th_insert_sorted(v: Vec<str>, s: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var placed: bool = false;
+    var i: i64 = 0;
+    while i < v.len() {
+        var x: str = v.get(i);
+        if x == s {
+            return v;
+        }
+        if !placed && str_compare(x, s) > 0 {
+            out.push(s);
+            placed = true;
+        }
+        out.push(x);
+        i = i + 1;
+    }
+    if !placed {
+        out.push(s);
+    }
+    return out;
+}

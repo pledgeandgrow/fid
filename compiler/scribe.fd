@@ -12,7 +12,7 @@
 //   HTML/Markdown files in the specified output directory (default: docs/)
 
 module compiler::scribe;
- use core; use vec; use string;
+ use core; use vec; use string; use compiler::build_info;
 // Wrapper structs for tuple-like data (Fides has no tuples)
 pub struct StringPair {
     pub a: str,
@@ -93,7 +93,8 @@ pub fn extract_docs(source: str) -> Vec<DocItem> {
             var trimmed: str = str_trim_start(lines.get(i));
             if str_starts_with(trimmed, "///") {
                 var rest: str = str_slice(trimmed, 3, str_len(trimmed));
-                doc_lines.push(str_trim_start(rest));
+                // TL11: an example's code lines keep their indentation
+                doc_lines.push(scribe_doc_line(lines.get(i), rest));
                 i = i + 1;
             } else if str_starts_with(trimmed, "//") {
                 i = i + 1;
@@ -295,7 +296,8 @@ fn scribe_parse_struct(lines: Vec<str>, start: i64, doc: str) -> ParseResult {
         if in_body && brace_depth > 0 && !str_starts_with(l, "{") && !str_starts_with(l, "}") {
             var field_line: str = str_trim_end_char(l, 44);
             // remove trailing comma
-            var colon_pos: i64 = sc_str_find_char(field_line, ":");
+            // byte codes: a str literal given for the i64 never matched
+            var colon_pos: i64 = sc_str_find_char(field_line, 58);
             if colon_pos >= 0 {
                 var field_name: str = str_trim(str_slice(field_line, 0, colon_pos));
                 field_name = str_trim_start_str(field_name, "pub ");
@@ -352,7 +354,7 @@ fn scribe_parse_enum(lines: Vec<str>, start: i64, doc: str) -> ParseResult {
             // remove trailing comma
             // Variant: "Ok(i64)" or "None" or "Ok(i64, str)"
             var var_name: str = var_line;
-            var paren_pos: i64 = sc_str_find_char(var_line, "(");
+            var paren_pos: i64 = sc_str_find_char(var_line, 40);
             if paren_pos >= 0 {
                 var_name = str_slice(var_line, 0, paren_pos);
             }
@@ -528,7 +530,7 @@ fn extract_params_and_return(line: str) -> ParamsRet {
     var ret_type: str = "";
 
     // Find params between first ( and matching )
-    var start: i64 = sc_str_find_char(line, "(");
+    var start: i64 = sc_str_find_char(line, 40);
     if start < 0 {
         return ParamsRet_new(params, ret_type);
     }
@@ -558,7 +560,7 @@ fn extract_params_and_return(line: str) -> ParamsRet {
     while pi < parts.len() {
         var param: str = str_trim(parts.get(pi));
         if str_len(param) > 0 {
-            var colon: i64 = sc_str_find_char(param, ":");
+            var colon: i64 = sc_str_find_char(param, 58);
             if colon >= 0 {
                 var pname: str = str_trim_start_str(str_slice(param, 0, colon), "pub ");
                 pname = str_trim(pname);
@@ -602,20 +604,36 @@ pub fn escape_html(s: str) -> str {
 // --- HTML generation ---
 
 pub fn generate_html(items: Vec<DocItem>, module_name: str) -> str {
+    return generate_html_ctx(items, module_name, DocCtx_new());
+}
+
+/// TL11: a module's page; `ctx` names the types other pages document
+/// (signatures link to them), the module's source page (each item links
+/// to its line) and the version label.
+pub fn generate_html_ctx(items: Vec<DocItem>, module_name: str, ctx: DocCtx) -> str {
     var html: str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
     html = html + "<title>" + escape_html(module_name) + " -- Fides Documentation</title>\n";
     html = html + "<meta charset=\"utf-8\">\n";
     html = html + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
-    html = html + "<style>\n" + CSS + "</style>\n";
+    html = html + "<style>\n" + CSS + SCRIBE_CSS_MORE + "</style>\n";
     html = html + "</head>\n<body>\n";
 
     html = html + "<h1>" + escape_html(module_name) + "</h1>\n";
+    if str_len(ctx.version) > 0 {
+        html = html + "<p class=\"version\">Version " + escape_html(ctx.version) + "</p>\n";
+    }
+    if str_len(ctx.src_href) > 0 {
+        html = html + "<p class=\"srcfile\">Source: <a class=\"src\" href=\"" + escape_html(ctx.src_href) + "\">" + escape_html(ctx.src_label) + "</a></p>\n";
+    }
     html = html + "<nav class=\"sidebar\">\n<ul>\n";
 
     var i: i64 = 0;
     while i < items.len() {
         var item: DocItem = items.get(i);
-        if item.is_pub || item.kind == "impl" {
+        if item.kind == "impl" {
+            // the impl's own section (the type may be documented elsewhere)
+            html = html + "<li><a href=\"#impl-" + escape_html(item.name) + "\">" + escape_html(item.name) + " <span class=\"kind\">" + item.kind + "</span></a></li>\n";
+        } else if item.is_pub {
             html = html + "<li><a href=\"#" + escape_html(item.name) + "\">" + escape_html(item.name) + " <span class=\"kind\">" + item.kind + "</span></a></li>\n";
         }
         i = i + 1;
@@ -651,125 +669,128 @@ pub fn generate_html(items: Vec<DocItem>, module_name: str) -> str {
         i = i + 1;
     }
 
+    // the sections go through a StringBuilder: core's page has thousands
+    var body: StringBuilder = StringBuilder::new();
+    body.append_str(html);
     if functions.len() > 0 {
-        html = html + "<h2 id=\"functions\">Functions</h2>\n";
+        body.append_str("<h2 id=\"functions\">Functions</h2>\n");
         i = 0;
         while i < functions.len() {
-            html = html + render_function(functions.get(i));
+            body.append_str(render_function(functions.get(i), ctx));
             i = i + 1;
         }
     }
 
     if structs.len() > 0 {
-        html = html + "<h2 id=\"structs\">Structs</h2>\n";
+        body.append_str("<h2 id=\"structs\">Structs</h2>\n");
         i = 0;
         while i < structs.len() {
-            html = html + render_struct(structs.get(i));
+            body.append_str(render_struct(structs.get(i), ctx));
             i = i + 1;
         }
     }
 
     if enums.len() > 0 {
-        html = html + "<h2 id=\"enums\">Enums</h2>\n";
+        body.append_str("<h2 id=\"enums\">Enums</h2>\n");
         i = 0;
         while i < enums.len() {
-            html = html + render_enum(enums.get(i));
+            body.append_str(render_enum(enums.get(i), ctx));
             i = i + 1;
         }
     }
 
     if impls.len() > 0 {
-        html = html + "<h2 id=\"impls\">Implementations</h2>\n";
+        body.append_str("<h2 id=\"impls\">Implementations</h2>\n");
         i = 0;
         while i < impls.len() {
-            html = html + render_impl(impls.get(i));
+            body.append_str(render_impl(impls.get(i), ctx));
             i = i + 1;
         }
     }
 
     if consts.len() > 0 {
-        html = html + "<h2 id=\"consts\">Constants</h2>\n";
+        body.append_str("<h2 id=\"consts\">Constants</h2>\n");
         i = 0;
         while i < consts.len() {
-            html = html + render_const(consts.get(i));
+            body.append_str(render_const(consts.get(i), ctx));
             i = i + 1;
         }
     }
 
     if traits.len() > 0 {
-        html = html + "<h2 id=\"traits\">Traits</h2>\n";
+        body.append_str("<h2 id=\"traits\">Traits</h2>\n");
         i = 0;
         while i < traits.len() {
-            html = html + render_trait(traits.get(i));
+            body.append_str(render_trait(traits.get(i), ctx));
             i = i + 1;
         }
     }
 
-    html = html + "</main>\n";
-    html = html + "<footer><p>Generated by scribe -- Fides documentation generator</p></footer>\n";
-    html = html + "</body>\n</html>\n";
-    return html;
+    body.append_str("</main>\n");
+    body.append_str("<footer><p>Generated by scribe -- Fides documentation generator</p></footer>\n");
+    body.append_str("</body>\n</html>\n");
+    return body.to_str();
 }
 
-fn render_function(item: DocItem) -> str {
+fn render_function(item: DocItem, ctx: DocCtx) -> str {
     var html: str = "<section id=\"" + escape_html(item.name) + "\">\n";
     html = html + "<h3>" + escape_html(item.name) + "</h3>\n";
     if str_len(item.doc) > 0 {
-        html = html + "<div class=\"doc\">" + escape_html(str_replace(item.doc, "\n", "<br>\n")) + "</div>\n";
+        html = html + "<div class=\"doc\">" + scribe_doc_html(item.doc) + "</div>\n";
     }
-    html = html + "<pre class=\"signature\">" + escape_html(item.signature) + "</pre>\n";
+    html = html + "<pre class=\"signature\">" + scribe_link_types(item.signature, ctx, item.name) + "</pre>\n";
 
     if item.params.len() > 0 {
         html = html + "<h4>Parameters</h4>\n<table>\n";
         var pi: i64 = 0;
         while pi < item.params.len() {
             var param: StringPair = item.params.get(pi);
-            html = html + "<tr><td class=\"name\">" + escape_html(param.a) + "</td><td class=\"type\">" + escape_html(param.b) + "</td></tr>\n";
+            html = html + "<tr><td class=\"name\">" + escape_html(param.a) + "</td><td class=\"type\">" + scribe_link_types(param.b, ctx, "") + "</td></tr>\n";
             pi = pi + 1;
         }
         html = html + "</table>\n";
     }
 
     if str_len(item.ret_type) > 0 {
-        html = html + "<h4>Returns</h4>\n<p class=\"type\">" + escape_html(item.ret_type) + "</p>\n";
+        html = html + "<h4>Returns</h4>\n<p class=\"type\">" + scribe_link_types(item.ret_type, ctx, "") + "</p>\n";
     }
 
-    html = html + "<p class=\"location\">Defined at line " + int_to_str(item.line) + "</p>\n";
+    html = html + scribe_location_html(item.line, ctx);
     html = html + "</section>\n";
     return html;
 }
 
-fn render_struct(item: DocItem) -> str {
+fn render_struct(item: DocItem, ctx: DocCtx) -> str {
     var html: str = "<section id=\"" + escape_html(item.name) + "\">\n";
     html = html + "<h3>" + escape_html(item.name) + "</h3>\n";
     if str_len(item.doc) > 0 {
-        html = html + "<div class=\"doc\">" + escape_html(str_replace(item.doc, "\n", "<br>\n")) + "</div>\n";
+        html = html + "<div class=\"doc\">" + scribe_doc_html(item.doc) + "</div>\n";
     }
-    html = html + "<pre class=\"signature\">" + escape_html(item.signature) + "</pre>\n";
+    html = html + "<pre class=\"signature\">" + scribe_link_types(item.signature, ctx, item.name) + "</pre>\n";
 
     if item.fields.len() > 0 {
         html = html + "<h4>Fields</h4>\n<table>\n";
         var fi: i64 = 0;
         while fi < item.fields.len() {
             var field: StringTriple = item.fields.get(fi);
-            html = html + "<tr><td class=\"name\">" + escape_html(field.a) + "</td><td class=\"type\">" + escape_html(field.b) + "</td><td class=\"doc\">" + escape_html(field.c) + "</td></tr>\n";
+            html = html + "<tr><td class=\"name\">" + escape_html(field.a) + "</td><td class=\"type\">" + scribe_link_types(field.b, ctx, "") + "</td><td class=\"doc\">" + escape_html(field.c) + "</td></tr>\n";
             fi = fi + 1;
         }
         html = html + "</table>\n";
     }
 
-    html = html + "<p class=\"location\">Defined at line " + int_to_str(item.line) + "</p>\n";
+    html = html + scribe_location_html(item.line, ctx);
     html = html + "</section>\n";
     return html;
 }
 
-fn render_enum(item: DocItem) -> str {
+fn render_enum(item: DocItem, ctx: DocCtx) -> str {
     var html: str = "<section id=\"" + escape_html(item.name) + "\">\n";
     html = html + "<h3>" + escape_html(item.name) + "</h3>\n";
     if str_len(item.doc) > 0 {
-        html = html + "<div class=\"doc\">" + escape_html(str_replace(item.doc, "\n", "<br>\n")) + "</div>\n";
+        html = html + "<div class=\"doc\">" + scribe_doc_html(item.doc) + "</div>\n";
     }
-    html = html + "<pre class=\"signature\">" + escape_html(item.signature) + "</pre>\n";
+    html = html + "<pre class=\"signature\">" + scribe_link_types(item.signature, ctx, item.name) + "</pre>\n";
 
     if item.variants.len() > 0 {
         html = html + "<h4>Variants</h4>\n<ul>\n";
@@ -782,23 +803,24 @@ fn render_enum(item: DocItem) -> str {
         html = html + "</ul>\n";
     }
 
-    html = html + "<p class=\"location\">Defined at line " + int_to_str(item.line) + "</p>\n";
+    html = html + scribe_location_html(item.line, ctx);
     html = html + "</section>\n";
     return html;
 }
 
-fn render_impl(item: DocItem) -> str {
+fn render_impl(item: DocItem, ctx: DocCtx) -> str {
     var html: str = "<section id=\"impl-" + escape_html(item.name) + "\">\n";
-    html = html + "<h3>impl " + escape_html(item.name) + "</h3>\n";
+    html = html + "<h3>impl " + scribe_link_types(item.name, ctx, "") + "</h3>\n";
     if str_len(item.doc) > 0 {
-        html = html + "<div class=\"doc\">" + escape_html(str_replace(item.doc, "\n", "<br>\n")) + "</div>\n";
+        html = html + "<div class=\"doc\">" + scribe_doc_html(item.doc) + "</div>\n";
     }
+    html = html + scribe_location_html(item.line, ctx);
 
     if item.methods.len() > 0 {
         html = html + "<h4>Methods</h4>\n";
         var mi: i64 = 0;
         while mi < item.methods.len() {
-            html = html + render_function(item.methods.get(mi));
+            html = html + render_function(item.methods.get(mi), ctx);
             mi = mi + 1;
         }
     }
@@ -807,26 +829,26 @@ fn render_impl(item: DocItem) -> str {
     return html;
 }
 
-fn render_const(item: DocItem) -> str {
+fn render_const(item: DocItem, ctx: DocCtx) -> str {
     var html: str = "<section id=\"" + escape_html(item.name) + "\">\n";
     html = html + "<h3>" + escape_html(item.name) + "</h3>\n";
     if str_len(item.doc) > 0 {
-        html = html + "<div class=\"doc\">" + escape_html(str_replace(item.doc, "\n", "<br>\n")) + "</div>\n";
+        html = html + "<div class=\"doc\">" + scribe_doc_html(item.doc) + "</div>\n";
     }
-    html = html + "<pre class=\"signature\">" + escape_html(item.signature) + "</pre>\n";
-    html = html + "<p class=\"location\">Defined at line " + int_to_str(item.line) + "</p>\n";
+    html = html + "<pre class=\"signature\">" + scribe_link_types(item.signature, ctx, item.name) + "</pre>\n";
+    html = html + scribe_location_html(item.line, ctx);
     html = html + "</section>\n";
     return html;
 }
 
-fn render_trait(item: DocItem) -> str {
+fn render_trait(item: DocItem, ctx: DocCtx) -> str {
     var html: str = "<section id=\"" + escape_html(item.name) + "\">\n";
     html = html + "<h3>cap " + escape_html(item.name) + "</h3>\n";
     if str_len(item.doc) > 0 {
-        html = html + "<div class=\"doc\">" + escape_html(str_replace(item.doc, "\n", "<br>\n")) + "</div>\n";
+        html = html + "<div class=\"doc\">" + scribe_doc_html(item.doc) + "</div>\n";
     }
-    html = html + "<pre class=\"signature\">" + escape_html(item.signature) + "</pre>\n";
-    html = html + "<p class=\"location\">Defined at line " + int_to_str(item.line) + "</p>\n";
+    html = html + "<pre class=\"signature\">" + scribe_link_types(item.signature, ctx, item.name) + "</pre>\n";
+    html = html + scribe_location_html(item.line, ctx);
     html = html + "</section>\n";
     return html;
 }
@@ -857,7 +879,7 @@ pub fn generate_markdown(items: Vec<DocItem>, module_name: str) -> str {
         }
         md = md + "## " + item.name + "\n\n";
         if str_len(item.doc) > 0 {
-            md = md + item.doc + "\n\n";
+            md = md + scribe_doc_md(item.doc) + "\n\n";
         }
         md = md + "```fides\n" + item.signature + "\n```\n\n";
 
@@ -907,7 +929,7 @@ pub fn generate_markdown(items: Vec<DocItem>, module_name: str) -> str {
                 var method: DocItem = item.methods.get(mi);
                 md = md + "### " + method.name + "\n\n";
                 if str_len(method.doc) > 0 {
-                    md = md + method.doc + "\n\n";
+                    md = md + scribe_doc_md(method.doc) + "\n\n";
                 }
                 md = md + "```fides\n" + method.signature + "\n```\n\n";
                 mi = mi + 1;
@@ -925,10 +947,20 @@ pub fn generate_markdown(items: Vec<DocItem>, module_name: str) -> str {
 // --- CSS ---
 
 pub const CSS: str = "body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; color: #333; }\nnav.sidebar { float: right; width: 200px; padding: 10px; background: #f5f5f5; border-radius: 5px; }\nnav.sidebar ul { list-style: none; padding: 0; }\nnav.sidebar li { padding: 4px 0; }\n.kind { color: #999; font-size: 0.85em; }\nsection { border-bottom: 1px solid #eee; padding: 20px 0; }\nh1 { color: #2c3e50; }\nh2 { color: #34495e; margin-top: 30px; }\npre { background: #f8f8f8; padding: 10px; border-radius: 5px; overflow-x: auto; }\ncode { font-family: 'Fira Code', monospace; font-size: 0.9em; }\ntable { border-collapse: collapse; margin: 10px 0; }\ntd { border: 1px solid #ddd; padding: 6px 12px; }\n.line { color: #999; font-size: 0.85em; }\n.doc { margin: 10px 0; line-height: 1.5; }\n";
+/// TL11: type links, source links, examples and the version label.
+pub const SCRIBE_CSS_MORE: str = "a.ty { color: #2a6db0; text-decoration: none; }\na.ty:hover { text-decoration: underline; }\n.location a.src { color: #777; }\n.version { color: #666; font-size: 0.9em; margin-top: -10px; }\n.example-note { color: #555; font-size: 0.85em; margin: 8px 0 2px; }\npre.example { background: #f3f7f3; border-left: 3px solid #8b8; }\n";
 // --- File processing ---
 
 pub fn scribe_process_file(input_path: str, output_dir: str, format: str) -> str {
-    var source: str = p_file_read(input_path);
+    // read_file: p_file_read gives a raw 0 for a missing file
+    var source: str = "";
+    match read_file(input_path) {
+        Option::Some(c) => {
+            source = c;
+        }
+        Option::None => {
+        }
+    }
     if str_len(source) == 0 {
         return "Cannot read " + input_path;
     }
@@ -944,31 +976,52 @@ pub fn scribe_process_file(input_path: str, output_dir: str, format: str) -> str
         content = generate_markdown(items, module_name);
         ext = "md";
     } else {
-        content = generate_html(items, module_name);
+        // TL11: types of this file link to their sections, items to their
+        // lines in src/<page>.html
+        var page1: str = scribe_page_name(module_name);
+        var ctx: DocCtx = DocCtx_new();
+        scribe_register_types(& mut ctx, items, page1);
+        ctx.page = page1;
+        ctx.src_href = "src/" + page1 + ".html";
+        ctx.src_label = input_path;
+        ctx.version = scribe_doc_version(scribe_dir_of(input_path));
+        scribe_mkdir_all(output_dir);
+        p_mkdir(output_dir + "/src");
+        p_file_write(output_dir + "/" + ctx.src_href, scribe_source_page(source, input_path, page1));
+        content = generate_html_ctx(items, module_name, ctx);
     }
 
-    var output_file: str = output_dir + "/" + module_name + "." + ext;
-    p_file_write(output_file, content);
+    var output_file: str = output_dir + "/" + scribe_page_name(module_name) + "." + ext;
+    // AD1: as the Rust scribe (fs::create_dir_all), the output directory
+    // and its parents are made first; a markdown page was not written when
+    // the directory did not exist yet.
+    scribe_mkdir_all(output_dir);
+    if p_file_write(output_file, content) != 0 {
+        return "Cannot write " + output_file;
+    }
 
     return "Generated " + output_file + " (" + int_to_str(items.len()) + " items)";
 }
 
+/// `fid doc <dir>` (TL11): a documentation site for the .fd files under
+/// `input_dir`, as scribe_site writes it. A .fd file is one page; a file
+/// that lists paths (one a line) documents those files.
 pub fn process_directory(input_dir: str, output_dir: str, format: str) -> str {
-    // LIMITATION: The Fides runtime does not provide a directory listing API
-    // (no readdir/getdents syscall wrapper). The Rust reference (src/scribe.rs)
-    // uses std::fs::read_dir, which is not available in the self-hosted compiler.
-    //
-    // To process multiple files, call scribe_process_file for each .fd file
-    // individually, or pass a newline-separated list of file paths.
-    //
-    // If the input is a single .fd file, process it directly.
     if str_ends_with(input_dir, ".fd") {
         return scribe_process_file(input_dir, output_dir, format);
     }
-
-    // Try to read the input as a file containing newline-separated paths.
-    // This allows batch processing without a directory listing API.
-    var listing: str = p_file_read(input_dir);
+    if p_is_dir(input_dir) != 0 {
+        return scribe_site(input_dir, output_dir, format);
+    }
+    // A file of newline-separated paths
+    var listing: str = "";
+    match read_file(input_dir) {
+        Option::Some(c) => {
+            listing = c;
+        }
+        Option::None => {
+        }
+    }
     if str_len(listing) > 0 {
         var paths: Vec<str> = str_split(listing, "\n");
         var count: i64 = 0;
@@ -985,8 +1038,642 @@ pub fn process_directory(input_dir: str, output_dir: str, format: str) -> str {
             return "Generated documentation for " + int_to_str(count) + " file(s) in " + output_dir;
         }
     }
+    return "Cannot read " + input_dir + ": not a .fd file, a directory, or a list of paths";
+}
 
-    return "Cannot list directory " + input_dir + " -- directory listing is not available in the Fides runtime. Call scribe_process_file for each .fd file individually.";
+// --- TL11: documentation sites --------------------------------------------
+
+/// The file name of a module's page, without the extension: `a::b` is
+/// `a_b` (`:` cannot be in a Windows file name).
+pub fn scribe_page_name(module_name: str) -> str {
+    return str_replace(module_name, "::", "_");
+}
+
+/// The .fd files under `dir` (recursively; not in hidden directories or
+/// ark_modules/), appended to `out`.
+fn scribe_collect(dir: str, out: & mut Vec<str>) {
+    var listing: str = p_dir_list(dir);
+    if str_len(listing) == 0 {
+        return;
+    }
+    var names: Vec<str> = str_split(listing, "\n");
+    var i: i64 = 0;
+    while i < names.len() {
+        var nm: str = str_trim(names.get(i));
+        if str_len(nm) > 0 && !str_starts_with(nm, ".") && nm != "ark_modules" {
+            var full: str = dir + "/" + nm;
+            if p_is_dir(full) != 0 {
+                scribe_collect(full, out);
+            } else if str_ends_with(nm, ".fd") {
+                out.push(full);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// The first line of the comment a file starts with (its summary), or "".
+fn scribe_file_summary(source: str) -> str {
+    var lines: Vec<str> = str_split(source, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = str_trim(lines.get(i));
+        if str_len(l) > 0 {
+            if !str_starts_with(l, "//") {
+                return "";
+            }
+            var text: str = str_trim(str_trim_start_str(str_trim_start_str(l, "//"), "/"));
+            // a separator line (// ----) or an empty comment says nothing
+            if str_len(text) > 0 && !str_starts_with(text, "---") && !str_starts_with(text, "===") {
+                return text;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// `s` as the inside of a JavaScript string literal in an HTML page.
+fn scribe_js_str(s: str) -> str {
+    var r: str = str_replace(s, "\\", "\\\\");
+    r = str_replace(r, "\"", "\\\"");
+    r = str_replace(r, "<", "\\u003c");
+    r = str_replace(r, "\r", " ");
+    r = str_replace(r, "\n", " ");
+    return r;
+}
+
+// --- TL11: links between types, source links, examples, versions --------
+
+/// What a page needs to link outside one item: the types the site
+/// documents (`types`: a type's name, and `<page>#<name>` for the page that
+/// declares it, to an index into `pages`), this page's name, its source
+/// page (`src_href`, "" for none) and file, and the version label.
+pub struct DocCtx {
+    pub types: HashMap<str, i64>,
+    pub pages: Vec<str>,
+    pub page: str,
+    pub src_href: str,
+    pub src_label: str,
+    pub version: str,
+}
+
+/// A context that links nothing (a page on its own).
+pub fn DocCtx_new() -> DocCtx {
+    var types: HashMap<str, i64> = HashMap::new();
+    var pages: Vec<str> = Vec::new();
+    return DocCtx {
+        types: types, pages: pages, page: "", src_href: "", src_label: "", version: "",
+    };
+}
+
+/// Enter the types `items` declare (pub structs and enums, and caps, whose
+/// sections render_* gives the id of their name) as sections of `page`.
+/// The first page to declare a name is the one other pages link to.
+pub fn scribe_register_types(ctx: & mut DocCtx, items: Vec<DocItem>, page: str) {
+    var i: i64 = 0;
+    while i < items.len() {
+        var it: DocItem = items.get(i);
+        if str_len(it.name) > 0 && ((it.is_pub && (it.kind == "struct" || it.kind == "enum")) || it.kind == "trait") {
+            var local: str = page + "#" + it.name;
+            if !ctx.types.contains(local) {
+                ctx.pages.push(page);
+                var idx: i64 = ctx.pages.len() - 1;
+                ctx.types.insert(local, idx);
+                if !ctx.types.contains(it.name) {
+                    ctx.types.insert(it.name, idx);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// The link to the section of type `name` ("#Name" on this page,
+/// "page.html#Name" on another), or "" when no page documents it.
+pub fn scribe_type_href(ctx: DocCtx, name: str) -> str {
+    if str_len(ctx.page) > 0 && ctx.types.contains(ctx.page + "#" + name) {
+        return "#" + name;
+    }
+    if ctx.types.contains(name) {
+        var idx: i64 = ctx.types.get(name);
+        if idx >= 0 && idx < ctx.pages.len() {
+            var p: str = ctx.pages.get(idx);
+            if p == ctx.page {
+                return "#" + name;
+            }
+            return p + ".html#" + name;
+        }
+    }
+    return "";
+}
+
+fn scribe_is_word_byte(c: i64) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95;
+}
+
+/// `text` (a signature or a type) as HTML in which each type name a page
+/// documents links to its section. `self_name` (the item declared) stays
+/// text, and so do string literals and a trailing `//` comment.
+pub fn scribe_link_types(text: str, ctx: DocCtx, self_name: str) -> str {
+    if ctx.pages.len() == 0 {
+        return escape_html(text);
+    }
+    var n: i64 = str_len(text);
+    var sb: StringBuilder = StringBuilder::new();
+    var run: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var c: i64 = str_byte_at(text, i);
+        if c == 34 {
+            // a string literal (a parameter's default) stays text
+            i = i + 1;
+            while i < n && str_byte_at(text, i) != 34 {
+                if str_byte_at(text, i) == 92 {
+                    i = i + 1;
+                }
+                i = i + 1;
+            }
+            i = i + 1;
+        } else if c == 47 && i + 1 < n && str_byte_at(text, i + 1) == 47 {
+            i = n;
+        } else if scribe_is_word_byte(c) {
+            var j: i64 = i + 1;
+            while j < n && scribe_is_word_byte(str_byte_at(text, j)) {
+                j = j + 1;
+            }
+            // type names start with a capital; words starting with a
+            // digit or a small letter (values, i64, str) are never linked
+            if c >= 65 && c <= 90 {
+                var word: str = str_slice(text, i, j);
+                if word != self_name {
+                    var href: str = scribe_type_href(ctx, word);
+                    if str_len(href) > 0 {
+                        sb.append_str(escape_html(str_slice(text, run, i)));
+                        sb.append_str("<a class=\"ty\" href=\"" + escape_html(href) + "\">" + word + "</a>");
+                        run = j;
+                    }
+                }
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    if run < n {
+        sb.append_str(escape_html(str_slice(text, run, n)));
+    }
+    return sb.to_str();
+}
+
+/// Where an item is defined: a link to its line on the module's source
+/// page when there is one, else the line number.
+pub fn scribe_location_html(line: i64, ctx: DocCtx) -> str {
+    if str_len(ctx.src_href) > 0 {
+        return "<p class=\"location\">Defined at <a class=\"src\" href=\"" + escape_html(ctx.src_href) + "#L" + int_to_str(line) + "\">" + escape_html(ctx.src_label) + ":" + int_to_str(line) + "</a></p>\n";
+    }
+    return "<p class=\"location\">Defined at line " + int_to_str(line) + "</p>\n";
+}
+
+/// The page of a module's source (written to src/<page>.html): a line
+/// each, `id="L<n>"`, so a location links to its line, and a link back
+/// to the module's page.
+pub fn scribe_source_page(source: str, label: str, module_page: str) -> str {
+    var sb: StringBuilder = StringBuilder::new();
+    sb.append_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<title>" + escape_html(label) + " -- source</title>\n<meta charset=\"utf-8\">\n");
+    sb.append_str("<style>\nbody { font-family: -apple-system, sans-serif; margin: 0 auto; padding: 20px; color: #333; }\npre.src { background: #f8f8f8; padding: 10px; overflow-x: auto; line-height: 1.35; }\npre.src span:target { background: #fff3b0; }\na.ln { display: inline-block; width: 4em; color: #999; text-decoration: none; text-align: right; margin-right: 1em; user-select: none; }\n</style>\n</head>\n<body>\n");
+    sb.append_str("<p><a href=\"../" + escape_html(module_page) + ".html\">Documentation of " + escape_html(label) + "</a></p>\n");
+    sb.append_str("<h1>" + escape_html(label) + "</h1>\n<pre class=\"src\">");
+    var lines: Vec<str> = str_split(source, "\n");
+    var n: i64 = lines.len();
+    // a file ending in a newline has no line after it
+    if n > 0 && str_len(lines.get(n - 1)) == 0 {
+        n = n - 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        var num: str = int_to_str(i + 1);
+        var text: str = lines.get(i);
+        if str_len(text) > 0 && str_byte_at(text, str_len(text) - 1) == 13 {
+            text = str_slice(text, 0, str_len(text) - 1);
+        }
+        sb.append_str("<span id=\"L" + num + "\"><a class=\"ln\" href=\"#L" + num + "\">" + num + "</a>" + escape_html(text) + "</span>\n");
+        i = i + 1;
+    }
+    sb.append_str("</pre>\n</body>\n</html>\n");
+    return sb.to_str();
+}
+
+/// A `///` line's text as the doc keeps it: `rest` (what follows `///`)
+/// trimmed, except for a line of an example as scripts/doctest.py reads
+/// one (`///` in column 0, then two spaces or more), which keeps its
+/// indentation so scribe_doc_html can find the example.
+pub fn scribe_doc_line(raw: str, rest: str) -> str {
+    if str_starts_with(raw, "///  ") {
+        return str_trim_end_char(rest, 13);
+    }
+    return str_trim_start(rest);
+}
+
+/// -1 unless `l` (trimmed) is doctest.py's example marker: 0 for
+/// `Example:`, 1 for `Example (native only):`.
+pub fn scribe_example_marker(l: str) -> i64 {
+    if !str_starts_with(l, "Example") || !str_ends_with(l, ":") || str_len(l) < 8 {
+        return -1;
+    }
+    var mid: str = str_trim(str_slice(l, 7, str_len(l) - 1));
+    if str_len(mid) == 0 {
+        return 0;
+    }
+    if mid == "(native only)" {
+        return 1;
+    }
+    return -1;
+}
+
+/// The code of an example: doc lines `from` .. `to`, less the indentation
+/// they share.
+fn scribe_example_code(lines: Vec<str>, from: i64, to: i64) -> str {
+    var indent: i64 = 1000000;
+    var k: i64 = from;
+    while k < to {
+        var cl: str = lines.get(k);
+        var sp: i64 = 0;
+        while sp < str_len(cl) && str_byte_at(cl, sp) == 32 {
+            sp = sp + 1;
+        }
+        if sp < str_len(cl) && sp < indent {
+            indent = sp;
+        }
+        k = k + 1;
+    }
+    var out: str = "";
+    k = from;
+    while k < to {
+        var cl2: str = lines.get(k);
+        var code: str = "";
+        if str_len(cl2) > indent {
+            code = str_slice(cl2, indent, str_len(cl2));
+        }
+        if k > from {
+            out = out + "\n";
+        }
+        out = out + code;
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The end (exclusive) of the example whose marker is doc line `i`: the
+/// lines after it indented by two spaces or more.
+fn scribe_example_end(lines: Vec<str>, i: i64) -> i64 {
+    var end: i64 = i + 1;
+    while end < lines.len() && str_starts_with(lines.get(end), "  ") {
+        end = end + 1;
+    }
+    return end;
+}
+
+/// A doc comment as HTML: its lines joined with <br>, and each example
+/// (doctest.py's convention) as a code block with a note that
+/// scripts/doctest.py runs it.
+pub fn scribe_doc_html(doc: str) -> str {
+    var lines: Vec<str> = str_split(doc, "\n");
+    var sb: StringBuilder = StringBuilder::new();
+    var after_text: bool = false;
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        var kind: i64 = scribe_example_marker(str_trim(l));
+        var end: i64 = i + 1;
+        if kind >= 0 {
+            end = scribe_example_end(lines, i);
+        }
+        if kind >= 0 && end > i + 1 {
+            sb.append_str("<p class=\"example-note\">Example");
+            if kind == 1 {
+                sb.append_str(" (native only)");
+            }
+            sb.append_str(" -- run as a test by <code>scripts/doctest.py</code></p>\n<pre class=\"example\"><code>");
+            sb.append_str(escape_html(scribe_example_code(lines, i + 1, end)));
+            sb.append_str("</code></pre>\n");
+            after_text = false;
+            i = end;
+        } else {
+            if after_text {
+                sb.append_str("<br>\n");
+            }
+            sb.append_str(escape_html(str_trim(l)));
+            after_text = true;
+            i = i + 1;
+        }
+    }
+    return sb.to_str();
+}
+
+/// A doc comment as Markdown, its examples as fenced code.
+pub fn scribe_doc_md(doc: str) -> str {
+    var lines: Vec<str> = str_split(doc, "\n");
+    var out: str = "";
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = lines.get(i);
+        var kind: i64 = scribe_example_marker(str_trim(l));
+        var end: i64 = i + 1;
+        if kind >= 0 {
+            end = scribe_example_end(lines, i);
+        }
+        if kind >= 0 && end > i + 1 {
+            var note: str = "Example";
+            if kind == 1 {
+                note = note + " (native only)";
+            }
+            out = out + "\n*" + note + " -- run as a test by `scripts/doctest.py`:*\n\n```fides\n" + scribe_example_code(lines, i + 1, end) + "\n```\n";
+            i = end;
+        } else {
+            out = out + str_trim(l) + "\n";
+            i = i + 1;
+        }
+    }
+    return str_trim_end(out);
+}
+
+/// The directory part of `path` ("." for none).
+fn scribe_dir_of(path: str) -> str {
+    var p: str = str_replace(path, "\\", "/");
+    var slash: i64 = str_rfind_char(p, 47);
+    if slash < 0 {
+        return ".";
+    }
+    if slash == 0 {
+        return "/";
+    }
+    return str_slice(p, 0, slash);
+}
+
+/// The value of `key = "…"` in the [package] section (or before any
+/// section) of an ark.toml, or "".
+pub fn scribe_toml_value(toml: str, key: str) -> str {
+    var lines: Vec<str> = str_split(toml, "\n");
+    var section: str = "";
+    var i: i64 = 0;
+    while i < lines.len() {
+        var l: str = str_trim(lines.get(i));
+        if str_starts_with(l, "[") {
+            section = l;
+        } else if (section == "" || section == "[package]") && str_starts_with(l, key) {
+            var rest: str = str_trim(str_slice(l, str_len(key), str_len(l)));
+            if str_starts_with(rest, "=") {
+                var v: str = str_trim(str_slice(rest, 1, str_len(rest)));
+                if str_starts_with(v, "\"") {
+                    v = str_slice(v, 1, str_len(v));
+                    var q: i64 = sc_str_find_char(v, 34);
+                    if q >= 0 {
+                        v = str_slice(v, 0, q);
+                    }
+                }
+                return v;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The version label of the documentation of `dir`: $FID_DOC_VERSION when
+/// set; else the name and version of the package (an ark.toml in `dir` or
+/// its parent); else the fid version (and the commit a release build has).
+pub fn scribe_doc_version(dir: str) -> str {
+    var label: str = "";
+    match env_var("FID_DOC_VERSION") {
+        Option::Some(v) => {
+            label = str_trim(v);
+        }
+        Option::None => {
+        }
+    }
+    if str_len(label) > 0 {
+        return label;
+    }
+    var toml: str = "";
+    match read_file(dir + "/ark.toml") {
+        Option::Some(t) => {
+            toml = t;
+        }
+        Option::None => {
+        }
+    }
+    if str_len(toml) == 0 {
+        match read_file(dir + "/../ark.toml") {
+            Option::Some(t2) => {
+                toml = t2;
+            }
+            Option::None => {
+            }
+        }
+    }
+    if str_len(toml) > 0 {
+        var ver: str = scribe_toml_value(toml, "version");
+        if str_len(ver) > 0 {
+            var name: str = scribe_toml_value(toml, "name");
+            if str_len(name) > 0 {
+                return name + " " + ver;
+            }
+            return ver;
+        }
+    }
+    label = "fid " + fid_version();
+    if str_len(fid_build_commit()) > 0 {
+        label = label + " (commit " + fid_build_commit() + ")";
+    }
+    return label;
+}
+
+/// TL11: a documentation site for the .fd files under `input_dir`, written
+/// to `output_dir`: a page per module (as `fid doc <file>` writes it, with a
+/// link back to the index) and an index — every module with the first line
+/// of its file's leading comment and its count of public items, and (HTML)
+/// a search box over every public item's name, kind and signature that
+/// links to the item's anchor. Markdown: index.md with the module list.
+pub fn scribe_site(input_dir: str, output_dir: str, format: str) -> str {
+    p_mkdir(output_dir);
+    var files: Vec<str> = Vec::new();
+    scribe_collect(input_dir, & mut files);
+    if files.len() == 0 {
+        return "No .fd files under " + input_dir;
+    }
+    var md: bool = format == "markdown" || format == "md";
+    var ext: str = "html";
+    if md {
+        ext = "md";
+    }
+    // TL11, pass 1: the types every page documents, so a signature on one
+    // page links to a type documented on another
+    var ctx: DocCtx = DocCtx_new();
+    ctx.version = scribe_doc_version(input_dir);
+    // each file's page name: its module's, or (when another file has that
+    // name: stdlib/math.fd and a runtime's math.fd) its path under
+    // input_dir with `/` as `_`, so no page overwrites another. A file
+    // whose path is its module's name (stdlib/math.fd) keeps the name.
+    var sources: Vec<str> = Vec::new();
+    var mod_pages: Vec<str> = Vec::new();
+    var path_pages: Vec<str> = Vec::new();
+    var ti: i64 = 0;
+    while ti < files.len() {
+        var tsource: str = "";
+        match read_file(files.get(ti)) {
+            Option::Some(tsrc) => {
+                tsource = tsrc;
+            }
+            Option::None => {
+            }
+        }
+        sources.push(tsource);
+        var rel: str = files.get(ti);
+        if str_starts_with(rel, input_dir + "/") {
+            rel = str_slice(rel, str_len(input_dir) + 1, str_len(rel));
+        }
+        if str_ends_with(rel, ".fd") {
+            rel = str_slice(rel, 0, str_len(rel) - 3);
+        }
+        path_pages.push(str_replace(str_replace(scribe_page_name(rel), "/", "_"), "\\", "_"));
+        if str_len(tsource) > 0 {
+            mod_pages.push(scribe_page_name(extract_module_name(tsource, files.get(ti))));
+        } else {
+            mod_pages.push("");
+        }
+        ti = ti + 1;
+    }
+    var site_pages: Vec<str> = Vec::new();
+    var used: HashMap<str, i64> = HashMap::new();
+    // first the files at their module's path, then the rest
+    var round: i64 = 0;
+    while round < 2 {
+        ti = 0;
+        while ti < files.len() {
+            var mp: str = mod_pages.get(ti);
+            var pp: str = path_pages.get(ti);
+            if round == 0 {
+                if str_len(mp) > 0 && mp == pp && mp != "index" && !used.contains(mp) {
+                    used.insert(mp, ti);
+                    site_pages.push(mp);
+                } else {
+                    site_pages.push("");
+                }
+            } else if str_len(mp) > 0 && str_len(site_pages.get(ti)) == 0 {
+                var tpage: str = mp;
+                if used.contains(tpage) || tpage == "index" {
+                    tpage = pp;
+                    var k: i64 = 2;
+                    while used.contains(tpage) || tpage == "index" {
+                        tpage = pp + "_" + int_to_str(k);
+                        k = k + 1;
+                    }
+                }
+                used.insert(tpage, ti);
+                site_pages.set(ti, tpage);
+            }
+            ti = ti + 1;
+        }
+        round = round + 1;
+    }
+    ti = 0;
+    while ti < files.len() {
+        if str_len(sources.get(ti)) > 0 {
+            var titems: Vec<DocItem> = extract_docs(sources.get(ti));
+            scribe_register_types(& mut ctx, titems, site_pages.get(ti));
+        }
+        ti = ti + 1;
+    }
+    var module_pages: Vec<str> = Vec::new();
+    if !md {
+        p_mkdir(output_dir + "/src");
+    }
+    // per module: (name, summary, public item count)
+    var modules: Vec<StringTriple> = Vec::new();
+    var search: str = "";
+    var total_items: i64 = 0;
+    var fi: i64 = 0;
+    while fi < files.len() {
+        var source: str = sources.get(fi);
+        if str_len(source) > 0 {
+            var items: Vec<DocItem> = extract_docs(source);
+            var module_name: str = extract_module_name(source, files.get(fi));
+            var page: str = site_pages.get(fi);
+            if str_len(page) == 0 {
+                page = scribe_page_name(module_name);
+            }
+            module_pages.push(page);
+            var content: str = "";
+            if md {
+                content = "[All modules](index.md)\n\n" + generate_markdown(items, module_name);
+            } else {
+                // TL11: the module's source as a page with an id per line
+                ctx.page = page;
+                ctx.src_href = "src/" + page + ".html";
+                ctx.src_label = files.get(fi);
+                p_file_write(output_dir + "/" + ctx.src_href, scribe_source_page(source, files.get(fi), page));
+                content = str_replace(generate_html_ctx(items, module_name, ctx), "<body>\n", "<body>\n<p><a href=\"index.html\">All modules</a></p>\n");
+            }
+            p_file_write(output_dir + "/" + page + "." + ext, content);
+            var pub_count: i64 = 0;
+            var ii: i64 = 0;
+            while ii < items.len() {
+                var it: DocItem = items.get(ii);
+                if it.is_pub {
+                    pub_count = pub_count + 1;
+                    if !md {
+                        search = search + "[\"" + scribe_js_str(page) + "\",\"" + scribe_js_str(module_name) + "\",\"" + scribe_js_str(it.kind) + "\",\"" + scribe_js_str(it.name) + "\",\"" + scribe_js_str(it.signature) + "\"],\n";
+                    }
+                }
+                ii = ii + 1;
+            }
+            total_items = total_items + pub_count;
+            modules.push(StringTriple_new(module_name, scribe_file_summary(source), int_to_str(pub_count)));
+        }
+        fi = fi + 1;
+    }
+    var index: str = "";
+    if md {
+        index = "# Modules\n\n";
+        var mi: i64 = 0;
+        while mi < modules.len() {
+            var m: StringTriple = modules.get(mi);
+            index = index + "- [" + m.a + "](" + module_pages.get(mi) + ".md) (" + m.c + " items)";
+            if str_len(m.b) > 0 {
+                index = index + " -- " + m.b;
+            }
+            index = index + "\n";
+            mi = mi + 1;
+        }
+    } else {
+        index = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<title>Fides Documentation</title>\n";
+        index = index + "<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
+        index = index + "<style>\n" + CSS + SCRIBE_CSS_MORE + "#q { width: 100%; padding: 8px; font-size: 1em; box-sizing: border-box; }\n#results li { padding: 3px 0; }\n</style>\n</head>\n<body>\n";
+        index = index + "<h1>Modules</h1>\n";
+        // TL11: which version of the library these pages document
+        index = index + "<p class=\"version\">Version " + escape_html(ctx.version) + "</p>\n";
+        index = index + "<input id=\"q\" type=\"search\" placeholder=\"Search " + int_to_str(total_items) + " functions, types and constants\" autofocus>\n<ul id=\"results\"></ul>\n";
+        index = index + "<table>\n";
+        var mj: i64 = 0;
+        while mj < modules.len() {
+            var m2: StringTriple = modules.get(mj);
+            index = index + "<tr><td><a href=\"" + escape_html(module_pages.get(mj)) + ".html\">" + escape_html(m2.a) + "</a></td><td>" + escape_html(m2.b) + "</td><td class=\"line\">" + m2.c + " items</td></tr>\n";
+            mj = mj + 1;
+        }
+        index = index + "</table>\n";
+        index = index + "<script>\nconst ITEMS = [\n" + search + "];\n";
+        index = index + "const q = document.getElementById('q'), res = document.getElementById('results');\n";
+        index = index + "q.addEventListener('input', () => {\n  const t = q.value.toLowerCase(); res.innerHTML = '';\n  if (!t) return;\n  let n = 0;\n";
+        index = index + "  for (const it of ITEMS) {\n    if (!it[3].toLowerCase().includes(t)) continue;\n";
+        index = index + "    const li = document.createElement('li'), a = document.createElement('a');\n";
+        index = index + "    a.href = it[0] + '.html#' + (it[2] === 'impl' ? 'impl-' : '') + it[3]; a.textContent = it[3]; li.appendChild(a);\n";
+        index = index + "    const k = document.createElement('span'); k.className = 'kind'; k.textContent = ' ' + it[2] + ' in ' + it[1] + ': ' + it[4];\n";
+        index = index + "    li.appendChild(k); res.appendChild(li);\n    if (++n >= 50) break;\n  }\n});\n</script>\n";
+        index = index + "<footer><p>Generated by scribe -- Fides documentation generator</p></footer>\n</body>\n</html>\n";
+    }
+    p_file_write(output_dir + "/index." + ext, index);
+    return "Generated " + output_dir + "/index." + ext + ": " + int_to_str(modules.len()) + " module(s), " + int_to_str(total_items) + " public item(s)";
 }
 
 fn extract_module_name(source: str, fallback_path: str) -> str {
@@ -996,6 +1683,11 @@ fn extract_module_name(source: str, fallback_path: str) -> str {
         var l: str = str_trim_start(lines.get(i));
         if str_starts_with(l, "module ") {
             var s: str = str_slice(l, 7, str_len(l));
+            // `module a; use b; ...` on one line: the name ends at the `;`
+            var semi: i64 = sc_str_find_char(s, 59);
+            if semi >= 0 {
+                s = str_slice(s, 0, semi);
+            }
             s = str_trim(s);
             s = str_trim_end_char(s, 59);
             // remove trailing ';'
@@ -1098,42 +1790,120 @@ pub fn str_trim_start_str(s: str, prefix: str) -> str {
 
 // --- Entry point ---
 
+/// Make `path` and every parent it lacks (as fs::create_dir_all); an
+/// existing directory is fine. Both separators count.
+pub fn scribe_mkdir_all(path: str) {
+    var n: i64 = str_len(path);
+    var i: i64 = 1;
+    while i < n {
+        var c: i64 = str_byte_at(path, i);
+        if (c == 47 || c == 92) && str_byte_at(path, i - 1) != 58 {
+            var _p: i64 = p_mkdir(str_slice(path, 0, i));
+        }
+        i = i + 1;
+    }
+    if n > 0 {
+        var _q: i64 = p_mkdir(path);
+    }
+}
+
+/// Command-line argument `i`, "" past the last.
+fn scribe_arg(i: i64) -> str {
+    match arg_at(i) {
+        Option::Some(a) => {
+            return a;
+        }
+        Option::None => {
+        }
+    }
+    return "";
+}
+
+pub fn scribe_help_text() -> str {
+    return "scribe -- Documentation generator for Fides\n\n" +
+        "USAGE:\n" +
+        "    scribe <file.fd> [--output <dir>] [--format html|markdown]\n" +
+        "    scribe <dir>    [--output <dir>] [--format html|markdown]\n\n" +
+        "OPTIONS:\n" +
+        "    --output <dir>      Output directory (default: docs/)\n" +
+        "    --format <format>   Output format: html (default) or markdown\n" +
+        "    --help, -h          Show this help\n\n" +
+        "EXAMPLES:\n" +
+        "    scribe stdlib/math.fd                    # Generate HTML docs\n" +
+        "    scribe stdlib/ --output docs/            # Generate docs for all stdlib\n" +
+        "    scribe stdlib/ --format markdown         # Generate Markdown docs\n";
+}
+
+/// Is `message` (from process_directory) a failure?
+fn scribe_failed(message: str) -> bool {
+    return str_starts_with(message, "Cannot ") || str_starts_with(message, "No .fd files");
+}
+
 /// Standalone `scribe.exe` entry; also serves `fid scribe` (skips the
 /// leading "scribe" argument, and a "--" separator from `fid run`).
+/// Arguments as the Rust scribe takes them (src/bin/scribe.rs, AD1):
+/// options anywhere, `-o`/`-f` short forms, `--help`/`-h` (exit 0),
+/// `--version`/`-v`, one input; an error goes to stderr with exit 1.
 pub fn scribe_main() -> i64 {
     var n: i64 = p_argc();
     var start: i64 = 1;
     var i: i64 = 0;
     while i < n {
-        if p_argv(i) == "--" {
+        if scribe_arg(i) == "--" {
             start = i + 1;
             break;
         }
         i = i + 1;
     }
-    if start < n && p_argv(start) == "scribe" {
+    if start < n && scribe_arg(start) == "scribe" {
         start = start + 1;
     }
     if start >= n {
-        print("scribe -- Documentation generator for Fides\n\nUSAGE:\n    scribe <file.fd> [--output <dir>] [--format html|markdown]\n");
+        print(scribe_help_text());
         return 1;
     }
-    var input: str = p_argv(start);
+    var input: str = "";
+    var have_input: bool = false;
     var format: str = "html";
     var output_dir: str = "docs";
-    i = start + 1;
+    i = start;
     while i < n {
-        var a: str = p_argv(i);
-        if a == "--format" && i + 1 < n {
-            format = p_argv(i + 1);
+        var a: str = scribe_arg(i);
+        if a == "--format" || a == "-f" {
+            if i + 1 < n {
+                format = scribe_arg(i + 1);
+            }
             i = i + 1;
-        } else if a == "--output" && i + 1 < n {
-            output_dir = p_argv(i + 1);
+        } else if a == "--output" || a == "-o" {
+            if i + 1 < n {
+                output_dir = scribe_arg(i + 1);
+            }
             i = i + 1;
+        } else if a == "--help" || a == "-h" {
+            print(scribe_help_text());
+            return 0;
+        } else if a == "--version" || a == "-v" {
+            print("scribe 0.1.0 -- Fides documentation generator\n");
+            return 0;
+        } else if !have_input {
+            input = a;
+            have_input = true;
+        } else {
+            p_eprint_str("Unknown argument: " + a + "\n");
+            return 1;
         }
         i = i + 1;
     }
-    var message: str = scribe_process_file(input, output_dir, format);
+    if !have_input {
+        p_eprint_str("Error: no input file or directory specified\nRun 'scribe --help' for usage.\n");
+        return 1;
+    }
+    // a file is one page; a directory is a site (TL11)
+    var message: str = process_directory(input, output_dir, format);
+    if scribe_failed(message) {
+        p_eprint_str("error: " + message + "\n");
+        return 1;
+    }
     print(message);
     print("\n");
     return 0;

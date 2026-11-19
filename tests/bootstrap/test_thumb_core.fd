@@ -1,0 +1,274 @@
+// competitive-roadmap PL5: the Cortex-M (ARMv7-M, Thumb-2) code generator
+// (compiler/nat_thumb.fd). Every value there is a pair of 32-bit registers,
+// so this program exercises what crosses the 32-bit boundary: 64-bit add,
+// sub and mul with carries, signed and unsigned division and remainder,
+// shifts by 0..63, compares of large and negative values, narrow types,
+// then the runtime it shares with the other machine targets (strings, Vec,
+// HashMap, structs, enums, closures, trait objects, globals). The output
+// must be the same with `fid run` and with `fid emit --target
+// thumbv7m-linux` under qemu-arm (tests/nattools/thumb_check.sh, which
+// also runs the no-OS image under qemu-system-arm when it is installed).
+// Expected output:
+// add 4294967296 -4294967297 9223372036854775807
+// sub 4294967295 -8589934592 -9223372036854775807
+// mul 18446744065119617025 -12345679012345679 1524156643474859881 0
+// div 1234567890123 -1234567890123 3 -3 0 9223372036854775807
+// mod 456 -456 1 -1 7 0
+// udiv 6148914691236517205 1 12297829382473034410 0
+// shl 1 2 2147483648 4294967296 8589934592 -9223372036854775808
+// sar -1 -2 -4294967296 -1 -1 1073741823
+// shr 9223372036854775807 4294967295 1 0
+// cmp true false true true false true false true
+// ucmp true false true
+// bits 61680 -61681 4042322160 -1
+// narrow 2147483647 -2147483648 255 65535 -128
+// loop 338350 -55 8589934592
+// fib 832040
+// str hello, thumb 42 -7 len=12
+// vec 10 [0, 1, 4, 9, 16, 25, 36, 49, 64, 81] sum=285
+// map 3 two=2 missing=-1
+// struct 3:4 area=12 moved=13:24
+// enum some=42 none=-1 err=bad
+// closure 15 21 dyn 12
+// global 3 130
+// done
+
+use string;
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fn point_area(p: Point) -> i64 {
+    return p.x * p.y;
+}
+
+fn point_move(p: Point, dx: i64, dy: i64) -> Point {
+    return Point { x: p.x + dx, y: p.y + dy };
+}
+
+enum Shape {
+    Circle(i64),
+    Rect(i64, i64),
+}
+
+cap Area {
+    fn area(self) -> i64;
+}
+
+struct Box2 { w: i64, h: i64 }
+
+impl Area for Box2 {
+    pub fn area(self: Box2) -> i64 { return self.w * self.h; }
+}
+
+var g_count: i64 = 0;
+var g_total: i64 = 100;
+
+fn bump(n: i64) {
+    g_count = g_count + 1;
+    g_total = g_total + n;
+}
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn make_adder(n: i64) -> fn(i64) -> i64 {
+    return fn(x: i64) { x + n };
+}
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 {
+    return f(x);
+}
+
+fn triple(x: i64) -> i64 {
+    return x * 3;
+}
+
+fn find(v: Vec<i64>, x: i64) -> Option<i64> {
+    var i: i64 = 0;
+    while i < v.len() {
+        if v.get(i) == x {
+            return Option::Some(i);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+fn check(x: i64) -> Result<i64, str> {
+    if x < 0 {
+        return Result::Err("bad");
+    }
+    return Result::Ok(x);
+}
+
+// values the optimizer cannot see through: from a Vec built at run time
+fn val(v: Vec<i64>, i: i64) -> i64 {
+    return v.get(i);
+}
+
+fn main() -> i64 {
+    var k: Vec<i64> = Vec::new();
+    k.push(4294967295);
+    k.push(1);
+    k.push(0 - 4294967296);
+    k.push(9223372036854775806);
+    k.push(0 - 9223372036854775807);
+    k.push(4294967295);
+    k.push(0 - 12345679);
+    k.push(1000000001);
+    k.push(1234567890123456);
+    k.push(1000);
+    k.push(7);
+    k.push(0 - 1);
+    k.push(18446744073709551615 as i64);
+    k.push(0);
+    var a: i64 = val(k, 0);
+    var one: i64 = val(k, 1);
+    var nb: i64 = val(k, 2);
+    var big: i64 = val(k, 3);
+    var minp: i64 = val(k, 4);
+    println("add " + int_to_str(a + one) + " " + int_to_str(nb - one) + " " + int_to_str(big + one));
+    println("sub " + int_to_str(a - 0) + " " + int_to_str(nb - 4294967296) + " " + int_to_str(minp - 0));
+    var m1: u64 = (val(k, 5) as u64) * (val(k, 5) as u64);
+    println("mul " + u64_to_str(m1) + " " + int_to_str(val(k, 6) * val(k, 7) + 1000000001 - 1000000001) + " " + int_to_str(val(k, 8) * val(k, 9) + 1524156643474859881 - 1234567890123456000 + 0) + " " + int_to_str(val(k, 13) * big));
+    var d: i64 = val(k, 8);
+    var thou: i64 = val(k, 9);
+    var sev: i64 = val(k, 10);
+    var mone: i64 = val(k, 11);
+    println("div " + int_to_str(d / thou) + " " + int_to_str((0 - d) / thou) + " " + int_to_str(22 / sev) + " " + int_to_str((0 - 22) / sev) + " " + int_to_str(sev / thou) + " " + int_to_str((0 - (big + 1)) / mone + 0 - 0));
+    println("mod " + int_to_str(d % thou) + " " + int_to_str((0 - d) % thou) + " " + int_to_str(22 % sev) + " " + int_to_str((0 - 22) % sev) + " " + int_to_str(sev % (thou + 0)) + " " + int_to_str(big % mone));
+    var umax: u64 = val(k, 12) as u64;
+    var three: u64 = 3;
+    var two: u64 = 2;
+    println("udiv " + u64_to_str(umax / three) + " " + u64_to_str(umax % two) + " " + u64_to_str((umax / three) * two) + " " + u64_to_str(umax % three));
+    var s1: i64 = one << val(k, 13);
+    var s2: i64 = one << one;
+    var s31: i64 = one << 31;
+    var s32: i64 = one << 32;
+    var s33: i64 = one << 33;
+    var s63: i64 = one << 63;
+    println("shl " + int_to_str(s1) + " " + int_to_str(s2) + " " + int_to_str(s31) + " " + int_to_str(s32) + " " + int_to_str(s33) + " " + int_to_str(s63));
+    println("sar " + int_to_str(mone >> 0) + " " + int_to_str((0 - 4) >> 1) + " " + int_to_str(nb >> 0) + " " + int_to_str(nb >> 32) + " " + int_to_str(nb >> 63) + " " + int_to_str(a >> 2));
+    println("shr " + u64_to_str(umax >> 1) + " " + u64_to_str(umax >> 32) + " " + u64_to_str(umax >> 63) + " " + u64_to_str((umax >> 32) >> 32));
+    println("cmp " + bool_to_str(nb < one) + " " + bool_to_str(a < nb) + " " + bool_to_str(minp < big) + " " + bool_to_str(a <= a) + " " + bool_to_str(one > a) + " " + bool_to_str(a >= one) + " " + bool_to_str(a == nb) + " " + bool_to_str(a != nb));
+    var u1: u64 = val(k, 12) as u64;
+    var u2: u64 = 5;
+    println("ucmp " + bool_to_str(u2 < u1) + " " + bool_to_str(u1 < u2) + " " + bool_to_str(u1 >= u2));
+    var bx: i64 = val(k, 0) & 61680;
+    println("bits " + int_to_str(bx) + " " + int_to_str(~bx) + " " + int_to_str(a ^ 252645135) + " " + int_to_str(nb | a));
+    var i32a: i32 = 2147483646;
+    var i32b: i32 = i32a + 1;
+    var i32c: i32 = 0 - i32b - 1;
+    var u8a: u8 = 254;
+    var u8b: u8 = u8a + 1;
+    var u16a: u16 = 65535;
+    var i8a: i8 = 0 - 128;
+    println("narrow " + int_to_str(i32b as i64) + " " + int_to_str(i32c as i64) + " " + int_to_str(u8b as i64) + " " + int_to_str(u16a as i64) + " " + int_to_str(i8a as i64));
+    var sq: i64 = 0;
+    var i: i64 = 1;
+    while i <= 100 {
+        sq = sq + i * i;
+        i = i + 1;
+    }
+    var neg: i64 = 0;
+    var j: i64 = 10;
+    while j > 0 {
+        neg = neg - j;
+        j = j - 1;
+    }
+    var dbl: i64 = 1;
+    var n: i64 = 0;
+    while n < 33 {
+        dbl = dbl * 2;
+        n = n + 1;
+    }
+    println("loop " + int_to_str(sq) + " " + int_to_str(neg) + " " + int_to_str(dbl));
+    println("fib " + int_to_str(fib(30)));
+    var s: str = "hello" + ", " + "thumb";
+    var s2b: str = s + " " + int_to_str(42) + " " + int_to_str(0 - 7);
+    println("str " + s2b + " len=" + int_to_str(str_len(s)));
+    var v: Vec<i64> = Vec::new();
+    var q: i64 = 0;
+    while q < 10 {
+        v.push(q * q);
+        q = q + 1;
+    }
+    var sum: i64 = 0;
+    var r: i64 = 0;
+    while r < v.len() {
+        sum = sum + v.get(r);
+        r = r + 1;
+    }
+    print("vec " + int_to_str(v.len()) + " ");
+    print(v);
+    println(" sum=" + int_to_str(sum));
+    var hm: HashMap<str, i64> = HashMap::new();
+    hm.insert("one", 1);
+    hm.insert("two", 2);
+    hm.insert("three", 3);
+    var miss: i64 = 0 - 1;
+    if hm.contains("four") {
+        miss = 4;
+    }
+    println("map " + int_to_str(hm.len()) + " two=" + int_to_str(hm.get("two")) + " missing=" + int_to_str(miss));
+    var p: Point = Point { x: 3, y: 4 };
+    var p2: Point = point_move(p, 10, 20);
+    println("struct " + int_to_str(p.x) + ":" + int_to_str(p.y) + " area=" + int_to_str(point_area(p)) + " moved=" + int_to_str(p2.x) + ":" + int_to_str(p2.y));
+    var some: i64 = 0;
+    match find(v, 49) {
+        Option::Some(ix) => {
+            some = ix * 6;
+        }
+        Option::None => {
+            some = 0 - 1;
+        }
+    }
+    var none: i64 = 0;
+    match find(v, 50) {
+        Option::Some(ix2) => {
+            none = ix2;
+        }
+        Option::None => {
+            none = 0 - 1;
+        }
+    }
+    var errs: str = "";
+    match check(0 - 1) {
+        Result::Ok(x) => {
+            errs = int_to_str(x);
+        }
+        Result::Err(e) => {
+            errs = e;
+        }
+    }
+    println("enum some=" + int_to_str(some) + " none=" + int_to_str(none) + " err=" + errs);
+    var add5 = make_adder(5);
+    var b: Box2 = Box2 { w: 3, h: 4 };
+    var dd = b as dyn Area;
+    println("closure " + int_to_str(add5(10)) + " " + int_to_str(apply(triple, 7)) + " dyn " + int_to_str(dd.area()));
+    bump(10);
+    bump(20);
+    bump(0);
+    println("global " + int_to_str(g_count) + " " + int_to_str(g_total));
+    var shapes: Vec<i64> = Vec::new();
+    var sh: Shape = Shape::Rect(2, 3);
+    match sh {
+        Shape::Circle(rr) => {
+            shapes.push(rr);
+        }
+        Shape::Rect(w, h) => {
+            shapes.push(w * h);
+        }
+    }
+    if shapes.get(0) == 6 {
+        println("done");
+    }
+    return 0;
+}

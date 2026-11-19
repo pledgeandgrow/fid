@@ -1,0 +1,178 @@
+// RA7 (docs/roadmap/llvm-roadmap.md): the argument-register hints of
+// compiler/nat_ir.fd (ng_arg_hints, ng_ra7_info, ng_arg_fit) and their
+// checker (ng_mir_check_args) on hand-made machine IR, through
+// nat_arghint_unit / nat_arghint_check_unit. Every value starts in a pool
+// register (20); a value a move ties to an argument register moves there
+// when it fits:
+//   call      parameters, two call operands and the call's result
+//             (AArch64, RISC-V): the operands and the result take their
+//             registers, the parameter that lives across the call does not;
+//             forcing it into x0 is rejected by the checker
+//   division  x86-64: the third parameter (rdx) lives across a division,
+//             which uses rdx: it stays out; forcing it in is rejected
+//   across    a call operand t that lives across another call stays out;
+//             with the implicit uses ignored (the mutation) it is put in
+//             x2 and the checker rejects that
+//   branch    a parameter read in one arm keeps x0 (the other arm's
+//             registers are its own)
+// Op codes are compiler/nat_ir.fd's MO_* numbers (MO_LI 1, MO_MOV 2,
+// MO_CALL 9, MO_BNEZ 12, MO_ADD 16, MO_MUL 18, MO_DIV 27, MO_PROLOGUE 36,
+// MO_EPILOGUE 37, MO_PLACE 41); values are vregs 64 and up.
+// Run:
+//   fid run tests/nattools/arghint_unit.fd
+// Expected output:
+// a64 call: 20 0 1 0 0 placed 4
+// a64 call: sound
+// a64 call: x0 across the call rejected
+// rv64 call: 20 10 11 10 10 placed 4
+// rv64 call: sound
+// rv64 call: a0 across the call rejected
+// x64 division: 7 20 20 20 7 placed 2
+// x64 division: sound
+// x64 division: rdx across the division rejected
+// a64 across: 20 20 2 20 20 1 0 placed 3
+// a64 across: sound
+// a64 across mutant: 20 20 2 20 2 1 0 placed 4
+// a64 across mutant: rejected
+// a64 branch: 0 20 placed 1
+// a64 branch: sound
+use core;
+use vec;
+use string;
+use compiler::nat_enc;
+use compiler::nat_ir;
+
+fn op(v: & mut Vec<i64>, o: i64, r0: i64, r1: i64, r2: i64, i0: i64) {
+    v.push(o);
+    v.push(r0);
+    v.push(r1);
+    v.push(r2);
+    v.push(i0);
+    v.push(0);
+    v.push(0);
+}
+
+fn regs(res: & Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i + 1 < res.len() {
+        if i > 0 {
+            s = s + " ";
+        }
+        s = s + int_to_str(res.get(i));
+        i = i + 1;
+    }
+    return s + " placed " + int_to_str(res.get(res.len() - 1));
+}
+
+/// parameters a (r0) and b (r1); f(b, 5); a + the result returned
+fn call_shape(r0: i64, r1: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    op(& mut v, 36, 0, 0, 0, 0);
+    op(& mut v, 2, 64, r0, 0, 0);
+    op(& mut v, 2, 65, r1, 0, 0);
+    op(& mut v, 1, 66, 0, 0, 5);
+    op(& mut v, 2, r0, 65, 0, 0);
+    op(& mut v, 2, r1, 66, 0, 0);
+    op(& mut v, 9, 0, 0, 0, 99);
+    op(& mut v, 2, 67, r0, 0, 0);
+    op(& mut v, 16, 68, 67, 64, 0);
+    op(& mut v, 2, r0, 68, 0, 0);
+    op(& mut v, 37, 0, 0, 0, 0);
+    return v;
+}
+
+fn verdict(msg: str) -> str {
+    if str_len(msg) == 0 {
+        return "sound";
+    }
+    return "rejected";
+}
+
+fn call_case(arch: i64, name: str, r0: i64, r1: i64, rname: str) {
+    var v: Vec<i64> = call_shape(r0, r1);
+    var res: Vec<i64> = nat_arghint_unit(arch, & v, 5, false);
+    println(name + " call: " + regs(& res));
+    println(name + " call: " + verdict(nat_arghint_check_unit(arch, & v, 5, & res)));
+    var bad: Vec<i64> = res.clone();
+    bad.set(0, r0);
+    var msg: str = nat_arghint_check_unit(arch, & v, 5, & bad);
+    if str_len(msg) > 0 {
+        println(name + " call: " + rname + " across the call rejected");
+    } else {
+        println(name + " call: " + rname + " across the call ACCEPTED");
+    }
+}
+
+fn main() {
+    call_case(NAT_A64, "a64", 0, 1, "x0");
+    call_case(NAT_RV64, "rv64", 10, 11, "a0");
+
+    // x86-64: a / b + c with a, b, c in rdi, rsi, rdx; then g(that)
+    var d: Vec<i64> = Vec::new();
+    op(& mut d, 36, 0, 0, 0, 0);
+    op(& mut d, 2, 64, 7, 0, 0);
+    op(& mut d, 2, 65, 6, 0, 0);
+    op(& mut d, 2, 66, 2, 0, 0);
+    op(& mut d, 27, 67, 64, 65, 0);
+    op(& mut d, 16, 68, 67, 66, 0);
+    op(& mut d, 2, 7, 68, 0, 0);
+    op(& mut d, 9, 0, 0, 0, 99);
+    op(& mut d, 37, 0, 0, 0, 0);
+    var rd: Vec<i64> = nat_arghint_unit(NAT_X64, & d, 5, false);
+    println("x64 division: " + regs(& rd));
+    println("x64 division: " + verdict(nat_arghint_check_unit(NAT_X64, & d, 5, & rd)));
+    var badd: Vec<i64> = rd.clone();
+    badd.set(2, 2);
+    if str_len(nat_arghint_check_unit(NAT_X64, & d, 5, & badd)) > 0 {
+        println("x64 division: rdx across the division rejected");
+    } else {
+        println("x64 division: rdx across the division ACCEPTED");
+    }
+
+    // AArch64: p = f(a, b, 1); t = a * p; u = g(b, t); f(p, u, t)
+    var c: Vec<i64> = Vec::new();
+    op(& mut c, 36, 0, 0, 0, 0);
+    op(& mut c, 2, 64, 0, 0, 0);
+    op(& mut c, 2, 65, 1, 0, 0);
+    op(& mut c, 1, 66, 0, 0, 1);
+    op(& mut c, 2, 0, 64, 0, 0);
+    op(& mut c, 2, 1, 65, 0, 0);
+    op(& mut c, 2, 2, 66, 0, 0);
+    op(& mut c, 9, 0, 0, 0, 99);
+    op(& mut c, 2, 67, 0, 0, 0);
+    op(& mut c, 18, 68, 64, 67, 0);
+    op(& mut c, 2, 0, 65, 0, 0);
+    op(& mut c, 2, 1, 68, 0, 0);
+    op(& mut c, 9, 0, 0, 0, 98);
+    op(& mut c, 2, 69, 0, 0, 0);
+    op(& mut c, 2, 0, 67, 0, 0);
+    op(& mut c, 2, 1, 69, 0, 0);
+    op(& mut c, 2, 2, 68, 0, 0);
+    op(& mut c, 9, 0, 0, 0, 99);
+    op(& mut c, 2, 70, 0, 0, 0);
+    op(& mut c, 2, 0, 70, 0, 0);
+    op(& mut c, 37, 0, 0, 0, 0);
+    var rc: Vec<i64> = nat_arghint_unit(NAT_A64, & c, 7, false);
+    println("a64 across: " + regs(& rc));
+    println("a64 across: " + verdict(nat_arghint_check_unit(NAT_A64, & c, 7, & rc)));
+    var rm: Vec<i64> = nat_arghint_unit(NAT_A64, & c, 7, true);
+    println("a64 across mutant: " + regs(& rm));
+    println("a64 across mutant: " + verdict(nat_arghint_check_unit(NAT_A64, & c, 7, & rm)));
+
+    // AArch64: if a != 0 { f(a, 3) }; return 3
+    var b: Vec<i64> = Vec::new();
+    op(& mut b, 36, 0, 0, 0, 0);
+    op(& mut b, 2, 64, 0, 0, 0);
+    op(& mut b, 1, 65, 0, 0, 3);
+    op(& mut b, 12, 64, 0, 0, 7);
+    op(& mut b, 2, 1, 65, 0, 0);
+    op(& mut b, 2, 0, 64, 0, 0);
+    op(& mut b, 9, 0, 0, 0, 99);
+    op(& mut b, 41, 0, 0, 0, 7);
+    op(& mut b, 2, 0, 65, 0, 0);
+    op(& mut b, 37, 0, 0, 0, 0);
+    var rb: Vec<i64> = nat_arghint_unit(NAT_A64, & b, 2, false);
+    println("a64 branch: " + regs(& rb));
+    println("a64 branch: " + verdict(nat_arghint_check_unit(NAT_A64, & b, 2, & rb)));
+}

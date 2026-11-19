@@ -703,7 +703,7 @@ fn real_main() {
         }
 
         "version" => {
-            println!("fidesc 0.1.0 (bootstrap compiler)");
+            println!("fidesc 1.0.0 (bootstrap compiler)");
             println!("Written in Rust — will be replaced by self-hosted Fides compiler");
         }
 

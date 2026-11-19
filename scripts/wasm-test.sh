@@ -56,6 +56,12 @@ one() {
   timeout 600 "$FID" wasm "$f" -o "$OUT/$b.wasm" > "$OUT/$b.build.log" 2>&1
   local rc=$?
   echo $rc > "$OUT/$b.build_rc"
+  # TG16: a module the engine does not validate counts as BUILD
+  if [ $rc = 0 ] && ! node tests/wasm/validate.mjs "$OUT/$b.wasm" > "$OUT/$b.valid.log" 2>&1; then
+    cat "$OUT/$b.valid.log" >> "$OUT/$b.build.log"
+    echo 1 > "$OUT/$b.build_rc"
+    rc=1
+  fi
   if [ $rc = 0 ]; then
     timeout 60 node scripts/wasm-run.mjs "$OUT/$b.wasm" < /dev/null > "$OUT/$b.actual" 2> "$OUT/$b.stderr"
     echo $? > "$OUT/$b.actual_rc"
@@ -66,8 +72,8 @@ export FID OUT REUSE
 printf '%s\n' "${TESTS[@]}" | xargs -P "$JOBS" -I{} bash -c 'one "$@"' _ {}
 
 # The panic's message without its details (the interpreter also prints
-# the operands)
-panic_key() { grep -a -m1 '^Panic:' "$1" 2>/dev/null | tr -d '\r' | sed -E 's/^(Panic: [^:]*).*/\1/'; }
+# the operands, and " at line N", which compiled code does not)
+panic_key() { grep -a -m1 '^Panic:' "$1" 2>/dev/null | tr -d '\r' | sed -E 's/^(Panic: [^:]*).*/\1/; s/ at line [0-9]+$//'; }
 pass=0; fail=0; berr=0; skip=0
 : > "$OUT/results.txt"
 for f in "${TESTS[@]}"; do
@@ -76,9 +82,16 @@ for f in "${TESTS[@]}"; do
   if [ "$erc" = 124 ] || grep -q '^Compilation error\|^Compilation errors\|^error: ' "$OUT/$b.expected" 2>/dev/null; then
     echo "SKIP  $b (fid run gives no reference: rc $erc)" >> "$OUT/results.txt"; skip=$((skip+1)); continue
   fi
+  if grep -aq 'is not available in the interpreter' "$OUT/$b.expected_err" 2>/dev/null; then
+    echo "SKIP  $b (fid run cannot run its FFI)" >> "$OUT/results.txt"; skip=$((skip+1)); continue
+  fi
   if [ "$(cat "$OUT/$b.build_rc" 2>/dev/null)" != 0 ]; then
-    echo "BUILD $b: $(grep -a -m1 -i 'error\|not available\|panic' "$OUT/$b.build.log" | cut -c1-160)" >> "$OUT/results.txt"
+    echo "BUILD $b: $(grep -a -m1 -i 'error\|not available\|panic\|INVALID' "$OUT/$b.build.log" | cut -c1-160)" >> "$OUT/results.txt"
     berr=$((berr+1)); continue
+  fi
+  # PL4: what WebAssembly has no way to do (processes) is a clear panic
+  if grep -aq '^Panic: not available in WebAssembly' "$OUT/$b.stderr" 2>/dev/null; then
+    echo "SKIP  $b ($(grep -a -m1 '^Panic: not available in WebAssembly' "$OUT/$b.stderr" | cut -c8-120))" >> "$OUT/results.txt"; skip=$((skip+1)); continue
   fi
   arc=$(cat "$OUT/$b.actual_rc" 2>/dev/null)
   if [ "$arc" = "$erc" ] && [ "$(panic_key "$OUT/$b.expected_err")" = "$(panic_key "$OUT/$b.stderr")" ] \
